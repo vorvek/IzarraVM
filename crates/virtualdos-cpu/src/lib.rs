@@ -810,6 +810,39 @@ impl Cpu386 {
                 self.set_flag(FLAG_DF, true);
                 Ok(clocks(2))
             }
+            0xff => {
+                let modrm = self.fetch_modrm(bus)?;
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
+                match modrm.reg {
+                    0 | 1 => {
+                        let value = self.read_operand_sized(bus, operand, operand_size)?;
+                        let result = self.inc_dec(value, modrm.reg == 1, operand_size.bus_width());
+                        self.write_operand_sized(bus, operand, operand_size, result)?;
+                        Ok(clocks(2))
+                    }
+                    2 => {
+                        let target = self.read_operand_sized(bus, operand, operand_size)?;
+                        self.push(bus, self.registers.eip, operand_size)?;
+                        self.registers.eip = target & operand_size.mask();
+                        Ok(clocks(7))
+                    }
+                    4 => {
+                        let target = self.read_operand_sized(bus, operand, operand_size)?;
+                        self.registers.eip = target & operand_size.mask();
+                        Ok(clocks(7))
+                    }
+                    6 => {
+                        let value = self.read_operand_sized(bus, operand, operand_size)?;
+                        self.push(bus, value, operand_size)?;
+                        Ok(clocks(2))
+                    }
+                    extension => Err(CpuError::UnsupportedGroupOpcode {
+                        opcode: 0xff,
+                        extension,
+                    }
+                    .into()),
+                }
+            }
             0xfe => {
                 let modrm = self.fetch_modrm(bus)?;
                 let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
@@ -2535,6 +2568,92 @@ mod tests {
         assert_eq!(cpu.read_reg16(Reg16::Ax), 0x0000);
         assert!(cpu.flag(FLAG_ZF));
         assert!(!cpu.flag(FLAG_CF));
+    }
+
+    #[test]
+    fn inc_word_memory_via_ff_group() {
+        // inc word [bx]  (0xff /0, modrm 0x07). 0x00ff -> 0x0100.
+        let mut memory = vec![0; 1024];
+        memory[0..2].copy_from_slice(&[0xff, 0x07]);
+        memory[0x200..0x202].copy_from_slice(&0x00ffu16.to_le_bytes());
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Bx, 0x200);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(
+            u16::from_le_bytes([bus.memory[0x200], bus.memory[0x201]]),
+            0x0100
+        );
+        assert!(!cpu.flag(FLAG_ZF));
+    }
+
+    #[test]
+    fn call_near_indirect_register_pushes_return_and_jumps() {
+        // call ax  (0xff /2, modrm 0xd0). Pushes return eip (2), jumps to ax.
+        let mut memory = vec![0; 1024];
+        memory[0..2].copy_from_slice(&[0xff, 0xd0]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Sp, 0x100);
+        cpu.write_reg16(Reg16::Ax, 0x0050);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eip, 0x0050);
+        assert_eq!(cpu.read_reg16(Reg16::Sp), 0x00fe);
+        assert_eq!(
+            u16::from_le_bytes([bus.memory[0xfe], bus.memory[0xff]]),
+            0x0002
+        );
+    }
+
+    #[test]
+    fn jmp_near_indirect_sets_eip_without_push() {
+        // jmp bx  (0xff /4, modrm 0xe3).
+        let mut memory = vec![0; 64];
+        memory[0..2].copy_from_slice(&[0xff, 0xe3]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Sp, 0x100);
+        cpu.write_reg16(Reg16::Bx, 0x0030);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eip, 0x0030);
+        assert_eq!(cpu.read_reg16(Reg16::Sp), 0x0100); // no push
+    }
+
+    #[test]
+    fn push_rm_writes_value_and_decrements_sp() {
+        // push cx  (0xff /6, modrm 0xf1).
+        let mut memory = vec![0; 256];
+        memory[0..2].copy_from_slice(&[0xff, 0xf1]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Sp, 0x100);
+        cpu.write_reg16(Reg16::Cx, 0xbeef);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Sp), 0x00fe);
+        assert_eq!(
+            u16::from_le_bytes([bus.memory[0xfe], bus.memory[0xff]]),
+            0xbeef
+        );
     }
 
     #[test]
