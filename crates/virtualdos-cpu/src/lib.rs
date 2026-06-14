@@ -528,7 +528,14 @@ impl Cpu386 {
                 let modrm = self.fetch_modrm(bus)?;
                 let value = self.read_rm_u8(bus, prefixes, address_size, modrm)?;
                 let reg = self.read_gpr8(modrm.reg);
-                self.set_logic_flags(u32::from(value & reg), OperandSize::Word);
+                self.alu(4, u32::from(value), u32::from(reg), BusWidth::Byte);
+                Ok(clocks(2))
+            }
+            0x85 => {
+                let modrm = self.fetch_modrm(bus)?;
+                let value = self.read_rm_sized(bus, prefixes, address_size, operand_size, modrm)?;
+                let reg = self.read_gpr_sized(modrm.reg, operand_size);
+                self.alu(4, value, reg, operand_size.bus_width());
                 Ok(clocks(2))
             }
             0x88 => {
@@ -609,8 +616,14 @@ impl Cpu386 {
             }
             0xa8 => {
                 let imm = self.fetch_u8(bus)?;
-                let value = self.read_gpr8(0);
-                self.set_logic_flags(u32::from(value & imm), OperandSize::Word);
+                let al = self.read_gpr8(0);
+                self.alu(4, u32::from(al), u32::from(imm), BusWidth::Byte);
+                Ok(clocks(2))
+            }
+            0xa9 => {
+                let imm = self.fetch_immediate(bus, operand_size)?;
+                let acc = self.read_gpr_sized(0, operand_size);
+                self.alu(4, acc, imm, operand_size.bus_width());
                 Ok(clocks(2))
             }
             0xaa => {
@@ -754,11 +767,27 @@ impl Cpu386 {
                     0 => {
                         let value = self.read_rm_u8(bus, prefixes, address_size, modrm)?;
                         let imm = self.fetch_u8(bus)?;
-                        self.set_logic_flags(u32::from(value & imm), OperandSize::Word);
+                        self.alu(4, u32::from(value), u32::from(imm), BusWidth::Byte);
                         Ok(clocks(2))
                     }
                     _ => Err(CpuError::UnsupportedGroupOpcode {
-                        opcode,
+                        opcode: 0xf6,
+                        extension: modrm.reg,
+                    }
+                    .into()),
+                }
+            }
+            0xf7 => {
+                let modrm = self.fetch_modrm(bus)?;
+                match modrm.reg {
+                    0 => {
+                        let value = self.read_rm_sized(bus, prefixes, address_size, operand_size, modrm)?;
+                        let imm = self.fetch_immediate(bus, operand_size)?;
+                        self.alu(4, value, imm, operand_size.bus_width());
+                        Ok(clocks(2))
+                    }
+                    _ => Err(CpuError::UnsupportedGroupOpcode {
+                        opcode: 0xf7,
                         extension: modrm.reg,
                     }
                     .into()),
@@ -2316,6 +2345,40 @@ mod tests {
                 .iter()
                 .any(|cycle| { cycle.kind == BusAccessKind::IoWrite && cycle.address == 0x03f8 })
         );
+    }
+
+    #[test]
+    fn test_byte_sets_sign_flag() {
+        // test al, al with al = 0x80  (0x84 modrm 0xc0). SF must reflect bit 7.
+        let mut memory = vec![0; 16];
+        memory[0..2].copy_from_slice(&[0x84, 0xc0]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_gpr8(0, 0x80);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert!(cpu.flag(FLAG_SF));
+        assert!(!cpu.flag(FLAG_ZF));
+        assert!(!cpu.flag(FLAG_CF));
+    }
+
+    #[test]
+    fn test_word_immediate_group_f7() {
+        // test bx, 0x0001  (0xf7 /0, modrm 0xc3, imm 0x0001). bx=0x0002 -> ZF set.
+        let mut memory = vec![0; 16];
+        memory[0..4].copy_from_slice(&[0xf7, 0xc3, 0x01, 0x00]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Bx, 0x0002);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert!(cpu.flag(FLAG_ZF));
     }
 
     #[test]
