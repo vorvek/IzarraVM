@@ -1,5 +1,10 @@
 use serde::Deserialize;
 use virtualdos_bus::{BusAccessKind, BusError, BusWidth, CpuBus};
+use virtualdos_cpu::{Cpu386, CpuError, SegmentIndex, SegmentRegister};
+
+// Flags the CPU core actually models. AF (bit 4) is intentionally excluded
+// until Plan 2 adds it; reserved bits are never compared.
+const MODELED_FLAGS: u32 = 0x0000_0fc5;
 
 const MEM_SIZE: usize = 0x0100_0000; // 16 MiB covers the 24-bit address bus used by the suite
 
@@ -117,10 +122,190 @@ impl Seg {
             Seg::Descriptor { sel, .. } => sel.unwrap_or(0) as u16,
         }
     }
+
+    fn to_register(&self) -> SegmentRegister {
+        match self {
+            Seg::Descriptor {
+                base: Some(base),
+                limit,
+                ..
+            } => SegmentRegister {
+                selector: self.selector(),
+                base: *base,
+                limit: limit.unwrap_or(0xffff),
+                access: 0x93,
+                default_size_32: false,
+            },
+            _ => SegmentRegister::real(self.selector()),
+        }
+    }
 }
 
 fn load_tests(text: &str) -> Vec<CpuTest> {
     serde_json::from_str(text).expect("test vectors should deserialize")
+}
+
+fn apply_state(cpu: &mut Cpu386, bus: &mut FlatBus, state: &TestState) {
+    if let Some(v) = state.eax {
+        cpu.registers.set_eax(v);
+    }
+    if let Some(v) = state.ebx {
+        cpu.registers.set_ebx(v);
+    }
+    if let Some(v) = state.ecx {
+        cpu.registers.set_ecx(v);
+    }
+    if let Some(v) = state.edx {
+        cpu.registers.set_edx(v);
+    }
+    if let Some(v) = state.esi {
+        cpu.registers.set_esi(v);
+    }
+    if let Some(v) = state.edi {
+        cpu.registers.set_edi(v);
+    }
+    if let Some(v) = state.ebp {
+        cpu.registers.set_ebp(v);
+    }
+    if let Some(v) = state.esp {
+        cpu.registers.set_esp(v);
+    }
+    if let Some(v) = state.eip {
+        cpu.registers.eip = v;
+    }
+    if let Some(v) = state.eflags {
+        cpu.registers.eflags = v;
+    }
+    if let Some(v) = state.cr0 {
+        cpu.control.cr0 = v;
+    }
+    if let Some(v) = state.cr3 {
+        cpu.control.cr3 = v;
+    }
+
+    let segments = [
+        (SegmentIndex::Es, &state.es),
+        (SegmentIndex::Cs, &state.cs),
+        (SegmentIndex::Ss, &state.ss),
+        (SegmentIndex::Ds, &state.ds),
+        (SegmentIndex::Fs, &state.fs),
+        (SegmentIndex::Gs, &state.gs),
+    ];
+    for (index, seg) in segments {
+        if let Some(seg) = seg {
+            cpu.registers.set_segment(index, seg.to_register());
+        }
+    }
+
+    for entry in &state.ram {
+        bus.write_u8(entry[0], entry[1] as u8);
+    }
+}
+
+fn diffs(cpu: &Cpu386, bus: &FlatBus, expected: &TestState) -> Vec<String> {
+    let mut out = Vec::new();
+    {
+        let mut check = |name: &str, want: Option<u32>, got: u32| {
+            if let Some(want) = want
+                && want != got
+            {
+                out.push(format!("{name}: want {want:#010x}, got {got:#010x}"));
+            }
+        };
+
+        check("eax", expected.eax, cpu.registers.eax());
+        check("ebx", expected.ebx, cpu.registers.ebx());
+        check("ecx", expected.ecx, cpu.registers.ecx());
+        check("edx", expected.edx, cpu.registers.edx());
+        check("esi", expected.esi, cpu.registers.esi());
+        check("edi", expected.edi, cpu.registers.edi());
+        check("ebp", expected.ebp, cpu.registers.ebp());
+        check("esp", expected.esp, cpu.registers.esp());
+        check("eip", expected.eip, cpu.registers.eip);
+        check("cr0", expected.cr0, cpu.control.cr0);
+        check("cr3", expected.cr3, cpu.control.cr3);
+    }
+
+    if let Some(want) = expected.eflags {
+        let got = cpu.registers.eflags;
+        if (want ^ got) & MODELED_FLAGS != 0 {
+            out.push(format!(
+                "eflags(modeled): want {:#06x}, got {:#06x}",
+                want & MODELED_FLAGS,
+                got & MODELED_FLAGS
+            ));
+        }
+    }
+
+    let segments = [
+        ("cs", &expected.cs, SegmentIndex::Cs),
+        ("ds", &expected.ds, SegmentIndex::Ds),
+        ("es", &expected.es, SegmentIndex::Es),
+        ("ss", &expected.ss, SegmentIndex::Ss),
+        ("fs", &expected.fs, SegmentIndex::Fs),
+        ("gs", &expected.gs, SegmentIndex::Gs),
+    ];
+    for (name, seg, index) in segments {
+        if let Some(seg) = seg {
+            let want = seg.selector();
+            let got = cpu.registers.segment(index).selector;
+            if want != got {
+                out.push(format!("{name} selector: want {want:#06x}, got {got:#06x}"));
+            }
+        }
+    }
+
+    for entry in &expected.ram {
+        let want = entry[1] as u8;
+        let got = bus.read_u8(entry[0]);
+        if want != got {
+            out.push(format!(
+                "ram[{:#08x}]: want {want:#04x}, got {got:#04x}",
+                entry[0]
+            ));
+        }
+    }
+
+    out
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Outcome {
+    Pass,
+    Fail(Vec<String>),
+    Unimplemented,
+    Skipped(&'static str),
+    Errored(String),
+}
+
+fn run_test(test: &CpuTest) -> Outcome {
+    if test.exception.is_some() {
+        return Outcome::Skipped("exception");
+    }
+    if let Some(&first) = test.bytes.first()
+        && matches!(first, 0xe4..=0xe7 | 0xec..=0xef)
+    {
+        return Outcome::Skipped("port io");
+    }
+
+    let mut cpu = Cpu386::default();
+    let mut bus = FlatBus::new();
+    apply_state(&mut cpu, &mut bus, &test.initial);
+
+    match cpu.cycle(&mut bus) {
+        Ok(_) => {
+            let differences = diffs(&cpu, &bus, &test.final_state);
+            if differences.is_empty() {
+                Outcome::Pass
+            } else {
+                Outcome::Fail(differences)
+            }
+        }
+        Err(CpuError::UnsupportedOpcode { .. })
+        | Err(CpuError::UnsupportedTwoByteOpcode { .. })
+        | Err(CpuError::UnsupportedGroupOpcode { .. }) => Outcome::Unimplemented,
+        Err(other) => Outcome::Errored(other.to_string()),
+    }
 }
 
 #[test]
@@ -156,4 +341,16 @@ fn flat_bus_round_trips_widths() {
             .unwrap(),
         0x1234_5678
     );
+}
+
+#[test]
+fn synthetic_fixture_executes_and_matches() {
+    let tests = load_tests(include_str!("fixtures/conformance_sample.json"));
+
+    for test in &tests {
+        match run_test(test) {
+            Outcome::Pass => {}
+            other => panic!("test {:?} did not pass: {other:?}", test.name),
+        }
+    }
 }
