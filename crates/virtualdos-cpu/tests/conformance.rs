@@ -206,12 +206,16 @@ fn apply_state(cpu: &mut Cpu386, bus: &mut FlatBus, state: &TestState) {
 /// Flags that the 386 leaves undefined for this instruction, so the harness
 /// must not compare them. For this slice that is AF on the logic ops
 /// (AND/OR/XOR and TEST); arithmetic ops define every modeled flag.
+/// EXTEND HERE when adding opcodes with other undefined flags (for example
+/// OF after a multi-bit shift, or the flags MUL/DIV leave undefined).
+/// The prefix-skip set below must mirror the CPU's `read_prefixes` exactly,
+/// or this helper and the CPU would disagree on which byte is the opcode.
 fn undefined_flags(bytes: &[u8]) -> u32 {
     let mut index = 0;
     while index < bytes.len()
         && matches!(
             bytes[index],
-            0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf0 | 0xf2 | 0xf3
+            0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf3
         )
     {
         index += 1;

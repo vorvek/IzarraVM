@@ -2424,4 +2424,67 @@ mod tests {
         assert!(cpu.flag(FLAG_ZF));
         assert!(cpu.flag(FLAG_AF)); // AND leaves AF untouched (undefined)
     }
+
+    #[test]
+    fn alu_add_byte_overflow_without_carry() {
+        let mut cpu = Cpu386::default();
+        let result = cpu.alu(0, 0x7f, 0x01, BusWidth::Byte); // 127 + 1 -> 0x80
+        assert_eq!(result, 0x80);
+        assert!(cpu.flag(FLAG_OF)); // signed overflow, isolated from carry
+        assert!(!cpu.flag(FLAG_CF)); // no unsigned carry
+        assert!(cpu.flag(FLAG_SF));
+        assert!(cpu.flag(FLAG_AF));
+    }
+
+    #[test]
+    fn alu_sbb_borrow_in_with_max_subtrahend() {
+        let mut cpu = Cpu386::default();
+        cpu.set_flag(FLAG_CF, true); // borrow in
+        let result = cpu.alu(3, 0x00, 0xff, BusWidth::Byte); // 0 - 0xff - 1
+        assert_eq!(result, 0x00);
+        assert!(cpu.flag(FLAG_CF)); // b + borrow must not wrap to 0 and clear CF
+        assert!(cpu.flag(FLAG_ZF));
+    }
+
+    #[test]
+    fn alu_parity_uses_low_byte_only() {
+        let mut cpu = Cpu386::default();
+        let result = cpu.alu(0, 0x00ff, 0x0001, BusWidth::Word); // -> 0x0100
+        assert_eq!(result, 0x0100);
+        assert!(cpu.flag(FLAG_PF)); // low byte 0x00 is even parity; full word would be odd
+    }
+
+    #[test]
+    fn alu_sign_flag_word_uses_bit15() {
+        let mut cpu = Cpu386::default();
+        let result = cpu.alu(0, 0x8000, 0x0000, BusWidth::Word);
+        assert_eq!(result, 0x8000);
+        assert!(cpu.flag(FLAG_SF));
+    }
+
+    #[test]
+    fn cmp_memory_form_issues_no_write() {
+        // cmp [bx], al  (0x38 modrm 0x07). Equal operands -> ZF, and no write cycle.
+        let mut memory = vec![0; 1024];
+        memory[0..3].copy_from_slice(&[0x38, 0x07, 0xf4]);
+        memory[0x200] = 0x42;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Bx, 0x200);
+        cpu.write_gpr8(0, 0x42); // al
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert!(cpu.flag(FLAG_ZF));
+        assert_eq!(bus.memory[0x200], 0x42); // unchanged
+        assert!(
+            !bus.trace
+                .cycles()
+                .iter()
+                .any(|cycle| cycle.kind == BusAccessKind::DataWrite)
+        );
+    }
 }
