@@ -354,3 +354,81 @@ fn synthetic_fixture_executes_and_matches() {
         }
     }
 }
+
+#[test]
+#[ignore = "set VIRTUALDOS_386_TESTS to a directory of converted JSON vectors"]
+fn conformance_suite_report() {
+    let dir = std::env::var("VIRTUALDOS_386_TESTS")
+        .expect("VIRTUALDOS_386_TESTS must point at the converted JSON suite");
+
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .expect("test directory should be readable")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    paths.sort();
+
+    let (mut total, mut pass, mut fail, mut unimpl, mut skip, mut errored) =
+        (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut failing_files: Vec<String> = Vec::new();
+    let mut first_failures: Vec<String> = Vec::new();
+
+    for path in &paths {
+        let text = std::fs::read_to_string(path).expect("vector file should be readable");
+        let tests: Vec<CpuTest> = match serde_json::from_str(&text) {
+            Ok(tests) => tests,
+            Err(error) => {
+                eprintln!("parse {}: {error}", path.display());
+                continue;
+            }
+        };
+
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let (mut file_pass, mut file_fail) = (0u64, 0u64);
+        for test in &tests {
+            total += 1;
+            match run_test(test) {
+                Outcome::Pass => {
+                    pass += 1;
+                    file_pass += 1;
+                }
+                Outcome::Fail(differences) => {
+                    fail += 1;
+                    file_fail += 1;
+                    if first_failures.len() < 20 {
+                        first_failures.push(format!(
+                            "{name} [{}]: {}",
+                            test.name,
+                            differences.join("; ")
+                        ));
+                    }
+                }
+                Outcome::Unimplemented => unimpl += 1,
+                Outcome::Skipped(_) => skip += 1,
+                Outcome::Errored(message) => {
+                    errored += 1;
+                    if first_failures.len() < 20 {
+                        first_failures.push(format!("{name} [{}]: ERROR {message}", test.name));
+                    }
+                }
+            }
+        }
+        if file_fail > 0 {
+            failing_files.push(format!("{name}: {file_pass} pass / {file_fail} fail"));
+        }
+    }
+
+    println!(
+        "files={} total={total} pass={pass} fail={fail} unimplemented={unimpl} skipped={skip} errored={errored}",
+        paths.len()
+    );
+    for line in &failing_files {
+        println!("FAIL {line}");
+    }
+    for line in &first_failures {
+        println!("  {line}");
+    }
+
+    assert!(total > 0, "no vectors were parsed from {dir}");
+}
