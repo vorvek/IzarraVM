@@ -493,20 +493,35 @@ impl Cpu386 {
             }
             0x80 => {
                 let modrm = self.fetch_modrm(bus)?;
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
                 let imm = u32::from(self.fetch_u8(bus)?);
-                self.execute_group_80(bus, prefixes, address_size, modrm, imm)?;
+                let a = u32::from(self.read_operand_u8(bus, operand)?);
+                let result = self.alu(modrm.reg, a, imm, BusWidth::Byte) as u8;
+                if modrm.reg != 7 {
+                    self.write_operand_u8(bus, operand, result)?;
+                }
                 Ok(clocks(2))
             }
             0x81 => {
                 let modrm = self.fetch_modrm(bus)?;
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
                 let imm = self.fetch_immediate(bus, operand_size)?;
-                self.execute_group_81_83(bus, prefixes, address_size, operand_size, modrm, imm)?;
+                let a = self.read_operand_sized(bus, operand, operand_size)?;
+                let result = self.alu(modrm.reg, a, imm, operand_size.bus_width());
+                if modrm.reg != 7 {
+                    self.write_operand_sized(bus, operand, operand_size, result)?;
+                }
                 Ok(clocks(2))
             }
             0x83 => {
                 let modrm = self.fetch_modrm(bus)?;
-                let imm = sign_extend_u8(self.fetch_u8(bus)?) & operand_size.mask();
-                self.execute_group_81_83(bus, prefixes, address_size, operand_size, modrm, imm)?;
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
+                let imm = sign_extend_u8(self.fetch_u8(bus)?);
+                let a = self.read_operand_sized(bus, operand, operand_size)?;
+                let result = self.alu(modrm.reg, a, imm, operand_size.bus_width());
+                if modrm.reg != 7 {
+                    self.write_operand_sized(bus, operand, operand_size, result)?;
+                }
                 Ok(clocks(2))
             }
             0x84 => {
@@ -2301,6 +2316,44 @@ mod tests {
                 .iter()
                 .any(|cycle| { cycle.kind == BusAccessKind::IoWrite && cycle.address == 0x03f8 })
         );
+    }
+
+    #[test]
+    fn group81_add_memory_with_displacement_and_immediate() {
+        // add word [bx+0x10], 0x0102  (0x81 /0, modrm 0x47, disp 0x10, imm 0x0102)
+        let mut memory = vec![0; 1024];
+        memory[0..6].copy_from_slice(&[0x81, 0x47, 0x10, 0x02, 0x01, 0xf4]);
+        memory[0x210..0x212].copy_from_slice(&0x0003u16.to_le_bytes());
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Bx, 0x200);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(
+            u16::from_le_bytes([bus.memory[0x210], bus.memory[0x211]]),
+            0x0105
+        );
+        assert_eq!(cpu.registers.eip, 5); // opcode + modrm + disp8 + imm16
+    }
+
+    #[test]
+    fn group83_sign_extends_immediate() {
+        // sub bx, -1  (0x83 /5, modrm 0xeb, imm 0xff -> -1)
+        let mut memory = vec![0; 16];
+        memory[0..3].copy_from_slice(&[0x83, 0xeb, 0xff]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Bx, 0x0005);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Bx), 0x0006); // 5 - (-1) = 6
     }
 
     #[test]
