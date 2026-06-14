@@ -847,14 +847,6 @@ impl Cpu386 {
                 let modrm = self.fetch_modrm(bus)?;
                 let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
                 let op = modrm.reg;
-                // Rotates (/0../3) arrive in a later task; reject them cleanly for now.
-                if !matches!(op, 4..=7) {
-                    return Err(CpuError::UnsupportedGroupOpcode {
-                        opcode,
-                        extension: op,
-                    }
-                    .into());
-                }
                 let count = match opcode {
                     0xc0 | 0xc1 => self.fetch_u8(bus)?,
                     0xd0 | 0xd1 => 1,
@@ -2039,10 +2031,35 @@ impl Cpu386 {
         }
         let mask = width_mask(width);
         let msb = width_sign(width);
+        let bits = width.bytes() * 8;
         let mut v = value & mask;
         let mut cf = self.flag(FLAG_CF); // seed for RCL/RCR
         for _ in 0..count {
             match op {
+                0 => {
+                    // ROL
+                    let bit = (v & msb) != 0;
+                    v = ((v << 1) | u32::from(bit)) & mask;
+                    cf = bit;
+                }
+                1 => {
+                    // ROR
+                    let bit = (v & 1) != 0;
+                    v = (v >> 1) | (u32::from(bit) << (bits - 1));
+                    cf = bit;
+                }
+                2 => {
+                    // RCL (rotate left through carry)
+                    let bit = (v & msb) != 0;
+                    v = ((v << 1) | u32::from(cf)) & mask;
+                    cf = bit;
+                }
+                3 => {
+                    // RCR (rotate right through carry)
+                    let bit = (v & 1) != 0;
+                    v = (v >> 1) | (u32::from(cf) << (bits - 1));
+                    cf = bit;
+                }
                 4 | 6 => {
                     // SHL (/6 aliases SHL)
                     cf = (v & msb) != 0;
@@ -2066,15 +2083,19 @@ impl Cpu386 {
             // OF is defined only for a single-bit count.
             let top = (v & msb) != 0;
             let of = match op {
-                4 | 6 => top ^ cf,       // SHL: top bit of result XOR carry out
-                5 => (value & msb) != 0, // SHR: most-significant bit of the original
-                7 => false,              // SAR never overflows
+                0 | 2 => top ^ cf,                      // ROL, RCL: top bit XOR carry out
+                1 | 3 => top ^ ((v & (msb >> 1)) != 0), // ROR, RCR: top two bits XORed
+                4 | 6 => top ^ cf,                      // SHL: top bit of result XOR carry out
+                5 => (value & msb) != 0,                // SHR: most-significant bit of the original
+                7 => false,                             // SAR never overflows
                 _ => unreachable!("shift/rotate op {op}"),
             };
             self.set_flag(FLAG_OF, of);
         }
-        // Shifts set SF/ZF/PF; AF is left untouched (undefined on the 386).
-        self.set_szp(v, width);
+        // Shifts set SF/ZF/PF; rotates leave them (and AF) untouched.
+        if matches!(op, 4..=7) {
+            self.set_szp(v, width);
+        }
         v & mask
     }
 
@@ -3052,5 +3073,96 @@ mod tests {
 
         assert_eq!(cpu.read_reg16(Reg16::Ax), 0x1234);
         assert!(cpu.flag(FLAG_CF)); // unchanged: a zero count touches no flags
+    }
+
+    #[test]
+    fn rol_word_by_one() {
+        // rol ax,1 (0xd1 /0, modrm 0xc0). 0x8000 -> 0x0001, CF=1, OF=msb^cf=0^1=1.
+        let mut memory = vec![0; 16];
+        memory[0..2].copy_from_slice(&[0xd1, 0xc0]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x8000);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x0001);
+        assert!(cpu.flag(FLAG_CF));
+        assert!(cpu.flag(FLAG_OF));
+    }
+
+    #[test]
+    fn ror_word_by_one() {
+        // ror ax,1 (0xd1 /1, modrm 0xc8). 0x0001 -> 0x8000, CF=1, OF=msb^next=1^0=1.
+        let mut memory = vec![0; 16];
+        memory[0..2].copy_from_slice(&[0xd1, 0xc8]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x0001);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x8000);
+        assert!(cpu.flag(FLAG_CF));
+        assert!(cpu.flag(FLAG_OF));
+    }
+
+    #[test]
+    fn rcl_word_rotates_through_carry() {
+        // rcl ax,1 (0xd1 /2, modrm 0xd0). ax=0x0000, CF=1 -> 0x0001, CF=0 (old msb=0).
+        let mut memory = vec![0; 16];
+        memory[0..2].copy_from_slice(&[0xd1, 0xd0]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x0000);
+        cpu.set_flag(FLAG_CF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x0001); // carry rotated into bit 0
+        assert!(!cpu.flag(FLAG_CF)); // old msb (0) rotated out
+    }
+
+    #[test]
+    fn rcr_word_rotates_through_carry() {
+        // rcr ax,1 (0xd1 /3, modrm 0xd8). ax=0x0000, CF=1 -> 0x8000, CF=0 (old bit0=0).
+        let mut memory = vec![0; 16];
+        memory[0..2].copy_from_slice(&[0xd1, 0xd8]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x0000);
+        cpu.set_flag(FLAG_CF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x8000); // carry rotated into bit 15
+        assert!(!cpu.flag(FLAG_CF)); // old bit0 (0) rotated out
+    }
+
+    #[test]
+    fn rotate_leaves_sign_zero_parity_untouched() {
+        // rol ax,1: rotates touch only CF/OF, never SF/ZF/PF. Set ZF first, then
+        // rotate to a nonzero result and confirm ZF survives.
+        let mut memory = vec![0; 16];
+        memory[0..2].copy_from_slice(&[0xd1, 0xc0]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x8000);
+        cpu.set_flag(FLAG_ZF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x0001);
+        assert!(cpu.flag(FLAG_ZF)); // unchanged by a rotate
     }
 }
