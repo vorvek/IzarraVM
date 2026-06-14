@@ -1,0 +1,7 @@
+/target/
+/.local/
+/virtualdos-output/
+/compatibility-output/
+/corpus-output/
+*.log
+*.tmp

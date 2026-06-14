@@ -1,0 +1,21 @@
+[package]
+name = "virtualdos"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+virtualdos-audio = { path = "../virtualdos-audio" }
+virtualdos-bus = { path = "../virtualdos-bus" }
+virtualdos-core = { path = "../virtualdos-core" }
+virtualdos-cpu = { path = "../virtualdos-cpu" }
+virtualdos-dos = { path = "../virtualdos-dos" }
+virtualdos-input = { path = "../virtualdos-input" }
+virtualdos-video = { path = "../virtualdos-video" }
+winit.workspace = true

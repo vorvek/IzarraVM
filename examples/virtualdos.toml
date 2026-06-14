@@ -1,0 +1,25 @@
+[machine]
+cpu = "i386dx_25"
+memory_mib = 16
+video = "et4000_w32p"
+
+[dos]
+c_drive = "R:\\La Colecci\u00f3n by Neville\\dosroot\\"
+
+[audio]
+pc_speaker = true
+sound_blaster = true
+opl3 = true
+
+[audio.midi]
+backend = "external"
+soundfont = ""
+
+[input]
+keyboard = true
+mouse = true
+joystick = true
+steam_input = "off"
+
+[diagnostics]
+trace_devices = false
