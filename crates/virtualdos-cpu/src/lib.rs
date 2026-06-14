@@ -810,6 +810,14 @@ impl Cpu386 {
                 self.set_flag(FLAG_DF, true);
                 Ok(clocks(2))
             }
+            0x40..=0x4f => {
+                let index = opcode & 0x07;
+                let is_dec = opcode >= 0x48;
+                let value = self.read_gpr_sized(index, operand_size);
+                let result = self.inc_dec(value, is_dec, operand_size.bus_width());
+                self.write_gpr_sized(index, operand_size, result);
+                Ok(clocks(2))
+            }
             0x0f => self.execute_two_byte(bus, prefixes, address_size, operand_size),
             _ => Err(CpuError::UnsupportedOpcode {
                 opcode,
@@ -1940,6 +1948,18 @@ impl Cpu386 {
         }
     }
 
+    fn inc_dec(&mut self, value: u32, is_dec: bool, width: BusWidth) -> u32 {
+        // INC/DEC affect OF/SF/ZF/AF/PF exactly like ADD/SUB by 1, but leave CF.
+        let carry = self.flag(FLAG_CF);
+        let result = if is_dec {
+            self.alu_sub(value, 1, 0, width)
+        } else {
+            self.alu_add(value, 1, 0, width)
+        };
+        self.set_flag(FLAG_CF, carry);
+        result
+    }
+
     fn alu_add(&mut self, a: u32, b: u32, carry: u32, width: BusWidth) -> u32 {
         let mask = width_mask(width);
         let sign = width_sign(width);
@@ -2460,6 +2480,64 @@ mod tests {
         let result = cpu.alu(0, 0x8000, 0x0000, BusWidth::Word);
         assert_eq!(result, 0x8000);
         assert!(cpu.flag(FLAG_SF));
+    }
+
+    #[test]
+    fn inc_reg_preserves_carry_flag() {
+        // inc ax (0x40) with CF set: AX increments, CF stays set, AF set by 0xff+1.
+        let mut memory = vec![0; 16];
+        memory[0] = 0x40;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.set_flag(FLAG_CF, true);
+        cpu.write_reg16(Reg16::Ax, 0x00ff);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x0100);
+        assert!(cpu.flag(FLAG_CF)); // INC must not touch CF
+        assert!(cpu.flag(FLAG_AF));
+    }
+
+    #[test]
+    fn dec_reg_sets_zero_and_keeps_carry_clear() {
+        // dec ax (0x48) with CF clear: AX -> 0, ZF set, CF still clear.
+        let mut memory = vec![0; 16];
+        memory[0] = 0x48;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.set_flag(FLAG_CF, false);
+        cpu.write_reg16(Reg16::Ax, 0x0001);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x0000);
+        assert!(cpu.flag(FLAG_ZF));
+        assert!(!cpu.flag(FLAG_CF));
+    }
+
+    #[test]
+    fn inc_word_overflow_sets_of_and_sf() {
+        // inc ax (0x40) on 0x7fff: -> 0x8000, OF and SF set, CF preserved.
+        let mut memory = vec![0; 16];
+        memory[0] = 0x40;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.set_flag(FLAG_CF, true);
+        cpu.write_reg16(Reg16::Ax, 0x7fff);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x8000);
+        assert!(cpu.flag(FLAG_OF));
+        assert!(cpu.flag(FLAG_SF));
+        assert!(cpu.flag(FLAG_CF)); // preserved
     }
 
     #[test]
