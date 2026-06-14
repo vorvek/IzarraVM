@@ -83,6 +83,18 @@ struct CpuTest {
 
 #[derive(Debug, Default, Deserialize)]
 struct TestState {
+    #[serde(default)]
+    regs: Regs,
+    #[serde(default)]
+    ram: Vec<[u32; 2]>,
+}
+
+/// Register block as emitted by moo2json: nested under `regs`, only the
+/// registers present in the vector are set. Segment registers are plain
+/// selectors; in real mode the base is `selector << 4`. Unmodeled keys
+/// (dr6/dr7/ea/queue) are ignored by serde.
+#[derive(Debug, Default, Deserialize)]
+struct Regs {
     eax: Option<u32>,
     ebx: Option<u32>,
     ecx: Option<u32>,
@@ -95,51 +107,12 @@ struct TestState {
     eflags: Option<u32>,
     cr0: Option<u32>,
     cr3: Option<u32>,
-    cs: Option<Seg>,
-    ds: Option<Seg>,
-    es: Option<Seg>,
-    ss: Option<Seg>,
-    fs: Option<Seg>,
-    gs: Option<Seg>,
-    #[serde(default)]
-    ram: Vec<[u32; 2]>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum Seg {
-    Selector(u32),
-    Descriptor {
-        sel: Option<u32>,
-        base: Option<u32>,
-        limit: Option<u32>,
-    },
-}
-
-impl Seg {
-    fn selector(&self) -> u16 {
-        match self {
-            Seg::Selector(value) => *value as u16,
-            Seg::Descriptor { sel, .. } => sel.unwrap_or(0) as u16,
-        }
-    }
-
-    fn to_register(&self) -> SegmentRegister {
-        match self {
-            Seg::Descriptor {
-                base: Some(base),
-                limit,
-                ..
-            } => SegmentRegister {
-                selector: self.selector(),
-                base: *base,
-                limit: limit.unwrap_or(0xffff),
-                access: 0x93,
-                default_size_32: false,
-            },
-            _ => SegmentRegister::real(self.selector()),
-        }
-    }
+    cs: Option<u32>,
+    ds: Option<u32>,
+    es: Option<u32>,
+    ss: Option<u32>,
+    fs: Option<u32>,
+    gs: Option<u32>,
 }
 
 fn load_tests(text: &str) -> Vec<CpuTest> {
@@ -147,54 +120,56 @@ fn load_tests(text: &str) -> Vec<CpuTest> {
 }
 
 fn apply_state(cpu: &mut Cpu386, bus: &mut FlatBus, state: &TestState) {
-    if let Some(v) = state.eax {
+    let regs = &state.regs;
+    if let Some(v) = regs.eax {
         cpu.registers.set_eax(v);
     }
-    if let Some(v) = state.ebx {
+    if let Some(v) = regs.ebx {
         cpu.registers.set_ebx(v);
     }
-    if let Some(v) = state.ecx {
+    if let Some(v) = regs.ecx {
         cpu.registers.set_ecx(v);
     }
-    if let Some(v) = state.edx {
+    if let Some(v) = regs.edx {
         cpu.registers.set_edx(v);
     }
-    if let Some(v) = state.esi {
+    if let Some(v) = regs.esi {
         cpu.registers.set_esi(v);
     }
-    if let Some(v) = state.edi {
+    if let Some(v) = regs.edi {
         cpu.registers.set_edi(v);
     }
-    if let Some(v) = state.ebp {
+    if let Some(v) = regs.ebp {
         cpu.registers.set_ebp(v);
     }
-    if let Some(v) = state.esp {
+    if let Some(v) = regs.esp {
         cpu.registers.set_esp(v);
     }
-    if let Some(v) = state.eip {
+    if let Some(v) = regs.eip {
         cpu.registers.eip = v;
     }
-    if let Some(v) = state.eflags {
+    if let Some(v) = regs.eflags {
         cpu.registers.eflags = v;
     }
-    if let Some(v) = state.cr0 {
+    if let Some(v) = regs.cr0 {
         cpu.control.cr0 = v;
     }
-    if let Some(v) = state.cr3 {
+    if let Some(v) = regs.cr3 {
         cpu.control.cr3 = v;
     }
 
     let segments = [
-        (SegmentIndex::Es, &state.es),
-        (SegmentIndex::Cs, &state.cs),
-        (SegmentIndex::Ss, &state.ss),
-        (SegmentIndex::Ds, &state.ds),
-        (SegmentIndex::Fs, &state.fs),
-        (SegmentIndex::Gs, &state.gs),
+        (SegmentIndex::Es, regs.es),
+        (SegmentIndex::Cs, regs.cs),
+        (SegmentIndex::Ss, regs.ss),
+        (SegmentIndex::Ds, regs.ds),
+        (SegmentIndex::Fs, regs.fs),
+        (SegmentIndex::Gs, regs.gs),
     ];
-    for (index, seg) in segments {
-        if let Some(seg) = seg {
-            cpu.registers.set_segment(index, seg.to_register());
+    for (index, selector) in segments {
+        if let Some(selector) = selector {
+            cpu.registers
+                .set_segment(index, SegmentRegister::real(selector as u16));
         }
     }
 
@@ -236,6 +211,7 @@ fn undefined_flags(bytes: &[u8]) -> u32 {
 
 fn diffs(cpu: &Cpu386, bus: &FlatBus, expected: &TestState, undefined: u32) -> Vec<String> {
     let mut out = Vec::new();
+    let regs = &expected.regs;
     {
         let mut check = |name: &str, want: Option<u32>, got: u32| {
             if let Some(want) = want
@@ -245,20 +221,20 @@ fn diffs(cpu: &Cpu386, bus: &FlatBus, expected: &TestState, undefined: u32) -> V
             }
         };
 
-        check("eax", expected.eax, cpu.registers.eax());
-        check("ebx", expected.ebx, cpu.registers.ebx());
-        check("ecx", expected.ecx, cpu.registers.ecx());
-        check("edx", expected.edx, cpu.registers.edx());
-        check("esi", expected.esi, cpu.registers.esi());
-        check("edi", expected.edi, cpu.registers.edi());
-        check("ebp", expected.ebp, cpu.registers.ebp());
-        check("esp", expected.esp, cpu.registers.esp());
-        check("eip", expected.eip, cpu.registers.eip);
-        check("cr0", expected.cr0, cpu.control.cr0);
-        check("cr3", expected.cr3, cpu.control.cr3);
+        check("eax", regs.eax, cpu.registers.eax());
+        check("ebx", regs.ebx, cpu.registers.ebx());
+        check("ecx", regs.ecx, cpu.registers.ecx());
+        check("edx", regs.edx, cpu.registers.edx());
+        check("esi", regs.esi, cpu.registers.esi());
+        check("edi", regs.edi, cpu.registers.edi());
+        check("ebp", regs.ebp, cpu.registers.ebp());
+        check("esp", regs.esp, cpu.registers.esp());
+        check("eip", regs.eip, cpu.registers.eip);
+        check("cr0", regs.cr0, cpu.control.cr0);
+        check("cr3", regs.cr3, cpu.control.cr3);
     }
 
-    if let Some(want) = expected.eflags {
+    if let Some(want) = regs.eflags {
         let got = cpu.registers.eflags;
         let defined = MODELED_FLAGS & !undefined;
         if (want ^ got) & defined != 0 {
@@ -273,16 +249,16 @@ fn diffs(cpu: &Cpu386, bus: &FlatBus, expected: &TestState, undefined: u32) -> V
     // v1 compares segment selectors only. Cached base/limit/access are not
     // checked yet; revisit when opcode coverage reaches protected mode.
     let segments = [
-        ("cs", &expected.cs, SegmentIndex::Cs),
-        ("ds", &expected.ds, SegmentIndex::Ds),
-        ("es", &expected.es, SegmentIndex::Es),
-        ("ss", &expected.ss, SegmentIndex::Ss),
-        ("fs", &expected.fs, SegmentIndex::Fs),
-        ("gs", &expected.gs, SegmentIndex::Gs),
+        ("cs", regs.cs, SegmentIndex::Cs),
+        ("ds", regs.ds, SegmentIndex::Ds),
+        ("es", regs.es, SegmentIndex::Es),
+        ("ss", regs.ss, SegmentIndex::Ss),
+        ("fs", regs.fs, SegmentIndex::Fs),
+        ("gs", regs.gs, SegmentIndex::Gs),
     ];
-    for (name, seg, index) in segments {
-        if let Some(seg) = seg {
-            let want = seg.selector();
+    for (name, selector, index) in segments {
+        if let Some(selector) = selector {
+            let want = selector as u16;
             let got = cpu.registers.segment(index).selector;
             if want != got {
                 out.push(format!("{name} selector: want {want:#06x}, got {got:#06x}"));
@@ -327,20 +303,34 @@ fn run_test(test: &CpuTest) -> Outcome {
     let mut bus = FlatBus::new();
     apply_state(&mut cpu, &mut bus, &test.initial);
 
-    match cpu.cycle(&mut bus) {
-        Ok(_) => {
-            let undefined = undefined_flags(&test.bytes);
-            let differences = diffs(&cpu, &bus, &test.final_state, undefined);
-            if differences.is_empty() {
-                Outcome::Pass
-            } else {
-                Outcome::Fail(differences)
+    // Each vector is the instruction under test followed by a HLT terminator;
+    // the captured final state is taken after the CPU halts (its eip is past
+    // the HLT). Run until halt, guarding against a vector that never halts.
+    let mut guard = 0;
+    loop {
+        match cpu.cycle(&mut bus) {
+            Ok(outcome) => {
+                if outcome.halted {
+                    break;
+                }
             }
+            Err(CpuError::UnsupportedOpcode { .. })
+            | Err(CpuError::UnsupportedTwoByteOpcode { .. })
+            | Err(CpuError::UnsupportedGroupOpcode { .. }) => return Outcome::Unimplemented,
+            Err(other) => return Outcome::Errored(other.to_string()),
         }
-        Err(CpuError::UnsupportedOpcode { .. })
-        | Err(CpuError::UnsupportedTwoByteOpcode { .. })
-        | Err(CpuError::UnsupportedGroupOpcode { .. }) => Outcome::Unimplemented,
-        Err(other) => Outcome::Errored(other.to_string()),
+        guard += 1;
+        if guard > 1024 {
+            return Outcome::Errored("did not halt within 1024 instructions".to_string());
+        }
+    }
+
+    let undefined = undefined_flags(&test.bytes);
+    let differences = diffs(&cpu, &bus, &test.final_state, undefined);
+    if differences.is_empty() {
+        Outcome::Pass
+    } else {
+        Outcome::Fail(differences)
     }
 }
 
@@ -351,19 +341,17 @@ fn parses_synthetic_fixture() {
 
     assert_eq!(tests.len(), 3);
     assert_eq!(tests[0].name, "nop");
-    assert_eq!(tests[0].bytes, vec![144]);
-    assert_eq!(tests[0].initial.cs.as_ref().unwrap().selector(), 0xf000);
-    assert_eq!(tests[0].final_state.eip, Some(257));
+    assert_eq!(tests[0].bytes, vec![144, 244]);
+    assert_eq!(tests[0].initial.regs.cs, Some(0));
+    assert_eq!(tests[0].initial.regs.eip, Some(256));
+    assert_eq!(tests[0].final_state.regs.eip, Some(258));
 
-    let clc = &tests[1];
-    assert_eq!(clc.name, "clc");
-    match clc.initial.cs.as_ref().unwrap() {
-        Seg::Descriptor { base, .. } => assert_eq!(*base, Some(0x000f_0000)),
-        Seg::Selector(_) => panic!("clc fixture should use the descriptor form"),
-    }
+    assert_eq!(tests[1].name, "clc");
+    assert_eq!(tests[1].initial.regs.eflags, Some(3));
+    assert_eq!(tests[1].final_state.regs.eflags, Some(2));
 
     assert_eq!(tests[2].name, "add al imm sets af");
-    assert_eq!(tests[2].final_state.eflags, Some(18));
+    assert_eq!(tests[2].final_state.regs.eflags, Some(18));
 }
 
 #[test]
@@ -422,6 +410,7 @@ fn conformance_suite_report() {
     let (mut total, mut pass, mut fail, mut unimpl, mut skip, mut errored) =
         (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     let mut failing_files: Vec<String> = Vec::new();
+    let mut partial_files: Vec<String> = Vec::new();
     let mut first_failures: Vec<String> = Vec::new();
     let mut parse_errors = 0u64;
 
@@ -437,7 +426,8 @@ fn conformance_suite_report() {
         };
 
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        let (mut file_pass, mut file_fail) = (0u64, 0u64);
+        let (mut file_pass, mut file_fail, mut file_unimpl, mut file_skip) =
+            (0u64, 0u64, 0u64, 0u64);
         for test in &tests {
             total += 1;
             match run_test(test) {
@@ -456,8 +446,14 @@ fn conformance_suite_report() {
                         ));
                     }
                 }
-                Outcome::Unimplemented => unimpl += 1,
-                Outcome::Skipped => skip += 1,
+                Outcome::Unimplemented => {
+                    unimpl += 1;
+                    file_unimpl += 1;
+                }
+                Outcome::Skipped => {
+                    skip += 1;
+                    file_skip += 1;
+                }
                 Outcome::Errored(message) => {
                     errored += 1;
                     if first_failures.len() < 20 {
@@ -468,6 +464,10 @@ fn conformance_suite_report() {
         }
         if file_fail > 0 {
             failing_files.push(format!("{name}: {file_pass} pass / {file_fail} fail"));
+        } else if file_unimpl > 0 || file_skip > 0 {
+            partial_files.push(format!(
+                "{name}: {file_pass} pass, {file_unimpl} unimplemented, {file_skip} skipped"
+            ));
         }
     }
 
@@ -477,6 +477,9 @@ fn conformance_suite_report() {
     );
     for line in &failing_files {
         println!("FAIL {line}");
+    }
+    for line in &partial_files {
+        println!("PARTIAL {line}");
     }
     for line in &first_failures {
         println!("  {line}");

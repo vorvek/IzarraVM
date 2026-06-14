@@ -1,52 +1,20 @@
 [
   {
     "name": "nop",
-    "bytes": [144],
-    "initial": {
-      "cs": 61440,
-      "eip": 256,
-      "eflags": 2,
-      "ram": [[983296, 144]]
-    },
-    "final": {
-      "cs": 61440,
-      "eip": 257,
-      "eflags": 2,
-      "ram": [[983296, 144]]
-    }
+    "bytes": [144, 244],
+    "initial": { "regs": { "cs": 0, "eip": 256, "eflags": 2 }, "ram": [[256, 144], [257, 244]] },
+    "final": { "regs": { "cs": 0, "eip": 258, "eflags": 2 }, "ram": [[256, 144], [257, 244]] }
   },
   {
     "name": "clc",
-    "bytes": [248],
-    "initial": {
-      "cs": { "sel": 8, "base": 983040, "limit": 65535 },
-      "eip": 256,
-      "eflags": 3,
-      "ram": [[983296, 248]]
-    },
-    "final": {
-      "cs": { "sel": 8, "base": 983040, "limit": 65535 },
-      "eip": 257,
-      "eflags": 2,
-      "ram": [[983296, 248]]
-    }
+    "bytes": [248, 244],
+    "initial": { "regs": { "cs": 0, "eip": 256, "eflags": 3 }, "ram": [[256, 248], [257, 244]] },
+    "final": { "regs": { "cs": 0, "eip": 258, "eflags": 2 }, "ram": [[256, 248], [257, 244]] }
   },
   {
     "name": "add al imm sets af",
-    "bytes": [4, 1],
-    "initial": {
-      "cs": 0,
-      "eip": 256,
-      "eax": 15,
-      "eflags": 2,
-      "ram": [[256, 4], [257, 1]]
-    },
-    "final": {
-      "cs": 0,
-      "eip": 258,
-      "eax": 16,
-      "eflags": 18,
-      "ram": [[256, 4], [257, 1]]
-    }
+    "bytes": [4, 1, 244],
+    "initial": { "regs": { "cs": 0, "eip": 256, "eax": 15, "eflags": 2 }, "ram": [[256, 4], [257, 1], [258, 244]] },
+    "final": { "regs": { "cs": 0, "eip": 259, "eax": 16, "eflags": 18 }, "ram": [[256, 4], [257, 1], [258, 244]] }
   }
 ]
