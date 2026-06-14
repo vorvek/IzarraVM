@@ -10,6 +10,10 @@ VirtualDOS is a Rust-based, games-first DOS emulator project. The initial target
 
 The repository is MIT licensed. FreeDOS may be used as a behavioral reference, but this project does not copy GPL FreeDOS code.
 
+## Development Policy
+
+Active development is Windows-first for now, matching the local DOS library and current workstation. Keep the architecture portable: use cross-platform crates for windowing, graphics, audio, MIDI, input, paths, and process boundaries; avoid Windows-only APIs unless they are isolated behind a backend trait.
+
 ## Current State
 
 This is a scaffold. It opens a native `winit` window, validates TOML/CLI configuration, initializes placeholder emulator subsystems, and includes local compatibility-corpus scanning tools. It does not run DOS games yet.
@@ -21,7 +25,7 @@ cargo run -p virtualdos -- --headless-config-check
 cargo run -p virtualdos -- --config examples/virtualdos.toml
 ```
 
-On Linux, replace the `c_drive` path in `examples/virtualdos.toml` or pass `--c-drive /path/to/dosroot`.
+For non-Windows hosts later, replace the `c_drive` path in `examples/virtualdos.toml` or pass `--c-drive /path/to/dosroot`.
 
 ## Compatibility Corpus
 
