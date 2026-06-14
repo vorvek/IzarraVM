@@ -810,6 +810,23 @@ impl Cpu386 {
                 self.set_flag(FLAG_DF, true);
                 Ok(clocks(2))
             }
+            0xfe => {
+                let modrm = self.fetch_modrm(bus)?;
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
+                match modrm.reg {
+                    0 | 1 => {
+                        let value = u32::from(self.read_operand_u8(bus, operand)?);
+                        let result = self.inc_dec(value, modrm.reg == 1, BusWidth::Byte) as u8;
+                        self.write_operand_u8(bus, operand, result)?;
+                        Ok(clocks(2))
+                    }
+                    extension => Err(CpuError::UnsupportedGroupOpcode {
+                        opcode: 0xfe,
+                        extension,
+                    }
+                    .into()),
+                }
+            }
             0x40..=0x4f => {
                 let index = opcode & 0x07;
                 let is_dec = opcode >= 0x48;
@@ -2518,6 +2535,27 @@ mod tests {
         assert_eq!(cpu.read_reg16(Reg16::Ax), 0x0000);
         assert!(cpu.flag(FLAG_ZF));
         assert!(!cpu.flag(FLAG_CF));
+    }
+
+    #[test]
+    fn inc_byte_memory_with_displacement() {
+        // inc byte [bx+0x10]  (0xfe /0, modrm 0x47, disp 0x10). 0x7f -> 0x80.
+        let mut memory = vec![0; 1024];
+        memory[0..3].copy_from_slice(&[0xfe, 0x47, 0x10]);
+        memory[0x210] = 0x7f;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Bx, 0x200);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(bus.memory[0x210], 0x80);
+        assert!(cpu.flag(FLAG_SF));
+        assert!(cpu.flag(FLAG_OF)); // 0x7f + 1 byte overflow
+        assert_eq!(cpu.registers.eip, 3); // opcode + modrm + disp8
     }
 
     #[test]
