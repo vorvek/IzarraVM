@@ -1,5 +1,5 @@
 [package]
-name = "virtualdos-cpu"
+name = "virtualdos-firmware"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
@@ -8,5 +8,3 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-thiserror.workspace = true
-virtualdos-bus = { path = "../virtualdos-bus" }

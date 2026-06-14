@@ -8,7 +8,9 @@ members = [
     "crates/virtualdos-corpus",
     "crates/virtualdos-cpu",
     "crates/virtualdos-dos",
+    "crates/virtualdos-firmware",
     "crates/virtualdos-input",
+    "crates/virtualdos-machine",
     "crates/virtualdos-video",
 ]
 

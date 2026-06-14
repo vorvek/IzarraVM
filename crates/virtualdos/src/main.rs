@@ -3,11 +3,13 @@ use std::error::Error;
 use std::path::PathBuf;
 use tracing::info;
 use virtualdos_audio::AudioSubsystem;
-use virtualdos_bus::Memory;
-use virtualdos_core::{AppConfig, ConfigOverrides, CpuPreset, MidiBackend, VideoCard};
-use virtualdos_cpu::Cpu386;
+use virtualdos_core::{
+    AppConfig, ConfigOverrides, CpuPreset, HardwareProfile, MidiBackend, VideoCard,
+};
 use virtualdos_dos::{DosKernelServices, HostDrive};
+use virtualdos_firmware::{boot_test_image, parse_result_block, test_rom};
 use virtualdos_input::InputState;
+use virtualdos_machine::{Machine, MachineProfile};
 use virtualdos_video::{PlaceholderVideoAdapter, VideoAdapter};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -34,6 +36,10 @@ struct Cli {
     midi_backend: Option<MidiBackend>,
     #[arg(long)]
     headless_config_check: bool,
+    #[arg(long)]
+    headless_test_rom: bool,
+    #[arg(long)]
+    headless_boot_suite: bool,
     #[arg(long, env = "VIRTUALDOS_DOSROOT")]
     dosroot: Option<PathBuf>,
 }
@@ -49,9 +55,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     let config = load_config(&cli)?;
     config.validate()?;
+    let hardware = HardwareProfile::from_config(&config.machine)?;
     let dos = DosKernelServices::new(HostDrive::mount_c(&config.dos.c_drive)?);
-    let _memory = Memory::from_mib(config.machine.memory_mib)?;
-    let _cpu = Cpu386::default();
     let audio = AudioSubsystem::from_config(&config.audio);
     let input = InputState {
         keyboard_enabled: config.input.keyboard,
@@ -62,7 +67,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     info!(
         cpu = %config.machine.cpu,
-        hz = config.machine.cpu.clock_hz(),
+        hz = hardware.clock_hz,
         memory_mib = config.machine.memory_mib,
         video = %config.machine.video,
         c_drive = %dos.c_drive.root().display(),
@@ -77,7 +82,39 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    run_window(config, video)?;
+    if cli.headless_boot_suite {
+        let mut machine = Machine::new_boot_image(
+            MachineProfile::from_hardware_profile(&hardware),
+            boot_test_image(),
+        )?;
+        let stop_reason = machine.run_until_halt_or_cycles(5_000_000)?;
+        let results = parse_result_block(machine.memory().as_slice())?;
+        println!("{}", machine.serial_text());
+        println!("records: {}", results.records.len());
+        println!("stop: {stop_reason:?}");
+        return Ok(());
+    }
+
+    let mut machine = Machine::new(MachineProfile::from_hardware_profile(&hardware), test_rom())?;
+    let stop_reason = machine.run_until_halt_or_cycles(5_000_000)?;
+    let screen = machine.screen_text();
+    let screen_text = screen.as_text();
+
+    info!(
+        ?stop_reason,
+        clocks = machine.elapsed_clocks(),
+        bus_cycles = machine.bus_trace().cycles().len(),
+        first_line = %screen.line_string(0),
+        "test ROM completed"
+    );
+
+    if cli.headless_test_rom {
+        println!("{screen_text}");
+        println!("stop: {stop_reason:?}");
+        return Ok(());
+    }
+
+    run_window(config, video, screen_text)?;
     Ok(())
 }
 
@@ -101,7 +138,11 @@ fn load_config(cli: &Cli) -> Result<AppConfig, Box<dyn Error>> {
     Ok(config)
 }
 
-fn run_window(config: AppConfig, video: PlaceholderVideoAdapter) -> Result<(), Box<dyn Error>> {
+fn run_window(
+    config: AppConfig,
+    video: PlaceholderVideoAdapter,
+    screen_text: String,
+) -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
 
@@ -113,6 +154,7 @@ fn run_window(config: AppConfig, video: PlaceholderVideoAdapter) -> Result<(), B
             config.machine.memory_mib,
             video.card()
         ),
+        screen_text,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -121,6 +163,7 @@ fn run_window(config: AppConfig, video: PlaceholderVideoAdapter) -> Result<(), B
 struct WindowApp {
     window: Option<Window>,
     title: String,
+    screen_text: String,
 }
 
 impl ApplicationHandler for WindowApp {
@@ -135,6 +178,7 @@ impl ApplicationHandler for WindowApp {
         let window = event_loop
             .create_window(attributes)
             .expect("native window should be creatable");
+        info!(screen = %self.screen_text, "initial text-mode screen");
         self.window = Some(window);
     }
 

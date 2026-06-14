@@ -2536,7 +2536,9 @@ dependencies = [
  "virtualdos-core",
  "virtualdos-cpu",
  "virtualdos-dos",
+ "virtualdos-firmware",
  "virtualdos-input",
+ "virtualdos-machine",
  "virtualdos-video",
  "winit",
 ]
@@ -2583,6 +2585,7 @@ name = "virtualdos-cpu"
 version = "0.1.0"
 dependencies = [
  "thiserror 2.0.18",
+ "virtualdos-bus",
 ]
 
 [[package]]
@@ -2594,11 +2597,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "virtualdos-firmware"
+version = "0.1.0"
+
+[[package]]
 name = "virtualdos-input"
 version = "0.1.0"
 dependencies = [
  "gilrs",
  "winit",
+]
+
+[[package]]
+name = "virtualdos-machine"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
+ "virtualdos-bus",
+ "virtualdos-core",
+ "virtualdos-cpu",
+ "virtualdos-firmware",
+ "virtualdos-video",
 ]
 
 [[package]]

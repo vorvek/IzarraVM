@@ -16,12 +16,14 @@ Active development is Windows-first for now, matching the local DOS library and 
 
 ## Current State
 
-This is a scaffold. It opens a native `winit` window, validates TOML/CLI configuration, initializes placeholder emulator subsystems, and includes local compatibility-corpus scanning tools. It does not run DOS games yet.
+This is an early emulator scaffold. It validates TOML/CLI configuration, includes local compatibility-corpus scanning tools, and boots a clean-room 80386DX-25 test ROM far enough to show deterministic VGA text-mode compatibility checks. It does not run DOS games yet.
 
 ## Quick Start
 
 ```powershell
 cargo run -p virtualdos -- --headless-config-check
+cargo run -p virtualdos -- --headless-test-rom
+cargo run -p virtualdos -- --headless-boot-suite
 cargo run -p virtualdos -- --config examples/virtualdos.toml
 ```
 

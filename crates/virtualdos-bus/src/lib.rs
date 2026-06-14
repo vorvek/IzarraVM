@@ -10,6 +10,12 @@ pub enum BusError {
         end: usize,
         len: usize,
     },
+    #[error("unmapped physical memory access at {address:#010x}")]
+    UnmappedMemory { address: u32 },
+    #[error("unsupported I/O port {port:#06x}")]
+    UnsupportedPort { port: u16 },
+    #[error("bus value width mismatch for {width:?}")]
+    WidthMismatch { width: BusWidth },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +54,22 @@ impl Memory {
             .ok_or_else(|| self.out_of_bounds(address, 1))
     }
 
+    pub fn read_u16(&self, address: usize) -> Result<u16, BusError> {
+        Ok(u16::from_le_bytes([
+            self.read_u8(address)?,
+            self.read_u8(address + 1)?,
+        ]))
+    }
+
+    pub fn read_u32(&self, address: usize) -> Result<u32, BusError> {
+        Ok(u32::from_le_bytes([
+            self.read_u8(address)?,
+            self.read_u8(address + 1)?,
+            self.read_u8(address + 2)?,
+            self.read_u8(address + 3)?,
+        ]))
+    }
+
     pub fn write_u8(&mut self, address: usize, value: u8) -> Result<(), BusError> {
         let len = self.data.len();
         let slot = self
@@ -62,6 +84,20 @@ impl Memory {
         Ok(())
     }
 
+    pub fn write_u16(&mut self, address: usize, value: u16) -> Result<(), BusError> {
+        for (offset, byte) in value.to_le_bytes().into_iter().enumerate() {
+            self.write_u8(address + offset, byte)?;
+        }
+        Ok(())
+    }
+
+    pub fn write_u32(&mut self, address: usize, value: u32) -> Result<(), BusError> {
+        for (offset, byte) in value.to_le_bytes().into_iter().enumerate() {
+            self.write_u8(address + offset, byte)?;
+        }
+        Ok(())
+    }
+
     pub fn as_slice(&self) -> &[u8] {
         &self.data
     }
@@ -73,6 +109,126 @@ impl Memory {
             len: self.data.len(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusWidth {
+    Byte,
+    Word,
+    Dword,
+}
+
+impl BusWidth {
+    pub const fn bytes(self) -> u32 {
+        match self {
+            Self::Byte => 1,
+            Self::Word => 2,
+            Self::Dword => 4,
+        }
+    }
+
+    pub const fn byte_enable(self, address: u32) -> u8 {
+        match self {
+            Self::Byte => 1 << (address & 0x3),
+            Self::Word => 0b0011 << (address & 0x2),
+            Self::Dword => 0b1111,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusAccessKind {
+    InstructionPrefetch,
+    DataRead,
+    DataWrite,
+    PageWalkRead,
+    PageWalkWrite,
+    IoRead,
+    IoWrite,
+    InterruptAcknowledge,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusState {
+    T1,
+    T2,
+    Tw,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BusCycle {
+    pub kind: BusAccessKind,
+    pub address: u32,
+    pub width: BusWidth,
+    pub byte_enable: u8,
+    pub wait_states: u8,
+    pub states: Vec<BusState>,
+    pub clocks: u32,
+}
+
+impl BusCycle {
+    pub fn new(kind: BusAccessKind, address: u32, width: BusWidth, wait_states: u8) -> Self {
+        let mut states = vec![BusState::T1, BusState::T2];
+        states.extend(std::iter::repeat_n(BusState::Tw, usize::from(wait_states)));
+        Self {
+            kind,
+            address,
+            width,
+            byte_enable: width.byte_enable(address),
+            wait_states,
+            clocks: states.len() as u32,
+            states,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BusTrace {
+    cycles: Vec<BusCycle>,
+    elapsed_clocks: u64,
+}
+
+impl BusTrace {
+    pub fn push(&mut self, cycle: BusCycle) {
+        self.elapsed_clocks += u64::from(cycle.clocks);
+        self.cycles.push(cycle);
+    }
+
+    pub fn cycles(&self) -> &[BusCycle] {
+        &self.cycles
+    }
+
+    pub fn elapsed_clocks(&self) -> u64 {
+        self.elapsed_clocks
+    }
+
+    pub fn clear(&mut self) {
+        self.cycles.clear();
+        self.elapsed_clocks = 0;
+    }
+}
+
+pub trait CpuBus {
+    fn read_memory(
+        &mut self,
+        address: u32,
+        width: BusWidth,
+        kind: BusAccessKind,
+    ) -> Result<u32, BusError>;
+
+    fn write_memory(
+        &mut self,
+        address: u32,
+        width: BusWidth,
+        value: u32,
+        kind: BusAccessKind,
+    ) -> Result<(), BusError>;
+
+    fn read_io(&mut self, port: u16, width: BusWidth) -> Result<u32, BusError>;
+
+    fn write_io(&mut self, port: u16, width: BusWidth, value: u32) -> Result<(), BusError>;
+
+    fn interrupt_acknowledge(&mut self, vector: u8) -> Result<(), BusError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,7 +270,12 @@ mod tests {
     fn memory_reads_and_writes() {
         let mut memory = Memory::new(16).unwrap();
         memory.write_u8(3, 0x7f).unwrap();
+        memory.write_u16(4, 0x1234).unwrap();
+        memory.write_u32(8, 0x89abcdef).unwrap();
+
         assert_eq!(memory.read_u8(3).unwrap(), 0x7f);
+        assert_eq!(memory.read_u16(4).unwrap(), 0x1234);
+        assert_eq!(memory.read_u32(8).unwrap(), 0x89abcdef);
     }
 
     #[test]
@@ -124,6 +285,18 @@ mod tests {
             memory.write_u8(16, 0),
             Err(BusError::MemoryOutOfBounds { .. })
         ));
+    }
+
+    #[test]
+    fn bus_cycle_tracks_state_count_and_byte_enables() {
+        let cycle = BusCycle::new(BusAccessKind::DataRead, 0x1002, BusWidth::Word, 2);
+
+        assert_eq!(cycle.byte_enable, 0b1100);
+        assert_eq!(
+            cycle.states,
+            vec![BusState::T1, BusState::T2, BusState::Tw, BusState::Tw]
+        );
+        assert_eq!(cycle.clocks, 4);
     }
 
     #[test]
