@@ -847,7 +847,7 @@ impl Cpu386 {
                 let modrm = self.fetch_modrm(bus)?;
                 let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
                 let op = modrm.reg;
-                // ponytail: rotates (/0../3) arrive in Task 2; reject them cleanly for now.
+                // Rotates (/0../3) arrive in a later task; reject them cleanly for now.
                 if !matches!(op, 4..=7) {
                     return Err(CpuError::UnsupportedGroupOpcode {
                         opcode,
@@ -2028,7 +2028,7 @@ impl Cpu386 {
     }
 
     fn shift_rotate(&mut self, op: u8, value: u32, raw_count: u8, width: BusWidth) -> u32 {
-        // ponytail: the 386 masks the count to 5 bits, then performs that many
+        // The 386 masks the count to 5 bits, then performs that many
         // single-bit steps. A single-bit loop (<=31 iterations) matches silicon
         // step for step and avoids every closed-form edge case (a `>> bits` shift
         // at a full rotation, the RCL/RCR rotate-through-carry modulus). Switch to
@@ -2907,7 +2907,7 @@ mod tests {
     }
 
     #[test]
-    fn shl_word_by_one_sets_cf_and_of() {
+    fn shl_word_by_one_sets_of_and_clears_cf() {
         // shl ax,1 (0xd1 /4, modrm 0xe0). 0x4000 -> 0x8000, CF=0 (old bit15), OF=1, SF=1.
         let mut memory = vec![0; 16];
         memory[0..2].copy_from_slice(&[0xd1, 0xe0]);
@@ -2941,6 +2941,27 @@ mod tests {
         assert_eq!(cpu.read_reg16(Reg16::Ax), 0x4000);
         assert!(cpu.flag(FLAG_CF));
         assert!(cpu.flag(FLAG_OF));
+        assert!(!cpu.flag(FLAG_SF)); // result 0x4000 is positive
+    }
+
+    #[test]
+    fn shl_dword_by_one_via_operand_size_prefix() {
+        // shl eax,1 (0x66 0xd1 /4, modrm 0xe0). 0x4000_0000 -> 0x8000_0000, CF=0, OF=1, SF=1.
+        let mut memory = vec![0; 16];
+        memory[0..3].copy_from_slice(&[0x66, 0xd1, 0xe0]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_eax(0x4000_0000);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eax(), 0x8000_0000);
+        assert!(!cpu.flag(FLAG_CF));
+        assert!(cpu.flag(FLAG_OF));
+        assert!(cpu.flag(FLAG_SF));
+        assert_eq!(cpu.registers.eip, 3); // prefix + opcode + modrm
     }
 
     #[test]
