@@ -10,3 +10,7 @@ authors.workspace = true
 [dependencies]
 thiserror.workspace = true
 virtualdos-bus = { path = "../virtualdos-bus" }
+
+[dev-dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
