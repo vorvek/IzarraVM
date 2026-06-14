@@ -312,8 +312,8 @@ mod tests {
 
     #[test]
     fn placeholder_adapter_tracks_selected_card() {
-        let adapter = PlaceholderVideoAdapter::new(VideoCard::Et4000W32p);
-        assert_eq!(adapter.card(), VideoCard::Et4000W32p);
+        let adapter = PlaceholderVideoAdapter::new(VideoCard::Et4000Ax);
+        assert_eq!(adapter.card(), VideoCard::Et4000Ax);
         assert_eq!(adapter.framebuffer().indexed_pixels.len(), 64_000);
     }
 }

@@ -86,9 +86,9 @@ impl FromStr for CpuPreset {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VideoCard {
-    #[serde(rename = "et4000_w32p")]
+    #[serde(rename = "et4000_ax")]
     #[default]
-    Et4000W32p,
+    Et4000Ax,
     #[serde(rename = "s3_virge_dx")]
     S3VirgeDx,
     #[serde(rename = "voodoo2")]
@@ -98,7 +98,7 @@ pub enum VideoCard {
 impl VideoCard {
     pub const fn canonical_name(self) -> &'static str {
         match self {
-            Self::Et4000W32p => "et4000_w32p",
+            Self::Et4000Ax => "et4000_ax",
             Self::S3VirgeDx => "s3_virge_dx",
             Self::Voodoo2 => "voodoo2",
         }
@@ -116,7 +116,7 @@ impl FromStr for VideoCard {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match normalize(value).as_str() {
-            "et4000w32p" | "et4000_w32p" | "tsenget4000w32p" => Ok(Self::Et4000W32p),
+            "et4000ax" | "et4000_ax" | "tsenget4000ax" => Ok(Self::Et4000Ax),
             "s3virgedx" | "s3_virge_dx" | "virgedx" => Ok(Self::S3VirgeDx),
             "voodoo2" | "3dfxvoodoo2" => Ok(Self::Voodoo2),
             _ => Err(ConfigError::UnknownPreset {
@@ -243,7 +243,7 @@ impl Default for MachineConfig {
         Self {
             cpu: CpuPreset::I386Dx25,
             memory_mib: 16,
-            video: VideoCard::Et4000W32p,
+            video: VideoCard::Et4000Ax,
         }
     }
 }
@@ -430,14 +430,14 @@ mod tests {
                 [machine]
                 cpu = "i386dx_25"
                 memory_mib = 16
-                video = "et4000_w32p"
+                video = "et4000_ax"
             "#,
         )
         .unwrap();
 
         let config = AppConfig::from_toml_path(path).unwrap();
         assert_eq!(config.machine.cpu, CpuPreset::I386Dx25);
-        assert_eq!(config.machine.video, VideoCard::Et4000W32p);
+        assert_eq!(config.machine.video, VideoCard::Et4000Ax);
         assert_eq!(config.dos.c_drive, PathBuf::from("."));
     }
 }

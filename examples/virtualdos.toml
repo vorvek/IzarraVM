@@ -1,7 +1,7 @@
 [machine]
 cpu = "i386dx_25"
 memory_mib = 16
-video = "et4000_w32p"
+video = "et4000_ax"
 
 [dos]
 c_drive = "R:\\La Colecci\u00f3n by Neville\\dosroot\\"

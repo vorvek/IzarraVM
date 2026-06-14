@@ -407,7 +407,7 @@ mod tests {
     #[test]
     fn live_tick_advances_machine_and_renders_screen() {
         let mut machine = Machine::new(
-            MachineProfile::i386dx25(16, VideoCard::Et4000W32p),
+            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
             test_rom(),
         )
         .unwrap();

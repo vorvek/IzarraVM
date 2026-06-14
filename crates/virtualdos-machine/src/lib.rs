@@ -658,7 +658,7 @@ mod tests {
 
     fn test_machine() -> Machine {
         Machine::new(
-            MachineProfile::i386dx25(16, VideoCard::Et4000W32p),
+            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
             I386DX25_TEST_ROM,
         )
         .unwrap()
@@ -673,11 +673,8 @@ mod tests {
 
     #[test]
     fn rejects_non_64k_roms() {
-        let err = Machine::new(
-            MachineProfile::i386dx25(16, VideoCard::Et4000W32p),
-            [0u8; 8],
-        )
-        .unwrap_err();
+        let err =
+            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), [0u8; 8]).unwrap_err();
 
         assert!(matches!(err, MachineError::InvalidRomSize(8)));
     }
@@ -762,7 +759,7 @@ mod tests {
             0xf4, // hlt
         ]);
         let mut machine =
-            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000W32p), rom).unwrap();
+            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
 
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
 
@@ -776,7 +773,7 @@ mod tests {
     #[test]
     fn boot_image_starts_at_bios_loaded_boot_sector() {
         let mut machine = Machine::new_boot_image(
-            MachineProfile::i386dx25(16, VideoCard::Et4000W32p),
+            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
             virtualdos_firmware::X86_BOOT_TEST_IMAGE,
         )
         .unwrap();
@@ -793,7 +790,7 @@ mod tests {
     #[test]
     fn boot_image_emits_serial_records_and_result_block() {
         let mut machine = Machine::new_boot_image(
-            MachineProfile::i386dx25(16, VideoCard::Et4000W32p),
+            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
             virtualdos_firmware::X86_BOOT_TEST_IMAGE,
         )
         .unwrap();
