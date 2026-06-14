@@ -3127,6 +3127,7 @@ mod tests {
 
         assert_eq!(cpu.read_reg16(Reg16::Ax), 0x0001); // carry rotated into bit 0
         assert!(!cpu.flag(FLAG_CF)); // old msb (0) rotated out
+        assert!(!cpu.flag(FLAG_OF)); // result_msb(0) ^ cf(0)
     }
 
     #[test]
@@ -3145,6 +3146,7 @@ mod tests {
 
         assert_eq!(cpu.read_reg16(Reg16::Ax), 0x8000); // carry rotated into bit 15
         assert!(!cpu.flag(FLAG_CF)); // old bit0 (0) rotated out
+        assert!(cpu.flag(FLAG_OF)); // result_msb(1) ^ result_bit14(0)
     }
 
     #[test]
@@ -3164,5 +3166,24 @@ mod tests {
 
         assert_eq!(cpu.read_reg16(Reg16::Ax), 0x0001);
         assert!(cpu.flag(FLAG_ZF)); // unchanged by a rotate
+    }
+
+    #[test]
+    fn ror_byte_by_cl_multi_bit() {
+        // ror al,cl with cl=3 (0xd2 /1, modrm 0xc8). Exercises the byte width
+        // (msb 0x80, shift by bits-1=7) and a multi-bit count. al 0x01 ror 3 = 0x20.
+        let mut memory = vec![0; 16];
+        memory[0..2].copy_from_slice(&[0xd2, 0xc8]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x0001);
+        cpu.write_reg16(Reg16::Cx, 3);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x0020); // ah preserved, al rotated
+        assert!(!cpu.flag(FLAG_CF)); // last bit out is 0
     }
 }
