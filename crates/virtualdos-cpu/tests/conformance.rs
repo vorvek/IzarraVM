@@ -6,6 +6,7 @@ use virtualdos_cpu::{Cpu386, CpuError, SegmentIndex, SegmentRegister};
 // (see undefined_flags); reserved and unmodeled high bits are never compared.
 const MODELED_FLAGS: u32 = 0x0000_0fd5;
 const FLAG_AF: u32 = 0x0000_0010;
+const FLAG_OF: u32 = 0x0000_0800;
 
 const MEM_SIZE: usize = 0x0100_0000; // 16 MiB covers the 24-bit address bus used by the suite
 
@@ -179,10 +180,12 @@ fn apply_state(cpu: &mut Cpu386, bus: &mut FlatBus, state: &TestState) {
 }
 
 /// Flags that the 386 leaves undefined for this instruction, so the harness
-/// must not compare them. For this slice that is AF on the logic ops
-/// (AND/OR/XOR and TEST); arithmetic ops define every modeled flag.
-/// EXTEND HERE when adding opcodes with other undefined flags (for example
-/// OF after a multi-bit shift, or the flags MUL/DIV leave undefined).
+/// must not compare them. Logic ops (AND/OR/XOR/TEST) leave AF undefined.
+/// Shift/rotate ops leave AF undefined in all forms; OF is only defined when
+/// the count is exactly 1, which is only guaranteed by the 0xD0/0xD1 forms.
+/// The 0xC0/0xC1 forms encode the count as an imm8 that this helper does not
+/// decode, and the 0xD2/0xD3 forms take the count from CL at runtime, so OF
+/// is treated as undefined for those. Arithmetic ops define every modeled flag.
 /// The prefix-skip set below must mirror the CPU's `read_prefixes` exactly,
 /// or this helper and the CPU would disagree on which byte is the opcode.
 fn undefined_flags(bytes: &[u8]) -> u32 {
@@ -206,7 +209,17 @@ fn undefined_flags(bytes: &[u8]) -> u32 {
         0xf6 | 0xf7 => reg == Some(0),
         _ => false,
     };
-    if is_logic { FLAG_AF } else { 0 }
+    // Shift/rotate group: OF is defined only for a 1-bit count. 0xD0/0xD1 always
+    // shift by 1 (OF defined); 0xC0/0xC1 (imm8 count) and 0xD2/0xD3 (CL count)
+    // carry a count this helper does not decode, so OF is undefined there. AF is
+    // undefined for shifts and preserved by rotates, so masking it is correct for
+    // shifts and harmless for rotates. SF/ZF/PF stay compared for every count.
+    match opcode {
+        0xc0 | 0xc1 | 0xd2 | 0xd3 => FLAG_AF | FLAG_OF,
+        0xd0 | 0xd1 => FLAG_AF,
+        _ if is_logic => FLAG_AF,
+        _ => 0,
+    }
 }
 
 fn diffs(cpu: &Cpu386, bus: &FlatBus, expected: &TestState, undefined: u32) -> Vec<String> {
@@ -363,6 +376,17 @@ fn undefined_flags_marks_logic_ops() {
     assert_eq!(undefined_flags(&[0xf7, 0xc3, 0x01, 0x00]), AF); // TEST group /0
     assert_eq!(undefined_flags(&[0x00, 0xc0]), 0); // ADD -> all defined
     assert_eq!(undefined_flags(&[0x81, 0xc3, 0x01, 0x00]), 0); // ADD group /0
+}
+
+#[test]
+fn undefined_flags_marks_shifts() {
+    const AF: u32 = 0x0000_0010;
+    const OF: u32 = 0x0000_0800;
+    assert_eq!(undefined_flags(&[0xd1, 0xe0]), AF); // shl ax,1: OF defined, AF undefined
+    assert_eq!(undefined_flags(&[0xc1, 0xe0, 0x04]), AF | OF); // shl ax,4: imm count
+    assert_eq!(undefined_flags(&[0xd3, 0xe0]), AF | OF); // shl ax,cl: CL count
+    assert_eq!(undefined_flags(&[0x66, 0xd1, 0xe0]), AF); // 0x66 skipped -> d1
+    assert_eq!(undefined_flags(&[0xc0, 0xc0, 0x01]), AF | OF); // rol al,1 via imm
 }
 
 #[test]
