@@ -58,7 +58,7 @@ CPU levels:
 4) Pentium MMX 233Mhz
 
 GPU levels:
-1) Tseng Labs ET4000/W32p
+1) Tseng Labs ET4000AX
 2) S3 Trio
 3) Voodoo 2 single/SLI
 
