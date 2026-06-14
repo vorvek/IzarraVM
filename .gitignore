@@ -3,5 +3,6 @@
 /virtualdos-output/
 /compatibility-output/
 /corpus-output/
+/dev_docs/
 *.log
 *.tmp
