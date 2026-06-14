@@ -19,13 +19,13 @@
     "name": "clc",
     "bytes": [248],
     "initial": {
-      "cs": { "sel": 61440, "base": 983040, "limit": 65535 },
+      "cs": { "sel": 8, "base": 983040, "limit": 65535 },
       "eip": 256,
       "eflags": 3,
       "ram": [[983296, 248]]
     },
     "final": {
-      "cs": { "sel": 61440, "base": 983040, "limit": 65535 },
+      "cs": { "sel": 8, "base": 983040, "limit": 65535 },
       "eip": 257,
       "eflags": 2,
       "ram": [[983296, 248]]

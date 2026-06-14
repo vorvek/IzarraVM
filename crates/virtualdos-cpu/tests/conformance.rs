@@ -237,6 +237,8 @@ fn diffs(cpu: &Cpu386, bus: &FlatBus, expected: &TestState) -> Vec<String> {
         }
     }
 
+    // v1 compares segment selectors only. Cached base/limit/access are not
+    // checked yet; revisit when opcode coverage reaches protected mode.
     let segments = [
         ("cs", &expected.cs, SegmentIndex::Cs),
         ("ds", &expected.ds, SegmentIndex::Ds),
@@ -269,23 +271,23 @@ fn diffs(cpu: &Cpu386, bus: &FlatBus, expected: &TestState) -> Vec<String> {
     out
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 enum Outcome {
     Pass,
     Fail(Vec<String>),
     Unimplemented,
-    Skipped(&'static str),
+    Skipped,
     Errored(String),
 }
 
 fn run_test(test: &CpuTest) -> Outcome {
     if test.exception.is_some() {
-        return Outcome::Skipped("exception");
+        return Outcome::Skipped;
     }
     if let Some(&first) = test.bytes.first()
         && matches!(first, 0xe4..=0xe7 | 0xec..=0xef)
     {
-        return Outcome::Skipped("port io");
+        return Outcome::Skipped;
     }
 
     let mut cpu = Cpu386::default();
@@ -373,12 +375,14 @@ fn conformance_suite_report() {
         (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     let mut failing_files: Vec<String> = Vec::new();
     let mut first_failures: Vec<String> = Vec::new();
+    let mut parse_errors = 0u64;
 
     for path in &paths {
         let text = std::fs::read_to_string(path).expect("vector file should be readable");
         let tests: Vec<CpuTest> = match serde_json::from_str(&text) {
             Ok(tests) => tests,
             Err(error) => {
+                parse_errors += 1;
                 eprintln!("parse {}: {error}", path.display());
                 continue;
             }
@@ -405,7 +409,7 @@ fn conformance_suite_report() {
                     }
                 }
                 Outcome::Unimplemented => unimpl += 1,
-                Outcome::Skipped(_) => skip += 1,
+                Outcome::Skipped => skip += 1,
                 Outcome::Errored(message) => {
                     errored += 1;
                     if first_failures.len() < 20 {
@@ -420,7 +424,7 @@ fn conformance_suite_report() {
     }
 
     println!(
-        "files={} total={total} pass={pass} fail={fail} unimplemented={unimpl} skipped={skip} errored={errored}",
+        "files={} parse_errors={parse_errors} total={total} pass={pass} fail={fail} unimplemented={unimpl} skipped={skip} errored={errored}",
         paths.len()
     );
     for line in &failing_files {
@@ -431,4 +435,8 @@ fn conformance_suite_report() {
     }
 
     assert!(total > 0, "no vectors were parsed from {dir}");
+    assert_eq!(
+        parse_errors, 0,
+        "{parse_errors} vector file(s) failed to parse; the report would understate coverage"
+    );
 }
