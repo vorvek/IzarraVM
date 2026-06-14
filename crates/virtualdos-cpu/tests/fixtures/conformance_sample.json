@@ -30,5 +30,23 @@
       "eflags": 2,
       "ram": [[983296, 248]]
     }
+  },
+  {
+    "name": "add al imm sets af",
+    "bytes": [4, 1],
+    "initial": {
+      "cs": 0,
+      "eip": 256,
+      "eax": 15,
+      "eflags": 2,
+      "ram": [[256, 4], [257, 1]]
+    },
+    "final": {
+      "cs": 0,
+      "eip": 258,
+      "eax": 16,
+      "eflags": 18,
+      "ram": [[256, 4], [257, 1]]
+    }
   }
 ]

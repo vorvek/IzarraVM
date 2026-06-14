@@ -2,9 +2,10 @@ use serde::Deserialize;
 use virtualdos_bus::{BusAccessKind, BusError, BusWidth, CpuBus};
 use virtualdos_cpu::{Cpu386, CpuError, SegmentIndex, SegmentRegister};
 
-// Flags the CPU core actually models. AF (bit 4) is intentionally excluded
-// until Plan 2 adds it; reserved bits are never compared.
-const MODELED_FLAGS: u32 = 0x0000_0fc5;
+// Flags the CPU core models. AF is now modeled but is undefined for logic ops
+// (see undefined_flags); reserved and unmodeled high bits are never compared.
+const MODELED_FLAGS: u32 = 0x0000_0fd5;
+const FLAG_AF: u32 = 0x0000_0010;
 
 const MEM_SIZE: usize = 0x0100_0000; // 16 MiB covers the 24-bit address bus used by the suite
 
@@ -202,7 +203,34 @@ fn apply_state(cpu: &mut Cpu386, bus: &mut FlatBus, state: &TestState) {
     }
 }
 
-fn diffs(cpu: &Cpu386, bus: &FlatBus, expected: &TestState) -> Vec<String> {
+/// Flags that the 386 leaves undefined for this instruction, so the harness
+/// must not compare them. For this slice that is AF on the logic ops
+/// (AND/OR/XOR and TEST); arithmetic ops define every modeled flag.
+fn undefined_flags(bytes: &[u8]) -> u32 {
+    let mut index = 0;
+    while index < bytes.len()
+        && matches!(
+            bytes[index],
+            0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf0 | 0xf2 | 0xf3
+        )
+    {
+        index += 1;
+    }
+    let Some(&opcode) = bytes.get(index) else {
+        return 0;
+    };
+    let reg = bytes.get(index + 1).map(|modrm| (modrm >> 3) & 0x07);
+    let is_logic = match opcode {
+        op if op < 0x40 && (op & 0x07) < 6 => matches!((op >> 3) & 0x07, 1 | 4 | 6),
+        0x84 | 0x85 | 0xa8 | 0xa9 => true,
+        0x80 | 0x81 | 0x83 => matches!(reg, Some(1 | 4 | 6)),
+        0xf6 | 0xf7 => reg == Some(0),
+        _ => false,
+    };
+    if is_logic { FLAG_AF } else { 0 }
+}
+
+fn diffs(cpu: &Cpu386, bus: &FlatBus, expected: &TestState, undefined: u32) -> Vec<String> {
     let mut out = Vec::new();
     {
         let mut check = |name: &str, want: Option<u32>, got: u32| {
@@ -228,11 +256,12 @@ fn diffs(cpu: &Cpu386, bus: &FlatBus, expected: &TestState) -> Vec<String> {
 
     if let Some(want) = expected.eflags {
         let got = cpu.registers.eflags;
-        if (want ^ got) & MODELED_FLAGS != 0 {
+        let defined = MODELED_FLAGS & !undefined;
+        if (want ^ got) & defined != 0 {
             out.push(format!(
-                "eflags(modeled): want {:#06x}, got {:#06x}",
-                want & MODELED_FLAGS,
-                got & MODELED_FLAGS
+                "eflags(defined): want {:#06x}, got {:#06x}",
+                want & defined,
+                got & defined
             ));
         }
     }
@@ -296,7 +325,8 @@ fn run_test(test: &CpuTest) -> Outcome {
 
     match cpu.cycle(&mut bus) {
         Ok(_) => {
-            let differences = diffs(&cpu, &bus, &test.final_state);
+            let undefined = undefined_flags(&test.bytes);
+            let differences = diffs(&cpu, &bus, &test.final_state, undefined);
             if differences.is_empty() {
                 Outcome::Pass
             } else {
@@ -315,7 +345,7 @@ fn parses_synthetic_fixture() {
     let text = include_str!("fixtures/conformance_sample.json");
     let tests = load_tests(text);
 
-    assert_eq!(tests.len(), 2);
+    assert_eq!(tests.len(), 3);
     assert_eq!(tests[0].name, "nop");
     assert_eq!(tests[0].bytes, vec![144]);
     assert_eq!(tests[0].initial.cs.as_ref().unwrap().selector(), 0xf000);
@@ -327,6 +357,20 @@ fn parses_synthetic_fixture() {
         Seg::Descriptor { base, .. } => assert_eq!(*base, Some(0x000f_0000)),
         Seg::Selector(_) => panic!("clc fixture should use the descriptor form"),
     }
+
+    assert_eq!(tests[2].name, "add al imm sets af");
+    assert_eq!(tests[2].final_state.eflags, Some(18));
+}
+
+#[test]
+fn undefined_flags_marks_logic_ops() {
+    const AF: u32 = 0x0000_0010;
+    assert_eq!(undefined_flags(&[0x20, 0xc0]), AF); // AND
+    assert_eq!(undefined_flags(&[0x84, 0xc0]), AF); // TEST
+    assert_eq!(undefined_flags(&[0x81, 0xe3, 0x01, 0x00]), AF); // AND group /4
+    assert_eq!(undefined_flags(&[0xf7, 0xc3, 0x01, 0x00]), AF); // TEST group /0
+    assert_eq!(undefined_flags(&[0x00, 0xc0]), 0); // ADD -> all defined
+    assert_eq!(undefined_flags(&[0x81, 0xc3, 0x01, 0x00]), 0); // ADD group /0
 }
 
 #[test]

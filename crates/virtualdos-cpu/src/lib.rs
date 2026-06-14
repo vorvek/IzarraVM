@@ -781,7 +781,8 @@ impl Cpu386 {
                 let modrm = self.fetch_modrm(bus)?;
                 match modrm.reg {
                     0 => {
-                        let value = self.read_rm_sized(bus, prefixes, address_size, operand_size, modrm)?;
+                        let value =
+                            self.read_rm_sized(bus, prefixes, address_size, operand_size, modrm)?;
                         let imm = self.fetch_immediate(bus, operand_size)?;
                         self.alu(4, value, imm, operand_size.bus_width());
                         Ok(clocks(2))
@@ -1350,9 +1351,13 @@ impl Cpu386 {
     ) -> ExecResult<u32> {
         match operand {
             RmOperand::Register(index) => Ok(self.read_gpr_sized(index, size)),
-            RmOperand::Memory(memory) => {
-                self.read_memory_sized(bus, memory.segment, memory.offset, size, BusAccessKind::DataRead)
-            }
+            RmOperand::Memory(memory) => self.read_memory_sized(
+                bus,
+                memory.segment,
+                memory.offset,
+                size,
+                BusAccessKind::DataRead,
+            ),
         }
     }
 
