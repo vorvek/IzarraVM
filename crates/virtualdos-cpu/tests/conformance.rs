@@ -181,8 +181,9 @@ fn apply_state(cpu: &mut Cpu386, bus: &mut FlatBus, state: &TestState) {
 
 /// Flags that the 386 leaves undefined for this instruction, so the harness
 /// must not compare them. Logic ops (AND/OR/XOR/TEST) leave AF undefined.
-/// Shift/rotate ops leave AF undefined in all forms; OF is only defined when
-/// the count is exactly 1, which is only guaranteed by the 0xD0/0xD1 forms.
+/// Shift ops leave AF undefined; rotate ops preserve AF, so masking AF is safe
+/// for both. OF is only defined when the count is exactly 1, which is only
+/// guaranteed by the 0xD0/0xD1 forms.
 /// The 0xC0/0xC1 forms encode the count as an imm8 that this helper does not
 /// decode, and the 0xD2/0xD3 forms take the count from CL at runtime, so OF
 /// is treated as undefined for those. Arithmetic ops define every modeled flag.
@@ -382,8 +383,10 @@ fn undefined_flags_marks_logic_ops() {
 fn undefined_flags_marks_shifts() {
     const AF: u32 = 0x0000_0010;
     const OF: u32 = 0x0000_0800;
+    assert_eq!(undefined_flags(&[0xd0, 0xe0]), AF); // shl al,1: OF defined, AF undefined
     assert_eq!(undefined_flags(&[0xd1, 0xe0]), AF); // shl ax,1: OF defined, AF undefined
     assert_eq!(undefined_flags(&[0xc1, 0xe0, 0x04]), AF | OF); // shl ax,4: imm count
+    assert_eq!(undefined_flags(&[0xd2, 0xe0]), AF | OF); // shl al,cl: CL count
     assert_eq!(undefined_flags(&[0xd3, 0xe0]), AF | OF); // shl ax,cl: CL count
     assert_eq!(undefined_flags(&[0x66, 0xd1, 0xe0]), AF); // 0x66 skipped -> d1
     assert_eq!(undefined_flags(&[0xc0, 0xc0, 0x01]), AF | OF); // rol al,1 via imm
