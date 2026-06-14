@@ -409,13 +409,8 @@ impl Cpu386 {
         let address_size = self.address_size(prefixes);
 
         match opcode {
-            0x05 => {
-                let imm = self.fetch_immediate(bus, operand_size)?;
-                let value = self.read_gpr_sized(0, operand_size);
-                let result = value.wrapping_add(imm) & operand_size.mask();
-                self.write_gpr_sized(0, operand_size, result);
-                self.set_add_flags(value, imm, result, operand_size);
-                Ok(clocks(2))
+            opcode if opcode < 0x40 && (opcode & 0x07) < 6 => {
+                self.execute_alu_block(bus, opcode, prefixes, address_size, operand_size)
             }
             0x06 => {
                 self.push(
@@ -429,13 +424,6 @@ impl Cpu386 {
                 let value = self.pop(bus, OperandSize::Word)? as u16;
                 self.load_segment(bus, SegmentIndex::Es, value)?;
                 Ok(clocks(7))
-            }
-            0x0d => {
-                let imm = self.fetch_immediate(bus, operand_size)?;
-                let result = self.read_gpr_sized(0, operand_size) | imm;
-                self.write_gpr_sized(0, operand_size, result);
-                self.set_logic_flags(result, operand_size);
-                Ok(clocks(2))
             }
             0x0e => {
                 self.push(
@@ -900,6 +888,81 @@ impl Cpu386 {
         }
     }
 
+    fn execute_alu_block<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        opcode: u8,
+        prefixes: Prefixes,
+        address_size: AddressSize,
+        operand_size: OperandSize,
+    ) -> ExecResult<CycleOutcome> {
+        let op = (opcode >> 3) & 0x07;
+        let form = opcode & 0x07;
+        let write_back = op != 7; // CMP computes flags only
+
+        match form {
+            0 => {
+                let modrm = self.fetch_modrm(bus)?;
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
+                let a = u32::from(self.read_operand_u8(bus, operand)?);
+                let b = u32::from(self.read_gpr8(modrm.reg));
+                let result = self.alu(op, a, b, BusWidth::Byte) as u8;
+                if write_back {
+                    self.write_operand_u8(bus, operand, result)?;
+                }
+            }
+            1 => {
+                let modrm = self.fetch_modrm(bus)?;
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
+                let a = self.read_operand_sized(bus, operand, operand_size)?;
+                let b = self.read_gpr_sized(modrm.reg, operand_size);
+                let result = self.alu(op, a, b, operand_size.bus_width());
+                if write_back {
+                    self.write_operand_sized(bus, operand, operand_size, result)?;
+                }
+            }
+            2 => {
+                let modrm = self.fetch_modrm(bus)?;
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
+                let a = u32::from(self.read_gpr8(modrm.reg));
+                let b = u32::from(self.read_operand_u8(bus, operand)?);
+                let result = self.alu(op, a, b, BusWidth::Byte) as u8;
+                if write_back {
+                    self.write_gpr8(modrm.reg, result);
+                }
+            }
+            3 => {
+                let modrm = self.fetch_modrm(bus)?;
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
+                let a = self.read_gpr_sized(modrm.reg, operand_size);
+                let b = self.read_operand_sized(bus, operand, operand_size)?;
+                let result = self.alu(op, a, b, operand_size.bus_width());
+                if write_back {
+                    self.write_gpr_sized(modrm.reg, operand_size, result);
+                }
+            }
+            4 => {
+                let imm = u32::from(self.fetch_u8(bus)?);
+                let a = u32::from(self.read_gpr8(0));
+                let result = self.alu(op, a, imm, BusWidth::Byte) as u8;
+                if write_back {
+                    self.write_gpr8(0, result);
+                }
+            }
+            5 => {
+                let imm = self.fetch_immediate(bus, operand_size)?;
+                let a = self.read_gpr_sized(0, operand_size);
+                let result = self.alu(op, a, imm, operand_size.bus_width());
+                if write_back {
+                    self.write_gpr_sized(0, operand_size, result);
+                }
+            }
+            _ => unreachable!("alu form {form}"),
+        }
+
+        Ok(clocks(2))
+    }
+
     fn execute_group_80<B: CpuBus>(
         &mut self,
         bus: &mut B,
@@ -1264,6 +1327,73 @@ impl Cpu386 {
             )?,
         }
         Ok(())
+    }
+
+    fn read_operand_u8<B: CpuBus>(&mut self, bus: &mut B, operand: RmOperand) -> ExecResult<u8> {
+        match operand {
+            RmOperand::Register(index) => Ok(self.read_gpr8(index)),
+            RmOperand::Memory(memory) => {
+                self.read_memory_u8(bus, memory.segment, memory.offset, BusAccessKind::DataRead)
+            }
+        }
+    }
+
+    fn write_operand_u8<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        operand: RmOperand,
+        value: u8,
+    ) -> ExecResult<()> {
+        match operand {
+            RmOperand::Register(index) => {
+                self.write_gpr8(index, value);
+                Ok(())
+            }
+            RmOperand::Memory(memory) => self.write_memory_u8(
+                bus,
+                memory.segment,
+                memory.offset,
+                value,
+                BusAccessKind::DataWrite,
+            ),
+        }
+    }
+
+    fn read_operand_sized<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        operand: RmOperand,
+        size: OperandSize,
+    ) -> ExecResult<u32> {
+        match operand {
+            RmOperand::Register(index) => Ok(self.read_gpr_sized(index, size)),
+            RmOperand::Memory(memory) => {
+                self.read_memory_sized(bus, memory.segment, memory.offset, size, BusAccessKind::DataRead)
+            }
+        }
+    }
+
+    fn write_operand_sized<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        operand: RmOperand,
+        size: OperandSize,
+        value: u32,
+    ) -> ExecResult<()> {
+        match operand {
+            RmOperand::Register(index) => {
+                self.write_gpr_sized(index, size, value);
+                Ok(())
+            }
+            RmOperand::Memory(memory) => self.write_memory_sized(
+                bus,
+                memory.segment,
+                memory.offset,
+                size,
+                value,
+                BusAccessKind::DataWrite,
+            ),
+        }
     }
 
     fn read_memory_u8<B: CpuBus>(
@@ -2171,6 +2301,62 @@ mod tests {
                 .iter()
                 .any(|cycle| { cycle.kind == BusAccessKind::IoWrite && cycle.address == 0x03f8 })
         );
+    }
+
+    #[test]
+    fn add_rm_reg_byte_writes_memory_with_displacement() {
+        // add [bx+0x10], al   (opcode 0x00, modrm 0x47, disp 0x10)
+        let mut memory = vec![0; 1024];
+        memory[0..4].copy_from_slice(&[0x00, 0x47, 0x10, 0xf4]);
+        memory[0x210] = 0x01; // [bx+0x10] initial
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Bx, 0x200);
+        cpu.write_gpr8(0, 0x05); // al
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(bus.memory[0x210], 0x06);
+        assert_eq!(cpu.registers.eip, 3); // opcode + modrm + disp8, no double-fetch
+    }
+
+    #[test]
+    fn sub_reg_rm_sets_flags() {
+        // sub al, bl  (opcode 0x2a, modrm 0xc3)
+        let mut memory = vec![0; 16];
+        memory[0..2].copy_from_slice(&[0x2a, 0xc3]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_gpr8(0, 0x05); // al
+        cpu.write_gpr8(3, 0x05); // bl
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_gpr8(0), 0x00);
+        assert!(cpu.flag(FLAG_ZF));
+        assert!(!cpu.flag(FLAG_CF));
+    }
+
+    #[test]
+    fn cmp_does_not_write_back() {
+        // cmp al, 0x10 is form via 0x3c (AL, imm8)
+        let mut memory = vec![0; 16];
+        memory[0..2].copy_from_slice(&[0x3c, 0x10]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_gpr8(0, 0x10);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_gpr8(0), 0x10); // unchanged
+        assert!(cpu.flag(FLAG_ZF));
     }
 
     #[test]
