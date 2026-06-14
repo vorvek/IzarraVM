@@ -2722,4 +2722,107 @@ mod tests {
                 .any(|cycle| cycle.kind == BusAccessKind::DataWrite)
         );
     }
+
+    #[test]
+    fn incdec_preserve_carry_both_directions() {
+        // DEC with CF set leaves CF set.
+        let mut memory = vec![0; 16];
+        memory[0] = 0x48; // dec ax
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.set_flag(FLAG_CF, true);
+        cpu.write_reg16(Reg16::Ax, 0x0005);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x0004);
+        assert!(cpu.flag(FLAG_CF));
+
+        // INC with CF clear leaves CF clear.
+        let mut memory = vec![0; 16];
+        memory[0] = 0x40; // inc ax
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.set_flag(FLAG_CF, false);
+        cpu.write_reg16(Reg16::Ax, 0x0005);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x0006);
+        assert!(!cpu.flag(FLAG_CF));
+    }
+
+    #[test]
+    fn dec_word_overflow_sets_of() {
+        // dec ax (0x48) on 0x8000 -> 0x7fff: OF set, SF clear.
+        let mut memory = vec![0; 16];
+        memory[0] = 0x48;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x8000);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x7fff);
+        assert!(cpu.flag(FLAG_OF));
+        assert!(!cpu.flag(FLAG_SF));
+    }
+
+    #[test]
+    fn call_near_indirect_memory_displacement_return_addr() {
+        // call [bx+0x10] (0xff /2, modrm 0x57, disp 0x10): 3-byte instruction,
+        // return address must be computed after the displacement fetch.
+        let mut memory = vec![0; 1024];
+        memory[0..3].copy_from_slice(&[0xff, 0x57, 0x10]);
+        memory[0x210..0x212].copy_from_slice(&0x0080u16.to_le_bytes());
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Sp, 0x100);
+        cpu.write_reg16(Reg16::Bx, 0x200);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.eip, 0x0080);
+        assert_eq!(
+            u16::from_le_bytes([bus.memory[0xfe], bus.memory[0xff]]),
+            0x0003
+        );
+    }
+
+    #[test]
+    fn push_sp_uses_pre_decrement_value() {
+        // push sp (0xff /6, modrm 0xf4): the 386 pushes SP before the decrement.
+        let mut memory = vec![0; 256];
+        memory[0..2].copy_from_slice(&[0xff, 0xf4]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Sp, 0x100);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.read_reg16(Reg16::Sp), 0x00fe);
+        assert_eq!(
+            u16::from_le_bytes([bus.memory[0xfe], bus.memory[0xff]]),
+            0x0100
+        );
+    }
+
+    #[test]
+    fn inc_dword_uses_32bit_width() {
+        // 0x66 0x40 = inc eax (32-bit operand): 0x0000ffff -> 0x00010000.
+        let mut memory = vec![0; 16];
+        memory[0..2].copy_from_slice(&[0x66, 0x40]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_eax(0x0000_ffff);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.eax(), 0x0001_0000);
+        assert!(!cpu.flag(FLAG_ZF));
+        assert!(!cpu.flag(FLAG_SF));
+    }
 }
