@@ -1007,67 +1007,6 @@ impl Cpu386 {
         Ok(clocks(2))
     }
 
-    fn execute_group_80<B: CpuBus>(
-        &mut self,
-        bus: &mut B,
-        prefixes: Prefixes,
-        address_size: AddressSize,
-        modrm: ModRm,
-        imm: u32,
-    ) -> ExecResult<()> {
-        let value = u32::from(self.read_rm_u8(bus, prefixes, address_size, modrm)?);
-        match modrm.reg {
-            7 => {
-                let result = value.wrapping_sub(imm) & 0xff;
-                self.set_sub_flags(value, imm, result, OperandSize::Word);
-            }
-            _ => {
-                return Err(CpuError::UnsupportedGroupOpcode {
-                    opcode: 0x80,
-                    extension: modrm.reg,
-                }
-                .into());
-            }
-        }
-        Ok(())
-    }
-
-    fn execute_group_81_83<B: CpuBus>(
-        &mut self,
-        bus: &mut B,
-        prefixes: Prefixes,
-        address_size: AddressSize,
-        operand_size: OperandSize,
-        modrm: ModRm,
-        imm: u32,
-    ) -> ExecResult<()> {
-        let value = self.read_rm_sized(bus, prefixes, address_size, operand_size, modrm)?;
-        match modrm.reg {
-            0 => {
-                let result = value.wrapping_add(imm) & operand_size.mask();
-                self.write_rm_sized(bus, prefixes, address_size, operand_size, modrm, result)?;
-                self.set_add_flags(value, imm, result, operand_size);
-            }
-            1 => {
-                let result = (value | imm) & operand_size.mask();
-                self.write_rm_sized(bus, prefixes, address_size, operand_size, modrm, result)?;
-                self.set_logic_flags(result, operand_size);
-            }
-            7 => {
-                let result = value.wrapping_sub(imm) & operand_size.mask();
-                self.set_sub_flags(value, imm, result, operand_size);
-            }
-            _ => {
-                return Err(CpuError::UnsupportedGroupOpcode {
-                    opcode: 0x81,
-                    extension: modrm.reg,
-                }
-                .into());
-            }
-        }
-        Ok(())
-    }
-
     fn read_prefixes<B: CpuBus>(&mut self, bus: &mut B) -> ExecResult<Prefixes> {
         let mut prefixes = Prefixes::default();
         loop {
@@ -1966,44 +1905,6 @@ impl Cpu386 {
         self.registers.eflags |= 0x2;
     }
 
-    fn set_logic_flags(&mut self, result: u32, operand_size: OperandSize) {
-        let result = result & operand_size.mask();
-        self.set_flag(FLAG_CF | FLAG_OF, false);
-        self.set_flag(FLAG_ZF, result == 0);
-        self.set_flag(FLAG_SF, sign_bit(result, operand_size));
-        self.set_flag(FLAG_PF, parity(result as u8));
-    }
-
-    fn set_add_flags(&mut self, left: u32, right: u32, result: u32, operand_size: OperandSize) {
-        let mask = operand_size.mask();
-        let sign_mask = match operand_size {
-            OperandSize::Word => 0x8000,
-            OperandSize::Dword => 0x8000_0000,
-        };
-        let full = u64::from(left & mask) + u64::from(right & mask);
-        self.set_flag(FLAG_CF, full > u64::from(mask));
-        self.set_flag(
-            FLAG_OF,
-            ((left ^ result) & (right ^ result) & sign_mask) != 0,
-        );
-        self.set_flag(FLAG_ZF, result & mask == 0);
-        self.set_flag(FLAG_SF, result & sign_mask != 0);
-        self.set_flag(FLAG_PF, parity(result as u8));
-    }
-
-    fn set_sub_flags(&mut self, left: u32, right: u32, result: u32, operand_size: OperandSize) {
-        let mask = operand_size.mask();
-        let sign_mask = match operand_size {
-            OperandSize::Word => 0x8000,
-            OperandSize::Dword => 0x8000_0000,
-        };
-        self.set_flag(FLAG_CF, (left & mask) < (right & mask));
-        self.set_flag(FLAG_OF, ((left ^ right) & (left ^ result) & sign_mask) != 0);
-        self.set_flag(FLAG_ZF, result & mask == 0);
-        self.set_flag(FLAG_SF, result & sign_mask != 0);
-        self.set_flag(FLAG_PF, parity(result as u8));
-    }
-
     fn alu(&mut self, op: u8, a: u32, b: u32, width: BusWidth) -> u32 {
         let mask = width_mask(width);
         let cf_in = u32::from(self.flag(FLAG_CF));
@@ -2105,13 +2006,6 @@ fn clocks(core_clocks: u32) -> CycleOutcome {
 
 fn sign_extend_u8(value: u8) -> u32 {
     value as i8 as i32 as u32
-}
-
-fn sign_bit(value: u32, operand_size: OperandSize) -> bool {
-    match operand_size {
-        OperandSize::Word => value & 0x8000 != 0,
-        OperandSize::Dword => value & 0x8000_0000 != 0,
-    }
 }
 
 const fn width_mask(width: BusWidth) -> u32 {
