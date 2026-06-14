@@ -228,7 +228,7 @@ pub trait CpuBus {
 
     fn write_io(&mut self, port: u16, width: BusWidth, value: u32) -> Result<(), BusError>;
 
-    fn interrupt_acknowledge(&mut self, vector: u8) -> Result<(), BusError>;
+    fn interrupt_acknowledge(&mut self, vector: u8, ax: u16) -> Result<(), BusError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

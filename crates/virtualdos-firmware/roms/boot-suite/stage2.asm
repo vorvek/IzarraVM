@@ -2,6 +2,7 @@ bits 16
 org 0x8000
 
 %define VGA_TEXT 0xb800
+%define VGA_MODE13H 0xa000
 %define RESULT_BLOCK 0x9000
 %define COM1_DATA 0x03f8
 %define COM1_IER 0x03f9
@@ -50,6 +51,8 @@ stage2_start:
     mov si, line_memory
     mov ah, 0x0b
     call puts_screen
+
+    call test_mode13h
 
     hlt
     jmp $
@@ -108,6 +111,22 @@ puts_screen:
     stosw
     jmp puts_screen
 .done:
+    ret
+
+test_mode13h:
+    mov ax, 0x0013
+    int 0x10
+    mov ax, VGA_MODE13H
+    mov es, ax
+    mov di, 0
+    mov al, 0x2a
+    stosb
+    mov di, 319
+    mov al, 0x13
+    stosb
+    mov di, 63680
+    mov al, 0x7f
+    stosb
     ret
 
 copy_result_block:

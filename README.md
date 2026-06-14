@@ -48,3 +48,25 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo build --workspace
 ```
+
+
+## Objectives
+CPU levels: 
+1) i386 @ 25MHz
+2) 486DX2 @ 66MHz
+3) Pentium 133MHz
+4) Pentium MMX 233Mhz
+
+GPU levels:
+1) Tseng Labs ET4000/W32p
+2) S3 Trio
+3) Voodoo 2 single/SLI
+
+RAM:
+Manually selectable from 1MB to 128MB
+
+Sound:
+1) PC Speaker
+2) Adlib / OPL2
+3) Sound Blaster 16 / OPL3
+4) MIDI

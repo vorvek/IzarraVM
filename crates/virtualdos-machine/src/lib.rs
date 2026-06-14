@@ -2,7 +2,10 @@ use thiserror::Error;
 use virtualdos_bus::{BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CpuBus, Memory};
 use virtualdos_core::{CpuPreset, HardwareProfile, VideoCard};
 use virtualdos_cpu::{Cpu386, CpuError, SegmentIndex, SegmentRegister};
-use virtualdos_video::{TextFrame, VGA_TEXT_BASE, VGA_TEXT_MEMORY_SIZE, VgaTextMode};
+use virtualdos_video::{
+    Framebuffer, MODE13H_MEMORY_SIZE, TextFrame, VGA_MODE13H_BASE, VGA_TEXT_BASE,
+    VGA_TEXT_MEMORY_SIZE, VgaTextMode,
+};
 
 pub const HIGH_ROM_BASE: u32 = 0xffff_0000;
 pub const LOW_BIOS_BASE: u32 = 0x000f_0000;
@@ -10,7 +13,7 @@ pub const BIOS_ROM_SIZE: usize = 64 * 1024;
 pub const BOOT_IMAGE_SIZE: usize = 1440 * 1024;
 pub const BOOT_SECTOR_ADDRESS: usize = 0x7c00;
 pub const BOOT_STAGE2_ADDRESS: usize = 0x8000;
-pub const BIOS_INT13_STUB_ADDRESS: usize = 0x0600;
+pub const BIOS_IRET_STUB_ADDRESS: usize = 0x0600;
 pub const RESULT_BLOCK_ADDRESS: usize = 0x9000;
 
 #[derive(Debug, Error)]
@@ -108,7 +111,7 @@ impl Machine {
             return Err(MachineError::InvalidRomSize(rom.len()));
         }
 
-        Ok(Self {
+        let mut machine = Self {
             memory: Memory::from_mib(profile.memory_mib)?,
             profile,
             cpu: Cpu386::default(),
@@ -118,7 +121,9 @@ impl Machine {
             device_ports: DevicePorts::default(),
             trace: BusTrace::default(),
             elapsed_clocks: 0,
-        })
+        };
+        install_boot_bios_stubs(&mut machine.memory)?;
+        Ok(machine)
     }
 
     pub fn new_boot_image(
@@ -188,6 +193,10 @@ impl Machine {
 
     pub fn screen_text(&self) -> TextFrame {
         self.video.frame()
+    }
+
+    pub fn mode13h_framebuffer(&self) -> &Framebuffer {
+        self.video.mode13h_framebuffer()
     }
 
     pub fn bus_trace(&self) -> &BusTrace {
@@ -389,13 +398,16 @@ impl CpuBus for MachineBus<'_> {
         }
     }
 
-    fn interrupt_acknowledge(&mut self, vector: u8) -> Result<(), BusError> {
+    fn interrupt_acknowledge(&mut self, vector: u8, ax: u16) -> Result<(), BusError> {
         self.trace.push(BusCycle::new(
             BusAccessKind::InterruptAcknowledge,
             u32::from(vector),
             BusWidth::Byte,
             self.wait_states.io,
         ));
+        if vector == 0x10 && ax == 0x0013 {
+            self.video.set_mode13h();
+        }
         Ok(())
     }
 }
@@ -518,10 +530,12 @@ fn boot_sector_cpu() -> Cpu386 {
 }
 
 fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
-    let vector = 0x13 * 4;
-    memory.write_u16(vector, BIOS_INT13_STUB_ADDRESS as u16)?;
-    memory.write_u16(vector + 2, 0)?;
-    memory.write_u8(BIOS_INT13_STUB_ADDRESS, 0xcf)
+    for vector in [0x10, 0x13] {
+        let address = vector * 4;
+        memory.write_u16(address, BIOS_IRET_STUB_ADDRESS as u16)?;
+        memory.write_u16(address + 2, 0)?;
+    }
+    memory.write_u8(BIOS_IRET_STUB_ADDRESS, 0xcf)
 }
 
 impl MachineBus<'_> {
@@ -530,11 +544,21 @@ impl MachineBus<'_> {
             return Ok(self.rom[offset..offset + width].to_vec());
         }
 
-        if let Some(offset) = video_offset(address, width) {
+        if let Some(offset) = video_text_offset(address, width) {
             return (0..width)
                 .map(|index| {
                     self.video
                         .read_u8(offset + index)
+                        .map_err(|_| BusError::UnmappedMemory { address })
+                })
+                .collect();
+        }
+
+        if let Some(offset) = video_mode13h_offset(address, width) {
+            return (0..width)
+                .map(|index| {
+                    self.video
+                        .read_mode13h_u8(offset + index)
                         .map_err(|_| BusError::UnmappedMemory { address })
                 })
                 .collect();
@@ -555,10 +579,17 @@ impl MachineBus<'_> {
             return Ok(());
         }
 
-        if let Some(offset) = video_offset(address, 1) {
+        if let Some(offset) = video_text_offset(address, 1) {
             return self
                 .video
                 .write_u8(offset, value)
+                .map_err(|_| BusError::UnmappedMemory { address });
+        }
+
+        if let Some(offset) = video_mode13h_offset(address, 1) {
+            return self
+                .video
+                .write_mode13h_u8(offset, value)
                 .map_err(|_| BusError::UnmappedMemory { address });
         }
 
@@ -572,7 +603,9 @@ impl MachineBus<'_> {
     fn memory_wait_states(&self, address: u32) -> u8 {
         if rom_offset(address, 1).is_some() {
             self.wait_states.rom
-        } else if video_offset(address, 1).is_some() {
+        } else if video_text_offset(address, 1).is_some()
+            || video_mode13h_offset(address, 1).is_some()
+        {
             self.wait_states.video
         } else {
             self.wait_states.ram
@@ -600,10 +633,19 @@ fn rom_offset(address: u32, width: usize) -> Option<usize> {
     (offset + width <= BIOS_ROM_SIZE).then_some(offset)
 }
 
-fn video_offset(address: u32, width: usize) -> Option<usize> {
+fn video_text_offset(address: u32, width: usize) -> Option<usize> {
     let end = VGA_TEXT_BASE + VGA_TEXT_MEMORY_SIZE as u32;
     if (VGA_TEXT_BASE..end).contains(&address) && address + width as u32 <= end {
         Some((address - VGA_TEXT_BASE) as usize)
+    } else {
+        None
+    }
+}
+
+fn video_mode13h_offset(address: u32, width: usize) -> Option<usize> {
+    let end = VGA_MODE13H_BASE + MODE13H_MEMORY_SIZE as u32;
+    if (VGA_MODE13H_BASE..end).contains(&address) && address + width as u32 <= end {
+        Some((address - VGA_MODE13H_BASE) as usize)
     } else {
         None
     }
@@ -620,6 +662,13 @@ mod tests {
             I386DX25_TEST_ROM,
         )
         .unwrap()
+    }
+
+    fn rom_with_code(code: &[u8]) -> Vec<u8> {
+        let mut rom = vec![0; BIOS_ROM_SIZE];
+        rom[..code.len()].copy_from_slice(code);
+        rom[0xfff0..0xfff5].copy_from_slice(&[0xea, 0x00, 0x00, 0x00, 0xf0]);
+        rom
     }
 
     #[test]
@@ -701,6 +750,30 @@ mod tests {
     }
 
     #[test]
+    fn int10_mode13h_maps_a000_to_framebuffer() {
+        let rom = rom_with_code(&[
+            0xb8, 0x13, 0x00, // mov ax, 0013h
+            0xcd, 0x10, // int 10h
+            0xb8, 0x00, 0xa0, // mov ax, a000h
+            0x8e, 0xc0, // mov es, ax
+            0xbf, 0x7b, 0x00, // mov di, 007bh
+            0xb0, 0x2a, // mov al, 2ah
+            0xaa, // stosb
+            0xf4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000W32p), rom).unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(machine.mode13h_framebuffer().indexed_pixels[0x7b], 0x2a);
+        assert!(machine.bus_trace().cycles().iter().any(|cycle| {
+            cycle.kind == BusAccessKind::InterruptAcknowledge && cycle.address == 0x10
+        }));
+    }
+
+    #[test]
     fn boot_image_starts_at_bios_loaded_boot_sector() {
         let mut machine = Machine::new_boot_image(
             MachineProfile::i386dx25(16, VideoCard::Et4000W32p),
@@ -731,6 +804,7 @@ mod tests {
 
         assert_eq!(reason, StopReason::Halted);
         assert!(serial.contains("PASS boot.stage2"));
+        assert!(serial.contains("PASS video.vga_mode13h"));
         assert!(serial.contains("FAIL sound.opl3"));
         assert_eq!(
             usize::from(results.declared_record_count),
@@ -740,6 +814,13 @@ mod tests {
             record.status == virtualdos_firmware::SuiteRecordStatus::Pass
                 && record.name == "video.vga_text"
         }));
+        assert!(results.records.iter().any(|record| {
+            record.status == virtualdos_firmware::SuiteRecordStatus::Pass
+                && record.name == "video.vga_mode13h"
+        }));
+        assert_eq!(machine.mode13h_framebuffer().indexed_pixels[0], 0x2a);
+        assert_eq!(machine.mode13h_framebuffer().indexed_pixels[319], 0x13);
+        assert_eq!(machine.mode13h_framebuffer().indexed_pixels[63680], 0x7f);
         assert!(results.records.iter().any(|record| {
             record.status == virtualdos_firmware::SuiteRecordStatus::Fail
                 && record.name == "sound.sb_16bit_dma"

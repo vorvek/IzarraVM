@@ -1559,7 +1559,7 @@ impl Cpu386 {
     }
 
     fn software_interrupt<B: CpuBus>(&mut self, bus: &mut B, vector: u8) -> ExecResult<()> {
-        bus.interrupt_acknowledge(vector)?;
+        bus.interrupt_acknowledge(vector, self.read_gpr16(0))?;
         if self.is_protected_mode() {
             self.deliver_exception(bus, vector, None)
         } else {
@@ -1966,7 +1966,7 @@ mod tests {
             Ok(())
         }
 
-        fn interrupt_acknowledge(&mut self, vector: u8) -> Result<(), BusError> {
+        fn interrupt_acknowledge(&mut self, vector: u8, _ax: u16) -> Result<(), BusError> {
             self.trace.push(BusCycle::new(
                 BusAccessKind::InterruptAcknowledge,
                 u32::from(vector),

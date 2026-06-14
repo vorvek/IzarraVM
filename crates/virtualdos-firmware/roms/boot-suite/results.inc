@@ -1,6 +1,6 @@
 %define RESULT_RECORD_COUNT 21
 %define RESULT_PAYLOAD_LEN 457
-%define RESULT_PAYLOAD_CHECKSUM 0x9e1a
+%define RESULT_PAYLOAD_CHECKSUM 0x9e35
 
 result_block_template:
     db 'VDTS'
@@ -22,7 +22,7 @@ result_payload:
     db 'PASS video.vga_text', 10
     db 'FAIL video.cga_graphics', 10
     db 'FAIL video.ega_planar', 10
-    db 'FAIL video.vga_mode13h', 10
+    db 'PASS video.vga_mode13h', 10
     db 'FAIL sound.pc_speaker', 10
     db 'FAIL sound.opl2', 10
     db 'FAIL sound.opl3', 10

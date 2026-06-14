@@ -3,6 +3,8 @@ use virtualdos_core::VideoCard;
 
 pub const MODE13H_WIDTH: u32 = 320;
 pub const MODE13H_HEIGHT: u32 = 200;
+pub const MODE13H_MEMORY_SIZE: usize = 64_000;
+pub const VGA_MODE13H_BASE: u32 = 0x000a_0000;
 pub const VGA_TEXT_BASE: u32 = 0x000b_8000;
 pub const VGA_TEXT_COLUMNS: usize = 80;
 pub const VGA_TEXT_ROWS: usize = 25;
@@ -15,6 +17,8 @@ pub enum VideoError {
     EmptyFramebuffer,
     #[error("VGA text memory offset {offset:#x} is outside the text buffer")]
     TextMemoryOutOfBounds { offset: usize },
+    #[error("VGA Mode 13h offset {offset:#x} is outside the framebuffer")]
+    Mode13hOutOfBounds { offset: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +95,7 @@ impl TextFrame {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VgaTextMode {
     memory: [u8; VGA_TEXT_MEMORY_SIZE],
+    mode13h: Framebuffer,
     crtc_index: u8,
     cursor_offset: u16,
 }
@@ -105,6 +110,7 @@ impl Default for VgaTextMode {
 
         Self {
             memory,
+            mode13h: Framebuffer::mode13h(),
             crtc_index: 0,
             cursor_offset: 0,
         }
@@ -126,6 +132,32 @@ impl VgaTextMode {
             .ok_or(VideoError::TextMemoryOutOfBounds { offset })?;
         *slot = value;
         Ok(())
+    }
+
+    pub fn mode13h_framebuffer(&self) -> &Framebuffer {
+        &self.mode13h
+    }
+
+    pub fn read_mode13h_u8(&self, offset: usize) -> Result<u8, VideoError> {
+        self.mode13h
+            .indexed_pixels
+            .get(offset)
+            .copied()
+            .ok_or(VideoError::Mode13hOutOfBounds { offset })
+    }
+
+    pub fn write_mode13h_u8(&mut self, offset: usize, value: u8) -> Result<(), VideoError> {
+        let slot = self
+            .mode13h
+            .indexed_pixels
+            .get_mut(offset)
+            .ok_or(VideoError::Mode13hOutOfBounds { offset })?;
+        *slot = value;
+        Ok(())
+    }
+
+    pub fn set_mode13h(&mut self) {
+        self.mode13h = Framebuffer::mode13h();
     }
 
     pub fn read_port(&self, port: u16) -> Option<u8> {
@@ -230,7 +262,7 @@ mod tests {
         let framebuffer = Framebuffer::mode13h();
         assert_eq!(framebuffer.width, 320);
         assert_eq!(framebuffer.height, 200);
-        assert_eq!(framebuffer.indexed_pixels.len(), 64_000);
+        assert_eq!(framebuffer.indexed_pixels.len(), MODE13H_MEMORY_SIZE);
     }
 
     #[test]
@@ -254,6 +286,16 @@ mod tests {
         assert_eq!(frame.cells[0].character, b'V');
         assert_eq!(frame.cells[0].attribute, 0x0a);
         assert_eq!(frame.line_string(0), "V");
+    }
+
+    #[test]
+    fn mode13h_memory_write_updates_framebuffer() {
+        let mut video = VgaTextMode::default();
+        video.set_mode13h();
+        video.write_mode13h_u8(123, 0x2a).unwrap();
+
+        assert_eq!(video.mode13h_framebuffer().indexed_pixels[123], 0x2a);
+        assert_eq!(video.read_mode13h_u8(123).unwrap(), 0x2a);
     }
 
     #[test]

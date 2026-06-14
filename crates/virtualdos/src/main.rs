@@ -1,6 +1,9 @@
 use clap::Parser;
+use font8x8::{BASIC_FONTS, UnicodeFonts};
 use std::error::Error;
+use std::num::NonZeroU32;
 use std::path::PathBuf;
+use std::rc::Rc;
 use tracing::info;
 use virtualdos_audio::AudioSubsystem;
 use virtualdos_core::{
@@ -9,13 +12,23 @@ use virtualdos_core::{
 use virtualdos_dos::{DosKernelServices, HostDrive};
 use virtualdos_firmware::{boot_test_image, parse_result_block, test_rom};
 use virtualdos_input::InputState;
-use virtualdos_machine::{Machine, MachineProfile};
-use virtualdos_video::{PlaceholderVideoAdapter, VideoAdapter};
+use virtualdos_machine::{Machine, MachineProfile, StopReason};
+use virtualdos_video::{PlaceholderVideoAdapter, TextFrame, VideoAdapter};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, OwnedDisplayHandle};
 use winit::window::{Window, WindowAttributes, WindowId};
+
+const GLYPH_SIZE: usize = 8;
+const TEXT_SCALE: usize = 2;
+const LIVE_CYCLE_BATCH: u64 = 50_000;
+const WINDOW_WIDTH: u32 = 1280;
+const WINDOW_HEIGHT: u32 = 400;
+const VGA_PALETTE: [u32; 16] = [
+    0x000000, 0x0000aa, 0x00aa00, 0x00aaaa, 0xaa0000, 0xaa00aa, 0xaa5500, 0xaaaaaa, 0x555555,
+    0x5555ff, 0x55ff55, 0x55ffff, 0xff5555, 0xff55ff, 0xffff55, 0xffffff,
+];
 
 #[derive(Debug, Parser)]
 #[command(version, about = "VirtualDOS emulator scaffold")]
@@ -95,26 +108,26 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    let mut machine = Machine::new(MachineProfile::from_hardware_profile(&hardware), test_rom())?;
-    let stop_reason = machine.run_until_halt_or_cycles(5_000_000)?;
-    let screen = machine.screen_text();
-    let screen_text = screen.as_text();
-
-    info!(
-        ?stop_reason,
-        clocks = machine.elapsed_clocks(),
-        bus_cycles = machine.bus_trace().cycles().len(),
-        first_line = %screen.line_string(0),
-        "test ROM completed"
-    );
-
     if cli.headless_test_rom {
+        let mut machine =
+            Machine::new(MachineProfile::from_hardware_profile(&hardware), test_rom())?;
+        let stop_reason = machine.run_until_halt_or_cycles(5_000_000)?;
+        let screen = machine.screen_text();
+        let screen_text = screen.as_text();
+        info!(
+            ?stop_reason,
+            clocks = machine.elapsed_clocks(),
+            bus_cycles = machine.bus_trace().cycles().len(),
+            first_line = %screen.line_string(0),
+            "test ROM completed"
+        );
         println!("{screen_text}");
         println!("stop: {stop_reason:?}");
         return Ok(());
     }
 
-    run_window(config, video, screen_text)?;
+    let machine = Machine::new(MachineProfile::from_hardware_profile(&hardware), test_rom())?;
+    run_window(config, video, machine)?;
     Ok(())
 }
 
@@ -141,29 +154,39 @@ fn load_config(cli: &Cli) -> Result<AppConfig, Box<dyn Error>> {
 fn run_window(
     config: AppConfig,
     video: PlaceholderVideoAdapter,
-    screen_text: String,
+    machine: Machine,
 ) -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
+    let context = softbuffer::Context::new(event_loop.owned_display_handle())?;
+    let rendered_screen = render_text_frame(&machine.screen_text());
 
     let mut app = WindowApp {
+        context,
         window: None,
+        surface: None,
         title: format!(
             "VirtualDOS - {} / {} MiB / {}",
             config.machine.cpu,
             config.machine.memory_mib,
             video.card()
         ),
-        screen_text,
+        machine,
+        rendered_screen,
+        stop_reason: None,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
 }
 
 struct WindowApp {
-    window: Option<Window>,
+    context: softbuffer::Context<OwnedDisplayHandle>,
+    window: Option<Rc<Window>>,
+    surface: Option<softbuffer::Surface<OwnedDisplayHandle, Rc<Window>>>,
     title: String,
-    screen_text: String,
+    machine: Machine,
+    rendered_screen: RenderedFrame,
+    stop_reason: Option<StopReason>,
 }
 
 impl ApplicationHandler for WindowApp {
@@ -174,11 +197,17 @@ impl ApplicationHandler for WindowApp {
 
         let attributes = WindowAttributes::default()
             .with_title(self.title.clone())
-            .with_inner_size(LogicalSize::new(960.0, 600.0));
-        let window = event_loop
-            .create_window(attributes)
-            .expect("native window should be creatable");
-        info!(screen = %self.screen_text, "initial text-mode screen");
+            .with_inner_size(LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
+        let window = Rc::new(
+            event_loop
+                .create_window(attributes)
+                .expect("native window should be creatable"),
+        );
+        let surface = softbuffer::Surface::new(&self.context, window.clone())
+            .expect("native window surface should be creatable");
+        info!("live test ROM screen started");
+        window.request_redraw();
+        self.surface = Some(surface);
         self.window = Some(window);
     }
 
@@ -190,15 +219,204 @@ impl ApplicationHandler for WindowApp {
     ) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::RedrawRequested => {}
-            WindowEvent::Resized(_size) => {}
+            WindowEvent::RedrawRequested => self.redraw(),
+            WindowEvent::Resized(_size) => {
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
             _ => {}
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(window) = &self.window {
-            window.request_redraw();
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.stop_reason.is_none() {
+            let reason = tick_machine(&mut self.machine, LIVE_CYCLE_BATCH);
+            self.rendered_screen = render_text_frame(&self.machine.screen_text());
+            if let Some(reason) = reason {
+                self.finish(reason);
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
         }
+    }
+}
+
+impl WindowApp {
+    fn finish(&mut self, reason: StopReason) {
+        info!(
+            ?reason,
+            clocks = self.machine.elapsed_clocks(),
+            bus_cycles = self.machine.bus_trace().cycles().len(),
+            first_line = %self.machine.screen_text().line_string(0),
+            "live test ROM stopped"
+        );
+        if let Some(window) = &self.window {
+            window.set_title(&format!("{} - {reason:?}", self.title));
+        }
+        self.stop_reason = Some(reason);
+    }
+
+    fn redraw(&mut self) {
+        let (Some(window), Some(surface)) = (&self.window, &mut self.surface) else {
+            return;
+        };
+        let size = window.inner_size();
+        let Some(width) = NonZeroU32::new(size.width.max(1)) else {
+            return;
+        };
+        let Some(height) = NonZeroU32::new(size.height.max(1)) else {
+            return;
+        };
+
+        surface
+            .resize(width, height)
+            .expect("native window surface should be resizable");
+        let mut buffer = surface
+            .buffer_mut()
+            .expect("native window buffer should be writable");
+        blit_centered(
+            &self.rendered_screen,
+            &mut buffer,
+            width.get() as usize,
+            height.get() as usize,
+        );
+        buffer
+            .present()
+            .expect("native window buffer should be presentable");
+    }
+}
+
+fn tick_machine(machine: &mut Machine, cycles: u64) -> Option<StopReason> {
+    match machine.run_cycles(cycles) {
+        Ok(StopReason::CycleLimit { .. }) => None,
+        Ok(reason) => Some(reason),
+        Err(error) => Some(StopReason::CpuError(error.to_string())),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RenderedFrame {
+    width: usize,
+    height: usize,
+    pixels: Vec<u32>,
+}
+
+fn render_text_frame(frame: &TextFrame) -> RenderedFrame {
+    let width = frame.columns * GLYPH_SIZE * TEXT_SCALE;
+    let height = frame.rows * GLYPH_SIZE * TEXT_SCALE;
+    let mut pixels = vec![VGA_PALETTE[0]; width * height];
+
+    for (cell_index, cell) in frame.cells.iter().enumerate() {
+        let column = cell_index % frame.columns;
+        let row = cell_index / frame.columns;
+        if row >= frame.rows {
+            break;
+        }
+
+        let character = match cell.character {
+            0 => ' ',
+            byte => char::from(byte),
+        };
+        let glyph = BASIC_FONTS.get(character).unwrap_or([0; GLYPH_SIZE]);
+        let foreground = VGA_PALETTE[usize::from(cell.attribute & 0x0f)];
+        let background = VGA_PALETTE[usize::from((cell.attribute >> 4) & 0x0f)];
+        let cell_x = column * GLYPH_SIZE * TEXT_SCALE;
+        let cell_y = row * GLYPH_SIZE * TEXT_SCALE;
+
+        for (glyph_y, bits) in glyph.iter().copied().enumerate() {
+            for glyph_x in 0..GLYPH_SIZE {
+                let color = if bits & (1 << glyph_x) != 0 {
+                    foreground
+                } else {
+                    background
+                };
+                for scale_y in 0..TEXT_SCALE {
+                    for scale_x in 0..TEXT_SCALE {
+                        let x = cell_x + glyph_x * TEXT_SCALE + scale_x;
+                        let y = cell_y + glyph_y * TEXT_SCALE + scale_y;
+                        pixels[y * width + x] = color;
+                    }
+                }
+            }
+        }
+    }
+
+    RenderedFrame {
+        width,
+        height,
+        pixels,
+    }
+}
+
+fn blit_centered(
+    source: &RenderedFrame,
+    target: &mut [u32],
+    target_width: usize,
+    target_height: usize,
+) {
+    target.fill(VGA_PALETTE[0]);
+    let copy_width = source.width.min(target_width);
+    let copy_height = source.height.min(target_height);
+    let source_x = (source.width - copy_width) / 2;
+    let source_y = (source.height - copy_height) / 2;
+    let target_x = (target_width - copy_width) / 2;
+    let target_y = (target_height - copy_height) / 2;
+
+    for row in 0..copy_height {
+        let source_start = (source_y + row) * source.width + source_x;
+        let target_start = (target_y + row) * target_width + target_x;
+        target[target_start..target_start + copy_width]
+            .copy_from_slice(&source.pixels[source_start..source_start + copy_width]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use virtualdos_video::TextCell;
+
+    #[test]
+    fn text_renderer_draws_foreground_pixels() {
+        let mut cells = vec![TextCell::default(); 80 * 25];
+        cells[0] = TextCell {
+            character: b'X',
+            attribute: 0x0f,
+        };
+        let frame = TextFrame {
+            columns: 80,
+            rows: 25,
+            cells,
+            cursor_offset: 0,
+        };
+
+        let rendered = render_text_frame(&frame);
+
+        assert_eq!(rendered.width, WINDOW_WIDTH as usize);
+        assert_eq!(rendered.height, WINDOW_HEIGHT as usize);
+        assert!(
+            rendered
+                .pixels
+                .iter()
+                .any(|pixel| *pixel == VGA_PALETTE[15])
+        );
+    }
+
+    #[test]
+    fn live_tick_advances_machine_and_renders_screen() {
+        let mut machine = Machine::new(
+            MachineProfile::i386dx25(16, VideoCard::Et4000W32p),
+            test_rom(),
+        )
+        .unwrap();
+
+        let _ = tick_machine(&mut machine, LIVE_CYCLE_BATCH);
+        let rendered = render_text_frame(&machine.screen_text());
+
+        assert_eq!(rendered.width, WINDOW_WIDTH as usize);
+        assert_eq!(rendered.height, WINDOW_HEIGHT as usize);
+        assert_eq!(rendered.pixels.len(), rendered.width * rendered.height);
     }
 }
