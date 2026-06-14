@@ -3,6 +3,7 @@ use virtualdos_bus::{BusAccessKind, BusError, BusWidth, CpuBus};
 
 const FLAG_CF: u32 = 0x0000_0001;
 const FLAG_PF: u32 = 0x0000_0004;
+const FLAG_AF: u32 = 0x0000_0010;
 const FLAG_ZF: u32 = 0x0000_0040;
 const FLAG_SF: u32 = 0x0000_0080;
 const FLAG_TF: u32 = 0x0000_0100;
@@ -1829,6 +1830,72 @@ impl Cpu386 {
         self.set_flag(FLAG_PF, parity(result as u8));
     }
 
+    fn alu(&mut self, op: u8, a: u32, b: u32, width: BusWidth) -> u32 {
+        let mask = width_mask(width);
+        let cf_in = u32::from(self.flag(FLAG_CF));
+        match op {
+            0 => self.alu_add(a, b, 0, width),
+            2 => self.alu_add(a, b, cf_in, width),
+            3 => self.alu_sub(a, b, cf_in, width),
+            5 | 7 => self.alu_sub(a, b, 0, width),
+            1 => {
+                let result = (a | b) & mask;
+                self.set_flag(FLAG_CF | FLAG_OF, false);
+                self.set_szp(result, width);
+                result
+            }
+            4 => {
+                let result = (a & b) & mask;
+                self.set_flag(FLAG_CF | FLAG_OF, false);
+                self.set_szp(result, width);
+                result
+            }
+            6 => {
+                let result = (a ^ b) & mask;
+                self.set_flag(FLAG_CF | FLAG_OF, false);
+                self.set_szp(result, width);
+                result
+            }
+            _ => unreachable!("alu op {op}"),
+        }
+    }
+
+    fn alu_add(&mut self, a: u32, b: u32, carry: u32, width: BusWidth) -> u32 {
+        let mask = width_mask(width);
+        let sign = width_sign(width);
+        let a = a & mask;
+        let b = b & mask;
+        let full = u64::from(a) + u64::from(b) + u64::from(carry);
+        let result = (full as u32) & mask;
+        self.set_flag(FLAG_CF, full > u64::from(mask));
+        self.set_flag(FLAG_OF, ((a ^ result) & (b ^ result) & sign) != 0);
+        self.set_flag(FLAG_AF, ((a ^ b ^ result) & 0x10) != 0);
+        self.set_szp(result, width);
+        result
+    }
+
+    fn alu_sub(&mut self, a: u32, b: u32, borrow: u32, width: BusWidth) -> u32 {
+        let mask = width_mask(width);
+        let sign = width_sign(width);
+        let a = a & mask;
+        let b = b & mask;
+        let rhs = u64::from(b) + u64::from(borrow);
+        let result = (u64::from(a).wrapping_sub(rhs) as u32) & mask;
+        self.set_flag(FLAG_CF, u64::from(a) < rhs);
+        self.set_flag(FLAG_OF, ((a ^ b) & (a ^ result) & sign) != 0);
+        self.set_flag(FLAG_AF, ((a ^ b ^ result) & 0x10) != 0);
+        self.set_szp(result, width);
+        result
+    }
+
+    fn set_szp(&mut self, result: u32, width: BusWidth) {
+        let mask = width_mask(width);
+        let sign = width_sign(width);
+        self.set_flag(FLAG_ZF, result & mask == 0);
+        self.set_flag(FLAG_SF, result & sign != 0);
+        self.set_flag(FLAG_PF, parity(result as u8));
+    }
+
     fn condition(&self, condition: u8) -> bool {
         match condition {
             0x0 => self.flag(FLAG_OF),
@@ -1873,6 +1940,22 @@ fn sign_bit(value: u32, operand_size: OperandSize) -> bool {
     }
 }
 
+const fn width_mask(width: BusWidth) -> u32 {
+    match width {
+        BusWidth::Byte => 0x0000_00ff,
+        BusWidth::Word => 0x0000_ffff,
+        BusWidth::Dword => 0xffff_ffff,
+    }
+}
+
+const fn width_sign(width: BusWidth) -> u32 {
+    match width {
+        BusWidth::Byte => 0x0000_0080,
+        BusWidth::Word => 0x0000_8000,
+        BusWidth::Dword => 0x8000_0000,
+    }
+}
+
 fn parity(value: u8) -> bool {
     value.count_ones() % 2 == 0
 }
@@ -1884,7 +1967,7 @@ fn page_fault_code(present: bool, write: bool, instruction_fetch: bool) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use virtualdos_bus::{BusCycle, BusTrace};
+    use virtualdos_bus::{BusCycle, BusTrace, BusWidth};
 
     #[derive(Default)]
     struct TestBus {
@@ -2088,5 +2171,56 @@ mod tests {
                 .iter()
                 .any(|cycle| { cycle.kind == BusAccessKind::IoWrite && cycle.address == 0x03f8 })
         );
+    }
+
+    #[test]
+    fn alu_add_byte_sets_carry_zero_and_aux() {
+        let mut cpu = Cpu386::default();
+        let result = cpu.alu(0, 0xff, 0x01, BusWidth::Byte);
+        assert_eq!(result, 0x00);
+        assert!(cpu.flag(FLAG_CF));
+        assert!(cpu.flag(FLAG_ZF));
+        assert!(cpu.flag(FLAG_AF));
+        assert!(!cpu.flag(FLAG_OF));
+    }
+
+    #[test]
+    fn alu_adc_uses_carry_in() {
+        let mut cpu = Cpu386::default();
+        cpu.set_flag(FLAG_CF, true);
+        let result = cpu.alu(2, 0x01, 0x01, BusWidth::Word); // ADC 1,1 with CF=1 -> 3
+        assert_eq!(result, 0x0003);
+        assert!(!cpu.flag(FLAG_CF));
+    }
+
+    #[test]
+    fn alu_sub_byte_sets_borrow_and_sign() {
+        let mut cpu = Cpu386::default();
+        let result = cpu.alu(5, 0x00, 0x01, BusWidth::Byte); // 0 - 1 = 0xff
+        assert_eq!(result, 0xff);
+        assert!(cpu.flag(FLAG_CF));
+        assert!(cpu.flag(FLAG_SF));
+        assert!(cpu.flag(FLAG_AF));
+    }
+
+    #[test]
+    fn alu_sbb_uses_borrow_in() {
+        let mut cpu = Cpu386::default();
+        cpu.set_flag(FLAG_CF, true);
+        let result = cpu.alu(3, 0x05, 0x02, BusWidth::Word); // 5 - 2 - 1 = 2
+        assert_eq!(result, 0x0002);
+        assert!(!cpu.flag(FLAG_CF));
+    }
+
+    #[test]
+    fn alu_logic_clears_carry_overflow_leaves_aux() {
+        let mut cpu = Cpu386::default();
+        cpu.set_flag(FLAG_AF, true);
+        let result = cpu.alu(4, 0xf0, 0x0f, BusWidth::Byte); // AND -> 0
+        assert_eq!(result, 0x00);
+        assert!(!cpu.flag(FLAG_CF));
+        assert!(!cpu.flag(FLAG_OF));
+        assert!(cpu.flag(FLAG_ZF));
+        assert!(cpu.flag(FLAG_AF)); // AND leaves AF untouched (undefined)
     }
 }
