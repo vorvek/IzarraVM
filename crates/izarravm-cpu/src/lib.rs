@@ -585,6 +585,22 @@ impl Cpu386 {
                 self.write_rm_sized(bus, prefixes, address_size, OperandSize::Word, modrm, value)?;
                 Ok(clocks(2))
             }
+            0x8d => {
+                let modrm = self.fetch_modrm(bus)?;
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
+                match operand {
+                    RmOperand::Memory(mem) => {
+                        // LEA loads the effective address, not the memory it points at.
+                        self.write_gpr_sized(modrm.reg, operand_size, mem.offset);
+                        Ok(clocks(2))
+                    }
+                    // LEA requires a memory operand; mod=3 is an invalid encoding.
+                    RmOperand::Register(_) => Err(InternalFault::Exception {
+                        vector: 6,
+                        error_code: None,
+                    }),
+                }
+            }
             0x8e => {
                 let modrm = self.fetch_modrm(bus)?;
                 let value =
@@ -4157,5 +4173,45 @@ mod tests {
 
         assert_eq!(bus.memory[0x230], 0x99); // es:di destination
         assert_eq!(bus.memory[0x10], 0); // ds:si source was not used
+    }
+
+    #[test]
+    fn lea_loads_effective_address() {
+        // lea bx, [si+0x10]  (0x8d 0x5c 0x10). bx <- si + 0x10, no memory access:
+        // the byte at the computed address must not be loaded.
+        let mut memory = vec![0; 1024];
+        memory[0..3].copy_from_slice(&[0x8d, 0x5c, 0x10]);
+        memory[0x110] = 0x99;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esi(0x0100);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Bx), 0x0110);
+    }
+
+    #[test]
+    fn lea_with_register_operand_delivers_ud() {
+        // lea ax, ax  (0x8d 0xc0, mod=3) is an invalid encoding -> #UD (vector 6).
+        // IVT[6] at 0x18 points to IP 0x00ee, CS 0; the CPU vectors there and clears IF.
+        let mut memory = vec![0; 1024];
+        memory[0..2].copy_from_slice(&[0x8d, 0xc0]);
+        memory[0x18] = 0xee; // vector 6 IP low byte (IP = 0x00ee)
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        cpu.set_flag(FLAG_IF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eip, 0x00ee);
+        assert!(!cpu.flag(FLAG_IF));
     }
 }
