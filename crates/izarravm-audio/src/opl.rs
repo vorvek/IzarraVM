@@ -364,6 +364,22 @@ impl Operator {
         self.feedback_history = [out, self.feedback_history[0]];
         out
     }
+
+    /// Rhythm-mode percussion output: a full-scale square whose sign is the
+    /// `positive` bit (driven by the noise LFSR and/or the metallic phase mix),
+    /// scaled by the operator's level and envelope. Used by the snare, hi-hat
+    /// and cymbal, whose exact hardware bit-logic is unpublished.
+    fn percussion_sample(&self, extra_attenuation: u16, positive: bool) -> i32 {
+        let attenuation = u32::from(self.total_level) * 32
+            + u32::from(self.ksl_attenuation())
+            + u32::from(extra_attenuation);
+        let magnitude = exp_lookup(attenuation);
+        if positive {
+            magnitude
+        } else {
+            -magnitude
+        }
+    }
 }
 
 /// Map the 10-bit wave position to a (log-sine attenuation, sign) pair for one
@@ -462,6 +478,25 @@ const FOUR_OP_PRIMARY: [usize; 6] = [0, 1, 2, 9, 10, 11];
 /// 8-phase counter (`eg_counter >> 10`, 8192 samples ~= 6.07 Hz) instead.
 const TREMOLO_PERIOD: u32 = 13437;
 
+/// Rhythm-mode operator slots (datasheet p11): bass drum is the 2-op pair
+/// 12->15 on channel 6; hi-hat (13) and snare (16) share channel 7; tom-tom
+/// (14) and cymbal (17) share channel 8.
+const RHYTHM_BD_MOD: usize = 12;
+const RHYTHM_BD_CAR: usize = 15;
+const RHYTHM_HH: usize = 13;
+const RHYTHM_TT: usize = 14;
+const RHYTHM_SD: usize = 16;
+const RHYTHM_CY: usize = 17;
+
+/// Enharmonic toggle for the hi-hat / cymbal, mixing high bits of the two
+/// operators' wave positions. Clean-room approximation: the hardware's exact
+/// metallic phase logic is not published in the datasheet or programmer's guide.
+fn metal_bit(phase_hh: u32, phase_cy: u32) -> bool {
+    let a = (phase_hh >> 10) & 0x3ff;
+    let b = (phase_cy >> 10) & 0x3ff;
+    ((a >> 8) ^ (a >> 3) ^ (b >> 7) ^ (b >> 2)) & 1 != 0
+}
+
 /// Whether `channel` is the primary half of an active 4-op voice (renders all
 /// four operators) under the reg 0x104 `mask`.
 fn four_op_primary(channel: usize, mask: u8) -> bool {
@@ -493,6 +528,8 @@ pub struct OplChip {
     timer2: Timer,
     operators: [Operator; 36],
     eg_counter: u32,
+    /// Maximal-length 16-bit LFSR feeding the rhythm-mode noise instruments.
+    noise: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -547,6 +584,7 @@ impl Default for OplChip {
             timer2: Timer::new(320),
             operators: std::array::from_fn(|_| Operator::default()),
             eg_counter: 0,
+            noise: 1,
         }
     }
 }
@@ -626,16 +664,113 @@ impl OplChip {
         attenuation
     }
 
+    /// Rhythm/percussion mode (reg 0xBD bit5): channels 6-8 become the five
+    /// percussion instruments instead of melodic voices.
+    fn rhythm_enabled(&self) -> bool {
+        self.registers[0][0xbd] & 0x20 != 0
+    }
+
+    /// Step the noise LFSR one sample (maximal-length 16-bit Galois polynomial).
+    fn advance_noise(&mut self) {
+        let feedback = self.noise & 1 != 0;
+        self.noise >>= 1;
+        if feedback {
+            self.noise ^= 0xb400;
+        }
+    }
+
+    /// Render the five percussion instruments and sum them into `(left, right)`.
+    /// All operators take their pitch from channels 6-8 but are keyed by the
+    /// 0xBD on-bits, not the channel KEY-ON. Bass drum is a normal 2-op FM voice;
+    /// tom-tom is a plain tone; snare/hi-hat/cymbal are noise + metallic squares.
+    fn render_rhythm(&mut self) -> (i32, i32) {
+        let note_select = self.registers[0][0x08] & 0x40 != 0;
+        let bd = self.registers[0][0xbd];
+        let noise = self.noise & 1 != 0;
+        let ops = [
+            RHYTHM_BD_MOD,
+            RHYTHM_BD_CAR,
+            RHYTHM_HH,
+            RHYTHM_TT,
+            RHYTHM_SD,
+            RHYTHM_CY,
+        ];
+
+        // Bass drum operators belong to channel 6, hi-hat/snare to 7, the rest
+        // to 8. Load each from its channel, then override the key from 0xBD.
+        for op in ops {
+            let channel = 6 + (op - RHYTHM_BD_MOD) % 3;
+            self.load_operator(op, channel);
+        }
+        self.operators[RHYTHM_BD_MOD].set_feedback((self.registers[0][0xc6] >> 1) & 0x07);
+        self.operators[RHYTHM_BD_MOD].set_key(bd & 0x10 != 0);
+        self.operators[RHYTHM_BD_CAR].set_key(bd & 0x10 != 0);
+        self.operators[RHYTHM_HH].set_key(bd & 0x01 != 0);
+        self.operators[RHYTHM_SD].set_key(bd & 0x08 != 0);
+        self.operators[RHYTHM_TT].set_key(bd & 0x04 != 0);
+        self.operators[RHYTHM_CY].set_key(bd & 0x02 != 0);
+        for op in ops {
+            self.operators[op].advance_envelope(self.eg_counter, note_select);
+        }
+
+        // Bass drum: 2-op FM (op12 -> op15), additive per channel 6's bit0.
+        let bd_mod_att = self.operator_attenuation(RHYTHM_BD_MOD);
+        let bd_car_att = self.operator_attenuation(RHYTHM_BD_CAR);
+        let bd_mod_out = self.operators[RHYTHM_BD_MOD].render_feedback(bd_mod_att);
+        let bass = if self.registers[0][0xc6] & 0x01 != 0 {
+            self.operators[RHYTHM_BD_CAR].sample(bd_car_att)
+        } else {
+            self.operators[RHYTHM_BD_CAR].sample_modulated(bd_mod_out, bd_car_att)
+        };
+
+        // Tom-tom: a plain tone.
+        let tom = self.operators[RHYTHM_TT].sample(self.operator_attenuation(RHYTHM_TT));
+
+        // Snare/hi-hat/cymbal: full-scale squares toggled by the noise LFSR and
+        // the metallic phase mix (clean-room approximation, see `metal_bit`).
+        let metal = metal_bit(
+            self.operators[RHYTHM_HH].phase,
+            self.operators[RHYTHM_CY].phase,
+        );
+        let snare_bit = ((self.operators[RHYTHM_SD].phase >> 19) & 1 != 0) ^ noise;
+        let snare = self.operators[RHYTHM_SD].percussion_sample(self.operator_attenuation(RHYTHM_SD), snare_bit);
+        let hihat = self.operators[RHYTHM_HH].percussion_sample(self.operator_attenuation(RHYTHM_HH), metal ^ noise);
+        let cymbal = self.operators[RHYTHM_CY].percussion_sample(self.operator_attenuation(RHYTHM_CY), metal);
+
+        let (vibrato, deep) = (self.vibrato_phase(), self.deep_vibrato());
+        for op in ops {
+            self.operators[op].advance_with_lfo(vibrato, deep);
+        }
+
+        // Pan each instrument by its source channel (6 = BD, 7 = HH/SD, 8 = TT/CY).
+        let (mut left, mut right) = (0, 0);
+        for (out, channel) in [(bass, 6), (hihat, 7), (snare, 7), (tom, 8), (cymbal, 8)] {
+            let (l, r) = self.channel_pan(channel);
+            if l {
+                left += out;
+            }
+            if r {
+                right += out;
+            }
+        }
+        (left, right)
+    }
+
     /// Render one stereo `(left, right)` sample at the chip's native 49716 Hz
     /// rate. OPL3 mode sums all 18 two-op channels; otherwise the 9 OPL2
     /// channels. (4-op and rhythm mode are added in later layers.) The EG
     /// counter ticks per sample.
     pub fn render_sample(&mut self) -> (i32, i32) {
         self.eg_counter = self.eg_counter.wrapping_add(1);
+        self.advance_noise();
         let channels = if self.opl3_enabled() { 18 } else { 9 };
+        let rhythm = self.rhythm_enabled();
         let mask = self.four_op_mask();
         let (mut left, mut right) = (0, 0);
         for channel in 0..channels {
+            if rhythm && (6..=8).contains(&channel) {
+                continue; // channels 6-8 are rendered as percussion below
+            }
             if four_op_secondary(channel, mask) {
                 continue; // operators rendered by the paired 4-op primary
             }
@@ -653,6 +788,11 @@ impl OplChip {
             if r {
                 right += out;
             }
+        }
+        if rhythm {
+            let (l, r) = self.render_rhythm();
+            left += l;
+            right += r;
         }
         (left, right)
     }
@@ -1510,6 +1650,59 @@ mod tests {
         assert_eq!(advance(6, true), (fnum - (fnum >> 7)) << 4, "deep trough = -fnum>>7");
         assert_eq!(advance(1, true), (fnum + (fnum >> 8)) << 4, "deep half-step = +fnum>>8");
         assert_eq!(advance(2, false), (fnum + (fnum >> 8)) << 4, "shallow peak = +fnum>>8");
+    }
+
+    // Program a percussion operator (by register slot) loud and sustained.
+    fn loud_rhythm_op(opl: &mut OplChip, slot: usize) {
+        opl.write_register((0x20 + slot) as u8, 0x21); // sustained, multiple x1
+        opl.write_register((0x40 + slot) as u8, 0x00); // total level 0
+        opl.write_register((0x60 + slot) as u8, 0xf0); // attack 15
+        opl.write_register((0x80 + slot) as u8, 0x00);
+    }
+
+    #[test]
+    fn rhythm_mode_keys_instruments_via_the_0xbd_register() {
+        let mut opl = OplChip::default();
+        for slot in [16, 17, 18, 19, 20, 21] {
+            loud_rhythm_op(&mut opl, slot); // operators 12..17
+        }
+        for ch in [6u8, 7, 8] {
+            opl.write_register(0xa0 + ch, 0x00);
+            opl.write_register(0xb0 + ch, (4 << 2) | 0x02); // block 4, fnum 0x200, no melodic key
+            opl.write_register(0xc0 + ch, 0x00);
+        }
+        opl.write_register(0xbd, 0x3f); // rhythm + all five instruments on
+        let peak = (0..1024).map(|_| opl.render_sample().0.abs()).max().unwrap();
+        assert!(peak > 1000, "percussion sounds, peak {peak}");
+    }
+
+    #[test]
+    fn rhythm_bass_drum_sounds_as_a_two_op_voice() {
+        let mut opl = OplChip::default();
+        loud_rhythm_op(&mut opl, 19); // op 15 = channel 6 carrier
+        opl.write_register(0xa6, 0x00);
+        opl.write_register(0xc6, 0x00); // FM, modulator silent -> clean carrier
+        opl.write_register(0xb6, (4 << 2) | 0x02); // block 4, fnum 0x200, no melodic key
+        opl.write_register(0xbd, 0x20 | 0x10); // rhythm + bass drum on
+        let peak = (0..256).map(|_| opl.render_sample().0.abs()).max().unwrap();
+        assert!(peak > 1000, "bass drum sounds, peak {peak}");
+    }
+
+    #[test]
+    fn rhythm_mode_silences_the_melodic_channel() {
+        // Channel 6 plays a melodic tone; enabling rhythm (bass drum unkeyed)
+        // replaces those operators, so the channel falls silent.
+        let melodic_peak = |bd: u8| {
+            let mut opl = OplChip::default();
+            loud_rhythm_op(&mut opl, 19); // op 15 = channel 6 carrier
+            opl.write_register(0xa6, 0x00);
+            opl.write_register(0xc6, 0x00); // FM
+            opl.write_register(0xb6, 0x20 | (4 << 2) | 0x02); // melodic KEY-ON, block 4
+            opl.write_register(0xbd, bd);
+            (0..256).map(|_| opl.render_sample().0.abs()).max().unwrap()
+        };
+        assert!(melodic_peak(0x00) > 1000, "channel 6 tone sounds without rhythm");
+        assert_eq!(melodic_peak(0x20), 0, "rhythm mode silences melodic channel 6");
     }
 
     #[test]
