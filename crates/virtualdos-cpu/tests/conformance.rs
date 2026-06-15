@@ -6,7 +6,10 @@ use virtualdos_cpu::{Cpu386, CpuError, SegmentIndex, SegmentRegister};
 // (see undefined_flags); reserved and unmodeled high bits are never compared.
 const MODELED_FLAGS: u32 = 0x0000_0fd5;
 const FLAG_CF: u32 = 0x0000_0001;
+const FLAG_PF: u32 = 0x0000_0004;
 const FLAG_AF: u32 = 0x0000_0010;
+const FLAG_ZF: u32 = 0x0000_0040;
+const FLAG_SF: u32 = 0x0000_0080;
 const FLAG_OF: u32 = 0x0000_0800;
 
 const MEM_SIZE: usize = 0x0100_0000; // 16 MiB covers the 24-bit address bus used by the suite
@@ -188,7 +191,11 @@ fn apply_state(cpu: &mut Cpu386, bus: &mut FlatBus, state: &TestState) {
 /// CF is undefined for SHL/SHR (and the /6 SHL alias) when the masked count reaches
 /// the operand size in bits, per the Intel SDM. SAR and the rotates keep CF defined
 /// at any count. See dev_docs/reference/80386-shift-flags.md. SF/ZF/PF and the
-/// result stay compared for every count. Arithmetic ops define every modeled flag.
+/// result stay compared for every count. For the 0xF6/0xF7 group the mask depends
+/// on /reg: TEST (/0, /1) leaves AF undefined; MUL/IMUL (/4, /5) define CF/OF and
+/// leave SF/ZF/AF/PF undefined; DIV/IDIV (/6, /7) leave all arithmetic flags
+/// undefined; NOT (/2) and NEG (/3) define every modeled flag. Arithmetic ops
+/// other than the 0xF6/0xF7 group define every modeled flag.
 /// The prefix-skip set below must mirror the CPU's `read_prefixes` exactly, or this
 /// helper and the CPU would disagree on which byte is the opcode.
 fn undefined_flags(bytes: &[u8], cl: u8) -> u32 {
@@ -213,7 +220,6 @@ fn undefined_flags(bytes: &[u8], cl: u8) -> u32 {
         op if op < 0x40 && (op & 0x07) < 6 => matches!((op >> 3) & 0x07, 1 | 4 | 6),
         0x84 | 0x85 | 0xa8 | 0xa9 => true,
         0x80 | 0x81 | 0x83 => matches!(reg, Some(1 | 4 | 6)),
-        0xf6 | 0xf7 => reg == Some(0),
         _ => false,
     };
 
@@ -246,6 +252,18 @@ fn undefined_flags(bytes: &[u8], cl: u8) -> u32 {
             }
         }
         return mask;
+    }
+
+    if matches!(opcode, 0xf6 | 0xf7) {
+        // /0 and the /1 alias are TEST (AF undefined). /4 MUL and /5 IMUL define CF/OF
+        // and leave SF/ZF/AF/PF undefined. /6 DIV and /7 IDIV leave every arithmetic
+        // flag undefined. /2 NOT touches no flag and /3 NEG defines every modeled flag.
+        return match reg {
+            Some(0 | 1) => FLAG_AF,
+            Some(4 | 5) => FLAG_SF | FLAG_ZF | FLAG_AF | FLAG_PF,
+            Some(6 | 7) => FLAG_CF | FLAG_OF | FLAG_SF | FLAG_ZF | FLAG_AF | FLAG_PF,
+            _ => 0,
+        };
     }
 
     if is_logic { FLAG_AF } else { 0 }
@@ -436,6 +454,34 @@ fn undefined_flags_marks_shifts() {
     // SAR and rotates keep CF defined at any count.
     assert_eq!(undefined_flags(&[0xd2, 0xf8, 0xf4], 20), AF | OF); // sar al,cl cl=20
     assert_eq!(undefined_flags(&[0xd2, 0xd8, 0xf4], 20), AF | OF); // rcr al,cl cl=20
+}
+
+#[test]
+fn undefined_flags_marks_muldiv() {
+    const CF: u32 = 0x0000_0001;
+    const PF: u32 = 0x0000_0004;
+    const AF: u32 = 0x0000_0010;
+    const ZF: u32 = 0x0000_0040;
+    const SF: u32 = 0x0000_0080;
+    const OF: u32 = 0x0000_0800;
+    // MUL/IMUL: CF/OF defined, SF/ZF/AF/PF undefined.
+    assert_eq!(undefined_flags(&[0xf6, 0xe3], 0), SF | ZF | AF | PF); // mul bl
+    assert_eq!(undefined_flags(&[0xf7, 0xe3], 0), SF | ZF | AF | PF); // mul bx
+    assert_eq!(undefined_flags(&[0xf6, 0xeb], 0), SF | ZF | AF | PF); // imul bl
+    // DIV/IDIV: every arithmetic flag undefined.
+    assert_eq!(
+        undefined_flags(&[0xf6, 0xf3], 0),
+        CF | OF | SF | ZF | AF | PF
+    ); // div bl
+    assert_eq!(
+        undefined_flags(&[0xf6, 0xfb], 0),
+        CF | OF | SF | ZF | AF | PF
+    ); // idiv bl
+    // NOT/NEG define every modeled flag.
+    assert_eq!(undefined_flags(&[0xf6, 0xd3], 0), 0); // not bl
+    assert_eq!(undefined_flags(&[0xf6, 0xdb], 0), 0); // neg bl
+    // TEST still masks AF.
+    assert_eq!(undefined_flags(&[0xf6, 0xc3, 0x01], 0), AF); // test bl, imm8
 }
 
 #[test]
