@@ -34,6 +34,8 @@ pub enum CpuError {
     GeneralProtection { selector: u16 },
     #[error("IDT vector {vector} is outside IDTR limit")]
     IdtLimit { vector: u8 },
+    #[error("divide error (#DE): divide by zero or quotient overflow")]
+    DivideError,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -781,6 +783,8 @@ impl Cpu386 {
                     }
                     4 => self.mul(value, false, BusWidth::Byte), // MUL
                     5 => self.mul(value, true, BusWidth::Byte),  // IMUL
+                    6 => self.div(value, false, BusWidth::Byte)?, // DIV
+                    7 => self.div(value, true, BusWidth::Byte)?, // IDIV
                     _ => {
                         return Err(CpuError::UnsupportedGroupOpcode {
                             opcode: 0xf6,
@@ -817,6 +821,8 @@ impl Cpu386 {
                     }
                     4 => self.mul(value, false, operand_size.bus_width()), // MUL
                     5 => self.mul(value, true, operand_size.bus_width()),  // IMUL
+                    6 => self.div(value, false, operand_size.bus_width())?, // DIV
+                    7 => self.div(value, true, operand_size.bus_width())?, // IDIV
                     _ => {
                         return Err(CpuError::UnsupportedGroupOpcode {
                             opcode: 0xf7,
@@ -2217,6 +2223,95 @@ impl Cpu386 {
         self.set_flag(FLAG_CF | FLAG_OF, significant);
     }
 
+    fn div(&mut self, operand: u32, signed: bool, width: BusWidth) -> ExecResult<()> {
+        // Divide the implicit dividend (AX / DX:AX / EDX:EAX) by the operand, writing the
+        // quotient to AL/AX/EAX and the remainder to AH/DX/EDX. Divide-by-zero and
+        // quotient overflow are checked BEFORE any register write and return DivideError
+        // (real-mode #DE delivery is deferred). Arithmetic flags are left undefined.
+        if operand & width_mask(width) == 0 {
+            return Err(CpuError::DivideError.into());
+        }
+        match (width, signed) {
+            (BusWidth::Byte, false) => {
+                let dividend = u32::from(self.read_gpr16(0));
+                let divisor = u32::from(operand as u8);
+                let quotient = dividend / divisor;
+                if quotient > 0xff {
+                    return Err(CpuError::DivideError.into());
+                }
+                self.write_gpr8(0, quotient as u8);
+                self.write_gpr8(4, (dividend % divisor) as u8);
+            }
+            (BusWidth::Byte, true) => {
+                let dividend = i32::from(self.read_gpr16(0) as i16);
+                let divisor = i32::from(operand as u8 as i8);
+                let (Some(quotient), Some(remainder)) =
+                    (dividend.checked_div(divisor), dividend.checked_rem(divisor))
+                else {
+                    return Err(CpuError::DivideError.into());
+                };
+                if !(i32::from(i8::MIN)..=i32::from(i8::MAX)).contains(&quotient) {
+                    return Err(CpuError::DivideError.into());
+                }
+                self.write_gpr8(0, quotient as u8);
+                self.write_gpr8(4, remainder as u8);
+            }
+            (BusWidth::Word, false) => {
+                let dividend =
+                    (u32::from(self.read_gpr16(2)) << 16) | u32::from(self.read_gpr16(0));
+                let divisor = u32::from(operand as u16);
+                let quotient = dividend / divisor;
+                if quotient > 0xffff {
+                    return Err(CpuError::DivideError.into());
+                }
+                self.write_gpr16(0, quotient as u16);
+                self.write_gpr16(2, (dividend % divisor) as u16);
+            }
+            (BusWidth::Word, true) => {
+                let dividend =
+                    ((u32::from(self.read_gpr16(2)) << 16) | u32::from(self.read_gpr16(0))) as i32;
+                let divisor = i32::from(operand as u16 as i16);
+                let (Some(quotient), Some(remainder)) =
+                    (dividend.checked_div(divisor), dividend.checked_rem(divisor))
+                else {
+                    return Err(CpuError::DivideError.into());
+                };
+                if !(i32::from(i16::MIN)..=i32::from(i16::MAX)).contains(&quotient) {
+                    return Err(CpuError::DivideError.into());
+                }
+                self.write_gpr16(0, quotient as u16);
+                self.write_gpr16(2, remainder as u16);
+            }
+            (BusWidth::Dword, false) => {
+                let dividend =
+                    (u64::from(self.read_gpr32(2)) << 32) | u64::from(self.read_gpr32(0));
+                let divisor = u64::from(operand);
+                let quotient = dividend / divisor;
+                if quotient > 0xffff_ffff {
+                    return Err(CpuError::DivideError.into());
+                }
+                self.write_gpr32(0, quotient as u32);
+                self.write_gpr32(2, (dividend % divisor) as u32);
+            }
+            (BusWidth::Dword, true) => {
+                let dividend =
+                    ((u64::from(self.read_gpr32(2)) << 32) | u64::from(self.read_gpr32(0))) as i64;
+                let divisor = i64::from(operand as i32);
+                let (Some(quotient), Some(remainder)) =
+                    (dividend.checked_div(divisor), dividend.checked_rem(divisor))
+                else {
+                    return Err(CpuError::DivideError.into());
+                };
+                if !(i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&quotient) {
+                    return Err(CpuError::DivideError.into());
+                }
+                self.write_gpr32(0, quotient as u32);
+                self.write_gpr32(2, remainder as u32);
+            }
+        }
+        Ok(())
+    }
+
     fn set_szp(&mut self, result: u32, width: BusWidth) {
         let mask = width_mask(width);
         let sign = width_sign(width);
@@ -3478,5 +3573,90 @@ mod tests {
         assert_eq!(cpu.registers.edx(), 0x0000_0001);
         assert!(cpu.flag(FLAG_CF));
         assert!(cpu.flag(FLAG_OF));
+    }
+
+    #[test]
+    fn div_byte_writes_quotient_and_remainder() {
+        // div bl (0xf6 /6, modrm 0xf3). ax=0x0011(17), bl=0x05 -> al=3, ah=2.
+        let mut memory = vec![0; 16];
+        memory[0..2].copy_from_slice(&[0xf6, 0xf3]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x0011);
+        cpu.write_reg16(Reg16::Bx, 0x0005);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x0203); // ah=2 (rem), al=3 (quot)
+    }
+
+    #[test]
+    fn div_word_writes_ax_and_dx() {
+        // div bx (0xf7 /6, modrm 0xf3). dx:ax = 0x0000:0x0011 (17), bx=5 -> ax=3 (quot), dx=2 (rem).
+        let mut memory = vec![0; 16];
+        memory[0..2].copy_from_slice(&[0xf7, 0xf3]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Dx, 0x0000);
+        cpu.write_reg16(Reg16::Ax, 0x0011);
+        cpu.write_reg16(Reg16::Bx, 0x0005);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x0003);
+        assert_eq!(cpu.read_reg16(Reg16::Dx), 0x0002);
+    }
+
+    #[test]
+    fn idiv_byte_negative_dividend_truncates_toward_zero() {
+        // idiv bl (0xf6 /7, modrm 0xfb). ax=-17=0xffef, bl=+5 -> quot=-3 (0xfd), rem=-2 (0xfe).
+        let mut memory = vec![0; 16];
+        memory[0..2].copy_from_slice(&[0xf6, 0xfb]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0xffef);
+        cpu.write_reg16(Reg16::Bx, 0x0005);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax) & 0xff, 0xfd); // al = -3
+        assert_eq!((cpu.read_reg16(Reg16::Ax) >> 8) & 0xff, 0xfe); // ah = -2
+    }
+
+    #[test]
+    fn div_by_zero_returns_error_without_writes() {
+        // div bl with bl=0 -> DivideError; ax unchanged.
+        let mut memory = vec![0; 16];
+        memory[0..2].copy_from_slice(&[0xf6, 0xf3]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x1234);
+        cpu.write_reg16(Reg16::Bx, 0x0000);
+        let mut bus = TestBus::with_memory(memory);
+
+        assert_eq!(cpu.cycle(&mut bus).unwrap_err(), CpuError::DivideError);
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x1234); // no writes
+    }
+
+    #[test]
+    fn div_quotient_overflow_returns_error() {
+        // div bl: ax=0xffff, bl=0x01 -> quotient 0xffff > 0xff -> DivideError.
+        let mut memory = vec![0; 16];
+        memory[0..2].copy_from_slice(&[0xf6, 0xf3]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0xffff);
+        cpu.write_reg16(Reg16::Bx, 0x0001);
+        let mut bus = TestBus::with_memory(memory);
+
+        assert_eq!(cpu.cycle(&mut bus).unwrap_err(), CpuError::DivideError);
     }
 }
