@@ -224,6 +224,26 @@ fn undefined_flags(bytes: &[u8], cl: u8) -> u32 {
             0xaf => FLAG_SF | FLAG_ZF | FLAG_AF | FLAG_PF,
             0xa3 | 0xab | 0xb3 | 0xbb | 0xba => FLAG_OF | FLAG_SF | FLAG_AF | FLAG_PF,
             0xbc | 0xbd => FLAG_CF | FLAG_OF | FLAG_SF | FLAG_AF | FLAG_PF,
+            0xa4 | 0xa5 | 0xac | 0xad => {
+                // SHLD/SHRD. AF is always undefined; OF is undefined unless the count is
+                // 1; for a count past the operand width the result is undefined, so
+                // CF/SF/ZF/PF are too. A count of 0 changes no flags. The imm8 count is
+                // the byte before the HLT terminator; the CL forms read the cl argument.
+                let width = if operand_size_override { 32 } else { 16 };
+                let count = match bytes.get(index + 1).copied().unwrap_or(0) {
+                    0xa4 | 0xac => bytes.get(bytes.len().wrapping_sub(2)).copied().unwrap_or(0),
+                    _ => cl,
+                } & 0x1f;
+                if count == 0 {
+                    0
+                } else if count == 1 {
+                    FLAG_AF
+                } else if u32::from(count) <= width {
+                    FLAG_AF | FLAG_OF
+                } else {
+                    FLAG_CF | FLAG_OF | FLAG_SF | FLAG_ZF | FLAG_AF | FLAG_PF
+                }
+            }
             _ => 0,
         };
     }
@@ -678,6 +698,35 @@ fn conformance_suite_report() {
     assert_eq!(
         parse_errors, 0,
         "{parse_errors} vector file(s) failed to parse; the report would understate coverage"
+    );
+}
+
+#[test]
+fn undefined_flags_covers_double_shift() {
+    // SHLD/SHRD imm8: the count is the byte before the HLT terminator (0xf4).
+    // count 0 -> no flags change, nothing undefined.
+    assert_eq!(undefined_flags(&[0x0f, 0xa4, 0xd8, 0x00, 0xf4], 0), 0);
+    // count 1 -> AF undefined (OF is defined for a single-bit count).
+    assert_eq!(undefined_flags(&[0x0f, 0xa4, 0xd8, 0x01, 0xf4], 0), FLAG_AF);
+    // count 4 on a 16-bit operand -> AF|OF.
+    assert_eq!(
+        undefined_flags(&[0x0f, 0xa4, 0xd8, 0x04, 0xf4], 0),
+        FLAG_AF | FLAG_OF
+    );
+    // count 20 on a 16-bit operand (> width) -> every arithmetic flag undefined.
+    assert_eq!(
+        undefined_flags(&[0x0f, 0xa4, 0xd8, 0x14, 0xf4], 0),
+        FLAG_CF | FLAG_OF | FLAG_SF | FLAG_ZF | FLAG_AF | FLAG_PF
+    );
+    // CL form (0xa5): the count comes from the cl argument. cl=4 -> AF|OF.
+    assert_eq!(
+        undefined_flags(&[0x0f, 0xa5, 0xd8, 0xf4], 4),
+        FLAG_AF | FLAG_OF
+    );
+    // 32-bit (0x66): a masked count of 20 is <= width 32, so AF|OF, not the >width case.
+    assert_eq!(
+        undefined_flags(&[0x66, 0x0f, 0xa4, 0xd8, 0x14, 0xf4], 0),
+        FLAG_AF | FLAG_OF
     );
 }
 
