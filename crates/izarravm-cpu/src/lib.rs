@@ -622,6 +622,42 @@ impl Cpu386 {
                 Ok(clocks(7))
             }
             0x90 => Ok(clocks(3)),
+            0x98 => {
+                // CBW / CWDE: sign-extend the accumulator into the next width.
+                match operand_size {
+                    OperandSize::Word => {
+                        let ax = i16::from(self.read_gpr8(0) as i8) as u16;
+                        self.write_gpr16(0, ax);
+                    }
+                    OperandSize::Dword => {
+                        let eax = i32::from(self.read_gpr16(0) as i16) as u32;
+                        self.write_gpr32(0, eax);
+                    }
+                }
+                Ok(clocks(3))
+            }
+            0x99 => {
+                // CWD / CDQ: fill (E)DX with the sign of the accumulator.
+                match operand_size {
+                    OperandSize::Word => {
+                        let dx = if (self.read_gpr16(0) as i16) < 0 {
+                            0xffff
+                        } else {
+                            0
+                        };
+                        self.write_gpr16(2, dx);
+                    }
+                    OperandSize::Dword => {
+                        let edx = if (self.read_gpr32(0) as i32) < 0 {
+                            0xffff_ffff
+                        } else {
+                            0
+                        };
+                        self.write_gpr32(2, edx);
+                    }
+                }
+                Ok(clocks(2))
+            }
             0xa1 => {
                 let offset = self.fetch_moffs(bus, address_size)?;
                 let value = self.read_memory_sized(
@@ -4213,5 +4249,87 @@ mod tests {
 
         assert_eq!(cpu.registers.eip, 0x00ee);
         assert!(!cpu.flag(FLAG_IF));
+    }
+
+    #[test]
+    fn cbw_sign_extends_al_into_ax() {
+        // cbw (0x98): al = 0x80 (-128) -> ax = 0xff80.
+        let mut memory = vec![0; 64];
+        memory[0] = 0x98;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_gpr8(0, 0x80);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0xff80);
+    }
+
+    #[test]
+    fn cwde_sign_extends_ax_into_eax() {
+        // 0x66 0x98 (CWDE): ax = 0x8000 -> eax = 0xffff_8000.
+        let mut memory = vec![0; 64];
+        memory[0..2].copy_from_slice(&[0x66, 0x98]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_eax(0x0000_8000);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eax(), 0xffff_8000);
+    }
+
+    #[test]
+    fn cwd_fills_dx_from_ax_sign() {
+        // cwd (0x99): ax = 0x8000 (negative) -> dx = 0xffff, ax unchanged.
+        let mut memory = vec![0; 64];
+        memory[0] = 0x99;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x8000);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Dx), 0xffff);
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x8000);
+    }
+
+    #[test]
+    fn cwd_clears_dx_for_positive_ax() {
+        // cwd (0x99): ax = 0x0001 (positive) -> dx = 0.
+        let mut memory = vec![0; 64];
+        memory[0] = 0x99;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x0001);
+        cpu.write_reg16(Reg16::Dx, 0xaaaa);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Dx), 0x0000);
+    }
+
+    #[test]
+    fn cdq_fills_edx_from_eax_sign() {
+        // 0x66 0x99 (CDQ): eax = 0x8000_0000 -> edx = 0xffff_ffff.
+        let mut memory = vec![0; 64];
+        memory[0..2].copy_from_slice(&[0x66, 0x99]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_eax(0x8000_0000);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.edx(), 0xffff_ffff);
     }
 }
