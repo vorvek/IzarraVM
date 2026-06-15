@@ -2745,6 +2745,22 @@ impl Cpu386 {
         let msb = 1u32 << (bits - 1);
         let mut d = dest & mask;
         let mut s = src & mask;
+        // A masked count past the operand width is undefined per Intel, but the 386
+        // leaves the destination as the source rotated by the count modulo the width:
+        // SHLD rotates left, SHRD rotates right. A 5-bit count never exceeds a 32-bit
+        // width, so this only applies to the 16-bit forms. The flags are undefined here
+        // and the conformance harness masks them. Derived from the SingleStepTests
+        // vectors.
+        if count > bits {
+            let n = count % bits;
+            let result = if left {
+                ((s << n) | (s >> (bits - n))) & mask
+            } else {
+                ((s >> n) | (s << (bits - n))) & mask
+            };
+            self.set_szp(result, operand_size.bus_width());
+            return result;
+        }
         // A nonzero count always overwrites cf on the first iteration; unlike the
         // rotate-through-carry shifts there is no carry-in to seed.
         let mut cf = false;
@@ -6163,5 +6179,42 @@ mod tests {
         assert_eq!(cpu.read_reg16(Reg16::Ax), 0x1234);
         assert!(cpu.flag(FLAG_CF));
         assert!(cpu.flag(FLAG_OF));
+    }
+
+    #[test]
+    fn shld_count_past_width_rotates_source() {
+        // shld ax, bx, 18 (0x0f 0xa4 0xd8 0x12): count 18 > 16 is undefined per Intel; the
+        // 386 leaves ax as the source rotated left by 18 mod 16 = 2. bx=0x1234 -> ax=0x48d0.
+        // The destination's prior value does not matter (preset 0xffff).
+        let mut memory = vec![0; 64];
+        memory[0..4].copy_from_slice(&[0x0f, 0xa4, 0xd8, 0x12]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0xffff);
+        cpu.write_reg16(Reg16::Bx, 0x1234);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x48d0);
+    }
+
+    #[test]
+    fn shrd_count_past_width_rotates_source() {
+        // shrd ax, bx, 18 (0x0f 0xac 0xd8 0x12): the 386 leaves ax as the source rotated
+        // right by 2. bx=0x1234 -> ax=0x048d.
+        let mut memory = vec![0; 64];
+        memory[0..4].copy_from_slice(&[0x0f, 0xac, 0xd8, 0x12]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0xffff);
+        cpu.write_reg16(Reg16::Bx, 0x1234);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x048d);
     }
 }
