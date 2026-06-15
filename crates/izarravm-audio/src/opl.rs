@@ -53,14 +53,16 @@ pub(crate) fn logsin(index: usize) -> u16 {
 
 /// Convert a log-domain attenuation to a linear amplitude, the way the chip
 /// does: the low 8 bits index the (reversed, +1024) exp ROM, the high bits are
-/// a right shift. `exp_lookup(0)` is the maximum half-amplitude (2042).
+/// a right shift. The `<< 1` makes this the full 13-bit operator output
+/// (`exp_lookup(0)` ~= 4084), matching the chip; the modulation depth in FM
+/// depends on this absolute scale.
 pub(crate) fn exp_lookup(attenuation: u32) -> i32 {
     let fraction = (attenuation & 0xff) as usize;
     let shift = attenuation >> 8;
     if shift >= 32 {
         return 0; // attenuated past audibility (and past a valid i32 shift)
     }
-    (i32::from(EXP[fraction ^ 0xff]) + 1024) >> shift
+    ((i32::from(EXP[fraction ^ 0xff]) + 1024) << 1) >> shift
 }
 
 /// Frequency multiplier (MULT register, 0..15), stored doubled so the phase
@@ -352,13 +354,14 @@ impl Operator {
     /// Operator-1 output with self-feedback (reg 0xC0 bits 1-3). The chip feeds
     /// the average of the last two outputs back into the phase to keep the loop
     /// stable. The radian table (FB 1..7 = pi/16..4*pi) doubles each step; in
-    /// phase units (1024 = 2*pi) full depth (4*pi) is the full-scale output, so
-    /// the average is shifted by `8 - FB` (one extra bit for the /2 average).
+    /// phase units (1024 = 2*pi) full depth (4*pi = 2048) is half the full-scale
+    /// 13-bit output, so the average is shifted by `9 - FB` (one bit for the /2
+    /// average, one for the half).
     pub(crate) fn render_feedback(&mut self, extra_attenuation: u16) -> i32 {
         let modulation = if self.feedback == 0 {
             0
         } else {
-            (self.feedback_history[0] + self.feedback_history[1]) >> (8 - self.feedback)
+            (self.feedback_history[0] + self.feedback_history[1]) >> (9 - self.feedback)
         };
         let out = self.sample_modulated(modulation, extra_attenuation);
         self.feedback_history = [out, self.feedback_history[0]];
@@ -1010,7 +1013,7 @@ mod tests {
             let got = f64::from(exp_lookup(attenuation));
             let expected = ((i as f64 + 0.5) * std::f64::consts::PI / 512.0).sin() * max;
             assert!(
-                (got - expected).abs() <= 4.0,
+                (got - expected).abs() <= 8.0,
                 "index {i}: got {got}, expected {expected}"
             );
         }
@@ -1028,11 +1031,7 @@ mod tests {
     fn rom_tables_match_their_known_anchor_values() {
         assert_eq!(logsin(0), 2137, "quietest log-sin entry");
         assert_eq!(logsin(255), 0, "loudest log-sin entry");
-        assert_eq!(
-            exp_lookup(0),
-            2042,
-            "max half-amplitude at zero attenuation"
-        );
+        assert_eq!(exp_lookup(0), 4084, "max amplitude at zero attenuation");
     }
 
     fn sine_operator(fnum: u16, block: u8, waveform: u8) -> Operator {
@@ -1081,9 +1080,9 @@ mod tests {
     }
 
     #[test]
-    fn operator_peaks_near_max_half_amplitude() {
+    fn operator_peaks_near_max_amplitude() {
         let peak = peak_magnitude(sine_operator(0x200, 4, 0), 512);
-        assert!((peak - 2042).abs() <= 4, "peak {peak}");
+        assert!((peak - 4084).abs() <= 8, "peak {peak}");
     }
 
     #[test]
@@ -1231,7 +1230,7 @@ mod tests {
         let fed = feedback_channel_samples(7);
         assert_ne!(plain, fed, "feedback must reshape the waveform");
         let peak = fed.iter().map(|s| s.abs()).max().unwrap();
-        assert!(peak <= 2100, "self-feedback stays bounded, got {peak}");
+        assert!(peak <= 4200, "self-feedback stays bounded, got {peak}");
     }
 
     #[test]
@@ -1286,10 +1285,10 @@ mod tests {
 
     #[test]
     fn opl3_waveform6_is_a_square_wave() {
-        // Constant full-scale magnitude (exp_lookup(0) = 2042), sign flips at half.
+        // Constant full-scale magnitude (exp_lookup(0) = 4084), sign flips at half.
         let mut op = sine_operator(0x200, 4, 6);
         for i in 0..128 {
-            let expected = if i < 64 { 2042 } else { -2042 };
+            let expected = if i < 64 { 4084 } else { -4084 };
             assert_eq!(op.sample(0), expected, "square wave, i={i}");
             op.advance();
         }
