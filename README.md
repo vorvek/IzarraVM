@@ -100,5 +100,7 @@ cargo build --workspace
 
 ## License
 
-MIT licensed. FreeDOS may be used as a behavioral reference for the DOS layer, but
-this project does not copy GPL FreeDOS code.
+GNU GPL v3.0 only (see [LICENSE](LICENSE)). The subsystems are clean-room
+reimplementations built from primary hardware/OS documentation; reference
+implementations (e.g. FreeDOS for the DOS layer, Nuked-OPL3 for audio) are used
+only as behavioral oracles to check assumptions, never copied or translated.
