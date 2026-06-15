@@ -3659,4 +3659,41 @@ mod tests {
 
         assert_eq!(cpu.cycle(&mut bus).unwrap_err(), CpuError::DivideError);
     }
+
+    #[test]
+    fn div_dword_writes_eax_edx() {
+        // div ebx (0x66 0xf7 /6, modrm 0xf3). edx:eax = 0x1_0000_0005, ebx=2
+        // -> quot=0x8000_0002, rem=1. Exercises the u64 dword path.
+        let mut memory = vec![0; 16];
+        memory[0..3].copy_from_slice(&[0x66, 0xf7, 0xf3]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_edx(0x0000_0001);
+        cpu.registers.set_eax(0x0000_0005);
+        cpu.registers.set_ebx(0x0000_0002);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eax(), 0x8000_0002); // quotient
+        assert_eq!(cpu.registers.edx(), 0x0000_0001); // remainder
+    }
+
+    #[test]
+    fn idiv_dword_min_over_negative_one_is_divide_error() {
+        // idiv ebx (0x66 0xf7 /7, modrm 0xfb). edx:eax = i64::MIN, ebx = -1.
+        // checked_div catches the overflow so this is #DE, not a panic.
+        let mut memory = vec![0; 16];
+        memory[0..3].copy_from_slice(&[0x66, 0xf7, 0xfb]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_edx(0x8000_0000);
+        cpu.registers.set_eax(0x0000_0000);
+        cpu.registers.set_ebx(0xffff_ffff);
+        let mut bus = TestBus::with_memory(memory);
+
+        assert_eq!(cpu.cycle(&mut bus).unwrap_err(), CpuError::DivideError);
+    }
 }
