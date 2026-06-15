@@ -6583,6 +6583,24 @@ mod tests {
     }
 
     #[test]
+    fn loope_falls_through_when_zero_flag_clear() {
+        // loope +5 (0xe1 0x05): cx=3, ZF=0 -> cx=2, not taken (LOOPE loops while ZF=1): eip = 2.
+        let mut memory = vec![0; 64];
+        memory[0..2].copy_from_slice(&[0xe1, 0x05]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Cx, 3);
+        cpu.set_flag(FLAG_ZF, false);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Cx), 2);
+        assert_eq!(cpu.registers.eip, 2);
+    }
+
+    #[test]
     fn jcxz_branches_only_when_cx_zero() {
         // jcxz +5 (0xe3 0x05): cx=0 -> taken (eip=7), no decrement.
         let mut memory = vec![0; 64];
@@ -6630,5 +6648,6 @@ mod tests {
         cpu.cycle(&mut bus).unwrap();
 
         assert_eq!(cpu.registers.eip, 8);
+        assert_eq!(cpu.registers.ecx(), 0); // JECXZ does not decrement
     }
 }
