@@ -216,6 +216,16 @@ fn undefined_flags(bytes: &[u8], cl: u8) -> u32 {
     let Some(&opcode) = bytes.get(index) else {
         return 0;
     };
+    // Two-byte 0F opcodes: key on the second opcode byte. This must precede the
+    // `reg` extraction below, which would otherwise read the second opcode byte as a
+    // ModRM. IMUL 0F AF defines CF/OF; BSF/BSR 0F BC/BD define ZF.
+    if opcode == 0x0f {
+        return match bytes.get(index + 1).copied().unwrap_or(0) {
+            0xaf => FLAG_SF | FLAG_ZF | FLAG_AF | FLAG_PF,
+            0xbc | 0xbd => FLAG_CF | FLAG_OF | FLAG_SF | FLAG_AF | FLAG_PF,
+            _ => 0,
+        };
+    }
     let reg = bytes.get(index + 1).map(|modrm| (modrm >> 3) & 0x07);
     let is_logic = match opcode {
         op if op < 0x40 && (op & 0x07) < 6 => matches!((op >> 3) & 0x07, 1 | 4 | 6),
@@ -490,6 +500,29 @@ fn undefined_flags_marks_muldiv() {
     assert_eq!(undefined_flags(&[0xf6, 0xdb], 0), 0); // neg bl
     // TEST still masks AF.
     assert_eq!(undefined_flags(&[0xf6, 0xc3, 0x01], 0), AF); // test bl, imm8
+}
+
+#[test]
+fn undefined_flags_covers_two_byte_opcodes() {
+    // IMUL 0F AF defines CF/OF and leaves SF/ZF/AF/PF undefined.
+    assert_eq!(
+        undefined_flags(&[0x0f, 0xaf, 0xc3], 0),
+        FLAG_SF | FLAG_ZF | FLAG_AF | FLAG_PF
+    );
+    // BSF/BSR 0F BC/BD define ZF and leave CF/OF/SF/AF/PF undefined.
+    assert_eq!(
+        undefined_flags(&[0x0f, 0xbc, 0xc3], 0),
+        FLAG_CF | FLAG_OF | FLAG_SF | FLAG_AF | FLAG_PF
+    );
+    assert_eq!(
+        undefined_flags(&[0x0f, 0xbd, 0xc3], 0),
+        FLAG_CF | FLAG_OF | FLAG_SF | FLAG_AF | FLAG_PF
+    );
+    // A 0x66 prefix in front is skipped and still resolves to the same mask.
+    assert_eq!(
+        undefined_flags(&[0x66, 0x0f, 0xaf, 0xc3], 0),
+        FLAG_SF | FLAG_ZF | FLAG_AF | FLAG_PF
+    );
 }
 
 #[test]
