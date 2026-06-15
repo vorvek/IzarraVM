@@ -743,6 +743,18 @@ impl Cpu386 {
                 self.load_flags(value, operand_size);
                 Ok(clocks(4))
             }
+            0x9e => {
+                // SAHF: load CF/PF/AF/ZF/SF from AH; OF and the reserved bits are untouched.
+                let ah = u32::from(self.read_gpr8(4));
+                self.registers.eflags = (self.registers.eflags & !0xd5) | (ah & 0xd5);
+                Ok(clocks(3))
+            }
+            0x9f => {
+                // LAHF: AH = low flag byte with bit1 forced 1, bits 3 and 5 forced 0.
+                let ah = ((self.registers.eflags as u8) & 0xd5) | 0x02;
+                self.write_gpr8(4, ah);
+                Ok(clocks(2))
+            }
             0xa1 => {
                 let offset = self.fetch_moffs(bus, address_size)?;
                 let value = self.read_memory_sized(
@@ -1089,8 +1101,18 @@ impl Cpu386 {
                 }
                 Ok(clocks(2))
             }
+            0xf5 => {
+                // CMC: complement the carry flag.
+                self.set_flag(FLAG_CF, !self.flag(FLAG_CF));
+                Ok(clocks(2))
+            }
             0xf8 => {
                 self.set_flag(FLAG_CF, false);
+                Ok(clocks(2))
+            }
+            0xf9 => {
+                // STC: set the carry flag.
+                self.set_flag(FLAG_CF, true);
                 Ok(clocks(2))
             }
             0xfa => {
@@ -4909,6 +4931,73 @@ mod tests {
         cpu.cycle(&mut bus).unwrap();
 
         assert!(cpu.flag(FLAG_IF));
+    }
+
+    #[test]
+    fn lahf_loads_flag_byte_into_ah() {
+        // lahf (0x9f). CF=PF=AF=ZF=SF=1 -> AH = 0xD5 | 0x02 = 0xD7; AL unchanged.
+        let mut memory = vec![0; 64];
+        memory[0] = 0x9f;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x0000);
+        cpu.set_flag(FLAG_CF, true);
+        cpu.set_flag(FLAG_PF, true);
+        cpu.set_flag(FLAG_AF, true);
+        cpu.set_flag(FLAG_ZF, true);
+        cpu.set_flag(FLAG_SF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax) >> 8, 0xd7);
+        assert_eq!(cpu.read_reg16(Reg16::Ax) & 0xff, 0x00);
+    }
+
+    #[test]
+    fn sahf_loads_flags_from_ah_leaving_overflow() {
+        // sahf (0x9e). AH=0xD7 -> CF=PF=AF=ZF=SF=1; OF untouched (stays 0).
+        let mut memory = vec![0; 64];
+        memory[0] = 0x9e;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0xd700); // AH=0xD7, AL=0
+        cpu.set_flag(FLAG_CF, false);
+        cpu.set_flag(FLAG_PF, false);
+        cpu.set_flag(FLAG_AF, false);
+        cpu.set_flag(FLAG_ZF, false);
+        cpu.set_flag(FLAG_SF, false);
+        cpu.set_flag(FLAG_OF, false);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert!(cpu.flag(FLAG_CF));
+        assert!(cpu.flag(FLAG_PF));
+        assert!(cpu.flag(FLAG_AF));
+        assert!(cpu.flag(FLAG_ZF));
+        assert!(cpu.flag(FLAG_SF));
+        assert!(!cpu.flag(FLAG_OF));
+    }
+
+    #[test]
+    fn stc_sets_carry_and_cmc_toggles_it() {
+        // stc (0xf9) sets CF; cmc (0xf5) toggles it back to 0.
+        let mut memory = vec![0; 64];
+        memory[0..2].copy_from_slice(&[0xf9, 0xf5]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.set_flag(FLAG_CF, false);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap(); // stc
+        assert!(cpu.flag(FLAG_CF));
+
+        cpu.cycle(&mut bus).unwrap(); // cmc
+        assert!(!cpu.flag(FLAG_CF));
     }
 
     #[test]
