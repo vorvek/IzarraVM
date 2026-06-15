@@ -518,13 +518,36 @@ impl OplChip {
         self.registers[1][0x05] & 0x01 != 0
     }
 
-    /// Render one mono sample at the chip's native 49716 Hz rate. OPL3 mode sums
-    /// all 18 two-op channels; otherwise the 9 OPL2 channels. (Stereo, 4-op and
-    /// rhythm mode are added in later layers.) The EG counter ticks per sample.
-    pub fn render_sample(&mut self) -> i32 {
+    /// Render one stereo `(left, right)` sample at the chip's native 49716 Hz
+    /// rate. OPL3 mode sums all 18 two-op channels; otherwise the 9 OPL2
+    /// channels. (4-op and rhythm mode are added in later layers.) The EG
+    /// counter ticks per sample.
+    pub fn render_sample(&mut self) -> (i32, i32) {
         self.eg_counter = self.eg_counter.wrapping_add(1);
         let channels = if self.opl3_enabled() { 18 } else { 9 };
-        (0..channels).map(|channel| self.render_channel(channel)).sum()
+        let (mut left, mut right) = (0, 0);
+        for channel in 0..channels {
+            let out = self.render_channel(channel);
+            let (l, r) = self.channel_pan(channel);
+            if l {
+                left += out;
+            }
+            if r {
+                right += out;
+            }
+        }
+        (left, right)
+    }
+
+    /// Which outputs a channel feeds. OPL3 pans via reg 0xC0 bit4 (left) / bit5
+    /// (right) on the carrier; OPL2 mode has no panning, so every channel feeds
+    /// both. A channel with neither bit set in OPL3 mode is silent.
+    fn channel_pan(&self, channel: usize) -> (bool, bool) {
+        if !self.opl3_enabled() {
+            return (true, true);
+        }
+        let c0 = self.registers[channel / 9][0xc0 + channel % 9];
+        (c0 & 0x10 != 0, c0 & 0x20 != 0)
     }
 
     fn render_channel(&mut self, channel: usize) -> i32 {
@@ -849,7 +872,7 @@ mod tests {
         opl.write_register(0xc0, 0x01 | (fb << 1)); // additive + feedback factor
         opl.write_register(0xa0, 0x00);
         opl.write_register(0xb0, 0x20 | (4 << 2) | 0x02); // key-on, block 4, fnum 0x200
-        (0..256).map(|_| opl.render_sample()).collect()
+        (0..256).map(|_| opl.render_sample().0).collect()
     }
 
     #[test]
@@ -976,7 +999,7 @@ mod tests {
     fn silent_chip_renders_zero() {
         let mut opl = OplChip::default();
         for _ in 0..64 {
-            assert_eq!(opl.render_sample(), 0);
+            assert_eq!(opl.render_sample(), (0, 0));
         }
     }
 
@@ -991,9 +1014,9 @@ mod tests {
         let rate = 49_716.0_f64;
         let expected = f64::from(fnum) * 2f64.powi(i32::from(block)) * rate / 2f64.powi(20);
         let mut crossings = 0u32;
-        let mut prev = opl.render_sample();
+        let mut prev = opl.render_sample().0;
         for _ in 1..rate as usize {
-            let s = opl.render_sample();
+            let s = opl.render_sample().0;
             if prev <= 0 && s > 0 {
                 crossings += 1;
             }
@@ -1012,7 +1035,7 @@ mod tests {
         let collect = |additive| {
             let mut opl = OplChip::default();
             program_channel0(&mut opl, 0x200, 4, additive, 0x00);
-            (0..128).map(|_| opl.render_sample()).collect::<Vec<_>>()
+            (0..128).map(|_| opl.render_sample().0).collect::<Vec<_>>()
         };
         assert_ne!(
             collect(false),
@@ -1034,7 +1057,7 @@ mod tests {
             opl.write_register(0xa0, 0x00); // f-number low
             opl.write_register(0xc0, 0x01); // additive, so the carrier reaches output
             opl.write_register(0xb0, 0x20 | (6 << 2) | 0x02); // key-on, block 6, fnum 0x200
-            (0..64).map(|_| opl.render_sample().abs()).max().unwrap()
+            (0..64).map(|_| opl.render_sample().0.abs()).max().unwrap()
         };
         let loud = peak(0);
         let scaled = peak(3);
@@ -1060,10 +1083,10 @@ mod tests {
             write_secondary(opl, 0x63, 0xf0); // attack 15 (instant)
             write_secondary(opl, 0x83, 0x00);
             write_secondary(opl, 0xa0, 0x00); // channel 9 f-number low
-            write_secondary(opl, 0xc0, 0x01); // additive
+            write_secondary(opl, 0xc0, 0x31); // additive + left/right enable
             write_secondary(opl, 0xb0, 0x20 | (4 << 2) | 0x02); // key-on, block 4, fnum 0x200
         };
-        let peak = |opl: &mut OplChip| (0..256).map(|_| opl.render_sample().abs()).max().unwrap();
+        let peak = |opl: &mut OplChip| (0..256).map(|_| opl.render_sample().0.abs()).max().unwrap();
 
         let mut off = OplChip::default();
         setup(&mut off);
@@ -1073,6 +1096,33 @@ mod tests {
         write_secondary(&mut on, 0x05, 0x01); // NEW: enable OPL3 mode
         setup(&mut on);
         assert!(peak(&mut on) > 1000, "secondary channel sounds in OPL3 mode");
+    }
+
+    #[test]
+    fn opl3_panning_routes_the_channel_to_selected_outputs() {
+        // reg 0xC0 bit4 = left, bit5 = right; neither set leaves the channel mute.
+        let peaks = |c0: u8| {
+            let mut opl = OplChip::default();
+            write_secondary(&mut opl, 0x05, 0x01); // NEW
+            write_secondary(&mut opl, 0x23, 0x21); // carrier sustained, multiple x1
+            write_secondary(&mut opl, 0x43, 0x00);
+            write_secondary(&mut opl, 0x63, 0xf0); // instant attack
+            write_secondary(&mut opl, 0x83, 0x00);
+            write_secondary(&mut opl, 0xa0, 0x00);
+            write_secondary(&mut opl, 0xc0, c0);
+            write_secondary(&mut opl, 0xb0, 0x20 | (4 << 2) | 0x02);
+            let (mut lpk, mut rpk) = (0, 0);
+            for _ in 0..256 {
+                let (l, r) = opl.render_sample();
+                lpk = lpk.max(l.abs());
+                rpk = rpk.max(r.abs());
+            }
+            (lpk, rpk)
+        };
+        assert!(matches!(peaks(0x11), (l, 0) if l > 1000), "additive, left only");
+        assert!(matches!(peaks(0x21), (0, r) if r > 1000), "additive, right only");
+        assert!(matches!(peaks(0x31), (l, r) if l > 1000 && r > 1000), "both");
+        assert_eq!(peaks(0x01), (0, 0), "no pan bits: silent");
     }
 
     #[test]
@@ -1091,7 +1141,7 @@ mod tests {
             opl.write_register(0xc0, 0x01); // additive
             opl.write_register(0xa0, 0x00);
             opl.write_register(0xb0, 0x20 | (4 << 2) | 0x02); // key-on, block 4, fnum 0x200
-            (0..256).any(|_| opl.render_sample() < 0)
+            (0..256).any(|_| opl.render_sample().0 < 0)
         };
         assert!(has_negative(0x00), "WSEnable off forces a full sine (has negatives)");
         assert!(!has_negative(0x20), "WSEnable on lets half-sine silence negatives");
