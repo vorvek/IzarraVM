@@ -9,6 +9,7 @@ authors.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+izarravm-audio = { path = "../izarravm-audio" }
 izarravm-bus = { path = "../izarravm-bus" }
 izarravm-core = { path = "../izarravm-core" }
 izarravm-cpu = { path = "../izarravm-cpu" }

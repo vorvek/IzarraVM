@@ -34,6 +34,7 @@ fn blackman(t: f64, half: f64) -> f64 {
 /// for the filter window across calls.
 ///
 /// [`process`]: Resampler::process
+#[derive(Debug, Clone)]
 pub struct Resampler {
     step: f64,               // input frames consumed per output frame
     next: f64,               // absolute output position (input-frame units), monotonic
