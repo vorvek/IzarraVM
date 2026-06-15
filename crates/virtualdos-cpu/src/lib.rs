@@ -779,6 +779,8 @@ impl Cpu386 {
                         let result = self.alu_sub(0, value, 0, BusWidth::Byte) as u8;
                         self.write_operand_u8(bus, operand, result)?;
                     }
+                    4 => self.mul(value, false, BusWidth::Byte), // MUL
+                    5 => self.mul(value, true, BusWidth::Byte),  // IMUL
                     _ => {
                         return Err(CpuError::UnsupportedGroupOpcode {
                             opcode: 0xf6,
@@ -813,6 +815,8 @@ impl Cpu386 {
                         let result = self.alu_sub(0, value, 0, operand_size.bus_width());
                         self.write_operand_sized(bus, operand, operand_size, result)?;
                     }
+                    4 => self.mul(value, false, operand_size.bus_width()), // MUL
+                    5 => self.mul(value, true, operand_size.bus_width()),  // IMUL
                     _ => {
                         return Err(CpuError::UnsupportedGroupOpcode {
                             opcode: 0xf7,
@@ -2168,6 +2172,51 @@ impl Cpu386 {
         result
     }
 
+    fn mul(&mut self, operand: u32, signed: bool, width: BusWidth) {
+        // Multiply the implicit accumulator (AL/AX/EAX) by the operand and store the
+        // wide product split across AH:AL / DX:AX / EDX:EAX. CF and OF are set when the
+        // high half is significant (unsigned: nonzero; signed: not the sign extension
+        // of the low half); SF/ZF/AF/PF are left untouched (undefined on the 386).
+        let significant = match (width, signed) {
+            (BusWidth::Byte, false) => {
+                let product = u16::from(self.read_gpr8(0)) * u16::from(operand as u8);
+                self.write_gpr16(0, product);
+                product & 0xff00 != 0
+            }
+            (BusWidth::Byte, true) => {
+                let product = i16::from(self.read_gpr8(0) as i8) * i16::from(operand as u8 as i8);
+                self.write_gpr16(0, product as u16);
+                product != i16::from(product as u8 as i8)
+            }
+            (BusWidth::Word, false) => {
+                let product = u32::from(self.read_gpr16(0)) * u32::from(operand as u16);
+                self.write_gpr16(0, product as u16);
+                self.write_gpr16(2, (product >> 16) as u16);
+                product >> 16 != 0
+            }
+            (BusWidth::Word, true) => {
+                let product =
+                    i32::from(self.read_gpr16(0) as i16) * i32::from(operand as u16 as i16);
+                self.write_gpr16(0, product as u16);
+                self.write_gpr16(2, (product >> 16) as u16);
+                product != i32::from(product as u16 as i16)
+            }
+            (BusWidth::Dword, false) => {
+                let product = u64::from(self.read_gpr32(0)) * u64::from(operand);
+                self.write_gpr32(0, product as u32);
+                self.write_gpr32(2, (product >> 32) as u32);
+                product >> 32 != 0
+            }
+            (BusWidth::Dword, true) => {
+                let product = i64::from(self.read_gpr32(0) as i32) * i64::from(operand as i32);
+                self.write_gpr32(0, product as u32);
+                self.write_gpr32(2, (product >> 32) as u32);
+                product != i64::from(product as u32 as i32)
+            }
+        };
+        self.set_flag(FLAG_CF | FLAG_OF, significant);
+    }
+
     fn set_szp(&mut self, result: u32, width: BusWidth) {
         let mask = width_mask(width);
         let sign = width_sign(width);
@@ -3308,5 +3357,105 @@ mod tests {
 
         assert_eq!(cpu.read_reg16(Reg16::Bx), 0xf00f);
         assert!(cpu.flag(FLAG_CF)); // NOT touches no flags
+    }
+
+    #[test]
+    fn mul_byte_sets_carry_when_high_nonzero() {
+        // mul bl (0xf6 /4, modrm 0xe3). al=0x10, bl=0x10 -> ax=0x0100; CF/OF set (ah != 0).
+        let mut memory = vec![0; 16];
+        memory[0..2].copy_from_slice(&[0xf6, 0xe3]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x0010);
+        cpu.write_reg16(Reg16::Bx, 0x0010);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x0100);
+        assert!(cpu.flag(FLAG_CF));
+        assert!(cpu.flag(FLAG_OF));
+    }
+
+    #[test]
+    fn mul_byte_clears_carry_when_high_zero() {
+        // mul bl. al=0x05, bl=0x03 -> ax=0x000f; CF/OF clear.
+        let mut memory = vec![0; 16];
+        memory[0..2].copy_from_slice(&[0xf6, 0xe3]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x0005);
+        cpu.write_reg16(Reg16::Bx, 0x0003);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x000f);
+        assert!(!cpu.flag(FLAG_CF));
+        assert!(!cpu.flag(FLAG_OF));
+    }
+
+    #[test]
+    fn mul_word_writes_dx_ax_preserving_high_halves() {
+        // mul bx (0xf7 /4, modrm 0xe3). ax=0x1000, bx=0x0010 -> product 0x0010_0000:
+        // ax=0x0000, dx=0x0001; CF/OF set. High 16 bits of EAX/EDX must survive.
+        let mut memory = vec![0; 16];
+        memory[0..2].copy_from_slice(&[0xf7, 0xe3]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_eax(0xaaaa_1000);
+        cpu.registers.set_edx(0xbbbb_0000);
+        cpu.registers.set_ebx(0x0000_0010);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eax(), 0xaaaa_0000); // ax=0, high preserved
+        assert_eq!(cpu.registers.edx(), 0xbbbb_0001); // dx=1, high preserved
+        assert!(cpu.flag(FLAG_CF));
+        assert!(cpu.flag(FLAG_OF));
+    }
+
+    #[test]
+    fn imul_byte_clears_carry_when_result_fits() {
+        // imul bl (0xf6 /5, modrm 0xeb). al=0xff(-1), bl=0x02(+2) -> ax=0xfffe(-2);
+        // CF/OF clear because the high half is the sign extension of the low half.
+        let mut memory = vec![0; 16];
+        memory[0..2].copy_from_slice(&[0xf6, 0xeb]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x00ff);
+        cpu.write_reg16(Reg16::Bx, 0x0002);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0xfffe);
+        assert!(!cpu.flag(FLAG_CF));
+        assert!(!cpu.flag(FLAG_OF));
+    }
+
+    #[test]
+    fn imul_byte_sets_carry_when_result_overflows() {
+        // imul bl. al=0x10(+16), bl=0x10(+16) -> ax=0x0100(+256); the low byte is 0x00,
+        // its sign extension is 0x0000 != 0x0100, so CF/OF set.
+        let mut memory = vec![0; 16];
+        memory[0..2].copy_from_slice(&[0xf6, 0xeb]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x0010);
+        cpu.write_reg16(Reg16::Bx, 0x0010);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x0100);
+        assert!(cpu.flag(FLAG_CF));
+        assert!(cpu.flag(FLAG_OF));
     }
 }
