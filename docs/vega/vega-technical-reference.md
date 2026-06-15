@@ -31,6 +31,8 @@ talks to the engine through the register block to move pixels without the CPU.
 - A blit engine: solid fill, screen to screen copy, monochrome color expand
   (text), and line draw, each with a raster operation, optional clipping, and
   optional color key.
+- A tiled pattern fill, a 64x64 hardware cursor, and a scaled video overlay with
+  YUV color conversion, for desktop work and CD video playback.
 - VESA VBE 2.0 compatible, with a linear frame buffer.
 
 The legacy VGA text mode and mode 13h remain available and are unchanged. They
@@ -166,6 +168,9 @@ Offsets below are relative to the block base.
 | 4 | Full ROP3 set honored (beyond plain copy and fill) |
 | 5 | `CLIP` honored |
 | 6 | `COLORKEY` honored |
+| 7 | `PATTERN_FILL` available |
+| 8 | Hardware cursor available |
+| 9 | Video overlay available |
 
 The register map in this manual is fixed. `CAPS` reports which parts the running
 build implements, so a driver written against the full map degrades cleanly on
@@ -208,6 +213,7 @@ Latch the parameters, then write `COMMAND` to run an operation.
 | `0x0138` | `CLIP_BR` | R/W | Clip rectangle bottom-right (Y:X packed). Exclusive. |
 | `0x013C` | `LINE_START` | R/W | Line start point (Y:X packed). |
 | `0x0140` | `LINE_END` | R/W | Line end point (Y:X packed). |
+| `0x0144` | `PAT_BASE` | R/W | Frame store offset of an 8x8 pattern in the destination format, row pitch `8 * DEPTH` bytes. Used by `PATTERN_FILL`. |
 | `0x0150` | `COMMAND` | W | Write a command code to start an operation. See section 7.4. |
 | `0x0160` | `MONO_DATA` | W | Monochrome data port for `COLOR_EXPAND_DATA`. See section 7.4. |
 
@@ -223,6 +229,7 @@ latched registers, with `BUSY` set for the duration.
 | `0x03` | `COLOR_EXPAND_DATA` | Expand a monochrome bitmap, streamed through `MONO_DATA`, into the destination rectangle. Set bits take `FG_COLOR`; clear bits take `BG_COLOR`, or are left untouched when `EXPAND_TRANSPARENT`. |
 | `0x04` | `COLOR_EXPAND_MEM` | As above, but the monochrome source is read from the frame store at `SRC_BASE` / `SRC_XY` with `SRC_PITCH`, 1 bit per pixel, most significant bit first. |
 | `0x05` | `LINE` | Draw a line from `LINE_START` to `LINE_END` in `FG_COLOR` through `ROP`. |
+| `0x06` | `PATTERN_FILL` | Fill the destination rectangle by tiling the 8x8 pattern at `PAT_BASE`, in the destination format. The pattern phase is aligned to the surface origin so adjacent fills tile seamlessly. `ROP` and color key apply, so a hatch pattern keys its background through. Monochrome GDI brushes are realized by expanding the brush once into an 8x8 color tile. |
 
 `COLOR_EXPAND_DATA` streams its source. After writing the command, write the
 bitmap to `MONO_DATA` one 32-bit word at a time, most significant bit first. Each
@@ -261,6 +268,62 @@ The default is `0xCC` for `COPY` and color expand, and `0xF0` for `FILL`. Codes
 outside this table are reserved. `CAPS` bit 4 reports whether the build honors
 the full set or only plain copy and fill.
 
+### 7.7 Hardware cursor
+
+A 64x64 two-plane cursor, composited by the display path so the CPU never blits
+the pointer. Its bitmap lives in the frame store as 64x64 at 2 bits per pixel: an
+AND bit and an XOR bit per pixel, 1024 bytes, packed most significant bit first.
+
+| AND | XOR | Result |
+|-----|-----|--------|
+| 0 | 0 | Background color (`CURSOR_BG`) |
+| 0 | 1 | Foreground color (`CURSOR_FG`) |
+| 1 | 0 | Transparent, the screen shows through |
+| 1 | 1 | The screen pixel inverted |
+
+| Offset | Name | Access | Description |
+|--------|------|--------|-------------|
+| `0x0028` | `CURSOR_CTRL` | R/W | Bit 0 `ENABLE`. Other bits reserved. |
+| `0x002C` | `CURSOR_ADDR` | R/W | Frame store offset of the 1024-byte cursor bitmap. |
+| `0x0030` | `CURSOR_POS` | R/W | Top-left screen position. Y in bits 31..16, X in bits 15..0, each a signed 16-bit value so the cursor can run off the top and left edges. The visible part is clipped to the screen. |
+| `0x0034` | `CURSOR_FG` | R/W | Foreground color, in the display format or a palette index in 8-bit modes. |
+| `0x0038` | `CURSOR_BG` | R/W | Background color. |
+
+Moving the pointer is one write to `CURSOR_POS` per frame, which is the point of
+the feature.
+
+### 7.8 Video overlay
+
+A scaled video window composited at scanout. The source is a YUV image in the
+frame store. The engine converts it to RGB by the BT.601 coefficients and scales
+it from its source size to a destination rectangle on screen, gated by a color
+key so desktop windows can occlude it. This is the path for CD video without
+spending the CPU on color conversion and scaling.
+
+Source formats:
+
+- **YUY2**: packed 4:2:2, 16 bits per pixel, byte order Y0, U, Y1, V.
+- **YV12**: planar 4:2:0, an 8-bit Y plane, then 8-bit V and U planes at half
+  width and half height.
+
+| Offset | Name | Access | Description |
+|--------|------|--------|-------------|
+| `0x0040` | `OVL_CTRL` | R/W | Bit 0 `ENABLE`. Bits 2..1 `FORMAT` (0 YUY2, 1 YV12). Bit 3 `KEY_EN`. |
+| `0x0044` | `OVL_SRC_Y` | R/W | Frame store offset of the Y plane, or of the packed surface for YUY2. |
+| `0x0048` | `OVL_SRC_PITCH` | R/W | Bytes per scanline of the Y or packed plane. |
+| `0x004C` | `OVL_SRC_DIM` | R/W | Source size. Height in bits 31..16, width in bits 15..0. |
+| `0x0050` | `OVL_SRC_U` | R/W | Frame store offset of the U plane (YV12 only). |
+| `0x0054` | `OVL_SRC_V` | R/W | Frame store offset of the V plane (YV12 only). |
+| `0x0058` | `OVL_DST_XY` | R/W | Destination top-left on screen (Y:X packed). |
+| `0x005C` | `OVL_DST_DIM` | R/W | Destination size. Height in bits 31..16, width in bits 15..0, the scaled size on screen. |
+| `0x0060` | `OVL_COLORKEY` | R/W | When `KEY_EN`, the overlay appears only where the primary surface equals this value. |
+
+Within the destination rectangle the engine samples the source scaled to the
+destination size, converts YUV to RGB, and presents it. With `KEY_EN`, an
+application paints `OVL_COLORKEY` into its video window, and the overlay shows
+there, hidden wherever another window draws over the key. Chroma is upsampled for
+the 4:2:0 format.
+
 ---
 
 ## 8. Coordinates, colors, and bounds
@@ -283,6 +346,8 @@ hardware. For Margo:
   silicon would take measurable time, and `BUSY` would clear later.
 - Mode changes and `DISP_START` take effect cleanly, without the analog timing
   of a real RAMDAC.
+- The video overlay scales by point sampling. Real silicon interpolated, for a
+  smoother scaled image.
 
 ---
 

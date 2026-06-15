@@ -234,6 +234,76 @@ void set_clip(int x0, int y0, int x1, int y1) {
 }
 ```
 
+## Tiling a pattern
+
+`PATTERN_FILL` tiles an 8x8 pattern across a rectangle instead of a solid color.
+Put the 8x8 tile somewhere in offscreen memory first, in the screen's pixel
+format, then point `PAT_BASE` at it. The tiling lines up to the surface origin,
+so two adjacent fills meet seamlessly.
+
+```c
+/* (target) */
+void pattern_fill(unsigned long base, int pitch, int bpp,
+                  unsigned long pat_offset,
+                  int x, int y, int w, int h) {
+    margo_wait();
+    REG(0x0100) = base;                 /* DST_BASE */
+    REG(0x0104) = pitch;                /* DST_PITCH */
+    REG(0x0110) = bpp / 8;              /* DEPTH */
+    REG(0x0114) = (y << 16) | x;        /* DST_XY */
+    REG(0x011C) = (h << 16) | w;        /* DIM */
+    REG(0x0144) = pat_offset;           /* PAT_BASE: the 8x8 tile */
+    REG(0x0128) = 0xCC;                 /* ROP = SRCCOPY */
+    REG(0x0150) = 0x06;                 /* COMMAND = PATTERN_FILL */
+    margo_wait();
+}
+```
+
+## The hardware cursor
+
+The cursor is a 64x64 two-plane bitmap in offscreen memory and a position. Point
+the engine at the bitmap, set the two colors, and enable it. From then on, moving
+the pointer is one register write per frame, and the CPU never touches the
+screen under it.
+
+```c
+/* (target) */
+void enable_cursor(unsigned long bitmap_offset,
+                   unsigned long fg, unsigned long bg) {
+    REG(0x002C) = bitmap_offset;        /* CURSOR_ADDR: 64x64 2bpp AND/XOR */
+    REG(0x0034) = fg;                   /* CURSOR_FG */
+    REG(0x0038) = bg;                   /* CURSOR_BG */
+    REG(0x0028) = 1;                    /* CURSOR_CTRL = ENABLE */
+}
+
+void move_cursor(int x, int y) {
+    REG(0x0030) = ((y & 0xFFFF) << 16) | (x & 0xFFFF);   /* CURSOR_POS */
+}
+```
+
+## Playing video through the overlay
+
+The overlay takes a YUV image, converts it to RGB, and scales it into a window,
+all in hardware. Decode each frame into a YUV buffer in offscreen memory, point
+the overlay at it, and key it through the desktop. To show the overlay, paint the
+color key into the window; to hide a region, draw over the key as usual.
+
+```c
+/* (target) */
+/* Show a YUY2 frame (already in offscreen memory) scaled into a window. */
+void show_overlay(unsigned long y_offset, int src_pitch, int sw, int sh,
+                  int dx, int dy, int dw, int dh, unsigned long key) {
+    REG(0x0044) = y_offset;             /* OVL_SRC_Y (packed surface) */
+    REG(0x0048) = src_pitch;            /* OVL_SRC_PITCH */
+    REG(0x004C) = (sh << 16) | sw;      /* OVL_SRC_DIM */
+    REG(0x0058) = (dy << 16) | dx;      /* OVL_DST_XY */
+    REG(0x005C) = (dh << 16) | dw;      /* OVL_DST_DIM, the scaled size */
+    REG(0x0060) = key;                  /* OVL_COLORKEY */
+    REG(0x0040) = 1 | (0 << 1) | (1 << 3);  /* ENABLE, FORMAT=YUY2, KEY_EN */
+    /* Then fill the window with `key` so the overlay shows through. */
+}
+```
+
 ## Putting it together
 
 A desktop redraw is these primitives in sequence: fill the background, copy
