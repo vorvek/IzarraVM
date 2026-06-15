@@ -46,6 +46,13 @@ impl Framebuffer {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VideoMode {
+    #[default]
+    Text,
+    Mode13h,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TextCell {
     pub character: u8,
@@ -96,6 +103,7 @@ impl TextFrame {
 pub struct VgaTextMode {
     memory: [u8; VGA_TEXT_MEMORY_SIZE],
     mode13h: Framebuffer,
+    mode: VideoMode,
     crtc_index: u8,
     cursor_offset: u16,
 }
@@ -111,6 +119,7 @@ impl Default for VgaTextMode {
         Self {
             memory,
             mode13h: Framebuffer::mode13h(),
+            mode: VideoMode::Text,
             crtc_index: 0,
             cursor_offset: 0,
         }
@@ -158,6 +167,11 @@ impl VgaTextMode {
 
     pub fn set_mode13h(&mut self) {
         self.mode13h = Framebuffer::mode13h();
+        self.mode = VideoMode::Mode13h;
+    }
+
+    pub fn active_mode(&self) -> VideoMode {
+        self.mode
     }
 
     pub fn read_port(&self, port: u16) -> Option<u8> {
@@ -315,5 +329,13 @@ mod tests {
         let adapter = PlaceholderVideoAdapter::new(VideoCard::Et4000Ax);
         assert_eq!(adapter.card(), VideoCard::Et4000Ax);
         assert_eq!(adapter.framebuffer().indexed_pixels.len(), 64_000);
+    }
+
+    #[test]
+    fn set_mode13h_switches_active_mode() {
+        let mut video = VgaTextMode::default();
+        assert_eq!(video.active_mode(), VideoMode::Text);
+        video.set_mode13h();
+        assert_eq!(video.active_mode(), VideoMode::Mode13h);
     }
 }
