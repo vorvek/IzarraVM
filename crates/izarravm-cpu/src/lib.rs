@@ -496,6 +496,33 @@ impl Cpu386 {
                 self.write_gpr_sized(index, operand_size, value);
                 Ok(clocks(4))
             }
+            0x60 => {
+                // PUSHA / PUSHAD: push AX, CX, DX, BX, the pre-instruction SP, BP, SI, DI.
+                let sp_snapshot = self.read_gpr_sized(4, operand_size);
+                for index in [0u8, 1, 2, 3] {
+                    let value = self.read_gpr_sized(index, operand_size);
+                    self.push(bus, value, operand_size)?;
+                }
+                self.push(bus, sp_snapshot, operand_size)?;
+                for index in [5u8, 6, 7] {
+                    let value = self.read_gpr_sized(index, operand_size);
+                    self.push(bus, value, operand_size)?;
+                }
+                Ok(clocks(18))
+            }
+            0x61 => {
+                // POPA / POPAD: pop DI, SI, BP, discard the SP slot, then BX, DX, CX, AX.
+                for index in [7u8, 6, 5] {
+                    let value = self.pop(bus, operand_size)?;
+                    self.write_gpr_sized(index, operand_size, value);
+                }
+                self.pop(bus, operand_size)?; // SP slot is discarded, SP advances over it
+                for index in [3u8, 2, 1, 0] {
+                    let value = self.pop(bus, operand_size)?;
+                    self.write_gpr_sized(index, operand_size, value);
+                }
+                Ok(clocks(18))
+            }
             0x68 => {
                 let value = self.fetch_immediate(bus, operand_size)?;
                 self.push(bus, value, operand_size)?;
@@ -820,6 +847,14 @@ impl Cpu386 {
                 let value = self.fetch_immediate(bus, operand_size)?;
                 self.write_rm_sized(bus, prefixes, address_size, operand_size, modrm, value)?;
                 Ok(clocks(2))
+            }
+            0xc9 => {
+                // LEAVE: (E)SP <- (E)BP; (E)BP <- pop.
+                let frame = self.read_gpr_sized(5, operand_size);
+                self.write_gpr_sized(4, operand_size, frame);
+                let saved = self.pop(bus, operand_size)?;
+                self.write_gpr_sized(5, operand_size, saved);
+                Ok(clocks(4))
             }
             0xcd => {
                 let vector = self.fetch_u8(bus)?;
@@ -4402,5 +4437,66 @@ mod tests {
 
         assert!(cpu.flag(FLAG_CF));
         assert_eq!(cpu.registers.eflags & 0x2, 0x2);
+    }
+
+    #[test]
+    fn leave_restores_sp_and_bp() {
+        // leave (0xc9): sp <- bp; bp <- pop. bp = 0x0200, [ss:0x0200] = 0x1234.
+        // Result: bp = 0x1234, sp = 0x0202 (0x0200 then +2 from the pop).
+        let mut memory = vec![0; 1024];
+        memory[0] = 0xc9;
+        memory[0x200..0x202].copy_from_slice(&0x1234u16.to_le_bytes());
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0080);
+        cpu.write_gpr16(5, 0x0200); // BP
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_gpr16(5), 0x1234);
+        assert_eq!(cpu.read_gpr16(4), 0x0202);
+    }
+
+    #[test]
+    fn pusha_then_popa_round_trips_and_saves_original_sp() {
+        // pusha (0x60) ; popa (0x61). All GPRs round-trip; the SP slot holds the
+        // pre-pusha SP and popa discards it, so SP returns to its starting value.
+        let mut memory = vec![0; 1024];
+        memory[0] = 0x60;
+        memory[1] = 0x61;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        cpu.write_gpr16(0, 0x1111);
+        cpu.write_gpr16(1, 0x2222);
+        cpu.write_gpr16(2, 0x3333);
+        cpu.write_gpr16(3, 0x4444);
+        cpu.write_gpr16(5, 0x6666);
+        cpu.write_gpr16(6, 0x7777);
+        cpu.write_gpr16(7, 0x8888);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap(); // pusha: 8 words, sp 0x0100 -> 0x00f0
+        assert_eq!(cpu.read_gpr16(4), 0x00f0);
+        // the 5th push (the SP slot) lands at 0x0100 - 2*5 = 0x00f6 and holds 0x0100
+        assert_eq!(
+            u16::from_le_bytes([bus.memory[0xf6], bus.memory[0xf7]]),
+            0x0100
+        );
+
+        cpu.cycle(&mut bus).unwrap(); // popa
+        assert_eq!(cpu.read_gpr16(0), 0x1111);
+        assert_eq!(cpu.read_gpr16(1), 0x2222);
+        assert_eq!(cpu.read_gpr16(2), 0x3333);
+        assert_eq!(cpu.read_gpr16(3), 0x4444);
+        assert_eq!(cpu.read_gpr16(5), 0x6666);
+        assert_eq!(cpu.read_gpr16(6), 0x7777);
+        assert_eq!(cpu.read_gpr16(7), 0x8888);
+        assert_eq!(cpu.read_gpr16(4), 0x0100);
     }
 }
