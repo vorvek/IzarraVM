@@ -1779,7 +1779,9 @@ impl Cpu386 {
 
     fn check_lock_target<B: CpuBus>(&mut self, bus: &mut B, opcode: u8) -> ExecResult<()> {
         // The byte after the opcode sits at eip (the ModRM, or for 0F the second opcode byte).
-        // Peeking re-reads an instruction byte; it changes no register or memory state.
+        // Peeking re-reads an instruction byte; in real mode it changes no register or memory
+        // state. Under paging it may set the page-table accessed bit, as the following fetch
+        // would anyway.
         let eip = self.registers.eip;
         let lockable = match opcode {
             // ALU r/m, reg (destination is r/m): ADD/OR/ADC/SBB/AND/SUB/XOR, and XCHG.
@@ -7294,6 +7296,44 @@ mod tests {
         // lock mov ax, bx (0xf0 0x89 0xd8). MOV is not lockable -> #UD.
         let mut memory = vec![0; 1024];
         memory[0..3].copy_from_slice(&[0xf0, 0x89, 0xd8]);
+        memory[0x18] = 0xee;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        cpu.set_flag(FLAG_IF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eip, 0x00ee);
+        assert!(!cpu.flag(FLAG_IF));
+    }
+
+    #[test]
+    fn lock_bts_imm_to_memory_executes() {
+        // lock bts [0x40], 3 (0xf0 0x0f 0xba 0x2e 0x40 0x00 0x03, /5 = BTS). set bit 3 of [0x40].
+        let mut memory = vec![0; 128];
+        memory[0..7].copy_from_slice(&[0xf0, 0x0f, 0xba, 0x2e, 0x40, 0x00, 0x03]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        cpu.set_flag(FLAG_CF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(bus.memory[0x40], 0x08); // bit 3 set
+        assert!(!cpu.flag(FLAG_CF)); // old bit was 0
+    }
+
+    #[test]
+    fn lock_btc_imm_register_delivers_ud() {
+        // lock btc bx, 5 (0xf0 0x0f 0xba 0xfb 0x05, /7 = BTC, mod=3 register dest) -> #UD.
+        let mut memory = vec![0; 1024];
+        memory[0..5].copy_from_slice(&[0xf0, 0x0f, 0xba, 0xfb, 0x05]);
         memory[0x18] = 0xee;
         let mut cpu = Cpu386::default();
         cpu.load_segment_real(SegmentIndex::Cs, 0);
