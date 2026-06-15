@@ -1145,6 +1145,7 @@ dependencies = [
 name = "izarravm-machine"
 version = "0.1.0"
 dependencies = [
+ "izarravm-audio",
  "izarravm-bus",
  "izarravm-core",
  "izarravm-cpu",
