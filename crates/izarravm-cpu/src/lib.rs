@@ -1105,6 +1105,39 @@ impl Cpu386 {
                         self.push(bus, value, operand_size)?;
                         Ok(clocks(2))
                     }
+                    3 | 5 => {
+                        // Far CALL (/3) and far JMP (/5) via memory. The operand must be memory;
+                        // mod=3 is an invalid encoding and faults as #UD.
+                        let memory = match operand {
+                            RmOperand::Memory(memory) => memory,
+                            RmOperand::Register(_) => {
+                                return Err(InternalFault::Exception {
+                                    vector: 6,
+                                    error_code: None,
+                                });
+                            }
+                        };
+                        let offset = self.read_memory_sized(
+                            bus,
+                            memory.segment,
+                            memory.offset,
+                            operand_size,
+                            BusAccessKind::DataRead,
+                        )?;
+                        let selector = self.read_memory_sized(
+                            bus,
+                            memory.segment,
+                            memory.offset + operand_size.bytes(),
+                            OperandSize::Word,
+                            BusAccessKind::DataRead,
+                        )? as u16;
+                        if modrm.reg == 3 {
+                            self.far_call(bus, selector, offset, operand_size)?;
+                        } else {
+                            self.far_jump(bus, selector, offset, operand_size)?;
+                        }
+                        Ok(clocks(11))
+                    }
                     extension => Err(CpuError::UnsupportedGroupOpcode {
                         opcode: 0xff,
                         extension,
@@ -4831,5 +4864,100 @@ mod tests {
             u16::from_le_bytes([bus.memory[0xfc], bus.memory[0xfd]]),
             0x0005
         );
+    }
+
+    #[test]
+    fn far_call_via_memory_pushes_return_and_transfers() {
+        // call far [0x0200]  (0xff 0x1e 0x00 0x02), a 4-byte instruction. The far
+        // pointer at ds:0x0200 is offset 0x0100, selector 0x3000.
+        let mut memory = vec![0; 1024];
+        memory[0..4].copy_from_slice(&[0xff, 0x1e, 0x00, 0x02]);
+        memory[0x200..0x204].copy_from_slice(&[0x00, 0x01, 0x00, 0x30]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.cs().selector, 0x3000);
+        assert_eq!(cpu.registers.eip, 0x0100);
+        assert_eq!(cpu.read_gpr16(4), 0x00fc);
+        // return CS 0x0000 at the higher slot, return IP 0x0004 below it
+        assert_eq!(
+            u16::from_le_bytes([bus.memory[0xfe], bus.memory[0xff]]),
+            0x0000
+        );
+        assert_eq!(
+            u16::from_le_bytes([bus.memory[0xfc], bus.memory[0xfd]]),
+            0x0004
+        );
+    }
+
+    #[test]
+    fn far_jmp_via_memory_transfers_without_pushing() {
+        // jmp far [0x0200]  (0xff 0x2e 0x00 0x02). Pointer = offset 0x0100, selector 0x3000.
+        let mut memory = vec![0; 1024];
+        memory[0..4].copy_from_slice(&[0xff, 0x2e, 0x00, 0x02]);
+        memory[0x200..0x204].copy_from_slice(&[0x00, 0x01, 0x00, 0x30]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.cs().selector, 0x3000);
+        assert_eq!(cpu.registers.eip, 0x0100);
+        assert_eq!(cpu.read_gpr16(4), 0x0100); // nothing pushed
+    }
+
+    #[test]
+    fn far_call_via_register_operand_delivers_ud() {
+        // 0xff /3 with mod=3 (0xff 0xd8) is an invalid encoding -> #UD (vector 6).
+        // IVT[6] at 0x18 points to IP 0x00ee, CS 0; the CPU vectors there and clears IF.
+        let mut memory = vec![0; 1024];
+        memory[0..2].copy_from_slice(&[0xff, 0xd8]);
+        memory[0x18] = 0xee;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        cpu.set_flag(FLAG_IF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eip, 0x00ee);
+        assert!(!cpu.flag(FLAG_IF));
+    }
+
+    #[test]
+    fn far_jmp_via_register_operand_delivers_ud() {
+        // 0xff /5 with mod=3 (0xff 0xe8) is an invalid encoding -> #UD (vector 6).
+        // The conformance suite pre-skips exception vectors, so this is the only
+        // guard that the register form of the far JMP faults rather than transfers.
+        let mut memory = vec![0; 1024];
+        memory[0..2].copy_from_slice(&[0xff, 0xe8]);
+        memory[0x18] = 0xee;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        cpu.set_flag(FLAG_IF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eip, 0x00ee);
+        assert!(!cpu.flag(FLAG_IF));
     }
 }
