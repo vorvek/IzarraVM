@@ -951,6 +951,28 @@ impl Cpu386 {
                 self.iret(bus, operand_size)?;
                 Ok(clocks(22))
             }
+            0xe0 | 0xe1 => {
+                // LOOPNE (E0) / LOOPE (E1): decrement (E)CX, branch while non-zero and ZF matches.
+                let rel = self.fetch_i8(bus)? as i32;
+                let count_nonzero = match address_size {
+                    AddressSize::Word => {
+                        let next = self.read_gpr16(1).wrapping_sub(1);
+                        self.write_gpr16(1, next);
+                        next != 0
+                    }
+                    AddressSize::Dword => {
+                        let next = self.registers.ecx().wrapping_sub(1);
+                        self.registers.set_ecx(next);
+                        next != 0
+                    }
+                };
+                let zf = self.flag(FLAG_ZF);
+                let taken = count_nonzero && (if opcode == 0xe1 { zf } else { !zf });
+                if taken {
+                    self.relative_jump(rel, operand_size);
+                }
+                Ok(clocks(11))
+            }
             0xe2 => {
                 let rel = self.fetch_i8(bus)? as i32;
                 let taken = match address_size {
@@ -969,6 +991,18 @@ impl Cpu386 {
                     self.relative_jump(rel, operand_size);
                 }
                 Ok(clocks(11))
+            }
+            0xe3 => {
+                // JCXZ / JECXZ: no decrement; branch when (E)CX is zero.
+                let rel = self.fetch_i8(bus)? as i32;
+                let count_zero = match address_size {
+                    AddressSize::Word => self.read_gpr16(1) == 0,
+                    AddressSize::Dword => self.registers.ecx() == 0,
+                };
+                if count_zero {
+                    self.relative_jump(rel, operand_size);
+                }
+                Ok(clocks(9))
             }
             0xe4 => {
                 let port = u16::from(self.fetch_u8(bus)?);
@@ -6474,5 +6508,127 @@ mod tests {
         assert_eq!(cpu.read_reg16(Reg16::Ax) & 0xff, 0x99); // AL got the memory byte
         assert_eq!(bus.memory[0x30], 0x55); // memory got AL
         assert_eq!(cpu.registers.eip, 3); // opcode + modrm + disp8, no extra fetch
+    }
+
+    #[test]
+    fn loopne_decrements_cx_and_branches_while_not_equal() {
+        // loopne +5 (0xe0 0x05). cx=3, ZF=0 -> cx=2, taken: eip = 2 + 5 = 7.
+        let mut memory = vec![0; 64];
+        memory[0..2].copy_from_slice(&[0xe0, 0x05]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Cx, 3);
+        cpu.set_flag(FLAG_ZF, false);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Cx), 2);
+        assert_eq!(cpu.registers.eip, 7);
+    }
+
+    #[test]
+    fn loopne_falls_through_when_zero_flag_set() {
+        // loopne +5: cx=3, ZF=1 -> cx=2, not taken (LOOPNE loops while ZF=0): eip = 2.
+        let mut memory = vec![0; 64];
+        memory[0..2].copy_from_slice(&[0xe0, 0x05]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Cx, 3);
+        cpu.set_flag(FLAG_ZF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Cx), 2);
+        assert_eq!(cpu.registers.eip, 2);
+    }
+
+    #[test]
+    fn loopne_falls_through_when_count_reaches_zero() {
+        // loopne +5: cx=1, ZF=0 -> cx=0, not taken (count zero): eip = 2.
+        let mut memory = vec![0; 64];
+        memory[0..2].copy_from_slice(&[0xe0, 0x05]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Cx, 1);
+        cpu.set_flag(FLAG_ZF, false);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Cx), 0);
+        assert_eq!(cpu.registers.eip, 2);
+    }
+
+    #[test]
+    fn loope_branches_while_equal() {
+        // loope +5 (0xe1 0x05): cx=3, ZF=1 -> cx=2, taken: eip = 7.
+        let mut memory = vec![0; 64];
+        memory[0..2].copy_from_slice(&[0xe1, 0x05]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Cx, 3);
+        cpu.set_flag(FLAG_ZF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Cx), 2);
+        assert_eq!(cpu.registers.eip, 7);
+    }
+
+    #[test]
+    fn jcxz_branches_only_when_cx_zero() {
+        // jcxz +5 (0xe3 0x05): cx=0 -> taken (eip=7), no decrement.
+        let mut memory = vec![0; 64];
+        memory[0..2].copy_from_slice(&[0xe3, 0x05]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Cx, 0);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Cx), 0);
+        assert_eq!(cpu.registers.eip, 7);
+    }
+
+    #[test]
+    fn jcxz_falls_through_when_cx_nonzero() {
+        // jcxz +5: cx=1 -> not taken: eip = 2.
+        let mut memory = vec![0; 64];
+        memory[0..2].copy_from_slice(&[0xe3, 0x05]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Cx, 1);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Cx), 1);
+        assert_eq!(cpu.registers.eip, 2);
+    }
+
+    #[test]
+    fn jecxz_uses_ecx_with_address_override() {
+        // 0x67 jecxz +5 (0x67 0xe3 0x05): ecx=0 -> taken: eip = 3 + 5 = 8.
+        let mut memory = vec![0; 64];
+        memory[0..3].copy_from_slice(&[0x67, 0xe3, 0x05]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_gpr32(1, 0); // ecx = 0
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eip, 8);
     }
 }
