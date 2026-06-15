@@ -6984,4 +6984,49 @@ mod tests {
         assert!(!cpu.flag(FLAG_CF));
         assert!(!cpu.flag(FLAG_AF));
     }
+
+    #[test]
+    fn aaa_aux_carry_triggers_adjust() {
+        // aaa: AL=0x01 (low nibble <= 9), AF=1 -> the adjust fires on AF alone.
+        // AX=0x0001 + 0x106 = 0x0107, then AL &= 0x0f -> AX=0x0107; AL=0x07, AH=0x01, CF=1, AF=1.
+        let mut memory = vec![0; 64];
+        memory[0] = 0x37;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x0001);
+        cpu.set_flag(FLAG_AF, true);
+        cpu.set_flag(FLAG_CF, false);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax) & 0xff, 0x07);
+        assert_eq!(cpu.read_reg16(Reg16::Ax) >> 8, 0x01);
+        assert!(cpu.flag(FLAG_CF));
+        assert!(cpu.flag(FLAG_AF));
+    }
+
+    #[test]
+    fn aas_aux_carry_triggers_adjust() {
+        // aas: AL=0x08 (low nibble <= 9, >= 6 so no extra AH borrow), AF=1 -> the adjust
+        // fires on AF alone. AX=0x0208 - 6 = 0x0202, AH-1 -> 0x0102, AL &= 0x0f -> AX=0x0102;
+        // AL=0x02, AH=0x01, CF=1, AF=1.
+        let mut memory = vec![0; 64];
+        memory[0] = 0x3f;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x0208);
+        cpu.set_flag(FLAG_AF, true);
+        cpu.set_flag(FLAG_CF, false);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax) & 0xff, 0x02);
+        assert_eq!(cpu.read_reg16(Reg16::Ax) >> 8, 0x01);
+        assert!(cpu.flag(FLAG_CF));
+        assert!(cpu.flag(FLAG_AF));
+    }
 }
