@@ -300,12 +300,23 @@ enum AddressSize {
     Dword,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepKind {
+    Repe,
+    Repne,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct Prefixes {
     operand_size_override: bool,
     address_size_override: bool,
-    rep: bool,
+    rep: Option<RepKind>,
     segment_override: Option<SegmentIndex>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StringOp {
+    Movs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -461,7 +472,7 @@ impl Cpu386 {
                 self.load_segment(bus, SegmentIndex::Ds, value)?;
                 Ok(clocks(7))
             }
-            0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf3 => {
+            0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 => {
                 Err(CpuError::UnsupportedOpcode {
                     opcode,
                     cs: self.registers.cs().selector,
@@ -613,6 +624,20 @@ impl Cpu386 {
                     operand_size,
                     value,
                     BusAccessKind::DataWrite,
+                )?;
+                Ok(clocks(4))
+            }
+            0xa4 => {
+                self.run_string(bus, StringOp::Movs, BusWidth::Byte, prefixes, address_size)?;
+                Ok(clocks(4))
+            }
+            0xa5 => {
+                self.run_string(
+                    bus,
+                    StringOp::Movs,
+                    operand_size.bus_width(),
+                    prefixes,
+                    address_size,
                 )?;
                 Ok(clocks(4))
             }
@@ -1140,7 +1165,8 @@ impl Cpu386 {
                 0x65 => prefixes.segment_override = Some(SegmentIndex::Gs),
                 0x66 => prefixes.operand_size_override = !prefixes.operand_size_override,
                 0x67 => prefixes.address_size_override = !prefixes.address_size_override,
-                0xf3 => prefixes.rep = true,
+                0xf3 => prefixes.rep = Some(RepKind::Repe),
+                0xf2 => prefixes.rep = Some(RepKind::Repne),
                 _ => {
                     self.registers.eip = eip;
                     return Ok(prefixes);
@@ -1773,6 +1799,113 @@ impl Cpu386 {
             BusAccessKind::DataWrite,
         )?;
         self.adjust_index_register(7, address_size, 1);
+        Ok(())
+    }
+
+    fn index_offset(&self, index: u8, address_size: AddressSize) -> u32 {
+        match address_size {
+            AddressSize::Word => u32::from(self.read_gpr16(index)),
+            AddressSize::Dword => self.read_gpr32(index),
+        }
+    }
+
+    fn string_count(&self, address_size: AddressSize) -> u32 {
+        self.index_offset(1, address_size) // CX / ECX
+    }
+
+    fn decrement_string_count(&mut self, address_size: AddressSize) {
+        match address_size {
+            AddressSize::Word => {
+                let cx = self.read_gpr16(1).wrapping_sub(1);
+                self.write_gpr16(1, cx);
+            }
+            AddressSize::Dword => {
+                let ecx = self.read_gpr32(1).wrapping_sub(1);
+                self.write_gpr32(1, ecx);
+            }
+        }
+    }
+
+    fn read_string_src<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        prefixes: Prefixes,
+        address_size: AddressSize,
+        width: BusWidth,
+    ) -> ExecResult<u32> {
+        let segment = prefixes.segment_override.unwrap_or(SegmentIndex::Ds);
+        let offset = self.index_offset(6, address_size); // SI / ESI
+        let physical = self.translate_segmented(
+            bus,
+            segment,
+            offset,
+            width.bytes(),
+            BusAccessKind::DataRead,
+            false,
+        )?;
+        Ok(bus.read_memory(physical, width, BusAccessKind::DataRead)?)
+    }
+
+    fn write_string_dst<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        address_size: AddressSize,
+        width: BusWidth,
+        value: u32,
+    ) -> ExecResult<()> {
+        let offset = self.index_offset(7, address_size); // DI / EDI
+        let physical = self.translate_segmented(
+            bus,
+            SegmentIndex::Es,
+            offset,
+            width.bytes(),
+            BusAccessKind::DataWrite,
+            true,
+        )?;
+        bus.write_memory(physical, width, value, BusAccessKind::DataWrite)?;
+        Ok(())
+    }
+
+    fn string_step<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        op: StringOp,
+        width: BusWidth,
+        prefixes: Prefixes,
+        address_size: AddressSize,
+    ) -> ExecResult<()> {
+        let bytes = width.bytes();
+        match op {
+            StringOp::Movs => {
+                let value = self.read_string_src(bus, prefixes, address_size, width)?;
+                self.write_string_dst(bus, address_size, width, value)?;
+                self.adjust_index_register(6, address_size, bytes);
+                self.adjust_index_register(7, address_size, bytes);
+            }
+        }
+        Ok(())
+    }
+
+    fn run_string<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        op: StringOp,
+        width: BusWidth,
+        prefixes: Prefixes,
+        address_size: AddressSize,
+    ) -> ExecResult<()> {
+        match prefixes.rep {
+            None => self.string_step(bus, op, width, prefixes, address_size)?,
+            // MOVS repeats CX times regardless of REPE/REPNE; the ZF test arrives with
+            // CMPS/SCAS in a later task.
+            Some(_) => loop {
+                if self.string_count(address_size) == 0 {
+                    break;
+                }
+                self.string_step(bus, op, width, prefixes, address_size)?;
+                self.decrement_string_count(address_size);
+            },
+        }
         Ok(())
     }
 
@@ -3695,5 +3828,123 @@ mod tests {
         let mut bus = TestBus::with_memory(memory);
 
         assert_eq!(cpu.cycle(&mut bus).unwrap_err(), CpuError::DivideError);
+    }
+
+    #[test]
+    fn movsb_copies_and_increments_when_df_clear() {
+        // movsb (0xa4). [ds:si]=0x42 -> [es:di]; si and di increment (DF=0).
+        let mut memory = vec![0; 1024];
+        memory[0] = 0xa4;
+        memory[0x100] = 0x42;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Es, 0);
+        cpu.registers.eip = 0;
+        cpu.set_flag(FLAG_DF, false);
+        cpu.registers.set_esi(0x100);
+        cpu.registers.set_edi(0x200);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(bus.memory[0x200], 0x42);
+        assert_eq!(cpu.registers.esi(), 0x101);
+        assert_eq!(cpu.registers.edi(), 0x201);
+    }
+
+    #[test]
+    fn movsb_decrements_when_df_set() {
+        // movsb with DF=1: si and di decrement.
+        let mut memory = vec![0; 1024];
+        memory[0] = 0xa4;
+        memory[0x100] = 0x42;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Es, 0);
+        cpu.registers.eip = 0;
+        cpu.set_flag(FLAG_DF, true);
+        cpu.registers.set_esi(0x100);
+        cpu.registers.set_edi(0x200);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(bus.memory[0x200], 0x42);
+        assert_eq!(cpu.registers.esi(), 0x0ff);
+        assert_eq!(cpu.registers.edi(), 0x1ff);
+    }
+
+    #[test]
+    fn rep_movsb_copies_cx_bytes() {
+        // rep movsb (0xf3 0xa4) with cx=3 copies 3 bytes, leaves cx=0, advances si/di by 3.
+        let mut memory = vec![0; 1024];
+        memory[0..2].copy_from_slice(&[0xf3, 0xa4]);
+        memory[0x100..0x103].copy_from_slice(&[1, 2, 3]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Es, 0);
+        cpu.registers.eip = 0;
+        cpu.set_flag(FLAG_DF, false);
+        cpu.registers.set_esi(0x100);
+        cpu.registers.set_edi(0x200);
+        cpu.registers.set_ecx(3);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(&bus.memory[0x200..0x203], &[1, 2, 3]);
+        assert_eq!(cpu.registers.esi(), 0x103);
+        assert_eq!(cpu.registers.edi(), 0x203);
+        assert_eq!(cpu.registers.ecx(), 0);
+    }
+
+    #[test]
+    fn rep_movsb_with_zero_count_does_nothing() {
+        // rep movsb with cx=0 performs no access and leaves si/di/cx unchanged.
+        let mut memory = vec![0; 1024];
+        memory[0..2].copy_from_slice(&[0xf3, 0xa4]);
+        memory[0x100] = 0x42;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Es, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esi(0x100);
+        cpu.registers.set_edi(0x200);
+        cpu.registers.set_ecx(0);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(bus.memory[0x200], 0); // no write
+        assert_eq!(cpu.registers.esi(), 0x100);
+        assert_eq!(cpu.registers.edi(), 0x200);
+        assert_eq!(cpu.registers.ecx(), 0);
+    }
+
+    #[test]
+    fn movsb_honors_source_segment_override() {
+        // es: movsb (0x26 0xa4). With ds=0 and es base 0x200, the override reads the
+        // source from es:si (0x210), not ds:si (0x10); the destination stays es:di (0x230).
+        let mut memory = vec![0; 0x400];
+        memory[0..2].copy_from_slice(&[0x26, 0xa4]);
+        memory[0x210] = 0x99;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Es, 0x20); // base 0x200
+        cpu.registers.eip = 0;
+        cpu.set_flag(FLAG_DF, false);
+        cpu.registers.set_esi(0x10);
+        cpu.registers.set_edi(0x30);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(bus.memory[0x230], 0x99); // es:di destination
+        assert_eq!(bus.memory[0x10], 0); // ds:si source was not used
     }
 }
