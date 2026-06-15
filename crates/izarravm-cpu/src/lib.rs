@@ -1359,6 +1359,16 @@ impl Cpu386 {
                 self.write_gpr_sized(modrm.reg, operand_size, value);
                 Ok(clocks(3))
             }
+            0xaf => {
+                // IMUL r, r/m: two-operand signed multiply into the reg destination.
+                let modrm = self.fetch_modrm(bus)?;
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
+                let src = self.read_operand_sized(bus, operand, operand_size)?;
+                let dst = self.read_gpr_sized(modrm.reg, operand_size);
+                let result = self.imul_truncated(dst, src, operand_size);
+                self.write_gpr_sized(modrm.reg, operand_size, result);
+                Ok(clocks(9))
+            }
             _ => Err(CpuError::UnsupportedTwoByteOpcode {
                 opcode,
                 cs: self.registers.cs().selector,
@@ -2726,6 +2736,24 @@ impl Cpu386 {
             }
         };
         self.set_flag(FLAG_CF | FLAG_OF, significant);
+    }
+
+    fn imul_truncated(&mut self, a: u32, b: u32, operand_size: OperandSize) -> u32 {
+        // Two-operand signed multiply: the low-half product truncated to the operand size.
+        // CF/OF are set when the full product does not sign-extend back from the truncation
+        // (the result does not fit). SF/ZF/AF/PF are left undefined, matching the 386.
+        let (result, significant) = match operand_size {
+            OperandSize::Word => {
+                let p = i32::from(a as u16 as i16) * i32::from(b as u16 as i16);
+                (p as u16 as u32, p != i32::from(p as u16 as i16))
+            }
+            OperandSize::Dword => {
+                let p = i64::from(a as i32) * i64::from(b as i32);
+                (p as u32, p != i64::from(p as u32 as i32))
+            }
+        };
+        self.set_flag(FLAG_CF | FLAG_OF, significant);
+        result
     }
 
     fn div(&mut self, operand: u32, signed: bool, width: BusWidth) -> ExecResult<()> {
@@ -5274,5 +5302,126 @@ mod tests {
         cpu.cycle(&mut bus).unwrap();
 
         assert_eq!(bus.memory[0x40], 1);
+    }
+
+    #[test]
+    fn imul_0f_af_16bit_fits_clears_carry_overflow() {
+        // imul bx, cx (0x0f 0xaf 0xd9, modrm mod=3 reg=bx rm=cx): 3 * 4 = 12, CF=OF=0.
+        let mut memory = vec![0; 64];
+        memory[0..3].copy_from_slice(&[0x0f, 0xaf, 0xd9]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Bx, 3);
+        cpu.write_reg16(Reg16::Cx, 4);
+        cpu.set_flag(FLAG_CF | FLAG_OF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Bx), 12);
+        assert!(!cpu.flag(FLAG_CF));
+        assert!(!cpu.flag(FLAG_OF));
+    }
+
+    #[test]
+    fn imul_0f_af_16bit_overflow_sets_carry_overflow() {
+        // imul bx, cx (0x0f 0xaf 0xd9): 0x1000 * 0x10 = 0x10000, truncates to 0, CF=OF=1.
+        let mut memory = vec![0; 64];
+        memory[0..3].copy_from_slice(&[0x0f, 0xaf, 0xd9]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Bx, 0x1000);
+        cpu.write_reg16(Reg16::Cx, 0x0010);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Bx), 0x0000);
+        assert!(cpu.flag(FLAG_CF));
+        assert!(cpu.flag(FLAG_OF));
+    }
+
+    #[test]
+    fn imul_0f_af_32bit_fits_clears_carry_overflow() {
+        // 0x66 0x0f 0xaf 0xd9 (imul ebx, ecx): 1000 * 1000 = 1_000_000, CF=OF=0.
+        let mut memory = vec![0; 64];
+        memory[0..4].copy_from_slice(&[0x66, 0x0f, 0xaf, 0xd9]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_gpr32(3, 1000); // ebx
+        cpu.write_gpr32(1, 1000); // ecx
+        cpu.set_flag(FLAG_CF | FLAG_OF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_gpr32(3), 1_000_000);
+        assert!(!cpu.flag(FLAG_CF));
+        assert!(!cpu.flag(FLAG_OF));
+    }
+
+    #[test]
+    fn imul_0f_af_32bit_overflow_sets_carry_overflow() {
+        // 0x66 0x0f 0xaf 0xd9 (imul ebx, ecx): 0x10000 * 0x10000 = 0x1_0000_0000,
+        // truncates to 0, CF=OF=1.
+        let mut memory = vec![0; 64];
+        memory[0..4].copy_from_slice(&[0x66, 0x0f, 0xaf, 0xd9]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_gpr32(3, 0x0001_0000); // ebx
+        cpu.write_gpr32(1, 0x0001_0000); // ecx
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_gpr32(3), 0x0000_0000);
+        assert!(cpu.flag(FLAG_CF));
+        assert!(cpu.flag(FLAG_OF));
+    }
+
+    #[test]
+    fn imul_0f_af_signed_negative_result_fits() {
+        // imul bx, cx (0x0f 0xaf 0xd9): -1 * 5 = -5 (0xfffb), fits signed 16-bit, CF=OF=0.
+        let mut memory = vec![0; 64];
+        memory[0..3].copy_from_slice(&[0x0f, 0xaf, 0xd9]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Bx, 0xffff); // -1
+        cpu.write_reg16(Reg16::Cx, 0x0005);
+        cpu.set_flag(FLAG_CF | FLAG_OF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Bx), 0xfffb);
+        assert!(!cpu.flag(FLAG_CF));
+        assert!(!cpu.flag(FLAG_OF));
+    }
+
+    #[test]
+    fn imul_0f_af_signed_overflow_differs_from_unsigned() {
+        // imul bx, cx (0x0f 0xaf 0xd9): -1 * -32768 = +32768. The low half 0x8000
+        // sign-extends to -32768, not +32768, so the signed result does not fit:
+        // bx=0x8000, CF=OF=1. An unsigned multiply of 0xffff * 0x8000 would truncate
+        // to the same 0x8000 but read as non-overflowing, so this distinguishes IMUL.
+        let mut memory = vec![0; 64];
+        memory[0..3].copy_from_slice(&[0x0f, 0xaf, 0xd9]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Bx, 0xffff); // -1
+        cpu.write_reg16(Reg16::Cx, 0x8000); // -32768
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Bx), 0x8000);
+        assert!(cpu.flag(FLAG_CF));
+        assert!(cpu.flag(FLAG_OF));
     }
 }
