@@ -345,9 +345,19 @@ fn waveform_attenuation(position: u32, waveform: u8) -> Option<(u16, bool)> {
         1 => (!second_half).then_some((folded, false)), // half sine
         2 => Some((folded, false)),                     // abs sine
         3 => (!second_quarter).then_some((logsin(quarter), false)), // quarter sine
-        // Waveforms 4-7 are OPL3-only; implemented in the OPL3 waveform layer.
-        // Until then they fall back to the full sine shape.
-        _ => Some((folded, second_half)),
+        // Waveforms 4-7 are OPL3-only (gated to 0-3 unless NEW is set).
+        // 4: full sine at double rate in the first half, silent in the second.
+        4 => (!second_half)
+            .then(|| waveform_attenuation((position << 1) & 0x3ff, 0))
+            .flatten(),
+        // 5: abs sine at double rate in the first half, silent in the second.
+        5 => (!second_half)
+            .then(|| waveform_attenuation((position << 1) & 0x3ff, 2))
+            .flatten(),
+        6 => Some((0, second_half)), // square wave: constant full magnitude
+        // 7: logarithmic sawtooth; each half starts loud and decays as the
+        // position ramps the attenuation linearly (8 log units per phase step).
+        _ => Some((((position & 0x1ff) << 3) as u16, second_half)),
     }
 }
 
@@ -912,6 +922,70 @@ mod tests {
         assert!(dist(2) < dist(5), "FB=5 should deviate more than FB=2");
     }
 
+    #[test]
+    fn opl3_waveform4_is_a_double_rate_sine_in_the_first_half() {
+        // Period 128, first half 0..64. WAVE4 packs a full sine into the first
+        // half (both signs) and silences the second.
+        let mut op = sine_operator(0x200, 4, 4);
+        let (mut saw_pos, mut saw_neg) = (false, false);
+        for i in 0..128 {
+            let s = op.sample(0);
+            if i < 64 {
+                saw_pos |= s > 0;
+                saw_neg |= s < 0;
+            } else {
+                assert_eq!(s, 0, "second half is silent, i={i}");
+            }
+            op.advance();
+        }
+        assert!(saw_pos && saw_neg, "first half is a full sine");
+    }
+
+    #[test]
+    fn opl3_waveform5_is_double_rate_abs_sine_in_the_first_half() {
+        let mut op = sine_operator(0x200, 4, 5);
+        let mut peak = 0;
+        for i in 0..128 {
+            let s = op.sample(0);
+            if i < 64 {
+                assert!(s >= 0, "abs sine is non-negative, i={i}");
+                peak = peak.max(s);
+            } else {
+                assert_eq!(s, 0, "second half is silent, i={i}");
+            }
+            op.advance();
+        }
+        assert!(peak > 1000, "first half has audible humps");
+    }
+
+    #[test]
+    fn opl3_waveform6_is_a_square_wave() {
+        // Constant full-scale magnitude (exp_lookup(0) = 2042), sign flips at half.
+        let mut op = sine_operator(0x200, 4, 6);
+        for i in 0..128 {
+            let expected = if i < 64 { 2042 } else { -2042 };
+            assert_eq!(op.sample(0), expected, "square wave, i={i}");
+            op.advance();
+        }
+    }
+
+    #[test]
+    fn opl3_waveform7_is_a_log_sawtooth() {
+        // Each half starts at the peak and decays; sign flips at the half.
+        let mut op = sine_operator(0x200, 4, 7);
+        let samples: Vec<i32> = (0..128)
+            .map(|_| {
+                let s = op.sample(0);
+                op.advance();
+                s
+            })
+            .collect();
+        assert!(samples[0] > 2000, "first half starts at the positive peak");
+        assert!(samples[64] < -2000, "second half starts at the negative peak");
+        assert!(samples[32] < samples[0], "first half decays toward zero");
+        assert!(samples[96].abs() < samples[64].abs(), "second half decays");
+    }
+
     fn program_channel0(opl: &mut OplChip, fnum: u16, block: u8, additive: bool, modulator_tl: u8) {
         opl.write_register(0x20, 0x01); // modulator: multiple x1
         opl.write_register(0x23, 0x01); // carrier: multiple x1
@@ -1123,6 +1197,31 @@ mod tests {
         assert!(matches!(peaks(0x21), (0, r) if r > 1000), "additive, right only");
         assert!(matches!(peaks(0x31), (l, r) if l > 1000 && r > 1000), "both");
         assert_eq!(peaks(0x01), (0, 0), "no pan bits: silent");
+    }
+
+    #[test]
+    fn waveforms_above_three_require_opl3_mode() {
+        // E0=6 is a square wave (has negative samples) in OPL3 mode, but masks
+        // to waveform 2 (abs sine, non-negative) when the chip is an OPL2.
+        let has_negative = |new: bool| {
+            let mut opl = OplChip::default();
+            opl.write_register(0x01, 0x20); // WSEnable
+            if new {
+                write_secondary(&mut opl, 0x05, 0x01); // OPL3 mode
+            }
+            opl.write_register(0x20, 0x01); // modulator multiple x1
+            opl.write_register(0x40, 0x00); // modulator loud
+            opl.write_register(0x60, 0xf0); // modulator instant attack
+            opl.write_register(0x80, 0x00);
+            opl.write_register(0x63, 0x00); // carrier attack 0 -> silent
+            opl.write_register(0xe0, 0x06); // modulator waveform 6 (square / abs sine)
+            opl.write_register(0xc0, 0x31); // additive + left/right (pan ignored as OPL2)
+            opl.write_register(0xa0, 0x00);
+            opl.write_register(0xb0, 0x20 | (4 << 2) | 0x02); // key-on, block 4, fnum 0x200
+            (0..256).any(|_| opl.render_sample().0 < 0)
+        };
+        assert!(!has_negative(false), "OPL2 masks waveform 6 to abs sine");
+        assert!(has_negative(true), "OPL3 waveform 6 is a square wave");
     }
 
     #[test]
