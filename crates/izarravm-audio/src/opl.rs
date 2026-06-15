@@ -92,6 +92,8 @@ pub(crate) struct Operator {
     key_scale_level: u8,         // KSL: 0 = off, else 1.5/3/6 dB per octave of pitch
     feedback: u8,                // FB factor for operator-1 self-modulation (0 = off)
     feedback_history: [i32; 2],  // last two outputs; averaged for stable feedback
+    tremolo: bool,               // AM: this operator follows the amplitude LFO
+    vibrato: bool,               // VIB: this operator follows the pitch LFO
     // Envelope generator.
     attack: u8,
     decay: u8,
@@ -116,6 +118,8 @@ impl Default for Operator {
             key_scale_level: 0,
             feedback: 0,
             feedback_history: [0, 0],
+            tremolo: false,
+            vibrato: false,
             attack: 0,
             decay: 0,
             sustain: 0,
@@ -155,6 +159,14 @@ impl Operator {
         self.feedback = value & 0x07;
     }
 
+    pub(crate) fn set_tremolo(&mut self, on: bool) {
+        self.tremolo = on;
+    }
+
+    pub(crate) fn set_vibrato(&mut self, on: bool) {
+        self.vibrato = on;
+    }
+
     /// Key-scale-level attenuation for the current pitch, in log-domain units
     /// (the same scale as `eg_attenuation`). 0 when KSL is off. The 6 dB/oct base
     /// `KSL[fnum>>6]` is referenced to the top octave (block 7) and lowered 8
@@ -188,13 +200,31 @@ impl Operator {
         self.key_on = on;
     }
 
-    /// Per-sample phase step. `f = fnum * 2^block * rate / 2^20` for MULT x1.
-    fn phase_increment(&self) -> u32 {
-        ((u32::from(self.fnum) << self.block) * MULTIPLE_X2[self.multiple as usize]) >> 1
+    /// Per-sample phase step for an effective F-number. `f = fnum * 2^block *
+    /// rate / 2^20` for MULT x1.
+    fn phase_increment(&self, fnum: u32) -> u32 {
+        ((fnum << self.block) * MULTIPLE_X2[self.multiple as usize]) >> 1
     }
 
+    /// Advance one sample with no LFO. Operator-level tests use this; the chip
+    /// render path always goes through `advance_with_lfo`.
+    #[cfg(test)]
     pub(crate) fn advance(&mut self) {
-        self.phase = self.phase.wrapping_add(self.phase_increment()) & 0x000f_ffff;
+        self.advance_with_lfo(0, false);
+    }
+
+    /// Advance the phase, optionally applying vibrato. `vibrato_lfo` is the
+    /// global pitch LFO in [-256, 256]; when VIB is enabled it bends the
+    /// F-number by `(fnum >> 7) * lfo / 256` (>> 8 for shallow vibrato), i.e.
+    /// about +/-14 or +/-7 cents at the peak.
+    pub(crate) fn advance_with_lfo(&mut self, vibrato_lfo: i32, deep_vibrato: bool) {
+        let mut fnum = i32::from(self.fnum);
+        if self.vibrato {
+            let shift = if deep_vibrato { 7 } else { 8 };
+            fnum += (i32::from(self.fnum) >> shift) * vibrato_lfo / 256;
+        }
+        let inc = self.phase_increment(fnum.clamp(0, 0x3ff) as u32);
+        self.phase = self.phase.wrapping_add(inc) & 0x000f_ffff;
     }
 
     /// Envelope attenuation in exp-table units. The 0..0x1ff envelope is
@@ -419,6 +449,10 @@ fn channel_operators(channel: usize) -> (usize, usize) {
 /// Nth pair here.
 const FOUR_OP_PRIMARY: [usize; 6] = [0, 1, 2, 9, 10, 11];
 
+/// LFO periods in samples at the 49716 Hz rate: tremolo 3.7 Hz, vibrato 6.1 Hz.
+const TREMOLO_PERIOD: u32 = 13437;
+const VIBRATO_PERIOD: u32 = 8150;
+
 /// Whether `channel` is the primary half of an active 4-op voice (renders all
 /// four operators) under the reg 0x104 `mask`.
 fn four_op_primary(channel: usize, mask: u8) -> bool {
@@ -552,6 +586,47 @@ impl OplChip {
         self.registers[1][0x05] & 0x01 != 0
     }
 
+    /// Tremolo (AM) attenuation for the current LFO phase: a triangle rising to
+    /// the reg 0xBD bit7 depth (4.8 dB, else 1.0 dB) and back, in log-domain
+    /// units (256 units = 6.02 dB, so 4.8 dB ~= 204 and 1.0 dB ~= 43).
+    fn tremolo_attenuation(&self) -> u16 {
+        let pos = self.eg_counter % TREMOLO_PERIOD;
+        let half = TREMOLO_PERIOD / 2;
+        let up = if pos < half { pos } else { TREMOLO_PERIOD - pos };
+        let peak = if self.registers[0][0xbd] & 0x80 != 0 { 204 } else { 43 };
+        (up * peak / half) as u16
+    }
+
+    /// Vibrato (pitch) LFO for the current phase: a triangle in [-256, 256] at
+    /// 6.1 Hz. The per-operator depth (reg 0xBD bit6) is applied in
+    /// `advance_with_lfo`.
+    fn vibrato_lfo(&self) -> i32 {
+        let pos = (self.eg_counter % VIBRATO_PERIOD) as i32;
+        let period = VIBRATO_PERIOD as i32;
+        let quarter = period / 4;
+        if pos < quarter {
+            pos * 256 / quarter
+        } else if pos < 3 * quarter {
+            256 - (pos - quarter) * 256 / quarter
+        } else {
+            (pos - period) * 256 / quarter
+        }
+    }
+
+    fn deep_vibrato(&self) -> bool {
+        self.registers[0][0xbd] & 0x40 != 0
+    }
+
+    /// An operator's total attenuation: its envelope plus the tremolo LFO when
+    /// AM is enabled for it.
+    fn operator_attenuation(&self, op: usize) -> u16 {
+        let mut attenuation = self.operators[op].eg_attenuation();
+        if self.operators[op].tremolo {
+            attenuation += self.tremolo_attenuation();
+        }
+        attenuation
+    }
+
     /// Render one stereo `(left, right)` sample at the chip's native 49716 Hz
     /// rate. OPL3 mode sums all 18 two-op channels; otherwise the 9 OPL2
     /// channels. (4-op and rhythm mode are added in later layers.) The EG
@@ -614,10 +689,10 @@ impl OplChip {
             self.operators[op].advance_envelope(self.eg_counter, note_select);
         }
         let (a1, a2, a3, a4) = (
-            self.operators[op1].eg_attenuation(),
-            self.operators[op2].eg_attenuation(),
-            self.operators[op3].eg_attenuation(),
-            self.operators[op4].eg_attenuation(),
+            self.operator_attenuation(op1),
+            self.operator_attenuation(op2),
+            self.operator_attenuation(op3),
+            self.operator_attenuation(op4),
         );
 
         let o1 = self.operators[op1].render_feedback(a1);
@@ -651,8 +726,9 @@ impl OplChip {
             }
         };
 
+        let (vibrato, deep) = (self.vibrato_lfo(), self.deep_vibrato());
         for op in [op1, op2, op3, op4] {
-            self.operators[op].advance();
+            self.operators[op].advance_with_lfo(vibrato, deep);
         }
         out
     }
@@ -681,17 +757,18 @@ impl OplChip {
         self.operators[carrier].advance_envelope(self.eg_counter, note_select);
 
         let additive = c0 & 0x01 != 0;
-        let modulator_att = self.operators[modulator].eg_attenuation();
+        let modulator_att = self.operator_attenuation(modulator);
+        let carrier_att = self.operator_attenuation(carrier);
         let modulator_out = self.operators[modulator].render_feedback(modulator_att);
         let output = if additive {
-            modulator_out + self.operators[carrier].sample(self.operators[carrier].eg_attenuation())
+            modulator_out + self.operators[carrier].sample(carrier_att)
         } else {
-            let carrier_att = self.operators[carrier].eg_attenuation();
             self.operators[carrier].sample_modulated(modulator_out, carrier_att)
         };
 
-        self.operators[modulator].advance();
-        self.operators[carrier].advance();
+        let (vibrato, deep) = (self.vibrato_lfo(), self.deep_vibrato());
+        self.operators[modulator].advance_with_lfo(vibrato, deep);
+        self.operators[carrier].advance_with_lfo(vibrato, deep);
         output
     }
 
@@ -725,6 +802,8 @@ impl OplChip {
         op.set_multiple(r20 & 0x0f);
         op.set_key_scale_rate(r20 & 0x10 != 0);
         op.set_eg_type(r20 & 0x20 != 0);
+        op.set_vibrato(r20 & 0x40 != 0);
+        op.set_tremolo(r20 & 0x80 != 0);
         op.set_total_level(total_level);
         op.set_key_scale_level(r40 >> 6);
         op.set_waveform(waveform);
@@ -1360,6 +1439,58 @@ mod tests {
         assert_ne!(fm_fm, collect(0, 1), "FM-FM differs from FM-AM");
         assert_ne!(fm_fm, collect(1, 0), "FM-FM differs from AM-FM");
         assert_ne!(fm_fm, collect(1, 1), "FM-FM differs from AM-AM");
+    }
+
+    #[test]
+    fn tremolo_dips_the_amplitude_when_enabled() {
+        // AM on a steady loud carrier swings the peak by ~4.8 dB (a ~1.74x
+        // factor) over the 3.7 Hz cycle; without AM the amplitude is constant.
+        let peaks = |am: u8, dam: u8| {
+            let mut opl = OplChip::default();
+            opl.write_register(0x23, 0x20 | am | 0x01); // carrier: sustained (+AM), mult x1
+            opl.write_register(0x43, 0x00);
+            opl.write_register(0x63, 0xf0); // instant attack
+            opl.write_register(0x83, 0x00);
+            opl.write_register(0xbd, dam); // tremolo depth (bit7)
+            opl.write_register(0xa0, 0x00);
+            opl.write_register(0xc0, 0x01); // additive
+            opl.write_register(0xb0, 0x20 | (4 << 2) | 0x02); // key-on, block 4, fnum 0x200
+            let (mut lo, mut hi) = (i32::MAX, 0);
+            for _ in 0..(TREMOLO_PERIOD / 128) {
+                let peak = (0..128).map(|_| opl.render_sample().0.abs()).max().unwrap();
+                lo = lo.min(peak);
+                hi = hi.max(peak);
+            }
+            (lo, hi)
+        };
+
+        let (lo, hi) = peaks(0x80, 0x80); // AM on, DAM=1 (4.8 dB)
+        let ratio = f64::from(hi) / f64::from(lo);
+        assert!((ratio - 1.74).abs() < 0.2, "expected ~4.8 dB swing, got {ratio}");
+
+        let (lo, hi) = peaks(0x00, 0x80); // AM off
+        assert_eq!(lo, hi, "no tremolo without AM");
+    }
+
+    #[test]
+    fn vibrato_wobbles_the_pitch_when_enabled() {
+        // VIB bends the carrier frequency over the 6.1 Hz cycle, so the rendered
+        // waveform diverges from a steady-pitch one; without VIB it is identical.
+        let render = |vib: u8, dvb: u8| {
+            let mut opl = OplChip::default();
+            opl.write_register(0x20, vib | 0x01); // modulator: VIB (bit6) + multiple x1
+            opl.write_register(0x40, 0x00); // modulator loud
+            opl.write_register(0x60, 0xf0); // instant attack
+            opl.write_register(0x80, 0x00);
+            opl.write_register(0x63, 0x00); // carrier attack 0 -> silent
+            opl.write_register(0xbd, dvb); // vibrato depth (bit6)
+            opl.write_register(0xc0, 0x01); // additive
+            opl.write_register(0xa0, 0x00);
+            opl.write_register(0xb0, 0x20 | (4 << 2) | 0x02); // key-on, block 4, fnum 0x200
+            (0..4096).map(|_| opl.render_sample().0).collect::<Vec<_>>()
+        };
+        assert_eq!(render(0x00, 0x40), render(0x00, 0x00), "no vibrato when VIB is off");
+        assert_ne!(render(0x40, 0x40), render(0x00, 0x40), "VIB bends the pitch");
     }
 
     #[test]
