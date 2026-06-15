@@ -1124,10 +1124,20 @@ impl Cpu386 {
                             operand_size,
                             BusAccessKind::DataRead,
                         )?;
+                        // The selector follows the offset in memory. Its address is
+                        // computed in the address-size space, so on a 16-bit real-mode
+                        // segment it wraps at 0xffff (offset 0xfffe puts the selector at
+                        // 0x0000, not past the limit), matching the 80386.
+                        let selector_offset = match address_size {
+                            AddressSize::Word => u32::from(
+                                (memory.offset as u16).wrapping_add(operand_size.bytes() as u16),
+                            ),
+                            AddressSize::Dword => memory.offset.wrapping_add(operand_size.bytes()),
+                        };
                         let selector = self.read_memory_sized(
                             bus,
                             memory.segment,
-                            memory.offset + operand_size.bytes(),
+                            selector_offset,
                             OperandSize::Word,
                             BusAccessKind::DataRead,
                         )? as u16;
@@ -4959,5 +4969,36 @@ mod tests {
 
         assert_eq!(cpu.registers.eip, 0x00ee);
         assert!(!cpu.flag(FLAG_IF));
+    }
+
+    #[test]
+    fn far_call_via_memory_wraps_selector_offset_at_64k() {
+        // call far [bx+di] (0xff 0x19) with bx+di = 0xfffe. On a 16-bit real-mode
+        // segment the IP is read at ds:0xfffe and the selector offset wraps to
+        // ds:0x0000 rather than reading past the 0xffff limit; a real 80386
+        // completes this without faulting (SingleStepTests FF.3 "call far
+        // [ds:bx+di]" with bx=di=0xffff).
+        let ds_base = 0x2_0000usize; // ds selector 0x2000
+        let mut memory = vec![0; 0x3_0000];
+        memory[0..2].copy_from_slice(&[0xff, 0x19]);
+        // IP at ds:0xfffe
+        memory[ds_base + 0xfffe..ds_base + 0x1_0000].copy_from_slice(&0x0100u16.to_le_bytes());
+        // selector at the wrapped ds:0x0000
+        memory[ds_base..ds_base + 2].copy_from_slice(&0x3000u16.to_le_bytes());
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0x2000);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        cpu.write_gpr16(3, 0xfffe); // bx
+        cpu.write_gpr16(7, 0x0000); // di
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.cs().selector, 0x3000);
+        assert_eq!(cpu.registers.eip, 0x0100);
+        assert_eq!(cpu.read_gpr16(4), 0x00fc); // pushed CS then return IP
     }
 }
