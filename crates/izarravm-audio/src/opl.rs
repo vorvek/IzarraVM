@@ -89,7 +89,9 @@ pub(crate) struct Operator {
     multiple: u8,
     waveform: u8,
     total_level: u8,
-    key_scale_level: u8, // KSL: 0 = off, else 1.5/3/6 dB per octave of pitch
+    key_scale_level: u8,         // KSL: 0 = off, else 1.5/3/6 dB per octave of pitch
+    feedback: u8,                // FB factor for operator-1 self-modulation (0 = off)
+    feedback_history: [i32; 2],  // last two outputs; averaged for stable feedback
     // Envelope generator.
     attack: u8,
     decay: u8,
@@ -112,6 +114,8 @@ impl Default for Operator {
             waveform: 0,
             total_level: 0,
             key_scale_level: 0,
+            feedback: 0,
+            feedback_history: [0, 0],
             attack: 0,
             decay: 0,
             sustain: 0,
@@ -145,6 +149,10 @@ impl Operator {
 
     pub(crate) fn set_key_scale_level(&mut self, value: u8) {
         self.key_scale_level = value & 0x03;
+    }
+
+    pub(crate) fn set_feedback(&mut self, value: u8) {
+        self.feedback = value & 0x07;
     }
 
     /// Key-scale-level attenuation for the current pitch, in log-domain units
@@ -291,8 +299,8 @@ impl Operator {
     /// Operator output with the carrier phase offset by `phase_modulation`, the
     /// modulator's signed output in wave-position units where 1024 units = one
     /// cycle = 2*pi. A full-scale modulator (~+/-2048) bends the carrier by
-    /// ~4*pi, matching the datasheet's maximum feedback depth (FB = 7 -> 4*pi);
-    /// feedback, once added, will scale as output >> (7 - FB).
+    /// ~4*pi, matching the datasheet's maximum feedback depth (FB = 7 -> 4*pi).
+    /// Self-feedback reuses this path via `render_feedback`.
     pub(crate) fn sample_modulated(&self, phase_modulation: i32, extra_attenuation: u16) -> i32 {
         let attenuation = u32::from(self.total_level) * 32
             + u32::from(self.ksl_attenuation())
@@ -300,6 +308,22 @@ impl Operator {
         let position =
             ((((self.phase >> 10) as i32).wrapping_add(phase_modulation)) & 0x3ff) as u32;
         waveform_output_at(position, self.waveform, attenuation)
+    }
+
+    /// Operator-1 output with self-feedback (reg 0xC0 bits 1-3). The chip feeds
+    /// the average of the last two outputs back into the phase to keep the loop
+    /// stable. The radian table (FB 1..7 = pi/16..4*pi) doubles each step; in
+    /// phase units (1024 = 2*pi) full depth (4*pi) is the full-scale output, so
+    /// the average is shifted by `8 - FB` (one extra bit for the /2 average).
+    pub(crate) fn render_feedback(&mut self, extra_attenuation: u16) -> i32 {
+        let modulation = if self.feedback == 0 {
+            0
+        } else {
+            (self.feedback_history[0] + self.feedback_history[1]) >> (8 - self.feedback)
+        };
+        let out = self.sample_modulated(modulation, extra_attenuation);
+        self.feedback_history = [out, self.feedback_history[0]];
+        out
     }
 }
 
@@ -489,12 +513,13 @@ impl OplChip {
         let (modulator, carrier) = channel_operators(channel);
         self.load_operator(modulator, channel);
         self.load_operator(carrier, channel);
+        self.operators[modulator].set_feedback((self.registers[0xc0 + channel] >> 1) & 0x07);
         self.operators[modulator].advance_envelope(self.eg_counter, note_select);
         self.operators[carrier].advance_envelope(self.eg_counter, note_select);
 
         let additive = self.registers[0xc0 + channel] & 0x01 != 0;
-        let modulator_out =
-            self.operators[modulator].sample(self.operators[modulator].eg_attenuation());
+        let modulator_att = self.operators[modulator].eg_attenuation();
+        let modulator_out = self.operators[modulator].render_feedback(modulator_att);
         let output = if additive {
             modulator_out + self.operators[carrier].sample(self.operators[carrier].eg_attenuation())
         } else {
@@ -776,6 +801,62 @@ mod tests {
     fn ksl_clamps_to_zero_for_low_pitch() {
         // Bottom octave with a small F-number sits below the reference: no cost.
         assert_eq!(ksl_operator(0x000, 0, 3).ksl_attenuation(), 0);
+    }
+
+    // Channel 0 with only the modulator (op 0) audible: carrier never opens
+    // (attack 0), additive, modulator at instant attack, self-feedback `fb`.
+    fn feedback_channel_samples(fb: u8) -> Vec<i32> {
+        let mut opl = OplChip::default();
+        opl.write_register(0x20, 0x01); // modulator: multiple x1
+        opl.write_register(0x23, 0x01); // carrier: multiple x1
+        opl.write_register(0x40, 0x00); // modulator loud
+        opl.write_register(0x43, 0x00);
+        opl.write_register(0x60, 0xf0); // modulator: instant attack
+        opl.write_register(0x63, 0x00); // carrier: attack 0 -> stays silent
+        opl.write_register(0x80, 0x00);
+        opl.write_register(0x83, 0x00);
+        opl.write_register(0xe0, 0x00); // modulator waveform: sine
+        opl.write_register(0xc0, 0x01 | (fb << 1)); // additive + feedback factor
+        opl.write_register(0xa0, 0x00);
+        opl.write_register(0xb0, 0x20 | (4 << 2) | 0x02); // key-on, block 4, fnum 0x200
+        (0..256).map(|_| opl.render_sample()).collect()
+    }
+
+    #[test]
+    fn feedback_zero_is_a_clean_sine() {
+        // FB=0 leaves the modulator unmodulated: it must equal a bare sine.
+        let mut reference = sine_operator(0x200, 4, 0);
+        let expected: Vec<i32> = (0..256)
+            .map(|_| {
+                let s = reference.sample(0);
+                reference.advance();
+                s
+            })
+            .collect();
+        assert_eq!(feedback_channel_samples(0), expected);
+    }
+
+    #[test]
+    fn feedback_alters_and_bounds_the_modulator() {
+        let plain = feedback_channel_samples(0);
+        let fed = feedback_channel_samples(7);
+        assert_ne!(plain, fed, "feedback must reshape the waveform");
+        let peak = fed.iter().map(|s| s.abs()).max().unwrap();
+        assert!(peak <= 2100, "self-feedback stays bounded, got {peak}");
+    }
+
+    #[test]
+    fn stronger_feedback_deviates_further_from_a_sine() {
+        // Distance from the FB=0 sine grows with the feedback factor.
+        let base = feedback_channel_samples(0);
+        let dist = |fb| {
+            feedback_channel_samples(fb)
+                .iter()
+                .zip(&base)
+                .map(|(a, b)| u64::from((a - b).unsigned_abs()))
+                .sum::<u64>()
+        };
+        assert!(dist(2) < dist(5), "FB=5 should deviate more than FB=2");
     }
 
     fn program_channel0(opl: &mut OplChip, fnum: u16, block: u8, additive: bool, modulator_tl: u8) {
