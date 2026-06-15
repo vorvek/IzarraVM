@@ -1399,6 +1399,16 @@ impl Cpu386 {
                 }
                 Ok(clocks(10))
             }
+            0xa3 | 0xab | 0xb3 | 0xbb => {
+                // BT/BTS/BTR/BTC r/m, r. The opcodes are 8 apart: A3=BT, AB=BTS, B3=BTR, BB=BTC.
+                // The bit index in the reg operand is signed for a memory operand.
+                let op = (opcode - 0xa3) / 8;
+                let modrm = self.fetch_modrm(bus)?;
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
+                let index = self.read_gpr_sized(modrm.reg, operand_size);
+                self.bit_string_op(bus, op, operand, index, operand_size, address_size, true)?;
+                Ok(clocks(6))
+            }
             _ => Err(CpuError::UnsupportedTwoByteOpcode {
                 opcode,
                 cs: self.registers.cs().selector,
@@ -2560,6 +2570,74 @@ impl Cpu386 {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn bit_string_op<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        op: u8,
+        operand: RmOperand,
+        raw_index: u32,
+        operand_size: OperandSize,
+        address_size: AddressSize,
+        register_index: bool,
+    ) -> ExecResult<()> {
+        let bits = operand_size.bytes() * 8; // 16 or 32
+        match operand {
+            RmOperand::Register(index) => {
+                let bit = raw_index & (bits - 1);
+                let value = self.read_gpr_sized(index, operand_size);
+                let (cf, new) = bit_op(op, value, bit);
+                self.set_flag(FLAG_CF, cf);
+                if op != 0 {
+                    self.write_gpr_sized(index, operand_size, new);
+                }
+                Ok(())
+            }
+            RmOperand::Memory(mem) => {
+                let (offset, bit) = if register_index {
+                    // Signed bit-addressing: an index past the operand width walks to an
+                    // adjacent operand in the bit string. div_euclid/rem_euclid give the
+                    // floor block and the non-negative bit within it.
+                    let signed = match operand_size {
+                        OperandSize::Word => i32::from(raw_index as u16 as i16),
+                        OperandSize::Dword => raw_index as i32,
+                    };
+                    let block = signed.div_euclid(bits as i32);
+                    let bit = signed.rem_euclid(bits as i32) as u32;
+                    let bytes = operand_size.bytes() as i32;
+                    let offset = (mem.offset as i32).wrapping_add(block * bytes) as u32;
+                    let offset = match address_size {
+                        AddressSize::Word => offset & 0xffff,
+                        AddressSize::Dword => offset,
+                    };
+                    (offset, bit)
+                } else {
+                    (mem.offset, raw_index & (bits - 1))
+                };
+                let value = self.read_memory_sized(
+                    bus,
+                    mem.segment,
+                    offset,
+                    operand_size,
+                    BusAccessKind::DataRead,
+                )?;
+                let (cf, new) = bit_op(op, value, bit);
+                self.set_flag(FLAG_CF, cf);
+                if op != 0 {
+                    self.write_memory_sized(
+                        bus,
+                        mem.segment,
+                        offset,
+                        operand_size,
+                        new,
+                        BusAccessKind::DataWrite,
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     fn flag(&self, flag: u32) -> bool {
         self.registers.eflags & flag != 0
     }
@@ -2918,6 +2996,20 @@ fn clocks(core_clocks: u32) -> CycleOutcome {
 
 fn sign_extend_u8(value: u8) -> u32 {
     value as i8 as i32 as u32
+}
+
+fn bit_op(op: u8, value: u32, bit: u32) -> (bool, u32) {
+    // op: 0=BT, 1=BTS, 2=BTR, 3=BTC. `bit` is already reduced to 0..31.
+    let mask = 1u32 << bit;
+    let cf = value & mask != 0;
+    let new = match op {
+        0 => value,         // BT: read-only
+        1 => value | mask,  // BTS
+        2 => value & !mask, // BTR
+        3 => value ^ mask,  // BTC
+        _ => unreachable!("bit op {op}"),
+    };
+    (cf, new)
 }
 
 const fn width_mask(width: BusWidth) -> u32 {
@@ -5561,5 +5653,165 @@ mod tests {
 
         assert!(cpu.flag(FLAG_ZF));
         assert_eq!(cpu.read_reg16(Reg16::Bx), 0x1234);
+    }
+
+    #[test]
+    fn bt_register_reads_set_bit() {
+        // bt cx, bx (0x0f 0xa3 0xd9, modrm mod=3 reg=bx rm=cx): cx=0x0008 bit 3, bx=3 -> CF=1, cx unchanged.
+        let mut memory = vec![0; 64];
+        memory[0..3].copy_from_slice(&[0x0f, 0xa3, 0xd9]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Cx, 0x0008);
+        cpu.write_reg16(Reg16::Bx, 3);
+        cpu.set_flag(FLAG_CF, false);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert!(cpu.flag(FLAG_CF));
+        assert_eq!(cpu.read_reg16(Reg16::Cx), 0x0008);
+    }
+
+    #[test]
+    fn bt_register_reads_clear_bit() {
+        // bt cx, bx: cx=0x0008, bx=2 (bit 2 clear) -> CF=0.
+        let mut memory = vec![0; 64];
+        memory[0..3].copy_from_slice(&[0x0f, 0xa3, 0xd9]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Cx, 0x0008);
+        cpu.write_reg16(Reg16::Bx, 2);
+        cpu.set_flag(FLAG_CF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert!(!cpu.flag(FLAG_CF));
+    }
+
+    #[test]
+    fn bts_register_sets_bit_and_reads_old() {
+        // bts cx, bx (0x0f 0xab 0xd9): cx=0x0000, bx=3 -> CF=0 (old bit), cx=0x0008.
+        let mut memory = vec![0; 64];
+        memory[0..3].copy_from_slice(&[0x0f, 0xab, 0xd9]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Cx, 0x0000);
+        cpu.write_reg16(Reg16::Bx, 3);
+        cpu.set_flag(FLAG_CF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert!(!cpu.flag(FLAG_CF));
+        assert_eq!(cpu.read_reg16(Reg16::Cx), 0x0008);
+    }
+
+    #[test]
+    fn btr_register_clears_bit_and_reads_old() {
+        // btr cx, bx (0x0f 0xb3 0xd9): cx=0x0008, bx=3 -> CF=1 (old bit), cx=0x0000.
+        let mut memory = vec![0; 64];
+        memory[0..3].copy_from_slice(&[0x0f, 0xb3, 0xd9]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Cx, 0x0008);
+        cpu.write_reg16(Reg16::Bx, 3);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert!(cpu.flag(FLAG_CF));
+        assert_eq!(cpu.read_reg16(Reg16::Cx), 0x0000);
+    }
+
+    #[test]
+    fn btc_register_toggles_bit() {
+        // btc cx, bx (0x0f 0xbb 0xd9): cx=0x0008, bx=3 -> CF=1 (old), cx=0x0000 (toggled off).
+        let mut memory = vec![0; 64];
+        memory[0..3].copy_from_slice(&[0x0f, 0xbb, 0xd9]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Cx, 0x0008);
+        cpu.write_reg16(Reg16::Bx, 3);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert!(cpu.flag(FLAG_CF));
+        assert_eq!(cpu.read_reg16(Reg16::Cx), 0x0000);
+    }
+
+    #[test]
+    fn bts_memory_positive_index_walks_to_next_word() {
+        // bts [0x40], bx (0x0f 0xab 0x1e 0x40 0x00, modrm mod=00 reg=bx rm=110 disp16):
+        // bx=17 -> block 1, bit 1 -> word at 0x42 (0x40+2). [0x42]=0 -> CF=0, [0x42]=0x0002.
+        let mut memory = vec![0; 128];
+        memory[0..5].copy_from_slice(&[0x0f, 0xab, 0x1e, 0x40, 0x00]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Bx, 17);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert!(!cpu.flag(FLAG_CF));
+        assert_eq!(
+            u16::from_le_bytes([bus.memory[0x42], bus.memory[0x43]]),
+            0x0002
+        );
+        assert_eq!(
+            u16::from_le_bytes([bus.memory[0x40], bus.memory[0x41]]),
+            0x0000
+        );
+    }
+
+    #[test]
+    fn bt_memory_negative_index_walks_to_previous_word() {
+        // bt [0x40], bx (0x0f 0xa3 0x1e 0x40 0x00): bx=0xffff (-1) -> block -1, bit 15 ->
+        // word at 0x3e (0x40-2). [0x3e]=0x8000 -> CF=1. BT does not write.
+        let mut memory = vec![0; 128];
+        memory[0..5].copy_from_slice(&[0x0f, 0xa3, 0x1e, 0x40, 0x00]);
+        memory[0x3e..0x40].copy_from_slice(&0x8000u16.to_le_bytes());
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Bx, 0xffff); // -1
+        cpu.set_flag(FLAG_CF, false);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert!(cpu.flag(FLAG_CF));
+        assert_eq!(
+            u16::from_le_bytes([bus.memory[0x3e], bus.memory[0x3f]]),
+            0x8000
+        );
+    }
+
+    #[test]
+    fn bts_32bit_register_sets_high_bit() {
+        // 0x66 0x0f 0xab 0xd9 (bts ecx, ebx): ecx=0, ebx=20 -> CF=0, ecx bit 20 set.
+        let mut memory = vec![0; 64];
+        memory[0..4].copy_from_slice(&[0x66, 0x0f, 0xab, 0xd9]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_gpr32(1, 0); // ecx
+        cpu.write_gpr32(3, 20); // ebx
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert!(!cpu.flag(FLAG_CF));
+        assert_eq!(cpu.read_gpr32(1), 0x0010_0000);
     }
 }
