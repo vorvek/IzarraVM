@@ -1304,6 +1304,50 @@ impl Cpu386 {
                 self.write_gpr8(0, value);
                 Ok(clocks(5))
             }
+            0x27 => {
+                // DAA: decimal adjust AL after addition. OF is left undefined.
+                let old_al = self.read_gpr8(0);
+                let old_cf = self.flag(FLAG_CF);
+                let mut al = old_al;
+                self.set_flag(FLAG_CF, false);
+                if (al & 0x0f) > 9 || self.flag(FLAG_AF) {
+                    let (sum, carry) = al.overflowing_add(6);
+                    al = sum;
+                    self.set_flag(FLAG_CF, old_cf || carry);
+                    self.set_flag(FLAG_AF, true);
+                } else {
+                    self.set_flag(FLAG_AF, false);
+                }
+                if old_al > 0x99 || old_cf {
+                    al = al.wrapping_add(0x60);
+                    self.set_flag(FLAG_CF, true);
+                }
+                self.write_gpr8(0, al);
+                self.set_szp(u32::from(al), BusWidth::Byte);
+                Ok(clocks(4))
+            }
+            0x2f => {
+                // DAS: decimal adjust AL after subtraction. OF is left undefined.
+                let old_al = self.read_gpr8(0);
+                let old_cf = self.flag(FLAG_CF);
+                let mut al = old_al;
+                self.set_flag(FLAG_CF, false);
+                if (al & 0x0f) > 9 || self.flag(FLAG_AF) {
+                    let (diff, borrow) = al.overflowing_sub(6);
+                    al = diff;
+                    self.set_flag(FLAG_CF, old_cf || borrow);
+                    self.set_flag(FLAG_AF, true);
+                } else {
+                    self.set_flag(FLAG_AF, false);
+                }
+                if old_al > 0x99 || old_cf {
+                    al = al.wrapping_sub(0x60);
+                    self.set_flag(FLAG_CF, true);
+                }
+                self.write_gpr8(0, al);
+                self.set_szp(u32::from(al), BusWidth::Byte);
+                Ok(clocks(4))
+            }
             0x0f => self.execute_two_byte(bus, prefixes, address_size, operand_size),
             _ => Err(CpuError::UnsupportedOpcode {
                 opcode,
@@ -6722,5 +6766,85 @@ mod tests {
         cpu.cycle(&mut bus).unwrap();
 
         assert_eq!(cpu.read_reg16(Reg16::Ax) & 0xff, 0x99);
+    }
+
+    #[test]
+    fn daa_low_nibble_correction() {
+        // daa (0x27): AL=0x7C, CF=0, AF=0 -> AL=0x82 (low nibble +6), CF=0, AF=1.
+        let mut memory = vec![0; 64];
+        memory[0] = 0x27;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x007c);
+        cpu.set_flag(FLAG_CF, false);
+        cpu.set_flag(FLAG_AF, false);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax) & 0xff, 0x82);
+        assert!(!cpu.flag(FLAG_CF));
+        assert!(cpu.flag(FLAG_AF));
+    }
+
+    #[test]
+    fn daa_both_corrections_set_carry() {
+        // daa: AL=0xAA -> +6 = 0xB0 (AF=1), then +0x60 = 0x10 (CF=1).
+        let mut memory = vec![0; 64];
+        memory[0] = 0x27;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x00aa);
+        cpu.set_flag(FLAG_CF, false);
+        cpu.set_flag(FLAG_AF, false);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax) & 0xff, 0x10);
+        assert!(cpu.flag(FLAG_CF));
+        assert!(cpu.flag(FLAG_AF));
+    }
+
+    #[test]
+    fn das_low_nibble_correction() {
+        // das (0x2f): AL=0x4A, CF=0, AF=0 -> AL=0x44 (low nibble -6), CF=0, AF=1.
+        let mut memory = vec![0; 64];
+        memory[0] = 0x2f;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x004a);
+        cpu.set_flag(FLAG_CF, false);
+        cpu.set_flag(FLAG_AF, false);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax) & 0xff, 0x44);
+        assert!(!cpu.flag(FLAG_CF));
+        assert!(cpu.flag(FLAG_AF));
+    }
+
+    #[test]
+    fn das_high_correction_on_incoming_carry() {
+        // das: AL=0x00, CF=1, AF=0 -> -0x60 = 0xA0, CF=1, AF=0.
+        let mut memory = vec![0; 64];
+        memory[0] = 0x2f;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x0000);
+        cpu.set_flag(FLAG_CF, true);
+        cpu.set_flag(FLAG_AF, false);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax) & 0xff, 0xa0);
+        assert!(cpu.flag(FLAG_CF));
+        assert!(!cpu.flag(FLAG_AF));
     }
 }
