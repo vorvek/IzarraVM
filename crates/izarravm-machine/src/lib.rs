@@ -234,7 +234,9 @@ impl Machine {
     /// resampled 44100 Hz stereo PCM (saturated to 16-bit) ready for the DAC.
     /// The caller paces this by elapsed emulated time to keep audio in step.
     pub fn render_audio(&mut self, native_samples: usize) -> Vec<(i16, i16)> {
-        let native: Vec<(i32, i32)> = (0..native_samples).map(|_| self.opl.render_sample()).collect();
+        let native: Vec<(i32, i32)> = (0..native_samples)
+            .map(|_| self.opl.render_sample())
+            .collect();
         self.resampler
             .process(&native)
             .into_iter()
@@ -937,7 +939,8 @@ mod tests {
     fn program_tone(bus: &mut MachineBus, addr: u16, data: u16) {
         let mut write = |reg: u8, value: u8| {
             bus.write_io(addr, BusWidth::Byte, u32::from(reg)).unwrap();
-            bus.write_io(data, BusWidth::Byte, u32::from(value)).unwrap();
+            bus.write_io(data, BusWidth::Byte, u32::from(value))
+                .unwrap();
         };
         write(0x20, 0x01); // modulator: multiple x1
         write(0x40, 0x3f); // modulator muted
@@ -993,8 +996,10 @@ mod tests {
         let mut machine = test_machine();
         with_bus(&mut machine, |bus| {
             let mut write = |reg: u8, value: u8| {
-                bus.write_io(0x0388, BusWidth::Byte, u32::from(reg)).unwrap();
-                bus.write_io(0x0389, BusWidth::Byte, u32::from(value)).unwrap();
+                bus.write_io(0x0388, BusWidth::Byte, u32::from(reg))
+                    .unwrap();
+                bus.write_io(0x0389, BusWidth::Byte, u32::from(value))
+                    .unwrap();
             };
             write(0x04, 0x60); // mask both timers
             write(0x04, 0x80); // reset the overflow flags
@@ -1008,6 +1013,10 @@ mod tests {
         let status = with_bus(&mut machine, |bus| {
             bus.read_io(0x0388, BusWidth::Byte).unwrap()
         });
-        assert_eq!(status & 0xe0, 0xc0, "timer 1 overflow raises IRQ + timer-1 flag");
+        assert_eq!(
+            status & 0xe0,
+            0xc0,
+            "timer 1 overflow raises IRQ + timer-1 flag"
+        );
     }
 }

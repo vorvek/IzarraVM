@@ -36,11 +36,11 @@ fn blackman(t: f64, half: f64) -> f64 {
 /// [`process`]: Resampler::process
 #[derive(Debug, Clone)]
 pub struct Resampler {
-    step: f64,               // input frames consumed per output frame
-    next: f64,               // absolute output position (input-frame units), monotonic
-    consumed: usize,         // input frames dropped from the front of `history`
+    step: f64,       // input frames consumed per output frame
+    next: f64,       // absolute output position (input-frame units), monotonic
+    consumed: usize, // input frames dropped from the front of `history`
     history: Vec<(i32, i32)>,
-    table: Vec<f32>,         // PHASES rows of TAPS weights
+    table: Vec<f32>, // PHASES rows of TAPS weights
 }
 
 impl Resampler {

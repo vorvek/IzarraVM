@@ -209,8 +209,8 @@ struct WindowApp {
     rendered_screen: RenderedFrame,
     stop_reason: Option<StopReason>,
     audio: Option<AudioPlayer>,
-    audio_clocks: u64,        // elapsed clocks already turned into audio
-    audio_sample_debt: f64,   // fractional OPL samples owed
+    audio_clocks: u64,             // elapsed clocks already turned into audio
+    audio_sample_debt: f64,        // fractional OPL samples owed
     epoch: Option<(Instant, u64)>, // wall-clock + machine clocks at pacing start
 }
 
@@ -262,7 +262,9 @@ impl ApplicationHandler for WindowApp {
         // Pace the emulation to wall-clock time so the OPL audio plays at the
         // right rate; the catch-up is capped at 50 ms to avoid a spiral.
         let now = Instant::now();
-        let (epoch, epoch_clocks) = *self.epoch.get_or_insert((now, self.machine.elapsed_clocks()));
+        let (epoch, epoch_clocks) = *self
+            .epoch
+            .get_or_insert((now, self.machine.elapsed_clocks()));
         let executed = self.machine.elapsed_clocks().saturating_sub(epoch_clocks);
         let cap = self.clock_hz / 20;
         let budget = pacing_budget(now.duration_since(epoch), self.clock_hz, executed, cap);

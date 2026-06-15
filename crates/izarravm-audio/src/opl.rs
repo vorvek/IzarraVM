@@ -91,11 +91,11 @@ pub(crate) struct Operator {
     multiple: u8,
     waveform: u8,
     total_level: u8,
-    key_scale_level: u8,         // KSL: 0 = off, else 1.5/3/6 dB per octave of pitch
-    feedback: u8,                // FB factor for operator-1 self-modulation (0 = off)
-    feedback_history: [i32; 2],  // last two outputs; averaged for stable feedback
-    tremolo: bool,               // AM: this operator follows the amplitude LFO
-    vibrato: bool,               // VIB: this operator follows the pitch LFO
+    key_scale_level: u8, // KSL: 0 = off, else 1.5/3/6 dB per octave of pitch
+    feedback: u8,        // FB factor for operator-1 self-modulation (0 = off)
+    feedback_history: [i32; 2], // last two outputs; averaged for stable feedback
+    tremolo: bool,       // AM: this operator follows the amplitude LFO
+    vibrato: bool,       // VIB: this operator follows the pitch LFO
     // Envelope generator.
     attack: u8,
     decay: u8,
@@ -377,11 +377,7 @@ impl Operator {
             + u32::from(self.ksl_attenuation())
             + u32::from(extra_attenuation);
         let magnitude = exp_lookup(attenuation);
-        if positive {
-            magnitude
-        } else {
-            -magnitude
-        }
+        if positive { magnitude } else { -magnitude }
     }
 }
 
@@ -642,8 +638,16 @@ impl OplChip {
     fn tremolo_attenuation(&self) -> u16 {
         let pos = self.eg_counter % TREMOLO_PERIOD;
         let half = TREMOLO_PERIOD / 2;
-        let up = if pos < half { pos } else { TREMOLO_PERIOD - pos };
-        let peak = if self.registers[0][0xbd] & 0x80 != 0 { 204 } else { 43 };
+        let up = if pos < half {
+            pos
+        } else {
+            TREMOLO_PERIOD - pos
+        };
+        let peak = if self.registers[0][0xbd] & 0x80 != 0 {
+            204
+        } else {
+            43
+        };
         (up * peak / half) as u16
     }
 
@@ -736,9 +740,12 @@ impl OplChip {
             self.operators[RHYTHM_CY].phase,
         );
         let snare_bit = ((self.operators[RHYTHM_SD].phase >> 19) & 1 != 0) ^ noise;
-        let snare = self.operators[RHYTHM_SD].percussion_sample(self.operator_attenuation(RHYTHM_SD), snare_bit);
-        let hihat = self.operators[RHYTHM_HH].percussion_sample(self.operator_attenuation(RHYTHM_HH), metal ^ noise);
-        let cymbal = self.operators[RHYTHM_CY].percussion_sample(self.operator_attenuation(RHYTHM_CY), metal);
+        let snare = self.operators[RHYTHM_SD]
+            .percussion_sample(self.operator_attenuation(RHYTHM_SD), snare_bit);
+        let hihat = self.operators[RHYTHM_HH]
+            .percussion_sample(self.operator_attenuation(RHYTHM_HH), metal ^ noise);
+        let cymbal = self.operators[RHYTHM_CY]
+            .percussion_sample(self.operator_attenuation(RHYTHM_CY), metal);
 
         let (vibrato, deep) = (self.vibrato_phase(), self.deep_vibrato());
         for op in ops {
@@ -1154,7 +1161,9 @@ mod tests {
         // Reproduces the standard KSL ROM; top entry = 64 units = 48 dB.
         assert_eq!(
             *KSL,
-            [0, 32, 40, 45, 48, 51, 53, 55, 56, 58, 59, 60, 61, 62, 63, 64]
+            [
+                0, 32, 40, 45, 48, 51, 53, 55, 56, 58, 59, 60, 61, 62, 63, 64
+            ]
         );
     }
 
@@ -1171,7 +1180,10 @@ mod tests {
         let lo = peak_magnitude(ksl_operator(0x200, 5, 3), 256);
         let hi = peak_magnitude(ksl_operator(0x200, 6, 3), 256);
         let ratio = f64::from(lo) / f64::from(hi);
-        assert!((ratio - 2.0).abs() < 0.05, "expected ~2x per octave, got {ratio}");
+        assert!(
+            (ratio - 2.0).abs() < 0.05,
+            "expected ~2x per octave, got {ratio}"
+        );
     }
 
     #[test]
@@ -1180,8 +1192,14 @@ mod tests {
         // Settings 1/2/3 attenuate by a quarter/half/all of the 6 dB/oct value.
         let base = 48u16;
         assert_eq!(ksl_operator(0x200, 6, 3).ksl_attenuation(), base << 5);
-        assert_eq!(ksl_operator(0x200, 6, 2).ksl_attenuation(), (base >> 1) << 5);
-        assert_eq!(ksl_operator(0x200, 6, 1).ksl_attenuation(), (base >> 2) << 5);
+        assert_eq!(
+            ksl_operator(0x200, 6, 2).ksl_attenuation(),
+            (base >> 1) << 5
+        );
+        assert_eq!(
+            ksl_operator(0x200, 6, 1).ksl_attenuation(),
+            (base >> 2) << 5
+        );
         assert_eq!(ksl_operator(0x200, 6, 0).ksl_attenuation(), 0);
     }
 
@@ -1306,7 +1324,10 @@ mod tests {
             })
             .collect();
         assert!(samples[0] > 2000, "first half starts at the positive peak");
-        assert!(samples[64] < -2000, "second half starts at the negative peak");
+        assert!(
+            samples[64] < -2000,
+            "second half starts at the negative peak"
+        );
         assert!(samples[32] < samples[0], "first half decays toward zero");
         assert!(samples[96].abs() < samples[64].abs(), "second half decays");
     }
@@ -1489,12 +1510,19 @@ mod tests {
 
         let mut off = OplChip::default();
         setup(&mut off);
-        assert_eq!(peak(&mut off), 0, "secondary channel is silent without OPL3 mode");
+        assert_eq!(
+            peak(&mut off),
+            0,
+            "secondary channel is silent without OPL3 mode"
+        );
 
         let mut on = OplChip::default();
         write_secondary(&mut on, 0x05, 0x01); // NEW: enable OPL3 mode
         setup(&mut on);
-        assert!(peak(&mut on) > 1000, "secondary channel sounds in OPL3 mode");
+        assert!(
+            peak(&mut on) > 1000,
+            "secondary channel sounds in OPL3 mode"
+        );
     }
 
     #[test]
@@ -1518,9 +1546,18 @@ mod tests {
             }
             (lpk, rpk)
         };
-        assert!(matches!(peaks(0x11), (l, 0) if l > 1000), "additive, left only");
-        assert!(matches!(peaks(0x21), (0, r) if r > 1000), "additive, right only");
-        assert!(matches!(peaks(0x31), (l, r) if l > 1000 && r > 1000), "both");
+        assert!(
+            matches!(peaks(0x11), (l, 0) if l > 1000),
+            "additive, left only"
+        );
+        assert!(
+            matches!(peaks(0x21), (0, r) if r > 1000),
+            "additive, right only"
+        );
+        assert!(
+            matches!(peaks(0x31), (l, r) if l > 1000 && r > 1000),
+            "both"
+        );
         assert_eq!(peaks(0x01), (0, 0), "no pan bits: silent");
     }
 
@@ -1543,7 +1580,10 @@ mod tests {
 
         let mut two_op = OplChip::default();
         setup_channel3(&mut two_op);
-        assert!(peak(&mut two_op) > 1000, "channel 3 sounds as an independent 2-op");
+        assert!(
+            peak(&mut two_op) > 1000,
+            "channel 3 sounds as an independent 2-op"
+        );
 
         let mut four_op = OplChip::default();
         setup_channel3(&mut four_op);
@@ -1604,7 +1644,10 @@ mod tests {
 
         let (lo, hi) = peaks(0x80, 0x80); // AM on, DAM=1 (4.8 dB)
         let ratio = f64::from(hi) / f64::from(lo);
-        assert!((ratio - 1.74).abs() < 0.2, "expected ~4.8 dB swing, got {ratio}");
+        assert!(
+            (ratio - 1.74).abs() < 0.2,
+            "expected ~4.8 dB swing, got {ratio}"
+        );
 
         let (lo, hi) = peaks(0x00, 0x80); // AM off
         assert_eq!(lo, hi, "no tremolo without AM");
@@ -1627,8 +1670,16 @@ mod tests {
             opl.write_register(0xb0, 0x20 | (4 << 2) | 0x02); // key-on, block 4, fnum 0x200
             (0..4096).map(|_| opl.render_sample().0).collect::<Vec<_>>()
         };
-        assert_eq!(render(0x00, 0x40), render(0x00, 0x00), "no vibrato when VIB is off");
-        assert_ne!(render(0x40, 0x40), render(0x00, 0x40), "VIB bends the pitch");
+        assert_eq!(
+            render(0x00, 0x40),
+            render(0x00, 0x00),
+            "no vibrato when VIB is off"
+        );
+        assert_ne!(
+            render(0x40, 0x40),
+            render(0x00, 0x40),
+            "VIB bends the pitch"
+        );
     }
 
     #[test]
@@ -1645,10 +1696,26 @@ mod tests {
             op.phase
         };
         assert_eq!(advance(0, true), fnum << 4, "phase 0: no bend");
-        assert_eq!(advance(2, true), (fnum + (fnum >> 7)) << 4, "deep peak = +fnum>>7");
-        assert_eq!(advance(6, true), (fnum - (fnum >> 7)) << 4, "deep trough = -fnum>>7");
-        assert_eq!(advance(1, true), (fnum + (fnum >> 8)) << 4, "deep half-step = +fnum>>8");
-        assert_eq!(advance(2, false), (fnum + (fnum >> 8)) << 4, "shallow peak = +fnum>>8");
+        assert_eq!(
+            advance(2, true),
+            (fnum + (fnum >> 7)) << 4,
+            "deep peak = +fnum>>7"
+        );
+        assert_eq!(
+            advance(6, true),
+            (fnum - (fnum >> 7)) << 4,
+            "deep trough = -fnum>>7"
+        );
+        assert_eq!(
+            advance(1, true),
+            (fnum + (fnum >> 8)) << 4,
+            "deep half-step = +fnum>>8"
+        );
+        assert_eq!(
+            advance(2, false),
+            (fnum + (fnum >> 8)) << 4,
+            "shallow peak = +fnum>>8"
+        );
     }
 
     // Program a percussion operator (by register slot) loud and sustained.
@@ -1671,7 +1738,10 @@ mod tests {
             opl.write_register(0xc0 + ch, 0x00);
         }
         opl.write_register(0xbd, 0x3f); // rhythm + all five instruments on
-        let peak = (0..1024).map(|_| opl.render_sample().0.abs()).max().unwrap();
+        let peak = (0..1024)
+            .map(|_| opl.render_sample().0.abs())
+            .max()
+            .unwrap();
         assert!(peak > 1000, "percussion sounds, peak {peak}");
     }
 
@@ -1700,8 +1770,15 @@ mod tests {
             opl.write_register(0xbd, bd);
             (0..256).map(|_| opl.render_sample().0.abs()).max().unwrap()
         };
-        assert!(melodic_peak(0x00) > 1000, "channel 6 tone sounds without rhythm");
-        assert_eq!(melodic_peak(0x20), 0, "rhythm mode silences melodic channel 6");
+        assert!(
+            melodic_peak(0x00) > 1000,
+            "channel 6 tone sounds without rhythm"
+        );
+        assert_eq!(
+            melodic_peak(0x20),
+            0,
+            "rhythm mode silences melodic channel 6"
+        );
     }
 
     #[test]
@@ -1747,8 +1824,14 @@ mod tests {
             opl.write_register(0xb0, 0x20 | (4 << 2) | 0x02); // key-on, block 4, fnum 0x200
             (0..256).any(|_| opl.render_sample().0 < 0)
         };
-        assert!(has_negative(0x00), "WSEnable off forces a full sine (has negatives)");
-        assert!(!has_negative(0x20), "WSEnable on lets half-sine silence negatives");
+        assert!(
+            has_negative(0x00),
+            "WSEnable off forces a full sine (has negatives)"
+        );
+        assert!(
+            !has_negative(0x20),
+            "WSEnable on lets half-sine silence negatives"
+        );
     }
 
     #[test]
