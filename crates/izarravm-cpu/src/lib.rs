@@ -3023,7 +3023,8 @@ fn sign_extend_u8(value: u8) -> u32 {
 }
 
 fn bit_op(op: u8, value: u32, bit: u32) -> (bool, u32) {
-    // op: 0=BT, 1=BTS, 2=BTR, 3=BTC. `bit` is already reduced to 0..31.
+    // op: 0=BT, 1=BTS, 2=BTR, 3=BTC. `bit` is already reduced to 0..bits-1 (the caller
+    // masks to the operand width, so 0..15 for a word and 0..31 for a dword).
     let mask = 1u32 << bit;
     let cf = value & mask != 0;
     let new = match op {
@@ -5818,6 +5819,30 @@ mod tests {
         assert_eq!(
             u16::from_le_bytes([bus.memory[0x3e], bus.memory[0x3f]]),
             0x8000
+        );
+    }
+
+    #[test]
+    fn btc_memory_negative_index_walks_and_toggles() {
+        // btc [0x40], bx (0x0f 0xbb 0x1e 0x40 0x00): bx=0xffff (-1) -> word at 0x3e, bit 15.
+        // [0x3e]=0x8000 (bit 15 set) -> CF=1, the bit toggles off -> [0x3e]=0x0000.
+        let mut memory = vec![0; 128];
+        memory[0..5].copy_from_slice(&[0x0f, 0xbb, 0x1e, 0x40, 0x00]);
+        memory[0x3e..0x40].copy_from_slice(&0x8000u16.to_le_bytes());
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Bx, 0xffff); // -1
+        cpu.set_flag(FLAG_CF, false);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert!(cpu.flag(FLAG_CF));
+        assert_eq!(
+            u16::from_le_bytes([bus.memory[0x3e], bus.memory[0x3f]]),
+            0x0000
         );
     }
 
