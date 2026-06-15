@@ -1433,6 +1433,28 @@ impl Cpu386 {
                 )?;
                 Ok(clocks(6))
             }
+            0xa4 | 0xac => {
+                // SHLD (A4) / SHRD (AC) r/m, r, imm8. The imm8 follows the ModRM and displacement.
+                let modrm = self.fetch_modrm(bus)?;
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
+                let src = self.read_gpr_sized(modrm.reg, operand_size);
+                let count = self.fetch_u8(bus)?;
+                let dest = self.read_operand_sized(bus, operand, operand_size)?;
+                let result = self.double_shift(opcode == 0xa4, dest, src, count, operand_size);
+                self.write_operand_sized(bus, operand, operand_size, result)?;
+                Ok(clocks(3))
+            }
+            0xa5 | 0xad => {
+                // SHLD (A5) / SHRD (AD) r/m, r, CL.
+                let modrm = self.fetch_modrm(bus)?;
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
+                let src = self.read_gpr_sized(modrm.reg, operand_size);
+                let count = (self.registers.ecx() & 0xff) as u8;
+                let dest = self.read_operand_sized(bus, operand, operand_size)?;
+                let result = self.double_shift(opcode == 0xa5, dest, src, count, operand_size);
+                self.write_operand_sized(bus, operand, operand_size, result)?;
+                Ok(clocks(3))
+            }
             _ => Err(CpuError::UnsupportedTwoByteOpcode {
                 opcode,
                 cs: self.registers.cs().selector,
@@ -2703,6 +2725,49 @@ impl Cpu386 {
             }
             _ => unreachable!("alu op {op}"),
         }
+    }
+
+    fn double_shift(
+        &mut self,
+        left: bool,
+        dest: u32,
+        src: u32,
+        raw_count: u8,
+        operand_size: OperandSize,
+    ) -> u32 {
+        // The 386 masks the count to 5 bits. A count of 0 is a no-op that touches no flags.
+        let count = u32::from(raw_count) & 0x1f;
+        if count == 0 {
+            return dest;
+        }
+        let bits = operand_size.bytes() * 8;
+        let mask = operand_size.mask();
+        let msb = 1u32 << (bits - 1);
+        let mut d = dest & mask;
+        let mut s = src & mask;
+        // A nonzero count always overwrites cf on the first iteration; unlike the
+        // rotate-through-carry shifts there is no carry-in to seed.
+        let mut cf = false;
+        for _ in 0..count {
+            if left {
+                // SHLD: dest shifts left, the vacated low bit takes src's high bit.
+                cf = d & msb != 0;
+                d = ((d << 1) | ((s & msb) >> (bits - 1))) & mask;
+                s = (s << 1) & mask;
+            } else {
+                // SHRD: dest shifts right, the vacated high bit takes src's low bit.
+                cf = d & 1 != 0;
+                d = (d >> 1) | ((s & 1) << (bits - 1));
+                s >>= 1;
+            }
+        }
+        self.set_flag(FLAG_CF, cf);
+        if count == 1 {
+            // OF is defined only for a single-bit count: set when the sign bit changed.
+            self.set_flag(FLAG_OF, (dest ^ d) & msb != 0);
+        }
+        self.set_szp(d, operand_size.bus_width());
+        d & mask
     }
 
     fn shift_rotate(&mut self, op: u8, value: u32, raw_count: u8, width: BusWidth) -> u32 {
@@ -5940,5 +6005,163 @@ mod tests {
 
         assert_eq!(cpu.registers.eip, 0x00ee);
         assert!(!cpu.flag(FLAG_IF));
+    }
+
+    #[test]
+    fn shld_imm_shifts_left_and_fills_from_source() {
+        // shld ax, bx, 4 (0x0f 0xa4 0xd8 0x04, modrm mod=3 reg=bx rm=ax):
+        // ax=0x1234, bx=0x5678 -> ax=0x2345, CF=1 (bit shifted out of ax bit 12).
+        let mut memory = vec![0; 64];
+        memory[0..4].copy_from_slice(&[0x0f, 0xa4, 0xd8, 0x04]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x1234);
+        cpu.write_reg16(Reg16::Bx, 0x5678);
+        cpu.set_flag(FLAG_CF, false);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x2345);
+        assert!(cpu.flag(FLAG_CF));
+    }
+
+    #[test]
+    fn shrd_imm_shifts_right_and_fills_from_source() {
+        // shrd ax, bx, 4 (0x0f 0xac 0xd8 0x04): ax=0x1234, bx=0x5678 -> ax=0x8123, CF=0.
+        let mut memory = vec![0; 64];
+        memory[0..4].copy_from_slice(&[0x0f, 0xac, 0xd8, 0x04]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x1234);
+        cpu.write_reg16(Reg16::Bx, 0x5678);
+        cpu.set_flag(FLAG_CF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x8123);
+        assert!(!cpu.flag(FLAG_CF));
+    }
+
+    #[test]
+    fn shld_cl_uses_cl_count() {
+        // shld ax, bx, cl (0x0f 0xa5 0xd8): cl=4 -> same as imm 4: ax=0x2345, CF=1.
+        let mut memory = vec![0; 64];
+        memory[0..3].copy_from_slice(&[0x0f, 0xa5, 0xd8]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x1234);
+        cpu.write_reg16(Reg16::Bx, 0x5678);
+        cpu.write_reg16(Reg16::Cx, 0x0004); // cl = 4
+        cpu.set_flag(FLAG_CF, false);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x2345);
+        assert!(cpu.flag(FLAG_CF));
+    }
+
+    #[test]
+    fn shrd_cl_uses_cl_count() {
+        // shrd ax, bx, cl (0x0f 0xad 0xd8): cl=4 -> same as shrd imm 4: ax=0x8123, CF=0.
+        let mut memory = vec![0; 64];
+        memory[0..3].copy_from_slice(&[0x0f, 0xad, 0xd8]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x1234);
+        cpu.write_reg16(Reg16::Bx, 0x5678);
+        cpu.write_reg16(Reg16::Cx, 0x0004); // cl = 4
+        cpu.set_flag(FLAG_CF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x8123);
+        assert!(!cpu.flag(FLAG_CF));
+    }
+
+    #[test]
+    fn shld_32bit_imm() {
+        // 0x66 0x0f 0xa4 0xd8 0x08 (shld eax, ebx, 8): eax=0x1234_5678, ebx=0x9abc_def0
+        // -> eax=0x3456_789a, CF=0.
+        let mut memory = vec![0; 64];
+        memory[0..5].copy_from_slice(&[0x66, 0x0f, 0xa4, 0xd8, 0x08]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_gpr32(0, 0x1234_5678); // eax
+        cpu.write_gpr32(3, 0x9abc_def0); // ebx
+        cpu.set_flag(FLAG_CF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_gpr32(0), 0x3456_789a);
+        assert!(!cpu.flag(FLAG_CF));
+    }
+
+    #[test]
+    fn shld_count_one_sets_overflow_on_sign_change() {
+        // shld ax, bx, 1 (0x0f 0xa4 0xd8 0x01): ax=0x4000 -> ax=0x8000, sign flips, OF=1.
+        let mut memory = vec![0; 64];
+        memory[0..4].copy_from_slice(&[0x0f, 0xa4, 0xd8, 0x01]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x4000);
+        cpu.write_reg16(Reg16::Bx, 0x0000);
+        cpu.set_flag(FLAG_OF, false);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x8000);
+        assert!(cpu.flag(FLAG_OF));
+    }
+
+    #[test]
+    fn shld_count_one_clears_overflow_without_sign_change() {
+        // shld ax, bx, 1: ax=0x0001 -> ax=0x0002, sign unchanged, OF=0.
+        let mut memory = vec![0; 64];
+        memory[0..4].copy_from_slice(&[0x0f, 0xa4, 0xd8, 0x01]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x0001);
+        cpu.write_reg16(Reg16::Bx, 0x0000);
+        cpu.set_flag(FLAG_OF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x0002);
+        assert!(!cpu.flag(FLAG_OF));
+    }
+
+    #[test]
+    fn shld_count_zero_is_noop() {
+        // shld ax, bx, 0 (0x0f 0xa4 0xd8 0x00): ax unchanged, flags unchanged.
+        let mut memory = vec![0; 64];
+        memory[0..4].copy_from_slice(&[0x0f, 0xa4, 0xd8, 0x00]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x1234);
+        cpu.write_reg16(Reg16::Bx, 0x5678);
+        cpu.set_flag(FLAG_CF, true);
+        cpu.set_flag(FLAG_OF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x1234);
+        assert!(cpu.flag(FLAG_CF));
+        assert!(cpu.flag(FLAG_OF));
     }
 }
