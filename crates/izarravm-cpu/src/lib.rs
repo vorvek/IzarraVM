@@ -745,8 +745,10 @@ impl Cpu386 {
             }
             0x9e => {
                 // SAHF: load CF/PF/AF/ZF/SF from AH; OF and the reserved bits are untouched.
+                // The trailing | 0x02 keeps the always-one reserved bit set, matching
+                // set_flag and load_flags.
                 let ah = u32::from(self.read_gpr8(4));
-                self.registers.eflags = (self.registers.eflags & !0xd5) | (ah & 0xd5);
+                self.registers.eflags = (self.registers.eflags & !0xd5) | (ah & 0xd5) | 0x02;
                 Ok(clocks(3))
             }
             0x9f => {
@@ -4957,7 +4959,7 @@ mod tests {
 
     #[test]
     fn sahf_loads_flags_from_ah_leaving_overflow() {
-        // sahf (0x9e). AH=0xD7 -> CF=PF=AF=ZF=SF=1; OF untouched (stays 0).
+        // sahf (0x9e). AH=0xD7 -> CF=PF=AF=ZF=SF=1; OF untouched (a set OF survives).
         let mut memory = vec![0; 64];
         memory[0] = 0x9e;
         let mut cpu = Cpu386::default();
@@ -4969,7 +4971,7 @@ mod tests {
         cpu.set_flag(FLAG_AF, false);
         cpu.set_flag(FLAG_ZF, false);
         cpu.set_flag(FLAG_SF, false);
-        cpu.set_flag(FLAG_OF, false);
+        cpu.set_flag(FLAG_OF, true);
         let mut bus = TestBus::with_memory(memory);
 
         cpu.cycle(&mut bus).unwrap();
@@ -4979,7 +4981,7 @@ mod tests {
         assert!(cpu.flag(FLAG_AF));
         assert!(cpu.flag(FLAG_ZF));
         assert!(cpu.flag(FLAG_SF));
-        assert!(!cpu.flag(FLAG_OF));
+        assert!(cpu.flag(FLAG_OF));
     }
 
     #[test]
