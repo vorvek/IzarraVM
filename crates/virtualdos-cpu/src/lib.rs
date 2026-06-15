@@ -317,6 +317,8 @@ struct Prefixes {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StringOp {
     Movs,
+    Cmps,
+    Scas,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -635,6 +637,34 @@ impl Cpu386 {
                 self.run_string(
                     bus,
                     StringOp::Movs,
+                    operand_size.bus_width(),
+                    prefixes,
+                    address_size,
+                )?;
+                Ok(clocks(4))
+            }
+            0xa6 => {
+                self.run_string(bus, StringOp::Cmps, BusWidth::Byte, prefixes, address_size)?;
+                Ok(clocks(4))
+            }
+            0xa7 => {
+                self.run_string(
+                    bus,
+                    StringOp::Cmps,
+                    operand_size.bus_width(),
+                    prefixes,
+                    address_size,
+                )?;
+                Ok(clocks(4))
+            }
+            0xae => {
+                self.run_string(bus, StringOp::Scas, BusWidth::Byte, prefixes, address_size)?;
+                Ok(clocks(4))
+            }
+            0xaf => {
+                self.run_string(
+                    bus,
+                    StringOp::Scas,
                     operand_size.bus_width(),
                     prefixes,
                     address_size,
@@ -1846,6 +1876,32 @@ impl Cpu386 {
         Ok(bus.read_memory(physical, width, BusAccessKind::DataRead)?)
     }
 
+    fn read_string_dst<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        address_size: AddressSize,
+        width: BusWidth,
+    ) -> ExecResult<u32> {
+        let offset = self.index_offset(7, address_size); // DI / EDI
+        let physical = self.translate_segmented(
+            bus,
+            SegmentIndex::Es,
+            offset,
+            width.bytes(),
+            BusAccessKind::DataRead,
+            false,
+        )?;
+        Ok(bus.read_memory(physical, width, BusAccessKind::DataRead)?)
+    }
+
+    fn acc_read(&self, width: BusWidth) -> u32 {
+        match width {
+            BusWidth::Byte => u32::from(self.read_gpr8(0)),
+            BusWidth::Word => u32::from(self.read_gpr16(0)),
+            BusWidth::Dword => self.read_gpr32(0),
+        }
+    }
+
     fn write_string_dst<B: CpuBus>(
         &mut self,
         bus: &mut B,
@@ -1882,6 +1938,19 @@ impl Cpu386 {
                 self.adjust_index_register(6, address_size, bytes);
                 self.adjust_index_register(7, address_size, bytes);
             }
+            StringOp::Cmps => {
+                let a = self.read_string_src(bus, prefixes, address_size, width)?;
+                let b = self.read_string_dst(bus, address_size, width)?;
+                self.alu_sub(a, b, 0, width); // flags only: [DS:SI] - [ES:DI]
+                self.adjust_index_register(6, address_size, bytes);
+                self.adjust_index_register(7, address_size, bytes);
+            }
+            StringOp::Scas => {
+                let a = self.acc_read(width);
+                let b = self.read_string_dst(bus, address_size, width)?;
+                self.alu_sub(a, b, 0, width); // flags only: accumulator - [ES:DI]
+                self.adjust_index_register(7, address_size, bytes);
+            }
         }
         Ok(())
     }
@@ -1896,14 +1965,24 @@ impl Cpu386 {
     ) -> ExecResult<()> {
         match prefixes.rep {
             None => self.string_step(bus, op, width, prefixes, address_size)?,
-            // MOVS repeats CX times regardless of REPE/REPNE; the ZF test arrives with
-            // CMPS/SCAS in a later task.
-            Some(_) => loop {
+            Some(kind) => loop {
                 if self.string_count(address_size) == 0 {
                     break;
                 }
                 self.string_step(bus, op, width, prefixes, address_size)?;
                 self.decrement_string_count(address_size);
+                // CMPS/SCAS also end the repeat on the ZF condition. REPE continues while
+                // ZF is set; REPNE continues while ZF is clear. MOVS/STOS/LODS ignore ZF.
+                if matches!(op, StringOp::Cmps | StringOp::Scas) {
+                    let zf = self.flag(FLAG_ZF);
+                    let again = match kind {
+                        RepKind::Repe => zf,
+                        RepKind::Repne => !zf,
+                    };
+                    if !again {
+                        break;
+                    }
+                }
             },
         }
         Ok(())
@@ -3923,6 +4002,127 @@ mod tests {
         assert_eq!(cpu.registers.esi(), 0x100);
         assert_eq!(cpu.registers.edi(), 0x200);
         assert_eq!(cpu.registers.ecx(), 0);
+    }
+
+    #[test]
+    fn cmpsb_equal_sets_zero_flag() {
+        // cmpsb (0xa6). [ds:si]=0x55, [es:di]=0x55 -> equal, ZF set.
+        let mut memory = vec![0; 1024];
+        memory[0] = 0xa6;
+        memory[0x100] = 0x55;
+        memory[0x200] = 0x55;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Es, 0);
+        cpu.registers.eip = 0;
+        cpu.set_flag(FLAG_DF, false);
+        cpu.registers.set_esi(0x100);
+        cpu.registers.set_edi(0x200);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert!(cpu.flag(FLAG_ZF));
+        assert_eq!(cpu.registers.esi(), 0x101);
+        assert_eq!(cpu.registers.edi(), 0x201);
+    }
+
+    #[test]
+    fn cmpsb_unequal_clears_zero_flag() {
+        // cmpsb. [ds:si]=0x10, [es:di]=0x20 -> 0x10-0x20 borrows: ZF clear, CF set.
+        let mut memory = vec![0; 1024];
+        memory[0] = 0xa6;
+        memory[0x100] = 0x10;
+        memory[0x200] = 0x20;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Es, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esi(0x100);
+        cpu.registers.set_edi(0x200);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert!(!cpu.flag(FLAG_ZF));
+        assert!(cpu.flag(FLAG_CF)); // 0x10 < 0x20
+    }
+
+    #[test]
+    fn scasb_compares_al_with_es_di() {
+        // scasb (0xae). al=0x41, [es:di]=0x41 -> ZF set; di increments, si untouched.
+        let mut memory = vec![0; 1024];
+        memory[0] = 0xae;
+        memory[0x200] = 0x41;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Es, 0);
+        cpu.registers.eip = 0;
+        cpu.write_gpr8(0, 0x41);
+        cpu.registers.set_esi(0x100);
+        cpu.registers.set_edi(0x200);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert!(cpu.flag(FLAG_ZF));
+        assert_eq!(cpu.registers.edi(), 0x201);
+        assert_eq!(cpu.registers.esi(), 0x100); // SCAS does not touch SI
+    }
+
+    #[test]
+    fn repe_cmpsb_stops_on_first_mismatch() {
+        // repe cmpsb (0xf3 0xa6), cx=4. Source "AABB" vs dest "AACC": the third byte
+        // (index 2) is the B/C mismatch, so the repeat stops there with ZF clear after
+        // 3 iterations; cx counts 4 -> 3 -> 2 -> 1, si/di advance by 3.
+        let mut memory = vec![0; 1024];
+        memory[0..2].copy_from_slice(&[0xf3, 0xa6]);
+        memory[0x100..0x104].copy_from_slice(b"AABB");
+        memory[0x200..0x204].copy_from_slice(b"AACC");
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Es, 0);
+        cpu.registers.eip = 0;
+        cpu.set_flag(FLAG_DF, false);
+        cpu.registers.set_esi(0x100);
+        cpu.registers.set_edi(0x200);
+        cpu.registers.set_ecx(4);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert!(!cpu.flag(FLAG_ZF)); // stopped on the index-2 mismatch (B != C)
+        assert_eq!(cpu.registers.ecx(), 1); // 4 -> 3 -> 2 -> 1, then ZF clear stops
+        assert_eq!(cpu.registers.esi(), 0x103);
+        assert_eq!(cpu.registers.edi(), 0x203);
+    }
+
+    #[test]
+    fn repne_scasb_stops_on_match() {
+        // repne scasb (0xf2 0xae), cx=4, al='C'. Dest "AACA": scans until the match at
+        // index 2, stopping with ZF set after 3 iterations; cx counts 4 -> 3 -> 2 -> 1,
+        // di advances by 3.
+        let mut memory = vec![0; 1024];
+        memory[0..2].copy_from_slice(&[0xf2, 0xae]);
+        memory[0x200..0x204].copy_from_slice(b"AACA");
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Es, 0);
+        cpu.registers.eip = 0;
+        cpu.set_flag(FLAG_DF, false);
+        cpu.write_gpr8(0, b'C');
+        cpu.registers.set_edi(0x200);
+        cpu.registers.set_ecx(4);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert!(cpu.flag(FLAG_ZF)); // matched 'C' at index 2
+        assert_eq!(cpu.registers.ecx(), 1); // 4 -> 3 -> 2 -> 1, match stops
+        assert_eq!(cpu.registers.edi(), 0x203);
     }
 
     #[test]
