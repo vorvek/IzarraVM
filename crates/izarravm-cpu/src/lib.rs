@@ -594,12 +594,13 @@ impl Cpu386 {
                 Ok(clocks(2))
             }
             0x86 => {
-                // XCHG r/m8, r8. Re-decoding the ModRm for the write recomputes the identical
-                // address, matching the byte read/write neighbours (0x84/0x88).
+                // XCHG r/m8, r8. Decode the operand once, then cross-write; decoding twice would
+                // re-fetch the displacement and over-advance eip for a memory operand.
                 let modrm = self.fetch_modrm(bus)?;
-                let rm = self.read_rm_u8(bus, prefixes, address_size, modrm)?;
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
+                let rm = self.read_operand_u8(bus, operand)?;
                 let reg = self.read_gpr8(modrm.reg);
-                self.write_rm_u8(bus, prefixes, address_size, modrm, reg)?;
+                self.write_operand_u8(bus, operand, reg)?;
                 self.write_gpr8(modrm.reg, rm);
                 Ok(clocks(3))
             }
@@ -6359,5 +6360,28 @@ mod tests {
 
         assert_eq!(cpu.read_gpr32(0), 0x0003_0004);
         assert_eq!(cpu.read_gpr32(3), 0x0001_0002);
+    }
+
+    #[test]
+    fn xchg_byte_swaps_register_and_memory_with_displacement() {
+        // xchg [bx+0x10], al (0x86 0x47 0x10, modrm mod=1 reg=al rm=[bx]+disp8).
+        // bx=0x20 -> address 0x30. Guards against re-decoding the ModRm, which would
+        // consume a second displacement byte and advance eip past the instruction.
+        let mut memory = vec![0; 128];
+        memory[0..3].copy_from_slice(&[0x86, 0x47, 0x10]);
+        memory[0x30] = 0x99;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Bx, 0x0020);
+        cpu.write_reg16(Reg16::Ax, 0x0055); // AL = 0x55
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax) & 0xff, 0x99); // AL got the memory byte
+        assert_eq!(bus.memory[0x30], 0x55); // memory got AL
+        assert_eq!(cpu.registers.eip, 3); // opcode + modrm + disp8, no extra fetch
     }
 }
