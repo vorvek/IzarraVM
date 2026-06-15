@@ -1378,6 +1378,30 @@ impl Cpu386 {
                 self.write_gpr8(0, al);
                 Ok(clocks(4))
             }
+            0xd4 => {
+                // AAM: AH = AL / imm8, AL = AL % imm8. OF/AF/CF undefined; SF/ZF/PF from AL.
+                let divisor = self.fetch_u8(bus)?;
+                if divisor == 0 {
+                    return Err(CpuError::DivideError.into());
+                }
+                let al = self.read_gpr8(0);
+                self.write_gpr8(4, al / divisor);
+                let rem = al % divisor;
+                self.write_gpr8(0, rem);
+                self.set_szp(u32::from(rem), BusWidth::Byte);
+                Ok(clocks(17))
+            }
+            0xd5 => {
+                // AAD: AL = (AL + AH*imm8) & 0xff, AH = 0. OF/AF/CF undefined; SF/ZF/PF from AL.
+                let multiplier = self.fetch_u8(bus)?;
+                let al = self.read_gpr8(0);
+                let ah = self.read_gpr8(4);
+                let result = al.wrapping_add(ah.wrapping_mul(multiplier));
+                self.write_gpr8(0, result);
+                self.write_gpr8(4, 0);
+                self.set_szp(u32::from(result), BusWidth::Byte);
+                Ok(clocks(19))
+            }
             0x0f => self.execute_two_byte(bus, prefixes, address_size, operand_size),
             _ => Err(CpuError::UnsupportedOpcode {
                 opcode,
@@ -7028,5 +7052,56 @@ mod tests {
         assert_eq!(cpu.read_reg16(Reg16::Ax) >> 8, 0x01);
         assert!(cpu.flag(FLAG_CF));
         assert!(cpu.flag(FLAG_AF));
+    }
+
+    #[test]
+    fn aam_splits_al_into_ah_and_al() {
+        // aam (0xd4 0x0a): AL=0x4B (75) -> AH=7, AL=5. SF=0, ZF=0.
+        let mut memory = vec![0; 64];
+        memory[0..2].copy_from_slice(&[0xd4, 0x0a]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x004b);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax) & 0xff, 0x05);
+        assert_eq!(cpu.read_reg16(Reg16::Ax) >> 8, 0x07);
+        assert!(!cpu.flag(FLAG_SF));
+        assert!(!cpu.flag(FLAG_ZF));
+    }
+
+    #[test]
+    fn aam_zero_divisor_is_divide_error() {
+        // aam (0xd4 0x00): divide by zero -> DivideError.
+        let mut memory = vec![0; 64];
+        memory[0..2].copy_from_slice(&[0xd4, 0x00]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x004b);
+        let mut bus = TestBus::with_memory(memory);
+
+        assert!(matches!(cpu.cycle(&mut bus), Err(CpuError::DivideError)));
+    }
+
+    #[test]
+    fn aad_folds_ah_into_al() {
+        // aad (0xd5 0x0a): AX=0x0507 (AH=5, AL=7) -> AL = 7 + 5*10 = 57 = 0x39, AH=0.
+        let mut memory = vec![0; 64];
+        memory[0..2].copy_from_slice(&[0xd5, 0x0a]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x0507);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax) & 0xff, 0x39);
+        assert_eq!(cpu.read_reg16(Reg16::Ax) >> 8, 0x00);
+        assert!(!cpu.flag(FLAG_ZF));
     }
 }
