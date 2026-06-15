@@ -593,6 +593,26 @@ impl Cpu386 {
                 self.alu(4, value, reg, operand_size.bus_width());
                 Ok(clocks(2))
             }
+            0x86 => {
+                // XCHG r/m8, r8. Re-decoding the ModRm for the write recomputes the identical
+                // address, matching the byte read/write neighbours (0x84/0x88).
+                let modrm = self.fetch_modrm(bus)?;
+                let rm = self.read_rm_u8(bus, prefixes, address_size, modrm)?;
+                let reg = self.read_gpr8(modrm.reg);
+                self.write_rm_u8(bus, prefixes, address_size, modrm, reg)?;
+                self.write_gpr8(modrm.reg, rm);
+                Ok(clocks(3))
+            }
+            0x87 => {
+                // XCHG r/m16/32, r16/32. Decode the operand once, then cross-write.
+                let modrm = self.fetch_modrm(bus)?;
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
+                let rm = self.read_operand_sized(bus, operand, operand_size)?;
+                let reg = self.read_gpr_sized(modrm.reg, operand_size);
+                self.write_operand_sized(bus, operand, operand_size, reg)?;
+                self.write_gpr_sized(modrm.reg, operand_size, rm);
+                Ok(clocks(3))
+            }
             0x88 => {
                 let modrm = self.fetch_modrm(bus)?;
                 let value = self.read_gpr8(modrm.reg);
@@ -660,6 +680,16 @@ impl Cpu386 {
                 Ok(clocks(7))
             }
             0x90 => Ok(clocks(3)),
+            0x91..=0x97 => {
+                // XCHG AX/EAX, reg. The register index is the low 3 opcode bits; 0x90 (index 0,
+                // XCHG AX,AX) is the existing NOP arm.
+                let reg = opcode & 7;
+                let acc = self.read_gpr_sized(0, operand_size);
+                let other = self.read_gpr_sized(reg, operand_size);
+                self.write_gpr_sized(0, operand_size, other);
+                self.write_gpr_sized(reg, operand_size, acc);
+                Ok(clocks(3))
+            }
             0x98 => {
                 // CBW / CWDE: sign-extend the accumulator into the next width.
                 match operand_size {
@@ -6216,5 +6246,118 @@ mod tests {
         cpu.cycle(&mut bus).unwrap();
 
         assert_eq!(cpu.read_reg16(Reg16::Ax), 0x048d);
+    }
+
+    #[test]
+    fn xchg_byte_swaps_registers() {
+        // xchg al, bl (0x86 0xc3, modrm mod=3 reg=al rm=bl). al=0x12, bl=0x34 -> al=0x34, bl=0x12.
+        let mut memory = vec![0; 64];
+        memory[0..2].copy_from_slice(&[0x86, 0xc3]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x0012);
+        cpu.write_reg16(Reg16::Bx, 0x0034);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax) & 0xff, 0x34);
+        assert_eq!(cpu.read_reg16(Reg16::Bx) & 0xff, 0x12);
+    }
+
+    #[test]
+    fn xchg_word_swaps_registers() {
+        // xchg bx, ax (0x87 0xc3, modrm reg=ax rm=bx). ax=0x1234, bx=0x5678 -> swapped.
+        let mut memory = vec![0; 64];
+        memory[0..2].copy_from_slice(&[0x87, 0xc3]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x1234);
+        cpu.write_reg16(Reg16::Bx, 0x5678);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x5678);
+        assert_eq!(cpu.read_reg16(Reg16::Bx), 0x1234);
+    }
+
+    #[test]
+    fn xchg_word_swaps_register_and_memory() {
+        // xchg [0x40], ax (0x87 0x06 0x40 0x00, modrm mod=0 reg=ax rm=110 disp16).
+        let mut memory = vec![0; 128];
+        memory[0..4].copy_from_slice(&[0x87, 0x06, 0x40, 0x00]);
+        memory[0x40] = 0xcd;
+        memory[0x41] = 0xab; // word at 0x40 = 0xabcd
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x1234);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0xabcd);
+        assert_eq!(
+            u16::from_le_bytes([bus.memory[0x40], bus.memory[0x41]]),
+            0x1234
+        );
+    }
+
+    #[test]
+    fn xchg_dword_swaps_registers() {
+        // 0x66 0x87 0xc3 (xchg ebx, eax). eax=0x1111_2222, ebx=0x3333_4444 -> swapped.
+        let mut memory = vec![0; 64];
+        memory[0..3].copy_from_slice(&[0x66, 0x87, 0xc3]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_gpr32(0, 0x1111_2222);
+        cpu.write_gpr32(3, 0x3333_4444);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_gpr32(0), 0x3333_4444);
+        assert_eq!(cpu.read_gpr32(3), 0x1111_2222);
+    }
+
+    #[test]
+    fn xchg_accumulator_swaps_ax_with_reg() {
+        // xchg ax, cx (0x91). ax=0x1234, cx=0x5678 -> swapped.
+        let mut memory = vec![0; 64];
+        memory[0] = 0x91;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x1234);
+        cpu.write_reg16(Reg16::Cx, 0x5678);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x5678);
+        assert_eq!(cpu.read_reg16(Reg16::Cx), 0x1234);
+    }
+
+    #[test]
+    fn xchg_accumulator_dword_swaps_eax_with_reg() {
+        // 0x66 0x93 (xchg eax, ebx). eax=0x0001_0002, ebx=0x0003_0004 -> swapped.
+        let mut memory = vec![0; 64];
+        memory[0..2].copy_from_slice(&[0x66, 0x93]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_gpr32(0, 0x0001_0002);
+        cpu.write_gpr32(3, 0x0003_0004);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_gpr32(0), 0x0003_0004);
+        assert_eq!(cpu.read_gpr32(3), 0x0001_0002);
     }
 }
