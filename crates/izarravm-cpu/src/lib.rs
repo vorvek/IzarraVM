@@ -658,6 +658,21 @@ impl Cpu386 {
                 }
                 Ok(clocks(2))
             }
+            0x9c => {
+                // PUSHF / PUSHFD. PUSHFD clears VM (bit 17) and RF (bit 16) in the pushed image.
+                let value = match operand_size {
+                    OperandSize::Word => self.registers.eflags & 0xffff,
+                    OperandSize::Dword => self.registers.eflags & !0x0003_0000,
+                };
+                self.push(bus, value, operand_size)?;
+                Ok(clocks(3))
+            }
+            0x9d => {
+                // POPF / POPFD: load the popped image through the shared flag-load.
+                let value = self.pop(bus, operand_size)?;
+                self.load_flags(value, operand_size);
+                Ok(clocks(4))
+            }
             0xa1 => {
                 let offset = self.fetch_moffs(bus, address_size)?;
                 let value = self.read_memory_sized(
@@ -964,6 +979,12 @@ impl Cpu386 {
             }
             0xfa => {
                 self.set_flag(FLAG_IF, false);
+                Ok(clocks(3))
+            }
+            0xfb => {
+                // STI sets IF. The one-instruction interrupt shadow is irrelevant until
+                // interrupt delivery exists.
+                self.set_flag(FLAG_IF, true);
                 Ok(clocks(3))
             }
             0xfc => {
@@ -2090,6 +2111,18 @@ impl Cpu386 {
         Ok(bus.read_memory(physical, BusWidth::Dword, BusAccessKind::DataRead)?)
     }
 
+    fn load_flags(&mut self, value: u32, operand_size: OperandSize) {
+        match operand_size {
+            OperandSize::Word => {
+                self.registers.eflags =
+                    (self.registers.eflags & 0xffff_0000) | (value & 0xffff) | 0x2;
+            }
+            OperandSize::Dword => {
+                self.registers.eflags = value | 0x2;
+            }
+        }
+    }
+
     fn iret<B: CpuBus>(&mut self, bus: &mut B, operand_size: OperandSize) -> ExecResult<()> {
         match operand_size {
             OperandSize::Word => {
@@ -2098,8 +2131,7 @@ impl Cpu386 {
                 let flags = self.pop(bus, OperandSize::Word)?;
                 self.load_segment(bus, SegmentIndex::Cs, cs)?;
                 self.registers.eip = ip & 0xffff;
-                self.registers.eflags =
-                    (self.registers.eflags & 0xffff_0000) | (flags & 0xffff) | 0x2;
+                self.load_flags(flags, OperandSize::Word);
             }
             OperandSize::Dword => {
                 let eip = self.pop(bus, OperandSize::Dword)?;
@@ -2107,7 +2139,7 @@ impl Cpu386 {
                 let flags = self.pop(bus, OperandSize::Dword)?;
                 self.load_segment(bus, SegmentIndex::Cs, cs)?;
                 self.registers.eip = eip;
-                self.registers.eflags = flags | 0x2;
+                self.load_flags(flags, OperandSize::Dword);
             }
         }
         Ok(())
@@ -4331,5 +4363,44 @@ mod tests {
         cpu.cycle(&mut bus).unwrap();
 
         assert_eq!(cpu.registers.edx(), 0xffff_ffff);
+    }
+
+    #[test]
+    fn sti_sets_interrupt_flag() {
+        // sti (0xfb) sets IF.
+        let mut memory = vec![0; 64];
+        memory[0] = 0xfb;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.set_flag(FLAG_IF, false);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert!(cpu.flag(FLAG_IF));
+    }
+
+    #[test]
+    fn pushf_then_popf_restores_flags() {
+        // pushf (0x9c) ; popf (0x9d). pushf saves CF=1; CF is perturbed by hand;
+        // popf restores it and reserved bit 1 stays set.
+        let mut memory = vec![0; 1024];
+        memory[0] = 0x9c;
+        memory[1] = 0x9d;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        cpu.set_flag(FLAG_CF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap(); // pushf
+        cpu.set_flag(FLAG_CF, false); // perturb after the value is on the stack
+        cpu.cycle(&mut bus).unwrap(); // popf
+
+        assert!(cpu.flag(FLAG_CF));
+        assert_eq!(cpu.registers.eflags & 0x2, 0x2);
     }
 }
