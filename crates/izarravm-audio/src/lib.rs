@@ -1,8 +1,10 @@
 use izarravm_core::{AudioConfig, MidiBackend};
 
 mod opl;
+mod resample;
 
 pub use opl::OplChip;
+pub use resample::Resampler;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioDeviceKind {
