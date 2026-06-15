@@ -347,9 +347,10 @@ enum Outcome {
     Unimplemented,
     Skipped,
     // The CPU raised #DE (DivideError) on a vector the suite did not mark as an
-    // exception. These are IDIV/DIV overflow-boundary cases where the 386 silicon
-    // produces a non-trapping result we do not model; our CPU follows Intel's
-    // documented #DE. Counted separately so the divergence stays visible.
+    // exception. Because divide-by-zero vectors always carry an exception field and
+    // are skipped above, a DivideError here is always a quotient-overflow case where
+    // the 386 silicon produces a non-trapping result we do not model; our CPU follows
+    // Intel's documented #DE. Counted separately so the divergence stays visible.
     DivideQuirk,
     Errored(String),
 }
