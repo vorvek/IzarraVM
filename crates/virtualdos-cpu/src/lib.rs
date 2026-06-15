@@ -319,6 +319,8 @@ enum StringOp {
     Movs,
     Cmps,
     Scas,
+    Stos,
+    Lods,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -684,15 +686,31 @@ impl Cpu386 {
                 Ok(clocks(2))
             }
             0xaa => {
-                self.stos_u8(bus, address_size)?;
+                self.run_string(bus, StringOp::Stos, BusWidth::Byte, prefixes, address_size)?;
+                Ok(clocks(4))
+            }
+            0xab => {
+                self.run_string(
+                    bus,
+                    StringOp::Stos,
+                    operand_size.bus_width(),
+                    prefixes,
+                    address_size,
+                )?;
                 Ok(clocks(4))
             }
             0xac => {
-                self.lods(bus, prefixes, address_size, BusWidth::Byte)?;
-                Ok(clocks(5))
+                self.run_string(bus, StringOp::Lods, BusWidth::Byte, prefixes, address_size)?;
+                Ok(clocks(4))
             }
-            0xab => {
-                self.stos(bus, address_size, operand_size)?;
+            0xad => {
+                self.run_string(
+                    bus,
+                    StringOp::Lods,
+                    operand_size.bus_width(),
+                    prefixes,
+                    address_size,
+                )?;
                 Ok(clocks(4))
             }
             0xb0..=0xb7 => {
@@ -1762,76 +1780,6 @@ impl Cpu386 {
         }
     }
 
-    fn lods<B: CpuBus>(
-        &mut self,
-        bus: &mut B,
-        prefixes: Prefixes,
-        address_size: AddressSize,
-        width: BusWidth,
-    ) -> ExecResult<()> {
-        let segment = prefixes.segment_override.unwrap_or(SegmentIndex::Ds);
-        let increment = width.bytes();
-        let offset = match address_size {
-            AddressSize::Word => u32::from(self.read_gpr16(6)),
-            AddressSize::Dword => self.registers.esi(),
-        };
-        let physical = self.translate_segmented(
-            bus,
-            segment,
-            offset,
-            increment,
-            BusAccessKind::DataRead,
-            false,
-        )?;
-        let value = bus.read_memory(physical, width, BusAccessKind::DataRead)?;
-        match width {
-            BusWidth::Byte => self.write_gpr8(0, value as u8),
-            BusWidth::Word => self.write_gpr16(0, value as u16),
-            BusWidth::Dword => self.write_gpr32(0, value),
-        }
-        self.adjust_index_register(6, address_size, increment);
-        Ok(())
-    }
-
-    fn stos<B: CpuBus>(
-        &mut self,
-        bus: &mut B,
-        address_size: AddressSize,
-        operand_size: OperandSize,
-    ) -> ExecResult<()> {
-        let offset = match address_size {
-            AddressSize::Word => u32::from(self.read_gpr16(7)),
-            AddressSize::Dword => self.registers.edi(),
-        };
-        let value = self.read_gpr_sized(0, operand_size);
-        self.write_memory_sized(
-            bus,
-            SegmentIndex::Es,
-            offset,
-            operand_size,
-            value,
-            BusAccessKind::DataWrite,
-        )?;
-        self.adjust_index_register(7, address_size, operand_size.bytes());
-        Ok(())
-    }
-
-    fn stos_u8<B: CpuBus>(&mut self, bus: &mut B, address_size: AddressSize) -> ExecResult<()> {
-        let offset = match address_size {
-            AddressSize::Word => u32::from(self.read_gpr16(7)),
-            AddressSize::Dword => self.registers.edi(),
-        };
-        self.write_memory_u8(
-            bus,
-            SegmentIndex::Es,
-            offset,
-            self.read_gpr8(0),
-            BusAccessKind::DataWrite,
-        )?;
-        self.adjust_index_register(7, address_size, 1);
-        Ok(())
-    }
-
     fn index_offset(&self, index: u8, address_size: AddressSize) -> u32 {
         match address_size {
             AddressSize::Word => u32::from(self.read_gpr16(index)),
@@ -1902,6 +1850,14 @@ impl Cpu386 {
         }
     }
 
+    fn acc_write(&mut self, width: BusWidth, value: u32) {
+        match width {
+            BusWidth::Byte => self.write_gpr8(0, value as u8),
+            BusWidth::Word => self.write_gpr16(0, value as u16),
+            BusWidth::Dword => self.write_gpr32(0, value),
+        }
+    }
+
     fn write_string_dst<B: CpuBus>(
         &mut self,
         bus: &mut B,
@@ -1950,6 +1906,16 @@ impl Cpu386 {
                 let b = self.read_string_dst(bus, address_size, width)?;
                 self.alu_sub(a, b, 0, width); // flags only: accumulator - [ES:DI]
                 self.adjust_index_register(7, address_size, bytes);
+            }
+            StringOp::Stos => {
+                let value = self.acc_read(width);
+                self.write_string_dst(bus, address_size, width, value)?;
+                self.adjust_index_register(7, address_size, bytes);
+            }
+            StringOp::Lods => {
+                let value = self.read_string_src(bus, prefixes, address_size, width)?;
+                self.acc_write(width, value);
+                self.adjust_index_register(6, address_size, bytes);
             }
         }
         Ok(())
@@ -2779,6 +2745,48 @@ mod tests {
 
         assert_eq!(bus.memory[0x200], b'S');
         assert_eq!(cpu.registers.edi(), 0x201);
+    }
+
+    #[test]
+    fn rep_stosb_fills_es_di() {
+        // rep stosb (0xf3 0xaa), cx=3, al=0xee. Fills 3 bytes at es:di, cx -> 0, di += 3.
+        let mut memory = vec![0; 1024];
+        memory[0..2].copy_from_slice(&[0xf3, 0xaa]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Es, 0);
+        cpu.registers.eip = 0;
+        cpu.set_flag(FLAG_DF, false);
+        cpu.write_gpr8(0, 0xee);
+        cpu.registers.set_edi(0x300);
+        cpu.registers.set_ecx(3);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(&bus.memory[0x300..0x303], &[0xee, 0xee, 0xee]);
+        assert_eq!(cpu.registers.edi(), 0x303);
+        assert_eq!(cpu.registers.ecx(), 0);
+    }
+
+    #[test]
+    fn lodsw_loads_ax_and_advances_si() {
+        // lodsw (0xad). [ds:si]=0x1234 (LE) -> ax; si += 2.
+        let mut memory = vec![0; 1024];
+        memory[0] = 0xad;
+        memory[0x100..0x102].copy_from_slice(&0x1234u16.to_le_bytes());
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        cpu.set_flag(FLAG_DF, false);
+        cpu.registers.set_esi(0x100);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x1234);
+        assert_eq!(cpu.registers.esi(), 0x102);
     }
 
     #[test]
