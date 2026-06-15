@@ -14,7 +14,9 @@ Restricted:
 - Nuked-OPL3 and the DOSBox OPL cores are LGPL 2.1 / GPL. They may be consulted
   ONLY to check an assumption — confirm a table value or an edge-case behaviour.
   Their code must not be copied, translated, or otherwise derived into this
-  MIT-licensed repository.
+  repository. The constraint is clean-room provenance, not license
+  compatibility: even a permissively-licensed implementation is off-limits as a
+  source to translate.
 
 Lookup tables are generated from published formulas. Any value cross-checked
 against a restricted source must be independently re-derived from the datasheet
