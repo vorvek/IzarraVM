@@ -422,11 +422,14 @@ fn undefined_flags_marks_shifts() {
     // imm/CL counts below the operand width: AF|OF, CF still defined.
     assert_eq!(undefined_flags(&[0xc1, 0xe0, 0x04, 0xf4], 0), AF | OF); // shl ax,4 (word)
     assert_eq!(undefined_flags(&[0xd2, 0xe0, 0xf4], 7), AF | OF); // shl al,cl cl=7 (<8)
+    // 0xC0 (imm8 form) always masks OF, so a ROL by 1 here still reports OF; CF
+    // masking is unaffected because it only applies to SHL/SHR/alias.
     assert_eq!(undefined_flags(&[0xc0, 0xc0, 0x01, 0xf4], 0), AF | OF); // rol al,1 via imm
     // count reaches the operand width: CF also undefined.
     assert_eq!(undefined_flags(&[0xc0, 0xe0, 0x10, 0xf4], 0), AF | OF | CF); // shl al,16 (>=8)
     assert_eq!(undefined_flags(&[0xc0, 0xe8, 0x10, 0xf4], 0), AF | OF | CF); // shr al,16 (>=8)
     assert_eq!(undefined_flags(&[0xd2, 0xe0, 0xf4], 8), AF | OF | CF); // shl al,cl cl=8 (>=8)
+    assert_eq!(undefined_flags(&[0xd2, 0xe8, 0xf4], 8), AF | OF | CF); // shr al,cl cl=8 (>=8)
     assert_eq!(undefined_flags(&[0xc1, 0xe0, 0x10, 0xf4], 0), AF | OF | CF); // shl ax,16 (word >=16)
     // dword (0x66): a 5-bit count never reaches 32, so CF stays defined.
     assert_eq!(undefined_flags(&[0x66, 0xc1, 0xe0, 0x1f, 0xf4], 0), AF | OF); // shl eax,31 (<32)
