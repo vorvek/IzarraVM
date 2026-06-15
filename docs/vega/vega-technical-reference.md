@@ -173,7 +173,7 @@ Offsets below are relative to the block base.
 |--------|------|--------|-------------|
 | `0x0000` | `ID` | R | Identity and interface version. Reads `0x4D470100`: `0x4D47` is the Margo signature, the low half is version 1.00. |
 | `0x0004` | `CAPS` | R | Feature bitmap. A driver reads it to learn which operations this build implements. See below. |
-| `0x0008` | `STATUS` | R | Bit 0 `BUSY`: the blit engine is working. Bit 1 `FIFO_FULL`: reserved, reads 0. |
+| `0x0008` | `STATUS` | R | Bit 0 `BUSY`: an operation is in progress, set until its modeled completion time (section 9). Bit 1 `FIFO_FULL`: reserved, reads 0. |
 | `0x000C` | `CONTROL` | R/W | Bit 0 `RESET`: write 1 to abort the current operation and clear the engine, self-clearing. Bit 1 `DITHER_EN`: dither wherever color precision drops (section 7.10). Other bits reserved, write 0. |
 
 `CAPS` bits:
@@ -394,14 +394,35 @@ has no effect on 32-bit surfaces, where no precision is lost.
 
 ---
 
-## 9. Notes on fidelity
+## 9. Timing and fidelity
 
-The Izarra 3000 is a fantasy machine, and the emulator marks where it bends real
-hardware. For Margo:
+The Izarra 3000 is a fantasy machine. Where the emulator bends real hardware, it
+marks it here.
 
-- Blits complete before the write to `COMMAND` returns, so `BUSY` reads 0
-  immediately after. Software that polls `BUSY` still behaves correctly. Real
-  silicon would take measurable time, and `BUSY` would clear later.
+### Timing
+
+Margo computes the result of an operation in one step rather than simulating its
+datapath cycle by cycle, but it stays faithful at the register interface. Each
+operation is given a duration from a cost model: a fixed setup overhead plus the
+work divided by the rated throughput (section 1.1). `STATUS.BUSY` stays set until
+that modeled completion time, and the pusher's `PUSH_GET` advances through the
+ring as it consumes commands. The result bytes are in the frame store at once,
+but software cannot observe the engine as idle until the modeled time has passed,
+measured on the machine's clock.
+
+Because Margo is defined here rather than measured from silicon, this timing is
+exact by construction: the cost model is the specification, and the emulator
+honors it. Software that polls `BUSY`, races the engine, or feeds the pusher as a
+producer to its consumer behaves as it would on the real part. That is a stronger
+guarantee than the CPU compatibility modes, which only approximate a real 386 or
+486.
+
+The one part that stays approximate is memory contention. A running operation
+consumes frame-store and host-port bandwidth that could stall a CPU access to the
+same memory. That coupling is approximated, not modeled exactly.
+
+### Other liberties
+
 - Mode changes and `DISP_START` take effect cleanly, without the analog timing
   of a real RAMDAC.
 - The video overlay scales by point sampling. Real silicon interpolated, for a

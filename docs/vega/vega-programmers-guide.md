@@ -36,6 +36,10 @@ writing a handful of registers, then writes a command, and the engine does the
 work. On a slow CPU, in Izarra 1000 compatibility mode for example, this is the
 difference between a responsive desktop and a crawling one.
 
+The engine runs while the CPU does other work. An operation takes real time, so a
+program issues it, goes off to prepare the next one, and only waits on `BUSY` when
+it actually needs the result. That overlap is where the speed comes from.
+
 ## A convention for the examples
 
 The examples use these definitions. They assume a flat or protected-mode program
