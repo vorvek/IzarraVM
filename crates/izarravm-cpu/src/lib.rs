@@ -1291,6 +1291,19 @@ impl Cpu386 {
                 self.write_gpr_sized(index, operand_size, result);
                 Ok(clocks(2))
             }
+            0xd7 => {
+                // XLAT: AL = [segment:(B)X + AL]. DS is the default, overridable; the 16-bit base
+                // plus AL wraps inside the segment.
+                let segment = prefixes.segment_override.unwrap_or(SegmentIndex::Ds);
+                let al = u32::from(self.read_gpr8(0));
+                let offset = match address_size {
+                    AddressSize::Word => u32::from(self.read_gpr16(3).wrapping_add(al as u16)),
+                    AddressSize::Dword => self.read_gpr32(3).wrapping_add(al),
+                };
+                let value = self.read_memory_u8(bus, segment, offset, BusAccessKind::DataRead)?;
+                self.write_gpr8(0, value);
+                Ok(clocks(5))
+            }
             0x0f => self.execute_two_byte(bus, prefixes, address_size, operand_size),
             _ => Err(CpuError::UnsupportedOpcode {
                 opcode,
@@ -6649,5 +6662,65 @@ mod tests {
 
         assert_eq!(cpu.registers.eip, 8);
         assert_eq!(cpu.registers.ecx(), 0); // JECXZ does not decrement
+    }
+
+    #[test]
+    fn xlat_reads_ds_table_indexed_by_al() {
+        // xlat (0xd7): DS:0, BX=0x10, AL=0x05 -> AL = [0x15].
+        let mut memory = vec![0; 64];
+        memory[0] = 0xd7;
+        memory[0x15] = 0xab;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Bx, 0x0010);
+        cpu.write_reg16(Reg16::Ax, 0x0005); // AL = 5, AH = 0
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax) & 0xff, 0xab);
+        assert_eq!(cpu.read_reg16(Reg16::Ax) >> 8, 0x00); // AH unchanged
+        assert_eq!(cpu.read_reg16(Reg16::Bx), 0x0010); // BX unchanged
+    }
+
+    #[test]
+    fn xlat_wraps_the_16bit_base_plus_index() {
+        // xlat: BX=0xffff, AL=0x02 -> offset = (0xffff + 2) & 0xffff = 0x0001.
+        let mut memory = vec![0; 64];
+        memory[0] = 0xd7;
+        memory[0x01] = 0xcd;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Bx, 0xffff);
+        cpu.write_reg16(Reg16::Ax, 0x0002);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax) & 0xff, 0xcd);
+    }
+
+    #[test]
+    fn xlat_honours_a_segment_override() {
+        // 0x26 xlat (es override). ES base = 0x0100 << 4 = 0x1000. BX=0x10, AL=0x05 -> [0x1015].
+        let mut memory = vec![0; 0x2000];
+        memory[0..2].copy_from_slice(&[0x26, 0xd7]);
+        memory[0x1015] = 0x99;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Es, 0x0100);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Bx, 0x0010);
+        cpu.write_reg16(Reg16::Ax, 0x0005);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax) & 0xff, 0x99);
     }
 }
