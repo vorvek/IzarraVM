@@ -53,6 +53,81 @@ pub enum VideoMode {
     Mode13h,
 }
 
+pub const DAC_ENTRIES: usize = 256;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dac {
+    palette: [[u8; 3]; DAC_ENTRIES], // 6-bit components, 0..=63
+    write_index: u8,
+    read_index: u8,
+    write_component: u8, // 0,1,2 -> R,G,B
+    read_component: u8,
+}
+
+impl Default for Dac {
+    fn default() -> Self {
+        // Provisional grayscale ramp so any index renders visibly. Loading the
+        // exact stock VGA default palette is a follow-up slice.
+        let mut palette = [[0u8; 3]; DAC_ENTRIES];
+        for (index, entry) in palette.iter_mut().enumerate() {
+            let level = (index >> 2) as u8; // 0..=63
+            *entry = [level, level, level];
+        }
+        Self {
+            palette,
+            write_index: 0,
+            read_index: 0,
+            write_component: 0,
+            read_component: 0,
+        }
+    }
+}
+
+impl Dac {
+    pub fn set_write_index(&mut self, index: u8) {
+        self.write_index = index;
+        self.write_component = 0;
+    }
+
+    pub fn set_read_index(&mut self, index: u8) {
+        self.read_index = index;
+        self.read_component = 0;
+    }
+
+    pub fn write_data(&mut self, value: u8) {
+        self.palette[self.write_index as usize][self.write_component as usize] = value & 0x3f;
+        self.write_component += 1;
+        if self.write_component == 3 {
+            self.write_component = 0;
+            self.write_index = self.write_index.wrapping_add(1);
+        }
+    }
+
+    pub fn read_data(&mut self) -> u8 {
+        let value = self.palette[self.read_index as usize][self.read_component as usize];
+        self.read_component += 1;
+        if self.read_component == 3 {
+            self.read_component = 0;
+            self.read_index = self.read_index.wrapping_add(1);
+        }
+        value
+    }
+
+    pub fn write_index(&self) -> u8 {
+        self.write_index
+    }
+
+    pub fn rgb888(&self, index: u8) -> (u8, u8, u8) {
+        let [r, g, b] = self.palette[index as usize];
+        (expand6(r), expand6(g), expand6(b))
+    }
+}
+
+fn expand6(component: u8) -> u8 {
+    // 6-bit (0..=63) to 8-bit, replicating the high bits into the low.
+    (component << 2) | (component >> 4)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TextCell {
     pub character: u8,
@@ -104,6 +179,7 @@ pub struct VgaTextMode {
     memory: [u8; VGA_TEXT_MEMORY_SIZE],
     mode13h: Framebuffer,
     mode: VideoMode,
+    dac: Dac,
     crtc_index: u8,
     cursor_offset: u16,
 }
@@ -120,6 +196,7 @@ impl Default for VgaTextMode {
             memory,
             mode13h: Framebuffer::mode13h(),
             mode: VideoMode::Text,
+            dac: Dac::default(),
             crtc_index: 0,
             cursor_offset: 0,
         }
@@ -174,8 +251,10 @@ impl VgaTextMode {
         self.mode
     }
 
-    pub fn read_port(&self, port: u16) -> Option<u8> {
+    pub fn read_port(&mut self, port: u16) -> Option<u8> {
         match port {
+            0x03c8 => Some(self.dac.write_index()),
+            0x03c9 => Some(self.dac.read_data()),
             0x03d4 => Some(self.crtc_index),
             0x03d5 => match self.crtc_index {
                 0x0e => Some((self.cursor_offset >> 8) as u8),
@@ -205,8 +284,29 @@ impl VgaTextMode {
                 }
                 true
             }
+            0x03c7 => {
+                self.dac.set_read_index(value);
+                true
+            }
+            0x03c8 => {
+                self.dac.set_write_index(value);
+                true
+            }
+            0x03c9 => {
+                self.dac.write_data(value);
+                true
+            }
             _ => false,
         }
+    }
+
+    pub fn palette_argb(&self) -> [u32; DAC_ENTRIES] {
+        let mut out = [0u32; DAC_ENTRIES];
+        for (index, slot) in out.iter_mut().enumerate() {
+            let (r, g, b) = self.dac.rgb888(index as u8);
+            *slot = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
+        }
+        out
     }
 
     pub fn frame(&self) -> TextFrame {
@@ -337,5 +437,28 @@ mod tests {
         assert_eq!(video.active_mode(), VideoMode::Text);
         video.set_mode13h();
         assert_eq!(video.active_mode(), VideoMode::Mode13h);
+    }
+
+    #[test]
+    fn dac_write_then_read_round_trips() {
+        let mut video = VgaTextMode::default();
+        video.write_port(0x03c8, 5); // write index = 5
+        video.write_port(0x03c9, 63); // R
+        video.write_port(0x03c9, 10); // G
+        video.write_port(0x03c9, 31); // B
+        video.write_port(0x03c7, 5); // read index = 5
+        assert_eq!(video.read_port(0x03c9), Some(63));
+        assert_eq!(video.read_port(0x03c9), Some(10));
+        assert_eq!(video.read_port(0x03c9), Some(31));
+    }
+
+    #[test]
+    fn palette_argb_expands_six_bit_components() {
+        let mut video = VgaTextMode::default();
+        video.write_port(0x03c8, 1);
+        video.write_port(0x03c9, 63); // R
+        video.write_port(0x03c9, 0); // G
+        video.write_port(0x03c9, 0); // B
+        assert_eq!(video.palette_argb()[1], 0x00FF_0000);
     }
 }
