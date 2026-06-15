@@ -414,6 +414,30 @@ fn channel_operators(channel: usize) -> (usize, usize) {
     (base, base + 3)
 }
 
+/// 2-op channels that can become the primary half of a 4-op voice. Each pairs
+/// with the channel three higher (e.g. 0 with 3); reg 0x104 bit N enables the
+/// Nth pair here.
+const FOUR_OP_PRIMARY: [usize; 6] = [0, 1, 2, 9, 10, 11];
+
+/// Whether `channel` is the primary half of an active 4-op voice (renders all
+/// four operators) under the reg 0x104 `mask`.
+fn four_op_primary(channel: usize, mask: u8) -> bool {
+    FOUR_OP_PRIMARY
+        .iter()
+        .position(|&p| p == channel)
+        .is_some_and(|bit| mask & (1 << bit) != 0)
+}
+
+/// Whether `channel` is the secondary half of an active 4-op voice. Such a
+/// channel is skipped: its two operators are rendered by the paired primary.
+fn four_op_secondary(channel: usize, mask: u8) -> bool {
+    channel >= 3
+        && FOUR_OP_PRIMARY
+            .iter()
+            .position(|&p| p == channel - 3)
+            .is_some_and(|bit| mask & (1 << bit) != 0)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OplChip {
     /// Two register banks: 0 = primary (ports 0x388/0x389, channels 0-8),
@@ -535,9 +559,19 @@ impl OplChip {
     pub fn render_sample(&mut self) -> (i32, i32) {
         self.eg_counter = self.eg_counter.wrapping_add(1);
         let channels = if self.opl3_enabled() { 18 } else { 9 };
+        let mask = self.four_op_mask();
         let (mut left, mut right) = (0, 0);
         for channel in 0..channels {
-            let out = self.render_channel(channel);
+            if four_op_secondary(channel, mask) {
+                continue; // operators rendered by the paired 4-op primary
+            }
+            let out = if four_op_primary(channel, mask) {
+                self.render_four_op(channel)
+            } else {
+                self.render_channel(channel)
+            };
+            // 4-op voices are panned by their primary channel; per-carrier
+            // routing across both channels' pan bits is left for later if needed.
             let (l, r) = self.channel_pan(channel);
             if l {
                 left += out;
@@ -547,6 +581,80 @@ impl OplChip {
             }
         }
         (left, right)
+    }
+
+    /// The reg 0x104 four-operator enable mask (six channel pairs), or 0 when
+    /// the chip is not in OPL3 mode.
+    fn four_op_mask(&self) -> u8 {
+        if self.opl3_enabled() {
+            self.registers[1][0x04] & 0x3f
+        } else {
+            0
+        }
+    }
+
+    /// Render a 4-op voice whose primary 2-op channel is `channel` (and whose
+    /// secondary is `channel + 3`). All four operators take their pitch and
+    /// key-on from the primary channel; only operator 1 uses feedback. The
+    /// connection bits of the two channels select one of four algorithms.
+    fn render_four_op(&mut self, channel: usize) -> i32 {
+        let note_select = self.registers[0][0x08] & 0x40 != 0;
+        let bank = channel / 9;
+        let ch = channel % 9;
+        let c0_first = self.registers[bank][0xc0 + ch];
+        let c0_second = self.registers[bank][0xc0 + ch + 3];
+        let (op1, op2) = channel_operators(channel);
+        let (op3, op4) = channel_operators(channel + 3);
+
+        for op in [op1, op2, op3, op4] {
+            self.load_operator(op, channel);
+        }
+        self.operators[op1].set_feedback((c0_first >> 1) & 0x07);
+        for op in [op1, op2, op3, op4] {
+            self.operators[op].advance_envelope(self.eg_counter, note_select);
+        }
+        let (a1, a2, a3, a4) = (
+            self.operators[op1].eg_attenuation(),
+            self.operators[op2].eg_attenuation(),
+            self.operators[op3].eg_attenuation(),
+            self.operators[op4].eg_attenuation(),
+        );
+
+        let o1 = self.operators[op1].render_feedback(a1);
+        let out = match (c0_first & 1, c0_second & 1) {
+            (0, 0) => {
+                // FM-FM: serial 1 -> 2 -> 3 -> 4.
+                let o2 = self.operators[op2].sample_modulated(o1, a2);
+                let o3 = self.operators[op3].sample_modulated(o2, a3);
+                self.operators[op4].sample_modulated(o3, a4)
+            }
+            (0, 1) => {
+                // FM-AM: (1 -> 2) + (3 -> 4).
+                let o2 = self.operators[op2].sample_modulated(o1, a2);
+                let o3 = self.operators[op3].sample(a3);
+                let o4 = self.operators[op4].sample_modulated(o3, a4);
+                o2 + o4
+            }
+            (1, 0) => {
+                // AM-FM: 1 + (2 -> 3 -> 4).
+                let o2 = self.operators[op2].sample(a2);
+                let o3 = self.operators[op3].sample_modulated(o2, a3);
+                let o4 = self.operators[op4].sample_modulated(o3, a4);
+                o1 + o4
+            }
+            _ => {
+                // AM-AM: 1 + (2 -> 3) + 4.
+                let o2 = self.operators[op2].sample(a2);
+                let o3 = self.operators[op3].sample_modulated(o2, a3);
+                let o4 = self.operators[op4].sample(a4);
+                o1 + o3 + o4
+            }
+        };
+
+        for op in [op1, op2, op3, op4] {
+            self.operators[op].advance();
+        }
+        out
     }
 
     /// Which outputs a channel feeds. OPL3 pans via reg 0xC0 bit4 (left) / bit5
@@ -1197,6 +1305,61 @@ mod tests {
         assert!(matches!(peaks(0x21), (0, r) if r > 1000), "additive, right only");
         assert!(matches!(peaks(0x31), (l, r) if l > 1000 && r > 1000), "both");
         assert_eq!(peaks(0x01), (0, 0), "no pan bits: silent");
+    }
+
+    #[test]
+    fn four_op_mode_consumes_the_secondary_channel() {
+        // Program channel 3 as a loud keyed tone (operators 6 and 9). Enabling
+        // 4-op for pair 0/3 hands those operators to channel 0's 4-op voice,
+        // which is unkeyed here, so the previously audible tone goes silent.
+        let setup_channel3 = |opl: &mut OplChip| {
+            write_secondary(opl, 0x05, 0x01); // OPL3 mode
+            opl.write_register(0x2b, 0x21); // op 9 (slot 11): sustained, multiple x1
+            opl.write_register(0x4b, 0x00); // op 9 total level 0
+            opl.write_register(0x6b, 0xf0); // op 9 attack 15
+            opl.write_register(0x8b, 0x00);
+            opl.write_register(0xa3, 0x00); // channel 3 f-number low
+            opl.write_register(0xc3, 0x31); // additive + left/right
+            opl.write_register(0xb3, 0x20 | (4 << 2) | 0x02); // key-on, block 4, fnum 0x200
+        };
+        let peak = |opl: &mut OplChip| (0..256).map(|_| opl.render_sample().0.abs()).max().unwrap();
+
+        let mut two_op = OplChip::default();
+        setup_channel3(&mut two_op);
+        assert!(peak(&mut two_op) > 1000, "channel 3 sounds as an independent 2-op");
+
+        let mut four_op = OplChip::default();
+        setup_channel3(&mut four_op);
+        write_secondary(&mut four_op, 0x04, 0x01); // enable 4-op for pair 0/3
+        assert_eq!(peak(&mut four_op), 0, "4-op mode consumes channel 3");
+    }
+
+    #[test]
+    fn four_op_algorithms_produce_different_timbres() {
+        // A keyed 4-op voice on channel 0 with all operators loud; the four
+        // connection settings route the operators differently.
+        let collect = |cnt1: u8, cnt2: u8| {
+            let mut opl = OplChip::default();
+            write_secondary(&mut opl, 0x05, 0x01); // OPL3 mode
+            write_secondary(&mut opl, 0x04, 0x01); // 4-op for pair 0/3
+            for slot in [0, 3, 8, 11] {
+                // operators 0, 3, 6, 9: loud, instant attack, multiple x1
+                opl.write_register(0x20 + slot, 0x01);
+                opl.write_register(0x40 + slot, 0x00);
+                opl.write_register(0x60 + slot, 0xf0);
+                opl.write_register(0x80 + slot, 0x00);
+            }
+            opl.write_register(0xa0, 0x00); // channel 0 f-number low
+            opl.write_register(0xc0, 0x30 | cnt1); // pan + connection bit 1
+            opl.write_register(0xc3, cnt2); // secondary connection bit
+            opl.write_register(0xb0, 0x20 | (4 << 2) | 0x02); // key-on, block 4, fnum 0x200
+            (0..128).map(|_| opl.render_sample().0).collect::<Vec<_>>()
+        };
+        let fm_fm = collect(0, 0);
+        assert!(fm_fm.iter().any(|&s| s != 0), "the 4-op voice is audible");
+        assert_ne!(fm_fm, collect(0, 1), "FM-FM differs from FM-AM");
+        assert_ne!(fm_fm, collect(1, 0), "FM-FM differs from AM-FM");
+        assert_ne!(fm_fm, collect(1, 1), "FM-FM differs from AM-AM");
     }
 
     #[test]
