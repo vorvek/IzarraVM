@@ -247,6 +247,16 @@ fn undefined_flags(bytes: &[u8], cl: u8) -> u32 {
             _ => 0,
         };
     }
+    if matches!(opcode, 0x27 | 0x2f | 0x37 | 0x3f | 0xd4 | 0xd5) {
+        // BCD/ASCII adjust. DAA/DAS define CF/AF/SF/ZF/PF and leave OF undefined. AAA/AAS
+        // define CF/AF and leave OF/SF/ZF/PF undefined. AAM/AAD define SF/ZF/PF and leave
+        // OF/AF/CF undefined.
+        return match opcode {
+            0x27 | 0x2f => FLAG_OF,
+            0x37 | 0x3f => FLAG_OF | FLAG_SF | FLAG_ZF | FLAG_PF,
+            _ => FLAG_OF | FLAG_AF | FLAG_CF,
+        };
+    }
     let reg = bytes.get(index + 1).map(|modrm| (modrm >> 3) & 0x07);
     let is_logic = match opcode {
         op if op < 0x40 && (op & 0x07) < 6 => matches!((op >> 3) & 0x07, 1 | 4 | 6),
@@ -698,6 +708,31 @@ fn conformance_suite_report() {
     assert_eq!(
         parse_errors, 0,
         "{parse_errors} vector file(s) failed to parse; the report would understate coverage"
+    );
+}
+
+#[test]
+fn undefined_flags_covers_bcd_adjust() {
+    // DAA/DAS leave OF undefined (CF/AF/SF/ZF/PF defined).
+    assert_eq!(undefined_flags(&[0x27], 0), FLAG_OF);
+    assert_eq!(undefined_flags(&[0x2f], 0), FLAG_OF);
+    // AAA/AAS leave OF/SF/ZF/PF undefined (CF/AF defined).
+    assert_eq!(
+        undefined_flags(&[0x37], 0),
+        FLAG_OF | FLAG_SF | FLAG_ZF | FLAG_PF
+    );
+    assert_eq!(
+        undefined_flags(&[0x3f], 0),
+        FLAG_OF | FLAG_SF | FLAG_ZF | FLAG_PF
+    );
+    // AAM/AAD leave OF/AF/CF undefined (SF/ZF/PF defined).
+    assert_eq!(
+        undefined_flags(&[0xd4, 0x0a], 0),
+        FLAG_OF | FLAG_AF | FLAG_CF
+    );
+    assert_eq!(
+        undefined_flags(&[0xd5, 0x0a], 0),
+        FLAG_OF | FLAG_AF | FLAG_CF
     );
 }
 
