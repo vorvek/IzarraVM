@@ -1316,6 +1316,16 @@ impl Cpu386 {
                 }
                 Ok(clocks(3))
             }
+            0x90..=0x9f => {
+                // SETcc r/m8: set the byte to 1 when the condition holds, else 0. The condition
+                // code is the low nibble of the opcode; SETcc is always byte-wide and touches no
+                // flags. The ModRM reg field is not used.
+                let modrm = self.fetch_modrm(bus)?;
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
+                let set = self.condition(opcode & 0x0f);
+                self.write_operand_u8(bus, operand, u8::from(set))?;
+                Ok(clocks(4))
+            }
             0xb6 => {
                 // MOVZX r, r/m8: zero-extend the byte into the destination at the operand width.
                 let modrm = self.fetch_modrm(bus)?;
@@ -5191,5 +5201,59 @@ mod tests {
         cpu.cycle(&mut bus).unwrap();
 
         assert_eq!(cpu.registers.eax(), 0xdead_8000);
+    }
+
+    #[test]
+    fn setz_sets_byte_when_zf_set() {
+        // setz bl (0x0f 0x94 0xc3): ZF=1 -> bl=1. bl preset 0xff to prove it is overwritten.
+        let mut memory = vec![0; 64];
+        memory[0..3].copy_from_slice(&[0x0f, 0x94, 0xc3]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_gpr8(3, 0xff);
+        cpu.set_flag(FLAG_ZF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_gpr8(3), 1);
+        // SETcc writes the byte without disturbing the flag it tested.
+        assert!(cpu.flag(FLAG_ZF));
+    }
+
+    #[test]
+    fn setz_clears_byte_when_zf_clear() {
+        // setz bl (0x0f 0x94 0xc3): ZF=0 -> bl=0.
+        let mut memory = vec![0; 64];
+        memory[0..3].copy_from_slice(&[0x0f, 0x94, 0xc3]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_gpr8(3, 0xff);
+        cpu.set_flag(FLAG_ZF, false);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_gpr8(3), 0);
+    }
+
+    #[test]
+    fn setnz_writes_memory_destination() {
+        // setnz byte [0x40] (0x0f 0x95 0x06 0x40 0x00, modrm mod=00 rm=110 disp16):
+        // ZF=0 -> !ZF true -> [ds:0x40]=1.
+        let mut memory = vec![0; 128];
+        memory[0..5].copy_from_slice(&[0x0f, 0x95, 0x06, 0x40, 0x00]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        cpu.set_flag(FLAG_ZF, false);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(bus.memory[0x40], 1);
     }
 }
