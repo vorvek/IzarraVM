@@ -222,6 +222,7 @@ fn undefined_flags(bytes: &[u8], cl: u8) -> u32 {
     if opcode == 0x0f {
         return match bytes.get(index + 1).copied().unwrap_or(0) {
             0xaf => FLAG_SF | FLAG_ZF | FLAG_AF | FLAG_PF,
+            0xa3 | 0xab | 0xb3 | 0xbb | 0xba => FLAG_OF | FLAG_SF | FLAG_AF | FLAG_PF,
             0xbc | 0xbd => FLAG_CF | FLAG_OF | FLAG_SF | FLAG_AF | FLAG_PF,
             _ => 0,
         };
@@ -522,6 +523,23 @@ fn undefined_flags_covers_two_byte_opcodes() {
     assert_eq!(
         undefined_flags(&[0x66, 0x0f, 0xaf, 0xc3], 0),
         FLAG_SF | FLAG_ZF | FLAG_AF | FLAG_PF
+    );
+}
+
+#[test]
+fn undefined_flags_covers_bit_test_group() {
+    // BT family 0F A3/AB/B3/BB/BA define CF and leave OF/SF/AF/PF undefined; ZF is
+    // unaffected (not changed), so it is not in the mask.
+    for op in [0xa3u8, 0xab, 0xb3, 0xbb, 0xba] {
+        assert_eq!(
+            undefined_flags(&[0x0f, op, 0xc1], 0),
+            FLAG_OF | FLAG_SF | FLAG_AF | FLAG_PF
+        );
+    }
+    // A 0x66 prefix in front resolves to the same mask.
+    assert_eq!(
+        undefined_flags(&[0x66, 0x0f, 0xa3, 0xc1], 0),
+        FLAG_OF | FLAG_SF | FLAG_AF | FLAG_PF
     );
 }
 
