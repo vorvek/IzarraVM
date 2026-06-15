@@ -26,10 +26,25 @@ fn build_exp() -> [u16; 256] {
     table
 }
 
+/// Key-scale-level base attenuation (the 6 dB/oct setting), in 0.75 dB units,
+/// indexed by the top four F-number bits. Pitch costs ~6 dB per octave, so a
+/// block step is 8 units (= 6 dB); within an octave the attenuation follows
+/// log2 of the F-number: `ksl[n] = ceil(8 * log2(16*n))`, `ksl[0] = 0`. The
+/// datasheet only prints the per-octave dB rate, so this is derived from it; the
+/// result reproduces the standard KSL ROM `{0,32,40,45,...,63,64}` exactly.
+fn build_ksl() -> [u16; 16] {
+    let mut table = [0u16; 16];
+    for (n, slot) in table.iter_mut().enumerate().skip(1) {
+        *slot = (8.0 * (16.0 * n as f64).log2()).ceil() as u16;
+    }
+    table
+}
+
 use std::sync::LazyLock;
 
 static LOGSIN: LazyLock<[u16; 256]> = LazyLock::new(build_logsin);
 static EXP: LazyLock<[u16; 256]> = LazyLock::new(build_exp);
+static KSL: LazyLock<[u16; 16]> = LazyLock::new(build_ksl);
 
 /// Log-sine ROM lookup for a quarter-wave index (0..256).
 pub(crate) fn logsin(index: usize) -> u16 {
@@ -74,6 +89,7 @@ pub(crate) struct Operator {
     multiple: u8,
     waveform: u8,
     total_level: u8,
+    key_scale_level: u8, // KSL: 0 = off, else 1.5/3/6 dB per octave of pitch
     // Envelope generator.
     attack: u8,
     decay: u8,
@@ -95,6 +111,7 @@ impl Default for Operator {
             multiple: 0,
             waveform: 0,
             total_level: 0,
+            key_scale_level: 0,
             attack: 0,
             decay: 0,
             sustain: 0,
@@ -124,6 +141,24 @@ impl Operator {
 
     pub(crate) fn set_total_level(&mut self, value: u8) {
         self.total_level = value & 0x3f;
+    }
+
+    pub(crate) fn set_key_scale_level(&mut self, value: u8) {
+        self.key_scale_level = value & 0x03;
+    }
+
+    /// Key-scale-level attenuation for the current pitch, in log-domain units
+    /// (the same scale as `eg_attenuation`). 0 when KSL is off. The 6 dB/oct base
+    /// `KSL[fnum>>6]` is referenced to the top octave (block 7) and lowered 8
+    /// units (6 dB) per octave below it; settings 1/2/3 take 1/4, 1/2 and all of
+    /// it (1.5/3/6 dB per octave). 0.75 dB == 32 log units, hence the `<< 5`.
+    fn ksl_attenuation(&self) -> u16 {
+        if self.key_scale_level == 0 {
+            return 0;
+        }
+        let base = i32::from(KSL[(self.fnum >> 6) as usize]) - 8 * (7 - i32::from(self.block));
+        let units = (base.max(0) as u32) >> (3 - u32::from(self.key_scale_level));
+        (units << 5) as u16
     }
 
     pub(crate) fn set_envelope(&mut self, attack: u8, decay: u8, sustain: u8, release: u8) {
@@ -259,7 +294,9 @@ impl Operator {
     /// ~4*pi, matching the datasheet's maximum feedback depth (FB = 7 -> 4*pi);
     /// feedback, once added, will scale as output >> (7 - FB).
     pub(crate) fn sample_modulated(&self, phase_modulation: i32, extra_attenuation: u16) -> i32 {
-        let attenuation = u32::from(self.total_level) * 32 + u32::from(extra_attenuation);
+        let attenuation = u32::from(self.total_level) * 32
+            + u32::from(self.ksl_attenuation())
+            + u32::from(extra_attenuation);
         let position =
             ((((self.phase >> 10) as i32).wrapping_add(phase_modulation)) & 0x3ff) as u32;
         waveform_output_at(position, self.waveform, attenuation)
@@ -478,7 +515,8 @@ impl OplChip {
             | ((u16::from(self.registers[0xb0 + channel]) & 0x03) << 8);
         let block = (self.registers[0xb0 + channel] >> 2) & 0x07;
         let r20 = self.registers[0x20 + slot];
-        let total_level = self.registers[0x40 + slot] & 0x3f;
+        let r40 = self.registers[0x40 + slot];
+        let total_level = r40 & 0x3f;
         let waveform = self.registers[0xe0 + slot] & 0x07;
         let ad = self.registers[0x60 + slot];
         let sr = self.registers[0x80 + slot];
@@ -490,6 +528,7 @@ impl OplChip {
         op.set_key_scale_rate(r20 & 0x10 != 0);
         op.set_eg_type(r20 & 0x20 != 0);
         op.set_total_level(total_level);
+        op.set_key_scale_level(r40 >> 6);
         op.set_waveform(waveform);
         op.set_envelope(ad >> 4, ad & 0x0f, sr >> 4, sr & 0x0f);
         op.set_key(key_on);
@@ -685,6 +724,60 @@ mod tests {
         }
     }
 
+    fn ksl_operator(fnum: u16, block: u8, setting: u8) -> Operator {
+        let mut op = sine_operator(fnum, block, 0);
+        op.set_key_scale_level(setting);
+        op
+    }
+
+    #[test]
+    fn ksl_table_follows_the_six_db_per_octave_derivation() {
+        // ceil(8*log2(16n)) in 0.75 dB units: 8 units = 6 dB = one octave.
+        assert_eq!(KSL[0], 0, "no attenuation at the lowest F-number");
+        for n in 1..16usize {
+            let expected = (8.0 * (16.0 * n as f64).log2()).ceil() as u16;
+            assert_eq!(KSL[n], expected, "ksl[{n}]");
+        }
+        // Reproduces the standard KSL ROM; top entry = 64 units = 48 dB.
+        assert_eq!(
+            *KSL,
+            [0, 32, 40, 45, 48, 51, 53, 55, 56, 58, 59, 60, 61, 62, 63, 64]
+        );
+    }
+
+    #[test]
+    fn ksl_zero_leaves_output_unattenuated() {
+        let plain = peak_magnitude(sine_operator(0x300, 6, 0), 256);
+        let off = peak_magnitude(ksl_operator(0x300, 6, 0), 256);
+        assert_eq!(off, plain, "KSL=0 must not change the output");
+    }
+
+    #[test]
+    fn ksl_attenuates_six_db_per_octave_at_max_setting() {
+        // Setting 3 = 6 dB/oct; one octave up at the same F-number halves output.
+        let lo = peak_magnitude(ksl_operator(0x200, 5, 3), 256);
+        let hi = peak_magnitude(ksl_operator(0x200, 6, 3), 256);
+        let ratio = f64::from(lo) / f64::from(hi);
+        assert!((ratio - 2.0).abs() < 0.05, "expected ~2x per octave, got {ratio}");
+    }
+
+    #[test]
+    fn ksl_settings_scale_the_attenuation() {
+        // block 6, fnum 0x200 (n=8): base = KSL[8] - 8*(7-6) = 56 - 8 = 48 units.
+        // Settings 1/2/3 attenuate by a quarter/half/all of the 6 dB/oct value.
+        let base = 48u16;
+        assert_eq!(ksl_operator(0x200, 6, 3).ksl_attenuation(), base << 5);
+        assert_eq!(ksl_operator(0x200, 6, 2).ksl_attenuation(), (base >> 1) << 5);
+        assert_eq!(ksl_operator(0x200, 6, 1).ksl_attenuation(), (base >> 2) << 5);
+        assert_eq!(ksl_operator(0x200, 6, 0).ksl_attenuation(), 0);
+    }
+
+    #[test]
+    fn ksl_clamps_to_zero_for_low_pitch() {
+        // Bottom octave with a small F-number sits below the reference: no cost.
+        assert_eq!(ksl_operator(0x000, 0, 3).ksl_attenuation(), 0);
+    }
+
     fn program_channel0(opl: &mut OplChip, fnum: u16, block: u8, additive: bool, modulator_tl: u8) {
         opl.write_register(0x20, 0x01); // modulator: multiple x1
         opl.write_register(0x23, 0x01); // carrier: multiple x1
@@ -814,6 +907,29 @@ mod tests {
             collect(false),
             collect(true),
             "FM should not equal additive"
+        );
+    }
+
+    #[test]
+    fn channel_applies_key_scale_level_from_registers() {
+        // Decode reg 0x40 bits6-7 into the carrier: at block 6 / fnum 0x200 a
+        // KSL of 3 is 36 dB of attenuation, so the keyed tone is far quieter.
+        let peak = |ksl_bits: u8| {
+            let mut opl = OplChip::default();
+            opl.write_register(0x23, 0x21); // carrier: sustained, multiple x1
+            opl.write_register(0x43, ksl_bits << 6); // KSL in bits 6-7, total level 0
+            opl.write_register(0x63, 0xf0); // attack 15 (instant)
+            opl.write_register(0x83, 0x00);
+            opl.write_register(0xa0, 0x00); // f-number low
+            opl.write_register(0xc0, 0x01); // additive, so the carrier reaches output
+            opl.write_register(0xb0, 0x20 | (6 << 2) | 0x02); // key-on, block 6, fnum 0x200
+            (0..64).map(|_| opl.render_sample().abs()).max().unwrap()
+        };
+        let loud = peak(0);
+        let scaled = peak(3);
+        assert!(
+            scaled * 10 < loud,
+            "KSL=3 at block 6 must strongly attenuate: {scaled} vs {loud}"
         );
     }
 
