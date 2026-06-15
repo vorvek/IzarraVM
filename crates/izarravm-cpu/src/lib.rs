@@ -1316,6 +1316,39 @@ impl Cpu386 {
                 }
                 Ok(clocks(3))
             }
+            0xb6 => {
+                // MOVZX r, r/m8: zero-extend the byte into the destination at the operand width.
+                let modrm = self.fetch_modrm(bus)?;
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
+                let value = u32::from(self.read_operand_u8(bus, operand)?);
+                self.write_gpr_sized(modrm.reg, operand_size, value);
+                Ok(clocks(3))
+            }
+            0xb7 => {
+                // MOVZX r, r/m16: zero-extend the word into the destination.
+                let modrm = self.fetch_modrm(bus)?;
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
+                let value = self.read_operand_sized(bus, operand, OperandSize::Word)?;
+                self.write_gpr_sized(modrm.reg, operand_size, value);
+                Ok(clocks(3))
+            }
+            0xbe => {
+                // MOVSX r, r/m8: sign-extend the byte into the destination.
+                let modrm = self.fetch_modrm(bus)?;
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
+                let value = sign_extend_u8(self.read_operand_u8(bus, operand)?);
+                self.write_gpr_sized(modrm.reg, operand_size, value);
+                Ok(clocks(3))
+            }
+            0xbf => {
+                // MOVSX r, r/m16: sign-extend the word into the destination.
+                let modrm = self.fetch_modrm(bus)?;
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
+                let value =
+                    self.read_operand_sized(bus, operand, OperandSize::Word)? as i16 as i32 as u32;
+                self.write_gpr_sized(modrm.reg, operand_size, value);
+                Ok(clocks(3))
+            }
             _ => Err(CpuError::UnsupportedTwoByteOpcode {
                 opcode,
                 cs: self.registers.cs().selector,
@@ -5025,5 +5058,138 @@ mod tests {
         assert_eq!(cpu.registers.eip, 0x0001_2345);
         // sp 0x0100 -> +8 (two dword pops) = 0x0108, high half preserved
         assert_eq!(cpu.registers.esp(), 0xcafe_0108);
+    }
+
+    #[test]
+    fn movzx_byte_zero_extends_into_ax() {
+        // movzx ax, bl  (0x0f 0xb6 0xc3, modrm mod=3 reg=ax rm=bl): bl=0x80 -> ax=0x0080.
+        let mut memory = vec![0; 64];
+        memory[0..3].copy_from_slice(&[0x0f, 0xb6, 0xc3]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_gpr8(3, 0x80); // bl
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x0080);
+    }
+
+    #[test]
+    fn movzx_byte_zero_extends_into_eax_clearing_high_bits() {
+        // 0x66 0x0f 0xb6 0xc3 (movzx eax, bl): bl=0x80, eax preset 0xffff_ffff -> eax=0x0000_0080.
+        let mut memory = vec![0; 64];
+        memory[0..4].copy_from_slice(&[0x66, 0x0f, 0xb6, 0xc3]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_eax(0xffff_ffff);
+        cpu.write_gpr8(3, 0x80);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eax(), 0x0000_0080);
+    }
+
+    #[test]
+    fn movzx_word_zero_extends_into_eax() {
+        // 0x66 0x0f 0xb7 0xc3 (movzx eax, bx): bx=0x8000, eax preset 0xffff_ffff -> eax=0x0000_8000.
+        let mut memory = vec![0; 64];
+        memory[0..4].copy_from_slice(&[0x66, 0x0f, 0xb7, 0xc3]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_eax(0xffff_ffff);
+        cpu.write_reg16(Reg16::Bx, 0x8000);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eax(), 0x0000_8000);
+    }
+
+    #[test]
+    fn movsx_byte_sign_extends_into_ax() {
+        // movsx ax, bl (0x0f 0xbe 0xc3): bl=0x80 -> ax=0xff80.
+        let mut memory = vec![0; 64];
+        memory[0..3].copy_from_slice(&[0x0f, 0xbe, 0xc3]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_gpr8(3, 0x80);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0xff80);
+    }
+
+    #[test]
+    fn movsx_byte_sign_extends_into_eax() {
+        // 0x66 0x0f 0xbe 0xc3 (movsx eax, bl): bl=0x80 -> eax=0xffff_ff80.
+        let mut memory = vec![0; 64];
+        memory[0..4].copy_from_slice(&[0x66, 0x0f, 0xbe, 0xc3]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_gpr8(3, 0x80);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eax(), 0xffff_ff80);
+    }
+
+    #[test]
+    fn movsx_word_sign_extends_into_eax() {
+        // 0x66 0x0f 0xbf 0xc3 (movsx eax, bx): bx=0x8000 -> eax=0xffff_8000.
+        let mut memory = vec![0; 64];
+        memory[0..4].copy_from_slice(&[0x66, 0x0f, 0xbf, 0xc3]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Bx, 0x8000);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eax(), 0xffff_8000);
+    }
+
+    #[test]
+    fn movsx_byte_positive_source_zero_fills() {
+        // movsx ax, bl (0x0f 0xbe 0xc3): bl=0x7f (positive) -> ax=0x007f, no sign fill.
+        let mut memory = vec![0; 64];
+        memory[0..3].copy_from_slice(&[0x0f, 0xbe, 0xc3]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_gpr8(3, 0x7f);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x007f);
+    }
+
+    #[test]
+    fn movzx_word_into_16bit_dest_preserves_high_eax() {
+        // movzx ax, bx (0x0f 0xb7 0xc3, no 0x66): a word source into a 16-bit
+        // destination is a plain word move; the high half of EAX is preserved by
+        // write_gpr16.
+        let mut memory = vec![0; 64];
+        memory[0..3].copy_from_slice(&[0x0f, 0xb7, 0xc3]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_eax(0xdead_0000);
+        cpu.write_reg16(Reg16::Bx, 0x8000);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eax(), 0xdead_8000);
     }
 }
