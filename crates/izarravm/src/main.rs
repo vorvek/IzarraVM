@@ -13,6 +13,7 @@ use std::error::Error;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 use tracing::info;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -22,7 +23,6 @@ use winit::window::{Window, WindowAttributes, WindowId};
 
 const GLYPH_SIZE: usize = 8;
 const TEXT_SCALE: usize = 2;
-const LIVE_CYCLE_BATCH: u64 = 50_000;
 const OPL_NATIVE_HZ: f64 = 49_716.0;
 const WINDOW_WIDTH: u32 = 1280;
 const WINDOW_HEIGHT: u32 = 400;
@@ -193,6 +193,7 @@ fn run_window(
         audio,
         audio_clocks: 0,
         audio_sample_debt: 0.0,
+        epoch: None,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -210,6 +211,7 @@ struct WindowApp {
     audio: Option<AudioPlayer>,
     audio_clocks: u64,        // elapsed clocks already turned into audio
     audio_sample_debt: f64,   // fractional OPL samples owed
+    epoch: Option<(Instant, u64)>, // wall-clock + machine clocks at pacing start
 }
 
 impl ApplicationHandler for WindowApp {
@@ -253,18 +255,34 @@ impl ApplicationHandler for WindowApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if self.stop_reason.is_none() {
-            let reason = tick_machine(&mut self.machine, LIVE_CYCLE_BATCH);
+        if self.stop_reason.is_some() {
+            return;
+        }
+
+        // Pace the emulation to wall-clock time so the OPL audio plays at the
+        // right rate; the catch-up is capped at 50 ms to avoid a spiral.
+        let now = Instant::now();
+        let (epoch, epoch_clocks) = *self.epoch.get_or_insert((now, self.machine.elapsed_clocks()));
+        let executed = self.machine.elapsed_clocks().saturating_sub(epoch_clocks);
+        let cap = self.clock_hz / 20;
+        let budget = pacing_budget(now.duration_since(epoch), self.clock_hz, executed, cap);
+
+        if budget > 0 {
+            let reason = tick_machine(&mut self.machine, budget);
             self.pump_audio();
             self.rendered_screen = render_text_frame(&self.machine.screen_text());
             if let Some(reason) = reason {
                 self.finish(reason);
                 event_loop.set_control_flow(ControlFlow::Wait);
+                return;
             }
             if let Some(window) = &self.window {
                 window.request_redraw();
             }
         }
+
+        // Sleep briefly instead of busy-spinning until the next ~2 ms slice.
+        event_loop.set_control_flow(ControlFlow::WaitUntil(now + Duration::from_millis(2)));
     }
 }
 
@@ -333,6 +351,14 @@ impl WindowApp {
             .present()
             .expect("native window buffer should be presentable");
     }
+}
+
+/// Emulated clocks to run this tick so the machine tracks wall-clock time: the
+/// shortfall between the clocks real time calls for and those already run since
+/// the epoch, capped so a host that cannot keep up does not spiral.
+fn pacing_budget(wall_elapsed: Duration, clock_hz: u64, executed: u64, cap: u64) -> u64 {
+    let target = (wall_elapsed.as_secs_f64() * clock_hz as f64) as u64;
+    target.saturating_sub(executed).min(cap)
 }
 
 fn tick_machine(machine: &mut Machine, cycles: u64) -> Option<StopReason> {
@@ -425,6 +451,20 @@ mod tests {
     use izarravm_video::TextCell;
 
     #[test]
+    fn pacing_tracks_wall_clock_and_caps_catch_up() {
+        let hz = 25_000_000;
+        let cap = hz / 20;
+        // No wall time elapsed yet: nothing to run.
+        assert_eq!(pacing_budget(Duration::ZERO, hz, 0, cap), 0);
+        // 1 ms at 25 MHz calls for 25_000 clocks.
+        assert_eq!(pacing_budget(Duration::from_millis(1), hz, 0, cap), 25_000);
+        // Already ahead of wall time: nothing to run.
+        assert_eq!(pacing_budget(Duration::from_millis(1), hz, 30_000, cap), 0);
+        // Far behind: catch-up is capped, not unbounded.
+        assert_eq!(pacing_budget(Duration::from_secs(10), hz, 0, cap), cap);
+    }
+
+    #[test]
     fn text_renderer_draws_foreground_pixels() {
         let mut cells = vec![TextCell::default(); 80 * 25];
         cells[0] = TextCell {
@@ -458,7 +498,7 @@ mod tests {
         )
         .unwrap();
 
-        let _ = tick_machine(&mut machine, LIVE_CYCLE_BATCH);
+        let _ = tick_machine(&mut machine, 50_000);
         let rendered = render_text_frame(&machine.screen_text());
 
         assert_eq!(rendered.width, WINDOW_WIDTH as usize);
