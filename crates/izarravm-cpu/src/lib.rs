@@ -1409,6 +1409,30 @@ impl Cpu386 {
                 self.bit_string_op(bus, op, operand, index, operand_size, address_size, true)?;
                 Ok(clocks(6))
             }
+            0xba => {
+                // BT/BTS/BTR/BTC r/m, imm8: /4=BT, /5=BTS, /6=BTR, /7=BTC. The imm8 follows the
+                // ModRM and displacement. /0../3 are not defined bit-test ops.
+                let modrm = self.fetch_modrm(bus)?;
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
+                let imm = self.fetch_u8(bus)?;
+                if modrm.reg < 4 {
+                    return Err(InternalFault::Exception {
+                        vector: 6,
+                        error_code: None,
+                    });
+                }
+                let op = modrm.reg - 4;
+                self.bit_string_op(
+                    bus,
+                    op,
+                    operand,
+                    u32::from(imm),
+                    operand_size,
+                    address_size,
+                    false,
+                )?;
+                Ok(clocks(6))
+            }
             _ => Err(CpuError::UnsupportedTwoByteOpcode {
                 opcode,
                 cs: self.registers.cs().selector,
@@ -5813,5 +5837,83 @@ mod tests {
 
         assert!(!cpu.flag(FLAG_CF));
         assert_eq!(cpu.read_gpr32(1), 0x0010_0000);
+    }
+
+    #[test]
+    fn bt_immediate_reads_selected_bit() {
+        // bt cx, 5 (0x0f 0xba 0xe1 0x05, modrm mod=3 reg=/4 rm=cx): cx=0x0020 bit 5 -> CF=1, cx unchanged.
+        let mut memory = vec![0; 64];
+        memory[0..4].copy_from_slice(&[0x0f, 0xba, 0xe1, 0x05]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Cx, 0x0020);
+        cpu.set_flag(FLAG_CF, false);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert!(cpu.flag(FLAG_CF));
+        assert_eq!(cpu.read_reg16(Reg16::Cx), 0x0020);
+    }
+
+    #[test]
+    fn btr_immediate_clears_selected_bit() {
+        // btr cx, 5 (0x0f 0xba 0xf1 0x05, modrm mod=3 reg=/6 rm=cx): cx=0x0020 -> CF=1, cx=0x0000.
+        let mut memory = vec![0; 64];
+        memory[0..4].copy_from_slice(&[0x0f, 0xba, 0xf1, 0x05]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Cx, 0x0020);
+        cpu.set_flag(FLAG_CF, false); // prove CF=1 comes from the old bit, not a residual
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert!(cpu.flag(FLAG_CF));
+        assert_eq!(cpu.read_reg16(Reg16::Cx), 0x0000);
+    }
+
+    #[test]
+    fn bts_immediate_memory_no_walk() {
+        // bts [0x40], 5 (0x0f 0xba 0x2e 0x40 0x00 0x05, modrm mod=00 reg=/5 rm=110 disp16):
+        // imm bit 5, accesses [0x40] directly (no walk). [0x40]=0 -> CF=0, [0x40]=0x0020.
+        let mut memory = vec![0; 128];
+        memory[0..6].copy_from_slice(&[0x0f, 0xba, 0x2e, 0x40, 0x00, 0x05]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert!(!cpu.flag(FLAG_CF));
+        assert_eq!(
+            u16::from_le_bytes([bus.memory[0x40], bus.memory[0x41]]),
+            0x0020
+        );
+    }
+
+    #[test]
+    fn bt_immediate_reg_below_4_delivers_ud() {
+        // 0x0f 0xba 0xc1 0x05 (modrm mod=3 reg=/0 rm=cx): reg<4 is invalid -> #UD (vector 6).
+        // 1024 bytes so the stack push at 0x0100 (6 bytes) and IVT at 0x18 both fit.
+        let mut memory = vec![0; 1024];
+        memory[0..4].copy_from_slice(&[0x0f, 0xba, 0xc1, 0x05]);
+        memory[0x18] = 0xee; // IVT[6] IP low byte -> IP 0x00ee
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        cpu.set_flag(FLAG_IF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eip, 0x00ee);
+        assert!(!cpu.flag(FLAG_IF));
     }
 }
