@@ -197,14 +197,15 @@ fn apply_state(cpu: &mut Cpu386, bus: &mut FlatBus, state: &TestState) {
 /// undefined; NOT (/2) and NEG (/3) define every modeled flag. Arithmetic ops
 /// other than the 0xF6/0xF7 group define every modeled flag.
 /// The prefix-skip set below must mirror the CPU's `read_prefixes` exactly, or this
-/// helper and the CPU would disagree on which byte is the opcode.
+/// helper and the CPU would disagree on which byte is the opcode. 0xF2 and 0xF3 are
+/// the REPNE and REP prefixes respectively.
 fn undefined_flags(bytes: &[u8], cl: u8) -> u32 {
     let mut index = 0;
     let mut operand_size_override = false;
     while index < bytes.len()
         && matches!(
             bytes[index],
-            0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf3
+            0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf2 | 0xf3
         )
     {
         if bytes[index] == 0x66 {
@@ -627,4 +628,17 @@ fn conformance_suite_report() {
         parse_errors, 0,
         "{parse_errors} vector file(s) failed to parse; the report would understate coverage"
     );
+}
+
+#[test]
+fn undefined_flags_skips_repne_prefix() {
+    const PF: u32 = 0x0000_0004;
+    const AF: u32 = 0x0000_0010;
+    const ZF: u32 = 0x0000_0040;
+    const SF: u32 = 0x0000_0080;
+    // 0xf2 (REPNE) must be skipped to reach the opcode, mirroring read_prefixes.
+    // f2 then f6 /4 (mul) resolves to the MUL mask, proving the prefix is skipped.
+    assert_eq!(undefined_flags(&[0xf2, 0xf6, 0xe3], 0), SF | ZF | AF | PF);
+    // REPNE CMPSB defines every modeled flag, so no mask.
+    assert_eq!(undefined_flags(&[0xf2, 0xa6], 0), 0);
 }
