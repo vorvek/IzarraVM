@@ -42,6 +42,9 @@ pub(crate) fn logsin(index: usize) -> u16 {
 pub(crate) fn exp_lookup(attenuation: u32) -> i32 {
     let fraction = (attenuation & 0xff) as usize;
     let shift = attenuation >> 8;
+    if shift >= 32 {
+        return 0; // attenuated past audibility (and past a valid i32 shift)
+    }
     (i32::from(EXP[fraction ^ 0xff]) + 1024) >> shift
 }
 
@@ -50,10 +53,20 @@ pub(crate) fn exp_lookup(attenuation: u32) -> i32 {
 /// two documented duplicate slots (11->10, 13->12, 14->15... per the spec).
 const MULTIPLE_X2: [u32; 16] = [1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 20, 24, 24, 30, 30];
 
-/// A single FM operator: a 20-bit phase accumulator plus its waveform and
-/// level. The envelope generator is added in a later layer; for now an
-/// operator plays at full volume minus its total level.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Envelope-generator phase. `Release` doubles as the idle / keyed-off state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EgState {
+    Attack,
+    Decay,
+    Sustain,
+    Release,
+}
+
+/// A single FM operator: a 20-bit phase accumulator, its waveform and level,
+/// and an ADSR envelope generator. The envelope datapath (rates, curve, timing)
+/// was derived from the YMF262's documented behaviour and cross-checked against
+/// a reference; see dev_docs/opl3-plan.md.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Operator {
     phase: u32,
     fnum: u16,
@@ -61,6 +74,38 @@ pub(crate) struct Operator {
     multiple: u8,
     waveform: u8,
     total_level: u8,
+    // Envelope generator.
+    attack: u8,
+    decay: u8,
+    sustain: u8,
+    release: u8,
+    sustained: bool,      // EGT: hold at the sustain level while keyed
+    key_scale_rate: bool, // KSR: shorten the envelope at higher pitch
+    key_on: bool,
+    eg_level: u16, // 0 = loudest, 0x1ff = silent
+    eg_state: EgState,
+}
+
+impl Default for Operator {
+    fn default() -> Self {
+        Self {
+            phase: 0,
+            fnum: 0,
+            block: 0,
+            multiple: 0,
+            waveform: 0,
+            total_level: 0,
+            attack: 0,
+            decay: 0,
+            sustain: 0,
+            release: 0,
+            sustained: false,
+            key_scale_rate: false,
+            key_on: false,
+            eg_level: 0x1ff,
+            eg_state: EgState::Release,
+        }
+    }
 }
 
 impl Operator {
@@ -81,6 +126,25 @@ impl Operator {
         self.total_level = value & 0x3f;
     }
 
+    pub(crate) fn set_envelope(&mut self, attack: u8, decay: u8, sustain: u8, release: u8) {
+        self.attack = attack & 0x0f;
+        self.decay = decay & 0x0f;
+        self.sustain = sustain & 0x0f;
+        self.release = release & 0x0f;
+    }
+
+    pub(crate) fn set_eg_type(&mut self, sustained: bool) {
+        self.sustained = sustained;
+    }
+
+    pub(crate) fn set_key_scale_rate(&mut self, ksr: bool) {
+        self.key_scale_rate = ksr;
+    }
+
+    pub(crate) fn set_key(&mut self, on: bool) {
+        self.key_on = on;
+    }
+
     /// Per-sample phase step. `f = fnum * 2^block * rate / 2^20` for MULT x1.
     fn phase_increment(&self) -> u32 {
         ((u32::from(self.fnum) << self.block) * MULTIPLE_X2[self.multiple as usize]) >> 1
@@ -88,6 +152,98 @@ impl Operator {
 
     pub(crate) fn advance(&mut self) {
         self.phase = self.phase.wrapping_add(self.phase_increment()) & 0x000f_ffff;
+    }
+
+    /// Envelope attenuation in exp-table units. The 0..0x1ff envelope is
+    /// 0.1875 dB/step, which is 8 of our log units (256 units == 6.02 dB).
+    pub(crate) fn eg_attenuation(&self) -> u16 {
+        self.eg_level << 3
+    }
+
+    /// Key-scale number: block plus one F-number MSB (which bit depends on NTS).
+    fn key_scale_number(&self, note_select: bool) -> u8 {
+        let bit = (self.fnum >> if note_select { 9 } else { 8 }) & 1;
+        (self.block << 1) | bit as u8
+    }
+
+    /// Effective envelope rate: `4*rate + offset`, capped at 63. A rate nibble
+    /// of 0 stays 0 (the envelope is frozen). The offset is the key-scale
+    /// number, or its top two bits when KSR is off (datasheet p9-p10).
+    fn effective_rate(&self, rate: u8, note_select: bool) -> u8 {
+        if rate == 0 {
+            return 0;
+        }
+        let ksn = self.key_scale_number(note_select);
+        let offset = if self.key_scale_rate { ksn } else { ksn >> 2 };
+        (4 * rate + offset).min(63)
+    }
+
+    /// Sustain target attenuation: 3 dB (16 units) per step, with 0xf the
+    /// special 93 dB floor.
+    fn sustain_target(&self) -> u16 {
+        if self.sustain == 0x0f {
+            0x1f0
+        } else {
+            u16::from(self.sustain) << 4
+        }
+    }
+
+    /// Advance the envelope one sample using the global EG counter. Key-on from
+    /// a released operator starts the attack (and restarts the phase, as the
+    /// chip does); key-off drops straight to release.
+    pub(crate) fn advance_envelope(&mut self, counter: u32, note_select: bool) {
+        match (self.key_on, self.eg_state) {
+            (true, EgState::Release) => {
+                self.eg_state = EgState::Attack;
+                self.phase = 0;
+            }
+            (false, state) if state != EgState::Release => {
+                self.eg_state = EgState::Release;
+            }
+            _ => {}
+        }
+
+        let rate = match self.eg_state {
+            EgState::Attack => self.attack,
+            EgState::Decay => self.decay,
+            EgState::Sustain => {
+                if self.sustained {
+                    return; // hold at the sustain level until key-off
+                }
+                self.release // percussive: keep decaying at the release rate
+            }
+            EgState::Release => self.release,
+        };
+        let eff = self.effective_rate(rate, note_select);
+        let inc = eg_increment(eff, counter);
+
+        match self.eg_state {
+            EgState::Attack => {
+                if eff >= 60 {
+                    self.eg_level = 0; // rate_hi == 15: instant attack
+                } else {
+                    for _ in 0..inc {
+                        if self.eg_level == 0 {
+                            break;
+                        }
+                        self.eg_level -= (self.eg_level >> 3) + 1;
+                    }
+                }
+                if self.eg_level == 0 {
+                    self.eg_state = EgState::Decay;
+                }
+            }
+            EgState::Decay => {
+                self.eg_level = (self.eg_level + inc).min(0x1ff);
+                if self.eg_level >= self.sustain_target() {
+                    self.eg_level = self.sustain_target();
+                    self.eg_state = EgState::Sustain;
+                }
+            }
+            EgState::Sustain | EgState::Release => {
+                self.eg_level = (self.eg_level + inc).min(0x1ff);
+            }
+        }
     }
 
     /// Signed operator output for the current phase. `extra_attenuation` carries
@@ -142,6 +298,36 @@ fn waveform_output_at(position: u32, waveform: u8, attenuation: u32) -> i32 {
     if negative { -magnitude } else { magnitude }
 }
 
+/// Envelope increment for this sample. The global counter ticks once per
+/// sample; an EG step happens every `2^(13 - rate_hi)` samples (rate_hi <= 12)
+/// or every sample with a scaled increment above that. The low two rate bits
+/// pick an 8-phase pattern averaging 1.0 / 1.25 / 1.5 / 1.75 per step. Derived
+/// from the chip's documented timing and validated against a reference.
+fn eg_increment(effective_rate: u8, counter: u32) -> u16 {
+    if effective_rate == 0 {
+        return 0;
+    }
+    const PATTERN: [[u16; 8]; 4] = [
+        [1, 1, 1, 1, 1, 1, 1, 1],
+        [1, 1, 1, 2, 1, 1, 1, 2],
+        [1, 2, 1, 2, 1, 2, 1, 2],
+        [1, 2, 2, 2, 1, 2, 2, 2],
+    ];
+    let rate_hi = effective_rate >> 2;
+    let rate_lo = (effective_rate & 3) as usize;
+    if rate_hi < 13 {
+        let shift = 13 - rate_hi;
+        if counter & ((1 << shift) - 1) != 0 {
+            return 0;
+        }
+        let phase = ((counter >> shift) & 7) as usize;
+        PATTERN[rate_lo][phase]
+    } else {
+        let phase = (counter & 7) as usize;
+        PATTERN[rate_lo][phase] << (rate_hi - 13)
+    }
+}
+
 /// Register slot offset for each of the 18 operators. The OPL leaves gaps at
 /// offsets 6,7,14,15 (and 22+), so operator i reads its registers at
 /// `base + OPERATOR_SLOT[i]`.
@@ -162,6 +348,7 @@ pub struct OplChip {
     timer1: Timer,
     timer2: Timer,
     operators: [Operator; 18],
+    eg_counter: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -215,6 +402,7 @@ impl Default for OplChip {
             timer1: Timer::new(80),
             timer2: Timer::new(320),
             operators: Default::default(),
+            eg_counter: 0,
         }
     }
 }
@@ -248,42 +436,33 @@ impl OplChip {
             }
         }
 
-        // Key-on (register 0xB0-0xB8 bit 5) rising edge restarts the channel's
-        // operator phases, as the real chip does.
-        if (0xb0..=0xb8).contains(&index) {
-            let was_on = self.registers[index as usize] & 0x20 != 0;
-            let now_on = value & 0x20 != 0;
-            if now_on && !was_on {
-                let (modulator, carrier) = channel_operators((index - 0xb0) as usize);
-                self.operators[modulator].phase = 0;
-                self.operators[carrier].phase = 0;
-            }
-        }
-
         self.registers[index as usize] = value;
     }
 
     /// Render one mono sample at the chip's native 49716 Hz rate, summing the
-    /// nine 2-op channels. (OPL3 4-op/stereo, the envelope, and rhythm mode are
-    /// added in later layers; for now key-on gates each channel on or off.)
+    /// nine 2-op channels. (OPL3 4-op/stereo and rhythm mode are added in later
+    /// layers.) The global envelope counter ticks once per sample.
     pub fn render_sample(&mut self) -> i32 {
+        self.eg_counter = self.eg_counter.wrapping_add(1);
         (0..9).map(|channel| self.render_channel(channel)).sum()
     }
 
     fn render_channel(&mut self, channel: usize) -> i32 {
+        let note_select = self.registers[0x08] & 0x40 != 0;
         let (modulator, carrier) = channel_operators(channel);
         self.load_operator(modulator, channel);
         self.load_operator(carrier, channel);
+        self.operators[modulator].advance_envelope(self.eg_counter, note_select);
+        self.operators[carrier].advance_envelope(self.eg_counter, note_select);
 
-        let keyed = self.registers[0xb0 + channel] & 0x20 != 0;
         let additive = self.registers[0xc0 + channel] & 0x01 != 0;
-        let output = if !keyed {
-            0
-        } else if additive {
-            self.operators[modulator].sample(0) + self.operators[carrier].sample(0)
+        let modulator_out =
+            self.operators[modulator].sample(self.operators[modulator].eg_attenuation());
+        let output = if additive {
+            modulator_out + self.operators[carrier].sample(self.operators[carrier].eg_attenuation())
         } else {
-            let modulation = self.operators[modulator].sample(0);
-            self.operators[carrier].sample_modulated(modulation, 0)
+            let carrier_att = self.operators[carrier].eg_attenuation();
+            self.operators[carrier].sample_modulated(modulator_out, carrier_att)
         };
 
         self.operators[modulator].advance();
@@ -291,21 +470,36 @@ impl OplChip {
         output
     }
 
-    /// Refresh one operator's parameters from its registers, preserving phase.
+    /// Refresh one operator's parameters from its registers, preserving phase
+    /// and envelope state.
     fn load_operator(&mut self, operator: usize, channel: usize) {
         let slot = OPERATOR_SLOT[operator];
         let fnum = u16::from(self.registers[0xa0 + channel])
             | ((u16::from(self.registers[0xb0 + channel]) & 0x03) << 8);
         let block = (self.registers[0xb0 + channel] >> 2) & 0x07;
-        let multiple = self.registers[0x20 + slot] & 0x0f;
+        let r20 = self.registers[0x20 + slot];
         let total_level = self.registers[0x40 + slot] & 0x3f;
         let waveform = self.registers[0xe0 + slot] & 0x07;
+        let ad = self.registers[0x60 + slot];
+        let sr = self.registers[0x80 + slot];
+        let key_on = self.registers[0xb0 + channel] & 0x20 != 0;
 
         let op = &mut self.operators[operator];
         op.set_frequency(fnum, block);
-        op.set_multiple(multiple);
+        op.set_multiple(r20 & 0x0f);
+        op.set_key_scale_rate(r20 & 0x10 != 0);
+        op.set_eg_type(r20 & 0x20 != 0);
         op.set_total_level(total_level);
         op.set_waveform(waveform);
+        op.set_envelope(ad >> 4, ad & 0x0f, sr >> 4, sr & 0x0f);
+        op.set_key(key_on);
+    }
+
+    /// Current envelope attenuation (0 = loud, 0x1ff = silent) of an operator.
+    /// Exposed for the dev-only cross-check harness; not part of the chip's API.
+    #[doc(hidden)]
+    pub fn envelope_level(&self, operator: usize) -> u16 {
+        self.operators[operator].eg_level
     }
 
     /// Advance the hardware timers by `micros` microseconds of chip time.
@@ -367,6 +561,14 @@ mod tests {
                 "index {i}: got {got}, expected {expected}"
             );
         }
+    }
+
+    #[test]
+    fn exp_lookup_saturates_to_zero_for_large_attenuation() {
+        // A fully-silent envelope plus total level can push attenuation past a
+        // valid 32-bit shift; it must saturate to silence, not overflow.
+        assert_eq!(exp_lookup(0x1ff << 3), 0);
+        assert_eq!(exp_lookup(0x2000), 0);
     }
 
     #[test]
@@ -488,6 +690,10 @@ mod tests {
         opl.write_register(0x23, 0x01); // carrier: multiple x1
         opl.write_register(0x40, modulator_tl); // modulator total level
         opl.write_register(0x43, 0x00); // carrier total level: loudest
+        opl.write_register(0x60, 0xf0); // both operators: attack 15 (instant), decay 0
+        opl.write_register(0x63, 0xf0);
+        opl.write_register(0x80, 0x00); // sustain 0, release 0
+        opl.write_register(0x83, 0x00);
         opl.write_register(0xe0, 0x00); // modulator waveform: sine
         opl.write_register(0xe3, 0x00); // carrier waveform: sine
         opl.write_register(0xc0, u8::from(additive)); // connection
@@ -496,6 +702,70 @@ mod tests {
             0xb0,
             0x20 | (block & 0x07) << 2 | ((fnum >> 8) & 0x03) as u8,
         );
+    }
+
+    // Carrier (operator 3) envelope after rendering `samples`, keyed at block 4.
+    fn carrier_eg_after(setup: impl Fn(&mut OplChip), samples: usize) -> u16 {
+        let mut opl = OplChip::default();
+        setup(&mut opl);
+        for _ in 0..samples {
+            opl.render_sample();
+        }
+        opl.envelope_level(3)
+    }
+
+    fn key_carrier(opl: &mut OplChip, ar: u8, dr: u8, sl: u8, rr: u8) {
+        opl.write_register(0x23, 0x21); // EGT sustained, multiple 1
+        opl.write_register(0x43, 0x00); // total level 0
+        opl.write_register(0x63, (ar << 4) | dr);
+        opl.write_register(0x83, (sl << 4) | rr);
+        opl.write_register(0xa0, 0x00);
+        opl.write_register(0xc0, 0x01); // additive, so the carrier reaches output
+        opl.write_register(0xb0, 0x20 | (4 << 2)); // key-on, block 4
+    }
+
+    #[test]
+    fn attack_opens_the_envelope_to_full_volume() {
+        let eg = carrier_eg_after(|opl| key_carrier(opl, 15, 0, 0, 0), 4);
+        assert_eq!(eg, 0, "instant attack reaches full volume");
+    }
+
+    #[test]
+    fn zero_attack_rate_keeps_the_operator_silent() {
+        let eg = carrier_eg_after(|opl| key_carrier(opl, 0, 0, 0, 0), 5000);
+        assert_eq!(eg, 0x1ff, "attack rate 0 never opens");
+    }
+
+    #[test]
+    fn higher_attack_rate_opens_faster() {
+        let slow = carrier_eg_after(|opl| key_carrier(opl, 6, 0, 0, 0), 1500);
+        let fast = carrier_eg_after(|opl| key_carrier(opl, 8, 0, 0, 0), 1500);
+        assert!(
+            fast < slow,
+            "AR=8 should be further along than AR=6: {fast} vs {slow}"
+        );
+    }
+
+    #[test]
+    fn decay_falls_to_the_sustain_level_and_holds() {
+        let eg = carrier_eg_after(|opl| key_carrier(opl, 15, 12, 8, 0), 2000);
+        assert_eq!(eg, 0x80, "decay settles and holds at sustain level 8");
+    }
+
+    #[test]
+    fn key_off_releases_to_silence() {
+        let mut opl = OplChip::default();
+        key_carrier(&mut opl, 15, 0, 0, 8); // instant attack, release rate 8
+        for _ in 0..8 {
+            opl.render_sample();
+        }
+        assert_eq!(opl.envelope_level(3), 0, "keyed and open");
+
+        opl.write_register(0xb0, 4 << 2); // key-off, keep block
+        for _ in 0..20_000 {
+            opl.render_sample();
+        }
+        assert_eq!(opl.envelope_level(3), 0x1ff, "released to silence");
     }
 
     #[test]
