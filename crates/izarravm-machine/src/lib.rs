@@ -4,7 +4,7 @@ use izarravm_core::{CpuPreset, HardwareProfile, VideoCard};
 use izarravm_cpu::{Cpu386, CpuError, SegmentIndex, SegmentRegister};
 use izarravm_video::{
     Framebuffer, MODE13H_MEMORY_SIZE, TextFrame, VGA_MODE13H_BASE, VGA_TEXT_BASE,
-    VGA_TEXT_MEMORY_SIZE, VgaTextMode,
+    VGA_TEXT_MEMORY_SIZE, VgaTextMode, VideoMode,
 };
 use thiserror::Error;
 
@@ -216,6 +216,14 @@ impl Machine {
 
     pub fn mode13h_framebuffer(&self) -> &Framebuffer {
         self.video.mode13h_framebuffer()
+    }
+
+    pub fn is_graphics_mode(&self) -> bool {
+        self.video.active_mode() == VideoMode::Mode13h
+    }
+
+    pub fn palette_argb(&self) -> [u32; 256] {
+        self.video.palette_argb()
     }
 
     pub fn bus_trace(&self) -> &BusTrace {
@@ -866,6 +874,7 @@ mod tests {
 
         assert_eq!(reason, StopReason::Halted);
         assert_eq!(machine.mode13h_framebuffer().indexed_pixels[0x7b], 0x2a);
+        assert!(machine.is_graphics_mode());
         assert!(machine.bus_trace().cycles().iter().any(|cycle| {
             cycle.kind == BusAccessKind::InterruptAcknowledge && cycle.address == 0x10
         }));
