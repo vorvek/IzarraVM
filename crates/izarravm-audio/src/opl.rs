@@ -97,11 +97,11 @@ impl Operator {
         self.sample_modulated(0, extra_attenuation)
     }
 
-    /// Operator output with the carrier phase offset by `phase_modulation` (the
-    /// modulator's signed output, in 10-bit wave-position units). A full-scale
-    /// modulator (+/-2042) bends the carrier by ~2 cycles, the OPL maximum.
-    // The exact modulation depth alignment is pending a YMF262 datasheet check;
-    // it shapes timbre, not the fundamental frequency.
+    /// Operator output with the carrier phase offset by `phase_modulation`, the
+    /// modulator's signed output in wave-position units where 1024 units = one
+    /// cycle = 2*pi. A full-scale modulator (~+/-2048) bends the carrier by
+    /// ~4*pi, matching the datasheet's maximum feedback depth (FB = 7 -> 4*pi);
+    /// feedback, once added, will scale as output >> (7 - FB).
     pub(crate) fn sample_modulated(&self, phase_modulation: i32, extra_attenuation: u16) -> i32 {
         let attenuation = u32::from(self.total_level) * 32 + u32::from(extra_attenuation);
         let position =
