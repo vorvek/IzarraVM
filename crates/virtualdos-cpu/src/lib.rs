@@ -3458,4 +3458,25 @@ mod tests {
         assert!(cpu.flag(FLAG_CF));
         assert!(cpu.flag(FLAG_OF));
     }
+
+    #[test]
+    fn mul_dword_writes_edx_eax() {
+        // mul ebx (0x66 0xf7 /4, modrm 0xe3). eax=0x0001_0000 * ebx=0x0001_0000
+        // = 0x1_0000_0000 -> eax=0, edx=1; CF/OF set. Exercises the u64 dword path.
+        let mut memory = vec![0; 16];
+        memory[0..3].copy_from_slice(&[0x66, 0xf7, 0xe3]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_eax(0x0001_0000);
+        cpu.registers.set_ebx(0x0001_0000);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eax(), 0x0000_0000);
+        assert_eq!(cpu.registers.edx(), 0x0000_0001);
+        assert!(cpu.flag(FLAG_CF));
+        assert!(cpu.flag(FLAG_OF));
+    }
 }
