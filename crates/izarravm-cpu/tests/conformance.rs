@@ -205,7 +205,7 @@ fn undefined_flags(bytes: &[u8], cl: u8) -> u32 {
     while index < bytes.len()
         && matches!(
             bytes[index],
-            0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf2 | 0xf3
+            0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf0 | 0xf2 | 0xf3
         )
     {
         if bytes[index] == 0x66 {
@@ -776,4 +776,13 @@ fn undefined_flags_skips_repne_prefix() {
     assert_eq!(undefined_flags(&[0xf2, 0xf6, 0xe3], 0), SF | ZF | AF | PF);
     // REPNE CMPSB defines every modeled flag, so no mask.
     assert_eq!(undefined_flags(&[0xf2, 0xa6], 0), 0);
+}
+
+#[test]
+fn undefined_flags_skips_lock_prefix() {
+    // The prefix-skip set must mirror read_prefixes, which now consumes 0xf0.
+    // LOCK AND (0xf0 0x20 0xc0): AND leaves AF undefined, so AF must still be masked.
+    assert_eq!(undefined_flags(&[0xf0, 0x20, 0xc0], 0), FLAG_AF);
+    // LOCK ADD (0xf0 0x00 0xc0): ADD defines every modeled flag, so nothing is undefined.
+    assert_eq!(undefined_flags(&[0xf0, 0x00, 0xc0], 0), 0);
 }
