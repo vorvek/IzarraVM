@@ -829,10 +829,27 @@ impl Cpu386 {
                 self.write_gpr_sized(opcode - 0xb8, operand_size, value);
                 Ok(clocks(2))
             }
+            0xc2 => {
+                // RET near, release imm16 bytes of arguments. The release count is always a
+                // 16-bit immediate; the operand size only selects the offset pop width.
+                let release = self.fetch_u16(bus)?;
+                let target = self.pop(bus, operand_size)?;
+                self.registers.eip = target & operand_size.mask();
+                self.release_stack(release);
+                Ok(clocks(10))
+            }
             0xc3 => {
                 let target = self.pop(bus, operand_size)?;
                 self.registers.eip = target & operand_size.mask();
                 Ok(clocks(10))
+            }
+            0xca => {
+                // RETF, release imm16 bytes. The count is part of the instruction stream, so
+                // it is fetched before the pops.
+                let release = self.fetch_u16(bus)?;
+                self.return_far(bus, operand_size)?;
+                self.release_stack(release);
+                Ok(clocks(17))
             }
             0xcb => {
                 self.return_far(bus, operand_size)?;
@@ -2268,6 +2285,20 @@ impl Cpu386 {
         self.load_segment(bus, SegmentIndex::Cs, selector)?;
         self.registers.eip = offset & operand_size.mask();
         Ok(())
+    }
+
+    fn release_stack(&mut self, count: u16) {
+        // The immediate return forms release `count` bytes of arguments after the
+        // pop. The stack pointer width follows the stack, not the operand size: a
+        // real-mode 16-bit stack moves only SP and preserves ESP[31:16]. The SS
+        // B-bit-accurate version arrives with 32-bit protected-mode stacks.
+        if self.is_protected_mode() {
+            let esp = self.registers.esp().wrapping_add(u32::from(count));
+            self.registers.set_esp(esp);
+        } else {
+            let sp = self.read_gpr16(4).wrapping_add(count);
+            self.write_gpr16(4, sp);
+        }
     }
 
     fn far_jump<B: CpuBus>(
@@ -4694,6 +4725,83 @@ mod tests {
         assert_eq!(cpu.registers.cs().selector, 0x0000);
         assert_eq!(cpu.registers.eip, 0x0005);
         assert_eq!(cpu.read_gpr16(4), 0x0100); // sp restored
+    }
+
+    #[test]
+    fn ret_near_imm16_pops_and_releases() {
+        // ret 0x0004  (0xc2 0x04 0x00). Return ip 0x0100 at ss:0x0100.
+        let mut memory = vec![0; 1024];
+        memory[0..3].copy_from_slice(&[0xc2, 0x04, 0x00]);
+        memory[0x100..0x102].copy_from_slice(&0x0100u16.to_le_bytes());
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eip, 0x0100);
+        // sp: 0x0100 -> +2 (word pop) -> +4 (release) = 0x0106
+        assert_eq!(cpu.read_gpr16(4), 0x0106);
+    }
+
+    #[test]
+    fn ret_near_imm16_32bit_preserves_high_esp() {
+        // 0x66 0xc2 0x04 0x00 : 32-bit ret, release 4. Pop eip (dword), then release.
+        let mut memory = vec![0; 1024];
+        memory[0..4].copy_from_slice(&[0x66, 0xc2, 0x04, 0x00]);
+        memory[0x100..0x104].copy_from_slice(&0x0000_0100u32.to_le_bytes());
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0xdead_0100);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eip, 0x0000_0100);
+        // real-mode 16-bit stack: only SP moves, ESP[31:16] preserved.
+        // 0x0100 -> +4 (dword pop) -> +4 (release) = 0x0108
+        assert_eq!(cpu.registers.esp(), 0xdead_0108);
+    }
+
+    #[test]
+    fn retf_imm16_pops_far_and_releases() {
+        // retf 0x0004  (0xca 0x04 0x00). Stack: ip 0x0100 then cs 0x3000 at ss:0x0100.
+        let mut memory = vec![0; 1024];
+        memory[0..3].copy_from_slice(&[0xca, 0x04, 0x00]);
+        memory[0x100..0x104].copy_from_slice(&[0x00, 0x01, 0x00, 0x30]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.cs().selector, 0x3000);
+        assert_eq!(cpu.registers.eip, 0x0100);
+        // sp: 0x0100 -> +4 (far pop) -> +4 (release) = 0x0108
+        assert_eq!(cpu.read_gpr16(4), 0x0108);
+    }
+
+    #[test]
+    fn release_stack_wraps_sp_and_preserves_high_esp_in_real_mode() {
+        // release_stack alone, with no surrounding pop, must move only SP on a
+        // real-mode 16-bit stack and wrap at the 16-bit boundary. ESP[31:16] must
+        // not absorb the carry: a full-ESP add of 0xbeef_fffe + 4 would carry into
+        // 0xbef0_0002, while the SP-only path gives 0xbeef_0002.
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.set_esp(0xbeef_fffe);
+
+        cpu.release_stack(4);
+
+        assert_eq!(cpu.registers.esp(), 0xbeef_0002);
     }
 
     #[test]
