@@ -1348,6 +1348,36 @@ impl Cpu386 {
                 self.set_szp(u32::from(al), BusWidth::Byte);
                 Ok(clocks(4))
             }
+            0x37 => {
+                // AAA: ASCII adjust AL after addition. OF/SF/ZF/PF are left undefined.
+                if (self.read_gpr8(0) & 0x0f) > 9 || self.flag(FLAG_AF) {
+                    let ax = self.read_gpr16(0).wrapping_add(0x106);
+                    self.write_gpr16(0, ax);
+                    self.set_flag(FLAG_AF, true);
+                    self.set_flag(FLAG_CF, true);
+                } else {
+                    self.set_flag(FLAG_AF, false);
+                    self.set_flag(FLAG_CF, false);
+                }
+                let al = self.read_gpr8(0) & 0x0f;
+                self.write_gpr8(0, al);
+                Ok(clocks(4))
+            }
+            0x3f => {
+                // AAS: ASCII adjust AL after subtraction. OF/SF/ZF/PF are left undefined.
+                if (self.read_gpr8(0) & 0x0f) > 9 || self.flag(FLAG_AF) {
+                    let ax = self.read_gpr16(0).wrapping_sub(6);
+                    self.write_gpr16(0, ax.wrapping_sub(0x100));
+                    self.set_flag(FLAG_AF, true);
+                    self.set_flag(FLAG_CF, true);
+                } else {
+                    self.set_flag(FLAG_AF, false);
+                    self.set_flag(FLAG_CF, false);
+                }
+                let al = self.read_gpr8(0) & 0x0f;
+                self.write_gpr8(0, al);
+                Ok(clocks(4))
+            }
             0x0f => self.execute_two_byte(bus, prefixes, address_size, operand_size),
             _ => Err(CpuError::UnsupportedOpcode {
                 opcode,
@@ -6866,6 +6896,92 @@ mod tests {
 
         assert_eq!(cpu.read_reg16(Reg16::Ax) & 0xff, 0xa0);
         assert!(cpu.flag(FLAG_CF));
+        assert!(!cpu.flag(FLAG_AF));
+    }
+
+    #[test]
+    fn aaa_adjusts_and_carries_into_ah() {
+        // aaa (0x37): AX=0x000B (AL low nibble > 9) -> AX += 0x106, AL &= 0x0f.
+        // AX=0x0111 then AL=0x01 -> AX=0x0101; CF=1, AF=1.
+        let mut memory = vec![0; 64];
+        memory[0] = 0x37;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x000b);
+        cpu.set_flag(FLAG_AF, false);
+        cpu.set_flag(FLAG_CF, false);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax) & 0xff, 0x01);
+        assert_eq!(cpu.read_reg16(Reg16::Ax) >> 8, 0x01);
+        assert!(cpu.flag(FLAG_CF));
+        assert!(cpu.flag(FLAG_AF));
+    }
+
+    #[test]
+    fn aaa_no_adjust_clears_carry() {
+        // aaa: AX=0x0005, AF=0 -> only AL &= 0x0f; CF=0, AF=0, AH unchanged.
+        let mut memory = vec![0; 64];
+        memory[0] = 0x37;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x0005);
+        cpu.set_flag(FLAG_AF, false);
+        cpu.set_flag(FLAG_CF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax) & 0xff, 0x05);
+        assert_eq!(cpu.read_reg16(Reg16::Ax) >> 8, 0x00);
+        assert!(!cpu.flag(FLAG_CF));
+        assert!(!cpu.flag(FLAG_AF));
+    }
+
+    #[test]
+    fn aas_adjusts_and_borrows_from_ah() {
+        // aas (0x3f): AX=0x020B (AL low nibble > 9) -> AX -= 6, AH -= 1, AL &= 0x0f.
+        // 0x020B - 6 = 0x0205, AH-1 -> 0x0105, AL=0x05; CF=1, AF=1.
+        let mut memory = vec![0; 64];
+        memory[0] = 0x3f;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x020b);
+        cpu.set_flag(FLAG_AF, false);
+        cpu.set_flag(FLAG_CF, false);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax) & 0xff, 0x05);
+        assert_eq!(cpu.read_reg16(Reg16::Ax) >> 8, 0x01);
+        assert!(cpu.flag(FLAG_CF));
+        assert!(cpu.flag(FLAG_AF));
+    }
+
+    #[test]
+    fn aas_no_adjust_clears_carry() {
+        // aas: AX=0x0204, AF=0 -> only AL &= 0x0f; CF=0, AF=0, AH unchanged.
+        let mut memory = vec![0; 64];
+        memory[0] = 0x3f;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x0204);
+        cpu.set_flag(FLAG_AF, false);
+        cpu.set_flag(FLAG_CF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax) & 0xff, 0x04);
+        assert_eq!(cpu.read_reg16(Reg16::Ax) >> 8, 0x02);
+        assert!(!cpu.flag(FLAG_CF));
         assert!(!cpu.flag(FLAG_AF));
     }
 }
