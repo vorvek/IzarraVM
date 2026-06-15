@@ -941,6 +941,15 @@ impl Cpu386 {
                 self.relative_jump(rel, operand_size);
                 Ok(clocks(7))
             }
+            0x9a => {
+                let offset = match operand_size {
+                    OperandSize::Word => u32::from(self.fetch_u16(bus)?),
+                    OperandSize::Dword => self.fetch_u32(bus)?,
+                };
+                let selector = self.fetch_u16(bus)?;
+                self.far_call(bus, selector, offset, operand_size)?;
+                Ok(clocks(17))
+            }
             0xea => {
                 let offset = match operand_size {
                     OperandSize::Word => u32::from(self.fetch_u16(bus)?),
@@ -2226,6 +2235,24 @@ impl Cpu386 {
                 self.load_flags(flags, OperandSize::Dword);
             }
         }
+        Ok(())
+    }
+
+    fn far_call<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        selector: u16,
+        offset: u32,
+        operand_size: OperandSize,
+    ) -> ExecResult<()> {
+        // Push CS first (higher stack address), then the return offset (lower
+        // address). RETF pops in the opposite order: offset first, then CS.
+        // self.registers.eip already points past the instruction, because the
+        // far pointer operands have been fetched.
+        self.push(bus, u32::from(self.registers.cs().selector), operand_size)?;
+        self.push(bus, self.registers.eip, operand_size)?;
+        self.load_segment(bus, SegmentIndex::Cs, selector)?;
+        self.registers.eip = offset & operand_size.mask();
         Ok(())
     }
 
@@ -4612,5 +4639,34 @@ mod tests {
 
         // SP 0x200 + 32 = 0x220; high half from the discarded slot = 0x5a04.
         assert_eq!(cpu.registers.esp(), 0x5a04_0220);
+    }
+
+    #[test]
+    fn far_call_pushes_return_and_loads_target() {
+        // call far 0x3000:0x0100  (0x9a 0x00 0x01 0x00 0x30), a 5-byte instruction.
+        // Pushes CS (0x0000) then the return IP (0x0005), then loads cs:eip.
+        let mut memory = vec![0; 1024];
+        memory[0..5].copy_from_slice(&[0x9a, 0x00, 0x01, 0x00, 0x30]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.cs().selector, 0x3000);
+        assert_eq!(cpu.registers.eip, 0x0100);
+        assert_eq!(cpu.read_gpr16(4), 0x00fc); // two word pushes from 0x0100
+        // CS at the higher slot, return IP just below it
+        assert_eq!(
+            u16::from_le_bytes([bus.memory[0xfe], bus.memory[0xff]]),
+            0x0000
+        );
+        assert_eq!(
+            u16::from_le_bytes([bus.memory[0xfc], bus.memory[0xfd]]),
+            0x0005
+        );
     }
 }
