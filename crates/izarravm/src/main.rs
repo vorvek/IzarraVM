@@ -541,7 +541,13 @@ mod tests {
 
         assert_eq!(rendered.width, 320 * MODE13H_SCALE);
         assert_eq!(rendered.height, 200 * MODE13H_SCALE);
+        // Source pixel 0 fans out to a MODE13H_SCALE by MODE13H_SCALE block.
         assert_eq!(rendered.pixels[0], 0x00AB_CDEF);
+        assert_eq!(rendered.pixels[1], 0x00AB_CDEF);
+        assert_eq!(rendered.pixels[rendered.width], 0x00AB_CDEF);
+        assert_eq!(rendered.pixels[rendered.width + 1], 0x00AB_CDEF);
+        // The next source pixel keeps the background color.
+        assert_eq!(rendered.pixels[MODE13H_SCALE], palette[0]);
     }
 
     #[test]
