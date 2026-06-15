@@ -1,25 +1,25 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/virtualdos",
-    "crates/virtualdos-audio",
-    "crates/virtualdos-bus",
-    "crates/virtualdos-core",
-    "crates/virtualdos-corpus",
-    "crates/virtualdos-cpu",
-    "crates/virtualdos-dos",
-    "crates/virtualdos-firmware",
-    "crates/virtualdos-input",
-    "crates/virtualdos-machine",
-    "crates/virtualdos-video",
+    "crates/izarravm",
+    "crates/izarravm-audio",
+    "crates/izarravm-bus",
+    "crates/izarravm-core",
+    "crates/izarravm-corpus",
+    "crates/izarravm-cpu",
+    "crates/izarravm-dos",
+    "crates/izarravm-firmware",
+    "crates/izarravm-input",
+    "crates/izarravm-machine",
+    "crates/izarravm-video",
 ]
 
 [workspace.package]
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
-repository = "https://github.com/vorvek/VirtualDOS"
-authors = ["VirtualDOS contributors"]
+repository = "https://github.com/vorvek/IzarraVM"
+authors = ["IzarraVM contributors"]
 
 [workspace.dependencies]
 bitflags = "2.6"

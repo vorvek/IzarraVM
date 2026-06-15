@@ -1,0 +1,18 @@
+[package]
+name = "izarravm-machine"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+izarravm-bus = { path = "../izarravm-bus" }
+izarravm-core = { path = "../izarravm-core" }
+izarravm-cpu = { path = "../izarravm-cpu" }
+izarravm-video = { path = "../izarravm-video" }
+
+[dev-dependencies]
+izarravm-firmware = { path = "../izarravm-firmware" }

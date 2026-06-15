@@ -1,44 +1,93 @@
-# VirtualDOS
+# IzarraVM
 
-VirtualDOS is a Rust-based, games-first DOS emulator project. The initial target is early-90s DOS game compatibility, with Wolfenstein 3D-era hardware as the first practical milestone:
+IzarraVM is a Rust emulator for the Izarra 3000, a fictional late-1990s
+computer. The Izarra 3000 is a fully integrated machine in the spirit of an Amiga
+or a Mac: fixed custom hardware running its own GUI operating system, Belunza Disk
+System, over an MS-DOS compatible core. The emulator reproduces that one machine
+rather than offering a configurable PC.
 
-- 386 real-mode CPU execution and timing tests first.
-- VGA Mode 13h and ET4000-style SVGA boundaries first.
-- PC speaker, AdLib/OPL, Sound Blaster, and MIDI backend boundaries.
-- Keyboard, mouse, DOS joystick, and future optional Steam Input support.
-- Host-folder DOS `C:` mounts, with no virtual disk image requirement.
+The aim is to run early to mid 1990s DOS games the way the Izarra would have run
+them. It does not run DOS games yet. Today it boots clean-room test ROMs and
+validates configuration and the local game corpus.
 
-The repository is MIT licensed. FreeDOS may be used as a behavioral reference, but this project does not copy GPL FreeDOS code.
+There was never a real Izarra 3000. In the project's fiction the company went
+bankrupt in early 1997, before the machine shipped, which is also why it is a good
+DOS computer that arrived just as Windows 95 took over the market.
+
+## The Izarra 3000
+
+Fixed hardware. None of it is user-selectable; the point of the machine is that it
+is one tight design.
+
+- CPU: GSW-586, a Pentium and K6 class part at 200 MHz on a 66 MHz bus. Two
+  backward compatibility modes throttle it to behave like the earlier machines in
+  the line: 486DX2 at 66 MHz (the Izarra 2000) and 386DX at 25 MHz (the Izarra
+  1000), switchable from Belunza without a reboot.
+- Memory: 24 MB SDRAM.
+- Graphics: VEGA, an integrated chipset built from a 2D chip (Margo) and a
+  Glide-capable 3D chip (Distira). 4 MB shared, VESA VBE 2.0, up to 1024x768 at
+  32-bit color.
+- Sound: Resonique 2, compatible with the Sound Blaster 16, with an OPL3 FM chip,
+  an MPU-401 MIDI port, and a wavetable daughterboard.
+- Storage: 3.6 GB IDE hard disk, 12x CD-ROM with CD audio, 1.44 MB floppy.
+- Display: 15-inch CRT, up to 1024x768.
+- Firmware: a 2 MB ROM holding a simplified custom BIOS and Belunza Disk System.
+
+Games see a DOS environment. Belunza runs an MS-DOS 6.1 compatible core with the
+usual memory managers, and maps itself out of conventional memory so games that
+need most of the first 640 KB (Wing Commander, for one) still get it.
+
+## Implementation order
+
+One machine, built in layers. The rough sequence:
+
+- CPU: a 386 core first, which doubles as the Izarra 1000 compatibility mode, then
+  486DX2 behavior, then the full GSW-586.
+- Graphics: VGA text and Mode 13h, then VESA SVGA on Margo, then the Distira 3D
+  unit and the Glide path.
+- Sound: PC speaker, then OPL3 and Sound Blaster 16, then MPU-401 MIDI and
+  wavetable.
+- Host integration: keyboard and mouse, DOS joystick, and host-folder C: mounts
+  with no virtual disk image required.
 
 ## Development Policy
 
-Active development is Windows-first for now, matching the local DOS library and current workstation. Keep the architecture portable: use cross-platform crates for windowing, graphics, audio, MIDI, input, paths, and process boundaries; avoid Windows-only APIs unless they are isolated behind a backend trait.
+Active development is Windows-first for now, matching the local DOS library and
+current workstation. Keep the architecture portable: use cross-platform crates for
+windowing, graphics, audio, MIDI, input, paths, and process boundaries, and avoid
+Windows-only APIs unless they are isolated behind a backend trait.
 
 ## Current State
 
-This is an early emulator scaffold. It validates TOML/CLI configuration, includes local compatibility-corpus scanning tools, and boots a clean-room 80386DX-25 test ROM far enough to show deterministic VGA text-mode compatibility checks. It does not run DOS games yet.
+This is an early emulator scaffold. It validates TOML and CLI configuration,
+includes local compatibility-corpus scanning tools, and boots a clean-room 80386
+test ROM far enough to show deterministic VGA text-mode checks. It does not run DOS
+games yet.
 
 ## Quick Start
 
 ```powershell
-cargo run -p virtualdos -- --headless-config-check
-cargo run -p virtualdos -- --headless-test-rom
-cargo run -p virtualdos -- --headless-boot-suite
-cargo run -p virtualdos -- --config examples/virtualdos.toml
+cargo run -p izarravm -- --headless-config-check
+cargo run -p izarravm -- --headless-test-rom
+cargo run -p izarravm -- --headless-boot-suite
+cargo run -p izarravm -- --config examples/izarravm.toml
 ```
 
-For non-Windows hosts later, replace the `c_drive` path in `examples/virtualdos.toml` or pass `--c-drive /path/to/dosroot`.
+For non-Windows hosts later, replace the `c_drive` path in
+`examples/izarravm.toml` or pass `--c-drive /path/to/dosroot`.
 
 ## Compatibility Corpus
 
-The local DOS collection is treated as read-only and machine-local. Configure it with either `VIRTUALDOS_DOSROOT` or `--dosroot`:
+The local DOS collection is treated as read-only and machine-local. Configure it
+with either `IZARRAVM_DOSROOT` or `--dosroot`:
 
 ```powershell
-$env:VIRTUALDOS_DOSROOT = 'R:\La Colección by Neville\dosroot\'
-cargo run -p virtualdos-corpus -- --output corpus-output\scan.json
+$env:IZARRAVM_DOSROOT = 'R:\La Colección by Neville\dosroot\'
+cargo run -p izarravm-corpus -- --output corpus-output\scan.json
 ```
 
-Generated corpus output belongs in ignored local directories such as `corpus-output/` or `compatibility-output/`.
+Generated corpus output belongs in ignored local directories such as
+`corpus-output/` or `compatibility-output/`.
 
 ## Validation
 
@@ -49,24 +98,7 @@ cargo test --workspace
 cargo build --workspace
 ```
 
+## License
 
-## Objectives
-CPU levels: 
-1) i386 @ 25MHz
-2) 486DX2 @ 66MHz
-3) Pentium 133MHz
-4) Pentium MMX 233Mhz
-
-GPU levels:
-1) Tseng Labs ET4000AX
-2) S3 Trio
-3) Voodoo 2 single/SLI
-
-RAM:
-Manually selectable from 1MB to 128MB
-
-Sound:
-1) PC Speaker
-2) Adlib / OPL2
-3) Sound Blaster 16 / OPL3
-4) MIDI
+MIT licensed. FreeDOS may be used as a behavioral reference for the DOS layer, but
+this project does not copy GPL FreeDOS code.

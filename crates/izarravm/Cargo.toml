@@ -1,0 +1,25 @@
+[package]
+name = "izarravm"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+clap.workspace = true
+font8x8.workspace = true
+softbuffer.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+izarravm-audio = { path = "../izarravm-audio" }
+izarravm-bus = { path = "../izarravm-bus" }
+izarravm-core = { path = "../izarravm-core" }
+izarravm-cpu = { path = "../izarravm-cpu" }
+izarravm-dos = { path = "../izarravm-dos" }
+izarravm-firmware = { path = "../izarravm-firmware" }
+izarravm-input = { path = "../izarravm-input" }
+izarravm-machine = { path = "../izarravm-machine" }
+izarravm-video = { path = "../izarravm-video" }
+winit.workspace = true

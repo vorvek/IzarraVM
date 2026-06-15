@@ -1054,6 +1054,115 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "izarravm"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "font8x8",
+ "izarravm-audio",
+ "izarravm-bus",
+ "izarravm-core",
+ "izarravm-cpu",
+ "izarravm-dos",
+ "izarravm-firmware",
+ "izarravm-input",
+ "izarravm-machine",
+ "izarravm-video",
+ "softbuffer",
+ "tracing",
+ "tracing-subscriber",
+ "winit",
+]
+
+[[package]]
+name = "izarravm-audio"
+version = "0.1.0"
+dependencies = [
+ "cpal",
+ "izarravm-core",
+ "midir",
+]
+
+[[package]]
+name = "izarravm-bus"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "izarravm-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "izarravm-corpus"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "serde",
+ "serde_json",
+ "walkdir",
+]
+
+[[package]]
+name = "izarravm-cpu"
+version = "0.1.0"
+dependencies = [
+ "izarravm-bus",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "izarravm-dos"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "izarravm-firmware"
+version = "0.1.0"
+
+[[package]]
+name = "izarravm-input"
+version = "0.1.0"
+dependencies = [
+ "gilrs",
+ "winit",
+]
+
+[[package]]
+name = "izarravm-machine"
+version = "0.1.0"
+dependencies = [
+ "izarravm-bus",
+ "izarravm-core",
+ "izarravm-cpu",
+ "izarravm-firmware",
+ "izarravm-video",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "izarravm-video"
+version = "0.1.0"
+dependencies = [
+ "izarravm-core",
+ "thiserror 2.0.18",
+ "wgpu",
+]
+
+[[package]]
 name = "jni"
 version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2703,115 +2812,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "virtualdos"
-version = "0.1.0"
-dependencies = [
- "clap",
- "font8x8",
- "softbuffer",
- "tracing",
- "tracing-subscriber",
- "virtualdos-audio",
- "virtualdos-bus",
- "virtualdos-core",
- "virtualdos-cpu",
- "virtualdos-dos",
- "virtualdos-firmware",
- "virtualdos-input",
- "virtualdos-machine",
- "virtualdos-video",
- "winit",
-]
-
-[[package]]
-name = "virtualdos-audio"
-version = "0.1.0"
-dependencies = [
- "cpal",
- "midir",
- "virtualdos-core",
-]
-
-[[package]]
-name = "virtualdos-bus"
-version = "0.1.0"
-dependencies = [
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "virtualdos-core"
-version = "0.1.0"
-dependencies = [
- "serde",
- "tempfile",
- "thiserror 2.0.18",
- "toml",
- "tracing",
-]
-
-[[package]]
-name = "virtualdos-corpus"
-version = "0.1.0"
-dependencies = [
- "clap",
- "serde",
- "serde_json",
- "walkdir",
-]
-
-[[package]]
-name = "virtualdos-cpu"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "virtualdos-bus",
-]
-
-[[package]]
-name = "virtualdos-dos"
-version = "0.1.0"
-dependencies = [
- "tempfile",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "virtualdos-firmware"
-version = "0.1.0"
-
-[[package]]
-name = "virtualdos-input"
-version = "0.1.0"
-dependencies = [
- "gilrs",
- "winit",
-]
-
-[[package]]
-name = "virtualdos-machine"
-version = "0.1.0"
-dependencies = [
- "thiserror 2.0.18",
- "virtualdos-bus",
- "virtualdos-core",
- "virtualdos-cpu",
- "virtualdos-firmware",
- "virtualdos-video",
-]
-
-[[package]]
-name = "virtualdos-video"
-version = "0.1.0"
-dependencies = [
- "thiserror 2.0.18",
- "virtualdos-core",
- "wgpu",
-]
 
 [[package]]
 name = "walkdir"
