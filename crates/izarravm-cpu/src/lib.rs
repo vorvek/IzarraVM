@@ -1369,6 +1369,36 @@ impl Cpu386 {
                 self.write_gpr_sized(modrm.reg, operand_size, result);
                 Ok(clocks(9))
             }
+            0xbc => {
+                // BSF: index of the lowest set bit. Source 0 -> ZF=1, destination unchanged
+                // (386 silicon; Intel documents the destination as undefined).
+                let modrm = self.fetch_modrm(bus)?;
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
+                let src =
+                    self.read_operand_sized(bus, operand, operand_size)? & operand_size.mask();
+                if src == 0 {
+                    self.set_flag(FLAG_ZF, true);
+                } else {
+                    self.set_flag(FLAG_ZF, false);
+                    self.write_gpr_sized(modrm.reg, operand_size, src.trailing_zeros());
+                }
+                Ok(clocks(10))
+            }
+            0xbd => {
+                // BSR: index of the highest set bit. Source 0 -> ZF=1, destination unchanged
+                // (386 silicon; Intel documents the destination as undefined).
+                let modrm = self.fetch_modrm(bus)?;
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
+                let src =
+                    self.read_operand_sized(bus, operand, operand_size)? & operand_size.mask();
+                if src == 0 {
+                    self.set_flag(FLAG_ZF, true);
+                } else {
+                    self.set_flag(FLAG_ZF, false);
+                    self.write_gpr_sized(modrm.reg, operand_size, 31 - src.leading_zeros());
+                }
+                Ok(clocks(10))
+            }
             _ => Err(CpuError::UnsupportedTwoByteOpcode {
                 opcode,
                 cs: self.registers.cs().selector,
@@ -5423,5 +5453,113 @@ mod tests {
         assert_eq!(cpu.read_reg16(Reg16::Bx), 0x8000);
         assert!(cpu.flag(FLAG_CF));
         assert!(cpu.flag(FLAG_OF));
+    }
+
+    #[test]
+    fn bsf_finds_lowest_set_bit() {
+        // bsf bx, cx (0x0f 0xbc 0xd9): cx=0x0140 -> lowest set bit at index 6, ZF=0.
+        let mut memory = vec![0; 64];
+        memory[0..3].copy_from_slice(&[0x0f, 0xbc, 0xd9]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Cx, 0x0140);
+        cpu.set_flag(FLAG_ZF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Bx), 6);
+        assert!(!cpu.flag(FLAG_ZF));
+    }
+
+    #[test]
+    fn bsf_zero_source_sets_zf_and_leaves_dest() {
+        // bsf bx, cx (0x0f 0xbc 0xd9): cx=0 -> ZF=1, bx unchanged (preset 0xbeef).
+        let mut memory = vec![0; 64];
+        memory[0..3].copy_from_slice(&[0x0f, 0xbc, 0xd9]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Cx, 0x0000);
+        cpu.write_reg16(Reg16::Bx, 0xbeef);
+        cpu.set_flag(FLAG_ZF, false);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert!(cpu.flag(FLAG_ZF));
+        assert_eq!(cpu.read_reg16(Reg16::Bx), 0xbeef);
+    }
+
+    #[test]
+    fn bsf_32bit_finds_low_bit() {
+        // 0x66 0x0f 0xbc 0xd9 (bsf ebx, ecx): ecx=0x8000_0000 -> index 31, ZF=0.
+        let mut memory = vec![0; 64];
+        memory[0..4].copy_from_slice(&[0x66, 0x0f, 0xbc, 0xd9]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_gpr32(1, 0x8000_0000); // ecx
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_gpr32(3), 31); // ebx
+        assert!(!cpu.flag(FLAG_ZF));
+    }
+
+    #[test]
+    fn bsr_finds_highest_set_bit() {
+        // bsr bx, cx (0x0f 0xbd 0xd9): cx=0x0140 -> highest set bit at index 8, ZF=0.
+        let mut memory = vec![0; 64];
+        memory[0..3].copy_from_slice(&[0x0f, 0xbd, 0xd9]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Cx, 0x0140);
+        cpu.set_flag(FLAG_ZF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Bx), 8);
+        assert!(!cpu.flag(FLAG_ZF));
+    }
+
+    #[test]
+    fn bsr_32bit_finds_high_bit() {
+        // 0x66 0x0f 0xbd 0xd9 (bsr ebx, ecx): ecx=0x8000_0000 -> index 31, ZF=0.
+        let mut memory = vec![0; 64];
+        memory[0..4].copy_from_slice(&[0x66, 0x0f, 0xbd, 0xd9]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_gpr32(1, 0x8000_0000); // ecx
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_gpr32(3), 31); // ebx
+        assert!(!cpu.flag(FLAG_ZF));
+    }
+
+    #[test]
+    fn bsr_zero_source_sets_zf_and_leaves_dest() {
+        // bsr bx, cx (0x0f 0xbd 0xd9): cx=0 -> ZF=1, bx unchanged (preset 0x1234).
+        let mut memory = vec![0; 64];
+        memory[0..3].copy_from_slice(&[0x0f, 0xbd, 0xd9]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Cx, 0x0000);
+        cpu.write_reg16(Reg16::Bx, 0x1234);
+        cpu.set_flag(FLAG_ZF, false);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert!(cpu.flag(FLAG_ZF));
+        assert_eq!(cpu.read_reg16(Reg16::Bx), 0x1234);
     }
 }
