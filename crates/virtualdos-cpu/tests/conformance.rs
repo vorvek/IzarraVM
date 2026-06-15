@@ -5,6 +5,7 @@ use virtualdos_cpu::{Cpu386, CpuError, SegmentIndex, SegmentRegister};
 // Flags the CPU core models. AF is now modeled but is undefined for logic ops
 // (see undefined_flags); reserved and unmodeled high bits are never compared.
 const MODELED_FLAGS: u32 = 0x0000_0fd5;
+const FLAG_CF: u32 = 0x0000_0001;
 const FLAG_AF: u32 = 0x0000_0010;
 const FLAG_OF: u32 = 0x0000_0800;
 
@@ -179,24 +180,29 @@ fn apply_state(cpu: &mut Cpu386, bus: &mut FlatBus, state: &TestState) {
     }
 }
 
-/// Flags that the 386 leaves undefined for this instruction, so the harness
-/// must not compare them. Logic ops (AND/OR/XOR/TEST) leave AF undefined.
-/// Shift ops leave AF undefined; rotate ops preserve AF, so masking AF is safe
-/// for both. OF is only defined when the count is exactly 1, which is only
-/// guaranteed by the 0xD0/0xD1 forms.
-/// The 0xC0/0xC1 forms encode the count as an imm8 that this helper does not
-/// decode, and the 0xD2/0xD3 forms take the count from CL at runtime, so OF
-/// is treated as undefined for those. Arithmetic ops define every modeled flag.
-/// The prefix-skip set below must mirror the CPU's `read_prefixes` exactly,
-/// or this helper and the CPU would disagree on which byte is the opcode.
-fn undefined_flags(bytes: &[u8]) -> u32 {
+/// Flags that the 386 leaves undefined for this instruction, so the harness must
+/// not compare them. `cl` is the initial CL, needed for the CL-count shift forms.
+/// Logic ops (AND/OR/XOR/TEST) leave AF undefined. For the shift/rotate group:
+/// AF is undefined for shifts and preserved by rotates (so masking it is safe for
+/// both); OF is defined only for a 1-bit count (guaranteed only by 0xD0/0xD1); and
+/// CF is undefined for SHL/SHR (and the /6 SHL alias) when the masked count reaches
+/// the operand size in bits, per the Intel SDM. SAR and the rotates keep CF defined
+/// at any count. See dev_docs/reference/80386-shift-flags.md. SF/ZF/PF and the
+/// result stay compared for every count. Arithmetic ops define every modeled flag.
+/// The prefix-skip set below must mirror the CPU's `read_prefixes` exactly, or this
+/// helper and the CPU would disagree on which byte is the opcode.
+fn undefined_flags(bytes: &[u8], cl: u8) -> u32 {
     let mut index = 0;
+    let mut operand_size_override = false;
     while index < bytes.len()
         && matches!(
             bytes[index],
             0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf3
         )
     {
+        if bytes[index] == 0x66 {
+            operand_size_override = true;
+        }
         index += 1;
     }
     let Some(&opcode) = bytes.get(index) else {
@@ -210,17 +216,39 @@ fn undefined_flags(bytes: &[u8]) -> u32 {
         0xf6 | 0xf7 => reg == Some(0),
         _ => false,
     };
-    // Shift/rotate group: OF is defined only for a 1-bit count. 0xD0/0xD1 always
-    // shift by 1 (OF defined); 0xC0/0xC1 (imm8 count) and 0xD2/0xD3 (CL count)
-    // carry a count this helper does not decode, so OF is undefined there. AF is
-    // undefined for shifts and preserved by rotates, so masking it is correct for
-    // shifts and harmless for rotates. SF/ZF/PF stay compared for every count.
-    match opcode {
-        0xc0 | 0xc1 | 0xd2 | 0xd3 => FLAG_AF | FLAG_OF,
-        0xd0 | 0xd1 => FLAG_AF,
-        _ if is_logic => FLAG_AF,
-        _ => 0,
+
+    if matches!(opcode, 0xc0 | 0xc1 | 0xd0 | 0xd1 | 0xd2 | 0xd3) {
+        let mut mask = FLAG_AF;
+        // OF is undefined unless the count is a guaranteed 1 (0xD0/0xD1).
+        if !matches!(opcode, 0xd0 | 0xd1) {
+            mask |= FLAG_OF;
+        }
+        // CF is undefined for SHL(/4), SHR(/5), and the /6 SHL alias once the masked
+        // count reaches the operand width. The count is the imm8 (the byte before the
+        // HLT terminator) for 0xC0/0xC1, CL for 0xD2/0xD3, and 1 for 0xD0/0xD1. Width
+        // is 8 for the byte opcodes, 32 with a 0x66 prefix, else 16; a 5-bit count
+        // never reaches 32, so dword shifts keep CF defined.
+        if matches!(reg, Some(4..=6)) {
+            let width_bits: u32 = if opcode & 1 == 0 {
+                8
+            } else if operand_size_override {
+                32
+            } else {
+                16
+            };
+            let count = match opcode {
+                0xc0 | 0xc1 => bytes.get(bytes.len().wrapping_sub(2)).copied().unwrap_or(0),
+                0xd0 | 0xd1 => 1,
+                _ => cl,
+            };
+            if u32::from(count & 0x1f) >= width_bits {
+                mask |= FLAG_CF;
+            }
+        }
+        return mask;
     }
+
+    if is_logic { FLAG_AF } else { 0 }
 }
 
 fn diffs(cpu: &Cpu386, bus: &FlatBus, expected: &TestState, undefined: u32) -> Vec<String> {
@@ -339,7 +367,8 @@ fn run_test(test: &CpuTest) -> Outcome {
         }
     }
 
-    let undefined = undefined_flags(&test.bytes);
+    let cl = (test.initial.regs.ecx.unwrap_or(0) & 0xff) as u8;
+    let undefined = undefined_flags(&test.bytes, cl);
     let differences = diffs(&cpu, &bus, &test.final_state, undefined);
     if differences.is_empty() {
         Outcome::Pass
@@ -371,25 +400,39 @@ fn parses_synthetic_fixture() {
 #[test]
 fn undefined_flags_marks_logic_ops() {
     const AF: u32 = 0x0000_0010;
-    assert_eq!(undefined_flags(&[0x20, 0xc0]), AF); // AND
-    assert_eq!(undefined_flags(&[0x84, 0xc0]), AF); // TEST
-    assert_eq!(undefined_flags(&[0x81, 0xe3, 0x01, 0x00]), AF); // AND group /4
-    assert_eq!(undefined_flags(&[0xf7, 0xc3, 0x01, 0x00]), AF); // TEST group /0
-    assert_eq!(undefined_flags(&[0x00, 0xc0]), 0); // ADD -> all defined
-    assert_eq!(undefined_flags(&[0x81, 0xc3, 0x01, 0x00]), 0); // ADD group /0
+    assert_eq!(undefined_flags(&[0x20, 0xc0], 0), AF); // AND
+    assert_eq!(undefined_flags(&[0x84, 0xc0], 0), AF); // TEST
+    assert_eq!(undefined_flags(&[0x81, 0xe3, 0x01, 0x00], 0), AF); // AND group /4
+    assert_eq!(undefined_flags(&[0xf7, 0xc3, 0x01, 0x00], 0), AF); // TEST group /0
+    assert_eq!(undefined_flags(&[0x00, 0xc0], 0), 0); // ADD -> all defined
+    assert_eq!(undefined_flags(&[0x81, 0xc3, 0x01, 0x00], 0), 0); // ADD group /0
 }
 
 #[test]
 fn undefined_flags_marks_shifts() {
+    // Bytes are written with the trailing 0xF4 HLT terminator the real vectors carry,
+    // so the imm8 count (the byte before HLT) lands where the helper reads it.
     const AF: u32 = 0x0000_0010;
     const OF: u32 = 0x0000_0800;
-    assert_eq!(undefined_flags(&[0xd0, 0xe0]), AF); // shl al,1: OF defined, AF undefined
-    assert_eq!(undefined_flags(&[0xd1, 0xe0]), AF); // shl ax,1: OF defined, AF undefined
-    assert_eq!(undefined_flags(&[0xc1, 0xe0, 0x04]), AF | OF); // shl ax,4: imm count
-    assert_eq!(undefined_flags(&[0xd2, 0xe0]), AF | OF); // shl al,cl: CL count
-    assert_eq!(undefined_flags(&[0xd3, 0xe0]), AF | OF); // shl ax,cl: CL count
-    assert_eq!(undefined_flags(&[0x66, 0xd1, 0xe0]), AF); // 0x66 skipped -> d1
-    assert_eq!(undefined_flags(&[0xc0, 0xc0, 0x01]), AF | OF); // rol al,1 via imm
+    const CF: u32 = 0x0000_0001;
+    // OF defined (count is a guaranteed 1), AF undefined, CF defined.
+    assert_eq!(undefined_flags(&[0xd0, 0xe0, 0xf4], 0), AF); // shl al,1
+    assert_eq!(undefined_flags(&[0xd1, 0xe0, 0xf4], 0), AF); // shl ax,1
+    assert_eq!(undefined_flags(&[0x66, 0xd1, 0xe0, 0xf4], 0), AF); // 0x66 skipped -> d1
+    // imm/CL counts below the operand width: AF|OF, CF still defined.
+    assert_eq!(undefined_flags(&[0xc1, 0xe0, 0x04, 0xf4], 0), AF | OF); // shl ax,4 (word)
+    assert_eq!(undefined_flags(&[0xd2, 0xe0, 0xf4], 7), AF | OF); // shl al,cl cl=7 (<8)
+    assert_eq!(undefined_flags(&[0xc0, 0xc0, 0x01, 0xf4], 0), AF | OF); // rol al,1 via imm
+    // count reaches the operand width: CF also undefined.
+    assert_eq!(undefined_flags(&[0xc0, 0xe0, 0x10, 0xf4], 0), AF | OF | CF); // shl al,16 (>=8)
+    assert_eq!(undefined_flags(&[0xc0, 0xe8, 0x10, 0xf4], 0), AF | OF | CF); // shr al,16 (>=8)
+    assert_eq!(undefined_flags(&[0xd2, 0xe0, 0xf4], 8), AF | OF | CF); // shl al,cl cl=8 (>=8)
+    assert_eq!(undefined_flags(&[0xc1, 0xe0, 0x10, 0xf4], 0), AF | OF | CF); // shl ax,16 (word >=16)
+    // dword (0x66): a 5-bit count never reaches 32, so CF stays defined.
+    assert_eq!(undefined_flags(&[0x66, 0xc1, 0xe0, 0x1f, 0xf4], 0), AF | OF); // shl eax,31 (<32)
+    // SAR and rotates keep CF defined at any count.
+    assert_eq!(undefined_flags(&[0xd2, 0xf8, 0xf4], 20), AF | OF); // sar al,cl cl=20
+    assert_eq!(undefined_flags(&[0xd2, 0xd8, 0xf4], 20), AF | OF); // rcr al,cl cl=20
 }
 
 #[test]
