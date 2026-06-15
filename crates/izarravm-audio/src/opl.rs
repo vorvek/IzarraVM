@@ -213,15 +213,24 @@ impl Operator {
         self.advance_with_lfo(0, false);
     }
 
-    /// Advance the phase, optionally applying vibrato. `vibrato_lfo` is the
-    /// global pitch LFO in [-256, 256]; when VIB is enabled it bends the
-    /// F-number by `(fnum >> 7) * lfo / 256` (>> 8 for shallow vibrato), i.e.
-    /// about +/-14 or +/-7 cents at the peak.
-    pub(crate) fn advance_with_lfo(&mut self, vibrato_lfo: i32, deep_vibrato: bool) {
+    /// Advance the phase, optionally applying vibrato. `vibrato_phase` is the
+    /// global 0..7 pitch-LFO phase. When VIB is enabled the F-number is bent by
+    /// an 8-step triangle whose peak adds `fnum >> 7` and whose half-steps add
+    /// `fnum >> 8` (each one bit shallower for non-deep vibrato), giving about
+    /// +/-14 or +/-7 cents.
+    pub(crate) fn advance_with_lfo(&mut self, vibrato_phase: u8, deep_vibrato: bool) {
         let mut fnum = i32::from(self.fnum);
         if self.vibrato {
-            let shift = if deep_vibrato { 7 } else { 8 };
-            fnum += (i32::from(self.fnum) >> shift) * vibrato_lfo / 256;
+            let (half_shift, peak_shift) = if deep_vibrato { (8, 7) } else { (9, 8) };
+            let half = i32::from(self.fnum) >> half_shift;
+            let peak = i32::from(self.fnum) >> peak_shift;
+            fnum += match vibrato_phase {
+                1 | 3 => half,
+                2 => peak,
+                5 | 7 => -half,
+                6 => -peak,
+                _ => 0, // phases 0 and 4
+            };
         }
         let inc = self.phase_increment(fnum.clamp(0, 0x3ff) as u32);
         self.phase = self.phase.wrapping_add(inc) & 0x000f_ffff;
@@ -449,9 +458,9 @@ fn channel_operators(channel: usize) -> (usize, usize) {
 /// Nth pair here.
 const FOUR_OP_PRIMARY: [usize; 6] = [0, 1, 2, 9, 10, 11];
 
-/// LFO periods in samples at the 49716 Hz rate: tremolo 3.7 Hz, vibrato 6.1 Hz.
+/// Tremolo LFO period in samples at 49716 Hz (3.7 Hz). Vibrato uses a power-of-2
+/// 8-phase counter (`eg_counter >> 10`, 8192 samples ~= 6.07 Hz) instead.
 const TREMOLO_PERIOD: u32 = 13437;
-const VIBRATO_PERIOD: u32 = 8150;
 
 /// Whether `channel` is the primary half of an active 4-op voice (renders all
 /// four operators) under the reg 0x104 `mask`.
@@ -597,20 +606,10 @@ impl OplChip {
         (up * peak / half) as u16
     }
 
-    /// Vibrato (pitch) LFO for the current phase: a triangle in [-256, 256] at
-    /// 6.1 Hz. The per-operator depth (reg 0xBD bit6) is applied in
-    /// `advance_with_lfo`.
-    fn vibrato_lfo(&self) -> i32 {
-        let pos = (self.eg_counter % VIBRATO_PERIOD) as i32;
-        let period = VIBRATO_PERIOD as i32;
-        let quarter = period / 4;
-        if pos < quarter {
-            pos * 256 / quarter
-        } else if pos < 3 * quarter {
-            256 - (pos - quarter) * 256 / quarter
-        } else {
-            (pos - period) * 256 / quarter
-        }
+    /// Vibrato (pitch) LFO phase 0..7 at ~6.07 Hz (one step per 1024 samples).
+    /// The per-operator F-number bend is applied in `advance_with_lfo`.
+    fn vibrato_phase(&self) -> u8 {
+        ((self.eg_counter >> 10) & 7) as u8
     }
 
     fn deep_vibrato(&self) -> bool {
@@ -726,7 +725,7 @@ impl OplChip {
             }
         };
 
-        let (vibrato, deep) = (self.vibrato_lfo(), self.deep_vibrato());
+        let (vibrato, deep) = (self.vibrato_phase(), self.deep_vibrato());
         for op in [op1, op2, op3, op4] {
             self.operators[op].advance_with_lfo(vibrato, deep);
         }
@@ -766,7 +765,7 @@ impl OplChip {
             self.operators[carrier].sample_modulated(modulator_out, carrier_att)
         };
 
-        let (vibrato, deep) = (self.vibrato_lfo(), self.deep_vibrato());
+        let (vibrato, deep) = (self.vibrato_phase(), self.deep_vibrato());
         self.operators[modulator].advance_with_lfo(vibrato, deep);
         self.operators[carrier].advance_with_lfo(vibrato, deep);
         output
@@ -1491,6 +1490,26 @@ mod tests {
         };
         assert_eq!(render(0x00, 0x40), render(0x00, 0x00), "no vibrato when VIB is off");
         assert_ne!(render(0x40, 0x40), render(0x00, 0x40), "VIB bends the pitch");
+    }
+
+    #[test]
+    fn vibrato_bends_the_fnumber_to_the_full_step_depth() {
+        // One sample of phase advance equals the bent F-number's increment.
+        // block 4, multiple x1: increment = fnum << 4. Deep vibrato adds
+        // fnum>>7 at the peak (phase 2) and fnum>>8 at the half-steps; the
+        // shallow setting is one bit weaker. (Regression: depth was halved.)
+        let fnum = 0x200u32;
+        let advance = |phase: u8, deep: bool| {
+            let mut op = sine_operator(fnum as u16, 4, 0);
+            op.set_vibrato(true);
+            op.advance_with_lfo(phase, deep);
+            op.phase
+        };
+        assert_eq!(advance(0, true), fnum << 4, "phase 0: no bend");
+        assert_eq!(advance(2, true), (fnum + (fnum >> 7)) << 4, "deep peak = +fnum>>7");
+        assert_eq!(advance(6, true), (fnum - (fnum >> 7)) << 4, "deep trough = -fnum>>7");
+        assert_eq!(advance(1, true), (fnum + (fnum >> 8)) << 4, "deep half-step = +fnum>>8");
+        assert_eq!(advance(2, false), (fnum + (fnum >> 8)) << 4, "shallow peak = +fnum>>8");
     }
 
     #[test]
