@@ -38,6 +38,25 @@ talks to the engine through the register block to move pixels without the CPU.
 The legacy VGA text mode and mode 13h remain available and are unchanged. They
 are documented with the rest of the VGA core, not here.
 
+### 1.1 Datasheet
+
+| Parameter | Value |
+|-----------|-------|
+| Host interface | 66 MHz, 32-bit, bus-mastering port to the custom chipset (PCI derived) |
+| Host bandwidth | about 266 MB/s peak |
+| Margo core clock | 100 MHz |
+| Frame store | 4 MB SGRAM, 128-bit, 100 MHz, shared with Distira |
+| Memory bandwidth | about 1.6 GB/s |
+| RAMDAC | 206 MHz, integrated |
+| 2D solid fill | up to about 200 Mpixels/s |
+| 2D screen-to-screen blit | up to about 100 Mpixels/s |
+| Maximum mode | 1024x768 at 32-bit color |
+| Process | 350 nm |
+
+These are rated figures. The emulator does not model graphics timing
+cycle-for-cycle, so the fill and blit rates describe the part, not the emulated
+behavior (section 9).
+
 ---
 
 ## 2. Physical memory map
@@ -155,7 +174,7 @@ Offsets below are relative to the block base.
 | `0x0000` | `ID` | R | Identity and interface version. Reads `0x4D470100`: `0x4D47` is the Margo signature, the low half is version 1.00. |
 | `0x0004` | `CAPS` | R | Feature bitmap. A driver reads it to learn which operations this build implements. See below. |
 | `0x0008` | `STATUS` | R | Bit 0 `BUSY`: the blit engine is working. Bit 1 `FIFO_FULL`: reserved, reads 0. |
-| `0x000C` | `CONTROL` | R/W | Bit 0 `RESET`: write 1 to abort the current operation and clear the engine. Self-clearing. Other bits reserved, write 0. |
+| `0x000C` | `CONTROL` | R/W | Bit 0 `RESET`: write 1 to abort the current operation and clear the engine, self-clearing. Bit 1 `DITHER_EN`: dither wherever color precision drops (section 7.10). Other bits reserved, write 0. |
 
 `CAPS` bits:
 
@@ -171,6 +190,8 @@ Offsets below are relative to the block base.
 | 7 | `PATTERN_FILL` available |
 | 8 | Hardware cursor available |
 | 9 | Video overlay available |
+| 10 | DMA pusher available |
+| 11 | Hardware dithering available |
 
 The register map in this manual is fixed. `CAPS` reports which parts the running
 build implements, so a driver written against the full map degrades cleanly on
@@ -323,6 +344,43 @@ destination size, converts YUV to RGB, and presents it. With `KEY_EN`, an
 application paints `OVL_COLORKEY` into its video window, and the overlay shows
 there, hidden wherever another window draws over the key. Chroma is upsampled for
 the 4:2:0 format.
+
+### 7.9 DMA pusher
+
+The pusher is a bus-master command engine. Rather than write registers one at a
+time, a driver builds a stream of commands in a ring buffer in system memory and
+lets Margo read and run them. This keeps the CPU off the bus during long
+sequences of operations, which is what holds the desktop together on a throttled
+CPU.
+
+| Offset | Name | Access | Description |
+|--------|------|--------|-------------|
+| `0x0080` | `PUSH_CTRL` | R/W | Bit 0 `ENABLE`. |
+| `0x0084` | `PUSH_BASE` | R/W | System physical address of the command ring, 16-byte aligned. |
+| `0x0088` | `PUSH_SIZE` | R/W | Ring size in bytes, a power of two. |
+| `0x008C` | `PUSH_PUT` | R/W | Byte offset into the ring of the end of submitted commands. Writing it is the doorbell that runs the pusher. |
+| `0x0090` | `PUSH_GET` | R | The pusher's current read offset. Equals `PUSH_PUT` when the ring is drained. |
+
+The ring holds 32-bit words. Each command starts with a header word:
+
+    header = (count << 16) | method
+
+`method` (bits 15..0) is a byte offset into this register block, a multiple of 4.
+`count` (bits 31..16) is the number of data words that follow. The pusher writes
+the data words to `method`, `method + 4`, `method + 8`, and so on, exactly as if
+the CPU had written those registers in order. A write to `COMMAND` (offset
+`0x0150`) through the pusher starts an operation just like a direct write. The
+pusher advances `PUSH_GET` past each consumed word, wraps at `PUSH_SIZE`, and
+stops when `GET` reaches `PUT`. Scattered writes use one header per register, a
+`count` of 1; a contiguous run uses a single header.
+
+### 7.10 Dithering
+
+When `CONTROL.DITHER_EN` is set, Margo applies an ordered 4x4 dither wherever it
+reduces color precision: higher-precision color written into a 15 or 16-bit
+surface by the blit engine, and the video overlay presented on a 15 or 16-bit
+display. Dithering trades a little spatial noise for the absence of banding. It
+has no effect on 32-bit surfaces, where no precision is lost.
 
 ---
 

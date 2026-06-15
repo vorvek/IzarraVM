@@ -304,6 +304,55 @@ void show_overlay(unsigned long y_offset, int src_pitch, int sw, int sh,
 }
 ```
 
+## Driving the engine by DMA
+
+On a busy redraw, writing every register from the CPU is the slow part, not the
+drawing. The DMA pusher lets you build a batch of operations in a ring buffer in
+memory and hand the whole thing to Margo at once. Each command is a header word,
+`(count << 16) | method`, followed by `count` data words that land in consecutive
+registers.
+
+```c
+/* (target) */
+static unsigned long ring[256];          /* system memory, 16-byte aligned */
+
+#define PKT(count, method) (((unsigned long)(count) << 16) | (method))
+
+void start_pusher(void) {
+    REG(0x0084) = (unsigned long)ring;   /* PUSH_BASE */
+    REG(0x0088) = sizeof(ring);          /* PUSH_SIZE */
+    REG(0x0080) = 1;                     /* PUSH_CTRL = ENABLE */
+}
+
+/* Queue a solid fill into the ring, then ring the doorbell. */
+void fill_via_pusher(int *put, unsigned long base, int pitch, int bpp,
+                     int x, int y, int w, int h, unsigned long color) {
+    int i = *put / 4;
+    ring[i++] = PKT(3, 0x0100);          /* DST_BASE, DST_PITCH, SRC_BASE */
+    ring[i++] = base;
+    ring[i++] = pitch;
+    ring[i++] = base;                    /* SRC_BASE: unused by fill */
+    ring[i++] = PKT(1, 0x0110); ring[i++] = bpp / 8;          /* DEPTH */
+    ring[i++] = PKT(1, 0x0114); ring[i++] = (y << 16) | x;    /* DST_XY */
+    ring[i++] = PKT(1, 0x011C); ring[i++] = (h << 16) | w;    /* DIM */
+    ring[i++] = PKT(1, 0x0120); ring[i++] = color;            /* FG_COLOR */
+    ring[i++] = PKT(1, 0x0128); ring[i++] = 0xF0;             /* ROP = PATCOPY */
+    ring[i++] = PKT(1, 0x0150); ring[i++] = 0x01;             /* COMMAND = FILL */
+    *put = i * 4;
+    REG(0x008C) = *put;                  /* PUSH_PUT: doorbell, the pusher runs */
+}
+```
+
+## Dithering
+
+In a 15 or 16-bit mode, true-color images and the scaled video overlay can band.
+Set `DITHER_EN` in `CONTROL` once and Margo dithers them as it writes.
+
+```c
+/* (target) */
+REG(0x000C) = 0x02;     /* CONTROL: DITHER_EN */
+```
+
 ## Putting it together
 
 A desktop redraw is these primitives in sequence: fill the background, copy
