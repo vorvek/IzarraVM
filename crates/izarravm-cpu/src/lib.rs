@@ -831,7 +831,8 @@ impl Cpu386 {
             }
             0xc2 => {
                 // RET near, release imm16 bytes of arguments. The release count is always a
-                // 16-bit immediate; the operand size only selects the offset pop width.
+                // 16-bit immediate fetched from the instruction stream before the return
+                // address is popped; the operand size only selects the offset pop width.
                 let release = self.fetch_u16(bus)?;
                 let target = self.pop(bus, operand_size)?;
                 self.registers.eip = target & operand_size.mask();
@@ -5000,5 +5001,29 @@ mod tests {
         assert_eq!(cpu.registers.cs().selector, 0x3000);
         assert_eq!(cpu.registers.eip, 0x0100);
         assert_eq!(cpu.read_gpr16(4), 0x00fc); // pushed CS then return IP
+    }
+
+    #[test]
+    fn retf_32bit_pops_full_eip_and_preserves_high_esp() {
+        // 0x66 0xcb (32-bit RETF). Pops EIP (dword, not masked to 16) then CS
+        // (dword, truncated to the selector). On the real-mode 16-bit stack only
+        // SP moves, so ESP[31:16] is preserved.
+        let mut memory = vec![0; 1024];
+        memory[0..2].copy_from_slice(&[0x66, 0xcb]);
+        memory[0x100..0x104].copy_from_slice(&0x0001_2345u32.to_le_bytes()); // EIP
+        memory[0x104..0x108].copy_from_slice(&0x0000_3000u32.to_le_bytes()); // CS
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0xcafe_0100);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.cs().selector, 0x3000);
+        assert_eq!(cpu.registers.eip, 0x0001_2345);
+        // sp 0x0100 -> +8 (two dword pops) = 0x0108, high half preserved
+        assert_eq!(cpu.registers.esp(), 0xcafe_0108);
     }
 }
