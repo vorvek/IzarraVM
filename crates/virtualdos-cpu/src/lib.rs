@@ -4040,6 +4040,7 @@ mod tests {
         cpu.load_segment_real(SegmentIndex::Ds, 0);
         cpu.load_segment_real(SegmentIndex::Es, 0);
         cpu.registers.eip = 0;
+        cpu.set_flag(FLAG_DF, false);
         cpu.registers.set_esi(0x100);
         cpu.registers.set_edi(0x200);
         let mut bus = TestBus::with_memory(memory);
@@ -4048,6 +4049,8 @@ mod tests {
 
         assert!(!cpu.flag(FLAG_ZF));
         assert!(cpu.flag(FLAG_CF)); // 0x10 < 0x20
+        assert_eq!(cpu.registers.esi(), 0x101); // si advances even when unequal
+        assert_eq!(cpu.registers.edi(), 0x201);
     }
 
     #[test]
