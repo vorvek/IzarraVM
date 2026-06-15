@@ -5204,6 +5204,25 @@ mod tests {
     }
 
     #[test]
+    fn movzx_reads_byte_from_memory_source() {
+        // movzx ax, byte [0x40] (0x0f 0xb6 0x06 0x40 0x00, modrm mod=00 rm=110 disp16):
+        // [ds:0x40]=0x80 -> ax=0x0080. Exercises the memory-source decode path that the
+        // register-operand tests do not, since the conformance vectors are not in CI.
+        let mut memory = vec![0; 128];
+        memory[0..5].copy_from_slice(&[0x0f, 0xb6, 0x06, 0x40, 0x00]);
+        memory[0x40] = 0x80;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x0080);
+    }
+
+    #[test]
     fn setz_sets_byte_when_zf_set() {
         // setz bl (0x0f 0x94 0xc3): ZF=1 -> bl=1. bl preset 0xff to prove it is overwritten.
         let mut memory = vec![0; 64];
