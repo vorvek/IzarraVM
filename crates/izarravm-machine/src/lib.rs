@@ -3,7 +3,7 @@ use izarravm_bus::{BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CpuBus
 use izarravm_core::{CpuPreset, HardwareProfile, VideoCard};
 use izarravm_cpu::{Cpu386, CpuError, SegmentIndex, SegmentRegister};
 use izarravm_video::{
-    Framebuffer, MODE13H_MEMORY_SIZE, TextFrame, VGA_MODE13H_BASE, VGA_TEXT_BASE,
+    DAC_ENTRIES, Framebuffer, MODE13H_MEMORY_SIZE, TextFrame, VGA_MODE13H_BASE, VGA_TEXT_BASE,
     VGA_TEXT_MEMORY_SIZE, VgaTextMode, VideoMode,
 };
 use thiserror::Error;
@@ -222,7 +222,7 @@ impl Machine {
         self.video.active_mode() == VideoMode::Mode13h
     }
 
-    pub fn palette_argb(&self) -> [u32; 256] {
+    pub fn palette_argb(&self) -> [u32; DAC_ENTRIES] {
         self.video.palette_argb()
     }
 
