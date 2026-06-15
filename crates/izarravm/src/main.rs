@@ -8,7 +8,7 @@ use izarravm_dos::{DosKernelServices, HostDrive};
 use izarravm_firmware::{boot_test_image, parse_result_block, test_rom};
 use izarravm_input::InputState;
 use izarravm_machine::{Machine, MachineProfile, StopReason};
-use izarravm_video::{PlaceholderVideoAdapter, TextFrame, VideoAdapter};
+use izarravm_video::{Framebuffer, PlaceholderVideoAdapter, TextFrame, VideoAdapter};
 use std::error::Error;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -26,6 +26,7 @@ const TEXT_SCALE: usize = 2;
 const OPL_NATIVE_HZ: f64 = 49_716.0;
 const WINDOW_WIDTH: u32 = 1280;
 const WINDOW_HEIGHT: u32 = 400;
+const MODE13H_SCALE: usize = 2;
 const VGA_PALETTE: [u32; 16] = [
     0x000000, 0x0000aa, 0x00aa00, 0x00aaaa, 0xaa0000, 0xaa00aa, 0xaa5500, 0xaaaaaa, 0x555555,
     0x5555ff, 0x55ff55, 0x55ffff, 0xff5555, 0xff55ff, 0xffff55, 0xffffff,
@@ -272,7 +273,7 @@ impl ApplicationHandler for WindowApp {
         if budget > 0 {
             let reason = tick_machine(&mut self.machine, budget);
             self.pump_audio();
-            self.rendered_screen = render_text_frame(&self.machine.screen_text());
+            self.rendered_screen = self.render_current_frame();
             if let Some(reason) = reason {
                 self.finish(reason);
                 event_loop.set_control_flow(ControlFlow::Wait);
@@ -323,6 +324,17 @@ impl WindowApp {
             window.set_title(&format!("{} - {reason:?}", self.title));
         }
         self.stop_reason = Some(reason);
+    }
+
+    fn render_current_frame(&self) -> RenderedFrame {
+        if self.machine.is_graphics_mode() {
+            render_mode13h(
+                self.machine.mode13h_framebuffer(),
+                &self.machine.palette_argb(),
+            )
+        } else {
+            render_text_frame(&self.machine.screen_text())
+        }
     }
 
     fn redraw(&mut self) {
@@ -425,6 +437,32 @@ fn render_text_frame(frame: &TextFrame) -> RenderedFrame {
     }
 }
 
+fn render_mode13h(framebuffer: &Framebuffer, palette: &[u32; 256]) -> RenderedFrame {
+    let source_width = framebuffer.width as usize;
+    let width = source_width * MODE13H_SCALE;
+    let height = framebuffer.height as usize * MODE13H_SCALE;
+    let mut pixels = vec![palette[0]; width * height];
+
+    for (pixel_index, &index) in framebuffer.indexed_pixels.iter().enumerate() {
+        let source_x = pixel_index % source_width;
+        let source_y = pixel_index / source_width;
+        let color = palette[usize::from(index)];
+        for scale_y in 0..MODE13H_SCALE {
+            for scale_x in 0..MODE13H_SCALE {
+                let x = source_x * MODE13H_SCALE + scale_x;
+                let y = source_y * MODE13H_SCALE + scale_y;
+                pixels[y * width + x] = color;
+            }
+        }
+    }
+
+    RenderedFrame {
+        width,
+        height,
+        pixels,
+    }
+}
+
 fn blit_centered(
     source: &RenderedFrame,
     target: &mut [u32],
@@ -490,6 +528,20 @@ mod tests {
                 .iter()
                 .any(|pixel| *pixel == VGA_PALETTE[15])
         );
+    }
+
+    #[test]
+    fn mode13h_renderer_maps_indices_through_palette() {
+        let mut framebuffer = Framebuffer::mode13h();
+        framebuffer.indexed_pixels[0] = 1;
+        let mut palette = [0u32; 256];
+        palette[1] = 0x00AB_CDEF;
+
+        let rendered = render_mode13h(&framebuffer, &palette);
+
+        assert_eq!(rendered.width, 320 * MODE13H_SCALE);
+        assert_eq!(rendered.height, 200 * MODE13H_SCALE);
+        assert_eq!(rendered.pixels[0], 0x00AB_CDEF);
     }
 
     #[test]
