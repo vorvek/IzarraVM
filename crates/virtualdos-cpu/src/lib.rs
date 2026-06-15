@@ -773,7 +773,7 @@ impl Cpu386 {
                 let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
                 let value = u32::from(self.read_operand_u8(bus, operand)?);
                 match modrm.reg {
-                    2 => self.write_operand_u8(bus, operand, !(value as u8))?, // NOT
+                    2 => self.write_operand_u8(bus, operand, !(value as u8))?, // NOT: no flags changed
                     3 => {
                         // NEG: flags like 0 - operand (CF set unless operand is 0).
                         let result = self.alu_sub(0, value, 0, BusWidth::Byte) as u8;
@@ -802,8 +802,14 @@ impl Cpu386 {
                 let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
                 let value = self.read_operand_sized(bus, operand, operand_size)?;
                 match modrm.reg {
-                    2 => self.write_operand_sized(bus, operand, operand_size, !value)?, // NOT
+                    2 => {
+                        // NOT: bitwise complement, no flags changed. Mask like every
+                        // other write_operand_sized caller so no high bits are passed.
+                        let result = !value & operand_size.mask();
+                        self.write_operand_sized(bus, operand, operand_size, result)?;
+                    }
                     3 => {
+                        // NEG: flags like 0 - operand (CF set unless operand is 0).
                         let result = self.alu_sub(0, value, 0, operand_size.bus_width());
                         self.write_operand_sized(bus, operand, operand_size, result)?;
                     }
@@ -3295,10 +3301,12 @@ mod tests {
         cpu.load_segment_real(SegmentIndex::Cs, 0);
         cpu.registers.eip = 0;
         cpu.write_reg16(Reg16::Bx, 0x0ff0);
+        cpu.set_flag(FLAG_CF, true);
         let mut bus = TestBus::with_memory(memory);
 
         cpu.cycle(&mut bus).unwrap();
 
         assert_eq!(cpu.read_reg16(Reg16::Bx), 0xf00f);
+        assert!(cpu.flag(FLAG_CF)); // NOT touches no flags
     }
 }
