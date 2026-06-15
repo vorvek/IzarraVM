@@ -1,9 +1,11 @@
 use izarravm_core::{AudioConfig, MidiBackend};
 
 mod opl;
+mod output;
 mod resample;
 
 pub use opl::OplChip;
+pub use output::AudioPlayer;
 pub use resample::Resampler;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
