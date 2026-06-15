@@ -389,26 +389,32 @@ fn eg_increment(effective_rate: u8, counter: u32) -> u16 {
     }
 }
 
-/// Register slot offset for each of the 18 operators. The OPL leaves gaps at
-/// offsets 6,7,14,15 (and 22+), so operator i reads its registers at
-/// `base + OPERATOR_SLOT[i]`.
+/// Register slot offset for the 18 operators in one bank. The OPL leaves gaps at
+/// offsets 6,7,14,15, so operator `i` reads its registers at
+/// `base + OPERATOR_SLOT[i % 18]`; the second bank repeats the same offsets.
 const OPERATOR_SLOT: [usize; 18] = [
     0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 13, 16, 17, 18, 19, 20, 21,
 ];
 
-/// The (modulator, carrier) operator indices for a 2-op channel (0..9).
+/// The (modulator, carrier) operator indices for a 2-op channel (0..18).
+/// Channels 0-8 live in bank 0 (operators 0-17), 9-17 in bank 1 (18-35).
 fn channel_operators(channel: usize) -> (usize, usize) {
-    let base = (channel / 3) * 6 + (channel % 3);
+    let local = channel % 9;
+    let base = (channel / 9) * 18 + (local / 3) * 6 + (local % 3);
     (base, base + 3)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OplChip {
-    registers: [u8; 256],
-    address: u8,
+    /// Two register banks: 0 = primary (ports 0x388/0x389, channels 0-8),
+    /// 1 = secondary (ports 0x38A/0x38B, channels 9-17 and the OPL3 control
+    /// registers 0x104 four-op-enable / 0x105 NEW).
+    registers: [[u8; 256]; 2],
+    /// Latched register address per bank (port base+0 / base+2).
+    address: [u8; 2],
     timer1: Timer,
     timer2: Timer,
-    operators: [Operator; 18],
+    operators: [Operator; 36],
     eg_counter: u32,
 }
 
@@ -458,11 +464,11 @@ impl Timer {
 impl Default for OplChip {
     fn default() -> Self {
         Self {
-            registers: [0; 256],
-            address: 0,
+            registers: [[0; 256]; 2],
+            address: [0, 0],
             timer1: Timer::new(80),
             timer2: Timer::new(320),
-            operators: Default::default(),
+            operators: std::array::from_fn(|_| Operator::default()),
             eg_counter: 0,
         }
     }
@@ -470,13 +476,19 @@ impl Default for OplChip {
 
 impl OplChip {
     pub fn register(&self, index: u8) -> u8 {
-        self.registers[index as usize]
+        self.registers[0][index as usize]
     }
 
-    /// Write a chip register, applying the side effects of the timer-control
-    /// register (0x04) and storing everything else verbatim for later synthesis.
+    /// Write a primary-bank register (port 0x389). OPL2 programs and AdLib
+    /// detection use this; OPL3 secondary-bank writes arrive via `write_port`.
     pub fn write_register(&mut self, index: u8, value: u8) {
-        if index == 0x04 {
+        self.write_bank(0, index, value);
+    }
+
+    /// Write `value` into `bank`'s register `index`, applying the timer-control
+    /// side effects (primary 0x04 only) and storing everything else verbatim.
+    fn write_bank(&mut self, bank: usize, index: u8, value: u8) {
+        if bank == 0 && index == 0x04 {
             // bit0/bit1: start timer 1/2 (rising edge reloads from preset).
             // bit7: reset both overflow flags.
             if value & 0x80 != 0 {
@@ -486,38 +498,48 @@ impl OplChip {
             let start1 = value & 0x01 != 0;
             let start2 = value & 0x02 != 0;
             if start1 && !self.timer1.running {
-                self.timer1.start(self.registers[0x02]);
+                self.timer1.start(self.registers[0][0x02]);
             } else {
                 self.timer1.running = start1;
             }
             if start2 && !self.timer2.running {
-                self.timer2.start(self.registers[0x03]);
+                self.timer2.start(self.registers[0][0x03]);
             } else {
                 self.timer2.running = start2;
             }
         }
 
-        self.registers[index as usize] = value;
+        self.registers[bank][index as usize] = value;
     }
 
-    /// Render one mono sample at the chip's native 49716 Hz rate, summing the
-    /// nine 2-op channels. (OPL3 4-op/stereo and rhythm mode are added in later
-    /// layers.) The global envelope counter ticks once per sample.
+    /// OPL3 mode (reg 0x105 bit0 / NEW): enables 18 channels, 8 waveforms and
+    /// stereo. Cleared by default, where the chip behaves as an OPL2.
+    fn opl3_enabled(&self) -> bool {
+        self.registers[1][0x05] & 0x01 != 0
+    }
+
+    /// Render one mono sample at the chip's native 49716 Hz rate. OPL3 mode sums
+    /// all 18 two-op channels; otherwise the 9 OPL2 channels. (Stereo, 4-op and
+    /// rhythm mode are added in later layers.) The EG counter ticks per sample.
     pub fn render_sample(&mut self) -> i32 {
         self.eg_counter = self.eg_counter.wrapping_add(1);
-        (0..9).map(|channel| self.render_channel(channel)).sum()
+        let channels = if self.opl3_enabled() { 18 } else { 9 };
+        (0..channels).map(|channel| self.render_channel(channel)).sum()
     }
 
     fn render_channel(&mut self, channel: usize) -> i32 {
-        let note_select = self.registers[0x08] & 0x40 != 0;
+        let note_select = self.registers[0][0x08] & 0x40 != 0;
+        let bank = channel / 9;
+        let ch = channel % 9;
+        let c0 = self.registers[bank][0xc0 + ch];
         let (modulator, carrier) = channel_operators(channel);
         self.load_operator(modulator, channel);
         self.load_operator(carrier, channel);
-        self.operators[modulator].set_feedback((self.registers[0xc0 + channel] >> 1) & 0x07);
+        self.operators[modulator].set_feedback((c0 >> 1) & 0x07);
         self.operators[modulator].advance_envelope(self.eg_counter, note_select);
         self.operators[carrier].advance_envelope(self.eg_counter, note_select);
 
-        let additive = self.registers[0xc0 + channel] & 0x01 != 0;
+        let additive = c0 & 0x01 != 0;
         let modulator_att = self.operators[modulator].eg_attenuation();
         let modulator_out = self.operators[modulator].render_feedback(modulator_att);
         let output = if additive {
@@ -533,19 +555,29 @@ impl OplChip {
     }
 
     /// Refresh one operator's parameters from its registers, preserving phase
-    /// and envelope state.
+    /// and envelope state. The operator and its channel share a bank.
     fn load_operator(&mut self, operator: usize, channel: usize) {
-        let slot = OPERATOR_SLOT[operator];
-        let fnum = u16::from(self.registers[0xa0 + channel])
-            | ((u16::from(self.registers[0xb0 + channel]) & 0x03) << 8);
-        let block = (self.registers[0xb0 + channel] >> 2) & 0x07;
-        let r20 = self.registers[0x20 + slot];
-        let r40 = self.registers[0x40 + slot];
+        let bank = channel / 9;
+        let ch = channel % 9;
+        let slot = OPERATOR_SLOT[operator % 18];
+        let regs = &self.registers[bank];
+        let fnum = u16::from(regs[0xa0 + ch]) | ((u16::from(regs[0xb0 + ch]) & 0x03) << 8);
+        let block = (regs[0xb0 + ch] >> 2) & 0x07;
+        let r20 = regs[0x20 + slot];
+        let r40 = regs[0x40 + slot];
         let total_level = r40 & 0x3f;
-        let waveform = self.registers[0xe0 + slot] & 0x07;
-        let ad = self.registers[0x60 + slot];
-        let sr = self.registers[0x80 + slot];
-        let key_on = self.registers[0xb0 + channel] & 0x20 != 0;
+        let ad = regs[0x60 + slot];
+        let sr = regs[0x80 + slot];
+        let key_on = regs[0xb0 + ch] & 0x20 != 0;
+        // Waveform select is gated: forced to sine unless WSEnable (0x01 bit5);
+        // waveforms 4-7 only exist in OPL3 mode (NEW), else masked to 0-3.
+        let waveform = if self.registers[0][0x01] & 0x20 == 0 {
+            0
+        } else if self.opl3_enabled() {
+            regs[0xe0 + slot] & 0x07
+        } else {
+            regs[0xe0 + slot] & 0x03
+        };
 
         let op = &mut self.operators[operator];
         op.set_frequency(fnum, block);
@@ -568,7 +600,7 @@ impl OplChip {
 
     /// Advance the hardware timers by `micros` microseconds of chip time.
     pub fn advance_micros(&mut self, micros: u64) {
-        let (preset1, preset2) = (self.registers[0x02], self.registers[0x03]);
+        let (preset1, preset2) = (self.registers[0][0x02], self.registers[0][0x03]);
         self.timer1.advance(micros, preset1);
         self.timer2.advance(micros, preset2);
     }
@@ -577,7 +609,7 @@ impl OplChip {
     /// A timer's overflow flag is always reported; the mask bits in register
     /// 0x04 (bit6 = timer 1, bit5 = timer 2) only gate the IRQ line.
     pub fn status(&self) -> u8 {
-        let control = self.registers[0x04];
+        let control = self.registers[0][0x04];
         let t1_irq = self.timer1.expired && control & 0x40 == 0;
         let t2_irq = self.timer2.expired && control & 0x20 == 0;
         ((t1_irq || t2_irq) as u8) << 7
@@ -587,23 +619,21 @@ impl OplChip {
 
     pub fn read_port(&self, port: u16) -> Option<u8> {
         match port {
-            0x0388 => Some(self.status()),
+            // The status byte is mirrored on both base+0 and base+2.
+            0x0388 | 0x038a => Some(self.status()),
             _ => None,
         }
     }
 
     pub fn write_port(&mut self, port: u16, value: u8) -> bool {
         match port {
-            0x0388 => {
-                self.address = value;
-                true
-            }
-            0x0389 => {
-                self.write_register(self.address, value);
-                true
-            }
-            _ => false,
+            0x0388 => self.address[0] = value,
+            0x0389 => self.write_bank(0, self.address[0], value),
+            0x038a => self.address[1] = value,
+            0x038b => self.write_bank(1, self.address[1], value),
+            _ => return false,
         }
+        true
     }
 }
 
@@ -1012,6 +1042,59 @@ mod tests {
             scaled * 10 < loud,
             "KSL=3 at block 6 must strongly attenuate: {scaled} vs {loud}"
         );
+    }
+
+    // Write `value` into secondary-bank register `index` via ports 0x38A/0x38B.
+    fn write_secondary(opl: &mut OplChip, index: u8, value: u8) {
+        opl.write_port(0x38a, index);
+        opl.write_port(0x38b, value);
+    }
+
+    #[test]
+    fn opl3_mode_unlocks_the_secondary_bank_channels() {
+        // Channel 9 lives in the secondary bank; it is silent until OPL3 mode
+        // (reg 0x105 / NEW) is enabled and the chip renders all 18 channels.
+        let setup = |opl: &mut OplChip| {
+            write_secondary(opl, 0x23, 0x21); // carrier (op 21): sustained, multiple x1
+            write_secondary(opl, 0x43, 0x00); // carrier total level 0
+            write_secondary(opl, 0x63, 0xf0); // attack 15 (instant)
+            write_secondary(opl, 0x83, 0x00);
+            write_secondary(opl, 0xa0, 0x00); // channel 9 f-number low
+            write_secondary(opl, 0xc0, 0x01); // additive
+            write_secondary(opl, 0xb0, 0x20 | (4 << 2) | 0x02); // key-on, block 4, fnum 0x200
+        };
+        let peak = |opl: &mut OplChip| (0..256).map(|_| opl.render_sample().abs()).max().unwrap();
+
+        let mut off = OplChip::default();
+        setup(&mut off);
+        assert_eq!(peak(&mut off), 0, "secondary channel is silent without OPL3 mode");
+
+        let mut on = OplChip::default();
+        write_secondary(&mut on, 0x05, 0x01); // NEW: enable OPL3 mode
+        setup(&mut on);
+        assert!(peak(&mut on) > 1000, "secondary channel sounds in OPL3 mode");
+    }
+
+    #[test]
+    fn waveform_select_requires_wsenable() {
+        // A half-sine (E0=1) silences the wave's negative half, but only when
+        // WSEnable (reg 0x01 bit5) is set; otherwise the chip forces a full sine.
+        let has_negative = |wse: u8| {
+            let mut opl = OplChip::default();
+            opl.write_register(0x01, wse); // 0x20 = WSEnable, 0x00 = off
+            opl.write_register(0x20, 0x01); // modulator multiple x1
+            opl.write_register(0x40, 0x00); // modulator loud
+            opl.write_register(0x60, 0xf0); // modulator instant attack
+            opl.write_register(0x80, 0x00);
+            opl.write_register(0x63, 0x00); // carrier attack 0 -> stays silent
+            opl.write_register(0xe0, 0x01); // modulator waveform: half-sine
+            opl.write_register(0xc0, 0x01); // additive
+            opl.write_register(0xa0, 0x00);
+            opl.write_register(0xb0, 0x20 | (4 << 2) | 0x02); // key-on, block 4, fnum 0x200
+            (0..256).any(|_| opl.render_sample() < 0)
+        };
+        assert!(has_negative(0x00), "WSEnable off forces a full sine (has negatives)");
+        assert!(!has_negative(0x20), "WSEnable on lets half-sine silence negatives");
     }
 
     #[test]
