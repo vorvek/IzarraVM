@@ -364,6 +364,9 @@ impl Cpu386 {
     }
 
     pub fn is_protected_mode(&self) -> bool {
+        // Stack code also uses this as a proxy for the SS B-bit (stack width): real
+        // mode always has a 16-bit stack. Replace with a real SS.B check when 32-bit
+        // protected-mode stacks land.
         self.control.cr0 & CR0_PE != 0
     }
 
@@ -696,8 +699,9 @@ impl Cpu386 {
             0x9c => {
                 // PUSHF / PUSHFD. The 386 EFLAGS defines no bits above 15 except RF and
                 // VM, both of which PUSHFD clears in the pushed image, so both forms push
-                // the low 16 flag bits (PUSHFD zero-extends to 32). This also keeps the
-                // harness-injected high garbage bits out of the image.
+                // the identical low 16 flag bits; the dword form just zero-extends to 32.
+                // Confirmed against the 669C vectors. operand_size still drives whether
+                // push writes 2 or 4 bytes.
                 let value = self.registers.eflags & 0xffff;
                 self.push(bus, value, operand_size)?;
                 Ok(clocks(3))
