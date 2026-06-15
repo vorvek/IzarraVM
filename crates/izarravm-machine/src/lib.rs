@@ -1,3 +1,4 @@
+use izarravm_audio::{OplChip, Resampler};
 use izarravm_bus::{BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CpuBus, Memory};
 use izarravm_core::{CpuPreset, HardwareProfile, VideoCard};
 use izarravm_cpu::{Cpu386, CpuError, SegmentIndex, SegmentRegister};
@@ -91,6 +92,10 @@ pub enum StopReason {
     CpuError(String),
 }
 
+/// The OPL3 renders at this native rate; the Resonique 2 DAC outputs at 44100.
+const OPL_NATIVE_HZ: u32 = 49_716;
+const DAC_HZ: u32 = 44_100;
+
 #[derive(Debug)]
 pub struct Machine {
     profile: MachineProfile,
@@ -100,6 +105,9 @@ pub struct Machine {
     rom: Vec<u8>,
     serial: SerialPort,
     device_ports: DevicePorts,
+    opl: OplChip,
+    resampler: Resampler,
+    opl_micros: f64, // fractional microseconds owed to the OPL timers
     trace: BusTrace,
     elapsed_clocks: u64,
 }
@@ -119,6 +127,9 @@ impl Machine {
             rom: rom.to_vec(),
             serial: SerialPort::default(),
             device_ports: DevicePorts::default(),
+            opl: OplChip::default(),
+            resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
+            opl_micros: 0.0,
             trace: BusTrace::default(),
             elapsed_clocks: 0,
         };
@@ -143,6 +154,9 @@ impl Machine {
             rom: vec![0; BIOS_ROM_SIZE],
             serial: SerialPort::default(),
             device_ports: DevicePorts::default(),
+            opl: OplChip::default(),
+            resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
+            opl_micros: 0.0,
             trace: BusTrace::default(),
             elapsed_clocks: 0,
         };
@@ -207,6 +221,27 @@ impl Machine {
         self.elapsed_clocks
     }
 
+    /// Advance time-based devices (currently the OPL timers) by `clocks` of CPU
+    /// time, converting to microseconds and carrying the fractional remainder.
+    fn advance_devices(&mut self, clocks: u64) {
+        self.opl_micros += clocks as f64 * 1_000_000.0 / self.profile.clock_hz as f64;
+        let whole = self.opl_micros.floor();
+        self.opl.advance_micros(whole as u64);
+        self.opl_micros -= whole;
+    }
+
+    /// Render `native_samples` of OPL3 output at 49716 Hz and return the
+    /// resampled 44100 Hz stereo PCM (saturated to 16-bit) ready for the DAC.
+    /// The caller paces this by elapsed emulated time to keep audio in step.
+    pub fn render_audio(&mut self, native_samples: usize) -> Vec<(i16, i16)> {
+        let native: Vec<(i32, i32)> = (0..native_samples).map(|_| self.opl.render_sample()).collect();
+        self.resampler
+            .process(&native)
+            .into_iter()
+            .map(|(l, r)| (clamp_i16(l), clamp_i16(r)))
+            .collect()
+    }
+
     pub fn run_cycles(&mut self, cycles: u64) -> Result<StopReason, MachineError> {
         let deadline = self.elapsed_clocks.saturating_add(cycles);
         self.run_until_clock(deadline, cycles)
@@ -236,6 +271,7 @@ impl Machine {
                     rom,
                     serial,
                     device_ports,
+                    opl,
                     trace,
                     ..
                 } = self;
@@ -245,6 +281,7 @@ impl Machine {
                     rom,
                     serial,
                     device_ports,
+                    opl,
                     trace,
                     wait_states: profile.wait_states,
                 };
@@ -254,7 +291,12 @@ impl Machine {
             match outcome {
                 Ok(outcome) => {
                     let bus_clocks = self.trace.elapsed_clocks() - trace_before;
-                    self.elapsed_clocks += u64::from(outcome.core_clocks) + bus_clocks;
+                    let step = u64::from(outcome.core_clocks) + bus_clocks;
+                    self.elapsed_clocks += step;
+                    // Advance the OPL timers so AdLib detection's delay loops see
+                    // the overflow flag (the synthesis clock is driven separately
+                    // by `render_audio`).
+                    self.advance_devices(step);
                     if outcome.halted {
                         return Ok(StopReason::Halted);
                     }
@@ -273,6 +315,7 @@ struct MachineBus<'a> {
     rom: &'a [u8],
     serial: &'a mut SerialPort,
     device_ports: &'a mut DevicePorts,
+    opl: &'a mut OplChip,
     trace: &'a mut BusTrace,
     wait_states: WaitStateProfile,
 }
@@ -370,6 +413,10 @@ impl CpuBus for MachineBus<'_> {
         if let Some(value) = self.video.read_port(port) {
             return Ok(u32::from(value));
         }
+        if let Some(opl_port) = opl_port(port) {
+            // The chip drives only the status byte on reads; data ports read open-bus.
+            return Ok(u32::from(self.opl.read_port(opl_port).unwrap_or(0xff)));
+        }
         self.device_ports
             .read_port(port)
             .map(u32::from)
@@ -388,6 +435,10 @@ impl CpuBus for MachineBus<'_> {
             return Err(BusError::WidthMismatch { width });
         }
 
+        if let Some(opl_port) = opl_port(port) {
+            self.opl.write_port(opl_port, value as u8);
+            return Ok(());
+        }
         if self.serial.write_port(port, value as u8)
             || self.video.write_port(port, value as u8)
             || self.device_ports.write_port(port, value as u8)
@@ -453,10 +504,32 @@ fn known_passive_ports() -> impl Iterator<Item = u16> {
         0x00a0..=0x00a1, // slave PIC
         0x00c0..=0x00df, // DMA controller 2
         0x0220..=0x022f, // Sound Blaster base
-        0x0388..=0x038b, // OPL2/OPL3
+        0x0388..=0x038b, // OPL2/OPL3 (intercepted by the chip, kept as a fallback)
         0x03b0..=0x03df, // MDA/CGA/EGA/VGA registers
     ];
     ranges.into_iter().flatten()
+}
+
+/// Map a CPU I/O port to the OPL register port (0x388-0x38B) it addresses, or
+/// `None` if it is not an OPL port. The native AdLib ports are mirrored onto the
+/// Sound Blaster Pro/16 OPL aliases at base 0x220: 0x220-0x223 are the two OPL3
+/// banks, and 0x228-0x229 the OPL2-compatible single bank.
+fn opl_port(port: u16) -> Option<u16> {
+    match port {
+        0x0388..=0x038b => Some(port),
+        0x0220 => Some(0x0388),
+        0x0221 => Some(0x0389),
+        0x0222 => Some(0x038a),
+        0x0223 => Some(0x038b),
+        0x0228 => Some(0x0388),
+        0x0229 => Some(0x0389),
+        _ => None,
+    }
+}
+
+/// Saturate an OPL mix value to the 16-bit DAC range.
+fn clamp_i16(value: i32) -> i16 {
+    value.clamp(i16::MIN as i32, i16::MAX as i32) as i16
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -702,6 +775,7 @@ mod tests {
                 rom: &machine.rom,
                 serial: &mut machine.serial,
                 device_ports: &mut machine.device_ports,
+                opl: &mut machine.opl,
                 trace: &mut machine.trace,
                 wait_states: machine.profile.wait_states,
             };
@@ -826,19 +900,12 @@ mod tests {
 
     #[test]
     fn passive_target_ports_allow_capability_probes_to_fail_cleanly() {
+        // 0x224 is the SB DSP reset port: still an unimplemented passive port
+        // (0x388 is now the OPL chip).
         let mut machine = test_machine();
-        let value = {
-            let mut bus = MachineBus {
-                memory: &mut machine.memory,
-                video: &mut machine.video,
-                rom: &machine.rom,
-                serial: &mut machine.serial,
-                device_ports: &mut machine.device_ports,
-                trace: &mut machine.trace,
-                wait_states: machine.profile.wait_states,
-            };
-            bus.read_io(0x0388, BusWidth::Byte).unwrap()
-        };
+        let value = with_bus(&mut machine, |bus| {
+            bus.read_io(0x0224, BusWidth::Byte).unwrap()
+        });
 
         assert_eq!(value, 0xff);
         assert!(
@@ -846,7 +913,101 @@ mod tests {
                 .bus_trace()
                 .cycles()
                 .iter()
-                .any(|cycle| cycle.kind == BusAccessKind::IoRead && cycle.address == 0x0388)
+                .any(|cycle| cycle.kind == BusAccessKind::IoRead && cycle.address == 0x0224)
         );
+    }
+
+    // Run one closure against a freshly-borrowed bus over the whole machine.
+    fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R {
+        let mut bus = MachineBus {
+            memory: &mut machine.memory,
+            video: &mut machine.video,
+            rom: &machine.rom,
+            serial: &mut machine.serial,
+            device_ports: &mut machine.device_ports,
+            opl: &mut machine.opl,
+            trace: &mut machine.trace,
+            wait_states: machine.profile.wait_states,
+        };
+        f(&mut bus)
+    }
+
+    // Program channel 0 as a keyed sine tone through the given OPL address/data
+    // port pair (so the same routine can drive the native and aliased ports).
+    fn program_tone(bus: &mut MachineBus, addr: u16, data: u16) {
+        let mut write = |reg: u8, value: u8| {
+            bus.write_io(addr, BusWidth::Byte, u32::from(reg)).unwrap();
+            bus.write_io(data, BusWidth::Byte, u32::from(value)).unwrap();
+        };
+        write(0x20, 0x01); // modulator: multiple x1
+        write(0x40, 0x3f); // modulator muted
+        write(0x60, 0xf0); // modulator instant attack
+        write(0x80, 0x00);
+        write(0x23, 0x21); // carrier: sustained, multiple x1
+        write(0x43, 0x00); // carrier loud
+        write(0x63, 0xf0); // carrier instant attack
+        write(0x83, 0x00);
+        write(0xc0, 0x01); // additive
+        write(0xa0, 0x00); // f-number low
+        write(0xb0, 0x20 | (4 << 2) | 0x02); // key-on, block 4, fnum 0x200
+    }
+
+    #[test]
+    fn opl_sounds_through_the_adlib_ports() {
+        let mut machine = test_machine();
+        with_bus(&mut machine, |bus| program_tone(bus, 0x0388, 0x0389));
+        let pcm = machine.render_audio(2000);
+        assert!(
+            pcm.iter().any(|&(l, _)| l != 0),
+            "the OPL should produce audio via the AdLib ports"
+        );
+    }
+
+    #[test]
+    fn opl_sounds_through_the_sound_blaster_aliases() {
+        // 0x220/0x221 mirror the OPL3 primary-bank address/data ports.
+        let mut machine = test_machine();
+        with_bus(&mut machine, |bus| program_tone(bus, 0x0220, 0x0221));
+        let pcm = machine.render_audio(2000);
+        assert!(
+            pcm.iter().any(|&(l, _)| l != 0),
+            "the OPL should produce audio via the SB base aliases"
+        );
+    }
+
+    #[test]
+    fn render_audio_outputs_at_the_dac_rate() {
+        let mut machine = test_machine();
+        let pcm = machine.render_audio(OPL_NATIVE_HZ as usize); // one second of OPL time
+        assert!(
+            (pcm.len() as i32 - DAC_HZ as i32).abs() < 50,
+            "expected ~{DAC_HZ} frames, got {}",
+            pcm.len()
+        );
+    }
+
+    #[test]
+    fn opl_timers_advance_with_machine_clocks() {
+        // AdLib detection: arm timer 1 to overflow in one 80us step, let machine
+        // time pass, and confirm the status port reports the overflow + IRQ.
+        let mut machine = test_machine();
+        with_bus(&mut machine, |bus| {
+            let mut write = |reg: u8, value: u8| {
+                bus.write_io(0x0388, BusWidth::Byte, u32::from(reg)).unwrap();
+                bus.write_io(0x0389, BusWidth::Byte, u32::from(value)).unwrap();
+            };
+            write(0x04, 0x60); // mask both timers
+            write(0x04, 0x80); // reset the overflow flags
+            write(0x02, 0xff); // timer 1 preset: overflow in one step
+            write(0x04, 0x21); // start timer 1 (unmasked), mask timer 2
+        });
+
+        // 100 us of CPU time (clock_hz/10000 clocks) covers the 80 us timer step.
+        machine.advance_devices(machine.profile().clock_hz / 10_000);
+
+        let status = with_bus(&mut machine, |bus| {
+            bus.read_io(0x0388, BusWidth::Byte).unwrap()
+        });
+        assert_eq!(status & 0xe0, 0xc0, "timer 1 overflow raises IRQ + timer-1 flag");
     }
 }

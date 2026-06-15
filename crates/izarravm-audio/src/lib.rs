@@ -1,5 +1,13 @@
 use izarravm_core::{AudioConfig, MidiBackend};
 
+mod opl;
+mod output;
+mod resample;
+
+pub use opl::OplChip;
+pub use output::AudioPlayer;
+pub use resample::Resampler;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioDeviceKind {
     PcSpeaker,
@@ -15,8 +23,10 @@ pub struct MixerConfig {
 
 impl Default for MixerConfig {
     fn default() -> Self {
+        // The Resonique 2 (SB16-class) DAC tops out at 44.1 kHz stereo; 48 kHz
+        // would be anachronistic for this machine.
         Self {
-            sample_rate_hz: 48_000,
+            sample_rate_hz: 44_100,
             channels: 2,
         }
     }
