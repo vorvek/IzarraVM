@@ -763,36 +763,59 @@ impl Cpu386 {
             }
             0xf6 => {
                 let modrm = self.fetch_modrm(bus)?;
-                match modrm.reg {
-                    0 => {
-                        let value = self.read_rm_u8(bus, prefixes, address_size, modrm)?;
-                        let imm = self.fetch_u8(bus)?;
-                        self.alu(4, u32::from(value), u32::from(imm), BusWidth::Byte);
-                        Ok(clocks(2))
-                    }
-                    _ => Err(CpuError::UnsupportedGroupOpcode {
-                        opcode: 0xf6,
-                        extension: modrm.reg,
-                    }
-                    .into()),
+                if modrm.reg == 0 {
+                    // TEST r/m8, imm8 (unchanged)
+                    let value = self.read_rm_u8(bus, prefixes, address_size, modrm)?;
+                    let imm = self.fetch_u8(bus)?;
+                    self.alu(4, u32::from(value), u32::from(imm), BusWidth::Byte);
+                    return Ok(clocks(2));
                 }
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
+                let value = u32::from(self.read_operand_u8(bus, operand)?);
+                match modrm.reg {
+                    2 => self.write_operand_u8(bus, operand, !(value as u8))?, // NOT
+                    3 => {
+                        // NEG: flags like 0 - operand (CF set unless operand is 0).
+                        let result = self.alu_sub(0, value, 0, BusWidth::Byte) as u8;
+                        self.write_operand_u8(bus, operand, result)?;
+                    }
+                    _ => {
+                        return Err(CpuError::UnsupportedGroupOpcode {
+                            opcode: 0xf6,
+                            extension: modrm.reg,
+                        }
+                        .into());
+                    }
+                }
+                Ok(clocks(2))
             }
             0xf7 => {
                 let modrm = self.fetch_modrm(bus)?;
-                match modrm.reg {
-                    0 => {
-                        let value =
-                            self.read_rm_sized(bus, prefixes, address_size, operand_size, modrm)?;
-                        let imm = self.fetch_immediate(bus, operand_size)?;
-                        self.alu(4, value, imm, operand_size.bus_width());
-                        Ok(clocks(2))
-                    }
-                    _ => Err(CpuError::UnsupportedGroupOpcode {
-                        opcode: 0xf7,
-                        extension: modrm.reg,
-                    }
-                    .into()),
+                if modrm.reg == 0 {
+                    // TEST r/m, imm (unchanged)
+                    let value =
+                        self.read_rm_sized(bus, prefixes, address_size, operand_size, modrm)?;
+                    let imm = self.fetch_immediate(bus, operand_size)?;
+                    self.alu(4, value, imm, operand_size.bus_width());
+                    return Ok(clocks(2));
                 }
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
+                let value = self.read_operand_sized(bus, operand, operand_size)?;
+                match modrm.reg {
+                    2 => self.write_operand_sized(bus, operand, operand_size, !value)?, // NOT
+                    3 => {
+                        let result = self.alu_sub(0, value, 0, operand_size.bus_width());
+                        self.write_operand_sized(bus, operand, operand_size, result)?;
+                    }
+                    _ => {
+                        return Err(CpuError::UnsupportedGroupOpcode {
+                            opcode: 0xf7,
+                            extension: modrm.reg,
+                        }
+                        .into());
+                    }
+                }
+                Ok(clocks(2))
             }
             0xf8 => {
                 self.set_flag(FLAG_CF, false);
@@ -3185,5 +3208,97 @@ mod tests {
 
         assert_eq!(cpu.read_reg16(Reg16::Ax), 0x0020); // ah preserved, al rotated
         assert!(!cpu.flag(FLAG_CF)); // last bit out is 0
+    }
+
+    #[test]
+    fn not_byte_leaves_flags_untouched() {
+        // not bl (0xf6 /2, modrm 0xd3). 0x0f -> 0xf0; NOT affects no flags.
+        let mut memory = vec![0; 16];
+        memory[0..2].copy_from_slice(&[0xf6, 0xd3]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Bx, 0x000f);
+        cpu.set_flag(FLAG_CF, true);
+        cpu.set_flag(FLAG_ZF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Bx) & 0xff, 0xf0);
+        assert!(cpu.flag(FLAG_CF)); // unchanged
+        assert!(cpu.flag(FLAG_ZF)); // unchanged
+    }
+
+    #[test]
+    fn neg_byte_sets_carry_and_sign() {
+        // neg bl (0xf6 /3, modrm 0xdb). 0x01 -> 0xff; CF set, SF set, ZF clear.
+        let mut memory = vec![0; 16];
+        memory[0..2].copy_from_slice(&[0xf6, 0xdb]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Bx, 0x0001);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Bx) & 0xff, 0xff);
+        assert!(cpu.flag(FLAG_CF)); // operand nonzero
+        assert!(cpu.flag(FLAG_SF));
+        assert!(!cpu.flag(FLAG_ZF));
+    }
+
+    #[test]
+    fn neg_zero_clears_carry_and_sets_zero() {
+        // neg bl of 0x00 -> 0x00; CF clear, ZF set.
+        let mut memory = vec![0; 16];
+        memory[0..2].copy_from_slice(&[0xf6, 0xdb]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Bx, 0x0000);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Bx) & 0xff, 0x00);
+        assert!(!cpu.flag(FLAG_CF)); // operand zero
+        assert!(cpu.flag(FLAG_ZF));
+    }
+
+    #[test]
+    fn neg_byte_overflow_at_0x80() {
+        // neg bl of 0x80 -> 0x80; OF set (only value that negates to itself), CF and SF set.
+        let mut memory = vec![0; 16];
+        memory[0..2].copy_from_slice(&[0xf6, 0xdb]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Bx, 0x0080);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Bx) & 0xff, 0x80);
+        assert!(cpu.flag(FLAG_OF));
+        assert!(cpu.flag(FLAG_CF));
+        assert!(cpu.flag(FLAG_SF));
+    }
+
+    #[test]
+    fn not_word_via_f7_complements() {
+        // not bx (0xf7 /2, modrm 0xd3). 0x0ff0 -> 0xf00f; flags unchanged.
+        let mut memory = vec![0; 16];
+        memory[0..2].copy_from_slice(&[0xf7, 0xd3]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Bx, 0x0ff0);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Bx), 0xf00f);
     }
 }
