@@ -310,6 +310,7 @@ enum RepKind {
 struct Prefixes {
     operand_size_override: bool,
     address_size_override: bool,
+    lock: bool,
     rep: Option<RepKind>,
     segment_override: Option<SegmentIndex>,
 }
@@ -425,6 +426,9 @@ impl Cpu386 {
         let instruction_eip = self.registers.eip;
         let prefixes = self.read_prefixes(bus)?;
         let opcode = self.fetch_u8(bus)?;
+        if prefixes.lock {
+            self.check_lock_target(bus, opcode)?;
+        }
         let operand_size = self.operand_size(prefixes);
         let address_size = self.address_size(prefixes);
 
@@ -1753,6 +1757,7 @@ impl Cpu386 {
                 0x65 => prefixes.segment_override = Some(SegmentIndex::Gs),
                 0x66 => prefixes.operand_size_override = !prefixes.operand_size_override,
                 0x67 => prefixes.address_size_override = !prefixes.address_size_override,
+                0xf0 => prefixes.lock = true,
                 0xf3 => prefixes.rep = Some(RepKind::Repe),
                 0xf2 => prefixes.rep = Some(RepKind::Repne),
                 _ => {
@@ -1760,6 +1765,63 @@ impl Cpu386 {
                     return Ok(prefixes);
                 }
             }
+        }
+    }
+
+    fn peek_u8<B: CpuBus>(&mut self, bus: &mut B, offset: u32) -> ExecResult<u8> {
+        self.read_memory_u8(
+            bus,
+            SegmentIndex::Cs,
+            offset,
+            BusAccessKind::InstructionPrefetch,
+        )
+    }
+
+    fn check_lock_target<B: CpuBus>(&mut self, bus: &mut B, opcode: u8) -> ExecResult<()> {
+        // The byte after the opcode sits at eip (the ModRM, or for 0F the second opcode byte).
+        // Peeking re-reads an instruction byte; it changes no register or memory state.
+        let eip = self.registers.eip;
+        let lockable = match opcode {
+            // ALU r/m, reg (destination is r/m): ADD/OR/ADC/SBB/AND/SUB/XOR, and XCHG.
+            0x00 | 0x01 | 0x08 | 0x09 | 0x10 | 0x11 | 0x18 | 0x19 | 0x20 | 0x21 | 0x28 | 0x29
+            | 0x30 | 0x31 | 0x86 | 0x87 => self.peek_u8(bus, eip)? >> 6 != 3,
+            // Group ALU 80/81/83: /0..6 write r/m; /7 is CMP (read only, not lockable).
+            0x80 | 0x81 | 0x83 => {
+                let modrm = self.peek_u8(bus, eip)?;
+                modrm >> 6 != 3 && (modrm >> 3) & 7 != 7
+            }
+            // F6/F7: /2 NOT, /3 NEG write r/m; the other sub-ops do not.
+            0xf6 | 0xf7 => {
+                let modrm = self.peek_u8(bus, eip)?;
+                modrm >> 6 != 3 && matches!((modrm >> 3) & 7, 2 | 3)
+            }
+            // FE/FF: /0 INC, /1 DEC write r/m; FF /2..7 are CALL/JMP/PUSH (not lockable).
+            0xfe | 0xff => {
+                let modrm = self.peek_u8(bus, eip)?;
+                modrm >> 6 != 3 && matches!((modrm >> 3) & 7, 0 | 1)
+            }
+            0x0f => {
+                let second = self.peek_u8(bus, eip)?;
+                match second {
+                    // BTS/BTR/BTC r/m, reg write r/m; BT (A3) only reads.
+                    0xab | 0xb3 | 0xbb => self.peek_u8(bus, eip.wrapping_add(1))? >> 6 != 3,
+                    // BA: /5 BTS, /6 BTR, /7 BTC write; /4 BT only reads.
+                    0xba => {
+                        let modrm = self.peek_u8(bus, eip.wrapping_add(1))?;
+                        modrm >> 6 != 3 && matches!((modrm >> 3) & 7, 5..=7)
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        };
+        if lockable {
+            Ok(())
+        } else {
+            Err(InternalFault::Exception {
+                vector: 6,
+                error_code: None,
+            })
         }
     }
 
@@ -7103,5 +7165,147 @@ mod tests {
         assert_eq!(cpu.read_reg16(Reg16::Ax) & 0xff, 0x39);
         assert_eq!(cpu.read_reg16(Reg16::Ax) >> 8, 0x00);
         assert!(!cpu.flag(FLAG_ZF));
+    }
+
+    #[test]
+    fn lock_add_to_memory_executes() {
+        // lock add [0x40], ax (0xf0 0x01 0x06 0x40 0x00). mem[0x40]=0x0010, ax=0x0005 -> 0x0015.
+        let mut memory = vec![0; 128];
+        memory[0..5].copy_from_slice(&[0xf0, 0x01, 0x06, 0x40, 0x00]);
+        memory[0x40] = 0x10;
+        memory[0x41] = 0x00;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x0005);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(
+            u16::from_le_bytes([bus.memory[0x40], bus.memory[0x41]]),
+            0x0015
+        );
+    }
+
+    #[test]
+    fn lock_bts_to_memory_executes() {
+        // lock bts [0x40], ax (0xf0 0x0f 0xab 0x06 0x40 0x00). ax=3 -> set bit 3 of [0x40].
+        let mut memory = vec![0; 128];
+        memory[0..6].copy_from_slice(&[0xf0, 0x0f, 0xab, 0x06, 0x40, 0x00]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x0003);
+        cpu.set_flag(FLAG_CF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(bus.memory[0x40], 0x08); // bit 3 set
+        assert!(!cpu.flag(FLAG_CF)); // old bit was 0
+    }
+
+    #[test]
+    fn lock_on_register_destination_delivers_ud() {
+        // lock add ax, bx (0xf0 0x01 0xd8, mod=3 register dest). LOCK needs memory -> #UD.
+        let mut memory = vec![0; 1024];
+        memory[0..3].copy_from_slice(&[0xf0, 0x01, 0xd8]);
+        memory[0x18] = 0xee; // IVT[6] -> IP 0x00ee, CS 0
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        cpu.set_flag(FLAG_IF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eip, 0x00ee);
+        assert!(!cpu.flag(FLAG_IF));
+    }
+
+    #[test]
+    fn lock_xchg_register_delivers_ud() {
+        // lock xchg ax, bx (0xf0 0x87 0xd8, mod=3). XCHG needs memory -> #UD.
+        let mut memory = vec![0; 1024];
+        memory[0..3].copy_from_slice(&[0xf0, 0x87, 0xd8]);
+        memory[0x18] = 0xee;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        cpu.set_flag(FLAG_IF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eip, 0x00ee);
+        assert!(!cpu.flag(FLAG_IF));
+    }
+
+    #[test]
+    fn lock_inc_register_delivers_ud() {
+        // lock inc al (0xf0 0xfe 0xc0, FE /0 mod=3). INC of a register under LOCK -> #UD.
+        let mut memory = vec![0; 1024];
+        memory[0..3].copy_from_slice(&[0xf0, 0xfe, 0xc0]);
+        memory[0x18] = 0xee;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        cpu.set_flag(FLAG_IF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eip, 0x00ee);
+        assert!(!cpu.flag(FLAG_IF));
+    }
+
+    #[test]
+    fn lock_cmp_memory_delivers_ud() {
+        // lock cmp [0x40], ax (0xf0 0x39 0x06 0x40 0x00). CMP is not lockable even to memory -> #UD.
+        let mut memory = vec![0; 1024];
+        memory[0..5].copy_from_slice(&[0xf0, 0x39, 0x06, 0x40, 0x00]);
+        memory[0x18] = 0xee;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        cpu.set_flag(FLAG_IF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eip, 0x00ee);
+        assert!(!cpu.flag(FLAG_IF));
+    }
+
+    #[test]
+    fn lock_non_lockable_opcode_delivers_ud() {
+        // lock mov ax, bx (0xf0 0x89 0xd8). MOV is not lockable -> #UD.
+        let mut memory = vec![0; 1024];
+        memory[0..3].copy_from_slice(&[0xf0, 0x89, 0xd8]);
+        memory[0x18] = 0xee;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        cpu.set_flag(FLAG_IF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eip, 0x00ee);
+        assert!(!cpu.flag(FLAG_IF));
     }
 }
