@@ -1320,7 +1320,7 @@ impl Cpu386 {
                 }
                 if old_al > 0x99 || old_cf {
                     al = al.wrapping_add(0x60);
-                    self.set_flag(FLAG_CF, true);
+                    self.set_flag(FLAG_CF, true); // the high correction always sets CF
                 }
                 self.write_gpr8(0, al);
                 self.set_szp(u32::from(al), BusWidth::Byte);
@@ -1342,7 +1342,7 @@ impl Cpu386 {
                 }
                 if old_al > 0x99 || old_cf {
                     al = al.wrapping_sub(0x60);
-                    self.set_flag(FLAG_CF, true);
+                    self.set_flag(FLAG_CF, true); // the high correction always sets CF
                 }
                 self.write_gpr8(0, al);
                 self.set_szp(u32::from(al), BusWidth::Byte);
@@ -6805,6 +6805,27 @@ mod tests {
 
         assert_eq!(cpu.read_reg16(Reg16::Ax) & 0xff, 0x10);
         assert!(cpu.flag(FLAG_CF));
+        assert!(cpu.flag(FLAG_AF));
+    }
+
+    #[test]
+    fn daa_incoming_aux_carry_triggers_correction() {
+        // daa: AL=0x20 (low nibble <= 9), AF=1 -> the first correction fires on AF alone:
+        // AL=0x26, CF=0, AF=1.
+        let mut memory = vec![0; 64];
+        memory[0] = 0x27;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x0020);
+        cpu.set_flag(FLAG_CF, false);
+        cpu.set_flag(FLAG_AF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Ax) & 0xff, 0x26);
+        assert!(!cpu.flag(FLAG_CF));
         assert!(cpu.flag(FLAG_AF));
     }
 
