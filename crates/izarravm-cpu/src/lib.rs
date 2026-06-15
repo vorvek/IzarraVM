@@ -834,6 +834,10 @@ impl Cpu386 {
                 self.registers.eip = target & operand_size.mask();
                 Ok(clocks(10))
             }
+            0xcb => {
+                self.return_far(bus, operand_size)?;
+                Ok(clocks(17))
+            }
             0xc6 => {
                 let modrm = self.fetch_modrm(bus)?;
                 if modrm.reg != 0 {
@@ -2251,6 +2255,16 @@ impl Cpu386 {
         // far pointer operands have been fetched.
         self.push(bus, u32::from(self.registers.cs().selector), operand_size)?;
         self.push(bus, self.registers.eip, operand_size)?;
+        self.load_segment(bus, SegmentIndex::Cs, selector)?;
+        self.registers.eip = offset & operand_size.mask();
+        Ok(())
+    }
+
+    fn return_far<B: CpuBus>(&mut self, bus: &mut B, operand_size: OperandSize) -> ExecResult<()> {
+        // Pop the offset then CS, mirroring iret's pop order. On the 32-bit form CS
+        // occupies four stack bytes; the high two are discarded on load.
+        let offset = self.pop(bus, operand_size)?;
+        let selector = self.pop(bus, operand_size)? as u16;
         self.load_segment(bus, SegmentIndex::Cs, selector)?;
         self.registers.eip = offset & operand_size.mask();
         Ok(())
@@ -4639,6 +4653,47 @@ mod tests {
 
         // SP 0x200 + 32 = 0x220; high half from the discarded slot = 0x5a04.
         assert_eq!(cpu.registers.esp(), 0x5a04_0220);
+    }
+
+    #[test]
+    fn retf_pops_offset_then_segment() {
+        // retf (0xcb). Stack at ss:0x0100 holds ip 0x0100 then cs 0x3000.
+        let mut memory = vec![0; 1024];
+        memory[0] = 0xcb;
+        memory[0x100..0x104].copy_from_slice(&[0x00, 0x01, 0x00, 0x30]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.cs().selector, 0x3000);
+        assert_eq!(cpu.registers.eip, 0x0100);
+        assert_eq!(cpu.read_gpr16(4), 0x0104); // two word pops from 0x0100
+    }
+
+    #[test]
+    fn far_call_then_retf_round_trips() {
+        // call far 0x0000:0x0010 ; the target at 0x10 is retf (0xcb).
+        let mut memory = vec![0; 1024];
+        memory[0..5].copy_from_slice(&[0x9a, 0x10, 0x00, 0x00, 0x00]);
+        memory[0x10] = 0xcb;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap(); // far call -> cs:0x0000, eip 0x0010
+        assert_eq!(cpu.registers.eip, 0x0010);
+        cpu.cycle(&mut bus).unwrap(); // retf -> back to cs:0x0000, eip 0x0005
+        assert_eq!(cpu.registers.cs().selector, 0x0000);
+        assert_eq!(cpu.registers.eip, 0x0005);
+        assert_eq!(cpu.read_gpr16(4), 0x0100); // sp restored
     }
 
     #[test]
