@@ -8,6 +8,8 @@ use izarravm_video::{
 };
 use thiserror::Error;
 
+mod pic;
+
 pub const HIGH_ROM_BASE: u32 = 0xffff_0000;
 pub const LOW_BIOS_BASE: u32 = 0x000f_0000;
 pub const BIOS_ROM_SIZE: usize = 64 * 1024;
@@ -105,6 +107,7 @@ pub struct Machine {
     rom: Vec<u8>,
     serial: SerialPort,
     device_ports: DevicePorts,
+    pic: pic::Pic8259Pair,
     opl: OplChip,
     resampler: Resampler,
     opl_micros: f64, // fractional microseconds owed to the OPL timers
@@ -127,6 +130,7 @@ impl Machine {
             rom: rom.to_vec(),
             serial: SerialPort::default(),
             device_ports: DevicePorts::default(),
+            pic: pic::Pic8259Pair::default(),
             opl: OplChip::default(),
             resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             opl_micros: 0.0,
@@ -154,6 +158,7 @@ impl Machine {
             rom: vec![0; BIOS_ROM_SIZE],
             serial: SerialPort::default(),
             device_ports: DevicePorts::default(),
+            pic: pic::Pic8259Pair::default(),
             opl: OplChip::default(),
             resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             opl_micros: 0.0,
@@ -244,6 +249,12 @@ impl Machine {
             .collect()
     }
 
+    /// Raise a hardware interrupt request line into the PIC. The PIT and other
+    /// devices call this; slice 2b wires the PIT's IRQ0 tick through here.
+    pub fn request_irq(&mut self, line: u8) {
+        self.pic.request(line);
+    }
+
     pub fn run_cycles(&mut self, cycles: u64) -> Result<StopReason, MachineError> {
         let deadline = self.elapsed_clocks.saturating_add(cycles);
         self.run_until_clock(deadline, cycles)
@@ -273,6 +284,7 @@ impl Machine {
                     rom,
                     serial,
                     device_ports,
+                    pic,
                     opl,
                     trace,
                     ..
@@ -283,6 +295,7 @@ impl Machine {
                     rom,
                     serial,
                     device_ports,
+                    pic,
                     opl,
                     trace,
                     wait_states: profile.wait_states,
@@ -317,6 +330,7 @@ struct MachineBus<'a> {
     rom: &'a [u8],
     serial: &'a mut SerialPort,
     device_ports: &'a mut DevicePorts,
+    pic: &'a mut pic::Pic8259Pair,
     opl: &'a mut OplChip,
     trace: &'a mut BusTrace,
     wait_states: WaitStateProfile,
@@ -419,6 +433,9 @@ impl CpuBus for MachineBus<'_> {
             // The chip drives only the status byte on reads; data ports read open-bus.
             return Ok(u32::from(self.opl.read_port(opl_port).unwrap_or(0xff)));
         }
+        if let Some(value) = self.pic.read_port(port) {
+            return Ok(u32::from(value));
+        }
         self.device_ports
             .read_port(port)
             .map(u32::from)
@@ -443,12 +460,21 @@ impl CpuBus for MachineBus<'_> {
         }
         if self.serial.write_port(port, value as u8)
             || self.video.write_port(port, value as u8)
+            || self.pic.write_port(port, value as u8)
             || self.device_ports.write_port(port, value as u8)
         {
             Ok(())
         } else {
             Err(BusError::UnsupportedPort { port })
         }
+    }
+
+    fn interrupt_pending(&self) -> bool {
+        self.pic.interrupt_pending()
+    }
+
+    fn acknowledge_interrupt(&mut self) -> Option<u8> {
+        self.pic.acknowledge()
     }
 
     fn interrupt_acknowledge(&mut self, vector: u8, ax: u16) -> Result<(), BusError> {
@@ -498,12 +524,10 @@ impl DevicePorts {
 fn known_passive_ports() -> impl Iterator<Item = u16> {
     let ranges = [
         0x0000..=0x000f, // DMA controller 1
-        0x0020..=0x0021, // master PIC
         0x0040..=0x0043, // PIT
         0x0060..=0x0064, // keyboard controller / A20 path
         0x0080..=0x008f, // DMA page registers
         0x0092..=0x0092, // system control port A / fast A20
-        0x00a0..=0x00a1, // slave PIC
         0x00c0..=0x00df, // DMA controller 2
         0x0220..=0x022f, // Sound Blaster base
         0x0388..=0x038b, // OPL2/OPL3 (intercepted by the chip, kept as a fallback)
@@ -777,6 +801,7 @@ mod tests {
                 rom: &machine.rom,
                 serial: &mut machine.serial,
                 device_ports: &mut machine.device_ports,
+                pic: &mut machine.pic,
                 opl: &mut machine.opl,
                 trace: &mut machine.trace,
                 wait_states: machine.profile.wait_states,
@@ -927,6 +952,7 @@ mod tests {
             rom: &machine.rom,
             serial: &mut machine.serial,
             device_ports: &mut machine.device_ports,
+            pic: &mut machine.pic,
             opl: &mut machine.opl,
             trace: &mut machine.trace,
             wait_states: machine.profile.wait_states,
@@ -953,6 +979,43 @@ mod tests {
         write(0xc0, 0x01); // additive
         write(0xa0, 0x00); // f-number low
         write(0xb0, 0x20 | (4 << 2) | 0x02); // key-on, block 4, fnum 0x200
+    }
+
+    #[test]
+    fn pic_command_and_data_ports_route_to_the_master() {
+        let mut machine = test_machine();
+        let mask = with_bus(&mut machine, |bus| {
+            // ICW1..ICW4 init, then OCW1 sets the mask to a recognizable value.
+            for (port, value) in [
+                (0x20u16, 0x11u32),
+                (0x21, 0x08),
+                (0x21, 0x04),
+                (0x21, 0x01),
+                (0x21, 0xab),
+            ] {
+                bus.write_io(port, BusWidth::Byte, value).unwrap();
+            }
+            // The data port reads back the mask, not the passive 0xff stub.
+            bus.read_io(0x21, BusWidth::Byte).unwrap()
+        });
+        assert_eq!(mask, 0xab);
+    }
+
+    #[test]
+    fn machine_bus_acknowledges_a_pic_interrupt() {
+        let mut machine = test_machine();
+        with_bus(&mut machine, |bus| {
+            for (port, value) in [(0x20u16, 0x11u32), (0x21, 0x08), (0x21, 0x04), (0x21, 0x01)] {
+                bus.write_io(port, BusWidth::Byte, value).unwrap();
+            }
+        });
+        machine.request_irq(0);
+
+        let (pending, vector) = with_bus(&mut machine, |bus| {
+            (bus.interrupt_pending(), bus.acknowledge_interrupt())
+        });
+        assert!(pending);
+        assert_eq!(vector, Some(0x08));
     }
 
     #[test]
