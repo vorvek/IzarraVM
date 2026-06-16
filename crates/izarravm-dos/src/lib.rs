@@ -120,6 +120,9 @@ pub enum DosAction {
 /// DOS services are emulated host-side (HLE), the standard approach for a machine
 /// with no resident DOS. Unimplemented INT 21h functions return Continue with no
 /// effect, so the caller's IRET stub returns cleanly; later slices fill them in.
+///
+/// `mem` is `&mut` because the file-read call (AH=3Fh, a later slice) writes the
+/// data it reads back into guest memory at DS:DX; the print call only reads.
 pub fn dispatch(
     vector: u8,
     regs: &mut DosRegs,
@@ -224,6 +227,28 @@ mod tests {
         assert_eq!(action, DosAction::Continue);
         assert_eq!(out, b"Hello");
         assert_eq!(regs.ax & 0x00ff, 0x24); // AH=09h returns AL = '$'
+        assert_eq!(regs.ax >> 8, 0x09); // AH is preserved
+    }
+
+    #[test]
+    fn ah09_without_terminator_propagates_a_memory_error() {
+        // A string with no '$' runs off the end of memory; the out-of-bounds read
+        // surfaces as a DosError rather than looping forever.
+        let mut mem = Memory::new(4096).unwrap();
+        for offset in 0..4096 {
+            mem.write_u8(offset, b'A').unwrap();
+        }
+        let mut regs = DosRegs {
+            ax: 0x0900,
+            ds: 0x0000,
+            dx: 0x0000,
+            ..DosRegs::default()
+        };
+        let mut out = Vec::new();
+        assert!(matches!(
+            dispatch(0x21, &mut regs, &mut mem, &mut out),
+            Err(DosError::Memory(_))
+        ));
     }
 
     #[test]
