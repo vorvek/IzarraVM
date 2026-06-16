@@ -1,6 +1,6 @@
-%define RESULT_RECORD_COUNT 21
-%define RESULT_PAYLOAD_LEN 457
-%define RESULT_PAYLOAD_CHECKSUM 0x9e35
+%define RESULT_RECORD_COUNT 22
+%define RESULT_PAYLOAD_LEN 473
+%define RESULT_PAYLOAD_CHECKSUM 0xa346
 
 result_block_template:
     db 'VDTS'
@@ -30,6 +30,8 @@ result_payload:
     db 'FAIL sound.sb_8bit_dma', 10
     db 'FAIL sound.sb_16bit_dma', 10
     db 'FAIL sound.sb_adpcm', 10
+timer_record:
+    db 'FAIL timer.irq0', 10
 result_payload_end:
     db 0
 result_block_end:

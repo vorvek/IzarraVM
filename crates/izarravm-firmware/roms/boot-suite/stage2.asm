@@ -9,6 +9,12 @@ org 0x8000
 %define COM1_LCR 0x03fb
 %define COM1_MCR 0x03fc
 %define COM1_LSR 0x03fd
+%define PIT_CH0 0x40
+%define PIT_CTRL 0x43
+%define PIC_CMD 0x20
+%define PIC_DATA 0x21
+%define TICK_COUNT 0x0600
+%define TICK_TARGET 10
 
 stage2_start:
     cli
@@ -53,6 +59,7 @@ stage2_start:
     call puts_screen
 
     call test_mode13h
+    call test_timer
 
     hlt
     jmp $
@@ -144,6 +151,54 @@ copy_result_block:
     pop es
     pop ds
     ret
+
+test_timer:
+    ; Initialize the PIC for IRQ0 (ICW1..ICW4, vector base 0x08) and unmask IRQ0.
+    mov al, 0x11
+    out PIC_CMD, al
+    mov al, 0x08
+    out PIC_DATA, al
+    mov al, 0x04
+    out PIC_DATA, al
+    mov al, 0x01
+    out PIC_DATA, al
+    mov al, 0xfe
+    out PIC_DATA, al
+    ; IVT[8] -> 0000:irq0_handler
+    xor ax, ax
+    mov es, ax
+    mov word [es:0x20], irq0_handler
+    mov word [es:0x22], 0
+    mov word [TICK_COUNT], 0
+    ; Channel 0: mode 3, LSB then MSB, count 11932 (about 100 Hz) for a short run.
+    mov al, 0x36
+    out PIT_CTRL, al
+    mov ax, 11932
+    out PIT_CH0, al
+    mov al, ah
+    out PIT_CH0, al
+    sti
+.wait:
+    hlt
+    mov ax, [TICK_COUNT]
+    cmp ax, TICK_TARGET
+    jb .wait
+    cli
+    ; Passed: patch FAIL -> PASS in the copied result block and fix the checksum.
+    mov di, RESULT_BLOCK + (timer_record - result_block_template)
+    mov byte [di], 'P'
+    mov byte [di + 2], 'S'
+    mov byte [di + 3], 'S'
+    add word [RESULT_BLOCK + 10], 27
+    ret
+
+irq0_handler:
+    push ax
+    inc word [TICK_COUNT]
+    mov al, 0x20
+    out PIC_CMD, al
+    pop ax
+    iret
 
 title db 'IzarraVM x86 Boot Test Suite', 0
 line_cpu db 'CPU: real/protected/paging smoke PASS', 0

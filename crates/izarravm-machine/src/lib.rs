@@ -1088,6 +1088,29 @@ mod tests {
     }
 
     #[test]
+    fn boot_suite_reports_timer_irq0_pass() {
+        let mut machine = Machine::new_boot_image(
+            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            izarravm_firmware::X86_BOOT_TEST_IMAGE,
+        )
+        .unwrap();
+        let reason = machine.run_until_halt_or_cycles(5_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+
+        let results = izarravm_firmware::parse_result_block(machine.memory().as_slice()).unwrap();
+        assert!(
+            results.records.iter().any(|record| {
+                record.status == izarravm_firmware::SuiteRecordStatus::Pass
+                    && record.name == "timer.irq0"
+            }),
+            "boot suite should report PASS timer.irq0"
+        );
+        // The timer idle genuinely advanced emulated time (ten ticks of ~11932
+        // input clocks each), not spun instantly.
+        assert!(machine.elapsed_clocks() > 1_500_000);
+    }
+
+    #[test]
     fn cli_hlt_is_a_genuine_halt() {
         // With interrupts off, HLT must still halt immediately, not spin.
         let mut machine = Machine::new(
