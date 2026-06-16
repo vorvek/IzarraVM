@@ -957,7 +957,9 @@ mod tests {
         )
         .unwrap();
 
-        let reason = machine.run_until_halt_or_cycles(2_000_000).unwrap();
+        // The budget covers the timer test's idle (ten ticks of about 11932 PIT
+        // clocks, near 2.5M CPU clocks) plus the setup, matching the headless runner.
+        let reason = machine.run_until_halt_or_cycles(5_000_000).unwrap();
         let serial = machine.serial_text();
         let results = izarravm_firmware::parse_result_block(machine.memory().as_slice()).unwrap();
 
