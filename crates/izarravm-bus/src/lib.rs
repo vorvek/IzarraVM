@@ -229,6 +229,21 @@ pub trait CpuBus {
     fn write_io(&mut self, port: u16, width: BusWidth, value: u32) -> Result<(), BusError>;
 
     fn interrupt_acknowledge(&mut self, vector: u8, ax: u16) -> Result<(), BusError>;
+
+    /// True while a device is asserting INTR through the PIC with a request that
+    /// outranks anything in service. Non-mutating: the CPU calls it on every cycle
+    /// and every halted cycle, so it must never consume the request. Defaulted to
+    /// `false` so buses without an interrupt controller see no injected interrupts.
+    fn interrupt_pending(&self) -> bool {
+        false
+    }
+
+    /// The interrupt-acknowledge handshake. Commits the highest-priority request
+    /// (sets ISR, clears IRR) and returns its vector byte, or `None` if the line
+    /// dropped before acknowledge. Defaulted to `None`.
+    fn acknowledge_interrupt(&mut self) -> Option<u8> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

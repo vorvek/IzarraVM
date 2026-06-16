@@ -388,11 +388,34 @@ impl Cpu386 {
     }
 
     pub fn cycle<B: CpuBus>(&mut self, bus: &mut B) -> Result<CycleOutcome, CpuError> {
+        // Wake from HLT only when a maskable interrupt can actually be taken. The 386
+        // exits HLT on an enabled interrupt; a masked or IF-disabled request leaves it
+        // halted. NMI and the other non-maskable wake sources are out of scope.
         if self.halted {
-            return Ok(CycleOutcome {
-                core_clocks: 1,
-                halted: true,
-            });
+            if self.flag(FLAG_IF) && bus.interrupt_pending() {
+                self.halted = false;
+            } else {
+                return Ok(CycleOutcome {
+                    core_clocks: 1,
+                    halted: true,
+                });
+            }
+        }
+
+        // Service a pending hardware interrupt before fetching the next instruction.
+        if self.flag(FLAG_IF) && bus.interrupt_pending() {
+            if let Some(vector) = bus.acknowledge_interrupt() {
+                self.hardware_interrupt(bus, vector)
+                    .map_err(|fault| match fault {
+                        InternalFault::Cpu(error) => error,
+                        InternalFault::Exception { vector, .. } => CpuError::IdtLimit { vector },
+                    })?;
+                self.elapsed_clocks += 61;
+                return Ok(CycleOutcome {
+                    core_clocks: 61,
+                    halted: false,
+                });
+            }
         }
 
         let start_eip = self.registers.eip;
@@ -2612,22 +2635,36 @@ impl Cpu386 {
         if self.is_protected_mode() {
             self.deliver_exception(bus, vector, None)
         } else {
-            self.push(bus, self.registers.eflags as u16 as u32, OperandSize::Word)?;
-            self.push(
-                bus,
-                u32::from(self.registers.cs().selector),
-                OperandSize::Word,
-            )?;
-            self.push(bus, self.registers.eip as u16 as u32, OperandSize::Word)?;
-            self.set_flag(FLAG_IF | FLAG_TF, false);
-            let vector_address = u32::from(vector) * 4;
-            let ip =
-                bus.read_memory(vector_address, BusWidth::Word, BusAccessKind::DataRead)? as u16;
-            let cs = bus.read_memory(vector_address + 2, BusWidth::Word, BusAccessKind::DataRead)?
-                as u16;
-            self.load_segment_real(SegmentIndex::Cs, cs);
-            self.registers.eip = u32::from(ip);
-            Ok(())
+            self.real_mode_interrupt(bus, vector)
+        }
+    }
+
+    fn real_mode_interrupt<B: CpuBus>(&mut self, bus: &mut B, vector: u8) -> ExecResult<()> {
+        self.push(bus, self.registers.eflags as u16 as u32, OperandSize::Word)?;
+        self.push(
+            bus,
+            u32::from(self.registers.cs().selector),
+            OperandSize::Word,
+        )?;
+        self.push(bus, self.registers.eip as u16 as u32, OperandSize::Word)?;
+        self.set_flag(FLAG_IF | FLAG_TF, false);
+        let vector_address = u32::from(vector) * 4;
+        let ip = bus.read_memory(vector_address, BusWidth::Word, BusAccessKind::DataRead)? as u16;
+        let cs =
+            bus.read_memory(vector_address + 2, BusWidth::Word, BusAccessKind::DataRead)? as u16;
+        self.load_segment_real(SegmentIndex::Cs, cs);
+        self.registers.eip = u32::from(ip);
+        Ok(())
+    }
+
+    // Hardware interrupt entry. Unlike software_interrupt it does NOT call
+    // interrupt_acknowledge: that hook is the software-INT device side-effect path
+    // (the video mode-set), not the INTA handshake, which the PIC handled already.
+    fn hardware_interrupt<B: CpuBus>(&mut self, bus: &mut B, vector: u8) -> ExecResult<()> {
+        if self.is_protected_mode() {
+            self.deliver_exception(bus, vector, None)
+        } else {
+            self.real_mode_interrupt(bus, vector)
         }
     }
 
@@ -3415,6 +3452,7 @@ mod tests {
     struct TestBus {
         memory: Vec<u8>,
         trace: BusTrace,
+        pending_irq: Option<u8>,
     }
 
     impl TestBus {
@@ -3422,6 +3460,7 @@ mod tests {
             Self {
                 memory,
                 trace: BusTrace::default(),
+                pending_irq: None,
             }
         }
     }
@@ -3499,6 +3538,14 @@ mod tests {
                 0,
             ));
             Ok(())
+        }
+
+        fn interrupt_pending(&self) -> bool {
+            self.pending_irq.is_some()
+        }
+
+        fn acknowledge_interrupt(&mut self) -> Option<u8> {
+            self.pending_irq.take()
         }
     }
 
@@ -7347,5 +7394,91 @@ mod tests {
 
         assert_eq!(cpu.registers.eip, 0x00ee);
         assert!(!cpu.flag(FLAG_IF));
+    }
+
+    #[test]
+    fn hardware_irq_injects_when_if_enabled() {
+        // IVT[8] (physical 0x20) -> IP 0x00cc, CS 0. With IF=1 and a pending IRQ,
+        // cycle() vectors to the handler before the NOP at eip 0 can execute.
+        let mut memory = vec![0; 1024];
+        memory[0] = 0x90; // nop that must NOT run
+        memory[0x20] = 0xcc; // handler IP low byte
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        cpu.set_flag(FLAG_IF, true);
+        let mut bus = TestBus::with_memory(memory);
+        bus.pending_irq = Some(8);
+
+        let outcome = cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eip, 0x00cc);
+        assert!(!cpu.flag(FLAG_IF)); // delivery clears IF
+        assert!(!outcome.halted);
+        assert_eq!(bus.acknowledge_interrupt(), None); // the request was consumed
+    }
+
+    #[test]
+    fn hardware_irq_held_off_when_if_clear() {
+        // IF=0: the pending IRQ waits and the NOP at eip 0 runs instead.
+        let mut memory = vec![0; 1024];
+        memory[0] = 0x90; // nop
+        memory[0x20] = 0xcc;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.set_flag(FLAG_IF, false);
+        let mut bus = TestBus::with_memory(memory);
+        bus.pending_irq = Some(8);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eip, 1); // NOP executed, no vector taken
+        assert_eq!(bus.acknowledge_interrupt(), Some(8)); // still pending
+    }
+
+    #[test]
+    fn hlt_wakes_on_pending_irq() {
+        let mut memory = vec![0; 1024];
+        memory[0] = 0xf4; // hlt
+        memory[0x20] = 0xcc; // IVT[8] IP
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        cpu.set_flag(FLAG_IF, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        // First cycle executes HLT and halts.
+        assert!(cpu.cycle(&mut bus).unwrap().halted);
+
+        // A pending IRQ wakes the CPU and is delivered on the next cycle.
+        bus.pending_irq = Some(8);
+        let woken = cpu.cycle(&mut bus).unwrap();
+        assert!(!woken.halted);
+        assert_eq!(cpu.registers.eip, 0x00cc);
+    }
+
+    #[test]
+    fn hlt_stays_halted_without_deliverable_irq() {
+        let mut memory = vec![0; 1024];
+        memory[0] = 0xf4; // hlt
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.set_flag(FLAG_IF, true);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap(); // execute HLT
+
+        // No pending IRQ: stays halted.
+        assert!(cpu.cycle(&mut bus).unwrap().halted);
+
+        // Pending IRQ but IF=0: masked at the CPU, stays halted.
+        cpu.set_flag(FLAG_IF, false);
+        bus.pending_irq = Some(8);
+        assert!(cpu.cycle(&mut bus).unwrap().halted);
     }
 }
