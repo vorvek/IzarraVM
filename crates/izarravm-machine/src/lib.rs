@@ -23,6 +23,9 @@ pub const BOOT_SECTOR_ADDRESS: usize = 0x7c00;
 pub const BOOT_STAGE2_ADDRESS: usize = 0x8000;
 pub const BIOS_IRET_STUB_ADDRESS: usize = 0x0600;
 pub const RESULT_BLOCK_ADDRESS: usize = 0x9000;
+/// Fixed load segment for a .COM: PSP at linear 0x1000, clear of the IVT, the
+/// BIOS data area, the BIOS stub at 0x0600, and the boot result block at 0x9000.
+const DOS_LOAD_SEGMENT: u16 = 0x0100;
 
 #[derive(Debug, Error)]
 pub enum MachineError {
@@ -30,6 +33,8 @@ pub enum MachineError {
     Bus(#[from] BusError),
     #[error(transparent)]
     Cpu(#[from] CpuError),
+    #[error(transparent)]
+    Dos(#[from] izarravm_dos::DosError),
     #[error("test BIOS ROM must be exactly 64 KiB, got {0} bytes")]
     InvalidRomSize(usize),
     #[error("boot image must be exactly 1.44 MiB, got {0} bytes")]
@@ -97,6 +102,7 @@ pub enum StopReason {
     Halted,
     CycleLimit { requested: u64 },
     CpuError(String),
+    DosExit { code: u8 },
 }
 
 /// The OPL3 renders at this native rate; the Resonique 2 DAC outputs at 44100.
@@ -120,7 +126,8 @@ pub struct Machine {
     video: VgaTextMode,
     margo: Margo,
     margo_active: bool,
-    int10_pending: bool,
+    pending_soft_int: Option<u8>, // software-INT vector awaiting deferred dispatch
+    dos_stdout: Vec<u8>,          // captured DOS standard output (INT 21h AH=09h)
     rom: Vec<u8>,
     serial: SerialPort,
     device_ports: DevicePorts,
@@ -149,7 +156,8 @@ impl Machine {
             video: VgaTextMode::default(),
             margo: Margo::default(),
             margo_active: false,
-            int10_pending: false,
+            pending_soft_int: None,
+            dos_stdout: Vec::new(),
             rom: rom.to_vec(),
             serial: SerialPort::default(),
             device_ports: DevicePorts::default(),
@@ -189,7 +197,8 @@ impl Machine {
             video: VgaTextMode::default(),
             margo: Margo::default(),
             margo_active: false,
-            int10_pending: false,
+            pending_soft_int: None,
+            dos_stdout: Vec::new(),
             rom: vec![0; BIOS_ROM_SIZE],
             serial: SerialPort::default(),
             device_ports: DevicePorts::default(),
@@ -224,6 +233,55 @@ impl Machine {
         }
 
         install_boot_bios_stubs(&mut machine.memory)?;
+        Ok(machine)
+    }
+
+    /// Build a machine with a .COM program loaded and ready to run. The program is
+    /// placed at DOS_LOAD_SEGMENT with its PSP, and the CPU is set to its entry
+    /// (CS=DS=ES=SS=segment, IP=0x100, SP=0xFFFE). Run with run_until_halt_or_cycles
+    /// and read dos_output plus the DosExit stop reason.
+    pub fn new_dos_com(profile: MachineProfile, image: &[u8]) -> Result<Self, MachineError> {
+        let mut machine = Self {
+            memory: Memory::from_mib(profile.memory_mib)?,
+            profile,
+            cpu: Cpu386::default(),
+            video: VgaTextMode::default(),
+            margo: Margo::default(),
+            margo_active: false,
+            pending_soft_int: None,
+            dos_stdout: Vec::new(),
+            rom: vec![0; BIOS_ROM_SIZE],
+            serial: SerialPort::default(),
+            device_ports: DevicePorts::default(),
+            pic: pic::Pic8259Pair::default(),
+            pit: pit::Pit::default(),
+            pit_clocks: 0.0,
+            opl: OplChip::default(),
+            resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
+            opl_micros: 0.0,
+            margo_ns: 0.0,
+            trace: BusTrace::default(),
+            elapsed_clocks: 0,
+        };
+        debug_assert!(
+            machine.memory.len() as u64 <= u64::from(MARGO_LFB_BASE),
+            "system RAM overlaps the Margo LFB aperture at 0xE0000000"
+        );
+        install_boot_bios_stubs(&mut machine.memory)?;
+
+        let entry = izarravm_dos::load_com(image, &mut machine.memory, DOS_LOAD_SEGMENT)?;
+        let segment = SegmentRegister::real(entry.segment);
+        for index in [
+            SegmentIndex::Cs,
+            SegmentIndex::Ds,
+            SegmentIndex::Es,
+            SegmentIndex::Ss,
+        ] {
+            machine.cpu.registers.set_segment(index, segment);
+        }
+        machine.cpu.registers.eip = u32::from(entry.ip);
+        machine.cpu.registers.set_esp(u32::from(entry.sp));
+        machine.cpu.registers.eflags = 0x0000_0002;
         Ok(machine)
     }
 
@@ -274,7 +332,7 @@ impl Machine {
             pit: &mut self.pit,
             opl: &mut self.opl,
             trace: &mut self.trace,
-            int10_pending: &mut self.int10_pending,
+            pending_soft_int: &mut self.pending_soft_int,
             wait_states: self.profile.wait_states,
         }
     }
@@ -314,6 +372,50 @@ impl Machine {
         if (ax >> 8) == 0x4f {
             self.handle_vbe(ax as u8);
         }
+    }
+
+    /// Service a DOS software interrupt (INT 20h or INT 21h) host-side after the
+    /// instruction retires. The CPU registers are intact here (a software interrupt
+    /// only pushes flags/CS/IP), so the kernel reads and writes them through a
+    /// marshalled DosRegs. IVT[0x20]/[0x21] is an IRET stub, so the next cycle
+    /// returns to the caller with the results in place. DOS services are emulated
+    /// host-side (HLE); the hardware INT path is otherwise real. Returns Some(code)
+    /// when the program should terminate.
+    fn handle_dos_int(&mut self, vector: u8) -> Result<Option<u8>, izarravm_dos::DosError> {
+        let mut regs = izarravm_dos::DosRegs {
+            ax: self.cpu.registers.eax() as u16,
+            bx: self.cpu.registers.ebx() as u16,
+            cx: self.cpu.registers.ecx() as u16,
+            dx: self.cpu.registers.edx() as u16,
+            si: self.cpu.registers.esi() as u16,
+            di: self.cpu.registers.edi() as u16,
+            ds: self.cpu.registers.segment(SegmentIndex::Ds).selector,
+            es: self.cpu.registers.segment(SegmentIndex::Es).selector,
+            cf: self.cpu.registers.eflags & 0x1 != 0,
+        };
+        let action =
+            izarravm_dos::dispatch(vector, &mut regs, &mut self.memory, &mut self.dos_stdout)?;
+        // Marshal AX and CF back. Only these change in slice 1, but writing the pair
+        // keeps later slices that return BX/CX/DX from reworking this. CF is bit 0
+        // of eflags; the literal 0x1 is used because the CPU's FLAG_CF is private.
+        let eax = (self.cpu.registers.eax() & 0xffff_0000) | u32::from(regs.ax);
+        self.cpu.registers.set_eax(eax);
+        if regs.cf {
+            self.cpu.registers.eflags |= 0x1;
+        } else {
+            self.cpu.registers.eflags &= !0x1;
+        }
+        Ok(match action {
+            izarravm_dos::DosAction::Continue => None,
+            izarravm_dos::DosAction::Exit(code) => Some(code),
+        })
+    }
+
+    /// The bytes the DOS kernel has written to standard output (INT 21h AH=09h and,
+    /// in later slices, the character-output calls). Captured host-side for headless
+    /// runs; not yet rendered to the VGA text mode.
+    pub fn dos_output(&self) -> &[u8] {
+        &self.dos_stdout
     }
 
     /// VBE (`INT 10h`, `AH=4Fh`). `function` is `AL`. Unimplemented functions
@@ -538,7 +640,7 @@ impl Machine {
         requested: u64,
     ) -> Result<StopReason, MachineError> {
         while self.elapsed_clocks < deadline {
-            self.int10_pending = false;
+            self.pending_soft_int = None;
             let trace_before = self.trace.elapsed_clocks();
             let outcome = {
                 let Machine {
@@ -554,7 +656,7 @@ impl Machine {
                     pit,
                     opl,
                     trace,
-                    int10_pending,
+                    pending_soft_int,
                     ..
                 } = self;
                 let mut bus = MachineBus {
@@ -568,7 +670,7 @@ impl Machine {
                     pit,
                     opl,
                     trace,
-                    int10_pending,
+                    pending_soft_int,
                     wait_states: profile.wait_states,
                 };
                 cpu.cycle(&mut bus)
@@ -583,8 +685,20 @@ impl Machine {
                     // the overflow flag (the synthesis clock is driven separately
                     // by `render_audio`).
                     self.advance_devices(step);
-                    if self.int10_pending {
-                        self.handle_int10();
+                    if let Some(vector) = self.pending_soft_int {
+                        match vector {
+                            0x10 => self.handle_int10(),
+                            0x20 | 0x21 => match self.handle_dos_int(vector) {
+                                Ok(Some(code)) => return Ok(StopReason::DosExit { code }),
+                                Ok(None) => {}
+                                Err(error) => {
+                                    return Ok(StopReason::CpuError(format!(
+                                        "DOS INT {vector:#04x}: {error}"
+                                    )));
+                                }
+                            },
+                            _ => {}
+                        }
                     }
                     if outcome.halted {
                         match self.next_timer_wake(deadline) {
@@ -615,7 +729,7 @@ struct MachineBus<'a> {
     pit: &'a mut pit::Pit,
     opl: &'a mut OplChip,
     trace: &'a mut BusTrace,
-    int10_pending: &'a mut bool,
+    pending_soft_int: &'a mut Option<u8>,
     wait_states: WaitStateProfile,
 }
 
@@ -771,10 +885,13 @@ impl CpuBus for MachineBus<'_> {
             BusWidth::Byte,
             self.wait_states.io,
         ));
-        // Vector 0x10 reaches here only from a software INT today: the CPU never
-        // faults with vector 0x10. Revisit if an x87 #MF (vector 0x10) is added.
-        if vector == 0x10 {
-            *self.int10_pending = true;
+        // Record the software-INT vector for the deferred dispatch in the run loop,
+        // which has the CPU registers and memory to service it. 0x10 is the BIOS
+        // video service; 0x20/0x21 are the DOS kernel. Vector 0x10 reaches here
+        // only from a software INT today (the CPU never faults with vector 0x10);
+        // revisit if an x87 #MF is added.
+        if matches!(vector, 0x10 | 0x20 | 0x21) {
+            *self.pending_soft_int = Some(vector);
         }
         Ok(())
     }
@@ -917,7 +1034,7 @@ fn boot_sector_cpu() -> Cpu386 {
 }
 
 fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
-    for vector in [0x10, 0x13] {
+    for vector in [0x10, 0x13, 0x20, 0x21] {
         let address = vector * 4;
         memory.write_u16(address, BIOS_IRET_STUB_ADDRESS as u16)?;
         memory.write_u16(address + 2, 0)?;
@@ -1414,7 +1531,7 @@ mod tests {
             pit: &mut machine.pit,
             opl: &mut machine.opl,
             trace: &mut machine.trace,
-            int10_pending: &mut machine.int10_pending,
+            pending_soft_int: &mut machine.pending_soft_int,
             wait_states: machine.profile.wait_states,
         };
         f(&mut bus)
@@ -1783,6 +1900,42 @@ mod tests {
         assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
         machine.advance_devices(1);
         assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 0);
+    }
+
+    #[test]
+    fn dos_com_prints_string_and_exits() {
+        // org 0x100: mov ah,9; mov dx,0x010c; int 21; mov ax,4c00; int 21; db 'Hi$'
+        let com: &[u8] = &[
+            0xb4, 0x09, 0xba, 0x0c, 0x01, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21, b'H', b'i',
+            b'$',
+        ];
+        let mut machine =
+            Machine::new_dos_com(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com).unwrap();
+        let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
+        assert_eq!(machine.dos_output(), b"Hi");
+    }
+
+    #[test]
+    fn dos_com_exit_code_is_carried_through() {
+        // org 0x100: mov ax,4c07; int 21
+        let com: &[u8] = &[0xb8, 0x07, 0x4c, 0xcd, 0x21];
+        let mut machine =
+            Machine::new_dos_com(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com).unwrap();
+        let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
+        assert_eq!(reason, StopReason::DosExit { code: 7 });
+        assert!(machine.dos_output().is_empty());
+    }
+
+    #[test]
+    fn dos_com_unhandled_int21_returns_through_stub_and_exits() {
+        // org 0x100: mov ah,0x30 (unhandled); int 21; mov ax,4c00; int 21
+        let com: &[u8] = &[0xb4, 0x30, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21];
+        let mut machine =
+            Machine::new_dos_com(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com).unwrap();
+        let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
+        assert!(machine.dos_output().is_empty());
     }
 
     #[test]
