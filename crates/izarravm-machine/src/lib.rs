@@ -8,6 +8,7 @@ use izarravm_video::{
     MODE13H_MEMORY_SIZE, Margo, TextFrame, VGA_MODE13H_BASE, VGA_TEXT_BASE, VGA_TEXT_MEMORY_SIZE,
     VgaTextMode, VideoMode, vbe_mode,
 };
+use std::collections::VecDeque;
 use thiserror::Error;
 
 mod pic;
@@ -128,6 +129,7 @@ pub struct Machine {
     margo_active: bool,
     pending_soft_int: Option<u8>, // software-INT vector awaiting deferred dispatch
     dos_stdout: Vec<u8>,          // captured DOS standard output (INT 21h AH=09h)
+    dos_stdin: VecDeque<u8>,      // preloaded DOS standard input (slice 2 char I/O)
     rom: Vec<u8>,
     serial: SerialPort,
     device_ports: DevicePorts,
@@ -158,6 +160,7 @@ impl Machine {
             margo_active: false,
             pending_soft_int: None,
             dos_stdout: Vec::new(),
+            dos_stdin: VecDeque::new(),
             rom: rom.to_vec(),
             serial: SerialPort::default(),
             device_ports: DevicePorts::default(),
@@ -199,6 +202,7 @@ impl Machine {
             margo_active: false,
             pending_soft_int: None,
             dos_stdout: Vec::new(),
+            dos_stdin: VecDeque::new(),
             rom: vec![0; BIOS_ROM_SIZE],
             serial: SerialPort::default(),
             device_ports: DevicePorts::default(),
@@ -256,6 +260,7 @@ impl Machine {
             margo_active: false,
             pending_soft_int: None,
             dos_stdout: Vec::new(),
+            dos_stdin: VecDeque::new(),
             rom: vec![0; BIOS_ROM_SIZE],
             serial: SerialPort::default(),
             device_ports: DevicePorts::default(),
@@ -398,16 +403,28 @@ impl Machine {
             ds: self.cpu.registers.segment(SegmentIndex::Ds).selector,
             es: self.cpu.registers.segment(SegmentIndex::Es).selector,
             cf: self.cpu.registers.eflags & 0x1 != 0,
+            zf: self.cpu.registers.eflags & 0x40 != 0,
         };
-        let action =
-            izarravm_dos::dispatch(vector, &mut regs, &mut self.memory, &mut self.dos_stdout)?;
-        // Marshal the result back. Every general-purpose register and CF is written
+        let action = izarravm_dos::dispatch(
+            vector,
+            &mut regs,
+            &mut self.memory,
+            &mut self.dos_stdin,
+            &mut self.dos_stdout,
+        )?;
+        // Marshal the result back. Every general-purpose register is written
         // unconditionally so a later slice that returns a value in any of them (for
         // example AH=3Fh returns the byte count in CX) needs no change here. Only the
         // low 16 bits are touched, preserving each e-register's high half. DS and ES
         // are inputs to INT 21h; the rare functions that return a segment (AH=2Fh in
-        // ES) add their own write-back when implemented. CF is bit 0 of eflags; the
-        // literal 0x1 is used because the CPU's FLAG_CF is private to the cpu crate.
+        // ES) add their own write-back when implemented.
+        //
+        // The INT pushed FLAGS/CS/IP; after it the real-mode frame is [SS:SP]=IP,
+        // [SS:SP+2]=CS, [SS:SP+4]=FLAGS. handle_dos_int does not move the guest
+        // stack, so SS:SP+4 is the FLAGS image the IRET stub will pop. Returned
+        // flags must go there: writing live eflags would be discarded by that IRET.
+        let flags_addr = self.cpu.registers.segment(SegmentIndex::Ss).base
+            + u32::from((self.cpu.registers.esp() as u16).wrapping_add(4));
         let r = &mut self.cpu.registers;
         r.set_eax((r.eax() & 0xffff_0000) | u32::from(regs.ax));
         r.set_ebx((r.ebx() & 0xffff_0000) | u32::from(regs.bx));
@@ -415,11 +432,19 @@ impl Machine {
         r.set_edx((r.edx() & 0xffff_0000) | u32::from(regs.dx));
         r.set_esi((r.esi() & 0xffff_0000) | u32::from(regs.si));
         r.set_edi((r.edi() & 0xffff_0000) | u32::from(regs.di));
-        if regs.cf {
-            r.eflags |= 0x1;
+        // CF is bit 0, ZF is bit 6; FLAG_CF/FLAG_ZF are private to the cpu crate.
+        let mut flags = self.memory.read_u16(flags_addr as usize)?;
+        flags = if regs.cf {
+            flags | 0x0001
         } else {
-            r.eflags &= !0x1;
-        }
+            flags & !0x0001
+        };
+        flags = if regs.zf {
+            flags | 0x0040
+        } else {
+            flags & !0x0040
+        };
+        self.memory.write_u16(flags_addr as usize, flags)?;
         Ok(match action {
             izarravm_dos::DosAction::Continue => None,
             izarravm_dos::DosAction::Exit(code) => Some(code),
@@ -431,6 +456,13 @@ impl Machine {
     /// runs; not yet rendered to the VGA text mode.
     pub fn dos_output(&self) -> &[u8] {
         &self.dos_stdout
+    }
+
+    /// Replace the DOS standard-input buffer, consumed front to back by the
+    /// character-input calls. An exhausted buffer yields ^Z (EOF) for the blocking
+    /// reads (AH=01h/08h); AH=06h reports an empty buffer through ZF.
+    pub fn set_dos_stdin(&mut self, bytes: &[u8]) {
+        self.dos_stdin = bytes.iter().copied().collect();
     }
 
     /// VBE (`INT 10h`, `AH=4Fh`). `function` is `AL`. Unimplemented functions
@@ -1990,6 +2022,50 @@ mod tests {
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
         assert_eq!(reason, StopReason::DosExit { code: 0 });
         assert_eq!(machine.dos_output(), b"Hello, world!\r\n");
+    }
+
+    #[test]
+    fn dos_com_ah06_zf_reaches_the_guest() {
+        // org 0x100: AH=06h DL=0xFF; INT 21h; JZ empty; echo AL via AH=02h; else '!'
+        // Proves ZF returned by AH=06h survives the IRET (it is written to the pushed
+        // FLAGS image, not just live eflags which the IRET would discard).
+        let com: &[u8] = &[
+            0xb4, 0x06, 0xb2, 0xff, 0xcd, 0x21, 0x74, 0x08, 0x88, 0xc2, 0xb4, 0x02, 0xcd, 0x21,
+            0xeb, 0x06, 0xb2, 0x21, 0xb4, 0x02, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21,
+        ];
+
+        let mut available =
+            Machine::new_dos_com(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com).unwrap();
+        available.set_dos_stdin(b"X");
+        assert_eq!(
+            available.run_until_halt_or_cycles(100_000).unwrap(),
+            StopReason::DosExit { code: 0 }
+        );
+        assert_eq!(available.dos_output(), b"X"); // char path taken, AL echoed
+
+        let mut empty =
+            Machine::new_dos_com(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com).unwrap();
+        assert_eq!(
+            empty.run_until_halt_or_cycles(100_000).unwrap(),
+            StopReason::DosExit { code: 0 }
+        );
+        assert_eq!(empty.dos_output(), b"!"); // empty path taken (ZF=1)
+    }
+
+    #[test]
+    fn dos_com_echoes_input() {
+        // org 0x100: AH=01h; INT 21h (x2, each echoes); AH=4Ch exit
+        let com: &[u8] = &[
+            0xb4, 0x01, 0xcd, 0x21, 0xb4, 0x01, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21,
+        ];
+        let mut machine =
+            Machine::new_dos_com(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com).unwrap();
+        machine.set_dos_stdin(b"hi");
+        assert_eq!(
+            machine.run_until_halt_or_cycles(100_000).unwrap(),
+            StopReason::DosExit { code: 0 }
+        );
+        assert_eq!(machine.dos_output(), b"hi");
     }
 
     #[test]
