@@ -207,7 +207,7 @@ line exclusive-ORs into the screen, which is the classic way to draw and erase a
 rubber-band selection without saving the background.
 
 ```c
-/* (target) */
+/* (verified) */
 void draw_line(unsigned long base, int pitch, int bpp,
                int x0, int y0, int x1, int y1, unsigned long color) {
     margo_wait();

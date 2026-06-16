@@ -1706,4 +1706,34 @@ mod tests {
         machine.advance_devices(1);
         assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 0);
     }
+
+    #[test]
+    fn line_through_the_mmio_aperture_draws_and_times_busy() {
+        let mut machine = test_machine();
+        // draw_line: a horizontal 5-pixel line at y=5 from x=10 to x=14, pitch 640,
+        // depth 1, FG 0xAB. ROP 0xCC draws solid for LINE (it has no source).
+        write_mmio_reg(&mut machine, 0x100, 0); // DST_BASE
+        write_mmio_reg(&mut machine, 0x104, 640); // DST_PITCH
+        write_mmio_reg(&mut machine, 0x110, 1); // DEPTH
+        write_mmio_reg(&mut machine, 0x13c, (5 << 16) | 10); // LINE_START: (10,5)
+        write_mmio_reg(&mut machine, 0x140, (5 << 16) | 14); // LINE_END: (14,5)
+        write_mmio_reg(&mut machine, 0x120, 0xab); // FG_COLOR
+        write_mmio_reg(&mut machine, 0x128, 0xcc); // ROP (solid for LINE)
+        write_mmio_reg(&mut machine, 0x150, 0x05); // COMMAND: LINE
+
+        // The five pixels (x=10..14, y=5) are set; the pixel just left is not.
+        for x in 10u32..=14 {
+            assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 5 * 640 + x), 0xab);
+        }
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 5 * 640 + 9), 0x00);
+        // BUSY set right after the command.
+        assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
+
+        // 5 pixels -> busy_ns = 100 + 5*10 = 150 ns. At 25 MHz (40 ns/clock), three
+        // clocks (120 ns) leave it busy; the fourth clears it.
+        machine.advance_devices(3);
+        assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
+        machine.advance_devices(1);
+        assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 0);
+    }
 }
