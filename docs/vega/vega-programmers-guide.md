@@ -122,7 +122,7 @@ the command, wait for idle. A solid fill uses `FG_COLOR` and the `PATCOPY`
 raster op.
 
 ```c
-/* (target) */
+/* (verified) */
 void fill_rect(unsigned long base, int pitch, int bpp,
                int x, int y, int w, int h, unsigned long color) {
     margo_wait();

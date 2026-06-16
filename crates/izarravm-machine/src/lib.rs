@@ -125,6 +125,7 @@ pub struct Machine {
     opl: OplChip,
     resampler: Resampler,
     opl_micros: f64, // fractional microseconds owed to the OPL timers
+    margo_ns: f64,   // fractional nanoseconds owed to the Margo busy countdown
     trace: BusTrace,
     elapsed_clocks: u64,
 }
@@ -151,6 +152,7 @@ impl Machine {
             opl: OplChip::default(),
             resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             opl_micros: 0.0,
+            margo_ns: 0.0,
             trace: BusTrace::default(),
             elapsed_clocks: 0,
         };
@@ -188,6 +190,7 @@ impl Machine {
             opl: OplChip::default(),
             resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             opl_micros: 0.0,
+            margo_ns: 0.0,
             trace: BusTrace::default(),
             elapsed_clocks: 0,
         };
@@ -432,13 +435,18 @@ impl Machine {
         self.elapsed_clocks
     }
 
-    /// Advance time-based devices (currently the OPL timers) by `clocks` of CPU
-    /// time, converting to microseconds and carrying the fractional remainder.
+    /// Advance time-based devices by `clocks` of CPU time, carrying fractional
+    /// remainders for both microsecond (OPL) and nanosecond (Margo) domains.
     fn advance_devices(&mut self, clocks: u64) {
         self.opl_micros += clocks as f64 * 1_000_000.0 / self.profile.clock_hz as f64;
         let whole = self.opl_micros.floor();
         self.opl.advance_micros(whole as u64);
         self.opl_micros -= whole;
+
+        self.margo_ns += clocks as f64 * 1_000_000_000.0 / self.profile.clock_hz as f64;
+        let whole_ns = self.margo_ns.floor();
+        self.margo.advance_busy(whole_ns as u64);
+        self.margo_ns -= whole_ns;
     }
 
     /// Render `native_samples` of OPL3 output at 49716 Hz and return the
@@ -1552,5 +1560,44 @@ mod tests {
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
         assert_eq!(reason, StopReason::Halted);
         assert_eq!(machine.cpu().registers.eax() as u16, 0x014f);
+    }
+
+    // Write/read a 32-bit Margo register through the MMIO aperture.
+    fn write_mmio_reg(machine: &mut Machine, offset: u32, value: u32) {
+        for (i, b) in value.to_le_bytes().into_iter().enumerate() {
+            machine.write_physical_u8(MARGO_MMIO_BASE + offset + i as u32, b);
+        }
+    }
+
+    fn read_mmio_reg(machine: &mut Machine, offset: u32) -> u32 {
+        let mut value = 0u32;
+        for i in 0..4 {
+            value |= u32::from(machine.read_physical_u8(MARGO_MMIO_BASE + offset + i)) << (8 * i);
+        }
+        value
+    }
+
+    #[test]
+    fn fill_through_the_mmio_aperture_writes_vram_and_times_busy() {
+        let mut machine = test_machine();
+        // Latch a 5x4 fill at (3, 2), pitch 640, depth 1, color 0xAB, solid.
+        write_mmio_reg(&mut machine, 0x100, 0); // DST_BASE
+        write_mmio_reg(&mut machine, 0x104, 640); // DST_PITCH
+        write_mmio_reg(&mut machine, 0x110, 1); // DEPTH
+        write_mmio_reg(&mut machine, 0x114, (2 << 16) | 3); // DST_XY: y=2, x=3
+        write_mmio_reg(&mut machine, 0x11c, (4 << 16) | 5); // DIM: h=4, w=5
+        write_mmio_reg(&mut machine, 0x120, 0xab); // FG_COLOR
+        write_mmio_reg(&mut machine, 0x128, 0xf0); // ROP: PATCOPY
+        write_mmio_reg(&mut machine, 0x150, 0x01); // COMMAND: FILL
+
+        // VRAM filled (read the top-left filled pixel back through the LFB).
+        let pixel = MARGO_LFB_BASE + 2 * 640 + 3;
+        assert_eq!(machine.read_physical_u8(pixel), 0xab);
+        // BUSY is set right after the command.
+        assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
+
+        // Advance past the modeled time (20 pixels -> 200 ns); BUSY clears.
+        machine.advance_devices(machine.profile().clock_hz / 1_000);
+        assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 0);
     }
 }
