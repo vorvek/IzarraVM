@@ -176,6 +176,8 @@ fn dispatch_int21(
                     None => regs.zf = true,
                 }
             } else {
+                // Output form: ZF is undefined for AH=06h output, so leave regs.zf
+                // at the guest value rather than clobbering it.
                 let ch = regs.dx as u8;
                 stdout.push(ch);
                 regs.ax = (regs.ax & 0xff00) | u16::from(ch);
