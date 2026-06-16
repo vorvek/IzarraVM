@@ -275,13 +275,55 @@ impl Machine {
 
     /// Service the host side of an `INT 10h` after the instruction retires.
     /// The CPU registers are intact here: a software interrupt only pushes
-    /// flags/CS/IP. VBE functions (`AH=4Fh`) land in later tasks.
+    /// flags/CS/IP.
     fn handle_int10(&mut self) {
         let ax = self.cpu.registers.eax() as u16;
         if ax == 0x0013 {
             self.video.set_mode13h();
             self.margo_active = false;
+            return;
         }
+        if (ax >> 8) == 0x4f {
+            self.handle_vbe(ax as u8);
+        }
+    }
+
+    /// VBE (`INT 10h`, `AH=4Fh`). `function` is `AL`. Unimplemented functions
+    /// leave `AX` unchanged, so `AL != 0x4F` signals "not supported" to the guest.
+    fn handle_vbe(&mut self, function: u8) {
+        match function {
+            0x02 => self.vbe_set_mode(),
+            0x03 => self.vbe_current_mode(),
+            _ => {}
+        }
+    }
+
+    /// Set the `AX` low word to a VBE status (`0x004F` ok, `0x014F` failed),
+    /// preserving the high word.
+    fn set_vbe_status(&mut self, status: u16) {
+        let eax = (self.cpu.registers.eax() & 0xffff_0000) | u32::from(status);
+        self.cpu.registers.set_eax(eax);
+    }
+
+    fn vbe_set_mode(&mut self) {
+        let mode = self.cpu.registers.ebx() as u16 & 0x01ff;
+        if self.margo.set_mode(mode) {
+            self.margo_active = true;
+            self.set_vbe_status(0x004f);
+        } else {
+            self.set_vbe_status(0x014f);
+        }
+    }
+
+    fn vbe_current_mode(&mut self) {
+        let mode = if self.margo_active {
+            self.margo.display().mode
+        } else {
+            0x0003
+        };
+        let ebx = (self.cpu.registers.ebx() & 0xffff_0000) | u32::from(mode);
+        self.cpu.registers.set_ebx(ebx);
+        self.set_vbe_status(0x004f);
     }
 
     pub fn set_margo_mode_640x480x8(&mut self) {
@@ -1100,6 +1142,79 @@ mod tests {
         assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
         assert_eq!(machine.margo().display().width, 640);
         assert_eq!(machine.margo().display().height, 480);
+    }
+
+    #[test]
+    fn vbe_set_mode_selects_a_margo_mode() {
+        let rom = rom_with_code(&[
+            0xb8, 0x02, 0x4f, // mov ax, 4F02h
+            0xbb, 0x01, 0x41, // mov bx, 0101h | 4000h (LFB)
+            0xcd, 0x10, // int 10h
+            0xf4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(machine.cpu().registers.eax() as u16, 0x004f);
+        assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
+        assert_eq!(machine.margo().display().width, 640);
+        assert_eq!(machine.margo().display().height, 480);
+    }
+
+    #[test]
+    fn vbe_set_mode_then_vga_mode_follows_the_display() {
+        let rom = rom_with_code(&[
+            0xb8, 0x02, 0x4f, // mov ax, 4F02h
+            0xbb, 0x01, 0x41, // mov bx, 0101h | 4000h
+            0xcd, 0x10, // int 10h
+            0xb8, 0x13, 0x00, // mov ax, 0013h
+            0xcd, 0x10, // int 10h
+            0xf4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(machine.active_display(), ActiveDisplay::Mode13h);
+    }
+
+    #[test]
+    fn vbe_set_mode_rejects_hi_color_modes() {
+        let rom = rom_with_code(&[
+            0xb8, 0x02, 0x4f, // mov ax, 4F02h
+            0xbb, 0x11, 0x01, // mov bx, 0111h (640x480x16, not in this slice)
+            0xcd, 0x10, // int 10h
+            0xf4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(machine.cpu().registers.eax() as u16, 0x014f);
+        assert_eq!(machine.active_display(), ActiveDisplay::Text);
+    }
+
+    #[test]
+    fn vbe_current_mode_returns_the_set_mode() {
+        let rom = rom_with_code(&[
+            0xb8, 0x02, 0x4f, // mov ax, 4F02h
+            0xbb, 0x01, 0x41, // mov bx, 0101h | 4000h
+            0xcd, 0x10, // int 10h
+            0xb8, 0x03, 0x4f, // mov ax, 4F03h
+            0xcd, 0x10, // int 10h
+            0xf4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(machine.cpu().registers.eax() as u16, 0x004f);
+        assert_eq!(machine.cpu().registers.ebx() as u16, 0x0101);
     }
 
     #[test]

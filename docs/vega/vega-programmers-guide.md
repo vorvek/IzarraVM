@@ -66,7 +66,7 @@ This example selects mode `0x101`, 640x480 at 8-bit color, with the linear frame
 buffer.
 
 ```c
-/* (target) */
+/* (verified) */
 #include <dos.h>
 
 void set_mode_640x480x8(void) {
