@@ -178,7 +178,7 @@ const COM_MAX_LEN: usize = 0x10000 - 0x100;
 pub struct ProgramEntry {
     pub segment: u16, // CS = DS = ES = SS
     pub ip: u16,      // 0x0100
-    pub sp: u16,      // 0xFFFE
+    pub sp: u16,      // 0xfffe
 }
 
 /// Load a .COM image into `mem` at `segment` and build its PSP. Returns the entry
@@ -202,7 +202,8 @@ pub fn load_com(image: &[u8], mem: &mut Memory, segment: u16) -> Result<ProgramE
         mem.write_u8(base + 0x100 + index, byte)?;
     }
     // .COM stack: SP=0xFFFE with a 0x0000 return word, so a bare RET lands at
-    // PSP:0 and hits the INT 20h.
+    // PSP:0 and hits the INT 20h. Written after the image, so a maximum-size image
+    // has its last two bytes overwritten by this word, which is what real DOS does.
     mem.write_u16(base + 0xfffe, 0x0000)?;
     Ok(ProgramEntry {
         segment,
@@ -361,6 +362,7 @@ mod tests {
         let base = 0x0100usize * 16;
         assert_eq!(mem.read_u8(base).unwrap(), 0xcd); // INT 20h opcode at PSP:0
         assert_eq!(mem.read_u8(base + 1).unwrap(), 0x20);
+        assert_eq!(mem.read_u16(base + 0x02).unwrap(), 0x1100); // top-of-memory paragraph
         assert_eq!(mem.read_u8(base + 0x80).unwrap(), 0x00); // empty command tail length
         assert_eq!(mem.read_u8(base + 0x81).unwrap(), 0x0d);
         assert_eq!(mem.read_u8(base + 0x100).unwrap(), 0xb8); // image lands at 0x100
@@ -371,10 +373,11 @@ mod tests {
     #[test]
     fn load_com_rejects_oversize_image() {
         let mut mem = Memory::new(1024 * 1024).unwrap();
-        let image = vec![0x90; 0x10000 - 0x100 + 1]; // one byte over the .COM limit
-        assert!(matches!(
-            load_com(&image, &mut mem, 0x0100),
-            Err(DosError::ComTooLarge(_))
-        ));
+        let len = 0x10000 - 0x100 + 1; // one byte over the .COM limit
+        let image = vec![0x90; len];
+        match load_com(&image, &mut mem, 0x0100) {
+            Err(DosError::ComTooLarge(reported)) => assert_eq!(reported, len),
+            other => panic!("expected ComTooLarge, got {other:?}"),
+        }
     }
 }
