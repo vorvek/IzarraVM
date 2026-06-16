@@ -353,6 +353,12 @@ impl Machine {
         bus.read_memory_bytes(address, 1).map(|b| b[0]).unwrap_or(0)
     }
 
+    /// Last byte written to a passive I/O port (such as 0x80, the POST diagnostic
+    /// port), or None if the port is not decoded.
+    pub fn io_port(&self, port: u16) -> Option<u8> {
+        self.device_ports.read_port(port)
+    }
+
     pub fn write_physical_u8(&mut self, address: u32, value: u8) {
         let mut bus = self.make_bus();
         let _ = bus.write_memory_byte(address, value);
@@ -1262,6 +1268,18 @@ mod tests {
         rom[..code.len()].copy_from_slice(code);
         rom[0xfff0..0xfff5].copy_from_slice(&[0xea, 0x00, 0x00, 0x00, 0xf0]);
         rom
+    }
+
+    #[test]
+    fn io_port_reports_last_post_write() {
+        // mov al,0x42; out 0x80,al; hlt
+        let mut machine = Machine::new(
+            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            rom_with_code(&[0xb0, 0x42, 0xe6, 0x80, 0xf4]),
+        )
+        .unwrap();
+        machine.run_until_halt_or_cycles(10_000).unwrap();
+        assert_eq!(machine.io_port(0x80), Some(0x42));
     }
 
     fn read_u16(machine: &mut Machine, addr: u32) -> u16 {
