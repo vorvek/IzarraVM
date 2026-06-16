@@ -193,6 +193,7 @@ void draw_glyph_8x8(unsigned long base, int pitch, int bpp,
     REG(0x011C) = (8 << 16) | 8;        /* DIM = 8x8 */
     REG(0x0120) = fg;                   /* FG_COLOR */
     REG(0x0130) = 0x04;                 /* FLAGS = EXPAND_TRANSPARENT */
+    REG(0x0128) = 0xCC;                 /* ROP = SRCCOPY (S = expanded pixel) */
     REG(0x0150) = 0x03;                 /* COMMAND = COLOR_EXPAND_DATA */
     for (row = 0; row < 8; row++)
         REG(0x0160) = (unsigned long)glyph[row] << 24;  /* bits in the high byte */
@@ -217,7 +218,7 @@ void draw_line(unsigned long base, int pitch, int bpp,
     REG(0x013C) = (y0 << 16) | x0;      /* LINE_START */
     REG(0x0140) = (y1 << 16) | x1;      /* LINE_END */
     REG(0x0120) = color;                /* FG_COLOR */
-    REG(0x0128) = 0xCC;                 /* ROP = SRCCOPY */
+    REG(0x0128) = 0xF0;                 /* ROP = PATCOPY (solid; LINE has no source) */
     REG(0x0150) = 0x05;                 /* COMMAND = LINE */
     margo_wait();
 }

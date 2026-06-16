@@ -1662,6 +1662,7 @@ mod tests {
         write_mmio_reg(&mut machine, 0x11c, (8 << 16) | 8); // DIM: 8x8
         write_mmio_reg(&mut machine, 0x120, 0xab); // FG_COLOR
         write_mmio_reg(&mut machine, 0x130, 0x04); // FLAGS: EXPAND_TRANSPARENT
+        write_mmio_reg(&mut machine, 0x128, 0xcc); // ROP: SRCCOPY (S = expanded pixel)
         write_mmio_reg(&mut machine, 0x150, 0x03); // COMMAND: COLOR_EXPAND_DATA
 
         // Armed: BUSY set before any data, nothing drawn yet.
@@ -1711,14 +1712,15 @@ mod tests {
     fn line_through_the_mmio_aperture_draws_and_times_busy() {
         let mut machine = test_machine();
         // draw_line: a horizontal 5-pixel line at y=5 from x=10 to x=14, pitch 640,
-        // depth 1, FG 0xAB. ROP 0xCC draws solid for LINE (it has no source).
+        // depth 1, FG 0xAB. ROP 0xF0 (PATCOPY) draws solid; LINE has no source, so
+        // the pattern (FG) is the right input, not SRCCOPY.
         write_mmio_reg(&mut machine, 0x100, 0); // DST_BASE
         write_mmio_reg(&mut machine, 0x104, 640); // DST_PITCH
         write_mmio_reg(&mut machine, 0x110, 1); // DEPTH
         write_mmio_reg(&mut machine, 0x13c, (5 << 16) | 10); // LINE_START: (10,5)
         write_mmio_reg(&mut machine, 0x140, (5 << 16) | 14); // LINE_END: (14,5)
         write_mmio_reg(&mut machine, 0x120, 0xab); // FG_COLOR
-        write_mmio_reg(&mut machine, 0x128, 0xcc); // ROP (solid for LINE)
+        write_mmio_reg(&mut machine, 0x128, 0xf0); // ROP: PATCOPY (solid; LINE has no source)
         write_mmio_reg(&mut machine, 0x150, 0x05); // COMMAND: LINE
 
         // The five pixels (x=10..14, y=5) are set; the pixel just left is not.
