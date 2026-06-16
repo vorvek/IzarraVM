@@ -6,6 +6,50 @@ pub const MARGO_MMIO_SIZE: usize = 0x0001_0000; // 64 KB register block
 pub const MARGO_ID_VALUE: u32 = 0x4D47_0100; // 'M' 'G', version 1.00
 pub const MARGO_CAPS_VALUE: u32 = 0x0000_0000; // no engine ops in this slice
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VbeMode {
+    pub number: u16,
+    pub width: u32,
+    pub height: u32,
+    pub bpp: u32,
+}
+
+/// The modes Margo lists, reports, and sets. Slice 2b implements the 8-bit
+/// indexed modes only; hi-color modes arrive in a later slice.
+pub const MARGO_VBE_MODES: &[VbeMode] = &[
+    VbeMode {
+        number: 0x100,
+        width: 640,
+        height: 400,
+        bpp: 8,
+    },
+    VbeMode {
+        number: 0x101,
+        width: 640,
+        height: 480,
+        bpp: 8,
+    },
+    VbeMode {
+        number: 0x103,
+        width: 800,
+        height: 600,
+        bpp: 8,
+    },
+    VbeMode {
+        number: 0x105,
+        width: 1024,
+        height: 768,
+        bpp: 8,
+    },
+];
+
+pub fn vbe_mode(number: u16) -> Option<VbeMode> {
+    MARGO_VBE_MODES
+        .iter()
+        .copied()
+        .find(|mode| mode.number == number)
+}
+
 pub const REG_ID: usize = 0x0000;
 pub const REG_CAPS: usize = 0x0004;
 pub const REG_STATUS: usize = 0x0008;
@@ -49,15 +93,24 @@ impl Margo {
         self.display
     }
 
-    pub fn set_mode_640x480x8(&mut self) {
+    /// Set the display to a VBE mode. Returns false for modes outside the table.
+    pub fn set_mode(&mut self, number: u16) -> bool {
+        let Some(mode) = vbe_mode(number) else {
+            return false;
+        };
         self.display = MargoDisplay {
-            mode: 0x0101,
-            width: 640,
-            height: 480,
-            bpp: 8,
-            pitch: 640,
+            mode: mode.number,
+            width: mode.width,
+            height: mode.height,
+            bpp: mode.bpp,
+            pitch: mode.width * mode.bpp / 8,
             start: 0,
         };
+        true
+    }
+
+    pub fn set_mode_640x480x8(&mut self) {
+        self.set_mode(0x101);
     }
 
     pub fn read_vram_u8(&self, offset: usize) -> u8 {
@@ -193,5 +246,42 @@ mod tests {
         assert_eq!(surface.len(), 640 * 480);
         assert_eq!(surface[0], 0x11);
         assert_eq!(surface[last], 0x22);
+    }
+
+    #[test]
+    fn set_mode_looks_up_the_table() {
+        let mut margo = Margo::default();
+        assert!(margo.set_mode(0x103));
+        assert_eq!(margo.display().mode, 0x103);
+        assert_eq!(margo.display().width, 800);
+        assert_eq!(margo.display().height, 600);
+        assert_eq!(margo.display().bpp, 8);
+        assert_eq!(margo.display().pitch, 800);
+    }
+
+    #[test]
+    fn set_mode_rejects_modes_outside_the_table() {
+        let mut margo = Margo::default();
+        assert!(!margo.set_mode(0x111)); // 640x480x16, not implemented in this slice
+        assert_eq!(margo.display(), MargoDisplay::default());
+    }
+
+    #[test]
+    fn set_mode_640x480x8_wrapper_still_sets_0x101() {
+        let mut margo = Margo::default();
+        margo.set_mode_640x480x8();
+        assert_eq!(margo.display().mode, 0x101);
+        assert_eq!(margo.display().width, 640);
+        assert_eq!(margo.display().height, 480);
+        assert_eq!(margo.display().pitch, 640);
+    }
+
+    #[test]
+    fn vbe_mode_lookup_finds_table_entries() {
+        assert_eq!(
+            vbe_mode(0x105).map(|m| (m.width, m.height)),
+            Some((1024, 768))
+        );
+        assert!(vbe_mode(0x999).is_none());
     }
 }

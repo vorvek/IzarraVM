@@ -3,7 +3,10 @@ use thiserror::Error;
 
 pub mod margo;
 
-pub use margo::{MARGO_ID_VALUE, MARGO_MMIO_SIZE, MARGO_VRAM_SIZE, Margo, MargoDisplay};
+pub use margo::{
+    MARGO_ID_VALUE, MARGO_MMIO_SIZE, MARGO_VBE_MODES, MARGO_VRAM_SIZE, Margo, MargoDisplay,
+    VbeMode, vbe_mode,
+};
 
 pub const MODE13H_WIDTH: u32 = 320;
 pub const MODE13H_HEIGHT: u32 = 200;
