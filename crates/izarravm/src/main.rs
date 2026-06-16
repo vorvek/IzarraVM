@@ -11,7 +11,7 @@ use izarravm_machine::{ActiveDisplay, Machine, MachineProfile, StopReason};
 use izarravm_video::{Framebuffer, MargoDisplay, PlaceholderVideoAdapter, TextFrame, VideoAdapter};
 use std::error::Error;
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use tracing::info;
@@ -28,6 +28,10 @@ const WINDOW_WIDTH: u32 = 1280;
 const WINDOW_HEIGHT: u32 = 400;
 const MODE13H_SCALE: usize = 2;
 const MARGO_LFB_SCALE: usize = 1;
+/// Default cycle budget for --headless-test-rom. Large enough that test386.bin
+/// reaches its POST-0x03 fault out of the box; halting ROMs return at their HLT
+/// well before this, and --cycles tunes it down for quick runs.
+const DEFAULT_TEST_ROM_CYCLES: u64 = 200_000_000;
 const VGA_PALETTE: [u32; 16] = [
     0x000000, 0x0000aa, 0x00aa00, 0x00aaaa, 0xaa0000, 0xaa00aa, 0xaa5500, 0xaaaaaa, 0x555555,
     0x5555ff, 0x55ff55, 0x55ffff, 0xff5555, 0xff55ff, 0xffff55, 0xffffff,
@@ -60,6 +64,10 @@ struct Cli {
     headless_run_com: Option<PathBuf>,
     #[arg(long)]
     stdin_text: Option<String>,
+    #[arg(long)]
+    bios: Option<PathBuf>,
+    #[arg(long)]
+    cycles: Option<u64>,
     #[arg(long)]
     margo_test_pattern: bool,
     #[arg(long, env = "IZARRAVM_DOSROOT")]
@@ -153,9 +161,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     if cli.headless_test_rom {
-        let mut machine =
-            Machine::new(MachineProfile::from_hardware_profile(&hardware), test_rom())?;
-        let stop_reason = machine.run_until_halt_or_cycles(5_000_000)?;
+        let rom = select_rom(cli.bios.as_deref())?;
+        let mut machine = Machine::new(MachineProfile::from_hardware_profile(&hardware), &rom)?;
+        let budget = cli.cycles.unwrap_or(DEFAULT_TEST_ROM_CYCLES);
+        let stop_reason = machine.run_until_halt_or_cycles(budget)?;
         let screen = machine.screen_text();
         let screen_text = screen.as_text();
         info!(
@@ -166,11 +175,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             "test ROM completed"
         );
         println!("{screen_text}");
+        println!("post: {:#04x}", machine.io_port(0x80).unwrap_or(0));
         println!("stop: {stop_reason:?}");
         return Ok(());
     }
 
-    let mut machine = Machine::new(MachineProfile::from_hardware_profile(&hardware), test_rom())?;
+    let rom = select_rom(cli.bios.as_deref())?;
+    let mut machine = Machine::new(MachineProfile::from_hardware_profile(&hardware), &rom)?;
     if cli.margo_test_pattern {
         load_margo_test_pattern(&mut machine);
     }
@@ -196,6 +207,14 @@ fn load_config(cli: &Cli) -> Result<AppConfig, Box<dyn Error>> {
     });
 
     Ok(config)
+}
+
+/// The BIOS ROM to boot: the file passed with --bios, or the built-in test ROM.
+fn select_rom(bios: Option<&Path>) -> Result<Vec<u8>, Box<dyn Error>> {
+    match bios {
+        Some(path) => Ok(std::fs::read(path)?),
+        None => Ok(test_rom().to_vec()),
+    }
 }
 
 fn run_window(
@@ -683,6 +702,11 @@ mod tests {
         // Bottom-right visible pixel was written (not left at zero).
         let last = (display.pitch * (display.height - 1) + (display.width - 1)) as usize;
         assert_ne!(machine.margo().vram()[last], 0);
+    }
+
+    #[test]
+    fn select_rom_without_bios_returns_the_builtin_test_rom() {
+        assert_eq!(select_rom(None).unwrap(), test_rom().to_vec());
     }
 
     #[test]
