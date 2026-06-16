@@ -9,6 +9,7 @@ authors.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+izarravm-bus = { path = "../izarravm-bus" }
 
 [dev-dependencies]
 tempfile.workspace = true
