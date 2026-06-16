@@ -319,7 +319,7 @@ impl Machine {
         let mode = if self.margo_active {
             self.margo.display().mode
         } else {
-            0x0003
+            0x0003 // VBE mode 0003h: standard 80x25 text fallback
         };
         let ebx = (self.cpu.registers.ebx() & 0xffff_0000) | u32::from(mode);
         self.cpu.registers.set_ebx(ebx);
@@ -1178,6 +1178,9 @@ mod tests {
 
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
         assert_eq!(reason, StopReason::Halted);
+        // The VGA mode-set hands the display back to VGA, but the 4F02 call must
+        // still have set the Margo mode (width stays set; only margo_active clears).
+        assert_eq!(machine.margo().display().width, 640);
         assert_eq!(machine.active_display(), ActiveDisplay::Mode13h);
     }
 
