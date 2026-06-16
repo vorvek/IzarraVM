@@ -2104,6 +2104,7 @@ mod tests {
         write_mmio_reg(&mut machine, 0x11c, (8 << 16) | 8); // DIM: 8x8
         write_mmio_reg(&mut machine, 0x120, 0xab); // FG_COLOR
         write_mmio_reg(&mut machine, 0x130, 0x04); // FLAGS: EXPAND_TRANSPARENT
+        write_mmio_reg(&mut machine, 0x128, 0xcc); // ROP: SRCCOPY (S = expanded pixel)
         write_mmio_reg(&mut machine, 0x150, 0x03); // COMMAND: COLOR_EXPAND_DATA
 
         // Armed: BUSY set before any data, nothing drawn yet.
@@ -2160,5 +2161,70 @@ mod tests {
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
         assert_eq!(reason, StopReason::DosExit { code: 0 });
         assert_eq!(machine.dos_output(), b"hi");
+    }
+
+    #[test]
+    fn line_through_the_mmio_aperture_draws_and_times_busy() {
+        let mut machine = test_machine();
+        // draw_line: a horizontal 5-pixel line at y=5 from x=10 to x=14, pitch 640,
+        // depth 1, FG 0xAB. ROP 0xF0 (PATCOPY) draws solid; LINE has no source, so
+        // the pattern (FG) is the right input, not SRCCOPY.
+        write_mmio_reg(&mut machine, 0x100, 0); // DST_BASE
+        write_mmio_reg(&mut machine, 0x104, 640); // DST_PITCH
+        write_mmio_reg(&mut machine, 0x110, 1); // DEPTH
+        write_mmio_reg(&mut machine, 0x13c, (5 << 16) | 10); // LINE_START: (10,5)
+        write_mmio_reg(&mut machine, 0x140, (5 << 16) | 14); // LINE_END: (14,5)
+        write_mmio_reg(&mut machine, 0x120, 0xab); // FG_COLOR
+        write_mmio_reg(&mut machine, 0x128, 0xf0); // ROP: PATCOPY (solid; LINE has no source)
+        write_mmio_reg(&mut machine, 0x150, 0x05); // COMMAND: LINE
+
+        // The five pixels (x=10..14, y=5) are set; the pixel just left is not.
+        for x in 10u32..=14 {
+            assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 5 * 640 + x), 0xab);
+        }
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 5 * 640 + 9), 0x00);
+        // BUSY set right after the command.
+        assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
+
+        // 5 pixels -> busy_ns = 100 + 5*10 = 150 ns. At 25 MHz (40 ns/clock), three
+        // clocks (120 ns) leave it busy; the fourth clears it.
+        machine.advance_devices(3);
+        assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
+        machine.advance_devices(1);
+        assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 0);
+    }
+
+    #[test]
+    fn clipped_xor_fill_through_the_mmio_aperture() {
+        let mut machine = test_machine();
+        // Seed x=0..3 at y=0 with 0xFF through the LFB.
+        for x in 0u32..4 {
+            machine.write_physical_u8(MARGO_LFB_BASE + x, 0xff);
+        }
+        // FILL the 4x1 row with FG 0x0F through ROP 0x5A (PATINVERT: D ^ P), but clip
+        // to x in [0, 3): x=0,1,2 are XORed, x=3 is left alone.
+        write_mmio_reg(&mut machine, 0x100, 0); // DST_BASE
+        write_mmio_reg(&mut machine, 0x104, 640); // DST_PITCH
+        write_mmio_reg(&mut machine, 0x110, 1); // DEPTH
+        write_mmio_reg(&mut machine, 0x114, 0); // DST_XY: (0,0)
+        write_mmio_reg(&mut machine, 0x11c, (1 << 16) | 4); // DIM: 4x1
+        write_mmio_reg(&mut machine, 0x120, 0x0f); // FG_COLOR
+        write_mmio_reg(&mut machine, 0x128, 0x5a); // ROP: PATINVERT
+        write_mmio_reg(&mut machine, 0x134, 0); // CLIP_TL: (0,0)
+        write_mmio_reg(&mut machine, 0x138, (1 << 16) | 3); // CLIP_BR: (3,1) exclusive
+        write_mmio_reg(&mut machine, 0x130, 0x2); // FLAGS: CLIP_EN
+        write_mmio_reg(&mut machine, 0x150, 0x01); // COMMAND: FILL
+
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE), 0xf0); // 0xff ^ 0x0f
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 1), 0xf0);
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 2), 0xf0);
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 3), 0xff); // clipped, untouched
+        // 3 pixels written -> busy_ns = 100 + 3*5 = 115 ns. At 40 ns/clock, two clocks
+        // (80 ns) leave it busy; the third clears it.
+        assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
+        machine.advance_devices(2);
+        assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
+        machine.advance_devices(1);
+        assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 0);
     }
 }

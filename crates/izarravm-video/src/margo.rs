@@ -1,11 +1,11 @@
 //! Margo, the VEGA 2D engine: the display register block, the linear frame
-//! buffer, and the blit engine. The engine implements FILL, COPY, and color
-//! expand.
+//! buffer, and the blit engine. The engine implements FILL, COPY, color expand,
+//! and LINE, all with full ROP3 and rectangle clipping.
 
 pub const MARGO_VRAM_SIZE: usize = 4 * 1024 * 1024;
 pub const MARGO_MMIO_SIZE: usize = 0x0001_0000; // 64 KB register block
 pub const MARGO_ID_VALUE: u32 = 0x4D47_0100; // 'M' 'G', version 1.00
-pub const MARGO_CAPS_VALUE: u32 = 0x0000_0047; // bits 0 FILL, 1 COPY, 2 COLOR_EXPAND, 6 COLORKEY
+pub const MARGO_CAPS_VALUE: u32 = 0x0000_007f; // bits 0 FILL, 1 COPY, 2 COLOR_EXPAND, 3 LINE, 4 ROP3, 5 CLIP, 6 COLORKEY
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VbeMode {
@@ -77,6 +77,10 @@ pub const REG_BG_COLOR: usize = 0x0124;
 pub const REG_ROP: usize = 0x0128;
 pub const REG_COLORKEY: usize = 0x012c;
 pub const REG_FLAGS: usize = 0x0130;
+pub const REG_CLIP_TL: usize = 0x0134;
+pub const REG_CLIP_BR: usize = 0x0138;
+pub const REG_LINE_START: usize = 0x013c;
+pub const REG_LINE_END: usize = 0x0140;
 pub const REG_COMMAND: usize = 0x0150;
 pub const REG_MONO_DATA: usize = 0x0160;
 
@@ -85,6 +89,7 @@ const BLIT_REGS: usize = 20; // 0x100..0x150, twenty 32-bit slots; COMMAND at 0x
 const FILL_NS_PER_PIXEL: u64 = 5; // 200 Mpixels/s solid fill (section 1.1)
 const COPY_NS_PER_PIXEL: u64 = 10; // 100 Mpixels/s screen-to-screen blit (section 1.1)
 const EXPAND_NS_PER_PIXEL: u64 = 5; // 200 Mpixels/s color expand (section 1.1, fill class)
+const LINE_NS_PER_PIXEL: u64 = 10; // 100 Mpixels/s, one pixel per clock (section 1.1)
 const BLIT_SETUP_NS: u64 = 100; // fixed per-operation setup, shared by all blits
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -97,6 +102,70 @@ pub struct MargoDisplay {
     pub start: u32,
 }
 
+/// Evaluate an 8-bit ROP3 code: the boolean function of pattern P, source S, and
+/// destination D, applied bitwise across the pixel value. Bit `4*P + 2*S + D` of
+/// `rop` is the result for that input combination.
+fn rop3(rop: u8, p: u32, s: u32, d: u32) -> u32 {
+    let mut out = 0u32;
+    if rop & 0x01 != 0 {
+        out |= !p & !s & !d;
+    }
+    if rop & 0x02 != 0 {
+        out |= !p & !s & d;
+    }
+    if rop & 0x04 != 0 {
+        out |= !p & s & !d;
+    }
+    if rop & 0x08 != 0 {
+        out |= !p & s & d;
+    }
+    if rop & 0x10 != 0 {
+        out |= p & !s & !d;
+    }
+    if rop & 0x20 != 0 {
+        out |= p & !s & d;
+    }
+    if rop & 0x40 != 0 {
+        out |= p & s & !d;
+    }
+    if rop & 0x80 != 0 {
+        out |= p & s & d;
+    }
+    out
+}
+
+/// Combine pattern P and source S with the destination pixel at `off` through the
+/// ROP3 code `rop`, writing the low `depth` bytes (little-endian). The caller has
+/// bounds-checked `[off, off + depth)`.
+fn write_rop(vram: &mut [u8], off: usize, depth: usize, rop: u8, p: u32, s: u32) {
+    let mut db = [0u8; 4];
+    db[..depth].copy_from_slice(&vram[off..off + depth]);
+    let d = u32::from_le_bytes(db);
+    let result = rop3(rop, p, s, d).to_le_bytes();
+    vram[off..off + depth].copy_from_slice(&result[..depth]);
+}
+
+/// The clip rectangle. `[x0, x1) x [y0, y1)`: top-left inclusive, bottom-right
+/// exclusive (section 7.3). When disabled, `allows` is always true.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Clip {
+    enabled: bool,
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+}
+
+impl Clip {
+    fn allows(&self, x: u64, y: u64) -> bool {
+        !self.enabled
+            || (x >= self.x0 as u64
+                && x < self.x1 as u64
+                && y >= self.y0 as u64
+                && y < self.y1 as u64)
+    }
+}
+
 struct FillParams {
     dst_base: u32,
     dst_pitch: u32,
@@ -106,22 +175,22 @@ struct FillParams {
     width: u32,
     height: u32,
     fg_color: u32,
-    rop: u8, // 0xF0 PATCOPY (solid), 0x5A PATINVERT (XOR), others treated as solid
+    rop: u8, // ROP3 code; P = FG_COLOR, no source (S = 0)
+    clip: Clip,
 }
 
-/// Fill a rectangle in `vram` from the latched parameters. Returns the number of
-/// pixels actually written inside the frame store; for a fill that fits, that is
-/// the rectangle area. Off-store pixels are skipped, not wrapped (section 8).
-/// `depth` outside {1, 2, 4} is a no-op. The loop is bounded to `vram.len()`
-/// considered pixels, so a pathological DIM cannot spin, and the offset math is
-/// done in u64 with saturating arithmetic so extreme coordinates skip rather
-/// than overflow.
+/// Fill a rectangle in `vram` from the latched parameters, applying the ROP3 code
+/// with P = `FG_COLOR` and S = 0 (FILL has no source, section 7.6). Returns the
+/// number of pixels actually written (in bounds and inside the clip rectangle).
+/// Off-store and clipped pixels are skipped, not wrapped (section 8). `depth`
+/// outside {1, 2, 4} is a no-op. The loop is bounded to `vram.len()` considered
+/// pixels and the offset math is u64-saturating, so a pathological DIM cannot
+/// spin or overflow.
 fn fill(vram: &mut [u8], p: &FillParams) -> u64 {
     if !matches!(p.depth, 1 | 2 | 4) {
         return 0;
     }
     let depth = p.depth as usize;
-    let fg = p.fg_color.to_le_bytes();
     let len = vram.len() as u64;
     let mut considered: u64 = 0;
     let mut written: u64 = 0;
@@ -133,6 +202,9 @@ fn fill(vram: &mut [u8], p: &FillParams) -> u64 {
             }
             considered += 1;
             let x = p.dst_x as u64 + col as u64;
+            if !p.clip.allows(x, y) {
+                continue;
+            }
             let offset = (p.dst_base as u64)
                 .saturating_add(y.saturating_mul(p.dst_pitch as u64))
                 .saturating_add(x.saturating_mul(depth as u64));
@@ -140,14 +212,7 @@ fn fill(vram: &mut [u8], p: &FillParams) -> u64 {
                 continue;
             }
             written += 1;
-            let offset = offset as usize;
-            if p.rop == 0x5a {
-                for b in 0..depth {
-                    vram[offset + b] ^= fg[b];
-                }
-            } else {
-                vram[offset..offset + depth].copy_from_slice(&fg[..depth]);
-            }
+            write_rop(vram, offset as usize, depth, p.rop, p.fg_color, 0);
         }
     }
     written
@@ -165,18 +230,21 @@ struct CopyParams {
     src_y: u32,
     width: u32,
     height: u32,
+    fg_color: u32, // pattern P for ROP3
+    rop: u8,       // ROP3 code; S = source pixel
     colorkey: u32,
     colorkey_en: bool,
+    clip: Clip,
 }
 
-/// Copy a source rectangle to a destination rectangle in `vram`, SRCCOPY.
-/// Returns the number of pixels actually written (in-bounds on both sides and
-/// not keyed out). A source or destination pixel whose byte range falls outside
-/// the frame store is skipped, not wrapped (section 8). `depth` outside {1, 2, 4}
-/// is a no-op. The loop is bounded to `vram.len()` considered pixels, and the
-/// offset math is u64-saturating, so a pathological or adversarial rectangle
-/// cannot spin or overflow. Traversal direction is chosen from the coordinates so
-/// overlapping copies stay correct (section 7.4).
+/// Copy a source rectangle to a destination rectangle in `vram`, combining source
+/// S, pattern P = `FG_COLOR`, and destination D through the ROP3 code. Returns the
+/// number of pixels written (in bounds on both sides, inside the clip rectangle,
+/// and not keyed out). Off-store, clipped, and keyed pixels are skipped, not
+/// wrapped (section 8). `depth` outside {1, 2, 4} is a no-op. The loop is bounded
+/// to `vram.len()` considered pixels and the offset math is u64-saturating.
+/// Traversal direction is chosen from the coordinates so overlapping copies stay
+/// correct (section 7.4).
 fn copy(vram: &mut [u8], p: &CopyParams) -> u64 {
     if !matches!(p.depth, 1 | 2 | 4) {
         return 0;
@@ -196,23 +264,31 @@ fn copy(vram: &mut [u8], p: &CopyParams) -> u64 {
                 break 'rows;
             }
             considered += 1;
+            let dest_x = p.dst_x as u64 + col as u64;
+            let dest_y = p.dst_y as u64 + row as u64;
+            if !p.clip.allows(dest_x, dest_y) {
+                continue;
+            }
             let src_off = (p.src_base as u64)
                 .saturating_add((p.src_y as u64 + row as u64).saturating_mul(p.src_pitch as u64))
                 .saturating_add((p.src_x as u64 + col as u64).saturating_mul(depth as u64));
             let dst_off = (p.dst_base as u64)
-                .saturating_add((p.dst_y as u64 + row as u64).saturating_mul(p.dst_pitch as u64))
-                .saturating_add((p.dst_x as u64 + col as u64).saturating_mul(depth as u64));
+                .saturating_add(dest_y.saturating_mul(p.dst_pitch as u64))
+                .saturating_add(dest_x.saturating_mul(depth as u64));
             if src_off.saturating_add(depth as u64) > len
                 || dst_off.saturating_add(depth as u64) > len
             {
                 continue;
             }
             let (src_off, dst_off) = (src_off as usize, dst_off as usize);
-            if p.colorkey_en && vram[src_off..src_off + depth] == key[..depth] {
+            let mut sb = [0u8; 4];
+            sb[..depth].copy_from_slice(&vram[src_off..src_off + depth]);
+            if p.colorkey_en && sb[..depth] == key[..depth] {
                 continue;
             }
+            let s = u32::from_le_bytes(sb);
             written += 1;
-            vram.copy_within(src_off..src_off + depth, dst_off);
+            write_rop(vram, dst_off, depth, p.rop, p.fg_color, s);
         }
     }
     written
@@ -230,28 +306,32 @@ struct ExpandParams {
     fg_color: u32,
     bg_color: u32,
     transparent: bool, // EXPAND_TRANSPARENT: clear bits are skipped
+    rop: u8,           // ROP3 code; S = expanded pixel (FG/BG), P = FG_COLOR
+    clip: Clip,
 }
 
-/// Write one expanded destination pixel. `set` chooses FG vs BG; a clear bit
-/// under EXPAND_TRANSPARENT is skipped. A pixel whose byte range falls outside
-/// the frame store is skipped, not wrapped (section 8). Returns true if a pixel
-/// was written.
+/// Write one expanded destination pixel. `set` chooses the source S (FG for a set
+/// bit, BG for a clear bit); a clear bit under EXPAND_TRANSPARENT is skipped. The
+/// pixel is combined with pattern P = `FG_COLOR` and destination D through the
+/// ROP3 code. A pixel outside the clip rectangle or the frame store is skipped,
+/// not wrapped (section 8). Returns true if a pixel was written.
 /// `p.depth` must be 1, 2, or 4; callers guard this before calling.
 fn put_expand_pixel(vram: &mut [u8], p: &ExpandParams, x: u64, y: u64, set: bool) -> bool {
     if !set && p.transparent {
         return false;
     }
+    if !p.clip.allows(x, y) {
+        return false;
+    }
     let depth = p.depth as usize;
-    let color = if set { p.fg_color } else { p.bg_color };
-    let bytes = color.to_le_bytes();
+    let s = if set { p.fg_color } else { p.bg_color };
     let off = (p.dst_base as u64)
         .saturating_add(y.saturating_mul(p.dst_pitch as u64))
         .saturating_add(x.saturating_mul(depth as u64));
     if off.saturating_add(depth as u64) > vram.len() as u64 {
         return false;
     }
-    let off = off as usize;
-    vram[off..off + depth].copy_from_slice(&bytes[..depth]);
+    write_rop(vram, off as usize, depth, p.rop, p.fg_color, s);
     true
 }
 
@@ -342,6 +422,68 @@ fn expand_word(
             set,
         ) {
             written += 1;
+        }
+    }
+    written
+}
+
+struct LineParams {
+    dst_base: u32,
+    dst_pitch: u32,
+    depth: u32, // bytes per pixel: 1, 2, or 4
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+    fg_color: u32,
+    rop: u8, // ROP3 code; P = FG_COLOR, no source (S = 0)
+    clip: Clip,
+}
+
+/// Draw a line from `(x0, y0)` to `(x1, y1)` in `vram` with integer Bresenham.
+/// Both endpoints are inclusive; a zero-length line plots one pixel. The ROP3
+/// code is applied with P = `FG_COLOR` and S = 0 (LINE has no source). A pixel
+/// outside the clip rectangle or the frame store is skipped, not wrapped
+/// (section 8). `depth` outside {1, 2, 4} is a no-op. Coordinates must be
+/// 16-bit (`run_line` supplies them as such), so the loop runs at most
+/// `max(|dx|, |dy|) + 1 <= 65536` steps and cannot spin; the offset math is
+/// u64-saturating so extreme `dst_base` / `dst_pitch` skip rather than overflow.
+/// Returns the number of pixels written.
+fn line(vram: &mut [u8], p: &LineParams) -> u64 {
+    if !matches!(p.depth, 1 | 2 | 4) {
+        return 0;
+    }
+    let depth = p.depth as usize;
+    let len = vram.len() as u64;
+    let (mut x, mut y) = (p.x0 as i64, p.y0 as i64);
+    let (x1, y1) = (p.x1 as i64, p.y1 as i64);
+    let dx = (x1 - x).abs();
+    let dy = -(y1 - y).abs();
+    let sx = if x < x1 { 1 } else { -1 };
+    let sy = if y < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+    let mut written: u64 = 0;
+    loop {
+        if p.clip.allows(x as u64, y as u64) {
+            let off = (p.dst_base as u64)
+                .saturating_add((y as u64).saturating_mul(p.dst_pitch as u64))
+                .saturating_add((x as u64).saturating_mul(depth as u64));
+            if off.saturating_add(depth as u64) <= len {
+                write_rop(vram, off as usize, depth, p.rop, p.fg_color, 0);
+                written += 1;
+            }
+        }
+        if x == x1 && y == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y += sy;
         }
     }
     written
@@ -497,6 +639,18 @@ impl Margo {
         self.blit[(offset - BLIT_BASE) / 4]
     }
 
+    fn build_clip(&self) -> Clip {
+        let tl = self.blit_reg(REG_CLIP_TL);
+        let br = self.blit_reg(REG_CLIP_BR);
+        Clip {
+            enabled: self.blit_reg(REG_FLAGS) & 0x2 != 0,
+            x0: tl & 0xffff,
+            y0: tl >> 16,
+            x1: br & 0xffff,
+            y1: br >> 16,
+        }
+    }
+
     fn run_command(&mut self) {
         // Any COMMAND write ends an in-flight COLOR_EXPAND_DATA stream; the
         // 0x03 arm below starts a fresh one.
@@ -506,6 +660,7 @@ impl Margo {
             0x02 => self.run_copy(),
             0x03 => self.arm_expand_data(),
             0x04 => self.run_expand_mem(),
+            0x05 => self.run_line(),
             _ => {}
         }
         self.command = 0;
@@ -524,6 +679,7 @@ impl Margo {
             height: dim >> 16,
             fg_color: self.blit_reg(REG_FG_COLOR),
             rop: self.blit_reg(REG_ROP) as u8,
+            clip: self.build_clip(),
         };
         let pixels = fill(&mut self.vram, &params);
         self.busy_ns = BLIT_SETUP_NS + pixels * FILL_NS_PER_PIXEL;
@@ -545,8 +701,11 @@ impl Margo {
             src_y: src_xy >> 16,
             width: dim & 0xffff,
             height: dim >> 16,
+            fg_color: self.blit_reg(REG_FG_COLOR),
+            rop: self.blit_reg(REG_ROP) as u8,
             colorkey: self.blit_reg(REG_COLORKEY),
             colorkey_en: self.blit_reg(REG_FLAGS) & 0x1 != 0,
+            clip: self.build_clip(),
         };
         let pixels = copy(&mut self.vram, &params);
         self.busy_ns = BLIT_SETUP_NS + pixels * COPY_NS_PER_PIXEL;
@@ -568,6 +727,8 @@ impl Margo {
                 fg_color: self.blit_reg(REG_FG_COLOR),
                 bg_color: self.blit_reg(REG_BG_COLOR),
                 transparent: self.blit_reg(REG_FLAGS) & 0x4 != 0,
+                rop: self.blit_reg(REG_ROP) as u8,
+                clip: self.build_clip(),
             },
             src_base: self.blit_reg(REG_SRC_BASE),
             src_pitch: self.blit_reg(REG_SRC_PITCH),
@@ -576,6 +737,25 @@ impl Margo {
         };
         let pixels = color_expand_mem(&mut self.vram, &params);
         self.busy_ns = BLIT_SETUP_NS + pixels * EXPAND_NS_PER_PIXEL;
+    }
+
+    fn run_line(&mut self) {
+        let start = self.blit_reg(REG_LINE_START);
+        let end = self.blit_reg(REG_LINE_END);
+        let params = LineParams {
+            dst_base: self.blit_reg(REG_DST_BASE),
+            dst_pitch: self.blit_reg(REG_DST_PITCH),
+            depth: self.blit_reg(REG_DEPTH),
+            x0: start & 0xffff,
+            y0: start >> 16,
+            x1: end & 0xffff,
+            y1: end >> 16,
+            fg_color: self.blit_reg(REG_FG_COLOR),
+            rop: self.blit_reg(REG_ROP) as u8,
+            clip: self.build_clip(),
+        };
+        let pixels = line(&mut self.vram, &params);
+        self.busy_ns = BLIT_SETUP_NS + pixels * LINE_NS_PER_PIXEL;
     }
 
     fn arm_expand_data(&mut self) {
@@ -603,6 +783,8 @@ impl Margo {
             fg_color: self.blit_reg(REG_FG_COLOR),
             bg_color: self.blit_reg(REG_BG_COLOR),
             transparent: self.blit_reg(REG_FLAGS) & 0x4 != 0,
+            rop: self.blit_reg(REG_ROP) as u8,
+            clip: self.build_clip(),
         };
         self.expand = Some(ExpandState {
             params,
@@ -777,6 +959,7 @@ mod tests {
             height: 2,
             fg_color: 0x0000_00ab,
             rop: 0xf0,
+            clip: Clip::default(),
         };
         let pixels = fill(&mut vram, &p);
         assert_eq!(pixels, 4);
@@ -804,6 +987,7 @@ mod tests {
             height: 1,
             fg_color: 0x0000_1234,
             rop: 0xf0,
+            clip: Clip::default(),
         };
         fill(&mut vram, &p2);
         assert_eq!(vram[0], 0x34);
@@ -821,6 +1005,7 @@ mod tests {
             height: 1,
             fg_color: 0xdead_beef,
             rop: 0xf0,
+            clip: Clip::default(),
         };
         fill(&mut vram, &p4);
         assert_eq!(&vram[16..20], &[0xef, 0xbe, 0xad, 0xde]);
@@ -839,6 +1024,7 @@ mod tests {
             height: 1,
             fg_color: 0x0000_000f,
             rop: 0x5a, // PATINVERT: dst ^= fg
+            clip: Clip::default(),
         };
         fill(&mut vram, &p);
         assert_eq!(vram[0], 0xf0); // 0xff ^ 0x0f
@@ -861,6 +1047,7 @@ mod tests {
             height: 1,
             fg_color: 0x0000_0077,
             rop: 0xf0,
+            clip: Clip::default(),
         };
         fill(&mut vram, &p);
         assert_eq!(vram[14], 0x77);
@@ -881,6 +1068,7 @@ mod tests {
             height: 2,
             fg_color: 0x0000_00ff,
             rop: 0xf0,
+            clip: Clip::default(),
         };
         assert_eq!(fill(&mut vram, &p), 0);
         assert!(vram.iter().all(|&b| b == 0));
@@ -900,6 +1088,7 @@ mod tests {
             height: 4000,
             fg_color: 0x0000_0001,
             rop: 0xf0,
+            clip: Clip::default(),
         };
         assert_eq!(fill(&mut vram, &p), 16);
     }
@@ -919,6 +1108,7 @@ mod tests {
             height: 8,
             fg_color: 0xdead_beef,
             rop: 0xf0,
+            clip: Clip::default(),
         };
         assert_eq!(fill(&mut vram, &p), 0);
         assert!(vram.iter().all(|&b| b == 0));
@@ -942,10 +1132,47 @@ mod tests {
     }
 
     #[test]
-    fn caps_reports_fill_copy_expand_and_colorkey() {
+    fn caps_reports_all_implemented_features() {
         let margo = Margo::default();
-        // bit 0 FILL, bit 1 COPY, bit 2 COLOR_EXPAND, bit 6 COLORKEY.
-        assert_eq!(read_reg_u32(&margo, REG_CAPS), 0x0000_0047);
+        // bits 0 FILL, 1 COPY, 2 COLOR_EXPAND, 3 LINE, 4 full ROP3, 5 CLIP, 6 COLORKEY.
+        assert_eq!(read_reg_u32(&margo, REG_CAPS), 0x0000_007f);
+    }
+
+    #[test]
+    fn command_line_draws_and_sets_busy() {
+        let mut margo = Margo::default();
+        write_reg(&mut margo, REG_DST_BASE, 0);
+        write_reg(&mut margo, REG_DST_PITCH, 8);
+        write_reg(&mut margo, REG_DEPTH, 1);
+        write_reg(&mut margo, REG_LINE_START, 0); // (0,0)
+        write_reg(&mut margo, REG_LINE_END, 3); // (3,0): horizontal 4-pixel line
+        write_reg(&mut margo, REG_FG_COLOR, 0xab);
+        write_reg(&mut margo, REG_ROP, 0xf0);
+        write_reg(&mut margo, REG_COMMAND, 0x05); // LINE
+
+        for off in 0..4 {
+            assert_eq!(margo.read_vram_u8(off), 0xab);
+        }
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 1); // BUSY set
+    }
+
+    #[test]
+    fn command_line_busy_drains_at_the_line_rate() {
+        let mut margo = Margo::default();
+        write_reg(&mut margo, REG_DST_BASE, 0);
+        write_reg(&mut margo, REG_DST_PITCH, 8);
+        write_reg(&mut margo, REG_DEPTH, 1);
+        write_reg(&mut margo, REG_LINE_START, 0);
+        write_reg(&mut margo, REG_LINE_END, 3); // 4-pixel line
+        write_reg(&mut margo, REG_FG_COLOR, 0xab);
+        write_reg(&mut margo, REG_ROP, 0xf0);
+        write_reg(&mut margo, REG_COMMAND, 0x05);
+
+        // 4 pixels -> busy_ns = 100 + 4*10 = 140. One ns short still reads busy.
+        margo.advance_busy(139);
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 1);
+        margo.advance_busy(1);
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 0);
     }
 
     #[test]
@@ -1011,6 +1238,7 @@ mod tests {
         write_reg(&mut margo, REG_SRC_XY, 0); // (0,0)
         write_reg(&mut margo, REG_DIM, (1 << 16) | 1); // 1x1
         write_reg(&mut margo, REG_FLAGS, 0);
+        write_reg(&mut margo, REG_ROP, 0xcc); // SRCCOPY
         write_reg(&mut margo, REG_COMMAND, 0x02); // COPY
 
         assert_eq!(margo.read_vram_u8(8 + 4), 0x55); // (4,1) got the source byte
@@ -1028,6 +1256,7 @@ mod tests {
         write_reg(&mut margo, REG_DST_XY, 2 << 16); // y=2, x=0 (no overlap with src)
         write_reg(&mut margo, REG_SRC_XY, 0);
         write_reg(&mut margo, REG_DIM, (1 << 16) | 2); // 2x1 = 2 pixels
+        write_reg(&mut margo, REG_ROP, 0xcc); // SRCCOPY
         write_reg(&mut margo, REG_COMMAND, 0x02);
 
         // 2 pixels -> busy_ns = 100 + 2*10 = 120. One ns short still reads busy.
@@ -1057,8 +1286,11 @@ mod tests {
             src_y: 0,
             width: 2,
             height: 2,
+            fg_color: 0,
+            rop: 0xcc,
             colorkey: 0,
             colorkey_en: false,
+            clip: Clip::default(),
         };
         let pixels = copy(&mut vram, &p);
         assert_eq!(pixels, 4);
@@ -1089,8 +1321,11 @@ mod tests {
             src_y: 0,
             width: 1,
             height: 1,
+            fg_color: 0,
+            rop: 0xcc,
             colorkey: 0,
             colorkey_en: false,
+            clip: Clip::default(),
         };
         assert_eq!(copy(&mut vram, &p2), 1);
         assert_eq!(&vram[8..10], &[0x34, 0x12]); // (4,0) at depth 2 = offset 8
@@ -1110,8 +1345,11 @@ mod tests {
             src_y: 0,
             width: 1,
             height: 1,
+            fg_color: 0,
+            rop: 0xcc,
             colorkey: 0,
             colorkey_en: false,
+            clip: Clip::default(),
         };
         assert_eq!(copy(&mut vram, &p4), 1);
         assert_eq!(&vram[8..12], &[0xef, 0xbe, 0xad, 0xde]); // (2,0) at depth 4 = offset 8
@@ -1138,8 +1376,11 @@ mod tests {
             src_y: 0,
             width: 2,
             height: 1,
+            fg_color: 0,
+            rop: 0xcc,
             colorkey: 0x05,
             colorkey_en: true,
+            clip: Clip::default(),
         };
         assert_eq!(copy(&mut vram, &p), 1); // only the non-keyed pixel written
         assert_eq!(vram[8], 0xee); // keyed source 0x05 -> destination untouched
@@ -1173,8 +1414,11 @@ mod tests {
             src_y: 0,
             width: 2,
             height: 1,
+            fg_color: 0,
+            rop: 0xcc,
             colorkey: 0x1234,
             colorkey_en: true,
+            clip: Clip::default(),
         };
         assert_eq!(copy(&mut vram, &p), 1); // only the non-keyed pixel written
         // Keyed pixel (0x1234) skipped -> destination (0,1) bytes untouched.
@@ -1202,8 +1446,11 @@ mod tests {
             src_y: 0,
             width: 4,
             height: 1,
+            fg_color: 0,
+            rop: 0xcc,
             colorkey: 0,
             colorkey_en: false,
+            clip: Clip::default(),
         };
         assert_eq!(copy(&mut vram, &p_src), 2);
         assert_eq!(vram[0], 0x71);
@@ -1227,8 +1474,11 @@ mod tests {
             src_y: 0,
             width: 4,
             height: 1,
+            fg_color: 0,
+            rop: 0xcc,
             colorkey: 0,
             colorkey_en: false,
+            clip: Clip::default(),
         };
         assert_eq!(copy(&mut vram, &p_dst), 2); // offsets 14,15 in; 16,17 out
         assert_eq!(vram[14], 0x81);
@@ -1251,8 +1501,11 @@ mod tests {
             src_y: 0,
             width: 1,
             height: 1,
+            fg_color: 0,
+            rop: 0xcc,
             colorkey: 0,
             colorkey_en: false,
+            clip: Clip::default(),
         };
         assert_eq!(copy(&mut vram, &p), 0);
         assert_eq!(vram[1], 0x00); // nothing written
@@ -1273,8 +1526,11 @@ mod tests {
             src_y: 0,
             width: 4000,
             height: 4000,
+            fg_color: 0,
+            rop: 0xcc,
             colorkey: 0,
             colorkey_en: false,
+            clip: Clip::default(),
         };
         // A pathological DIM must not spin; the loop is capped at vram.len().
         // With src==dst every considered pixel is a no-op move, so written tracks
@@ -1297,8 +1553,11 @@ mod tests {
             src_y: u32::MAX,
             width: 8,
             height: 8,
+            fg_color: 0,
+            rop: 0xcc,
             colorkey: 0,
             colorkey_en: false,
+            clip: Clip::default(),
         };
         assert_eq!(copy(&mut vram, &p), 0); // must not panic; nothing written
         assert!(vram.iter().all(|&b| b == 0));
@@ -1326,8 +1585,11 @@ mod tests {
             src_y: 0,
             width: 4,
             height: 2,
+            fg_color: 0,
+            rop: 0xcc,
             colorkey: 0,
             colorkey_en: false,
+            clip: Clip::default(),
         };
         copy(&mut vram, &p);
         assert_eq!(&vram[4..8], &[1, 1, 1, 1]); // row 1 = old row 0
@@ -1354,8 +1616,11 @@ mod tests {
             src_y: 0,
             width: 4,
             height: 1,
+            fg_color: 0,
+            rop: 0xcc,
             colorkey: 0,
             colorkey_en: false,
+            clip: Clip::default(),
         };
         copy(&mut vram, &p);
         // Destination x=1..4 takes source x=0..3 = [1,2,3,4]; x=0 and x>=5 untouched.
@@ -1386,8 +1651,11 @@ mod tests {
             src_y: 0,
             width: 3,
             height: 2,
+            fg_color: 0,
+            rop: 0xcc,
             colorkey: 0,
             colorkey_en: false,
+            clip: Clip::default(),
         };
         copy(&mut vram, &p);
         // dst row 1 (offset 4) cols 1..4 = src row 0 [1,2,3]; dst row 2 (offset 8)
@@ -1416,6 +1684,8 @@ mod tests {
                 fg_color: 0xab,
                 bg_color: 0xcd,
                 transparent: false,
+                rop: 0xcc,
+                clip: Clip::default(),
             },
             src_base: 0,
             src_pitch: 1,
@@ -1446,6 +1716,8 @@ mod tests {
                 fg_color: 0xab,
                 bg_color: 0xcd,
                 transparent: true,
+                rop: 0xcc,
+                clip: Clip::default(),
             },
             src_base: 0,
             src_pitch: 1,
@@ -1473,6 +1745,8 @@ mod tests {
                 fg_color: 0x1234,
                 bg_color: 0x5678,
                 transparent: false,
+                rop: 0xcc,
+                clip: Clip::default(),
             },
             src_base: 0,
             src_pitch: 1,
@@ -1498,6 +1772,8 @@ mod tests {
                 fg_color: 0xdead_beef,
                 bg_color: 0,
                 transparent: false,
+                rop: 0xcc,
+                clip: Clip::default(),
             },
             src_base: 0,
             src_pitch: 1,
@@ -1527,6 +1803,8 @@ mod tests {
                 fg_color: 0xab,
                 bg_color: 0xcd,
                 transparent: false,
+                rop: 0xcc,
+                clip: Clip::default(),
             },
             src_base: 0,
             src_pitch: 2,
@@ -1555,6 +1833,8 @@ mod tests {
                 fg_color: 0xab,
                 bg_color: 0xcd,
                 transparent: false,
+                rop: 0xcc,
+                clip: Clip::default(),
             },
             src_base: 0,
             src_pitch: 1,
@@ -1579,6 +1859,8 @@ mod tests {
                 fg_color: 0xab,
                 bg_color: 0xcd,
                 transparent: false,
+                rop: 0xcc,
+                clip: Clip::default(),
             },
             src_base: 100,
             src_pitch: 16,
@@ -1605,6 +1887,8 @@ mod tests {
                 fg_color: 0xab,
                 bg_color: 0xcd,
                 transparent: false,
+                rop: 0xcc,
+                clip: Clip::default(),
             },
             src_base: 8,
             src_pitch: 4,
@@ -1632,6 +1916,8 @@ mod tests {
                 fg_color: 0xab,
                 bg_color: 0,
                 transparent: false,
+                rop: 0xcc,
+                clip: Clip::default(),
             },
             src_base: 0,
             src_pitch: 0,
@@ -1656,6 +1942,8 @@ mod tests {
                 fg_color: 0xdead_beef,
                 bg_color: 0,
                 transparent: false,
+                rop: 0xcc,
+                clip: Clip::default(),
             },
             src_base: u32::MAX,
             src_pitch: u32::MAX,
@@ -1691,6 +1979,7 @@ mod tests {
         write_reg(&mut margo, REG_FG_COLOR, 0xab);
         write_reg(&mut margo, REG_BG_COLOR, 0xcd);
         write_reg(&mut margo, REG_FLAGS, 0);
+        write_reg(&mut margo, REG_ROP, 0xcc); // SRCCOPY
         write_reg(&mut margo, REG_COMMAND, 0x04); // COLOR_EXPAND_MEM
 
         assert_eq!(margo.read_vram_u8(16), 0xab); // col 0 set -> FG
@@ -1711,6 +2000,7 @@ mod tests {
         write_reg(&mut margo, REG_SRC_XY, 0);
         write_reg(&mut margo, REG_DIM, (1 << 16) | 4); // 4x1 = 4 pixels
         write_reg(&mut margo, REG_FLAGS, 0);
+        write_reg(&mut margo, REG_ROP, 0xcc); // SRCCOPY
         write_reg(&mut margo, REG_COMMAND, 0x04);
 
         // 4 pixels -> busy_ns = 100 + 4*5 = 120. One ns short still reads busy.
@@ -1731,6 +2021,7 @@ mod tests {
         write_reg(&mut margo, REG_FG_COLOR, 0xab);
         write_reg(&mut margo, REG_BG_COLOR, 0xcd);
         write_reg(&mut margo, REG_FLAGS, 0);
+        write_reg(&mut margo, REG_ROP, 0xcc); // SRCCOPY
         write_reg(&mut margo, REG_COMMAND, 0x03); // COLOR_EXPAND_DATA
 
         // Armed: BUSY set before any data word, nothing drawn yet.
@@ -1749,6 +2040,7 @@ mod tests {
         write_reg(&mut margo, REG_FG_COLOR, 0xab);
         write_reg(&mut margo, REG_BG_COLOR, 0xcd);
         write_reg(&mut margo, REG_FLAGS, 0);
+        write_reg(&mut margo, REG_ROP, 0xcc); // SRCCOPY
         write_reg(&mut margo, REG_COMMAND, 0x03);
 
         // 0xA0000000: bits 31 and 29 set -> cols 0 and 2 set, cols 1 and 3 clear.
@@ -1773,6 +2065,7 @@ mod tests {
         write_reg(&mut margo, REG_FG_COLOR, 0xab);
         write_reg(&mut margo, REG_BG_COLOR, 0xcd);
         write_reg(&mut margo, REG_FLAGS, 0);
+        write_reg(&mut margo, REG_ROP, 0xcc); // SRCCOPY
         write_reg(&mut margo, REG_COMMAND, 0x03);
 
         write_reg(&mut margo, REG_MONO_DATA, 0x8000_0000); // word 0: col 0 set
@@ -1796,6 +2089,7 @@ mod tests {
         write_reg(&mut margo, REG_FG_COLOR, 0xab);
         write_reg(&mut margo, REG_BG_COLOR, 0xcd);
         write_reg(&mut margo, REG_FLAGS, 0);
+        write_reg(&mut margo, REG_ROP, 0xcc); // SRCCOPY
         write_reg(&mut margo, REG_COMMAND, 0x03);
         assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 1); // armed
 
@@ -1825,6 +2119,7 @@ mod tests {
         write_reg(&mut margo, REG_FG_COLOR, 0xab);
         write_reg(&mut margo, REG_BG_COLOR, 0xcd);
         write_reg(&mut margo, REG_FLAGS, 0x04); // EXPAND_TRANSPARENT
+        write_reg(&mut margo, REG_ROP, 0xcc); // SRCCOPY
         write_reg(&mut margo, REG_COMMAND, 0x03);
 
         write_reg(&mut margo, REG_MONO_DATA, 0x8000_0000); // col 0 set, col 1 clear
@@ -1844,6 +2139,7 @@ mod tests {
         write_reg(&mut margo, REG_FG_COLOR, 0xab);
         write_reg(&mut margo, REG_BG_COLOR, 0xcd);
         write_reg(&mut margo, REG_FLAGS, 0);
+        write_reg(&mut margo, REG_ROP, 0xcc); // SRCCOPY
         write_reg(&mut margo, REG_COMMAND, 0x03);
         write_reg(&mut margo, REG_MONO_DATA, 0xff00_0000); // row 0: cols 0..7 set
         assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 1); // armed, one word left
@@ -1878,6 +2174,7 @@ mod tests {
         write_reg(&mut margo, REG_FG_COLOR, 0xab);
         write_reg(&mut margo, REG_BG_COLOR, 0xcd);
         write_reg(&mut margo, REG_FLAGS, 0);
+        write_reg(&mut margo, REG_ROP, 0xcc); // SRCCOPY
         write_reg(&mut margo, REG_COMMAND, 0x03);
         write_reg(&mut margo, REG_MONO_DATA, 0xff00_0000); // feed only row 0; under-run
 
@@ -1893,6 +2190,401 @@ mod tests {
         let row1 = margo.read_vram_u8(8); // row 1, col 0 of the original stream target
         write_reg(&mut margo, REG_MONO_DATA, 0xff00_0000);
         assert_eq!(margo.read_vram_u8(8), row1);
+    }
+
+    #[test]
+    fn line_draws_a_shallow_line_endpoints_inclusive() {
+        // (0,0) -> (4,2), pitch 8, depth 1. Bresenham plots (0,0),(1,1),(2,1),(3,2),
+        // (4,2): offsets 0, 9, 10, 19, 20. Both endpoints are drawn.
+        let mut vram = vec![0u8; 64];
+        let p = LineParams {
+            dst_base: 0,
+            dst_pitch: 8,
+            depth: 1,
+            x0: 0,
+            y0: 0,
+            x1: 4,
+            y1: 2,
+            fg_color: 0xab,
+            rop: 0xf0,
+            clip: Clip::default(),
+        };
+        assert_eq!(line(&mut vram, &p), 5);
+        for off in [0usize, 9, 10, 19, 20] {
+            assert_eq!(vram[off], 0xab, "expected line pixel at offset {off}");
+        }
+        assert_eq!(vram[1], 0x00); // (1,0) is not on the line
+    }
+
+    #[test]
+    fn line_draws_a_steep_line() {
+        // (0,0) -> (2,4), pitch 8: (0,0),(1,1),(1,2),(2,3),(2,4) -> offsets
+        // 0, 9, 17, 26, 34 (covers the y-major Bresenham branch).
+        let mut vram = vec![0u8; 64];
+        let p = LineParams {
+            dst_base: 0,
+            dst_pitch: 8,
+            depth: 1,
+            x0: 0,
+            y0: 0,
+            x1: 2,
+            y1: 4,
+            fg_color: 0xcd,
+            rop: 0xf0,
+            clip: Clip::default(),
+        };
+        assert_eq!(line(&mut vram, &p), 5);
+        for off in [0usize, 9, 17, 26, 34] {
+            assert_eq!(vram[off], 0xcd, "expected line pixel at offset {off}");
+        }
+    }
+
+    #[test]
+    fn line_draws_horizontal_and_vertical_runs() {
+        // Horizontal (0,1) -> (3,1), pitch 8: offsets 8, 9, 10, 11.
+        let mut vram = vec![0u8; 64];
+        let h = LineParams {
+            dst_base: 0,
+            dst_pitch: 8,
+            depth: 1,
+            x0: 0,
+            y0: 1,
+            x1: 3,
+            y1: 1,
+            fg_color: 0x11,
+            rop: 0xf0,
+            clip: Clip::default(),
+        };
+        assert_eq!(line(&mut vram, &h), 4);
+        assert_eq!(&vram[8..12], &[0x11, 0x11, 0x11, 0x11]);
+
+        // Vertical (1,0) -> (1,3), pitch 8: offsets 1, 9, 17, 25.
+        let mut vram = vec![0u8; 64];
+        let v = LineParams {
+            dst_base: 0,
+            dst_pitch: 8,
+            depth: 1,
+            x0: 1,
+            y0: 0,
+            x1: 1,
+            y1: 3,
+            fg_color: 0x22,
+            rop: 0xf0,
+            clip: Clip::default(),
+        };
+        assert_eq!(line(&mut vram, &v), 4);
+        for off in [1usize, 9, 17, 25] {
+            assert_eq!(vram[off], 0x22);
+        }
+    }
+
+    #[test]
+    fn line_draws_a_45_degree_diagonal() {
+        // (0,0) -> (3,3), pitch 8: one pixel per step at offsets 0, 9, 18, 27.
+        let mut vram = vec![0u8; 64];
+        let p = LineParams {
+            dst_base: 0,
+            dst_pitch: 8,
+            depth: 1,
+            x0: 0,
+            y0: 0,
+            x1: 3,
+            y1: 3,
+            fg_color: 0x33,
+            rop: 0xf0,
+            clip: Clip::default(),
+        };
+        assert_eq!(line(&mut vram, &p), 4);
+        for off in [0usize, 9, 18, 27] {
+            assert_eq!(vram[off], 0x33);
+        }
+    }
+
+    #[test]
+    fn line_degenerate_plots_one_pixel() {
+        // LINE_START == LINE_END plots exactly the one pixel (5,5), offset 45.
+        let mut vram = vec![0u8; 64];
+        let p = LineParams {
+            dst_base: 0,
+            dst_pitch: 8,
+            depth: 1,
+            x0: 5,
+            y0: 5,
+            x1: 5,
+            y1: 5,
+            fg_color: 0x44,
+            rop: 0xf0,
+            clip: Clip::default(),
+        };
+        assert_eq!(line(&mut vram, &p), 1);
+        assert_eq!(vram[45], 0x44);
+    }
+
+    #[test]
+    fn line_reversed_direction_covers_negative_steps() {
+        // (3,3) -> (0,0): both sx and sy are negative. A diagonal is symmetric, so it
+        // plots the same pixels as (0,0) -> (3,3): offsets 0, 9, 18, 27.
+        let mut vram = vec![0u8; 64];
+        let p = LineParams {
+            dst_base: 0,
+            dst_pitch: 8,
+            depth: 1,
+            x0: 3,
+            y0: 3,
+            x1: 0,
+            y1: 0,
+            fg_color: 0xab,
+            rop: 0xf0,
+            clip: Clip::default(),
+        };
+        assert_eq!(line(&mut vram, &p), 4);
+        for off in [0usize, 9, 18, 27] {
+            assert_eq!(vram[off], 0xab);
+        }
+    }
+
+    #[test]
+    fn line_writes_depth_2_and_4_pixels() {
+        // depth 2 horizontal 2-pixel line, FG 0x1234 little-endian, pitch 16.
+        let mut vram = vec![0u8; 64];
+        let p2 = LineParams {
+            dst_base: 0,
+            dst_pitch: 16,
+            depth: 2,
+            x0: 0,
+            y0: 0,
+            x1: 1,
+            y1: 0,
+            fg_color: 0x1234,
+            rop: 0xf0,
+            clip: Clip::default(),
+        };
+        assert_eq!(line(&mut vram, &p2), 2);
+        assert_eq!(&vram[0..2], &[0x34, 0x12]); // (0,0)
+        assert_eq!(&vram[2..4], &[0x34, 0x12]); // (1,0) at depth 2 = offset 2
+
+        // depth 4 single point at (1,0) = offset 4, FG 0xDEADBEEF.
+        let mut vram = vec![0u8; 64];
+        let p4 = LineParams {
+            dst_base: 0,
+            dst_pitch: 16,
+            depth: 4,
+            x0: 1,
+            y0: 0,
+            x1: 1,
+            y1: 0,
+            fg_color: 0xdead_beef,
+            rop: 0xf0,
+            clip: Clip::default(),
+        };
+        assert_eq!(line(&mut vram, &p4), 1);
+        assert_eq!(&vram[4..8], &[0xef, 0xbe, 0xad, 0xde]);
+    }
+
+    #[test]
+    fn line_xor_rop_draws_and_erases() {
+        // Horizontal (0,0) -> (3,0) at offsets 0..4 over a 0xFF background; ROP 0x5A
+        // XORs 0x0F in, and a second identical draw restores the background.
+        let mut vram = vec![0xffu8; 32];
+        let p = LineParams {
+            dst_base: 0,
+            dst_pitch: 8,
+            depth: 1,
+            x0: 0,
+            y0: 0,
+            x1: 3,
+            y1: 0,
+            fg_color: 0x0f,
+            rop: 0x5a,
+            clip: Clip::default(),
+        };
+        assert_eq!(line(&mut vram, &p), 4);
+        assert_eq!(&vram[0..4], &[0xf0, 0xf0, 0xf0, 0xf0]); // 0xff ^ 0x0f
+        assert_eq!(line(&mut vram, &p), 4);
+        assert_eq!(&vram[0..4], &[0xff, 0xff, 0xff, 0xff]); // restored
+    }
+
+    #[test]
+    fn line_skips_out_of_store_pixels() {
+        // Vertical (0,0) -> (0,3), pitch 8, store 16: offsets 0, 8 are in; 16, 24 out.
+        let mut vram = vec![0u8; 16];
+        let p = LineParams {
+            dst_base: 0,
+            dst_pitch: 8,
+            depth: 1,
+            x0: 0,
+            y0: 0,
+            x1: 0,
+            y1: 3,
+            fg_color: 0xab,
+            rop: 0xf0,
+            clip: Clip::default(),
+        };
+        assert_eq!(line(&mut vram, &p), 2);
+        assert_eq!(vram[0], 0xab);
+        assert_eq!(vram[8], 0xab);
+    }
+
+    #[test]
+    fn line_rejects_invalid_depth() {
+        let mut vram = vec![0u8; 16];
+        let p = LineParams {
+            dst_base: 0,
+            dst_pitch: 4,
+            depth: 3, // not 1, 2, or 4
+            x0: 0,
+            y0: 0,
+            x1: 2,
+            y1: 0,
+            fg_color: 0xff,
+            rop: 0xf0,
+            clip: Clip::default(),
+        };
+        assert_eq!(line(&mut vram, &p), 0);
+        assert!(vram.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn line_skips_extreme_offsets_without_overflow() {
+        // 16-bit coordinates (as run_line supplies) with an extreme base and pitch:
+        // every offset saturates past the store, nothing is written, no panic.
+        let mut vram = vec![0u8; 64];
+        let p = LineParams {
+            dst_base: u32::MAX,
+            dst_pitch: u32::MAX,
+            depth: 4,
+            x0: 0xffff,
+            y0: 0xffff,
+            x1: 0,
+            y1: 0,
+            fg_color: 0xdead_beef,
+            rop: 0xf0,
+            clip: Clip::default(),
+        };
+        assert_eq!(line(&mut vram, &p), 0);
+        assert!(vram.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn fill_applies_rop3_pattern_and_dest_codes() {
+        // Single pixel (0,0), pitch 4, depth 1, over dest 0x3C with FG 0x0F.
+        // FILL has no source (S = 0), so only P/D codes are meaningful.
+        let cases: [(u8, u8); 5] = [
+            (0xf0, 0x0f),        // PATCOPY -> P (FG)
+            (0x55, !0x3cu8),     // DSTINVERT -> ~D
+            (0x5a, 0x3c ^ 0x0f), // PATINVERT -> D ^ P
+            (0x00, 0x00),        // BLACKNESS
+            (0xff, 0xff),        // WHITENESS
+        ];
+        for (rop, expected) in cases {
+            let mut vram = vec![0u8; 16];
+            vram[0] = 0x3c;
+            let p = FillParams {
+                dst_base: 0,
+                dst_pitch: 4,
+                depth: 1,
+                dst_x: 0,
+                dst_y: 0,
+                width: 1,
+                height: 1,
+                fg_color: 0x0f,
+                rop,
+                clip: Clip::default(),
+            };
+            assert_eq!(fill(&mut vram, &p), 1);
+            assert_eq!(vram[0], expected, "rop {rop:#x}");
+        }
+    }
+
+    #[test]
+    fn fill_clips_to_the_rectangle() {
+        // 4x1 fill at y=0, cols 0..3, pitch 8; clip to x in [1, 3), y in [0, 1).
+        let mut vram = vec![0u8; 16];
+        let p = FillParams {
+            dst_base: 0,
+            dst_pitch: 8,
+            depth: 1,
+            dst_x: 0,
+            dst_y: 0,
+            width: 4,
+            height: 1,
+            fg_color: 0xab,
+            rop: 0xf0,
+            clip: Clip {
+                enabled: true,
+                x0: 1,
+                y0: 0,
+                x1: 3,
+                y1: 1,
+            },
+        };
+        assert_eq!(fill(&mut vram, &p), 2); // only x = 1, 2
+        assert_eq!(vram[0], 0x00); // x = 0 clipped
+        assert_eq!(vram[1], 0xab);
+        assert_eq!(vram[2], 0xab);
+        assert_eq!(vram[3], 0x00); // x = 3 clipped (BR exclusive)
+    }
+
+    #[test]
+    fn line_applies_rop3_against_the_destination() {
+        // Horizontal 3-pixel line over a 0xFF background; DSTINVERT (0x55) -> 0x00.
+        let mut vram = vec![0xffu8; 8];
+        let p = LineParams {
+            dst_base: 0,
+            dst_pitch: 8,
+            depth: 1,
+            x0: 0,
+            y0: 0,
+            x1: 2,
+            y1: 0,
+            fg_color: 0,
+            rop: 0x55,
+            clip: Clip::default(),
+        };
+        assert_eq!(line(&mut vram, &p), 3);
+        assert_eq!(&vram[0..3], &[0x00, 0x00, 0x00]);
+        assert_eq!(vram[3], 0xff); // outside the line
+    }
+
+    #[test]
+    fn line_clips_to_the_rectangle() {
+        // Horizontal line cols 0..4 at y=0; clip to x in [1, 3).
+        let mut vram = vec![0u8; 8];
+        let p = LineParams {
+            dst_base: 0,
+            dst_pitch: 8,
+            depth: 1,
+            x0: 0,
+            y0: 0,
+            x1: 4,
+            y1: 0,
+            fg_color: 0xab,
+            rop: 0xf0,
+            clip: Clip {
+                enabled: true,
+                x0: 1,
+                y0: 0,
+                x1: 3,
+                y1: 1,
+            },
+        };
+        assert_eq!(line(&mut vram, &p), 2); // only x = 1, 2
+        assert_eq!(&vram[0..5], &[0x00, 0xab, 0xab, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn rop3_evaluates_the_named_codes() {
+        // Distinct multi-bit operands so the test exercises the bitwise evaluation.
+        let (p, s, d) = (0xf0u32, 0xccu32, 0xaau32);
+        assert_eq!(rop3(0x00, p, s, d), 0); // BLACKNESS
+        assert_eq!(rop3(0xff, p, s, d), u32::MAX); // WHITENESS
+        assert_eq!(rop3(0xcc, p, s, d), s); // SRCCOPY
+        assert_eq!(rop3(0xf0, p, s, d), p); // PATCOPY
+        assert_eq!(rop3(0x55, p, s, d), !d); // DSTINVERT
+        assert_eq!(rop3(0x5a, p, s, d), d ^ p); // PATINVERT
+        assert_eq!(rop3(0x66, p, s, d), d ^ s); // SRCINVERT
+        assert_eq!(rop3(0x88, p, s, d), d & s); // SRCAND
+        assert_eq!(rop3(0xee, p, s, d), d | s); // SRCPAINT
     }
 
     #[test]
@@ -1919,13 +2611,199 @@ mod tests {
             src_y: 0,
             width: 3,
             height: 2,
+            fg_color: 0,
+            rop: 0xcc,
             colorkey: 0,
             colorkey_en: false,
+            clip: Clip::default(),
         };
         copy(&mut vram, &p);
         // dst row 1 (offsets 4,5,6) = src row 0 [1,2,3]; dst row 2 (offsets 8,9,10)
         // = src row 1 [4,5,6], uncorrupted by the row overlap.
         assert_eq!(&vram[4..7], &[1, 2, 3]);
         assert_eq!(&vram[8..11], &[4, 5, 6]);
+    }
+
+    #[test]
+    fn copy_applies_rop3_source_and_dest() {
+        // Source 0xCC at (0,0), dest 0xAA at (4,0), pitch 8. SRCINVERT (0x66) -> D^S.
+        let mut vram = vec![0u8; 16];
+        vram[0] = 0xcc;
+        vram[4] = 0xaa;
+        let p = CopyParams {
+            dst_base: 0,
+            dst_pitch: 8,
+            src_base: 0,
+            src_pitch: 8,
+            depth: 1,
+            dst_x: 4,
+            dst_y: 0,
+            src_x: 0,
+            src_y: 0,
+            width: 1,
+            height: 1,
+            fg_color: 0,
+            rop: 0x66,
+            colorkey: 0,
+            colorkey_en: false,
+            clip: Clip::default(),
+        };
+        assert_eq!(copy(&mut vram, &p), 1);
+        assert_eq!(vram[4], 0xaa ^ 0xcc); // D ^ S
+    }
+
+    #[test]
+    fn copy_clips_to_the_rectangle() {
+        // Source row [1,2,3,4] at (0,0); copy to (0,1) cols 0..4; clip to x in [1,3).
+        let mut vram = vec![0u8; 16];
+        vram[0] = 1;
+        vram[1] = 2;
+        vram[2] = 3;
+        vram[3] = 4;
+        let p = CopyParams {
+            dst_base: 0,
+            dst_pitch: 8,
+            src_base: 0,
+            src_pitch: 8,
+            depth: 1,
+            dst_x: 0,
+            dst_y: 1,
+            src_x: 0,
+            src_y: 0,
+            width: 4,
+            height: 1,
+            fg_color: 0,
+            rop: 0xcc,
+            colorkey: 0,
+            colorkey_en: false,
+            clip: Clip {
+                enabled: true,
+                x0: 1,
+                y0: 1,
+                x1: 3,
+                y1: 2,
+            },
+        };
+        assert_eq!(copy(&mut vram, &p), 2); // dest x = 1, 2 only
+        assert_eq!(vram[8], 0); // dest (0,1) clipped
+        assert_eq!(vram[9], 2); // dest (1,1) = src x=1
+        assert_eq!(vram[10], 3); // dest (2,1) = src x=2
+        assert_eq!(vram[11], 0); // dest (3,1) clipped
+    }
+
+    #[test]
+    fn copy_applies_rop3_at_depth_2() {
+        // Source pixel 0x1234, dest pixel 0xABCD, depth 2, SRCINVERT (0x66): D ^ S.
+        // 0x1234 ^ 0xABCD = 0xB9F9, stored little-endian.
+        let mut vram = vec![0u8; 32];
+        vram[0] = 0x34; // src (0,0) low byte
+        vram[1] = 0x12; // src (0,0) high byte
+        vram[4] = 0xcd; // dst (2,0) low byte  (pitch 16 -> offset 2*depth = 4)
+        vram[5] = 0xab; // dst (2,0) high byte
+        let p = CopyParams {
+            dst_base: 0,
+            dst_pitch: 16,
+            src_base: 0,
+            src_pitch: 16,
+            depth: 2,
+            dst_x: 2,
+            dst_y: 0,
+            src_x: 0,
+            src_y: 0,
+            width: 1,
+            height: 1,
+            fg_color: 0,
+            rop: 0x66,
+            colorkey: 0,
+            colorkey_en: false,
+            clip: Clip::default(),
+        };
+        assert_eq!(copy(&mut vram, &p), 1);
+        let result = u16::from_le_bytes([vram[4], vram[5]]);
+        assert_eq!(result, 0x1234u16 ^ 0xabcdu16); // 0xB9F9
+    }
+
+    #[test]
+    fn color_expand_mem_applies_rop3() {
+        // Source bit set -> S = FG 0x0F; dest 0xAA; SRCINVERT (0x66) -> D ^ S.
+        let mut vram = vec![0u8; 64];
+        vram[0] = 0x80; // mono source, col 0 set
+        vram[16] = 0xaa; // dest pixel
+        let p = ExpandMemParams {
+            common: ExpandParams {
+                dst_base: 16,
+                dst_pitch: 8,
+                depth: 1,
+                dst_x: 0,
+                dst_y: 0,
+                width: 1,
+                height: 1,
+                fg_color: 0x0f,
+                bg_color: 0,
+                transparent: false,
+                rop: 0x66,
+                clip: Clip::default(),
+            },
+            src_base: 0,
+            src_pitch: 1,
+            src_x: 0,
+            src_y: 0,
+        };
+        assert_eq!(color_expand_mem(&mut vram, &p), 1);
+        assert_eq!(vram[16], 0xaa ^ 0x0f);
+    }
+
+    #[test]
+    fn color_expand_mem_clips() {
+        // Source 0xC0 (cols 0,1 set) expanded to dest cols 0,1; clip to x in [1,2).
+        let mut vram = vec![0u8; 64];
+        vram[0] = 0xc0;
+        let p = ExpandMemParams {
+            common: ExpandParams {
+                dst_base: 16,
+                dst_pitch: 8,
+                depth: 1,
+                dst_x: 0,
+                dst_y: 0,
+                width: 2,
+                height: 1,
+                fg_color: 0xab,
+                bg_color: 0xcd,
+                transparent: false,
+                rop: 0xcc,
+                clip: Clip {
+                    enabled: true,
+                    x0: 1,
+                    y0: 0,
+                    x1: 2,
+                    y1: 1,
+                },
+            },
+            src_base: 0,
+            src_pitch: 1,
+            src_x: 0,
+            src_y: 0,
+        };
+        assert_eq!(color_expand_mem(&mut vram, &p), 1); // only col 1
+        assert_eq!(vram[16], 0x00); // col 0 clipped
+        assert_eq!(vram[17], 0xab); // col 1 set -> S = FG, 0xcc writes S
+    }
+
+    #[test]
+    fn expand_data_applies_rop3() {
+        // Streamed DATA must honor ROP too: arm with SRCINVERT, dest 0xAA, set bit.
+        let mut margo = Margo::default();
+        margo.write_vram_u8(0, 0xaa);
+        write_reg(&mut margo, REG_DST_BASE, 0);
+        write_reg(&mut margo, REG_DST_PITCH, 8);
+        write_reg(&mut margo, REG_DEPTH, 1);
+        write_reg(&mut margo, REG_DST_XY, 0);
+        write_reg(&mut margo, REG_DIM, (1 << 16) | 1); // 1x1
+        write_reg(&mut margo, REG_FG_COLOR, 0x0f);
+        write_reg(&mut margo, REG_FLAGS, 0);
+        write_reg(&mut margo, REG_ROP, 0x66); // SRCINVERT: D ^ S
+        write_reg(&mut margo, REG_COMMAND, 0x03);
+        write_reg(&mut margo, REG_MONO_DATA, 0x8000_0000); // one word, col 0 set
+        assert_eq!(margo.read_vram_u8(0), 0xaa ^ 0x0f);
     }
 }
