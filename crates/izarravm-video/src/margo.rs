@@ -85,6 +85,56 @@ pub struct MargoDisplay {
     pub start: u32,
 }
 
+#[allow(dead_code)]
+struct FillParams {
+    dst_base: u32,
+    dst_pitch: u32,
+    depth: u32, // bytes per pixel: 1, 2, or 4
+    dst_x: u32,
+    dst_y: u32,
+    width: u32,
+    height: u32,
+    fg_color: u32,
+    rop: u8,
+}
+
+/// Fill a rectangle in `vram` from the latched parameters. Returns the number of
+/// pixels iterated, which is the rectangle area for a fill that fits and is
+/// capped at `vram.len()` otherwise. Off-store pixels are skipped, not wrapped
+/// (section 8). `depth` outside {1, 2, 4} is a no-op.
+#[allow(dead_code)]
+fn fill(vram: &mut [u8], p: &FillParams) -> u64 {
+    if !matches!(p.depth, 1 | 2 | 4) {
+        return 0;
+    }
+    let depth = p.depth as usize;
+    let fg = p.fg_color.to_le_bytes();
+    let cap = vram.len() as u64;
+    let mut iterated: u64 = 0;
+    'rows: for row in 0..p.height {
+        let y = p.dst_y as usize + row as usize;
+        for col in 0..p.width {
+            if iterated >= cap {
+                break 'rows;
+            }
+            iterated += 1;
+            let x = p.dst_x as usize + col as usize;
+            let offset = p.dst_base as usize + y * p.dst_pitch as usize + x * depth;
+            if offset + depth > vram.len() {
+                continue;
+            }
+            if p.rop == 0x5a {
+                for b in 0..depth {
+                    vram[offset + b] ^= fg[b];
+                }
+            } else {
+                vram[offset..offset + depth].copy_from_slice(&fg[..depth]);
+            }
+        }
+    }
+    iterated
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Margo {
     vram: Vec<u8>,
@@ -321,5 +371,146 @@ mod tests {
         margo.write_mmio_u8(REG_FG_COLOR, 0xab);
         assert_eq!(read_reg_u32(&margo, REG_FG_COLOR), 0x0000_00ab);
         assert_eq!(read_reg_u32(&margo, REG_DST_BASE), 0x4433_2211);
+    }
+
+    #[test]
+    fn fill_writes_a_solid_rectangle_depth_1() {
+        let mut vram = vec![0u8; 64];
+        // pitch 8, 2x2 rectangle at (x=1, y=1), color 0xAB, solid (ROP 0xF0).
+        let p = FillParams {
+            dst_base: 0,
+            dst_pitch: 8,
+            depth: 1,
+            dst_x: 1,
+            dst_y: 1,
+            width: 2,
+            height: 2,
+            fg_color: 0x0000_00ab,
+            rop: 0xf0,
+        };
+        let pixels = fill(&mut vram, &p);
+        assert_eq!(pixels, 4);
+        // Rows y=1 and y=2, columns x=1,2 -> offsets 9,10 and 17,18.
+        assert_eq!(vram[9], 0xab);
+        assert_eq!(vram[10], 0xab);
+        assert_eq!(vram[17], 0xab);
+        assert_eq!(vram[18], 0xab);
+        // Neighbours stay zero.
+        assert_eq!(vram[8], 0x00);
+        assert_eq!(vram[11], 0x00);
+    }
+
+    #[test]
+    fn fill_writes_depth_2_and_4_pixels() {
+        let mut vram = vec![0u8; 64];
+        // depth 2: one pixel at (0,0), color 0x1234 -> low 2 bytes little-endian.
+        let p2 = FillParams {
+            dst_base: 0,
+            dst_pitch: 16,
+            depth: 2,
+            dst_x: 0,
+            dst_y: 0,
+            width: 1,
+            height: 1,
+            fg_color: 0x0000_1234,
+            rop: 0xf0,
+        };
+        fill(&mut vram, &p2);
+        assert_eq!(vram[0], 0x34);
+        assert_eq!(vram[1], 0x12);
+        assert_eq!(vram[2], 0x00);
+
+        // depth 4: one pixel at offset 16, color 0xDEADBEEF.
+        let p4 = FillParams {
+            dst_base: 16,
+            dst_pitch: 16,
+            depth: 4,
+            dst_x: 0,
+            dst_y: 0,
+            width: 1,
+            height: 1,
+            fg_color: 0xdead_beef,
+            rop: 0xf0,
+        };
+        fill(&mut vram, &p4);
+        assert_eq!(&vram[16..20], &[0xef, 0xbe, 0xad, 0xde]);
+    }
+
+    #[test]
+    fn fill_xor_rop_inverts_the_destination() {
+        let mut vram = vec![0xffu8; 16];
+        let p = FillParams {
+            dst_base: 0,
+            dst_pitch: 4,
+            depth: 1,
+            dst_x: 0,
+            dst_y: 0,
+            width: 2,
+            height: 1,
+            fg_color: 0x0000_000f,
+            rop: 0x5a, // PATINVERT: dst ^= fg
+        };
+        fill(&mut vram, &p);
+        assert_eq!(vram[0], 0xf0); // 0xff ^ 0x0f
+        assert_eq!(vram[1], 0xf0);
+        assert_eq!(vram[2], 0xff); // outside the 2-wide rect
+    }
+
+    #[test]
+    fn fill_skips_out_of_bounds_without_wrapping() {
+        let mut vram = vec![0u8; 16];
+        // A rectangle that runs off the end of the store. base 14, pitch 4,
+        // depth 1, 4 wide x 1 high -> offsets 14,15,16,17. 16 and 17 are out.
+        let p = FillParams {
+            dst_base: 14,
+            dst_pitch: 4,
+            depth: 1,
+            dst_x: 0,
+            dst_y: 0,
+            width: 4,
+            height: 1,
+            fg_color: 0x0000_0077,
+            rop: 0xf0,
+        };
+        fill(&mut vram, &p);
+        assert_eq!(vram[14], 0x77);
+        assert_eq!(vram[15], 0x77);
+        assert_eq!(vram[0], 0x00); // not wrapped to the start
+    }
+
+    #[test]
+    fn fill_rejects_invalid_depth() {
+        let mut vram = vec![0u8; 16];
+        let p = FillParams {
+            dst_base: 0,
+            dst_pitch: 4,
+            depth: 3, // not 1, 2, or 4
+            dst_x: 0,
+            dst_y: 0,
+            width: 2,
+            height: 2,
+            fg_color: 0x0000_00ff,
+            rop: 0xf0,
+        };
+        assert_eq!(fill(&mut vram, &p), 0);
+        assert!(vram.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn fill_caps_iterations_at_the_store_size() {
+        let mut vram = vec![0u8; 16];
+        // A pathological DIM must not spin: capped at vram.len() iterations.
+        let p = FillParams {
+            dst_base: 0,
+            dst_pitch: 4,
+            depth: 1,
+            dst_x: 0,
+            dst_y: 0,
+            width: 4000,
+            height: 4000,
+            fg_color: 0x0000_0001,
+            rop: 0xf0,
+        };
+        assert_eq!(fill(&mut vram, &p), 16);
     }
 }
