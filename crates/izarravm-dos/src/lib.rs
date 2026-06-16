@@ -472,6 +472,12 @@ mod tests {
     }
 
     #[test]
+    fn ah08_on_empty_returns_eof_ctrl_z() {
+        let (regs, _out) = char_io(0x0800, 0, b""); // empty buffer, no echo
+        assert_eq!(regs.ax & 0x00ff, 0x1a); // ^Z
+    }
+
+    #[test]
     fn ah06_output_writes_dl() {
         let (regs, out) = char_io(0x0600, 0x0042, b""); // AH=06h, DL='B' (not 0xFF)
         assert_eq!(out, b"B");
@@ -480,10 +486,20 @@ mod tests {
 
     #[test]
     fn ah06_input_available_clears_zf() {
-        let (regs, out) = char_io(0x0600, 0x00ff, b"X"); // AH=06h, DL=0xFF
+        // ZF starts set so the assertion proves the available path clears it.
+        let mut mem = Memory::new(4096).unwrap();
+        let mut stdin: VecDeque<u8> = b"X".iter().copied().collect();
+        let mut stdout = Vec::new();
+        let mut regs = DosRegs {
+            ax: 0x0600,
+            dx: 0x00ff,
+            zf: true,
+            ..DosRegs::default()
+        };
+        dispatch(0x21, &mut regs, &mut mem, &mut stdin, &mut stdout).unwrap();
         assert_eq!(regs.ax & 0x00ff, 0x58); // AL = 'X'
-        assert!(!regs.zf); // character available
-        assert!(out.is_empty()); // no echo
+        assert!(!regs.zf); // cleared because a character was available
+        assert!(stdout.is_empty()); // no echo
     }
 
     #[test]
