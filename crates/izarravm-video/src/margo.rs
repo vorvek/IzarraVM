@@ -61,6 +61,20 @@ pub const REG_DISP_BPP: usize = 0x001c;
 pub const REG_DISP_PITCH: usize = 0x0020;
 pub const REG_DISP_START: usize = 0x0024;
 
+// Blit engine registers (section 7.3). All R/W; the engine reads the ones it
+// needs when COMMAND fires. The block 0x100..0x150 is a flat R/W store.
+pub const REG_DST_BASE: usize = 0x0100;
+pub const REG_DST_PITCH: usize = 0x0104;
+pub const REG_DEPTH: usize = 0x0110;
+pub const REG_DST_XY: usize = 0x0114;
+pub const REG_DIM: usize = 0x011c;
+pub const REG_FG_COLOR: usize = 0x0120;
+pub const REG_ROP: usize = 0x0128;
+pub const REG_COMMAND: usize = 0x0150;
+
+const BLIT_BASE: usize = 0x0100;
+const BLIT_REGS: usize = 20; // 0x100..0x150, twenty 32-bit slots
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MargoDisplay {
     pub mode: u16,
@@ -76,6 +90,7 @@ pub struct Margo {
     vram: Vec<u8>,
     display: MargoDisplay,
     control: u32,
+    blit: [u32; BLIT_REGS],
 }
 
 impl Default for Margo {
@@ -84,6 +99,7 @@ impl Default for Margo {
             vram: vec![0; MARGO_VRAM_SIZE],
             display: MargoDisplay::default(),
             control: 0,
+            blit: [0; BLIT_REGS],
         }
     }
 }
@@ -153,6 +169,9 @@ impl Margo {
             REG_DISP_BPP => self.display.bpp,
             REG_DISP_PITCH => self.display.pitch,
             REG_DISP_START => self.display.start,
+            reg if (BLIT_BASE..BLIT_BASE + BLIT_REGS * 4).contains(&reg) => {
+                self.blit[(reg - BLIT_BASE) / 4]
+            }
             _ => 0,
         }
     }
@@ -166,15 +185,18 @@ impl Margo {
     pub fn write_mmio_u8(&mut self, offset: usize, value: u8) {
         let reg = offset & !0x3;
         let byte = offset & 0x3;
-        // Only CONTROL and DISP_START are writable in this slice. Everything else
-        // (identity, caps, the display geometry set by the host mode-set) is
-        // read-only to the bus.
+        let shift = 8 * byte;
+        if (BLIT_BASE..BLIT_BASE + BLIT_REGS * 4).contains(&reg) {
+            let slot = &mut self.blit[(reg - BLIT_BASE) / 4];
+            *slot = (*slot & !(0xff_u32 << shift)) | (u32::from(value) << shift);
+            return;
+        }
+        // Only CONTROL and DISP_START are writable outside the blit block.
         let target = match reg {
             REG_CONTROL => &mut self.control,
             REG_DISP_START => &mut self.display.start,
             _ => return,
         };
-        let shift = 8 * byte;
         *target = (*target & !(0xff_u32 << shift)) | (u32::from(value) << shift);
     }
 }
@@ -283,5 +305,21 @@ mod tests {
             Some((1024, 768))
         );
         assert!(vbe_mode(0x999).is_none());
+    }
+
+    #[test]
+    fn blit_registers_round_trip() {
+        let mut margo = Margo::default();
+        // Distinct values in each lane prove byte recombination.
+        margo.write_mmio_u8(REG_DST_BASE, 0x11);
+        margo.write_mmio_u8(REG_DST_BASE + 1, 0x22);
+        margo.write_mmio_u8(REG_DST_BASE + 2, 0x33);
+        margo.write_mmio_u8(REG_DST_BASE + 3, 0x44);
+        assert_eq!(read_reg_u32(&margo, REG_DST_BASE), 0x4433_2211);
+
+        // A different blit register is independent.
+        margo.write_mmio_u8(REG_FG_COLOR, 0xab);
+        assert_eq!(read_reg_u32(&margo, REG_FG_COLOR), 0x0000_00ab);
+        assert_eq!(read_reg_u32(&margo, REG_DST_BASE), 0x4433_2211);
     }
 }
