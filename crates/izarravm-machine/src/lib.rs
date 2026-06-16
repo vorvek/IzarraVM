@@ -116,6 +116,7 @@ pub struct Machine {
     video: VgaTextMode,
     margo: Margo,
     margo_active: bool,
+    int10_pending: bool,
     rom: Vec<u8>,
     serial: SerialPort,
     device_ports: DevicePorts,
@@ -141,6 +142,7 @@ impl Machine {
             video: VgaTextMode::default(),
             margo: Margo::default(),
             margo_active: false,
+            int10_pending: false,
             rom: rom.to_vec(),
             serial: SerialPort::default(),
             device_ports: DevicePorts::default(),
@@ -171,6 +173,7 @@ impl Machine {
             video: VgaTextMode::default(),
             margo: Margo::default(),
             margo_active: false,
+            int10_pending: false,
             rom: vec![0; BIOS_ROM_SIZE],
             serial: SerialPort::default(),
             device_ports: DevicePorts::default(),
@@ -243,6 +246,7 @@ impl Machine {
             serial: &mut self.serial,
             device_ports: &mut self.device_ports,
             trace: &mut self.trace,
+            int10_pending: &mut self.int10_pending,
             wait_states: self.profile.wait_states,
         }
     }
@@ -267,6 +271,17 @@ impl Machine {
 
     pub fn margo_mut(&mut self) -> &mut Margo {
         &mut self.margo
+    }
+
+    /// Service the host side of an `INT 10h` after the instruction retires.
+    /// The CPU registers are intact here: a software interrupt only pushes
+    /// flags/CS/IP. VBE functions (`AH=4Fh`) land in later tasks.
+    fn handle_int10(&mut self) {
+        let ax = self.cpu.registers.eax() as u16;
+        if ax == 0x0013 {
+            self.video.set_mode13h();
+            self.margo_active = false;
+        }
     }
 
     pub fn set_margo_mode_640x480x8(&mut self) {
@@ -344,6 +359,7 @@ impl Machine {
         requested: u64,
     ) -> Result<StopReason, MachineError> {
         while self.elapsed_clocks < deadline {
+            self.int10_pending = false;
             let trace_before = self.trace.elapsed_clocks();
             let outcome = {
                 let Machine {
@@ -358,6 +374,7 @@ impl Machine {
                     pic,
                     opl,
                     trace,
+                    int10_pending,
                     ..
                 } = self;
                 let mut bus = MachineBus {
@@ -370,6 +387,7 @@ impl Machine {
                     pic,
                     opl,
                     trace,
+                    int10_pending,
                     wait_states: profile.wait_states,
                 };
                 cpu.cycle(&mut bus)
@@ -384,6 +402,9 @@ impl Machine {
                     // the overflow flag (the synthesis clock is driven separately
                     // by `render_audio`).
                     self.advance_devices(step);
+                    if self.int10_pending {
+                        self.handle_int10();
+                    }
                     if outcome.halted {
                         return Ok(StopReason::Halted);
                     }
@@ -406,6 +427,7 @@ struct MachineBus<'a> {
     pic: &'a mut pic::Pic8259Pair,
     opl: &'a mut OplChip,
     trace: &'a mut BusTrace,
+    int10_pending: &'a mut bool,
     wait_states: WaitStateProfile,
 }
 
@@ -550,15 +572,15 @@ impl CpuBus for MachineBus<'_> {
         self.pic.acknowledge()
     }
 
-    fn interrupt_acknowledge(&mut self, vector: u8, ax: u16) -> Result<(), BusError> {
+    fn interrupt_acknowledge(&mut self, vector: u8, _ax: u16) -> Result<(), BusError> {
         self.trace.push(BusCycle::new(
             BusAccessKind::InterruptAcknowledge,
             u32::from(vector),
             BusWidth::Byte,
             self.wait_states.io,
         ));
-        if vector == 0x10 && ax == 0x0013 {
-            self.video.set_mode13h();
+        if vector == 0x10 {
+            *self.int10_pending = true;
         }
         Ok(())
     }
@@ -910,18 +932,7 @@ mod tests {
     fn unaligned_dword_splits_into_byte_bus_cycles() {
         let mut machine = test_machine();
         {
-            let mut bus = MachineBus {
-                memory: &mut machine.memory,
-                video: &mut machine.video,
-                margo: &mut machine.margo,
-                rom: &machine.rom,
-                serial: &mut machine.serial,
-                device_ports: &mut machine.device_ports,
-                pic: &mut machine.pic,
-                opl: &mut machine.opl,
-                trace: &mut machine.trace,
-                wait_states: machine.profile.wait_states,
-            };
+            let mut bus = machine.make_bus();
             bus.write_memory(
                 0x101,
                 BusWidth::Dword,
@@ -1057,6 +1068,26 @@ mod tests {
             | (u32::from(machine.read_physical_u8(MARGO_MMIO_BASE + 2)) << 16)
             | (u32::from(machine.read_physical_u8(MARGO_MMIO_BASE + 3)) << 24);
         assert_eq!(id, MARGO_ID_VALUE);
+    }
+
+    #[test]
+    fn vga_mode_set_clears_a_latched_margo_display() {
+        let rom = rom_with_code(&[
+            0xb8, 0x13, 0x00, // mov ax, 0013h
+            0xcd, 0x10, // int 10h
+            0xf4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+
+        // Host path latches Margo as the active display.
+        machine.set_margo_mode_640x480x8();
+        assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
+
+        // A guest VGA mode-set must hand the display back to VGA.
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(machine.active_display(), ActiveDisplay::Mode13h);
     }
 
     #[test]
