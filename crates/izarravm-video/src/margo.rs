@@ -65,11 +65,16 @@ pub const REG_DISP_START: usize = 0x0024;
 // needs when COMMAND fires. The block 0x100..0x150 is a flat R/W store.
 pub const REG_DST_BASE: usize = 0x0100;
 pub const REG_DST_PITCH: usize = 0x0104;
+pub const REG_SRC_BASE: usize = 0x0108;
+pub const REG_SRC_PITCH: usize = 0x010c;
 pub const REG_DEPTH: usize = 0x0110;
 pub const REG_DST_XY: usize = 0x0114;
+pub const REG_SRC_XY: usize = 0x0118;
 pub const REG_DIM: usize = 0x011c;
 pub const REG_FG_COLOR: usize = 0x0120;
+pub const REG_COLORKEY: usize = 0x012c;
 pub const REG_ROP: usize = 0x0128;
+pub const REG_FLAGS: usize = 0x0130;
 pub const REG_COMMAND: usize = 0x0150;
 
 const BLIT_BASE: usize = 0x0100;
@@ -138,6 +143,67 @@ fn fill(vram: &mut [u8], p: &FillParams) -> u64 {
             } else {
                 vram[offset..offset + depth].copy_from_slice(&fg[..depth]);
             }
+        }
+    }
+    written
+}
+
+struct CopyParams {
+    dst_base: u32,
+    dst_pitch: u32,
+    src_base: u32,
+    src_pitch: u32,
+    depth: u32, // bytes per pixel: 1, 2, or 4
+    dst_x: u32,
+    dst_y: u32,
+    src_x: u32,
+    src_y: u32,
+    width: u32,
+    height: u32,
+    colorkey: u32,
+    colorkey_en: bool,
+}
+
+/// Copy a source rectangle to a destination rectangle in `vram`, SRCCOPY.
+/// Returns the number of pixels actually written (in-bounds on both sides and
+/// not keyed out). A source or destination pixel whose byte range falls outside
+/// the frame store is skipped, not wrapped (section 8). `depth` outside {1, 2, 4}
+/// is a no-op. The loop is bounded to `vram.len()` considered pixels, and the
+/// offset math is u64-saturating, so a pathological or adversarial rectangle
+/// cannot spin or overflow. Traversal is forward; overlap-safe ordering is added
+/// next.
+fn copy(vram: &mut [u8], p: &CopyParams) -> u64 {
+    if !matches!(p.depth, 1 | 2 | 4) {
+        return 0;
+    }
+    let depth = p.depth as usize;
+    let len = vram.len() as u64;
+    let key = p.colorkey.to_le_bytes();
+    let mut considered: u64 = 0;
+    let mut written: u64 = 0;
+    'rows: for row in 0..p.height {
+        for col in 0..p.width {
+            if considered >= len {
+                break 'rows;
+            }
+            considered += 1;
+            let src_off = (p.src_base as u64)
+                .saturating_add((p.src_y as u64 + row as u64).saturating_mul(p.src_pitch as u64))
+                .saturating_add((p.src_x as u64 + col as u64).saturating_mul(depth as u64));
+            let dst_off = (p.dst_base as u64)
+                .saturating_add((p.dst_y as u64 + row as u64).saturating_mul(p.dst_pitch as u64))
+                .saturating_add((p.dst_x as u64 + col as u64).saturating_mul(depth as u64));
+            if src_off.saturating_add(depth as u64) > len
+                || dst_off.saturating_add(depth as u64) > len
+            {
+                continue;
+            }
+            let (src_off, dst_off) = (src_off as usize, dst_off as usize);
+            if p.colorkey_en && vram[src_off..src_off + depth] == key[..depth] {
+                continue;
+            }
+            written += 1;
+            vram.copy_within(src_off..src_off + depth, dst_off);
         }
     }
     written
@@ -667,5 +733,235 @@ mod tests {
         assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 0);
         // RESET is self-clearing.
         assert_eq!(read_reg_u32(&margo, REG_CONTROL) & 1, 0);
+    }
+
+    #[test]
+    fn copy_moves_a_non_overlapping_rectangle_depth_1() {
+        // pitch 8. Source 2x2 at (0,0) holds distinct bytes; copy it to (4,2).
+        let mut vram = vec![0u8; 64];
+        vram[0] = 0xa1; // (0,0)
+        vram[1] = 0xa2; // (1,0)
+        vram[8] = 0xa3; // (0,1)
+        vram[9] = 0xa4; // (1,1)
+        let p = CopyParams {
+            dst_base: 0,
+            dst_pitch: 8,
+            src_base: 0,
+            src_pitch: 8,
+            depth: 1,
+            dst_x: 4,
+            dst_y: 2,
+            src_x: 0,
+            src_y: 0,
+            width: 2,
+            height: 2,
+            colorkey: 0,
+            colorkey_en: false,
+        };
+        let pixels = copy(&mut vram, &p);
+        assert_eq!(pixels, 4);
+        // Destination (4,2)=20, (5,2)=21, (4,3)=28, (5,3)=29.
+        assert_eq!(vram[20], 0xa1);
+        assert_eq!(vram[21], 0xa2);
+        assert_eq!(vram[28], 0xa3);
+        assert_eq!(vram[29], 0xa4);
+        // Source untouched.
+        assert_eq!(vram[0], 0xa1);
+    }
+
+    #[test]
+    fn copy_moves_depth_2_and_4_pixels() {
+        let mut vram = vec![0u8; 64];
+        // depth 2: source pixel at (0,0) = 0x1234, copy to (4,0).
+        vram[0] = 0x34;
+        vram[1] = 0x12;
+        let p2 = CopyParams {
+            dst_base: 0,
+            dst_pitch: 32,
+            src_base: 0,
+            src_pitch: 32,
+            depth: 2,
+            dst_x: 4,
+            dst_y: 0,
+            src_x: 0,
+            src_y: 0,
+            width: 1,
+            height: 1,
+            colorkey: 0,
+            colorkey_en: false,
+        };
+        assert_eq!(copy(&mut vram, &p2), 1);
+        assert_eq!(&vram[8..10], &[0x34, 0x12]); // (4,0) at depth 2 = offset 8
+
+        // depth 4: source pixel at (0,0) = 0xDEADBEEF, copy to (2,0).
+        let mut vram = vec![0u8; 64];
+        vram[0..4].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+        let p4 = CopyParams {
+            dst_base: 0,
+            dst_pitch: 32,
+            src_base: 0,
+            src_pitch: 32,
+            depth: 4,
+            dst_x: 2,
+            dst_y: 0,
+            src_x: 0,
+            src_y: 0,
+            width: 1,
+            height: 1,
+            colorkey: 0,
+            colorkey_en: false,
+        };
+        assert_eq!(copy(&mut vram, &p4), 1);
+        assert_eq!(&vram[8..12], &[0xef, 0xbe, 0xad, 0xde]); // (2,0) at depth 4 = offset 8
+    }
+
+    #[test]
+    fn copy_color_key_skips_matching_source_pixels() {
+        // Source row [0x05, 0x07] at (0,0); key 0x05 is transparent.
+        let mut vram = vec![0u8; 32];
+        vram[0] = 0x05;
+        vram[1] = 0x07;
+        // Pre-fill the destination so a skipped pixel is visibly left alone.
+        vram[8] = 0xee;
+        vram[9] = 0xee;
+        let p = CopyParams {
+            dst_base: 0,
+            dst_pitch: 8,
+            src_base: 0,
+            src_pitch: 8,
+            depth: 1,
+            dst_x: 0,
+            dst_y: 1,
+            src_x: 0,
+            src_y: 0,
+            width: 2,
+            height: 1,
+            colorkey: 0x05,
+            colorkey_en: true,
+        };
+        assert_eq!(copy(&mut vram, &p), 1); // only the non-keyed pixel written
+        assert_eq!(vram[8], 0xee); // keyed source 0x05 -> destination untouched
+        assert_eq!(vram[9], 0x07); // non-keyed source copied
+    }
+
+    #[test]
+    fn copy_skips_out_of_bounds_source_and_destination() {
+        // Source partly off the store: src base 14, 4 wide at depth 1 -> offsets
+        // 14,15,16,17; 16 and 17 are out, so only two pixels are readable.
+        let mut vram = vec![0u8; 16];
+        vram[14] = 0x71;
+        vram[15] = 0x72;
+        let p_src = CopyParams {
+            dst_base: 0,
+            dst_pitch: 16,
+            src_base: 14,
+            src_pitch: 16,
+            depth: 1,
+            dst_x: 0,
+            dst_y: 0,
+            src_x: 0,
+            src_y: 0,
+            width: 4,
+            height: 1,
+            colorkey: 0,
+            colorkey_en: false,
+        };
+        assert_eq!(copy(&mut vram, &p_src), 2);
+        assert_eq!(vram[0], 0x71);
+        assert_eq!(vram[1], 0x72);
+
+        // Destination partly off the store: same idea, dst base 14.
+        let mut vram = vec![0u8; 16];
+        vram[0] = 0x81;
+        vram[1] = 0x82;
+        vram[2] = 0x83;
+        vram[3] = 0x84;
+        let p_dst = CopyParams {
+            dst_base: 14,
+            dst_pitch: 16,
+            src_base: 0,
+            src_pitch: 16,
+            depth: 1,
+            dst_x: 0,
+            dst_y: 0,
+            src_x: 0,
+            src_y: 0,
+            width: 4,
+            height: 1,
+            colorkey: 0,
+            colorkey_en: false,
+        };
+        assert_eq!(copy(&mut vram, &p_dst), 2); // offsets 14,15 in; 16,17 out
+        assert_eq!(vram[14], 0x81);
+        assert_eq!(vram[15], 0x82);
+    }
+
+    #[test]
+    fn copy_rejects_invalid_depth() {
+        let mut vram = vec![0u8; 16];
+        vram[0] = 0xaa;
+        let p = CopyParams {
+            dst_base: 0,
+            dst_pitch: 4,
+            src_base: 0,
+            src_pitch: 4,
+            depth: 3, // not 1, 2, or 4
+            dst_x: 1,
+            dst_y: 0,
+            src_x: 0,
+            src_y: 0,
+            width: 1,
+            height: 1,
+            colorkey: 0,
+            colorkey_en: false,
+        };
+        assert_eq!(copy(&mut vram, &p), 0);
+        assert_eq!(vram[1], 0x00); // nothing written
+    }
+
+    #[test]
+    fn copy_caps_iterations_at_the_store_size() {
+        let mut vram = vec![0u8; 16];
+        let p = CopyParams {
+            dst_base: 0,
+            dst_pitch: 4,
+            src_base: 0,
+            src_pitch: 4,
+            depth: 1,
+            dst_x: 0,
+            dst_y: 0,
+            src_x: 0,
+            src_y: 0,
+            width: 4000,
+            height: 4000,
+            colorkey: 0,
+            colorkey_en: false,
+        };
+        // A pathological DIM must not spin; the loop is capped at vram.len().
+        // With src==dst every considered pixel is a no-op move, so written tracks
+        // the in-bounds count up to the cap.
+        assert_eq!(copy(&mut vram, &p), 16);
+    }
+
+    #[test]
+    fn copy_skips_extreme_coordinates_without_overflow() {
+        let mut vram = vec![0u8; 64];
+        let p = CopyParams {
+            dst_base: u32::MAX,
+            dst_pitch: u32::MAX,
+            src_base: u32::MAX,
+            src_pitch: u32::MAX,
+            depth: 4,
+            dst_x: u32::MAX,
+            dst_y: u32::MAX,
+            src_x: u32::MAX,
+            src_y: u32::MAX,
+            width: 8,
+            height: 8,
+            colorkey: 0,
+            colorkey_en: false,
+        };
+        assert_eq!(copy(&mut vram, &p), 0); // must not panic; nothing written
+        assert!(vram.iter().all(|&b| b == 0));
     }
 }
