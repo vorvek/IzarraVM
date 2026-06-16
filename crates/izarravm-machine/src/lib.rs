@@ -364,9 +364,9 @@ impl Machine {
                     self.advance_devices(step);
                     if outcome.halted {
                         match self.next_timer_wake(deadline) {
-                            Some(step) => {
-                                self.elapsed_clocks += step;
-                                self.advance_devices(step);
+                            Some(wake_step) => {
+                                self.elapsed_clocks += wake_step;
+                                self.advance_devices(wake_step);
                             }
                             None => return Ok(StopReason::Halted),
                         }
@@ -1079,6 +1079,8 @@ mod tests {
             machine.memory().as_slice()[0x0501],
         ]);
         assert_eq!(tick, 1, "the IRQ0 handler should have run once");
+        // One tick is about 1000 PIT clocks, near 21000 CPU clocks at 25 MHz, so a
+        // real fast-forward clears this slack floor while a no-op halt would not.
         assert!(
             machine.elapsed_clocks() > 10_000,
             "the fast-forward should have advanced emulated time across the tick interval"
