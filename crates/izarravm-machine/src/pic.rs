@@ -143,7 +143,10 @@ impl Pic {
 
 /// The master/slave 8259A pair. The slave's INT output drives master IR2, modeled
 /// by mirroring any slave request onto master IR2 so the single-chip resolver
-/// handles both levels.
+/// handles both levels. The mirror is edge latched: a second slave request latched
+/// while another slave level is in service must be re-raised through `request`,
+/// because the master IR2 bit is not held across its EOI. The PIT (IRQ0, master)
+/// does not exercise this; add a held slave INT line if a cascaded device needs it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct Pic8259Pair {
     master: Pic,
@@ -187,7 +190,8 @@ impl Pic8259Pair {
         if master_irq != 2 {
             return Some(self.master.vector(master_irq));
         }
-        // Cascade: the master selected the slave. EOI is later owed to both chips.
+        // Cascade: the master selected the slave. A non-AEOI EOI is later owed to
+        // both chips (the slave then the master); under AEOI each ISR self-clears.
         match self.slave.highest_pending() {
             Some(slave_irq) => {
                 self.slave.set_in_service(slave_irq);
