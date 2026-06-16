@@ -172,12 +172,14 @@ impl Pic8259Pair {
     }
 
     pub(crate) fn request(&mut self, irq: u8) {
+        debug_assert!(irq < 16, "the PIC pair has 16 IRQ lines, got {irq}");
         if irq < 8 {
             self.master.irr |= 1 << irq;
-        } else {
+        } else if irq < 16 {
             self.slave.irr |= 1 << (irq - 8);
             self.master.irr |= 1 << 2; // the slave INT line is wired to master IR2
         }
+        // irq >= 16 is not a PC interrupt line; ignore it in release builds.
     }
 
     pub(crate) fn interrupt_pending(&self) -> bool {
@@ -309,6 +311,7 @@ mod tests {
         pic.request(9); // master IR2 + slave line 1
         pic.write_port(0xa1, 0x02); // mask slave line 1 after raising it
         assert_eq!(pic.acknowledge(), Some(0x77)); // slave base 0x70 | 7, spurious
+        assert_eq!(pic.master.isr, 0x04); // master IR2 is in service, owes a master EOI
         assert_eq!(pic.slave.isr, 0x00); // no slave ISR set on a spurious IR7
     }
 }
