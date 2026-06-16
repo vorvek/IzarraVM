@@ -4,9 +4,9 @@ use izarravm_core::{CpuPreset, HardwareProfile, VideoCard};
 use izarravm_cpu::{Cpu386, CpuError, SegmentIndex, SegmentRegister};
 pub use izarravm_video::MARGO_ID_VALUE;
 use izarravm_video::{
-    DAC_ENTRIES, Framebuffer, MARGO_MMIO_SIZE, MARGO_VRAM_SIZE, MODE13H_MEMORY_SIZE, Margo,
-    TextFrame, VGA_MODE13H_BASE, VGA_TEXT_BASE, VGA_TEXT_MEMORY_SIZE, VgaTextMode, VideoMode,
-    vbe_mode,
+    DAC_ENTRIES, Framebuffer, MARGO_MMIO_SIZE, MARGO_VBE_MODES, MARGO_VRAM_SIZE,
+    MODE13H_MEMORY_SIZE, Margo, TextFrame, VGA_MODE13H_BASE, VGA_TEXT_BASE, VGA_TEXT_MEMORY_SIZE,
+    VgaTextMode, VideoMode, vbe_mode,
 };
 use thiserror::Error;
 
@@ -293,11 +293,38 @@ impl Machine {
     /// leave `AX` unchanged, so `AL != 0x4F` signals "not supported" to the guest.
     fn handle_vbe(&mut self, function: u8) {
         match function {
+            0x00 => self.vbe_controller_info(),
             0x01 => self.vbe_mode_info(),
             0x02 => self.vbe_set_mode(),
             0x03 => self.vbe_current_mode(),
             _ => {}
         }
+    }
+
+    fn vbe_controller_info(&mut self) {
+        let es = self.cpu.registers.segment(SegmentIndex::Es).selector;
+        let di = self.cpu.registers.edi() as u16;
+        let mut block = [0u8; 256];
+        block[0x00..0x04].copy_from_slice(b"VESA");
+        block[0x04..0x06].copy_from_slice(&0x0200u16.to_le_bytes()); // VbeVersion
+        block[0x12..0x14].copy_from_slice(&64u16.to_le_bytes()); // TotalMemory: 64 * 64 KB = 4 MB
+
+        // The mode list lives inside the block at offset 0x14. VideoModePtr is a
+        // real-mode far pointer (segment:offset) to it.
+        let list_offset = di.wrapping_add(0x14);
+        let video_mode_ptr = (u32::from(es) << 16) | u32::from(list_offset);
+        block[0x0e..0x12].copy_from_slice(&video_mode_ptr.to_le_bytes());
+
+        let mut pos = 0x14;
+        for mode in MARGO_VBE_MODES {
+            block[pos..pos + 2].copy_from_slice(&mode.number.to_le_bytes());
+            pos += 2;
+        }
+        block[pos..pos + 2].copy_from_slice(&0xffffu16.to_le_bytes());
+
+        let addr = self.vbe_block_ptr();
+        self.write_guest_block(addr, &block);
+        self.set_vbe_status(0x004f);
     }
 
     /// Set the `AX` low word to a VBE status (`0x004F` ok, `0x014F` failed),
@@ -1448,6 +1475,41 @@ mod tests {
         assert_eq!(read_u16(&mut machine, base + 0x14), 480); // YResolution
         assert_eq!(machine.read_physical_u8(base + 0x19), 8); // BitsPerPixel
         assert_eq!(read_u32(&mut machine, base + 0x28), MARGO_LFB_BASE); // PhysBasePtr
+    }
+
+    #[test]
+    fn vbe_controller_info_fills_the_block() {
+        let rom = rom_with_code(&[
+            0xb8, 0x00, 0x40, // mov ax, 4000h
+            0x8e, 0xc0, // mov es, ax
+            0xbf, 0x00, 0x00, // mov di, 0
+            0xb8, 0x00, 0x4f, // mov ax, 4F00h
+            0xcd, 0x10, // int 10h
+            0xf4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(machine.cpu().registers.eax() as u16, 0x004f);
+
+        let base = 0x40000;
+        assert_eq!(machine.read_physical_u8(base), b'V');
+        assert_eq!(machine.read_physical_u8(base + 1), b'E');
+        assert_eq!(machine.read_physical_u8(base + 2), b'S');
+        assert_eq!(machine.read_physical_u8(base + 3), b'A');
+        assert_eq!(read_u16(&mut machine, base + 0x04), 0x0200); // VbeVersion
+        assert_eq!(read_u16(&mut machine, base + 0x12), 64); // TotalMemory (64 KB units)
+
+        // VideoModePtr (seg:off) must point at the mode list.
+        let ptr = read_u32(&mut machine, base + 0x0e);
+        let list = (((ptr >> 16) & 0xffff) << 4) + (ptr & 0xffff);
+        assert_eq!(read_u16(&mut machine, list), 0x0100);
+        assert_eq!(read_u16(&mut machine, list + 2), 0x0101);
+        assert_eq!(read_u16(&mut machine, list + 4), 0x0103);
+        assert_eq!(read_u16(&mut machine, list + 6), 0x0105);
+        assert_eq!(read_u16(&mut machine, list + 8), 0xffff);
     }
 
     #[test]
