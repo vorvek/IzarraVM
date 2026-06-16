@@ -1600,8 +1600,14 @@ mod tests {
         write_mmio_reg(&mut machine, 0x150, 0x02); // COMMAND: COPY
 
         // Destination corners hold the source bytes (read back through the LFB).
-        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 10 * 640 + 10), 0xa1);
-        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 11 * 640 + 11), 0xa4);
+        assert_eq!(
+            machine.read_physical_u8(MARGO_LFB_BASE + 10 * 640 + 10),
+            0xa1
+        );
+        assert_eq!(
+            machine.read_physical_u8(MARGO_LFB_BASE + 11 * 640 + 11),
+            0xa4
+        );
         // BUSY is set right after the command.
         assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
 
