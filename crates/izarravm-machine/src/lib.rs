@@ -1578,6 +1578,42 @@ mod tests {
     }
 
     #[test]
+    fn copy_through_the_mmio_aperture_moves_vram_and_times_busy() {
+        let mut machine = test_machine();
+        // Seed a 2x2 source rectangle at (0, 0), pitch 640, depth 1, through the LFB.
+        machine.write_physical_u8(MARGO_LFB_BASE, 0xa1); // (0,0)
+        machine.write_physical_u8(MARGO_LFB_BASE + 1, 0xa2); // (1,0)
+        machine.write_physical_u8(MARGO_LFB_BASE + 640, 0xa3); // (0,1)
+        machine.write_physical_u8(MARGO_LFB_BASE + 641, 0xa4); // (1,1)
+
+        // Copy it to (10, 10) on the same surface (no overlap).
+        write_mmio_reg(&mut machine, 0x100, 0); // DST_BASE
+        write_mmio_reg(&mut machine, 0x104, 640); // DST_PITCH
+        write_mmio_reg(&mut machine, 0x108, 0); // SRC_BASE
+        write_mmio_reg(&mut machine, 0x10c, 640); // SRC_PITCH
+        write_mmio_reg(&mut machine, 0x110, 1); // DEPTH
+        write_mmio_reg(&mut machine, 0x114, (10 << 16) | 10); // DST_XY: y=10, x=10
+        write_mmio_reg(&mut machine, 0x118, 0); // SRC_XY: (0,0)
+        write_mmio_reg(&mut machine, 0x11c, (2 << 16) | 2); // DIM: h=2, w=2
+        write_mmio_reg(&mut machine, 0x128, 0xcc); // ROP: SRCCOPY
+        write_mmio_reg(&mut machine, 0x130, 0); // FLAGS: none
+        write_mmio_reg(&mut machine, 0x150, 0x02); // COMMAND: COPY
+
+        // Destination corners hold the source bytes (read back through the LFB).
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 10 * 640 + 10), 0xa1);
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 11 * 640 + 11), 0xa4);
+        // BUSY is set right after the command.
+        assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
+
+        // 4 pixels -> busy_ns = 100 + 4*10 = 140 ns. At 25 MHz (40 ns/clock),
+        // three clocks (120 ns) leave it busy; the fourth clears it.
+        machine.advance_devices(3);
+        assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
+        machine.advance_devices(1);
+        assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 0);
+    }
+
+    #[test]
     fn fill_through_the_mmio_aperture_writes_vram_and_times_busy() {
         let mut machine = test_machine();
         // Latch a 5x4 fill at (3, 2), pitch 640, depth 1, color 0xAB, solid.

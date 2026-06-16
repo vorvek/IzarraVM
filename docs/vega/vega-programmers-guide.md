@@ -146,7 +146,7 @@ destination may overlap, so a screen can scroll by copying itself shifted by one
 text line. The engine handles overlap.
 
 ```c
-/* (target) */
+/* (verified) */
 void copy_rect(unsigned long base, int pitch, int bpp,
                int sx, int sy, int dx, int dy, int w, int h) {
     margo_wait();
