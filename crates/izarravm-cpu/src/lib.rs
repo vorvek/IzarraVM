@@ -257,10 +257,9 @@ pub struct Cpu386 {
     pub idtr: DescriptorTable,
     pub elapsed_clocks: u64,
     pub halted: bool,
-    // STI and IRET set this to block interrupt delivery for one instruction.
-    // The 386 holds off maskable interrupts until the instruction after STI;
-    // we apply the same rule after IRET so a handler can return to a CLI
-    // that runs before the next interrupt is taken.
+    // STI sets this to block maskable interrupt delivery for one instruction:
+    // the 386 holds off interrupts until the instruction after STI, which makes
+    // the STI; HLT idle idiom safe (the HLT runs before any interrupt is taken).
     interrupt_shadow: bool,
 }
 
@@ -407,9 +406,9 @@ impl Cpu386 {
             }
         }
 
-        // Consume the one-instruction shadow set by STI or IRET. While the shadow
-        // is active the interrupt check below is skipped so the instruction that
-        // follows STI/IRET always executes before an interrupt can be taken.
+        // Consume the one-instruction shadow set by STI. While it is active the
+        // interrupt check below is skipped so the instruction after STI always
+        // executes before an interrupt can be taken.
         let shadowed = self.interrupt_shadow;
         self.interrupt_shadow = false;
 
@@ -992,13 +991,7 @@ impl Cpu386 {
                 Ok(clocks(37))
             }
             0xcf => {
-                let if_before = self.flag(FLAG_IF);
                 self.iret(bus, operand_size)?;
-                // If IRET restored IF from cleared to set, arm the shadow so the
-                // instruction the handler returns to runs before the next interrupt.
-                if !if_before && self.flag(FLAG_IF) {
-                    self.interrupt_shadow = true;
-                }
                 Ok(clocks(22))
             }
             0xe0 | 0xe1 => {
