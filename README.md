@@ -2,7 +2,7 @@
 
 IzarraVM is a Rust emulator for the Izarra 3000, a fictional late-1990s
 computer. The Izarra 3000 is a fully integrated machine in the spirit of an Amiga
-or a Mac: fixed custom hardware running its own GUI operating system, Belunza Disk
+or a Mac: fixed custom hardware running its own GUI operating system, Toka Disk
 System, over an MS-DOS compatible core. The emulator reproduces that one machine
 rather than offering a configurable PC.
 
@@ -22,7 +22,7 @@ is one tight design.
 - CPU: GSW-586, a Pentium and K6 class part at 200 MHz on a 66 MHz bus. Two
   backward compatibility modes throttle it to behave like the earlier machines in
   the line: 486DX2 at 66 MHz (the Izarra 2000) and 386DX at 25 MHz (the Izarra
-  1000), switchable from Belunza without a reboot.
+  1000), switchable from Toka without a reboot.
 - Memory: 24 MB SDRAM.
 - Graphics: VEGA, an integrated chipset built from a 2D chip (Margo) and a
   Glide-capable 3D chip (Distira). 4 MB shared, VESA VBE 2.0, up to 1024x768 at
@@ -31,9 +31,9 @@ is one tight design.
   an MPU-401 MIDI port, and a wavetable daughterboard.
 - Storage: 3.6 GB IDE hard disk, 12x CD-ROM with CD audio, 1.44 MB floppy.
 - Display: 15-inch CRT, up to 1024x768.
-- Firmware: a 2 MB ROM holding a simplified custom BIOS and Belunza Disk System.
+- Firmware: a 2 MB ROM holding a simplified custom BIOS and Toka Disk System.
 
-Games see a DOS environment. Belunza runs an MS-DOS 6.1 compatible core with the
+Games see a DOS environment. Toka runs an MS-DOS 6.1 compatible core with the
 usual memory managers, and maps itself out of conventional memory so games that
 need most of the first 640 KB (Wing Commander, for one) still get it.
 
