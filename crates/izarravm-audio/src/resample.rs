@@ -86,7 +86,7 @@ impl Resampler {
         }
         // Drop input before the next output's leftmost tap. `next` itself never
         // rewinds, so chunked and one-shot runs stay bit-identical.
-        // ponytail: Vec::drain shifts ~TAPS elements; a ring buffer if it shows.
+        // Vec::drain shifts ~TAPS elements; switch to a ring buffer if it shows.
         let keep_from = (self.next.floor() as usize).saturating_sub(HALF - 1);
         let drop = keep_from.saturating_sub(self.consumed);
         if drop > 0 {

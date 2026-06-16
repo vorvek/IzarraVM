@@ -60,7 +60,7 @@ impl AudioPlayer {
 
     /// Queue resampled frames for playback, dropping the oldest if the backlog
     /// exceeds ~0.5 s so a faster-than-real-time emulator cannot grow the buffer
-    /// without bound. ponytail: Mutex ring; move to lock-free if it ever glitches.
+    /// without bound. Mutex ring for now; move to lock-free if it ever glitches.
     pub fn queue(&self, frames: &[(i16, i16)]) {
         let mut ring = self.ring.lock().expect("audio ring poisoned");
         ring.extend(frames.iter().copied());
