@@ -7,8 +7,8 @@ use izarravm_core::{
 use izarravm_dos::{DosKernelServices, HostDrive};
 use izarravm_firmware::{boot_test_image, parse_result_block, test_rom};
 use izarravm_input::InputState;
-use izarravm_machine::{Machine, MachineProfile, StopReason};
-use izarravm_video::{Framebuffer, PlaceholderVideoAdapter, TextFrame, VideoAdapter};
+use izarravm_machine::{ActiveDisplay, Machine, MachineProfile, StopReason};
+use izarravm_video::{Framebuffer, MargoDisplay, PlaceholderVideoAdapter, TextFrame, VideoAdapter};
 use std::error::Error;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -27,6 +27,7 @@ const OPL_NATIVE_HZ: f64 = 49_716.0;
 const WINDOW_WIDTH: u32 = 1280;
 const WINDOW_HEIGHT: u32 = 400;
 const MODE13H_SCALE: usize = 2;
+const MARGO_LFB_SCALE: usize = 1;
 const VGA_PALETTE: [u32; 16] = [
     0x000000, 0x0000aa, 0x00aa00, 0x00aaaa, 0xaa0000, 0xaa00aa, 0xaa5500, 0xaaaaaa, 0x555555,
     0x5555ff, 0x55ff55, 0x55ffff, 0xff5555, 0xff55ff, 0xffff55, 0xffffff,
@@ -327,13 +328,19 @@ impl WindowApp {
     }
 
     fn render_current_frame(&self) -> RenderedFrame {
-        if self.machine.is_graphics_mode() {
-            render_mode13h(
-                self.machine.mode13h_framebuffer(),
-                &self.machine.palette_argb(),
-            )
-        } else {
-            render_text_frame(&self.machine.screen_text())
+        match self.machine.active_display() {
+            ActiveDisplay::MargoLfb => {
+                let margo = self.machine.margo();
+                render_margo_lfb(
+                    margo.display(),
+                    margo.visible_surface(),
+                    &self.machine.palette_argb(),
+                )
+            }
+            ActiveDisplay::Mode13h => {
+                render_mode13h(self.machine.mode13h_framebuffer(), &self.machine.palette_argb())
+            }
+            ActiveDisplay::Text => render_text_frame(&self.machine.screen_text()),
         }
     }
 
@@ -463,6 +470,35 @@ fn render_mode13h(framebuffer: &Framebuffer, palette: &[u32; 256]) -> RenderedFr
     }
 }
 
+fn render_margo_lfb(display: MargoDisplay, vram: &[u8], palette: &[u32; 256]) -> RenderedFrame {
+    let width = display.width as usize;
+    let height = display.height as usize;
+    let pitch = display.pitch as usize;
+    let out_width = width * MARGO_LFB_SCALE;
+    let out_height = height * MARGO_LFB_SCALE;
+    let mut pixels = vec![palette[0]; out_width * out_height];
+
+    for source_y in 0..height {
+        for source_x in 0..width {
+            let index = vram.get(source_y * pitch + source_x).copied().unwrap_or(0);
+            let color = palette[usize::from(index)];
+            for scale_y in 0..MARGO_LFB_SCALE {
+                for scale_x in 0..MARGO_LFB_SCALE {
+                    let x = source_x * MARGO_LFB_SCALE + scale_x;
+                    let y = source_y * MARGO_LFB_SCALE + scale_y;
+                    pixels[y * out_width + x] = color;
+                }
+            }
+        }
+    }
+
+    RenderedFrame {
+        width: out_width,
+        height: out_height,
+        pixels,
+    }
+}
+
 fn blit_centered(
     source: &RenderedFrame,
     target: &mut [u32],
@@ -548,6 +584,28 @@ mod tests {
         assert_eq!(rendered.pixels[rendered.width + 1], 0x00AB_CDEF);
         // The next source pixel keeps the background color.
         assert_eq!(rendered.pixels[MODE13H_SCALE], palette[0]);
+    }
+
+    #[test]
+    fn margo_lfb_renderer_maps_indices_through_palette() {
+        let display = izarravm_video::MargoDisplay {
+            mode: 0x0101,
+            width: 4,
+            height: 2,
+            bpp: 8,
+            pitch: 4,
+            start: 0,
+        };
+        let vram = [0u8, 1, 0, 0, 0, 0, 0, 0];
+        let mut palette = [0u32; 256];
+        palette[1] = 0x0012_3456;
+
+        let rendered = render_margo_lfb(display, &vram, &palette);
+
+        assert_eq!(rendered.width, 4 * MARGO_LFB_SCALE);
+        assert_eq!(rendered.height, 2 * MARGO_LFB_SCALE);
+        // Source pixel (1,0) has index 1.
+        assert_eq!(rendered.pixels[MARGO_LFB_SCALE], 0x0012_3456);
     }
 
     #[test]
