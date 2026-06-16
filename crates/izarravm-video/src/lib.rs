@@ -1,6 +1,10 @@
 use izarravm_core::VideoCard;
 use thiserror::Error;
 
+pub mod margo;
+
+pub use margo::{Margo, MargoDisplay, MARGO_ID_VALUE, MARGO_VRAM_SIZE};
+
 pub const MODE13H_WIDTH: u32 = 320;
 pub const MODE13H_HEIGHT: u32 = 200;
 pub const MODE13H_MEMORY_SIZE: usize = 64_000;
