@@ -251,6 +251,7 @@ fn copy(vram: &mut [u8], p: &CopyParams) -> u64 {
     }
     let depth = p.depth as usize;
     let len = vram.len() as u64;
+    let key = p.colorkey.to_le_bytes();
     let mut considered: u64 = 0;
     let mut written: u64 = 0;
     let row_rev = p.dst_y > p.src_y; // dest below source: copy bottom-to-top
@@ -282,7 +283,7 @@ fn copy(vram: &mut [u8], p: &CopyParams) -> u64 {
             let (src_off, dst_off) = (src_off as usize, dst_off as usize);
             let mut sb = [0u8; 4];
             sb[..depth].copy_from_slice(&vram[src_off..src_off + depth]);
-            if p.colorkey_en && sb[..depth] == p.colorkey.to_le_bytes()[..depth] {
+            if p.colorkey_en && sb[..depth] == key[..depth] {
                 continue;
             }
             let s = u32::from_le_bytes(sb);
