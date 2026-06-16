@@ -95,34 +95,42 @@ struct FillParams {
     width: u32,
     height: u32,
     fg_color: u32,
-    rop: u8,
+    rop: u8, // 0xF0 PATCOPY (solid), 0x5A PATINVERT (XOR), others treated as solid
 }
 
-/// Fill a rectangle in `vram` from the latched parameters. Returns the number of
-/// pixels iterated, which is the rectangle area for a fill that fits and is
-/// capped at `vram.len()` otherwise. Off-store pixels are skipped, not wrapped
-/// (section 8). `depth` outside {1, 2, 4} is a no-op.
 #[allow(dead_code)]
+/// Fill a rectangle in `vram` from the latched parameters. Returns the number of
+/// pixels actually written inside the frame store; for a fill that fits, that is
+/// the rectangle area. Off-store pixels are skipped, not wrapped (section 8).
+/// `depth` outside {1, 2, 4} is a no-op. The loop is bounded to `vram.len()`
+/// considered pixels, so a pathological DIM cannot spin, and the offset math is
+/// done in u64 with saturating arithmetic so extreme coordinates skip rather
+/// than overflow.
 fn fill(vram: &mut [u8], p: &FillParams) -> u64 {
     if !matches!(p.depth, 1 | 2 | 4) {
         return 0;
     }
     let depth = p.depth as usize;
     let fg = p.fg_color.to_le_bytes();
-    let cap = vram.len() as u64;
-    let mut iterated: u64 = 0;
+    let len = vram.len() as u64;
+    let mut considered: u64 = 0;
+    let mut written: u64 = 0;
     'rows: for row in 0..p.height {
-        let y = p.dst_y as usize + row as usize;
+        let y = p.dst_y as u64 + row as u64;
         for col in 0..p.width {
-            if iterated >= cap {
+            if considered >= len {
                 break 'rows;
             }
-            iterated += 1;
-            let x = p.dst_x as usize + col as usize;
-            let offset = p.dst_base as usize + y * p.dst_pitch as usize + x * depth;
-            if offset + depth > vram.len() {
+            considered += 1;
+            let x = p.dst_x as u64 + col as u64;
+            let offset = (p.dst_base as u64)
+                .saturating_add(y.saturating_mul(p.dst_pitch as u64))
+                .saturating_add(x.saturating_mul(depth as u64));
+            if offset.saturating_add(depth as u64) > len {
                 continue;
             }
+            written += 1;
+            let offset = offset as usize;
             if p.rop == 0x5a {
                 for b in 0..depth {
                     vram[offset + b] ^= fg[b];
@@ -132,7 +140,7 @@ fn fill(vram: &mut [u8], p: &FillParams) -> u64 {
             }
         }
     }
-    iterated
+    written
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -512,5 +520,25 @@ mod tests {
             rop: 0xf0,
         };
         assert_eq!(fill(&mut vram, &p), 16);
+    }
+
+    #[test]
+    fn fill_skips_extreme_coordinates_without_overflow() {
+        let mut vram = vec![0u8; 64];
+        // Adversarial guest registers: every pixel is far out of the store.
+        // Must not panic; nothing is written.
+        let p = FillParams {
+            dst_base: u32::MAX,
+            dst_pitch: u32::MAX,
+            depth: 4,
+            dst_x: u32::MAX,
+            dst_y: u32::MAX,
+            width: 8,
+            height: 8,
+            fg_color: 0xdead_beef,
+            rop: 0xf0,
+        };
+        assert_eq!(fill(&mut vram, &p), 0);
+        assert!(vram.iter().all(|&b| b == 0));
     }
 }
