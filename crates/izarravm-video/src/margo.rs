@@ -1,11 +1,11 @@
 //! Margo, the VEGA 2D engine: the display register block, the linear frame
-//! buffer, and the blit engine. The engine implements FILL, COPY, and color
-//! expand.
+//! buffer, and the blit engine. The engine implements FILL, COPY, color expand,
+//! and LINE.
 
 pub const MARGO_VRAM_SIZE: usize = 4 * 1024 * 1024;
 pub const MARGO_MMIO_SIZE: usize = 0x0001_0000; // 64 KB register block
 pub const MARGO_ID_VALUE: u32 = 0x4D47_0100; // 'M' 'G', version 1.00
-pub const MARGO_CAPS_VALUE: u32 = 0x0000_0047; // bits 0 FILL, 1 COPY, 2 COLOR_EXPAND, 6 COLORKEY
+pub const MARGO_CAPS_VALUE: u32 = 0x0000_004f; // bits 0 FILL, 1 COPY, 2 COLOR_EXPAND, 3 LINE, 6 COLORKEY
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VbeMode {
@@ -77,6 +77,8 @@ pub const REG_BG_COLOR: usize = 0x0124;
 pub const REG_ROP: usize = 0x0128;
 pub const REG_COLORKEY: usize = 0x012c;
 pub const REG_FLAGS: usize = 0x0130;
+pub const REG_LINE_START: usize = 0x013c;
+pub const REG_LINE_END: usize = 0x0140;
 pub const REG_COMMAND: usize = 0x0150;
 pub const REG_MONO_DATA: usize = 0x0160;
 
@@ -85,6 +87,7 @@ const BLIT_REGS: usize = 20; // 0x100..0x150, twenty 32-bit slots; COMMAND at 0x
 const FILL_NS_PER_PIXEL: u64 = 5; // 200 Mpixels/s solid fill (section 1.1)
 const COPY_NS_PER_PIXEL: u64 = 10; // 100 Mpixels/s screen-to-screen blit (section 1.1)
 const EXPAND_NS_PER_PIXEL: u64 = 5; // 200 Mpixels/s color expand (section 1.1, fill class)
+const LINE_NS_PER_PIXEL: u64 = 10; // 100 Mpixels/s, one pixel per clock (section 1.1)
 const BLIT_SETUP_NS: u64 = 100; // fixed per-operation setup, shared by all blits
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -347,6 +350,73 @@ fn expand_word(
     written
 }
 
+struct LineParams {
+    dst_base: u32,
+    dst_pitch: u32,
+    depth: u32, // bytes per pixel: 1, 2, or 4
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+    fg_color: u32,
+    rop: u8, // 0x5A PATINVERT (XOR), others solid
+}
+
+/// Draw a line from `(x0, y0)` to `(x1, y1)` in `vram` with integer Bresenham.
+/// Both endpoints are inclusive; a zero-length line plots one pixel. ROP 0x5A
+/// exclusive-ORs `FG_COLOR` into the destination (rubber-band), every other code
+/// writes it solid. A pixel whose byte range falls outside the frame store is
+/// skipped, not wrapped (section 8). `depth` outside {1, 2, 4} is a no-op.
+/// Coordinates must be 16-bit (`run_line` supplies them as such), so the loop
+/// runs at most `max(|dx|, |dy|) + 1 <= 65536` steps and cannot spin; the offset
+/// math is u64-saturating so extreme `dst_base` / `dst_pitch` skip rather than
+/// overflow. Returns the number of pixels written.
+fn line(vram: &mut [u8], p: &LineParams) -> u64 {
+    if !matches!(p.depth, 1 | 2 | 4) {
+        return 0;
+    }
+    let depth = p.depth as usize;
+    let fg = p.fg_color.to_le_bytes();
+    let len = vram.len() as u64;
+    let (mut x, mut y) = (p.x0 as i64, p.y0 as i64);
+    let (x1, y1) = (p.x1 as i64, p.y1 as i64);
+    let dx = (x1 - x).abs();
+    let dy = -(y1 - y).abs();
+    let sx = if x < x1 { 1 } else { -1 };
+    let sy = if y < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+    let mut written: u64 = 0;
+    loop {
+        let off = (p.dst_base as u64)
+            .saturating_add((y as u64).saturating_mul(p.dst_pitch as u64))
+            .saturating_add((x as u64).saturating_mul(depth as u64));
+        if off.saturating_add(depth as u64) <= len {
+            let off = off as usize;
+            if p.rop == 0x5a {
+                for b in 0..depth {
+                    vram[off + b] ^= fg[b];
+                }
+            } else {
+                vram[off..off + depth].copy_from_slice(&fg[..depth]);
+            }
+            written += 1;
+        }
+        if x == x1 && y == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y += sy;
+        }
+    }
+    written
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Margo {
     vram: Vec<u8>,
@@ -506,6 +576,7 @@ impl Margo {
             0x02 => self.run_copy(),
             0x03 => self.arm_expand_data(),
             0x04 => self.run_expand_mem(),
+            0x05 => self.run_line(),
             _ => {}
         }
         self.command = 0;
@@ -576,6 +647,24 @@ impl Margo {
         };
         let pixels = color_expand_mem(&mut self.vram, &params);
         self.busy_ns = BLIT_SETUP_NS + pixels * EXPAND_NS_PER_PIXEL;
+    }
+
+    fn run_line(&mut self) {
+        let start = self.blit_reg(REG_LINE_START);
+        let end = self.blit_reg(REG_LINE_END);
+        let params = LineParams {
+            dst_base: self.blit_reg(REG_DST_BASE),
+            dst_pitch: self.blit_reg(REG_DST_PITCH),
+            depth: self.blit_reg(REG_DEPTH),
+            x0: start & 0xffff,
+            y0: start >> 16,
+            x1: end & 0xffff,
+            y1: end >> 16,
+            fg_color: self.blit_reg(REG_FG_COLOR),
+            rop: self.blit_reg(REG_ROP) as u8,
+        };
+        let pixels = line(&mut self.vram, &params);
+        self.busy_ns = BLIT_SETUP_NS + pixels * LINE_NS_PER_PIXEL;
     }
 
     fn arm_expand_data(&mut self) {
@@ -942,10 +1031,47 @@ mod tests {
     }
 
     #[test]
-    fn caps_reports_fill_copy_expand_and_colorkey() {
+    fn caps_reports_fill_copy_expand_line_and_colorkey() {
         let margo = Margo::default();
-        // bit 0 FILL, bit 1 COPY, bit 2 COLOR_EXPAND, bit 6 COLORKEY.
-        assert_eq!(read_reg_u32(&margo, REG_CAPS), 0x0000_0047);
+        // bit 0 FILL, 1 COPY, 2 COLOR_EXPAND, 3 LINE, 6 COLORKEY.
+        assert_eq!(read_reg_u32(&margo, REG_CAPS), 0x0000_004f);
+    }
+
+    #[test]
+    fn command_line_draws_and_sets_busy() {
+        let mut margo = Margo::default();
+        write_reg(&mut margo, REG_DST_BASE, 0);
+        write_reg(&mut margo, REG_DST_PITCH, 8);
+        write_reg(&mut margo, REG_DEPTH, 1);
+        write_reg(&mut margo, REG_LINE_START, 0); // (0,0)
+        write_reg(&mut margo, REG_LINE_END, 3); // (3,0): horizontal 4-pixel line
+        write_reg(&mut margo, REG_FG_COLOR, 0xab);
+        write_reg(&mut margo, REG_ROP, 0xf0);
+        write_reg(&mut margo, REG_COMMAND, 0x05); // LINE
+
+        for off in 0..4 {
+            assert_eq!(margo.read_vram_u8(off), 0xab);
+        }
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 1); // BUSY set
+    }
+
+    #[test]
+    fn command_line_busy_drains_at_the_line_rate() {
+        let mut margo = Margo::default();
+        write_reg(&mut margo, REG_DST_BASE, 0);
+        write_reg(&mut margo, REG_DST_PITCH, 8);
+        write_reg(&mut margo, REG_DEPTH, 1);
+        write_reg(&mut margo, REG_LINE_START, 0);
+        write_reg(&mut margo, REG_LINE_END, 3); // 4-pixel line
+        write_reg(&mut margo, REG_FG_COLOR, 0xab);
+        write_reg(&mut margo, REG_ROP, 0xf0);
+        write_reg(&mut margo, REG_COMMAND, 0x05);
+
+        // 4 pixels -> busy_ns = 100 + 4*10 = 140. One ns short still reads busy.
+        margo.advance_busy(139);
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 1);
+        margo.advance_busy(1);
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 0);
     }
 
     #[test]
@@ -1893,6 +2019,266 @@ mod tests {
         let row1 = margo.read_vram_u8(8); // row 1, col 0 of the original stream target
         write_reg(&mut margo, REG_MONO_DATA, 0xff00_0000);
         assert_eq!(margo.read_vram_u8(8), row1);
+    }
+
+    #[test]
+    fn line_draws_a_shallow_line_endpoints_inclusive() {
+        // (0,0) -> (4,2), pitch 8, depth 1. Bresenham plots (0,0),(1,1),(2,1),(3,2),
+        // (4,2): offsets 0, 9, 10, 19, 20. Both endpoints are drawn.
+        let mut vram = vec![0u8; 64];
+        let p = LineParams {
+            dst_base: 0,
+            dst_pitch: 8,
+            depth: 1,
+            x0: 0,
+            y0: 0,
+            x1: 4,
+            y1: 2,
+            fg_color: 0xab,
+            rop: 0xf0,
+        };
+        assert_eq!(line(&mut vram, &p), 5);
+        for off in [0usize, 9, 10, 19, 20] {
+            assert_eq!(vram[off], 0xab, "expected line pixel at offset {off}");
+        }
+        assert_eq!(vram[1], 0x00); // (1,0) is not on the line
+    }
+
+    #[test]
+    fn line_draws_a_steep_line() {
+        // (0,0) -> (2,4), pitch 8: (0,0),(1,1),(1,2),(2,3),(2,4) -> offsets
+        // 0, 9, 17, 26, 34 (covers the y-major Bresenham branch).
+        let mut vram = vec![0u8; 64];
+        let p = LineParams {
+            dst_base: 0,
+            dst_pitch: 8,
+            depth: 1,
+            x0: 0,
+            y0: 0,
+            x1: 2,
+            y1: 4,
+            fg_color: 0xcd,
+            rop: 0xf0,
+        };
+        assert_eq!(line(&mut vram, &p), 5);
+        for off in [0usize, 9, 17, 26, 34] {
+            assert_eq!(vram[off], 0xcd, "expected line pixel at offset {off}");
+        }
+    }
+
+    #[test]
+    fn line_draws_horizontal_and_vertical_runs() {
+        // Horizontal (0,1) -> (3,1), pitch 8: offsets 8, 9, 10, 11.
+        let mut vram = vec![0u8; 64];
+        let h = LineParams {
+            dst_base: 0,
+            dst_pitch: 8,
+            depth: 1,
+            x0: 0,
+            y0: 1,
+            x1: 3,
+            y1: 1,
+            fg_color: 0x11,
+            rop: 0xf0,
+        };
+        assert_eq!(line(&mut vram, &h), 4);
+        assert_eq!(&vram[8..12], &[0x11, 0x11, 0x11, 0x11]);
+
+        // Vertical (1,0) -> (1,3), pitch 8: offsets 1, 9, 17, 25.
+        let mut vram = vec![0u8; 64];
+        let v = LineParams {
+            dst_base: 0,
+            dst_pitch: 8,
+            depth: 1,
+            x0: 1,
+            y0: 0,
+            x1: 1,
+            y1: 3,
+            fg_color: 0x22,
+            rop: 0xf0,
+        };
+        assert_eq!(line(&mut vram, &v), 4);
+        for off in [1usize, 9, 17, 25] {
+            assert_eq!(vram[off], 0x22);
+        }
+    }
+
+    #[test]
+    fn line_draws_a_45_degree_diagonal() {
+        // (0,0) -> (3,3), pitch 8: one pixel per step at offsets 0, 9, 18, 27.
+        let mut vram = vec![0u8; 64];
+        let p = LineParams {
+            dst_base: 0,
+            dst_pitch: 8,
+            depth: 1,
+            x0: 0,
+            y0: 0,
+            x1: 3,
+            y1: 3,
+            fg_color: 0x33,
+            rop: 0xf0,
+        };
+        assert_eq!(line(&mut vram, &p), 4);
+        for off in [0usize, 9, 18, 27] {
+            assert_eq!(vram[off], 0x33);
+        }
+    }
+
+    #[test]
+    fn line_degenerate_plots_one_pixel() {
+        // LINE_START == LINE_END plots exactly the one pixel (5,5), offset 45.
+        let mut vram = vec![0u8; 64];
+        let p = LineParams {
+            dst_base: 0,
+            dst_pitch: 8,
+            depth: 1,
+            x0: 5,
+            y0: 5,
+            x1: 5,
+            y1: 5,
+            fg_color: 0x44,
+            rop: 0xf0,
+        };
+        assert_eq!(line(&mut vram, &p), 1);
+        assert_eq!(vram[45], 0x44);
+    }
+
+    #[test]
+    fn line_reversed_direction_covers_negative_steps() {
+        // (3,3) -> (0,0): both sx and sy are negative. A diagonal is symmetric, so it
+        // plots the same pixels as (0,0) -> (3,3): offsets 0, 9, 18, 27.
+        let mut vram = vec![0u8; 64];
+        let p = LineParams {
+            dst_base: 0,
+            dst_pitch: 8,
+            depth: 1,
+            x0: 3,
+            y0: 3,
+            x1: 0,
+            y1: 0,
+            fg_color: 0xab,
+            rop: 0xf0,
+        };
+        assert_eq!(line(&mut vram, &p), 4);
+        for off in [0usize, 9, 18, 27] {
+            assert_eq!(vram[off], 0xab);
+        }
+    }
+
+    #[test]
+    fn line_writes_depth_2_and_4_pixels() {
+        // depth 2 horizontal 2-pixel line, FG 0x1234 little-endian, pitch 16.
+        let mut vram = vec![0u8; 64];
+        let p2 = LineParams {
+            dst_base: 0,
+            dst_pitch: 16,
+            depth: 2,
+            x0: 0,
+            y0: 0,
+            x1: 1,
+            y1: 0,
+            fg_color: 0x1234,
+            rop: 0xf0,
+        };
+        assert_eq!(line(&mut vram, &p2), 2);
+        assert_eq!(&vram[0..2], &[0x34, 0x12]); // (0,0)
+        assert_eq!(&vram[2..4], &[0x34, 0x12]); // (1,0) at depth 2 = offset 2
+
+        // depth 4 single point at (1,0) = offset 4, FG 0xDEADBEEF.
+        let mut vram = vec![0u8; 64];
+        let p4 = LineParams {
+            dst_base: 0,
+            dst_pitch: 16,
+            depth: 4,
+            x0: 1,
+            y0: 0,
+            x1: 1,
+            y1: 0,
+            fg_color: 0xdead_beef,
+            rop: 0xf0,
+        };
+        assert_eq!(line(&mut vram, &p4), 1);
+        assert_eq!(&vram[4..8], &[0xef, 0xbe, 0xad, 0xde]);
+    }
+
+    #[test]
+    fn line_xor_rop_draws_and_erases() {
+        // Horizontal (0,0) -> (3,0) at offsets 0..4 over a 0xFF background; ROP 0x5A
+        // XORs 0x0F in, and a second identical draw restores the background.
+        let mut vram = vec![0xffu8; 32];
+        let p = LineParams {
+            dst_base: 0,
+            dst_pitch: 8,
+            depth: 1,
+            x0: 0,
+            y0: 0,
+            x1: 3,
+            y1: 0,
+            fg_color: 0x0f,
+            rop: 0x5a,
+        };
+        assert_eq!(line(&mut vram, &p), 4);
+        assert_eq!(&vram[0..4], &[0xf0, 0xf0, 0xf0, 0xf0]); // 0xff ^ 0x0f
+        assert_eq!(line(&mut vram, &p), 4);
+        assert_eq!(&vram[0..4], &[0xff, 0xff, 0xff, 0xff]); // restored
+    }
+
+    #[test]
+    fn line_skips_out_of_store_pixels() {
+        // Vertical (0,0) -> (0,3), pitch 8, store 16: offsets 0, 8 are in; 16, 24 out.
+        let mut vram = vec![0u8; 16];
+        let p = LineParams {
+            dst_base: 0,
+            dst_pitch: 8,
+            depth: 1,
+            x0: 0,
+            y0: 0,
+            x1: 0,
+            y1: 3,
+            fg_color: 0xab,
+            rop: 0xf0,
+        };
+        assert_eq!(line(&mut vram, &p), 2);
+        assert_eq!(vram[0], 0xab);
+        assert_eq!(vram[8], 0xab);
+    }
+
+    #[test]
+    fn line_rejects_invalid_depth() {
+        let mut vram = vec![0u8; 16];
+        let p = LineParams {
+            dst_base: 0,
+            dst_pitch: 4,
+            depth: 3, // not 1, 2, or 4
+            x0: 0,
+            y0: 0,
+            x1: 2,
+            y1: 0,
+            fg_color: 0xff,
+            rop: 0xf0,
+        };
+        assert_eq!(line(&mut vram, &p), 0);
+        assert!(vram.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn line_skips_extreme_offsets_without_overflow() {
+        // 16-bit coordinates (as run_line supplies) with an extreme base and pitch:
+        // every offset saturates past the store, nothing is written, no panic.
+        let mut vram = vec![0u8; 64];
+        let p = LineParams {
+            dst_base: u32::MAX,
+            dst_pitch: u32::MAX,
+            depth: 4,
+            x0: 0xffff,
+            y0: 0xffff,
+            x1: 0,
+            y1: 0,
+            fg_color: 0xdead_beef,
+            rop: 0xf0,
+        };
+        assert_eq!(line(&mut vram, &p), 0);
+        assert!(vram.iter().all(|&b| b == 0));
     }
 
     #[test]
