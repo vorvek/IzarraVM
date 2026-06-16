@@ -310,7 +310,9 @@ impl Machine {
         block[0x12..0x14].copy_from_slice(&64u16.to_le_bytes()); // TotalMemory: 64 * 64 KB = 4 MB
 
         // The mode list lives inside the block at offset 0x14. VideoModePtr is a
-        // real-mode far pointer (segment:offset) to it.
+        // real-mode far pointer the guest decodes as seg:off, so it carries the
+        // ES selector, not the linear base. vbe_block_ptr() uses the base for the
+        // write-side physical address; in real mode the two agree (base = selector << 4).
         let list_offset = di.wrapping_add(0x14);
         let video_mode_ptr = (u32::from(es) << 16) | u32::from(list_offset);
         block[0x0e..0x12].copy_from_slice(&video_mode_ptr.to_le_bytes());
@@ -1501,6 +1503,9 @@ mod tests {
         assert_eq!(machine.read_physical_u8(base + 3), b'A');
         assert_eq!(read_u16(&mut machine, base + 0x04), 0x0200); // VbeVersion
         assert_eq!(read_u16(&mut machine, base + 0x12), 64); // TotalMemory (64 KB units)
+        // OemStringPtr and Capabilities are intentionally left zero.
+        assert_eq!(read_u32(&mut machine, base + 0x06), 0); // OemStringPtr
+        assert_eq!(read_u32(&mut machine, base + 0x0a), 0); // Capabilities
 
         // VideoModePtr (seg:off) must point at the mode list.
         let ptr = read_u32(&mut machine, base + 0x0e);
