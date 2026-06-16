@@ -184,7 +184,9 @@ test_timer:
     cmp ax, TICK_TARGET
     jb .wait
     cli
-    ; Passed: patch FAIL -> PASS in the copied result block and fix the checksum.
+    ; Passed: patch FAIL -> PASS in the copied result block at 0x9000. Only bytes
+    ; 0, 2, 3 change (F->P, I->S, L->S), and the additive checksum word at offset
+    ; 10 gains 27, the difference between the 'PASS' and 'FAIL' byte sums.
     mov di, RESULT_BLOCK + (timer_record - result_block_template)
     mov byte [di], 'P'
     mov byte [di + 2], 'S'
