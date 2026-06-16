@@ -206,7 +206,7 @@ fn dispatch_int21(
         }
         // AH=4Ch: terminate with the return code in AL.
         0x4c => Ok(DosAction::Exit((regs.ax & 0x00ff) as u8)),
-        // Character I/O (01h/02h/06h/08h) and file I/O (3Dh/3Fh/3Eh) are later
+        // File I/O (3Dh/3Fh/3Eh) and the other unimplemented functions are later
         // slices. An unimplemented function is a no-op so the IRET stub returns.
         _ => Ok(DosAction::Continue),
     }
