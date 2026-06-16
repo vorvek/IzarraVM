@@ -1,10 +1,10 @@
 //! Margo, the VEGA 2D engine: the display register block, the linear frame
-//! buffer, and the blit engine. The engine currently implements FILL.
+//! buffer, and the blit engine. The engine implements FILL and COPY.
 
 pub const MARGO_VRAM_SIZE: usize = 4 * 1024 * 1024;
 pub const MARGO_MMIO_SIZE: usize = 0x0001_0000; // 64 KB register block
 pub const MARGO_ID_VALUE: u32 = 0x4D47_0100; // 'M' 'G', version 1.00
-pub const MARGO_CAPS_VALUE: u32 = 0x0000_0001; // bit 0: FILL available
+pub const MARGO_CAPS_VALUE: u32 = 0x0000_0043; // bits 0 FILL, 1 COPY, 6 COLORKEY
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VbeMode {
@@ -79,8 +79,9 @@ pub const REG_COMMAND: usize = 0x0150;
 
 const BLIT_BASE: usize = 0x0100;
 const BLIT_REGS: usize = 20; // 0x100..0x150, twenty 32-bit slots; COMMAND at 0x150 is handled separately
-const FILL_NS_PER_PIXEL: u64 = 5; // 200 Mpixels/s (section 1.1)
-const FILL_SETUP_NS: u64 = 100; // fixed per-operation setup
+const FILL_NS_PER_PIXEL: u64 = 5; // 200 Mpixels/s solid fill (section 1.1)
+const COPY_NS_PER_PIXEL: u64 = 10; // 100 Mpixels/s screen-to-screen blit (section 1.1)
+const BLIT_SETUP_NS: u64 = 100; // fixed per-operation setup, shared by all blits
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MargoDisplay {
@@ -352,8 +353,10 @@ impl Margo {
     }
 
     fn run_command(&mut self) {
-        if (self.command & 0xff) == 0x01 {
-            self.run_fill();
+        match self.command & 0xff {
+            0x01 => self.run_fill(),
+            0x02 => self.run_copy(),
+            _ => {}
         }
         self.command = 0;
     }
@@ -373,7 +376,30 @@ impl Margo {
             rop: self.blit_reg(REG_ROP) as u8,
         };
         let pixels = fill(&mut self.vram, &params);
-        self.busy_ns = FILL_SETUP_NS + pixels * FILL_NS_PER_PIXEL;
+        self.busy_ns = BLIT_SETUP_NS + pixels * FILL_NS_PER_PIXEL;
+    }
+
+    fn run_copy(&mut self) {
+        let dst_xy = self.blit_reg(REG_DST_XY);
+        let src_xy = self.blit_reg(REG_SRC_XY);
+        let dim = self.blit_reg(REG_DIM);
+        let params = CopyParams {
+            dst_base: self.blit_reg(REG_DST_BASE),
+            dst_pitch: self.blit_reg(REG_DST_PITCH),
+            src_base: self.blit_reg(REG_SRC_BASE),
+            src_pitch: self.blit_reg(REG_SRC_PITCH),
+            depth: self.blit_reg(REG_DEPTH),
+            dst_x: dst_xy & 0xffff,
+            dst_y: dst_xy >> 16,
+            src_x: src_xy & 0xffff,
+            src_y: src_xy >> 16,
+            width: dim & 0xffff,
+            height: dim >> 16,
+            colorkey: self.blit_reg(REG_COLORKEY),
+            colorkey_en: self.blit_reg(REG_FLAGS) & 0x1 != 0,
+        };
+        let pixels = copy(&mut self.vram, &params);
+        self.busy_ns = BLIT_SETUP_NS + pixels * COPY_NS_PER_PIXEL;
     }
 
     /// Drain `ns` nanoseconds of modeled busy time. The machine calls this each
@@ -684,9 +710,10 @@ mod tests {
     }
 
     #[test]
-    fn caps_reports_fill_available() {
+    fn caps_reports_fill_copy_and_colorkey() {
         let margo = Margo::default();
-        assert_eq!(read_reg_u32(&margo, REG_CAPS), 0x0000_0001);
+        // bit 0 FILL, bit 1 COPY, bit 6 COLORKEY.
+        assert_eq!(read_reg_u32(&margo, REG_CAPS), 0x0000_0043);
     }
 
     #[test]
@@ -720,7 +747,7 @@ mod tests {
     fn unknown_command_is_a_no_op() {
         let mut margo = Margo::default();
         setup_fill(&mut margo);
-        write_reg(&mut margo, REG_COMMAND, 0x02); // COPY: not implemented this slice
+        write_reg(&mut margo, REG_COMMAND, 0x07); // unused command code
         // No VRAM change and no busy time: offset 9 is the first pixel FILL would write.
         assert_eq!(margo.read_vram_u8(9), 0x00);
         assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 0);
@@ -737,6 +764,45 @@ mod tests {
         assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 0);
         // RESET is self-clearing.
         assert_eq!(read_reg_u32(&margo, REG_CONTROL) & 1, 0);
+    }
+
+    #[test]
+    fn command_copy_moves_vram_and_sets_busy() {
+        let mut margo = Margo::default();
+        margo.write_vram_u8(0, 0x55); // source pixel (0,0), pitch 8
+        write_reg(&mut margo, REG_DST_BASE, 0);
+        write_reg(&mut margo, REG_DST_PITCH, 8);
+        write_reg(&mut margo, REG_SRC_BASE, 0);
+        write_reg(&mut margo, REG_SRC_PITCH, 8);
+        write_reg(&mut margo, REG_DEPTH, 1);
+        write_reg(&mut margo, REG_DST_XY, (1 << 16) | 4); // y=1, x=4
+        write_reg(&mut margo, REG_SRC_XY, 0); // (0,0)
+        write_reg(&mut margo, REG_DIM, (1 << 16) | 1); // 1x1
+        write_reg(&mut margo, REG_FLAGS, 0);
+        write_reg(&mut margo, REG_COMMAND, 0x02); // COPY
+
+        assert_eq!(margo.read_vram_u8(8 + 4), 0x55); // (4,1) got the source byte
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 1); // BUSY set
+    }
+
+    #[test]
+    fn command_copy_busy_drains_at_the_copy_rate() {
+        let mut margo = Margo::default();
+        write_reg(&mut margo, REG_DST_BASE, 0);
+        write_reg(&mut margo, REG_DST_PITCH, 8);
+        write_reg(&mut margo, REG_SRC_BASE, 0);
+        write_reg(&mut margo, REG_SRC_PITCH, 8);
+        write_reg(&mut margo, REG_DEPTH, 1);
+        write_reg(&mut margo, REG_DST_XY, 2 << 16); // y=2, x=0 (no overlap with src)
+        write_reg(&mut margo, REG_SRC_XY, 0);
+        write_reg(&mut margo, REG_DIM, (1 << 16) | 2); // 2x1 = 2 pixels
+        write_reg(&mut margo, REG_COMMAND, 0x02);
+
+        // 2 pixels -> busy_ns = 100 + 2*10 = 120. One ns short still reads busy.
+        margo.advance_busy(119);
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 1);
+        margo.advance_busy(1);
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 0);
     }
 
     #[test]
@@ -1041,8 +1107,8 @@ mod tests {
     fn copy_overlap_right_does_not_corrupt() {
         // One row [1,2,3,4,5,6,7,8]. Copy the 4-wide rect at x=0 to x=1.
         let mut vram = vec![0u8; 8];
-        for i in 0..8 {
-            vram[i] = (i + 1) as u8;
+        for (i, slot) in vram.iter_mut().enumerate() {
+            *slot = (i + 1) as u8;
         }
         let p = CopyParams {
             dst_base: 0,
