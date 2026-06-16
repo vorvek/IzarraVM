@@ -102,6 +102,13 @@ pub enum StopReason {
 const OPL_NATIVE_HZ: u32 = 49_716;
 const DAC_HZ: u32 = 44_100;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActiveDisplay {
+    Text,
+    Mode13h,
+    MargoLfb,
+}
+
 #[derive(Debug)]
 pub struct Machine {
     profile: MachineProfile,
@@ -109,6 +116,7 @@ pub struct Machine {
     memory: Memory,
     video: VgaTextMode,
     margo: Margo,
+    margo_active: bool,
     rom: Vec<u8>,
     serial: SerialPort,
     device_ports: DevicePorts,
@@ -133,6 +141,7 @@ impl Machine {
             cpu: Cpu386::default(),
             video: VgaTextMode::default(),
             margo: Margo::default(),
+            margo_active: false,
             rom: rom.to_vec(),
             serial: SerialPort::default(),
             device_ports: DevicePorts::default(),
@@ -162,6 +171,7 @@ impl Machine {
             cpu: boot_sector_cpu(),
             video: VgaTextMode::default(),
             margo: Margo::default(),
+            margo_active: false,
             rom: vec![0; BIOS_ROM_SIZE],
             serial: SerialPort::default(),
             device_ports: DevicePorts::default(),
@@ -277,6 +287,29 @@ impl Machine {
 
     pub fn is_graphics_mode(&self) -> bool {
         self.video.active_mode() == VideoMode::Mode13h
+    }
+
+    pub fn margo(&self) -> &Margo {
+        &self.margo
+    }
+
+    pub fn margo_mut(&mut self) -> &mut Margo {
+        &mut self.margo
+    }
+
+    pub fn set_margo_mode_640x480x8(&mut self) {
+        self.margo.set_mode_640x480x8();
+        self.margo_active = true;
+    }
+
+    pub fn active_display(&self) -> ActiveDisplay {
+        if self.margo_active {
+            ActiveDisplay::MargoLfb
+        } else if self.video.active_mode() == VideoMode::Mode13h {
+            ActiveDisplay::Mode13h
+        } else {
+            ActiveDisplay::Text
+        }
     }
 
     pub fn palette_argb(&self) -> [u32; DAC_ENTRIES] {
@@ -1052,6 +1085,18 @@ mod tests {
             | (u32::from(machine.read_physical_u8(MARGO_MMIO_BASE + 2)) << 16)
             | (u32::from(machine.read_physical_u8(MARGO_MMIO_BASE + 3)) << 24);
         assert_eq!(id, MARGO_ID_VALUE);
+    }
+
+    #[test]
+    fn host_mode_set_selects_margo_lfb() {
+        let mut machine = test_machine();
+        assert_eq!(machine.active_display(), ActiveDisplay::Text);
+
+        machine.set_margo_mode_640x480x8();
+
+        assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
+        assert_eq!(machine.margo().display().width, 640);
+        assert_eq!(machine.margo().display().height, 480);
     }
 
     #[test]
