@@ -2,9 +2,11 @@ use izarravm_audio::{OplChip, Resampler};
 use izarravm_bus::{BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CpuBus, Memory};
 use izarravm_core::{CpuPreset, HardwareProfile, VideoCard};
 use izarravm_cpu::{Cpu386, CpuError, SegmentIndex, SegmentRegister};
+pub use izarravm_video::MARGO_ID_VALUE;
 use izarravm_video::{
-    Framebuffer, MODE13H_MEMORY_SIZE, TextFrame, VGA_MODE13H_BASE, VGA_TEXT_BASE,
-    VGA_TEXT_MEMORY_SIZE, VgaTextMode,
+    DAC_ENTRIES, Framebuffer, MARGO_MMIO_SIZE, MARGO_VBE_MODES, MARGO_VRAM_SIZE,
+    MODE13H_MEMORY_SIZE, Margo, TextFrame, VGA_MODE13H_BASE, VGA_TEXT_BASE, VGA_TEXT_MEMORY_SIZE,
+    VgaTextMode, VideoMode, vbe_mode,
 };
 use thiserror::Error;
 
@@ -12,6 +14,8 @@ mod pic;
 mod pit;
 
 pub const HIGH_ROM_BASE: u32 = 0xffff_0000;
+pub const MARGO_LFB_BASE: u32 = 0xE000_0000;
+pub const MARGO_MMIO_BASE: u32 = 0xE040_0000;
 pub const LOW_BIOS_BASE: u32 = 0x000f_0000;
 pub const BIOS_ROM_SIZE: usize = 64 * 1024;
 pub const BOOT_IMAGE_SIZE: usize = 1440 * 1024;
@@ -101,12 +105,22 @@ const DAC_HZ: u32 = 44_100;
 /// Standard PC PIT input clock frequency.
 const PIT_INPUT_HZ: u32 = 1_193_182;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActiveDisplay {
+    Text,
+    Mode13h,
+    MargoLfb,
+}
+
 #[derive(Debug)]
 pub struct Machine {
     profile: MachineProfile,
     cpu: Cpu386,
     memory: Memory,
     video: VgaTextMode,
+    margo: Margo,
+    margo_active: bool,
+    int10_pending: bool,
     rom: Vec<u8>,
     serial: SerialPort,
     device_ports: DevicePorts,
@@ -116,6 +130,7 @@ pub struct Machine {
     opl: OplChip,
     resampler: Resampler,
     opl_micros: f64, // fractional microseconds owed to the OPL timers
+    margo_ns: f64,   // fractional nanoseconds owed to the Margo busy countdown
     trace: BusTrace,
     elapsed_clocks: u64,
 }
@@ -132,6 +147,9 @@ impl Machine {
             profile,
             cpu: Cpu386::default(),
             video: VgaTextMode::default(),
+            margo: Margo::default(),
+            margo_active: false,
+            int10_pending: false,
             rom: rom.to_vec(),
             serial: SerialPort::default(),
             device_ports: DevicePorts::default(),
@@ -141,9 +159,16 @@ impl Machine {
             opl: OplChip::default(),
             resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             opl_micros: 0.0,
+            margo_ns: 0.0,
             trace: BusTrace::default(),
             elapsed_clocks: 0,
         };
+        // The Margo LFB aperture is decoded before RAM, so system memory must
+        // stay below it. Validated config caps memory far under this bound.
+        debug_assert!(
+            machine.memory.len() as u64 <= u64::from(MARGO_LFB_BASE),
+            "system RAM overlaps the Margo LFB aperture at 0xE0000000"
+        );
         install_boot_bios_stubs(&mut machine.memory)?;
         Ok(machine)
     }
@@ -162,6 +187,9 @@ impl Machine {
             profile,
             cpu: boot_sector_cpu(),
             video: VgaTextMode::default(),
+            margo: Margo::default(),
+            margo_active: false,
+            int10_pending: false,
             rom: vec![0; BIOS_ROM_SIZE],
             serial: SerialPort::default(),
             device_ports: DevicePorts::default(),
@@ -171,9 +199,16 @@ impl Machine {
             opl: OplChip::default(),
             resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             opl_micros: 0.0,
+            margo_ns: 0.0,
             trace: BusTrace::default(),
             elapsed_clocks: 0,
         };
+        // The Margo LFB aperture is decoded before RAM, so system memory must
+        // stay below it. Validated config caps memory far under this bound.
+        debug_assert!(
+            machine.memory.len() as u64 <= u64::from(MARGO_LFB_BASE),
+            "system RAM overlaps the Margo LFB aperture at 0xE0000000"
+        );
 
         for (offset, byte) in image[0..512].iter().copied().enumerate() {
             machine
@@ -227,6 +262,181 @@ impl Machine {
         self.video.mode13h_framebuffer()
     }
 
+    fn make_bus(&mut self) -> MachineBus<'_> {
+        MachineBus {
+            memory: &mut self.memory,
+            video: &mut self.video,
+            margo: &mut self.margo,
+            rom: &self.rom,
+            serial: &mut self.serial,
+            device_ports: &mut self.device_ports,
+            pic: &mut self.pic,
+            pit: &mut self.pit,
+            opl: &mut self.opl,
+            trace: &mut self.trace,
+            int10_pending: &mut self.int10_pending,
+            wait_states: self.profile.wait_states,
+        }
+    }
+
+    pub fn read_physical_u8(&mut self, address: u32) -> u8 {
+        let bus = self.make_bus();
+        bus.read_memory_bytes(address, 1).map(|b| b[0]).unwrap_or(0)
+    }
+
+    pub fn write_physical_u8(&mut self, address: u32, value: u8) {
+        let mut bus = self.make_bus();
+        let _ = bus.write_memory_byte(address, value);
+    }
+
+    pub fn is_graphics_mode(&self) -> bool {
+        self.video.active_mode() == VideoMode::Mode13h
+    }
+
+    pub fn margo(&self) -> &Margo {
+        &self.margo
+    }
+
+    pub fn margo_mut(&mut self) -> &mut Margo {
+        &mut self.margo
+    }
+
+    /// Service the host side of an `INT 10h` after the instruction retires.
+    /// The CPU registers are intact here: a software interrupt only pushes
+    /// flags/CS/IP.
+    fn handle_int10(&mut self) {
+        let ax = self.cpu.registers.eax() as u16;
+        if ax == 0x0013 {
+            self.video.set_mode13h();
+            self.margo_active = false;
+            return;
+        }
+        if (ax >> 8) == 0x4f {
+            self.handle_vbe(ax as u8);
+        }
+    }
+
+    /// VBE (`INT 10h`, `AH=4Fh`). `function` is `AL`. Unimplemented functions
+    /// leave `AX` unchanged, so `AL != 0x4F` signals "not supported" to the guest.
+    fn handle_vbe(&mut self, function: u8) {
+        match function {
+            0x00 => self.vbe_controller_info(),
+            0x01 => self.vbe_mode_info(),
+            0x02 => self.vbe_set_mode(),
+            0x03 => self.vbe_current_mode(),
+            _ => {}
+        }
+    }
+
+    fn vbe_controller_info(&mut self) {
+        let es = self.cpu.registers.segment(SegmentIndex::Es).selector;
+        let di = self.cpu.registers.edi() as u16;
+        let mut block = [0u8; 256];
+        block[0x00..0x04].copy_from_slice(b"VESA");
+        block[0x04..0x06].copy_from_slice(&0x0200u16.to_le_bytes()); // VbeVersion
+        block[0x12..0x14].copy_from_slice(&64u16.to_le_bytes()); // TotalMemory: 64 * 64 KB = 4 MB
+
+        // The mode list lives inside the block at offset 0x14. VideoModePtr is a
+        // real-mode far pointer the guest decodes as seg:off, so it carries the
+        // ES selector, not the linear base. vbe_block_ptr() uses the base for the
+        // write-side physical address; in real mode the two agree (base = selector << 4).
+        let list_offset = di.wrapping_add(0x14);
+        let video_mode_ptr = (u32::from(es) << 16) | u32::from(list_offset);
+        block[0x0e..0x12].copy_from_slice(&video_mode_ptr.to_le_bytes());
+
+        let mut pos = 0x14;
+        for mode in MARGO_VBE_MODES {
+            block[pos..pos + 2].copy_from_slice(&mode.number.to_le_bytes());
+            pos += 2;
+        }
+        block[pos..pos + 2].copy_from_slice(&0xffffu16.to_le_bytes());
+
+        let addr = self.vbe_block_ptr();
+        self.write_guest_block(addr, &block);
+        self.set_vbe_status(0x004f);
+    }
+
+    /// Set the `AX` low word to a VBE status (`0x004F` ok, `0x014F` failed),
+    /// preserving the high word.
+    fn set_vbe_status(&mut self, status: u16) {
+        let eax = (self.cpu.registers.eax() & 0xffff_0000) | u32::from(status);
+        self.cpu.registers.set_eax(eax);
+    }
+
+    fn vbe_set_mode(&mut self) {
+        let mode = self.cpu.registers.ebx() as u16 & 0x01ff;
+        if self.margo.set_mode(mode) {
+            self.margo_active = true;
+            self.set_vbe_status(0x004f);
+        } else {
+            self.set_vbe_status(0x014f);
+        }
+    }
+
+    fn vbe_current_mode(&mut self) {
+        let mode = if self.margo_active {
+            self.margo.display().mode
+        } else {
+            0x0003 // VBE mode 0003h: standard 80x25 text fallback
+        };
+        let ebx = (self.cpu.registers.ebx() & 0xffff_0000) | u32::from(mode);
+        self.cpu.registers.set_ebx(ebx);
+        self.set_vbe_status(0x004f);
+    }
+
+    /// Real-mode `ES:DI` of the caller's info block, as a physical address.
+    fn vbe_block_ptr(&self) -> u32 {
+        let es = self.cpu.registers.segment(SegmentIndex::Es).base;
+        let di = self.cpu.registers.edi() as u16;
+        es + u32::from(di)
+    }
+
+    fn write_guest_block(&mut self, addr: u32, bytes: &[u8]) {
+        for (index, &byte) in bytes.iter().enumerate() {
+            self.write_physical_u8(addr + index as u32, byte);
+        }
+    }
+
+    fn vbe_mode_info(&mut self) {
+        let mode = self.cpu.registers.ecx() as u16 & 0x01ff;
+        let Some(info) = vbe_mode(mode) else {
+            self.set_vbe_status(0x014f);
+            return;
+        };
+        let pitch = (info.width * info.bpp / 8) as u16;
+        let mut block = [0u8; 256];
+        block[0x00..0x02].copy_from_slice(&0x009bu16.to_le_bytes()); // ModeAttributes: supported, color, graphics, linear-fb
+        block[0x10..0x12].copy_from_slice(&pitch.to_le_bytes()); // BytesPerScanLine
+        block[0x12..0x14].copy_from_slice(&(info.width as u16).to_le_bytes()); // XResolution
+        block[0x14..0x16].copy_from_slice(&(info.height as u16).to_le_bytes()); // YResolution
+        block[0x18] = 1; // NumberOfPlanes
+        block[0x19] = info.bpp as u8; // BitsPerPixel
+        block[0x1b] = 4; // MemoryModel: packed pixel
+        block[0x28..0x2c].copy_from_slice(&MARGO_LFB_BASE.to_le_bytes()); // PhysBasePtr
+        let addr = self.vbe_block_ptr();
+        self.write_guest_block(addr, &block);
+        self.set_vbe_status(0x004f);
+    }
+
+    pub fn set_margo_mode_640x480x8(&mut self) {
+        self.margo.set_mode_640x480x8();
+        self.margo_active = true;
+    }
+
+    pub fn active_display(&self) -> ActiveDisplay {
+        if self.margo_active {
+            ActiveDisplay::MargoLfb
+        } else if self.video.active_mode() == VideoMode::Mode13h {
+            ActiveDisplay::Mode13h
+        } else {
+            ActiveDisplay::Text
+        }
+    }
+
+    pub fn palette_argb(&self) -> [u32; DAC_ENTRIES] {
+        self.video.palette_argb()
+    }
+
     pub fn bus_trace(&self) -> &BusTrace {
         &self.trace
     }
@@ -236,7 +446,8 @@ impl Machine {
     }
 
     /// Advance time-based devices by `clocks` of CPU time, carrying fractional
-    /// remainders forward for both the OPL timers and the PIT counters.
+    /// remainders forward for the OPL timers (microseconds), the PIT counters,
+    /// and the Margo blit engine (nanoseconds).
     fn advance_devices(&mut self, clocks: u64) {
         self.opl_micros += clocks as f64 * 1_000_000.0 / self.profile.clock_hz as f64;
         let whole = self.opl_micros.floor();
@@ -250,6 +461,11 @@ impl Machine {
         for _ in 0..edges {
             self.pic.request(0); // channel 0 OUT rising edge is IRQ0
         }
+
+        self.margo_ns += clocks as f64 * 1_000_000_000.0 / self.profile.clock_hz as f64;
+        let whole_ns = self.margo_ns.floor();
+        self.margo.advance_busy(whole_ns as u64);
+        self.margo_ns -= whole_ns;
     }
 
     /// Render `native_samples` of OPL3 output at 49716 Hz and return the
@@ -322,6 +538,7 @@ impl Machine {
         requested: u64,
     ) -> Result<StopReason, MachineError> {
         while self.elapsed_clocks < deadline {
+            self.int10_pending = false;
             let trace_before = self.trace.elapsed_clocks();
             let outcome = {
                 let Machine {
@@ -329,6 +546,7 @@ impl Machine {
                     cpu,
                     memory,
                     video,
+                    margo,
                     rom,
                     serial,
                     device_ports,
@@ -336,11 +554,13 @@ impl Machine {
                     pit,
                     opl,
                     trace,
+                    int10_pending,
                     ..
                 } = self;
                 let mut bus = MachineBus {
                     memory,
                     video,
+                    margo,
                     rom,
                     serial,
                     device_ports,
@@ -348,6 +568,7 @@ impl Machine {
                     pit,
                     opl,
                     trace,
+                    int10_pending,
                     wait_states: profile.wait_states,
                 };
                 cpu.cycle(&mut bus)
@@ -362,6 +583,9 @@ impl Machine {
                     // the overflow flag (the synthesis clock is driven separately
                     // by `render_audio`).
                     self.advance_devices(step);
+                    if self.int10_pending {
+                        self.handle_int10();
+                    }
                     if outcome.halted {
                         match self.next_timer_wake(deadline) {
                             Some(wake_step) => {
@@ -383,6 +607,7 @@ impl Machine {
 struct MachineBus<'a> {
     memory: &'a mut Memory,
     video: &'a mut VgaTextMode,
+    margo: &'a mut Margo,
     rom: &'a [u8],
     serial: &'a mut SerialPort,
     device_ports: &'a mut DevicePorts,
@@ -390,6 +615,7 @@ struct MachineBus<'a> {
     pit: &'a mut pit::Pit,
     opl: &'a mut OplChip,
     trace: &'a mut BusTrace,
+    int10_pending: &'a mut bool,
     wait_states: WaitStateProfile,
 }
 
@@ -538,15 +764,17 @@ impl CpuBus for MachineBus<'_> {
         self.pic.acknowledge()
     }
 
-    fn interrupt_acknowledge(&mut self, vector: u8, ax: u16) -> Result<(), BusError> {
+    fn interrupt_acknowledge(&mut self, vector: u8, _ax: u16) -> Result<(), BusError> {
         self.trace.push(BusCycle::new(
             BusAccessKind::InterruptAcknowledge,
             u32::from(vector),
             BusWidth::Byte,
             self.wait_states.io,
         ));
-        if vector == 0x10 && ax == 0x0013 {
-            self.video.set_mode13h();
+        // Vector 0x10 reaches here only from a software INT today: the CPU never
+        // faults with vector 0x10. Revisit if an x87 #MF (vector 0x10) is added.
+        if vector == 0x10 {
+            *self.int10_pending = true;
         }
         Ok(())
     }
@@ -723,6 +951,18 @@ impl MachineBus<'_> {
                 .collect();
         }
 
+        if let Some(offset) = margo_lfb_offset(address, width) {
+            return Ok((0..width)
+                .map(|index| self.margo.read_vram_u8(offset + index))
+                .collect());
+        }
+
+        if let Some(offset) = margo_mmio_offset(address, width) {
+            return Ok((0..width)
+                .map(|index| self.margo.read_mmio_u8(offset + index))
+                .collect());
+        }
+
         let end = address as usize + width;
         if end <= self.memory.len() {
             return (0..width)
@@ -752,6 +992,16 @@ impl MachineBus<'_> {
                 .map_err(|_| BusError::UnmappedMemory { address });
         }
 
+        if let Some(offset) = margo_lfb_offset(address, 1) {
+            self.margo.write_vram_u8(offset, value);
+            return Ok(());
+        }
+
+        if let Some(offset) = margo_mmio_offset(address, 1) {
+            self.margo.write_mmio_u8(offset, value);
+            return Ok(());
+        }
+
         if (address as usize) < self.memory.len() {
             return self.memory.write_u8(address as usize, value);
         }
@@ -764,6 +1014,8 @@ impl MachineBus<'_> {
             self.wait_states.rom
         } else if video_text_offset(address, 1).is_some()
             || video_mode13h_offset(address, 1).is_some()
+            || margo_lfb_offset(address, 1).is_some()
+            || margo_mmio_offset(address, 1).is_some()
         {
             self.wait_states.video
         } else {
@@ -810,6 +1062,24 @@ fn video_mode13h_offset(address: u32, width: usize) -> Option<usize> {
     }
 }
 
+fn margo_lfb_offset(address: u32, width: usize) -> Option<usize> {
+    let end = MARGO_LFB_BASE + MARGO_VRAM_SIZE as u32;
+    if (MARGO_LFB_BASE..end).contains(&address) && address + width as u32 <= end {
+        Some((address - MARGO_LFB_BASE) as usize)
+    } else {
+        None
+    }
+}
+
+fn margo_mmio_offset(address: u32, width: usize) -> Option<usize> {
+    let end = MARGO_MMIO_BASE + MARGO_MMIO_SIZE as u32;
+    if (MARGO_MMIO_BASE..end).contains(&address) && address + width as u32 <= end {
+        Some((address - MARGO_MMIO_BASE) as usize)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -828,6 +1098,15 @@ mod tests {
         rom[..code.len()].copy_from_slice(code);
         rom[0xfff0..0xfff5].copy_from_slice(&[0xea, 0x00, 0x00, 0x00, 0xf0]);
         rom
+    }
+
+    fn read_u16(machine: &mut Machine, addr: u32) -> u16 {
+        u16::from(machine.read_physical_u8(addr))
+            | (u16::from(machine.read_physical_u8(addr + 1)) << 8)
+    }
+
+    fn read_u32(machine: &mut Machine, addr: u32) -> u32 {
+        u32::from(read_u16(machine, addr)) | (u32::from(read_u16(machine, addr + 2)) << 16)
     }
 
     #[test]
@@ -855,18 +1134,7 @@ mod tests {
     fn unaligned_dword_splits_into_byte_bus_cycles() {
         let mut machine = test_machine();
         {
-            let mut bus = MachineBus {
-                memory: &mut machine.memory,
-                video: &mut machine.video,
-                rom: &machine.rom,
-                serial: &mut machine.serial,
-                device_ports: &mut machine.device_ports,
-                pic: &mut machine.pic,
-                pit: &mut machine.pit,
-                opl: &mut machine.opl,
-                trace: &mut machine.trace,
-                wait_states: machine.profile.wait_states,
-            };
+            let mut bus = machine.make_bus();
             bus.write_memory(
                 0x101,
                 BusWidth::Dword,
@@ -927,6 +1195,7 @@ mod tests {
 
         assert_eq!(reason, StopReason::Halted);
         assert_eq!(machine.mode13h_framebuffer().indexed_pixels[0x7b], 0x2a);
+        assert!(machine.is_graphics_mode());
         assert!(machine.bus_trace().cycles().iter().any(|cycle| {
             cycle.kind == BusAccessKind::InterruptAcknowledge && cycle.address == 0x10
         }));
@@ -989,6 +1258,131 @@ mod tests {
     }
 
     #[test]
+    fn margo_apertures_route_through_the_bus() {
+        let mut machine = test_machine();
+
+        // LFB: write a byte at the aperture base + 5, read it back.
+        let lfb = MARGO_LFB_BASE + 5;
+        machine.write_physical_u8(lfb, 0x9c);
+        assert_eq!(machine.read_physical_u8(lfb), 0x9c);
+
+        // MMIO: the ID register reads the Margo magic.
+        let id = u32::from(machine.read_physical_u8(MARGO_MMIO_BASE))
+            | (u32::from(machine.read_physical_u8(MARGO_MMIO_BASE + 1)) << 8)
+            | (u32::from(machine.read_physical_u8(MARGO_MMIO_BASE + 2)) << 16)
+            | (u32::from(machine.read_physical_u8(MARGO_MMIO_BASE + 3)) << 24);
+        assert_eq!(id, MARGO_ID_VALUE);
+    }
+
+    #[test]
+    fn vga_mode_set_clears_a_latched_margo_display() {
+        let rom = rom_with_code(&[
+            0xb8, 0x13, 0x00, // mov ax, 0013h
+            0xcd, 0x10, // int 10h
+            0xf4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+
+        // Host path latches Margo as the active display.
+        machine.set_margo_mode_640x480x8();
+        assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
+
+        // A guest VGA mode-set must hand the display back to VGA.
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(machine.active_display(), ActiveDisplay::Mode13h);
+    }
+
+    #[test]
+    fn host_mode_set_selects_margo_lfb() {
+        let mut machine = test_machine();
+        assert_eq!(machine.active_display(), ActiveDisplay::Text);
+
+        machine.set_margo_mode_640x480x8();
+
+        assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
+        assert_eq!(machine.margo().display().width, 640);
+        assert_eq!(machine.margo().display().height, 480);
+    }
+
+    #[test]
+    fn vbe_set_mode_selects_a_margo_mode() {
+        let rom = rom_with_code(&[
+            0xb8, 0x02, 0x4f, // mov ax, 4F02h
+            0xbb, 0x01, 0x41, // mov bx, 0101h | 4000h (LFB)
+            0xcd, 0x10, // int 10h
+            0xf4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(machine.cpu().registers.eax() as u16, 0x004f);
+        assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
+        assert_eq!(machine.margo().display().width, 640);
+        assert_eq!(machine.margo().display().height, 480);
+    }
+
+    #[test]
+    fn vbe_set_mode_then_vga_mode_follows_the_display() {
+        let rom = rom_with_code(&[
+            0xb8, 0x02, 0x4f, // mov ax, 4F02h
+            0xbb, 0x01, 0x41, // mov bx, 0101h | 4000h
+            0xcd, 0x10, // int 10h
+            0xb8, 0x13, 0x00, // mov ax, 0013h
+            0xcd, 0x10, // int 10h
+            0xf4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        // The VGA mode-set hands the display back to VGA, but the 4F02 call must
+        // still have set the Margo mode (width stays set; only margo_active clears).
+        assert_eq!(machine.margo().display().width, 640);
+        assert_eq!(machine.active_display(), ActiveDisplay::Mode13h);
+    }
+
+    #[test]
+    fn vbe_set_mode_rejects_hi_color_modes() {
+        let rom = rom_with_code(&[
+            0xb8, 0x02, 0x4f, // mov ax, 4F02h
+            0xbb, 0x11, 0x01, // mov bx, 0111h (640x480x16, not in this slice)
+            0xcd, 0x10, // int 10h
+            0xf4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(machine.cpu().registers.eax() as u16, 0x014f);
+        assert_eq!(machine.active_display(), ActiveDisplay::Text);
+    }
+
+    #[test]
+    fn vbe_current_mode_returns_the_set_mode() {
+        let rom = rom_with_code(&[
+            0xb8, 0x02, 0x4f, // mov ax, 4F02h
+            0xbb, 0x01, 0x41, // mov bx, 0101h | 4000h
+            0xcd, 0x10, // int 10h
+            0xb8, 0x03, 0x4f, // mov ax, 4F03h
+            0xcd, 0x10, // int 10h
+            0xf4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(machine.cpu().registers.eax() as u16, 0x004f);
+        assert_eq!(machine.cpu().registers.ebx() as u16, 0x0101);
+    }
+
+    #[test]
     fn passive_target_ports_allow_capability_probes_to_fail_cleanly() {
         // 0x224 is the SB DSP reset port: still an unimplemented passive port
         // (0x388 is now the OPL chip).
@@ -1012,6 +1406,7 @@ mod tests {
         let mut bus = MachineBus {
             memory: &mut machine.memory,
             video: &mut machine.video,
+            margo: &mut machine.margo,
             rom: &machine.rom,
             serial: &mut machine.serial,
             device_ports: &mut machine.device_ports,
@@ -1019,6 +1414,7 @@ mod tests {
             pit: &mut machine.pit,
             opl: &mut machine.opl,
             trace: &mut machine.trace,
+            int10_pending: &mut machine.int10_pending,
             wait_states: machine.profile.wait_states,
         };
         f(&mut bus)
@@ -1246,5 +1642,173 @@ mod tests {
             0xc0,
             "timer 1 overflow raises IRQ + timer-1 flag"
         );
+    }
+
+    #[test]
+    fn vbe_mode_info_fills_the_block() {
+        // ES = 0x4000 -> physical 0x40000, DI = 0.
+        let rom = rom_with_code(&[
+            0xb8, 0x00, 0x40, // mov ax, 4000h
+            0x8e, 0xc0, // mov es, ax
+            0xbf, 0x00, 0x00, // mov di, 0
+            0xb8, 0x01, 0x4f, // mov ax, 4F01h
+            0xb9, 0x01, 0x01, // mov cx, 0101h
+            0xcd, 0x10, // int 10h
+            0xf4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(machine.cpu().registers.eax() as u16, 0x004f);
+
+        let base = 0x40000;
+        assert_eq!(read_u16(&mut machine, base + 0x10), 640); // BytesPerScanLine
+        assert_eq!(read_u16(&mut machine, base + 0x12), 640); // XResolution
+        assert_eq!(read_u16(&mut machine, base + 0x14), 480); // YResolution
+        assert_eq!(machine.read_physical_u8(base + 0x19), 8); // BitsPerPixel
+        assert_eq!(read_u32(&mut machine, base + 0x28), MARGO_LFB_BASE); // PhysBasePtr
+    }
+
+    #[test]
+    fn vbe_controller_info_fills_the_block() {
+        let rom = rom_with_code(&[
+            0xb8, 0x00, 0x40, // mov ax, 4000h
+            0x8e, 0xc0, // mov es, ax
+            0xbf, 0x00, 0x00, // mov di, 0
+            0xb8, 0x00, 0x4f, // mov ax, 4F00h
+            0xcd, 0x10, // int 10h
+            0xf4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(machine.cpu().registers.eax() as u16, 0x004f);
+
+        let base = 0x40000;
+        assert_eq!(machine.read_physical_u8(base), b'V');
+        assert_eq!(machine.read_physical_u8(base + 1), b'E');
+        assert_eq!(machine.read_physical_u8(base + 2), b'S');
+        assert_eq!(machine.read_physical_u8(base + 3), b'A');
+        assert_eq!(read_u16(&mut machine, base + 0x04), 0x0200); // VbeVersion
+        assert_eq!(read_u16(&mut machine, base + 0x12), 64); // TotalMemory (64 KB units)
+        // OemStringPtr and Capabilities are intentionally left zero.
+        assert_eq!(read_u32(&mut machine, base + 0x06), 0); // OemStringPtr
+        assert_eq!(read_u32(&mut machine, base + 0x0a), 0); // Capabilities
+
+        // VideoModePtr (seg:off) must point at the mode list.
+        let ptr = read_u32(&mut machine, base + 0x0e);
+        let list = (((ptr >> 16) & 0xffff) << 4) + (ptr & 0xffff);
+        assert_eq!(read_u16(&mut machine, list), 0x0100);
+        assert_eq!(read_u16(&mut machine, list + 2), 0x0101);
+        assert_eq!(read_u16(&mut machine, list + 4), 0x0103);
+        assert_eq!(read_u16(&mut machine, list + 6), 0x0105);
+        assert_eq!(read_u16(&mut machine, list + 8), 0xffff);
+    }
+
+    #[test]
+    fn vbe_mode_info_rejects_unknown_modes() {
+        let rom = rom_with_code(&[
+            0xb8, 0x00, 0x40, // mov ax, 4000h
+            0x8e, 0xc0, // mov es, ax
+            0xbf, 0x00, 0x00, // mov di, 0
+            0xb8, 0x01, 0x4f, // mov ax, 4F01h
+            0xb9, 0x11, 0x01, // mov cx, 0111h (not in the table)
+            0xcd, 0x10, // int 10h
+            0xf4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(machine.cpu().registers.eax() as u16, 0x014f);
+    }
+
+    // Write/read a 32-bit Margo register through the MMIO aperture.
+    fn write_mmio_reg(machine: &mut Machine, offset: u32, value: u32) {
+        for (i, b) in value.to_le_bytes().into_iter().enumerate() {
+            machine.write_physical_u8(MARGO_MMIO_BASE + offset + i as u32, b);
+        }
+    }
+
+    fn read_mmio_reg(machine: &mut Machine, offset: u32) -> u32 {
+        let mut value = 0u32;
+        for i in 0..4 {
+            value |= u32::from(machine.read_physical_u8(MARGO_MMIO_BASE + offset + i)) << (8 * i);
+        }
+        value
+    }
+
+    #[test]
+    fn copy_through_the_mmio_aperture_moves_vram_and_times_busy() {
+        let mut machine = test_machine();
+        // Seed a 2x2 source rectangle at (0, 0), pitch 640, depth 1, through the LFB.
+        machine.write_physical_u8(MARGO_LFB_BASE, 0xa1); // (0,0)
+        machine.write_physical_u8(MARGO_LFB_BASE + 1, 0xa2); // (1,0)
+        machine.write_physical_u8(MARGO_LFB_BASE + 640, 0xa3); // (0,1)
+        machine.write_physical_u8(MARGO_LFB_BASE + 641, 0xa4); // (1,1)
+
+        // Copy it to (10, 10) on the same surface (no overlap).
+        write_mmio_reg(&mut machine, 0x100, 0); // DST_BASE
+        write_mmio_reg(&mut machine, 0x104, 640); // DST_PITCH
+        write_mmio_reg(&mut machine, 0x108, 0); // SRC_BASE
+        write_mmio_reg(&mut machine, 0x10c, 640); // SRC_PITCH
+        write_mmio_reg(&mut machine, 0x110, 1); // DEPTH
+        write_mmio_reg(&mut machine, 0x114, (10 << 16) | 10); // DST_XY: y=10, x=10
+        write_mmio_reg(&mut machine, 0x118, 0); // SRC_XY: (0,0)
+        write_mmio_reg(&mut machine, 0x11c, (2 << 16) | 2); // DIM: h=2, w=2
+        write_mmio_reg(&mut machine, 0x128, 0xcc); // ROP: SRCCOPY
+        write_mmio_reg(&mut machine, 0x130, 0); // FLAGS: none
+        write_mmio_reg(&mut machine, 0x150, 0x02); // COMMAND: COPY
+
+        // Destination corners hold the source bytes (read back through the LFB).
+        assert_eq!(
+            machine.read_physical_u8(MARGO_LFB_BASE + 10 * 640 + 10),
+            0xa1
+        );
+        assert_eq!(
+            machine.read_physical_u8(MARGO_LFB_BASE + 11 * 640 + 11),
+            0xa4
+        );
+        // BUSY is set right after the command.
+        assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
+
+        // 4 pixels -> busy_ns = 100 + 4*10 = 140 ns. At 25 MHz (40 ns/clock),
+        // three clocks (120 ns) leave it busy; the fourth clears it.
+        machine.advance_devices(3);
+        assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
+        machine.advance_devices(1);
+        assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 0);
+    }
+
+    #[test]
+    fn fill_through_the_mmio_aperture_writes_vram_and_times_busy() {
+        let mut machine = test_machine();
+        // Latch a 5x4 fill at (3, 2), pitch 640, depth 1, color 0xAB, solid.
+        write_mmio_reg(&mut machine, 0x100, 0); // DST_BASE
+        write_mmio_reg(&mut machine, 0x104, 640); // DST_PITCH
+        write_mmio_reg(&mut machine, 0x110, 1); // DEPTH
+        write_mmio_reg(&mut machine, 0x114, (2 << 16) | 3); // DST_XY: y=2, x=3
+        write_mmio_reg(&mut machine, 0x11c, (4 << 16) | 5); // DIM: h=4, w=5
+        write_mmio_reg(&mut machine, 0x120, 0xab); // FG_COLOR
+        write_mmio_reg(&mut machine, 0x128, 0xf0); // ROP: PATCOPY
+        write_mmio_reg(&mut machine, 0x150, 0x01); // COMMAND: FILL
+
+        // VRAM filled (read the top-left filled pixel back through the LFB).
+        let pixel = MARGO_LFB_BASE + 2 * 640 + 3;
+        assert_eq!(machine.read_physical_u8(pixel), 0xab);
+        // BUSY is set right after the command.
+        assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
+
+        // 20 pixels -> busy_ns = 100 + 20*5 = 200 ns = 5 clocks at 25 MHz.
+        // Four clocks (160 ns) leave it busy; the fifth clears it.
+        machine.advance_devices(4);
+        assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
+        machine.advance_devices(1);
+        assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 0);
     }
 }
