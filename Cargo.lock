@@ -1125,6 +1125,7 @@ dependencies = [
 name = "izarravm-dos"
 version = "0.1.0"
 dependencies = [
+ "izarravm-bus",
  "tempfile",
  "thiserror 2.0.18",
 ]
@@ -1149,6 +1150,7 @@ dependencies = [
  "izarravm-bus",
  "izarravm-core",
  "izarravm-cpu",
+ "izarravm-dos",
  "izarravm-firmware",
  "izarravm-video",
  "thiserror 2.0.18",
