@@ -154,6 +154,12 @@ impl Machine {
             trace: BusTrace::default(),
             elapsed_clocks: 0,
         };
+        // The Margo LFB aperture is decoded before RAM, so system memory must
+        // stay below it. Validated config caps memory far under this bound.
+        debug_assert!(
+            machine.memory.len() as u64 <= u64::from(MARGO_LFB_BASE),
+            "system RAM overlaps the Margo LFB aperture at 0xE0000000"
+        );
         install_boot_bios_stubs(&mut machine.memory)?;
         Ok(machine)
     }
@@ -185,6 +191,12 @@ impl Machine {
             trace: BusTrace::default(),
             elapsed_clocks: 0,
         };
+        // The Margo LFB aperture is decoded before RAM, so system memory must
+        // stay below it. Validated config caps memory far under this bound.
+        debug_assert!(
+            machine.memory.len() as u64 <= u64::from(MARGO_LFB_BASE),
+            "system RAM overlaps the Margo LFB aperture at 0xE0000000"
+        );
 
         for (offset, byte) in image[0..512].iter().copied().enumerate() {
             machine
