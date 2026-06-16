@@ -72,8 +72,8 @@ pub const REG_DST_XY: usize = 0x0114;
 pub const REG_SRC_XY: usize = 0x0118;
 pub const REG_DIM: usize = 0x011c;
 pub const REG_FG_COLOR: usize = 0x0120;
-pub const REG_COLORKEY: usize = 0x012c;
 pub const REG_ROP: usize = 0x0128;
+pub const REG_COLORKEY: usize = 0x012c;
 pub const REG_FLAGS: usize = 0x0130;
 pub const REG_COMMAND: usize = 0x0150;
 
@@ -1164,5 +1164,39 @@ mod tests {
         assert_eq!(&vram[9..12], &[4, 5, 6]);
         // Source row 0 is unchanged where the destination did not overwrite it.
         assert_eq!(vram[0], 1);
+    }
+
+    #[test]
+    fn copy_overlap_down_left_does_not_corrupt() {
+        // pitch 4. Source 3x2 rect at (1,0); copy it down-left to (0,1). Rows must
+        // reverse (dst below src) while columns stay forward (dst left of src).
+        let mut vram = vec![0u8; 16];
+        // src row 0 at offsets 1,2,3; src row 1 at offsets 5,6,7.
+        vram[1] = 1;
+        vram[2] = 2;
+        vram[3] = 3;
+        vram[5] = 4;
+        vram[6] = 5;
+        vram[7] = 6;
+        let p = CopyParams {
+            dst_base: 0,
+            dst_pitch: 4,
+            src_base: 0,
+            src_pitch: 4,
+            depth: 1,
+            dst_x: 0,
+            dst_y: 1,
+            src_x: 1,
+            src_y: 0,
+            width: 3,
+            height: 2,
+            colorkey: 0,
+            colorkey_en: false,
+        };
+        copy(&mut vram, &p);
+        // dst row 1 (offsets 4,5,6) = src row 0 [1,2,3]; dst row 2 (offsets 8,9,10)
+        // = src row 1 [4,5,6], uncorrupted by the row overlap.
+        assert_eq!(&vram[4..7], &[1, 2, 3]);
+        assert_eq!(&vram[8..11], &[4, 5, 6]);
     }
 }
