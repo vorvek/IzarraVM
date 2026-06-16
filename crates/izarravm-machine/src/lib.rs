@@ -3,14 +3,18 @@ use izarravm_bus::{BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CpuBus
 use izarravm_core::{CpuPreset, HardwareProfile, VideoCard};
 use izarravm_cpu::{Cpu386, CpuError, SegmentIndex, SegmentRegister};
 use izarravm_video::{
-    DAC_ENTRIES, Framebuffer, MODE13H_MEMORY_SIZE, TextFrame, VGA_MODE13H_BASE, VGA_TEXT_BASE,
-    VGA_TEXT_MEMORY_SIZE, VgaTextMode, VideoMode,
+    DAC_ENTRIES, Framebuffer, Margo, MARGO_VRAM_SIZE, MODE13H_MEMORY_SIZE, TextFrame,
+    VGA_MODE13H_BASE, VGA_TEXT_BASE, VGA_TEXT_MEMORY_SIZE, VgaTextMode, VideoMode,
 };
+pub use izarravm_video::MARGO_ID_VALUE;
 use thiserror::Error;
 
 mod pic;
 
 pub const HIGH_ROM_BASE: u32 = 0xffff_0000;
+pub const MARGO_LFB_BASE: u32 = 0xE000_0000;
+pub const MARGO_MMIO_BASE: u32 = 0xE040_0000;
+pub const MARGO_MMIO_SIZE: usize = 0x0001_0000; // 64 KB
 pub const LOW_BIOS_BASE: u32 = 0x000f_0000;
 pub const BIOS_ROM_SIZE: usize = 64 * 1024;
 pub const BOOT_IMAGE_SIZE: usize = 1440 * 1024;
@@ -104,6 +108,7 @@ pub struct Machine {
     cpu: Cpu386,
     memory: Memory,
     video: VgaTextMode,
+    margo: Margo,
     rom: Vec<u8>,
     serial: SerialPort,
     device_ports: DevicePorts,
@@ -127,6 +132,7 @@ impl Machine {
             profile,
             cpu: Cpu386::default(),
             video: VgaTextMode::default(),
+            margo: Margo::default(),
             rom: rom.to_vec(),
             serial: SerialPort::default(),
             device_ports: DevicePorts::default(),
@@ -155,6 +161,7 @@ impl Machine {
             profile,
             cpu: boot_sector_cpu(),
             video: VgaTextMode::default(),
+            margo: Margo::default(),
             rom: vec![0; BIOS_ROM_SIZE],
             serial: SerialPort::default(),
             device_ports: DevicePorts::default(),
@@ -216,6 +223,56 @@ impl Machine {
 
     pub fn mode13h_framebuffer(&self) -> &Framebuffer {
         self.video.mode13h_framebuffer()
+    }
+
+    pub fn read_physical_u8(&mut self, address: u32) -> u8 {
+        let Machine {
+            profile,
+            memory,
+            video,
+            margo,
+            rom,
+            serial,
+            device_ports,
+            trace,
+            ..
+        } = self;
+        let bus = MachineBus {
+            memory,
+            video,
+            margo,
+            rom,
+            serial,
+            device_ports,
+            trace,
+            wait_states: profile.wait_states,
+        };
+        bus.read_memory_bytes(address, 1).map(|b| b[0]).unwrap_or(0)
+    }
+
+    pub fn write_physical_u8(&mut self, address: u32, value: u8) {
+        let Machine {
+            profile,
+            memory,
+            video,
+            margo,
+            rom,
+            serial,
+            device_ports,
+            trace,
+            ..
+        } = self;
+        let mut bus = MachineBus {
+            memory,
+            video,
+            margo,
+            rom,
+            serial,
+            device_ports,
+            trace,
+            wait_states: profile.wait_states,
+        };
+        let _ = bus.write_memory_byte(address, value);
     }
 
     pub fn is_graphics_mode(&self) -> bool {
@@ -289,6 +346,7 @@ impl Machine {
                     cpu,
                     memory,
                     video,
+                    margo,
                     rom,
                     serial,
                     device_ports,
@@ -300,6 +358,7 @@ impl Machine {
                 let mut bus = MachineBus {
                     memory,
                     video,
+                    margo,
                     rom,
                     serial,
                     device_ports,
@@ -335,6 +394,7 @@ impl Machine {
 struct MachineBus<'a> {
     memory: &'a mut Memory,
     video: &'a mut VgaTextMode,
+    margo: &'a mut Margo,
     rom: &'a [u8],
     serial: &'a mut SerialPort,
     device_ports: &'a mut DevicePorts,
@@ -671,6 +731,18 @@ impl MachineBus<'_> {
                 .collect();
         }
 
+        if let Some(offset) = margo_lfb_offset(address, width) {
+            return Ok((0..width)
+                .map(|index| self.margo.read_vram_u8(offset + index))
+                .collect());
+        }
+
+        if let Some(offset) = margo_mmio_offset(address, width) {
+            return Ok((0..width)
+                .map(|index| self.margo.read_mmio_u8(offset + index))
+                .collect());
+        }
+
         let end = address as usize + width;
         if end <= self.memory.len() {
             return (0..width)
@@ -700,6 +772,16 @@ impl MachineBus<'_> {
                 .map_err(|_| BusError::UnmappedMemory { address });
         }
 
+        if let Some(offset) = margo_lfb_offset(address, 1) {
+            self.margo.write_vram_u8(offset, value);
+            return Ok(());
+        }
+
+        if let Some(offset) = margo_mmio_offset(address, 1) {
+            self.margo.write_mmio_u8(offset, value);
+            return Ok(());
+        }
+
         if (address as usize) < self.memory.len() {
             return self.memory.write_u8(address as usize, value);
         }
@@ -712,6 +794,8 @@ impl MachineBus<'_> {
             self.wait_states.rom
         } else if video_text_offset(address, 1).is_some()
             || video_mode13h_offset(address, 1).is_some()
+            || margo_lfb_offset(address, 1).is_some()
+            || margo_mmio_offset(address, 1).is_some()
         {
             self.wait_states.video
         } else {
@@ -753,6 +837,24 @@ fn video_mode13h_offset(address: u32, width: usize) -> Option<usize> {
     let end = VGA_MODE13H_BASE + MODE13H_MEMORY_SIZE as u32;
     if (VGA_MODE13H_BASE..end).contains(&address) && address + width as u32 <= end {
         Some((address - VGA_MODE13H_BASE) as usize)
+    } else {
+        None
+    }
+}
+
+fn margo_lfb_offset(address: u32, width: usize) -> Option<usize> {
+    let end = MARGO_LFB_BASE + MARGO_VRAM_SIZE as u32;
+    if (MARGO_LFB_BASE..end).contains(&address) && address + width as u32 <= end {
+        Some((address - MARGO_LFB_BASE) as usize)
+    } else {
+        None
+    }
+}
+
+fn margo_mmio_offset(address: u32, width: usize) -> Option<usize> {
+    let end = MARGO_MMIO_BASE + MARGO_MMIO_SIZE as u32;
+    if (MARGO_MMIO_BASE..end).contains(&address) && address + width as u32 <= end {
+        Some((address - MARGO_MMIO_BASE) as usize)
     } else {
         None
     }
@@ -806,6 +908,7 @@ mod tests {
             let mut bus = MachineBus {
                 memory: &mut machine.memory,
                 video: &mut machine.video,
+                margo: &mut machine.margo,
                 rom: &machine.rom,
                 serial: &mut machine.serial,
                 device_ports: &mut machine.device_ports,
@@ -932,6 +1035,23 @@ mod tests {
             record.status == izarravm_firmware::SuiteRecordStatus::Fail
                 && record.name == "sound.sb_16bit_dma"
         }));
+    }
+
+    #[test]
+    fn margo_apertures_route_through_the_bus() {
+        let mut machine = test_machine();
+
+        // LFB: write a byte at the aperture base + 5, read it back.
+        let lfb = MARGO_LFB_BASE + 5;
+        machine.write_physical_u8(lfb, 0x9c);
+        assert_eq!(machine.read_physical_u8(lfb), 0x9c);
+
+        // MMIO: the ID register reads the Margo magic.
+        let id = u32::from(machine.read_physical_u8(MARGO_MMIO_BASE))
+            | (u32::from(machine.read_physical_u8(MARGO_MMIO_BASE + 1)) << 8)
+            | (u32::from(machine.read_physical_u8(MARGO_MMIO_BASE + 2)) << 16)
+            | (u32::from(machine.read_physical_u8(MARGO_MMIO_BASE + 3)) << 24);
+        assert_eq!(id, MARGO_ID_VALUE);
     }
 
     #[test]
