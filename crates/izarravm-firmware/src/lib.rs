@@ -4,6 +4,8 @@ pub const X86_BOOT_TEST_IMAGE: &[u8] = include_bytes!("../roms/boot-suite/izarra
 pub const X86_BOOT_TEST_BOOT_SOURCE: &str = include_str!("../roms/boot-suite/boot.asm");
 pub const X86_BOOT_TEST_STAGE2_SOURCE: &str = include_str!("../roms/boot-suite/stage2.asm");
 pub const X86_BOOT_TEST_RESULTS_SOURCE: &str = include_str!("../roms/boot-suite/results.inc");
+pub const HELLO_COM: &[u8] = include_bytes!("../roms/dos/hello.com");
+pub const HELLO_COM_SOURCE: &str = include_str!("../roms/dos/hello.asm");
 
 pub const I386DX25_TEST_ROM_SIZE: usize = 64 * 1024;
 pub const X86_BOOT_TEST_IMAGE_SIZE: usize = 1440 * 1024;
@@ -16,6 +18,10 @@ pub fn test_rom() -> &'static [u8] {
 
 pub fn boot_test_image() -> &'static [u8] {
     X86_BOOT_TEST_IMAGE
+}
+
+pub fn hello_com() -> &'static [u8] {
+    HELLO_COM
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

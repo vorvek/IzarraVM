@@ -1973,4 +1973,16 @@ mod tests {
         machine.advance_devices(1);
         assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 0);
     }
+
+    #[test]
+    fn dos_com_runs_the_committed_hello_fixture() {
+        let mut machine = Machine::new_dos_com(
+            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            izarravm_firmware::HELLO_COM,
+        )
+        .unwrap();
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
+        assert_eq!(machine.dos_output(), b"Hello, world!\r\n");
+    }
 }

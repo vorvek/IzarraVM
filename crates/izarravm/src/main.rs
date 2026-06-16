@@ -57,6 +57,8 @@ struct Cli {
     #[arg(long)]
     headless_boot_suite: bool,
     #[arg(long)]
+    headless_run_com: Option<PathBuf>,
+    #[arg(long)]
     margo_test_pattern: bool,
     #[arg(long, env = "IZARRAVM_DOSROOT")]
     dosroot: Option<PathBuf>,
@@ -124,6 +126,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("records: {}", results.records.len());
         println!("stop: {stop_reason:?}");
         return Ok(());
+    }
+
+    if let Some(path) = &cli.headless_run_com {
+        let image = std::fs::read(path)?;
+        let mut machine =
+            Machine::new_dos_com(MachineProfile::from_hardware_profile(&hardware), &image)?;
+        let stop_reason = machine.run_until_halt_or_cycles(50_000_000)?;
+        print!("{}", String::from_utf8_lossy(machine.dos_output()));
+        println!("stop: {stop_reason:?}");
+        let code = match stop_reason {
+            StopReason::DosExit { code } => i32::from(code),
+            _ => 1,
+        };
+        std::process::exit(code);
     }
 
     if cli.headless_test_rom {
