@@ -258,6 +258,8 @@ impl Machine {
             rom: &self.rom,
             serial: &mut self.serial,
             device_ports: &mut self.device_ports,
+            pic: &mut self.pic,
+            opl: &mut self.opl,
             trace: &mut self.trace,
             int10_pending: &mut self.int10_pending,
             wait_states: self.profile.wait_states,
@@ -1332,12 +1334,14 @@ mod tests {
         let mut bus = MachineBus {
             memory: &mut machine.memory,
             video: &mut machine.video,
+            margo: &mut machine.margo,
             rom: &machine.rom,
             serial: &mut machine.serial,
             device_ports: &mut machine.device_ports,
             pic: &mut machine.pic,
             opl: &mut machine.opl,
             trace: &mut machine.trace,
+            int10_pending: &mut machine.int10_pending,
             wait_states: machine.profile.wait_states,
         };
         f(&mut bus)
