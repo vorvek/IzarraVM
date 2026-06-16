@@ -498,6 +498,9 @@ impl Margo {
     }
 
     fn run_command(&mut self) {
+        // Any COMMAND write ends an in-flight COLOR_EXPAND_DATA stream; the
+        // 0x03 arm below starts a fresh one.
+        self.expand = None;
         match self.command & 0xff {
             0x01 => self.run_fill(),
             0x02 => self.run_copy(),
@@ -1861,6 +1864,35 @@ mod tests {
         write_reg(&mut margo, REG_MONO_DATA, 0xffff_ffff); // nothing armed
         assert_eq!(margo.read_vram_u8(0), 0x11); // untouched
         assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 0); // not busy
+    }
+
+    #[test]
+    fn a_new_command_abandons_an_in_flight_expand_stream() {
+        let mut margo = Margo::default();
+        // Arm a 2-word DATA stream targeting row 0 and row 1 at base 0, pitch 8.
+        write_reg(&mut margo, REG_DST_BASE, 0);
+        write_reg(&mut margo, REG_DST_PITCH, 8);
+        write_reg(&mut margo, REG_DEPTH, 1);
+        write_reg(&mut margo, REG_DST_XY, 0);
+        write_reg(&mut margo, REG_DIM, (2 << 16) | 8); // h=2, w=8 -> 2 words
+        write_reg(&mut margo, REG_FG_COLOR, 0xab);
+        write_reg(&mut margo, REG_BG_COLOR, 0xcd);
+        write_reg(&mut margo, REG_FLAGS, 0);
+        write_reg(&mut margo, REG_COMMAND, 0x03);
+        write_reg(&mut margo, REG_MONO_DATA, 0xff00_0000); // feed only row 0; under-run
+
+        // A synchronous FILL now starts a new operation and abandons the stream.
+        setup_fill(&mut margo);
+        write_reg(&mut margo, REG_COMMAND, 0x01);
+
+        // BUSY is driven only by the FILL's modeled time now, not a pinned stream.
+        margo.advance_busy(1_000_000);
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 0);
+
+        // The abandoned stream must not resume: a later MONO_DATA write is ignored.
+        let row1 = margo.read_vram_u8(8); // row 1, col 0 of the original stream target
+        write_reg(&mut margo, REG_MONO_DATA, 0xff00_0000);
+        assert_eq!(margo.read_vram_u8(8), row1);
     }
 
     #[test]
