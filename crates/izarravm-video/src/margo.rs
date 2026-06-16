@@ -1,10 +1,11 @@
 //! Margo, the VEGA 2D engine: the display register block, the linear frame
-//! buffer, and the blit engine. The engine implements FILL and COPY.
+//! buffer, and the blit engine. The engine implements FILL, COPY, and color
+//! expand.
 
 pub const MARGO_VRAM_SIZE: usize = 4 * 1024 * 1024;
 pub const MARGO_MMIO_SIZE: usize = 0x0001_0000; // 64 KB register block
 pub const MARGO_ID_VALUE: u32 = 0x4D47_0100; // 'M' 'G', version 1.00
-pub const MARGO_CAPS_VALUE: u32 = 0x0000_0043; // bits 0 FILL, 1 COPY, 6 COLORKEY
+pub const MARGO_CAPS_VALUE: u32 = 0x0000_0047; // bits 0 FILL, 1 COPY, 2 COLOR_EXPAND, 6 COLORKEY
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VbeMode {
@@ -72,15 +73,18 @@ pub const REG_DST_XY: usize = 0x0114;
 pub const REG_SRC_XY: usize = 0x0118;
 pub const REG_DIM: usize = 0x011c;
 pub const REG_FG_COLOR: usize = 0x0120;
+pub const REG_BG_COLOR: usize = 0x0124;
 pub const REG_ROP: usize = 0x0128;
 pub const REG_COLORKEY: usize = 0x012c;
 pub const REG_FLAGS: usize = 0x0130;
 pub const REG_COMMAND: usize = 0x0150;
+pub const REG_MONO_DATA: usize = 0x0160;
 
 const BLIT_BASE: usize = 0x0100;
 const BLIT_REGS: usize = 20; // 0x100..0x150, twenty 32-bit slots; COMMAND at 0x150 is handled separately
 const FILL_NS_PER_PIXEL: u64 = 5; // 200 Mpixels/s solid fill (section 1.1)
 const COPY_NS_PER_PIXEL: u64 = 10; // 100 Mpixels/s screen-to-screen blit (section 1.1)
+const EXPAND_NS_PER_PIXEL: u64 = 5; // 200 Mpixels/s color expand (section 1.1, fill class)
 const BLIT_SETUP_NS: u64 = 100; // fixed per-operation setup, shared by all blits
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -214,6 +218,135 @@ fn copy(vram: &mut [u8], p: &CopyParams) -> u64 {
     written
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExpandParams {
+    dst_base: u32,
+    dst_pitch: u32,
+    depth: u32, // bytes per pixel: 1, 2, or 4
+    dst_x: u32,
+    dst_y: u32,
+    width: u32,
+    height: u32,
+    fg_color: u32,
+    bg_color: u32,
+    transparent: bool, // EXPAND_TRANSPARENT: clear bits are skipped
+}
+
+/// Write one expanded destination pixel. `set` chooses FG vs BG; a clear bit
+/// under EXPAND_TRANSPARENT is skipped. A pixel whose byte range falls outside
+/// the frame store is skipped, not wrapped (section 8). Returns true if a pixel
+/// was written.
+/// `p.depth` must be 1, 2, or 4; callers guard this before calling.
+fn put_expand_pixel(vram: &mut [u8], p: &ExpandParams, x: u64, y: u64, set: bool) -> bool {
+    if !set && p.transparent {
+        return false;
+    }
+    let depth = p.depth as usize;
+    let color = if set { p.fg_color } else { p.bg_color };
+    let bytes = color.to_le_bytes();
+    let off = (p.dst_base as u64)
+        .saturating_add(y.saturating_mul(p.dst_pitch as u64))
+        .saturating_add(x.saturating_mul(depth as u64));
+    if off.saturating_add(depth as u64) > vram.len() as u64 {
+        return false;
+    }
+    let off = off as usize;
+    vram[off..off + depth].copy_from_slice(&bytes[..depth]);
+    true
+}
+
+struct ExpandMemParams {
+    common: ExpandParams,
+    src_base: u32,
+    src_pitch: u32,
+    src_x: u32,
+    src_y: u32,
+}
+
+/// Expand a 1-bpp source rectangle read from `vram` into a two-color destination
+/// rectangle, also in `vram`. The source is most-significant-bit first within
+/// each byte. A source byte or destination pixel outside the frame store is
+/// skipped, not wrapped (section 8). `depth` outside {1, 2, 4} is a no-op. The
+/// loop is bounded to `vram.len()` considered pixels and the offset math is
+/// u64-saturating, so an adversarial rectangle cannot spin or overflow. Returns
+/// the number of pixels written.
+fn color_expand_mem(vram: &mut [u8], p: &ExpandMemParams) -> u64 {
+    if !matches!(p.common.depth, 1 | 2 | 4) {
+        return 0;
+    }
+    let len = vram.len() as u64;
+    let mut considered: u64 = 0;
+    let mut written: u64 = 0;
+    'rows: for row in 0..p.common.height {
+        for col in 0..p.common.width {
+            if considered >= len {
+                break 'rows;
+            }
+            considered += 1;
+            let bit = p.src_x as u64 + col as u64;
+            let src_off = (p.src_base as u64)
+                .saturating_add((p.src_y as u64 + row as u64).saturating_mul(p.src_pitch as u64))
+                .saturating_add(bit / 8);
+            if src_off >= len {
+                continue;
+            }
+            let set = vram[src_off as usize] & (0x80u8 >> ((bit % 8) as u32)) != 0;
+            if put_expand_pixel(
+                vram,
+                &p.common,
+                p.common.dst_x as u64 + col as u64,
+                p.common.dst_y as u64 + row as u64,
+                set,
+            ) {
+                written += 1;
+            }
+        }
+    }
+    written
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExpandState {
+    params: ExpandParams,
+    words_per_row: u32,
+    total_words: u64,
+    words_received: u32,
+    written: u64, // running count, charged to busy_ns when the stream completes
+}
+
+/// Expand one 32-bit MONO_DATA word at the position implied by `received` (the
+/// count of words already consumed) and `words_per_row`. Bit 31 is the leftmost
+/// pixel; columns at or past `width` are padding and are skipped. Returns the
+/// number of pixels written by this word.
+fn expand_word(
+    vram: &mut [u8],
+    p: &ExpandParams,
+    words_per_row: u32,
+    received: u32,
+    word: u32,
+) -> u64 {
+    let row = received / words_per_row;
+    let col_base = (received % words_per_row) * 32;
+    let mut written: u64 = 0;
+    for i in 0..32u32 {
+        let col = col_base + i;
+        if col >= p.width {
+            break;
+        }
+        let set = word & (0x8000_0000u32 >> i) != 0;
+        if put_expand_pixel(
+            vram,
+            p,
+            p.dst_x as u64 + col as u64,
+            p.dst_y as u64 + row as u64,
+            set,
+        ) {
+            written += 1;
+        }
+    }
+    written
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Margo {
     vram: Vec<u8>,
@@ -222,6 +355,8 @@ pub struct Margo {
     blit: [u32; BLIT_REGS],
     command: u32,
     busy_ns: u64,
+    expand: Option<ExpandState>,
+    mono_data: u32,
 }
 
 impl Default for Margo {
@@ -233,6 +368,8 @@ impl Default for Margo {
             blit: [0; BLIT_REGS],
             command: 0,
             busy_ns: 0,
+            expand: None,
+            mono_data: 0,
         }
     }
 }
@@ -294,7 +431,7 @@ impl Margo {
         match reg {
             REG_ID => MARGO_ID_VALUE,
             REG_CAPS => MARGO_CAPS_VALUE,
-            REG_STATUS => u32::from(self.busy_ns > 0), // bit 0: BUSY
+            REG_STATUS => u32::from(self.busy_ns > 0 || self.expand.is_some()), // bit 0: BUSY
             REG_CONTROL => self.control,
             REG_DISP_MODE => u32::from(self.display.mode),
             REG_DISP_WIDTH => self.display.width,
@@ -327,12 +464,20 @@ impl Margo {
             }
             return;
         }
+        if reg == REG_MONO_DATA {
+            self.mono_data = (self.mono_data & !(0xff_u32 << shift)) | (u32::from(value) << shift);
+            if byte == 3 {
+                self.feed_mono_word(self.mono_data);
+            }
+            return;
+        }
         if reg == REG_CONTROL {
             self.control = (self.control & !(0xff_u32 << shift)) | (u32::from(value) << shift);
             if self.control & 0x1 != 0 {
                 // RESET aborts the operation. It already completed, so this only
-                // drops BUSY. The bit is self-clearing.
+                // drops BUSY and any in-flight color-expand stream. Self-clearing.
                 self.busy_ns = 0;
+                self.expand = None;
                 self.control &= !0x1;
             }
             return;
@@ -353,9 +498,14 @@ impl Margo {
     }
 
     fn run_command(&mut self) {
+        // Any COMMAND write ends an in-flight COLOR_EXPAND_DATA stream; the
+        // 0x03 arm below starts a fresh one.
+        self.expand = None;
         match self.command & 0xff {
             0x01 => self.run_fill(),
             0x02 => self.run_copy(),
+            0x03 => self.arm_expand_data(),
+            0x04 => self.run_expand_mem(),
             _ => {}
         }
         self.command = 0;
@@ -400,6 +550,88 @@ impl Margo {
         };
         let pixels = copy(&mut self.vram, &params);
         self.busy_ns = BLIT_SETUP_NS + pixels * COPY_NS_PER_PIXEL;
+    }
+
+    fn run_expand_mem(&mut self) {
+        let dst_xy = self.blit_reg(REG_DST_XY);
+        let src_xy = self.blit_reg(REG_SRC_XY);
+        let dim = self.blit_reg(REG_DIM);
+        let params = ExpandMemParams {
+            common: ExpandParams {
+                dst_base: self.blit_reg(REG_DST_BASE),
+                dst_pitch: self.blit_reg(REG_DST_PITCH),
+                depth: self.blit_reg(REG_DEPTH),
+                dst_x: dst_xy & 0xffff,
+                dst_y: dst_xy >> 16,
+                width: dim & 0xffff,
+                height: dim >> 16,
+                fg_color: self.blit_reg(REG_FG_COLOR),
+                bg_color: self.blit_reg(REG_BG_COLOR),
+                transparent: self.blit_reg(REG_FLAGS) & 0x4 != 0,
+            },
+            src_base: self.blit_reg(REG_SRC_BASE),
+            src_pitch: self.blit_reg(REG_SRC_PITCH),
+            src_x: src_xy & 0xffff,
+            src_y: src_xy >> 16,
+        };
+        let pixels = color_expand_mem(&mut self.vram, &params);
+        self.busy_ns = BLIT_SETUP_NS + pixels * EXPAND_NS_PER_PIXEL;
+    }
+
+    fn arm_expand_data(&mut self) {
+        let depth = self.blit_reg(REG_DEPTH);
+        if !matches!(depth, 1 | 2 | 4) {
+            return; // invalid pixel size: do not arm
+        }
+        let dst_xy = self.blit_reg(REG_DST_XY);
+        let dim = self.blit_reg(REG_DIM);
+        let width = dim & 0xffff;
+        let height = dim >> 16;
+        let words_per_row = width.div_ceil(32);
+        let total_words = u64::from(words_per_row) * u64::from(height);
+        if total_words == 0 {
+            return; // zero-area: nothing to stream
+        }
+        let params = ExpandParams {
+            dst_base: self.blit_reg(REG_DST_BASE),
+            dst_pitch: self.blit_reg(REG_DST_PITCH),
+            depth,
+            dst_x: dst_xy & 0xffff,
+            dst_y: dst_xy >> 16,
+            width,
+            height,
+            fg_color: self.blit_reg(REG_FG_COLOR),
+            bg_color: self.blit_reg(REG_BG_COLOR),
+            transparent: self.blit_reg(REG_FLAGS) & 0x4 != 0,
+        };
+        self.expand = Some(ExpandState {
+            params,
+            words_per_row,
+            total_words,
+            words_received: 0,
+            written: 0,
+        });
+    }
+
+    fn feed_mono_word(&mut self, word: u32) {
+        let Some(mut state) = self.expand else {
+            return; // nothing armed: a stray or overrun write
+        };
+        let written = expand_word(
+            &mut self.vram,
+            &state.params,
+            state.words_per_row,
+            state.words_received,
+            word,
+        );
+        state.words_received += 1;
+        state.written += written;
+        if u64::from(state.words_received) >= state.total_words {
+            self.busy_ns = BLIT_SETUP_NS + state.written * EXPAND_NS_PER_PIXEL;
+            self.expand = None;
+        } else {
+            self.expand = Some(state);
+        }
     }
 
     /// Drain `ns` nanoseconds of modeled busy time. The machine calls this each
@@ -710,10 +942,10 @@ mod tests {
     }
 
     #[test]
-    fn caps_reports_fill_copy_and_colorkey() {
+    fn caps_reports_fill_copy_expand_and_colorkey() {
         let margo = Margo::default();
-        // bit 0 FILL, bit 1 COPY, bit 6 COLORKEY.
-        assert_eq!(read_reg_u32(&margo, REG_CAPS), 0x0000_0043);
+        // bit 0 FILL, bit 1 COPY, bit 2 COLOR_EXPAND, bit 6 COLORKEY.
+        assert_eq!(read_reg_u32(&margo, REG_CAPS), 0x0000_0047);
     }
 
     #[test]
@@ -1164,6 +1396,503 @@ mod tests {
         assert_eq!(&vram[9..12], &[4, 5, 6]);
         // Source row 0 is unchanged where the destination did not overwrite it.
         assert_eq!(vram[0], 1);
+    }
+
+    #[test]
+    fn color_expand_mem_expands_to_fg_and_bg_depth_1() {
+        // Source byte 0xA0 = 1010_0000: cols 0 and 2 set, cols 1 and 3 clear
+        // (MSB first). Expand a 4x1 rect; set bits take FG 0xAB, clear bits BG 0xCD.
+        let mut vram = vec![0u8; 64];
+        vram[0] = 0xa0; // monochrome source row, src_base 0
+        let p = ExpandMemParams {
+            common: ExpandParams {
+                dst_base: 16,
+                dst_pitch: 8,
+                depth: 1,
+                dst_x: 0,
+                dst_y: 0,
+                width: 4,
+                height: 1,
+                fg_color: 0xab,
+                bg_color: 0xcd,
+                transparent: false,
+            },
+            src_base: 0,
+            src_pitch: 1,
+            src_x: 0,
+            src_y: 0,
+        };
+        assert_eq!(color_expand_mem(&mut vram, &p), 4);
+        assert_eq!(&vram[16..20], &[0xab, 0xcd, 0xab, 0xcd]);
+    }
+
+    #[test]
+    fn color_expand_mem_transparent_skips_clear_bits() {
+        // Same 0xA0 source; transparent leaves clear-bit destinations untouched.
+        let mut vram = vec![0u8; 64];
+        vram[0] = 0xa0;
+        for slot in &mut vram[16..20] {
+            *slot = 0xee; // pre-fill so a skip is visible
+        }
+        let p = ExpandMemParams {
+            common: ExpandParams {
+                dst_base: 16,
+                dst_pitch: 8,
+                depth: 1,
+                dst_x: 0,
+                dst_y: 0,
+                width: 4,
+                height: 1,
+                fg_color: 0xab,
+                bg_color: 0xcd,
+                transparent: true,
+            },
+            src_base: 0,
+            src_pitch: 1,
+            src_x: 0,
+            src_y: 0,
+        };
+        assert_eq!(color_expand_mem(&mut vram, &p), 2); // only the two set bits
+        assert_eq!(&vram[16..20], &[0xab, 0xee, 0xab, 0xee]);
+    }
+
+    #[test]
+    fn color_expand_mem_handles_depth_2_and_4() {
+        // depth 2: source 0x80 (col 0 set, col 1 clear) over a 2x1 rect.
+        let mut vram = vec![0u8; 64];
+        vram[0] = 0x80;
+        let p2 = ExpandMemParams {
+            common: ExpandParams {
+                dst_base: 16,
+                dst_pitch: 32,
+                depth: 2,
+                dst_x: 0,
+                dst_y: 0,
+                width: 2,
+                height: 1,
+                fg_color: 0x1234,
+                bg_color: 0x5678,
+                transparent: false,
+            },
+            src_base: 0,
+            src_pitch: 1,
+            src_x: 0,
+            src_y: 0,
+        };
+        assert_eq!(color_expand_mem(&mut vram, &p2), 2);
+        assert_eq!(&vram[16..18], &[0x34, 0x12]); // col 0 -> FG, little-endian
+        assert_eq!(&vram[18..20], &[0x78, 0x56]); // col 1 -> BG
+
+        // depth 4: source 0x80 (col 0 set) over a 1x1 rect -> FG 0xDEADBEEF.
+        let mut vram = vec![0u8; 64];
+        vram[0] = 0x80;
+        let p4 = ExpandMemParams {
+            common: ExpandParams {
+                dst_base: 16,
+                dst_pitch: 32,
+                depth: 4,
+                dst_x: 0,
+                dst_y: 0,
+                width: 1,
+                height: 1,
+                fg_color: 0xdead_beef,
+                bg_color: 0,
+                transparent: false,
+            },
+            src_base: 0,
+            src_pitch: 1,
+            src_x: 0,
+            src_y: 0,
+        };
+        assert_eq!(color_expand_mem(&mut vram, &p4), 1);
+        assert_eq!(&vram[16..20], &[0xef, 0xbe, 0xad, 0xde]);
+    }
+
+    #[test]
+    fn color_expand_mem_crosses_a_source_byte_boundary() {
+        // src_x = 7 puts col 0 at bit 7 (byte 0, LSB) and col 1 at bit 8 (byte 1,
+        // MSB). Byte 0 = 0x01 (col 0 set), byte 1 = 0x00 (col 1 clear).
+        let mut vram = vec![0u8; 64];
+        vram[0] = 0x01;
+        vram[1] = 0x00;
+        let p = ExpandMemParams {
+            common: ExpandParams {
+                dst_base: 16,
+                dst_pitch: 8,
+                depth: 1,
+                dst_x: 0,
+                dst_y: 0,
+                width: 2,
+                height: 1,
+                fg_color: 0xab,
+                bg_color: 0xcd,
+                transparent: false,
+            },
+            src_base: 0,
+            src_pitch: 2,
+            src_x: 7,
+            src_y: 0,
+        };
+        assert_eq!(color_expand_mem(&mut vram, &p), 2);
+        assert_eq!(&vram[16..18], &[0xab, 0xcd]); // col 0 set -> FG, col 1 clear -> BG
+    }
+
+    #[test]
+    fn color_expand_mem_skips_off_store_source_and_dest() {
+        // Destination runs off the store: base 14, 4 wide at depth 1 -> dst offsets
+        // 14,15,16,17; 16 and 17 are out. Source byte 0xF0 sets all four cols.
+        let mut vram = vec![0u8; 16];
+        vram[0] = 0xf0;
+        let p_dst = ExpandMemParams {
+            common: ExpandParams {
+                dst_base: 14,
+                dst_pitch: 16,
+                depth: 1,
+                dst_x: 0,
+                dst_y: 0,
+                width: 4,
+                height: 1,
+                fg_color: 0xab,
+                bg_color: 0xcd,
+                transparent: false,
+            },
+            src_base: 0,
+            src_pitch: 1,
+            src_x: 0,
+            src_y: 0,
+        };
+        assert_eq!(color_expand_mem(&mut vram, &p_dst), 2); // offsets 14,15 in
+        assert_eq!(vram[14], 0xab);
+        assert_eq!(vram[15], 0xab);
+
+        // Source off the store: src_base beyond the end -> every pixel skipped.
+        let mut vram = vec![0u8; 16];
+        let p_src = ExpandMemParams {
+            common: ExpandParams {
+                dst_base: 0,
+                dst_pitch: 16,
+                depth: 1,
+                dst_x: 0,
+                dst_y: 0,
+                width: 4,
+                height: 1,
+                fg_color: 0xab,
+                bg_color: 0xcd,
+                transparent: false,
+            },
+            src_base: 100,
+            src_pitch: 16,
+            src_x: 0,
+            src_y: 0,
+        };
+        assert_eq!(color_expand_mem(&mut vram, &p_src), 0);
+        assert!(vram.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn color_expand_mem_rejects_invalid_depth() {
+        let mut vram = vec![0u8; 16];
+        vram[0] = 0xff;
+        let p = ExpandMemParams {
+            common: ExpandParams {
+                dst_base: 0,
+                dst_pitch: 4,
+                depth: 3, // not 1, 2, or 4
+                dst_x: 1,
+                dst_y: 0,
+                width: 1,
+                height: 1,
+                fg_color: 0xab,
+                bg_color: 0xcd,
+                transparent: false,
+            },
+            src_base: 8,
+            src_pitch: 4,
+            src_x: 0,
+            src_y: 0,
+        };
+        assert_eq!(color_expand_mem(&mut vram, &p), 0);
+        assert_eq!(vram[1], 0x00); // nothing written
+    }
+
+    #[test]
+    fn color_expand_mem_caps_iterations_at_the_store_size() {
+        // Pathological DIM: an all-clear source with BG 0 and dst_base 0 writes 0
+        // over 0 for every in-bounds pixel, so the count equals the cap (vram.len()).
+        let mut vram = vec![0u8; 64];
+        let p = ExpandMemParams {
+            common: ExpandParams {
+                dst_base: 0,
+                dst_pitch: 4000,
+                depth: 1,
+                dst_x: 0,
+                dst_y: 0,
+                width: 4000,
+                height: 4000,
+                fg_color: 0xab,
+                bg_color: 0,
+                transparent: false,
+            },
+            src_base: 0,
+            src_pitch: 0,
+            src_x: 0,
+            src_y: 0,
+        };
+        assert_eq!(color_expand_mem(&mut vram, &p), 64);
+    }
+
+    #[test]
+    fn color_expand_mem_skips_extreme_coordinates_without_overflow() {
+        let mut vram = vec![0u8; 64];
+        let p = ExpandMemParams {
+            common: ExpandParams {
+                dst_base: u32::MAX,
+                dst_pitch: u32::MAX,
+                depth: 4,
+                dst_x: u32::MAX,
+                dst_y: u32::MAX,
+                width: 8,
+                height: 8,
+                fg_color: 0xdead_beef,
+                bg_color: 0,
+                transparent: false,
+            },
+            src_base: u32::MAX,
+            src_pitch: u32::MAX,
+            src_x: u32::MAX,
+            src_y: u32::MAX,
+        };
+        assert_eq!(color_expand_mem(&mut vram, &p), 0); // must not panic
+        assert!(vram.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn bg_color_round_trips() {
+        let mut margo = Margo::default();
+        margo.write_mmio_u8(REG_BG_COLOR, 0x11);
+        margo.write_mmio_u8(REG_BG_COLOR + 1, 0x22);
+        margo.write_mmio_u8(REG_BG_COLOR + 2, 0x33);
+        margo.write_mmio_u8(REG_BG_COLOR + 3, 0x44);
+        assert_eq!(read_reg_u32(&margo, REG_BG_COLOR), 0x4433_2211);
+    }
+
+    #[test]
+    fn command_expand_mem_writes_vram_and_sets_busy() {
+        let mut margo = Margo::default();
+        margo.write_vram_u8(0, 0x80); // source row: col 0 set, col 1 clear
+        write_reg(&mut margo, REG_DST_BASE, 16);
+        write_reg(&mut margo, REG_DST_PITCH, 8);
+        write_reg(&mut margo, REG_SRC_BASE, 0);
+        write_reg(&mut margo, REG_SRC_PITCH, 1);
+        write_reg(&mut margo, REG_DEPTH, 1);
+        write_reg(&mut margo, REG_DST_XY, 0); // (0,0)
+        write_reg(&mut margo, REG_SRC_XY, 0); // (0,0)
+        write_reg(&mut margo, REG_DIM, (1 << 16) | 2); // h=1, w=2
+        write_reg(&mut margo, REG_FG_COLOR, 0xab);
+        write_reg(&mut margo, REG_BG_COLOR, 0xcd);
+        write_reg(&mut margo, REG_FLAGS, 0);
+        write_reg(&mut margo, REG_COMMAND, 0x04); // COLOR_EXPAND_MEM
+
+        assert_eq!(margo.read_vram_u8(16), 0xab); // col 0 set -> FG
+        assert_eq!(margo.read_vram_u8(17), 0xcd); // col 1 clear -> BG
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 1); // BUSY set
+    }
+
+    #[test]
+    fn command_expand_mem_busy_drains_at_the_expand_rate() {
+        let mut margo = Margo::default();
+        // All-clear source, opaque: a 4x1 rect writes 4 BG pixels.
+        write_reg(&mut margo, REG_DST_BASE, 16);
+        write_reg(&mut margo, REG_DST_PITCH, 8);
+        write_reg(&mut margo, REG_SRC_BASE, 0);
+        write_reg(&mut margo, REG_SRC_PITCH, 1);
+        write_reg(&mut margo, REG_DEPTH, 1);
+        write_reg(&mut margo, REG_DST_XY, 0);
+        write_reg(&mut margo, REG_SRC_XY, 0);
+        write_reg(&mut margo, REG_DIM, (1 << 16) | 4); // 4x1 = 4 pixels
+        write_reg(&mut margo, REG_FLAGS, 0);
+        write_reg(&mut margo, REG_COMMAND, 0x04);
+
+        // 4 pixels -> busy_ns = 100 + 4*5 = 120. One ns short still reads busy.
+        margo.advance_busy(119);
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 1);
+        margo.advance_busy(1);
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 0);
+    }
+
+    #[test]
+    fn command_expand_data_arms_and_reports_busy() {
+        let mut margo = Margo::default();
+        write_reg(&mut margo, REG_DST_BASE, 0);
+        write_reg(&mut margo, REG_DST_PITCH, 8);
+        write_reg(&mut margo, REG_DEPTH, 1);
+        write_reg(&mut margo, REG_DST_XY, 0);
+        write_reg(&mut margo, REG_DIM, (1 << 16) | 8); // h=1, w=8 -> 1 word
+        write_reg(&mut margo, REG_FG_COLOR, 0xab);
+        write_reg(&mut margo, REG_BG_COLOR, 0xcd);
+        write_reg(&mut margo, REG_FLAGS, 0);
+        write_reg(&mut margo, REG_COMMAND, 0x03); // COLOR_EXPAND_DATA
+
+        // Armed: BUSY set before any data word, nothing drawn yet.
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 1);
+        assert_eq!(margo.read_vram_u8(0), 0x00);
+    }
+
+    #[test]
+    fn expand_data_word_paints_fg_and_bg_msb_first() {
+        let mut margo = Margo::default();
+        write_reg(&mut margo, REG_DST_BASE, 0);
+        write_reg(&mut margo, REG_DST_PITCH, 8);
+        write_reg(&mut margo, REG_DEPTH, 1);
+        write_reg(&mut margo, REG_DST_XY, 0);
+        write_reg(&mut margo, REG_DIM, (1 << 16) | 4); // h=1, w=4 -> 1 word/row
+        write_reg(&mut margo, REG_FG_COLOR, 0xab);
+        write_reg(&mut margo, REG_BG_COLOR, 0xcd);
+        write_reg(&mut margo, REG_FLAGS, 0);
+        write_reg(&mut margo, REG_COMMAND, 0x03);
+
+        // 0xA0000000: bits 31 and 29 set -> cols 0 and 2 set, cols 1 and 3 clear.
+        write_reg(&mut margo, REG_MONO_DATA, 0xa000_0000);
+
+        assert_eq!(margo.read_vram_u8(0), 0xab); // col 0 set
+        assert_eq!(margo.read_vram_u8(1), 0xcd); // col 1 clear
+        assert_eq!(margo.read_vram_u8(2), 0xab); // col 2 set
+        assert_eq!(margo.read_vram_u8(3), 0xcd); // col 3 clear
+        // Stream complete (one word) -> BUSY now reflects the cost tail.
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 1);
+    }
+
+    #[test]
+    fn expand_data_continues_a_wide_row_across_words() {
+        let mut margo = Margo::default();
+        write_reg(&mut margo, REG_DST_BASE, 0);
+        write_reg(&mut margo, REG_DST_PITCH, 64);
+        write_reg(&mut margo, REG_DEPTH, 1);
+        write_reg(&mut margo, REG_DST_XY, 0);
+        write_reg(&mut margo, REG_DIM, (1 << 16) | 40); // h=1, w=40 -> 2 words/row
+        write_reg(&mut margo, REG_FG_COLOR, 0xab);
+        write_reg(&mut margo, REG_BG_COLOR, 0xcd);
+        write_reg(&mut margo, REG_FLAGS, 0);
+        write_reg(&mut margo, REG_COMMAND, 0x03);
+
+        write_reg(&mut margo, REG_MONO_DATA, 0x8000_0000); // word 0: col 0 set
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 1); // armed, one word left
+        write_reg(&mut margo, REG_MONO_DATA, 0x8000_0000); // word 1: col 32 set
+
+        assert_eq!(margo.read_vram_u8(0), 0xab); // col 0 set (word 0, bit 31)
+        assert_eq!(margo.read_vram_u8(1), 0xcd); // col 1 clear
+        assert_eq!(margo.read_vram_u8(32), 0xab); // col 32 set (word 1, bit 31)
+        assert_eq!(margo.read_vram_u8(33), 0xcd); // col 33 clear
+    }
+
+    #[test]
+    fn expand_data_holds_busy_through_the_stream_then_drains() {
+        let mut margo = Margo::default();
+        write_reg(&mut margo, REG_DST_BASE, 0);
+        write_reg(&mut margo, REG_DST_PITCH, 8);
+        write_reg(&mut margo, REG_DEPTH, 1);
+        write_reg(&mut margo, REG_DST_XY, 0);
+        write_reg(&mut margo, REG_DIM, (2 << 16) | 8); // h=2, w=8 -> 1 word/row, 2 words
+        write_reg(&mut margo, REG_FG_COLOR, 0xab);
+        write_reg(&mut margo, REG_BG_COLOR, 0xcd);
+        write_reg(&mut margo, REG_FLAGS, 0);
+        write_reg(&mut margo, REG_COMMAND, 0x03);
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 1); // armed
+
+        write_reg(&mut margo, REG_MONO_DATA, 0); // row 0 (all clear -> all BG)
+        // Mid-stream BUSY is the armed flag, not a timer: a huge clock advance
+        // cannot clear it before the last word.
+        margo.advance_busy(1_000_000);
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 1);
+
+        write_reg(&mut margo, REG_MONO_DATA, 0); // row 1: last word completes the stream
+        // 16 pixels written (8x2, opaque) -> tail busy_ns = 100 + 16*5 = 180.
+        margo.advance_busy(179);
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 1);
+        margo.advance_busy(1);
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 0);
+    }
+
+    #[test]
+    fn expand_data_transparent_skips_clear_bits() {
+        let mut margo = Margo::default();
+        margo.write_vram_u8(1, 0xee); // col 1 destination pre-filled
+        write_reg(&mut margo, REG_DST_BASE, 0);
+        write_reg(&mut margo, REG_DST_PITCH, 8);
+        write_reg(&mut margo, REG_DEPTH, 1);
+        write_reg(&mut margo, REG_DST_XY, 0);
+        write_reg(&mut margo, REG_DIM, (1 << 16) | 2); // h=1, w=2
+        write_reg(&mut margo, REG_FG_COLOR, 0xab);
+        write_reg(&mut margo, REG_BG_COLOR, 0xcd);
+        write_reg(&mut margo, REG_FLAGS, 0x04); // EXPAND_TRANSPARENT
+        write_reg(&mut margo, REG_COMMAND, 0x03);
+
+        write_reg(&mut margo, REG_MONO_DATA, 0x8000_0000); // col 0 set, col 1 clear
+
+        assert_eq!(margo.read_vram_u8(0), 0xab); // col 0 set -> FG
+        assert_eq!(margo.read_vram_u8(1), 0xee); // col 1 clear -> left untouched
+    }
+
+    #[test]
+    fn expand_data_reset_aborts_the_stream() {
+        let mut margo = Margo::default();
+        write_reg(&mut margo, REG_DST_BASE, 0);
+        write_reg(&mut margo, REG_DST_PITCH, 8);
+        write_reg(&mut margo, REG_DEPTH, 1);
+        write_reg(&mut margo, REG_DST_XY, 0);
+        write_reg(&mut margo, REG_DIM, (2 << 16) | 8); // 2 words
+        write_reg(&mut margo, REG_FG_COLOR, 0xab);
+        write_reg(&mut margo, REG_BG_COLOR, 0xcd);
+        write_reg(&mut margo, REG_FLAGS, 0);
+        write_reg(&mut margo, REG_COMMAND, 0x03);
+        write_reg(&mut margo, REG_MONO_DATA, 0xff00_0000); // row 0: cols 0..7 set
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 1); // armed, one word left
+
+        write_reg(&mut margo, REG_CONTROL, 0x01); // RESET aborts the stream
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 0);
+
+        // Row 1 was never fed; a further MONO_DATA write is now ignored.
+        write_reg(&mut margo, REG_MONO_DATA, 0xff00_0000);
+        assert_eq!(margo.read_vram_u8(8), 0x00); // row 1 (offset 8) stays clear
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 0);
+    }
+
+    #[test]
+    fn expand_data_ignores_mono_data_when_idle() {
+        let mut margo = Margo::default();
+        margo.write_vram_u8(0, 0x11);
+        write_reg(&mut margo, REG_MONO_DATA, 0xffff_ffff); // nothing armed
+        assert_eq!(margo.read_vram_u8(0), 0x11); // untouched
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 0); // not busy
+    }
+
+    #[test]
+    fn a_new_command_abandons_an_in_flight_expand_stream() {
+        let mut margo = Margo::default();
+        // Arm a 2-word DATA stream targeting row 0 and row 1 at base 0, pitch 8.
+        write_reg(&mut margo, REG_DST_BASE, 0);
+        write_reg(&mut margo, REG_DST_PITCH, 8);
+        write_reg(&mut margo, REG_DEPTH, 1);
+        write_reg(&mut margo, REG_DST_XY, 0);
+        write_reg(&mut margo, REG_DIM, (2 << 16) | 8); // h=2, w=8 -> 2 words
+        write_reg(&mut margo, REG_FG_COLOR, 0xab);
+        write_reg(&mut margo, REG_BG_COLOR, 0xcd);
+        write_reg(&mut margo, REG_FLAGS, 0);
+        write_reg(&mut margo, REG_COMMAND, 0x03);
+        write_reg(&mut margo, REG_MONO_DATA, 0xff00_0000); // feed only row 0; under-run
+
+        // A synchronous FILL now starts a new operation and abandons the stream.
+        setup_fill(&mut margo);
+        write_reg(&mut margo, REG_COMMAND, 0x01);
+
+        // BUSY is driven only by the FILL's modeled time now, not a pinned stream.
+        margo.advance_busy(1_000_000);
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 0);
+
+        // The abandoned stream must not resume: a later MONO_DATA write is ignored.
+        let row1 = margo.read_vram_u8(8); // row 1, col 0 of the original stream target
+        write_reg(&mut margo, REG_MONO_DATA, 0xff00_0000);
+        assert_eq!(margo.read_vram_u8(8), row1);
     }
 
     #[test]

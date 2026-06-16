@@ -1991,4 +1991,65 @@ mod tests {
         assert_eq!(reason, StopReason::DosExit { code: 0 });
         assert_eq!(machine.dos_output(), b"Hello, world!\r\n");
     }
+
+    #[test]
+    fn color_expand_data_through_the_mmio_aperture_draws_a_glyph_and_times_busy() {
+        let mut machine = test_machine();
+        // draw_glyph_8x8: an 8x8 glyph expanded at (10, 5), pitch 640, depth 1,
+        // FG 0xAB, EXPAND_TRANSPARENT so clear bits leave the zeroed background.
+        // Row 0 = 0x80 (only the leftmost pixel), row 1 = 0x01 (only the rightmost),
+        // proving MSB-first ordering; the rest are blank.
+        let glyph: [u8; 8] = [0x80, 0x01, 0, 0, 0, 0, 0, 0];
+
+        write_mmio_reg(&mut machine, 0x100, 0); // DST_BASE
+        write_mmio_reg(&mut machine, 0x104, 640); // DST_PITCH
+        write_mmio_reg(&mut machine, 0x110, 1); // DEPTH
+        write_mmio_reg(&mut machine, 0x114, (5 << 16) | 10); // DST_XY: y=5, x=10
+        write_mmio_reg(&mut machine, 0x11c, (8 << 16) | 8); // DIM: 8x8
+        write_mmio_reg(&mut machine, 0x120, 0xab); // FG_COLOR
+        write_mmio_reg(&mut machine, 0x130, 0x04); // FLAGS: EXPAND_TRANSPARENT
+        write_mmio_reg(&mut machine, 0x150, 0x03); // COMMAND: COLOR_EXPAND_DATA
+
+        // Armed: BUSY set before any data, nothing drawn yet.
+        assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
+        assert_eq!(
+            machine.read_physical_u8(MARGO_LFB_BASE + 5 * 640 + 10),
+            0x00
+        );
+
+        // Stream the eight rows; the bits go in the high byte, MSB first.
+        for (row, &bits) in glyph.iter().enumerate() {
+            write_mmio_reg(&mut machine, 0x160, u32::from(bits) << 24); // MONO_DATA
+            if row < 7 {
+                // Still armed until the final word arrives.
+                assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
+            }
+        }
+
+        // Set bits painted FG; clear bits left untouched over the zeroed background.
+        assert_eq!(
+            machine.read_physical_u8(MARGO_LFB_BASE + 5 * 640 + 10),
+            0xab
+        ); // row 0, col 0
+        assert_eq!(
+            machine.read_physical_u8(MARGO_LFB_BASE + 6 * 640 + 17),
+            0xab
+        ); // row 1, col 7
+        assert_eq!(
+            machine.read_physical_u8(MARGO_LFB_BASE + 5 * 640 + 11),
+            0x00
+        ); // row 0, col 1 clear
+        assert_eq!(
+            machine.read_physical_u8(MARGO_LFB_BASE + 6 * 640 + 10),
+            0x00
+        ); // row 1, col 0 clear
+
+        // 2 pixels written -> busy_ns = 100 + 2*5 = 110 ns. At 25 MHz (40 ns/clock),
+        // two clocks (80 ns) leave it busy; the third clears it.
+        assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
+        machine.advance_devices(2);
+        assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
+        machine.advance_devices(1);
+        assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 0);
+    }
 }

@@ -180,7 +180,7 @@ For an 8x8 font, each glyph is eight bytes, one per row. Each row needs one word
 already on screen, leaving the background untouched.
 
 ```c
-/* (target) */
+/* (verified) */
 void draw_glyph_8x8(unsigned long base, int pitch, int bpp,
                     int x, int y, const unsigned char glyph[8],
                     unsigned long fg) {
