@@ -9,6 +9,7 @@ use izarravm_video::{
 use thiserror::Error;
 
 mod pic;
+mod pit;
 
 pub const HIGH_ROM_BASE: u32 = 0xffff_0000;
 pub const LOW_BIOS_BASE: u32 = 0x000f_0000;
@@ -97,6 +98,8 @@ pub enum StopReason {
 /// The OPL3 renders at this native rate; the Resonique 2 DAC outputs at 44100.
 const OPL_NATIVE_HZ: u32 = 49_716;
 const DAC_HZ: u32 = 44_100;
+/// Standard PC PIT input clock frequency.
+const PIT_INPUT_HZ: u32 = 1_193_182;
 
 #[derive(Debug)]
 pub struct Machine {
@@ -108,6 +111,8 @@ pub struct Machine {
     serial: SerialPort,
     device_ports: DevicePorts,
     pic: pic::Pic8259Pair,
+    pit: pit::Pit,
+    pit_clocks: f64, // fractional PIT input clocks owed to the counters
     opl: OplChip,
     resampler: Resampler,
     opl_micros: f64, // fractional microseconds owed to the OPL timers
@@ -131,6 +136,8 @@ impl Machine {
             serial: SerialPort::default(),
             device_ports: DevicePorts::default(),
             pic: pic::Pic8259Pair::default(),
+            pit: pit::Pit::default(),
+            pit_clocks: 0.0,
             opl: OplChip::default(),
             resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             opl_micros: 0.0,
@@ -159,6 +166,8 @@ impl Machine {
             serial: SerialPort::default(),
             device_ports: DevicePorts::default(),
             pic: pic::Pic8259Pair::default(),
+            pit: pit::Pit::default(),
+            pit_clocks: 0.0,
             opl: OplChip::default(),
             resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             opl_micros: 0.0,
@@ -226,13 +235,21 @@ impl Machine {
         self.elapsed_clocks
     }
 
-    /// Advance time-based devices (currently the OPL timers) by `clocks` of CPU
-    /// time, converting to microseconds and carrying the fractional remainder.
+    /// Advance time-based devices by `clocks` of CPU time, carrying fractional
+    /// remainders forward for both the OPL timers and the PIT counters.
     fn advance_devices(&mut self, clocks: u64) {
         self.opl_micros += clocks as f64 * 1_000_000.0 / self.profile.clock_hz as f64;
         let whole = self.opl_micros.floor();
         self.opl.advance_micros(whole as u64);
         self.opl_micros -= whole;
+
+        self.pit_clocks += clocks as f64 * f64::from(PIT_INPUT_HZ) / self.profile.clock_hz as f64;
+        let whole = self.pit_clocks.floor();
+        self.pit_clocks -= whole;
+        let edges = self.pit.tick(whole as u64);
+        for _ in 0..edges {
+            self.pic.request(0); // channel 0 OUT rising edge is IRQ0
+        }
     }
 
     /// Render `native_samples` of OPL3 output at 49716 Hz and return the
@@ -253,6 +270,20 @@ impl Machine {
     /// devices call this; slice 2b wires the PIT's IRQ0 tick through here.
     pub fn request_irq(&mut self, line: u8) {
         self.pic.request(line);
+    }
+
+    /// Drive a PIT counter's GATE line. The PC ties GATE0/GATE1 high; the sound
+    /// slice wires GATE2 from port 0x61. Exposed now so the GATE-triggered modes
+    /// have a caller outside tests.
+    pub fn set_timer_gate(&mut self, channel: usize, level: bool) {
+        self.pit.set_gate(channel, level);
+    }
+
+    /// Input CLK pulses until channel 0 produces its next OUT rising edge, or None
+    /// if the counter cannot fire from its current state. Used by the HLT
+    /// fast-forward path added in Task 2b-2.
+    pub fn clocks_until_timer0_irq(&self) -> Option<u64> {
+        self.pit.clocks_until_channel0_irq()
     }
 
     pub fn run_cycles(&mut self, cycles: u64) -> Result<StopReason, MachineError> {
@@ -285,6 +316,7 @@ impl Machine {
                     serial,
                     device_ports,
                     pic,
+                    pit,
                     opl,
                     trace,
                     ..
@@ -296,6 +328,7 @@ impl Machine {
                     serial,
                     device_ports,
                     pic,
+                    pit,
                     opl,
                     trace,
                     wait_states: profile.wait_states,
@@ -331,6 +364,7 @@ struct MachineBus<'a> {
     serial: &'a mut SerialPort,
     device_ports: &'a mut DevicePorts,
     pic: &'a mut pic::Pic8259Pair,
+    pit: &'a mut pit::Pit,
     opl: &'a mut OplChip,
     trace: &'a mut BusTrace,
     wait_states: WaitStateProfile,
@@ -433,6 +467,9 @@ impl CpuBus for MachineBus<'_> {
             // The chip drives only the status byte on reads; data ports read open-bus.
             return Ok(u32::from(self.opl.read_port(opl_port).unwrap_or(0xff)));
         }
+        if let Some(value) = self.pit.read_port(port) {
+            return Ok(u32::from(value));
+        }
         if let Some(value) = self.pic.read_port(port) {
             return Ok(u32::from(value));
         }
@@ -460,6 +497,7 @@ impl CpuBus for MachineBus<'_> {
         }
         if self.serial.write_port(port, value as u8)
             || self.video.write_port(port, value as u8)
+            || self.pit.write_port(port, value as u8)
             || self.pic.write_port(port, value as u8)
             || self.device_ports.write_port(port, value as u8)
         {
@@ -524,7 +562,6 @@ impl DevicePorts {
 fn known_passive_ports() -> impl Iterator<Item = u16> {
     let ranges = [
         0x0000..=0x000f, // DMA controller 1
-        0x0040..=0x0043, // PIT
         0x0060..=0x0064, // keyboard controller / A20 path
         0x0080..=0x008f, // DMA page registers
         0x0092..=0x0092, // system control port A / fast A20
@@ -802,6 +839,7 @@ mod tests {
                 serial: &mut machine.serial,
                 device_ports: &mut machine.device_ports,
                 pic: &mut machine.pic,
+                pit: &mut machine.pit,
                 opl: &mut machine.opl,
                 trace: &mut machine.trace,
                 wait_states: machine.profile.wait_states,
@@ -953,6 +991,7 @@ mod tests {
             serial: &mut machine.serial,
             device_ports: &mut machine.device_ports,
             pic: &mut machine.pic,
+            pit: &mut machine.pit,
             opl: &mut machine.opl,
             trace: &mut machine.trace,
             wait_states: machine.profile.wait_states,
@@ -979,6 +1018,28 @@ mod tests {
         write(0xc0, 0x01); // additive
         write(0xa0, 0x00); // f-number low
         write(0xb0, 0x20 | (4 << 2) | 0x02); // key-on, block 4, fnum 0x200
+    }
+
+    #[test]
+    fn pit_channel0_raises_irq0_while_running() {
+        // cli; jmp $ keeps the CPU spinning with interrupts off, so advance_devices
+        // ticks the PIT but the raised IRQ0 stays pending (never acknowledged).
+        let mut machine = Machine::new(
+            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            rom_with_code(&[0xfa, 0xeb, 0xfe]),
+        )
+        .unwrap();
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x43, BusWidth::Byte, 0x36).unwrap(); // counter 0, mode 3
+            bus.write_io(0x40, BusWidth::Byte, 0x04).unwrap(); // count low
+            bus.write_io(0x40, BusWidth::Byte, 0x00).unwrap(); // count high -> 4
+        });
+        machine.run_cycles(4000).unwrap();
+        let pending = with_bus(&mut machine, |bus| bus.interrupt_pending());
+        assert!(
+            pending,
+            "channel 0 should have raised IRQ0 over 4000 cycles"
+        );
     }
 
     #[test]
