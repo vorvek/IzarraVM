@@ -70,12 +70,13 @@ impl Counter {
     }
 
     fn write_control(&mut self, value: u8) {
-        if (value >> 4) & 0x3 == 0 {
+        let rw_field = (value >> 4) & 0x3;
+        if rw_field == 0 {
             // Counter-latch command: freeze the current count for reading.
             self.latch_count();
             return;
         }
-        self.rw = match (value >> 4) & 0x3 {
+        self.rw = match rw_field {
             1 => RwMode::Lsb,
             2 => RwMode::Msb,
             _ => RwMode::LsbThenMsb,
@@ -220,9 +221,9 @@ impl Counter {
     fn step_counting(&mut self) -> bool {
         // Level-sensitive GATE: low pauses counting (modes 0, 2, 3, 4).
         if !self.gate {
-            match self.mode {
-                2 | 3 => self.out = true, // GATE low forces OUT high in modes 2, 3
-                _ => {}
+            // GATE low forces OUT high in modes 2 and 3 and pauses counting.
+            if matches!(self.mode, 2 | 3) {
+                self.out = true;
             }
             return false;
         }
@@ -265,6 +266,10 @@ impl Counter {
                 }
             }
             4 | 5 => {
+                // Modes 4 and 5: count down while OUT is high, drive OUT low for one
+                // clock at terminal, then back high (the strobe) and stop. The rising
+                // edge that fires IRQ0 is that return to high, so the strobe lands N+1
+                // clocks after the count is loaded.
                 if self.out {
                     self.count = self.count.wrapping_sub(1);
                     if self.count == 0 {
