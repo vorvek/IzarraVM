@@ -129,15 +129,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     if let Some(path) = &cli.headless_run_com {
-        let image = std::fs::read(path)?;
-        let mut machine =
-            Machine::new_dos_com(MachineProfile::from_hardware_profile(&hardware), &image)?;
-        let stop_reason = machine.run_until_halt_or_cycles(50_000_000)?;
-        print!("{}", String::from_utf8_lossy(machine.dos_output()));
-        println!("stop: {stop_reason:?}");
-        let code = match stop_reason {
-            StopReason::DosExit { code } => i32::from(code),
-            _ => 1,
+        // Compute the exit code in an inner scope so the machine and the loaded
+        // image drop before process::exit (which does not unwind). The DOS exit
+        // code becomes the process status so a .COM result is scriptable.
+        let code = {
+            let image = std::fs::read(path)?;
+            let mut machine =
+                Machine::new_dos_com(MachineProfile::from_hardware_profile(&hardware), &image)?;
+            let stop_reason = machine.run_until_halt_or_cycles(50_000_000)?;
+            print!("{}", String::from_utf8_lossy(machine.dos_output()));
+            println!("stop: {stop_reason:?}");
+            match stop_reason {
+                StopReason::DosExit { code } => i32::from(code),
+                _ => 1,
+            }
         };
         std::process::exit(code);
     }
