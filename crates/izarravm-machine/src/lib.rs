@@ -354,7 +354,8 @@ impl Machine {
     }
 
     /// Last byte written to a passive I/O port (such as 0x80, the POST diagnostic
-    /// port), or None if the port is not decoded.
+    /// port), or None if the port address is not in the passive port map. A
+    /// decoded but never written port reads its default, not None.
     pub fn io_port(&self, port: u16) -> Option<u8> {
         self.device_ports.read_port(port)
     }
@@ -1280,6 +1281,7 @@ mod tests {
         .unwrap();
         machine.run_until_halt_or_cycles(10_000).unwrap();
         assert_eq!(machine.io_port(0x80), Some(0x42));
+        assert_eq!(machine.io_port(0x0100), None); // outside the passive port map
     }
 
     fn read_u16(machine: &mut Machine, addr: u32) -> u16 {
