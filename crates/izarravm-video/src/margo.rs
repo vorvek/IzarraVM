@@ -4,7 +4,7 @@
 pub const MARGO_VRAM_SIZE: usize = 4 * 1024 * 1024;
 pub const MARGO_MMIO_SIZE: usize = 0x0001_0000; // 64 KB register block
 pub const MARGO_ID_VALUE: u32 = 0x4D47_0100; // 'M' 'G', version 1.00
-pub const MARGO_CAPS_VALUE: u32 = 0x0000_0000; // no engine ops in this slice
+pub const MARGO_CAPS_VALUE: u32 = 0x0000_0001; // bit 0: FILL available
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VbeMode {
@@ -73,7 +73,9 @@ pub const REG_ROP: usize = 0x0128;
 pub const REG_COMMAND: usize = 0x0150;
 
 const BLIT_BASE: usize = 0x0100;
-const BLIT_REGS: usize = 20; // 0x100..0x150, twenty 32-bit slots
+const BLIT_REGS: usize = 20; // 0x100..0x150, twenty 32-bit slots; COMMAND at 0x150 is handled separately
+const FILL_NS_PER_PIXEL: u64 = 5; // 200 Mpixels/s (section 1.1)
+const FILL_SETUP_NS: u64 = 100; // fixed per-operation setup
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MargoDisplay {
@@ -85,7 +87,6 @@ pub struct MargoDisplay {
     pub start: u32,
 }
 
-#[allow(dead_code)]
 struct FillParams {
     dst_base: u32,
     dst_pitch: u32,
@@ -98,7 +99,6 @@ struct FillParams {
     rop: u8, // 0xF0 PATCOPY (solid), 0x5A PATINVERT (XOR), others treated as solid
 }
 
-#[allow(dead_code)]
 /// Fill a rectangle in `vram` from the latched parameters. Returns the number of
 /// pixels actually written inside the frame store; for a fill that fits, that is
 /// the rectangle area. Off-store pixels are skipped, not wrapped (section 8).
@@ -149,6 +149,8 @@ pub struct Margo {
     display: MargoDisplay,
     control: u32,
     blit: [u32; BLIT_REGS],
+    command: u32,
+    busy_ns: u64,
 }
 
 impl Default for Margo {
@@ -158,6 +160,8 @@ impl Default for Margo {
             display: MargoDisplay::default(),
             control: 0,
             blit: [0; BLIT_REGS],
+            command: 0,
+            busy_ns: 0,
         }
     }
 }
@@ -219,7 +223,7 @@ impl Margo {
         match reg {
             REG_ID => MARGO_ID_VALUE,
             REG_CAPS => MARGO_CAPS_VALUE,
-            REG_STATUS => 0, // BUSY clear, no FIFO in this slice
+            REG_STATUS => u32::from(self.busy_ns > 0), // bit 0: BUSY
             REG_CONTROL => self.control,
             REG_DISP_MODE => u32::from(self.display.mode),
             REG_DISP_WIDTH => self.display.width,
@@ -244,18 +248,67 @@ impl Margo {
         let reg = offset & !0x3;
         let byte = offset & 0x3;
         let shift = 8 * byte;
+
+        if reg == REG_COMMAND {
+            self.command = (self.command & !(0xff_u32 << shift)) | (u32::from(value) << shift);
+            if byte == 3 {
+                self.run_command();
+            }
+            return;
+        }
+        if reg == REG_CONTROL {
+            self.control = (self.control & !(0xff_u32 << shift)) | (u32::from(value) << shift);
+            if self.control & 0x1 != 0 {
+                // RESET aborts the operation. It already completed, so this only
+                // drops BUSY. The bit is self-clearing.
+                self.busy_ns = 0;
+                self.control &= !0x1;
+            }
+            return;
+        }
         if (BLIT_BASE..BLIT_BASE + BLIT_REGS * 4).contains(&reg) {
             let slot = &mut self.blit[(reg - BLIT_BASE) / 4];
             *slot = (*slot & !(0xff_u32 << shift)) | (u32::from(value) << shift);
             return;
         }
-        // Only CONTROL and DISP_START are writable outside the blit block.
-        let target = match reg {
-            REG_CONTROL => &mut self.control,
-            REG_DISP_START => &mut self.display.start,
-            _ => return,
+        if reg == REG_DISP_START {
+            let slot = &mut self.display.start;
+            *slot = (*slot & !(0xff_u32 << shift)) | (u32::from(value) << shift);
+        }
+    }
+
+    fn blit_reg(&self, offset: usize) -> u32 {
+        self.blit[(offset - BLIT_BASE) / 4]
+    }
+
+    fn run_command(&mut self) {
+        if (self.command & 0xff) == 0x01 {
+            self.run_fill();
+        }
+    }
+
+    fn run_fill(&mut self) {
+        let dst_xy = self.blit_reg(REG_DST_XY);
+        let dim = self.blit_reg(REG_DIM);
+        let params = FillParams {
+            dst_base: self.blit_reg(REG_DST_BASE),
+            dst_pitch: self.blit_reg(REG_DST_PITCH),
+            depth: self.blit_reg(REG_DEPTH),
+            dst_x: dst_xy & 0xffff,
+            dst_y: dst_xy >> 16,
+            width: dim & 0xffff,
+            height: dim >> 16,
+            fg_color: self.blit_reg(REG_FG_COLOR),
+            rop: self.blit_reg(REG_ROP) as u8,
         };
-        *target = (*target & !(0xff_u32 << shift)) | (u32::from(value) << shift);
+        let pixels = fill(&mut self.vram, &params);
+        self.busy_ns = FILL_SETUP_NS + pixels * FILL_NS_PER_PIXEL;
+    }
+
+    /// Drain `ns` nanoseconds of modeled busy time. The machine calls this each
+    /// CPU cycle, converting machine clocks to nanoseconds.
+    pub fn advance_busy(&mut self, ns: u64) {
+        self.busy_ns = self.busy_ns.saturating_sub(ns);
     }
 }
 
@@ -273,7 +326,7 @@ mod tests {
     fn reports_identity_caps_and_display() {
         let mut margo = Margo::default();
         assert_eq!(read_reg_u32(&margo, REG_ID), MARGO_ID_VALUE);
-        assert_eq!(read_reg_u32(&margo, REG_CAPS), 0);
+        assert_eq!(read_reg_u32(&margo, REG_CAPS), MARGO_CAPS_VALUE);
 
         margo.set_mode_640x480x8();
         assert_eq!(read_reg_u32(&margo, REG_DISP_WIDTH), 640);
@@ -540,5 +593,66 @@ mod tests {
         };
         assert_eq!(fill(&mut vram, &p), 0);
         assert!(vram.iter().all(|&b| b == 0));
+    }
+
+    // Write a 32-bit register through the byte-granular MMIO path.
+    fn write_reg(margo: &mut Margo, offset: usize, value: u32) {
+        for (i, b) in value.to_le_bytes().into_iter().enumerate() {
+            margo.write_mmio_u8(offset + i, b);
+        }
+    }
+
+    fn setup_fill(margo: &mut Margo) {
+        write_reg(margo, REG_DST_BASE, 0);
+        write_reg(margo, REG_DST_PITCH, 8);
+        write_reg(margo, REG_DEPTH, 1);
+        write_reg(margo, REG_DST_XY, (1 << 16) | 1); // y=1, x=1
+        write_reg(margo, REG_DIM, (2 << 16) | 2); // h=2, w=2
+        write_reg(margo, REG_FG_COLOR, 0x0000_00ab);
+        write_reg(margo, REG_ROP, 0xf0);
+    }
+
+    #[test]
+    fn caps_reports_fill_available() {
+        let margo = Margo::default();
+        assert_eq!(read_reg_u32(&margo, REG_CAPS), 0x0000_0001);
+    }
+
+    #[test]
+    fn command_fill_writes_vram_and_sets_busy() {
+        let mut margo = Margo::default();
+        setup_fill(&mut margo);
+        write_reg(&mut margo, REG_COMMAND, 0x01); // FILL
+
+        // VRAM is filled immediately.
+        assert_eq!(margo.read_vram_u8(9), 0xab); // y=1, x=1: pitch*y+x = 8+1
+        assert_eq!(margo.read_vram_u8(18), 0xab); // y=2, x=2: 8*2+2
+        // STATUS.BUSY is set.
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 1);
+    }
+
+    #[test]
+    fn advance_busy_drains_to_idle() {
+        let mut margo = Margo::default();
+        setup_fill(&mut margo);
+        write_reg(&mut margo, REG_COMMAND, 0x01);
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 1);
+
+        // 4 pixels: busy_ns = 100 + 4*5 = 120. Drain more than that.
+        margo.advance_busy(1_000);
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 0);
+    }
+
+    #[test]
+    fn control_reset_clears_busy() {
+        let mut margo = Margo::default();
+        setup_fill(&mut margo);
+        write_reg(&mut margo, REG_COMMAND, 0x01);
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 1);
+
+        write_reg(&mut margo, REG_CONTROL, 0x01); // RESET
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 0);
+        // RESET is self-clearing.
+        assert_eq!(read_reg_u32(&margo, REG_CONTROL) & 1, 0);
     }
 }
