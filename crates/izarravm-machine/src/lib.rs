@@ -2,11 +2,11 @@ use izarravm_audio::{OplChip, Resampler};
 use izarravm_bus::{BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CpuBus, Memory};
 use izarravm_core::{CpuPreset, HardwareProfile, VideoCard};
 use izarravm_cpu::{Cpu386, CpuError, SegmentIndex, SegmentRegister};
+pub use izarravm_video::MARGO_ID_VALUE;
 use izarravm_video::{
-    DAC_ENTRIES, Framebuffer, Margo, MARGO_VRAM_SIZE, MODE13H_MEMORY_SIZE, TextFrame,
+    DAC_ENTRIES, Framebuffer, MARGO_VRAM_SIZE, MODE13H_MEMORY_SIZE, Margo, TextFrame,
     VGA_MODE13H_BASE, VGA_TEXT_BASE, VGA_TEXT_MEMORY_SIZE, VgaTextMode, VideoMode,
 };
-pub use izarravm_video::MARGO_ID_VALUE;
 use thiserror::Error;
 
 mod pic;

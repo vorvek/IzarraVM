@@ -56,6 +56,8 @@ struct Cli {
     headless_test_rom: bool,
     #[arg(long)]
     headless_boot_suite: bool,
+    #[arg(long)]
+    margo_test_pattern: bool,
     #[arg(long, env = "IZARRAVM_DOSROOT")]
     dosroot: Option<PathBuf>,
 }
@@ -129,7 +131,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    let machine = Machine::new(MachineProfile::from_hardware_profile(&hardware), test_rom())?;
+    let mut machine = Machine::new(MachineProfile::from_hardware_profile(&hardware), test_rom())?;
+    if cli.margo_test_pattern {
+        load_margo_test_pattern(&mut machine);
+    }
     run_window(config, video, machine)?;
     Ok(())
 }
@@ -337,9 +342,10 @@ impl WindowApp {
                     &self.machine.palette_argb(),
                 )
             }
-            ActiveDisplay::Mode13h => {
-                render_mode13h(self.machine.mode13h_framebuffer(), &self.machine.palette_argb())
-            }
+            ActiveDisplay::Mode13h => render_mode13h(
+                self.machine.mode13h_framebuffer(),
+                &self.machine.palette_argb(),
+            ),
             ActiveDisplay::Text => render_text_frame(&self.machine.screen_text()),
         }
     }
@@ -467,6 +473,21 @@ fn render_mode13h(framebuffer: &Framebuffer, palette: &[u32; 256]) -> RenderedFr
         width,
         height,
         pixels,
+    }
+}
+
+fn load_margo_test_pattern(machine: &mut Machine) {
+    machine.set_margo_mode_640x480x8();
+    let display = machine.margo().display();
+    let width = display.width as usize;
+    let height = display.height as usize;
+    let pitch = display.pitch as usize;
+    let vram = machine.margo_mut().vram_mut();
+    for y in 0..height {
+        for x in 0..width {
+            // A diagonal gradient across the palette so every entry is exercised.
+            vram[y * pitch + x] = ((x + y) & 0xff) as u8;
+        }
     }
 }
 
@@ -606,6 +627,23 @@ mod tests {
         assert_eq!(rendered.height, 2 * MARGO_LFB_SCALE);
         // Source pixel (1,0) has index 1.
         assert_eq!(rendered.pixels[MARGO_LFB_SCALE], 0x0012_3456);
+    }
+
+    #[test]
+    fn test_pattern_fills_the_lfb_and_selects_margo() {
+        let mut machine = Machine::new(
+            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            test_rom(),
+        )
+        .unwrap();
+
+        load_margo_test_pattern(&mut machine);
+
+        assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
+        let display = machine.margo().display();
+        // Bottom-right visible pixel was written (not left at zero).
+        let last = (display.pitch * (display.height - 1) + (display.width - 1)) as usize;
+        assert_ne!(machine.margo().vram()[last], 0);
     }
 
     #[test]
