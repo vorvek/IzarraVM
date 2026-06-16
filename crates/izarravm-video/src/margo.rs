@@ -845,6 +845,43 @@ mod tests {
     }
 
     #[test]
+    fn copy_color_key_matches_full_pixel_at_depth_2() {
+        // depth 2, key 0x1234. A source pixel equal to the key is skipped; a pixel
+        // sharing only the high byte is copied (proves the compare uses both bytes).
+        let mut vram = vec![0u8; 32];
+        // src (0,0) = 0x1234 (keyed), src (1,0) = 0x1299 (not keyed), pitch 16.
+        vram[0] = 0x34;
+        vram[1] = 0x12;
+        vram[2] = 0x99;
+        vram[3] = 0x12;
+        // Destination row at y=1 pre-filled so a skip is visible.
+        vram[16] = 0xee;
+        vram[17] = 0xee;
+        vram[18] = 0xee;
+        vram[19] = 0xee;
+        let p = CopyParams {
+            dst_base: 0,
+            dst_pitch: 16,
+            src_base: 0,
+            src_pitch: 16,
+            depth: 2,
+            dst_x: 0,
+            dst_y: 1,
+            src_x: 0,
+            src_y: 0,
+            width: 2,
+            height: 1,
+            colorkey: 0x1234,
+            colorkey_en: true,
+        };
+        assert_eq!(copy(&mut vram, &p), 1); // only the non-keyed pixel written
+        // Keyed pixel (0x1234) skipped -> destination (0,1) bytes untouched.
+        assert_eq!(&vram[16..18], &[0xee, 0xee]);
+        // Non-keyed pixel (0x1299) copied -> destination (1,1) bytes = 0x1299.
+        assert_eq!(&vram[18..20], &[0x99, 0x12]);
+    }
+
+    #[test]
     fn copy_skips_out_of_bounds_source_and_destination() {
         // Source partly off the store: src base 14, 4 wide at depth 1 -> offsets
         // 14,15,16,17; 16 and 17 are out, so only two pixels are readable.
