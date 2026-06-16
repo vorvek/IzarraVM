@@ -6,6 +6,7 @@ pub use izarravm_video::MARGO_ID_VALUE;
 use izarravm_video::{
     DAC_ENTRIES, Framebuffer, MARGO_MMIO_SIZE, MARGO_VRAM_SIZE, MODE13H_MEMORY_SIZE, Margo,
     TextFrame, VGA_MODE13H_BASE, VGA_TEXT_BASE, VGA_TEXT_MEMORY_SIZE, VgaTextMode, VideoMode,
+    vbe_mode,
 };
 use thiserror::Error;
 
@@ -292,6 +293,7 @@ impl Machine {
     /// leave `AX` unchanged, so `AL != 0x4F` signals "not supported" to the guest.
     fn handle_vbe(&mut self, function: u8) {
         match function {
+            0x01 => self.vbe_mode_info(),
             0x02 => self.vbe_set_mode(),
             0x03 => self.vbe_current_mode(),
             _ => {}
@@ -323,6 +325,40 @@ impl Machine {
         };
         let ebx = (self.cpu.registers.ebx() & 0xffff_0000) | u32::from(mode);
         self.cpu.registers.set_ebx(ebx);
+        self.set_vbe_status(0x004f);
+    }
+
+    /// Real-mode `ES:DI` of the caller's info block, as a physical address.
+    fn vbe_block_ptr(&self) -> u32 {
+        let es = self.cpu.registers.segment(SegmentIndex::Es).base;
+        let di = self.cpu.registers.edi() as u16;
+        es + u32::from(di)
+    }
+
+    fn write_guest_block(&mut self, addr: u32, bytes: &[u8]) {
+        for (index, &byte) in bytes.iter().enumerate() {
+            self.write_physical_u8(addr + index as u32, byte);
+        }
+    }
+
+    fn vbe_mode_info(&mut self) {
+        let mode = self.cpu.registers.ecx() as u16 & 0x01ff;
+        let Some(info) = vbe_mode(mode) else {
+            self.set_vbe_status(0x014f);
+            return;
+        };
+        let pitch = (info.width * info.bpp / 8) as u16;
+        let mut block = [0u8; 256];
+        block[0x00..0x02].copy_from_slice(&0x009bu16.to_le_bytes()); // ModeAttributes
+        block[0x10..0x12].copy_from_slice(&pitch.to_le_bytes()); // BytesPerScanLine
+        block[0x12..0x14].copy_from_slice(&(info.width as u16).to_le_bytes()); // XResolution
+        block[0x14..0x16].copy_from_slice(&(info.height as u16).to_le_bytes()); // YResolution
+        block[0x18] = 1; // NumberOfPlanes
+        block[0x19] = info.bpp as u8; // BitsPerPixel
+        block[0x1b] = 4; // MemoryModel: packed pixel
+        block[0x28..0x2c].copy_from_slice(&MARGO_LFB_BASE.to_le_bytes()); // PhysBasePtr
+        let addr = self.vbe_block_ptr();
+        self.write_guest_block(addr, &block);
         self.set_vbe_status(0x004f);
     }
 
@@ -949,6 +985,15 @@ mod tests {
         rom
     }
 
+    fn read_u16(machine: &mut Machine, addr: u32) -> u16 {
+        u16::from(machine.read_physical_u8(addr))
+            | (u16::from(machine.read_physical_u8(addr + 1)) << 8)
+    }
+
+    fn read_u32(machine: &mut Machine, addr: u32) -> u32 {
+        u32::from(read_u16(machine, addr)) | (u32::from(read_u16(machine, addr + 2)) << 16)
+    }
+
     #[test]
     fn rejects_non_64k_roms() {
         let err =
@@ -1376,5 +1421,51 @@ mod tests {
             0xc0,
             "timer 1 overflow raises IRQ + timer-1 flag"
         );
+    }
+
+    #[test]
+    fn vbe_mode_info_fills_the_block() {
+        // ES = 0x4000 -> physical 0x40000, DI = 0.
+        let rom = rom_with_code(&[
+            0xb8, 0x00, 0x40, // mov ax, 4000h
+            0x8e, 0xc0, // mov es, ax
+            0xbf, 0x00, 0x00, // mov di, 0
+            0xb8, 0x01, 0x4f, // mov ax, 4F01h
+            0xb9, 0x01, 0x01, // mov cx, 0101h
+            0xcd, 0x10, // int 10h
+            0xf4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(machine.cpu().registers.eax() as u16, 0x004f);
+
+        let base = 0x40000;
+        assert_eq!(read_u16(&mut machine, base + 0x10), 640); // BytesPerScanLine
+        assert_eq!(read_u16(&mut machine, base + 0x12), 640); // XResolution
+        assert_eq!(read_u16(&mut machine, base + 0x14), 480); // YResolution
+        assert_eq!(machine.read_physical_u8(base + 0x19), 8); // BitsPerPixel
+        assert_eq!(read_u32(&mut machine, base + 0x28), MARGO_LFB_BASE); // PhysBasePtr
+    }
+
+    #[test]
+    fn vbe_mode_info_rejects_unknown_modes() {
+        let rom = rom_with_code(&[
+            0xb8, 0x00, 0x40, // mov ax, 4000h
+            0x8e, 0xc0, // mov es, ax
+            0xbf, 0x00, 0x00, // mov di, 0
+            0xb8, 0x01, 0x4f, // mov ax, 4F01h
+            0xb9, 0x11, 0x01, // mov cx, 0111h (not in the table)
+            0xcd, 0x10, // int 10h
+            0xf4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(machine.cpu().registers.eax() as u16, 0x014f);
     }
 }
