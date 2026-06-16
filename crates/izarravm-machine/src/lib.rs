@@ -1738,4 +1738,38 @@ mod tests {
         machine.advance_devices(1);
         assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 0);
     }
+
+    #[test]
+    fn clipped_xor_fill_through_the_mmio_aperture() {
+        let mut machine = test_machine();
+        // Seed x=0..3 at y=0 with 0xFF through the LFB.
+        for x in 0u32..4 {
+            machine.write_physical_u8(MARGO_LFB_BASE + x, 0xff);
+        }
+        // FILL the 4x1 row with FG 0x0F through ROP 0x5A (PATINVERT: D ^ P), but clip
+        // to x in [0, 3): x=0,1,2 are XORed, x=3 is left alone.
+        write_mmio_reg(&mut machine, 0x100, 0); // DST_BASE
+        write_mmio_reg(&mut machine, 0x104, 640); // DST_PITCH
+        write_mmio_reg(&mut machine, 0x110, 1); // DEPTH
+        write_mmio_reg(&mut machine, 0x114, 0); // DST_XY: (0,0)
+        write_mmio_reg(&mut machine, 0x11c, (1 << 16) | 4); // DIM: 4x1
+        write_mmio_reg(&mut machine, 0x120, 0x0f); // FG_COLOR
+        write_mmio_reg(&mut machine, 0x128, 0x5a); // ROP: PATINVERT
+        write_mmio_reg(&mut machine, 0x134, 0); // CLIP_TL: (0,0)
+        write_mmio_reg(&mut machine, 0x138, (1 << 16) | 3); // CLIP_BR: (3,1) exclusive
+        write_mmio_reg(&mut machine, 0x130, 0x2); // FLAGS: CLIP_EN
+        write_mmio_reg(&mut machine, 0x150, 0x01); // COMMAND: FILL
+
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE), 0xf0); // 0xff ^ 0x0f
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 1), 0xf0);
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 2), 0xf0);
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 3), 0xff); // clipped, untouched
+        // 3 pixels written -> busy_ns = 100 + 3*5 = 115 ns. At 40 ns/clock, two clocks
+        // (80 ns) leave it busy; the third clears it.
+        assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
+        machine.advance_devices(2);
+        assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
+        machine.advance_devices(1);
+        assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 0);
+    }
 }

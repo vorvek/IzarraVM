@@ -231,7 +231,7 @@ every operation is confined to that rectangle. A window manager sets the clip to
 a window's visible area, then draws freely without checking edges itself.
 
 ```c
-/* (target) */
+/* (verified) */
 void set_clip(int x0, int y0, int x1, int y1) {
     REG(0x0134) = (y0 << 16) | x0;      /* CLIP_TL, inclusive */
     REG(0x0138) = (y1 << 16) | x1;      /* CLIP_BR, exclusive */
