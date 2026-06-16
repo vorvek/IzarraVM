@@ -390,7 +390,7 @@ impl Machine {
         };
         let pitch = (info.width * info.bpp / 8) as u16;
         let mut block = [0u8; 256];
-        block[0x00..0x02].copy_from_slice(&0x009bu16.to_le_bytes()); // ModeAttributes
+        block[0x00..0x02].copy_from_slice(&0x009bu16.to_le_bytes()); // ModeAttributes: supported, color, graphics, linear-fb
         block[0x10..0x12].copy_from_slice(&pitch.to_le_bytes()); // BytesPerScanLine
         block[0x12..0x14].copy_from_slice(&(info.width as u16).to_le_bytes()); // XResolution
         block[0x14..0x16].copy_from_slice(&(info.height as u16).to_le_bytes()); // YResolution
@@ -698,6 +698,8 @@ impl CpuBus for MachineBus<'_> {
             BusWidth::Byte,
             self.wait_states.io,
         ));
+        // Vector 0x10 reaches here only from a software INT today: the CPU never
+        // faults with vector 0x10. Revisit if an x87 #MF (vector 0x10) is added.
         if vector == 0x10 {
             *self.int10_pending = true;
         }
