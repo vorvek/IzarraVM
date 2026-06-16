@@ -395,15 +395,24 @@ impl Machine {
         };
         let action =
             izarravm_dos::dispatch(vector, &mut regs, &mut self.memory, &mut self.dos_stdout)?;
-        // Marshal AX and CF back. Only these change in slice 1, but writing the pair
-        // keeps later slices that return BX/CX/DX from reworking this. CF is bit 0
-        // of eflags; the literal 0x1 is used because the CPU's FLAG_CF is private.
-        let eax = (self.cpu.registers.eax() & 0xffff_0000) | u32::from(regs.ax);
-        self.cpu.registers.set_eax(eax);
+        // Marshal the result back. Every general-purpose register and CF is written
+        // unconditionally so a later slice that returns a value in any of them (for
+        // example AH=3Fh returns the byte count in CX) needs no change here. Only the
+        // low 16 bits are touched, preserving each e-register's high half. DS and ES
+        // are inputs to INT 21h; the rare functions that return a segment (AH=2Fh in
+        // ES) add their own write-back when implemented. CF is bit 0 of eflags; the
+        // literal 0x1 is used because the CPU's FLAG_CF is private to the cpu crate.
+        let r = &mut self.cpu.registers;
+        r.set_eax((r.eax() & 0xffff_0000) | u32::from(regs.ax));
+        r.set_ebx((r.ebx() & 0xffff_0000) | u32::from(regs.bx));
+        r.set_ecx((r.ecx() & 0xffff_0000) | u32::from(regs.cx));
+        r.set_edx((r.edx() & 0xffff_0000) | u32::from(regs.dx));
+        r.set_esi((r.esi() & 0xffff_0000) | u32::from(regs.si));
+        r.set_edi((r.edi() & 0xffff_0000) | u32::from(regs.di));
         if regs.cf {
-            self.cpu.registers.eflags |= 0x1;
+            r.eflags |= 0x1;
         } else {
-            self.cpu.registers.eflags &= !0x1;
+            r.eflags &= !0x1;
         }
         Ok(match action {
             izarravm_dos::DosAction::Continue => None,
