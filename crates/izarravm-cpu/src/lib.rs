@@ -257,6 +257,11 @@ pub struct Cpu386 {
     pub idtr: DescriptorTable,
     pub elapsed_clocks: u64,
     pub halted: bool,
+    // STI and IRET set this to block interrupt delivery for one instruction.
+    // The 386 holds off maskable interrupts until the instruction after STI;
+    // we apply the same rule after IRET so a handler can return to a CLI
+    // that runs before the next interrupt is taken.
+    interrupt_shadow: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -402,8 +407,14 @@ impl Cpu386 {
             }
         }
 
+        // Consume the one-instruction shadow set by STI or IRET. While the shadow
+        // is active the interrupt check below is skipped so the instruction that
+        // follows STI/IRET always executes before an interrupt can be taken.
+        let shadowed = self.interrupt_shadow;
+        self.interrupt_shadow = false;
+
         // Service a pending hardware interrupt before fetching the next instruction.
-        if self.flag(FLAG_IF) && bus.interrupt_pending() {
+        if !shadowed && self.flag(FLAG_IF) && bus.interrupt_pending() {
             if let Some(vector) = bus.acknowledge_interrupt() {
                 self.hardware_interrupt(bus, vector)
                     .map_err(|fault| match fault {
@@ -937,8 +948,11 @@ impl Cpu386 {
                     }
                     .into());
                 }
+                // Displacement bytes (if any) come before the immediate in the encoding,
+                // so decode the operand first, then fetch the immediate.
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
                 let value = self.fetch_u8(bus)?;
-                self.write_rm_u8(bus, prefixes, address_size, modrm, value)?;
+                self.write_operand_u8(bus, operand, value)?;
                 Ok(clocks(2))
             }
             0xc7 => {
@@ -950,8 +964,11 @@ impl Cpu386 {
                     }
                     .into());
                 }
+                // Displacement bytes (if any) come before the immediate in the encoding,
+                // so decode the operand first, then fetch the immediate.
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
                 let value = self.fetch_immediate(bus, operand_size)?;
-                self.write_rm_sized(bus, prefixes, address_size, operand_size, modrm, value)?;
+                self.write_operand_sized(bus, operand, operand_size, value)?;
                 Ok(clocks(2))
             }
             0xc9 => {
@@ -975,7 +992,13 @@ impl Cpu386 {
                 Ok(clocks(37))
             }
             0xcf => {
+                let if_before = self.flag(FLAG_IF);
                 self.iret(bus, operand_size)?;
+                // If IRET restored IF from cleared to set, arm the shadow so the
+                // instruction the handler returns to runs before the next interrupt.
+                if !if_before && self.flag(FLAG_IF) {
+                    self.interrupt_shadow = true;
+                }
                 Ok(clocks(22))
             }
             0xe0 | 0xe1 => {
@@ -1183,9 +1206,10 @@ impl Cpu386 {
                 Ok(clocks(3))
             }
             0xfb => {
-                // STI sets IF. The one-instruction interrupt shadow is irrelevant until
-                // interrupt delivery exists.
+                // STI sets IF and arms the one-instruction shadow so the instruction
+                // immediately after STI always executes before any interrupt is taken.
                 self.set_flag(FLAG_IF, true);
+                self.interrupt_shadow = true;
                 Ok(clocks(3))
             }
             0xfc => {
@@ -2983,6 +3007,11 @@ impl Cpu386 {
                 Ok(())
             }
         }
+    }
+
+    /// True when the interrupt flag is set, so a maskable interrupt can be taken.
+    pub fn interrupts_enabled(&self) -> bool {
+        self.flag(FLAG_IF)
     }
 
     fn flag(&self, flag: u32) -> bool {

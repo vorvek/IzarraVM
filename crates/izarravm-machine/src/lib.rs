@@ -286,6 +286,23 @@ impl Machine {
         self.pit.clocks_until_channel0_irq()
     }
 
+    /// CPU clocks to advance while halted so the next channel-0 IRQ0 lands, or None
+    /// if nothing can wake the CPU (so HLT is a genuine halt). Clamped to the
+    /// deadline and to at least one clock, so the run loop always makes progress.
+    fn next_timer_wake(&self, deadline: u64) -> Option<u64> {
+        if !self.cpu.interrupts_enabled() || !self.pic.irq0_unmasked() {
+            return None;
+        }
+        let pit_delta = self.clocks_until_timer0_irq()?;
+        let cpu_delta = (u128::from(pit_delta) * u128::from(self.profile.clock_hz))
+            .div_ceil(u128::from(PIT_INPUT_HZ)) as u64;
+        let remaining = deadline.saturating_sub(self.elapsed_clocks);
+        if remaining == 0 {
+            return None;
+        }
+        Some(cpu_delta.max(1).min(remaining))
+    }
+
     pub fn run_cycles(&mut self, cycles: u64) -> Result<StopReason, MachineError> {
         let deadline = self.elapsed_clocks.saturating_add(cycles);
         self.run_until_clock(deadline, cycles)
@@ -346,7 +363,13 @@ impl Machine {
                     // by `render_audio`).
                     self.advance_devices(step);
                     if outcome.halted {
-                        return Ok(StopReason::Halted);
+                        match self.next_timer_wake(deadline) {
+                            Some(step) => {
+                                self.elapsed_clocks += step;
+                                self.advance_devices(step);
+                            }
+                            None => return Ok(StopReason::Halted),
+                        }
                     }
                 }
                 Err(error) => return Ok(StopReason::CpuError(error.to_string())),
@@ -1018,6 +1041,58 @@ mod tests {
         write(0xc0, 0x01); // additive
         write(0xa0, 0x00); // f-number low
         write(0xb0, 0x20 | (4 << 2) | 0x02); // key-on, block 4, fnum 0x200
+    }
+
+    fn boot_image_with(code: &[u8]) -> Vec<u8> {
+        let mut image = vec![0; BOOT_IMAGE_SIZE];
+        image[..code.len()].copy_from_slice(code);
+        image[510] = 0x55;
+        image[511] = 0xaa;
+        image
+    }
+
+    #[test]
+    fn hlt_wakes_on_pit_timer_tick() {
+        // Boot code: init the PIC, unmask IRQ0, program channel 0 (mode 3, count 4),
+        // install IVT[8] -> a handler that bumps [0x0500] and EOIs, sti, hlt, then
+        // cli, hlt. The run loop must fast-forward to the IRQ0 edge and wake the CPU.
+        let code: &[u8] = &[
+            0xb0, 0x11, 0xe6, 0x20, 0xb0, 0x08, 0xe6, 0x21, 0xb0, 0x04, 0xe6, 0x21, 0xb0, 0x01,
+            0xe6, 0x21, 0xb0, 0xfe, 0xe6, 0x21, 0xb0, 0x36, 0xe6, 0x43, 0xb0, 0x04, 0xe6, 0x40,
+            0xb0, 0x00, 0xe6, 0x40, 0xc7, 0x06, 0x20, 0x00, 0x30, 0x7c, 0xc7, 0x06, 0x22, 0x00,
+            0x00, 0x00, 0xfb, 0xf4, 0xfa, 0xf4, 0xff, 0x06, 0x00, 0x05, 0xb0, 0x20, 0xe6, 0x20,
+            0xcf,
+        ];
+        let mut machine = Machine::new_boot_image(
+            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            boot_image_with(code),
+        )
+        .unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+
+        assert_eq!(reason, StopReason::Halted);
+        let tick = u16::from_le_bytes([
+            machine.memory().as_slice()[0x0500],
+            machine.memory().as_slice()[0x0501],
+        ]);
+        assert_eq!(tick, 1, "the IRQ0 handler should have run once");
+        assert!(
+            machine.elapsed_clocks() > 50,
+            "the fast-forward should have advanced emulated time to the tick"
+        );
+    }
+
+    #[test]
+    fn cli_hlt_is_a_genuine_halt() {
+        // With interrupts off, HLT must still halt immediately, not spin.
+        let mut machine = Machine::new(
+            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            rom_with_code(&[0xfa, 0xf4]), // cli; hlt
+        )
+        .unwrap();
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
     }
 
     #[test]

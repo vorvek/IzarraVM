@@ -171,6 +171,11 @@ impl Pic8259Pair {
         }
     }
 
+    /// True when IRQ0 (master IR0) is not masked in the master IMR.
+    pub(crate) fn irq0_unmasked(&self) -> bool {
+        self.master.imr & 0x01 == 0
+    }
+
     pub(crate) fn request(&mut self, irq: u8) {
         debug_assert!(irq < 16, "the PIC pair has 16 IRQ lines, got {irq}");
         if irq < 8 {
