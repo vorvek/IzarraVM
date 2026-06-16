@@ -5,7 +5,7 @@ use izarravm_core::{
     AppConfig, ConfigOverrides, CpuPreset, HardwareProfile, MidiBackend, VideoCard,
 };
 use izarravm_dos::{DosKernelServices, HostDrive};
-use izarravm_firmware::{boot_test_image, parse_result_block, test_rom};
+use izarravm_firmware::{SuiteRecordStatus, boot_test_image, parse_result_block, test_rom};
 use izarravm_input::InputState;
 use izarravm_machine::{Machine, MachineProfile, StopReason};
 use izarravm_video::{PlaceholderVideoAdapter, TextFrame, VideoAdapter};
@@ -102,8 +102,21 @@ fn main() -> Result<(), Box<dyn Error>> {
             boot_test_image(),
         )?;
         let stop_reason = machine.run_until_halt_or_cycles(5_000_000)?;
+        // Report the result block, which holds the runtime outcome (the timer test
+        // patches its record here). The serial dump is an earlier static snapshot.
         let results = parse_result_block(machine.memory().as_slice())?;
-        println!("{}", machine.serial_text());
+        for record in &results.records {
+            let status = match record.status {
+                SuiteRecordStatus::Begin => "BEGIN",
+                SuiteRecordStatus::Pass => "PASS",
+                SuiteRecordStatus::Fail => "FAIL",
+                SuiteRecordStatus::Measure => "MEASURE",
+            };
+            match &record.value {
+                Some(value) => println!("{status} {} {value}", record.name),
+                None => println!("{status} {}", record.name),
+            }
+        }
         println!("records: {}", results.records.len());
         println!("stop: {stop_reason:?}");
         return Ok(());
