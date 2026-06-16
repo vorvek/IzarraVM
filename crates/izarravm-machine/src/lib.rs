@@ -1596,8 +1596,11 @@ mod tests {
         // BUSY is set right after the command.
         assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
 
-        // Advance past the modeled time (20 pixels -> 200 ns); BUSY clears.
-        machine.advance_devices(machine.profile().clock_hz / 1_000);
+        // 20 pixels -> busy_ns = 100 + 20*5 = 200 ns = 5 clocks at 25 MHz.
+        // Four clocks (160 ns) leave it busy; the fifth clears it.
+        machine.advance_devices(4);
+        assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
+        machine.advance_devices(1);
         assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 0);
     }
 }

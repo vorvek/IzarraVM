@@ -1,5 +1,5 @@
-//! Margo, the VEGA 2D engine. This slice covers the display register block and
-//! the linear frame buffer; the blit engine arrives in later slices.
+//! Margo, the VEGA 2D engine: the display register block, the linear frame
+//! buffer, and the blit engine. The engine currently implements FILL.
 
 pub const MARGO_VRAM_SIZE: usize = 4 * 1024 * 1024;
 pub const MARGO_MMIO_SIZE: usize = 0x0001_0000; // 64 KB register block
@@ -285,6 +285,7 @@ impl Margo {
         if (self.command & 0xff) == 0x01 {
             self.run_fill();
         }
+        self.command = 0;
     }
 
     fn run_fill(&mut self) {
@@ -638,8 +639,20 @@ mod tests {
         write_reg(&mut margo, REG_COMMAND, 0x01);
         assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 1);
 
-        // 4 pixels: busy_ns = 100 + 4*5 = 120. Drain more than that.
-        margo.advance_busy(1_000);
+        // 4 pixels: busy_ns = 100 + 4*5 = 120. One ns short still reads busy.
+        margo.advance_busy(119);
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 1);
+        margo.advance_busy(1);
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 0);
+    }
+
+    #[test]
+    fn unknown_command_is_a_no_op() {
+        let mut margo = Margo::default();
+        setup_fill(&mut margo);
+        write_reg(&mut margo, REG_COMMAND, 0x02); // COPY: not implemented this slice
+        // No VRAM change and no busy time: offset 9 is the first pixel FILL would write.
+        assert_eq!(margo.read_vram_u8(9), 0x00);
         assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 0);
     }
 
