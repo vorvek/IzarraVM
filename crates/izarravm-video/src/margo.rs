@@ -170,8 +170,8 @@ struct CopyParams {
 /// the frame store is skipped, not wrapped (section 8). `depth` outside {1, 2, 4}
 /// is a no-op. The loop is bounded to `vram.len()` considered pixels, and the
 /// offset math is u64-saturating, so a pathological or adversarial rectangle
-/// cannot spin or overflow. Traversal is forward; overlap-safe ordering is added
-/// next.
+/// cannot spin or overflow. Traversal direction is chosen from the coordinates so
+/// overlapping copies stay correct (section 7.4).
 fn copy(vram: &mut [u8], p: &CopyParams) -> u64 {
     if !matches!(p.depth, 1 | 2 | 4) {
         return 0;
@@ -181,8 +181,12 @@ fn copy(vram: &mut [u8], p: &CopyParams) -> u64 {
     let key = p.colorkey.to_le_bytes();
     let mut considered: u64 = 0;
     let mut written: u64 = 0;
-    'rows: for row in 0..p.height {
-        for col in 0..p.width {
+    let row_rev = p.dst_y > p.src_y; // dest below source: copy bottom-to-top
+    let col_rev = p.dst_x > p.src_x; // dest right of source: copy right-to-left
+    'rows: for r in 0..p.height {
+        let row = if row_rev { p.height - 1 - r } else { r };
+        for c in 0..p.width {
+            let col = if col_rev { p.width - 1 - c } else { c };
             if considered >= len {
                 break 'rows;
             }
@@ -1000,5 +1004,99 @@ mod tests {
         };
         assert_eq!(copy(&mut vram, &p), 0); // must not panic; nothing written
         assert!(vram.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn copy_overlap_down_does_not_corrupt() {
+        // pitch 4. Rows 0,1,2 hold distinct bytes. Copy the 4x2 rect at (0,0) down
+        // one row to (0,1): row 1 must become row 0's old bytes, row 2 row 1's.
+        let mut vram = vec![0u8; 32];
+        for i in 0..4 {
+            vram[i] = 1; // row 0
+            vram[4 + i] = 2; // row 1
+            vram[8 + i] = 3; // row 2
+        }
+        let p = CopyParams {
+            dst_base: 0,
+            dst_pitch: 4,
+            src_base: 0,
+            src_pitch: 4,
+            depth: 1,
+            dst_x: 0,
+            dst_y: 1,
+            src_x: 0,
+            src_y: 0,
+            width: 4,
+            height: 2,
+            colorkey: 0,
+            colorkey_en: false,
+        };
+        copy(&mut vram, &p);
+        assert_eq!(&vram[4..8], &[1, 1, 1, 1]); // row 1 = old row 0
+        assert_eq!(&vram[8..12], &[2, 2, 2, 2]); // row 2 = old row 1, not corrupted
+        assert_eq!(&vram[0..4], &[1, 1, 1, 1]); // row 0 untouched
+    }
+
+    #[test]
+    fn copy_overlap_right_does_not_corrupt() {
+        // One row [1,2,3,4,5,6,7,8]. Copy the 4-wide rect at x=0 to x=1.
+        let mut vram = vec![0u8; 8];
+        for i in 0..8 {
+            vram[i] = (i + 1) as u8;
+        }
+        let p = CopyParams {
+            dst_base: 0,
+            dst_pitch: 8,
+            src_base: 0,
+            src_pitch: 8,
+            depth: 1,
+            dst_x: 1,
+            dst_y: 0,
+            src_x: 0,
+            src_y: 0,
+            width: 4,
+            height: 1,
+            colorkey: 0,
+            colorkey_en: false,
+        };
+        copy(&mut vram, &p);
+        // Destination x=1..4 takes source x=0..3 = [1,2,3,4]; x=0 and x>=5 untouched.
+        assert_eq!(&vram[0..8], &[1, 1, 2, 3, 4, 6, 7, 8]);
+    }
+
+    #[test]
+    fn copy_overlap_diagonal_does_not_corrupt() {
+        // pitch 4. Copy the 3x2 rect at (0,0) to (1,1): both axes shift positive,
+        // so both must traverse in reverse.
+        let mut vram = vec![0u8; 16];
+        // Row 0: [1,2,3,_], row 1: [4,5,6,_].
+        vram[0] = 1;
+        vram[1] = 2;
+        vram[2] = 3;
+        vram[4] = 4;
+        vram[5] = 5;
+        vram[6] = 6;
+        let p = CopyParams {
+            dst_base: 0,
+            dst_pitch: 4,
+            src_base: 0,
+            src_pitch: 4,
+            depth: 1,
+            dst_x: 1,
+            dst_y: 1,
+            src_x: 0,
+            src_y: 0,
+            width: 3,
+            height: 2,
+            colorkey: 0,
+            colorkey_en: false,
+        };
+        copy(&mut vram, &p);
+        // dst row 1 (offset 4) cols 1..4 = src row 0 [1,2,3]; dst row 2 (offset 8)
+        // cols 1..4 = src row 1 [4,5,6].
+        assert_eq!(&vram[5..8], &[1, 2, 3]);
+        assert_eq!(&vram[9..12], &[4, 5, 6]);
+        // Source row 0 is unchanged where the destination did not overwrite it.
+        assert_eq!(vram[0], 1);
     }
 }
