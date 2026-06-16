@@ -169,6 +169,48 @@ fn dispatch_int21(
     }
 }
 
+/// The largest .COM image: a 64 KiB segment minus the 256-byte PSP.
+const COM_MAX_LEN: usize = 0x10000 - 0x100;
+
+/// Where to start executing a loaded .COM. All four segment registers point at the
+/// load segment; the entry is at offset 0x100, the stack at 0xFFFE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProgramEntry {
+    pub segment: u16, // CS = DS = ES = SS
+    pub ip: u16,      // 0x0100
+    pub sp: u16,      // 0xFFFE
+}
+
+/// Load a .COM image into `mem` at `segment` and build its PSP. Returns the entry
+/// state for the caller to apply to the CPU.
+pub fn load_com(image: &[u8], mem: &mut Memory, segment: u16) -> Result<ProgramEntry, DosError> {
+    if image.len() > COM_MAX_LEN {
+        return Err(DosError::ComTooLarge(image.len()));
+    }
+    let base = usize::from(segment) * 16;
+    // Minimal PSP. INT 20h (CD 20) at offset 0 so a near RET to PSP:0 terminates.
+    mem.write_u8(base, 0xcd)?;
+    mem.write_u8(base + 1, 0x20)?;
+    // Offset 0x02: segment of the first byte past the program's 64 KiB block.
+    mem.write_u16(base + 2, segment.wrapping_add(0x1000))?;
+    // Offset 0x80: command tail. Empty here: length 0, then a CR. The environment
+    // segment, parent PSP, default FCBs, and DTA are left zero (later slices).
+    mem.write_u8(base + 0x80, 0x00)?;
+    mem.write_u8(base + 0x81, 0x0d)?;
+    // Program image at offset 0x100.
+    for (index, &byte) in image.iter().enumerate() {
+        mem.write_u8(base + 0x100 + index, byte)?;
+    }
+    // .COM stack: SP=0xFFFE with a 0x0000 return word, so a bare RET lands at
+    // PSP:0 and hits the INT 20h.
+    mem.write_u16(base + 0xfffe, 0x0000)?;
+    Ok(ProgramEntry {
+        segment,
+        ip: 0x0100,
+        sp: 0xfffe,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,5 +343,38 @@ mod tests {
         let action = dispatch(0x21, &mut regs, &mut mem, &mut out).unwrap();
         assert_eq!(action, DosAction::Continue);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn load_com_builds_psp_and_entry() {
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let image = [0xb8, 0x00, 0x4c, 0xcd, 0x21]; // mov ax,4c00; int 21
+        let entry = load_com(&image, &mut mem, 0x0100).unwrap();
+        assert_eq!(
+            entry,
+            ProgramEntry {
+                segment: 0x0100,
+                ip: 0x0100,
+                sp: 0xfffe
+            }
+        );
+        let base = 0x0100usize * 16;
+        assert_eq!(mem.read_u8(base).unwrap(), 0xcd); // INT 20h opcode at PSP:0
+        assert_eq!(mem.read_u8(base + 1).unwrap(), 0x20);
+        assert_eq!(mem.read_u8(base + 0x80).unwrap(), 0x00); // empty command tail length
+        assert_eq!(mem.read_u8(base + 0x81).unwrap(), 0x0d);
+        assert_eq!(mem.read_u8(base + 0x100).unwrap(), 0xb8); // image lands at 0x100
+        assert_eq!(mem.read_u8(base + 0x104).unwrap(), 0x21);
+        assert_eq!(mem.read_u16(base + 0xfffe).unwrap(), 0x0000); // .COM return word
+    }
+
+    #[test]
+    fn load_com_rejects_oversize_image() {
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let image = vec![0x90; 0x10000 - 0x100 + 1]; // one byte over the .COM limit
+        assert!(matches!(
+            load_com(&image, &mut mem, 0x0100),
+            Err(DosError::ComTooLarge(_))
+        ));
     }
 }
