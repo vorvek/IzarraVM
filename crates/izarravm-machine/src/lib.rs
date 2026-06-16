@@ -4,8 +4,8 @@ use izarravm_core::{CpuPreset, HardwareProfile, VideoCard};
 use izarravm_cpu::{Cpu386, CpuError, SegmentIndex, SegmentRegister};
 pub use izarravm_video::MARGO_ID_VALUE;
 use izarravm_video::{
-    DAC_ENTRIES, Framebuffer, MARGO_VRAM_SIZE, MODE13H_MEMORY_SIZE, Margo, TextFrame,
-    VGA_MODE13H_BASE, VGA_TEXT_BASE, VGA_TEXT_MEMORY_SIZE, VgaTextMode, VideoMode,
+    DAC_ENTRIES, Framebuffer, MARGO_MMIO_SIZE, MARGO_VRAM_SIZE, MODE13H_MEMORY_SIZE, Margo,
+    TextFrame, VGA_MODE13H_BASE, VGA_TEXT_BASE, VGA_TEXT_MEMORY_SIZE, VgaTextMode, VideoMode,
 };
 use thiserror::Error;
 
@@ -14,7 +14,6 @@ mod pic;
 pub const HIGH_ROM_BASE: u32 = 0xffff_0000;
 pub const MARGO_LFB_BASE: u32 = 0xE000_0000;
 pub const MARGO_MMIO_BASE: u32 = 0xE040_0000;
-pub const MARGO_MMIO_SIZE: usize = 0x0001_0000; // 64 KB
 pub const LOW_BIOS_BASE: u32 = 0x000f_0000;
 pub const BIOS_ROM_SIZE: usize = 64 * 1024;
 pub const BOOT_IMAGE_SIZE: usize = 1440 * 1024;
@@ -235,53 +234,26 @@ impl Machine {
         self.video.mode13h_framebuffer()
     }
 
+    fn make_bus(&mut self) -> MachineBus<'_> {
+        MachineBus {
+            memory: &mut self.memory,
+            video: &mut self.video,
+            margo: &mut self.margo,
+            rom: &self.rom,
+            serial: &mut self.serial,
+            device_ports: &mut self.device_ports,
+            trace: &mut self.trace,
+            wait_states: self.profile.wait_states,
+        }
+    }
+
     pub fn read_physical_u8(&mut self, address: u32) -> u8 {
-        let Machine {
-            profile,
-            memory,
-            video,
-            margo,
-            rom,
-            serial,
-            device_ports,
-            trace,
-            ..
-        } = self;
-        let bus = MachineBus {
-            memory,
-            video,
-            margo,
-            rom,
-            serial,
-            device_ports,
-            trace,
-            wait_states: profile.wait_states,
-        };
+        let bus = self.make_bus();
         bus.read_memory_bytes(address, 1).map(|b| b[0]).unwrap_or(0)
     }
 
     pub fn write_physical_u8(&mut self, address: u32, value: u8) {
-        let Machine {
-            profile,
-            memory,
-            video,
-            margo,
-            rom,
-            serial,
-            device_ports,
-            trace,
-            ..
-        } = self;
-        let mut bus = MachineBus {
-            memory,
-            video,
-            margo,
-            rom,
-            serial,
-            device_ports,
-            trace,
-            wait_states: profile.wait_states,
-        };
+        let mut bus = self.make_bus();
         let _ = bus.write_memory_byte(address, value);
     }
 

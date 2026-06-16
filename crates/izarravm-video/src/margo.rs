@@ -2,6 +2,7 @@
 //! the linear frame buffer; the blit engine arrives in later slices.
 
 pub const MARGO_VRAM_SIZE: usize = 4 * 1024 * 1024;
+pub const MARGO_MMIO_SIZE: usize = 0x0001_0000; // 64 KB register block
 pub const MARGO_ID_VALUE: u32 = 0x4D47_0100; // 'M' 'G', version 1.00
 pub const MARGO_CAPS_VALUE: u32 = 0x0000_0000; // no engine ops in this slice
 
