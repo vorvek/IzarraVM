@@ -72,6 +72,7 @@ pub const REG_DST_XY: usize = 0x0114;
 pub const REG_SRC_XY: usize = 0x0118;
 pub const REG_DIM: usize = 0x011c;
 pub const REG_FG_COLOR: usize = 0x0120;
+pub const REG_BG_COLOR: usize = 0x0124;
 pub const REG_ROP: usize = 0x0128;
 pub const REG_COLORKEY: usize = 0x012c;
 pub const REG_FLAGS: usize = 0x0130;
@@ -81,6 +82,7 @@ const BLIT_BASE: usize = 0x0100;
 const BLIT_REGS: usize = 20; // 0x100..0x150, twenty 32-bit slots; COMMAND at 0x150 is handled separately
 const FILL_NS_PER_PIXEL: u64 = 5; // 200 Mpixels/s solid fill (section 1.1)
 const COPY_NS_PER_PIXEL: u64 = 10; // 100 Mpixels/s screen-to-screen blit (section 1.1)
+const EXPAND_NS_PER_PIXEL: u64 = 5; // 200 Mpixels/s color expand (section 1.1, fill class)
 const BLIT_SETUP_NS: u64 = 100; // fixed per-operation setup, shared by all blits
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -209,6 +211,92 @@ fn copy(vram: &mut [u8], p: &CopyParams) -> u64 {
             }
             written += 1;
             vram.copy_within(src_off..src_off + depth, dst_off);
+        }
+    }
+    written
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExpandParams {
+    dst_base: u32,
+    dst_pitch: u32,
+    depth: u32, // bytes per pixel: 1, 2, or 4
+    dst_x: u32,
+    dst_y: u32,
+    width: u32,
+    height: u32,
+    fg_color: u32,
+    bg_color: u32,
+    transparent: bool, // EXPAND_TRANSPARENT: clear bits are skipped
+}
+
+/// Write one expanded destination pixel. `set` chooses FG vs BG; a clear bit
+/// under EXPAND_TRANSPARENT is skipped. A pixel whose byte range falls outside
+/// the frame store is skipped, not wrapped (section 8). Returns true if a pixel
+/// was written.
+fn put_expand_pixel(vram: &mut [u8], p: &ExpandParams, x: u64, y: u64, set: bool) -> bool {
+    if !set && p.transparent {
+        return false;
+    }
+    let depth = p.depth as usize;
+    let color = if set { p.fg_color } else { p.bg_color };
+    let bytes = color.to_le_bytes();
+    let off = (p.dst_base as u64)
+        .saturating_add(y.saturating_mul(p.dst_pitch as u64))
+        .saturating_add(x.saturating_mul(depth as u64));
+    if off.saturating_add(depth as u64) > vram.len() as u64 {
+        return false;
+    }
+    let off = off as usize;
+    vram[off..off + depth].copy_from_slice(&bytes[..depth]);
+    true
+}
+
+struct ExpandMemParams {
+    common: ExpandParams,
+    src_base: u32,
+    src_pitch: u32,
+    src_x: u32,
+    src_y: u32,
+}
+
+/// Expand a 1-bpp source rectangle read from `vram` into a two-color destination
+/// rectangle, also in `vram`. The source is most-significant-bit first within
+/// each byte. A source byte or destination pixel outside the frame store is
+/// skipped, not wrapped (section 8). `depth` outside {1, 2, 4} is a no-op. The
+/// loop is bounded to `vram.len()` considered pixels and the offset math is
+/// u64-saturating, so an adversarial rectangle cannot spin or overflow. Returns
+/// the number of pixels written.
+fn color_expand_mem(vram: &mut [u8], p: &ExpandMemParams) -> u64 {
+    if !matches!(p.common.depth, 1 | 2 | 4) {
+        return 0;
+    }
+    let len = vram.len() as u64;
+    let mut considered: u64 = 0;
+    let mut written: u64 = 0;
+    'rows: for row in 0..p.common.height {
+        for col in 0..p.common.width {
+            if considered >= len {
+                break 'rows;
+            }
+            considered += 1;
+            let bit = p.src_x as u64 + col as u64;
+            let src_off = (p.src_base as u64)
+                .saturating_add((p.src_y as u64 + row as u64).saturating_mul(p.src_pitch as u64))
+                .saturating_add(bit / 8);
+            if src_off >= len {
+                continue;
+            }
+            let set = vram[src_off as usize] & (0x80u8 >> ((bit % 8) as u32)) != 0;
+            if put_expand_pixel(
+                vram,
+                &p.common,
+                p.common.dst_x as u64 + col as u64,
+                p.common.dst_y as u64 + row as u64,
+                set,
+            ) {
+                written += 1;
+            }
         }
     }
     written
@@ -356,6 +444,7 @@ impl Margo {
         match self.command & 0xff {
             0x01 => self.run_fill(),
             0x02 => self.run_copy(),
+            0x04 => self.run_expand_mem(),
             _ => {}
         }
         self.command = 0;
@@ -400,6 +489,32 @@ impl Margo {
         };
         let pixels = copy(&mut self.vram, &params);
         self.busy_ns = BLIT_SETUP_NS + pixels * COPY_NS_PER_PIXEL;
+    }
+
+    fn run_expand_mem(&mut self) {
+        let dst_xy = self.blit_reg(REG_DST_XY);
+        let src_xy = self.blit_reg(REG_SRC_XY);
+        let dim = self.blit_reg(REG_DIM);
+        let params = ExpandMemParams {
+            common: ExpandParams {
+                dst_base: self.blit_reg(REG_DST_BASE),
+                dst_pitch: self.blit_reg(REG_DST_PITCH),
+                depth: self.blit_reg(REG_DEPTH),
+                dst_x: dst_xy & 0xffff,
+                dst_y: dst_xy >> 16,
+                width: dim & 0xffff,
+                height: dim >> 16,
+                fg_color: self.blit_reg(REG_FG_COLOR),
+                bg_color: self.blit_reg(REG_BG_COLOR),
+                transparent: self.blit_reg(REG_FLAGS) & 0x4 != 0,
+            },
+            src_base: self.blit_reg(REG_SRC_BASE),
+            src_pitch: self.blit_reg(REG_SRC_PITCH),
+            src_x: src_xy & 0xffff,
+            src_y: src_xy >> 16,
+        };
+        let pixels = color_expand_mem(&mut self.vram, &params);
+        self.busy_ns = BLIT_SETUP_NS + pixels * EXPAND_NS_PER_PIXEL;
     }
 
     /// Drain `ns` nanoseconds of modeled busy time. The machine calls this each
@@ -1164,6 +1279,328 @@ mod tests {
         assert_eq!(&vram[9..12], &[4, 5, 6]);
         // Source row 0 is unchanged where the destination did not overwrite it.
         assert_eq!(vram[0], 1);
+    }
+
+    #[test]
+    fn color_expand_mem_expands_to_fg_and_bg_depth_1() {
+        // Source byte 0xA0 = 1010_0000: cols 0 and 2 set, cols 1 and 3 clear
+        // (MSB first). Expand a 4x1 rect; set bits take FG 0xAB, clear bits BG 0xCD.
+        let mut vram = vec![0u8; 64];
+        vram[0] = 0xa0; // monochrome source row, src_base 0
+        let p = ExpandMemParams {
+            common: ExpandParams {
+                dst_base: 16,
+                dst_pitch: 8,
+                depth: 1,
+                dst_x: 0,
+                dst_y: 0,
+                width: 4,
+                height: 1,
+                fg_color: 0xab,
+                bg_color: 0xcd,
+                transparent: false,
+            },
+            src_base: 0,
+            src_pitch: 1,
+            src_x: 0,
+            src_y: 0,
+        };
+        assert_eq!(color_expand_mem(&mut vram, &p), 4);
+        assert_eq!(&vram[16..20], &[0xab, 0xcd, 0xab, 0xcd]);
+    }
+
+    #[test]
+    fn color_expand_mem_transparent_skips_clear_bits() {
+        // Same 0xA0 source; transparent leaves clear-bit destinations untouched.
+        let mut vram = vec![0u8; 64];
+        vram[0] = 0xa0;
+        for slot in &mut vram[16..20] {
+            *slot = 0xee; // pre-fill so a skip is visible
+        }
+        let p = ExpandMemParams {
+            common: ExpandParams {
+                dst_base: 16,
+                dst_pitch: 8,
+                depth: 1,
+                dst_x: 0,
+                dst_y: 0,
+                width: 4,
+                height: 1,
+                fg_color: 0xab,
+                bg_color: 0xcd,
+                transparent: true,
+            },
+            src_base: 0,
+            src_pitch: 1,
+            src_x: 0,
+            src_y: 0,
+        };
+        assert_eq!(color_expand_mem(&mut vram, &p), 2); // only the two set bits
+        assert_eq!(&vram[16..20], &[0xab, 0xee, 0xab, 0xee]);
+    }
+
+    #[test]
+    fn color_expand_mem_handles_depth_2_and_4() {
+        // depth 2: source 0x80 (col 0 set, col 1 clear) over a 2x1 rect.
+        let mut vram = vec![0u8; 64];
+        vram[0] = 0x80;
+        let p2 = ExpandMemParams {
+            common: ExpandParams {
+                dst_base: 16,
+                dst_pitch: 32,
+                depth: 2,
+                dst_x: 0,
+                dst_y: 0,
+                width: 2,
+                height: 1,
+                fg_color: 0x1234,
+                bg_color: 0x5678,
+                transparent: false,
+            },
+            src_base: 0,
+            src_pitch: 1,
+            src_x: 0,
+            src_y: 0,
+        };
+        assert_eq!(color_expand_mem(&mut vram, &p2), 2);
+        assert_eq!(&vram[16..18], &[0x34, 0x12]); // col 0 -> FG, little-endian
+        assert_eq!(&vram[18..20], &[0x78, 0x56]); // col 1 -> BG
+
+        // depth 4: source 0x80 (col 0 set) over a 1x1 rect -> FG 0xDEADBEEF.
+        let mut vram = vec![0u8; 64];
+        vram[0] = 0x80;
+        let p4 = ExpandMemParams {
+            common: ExpandParams {
+                dst_base: 16,
+                dst_pitch: 32,
+                depth: 4,
+                dst_x: 0,
+                dst_y: 0,
+                width: 1,
+                height: 1,
+                fg_color: 0xdead_beef,
+                bg_color: 0,
+                transparent: false,
+            },
+            src_base: 0,
+            src_pitch: 1,
+            src_x: 0,
+            src_y: 0,
+        };
+        assert_eq!(color_expand_mem(&mut vram, &p4), 1);
+        assert_eq!(&vram[16..20], &[0xef, 0xbe, 0xad, 0xde]);
+    }
+
+    #[test]
+    fn color_expand_mem_crosses_a_source_byte_boundary() {
+        // src_x = 7 puts col 0 at bit 7 (byte 0, LSB) and col 1 at bit 8 (byte 1,
+        // MSB). Byte 0 = 0x01 (col 0 set), byte 1 = 0x00 (col 1 clear).
+        let mut vram = vec![0u8; 64];
+        vram[0] = 0x01;
+        vram[1] = 0x00;
+        let p = ExpandMemParams {
+            common: ExpandParams {
+                dst_base: 16,
+                dst_pitch: 8,
+                depth: 1,
+                dst_x: 0,
+                dst_y: 0,
+                width: 2,
+                height: 1,
+                fg_color: 0xab,
+                bg_color: 0xcd,
+                transparent: false,
+            },
+            src_base: 0,
+            src_pitch: 2,
+            src_x: 7,
+            src_y: 0,
+        };
+        assert_eq!(color_expand_mem(&mut vram, &p), 2);
+        assert_eq!(&vram[16..18], &[0xab, 0xcd]); // col 0 set -> FG, col 1 clear -> BG
+    }
+
+    #[test]
+    fn color_expand_mem_skips_off_store_source_and_dest() {
+        // Destination runs off the store: base 14, 4 wide at depth 1 -> dst offsets
+        // 14,15,16,17; 16 and 17 are out. Source byte 0xF0 sets all four cols.
+        let mut vram = vec![0u8; 16];
+        vram[0] = 0xf0;
+        let p_dst = ExpandMemParams {
+            common: ExpandParams {
+                dst_base: 14,
+                dst_pitch: 16,
+                depth: 1,
+                dst_x: 0,
+                dst_y: 0,
+                width: 4,
+                height: 1,
+                fg_color: 0xab,
+                bg_color: 0xcd,
+                transparent: false,
+            },
+            src_base: 0,
+            src_pitch: 1,
+            src_x: 0,
+            src_y: 0,
+        };
+        assert_eq!(color_expand_mem(&mut vram, &p_dst), 2); // offsets 14,15 in
+        assert_eq!(vram[14], 0xab);
+        assert_eq!(vram[15], 0xab);
+
+        // Source off the store: src_base beyond the end -> every pixel skipped.
+        let mut vram = vec![0u8; 16];
+        let p_src = ExpandMemParams {
+            common: ExpandParams {
+                dst_base: 0,
+                dst_pitch: 16,
+                depth: 1,
+                dst_x: 0,
+                dst_y: 0,
+                width: 4,
+                height: 1,
+                fg_color: 0xab,
+                bg_color: 0xcd,
+                transparent: false,
+            },
+            src_base: 100,
+            src_pitch: 16,
+            src_x: 0,
+            src_y: 0,
+        };
+        assert_eq!(color_expand_mem(&mut vram, &p_src), 0);
+        assert!(vram.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn color_expand_mem_rejects_invalid_depth() {
+        let mut vram = vec![0u8; 16];
+        vram[0] = 0xff;
+        let p = ExpandMemParams {
+            common: ExpandParams {
+                dst_base: 0,
+                dst_pitch: 4,
+                depth: 3, // not 1, 2, or 4
+                dst_x: 1,
+                dst_y: 0,
+                width: 1,
+                height: 1,
+                fg_color: 0xab,
+                bg_color: 0xcd,
+                transparent: false,
+            },
+            src_base: 8,
+            src_pitch: 4,
+            src_x: 0,
+            src_y: 0,
+        };
+        assert_eq!(color_expand_mem(&mut vram, &p), 0);
+        assert_eq!(vram[1], 0x00); // nothing written
+    }
+
+    #[test]
+    fn color_expand_mem_caps_iterations_at_the_store_size() {
+        // Pathological DIM: an all-clear source with BG 0 and dst_base 0 writes 0
+        // over 0 for every in-bounds pixel, so the count equals the cap (vram.len()).
+        let mut vram = vec![0u8; 64];
+        let p = ExpandMemParams {
+            common: ExpandParams {
+                dst_base: 0,
+                dst_pitch: 4000,
+                depth: 1,
+                dst_x: 0,
+                dst_y: 0,
+                width: 4000,
+                height: 4000,
+                fg_color: 0xab,
+                bg_color: 0,
+                transparent: false,
+            },
+            src_base: 0,
+            src_pitch: 0,
+            src_x: 0,
+            src_y: 0,
+        };
+        assert_eq!(color_expand_mem(&mut vram, &p), 64);
+    }
+
+    #[test]
+    fn color_expand_mem_skips_extreme_coordinates_without_overflow() {
+        let mut vram = vec![0u8; 64];
+        let p = ExpandMemParams {
+            common: ExpandParams {
+                dst_base: u32::MAX,
+                dst_pitch: u32::MAX,
+                depth: 4,
+                dst_x: u32::MAX,
+                dst_y: u32::MAX,
+                width: 8,
+                height: 8,
+                fg_color: 0xdead_beef,
+                bg_color: 0,
+                transparent: false,
+            },
+            src_base: u32::MAX,
+            src_pitch: u32::MAX,
+            src_x: u32::MAX,
+            src_y: u32::MAX,
+        };
+        assert_eq!(color_expand_mem(&mut vram, &p), 0); // must not panic
+        assert!(vram.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn bg_color_round_trips() {
+        let mut margo = Margo::default();
+        margo.write_mmio_u8(REG_BG_COLOR, 0x11);
+        margo.write_mmio_u8(REG_BG_COLOR + 1, 0x22);
+        margo.write_mmio_u8(REG_BG_COLOR + 2, 0x33);
+        margo.write_mmio_u8(REG_BG_COLOR + 3, 0x44);
+        assert_eq!(read_reg_u32(&margo, REG_BG_COLOR), 0x4433_2211);
+    }
+
+    #[test]
+    fn command_expand_mem_writes_vram_and_sets_busy() {
+        let mut margo = Margo::default();
+        margo.write_vram_u8(0, 0x80); // source row: col 0 set, col 1 clear
+        write_reg(&mut margo, REG_DST_BASE, 16);
+        write_reg(&mut margo, REG_DST_PITCH, 8);
+        write_reg(&mut margo, REG_SRC_BASE, 0);
+        write_reg(&mut margo, REG_SRC_PITCH, 1);
+        write_reg(&mut margo, REG_DEPTH, 1);
+        write_reg(&mut margo, REG_DST_XY, 0); // (0,0)
+        write_reg(&mut margo, REG_SRC_XY, 0); // (0,0)
+        write_reg(&mut margo, REG_DIM, (1 << 16) | 2); // h=1, w=2
+        write_reg(&mut margo, REG_FG_COLOR, 0xab);
+        write_reg(&mut margo, REG_BG_COLOR, 0xcd);
+        write_reg(&mut margo, REG_FLAGS, 0);
+        write_reg(&mut margo, REG_COMMAND, 0x04); // COLOR_EXPAND_MEM
+
+        assert_eq!(margo.read_vram_u8(16), 0xab); // col 0 set -> FG
+        assert_eq!(margo.read_vram_u8(17), 0xcd); // col 1 clear -> BG
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 1); // BUSY set
+    }
+
+    #[test]
+    fn command_expand_mem_busy_drains_at_the_expand_rate() {
+        let mut margo = Margo::default();
+        // All-clear source, opaque: a 4x1 rect writes 4 BG pixels.
+        write_reg(&mut margo, REG_DST_BASE, 16);
+        write_reg(&mut margo, REG_DST_PITCH, 8);
+        write_reg(&mut margo, REG_SRC_BASE, 0);
+        write_reg(&mut margo, REG_SRC_PITCH, 1);
+        write_reg(&mut margo, REG_DEPTH, 1);
+        write_reg(&mut margo, REG_DST_XY, 0);
+        write_reg(&mut margo, REG_SRC_XY, 0);
+        write_reg(&mut margo, REG_DIM, (1 << 16) | 4); // 4x1 = 4 pixels
+        write_reg(&mut margo, REG_FLAGS, 0);
+        write_reg(&mut margo, REG_COMMAND, 0x04);
+
+        // 4 pixels -> busy_ns = 100 + 4*5 = 120. One ns short still reads busy.
+        margo.advance_busy(119);
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 1);
+        margo.advance_busy(1);
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 0);
     }
 
     #[test]
