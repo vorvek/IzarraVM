@@ -240,6 +240,12 @@ impl Machine {
     /// placed at DOS_LOAD_SEGMENT with its PSP, and the CPU is set to its entry
     /// (CS=DS=ES=SS=segment, IP=0x100, SP=0xFFFE). Run with run_until_halt_or_cycles
     /// and read dos_output plus the DosExit stop reason.
+    ///
+    /// Entry eflags has IF clear, unlike real DOS which hands a .COM control with
+    /// interrupts enabled. This slice installs no BIOS interrupt handlers (IVT[8]
+    /// and friends are zero), so a program that wants hardware IRQs must set them up
+    /// and STI itself; the BIOS IVT and an interrupts-enabled handoff come with a
+    /// later slice.
     pub fn new_dos_com(profile: MachineProfile, image: &[u8]) -> Result<Self, MachineError> {
         let mut machine = Self {
             memory: Memory::from_mib(profile.memory_mib)?,
