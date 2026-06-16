@@ -1,10 +1,11 @@
 //! Margo, the VEGA 2D engine: the display register block, the linear frame
-//! buffer, and the blit engine. The engine implements FILL and COPY.
+//! buffer, and the blit engine. The engine implements FILL, COPY, and color
+//! expand.
 
 pub const MARGO_VRAM_SIZE: usize = 4 * 1024 * 1024;
 pub const MARGO_MMIO_SIZE: usize = 0x0001_0000; // 64 KB register block
 pub const MARGO_ID_VALUE: u32 = 0x4D47_0100; // 'M' 'G', version 1.00
-pub const MARGO_CAPS_VALUE: u32 = 0x0000_0043; // bits 0 FILL, 1 COPY, 6 COLORKEY
+pub const MARGO_CAPS_VALUE: u32 = 0x0000_0047; // bits 0 FILL, 1 COPY, 2 COLOR_EXPAND, 6 COLORKEY
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VbeMode {
@@ -938,10 +939,10 @@ mod tests {
     }
 
     #[test]
-    fn caps_reports_fill_copy_and_colorkey() {
+    fn caps_reports_fill_copy_expand_and_colorkey() {
         let margo = Margo::default();
-        // bit 0 FILL, bit 1 COPY, bit 6 COLORKEY.
-        assert_eq!(read_reg_u32(&margo, REG_CAPS), 0x0000_0043);
+        // bit 0 FILL, bit 1 COPY, bit 2 COLOR_EXPAND, bit 6 COLORKEY.
+        assert_eq!(read_reg_u32(&margo, REG_CAPS), 0x0000_0047);
     }
 
     #[test]
