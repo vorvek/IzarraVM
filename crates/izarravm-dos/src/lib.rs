@@ -1,6 +1,6 @@
 use izarravm_bus::{BusError, Memory};
 use std::collections::{HashMap, VecDeque};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -253,6 +253,48 @@ impl Default for DosDateTime {
     }
 }
 
+/// A DOS file access mode, from AL's low 3 bits on open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessMode {
+    Read,
+    Write,
+    ReadWrite,
+}
+
+impl AccessMode {
+    /// AL's low 3 bits select the access mode (the high bits are sharing and
+    /// inheritance, ignored). 0=read, 1=write, 2=read/write; 3-7 are unused by
+    /// real programs and map to Read (marked).
+    fn from_open_al(al: u8) -> Self {
+        match al & 0x07 {
+            1 => AccessMode::Write,
+            2 => AccessMode::ReadWrite,
+            _ => AccessMode::Read,
+        }
+    }
+
+    fn can_read(self) -> bool {
+        matches!(self, AccessMode::Read | AccessMode::ReadWrite)
+    }
+}
+
+/// An open file handle: the host file plus the DOS access mode it was opened
+/// with, which the kernel enforces on reads and writes.
+#[derive(Debug)]
+struct OpenFile {
+    file: File,
+    mode: AccessMode,
+}
+
+/// Open an existing host file for a DOS access mode (no create).
+fn open_host_file(path: &Path, mode: AccessMode) -> std::io::Result<File> {
+    match mode {
+        AccessMode::Read => File::open(path),
+        AccessMode::Write => OpenOptions::new().write(true).open(path),
+        AccessMode::ReadWrite => OpenOptions::new().read(true).write(true).open(path),
+    }
+}
+
 /// The stateful DOS kernel. Owns the host-side state that must survive between
 /// INT 21h calls: the open-file handle table and the mounted C: drive, plus the
 /// standard input and output buffers (high-level emulated, HLE). The machine
@@ -261,7 +303,7 @@ impl Default for DosDateTime {
 pub struct DosKernel {
     drive: Option<HostDrive>,
     // File handles 5 and up: AH=3Dh inserts, AH=3Fh/3Eh look up.
-    open_files: HashMap<u16, File>,
+    open_files: HashMap<u16, OpenFile>,
     stdin: VecDeque<u8>,
     stdout: Vec<u8>,
     clock: DosDateTime,
@@ -325,6 +367,25 @@ impl DosKernel {
             blocks: Vec::new(),
         };
         self.dta = (psp_seg, 0x80);
+    }
+
+    /// Resolve the ASCIIZ filename at ds:dx to a host path. Ok(Ok(path)) on
+    /// success; Ok(Err(code)) when a DOS error code should be returned (no NUL ->
+    /// 0x03, no drive -> 0x02, bad path -> 0x03); Err(DosError) for a guest-memory
+    /// fault.
+    fn resolve_open_path(
+        &self,
+        mem: &Memory,
+        ds: u16,
+        dx: u16,
+    ) -> Result<Result<PathBuf, u16>, DosError> {
+        let Some(name) = read_asciiz(mem, ds, dx)? else {
+            return Ok(Err(0x03));
+        };
+        let Some(drive) = self.drive.as_ref() else {
+            return Ok(Err(0x02));
+        };
+        Ok(drive.resolve_dos_path(&name).map_err(|_| 0x03))
     }
 
     /// Service a software interrupt the DOS kernel handles. `vector` is the INT
@@ -414,37 +475,24 @@ impl DosKernel {
                 regs.ax = (regs.ax & 0xff00) | 0x24;
                 Ok(DosAction::Continue)
             }
-            // AH=3Dh: open an existing file at DS:DX (ASCIIZ) for reading. AL is
-            // the access mode but is not enforced: every open is read-only,
-            // because writes (AH=40h) are a later slice. Returns CF=0 + AX=handle
-            // on success, CF=1 + AX=DOS code on error.
+            // AH=3Dh: open an existing file at DS:DX (ASCIIZ). AL's low 3 bits are
+            // the access mode (0=read, 1=write, 2=read/write), honored and enforced
+            // per handle. CF=0 + AX=handle on success, CF=1 + AX=DOS code on error.
             0x3d => {
-                let name = match read_asciiz(mem, regs.ds, regs.dx)? {
-                    Some(name) => name,
-                    None => {
-                        set_dos_error(regs, 0x03);
+                let mode = AccessMode::from_open_al(regs.ax as u8);
+                let path = match self.resolve_open_path(mem, regs.ds, regs.dx)? {
+                    Ok(path) => path,
+                    Err(code) => {
+                        set_dos_error(regs, code);
                         return Ok(DosAction::Continue);
                     }
                 };
-                let path = match &self.drive {
-                    None => {
-                        set_dos_error(regs, 0x02);
-                        return Ok(DosAction::Continue);
-                    }
-                    Some(drive) => match drive.resolve_dos_path(&name) {
-                        Ok(path) => path,
-                        Err(_) => {
-                            set_dos_error(regs, 0x03);
-                            return Ok(DosAction::Continue);
-                        }
-                    },
-                };
-                match File::open(&path) {
+                match open_host_file(&path, mode) {
                     Ok(file) => {
                         let handle = (5u16..)
                             .find(|h| !self.open_files.contains_key(h))
                             .expect("a free DOS handle exists at or below u16::MAX");
-                        self.open_files.insert(handle, file);
+                        self.open_files.insert(handle, OpenFile { file, mode });
                         regs.ax = handle;
                         regs.cf = false;
                     }
@@ -452,21 +500,21 @@ impl DosKernel {
                 }
                 Ok(DosAction::Continue)
             }
-            // AH=3Fh: read CX bytes from the handle in BX into the buffer at
-            // DS:DX. Returns CF=0 + AX=bytes-read (0 = EOF) on success, CF=1 +
-            // AX=0x06 for an unknown handle. A host read error maps to a DOS code;
-            // a guest-memory write fault propagates as DosError::Memory.
             0x3f => {
                 let handle = regs.bx;
                 let count = usize::from(regs.cx);
-                let Some(file) = self.open_files.get_mut(&handle) else {
+                let Some(of) = self.open_files.get_mut(&handle) else {
                     set_dos_error(regs, 0x06);
                     return Ok(DosAction::Continue);
                 };
+                if !of.mode.can_read() {
+                    set_dos_error(regs, 0x05);
+                    return Ok(DosAction::Continue);
+                }
                 let mut buffer = vec![0u8; count];
                 let mut filled = 0usize;
                 while filled < count {
-                    match file.read(&mut buffer[filled..]) {
+                    match of.file.read(&mut buffer[filled..]) {
                         Ok(0) => break,
                         Ok(n) => filled += n,
                         Err(err) => {
@@ -1900,5 +1948,32 @@ mod tests {
         };
         kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
         assert_eq!(regs.ax & 0xff, 0x01); // AL = number of logical drives
+    }
+
+    #[test]
+    fn read_on_a_write_only_handle_returns_ax05() {
+        let (mut kernel, mut mem, _dir) = kernel_with_drive(&[("DATA.TXT", b"hi")], r"C:\DATA.TXT");
+        // Open AL=1 (write-only) on the existing file.
+        let mut open = DosRegs {
+            ax: 0x3d01,
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut open, &mut mem).unwrap();
+        assert!(!open.cf, "open failed: ax={:#06x}", open.ax);
+        let handle = open.ax;
+        // Reading a write-only handle is access-denied.
+        let mut read = DosRegs {
+            ax: 0x3f00,
+            bx: handle,
+            cx: 16,
+            ds: 0x0100,
+            dx: 0x0400,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut read, &mut mem).unwrap();
+        assert!(read.cf);
+        assert_eq!(read.ax, 0x05);
     }
 }
