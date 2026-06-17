@@ -157,8 +157,8 @@ impl DosKernel {
     /// host-side (HLE). Unimplemented INT 21h functions return Continue with no
     /// effect, so the caller's IRET stub returns cleanly.
     ///
-    /// `mem` is `&mut` because the file-read call (AH=3Fh, a later slice) writes
-    /// the data it reads back into guest memory at DS:DX; the print call only reads.
+    /// `mem` is `&mut` because the file-read call (AH=3Fh) writes the data it
+    /// reads back into guest memory at DS:DX; most other calls only read it.
     pub fn dispatch(
         &mut self,
         vector: u8,
