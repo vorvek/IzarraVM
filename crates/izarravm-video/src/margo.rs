@@ -657,7 +657,7 @@ fn pattern(vram: &mut [u8], p: &PatternParams) -> u64 {
     }
     let depth = p.depth as usize;
     let len = vram.len() as u64;
-    let pat_pitch = 8 * depth as u64;
+    let pat_pitch: u64 = 8 * depth as u64;
     let key = p.colorkey.to_le_bytes();
     let mut considered: u64 = 0;
     let mut written: u64 = 0;
@@ -1555,6 +1555,42 @@ mod tests {
         assert_eq!(&vram[2..4], &0x1001u16.to_le_bytes()); // (1,0) tile[0][1]
         assert_eq!(&vram[4..6], &0x1008u16.to_le_bytes()); // (0,1) tile[1][0]
         assert_eq!(&vram[6..8], &0x1009u16.to_le_bytes()); // (1,1) tile[1][1]
+    }
+
+    #[test]
+    fn pattern_tiles_depth_4_pixels() {
+        // depth 4: pattern row pitch is 8 * 4 = 32 bytes. Tile cell (r, c) holds the
+        // 32-bit value 0x1000_0000 | (r*8 + c). A 2x2 fill proves the row pitch, the
+        // little-endian read of all four bytes, and the phase across both axes at
+        // depth 4.
+        let mut vram = vec![0u8; 1024];
+        let pat_base = 256usize;
+        for r in 0..8 {
+            for c in 0..8 {
+                let v: u32 = 0x1000_0000 | (r * 8 + c) as u32;
+                let off = pat_base + r * 32 + c * 4;
+                vram[off..off + 4].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        let p = PatternParams {
+            dst_base: 0,
+            dst_pitch: 8,
+            pat_base: pat_base as u32,
+            depth: 4,
+            dst_x: 0,
+            dst_y: 0,
+            width: 2,
+            height: 2,
+            rop: 0xf0,
+            colorkey: 0,
+            colorkey_en: false,
+            clip: Clip::default(),
+        };
+        assert_eq!(pattern(&mut vram, &p), 4);
+        assert_eq!(&vram[0..4], &0x1000_0000u32.to_le_bytes()); // (0,0) tile[0][0]
+        assert_eq!(&vram[4..8], &0x1000_0001u32.to_le_bytes()); // (1,0) tile[0][1]
+        assert_eq!(&vram[8..12], &0x1000_0008u32.to_le_bytes()); // (0,1) tile[1][0]
+        assert_eq!(&vram[12..16], &0x1000_0009u32.to_le_bytes()); // (1,1) tile[1][1]
     }
 
     #[test]
