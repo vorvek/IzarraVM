@@ -338,6 +338,23 @@ impl DosKernel {
                 regs.ax = (regs.ax & 0xff00) | 0x02;
                 Ok(DosAction::Continue)
             }
+            // AH=25h: set interrupt vector AL to DS:DX. Writes the real guest IVT
+            // (offset then segment, little-endian) at AL*4. ponytail: re-vectoring an
+            // HLE'd INT (0x10/0x20/0x21) writes the IVT but host dispatch still
+            // intercepts those by vector number.
+            0x25 => {
+                let addr = usize::from(regs.ax as u8) * 4;
+                mem.write_u16(addr, regs.dx)?;
+                mem.write_u16(addr + 2, regs.ds)?;
+                Ok(DosAction::Continue)
+            }
+            // AH=35h: get interrupt vector AL into ES:BX.
+            0x35 => {
+                let addr = usize::from(regs.ax as u8) * 4;
+                regs.bx = mem.read_u16(addr)?;
+                regs.es = mem.read_u16(addr + 2)?;
+                Ok(DosAction::Continue)
+            }
             // AH=4Ch: terminate with the return code in AL.
             0x4c => Ok(DosAction::Exit((regs.ax & 0x00ff) as u8)),
             // Other file functions (write, seek, find) and everything else are not
@@ -1243,6 +1260,28 @@ mod tests {
         // EXE: CS and DS are distinct segments; DS is the PSP.
         assert_ne!(entry.cs, entry.ds);
         assert_eq!(entry.ds, 0x0100);
+    }
+
+    #[test]
+    fn ah25_then_ah35_round_trip_vector() {
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        // AH=25h: set INT 0x1C to DS:DX = 0xBEEF:0x1234.
+        let mut set = DosRegs {
+            ax: 0x251c,
+            ds: 0xbeef,
+            dx: 0x1234,
+            ..DosRegs::default()
+        };
+        let mut kernel = DosKernel::new();
+        kernel.dispatch(0x21, &mut set, &mut mem).unwrap();
+        // The IVT entry at 0x1C*4 holds offset then segment, little-endian.
+        assert_eq!(mem.read_u16(0x1c * 4).unwrap(), 0x1234);
+        assert_eq!(mem.read_u16(0x1c * 4 + 2).unwrap(), 0xbeef);
+        // AH=35h: get INT 0x1C back into ES:BX.
+        let mut get = DosRegs { ax: 0x351c, ..DosRegs::default() };
+        kernel.dispatch(0x21, &mut get, &mut mem).unwrap();
+        assert_eq!(get.es, 0xbeef);
+        assert_eq!(get.bx, 0x1234);
     }
 
     #[test]

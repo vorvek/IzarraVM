@@ -484,6 +484,13 @@ impl Machine {
             flags & !0x0040
         };
         self.memory.write_u16(flags_addr as usize, flags)?;
+        // AH=35h (get vector) and AH=2Fh (get DTA) return a segment in ES. The
+        // marshalling reads ES as an input at the top; write it back here so those
+        // results reach the guest. For calls that do not touch ES, regs.es still
+        // equals the input selector, so this re-sets the same real-mode base.
+        self.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(regs.es));
         Ok(match action {
             izarravm_dos::DosAction::Continue => None,
             izarravm_dos::DosAction::Exit(code) => Some(code),
