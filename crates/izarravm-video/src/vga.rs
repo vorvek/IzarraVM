@@ -102,12 +102,10 @@ fn apply_logic(logic: u8, value: u8, latch: u8) -> u8 {
 /// is plane i's slice; `latches` are the four latch registers. Spec section 4.
 pub fn write_planes(
     planes: &mut [[u8; 1]; VGA_PLANES],
-    offset: usize,
     data: u8,
     gc: &GfxController,
     latches: &[u8; VGA_PLANES],
 ) {
-    let _ = offset; // single-byte helper; callers index the plane slices
     let rotated = data.rotate_right(u32::from(gc.rotate & 7));
     for plane in 0..VGA_PLANES {
         let latch = latches[plane];
@@ -164,7 +162,7 @@ mod tests {
         let mut gc = GfxController::default();
         gc.bit_mask = 0xF0;
         let latches = [0xFFu8; VGA_PLANES];
-        write_planes(&mut planes, 0, 0x0F, &gc, &latches);
+        write_planes(&mut planes, 0x0F, &gc, &latches);
         for p in &planes {
             assert_eq!(p[0], 0x0F);
         }
@@ -181,10 +179,55 @@ mod tests {
         gc.enable_set_reset = 0x0F;
         gc.set_reset = 0b1010;
         let latches = [0u8; VGA_PLANES];
-        write_planes(&mut planes, 0, 0x00, &gc, &latches);
+        write_planes(&mut planes, 0x00, &gc, &latches);
         assert_eq!(planes[0][0], 0x00);
         assert_eq!(planes[1][0], 0xFF);
         assert_eq!(planes[2][0], 0x00);
         assert_eq!(planes[3][0], 0xFF);
+    }
+
+    #[test]
+    fn write_mode_1_copies_latches_to_planes() {
+        let mut planes = [[0u8; 1]; VGA_PLANES];
+        let mut gc = GfxController::default();
+        gc.write_mode = 1;
+        let latches = [0x12, 0x34, 0x56, 0x78];
+        write_planes(&mut planes, 0x00, &gc, &latches); // data ignored in WM1
+        for plane in 0..VGA_PLANES {
+            assert_eq!(planes[plane][0], latches[plane]);
+        }
+    }
+
+    #[test]
+    fn write_mode_2_expands_color_nibble_per_plane() {
+        let mut planes = [[0u8; 1]; VGA_PLANES];
+        let mut gc = GfxController::default();
+        gc.write_mode = 2;
+        gc.bit_mask = 0xFF;
+        let latches = [0u8; VGA_PLANES];
+        write_planes(&mut planes, 0b0101, &gc, &latches); // planes 0 and 2 set
+        assert_eq!(planes[0][0], 0xFF);
+        assert_eq!(planes[1][0], 0x00);
+        assert_eq!(planes[2][0], 0xFF);
+        assert_eq!(planes[3][0], 0x00);
+    }
+
+    #[test]
+    fn write_mode_3_uses_set_reset_color_with_rotated_bitmask() {
+        // Effective mask = bit_mask (0xFF) & rotated data (0xF0, rotate=0) = 0xF0.
+        // Set/Reset 0b0011 -> planes 0,1 color 0xFF, planes 2,3 color 0x00.
+        // Result = (color & 0xF0) | (latch 0 & 0x0F).
+        let mut planes = [[0u8; 1]; VGA_PLANES];
+        let mut gc = GfxController::default();
+        gc.write_mode = 3;
+        gc.set_reset = 0b0011;
+        gc.bit_mask = 0xFF;
+        gc.rotate = 0;
+        let latches = [0u8; VGA_PLANES];
+        write_planes(&mut planes, 0xF0, &gc, &latches);
+        assert_eq!(planes[0][0], 0xF0);
+        assert_eq!(planes[1][0], 0xF0);
+        assert_eq!(planes[2][0], 0x00);
+        assert_eq!(planes[3][0], 0x00);
     }
 }
