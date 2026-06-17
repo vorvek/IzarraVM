@@ -15,6 +15,10 @@ org 0x8000
 %define PIC_DATA 0x21
 %define TICK_COUNT 0x0600
 %define TICK_TARGET 10
+%define DSP_RESET 0x226
+%define DSP_READ 0x22A
+%define DSP_WRITE 0x22C
+%define DSP_STATUS 0x22E
 
 stage2_start:
     cli
@@ -60,6 +64,7 @@ stage2_start:
 
     call test_mode13h
     call test_timer
+    call test_sb_dsp_reset
 
     hlt
     jmp $
@@ -118,6 +123,18 @@ puts_screen:
     stosw
     jmp puts_screen
 .done:
+    ret
+
+; Busy-wait long enough to cover the DSP reset settle (~100us) and one OPL
+; timer step (~80us). advance_devices ticks both with CPU clocks every step,
+; so ~0x4000 loop iterations at 25 MHz is comfortably over the windows the
+; detection probes poll for. cx is preserved for the callers' poll counters.
+delay:
+    push cx
+    mov cx, 0x4000
+.delay_loop:
+    loop .delay_loop
+    pop cx
     ret
 
 test_mode13h:
@@ -192,6 +209,37 @@ test_timer:
     mov byte [di + 2], 'S'
     mov byte [di + 3], 'S'
     add word [RESULT_BLOCK + 10], 27
+    ret
+
+test_sb_dsp_reset:
+    ; Reset the DSP: write 1 then 0 to 0x226. The ~100us settle advances with
+    ; CPU clocks (advance_devices ticks dsp.advance_micros), so a busy loop
+    ; covers it; then poll 0x22E bit7 and read 0x22A expecting the 0xAA ack.
+    mov dx, DSP_RESET
+    mov al, 0x01
+    out dx, al
+    mov al, 0x00
+    out dx, al
+    mov cx, 8
+.wait:
+    call delay
+    mov dx, DSP_STATUS
+    in al, dx
+    test al, 0x80
+    jnz .ready
+    loop .wait
+    ret                       ; never became ready -> leave FAIL
+.ready:
+    mov dx, DSP_READ
+    in al, dx
+    cmp al, 0xAA
+    jne .done                 ; wrong ack -> leave FAIL
+    mov di, RESULT_BLOCK + (sb_reset_record - result_block_template)
+    mov byte [di], 'P'
+    mov byte [di + 2], 'S'
+    mov byte [di + 3], 'S'
+    add word [RESULT_BLOCK + 10], 27
+.done:
     ret
 
 irq0_handler:
