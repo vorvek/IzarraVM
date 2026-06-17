@@ -1369,7 +1369,10 @@ mod tests {
         // offset 2, so a correct word-mode read shows index 1 at pixel 8.
         vga.vram[2] = 0x80; // bit 7 -> the first pixel of that character
         let row = vga.render_active_row(0);
-        assert_eq!(row[8], 1, "word mode reads plane offset 2 for the 2nd character");
+        assert_eq!(
+            row[8], 1,
+            "word mode reads plane offset 2 for the 2nd character"
+        );
         assert_eq!(row[0], 0, "char 0 (offset 0) is clear");
     }
 
@@ -1383,13 +1386,21 @@ mod tests {
         // Reference row from start_address 0: its first 8 pixels come from offset 0.
         vga.crtc.start_address = 0;
         let top = vga.render_active_row(0);
-        assert_eq!(&top[0..8], &[1u8; 8], "top-of-VRAM byte renders 8 pixels of index 1");
+        assert_eq!(
+            &top[0..8],
+            &[1u8; 8],
+            "top-of-VRAM byte renders 8 pixels of index 1"
+        );
         // Start 8 bytes before the 64 KB wrap: byte_col 0..7 read 0xFFF8..0xFFFF (clear),
         // byte_col 8 wraps to offset 0 (the marked byte). So pixels 64..71 must equal
         // the top-of-VRAM pixels, not tear.
         vga.crtc.start_address = 0xFFF8;
         let wrapped = vga.render_active_row(0);
-        assert_eq!(&wrapped[0..64], &[0u8; 64], "pre-wrap pixels read the cleared tail");
+        assert_eq!(
+            &wrapped[0..64],
+            &[0u8; 64],
+            "pre-wrap pixels read the cleared tail"
+        );
         assert_eq!(
             &wrapped[64..72],
             &top[0..8],
