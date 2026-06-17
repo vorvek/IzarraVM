@@ -2276,6 +2276,39 @@ mod tests {
     }
 
     #[test]
+    fn vbe_mode_info_reports_15bpp_masks() {
+        // Mode 0x0110 (X1R5G5B5): five-bit channels plus a one-bit reserved field.
+        let rom = rom_with_code(&[
+            0xb8, 0x00, 0x40, // mov ax, 4000h
+            0x8e, 0xc0, // mov es, ax
+            0xbf, 0x00, 0x00, // mov di, 0
+            0xb8, 0x01, 0x4f, // mov ax, 4F01h
+            0xb9, 0x10, 0x01, // mov cx, 0110h
+            0xcd, 0x10, // int 10h
+            0xf4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+        assert_eq!(
+            machine.run_until_halt_or_cycles(1_000_000).unwrap(),
+            StopReason::Halted
+        );
+        assert_eq!(machine.cpu().registers.eax() as u16, 0x004f);
+
+        let base = 0x40000;
+        assert_eq!(read_u16(&mut machine, base + 0x10), 1280); // BytesPerScanLine = 640 * 2
+        assert_eq!(machine.read_physical_u8(base + 0x19), 15); // BitsPerPixel
+        assert_eq!(machine.read_physical_u8(base + 0x1f), 5); // RedMaskSize
+        assert_eq!(machine.read_physical_u8(base + 0x20), 10); // RedFieldPosition
+        assert_eq!(machine.read_physical_u8(base + 0x21), 5); // GreenMaskSize
+        assert_eq!(machine.read_physical_u8(base + 0x22), 5); // GreenFieldPosition
+        assert_eq!(machine.read_physical_u8(base + 0x23), 5); // BlueMaskSize
+        assert_eq!(machine.read_physical_u8(base + 0x24), 0); // BlueFieldPosition
+        assert_eq!(machine.read_physical_u8(base + 0x25), 1); // RsvdMaskSize (the X bit)
+        assert_eq!(machine.read_physical_u8(base + 0x26), 15); // RsvdFieldPosition
+    }
+
+    #[test]
     fn hicolor_scanout_decodes_through_the_lfb_aperture() {
         let mut machine = test_machine();
         machine.margo_mut().set_mode(0x111); // 640x480x16, pitch 1280
