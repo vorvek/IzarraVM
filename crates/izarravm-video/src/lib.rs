@@ -61,6 +61,7 @@ pub enum VideoMode {
     Text,
     Mode13h,
     Planar,
+    ModeX,
 }
 
 pub const DAC_ENTRIES: usize = 256;

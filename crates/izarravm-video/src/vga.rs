@@ -148,6 +148,31 @@ impl CrtcTiming {
         }
     }
 
+    /// Mode X / mode Y base: 320x200 unchained 256-color. Offset 40 gives 80 bytes
+    /// per scanline per plane (320 pixels / 4 planes). 320x240 is reached when the
+    /// guest reprograms the vertical timing while unchained (see
+    /// `recompute_vertical_timing`).
+    pub fn mode_x() -> Self {
+        Self {
+            htotal_chars: 100,
+            char_width: 8,
+            hdisp_end: 320,
+            vtotal: 449,
+            vdisp_end: 400,
+            vblank_start: 407,
+            vblank_end: 442,
+            vretrace_start: 412,
+            vretrace_end: 414,
+            max_scan: 1,
+            double_scan: true,
+            start_address: 0,
+            offset: 40,
+            mode_control: 0xE3,
+            underline_loc: 0x00,
+            line_compare: 0x3FF,
+        }
+    }
+
     /// Total dots per frame = htotal_dots * vtotal (scan-counter lines).
     pub fn frame_dots(&self) -> u64 {
         (self.htotal_chars * self.char_width) as u64 * self.vtotal as u64
@@ -626,7 +651,20 @@ impl Vga {
     fn write_seq(&mut self, index: u8, value: u8) {
         match index {
             0x02 => self.seq.map_mask = value & 0x0F,
-            0x04 => self.seq.memory_mode = value,
+            0x04 => {
+                self.seq.memory_mode = value;
+                // Chain-4 (bit 3) cleared while in chained 256-color (mode 13h)
+                // selects unchained 256-color (mode X / mode Y). Setting it again
+                // returns to chained mode 13h. Acting on the write that toggles the
+                // bit is the faithful register-bang entry; the default memory_mode of
+                // 0 cannot trigger it because set_mode13h never writes index 04h.
+                let chain4_off = value & 0x08 == 0;
+                if chain4_off && self.mode == VideoMode::Mode13h {
+                    self.enter_mode_x();
+                } else if !chain4_off && self.mode == VideoMode::ModeX {
+                    self.set_mode13h();
+                }
+            }
             _ => {}
         }
     }
@@ -741,6 +779,17 @@ impl Vga {
     pub fn set_mode13h(&mut self) {
         self.mode13h = Framebuffer::mode13h();
         self.mode = VideoMode::Mode13h;
+    }
+
+    /// Enter unchained 256-color (mode X / mode Y) with the 320x200 base. The guest
+    /// retunes the geometry by reprogramming the vertical CRTC timing while here.
+    fn enter_mode_x(&mut self) {
+        self.crtc = CrtcTiming::mode_x();
+        self.beam = 0;
+        self.last_line = 0;
+        self.mode = VideoMode::ModeX;
+        self.presented = None;
+        self.resize_work();
     }
 
     pub fn active_mode(&self) -> VideoMode {
@@ -1611,5 +1660,25 @@ mod tests {
         assert_eq!(row.len(), 640);
         assert_eq!(row[639], 15, "column 639 reads bit 0 of all four planes");
         assert_eq!(row[0], 0, "column 0 is clear");
+    }
+
+    #[test]
+    fn clearing_chain4_in_mode13h_enters_and_leaves_mode_x() {
+        let mut vga = Vga::default();
+        vga.set_mode13h();
+        assert_eq!(vga.active_mode(), VideoMode::Mode13h);
+        // Sequencer Memory Mode (04h) written with chain-4 (bit 3) cleared enters
+        // unchained 256-color (mode X) from chained mode 13h.
+        vga.write_port(0x3C4, 0x04);
+        vga.write_port(0x3C5, 0x06);
+        assert_eq!(vga.active_mode(), VideoMode::ModeX);
+        // The unchained 320x200 base geometry: 320 wide, vtotal 449, offset 40.
+        assert_eq!(vga.raster_width(), 320);
+        assert_eq!(vga.raster_height(), 449);
+        assert_eq!(vga.crtc.offset, 40);
+        // Writing 04h with chain-4 set again reverts to chained mode 13h.
+        vga.write_port(0x3C4, 0x04);
+        vga.write_port(0x3C5, 0x0E);
+        assert_eq!(vga.active_mode(), VideoMode::Mode13h);
     }
 }
