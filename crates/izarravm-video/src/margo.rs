@@ -3797,8 +3797,9 @@ mod tests {
         let mut margo = Margo::default();
         margo.set_mode_640x480x8();
         let palette = [0u32; 256];
-        // CURSOR_ADDR within 4 bytes of the end of the store, so every plane read past
-        // it is off-store and skipped (transparent); must not panic or wrap.
+        // CURSOR_ADDR is 4 bytes from the end of the store: the AND plane bytes at
+        // addr+0..+3 are in VRAM, but the XOR plane at addr+512 is off-store, so the
+        // bounds check skips every cursor pixel as transparent. Must not panic or wrap.
         let addr = (MARGO_VRAM_SIZE as u32) - 4;
         write_reg(&mut margo, REG_CURSOR_ADDR, addr);
         write_reg(&mut margo, REG_CURSOR_POS, 0);
@@ -3806,6 +3807,6 @@ mod tests {
         write_reg(&mut margo, REG_CURSOR_BG, 0x20);
         write_reg(&mut margo, REG_CURSOR_CTRL, 1);
         let argb = margo.scanout_argb(&palette);
-        assert_eq!(argb[0], 0x00); // nothing composited (all plane bytes off-store)
+        assert_eq!(argb[0], 0x00); // xor plane off-store -> every pixel skipped -> surface 0
     }
 }
