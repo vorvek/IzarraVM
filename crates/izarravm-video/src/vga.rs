@@ -270,7 +270,8 @@ impl Vga {
         self.resize_work();
     }
 
-    /// Switch to mode 0Dh. Kept as an alias so existing callers do not churn.
+    /// Switch to mode 0Dh. Kept as an alias so existing callers do not churn;
+    /// new call sites can use `set_mode(0x0D)`.
     pub fn set_mode_0dh(&mut self) {
         self.set_planar_mode(CrtcTiming::mode_0dh());
     }
@@ -293,6 +294,10 @@ impl Vga {
         self.crtc.hdisp_end
     }
 
+    /// Scanlines per source row (the double-scan factor). For every mode this
+    /// slice supports this equals `max_scan + 1`, the form the spec and the
+    /// conformance doc use for the source divide; a triple-scan mode would have
+    /// to read `max_scan` directly.
     fn scan_factor(&self) -> u32 {
         if self.crtc.double_scan { 2 } else { 1 }
     }
@@ -1251,7 +1256,7 @@ mod tests {
 
         assert!(vga.set_mode(0x0E));
         assert_eq!(vga.raster_width(), 640);
-        assert_eq!(vga.raster_height(), 449); // doubled 640x200, vtotal 449
+        assert_eq!(vga.raster_height(), 449); // 0Eh vtotal 449; 200 rows double-scanned to 400 active
         assert_eq!(vga.active_mode(), VideoMode::Planar);
 
         assert!(vga.set_mode(0x10));
