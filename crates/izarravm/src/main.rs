@@ -42,7 +42,7 @@ struct Cli {
     #[arg(long)]
     headless_boot_suite: bool,
     #[arg(long)]
-    headless_run_com: Option<PathBuf>,
+    headless_run: Option<PathBuf>,
     #[arg(long)]
     stdin_text: Option<String>,
     #[arg(long)]
@@ -117,14 +117,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    if let Some(path) = &cli.headless_run_com {
+    if let Some(path) = &cli.headless_run {
         // Compute the exit code in an inner scope so the machine and the loaded
         // image drop before process::exit (which does not unwind). The DOS exit
         // code becomes the process status so a .COM result is scriptable.
         let code = {
             let image = std::fs::read(path)?;
             let mut machine =
-                Machine::new_dos_com(MachineProfile::from_hardware_profile(&hardware), &image)?;
+                Machine::new_dos_program(MachineProfile::from_hardware_profile(&hardware), &image)?;
             // Mount the configured C: drive so INT 21h file calls resolve.
             machine.mount_c_drive(dos.c_drive.clone());
             if let Some(text) = &cli.stdin_text {

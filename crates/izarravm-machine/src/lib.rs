@@ -242,17 +242,19 @@ impl Machine {
         Ok(machine)
     }
 
-    /// Build a machine with a .COM program loaded and ready to run. The program is
-    /// placed at DOS_LOAD_SEGMENT with its PSP, and the CPU is set to its entry
-    /// (CS=DS=ES=SS=segment, IP=0x100, SP=0xFFFE). Run with run_until_halt_or_cycles
-    /// and read dos_output plus the DosExit stop reason.
+    /// Build a machine with a DOS program loaded and ready to run. The format is
+    /// detected by the "MZ" signature: an .EXE is relocated and entered at its
+    /// header CS:IP / SS:SP with DS=ES=PSP; a .COM is loaded flat at
+    /// DOS_LOAD_SEGMENT with CS=DS=ES=SS=that segment, IP=0x100, SP=0xFFFE. Run
+    /// with run_until_halt_or_cycles and read dos_output plus the DosExit stop
+    /// reason.
     ///
-    /// Entry eflags has IF clear, unlike real DOS which hands a .COM control with
+    /// Entry eflags has IF clear, unlike real DOS which hands control with
     /// interrupts enabled. This slice installs no BIOS interrupt handlers (IVT[8]
     /// and friends are zero), so a program that wants hardware IRQs must set them up
     /// and STI itself; the BIOS IVT and an interrupts-enabled handoff come with a
     /// later slice.
-    pub fn new_dos_com(profile: MachineProfile, image: &[u8]) -> Result<Self, MachineError> {
+    pub fn new_dos_program(profile: MachineProfile, image: &[u8]) -> Result<Self, MachineError> {
         let mut machine = Self {
             memory: Memory::from_mib(profile.memory_mib)?,
             profile,
@@ -282,7 +284,7 @@ impl Machine {
         );
         install_boot_bios_stubs(&mut machine.memory)?;
 
-        let entry = izarravm_dos::load_com(image, &mut machine.memory, DOS_LOAD_SEGMENT)?;
+        let entry = izarravm_dos::load_program(image, &mut machine.memory, DOS_LOAD_SEGMENT)?;
         machine.apply_program_entry(entry);
         Ok(machine)
     }
@@ -2035,7 +2037,7 @@ mod tests {
             b'$',
         ];
         let mut machine =
-            Machine::new_dos_com(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com).unwrap();
+            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com).unwrap();
         let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
         assert_eq!(reason, StopReason::DosExit { code: 0 });
         assert_eq!(machine.dos_output(), b"Hi");
@@ -2046,7 +2048,7 @@ mod tests {
         // org 0x100: mov ax,4c07; int 21
         let com: &[u8] = &[0xb8, 0x07, 0x4c, 0xcd, 0x21];
         let mut machine =
-            Machine::new_dos_com(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com).unwrap();
+            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com).unwrap();
         let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
         assert_eq!(reason, StopReason::DosExit { code: 7 });
         assert!(machine.dos_output().is_empty());
@@ -2057,7 +2059,7 @@ mod tests {
         // org 0x100: mov ah,0x30 (unhandled); int 21; mov ax,4c00; int 21
         let com: &[u8] = &[0xb4, 0x30, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21];
         let mut machine =
-            Machine::new_dos_com(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com).unwrap();
+            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com).unwrap();
         let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
         assert_eq!(reason, StopReason::DosExit { code: 0 });
         assert!(machine.dos_output().is_empty());
@@ -2092,7 +2094,7 @@ mod tests {
 
     #[test]
     fn dos_com_runs_the_committed_hello_fixture() {
-        let mut machine = Machine::new_dos_com(
+        let mut machine = Machine::new_dos_program(
             MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
             izarravm_firmware::HELLO_COM,
         )
@@ -2113,7 +2115,7 @@ mod tests {
         ];
 
         let mut available =
-            Machine::new_dos_com(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com).unwrap();
+            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com).unwrap();
         available.set_dos_stdin(b"X");
         assert_eq!(
             available.run_until_halt_or_cycles(100_000).unwrap(),
@@ -2122,7 +2124,7 @@ mod tests {
         assert_eq!(available.dos_output(), b"X"); // char path taken, AL echoed
 
         let mut empty =
-            Machine::new_dos_com(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com).unwrap();
+            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com).unwrap();
         assert_eq!(
             empty.run_until_halt_or_cycles(100_000).unwrap(),
             StopReason::DosExit { code: 0 }
@@ -2137,7 +2139,7 @@ mod tests {
             0xb4, 0x01, 0xcd, 0x21, 0xb4, 0x01, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21,
         ];
         let mut machine =
-            Machine::new_dos_com(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com).unwrap();
+            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com).unwrap();
         machine.set_dos_stdin(b"hi");
         assert_eq!(
             machine.run_until_halt_or_cycles(100_000).unwrap(),
@@ -2210,7 +2212,7 @@ mod tests {
 
     #[test]
     fn dos_com_runs_the_committed_echo_fixture() {
-        let mut machine = Machine::new_dos_com(
+        let mut machine = Machine::new_dos_program(
             MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
             izarravm_firmware::ECHO_COM,
         )
@@ -2225,7 +2227,7 @@ mod tests {
     fn dos_com_reads_a_file_from_c_drive() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("HELLO.TXT"), b"File data 123").unwrap();
-        let mut machine = Machine::new_dos_com(
+        let mut machine = Machine::new_dos_program(
             MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
             izarravm_firmware::TYPE_COM,
         )
