@@ -307,11 +307,21 @@ impl DosKernel {
                 regs.cf = false;
                 Ok(DosAction::Continue)
             }
+            // AH=3Eh: close the handle in BX. Dropping the File closes it (RAII).
+            // CF=0 if the handle was open, CF=1 + AX=0x06 if it was not.
+            0x3e => {
+                if self.open_files.remove(&regs.bx).is_some() {
+                    regs.cf = false;
+                } else {
+                    set_dos_error(regs, 0x06);
+                }
+                Ok(DosAction::Continue)
+            }
             // AH=4Ch: terminate with the return code in AL.
             0x4c => Ok(DosAction::Exit((regs.ax & 0x00ff) as u8)),
-            // File reads and closes (3Fh/3Eh) and the other unimplemented functions
-            // are later slices. An unimplemented function is a no-op so the IRET stub
-            // returns.
+            // Other file functions (write, seek, find) and everything else are not
+            // yet implemented; later slices fill them in. An unimplemented function
+            // returns Continue so the IRET stub returns to the caller.
             _ => Ok(DosAction::Continue),
         }
     }
@@ -804,5 +814,54 @@ mod tests {
         let regs = read(&mut kernel, &mut mem, 99, 16, 0x0400);
         assert!(regs.cf);
         assert_eq!(regs.ax, 0x06);
+    }
+
+    fn close(kernel: &mut DosKernel, mem: &mut Memory, handle: u16) -> DosRegs {
+        let mut regs = DosRegs {
+            ax: 0x3e00,
+            bx: handle,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, mem).unwrap();
+        regs
+    }
+
+    #[test]
+    fn closes_an_open_handle() {
+        let (mut kernel, mut mem, _dir) = kernel_with_drive(&[("DATA.TXT", b"hi")], r"C:\DATA.TXT");
+        let handle = open_data(&mut kernel, &mut mem);
+        let regs = close(&mut kernel, &mut mem, handle);
+        assert!(!regs.cf);
+        assert_eq!(regs.ax, 0x3e00); // AX untouched on success, so AH is preserved
+        // Reading the closed handle now fails as invalid.
+        let after = read(&mut kernel, &mut mem, handle, 4, 0x0400);
+        assert!(after.cf);
+        assert_eq!(after.ax, 0x06);
+        // Closing the same handle again fails as invalid (no idempotent success).
+        let again = close(&mut kernel, &mut mem, handle);
+        assert!(again.cf);
+        assert_eq!(again.ax, 0x06);
+    }
+
+    #[test]
+    fn close_invalid_handle_sets_ax06() {
+        let (mut kernel, mut mem, _dir) = kernel_with_drive(&[("DATA.TXT", b"hi")], r"C:\DATA.TXT");
+        let regs = close(&mut kernel, &mut mem, 99);
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x06);
+    }
+
+    #[test]
+    fn handles_start_at_5_and_reuse_lowest_free() {
+        // One file opened twice: each open is an independent File and handle.
+        let (mut kernel, mut mem, _dir) =
+            kernel_with_drive(&[("DATA.TXT", b"one")], r"C:\DATA.TXT");
+        let h1 = open_data(&mut kernel, &mut mem);
+        let h2 = open_data(&mut kernel, &mut mem);
+        assert_eq!(h1, 5);
+        assert_eq!(h2, 6);
+        close(&mut kernel, &mut mem, h1);
+        let h3 = open_data(&mut kernel, &mut mem);
+        assert_eq!(h3, 5); // lowest free handle reused
     }
 }
