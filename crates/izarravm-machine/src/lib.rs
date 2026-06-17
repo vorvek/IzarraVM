@@ -396,7 +396,7 @@ impl Machine {
 
     /// Select a VGA planar mode by its INT 10h number from the host side. Returns
     /// false for an unimplemented number. On success it hands the display back to
-    /// the VGA core (clears the Margo latch), like the guest INT 10h path.
+    /// the VGA core by clearing the Margo latch.
     pub fn set_vga_mode(&mut self, mode: u8) -> bool {
         let ok = self.video.set_mode(mode);
         if ok {
