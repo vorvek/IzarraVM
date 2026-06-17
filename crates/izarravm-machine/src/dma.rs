@@ -83,7 +83,7 @@ impl DmaChannel {
 /// the command/status/request registers. Exposed methods operate on a "local"
 /// register index 0..16 (the master's raw port, or the slave's translated port).
 #[derive(Debug, Clone, Default)]
-struct DmaChip {
+pub(crate) struct DmaChip {
     pub(crate) channels: [DmaChannel; 4],
     hi_lo: bool,      // byte pointer: false = LSB next, true = MSB next
     command: u8,

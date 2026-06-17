@@ -138,6 +138,7 @@ pub struct Machine {
     pic: pic::Pic8259Pair,
     pit: pit::Pit,
     pit_clocks: f64, // fractional PIT input clocks owed to the counters
+    dma: dma::DmaController,
     opl: OplChip,
     resampler: Resampler,
     opl_micros: f64, // fractional microseconds owed to the OPL timers
@@ -169,6 +170,7 @@ impl Machine {
             pic: pic::Pic8259Pair::default(),
             pit: pit::Pit::default(),
             pit_clocks: 0.0,
+            dma: dma::DmaController::default(),
             opl: OplChip::default(),
             resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             opl_micros: 0.0,
@@ -211,6 +213,7 @@ impl Machine {
             pic: pic::Pic8259Pair::default(),
             pit: pit::Pit::default(),
             pit_clocks: 0.0,
+            dma: dma::DmaController::default(),
             opl: OplChip::default(),
             resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             opl_micros: 0.0,
@@ -271,6 +274,7 @@ impl Machine {
             pic: pic::Pic8259Pair::default(),
             pit: pit::Pit::default(),
             pit_clocks: 0.0,
+            dma: dma::DmaController::default(),
             opl: OplChip::default(),
             resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             opl_micros: 0.0,
@@ -355,6 +359,7 @@ impl Machine {
             device_ports: &mut self.device_ports,
             pic: &mut self.pic,
             pit: &mut self.pit,
+            dma: &mut self.dma,
             opl: &mut self.opl,
             trace: &mut self.trace,
             pending_soft_int: &mut self.pending_soft_int,
@@ -716,6 +721,13 @@ impl Machine {
         self.pic.request(line);
     }
 
+    /// Pull one byte from a DMA channel's memory transfer (memory->device read).
+    /// Returns None when the channel is masked or has reached terminal count. The
+    /// sound slice feeds this to the SB16 DSP for 8-bit playback.
+    pub fn dma_read_byte(&mut self, channel: usize) -> Option<u8> {
+        self.dma.read_byte(channel, &mut self.memory)
+    }
+
     /// Drive a PIT counter's GATE line. The PC ties GATE0/GATE1 high; the sound
     /// slice wires GATE2 from port 0x61. Exposed now so the GATE-triggered modes
     /// have a caller outside tests.
@@ -780,6 +792,7 @@ impl Machine {
                     device_ports,
                     pic,
                     pit,
+                    dma,
                     opl,
                     trace,
                     pending_soft_int,
@@ -794,6 +807,7 @@ impl Machine {
                     device_ports,
                     pic,
                     pit,
+                    dma,
                     opl,
                     trace,
                     pending_soft_int,
@@ -853,6 +867,7 @@ struct MachineBus<'a> {
     device_ports: &'a mut DevicePorts,
     pic: &'a mut pic::Pic8259Pair,
     pit: &'a mut pit::Pit,
+    dma: &'a mut dma::DmaController,
     opl: &'a mut OplChip,
     trace: &'a mut BusTrace,
     pending_soft_int: &'a mut Option<u8>,
@@ -962,6 +977,9 @@ impl CpuBus for MachineBus<'_> {
         if let Some(value) = self.pic.read_port(port) {
             return Ok(u32::from(value));
         }
+        if let Some(value) = self.dma.read_port(port) {
+            return Ok(u32::from(value));
+        }
         self.device_ports
             .read_port(port)
             .map(u32::from)
@@ -982,6 +1000,9 @@ impl CpuBus for MachineBus<'_> {
 
         if let Some(opl_port) = opl_port(port) {
             self.opl.write_port(opl_port, value as u8);
+            return Ok(());
+        }
+        if self.dma.write_port(port, value as u8) {
             return Ok(());
         }
         if self.serial.write_port(port, value as u8)
@@ -1673,6 +1694,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dma_channel_one_transfers_from_memory_through_the_bus() {
+        let mut machine = test_machine();
+        // Seed memory at physical 0x01_0010 (page 0x01, offset 0x0010).
+        machine.write_physical_u8(0x0001_0010, 0x77);
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x0B, BusWidth::Byte, 0x49).unwrap(); // mode ch1: single, read
+            bus.write_io(0x02, BusWidth::Byte, 0x10).unwrap(); // address LSB
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap(); // address MSB -> 0x0010
+            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap(); // count LSB
+            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap(); // count MSB -> 0 (1 transfer)
+            bus.write_io(0x83, BusWidth::Byte, 0x01).unwrap(); // page -> 0x01_0010
+            bus.write_io(0x0A, BusWidth::Byte, 0x01).unwrap(); // unmask channel 1
+        });
+        let byte = machine.dma_read_byte(1).expect("a byte from channel 1");
+        assert_eq!(byte, 0x77);
+    }
+
     // Run one closure against a freshly-borrowed bus over the whole machine.
     fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R {
         let mut bus = MachineBus {
@@ -1684,6 +1723,7 @@ mod tests {
             device_ports: &mut machine.device_ports,
             pic: &mut machine.pic,
             pit: &mut machine.pit,
+            dma: &mut machine.dma,
             opl: &mut machine.opl,
             trace: &mut machine.trace,
             pending_soft_int: &mut machine.pending_soft_int,
