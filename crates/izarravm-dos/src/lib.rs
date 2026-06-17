@@ -1,5 +1,6 @@
 use izarravm_bus::{BusError, Memory};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -115,102 +116,134 @@ pub enum DosAction {
     Exit(u8), // terminate the program with this code
 }
 
-/// Service a software interrupt the DOS kernel handles. `vector` is the INT number
-/// (0x20 terminate, 0x21 the AH-dispatched function set). Reads and writes `regs`,
-/// reads guest memory through `mem`, and appends console output to `stdout`.
-///
-/// DOS services are emulated host-side (HLE), the standard approach for a machine
-/// with no resident DOS. Unimplemented INT 21h functions return Continue with no
-/// effect, so the caller's IRET stub returns cleanly; later slices fill them in.
-///
-/// `mem` is `&mut` because the file-read call (AH=3Fh, a later slice) writes the
-/// data it reads back into guest memory at DS:DX; the print call only reads.
-pub fn dispatch(
-    vector: u8,
-    regs: &mut DosRegs,
-    mem: &mut Memory,
-    stdin: &mut VecDeque<u8>,
-    stdout: &mut Vec<u8>,
-) -> Result<DosAction, DosError> {
-    match vector {
-        0x20 => Ok(DosAction::Exit(0)),
-        0x21 => dispatch_int21(regs, mem, stdin, stdout),
-        // The machine only records 0x10/0x20/0x21 and routes 0x10 elsewhere, so
-        // this is unreachable today. Treat it as a no-op rather than panic.
-        _ => Ok(DosAction::Continue),
-    }
+/// The stateful DOS kernel. Owns the host-side state that must survive between
+/// INT 21h calls: the open-file handle table and the mounted C: drive, plus the
+/// standard input and output buffers (high-level emulated, HLE). The machine
+/// holds one of these and calls `dispatch` from its INT 21h handler.
+#[derive(Debug, Default)]
+pub struct DosKernel {
+    drive: Option<HostDrive>,
+    // File handles 5 and up; populated by AH=3Dh, read by AH=3Fh/3Eh (next task).
+    #[allow(dead_code)]
+    open_files: HashMap<u16, File>,
+    stdin: VecDeque<u8>,
+    stdout: Vec<u8>,
 }
 
-fn dispatch_int21(
-    regs: &mut DosRegs,
-    mem: &mut Memory,
-    stdin: &mut VecDeque<u8>,
-    stdout: &mut Vec<u8>,
-) -> Result<DosAction, DosError> {
-    let ah = (regs.ax >> 8) as u8;
-    match ah {
-        // AH=01h: read one character with echo. A real keyboard blocks; with a
-        // preloaded buffer an empty buffer yields the redirected-input EOF byte ^Z.
-        0x01 => {
-            let ch = stdin.pop_front().unwrap_or(0x1a);
-            stdout.push(ch);
-            regs.ax = (regs.ax & 0xff00) | u16::from(ch);
-            Ok(DosAction::Continue)
+impl DosKernel {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Mount a host directory as the C: drive. File opens resolve against it.
+    pub fn mount_c(&mut self, drive: HostDrive) {
+        self.drive = Some(drive);
+    }
+
+    /// Replace the standard-input buffer, consumed front to back by the
+    /// character-input calls.
+    pub fn set_stdin(&mut self, bytes: &[u8]) {
+        self.stdin = bytes.iter().copied().collect();
+    }
+
+    /// The bytes written to standard output so far.
+    pub fn stdout(&self) -> &[u8] {
+        &self.stdout
+    }
+
+    /// Service a software interrupt the DOS kernel handles. `vector` is the INT
+    /// number (0x20 terminate, 0x21 the AH-dispatched set). Reads and writes
+    /// `regs`, reads/writes guest memory through `mem`. DOS services are emulated
+    /// host-side (HLE). Unimplemented INT 21h functions return Continue with no
+    /// effect, so the caller's IRET stub returns cleanly.
+    ///
+    /// `mem` is `&mut` because the file-read call (AH=3Fh, a later slice) writes
+    /// the data it reads back into guest memory at DS:DX; the print call only reads.
+    pub fn dispatch(
+        &mut self,
+        vector: u8,
+        regs: &mut DosRegs,
+        mem: &mut Memory,
+    ) -> Result<DosAction, DosError> {
+        match vector {
+            0x20 => Ok(DosAction::Exit(0)),
+            0x21 => self.dispatch_int21(regs, mem),
+            // The machine only records 0x10/0x20/0x21 and routes 0x10 elsewhere, so
+            // this is unreachable today. Treat it as a no-op rather than panic.
+            _ => Ok(DosAction::Continue),
         }
-        // AH=02h: write the byte in DL to standard output. AL returns it (DOS 2+).
-        0x02 => {
-            let ch = regs.dx as u8;
-            stdout.push(ch);
-            regs.ax = (regs.ax & 0xff00) | u16::from(ch);
-            Ok(DosAction::Continue)
-        }
-        // AH=06h: direct console I/O. DL=0xFF reads without waiting (ZF reports
-        // whether a character was ready); any other DL writes DL.
-        0x06 => {
-            if regs.dx as u8 == 0xff {
-                match stdin.pop_front() {
-                    Some(ch) => {
-                        regs.ax = (regs.ax & 0xff00) | u16::from(ch);
-                        regs.zf = false;
-                    }
-                    None => regs.zf = true,
-                }
-            } else {
-                // Output form: ZF is undefined for AH=06h output, so leave regs.zf
-                // at the guest value rather than clobbering it.
-                let ch = regs.dx as u8;
-                stdout.push(ch);
+    }
+
+    fn dispatch_int21(
+        &mut self,
+        regs: &mut DosRegs,
+        mem: &mut Memory,
+    ) -> Result<DosAction, DosError> {
+        let ah = (regs.ax >> 8) as u8;
+        match ah {
+            // AH=01h: read one character with echo. A real keyboard blocks; with a
+            // preloaded buffer an empty buffer yields the redirected-input EOF byte ^Z.
+            0x01 => {
+                let ch = self.stdin.pop_front().unwrap_or(0x1a);
+                self.stdout.push(ch);
                 regs.ax = (regs.ax & 0xff00) | u16::from(ch);
+                Ok(DosAction::Continue)
             }
-            Ok(DosAction::Continue)
-        }
-        // AH=08h: read one character without echo. ^Z on an empty buffer, as AH=01h.
-        0x08 => {
-            let ch = stdin.pop_front().unwrap_or(0x1a);
-            regs.ax = (regs.ax & 0xff00) | u16::from(ch);
-            Ok(DosAction::Continue)
-        }
-        // AH=09h: print the '$'-terminated string at DS:DX to standard output.
-        0x09 => {
-            let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
-            let mut offset = 0usize;
-            loop {
-                let byte = mem.read_u8(base + offset)?;
-                if byte == b'$' {
-                    break;
+            // AH=02h: write the byte in DL to standard output. AL returns it (DOS 2+).
+            0x02 => {
+                let ch = regs.dx as u8;
+                self.stdout.push(ch);
+                regs.ax = (regs.ax & 0xff00) | u16::from(ch);
+                Ok(DosAction::Continue)
+            }
+            // AH=06h: direct console I/O. DL=0xFF reads without waiting (ZF reports
+            // whether a character was ready); any other DL writes DL.
+            0x06 => {
+                if regs.dx as u8 == 0xff {
+                    match self.stdin.pop_front() {
+                        Some(ch) => {
+                            regs.ax = (regs.ax & 0xff00) | u16::from(ch);
+                            regs.zf = false;
+                        }
+                        None => regs.zf = true,
+                    }
+                } else {
+                    // Output form: ZF is undefined for AH=06h output, so leave regs.zf
+                    // at the guest value rather than clobbering it.
+                    let ch = regs.dx as u8;
+                    self.stdout.push(ch);
+                    regs.ax = (regs.ax & 0xff00) | u16::from(ch);
                 }
-                stdout.push(byte);
-                offset += 1;
+                Ok(DosAction::Continue)
             }
-            // DOS returns AL = '$' (0x24) from AH=09h.
-            regs.ax = (regs.ax & 0xff00) | 0x24;
-            Ok(DosAction::Continue)
+            // AH=08h: read one character without echo. ^Z on an empty buffer, as AH=01h.
+            0x08 => {
+                let ch = self.stdin.pop_front().unwrap_or(0x1a);
+                regs.ax = (regs.ax & 0xff00) | u16::from(ch);
+                Ok(DosAction::Continue)
+            }
+            // AH=09h: print the '$'-terminated string at DS:DX to standard output.
+            0x09 => {
+                let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+                let mut offset = 0usize;
+                loop {
+                    let byte = mem.read_u8(base + offset)?;
+                    if byte == b'$' {
+                        break;
+                    }
+                    self.stdout.push(byte);
+                    offset += 1;
+                }
+                // DOS returns AL = '$' (0x24) from AH=09h.
+                regs.ax = (regs.ax & 0xff00) | 0x24;
+                Ok(DosAction::Continue)
+            }
+            // AH=4Ch: terminate with the return code in AL.
+            0x4c => Ok(DosAction::Exit((regs.ax & 0x00ff) as u8)),
+            // File I/O (3Dh/3Fh/3Eh) and the other unimplemented functions are later
+            // slices. An unimplemented function is a no-op so the IRET stub returns.
+            _ => Ok(DosAction::Continue),
         }
-        // AH=4Ch: terminate with the return code in AL.
-        0x4c => Ok(DosAction::Exit((regs.ax & 0x00ff) as u8)),
-        // File I/O (3Dh/3Fh/3Eh) and the other unimplemented functions are later
-        // slices. An unimplemented function is a no-op so the IRET stub returns.
-        _ => Ok(DosAction::Continue),
     }
 }
 
@@ -310,11 +343,11 @@ mod tests {
             dx: 0x0010,
             ..DosRegs::default()
         };
-        let mut stdin = VecDeque::new();
-        let mut out = Vec::new();
-        let action = dispatch(0x21, &mut regs, &mut mem, &mut stdin, &mut out).unwrap();
+        let mut kernel = DosKernel::new();
+        kernel.set_stdin(b"");
+        let action = kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
         assert_eq!(action, DosAction::Continue);
-        assert_eq!(out, b"Hello");
+        assert_eq!(kernel.stdout(), b"Hello");
         assert_eq!(regs.ax & 0x00ff, 0x24); // AH=09h returns AL = '$'
         assert_eq!(regs.ax >> 8, 0x09); // AH is preserved
     }
@@ -333,10 +366,10 @@ mod tests {
             dx: 0x0000,
             ..DosRegs::default()
         };
-        let mut stdin = VecDeque::new();
-        let mut out = Vec::new();
+        let mut kernel = DosKernel::new();
+        kernel.set_stdin(b"");
         assert!(matches!(
-            dispatch(0x21, &mut regs, &mut mem, &mut stdin, &mut out),
+            kernel.dispatch(0x21, &mut regs, &mut mem),
             Err(DosError::Memory(_))
         ));
     }
@@ -350,10 +383,10 @@ mod tests {
             dx: 0x0010,
             ..DosRegs::default()
         };
-        let mut stdin = VecDeque::new();
-        let mut out = Vec::new();
-        dispatch(0x21, &mut regs, &mut mem, &mut stdin, &mut out).unwrap();
-        assert!(out.is_empty());
+        let mut kernel = DosKernel::new();
+        kernel.set_stdin(b"");
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(kernel.stdout().is_empty());
     }
 
     #[test]
@@ -363,10 +396,10 @@ mod tests {
             ax: 0x4c07,
             ..DosRegs::default()
         };
-        let mut stdin = VecDeque::new();
-        let mut out = Vec::new();
+        let mut kernel = DosKernel::new();
+        kernel.set_stdin(b"");
         assert_eq!(
-            dispatch(0x21, &mut regs, &mut mem, &mut stdin, &mut out).unwrap(),
+            kernel.dispatch(0x21, &mut regs, &mut mem).unwrap(),
             DosAction::Exit(7)
         );
     }
@@ -375,10 +408,10 @@ mod tests {
     fn int20_exits_with_zero() {
         let mut mem = Memory::new(4096).unwrap();
         let mut regs = DosRegs::default();
-        let mut stdin = VecDeque::new();
-        let mut out = Vec::new();
+        let mut kernel = DosKernel::new();
+        kernel.set_stdin(b"");
         assert_eq!(
-            dispatch(0x20, &mut regs, &mut mem, &mut stdin, &mut out).unwrap(),
+            kernel.dispatch(0x20, &mut regs, &mut mem).unwrap(),
             DosAction::Exit(0)
         );
     }
@@ -390,11 +423,11 @@ mod tests {
             ax: 0x3000, // AH=30h get DOS version, not implemented this slice
             ..DosRegs::default()
         };
-        let mut stdin = VecDeque::new();
-        let mut out = Vec::new();
-        let action = dispatch(0x21, &mut regs, &mut mem, &mut stdin, &mut out).unwrap();
+        let mut kernel = DosKernel::new();
+        kernel.set_stdin(b"");
+        let action = kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
         assert_eq!(action, DosAction::Continue);
-        assert!(out.is_empty());
+        assert!(kernel.stdout().is_empty());
     }
 
     #[test]
@@ -434,16 +467,16 @@ mod tests {
 
     fn char_io(ax: u16, dx: u16, input: &[u8]) -> (DosRegs, Vec<u8>) {
         let mut mem = Memory::new(4096).unwrap();
-        let mut stdin: VecDeque<u8> = input.iter().copied().collect();
-        let mut stdout = Vec::new();
+        let mut kernel = DosKernel::new();
+        kernel.set_stdin(input);
         let mut regs = DosRegs {
             ax,
             dx,
             ..DosRegs::default()
         };
-        let action = dispatch(0x21, &mut regs, &mut mem, &mut stdin, &mut stdout).unwrap();
+        let action = kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
         assert_eq!(action, DosAction::Continue);
-        (regs, stdout) // DosRegs is Copy and holds the post-dispatch AX/ZF
+        (regs, kernel.stdout().to_vec()) // DosRegs is Copy and holds the post-dispatch AX/ZF
     }
 
     #[test]
@@ -490,18 +523,18 @@ mod tests {
     fn ah06_input_available_clears_zf() {
         // ZF starts set so the assertion proves the available path clears it.
         let mut mem = Memory::new(4096).unwrap();
-        let mut stdin: VecDeque<u8> = b"X".iter().copied().collect();
-        let mut stdout = Vec::new();
+        let mut kernel = DosKernel::new();
+        kernel.set_stdin(b"X");
         let mut regs = DosRegs {
             ax: 0x0600,
             dx: 0x00ff,
             zf: true,
             ..DosRegs::default()
         };
-        dispatch(0x21, &mut regs, &mut mem, &mut stdin, &mut stdout).unwrap();
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
         assert_eq!(regs.ax & 0x00ff, 0x58); // AL = 'X'
         assert!(!regs.zf); // cleared because a character was available
-        assert!(stdout.is_empty()); // no echo
+        assert!(kernel.stdout().is_empty()); // no echo
     }
 
     #[test]
