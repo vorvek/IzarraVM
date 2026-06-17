@@ -857,7 +857,9 @@ pub fn display_offset(mode_control: u8, underline_loc: u8, ma: u32) -> usize {
     let addr = if mode_control & 0x40 != 0 {
         ma // byte mode (CR17 bit 6): identity
     } else if underline_loc & 0x40 != 0 {
-        // doubleword mode (CR14 bit 6): rotate left 2, MA13 -> bit 1, MA12 -> bit 0
+        // doubleword mode (CR14 bit 6): rotate left 2, MA13 -> bit 1, MA12 -> bit 0.
+        // These bit positions are pending validation against an unbroken reference
+        // mirror; no in-scope 16-color planar workload exercises doubleword mode.
         (ma << 2) | ((ma >> 12) & 0x3)
     } else {
         // word mode: rotate left 1, MA15 (CR17 bit 5 = 1) or MA13 (= 0) -> bit 0
