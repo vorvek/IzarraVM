@@ -1153,6 +1153,7 @@ dependencies = [
  "izarravm-dos",
  "izarravm-firmware",
  "izarravm-video",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 

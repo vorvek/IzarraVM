@@ -2158,6 +2158,21 @@ mod tests {
     }
 
     #[test]
+    fn dos_com_reads_a_file_from_c_drive() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("HELLO.TXT"), b"File data 123").unwrap();
+        let mut machine = Machine::new_dos_com(
+            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            izarravm_firmware::TYPE_COM,
+        )
+        .unwrap();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
+        assert_eq!(machine.dos_output(), b"File data 123");
+    }
+
+    #[test]
     fn line_through_the_mmio_aperture_draws_and_times_busy() {
         let mut machine = test_machine();
         // draw_line: a horizontal 5-pixel line at y=5 from x=10 to x=14, pitch 640,
