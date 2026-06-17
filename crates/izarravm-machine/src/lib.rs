@@ -2814,6 +2814,51 @@ mod tests {
     }
 
     #[test]
+    fn overlay_yv12_chroma_traversal_addresses_each_cell() {
+        let mut machine = test_machine();
+        machine.margo_mut().set_mode(0x14a); // 640x480x32
+        // 4x4 YV12 source with a flat Y of 128, so each output pixel's color is set
+        // solely by which 2x2 chroma cell it samples. The 2x2 chroma grid (chroma
+        // pitch = Y pitch / 2 = 2) holds a distinct (U, V) per cell, so this proves
+        // cx = sx/2, cy = sy/2, and the chroma-plane stride, which the 2x2 test (only
+        // cell 0,0) does not exercise.
+        let yp = 0x0020_0000u32;
+        let up = 0x0020_1000u32;
+        let vp = 0x0020_2000u32;
+        for i in 0..16u32 {
+            machine.write_physical_u8(MARGO_LFB_BASE + yp + i, 128);
+        }
+        // Chroma cells indexed cy * 2 + cx.
+        let us = [128u8, 128, 255, 255];
+        let vs = [128u8, 255, 128, 255];
+        for i in 0..4u32 {
+            machine.write_physical_u8(MARGO_LFB_BASE + up + i, us[i as usize]);
+            machine.write_physical_u8(MARGO_LFB_BASE + vp + i, vs[i as usize]);
+        }
+
+        write_mmio_reg(&mut machine, 0x44, yp); // OVL_SRC_Y
+        write_mmio_reg(&mut machine, 0x48, 4); // OVL_SRC_PITCH (Y plane)
+        write_mmio_reg(&mut machine, 0x4c, (4 << 16) | 4); // OVL_SRC_DIM: 4x4
+        write_mmio_reg(&mut machine, 0x50, up); // OVL_SRC_U
+        write_mmio_reg(&mut machine, 0x54, vp); // OVL_SRC_V
+        write_mmio_reg(&mut machine, 0x58, (20 << 16) | 10); // OVL_DST_XY
+        write_mmio_reg(&mut machine, 0x5c, (4 << 16) | 4); // OVL_DST_DIM: 4x4 (1:1)
+        write_mmio_reg(&mut machine, 0x40, 1 | (1 << 1)); // ENABLE + FORMAT YV12
+
+        let palette = machine.palette_argb();
+        let argb = machine.margo().scanout_argb(&palette);
+        // Cell (0,0) U=128 V=128 -> gray; two pixels in the same cell share it.
+        assert_eq!(argb[20 * 640 + 10], 0x0082_8282);
+        assert_eq!(argb[21 * 640 + 11], 0x0082_8282);
+        // Cell (1,0) U=128 V=255.
+        assert_eq!(argb[20 * 640 + 12], 0x00ff_1b82);
+        // Cell (0,1) U=255 V=128.
+        assert_eq!(argb[22 * 640 + 10], 0x0082_51ff);
+        // Cell (1,1) U=255 V=255.
+        assert_eq!(argb[22 * 640 + 12], 0x00ff_00ff);
+    }
+
+    #[test]
     fn dos_program_startup_services() {
         // org 0x100:
         //   mov ah,0x30 / int 0x21            ; get version (AL=6, AH=10), no fault
