@@ -54,10 +54,19 @@ impl CrtcTiming {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Sequencer {
+    pub map_mask: u8,    // idx 2, low 4 bits
+    pub memory_mode: u8, // idx 4
+}
+
 #[derive(Debug, Clone)]
 pub struct Vga {
     pub(crate) vram: Vec<u8>,
     pub(crate) crtc: CrtcTiming,
+    pub(crate) seq: Sequencer,
+    pub(crate) gc: GfxController,
+    pub(crate) latches: [u8; VGA_PLANES],
 }
 
 impl Default for Vga {
@@ -65,6 +74,9 @@ impl Default for Vga {
         Self {
             vram: vec![0; VGA_PLANAR_SIZE],
             crtc: CrtcTiming::text_03h(),
+            seq: Sequencer::default(),
+            gc: GfxController::default(),
+            latches: [0; VGA_PLANES],
         }
     }
 }
@@ -72,6 +84,46 @@ impl Default for Vga {
 impl Vga {
     pub fn frame_dots(&self) -> u64 {
         self.crtc.frame_dots()
+    }
+
+    pub fn plane_byte(&self, plane: usize, offset: usize) -> u8 {
+        self.vram[plane * VGA_PLANE_SIZE + offset]
+    }
+
+    fn plane_slice_mut(&mut self, offset: usize) -> [[u8; 1]; VGA_PLANES] {
+        let mut planes = [[0u8; 1]; VGA_PLANES];
+        for plane in 0..VGA_PLANES {
+            planes[plane][0] = self.vram[plane * VGA_PLANE_SIZE + offset];
+        }
+        planes
+    }
+
+    fn store_planes(&mut self, offset: usize, planes: &[[u8; 1]; VGA_PLANES]) {
+        for plane in 0..VGA_PLANES {
+            if (self.seq.map_mask >> plane) & 1 != 0 {
+                self.vram[plane * VGA_PLANE_SIZE + offset] = planes[plane][0];
+            }
+        }
+    }
+
+    pub fn cpu_write(&mut self, offset: usize, data: u8) {
+        if offset >= VGA_PLANE_SIZE {
+            return;
+        }
+        let mut planes = self.plane_slice_mut(offset);
+        let gc = self.gc;
+        let latches = self.latches;
+        write_planes(&mut planes, data, &gc, &latches);
+        self.store_planes(offset, &planes);
+    }
+
+    pub fn cpu_read(&mut self, offset: usize) -> u8 {
+        if offset >= VGA_PLANE_SIZE {
+            return 0xFF;
+        }
+        let planes = self.plane_slice_mut(offset);
+        let gc = self.gc;
+        read_planes(&planes, &gc, &mut self.latches)
     }
 }
 
@@ -288,5 +340,27 @@ mod tests {
         let mut latches = [0u8; VGA_PLANES];
         let byte = read_planes(&planes, &gc, &mut latches);
         assert_eq!(byte, 0xFF); // every bit position matches the pattern
+    }
+
+    #[test]
+    fn cpu_write_then_read_round_trips_through_latches() {
+        let mut vga = Vga::default();
+        vga.seq.map_mask = 0x0F; // all planes enabled
+        vga.gc.write_mode = 0;
+        vga.gc.bit_mask = 0xFF;
+        vga.cpu_write(0x10, 0xA5);
+        vga.gc.read_map = 0;
+        assert_eq!(vga.cpu_read(0x10), 0xA5);
+        assert_eq!(vga.latches, [0xA5; VGA_PLANES]);
+    }
+
+    #[test]
+    fn map_mask_gates_which_planes_are_written() {
+        let mut vga = Vga::default();
+        vga.seq.map_mask = 0b0001; // only plane 0
+        vga.gc.bit_mask = 0xFF;
+        vga.cpu_write(0, 0xFF);
+        assert_eq!(vga.plane_byte(0, 0), 0xFF);
+        assert_eq!(vga.plane_byte(1, 0), 0x00);
     }
 }
