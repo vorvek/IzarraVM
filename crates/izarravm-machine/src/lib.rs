@@ -150,9 +150,9 @@ pub struct Machine {
     /// changes. Summed with the OPL stream in render_audio.
     dsp_resampler: Resampler,
     dsp_rate_hz: u32, // input rate the dsp_resampler is currently configured for
-    dsp_micros: f64, // fractional microseconds owed to the DSP reset-settle clock
-    margo_ns: f64,   // fractional nanoseconds owed to the Margo busy countdown
-    vga_dots: f64,   // fractional VGA dot clocks owed to the beam advance
+    dsp_micros: f64,  // fractional microseconds owed to the DSP reset-settle clock
+    margo_ns: f64,    // fractional nanoseconds owed to the Margo busy countdown
+    vga_dots: f64,    // fractional VGA dot clocks owed to the beam advance
     trace: BusTrace,
     elapsed_clocks: u64,
 }
@@ -743,7 +743,11 @@ impl Machine {
     /// mixer (render_audio) resamples and sums it with the OPL.
     pub fn render_dsp_audio(&mut self, native_samples: usize) -> Vec<i16> {
         let Machine {
-            dsp, dma, memory, pic, ..
+            dsp,
+            dma,
+            memory,
+            pic,
+            ..
         } = self;
         let mut out = Vec::with_capacity(native_samples);
         for _ in 0..native_samples {
@@ -779,9 +783,9 @@ impl Machine {
 
         self.sync_dsp_resampler();
         // DSP native samples spanning the same wall-clock window as the OPL.
-        let dsp_native_count =
-            (native_samples as f64 * self.dsp.rate_hz() as f64 / OPL_NATIVE_HZ as f64).round()
-                as usize;
+        let dsp_native_count = (native_samples as f64 * self.dsp.rate_hz() as f64
+            / OPL_NATIVE_HZ as f64)
+            .round() as usize;
         let dsp_mono = self.render_dsp_audio(dsp_native_count);
         let dsp_stereo: Vec<(i32, i32)> = dsp_mono.iter().map(|&s| (s as i32, s as i32)).collect();
         let dsp_out = self.dsp_resampler.process(&dsp_stereo);
@@ -2131,10 +2135,10 @@ mod tests {
         let out = machine.render_audio(4_000);
         assert!(!out.is_empty());
         let mid = &out[out.len() / 3..out.len() * 2 / 3];
-        let (min_l, max_l) =
-            mid.iter()
-                .map(|f| f.0)
-                .fold((i16::MAX, i16::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
+        let (min_l, max_l) = mid
+            .iter()
+            .map(|f| f.0)
+            .fold((i16::MAX, i16::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
         let center = (i32::from(min_l) + i32::from(max_l)) / 2;
         assert!(
             (center - EXPECTED).abs() < 400,

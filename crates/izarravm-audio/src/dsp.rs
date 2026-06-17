@@ -78,10 +78,10 @@ impl SbDsp {
     /// Number of argument bytes a DSP command consumes before it can dispatch.
     fn command_arity(command: u8) -> usize {
         match command {
-            0x10 | 0xE4 => 1,                         // direct DAC / test-register write
-            0x40 => 1,                                // set time constant (Task 5)
-            0x41 => 2,                                // set sample rate (Task 5)
-            0x48 => 2,                                // set block size (Task 5)
+            0x10 | 0xE4 => 1, // direct DAC / test-register write
+            0x40 => 1,        // set time constant (Task 5)
+            0x41 => 2,        // set sample rate (Task 5)
+            0x48 => 2,        // set block size (Task 5)
             _ => 0,
         }
     }
@@ -130,8 +130,8 @@ impl SbDsp {
                 // Set time constant: rate = 1_000_000 / (256 - tc).
                 if let Some(&tc) = args.first() {
                     let divisor = 256u32.wrapping_sub(u32::from(tc));
-                    if divisor != 0 {
-                        self.rate_hz = 1_000_000 / divisor;
+                    if let Some(rate) = 1_000_000u32.checked_div(divisor) {
+                        self.rate_hz = rate;
                     }
                 }
             }
@@ -150,8 +150,8 @@ impl SbDsp {
             }
             0x14 | 0x90 => self.arm_dma(false),
             0x1C => self.arm_dma(true),
-            0xD0 => self.playing = false, // halt DMA (position kept)
-            0xD4 => self.playing = true,  // continue DMA
+            0xD0 => self.playing = false,   // halt DMA (position kept)
+            0xD4 => self.playing = true,    // continue DMA
             0xDA => self.auto_init = false, // exit auto-init: stop at next TC
             _ => {}
         }
@@ -277,7 +277,10 @@ mod tests {
     #[test]
     fn dsp_claims_only_its_own_ports() {
         let mut dsp = SbDsp::default();
-        assert!(!dsp.write_port(0x224, 0x00), "mixer (0x224) stays out of scope");
+        assert!(
+            !dsp.write_port(0x224, 0x00),
+            "mixer (0x224) stays out of scope"
+        );
         assert!(dsp.write_port(0x226, 0x00), "reset is a DSP port");
     }
 

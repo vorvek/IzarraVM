@@ -85,10 +85,10 @@ impl DmaChannel {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DmaChip {
     pub(crate) channels: [DmaChannel; 4],
-    hi_lo: bool,      // byte pointer: false = LSB next, true = MSB next
+    hi_lo: bool, // byte pointer: false = LSB next, true = MSB next
     command: u8,
-    status: u8,       // bit N: channel N reached terminal count
-    request_reg: u8,  // software DREQ
+    status: u8,      // bit N: channel N reached terminal count
+    request_reg: u8, // software DREQ
 }
 
 impl DmaChip {
@@ -386,14 +386,16 @@ mod tests {
     #[test]
     fn single_transfer_reads_advances_and_signals_tc() {
         // Channel 1: page 0x00, base address 0x0010, count 2 (3 transfers: n+1).
-        let mut ch = DmaChannel::default();
-        ch.base_addr = 0x0010;
-        ch.cur_addr = 0x0010;
-        ch.base_count = 2;
-        ch.cur_count = 2;
-        ch.page = 0x00;
+        let mut ch = DmaChannel {
+            base_addr: 0x0010,
+            cur_addr: 0x0010,
+            base_count: 2,
+            cur_count: 2,
+            page: 0x00,
+            mask: false,
+            ..Default::default()
+        };
         ch.set_mode(0x49); // single transfer, read, auto-init off, ch1
-        ch.mask = false;
 
         let mut mem = mem_with(0x0010, &[0x11, 0x22, 0x33]);
         let b0 = ch.read_byte(&mut mem).unwrap();
@@ -407,13 +409,15 @@ mod tests {
 
     #[test]
     fn auto_init_reloads_from_base_at_tc() {
-        let mut ch = DmaChannel::default();
-        ch.base_addr = 0x0008;
-        ch.cur_addr = 0x0008;
-        ch.base_count = 1; // 2 transfers per cycle
-        ch.cur_count = 1;
+        let mut ch = DmaChannel {
+            base_addr: 0x0008,
+            cur_addr: 0x0008,
+            base_count: 1, // 2 transfers per cycle
+            cur_count: 1,
+            mask: false,
+            ..Default::default()
+        };
         ch.set_mode(0x59); // auto-init on
-        ch.mask = false;
 
         let mut mem = mem_with(0x0008, &[0xAA, 0xBB]);
         let _ = ch.read_byte(&mut mem);
