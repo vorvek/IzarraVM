@@ -6,7 +6,7 @@ pub use izarravm_video::MARGO_ID_VALUE;
 use izarravm_video::{
     DAC_ENTRIES, Framebuffer, MARGO_MMIO_SIZE, MARGO_VBE_MODES, MARGO_VRAM_SIZE,
     MODE13H_MEMORY_SIZE, Margo, TextFrame, VGA_MODE13H_BASE, VGA_TEXT_BASE, VGA_TEXT_MEMORY_SIZE,
-    VgaTextMode, VideoMode, vbe_mode,
+    Vga, VideoMode, vbe_mode,
 };
 use thiserror::Error;
 
@@ -123,7 +123,7 @@ pub struct Machine {
     profile: MachineProfile,
     cpu: Cpu386,
     memory: Memory,
-    video: VgaTextMode,
+    video: Vga,
     margo: Margo,
     margo_active: bool,
     pending_soft_int: Option<u8>, // software-INT vector awaiting deferred dispatch
@@ -153,7 +153,7 @@ impl Machine {
             memory: Memory::from_mib(profile.memory_mib)?,
             profile,
             cpu: Cpu386::default(),
-            video: VgaTextMode::default(),
+            video: Vga::default(),
             margo: Margo::default(),
             margo_active: false,
             pending_soft_int: None,
@@ -194,7 +194,7 @@ impl Machine {
             memory: Memory::from_mib(profile.memory_mib)?,
             profile,
             cpu: boot_sector_cpu(),
-            video: VgaTextMode::default(),
+            video: Vga::default(),
             margo: Margo::default(),
             margo_active: false,
             pending_soft_int: None,
@@ -251,7 +251,7 @@ impl Machine {
             memory: Memory::from_mib(profile.memory_mib)?,
             profile,
             cpu: Cpu386::default(),
-            video: VgaTextMode::default(),
+            video: Vga::default(),
             margo: Margo::default(),
             margo_active: false,
             pending_soft_int: None,
@@ -735,7 +735,7 @@ impl Machine {
 
 struct MachineBus<'a> {
     memory: &'a mut Memory,
-    video: &'a mut VgaTextMode,
+    video: &'a mut Vga,
     margo: &'a mut Margo,
     rom: &'a [u8],
     serial: &'a mut SerialPort,

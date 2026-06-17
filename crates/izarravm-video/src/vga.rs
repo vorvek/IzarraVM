@@ -1,6 +1,14 @@
 //! The legacy VGA core: 256 KB planar VRAM, the VGA register blocks, a
 //! cycle-coupled beam clock, and a catch-up rasterizer. This is Margo's
 //! VGA-compatibility personality (one chip, one frame store, one RAMDAC).
+//!
+//! It also carries the text/Mode-13h personality: the 80x25 character buffer,
+//! the linear Mode 13h framebuffer, the RAMDAC, and the CRTC text cursor.
+
+use crate::{
+    DAC_ENTRIES, Dac, Framebuffer, TextCell, TextFrame, VGA_TEXT_COLUMNS, VGA_TEXT_MEMORY_SIZE,
+    VGA_TEXT_ROWS, VideoError, VideoMode,
+};
 
 pub const VGA_PLANE_SIZE: usize = 64 * 1024;
 pub const VGA_PLANES: usize = 4;
@@ -124,10 +132,22 @@ pub struct Vga {
     pub(crate) seq_index: u8,
     pub(crate) gc_index: u8,
     pub(crate) crtc_index: u8,
+    // Legacy text/Mode-13h/RAMDAC/cursor personality, folded in from VgaTextMode.
+    pub(crate) text_memory: [u8; VGA_TEXT_MEMORY_SIZE],
+    pub(crate) mode13h: Framebuffer,
+    pub(crate) dac: Dac,
+    pub(crate) cursor_offset: u16,
+    pub(crate) mode: VideoMode,
 }
 
 impl Default for Vga {
     fn default() -> Self {
+        let mut text_memory = [0; VGA_TEXT_MEMORY_SIZE];
+        for cell in text_memory.chunks_exact_mut(2) {
+            cell[0] = b' ';
+            cell[1] = 0x07;
+        }
+
         Self {
             vram: vec![0; VGA_PLANAR_SIZE],
             crtc: CrtcTiming::text_03h(),
@@ -144,6 +164,11 @@ impl Default for Vga {
             seq_index: 0,
             gc_index: 0,
             crtc_index: 0,
+            text_memory,
+            mode13h: Framebuffer::mode13h(),
+            dac: Dac::default(),
+            cursor_offset: 0,
+            mode: VideoMode::Text,
         }
     }
 }
@@ -166,6 +191,7 @@ impl Vga {
         self.crtc = CrtcTiming::mode_0dh();
         self.beam = 0;
         self.last_line = 0;
+        self.mode = VideoMode::Planar;
         self.resize_work();
     }
 
@@ -378,6 +404,9 @@ impl Vga {
         match port {
             0x3C4 => { self.seq_index = value; true }
             0x3C5 => { let idx = self.seq_index; self.write_seq(idx, value); true }
+            0x3C7 => { self.dac.set_read_index(value); true }
+            0x3C8 => { self.dac.set_write_index(value); true }
+            0x3C9 => { self.dac.write_data(value); true }
             0x3CE => { self.gc_index = value; true }
             0x3CF => { let idx = self.gc_index; self.write_gc(idx, value); true }
             0x3D4 => { self.crtc_index = value; true }
@@ -390,6 +419,14 @@ impl Vga {
     /// Read from a VGA I/O port. Returns `Some(value)` for handled ports.
     pub fn read_port(&mut self, port: u16) -> Option<u8> {
         match port {
+            0x3C8 => Some(self.dac.write_index()),
+            0x3C9 => Some(self.dac.read_data()),
+            0x3D4 => Some(self.crtc_index),
+            0x3D5 => match self.crtc_index {
+                0x0E => Some((self.cursor_offset >> 8) as u8),
+                0x0F => Some(self.cursor_offset as u8),
+                _ => Some(0),
+            },
             0x3DA => Some(self.read_status1()),
             _ => None,
         }
@@ -429,6 +466,9 @@ impl Vga {
                 let cur = self.pending_start.unwrap_or(self.crtc.start_address);
                 self.set_start_address((cur & 0xFF00) | u32::from(value));
             }
+            // Text cursor location (high/low byte), shared CRTC index with timing.
+            0x0E => self.cursor_offset = (self.cursor_offset & 0x00FF) | (u16::from(value) << 8),
+            0x0F => self.cursor_offset = (self.cursor_offset & 0xFF00) | u16::from(value),
             0x13 => self.crtc.offset = u32::from(value),
             _ => {} // full timing programmed via set_mode_0dh in slice 1
         }
@@ -449,6 +489,80 @@ impl Vga {
                 _ => {}
             }
             self.attr.flip_flop_data = false;
+        }
+    }
+
+    pub fn read_u8(&self, offset: usize) -> Result<u8, VideoError> {
+        self.text_memory
+            .get(offset)
+            .copied()
+            .ok_or(VideoError::TextMemoryOutOfBounds { offset })
+    }
+
+    pub fn write_u8(&mut self, offset: usize, value: u8) -> Result<(), VideoError> {
+        let slot = self
+            .text_memory
+            .get_mut(offset)
+            .ok_or(VideoError::TextMemoryOutOfBounds { offset })?;
+        *slot = value;
+        Ok(())
+    }
+
+    pub fn mode13h_framebuffer(&self) -> &Framebuffer {
+        &self.mode13h
+    }
+
+    pub fn read_mode13h_u8(&self, offset: usize) -> Result<u8, VideoError> {
+        self.mode13h
+            .indexed_pixels
+            .get(offset)
+            .copied()
+            .ok_or(VideoError::Mode13hOutOfBounds { offset })
+    }
+
+    pub fn write_mode13h_u8(&mut self, offset: usize, value: u8) -> Result<(), VideoError> {
+        let slot = self
+            .mode13h
+            .indexed_pixels
+            .get_mut(offset)
+            .ok_or(VideoError::Mode13hOutOfBounds { offset })?;
+        *slot = value;
+        Ok(())
+    }
+
+    pub fn set_mode13h(&mut self) {
+        self.mode13h = Framebuffer::mode13h();
+        self.mode = VideoMode::Mode13h;
+    }
+
+    pub fn active_mode(&self) -> VideoMode {
+        self.mode
+    }
+
+    pub fn palette_argb(&self) -> [u32; DAC_ENTRIES] {
+        let mut out = [0u32; DAC_ENTRIES];
+        for (index, slot) in out.iter_mut().enumerate() {
+            let (r, g, b) = self.dac.rgb888(index as u8);
+            *slot = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
+        }
+        out
+    }
+
+    pub fn frame(&self) -> TextFrame {
+        let cells = self
+            .text_memory
+            .chunks_exact(2)
+            .map(|cell| TextCell {
+                character: cell[0],
+                attribute: cell[1],
+            })
+            .collect();
+
+        TextFrame {
+            columns: VGA_TEXT_COLUMNS,
+            rows: VGA_TEXT_ROWS,
+            cells,
+            cursor_offset: self.cursor_offset,
         }
     }
 }
@@ -846,5 +960,81 @@ mod tests {
         assert_eq!(vga.beam_dots(), 0);
         assert_eq!(vga.raster_width(), 320);
         assert_eq!(vga.frame_dots(), CrtcTiming::mode_0dh().frame_dots());
+    }
+
+    #[test]
+    fn text_mode_defaults_to_blank_80x25_screen() {
+        let text = Vga::default();
+        let frame = text.frame();
+
+        assert_eq!(frame.columns, 80);
+        assert_eq!(frame.rows, 25);
+        assert_eq!(frame.cells.len(), 2000);
+        assert!(frame.line_string(0).is_empty());
+    }
+
+    #[test]
+    fn text_memory_write_updates_frame_cell() {
+        let mut text = Vga::default();
+        text.write_u8(0, b'V').unwrap();
+        text.write_u8(1, 0x0a).unwrap();
+
+        let frame = text.frame();
+        assert_eq!(frame.cells[0].character, b'V');
+        assert_eq!(frame.cells[0].attribute, 0x0a);
+        assert_eq!(frame.line_string(0), "V");
+    }
+
+    #[test]
+    fn mode13h_memory_write_updates_framebuffer() {
+        let mut video = Vga::default();
+        video.set_mode13h();
+        video.write_mode13h_u8(123, 0x2a).unwrap();
+
+        assert_eq!(video.mode13h_framebuffer().indexed_pixels[123], 0x2a);
+        assert_eq!(video.read_mode13h_u8(123).unwrap(), 0x2a);
+    }
+
+    #[test]
+    fn crtc_cursor_ports_track_offset() {
+        let mut text = Vga::default();
+        assert!(text.write_port(0x03d4, 0x0e));
+        assert!(text.write_port(0x03d5, 0x12));
+        assert!(text.write_port(0x03d4, 0x0f));
+        assert!(text.write_port(0x03d5, 0x34));
+
+        assert_eq!(text.cursor_offset, 0x1234);
+        assert_eq!(text.read_port(0x03d5), Some(0x34));
+    }
+
+    #[test]
+    fn set_mode13h_switches_active_mode() {
+        let mut video = Vga::default();
+        assert_eq!(video.active_mode(), VideoMode::Text);
+        video.set_mode13h();
+        assert_eq!(video.active_mode(), VideoMode::Mode13h);
+    }
+
+    #[test]
+    fn dac_write_then_read_round_trips() {
+        let mut video = Vga::default();
+        video.write_port(0x03c8, 5); // write index = 5
+        video.write_port(0x03c9, 63); // R
+        video.write_port(0x03c9, 10); // G
+        video.write_port(0x03c9, 31); // B
+        video.write_port(0x03c7, 5); // read index = 5
+        assert_eq!(video.read_port(0x03c9), Some(63));
+        assert_eq!(video.read_port(0x03c9), Some(10));
+        assert_eq!(video.read_port(0x03c9), Some(31));
+    }
+
+    #[test]
+    fn palette_argb_expands_six_bit_components() {
+        let mut video = Vga::default();
+        video.write_port(0x03c8, 1);
+        video.write_port(0x03c9, 63); // R
+        video.write_port(0x03c9, 0); // G
+        video.write_port(0x03c9, 0); // B
+        assert_eq!(video.palette_argb()[1], 0x00FF_0000);
     }
 }
