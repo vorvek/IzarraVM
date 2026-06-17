@@ -111,6 +111,74 @@ pub fn bytes_per_pixel(bpp: u32) -> u32 {
     bpp.div_ceil(8)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Channel {
+    pub pos: u32,  // bit position of the low bit
+    pub size: u32, // bit width
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PixelFormat {
+    pub r: Channel,
+    pub g: Channel,
+    pub b: Channel,
+    pub x: Channel, // unused/reserved bits; size 0 when none
+}
+
+/// Direct-color layout for `bpp`. 8bpp is indexed (palette), not a direct-color
+/// format, so it returns None, as do depths outside the mode table.
+pub fn pixel_format(bpp: u32) -> Option<PixelFormat> {
+    match bpp {
+        15 => Some(PixelFormat {
+            r: Channel { pos: 10, size: 5 },
+            g: Channel { pos: 5, size: 5 },
+            b: Channel { pos: 0, size: 5 },
+            x: Channel { pos: 15, size: 1 },
+        }),
+        16 => Some(PixelFormat {
+            r: Channel { pos: 11, size: 5 },
+            g: Channel { pos: 5, size: 6 },
+            b: Channel { pos: 0, size: 5 },
+            x: Channel { pos: 0, size: 0 },
+        }),
+        32 => Some(PixelFormat {
+            r: Channel { pos: 16, size: 8 },
+            g: Channel { pos: 8, size: 8 },
+            b: Channel { pos: 0, size: 8 },
+            x: Channel { pos: 24, size: 8 },
+        }),
+        _ => None,
+    }
+}
+
+/// Expand a `size`-bit color component to 8 bits by replicating the high bits
+/// into the low ones. Only called with size 5, 6, or 8 (the R/G/B widths here);
+/// the `2 * size - 8` shift assumes size >= 4.
+fn expand_to_8(value: u32, size: u32) -> u32 {
+    if size >= 8 {
+        return value & 0xff;
+    }
+    let v = value & ((1 << size) - 1);
+    (v << (8 - size)) | (v >> (2 * size - 8))
+}
+
+/// Decode one scanout pixel to host ARGB `0x00RRGGBB`. `bpp` selects the format,
+/// `raw` is the little-endian pixel value already assembled from 1/2/4 bytes,
+/// and `palette` resolves 8-bit indices. Unknown depths decode to black.
+fn decode_argb(bpp: u32, raw: u32, palette: &[u32; 256]) -> u32 {
+    if bpp == 8 {
+        return palette[(raw & 0xff) as usize];
+    }
+    let Some(fmt) = pixel_format(bpp) else {
+        return 0;
+    };
+    // expand_to_8 masks to `size` bits, so the raw shift needs no extra mask.
+    let r = expand_to_8(raw >> fmt.r.pos, fmt.r.size);
+    let g = expand_to_8(raw >> fmt.g.pos, fmt.g.size);
+    let b = expand_to_8(raw >> fmt.b.pos, fmt.b.size);
+    (r << 16) | (g << 8) | b
+}
+
 pub const REG_ID: usize = 0x0000;
 pub const REG_CAPS: usize = 0x0004;
 pub const REG_STATUS: usize = 0x0008;
@@ -2893,5 +2961,45 @@ mod tests {
         assert_eq!(margo.display().pitch, 1280);
         margo.set_mode(0x14a); // 640x480x32
         assert_eq!(margo.display().pitch, 2560);
+    }
+
+    #[test]
+    fn pixel_format_describes_direct_color_layouts() {
+        assert!(pixel_format(8).is_none()); // indexed, not direct color
+        let f16 = pixel_format(16).unwrap();
+        assert_eq!((f16.r.pos, f16.r.size), (11, 5));
+        assert_eq!((f16.g.pos, f16.g.size), (5, 6));
+        assert_eq!((f16.b.pos, f16.b.size), (0, 5));
+        let f15 = pixel_format(15).unwrap();
+        assert_eq!((f15.r.pos, f15.r.size), (10, 5));
+        assert_eq!((f15.x.pos, f15.x.size), (15, 1));
+        let f32 = pixel_format(32).unwrap();
+        assert_eq!((f32.r.pos, f32.r.size), (16, 8));
+        assert_eq!((f32.x.pos, f32.x.size), (24, 8));
+    }
+
+    #[test]
+    fn decode_argb_handles_each_format() {
+        let palette = {
+            let mut p = [0u32; 256];
+            p[7] = 0x0012_3456;
+            p
+        };
+        // 8bpp indexed: straight palette lookup.
+        assert_eq!(decode_argb(8, 7, &palette), 0x0012_3456);
+        // 16bpp R5G6B5: red, green, blue, white, black.
+        assert_eq!(decode_argb(16, 0xf800, &palette), 0x00ff_0000);
+        assert_eq!(decode_argb(16, 0x07e0, &palette), 0x0000_ff00);
+        assert_eq!(decode_argb(16, 0x001f, &palette), 0x0000_00ff);
+        assert_eq!(decode_argb(16, 0xffff, &palette), 0x00ff_ffff);
+        assert_eq!(decode_argb(16, 0x0000, &palette), 0x0000_0000);
+        // 15bpp X1R5G5B5: red, green, blue; the X bit is ignored.
+        assert_eq!(decode_argb(15, 0x7c00, &palette), 0x00ff_0000);
+        assert_eq!(decode_argb(15, 0x03e0, &palette), 0x0000_ff00);
+        assert_eq!(decode_argb(15, 0x001f, &palette), 0x0000_00ff);
+        assert_eq!(decode_argb(15, 0x8000 | 0x7c00, &palette), 0x00ff_0000);
+        // 32bpp X8R8G8B8: the X byte is ignored.
+        assert_eq!(decode_argb(32, 0x0034_5678, &palette), 0x0034_5678);
+        assert_eq!(decode_argb(32, 0xff34_5678, &palette), 0x0034_5678);
     }
 }
