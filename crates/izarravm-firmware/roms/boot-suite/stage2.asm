@@ -21,6 +21,13 @@ org 0x8000
 %define DSP_STATUS 0x22E
 %define OPL_ADDR 0x388
 %define OPL_DATA 0x389
+%define DMA1_MODE 0x0B
+%define DMA1_ADDR 0x02
+%define DMA1_COUNT 0x03
+%define DMA1_PAGE 0x83
+%define DMA1_MASK 0x0A
+%define SB_DMA_TICKS 0x0610
+%define SB_DMA_BUF 0x0500
 
 stage2_start:
     cli
@@ -69,6 +76,7 @@ stage2_start:
     call test_sb_dsp_reset
     call test_opl3
     call test_opl2
+    call test_sb_8bit_dma
 
     hlt
     jmp $
@@ -308,6 +316,100 @@ test_opl2:
     mov byte [di + 3], 'S'
     add word [RESULT_BLOCK + 10], 27
     ret
+
+test_sb_8bit_dma:
+    ; Fill a 32-byte unsigned ramp at 0x0500 (DMA page 0, byte addr 0x0500).
+    mov di, SB_DMA_BUF
+    mov al, 0x80
+    mov cx, 32
+.fill:
+    stosb
+    add al, 8
+    loop .fill
+    ; 8237A ch1: single read, byte addr 0x0500, count 31 (->32 bytes), page 0.
+    mov dx, DMA1_MODE
+    mov al, 0x49
+    out dx, al
+    mov dx, DMA1_ADDR
+    mov al, 0x00
+    out dx, al
+    mov al, 0x05
+    out dx, al
+    mov dx, DMA1_COUNT
+    mov al, 0x1F
+    out dx, al
+    mov al, 0x00
+    out dx, al
+    mov dx, DMA1_PAGE
+    mov al, 0x00
+    out dx, al
+    mov dx, DMA1_MASK
+    mov al, 0x01            ; unmask ch1
+    out dx, al
+    ; DSP: 11025 Hz, block 32, single-cycle 8-bit DMA output.
+    mov dx, DSP_WRITE
+    mov al, 0x41
+    out dx, al
+    mov al, 0x2B
+    out dx, al
+    mov al, 0x11
+    out dx, al
+    mov al, 0x48
+    out dx, al
+    mov al, 0x1F
+    out dx, al
+    mov al, 0x00
+    out dx, al
+    mov al, 0x14
+    out dx, al
+    ; IRQ5 -> vector 0x0D (PIC base 0x08 set by test_timer). Install the handler
+    ; and unmask IRQ5 (clear IMR bit5), then spin until the handler bumps the
+    ; counter. Playback is clock-driven, so the DSP sample clock in advance_devices
+    ; edges the half/end-buffer IRQ during the spin.
+    xor ax, ax
+    mov es, ax
+    mov word [es:0x34], irq5_handler
+    mov word [es:0x36], 0
+    mov word [SB_DMA_TICKS], 0
+    mov dx, PIC_DATA
+    in al, dx
+    and al, 0xDF            ; clear bit5 -> unmask IRQ5
+    out dx, al
+    mov cx, 16
+    call wait_for_irq5
+    jz .done                ; timeout (counter still 0) -> leave FAIL
+    mov di, RESULT_BLOCK + (sb_8bit_dma_record - result_block_template)
+    mov byte [di], 'P'
+    mov byte [di + 2], 'S'
+    mov byte [di + 3], 'S'
+    add word [RESULT_BLOCK + 10], 27
+.done:
+    ret
+
+; Shared: sti, then spin (one delay window per iteration) until the IRQ5 handler
+; has set SB_DMA_TICKS != 0, then cli. cx is the poll budget. Leaves ZF clear
+; when the IRQ fired (counter nonzero) and ZF set on timeout. Callers branch
+; with `jz .done` to leave FAIL on timeout. Used by both DMA probes.
+wait_for_irq5:
+    sti
+.spin:
+    call delay
+    mov ax, [SB_DMA_TICKS]
+    test ax, ax
+    jnz .got
+    loop .spin
+.got:
+    cli
+    ret
+
+; IRQ5 handler: bump the tick counter, EOI the master PIC, iret.
+irq5_handler:
+    push ax
+    inc word [SB_DMA_TICKS]
+    mov al, 0x20
+    out PIC_CMD, al
+    pop ax
+    iret
 
 irq0_handler:
     push ax

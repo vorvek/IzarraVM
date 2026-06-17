@@ -28,10 +28,11 @@ opl2_record:
     db 'FAIL sound.opl2', 10
 opl3_record:
     db 'FAIL sound.opl3', 10
-sb_reset_record:
-    db 'FAIL sound.sb_dsp_reset', 10
-    db 'FAIL sound.sb_8bit_dma', 10
-    db 'FAIL sound.sb_16bit_dma', 10
+ sb_reset_record:
+     db 'FAIL sound.sb_dsp_reset', 10
+sb_8bit_dma_record:
+     db 'FAIL sound.sb_8bit_dma', 10
+     db 'FAIL sound.sb_16bit_dma', 10
     db 'FAIL sound.sb_adpcm', 10
 timer_record:
     db 'FAIL timer.irq0', 10
