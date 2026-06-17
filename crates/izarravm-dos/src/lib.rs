@@ -1,7 +1,7 @@
 use izarravm_bus::{BusError, Memory};
 use std::collections::{HashMap, VecDeque};
-use std::fs::File;
-use std::io::Read;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -127,7 +127,7 @@ pub enum DosAction {
 
 /// Conventional memory modeled as one block ending at paragraph 0xA000. The
 /// program owns [psp_seg, prog_top); AH=48h blocks stack upward from free_base.
-/// ponytail: bump allocator with a single resizable program block and LIFO
+/// Bump allocator with a single resizable program block and LIFO
 /// reclaim; no MCB chain, no free-list coalescing, no UMB/HIMEM.
 #[derive(Debug, Default)]
 struct Arena {
@@ -253,6 +253,75 @@ impl Default for DosDateTime {
     }
 }
 
+/// A DOS file access mode, from AL's low 3 bits on open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessMode {
+    Read,
+    Write,
+    ReadWrite,
+}
+
+impl AccessMode {
+    /// AL's low 3 bits select the access mode (the high bits are sharing and
+    /// inheritance, ignored). 0=read, 1=write, 2=read/write; 3-7 are unused by
+    /// real programs and map to Read (marked).
+    fn from_open_al(al: u8) -> Self {
+        match al & 0x07 {
+            1 => AccessMode::Write,
+            2 => AccessMode::ReadWrite,
+            _ => AccessMode::Read,
+        }
+    }
+
+    fn can_read(self) -> bool {
+        matches!(self, AccessMode::Read | AccessMode::ReadWrite)
+    }
+
+    fn can_write(self) -> bool {
+        matches!(self, AccessMode::Write | AccessMode::ReadWrite)
+    }
+}
+
+/// An open file handle: the host file plus the DOS access mode it was opened
+/// with, which the kernel enforces on reads and writes.
+#[derive(Debug)]
+struct OpenFile {
+    file: File,
+    mode: AccessMode,
+}
+
+/// Open an existing host file for a DOS access mode (no create).
+fn open_host_file(path: &Path, mode: AccessMode) -> std::io::Result<File> {
+    match mode {
+        AccessMode::Read => File::open(path),
+        AccessMode::Write => OpenOptions::new().write(true).open(path),
+        AccessMode::ReadWrite => OpenOptions::new().read(true).write(true).open(path),
+    }
+}
+
+/// One entry of a FindFirst/FindNext result: the documented DTA fields plus the
+/// uppercase 8.3 name to write into the 13-byte ASCIIZ slot.
+#[derive(Debug, Clone)]
+struct FindEntry {
+    attr: u8,
+    time: u16, // packed DOS time (RBIL #01665)
+    date: u16, // packed DOS date (RBIL #01666)
+    size: u32,
+    name: String, // uppercase 8.3, e.g. "LEVEL1.DAT"
+}
+
+/// A live directory search: the snapshot of matching entries and the cursor into
+/// it, keyed in the kernel by the DTA address. The whole match list is
+/// taken once at FindFirst; host directory changes between calls are not seen
+/// (real DOS re-walks and per RBIL may even return the same file twice, so
+/// neither is "correct"; ours is stable). The cursor lives here, not in the DTA
+/// reserved bytes, so relocating or copying the DTA mid-search is not honored.
+#[derive(Debug)]
+struct FindSearch {
+    entries: Vec<FindEntry>,
+    next: usize,
+}
+
 /// The stateful DOS kernel. Owns the host-side state that must survive between
 /// INT 21h calls: the open-file handle table and the mounted C: drive, plus the
 /// standard input and output buffers (high-level emulated, HLE). The machine
@@ -261,12 +330,13 @@ impl Default for DosDateTime {
 pub struct DosKernel {
     drive: Option<HostDrive>,
     // File handles 5 and up: AH=3Dh inserts, AH=3Fh/3Eh look up.
-    open_files: HashMap<u16, File>,
+    open_files: HashMap<u16, OpenFile>,
     stdin: VecDeque<u8>,
     stdout: Vec<u8>,
     clock: DosDateTime,
     arena: Arena,
     dta: (u16, u16),
+    find_searches: HashMap<(u16, u16), FindSearch>,
 }
 
 impl DosKernel {
@@ -325,6 +395,58 @@ impl DosKernel {
             blocks: Vec::new(),
         };
         self.dta = (psp_seg, 0x80);
+        self.find_searches.clear();
+    }
+
+    /// Resolve the ASCIIZ filename at ds:dx to a host path. Ok(Ok(path)) on
+    /// success; Ok(Err(code)) when a DOS error code should be returned (no NUL ->
+    /// 0x03, no drive -> 0x02, bad path -> 0x03); Err(DosError) for a guest-memory
+    /// fault.
+    fn resolve_open_path(
+        &self,
+        mem: &Memory,
+        ds: u16,
+        dx: u16,
+    ) -> Result<Result<PathBuf, u16>, DosError> {
+        let Some(name) = read_asciiz(mem, ds, dx)? else {
+            return Ok(Err(0x03));
+        };
+        let Some(drive) = self.drive.as_ref() else {
+            return Ok(Err(0x02));
+        };
+        Ok(drive.resolve_dos_path(&name).map_err(|_| 0x03))
+    }
+
+    /// Split a FindFirst filespec into (host directory, final-component pattern).
+    /// Ok((dir, pattern)) on success; Err(code) is a DOS error code (0x02 no drive,
+    /// 0x03 bad/non-C/traversal path). The pattern is the last path component (may
+    /// hold wildcards); the directory defaults to the C: root when no path is given
+    /// (no per-drive current directory is tracked, marked). The filespec is already
+    /// read from guest memory, so this touches no memory and returns no DosError.
+    fn split_find_spec(&self, filespec: &str) -> Result<(PathBuf, String), u16> {
+        let drive = self.drive.as_ref().ok_or(0x02u16)?;
+        let spec = filespec.trim();
+        let after_drive =
+            if let Some(rest) = spec.strip_prefix("C:").or_else(|| spec.strip_prefix("c:")) {
+                rest
+            } else if spec.as_bytes().get(1) == Some(&b':') {
+                return Err(0x03); // a drive letter other than C: (we mount only C:)
+            } else {
+                spec
+            };
+        let normalized = after_drive.replace('/', "\\");
+        let (dir_part, pattern) = match normalized.rfind('\\') {
+            Some(i) => (normalized[..i].to_string(), normalized[i + 1..].to_string()),
+            None => (String::new(), normalized.clone()),
+        };
+        let mut dir = drive.root().to_path_buf();
+        for component in dir_part.split('\\').filter(|c| !c.is_empty() && *c != ".") {
+            if component == ".." {
+                return Err(0x03);
+            }
+            dir.push(component);
+        }
+        Ok((dir, pattern))
     }
 
     /// Service a software interrupt the DOS kernel handles. `vector` is the INT
@@ -414,37 +536,24 @@ impl DosKernel {
                 regs.ax = (regs.ax & 0xff00) | 0x24;
                 Ok(DosAction::Continue)
             }
-            // AH=3Dh: open an existing file at DS:DX (ASCIIZ) for reading. AL is
-            // the access mode but is not enforced: every open is read-only,
-            // because writes (AH=40h) are a later slice. Returns CF=0 + AX=handle
-            // on success, CF=1 + AX=DOS code on error.
+            // AH=3Dh: open an existing file at DS:DX (ASCIIZ). AL's low 3 bits are
+            // the access mode (0=read, 1=write, 2=read/write), honored and enforced
+            // per handle. CF=0 + AX=handle on success, CF=1 + AX=DOS code on error.
             0x3d => {
-                let name = match read_asciiz(mem, regs.ds, regs.dx)? {
-                    Some(name) => name,
-                    None => {
-                        set_dos_error(regs, 0x03);
+                let mode = AccessMode::from_open_al(regs.ax as u8);
+                let path = match self.resolve_open_path(mem, regs.ds, regs.dx)? {
+                    Ok(path) => path,
+                    Err(code) => {
+                        set_dos_error(regs, code);
                         return Ok(DosAction::Continue);
                     }
                 };
-                let path = match &self.drive {
-                    None => {
-                        set_dos_error(regs, 0x02);
-                        return Ok(DosAction::Continue);
-                    }
-                    Some(drive) => match drive.resolve_dos_path(&name) {
-                        Ok(path) => path,
-                        Err(_) => {
-                            set_dos_error(regs, 0x03);
-                            return Ok(DosAction::Continue);
-                        }
-                    },
-                };
-                match File::open(&path) {
+                match open_host_file(&path, mode) {
                     Ok(file) => {
                         let handle = (5u16..)
                             .find(|h| !self.open_files.contains_key(h))
                             .expect("a free DOS handle exists at or below u16::MAX");
-                        self.open_files.insert(handle, file);
+                        self.open_files.insert(handle, OpenFile { file, mode });
                         regs.ax = handle;
                         regs.cf = false;
                     }
@@ -452,21 +561,21 @@ impl DosKernel {
                 }
                 Ok(DosAction::Continue)
             }
-            // AH=3Fh: read CX bytes from the handle in BX into the buffer at
-            // DS:DX. Returns CF=0 + AX=bytes-read (0 = EOF) on success, CF=1 +
-            // AX=0x06 for an unknown handle. A host read error maps to a DOS code;
-            // a guest-memory write fault propagates as DosError::Memory.
             0x3f => {
                 let handle = regs.bx;
                 let count = usize::from(regs.cx);
-                let Some(file) = self.open_files.get_mut(&handle) else {
+                let Some(of) = self.open_files.get_mut(&handle) else {
                     set_dos_error(regs, 0x06);
                     return Ok(DosAction::Continue);
                 };
+                if !of.mode.can_read() {
+                    set_dos_error(regs, 0x05);
+                    return Ok(DosAction::Continue);
+                }
                 let mut buffer = vec![0u8; count];
                 let mut filled = 0usize;
                 while filled < count {
-                    match file.read(&mut buffer[filled..]) {
+                    match of.file.read(&mut buffer[filled..]) {
                         Ok(0) => break,
                         Ok(n) => filled += n,
                         Err(err) => {
@@ -507,7 +616,7 @@ impl DosKernel {
                 Ok(DosAction::Continue)
             }
             // AH=25h: set interrupt vector AL to DS:DX. Writes the real guest IVT
-            // (offset then segment, little-endian) at AL*4. ponytail: re-vectoring an
+            // (offset then segment, little-endian) at AL*4. Re-vectoring an
             // HLE'd INT (0x10/0x20/0x21) writes the IVT but host dispatch still
             // intercepts those by vector number.
             0x25 => {
@@ -531,7 +640,7 @@ impl DosKernel {
                 Ok(DosAction::Continue)
             }
             // AH=2Bh: set date. CX=year(1980-2099), DH=month, DL=day. AL=0 ok, 0xFF
-            // invalid. ponytail: no calendar routine, so the day range is the coarse
+            // invalid. No calendar routine, so the day range is the coarse
             // 1..=31 (real DOS rejects e.g. Feb 31) and day_of_week is not recomputed;
             // no in-scope reader needs per-month validation or the post-set weekday.
             0x2b => {
@@ -632,7 +741,7 @@ impl DosKernel {
             }
             // AH=4Ch: terminate with the return code in AL.
             0x4c => Ok(DosAction::Exit((regs.ax & 0x00ff) as u8)),
-            // AH=33h: Ctrl-Break flag. ponytail stub: AL=00 (get) returns DL=0 (off);
+            // AH=33h: Ctrl-Break flag. Stub: AL=00 (get) returns DL=0 (off);
             // AL=01 (set) is accepted as a no-op. No INT 23h state is tracked yet.
             0x33 => {
                 if regs.ax as u8 == 0x00 {
@@ -640,14 +749,229 @@ impl DosKernel {
                 }
                 Ok(DosAction::Continue)
             }
-            // AH=0Eh: select default drive. ponytail stub: only C: exists, so report
+            // AH=0Eh: select default drive. Stub: only C: exists, so report
             // AL=1 logical drive and do not change the current drive.
             0x0e => {
                 regs.ax = (regs.ax & 0xff00) | 0x01;
                 Ok(DosAction::Continue)
             }
-            // Other file functions (write, seek, find) and everything else are not
-            // yet implemented; later slices fill them in. An unimplemented function
+            // AH=3Ch: create or truncate a file at DS:DX (ASCIIZ). CX = attributes
+            // (ignored; the host has no DOS attribute bits, marked). Opens read/write,
+            // truncating an existing file to zero. CF=0 + AX=handle, or CF=1 + AX=code.
+            0x3c => {
+                let path = match self.resolve_open_path(mem, regs.ds, regs.dx)? {
+                    Ok(path) => path,
+                    Err(code) => {
+                        set_dos_error(regs, code);
+                        return Ok(DosAction::Continue);
+                    }
+                };
+                match OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&path)
+                {
+                    Ok(file) => {
+                        let handle = (5u16..)
+                            .find(|h| !self.open_files.contains_key(h))
+                            .expect("a free DOS handle exists at or below u16::MAX");
+                        self.open_files.insert(
+                            handle,
+                            OpenFile {
+                                file,
+                                mode: AccessMode::ReadWrite,
+                            },
+                        );
+                        regs.ax = handle;
+                        regs.cf = false;
+                    }
+                    Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
+                }
+                Ok(DosAction::Continue)
+            }
+            // AH=40h: write CX bytes from DS:DX to the handle in BX. BX=1/2 route to
+            // stdout/stderr (the output buffer). For a file handle, CX=0 truncates the
+            // file at the current position. CF=0 + AX=bytes-written, or CF=1 + AX=code.
+            0x40 => {
+                let handle = regs.bx;
+                let count = usize::from(regs.cx);
+                let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+                // Predefined console handles: 1=stdout, 2=stderr -> the output buffer.
+                if handle == 1 || handle == 2 {
+                    for index in 0..count {
+                        let byte = mem.read_u8(base + index)?;
+                        self.stdout.push(byte);
+                    }
+                    regs.ax = regs.cx;
+                    regs.cf = false;
+                    return Ok(DosAction::Continue);
+                }
+                let Some(of) = self.open_files.get_mut(&handle) else {
+                    set_dos_error(regs, 0x06);
+                    return Ok(DosAction::Continue);
+                };
+                if !of.mode.can_write() {
+                    set_dos_error(regs, 0x05);
+                    return Ok(DosAction::Continue);
+                }
+                if count == 0 {
+                    // CX=0 truncates (or extends) the file to the current position.
+                    let pos = match of.file.stream_position() {
+                        Ok(pos) => pos,
+                        Err(err) => {
+                            set_dos_error(regs, dos_io_error_code(&err));
+                            return Ok(DosAction::Continue);
+                        }
+                    };
+                    if let Err(err) = of.file.set_len(pos) {
+                        set_dos_error(regs, dos_io_error_code(&err));
+                        return Ok(DosAction::Continue);
+                    }
+                    regs.ax = 0;
+                    regs.cf = false;
+                    return Ok(DosAction::Continue);
+                }
+                let mut buffer = vec![0u8; count];
+                for (index, slot) in buffer.iter_mut().enumerate() {
+                    *slot = mem.read_u8(base + index)?;
+                }
+                match of.file.write_all(&buffer) {
+                    Ok(()) => {
+                        regs.ax = regs.cx;
+                        regs.cf = false;
+                    }
+                    Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
+                }
+                Ok(DosAction::Continue)
+            }
+            // AH=42h: seek the handle in BX. AL=whence (0=start, 1=current signed,
+            // 2=end signed), CX:DX = 32-bit offset (CX high). CF=0 + DX:AX = new
+            // absolute position; AL>2 -> CF=1 + AX=0x01 (invalid function).
+            0x42 => {
+                let handle = regs.bx;
+                let Some(of) = self.open_files.get_mut(&handle) else {
+                    set_dos_error(regs, 0x06);
+                    return Ok(DosAction::Continue);
+                };
+                let offset = (u32::from(regs.cx) << 16) | u32::from(regs.dx);
+                let seek = match regs.ax as u8 {
+                    0 => SeekFrom::Start(u64::from(offset)),
+                    1 => SeekFrom::Current(i64::from(offset as i32)),
+                    2 => SeekFrom::End(i64::from(offset as i32)),
+                    _ => {
+                        set_dos_error(regs, 0x01);
+                        return Ok(DosAction::Continue);
+                    }
+                };
+                match of.file.seek(seek) {
+                    Ok(pos) => {
+                        let pos = pos as u32;
+                        regs.ax = pos as u16;
+                        regs.dx = (pos >> 16) as u16;
+                        regs.cf = false;
+                    }
+                    Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
+                }
+                Ok(DosAction::Continue)
+            }
+            // AH=4Eh: find first matching file. CX = attribute mask, DS:DX = ASCIIZ
+            // filespec (path + 8.3 wildcards). On success the 43-byte FindFirst data
+            // block is written to the current DTA and CF=0; on failure CF=1 with
+            // AX = 0x02 (no drive), 0x03 (bad path), 0x05 (host error), or 0x12 (no
+            // matching file).
+            0x4e => {
+                let Some(filespec) = read_asciiz(mem, regs.ds, regs.dx)? else {
+                    set_dos_error(regs, 0x03);
+                    return Ok(DosAction::Continue);
+                };
+                let (dir, pattern) = match self.split_find_spec(&filespec) {
+                    Ok(split) => split,
+                    Err(code) => {
+                        set_dos_error(regs, code);
+                        return Ok(DosAction::Continue);
+                    }
+                };
+                let mask = regs.cx as u8;
+                let pattern_template = pattern_to_8_3(&pattern);
+                let read_dir = match std::fs::read_dir(&dir) {
+                    Ok(read_dir) => read_dir,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        set_dos_error(regs, 0x03);
+                        return Ok(DosAction::Continue);
+                    }
+                    Err(_) => {
+                        set_dos_error(regs, 0x05);
+                        return Ok(DosAction::Continue);
+                    }
+                };
+                let mut entries = Vec::new();
+                for dirent in read_dir.flatten() {
+                    let raw = dirent.file_name();
+                    let Some(name) = raw.to_str() else {
+                        continue; // a non-UTF-8 host name cannot be an 8.3 DOS name
+                    };
+                    let Some(file_template) = host_name_to_8_3(name) else {
+                        continue;
+                    };
+                    if !template_matches(&file_template, &pattern_template) {
+                        continue;
+                    }
+                    let Ok(metadata) = dirent.metadata() else {
+                        continue;
+                    };
+                    let attr = if metadata.is_dir() { 0x10 } else { 0x00 };
+                    if !attr_matches(attr, mask) {
+                        continue;
+                    }
+                    let (time, date) =
+                        dos_time_date(metadata.modified().unwrap_or(std::time::UNIX_EPOCH));
+                    entries.push(FindEntry {
+                        attr,
+                        time,
+                        date,
+                        // The DTA size field is a 32-bit dword, so a host
+                        // file over 4 GiB truncates; DOS cannot represent more.
+                        size: metadata.len() as u32,
+                        name: name.to_ascii_uppercase(),
+                    });
+                }
+                let Some(first) = entries.first().cloned() else {
+                    set_dos_error(regs, 0x12);
+                    return Ok(DosAction::Continue);
+                };
+                write_find_record(mem, self.dta, &first)?;
+                // An abandoned search (FindFirst, take the first hit, never
+                // run to 0x12) leaves its snapshot here until init_program clears the
+                // map; bounded per program run, so no eviction policy.
+                self.find_searches
+                    .insert(self.dta, FindSearch { entries, next: 1 });
+                regs.cf = false;
+                Ok(DosAction::Continue)
+            }
+            // AH=4Fh: find next matching file. The active search is keyed by the
+            // current DTA address. CF=0 with the next entry written to the DTA, or
+            // CF=1 AX=0x12 (no more files) when the search is exhausted or there is
+            // no active search at this DTA.
+            0x4f => {
+                let dta = self.dta;
+                let Some(search) = self.find_searches.get_mut(&dta) else {
+                    set_dos_error(regs, 0x12);
+                    return Ok(DosAction::Continue);
+                };
+                let Some(entry) = search.entries.get(search.next).cloned() else {
+                    self.find_searches.remove(&dta);
+                    set_dos_error(regs, 0x12);
+                    return Ok(DosAction::Continue);
+                };
+                search.next += 1;
+                write_find_record(mem, dta, &entry)?;
+                regs.cf = false;
+                Ok(DosAction::Continue)
+            }
+            // Other file functions (find) and everything else are not yet
+            // implemented; later slices fill them in. An unimplemented function
             // returns Continue so the IRET stub returns to the caller.
             _ => Ok(DosAction::Continue),
         }
@@ -664,7 +988,7 @@ const TOKA_DOS_OEM: u8 = 0xff;
 const COM_MAX_LEN: usize = 0x10000 - 0x100;
 
 /// Conventional memory is modeled as one block ending at the 640 KiB video
-/// aperture (paragraph 0xA000). ponytail: single block, no MCB chain / EBDA /
+/// aperture (paragraph 0xA000). Single block, no MCB chain / EBDA /
 /// UMB; an .EXE that walks or resizes the memory arena is out of scope.
 const CONVENTIONAL_TOP_PARAGRAPH: u32 = 0xa000;
 
@@ -801,7 +1125,7 @@ pub fn load_exe(
 
     // Apply relocations: each (off, seg) names a word at module offset
     // seg*16+off; add start_seg so the segment reference points at the real load
-    // address. ponytail: out-of-range relocations are rejected rather than
+    // address. Out-of-range relocations are rejected rather than
     // applied blindly as real DOS would (avoids corrupting arbitrary memory).
     let reloc_end = usize::from(e_lfarlc) + usize::from(e_crlc) * 4;
     if reloc_end > image.len() {
@@ -841,7 +1165,7 @@ pub fn load_program(
     mem: &mut Memory,
     psp_segment: u16,
 ) -> Result<ProgramEntry, DosError> {
-    // ponytail: detect "MZ" only; the rare "ZM" alternate signature is treated
+    // Detect "MZ" only; the rare "ZM" alternate signature is treated
     // as a .COM (no real DOS game ships "ZM").
     if image.len() >= 2 && image[0] == b'M' && image[1] == b'Z' {
         load_exe(image, mem, psp_segment)
@@ -865,6 +1189,158 @@ fn dos_io_error_code(err: &std::io::Error) -> u16 {
         std::io::ErrorKind::NotFound => 0x02,
         _ => 0x05,
     }
+}
+
+/// Whether a byte is legal in a DOS 8.3 filename component: letters, digits, and a
+/// fixed punctuation set. Space, '.', and the DOS-reserved characters are not
+/// legal. Extended bytes (>= 0x80) fall through to false; the caller separately
+/// skips non-ASCII host names (marked).
+fn is_8_3_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'()-@^_`{}~".contains(&byte)
+}
+
+/// Convert a host modified-time to a packed DOS (time, date) pair. The result is
+/// UTC, not local time (marked); a timestamp before 1980-01-01 clamps to it, and a
+/// year past 2107 (the 7-bit DOS year ceiling) is not representable and clamps.
+/// Uses Howard Hinnant's days-to-civil algorithm so no date dependency is added.
+fn dos_time_date(modified: std::time::SystemTime) -> (u16, u16) {
+    let secs = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = (secs / 86_400) as i64;
+    let seconds_of_day = (secs % 86_400) as u32;
+    let (mut year, month, day) = civil_from_days(days);
+    if year < 1980 {
+        return (0, (1 << 5) | 1); // 1980-01-01 00:00:00
+    }
+    if year > 2107 {
+        year = 2107;
+    }
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+    let date = (((year - 1980) as u16) << 9) | ((month as u16) << 5) | day as u16;
+    let time = ((hour as u16) << 11) | ((minute as u16) << 5) | ((second / 2) as u16);
+    (time, date)
+}
+
+/// Howard Hinnant's civil-from-days: days since the Unix epoch (1970-01-01) to a
+/// proleptic Gregorian (year, month [1..12], day [1..31]).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let year = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+/// Build the blank-padded 11-byte 8.3 template for a host file name, uppercased.
+/// None if the name does not fit 8.3 (empty or dotted base such as a leading-dot
+/// ".cfg", base > 8, ext > 3, or non-ASCII): such host files are invisible to DOS
+/// find. No NAME~1 long-name mangling; the corpus is 8.3-named.
+fn host_name_to_8_3(name: &str) -> Option<[u8; 11]> {
+    if !name.is_ascii() {
+        return None;
+    }
+    let (base, ext) = match name.rsplit_once('.') {
+        Some((base, ext)) => (base, ext),
+        None => (name, ""),
+    };
+    if base.is_empty()
+        || base.len() > 8
+        || ext.len() > 3
+        || !base.bytes().all(is_8_3_char)
+        || !ext.bytes().all(is_8_3_char)
+    {
+        return None;
+    }
+    let mut template = [b' '; 11];
+    for (i, byte) in base.bytes().enumerate() {
+        template[i] = byte.to_ascii_uppercase();
+    }
+    for (i, byte) in ext.bytes().enumerate() {
+        template[8 + i] = byte.to_ascii_uppercase();
+    }
+    Some(template)
+}
+
+/// Build the 11-byte search template from a DOS wildcard pattern. '*' fills the
+/// rest of its field with '?'; other characters are uppercased; short fields pad
+/// with blanks. The COMMAND.COM habit of rewriting a bare name to
+/// "name.*" is NOT applied here (we are the kernel, not the shell), so "*" matches
+/// only extensionless files while "*.*" matches every name.
+fn pattern_to_8_3(pattern: &str) -> [u8; 11] {
+    let (base, ext) = match pattern.split_once('.') {
+        Some((base, ext)) => (base, ext),
+        None => (pattern, ""),
+    };
+    let mut template = [b' '; 11];
+    fill_field(&mut template[..8], base);
+    fill_field(&mut template[8..], ext);
+    template
+}
+
+/// Copy a pattern field into a blank slice: '*' fills the remainder with '?',
+/// other characters are uppercased and copied until the field or pattern ends.
+fn fill_field(field: &mut [u8], pattern: &str) {
+    for (i, byte) in pattern.bytes().enumerate() {
+        if i >= field.len() {
+            break;
+        }
+        if byte == b'*' {
+            for slot in &mut field[i..] {
+                *slot = b'?';
+            }
+            return;
+        }
+        field[i] = byte.to_ascii_uppercase();
+    }
+}
+
+/// Match a file's 8.3 template against a pattern template: at each of the 11
+/// positions a '?' in the pattern matches any byte (including the blank pad, so
+/// "LEVEL?.DAT" matches both "LEVEL1.DAT" and "LEVEL.DAT"); any other pattern byte
+/// must equal the file byte.
+fn template_matches(file: &[u8; 11], pattern: &[u8; 11]) -> bool {
+    file.iter()
+        .zip(pattern.iter())
+        .all(|(&f, &p)| p == b'?' || p == f)
+}
+
+/// RBIL: for masks other than the volume-label bit, a file matches if it has at
+/// most the masked special attributes. Host files carry only "normal" (0x00) or
+/// "directory" (0x10): a normal file always matches; a directory matches only when
+/// the mask includes the directory bit. Read-only (bit 0) and archive (bit 5) do
+/// not restrict and are ignored, per the spec.
+fn attr_matches(file_attr: u8, mask: u8) -> bool {
+    const SPECIAL: u8 = 0x02 | 0x04 | 0x10; // hidden | system | directory
+    file_attr & !mask & SPECIAL == 0
+}
+
+/// Write a 43-byte FindFirst data block at the DTA `(segment, offset)`. The
+/// DOS-internal area 0x00..0x15 is zeroed (the search cursor is kept kernel-side,
+/// so nothing readable lives there); the documented fields follow. A guest-memory
+/// fault propagates as DosError::Memory.
+fn write_find_record(mem: &mut Memory, dta: (u16, u16), entry: &FindEntry) -> Result<(), DosError> {
+    let base = usize::from(dta.0) * 16 + usize::from(dta.1);
+    for offset in 0..0x15 {
+        mem.write_u8(base + offset, 0)?;
+    }
+    mem.write_u8(base + 0x15, entry.attr)?;
+    mem.write_u16(base + 0x16, entry.time)?;
+    mem.write_u16(base + 0x18, entry.date)?;
+    mem.write_u32(base + 0x1a, entry.size)?;
+    let name = entry.name.as_bytes();
+    for i in 0..13 {
+        mem.write_u8(base + 0x1e + i, name.get(i).copied().unwrap_or(0))?;
+    }
+    Ok(())
 }
 
 /// Read an ASCIIZ string from guest memory at seg:off, scanning for a NUL with a
@@ -1900,5 +2376,594 @@ mod tests {
         };
         kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
         assert_eq!(regs.ax & 0xff, 0x01); // AL = number of logical drives
+    }
+
+    #[test]
+    fn read_on_a_write_only_handle_returns_ax05() {
+        let (mut kernel, mut mem, _dir) = kernel_with_drive(&[("DATA.TXT", b"hi")], r"C:\DATA.TXT");
+        // Open AL=1 (write-only) on the existing file.
+        let mut open = DosRegs {
+            ax: 0x3d01,
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut open, &mut mem).unwrap();
+        assert!(!open.cf, "open failed: ax={:#06x}", open.ax);
+        let handle = open.ax;
+        // Reading a write-only handle is access-denied.
+        let mut read = DosRegs {
+            ax: 0x3f00,
+            bx: handle,
+            cx: 16,
+            ds: 0x0100,
+            dx: 0x0400,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut read, &mut mem).unwrap();
+        assert!(read.cf);
+        assert_eq!(read.ax, 0x05);
+    }
+
+    #[test]
+    fn ah3c_creates_a_file_and_returns_a_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut kernel = DosKernel::new();
+        kernel.mount_c(HostDrive::mount_c(dir.path()).unwrap());
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let base = 0x0100usize * 16 + 0x0200;
+        for (i, b) in r"C:\NEW.TXT".bytes().enumerate() {
+            mem.write_u8(base + i, b).unwrap();
+        }
+        mem.write_u8(base + r"C:\NEW.TXT".len(), 0).unwrap();
+        let mut regs = DosRegs {
+            ax: 0x3c00,
+            cx: 0,
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf, "create failed: ax={:#06x}", regs.ax);
+        assert!(regs.ax >= 5);
+        assert!(dir.path().join("NEW.TXT").exists());
+    }
+
+    #[test]
+    fn ah3c_truncates_an_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("OLD.TXT"), b"previous contents").unwrap();
+        let mut kernel = DosKernel::new();
+        kernel.mount_c(HostDrive::mount_c(dir.path()).unwrap());
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let base = 0x0100usize * 16 + 0x0200;
+        for (i, b) in r"C:\OLD.TXT".bytes().enumerate() {
+            mem.write_u8(base + i, b).unwrap();
+        }
+        mem.write_u8(base + r"C:\OLD.TXT".len(), 0).unwrap();
+        let mut regs = DosRegs {
+            ax: 0x3c00,
+            cx: 0,
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf);
+        assert_eq!(
+            std::fs::metadata(dir.path().join("OLD.TXT")).unwrap().len(),
+            0
+        );
+    }
+
+    #[test]
+    fn ah40_on_a_read_only_handle_returns_ax05() {
+        let (mut kernel, mut mem, _dir) = kernel_with_drive(&[("R.TXT", b"hi")], r"C:\R.TXT");
+        let mut open = DosRegs {
+            ax: 0x3d00,
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut open, &mut mem).unwrap();
+        let handle = open.ax;
+        let mut write = DosRegs {
+            ax: 0x4000,
+            bx: handle,
+            cx: 2,
+            ds: 0x0100,
+            dx: 0x0300,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut write, &mut mem).unwrap();
+        assert!(write.cf);
+        assert_eq!(write.ax, 0x05);
+    }
+
+    #[test]
+    fn ah40_to_stdout_handle_writes_to_the_output_buffer() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let src = 0x0100usize * 16 + 0x0300;
+        for (i, b) in b"hello".iter().enumerate() {
+            mem.write_u8(src + i, *b).unwrap();
+        }
+        let mut regs = DosRegs {
+            ax: 0x4000,
+            bx: 1,
+            cx: 5,
+            ds: 0x0100,
+            dx: 0x0300,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf);
+        assert_eq!(regs.ax, 5);
+        assert_eq!(kernel.stdout(), b"hello");
+    }
+
+    #[test]
+    fn ah40_to_an_invalid_handle_returns_ax06() {
+        // BX=0 is not a routed console handle (1/2) and not an open file, so it
+        // falls through to the table lookup and returns invalid handle.
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let mut regs = DosRegs {
+            ax: 0x4000,
+            bx: 0,
+            cx: 1,
+            ds: 0x0100,
+            dx: 0x0300,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x06);
+    }
+
+    #[test]
+    fn ah42_seek_set_cur_end_return_position() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("S.TXT"), b"0123456789").unwrap();
+        let mut kernel = DosKernel::new();
+        kernel.mount_c(HostDrive::mount_c(dir.path()).unwrap());
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let name_base = 0x0100usize * 16 + 0x0200;
+        for (i, b) in r"C:\S.TXT".bytes().enumerate() {
+            mem.write_u8(name_base + i, b).unwrap();
+        }
+        mem.write_u8(name_base + r"C:\S.TXT".len(), 0).unwrap();
+        let mut open = DosRegs {
+            ax: 0x3d02,
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut open, &mut mem).unwrap();
+        let handle = open.ax;
+        // SET to 3.
+        let mut s = DosRegs {
+            ax: 0x4200,
+            bx: handle,
+            cx: 0,
+            dx: 3,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut s, &mut mem).unwrap();
+        assert!(!s.cf);
+        assert_eq!(((u32::from(s.dx) << 16) | u32::from(s.ax)), 3);
+        // CUR +2 -> 5.
+        let mut c = DosRegs {
+            ax: 0x4201,
+            bx: handle,
+            cx: 0,
+            dx: 2,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut c, &mut mem).unwrap();
+        assert_eq!(((u32::from(c.dx) << 16) | u32::from(c.ax)), 5);
+        // END +0 -> 10 (file length).
+        let mut e = DosRegs {
+            ax: 0x4202,
+            bx: handle,
+            cx: 0,
+            dx: 0,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut e, &mut mem).unwrap();
+        assert_eq!(((u32::from(e.dx) << 16) | u32::from(e.ax)), 10);
+    }
+
+    #[test]
+    fn ah42_bad_whence_returns_ax01() {
+        let (mut kernel, mut mem, _dir) = kernel_with_drive(&[("S.TXT", b"hi")], r"C:\S.TXT");
+        let mut open = DosRegs {
+            ax: 0x3d00,
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut open, &mut mem).unwrap();
+        let handle = open.ax;
+        let mut bad = DosRegs {
+            ax: 0x4203,
+            bx: handle,
+            cx: 0,
+            dx: 0,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut bad, &mut mem).unwrap();
+        assert!(bad.cf);
+        assert_eq!(bad.ax, 0x01);
+    }
+
+    #[test]
+    fn ah40_writes_bytes_and_ah3f_reads_them_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut kernel = DosKernel::new();
+        kernel.mount_c(HostDrive::mount_c(dir.path()).unwrap());
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let name_base = 0x0100usize * 16 + 0x0200;
+        for (i, b) in r"C:\W.TXT".bytes().enumerate() {
+            mem.write_u8(name_base + i, b).unwrap();
+        }
+        mem.write_u8(name_base + r"C:\W.TXT".len(), 0).unwrap();
+        let mut create = DosRegs {
+            ax: 0x3c00,
+            cx: 0,
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut create, &mut mem).unwrap();
+        let handle = create.ax;
+        let src = 0x0100usize * 16 + 0x0300;
+        for (i, b) in b"ABCD".iter().enumerate() {
+            mem.write_u8(src + i, *b).unwrap();
+        }
+        let mut write = DosRegs {
+            ax: 0x4000,
+            bx: handle,
+            cx: 4,
+            ds: 0x0100,
+            dx: 0x0300,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut write, &mut mem).unwrap();
+        assert!(!write.cf);
+        assert_eq!(write.ax, 4);
+        assert_eq!(std::fs::read(dir.path().join("W.TXT")).unwrap(), b"ABCD");
+        let mut seek = DosRegs {
+            ax: 0x4200,
+            bx: handle,
+            cx: 0,
+            dx: 0,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut seek, &mut mem).unwrap();
+        let mut read = DosRegs {
+            ax: 0x3f00,
+            bx: handle,
+            cx: 4,
+            ds: 0x0100,
+            dx: 0x0400,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut read, &mut mem).unwrap();
+        assert_eq!(read.ax, 4);
+        let dst = 0x0100usize * 16 + 0x0400;
+        let got: Vec<u8> = (0..4).map(|i| mem.read_u8(dst + i).unwrap()).collect();
+        assert_eq!(got, b"ABCD");
+    }
+
+    fn find_first(kernel: &mut DosKernel, mem: &mut Memory, filespec: &str, mask: u16) -> DosRegs {
+        // Place the ASCIIZ filespec at DS:DX = 0x0010:0x0000 (linear 0x100), clear
+        // of the DTA record written at linear 0 (the default DTA is (0,0)).
+        let base = 0x100;
+        for (i, byte) in filespec.bytes().enumerate() {
+            mem.write_u8(base + i, byte).unwrap();
+        }
+        mem.write_u8(base + filespec.len(), 0).unwrap();
+        let mut regs = DosRegs {
+            ax: 0x4e00,
+            cx: mask,
+            ds: 0x0010,
+            dx: 0x0000,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, mem).unwrap();
+        regs
+    }
+
+    fn find_next(kernel: &mut DosKernel, mem: &mut Memory) -> DosRegs {
+        let mut regs = DosRegs {
+            ax: 0x4f00,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, mem).unwrap();
+        regs
+    }
+
+    /// Read the ASCIIZ 8.3 name from the DTA record at linear 0, offset 0x1E.
+    fn dta_name(mem: &Memory) -> String {
+        let mut bytes = Vec::new();
+        for i in 0..13 {
+            let byte = mem.read_u8(0x1e + i).unwrap();
+            if byte == 0 {
+                break;
+            }
+            bytes.push(byte);
+        }
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// A kernel with `dir` mounted as C: and a 1 MiB memory for DTA writes.
+    fn find_kernel(dir: &Path) -> (DosKernel, Memory) {
+        let mut kernel = DosKernel::new();
+        kernel.mount_c(HostDrive::mount_c(dir).unwrap());
+        let mem = Memory::new(1024 * 1024).unwrap();
+        (kernel, mem)
+    }
+
+    #[test]
+    fn host_name_to_8_3_accepts_and_rejects() {
+        assert_eq!(host_name_to_8_3("HELLO.TXT"), Some(*b"HELLO   TXT"));
+        assert_eq!(host_name_to_8_3("readme"), Some(*b"README     "));
+        assert_eq!(host_name_to_8_3("a.b.c"), None); // two dots
+        assert_eq!(host_name_to_8_3("report.text"), None); // ext > 3
+        assert_eq!(host_name_to_8_3("toolongname.do"), None); // base > 8
+        assert_eq!(host_name_to_8_3(".cfg"), None); // empty base
+        assert_eq!(host_name_to_8_3("MY FILE.TXT"), None); // space is not an 8.3 char
+        assert_eq!(host_name_to_8_3("A+B.TXT"), None); // '+' is reserved
+        assert_eq!(host_name_to_8_3("CONFIG_1.SYS"), Some(*b"CONFIG_1SYS")); // '_' is legal
+    }
+
+    #[test]
+    fn template_matches_wildcards() {
+        let star_dot_star = pattern_to_8_3("*.*");
+        assert!(template_matches(
+            &host_name_to_8_3("GAME.EXE").unwrap(),
+            &star_dot_star
+        ));
+        assert!(template_matches(
+            &host_name_to_8_3("README").unwrap(),
+            &star_dot_star
+        ));
+
+        let star_exe = pattern_to_8_3("*.EXE");
+        assert!(template_matches(
+            &host_name_to_8_3("GAME.EXE").unwrap(),
+            &star_exe
+        ));
+        assert!(!template_matches(
+            &host_name_to_8_3("GAME.COM").unwrap(),
+            &star_exe
+        ));
+
+        let level_q = pattern_to_8_3("LEVEL?.DAT");
+        assert!(template_matches(
+            &host_name_to_8_3("LEVEL1.DAT").unwrap(),
+            &level_q
+        ));
+        assert!(template_matches(
+            &host_name_to_8_3("LEVEL.DAT").unwrap(),
+            &level_q
+        ));
+    }
+
+    #[test]
+    fn attr_matches_normal_and_directory() {
+        assert!(attr_matches(0x00, 0x00)); // a normal file always matches
+        assert!(!attr_matches(0x10, 0x00)); // a directory needs the mask bit
+        assert!(attr_matches(0x10, 0x10));
+        assert!(attr_matches(0x00, 0x10));
+    }
+
+    #[test]
+    fn ah4e_finds_a_matching_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("HELLO.TXT"), b"hi there").unwrap();
+        let (mut kernel, mut mem) = find_kernel(dir.path());
+        let regs = find_first(&mut kernel, &mut mem, "C:\\*.TXT", 0);
+        assert!(!regs.cf);
+        assert_eq!(dta_name(&mem), "HELLO.TXT");
+        assert_eq!(mem.read_u8(0x15).unwrap(), 0x00); // attr: normal file
+        assert_eq!(mem.read_u32(0x1a).unwrap(), 8); // size
+    }
+
+    #[test]
+    fn ah4e_no_match_returns_0x12() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut kernel, mut mem) = find_kernel(dir.path());
+        let regs = find_first(&mut kernel, &mut mem, "C:\\*.TXT", 0);
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x12);
+    }
+
+    #[test]
+    fn ah4e_bad_directory_returns_0x03() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut kernel, mut mem) = find_kernel(dir.path());
+        let regs = find_first(&mut kernel, &mut mem, "C:\\NOPE\\*.*", 0);
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x03);
+    }
+
+    #[test]
+    fn ah4e_skips_non_8_3_host_names_and_uppercases() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ok.txt"), b"a").unwrap();
+        std::fs::write(dir.path().join("report.text"), b"b").unwrap(); // ext > 3
+        std::fs::write(dir.path().join("a.b.c"), b"c").unwrap(); // two dots
+        let (mut kernel, mut mem) = find_kernel(dir.path());
+        let regs = find_first(&mut kernel, &mut mem, "C:\\*.*", 0);
+        assert!(!regs.cf);
+        assert_eq!(dta_name(&mem), "OK.TXT");
+        let regs = find_next(&mut kernel, &mut mem);
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x12);
+    }
+
+    #[test]
+    fn ah4e_directory_attr_filtering() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("F.TXT"), b"a").unwrap();
+        std::fs::create_dir(dir.path().join("SUB")).unwrap();
+
+        let (mut kernel, mut mem) = find_kernel(dir.path());
+        // Mask 0x00: directories excluded, only the file is found.
+        let regs = find_first(&mut kernel, &mut mem, "C:\\*.*", 0x00);
+        assert!(!regs.cf);
+        assert_eq!(dta_name(&mem), "F.TXT");
+        assert!(find_next(&mut kernel, &mut mem).cf);
+
+        // Mask 0x10: the directory is included.
+        let mut names = Vec::new();
+        let regs = find_first(&mut kernel, &mut mem, "C:\\*.*", 0x10);
+        assert!(!regs.cf);
+        names.push(dta_name(&mem));
+        loop {
+            let regs = find_next(&mut kernel, &mut mem);
+            if regs.cf {
+                break;
+            }
+            names.push(dta_name(&mem));
+        }
+        names.sort();
+        assert_eq!(names, vec!["F.TXT", "SUB"]);
+        // The directory entry carries attr 0x10 in its record.
+        let regs = find_first(&mut kernel, &mut mem, "C:\\SUB", 0x10);
+        assert!(!regs.cf);
+        assert_eq!(mem.read_u8(0x15).unwrap(), 0x10);
+    }
+
+    #[test]
+    fn ah4f_iterates_all_matches_then_0x12() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["A.DAT", "B.DAT", "C.DAT"] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        let (mut kernel, mut mem) = find_kernel(dir.path());
+        let mut names = Vec::new();
+        let regs = find_first(&mut kernel, &mut mem, "C:\\*.DAT", 0);
+        assert!(!regs.cf);
+        names.push(dta_name(&mem));
+        loop {
+            let regs = find_next(&mut kernel, &mut mem);
+            if regs.cf {
+                assert_eq!(regs.ax, 0x12);
+                break;
+            }
+            names.push(dta_name(&mem));
+        }
+        names.sort();
+        assert_eq!(names, vec!["A.DAT", "B.DAT", "C.DAT"]);
+    }
+
+    #[test]
+    fn ah4f_without_find_first_returns_0x12() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut kernel, mut mem) = find_kernel(dir.path());
+        let regs = find_next(&mut kernel, &mut mem);
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x12);
+    }
+
+    #[test]
+    fn ah4e_record_layout_zeroes_reserved_area() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("F.TXT"), b"abcd").unwrap();
+        let (mut kernel, mut mem) = find_kernel(dir.path());
+        // Dirty the reserved area first to prove FindFirst zeroes it.
+        for offset in 0..0x15 {
+            mem.write_u8(offset, 0xff).unwrap();
+        }
+        let regs = find_first(&mut kernel, &mut mem, "C:\\*.*", 0);
+        assert!(!regs.cf);
+        for offset in 0..0x15 {
+            assert_eq!(mem.read_u8(offset).unwrap(), 0, "reserved byte {offset:#x}");
+        }
+        assert_eq!(mem.read_u8(0x15).unwrap(), 0x00); // attr
+        assert_ne!(mem.read_u16(0x18).unwrap(), 0); // date is the real host mtime
+        assert_eq!(mem.read_u32(0x1a).unwrap(), 4); // size
+        assert_eq!(dta_name(&mem), "F.TXT");
+    }
+
+    #[test]
+    fn ah4e_packs_the_host_modified_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("STAMP.TXT");
+        std::fs::write(&path, b"x").unwrap();
+        // 2000-01-01 12:34:56 UTC.
+        let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(946_730_096);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+        let (mut kernel, mut mem) = find_kernel(dir.path());
+        let regs = find_first(&mut kernel, &mut mem, "C:\\*.TXT", 0);
+        assert!(!regs.cf);
+        // date = ((2000-1980)<<9)|(1<<5)|1 = 10273; time = (12<<11)|(34<<5)|(56/2) = 25692.
+        assert_eq!(mem.read_u16(0x18).unwrap(), 10_273);
+        assert_eq!(mem.read_u16(0x16).unwrap(), 25_692);
+    }
+
+    #[test]
+    fn ah40_cx0_truncates_at_the_current_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut kernel = DosKernel::new();
+        kernel.mount_c(HostDrive::mount_c(dir.path()).unwrap());
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let name_base = 0x0100usize * 16 + 0x0200;
+        for (i, b) in r"C:\T.TXT".bytes().enumerate() {
+            mem.write_u8(name_base + i, b).unwrap();
+        }
+        mem.write_u8(name_base + r"C:\T.TXT".len(), 0).unwrap();
+        let mut create = DosRegs {
+            ax: 0x3c00,
+            cx: 0,
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut create, &mut mem).unwrap();
+        let handle = create.ax;
+        let src = 0x0100usize * 16 + 0x0300;
+        for i in 0..10u8 {
+            mem.write_u8(src + usize::from(i), b'x').unwrap();
+        }
+        let mut write = DosRegs {
+            ax: 0x4000,
+            bx: handle,
+            cx: 10,
+            ds: 0x0100,
+            dx: 0x0300,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut write, &mut mem).unwrap();
+        let mut seek = DosRegs {
+            ax: 0x4200,
+            bx: handle,
+            cx: 0,
+            dx: 4,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut seek, &mut mem).unwrap();
+        let mut trunc = DosRegs {
+            ax: 0x4000,
+            bx: handle,
+            cx: 0,
+            ds: 0x0100,
+            dx: 0x0300,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut trunc, &mut mem).unwrap();
+        assert!(!trunc.cf);
+        assert_eq!(
+            std::fs::metadata(dir.path().join("T.TXT")).unwrap().len(),
+            4
+        );
     }
 }

@@ -1,4 +1,4 @@
-use izarravm_audio::{OplChip, Resampler};
+use izarravm_audio::{OplChip, Resampler, SbDsp};
 use izarravm_bus::{BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CpuBus, Memory};
 use izarravm_core::{CpuPreset, HardwareProfile, VideoCard};
 use izarravm_cpu::{Cpu386, CpuError, SegmentIndex, SegmentRegister};
@@ -10,6 +10,7 @@ use izarravm_video::{
 };
 use thiserror::Error;
 
+mod dma;
 mod pic;
 mod pit;
 
@@ -112,6 +113,10 @@ const DAC_HZ: u32 = 44_100;
 const PIT_INPUT_HZ: u32 = 1_193_182;
 /// VGA 25.175 MHz dot clock (standard 640x480 and related modes).
 const VGA_DOT_HZ: u64 = 25_175_000;
+/// Sound Blaster 16 IRQ and DMA resources (fixed for the Resonique 2).
+const SB_IRQ: u8 = 5;
+const SB_DMA_CHANNEL_8: usize = 1;
+const SB_DMA_CHANNEL_16: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveDisplay {
@@ -137,11 +142,18 @@ pub struct Machine {
     pic: pic::Pic8259Pair,
     pit: pit::Pit,
     pit_clocks: f64, // fractional PIT input clocks owed to the counters
+    dma: dma::DmaController,
     opl: OplChip,
     resampler: Resampler,
     opl_micros: f64, // fractional microseconds owed to the OPL timers
-    margo_ns: f64,   // fractional nanoseconds owed to the Margo busy countdown
-    vga_dots: f64,   // fractional VGA dot clocks owed to the beam advance
+    dsp: SbDsp,
+    /// DSP PCM resampler (rate_hz -> 44100), rebuilt when the programmed rate
+    /// changes. Summed with the OPL stream in render_audio.
+    dsp_resampler: Resampler,
+    dsp_rate_hz: u32, // input rate the dsp_resampler is currently configured for
+    dsp_micros: f64,  // fractional microseconds owed to the DSP reset-settle clock
+    margo_ns: f64,    // fractional nanoseconds owed to the Margo busy countdown
+    vga_dots: f64,    // fractional VGA dot clocks owed to the beam advance
     trace: BusTrace,
     elapsed_clocks: u64,
 }
@@ -168,9 +180,16 @@ impl Machine {
             pic: pic::Pic8259Pair::default(),
             pit: pit::Pit::default(),
             pit_clocks: 0.0,
+            dma: dma::DmaController::default(),
             opl: OplChip::default(),
             resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             opl_micros: 0.0,
+            dsp: SbDsp::default(),
+            // Placeholder; sync_dsp_resampler rebuilds this for the live rate on
+            // first use, so the value here never reaches the DAC as-is.
+            dsp_resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
+            dsp_rate_hz: 0,
+            dsp_micros: 0.0,
             margo_ns: 0.0,
             vga_dots: 0.0,
             trace: BusTrace::default(),
@@ -210,9 +229,16 @@ impl Machine {
             pic: pic::Pic8259Pair::default(),
             pit: pit::Pit::default(),
             pit_clocks: 0.0,
+            dma: dma::DmaController::default(),
             opl: OplChip::default(),
             resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             opl_micros: 0.0,
+            dsp: SbDsp::default(),
+            // Placeholder; sync_dsp_resampler rebuilds this for the live rate on
+            // first use, so the value here never reaches the DAC as-is.
+            dsp_resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
+            dsp_rate_hz: 0,
+            dsp_micros: 0.0,
             margo_ns: 0.0,
             vga_dots: 0.0,
             trace: BusTrace::default(),
@@ -270,9 +296,16 @@ impl Machine {
             pic: pic::Pic8259Pair::default(),
             pit: pit::Pit::default(),
             pit_clocks: 0.0,
+            dma: dma::DmaController::default(),
             opl: OplChip::default(),
             resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             opl_micros: 0.0,
+            dsp: SbDsp::default(),
+            // Placeholder; sync_dsp_resampler rebuilds this for the live rate on
+            // first use, so the value here never reaches the DAC as-is.
+            dsp_resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
+            dsp_rate_hz: 0,
+            dsp_micros: 0.0,
             margo_ns: 0.0,
             vga_dots: 0.0,
             trace: BusTrace::default(),
@@ -354,7 +387,9 @@ impl Machine {
             device_ports: &mut self.device_ports,
             pic: &mut self.pic,
             pit: &mut self.pit,
+            dma: &mut self.dma,
             opl: &mut self.opl,
+            dsp: &mut self.dsp,
             trace: &mut self.trace,
             pending_soft_int: &mut self.pending_soft_int,
             wait_states: self.profile.wait_states,
@@ -679,6 +714,14 @@ impl Machine {
         self.opl.advance_micros(whole as u64);
         self.opl_micros -= whole;
 
+        // The DSP reset-settle countdown advances with emulated time so a
+        // detection routine's delay loop sees 0xAA become available. The
+        // playback sample clock is paced by render_audio, not here.
+        self.dsp_micros += clocks as f64 * 1_000_000.0 / self.profile.clock_hz as f64;
+        let whole = self.dsp_micros.floor();
+        self.dsp.advance_micros(whole);
+        self.dsp_micros -= whole;
+
         self.pit_clocks += clocks as f64 * f64::from(PIT_INPUT_HZ) / self.profile.clock_hz as f64;
         let whole = self.pit_clocks.floor();
         self.pit_clocks -= whole;
@@ -696,19 +739,141 @@ impl Machine {
         let whole = self.vga_dots.floor();
         self.video.advance(whole as u64);
         self.vga_dots -= whole;
+
+        self.pump_pusher();
     }
 
-    /// Render `native_samples` of OPL3 output at 49716 Hz and return the
-    /// resampled 44100 Hz stereo PCM (saturated to 16-bit) ready for the DAC.
-    /// The caller paces this by elapsed emulated time to keep audio in step.
+    /// Drive the DMA pusher (section 7.9). While the pusher is enabled, the engine
+    /// is idle (`busy_ns == 0`), and the ring is not drained (`get != put`), read
+    /// one command from the ring in system RAM and replay its data words as
+    /// register writes through `margo.write_mmio_u8`, advancing PUSH_GET. A data
+    /// word that writes COMMAND sets `busy_ns`, so the loop stalls there until the
+    /// operation completes on a later `advance_devices`, which is why PUSH_GET
+    /// trails PUSH_PUT. Latch-only packets consume instantly.
+    ///
+    /// A full ring holds at most `size / 4` words, so the engine consumes at most
+    /// that many words per call: this backstops a malformed ring (a non-power-of-two
+    /// `size`, or a `put` that the `(get + 4) % size` orbit never reaches) where the
+    /// `get != put` guard alone would spin forever over latch-only or zeroed words.
+    /// A well-formed ring always drains in fewer than `size / 4` words, so the budget
+    /// never truncates legitimate work.
+    fn pump_pusher(&mut self) {
+        let p = self.margo.pusher();
+        if !p.enabled || p.size == 0 {
+            return;
+        }
+        let mut get = p.get;
+        let mut budget = (p.size / 4) as u64;
+        while self.margo.busy_ns() == 0 && get != p.put && budget > 0 {
+            let header = self.read_ring_word(p.base, p.size, get);
+            let method = (header & 0xffff) as usize;
+            let count = header >> 16;
+            get = (get + 4) % p.size;
+            budget -= 1;
+            let mut i = 0u32;
+            while i < count && get != p.put && budget > 0 {
+                let data = self.read_ring_word(p.base, p.size, get);
+                for b in 0..4 {
+                    self.margo
+                        .write_mmio_u8(method + (i as usize) * 4 + b, (data >> (8 * b)) as u8);
+                }
+                get = (get + 4) % p.size;
+                budget -= 1;
+                i += 1;
+            }
+            self.margo.set_pusher_get(get);
+        }
+    }
+
+    /// Read one 32-bit little-endian word from the command ring at byte offset
+    /// `off`, wrapping within `size` (a power of two in practice; `% size` is used
+    /// so any nonzero size is safe). Each byte is bounds-checked against system RAM;
+    /// an out-of-range byte reads as 0 (no panic, no wrap into other state).
+    fn read_ring_word(&self, base: u32, size: u32, off: u32) -> u32 {
+        let mut bytes = [0u8; 4];
+        for (b, slot) in bytes.iter_mut().enumerate() {
+            let ring_off = (off as usize + b) % size as usize;
+            *slot = self.memory.read_u8(base as usize + ring_off).unwrap_or(0);
+        }
+        u32::from_le_bytes(bytes)
+    }
+
+    /// Render `native_samples` of DSP DMA output as stereo frames. Each frame
+    /// pulls one byte (8-bit mode, mono duplicated L/R) or one/two 16-bit words
+    /// (16-bit mono/stereo) from the matching DMA channel; the DSP's half/end
+    /// IRQ is forwarded to the PIC as IRQ5. The DSP renders one stereo frame per
+    /// call; the mixer resamples and sums it with the OPL.
+    pub fn render_dsp_audio(&mut self, native_samples: usize) -> Vec<(i16, i16)> {
+        let Machine {
+            dsp,
+            dma,
+            memory,
+            pic,
+            ..
+        } = self;
+        let mut out = Vec::with_capacity(native_samples);
+        for _ in 0..native_samples {
+            // Only the fetcher matching the armed mode is given the DMA/memory
+            // borrow; the other is a no-op closure the DSP never calls. This keeps
+            // the single &mut dma/&mut memory borrow sound while feeding both paths
+            // through one render_frame call.
+            let frame = if dsp.is_16bit() {
+                dsp.render_frame(|| None, || dma.read_word(SB_DMA_CHANNEL_16, memory))
+            } else {
+                dsp.render_frame(|| dma.read_byte(SB_DMA_CHANNEL_8, memory), || None)
+            };
+            if let Some(sample) = frame {
+                out.push(sample);
+            }
+            if dsp.take_irq() {
+                pic.request(SB_IRQ);
+            }
+        }
+        out
+    }
+
+    /// Rebuild the DSP resampler when the programmed sample rate changes, so it
+    /// always runs rate_hz -> 44100.
+    fn sync_dsp_resampler(&mut self) {
+        let rate = self.dsp.rate_hz().max(1);
+        if rate != self.dsp_rate_hz {
+            self.dsp_resampler = Resampler::new(rate, DAC_HZ);
+            self.dsp_rate_hz = rate;
+        }
+    }
+
+    /// Render `native_samples` of mixed OPL3 + SB16 DSP audio at the 44100 Hz DAC
+    /// rate (stereo, saturated to 16-bit). `native_samples` is counted in OPL
+    /// native (49716 Hz) time; the DSP is advanced by the matching wall-clock
+    /// duration at its own rate. Each stream is resampled to 44100 and summed.
     pub fn render_audio(&mut self, native_samples: usize) -> Vec<(i16, i16)> {
-        let native: Vec<(i32, i32)> = (0..native_samples)
+        let opl_native: Vec<(i32, i32)> = (0..native_samples)
             .map(|_| self.opl.render_sample())
             .collect();
-        self.resampler
-            .process(&native)
-            .into_iter()
-            .map(|(l, r)| (clamp_i16(l), clamp_i16(r)))
+        let opl_out = self.resampler.process(&opl_native);
+
+        self.sync_dsp_resampler();
+        // DSP native samples spanning the same wall-clock window as the OPL.
+        let dsp_native_count = (native_samples as f64 * self.dsp.rate_hz() as f64
+            / OPL_NATIVE_HZ as f64)
+            .round() as usize;
+        // The DSP already produces stereo frames; widen to i32 and resample.
+        let dsp_stereo: Vec<(i32, i32)> = self
+            .render_dsp_audio(dsp_native_count)
+            .iter()
+            .map(|&(l, r)| (i32::from(l), i32::from(r)))
+            .collect();
+        let dsp_out = self.dsp_resampler.process(&dsp_stereo);
+
+        // Sum over the longer length; a silent (idle) DSP yields no frames, so the
+        // OPL passes through unchanged when no DMA playback is armed.
+        let len = opl_out.len().max(dsp_out.len());
+        (0..len)
+            .map(|i| {
+                let (ol, or) = opl_out.get(i).copied().unwrap_or((0, 0));
+                let (dl, dr) = dsp_out.get(i).copied().unwrap_or((0, 0));
+                (clamp_i16(ol + dl), clamp_i16(or + dr))
+            })
             .collect()
     }
 
@@ -716,6 +881,28 @@ impl Machine {
     /// devices call this; slice 2b wires the PIT's IRQ0 tick through here.
     pub fn request_irq(&mut self, line: u8) {
         self.pic.request(line);
+    }
+
+    /// Pull one byte from a DMA channel's memory transfer (memory->device read).
+    /// Returns None when the channel is masked or has reached terminal count. The
+    /// sound slice feeds this to the SB16 DSP for 8-bit playback.
+    pub fn dma_read_byte(&mut self, channel: usize) -> Option<u8> {
+        self.dma.read_byte(channel, &mut self.memory)
+    }
+
+    /// Pull one 16-bit word from a slave DMA channel's memory transfer
+    /// (memory->device read). Returns None on the master channels (0-3, 8-bit) or
+    /// when the slave channel is masked / at terminal count. The sound slice
+    /// feeds this to the SB16 DSP for 16-bit playback (channel 5).
+    pub fn dma_read_word(&mut self, channel: usize) -> Option<u16> {
+        self.dma.read_word(channel, &mut self.memory)
+    }
+
+    /// Advance the DSP reset-settle clock by `micros` microseconds. The run loop
+    /// drives this from CPU clocks in advance_devices; this exposes it directly
+    /// so a reset-detection golden can settle the DSP without running the CPU.
+    pub fn advance_dsp_micros(&mut self, micros: u64) {
+        self.dsp.advance_micros(micros as f64);
     }
 
     /// Drive a PIT counter's GATE line. The PC ties GATE0/GATE1 high; the sound
@@ -782,7 +969,9 @@ impl Machine {
                     device_ports,
                     pic,
                     pit,
+                    dma,
                     opl,
+                    dsp,
                     trace,
                     pending_soft_int,
                     ..
@@ -796,7 +985,9 @@ impl Machine {
                     device_ports,
                     pic,
                     pit,
+                    dma,
                     opl,
+                    dsp,
                     trace,
                     pending_soft_int,
                     wait_states: profile.wait_states,
@@ -855,7 +1046,9 @@ struct MachineBus<'a> {
     device_ports: &'a mut DevicePorts,
     pic: &'a mut pic::Pic8259Pair,
     pit: &'a mut pit::Pit,
+    dma: &'a mut dma::DmaController,
     opl: &'a mut OplChip,
+    dsp: &'a mut SbDsp,
     trace: &'a mut BusTrace,
     pending_soft_int: &'a mut Option<u8>,
     wait_states: WaitStateProfile,
@@ -958,10 +1151,16 @@ impl CpuBus for MachineBus<'_> {
             // The chip drives only the status byte on reads; data ports read open-bus.
             return Ok(u32::from(self.opl.read_port(opl_port).unwrap_or(0xff)));
         }
+        if let Some(value) = self.dsp.read_port(port) {
+            return Ok(u32::from(value));
+        }
         if let Some(value) = self.pit.read_port(port) {
             return Ok(u32::from(value));
         }
         if let Some(value) = self.pic.read_port(port) {
+            return Ok(u32::from(value));
+        }
+        if let Some(value) = self.dma.read_port(port) {
             return Ok(u32::from(value));
         }
         self.device_ports
@@ -984,6 +1183,12 @@ impl CpuBus for MachineBus<'_> {
 
         if let Some(opl_port) = opl_port(port) {
             self.opl.write_port(opl_port, value as u8);
+            return Ok(());
+        }
+        if self.dsp.write_port(port, value as u8) {
+            return Ok(());
+        }
+        if self.dma.write_port(port, value as u8) {
             return Ok(());
         }
         if self.serial.write_port(port, value as u8)
@@ -1694,6 +1899,136 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dma_channel_one_transfers_from_memory_through_the_bus() {
+        let mut machine = test_machine();
+        // Seed memory at physical 0x01_0010 (page 0x01, offset 0x0010).
+        machine.write_physical_u8(0x0001_0010, 0x77);
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x0B, BusWidth::Byte, 0x49).unwrap(); // mode ch1: single, read
+            bus.write_io(0x02, BusWidth::Byte, 0x10).unwrap(); // address LSB
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap(); // address MSB -> 0x0010
+            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap(); // count LSB
+            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap(); // count MSB -> 0 (1 transfer)
+            bus.write_io(0x83, BusWidth::Byte, 0x01).unwrap(); // page -> 0x01_0010
+            bus.write_io(0x0A, BusWidth::Byte, 0x01).unwrap(); // unmask channel 1
+        });
+        let byte = machine.dma_read_byte(1).expect("a byte from channel 1");
+        assert_eq!(byte, 0x77);
+    }
+
+    #[test]
+    fn sb_dsp_reset_handshake_through_the_bus() {
+        let mut machine = test_machine();
+        // Reset: write 1, then 0 to the DSP reset port 0x226.
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x226, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x226, BusWidth::Byte, 0x00).unwrap();
+        });
+        // Advance emulated time past the ~100us DSP settle window.
+        machine.advance_dsp_micros(200);
+        let status = with_bus(&mut machine, |bus| {
+            u8::try_from(bus.read_io(0x22E, BusWidth::Byte).unwrap()).unwrap()
+        });
+        assert_eq!(status & 0x80, 0x80, "data available after reset");
+        let ack = with_bus(&mut machine, |bus| {
+            u8::try_from(bus.read_io(0x22A, BusWidth::Byte).unwrap()).unwrap()
+        });
+        assert_eq!(ack, 0xAA);
+    }
+
+    #[test]
+    fn sb_dsp_version_and_status_route_through_the_bus() {
+        let mut machine = test_machine();
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x22C, BusWidth::Byte, 0xE1).unwrap(); // read version
+        });
+        let hi = with_bus(&mut machine, |bus| {
+            u8::try_from(bus.read_io(0x22A, BusWidth::Byte).unwrap()).unwrap()
+        });
+        let lo = with_bus(&mut machine, |bus| {
+            u8::try_from(bus.read_io(0x22A, BusWidth::Byte).unwrap()).unwrap()
+        });
+        assert_eq!([hi, lo], [4, 5]);
+    }
+
+    #[test]
+    fn sb_8bit_dma_plays_a_buffer_through_the_dsp() {
+        let mut machine = test_machine();
+        // A 16-byte unsigned ramp in conventional memory at 0x01_0000.
+        let bytes: Vec<u8> = (0..16).map(|i| (i * 16) as u8).collect();
+        for (i, &b) in bytes.iter().enumerate() {
+            machine.write_physical_u8(0x1_0000 + i as u32, b);
+        }
+        with_bus(&mut machine, |bus| {
+            // DMA ch1: address 0x0000, page 0x01, count 15, single read.
+            bus.write_io(0x0B, BusWidth::Byte, 0x49).unwrap(); // mode ch1
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x0F).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x83, BusWidth::Byte, 0x01).unwrap(); // page -> 0x01_0000
+            bus.write_io(0x0A, BusWidth::Byte, 0x01).unwrap(); // unmask ch1
+            // DSP: 11025 Hz, block 16, single 8-bit DMA output.
+            for &b in &[0x41u8, 0x2B, 0x11, 0x48, 0x0F, 0x00, 0x14] {
+                bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
+            }
+        });
+        let out = machine.render_dsp_audio(16);
+        assert_eq!(out.len(), 16);
+        // Unsigned 0x00 maps to a centered negative sample; mono is duplicated L/R.
+        assert!(out.iter().any(|&(l, _)| l < 0), "expected negative samples");
+        assert!(
+            out.iter().all(|&(l, r)| l == r),
+            "8-bit mono duplicated L/R"
+        );
+        // Single mode masks channel 1 at terminal count.
+        assert_eq!(machine.dma_read_byte(1), None);
+    }
+
+    #[test]
+    fn sb_16bit_dma_plays_a_signed_stereo_buffer_through_the_dsp() {
+        let mut machine = test_machine();
+        // 8 signed-LE stereo frames (32 bytes). The slave 8237A (channel 5)
+        // word-addresses its transfers, so page 0x01 at word addr 0 drives byte
+        // base (0x01 << 17) = 0x2_0000 (page in A23-A17, A0 tied low). Each frame
+        // is L = -1 (0xFFFF) then R = +1 (0x0001).
+        let frame: [u8; 4] = [0xFF, 0xFF, 0x01, 0x00];
+        for i in 0..8 {
+            for (j, &b) in frame.iter().enumerate() {
+                machine.write_physical_u8(0x2_0000 + (i * 4 + j) as u32, b);
+            }
+        }
+        with_bus(&mut machine, |bus| {
+            // Slave ch5 (local ch1): word addr 0, page 0x8B=0x01, count 15 (16
+            // words), auto-init read.
+            bus.write_io(0xD6, BusWidth::Byte, 0x59).unwrap(); // slave ch1 mode: auto-init, read
+            bus.write_io(0xC4, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0xC4, BusWidth::Byte, 0x00).unwrap(); // word addr 0
+            bus.write_io(0xC6, BusWidth::Byte, 0x0F).unwrap();
+            bus.write_io(0xC6, BusWidth::Byte, 0x00).unwrap(); // count 15 -> 16 words
+            bus.write_io(0x8B, BusWidth::Byte, 0x01).unwrap(); // page -> byte base 0x2_0000
+            bus.write_io(0xD4, BusWidth::Byte, 0x01).unwrap(); // unmask slave ch1
+            // DSP: 22050 Hz, 16-bit auto-init output, signed, stereo, count 15.
+            for &b in &[0x41u8, 0x56, 0x22, 0xB6, 0x30, 0x0F, 0x00] {
+                bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
+            }
+        });
+        let out = machine.render_dsp_audio(8);
+        assert_eq!(out.len(), 8);
+        assert_eq!(out[0].0, -1, "left channel is signed -1");
+        assert_eq!(out[0].1, 1, "right channel is signed +1");
+        assert!(
+            out.iter().all(|&(l, r)| l == -1 && r == 1),
+            "every stereo frame decodes L=-1, R=+1"
+        );
+        // Auto-init: channel 5 still feeds after draining the buffer.
+        assert!(
+            machine.dma_read_word(SB_DMA_CHANNEL_16).is_some(),
+            "auto-init keeps feeding"
+        );
+    }
+
     // Run one closure against a freshly-borrowed bus over the whole machine.
     fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R {
         let mut bus = MachineBus {
@@ -1705,7 +2040,9 @@ mod tests {
             device_ports: &mut machine.device_ports,
             pic: &mut machine.pic,
             pit: &mut machine.pit,
+            dma: &mut machine.dma,
             opl: &mut machine.opl,
+            dsp: &mut machine.dsp,
             trace: &mut machine.trace,
             pending_soft_int: &mut machine.pending_soft_int,
             wait_states: machine.profile.wait_states,
@@ -1904,6 +2241,60 @@ mod tests {
             "expected ~{DAC_HZ} frames, got {}",
             pcm.len()
         );
+    }
+
+    #[test]
+    fn render_audio_passes_through_when_the_dsp_is_idle() {
+        // No DMA playback armed: the DSP produces nothing, so render_audio must
+        // return the OPL-only output at the DAC rate (the existing contract).
+        let mut machine = test_machine();
+        let pcm = machine.render_audio(OPL_NATIVE_HZ as usize);
+        assert!(
+            (pcm.len() as i32 - DAC_HZ as i32).abs() < 50,
+            "idle DSP must not truncate the OPL stream, got {} frames",
+            pcm.len()
+        );
+    }
+
+    #[test]
+    fn render_audio_mixes_the_dsp_dc_level_with_the_opl() {
+        let mut machine = test_machine();
+        // A constant 256-byte DMA buffer; 0x40 maps to sample_u8(0x40) = -16384.
+        const BYTE: u8 = 0x40;
+        const EXPECTED: i32 = -16384; // (0x40 - 128) * 256
+        for i in 0..256u32 {
+            machine.write_physical_u8(0x1_0000 + i, BYTE);
+        }
+        with_bus(&mut machine, |bus| {
+            // DMA ch1: page 0x01, address 0, count 255, auto-init read.
+            bus.write_io(0x0B, BusWidth::Byte, 0x59).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0xFF).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x83, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x0A, BusWidth::Byte, 0x01).unwrap();
+            // DSP: 11025 Hz, block 256, auto-init 8-bit output.
+            for &b in &[0x41u8, 0x2B, 0x11, 0x48, 0xFF, 0x00, 0x1C] {
+                bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
+            }
+        });
+        // The OPL is silent (no voices keyed), so the steady output is the DSP DC
+        // level after the resampler warmup. Render plenty of OPL-native time.
+        let out = machine.render_audio(4_000);
+        assert!(!out.is_empty());
+        let mid = &out[out.len() / 3..out.len() * 2 / 3];
+        let (min_l, max_l) = mid
+            .iter()
+            .map(|f| f.0)
+            .fold((i16::MAX, i16::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
+        let center = (i32::from(min_l) + i32::from(max_l)) / 2;
+        assert!(
+            (center - EXPECTED).abs() < 400,
+            "DSP DC center {center}, expected ~{EXPECTED}"
+        );
+        // Mono is duplicated to both channels.
+        assert!(mid.iter().all(|f| f.0 == f.1), "DSP mono duplicated L/R");
     }
 
     #[test]
@@ -2770,6 +3161,368 @@ mod tests {
     }
 
     #[test]
+    fn overlay_color_key_gates_on_the_primary_pixel() {
+        let mut machine = test_machine();
+        machine.margo_mut().set_mode(0x14a); // 640x480x32, pitch 2560
+        // Primary at (10, 20) holds the key; (11, 20) holds an occluding window pixel.
+        let key = 0x0011_2233u32;
+        let occluder = 0x0044_5566u32;
+        let p0 = 20 * 2560 + 10 * 4;
+        let p1 = 20 * 2560 + 11 * 4;
+        for (i, b) in key.to_le_bytes().into_iter().enumerate() {
+            machine.write_physical_u8(MARGO_LFB_BASE + p0 + i as u32, b);
+        }
+        for (i, b) in occluder.to_le_bytes().into_iter().enumerate() {
+            machine.write_physical_u8(MARGO_LFB_BASE + p1 + i as u32, b);
+        }
+        // YUY2 source: Y0=235 (white), Y1=16 (black).
+        let src = 0x0020_0000u32;
+        machine.write_physical_u8(MARGO_LFB_BASE + src, 235);
+        machine.write_physical_u8(MARGO_LFB_BASE + src + 1, 128);
+        machine.write_physical_u8(MARGO_LFB_BASE + src + 2, 16);
+        machine.write_physical_u8(MARGO_LFB_BASE + src + 3, 128);
+
+        write_mmio_reg(&mut machine, 0x44, src);
+        write_mmio_reg(&mut machine, 0x48, 4);
+        write_mmio_reg(&mut machine, 0x4c, (1 << 16) | 2);
+        write_mmio_reg(&mut machine, 0x58, (20 << 16) | 10);
+        write_mmio_reg(&mut machine, 0x5c, (1 << 16) | 2);
+        write_mmio_reg(&mut machine, 0x60, key); // OVL_COLORKEY
+        write_mmio_reg(&mut machine, 0x40, 1 | (1 << 3)); // ENABLE + KEY_EN, FORMAT YUY2
+
+        let palette = machine.palette_argb();
+        let argb = machine.margo().scanout_argb(&palette);
+        // Where the primary equals the key, the overlay shows (white).
+        assert_eq!(argb[20 * 640 + 10], 0x00ff_ffff);
+        // Where another value occludes the key, the overlay is hidden and the
+        // decoded primary pixel (0x00445566 in X8R8G8B8) remains.
+        assert_eq!(argb[20 * 640 + 11], 0x0044_5566);
+    }
+
+    #[test]
+    fn overlay_yuy2_composites_through_the_apertures() {
+        let mut machine = test_machine();
+        machine.margo_mut().set_mode(0x14a); // 640x480x32
+        // One YUY2 group offscreen (2 MiB in, past the 32bpp visible surface):
+        // Y0=235 (white), U=128, Y1=16 (black), V=128. Byte order Y0, U, Y1, V.
+        let src = 0x0020_0000u32;
+        machine.write_physical_u8(MARGO_LFB_BASE + src, 235);
+        machine.write_physical_u8(MARGO_LFB_BASE + src + 1, 128);
+        machine.write_physical_u8(MARGO_LFB_BASE + src + 2, 16);
+        machine.write_physical_u8(MARGO_LFB_BASE + src + 3, 128);
+
+        write_mmio_reg(&mut machine, 0x44, src); // OVL_SRC_Y (packed surface)
+        write_mmio_reg(&mut machine, 0x48, 4); // OVL_SRC_PITCH
+        write_mmio_reg(&mut machine, 0x4c, (1 << 16) | 2); // OVL_SRC_DIM: w=2, h=1
+        write_mmio_reg(&mut machine, 0x58, (20 << 16) | 10); // OVL_DST_XY: x=10, y=20
+        write_mmio_reg(&mut machine, 0x5c, (1 << 16) | 2); // OVL_DST_DIM: w=2, h=1 (1:1)
+        write_mmio_reg(&mut machine, 0x40, 1); // OVL_CTRL: ENABLE, FORMAT YUY2, no key
+
+        let palette = machine.palette_argb();
+        let argb = machine.margo().scanout_argb(&palette);
+        assert_eq!(argb[20 * 640 + 10], 0x00ff_ffff); // Y0 -> white
+        assert_eq!(argb[20 * 640 + 11], 0x0000_0000); // Y1 -> black
+    }
+
+    #[test]
+    fn overlay_scales_by_point_sampling() {
+        let mut machine = test_machine();
+        machine.margo_mut().set_mode(0x14a);
+        // The same one YUY2 group, scaled 2x horizontally: dst width 4.
+        let src = 0x0020_0000u32;
+        machine.write_physical_u8(MARGO_LFB_BASE + src, 235);
+        machine.write_physical_u8(MARGO_LFB_BASE + src + 1, 128);
+        machine.write_physical_u8(MARGO_LFB_BASE + src + 2, 16);
+        machine.write_physical_u8(MARGO_LFB_BASE + src + 3, 128);
+
+        write_mmio_reg(&mut machine, 0x44, src);
+        write_mmio_reg(&mut machine, 0x48, 4);
+        write_mmio_reg(&mut machine, 0x4c, (1 << 16) | 2); // src w=2, h=1
+        write_mmio_reg(&mut machine, 0x58, (20 << 16) | 10);
+        write_mmio_reg(&mut machine, 0x5c, (1 << 16) | 4); // dst w=4, h=1 (2x)
+        write_mmio_reg(&mut machine, 0x40, 1);
+
+        let palette = machine.palette_argb();
+        let argb = machine.margo().scanout_argb(&palette);
+        // sx = dx * src_w / dst_w = dx * 2 / 4 = dx / 2:
+        // dst 0,1 sample src pixel 0 (white); dst 2,3 sample src pixel 1 (black).
+        assert_eq!(argb[20 * 640 + 10], 0x00ff_ffff);
+        assert_eq!(argb[20 * 640 + 11], 0x00ff_ffff);
+        assert_eq!(argb[20 * 640 + 12], 0x0000_0000);
+        assert_eq!(argb[20 * 640 + 13], 0x0000_0000);
+    }
+
+    #[test]
+    fn overlay_yv12_upsamples_chroma_through_the_apertures() {
+        let mut machine = test_machine();
+        machine.margo_mut().set_mode(0x14a); // 640x480x32
+        // YV12 source, 2x2. Y plane (pitch 2): [16, 235; 16, 235]. A single shared
+        // chroma sample (U=128, V=255) covers the whole 2x2 block (4:2:0 upsample).
+        let yp = 0x0020_0000u32;
+        let up = 0x0020_1000u32;
+        let vp = 0x0020_2000u32;
+        machine.write_physical_u8(MARGO_LFB_BASE + yp, 16); // (0,0)
+        machine.write_physical_u8(MARGO_LFB_BASE + yp + 1, 235); // (1,0)
+        machine.write_physical_u8(MARGO_LFB_BASE + yp + 2, 16); // (0,1)
+        machine.write_physical_u8(MARGO_LFB_BASE + yp + 3, 235); // (1,1)
+        machine.write_physical_u8(MARGO_LFB_BASE + up, 128); // U plane
+        machine.write_physical_u8(MARGO_LFB_BASE + vp, 255); // V plane
+
+        write_mmio_reg(&mut machine, 0x44, yp); // OVL_SRC_Y
+        write_mmio_reg(&mut machine, 0x48, 2); // OVL_SRC_PITCH (Y plane)
+        write_mmio_reg(&mut machine, 0x4c, (2 << 16) | 2); // OVL_SRC_DIM: 2x2
+        write_mmio_reg(&mut machine, 0x50, up); // OVL_SRC_U
+        write_mmio_reg(&mut machine, 0x54, vp); // OVL_SRC_V
+        write_mmio_reg(&mut machine, 0x58, (20 << 16) | 10); // OVL_DST_XY
+        write_mmio_reg(&mut machine, 0x5c, (2 << 16) | 2); // OVL_DST_DIM: 2x2 (1:1)
+        write_mmio_reg(&mut machine, 0x40, 1 | (1 << 1)); // ENABLE + FORMAT YV12
+
+        let palette = machine.palette_argb();
+        let argb = machine.margo().scanout_argb(&palette);
+        // Y=16 with (U=128, V=255) -> 0x00cb0000; Y=235 -> 0x00ff98ff. The same
+        // chroma sample applies across the 2x2 block.
+        assert_eq!(argb[20 * 640 + 10], 0x00cb_0000);
+        assert_eq!(argb[20 * 640 + 11], 0x00ff_98ff);
+        assert_eq!(argb[21 * 640 + 10], 0x00cb_0000);
+        assert_eq!(argb[21 * 640 + 11], 0x00ff_98ff);
+    }
+
+    #[test]
+    fn overlay_yv12_chroma_traversal_addresses_each_cell() {
+        let mut machine = test_machine();
+        machine.margo_mut().set_mode(0x14a); // 640x480x32
+        // 4x4 YV12 source with a flat Y of 128, so each output pixel's color is set
+        // solely by which 2x2 chroma cell it samples. The 2x2 chroma grid (chroma
+        // pitch = Y pitch / 2 = 2) holds a distinct (U, V) per cell, so this proves
+        // cx = sx/2, cy = sy/2, and the chroma-plane stride, which the 2x2 test (only
+        // cell 0,0) does not exercise.
+        let yp = 0x0020_0000u32;
+        let up = 0x0020_1000u32;
+        let vp = 0x0020_2000u32;
+        for i in 0..16u32 {
+            machine.write_physical_u8(MARGO_LFB_BASE + yp + i, 128);
+        }
+        // Chroma cells indexed cy * 2 + cx.
+        let us = [128u8, 128, 255, 255];
+        let vs = [128u8, 255, 128, 255];
+        for i in 0..4u32 {
+            machine.write_physical_u8(MARGO_LFB_BASE + up + i, us[i as usize]);
+            machine.write_physical_u8(MARGO_LFB_BASE + vp + i, vs[i as usize]);
+        }
+
+        write_mmio_reg(&mut machine, 0x44, yp); // OVL_SRC_Y
+        write_mmio_reg(&mut machine, 0x48, 4); // OVL_SRC_PITCH (Y plane)
+        write_mmio_reg(&mut machine, 0x4c, (4 << 16) | 4); // OVL_SRC_DIM: 4x4
+        write_mmio_reg(&mut machine, 0x50, up); // OVL_SRC_U
+        write_mmio_reg(&mut machine, 0x54, vp); // OVL_SRC_V
+        write_mmio_reg(&mut machine, 0x58, (20 << 16) | 10); // OVL_DST_XY
+        write_mmio_reg(&mut machine, 0x5c, (4 << 16) | 4); // OVL_DST_DIM: 4x4 (1:1)
+        write_mmio_reg(&mut machine, 0x40, 1 | (1 << 1)); // ENABLE + FORMAT YV12
+
+        let palette = machine.palette_argb();
+        let argb = machine.margo().scanout_argb(&palette);
+        // Cell (0,0) U=128 V=128 -> gray; two pixels in the same cell share it.
+        assert_eq!(argb[20 * 640 + 10], 0x0082_8282);
+        assert_eq!(argb[21 * 640 + 11], 0x0082_8282);
+        // Cell (1,0) U=128 V=255.
+        assert_eq!(argb[20 * 640 + 12], 0x00ff_1b82);
+        // Cell (0,1) U=255 V=128.
+        assert_eq!(argb[22 * 640 + 10], 0x0082_51ff);
+        // Cell (1,1) U=255 V=255.
+        assert_eq!(argb[22 * 640 + 12], 0x00ff_00ff);
+    }
+
+    #[test]
+    fn pusher_runs_a_fill_packet_from_the_ring() {
+        let mut machine = test_machine();
+        // A command ring in system RAM that issues one FILL: a 2x2 rect of 0xAB at
+        // (x=1, y=1) on a depth-1 surface, pitch 8, base 0. Mirrors the guide's
+        // fill_via_pusher: header words are (count << 16) | method.
+        let ring_base = 0x0001_0000u32;
+        let ring: [u32; 16] = [
+            (3 << 16) | 0x0100,
+            0, // DST_BASE = 0
+            8, // DST_PITCH = 8
+            0, // SRC_BASE = 0 (unused by FILL)
+            (1 << 16) | 0x0110,
+            1, // DEPTH = 1
+            (1 << 16) | 0x0114,
+            (1 << 16) | 1, // DST_XY: y=1, x=1
+            (1 << 16) | 0x011c,
+            (2 << 16) | 2, // DIM: h=2, w=2
+            (1 << 16) | 0x0120,
+            0xab, // FG_COLOR = 0xAB
+            (1 << 16) | 0x0128,
+            0xf0, // ROP = PATCOPY
+            (1 << 16) | 0x0150,
+            0x01, // COMMAND = FILL
+        ];
+        for (i, word) in ring.iter().enumerate() {
+            for (b, byte) in word.to_le_bytes().into_iter().enumerate() {
+                machine.write_physical_u8(ring_base + (i * 4 + b) as u32, byte);
+            }
+        }
+        let put = (ring.len() * 4) as u32; // 64
+
+        write_mmio_reg(&mut machine, 0x84, ring_base); // PUSH_BASE
+        write_mmio_reg(&mut machine, 0x88, 0x1000); // PUSH_SIZE (4 KiB, power of two)
+        write_mmio_reg(&mut machine, 0x80, 1); // PUSH_CTRL = ENABLE
+        write_mmio_reg(&mut machine, 0x8c, put); // PUSH_PUT = doorbell
+
+        // One device tick drives the pump; the FILL applies immediately.
+        machine.advance_devices(1);
+
+        // The fill landed in VRAM (read back through the LFB).
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 8 + 1), 0xab); // (1,1)
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 2 * 8 + 2), 0xab); // (2,2)
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE), 0x00); // (0,0) untouched
+        // The ring drained: GET reached PUT.
+        assert_eq!(read_mmio_reg(&mut machine, 0x90), put);
+    }
+
+    #[test]
+    fn pusher_does_not_spin_on_a_malformed_ring() {
+        let mut machine = test_machine();
+        // A non-power-of-two size with a PUT that the (get + 4) % size orbit never
+        // reaches, over zeroed RAM (every header decodes to method 0, count 0, so no
+        // COMMAND ever sets busy_ns). Without the word budget this would spin forever.
+        write_mmio_reg(&mut machine, 0x84, 0x0001_0000); // PUSH_BASE
+        write_mmio_reg(&mut machine, 0x88, 10); // PUSH_SIZE: not a multiple of 4
+        write_mmio_reg(&mut machine, 0x80, 1); // PUSH_CTRL = ENABLE
+        write_mmio_reg(&mut machine, 0x8c, 1); // PUSH_PUT = 1 (never on the orbit)
+
+        // Must return rather than hang. GET stays within the ring.
+        machine.advance_devices(1);
+        assert!(read_mmio_reg(&mut machine, 0x90) < 10);
+    }
+
+    #[test]
+    fn pusher_get_trails_put_until_commands_complete() {
+        let mut machine = test_machine();
+        // Two single-pixel FILLs in the ring. Common setup (DST_BASE, DST_PITCH,
+        // DEPTH, ROP) first, then per-fill DST_XY, DIM, FG_COLOR, COMMAND: 0xAA at
+        // (1,1) and 0xBB at (3,3). Header words are (count << 16) | method.
+        let ring_base = 0x0001_0000u32;
+        let ring: [u32; 23] = [
+            // Common setup: 7 words.
+            (2 << 16) | 0x0100,
+            0, // DST_BASE = 0
+            8, // DST_PITCH = 8
+            (1 << 16) | 0x0110,
+            1, // DEPTH = 1
+            (1 << 16) | 0x0128,
+            0xf0, // ROP = PATCOPY
+            // Fill 1: 8 words (cumulative 15 words = 60 bytes after this).
+            (1 << 16) | 0x0114,
+            (1 << 16) | 1, // DST_XY: y=1, x=1
+            (1 << 16) | 0x011c,
+            (1 << 16) | 1, // DIM: h=1, w=1
+            (1 << 16) | 0x0120,
+            0xaa, // FG_COLOR = 0xAA
+            (1 << 16) | 0x0150,
+            0x01, // COMMAND = FILL
+            // Fill 2: 8 words (cumulative 23 words = 92 bytes = PUT).
+            (1 << 16) | 0x0114,
+            (3 << 16) | 3, // DST_XY: y=3, x=3
+            (1 << 16) | 0x011c,
+            (1 << 16) | 1, // DIM: h=1, w=1
+            (1 << 16) | 0x0120,
+            0xbb, // FG_COLOR = 0xBB
+            (1 << 16) | 0x0150,
+            0x01, // COMMAND = FILL
+        ];
+        for (i, word) in ring.iter().enumerate() {
+            for (b, byte) in word.to_le_bytes().into_iter().enumerate() {
+                machine.write_physical_u8(ring_base + (i * 4 + b) as u32, byte);
+            }
+        }
+        let put = (ring.len() * 4) as u32; // 92
+        let after_fill1 = 15 * 4u32; // 60: offset just past fill 1's COMMAND packet
+
+        write_mmio_reg(&mut machine, 0x84, ring_base); // PUSH_BASE
+        write_mmio_reg(&mut machine, 0x88, 0x1000); // PUSH_SIZE
+        write_mmio_reg(&mut machine, 0x80, 1); // PUSH_CTRL = ENABLE
+        write_mmio_reg(&mut machine, 0x8c, put); // PUSH_PUT = doorbell
+
+        // One tick: the pump consumes the setup plus fill 1, which sets busy_ns and
+        // stalls the pump. GET trails PUT, fill 1 landed, fill 2 has not run yet.
+        machine.advance_devices(1);
+        assert_eq!(read_mmio_reg(&mut machine, 0x90), after_fill1); // GET lags PUT
+        assert_ne!(read_mmio_reg(&mut machine, 0x90), put);
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 8 + 1), 0xaa); // (1,1)
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 3 * 8 + 3), 0x00); // (3,3) not yet
+
+        // Enough ticks to drain fill 1's busy_ns (a 1-pixel fill is 105 ns; 10
+        // clocks at 25 MHz = 400 ns), letting the pump consume fill 2.
+        machine.advance_devices(10);
+        assert_eq!(read_mmio_reg(&mut machine, 0x90), put); // GET caught up
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 3 * 8 + 3), 0xbb); // (3,3) now
+    }
+
+    #[test]
+    fn pusher_streams_color_expand_data_through_the_ring() {
+        let mut machine = test_machine();
+        // The pusher arms COLOR_EXPAND_DATA and then streams its MONO_DATA words from
+        // the ring. This works only because the pump gates on busy_ns (arming leaves
+        // busy_ns at 0, so the pump keeps feeding the stream) rather than STATUS.BUSY.
+        // An 8x2 glyph at (0,0), depth 1, pitch 8, FG 0xAB, BG 0x00, ROP SRCCOPY: row
+        // 0 bits 0xA0 (x=0,2 set), row 1 bits 0x50 (x=1,3 set); MONO_DATA is MSB-first
+        // in the high byte. Each MONO_DATA word is its own packet (the port is a single
+        // register at 0x0160, so a count>1 run would scatter to 0x0164 and beyond).
+        let ring_base = 0x0001_0000u32;
+        let ring: [u32; 22] = [
+            (2 << 16) | 0x0100,
+            0, // DST_BASE = 0
+            8, // DST_PITCH = 8
+            (1 << 16) | 0x0110,
+            1, // DEPTH = 1
+            (1 << 16) | 0x0114,
+            0, // DST_XY = (0, 0)
+            (1 << 16) | 0x011c,
+            (2 << 16) | 8, // DIM: h=2, w=8
+            (2 << 16) | 0x0120,
+            0xab, // FG_COLOR
+            0x00, // BG_COLOR
+            (1 << 16) | 0x0128,
+            0xcc, // ROP = SRCCOPY (S = expanded pixel)
+            (1 << 16) | 0x0130,
+            0, // FLAGS = 0 (clear bits painted with BG)
+            (1 << 16) | 0x0150,
+            0x03, // COMMAND = COLOR_EXPAND_DATA (arms the stream; no busy_ns yet)
+            (1 << 16) | 0x0160,
+            0xa000_0000, // MONO_DATA row 0: bits 0xA0 in the high byte
+            (1 << 16) | 0x0160,
+            0x5000_0000, // MONO_DATA row 1: bits 0x50 in the high byte
+        ];
+        for (i, word) in ring.iter().enumerate() {
+            for (b, byte) in word.to_le_bytes().into_iter().enumerate() {
+                machine.write_physical_u8(ring_base + (i * 4 + b) as u32, byte);
+            }
+        }
+        let put = (ring.len() * 4) as u32; // 88
+
+        write_mmio_reg(&mut machine, 0x84, ring_base); // PUSH_BASE
+        write_mmio_reg(&mut machine, 0x88, 0x1000); // PUSH_SIZE
+        write_mmio_reg(&mut machine, 0x80, 1); // PUSH_CTRL = ENABLE
+        write_mmio_reg(&mut machine, 0x8c, put); // PUSH_PUT = doorbell
+
+        machine.advance_devices(1);
+
+        // Row 0: set bits at x=0,2 -> 0xAB; clear bits -> 0x00 (BG).
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE), 0xab); // (0,0)
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 1), 0x00); // (1,0)
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 2), 0xab); // (2,0)
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 3), 0x00); // (3,0)
+        // Row 1: set bits at x=1,3 -> 0xAB.
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 8), 0x00); // (0,1)
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 9), 0xab); // (1,1)
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 10), 0x00); // (2,1)
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 11), 0xab); // (3,1)
+        // The whole ring drained.
+        assert_eq!(read_mmio_reg(&mut machine, 0x90), put);
+    }
+
+    #[test]
     fn dos_program_startup_services() {
         // org 0x100:
         //   mov ah,0x30 / int 0x21            ; get version (AL=6, AH=10), no fault
@@ -2862,5 +3615,85 @@ mod tests {
             raster.pixels[6], 0xC2,
             "mode-X pixel scans out at its column with its full 8-bit value"
         );
+    }
+
+    #[test]
+    fn dos_program_writes_and_reads_back_a_file() {
+        // org 0x100: create C:\OUT.TXT (AH=3Ch), write "HI!" (AH=40h to the file
+        // handle), seek to 0 (AH=42h), read 3 bytes back (AH=3Fh), close (AH=3Eh),
+        // write the buffer to stdout (AH=40h, BX=1), exit (AH=4Ch). Data follows the
+        // code: fname at 0x13E, msg "HI!" at 0x149, buf at 0x14C.
+        let com: &[u8] = &[
+            0xb4, 0x3c, 0x31, 0xc9, 0xba, 0x3e, 0x01, 0xcd, 0x21, 0x89, 0xc3, 0xb4, 0x40, 0xb9,
+            0x03, 0x00, 0xba, 0x49, 0x01, 0xcd, 0x21, 0xb8, 0x00, 0x42, 0x31, 0xc9, 0x31, 0xd2,
+            0xcd, 0x21, 0xb4, 0x3f, 0xb9, 0x03, 0x00, 0xba, 0x4c, 0x01, 0xcd, 0x21, 0xb4, 0x3e,
+            0xcd, 0x21, 0xb4, 0x40, 0xbb, 0x01, 0x00, 0xb9, 0x03, 0x00, 0xba, 0x4c, 0x01, 0xcd,
+            0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21, // fname "C:\\OUT.TXT\0"
+            0x43, 0x3a, 0x5c, 0x4f, 0x55, 0x54, 0x2e, 0x54, 0x58, 0x54, 0x00,
+            // msg "HI!"
+            0x48, 0x49, 0x21, // buf (3 bytes)
+            0x00, 0x00, 0x00,
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com)
+                .unwrap();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
+        assert_eq!(machine.dos_output(), b"HI!");
+        assert_eq!(std::fs::read(dir.path().join("OUT.TXT")).unwrap(), b"HI!");
+    }
+
+    #[test]
+    fn dos_program_enumerates_files() {
+        // org 0x100: FindFirst "C:\\*.TXT" (AH=4Eh, CX=0). Then loop: if CF set, exit;
+        // else write the 13-byte DTA name field (PSP:0x9E) to stdout (AH=40h, BX=1,
+        // CX=13), FindNext (AH=4Fh), repeat. The default DTA is PSP:0x80, so the name
+        // field is at PSP:0x9E. Pattern "C:\\*.TXT\0" sits at 0x123.
+        //
+        //   off 0:  b4 4e        mov ah, 4Eh
+        //   off 2:  31 c9        xor cx, cx
+        //   off 4:  ba 23 01     mov dx, 0x123
+        //   off 7:  cd 21        int 21h
+        // loop (off 9):
+        //   off 9:  72 13        jc done (+0x13 -> off 30)
+        //   off 11: b4 40        mov ah, 40h
+        //   off 13: bb 01 00     mov bx, 1
+        //   off 16: b9 0d 00     mov cx, 13
+        //   off 19: ba 9e 00     mov dx, 0x9E
+        //   off 22: cd 21        int 21h
+        //   off 24: b4 4f        mov ah, 4Fh
+        //   off 26: cd 21        int 21h
+        //   off 28: eb eb        jmp loop (-0x15 -> off 9)
+        // done (off 30):
+        //   off 30: b8 00 4c     mov ax, 4C00h
+        //   off 33: cd 21        int 21h
+        //   off 35: "C:\\*.TXT", 0
+        let com: &[u8] = &[
+            0xb4, 0x4e, 0x31, 0xc9, 0xba, 0x23, 0x01, 0xcd, 0x21, 0x72, 0x13, 0xb4, 0x40, 0xbb,
+            0x01, 0x00, 0xb9, 0x0d, 0x00, 0xba, 0x9e, 0x00, 0xcd, 0x21, 0xb4, 0x4f, 0xcd, 0x21,
+            0xeb, 0xeb, 0xb8, 0x00, 0x4c, 0xcd, 0x21, 0x43, 0x3a, 0x5c, 0x2a, 0x2e, 0x54, 0x58,
+            0x54, 0x00,
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ONE.TXT"), b"a").unwrap();
+        std::fs::write(dir.path().join("TWO.TXT"), b"bb").unwrap();
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com)
+                .unwrap();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
+
+        // Each found name was written as the 13-byte ASCIIZ field; split on NUL.
+        let mut names: Vec<String> = machine
+            .dos_output()
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["ONE.TXT", "TWO.TXT"]);
     }
 }

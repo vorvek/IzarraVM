@@ -321,7 +321,7 @@ the overlay at it, and key it through the desktop. To show the overlay, paint th
 color key into the window; to hide a region, draw over the key as usual.
 
 ```c
-/* (target) */
+/* (verified) */
 /* Show a YUY2 frame (already in offscreen memory) scaled into a window. */
 void show_overlay(unsigned long y_offset, int src_pitch, int sw, int sh,
                   int dx, int dy, int dw, int dh, unsigned long key) {
@@ -345,7 +345,7 @@ memory and hand the whole thing to Margo at once. Each command is a header word,
 registers.
 
 ```c
-/* (target) */
+/* (verified) */
 static unsigned long ring[256];          /* system memory, 16-byte aligned */
 
 #define PKT(count, method) (((unsigned long)(count) << 16) | (method))
