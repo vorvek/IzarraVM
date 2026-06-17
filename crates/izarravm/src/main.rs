@@ -8,7 +8,9 @@ use izarravm_dos::{DosKernelServices, HostDrive};
 use izarravm_firmware::{SuiteRecordStatus, boot_test_image, parse_result_block, test_rom};
 use izarravm_input::InputState;
 use izarravm_machine::{ActiveDisplay, Machine, MachineProfile, StopReason};
-use izarravm_video::{Framebuffer, MargoDisplay, PlaceholderVideoAdapter, TextFrame, VideoAdapter};
+use izarravm_video::{
+    Framebuffer, MargoDisplay, PlaceholderVideoAdapter, TextFrame, VideoAdapter, VgaRaster,
+};
 use std::error::Error;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -28,6 +30,7 @@ const WINDOW_WIDTH: u32 = 1280;
 const WINDOW_HEIGHT: u32 = 400;
 const MODE13H_SCALE: usize = 2;
 const MARGO_LFB_SCALE: usize = 1;
+const VGA_RASTER_SCALE: usize = 2;
 const VGA_PALETTE: [u32; 16] = [
     0x000000, 0x0000aa, 0x00aa00, 0x00aaaa, 0xaa0000, 0xaa00aa, 0xaa5500, 0xaaaaaa, 0x555555,
     0x5555ff, 0x55ff55, 0x55ffff, 0xff5555, 0xff55ff, 0xffff55, 0xffffff,
@@ -366,7 +369,7 @@ impl WindowApp {
         self.stop_reason = Some(reason);
     }
 
-    fn render_current_frame(&self) -> RenderedFrame {
+    fn render_current_frame(&mut self) -> RenderedFrame {
         match self.machine.active_display() {
             ActiveDisplay::MargoLfb => {
                 let margo = self.machine.margo();
@@ -380,6 +383,10 @@ impl WindowApp {
                 self.machine.mode13h_framebuffer(),
                 &self.machine.palette_argb(),
             ),
+            ActiveDisplay::VgaRaster => {
+                let palette = self.machine.palette_argb();
+                render_vga_raster(self.machine.vga_raster(), &palette)
+            }
             ActiveDisplay::Text => render_text_frame(&self.machine.screen_text()),
         }
     }
@@ -498,6 +505,39 @@ fn render_mode13h(framebuffer: &Framebuffer, palette: &[u32; 256]) -> RenderedFr
             for scale_x in 0..MODE13H_SCALE {
                 let x = source_x * MODE13H_SCALE + scale_x;
                 let y = source_y * MODE13H_SCALE + scale_y;
+                pixels[y * width + x] = color;
+            }
+        }
+    }
+
+    RenderedFrame {
+        width,
+        height,
+        pixels,
+    }
+}
+
+fn render_vga_raster(raster: Option<VgaRaster>, palette: &[u32; 256]) -> RenderedFrame {
+    let Some(raster) = raster else {
+        return RenderedFrame {
+            width: 0,
+            height: 0,
+            pixels: Vec::new(),
+        };
+    };
+    let source_width = raster.width as usize;
+    let width = source_width * VGA_RASTER_SCALE;
+    let height = raster.height as usize * VGA_RASTER_SCALE;
+    let mut pixels = vec![palette[0]; width * height];
+
+    for (pixel_index, &index) in raster.pixels.iter().enumerate() {
+        let source_x = pixel_index % source_width;
+        let source_y = pixel_index / source_width;
+        let color = palette[usize::from(index)];
+        for scale_y in 0..VGA_RASTER_SCALE {
+            for scale_x in 0..VGA_RASTER_SCALE {
+                let x = source_x * VGA_RASTER_SCALE + scale_x;
+                let y = source_y * VGA_RASTER_SCALE + scale_y;
                 pixels[y * width + x] = color;
             }
         }

@@ -6,7 +6,7 @@ pub use izarravm_video::MARGO_ID_VALUE;
 use izarravm_video::{
     DAC_ENTRIES, Framebuffer, MARGO_MMIO_SIZE, MARGO_VBE_MODES, MARGO_VRAM_SIZE,
     MODE13H_MEMORY_SIZE, Margo, TextFrame, VGA_MODE13H_BASE, VGA_TEXT_BASE, VGA_TEXT_MEMORY_SIZE,
-    Vga, VideoMode, vbe_mode,
+    Vga, VgaRaster, VideoMode, vbe_mode,
 };
 use thiserror::Error;
 
@@ -117,6 +117,7 @@ const VGA_DOT_HZ: u64 = 25_175_000;
 pub enum ActiveDisplay {
     Text,
     Mode13h,
+    VgaRaster,
     MargoLfb,
 }
 
@@ -557,11 +558,17 @@ impl Machine {
     pub fn active_display(&self) -> ActiveDisplay {
         if self.margo_active {
             ActiveDisplay::MargoLfb
+        } else if self.video.active_mode() == VideoMode::Planar {
+            ActiveDisplay::VgaRaster
         } else if self.video.active_mode() == VideoMode::Mode13h {
             ActiveDisplay::Mode13h
         } else {
             ActiveDisplay::Text
         }
+    }
+
+    pub fn vga_raster(&mut self) -> Option<VgaRaster> {
+        self.video.take_presented()
     }
 
     pub fn palette_argb(&self) -> [u32; DAC_ENTRIES] {
@@ -2083,5 +2090,16 @@ mod tests {
         assert!(
             machine.video().beam_dots() != before || machine.video().frames_completed() > 0
         );
+    }
+
+    #[test]
+    fn planar_mode_presents_a_vga_raster() {
+        let mut machine = test_machine();
+        machine.set_vga_mode_0dh();
+        // Mode 0Dh frame is ~359 200 dots; 600 000 CPU clocks at 25 MHz yields
+        // ~603 600 dot clocks — enough to complete at least one full frame.
+        machine.advance_devices(600_000);
+        assert!(matches!(machine.active_display(), ActiveDisplay::VgaRaster));
+        assert!(machine.vga_raster().is_some());
     }
 }
