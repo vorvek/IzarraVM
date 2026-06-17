@@ -1541,10 +1541,10 @@ mod tests {
     }
 
     #[test]
-    fn vbe_set_mode_rejects_hi_color_modes() {
+    fn vbe_set_mode_accepts_hi_color_modes() {
         let rom = rom_with_code(&[
             0xb8, 0x02, 0x4f, // mov ax, 4F02h
-            0xbb, 0x11, 0x01, // mov bx, 0111h (640x480x16, not in this slice)
+            0xbb, 0x11, 0x41, // mov bx, 0111h | 4000h (640x480x16, linear frame buffer)
             0xcd, 0x10, // int 10h
             0xf4, // hlt
         ]);
@@ -1553,8 +1553,9 @@ mod tests {
 
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
         assert_eq!(reason, StopReason::Halted);
-        assert_eq!(machine.cpu().registers.eax() as u16, 0x014f);
-        assert_eq!(machine.active_display(), ActiveDisplay::Text);
+        assert_eq!(machine.cpu().registers.eax() as u16, 0x004f);
+        assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
+        assert_eq!(machine.margo().display().bpp, 16);
     }
 
     #[test]
@@ -1893,14 +1894,18 @@ mod tests {
         assert_eq!(read_u32(&mut machine, base + 0x06), 0); // OemStringPtr
         assert_eq!(read_u32(&mut machine, base + 0x0a), 0); // Capabilities
 
-        // VideoModePtr (seg:off) must point at the mode list.
+        // VideoModePtr (seg:off) must point at the mode list, which lists every
+        // entry in MARGO_VBE_MODES (8bpp then hi-color then true-color) and ends
+        // with the 0xffff terminator.
         let ptr = read_u32(&mut machine, base + 0x0e);
         let list = (((ptr >> 16) & 0xffff) << 4) + (ptr & 0xffff);
-        assert_eq!(read_u16(&mut machine, list), 0x0100);
-        assert_eq!(read_u16(&mut machine, list + 2), 0x0101);
-        assert_eq!(read_u16(&mut machine, list + 4), 0x0103);
-        assert_eq!(read_u16(&mut machine, list + 6), 0x0105);
-        assert_eq!(read_u16(&mut machine, list + 8), 0xffff);
+        let expected = [
+            0x0100, 0x0101, 0x0103, 0x0105, 0x0110, 0x0111, 0x0113, 0x0114, 0x0116, 0x0117, 0x014a,
+            0x014c, 0x014e, 0xffff,
+        ];
+        for (i, &mode) in expected.iter().enumerate() {
+            assert_eq!(read_u16(&mut machine, list + (i * 2) as u32), mode);
+        }
     }
 
     #[test]
