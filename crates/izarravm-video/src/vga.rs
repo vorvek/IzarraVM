@@ -263,8 +263,12 @@ impl Vga {
     }
 
     fn finalize_frame(&mut self) {
-        // Minimal: snapshot the work buffer, reset for next frame.
-        // Task 11 makes this render remaining lines with live state first.
+        // Render the lines the beam has not yet crossed, with the current register
+        // state, so a mid-frame change shows below the seam.
+        while self.last_line < self.crtc.vtotal {
+            self.render_scanline(self.last_line);
+            self.last_line += 1;
+        }
         self.presented = Some(VgaRaster {
             width: self.raster_width(),
             height: self.raster_height(),
@@ -798,6 +802,26 @@ mod tests {
         vga.write_port(0x3C0, 0x13); // pixel pan index
         vga.write_port(0x3C0, 0x02); // value
         assert_eq!(vga.attr.pixel_pan, 0x02);
+    }
+
+    #[test]
+    fn mid_frame_palette_change_splits_the_raster_at_the_beam_row() {
+        let mut vga = Vga::default();
+        vga.set_mode_0dh();
+        // Active content = attribute index 1 everywhere (plane 0 set).
+        for b in vga.vram[0..VGA_PLANE_SIZE].iter_mut() { *b = 0xFF; }
+        vga.attr.palette = core::array::from_fn(|i| i as u8); // index 1 -> DAC 1
+        // Run to counter line 50, then repaint palette[1] = 9 via the attribute port.
+        vga.advance(htotal_dots(&vga.crtc) * 50);
+        vga.write_port(0x3C0, 0x01); // attr index 1
+        vga.write_port(0x3C0, 9);    // palette[1] = 9
+        // Finish the frame.
+        vga.advance(vga.frame_dots());
+        let raster = vga.take_presented().unwrap();
+        let w = raster.width as usize;
+        assert_eq!(raster.pixels[0], 1, "above the split uses the old palette");
+        let below = 120 * w; // raster row 120 (counter line 60, > split at 50)
+        assert_eq!(raster.pixels[below], 9, "below the split uses the new palette");
     }
 
     #[test]
