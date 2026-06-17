@@ -849,9 +849,45 @@ pub fn write_planes(
     }
 }
 
+/// Map a display-address counter value `ma` to a per-plane byte offset, applying
+/// the CRTC byte/word/doubleword addressing transform and the 16-bit (64 KB)
+/// counter wrap. `mode_control` is CRTC index 17h, `underline_loc` is index 14h.
+/// See `dev_docs/reference/vga/crtc-addressing.md`.
+pub fn display_offset(mode_control: u8, underline_loc: u8, ma: u32) -> usize {
+    let addr = if mode_control & 0x40 != 0 {
+        ma // byte mode (CR17 bit 6): identity
+    } else if underline_loc & 0x40 != 0 {
+        // doubleword mode (CR14 bit 6): rotate left 2, MA13 -> bit 1, MA12 -> bit 0
+        (ma << 2) | ((ma >> 12) & 0x3)
+    } else {
+        // word mode: rotate left 1, MA15 (CR17 bit 5 = 1) or MA13 (= 0) -> bit 0
+        let wrap_bit = if mode_control & 0x20 != 0 { 15 } else { 13 };
+        (ma << 1) | ((ma >> wrap_bit) & 1)
+    };
+    (addr as usize) % VGA_PLANE_SIZE
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_offset_applies_byte_word_dword_transforms() {
+        // Byte mode (CR17 bit 6 = 1): identity, wrapped at 64 KB.
+        assert_eq!(display_offset(0xE3, 0x00, 0x1234), 0x1234);
+        assert_eq!(display_offset(0xE3, 0x00, 0x1_0005), 0x0005); // 64 KB counter wrap
+        // Word mode, 16-bit wrap (CR17 = 0xA3: bit 6 = 0, bit 5 = 1): rotate left 1,
+        // MA15 into bit 0.
+        assert_eq!(display_offset(0xA3, 0x00, 0x4001), 0x8002); // MA15 = 0
+        assert_eq!(display_offset(0xA3, 0x00, 0x8000), 0x0001); // MA15 = 1 -> bit 0
+        // Word mode, 14-bit wrap (CR17 = 0x83: bit 6 = 0, bit 5 = 0): MA13 into bit 0.
+        assert_eq!(display_offset(0x83, 0x00, 0x2000), 0x4001); // MA13 = 1 -> bit 0
+        // Doubleword mode (CR14 bit 6 = 1, word base): rotate left 2, MA13 -> bit 1,
+        // MA12 -> bit 0.
+        assert_eq!(display_offset(0xA3, 0x40, 0x3000), 0xC003);
+        // Byte mode wins over the doubleword bit.
+        assert_eq!(display_offset(0xE3, 0x40, 0x1234), 0x1234);
+    }
 
     #[test]
     fn crtc_addressing_registers_are_wired_and_default_per_mode() {
