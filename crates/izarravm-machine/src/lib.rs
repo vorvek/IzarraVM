@@ -286,6 +286,12 @@ impl Machine {
 
         let entry = izarravm_dos::load_program(image, &mut machine.memory, DOS_LOAD_SEGMENT)?;
         machine.apply_program_entry(entry);
+        // Seed the Toka-DOS per-program state (memory arena, DTA). prog_top is the
+        // top-of-memory paragraph the loader wrote to PSP:0x02.
+        let prog_top = machine
+            .memory
+            .read_u16(usize::from(DOS_LOAD_SEGMENT) * 16 + 2)?;
+        machine.dos.init_program(DOS_LOAD_SEGMENT, prog_top);
         Ok(machine)
     }
 
@@ -484,6 +490,13 @@ impl Machine {
             flags & !0x0040
         };
         self.memory.write_u16(flags_addr as usize, flags)?;
+        // AH=35h (get vector) and AH=2Fh (get DTA) return a segment in ES. The
+        // marshalling reads ES as an input at the top; write it back here so those
+        // results reach the guest. For calls that do not touch ES, regs.es still
+        // equals the input selector, so this re-sets the same real-mode base.
+        self.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(regs.es));
         Ok(match action {
             izarravm_dos::DosAction::Continue => None,
             izarravm_dos::DosAction::Exit(code) => Some(code),
@@ -2612,5 +2625,31 @@ mod tests {
         assert_eq!(raster.width, 640);
         assert_eq!(raster.height, 525);
         assert_eq!(raster.pixels[0], 1, "top-left pixel is attribute index 1");
+    }
+
+    #[test]
+    fn dos_program_startup_services() {
+        // org 0x100:
+        //   mov ah,0x30 / int 0x21            ; get version (AL=6, AH=10), no fault
+        //   mov bx,0x10 / mov ah,0x48 / int 21 ; allocate 16 paras -> AX=0x1100
+        //   mov [0x0204],ax                    ; store the allocated segment
+        //   mov ax,0x3521 / int 0x21           ; get INT 21h vector -> ES=0, BX=0x0600
+        //   mov [0x0200],es / mov [0x0202],bx  ; store ES then BX
+        //   mov ax,0x4c00 / int 0x21           ; exit 0
+        let com: &[u8] = &[
+            0xb4, 0x30, 0xcd, 0x21, 0xbb, 0x10, 0x00, 0xb4, 0x48, 0xcd, 0x21, 0xa3, 0x04, 0x02,
+            0xb8, 0x21, 0x35, 0xcd, 0x21, 0x8c, 0x06, 0x00, 0x02, 0x89, 0x1e, 0x02, 0x02, 0xb8,
+            0x00, 0x4c, 0xcd, 0x21,
+        ];
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com)
+                .unwrap();
+        let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
+        let mem = machine.memory();
+        // PSP at 0x0100 -> linear 0x1000; the program stored words at offsets 0x200..0x205.
+        assert_eq!(mem.read_u16(0x1200).unwrap(), 0x0000); // ES from IVT[0x21] (stub segment)
+        assert_eq!(mem.read_u16(0x1202).unwrap(), 0x0600); // BX from IVT[0x21] (stub offset)
+        assert_eq!(mem.read_u16(0x1204).unwrap(), 0x1100); // AH=48h allocated segment
     }
 }

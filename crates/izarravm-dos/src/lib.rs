@@ -125,6 +125,134 @@ pub enum DosAction {
     Exit(u8), // terminate the program with this code
 }
 
+/// Conventional memory modeled as one block ending at paragraph 0xA000. The
+/// program owns [psp_seg, prog_top); AH=48h blocks stack upward from free_base.
+/// ponytail: bump allocator with a single resizable program block and LIFO
+/// reclaim; no MCB chain, no free-list coalescing, no UMB/HIMEM.
+#[derive(Debug, Default)]
+struct Arena {
+    psp_seg: u16,
+    prog_top: u16,
+    free_base: u16,
+    blocks: Vec<(u16, u16)>, // (segment, paragraphs) in allocation order
+}
+
+const ARENA_TOP: u16 = 0xa000; // matches CONVENTIONAL_TOP_PARAGRAPH in the loader
+
+enum ResizeError {
+    TooBig(u16), // largest paragraphs that would fit
+    InvalidBlock,
+}
+
+impl Arena {
+    /// AH=48h: allocate `paras` paragraphs. Ok(segment) or Err(largest-available).
+    fn allocate(&mut self, paras: u16) -> Result<u16, u16> {
+        let end = u32::from(self.free_base) + u32::from(paras);
+        if end <= u32::from(ARENA_TOP) {
+            let seg = self.free_base;
+            self.blocks.push((seg, paras));
+            self.free_base = end as u16;
+            Ok(seg)
+        } else {
+            Err(ARENA_TOP - self.free_base)
+        }
+    }
+
+    /// AH=4Ah: resize the block at `seg` to `paras` paragraphs.
+    fn resize(&mut self, seg: u16, paras: u16) -> Result<(), ResizeError> {
+        if seg == self.psp_seg {
+            // The program block. Its ceiling is the lowest AH=48h block, or ARENA_TOP.
+            let limit = self
+                .blocks
+                .iter()
+                .map(|&(s, _)| s)
+                .min()
+                .unwrap_or(ARENA_TOP);
+            let new_top = u32::from(self.psp_seg) + u32::from(paras);
+            if new_top <= u32::from(limit) {
+                self.prog_top = new_top as u16;
+                if self.blocks.is_empty() {
+                    self.free_base = self.prog_top;
+                }
+                Ok(())
+            } else {
+                Err(ResizeError::TooBig(limit - self.psp_seg))
+            }
+        } else if let Some(idx) = self.blocks.iter().position(|&(s, _)| s == seg) {
+            if idx + 1 == self.blocks.len() {
+                // Top block: grow/shrink against the ceiling, moving free_base.
+                let new_end = u32::from(seg) + u32::from(paras);
+                if new_end <= u32::from(ARENA_TOP) {
+                    self.blocks[idx].1 = paras;
+                    self.free_base = new_end as u16;
+                    Ok(())
+                } else {
+                    Err(ResizeError::TooBig(ARENA_TOP - seg))
+                }
+            } else {
+                // Non-top block: shrink updates the size (no reclaim); grow fails.
+                let cur = self.blocks[idx].1;
+                if paras <= cur {
+                    self.blocks[idx].1 = paras;
+                    Ok(())
+                } else {
+                    Err(ResizeError::TooBig(cur))
+                }
+            }
+        } else {
+            Err(ResizeError::InvalidBlock)
+        }
+    }
+
+    /// AH=49h: free the block at `seg`. Ok(()) or Err(()) for an unknown block.
+    fn free(&mut self, seg: u16) -> Result<(), ()> {
+        if seg == self.psp_seg {
+            return Ok(()); // freeing the program block (e.g. at termination)
+        }
+        if let Some(idx) = self.blocks.iter().position(|&(s, _)| s == seg) {
+            let is_top = idx + 1 == self.blocks.len();
+            let (_, paras) = self.blocks.remove(idx);
+            if is_top {
+                self.free_base -= paras; // LIFO reclaim
+            }
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+}
+
+/// Toka-DOS wall clock. Deterministic by default (a fixed 1997 instant) so unit
+/// tests are stable; the machine/CLI may overwrite it via set_clock. Fields are
+/// stored explicitly, including day_of_week, to avoid any calendar computation.
+#[derive(Debug, Clone, Copy)]
+struct DosDateTime {
+    year: u16,
+    month: u8,
+    day: u8,
+    day_of_week: u8, // 0 = Sunday
+    hour: u8,
+    minute: u8,
+    second: u8,
+    hundredths: u8,
+}
+
+impl Default for DosDateTime {
+    fn default() -> Self {
+        // 1997-06-17 (a Tuesday, day_of_week = 2), 12:00:00.00.
+        Self {
+            year: 1997,
+            month: 6,
+            day: 17,
+            day_of_week: 2,
+            hour: 12,
+            minute: 0,
+            second: 0,
+            hundredths: 0,
+        }
+    }
+}
+
 /// The stateful DOS kernel. Owns the host-side state that must survive between
 /// INT 21h calls: the open-file handle table and the mounted C: drive, plus the
 /// standard input and output buffers (high-level emulated, HLE). The machine
@@ -136,6 +264,9 @@ pub struct DosKernel {
     open_files: HashMap<u16, File>,
     stdin: VecDeque<u8>,
     stdout: Vec<u8>,
+    clock: DosDateTime,
+    arena: Arena,
+    dta: (u16, u16),
 }
 
 impl DosKernel {
@@ -157,6 +288,43 @@ impl DosKernel {
     /// The bytes written to standard output so far.
     pub fn stdout(&self) -> &[u8] {
         &self.stdout
+    }
+
+    /// Replace the wall clock (host-time wiring is a later option; default is fixed).
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_clock(
+        &mut self,
+        year: u16,
+        month: u8,
+        day: u8,
+        day_of_week: u8,
+        hour: u8,
+        minute: u8,
+        second: u8,
+    ) {
+        self.clock = DosDateTime {
+            year,
+            month,
+            day,
+            day_of_week,
+            hour,
+            minute,
+            second,
+            hundredths: 0,
+        };
+    }
+
+    /// Seed per-program state after a program loads: the memory arena spanning
+    /// [psp_seg, ARENA_TOP) with the program owning [psp_seg, prog_top). The
+    /// machine calls this from new_dos_program; prog_top is the PSP:0x02 value.
+    pub fn init_program(&mut self, psp_seg: u16, prog_top: u16) {
+        self.arena = Arena {
+            psp_seg,
+            prog_top,
+            free_base: prog_top,
+            blocks: Vec::new(),
+        };
+        self.dta = (psp_seg, 0x80);
     }
 
     /// Service a software interrupt the DOS kernel handles. `vector` is the INT
@@ -325,8 +493,159 @@ impl DosKernel {
                 }
                 Ok(DosAction::Continue)
             }
+            // AH=30h: get Toka-DOS version. AL=major, AH=minor, BH=OEM, BL:CX=serial (0).
+            0x30 => {
+                regs.ax =
+                    u16::from(TOKA_DOS_VERSION_MAJOR) | (u16::from(TOKA_DOS_VERSION_MINOR) << 8);
+                regs.bx = u16::from(TOKA_DOS_OEM) << 8;
+                regs.cx = 0;
+                Ok(DosAction::Continue)
+            }
+            // AH=19h: get current default drive. Only C: is mounted, so AL=2 (0=A).
+            0x19 => {
+                regs.ax = (regs.ax & 0xff00) | 0x02;
+                Ok(DosAction::Continue)
+            }
+            // AH=25h: set interrupt vector AL to DS:DX. Writes the real guest IVT
+            // (offset then segment, little-endian) at AL*4. ponytail: re-vectoring an
+            // HLE'd INT (0x10/0x20/0x21) writes the IVT but host dispatch still
+            // intercepts those by vector number.
+            0x25 => {
+                let addr = usize::from(regs.ax as u8) * 4;
+                mem.write_u16(addr, regs.dx)?;
+                mem.write_u16(addr + 2, regs.ds)?;
+                Ok(DosAction::Continue)
+            }
+            // AH=35h: get interrupt vector AL into ES:BX.
+            0x35 => {
+                let addr = usize::from(regs.ax as u8) * 4;
+                regs.bx = mem.read_u16(addr)?;
+                regs.es = mem.read_u16(addr + 2)?;
+                Ok(DosAction::Continue)
+            }
+            // AH=2Ah: get date. CX=year, DH=month, DL=day, AL=day-of-week (0=Sun).
+            0x2a => {
+                regs.cx = self.clock.year;
+                regs.dx = (u16::from(self.clock.month) << 8) | u16::from(self.clock.day);
+                regs.ax = (regs.ax & 0xff00) | u16::from(self.clock.day_of_week);
+                Ok(DosAction::Continue)
+            }
+            // AH=2Bh: set date. CX=year(1980-2099), DH=month, DL=day. AL=0 ok, 0xFF
+            // invalid. ponytail: no calendar routine, so the day range is the coarse
+            // 1..=31 (real DOS rejects e.g. Feb 31) and day_of_week is not recomputed;
+            // no in-scope reader needs per-month validation or the post-set weekday.
+            0x2b => {
+                let year = regs.cx;
+                let month = (regs.dx >> 8) as u8;
+                let day = regs.dx as u8;
+                if (1980..=2099).contains(&year)
+                    && (1..=12).contains(&month)
+                    && (1..=31).contains(&day)
+                {
+                    self.clock.year = year;
+                    self.clock.month = month;
+                    self.clock.day = day;
+                    regs.ax &= 0xff00;
+                } else {
+                    regs.ax = (regs.ax & 0xff00) | 0xff;
+                }
+                Ok(DosAction::Continue)
+            }
+            // AH=2Ch: get time. CH=hour, CL=minute, DH=second, DL=hundredths.
+            0x2c => {
+                regs.cx = (u16::from(self.clock.hour) << 8) | u16::from(self.clock.minute);
+                regs.dx = (u16::from(self.clock.second) << 8) | u16::from(self.clock.hundredths);
+                Ok(DosAction::Continue)
+            }
+            // AH=2Dh: set time. CH=hour, CL=minute, DH=second, DL=hundredths. AL=0 ok,
+            // 0xFF invalid.
+            0x2d => {
+                let hour = (regs.cx >> 8) as u8;
+                let minute = regs.cx as u8;
+                let second = (regs.dx >> 8) as u8;
+                let hundredths = regs.dx as u8;
+                if hour < 24 && minute < 60 && second < 60 && hundredths < 100 {
+                    self.clock.hour = hour;
+                    self.clock.minute = minute;
+                    self.clock.second = second;
+                    self.clock.hundredths = hundredths;
+                    regs.ax &= 0xff00;
+                } else {
+                    regs.ax = (regs.ax & 0xff00) | 0xff;
+                }
+                Ok(DosAction::Continue)
+            }
+            // AH=48h: allocate BX paragraphs. CF=0 AX=segment, or CF=1 AX=0x08
+            // BX=largest-available.
+            0x48 => {
+                match self.arena.allocate(regs.bx) {
+                    Ok(seg) => {
+                        regs.ax = seg;
+                        regs.cf = false;
+                    }
+                    Err(largest) => {
+                        regs.cf = true;
+                        regs.ax = 0x08;
+                        regs.bx = largest;
+                    }
+                }
+                Ok(DosAction::Continue)
+            }
+            // AH=49h: free the block in ES. CF=0, or CF=1 AX=0x09 (invalid block).
+            0x49 => {
+                match self.arena.free(regs.es) {
+                    Ok(()) => regs.cf = false,
+                    Err(()) => {
+                        regs.cf = true;
+                        regs.ax = 0x09;
+                    }
+                }
+                Ok(DosAction::Continue)
+            }
+            // AH=4Ah: resize the block in ES to BX paragraphs. CF=0, or CF=1 with
+            // AX=0x08 BX=largest-available (too big) / AX=0x09 (invalid block).
+            0x4a => {
+                match self.arena.resize(regs.es, regs.bx) {
+                    Ok(()) => regs.cf = false,
+                    Err(ResizeError::TooBig(largest)) => {
+                        regs.cf = true;
+                        regs.ax = 0x08;
+                        regs.bx = largest;
+                    }
+                    Err(ResizeError::InvalidBlock) => {
+                        regs.cf = true;
+                        regs.ax = 0x09;
+                    }
+                }
+                Ok(DosAction::Continue)
+            }
+            // AH=1Ah: set the Disk Transfer Area to DS:DX.
+            0x1a => {
+                self.dta = (regs.ds, regs.dx);
+                Ok(DosAction::Continue)
+            }
+            // AH=2Fh: get the Disk Transfer Area into ES:BX. Default is PSP:0x80.
+            0x2f => {
+                regs.es = self.dta.0;
+                regs.bx = self.dta.1;
+                Ok(DosAction::Continue)
+            }
             // AH=4Ch: terminate with the return code in AL.
             0x4c => Ok(DosAction::Exit((regs.ax & 0x00ff) as u8)),
+            // AH=33h: Ctrl-Break flag. ponytail stub: AL=00 (get) returns DL=0 (off);
+            // AL=01 (set) is accepted as a no-op. No INT 23h state is tracked yet.
+            0x33 => {
+                if regs.ax as u8 == 0x00 {
+                    regs.dx &= 0xff00; // DL = 0 (off)
+                }
+                Ok(DosAction::Continue)
+            }
+            // AH=0Eh: select default drive. ponytail stub: only C: exists, so report
+            // AL=1 logical drive and do not change the current drive.
+            0x0e => {
+                regs.ax = (regs.ax & 0xff00) | 0x01;
+                Ok(DosAction::Continue)
+            }
             // Other file functions (write, seek, find) and everything else are not
             // yet implemented; later slices fill them in. An unimplemented function
             // returns Continue so the IRET stub returns to the caller.
@@ -334,6 +653,12 @@ impl DosKernel {
         }
     }
 }
+
+/// Toka-DOS (Toka Disk Operating System), the Izarra 3000's MS-DOS 6.1 clone,
+/// is what this HLE kernel emulates. INT 21h AH=30h reports its version.
+const TOKA_DOS_VERSION_MAJOR: u8 = 6;
+const TOKA_DOS_VERSION_MINOR: u8 = 10; // 6.10, the .NN-hundredths convention (6.20 -> 20)
+const TOKA_DOS_OEM: u8 = 0xff;
 
 /// The largest .COM image: a 64 KiB segment minus the 256-byte PSP.
 const COM_MAX_LEN: usize = 0x10000 - 0x100;
@@ -691,7 +1016,7 @@ mod tests {
     fn unimplemented_int21_function_is_noop() {
         let mut mem = Memory::new(4096).unwrap();
         let mut regs = DosRegs {
-            ax: 0x3000, // AH=30h get DOS version, not implemented this slice
+            ax: 0x4b00, // AH=4Bh EXEC, not implemented this slice
             ..DosRegs::default()
         };
         let mut kernel = DosKernel::new();
@@ -699,6 +1024,32 @@ mod tests {
         let action = kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
         assert_eq!(action, DosAction::Continue);
         assert!(kernel.stdout().is_empty());
+    }
+
+    #[test]
+    fn ah30_reports_toka_dos_version() {
+        let mut mem = Memory::new(4096).unwrap();
+        let mut regs = DosRegs {
+            ax: 0x3000,
+            ..DosRegs::default()
+        };
+        let mut kernel = DosKernel::new();
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(regs.ax & 0x00ff, 6); // AL = major
+        assert_eq!(regs.ax >> 8, 10); // AH = minor (6.10)
+        assert_eq!(regs.bx >> 8, 0xff); // BH = OEM
+    }
+
+    #[test]
+    fn ah19_reports_c_drive() {
+        let mut mem = Memory::new(4096).unwrap();
+        let mut regs = DosRegs {
+            ax: 0x1900,
+            ..DosRegs::default()
+        };
+        let mut kernel = DosKernel::new();
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(regs.ax & 0x00ff, 0x02); // AL = 2 (C:)
     }
 
     #[test]
@@ -1207,6 +1558,91 @@ mod tests {
     }
 
     #[test]
+    fn ah2a_2c_read_the_default_clock() {
+        let mut mem = Memory::new(4096).unwrap();
+        let mut kernel = DosKernel::new();
+        let mut date = DosRegs {
+            ax: 0x2a00,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut date, &mut mem).unwrap();
+        assert_eq!(date.cx, 1997); // year
+        assert_eq!(date.dx >> 8, 6); // month
+        assert_eq!(date.dx & 0xff, 17); // day
+        assert_eq!(date.ax & 0xff, 2); // day_of_week (Tuesday)
+        let mut time = DosRegs {
+            ax: 0x2c00,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut time, &mut mem).unwrap();
+        assert_eq!(time.cx >> 8, 12); // hour
+        assert_eq!(time.cx & 0xff, 0); // minute
+    }
+
+    #[test]
+    fn ah2b_2d_set_then_get_and_reject_out_of_range() {
+        let mut mem = Memory::new(4096).unwrap();
+        let mut kernel = DosKernel::new();
+        // Set date 2001-02-03.
+        let mut set = DosRegs {
+            ax: 0x2b00,
+            cx: 2001,
+            dx: (2u16 << 8) | 3,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut set, &mut mem).unwrap();
+        assert_eq!(set.ax & 0xff, 0x00); // success
+        let mut get = DosRegs {
+            ax: 0x2a00,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut get, &mut mem).unwrap();
+        assert_eq!(get.cx, 2001);
+        assert_eq!(get.dx >> 8, 2);
+        assert_eq!(get.dx & 0xff, 3);
+        // Reject month 13.
+        let mut bad = DosRegs {
+            ax: 0x2b00,
+            cx: 2001,
+            dx: (13u16 << 8) | 3,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut bad, &mut mem).unwrap();
+        assert_eq!(bad.ax & 0xff, 0xff); // failure, clock unchanged
+        let mut get2 = DosRegs {
+            ax: 0x2a00,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut get2, &mut mem).unwrap();
+        assert_eq!(get2.dx >> 8, 2); // still February
+    }
+
+    #[test]
+    fn ah25_then_ah35_round_trip_vector() {
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        // AH=25h: set INT 0x1C to DS:DX = 0xBEEF:0x1234.
+        let mut set = DosRegs {
+            ax: 0x251c,
+            ds: 0xbeef,
+            dx: 0x1234,
+            ..DosRegs::default()
+        };
+        let mut kernel = DosKernel::new();
+        kernel.dispatch(0x21, &mut set, &mut mem).unwrap();
+        // The IVT entry at 0x1C*4 holds offset then segment, little-endian.
+        assert_eq!(mem.read_u16(0x1c * 4).unwrap(), 0x1234);
+        assert_eq!(mem.read_u16(0x1c * 4 + 2).unwrap(), 0xbeef);
+        // AH=35h: get INT 0x1C back into ES:BX.
+        let mut get = DosRegs {
+            ax: 0x351c,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut get, &mut mem).unwrap();
+        assert_eq!(get.es, 0xbeef);
+        assert_eq!(get.bx, 0x1234);
+    }
+
+    #[test]
     fn load_program_routes_com_when_no_mz() {
         let mut mem = Memory::new(1024 * 1024).unwrap();
         let image = [0xb8, 0x00, 0x4c, 0xcd, 0x21]; // mov ax,4c00; int 21 (no MZ)
@@ -1218,5 +1654,251 @@ mod tests {
         assert_eq!(entry.es, 0x0100);
         assert_eq!(entry.ip, 0x0100);
         assert_eq!(entry.sp, 0xfffe);
+    }
+
+    fn arena_kernel() -> DosKernel {
+        let mut kernel = DosKernel::new();
+        // Program PSP at 0x0100, block top at 0x1100 (a .COM-style 64 KiB block).
+        kernel.init_program(0x0100, 0x1100);
+        kernel
+    }
+
+    #[test]
+    fn ah48_allocates_above_the_program_block() {
+        let mut mem = Memory::new(4096).unwrap();
+        let mut kernel = arena_kernel();
+        let mut regs = DosRegs {
+            ax: 0x4800,
+            bx: 0x0010,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf);
+        assert_eq!(regs.ax, 0x1100); // first free paragraph = prog_top
+    }
+
+    #[test]
+    fn ah4a_shrink_program_block_then_ah48_allocates_the_tail() {
+        let mut mem = Memory::new(4096).unwrap();
+        let mut kernel = arena_kernel();
+        // Shrink the program block (ES = PSP) to 0x0800 paragraphs.
+        let mut resize = DosRegs {
+            ax: 0x4a00,
+            es: 0x0100,
+            bx: 0x0800,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut resize, &mut mem).unwrap();
+        assert!(!resize.cf);
+        // Now AH=48h allocates from the freed tail: new free_base = 0x0100 + 0x0800 = 0x0900.
+        let mut alloc = DosRegs {
+            ax: 0x4800,
+            bx: 0x0010,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut alloc, &mut mem).unwrap();
+        assert!(!alloc.cf);
+        assert_eq!(alloc.ax, 0x0900);
+    }
+
+    #[test]
+    fn ah48_past_the_ceiling_returns_largest_available() {
+        let mut mem = Memory::new(4096).unwrap();
+        let mut kernel = arena_kernel();
+        // Request more than fits: free_base=0x1100, ceiling 0xA000 -> available 0x8F00.
+        let mut regs = DosRegs {
+            ax: 0x4800,
+            bx: 0x9000,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x08);
+        assert_eq!(regs.bx, 0x8f00); // 0xA000 - 0x1100
+    }
+
+    #[test]
+    fn ah4a_grow_program_block_too_big_fails_with_largest() {
+        let mut mem = Memory::new(4096).unwrap();
+        let mut kernel = arena_kernel();
+        // No allocations yet, so limit is ARENA_TOP. Ask for more than fits.
+        let mut regs = DosRegs {
+            ax: 0x4a00,
+            es: 0x0100,
+            bx: 0xa000,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x08);
+        assert_eq!(regs.bx, 0x9f00); // 0xA000 - 0x0100
+    }
+
+    #[test]
+    fn ah49_frees_top_block_lifo_then_reuses() {
+        let mut mem = Memory::new(4096).unwrap();
+        let mut kernel = arena_kernel();
+        let mut a = DosRegs {
+            ax: 0x4800,
+            bx: 0x0010,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut a, &mut mem).unwrap();
+        let seg = a.ax; // 0x1100
+        let mut free = DosRegs {
+            ax: 0x4900,
+            es: seg,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut free, &mut mem).unwrap();
+        assert!(!free.cf);
+        // The next allocation reuses the reclaimed paragraph.
+        let mut b = DosRegs {
+            ax: 0x4800,
+            bx: 0x0008,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut b, &mut mem).unwrap();
+        assert_eq!(b.ax, seg);
+    }
+
+    #[test]
+    fn ah49_unknown_block_returns_ax09() {
+        let mut mem = Memory::new(4096).unwrap();
+        let mut kernel = arena_kernel();
+        let mut regs = DosRegs {
+            ax: 0x4900,
+            es: 0x5555,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x09);
+    }
+
+    #[test]
+    fn ah49_non_top_free_leaves_a_hole_without_underflow() {
+        // Free a lower (non-top) block, then the top block: free_base must not
+        // underflow, and the lower hole stays leaked (the documented LIFO ceiling).
+        let mut mem = Memory::new(4096).unwrap();
+        let mut kernel = arena_kernel(); // psp 0x100, prog_top 0x1100
+        let mut a = DosRegs {
+            ax: 0x4800,
+            bx: 0x0010,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut a, &mut mem).unwrap();
+        assert_eq!(a.ax, 0x1100);
+        let mut b = DosRegs {
+            ax: 0x4800,
+            bx: 0x0010,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut b, &mut mem).unwrap();
+        assert_eq!(b.ax, 0x1110);
+        // Free the lower block A (non-top): the hole is not reclaimed.
+        let mut free_a = DosRegs {
+            ax: 0x4900,
+            es: 0x1100,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut free_a, &mut mem).unwrap();
+        assert!(!free_a.cf);
+        // Free the top block B: reclaims its paragraphs, no underflow.
+        let mut free_b = DosRegs {
+            ax: 0x4900,
+            es: 0x1110,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut free_b, &mut mem).unwrap();
+        assert!(!free_b.cf);
+        // A fresh allocation starts at 0x1110 (B's reclaimed top); A's hole at
+        // 0x1100 is leaked, as documented.
+        let mut c = DosRegs {
+            ax: 0x4800,
+            bx: 0x0008,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut c, &mut mem).unwrap();
+        assert_eq!(c.ax, 0x1110);
+    }
+
+    #[test]
+    fn ah48_zero_paragraphs_returns_a_segment_without_advancing() {
+        // A zero-paragraph allocation is a legal DOS request: it returns the
+        // current free_base and does not advance it.
+        let mut mem = Memory::new(4096).unwrap();
+        let mut kernel = arena_kernel();
+        let mut z = DosRegs {
+            ax: 0x4800,
+            bx: 0x0000,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut z, &mut mem).unwrap();
+        assert!(!z.cf);
+        assert_eq!(z.ax, 0x1100); // free_base, unchanged
+        let mut a = DosRegs {
+            ax: 0x4800,
+            bx: 0x0010,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut a, &mut mem).unwrap();
+        assert_eq!(a.ax, 0x1100); // next allocation still at free_base
+    }
+
+    #[test]
+    fn ah1a_2f_dta_round_trips_with_default_at_psp_0x80() {
+        let mut mem = Memory::new(4096).unwrap();
+        let mut kernel = DosKernel::new();
+        kernel.init_program(0x0100, 0x1100);
+        // Default DTA = PSP:0x80.
+        let mut get = DosRegs {
+            ax: 0x2f00,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut get, &mut mem).unwrap();
+        assert_eq!(get.es, 0x0100);
+        assert_eq!(get.bx, 0x0080);
+        // Set DTA to 0x1234:0x5678, read it back.
+        let mut set = DosRegs {
+            ax: 0x1a00,
+            ds: 0x1234,
+            dx: 0x5678,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut set, &mut mem).unwrap();
+        let mut get2 = DosRegs {
+            ax: 0x2f00,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut get2, &mut mem).unwrap();
+        assert_eq!(get2.es, 0x1234);
+        assert_eq!(get2.bx, 0x5678);
+    }
+
+    #[test]
+    fn ah33_get_ctrl_break_returns_off() {
+        let mut mem = Memory::new(4096).unwrap();
+        let mut kernel = DosKernel::new();
+        let mut regs = DosRegs {
+            ax: 0x3300,
+            dx: 0xffff,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(regs.dx & 0xff, 0x00); // DL = 0 (Ctrl-Break checking off)
+    }
+
+    #[test]
+    fn ah0e_reports_one_drive() {
+        let mut mem = Memory::new(4096).unwrap();
+        let mut kernel = DosKernel::new();
+        let mut regs = DosRegs {
+            ax: 0x0e00,
+            dx: 0x0002,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(regs.ax & 0xff, 0x01); // AL = number of logical drives
     }
 }
