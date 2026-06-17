@@ -453,6 +453,8 @@ impl Vga {
     /// (x >> 2)`, and the byte is the 8-bit DAC index directly (no attribute palette,
     /// no 6-bit mask). `counter_line` is in scan-counter units; double-scan maps it to
     /// the source row, exactly as the 16-color path.
+    /// The line-compare split and pel-pan are intentionally not applied here; they
+    /// are deferred for mode X (see the slice-5 spec section 1).
     pub fn render_modex_row(&self, counter_line: u32) -> Vec<u8> {
         let width = self.crtc.hdisp_end as usize;
         let source_row = counter_line / self.scan_factor();
@@ -1850,13 +1852,17 @@ mod tests {
         vga.vram[VGA_PLANE_SIZE] = 0x20;
         vga.vram[2 * VGA_PLANE_SIZE] = 0x30;
         vga.vram[3 * VGA_PLANE_SIZE] = 0x40;
+        vga.vram[1] = 0x11; // plane 0, offset 1: pixel 4 must read this
         let row = vga.render_modex_row(0);
         // Pixels 0..3 are planes 0..3 at offset 0, as full 8-bit DAC indices.
         assert_eq!(&row[0..4], &[0x10, 0x20, 0x30, 0x40]);
+        assert_eq!(row[4], 0x11, "pixel 4 wraps to plane 0 at plane offset 1");
     }
 
     #[test]
     fn mode_x_page_flip_reads_the_selected_page() {
+        // Checks render_modex_row's row_base arithmetic directly; the start-address
+        // vretrace latch is exercised end to end in the machine test (slice-5 task 5).
         let mut vga = Vga::default();
         vga.set_mode13h();
         vga.write_port(0x3C4, 0x04);
