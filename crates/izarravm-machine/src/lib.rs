@@ -10,6 +10,7 @@ use izarravm_video::{
 };
 use thiserror::Error;
 
+mod dma;
 mod pic;
 mod pit;
 
