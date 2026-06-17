@@ -417,6 +417,19 @@ impl Vga {
         }
     }
 
+    /// Effective horizontal pel-pan for one scanline, honoring the Attribute Mode
+    /// Control (10h) bit 5 "enable pixel panning up to line compare" forcing
+    /// (RBIL PORTS.B table P0664): below the CRTC Line Compare split the pan is
+    /// forced to 0 when bit 5 is set. Returns the raw 13h value masked to 0-15;
+    /// the mode-X caller masks further to 0-3.
+    fn pel_pan(&self, below_split: bool) -> usize {
+        if below_split && (self.attr.mode_control & 0x20 != 0) {
+            0
+        } else {
+            (self.attr.pixel_pan & 0x0F) as usize
+        }
+    }
+
     /// Assemble one active scanline into `hdisp_end` DAC indices, applying pel-pan
     /// and the attribute palette. `counter_line` is the scanline in scan-counter
     /// units; double-scan maps it to source row `counter_line / scan_factor`, so a
@@ -431,13 +444,7 @@ impl Vga {
         // the double-scan factor.
         let below_split = counter_line > self.crtc.line_compare;
         let (start, first_line) = self.split_origin(counter_line);
-        // Below the split, pel-pan is forced to 0 when Attribute Mode Control (10h)
-        // bit 5 is set ("enable pixel panning: 0 = all, 1 = up to line compare").
-        let pan = if below_split && (self.attr.mode_control & 0x20 != 0) {
-            0
-        } else {
-            (self.attr.pixel_pan & 0x0F) as usize
-        };
+        let pan = self.pel_pan(below_split);
         let source_row = (counter_line - first_line) / self.scan_factor();
         // The per-scanline counter increment is offset*2 in every addressing mode; the
         // byte/word/doubleword transform lives in display_offset, not the stride.
