@@ -1,3 +1,5 @@
+mod gui;
+
 use clap::Parser;
 use font8x8::{BASIC_FONTS, UnicodeFonts};
 use izarravm_audio::{AudioPlayer, AudioSubsystem};
