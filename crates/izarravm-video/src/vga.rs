@@ -98,6 +98,42 @@ fn apply_logic(logic: u8, value: u8, latch: u8) -> u8 {
     }
 }
 
+/// Read one byte through the VGA read datapath, loading the four latches.
+/// Spec section 4.
+pub fn read_planes(
+    planes: &[[u8; 1]; VGA_PLANES],
+    gc: &GfxController,
+    latches: &mut [u8; VGA_PLANES],
+) -> u8 {
+    for plane in 0..VGA_PLANES {
+        latches[plane] = planes[plane][0];
+    }
+    if gc.read_mode == 0 {
+        return planes[(gc.read_map & 3) as usize][0];
+    }
+    // Read mode 1: per bit, set the result bit where every cared-about plane
+    // matches the corresponding color_compare bit.
+    let mut result = 0u8;
+    for bit in 0..8 {
+        let mut matches = true;
+        for plane in 0..VGA_PLANES {
+            if (gc.color_dont_care >> plane) & 1 == 0 {
+                continue;
+            }
+            let plane_bit = (planes[plane][0] >> bit) & 1;
+            let cmp_bit = (gc.color_compare >> plane) & 1;
+            if plane_bit != cmp_bit {
+                matches = false;
+                break;
+            }
+        }
+        if matches {
+            result |= 1 << bit;
+        }
+    }
+    result
+}
+
 /// Write one byte through the VGA write datapath into all four planes. `planes[i]`
 /// is plane i's slice; `latches` are the four latch registers. Spec section 4.
 pub fn write_planes(
@@ -229,5 +265,28 @@ mod tests {
         assert_eq!(planes[1][0], 0xF0);
         assert_eq!(planes[2][0], 0x00);
         assert_eq!(planes[3][0], 0x00);
+    }
+
+    #[test]
+    fn read_mode_0_returns_selected_plane_and_loads_latches() {
+        let planes = [[0x11u8; 1], [0x22u8; 1], [0x33u8; 1], [0x44u8; 1]];
+        let mut gc = GfxController::default();
+        gc.read_map = 2;
+        let mut latches = [0u8; VGA_PLANES];
+        let byte = read_planes(&planes, &gc, &mut latches);
+        assert_eq!(byte, 0x33);
+        assert_eq!(latches, [0x11, 0x22, 0x33, 0x44]);
+    }
+
+    #[test]
+    fn read_mode_1_color_compares_each_bit() {
+        let planes = [[0xFFu8; 1], [0x00u8; 1], [0xFFu8; 1], [0x00u8; 1]];
+        let mut gc = GfxController::default();
+        gc.read_mode = 1;
+        gc.color_dont_care = 0x0F; // care about all four planes
+        gc.color_compare = 0b0101; // planes 0 and 2 set, 1 and 3 clear
+        let mut latches = [0u8; VGA_PLANES];
+        let byte = read_planes(&planes, &gc, &mut latches);
+        assert_eq!(byte, 0xFF); // every bit position matches the pattern
     }
 }
