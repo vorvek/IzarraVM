@@ -14,7 +14,18 @@ pub struct SbDsp {
     reset_micros: Option<f64>,
     read_data: VecDeque<u8>,
     data_available: bool,
-    inbox: VecDeque<u8>,
+    // Command interpreter: bytes written to 0x22C stream in here.
+    pending: Option<PendingCommand>,
+    // Immediate-command state.
+    direct_dac_byte: Option<u8>,
+    test_reg: u8,
+    speaker_on: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct PendingCommand {
+    command: u8,
+    args: Vec<u8>,
 }
 
 impl Default for SbDsp {
@@ -23,7 +34,10 @@ impl Default for SbDsp {
             reset_micros: None,
             read_data: VecDeque::new(),
             data_available: false,
-            inbox: VecDeque::new(),
+            pending: None,
+            direct_dac_byte: None,
+            test_reg: 0,
+            speaker_on: false,
         }
     }
 }
@@ -44,6 +58,67 @@ impl SbDsp {
     fn queue_read(&mut self, byte: u8) {
         self.read_data.push_back(byte);
         self.data_available = true;
+    }
+
+    /// Number of argument bytes a DSP command consumes before it can dispatch.
+    fn command_arity(command: u8) -> usize {
+        match command {
+            0x10 | 0xE4 => 1,                         // direct DAC / test-register write
+            0x40 => 1,                                // set time constant (Task 5)
+            0x41 => 2,                                // set sample rate (Task 5)
+            0x48 => 2,                                // set block size (Task 5)
+            _ => 0,
+        }
+    }
+
+    /// Push a command/data byte into the interpreter; dispatches when complete.
+    fn write_command_byte(&mut self, byte: u8) {
+        if let Some(mut pending) = self.pending.take() {
+            pending.args.push(byte);
+            if pending.args.len() >= Self::command_arity(pending.command) {
+                self.dispatch(pending.command, &pending.args);
+            } else {
+                self.pending = Some(pending);
+            }
+            return;
+        }
+        let arity = Self::command_arity(byte);
+        if arity == 0 {
+            self.dispatch(byte, &[]);
+        } else {
+            self.pending = Some(PendingCommand {
+                command: byte,
+                args: Vec::new(),
+            });
+        }
+    }
+
+    /// Execute a fully-assembled command with its argument bytes.
+    fn dispatch(&mut self, command: u8, args: &[u8]) {
+        match command {
+            0x10 => self.direct_dac_byte = args.first().copied(),
+            0xE4 => self.test_reg = args.first().copied().unwrap_or(0),
+            0xE1 => {
+                self.queue_read(DSP_VERSION_HI);
+                self.queue_read(DSP_VERSION_LO);
+            }
+            0xE8 => self.queue_read(self.test_reg),
+            0xD1 => self.speaker_on = true,
+            0xD3 => self.speaker_on = false,
+            0xE3 => {
+                // The CT1747 copyright string, NUL-terminated, as the DSP returns it.
+                for &b in b"Copyright (C) Creative Technology Ltd. 1992-94\0" {
+                    self.queue_read(b);
+                }
+            }
+            // Rate / block / DMA commands are wired in Tasks 5 and 6.
+            _ => {}
+        }
+    }
+
+    /// Last byte written by a direct 8-bit DAC command (0x10).
+    pub fn direct_dac_byte(&self) -> Option<u8> {
+        self.direct_dac_byte
     }
 
     pub fn read_port(&mut self, port: u16) -> Option<u8> {
@@ -69,6 +144,10 @@ impl SbDsp {
                     self.read_data.clear();
                     self.data_available = false;
                 }
+                true
+            }
+            0x22C => {
+                self.write_command_byte(value);
                 true
             }
             _ => false,
@@ -97,5 +176,34 @@ mod tests {
         let mut dsp = SbDsp::default();
         assert!(!dsp.write_port(0x224, 0x00), "mixer (0x224) stays out of scope");
         assert!(dsp.write_port(0x226, 0x00), "reset is a DSP port");
+    }
+
+    fn write_cmd(dsp: &mut SbDsp, bytes: &[u8]) {
+        for &b in bytes {
+            dsp.write_port(0x22C, b);
+        }
+    }
+
+    #[test]
+    fn version_command_returns_sb16_4_5() {
+        let mut dsp = SbDsp::default();
+        write_cmd(&mut dsp, &[0xE1]);
+        assert_eq!(dsp.read_port(0x22A), Some(DSP_VERSION_HI));
+        assert_eq!(dsp.read_port(0x22A), Some(DSP_VERSION_LO));
+    }
+
+    #[test]
+    fn test_register_write_then_read_round_trips() {
+        let mut dsp = SbDsp::default();
+        write_cmd(&mut dsp, &[0xE4, 0x5A]);
+        write_cmd(&mut dsp, &[0xE8]);
+        assert_eq!(dsp.read_port(0x22A), Some(0x5A));
+    }
+
+    #[test]
+    fn direct_dac_command_latches_one_byte() {
+        let mut dsp = SbDsp::default();
+        write_cmd(&mut dsp, &[0x10, 0x80]);
+        assert_eq!(dsp.direct_dac_byte(), Some(0x80));
     }
 }
