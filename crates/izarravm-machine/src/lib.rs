@@ -1,4 +1,4 @@
-use izarravm_audio::{OplChip, Resampler, SbDsp};
+use izarravm_audio::{OplChip, Resampler, SbDsp, SbMixer};
 use izarravm_bus::{BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CpuBus, Memory};
 use izarravm_core::{CpuPreset, HardwareProfile, VideoCard};
 use izarravm_cpu::{Cpu386, CpuError, SegmentIndex, SegmentRegister};
@@ -113,10 +113,6 @@ const DAC_HZ: u32 = 44_100;
 const PIT_INPUT_HZ: u32 = 1_193_182;
 /// VGA 25.175 MHz dot clock (standard 640x480 and related modes).
 const VGA_DOT_HZ: u64 = 25_175_000;
-/// Sound Blaster 16 IRQ and DMA resources (fixed for the Resonique 2).
-const SB_IRQ: u8 = 5;
-const SB_DMA_CHANNEL_8: usize = 1;
-const SB_DMA_CHANNEL_16: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveDisplay {
@@ -153,6 +149,7 @@ pub struct Machine {
     dsp_rate_hz: u32, // input rate the dsp_resampler is currently configured for
     dsp_micros: f64,  // fractional microseconds owed to the DSP reset-settle clock
     dsp_sample_phase: f64, // fractional DSP samples owed to the DMA playback clock
+    mixer: SbMixer,   // the CT1745 mixer: IRQ/DMA routing + volume attenuation
     margo_ns: f64,    // fractional nanoseconds owed to the Margo busy countdown
     vga_dots: f64,    // fractional VGA dot clocks owed to the beam advance
     trace: BusTrace,
@@ -192,6 +189,7 @@ impl Machine {
             dsp_rate_hz: 0,
             dsp_micros: 0.0,
             dsp_sample_phase: 0.0,
+            mixer: SbMixer::default(),
             margo_ns: 0.0,
             vga_dots: 0.0,
             trace: BusTrace::default(),
@@ -242,6 +240,7 @@ impl Machine {
             dsp_rate_hz: 0,
             dsp_micros: 0.0,
             dsp_sample_phase: 0.0,
+            mixer: SbMixer::default(),
             margo_ns: 0.0,
             vga_dots: 0.0,
             trace: BusTrace::default(),
@@ -310,6 +309,7 @@ impl Machine {
             dsp_rate_hz: 0,
             dsp_micros: 0.0,
             dsp_sample_phase: 0.0,
+            mixer: SbMixer::default(),
             margo_ns: 0.0,
             vga_dots: 0.0,
             trace: BusTrace::default(),
@@ -394,6 +394,7 @@ impl Machine {
             dma: &mut self.dma,
             opl: &mut self.opl,
             dsp: &mut self.dsp,
+            mixer: &mut self.mixer,
             trace: &mut self.trace,
             pending_soft_int: &mut self.pending_soft_int,
             wait_states: self.profile.wait_states,
@@ -732,6 +733,12 @@ impl Machine {
         // IRQ5 no longer depend on the host frontend pulling audio. The host path
         // (render_dsp_audio) only drains what the clock already produced.
         let rate = self.dsp.rate_hz();
+        // The mixer selects the IRQ line and DMA channels (registers 0x80/0x81);
+        // read them before the borrow-splitting loop below so the loop's
+        // `let Machine { dsp, dma, memory, .. } = self;` shape is untouched.
+        let irq_line = self.mixer.selected_irq();
+        let dma8 = self.mixer.selected_dma_8();
+        let dma16 = self.mixer.selected_dma_16();
         if self.dsp.is_playing() && rate > 0 {
             self.dsp_sample_phase += clocks as f64 * rate as f64 / self.profile.clock_hz as f64;
             while self.dsp_sample_phase >= 1.0 {
@@ -744,13 +751,15 @@ impl Machine {
                     dsp, dma, memory, ..
                 } = self;
                 if dsp.is_16bit() {
-                    dsp.tick_sample(|| None, || dma.read_word(SB_DMA_CHANNEL_16, memory));
+                    dsp.tick_sample(|| None, || dma.read_word(dma16, memory));
                 } else {
-                    dsp.tick_sample(|| dma.read_byte(SB_DMA_CHANNEL_8, memory), || None);
+                    dsp.tick_sample(|| dma.read_byte(dma8, memory), || None);
                 }
             }
             if self.dsp.take_irq() {
-                self.pic.request(SB_IRQ);
+                let is_16bit = self.dsp.is_16bit();
+                self.mixer.set_irq_status(is_16bit);
+                self.pic.request(irq_line);
             }
         }
 
@@ -963,7 +972,7 @@ impl Machine {
         } else {
             None
         };
-        let dsp_wake = if self.pic.irq5_unmasked() {
+        let dsp_wake = if self.pic.irq_unmasked(self.mixer.selected_irq()) {
             self.dsp
                 .clocks_until_next_irq(self.dsp.rate_hz(), self.profile.clock_hz)
         } else {
@@ -1014,6 +1023,7 @@ impl Machine {
                     dma,
                     opl,
                     dsp,
+                    mixer,
                     trace,
                     pending_soft_int,
                     ..
@@ -1030,6 +1040,7 @@ impl Machine {
                     dma,
                     opl,
                     dsp,
+                    mixer,
                     trace,
                     pending_soft_int,
                     wait_states: profile.wait_states,
@@ -1091,6 +1102,7 @@ struct MachineBus<'a> {
     dma: &'a mut dma::DmaController,
     opl: &'a mut OplChip,
     dsp: &'a mut SbDsp,
+    mixer: &'a mut SbMixer,
     trace: &'a mut BusTrace,
     pending_soft_int: &'a mut Option<u8>,
     wait_states: WaitStateProfile,
@@ -1193,7 +1205,15 @@ impl CpuBus for MachineBus<'_> {
             // The chip drives only the status byte on reads; data ports read open-bus.
             return Ok(u32::from(self.opl.read_port(opl_port).unwrap_or(0xff)));
         }
+        if let Some(value) = self.mixer.read_port(port) {
+            return Ok(u32::from(value));
+        }
         if let Some(value) = self.dsp.read_port(port) {
+            // A guest ISR acknowledges the DSP interrupt by reading 0x22E (8-bit)
+            // or 0x22F (16-bit); that read also clears the mixer's 0x82 source bit.
+            if port == 0x22E || port == 0x22F {
+                self.mixer.clear_irq_status();
+            }
             return Ok(u32::from(value));
         }
         if let Some(value) = self.pit.read_port(port) {
@@ -1225,6 +1245,9 @@ impl CpuBus for MachineBus<'_> {
 
         if let Some(opl_port) = opl_port(port) {
             self.opl.write_port(opl_port, value as u8);
+            return Ok(());
+        }
+        if self.mixer.write_port(port, value as u8) {
             return Ok(());
         }
         if self.dsp.write_port(port, value as u8) {
@@ -1924,11 +1947,11 @@ mod tests {
 
     #[test]
     fn passive_target_ports_allow_capability_probes_to_fail_cleanly() {
-        // 0x224 is the SB DSP reset port: still an unimplemented passive port
-        // (0x388 is now the OPL chip).
+        // 0x226 is the SB DSP reset port: still an unimplemented passive port
+        // (0x224/0x225 are now the CT1745 mixer, 0x388 the OPL chip).
         let mut machine = test_machine();
         let value = with_bus(&mut machine, |bus| {
-            bus.read_io(0x0224, BusWidth::Byte).unwrap()
+            bus.read_io(0x0226, BusWidth::Byte).unwrap()
         });
 
         assert_eq!(value, 0xff);
@@ -1937,8 +1960,29 @@ mod tests {
                 .bus_trace()
                 .cycles()
                 .iter()
-                .any(|cycle| cycle.kind == BusAccessKind::IoRead && cycle.address == 0x0224)
+                .any(|cycle| cycle.kind == BusAccessKind::IoRead && cycle.address == 0x0226)
         );
+    }
+
+    #[test]
+    fn mixer_index_port_decodes_instead_of_falling_through_passive() {
+        // 0x224 used to read 0xFF as a passive port; it is now the CT1745 mixer
+        // index register, whose read returns the latched index (0 at reset).
+        let mut machine = test_machine();
+        let index_read = with_bus(&mut machine, |bus| {
+            bus.read_io(0x0224, BusWidth::Byte).unwrap()
+        });
+        assert_eq!(index_read, 0x00, "0x224 returns the latched mixer index");
+        // Programming register 0x80 (IRQ7) round-trips through 0x225.
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x224, BusWidth::Byte, 0x80).unwrap();
+            bus.write_io(0x225, BusWidth::Byte, 0x04).unwrap();
+        });
+        let routed = with_bus(&mut machine, |bus| {
+            bus.write_io(0x224, BusWidth::Byte, 0x80).unwrap();
+            bus.read_io(0x225, BusWidth::Byte).unwrap()
+        });
+        assert_eq!(routed, 0x04, "IRQ7 latched in mixer register 0x80");
     }
 
     #[test]
@@ -2025,6 +2069,95 @@ mod tests {
     }
 
     #[test]
+    fn sb_mixer_selects_irq7_and_routes_the_dma_irq() {
+        let mut machine = test_machine();
+        // 8-bit ramp at 0x01_0000 (DMA ch1, the mixer's default 8-bit channel).
+        for (i, b) in (0..16u8).map(|i| i * 16).enumerate() {
+            machine.write_physical_u8(0x1_0000 + i as u32, b);
+        }
+        with_bus(&mut machine, |bus| {
+            // Route the DSP IRQ on IRQ7 (mixer register 0x80 = 0x04).
+            bus.write_io(0x224, BusWidth::Byte, 0x80).unwrap();
+            bus.write_io(0x225, BusWidth::Byte, 0x04).unwrap();
+            // PIC base 0x08 so IRQ7 -> vector 0x0F; mask everything except IR7.
+            bus.write_io(0x20, BusWidth::Byte, 0x11).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x08).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x04).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x7F).unwrap();
+            // DMA ch1 + DSP 8-bit single-cycle, exactly like the IRQ5 golden.
+            bus.write_io(0x0B, BusWidth::Byte, 0x49).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x0F).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x83, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x0A, BusWidth::Byte, 0x01).unwrap();
+            for &b in &[0x41u8, 0x2B, 0x11, 0x48, 0x0F, 0x00, 0x14] {
+                bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
+            }
+        });
+        machine.advance_devices_clocks(200_000);
+        let vector = with_bus(&mut machine, |bus| bus.acknowledge_interrupt());
+        assert_eq!(vector, Some(0x0F), "the DMA IRQ must land on line 7, not 5");
+    }
+
+    #[test]
+    fn sb_mixer_selects_dma_channel_3() {
+        let mut machine = test_machine();
+        let bytes: Vec<u8> = (0..16).map(|i| (i * 16) as u8).collect();
+        for (i, &b) in bytes.iter().enumerate() {
+            machine.write_physical_u8(0x1_0000 + i as u32, b);
+        }
+        with_bus(&mut machine, |bus| {
+            // Route the 8-bit DMA through DMA3 (mixer register 0x81 = 0x08).
+            bus.write_io(0x224, BusWidth::Byte, 0x81).unwrap();
+            bus.write_io(0x225, BusWidth::Byte, 0x08).unwrap();
+            // DMA ch3: page 0x82, byte addr 0, count 15 (16 bytes), single read.
+            bus.write_io(0x0B, BusWidth::Byte, 0x4B).unwrap();
+            bus.write_io(0x06, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x06, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x07, BusWidth::Byte, 0x0F).unwrap();
+            bus.write_io(0x07, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x82, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x0A, BusWidth::Byte, 0x03).unwrap();
+            // DSP: 11025 Hz, block 16, single-cycle 8-bit DMA output.
+            for &b in &[0x41u8, 0x2B, 0x11, 0x48, 0x0F, 0x00, 0x14] {
+                bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
+            }
+        });
+        let out = {
+            machine.advance_devices_clocks(200_000);
+            machine.render_dsp_audio(16)
+        };
+        assert_eq!(out.len(), 16, "buffer drained via DMA channel 3");
+        assert!(out.iter().any(|&(l, _)| l < 0), "expected negative samples");
+        assert!(
+            out.iter().all(|&(l, r)| l == r),
+            "8-bit mono duplicated L/R"
+        );
+        // Single mode masks channel 3 at terminal count, proving the producer
+        // drew from channel 3 (channel 1 stayed masked and untouched).
+        assert_eq!(machine.dma_read_byte(3), None, "ch3 reached TC");
+    }
+
+    #[test]
+    fn sb_mixer_reset_restores_irq5_default() {
+        let mut machine = test_machine();
+        with_bus(&mut machine, |bus| {
+            // Route the IRQ on IRQ7, then reset the mixer (any value to 0x00).
+            bus.write_io(0x224, BusWidth::Byte, 0x80).unwrap();
+            bus.write_io(0x225, BusWidth::Byte, 0x04).unwrap();
+            bus.write_io(0x224, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x225, BusWidth::Byte, 0x01).unwrap();
+            // A guest reset restores the hardware IRQ5 default, not the host config.
+            bus.write_io(0x224, BusWidth::Byte, 0x80).unwrap();
+            let byte = bus.read_io(0x225, BusWidth::Byte).unwrap();
+            assert_eq!(byte, 0x02);
+        });
+    }
+
+    #[test]
     fn sb_8bit_dma_plays_a_buffer_through_the_dsp() {
         let mut machine = test_machine();
         // A 16-byte unsigned ramp in conventional memory at 0x01_0000.
@@ -2104,9 +2237,9 @@ mod tests {
             out.iter().all(|&(l, r)| l == -1 && r == 1),
             "every stereo frame decodes L=-1, R=+1"
         );
-        // Auto-init: channel 5 still feeds after draining the buffer.
+        // Auto-init: channel 5 (the mixer's default 16-bit channel) still feeds.
         assert!(
-            machine.dma_read_word(SB_DMA_CHANNEL_16).is_some(),
+            machine.dma_read_word(5).is_some(),
             "auto-init keeps feeding"
         );
     }
@@ -2125,6 +2258,7 @@ mod tests {
             dma: &mut machine.dma,
             opl: &mut machine.opl,
             dsp: &mut machine.dsp,
+            mixer: &mut machine.mixer,
             trace: &mut machine.trace,
             pending_soft_int: &mut machine.pending_soft_int,
             wait_states: machine.profile.wait_states,

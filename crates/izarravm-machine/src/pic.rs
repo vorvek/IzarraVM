@@ -171,14 +171,21 @@ impl Pic8259Pair {
         }
     }
 
-    /// True when IRQ0 (master IR0) is not masked in the master IMR.
-    pub(crate) fn irq0_unmasked(&self) -> bool {
-        self.master.imr & 0x01 == 0
+    /// True when IRQ `irq` (0..15) is not masked. IRQ 0..7 are on the master,
+    /// IRQ 8..15 on the slave. IRQ10 (slave IR2) is gated by the slave IMR: the
+    /// master IR2 cascade line is normally unmasked, so the slave mask is the
+    /// meaningful gate.
+    pub(crate) fn irq_unmasked(&self, irq: u8) -> bool {
+        if irq < 8 {
+            self.master.imr & (1 << irq) == 0
+        } else {
+            self.slave.imr & (1 << (irq - 8)) == 0
+        }
     }
 
-    /// True when IRQ5 (master IR5, the Sound Blaster line) is not masked.
-    pub(crate) fn irq5_unmasked(&self) -> bool {
-        self.master.imr & 0x20 == 0
+    /// True when IRQ0 (master IR0) is not masked in the master IMR.
+    pub(crate) fn irq0_unmasked(&self) -> bool {
+        self.irq_unmasked(0)
     }
 
     pub(crate) fn request(&mut self, irq: u8) {
