@@ -102,12 +102,13 @@ certificate / HTTP 403) when this was written. Confirm against an unbroken mirro
 when one is reachable. No 16-color planar workload exercises doubleword mode.
 ```
 
-- [ ] **Step 2: Commit**
+- [ ] **Step 2: Leave it as a local cache (do not commit)**
 
-```bash
-git add dev_docs/reference/vga/crtc-addressing.md
-git commit -m "Cache the VGA CRTC display-address generation reference"
-```
+`/dev_docs/` is gitignored on purpose: it holds local-only reference caches (RBIL,
+the 386/486 manuals, the OPL3 docs), none of which are tracked. This reference
+follows the same pattern. Leave the file on disk; do not commit it and do not
+modify `.gitignore`. The code and conformance doc cite its path the same way the
+codebase already cites the RBIL paths.
 
 ---
 
