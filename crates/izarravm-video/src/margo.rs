@@ -6,7 +6,7 @@
 pub const MARGO_VRAM_SIZE: usize = 4 * 1024 * 1024;
 pub const MARGO_MMIO_SIZE: usize = 0x0001_0000; // 64 KB register block
 pub const MARGO_ID_VALUE: u32 = 0x4D47_0100; // 'M' 'G', version 1.00
-pub const MARGO_CAPS_VALUE: u32 = 0x0000_01ff; // bits 0 FILL, 1 COPY, 2 COLOR_EXPAND, 3 LINE, 4 ROP3, 5 CLIP, 6 COLORKEY, 7 PATTERN_FILL, 8 cursor
+pub const MARGO_CAPS_VALUE: u32 = 0x0000_01ff; // bits 0 FILL, 1 COPY, 2 COLOR_EXPAND, 3 LINE, 4 ROP3, 5 CLIP, 6 COLORKEY, 7 PATTERN_FILL, 8 CURSOR
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VbeMode {
@@ -818,7 +818,59 @@ impl Margo {
                 out.push(decode_argb(bpp, u32::from_le_bytes(bytes), palette));
             }
         }
+        self.composite_cursor(&mut out, palette);
         out
+    }
+
+    /// Overlay the 64x64 two-plane hardware cursor onto the decoded scanout `out`
+    /// (`width * height` ARGB pixels). No-op unless `CURSOR_CTRL` bit 0 is set. The
+    /// bitmap at `CURSOR_ADDR` is the AND plane (512 bytes) then the XOR plane
+    /// (`CURSOR_ADDR + 512`), each 64x64 at 1 bpp, 8 bytes per row, MSB first. The
+    /// (AND, XOR) bits select per the section 7.7 table: (0,0) background color,
+    /// (0,1) foreground color, (1,0) transparent, (1,1) the screen pixel inverted.
+    /// `CURSOR_FG`/`CURSOR_BG` decode through the display format like a pixel.
+    /// `CURSOR_POS` X/Y are signed 16-bit, so the cursor can run off the top/left;
+    /// pixels outside the screen are clipped. An off-store plane byte skips that
+    /// cursor pixel (transparent), never wraps.
+    fn composite_cursor(&self, out: &mut [u32], palette: &[u32; 256]) {
+        if self.cursor_reg(REG_CURSOR_CTRL) & 0x1 == 0 {
+            return;
+        }
+        let width = self.display.width as i32;
+        let height = self.display.height as i32;
+        let bpp = self.display.bpp;
+        let fg = decode_argb(bpp, self.cursor_reg(REG_CURSOR_FG), palette);
+        let bg = decode_argb(bpp, self.cursor_reg(REG_CURSOR_BG), palette);
+        let addr = self.cursor_reg(REG_CURSOR_ADDR) as u64;
+        let pos = self.cursor_reg(REG_CURSOR_POS);
+        let pos_x = (pos & 0xffff) as u16 as i16 as i32;
+        let pos_y = (pos >> 16) as u16 as i16 as i32;
+        let len = self.vram.len() as u64;
+        for cy in 0..64i32 {
+            for cx in 0..64i32 {
+                let sx = pos_x + cx;
+                let sy = pos_y + cy;
+                if sx < 0 || sx >= width || sy < 0 || sy >= height {
+                    continue;
+                }
+                let byte = (cy as u64) * 8 + (cx as u64) / 8;
+                let mask = 0x80u8 >> (cx & 7);
+                let and_off = addr.saturating_add(byte);
+                let xor_off = addr.saturating_add(512).saturating_add(byte);
+                if and_off >= len || xor_off >= len {
+                    continue; // off-store plane byte: skip (transparent), no wrap
+                }
+                let and_bit = self.vram[and_off as usize] & mask != 0;
+                let xor_bit = self.vram[xor_off as usize] & mask != 0;
+                let idx = (sy as usize) * (width as usize) + sx as usize;
+                out[idx] = match (and_bit, xor_bit) {
+                    (false, false) => bg,
+                    (false, true) => fg,
+                    (true, false) => continue, // transparent: leave the screen pixel
+                    (true, true) => !out[idx] & 0x00ff_ffff, // invert the screen pixel
+                };
+            }
+        }
     }
 
     fn register_u32(&self, reg: usize) -> u32 {
@@ -897,6 +949,10 @@ impl Margo {
 
     fn blit_reg(&self, offset: usize) -> u32 {
         self.blit[(offset - BLIT_BASE) / 4]
+    }
+
+    fn cursor_reg(&self, offset: usize) -> u32 {
+        self.cursor[(offset - CURSOR_BASE) / 4]
     }
 
     fn build_clip(&self) -> Clip {
@@ -1743,7 +1799,7 @@ mod tests {
     fn caps_reports_all_implemented_features() {
         let margo = Margo::default();
         // bits 0 FILL, 1 COPY, 2 COLOR_EXPAND, 3 LINE, 4 full ROP3, 5 CLIP, 6 COLORKEY,
-        // 7 PATTERN_FILL, 8 hardware cursor.
+        // 7 PATTERN_FILL, 8 CURSOR.
         assert_eq!(read_reg_u32(&margo, REG_CAPS), 0x0000_01ff);
     }
 
@@ -3599,5 +3655,157 @@ mod tests {
         margo.write_mmio_u8(REG_PAT_BASE + 2, 0x33);
         margo.write_mmio_u8(REG_PAT_BASE + 3, 0x44);
         assert_eq!(read_reg_u32(&margo, REG_PAT_BASE), 0x4433_2211);
+    }
+
+    #[test]
+    fn cursor_composites_the_four_and_xor_results() {
+        let mut margo = Margo::default();
+        margo.set_mode_640x480x8();
+        // Identity palette: 8bpp index i decodes to ARGB i, so values are self-evident.
+        let mut palette = [0u32; 256];
+        for (i, slot) in palette.iter_mut().enumerate() {
+            *slot = i as u32;
+        }
+        // Bitmap offscreen, beyond every mode's visible surface (1 MiB into VRAM).
+        let addr = 0x10_0000u32;
+        // Row 0, byte 0. AND plane sets cx2,cx3 (0x20|0x10=0x30); XOR plane sets cx1,cx3
+        // (0x40|0x10=0x50). So cx0=(0,0)->BG, cx1=(0,1)->FG, cx2=(1,0)->transparent,
+        // cx3=(1,1)->invert.
+        margo.write_vram_u8(addr as usize, 0x30);
+        margo.write_vram_u8(addr as usize + 512, 0x50);
+        write_reg(&mut margo, REG_CURSOR_ADDR, addr);
+        write_reg(&mut margo, REG_CURSOR_POS, 0); // (0, 0)
+        write_reg(&mut margo, REG_CURSOR_FG, 0x30);
+        write_reg(&mut margo, REG_CURSOR_BG, 0x20);
+        write_reg(&mut margo, REG_CURSOR_CTRL, 1); // ENABLE
+        let argb = margo.scanout_argb(&palette);
+        assert_eq!(argb[0], 0x20); // cx0 (0,0) -> BG
+        assert_eq!(argb[1], 0x30); // cx1 (0,1) -> FG
+        assert_eq!(argb[2], 0x00); // cx2 (1,0) -> transparent (surface stays 0)
+        assert_eq!(argb[3], 0x00ff_ffff); // cx3 (1,1) -> invert of 0
+        assert_eq!(argb[64], 0x00); // sx=64 is outside the 64-wide cursor
+    }
+
+    #[test]
+    fn cursor_addresses_planes_msb_first() {
+        let mut margo = Margo::default();
+        margo.set_mode_640x480x8();
+        let mut palette = [0u32; 256];
+        for (i, slot) in palette.iter_mut().enumerate() {
+            *slot = i as u32;
+        }
+        let addr = 0x10_0000u32;
+        // FG pixel at cursor (cx=9, cy=3): XOR byte = cy*8 + cx/8 = 25, mask = 0x80 >> 1
+        // = 0x40. AND clear. BG = 0 so only the FG pixel differs from the surface.
+        margo.write_vram_u8(addr as usize + 512 + 25, 0x40);
+        write_reg(&mut margo, REG_CURSOR_ADDR, addr);
+        write_reg(&mut margo, REG_CURSOR_POS, 0);
+        write_reg(&mut margo, REG_CURSOR_FG, 0x30);
+        write_reg(&mut margo, REG_CURSOR_BG, 0x00);
+        write_reg(&mut margo, REG_CURSOR_CTRL, 1);
+        let argb = margo.scanout_argb(&palette);
+        assert_eq!(argb[3 * 640 + 9], 0x30); // (cx=9, cy=3) -> FG
+        assert_eq!(argb[3 * 640 + 8], 0x00); // cx=8 (same byte, mask 0x80) is BG=0, not FG
+    }
+
+    #[test]
+    fn cursor_position_is_signed_and_clips_top_left() {
+        let mut margo = Margo::default();
+        margo.set_mode_640x480x8();
+        let mut palette = [0u32; 256];
+        for (i, slot) in palette.iter_mut().enumerate() {
+            *slot = i as u32;
+        }
+        let addr = 0x10_0000u32;
+        // FG pixel at cursor (cx=5, cy=5): XOR byte = 5*8 + 0 = 40, mask = 0x80 >> 5 = 0x04.
+        margo.write_vram_u8(addr as usize + 512 + 40, 0x04);
+        write_reg(&mut margo, REG_CURSOR_ADDR, addr);
+        // Signed position x = -3, y = -2: cursor (5,5) -> screen (2, 3); the cursor's
+        // top-left pixels map to negative screen coords and must be clipped, not wrapped.
+        let pos = (((-2i32) as u16 as u32) << 16) | ((-3i32) as u16 as u32);
+        write_reg(&mut margo, REG_CURSOR_POS, pos);
+        write_reg(&mut margo, REG_CURSOR_FG, 0x30);
+        write_reg(&mut margo, REG_CURSOR_BG, 0x00);
+        write_reg(&mut margo, REG_CURSOR_CTRL, 1);
+        let argb = margo.scanout_argb(&palette);
+        assert_eq!(argb[3 * 640 + 2], 0x30); // cursor (5,5) -> screen (2,3)
+    }
+
+    #[test]
+    fn cursor_clips_at_the_right_and_bottom_edges() {
+        let mut margo = Margo::default();
+        margo.set_mode_640x480x8();
+        let mut palette = [0u32; 256];
+        for (i, slot) in palette.iter_mut().enumerate() {
+            *slot = i as u32;
+        }
+        let addr = 0x10_0000u32;
+        // FG (XOR set, AND clear) at cursor (0,0), (2,0), and (0,2).
+        margo.write_vram_u8(addr as usize + 512, 0xa0); // XOR byte 0: cx0 (0x80) + cx2 (0x20)
+        margo.write_vram_u8(addr as usize + 512 + 16, 0x80); // XOR byte 16: (cy=2, cx=0)
+        write_reg(&mut margo, REG_CURSOR_ADDR, addr);
+        // Bottom-right corner. Cursor (0,0) -> (639,479) on-screen; (2,0) -> x=641 and
+        // (0,2) -> y=481 are off-screen. If not clipped, those would index out of bounds
+        // and panic, so a passing test proves the right/bottom clip.
+        write_reg(&mut margo, REG_CURSOR_POS, (479 << 16) | 639);
+        write_reg(&mut margo, REG_CURSOR_FG, 0x30);
+        write_reg(&mut margo, REG_CURSOR_BG, 0x00);
+        write_reg(&mut margo, REG_CURSOR_CTRL, 1);
+        let argb = margo.scanout_argb(&palette);
+        assert_eq!(argb[479 * 640 + 639], 0x30); // the on-screen corner pixel is FG
+    }
+
+    #[test]
+    fn cursor_disabled_leaves_scanout_untouched() {
+        let mut margo = Margo::default();
+        margo.set_mode_640x480x8();
+        let mut palette = [0u32; 256];
+        for (i, slot) in palette.iter_mut().enumerate() {
+            *slot = i as u32;
+        }
+        let addr = 0x10_0000u32;
+        margo.write_vram_u8(addr as usize, 0x30); // AND plane
+        margo.write_vram_u8(addr as usize + 512, 0x50); // XOR plane
+        write_reg(&mut margo, REG_CURSOR_ADDR, addr);
+        write_reg(&mut margo, REG_CURSOR_FG, 0x30);
+        write_reg(&mut margo, REG_CURSOR_BG, 0x20);
+        // CURSOR_CTRL left at 0 (disabled).
+        let argb = margo.scanout_argb(&palette);
+        assert_eq!(argb[0], 0x00);
+        assert_eq!(argb[1], 0x00);
+    }
+
+    #[test]
+    fn cursor_colors_decode_in_hi_color() {
+        let mut margo = Margo::default();
+        margo.set_mode(0x111); // 640x480x16, R5G6B5
+        let palette = [0u32; 256]; // unused at 16bpp
+        let addr = 0x10_0000u32;
+        // FG pixel at cursor (0,0): XOR plane byte 0 bit 0x80 (cx0), AND clear.
+        margo.write_vram_u8(addr as usize + 512, 0x80);
+        write_reg(&mut margo, REG_CURSOR_ADDR, addr);
+        write_reg(&mut margo, REG_CURSOR_POS, 0);
+        write_reg(&mut margo, REG_CURSOR_FG, 0xf800); // pure red in R5G6B5
+        write_reg(&mut margo, REG_CURSOR_BG, 0x0000);
+        write_reg(&mut margo, REG_CURSOR_CTRL, 1);
+        let argb = margo.scanout_argb(&palette);
+        assert_eq!(argb[0], 0x00ff_0000); // FG decoded through the display format
+    }
+
+    #[test]
+    fn cursor_skips_an_off_store_bitmap_without_panic() {
+        let mut margo = Margo::default();
+        margo.set_mode_640x480x8();
+        let palette = [0u32; 256];
+        // CURSOR_ADDR within 4 bytes of the end of the store, so every plane read past
+        // it is off-store and skipped (transparent); must not panic or wrap.
+        let addr = (MARGO_VRAM_SIZE as u32) - 4;
+        write_reg(&mut margo, REG_CURSOR_ADDR, addr);
+        write_reg(&mut margo, REG_CURSOR_POS, 0);
+        write_reg(&mut margo, REG_CURSOR_FG, 0x30);
+        write_reg(&mut margo, REG_CURSOR_BG, 0x20);
+        write_reg(&mut margo, REG_CURSOR_CTRL, 1);
+        let argb = margo.scanout_argb(&palette);
+        assert_eq!(argb[0], 0x00); // nothing composited (all plane bytes off-store)
     }
 }
