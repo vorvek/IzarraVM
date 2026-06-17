@@ -631,6 +631,20 @@ impl DosKernel {
             }
             // AH=4Ch: terminate with the return code in AL.
             0x4c => Ok(DosAction::Exit((regs.ax & 0x00ff) as u8)),
+            // AH=33h: Ctrl-Break flag. ponytail stub: AL=00 (get) returns DL=0 (off);
+            // AL=01 (set) is accepted as a no-op. No INT 23h state is tracked yet.
+            0x33 => {
+                if regs.ax as u8 == 0x00 {
+                    regs.dx &= 0xff00; // DL = 0 (off)
+                }
+                Ok(DosAction::Continue)
+            }
+            // AH=0Eh: select default drive. ponytail stub: only C: exists, so report
+            // AL=1 logical drive and do not change the current drive.
+            0x0e => {
+                regs.ax = (regs.ax & 0xff00) | 0x01;
+                Ok(DosAction::Continue)
+            }
             // Other file functions (write, seek, find) and everything else are not
             // yet implemented; later slices fill them in. An unimplemented function
             // returns Continue so the IRET stub returns to the caller.
@@ -1859,5 +1873,31 @@ mod tests {
         kernel.dispatch(0x21, &mut get2, &mut mem).unwrap();
         assert_eq!(get2.es, 0x1234);
         assert_eq!(get2.bx, 0x5678);
+    }
+
+    #[test]
+    fn ah33_get_ctrl_break_returns_off() {
+        let mut mem = Memory::new(4096).unwrap();
+        let mut kernel = DosKernel::new();
+        let mut regs = DosRegs {
+            ax: 0x3300,
+            dx: 0xffff,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(regs.dx & 0xff, 0x00); // DL = 0 (Ctrl-Break checking off)
+    }
+
+    #[test]
+    fn ah0e_reports_one_drive() {
+        let mut mem = Memory::new(4096).unwrap();
+        let mut kernel = DosKernel::new();
+        let mut regs = DosRegs {
+            ax: 0x0e00,
+            dx: 0x0002,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(regs.ax & 0xff, 0x01); // AL = number of logical drives
     }
 }
