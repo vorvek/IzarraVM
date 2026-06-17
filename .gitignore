@@ -4,5 +4,6 @@
 /compatibility-output/
 /corpus-output/
 /dev_docs/
+/docs/superpowers/
 *.log
 *.tmp
