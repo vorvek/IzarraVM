@@ -28,6 +28,12 @@ pub struct SbDsp {
     playing: bool,
     irq_pending: bool,
     half_reached: bool,
+    // 16-bit DMA playback state (SB16 0xBx family). dma_16bit selects the word
+    // fetch and sample-depth path; stereo selects one vs. two words per frame;
+    // sample_signed selects signed vs. unsigned 16-bit conversion.
+    dma_16bit: bool,
+    stereo: bool,
+    sample_signed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -53,6 +59,9 @@ impl Default for SbDsp {
             playing: false,
             irq_pending: false,
             half_reached: false,
+            dma_16bit: false,
+            stereo: false,
+            sample_signed: false,
         }
     }
 }
@@ -82,6 +91,9 @@ impl SbDsp {
             0x40 => 1,        // set time constant (Task 5)
             0x41 => 2,        // set sample rate (Task 5)
             0x48 => 2,        // set block size (Task 5)
+            // The SB16 0xBx family (16-bit DMA output/input, single + auto-init)
+            // takes a mode byte plus a 2-byte transfer count.
+            0xB0..=0xBF => 3,
             _ => 0,
         }
     }
@@ -150,6 +162,7 @@ impl SbDsp {
             }
             0x14 | 0x90 => self.arm_dma(false),
             0x1C => self.arm_dma(true),
+            0xB0..=0xBF => self.arm_16bit(command, args),
             0xD0 => self.playing = false,   // halt DMA (position kept)
             0xD4 => self.playing = true,    // continue DMA
             0xDA => self.auto_init = false, // exit auto-init: stop at next TC
@@ -158,10 +171,41 @@ impl SbDsp {
     }
 
     fn arm_dma(&mut self, auto_init: bool) {
+        // 8-bit DMA is mono unsigned PCM: clear the 16-bit/stereo/signed latches.
+        self.dma_16bit = false;
+        self.stereo = false;
+        self.sample_signed = false;
         self.auto_init = auto_init;
         self.playing = true;
         self.block_remaining = self.block_size;
         self.half_reached = false;
+    }
+
+    /// Arm the SB16 16-bit DMA path from a 0xBx command (mode byte + 2-byte
+    /// count). The command's auto-init bit is bit2 (0x04); bit3 (0x08) selects
+    /// A/D input. Mode byte: bit5 (0x20) = stereo, bit4 (0x10) = signed. Input
+    /// commands arm nothing (ADC is out of scope).
+    fn arm_16bit(&mut self, command: u8, args: &[u8]) {
+        if command & 0x08 != 0 {
+            // A/D (input) command; out of scope, so do not arm playback.
+            return;
+        }
+        let auto_init = command & 0x04 != 0;
+        let mode = args.first().copied().unwrap_or(0);
+        let stereo = mode & 0x20 != 0;
+        let signed = mode & 0x10 != 0;
+        // Count is low byte then high byte, value n means n+1 16-bit samples.
+        let count_lo = u32::from(args.get(1).copied().unwrap_or(0));
+        let count_hi = u32::from(args.get(2).copied().unwrap_or(0));
+        let count = (count_lo | (count_hi << 8)) + 1;
+        self.dma_16bit = true;
+        self.stereo = stereo;
+        self.sample_signed = signed;
+        self.auto_init = auto_init;
+        self.block_size = count;
+        self.block_remaining = count;
+        self.half_reached = false;
+        self.playing = true;
     }
 
     pub fn rate_hz(&self) -> u32 {
@@ -176,18 +220,71 @@ impl SbDsp {
         self.auto_init
     }
 
+    /// Whether the armed DMA mode is the SB16 16-bit (0xBx) path.
+    pub fn is_16bit(&self) -> bool {
+        self.dma_16bit
+    }
+
+    /// Whether the armed DMA mode is stereo (two words per output frame).
+    pub fn is_stereo(&self) -> bool {
+        self.stereo
+    }
+
     pub fn block_remaining(&self) -> u32 {
         self.block_remaining
     }
 
-    /// Produce one output sample for the current DMA byte, or None if idle.
-    /// `fetch` pulls the next DMA byte (the machine feeds the 8237A through it).
-    pub fn render_sample<F: FnMut() -> Option<u8>>(&mut self, mut fetch: F) -> Option<i16> {
+    /// Produce one stereo output frame for the current DMA mode, or None if the
+    /// channel is idle. `byte_fetch` feeds the 8-bit DMA path and `word_fetch`
+    /// the 16-bit path; only the one matching the armed mode is pulled. Mono
+    /// modes duplicate their single sample to both channels. `block_remaining`
+    /// is decremented by the words consumed (1 for 8-bit and 16-bit mono, 2 for
+    /// 16-bit stereo), and the half/end-buffer IRQ is edged exactly as the 8-bit
+    /// path does.
+    pub fn render_frame<B, W>(&mut self, mut byte_fetch: B, mut word_fetch: W) -> Option<(i16, i16)>
+    where
+        B: FnMut() -> Option<u8>,
+        W: FnMut() -> Option<u16>,
+    {
         if !self.playing {
-            return self.direct_dac_byte.map(sample_u8);
+            if self.dma_16bit {
+                return None;
+            }
+            return self.direct_dac_byte.map(|b| {
+                let s = sample_u8(b);
+                (s, s)
+            });
         }
-        let byte = fetch()?;
-        self.block_remaining = self.block_remaining.saturating_sub(1);
+        if self.dma_16bit {
+            let left = self.sample_word(word_fetch()?);
+            let right = if self.stereo {
+                self.sample_word(word_fetch()?)
+            } else {
+                left
+            };
+            let words = if self.stereo { 2 } else { 1 };
+            self.advance_block(words);
+            Some((left, right))
+        } else {
+            let s = sample_u8(byte_fetch()?);
+            self.advance_block(1);
+            Some((s, s))
+        }
+    }
+
+    /// Convert one 16-bit DMA word per the armed sample format.
+    fn sample_word(&self, word: u16) -> i16 {
+        if self.sample_signed {
+            sample_i16(word)
+        } else {
+            sample_u16(word)
+        }
+    }
+
+    /// Decrement the block counter by `consumed` words and edge the half and
+    /// end-of-buffer IRQs. Shared by the 8-bit and 16-bit render paths.
+    fn advance_block(&mut self, consumed: u32) {
+        self.block_remaining = self.block_remaining.saturating_sub(consumed);
         // Half-buffer IRQ fires once, at the block midpoint.
         if !self.half_reached && self.block_remaining <= self.block_size / 2 {
             self.half_reached = true;
@@ -203,7 +300,13 @@ impl SbDsp {
                 self.playing = false;
             }
         }
-        Some(sample_u8(byte))
+    }
+
+    /// Mono wrapper over [`render_frame`] for the 8-bit path (kept so the 8-bit
+    /// unit tests stay green). Returns the single channel duplicated L/R as one
+    /// i16.
+    pub fn render_sample<F: FnMut() -> Option<u8>>(&mut self, mut fetch: F) -> Option<i16> {
+        self.render_frame(&mut fetch, || None).map(|(l, _)| l)
     }
 
     /// Take and clear a pending half/end IRQ (cleared when the host reads 0x22E).
@@ -225,7 +328,14 @@ impl SbDsp {
                 self.data_available = !self.read_data.is_empty();
                 Some(byte)
             }
-            0x22E => Some(if self.data_available { 0x80 } else { 0x00 }),
+            // 0x22E is the 8-bit read-buffer status port and the 8-bit DMA
+            // interrupt-acknowledge port; 0x22F is its 16-bit counterpart. Only
+            // one DMA mode runs at a time, so a read of either status port clears
+            // the single pending half/end IRQ.
+            0x22E | 0x22F => {
+                self.irq_pending = false;
+                Some(if self.data_available { 0x80 } else { 0x00 })
+            }
             _ => None,
         }
     }
@@ -256,6 +366,19 @@ impl SbDsp {
 /// 16-bit value for the mixer: (byte - 128) * 256.
 fn sample_u8(byte: u8) -> i16 {
     (i32::from(byte) - 128).clamp(-128, 127) as i16 * 256
+}
+
+/// Convert one signed 16-bit DMA sample directly (no centering): the SB16 16-bit
+/// path is already signed PCM, so the bit pattern maps straight to i16.
+fn sample_i16(word: u16) -> i16 {
+    word as i16
+}
+
+/// Convert one unsigned 16-bit DMA sample (rare, mode-byte-selected) by
+/// re-centering around 0x8000: the upper half (>= 0x8000) maps to 0..=32767 and
+/// the lower half wraps to -32768..=-1.
+fn sample_u16(word: u16) -> i16 {
+    word.wrapping_sub(0x8000) as i16
 }
 
 #[cfg(test)]
@@ -393,5 +516,100 @@ mod tests {
         assert_eq!(sample_u8(0x00), -32_768, "0x00 -> full negative");
         assert_eq!(sample_u8(0x80), 0, "0x80 -> silence");
         assert_eq!(sample_u8(0xFF), 32_512, "0xFF -> near full positive");
+    }
+
+    #[test]
+    fn sb16_16bit_auto_init_command_arms_with_mode_and_count() {
+        let mut dsp = SbDsp::default();
+        write_cmd(&mut dsp, &[0x41, 0x2B, 0x11]); // 11025 Hz
+        // 0xB6 = 16-bit auto-init output; mode 0x30 = signed, stereo; count 7 -> 8 samples.
+        write_cmd(&mut dsp, &[0xB6, 0x30, 0x07, 0x00]);
+        assert!(dsp.is_playing() && dsp.is_auto_init());
+        assert!(dsp.is_16bit());
+        assert!(dsp.is_stereo());
+        assert_eq!(dsp.block_remaining(), 8);
+    }
+
+    #[test]
+    fn sb16_16bit_single_command_arms_non_auto_init() {
+        let mut dsp = SbDsp::default();
+        write_cmd(&mut dsp, &[0xB0, 0x00, 0x01, 0x00]); // single, mono, unsigned, count 2
+        assert!(dsp.is_16bit());
+        assert!(!dsp.is_stereo());
+        assert!(!dsp.is_auto_init());
+        assert_eq!(dsp.block_remaining(), 2);
+    }
+
+    #[test]
+    fn sb16_16bit_input_command_arms_nothing() {
+        // 0xB8 is the 16-bit A/D (input) command; ADC is out of scope, so it must
+        // not arm playback even with well-formed arguments.
+        let mut dsp = SbDsp::default();
+        write_cmd(&mut dsp, &[0xB8, 0x30, 0x07, 0x00]);
+        assert!(!dsp.is_playing());
+        assert!(!dsp.is_16bit());
+    }
+
+    #[test]
+    fn render_frame_16bit_signed_stereo_consumes_two_words() {
+        let mut dsp = SbDsp::default();
+        write_cmd(&mut dsp, &[0x41, 0x2B, 0x11]); // 11025 Hz
+        // auto-init, signed, stereo, count 7 -> 8 samples = 4 stereo frames.
+        write_cmd(&mut dsp, &[0xB6, 0x30, 0x07, 0x00]);
+        let words = [
+            0x0001u16, 0xFFFE, 0x7FFF, 0x8000, 0x0001, 0xFFFE, 0x7FFF, 0x8000,
+        ];
+        let mut i = 0;
+        let mut frames = Vec::new();
+        for _ in 0..4 {
+            let f = dsp.render_frame(
+                || panic!("8-bit fetch unused in 16-bit mode"),
+                || {
+                    let w = words[i % words.len()];
+                    i += 1;
+                    Some(w)
+                },
+            );
+            frames.push(f);
+        }
+        assert_eq!(frames[0], Some((1, -2)), "signed little-endian L,R");
+        assert!(dsp.is_playing(), "auto-init continues past TC");
+    }
+
+    #[test]
+    fn render_frame_16bit_mono_duplicates_one_word_to_both_channels() {
+        let mut dsp = SbDsp::default();
+        // single, mono, signed: 0xB0 with mode 0x10 (bit4 = signed, bit5 clear = mono).
+        write_cmd(&mut dsp, &[0xB0, 0x10, 0x01, 0x00]); // count 2 words
+        let f = dsp.render_frame(
+            || panic!("8-bit fetch unused in 16-bit mode"),
+            || Some(0x7FFF),
+        );
+        assert_eq!(f, Some((32_767, 32_767)), "mono duplicates the word L/R");
+    }
+
+    #[test]
+    fn render_frame_8bit_mono_duplicated_to_both_channels() {
+        let mut dsp = SbDsp::default();
+        write_cmd(&mut dsp, &[0x41, 0x2B, 0x11, 0x48, 0x01, 0x00, 0x14]); // 8-bit mono single
+        let f = dsp.render_frame(|| Some(0x80), || panic!("word fetch unused in 8-bit mode"));
+        assert_eq!(f, Some((0, 0)), "0x80 -> silence on both channels");
+    }
+
+    #[test]
+    fn reading_0x22f_acks_the_16bit_irq() {
+        let mut dsp = SbDsp::default();
+        write_cmd(&mut dsp, &[0x41, 0x2B, 0x11, 0xB6, 0x30, 0x00, 0x00]); // count 1
+        let mut w = 0u16;
+        let _ = dsp.render_frame(
+            || None,
+            || {
+                w = w.wrapping_add(1);
+                Some(w)
+            },
+        );
+        // end-of-buffer IRQ pending; 0x22F acks it.
+        dsp.read_port(0x22F);
+        assert!(!dsp.take_irq(), "0x22F cleared the pending IRQ");
     }
 }
