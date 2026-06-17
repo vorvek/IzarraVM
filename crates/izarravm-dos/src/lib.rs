@@ -507,6 +507,24 @@ pub fn load_exe(
     })
 }
 
+/// Load a .COM or .EXE by signature and build its PSP. Real DOS detects the
+/// format by the "MZ" word at the start of the image, not the file extension.
+/// `psp_segment` is where the PSP goes; a .COM loads its code at psp_segment:0x100,
+/// an .EXE loads its module at (psp_segment + 0x10):0.
+pub fn load_program(
+    image: &[u8],
+    mem: &mut Memory,
+    psp_segment: u16,
+) -> Result<ProgramEntry, DosError> {
+    // ponytail: detect "MZ" only; the rare "ZM" alternate signature is treated
+    // as a .COM (no real DOS game ships "ZM").
+    if image.len() >= 2 && image[0] == b'M' && image[1] == b'Z' {
+        load_exe(image, mem, psp_segment)
+    } else {
+        load_com(image, mem, psp_segment)
+    }
+}
+
 /// Set the DOS error return convention: CF=1 and AX = the DOS error code.
 fn set_dos_error(regs: &mut DosRegs, code: u16) {
     regs.cf = true;
@@ -1167,5 +1185,38 @@ mod tests {
             load_exe(&image, &mut mem, 0x100),
             Err(DosError::ExeImageTruncated(_))
         ));
+    }
+
+    #[test]
+    fn load_program_routes_exe_by_signature() {
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let image = build_mz(
+            &[0u8; 16],
+            &[],
+            0x0002,
+            0x0010,
+            0x0001,
+            0x0200,
+            0x10,
+            0xffff,
+        );
+        let entry = load_program(&image, &mut mem, 0x0100).unwrap();
+        // EXE: CS and DS are distinct segments; DS is the PSP.
+        assert_ne!(entry.cs, entry.ds);
+        assert_eq!(entry.ds, 0x0100);
+    }
+
+    #[test]
+    fn load_program_routes_com_when_no_mz() {
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let image = [0xb8, 0x00, 0x4c, 0xcd, 0x21]; // mov ax,4c00; int 21 (no MZ)
+        let entry = load_program(&image, &mut mem, 0x0100).unwrap();
+        // COM: all six entry fields equal the one load segment.
+        assert_eq!(entry.cs, 0x0100);
+        assert_eq!(entry.ds, 0x0100);
+        assert_eq!(entry.ss, 0x0100);
+        assert_eq!(entry.es, 0x0100);
+        assert_eq!(entry.ip, 0x0100);
+        assert_eq!(entry.sp, 0xfffe);
     }
 }
