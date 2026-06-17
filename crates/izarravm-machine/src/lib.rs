@@ -1,4 +1,4 @@
-use izarravm_audio::{OplChip, Resampler};
+use izarravm_audio::{OplChip, Resampler, SbDsp};
 use izarravm_bus::{BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CpuBus, Memory};
 use izarravm_core::{CpuPreset, HardwareProfile, VideoCard};
 use izarravm_cpu::{Cpu386, CpuError, SegmentIndex, SegmentRegister};
@@ -142,6 +142,9 @@ pub struct Machine {
     opl: OplChip,
     resampler: Resampler,
     opl_micros: f64, // fractional microseconds owed to the OPL timers
+    dsp: SbDsp,
+    dsp_resampler: Resampler,
+    dsp_micros: f64, // fractional microseconds owed to the DSP reset-settle clock
     margo_ns: f64,   // fractional nanoseconds owed to the Margo busy countdown
     vga_dots: f64,   // fractional VGA dot clocks owed to the beam advance
     trace: BusTrace,
@@ -174,6 +177,10 @@ impl Machine {
             opl: OplChip::default(),
             resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             opl_micros: 0.0,
+            dsp: SbDsp::default(),
+            // The DSP resampler is rebuilt when the programmed rate changes.
+            dsp_resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
+            dsp_micros: 0.0,
             margo_ns: 0.0,
             vga_dots: 0.0,
             trace: BusTrace::default(),
@@ -217,6 +224,10 @@ impl Machine {
             opl: OplChip::default(),
             resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             opl_micros: 0.0,
+            dsp: SbDsp::default(),
+            // The DSP resampler is rebuilt when the programmed rate changes.
+            dsp_resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
+            dsp_micros: 0.0,
             margo_ns: 0.0,
             vga_dots: 0.0,
             trace: BusTrace::default(),
@@ -278,6 +289,10 @@ impl Machine {
             opl: OplChip::default(),
             resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             opl_micros: 0.0,
+            dsp: SbDsp::default(),
+            // The DSP resampler is rebuilt when the programmed rate changes.
+            dsp_resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
+            dsp_micros: 0.0,
             margo_ns: 0.0,
             vga_dots: 0.0,
             trace: BusTrace::default(),
@@ -361,6 +376,7 @@ impl Machine {
             pit: &mut self.pit,
             dma: &mut self.dma,
             opl: &mut self.opl,
+            dsp: &mut self.dsp,
             trace: &mut self.trace,
             pending_soft_int: &mut self.pending_soft_int,
             wait_states: self.profile.wait_states,
@@ -682,6 +698,14 @@ impl Machine {
         self.opl.advance_micros(whole as u64);
         self.opl_micros -= whole;
 
+        // The DSP reset-settle countdown advances with emulated time so a
+        // detection routine's delay loop sees 0xAA become available. The
+        // playback sample clock is paced by render_audio, not here.
+        self.dsp_micros += clocks as f64 * 1_000_000.0 / self.profile.clock_hz as f64;
+        let whole = self.dsp_micros.floor();
+        self.dsp.advance_micros(whole);
+        self.dsp_micros -= whole;
+
         self.pit_clocks += clocks as f64 * f64::from(PIT_INPUT_HZ) / self.profile.clock_hz as f64;
         let whole = self.pit_clocks.floor();
         self.pit_clocks -= whole;
@@ -726,6 +750,13 @@ impl Machine {
     /// sound slice feeds this to the SB16 DSP for 8-bit playback.
     pub fn dma_read_byte(&mut self, channel: usize) -> Option<u8> {
         self.dma.read_byte(channel, &mut self.memory)
+    }
+
+    /// Advance the DSP reset-settle clock by `micros` microseconds. The run loop
+    /// drives this from CPU clocks in advance_devices; this exposes it directly
+    /// so a reset-detection golden can settle the DSP without running the CPU.
+    pub fn advance_dsp_micros(&mut self, micros: u64) {
+        self.dsp.advance_micros(micros as f64);
     }
 
     /// Drive a PIT counter's GATE line. The PC ties GATE0/GATE1 high; the sound
@@ -794,6 +825,7 @@ impl Machine {
                     pit,
                     dma,
                     opl,
+                    dsp,
                     trace,
                     pending_soft_int,
                     ..
@@ -809,6 +841,7 @@ impl Machine {
                     pit,
                     dma,
                     opl,
+                    dsp,
                     trace,
                     pending_soft_int,
                     wait_states: profile.wait_states,
@@ -869,6 +902,7 @@ struct MachineBus<'a> {
     pit: &'a mut pit::Pit,
     dma: &'a mut dma::DmaController,
     opl: &'a mut OplChip,
+    dsp: &'a mut SbDsp,
     trace: &'a mut BusTrace,
     pending_soft_int: &'a mut Option<u8>,
     wait_states: WaitStateProfile,
@@ -971,6 +1005,9 @@ impl CpuBus for MachineBus<'_> {
             // The chip drives only the status byte on reads; data ports read open-bus.
             return Ok(u32::from(self.opl.read_port(opl_port).unwrap_or(0xff)));
         }
+        if let Some(value) = self.dsp.read_port(port) {
+            return Ok(u32::from(value));
+        }
         if let Some(value) = self.pit.read_port(port) {
             return Ok(u32::from(value));
         }
@@ -1000,6 +1037,9 @@ impl CpuBus for MachineBus<'_> {
 
         if let Some(opl_port) = opl_port(port) {
             self.opl.write_port(opl_port, value as u8);
+            return Ok(());
+        }
+        if self.dsp.write_port(port, value as u8) {
             return Ok(());
         }
         if self.dma.write_port(port, value as u8) {
@@ -1712,6 +1752,41 @@ mod tests {
         assert_eq!(byte, 0x77);
     }
 
+    #[test]
+    fn sb_dsp_reset_handshake_through_the_bus() {
+        let mut machine = test_machine();
+        // Reset: write 1, then 0 to the DSP reset port 0x226.
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x226, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x226, BusWidth::Byte, 0x00).unwrap();
+        });
+        // Advance emulated time past the ~100us DSP settle window.
+        machine.advance_dsp_micros(200);
+        let status = with_bus(&mut machine, |bus| {
+            u8::try_from(bus.read_io(0x22E, BusWidth::Byte).unwrap()).unwrap()
+        });
+        assert_eq!(status & 0x80, 0x80, "data available after reset");
+        let ack = with_bus(&mut machine, |bus| {
+            u8::try_from(bus.read_io(0x22A, BusWidth::Byte).unwrap()).unwrap()
+        });
+        assert_eq!(ack, 0xAA);
+    }
+
+    #[test]
+    fn sb_dsp_version_and_status_route_through_the_bus() {
+        let mut machine = test_machine();
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x22C, BusWidth::Byte, 0xE1).unwrap(); // read version
+        });
+        let hi = with_bus(&mut machine, |bus| {
+            u8::try_from(bus.read_io(0x22A, BusWidth::Byte).unwrap()).unwrap()
+        });
+        let lo = with_bus(&mut machine, |bus| {
+            u8::try_from(bus.read_io(0x22A, BusWidth::Byte).unwrap()).unwrap()
+        });
+        assert_eq!([hi, lo], [4, 5]);
+    }
+
     // Run one closure against a freshly-borrowed bus over the whole machine.
     fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R {
         let mut bus = MachineBus {
@@ -1725,6 +1800,7 @@ mod tests {
             pit: &mut machine.pit,
             dma: &mut machine.dma,
             opl: &mut machine.opl,
+            dsp: &mut machine.dsp,
             trace: &mut machine.trace,
             pending_soft_int: &mut machine.pending_soft_int,
             wait_states: machine.profile.wait_states,
