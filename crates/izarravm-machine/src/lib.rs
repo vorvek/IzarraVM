@@ -110,6 +110,8 @@ const OPL_NATIVE_HZ: u32 = 49_716;
 const DAC_HZ: u32 = 44_100;
 /// Standard PC PIT input clock frequency.
 const PIT_INPUT_HZ: u32 = 1_193_182;
+/// VGA 25.175 MHz dot clock (standard 640x480 and related modes).
+const VGA_DOT_HZ: u64 = 25_175_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveDisplay {
@@ -138,6 +140,7 @@ pub struct Machine {
     resampler: Resampler,
     opl_micros: f64, // fractional microseconds owed to the OPL timers
     margo_ns: f64,   // fractional nanoseconds owed to the Margo busy countdown
+    vga_dots: f64,   // fractional VGA dot clocks owed to the beam advance
     trace: BusTrace,
     elapsed_clocks: u64,
 }
@@ -168,6 +171,7 @@ impl Machine {
             resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             opl_micros: 0.0,
             margo_ns: 0.0,
+            vga_dots: 0.0,
             trace: BusTrace::default(),
             elapsed_clocks: 0,
         };
@@ -209,6 +213,7 @@ impl Machine {
             resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             opl_micros: 0.0,
             margo_ns: 0.0,
+            vga_dots: 0.0,
             trace: BusTrace::default(),
             elapsed_clocks: 0,
         };
@@ -266,6 +271,7 @@ impl Machine {
             resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             opl_micros: 0.0,
             margo_ns: 0.0,
+            vga_dots: 0.0,
             trace: BusTrace::default(),
             elapsed_clocks: 0,
         };
@@ -363,6 +369,14 @@ impl Machine {
 
     pub fn margo_mut(&mut self) -> &mut Margo {
         &mut self.margo
+    }
+
+    pub fn video(&self) -> &Vga {
+        &self.video
+    }
+
+    pub fn set_vga_mode_0dh(&mut self) {
+        self.video.set_mode_0dh();
     }
 
     /// Service the host side of an `INT 10h` after the instruction retires.
@@ -583,6 +597,11 @@ impl Machine {
         let whole_ns = self.margo_ns.floor();
         self.margo.advance_busy(whole_ns as u64);
         self.margo_ns -= whole_ns;
+
+        self.vga_dots += clocks as f64 * VGA_DOT_HZ as f64 / self.profile.clock_hz as f64;
+        let whole = self.vga_dots.floor();
+        self.video.advance(whole as u64);
+        self.vga_dots -= whole;
     }
 
     /// Render `native_samples` of OPL3 output at 49716 Hz and return the
@@ -2051,5 +2070,18 @@ mod tests {
         assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
         machine.advance_devices(1);
         assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 0);
+    }
+
+    #[test]
+    fn machine_advances_the_vga_beam_with_cpu_clocks() {
+        let mut machine = test_machine();
+        machine.set_vga_mode_0dh();
+        let before = machine.video().beam_dots();
+        // 10 000 CPU clocks at 25 MHz with a 25.175 MHz dot clock advances
+        // roughly 10 070 dots — well above zero.
+        machine.advance_devices(10_000);
+        assert!(
+            machine.video().beam_dots() != before || machine.video().frames_completed() > 0
+        );
     }
 }
