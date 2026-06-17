@@ -1,12 +1,13 @@
 //! Margo, the VEGA 2D engine: the display register block, the linear frame
 //! buffer, and the blit engine. The engine implements FILL, COPY, color expand,
 //! LINE, and PATTERN_FILL, all with full ROP3 and rectangle clipping, plus a
-//! display-path hardware cursor, a scaled YUV video overlay, and a DMA command pusher.
+//! display-path hardware cursor, a scaled YUV video overlay, a DMA command pusher, and
+//! hardware dithering.
 
 pub const MARGO_VRAM_SIZE: usize = 4 * 1024 * 1024;
 pub const MARGO_MMIO_SIZE: usize = 0x0001_0000; // 64 KB register block
 pub const MARGO_ID_VALUE: u32 = 0x4D47_0100; // 'M' 'G', version 1.00
-pub const MARGO_CAPS_VALUE: u32 = 0x0000_07ff; // bits 0 FILL, 1 COPY, 2 COLOR_EXPAND, 3 LINE, 4 ROP3, 5 CLIP, 6 COLORKEY, 7 PATTERN_FILL, 8 CURSOR, 9 OVERLAY, 10 PUSHER
+pub const MARGO_CAPS_VALUE: u32 = 0x0000_0fff; // bits 0 FILL, 1 COPY, 2 COLOR_EXPAND, 3 LINE, 4 ROP3, 5 CLIP, 6 COLORKEY, 7 PATTERN_FILL, 8 CURSOR, 9 OVERLAY, 10 PUSHER, 11 DITHER
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VbeMode {
@@ -2039,8 +2040,8 @@ mod tests {
     fn caps_reports_all_implemented_features() {
         let margo = Margo::default();
         // bits 0 FILL, 1 COPY, 2 COLOR_EXPAND, 3 LINE, 4 full ROP3, 5 CLIP, 6 COLORKEY,
-        // 7 PATTERN_FILL, 8 CURSOR, 9 OVERLAY, 10 PUSHER.
-        assert_eq!(read_reg_u32(&margo, REG_CAPS), 0x0000_07ff);
+        // 7 PATTERN_FILL, 8 CURSOR, 9 OVERLAY, 10 PUSHER, 11 DITHER.
+        assert_eq!(read_reg_u32(&margo, REG_CAPS), 0x0000_0fff);
     }
 
     #[test]
