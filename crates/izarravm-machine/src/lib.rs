@@ -2822,4 +2822,44 @@ mod tests {
         assert_eq!(machine.read_physical_u8(0x000A_0000 + 5), 0x9C);
         assert_eq!(machine.read_physical_u8(0x000A_0000 + 0xFB00), 0x3C);
     }
+
+    #[test]
+    fn mode_x_320x240_through_the_machine() {
+        let mut machine = test_machine();
+        // Mode 13h, then unchained mode X.
+        machine.video_mut().set_mode13h();
+        machine.video_mut().write_port(0x3C4, 0x04);
+        machine.video_mut().write_port(0x3C5, 0x06);
+        // Abrash's 320x240 vertical timing through the CRTC ports.
+        for (idx, val) in [
+            (0x06u8, 0x0Du8),
+            (0x07, 0x3E),
+            (0x09, 0x41),
+            (0x10, 0xEA),
+            (0x11, 0xAC),
+            (0x12, 0xDF),
+            (0x15, 0xE7),
+            (0x16, 0x06),
+        ] {
+            machine.video_mut().write_port(0x3D4, idx);
+            machine.video_mut().write_port(0x3D5, val);
+        }
+        // Draw a pixel at column 6: plane 6 & 3 = 2, plane offset 6 >> 2 = 1.
+        machine.video_mut().write_port(0x3C4, 0x02);
+        machine.video_mut().write_port(0x3C5, 0x04); // map mask = plane 2
+        machine.video_mut().write_port(0x3CE, 0x08);
+        machine.video_mut().write_port(0x3CF, 0xFF); // bit mask 0xFF
+        machine.write_physical_u8(0x000A_0000 + 1, 0x2A); // plane 2, offset 1
+        // Complete a frame (mode-X 320x240 frame is ~421 600 dots; 500 000 clocks is
+        // ~503 500 dots, enough to cross one frame and present).
+        machine.advance_devices(500_000);
+        let raster = machine.vga_raster().expect("a frame presented");
+        assert_eq!(raster.width, 320);
+        assert_eq!(raster.height, 527, "320x240 vertical total");
+        // Column 6 of row 0 scans out the drawn 0x2A, as the 8-bit DAC index directly.
+        assert_eq!(
+            raster.pixels[6], 0x2A,
+            "mode-X pixel scans out at its column with its full 8-bit value"
+        );
+    }
 }
