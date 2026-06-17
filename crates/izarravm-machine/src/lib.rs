@@ -3021,6 +3021,178 @@ mod tests {
     }
 
     #[test]
+    fn overlay_color_key_gates_on_the_primary_pixel() {
+        let mut machine = test_machine();
+        machine.margo_mut().set_mode(0x14a); // 640x480x32, pitch 2560
+        // Primary at (10, 20) holds the key; (11, 20) holds an occluding window pixel.
+        let key = 0x0011_2233u32;
+        let occluder = 0x0044_5566u32;
+        let p0 = 20 * 2560 + 10 * 4;
+        let p1 = 20 * 2560 + 11 * 4;
+        for (i, b) in key.to_le_bytes().into_iter().enumerate() {
+            machine.write_physical_u8(MARGO_LFB_BASE + p0 + i as u32, b);
+        }
+        for (i, b) in occluder.to_le_bytes().into_iter().enumerate() {
+            machine.write_physical_u8(MARGO_LFB_BASE + p1 + i as u32, b);
+        }
+        // YUY2 source: Y0=235 (white), Y1=16 (black).
+        let src = 0x0020_0000u32;
+        machine.write_physical_u8(MARGO_LFB_BASE + src, 235);
+        machine.write_physical_u8(MARGO_LFB_BASE + src + 1, 128);
+        machine.write_physical_u8(MARGO_LFB_BASE + src + 2, 16);
+        machine.write_physical_u8(MARGO_LFB_BASE + src + 3, 128);
+
+        write_mmio_reg(&mut machine, 0x44, src);
+        write_mmio_reg(&mut machine, 0x48, 4);
+        write_mmio_reg(&mut machine, 0x4c, (1 << 16) | 2);
+        write_mmio_reg(&mut machine, 0x58, (20 << 16) | 10);
+        write_mmio_reg(&mut machine, 0x5c, (1 << 16) | 2);
+        write_mmio_reg(&mut machine, 0x60, key); // OVL_COLORKEY
+        write_mmio_reg(&mut machine, 0x40, 1 | (1 << 3)); // ENABLE + KEY_EN, FORMAT YUY2
+
+        let palette = machine.palette_argb();
+        let argb = machine.margo().scanout_argb(&palette);
+        // Where the primary equals the key, the overlay shows (white).
+        assert_eq!(argb[20 * 640 + 10], 0x00ff_ffff);
+        // Where another value occludes the key, the overlay is hidden and the
+        // decoded primary pixel (0x00445566 in X8R8G8B8) remains.
+        assert_eq!(argb[20 * 640 + 11], 0x0044_5566);
+    }
+
+    #[test]
+    fn overlay_yuy2_composites_through_the_apertures() {
+        let mut machine = test_machine();
+        machine.margo_mut().set_mode(0x14a); // 640x480x32
+        // One YUY2 group offscreen (2 MiB in, past the 32bpp visible surface):
+        // Y0=235 (white), U=128, Y1=16 (black), V=128. Byte order Y0, U, Y1, V.
+        let src = 0x0020_0000u32;
+        machine.write_physical_u8(MARGO_LFB_BASE + src, 235);
+        machine.write_physical_u8(MARGO_LFB_BASE + src + 1, 128);
+        machine.write_physical_u8(MARGO_LFB_BASE + src + 2, 16);
+        machine.write_physical_u8(MARGO_LFB_BASE + src + 3, 128);
+
+        write_mmio_reg(&mut machine, 0x44, src); // OVL_SRC_Y (packed surface)
+        write_mmio_reg(&mut machine, 0x48, 4); // OVL_SRC_PITCH
+        write_mmio_reg(&mut machine, 0x4c, (1 << 16) | 2); // OVL_SRC_DIM: w=2, h=1
+        write_mmio_reg(&mut machine, 0x58, (20 << 16) | 10); // OVL_DST_XY: x=10, y=20
+        write_mmio_reg(&mut machine, 0x5c, (1 << 16) | 2); // OVL_DST_DIM: w=2, h=1 (1:1)
+        write_mmio_reg(&mut machine, 0x40, 1); // OVL_CTRL: ENABLE, FORMAT YUY2, no key
+
+        let palette = machine.palette_argb();
+        let argb = machine.margo().scanout_argb(&palette);
+        assert_eq!(argb[20 * 640 + 10], 0x00ff_ffff); // Y0 -> white
+        assert_eq!(argb[20 * 640 + 11], 0x0000_0000); // Y1 -> black
+    }
+
+    #[test]
+    fn overlay_scales_by_point_sampling() {
+        let mut machine = test_machine();
+        machine.margo_mut().set_mode(0x14a);
+        // The same one YUY2 group, scaled 2x horizontally: dst width 4.
+        let src = 0x0020_0000u32;
+        machine.write_physical_u8(MARGO_LFB_BASE + src, 235);
+        machine.write_physical_u8(MARGO_LFB_BASE + src + 1, 128);
+        machine.write_physical_u8(MARGO_LFB_BASE + src + 2, 16);
+        machine.write_physical_u8(MARGO_LFB_BASE + src + 3, 128);
+
+        write_mmio_reg(&mut machine, 0x44, src);
+        write_mmio_reg(&mut machine, 0x48, 4);
+        write_mmio_reg(&mut machine, 0x4c, (1 << 16) | 2); // src w=2, h=1
+        write_mmio_reg(&mut machine, 0x58, (20 << 16) | 10);
+        write_mmio_reg(&mut machine, 0x5c, (1 << 16) | 4); // dst w=4, h=1 (2x)
+        write_mmio_reg(&mut machine, 0x40, 1);
+
+        let palette = machine.palette_argb();
+        let argb = machine.margo().scanout_argb(&palette);
+        // sx = dx * src_w / dst_w = dx * 2 / 4 = dx / 2:
+        // dst 0,1 sample src pixel 0 (white); dst 2,3 sample src pixel 1 (black).
+        assert_eq!(argb[20 * 640 + 10], 0x00ff_ffff);
+        assert_eq!(argb[20 * 640 + 11], 0x00ff_ffff);
+        assert_eq!(argb[20 * 640 + 12], 0x0000_0000);
+        assert_eq!(argb[20 * 640 + 13], 0x0000_0000);
+    }
+
+    #[test]
+    fn overlay_yv12_upsamples_chroma_through_the_apertures() {
+        let mut machine = test_machine();
+        machine.margo_mut().set_mode(0x14a); // 640x480x32
+        // YV12 source, 2x2. Y plane (pitch 2): [16, 235; 16, 235]. A single shared
+        // chroma sample (U=128, V=255) covers the whole 2x2 block (4:2:0 upsample).
+        let yp = 0x0020_0000u32;
+        let up = 0x0020_1000u32;
+        let vp = 0x0020_2000u32;
+        machine.write_physical_u8(MARGO_LFB_BASE + yp, 16); // (0,0)
+        machine.write_physical_u8(MARGO_LFB_BASE + yp + 1, 235); // (1,0)
+        machine.write_physical_u8(MARGO_LFB_BASE + yp + 2, 16); // (0,1)
+        machine.write_physical_u8(MARGO_LFB_BASE + yp + 3, 235); // (1,1)
+        machine.write_physical_u8(MARGO_LFB_BASE + up, 128); // U plane
+        machine.write_physical_u8(MARGO_LFB_BASE + vp, 255); // V plane
+
+        write_mmio_reg(&mut machine, 0x44, yp); // OVL_SRC_Y
+        write_mmio_reg(&mut machine, 0x48, 2); // OVL_SRC_PITCH (Y plane)
+        write_mmio_reg(&mut machine, 0x4c, (2 << 16) | 2); // OVL_SRC_DIM: 2x2
+        write_mmio_reg(&mut machine, 0x50, up); // OVL_SRC_U
+        write_mmio_reg(&mut machine, 0x54, vp); // OVL_SRC_V
+        write_mmio_reg(&mut machine, 0x58, (20 << 16) | 10); // OVL_DST_XY
+        write_mmio_reg(&mut machine, 0x5c, (2 << 16) | 2); // OVL_DST_DIM: 2x2 (1:1)
+        write_mmio_reg(&mut machine, 0x40, 1 | (1 << 1)); // ENABLE + FORMAT YV12
+
+        let palette = machine.palette_argb();
+        let argb = machine.margo().scanout_argb(&palette);
+        // Y=16 with (U=128, V=255) -> 0x00cb0000; Y=235 -> 0x00ff98ff. The same
+        // chroma sample applies across the 2x2 block.
+        assert_eq!(argb[20 * 640 + 10], 0x00cb_0000);
+        assert_eq!(argb[20 * 640 + 11], 0x00ff_98ff);
+        assert_eq!(argb[21 * 640 + 10], 0x00cb_0000);
+        assert_eq!(argb[21 * 640 + 11], 0x00ff_98ff);
+    }
+
+    #[test]
+    fn overlay_yv12_chroma_traversal_addresses_each_cell() {
+        let mut machine = test_machine();
+        machine.margo_mut().set_mode(0x14a); // 640x480x32
+        // 4x4 YV12 source with a flat Y of 128, so each output pixel's color is set
+        // solely by which 2x2 chroma cell it samples. The 2x2 chroma grid (chroma
+        // pitch = Y pitch / 2 = 2) holds a distinct (U, V) per cell, so this proves
+        // cx = sx/2, cy = sy/2, and the chroma-plane stride, which the 2x2 test (only
+        // cell 0,0) does not exercise.
+        let yp = 0x0020_0000u32;
+        let up = 0x0020_1000u32;
+        let vp = 0x0020_2000u32;
+        for i in 0..16u32 {
+            machine.write_physical_u8(MARGO_LFB_BASE + yp + i, 128);
+        }
+        // Chroma cells indexed cy * 2 + cx.
+        let us = [128u8, 128, 255, 255];
+        let vs = [128u8, 255, 128, 255];
+        for i in 0..4u32 {
+            machine.write_physical_u8(MARGO_LFB_BASE + up + i, us[i as usize]);
+            machine.write_physical_u8(MARGO_LFB_BASE + vp + i, vs[i as usize]);
+        }
+
+        write_mmio_reg(&mut machine, 0x44, yp); // OVL_SRC_Y
+        write_mmio_reg(&mut machine, 0x48, 4); // OVL_SRC_PITCH (Y plane)
+        write_mmio_reg(&mut machine, 0x4c, (4 << 16) | 4); // OVL_SRC_DIM: 4x4
+        write_mmio_reg(&mut machine, 0x50, up); // OVL_SRC_U
+        write_mmio_reg(&mut machine, 0x54, vp); // OVL_SRC_V
+        write_mmio_reg(&mut machine, 0x58, (20 << 16) | 10); // OVL_DST_XY
+        write_mmio_reg(&mut machine, 0x5c, (4 << 16) | 4); // OVL_DST_DIM: 4x4 (1:1)
+        write_mmio_reg(&mut machine, 0x40, 1 | (1 << 1)); // ENABLE + FORMAT YV12
+
+        let palette = machine.palette_argb();
+        let argb = machine.margo().scanout_argb(&palette);
+        // Cell (0,0) U=128 V=128 -> gray; two pixels in the same cell share it.
+        assert_eq!(argb[20 * 640 + 10], 0x0082_8282);
+        assert_eq!(argb[21 * 640 + 11], 0x0082_8282);
+        // Cell (1,0) U=128 V=255.
+        assert_eq!(argb[20 * 640 + 12], 0x00ff_1b82);
+        // Cell (0,1) U=255 V=128.
+        assert_eq!(argb[22 * 640 + 10], 0x0082_51ff);
+        // Cell (1,1) U=255 V=255.
+        assert_eq!(argb[22 * 640 + 12], 0x00ff_00ff);
+    }
+
+    #[test]
     fn dos_program_startup_services() {
         // org 0x100:
         //   mov ah,0x30 / int 0x21            ; get version (AL=6, AH=10), no fault

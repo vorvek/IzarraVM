@@ -1,12 +1,12 @@
 //! Margo, the VEGA 2D engine: the display register block, the linear frame
 //! buffer, and the blit engine. The engine implements FILL, COPY, color expand,
 //! LINE, and PATTERN_FILL, all with full ROP3 and rectangle clipping, plus a
-//! display-path hardware cursor.
+//! display-path hardware cursor and a scaled YUV video overlay.
 
 pub const MARGO_VRAM_SIZE: usize = 4 * 1024 * 1024;
 pub const MARGO_MMIO_SIZE: usize = 0x0001_0000; // 64 KB register block
 pub const MARGO_ID_VALUE: u32 = 0x4D47_0100; // 'M' 'G', version 1.00
-pub const MARGO_CAPS_VALUE: u32 = 0x0000_01ff; // bits 0 FILL, 1 COPY, 2 COLOR_EXPAND, 3 LINE, 4 ROP3, 5 CLIP, 6 COLORKEY, 7 PATTERN_FILL, 8 CURSOR
+pub const MARGO_CAPS_VALUE: u32 = 0x0000_03ff; // bits 0 FILL, 1 COPY, 2 COLOR_EXPAND, 3 LINE, 4 ROP3, 5 CLIP, 6 COLORKEY, 7 PATTERN_FILL, 8 CURSOR, 9 OVERLAY
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VbeMode {
@@ -184,6 +184,22 @@ fn decode_argb(bpp: u32, raw: u32, palette: &[u32; 256]) -> u32 {
     (r << 16) | (g << 8) | b
 }
 
+/// Convert one YUV triple to host ARGB 0x00RRGGBB by studio-swing ITU-R BT.601
+/// (Y 16..=235, chroma 16..=240), the canonical integer coefficients. Rounds with
+/// a +128 bias then an arithmetic shift, and clamps each channel to 0..=255. This
+/// is the overlay's conversion (section 7.8); it produces ARGB directly rather
+/// than going through `decode_argb`.
+fn yuv_to_argb(y: u8, u: u8, v: u8) -> u32 {
+    let c = y as i32 - 16;
+    let d = u as i32 - 128;
+    let e = v as i32 - 128;
+    let clamp = |x: i32| x.clamp(0, 255) as u32;
+    let r = clamp((298 * c + 409 * e + 128) >> 8);
+    let g = clamp((298 * c - 100 * d - 208 * e + 128) >> 8);
+    let b = clamp((298 * c + 516 * d + 128) >> 8);
+    (r << 16) | (g << 8) | b
+}
+
 pub const REG_ID: usize = 0x0000;
 pub const REG_CAPS: usize = 0x0004;
 pub const REG_STATUS: usize = 0x0008;
@@ -199,6 +215,15 @@ pub const REG_CURSOR_ADDR: usize = 0x002c;
 pub const REG_CURSOR_POS: usize = 0x0030;
 pub const REG_CURSOR_FG: usize = 0x0034;
 pub const REG_CURSOR_BG: usize = 0x0038;
+pub const REG_OVL_CTRL: usize = 0x0040;
+pub const REG_OVL_SRC_Y: usize = 0x0044;
+pub const REG_OVL_SRC_PITCH: usize = 0x0048;
+pub const REG_OVL_SRC_DIM: usize = 0x004c;
+pub const REG_OVL_SRC_U: usize = 0x0050;
+pub const REG_OVL_SRC_V: usize = 0x0054;
+pub const REG_OVL_DST_XY: usize = 0x0058;
+pub const REG_OVL_DST_DIM: usize = 0x005c;
+pub const REG_OVL_COLORKEY: usize = 0x0060;
 
 // Blit engine registers (section 7.3). All R/W; the engine reads the ones it
 // needs when COMMAND fires. The block 0x100..0x150 is a flat R/W store.
@@ -225,6 +250,8 @@ pub const REG_MONO_DATA: usize = 0x0160;
 
 const CURSOR_BASE: usize = 0x0028;
 const CURSOR_REGS: usize = 5; // 0x0028..0x003C: CTRL, ADDR, POS, FG, BG
+const OVL_BASE: usize = 0x0040;
+const OVL_REGS: usize = 9; // 0x0040..=0x0060: CTRL, SRC_Y, SRC_PITCH, SRC_DIM, SRC_U, SRC_V, DST_XY, DST_DIM, COLORKEY
 const BLIT_BASE: usize = 0x0100;
 const BLIT_REGS: usize = 20; // 0x100..0x150, twenty 32-bit slots; COMMAND at 0x150 is handled separately
 const FILL_NS_PER_PIXEL: u64 = 5; // 200 Mpixels/s solid fill (section 1.1)
@@ -718,6 +745,7 @@ pub struct Margo {
     expand: Option<ExpandState>,
     mono_data: u32,
     cursor: [u32; CURSOR_REGS],
+    overlay: [u32; OVL_REGS],
 }
 
 impl Default for Margo {
@@ -732,6 +760,7 @@ impl Default for Margo {
             expand: None,
             mono_data: 0,
             cursor: [0; CURSOR_REGS],
+            overlay: [0; OVL_REGS],
         }
     }
 }
@@ -818,6 +847,7 @@ impl Margo {
                 out.push(decode_argb(bpp, u32::from_le_bytes(bytes), palette));
             }
         }
+        self.composite_overlay(&mut out);
         self.composite_cursor(&mut out, palette);
         out
     }
@@ -873,6 +903,149 @@ impl Margo {
         }
     }
 
+    /// Composite the scaled YUV video overlay onto the decoded scanout `out`
+    /// (`width * height` ARGB pixels), before the cursor so the pointer stays on
+    /// top (section 7.8). No-op unless `OVL_CTRL` bit 0 (ENABLE) is set. Within the
+    /// destination rectangle (`OVL_DST_XY` / `OVL_DST_DIM`) the source is sampled
+    /// scaled from `OVL_SRC_DIM` by point sampling (section 9), converted by
+    /// `yuv_to_argb`, and written. Destination pixels off the screen are skipped,
+    /// not wrapped; every source read is bounds-checked against the frame store and
+    /// an off-store byte skips that overlay pixel. Zero source or destination
+    /// extent is a no-op (guards the scale divide).
+    fn composite_overlay(&self, out: &mut [u32]) {
+        let ctrl = self.overlay_reg(REG_OVL_CTRL);
+        if ctrl & 0x1 == 0 {
+            return;
+        }
+        let format = (ctrl >> 1) & 0x3;
+        let key_en = ctrl & 0x8 != 0;
+        let colorkey = self.overlay_reg(REG_OVL_COLORKEY);
+
+        let width = self.display.width as u64;
+        let height = self.display.height as u64;
+        let dst_xy = self.overlay_reg(REG_OVL_DST_XY);
+        let dst_dim = self.overlay_reg(REG_OVL_DST_DIM);
+        let src_dim = self.overlay_reg(REG_OVL_SRC_DIM);
+        let dst_x = (dst_xy & 0xffff) as u64;
+        let dst_y = (dst_xy >> 16) as u64;
+        let dst_w = (dst_dim & 0xffff) as u64;
+        let dst_h = (dst_dim >> 16) as u64;
+        let src_w = (src_dim & 0xffff) as u64;
+        let src_h = (src_dim >> 16) as u64;
+        if width == 0 || height == 0 || dst_w == 0 || dst_h == 0 || src_w == 0 || src_h == 0 {
+            return;
+        }
+        let len = self.vram.len() as u64;
+
+        for dy in 0..dst_h {
+            let screen_y = dst_y + dy;
+            if screen_y >= height {
+                continue;
+            }
+            for dx in 0..dst_w {
+                let screen_x = dst_x + dx;
+                if screen_x >= width {
+                    continue;
+                }
+                if key_en && !self.primary_keyed(screen_x, screen_y, colorkey) {
+                    continue; // occluded: another surface painted over the key here
+                }
+                let sx = (dx * src_w) / dst_w;
+                let sy = (dy * src_h) / dst_h;
+                let Some((y, u, v)) = self.sample_overlay(format, sx, sy, len) else {
+                    continue;
+                };
+                out[(screen_y * width + screen_x) as usize] = yuv_to_argb(y, u, v);
+            }
+        }
+    }
+
+    /// True when the raw primary pixel at screen `(x, y)` equals `colorkey` in its
+    /// low `depth` bytes (display format, little-endian), computed with the same
+    /// offset math as `scanout_argb` and bounds-checked. Mirrors COPY's color key
+    /// (section 7.5): the overlay shows only where the application painted the key,
+    /// and is hidden where another window drew over it.
+    fn primary_keyed(&self, x: u64, y: u64, colorkey: u32) -> bool {
+        let depth = bytes_per_pixel(self.display.bpp) as u64;
+        let pitch = self.display.pitch as u64;
+        let start = self.display.start as u64;
+        let len = self.vram.len() as u64;
+        let off = start
+            .saturating_add(y.saturating_mul(pitch))
+            .saturating_add(x.saturating_mul(depth));
+        let mut bytes = [0u8; 4];
+        for (i, slot) in bytes.iter_mut().enumerate().take(depth as usize) {
+            let addr = off.saturating_add(i as u64);
+            if addr < len {
+                *slot = self.vram[addr as usize];
+            }
+        }
+        colorkey.to_le_bytes()[..depth as usize] == bytes[..depth as usize]
+    }
+
+    /// Fetch the (Y, U, V) triple for source pixel `(sx, sy)` in the configured
+    /// overlay `format` (0 YUY2, 1 YV12; others reserved). Returns None when a
+    /// needed source byte falls outside the frame store (skip the pixel, no wrap)
+    /// or the format is reserved. All offsets are u64-saturating.
+    fn sample_overlay(&self, format: u32, sx: u64, sy: u64, len: u64) -> Option<(u8, u8, u8)> {
+        let src_y = self.overlay_reg(REG_OVL_SRC_Y) as u64;
+        let pitch = self.overlay_reg(REG_OVL_SRC_PITCH) as u64;
+        match format {
+            0 => {
+                // YUY2 packed 4:2:2, byte order Y0, U, Y1, V; a 4-byte group is two
+                // horizontally adjacent pixels sharing one U and one V.
+                let base = src_y
+                    .saturating_add(sy.saturating_mul(pitch))
+                    .saturating_add((sx / 2).saturating_mul(4));
+                let y = self.vram_byte(base.saturating_add((sx & 1) * 2), len)?;
+                let u = self.vram_byte(base.saturating_add(1), len)?;
+                let v = self.vram_byte(base.saturating_add(3), len)?;
+                Some((y, u, v))
+            }
+            1 => {
+                // YV12 planar 4:2:0: a full-resolution Y plane, then V and U planes
+                // at half width and half height. The register set carries no chroma
+                // pitch, so it is the Y pitch halved (slice-11 convention). Chroma is
+                // upsampled by point sampling: (sx/2, sy/2) addresses both planes.
+                let y = self.vram_byte(
+                    src_y
+                        .saturating_add(sy.saturating_mul(pitch))
+                        .saturating_add(sx),
+                    len,
+                )?;
+                let cpitch = pitch / 2;
+                let cx = sx / 2;
+                let cy = sy / 2;
+                let u_base = self.overlay_reg(REG_OVL_SRC_U) as u64;
+                let v_base = self.overlay_reg(REG_OVL_SRC_V) as u64;
+                let u = self.vram_byte(
+                    u_base
+                        .saturating_add(cy.saturating_mul(cpitch))
+                        .saturating_add(cx),
+                    len,
+                )?;
+                let v = self.vram_byte(
+                    v_base
+                        .saturating_add(cy.saturating_mul(cpitch))
+                        .saturating_add(cx),
+                    len,
+                )?;
+                Some((y, u, v))
+            }
+            _ => None,
+        }
+    }
+
+    /// Read one frame-store byte at `off`, or None when it falls at or past the end
+    /// of the store (the overlay then skips that pixel rather than wrapping).
+    fn vram_byte(&self, off: u64, len: u64) -> Option<u8> {
+        if off < len {
+            Some(self.vram[off as usize])
+        } else {
+            None
+        }
+    }
+
     fn register_u32(&self, reg: usize) -> u32 {
         match reg {
             REG_ID => MARGO_ID_VALUE,
@@ -887,6 +1060,9 @@ impl Margo {
             REG_DISP_START => self.display.start,
             reg if (CURSOR_BASE..CURSOR_BASE + CURSOR_REGS * 4).contains(&reg) => {
                 self.cursor[(reg - CURSOR_BASE) / 4]
+            }
+            reg if (OVL_BASE..OVL_BASE + OVL_REGS * 4).contains(&reg) => {
+                self.overlay[(reg - OVL_BASE) / 4]
             }
             reg if (BLIT_BASE..BLIT_BASE + BLIT_REGS * 4).contains(&reg) => {
                 self.blit[(reg - BLIT_BASE) / 4]
@@ -941,6 +1117,11 @@ impl Margo {
             *slot = (*slot & !(0xff_u32 << shift)) | (u32::from(value) << shift);
             return;
         }
+        if (OVL_BASE..OVL_BASE + OVL_REGS * 4).contains(&reg) {
+            let slot = &mut self.overlay[(reg - OVL_BASE) / 4];
+            *slot = (*slot & !(0xff_u32 << shift)) | (u32::from(value) << shift);
+            return;
+        }
         if reg == REG_DISP_START {
             let slot = &mut self.display.start;
             *slot = (*slot & !(0xff_u32 << shift)) | (u32::from(value) << shift);
@@ -953,6 +1134,10 @@ impl Margo {
 
     fn cursor_reg(&self, offset: usize) -> u32 {
         self.cursor[(offset - CURSOR_BASE) / 4]
+    }
+
+    fn overlay_reg(&self, offset: usize) -> u32 {
+        self.overlay[(offset - OVL_BASE) / 4]
     }
 
     fn build_clip(&self) -> Clip {
@@ -1799,8 +1984,25 @@ mod tests {
     fn caps_reports_all_implemented_features() {
         let margo = Margo::default();
         // bits 0 FILL, 1 COPY, 2 COLOR_EXPAND, 3 LINE, 4 full ROP3, 5 CLIP, 6 COLORKEY,
-        // 7 PATTERN_FILL, 8 CURSOR.
-        assert_eq!(read_reg_u32(&margo, REG_CAPS), 0x0000_01ff);
+        // 7 PATTERN_FILL, 8 CURSOR, 9 OVERLAY.
+        assert_eq!(read_reg_u32(&margo, REG_CAPS), 0x0000_03ff);
+    }
+
+    #[test]
+    fn overlay_registers_round_trip() {
+        let mut margo = Margo::default();
+        // Distinct values in each lane prove byte recombination through the store.
+        margo.write_mmio_u8(REG_OVL_CTRL, 0x11);
+        margo.write_mmio_u8(REG_OVL_CTRL + 1, 0x22);
+        margo.write_mmio_u8(REG_OVL_CTRL + 2, 0x33);
+        margo.write_mmio_u8(REG_OVL_CTRL + 3, 0x44);
+        assert_eq!(read_reg_u32(&margo, REG_OVL_CTRL), 0x4433_2211);
+        // Registers across the block are independent.
+        write_reg(&mut margo, REG_OVL_SRC_Y, 0x0020_0000);
+        write_reg(&mut margo, REG_OVL_COLORKEY, 0x00ff_00ff);
+        assert_eq!(read_reg_u32(&margo, REG_OVL_SRC_Y), 0x0020_0000);
+        assert_eq!(read_reg_u32(&margo, REG_OVL_COLORKEY), 0x00ff_00ff);
+        assert_eq!(read_reg_u32(&margo, REG_OVL_CTRL), 0x4433_2211);
     }
 
     #[test]
@@ -3790,6 +3992,17 @@ mod tests {
         write_reg(&mut margo, REG_CURSOR_CTRL, 1);
         let argb = margo.scanout_argb(&palette);
         assert_eq!(argb[0], 0x00ff_0000); // FG decoded through the display format
+    }
+
+    #[test]
+    fn yuv_to_argb_matches_bt601_reference_vectors() {
+        // Studio-swing ITU-R BT.601: Y 16..=235, chroma 16..=240.
+        assert_eq!(yuv_to_argb(16, 128, 128), 0x0000_0000); // black
+        assert_eq!(yuv_to_argb(235, 128, 128), 0x00ff_ffff); // white
+        assert_eq!(yuv_to_argb(128, 128, 128), 0x0082_8282); // mid gray (130)
+        assert_eq!(yuv_to_argb(235, 128, 255), 0x00ff_98ff); // red clamps high
+        assert_eq!(yuv_to_argb(128, 255, 128), 0x0082_51ff); // blue clamps high
+        assert_eq!(yuv_to_argb(16, 128, 16), 0x0000_5b00); // red clamps low to 0
     }
 
     #[test]
