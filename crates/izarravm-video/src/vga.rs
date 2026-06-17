@@ -75,6 +75,72 @@ impl Vga {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GfxController {
+    pub set_reset: u8,        // idx 0, low 4 bits
+    pub enable_set_reset: u8, // idx 1, low 4 bits
+    pub color_compare: u8,    // idx 2
+    pub rotate: u8,           // idx 3 bits 0..2
+    pub logic: u8,            // idx 3 bits 3..4: 0 copy,1 AND,2 OR,3 XOR
+    pub read_map: u8,         // idx 4
+    pub write_mode: u8,       // idx 5 bits 0..1
+    pub read_mode: u8,        // idx 5 bit 3
+    pub color_dont_care: u8,  // idx 7
+    pub bit_mask: u8,         // idx 8
+}
+
+fn apply_logic(logic: u8, value: u8, latch: u8) -> u8 {
+    match logic {
+        1 => value & latch,
+        2 => value | latch,
+        3 => value ^ latch,
+        _ => value,
+    }
+}
+
+/// Write one byte through the VGA write datapath into all four planes. `planes[i]`
+/// is plane i's slice; `latches` are the four latch registers. Spec section 4.
+pub fn write_planes(
+    planes: &mut [[u8; 1]; VGA_PLANES],
+    offset: usize,
+    data: u8,
+    gc: &GfxController,
+    latches: &[u8; VGA_PLANES],
+) {
+    let _ = offset; // single-byte helper; callers index the plane slices
+    let rotated = data.rotate_right(u32::from(gc.rotate & 7));
+    for plane in 0..VGA_PLANES {
+        let latch = latches[plane];
+        let value = match gc.write_mode {
+            1 => {
+                planes[plane][0] = latch; // WM1: latches straight to planes
+                continue;
+            }
+            2 => {
+                if (data >> plane) & 1 != 0 { 0xFF } else { 0x00 } // WM2
+            }
+            3 => {
+                if (gc.set_reset >> plane) & 1 != 0 { 0xFF } else { 0x00 } // WM3 color
+            }
+            _ => {
+                // WM0: set/reset substitution where enabled, else rotated data.
+                if (gc.enable_set_reset >> plane) & 1 != 0 {
+                    if (gc.set_reset >> plane) & 1 != 0 { 0xFF } else { 0x00 }
+                } else {
+                    rotated
+                }
+            }
+        };
+        let mask = if gc.write_mode == 3 {
+            gc.bit_mask & rotated
+        } else {
+            gc.bit_mask
+        };
+        let alu = apply_logic(gc.logic, value, latch);
+        planes[plane][0] = (alu & mask) | (latch & !mask);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,5 +153,38 @@ mod tests {
         // frame_dots must be non-zero at boot (default text timing) so the
         // per-instruction beam advance never divides by zero. (Spec §3/§6.)
         assert!(vga.frame_dots() > 0, "frame_dots must be defined before any mode-set");
+    }
+
+    #[test]
+    fn write_mode_0_applies_rotate_setreset_logic_and_bitmask() {
+        // Latches preloaded to 0xFF on all planes; write 0x0F with bit mask 0xF0,
+        // copy logic, no set/reset. Result per plane = (data & mask) | (latch & !mask)
+        // = (0x0F & 0xF0) | (0xFF & 0x0F) = 0x00 | 0x0F = 0x0F.
+        let mut planes = [[0u8; 1]; VGA_PLANES];
+        let mut gc = GfxController::default();
+        gc.bit_mask = 0xF0;
+        let latches = [0xFFu8; VGA_PLANES];
+        write_planes(&mut planes, 0, 0x0F, &gc, &latches);
+        for p in &planes {
+            assert_eq!(p[0], 0x0F);
+        }
+    }
+
+    #[test]
+    fn write_mode_0_set_reset_substitutes_color_per_plane() {
+        // Enable set/reset on all planes, set/reset value = 0b1010 (planes 1 and 3).
+        // With full bit mask and copy, each enabled plane writes its set/reset bit
+        // expanded to 0xFF or 0x00.
+        let mut planes = [[0u8; 1]; VGA_PLANES];
+        let mut gc = GfxController::default();
+        gc.bit_mask = 0xFF;
+        gc.enable_set_reset = 0x0F;
+        gc.set_reset = 0b1010;
+        let latches = [0u8; VGA_PLANES];
+        write_planes(&mut planes, 0, 0x00, &gc, &latches);
+        assert_eq!(planes[0][0], 0x00);
+        assert_eq!(planes[1][0], 0xFF);
+        assert_eq!(planes[2][0], 0x00);
+        assert_eq!(planes[3][0], 0xFF);
     }
 }
