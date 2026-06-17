@@ -2830,6 +2830,7 @@ mod tests {
         machine.video_mut().set_mode13h();
         machine.video_mut().write_port(0x3C4, 0x04);
         machine.video_mut().write_port(0x3C5, 0x06);
+        assert_eq!(machine.active_display(), ActiveDisplay::VgaRaster);
         // Abrash's 320x240 vertical timing through the CRTC ports.
         for (idx, val) in [
             (0x06u8, 0x0Du8),
@@ -2849,16 +2850,16 @@ mod tests {
         machine.video_mut().write_port(0x3C5, 0x04); // map mask = plane 2
         machine.video_mut().write_port(0x3CE, 0x08);
         machine.video_mut().write_port(0x3CF, 0xFF); // bit mask 0xFF
-        machine.write_physical_u8(0x000A_0000 + 1, 0x2A); // plane 2, offset 1
+        machine.write_physical_u8(0x000A_0000 + 1, 0xC2); // plane 2, offset 1; bits 6-7 set prove no 6-bit mask
         // Complete a frame (mode-X 320x240 frame is ~421 600 dots; 500 000 clocks is
         // ~503 500 dots, enough to cross one frame and present).
         machine.advance_devices(500_000);
         let raster = machine.vga_raster().expect("a frame presented");
         assert_eq!(raster.width, 320);
         assert_eq!(raster.height, 527, "320x240 vertical total");
-        // Column 6 of row 0 scans out the drawn 0x2A, as the 8-bit DAC index directly.
+        // Column 6 of row 0 scans out the drawn 0xC2, as the 8-bit DAC index directly.
         assert_eq!(
-            raster.pixels[6], 0x2A,
+            raster.pixels[6], 0xC2,
             "mode-X pixel scans out at its column with its full 8-bit value"
         );
     }
