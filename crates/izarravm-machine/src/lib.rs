@@ -1907,6 +1907,49 @@ mod tests {
         assert_eq!(machine.dma_read_byte(1), None);
     }
 
+    #[test]
+    fn sb_16bit_dma_plays_a_signed_stereo_buffer_through_the_dsp() {
+        let mut machine = test_machine();
+        // 8 signed-LE stereo frames (32 bytes). The slave 8237A (channel 5)
+        // word-addresses its transfers, so page 0x01 at word addr 0 drives byte
+        // base (0x01 << 17) = 0x2_0000 (page in A23-A17, A0 tied low). Each frame
+        // is L = -1 (0xFFFF) then R = +1 (0x0001).
+        let frame: [u8; 4] = [0xFF, 0xFF, 0x01, 0x00];
+        for i in 0..8 {
+            for (j, &b) in frame.iter().enumerate() {
+                machine.write_physical_u8(0x2_0000 + (i * 4 + j) as u32, b);
+            }
+        }
+        with_bus(&mut machine, |bus| {
+            // Slave ch5 (local ch1): word addr 0, page 0x8B=0x01, count 15 (16
+            // words), auto-init read.
+            bus.write_io(0xD6, BusWidth::Byte, 0x59).unwrap(); // slave ch1 mode: auto-init, read
+            bus.write_io(0xC4, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0xC4, BusWidth::Byte, 0x00).unwrap(); // word addr 0
+            bus.write_io(0xC6, BusWidth::Byte, 0x0F).unwrap();
+            bus.write_io(0xC6, BusWidth::Byte, 0x00).unwrap(); // count 15 -> 16 words
+            bus.write_io(0x8B, BusWidth::Byte, 0x01).unwrap(); // page -> byte base 0x2_0000
+            bus.write_io(0xD4, BusWidth::Byte, 0x01).unwrap(); // unmask slave ch1
+            // DSP: 22050 Hz, 16-bit auto-init output, signed, stereo, count 15.
+            for &b in &[0x41u8, 0x56, 0x22, 0xB6, 0x30, 0x0F, 0x00] {
+                bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
+            }
+        });
+        let out = machine.render_dsp_audio(8);
+        assert_eq!(out.len(), 8);
+        assert_eq!(out[0].0, -1, "left channel is signed -1");
+        assert_eq!(out[0].1, 1, "right channel is signed +1");
+        assert!(
+            out.iter().all(|&(l, r)| l == -1 && r == 1),
+            "every stereo frame decodes L=-1, R=+1"
+        );
+        // Auto-init: channel 5 still feeds after draining the buffer.
+        assert!(
+            machine.dma_read_word(SB_DMA_CHANNEL_16).is_some(),
+            "auto-init keeps feeding"
+        );
+    }
+
     // Run one closure against a freshly-borrowed bus over the whole machine.
     fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R {
         let mut bus = MachineBus {
