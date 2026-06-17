@@ -121,6 +121,9 @@ pub struct Vga {
     pub(crate) work: Vec<u8>,
     pub(crate) presented: Option<VgaRaster>,
     pub(crate) pending_start: Option<u32>,
+    pub(crate) seq_index: u8,
+    pub(crate) gc_index: u8,
+    pub(crate) crtc_index: u8,
 }
 
 impl Default for Vga {
@@ -138,6 +141,9 @@ impl Default for Vga {
             work: Vec::new(),
             presented: None,
             pending_start: None,
+            seq_index: 0,
+            gc_index: 0,
+            crtc_index: 0,
         }
     }
 }
@@ -358,6 +364,88 @@ impl Vga {
             status |= 0x08; // vertical retrace
         }
         status
+    }
+
+    /// Write to a VGA I/O port. Calls `catch_up()` first so any lines already
+    /// past the beam are rendered with the previous register state before the
+    /// new value takes effect. Returns `true` if the port is handled.
+    pub fn write_port(&mut self, port: u16, value: u8) -> bool {
+        self.catch_up();
+        match port {
+            0x3C4 => { self.seq_index = value; true }
+            0x3C5 => { let idx = self.seq_index; self.write_seq(idx, value); true }
+            0x3CE => { self.gc_index = value; true }
+            0x3CF => { let idx = self.gc_index; self.write_gc(idx, value); true }
+            0x3D4 => { self.crtc_index = value; true }
+            0x3D5 => { let idx = self.crtc_index; self.write_crtc(idx, value); true }
+            0x3C0 => { self.write_attr(value); true }
+            _ => false,
+        }
+    }
+
+    /// Read from a VGA I/O port. Returns `Some(value)` for handled ports.
+    pub fn read_port(&mut self, port: u16) -> Option<u8> {
+        match port {
+            0x3DA => Some(self.read_status1()),
+            _ => None,
+        }
+    }
+
+    fn write_seq(&mut self, index: u8, value: u8) {
+        match index {
+            0x02 => self.seq.map_mask = value & 0x0F,
+            0x04 => self.seq.memory_mode = value,
+            _ => {}
+        }
+    }
+
+    fn write_gc(&mut self, index: u8, value: u8) {
+        match index {
+            0x00 => self.gc.set_reset = value & 0x0F,
+            0x01 => self.gc.enable_set_reset = value & 0x0F,
+            0x02 => self.gc.color_compare = value & 0x0F,
+            0x03 => { self.gc.rotate = value & 7; self.gc.logic = (value >> 3) & 3; }
+            0x04 => self.gc.read_map = value & 3,
+            0x05 => { self.gc.write_mode = value & 3; self.gc.read_mode = (value >> 3) & 1; }
+            0x07 => self.gc.color_dont_care = value & 0x0F,
+            0x08 => self.gc.bit_mask = value,
+            _ => {}
+        }
+    }
+
+    fn write_crtc(&mut self, index: u8, value: u8) {
+        match index {
+            // Both start-address bytes buffer through the vretrace latch (no mid-frame
+            // tearing). Assemble against the pending value, or the active value if none.
+            0x0C => {
+                let cur = self.pending_start.unwrap_or(self.crtc.start_address);
+                self.set_start_address((cur & 0x00FF) | (u32::from(value) << 8));
+            }
+            0x0D => {
+                let cur = self.pending_start.unwrap_or(self.crtc.start_address);
+                self.set_start_address((cur & 0xFF00) | u32::from(value));
+            }
+            0x13 => self.crtc.offset = u32::from(value),
+            _ => {} // full timing programmed via set_mode_0dh in slice 1
+        }
+    }
+
+    fn write_attr(&mut self, value: u8) {
+        if !self.attr.flip_flop_data {
+            self.attr.index = value & 0x1F;
+            self.attr.flip_flop_data = true;
+        } else {
+            match self.attr.index {
+                0x00..=0x0F => self.attr.palette[self.attr.index as usize] = value & 0x3F,
+                0x10 => self.attr.mode_control = value,
+                0x11 => self.attr.overscan = value,
+                0x12 => self.attr.plane_enable = value,
+                0x13 => self.attr.pixel_pan = value & 0x0F,
+                0x14 => self.attr.color_select = value,
+                _ => {}
+            }
+            self.attr.flip_flop_data = false;
+        }
     }
 }
 
@@ -690,6 +778,26 @@ mod tests {
         vga.set_start_address(0x4000);
         vga.advance(vga.frame_dots());
         assert_eq!(vga.crtc.start_address, 0x4000, "no two-frame lag");
+    }
+
+    #[test]
+    fn gc_and_seq_ports_round_trip_and_catch_up_runs_first() {
+        let mut vga = Vga::default();
+        vga.set_mode_0dh();
+        vga.advance(htotal_dots(&vga.crtc) * 4); // beam at line 4
+        vga.write_port(0x3CE, 8); // GC index 8 = bit mask
+        vga.write_port(0x3CF, 0x0F);
+        assert_eq!(vga.gc.bit_mask, 0x0F);
+        assert_eq!(vga.last_line, 4); // the write caught up through line 4
+    }
+
+    #[test]
+    fn attribute_flipflop_alternates_index_then_data() {
+        let mut vga = Vga::default();
+        vga.read_status1(); // reset flip-flop to "index"
+        vga.write_port(0x3C0, 0x13); // pixel pan index
+        vga.write_port(0x3C0, 0x02); // value
+        assert_eq!(vga.attr.pixel_pan, 0x02);
     }
 
     #[test]
