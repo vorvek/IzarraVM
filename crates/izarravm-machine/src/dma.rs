@@ -509,14 +509,14 @@ mod tests {
     fn slave_channel_5_auto_init_reloads_and_keeps_feeding() {
         let mut dma = DmaController::default();
         dma.write_port(0xD6, 0x59); // mode, slave ch1: auto-init, read
-        dma.write_port(0xC4, 0x00); // word addr 0
+        dma.write_port(0xC4, 0x02); // word addr 0x0002
         dma.write_port(0xC4, 0x00);
         dma.write_port(0xC6, 0x01); // count 1 -> 2 word transfers per cycle
         dma.write_port(0xC6, 0x00);
-        dma.write_port(0x8B, 0x00); // page 0 -> byte base 0
+        dma.write_port(0x8B, 0x01); // page 0x01 -> byte base 0x2_0000
         dma.write_port(0xD4, 0x01); // unmask slave ch1
 
-        let byte_addr = (0x00u32 << 17) | (0x0000u32 << 1);
+        let byte_addr = (0x01u32 << 17) | (0x0002u32 << 1);
         let mut mem = Memory::new(byte_addr as usize + 4).unwrap();
         mem.write_u8(byte_addr as usize, 0x78).unwrap();
         mem.write_u8(byte_addr as usize + 1, 0x56).unwrap();

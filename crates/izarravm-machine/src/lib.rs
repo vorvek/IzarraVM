@@ -115,7 +115,8 @@ const PIT_INPUT_HZ: u32 = 1_193_182;
 const VGA_DOT_HZ: u64 = 25_175_000;
 /// Sound Blaster 16 IRQ and DMA resources (fixed for the Resonique 2).
 const SB_IRQ: u8 = 5;
-const SB_DMA_CHANNEL: usize = 1;
+const SB_DMA_CHANNEL_8: usize = 1;
+const SB_DMA_CHANNEL_16: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveDisplay {
@@ -737,11 +738,12 @@ impl Machine {
         self.vga_dots -= whole;
     }
 
-    /// Render `native_samples` of DSP 8-bit DMA output (signed 16-bit, mono).
-    /// Each sample pulls one byte from DMA channel 1; the DSP's half/end-buffer
-    /// IRQ is forwarded to the PIC as IRQ5. Returns the raw mono stream; the
-    /// mixer (render_audio) resamples and sums it with the OPL.
-    pub fn render_dsp_audio(&mut self, native_samples: usize) -> Vec<i16> {
+    /// Render `native_samples` of DSP DMA output as stereo frames. Each frame
+    /// pulls one byte (8-bit mode, mono duplicated L/R) or one/two 16-bit words
+    /// (16-bit mono/stereo) from the matching DMA channel; the DSP's half/end
+    /// IRQ is forwarded to the PIC as IRQ5. The DSP renders one stereo frame per
+    /// call; the mixer resamples and sums it with the OPL.
+    pub fn render_dsp_audio(&mut self, native_samples: usize) -> Vec<(i16, i16)> {
         let Machine {
             dsp,
             dma,
@@ -751,7 +753,16 @@ impl Machine {
         } = self;
         let mut out = Vec::with_capacity(native_samples);
         for _ in 0..native_samples {
-            if let Some(sample) = dsp.render_sample(|| dma.read_byte(SB_DMA_CHANNEL, memory)) {
+            // Only the fetcher matching the armed mode is given the DMA/memory
+            // borrow; the other is a no-op closure the DSP never calls. This keeps
+            // the single &mut dma/&mut memory borrow sound while feeding both paths
+            // through one render_frame call.
+            let frame = if dsp.is_16bit() {
+                dsp.render_frame(|| None, || dma.read_word(SB_DMA_CHANNEL_16, memory))
+            } else {
+                dsp.render_frame(|| dma.read_byte(SB_DMA_CHANNEL_8, memory), || None)
+            };
+            if let Some(sample) = frame {
                 out.push(sample);
             }
             if dsp.take_irq() {
@@ -786,8 +797,12 @@ impl Machine {
         let dsp_native_count = (native_samples as f64 * self.dsp.rate_hz() as f64
             / OPL_NATIVE_HZ as f64)
             .round() as usize;
-        let dsp_mono = self.render_dsp_audio(dsp_native_count);
-        let dsp_stereo: Vec<(i32, i32)> = dsp_mono.iter().map(|&s| (s as i32, s as i32)).collect();
+        // The DSP already produces stereo frames; widen to i32 and resample.
+        let dsp_stereo: Vec<(i32, i32)> = self
+            .render_dsp_audio(dsp_native_count)
+            .iter()
+            .map(|&(l, r)| (i32::from(l), i32::from(r)))
+            .collect();
         let dsp_out = self.dsp_resampler.process(&dsp_stereo);
 
         // Sum over the longer length; a silent (idle) DSP yields no frames, so the
@@ -813,6 +828,14 @@ impl Machine {
     /// sound slice feeds this to the SB16 DSP for 8-bit playback.
     pub fn dma_read_byte(&mut self, channel: usize) -> Option<u8> {
         self.dma.read_byte(channel, &mut self.memory)
+    }
+
+    /// Pull one 16-bit word from a slave DMA channel's memory transfer
+    /// (memory->device read). Returns None on the master channels (0-3, 8-bit) or
+    /// when the slave channel is masked / at terminal count. The sound slice
+    /// feeds this to the SB16 DSP for 16-bit playback (channel 5).
+    pub fn dma_read_word(&mut self, channel: usize) -> Option<u16> {
+        self.dma.read_word(channel, &mut self.memory)
     }
 
     /// Advance the DSP reset-settle clock by `micros` microseconds. The run loop
@@ -1874,8 +1897,12 @@ mod tests {
         });
         let out = machine.render_dsp_audio(16);
         assert_eq!(out.len(), 16);
-        // Unsigned 0x00 maps to a centered negative sample.
-        assert!(out.iter().any(|&s| s < 0), "expected negative samples");
+        // Unsigned 0x00 maps to a centered negative sample; mono is duplicated L/R.
+        assert!(out.iter().any(|&(l, _)| l < 0), "expected negative samples");
+        assert!(
+            out.iter().all(|&(l, r)| l == r),
+            "8-bit mono duplicated L/R"
+        );
         // Single mode masks channel 1 at terminal count.
         assert_eq!(machine.dma_read_byte(1), None);
     }
