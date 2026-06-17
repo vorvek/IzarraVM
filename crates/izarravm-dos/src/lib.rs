@@ -2200,6 +2200,25 @@ mod tests {
     }
 
     #[test]
+    fn ah40_to_an_invalid_handle_returns_ax06() {
+        // BX=0 is not a routed console handle (1/2) and not an open file, so it
+        // falls through to the table lookup and returns invalid handle.
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let mut regs = DosRegs {
+            ax: 0x4000,
+            bx: 0,
+            cx: 1,
+            ds: 0x0100,
+            dx: 0x0300,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x06);
+    }
+
+    #[test]
     fn ah42_seek_set_cur_end_return_position() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("S.TXT"), b"0123456789").unwrap();
