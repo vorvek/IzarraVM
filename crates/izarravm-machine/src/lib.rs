@@ -2599,6 +2599,67 @@ mod tests {
     }
 
     #[test]
+    fn line_compare_split_through_the_machine() {
+        let mut machine = test_machine();
+        machine.set_vga_mode_0dh(); // double-scanned byte mode
+        // A0000 writes fill plane 0 with a full bit mask, write mode 0 (reset default).
+        machine.video_mut().write_port(0x3C4, 0x02);
+        machine.video_mut().write_port(0x3C5, 0x01); // map mask = plane 0
+        machine.video_mut().write_port(0x3CE, 0x08);
+        machine.video_mut().write_port(0x3CF, 0xFF); // bit mask 0xFF
+        // Mark the top of VRAM (plane 0 offset 0) with bit 7 only: pixel 0 set, the rest
+        // clear. The split region reads this; a non-uniform byte also detects a
+        // wrongly-applied pel-pan below the split.
+        machine.write_physical_u8(0x000A_0000, 0x80);
+        // Identity attribute palette so index 1 -> DAC 1. read_status1 resets the
+        // flip-flop to "index"; 16 entries * 2 writes leaves it in "index" mode.
+        machine.video_mut().read_status1();
+        for i in 0..16u8 {
+            machine.video_mut().write_port(0x3C0, i); // index
+            machine.video_mut().write_port(0x3C0, i); // value: palette[i] = i
+        }
+        // Lock pel-pan below the split (Attribute Mode Control 10h bit 5) and pan the
+        // top by 4. The flip-flop is in "index" mode here.
+        machine.video_mut().write_port(0x3C0, 0x10); // attr index 0x10 (mode control)
+        machine.video_mut().write_port(0x3C0, 0x20); // bit 5: pel-pan up to line compare
+        machine.video_mut().write_port(0x3C0, 0x13); // attr index 0x13 (pixel pan)
+        machine.video_mut().write_port(0x3C0, 0x04); // pan 4
+        // Program a split at scan-counter line 100. The mode default line compare is
+        // 0x3FF, so the overflow (07h) bit 8 and max-scan (09h) bit 9 must be cleared.
+        // The 09h write touches only line compare bit 9, not the double-scan bit.
+        machine.video_mut().write_port(0x3D4, 0x07);
+        machine.video_mut().write_port(0x3D5, 0x00); // line compare bit 8 = 0
+        machine.video_mut().write_port(0x3D4, 0x09);
+        machine.video_mut().write_port(0x3D5, 0x00); // line compare bit 9 = 0
+        machine.video_mut().write_port(0x3D4, 0x18);
+        machine.video_mut().write_port(0x3D5, 0x64); // line compare low 8 bits = 100
+        // Scroll the top region to a cleared area of VRAM (start address 0x4000),
+        // buffered until the next vertical retrace.
+        machine.video_mut().write_port(0x3D4, 0x0C);
+        machine.video_mut().write_port(0x3D5, 0x40); // start address high
+        machine.video_mut().write_port(0x3D4, 0x0D);
+        machine.video_mut().write_port(0x3D5, 0x00); // start address low
+        // First frame latches the buffered start address; the second renders with it.
+        machine.advance_devices(400_000);
+        machine.advance_devices(400_000);
+        let raster = machine.vga_raster().expect("a frame presented");
+        let w = raster.width as usize; // 320
+        // A top scanline (50 < 100) reads the scrolled, cleared region: index 0.
+        assert_eq!(
+            raster.pixels[50 * w],
+            0,
+            "top region is scrolled to cleared VRAM"
+        );
+        // The first split scanline (101 = line_compare + 1) reads offset 0 (the marked
+        // byte), with pel-pan forced to 0 below the split: pixel 0 is the marked index 1.
+        assert_eq!(
+            raster.pixels[101 * w],
+            1,
+            "split region reads offset 0 with pel-pan forced to 0"
+        );
+    }
+
+    #[test]
     fn display_address_wrap_seam_through_the_machine() {
         let mut machine = test_machine();
         machine.set_vga_mode_0dh(); // byte mode
