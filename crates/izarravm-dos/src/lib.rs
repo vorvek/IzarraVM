@@ -125,6 +125,103 @@ pub enum DosAction {
     Exit(u8), // terminate the program with this code
 }
 
+/// Conventional memory modeled as one block ending at paragraph 0xA000. The
+/// program owns [psp_seg, prog_top); AH=48h blocks stack upward from free_base.
+/// ponytail: bump allocator with a single resizable program block and LIFO
+/// reclaim; no MCB chain, no free-list coalescing, no UMB/HIMEM.
+#[derive(Debug, Default)]
+struct Arena {
+    psp_seg: u16,
+    prog_top: u16,
+    free_base: u16,
+    blocks: Vec<(u16, u16)>, // (segment, paragraphs) in allocation order
+}
+
+const ARENA_TOP: u16 = 0xa000; // matches CONVENTIONAL_TOP_PARAGRAPH in the loader
+
+enum ResizeError {
+    TooBig(u16), // largest paragraphs that would fit
+    InvalidBlock,
+}
+
+impl Arena {
+    /// AH=48h: allocate `paras` paragraphs. Ok(segment) or Err(largest-available).
+    fn allocate(&mut self, paras: u16) -> Result<u16, u16> {
+        let end = u32::from(self.free_base) + u32::from(paras);
+        if end <= u32::from(ARENA_TOP) {
+            let seg = self.free_base;
+            self.blocks.push((seg, paras));
+            self.free_base = end as u16;
+            Ok(seg)
+        } else {
+            Err(ARENA_TOP - self.free_base)
+        }
+    }
+
+    /// AH=4Ah: resize the block at `seg` to `paras` paragraphs.
+    fn resize(&mut self, seg: u16, paras: u16) -> Result<(), ResizeError> {
+        if seg == self.psp_seg {
+            // The program block. Its ceiling is the lowest AH=48h block, or ARENA_TOP.
+            let limit = self
+                .blocks
+                .iter()
+                .map(|&(s, _)| s)
+                .min()
+                .unwrap_or(ARENA_TOP);
+            let new_top = u32::from(self.psp_seg) + u32::from(paras);
+            if new_top <= u32::from(limit) {
+                self.prog_top = new_top as u16;
+                if self.blocks.is_empty() {
+                    self.free_base = self.prog_top;
+                }
+                Ok(())
+            } else {
+                Err(ResizeError::TooBig(limit - self.psp_seg))
+            }
+        } else if let Some(idx) = self.blocks.iter().position(|&(s, _)| s == seg) {
+            if idx + 1 == self.blocks.len() {
+                // Top block: grow/shrink against the ceiling, moving free_base.
+                let new_end = u32::from(seg) + u32::from(paras);
+                if new_end <= u32::from(ARENA_TOP) {
+                    self.blocks[idx].1 = paras;
+                    self.free_base = new_end as u16;
+                    Ok(())
+                } else {
+                    Err(ResizeError::TooBig(ARENA_TOP - seg))
+                }
+            } else {
+                // Non-top block: shrink updates the size (no reclaim); grow fails.
+                let cur = self.blocks[idx].1;
+                if paras <= cur {
+                    self.blocks[idx].1 = paras;
+                    Ok(())
+                } else {
+                    Err(ResizeError::TooBig(cur))
+                }
+            }
+        } else {
+            Err(ResizeError::InvalidBlock)
+        }
+    }
+
+    /// AH=49h: free the block at `seg`. Ok(()) or Err(()) for an unknown block.
+    fn free(&mut self, seg: u16) -> Result<(), ()> {
+        if seg == self.psp_seg {
+            return Ok(()); // freeing the program block (e.g. at termination)
+        }
+        if let Some(idx) = self.blocks.iter().position(|&(s, _)| s == seg) {
+            let is_top = idx + 1 == self.blocks.len();
+            let (_, paras) = self.blocks.remove(idx);
+            if is_top {
+                self.free_base -= paras; // LIFO reclaim
+            }
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+}
+
 /// Toka-DOS wall clock. Deterministic by default (a fixed 1997 instant) so unit
 /// tests are stable; the machine/CLI may overwrite it via set_clock. Fields are
 /// stored explicitly, including day_of_week, to avoid any calendar computation.
@@ -168,6 +265,7 @@ pub struct DosKernel {
     stdin: VecDeque<u8>,
     stdout: Vec<u8>,
     clock: DosDateTime,
+    arena: Arena,
 }
 
 impl DosKernel {
@@ -212,6 +310,18 @@ impl DosKernel {
             minute,
             second,
             hundredths: 0,
+        };
+    }
+
+    /// Seed per-program state after a program loads: the memory arena spanning
+    /// [psp_seg, ARENA_TOP) with the program owning [psp_seg, prog_top). The
+    /// machine calls this from new_dos_program; prog_top is the PSP:0x02 value.
+    pub fn init_program(&mut self, psp_seg: u16, prog_top: u16) {
+        self.arena = Arena {
+            psp_seg,
+            prog_top,
+            free_base: prog_top,
+            blocks: Vec::new(),
         };
     }
 
@@ -459,6 +569,50 @@ impl DosKernel {
                     regs.ax &= 0xff00;
                 } else {
                     regs.ax = (regs.ax & 0xff00) | 0xff;
+                }
+                Ok(DosAction::Continue)
+            }
+            // AH=48h: allocate BX paragraphs. CF=0 AX=segment, or CF=1 AX=0x08
+            // BX=largest-available.
+            0x48 => {
+                match self.arena.allocate(regs.bx) {
+                    Ok(seg) => {
+                        regs.ax = seg;
+                        regs.cf = false;
+                    }
+                    Err(largest) => {
+                        regs.cf = true;
+                        regs.ax = 0x08;
+                        regs.bx = largest;
+                    }
+                }
+                Ok(DosAction::Continue)
+            }
+            // AH=49h: free the block in ES. CF=0, or CF=1 AX=0x09 (invalid block).
+            0x49 => {
+                match self.arena.free(regs.es) {
+                    Ok(()) => regs.cf = false,
+                    Err(()) => {
+                        regs.cf = true;
+                        regs.ax = 0x09;
+                    }
+                }
+                Ok(DosAction::Continue)
+            }
+            // AH=4Ah: resize the block in ES to BX paragraphs. CF=0, or CF=1 with
+            // AX=0x08 BX=largest-available (too big) / AX=0x09 (invalid block).
+            0x4a => {
+                match self.arena.resize(regs.es, regs.bx) {
+                    Ok(()) => regs.cf = false,
+                    Err(ResizeError::TooBig(largest)) => {
+                        regs.cf = true;
+                        regs.ax = 0x08;
+                        regs.bx = largest;
+                    }
+                    Err(ResizeError::InvalidBlock) => {
+                        regs.cf = true;
+                        regs.ax = 0x09;
+                    }
                 }
                 Ok(DosAction::Continue)
             }
@@ -1472,5 +1626,195 @@ mod tests {
         assert_eq!(entry.es, 0x0100);
         assert_eq!(entry.ip, 0x0100);
         assert_eq!(entry.sp, 0xfffe);
+    }
+
+    fn arena_kernel() -> DosKernel {
+        let mut kernel = DosKernel::new();
+        // Program PSP at 0x0100, block top at 0x1100 (a .COM-style 64 KiB block).
+        kernel.init_program(0x0100, 0x1100);
+        kernel
+    }
+
+    #[test]
+    fn ah48_allocates_above_the_program_block() {
+        let mut mem = Memory::new(4096).unwrap();
+        let mut kernel = arena_kernel();
+        let mut regs = DosRegs {
+            ax: 0x4800,
+            bx: 0x0010,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf);
+        assert_eq!(regs.ax, 0x1100); // first free paragraph = prog_top
+    }
+
+    #[test]
+    fn ah4a_shrink_program_block_then_ah48_allocates_the_tail() {
+        let mut mem = Memory::new(4096).unwrap();
+        let mut kernel = arena_kernel();
+        // Shrink the program block (ES = PSP) to 0x0800 paragraphs.
+        let mut resize = DosRegs {
+            ax: 0x4a00,
+            es: 0x0100,
+            bx: 0x0800,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut resize, &mut mem).unwrap();
+        assert!(!resize.cf);
+        // Now AH=48h allocates from the freed tail: new free_base = 0x0100 + 0x0800 = 0x0900.
+        let mut alloc = DosRegs {
+            ax: 0x4800,
+            bx: 0x0010,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut alloc, &mut mem).unwrap();
+        assert!(!alloc.cf);
+        assert_eq!(alloc.ax, 0x0900);
+    }
+
+    #[test]
+    fn ah48_past_the_ceiling_returns_largest_available() {
+        let mut mem = Memory::new(4096).unwrap();
+        let mut kernel = arena_kernel();
+        // Request more than fits: free_base=0x1100, ceiling 0xA000 -> available 0x8F00.
+        let mut regs = DosRegs {
+            ax: 0x4800,
+            bx: 0x9000,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x08);
+        assert_eq!(regs.bx, 0x8f00); // 0xA000 - 0x1100
+    }
+
+    #[test]
+    fn ah4a_grow_program_block_too_big_fails_with_largest() {
+        let mut mem = Memory::new(4096).unwrap();
+        let mut kernel = arena_kernel();
+        // No allocations yet, so limit is ARENA_TOP. Ask for more than fits.
+        let mut regs = DosRegs {
+            ax: 0x4a00,
+            es: 0x0100,
+            bx: 0xa000,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x08);
+        assert_eq!(regs.bx, 0x9f00); // 0xA000 - 0x0100
+    }
+
+    #[test]
+    fn ah49_frees_top_block_lifo_then_reuses() {
+        let mut mem = Memory::new(4096).unwrap();
+        let mut kernel = arena_kernel();
+        let mut a = DosRegs {
+            ax: 0x4800,
+            bx: 0x0010,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut a, &mut mem).unwrap();
+        let seg = a.ax; // 0x1100
+        let mut free = DosRegs {
+            ax: 0x4900,
+            es: seg,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut free, &mut mem).unwrap();
+        assert!(!free.cf);
+        // The next allocation reuses the reclaimed paragraph.
+        let mut b = DosRegs {
+            ax: 0x4800,
+            bx: 0x0008,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut b, &mut mem).unwrap();
+        assert_eq!(b.ax, seg);
+    }
+
+    #[test]
+    fn ah49_unknown_block_returns_ax09() {
+        let mut mem = Memory::new(4096).unwrap();
+        let mut kernel = arena_kernel();
+        let mut regs = DosRegs {
+            ax: 0x4900,
+            es: 0x5555,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x09);
+    }
+
+    #[test]
+    fn ah49_non_top_free_leaves_a_hole_without_underflow() {
+        // Free a lower (non-top) block, then the top block: free_base must not
+        // underflow, and the lower hole stays leaked (the documented LIFO ceiling).
+        let mut mem = Memory::new(4096).unwrap();
+        let mut kernel = arena_kernel(); // psp 0x100, prog_top 0x1100
+        let mut a = DosRegs {
+            ax: 0x4800,
+            bx: 0x0010,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut a, &mut mem).unwrap();
+        assert_eq!(a.ax, 0x1100);
+        let mut b = DosRegs {
+            ax: 0x4800,
+            bx: 0x0010,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut b, &mut mem).unwrap();
+        assert_eq!(b.ax, 0x1110);
+        // Free the lower block A (non-top): the hole is not reclaimed.
+        let mut free_a = DosRegs {
+            ax: 0x4900,
+            es: 0x1100,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut free_a, &mut mem).unwrap();
+        assert!(!free_a.cf);
+        // Free the top block B: reclaims its paragraphs, no underflow.
+        let mut free_b = DosRegs {
+            ax: 0x4900,
+            es: 0x1110,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut free_b, &mut mem).unwrap();
+        assert!(!free_b.cf);
+        // A fresh allocation starts at 0x1110 (B's reclaimed top); A's hole at
+        // 0x1100 is leaked, as documented.
+        let mut c = DosRegs {
+            ax: 0x4800,
+            bx: 0x0008,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut c, &mut mem).unwrap();
+        assert_eq!(c.ax, 0x1110);
+    }
+
+    #[test]
+    fn ah48_zero_paragraphs_returns_a_segment_without_advancing() {
+        // A zero-paragraph allocation is a legal DOS request: it returns the
+        // current free_base and does not advance it.
+        let mut mem = Memory::new(4096).unwrap();
+        let mut kernel = arena_kernel();
+        let mut z = DosRegs {
+            ax: 0x4800,
+            bx: 0x0000,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut z, &mut mem).unwrap();
+        assert!(!z.cf);
+        assert_eq!(z.ax, 0x1100); // free_base, unchanged
+        let mut a = DosRegs {
+            ax: 0x4800,
+            bx: 0x0010,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut a, &mut mem).unwrap();
+        assert_eq!(a.ax, 0x1100); // next allocation still at free_base
     }
 }

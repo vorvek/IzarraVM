@@ -286,6 +286,12 @@ impl Machine {
 
         let entry = izarravm_dos::load_program(image, &mut machine.memory, DOS_LOAD_SEGMENT)?;
         machine.apply_program_entry(entry);
+        // Seed the Toka-DOS per-program state (memory arena, DTA). prog_top is the
+        // top-of-memory paragraph the loader wrote to PSP:0x02.
+        let prog_top = machine
+            .memory
+            .read_u16(usize::from(DOS_LOAD_SEGMENT) * 16 + 2)?;
+        machine.dos.init_program(DOS_LOAD_SEGMENT, prog_top);
         Ok(machine)
     }
 
