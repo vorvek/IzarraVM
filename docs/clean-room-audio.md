@@ -107,8 +107,8 @@ re-derived here from the same cached primary sources
 firmware-feasible during CPU execution because the run loop advances the
 relevant emulated clock every instruction step (`Machine::advance_devices`
 ticks `dsp.advance_micros` for the reset settle and `opl.advance_micros` for the
-hardware timers); the two DMA rows are intentionally out of scope because DMA
-playback is host-render-driven, not clock-driven.
+hardware timers). The two DMA rows (`sound.sb_8bit_dma`, `sound.sb_16bit_dma`)
+are covered by the clock-driven-playback slice below.
 
 - **SB16 DSP reset handshake** (Creative CT1747 Programming Guide; mirrored by
   the host golden `sb_dsp_reset_handshake_through_the_bus`). Write `0x01` then
@@ -151,4 +151,79 @@ per-row labels (`sb_reset_record:`, `opl2_record:`, `opl3_record:`) to
 `results.inc` emits no bytes (a label is a NASM address symbol), so the header
 constants `RESULT_RECORD_COUNT` (22), `RESULT_PAYLOAD_LEN` (473), and
 `RESULT_PAYLOAD_CHECKSUM` (`0xa346`) are unchanged.
+
+## Clock-driven SB16 DMA playback
+
+The slice that flips `sound.sb_8bit_dma` and `sound.sb_16bit_dma` to PASS moves
+DMA sample advance and the half/end-buffer IRQ5 out of the host render path and
+into the per-CPU-clock device advance, mirroring how the PIT routes IRQ0. This
+makes playback timing (and the IRQ5 a guest `hlt`s on) independent of whether
+the host frontend is pulling audio — which is what real DOS games expect.
+
+- **Producer in `advance_devices`.** A DSP sample-clock phase accumulator
+  (`dsp_sample_phase: f64`) accrues `clocks * rate_hz / clock_hz` samples per
+  CPU step, exactly like the existing `opl_micros`/`dsp_micros` fractional
+  accumulators. For each whole sample `SbDsp::tick_sample(byte_fetch,
+  word_fetch)` runs the *unchanged* `render_frame` (which advances the block
+  counter and edges the half/end IRQ inside `advance_block`) and pushes the
+  rendered stereo frame onto a `rendered: VecDeque<(i16, i16)>` ring on the DSP.
+  After the tick loop, `if dsp.take_irq() { pic.request(SB_IRQ) }` — **this is
+  where IRQ5 now originates**, during CPU execution, regardless of host audio
+  pulls. Only the fetcher matching the armed mode is wired to the DMA channel,
+  so a single `&mut dma` / `&mut memory` borrow feeds the tick (the same borrow
+  shape the old host-side `render_dsp_audio` used). Direct-DAC (`0x10`) output
+  outside DMA playback is unaffected: `render_frame` still returns it, but the
+  producer is gated on `is_playing()`, so it reaches the host only through the
+  render path; direct DAC is rare in games and out of scope here.
+- **Ring-buffer policy.** `rendered` is a rate-match buffer between the producer
+  (advancing at `rate_hz`) and the host drainer (advancing at ~`rate_hz` after
+  resampling). It is capped at `DSP_RING_CAP` (8192 stereo frames, ~0.37 s at
+  22 kHz); on push-when-full it **drops the oldest** frame. Rationale: audio
+  fidelity may glitch, but the block counter and the IRQ timing it gates must
+  stay correct — that is the whole point of the split. In a headless test with
+  no host drainer the ring saturates and drops oldest while playback timing
+  stays exact, which is precisely what makes the firmware DMA probes work.
+- **Drainer in `render_dsp_audio`.** Its signature is unchanged; its body now
+  drains up to `native_samples` frames from the ring instead of calling
+  `render_frame` itself. The host mixer/resampler path (`render_audio`) is
+  unchanged in shape — it reads frames the clock already produced. When DMA is
+  idle the ring is empty, so a silent DSP still means OPL passthrough.
+- **8237A + DSP programming sequences** for the two firmware probes mirror the
+  host goldens exactly; the master/slave byte-addressing derivations and the
+  mode/count byte decoding are recorded above in "SB16 16-bit DMA notes" and
+  "SB16 DSP and 8237A notes" (page register wiring, `(page<<16)|addr` for the
+  8-bit master, `(page<<17)|(wordaddr<<1)` for the 16-bit slave, count `n`
+  meaning `n+1` transfers, half/end-buffer IRQ edges at the block mid/end).
+- **PIC state for the probes.** `test_timer` runs first and programs the master
+  PIC with ICW2 base `0x08`, so IRQ5 -> vector `0x0D`, and unmasks IRQ0 only
+  (writes `0xFE` to `0x21`). Each DMA probe additionally clears IMR bit 5
+  (`and al, 0xDF`) to unmask IRQ5 and installs IVT[`0x0D`] -> its handler, then
+  busy-loops on a tick counter the handler increments. The IRQ5 handler bumps
+  the counter, sends non-specific EOI (`0x20` to `0x20`), and `iret`s.
+
+### HLT fast-forward across the IRQ5 window
+
+`next_timer_wake` previously returned `None` (genuine halt) for a guest that
+`hlt`s on anything other than PIT/IRQ0, so a game that arms DMA and `hlt`s on
+IRQ5 would never wake — and worse, be treated as a genuine halt. The fix extends
+the wake set:
+
+- `Pic8259Pair::irq5_unmasked()` mirrors `irq0_unmasked()`
+  (`master.imr & 0x20 == 0`).
+- `SbDsp::clocks_until_next_irq(rate_hz, clock_hz) -> Option<u64>` returns the
+  CPU clocks to the sooner of the next half-buffer edge
+  (`block_remaining - block_size/2`, unless already reached) and the end-buffer
+  edge (`block_remaining`), converted via `ceil(samples * clock_hz / rate_hz)`
+  and clamped to at least one. It returns `None` only when not playing.
+- `next_timer_wake` now returns `None` only when interrupts are disabled or
+  *neither* IRQ0 nor IRQ5 can fire; otherwise it returns the `min` of the PIT
+  wake and the DSP wake, clamped to `[1, remaining]`.
+
+A guest that `sti;hlt`s on IRQ5 is thus fast-forwarded across the sample window
+(the host golden `sb_dma_irq5_wakes_a_halted_cpu_via_fast_forward` asserts both
+that the handler ran and that real emulated time advanced), matching how
+`boot_suite_reports_timer_irq0_pass` asserts genuine time advance for the PIT
+path. The boot-suite DMA probes themselves use busy-loops rather than `hlt`, so
+they are unaffected by this change.
+
 
