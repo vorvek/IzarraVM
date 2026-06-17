@@ -33,8 +33,7 @@ it. What is in:
 | Status (`3DA`) | Display-disabled (bit 0), vertical retrace (bit 3), beam-derived |
 | Beam | Cycle-coupled dot clock, catch-up rasterization, per-frame finalize |
 
-Deferred to later slices: line-compare split screens (and pel-pan forced
-to 0 below the split), pel-pan smooth-scroll polish, mode-X / unchained
+Deferred to later slices: pel-pan smooth-scroll polish, mode-X / unchained
 256-color, the bad-card mid-scanline latch (shake) reproduction,
 pixel-granular catch-up, and mid-frame Vertical-Display-End / blank-register
 tricks.
@@ -100,6 +99,60 @@ Divergences (fidelity directive):
 3. **Address-clock dividers not modeled.** CR17 bit 3 (count by 2) and CR14 bit 5
    (count by 4) are stored but not applied to the counter rate. The 16-color
    planar modes select no division.
+
+## Slice 4 coverage
+
+Slice 4 adds the CRTC Line Compare split screen. When the beam's scanline reaches
+the Line Compare value, the display-address counter reloads to offset 0 for the
+rest of the frame, so the region below the split shows VRAM from offset 0
+independent of the start-address scroll above it. This is the hardware split used
+for a scrolling playfield with a static status panel, the companion to the slice-3
+hardware scroll.
+
+| Area | Covered in slice 4 |
+|------|--------------------|
+| Line Compare | Full 10-bit value assembled from CRTC 18h (bits 0-7), the Overflow register 07h bit 4 (bit 8), and the Maximum Scan Line register 09h bit 6 (bit 9); live state on `CrtcTiming`, defaulted 0x3FF (disabled) per mode |
+| Split | Below the split (`counter_line > line_compare`) the address counter reloads to 0; rows are counted from the first split scanline (`line_compare + 1`), so the bottom region addresses VRAM from offset 0 |
+| Comparison point | Against the scan-counter line, in the same scan-counter units the beam and the other vertical timing registers use; not divided by the double-scan factor |
+| Pel-pan below split | Forced to 0 below the split when Attribute Mode Control (10h) bit 5 is set ("enable pixel panning: 0 = all, 1 = up to line compare"); applies everywhere when clear |
+| Registers | CRTC 18h / 07h / 09h writable through 3D4/3D5; each write updates only its line-compare bit |
+
+The semantics are pinned to Abrash's Graphics Programming Black Book chapter 30
+("Video Est Omnis Divisa"): the scanline matching line compare is the last line
+above the split, the split starts on the following line, and the split reloads the
+display-memory pointer to zero. The register assembly matches RBIL `PORTS.B`
+(CRTC table P0708, Attribute Mode Control table P0664).
+
+The done-signal is equality: the top region renders from a non-zero start address
+(scrolled and pel-panned) and the bottom region renders from offset 0 (pel-pan
+forced to 0), proven at unit
+(`vga::tests::line_compare_split_renders_top_scrolled_and_bottom_from_offset_zero`)
+and end-to-end (`line_compare_split_through_the_machine`) levels.
+
+Target, honesty note: the split-screen-with-scroll technique is verified against
+Abrash chapter 30. A specific 16-color shipping-title attribution was not confirmed
+from released source: the released id EGA sources (Keen Dreams, Catacomb 3-D) do not
+program the line-compare register, and the common claim that Commander Keen uses
+split-screen for its status bar is not backed by released source. The workload is the
+genre, an EGA/VGA 16-color hardware scroller with a locked status panel.
+
+Divergences (fidelity directive):
+
+1. **EGA two-lines-lower split not modeled.** Abrash chapter 30 notes the EGA split
+   may display two scan lines lower; this core targets the VGA, where the split
+   starts on the line after the match, so the EGA variance is out of scope.
+2. **Line Compare bit 9 assembled but unexercised in scope.** Bit 9 only matters for
+   splits at scanline 512 or higher; the in-scope modes top out at Vertical Display
+   End 480, so no in-scope split reaches it. Assembled for fidelity, flagged like
+   slice 3's doubleword bits.
+3. **Overflow / Maximum Scan Line non-line-compare fields not honored from guest
+   writes.** A 07h or 09h write updates only the line-compare bit; the vertical timing
+   high bits (07h) and the double-scan / max-scan fields (09h) stay mode-defaulted,
+   consistent with the existing full-timing-via-set_mode simplification.
+4. **Byte panning and exact preset-row-scan re-alignment at the split not modeled.**
+   CRTC 08h byte panning is not modeled, so it is not reset at the split; the bottom
+   region restarts row counting at `line_compare + 1` without a sub-double-scan-row
+   phase offset.
 
 ## Latch rules
 
