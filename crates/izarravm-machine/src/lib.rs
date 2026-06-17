@@ -394,6 +394,17 @@ impl Machine {
         self.video.set_mode_0dh();
     }
 
+    /// Select a VGA planar mode by its INT 10h number from the host side. Returns
+    /// false for an unimplemented number. On success it hands the display back to
+    /// the VGA core (clears the Margo latch), like the guest INT 10h path.
+    pub fn set_vga_mode(&mut self, mode: u8) -> bool {
+        let ok = self.video.set_mode(mode);
+        if ok {
+            self.margo_active = false;
+        }
+        ok
+    }
+
     /// Service the host side of an `INT 10h` after the instruction retires.
     /// The CPU registers are intact here: a software interrupt only pushes
     /// flags/CS/IP.
@@ -1154,7 +1165,9 @@ impl MachineBus<'_> {
             // the flat mode-13h buffer. cpu_read loads the VGA latches as a side
             // effect of the read, so this path needs &mut self.
             if self.video.active_mode() == VideoMode::Planar {
-                return Ok((0..width).map(|i| self.video.cpu_read(offset + i)).collect());
+                return Ok((0..width)
+                    .map(|i| self.video.cpu_read(offset + i))
+                    .collect());
             }
             return (0..width)
                 .map(|index| {
@@ -2384,9 +2397,7 @@ mod tests {
         // 10 000 CPU clocks at 25 MHz with a 25.175 MHz dot clock advances
         // roughly 10 070 dots — well above zero.
         machine.advance_devices(10_000);
-        assert!(
-            machine.video().beam_dots() != before || machine.video().frames_completed() > 0
-        );
+        assert!(machine.video().beam_dots() != before || machine.video().frames_completed() > 0);
     }
 
     #[test]
@@ -2480,5 +2491,21 @@ mod tests {
                 "row {row} below the split must use the new palette"
             );
         }
+    }
+
+    #[test]
+    fn set_vga_mode_selects_planar_geometry_per_number() {
+        let mut machine = test_machine();
+
+        assert!(machine.set_vga_mode(0x0E));
+        assert_eq!(machine.active_display(), ActiveDisplay::VgaRaster);
+        assert_eq!(machine.video().raster_width(), 640);
+        assert_eq!(machine.video().raster_height(), 449);
+
+        assert!(machine.set_vga_mode(0x12));
+        assert_eq!(machine.video().raster_width(), 640);
+        assert_eq!(machine.video().raster_height(), 525);
+
+        assert!(!machine.set_vga_mode(0x99));
     }
 }
