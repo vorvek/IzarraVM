@@ -2158,6 +2158,24 @@ mod tests {
     }
 
     #[test]
+    fn boot_suite_reports_opl3_pass() {
+        let mut machine = Machine::new_boot_image(
+            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            izarravm_firmware::X86_BOOT_TEST_IMAGE,
+        )
+        .unwrap();
+        machine.run_until_halt_or_cycles(5_000_000).unwrap();
+        let results = izarravm_firmware::parse_result_block(machine.memory().as_slice()).unwrap();
+        assert!(
+            results.records.iter().any(|record| {
+                record.status == izarravm_firmware::SuiteRecordStatus::Pass
+                    && record.name == "sound.opl3"
+            }),
+            "boot suite should report PASS sound.opl3 (YMF262 status-at-rest signature)"
+        );
+    }
+
+    #[test]
     fn cli_hlt_is_a_genuine_halt() {
         // With interrupts off, HLT must still halt immediately, not spin.
         let mut machine = Machine::new(

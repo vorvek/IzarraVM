@@ -25,6 +25,7 @@ result_payload:
     db 'PASS video.vga_mode13h', 10
     db 'FAIL sound.pc_speaker', 10
     db 'FAIL sound.opl2', 10
+opl3_record:
     db 'FAIL sound.opl3', 10
 sb_reset_record:
     db 'FAIL sound.sb_dsp_reset', 10

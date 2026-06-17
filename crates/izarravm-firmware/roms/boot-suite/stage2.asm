@@ -19,6 +19,8 @@ org 0x8000
 %define DSP_READ 0x22A
 %define DSP_WRITE 0x22C
 %define DSP_STATUS 0x22E
+%define OPL_ADDR 0x388
+%define OPL_DATA 0x389
 
 stage2_start:
     cli
@@ -65,6 +67,7 @@ stage2_start:
     call test_mode13h
     call test_timer
     call test_sb_dsp_reset
+    call test_opl3
 
     hlt
     jmp $
@@ -235,6 +238,28 @@ test_sb_dsp_reset:
     cmp al, 0xAA
     jne .done                 ; wrong ack -> leave FAIL
     mov di, RESULT_BLOCK + (sb_reset_record - result_block_template)
+    mov byte [di], 'P'
+    mov byte [di + 2], 'S'
+    mov byte [di + 3], 'S'
+    add word [RESULT_BLOCK + 10], 27
+.done:
+    ret
+
+test_opl3:
+    ; YMF262-vs-YM3812: reset the timer flags (reg 0x04 <- 0x80), then read the
+    ; status port. An OPL3 reads 0x00 at rest (only IRQ/timer bits 7/6/5 are
+    ; defined); an OPL2 reads 0x06 (always-set BUSY bits 1/2).
+    mov dx, OPL_ADDR
+    mov al, 0x04
+    out dx, al
+    mov dx, OPL_DATA
+    mov al, 0x80            ; reset both overflow flags
+    out dx, al
+    mov dx, OPL_ADDR        ; status is readable on 0x388
+    in al, dx
+    and al, 0xE0            ; only bits 7/6/5 are defined
+    jnz .done               ; nonzero -> not the OPL3 signature -> leave FAIL
+    mov di, RESULT_BLOCK + (opl3_record - result_block_template)
     mov byte [di], 'P'
     mov byte [di + 2], 'S'
     mov byte [di + 3], 'S'
