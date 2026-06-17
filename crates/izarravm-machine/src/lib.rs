@@ -3073,4 +3073,56 @@ mod tests {
         assert_eq!(machine.dos_output(), b"HI!");
         assert_eq!(std::fs::read(dir.path().join("OUT.TXT")).unwrap(), b"HI!");
     }
+
+    #[test]
+    fn dos_program_enumerates_files() {
+        // org 0x100: FindFirst "C:\\*.TXT" (AH=4Eh, CX=0). Then loop: if CF set, exit;
+        // else write the 13-byte DTA name field (PSP:0x9E) to stdout (AH=40h, BX=1,
+        // CX=13), FindNext (AH=4Fh), repeat. The default DTA is PSP:0x80, so the name
+        // field is at PSP:0x9E. Pattern "C:\\*.TXT\0" sits at 0x123.
+        //
+        //   off 0:  b4 4e        mov ah, 4Eh
+        //   off 2:  31 c9        xor cx, cx
+        //   off 4:  ba 23 01     mov dx, 0x123
+        //   off 7:  cd 21        int 21h
+        // loop (off 9):
+        //   off 9:  72 13        jc done (+0x13 -> off 30)
+        //   off 11: b4 40        mov ah, 40h
+        //   off 13: bb 01 00     mov bx, 1
+        //   off 16: b9 0d 00     mov cx, 13
+        //   off 19: ba 9e 00     mov dx, 0x9E
+        //   off 22: cd 21        int 21h
+        //   off 24: b4 4f        mov ah, 4Fh
+        //   off 26: cd 21        int 21h
+        //   off 28: eb eb        jmp loop (-0x15 -> off 9)
+        // done (off 30):
+        //   off 30: b8 00 4c     mov ax, 4C00h
+        //   off 33: cd 21        int 21h
+        //   off 35: "C:\\*.TXT", 0
+        let com: &[u8] = &[
+            0xb4, 0x4e, 0x31, 0xc9, 0xba, 0x23, 0x01, 0xcd, 0x21, 0x72, 0x13, 0xb4, 0x40, 0xbb,
+            0x01, 0x00, 0xb9, 0x0d, 0x00, 0xba, 0x9e, 0x00, 0xcd, 0x21, 0xb4, 0x4f, 0xcd, 0x21,
+            0xeb, 0xeb, 0xb8, 0x00, 0x4c, 0xcd, 0x21, 0x43, 0x3a, 0x5c, 0x2a, 0x2e, 0x54, 0x58,
+            0x54, 0x00,
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ONE.TXT"), b"a").unwrap();
+        std::fs::write(dir.path().join("TWO.TXT"), b"bb").unwrap();
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com)
+                .unwrap();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
+
+        // Each found name was written as the 13-byte ASCIIZ field; split on NUL.
+        let mut names: Vec<String> = machine
+            .dos_output()
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["ONE.TXT", "TWO.TXT"]);
+    }
 }
