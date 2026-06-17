@@ -15,8 +15,8 @@ pub struct VbeMode {
     pub bpp: u32,
 }
 
-/// The modes Margo lists, reports, and sets. Slice 2b implements the 8-bit
-/// indexed modes only; hi-color modes arrive in a later slice.
+/// The modes Margo lists, reports, and sets. Includes 8-bit indexed modes
+/// (slice 2b) and hi-color/true-color modes (slice 8): 15bpp, 16bpp, and 32bpp.
 pub const MARGO_VBE_MODES: &[VbeMode] = &[
     VbeMode {
         number: 0x100,
@@ -42,6 +42,60 @@ pub const MARGO_VBE_MODES: &[VbeMode] = &[
         height: 768,
         bpp: 8,
     },
+    VbeMode {
+        number: 0x110,
+        width: 640,
+        height: 480,
+        bpp: 15,
+    },
+    VbeMode {
+        number: 0x111,
+        width: 640,
+        height: 480,
+        bpp: 16,
+    },
+    VbeMode {
+        number: 0x113,
+        width: 800,
+        height: 600,
+        bpp: 15,
+    },
+    VbeMode {
+        number: 0x114,
+        width: 800,
+        height: 600,
+        bpp: 16,
+    },
+    VbeMode {
+        number: 0x116,
+        width: 1024,
+        height: 768,
+        bpp: 15,
+    },
+    VbeMode {
+        number: 0x117,
+        width: 1024,
+        height: 768,
+        bpp: 16,
+    },
+    VbeMode {
+        number: 0x14a,
+        width: 640,
+        height: 480,
+        bpp: 32,
+    },
+    VbeMode {
+        number: 0x14c,
+        width: 800,
+        height: 600,
+        bpp: 32,
+    },
+    VbeMode {
+        number: 0x14e,
+        width: 1024,
+        height: 768,
+        bpp: 32,
+    },
 ];
 
 pub fn vbe_mode(number: u16) -> Option<VbeMode> {
@@ -49,6 +103,12 @@ pub fn vbe_mode(number: u16) -> Option<VbeMode> {
         .iter()
         .copied()
         .find(|mode| mode.number == number)
+}
+
+/// Bytes a pixel of `bpp` occupies in the frame store: 8->1, 15->2, 16->2,
+/// 32->4. The 15bpp case is why this is not `bpp / 8`.
+pub fn bytes_per_pixel(bpp: u32) -> u32 {
+    bpp.div_ceil(8)
 }
 
 pub const REG_ID: usize = 0x0000;
@@ -531,7 +591,7 @@ impl Margo {
             width: mode.width,
             height: mode.height,
             bpp: mode.bpp,
-            pitch: mode.width * mode.bpp / 8,
+            pitch: mode.width * bytes_per_pixel(mode.bpp),
             start: 0,
         };
         true
@@ -906,7 +966,7 @@ mod tests {
     #[test]
     fn set_mode_rejects_modes_outside_the_table() {
         let mut margo = Margo::default();
-        assert!(!margo.set_mode(0x111)); // 640x480x16, not implemented in this slice
+        assert!(!margo.set_mode(0x112)); // 640x480x24 packed, not in the table
         assert_eq!(margo.display(), MargoDisplay::default());
     }
 
@@ -2805,5 +2865,33 @@ mod tests {
         write_reg(&mut margo, REG_COMMAND, 0x03);
         write_reg(&mut margo, REG_MONO_DATA, 0x8000_0000); // one word, col 0 set
         assert_eq!(margo.read_vram_u8(0), 0xaa ^ 0x0f);
+    }
+
+    #[test]
+    fn bytes_per_pixel_rounds_up_to_whole_bytes() {
+        assert_eq!(bytes_per_pixel(8), 1);
+        assert_eq!(bytes_per_pixel(15), 2);
+        assert_eq!(bytes_per_pixel(16), 2);
+        assert_eq!(bytes_per_pixel(32), 4);
+    }
+
+    #[test]
+    fn vbe_mode_lookup_finds_hicolor_modes() {
+        assert_eq!(vbe_mode(0x110).unwrap().bpp, 15);
+        assert_eq!(vbe_mode(0x111).unwrap().bpp, 16);
+        assert_eq!(vbe_mode(0x14a).unwrap().bpp, 32);
+        assert_eq!(vbe_mode(0x14e).unwrap().width, 1024);
+    }
+
+    #[test]
+    fn set_mode_pitch_uses_whole_byte_pixels() {
+        let mut margo = Margo::default();
+        margo.set_mode(0x110); // 640x480x15
+        assert_eq!(margo.display().bpp, 15);
+        assert_eq!(margo.display().pitch, 1280); // 640 * 2, not 640 * 15 / 8
+        margo.set_mode(0x111); // 640x480x16
+        assert_eq!(margo.display().pitch, 1280);
+        margo.set_mode(0x14a); // 640x480x32
+        assert_eq!(margo.display().pitch, 2560);
     }
 }

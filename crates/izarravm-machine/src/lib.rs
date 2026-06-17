@@ -1900,7 +1900,7 @@ mod tests {
             0x8e, 0xc0, // mov es, ax
             0xbf, 0x00, 0x00, // mov di, 0
             0xb8, 0x01, 0x4f, // mov ax, 4F01h
-            0xb9, 0x11, 0x01, // mov cx, 0111h (not in the table)
+            0xb9, 0x12, 0x01, // mov cx, 0112h (640x480x24, packed 24-bit not provided)
             0xcd, 0x10, // int 10h
             0xf4, // hlt
         ]);
