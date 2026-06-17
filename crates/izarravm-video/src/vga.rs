@@ -402,6 +402,21 @@ impl Vga {
         drawn
     }
 
+    /// Display-address origin for one scanline, honoring the CRTC Line Compare
+    /// split (Abrash, Graphics Programming Black Book ch.30). Returns
+    /// `(start_base, first_line)`: above the split the start address scrolls the
+    /// region; at and below `line_compare + 1` the address counter reloads to 0
+    /// and row counting restarts there. The comparison is in scan-counter units
+    /// and is not divided by the double-scan factor, so `first_line` is already
+    /// in counter units and is divided by `scan_factor` by the caller.
+    fn split_origin(&self, counter_line: u32) -> (u32, u32) {
+        if counter_line > self.crtc.line_compare {
+            (0, self.crtc.line_compare + 1)
+        } else {
+            (self.crtc.start_address, 0)
+        }
+    }
+
     /// Assemble one active scanline into `hdisp_end` DAC indices, applying pel-pan
     /// and the attribute palette. `counter_line` is the scanline in scan-counter
     /// units; double-scan maps it to source row `counter_line / scan_factor`, so a
@@ -415,11 +430,7 @@ impl Vga {
         // the beam and the other vertical timing registers use, so it is not divided by
         // the double-scan factor.
         let below_split = counter_line > self.crtc.line_compare;
-        let (start, first_line) = if below_split {
-            (0, self.crtc.line_compare + 1)
-        } else {
-            (self.crtc.start_address, 0)
-        };
+        let (start, first_line) = self.split_origin(counter_line);
         // Below the split, pel-pan is forced to 0 when Attribute Mode Control (10h)
         // bit 5 is set ("enable pixel panning: 0 = all, 1 = up to line compare").
         let pan = if below_split && (self.attr.mode_control & 0x20 != 0) {
