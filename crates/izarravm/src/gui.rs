@@ -66,6 +66,18 @@ fn text_to_color_image(frame: &TextFrame) -> egui::ColorImage {
     words_to_color_image(&words, width, height)
 }
 
+/// The Very Slow / Slow / Fast readout. The fiction's three modes map to these
+/// clocks; the actual mode is switched from Toka, which is not wired yet, so
+/// this reflects the machine's current clock. Anything unmapped shows its MHz.
+fn speed_label(clock_hz: u64) -> String {
+    match clock_hz {
+        25_000_000 => "Very Slow".to_string(),
+        66_000_000 => "Slow".to_string(),
+        233_000_000 => "Fast".to_string(),
+        other => format!("{} MHz", other / 1_000_000),
+    }
+}
+
 /// Nearest-neighbour integer upscale per axis, as large as fits the target
 /// without exceeding it. The caller then lets egui stretch the small remainder
 /// with bilinear filtering, which gives a sharp-bilinear look without a shader.
@@ -132,6 +144,15 @@ mod tests {
         let src = egui::ColorImage::new([4, 4], vec![egui::Color32::BLACK; 16]);
         let out = sharp_prescale(&src, 3, 3);
         assert_eq!(out.size, [4, 4]);
+    }
+
+    #[test]
+    fn speed_label_maps_known_clocks() {
+        assert_eq!(speed_label(25_000_000), "Very Slow");
+        assert_eq!(speed_label(66_000_000), "Slow");
+        assert_eq!(speed_label(233_000_000), "Fast");
+        // Unmapped clocks fall back to a raw MHz label.
+        assert_eq!(speed_label(133_000_000), "133 MHz");
     }
 
     #[test]
