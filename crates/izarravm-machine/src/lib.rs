@@ -2037,7 +2037,8 @@ mod tests {
             b'$',
         ];
         let mut machine =
-            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com).unwrap();
+            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com)
+                .unwrap();
         let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
         assert_eq!(reason, StopReason::DosExit { code: 0 });
         assert_eq!(machine.dos_output(), b"Hi");
@@ -2048,7 +2049,8 @@ mod tests {
         // org 0x100: mov ax,4c07; int 21
         let com: &[u8] = &[0xb8, 0x07, 0x4c, 0xcd, 0x21];
         let mut machine =
-            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com).unwrap();
+            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com)
+                .unwrap();
         let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
         assert_eq!(reason, StopReason::DosExit { code: 7 });
         assert!(machine.dos_output().is_empty());
@@ -2059,7 +2061,8 @@ mod tests {
         // org 0x100: mov ah,0x30 (unhandled); int 21; mov ax,4c00; int 21
         let com: &[u8] = &[0xb4, 0x30, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21];
         let mut machine =
-            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com).unwrap();
+            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com)
+                .unwrap();
         let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
         assert_eq!(reason, StopReason::DosExit { code: 0 });
         assert!(machine.dos_output().is_empty());
@@ -2131,7 +2134,8 @@ mod tests {
         ];
 
         let mut available =
-            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com).unwrap();
+            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com)
+                .unwrap();
         available.set_dos_stdin(b"X");
         assert_eq!(
             available.run_until_halt_or_cycles(100_000).unwrap(),
@@ -2140,7 +2144,8 @@ mod tests {
         assert_eq!(available.dos_output(), b"X"); // char path taken, AL echoed
 
         let mut empty =
-            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com).unwrap();
+            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com)
+                .unwrap();
         assert_eq!(
             empty.run_until_halt_or_cycles(100_000).unwrap(),
             StopReason::DosExit { code: 0 }
@@ -2155,7 +2160,8 @@ mod tests {
             0xb4, 0x01, 0xcd, 0x21, 0xb4, 0x01, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21,
         ];
         let mut machine =
-            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com).unwrap();
+            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com)
+                .unwrap();
         machine.set_dos_stdin(b"hi");
         assert_eq!(
             machine.run_until_halt_or_cycles(100_000).unwrap(),
