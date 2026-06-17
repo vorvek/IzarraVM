@@ -1,7 +1,7 @@
 use izarravm_bus::{BusError, Memory};
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -275,6 +275,10 @@ impl AccessMode {
 
     fn can_read(self) -> bool {
         matches!(self, AccessMode::Read | AccessMode::ReadWrite)
+    }
+
+    fn can_write(self) -> bool {
+        matches!(self, AccessMode::Write | AccessMode::ReadWrite)
     }
 }
 
@@ -724,6 +728,61 @@ impl DosKernel {
                             },
                         );
                         regs.ax = handle;
+                        regs.cf = false;
+                    }
+                    Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
+                }
+                Ok(DosAction::Continue)
+            }
+            // AH=40h: write CX bytes from DS:DX to the handle in BX. BX=1/2 route to
+            // stdout/stderr (the output buffer). For a file handle, CX=0 truncates the
+            // file at the current position. CF=0 + AX=bytes-written, or CF=1 + AX=code.
+            0x40 => {
+                let handle = regs.bx;
+                let count = usize::from(regs.cx);
+                let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+                // Predefined console handles: 1=stdout, 2=stderr -> the output buffer.
+                if handle == 1 || handle == 2 {
+                    for index in 0..count {
+                        let byte = mem.read_u8(base + index)?;
+                        self.stdout.push(byte);
+                    }
+                    regs.ax = regs.cx;
+                    regs.cf = false;
+                    return Ok(DosAction::Continue);
+                }
+                let Some(of) = self.open_files.get_mut(&handle) else {
+                    set_dos_error(regs, 0x06);
+                    return Ok(DosAction::Continue);
+                };
+                if !of.mode.can_write() {
+                    set_dos_error(regs, 0x05);
+                    return Ok(DosAction::Continue);
+                }
+                if count == 0 {
+                    // CX=0 truncates (or extends) the file to the current position.
+                    let pos = match of.file.stream_position() {
+                        Ok(pos) => pos,
+                        Err(err) => {
+                            set_dos_error(regs, dos_io_error_code(&err));
+                            return Ok(DosAction::Continue);
+                        }
+                    };
+                    if let Err(err) = of.file.set_len(pos) {
+                        set_dos_error(regs, dos_io_error_code(&err));
+                        return Ok(DosAction::Continue);
+                    }
+                    regs.ax = 0;
+                    regs.cf = false;
+                    return Ok(DosAction::Continue);
+                }
+                let mut buffer = vec![0u8; count];
+                for (index, slot) in buffer.iter_mut().enumerate() {
+                    *slot = mem.read_u8(base + index)?;
+                }
+                match of.file.write_all(&buffer) {
+                    Ok(()) => {
+                        regs.ax = regs.cx;
                         regs.cf = false;
                     }
                     Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
@@ -2062,5 +2121,51 @@ mod tests {
             std::fs::metadata(dir.path().join("OLD.TXT")).unwrap().len(),
             0
         );
+    }
+
+    #[test]
+    fn ah40_on_a_read_only_handle_returns_ax05() {
+        let (mut kernel, mut mem, _dir) = kernel_with_drive(&[("R.TXT", b"hi")], r"C:\R.TXT");
+        let mut open = DosRegs {
+            ax: 0x3d00,
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut open, &mut mem).unwrap();
+        let handle = open.ax;
+        let mut write = DosRegs {
+            ax: 0x4000,
+            bx: handle,
+            cx: 2,
+            ds: 0x0100,
+            dx: 0x0300,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut write, &mut mem).unwrap();
+        assert!(write.cf);
+        assert_eq!(write.ax, 0x05);
+    }
+
+    #[test]
+    fn ah40_to_stdout_handle_writes_to_the_output_buffer() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let src = 0x0100usize * 16 + 0x0300;
+        for (i, b) in b"hello".iter().enumerate() {
+            mem.write_u8(src + i, *b).unwrap();
+        }
+        let mut regs = DosRegs {
+            ax: 0x4000,
+            bx: 1,
+            cx: 5,
+            ds: 0x0100,
+            dx: 0x0300,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf);
+        assert_eq!(regs.ax, 5);
+        assert_eq!(kernel.stdout(), b"hello");
     }
 }
