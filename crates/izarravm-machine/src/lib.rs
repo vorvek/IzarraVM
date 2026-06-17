@@ -1,4 +1,4 @@
-use izarravm_audio::{OplChip, Resampler};
+use izarravm_audio::{OplChip, Resampler, SbDsp};
 use izarravm_bus::{BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CpuBus, Memory};
 use izarravm_core::{CpuPreset, HardwareProfile, VideoCard};
 use izarravm_cpu::{Cpu386, CpuError, SegmentIndex, SegmentRegister};
@@ -10,6 +10,7 @@ use izarravm_video::{
 };
 use thiserror::Error;
 
+mod dma;
 mod pic;
 mod pit;
 
@@ -112,6 +113,9 @@ const DAC_HZ: u32 = 44_100;
 const PIT_INPUT_HZ: u32 = 1_193_182;
 /// VGA 25.175 MHz dot clock (standard 640x480 and related modes).
 const VGA_DOT_HZ: u64 = 25_175_000;
+/// Sound Blaster 16 IRQ and DMA resources (fixed for the Resonique 2).
+const SB_IRQ: u8 = 5;
+const SB_DMA_CHANNEL: usize = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveDisplay {
@@ -137,11 +141,18 @@ pub struct Machine {
     pic: pic::Pic8259Pair,
     pit: pit::Pit,
     pit_clocks: f64, // fractional PIT input clocks owed to the counters
+    dma: dma::DmaController,
     opl: OplChip,
     resampler: Resampler,
     opl_micros: f64, // fractional microseconds owed to the OPL timers
-    margo_ns: f64,   // fractional nanoseconds owed to the Margo busy countdown
-    vga_dots: f64,   // fractional VGA dot clocks owed to the beam advance
+    dsp: SbDsp,
+    /// DSP PCM resampler (rate_hz -> 44100), rebuilt when the programmed rate
+    /// changes. Summed with the OPL stream in render_audio.
+    dsp_resampler: Resampler,
+    dsp_rate_hz: u32, // input rate the dsp_resampler is currently configured for
+    dsp_micros: f64,  // fractional microseconds owed to the DSP reset-settle clock
+    margo_ns: f64,    // fractional nanoseconds owed to the Margo busy countdown
+    vga_dots: f64,    // fractional VGA dot clocks owed to the beam advance
     trace: BusTrace,
     elapsed_clocks: u64,
 }
@@ -168,9 +179,16 @@ impl Machine {
             pic: pic::Pic8259Pair::default(),
             pit: pit::Pit::default(),
             pit_clocks: 0.0,
+            dma: dma::DmaController::default(),
             opl: OplChip::default(),
             resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             opl_micros: 0.0,
+            dsp: SbDsp::default(),
+            // Placeholder; sync_dsp_resampler rebuilds this for the live rate on
+            // first use, so the value here never reaches the DAC as-is.
+            dsp_resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
+            dsp_rate_hz: 0,
+            dsp_micros: 0.0,
             margo_ns: 0.0,
             vga_dots: 0.0,
             trace: BusTrace::default(),
@@ -210,9 +228,16 @@ impl Machine {
             pic: pic::Pic8259Pair::default(),
             pit: pit::Pit::default(),
             pit_clocks: 0.0,
+            dma: dma::DmaController::default(),
             opl: OplChip::default(),
             resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             opl_micros: 0.0,
+            dsp: SbDsp::default(),
+            // Placeholder; sync_dsp_resampler rebuilds this for the live rate on
+            // first use, so the value here never reaches the DAC as-is.
+            dsp_resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
+            dsp_rate_hz: 0,
+            dsp_micros: 0.0,
             margo_ns: 0.0,
             vga_dots: 0.0,
             trace: BusTrace::default(),
@@ -270,9 +295,16 @@ impl Machine {
             pic: pic::Pic8259Pair::default(),
             pit: pit::Pit::default(),
             pit_clocks: 0.0,
+            dma: dma::DmaController::default(),
             opl: OplChip::default(),
             resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             opl_micros: 0.0,
+            dsp: SbDsp::default(),
+            // Placeholder; sync_dsp_resampler rebuilds this for the live rate on
+            // first use, so the value here never reaches the DAC as-is.
+            dsp_resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
+            dsp_rate_hz: 0,
+            dsp_micros: 0.0,
             margo_ns: 0.0,
             vga_dots: 0.0,
             trace: BusTrace::default(),
@@ -354,7 +386,9 @@ impl Machine {
             device_ports: &mut self.device_ports,
             pic: &mut self.pic,
             pit: &mut self.pit,
+            dma: &mut self.dma,
             opl: &mut self.opl,
+            dsp: &mut self.dsp,
             trace: &mut self.trace,
             pending_soft_int: &mut self.pending_soft_int,
             wait_states: self.profile.wait_states,
@@ -676,6 +710,14 @@ impl Machine {
         self.opl.advance_micros(whole as u64);
         self.opl_micros -= whole;
 
+        // The DSP reset-settle countdown advances with emulated time so a
+        // detection routine's delay loop sees 0xAA become available. The
+        // playback sample clock is paced by render_audio, not here.
+        self.dsp_micros += clocks as f64 * 1_000_000.0 / self.profile.clock_hz as f64;
+        let whole = self.dsp_micros.floor();
+        self.dsp.advance_micros(whole);
+        self.dsp_micros -= whole;
+
         self.pit_clocks += clocks as f64 * f64::from(PIT_INPUT_HZ) / self.profile.clock_hz as f64;
         let whole = self.pit_clocks.floor();
         self.pit_clocks -= whole;
@@ -695,17 +737,68 @@ impl Machine {
         self.vga_dots -= whole;
     }
 
-    /// Render `native_samples` of OPL3 output at 49716 Hz and return the
-    /// resampled 44100 Hz stereo PCM (saturated to 16-bit) ready for the DAC.
-    /// The caller paces this by elapsed emulated time to keep audio in step.
+    /// Render `native_samples` of DSP 8-bit DMA output (signed 16-bit, mono).
+    /// Each sample pulls one byte from DMA channel 1; the DSP's half/end-buffer
+    /// IRQ is forwarded to the PIC as IRQ5. Returns the raw mono stream; the
+    /// mixer (render_audio) resamples and sums it with the OPL.
+    pub fn render_dsp_audio(&mut self, native_samples: usize) -> Vec<i16> {
+        let Machine {
+            dsp,
+            dma,
+            memory,
+            pic,
+            ..
+        } = self;
+        let mut out = Vec::with_capacity(native_samples);
+        for _ in 0..native_samples {
+            if let Some(sample) = dsp.render_sample(|| dma.read_byte(SB_DMA_CHANNEL, memory)) {
+                out.push(sample);
+            }
+            if dsp.take_irq() {
+                pic.request(SB_IRQ);
+            }
+        }
+        out
+    }
+
+    /// Rebuild the DSP resampler when the programmed sample rate changes, so it
+    /// always runs rate_hz -> 44100.
+    fn sync_dsp_resampler(&mut self) {
+        let rate = self.dsp.rate_hz().max(1);
+        if rate != self.dsp_rate_hz {
+            self.dsp_resampler = Resampler::new(rate, DAC_HZ);
+            self.dsp_rate_hz = rate;
+        }
+    }
+
+    /// Render `native_samples` of mixed OPL3 + SB16 DSP audio at the 44100 Hz DAC
+    /// rate (stereo, saturated to 16-bit). `native_samples` is counted in OPL
+    /// native (49716 Hz) time; the DSP is advanced by the matching wall-clock
+    /// duration at its own rate. Each stream is resampled to 44100 and summed.
     pub fn render_audio(&mut self, native_samples: usize) -> Vec<(i16, i16)> {
-        let native: Vec<(i32, i32)> = (0..native_samples)
+        let opl_native: Vec<(i32, i32)> = (0..native_samples)
             .map(|_| self.opl.render_sample())
             .collect();
-        self.resampler
-            .process(&native)
-            .into_iter()
-            .map(|(l, r)| (clamp_i16(l), clamp_i16(r)))
+        let opl_out = self.resampler.process(&opl_native);
+
+        self.sync_dsp_resampler();
+        // DSP native samples spanning the same wall-clock window as the OPL.
+        let dsp_native_count = (native_samples as f64 * self.dsp.rate_hz() as f64
+            / OPL_NATIVE_HZ as f64)
+            .round() as usize;
+        let dsp_mono = self.render_dsp_audio(dsp_native_count);
+        let dsp_stereo: Vec<(i32, i32)> = dsp_mono.iter().map(|&s| (s as i32, s as i32)).collect();
+        let dsp_out = self.dsp_resampler.process(&dsp_stereo);
+
+        // Sum over the longer length; a silent (idle) DSP yields no frames, so the
+        // OPL passes through unchanged when no DMA playback is armed.
+        let len = opl_out.len().max(dsp_out.len());
+        (0..len)
+            .map(|i| {
+                let (ol, or) = opl_out.get(i).copied().unwrap_or((0, 0));
+                let (dl, dr) = dsp_out.get(i).copied().unwrap_or((0, 0));
+                (clamp_i16(ol + dl), clamp_i16(or + dr))
+            })
             .collect()
     }
 
@@ -713,6 +806,20 @@ impl Machine {
     /// devices call this; slice 2b wires the PIT's IRQ0 tick through here.
     pub fn request_irq(&mut self, line: u8) {
         self.pic.request(line);
+    }
+
+    /// Pull one byte from a DMA channel's memory transfer (memory->device read).
+    /// Returns None when the channel is masked or has reached terminal count. The
+    /// sound slice feeds this to the SB16 DSP for 8-bit playback.
+    pub fn dma_read_byte(&mut self, channel: usize) -> Option<u8> {
+        self.dma.read_byte(channel, &mut self.memory)
+    }
+
+    /// Advance the DSP reset-settle clock by `micros` microseconds. The run loop
+    /// drives this from CPU clocks in advance_devices; this exposes it directly
+    /// so a reset-detection golden can settle the DSP without running the CPU.
+    pub fn advance_dsp_micros(&mut self, micros: u64) {
+        self.dsp.advance_micros(micros as f64);
     }
 
     /// Drive a PIT counter's GATE line. The PC ties GATE0/GATE1 high; the sound
@@ -779,7 +886,9 @@ impl Machine {
                     device_ports,
                     pic,
                     pit,
+                    dma,
                     opl,
+                    dsp,
                     trace,
                     pending_soft_int,
                     ..
@@ -793,7 +902,9 @@ impl Machine {
                     device_ports,
                     pic,
                     pit,
+                    dma,
                     opl,
+                    dsp,
                     trace,
                     pending_soft_int,
                     wait_states: profile.wait_states,
@@ -852,7 +963,9 @@ struct MachineBus<'a> {
     device_ports: &'a mut DevicePorts,
     pic: &'a mut pic::Pic8259Pair,
     pit: &'a mut pit::Pit,
+    dma: &'a mut dma::DmaController,
     opl: &'a mut OplChip,
+    dsp: &'a mut SbDsp,
     trace: &'a mut BusTrace,
     pending_soft_int: &'a mut Option<u8>,
     wait_states: WaitStateProfile,
@@ -955,10 +1068,16 @@ impl CpuBus for MachineBus<'_> {
             // The chip drives only the status byte on reads; data ports read open-bus.
             return Ok(u32::from(self.opl.read_port(opl_port).unwrap_or(0xff)));
         }
+        if let Some(value) = self.dsp.read_port(port) {
+            return Ok(u32::from(value));
+        }
         if let Some(value) = self.pit.read_port(port) {
             return Ok(u32::from(value));
         }
         if let Some(value) = self.pic.read_port(port) {
+            return Ok(u32::from(value));
+        }
+        if let Some(value) = self.dma.read_port(port) {
             return Ok(u32::from(value));
         }
         self.device_ports
@@ -981,6 +1100,12 @@ impl CpuBus for MachineBus<'_> {
 
         if let Some(opl_port) = opl_port(port) {
             self.opl.write_port(opl_port, value as u8);
+            return Ok(());
+        }
+        if self.dsp.write_port(port, value as u8) {
+            return Ok(());
+        }
+        if self.dma.write_port(port, value as u8) {
             return Ok(());
         }
         if self.serial.write_port(port, value as u8)
@@ -1672,6 +1797,89 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dma_channel_one_transfers_from_memory_through_the_bus() {
+        let mut machine = test_machine();
+        // Seed memory at physical 0x01_0010 (page 0x01, offset 0x0010).
+        machine.write_physical_u8(0x0001_0010, 0x77);
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x0B, BusWidth::Byte, 0x49).unwrap(); // mode ch1: single, read
+            bus.write_io(0x02, BusWidth::Byte, 0x10).unwrap(); // address LSB
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap(); // address MSB -> 0x0010
+            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap(); // count LSB
+            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap(); // count MSB -> 0 (1 transfer)
+            bus.write_io(0x83, BusWidth::Byte, 0x01).unwrap(); // page -> 0x01_0010
+            bus.write_io(0x0A, BusWidth::Byte, 0x01).unwrap(); // unmask channel 1
+        });
+        let byte = machine.dma_read_byte(1).expect("a byte from channel 1");
+        assert_eq!(byte, 0x77);
+    }
+
+    #[test]
+    fn sb_dsp_reset_handshake_through_the_bus() {
+        let mut machine = test_machine();
+        // Reset: write 1, then 0 to the DSP reset port 0x226.
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x226, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x226, BusWidth::Byte, 0x00).unwrap();
+        });
+        // Advance emulated time past the ~100us DSP settle window.
+        machine.advance_dsp_micros(200);
+        let status = with_bus(&mut machine, |bus| {
+            u8::try_from(bus.read_io(0x22E, BusWidth::Byte).unwrap()).unwrap()
+        });
+        assert_eq!(status & 0x80, 0x80, "data available after reset");
+        let ack = with_bus(&mut machine, |bus| {
+            u8::try_from(bus.read_io(0x22A, BusWidth::Byte).unwrap()).unwrap()
+        });
+        assert_eq!(ack, 0xAA);
+    }
+
+    #[test]
+    fn sb_dsp_version_and_status_route_through_the_bus() {
+        let mut machine = test_machine();
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x22C, BusWidth::Byte, 0xE1).unwrap(); // read version
+        });
+        let hi = with_bus(&mut machine, |bus| {
+            u8::try_from(bus.read_io(0x22A, BusWidth::Byte).unwrap()).unwrap()
+        });
+        let lo = with_bus(&mut machine, |bus| {
+            u8::try_from(bus.read_io(0x22A, BusWidth::Byte).unwrap()).unwrap()
+        });
+        assert_eq!([hi, lo], [4, 5]);
+    }
+
+    #[test]
+    fn sb_8bit_dma_plays_a_buffer_through_the_dsp() {
+        let mut machine = test_machine();
+        // A 16-byte unsigned ramp in conventional memory at 0x01_0000.
+        let bytes: Vec<u8> = (0..16).map(|i| (i * 16) as u8).collect();
+        for (i, &b) in bytes.iter().enumerate() {
+            machine.write_physical_u8(0x1_0000 + i as u32, b);
+        }
+        with_bus(&mut machine, |bus| {
+            // DMA ch1: address 0x0000, page 0x01, count 15, single read.
+            bus.write_io(0x0B, BusWidth::Byte, 0x49).unwrap(); // mode ch1
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x0F).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x83, BusWidth::Byte, 0x01).unwrap(); // page -> 0x01_0000
+            bus.write_io(0x0A, BusWidth::Byte, 0x01).unwrap(); // unmask ch1
+            // DSP: 11025 Hz, block 16, single 8-bit DMA output.
+            for &b in &[0x41u8, 0x2B, 0x11, 0x48, 0x0F, 0x00, 0x14] {
+                bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
+            }
+        });
+        let out = machine.render_dsp_audio(16);
+        assert_eq!(out.len(), 16);
+        // Unsigned 0x00 maps to a centered negative sample.
+        assert!(out.iter().any(|&s| s < 0), "expected negative samples");
+        // Single mode masks channel 1 at terminal count.
+        assert_eq!(machine.dma_read_byte(1), None);
+    }
+
     // Run one closure against a freshly-borrowed bus over the whole machine.
     fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R {
         let mut bus = MachineBus {
@@ -1683,7 +1891,9 @@ mod tests {
             device_ports: &mut machine.device_ports,
             pic: &mut machine.pic,
             pit: &mut machine.pit,
+            dma: &mut machine.dma,
             opl: &mut machine.opl,
+            dsp: &mut machine.dsp,
             trace: &mut machine.trace,
             pending_soft_int: &mut machine.pending_soft_int,
             wait_states: machine.profile.wait_states,
@@ -1882,6 +2092,60 @@ mod tests {
             "expected ~{DAC_HZ} frames, got {}",
             pcm.len()
         );
+    }
+
+    #[test]
+    fn render_audio_passes_through_when_the_dsp_is_idle() {
+        // No DMA playback armed: the DSP produces nothing, so render_audio must
+        // return the OPL-only output at the DAC rate (the existing contract).
+        let mut machine = test_machine();
+        let pcm = machine.render_audio(OPL_NATIVE_HZ as usize);
+        assert!(
+            (pcm.len() as i32 - DAC_HZ as i32).abs() < 50,
+            "idle DSP must not truncate the OPL stream, got {} frames",
+            pcm.len()
+        );
+    }
+
+    #[test]
+    fn render_audio_mixes_the_dsp_dc_level_with_the_opl() {
+        let mut machine = test_machine();
+        // A constant 256-byte DMA buffer; 0x40 maps to sample_u8(0x40) = -16384.
+        const BYTE: u8 = 0x40;
+        const EXPECTED: i32 = -16384; // (0x40 - 128) * 256
+        for i in 0..256u32 {
+            machine.write_physical_u8(0x1_0000 + i, BYTE);
+        }
+        with_bus(&mut machine, |bus| {
+            // DMA ch1: page 0x01, address 0, count 255, auto-init read.
+            bus.write_io(0x0B, BusWidth::Byte, 0x59).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0xFF).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x83, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x0A, BusWidth::Byte, 0x01).unwrap();
+            // DSP: 11025 Hz, block 256, auto-init 8-bit output.
+            for &b in &[0x41u8, 0x2B, 0x11, 0x48, 0xFF, 0x00, 0x1C] {
+                bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
+            }
+        });
+        // The OPL is silent (no voices keyed), so the steady output is the DSP DC
+        // level after the resampler warmup. Render plenty of OPL-native time.
+        let out = machine.render_audio(4_000);
+        assert!(!out.is_empty());
+        let mid = &out[out.len() / 3..out.len() * 2 / 3];
+        let (min_l, max_l) = mid
+            .iter()
+            .map(|f| f.0)
+            .fold((i16::MAX, i16::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
+        let center = (i32::from(min_l) + i32::from(max_l)) / 2;
+        assert!(
+            (center - EXPECTED).abs() < 400,
+            "DSP DC center {center}, expected ~{EXPECTED}"
+        );
+        // Mono is duplicated to both channels.
+        assert!(mid.iter().all(|f| f.0 == f.1), "DSP mono duplicated L/R");
     }
 
     #[test]
