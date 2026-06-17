@@ -44,7 +44,7 @@ impl CrtcTiming {
             vtotal: 449, vdisp_end: 400, vblank_start: 407, vblank_end: 442,
             vretrace_start: 412, vretrace_end: 414,
             max_scan: 1, double_scan: true,
-            start_address: 0, offset: 40,
+            start_address: 0, offset: 20,
         }
     }
 
@@ -165,9 +165,12 @@ impl Vga {
         self.crtc.hdisp_end
     }
 
+    fn scan_factor(&self) -> u32 { if self.crtc.double_scan { 2 } else { 1 } }
+
+    /// Full visible frame height in raster (doubled) lines: the whole vtotal span,
+    /// with blank rendered black so a short raster's letterbox is present.
     pub fn raster_height(&self) -> u32 {
-        let factor = if self.crtc.double_scan { 2 } else { 1 };
-        self.crtc.vdisp_end * factor // active-only for now; Task 8 makes it full-frame
+        self.crtc.vtotal * self.scan_factor()
     }
 
     fn resize_work(&mut self) {
@@ -187,8 +190,67 @@ impl Vga {
         drawn
     }
 
-    fn render_scanline(&mut self, _line: u32) {
-        // Stub: real pixel content lands in Task 8. Proves line-stepping only.
+    /// Assemble one active scanline (`src_line` in undoubled active space) into
+    /// `hdisp_end` DAC indices, applying pel-pan and the attribute palette.
+    pub fn render_active_row(&self, src_line: u32) -> Vec<u8> {
+        let width = self.crtc.hdisp_end as usize;
+        let pan = (self.attr.pixel_pan & 0x0F) as usize;
+        let mut row = vec![0u8; width];
+        // byte pitch per plane = 2 * offset register
+        let row_base = self.crtc.start_address as usize
+            + src_line as usize * self.crtc.offset as usize * 2;
+        for x in 0..width {
+            let px = x + pan;
+            let byte = px / 8;
+            let bit = 7 - (px % 8);
+            let off = (row_base + byte) % VGA_PLANE_SIZE;
+            let mut index = 0u8;
+            for plane in 0..VGA_PLANES {
+                let b = self.vram[plane * VGA_PLANE_SIZE + off];
+                index |= ((b >> bit) & 1) << plane;
+            }
+            row[x] = self.attr.palette[index as usize] & 0x3F;
+        }
+        row
+    }
+
+    fn region_color(&self, scan_line: u32) -> u8 {
+        // scan_line in undoubled counter space; caller guarantees scan_line >= vdisp_end.
+        if scan_line < self.crtc.vblank_start || scan_line >= self.crtc.vblank_end {
+            self.attr.overscan & 0x3F // border = overscan color
+        } else {
+            0 // vertical blank = black
+        }
+    }
+
+    fn render_scanline(&mut self, raster_line: u32) {
+        let factor = self.scan_factor();
+        let counter_line = raster_line / factor; // undoubled
+        let width = self.raster_width() as usize;
+        let dst = raster_line as usize * width;
+        if dst + width > self.work.len() {
+            return; // safety: work must be sized to raster_width*raster_height
+        }
+        if counter_line < self.crtc.vdisp_end {
+            let row = self.render_active_row(counter_line);
+            self.work[dst..dst + width].copy_from_slice(&row);
+        } else {
+            let color = self.region_color(counter_line);
+            for px in &mut self.work[dst..dst + width] {
+                *px = color;
+            }
+        }
+    }
+
+    /// Render an entire frame to a fresh raster (used by tests/goldens).
+    pub fn render_full_frame(&mut self) -> VgaRaster {
+        let w = self.raster_width();
+        let h = self.raster_height();
+        self.work = vec![0u8; (w * h) as usize];
+        for line in 0..h {
+            self.render_scanline(line);
+        }
+        VgaRaster { width: w, height: h, pixels: self.work.clone() }
     }
 
     fn finalize_frame(&mut self) {
@@ -562,6 +624,38 @@ mod tests {
         assert!(vga.take_presented().is_none());
         vga.advance(vga.frame_dots() + 10); // cross one frame
         assert!(vga.presented_ready());
+    }
+
+    #[test]
+    fn short_display_end_top_justifies_with_shortfall_at_bottom() {
+        let mut vga = Vga::default();
+        vga.set_mode_0dh();
+        vga.crtc.vdisp_end = 199;
+        vga.crtc.vtotal = 525;
+        vga.crtc.vblank_start = 245;
+        vga.crtc.vblank_end = 520;
+        vga.crtc.vretrace_start = 247;
+        vga.crtc.vretrace_end = 249;
+        for b in vga.vram[0..VGA_PLANE_SIZE].iter_mut() { *b = 0xFF; } // plane 0 set
+        vga.attr.palette = core::array::from_fn(|i| i as u8);
+        let raster = vga.render_full_frame();
+        let w = raster.width as usize;
+        assert_ne!(raster.pixels[0], 0, "row 0 should be active (top-justified)");
+        let last = (raster.height as usize - 1) * w;
+        assert_eq!(raster.pixels[last], 0, "bottom row is border/blank, not active");
+    }
+
+    #[test]
+    fn pixel_pan_shifts_the_active_row_left() {
+        let mut vga = Vga::default();
+        vga.set_mode_0dh();
+        vga.vram[0] = 0x80; // pixel 0 set in plane 0
+        vga.attr.palette = core::array::from_fn(|i| i as u8);
+        vga.attr.pixel_pan = 0;
+        let row0 = vga.render_active_row(0);
+        vga.attr.pixel_pan = 1;
+        let row1 = vga.render_active_row(0);
+        assert_eq!(row1[0], row0[1], "pan=1 shifts the row one pixel left");
     }
 
     #[test]
