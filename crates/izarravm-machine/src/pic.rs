@@ -176,6 +176,11 @@ impl Pic8259Pair {
         self.master.imr & 0x01 == 0
     }
 
+    /// True when IRQ5 (master IR5, the Sound Blaster line) is not masked.
+    pub(crate) fn irq5_unmasked(&self) -> bool {
+        self.master.imr & 0x20 == 0
+    }
+
     pub(crate) fn request(&mut self, irq: u8) {
         debug_assert!(irq < 16, "the PIC pair has 16 IRQ lines, got {irq}");
         if irq < 8 {

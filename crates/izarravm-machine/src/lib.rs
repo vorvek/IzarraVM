@@ -941,21 +941,41 @@ impl Machine {
         self.pit.clocks_until_channel0_irq()
     }
 
-    /// CPU clocks to advance while halted so the next channel-0 IRQ0 lands, or None
-    /// if nothing can wake the CPU (so HLT is a genuine halt). Clamped to the
-    /// deadline and to at least one clock, so the run loop always makes progress.
+    /// CPU clocks to advance while halted so the next wake-capable IRQ lands, or
+    /// None if nothing can wake the CPU (so HLT is a genuine halt). A halted guest
+    /// is woken by either IRQ0 (PIT channel 0 OUT edge) or IRQ5 (the SB16 DSP
+    /// half/end-buffer edge, now clock-driven). Each is considered only when
+    /// unmasked; the result is the sooner of the two, clamped to the deadline and
+    /// to at least one clock so the run loop always makes progress.
     fn next_timer_wake(&self, deadline: u64) -> Option<u64> {
-        if !self.cpu.interrupts_enabled() || !self.pic.irq0_unmasked() {
+        if !self.cpu.interrupts_enabled() {
             return None;
         }
-        let pit_delta = self.clocks_until_timer0_irq()?;
-        let cpu_delta = (u128::from(pit_delta) * u128::from(self.profile.clock_hz))
-            .div_ceil(u128::from(PIT_INPUT_HZ)) as u64;
         let remaining = deadline.saturating_sub(self.elapsed_clocks);
         if remaining == 0 {
             return None;
         }
-        Some(cpu_delta.max(1).min(remaining))
+        let pit_wake = if self.pic.irq0_unmasked() {
+            self.clocks_until_timer0_irq().map(|pit_delta| {
+                ((u128::from(pit_delta) * u128::from(self.profile.clock_hz))
+                    .div_ceil(u128::from(PIT_INPUT_HZ))) as u64
+            })
+        } else {
+            None
+        };
+        let dsp_wake = if self.pic.irq5_unmasked() {
+            self.dsp
+                .clocks_until_next_irq(self.dsp.rate_hz(), self.profile.clock_hz)
+        } else {
+            None
+        };
+        // The sooner of whichever wakes apply; None only when neither can fire.
+        let wake = match (pit_wake, dsp_wake) {
+            (None, None) => return None,
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) | (None, Some(a)) => a,
+        };
+        Some(wake.max(1).min(remaining))
     }
 
     pub fn run_cycles(&mut self, cycles: u64) -> Result<StopReason, MachineError> {
@@ -2290,6 +2310,67 @@ mod tests {
                     && record.name == "sound.sb_16bit_dma"
             }),
             "boot suite should report PASS sound.sb_16bit_dma (clock-driven auto-init DMA + IRQ5)"
+        );
+    }
+
+    #[test]
+    fn sb_dma_irq5_wakes_a_halted_cpu_via_fast_forward() {
+        // A guest arms 8-bit single-cycle DMA + IRQ5, then `sti;hlt`. The run loop
+        // must fast-forward across the DSP sample window (the new IRQ5 wake) and
+        // deliver the half-buffer IRQ5, so the handler runs and real emulated time
+        // advances -- not a genuine no-wake halt. Setup mirrors the 8-bit probe.
+        let mut machine = Machine::new(
+            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            // mov ax,0; mov ds,ax; sti; hlt; cli; hlt
+            rom_with_code(&[0xb8, 0x00, 0x00, 0x8e, 0xd8, 0xfb, 0xf4, 0xfa, 0xf4]),
+        )
+        .unwrap();
+        // 16-byte unsigned ramp at 0x01_0000 (DMA page 0x01, byte addr 0).
+        for (i, b) in (0..16u8).map(|i| i * 16).enumerate() {
+            machine.write_physical_u8(0x1_0000 + i as u32, b);
+        }
+        // IRQ5 handler at 0x0700: inc word [0x0610]; mov al,0x20; out 0x20,al; iret.
+        let handler: [u8; 9] = [0xff, 0x06, 0x10, 0x06, 0xb0, 0x20, 0xe6, 0x20, 0xcf];
+        for (i, &b) in handler.iter().enumerate() {
+            machine.write_physical_u8(0x0700 + i as u32, b);
+        }
+        // IVT[0x0D] -> 0x0000:0x0700; clear the tick counter.
+        machine.write_physical_u8(0x34, 0x00);
+        machine.write_physical_u8(0x35, 0x07);
+        machine.write_physical_u8(0x36, 0x00);
+        machine.write_physical_u8(0x37, 0x00);
+        machine.write_physical_u8(0x0610, 0x00);
+        machine.write_physical_u8(0x0611, 0x00);
+        with_bus(&mut machine, |bus| {
+            // PIC base 0x08 (ICW1..ICW4) so IRQ5 -> vector 0x0D; all IRQs unmasked.
+            bus.write_io(0x20, BusWidth::Byte, 0x11).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x08).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x04).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x01).unwrap();
+            // DMA ch1: page 0x01, byte addr 0, count 15 (16 bytes), single read.
+            bus.write_io(0x0B, BusWidth::Byte, 0x49).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x0F).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x83, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x0A, BusWidth::Byte, 0x01).unwrap();
+            // DSP: 11025 Hz, block 16, single-cycle 8-bit DMA output.
+            for &b in &[0x41u8, 0x2B, 0x11, 0x48, 0x0F, 0x00, 0x14] {
+                bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
+            }
+        });
+        let reason = machine.run_until_halt_or_cycles(5_000_000).unwrap();
+        // The handler ran (after the cli the second hlt is genuine).
+        assert_eq!(reason, StopReason::Halted);
+        let ticks = u16::from(machine.read_physical_u8(0x0610))
+            | (u16::from(machine.read_physical_u8(0x0611)) << 8);
+        assert!(ticks >= 1, "the IRQ5 handler should have run");
+        // The fast-forward crossed a real sample window (half-buffer at 8 samples
+        // ~= 18k CPU clocks at 25 MHz), not a no-op halt.
+        assert!(
+            machine.elapsed_clocks() > 15_000,
+            "the fast-forward should advance emulated time across the DSP sample window"
         );
     }
 

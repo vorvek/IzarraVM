@@ -278,7 +278,7 @@ impl SbDsp {
     /// `ceil(samples * clock_hz / rate_hz)`, clamped to at least one. For stereo
     /// modes the block counter advances in words, so this is a conservative
     /// (never under-) estimate, which is what the HLT fast-forward needs.
-    pub fn clocks_until_next_irq(&self, rate_hz: u32, clock_hz: u32) -> Option<u64> {
+    pub fn clocks_until_next_irq(&self, rate_hz: u32, clock_hz: u64) -> Option<u64> {
         if !self.playing || rate_hz == 0 {
             return None;
         }
@@ -289,7 +289,7 @@ impl SbDsp {
         };
         let end_left = self.block_remaining;
         let samples = half_left.min(end_left).max(1) as u64;
-        Some(((samples * clock_hz as u64).div_ceil(rate_hz as u64)).max(1))
+        Some(((samples * clock_hz).div_ceil(rate_hz as u64)).max(1))
     }
 
     /// Produce one stereo output frame for the current DMA mode, or None if the
