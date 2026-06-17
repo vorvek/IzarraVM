@@ -843,12 +843,19 @@ impl Machine {
     /// the rendered-frame ring the per-CPU-clock producer (in `advance_devices`)
     /// fills. The block counter and the half/end-buffer IRQ now advance with CPU
     /// time, independent of this call; this path only reads back frames for the
-    /// DAC. A silent (idle) DSP drains nothing, so the OPL passes through.
+    /// DAC. Each drained frame is attenuated by the CT1745 voice volume
+    /// (`0x32`/`0x33`) so a mid-buffer guest volume change applies immediately. A
+    /// silent (idle) DSP drains nothing, so the OPL passes through.
     pub fn render_dsp_audio(&mut self, native_samples: usize) -> Vec<(i16, i16)> {
+        let (voice_l, voice_r) = self.mixer.voice_gain();
         let mut out = Vec::with_capacity(native_samples);
         for _ in 0..native_samples {
             match self.dsp.drain_frame() {
-                Some(frame) => out.push(frame),
+                Some((l, r)) => {
+                    let l = clamp_i16((i32::from(l) as f32 * voice_l) as i32);
+                    let r = clamp_i16((i32::from(r) as f32 * voice_r) as i32);
+                    out.push((l, r));
+                }
                 None => break,
             }
         }
@@ -896,14 +903,21 @@ impl Machine {
             .collect();
         let dsp_out = self.dsp_resampler.process(&dsp_stereo);
 
-        // Sum over the longer length; a silent (idle) DSP yields no frames, so the
-        // OPL passes through unchanged when no DMA playback is armed.
+        // Apply master + output gain (0x30/0x31, 0x41/0x42) once to the summed
+        // pair. The DSP frames already carry the voice gain from render_dsp_audio,
+        // so this single scaling pass gives DSP·voice·master·outgain and
+        // OPL·master·outgain. A silent (idle) DSP yields no frames, so the OPL
+        // passes through (attenuated only by master/outgain) when no DMA is armed.
+        let (master_l, master_r) = self.mixer.master_gain();
+        let (outgain_l, outgain_r) = self.mixer.outgain_gain();
         let len = opl_out.len().max(dsp_out.len());
         (0..len)
             .map(|i| {
                 let (ol, or) = opl_out.get(i).copied().unwrap_or((0, 0));
                 let (dl, dr) = dsp_out.get(i).copied().unwrap_or((0, 0));
-                (clamp_i16(ol + dl), clamp_i16(or + dr))
+                let l = ((ol + dl) as f32 * (master_l * outgain_l)) as i32;
+                let r = ((or + dr) as f32 * (master_r * outgain_r)) as i32;
+                (clamp_i16(l), clamp_i16(r))
             })
             .collect()
     }
@@ -2219,6 +2233,12 @@ mod tests {
             bus.write_io(0xC6, BusWidth::Byte, 0x00).unwrap(); // count 15 -> 16 words
             bus.write_io(0x8B, BusWidth::Byte, 0x01).unwrap(); // page -> byte base 0x2_0000
             bus.write_io(0xD4, BusWidth::Byte, 0x01).unwrap(); // unmask slave ch1
+            // Voice volume to unity (0 dB) so the exact -1/+1 samples survive the
+            // CT1745 voice attenuation and the test stays about 16-bit decoding.
+            bus.write_io(0x224, BusWidth::Byte, 0x32).unwrap();
+            bus.write_io(0x225, BusWidth::Byte, 0x1F).unwrap();
+            bus.write_io(0x224, BusWidth::Byte, 0x33).unwrap();
+            bus.write_io(0x225, BusWidth::Byte, 0x1F).unwrap();
             // DSP: 22050 Hz, 16-bit auto-init output, signed, stereo, count 15.
             for &b in &[0x41u8, 0x56, 0x22, 0xB6, 0x30, 0x0F, 0x00] {
                 bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
@@ -2630,8 +2650,11 @@ mod tests {
     fn render_audio_mixes_the_dsp_dc_level_with_the_opl() {
         let mut machine = test_machine();
         // A constant 256-byte DMA buffer; 0x40 maps to sample_u8(0x40) = -16384.
+        // The default CT1745 volume attenuates it by voice (0x32=24, ~-14 dB)
+        // and master (0x30=24, ~-14 dB): -16384 * 0.19953^2 ~= -652.
         const BYTE: u8 = 0x40;
-        const EXPECTED: i32 = -16384; // (0x40 - 128) * 256
+        let expected: i32 =
+            (-16384.0f32 * 10f32.powf(-14.0 / 20.0) * 10f32.powf(-14.0 / 20.0)) as i32;
         for i in 0..256u32 {
             machine.write_physical_u8(0x1_0000 + i, BYTE);
         }
@@ -2663,11 +2686,85 @@ mod tests {
             .fold((i16::MAX, i16::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
         let center = (i32::from(min_l) + i32::from(max_l)) / 2;
         assert!(
-            (center - EXPECTED).abs() < 400,
-            "DSP DC center {center}, expected ~{EXPECTED}"
+            (center - expected).abs() < 400,
+            "DSP DC center {center}, expected ~{expected}"
         );
         // Mono is duplicated to both channels.
         assert!(mid.iter().all(|f| f.0 == f.1), "DSP mono duplicated L/R");
+    }
+
+    #[test]
+    fn sb_mixer_voice_and_master_volume_attenuate_output() {
+        let mut machine = test_machine();
+        // Constant 256-byte DC buffer: sample_u8(0x40) = -16384, auto-init.
+        for i in 0..256u32 {
+            machine.write_physical_u8(0x1_0000 + i, 0x40);
+        }
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x0B, BusWidth::Byte, 0x59).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0xFF).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x83, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x0A, BusWidth::Byte, 0x01).unwrap();
+            for &b in &[0x41u8, 0x2B, 0x11, 0x48, 0xFF, 0x00, 0x1C] {
+                bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
+            }
+        });
+
+        fn set_reg(machine: &mut Machine, index: u8, value: u8) {
+            with_bus(machine, |bus| {
+                bus.write_io(0x224, BusWidth::Byte, u32::from(index))
+                    .unwrap();
+                bus.write_io(0x225, BusWidth::Byte, u32::from(value))
+                    .unwrap();
+            });
+        }
+        // Refill the clock-driven ring, then render a window of mixed output.
+        fn render(machine: &mut Machine) -> Vec<(i16, i16)> {
+            machine.advance_devices_clocks(2_500_000);
+            machine.render_audio(4_000)
+        }
+        fn mid_quiet(out: &[(i16, i16)]) -> bool {
+            let mid = &out[out.len() / 3..out.len() * 2 / 3];
+            mid.iter().all(|&(l, r)| l.abs() <= 50 && r.abs() <= 50)
+        }
+
+        // Voice mute (0x32/0x33 = 0) silences the DSP path regardless of master.
+        set_reg(&mut machine, 0x32, 0x00);
+        set_reg(&mut machine, 0x33, 0x00);
+        assert!(
+            mid_quiet(&render(&mut machine)),
+            "voice mute silences the DSP output"
+        );
+
+        // Master mute (0x30/0x31 = 0) silences the whole mix even at full voice.
+        set_reg(&mut machine, 0x32, 0x1F);
+        set_reg(&mut machine, 0x33, 0x1F);
+        set_reg(&mut machine, 0x30, 0x00);
+        set_reg(&mut machine, 0x31, 0x00);
+        assert!(
+            mid_quiet(&render(&mut machine)),
+            "master mute silences the summed output"
+        );
+
+        // Defaults (master/voice 24 => -14 dB each) return the attenuated DC level.
+        for (idx, val) in [(0x30u8, 24u8), (0x31, 24), (0x32, 24), (0x33, 24)] {
+            set_reg(&mut machine, idx, val);
+        }
+        let restored = render(&mut machine);
+        let mid = &restored[restored.len() / 3..restored.len() * 2 / 3];
+        let (min_l, max_l) = mid
+            .iter()
+            .map(|f| f.0)
+            .fold((i16::MAX, i16::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
+        let center = (i32::from(min_l) + i32::from(max_l)) / 2;
+        let expected = (-16384.0f32 * 10f32.powf(-14.0 / 20.0) * 10f32.powf(-14.0 / 20.0)) as i32;
+        assert!(
+            (center - expected).abs() < 200,
+            "restored DC center {center}, expected ~{expected}"
+        );
     }
 
     #[test]
