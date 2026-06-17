@@ -266,6 +266,7 @@ pub struct DosKernel {
     stdout: Vec<u8>,
     clock: DosDateTime,
     arena: Arena,
+    dta: (u16, u16),
 }
 
 impl DosKernel {
@@ -323,6 +324,7 @@ impl DosKernel {
             free_base: prog_top,
             blocks: Vec::new(),
         };
+        self.dta = (psp_seg, 0x80);
     }
 
     /// Service a software interrupt the DOS kernel handles. `vector` is the INT
@@ -614,6 +616,17 @@ impl DosKernel {
                         regs.ax = 0x09;
                     }
                 }
+                Ok(DosAction::Continue)
+            }
+            // AH=1Ah: set the Disk Transfer Area to DS:DX.
+            0x1a => {
+                self.dta = (regs.ds, regs.dx);
+                Ok(DosAction::Continue)
+            }
+            // AH=2Fh: get the Disk Transfer Area into ES:BX. Default is PSP:0x80.
+            0x2f => {
+                regs.es = self.dta.0;
+                regs.bx = self.dta.1;
                 Ok(DosAction::Continue)
             }
             // AH=4Ch: terminate with the return code in AL.
@@ -1816,5 +1829,35 @@ mod tests {
         };
         kernel.dispatch(0x21, &mut a, &mut mem).unwrap();
         assert_eq!(a.ax, 0x1100); // next allocation still at free_base
+    }
+
+    #[test]
+    fn ah1a_2f_dta_round_trips_with_default_at_psp_0x80() {
+        let mut mem = Memory::new(4096).unwrap();
+        let mut kernel = DosKernel::new();
+        kernel.init_program(0x0100, 0x1100);
+        // Default DTA = PSP:0x80.
+        let mut get = DosRegs {
+            ax: 0x2f00,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut get, &mut mem).unwrap();
+        assert_eq!(get.es, 0x0100);
+        assert_eq!(get.bx, 0x0080);
+        // Set DTA to 0x1234:0x5678, read it back.
+        let mut set = DosRegs {
+            ax: 0x1a00,
+            ds: 0x1234,
+            dx: 0x5678,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut set, &mut mem).unwrap();
+        let mut get2 = DosRegs {
+            ax: 0x2f00,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut get2, &mut mem).unwrap();
+        assert_eq!(get2.es, 0x1234);
+        assert_eq!(get2.bx, 0x5678);
     }
 }
