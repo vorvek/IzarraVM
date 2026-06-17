@@ -73,6 +73,14 @@ pub struct Attribute {
     pub index: u8,
 }
 
+/// The pixel-perfect raster the host pulls. Square pixels, no aspect correction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VgaRaster {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>, // DAC indices; renderer resolves through the Dac
+}
+
 /// Total horizontal dots per scan line.
 pub fn htotal_dots(t: &CrtcTiming) -> u64 {
     (t.htotal_chars * t.char_width) as u64
@@ -110,6 +118,8 @@ pub struct Vga {
     pub(crate) beam: u64,
     pub(crate) last_line: u32,
     pub(crate) frames: u64,
+    pub(crate) work: Vec<u8>,
+    pub(crate) presented: Option<VgaRaster>,
 }
 
 impl Default for Vga {
@@ -124,6 +134,8 @@ impl Default for Vga {
             beam: 0,
             last_line: 0,
             frames: 0,
+            work: Vec::new(),
+            presented: None,
         }
     }
 }
@@ -146,6 +158,56 @@ impl Vga {
         self.crtc = CrtcTiming::mode_0dh();
         self.beam = 0;
         self.last_line = 0;
+        self.resize_work();
+    }
+
+    pub fn raster_width(&self) -> u32 {
+        self.crtc.hdisp_end
+    }
+
+    pub fn raster_height(&self) -> u32 {
+        let factor = if self.crtc.double_scan { 2 } else { 1 };
+        self.crtc.vdisp_end * factor // active-only for now; Task 8 makes it full-frame
+    }
+
+    fn resize_work(&mut self) {
+        self.work = vec![0; (self.raster_width() * self.raster_height()) as usize];
+    }
+
+    /// Render scanlines from last_line up to (not including) the current beam
+    /// line, using current register state. Returns how many lines were drawn.
+    pub fn catch_up(&mut self) -> u32 {
+        let current = beam_line(&self.crtc, self.beam);
+        let mut drawn = 0;
+        while self.last_line < current {
+            self.render_scanline(self.last_line);
+            self.last_line += 1;
+            drawn += 1;
+        }
+        drawn
+    }
+
+    fn render_scanline(&mut self, _line: u32) {
+        // Stub: real pixel content lands in Task 8. Proves line-stepping only.
+    }
+
+    fn finalize_frame(&mut self) {
+        // Minimal: snapshot the work buffer, reset for next frame.
+        // Task 11 makes this render remaining lines with live state first.
+        self.presented = Some(VgaRaster {
+            width: self.raster_width(),
+            height: self.raster_height(),
+            pixels: self.work.clone(),
+        });
+        self.last_line = 0;
+    }
+
+    pub fn presented_ready(&self) -> bool {
+        self.presented.is_some()
+    }
+
+    pub fn take_presented(&mut self) -> Option<VgaRaster> {
+        self.presented.take()
     }
 
     /// Advance the beam by whole dots, rolling over each completed frame
@@ -156,7 +218,11 @@ impl Vga {
             return; // guard: un-programmed CRTC
         }
         let total = self.beam + dots;
-        self.frames += total / frame;
+        let crossed = total / frame;
+        if crossed > 0 {
+            self.finalize_frame(); // finalize only the final completed frame
+            self.frames += crossed;
+        }
         self.beam = total % frame;
     }
 
@@ -476,6 +542,26 @@ mod tests {
         vga.cpu_write(0, 0xFF);
         assert_eq!(vga.plane_byte(0, 0), 0xFF);
         assert_eq!(vga.plane_byte(1, 0), 0x00);
+    }
+
+    #[test]
+    fn catch_up_is_incremental_and_zero_when_beam_has_not_moved_a_line() {
+        let mut vga = Vga::default();
+        vga.set_mode_0dh();
+        vga.advance(htotal_dots(&vga.crtc) * 3 + 5); // beam at line 3
+        let drawn = vga.catch_up();
+        assert_eq!(drawn, 3); // lines 0,1,2 rendered
+        let drawn_again = vga.catch_up();
+        assert_eq!(drawn_again, 0); // no line crossed since
+    }
+
+    #[test]
+    fn advance_past_a_frame_finalizes_a_presented_buffer() {
+        let mut vga = Vga::default();
+        vga.set_mode_0dh();
+        assert!(vga.take_presented().is_none());
+        vga.advance(vga.frame_dots() + 10); // cross one frame
+        assert!(vga.presented_ready());
     }
 
     #[test]
