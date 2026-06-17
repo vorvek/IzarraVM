@@ -381,7 +381,7 @@ In a 15 or 16-bit mode, true-color images and the scaled video overlay can band.
 Set `DITHER_EN` in `CONTROL` once and Margo dithers them as it writes.
 
 ```c
-/* (target) */
+/* (verified) */
 REG(0x000C) = 0x02;     /* CONTROL: DITHER_EN */
 ```
 

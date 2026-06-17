@@ -3606,4 +3606,34 @@ mod tests {
         assert_eq!(argb[2], 0x0084_8684); // cell 2
         assert_eq!(argb[3], 0x008c_868c); // cell 10
     }
+
+    #[test]
+    fn overlay_dithers_on_a_15bpp_display() {
+        let mut machine = test_machine();
+        machine.margo_mut().set_mode(0x110); // 640x480x15 (X1R5G5B5): all channels 5-bit
+        let src = 0x0010_0000u32;
+        for g in 0..2u32 {
+            let base = src + g * 4;
+            machine.write_physical_u8(MARGO_LFB_BASE + base, 130); // Y0
+            machine.write_physical_u8(MARGO_LFB_BASE + base + 1, 128); // U
+            machine.write_physical_u8(MARGO_LFB_BASE + base + 2, 130); // Y1
+            machine.write_physical_u8(MARGO_LFB_BASE + base + 3, 128); // V
+        }
+        write_mmio_reg(&mut machine, 0x44, src);
+        write_mmio_reg(&mut machine, 0x48, 8);
+        write_mmio_reg(&mut machine, 0x4c, (1 << 16) | 4);
+        write_mmio_reg(&mut machine, 0x58, 0);
+        write_mmio_reg(&mut machine, 0x5c, (1 << 16) | 4);
+        write_mmio_reg(&mut machine, 0x0c, 0x2); // CONTROL: DITHER_EN on
+        write_mmio_reg(&mut machine, 0x40, 1); // OVL_CTRL: ENABLE, YUY2
+
+        let palette = machine.palette_argb();
+        let argb = machine.margo().scanout_argb(&palette);
+        // 15bpp makes G 5-bit too (unlike 16bpp's 6-bit G), so a dithered-up pixel is
+        // gray 0x8C8C8C, not 0x8C868C. Row 0 cells 0, 8, 2, 10 -> 0x84, 0x8C, 0x84, 0x8C.
+        assert_eq!(argb[0], 0x0084_8484); // cell 0: truncated gray
+        assert_eq!(argb[1], 0x008c_8c8c); // cell 8: dithered up
+        assert_eq!(argb[2], 0x0084_8484); // cell 2
+        assert_eq!(argb[3], 0x008c_8c8c); // cell 10
+    }
 }
