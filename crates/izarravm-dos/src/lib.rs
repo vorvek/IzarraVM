@@ -925,10 +925,12 @@ impl DosKernel {
                     if !attr_matches(attr, mask) {
                         continue;
                     }
+                    let (time, date) =
+                        dos_time_date(metadata.modified().unwrap_or(std::time::UNIX_EPOCH));
                     entries.push(FindEntry {
                         attr,
-                        time: 0, // host timestamp wired in a later task
-                        date: 0,
+                        time,
+                        date,
                         // ponytail: the DTA size field is a 32-bit dword, so a host
                         // file over 4 GiB truncates; DOS cannot represent more.
                         size: metadata.len() as u32,
@@ -1195,6 +1197,47 @@ fn dos_io_error_code(err: &std::io::Error) -> u16 {
 /// skips non-ASCII host names (marked).
 fn is_8_3_char(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || b"!#$%&'()-@^_`{}~".contains(&byte)
+}
+
+/// Convert a host modified-time to a packed DOS (time, date) pair. The result is
+/// UTC, not local time (marked); a timestamp before 1980-01-01 clamps to it, and a
+/// year past 2107 (the 7-bit DOS year ceiling) is not representable and clamps.
+/// Uses Howard Hinnant's days-to-civil algorithm so no date dependency is added.
+fn dos_time_date(modified: std::time::SystemTime) -> (u16, u16) {
+    let secs = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = (secs / 86_400) as i64;
+    let seconds_of_day = (secs % 86_400) as u32;
+    let (mut year, month, day) = civil_from_days(days);
+    if year < 1980 {
+        return (0, (1 << 5) | 1); // 1980-01-01 00:00:00
+    }
+    if year > 2107 {
+        year = 2107;
+    }
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+    let date = (((year - 1980) as u16) << 9) | ((month as u16) << 5) | day as u16;
+    let time = ((hour as u16) << 11) | ((minute as u16) << 5) | ((second / 2) as u16);
+    (time, date)
+}
+
+/// Howard Hinnant's civil-from-days: days since the Unix epoch (1970-01-01) to a
+/// proleptic Gregorian (year, month [1..12], day [1..31]).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let year = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
 /// Build the blank-padded 11-byte 8.3 template for a host file name, uppercased.
@@ -2841,10 +2884,30 @@ mod tests {
             assert_eq!(mem.read_u8(offset).unwrap(), 0, "reserved byte {offset:#x}");
         }
         assert_eq!(mem.read_u8(0x15).unwrap(), 0x00); // attr
-        assert_eq!(mem.read_u16(0x16).unwrap(), 0); // time stub (Task 1)
-        assert_eq!(mem.read_u16(0x18).unwrap(), 0); // date stub (Task 1)
+        assert_ne!(mem.read_u16(0x18).unwrap(), 0); // date is the real host mtime
         assert_eq!(mem.read_u32(0x1a).unwrap(), 4); // size
         assert_eq!(dta_name(&mem), "F.TXT");
+    }
+
+    #[test]
+    fn ah4e_packs_the_host_modified_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("STAMP.TXT");
+        std::fs::write(&path, b"x").unwrap();
+        // 2000-01-01 12:34:56 UTC.
+        let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(946_730_096);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+        let (mut kernel, mut mem) = find_kernel(dir.path());
+        let regs = find_first(&mut kernel, &mut mem, "C:\\*.TXT", 0);
+        assert!(!regs.cf);
+        // date = ((2000-1980)<<9)|(1<<5)|1 = 10273; time = (12<<11)|(34<<5)|(56/2) = 25692.
+        assert_eq!(mem.read_u16(0x18).unwrap(), 10_273);
+        assert_eq!(mem.read_u16(0x16).unwrap(), 25_692);
     }
 
     #[test]
