@@ -98,3 +98,57 @@ source won and the code plus tests were fixed together:
   both share the single IRQ5 line, so the DSP clears its one pending IRQ on a
   read of either status port.
 
+## Boot-suite sound detection probes
+
+The three boot-suite probes that flip `sound.sb_dsp_reset`, `sound.opl2`, and
+`sound.opl3` to PASS are firmware I/O sequences; their detection techniques are
+re-derived here from the same cached primary sources
+(`dev_docs/reference/sb16-dsp/`, `dev_docs/reference/opl3/`). Each is
+firmware-feasible during CPU execution because the run loop advances the
+relevant emulated clock every instruction step (`Machine::advance_devices`
+ticks `dsp.advance_micros` for the reset settle and `opl.advance_micros` for the
+hardware timers); the two DMA rows are intentionally out of scope because DMA
+playback is host-render-driven, not clock-driven.
+
+- **SB16 DSP reset handshake** (Creative CT1747 Programming Guide; mirrored by
+  the host golden `sb_dsp_reset_handshake_through_the_bus`). Write `0x01` then
+  `0x00` to the reset port `0x226`; after a ~100 us settle the DSP queues `0xAA`
+  on read-data (`0x22A`) and sets bit 7 (data available) of the read-buffer-status
+  port (`0x22E`). The firmware arms the reset, busy-loops a window comfortably
+  longer than the settle (the settle counts down via `dsp.advance_micros`), polls
+  `0x22E` for bit 7, then reads `0x22A` expecting `0xAA`.
+- **OPL2-compatible (AdLib) timer-overflow detection** (Arnost guide / ADLIBDOC
+  + YMF262 datasheet; mirrored by the host golden
+  `opl_timers_advance_with_machine_clocks`). On the primary bank
+  (`0x388`/`0x389`): write reg `0x04 <- 0x60` (mask both timer IRQs, bits 6/5),
+  `0x04 <- 0x80` (reset both overflow flags, bit 7), `0x02 <- 0xFF` (timer-1
+  preset), then `0x04 <- 0x21` (start timer-1, bit 0, with timer-2 masked).
+  Timer-1 steps every ~80 us (256 timer input periods) and a `0xFF` preset
+  overflows in a single step, raising status bit 6 (timer-1 overflow). The
+  firmware polls `0x388` status bit 6. An OPL3 is an OPL2 superset, so this row
+  legitimately PASSES on the SB16-class hardware (the Resonique 2 advertises OPL2
+  compatibility).
+- **OPL3 (YMF262) status-at-rest signature** (YMF262 datasheet). After resetting
+  the timer flags (`0x04 <- 0x80`), the status port (`0x388`) reads `0x00` on a
+  YMF262, whose status byte defines only bits 7/6/5 (IRQ / timer-1 / timer-2). A
+  YM3812 (OPL2) instead reads `0x06` at rest because its status byte carries two
+  always-set "BUSY" bits (1/2) the YMF262 does not. The firmware masks the read
+  with `0xE0` and accepts `0x00`, distinguishing the YMF262. (The emulator models
+  the YMF262: `OplChip::status()` returns `0x00` at rest.)
+
+### FAIL -> PASS patch arithmetic
+
+Each probe patches its row in the *copied* result block at `0x9000`. The record
+text changes `FAIL` to `PASS`, so only bytes 0, 2, 3 of the row change
+(`F`->`P`, `I`->`S`, `L`->`S`). The additive checksum word stored at result-block
+offset `10` (immediately after the 4-byte magic and the three header words) is
+kept consistent by adding the per-row delta of those three bytes:
+`'P'-'F' = 0x50-0x46 = 10`, `'S'-'I' = 0x53-0x49 = 10`, `'S'-'L' = 0x53-0x4C =
+7`, summing to `27`. So every successful probe runs `add word [RESULT_BLOCK+10],
+27`; the host's `parse_result_block` recomputes the additive checksum over the
+patched payload, which stays valid as multiple probes flip their rows. Adding the
+per-row labels (`sb_reset_record:`, `opl2_record:`, `opl3_record:`) to
+`results.inc` emits no bytes (a label is a NASM address symbol), so the header
+constants `RESULT_RECORD_COUNT` (22), `RESULT_PAYLOAD_LEN` (473), and
+`RESULT_PAYLOAD_CHECKSUM` (`0xa346`) are unchanged.
+
