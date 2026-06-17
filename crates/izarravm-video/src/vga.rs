@@ -30,6 +30,8 @@ pub struct CrtcTiming {
     pub double_scan: bool,
     pub start_address: u32,
     pub offset: u32,
+    pub mode_control: u8,  // CRTC index 17h
+    pub underline_loc: u8, // CRTC index 14h
 }
 
 impl CrtcTiming {
@@ -50,6 +52,8 @@ impl CrtcTiming {
             double_scan: false,
             start_address: 0,
             offset: 80,
+            mode_control: 0xA3,
+            underline_loc: 0x00,
         }
     }
 
@@ -69,6 +73,8 @@ impl CrtcTiming {
             double_scan: true,
             start_address: 0,
             offset: 20,
+            mode_control: 0xE3,
+            underline_loc: 0x00,
         }
     }
 
@@ -89,6 +95,8 @@ impl CrtcTiming {
             double_scan: true,
             start_address: 0,
             offset: 40,
+            mode_control: 0xE3,
+            underline_loc: 0x00,
         }
     }
 
@@ -108,6 +116,8 @@ impl CrtcTiming {
             double_scan: false,
             start_address: 0,
             offset: 40,
+            mode_control: 0xE3,
+            underline_loc: 0x00,
         }
     }
 
@@ -127,6 +137,8 @@ impl CrtcTiming {
             double_scan: false,
             start_address: 0,
             offset: 40,
+            mode_control: 0xE3,
+            underline_loc: 0x00,
         }
     }
 
@@ -335,14 +347,16 @@ impl Vga {
         let pan = (self.attr.pixel_pan & 0x0F) as usize;
         let mut row = vec![0u8; width];
         let source_row = counter_line / self.scan_factor();
-        // byte pitch per plane = 2 * offset register
-        let row_base =
-            self.crtc.start_address as usize + source_row as usize * self.crtc.offset as usize * 2;
+        // Address-counter base for this row. The per-scanline counter increment is
+        // offset*2 in every addressing mode; the byte/word/doubleword transform
+        // lives in display_offset, not the stride.
+        let row_base = self.crtc.start_address + source_row * self.crtc.offset * 2;
         for (x, slot) in row.iter_mut().enumerate() {
             let px = x + pan;
             let byte = px / 8;
             let bit = 7 - (px % 8);
-            let off = (row_base + byte) % VGA_PLANE_SIZE;
+            let ma = row_base + byte as u32;
+            let off = display_offset(self.crtc.mode_control, self.crtc.underline_loc, ma);
             let mut index = 0u8;
             for plane in 0..VGA_PLANES {
                 let b = self.vram[plane * VGA_PLANE_SIZE + off];
@@ -630,6 +644,8 @@ impl Vga {
             0x0E => self.cursor_offset = (self.cursor_offset & 0x00FF) | (u16::from(value) << 8),
             0x0F => self.cursor_offset = (self.cursor_offset & 0xFF00) | u16::from(value),
             0x13 => self.crtc.offset = u32::from(value),
+            0x14 => self.crtc.underline_loc = value,
+            0x17 => self.crtc.mode_control = value,
             _ => {} // full timing programmed via set_mode_0dh in slice 1
         }
     }
@@ -835,9 +851,63 @@ pub fn write_planes(
     }
 }
 
+/// Map a display-address counter value `ma` to a per-plane byte offset, applying
+/// the CRTC byte/word/doubleword addressing transform and the 16-bit (64 KB)
+/// counter wrap. `mode_control` is CRTC index 17h, `underline_loc` is index 14h.
+/// See `dev_docs/reference/vga/crtc-addressing.md`.
+pub fn display_offset(mode_control: u8, underline_loc: u8, ma: u32) -> usize {
+    let addr = if mode_control & 0x40 != 0 {
+        ma // byte mode (CR17 bit 6): identity
+    } else if underline_loc & 0x40 != 0 {
+        // doubleword mode (CR14 bit 6): rotate left 2, MA13 -> bit 1, MA12 -> bit 0.
+        // These bit positions are pending validation against an unbroken reference
+        // mirror; no in-scope 16-color planar workload exercises doubleword mode.
+        (ma << 2) | ((ma >> 12) & 0x3)
+    } else {
+        // word mode: rotate left 1, MA15 (CR17 bit 5 = 1) or MA13 (= 0) -> bit 0
+        let wrap_bit = if mode_control & 0x20 != 0 { 15 } else { 13 };
+        (ma << 1) | ((ma >> wrap_bit) & 1)
+    };
+    (addr as usize) % VGA_PLANE_SIZE
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_offset_applies_byte_word_dword_transforms() {
+        // Byte mode (CR17 bit 6 = 1): identity, wrapped at 64 KB.
+        assert_eq!(display_offset(0xE3, 0x00, 0x1234), 0x1234);
+        assert_eq!(display_offset(0xE3, 0x00, 0x1_0005), 0x0005); // 64 KB counter wrap
+        // Word mode, 16-bit wrap (CR17 = 0xA3: bit 6 = 0, bit 5 = 1): rotate left 1,
+        // MA15 into bit 0.
+        assert_eq!(display_offset(0xA3, 0x00, 0x4001), 0x8002); // MA15 = 0
+        assert_eq!(display_offset(0xA3, 0x00, 0x8000), 0x0001); // MA15 = 1 -> bit 0
+        // Word mode, 14-bit wrap (CR17 = 0x83: bit 6 = 0, bit 5 = 0): MA13 into bit 0.
+        assert_eq!(display_offset(0x83, 0x00, 0x2000), 0x4001); // MA13 = 1 -> bit 0
+        // Doubleword mode (CR14 bit 6 = 1, word base): rotate left 2, MA13 -> bit 1,
+        // MA12 -> bit 0.
+        assert_eq!(display_offset(0xA3, 0x40, 0x3000), 0xC003);
+        // Byte mode wins over the doubleword bit.
+        assert_eq!(display_offset(0xE3, 0x40, 0x1234), 0x1234);
+    }
+
+    #[test]
+    fn crtc_addressing_registers_are_wired_and_default_per_mode() {
+        let mut vga = Vga::default();
+        vga.set_mode_0dh();
+        // 16-color planar modes power up in byte mode (CR17 = 0xE3).
+        assert_eq!(vga.crtc.mode_control, 0xE3);
+        assert_eq!(vga.crtc.underline_loc, 0x00);
+        // A guest write through the CRTC ports updates the live registers.
+        vga.write_port(0x3D4, 0x17); // CRTC index 17h
+        vga.write_port(0x3D5, 0xA3); // word mode
+        assert_eq!(vga.crtc.mode_control, 0xA3);
+        vga.write_port(0x3D4, 0x14); // CRTC index 14h
+        vga.write_port(0x3D5, 0x40); // doubleword bit
+        assert_eq!(vga.crtc.underline_loc, 0x40);
+    }
 
     #[test]
     fn beam_position_tracks_dots_in_scan_counter_units() {
@@ -1286,6 +1356,56 @@ mod tests {
         assert_eq!(vga.raster_height(), 449);
 
         assert!(!vga.set_mode(0x99)); // unknown number leaves a false result
+    }
+
+    #[test]
+    fn word_mode_render_rotates_the_address() {
+        let mut vga = Vga::default();
+        vga.set_mode_0dh();
+        vga.crtc.mode_control = 0xA3; // force word mode (bit 6 = 0), 16-bit wrap
+        vga.attr.palette = core::array::from_fn(|i| i as u8);
+        // The second character (byte_col 1) has counter ma = 1. Word mode maps ma = 1
+        // to plane offset 2 ((1 << 1) | 0); byte mode would read offset 1. Mark only
+        // offset 2, so a correct word-mode read shows index 1 at pixel 8.
+        vga.vram[2] = 0x80; // bit 7 -> the first pixel of that character
+        let row = vga.render_active_row(0);
+        assert_eq!(
+            row[8], 1,
+            "word mode reads plane offset 2 for the 2nd character"
+        );
+        assert_eq!(row[0], 0, "char 0 (offset 0) is clear");
+    }
+
+    #[test]
+    fn byte_mode_wrap_scanout_equals_top_of_vram() {
+        let mut vga = Vga::default();
+        vga.set_mode_0dh(); // byte mode (CR17 = 0xE3)
+        vga.attr.palette = core::array::from_fn(|i| i as u8);
+        // Distinct mark at the very top of VRAM (plane 0 offset 0): pixels 0..7 = index 1.
+        vga.vram[0] = 0xFF;
+        // Reference row from start_address 0: its first 8 pixels come from offset 0.
+        vga.crtc.start_address = 0;
+        let top = vga.render_active_row(0);
+        assert_eq!(
+            &top[0..8],
+            &[1u8; 8],
+            "top-of-VRAM byte renders 8 pixels of index 1"
+        );
+        // Start 8 bytes before the 64 KB wrap: byte_col 0..7 read 0xFFF8..0xFFFF (clear),
+        // byte_col 8 wraps to offset 0 (the marked byte). So pixels 64..71 must equal
+        // the top-of-VRAM pixels, not tear.
+        vga.crtc.start_address = 0xFFF8;
+        let wrapped = vga.render_active_row(0);
+        assert_eq!(
+            &wrapped[0..64],
+            &[0u8; 64],
+            "pre-wrap pixels read the cleared tail"
+        );
+        assert_eq!(
+            &wrapped[64..72],
+            &top[0..8],
+            "wrapped scanout pixels equal the top-of-VRAM pixels at the seam"
+        );
     }
 
     #[test]

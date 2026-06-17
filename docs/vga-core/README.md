@@ -33,8 +33,7 @@ it. What is in:
 | Status (`3DA`) | Display-disabled (bit 0), vertical retrace (bit 3), beam-derived |
 | Beam | Cycle-coupled dot clock, catch-up rasterization, per-frame finalize |
 
-Deferred to later slices: the 256 KB display-address wraparound (only the
-per-plane 64 KB wrap is modeled), line-compare split screens (and pel-pan forced
+Deferred to later slices: line-compare split screens (and pel-pan forced
 to 0 below the split), pel-pan smooth-scroll polish, mode-X / unchained
 256-color, the bad-card mid-scanline latch (shake) reproduction,
 pixel-granular catch-up, and mid-frame Vertical-Display-End / blank-register
@@ -69,6 +68,38 @@ a scanline reads source row `counter_line / (max_scan + 1)`, so a doubled mode
 holds each VRAM row for two scanlines. `Vertical Display End` is in scanline
 units. (Slice 1 doubled the output instead, which made 0Dh's raster roughly twice
 its real height; this is corrected here.)
+
+## Slice 3 coverage
+
+Slice 3 replaces the slice-1 display-address approximations with the faithful
+display-address counter. The address presented to the planes and the point at
+which it wraps now match hardware.
+
+| Area | Covered in slice 3 |
+|------|--------------------|
+| Addressing mode | Byte / word / doubleword, from CRTC Mode Control (17h) bit 6 and Underline Location (14h) bit 6, with the Address Wrap Select (17h bit 5) choosing MA13 vs MA15 for word mode |
+| Transform | `display_offset`: byte = identity; word = rotate left 1 with MA13/MA15 into bit 0; doubleword = rotate left 2 with MA13/MA12 into bits 1/0 |
+| Counter | `start_address + source_row*offset*2 + byte_col`; the `offset*2` per-scanline increment is mode-independent |
+| Wrap | 16-bit counter wraps at 64 KB per plane; one counter value addresses all four parallel 64 KB planes, so this is the 256 KB display wraparound |
+| Registers | CR17 (Mode Control) and CR14 (Underline Location) are live state on `CrtcTiming`, defaulted per mode (16-color planar = 0xE3 byte mode) and writable through 3D4/3D5 |
+
+Scope: 16-color planar modes only. Mode-X / unchained 256-color and its wrap stay
+deferred to the mode-X slice. The done-signal is the seam: wrapped scanout pixels
+EQUAL the top-of-VRAM pixels (`vga::tests::byte_mode_wrap_scanout_equals_top_of_vram`
+and `display_address_wrap_seam_through_the_machine`).
+
+Divergences (fidelity directive):
+
+1. **Doubleword bit positions pending reference confirmation.** Implemented as
+   MA13 -> bit 1, MA12 -> bit 0 from the recollected FreeVGA/Matrox transform; to
+   be confirmed against an unbroken mirror. Unexercised by any in-scope workload.
+2. **CR17 bits 0/1 row-scan substitution not modeled.** Address bits 13/14 always
+   come from the counter. The 16-color planar modes set these bits (substitution
+   off), so this matches hardware for every in-scope mode; CGA/Hercules-compat
+   modes that clear them are out of scope.
+3. **Address-clock dividers not modeled.** CR17 bit 3 (count by 2) and CR14 bit 5
+   (count by 4) are stored but not applied to the counter rate. The 16-color
+   planar modes select no division.
 
 ## Latch rules
 
@@ -136,10 +167,9 @@ modes land.
 
 These are simplifications recorded for later tightening, not hardware behavior:
 
-- **Start address** is treated as a direct byte offset within a plane (real VGA
-  applies word/byte/dword addressing modes); page flips at byte boundaries work.
-- **CRTC Offset register** stores the raw register value; the per-plane byte pitch
-  is `2 × offset` (so mode 0Dh's offset register = 20 gives a 40-byte pitch).
+- **Start address and offset pitch** are now handled by the faithful
+  display-address counter and the byte/word/doubleword transform (see "Slice 3
+  coverage"); these are no longer approximations.
 - **The A0000 aperture** routes to the planar datapath when the core is in a
   planar mode, and to the flat mode-13h buffer otherwise; the planar window is the
   64 KB `A0000..AFFFF` range.
