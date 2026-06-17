@@ -703,27 +703,36 @@ impl Machine {
     /// register writes through `margo.write_mmio_u8`, advancing PUSH_GET. A data
     /// word that writes COMMAND sets `busy_ns`, so the loop stalls there until the
     /// operation completes on a later `advance_devices`, which is why PUSH_GET
-    /// trails PUSH_PUT. Latch-only packets consume instantly. The loop terminates
-    /// because `get` advances monotonically toward `put`.
+    /// trails PUSH_PUT. Latch-only packets consume instantly.
+    ///
+    /// A full ring holds at most `size / 4` words, so the engine consumes at most
+    /// that many words per call: this backstops a malformed ring (a non-power-of-two
+    /// `size`, or a `put` that the `(get + 4) % size` orbit never reaches) where the
+    /// `get != put` guard alone would spin forever over latch-only or zeroed words.
+    /// A well-formed ring always drains in fewer than `size / 4` words, so the budget
+    /// never truncates legitimate work.
     fn pump_pusher(&mut self) {
         let p = self.margo.pusher();
         if !p.enabled || p.size == 0 {
             return;
         }
         let mut get = p.get;
-        while self.margo.busy_ns() == 0 && get != p.put {
+        let mut budget = (p.size / 4) as u64;
+        while self.margo.busy_ns() == 0 && get != p.put && budget > 0 {
             let header = self.read_ring_word(p.base, p.size, get);
             let method = (header & 0xffff) as usize;
             let count = header >> 16;
             get = (get + 4) % p.size;
+            budget -= 1;
             let mut i = 0u32;
-            while i < count && get != p.put {
+            while i < count && get != p.put && budget > 0 {
                 let data = self.read_ring_word(p.base, p.size, get);
                 for b in 0..4 {
                     self.margo
                         .write_mmio_u8(method + (i as usize) * 4 + b, (data >> (8 * b)) as u8);
                 }
                 get = (get + 4) % p.size;
+                budget -= 1;
                 i += 1;
             }
             self.margo.set_pusher_get(get);
@@ -2952,6 +2961,22 @@ mod tests {
         assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE), 0x00); // (0,0) untouched
         // The ring drained: GET reached PUT.
         assert_eq!(read_mmio_reg(&mut machine, 0x90), put);
+    }
+
+    #[test]
+    fn pusher_does_not_spin_on_a_malformed_ring() {
+        let mut machine = test_machine();
+        // A non-power-of-two size with a PUT that the (get + 4) % size orbit never
+        // reaches, over zeroed RAM (every header decodes to method 0, count 0, so no
+        // COMMAND ever sets busy_ns). Without the word budget this would spin forever.
+        write_mmio_reg(&mut machine, 0x84, 0x0001_0000); // PUSH_BASE
+        write_mmio_reg(&mut machine, 0x88, 10); // PUSH_SIZE: not a multiple of 4
+        write_mmio_reg(&mut machine, 0x80, 1); // PUSH_CTRL = ENABLE
+        write_mmio_reg(&mut machine, 0x8c, 1); // PUSH_PUT = 1 (never on the orbit)
+
+        // Must return rather than hang. GET stays within the ring.
+        machine.advance_devices(1);
+        assert!(read_mmio_reg(&mut machine, 0x90) < 10);
     }
 
     #[test]
