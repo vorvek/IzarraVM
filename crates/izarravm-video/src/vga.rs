@@ -223,21 +223,22 @@ impl Vga {
         }
     }
 
-    fn render_scanline(&mut self, raster_line: u32) {
+    /// Render one undoubled counter line, emitting `scan_factor` doubled raster
+    /// rows. `catch_up` and `render_full_frame` both work in counter lines, the
+    /// same space the beam counts in.
+    fn render_scanline(&mut self, counter_line: u32) {
         let factor = self.scan_factor();
-        let counter_line = raster_line / factor; // undoubled
         let width = self.raster_width() as usize;
-        let dst = raster_line as usize * width;
-        if dst + width > self.work.len() {
-            return; // safety: work must be sized to raster_width*raster_height
-        }
-        if counter_line < self.crtc.vdisp_end {
-            let row = self.render_active_row(counter_line);
-            self.work[dst..dst + width].copy_from_slice(&row);
+        let pixels = if counter_line < self.crtc.vdisp_end {
+            self.render_active_row(counter_line)
         } else {
-            let color = self.region_color(counter_line);
-            for px in &mut self.work[dst..dst + width] {
-                *px = color;
+            vec![self.region_color(counter_line); width]
+        };
+        for sub in 0..factor {
+            let raster_line = counter_line * factor + sub;
+            let dst = raster_line as usize * width;
+            if dst + width <= self.work.len() {
+                self.work[dst..dst + width].copy_from_slice(&pixels);
             }
         }
     }
@@ -247,8 +248,8 @@ impl Vga {
         let w = self.raster_width();
         let h = self.raster_height();
         self.work = vec![0u8; (w * h) as usize];
-        for line in 0..h {
-            self.render_scanline(line);
+        for counter_line in 0..self.crtc.vtotal {
+            self.render_scanline(counter_line);
         }
         VgaRaster { width: w, height: h, pixels: self.work.clone() }
     }
