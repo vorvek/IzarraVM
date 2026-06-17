@@ -2687,6 +2687,59 @@ mod tests {
     }
 
     #[test]
+    fn overlay_yuy2_composites_through_the_apertures() {
+        let mut machine = test_machine();
+        machine.margo_mut().set_mode(0x14a); // 640x480x32
+        // One YUY2 group offscreen (2 MiB in, past the 32bpp visible surface):
+        // Y0=235 (white), U=128, Y1=16 (black), V=128. Byte order Y0, U, Y1, V.
+        let src = 0x0020_0000u32;
+        machine.write_physical_u8(MARGO_LFB_BASE + src, 235);
+        machine.write_physical_u8(MARGO_LFB_BASE + src + 1, 128);
+        machine.write_physical_u8(MARGO_LFB_BASE + src + 2, 16);
+        machine.write_physical_u8(MARGO_LFB_BASE + src + 3, 128);
+
+        write_mmio_reg(&mut machine, 0x44, src); // OVL_SRC_Y (packed surface)
+        write_mmio_reg(&mut machine, 0x48, 4); // OVL_SRC_PITCH
+        write_mmio_reg(&mut machine, 0x4c, (1 << 16) | 2); // OVL_SRC_DIM: w=2, h=1
+        write_mmio_reg(&mut machine, 0x58, (20 << 16) | 10); // OVL_DST_XY: x=10, y=20
+        write_mmio_reg(&mut machine, 0x5c, (1 << 16) | 2); // OVL_DST_DIM: w=2, h=1 (1:1)
+        write_mmio_reg(&mut machine, 0x40, 1); // OVL_CTRL: ENABLE, FORMAT YUY2, no key
+
+        let palette = machine.palette_argb();
+        let argb = machine.margo().scanout_argb(&palette);
+        assert_eq!(argb[20 * 640 + 10], 0x00ff_ffff); // Y0 -> white
+        assert_eq!(argb[20 * 640 + 11], 0x0000_0000); // Y1 -> black
+    }
+
+    #[test]
+    fn overlay_scales_by_point_sampling() {
+        let mut machine = test_machine();
+        machine.margo_mut().set_mode(0x14a);
+        // The same one YUY2 group, scaled 2x horizontally: dst width 4.
+        let src = 0x0020_0000u32;
+        machine.write_physical_u8(MARGO_LFB_BASE + src, 235);
+        machine.write_physical_u8(MARGO_LFB_BASE + src + 1, 128);
+        machine.write_physical_u8(MARGO_LFB_BASE + src + 2, 16);
+        machine.write_physical_u8(MARGO_LFB_BASE + src + 3, 128);
+
+        write_mmio_reg(&mut machine, 0x44, src);
+        write_mmio_reg(&mut machine, 0x48, 4);
+        write_mmio_reg(&mut machine, 0x4c, (1 << 16) | 2); // src w=2, h=1
+        write_mmio_reg(&mut machine, 0x58, (20 << 16) | 10);
+        write_mmio_reg(&mut machine, 0x5c, (1 << 16) | 4); // dst w=4, h=1 (2x)
+        write_mmio_reg(&mut machine, 0x40, 1);
+
+        let palette = machine.palette_argb();
+        let argb = machine.margo().scanout_argb(&palette);
+        // sx = dx * src_w / dst_w = dx * 2 / 4 = dx / 2:
+        // dst 0,1 sample src pixel 0 (white); dst 2,3 sample src pixel 1 (black).
+        assert_eq!(argb[20 * 640 + 10], 0x00ff_ffff);
+        assert_eq!(argb[20 * 640 + 11], 0x00ff_ffff);
+        assert_eq!(argb[20 * 640 + 12], 0x0000_0000);
+        assert_eq!(argb[20 * 640 + 13], 0x0000_0000);
+    }
+
+    #[test]
     fn dos_program_startup_services() {
         // org 0x100:
         //   mov ah,0x30 / int 0x21            ; get version (AL=6, AH=10), no fault
