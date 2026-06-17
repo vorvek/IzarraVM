@@ -98,6 +98,6 @@ mod tests {
         let image = text_to_color_image(&frame);
         assert_eq!(image.size, [80 * GLYPH_SIZE, 25 * GLYPH_SIZE]);
         let white = egui::Color32::from_rgb(0xff, 0xff, 0xff);
-        assert!(image.pixels.iter().any(|p| *p == white));
+        assert!(image.pixels.contains(&white));
     }
 }
