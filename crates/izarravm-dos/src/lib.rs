@@ -127,7 +127,7 @@ pub enum DosAction {
 
 /// Conventional memory modeled as one block ending at paragraph 0xA000. The
 /// program owns [psp_seg, prog_top); AH=48h blocks stack upward from free_base.
-/// ponytail: bump allocator with a single resizable program block and LIFO
+/// Bump allocator with a single resizable program block and LIFO
 /// reclaim; no MCB chain, no free-list coalescing, no UMB/HIMEM.
 #[derive(Debug, Default)]
 struct Arena {
@@ -311,7 +311,7 @@ struct FindEntry {
 }
 
 /// A live directory search: the snapshot of matching entries and the cursor into
-/// it, keyed in the kernel by the DTA address. ponytail: the whole match list is
+/// it, keyed in the kernel by the DTA address. The whole match list is
 /// taken once at FindFirst; host directory changes between calls are not seen
 /// (real DOS re-walks and per RBIL may even return the same file twice, so
 /// neither is "correct"; ours is stable). The cursor lives here, not in the DTA
@@ -616,7 +616,7 @@ impl DosKernel {
                 Ok(DosAction::Continue)
             }
             // AH=25h: set interrupt vector AL to DS:DX. Writes the real guest IVT
-            // (offset then segment, little-endian) at AL*4. ponytail: re-vectoring an
+            // (offset then segment, little-endian) at AL*4. Re-vectoring an
             // HLE'd INT (0x10/0x20/0x21) writes the IVT but host dispatch still
             // intercepts those by vector number.
             0x25 => {
@@ -640,7 +640,7 @@ impl DosKernel {
                 Ok(DosAction::Continue)
             }
             // AH=2Bh: set date. CX=year(1980-2099), DH=month, DL=day. AL=0 ok, 0xFF
-            // invalid. ponytail: no calendar routine, so the day range is the coarse
+            // invalid. No calendar routine, so the day range is the coarse
             // 1..=31 (real DOS rejects e.g. Feb 31) and day_of_week is not recomputed;
             // no in-scope reader needs per-month validation or the post-set weekday.
             0x2b => {
@@ -741,7 +741,7 @@ impl DosKernel {
             }
             // AH=4Ch: terminate with the return code in AL.
             0x4c => Ok(DosAction::Exit((regs.ax & 0x00ff) as u8)),
-            // AH=33h: Ctrl-Break flag. ponytail stub: AL=00 (get) returns DL=0 (off);
+            // AH=33h: Ctrl-Break flag. Stub: AL=00 (get) returns DL=0 (off);
             // AL=01 (set) is accepted as a no-op. No INT 23h state is tracked yet.
             0x33 => {
                 if regs.ax as u8 == 0x00 {
@@ -749,7 +749,7 @@ impl DosKernel {
                 }
                 Ok(DosAction::Continue)
             }
-            // AH=0Eh: select default drive. ponytail stub: only C: exists, so report
+            // AH=0Eh: select default drive. Stub: only C: exists, so report
             // AL=1 logical drive and do not change the current drive.
             0x0e => {
                 regs.ax = (regs.ax & 0xff00) | 0x01;
@@ -931,7 +931,7 @@ impl DosKernel {
                         attr,
                         time,
                         date,
-                        // ponytail: the DTA size field is a 32-bit dword, so a host
+                        // The DTA size field is a 32-bit dword, so a host
                         // file over 4 GiB truncates; DOS cannot represent more.
                         size: metadata.len() as u32,
                         name: name.to_ascii_uppercase(),
@@ -942,7 +942,7 @@ impl DosKernel {
                     return Ok(DosAction::Continue);
                 };
                 write_find_record(mem, self.dta, &first)?;
-                // ponytail: an abandoned search (FindFirst, take the first hit, never
+                // An abandoned search (FindFirst, take the first hit, never
                 // run to 0x12) leaves its snapshot here until init_program clears the
                 // map; bounded per program run, so no eviction policy.
                 self.find_searches
@@ -988,7 +988,7 @@ const TOKA_DOS_OEM: u8 = 0xff;
 const COM_MAX_LEN: usize = 0x10000 - 0x100;
 
 /// Conventional memory is modeled as one block ending at the 640 KiB video
-/// aperture (paragraph 0xA000). ponytail: single block, no MCB chain / EBDA /
+/// aperture (paragraph 0xA000). Single block, no MCB chain / EBDA /
 /// UMB; an .EXE that walks or resizes the memory arena is out of scope.
 const CONVENTIONAL_TOP_PARAGRAPH: u32 = 0xa000;
 
@@ -1125,7 +1125,7 @@ pub fn load_exe(
 
     // Apply relocations: each (off, seg) names a word at module offset
     // seg*16+off; add start_seg so the segment reference points at the real load
-    // address. ponytail: out-of-range relocations are rejected rather than
+    // address. Out-of-range relocations are rejected rather than
     // applied blindly as real DOS would (avoids corrupting arbitrary memory).
     let reloc_end = usize::from(e_lfarlc) + usize::from(e_crlc) * 4;
     if reloc_end > image.len() {
@@ -1165,7 +1165,7 @@ pub fn load_program(
     mem: &mut Memory,
     psp_segment: u16,
 ) -> Result<ProgramEntry, DosError> {
-    // ponytail: detect "MZ" only; the rare "ZM" alternate signature is treated
+    // Detect "MZ" only; the rare "ZM" alternate signature is treated
     // as a .COM (no real DOS game ships "ZM").
     if image.len() >= 2 && image[0] == b'M' && image[1] == b'Z' {
         load_exe(image, mem, psp_segment)
@@ -1243,7 +1243,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 /// Build the blank-padded 11-byte 8.3 template for a host file name, uppercased.
 /// None if the name does not fit 8.3 (empty or dotted base such as a leading-dot
 /// ".cfg", base > 8, ext > 3, or non-ASCII): such host files are invisible to DOS
-/// find. ponytail: no NAME~1 long-name mangling; the corpus is 8.3-named.
+/// find. No NAME~1 long-name mangling; the corpus is 8.3-named.
 fn host_name_to_8_3(name: &str) -> Option<[u8; 11]> {
     if !name.is_ascii() {
         return None;
@@ -1272,7 +1272,7 @@ fn host_name_to_8_3(name: &str) -> Option<[u8; 11]> {
 
 /// Build the 11-byte search template from a DOS wildcard pattern. '*' fills the
 /// rest of its field with '?'; other characters are uppercased; short fields pad
-/// with blanks. ponytail: the COMMAND.COM habit of rewriting a bare name to
+/// with blanks. The COMMAND.COM habit of rewriting a bare name to
 /// "name.*" is NOT applied here (we are the kernel, not the shell), so "*" matches
 /// only extensionless files while "*.*" matches every name.
 fn pattern_to_8_3(pattern: &str) -> [u8; 11] {
