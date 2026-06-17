@@ -24,6 +24,7 @@ result_payload:
     db 'FAIL video.ega_planar', 10
     db 'PASS video.vga_mode13h', 10
     db 'FAIL sound.pc_speaker', 10
+opl2_record:
     db 'FAIL sound.opl2', 10
 opl3_record:
     db 'FAIL sound.opl3', 10

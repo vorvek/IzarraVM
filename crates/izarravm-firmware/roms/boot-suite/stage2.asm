@@ -68,6 +68,7 @@ stage2_start:
     call test_timer
     call test_sb_dsp_reset
     call test_opl3
+    call test_opl2
 
     hlt
     jmp $
@@ -265,6 +266,47 @@ test_opl3:
     mov byte [di + 3], 'S'
     add word [RESULT_BLOCK + 10], 27
 .done:
+    ret
+
+test_opl2:
+    ; AdLib timer-1 overflow test on the primary bank (0x388/0x389). Timer-1
+    ; steps every ~80us; a 0xFF preset overflows in one step. Mask and reset the
+    ; flags, load the preset, start timer-1, then poll status bit6.
+    mov dx, OPL_ADDR
+    mov al, 0x04
+    out dx, al
+    mov dx, OPL_DATA
+    mov al, 0x60            ; mask both timer IRQs (bits 6/5)
+    out dx, al
+    mov al, 0x80            ; reset both overflow flags
+    out dx, al
+    mov dx, OPL_ADDR
+    mov al, 0x02            ; timer-1 preset register
+    out dx, al
+    mov dx, OPL_DATA
+    mov al, 0xFF            ; preset -> overflow in one ~80us step
+    out dx, al
+    mov dx, OPL_ADDR
+    mov al, 0x04
+    out dx, al
+    mov dx, OPL_DATA
+    mov al, 0x21            ; start timer-1 (bit0), mask timer-2 IRQ (bit5)
+    out dx, al
+    mov cx, 8               ; poll up to 8 delay windows for the overflow
+.wait:
+    call delay
+    mov dx, OPL_ADDR        ; status on 0x388
+    in al, dx
+    test al, 0x40           ; timer-1 overflow flag
+    jnz .ready
+    loop .wait
+    ret                     ; never overflowed -> leave FAIL
+.ready:
+    mov di, RESULT_BLOCK + (opl2_record - result_block_template)
+    mov byte [di], 'P'
+    mov byte [di + 2], 'S'
+    mov byte [di + 3], 'S'
+    add word [RESULT_BLOCK + 10], 27
     ret
 
 irq0_handler:
