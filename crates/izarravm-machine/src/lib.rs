@@ -2711,4 +2711,32 @@ mod tests {
         assert_eq!(mem.read_u16(0x1202).unwrap(), 0x0600); // BX from IVT[0x21] (stub offset)
         assert_eq!(mem.read_u16(0x1204).unwrap(), 0x1100); // AH=48h allocated segment
     }
+
+    #[test]
+    fn dos_program_writes_and_reads_back_a_file() {
+        // org 0x100: create C:\OUT.TXT (AH=3Ch), write "HI!" (AH=40h to the file
+        // handle), seek to 0 (AH=42h), read 3 bytes back (AH=3Fh), close (AH=3Eh),
+        // write the buffer to stdout (AH=40h, BX=1), exit (AH=4Ch). Data follows the
+        // code: fname at 0x13E, msg "HI!" at 0x149, buf at 0x14C.
+        let com: &[u8] = &[
+            0xb4, 0x3c, 0x31, 0xc9, 0xba, 0x3e, 0x01, 0xcd, 0x21, 0x89, 0xc3, 0xb4, 0x40, 0xb9,
+            0x03, 0x00, 0xba, 0x49, 0x01, 0xcd, 0x21, 0xb8, 0x00, 0x42, 0x31, 0xc9, 0x31, 0xd2,
+            0xcd, 0x21, 0xb4, 0x3f, 0xb9, 0x03, 0x00, 0xba, 0x4c, 0x01, 0xcd, 0x21, 0xb4, 0x3e,
+            0xcd, 0x21, 0xb4, 0x40, 0xbb, 0x01, 0x00, 0xb9, 0x03, 0x00, 0xba, 0x4c, 0x01, 0xcd,
+            0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21, // fname "C:\\OUT.TXT\0"
+            0x43, 0x3a, 0x5c, 0x4f, 0x55, 0x54, 0x2e, 0x54, 0x58, 0x54, 0x00,
+            // msg "HI!"
+            0x48, 0x49, 0x21, // buf (3 bytes)
+            0x00, 0x00, 0x00,
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com)
+                .unwrap();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
+        assert_eq!(machine.dos_output(), b"HI!");
+        assert_eq!(std::fs::read(dir.path().join("OUT.TXT")).unwrap(), b"HI!");
+    }
 }
