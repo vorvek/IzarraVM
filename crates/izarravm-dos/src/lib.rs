@@ -430,6 +430,14 @@ pub fn load_exe(
     if e_cp == 0 {
         return Err(DosError::ExeImageTruncated("page count e_cp is zero"));
     }
+    // e_cblp is bytes used on the last page, legal range 0..=512 (0 and 512 both
+    // mean a full page). A larger value is a malformed header that would
+    // underflow the last-page computation below, so reject it up front.
+    if e_cblp > 512 {
+        return Err(DosError::ExeImageTruncated(
+            "bytes-on-last-page e_cblp exceeds 512",
+        ));
+    }
     let header_bytes = usize::from(e_cparhdr) * 16;
     let last_page = if e_cblp != 0 {
         512 - usize::from(e_cblp)
@@ -1145,6 +1153,19 @@ mod tests {
         assert!(matches!(
             load_exe(&image, &mut mem, 0x100),
             Err(DosError::ExeNotEnoughMemory { .. })
+        ));
+    }
+
+    #[test]
+    fn load_exe_rejects_oversized_e_cblp() {
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let mut image = build_mz(&[0u8; 16], &[], 0, 0, 0, 0x100, 0x10, 0xffff);
+        // e_cblp > 512 is a malformed header; it must be rejected, not underflow
+        // the last-page computation and panic in debug builds.
+        image[2..4].copy_from_slice(&0x0201u16.to_le_bytes());
+        assert!(matches!(
+            load_exe(&image, &mut mem, 0x100),
+            Err(DosError::ExeImageTruncated(_))
         ));
     }
 }
