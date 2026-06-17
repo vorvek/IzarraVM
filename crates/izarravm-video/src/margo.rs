@@ -1,11 +1,11 @@
 //! Margo, the VEGA 2D engine: the display register block, the linear frame
 //! buffer, and the blit engine. The engine implements FILL, COPY, color expand,
-//! and LINE, all with full ROP3 and rectangle clipping.
+//! LINE, and PATTERN_FILL, all with full ROP3 and rectangle clipping.
 
 pub const MARGO_VRAM_SIZE: usize = 4 * 1024 * 1024;
 pub const MARGO_MMIO_SIZE: usize = 0x0001_0000; // 64 KB register block
 pub const MARGO_ID_VALUE: u32 = 0x4D47_0100; // 'M' 'G', version 1.00
-pub const MARGO_CAPS_VALUE: u32 = 0x0000_007f; // bits 0 FILL, 1 COPY, 2 COLOR_EXPAND, 3 LINE, 4 ROP3, 5 CLIP, 6 COLORKEY
+pub const MARGO_CAPS_VALUE: u32 = 0x0000_00ff; // bits 0 FILL, 1 COPY, 2 COLOR_EXPAND, 3 LINE, 4 ROP3, 5 CLIP, 6 COLORKEY, 7 PATTERN_FILL
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VbeMode {
@@ -213,6 +213,7 @@ pub const REG_CLIP_TL: usize = 0x0134;
 pub const REG_CLIP_BR: usize = 0x0138;
 pub const REG_LINE_START: usize = 0x013c;
 pub const REG_LINE_END: usize = 0x0140;
+pub const REG_PAT_BASE: usize = 0x0144;
 pub const REG_COMMAND: usize = 0x0150;
 pub const REG_MONO_DATA: usize = 0x0160;
 
@@ -222,6 +223,7 @@ const FILL_NS_PER_PIXEL: u64 = 5; // 200 Mpixels/s solid fill (section 1.1)
 const COPY_NS_PER_PIXEL: u64 = 10; // 100 Mpixels/s screen-to-screen blit (section 1.1)
 const EXPAND_NS_PER_PIXEL: u64 = 5; // 200 Mpixels/s color expand (section 1.1, fill class)
 const LINE_NS_PER_PIXEL: u64 = 10; // 100 Mpixels/s, one pixel per clock (section 1.1)
+const PATTERN_NS_PER_PIXEL: u64 = 5; // fill class, 200 Mpixels/s (section 1.1)
 const BLIT_SETUP_NS: u64 = 100; // fixed per-operation setup, shared by all blits
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -621,6 +623,82 @@ fn line(vram: &mut [u8], p: &LineParams) -> u64 {
     written
 }
 
+struct PatternParams {
+    dst_base: u32,
+    dst_pitch: u32,
+    pat_base: u32,
+    depth: u32, // bytes per pixel: 1, 2, or 4
+    dst_x: u32,
+    dst_y: u32,
+    width: u32,
+    height: u32,
+    rop: u8, // ROP3 code; P = pattern pixel, no source (S = 0)
+    colorkey: u32,
+    colorkey_en: bool,
+    clip: Clip,
+}
+
+/// Fill the destination rectangle in `vram` by tiling the 8x8 pattern at
+/// `pat_base`. The pattern is in the destination format with a row pitch of
+/// `8 * depth` bytes; the pixel for destination `(x, y)` is `pattern[y % 8][x % 8]`
+/// using absolute destination coordinates, so the phase is aligned to the surface
+/// origin and adjacent fills tile seamlessly (section 7.4). The ROP3 code is
+/// applied with P = the pattern pixel and S = 0 (PATTERN_FILL has no source,
+/// section 7.6). With `colorkey_en`, a pattern pixel whose bytes equal `colorkey`
+/// is skipped, so a hatch keys its background through. A pixel outside the clip
+/// rectangle or the frame store, and a pattern byte range outside the store, are
+/// skipped, not wrapped (section 8). `depth` outside {1, 2, 4} is a no-op. The
+/// loop is bounded to `vram.len()` considered pixels and the offset math is
+/// u64-saturating, so a pathological DIM cannot spin or overflow. Returns the
+/// number of pixels written.
+fn pattern(vram: &mut [u8], p: &PatternParams) -> u64 {
+    if !matches!(p.depth, 1 | 2 | 4) {
+        return 0;
+    }
+    let depth = p.depth as usize;
+    let len = vram.len() as u64;
+    let pat_pitch = 8 * depth as u64;
+    let key = p.colorkey.to_le_bytes();
+    let mut considered: u64 = 0;
+    let mut written: u64 = 0;
+    'rows: for row in 0..p.height {
+        let y = p.dst_y as u64 + row as u64;
+        for col in 0..p.width {
+            if considered >= len {
+                break 'rows;
+            }
+            considered += 1;
+            let x = p.dst_x as u64 + col as u64;
+            if !p.clip.allows(x, y) {
+                continue;
+            }
+            // Pattern phase from absolute destination coordinates (& 7 == mod 8).
+            let pat_off = (p.pat_base as u64)
+                .saturating_add((y & 7).saturating_mul(pat_pitch))
+                .saturating_add((x & 7).saturating_mul(depth as u64));
+            if pat_off.saturating_add(depth as u64) > len {
+                continue;
+            }
+            let pat_off = pat_off as usize;
+            let mut pb = [0u8; 4];
+            pb[..depth].copy_from_slice(&vram[pat_off..pat_off + depth]);
+            if p.colorkey_en && pb[..depth] == key[..depth] {
+                continue;
+            }
+            let ppix = u32::from_le_bytes(pb);
+            let off = (p.dst_base as u64)
+                .saturating_add(y.saturating_mul(p.dst_pitch as u64))
+                .saturating_add(x.saturating_mul(depth as u64));
+            if off.saturating_add(depth as u64) > len {
+                continue;
+            }
+            written += 1;
+            write_rop(vram, off as usize, depth, p.rop, ppix, 0);
+        }
+    }
+    written
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Margo {
     vram: Vec<u8>,
@@ -825,6 +903,7 @@ impl Margo {
             0x03 => self.arm_expand_data(),
             0x04 => self.run_expand_mem(),
             0x05 => self.run_line(),
+            0x06 => self.run_pattern(),
             _ => {}
         }
         self.command = 0;
@@ -920,6 +999,27 @@ impl Margo {
         };
         let pixels = line(&mut self.vram, &params);
         self.busy_ns = BLIT_SETUP_NS + pixels * LINE_NS_PER_PIXEL;
+    }
+
+    fn run_pattern(&mut self) {
+        let dst_xy = self.blit_reg(REG_DST_XY);
+        let dim = self.blit_reg(REG_DIM);
+        let params = PatternParams {
+            dst_base: self.blit_reg(REG_DST_BASE),
+            dst_pitch: self.blit_reg(REG_DST_PITCH),
+            pat_base: self.blit_reg(REG_PAT_BASE),
+            depth: self.blit_reg(REG_DEPTH),
+            dst_x: dst_xy & 0xffff,
+            dst_y: dst_xy >> 16,
+            width: dim & 0xffff,
+            height: dim >> 16,
+            rop: self.blit_reg(REG_ROP) as u8,
+            colorkey: self.blit_reg(REG_COLORKEY),
+            colorkey_en: self.blit_reg(REG_FLAGS) & 0x1 != 0,
+            clip: self.build_clip(),
+        };
+        let pixels = pattern(&mut self.vram, &params);
+        self.busy_ns = BLIT_SETUP_NS + pixels * PATTERN_NS_PER_PIXEL;
     }
 
     fn arm_expand_data(&mut self) {
@@ -1278,6 +1378,258 @@ mod tests {
         assert!(vram.iter().all(|&b| b == 0));
     }
 
+    #[test]
+    fn pattern_adjacent_fills_tile_seamlessly() {
+        // Two 8x1 fills on the same row, the second starting at x=8. Because the phase
+        // is absolute, x=8 has phase 8 & 7 = 0, the same column as x=0, so the two
+        // fills meet as one continuous tile grid.
+        let mut vram = vec![0u8; 256];
+        let pat_base = 128usize;
+        for r in 0..8 {
+            for c in 0..8 {
+                vram[pat_base + r * 8 + c] = (r * 8 + c + 1) as u8;
+            }
+        }
+        let fill_a = PatternParams {
+            dst_base: 0,
+            dst_pitch: 64,
+            pat_base: pat_base as u32,
+            depth: 1,
+            dst_x: 0,
+            dst_y: 0,
+            width: 8,
+            height: 1,
+            rop: 0xf0,
+            colorkey: 0,
+            colorkey_en: false,
+            clip: Clip::default(),
+        };
+        assert_eq!(pattern(&mut vram, &fill_a), 8);
+        let fill_b = PatternParams {
+            dst_base: 0,
+            dst_pitch: 64,
+            pat_base: pat_base as u32,
+            depth: 1,
+            dst_x: 8,
+            dst_y: 0,
+            width: 8,
+            height: 1,
+            rop: 0xf0,
+            colorkey: 0,
+            colorkey_en: false,
+            clip: Clip::default(),
+        };
+        assert_eq!(pattern(&mut vram, &fill_b), 8);
+        // Tile row 0 is values 1..=8; columns 0..16 are that row repeated twice.
+        let expected: Vec<u8> = (0..16u32).map(|x| ((x & 7) + 1) as u8).collect();
+        assert_eq!(&vram[0..16], &expected[..]);
+    }
+
+    #[test]
+    fn pattern_patinvert_xors_the_pattern_into_the_destination() {
+        // ROP 0x5A = D ^ P. A uniform tile of 0x0F over a 0xFF destination yields 0xF0.
+        let mut vram = vec![0xffu8; 256];
+        let pat_base = 128usize;
+        for b in 0..64 {
+            vram[pat_base + b] = 0x0f;
+        }
+        let p = PatternParams {
+            dst_base: 0,
+            dst_pitch: 8,
+            pat_base: pat_base as u32,
+            depth: 1,
+            dst_x: 0,
+            dst_y: 0,
+            width: 4,
+            height: 1,
+            rop: 0x5a,
+            colorkey: 0,
+            colorkey_en: false,
+            clip: Clip::default(),
+        };
+        assert_eq!(pattern(&mut vram, &p), 4);
+        assert_eq!(&vram[0..4], &[0xf0, 0xf0, 0xf0, 0xf0]); // 0xff ^ 0x0f
+        assert_eq!(vram[4], 0xff); // outside the 4-wide rect
+    }
+
+    #[test]
+    fn pattern_colorkey_skips_matching_pattern_pixels() {
+        // A hatch: column 0 of every tile row is 0xAA (the stroke), the rest 0x11 (the
+        // background). With COLORKEY = 0x11 and COLORKEY_EN, only the strokes paint;
+        // the background keys through, leaving the destination untouched.
+        let mut vram = vec![0u8; 256];
+        let pat_base = 128usize;
+        for r in 0..8 {
+            for c in 0..8 {
+                vram[pat_base + r * 8 + c] = if c == 0 { 0xaa } else { 0x11 };
+            }
+        }
+        vram[0..8].fill(0x55); // pre-set the destination row so a kept pixel is visible
+        let p = PatternParams {
+            dst_base: 0,
+            dst_pitch: 8,
+            pat_base: pat_base as u32,
+            depth: 1,
+            dst_x: 0,
+            dst_y: 0,
+            width: 8,
+            height: 1,
+            rop: 0xf0,
+            colorkey: 0x11,
+            colorkey_en: true,
+            clip: Clip::default(),
+        };
+        assert_eq!(pattern(&mut vram, &p), 1); // only column 0 (0xAA) is written
+        assert_eq!(vram[0], 0xaa); // stroke painted
+        assert_eq!(&vram[1..8], &[0x55; 7]); // background kept (keyed through)
+    }
+
+    #[test]
+    fn pattern_clip_confines_the_fill() {
+        // Tile cell (r, c) = r*8 + c + 1. Clip to x in [1, 3): only columns 1 and 2 of
+        // the destination row are written, each with its absolute-phase tile value.
+        let mut vram = vec![0u8; 256];
+        let pat_base = 128usize;
+        for r in 0..8 {
+            for c in 0..8 {
+                vram[pat_base + r * 8 + c] = (r * 8 + c + 1) as u8;
+            }
+        }
+        let p = PatternParams {
+            dst_base: 0,
+            dst_pitch: 8,
+            pat_base: pat_base as u32,
+            depth: 1,
+            dst_x: 0,
+            dst_y: 0,
+            width: 4,
+            height: 1,
+            rop: 0xf0,
+            colorkey: 0,
+            colorkey_en: false,
+            clip: Clip {
+                enabled: true,
+                x0: 1,
+                y0: 0,
+                x1: 3,
+                y1: 1,
+            },
+        };
+        assert_eq!(pattern(&mut vram, &p), 2);
+        assert_eq!(vram[0], 0); // x=0 clipped out
+        assert_eq!(vram[1], 2); // (1,0) tile[0][1] = 0*8+1+1
+        assert_eq!(vram[2], 3); // (2,0) tile[0][2]
+        assert_eq!(vram[3], 0); // x=3 clipped out (BR exclusive)
+    }
+
+    #[test]
+    fn pattern_tiles_depth_2_pixels() {
+        // depth 2: pattern row pitch is 8 * 2 = 16 bytes. Tile cell (r, c) holds the
+        // 16-bit value 0x1000 | (r*8 + c). A 2x2 fill proves the row pitch, the
+        // little-endian read, and the phase across both axes at depth 2.
+        let mut vram = vec![0u8; 512];
+        let pat_base = 256usize;
+        for r in 0..8 {
+            for c in 0..8 {
+                let v: u16 = 0x1000 | (r * 8 + c) as u16;
+                let off = pat_base + r * 16 + c * 2;
+                vram[off..off + 2].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        let p = PatternParams {
+            dst_base: 0,
+            dst_pitch: 4,
+            pat_base: pat_base as u32,
+            depth: 2,
+            dst_x: 0,
+            dst_y: 0,
+            width: 2,
+            height: 2,
+            rop: 0xf0,
+            colorkey: 0,
+            colorkey_en: false,
+            clip: Clip::default(),
+        };
+        assert_eq!(pattern(&mut vram, &p), 4);
+        assert_eq!(&vram[0..2], &0x1000u16.to_le_bytes()); // (0,0) tile[0][0]
+        assert_eq!(&vram[2..4], &0x1001u16.to_le_bytes()); // (1,0) tile[0][1]
+        assert_eq!(&vram[4..6], &0x1008u16.to_le_bytes()); // (0,1) tile[1][0]
+        assert_eq!(&vram[6..8], &0x1009u16.to_le_bytes()); // (1,1) tile[1][1]
+    }
+
+    #[test]
+    fn pattern_skips_out_of_store_pixels_without_wrapping() {
+        // Store 16 bytes. Tile row 0 lives at bytes 8..16 (cells 1..=8); rows 1..7 are
+        // off-store but unused here. dst_base 14, pitch 4, 4-wide: offsets 14, 15 are
+        // in; 16, 17 are out and skipped, not wrapped to the start.
+        let mut vram = vec![0u8; 16];
+        for c in 0..8 {
+            vram[8 + c] = (c + 1) as u8;
+        }
+        let p = PatternParams {
+            dst_base: 14,
+            dst_pitch: 4,
+            pat_base: 8,
+            depth: 1,
+            dst_x: 0,
+            dst_y: 0,
+            width: 4,
+            height: 1,
+            rop: 0xf0,
+            colorkey: 0,
+            colorkey_en: false,
+            clip: Clip::default(),
+        };
+        assert_eq!(pattern(&mut vram, &p), 2);
+        assert_eq!(vram[14], 1); // (0,0) tile[0][0]
+        assert_eq!(vram[15], 2); // (1,0) tile[0][1]
+        assert_eq!(vram[0], 0); // not wrapped to the start
+    }
+
+    #[test]
+    fn pattern_rejects_invalid_depth() {
+        let mut vram = vec![0u8; 64];
+        let p = PatternParams {
+            dst_base: 0,
+            dst_pitch: 8,
+            pat_base: 0,
+            depth: 3, // not 1, 2, or 4
+            dst_x: 0,
+            dst_y: 0,
+            width: 2,
+            height: 2,
+            rop: 0xf0,
+            colorkey: 0,
+            colorkey_en: false,
+            clip: Clip::default(),
+        };
+        assert_eq!(pattern(&mut vram, &p), 0);
+        assert!(vram.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn pattern_skips_extreme_coordinates_without_overflow() {
+        // Adversarial guest registers: base, pitch, pat_base, and coordinates all
+        // u32::MAX. Must not panic; nothing is written.
+        let mut vram = vec![0u8; 64];
+        let p = PatternParams {
+            dst_base: u32::MAX,
+            dst_pitch: u32::MAX,
+            pat_base: u32::MAX,
+            depth: 4,
+            dst_x: u32::MAX,
+            dst_y: u32::MAX,
+            width: 8,
+            height: 8,
+            rop: 0xf0,
+            colorkey: 0,
+            colorkey_en: false,
+            clip: Clip::default(),
+        };
+        assert_eq!(pattern(&mut vram, &p), 0);
+        assert!(vram.iter().all(|&b| b == 0));
+    }
+
     // Write a 32-bit register through the byte-granular MMIO path.
     fn write_reg(margo: &mut Margo, offset: usize, value: u32) {
         for (i, b) in value.to_le_bytes().into_iter().enumerate() {
@@ -1296,10 +1648,49 @@ mod tests {
     }
 
     #[test]
+    fn pattern_tiles_with_surface_origin_phase() {
+        // An 8x8 tile whose cell (r, c) holds value r*8 + c + 1 (1..=64, so no cell is
+        // zero and a written pixel is always distinguishable from the cleared store).
+        // Filling a 10x10 rectangle at DST_XY (3, 2) must pick the pattern cell from
+        // the ABSOLUTE destination coordinate: pixel (x, y) -> tile[y & 7][x & 7]. If
+        // the phase were relative to the fill's start, (3, 2) would be tile[0][0] = 1,
+        // not tile[2][3] = 20.
+        let mut vram = vec![0u8; 1024];
+        let pat_base = 512usize; // clear of the destination rectangle (offsets 67..364)
+        for r in 0..8 {
+            for c in 0..8 {
+                vram[pat_base + r * 8 + c] = (r * 8 + c + 1) as u8;
+            }
+        }
+        let p = PatternParams {
+            dst_base: 0,
+            dst_pitch: 32,
+            pat_base: pat_base as u32,
+            depth: 1,
+            dst_x: 3,
+            dst_y: 2,
+            width: 10,
+            height: 10,
+            rop: 0xf0, // PATCOPY: result = P
+            colorkey: 0,
+            colorkey_en: false,
+            clip: Clip::default(),
+        };
+        assert_eq!(pattern(&mut vram, &p), 100);
+        assert_eq!(vram[2 * 32 + 3], 20); // (3,2)  tile[2][3] = 2*8+3+1
+        assert_eq!(vram[2 * 32 + 10], 19); // (10,2) tile[2][2], x wraps at 8
+        assert_eq!(vram[9 * 32 + 3], 12); // (3,9)  tile[1][3], y wraps at 8
+        assert_eq!(vram[11 * 32 + 11], 28); // (11,11) tile[3][3]
+        assert_eq!(vram[2 * 32 + 2], 0); // (2,2) left of dst_x, untouched
+        assert_eq!(vram[32 + 3], 0); // (3,1) above dst_y, untouched
+    }
+
+    #[test]
     fn caps_reports_all_implemented_features() {
         let margo = Margo::default();
-        // bits 0 FILL, 1 COPY, 2 COLOR_EXPAND, 3 LINE, 4 full ROP3, 5 CLIP, 6 COLORKEY.
-        assert_eq!(read_reg_u32(&margo, REG_CAPS), 0x0000_007f);
+        // bits 0 FILL, 1 COPY, 2 COLOR_EXPAND, 3 LINE, 4 full ROP3, 5 CLIP, 6 COLORKEY,
+        // 7 PATTERN_FILL.
+        assert_eq!(read_reg_u32(&margo, REG_CAPS), 0x0000_00ff);
     }
 
     #[test]
@@ -3073,5 +3464,65 @@ mod tests {
         let argb = margo.scanout_argb(&palette);
         assert_eq!(argb.len(), 640 * 480);
         assert_eq!(argb[640 + 1], 0x0034_5678);
+    }
+
+    #[test]
+    fn command_pattern_fill_tiles_and_sets_busy() {
+        let mut margo = Margo::default();
+        // Seed an 8x8 tile at VRAM offset 4096 (clear of the destination), depth 1,
+        // cell (r, c) = r*8 + c + 1.
+        let pat_base = 4096u32;
+        for r in 0..8u32 {
+            for c in 0..8u32 {
+                margo.write_vram_u8((pat_base + r * 8 + c) as usize, (r * 8 + c + 1) as u8);
+            }
+        }
+        write_reg(&mut margo, REG_DST_BASE, 0);
+        write_reg(&mut margo, REG_DST_PITCH, 32);
+        write_reg(&mut margo, REG_DEPTH, 1);
+        write_reg(&mut margo, REG_PAT_BASE, pat_base);
+        write_reg(&mut margo, REG_DST_XY, (2 << 16) | 3); // (x=3, y=2)
+        write_reg(&mut margo, REG_DIM, (10 << 16) | 10); // 10x10
+        write_reg(&mut margo, REG_ROP, 0xf0); // PATCOPY
+        write_reg(&mut margo, REG_COMMAND, 0x06); // PATTERN_FILL
+
+        assert_eq!(margo.read_vram_u8(2 * 32 + 3), 20); // (3,2) tile[2][3]
+        assert_eq!(margo.read_vram_u8(2 * 32 + 10), 19); // (10,2) tile[2][2]
+        assert_eq!(margo.read_vram_u8(9 * 32 + 3), 12); // (3,9) tile[1][3]
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 1); // BUSY set
+    }
+
+    #[test]
+    fn command_pattern_fill_busy_drains_at_the_fill_rate() {
+        let mut margo = Margo::default();
+        let pat_base = 4096u32;
+        for b in 0..64u32 {
+            margo.write_vram_u8((pat_base + b) as usize, 0xcd);
+        }
+        write_reg(&mut margo, REG_DST_BASE, 0);
+        write_reg(&mut margo, REG_DST_PITCH, 8);
+        write_reg(&mut margo, REG_DEPTH, 1);
+        write_reg(&mut margo, REG_PAT_BASE, pat_base);
+        write_reg(&mut margo, REG_DST_XY, 0);
+        write_reg(&mut margo, REG_DIM, (1 << 16) | 4); // 4x1
+        write_reg(&mut margo, REG_ROP, 0xf0);
+        write_reg(&mut margo, REG_COMMAND, 0x06);
+
+        // 4 pixels -> busy_ns = 100 + 4*5 = 120. One ns short still reads busy.
+        margo.advance_busy(119);
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 1);
+        margo.advance_busy(1);
+        assert_eq!(read_reg_u32(&margo, REG_STATUS) & 1, 0);
+    }
+
+    #[test]
+    fn pat_base_register_round_trips() {
+        let mut margo = Margo::default();
+        // Distinct values in each lane prove byte recombination through the store.
+        margo.write_mmio_u8(REG_PAT_BASE, 0x11);
+        margo.write_mmio_u8(REG_PAT_BASE + 1, 0x22);
+        margo.write_mmio_u8(REG_PAT_BASE + 2, 0x33);
+        margo.write_mmio_u8(REG_PAT_BASE + 3, 0x44);
+        assert_eq!(read_reg_u32(&margo, REG_PAT_BASE), 0x4433_2211);
     }
 }
