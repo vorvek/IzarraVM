@@ -158,6 +158,10 @@ fn expand_to_8(value: u32, size: u32) -> u32 {
     if size >= 8 {
         return value & 0xff;
     }
+    debug_assert!(
+        size >= 4,
+        "expand_to_8: size {size} below 4 underflows the replicate shift"
+    );
     let v = value & ((1 << size) - 1);
     (v << (8 - size)) | (v >> (2 * size - 8))
 }
@@ -703,17 +707,25 @@ impl Margo {
     pub fn scanout_argb(&self, palette: &[u32; 256]) -> Vec<u32> {
         let width = self.display.width as usize;
         let height = self.display.height as usize;
-        let pitch = self.display.pitch as usize;
+        let pitch = self.display.pitch as u64;
         let bpp = self.display.bpp;
-        let depth = bytes_per_pixel(bpp) as usize;
-        let start = self.display.start as usize;
+        let depth = bytes_per_pixel(bpp) as u64;
+        let start = self.display.start as u64;
+        let len = self.vram.len() as u64;
         let mut out = Vec::with_capacity(width * height);
-        for y in 0..height {
-            for x in 0..width {
-                let off = start + y * pitch + x * depth;
+        for y in 0..height as u64 {
+            for x in 0..width as u64 {
+                // Saturating like the blit paths, so an extreme DISP_START or
+                // pitch skips past the store rather than overflowing the offset.
+                let off = start
+                    .saturating_add(y.saturating_mul(pitch))
+                    .saturating_add(x.saturating_mul(depth));
                 let mut bytes = [0u8; 4];
-                for (i, slot) in bytes.iter_mut().enumerate().take(depth) {
-                    *slot = self.vram.get(off + i).copied().unwrap_or(0);
+                for (i, slot) in bytes.iter_mut().enumerate().take(depth as usize) {
+                    let addr = off.saturating_add(i as u64);
+                    if addr < len {
+                        *slot = self.vram[addr as usize];
+                    }
                 }
                 out.push(decode_argb(bpp, u32::from_le_bytes(bytes), palette));
             }
@@ -3047,5 +3059,19 @@ mod tests {
         assert_eq!(argb[2 * 640 + 3], 0x00ff_0000);
         assert_eq!(argb[0], 0x0000_ff00);
         assert_eq!(argb[1], 0x0000_0000); // untouched pixel
+    }
+
+    #[test]
+    fn scanout_argb_decodes_32bpp_pixels() {
+        let palette = [0u32; 256];
+        let mut margo = Margo::default();
+        margo.set_mode(0x14a); // 640x480x32, pitch 2560
+        // X8R8G8B8 0xff345678 at (1, 1): offset 1*2560 + 1*4 = 2564; X byte ignored.
+        for (i, b) in 0xff34_5678u32.to_le_bytes().into_iter().enumerate() {
+            margo.write_vram_u8(2564 + i, b);
+        }
+        let argb = margo.scanout_argb(&palette);
+        assert_eq!(argb.len(), 640 * 480);
+        assert_eq!(argb[640 + 1], 0x0034_5678);
     }
 }
