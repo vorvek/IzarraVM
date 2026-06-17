@@ -14,7 +14,7 @@ pub const VGA_PLANE_SIZE: usize = 64 * 1024;
 pub const VGA_PLANES: usize = 4;
 pub const VGA_PLANAR_SIZE: usize = VGA_PLANE_SIZE * VGA_PLANES; // 256 KB
 
-/// CRTC vertical/horizontal timing, in scan-counter (undoubled) units.
+/// CRTC vertical/horizontal timing, in scan-counter units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CrtcTiming {
     pub htotal_chars: u32,
@@ -272,7 +272,7 @@ impl Vga {
     }
 
     fn region_color(&self, scan_line: u32) -> u8 {
-        // scan_line in undoubled counter space; caller guarantees scan_line >= vdisp_end.
+        // scan_line in counter units; caller guarantees scan_line >= vdisp_end.
         if scan_line < self.crtc.vblank_start || scan_line >= self.crtc.vblank_end {
             self.attr.overscan & 0x3F // border = overscan color
         } else {
@@ -1036,7 +1036,7 @@ mod tests {
         let raster = vga.take_presented().unwrap();
         let w = raster.width as usize;
         assert_eq!(raster.pixels[0], 1, "above the split uses the old palette");
-        let below = 120 * w; // raster row 120 (counter line 60, > split at 50)
+        let below = 120 * w; // raster row 120 (counter line 120, > split at 50)
         assert_eq!(
             raster.pixels[below], 9,
             "below the split uses the new palette"
