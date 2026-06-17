@@ -113,6 +113,9 @@ const DAC_HZ: u32 = 44_100;
 const PIT_INPUT_HZ: u32 = 1_193_182;
 /// VGA 25.175 MHz dot clock (standard 640x480 and related modes).
 const VGA_DOT_HZ: u64 = 25_175_000;
+/// Sound Blaster 16 IRQ and DMA resources (fixed for the Resonique 2).
+const SB_IRQ: u8 = 5;
+const SB_DMA_CHANNEL: usize = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveDisplay {
@@ -143,6 +146,9 @@ pub struct Machine {
     resampler: Resampler,
     opl_micros: f64, // fractional microseconds owed to the OPL timers
     dsp: SbDsp,
+    /// DSP PCM resampler (rate_hz -> 44100); wired into render_audio in the
+    /// mixer slice.
+    #[allow(dead_code)]
     dsp_resampler: Resampler,
     dsp_micros: f64, // fractional microseconds owed to the DSP reset-settle clock
     margo_ns: f64,   // fractional nanoseconds owed to the Margo busy countdown
@@ -723,6 +729,26 @@ impl Machine {
         let whole = self.vga_dots.floor();
         self.video.advance(whole as u64);
         self.vga_dots -= whole;
+    }
+
+    /// Render `native_samples` of DSP 8-bit DMA output (signed 16-bit, mono).
+    /// Each sample pulls one byte from DMA channel 1; the DSP's half/end-buffer
+    /// IRQ is forwarded to the PIC as IRQ5. Returns the raw mono stream; the
+    /// mixer (render_audio) resamples and sums it with the OPL.
+    pub fn render_dsp_audio(&mut self, native_samples: usize) -> Vec<i16> {
+        let Machine {
+            dsp, dma, memory, pic, ..
+        } = self;
+        let mut out = Vec::with_capacity(native_samples);
+        for _ in 0..native_samples {
+            if let Some(sample) = dsp.render_sample(|| dma.read_byte(SB_DMA_CHANNEL, memory)) {
+                out.push(sample);
+            }
+            if dsp.take_irq() {
+                pic.request(SB_IRQ);
+            }
+        }
+        out
     }
 
     /// Render `native_samples` of OPL3 output at 49716 Hz and return the
@@ -1785,6 +1811,36 @@ mod tests {
             u8::try_from(bus.read_io(0x22A, BusWidth::Byte).unwrap()).unwrap()
         });
         assert_eq!([hi, lo], [4, 5]);
+    }
+
+    #[test]
+    fn sb_8bit_dma_plays_a_buffer_through_the_dsp() {
+        let mut machine = test_machine();
+        // A 16-byte unsigned ramp in conventional memory at 0x01_0000.
+        let bytes: Vec<u8> = (0..16).map(|i| (i * 16) as u8).collect();
+        for (i, &b) in bytes.iter().enumerate() {
+            machine.write_physical_u8(0x1_0000 + i as u32, b);
+        }
+        with_bus(&mut machine, |bus| {
+            // DMA ch1: address 0x0000, page 0x01, count 15, single read.
+            bus.write_io(0x0B, BusWidth::Byte, 0x49).unwrap(); // mode ch1
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x0F).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x83, BusWidth::Byte, 0x01).unwrap(); // page -> 0x01_0000
+            bus.write_io(0x0A, BusWidth::Byte, 0x01).unwrap(); // unmask ch1
+            // DSP: 11025 Hz, block 16, single 8-bit DMA output.
+            for &b in &[0x41u8, 0x2B, 0x11, 0x48, 0x0F, 0x00, 0x14] {
+                bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
+            }
+        });
+        let out = machine.render_dsp_audio(16);
+        assert_eq!(out.len(), 16);
+        // Unsigned 0x00 maps to a centered negative sample.
+        assert!(out.iter().any(|&s| s < 0), "expected negative samples");
+        // Single mode masks channel 1 at terminal count.
+        assert_eq!(machine.dma_read_byte(1), None);
     }
 
     // Run one closure against a freshly-borrowed bus over the whole machine.
