@@ -1,12 +1,16 @@
 //! Margo, the VEGA 2D engine: the display register block, the linear frame
 //! buffer, and the blit engine. The engine implements FILL, COPY, color expand,
 //! LINE, and PATTERN_FILL, all with full ROP3 and rectangle clipping, plus a
-//! display-path hardware cursor, a scaled YUV video overlay, and a DMA command pusher.
+//! display-path hardware cursor, a scaled YUV video overlay, a DMA command pusher, and
+//! hardware dithering.
 
 pub const MARGO_VRAM_SIZE: usize = 4 * 1024 * 1024;
 pub const MARGO_MMIO_SIZE: usize = 0x0001_0000; // 64 KB register block
 pub const MARGO_ID_VALUE: u32 = 0x4D47_0100; // 'M' 'G', version 1.00
-pub const MARGO_CAPS_VALUE: u32 = 0x0000_07ff; // bits 0 FILL, 1 COPY, 2 COLOR_EXPAND, 3 LINE, 4 ROP3, 5 CLIP, 6 COLORKEY, 7 PATTERN_FILL, 8 CURSOR, 9 OVERLAY, 10 PUSHER
+pub const MARGO_CAPS_VALUE: u32 = 0x0000_0fff; // bits 0 FILL, 1 COPY, 2 COLOR_EXPAND, 3 LINE, 4 ROP3, 5 CLIP, 6 COLORKEY, 7 PATTERN_FILL, 8 CURSOR, 9 OVERLAY, 10 PUSHER, 11 DITHER
+
+/// Ordered 4x4 Bayer matrix (cells 0..15) for hardware dithering (section 7.10).
+const BAYER_4X4: [[u32; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VbeMode {
@@ -198,6 +202,19 @@ fn yuv_to_argb(y: u8, u: u8, v: u8) -> u32 {
     let g = clamp((298 * c - 100 * d - 208 * e + 128) >> 8);
     let b = clamp((298 * c + 516 * d + 128) >> 8);
     (r << 16) | (g << 8) | b
+}
+
+/// Reduce one 8-bit channel `v` to `bits` (5 or 6) for a 15/16-bit display, then
+/// bit-replicate back to 8 bits (matching `expand_to_8`, so the host sees exactly
+/// what an N-bit DAC would show). With `dither` off the channel is plainly
+/// truncated (the value the primary surface stores). With it on, the ordered 4x4
+/// Bayer cell offset (scaled to the dropped low bits) is added before truncating,
+/// spreading the quantization error spatially. `bits` is 5 or 6 here.
+fn quantize_channel(v: u32, bits: u32, cell: u32, dither: bool) -> u32 {
+    let shift = 8 - bits;
+    let offset = if dither { (cell << shift) / 16 } else { 0 };
+    let code = (v + offset).min(255) >> shift;
+    (code << shift) | (code >> (2 * bits - 8))
 }
 
 pub const REG_ID: usize = 0x0000;
@@ -975,9 +992,31 @@ impl Margo {
                 let Some((y, u, v)) = self.sample_overlay(format, sx, sy, len) else {
                     continue;
                 };
-                out[(screen_y * width + screen_x) as usize] = yuv_to_argb(y, u, v);
+                out[(screen_y * width + screen_x) as usize] =
+                    self.present_overlay_pixel(yuv_to_argb(y, u, v), screen_x, screen_y);
             }
         }
+    }
+
+    /// Present one composited overlay ARGB pixel on the current display. On a 15 or
+    /// 16-bit display each channel is reduced to its display width (ordered-dithered
+    /// when `CONTROL.DITHER_EN` is set, truncated otherwise) and bit-expanded back to
+    /// 8 bits, so a real 15/16-bit display's banding (and its absence under dither)
+    /// is reproduced. On 8-bit (indexed) and 32-bit displays no precision is lost, so
+    /// the pixel passes through unchanged.
+    fn present_overlay_pixel(&self, argb: u32, x: u64, y: u64) -> u32 {
+        let Some(fmt) = pixel_format(self.display.bpp) else {
+            return argb; // 8-bit indexed: no direct-color reduction
+        };
+        if fmt.r.size >= 8 {
+            return argb; // 32-bit: no precision lost
+        }
+        let dither = self.control & 0x2 != 0; // CONTROL.DITHER_EN (bit 1)
+        let cell = BAYER_4X4[(y & 3) as usize][(x & 3) as usize];
+        let r = quantize_channel((argb >> 16) & 0xff, fmt.r.size, cell, dither);
+        let g = quantize_channel((argb >> 8) & 0xff, fmt.g.size, cell, dither);
+        let b = quantize_channel(argb & 0xff, fmt.b.size, cell, dither);
+        (r << 16) | (g << 8) | b
     }
 
     /// True when the raw primary pixel at screen `(x, y)` equals `colorkey` in its
@@ -2039,8 +2078,8 @@ mod tests {
     fn caps_reports_all_implemented_features() {
         let margo = Margo::default();
         // bits 0 FILL, 1 COPY, 2 COLOR_EXPAND, 3 LINE, 4 full ROP3, 5 CLIP, 6 COLORKEY,
-        // 7 PATTERN_FILL, 8 CURSOR, 9 OVERLAY, 10 PUSHER.
-        assert_eq!(read_reg_u32(&margo, REG_CAPS), 0x0000_07ff);
+        // 7 PATTERN_FILL, 8 CURSOR, 9 OVERLAY, 10 PUSHER, 11 DITHER.
+        assert_eq!(read_reg_u32(&margo, REG_CAPS), 0x0000_0fff);
     }
 
     #[test]
@@ -4079,6 +4118,22 @@ mod tests {
         assert_eq!(yuv_to_argb(235, 128, 255), 0x00ff_98ff); // red clamps high
         assert_eq!(yuv_to_argb(128, 255, 128), 0x0082_51ff); // blue clamps high
         assert_eq!(yuv_to_argb(16, 128, 16), 0x0000_5b00); // red clamps low to 0
+    }
+
+    #[test]
+    fn quantize_channel_truncates_and_dithers() {
+        // 0x85 = 133. 5-bit (R/B): truncate 133>>3=16 -> expand 132 (0x84).
+        assert_eq!(quantize_channel(133, 5, 0, false), 0x84);
+        // 5-bit with the top Bayer cell: offset 15/2=7, (133+7)>>3=17 -> expand 140 (0x8C).
+        assert_eq!(quantize_channel(133, 5, 15, true), 0x8c);
+        // Dither cell 0 adds no offset, so it equals the truncated value.
+        assert_eq!(quantize_channel(133, 5, 0, true), 0x84);
+        // 6-bit (G in 16bpp): 133>>2=33 -> expand 134 (0x86).
+        assert_eq!(quantize_channel(133, 6, 0, false), 0x86);
+        // Clamp: 255 + offset saturates at 255, never overflows the 5-bit code.
+        assert_eq!(quantize_channel(255, 5, 15, true), 0xff);
+        // Zero stays zero.
+        assert_eq!(quantize_channel(0, 5, 0, false), 0x00);
     }
 
     #[test]
