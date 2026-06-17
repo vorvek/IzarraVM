@@ -20,6 +20,14 @@ pub struct SbDsp {
     direct_dac_byte: Option<u8>,
     test_reg: u8,
     speaker_on: bool,
+    // 8-bit DMA playback state (Tasks 5-6).
+    rate_hz: u32,
+    block_size: u32,
+    block_remaining: u32,
+    auto_init: bool,
+    playing: bool,
+    irq_pending: bool,
+    half_reached: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -38,6 +46,13 @@ impl Default for SbDsp {
             direct_dac_byte: None,
             test_reg: 0,
             speaker_on: false,
+            rate_hz: 22_050,
+            block_size: 0,
+            block_remaining: 0,
+            auto_init: false,
+            playing: false,
+            irq_pending: false,
+            half_reached: false,
         }
     }
 }
@@ -111,9 +126,56 @@ impl SbDsp {
                     self.queue_read(b);
                 }
             }
-            // Rate / block / DMA commands are wired in Tasks 5 and 6.
+            0x40 => {
+                // Set time constant: rate = 1_000_000 / (256 - tc).
+                if let Some(&tc) = args.first() {
+                    let divisor = 256u32.wrapping_sub(u32::from(tc));
+                    if divisor != 0 {
+                        self.rate_hz = 1_000_000 / divisor;
+                    }
+                }
+            }
+            0x41 => {
+                // Set sample rate in Hz, high byte then low byte (SB16).
+                if args.len() >= 2 {
+                    self.rate_hz = (u32::from(args[0]) << 8) | u32::from(args[1]);
+                }
+            }
+            0x48 => {
+                // Set DSP block transfer size, low byte then high byte (n+1 bytes).
+                if args.len() >= 2 {
+                    let count = (u32::from(args[0]) | (u32::from(args[1]) << 8)) + 1;
+                    self.block_size = count;
+                }
+            }
+            0x14 | 0x90 => self.arm_dma(false),
+            0x1C => self.arm_dma(true),
+            // Halt/continue/exit (Task 6) and unknown commands: no-op for now.
             _ => {}
         }
+    }
+
+    fn arm_dma(&mut self, auto_init: bool) {
+        self.auto_init = auto_init;
+        self.playing = true;
+        self.block_remaining = self.block_size;
+        self.half_reached = false;
+    }
+
+    pub fn rate_hz(&self) -> u32 {
+        self.rate_hz
+    }
+
+    pub fn is_playing(&self) -> bool {
+        self.playing
+    }
+
+    pub fn is_auto_init(&self) -> bool {
+        self.auto_init
+    }
+
+    pub fn block_remaining(&self) -> u32 {
+        self.block_remaining
     }
 
     /// Last byte written by a direct 8-bit DAC command (0x10).
@@ -205,5 +267,37 @@ mod tests {
         let mut dsp = SbDsp::default();
         write_cmd(&mut dsp, &[0x10, 0x80]);
         assert_eq!(dsp.direct_dac_byte(), Some(0x80));
+    }
+
+    #[test]
+    fn time_constant_sets_the_playback_rate() {
+        let mut dsp = SbDsp::default();
+        write_cmd(&mut dsp, &[0x40, 0x9C]); // tc 0x9C -> 1e6/(256-156)=1e6/100 = 10000 Hz
+        assert_eq!(dsp.rate_hz(), 10_000);
+    }
+
+    #[test]
+    fn sb16_rate_command_programs_hz_directly() {
+        let mut dsp = SbDsp::default();
+        write_cmd(&mut dsp, &[0x41, 0x2B, 0x11]); // 0x2B11 = 11025 Hz, high byte then low byte
+        assert_eq!(dsp.rate_hz(), 11_025);
+    }
+
+    #[test]
+    fn dma_single_output_arms_with_block_size() {
+        let mut dsp = SbDsp::default();
+        write_cmd(&mut dsp, &[0x48, 0xFF, 0x00]); // block size 0x00FF -> 256
+        write_cmd(&mut dsp, &[0x14]); // 8-bit DMA single output
+        assert!(dsp.is_playing());
+        assert!(!dsp.is_auto_init());
+        assert_eq!(dsp.block_remaining(), 256);
+    }
+
+    #[test]
+    fn auto_init_command_marks_the_mode() {
+        let mut dsp = SbDsp::default();
+        write_cmd(&mut dsp, &[0x48, 0x00, 0x01]); // 0x0100 -> 256
+        write_cmd(&mut dsp, &[0x1C]); // 8-bit auto-init
+        assert!(dsp.is_playing() && dsp.is_auto_init());
     }
 }
