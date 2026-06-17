@@ -10,6 +10,8 @@ pub const ECHO_COM: &[u8] = include_bytes!("../roms/dos/echo.com");
 pub const ECHO_COM_SOURCE: &str = include_str!("../roms/dos/echo.asm");
 pub const TYPE_COM: &[u8] = include_bytes!("../roms/dos/type.com");
 pub const TYPE_COM_SOURCE: &str = include_str!("../roms/dos/type.asm");
+pub const EXEHELLO_EXE: &[u8] = include_bytes!("../roms/dos/exehello.exe");
+pub const EXEHELLO_EXE_SOURCE: &str = include_str!("../roms/dos/exehello.asm");
 
 pub const I386DX25_TEST_ROM_SIZE: usize = 64 * 1024;
 pub const X86_BOOT_TEST_IMAGE_SIZE: usize = 1440 * 1024;
@@ -30,6 +32,10 @@ pub fn hello_com() -> &'static [u8] {
 
 pub fn echo_com() -> &'static [u8] {
     ECHO_COM
+}
+
+pub fn exehello_exe() -> &'static [u8] {
+    EXEHELLO_EXE
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,5 +225,14 @@ mod tests {
     fn type_com_fixture_is_present() {
         assert!(!TYPE_COM.is_empty());
         assert_eq!(TYPE_COM[0], 0xb8); // mov ax, imm16 (the AH=3Dh open setup)
+    }
+
+    #[test]
+    fn exehello_exe_fixture_is_a_valid_mz() {
+        assert!(EXEHELLO_EXE.len() > 0x1c);
+        assert_eq!(&EXEHELLO_EXE[0..2], b"MZ");
+        // e_crlc at offset 6: at least one relocation, the load-bearing DS load.
+        let e_crlc = u16::from_le_bytes([EXEHELLO_EXE[6], EXEHELLO_EXE[7]]);
+        assert!(e_crlc >= 1, "fixture must carry a relocation, got {e_crlc}");
     }
 }
