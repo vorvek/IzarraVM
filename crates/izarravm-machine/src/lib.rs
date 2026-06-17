@@ -3544,4 +3544,66 @@ mod tests {
         names.sort();
         assert_eq!(names, vec!["ONE.TXT", "TWO.TXT"]);
     }
+
+    #[test]
+    fn overlay_quantizes_to_16bpp_display_without_dither() {
+        let mut machine = test_machine();
+        machine.margo_mut().set_mode(0x111); // 640x480x16 (R5G6B5)
+        // A uniform gray YUY2 source (Y=130, U=128, V=128 -> yuv_to_argb = 0x858585),
+        // 4 pixels (2 packed groups: Y0,U,Y1,V), offscreen at 1 MiB.
+        let src = 0x0010_0000u32;
+        for g in 0..2u32 {
+            let base = src + g * 4;
+            machine.write_physical_u8(MARGO_LFB_BASE + base, 130); // Y0
+            machine.write_physical_u8(MARGO_LFB_BASE + base + 1, 128); // U
+            machine.write_physical_u8(MARGO_LFB_BASE + base + 2, 130); // Y1
+            machine.write_physical_u8(MARGO_LFB_BASE + base + 3, 128); // V
+        }
+        write_mmio_reg(&mut machine, 0x44, src); // OVL_SRC_Y
+        write_mmio_reg(&mut machine, 0x48, 8); // OVL_SRC_PITCH
+        write_mmio_reg(&mut machine, 0x4c, (1 << 16) | 4); // OVL_SRC_DIM: 4x1
+        write_mmio_reg(&mut machine, 0x58, 0); // OVL_DST_XY: (0, 0)
+        write_mmio_reg(&mut machine, 0x5c, (1 << 16) | 4); // OVL_DST_DIM: 4x1 (1:1)
+        write_mmio_reg(&mut machine, 0x0c, 0); // CONTROL: DITHER_EN off
+        write_mmio_reg(&mut machine, 0x40, 1); // OVL_CTRL: ENABLE, YUY2
+
+        let palette = machine.palette_argb();
+        let argb = machine.margo().scanout_argb(&palette);
+        // On a 16bpp display the overlay is reduced to R5G6B5 and bit-expanded back:
+        // 0x858585 -> 0x848684 (R/B truncate to 0x84, G to 0x86), uniform (no dither).
+        for (x, &pixel) in argb.iter().enumerate().take(4) {
+            assert_eq!(pixel, 0x0084_8684, "pixel {x}");
+        }
+    }
+
+    #[test]
+    fn overlay_orders_dither_on_a_16bpp_display() {
+        let mut machine = test_machine();
+        machine.margo_mut().set_mode(0x111); // 640x480x16
+        let src = 0x0010_0000u32;
+        for g in 0..2u32 {
+            let base = src + g * 4;
+            machine.write_physical_u8(MARGO_LFB_BASE + base, 130);
+            machine.write_physical_u8(MARGO_LFB_BASE + base + 1, 128);
+            machine.write_physical_u8(MARGO_LFB_BASE + base + 2, 130);
+            machine.write_physical_u8(MARGO_LFB_BASE + base + 3, 128);
+        }
+        write_mmio_reg(&mut machine, 0x44, src);
+        write_mmio_reg(&mut machine, 0x48, 8);
+        write_mmio_reg(&mut machine, 0x4c, (1 << 16) | 4);
+        write_mmio_reg(&mut machine, 0x58, 0);
+        write_mmio_reg(&mut machine, 0x5c, (1 << 16) | 4);
+        write_mmio_reg(&mut machine, 0x0c, 0x2); // CONTROL: DITHER_EN on
+        write_mmio_reg(&mut machine, 0x40, 1); // OVL_CTRL: ENABLE, YUY2
+
+        let palette = machine.palette_argb();
+        let argb = machine.margo().scanout_argb(&palette);
+        // Row 0 Bayer cells are 0, 8, 2, 10. For gray 0x858585 the R/B (5-bit) jump
+        // a step where the cell offset pushes 133 past the 17th code: cells 8 and 10
+        // dither up to 0x8C, cells 0 and 2 stay at 0x84. G (6-bit) stays 0x86.
+        assert_eq!(argb[0], 0x0084_8684); // cell 0
+        assert_eq!(argb[1], 0x008c_868c); // cell 8
+        assert_eq!(argb[2], 0x0084_8684); // cell 2
+        assert_eq!(argb[3], 0x008c_868c); // cell 10
+    }
 }
