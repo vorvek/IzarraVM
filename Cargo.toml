@@ -31,7 +31,6 @@ midir = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 eframe = { version = "0.32", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }
-naga = { version = "26", features = ["termcolor"] }
 rfd = "0.15"
 softbuffer = "0.4.8"
 tempfile = "3.10"
@@ -40,5 +39,5 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 walkdir = "2.5"
-wgpu = "26"
+wgpu = "25"
 winit = "0.30"
