@@ -3636,4 +3636,35 @@ mod tests {
         assert_eq!(argb[2], 0x0084_8484); // cell 2
         assert_eq!(argb[3], 0x008c_8c8c); // cell 10
     }
+
+    #[test]
+    fn overlay_dither_is_locked_to_screen_position() {
+        let mut machine = test_machine();
+        machine.margo_mut().set_mode(0x111); // 640x480x16
+        // Uniform gray YUY2 source, 4x4 (4 rows x 2 packed groups = 8 groups), offscreen.
+        let src = 0x0010_0000u32;
+        for g in 0..8u32 {
+            let base = src + g * 4;
+            machine.write_physical_u8(MARGO_LFB_BASE + base, 130); // Y0
+            machine.write_physical_u8(MARGO_LFB_BASE + base + 1, 128); // U
+            machine.write_physical_u8(MARGO_LFB_BASE + base + 2, 130); // Y1
+            machine.write_physical_u8(MARGO_LFB_BASE + base + 3, 128); // V
+        }
+        write_mmio_reg(&mut machine, 0x44, src);
+        write_mmio_reg(&mut machine, 0x48, 8); // src pitch: 2 groups per row
+        write_mmio_reg(&mut machine, 0x4c, (4 << 16) | 4); // OVL_SRC_DIM: 4x4
+        write_mmio_reg(&mut machine, 0x58, (2 << 16) | 1); // OVL_DST_XY: x=1, y=2 (non-aligned)
+        write_mmio_reg(&mut machine, 0x5c, (4 << 16) | 4); // OVL_DST_DIM: 4x4 (1:1)
+        write_mmio_reg(&mut machine, 0x0c, 0x2); // CONTROL: DITHER_EN on
+        write_mmio_reg(&mut machine, 0x40, 1); // OVL_CTRL: ENABLE, YUY2
+
+        let palette = machine.palette_argb();
+        let argb = machine.margo().scanout_argb(&palette);
+        // The dither cell is BAYER[screen_y & 3][screen_x & 3] in ABSOLUTE screen
+        // coordinates, not destination-relative. If it were dst-relative, screen (1,2)
+        // would be cell 0 (0x848684); screen-locked it is BAYER[2][1] = 11.
+        assert_eq!(argb[2 * 640 + 1], 0x008c_868c); // screen (1,2): cell 11
+        assert_eq!(argb[2 * 640 + 4], 0x0084_8684); // screen (4,2): cell 3
+        assert_eq!(argb[5 * 640 + 2], 0x008c_8a8c); // screen (2,5): cell 14
+    }
 }
