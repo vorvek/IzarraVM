@@ -837,4 +837,14 @@ mod tests {
         // Reading 3DA resets the attribute address/data flip-flop to "address".
         assert!(!vga.attr.flip_flop_data);
     }
+
+    #[test]
+    fn mode_set_resets_beam_and_reports_planar_geometry() {
+        let mut vga = Vga::default();
+        vga.advance(12345); // dirty the beam in text mode
+        vga.set_mode_0dh();
+        assert_eq!(vga.beam_dots(), 0);
+        assert_eq!(vga.raster_width(), 320);
+        assert_eq!(vga.frame_dots(), CrtcTiming::mode_0dh().frame_dots());
+    }
 }
