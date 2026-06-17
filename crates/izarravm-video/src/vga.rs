@@ -60,6 +60,19 @@ pub struct Sequencer {
     pub memory_mode: u8, // idx 4
 }
 
+/// Attribute Controller register block (3C0/3C1).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Attribute {
+    pub palette: [u8; 16], // idx 0..15
+    pub mode_control: u8,  // idx 0x10
+    pub overscan: u8,      // idx 0x11
+    pub plane_enable: u8,  // idx 0x12
+    pub pixel_pan: u8,     // idx 0x13, low 4 bits
+    pub color_select: u8,  // idx 0x14
+    pub flip_flop_data: bool, // false = next 3C0 write is an index
+    pub index: u8,
+}
+
 /// Total horizontal dots per scan line.
 pub fn htotal_dots(t: &CrtcTiming) -> u64 {
     (t.htotal_chars * t.char_width) as u64
@@ -92,6 +105,7 @@ pub struct Vga {
     pub(crate) crtc: CrtcTiming,
     pub(crate) seq: Sequencer,
     pub(crate) gc: GfxController,
+    pub(crate) attr: Attribute,
     pub(crate) latches: [u8; VGA_PLANES],
     pub(crate) beam: u64,
     pub(crate) last_line: u32,
@@ -105,6 +119,7 @@ impl Default for Vga {
             crtc: CrtcTiming::text_03h(),
             seq: Sequencer::default(),
             gc: GfxController::default(),
+            attr: Attribute::default(),
             latches: [0; VGA_PLANES],
             beam: 0,
             last_line: 0,
@@ -183,6 +198,25 @@ impl Vga {
         let planes = self.plane_slice_mut(offset);
         let gc = self.gc;
         read_planes(&planes, &gc, &mut self.latches)
+    }
+
+    /// Read Input Status Register 1 (port 3DAh).
+    ///
+    /// Bit 0: display disabled (beam is in blank or retrace).
+    /// Bit 3: vertical retrace active.
+    ///
+    /// Reading this register also resets the Attribute Controller address/data
+    /// flip-flop so that the next write to 3C0 is treated as an index.
+    pub fn read_status1(&mut self) -> u8 {
+        self.attr.flip_flop_data = false; // reading 3DA resets the flip-flop
+        let mut status = 0u8;
+        if !beam_display_enable(&self.crtc, self.beam) {
+            status |= 0x01; // display disabled (blank or retrace)
+        }
+        if beam_vretrace(&self.crtc, self.beam) {
+            status |= 0x08; // vertical retrace
+        }
+        status
     }
 }
 
@@ -442,5 +476,19 @@ mod tests {
         vga.cpu_write(0, 0xFF);
         assert_eq!(vga.plane_byte(0, 0), 0xFF);
         assert_eq!(vga.plane_byte(1, 0), 0x00);
+    }
+
+    #[test]
+    fn status1_reports_beam_and_resets_attribute_flipflop() {
+        let mut vga = Vga::default();
+        vga.set_mode_0dh();
+        // Park the beam in vertical retrace.
+        let htotal = htotal_dots(&vga.crtc);
+        vga.beam = htotal * (vga.crtc.vretrace_start as u64);
+        let status = vga.read_status1();
+        assert_eq!(status & 0x08, 0x08); // bit 3 vertical retrace
+        assert_eq!(status & 0x01, 0x01); // bit 0 display disabled (in retrace)
+        // Reading 3DA resets the attribute address/data flip-flop to "address".
+        assert!(!vga.attr.flip_flop_data);
     }
 }
