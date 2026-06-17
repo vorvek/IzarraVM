@@ -1002,6 +1002,36 @@ impl Margo {
                 let v = self.vram_byte(base.saturating_add(3), len)?;
                 Some((y, u, v))
             }
+            1 => {
+                // YV12 planar 4:2:0: a full-resolution Y plane, then V and U planes
+                // at half width and half height. The register set carries no chroma
+                // pitch, so it is the Y pitch halved (slice-11 convention). Chroma is
+                // upsampled by point sampling: (sx/2, sy/2) addresses both planes.
+                let y = self.vram_byte(
+                    src_y
+                        .saturating_add(sy.saturating_mul(pitch))
+                        .saturating_add(sx),
+                    len,
+                )?;
+                let cpitch = pitch / 2;
+                let cx = sx / 2;
+                let cy = sy / 2;
+                let u_base = self.overlay_reg(REG_OVL_SRC_U) as u64;
+                let v_base = self.overlay_reg(REG_OVL_SRC_V) as u64;
+                let u = self.vram_byte(
+                    u_base
+                        .saturating_add(cy.saturating_mul(cpitch))
+                        .saturating_add(cx),
+                    len,
+                )?;
+                let v = self.vram_byte(
+                    v_base
+                        .saturating_add(cy.saturating_mul(cpitch))
+                        .saturating_add(cx),
+                    len,
+                )?;
+                Some((y, u, v))
+            }
             _ => None,
         }
     }
