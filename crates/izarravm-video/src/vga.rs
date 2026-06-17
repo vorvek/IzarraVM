@@ -347,14 +347,16 @@ impl Vga {
         let pan = (self.attr.pixel_pan & 0x0F) as usize;
         let mut row = vec![0u8; width];
         let source_row = counter_line / self.scan_factor();
-        // byte pitch per plane = 2 * offset register
-        let row_base =
-            self.crtc.start_address as usize + source_row as usize * self.crtc.offset as usize * 2;
+        // Address-counter base for this row. The per-scanline counter increment is
+        // offset*2 in every addressing mode; the byte/word/doubleword transform
+        // lives in display_offset, not the stride.
+        let row_base = self.crtc.start_address + source_row * self.crtc.offset * 2;
         for (x, slot) in row.iter_mut().enumerate() {
             let px = x + pan;
             let byte = px / 8;
             let bit = 7 - (px % 8);
-            let off = (row_base + byte) % VGA_PLANE_SIZE;
+            let ma = row_base + byte as u32;
+            let off = display_offset(self.crtc.mode_control, self.crtc.underline_loc, ma);
             let mut index = 0u8;
             for plane in 0..VGA_PLANES {
                 let b = self.vram[plane * VGA_PLANE_SIZE + off];
@@ -1354,6 +1356,45 @@ mod tests {
         assert_eq!(vga.raster_height(), 449);
 
         assert!(!vga.set_mode(0x99)); // unknown number leaves a false result
+    }
+
+    #[test]
+    fn word_mode_render_rotates_the_address() {
+        let mut vga = Vga::default();
+        vga.set_mode_0dh();
+        vga.crtc.mode_control = 0xA3; // force word mode (bit 6 = 0), 16-bit wrap
+        vga.attr.palette = core::array::from_fn(|i| i as u8);
+        // The second character (byte_col 1) has counter ma = 1. Word mode maps ma = 1
+        // to plane offset 2 ((1 << 1) | 0); byte mode would read offset 1. Mark only
+        // offset 2, so a correct word-mode read shows index 1 at pixel 8.
+        vga.vram[2] = 0x80; // bit 7 -> the first pixel of that character
+        let row = vga.render_active_row(0);
+        assert_eq!(row[8], 1, "word mode reads plane offset 2 for the 2nd character");
+        assert_eq!(row[0], 0, "char 0 (offset 0) is clear");
+    }
+
+    #[test]
+    fn byte_mode_wrap_scanout_equals_top_of_vram() {
+        let mut vga = Vga::default();
+        vga.set_mode_0dh(); // byte mode (CR17 = 0xE3)
+        vga.attr.palette = core::array::from_fn(|i| i as u8);
+        // Distinct mark at the very top of VRAM (plane 0 offset 0): pixels 0..7 = index 1.
+        vga.vram[0] = 0xFF;
+        // Reference row from start_address 0: its first 8 pixels come from offset 0.
+        vga.crtc.start_address = 0;
+        let top = vga.render_active_row(0);
+        assert_eq!(&top[0..8], &[1u8; 8], "top-of-VRAM byte renders 8 pixels of index 1");
+        // Start 8 bytes before the 64 KB wrap: byte_col 0..7 read 0xFFF8..0xFFFF (clear),
+        // byte_col 8 wraps to offset 0 (the marked byte). So pixels 64..71 must equal
+        // the top-of-VRAM pixels, not tear.
+        vga.crtc.start_address = 0xFFF8;
+        let wrapped = vga.render_active_row(0);
+        assert_eq!(&wrapped[0..64], &[0u8; 64], "pre-wrap pixels read the cleared tail");
+        assert_eq!(
+            &wrapped[64..72],
+            &top[0..8],
+            "wrapped scanout pixels equal the top-of-VRAM pixels at the seam"
+        );
     }
 
     #[test]
