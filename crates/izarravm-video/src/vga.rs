@@ -1848,7 +1848,7 @@ mod tests {
         vga.write_port(0x3C5, 0x06); // mode X, 320x200 base
         // Distinct full bytes in planes 0..3 at plane offset 0. 0x40 also proves the
         // byte is not masked to 6 bits (0x40 & 0x3F would be 0).
-        vga.vram[0 * VGA_PLANE_SIZE] = 0x10;
+        vga.vram[0] = 0x10; // plane 0, offset 0
         vga.vram[VGA_PLANE_SIZE] = 0x20;
         vga.vram[2 * VGA_PLANE_SIZE] = 0x30;
         vga.vram[3 * VGA_PLANE_SIZE] = 0x40;
