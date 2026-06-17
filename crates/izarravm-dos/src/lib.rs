@@ -325,6 +325,19 @@ impl DosKernel {
                 }
                 Ok(DosAction::Continue)
             }
+            // AH=30h: get Toka-DOS version. AL=major, AH=minor, BH=OEM, BL:CX=serial (0).
+            0x30 => {
+                regs.ax =
+                    u16::from(TOKA_DOS_VERSION_MAJOR) | (u16::from(TOKA_DOS_VERSION_MINOR) << 8);
+                regs.bx = u16::from(TOKA_DOS_OEM) << 8;
+                regs.cx = 0;
+                Ok(DosAction::Continue)
+            }
+            // AH=19h: get current default drive. Only C: is mounted, so AL=2 (0=A).
+            0x19 => {
+                regs.ax = (regs.ax & 0xff00) | 0x02;
+                Ok(DosAction::Continue)
+            }
             // AH=4Ch: terminate with the return code in AL.
             0x4c => Ok(DosAction::Exit((regs.ax & 0x00ff) as u8)),
             // Other file functions (write, seek, find) and everything else are not
@@ -334,6 +347,12 @@ impl DosKernel {
         }
     }
 }
+
+/// Toka-DOS (Toka Disk Operating System), the Izarra 3000's MS-DOS 6.1 clone,
+/// is what this HLE kernel emulates. INT 21h AH=30h reports its version.
+const TOKA_DOS_VERSION_MAJOR: u8 = 6;
+const TOKA_DOS_VERSION_MINOR: u8 = 10; // 6.10, the .NN-hundredths convention (6.20 -> 20)
+const TOKA_DOS_OEM: u8 = 0xff;
 
 /// The largest .COM image: a 64 KiB segment minus the 256-byte PSP.
 const COM_MAX_LEN: usize = 0x10000 - 0x100;
@@ -691,7 +710,7 @@ mod tests {
     fn unimplemented_int21_function_is_noop() {
         let mut mem = Memory::new(4096).unwrap();
         let mut regs = DosRegs {
-            ax: 0x3000, // AH=30h get DOS version, not implemented this slice
+            ax: 0x4b00, // AH=4Bh EXEC, not implemented this slice
             ..DosRegs::default()
         };
         let mut kernel = DosKernel::new();
@@ -699,6 +718,26 @@ mod tests {
         let action = kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
         assert_eq!(action, DosAction::Continue);
         assert!(kernel.stdout().is_empty());
+    }
+
+    #[test]
+    fn ah30_reports_toka_dos_version() {
+        let mut mem = Memory::new(4096).unwrap();
+        let mut regs = DosRegs { ax: 0x3000, ..DosRegs::default() };
+        let mut kernel = DosKernel::new();
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(regs.ax & 0x00ff, 6); // AL = major
+        assert_eq!(regs.ax >> 8, 10); // AH = minor (6.10)
+        assert_eq!(regs.bx >> 8, 0xff); // BH = OEM
+    }
+
+    #[test]
+    fn ah19_reports_c_drive() {
+        let mut mem = Memory::new(4096).unwrap();
+        let mut regs = DosRegs { ax: 0x1900, ..DosRegs::default() };
+        let mut kernel = DosKernel::new();
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(regs.ax & 0x00ff, 0x02); // AL = 2 (C:)
     }
 
     #[test]
