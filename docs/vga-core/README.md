@@ -36,9 +36,39 @@ it. What is in:
 Deferred to later slices: the 256 KB display-address wraparound (only the
 per-plane 64 KB wrap is modeled), line-compare split screens (and pel-pan forced
 to 0 below the split), pel-pan smooth-scroll polish, mode-X / unchained
-256-color, other planar modes (0Eh/10h/12h), the bad-card mid-scanline latch
-(shake) reproduction, pixel-granular catch-up, and mid-frame
-Vertical-Display-End / blank-register tricks.
+256-color, the bad-card mid-scanline latch (shake) reproduction,
+pixel-granular catch-up, and mid-frame Vertical-Display-End / blank-register
+tricks.
+
+## Slice 2 coverage
+
+Slice 2 generalizes the engine to the other standard 16-color planar modes, on a
+corrected double-scan model. The datapath, beam, catch-up, and latch rules are
+unchanged.
+
+| Mode | Output | Raster | Active | Distinct rows | Double-scanned | Refresh |
+|------|--------|--------|--------|---------------|----------------|---------|
+| 0Dh  | 320x200 | 320x449 | 400 | 200 | yes | 70 Hz |
+| 0Eh  | 640x200 | 640x449 | 400 | 200 | yes | 70 Hz |
+| 10h  | 640x350 | 640x449 | 350 | 350 | no  | 70 Hz |
+| 12h  | 640x480 | 640x525 | 480 | 480 | no  | 60 Hz |
+
+All four use the 25.175 MHz dot clock, 8-dot characters, and `htotal_chars` 100
+(800 dots per line). Per-plane byte pitch is `offset * 2` (offset 20 for the
+320-wide mode, 40 for the 640-wide modes). A mode is selected by number through
+`Vga::set_mode(u8)`, `Machine::set_vga_mode(u8)`, or `INT 10h, AH=00h` with AL =
+0Dh/0Eh/10h/12h (the host clears the Margo latch on a VGA mode-set). The exact
+vertical border and blank offsets per mode are conventional values validated
+against the FreeVGA reference; the load-bearing fields are resolution,
+double-scan, refresh family, and pitch.
+
+**Corrected double-scan model.** The beam and catch-up count in scanlines
+(0..Vertical Total), and one scanline emits exactly one raster row, so the raster
+height is `Vertical Total` (not doubled). Double-scan divides the source address:
+a scanline reads source row `counter_line / (max_scan + 1)`, so a doubled mode
+holds each VRAM row for two scanlines. `Vertical Display End` is in scanline
+units. (Slice 1 doubled the output instead, which made 0Dh's raster roughly twice
+its real height; this is corrected here.)
 
 ## Latch rules
 
@@ -72,13 +102,13 @@ centered. This is the Jazz Jackrabbit behavior (its tweaked 320×199 / ~60 Hz mo
 renders 199 active lines top-justified, the rest below held black) — derived from
 the registers, never from a centering rule.
 
-**Unit discipline:** the beam and the catch-up loop count in **scan-counter
-(undoubled)** lines (0..Vertical Total). Double-scanning is applied at render: a
-counter line emits `scan_factor` (2 for mode 0Dh) raster rows. Worked numbers
-that mention raster rows are in *doubled* space; the CRTC registers that produce
-them are *undoubled*. Exact per-mode border offsets are validated against real
-hardware as those modes land (slice 1 only asserts the qualitative top-justified
-layout).
+**Unit discipline:** the beam and the catch-up loop count in scan-counter lines
+(0..Vertical Total), and each scanline emits one raster row, so the raster height
+is `Vertical Total`. Double-scan divides the *source* address (source row =
+counter line / (max_scan + 1)), so a doubled mode holds each VRAM row for two
+scanlines; it does not multiply the output. `Vertical Display End` is in scanline
+units. Exact per-mode border offsets are validated against real hardware as those
+modes land.
 
 ## Documented divergences (fidelity directive)
 
