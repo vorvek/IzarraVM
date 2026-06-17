@@ -417,8 +417,7 @@ impl Machine {
         }
         // AH=00h, AL = a planar mode number this slice implements.
         if (ax >> 8) == 0x00 && matches!(ax as u8, 0x0D | 0x0E | 0x10 | 0x12) {
-            self.video.set_mode(ax as u8);
-            self.margo_active = false;
+            self.set_vga_mode(ax as u8); // clears the Margo latch internally
             return;
         }
         if (ax >> 8) == 0x4f {
