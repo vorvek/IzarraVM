@@ -2442,6 +2442,26 @@ mod tests {
     }
 
     #[test]
+    fn hardware_cursor_composites_through_the_apertures() {
+        let mut machine = test_machine();
+        machine.margo_mut().set_mode(0x111); // 640x480x16 (R5G6B5)
+        // Seed the cursor planes offscreen (1 MiB in, past the 16bpp visible surface)
+        // through the LFB. FG pixel at cursor (0,0): XOR plane byte 0 bit 0x80, AND clear.
+        let addr = 0x10_0000u32;
+        machine.write_physical_u8(MARGO_LFB_BASE + addr + 512, 0x80);
+        write_mmio_reg(&mut machine, 0x2c, addr); // CURSOR_ADDR
+        write_mmio_reg(&mut machine, 0x30, 0); // CURSOR_POS (0,0)
+        write_mmio_reg(&mut machine, 0x34, 0xf800); // CURSOR_FG = pure red
+        write_mmio_reg(&mut machine, 0x38, 0x0000); // CURSOR_BG
+        write_mmio_reg(&mut machine, 0x28, 1); // CURSOR_CTRL = ENABLE
+
+        let palette = machine.palette_argb();
+        let argb = machine.margo().scanout_argb(&palette);
+        assert_eq!(argb[0], 0x00ff_0000); // cursor (0,0) FG decoded as red
+        assert_eq!(argb[64], 0x0000_0000); // outside the 64-wide cursor: black surface
+    }
+
+    #[test]
     fn machine_advances_the_vga_beam_with_cpu_clocks() {
         let mut machine = test_machine();
         machine.set_vga_mode_0dh();

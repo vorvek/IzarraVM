@@ -299,7 +299,7 @@ the pointer is one register write per frame, and the CPU never touches the
 screen under it.
 
 ```c
-/* (target) */
+/* (verified) */
 void enable_cursor(unsigned long bitmap_offset,
                    unsigned long fg, unsigned long bg) {
     REG(0x002C) = bitmap_offset;        /* CURSOR_ADDR: 64x64 2bpp AND/XOR */

@@ -292,8 +292,10 @@ the full set or only plain copy and fill.
 ### 7.7 Hardware cursor
 
 A 64x64 two-plane cursor, composited by the display path so the CPU never blits
-the pointer. Its bitmap lives in the frame store as 64x64 at 2 bits per pixel: an
-AND bit and an XOR bit per pixel, 1024 bytes, packed most significant bit first.
+the pointer. Its bitmap lives in the frame store as two 512-byte planes: the AND plane first,
+then the XOR plane at `CURSOR_ADDR + 512`. Each plane is 64x64 at 1 bit per pixel,
+8 bytes per row, packed most significant bit first, so every pixel draws one AND
+bit and one XOR bit (1024 bytes total).
 
 | AND | XOR | Result |
 |-----|-----|--------|
