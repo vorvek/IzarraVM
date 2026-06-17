@@ -1,12 +1,12 @@
 //! Margo, the VEGA 2D engine: the display register block, the linear frame
 //! buffer, and the blit engine. The engine implements FILL, COPY, color expand,
 //! LINE, and PATTERN_FILL, all with full ROP3 and rectangle clipping, plus a
-//! display-path hardware cursor and a scaled YUV video overlay.
+//! display-path hardware cursor, a scaled YUV video overlay, and a DMA command pusher.
 
 pub const MARGO_VRAM_SIZE: usize = 4 * 1024 * 1024;
 pub const MARGO_MMIO_SIZE: usize = 0x0001_0000; // 64 KB register block
 pub const MARGO_ID_VALUE: u32 = 0x4D47_0100; // 'M' 'G', version 1.00
-pub const MARGO_CAPS_VALUE: u32 = 0x0000_03ff; // bits 0 FILL, 1 COPY, 2 COLOR_EXPAND, 3 LINE, 4 ROP3, 5 CLIP, 6 COLORKEY, 7 PATTERN_FILL, 8 CURSOR, 9 OVERLAY
+pub const MARGO_CAPS_VALUE: u32 = 0x0000_07ff; // bits 0 FILL, 1 COPY, 2 COLOR_EXPAND, 3 LINE, 4 ROP3, 5 CLIP, 6 COLORKEY, 7 PATTERN_FILL, 8 CURSOR, 9 OVERLAY, 10 PUSHER
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VbeMode {
@@ -225,6 +225,12 @@ pub const REG_OVL_DST_XY: usize = 0x0058;
 pub const REG_OVL_DST_DIM: usize = 0x005c;
 pub const REG_OVL_COLORKEY: usize = 0x0060;
 
+pub const REG_PUSH_CTRL: usize = 0x0080;
+pub const REG_PUSH_BASE: usize = 0x0084;
+pub const REG_PUSH_SIZE: usize = 0x0088;
+pub const REG_PUSH_PUT: usize = 0x008c;
+pub const REG_PUSH_GET: usize = 0x0090;
+
 // Blit engine registers (section 7.3). All R/W; the engine reads the ones it
 // needs when COMMAND fires. The block 0x100..0x150 is a flat R/W store.
 pub const REG_DST_BASE: usize = 0x0100;
@@ -252,6 +258,8 @@ const CURSOR_BASE: usize = 0x0028;
 const CURSOR_REGS: usize = 5; // 0x0028..0x003C: CTRL, ADDR, POS, FG, BG
 const OVL_BASE: usize = 0x0040;
 const OVL_REGS: usize = 9; // 0x0040..=0x0060: CTRL, SRC_Y, SRC_PITCH, SRC_DIM, SRC_U, SRC_V, DST_XY, DST_DIM, COLORKEY
+const PUSH_BASE_REG: usize = 0x0080;
+const PUSH_REGS: usize = 5; // 0x0080..=0x0090: CTRL, BASE, SIZE, PUT, GET
 const BLIT_BASE: usize = 0x0100;
 const BLIT_REGS: usize = 20; // 0x100..0x150, twenty 32-bit slots; COMMAND at 0x150 is handled separately
 const FILL_NS_PER_PIXEL: u64 = 5; // 200 Mpixels/s solid fill (section 1.1)
@@ -746,6 +754,7 @@ pub struct Margo {
     mono_data: u32,
     cursor: [u32; CURSOR_REGS],
     overlay: [u32; OVL_REGS],
+    pusher: [u32; PUSH_REGS],
 }
 
 impl Default for Margo {
@@ -761,6 +770,7 @@ impl Default for Margo {
             mono_data: 0,
             cursor: [0; CURSOR_REGS],
             overlay: [0; OVL_REGS],
+            pusher: [0; PUSH_REGS],
         }
     }
 }
@@ -1064,6 +1074,9 @@ impl Margo {
             reg if (OVL_BASE..OVL_BASE + OVL_REGS * 4).contains(&reg) => {
                 self.overlay[(reg - OVL_BASE) / 4]
             }
+            reg if (PUSH_BASE_REG..PUSH_BASE_REG + PUSH_REGS * 4).contains(&reg) => {
+                self.pusher[(reg - PUSH_BASE_REG) / 4]
+            }
             reg if (BLIT_BASE..BLIT_BASE + BLIT_REGS * 4).contains(&reg) => {
                 self.blit[(reg - BLIT_BASE) / 4]
             }
@@ -1120,6 +1133,14 @@ impl Margo {
         if (OVL_BASE..OVL_BASE + OVL_REGS * 4).contains(&reg) {
             let slot = &mut self.overlay[(reg - OVL_BASE) / 4];
             *slot = (*slot & !(0xff_u32 << shift)) | (u32::from(value) << shift);
+            return;
+        }
+        if (PUSH_BASE_REG..PUSH_BASE_REG + PUSH_REGS * 4).contains(&reg) {
+            // PUSH_GET (0x0090) is read-only to the bus; the engine owns it.
+            if reg != REG_PUSH_GET {
+                let slot = &mut self.pusher[(reg - PUSH_BASE_REG) / 4];
+                *slot = (*slot & !(0xff_u32 << shift)) | (u32::from(value) << shift);
+            }
             return;
         }
         if reg == REG_DISP_START {
@@ -1984,8 +2005,8 @@ mod tests {
     fn caps_reports_all_implemented_features() {
         let margo = Margo::default();
         // bits 0 FILL, 1 COPY, 2 COLOR_EXPAND, 3 LINE, 4 full ROP3, 5 CLIP, 6 COLORKEY,
-        // 7 PATTERN_FILL, 8 CURSOR, 9 OVERLAY.
-        assert_eq!(read_reg_u32(&margo, REG_CAPS), 0x0000_03ff);
+        // 7 PATTERN_FILL, 8 CURSOR, 9 OVERLAY, 10 PUSHER.
+        assert_eq!(read_reg_u32(&margo, REG_CAPS), 0x0000_07ff);
     }
 
     #[test]
@@ -2003,6 +2024,27 @@ mod tests {
         assert_eq!(read_reg_u32(&margo, REG_OVL_SRC_Y), 0x0020_0000);
         assert_eq!(read_reg_u32(&margo, REG_OVL_COLORKEY), 0x00ff_00ff);
         assert_eq!(read_reg_u32(&margo, REG_OVL_CTRL), 0x4433_2211);
+    }
+
+    #[test]
+    fn pusher_registers_round_trip() {
+        let mut margo = Margo::default();
+        // Distinct values in each lane prove byte recombination through the store.
+        margo.write_mmio_u8(REG_PUSH_CTRL, 0x11);
+        margo.write_mmio_u8(REG_PUSH_CTRL + 1, 0x22);
+        margo.write_mmio_u8(REG_PUSH_CTRL + 2, 0x33);
+        margo.write_mmio_u8(REG_PUSH_CTRL + 3, 0x44);
+        assert_eq!(read_reg_u32(&margo, REG_PUSH_CTRL), 0x4433_2211);
+        // The other R/W registers are independent across the block.
+        write_reg(&mut margo, REG_PUSH_BASE, 0x0001_0000);
+        write_reg(&mut margo, REG_PUSH_SIZE, 0x0000_1000);
+        write_reg(&mut margo, REG_PUSH_PUT, 0x0000_0040);
+        assert_eq!(read_reg_u32(&margo, REG_PUSH_BASE), 0x0001_0000);
+        assert_eq!(read_reg_u32(&margo, REG_PUSH_SIZE), 0x0000_1000);
+        assert_eq!(read_reg_u32(&margo, REG_PUSH_PUT), 0x0000_0040);
+        // PUSH_GET is read-only to the bus: a CPU write is ignored.
+        write_reg(&mut margo, REG_PUSH_GET, 0xdead_beef);
+        assert_eq!(read_reg_u32(&margo, REG_PUSH_GET), 0);
     }
 
     #[test]
