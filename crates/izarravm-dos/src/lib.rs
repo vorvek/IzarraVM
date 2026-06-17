@@ -531,8 +531,9 @@ impl DosKernel {
                 Ok(DosAction::Continue)
             }
             // AH=2Bh: set date. CX=year(1980-2099), DH=month, DL=day. AL=0 ok, 0xFF
-            // invalid. ponytail: day_of_week is not recomputed (no calendar routine;
-            // no in-scope reader needs the post-set weekday).
+            // invalid. ponytail: no calendar routine, so the day range is the coarse
+            // 1..=31 (real DOS rejects e.g. Feb 31) and day_of_week is not recomputed;
+            // no in-scope reader needs per-month validation or the post-set weekday.
             0x2b => {
                 let year = regs.cx;
                 let month = (regs.dx >> 8) as u8;
