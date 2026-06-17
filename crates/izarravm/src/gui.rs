@@ -66,6 +66,31 @@ fn text_to_color_image(frame: &TextFrame) -> egui::ColorImage {
     words_to_color_image(&words, width, height)
 }
 
+/// Nearest-neighbour integer upscale per axis, as large as fits the target
+/// without exceeding it. The caller then lets egui stretch the small remainder
+/// with bilinear filtering, which gives a sharp-bilinear look without a shader.
+fn sharp_prescale(image: &egui::ColorImage, target_w: usize, target_h: usize) -> egui::ColorImage {
+    let [source_w, source_h] = image.size;
+    if source_w == 0 || source_h == 0 {
+        return image.clone();
+    }
+    let factor_x = (target_w / source_w).max(1);
+    let factor_y = (target_h / source_h).max(1);
+    if factor_x == 1 && factor_y == 1 {
+        return image.clone();
+    }
+    let dest_w = source_w * factor_x;
+    let dest_h = source_h * factor_y;
+    let mut pixels = Vec::with_capacity(dest_w * dest_h);
+    for y in 0..dest_h {
+        let source_row = (y / factor_y) * source_w;
+        for x in 0..dest_w {
+            pixels.push(image.pixels[source_row + x / factor_x]);
+        }
+    }
+    egui::ColorImage::new([dest_w, dest_h], pixels)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,6 +105,33 @@ mod tests {
         assert_eq!(image.size, [2, 2]);
         let p = image.pixels[1];
         assert_eq!((p.r(), p.g(), p.b()), (0xAB, 0xCD, 0xEF));
+    }
+
+    #[test]
+    fn prescale_uses_per_axis_integer_factor() {
+        // 2x1 source, target 6x6: x factor 3, y factor 6.
+        let src = egui::ColorImage::new(
+            [2, 1],
+            vec![
+                egui::Color32::from_rgb(10, 0, 0),
+                egui::Color32::from_rgb(0, 20, 0),
+            ],
+        );
+        let out = sharp_prescale(&src, 6, 6);
+        assert_eq!(out.size, [6, 6]);
+        // First source pixel fills the left 3 columns, second fills the right 3.
+        assert_eq!(out.pixels[0], egui::Color32::from_rgb(10, 0, 0));
+        assert_eq!(out.pixels[2], egui::Color32::from_rgb(10, 0, 0));
+        assert_eq!(out.pixels[3], egui::Color32::from_rgb(0, 20, 0));
+        // Second output row repeats the first (vertical factor applied).
+        assert_eq!(out.pixels[6], egui::Color32::from_rgb(10, 0, 0));
+    }
+
+    #[test]
+    fn prescale_is_identity_when_target_smaller() {
+        let src = egui::ColorImage::new([4, 4], vec![egui::Color32::BLACK; 16]);
+        let out = sharp_prescale(&src, 3, 3);
+        assert_eq!(out.size, [4, 4]);
     }
 
     #[test]
