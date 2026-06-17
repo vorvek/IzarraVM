@@ -350,13 +350,30 @@ impl Vga {
     /// doubled mode holds each VRAM row for two scanlines.
     pub fn render_active_row(&self, counter_line: u32) -> Vec<u8> {
         let width = self.crtc.hdisp_end as usize;
-        let pan = (self.attr.pixel_pan & 0x0F) as usize;
+        // Line Compare split (CRTC 18h + 07h.4 + 09h.6). Abrash, Graphics Programming
+        // Black Book ch.30: the scanline matching line compare is the last line above
+        // the split; the split starts on the following line and reloads the display
+        // address counter to 0. The comparison is in scan-counter units, the same units
+        // the beam and the other vertical timing registers use, so it is not divided by
+        // the double-scan factor.
+        let below_split = counter_line > self.crtc.line_compare;
+        let (start, first_line) = if below_split {
+            (0, self.crtc.line_compare + 1)
+        } else {
+            (self.crtc.start_address, 0)
+        };
+        // Below the split, pel-pan is forced to 0 when Attribute Mode Control (10h)
+        // bit 5 is set ("enable pixel panning: 0 = all, 1 = up to line compare").
+        let pan = if below_split && (self.attr.mode_control & 0x20 != 0) {
+            0
+        } else {
+            (self.attr.pixel_pan & 0x0F) as usize
+        };
+        let source_row = (counter_line - first_line) / self.scan_factor();
+        // The per-scanline counter increment is offset*2 in every addressing mode; the
+        // byte/word/doubleword transform lives in display_offset, not the stride.
+        let row_base = start + source_row * self.crtc.offset * 2;
         let mut row = vec![0u8; width];
-        let source_row = counter_line / self.scan_factor();
-        // Address-counter base for this row. The per-scanline counter increment is
-        // offset*2 in every addressing mode; the byte/word/doubleword transform
-        // lives in display_offset, not the stride.
-        let row_base = self.crtc.start_address + source_row * self.crtc.offset * 2;
         for (x, slot) in row.iter_mut().enumerate() {
             let px = x + pan;
             let byte = px / 8;
@@ -1441,6 +1458,142 @@ mod tests {
             &wrapped[64..72],
             &top[0..8],
             "wrapped scanout pixels equal the top-of-VRAM pixels at the seam"
+        );
+    }
+
+    #[test]
+    fn line_compare_split_renders_top_scrolled_and_bottom_from_offset_zero() {
+        // A distinct byte per plane-0 offset so each source row is recognizable.
+        fn pattern(off: usize) -> u8 {
+            ((off as u32).wrapping_mul(7).wrapping_add(1) & 0xFF) as u8
+        }
+        // Reference renderer: no split (line compare stays 0x3FF), configurable scroll
+        // and pel-pan, rendering one row.
+        fn reference(s: u32, pan: u8, row: u32) -> Vec<u8> {
+            let mut r = Vga::default();
+            r.set_mode(0x12);
+            r.attr.palette = core::array::from_fn(|i| i as u8);
+            for off in 0..VGA_PLANE_SIZE {
+                r.vram[off] = pattern(off);
+            }
+            r.crtc.start_address = s;
+            r.attr.pixel_pan = pan;
+            r.render_active_row(row)
+        }
+
+        let mut vga = Vga::default();
+        vga.set_mode(0x12); // 640x480, not double-scanned, offset 40 (byte pitch 80)
+        vga.attr.palette = core::array::from_fn(|i| i as u8);
+        for off in 0..VGA_PLANE_SIZE {
+            vga.vram[off] = pattern(off);
+        }
+        let start = 0x1000u32;
+        let split = 300u32;
+        vga.crtc.start_address = start;
+        vga.crtc.line_compare = split;
+        vga.attr.pixel_pan = 3;
+        vga.attr.mode_control = 0x20; // bit 5: pel-pan up to line compare only
+
+        // Top row 200 (<= split): scrolled by `start`, panned by 3.
+        assert_eq!(
+            vga.render_active_row(200),
+            reference(start, 3, 200),
+            "top region renders scrolled and pel-panned"
+        );
+        // First split scanline (split+1): source row 0 from offset 0, pel-pan forced 0.
+        assert_eq!(
+            vga.render_active_row(split + 1),
+            reference(0, 0, 0),
+            "first split line renders source row 0 from offset 0 with pel-pan forced to 0"
+        );
+        // Split region row k: source row k from offset 0, pel-pan forced 0.
+        assert_eq!(
+            vga.render_active_row(split + 11),
+            reference(0, 0, 10),
+            "split region row k renders source row k from offset 0"
+        );
+    }
+
+    #[test]
+    fn line_compare_split_starts_on_the_line_after_the_match() {
+        let split = 100u32;
+        let mut vga = Vga::default();
+        vga.set_mode(0x12);
+        vga.attr.palette = core::array::from_fn(|i| i as u8);
+        vga.vram[0] = 0xFF; // offset 0 marked: index 1 across pixels 0..7
+        // Scroll the top region past the marked byte so the top reads cleared VRAM.
+        vga.crtc.start_address = 0x4000;
+        vga.crtc.line_compare = split;
+        // The matching scanline is the last top line: reads start_address (clear) -> 0.
+        assert_eq!(
+            vga.render_active_row(split)[0],
+            0,
+            "scanline == line_compare is still the top region"
+        );
+        // The next scanline is the first split line: reads offset 0 (marked) -> 1.
+        assert_eq!(
+            vga.render_active_row(split + 1)[0],
+            1,
+            "scanline line_compare+1 is the first split line, from offset 0"
+        );
+    }
+
+    #[test]
+    fn line_compare_compares_against_the_scan_counter_line_in_a_doubled_mode() {
+        let mut vga = Vga::default();
+        vga.set_mode_0dh(); // double-scanned: 400 active scanlines, source rows 0..200
+        vga.attr.palette = core::array::from_fn(|i| i as u8);
+        vga.vram[0] = 0xFF; // offset 0 marked -> index 1
+        // Split at scan-counter line 320. The source row counter only reaches ~200, so a
+        // split here can only match if the comparison is in scan-counter units.
+        let split = 320u32;
+        vga.crtc.start_address = 0x4000; // top region reads cleared VRAM
+        vga.crtc.line_compare = split;
+        assert_eq!(
+            vga.render_active_row(320)[0],
+            0,
+            "scanline 320 == line_compare is the last top line"
+        );
+        // Scanlines 321 and 322 are the first two split scanlines: the same doubled
+        // source row 0, read from offset 0.
+        assert_eq!(
+            vga.render_active_row(321)[0],
+            1,
+            "first split scanline, offset 0"
+        );
+        assert_eq!(
+            vga.render_active_row(322)[0],
+            1,
+            "second scanline holds the same doubled source row 0"
+        );
+    }
+
+    #[test]
+    fn pel_pan_below_split_is_forced_to_zero_only_when_enabled() {
+        // Render the first split-region row (offset 0) with a non-uniform byte so a
+        // pel-pan shift is visible. `mode_control` carries Attribute index 10h, `pan`
+        // the pel-pan value.
+        fn render(mode_control: u8, pan: u8) -> Vec<u8> {
+            let mut vga = Vga::default();
+            vga.set_mode(0x12);
+            vga.attr.palette = core::array::from_fn(|i| i as u8);
+            vga.vram[0] = 0b0101_0101; // alternating pixels in source row 0
+            vga.crtc.line_compare = 100;
+            vga.attr.pixel_pan = pan;
+            vga.attr.mode_control = mode_control;
+            vga.render_active_row(101) // first split line: source row 0, offset 0
+        }
+        // bit 5 set: pel-pan forced to 0 below the split, so pan 1 equals pan 0.
+        assert_eq!(
+            render(0x20, 1),
+            render(0x20, 0),
+            "Attribute 10h bit 5 set forces split-region pel-pan to 0"
+        );
+        // bit 5 clear: pel-pan applies below the split, so pan 1 differs from pan 0.
+        assert_ne!(
+            render(0x00, 1),
+            render(0x00, 0),
+            "Attribute 10h bit 5 clear pans the split region"
         );
     }
 
