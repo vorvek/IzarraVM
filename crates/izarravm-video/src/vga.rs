@@ -60,6 +60,32 @@ pub struct Sequencer {
     pub memory_mode: u8, // idx 4
 }
 
+/// Total horizontal dots per scan line.
+pub fn htotal_dots(t: &CrtcTiming) -> u64 {
+    (t.htotal_chars * t.char_width) as u64
+}
+
+/// Current scan line (0-based, scan-counter units) for a dot position.
+pub fn beam_line(t: &CrtcTiming, dots: u64) -> u32 {
+    ((dots / htotal_dots(t)) % t.vtotal as u64) as u32
+}
+
+/// Dot position within the current scan line.
+pub fn beam_dot(t: &CrtcTiming, dots: u64) -> u32 {
+    (dots % htotal_dots(t)) as u32
+}
+
+/// True when the beam is in the active display area (both H and V).
+pub fn beam_display_enable(t: &CrtcTiming, dots: u64) -> bool {
+    beam_line(t, dots) < t.vdisp_end && beam_dot(t, dots) < t.hdisp_end
+}
+
+/// True when the beam is inside the vertical retrace interval.
+pub fn beam_vretrace(t: &CrtcTiming, dots: u64) -> bool {
+    let line = beam_line(t, dots);
+    line >= t.vretrace_start && line < t.vretrace_end
+}
+
 #[derive(Debug, Clone)]
 pub struct Vga {
     pub(crate) vram: Vec<u8>,
@@ -67,6 +93,9 @@ pub struct Vga {
     pub(crate) seq: Sequencer,
     pub(crate) gc: GfxController,
     pub(crate) latches: [u8; VGA_PLANES],
+    pub(crate) beam: u64,
+    pub(crate) last_line: u32,
+    pub(crate) frames: u64,
 }
 
 impl Default for Vga {
@@ -77,6 +106,9 @@ impl Default for Vga {
             seq: Sequencer::default(),
             gc: GfxController::default(),
             latches: [0; VGA_PLANES],
+            beam: 0,
+            last_line: 0,
+            frames: 0,
         }
     }
 }
@@ -84,6 +116,33 @@ impl Default for Vga {
 impl Vga {
     pub fn frame_dots(&self) -> u64 {
         self.crtc.frame_dots()
+    }
+
+    pub fn beam_dots(&self) -> u64 {
+        self.beam
+    }
+
+    pub fn frames_completed(&self) -> u64 {
+        self.frames
+    }
+
+    /// Switch to mode 0Dh timing and reset the beam to the top of frame.
+    pub fn set_mode_0dh(&mut self) {
+        self.crtc = CrtcTiming::mode_0dh();
+        self.beam = 0;
+        self.last_line = 0;
+    }
+
+    /// Advance the beam by whole dots, rolling over each completed frame
+    /// arithmetically (O(1)).
+    pub fn advance(&mut self, dots: u64) {
+        let frame = self.frame_dots();
+        if frame == 0 {
+            return; // guard: un-programmed CRTC
+        }
+        let total = self.beam + dots;
+        self.frames += total / frame;
+        self.beam = total % frame;
     }
 
     pub fn plane_byte(&self, plane: usize, offset: usize) -> u8 {
@@ -230,6 +289,27 @@ pub fn write_planes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn beam_position_tracks_dots_in_scan_counter_units() {
+        let t = CrtcTiming::mode_0dh();
+        let htotal = (t.htotal_chars * t.char_width) as u64; // 800
+        let dots = htotal * 5 + 10; // 5 full lines + 10 dots
+        assert_eq!(beam_line(&t, dots), 5);
+        assert_eq!(beam_dot(&t, dots), 10);
+        assert!(beam_display_enable(&t, dots)); // line 5 < 400, dot 10 < 320
+        assert!(!beam_vretrace(&t, dots));       // 5 < vretrace_start 412
+    }
+
+    #[test]
+    fn advance_rolls_over_one_frame_in_o1() {
+        let mut vga = Vga::default();
+        vga.set_mode_0dh();
+        let frame = vga.frame_dots();
+        vga.advance(frame * 2 + 7); // just past two frames in one call
+        assert_eq!(vga.beam_dots(), 7);          // (2*frame+7) mod frame
+        assert_eq!(vga.frames_completed(), 2);
+    }
 
     #[test]
     fn boots_with_defined_frame_dots_and_zeroed_vram() {
