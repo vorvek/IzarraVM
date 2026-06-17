@@ -448,6 +448,25 @@ impl Vga {
         row
     }
 
+    /// Assemble one unchained 256-color (mode X) scanline. Four planes are
+    /// column-interleaved: pixel x is plane `x & 3` at plane offset `row_base +
+    /// (x >> 2)`, and the byte is the 8-bit DAC index directly (no attribute palette,
+    /// no 6-bit mask). `counter_line` is in scan-counter units; double-scan maps it to
+    /// the source row, exactly as the 16-color path.
+    pub fn render_modex_row(&self, counter_line: u32) -> Vec<u8> {
+        let width = self.crtc.hdisp_end as usize;
+        let source_row = counter_line / self.scan_factor();
+        let row_base = self.crtc.start_address + source_row * self.crtc.offset * 2;
+        let mut row = vec![0u8; width];
+        for (x, slot) in row.iter_mut().enumerate() {
+            let plane = x & 3;
+            let ma = row_base + (x >> 2) as u32;
+            let off = display_offset(self.crtc.mode_control, self.crtc.underline_loc, ma);
+            *slot = self.vram[plane * VGA_PLANE_SIZE + off];
+        }
+        row
+    }
+
     fn region_color(&self, scan_line: u32) -> u8 {
         // scan_line in counter units; caller guarantees scan_line >= vdisp_end.
         if scan_line < self.crtc.vblank_start || scan_line >= self.crtc.vblank_end {
@@ -464,7 +483,10 @@ impl Vga {
     fn render_scanline(&mut self, counter_line: u32) {
         let width = self.raster_width() as usize;
         let pixels = if counter_line < self.crtc.vdisp_end {
-            self.render_active_row(counter_line)
+            match self.mode {
+                VideoMode::ModeX => self.render_modex_row(counter_line),
+                _ => self.render_active_row(counter_line),
+            }
         } else {
             vec![self.region_color(counter_line); width]
         };
@@ -1814,5 +1836,54 @@ mod tests {
         vga.write_port(0x3C4, 0x04);
         vga.write_port(0x3C5, 0x0E);
         assert_eq!(vga.active_mode(), VideoMode::Mode13h);
+    }
+
+    #[test]
+    fn mode_x_scanout_is_column_interleaved_8bit_direct() {
+        let mut vga = Vga::default();
+        vga.set_mode13h();
+        vga.write_port(0x3C4, 0x04);
+        vga.write_port(0x3C5, 0x06); // mode X, 320x200 base
+        // Distinct full bytes in planes 0..3 at plane offset 0. 0x40 also proves the
+        // byte is not masked to 6 bits (0x40 & 0x3F would be 0).
+        vga.vram[0 * VGA_PLANE_SIZE] = 0x10;
+        vga.vram[VGA_PLANE_SIZE] = 0x20;
+        vga.vram[2 * VGA_PLANE_SIZE] = 0x30;
+        vga.vram[3 * VGA_PLANE_SIZE] = 0x40;
+        let row = vga.render_modex_row(0);
+        // Pixels 0..3 are planes 0..3 at offset 0, as full 8-bit DAC indices.
+        assert_eq!(&row[0..4], &[0x10, 0x20, 0x30, 0x40]);
+    }
+
+    #[test]
+    fn mode_x_page_flip_reads_the_selected_page() {
+        let mut vga = Vga::default();
+        vga.set_mode13h();
+        vga.write_port(0x3C4, 0x04);
+        vga.write_port(0x3C5, 0x06);
+        let page1 = 0x3E80usize; // 16000 plane-bytes: a 320x200 page
+        vga.vram[0] = 0xAA; // page 0, plane 0, offset 0
+        vga.vram[page1] = 0x55; // page 1, plane 0, offset 0
+        assert_eq!(vga.render_modex_row(0)[0], 0xAA, "start 0 reads page 0");
+        vga.crtc.start_address = page1 as u32;
+        assert_eq!(
+            vga.render_modex_row(0)[0],
+            0x55,
+            "start at page 1 reads page 1"
+        );
+    }
+
+    #[test]
+    fn render_scanline_dispatches_to_the_mode_x_scanout() {
+        let mut vga = Vga::default();
+        vga.set_mode13h();
+        vga.write_port(0x3C4, 0x04);
+        vga.write_port(0x3C5, 0x06);
+        vga.vram[0] = 0x7E;
+        let raster = vga.render_full_frame();
+        assert_eq!(
+            raster.pixels[0], 0x7E,
+            "row 0 pixel 0 is plane 0 offset 0, 8-bit direct"
+        );
     }
 }
