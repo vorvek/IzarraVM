@@ -14,6 +14,10 @@ pub const MODE13H_WIDTH: u32 = 320;
 pub const MODE13H_HEIGHT: u32 = 200;
 pub const MODE13H_MEMORY_SIZE: usize = 64_000;
 pub const VGA_MODE13H_BASE: u32 = 0x000a_0000;
+/// The full 64 KiB A0000 window the VGA hardware decodes, used for unchained
+/// (mode X) and 16-color planar access. Wider than `MODE13H_MEMORY_SIZE`, the
+/// 64000-byte chained mode-13h buffer.
+pub const VGA_PLANAR_WINDOW_SIZE: u32 = 0x1_0000;
 pub const VGA_TEXT_BASE: u32 = 0x000b_8000;
 pub const VGA_TEXT_COLUMNS: usize = 80;
 pub const VGA_TEXT_ROWS: usize = 25;
@@ -61,6 +65,7 @@ pub enum VideoMode {
     Text,
     Mode13h,
     Planar,
+    ModeX,
 }
 
 pub const DAC_ENTRIES: usize = 256;

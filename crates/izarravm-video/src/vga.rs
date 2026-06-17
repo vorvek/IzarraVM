@@ -148,9 +148,65 @@ impl CrtcTiming {
         }
     }
 
+    /// Mode X / mode Y base: 320x200 unchained 256-color. Offset 40 gives 80 bytes
+    /// per scanline per plane (320 pixels / 4 planes). 320x240 is reached when the
+    /// guest reprograms the vertical timing while unchained (see
+    /// `recompute_vertical_timing`).
+    pub fn mode_x() -> Self {
+        Self {
+            htotal_chars: 100,
+            char_width: 8,
+            hdisp_end: 320,
+            vtotal: 449,
+            vdisp_end: 400,
+            vblank_start: 407,
+            vblank_end: 442,
+            vretrace_start: 412,
+            vretrace_end: 414,
+            max_scan: 1,
+            double_scan: true,
+            start_address: 0,
+            offset: 40,
+            mode_control: 0xE3,
+            underline_loc: 0x00,
+            line_compare: 0x3FF,
+        }
+    }
+
     /// Total dots per frame = htotal_dots * vtotal (scan-counter lines).
     pub fn frame_dots(&self) -> u64 {
         (self.htotal_chars * self.char_width) as u64 * self.vtotal as u64
+    }
+}
+
+/// Raw CRTC vertical-timing register bytes, honored only while unchained (mode X)
+/// so the geometry follows whatever the guest programs. Seeded at mode-X entry and
+/// derived into `CrtcTiming` by `recompute_vertical_timing`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CrtcRegs {
+    pub r06: u8, // vertical total (low 8)
+    pub r07: u8, // overflow (high bits of several fields)
+    pub r09: u8, // maximum scan line (double-scan, max_scan, line-compare bit 9)
+    pub r10: u8, // vertical retrace start (low 8)
+    pub r11: u8, // vertical retrace end (low-nibble compare)
+    pub r12: u8, // vertical display end (low 8)
+    pub r15: u8, // vertical blank start (low 8)
+    pub r16: u8, // vertical blank end (8-bit compare)
+}
+
+impl CrtcRegs {
+    /// The 320x200 unchained register set, matching `CrtcTiming::mode_x()`.
+    pub fn mode_x_320x200() -> Self {
+        Self {
+            r06: 0xBF,
+            r07: 0x1F,
+            r09: 0x41,
+            r10: 0x9C,
+            r11: 0x0E,
+            r12: 0x8F,
+            r15: 0x97,
+            r16: 0xBA,
+        }
     }
 }
 
@@ -211,6 +267,7 @@ pub fn beam_vretrace(t: &CrtcTiming, dots: u64) -> bool {
 pub struct Vga {
     pub(crate) vram: Vec<u8>,
     pub(crate) crtc: CrtcTiming,
+    pub(crate) crtc_regs: CrtcRegs,
     pub(crate) seq: Sequencer,
     pub(crate) gc: GfxController,
     pub(crate) attr: Attribute,
@@ -243,6 +300,7 @@ impl Default for Vga {
         Self {
             vram: vec![0; VGA_PLANAR_SIZE],
             crtc: CrtcTiming::text_03h(),
+            crtc_regs: CrtcRegs::default(),
             seq: Sequencer::default(),
             gc: GfxController::default(),
             attr: Attribute::default(),
@@ -390,6 +448,27 @@ impl Vga {
         row
     }
 
+    /// Assemble one unchained 256-color (mode X) scanline. Four planes are
+    /// column-interleaved: pixel x is plane `x & 3` at plane offset `row_base +
+    /// (x >> 2)`, and the byte is the 8-bit DAC index directly (no attribute palette,
+    /// no 6-bit mask). `counter_line` is in scan-counter units; double-scan maps it to
+    /// the source row, exactly as the 16-color path.
+    /// The line-compare split and pel-pan are intentionally not applied here; they
+    /// are deferred for mode X (see the slice-5 spec section 1).
+    pub fn render_modex_row(&self, counter_line: u32) -> Vec<u8> {
+        let width = self.crtc.hdisp_end as usize;
+        let source_row = counter_line / self.scan_factor();
+        let row_base = self.crtc.start_address + source_row * self.crtc.offset * 2;
+        let mut row = vec![0u8; width];
+        for (x, slot) in row.iter_mut().enumerate() {
+            let plane = x & 3;
+            let ma = row_base + (x >> 2) as u32;
+            let off = display_offset(self.crtc.mode_control, self.crtc.underline_loc, ma);
+            *slot = self.vram[plane * VGA_PLANE_SIZE + off];
+        }
+        row
+    }
+
     fn region_color(&self, scan_line: u32) -> u8 {
         // scan_line in counter units; caller guarantees scan_line >= vdisp_end.
         if scan_line < self.crtc.vblank_start || scan_line >= self.crtc.vblank_end {
@@ -406,7 +485,10 @@ impl Vga {
     fn render_scanline(&mut self, counter_line: u32) {
         let width = self.raster_width() as usize;
         let pixels = if counter_line < self.crtc.vdisp_end {
-            self.render_active_row(counter_line)
+            match self.mode {
+                VideoMode::ModeX => self.render_modex_row(counter_line),
+                _ => self.render_active_row(counter_line),
+            }
         } else {
             vec![self.region_color(counter_line); width]
         };
@@ -626,7 +708,20 @@ impl Vga {
     fn write_seq(&mut self, index: u8, value: u8) {
         match index {
             0x02 => self.seq.map_mask = value & 0x0F,
-            0x04 => self.seq.memory_mode = value,
+            0x04 => {
+                self.seq.memory_mode = value;
+                // Chain-4 (bit 3) cleared while in chained 256-color (mode 13h)
+                // selects unchained 256-color (mode X / mode Y). Setting it again
+                // returns to chained mode 13h. Acting on the write that toggles the
+                // bit is the faithful register-bang entry; the default memory_mode of
+                // 0 cannot trigger it because set_mode13h never writes index 04h.
+                let chain4_off = value & 0x08 == 0;
+                if chain4_off && self.mode == VideoMode::Mode13h {
+                    self.enter_mode_x();
+                } else if !chain4_off && self.mode == VideoMode::ModeX {
+                    self.set_mode13h();
+                }
+            }
             _ => {}
         }
     }
@@ -679,6 +774,27 @@ impl Vga {
                     (self.crtc.line_compare & !0x200) | (u32::from((value >> 6) & 1) << 9);
             }
             _ => {} // full timing programmed via set_mode_0dh in slice 1
+        }
+        // While unchained (mode X), honor the guest's vertical CRTC timing so the
+        // geometry follows the registers it programs (Abrash's bang yields 320x240).
+        // Seeded at mode-X entry; the absolute fields are derived in
+        // recompute_vertical_timing. The line-compare bits (07h/09h/18h) are handled
+        // by the match above and left untouched here.
+        if self.mode == VideoMode::ModeX
+            && matches!(index, 0x06 | 0x07 | 0x09 | 0x10 | 0x11 | 0x12 | 0x15 | 0x16)
+        {
+            match index {
+                0x06 => self.crtc_regs.r06 = value,
+                0x07 => self.crtc_regs.r07 = value,
+                0x09 => self.crtc_regs.r09 = value,
+                0x10 => self.crtc_regs.r10 = value,
+                0x11 => self.crtc_regs.r11 = value,
+                0x12 => self.crtc_regs.r12 = value,
+                0x15 => self.crtc_regs.r15 = value,
+                0x16 => self.crtc_regs.r16 = value,
+                _ => unreachable!(),
+            }
+            self.recompute_vertical_timing();
         }
     }
 
@@ -741,6 +857,66 @@ impl Vga {
     pub fn set_mode13h(&mut self) {
         self.mode13h = Framebuffer::mode13h();
         self.mode = VideoMode::Mode13h;
+    }
+
+    /// Derive the absolute vertical timing in `crtc` from the raw register bytes in
+    /// `crtc_regs`, applying the overflow-bit assembly and the VGA register
+    /// conventions (vertical total + 2, vertical display end + 1, the retrace/blank
+    /// ends as line-counter compares). Used only while unchained (mode X).
+    fn recompute_vertical_timing(&mut self) {
+        let r = self.crtc_regs;
+        let vtotal =
+            ((r.r06 as u32) | (((r.r07 & 1) as u32) << 8) | ((((r.r07 >> 5) & 1) as u32) << 9)) + 2;
+        let vdisp = ((r.r12 as u32)
+            | ((((r.r07 >> 1) & 1) as u32) << 8)
+            | ((((r.r07 >> 6) & 1) as u32) << 9))
+            + 1;
+        let vretrace_start = (r.r10 as u32)
+            | ((((r.r07 >> 2) & 1) as u32) << 8)
+            | ((((r.r07 >> 7) & 1) as u32) << 9);
+        let vblank_start = (r.r15 as u32)
+            | ((((r.r07 >> 3) & 1) as u32) << 8)
+            | ((((r.r09 >> 5) & 1) as u32) << 9);
+        let vretrace_end = {
+            let target = (r.r11 & 0x0F) as u32;
+            let mut e = (vretrace_start & !0x0F) | target;
+            if e <= vretrace_start {
+                e += 0x10;
+            }
+            e
+        };
+        let vblank_end = {
+            let target = r.r16 as u32;
+            let mut e = (vblank_start & !0xFF) | target;
+            if e <= vblank_start {
+                e += 0x100;
+            }
+            e
+        };
+        let max_scan = (r.r09 & 0x1F) as u32;
+        self.crtc.vtotal = vtotal;
+        self.crtc.vdisp_end = vdisp;
+        self.crtc.vretrace_start = vretrace_start;
+        self.crtc.vretrace_end = vretrace_end;
+        self.crtc.vblank_start = vblank_start;
+        self.crtc.vblank_end = vblank_end;
+        self.crtc.max_scan = max_scan;
+        self.crtc.double_scan = (r.r09 & 0x80 != 0) || max_scan == 1;
+        self.resize_work();
+    }
+
+    /// Enter unchained 256-color (mode X / mode Y) with the 320x200 base. The guest
+    /// retunes the geometry by reprogramming the vertical CRTC timing while here.
+    fn enter_mode_x(&mut self) {
+        // seq.memory_mode already holds the chain-4-off value from the write_seq
+        // call that triggered this entry, so it is not reseeded here.
+        self.crtc = CrtcTiming::mode_x();
+        self.crtc_regs = CrtcRegs::mode_x_320x200();
+        self.recompute_vertical_timing(); // derives the vertical fields and sizes work
+        self.beam = 0;
+        self.last_line = 0;
+        self.mode = VideoMode::ModeX;
+        self.presented = None;
     }
 
     pub fn active_mode(&self) -> VideoMode {
@@ -1611,5 +1787,109 @@ mod tests {
         assert_eq!(row.len(), 640);
         assert_eq!(row[639], 15, "column 639 reads bit 0 of all four planes");
         assert_eq!(row[0], 0, "column 0 is clear");
+    }
+
+    #[test]
+    fn guest_crtc_bang_retunes_mode_x_to_320x240() {
+        let mut vga = Vga::default();
+        vga.set_mode13h();
+        vga.write_port(0x3C4, 0x04);
+        vga.write_port(0x3C5, 0x06); // enter mode X, 320x200 base
+        assert_eq!(vga.raster_height(), 449);
+        // Abrash's 320x240 vertical timing (Black Book Listing 47.1), index then data.
+        for (idx, val) in [
+            (0x06u8, 0x0Du8), // vertical total
+            (0x07, 0x3E),     // overflow (high bits)
+            (0x09, 0x41),     // max scan line: 2 scanlines per row
+            (0x10, 0xEA),     // vretrace start
+            (0x11, 0xAC),     // vretrace end + protect
+            (0x12, 0xDF),     // vertical display end
+            (0x15, 0xE7),     // vblank start
+            (0x16, 0x06),     // vblank end
+        ] {
+            vga.write_port(0x3D4, idx);
+            vga.write_port(0x3D5, val);
+        }
+        assert_eq!(vga.crtc.vtotal, 527, "527 total scanlines");
+        assert_eq!(vga.crtc.vdisp_end, 480, "480 active scanlines");
+        assert_eq!(vga.crtc.max_scan, 1);
+        assert!(
+            vga.crtc.double_scan,
+            "double-scanned: 240 source rows over 480 lines"
+        );
+        assert_eq!(vga.raster_height(), 527);
+    }
+
+    #[test]
+    fn clearing_chain4_in_mode13h_enters_and_leaves_mode_x() {
+        let mut vga = Vga::default();
+        vga.set_mode13h();
+        assert_eq!(vga.active_mode(), VideoMode::Mode13h);
+        // Sequencer Memory Mode (04h) written with chain-4 (bit 3) cleared enters
+        // unchained 256-color (mode X) from chained mode 13h.
+        vga.write_port(0x3C4, 0x04);
+        vga.write_port(0x3C5, 0x06);
+        assert_eq!(vga.active_mode(), VideoMode::ModeX);
+        // The unchained 320x200 base geometry: 320 wide, vtotal 449, offset 40.
+        assert_eq!(vga.raster_width(), 320);
+        assert_eq!(vga.raster_height(), 449);
+        assert_eq!(vga.crtc.offset, 40);
+        // Writing 04h with chain-4 set again reverts to chained mode 13h.
+        vga.write_port(0x3C4, 0x04);
+        vga.write_port(0x3C5, 0x0E);
+        assert_eq!(vga.active_mode(), VideoMode::Mode13h);
+    }
+
+    #[test]
+    fn mode_x_scanout_is_column_interleaved_8bit_direct() {
+        let mut vga = Vga::default();
+        vga.set_mode13h();
+        vga.write_port(0x3C4, 0x04);
+        vga.write_port(0x3C5, 0x06); // mode X, 320x200 base
+        // Distinct full bytes in planes 0..3 at plane offset 0. 0x40 also proves the
+        // byte is not masked to 6 bits (0x40 & 0x3F would be 0).
+        vga.vram[0] = 0x10; // plane 0, offset 0
+        vga.vram[VGA_PLANE_SIZE] = 0x20;
+        vga.vram[2 * VGA_PLANE_SIZE] = 0x30;
+        vga.vram[3 * VGA_PLANE_SIZE] = 0x40;
+        vga.vram[1] = 0x11; // plane 0, offset 1: pixel 4 must read this
+        let row = vga.render_modex_row(0);
+        // Pixels 0..3 are planes 0..3 at offset 0, as full 8-bit DAC indices.
+        assert_eq!(&row[0..4], &[0x10, 0x20, 0x30, 0x40]);
+        assert_eq!(row[4], 0x11, "pixel 4 wraps to plane 0 at plane offset 1");
+    }
+
+    #[test]
+    fn mode_x_page_flip_reads_the_selected_page() {
+        // Checks render_modex_row's row_base arithmetic directly; the start-address
+        // vretrace latch is exercised end to end in the machine test (slice-5 task 5).
+        let mut vga = Vga::default();
+        vga.set_mode13h();
+        vga.write_port(0x3C4, 0x04);
+        vga.write_port(0x3C5, 0x06);
+        let page1 = 0x3E80usize; // 16000 plane-bytes: a 320x200 page
+        vga.vram[0] = 0xAA; // page 0, plane 0, offset 0
+        vga.vram[page1] = 0x55; // page 1, plane 0, offset 0
+        assert_eq!(vga.render_modex_row(0)[0], 0xAA, "start 0 reads page 0");
+        vga.crtc.start_address = page1 as u32;
+        assert_eq!(
+            vga.render_modex_row(0)[0],
+            0x55,
+            "start at page 1 reads page 1"
+        );
+    }
+
+    #[test]
+    fn render_scanline_dispatches_to_the_mode_x_scanout() {
+        let mut vga = Vga::default();
+        vga.set_mode13h();
+        vga.write_port(0x3C4, 0x04);
+        vga.write_port(0x3C5, 0x06);
+        vga.vram[0] = 0x7E;
+        let raster = vga.render_full_frame();
+        assert_eq!(
+            raster.pixels[0], 0x7E,
+            "row 0 pixel 0 is plane 0 offset 0, 8-bit direct"
+        );
     }
 }
