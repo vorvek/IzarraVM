@@ -2292,6 +2292,44 @@ mod tests {
     }
 
     #[test]
+    fn pattern_fill_through_the_mmio_aperture_tiles_and_times_busy() {
+        let mut machine = test_machine();
+        // Seed an 8x8 tile in offscreen VRAM (offset 0x10000, clear of the
+        // destination) through the LFB: cell (r, c) = r*8 + c + 1, depth 1.
+        let pat_base = 0x1_0000u32;
+        for r in 0..8u32 {
+            for c in 0..8u32 {
+                machine.write_physical_u8(
+                    MARGO_LFB_BASE + pat_base + r * 8 + c,
+                    (r * 8 + c + 1) as u8,
+                );
+            }
+        }
+        write_mmio_reg(&mut machine, 0x100, 0); // DST_BASE
+        write_mmio_reg(&mut machine, 0x104, 640); // DST_PITCH
+        write_mmio_reg(&mut machine, 0x110, 1); // DEPTH
+        write_mmio_reg(&mut machine, 0x144, pat_base); // PAT_BASE
+        write_mmio_reg(&mut machine, 0x114, (2 << 16) | 3); // DST_XY: (x=3, y=2)
+        write_mmio_reg(&mut machine, 0x11c, (4 << 16) | 4); // DIM: 4x4
+        write_mmio_reg(&mut machine, 0x128, 0xf0); // ROP: PATCOPY (P = pattern, no source)
+        write_mmio_reg(&mut machine, 0x150, 0x06); // COMMAND: PATTERN_FILL
+
+        // Absolute-phase tiling: dst (x, y) -> tile[y & 7][x & 7] = (y & 7)*8 + (x & 7) + 1.
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 2 * 640 + 3), 20); // (3,2) tile[2][3]
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 2 * 640 + 6), 23); // (6,2) tile[2][6]
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 5 * 640 + 3), 44); // (3,5) tile[5][3]
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 2 * 640 + 2), 0); // left of the rect
+        assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1); // BUSY set
+
+        // 16 pixels -> busy_ns = 100 + 16*5 = 180 ns. At 25 MHz (40 ns/clock), four
+        // clocks (160 ns) leave it busy; the fifth clears it.
+        machine.advance_devices(4);
+        assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
+        machine.advance_devices(1);
+        assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 0);
+    }
+
+    #[test]
     fn clipped_xor_fill_through_the_mmio_aperture() {
         let mut machine = test_machine();
         // Seed x=0..3 at y=0 with 0xFF through the LFB.

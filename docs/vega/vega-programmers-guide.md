@@ -274,7 +274,7 @@ format, then point `PAT_BASE` at it. The tiling lines up to the surface origin,
 so two adjacent fills meet seamlessly.
 
 ```c
-/* (target) */
+/* (verified) */
 void pattern_fill(unsigned long base, int pitch, int bpp,
                   unsigned long pat_offset,
                   int x, int y, int w, int h) {
@@ -285,7 +285,7 @@ void pattern_fill(unsigned long base, int pitch, int bpp,
     REG(0x0114) = (y << 16) | x;        /* DST_XY */
     REG(0x011C) = (h << 16) | w;        /* DIM */
     REG(0x0144) = pat_offset;           /* PAT_BASE: the 8x8 tile */
-    REG(0x0128) = 0xCC;                 /* ROP = SRCCOPY */
+    REG(0x0128) = 0xF0;                 /* ROP = PATCOPY (P = pattern, no source) */
     REG(0x0150) = 0x06;                 /* COMMAND = PATTERN_FILL */
     margo_wait();
 }
