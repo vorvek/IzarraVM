@@ -3618,6 +3618,76 @@ mod tests {
     }
 
     #[test]
+    fn mode_x_line_compare_split_through_the_machine() {
+        let mut machine = test_machine();
+        // Mode 13h, then unchained mode X.
+        machine.video_mut().set_mode13h();
+        machine.video_mut().write_port(0x3C4, 0x04);
+        machine.video_mut().write_port(0x3C5, 0x06);
+        assert_eq!(machine.active_display(), ActiveDisplay::VgaRaster);
+        // Abrash's 320x240 vertical timing through the CRTC ports (Black Book Listing
+        // 47.1): double-scanned, 240 source rows over 480 scanlines.
+        for (idx, val) in [
+            (0x06u8, 0x0Du8),
+            (0x07, 0x3E),
+            (0x09, 0x41),
+            (0x10, 0xEA),
+            (0x11, 0xAC),
+            (0x12, 0xDF),
+            (0x15, 0xE7),
+            (0x16, 0x06),
+        ] {
+            machine.video_mut().write_port(0x3D4, idx);
+            machine.video_mut().write_port(0x3D5, val);
+        }
+        // Program a split at scan-counter line 200. The 320x240 bang sets 07h bit 4
+        // (line-compare bit 8) and 09h bit 6 (line-compare bit 9); rewrite both with
+        // their other overflow / max-scan bits intact but those two line-compare bits
+        // clear, then the low byte. The kept bits reproduce vtotal 527, vdisp_end 480
+        // and keep double-scan on; only line-compare bits 8 and 9 are forced to 0.
+        machine.video_mut().write_port(0x3D4, 0x07);
+        machine.video_mut().write_port(0x3D5, 0x2E); // overflow minus line-compare bit 8
+        machine.video_mut().write_port(0x3D4, 0x09);
+        machine.video_mut().write_port(0x3D5, 0x01); // max scan 1 (double-scan), bit 6 clear
+        machine.video_mut().write_port(0x3D4, 0x18);
+        machine.video_mut().write_port(0x3D5, 0xC8); // line compare low 8 = 200
+        // Mark the status panel: plane 0, offset 0 (pixel 0 of any scanline reading
+        // offset 0). 0xC2 has bits above 0x3F set, proving the 8-bit DAC index is read
+        // directly with no attribute 6-bit mask.
+        machine.video_mut().write_port(0x3C4, 0x02);
+        machine.video_mut().write_port(0x3C5, 0x01); // map mask = plane 0
+        machine.video_mut().write_port(0x3CE, 0x08);
+        machine.video_mut().write_port(0x3CF, 0xFF); // bit mask 0xFF
+        machine.write_physical_u8(0x000A_0000, 0xC2);
+        // Scroll the top region to cleared VRAM, buffered until the next vertical
+        // retrace. Two frame periods: the first latches the start address, the second
+        // renders with it (the vretrace latch is exercised the same way as the 16-color
+        // split test).
+        machine.video_mut().write_port(0x3D4, 0x0C);
+        machine.video_mut().write_port(0x3D5, 0x40); // start address high = 0x40
+        machine.video_mut().write_port(0x3D4, 0x0D);
+        machine.video_mut().write_port(0x3D5, 0x00); // start address low = 0x00 -> 0x4000
+        machine.advance_devices(500_000);
+        machine.advance_devices(500_000);
+        let raster = machine.vga_raster().expect("a frame presented");
+        assert_eq!(raster.width, 320, "mode-X width");
+        let w = raster.width as usize;
+        // A top scanline (50 < 200) reads the scrolled, cleared region: 0.
+        assert_eq!(
+            raster.pixels[50 * w],
+            0,
+            "top region is scrolled to cleared VRAM"
+        );
+        // The first split scanline (201 = line_compare + 1) reads offset 0 (the marked
+        // status panel), as the full 8-bit DAC index.
+        assert_eq!(
+            raster.pixels[201 * w],
+            0xC2,
+            "split region reads offset 0 at the full 8-bit value"
+        );
+    }
+
+    #[test]
     fn dos_program_writes_and_reads_back_a_file() {
         // org 0x100: create C:\OUT.TXT (AH=3Ch), write "HI!" (AH=40h to the file
         // handle), seek to 0 (AH=42h), read 3 bytes back (AH=3Fh), close (AH=3Eh),
