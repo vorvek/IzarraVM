@@ -2450,15 +2450,17 @@ mod tests {
         let addr = 0x10_0000u32;
         machine.write_physical_u8(MARGO_LFB_BASE + addr + 512, 0x80);
         write_mmio_reg(&mut machine, 0x2c, addr); // CURSOR_ADDR
-        write_mmio_reg(&mut machine, 0x30, 0); // CURSOR_POS (0,0)
+        write_mmio_reg(&mut machine, 0x30, (5 << 16) | 3); // CURSOR_POS: (x=3, y=5)
         write_mmio_reg(&mut machine, 0x34, 0xf800); // CURSOR_FG = pure red
         write_mmio_reg(&mut machine, 0x38, 0x0000); // CURSOR_BG
         write_mmio_reg(&mut machine, 0x28, 1); // CURSOR_CTRL = ENABLE
 
         let palette = machine.palette_argb();
         let argb = machine.margo().scanout_argb(&palette);
-        assert_eq!(argb[0], 0x00ff_0000); // cursor (0,0) FG decoded as red
-        assert_eq!(argb[64], 0x0000_0000); // outside the 64-wide cursor: black surface
+        // Cursor pixel (0,0) lands at the positioned screen pixel (3, 5), proving the
+        // packed CURSOR_POS encoding routes through the aperture.
+        assert_eq!(argb[5 * 640 + 3], 0x00ff_0000); // FG decoded as red at (3,5)
+        assert_eq!(argb[0], 0x0000_0000); // the origin is outside the cursor: black surface
     }
 
     #[test]

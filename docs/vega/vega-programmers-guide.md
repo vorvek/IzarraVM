@@ -302,7 +302,7 @@ screen under it.
 /* (verified) */
 void enable_cursor(unsigned long bitmap_offset,
                    unsigned long fg, unsigned long bg) {
-    REG(0x002C) = bitmap_offset;        /* CURSOR_ADDR: 64x64 2bpp AND/XOR */
+    REG(0x002C) = bitmap_offset;        /* CURSOR_ADDR: 64x64 two-plane (AND then XOR) */
     REG(0x0034) = fg;                   /* CURSOR_FG */
     REG(0x0038) = bg;                   /* CURSOR_BG */
     REG(0x0028) = 1;                    /* CURSOR_CTRL = ENABLE */
