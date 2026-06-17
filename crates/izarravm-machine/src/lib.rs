@@ -2626,4 +2626,30 @@ mod tests {
         assert_eq!(raster.height, 525);
         assert_eq!(raster.pixels[0], 1, "top-left pixel is attribute index 1");
     }
+
+    #[test]
+    fn dos_program_startup_services() {
+        // org 0x100:
+        //   mov ah,0x30 / int 0x21            ; get version (AL=6, AH=10), no fault
+        //   mov bx,0x10 / mov ah,0x48 / int 21 ; allocate 16 paras -> AX=0x1100
+        //   mov [0x0204],ax                    ; store the allocated segment
+        //   mov ax,0x3521 / int 0x21           ; get INT 21h vector -> ES=0, BX=0x0600
+        //   mov [0x0200],es / mov [0x0202],bx  ; store ES then BX
+        //   mov ax,0x4c00 / int 0x21           ; exit 0
+        let com: &[u8] = &[
+            0xb4, 0x30, 0xcd, 0x21, 0xbb, 0x10, 0x00, 0xb4, 0x48, 0xcd, 0x21, 0xa3, 0x04, 0x02,
+            0xb8, 0x21, 0x35, 0xcd, 0x21, 0x8c, 0x06, 0x00, 0x02, 0x89, 0x1e, 0x02, 0x02, 0xb8,
+            0x00, 0x4c, 0xcd, 0x21,
+        ];
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com)
+                .unwrap();
+        let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
+        let mem = machine.memory();
+        // PSP at 0x0100 -> linear 0x1000; the program stored words at offsets 0x200..0x205.
+        assert_eq!(mem.read_u16(0x1200).unwrap(), 0x0000); // ES from IVT[0x21] (stub segment)
+        assert_eq!(mem.read_u16(0x1202).unwrap(), 0x0600); // BX from IVT[0x21] (stub offset)
+        assert_eq!(mem.read_u16(0x1204).unwrap(), 0x1100); // AH=48h allocated segment
+    }
 }
