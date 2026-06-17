@@ -2272,7 +2272,10 @@ mod tests {
         let pat_base = 0x1_0000u32;
         for r in 0..8u32 {
             for c in 0..8u32 {
-                machine.write_physical_u8(MARGO_LFB_BASE + pat_base + r * 8 + c, (r * 8 + c + 1) as u8);
+                machine.write_physical_u8(
+                    MARGO_LFB_BASE + pat_base + r * 8 + c,
+                    (r * 8 + c + 1) as u8,
+                );
             }
         }
         write_mmio_reg(&mut machine, 0x100, 0); // DST_BASE
