@@ -694,6 +694,42 @@ impl DosKernel {
                 regs.ax = (regs.ax & 0xff00) | 0x01;
                 Ok(DosAction::Continue)
             }
+            // AH=3Ch: create or truncate a file at DS:DX (ASCIIZ). CX = attributes
+            // (ignored; the host has no DOS attribute bits, marked). Opens read/write,
+            // truncating an existing file to zero. CF=0 + AX=handle, or CF=1 + AX=code.
+            0x3c => {
+                let path = match self.resolve_open_path(mem, regs.ds, regs.dx)? {
+                    Ok(path) => path,
+                    Err(code) => {
+                        set_dos_error(regs, code);
+                        return Ok(DosAction::Continue);
+                    }
+                };
+                match OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&path)
+                {
+                    Ok(file) => {
+                        let handle = (5u16..)
+                            .find(|h| !self.open_files.contains_key(h))
+                            .expect("a free DOS handle exists at or below u16::MAX");
+                        self.open_files.insert(
+                            handle,
+                            OpenFile {
+                                file,
+                                mode: AccessMode::ReadWrite,
+                            },
+                        );
+                        regs.ax = handle;
+                        regs.cf = false;
+                    }
+                    Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
+                }
+                Ok(DosAction::Continue)
+            }
             // Other file functions (write, seek, find) and everything else are not
             // yet implemented; later slices fill them in. An unimplemented function
             // returns Continue so the IRET stub returns to the caller.
@@ -1975,5 +2011,56 @@ mod tests {
         kernel.dispatch(0x21, &mut read, &mut mem).unwrap();
         assert!(read.cf);
         assert_eq!(read.ax, 0x05);
+    }
+
+    #[test]
+    fn ah3c_creates_a_file_and_returns_a_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut kernel = DosKernel::new();
+        kernel.mount_c(HostDrive::mount_c(dir.path()).unwrap());
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let base = 0x0100usize * 16 + 0x0200;
+        for (i, b) in r"C:\NEW.TXT".bytes().enumerate() {
+            mem.write_u8(base + i, b).unwrap();
+        }
+        mem.write_u8(base + r"C:\NEW.TXT".len(), 0).unwrap();
+        let mut regs = DosRegs {
+            ax: 0x3c00,
+            cx: 0,
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf, "create failed: ax={:#06x}", regs.ax);
+        assert!(regs.ax >= 5);
+        assert!(dir.path().join("NEW.TXT").exists());
+    }
+
+    #[test]
+    fn ah3c_truncates_an_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("OLD.TXT"), b"previous contents").unwrap();
+        let mut kernel = DosKernel::new();
+        kernel.mount_c(HostDrive::mount_c(dir.path()).unwrap());
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let base = 0x0100usize * 16 + 0x0200;
+        for (i, b) in r"C:\OLD.TXT".bytes().enumerate() {
+            mem.write_u8(base + i, b).unwrap();
+        }
+        mem.write_u8(base + r"C:\OLD.TXT".len(), 0).unwrap();
+        let mut regs = DosRegs {
+            ax: 0x3c00,
+            cx: 0,
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf);
+        assert_eq!(
+            std::fs::metadata(dir.path().join("OLD.TXT")).unwrap().len(),
+            0
+        );
     }
 }
