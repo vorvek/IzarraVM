@@ -146,10 +146,10 @@ pub struct Machine {
     resampler: Resampler,
     opl_micros: f64, // fractional microseconds owed to the OPL timers
     dsp: SbDsp,
-    /// DSP PCM resampler (rate_hz -> 44100); wired into render_audio in the
-    /// mixer slice.
-    #[allow(dead_code)]
+    /// DSP PCM resampler (rate_hz -> 44100), rebuilt when the programmed rate
+    /// changes. Summed with the OPL stream in render_audio.
     dsp_resampler: Resampler,
+    dsp_rate_hz: u32, // input rate the dsp_resampler is currently configured for
     dsp_micros: f64, // fractional microseconds owed to the DSP reset-settle clock
     margo_ns: f64,   // fractional nanoseconds owed to the Margo busy countdown
     vga_dots: f64,   // fractional VGA dot clocks owed to the beam advance
@@ -184,8 +184,10 @@ impl Machine {
             resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             opl_micros: 0.0,
             dsp: SbDsp::default(),
-            // The DSP resampler is rebuilt when the programmed rate changes.
+            // Placeholder; sync_dsp_resampler rebuilds this for the live rate on
+            // first use, so the value here never reaches the DAC as-is.
             dsp_resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
+            dsp_rate_hz: 0,
             dsp_micros: 0.0,
             margo_ns: 0.0,
             vga_dots: 0.0,
@@ -231,8 +233,10 @@ impl Machine {
             resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             opl_micros: 0.0,
             dsp: SbDsp::default(),
-            // The DSP resampler is rebuilt when the programmed rate changes.
+            // Placeholder; sync_dsp_resampler rebuilds this for the live rate on
+            // first use, so the value here never reaches the DAC as-is.
             dsp_resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
+            dsp_rate_hz: 0,
             dsp_micros: 0.0,
             margo_ns: 0.0,
             vga_dots: 0.0,
@@ -296,8 +300,10 @@ impl Machine {
             resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             opl_micros: 0.0,
             dsp: SbDsp::default(),
-            // The DSP resampler is rebuilt when the programmed rate changes.
+            // Placeholder; sync_dsp_resampler rebuilds this for the live rate on
+            // first use, so the value here never reaches the DAC as-is.
             dsp_resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
+            dsp_rate_hz: 0,
             dsp_micros: 0.0,
             margo_ns: 0.0,
             vga_dots: 0.0,
@@ -751,17 +757,44 @@ impl Machine {
         out
     }
 
-    /// Render `native_samples` of OPL3 output at 49716 Hz and return the
-    /// resampled 44100 Hz stereo PCM (saturated to 16-bit) ready for the DAC.
-    /// The caller paces this by elapsed emulated time to keep audio in step.
+    /// Rebuild the DSP resampler when the programmed sample rate changes, so it
+    /// always runs rate_hz -> 44100.
+    fn sync_dsp_resampler(&mut self) {
+        let rate = self.dsp.rate_hz().max(1);
+        if rate != self.dsp_rate_hz {
+            self.dsp_resampler = Resampler::new(rate, DAC_HZ);
+            self.dsp_rate_hz = rate;
+        }
+    }
+
+    /// Render `native_samples` of mixed OPL3 + SB16 DSP audio at the 44100 Hz DAC
+    /// rate (stereo, saturated to 16-bit). `native_samples` is counted in OPL
+    /// native (49716 Hz) time; the DSP is advanced by the matching wall-clock
+    /// duration at its own rate. Each stream is resampled to 44100 and summed.
     pub fn render_audio(&mut self, native_samples: usize) -> Vec<(i16, i16)> {
-        let native: Vec<(i32, i32)> = (0..native_samples)
+        let opl_native: Vec<(i32, i32)> = (0..native_samples)
             .map(|_| self.opl.render_sample())
             .collect();
-        self.resampler
-            .process(&native)
-            .into_iter()
-            .map(|(l, r)| (clamp_i16(l), clamp_i16(r)))
+        let opl_out = self.resampler.process(&opl_native);
+
+        self.sync_dsp_resampler();
+        // DSP native samples spanning the same wall-clock window as the OPL.
+        let dsp_native_count =
+            (native_samples as f64 * self.dsp.rate_hz() as f64 / OPL_NATIVE_HZ as f64).round()
+                as usize;
+        let dsp_mono = self.render_dsp_audio(dsp_native_count);
+        let dsp_stereo: Vec<(i32, i32)> = dsp_mono.iter().map(|&s| (s as i32, s as i32)).collect();
+        let dsp_out = self.dsp_resampler.process(&dsp_stereo);
+
+        // Sum over the longer length; a silent (idle) DSP yields no frames, so the
+        // OPL passes through unchanged when no DMA playback is armed.
+        let len = opl_out.len().max(dsp_out.len());
+        (0..len)
+            .map(|i| {
+                let (ol, or) = opl_out.get(i).copied().unwrap_or((0, 0));
+                let (dl, dr) = dsp_out.get(i).copied().unwrap_or((0, 0));
+                (clamp_i16(ol + dl), clamp_i16(or + dr))
+            })
             .collect()
     }
 
@@ -2055,6 +2088,60 @@ mod tests {
             "expected ~{DAC_HZ} frames, got {}",
             pcm.len()
         );
+    }
+
+    #[test]
+    fn render_audio_passes_through_when_the_dsp_is_idle() {
+        // No DMA playback armed: the DSP produces nothing, so render_audio must
+        // return the OPL-only output at the DAC rate (the existing contract).
+        let mut machine = test_machine();
+        let pcm = machine.render_audio(OPL_NATIVE_HZ as usize);
+        assert!(
+            (pcm.len() as i32 - DAC_HZ as i32).abs() < 50,
+            "idle DSP must not truncate the OPL stream, got {} frames",
+            pcm.len()
+        );
+    }
+
+    #[test]
+    fn render_audio_mixes_the_dsp_dc_level_with_the_opl() {
+        let mut machine = test_machine();
+        // A constant 256-byte DMA buffer; 0x40 maps to sample_u8(0x40) = -16384.
+        const BYTE: u8 = 0x40;
+        const EXPECTED: i32 = -16384; // (0x40 - 128) * 256
+        for i in 0..256u32 {
+            machine.write_physical_u8(0x1_0000 + i, BYTE);
+        }
+        with_bus(&mut machine, |bus| {
+            // DMA ch1: page 0x01, address 0, count 255, auto-init read.
+            bus.write_io(0x0B, BusWidth::Byte, 0x59).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0xFF).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x83, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x0A, BusWidth::Byte, 0x01).unwrap();
+            // DSP: 11025 Hz, block 256, auto-init 8-bit output.
+            for &b in &[0x41u8, 0x2B, 0x11, 0x48, 0xFF, 0x00, 0x1C] {
+                bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
+            }
+        });
+        // The OPL is silent (no voices keyed), so the steady output is the DSP DC
+        // level after the resampler warmup. Render plenty of OPL-native time.
+        let out = machine.render_audio(4_000);
+        assert!(!out.is_empty());
+        let mid = &out[out.len() / 3..out.len() * 2 / 3];
+        let (min_l, max_l) =
+            mid.iter()
+                .map(|f| f.0)
+                .fold((i16::MAX, i16::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
+        let center = (i32::from(min_l) + i32::from(max_l)) / 2;
+        assert!(
+            (center - EXPECTED).abs() < 400,
+            "DSP DC center {center}, expected ~{EXPECTED}"
+        );
+        // Mono is duplicated to both channels.
+        assert!(mid.iter().all(|f| f.0 == f.1), "DSP mono duplicated L/R");
     }
 
     #[test]
