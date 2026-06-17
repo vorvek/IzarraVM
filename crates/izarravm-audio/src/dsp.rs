@@ -150,7 +150,9 @@ impl SbDsp {
             }
             0x14 | 0x90 => self.arm_dma(false),
             0x1C => self.arm_dma(true),
-            // Halt/continue/exit (Task 6) and unknown commands: no-op for now.
+            0xD0 => self.playing = false, // halt DMA (position kept)
+            0xD4 => self.playing = true,  // continue DMA
+            0xDA => self.auto_init = false, // exit auto-init: stop at next TC
             _ => {}
         }
     }
@@ -176,6 +178,39 @@ impl SbDsp {
 
     pub fn block_remaining(&self) -> u32 {
         self.block_remaining
+    }
+
+    /// Produce one output sample for the current DMA byte, or None if idle.
+    /// `fetch` pulls the next DMA byte (the machine feeds the 8237A through it).
+    pub fn render_sample<F: FnMut() -> Option<u8>>(&mut self, mut fetch: F) -> Option<i16> {
+        if !self.playing {
+            return self.direct_dac_byte.map(sample_u8);
+        }
+        let byte = fetch()?;
+        self.block_remaining = self.block_remaining.saturating_sub(1);
+        // Half-buffer IRQ fires once, at the block midpoint.
+        if !self.half_reached && self.block_remaining <= self.block_size / 2 {
+            self.half_reached = true;
+            self.irq_pending = true;
+        }
+        if self.block_remaining == 0 {
+            // End-of-buffer IRQ. Auto-init reloads and keeps going; single mode stops.
+            self.irq_pending = true;
+            if self.auto_init {
+                self.block_remaining = self.block_size;
+                self.half_reached = false;
+            } else {
+                self.playing = false;
+            }
+        }
+        Some(sample_u8(byte))
+    }
+
+    /// Take and clear a pending half/end IRQ (cleared when the host reads 0x22E).
+    pub fn take_irq(&mut self) -> bool {
+        let pending = self.irq_pending;
+        self.irq_pending = false;
+        pending
     }
 
     /// Last byte written by a direct 8-bit DAC command (0x10).
@@ -215,6 +250,12 @@ impl SbDsp {
             _ => false,
         }
     }
+}
+
+/// Convert one 8-bit Sound Blaster PCM sample (unsigned) to a centered signed
+/// 16-bit value for the mixer: (byte - 128) * 256.
+fn sample_u8(byte: u8) -> i16 {
+    (i32::from(byte) - 128).clamp(-128, 127) as i16 * 256
 }
 
 #[cfg(test)]
@@ -299,5 +340,55 @@ mod tests {
         write_cmd(&mut dsp, &[0x48, 0x00, 0x01]); // 0x0100 -> 256
         write_cmd(&mut dsp, &[0x1C]); // 8-bit auto-init
         assert!(dsp.is_playing() && dsp.is_auto_init());
+    }
+
+    #[test]
+    fn render_sample_consumes_dma_bytes_and_edges_half_and_end_irqs() {
+        let mut dsp = SbDsp::default();
+        write_cmd(&mut dsp, &[0x41, 0x2B, 0x11]); // 11025 Hz
+        write_cmd(&mut dsp, &[0x48, 0x07, 0x00]); // block size 8
+        write_cmd(&mut dsp, &[0x1C]); // 8-bit auto-init
+        let pattern = [0x00u8, 0x40, 0x80, 0xC0, 0x00, 0x40, 0x80, 0xC0];
+        let mut irq_at: Vec<usize> = Vec::new();
+        for i in 1..=8 {
+            let byte = pattern[(i - 1) % pattern.len()];
+            let _ = dsp.render_sample(move || Some(byte));
+            if dsp.take_irq() {
+                irq_at.push(i);
+            }
+        }
+        // Half-buffer IRQ at the midpoint (4 consumed), end IRQ at TC (8 consumed).
+        assert_eq!(irq_at, vec![4, 8], "half at 4, end at 8");
+        // Auto-init reloads and keeps playing across terminal count.
+        assert!(dsp.is_playing(), "auto-init keeps playing past TC");
+    }
+
+    #[test]
+    fn single_mode_stops_at_end_of_block() {
+        let mut dsp = SbDsp::default();
+        write_cmd(&mut dsp, &[0x41, 0x2B, 0x11, 0x48, 0x01, 0x00, 0x14]); // block 2, single
+        let _ = dsp.render_sample(|| Some(0x80));
+        let _ = dsp.render_sample(|| Some(0x80)); // TC -> single stops
+        assert!(!dsp.is_playing(), "single mode halts after the block");
+    }
+
+    #[test]
+    fn halt_continue_and_exit_auto_init_commands_control_playback() {
+        let mut dsp = SbDsp::default();
+        write_cmd(&mut dsp, &[0x48, 0x07, 0x00, 0x1C]); // auto-init, block 8
+        assert!(dsp.is_playing() && dsp.is_auto_init());
+        write_cmd(&mut dsp, &[0xD0]); // halt
+        assert!(!dsp.is_playing());
+        write_cmd(&mut dsp, &[0xD4]); // continue
+        assert!(dsp.is_playing());
+        write_cmd(&mut dsp, &[0xDA]); // exit auto-init
+        assert!(!dsp.is_auto_init(), "exit-auto-init clears the mode");
+    }
+
+    #[test]
+    fn sample_u8_centers_unsigned_bytes() {
+        assert_eq!(sample_u8(0x00), -32_768, "0x00 -> full negative");
+        assert_eq!(sample_u8(0x80), 0, "0x80 -> silence");
+        assert_eq!(sample_u8(0xFF), 32_512, "0xFF -> near full positive");
     }
 }
