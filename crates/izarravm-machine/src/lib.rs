@@ -415,6 +415,12 @@ impl Machine {
             self.margo_active = false;
             return;
         }
+        // AH=00h, AL = a planar mode number this slice implements.
+        if (ax >> 8) == 0x00 && matches!(ax as u8, 0x0D | 0x0E | 0x10 | 0x12) {
+            self.video.set_mode(ax as u8);
+            self.margo_active = false;
+            return;
+        }
         if (ax >> 8) == 0x4f {
             self.handle_vbe(ax as u8);
         }
@@ -2507,5 +2513,40 @@ mod tests {
         assert_eq!(machine.video().raster_height(), 525);
 
         assert!(!machine.set_vga_mode(0x99));
+    }
+
+    #[test]
+    fn int10_sets_mode_12h_then_draws_and_presents_640x480() {
+        // mov ax, 0012h; int 10h; hlt
+        let rom = rom_with_code(&[0xb8, 0x12, 0x00, 0xcd, 0x10, 0xf4]);
+        let mut machine =
+            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(machine.active_display(), ActiveDisplay::VgaRaster);
+        assert_eq!(machine.video().raster_width(), 640);
+        assert_eq!(machine.video().raster_height(), 525);
+
+        // Draw attribute index 1 into the first byte of plane 0 (first 8 pixels of
+        // the top row) through the A0000 datapath, with an identity palette.
+        machine.video_mut().write_port(0x3C4, 0x02);
+        machine.video_mut().write_port(0x3C5, 0x01); // map mask = plane 0
+        machine.video_mut().write_port(0x3CE, 0x08);
+        machine.video_mut().write_port(0x3CF, 0xFF); // bit mask 0xFF
+        machine.write_physical_u8(0x000A_0000, 0xFF);
+        machine.video_mut().read_status1(); // reset attr flip-flop to index
+        for i in 0..16u8 {
+            machine.video_mut().write_port(0x3C0, i); // index
+            machine.video_mut().write_port(0x3C0, i); // palette[i] = i
+        }
+
+        // A 12h frame is 800 * 525 = 420 000 dots; 600 000 clocks (~604 000 dots)
+        // completes at least one frame.
+        machine.advance_devices(600_000);
+        let raster = machine.vga_raster().expect("a frame presented");
+        assert_eq!(raster.width, 640);
+        assert_eq!(raster.height, 525);
+        assert_eq!(raster.pixels[0], 1, "top-left pixel is attribute index 1");
     }
 }
