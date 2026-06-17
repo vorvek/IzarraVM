@@ -879,8 +879,10 @@ mod tests {
         // copy logic, no set/reset. Result per plane = (data & mask) | (latch & !mask)
         // = (0x0F & 0xF0) | (0xFF & 0x0F) = 0x00 | 0x0F = 0x0F.
         let mut planes = [[0u8; 1]; VGA_PLANES];
-        let mut gc = GfxController::default();
-        gc.bit_mask = 0xF0;
+        let gc = GfxController {
+            bit_mask: 0xF0,
+            ..Default::default()
+        };
         let latches = [0xFFu8; VGA_PLANES];
         write_planes(&mut planes, 0x0F, &gc, &latches);
         for p in &planes {
@@ -894,10 +896,12 @@ mod tests {
         // With full bit mask and copy, each enabled plane writes its set/reset bit
         // expanded to 0xFF or 0x00.
         let mut planes = [[0u8; 1]; VGA_PLANES];
-        let mut gc = GfxController::default();
-        gc.bit_mask = 0xFF;
-        gc.enable_set_reset = 0x0F;
-        gc.set_reset = 0b1010;
+        let gc = GfxController {
+            bit_mask: 0xFF,
+            enable_set_reset: 0x0F,
+            set_reset: 0b1010,
+            ..Default::default()
+        };
         let latches = [0u8; VGA_PLANES];
         write_planes(&mut planes, 0x00, &gc, &latches);
         assert_eq!(planes[0][0], 0x00);
@@ -909,8 +913,10 @@ mod tests {
     #[test]
     fn write_mode_1_copies_latches_to_planes() {
         let mut planes = [[0u8; 1]; VGA_PLANES];
-        let mut gc = GfxController::default();
-        gc.write_mode = 1;
+        let gc = GfxController {
+            write_mode: 1,
+            ..Default::default()
+        };
         let latches = [0x12, 0x34, 0x56, 0x78];
         write_planes(&mut planes, 0x00, &gc, &latches); // data ignored in WM1
         for plane in 0..VGA_PLANES {
@@ -921,9 +927,11 @@ mod tests {
     #[test]
     fn write_mode_2_expands_color_nibble_per_plane() {
         let mut planes = [[0u8; 1]; VGA_PLANES];
-        let mut gc = GfxController::default();
-        gc.write_mode = 2;
-        gc.bit_mask = 0xFF;
+        let gc = GfxController {
+            write_mode: 2,
+            bit_mask: 0xFF,
+            ..Default::default()
+        };
         let latches = [0u8; VGA_PLANES];
         write_planes(&mut planes, 0b0101, &gc, &latches); // planes 0 and 2 set
         assert_eq!(planes[0][0], 0xFF);
@@ -938,11 +946,13 @@ mod tests {
         // Set/Reset 0b0011 -> planes 0,1 color 0xFF, planes 2,3 color 0x00.
         // Result = (color & 0xF0) | (latch 0 & 0x0F).
         let mut planes = [[0u8; 1]; VGA_PLANES];
-        let mut gc = GfxController::default();
-        gc.write_mode = 3;
-        gc.set_reset = 0b0011;
-        gc.bit_mask = 0xFF;
-        gc.rotate = 0;
+        let gc = GfxController {
+            write_mode: 3,
+            set_reset: 0b0011,
+            bit_mask: 0xFF,
+            rotate: 0,
+            ..Default::default()
+        };
         let latches = [0u8; VGA_PLANES];
         write_planes(&mut planes, 0xF0, &gc, &latches);
         assert_eq!(planes[0][0], 0xF0);
@@ -954,8 +964,10 @@ mod tests {
     #[test]
     fn read_mode_0_returns_selected_plane_and_loads_latches() {
         let planes = [[0x11u8; 1], [0x22u8; 1], [0x33u8; 1], [0x44u8; 1]];
-        let mut gc = GfxController::default();
-        gc.read_map = 2;
+        let gc = GfxController {
+            read_map: 2,
+            ..Default::default()
+        };
         let mut latches = [0u8; VGA_PLANES];
         let byte = read_planes(&planes, &gc, &mut latches);
         assert_eq!(byte, 0x33);
@@ -965,10 +977,12 @@ mod tests {
     #[test]
     fn read_mode_1_color_compares_each_bit() {
         let planes = [[0xFFu8; 1], [0x00u8; 1], [0xFFu8; 1], [0x00u8; 1]];
-        let mut gc = GfxController::default();
-        gc.read_mode = 1;
-        gc.color_dont_care = 0x0F; // care about all four planes
-        gc.color_compare = 0b0101; // planes 0 and 2 set, 1 and 3 clear
+        let gc = GfxController {
+            read_mode: 1,
+            color_dont_care: 0x0F, // care about all four planes
+            color_compare: 0b0101, // planes 0 and 2 set, 1 and 3 clear
+            ..Default::default()
+        };
         let mut latches = [0u8; VGA_PLANES];
         let byte = read_planes(&planes, &gc, &mut latches);
         assert_eq!(byte, 0xFF); // every bit position matches the pattern
