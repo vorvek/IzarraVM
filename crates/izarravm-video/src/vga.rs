@@ -32,6 +32,7 @@ pub struct CrtcTiming {
     pub offset: u32,
     pub mode_control: u8,  // CRTC index 17h
     pub underline_loc: u8, // CRTC index 14h
+    pub line_compare: u32, // assembled 10-bit value: CRTC 18h + 07h.4 + 09h.6
 }
 
 impl CrtcTiming {
@@ -54,6 +55,7 @@ impl CrtcTiming {
             offset: 80,
             mode_control: 0xA3,
             underline_loc: 0x00,
+            line_compare: 0x3FF,
         }
     }
 
@@ -75,6 +77,7 @@ impl CrtcTiming {
             offset: 20,
             mode_control: 0xE3,
             underline_loc: 0x00,
+            line_compare: 0x3FF,
         }
     }
 
@@ -97,6 +100,7 @@ impl CrtcTiming {
             offset: 40,
             mode_control: 0xE3,
             underline_loc: 0x00,
+            line_compare: 0x3FF,
         }
     }
 
@@ -118,6 +122,7 @@ impl CrtcTiming {
             offset: 40,
             mode_control: 0xE3,
             underline_loc: 0x00,
+            line_compare: 0x3FF,
         }
     }
 
@@ -139,6 +144,7 @@ impl CrtcTiming {
             offset: 40,
             mode_control: 0xE3,
             underline_loc: 0x00,
+            line_compare: 0x3FF,
         }
     }
 
@@ -646,6 +652,15 @@ impl Vga {
             0x13 => self.crtc.offset = u32::from(value),
             0x14 => self.crtc.underline_loc = value,
             0x17 => self.crtc.mode_control = value,
+            0x18 => self.crtc.line_compare = (self.crtc.line_compare & !0xFF) | u32::from(value),
+            0x07 => {
+                self.crtc.line_compare =
+                    (self.crtc.line_compare & !0x100) | (u32::from((value >> 4) & 1) << 8);
+            }
+            0x09 => {
+                self.crtc.line_compare =
+                    (self.crtc.line_compare & !0x200) | (u32::from((value >> 6) & 1) << 9);
+            }
             _ => {} // full timing programmed via set_mode_0dh in slice 1
         }
     }
@@ -907,6 +922,27 @@ mod tests {
         vga.write_port(0x3D4, 0x14); // CRTC index 14h
         vga.write_port(0x3D5, 0x40); // doubleword bit
         assert_eq!(vga.crtc.underline_loc, 0x40);
+    }
+
+    #[test]
+    fn line_compare_registers_assemble_ten_bits_and_default_per_mode() {
+        let mut vga = Vga::default();
+        vga.set_mode_0dh();
+        // 16-color planar modes power up with the split disabled (line compare 0x3FF).
+        assert_eq!(vga.crtc.line_compare, 0x3FF);
+        // Assemble a split at scanline 0x150: low byte via 18h, bit 8 set via the
+        // Overflow register 07h bit 4, bit 9 cleared via the Maximum Scan Line 09h bit 6.
+        vga.write_port(0x3D4, 0x18);
+        vga.write_port(0x3D5, 0x50);
+        vga.write_port(0x3D4, 0x07);
+        vga.write_port(0x3D5, 0x10); // bit 4 set -> line compare bit 8 = 1
+        vga.write_port(0x3D4, 0x09);
+        vga.write_port(0x3D5, 0x00); // bit 6 clear -> line compare bit 9 = 0
+        assert_eq!(vga.crtc.line_compare, 0x150);
+        // Clearing the overflow bit 4 drops line compare bit 8.
+        vga.write_port(0x3D4, 0x07);
+        vga.write_port(0x3D5, 0x00);
+        assert_eq!(vga.crtc.line_compare, 0x050);
     }
 
     #[test]
