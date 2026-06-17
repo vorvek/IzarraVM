@@ -27,7 +27,7 @@ it. What is in:
 | Planar memory | Four-plane model, write modes 0–3, read modes 0–1, latches, data-rotate/ALU, Map Mask, Bit Mask, Set/Reset |
 | Sequencer (`3C4/3C5`) | Map Mask (2), Memory Mode (4); Clocking Mode (1) char-width feeds the dot count |
 | Graphics Ctrl (`3CE/3CF`) | Set/Reset (0), Enable Set/Reset (1), Color Compare (2), Data Rotate/Function (3), Read Map (4), Mode (5), Color Don't Care (7), Bit Mask (8) |
-| Attribute (`3C0`) | 16 palette entries, Mode Control (10h), Overscan (11h), Plane Enable (12h), Pixel Pan (13h), Color Select (14h); the `3DA` flip-flop reset |
+| Attribute (`3C0`) | 16 palette entries, Mode Control (10h), Overscan (11h), Pixel Pan (13h); the `3DA` flip-flop reset. Plane Enable (12h) and Color Select (14h) are **stored, not yet applied** (unused in mode 0Dh; applying 12h's default 0 would blank the screen) |
 | CRTC (`3D4/3D5`) | Start Address Hi/Lo (0C/0D), Offset (13h), text cursor (0E/0F); full vertical timing carried in `CrtcTiming` |
 | DAC (`3C7/3C8/3C9`) | Read/write index + 6-bit RGB data |
 | Status (`3DA`) | Display-disabled (bit 0), vertical retrace (bit 3), beam-derived |

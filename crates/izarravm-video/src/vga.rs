@@ -192,6 +192,7 @@ impl Vga {
         self.beam = 0;
         self.last_line = 0;
         self.mode = VideoMode::Planar;
+        self.presented = None; // drop any stale frame from a prior mode
         self.resize_work();
     }
 
@@ -233,7 +234,7 @@ impl Vga {
         // byte pitch per plane = 2 * offset register
         let row_base = self.crtc.start_address as usize
             + src_line as usize * self.crtc.offset as usize * 2;
-        for x in 0..width {
+        for (x, slot) in row.iter_mut().enumerate() {
             let px = x + pan;
             let byte = px / 8;
             let bit = 7 - (px % 8);
@@ -243,7 +244,7 @@ impl Vga {
                 let b = self.vram[plane * VGA_PLANE_SIZE + off];
                 index |= ((b >> bit) & 1) << plane;
             }
-            row[x] = self.attr.palette[index as usize] & 0x3F;
+            *slot = self.attr.palette[index as usize] & 0x3F;
         }
         row
     }
@@ -295,11 +296,16 @@ impl Vga {
             self.render_scanline(self.last_line);
             self.last_line += 1;
         }
-        self.presented = Some(VgaRaster {
-            width: self.raster_width(),
-            height: self.raster_height(),
-            pixels: self.work.clone(),
-        });
+        // `work` is sized only in planar mode; text/13h leave it empty, so a frame
+        // built from it would have a pixel count that mismatches width*height. Only
+        // publish a raster when there is real planar content to show.
+        if !self.work.is_empty() {
+            self.presented = Some(VgaRaster {
+                width: self.raster_width(),
+                height: self.raster_height(),
+                pixels: self.work.clone(),
+            });
+        }
         if let Some(addr) = self.pending_start.take() {
             self.crtc.start_address = addr; // latched for the next frame
         }
@@ -314,6 +320,12 @@ impl Vga {
         self.presented.take()
     }
 
+    /// The most recent finalized frame, read without consuming it. A host polling
+    /// faster than frames complete keeps seeing the last frame instead of black.
+    pub fn last_presented(&self) -> Option<&VgaRaster> {
+        self.presented.as_ref()
+    }
+
     /// Advance the beam by whole dots, rolling over each completed frame
     /// arithmetically (O(1)).
     pub fn advance(&mut self, dots: u64) {
@@ -324,6 +336,9 @@ impl Vga {
         let total = self.beam + dots;
         let crossed = total / frame;
         if crossed > 0 {
+            if crossed > 1 {
+                self.last_line = 0; // skipped frames: the final frame is a full render
+            }
             self.finalize_frame(); // finalize only the final completed frame
             self.frames += crossed;
         }
@@ -336,16 +351,16 @@ impl Vga {
 
     fn plane_slice_mut(&mut self, offset: usize) -> [[u8; 1]; VGA_PLANES] {
         let mut planes = [[0u8; 1]; VGA_PLANES];
-        for plane in 0..VGA_PLANES {
-            planes[plane][0] = self.vram[plane * VGA_PLANE_SIZE + offset];
+        for (plane, slot) in planes.iter_mut().enumerate() {
+            slot[0] = self.vram[plane * VGA_PLANE_SIZE + offset];
         }
         planes
     }
 
     fn store_planes(&mut self, offset: usize, planes: &[[u8; 1]; VGA_PLANES]) {
-        for plane in 0..VGA_PLANES {
+        for (plane, slot) in planes.iter().enumerate() {
             if (self.seq.map_mask >> plane) & 1 != 0 {
-                self.vram[plane * VGA_PLANE_SIZE + offset] = planes[plane][0];
+                self.vram[plane * VGA_PLANE_SIZE + offset] = slot[0];
             }
         }
     }
@@ -370,13 +385,6 @@ impl Vga {
         read_planes(&planes, &gc, &mut self.latches)
     }
 
-    /// Read Input Status Register 1 (port 3DAh).
-    ///
-    /// Bit 0: display disabled (beam is in blank or retrace).
-    /// Bit 3: vertical retrace active.
-    ///
-    /// Reading this register also resets the Attribute Controller address/data
-    /// flip-flop so that the next write to 3C0 is treated as an index.
     /// Buffer a CRTC start-address change. The value is latched into the active
     /// start address at the next frame boundary (finalize_frame), so mid-frame
     /// writes do not tear.
@@ -384,7 +392,15 @@ impl Vga {
         self.pending_start = Some(addr); // snapshot at next vretrace (finalize)
     }
 
+    /// Read Input Status Register 1 (port 3DAh).
+    ///
+    /// Bit 0: display disabled (beam is in blank or retrace).
+    /// Bit 3: vertical retrace active.
+    ///
+    /// Reading this register also resets the Attribute Controller address/data
+    /// flip-flop so that the next write to 3C0 is treated as an index.
     pub fn read_status1(&mut self) -> u8 {
+        self.catch_up(); // a 3DA read catches the raster up, like a register write
         self.attr.flip_flop_data = false; // reading 3DA resets the flip-flop
         let mut status = 0u8;
         if !beam_display_enable(&self.crtc, self.beam) {
@@ -608,11 +624,11 @@ pub fn read_planes(
     let mut result = 0u8;
     for bit in 0..8 {
         let mut matches = true;
-        for plane in 0..VGA_PLANES {
+        for (plane, slot) in planes.iter().enumerate() {
             if (gc.color_dont_care >> plane) & 1 == 0 {
                 continue;
             }
-            let plane_bit = (planes[plane][0] >> bit) & 1;
+            let plane_bit = (slot[0] >> bit) & 1;
             let cmp_bit = (gc.color_compare >> plane) & 1;
             if plane_bit != cmp_bit {
                 matches = false;

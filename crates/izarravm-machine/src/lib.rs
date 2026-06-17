@@ -361,7 +361,10 @@ impl Machine {
     }
 
     pub fn is_graphics_mode(&self) -> bool {
-        self.video.active_mode() == VideoMode::Mode13h
+        matches!(
+            self.video.active_mode(),
+            VideoMode::Mode13h | VideoMode::Planar
+        )
     }
 
     pub fn margo(&self) -> &Margo {
@@ -572,7 +575,7 @@ impl Machine {
     }
 
     pub fn vga_raster(&mut self) -> Option<VgaRaster> {
-        self.video.take_presented()
+        self.video.last_presented().cloned()
     }
 
     pub fn palette_argb(&self) -> [u32; DAC_ENTRIES] {
