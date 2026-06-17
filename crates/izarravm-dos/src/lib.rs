@@ -1,6 +1,7 @@
 use izarravm_bus::{BusError, Memory};
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -273,6 +274,37 @@ impl DosKernel {
                     }
                     Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
                 }
+                Ok(DosAction::Continue)
+            }
+            // AH=3Fh: read CX bytes from the handle in BX into the buffer at
+            // DS:DX. Returns CF=0 + AX=bytes-read (0 = EOF) on success, CF=1 +
+            // AX=0x06 for an unknown handle. A host read error maps to a DOS code;
+            // a guest-memory write fault propagates as DosError::Memory.
+            0x3f => {
+                let handle = regs.bx;
+                let count = usize::from(regs.cx);
+                let Some(file) = self.open_files.get_mut(&handle) else {
+                    set_dos_error(regs, 0x06);
+                    return Ok(DosAction::Continue);
+                };
+                let mut buffer = vec![0u8; count];
+                let mut filled = 0usize;
+                while filled < count {
+                    match file.read(&mut buffer[filled..]) {
+                        Ok(0) => break,
+                        Ok(n) => filled += n,
+                        Err(err) => {
+                            set_dos_error(regs, dos_io_error_code(&err));
+                            return Ok(DosAction::Continue);
+                        }
+                    }
+                }
+                let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+                for (index, &byte) in buffer[..filled].iter().enumerate() {
+                    mem.write_u8(base + index, byte)?;
+                }
+                regs.ax = filled as u16;
+                regs.cf = false;
                 Ok(DosAction::Continue)
             }
             // AH=4Ch: terminate with the return code in AL.
@@ -705,5 +737,72 @@ mod tests {
         let regs = open(&mut kernel, &mut mem);
         assert!(regs.cf);
         assert_eq!(regs.ax, 0x03);
+    }
+
+    /// Open DATA.TXT and return the handle (asserts the open succeeded).
+    fn open_data(kernel: &mut DosKernel, mem: &mut Memory) -> u16 {
+        let regs = open(kernel, mem);
+        assert!(!regs.cf, "open failed: ax={:#06x}", regs.ax);
+        regs.ax
+    }
+
+    fn read(
+        kernel: &mut DosKernel,
+        mem: &mut Memory,
+        handle: u16,
+        count: u16,
+        dst: u16,
+    ) -> DosRegs {
+        let mut regs = DosRegs {
+            ax: 0x3f00,
+            bx: handle,
+            cx: count,
+            ds: 0x0100,
+            dx: dst,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, mem).unwrap();
+        regs
+    }
+
+    #[test]
+    fn reads_file_bytes_into_guest_memory() {
+        let (mut kernel, mut mem, _dir) =
+            kernel_with_drive(&[("DATA.TXT", b"hello")], r"C:\DATA.TXT");
+        let handle = open_data(&mut kernel, &mut mem);
+        let regs = read(&mut kernel, &mut mem, handle, 16, 0x0400);
+        assert!(!regs.cf);
+        assert_eq!(regs.ax, 5); // 5 bytes read
+        let base = 0x0100usize * 16 + 0x0400;
+        let got: Vec<u8> = (0..5).map(|i| mem.read_u8(base + i).unwrap()).collect();
+        assert_eq!(got, b"hello");
+    }
+
+    #[test]
+    fn reads_in_chunks_then_eof() {
+        let (mut kernel, mut mem, _dir) =
+            kernel_with_drive(&[("DATA.TXT", b"abcdef")], r"C:\DATA.TXT");
+        let handle = open_data(&mut kernel, &mut mem);
+        let first = read(&mut kernel, &mut mem, handle, 4, 0x0400);
+        assert_eq!(first.ax, 4);
+        let second = read(&mut kernel, &mut mem, handle, 4, 0x0410);
+        assert_eq!(second.ax, 2); // only 2 left
+        let third = read(&mut kernel, &mut mem, handle, 4, 0x0420);
+        assert_eq!(third.ax, 0); // EOF
+        assert!(!third.cf);
+        let base = 0x0100usize * 16 + 0x0400;
+        let chunk0: Vec<u8> = (0..4).map(|i| mem.read_u8(base + i).unwrap()).collect();
+        assert_eq!(chunk0, b"abcd");
+        let base1 = 0x0100usize * 16 + 0x0410;
+        let chunk1: Vec<u8> = (0..2).map(|i| mem.read_u8(base1 + i).unwrap()).collect();
+        assert_eq!(chunk1, b"ef");
+    }
+
+    #[test]
+    fn read_invalid_handle_sets_ax06() {
+        let (mut kernel, mut mem, _dir) = kernel_with_drive(&[("DATA.TXT", b"hi")], r"C:\DATA.TXT");
+        let regs = read(&mut kernel, &mut mem, 99, 16, 0x0400);
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x06);
     }
 }
