@@ -3043,6 +3043,69 @@ mod tests {
     }
 
     #[test]
+    fn pusher_streams_color_expand_data_through_the_ring() {
+        let mut machine = test_machine();
+        // The pusher arms COLOR_EXPAND_DATA and then streams its MONO_DATA words from
+        // the ring. This works only because the pump gates on busy_ns (arming leaves
+        // busy_ns at 0, so the pump keeps feeding the stream) rather than STATUS.BUSY.
+        // An 8x2 glyph at (0,0), depth 1, pitch 8, FG 0xAB, BG 0x00, ROP SRCCOPY: row
+        // 0 bits 0xA0 (x=0,2 set), row 1 bits 0x50 (x=1,3 set); MONO_DATA is MSB-first
+        // in the high byte. Each MONO_DATA word is its own packet (the port is a single
+        // register at 0x0160, so a count>1 run would scatter to 0x0164 and beyond).
+        let ring_base = 0x0001_0000u32;
+        let ring: [u32; 22] = [
+            (2 << 16) | 0x0100,
+            0, // DST_BASE = 0
+            8, // DST_PITCH = 8
+            (1 << 16) | 0x0110,
+            1, // DEPTH = 1
+            (1 << 16) | 0x0114,
+            0, // DST_XY = (0, 0)
+            (1 << 16) | 0x011c,
+            (2 << 16) | 8, // DIM: h=2, w=8
+            (2 << 16) | 0x0120,
+            0xab, // FG_COLOR
+            0x00, // BG_COLOR
+            (1 << 16) | 0x0128,
+            0xcc, // ROP = SRCCOPY (S = expanded pixel)
+            (1 << 16) | 0x0130,
+            0, // FLAGS = 0 (clear bits painted with BG)
+            (1 << 16) | 0x0150,
+            0x03, // COMMAND = COLOR_EXPAND_DATA (arms the stream; no busy_ns yet)
+            (1 << 16) | 0x0160,
+            0xa000_0000, // MONO_DATA row 0: bits 0xA0 in the high byte
+            (1 << 16) | 0x0160,
+            0x5000_0000, // MONO_DATA row 1: bits 0x50 in the high byte
+        ];
+        for (i, word) in ring.iter().enumerate() {
+            for (b, byte) in word.to_le_bytes().into_iter().enumerate() {
+                machine.write_physical_u8(ring_base + (i * 4 + b) as u32, byte);
+            }
+        }
+        let put = (ring.len() * 4) as u32; // 88
+
+        write_mmio_reg(&mut machine, 0x84, ring_base); // PUSH_BASE
+        write_mmio_reg(&mut machine, 0x88, 0x1000); // PUSH_SIZE
+        write_mmio_reg(&mut machine, 0x80, 1); // PUSH_CTRL = ENABLE
+        write_mmio_reg(&mut machine, 0x8c, put); // PUSH_PUT = doorbell
+
+        machine.advance_devices(1);
+
+        // Row 0: set bits at x=0,2 -> 0xAB; clear bits -> 0x00 (BG).
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE), 0xab); // (0,0)
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 1), 0x00); // (1,0)
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 2), 0xab); // (2,0)
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 3), 0x00); // (3,0)
+        // Row 1: set bits at x=1,3 -> 0xAB.
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 8), 0x00); // (0,1)
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 9), 0xab); // (1,1)
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 10), 0x00); // (2,1)
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 11), 0xab); // (3,1)
+        // The whole ring drained.
+        assert_eq!(read_mmio_reg(&mut machine, 0x90), put);
+    }
+
+    #[test]
     fn dos_program_startup_services() {
         // org 0x100:
         //   mov ah,0x30 / int 0x21            ; get version (AL=6, AH=10), no fault
