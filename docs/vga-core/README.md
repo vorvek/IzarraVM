@@ -33,10 +33,9 @@ it. What is in:
 | Status (`3DA`) | Display-disabled (bit 0), vertical retrace (bit 3), beam-derived |
 | Beam | Cycle-coupled dot clock, catch-up rasterization, per-frame finalize |
 
-Deferred to later slices: pel-pan smooth-scroll polish, mode-X / unchained
-256-color, the bad-card mid-scanline latch (shake) reproduction,
-pixel-granular catch-up, and mid-frame Vertical-Display-End / blank-register
-tricks.
+Deferred to later slices: pel-pan smooth-scroll polish, the bad-card
+mid-scanline latch (shake) reproduction, pixel-granular catch-up, and
+mid-frame Vertical-Display-End / blank-register tricks.
 
 ## Slice 2 coverage
 
@@ -82,8 +81,8 @@ which it wraps now match hardware.
 | Wrap | 16-bit counter wraps at 64 KB per plane; one counter value addresses all four parallel 64 KB planes, so this is the 256 KB display wraparound |
 | Registers | CR17 (Mode Control) and CR14 (Underline Location) are live state on `CrtcTiming`, defaulted per mode (16-color planar = 0xE3 byte mode) and writable through 3D4/3D5 |
 
-Scope: 16-color planar modes only. Mode-X / unchained 256-color and its wrap stay
-deferred to the mode-X slice. The done-signal is the seam: wrapped scanout pixels
+Scope: 16-color planar modes only. Mode-X / unchained 256-color wrap landed in
+slice 5. The done-signal is the seam: wrapped scanout pixels
 EQUAL the top-of-VRAM pixels (`vga::tests::byte_mode_wrap_scanout_equals_top_of_vram`
 and `display_address_wrap_seam_through_the_machine`).
 
@@ -153,6 +152,57 @@ Divergences (fidelity directive):
    CRTC 08h byte panning is not modeled, so it is not reset at the split; the bottom
    region restarts row counting at `line_compare + 1` without a sub-double-scan-row
    phase offset.
+
+## Slice 5 coverage
+
+Slice 5 adds the unchained 256-color planar modes: classic Mode X (320x240, square
+pixels) and 320x200 unchained (mode Y). Unlike the chained mode 13h (a flat linear
+64000-byte buffer), these run the 256 KB planar memory with chain-4 off, so each
+pixel is a full 8-bit DAC index living in one of four column-interleaved planes.
+
+| Area | Covered in slice 5 |
+|------|--------------------|
+| Entry | A guest write clearing the Sequencer Memory Mode (04h) chain-4 bit while in mode 13h enters `VideoMode::ModeX` with a 320x200 unchained base; setting the bit again reverts to chained mode 13h |
+| Geometry | Honored guest CRTC vertical timing (06h/07h/09h/10h/11h/12h/15h/16h) via a raw register file and `recompute_vertical_timing`, so Abrash's bang retunes to 320x240 (vtotal 527, vdisp_end 480, 240 source rows double-scanned to 480) and a bare mode Y stays 320x200 |
+| Scanout | `render_modex_row`: `plane = x & 3`, plane offset `row_base + (x >> 2)`, the byte as the 8-bit DAC index directly (no attribute palette, no 6-bit mask) |
+| Writes | The existing planar datapath (Map Mask + write modes + latches); the A0000 planar aperture is the full 64 KB |
+| Page flipping | The existing start-address vretrace latch; `render_modex_row` bases `row_base` on it |
+| Presentation | The `VgaRaster` path, pixels resolved through the 256-entry DAC |
+
+The semantics are pinned to Abrash's Graphics Programming Black Book chapters 47-49
+("Mode X"), the origin of the mode (Listing 47.1's 320x240 register dump). The
+done-signal is equality: an unchained pixel written at column x scans out at column
+x with its full 8-bit value, and the guest's CRTC bang yields a 320x240 raster,
+proven at unit (`vga::tests::mode_x_scanout_is_column_interleaved_8bit_direct`,
+`guest_crtc_bang_retunes_mode_x_to_320x240`) and end-to-end
+(`mode_x_320x240_through_the_machine`) levels.
+
+Target, honesty note: the 320x240 register sequence is Abrash's de-facto-standard
+primary source. The released id Wolfenstein 3D source (`WOLFSRC/ID_VL.C`) runs
+unchained (chain-4 = 0), the mode-Y 320x200 variant; the 320x240 workload is the
+pinball / double-buffered 256-color genre (Pinball Illusions at 320x240). No
+released-source 320x240 title was inspected.
+
+Divergences (fidelity directive):
+
+1. **Mode X combined with the line-compare split is not modeled.** The split (slice
+   4) applies to the 16-color render path; extending it to the mode-X scanout is
+   deferred.
+2. **Mode-X pel-pan is not modeled.** The 8-bit 256-color pixel pan is deferred;
+   byte-granular start-address scroll and page flipping (the primary mode-X
+   mechanism) are modeled.
+3. **Only the chain-4 to unchained-planar transition is modeled,** not the full
+   odd/even host-addressing matrix.
+4. **The 256-color byte is the DAC index directly.** Attribute Mode Control bit 6
+   (the 8-bit-color gate) is not modeled as a separate switch; unchained 256-color
+   implies it.
+5. **Exact 320x240 blank and retrace offsets follow the guest's registers,** with
+   the end fields as line-counter compares; the load-bearing fields are 320x240
+   resolution, 60 Hz, double-scan, and pitch.
+6. **The CRTC End Vertical Retrace (11h) write-protect bit (bit 7) is not enforced.**
+   When set, real hardware locks CRTC registers 00h-07h against further writes; the
+   core honors all subsequent vertical-timing writes regardless. No in-scope mode-X
+   setup depends on the protection.
 
 ## Latch rules
 
