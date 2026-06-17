@@ -664,28 +664,6 @@ mod tests {
     }
 
     #[test]
-    fn margo_lfb_renderer_maps_indices_through_palette() {
-        let display = izarravm_video::MargoDisplay {
-            mode: 0x0101,
-            width: 4,
-            height: 2,
-            bpp: 8,
-            pitch: 4,
-            start: 0,
-        };
-        // Scanout is already decoded to ARGB; pixel (1,0) is a distinct color.
-        let mut scanout = [0u32; 8];
-        scanout[1] = 0x0012_3456;
-
-        let rendered = render_margo_lfb(display, &scanout);
-
-        assert_eq!(rendered.width, 4 * MARGO_LFB_SCALE);
-        assert_eq!(rendered.height, 2 * MARGO_LFB_SCALE);
-        // Source pixel (1,0) fans out to a block starting at x=MARGO_LFB_SCALE.
-        assert_eq!(rendered.pixels[MARGO_LFB_SCALE], 0x0012_3456);
-    }
-
-    #[test]
     fn render_margo_lfb_scales_decoded_pixels() {
         let display = MargoDisplay {
             width: 2,
