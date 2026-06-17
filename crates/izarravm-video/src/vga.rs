@@ -37,22 +37,38 @@ impl CrtcTiming {
     /// beam math is valid before any graphics mode-set.
     pub fn text_03h() -> Self {
         Self {
-            htotal_chars: 100, char_width: 9, hdisp_end: 720,
-            vtotal: 449, vdisp_end: 400, vblank_start: 407, vblank_end: 442,
-            vretrace_start: 412, vretrace_end: 414,
-            max_scan: 15, double_scan: false,
-            start_address: 0, offset: 80,
+            htotal_chars: 100,
+            char_width: 9,
+            hdisp_end: 720,
+            vtotal: 449,
+            vdisp_end: 400,
+            vblank_start: 407,
+            vblank_end: 442,
+            vretrace_start: 412,
+            vretrace_end: 414,
+            max_scan: 15,
+            double_scan: false,
+            start_address: 0,
+            offset: 80,
         }
     }
 
     /// Mode 0Dh: 320x200x16 planar, 70 Hz, double-scanned, 8-dot chars.
     pub fn mode_0dh() -> Self {
         Self {
-            htotal_chars: 100, char_width: 8, hdisp_end: 320,
-            vtotal: 449, vdisp_end: 400, vblank_start: 407, vblank_end: 442,
-            vretrace_start: 412, vretrace_end: 414,
-            max_scan: 1, double_scan: true,
-            start_address: 0, offset: 20,
+            htotal_chars: 100,
+            char_width: 8,
+            hdisp_end: 320,
+            vtotal: 449,
+            vdisp_end: 400,
+            vblank_start: 407,
+            vblank_end: 442,
+            vretrace_start: 412,
+            vretrace_end: 414,
+            max_scan: 1,
+            double_scan: true,
+            start_address: 0,
+            offset: 20,
         }
     }
 
@@ -71,12 +87,12 @@ pub struct Sequencer {
 /// Attribute Controller register block (3C0/3C1).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Attribute {
-    pub palette: [u8; 16], // idx 0..15
-    pub mode_control: u8,  // idx 0x10
-    pub overscan: u8,      // idx 0x11
-    pub plane_enable: u8,  // idx 0x12
-    pub pixel_pan: u8,     // idx 0x13, low 4 bits
-    pub color_select: u8,  // idx 0x14
+    pub palette: [u8; 16],    // idx 0..15
+    pub mode_control: u8,     // idx 0x10
+    pub overscan: u8,         // idx 0x11
+    pub plane_enable: u8,     // idx 0x12
+    pub pixel_pan: u8,        // idx 0x13, low 4 bits
+    pub color_select: u8,     // idx 0x14
     pub flip_flop_data: bool, // false = next 3C0 write is an index
     pub index: u8,
 }
@@ -200,12 +216,15 @@ impl Vga {
         self.crtc.hdisp_end
     }
 
-    fn scan_factor(&self) -> u32 { if self.crtc.double_scan { 2 } else { 1 } }
+    fn scan_factor(&self) -> u32 {
+        if self.crtc.double_scan { 2 } else { 1 }
+    }
 
-    /// Full visible frame height in raster (doubled) lines: the whole vtotal span,
-    /// with blank rendered black so a short raster's letterbox is present.
+    /// Full visible frame height in raster lines. One raster row per scanline, so
+    /// this is `vtotal`; double-scan divides the source address (see
+    /// `render_active_row`) rather than multiplying the output.
     pub fn raster_height(&self) -> u32 {
-        self.crtc.vtotal * self.scan_factor()
+        self.crtc.vtotal
     }
 
     fn resize_work(&mut self) {
@@ -225,15 +244,18 @@ impl Vga {
         drawn
     }
 
-    /// Assemble one active scanline (`src_line` in undoubled active space) into
-    /// `hdisp_end` DAC indices, applying pel-pan and the attribute palette.
-    pub fn render_active_row(&self, src_line: u32) -> Vec<u8> {
+    /// Assemble one active scanline into `hdisp_end` DAC indices, applying pel-pan
+    /// and the attribute palette. `counter_line` is the scanline in scan-counter
+    /// units; double-scan maps it to source row `counter_line / scan_factor`, so a
+    /// doubled mode holds each VRAM row for two scanlines.
+    pub fn render_active_row(&self, counter_line: u32) -> Vec<u8> {
         let width = self.crtc.hdisp_end as usize;
         let pan = (self.attr.pixel_pan & 0x0F) as usize;
         let mut row = vec![0u8; width];
+        let source_row = counter_line / self.scan_factor();
         // byte pitch per plane = 2 * offset register
-        let row_base = self.crtc.start_address as usize
-            + src_line as usize * self.crtc.offset as usize * 2;
+        let row_base =
+            self.crtc.start_address as usize + source_row as usize * self.crtc.offset as usize * 2;
         for (x, slot) in row.iter_mut().enumerate() {
             let px = x + pan;
             let byte = px / 8;
@@ -258,23 +280,20 @@ impl Vga {
         }
     }
 
-    /// Render one undoubled counter line, emitting `scan_factor` doubled raster
-    /// rows. `catch_up` and `render_full_frame` both work in counter lines, the
-    /// same space the beam counts in.
+    /// Render one scanline (counter line) into a single raster row. Active lines
+    /// come from the planes; below `vdisp_end` the row is the border or blank
+    /// color. `catch_up` and `render_full_frame` both step in counter lines, the
+    /// space the beam counts in.
     fn render_scanline(&mut self, counter_line: u32) {
-        let factor = self.scan_factor();
         let width = self.raster_width() as usize;
         let pixels = if counter_line < self.crtc.vdisp_end {
             self.render_active_row(counter_line)
         } else {
             vec![self.region_color(counter_line); width]
         };
-        for sub in 0..factor {
-            let raster_line = counter_line * factor + sub;
-            let dst = raster_line as usize * width;
-            if dst + width <= self.work.len() {
-                self.work[dst..dst + width].copy_from_slice(&pixels);
-            }
+        let dst = counter_line as usize * width;
+        if dst + width <= self.work.len() {
+            self.work[dst..dst + width].copy_from_slice(&pixels);
         }
     }
 
@@ -286,7 +305,11 @@ impl Vga {
         for counter_line in 0..self.crtc.vtotal {
             self.render_scanline(counter_line);
         }
-        VgaRaster { width: w, height: h, pixels: self.work.clone() }
+        VgaRaster {
+            width: w,
+            height: h,
+            pixels: self.work.clone(),
+        }
     }
 
     fn finalize_frame(&mut self) {
@@ -418,16 +441,49 @@ impl Vga {
     pub fn write_port(&mut self, port: u16, value: u8) -> bool {
         self.catch_up();
         match port {
-            0x3C4 => { self.seq_index = value; true }
-            0x3C5 => { let idx = self.seq_index; self.write_seq(idx, value); true }
-            0x3C7 => { self.dac.set_read_index(value); true }
-            0x3C8 => { self.dac.set_write_index(value); true }
-            0x3C9 => { self.dac.write_data(value); true }
-            0x3CE => { self.gc_index = value; true }
-            0x3CF => { let idx = self.gc_index; self.write_gc(idx, value); true }
-            0x3D4 => { self.crtc_index = value; true }
-            0x3D5 => { let idx = self.crtc_index; self.write_crtc(idx, value); true }
-            0x3C0 => { self.write_attr(value); true }
+            0x3C4 => {
+                self.seq_index = value;
+                true
+            }
+            0x3C5 => {
+                let idx = self.seq_index;
+                self.write_seq(idx, value);
+                true
+            }
+            0x3C7 => {
+                self.dac.set_read_index(value);
+                true
+            }
+            0x3C8 => {
+                self.dac.set_write_index(value);
+                true
+            }
+            0x3C9 => {
+                self.dac.write_data(value);
+                true
+            }
+            0x3CE => {
+                self.gc_index = value;
+                true
+            }
+            0x3CF => {
+                let idx = self.gc_index;
+                self.write_gc(idx, value);
+                true
+            }
+            0x3D4 => {
+                self.crtc_index = value;
+                true
+            }
+            0x3D5 => {
+                let idx = self.crtc_index;
+                self.write_crtc(idx, value);
+                true
+            }
+            0x3C0 => {
+                self.write_attr(value);
+                true
+            }
             _ => false,
         }
     }
@@ -461,9 +517,15 @@ impl Vga {
             0x00 => self.gc.set_reset = value & 0x0F,
             0x01 => self.gc.enable_set_reset = value & 0x0F,
             0x02 => self.gc.color_compare = value & 0x0F,
-            0x03 => { self.gc.rotate = value & 7; self.gc.logic = (value >> 3) & 3; }
+            0x03 => {
+                self.gc.rotate = value & 7;
+                self.gc.logic = (value >> 3) & 3;
+            }
             0x04 => self.gc.read_map = value & 3,
-            0x05 => { self.gc.write_mode = value & 3; self.gc.read_mode = (value >> 3) & 1; }
+            0x05 => {
+                self.gc.write_mode = value & 3;
+                self.gc.read_mode = (value >> 3) & 1;
+            }
             0x07 => self.gc.color_dont_care = value & 0x0F,
             0x08 => self.gc.bit_mask = value,
             _ => {}
@@ -662,12 +724,20 @@ pub fn write_planes(
                 if (data >> plane) & 1 != 0 { 0xFF } else { 0x00 } // WM2
             }
             3 => {
-                if (gc.set_reset >> plane) & 1 != 0 { 0xFF } else { 0x00 } // WM3 color
+                if (gc.set_reset >> plane) & 1 != 0 {
+                    0xFF
+                } else {
+                    0x00
+                } // WM3 color
             }
             _ => {
                 // WM0: set/reset substitution where enabled, else rotated data.
                 if (gc.enable_set_reset >> plane) & 1 != 0 {
-                    if (gc.set_reset >> plane) & 1 != 0 { 0xFF } else { 0x00 }
+                    if (gc.set_reset >> plane) & 1 != 0 {
+                        0xFF
+                    } else {
+                        0x00
+                    }
                 } else {
                     rotated
                 }
@@ -695,7 +765,7 @@ mod tests {
         assert_eq!(beam_line(&t, dots), 5);
         assert_eq!(beam_dot(&t, dots), 10);
         assert!(beam_display_enable(&t, dots)); // line 5 < 400, dot 10 < 320
-        assert!(!beam_vretrace(&t, dots));       // 5 < vretrace_start 412
+        assert!(!beam_vretrace(&t, dots)); // 5 < vretrace_start 412
     }
 
     #[test]
@@ -704,7 +774,7 @@ mod tests {
         vga.set_mode_0dh();
         let frame = vga.frame_dots();
         vga.advance(frame * 2 + 7); // just past two frames in one call
-        assert_eq!(vga.beam_dots(), 7);          // (2*frame+7) mod frame
+        assert_eq!(vga.beam_dots(), 7); // (2*frame+7) mod frame
         assert_eq!(vga.frames_completed(), 2);
     }
 
@@ -715,7 +785,10 @@ mod tests {
         assert!(vga.vram.iter().all(|&b| b == 0));
         // frame_dots must be non-zero at boot (default text timing) so the
         // per-instruction beam advance never divides by zero. (Spec §3/§6.)
-        assert!(vga.frame_dots() > 0, "frame_dots must be defined before any mode-set");
+        assert!(
+            vga.frame_dots() > 0,
+            "frame_dots must be defined before any mode-set"
+        );
     }
 
     #[test]
@@ -871,13 +944,21 @@ mod tests {
         vga.crtc.vblank_end = 520;
         vga.crtc.vretrace_start = 247;
         vga.crtc.vretrace_end = 249;
-        for b in vga.vram[0..VGA_PLANE_SIZE].iter_mut() { *b = 0xFF; } // plane 0 set
+        for b in vga.vram[0..VGA_PLANE_SIZE].iter_mut() {
+            *b = 0xFF;
+        } // plane 0 set
         vga.attr.palette = core::array::from_fn(|i| i as u8);
         let raster = vga.render_full_frame();
         let w = raster.width as usize;
-        assert_ne!(raster.pixels[0], 0, "row 0 should be active (top-justified)");
+        assert_ne!(
+            raster.pixels[0], 0,
+            "row 0 should be active (top-justified)"
+        );
         let last = (raster.height as usize - 1) * w;
-        assert_eq!(raster.pixels[last], 0, "bottom row is border/blank, not active");
+        assert_eq!(
+            raster.pixels[last], 0,
+            "bottom row is border/blank, not active"
+        );
     }
 
     #[test]
@@ -899,7 +980,10 @@ mod tests {
         vga.set_mode_0dh();
         vga.advance(htotal_dots(&vga.crtc) * 100); // beam mid-frame, line 100
         vga.set_start_address(0x2000); // buffered, not active yet
-        assert_eq!(vga.crtc.start_address, 0, "start address unchanged this frame");
+        assert_eq!(
+            vga.crtc.start_address, 0,
+            "start address unchanged this frame"
+        );
         vga.advance(vga.frame_dots()); // cross the frame boundary
         assert_eq!(vga.crtc.start_address, 0x2000, "applied on the next frame");
     }
@@ -939,19 +1023,24 @@ mod tests {
         let mut vga = Vga::default();
         vga.set_mode_0dh();
         // Active content = attribute index 1 everywhere (plane 0 set).
-        for b in vga.vram[0..VGA_PLANE_SIZE].iter_mut() { *b = 0xFF; }
+        for b in vga.vram[0..VGA_PLANE_SIZE].iter_mut() {
+            *b = 0xFF;
+        }
         vga.attr.palette = core::array::from_fn(|i| i as u8); // index 1 -> DAC 1
         // Run to counter line 50, then repaint palette[1] = 9 via the attribute port.
         vga.advance(htotal_dots(&vga.crtc) * 50);
         vga.write_port(0x3C0, 0x01); // attr index 1
-        vga.write_port(0x3C0, 9);    // palette[1] = 9
+        vga.write_port(0x3C0, 9); // palette[1] = 9
         // Finish the frame.
         vga.advance(vga.frame_dots());
         let raster = vga.take_presented().unwrap();
         let w = raster.width as usize;
         assert_eq!(raster.pixels[0], 1, "above the split uses the old palette");
         let below = 120 * w; // raster row 120 (counter line 60, > split at 50)
-        assert_eq!(raster.pixels[below], 9, "below the split uses the new palette");
+        assert_eq!(
+            raster.pixels[below], 9,
+            "below the split uses the new palette"
+        );
     }
 
     #[test]
@@ -1052,5 +1141,30 @@ mod tests {
         video.write_port(0x03c9, 0); // G
         video.write_port(0x03c9, 0); // B
         assert_eq!(video.palette_argb()[1], 0x00FF_0000);
+    }
+
+    #[test]
+    fn mode_0dh_raster_height_equals_vtotal_not_doubled() {
+        let mut vga = Vga::default();
+        vga.set_mode_0dh();
+        // One raster row per scanline: vtotal (449), not vtotal * scan_factor.
+        assert_eq!(vga.raster_height(), 449);
+    }
+
+    #[test]
+    fn double_scan_holds_each_source_row_for_two_scanlines() {
+        let mut vga = Vga::default();
+        vga.set_mode_0dh(); // doubled mode
+        // Source row 0 has pixel 0 set in plane 0; source row 1 (byte pitch
+        // offset*2 = 40) is clear.
+        vga.vram[0] = 0x80;
+        vga.attr.palette = core::array::from_fn(|i| i as u8);
+        let r0 = vga.render_active_row(0);
+        let r1 = vga.render_active_row(1);
+        let r2 = vga.render_active_row(2);
+        assert_eq!(r0, r1, "scanlines 0 and 1 read the same source row");
+        assert_ne!(r0, r2, "scanline 2 reads the next source row");
+        assert_eq!(r0[0], 1, "source row 0 pixel 0 is attribute index 1");
+        assert_eq!(r2[0], 0, "source row 1 pixel 0 is attribute index 0");
     }
 }
