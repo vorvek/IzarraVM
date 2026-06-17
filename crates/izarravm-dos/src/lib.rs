@@ -125,6 +125,37 @@ pub enum DosAction {
     Exit(u8), // terminate the program with this code
 }
 
+/// Toka-DOS wall clock. Deterministic by default (a fixed 1997 instant) so unit
+/// tests are stable; the machine/CLI may overwrite it via set_clock. Fields are
+/// stored explicitly, including day_of_week, to avoid any calendar computation.
+#[derive(Debug, Clone, Copy)]
+struct DosDateTime {
+    year: u16,
+    month: u8,
+    day: u8,
+    day_of_week: u8, // 0 = Sunday
+    hour: u8,
+    minute: u8,
+    second: u8,
+    hundredths: u8,
+}
+
+impl Default for DosDateTime {
+    fn default() -> Self {
+        // 1997-06-17 (a Tuesday, day_of_week = 2), 12:00:00.00.
+        Self {
+            year: 1997,
+            month: 6,
+            day: 17,
+            day_of_week: 2,
+            hour: 12,
+            minute: 0,
+            second: 0,
+            hundredths: 0,
+        }
+    }
+}
+
 /// The stateful DOS kernel. Owns the host-side state that must survive between
 /// INT 21h calls: the open-file handle table and the mounted C: drive, plus the
 /// standard input and output buffers (high-level emulated, HLE). The machine
@@ -136,6 +167,7 @@ pub struct DosKernel {
     open_files: HashMap<u16, File>,
     stdin: VecDeque<u8>,
     stdout: Vec<u8>,
+    clock: DosDateTime,
 }
 
 impl DosKernel {
@@ -157,6 +189,30 @@ impl DosKernel {
     /// The bytes written to standard output so far.
     pub fn stdout(&self) -> &[u8] {
         &self.stdout
+    }
+
+    /// Replace the wall clock (host-time wiring is a later option; default is fixed).
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_clock(
+        &mut self,
+        year: u16,
+        month: u8,
+        day: u8,
+        day_of_week: u8,
+        hour: u8,
+        minute: u8,
+        second: u8,
+    ) {
+        self.clock = DosDateTime {
+            year,
+            month,
+            day,
+            day_of_week,
+            hour,
+            minute,
+            second,
+            hundredths: 0,
+        };
     }
 
     /// Service a software interrupt the DOS kernel handles. `vector` is the INT
@@ -353,6 +409,57 @@ impl DosKernel {
                 let addr = usize::from(regs.ax as u8) * 4;
                 regs.bx = mem.read_u16(addr)?;
                 regs.es = mem.read_u16(addr + 2)?;
+                Ok(DosAction::Continue)
+            }
+            // AH=2Ah: get date. CX=year, DH=month, DL=day, AL=day-of-week (0=Sun).
+            0x2a => {
+                regs.cx = self.clock.year;
+                regs.dx = (u16::from(self.clock.month) << 8) | u16::from(self.clock.day);
+                regs.ax = (regs.ax & 0xff00) | u16::from(self.clock.day_of_week);
+                Ok(DosAction::Continue)
+            }
+            // AH=2Bh: set date. CX=year(1980-2099), DH=month, DL=day. AL=0 ok, 0xFF
+            // invalid. ponytail: day_of_week is not recomputed (no calendar routine;
+            // no in-scope reader needs the post-set weekday).
+            0x2b => {
+                let year = regs.cx;
+                let month = (regs.dx >> 8) as u8;
+                let day = regs.dx as u8;
+                if (1980..=2099).contains(&year)
+                    && (1..=12).contains(&month)
+                    && (1..=31).contains(&day)
+                {
+                    self.clock.year = year;
+                    self.clock.month = month;
+                    self.clock.day = day;
+                    regs.ax &= 0xff00;
+                } else {
+                    regs.ax = (regs.ax & 0xff00) | 0xff;
+                }
+                Ok(DosAction::Continue)
+            }
+            // AH=2Ch: get time. CH=hour, CL=minute, DH=second, DL=hundredths.
+            0x2c => {
+                regs.cx = (u16::from(self.clock.hour) << 8) | u16::from(self.clock.minute);
+                regs.dx = (u16::from(self.clock.second) << 8) | u16::from(self.clock.hundredths);
+                Ok(DosAction::Continue)
+            }
+            // AH=2Dh: set time. CH=hour, CL=minute, DH=second, DL=hundredths. AL=0 ok,
+            // 0xFF invalid.
+            0x2d => {
+                let hour = (regs.cx >> 8) as u8;
+                let minute = regs.cx as u8;
+                let second = (regs.dx >> 8) as u8;
+                let hundredths = regs.dx as u8;
+                if hour < 24 && minute < 60 && second < 60 && hundredths < 100 {
+                    self.clock.hour = hour;
+                    self.clock.minute = minute;
+                    self.clock.second = second;
+                    self.clock.hundredths = hundredths;
+                    regs.ax &= 0xff00;
+                } else {
+                    regs.ax = (regs.ax & 0xff00) | 0xff;
+                }
                 Ok(DosAction::Continue)
             }
             // AH=4Ch: terminate with the return code in AL.
@@ -740,7 +847,10 @@ mod tests {
     #[test]
     fn ah30_reports_toka_dos_version() {
         let mut mem = Memory::new(4096).unwrap();
-        let mut regs = DosRegs { ax: 0x3000, ..DosRegs::default() };
+        let mut regs = DosRegs {
+            ax: 0x3000,
+            ..DosRegs::default()
+        };
         let mut kernel = DosKernel::new();
         kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
         assert_eq!(regs.ax & 0x00ff, 6); // AL = major
@@ -751,7 +861,10 @@ mod tests {
     #[test]
     fn ah19_reports_c_drive() {
         let mut mem = Memory::new(4096).unwrap();
-        let mut regs = DosRegs { ax: 0x1900, ..DosRegs::default() };
+        let mut regs = DosRegs {
+            ax: 0x1900,
+            ..DosRegs::default()
+        };
         let mut kernel = DosKernel::new();
         kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
         assert_eq!(regs.ax & 0x00ff, 0x02); // AL = 2 (C:)
@@ -1263,6 +1376,66 @@ mod tests {
     }
 
     #[test]
+    fn ah2a_2c_read_the_default_clock() {
+        let mut mem = Memory::new(4096).unwrap();
+        let mut kernel = DosKernel::new();
+        let mut date = DosRegs {
+            ax: 0x2a00,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut date, &mut mem).unwrap();
+        assert_eq!(date.cx, 1997); // year
+        assert_eq!(date.dx >> 8, 6); // month
+        assert_eq!(date.dx & 0xff, 17); // day
+        assert_eq!(date.ax & 0xff, 2); // day_of_week (Tuesday)
+        let mut time = DosRegs {
+            ax: 0x2c00,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut time, &mut mem).unwrap();
+        assert_eq!(time.cx >> 8, 12); // hour
+        assert_eq!(time.cx & 0xff, 0); // minute
+    }
+
+    #[test]
+    fn ah2b_2d_set_then_get_and_reject_out_of_range() {
+        let mut mem = Memory::new(4096).unwrap();
+        let mut kernel = DosKernel::new();
+        // Set date 2001-02-03.
+        let mut set = DosRegs {
+            ax: 0x2b00,
+            cx: 2001,
+            dx: (2u16 << 8) | 3,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut set, &mut mem).unwrap();
+        assert_eq!(set.ax & 0xff, 0x00); // success
+        let mut get = DosRegs {
+            ax: 0x2a00,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut get, &mut mem).unwrap();
+        assert_eq!(get.cx, 2001);
+        assert_eq!(get.dx >> 8, 2);
+        assert_eq!(get.dx & 0xff, 3);
+        // Reject month 13.
+        let mut bad = DosRegs {
+            ax: 0x2b00,
+            cx: 2001,
+            dx: (13u16 << 8) | 3,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut bad, &mut mem).unwrap();
+        assert_eq!(bad.ax & 0xff, 0xff); // failure, clock unchanged
+        let mut get2 = DosRegs {
+            ax: 0x2a00,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut get2, &mut mem).unwrap();
+        assert_eq!(get2.dx >> 8, 2); // still February
+    }
+
+    #[test]
     fn ah25_then_ah35_round_trip_vector() {
         let mut mem = Memory::new(1024 * 1024).unwrap();
         // AH=25h: set INT 0x1C to DS:DX = 0xBEEF:0x1234.
@@ -1278,7 +1451,10 @@ mod tests {
         assert_eq!(mem.read_u16(0x1c * 4).unwrap(), 0x1234);
         assert_eq!(mem.read_u16(0x1c * 4 + 2).unwrap(), 0xbeef);
         // AH=35h: get INT 0x1C back into ES:BX.
-        let mut get = DosRegs { ax: 0x351c, ..DosRegs::default() };
+        let mut get = DosRegs {
+            ax: 0x351c,
+            ..DosRegs::default()
+        };
         kernel.dispatch(0x21, &mut get, &mut mem).unwrap();
         assert_eq!(get.es, 0xbeef);
         assert_eq!(get.bx, 0x1234);
