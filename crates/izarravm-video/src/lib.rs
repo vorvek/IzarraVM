@@ -2,6 +2,8 @@ use izarravm_core::VideoCard;
 use thiserror::Error;
 
 pub mod margo;
+pub mod vga;
+pub use vga::{Vga, VGA_PLANAR_SIZE};
 
 pub use margo::{
     MARGO_ID_VALUE, MARGO_MMIO_SIZE, MARGO_VBE_MODES, MARGO_VRAM_SIZE, Margo, MargoDisplay,
