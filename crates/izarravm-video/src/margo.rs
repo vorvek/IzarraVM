@@ -742,6 +742,16 @@ fn pattern(vram: &mut [u8], p: &PatternParams) -> u64 {
     written
 }
 
+/// The DMA pusher's register state, read by the machine that drives the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PusherRegs {
+    pub enabled: bool,
+    pub base: u32,
+    pub size: u32,
+    pub put: u32,
+    pub get: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Margo {
     vram: Vec<u8>,
@@ -1159,6 +1169,30 @@ impl Margo {
 
     fn overlay_reg(&self, offset: usize) -> u32 {
         self.overlay[(offset - OVL_BASE) / 4]
+    }
+
+    /// The DMA pusher registers, for the machine-level engine (section 7.9).
+    pub fn pusher(&self) -> PusherRegs {
+        PusherRegs {
+            enabled: self.pusher[0] & 0x1 != 0,
+            base: self.pusher[1],
+            size: self.pusher[2],
+            put: self.pusher[3],
+            get: self.pusher[4],
+        }
+    }
+
+    /// Advance the pusher's read offset PUSH_GET (engine-owned; read-only to the bus).
+    pub fn set_pusher_get(&mut self, get: u32) {
+        self.pusher[4] = get;
+    }
+
+    /// The remaining modeled busy time in nanoseconds. The pusher gates on this so
+    /// it stalls at each COMMAND until that operation completes; an armed but unfed
+    /// color-expand stream reads 0 here (busy_ns is only set when an operation
+    /// completes), so the pusher keeps feeding its MONO_DATA words.
+    pub fn busy_ns(&self) -> u64 {
+        self.busy_ns
     }
 
     fn build_clip(&self) -> Clip {

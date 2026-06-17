@@ -693,6 +693,54 @@ impl Machine {
         let whole = self.vga_dots.floor();
         self.video.advance(whole as u64);
         self.vga_dots -= whole;
+
+        self.pump_pusher();
+    }
+
+    /// Drive the DMA pusher (section 7.9). While the pusher is enabled, the engine
+    /// is idle (`busy_ns == 0`), and the ring is not drained (`get != put`), read
+    /// one command from the ring in system RAM and replay its data words as
+    /// register writes through `margo.write_mmio_u8`, advancing PUSH_GET. A data
+    /// word that writes COMMAND sets `busy_ns`, so the loop stalls there until the
+    /// operation completes on a later `advance_devices`, which is why PUSH_GET
+    /// trails PUSH_PUT. Latch-only packets consume instantly. The loop terminates
+    /// because `get` advances monotonically toward `put`.
+    fn pump_pusher(&mut self) {
+        let p = self.margo.pusher();
+        if !p.enabled || p.size == 0 {
+            return;
+        }
+        let mut get = p.get;
+        while self.margo.busy_ns() == 0 && get != p.put {
+            let header = self.read_ring_word(p.base, p.size, get);
+            let method = (header & 0xffff) as usize;
+            let count = header >> 16;
+            get = (get + 4) % p.size;
+            let mut i = 0u32;
+            while i < count && get != p.put {
+                let data = self.read_ring_word(p.base, p.size, get);
+                for b in 0..4 {
+                    self.margo
+                        .write_mmio_u8(method + (i as usize) * 4 + b, (data >> (8 * b)) as u8);
+                }
+                get = (get + 4) % p.size;
+                i += 1;
+            }
+            self.margo.set_pusher_get(get);
+        }
+    }
+
+    /// Read one 32-bit little-endian word from the command ring at byte offset
+    /// `off`, wrapping within `size` (a power of two in practice; `% size` is used
+    /// so any nonzero size is safe). Each byte is bounds-checked against system RAM;
+    /// an out-of-range byte reads as 0 (no panic, no wrap into other state).
+    fn read_ring_word(&self, base: u32, size: u32, off: u32) -> u32 {
+        let mut bytes = [0u8; 4];
+        for (b, slot) in bytes.iter_mut().enumerate() {
+            let ring_off = (off as usize + b) % size as usize;
+            *slot = self.memory.read_u8(base as usize + ring_off).unwrap_or(0);
+        }
+        u32::from_le_bytes(bytes)
     }
 
     /// Render `native_samples` of OPL3 output at 49716 Hz and return the
@@ -2856,6 +2904,54 @@ mod tests {
         assert_eq!(argb[22 * 640 + 10], 0x0082_51ff);
         // Cell (1,1) U=255 V=255.
         assert_eq!(argb[22 * 640 + 12], 0x00ff_00ff);
+    }
+
+    #[test]
+    fn pusher_runs_a_fill_packet_from_the_ring() {
+        let mut machine = test_machine();
+        // A command ring in system RAM that issues one FILL: a 2x2 rect of 0xAB at
+        // (x=1, y=1) on a depth-1 surface, pitch 8, base 0. Mirrors the guide's
+        // fill_via_pusher: header words are (count << 16) | method.
+        let ring_base = 0x0001_0000u32;
+        let ring: [u32; 16] = [
+            (3 << 16) | 0x0100,
+            0, // DST_BASE = 0
+            8, // DST_PITCH = 8
+            0, // SRC_BASE = 0 (unused by FILL)
+            (1 << 16) | 0x0110,
+            1, // DEPTH = 1
+            (1 << 16) | 0x0114,
+            (1 << 16) | 1, // DST_XY: y=1, x=1
+            (1 << 16) | 0x011c,
+            (2 << 16) | 2, // DIM: h=2, w=2
+            (1 << 16) | 0x0120,
+            0xab, // FG_COLOR = 0xAB
+            (1 << 16) | 0x0128,
+            0xf0, // ROP = PATCOPY
+            (1 << 16) | 0x0150,
+            0x01, // COMMAND = FILL
+        ];
+        for (i, word) in ring.iter().enumerate() {
+            for (b, byte) in word.to_le_bytes().into_iter().enumerate() {
+                machine.write_physical_u8(ring_base + (i * 4 + b) as u32, byte);
+            }
+        }
+        let put = (ring.len() * 4) as u32; // 64
+
+        write_mmio_reg(&mut machine, 0x84, ring_base); // PUSH_BASE
+        write_mmio_reg(&mut machine, 0x88, 0x1000); // PUSH_SIZE (4 KiB, power of two)
+        write_mmio_reg(&mut machine, 0x80, 1); // PUSH_CTRL = ENABLE
+        write_mmio_reg(&mut machine, 0x8c, put); // PUSH_PUT = doorbell
+
+        // One device tick drives the pump; the FILL applies immediately.
+        machine.advance_devices(1);
+
+        // The fill landed in VRAM (read back through the LFB).
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 8 + 1), 0xab); // (1,1)
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 2 * 8 + 2), 0xab); // (2,2)
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE), 0x00); // (0,0) untouched
+        // The ring drained: GET reached PUT.
+        assert_eq!(read_mmio_reg(&mut machine, 0x90), put);
     }
 
     #[test]
