@@ -72,6 +72,64 @@ impl CrtcTiming {
         }
     }
 
+    /// Mode 0Eh: 640x200x16 planar, 70 Hz, double-scanned, 8-dot chars. Same
+    /// vertical timing as 0Dh, wider active, 80-byte line (offset 40).
+    pub fn mode_0eh() -> Self {
+        Self {
+            htotal_chars: 100,
+            char_width: 8,
+            hdisp_end: 640,
+            vtotal: 449,
+            vdisp_end: 400,
+            vblank_start: 407,
+            vblank_end: 442,
+            vretrace_start: 412,
+            vretrace_end: 414,
+            max_scan: 1,
+            double_scan: true,
+            start_address: 0,
+            offset: 40,
+        }
+    }
+
+    /// Mode 10h: 640x350x16 planar, 70 Hz, not double-scanned, 8-dot chars.
+    pub fn mode_10h() -> Self {
+        Self {
+            htotal_chars: 100,
+            char_width: 8,
+            hdisp_end: 640,
+            vtotal: 449,
+            vdisp_end: 350,
+            vblank_start: 355,
+            vblank_end: 442,
+            vretrace_start: 387,
+            vretrace_end: 389,
+            max_scan: 0,
+            double_scan: false,
+            start_address: 0,
+            offset: 40,
+        }
+    }
+
+    /// Mode 12h: 640x480x16 planar, 60 Hz, not double-scanned, 8-dot chars.
+    pub fn mode_12h() -> Self {
+        Self {
+            htotal_chars: 100,
+            char_width: 8,
+            hdisp_end: 640,
+            vtotal: 525,
+            vdisp_end: 480,
+            vblank_start: 490,
+            vblank_end: 520,
+            vretrace_start: 490,
+            vretrace_end: 492,
+            max_scan: 0,
+            double_scan: false,
+            start_address: 0,
+            offset: 40,
+        }
+    }
+
     /// Total dots per frame = htotal_dots * vtotal (scan-counter lines).
     pub fn frame_dots(&self) -> u64 {
         (self.htotal_chars * self.char_width) as u64 * self.vtotal as u64
@@ -202,14 +260,33 @@ impl Vga {
         self.frames
     }
 
-    /// Switch to mode 0Dh timing and reset the beam to the top of frame.
-    pub fn set_mode_0dh(&mut self) {
-        self.crtc = CrtcTiming::mode_0dh();
+    /// Install a planar mode's timing and reset the beam to the top of frame.
+    fn set_planar_mode(&mut self, timing: CrtcTiming) {
+        self.crtc = timing;
         self.beam = 0;
         self.last_line = 0;
         self.mode = VideoMode::Planar;
         self.presented = None; // drop any stale frame from a prior mode
         self.resize_work();
+    }
+
+    /// Switch to mode 0Dh. Kept as an alias so existing callers do not churn.
+    pub fn set_mode_0dh(&mut self) {
+        self.set_planar_mode(CrtcTiming::mode_0dh());
+    }
+
+    /// Select a planar mode by its INT 10h number. Returns false for a number this
+    /// slice does not implement, leaving the current mode untouched.
+    pub fn set_mode(&mut self, mode: u8) -> bool {
+        let timing = match mode {
+            0x0D => CrtcTiming::mode_0dh(),
+            0x0E => CrtcTiming::mode_0eh(),
+            0x10 => CrtcTiming::mode_10h(),
+            0x12 => CrtcTiming::mode_12h(),
+            _ => return false,
+        };
+        self.set_planar_mode(timing);
+        true
     }
 
     pub fn raster_width(&self) -> u32 {
@@ -1166,5 +1243,45 @@ mod tests {
         assert_ne!(r0, r2, "scanline 2 reads the next source row");
         assert_eq!(r0[0], 1, "source row 0 pixel 0 is attribute index 1");
         assert_eq!(r2[0], 0, "source row 1 pixel 0 is attribute index 0");
+    }
+
+    #[test]
+    fn set_mode_selects_geometry_for_each_planar_number() {
+        let mut vga = Vga::default();
+
+        assert!(vga.set_mode(0x0E));
+        assert_eq!(vga.raster_width(), 640);
+        assert_eq!(vga.raster_height(), 449); // doubled 640x200, vtotal 449
+        assert_eq!(vga.active_mode(), VideoMode::Planar);
+
+        assert!(vga.set_mode(0x10));
+        assert_eq!(vga.raster_width(), 640);
+        assert_eq!(vga.raster_height(), 449); // 640x350, vtotal 449
+
+        assert!(vga.set_mode(0x12));
+        assert_eq!(vga.raster_width(), 640);
+        assert_eq!(vga.raster_height(), 525); // 640x480, vtotal 525
+
+        assert!(vga.set_mode(0x0D));
+        assert_eq!(vga.raster_width(), 320);
+        assert_eq!(vga.raster_height(), 449);
+
+        assert!(!vga.set_mode(0x99)); // unknown number leaves a false result
+    }
+
+    #[test]
+    fn wide_mode_assembles_four_bit_index_across_the_full_line() {
+        let mut vga = Vga::default();
+        vga.set_mode(0x12); // 640 wide, not doubled
+        vga.attr.palette = core::array::from_fn(|i| i as u8);
+        // Column 639 is byte 79, bit 0. Set that bit in all four planes so the
+        // assembled index is 0b1111 = 15.
+        for plane in 0..VGA_PLANES {
+            vga.vram[plane * VGA_PLANE_SIZE + 79] = 0x01;
+        }
+        let row = vga.render_active_row(0);
+        assert_eq!(row.len(), 640);
+        assert_eq!(row[639], 15, "column 639 reads bit 0 of all four planes");
+        assert_eq!(row[0], 0, "column 0 is clear");
     }
 }
