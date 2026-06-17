@@ -46,18 +46,21 @@ impl DmaChannel {
         self.addr_decrement = value & 0x20 != 0;
     }
 
-    fn address(&self) -> u32 {
+    /// Byte address the master (8-bit) drives: page in A23-A16, cur_addr in A15-A0.
+    fn byte_address(&self) -> u32 {
         (u32::from(self.page) << 16) | u32::from(self.cur_addr)
     }
 
-    /// Read one byte from memory (memory->device read transfer) and step the
-    /// channel. Returns None when masked or already at terminal count.
-    pub(crate) fn read_byte(&mut self, memory: &mut Memory) -> Option<u8> {
-        if self.mask {
-            return None;
-        }
-        let addr = self.address() as usize;
-        let byte = memory.read_u8(addr).ok()?;
+    /// Word address the slave (16-bit) drives: page in A23-A17, cur_addr (a word
+    /// count) in A16-A1; A0 is tied low so transfers are always word-aligned.
+    /// IBM PC/AT 16-bit DMA wiring: the slave's address counter counts words.
+    fn word_address(&self) -> u32 {
+        (u32::from(self.page) << 17) | (u32::from(self.cur_addr) << 1)
+    }
+
+    /// Shared per-transfer step: advance the address counter, decrement the count
+    /// through zero to terminal count, then reload (auto-init) or mask (single).
+    fn step_after_read(&mut self) {
         self.cur_addr = if self.addr_decrement {
             self.cur_addr.wrapping_sub(1)
         } else {
@@ -75,7 +78,32 @@ impl DmaChannel {
                 self.mask = true;
             }
         }
+    }
+
+    /// Read one byte from memory (memory->device read transfer) and step the
+    /// channel. Returns None when masked or already at terminal count.
+    pub(crate) fn read_byte(&mut self, memory: &mut Memory) -> Option<u8> {
+        if self.mask {
+            return None;
+        }
+        let byte = memory.read_u8(self.byte_address() as usize).ok()?;
+        self.step_after_read();
         Some(byte)
+    }
+
+    /// Read one little-endian word from memory on the slave's word-addressed path
+    /// (memory->device, 16-bit DMA). The counter steps in words, exactly as the
+    /// byte path steps in bytes; only the address formation differs. Returns None
+    /// when masked or already at terminal count.
+    pub(crate) fn read_word(&mut self, memory: &mut Memory) -> Option<u16> {
+        if self.mask {
+            return None;
+        }
+        let addr = self.word_address() as usize;
+        let lo = memory.read_u8(addr).ok()?;
+        let hi = memory.read_u8(addr + 1).ok()?;
+        self.step_after_read();
+        Some(u16::from_le_bytes([lo, hi]))
     }
 }
 
@@ -232,6 +260,16 @@ impl DmaChip {
         }
         Some(byte)
     }
+
+    /// Read one 16-bit word from the device (memory->device) on local channel
+    /// `ci`, latching terminal-count into the status register.
+    fn read_word(&mut self, ci: usize, memory: &mut Memory) -> Option<u16> {
+        let word = self.channels[ci].read_word(memory)?;
+        if self.channels[ci].reached_tc {
+            self.status |= 1 << ci;
+        }
+        Some(word)
+    }
 }
 
 /// The master/slave 8237A pair. Channels 0-3 are the master (8-bit); channels
@@ -315,6 +353,17 @@ impl DmaController {
         } else {
             // Slave channels are 16-bit on real hardware; modeled byte-wise here.
             self.slave.read_byte(channel - 4, memory)
+        }
+    }
+
+    /// Read one 16-bit word for DMA channel `channel`. The slave (channels 4-7)
+    /// drives the word-addressed path; the master channels (0-3, 8-bit) return
+    /// None. The sound slice uses channel 5 for SB16 16-bit DMA output.
+    pub(crate) fn read_word(&mut self, channel: usize, memory: &mut Memory) -> Option<u16> {
+        if channel < 4 {
+            None
+        } else {
+            self.slave.read_word(channel - 4, memory)
         }
     }
 }
@@ -428,5 +477,59 @@ mod tests {
         assert_eq!(ch.cur_addr, ch.base_addr, "address reloaded from base");
         assert_eq!(ch.cur_count, ch.base_count, "count reloaded from base");
         assert_eq!(ch.read_byte(&mut mem).unwrap(), 0xAA, "restarts the buffer");
+    }
+
+    #[test]
+    fn slave_channel_5_reads_word_little_endian_and_steps_in_words() {
+        // Channel 5 = slave local channel 1, page 0x8B.
+        // Slave ports: 0xC4/0xC6 (stride-2 local 1), mode 0xD6, mask 0xD4.
+        let mut dma = DmaController::default();
+        dma.write_port(0xD6, 0x49); // mode, slave ch1: single, read, auto-init off
+        dma.write_port(0xC4, 0x10); // slave ch1 address LSB
+        dma.write_port(0xC4, 0x00); // ...MSB -> word addr 0x0010
+        dma.write_port(0xC6, 0x00); // slave ch1 count LSB
+        dma.write_port(0xC6, 0x00); // ...MSB -> 0 (1 word transfer)
+        dma.write_port(0x8B, 0x01); // page -> byte base 0x01_0000 + (0x0010<<1)
+        dma.write_port(0xD4, 0x01); // unmask slave ch1 (channel 5)
+
+        // Seed two bytes at the word-aligned byte address.
+        let byte_addr = (0x01u32 << 17) | (0x0010u32 << 1);
+        let mut mem = Memory::new(byte_addr as usize + 4).unwrap();
+        mem.write_u8(byte_addr as usize, 0x34).unwrap();
+        mem.write_u8(byte_addr as usize + 1, 0x12).unwrap();
+
+        let word = dma.read_word(5, &mut mem).expect("a word from channel 5");
+        assert_eq!(word, 0x1234, "little-endian word read");
+        assert!(dma.slave.channels[1].reached_tc);
+        assert!(dma.slave.channels[1].mask, "single mode masks at TC");
+        assert_eq!(dma.read_word(5, &mut mem), None);
+    }
+
+    #[test]
+    fn slave_channel_5_auto_init_reloads_and_keeps_feeding() {
+        let mut dma = DmaController::default();
+        dma.write_port(0xD6, 0x59); // mode, slave ch1: auto-init, read
+        dma.write_port(0xC4, 0x00); // word addr 0
+        dma.write_port(0xC4, 0x00);
+        dma.write_port(0xC6, 0x01); // count 1 -> 2 word transfers per cycle
+        dma.write_port(0xC6, 0x00);
+        dma.write_port(0x8B, 0x00); // page 0 -> byte base 0
+        dma.write_port(0xD4, 0x01); // unmask slave ch1
+
+        let byte_addr = (0x00u32 << 17) | (0x0000u32 << 1);
+        let mut mem = Memory::new(byte_addr as usize + 4).unwrap();
+        mem.write_u8(byte_addr as usize, 0x78).unwrap();
+        mem.write_u8(byte_addr as usize + 1, 0x56).unwrap();
+
+        let w0 = dma.read_word(5, &mut mem).unwrap();
+        let _tc = dma.read_word(5, &mut mem).unwrap(); // TC -> auto-init reload
+        assert!(dma.slave.channels[1].reached_tc);
+        assert!(
+            !dma.slave.channels[1].mask,
+            "auto-init keeps the channel live"
+        );
+        // After reload the address is back at the base, so the next word repeats.
+        assert_eq!(w0, 0x5678);
+        assert_eq!(dma.read_word(5, &mut mem), Some(0x5678), "buffer restarts");
     }
 }
