@@ -154,3 +154,10 @@ and `copper_bar_split_through_the_machine` (end to end through the bus: an A0000
 planar fill, a mid-frame palette change via the attribute port, the beam advanced
 by the machine clock, and the presented raster showing the split in the active
 region).
+
+Slice 2's done-signal is `int10_sets_mode_12h_then_draws_and_presents_640x480`:
+a guest `INT 10h, AH=00h, AL=12h` selects mode 12h, a plane fill through the
+A0000 datapath draws into it, the machine clock completes a frame, and the
+presented raster is the expected 640x480 with the drawn pixel in place. The
+double-scan correction is pinned by `mode_0dh_raster_height_equals_vtotal_not_doubled`
+and `double_scan_holds_each_source_row_for_two_scanlines`.
