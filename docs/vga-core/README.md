@@ -185,12 +185,13 @@ released-source 320x240 title was inspected.
 
 Divergences (fidelity directive):
 
-1. **Mode X combined with the line-compare split is not modeled.** The split (slice
-   4) applies to the 16-color render path; extending it to the mode-X scanout is
-   deferred.
+1. **Mode X combined with the line-compare split landed in slice 6.** The split
+   (slice 4) now applies to the mode-X scanout via the shared `split_origin`; see
+   "Slice 6 coverage."
 2. **Mode-X pel-pan is not modeled.** The 8-bit 256-color pixel pan is deferred;
    byte-granular start-address scroll and page flipping (the primary mode-X
-   mechanism) are modeled.
+   mechanism) are modeled. The pel-pan-below-split forcing (slice 4) has no value
+   to force in mode X until pel-pan itself lands; it arrives with it.
 3. **Only the chain-4 to unchained-planar transition is modeled,** not the full
    odd/even host-addressing matrix.
 4. **The 256-color byte is the DAC index directly.** Attribute Mode Control bit 6
@@ -203,6 +204,45 @@ Divergences (fidelity directive):
    When set, real hardware locks CRTC registers 00h-07h against further writes; the
    core honors all subsequent vertical-timing writes regardless. No in-scope mode-X
    setup depends on the protection.
+
+## Slice 6 coverage
+
+Slice 6 extends the slice-4 CRTC Line Compare split to the unchained 256-color
+(mode X) scanout, so a mode-X scrolling playfield with a hardware-split status
+panel renders the panel from offset 0 independent of the top-region start-address
+scroll. The split is address-only: the column-interleaved mode-X addressing is
+unchanged, and only the `row_base` origin changes below the split.
+
+| Area | Covered in slice 6 |
+|------|--------------------|
+| Shared origin | `split_origin`: the display-address origin decision (start address vs the reload-to-zero below-split region) factored out of the 16-color path and shared by both render paths |
+| Mode-X split | `render_modex_row` routes through `split_origin`; below the compare row the address counter reloads to 0 and source-row counting restarts at `line_compare + 1` |
+| Comparison units | Scan-counter lines, the same units the beam and the other vertical-timing registers use; not divided by the double-scan factor |
+| Double-scan | Divides the split source row exactly as it divides the top region, so a 320x240 split holds each split source row for two scanlines |
+
+The semantics carry over verbatim from slice 4, pinned to Abrash's Graphics
+Programming Black Book chapter 30 (line compare) and chapters 47-49 (Mode X). No
+new hardware behavior is introduced: the line-compare reload is color-depth-
+independent, operating on the linear display-address counter below the
+sequencer/attribute color path.
+
+The done-signal is equality: the top region renders scrolled by the start address
+and the bottom region renders from offset 0, proven at unit
+(`vga::tests::mode_x_line_compare_split_renders_top_scrolled_and_bottom_from_offset_zero`,
+`mode_x_line_compare_split_starts_on_the_line_after_the_match`,
+`mode_x_line_compare_compares_in_scan_counter_units_double_scanned`) and
+end-to-end (`mode_x_line_compare_split_through_the_machine`) levels.
+
+Target, honesty note: the mode-X split status bar is the 256-color scroller genre
+workload (a locked panel under a scrolling playfield). A specific released-source
+320x240 title was not inspected, matching the slice-5 honesty note.
+
+Divergences (fidelity directive):
+
+1. **Mode-X pel-pan-below-split forcing is deferred with mode-X pel-pan.** Mode X
+   has no pel-pan yet (slice 5 divergence 2), so below the split there is no
+   pel-pan value to force to 0; that forcing lands naturally with the mode-X
+   pel-pan work. The address-only split here has no pel-pan dependency.
 
 ## Latch rules
 

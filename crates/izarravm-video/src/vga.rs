@@ -402,6 +402,21 @@ impl Vga {
         drawn
     }
 
+    /// Display-address origin for one scanline, honoring the CRTC Line Compare
+    /// split (Abrash, Graphics Programming Black Book ch.30). Returns
+    /// `(start_base, first_line)`: above the split the start address scrolls the
+    /// region; at and below `line_compare + 1` the address counter reloads to 0
+    /// and row counting restarts there. The comparison is in scan-counter units
+    /// and is not divided by the double-scan factor, so `first_line` is already
+    /// in counter units and is divided by `scan_factor` by the caller.
+    fn split_origin(&self, counter_line: u32) -> (u32, u32) {
+        if counter_line > self.crtc.line_compare {
+            (0, self.crtc.line_compare + 1)
+        } else {
+            (self.crtc.start_address, 0)
+        }
+    }
+
     /// Assemble one active scanline into `hdisp_end` DAC indices, applying pel-pan
     /// and the attribute palette. `counter_line` is the scanline in scan-counter
     /// units; double-scan maps it to source row `counter_line / scan_factor`, so a
@@ -415,11 +430,7 @@ impl Vga {
         // the beam and the other vertical timing registers use, so it is not divided by
         // the double-scan factor.
         let below_split = counter_line > self.crtc.line_compare;
-        let (start, first_line) = if below_split {
-            (0, self.crtc.line_compare + 1)
-        } else {
-            (self.crtc.start_address, 0)
-        };
+        let (start, first_line) = self.split_origin(counter_line);
         // Below the split, pel-pan is forced to 0 when Attribute Mode Control (10h)
         // bit 5 is set ("enable pixel panning: 0 = all, 1 = up to line compare").
         let pan = if below_split && (self.attr.mode_control & 0x20 != 0) {
@@ -453,12 +464,18 @@ impl Vga {
     /// (x >> 2)`, and the byte is the 8-bit DAC index directly (no attribute palette,
     /// no 6-bit mask). `counter_line` is in scan-counter units; double-scan maps it to
     /// the source row, exactly as the 16-color path.
-    /// The line-compare split and pel-pan are intentionally not applied here; they
-    /// are deferred for mode X (see the slice-5 spec section 1).
+    /// The CRTC Line Compare split is applied: at and below `line_compare + 1` the
+    /// display-address counter reloads to 0 and row counting restarts there (Abrash,
+    /// Graphics Programming Black Book ch.30). Pel-pan does not exist for mode X yet,
+    /// so its forced-to-zero-below-split behavior is deferred to backlog slice #2.
     pub fn render_modex_row(&self, counter_line: u32) -> Vec<u8> {
         let width = self.crtc.hdisp_end as usize;
-        let source_row = counter_line / self.scan_factor();
-        let row_base = self.crtc.start_address + source_row * self.crtc.offset * 2;
+        let (start, first_line) = self.split_origin(counter_line);
+        // The split branch returns first_line = line_compare + 1 and is taken only when
+        // counter_line > line_compare, so counter_line >= first_line holds: the
+        // subtraction never underflows.
+        let source_row = (counter_line - first_line) / self.scan_factor();
+        let row_base = start + source_row * self.crtc.offset * 2;
         let mut row = vec![0u8; width];
         for (x, slot) in row.iter_mut().enumerate() {
             let plane = x & 3;
@@ -1876,6 +1893,137 @@ mod tests {
             vga.render_modex_row(0)[0],
             0x55,
             "start at page 1 reads page 1"
+        );
+    }
+
+    #[test]
+    fn mode_x_line_compare_split_renders_top_scrolled_and_bottom_from_offset_zero() {
+        // A distinct byte per plane offset so each source row is recognizable. The
+        // values reach above 0x3F, which also proves mode X reads the full 8-bit DAC
+        // index directly (no attribute 6-bit mask).
+        fn pattern(off: usize) -> u8 {
+            ((off as u32).wrapping_mul(7).wrapping_add(1) & 0xFF) as u8
+        }
+        // Reference renderer with line compare left at the 0x3FF default (disabled):
+        // produces a single scrolled row via the mode-X scanout.
+        fn reference(start: u32, row: u32) -> Vec<u8> {
+            let mut r = Vga::default();
+            r.set_mode13h();
+            r.write_port(0x3C4, 0x04);
+            r.write_port(0x3C5, 0x06); // mode X, 320x200 base, double-scanned
+            for plane in 0..VGA_PLANES {
+                for off in 0..VGA_PLANE_SIZE {
+                    r.vram[plane * VGA_PLANE_SIZE + off] = pattern(off);
+                }
+            }
+            r.crtc.start_address = start;
+            r.render_modex_row(row)
+        }
+
+        let mut vga = Vga::default();
+        vga.set_mode13h();
+        vga.write_port(0x3C4, 0x04);
+        vga.write_port(0x3C5, 0x06); // mode X, double-scanned: source_row = counter_line / 2
+        for plane in 0..VGA_PLANES {
+            for off in 0..VGA_PLANE_SIZE {
+                vga.vram[plane * VGA_PLANE_SIZE + off] = pattern(off);
+            }
+        }
+        let start = 0x1000u32;
+        let split = 300u32;
+        vga.crtc.start_address = start;
+        vga.crtc.line_compare = split;
+
+        // Top row 200 (<= split): source row 100, scrolled by start.
+        assert_eq!(
+            vga.render_modex_row(200),
+            reference(start, 200),
+            "top region renders scrolled by start_address"
+        );
+        // First split scanline (split + 1): source row 0 from offset 0.
+        assert_eq!(
+            vga.render_modex_row(split + 1),
+            reference(0, 0),
+            "first split line renders source row 0 from offset 0"
+        );
+        // Deeper split scanline: (counter_line - (split + 1)) / 2 = 10, so source
+        // row 10 from offset 0 matches the reference's source row 10 (row 20 / 2).
+        assert_eq!(
+            vga.render_modex_row(split + 21),
+            reference(0, 20),
+            "split region row 10 renders source row 10 from offset 0"
+        );
+    }
+
+    #[test]
+    fn mode_x_line_compare_split_starts_on_the_line_after_the_match() {
+        let split = 100u32;
+        let mut vga = Vga::default();
+        vga.set_mode13h();
+        vga.write_port(0x3C4, 0x04);
+        vga.write_port(0x3C5, 0x06); // mode X
+        vga.vram[0] = 0xFF; // plane 0, offset 0 marked (pixel 0)
+        // Scroll the top region past the marked byte so the top reads cleared VRAM.
+        vga.crtc.start_address = 0x4000;
+        vga.crtc.line_compare = split;
+        // The matching scanline is the last top line: reads start_address (clear).
+        assert_eq!(
+            vga.render_modex_row(split)[0],
+            0,
+            "scanline == line_compare is still the top region"
+        );
+        // The next scanline is the first split line: reads offset 0 (marked).
+        assert_eq!(
+            vga.render_modex_row(split + 1)[0],
+            0xFF,
+            "scanline line_compare + 1 is the first split line, from offset 0"
+        );
+    }
+
+    #[test]
+    fn mode_x_line_compare_compares_in_scan_counter_units_double_scanned() {
+        let mut vga = Vga::default();
+        vga.set_mode13h();
+        vga.write_port(0x3C4, 0x04);
+        vga.write_port(0x3C5, 0x06); // mode X
+        // Abrash's 320x240 vertical timing (Black Book Listing 47.1): double-scanned,
+        // 240 source rows over 480 scanlines. Same bang as the guest-CRTC retune test.
+        for (idx, val) in [
+            (0x06u8, 0x0Du8),
+            (0x07, 0x3E),
+            (0x09, 0x41),
+            (0x10, 0xEA),
+            (0x11, 0xAC),
+            (0x12, 0xDF),
+            (0x15, 0xE7),
+            (0x16, 0x06),
+        ] {
+            vga.write_port(0x3D4, idx);
+            vga.write_port(0x3D5, val);
+        }
+        vga.vram[0] = 0xFF; // plane 0, offset 0 marked (pixel 0)
+        // Split at scan-counter line 400. The source row counter only reaches 240, so
+        // a split here can only match if the comparison is in scan-counter units, not
+        // divided by the double-scan factor.
+        let split = 400u32;
+        vga.crtc.start_address = 0x4000; // top region reads cleared VRAM
+        vga.crtc.line_compare = split;
+        assert_eq!(
+            vga.render_modex_row(400)[0],
+            0,
+            "scanline 400 == line_compare is the last top line"
+        );
+        // Scanlines 401 and 402 are the first two split scanlines: the same doubled
+        // source row 0, read from offset 0.
+        assert_eq!(
+            vga.render_modex_row(401)[0],
+            0xFF,
+            "first split scanline, offset 0"
+        );
+        assert_eq!(
+            vga.render_modex_row(402)[0],
+            0xFF,
+            "second scanline holds the same doubled source row 0"
         );
     }
 
