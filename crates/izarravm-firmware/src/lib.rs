@@ -8,6 +8,8 @@ pub const HELLO_COM: &[u8] = include_bytes!("../roms/dos/hello.com");
 pub const HELLO_COM_SOURCE: &str = include_str!("../roms/dos/hello.asm");
 pub const ECHO_COM: &[u8] = include_bytes!("../roms/dos/echo.com");
 pub const ECHO_COM_SOURCE: &str = include_str!("../roms/dos/echo.asm");
+pub const TYPE_COM: &[u8] = include_bytes!("../roms/dos/type.com");
+pub const TYPE_COM_SOURCE: &str = include_str!("../roms/dos/type.asm");
 
 pub const I386DX25_TEST_ROM_SIZE: usize = 64 * 1024;
 pub const X86_BOOT_TEST_IMAGE_SIZE: usize = 1440 * 1024;
@@ -211,5 +213,11 @@ mod tests {
         assert!(results.records.iter().any(|record| {
             record.status == SuiteRecordStatus::Fail && record.name == "sound.opl3"
         }));
+    }
+
+    #[test]
+    fn type_com_fixture_is_present() {
+        assert!(!TYPE_COM.is_empty());
+        assert_eq!(TYPE_COM[0], 0xb8); // mov ax, imm16 (the AH=3Dh open setup)
     }
 }
