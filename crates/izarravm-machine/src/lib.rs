@@ -2980,6 +2980,69 @@ mod tests {
     }
 
     #[test]
+    fn pusher_get_trails_put_until_commands_complete() {
+        let mut machine = test_machine();
+        // Two single-pixel FILLs in the ring. Common setup (DST_BASE, DST_PITCH,
+        // DEPTH, ROP) first, then per-fill DST_XY, DIM, FG_COLOR, COMMAND: 0xAA at
+        // (1,1) and 0xBB at (3,3). Header words are (count << 16) | method.
+        let ring_base = 0x0001_0000u32;
+        let ring: [u32; 23] = [
+            // Common setup: 7 words.
+            (2 << 16) | 0x0100,
+            0, // DST_BASE = 0
+            8, // DST_PITCH = 8
+            (1 << 16) | 0x0110,
+            1, // DEPTH = 1
+            (1 << 16) | 0x0128,
+            0xf0, // ROP = PATCOPY
+            // Fill 1: 8 words (cumulative 15 words = 60 bytes after this).
+            (1 << 16) | 0x0114,
+            (1 << 16) | 1, // DST_XY: y=1, x=1
+            (1 << 16) | 0x011c,
+            (1 << 16) | 1, // DIM: h=1, w=1
+            (1 << 16) | 0x0120,
+            0xaa, // FG_COLOR = 0xAA
+            (1 << 16) | 0x0150,
+            0x01, // COMMAND = FILL
+            // Fill 2: 8 words (cumulative 23 words = 92 bytes = PUT).
+            (1 << 16) | 0x0114,
+            (3 << 16) | 3, // DST_XY: y=3, x=3
+            (1 << 16) | 0x011c,
+            (1 << 16) | 1, // DIM: h=1, w=1
+            (1 << 16) | 0x0120,
+            0xbb, // FG_COLOR = 0xBB
+            (1 << 16) | 0x0150,
+            0x01, // COMMAND = FILL
+        ];
+        for (i, word) in ring.iter().enumerate() {
+            for (b, byte) in word.to_le_bytes().into_iter().enumerate() {
+                machine.write_physical_u8(ring_base + (i * 4 + b) as u32, byte);
+            }
+        }
+        let put = (ring.len() * 4) as u32; // 92
+        let after_fill1 = 15 * 4u32; // 60: offset just past fill 1's COMMAND packet
+
+        write_mmio_reg(&mut machine, 0x84, ring_base); // PUSH_BASE
+        write_mmio_reg(&mut machine, 0x88, 0x1000); // PUSH_SIZE
+        write_mmio_reg(&mut machine, 0x80, 1); // PUSH_CTRL = ENABLE
+        write_mmio_reg(&mut machine, 0x8c, put); // PUSH_PUT = doorbell
+
+        // One tick: the pump consumes the setup plus fill 1, which sets busy_ns and
+        // stalls the pump. GET trails PUT, fill 1 landed, fill 2 has not run yet.
+        machine.advance_devices(1);
+        assert_eq!(read_mmio_reg(&mut machine, 0x90), after_fill1); // GET lags PUT
+        assert_ne!(read_mmio_reg(&mut machine, 0x90), put);
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 8 + 1), 0xaa); // (1,1)
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 3 * 8 + 3), 0x00); // (3,3) not yet
+
+        // Enough ticks to drain fill 1's busy_ns (a 1-pixel fill is 105 ns; 10
+        // clocks at 25 MHz = 400 ns), letting the pump consume fill 2.
+        machine.advance_devices(10);
+        assert_eq!(read_mmio_reg(&mut machine, 0x90), put); // GET caught up
+        assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 3 * 8 + 3), 0xbb); // (3,3) now
+    }
+
+    #[test]
     fn dos_program_startup_services() {
         // org 0x100:
         //   mov ah,0x30 / int 0x21            ; get version (AL=6, AH=10), no fault
