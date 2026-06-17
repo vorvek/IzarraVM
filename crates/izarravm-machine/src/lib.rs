@@ -152,6 +152,7 @@ pub struct Machine {
     dsp_resampler: Resampler,
     dsp_rate_hz: u32, // input rate the dsp_resampler is currently configured for
     dsp_micros: f64,  // fractional microseconds owed to the DSP reset-settle clock
+    dsp_sample_phase: f64, // fractional DSP samples owed to the DMA playback clock
     margo_ns: f64,    // fractional nanoseconds owed to the Margo busy countdown
     vga_dots: f64,    // fractional VGA dot clocks owed to the beam advance
     trace: BusTrace,
@@ -190,6 +191,7 @@ impl Machine {
             dsp_resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             dsp_rate_hz: 0,
             dsp_micros: 0.0,
+            dsp_sample_phase: 0.0,
             margo_ns: 0.0,
             vga_dots: 0.0,
             trace: BusTrace::default(),
@@ -239,6 +241,7 @@ impl Machine {
             dsp_resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             dsp_rate_hz: 0,
             dsp_micros: 0.0,
+            dsp_sample_phase: 0.0,
             margo_ns: 0.0,
             vga_dots: 0.0,
             trace: BusTrace::default(),
@@ -306,6 +309,7 @@ impl Machine {
             dsp_resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             dsp_rate_hz: 0,
             dsp_micros: 0.0,
+            dsp_sample_phase: 0.0,
             margo_ns: 0.0,
             vga_dots: 0.0,
             trace: BusTrace::default(),
@@ -715,12 +719,40 @@ impl Machine {
         self.opl_micros -= whole;
 
         // The DSP reset-settle countdown advances with emulated time so a
-        // detection routine's delay loop sees 0xAA become available. The
-        // playback sample clock is paced by render_audio, not here.
+        // detection routine's delay loop sees 0xAA become available.
         self.dsp_micros += clocks as f64 * 1_000_000.0 / self.profile.clock_hz as f64;
         let whole = self.dsp_micros.floor();
         self.dsp.advance_micros(whole);
         self.dsp_micros -= whole;
+
+        // DMA playback is clock-driven: accrue DSP sample phases per CPU clock
+        // and, for each whole sample, advance the block and buffer the rendered
+        // stereo frame onto the DSP ring. The half/end-buffer IRQ that
+        // render_frame edges is forwarded to the PIC here, so playback timing and
+        // IRQ5 no longer depend on the host frontend pulling audio. The host path
+        // (render_dsp_audio) only drains what the clock already produced.
+        let rate = self.dsp.rate_hz();
+        if self.dsp.is_playing() && rate > 0 {
+            self.dsp_sample_phase += clocks as f64 * rate as f64 / self.profile.clock_hz as f64;
+            while self.dsp_sample_phase >= 1.0 {
+                self.dsp_sample_phase -= 1.0;
+                // Borrow dsp/dma/memory together for one sample tick (same shape
+                // as render_dsp_audio). Only the fetcher matching the armed mode
+                // is wired to the DMA channel, so a single &mut dma/&mut memory
+                // borrow feeds the tick.
+                let Machine {
+                    dsp, dma, memory, ..
+                } = self;
+                if dsp.is_16bit() {
+                    dsp.tick_sample(|| None, || dma.read_word(SB_DMA_CHANNEL_16, memory));
+                } else {
+                    dsp.tick_sample(|| dma.read_byte(SB_DMA_CHANNEL_8, memory), || None);
+                }
+            }
+            if self.dsp.take_irq() {
+                self.pic.request(SB_IRQ);
+            }
+        }
 
         self.pit_clocks += clocks as f64 * f64::from(PIT_INPUT_HZ) / self.profile.clock_hz as f64;
         let whole = self.pit_clocks.floor();
@@ -798,38 +830,28 @@ impl Machine {
         u32::from_le_bytes(bytes)
     }
 
-    /// Render `native_samples` of DSP DMA output as stereo frames. Each frame
-    /// pulls one byte (8-bit mode, mono duplicated L/R) or one/two 16-bit words
-    /// (16-bit mono/stereo) from the matching DMA channel; the DSP's half/end
-    /// IRQ is forwarded to the PIC as IRQ5. The DSP renders one stereo frame per
-    /// call; the mixer resamples and sums it with the OPL.
+    /// Render `native_samples` of DSP DMA output as stereo frames by draining
+    /// the rendered-frame ring the per-CPU-clock producer (in `advance_devices`)
+    /// fills. The block counter and the half/end-buffer IRQ now advance with CPU
+    /// time, independent of this call; this path only reads back frames for the
+    /// DAC. A silent (idle) DSP drains nothing, so the OPL passes through.
     pub fn render_dsp_audio(&mut self, native_samples: usize) -> Vec<(i16, i16)> {
-        let Machine {
-            dsp,
-            dma,
-            memory,
-            pic,
-            ..
-        } = self;
         let mut out = Vec::with_capacity(native_samples);
         for _ in 0..native_samples {
-            // Only the fetcher matching the armed mode is given the DMA/memory
-            // borrow; the other is a no-op closure the DSP never calls. This keeps
-            // the single &mut dma/&mut memory borrow sound while feeding both paths
-            // through one render_frame call.
-            let frame = if dsp.is_16bit() {
-                dsp.render_frame(|| None, || dma.read_word(SB_DMA_CHANNEL_16, memory))
-            } else {
-                dsp.render_frame(|| dma.read_byte(SB_DMA_CHANNEL_8, memory), || None)
-            };
-            if let Some(sample) = frame {
-                out.push(sample);
-            }
-            if dsp.take_irq() {
-                pic.request(SB_IRQ);
+            match self.dsp.drain_frame() {
+                Some(frame) => out.push(frame),
+                None => break,
             }
         }
         out
+    }
+
+    /// Drive the internal per-clock device advance (PIT, OPL, DSP reset-settle,
+    /// and the clock-driven DMA playback producer). Exposed so a host test or a
+    /// frontend can flush device time without running the CPU, and so the DMA
+    /// host goldens can advance the clock that now paces playback.
+    pub fn advance_devices_clocks(&mut self, clocks: u64) {
+        self.advance_devices(clocks);
     }
 
     /// Rebuild the DSP resampler when the programmed sample rate changes, so it
@@ -1953,6 +1975,36 @@ mod tests {
     }
 
     #[test]
+    fn sb_dma_irq5_fires_from_the_cpu_clock_without_host_audio_pull() {
+        let mut machine = test_machine();
+        // 8-bit ramp at 0x01_0000; arm DMA ch1 + DSP exactly like the playback golden.
+        for (i, b) in (0..16u8).map(|i| i * 16).enumerate() {
+            machine.write_physical_u8(0x1_0000 + i as u32, b);
+        }
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x0B, BusWidth::Byte, 0x49).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x0F).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x83, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x0A, BusWidth::Byte, 0x01).unwrap();
+            for &b in &[0x41u8, 0x2B, 0x11, 0x48, 0x0F, 0x00, 0x14] {
+                bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
+            }
+        });
+        let before = with_bus(&mut machine, |bus| bus.interrupt_pending());
+        assert!(!before, "no IRQ pending before time advances");
+        // Advance CPU time for well over the 16-sample block (single-cycle -> end IRQ).
+        machine.advance_devices_clocks(200_000);
+        let after = with_bus(&mut machine, |bus| bus.interrupt_pending());
+        assert!(
+            after,
+            "IRQ5 must be raised by the per-clock sample advance, not the host render path"
+        );
+    }
+
+    #[test]
     fn sb_8bit_dma_plays_a_buffer_through_the_dsp() {
         let mut machine = test_machine();
         // A 16-byte unsigned ramp in conventional memory at 0x01_0000.
@@ -1974,7 +2026,12 @@ mod tests {
                 bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
             }
         });
-        let out = machine.render_dsp_audio(16);
+        let out = {
+            // Playback is now clock-driven: advance CPU time for well over the
+            // 16-sample block (single-cycle -> end IRQ), then drain the ring.
+            machine.advance_devices_clocks(200_000);
+            machine.render_dsp_audio(16)
+        };
         assert_eq!(out.len(), 16);
         // Unsigned 0x00 maps to a centered negative sample; mono is duplicated L/R.
         assert!(out.iter().any(|&(l, _)| l < 0), "expected negative samples");
@@ -2014,7 +2071,12 @@ mod tests {
                 bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
             }
         });
-        let out = machine.render_dsp_audio(8);
+        let out = {
+            // Playback is now clock-driven: advance CPU time for well over the
+            // 8-frame stereo buffer (auto-init keeps feeding), then drain the ring.
+            machine.advance_devices_clocks(200_000);
+            machine.render_dsp_audio(8)
+        };
         assert_eq!(out.len(), 8);
         assert_eq!(out[0].0, -1, "left channel is signed -1");
         assert_eq!(out[0].1, 1, "right channel is signed +1");
@@ -2335,7 +2397,10 @@ mod tests {
             }
         });
         // The OPL is silent (no voices keyed), so the steady output is the DSP DC
-        // level after the resampler warmup. Render plenty of OPL-native time.
+        // level after the resampler warmup. Playback is clock-driven now, so
+        // advance CPU time to let the per-clock producer fill the ring, then
+        // render plenty of OPL-native time for the host drainer + resampler.
+        machine.advance_devices_clocks(2_500_000);
         let out = machine.render_audio(4_000);
         assert!(!out.is_empty());
         let mid = &out[out.len() / 3..out.len() * 2 / 3];

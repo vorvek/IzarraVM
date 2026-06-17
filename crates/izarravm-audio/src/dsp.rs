@@ -7,6 +7,13 @@ use std::collections::VecDeque;
 pub const DSP_VERSION_HI: u8 = 4;
 pub const DSP_VERSION_LO: u8 = 5;
 
+/// Bounded length of the rendered-frame ring, in stereo frames (~0.37 s at
+/// 22 kHz). The ring is a rate-match buffer between the per-CPU-clock producer
+/// (in `advance_devices`) and the host drainer (`render_dsp_audio`). On push
+/// when full it drops the oldest frame: audio fidelity may glitch, but the
+/// block counter and IRQ timing stay correct, which is the point of the split.
+const DSP_RING_CAP: usize = 8192;
+
 /// One DSP. The reset port (0x226) drives a microsecond countdown; when it
 /// elapses the DSP queues 0xAA on read-data and asserts data-available.
 #[derive(Debug, Clone, PartialEq)]
@@ -34,6 +41,9 @@ pub struct SbDsp {
     dma_16bit: bool,
     stereo: bool,
     sample_signed: bool,
+    // Rendered stereo frames produced by the per-CPU-clock producer, drained by
+    // the host audio path. See DSP_RING_CAP for the cap/drop-oldest policy.
+    rendered: VecDeque<(i16, i16)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -62,6 +72,7 @@ impl Default for SbDsp {
             dma_16bit: false,
             stereo: false,
             sample_signed: false,
+            rendered: VecDeque::new(),
         }
     }
 }
@@ -232,6 +243,53 @@ impl SbDsp {
 
     pub fn block_remaining(&self) -> u32 {
         self.block_remaining
+    }
+
+    /// Advance the DMA playback by exactly one stereo frame and push the result
+    /// onto the rendered-frame ring. This is the per-CPU-clock producer entry
+    /// point: it wraps the existing [`render_frame`] (which advances the block
+    /// counter and edges the half/end IRQs) and buffers the frame for the host
+    /// drainer. A `None` frame (channel idle or DMA exhausted) is not pushed.
+    /// The IRQ raised inside `render_frame` is left pending for the caller to
+    /// forward to the PIC via [`take_irq`].
+    pub fn tick_sample<B, W>(&mut self, byte_fetch: B, word_fetch: W)
+    where
+        B: FnMut() -> Option<u8>,
+        W: FnMut() -> Option<u16>,
+    {
+        if let Some(frame) = self.render_frame(byte_fetch, word_fetch) {
+            if self.rendered.len() >= DSP_RING_CAP {
+                self.rendered.pop_front();
+            }
+            self.rendered.push_back(frame);
+        }
+    }
+
+    /// Pop the oldest rendered stereo frame for the host audio path, or None
+    /// when the ring is empty (silent DSP = OPL passthrough).
+    pub fn drain_frame(&mut self) -> Option<(i16, i16)> {
+        self.rendered.pop_front()
+    }
+
+    /// CPU clocks until the next half/end-buffer IRQ edges, or None when the DSP
+    /// is not playing. The next edge is the sooner of the half-buffer point
+    /// (`block_remaining - block_size/2`, unless already reached) and the
+    /// end-of-buffer point (`block_remaining`). Converted to CPU clocks via
+    /// `ceil(samples * clock_hz / rate_hz)`, clamped to at least one. For stereo
+    /// modes the block counter advances in words, so this is a conservative
+    /// (never under-) estimate, which is what the HLT fast-forward needs.
+    pub fn clocks_until_next_irq(&self, rate_hz: u32, clock_hz: u32) -> Option<u64> {
+        if !self.playing || rate_hz == 0 {
+            return None;
+        }
+        let half_left = if self.half_reached {
+            u32::MAX
+        } else {
+            self.block_remaining.saturating_sub(self.block_size / 2)
+        };
+        let end_left = self.block_remaining;
+        let samples = half_left.min(end_left).max(1) as u64;
+        Some(((samples * clock_hz as u64).div_ceil(rate_hz as u64)).max(1))
     }
 
     /// Produce one stereo output frame for the current DMA mode, or None if the
