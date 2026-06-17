@@ -4,8 +4,8 @@ use thiserror::Error;
 pub mod margo;
 
 pub use margo::{
-    MARGO_ID_VALUE, MARGO_MMIO_SIZE, MARGO_VBE_MODES, MARGO_VRAM_SIZE, Margo, MargoDisplay,
-    VbeMode, vbe_mode,
+    Channel, MARGO_ID_VALUE, MARGO_MMIO_SIZE, MARGO_VBE_MODES, MARGO_VRAM_SIZE, Margo,
+    MargoDisplay, PixelFormat, VbeMode, bytes_per_pixel, pixel_format, vbe_mode,
 };
 
 pub const MODE13H_WIDTH: u32 = 320;

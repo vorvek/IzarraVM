@@ -697,6 +697,30 @@ impl Margo {
         &self.vram[start..end]
     }
 
+    /// The visible surface decoded to host ARGB `0x00RRGGBB`, one entry per
+    /// source pixel, `width * height` long. Empty when no mode is set. Reads are
+    /// bounds-checked and default to 0, matching `visible_surface`.
+    pub fn scanout_argb(&self, palette: &[u32; 256]) -> Vec<u32> {
+        let width = self.display.width as usize;
+        let height = self.display.height as usize;
+        let pitch = self.display.pitch as usize;
+        let bpp = self.display.bpp;
+        let depth = bytes_per_pixel(bpp) as usize;
+        let start = self.display.start as usize;
+        let mut out = Vec::with_capacity(width * height);
+        for y in 0..height {
+            for x in 0..width {
+                let off = start + y * pitch + x * depth;
+                let mut bytes = [0u8; 4];
+                for (i, slot) in bytes.iter_mut().enumerate().take(depth) {
+                    *slot = self.vram.get(off + i).copied().unwrap_or(0);
+                }
+                out.push(decode_argb(bpp, u32::from_le_bytes(bytes), palette));
+            }
+        }
+        out
+    }
+
     fn register_u32(&self, reg: usize) -> u32 {
         match reg {
             REG_ID => MARGO_ID_VALUE,
@@ -3001,5 +3025,27 @@ mod tests {
         // 32bpp X8R8G8B8: the X byte is ignored.
         assert_eq!(decode_argb(32, 0x0034_5678, &palette), 0x0034_5678);
         assert_eq!(decode_argb(32, 0xff34_5678, &palette), 0x0034_5678);
+    }
+
+    #[test]
+    fn scanout_argb_decodes_the_visible_surface() {
+        let palette = [0u32; 256];
+        let mut margo = Margo::default();
+        // No mode set yet: empty scanout.
+        assert!(margo.scanout_argb(&palette).is_empty());
+
+        margo.set_mode(0x111); // 640x480x16, pitch 1280
+        // Red pixel at (3, 2): offset 2*1280 + 3*2 = 2566; R5G6B5 red = 0xf800 LE.
+        margo.write_vram_u8(2566, 0x00);
+        margo.write_vram_u8(2567, 0xf8);
+        // Green pixel at (0, 0): 0x07e0 LE.
+        margo.write_vram_u8(0, 0xe0);
+        margo.write_vram_u8(1, 0x07);
+
+        let argb = margo.scanout_argb(&palette);
+        assert_eq!(argb.len(), 640 * 480);
+        assert_eq!(argb[2 * 640 + 3], 0x00ff_0000);
+        assert_eq!(argb[0], 0x0000_ff00);
+        assert_eq!(argb[1], 0x0000_0000); // untouched pixel
     }
 }
