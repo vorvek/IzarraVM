@@ -351,7 +351,7 @@ impl Machine {
     }
 
     pub fn read_physical_u8(&mut self, address: u32) -> u8 {
-        let bus = self.make_bus();
+        let mut bus = self.make_bus();
         bus.read_memory_bytes(address, 1).map(|b| b[0]).unwrap_or(0)
     }
 
@@ -374,6 +374,10 @@ impl Machine {
 
     pub fn video(&self) -> &Vga {
         &self.video
+    }
+
+    pub fn video_mut(&mut self) -> &mut Vga {
+        &mut self.video
     }
 
     pub fn set_vga_mode_0dh(&mut self) {
@@ -1084,7 +1088,7 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
 }
 
 impl MachineBus<'_> {
-    fn read_memory_bytes(&self, address: u32, width: usize) -> Result<Vec<u8>, BusError> {
+    fn read_memory_bytes(&mut self, address: u32, width: usize) -> Result<Vec<u8>, BusError> {
         if let Some(offset) = rom_offset(address, width) {
             return Ok(self.rom[offset..offset + width].to_vec());
         }
@@ -1100,6 +1104,12 @@ impl MachineBus<'_> {
         }
 
         if let Some(offset) = video_mode13h_offset(address, width) {
+            // In planar mode (0Dh) the A0000 aperture is the planar datapath, not
+            // the flat mode-13h buffer. cpu_read loads the VGA latches as a side
+            // effect of the read, so this path needs &mut self.
+            if self.video.active_mode() == VideoMode::Planar {
+                return Ok((0..width).map(|i| self.video.cpu_read(offset + i)).collect());
+            }
             return (0..width)
                 .map(|index| {
                     self.video
@@ -1144,6 +1154,13 @@ impl MachineBus<'_> {
         }
 
         if let Some(offset) = video_mode13h_offset(address, 1) {
+            // In planar mode (0Dh) the A0000 aperture routes through the planar
+            // datapath (map mask, write mode, bit mask, latches), not the flat
+            // mode-13h buffer.
+            if self.video.active_mode() == VideoMode::Planar {
+                self.video.cpu_write(offset, value);
+                return Ok(());
+            }
             return self
                 .video
                 .write_mode13h_u8(offset, value)
@@ -2101,5 +2118,87 @@ mod tests {
         machine.advance_devices(600_000);
         assert!(matches!(machine.active_display(), ActiveDisplay::VgaRaster));
         assert!(machine.vga_raster().is_some());
+    }
+
+    #[test]
+    fn a0000_writes_route_to_the_planar_datapath_in_mode_0dh() {
+        let mut machine = test_machine();
+        machine.set_vga_mode_0dh();
+        // Enable plane 0 only, copy write mode, full bit mask, via the VGA ports.
+        machine.video_mut().write_port(0x3C4, 0x02);
+        machine.video_mut().write_port(0x3C5, 0x01); // map mask = plane 0
+        machine.video_mut().write_port(0x3CE, 0x05);
+        machine.video_mut().write_port(0x3CF, 0x00); // write mode 0
+        machine.video_mut().write_port(0x3CE, 0x08);
+        machine.video_mut().write_port(0x3CF, 0xFF); // bit mask 0xFF
+        // Write a byte to A0000 through the machine memory path.
+        machine.write_physical_u8(0x000A_0000, 0xFF);
+        // Plane 0 byte 0 should now be 0xFF (planar datapath), confirming routing.
+        assert_eq!(machine.video().plane_byte(0, 0), 0xFF);
+    }
+
+    #[test]
+    fn copper_bar_split_through_the_machine() {
+        let mut machine = test_machine();
+        machine.set_vga_mode_0dh();
+        // Set up so A0000 writes fill plane 0 (attribute index 1) with a full bit
+        // mask. Write mode 0 is the reset default.
+        machine.video_mut().write_port(0x3C4, 0x02);
+        machine.video_mut().write_port(0x3C5, 0x01); // map mask = plane 0
+        machine.video_mut().write_port(0x3CE, 0x08);
+        machine.video_mut().write_port(0x3CF, 0xFF); // bit mask 0xFF
+        // Fill the visible region of plane 0 (offset 0..8000 covers 200 lines * 40
+        // bytes) through the machine memory path — exercises the A0000 routing.
+        for off in 0..8000u32 {
+            machine.write_physical_u8(0x000A_0000 + off, 0xFF);
+        }
+        // Identity attribute palette so index 1 -> DAC 1. Reading 3DA resets the
+        // flip-flop to "index" first; each entry is an index write then a value
+        // write, so after 16 entries the flip-flop is back in "index" mode.
+        machine.video_mut().read_status1(); // reset attr flip-flop
+        for i in 0..16u8 {
+            machine.video_mut().write_port(0x3C0, i); // index
+            machine.video_mut().write_port(0x3C0, i); // value: palette[i] = i
+        }
+        // Advance to roughly counter line 50, change palette[1] -> 9, then finish
+        // the frame. dots = clocks * VGA_DOT_HZ / clock_hz (~1.007 dots/clock);
+        // 39_700 clocks ≈ 39_980 dots ≈ counter line 49 (htotal 800).
+        machine.advance_devices(39_700);
+        // The flip-flop is in "index" mode here (even number of writes above).
+        machine.video_mut().write_port(0x3C0, 0x01); // attr index 1
+        machine.video_mut().write_port(0x3C0, 9); // palette[1] = 9
+        machine.advance_devices(400_000); // complete the frame
+        let raster = machine.vga_raster().expect("a frame presented");
+        let w = raster.width as usize;
+        // The principle: a contiguous top region uses the old palette (DAC 1) and a
+        // lower region uses the new palette (DAC 9), separated by the beam row at
+        // the time of the palette change. Scan for that transition rather than
+        // hard-coding the split row, so the test survives small timing drift.
+        assert_eq!(raster.pixels[0], 1, "top of frame uses the old palette");
+        let height = raster.height as usize;
+        let mut split = None;
+        for row in 0..height {
+            let p = raster.pixels[row * w];
+            if p == 9 {
+                split = Some(row);
+                break;
+            }
+            assert_eq!(p, 1, "row {row} above the split must use the old palette");
+        }
+        let split = split.expect("a row using the new palette exists below the split");
+        // The split must land in the active region (200 raster rows of content),
+        // not at the very top or beyond the visible area.
+        assert!(
+            (1..200).contains(&split),
+            "split row {split} should fall inside the active picture"
+        );
+        // Every active row at or below the split uses the new palette.
+        for row in split..200 {
+            assert_eq!(
+                raster.pixels[row * w],
+                9,
+                "row {row} below the split must use the new palette"
+            );
+        }
     }
 }
