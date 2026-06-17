@@ -5,8 +5,8 @@ use izarravm_cpu::{Cpu386, CpuError, SegmentIndex, SegmentRegister};
 pub use izarravm_video::MARGO_ID_VALUE;
 use izarravm_video::{
     DAC_ENTRIES, Framebuffer, MARGO_MMIO_SIZE, MARGO_VBE_MODES, MARGO_VRAM_SIZE,
-    MODE13H_MEMORY_SIZE, Margo, TextFrame, VGA_MODE13H_BASE, VGA_TEXT_BASE, VGA_TEXT_MEMORY_SIZE,
-    Vga, VgaRaster, VideoMode, bytes_per_pixel, pixel_format, vbe_mode,
+    MODE13H_MEMORY_SIZE, Margo, TextFrame, VGA_MODE13H_BASE, VGA_PLANAR_WINDOW_SIZE, VGA_TEXT_BASE,
+    VGA_TEXT_MEMORY_SIZE, Vga, VgaRaster, VideoMode, bytes_per_pixel, pixel_format, vbe_mode,
 };
 use thiserror::Error;
 
@@ -1333,7 +1333,7 @@ fn video_mode13h_offset(address: u32, width: usize) -> Option<usize> {
 /// The A0000 window for unchained / 16-color planar access: the full 64 KB the
 /// hardware decodes, wider than the 64000-byte chained mode-13h buffer.
 fn vga_planar_offset(address: u32, width: usize) -> Option<usize> {
-    let end = VGA_MODE13H_BASE + 0x1_0000;
+    let end = VGA_MODE13H_BASE + VGA_PLANAR_WINDOW_SIZE;
     if (VGA_MODE13H_BASE..end).contains(&address) && address + width as u32 <= end {
         Some((address - VGA_MODE13H_BASE) as usize)
     } else {
@@ -2814,5 +2814,12 @@ mod tests {
         // unchained planar window.
         machine.write_physical_u8(0x000A_0000 + 0xFB00, 0x3C);
         assert_eq!(machine.video().plane_byte(2, 0xFB00), 0x3C);
+        // Read back through the bus read path: select plane 2 as the read-map source,
+        // then the A0000 reads return the bytes written above (proving cpu_read routes
+        // through the 64 KB window too, including past the old 64000-byte cap).
+        machine.video_mut().write_port(0x3CE, 0x04); // GC Read Map Select
+        machine.video_mut().write_port(0x3CF, 0x02); // plane 2
+        assert_eq!(machine.read_physical_u8(0x000A_0000 + 5), 0x9C);
+        assert_eq!(machine.read_physical_u8(0x000A_0000 + 0xFB00), 0x3C);
     }
 }
