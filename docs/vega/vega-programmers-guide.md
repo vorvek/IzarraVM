@@ -345,7 +345,7 @@ memory and hand the whole thing to Margo at once. Each command is a header word,
 registers.
 
 ```c
-/* (target) */
+/* (verified) */
 static unsigned long ring[256];          /* system memory, 16-byte aligned */
 
 #define PKT(count, method) (((unsigned long)(count) << 16) | (method))
