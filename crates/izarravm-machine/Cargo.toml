@@ -18,3 +18,4 @@ izarravm-video = { path = "../izarravm-video" }
 
 [dev-dependencies]
 izarravm-firmware = { path = "../izarravm-firmware" }
+tempfile.workspace = true

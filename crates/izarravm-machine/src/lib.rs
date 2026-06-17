@@ -8,7 +8,6 @@ use izarravm_video::{
     MODE13H_MEMORY_SIZE, Margo, TextFrame, VGA_MODE13H_BASE, VGA_TEXT_BASE, VGA_TEXT_MEMORY_SIZE,
     VgaTextMode, VideoMode, bytes_per_pixel, pixel_format, vbe_mode,
 };
-use std::collections::VecDeque;
 use thiserror::Error;
 
 mod pic;
@@ -128,8 +127,7 @@ pub struct Machine {
     margo: Margo,
     margo_active: bool,
     pending_soft_int: Option<u8>, // software-INT vector awaiting deferred dispatch
-    dos_stdout: Vec<u8>,          // captured DOS standard output (INT 21h AH=09h)
-    dos_stdin: VecDeque<u8>,      // preloaded DOS standard input (slice 2 char I/O)
+    dos: izarravm_dos::DosKernel, // DOS kernel state: open files, drive, stdin/stdout
     rom: Vec<u8>,
     serial: SerialPort,
     device_ports: DevicePorts,
@@ -159,8 +157,7 @@ impl Machine {
             margo: Margo::default(),
             margo_active: false,
             pending_soft_int: None,
-            dos_stdout: Vec::new(),
-            dos_stdin: VecDeque::new(),
+            dos: izarravm_dos::DosKernel::default(),
             rom: rom.to_vec(),
             serial: SerialPort::default(),
             device_ports: DevicePorts::default(),
@@ -201,8 +198,7 @@ impl Machine {
             margo: Margo::default(),
             margo_active: false,
             pending_soft_int: None,
-            dos_stdout: Vec::new(),
-            dos_stdin: VecDeque::new(),
+            dos: izarravm_dos::DosKernel::default(),
             rom: vec![0; BIOS_ROM_SIZE],
             serial: SerialPort::default(),
             device_ports: DevicePorts::default(),
@@ -259,8 +255,7 @@ impl Machine {
             margo: Margo::default(),
             margo_active: false,
             pending_soft_int: None,
-            dos_stdout: Vec::new(),
-            dos_stdin: VecDeque::new(),
+            dos: izarravm_dos::DosKernel::default(),
             rom: vec![0; BIOS_ROM_SIZE],
             serial: SerialPort::default(),
             device_ports: DevicePorts::default(),
@@ -412,13 +407,7 @@ impl Machine {
             cf: self.cpu.registers.eflags & 0x1 != 0,
             zf: self.cpu.registers.eflags & 0x40 != 0,
         };
-        let action = izarravm_dos::dispatch(
-            vector,
-            &mut regs,
-            &mut self.memory,
-            &mut self.dos_stdin,
-            &mut self.dos_stdout,
-        )?;
+        let action = self.dos.dispatch(vector, &mut regs, &mut self.memory)?;
         // Marshal the result back. Every general-purpose register is written
         // unconditionally so a later slice that returns a value in any of them (for
         // example AH=3Fh returns the byte count in CX) needs no change here. Only the
@@ -458,18 +447,23 @@ impl Machine {
         })
     }
 
-    /// The bytes the DOS kernel has written to standard output (INT 21h AH=09h and,
-    /// in later slices, the character-output calls). Captured host-side for headless
-    /// runs; not yet rendered to the VGA text mode.
+    /// The bytes the DOS kernel has written to standard output (INT 21h AH=09h and
+    /// the character-output calls). Captured host-side for headless runs; not yet
+    /// rendered to the VGA text mode.
     pub fn dos_output(&self) -> &[u8] {
-        &self.dos_stdout
+        self.dos.stdout()
     }
 
     /// Replace the DOS standard-input buffer, consumed front to back by the
     /// character-input calls. An exhausted buffer yields ^Z (EOF) for the blocking
     /// reads (AH=01h/08h); AH=06h reports an empty buffer through ZF.
     pub fn set_dos_stdin(&mut self, bytes: &[u8]) {
-        self.dos_stdin = bytes.iter().copied().collect();
+        self.dos.set_stdin(bytes);
+    }
+
+    /// Mount a host directory as the guest C: drive for INT 21h file calls.
+    pub fn mount_c_drive(&mut self, drive: izarravm_dos::HostDrive) {
+        self.dos.mount_c(drive);
     }
 
     /// VBE (`INT 10h`, `AH=4Fh`). `function` is `AL`. Unimplemented functions
@@ -2176,6 +2170,21 @@ mod tests {
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
         assert_eq!(reason, StopReason::DosExit { code: 0 });
         assert_eq!(machine.dos_output(), b"hi");
+    }
+
+    #[test]
+    fn dos_com_reads_a_file_from_c_drive() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("HELLO.TXT"), b"File data 123").unwrap();
+        let mut machine = Machine::new_dos_com(
+            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            izarravm_firmware::TYPE_COM,
+        )
+        .unwrap();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
+        assert_eq!(machine.dos_output(), b"File data 123");
     }
 
     #[test]

@@ -146,6 +146,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             let image = std::fs::read(path)?;
             let mut machine =
                 Machine::new_dos_com(MachineProfile::from_hardware_profile(&hardware), &image)?;
+            // Mount the configured C: drive so INT 21h file calls resolve.
+            machine.mount_c_drive(dos.c_drive.clone());
             if let Some(text) = &cli.stdin_text {
                 machine.set_dos_stdin(text.as_bytes());
             }
