@@ -381,7 +381,7 @@ impl Machine {
     pub fn is_graphics_mode(&self) -> bool {
         matches!(
             self.video.active_mode(),
-            VideoMode::Mode13h | VideoMode::Planar
+            VideoMode::Mode13h | VideoMode::Planar | VideoMode::ModeX
         )
     }
 
@@ -642,7 +642,10 @@ impl Machine {
     pub fn active_display(&self) -> ActiveDisplay {
         if self.margo_active {
             ActiveDisplay::MargoLfb
-        } else if self.video.active_mode() == VideoMode::Planar {
+        } else if matches!(
+            self.video.active_mode(),
+            VideoMode::Planar | VideoMode::ModeX
+        ) {
             ActiveDisplay::VgaRaster
         } else if self.video.active_mode() == VideoMode::Mode13h {
             ActiveDisplay::Mode13h
@@ -1183,15 +1186,19 @@ impl MachineBus<'_> {
                 .collect();
         }
 
-        if let Some(offset) = video_mode13h_offset(address, width) {
-            // In planar mode (0Dh) the A0000 aperture is the planar datapath, not
-            // the flat mode-13h buffer. cpu_read loads the VGA latches as a side
-            // effect of the read, so this path needs &mut self.
-            if self.video.active_mode() == VideoMode::Planar {
+        // Unchained (mode X) and 16-color planar use the 64 KB planar datapath;
+        // chained mode 13h uses the flat 64000-byte buffer. cpu_read loads the VGA
+        // latches as a side effect, so the planar path needs &mut self.
+        if matches!(
+            self.video.active_mode(),
+            VideoMode::Planar | VideoMode::ModeX
+        ) {
+            if let Some(offset) = vga_planar_offset(address, width) {
                 return Ok((0..width)
                     .map(|i| self.video.cpu_read(offset + i))
                     .collect());
             }
+        } else if let Some(offset) = video_mode13h_offset(address, width) {
             return (0..width)
                 .map(|index| {
                     self.video
@@ -1235,14 +1242,18 @@ impl MachineBus<'_> {
                 .map_err(|_| BusError::UnmappedMemory { address });
         }
 
-        if let Some(offset) = video_mode13h_offset(address, 1) {
-            // In planar mode (0Dh) the A0000 aperture routes through the planar
-            // datapath (map mask, write mode, bit mask, latches), not the flat
-            // mode-13h buffer.
-            if self.video.active_mode() == VideoMode::Planar {
+        // Unchained (mode X) and 16-color planar route A0000 through the 64 KB
+        // planar datapath (map mask, write mode, bit mask, latches); chained mode
+        // 13h writes the flat 64000-byte buffer.
+        if matches!(
+            self.video.active_mode(),
+            VideoMode::Planar | VideoMode::ModeX
+        ) {
+            if let Some(offset) = vga_planar_offset(address, 1) {
                 self.video.cpu_write(offset, value);
                 return Ok(());
             }
+        } else if let Some(offset) = video_mode13h_offset(address, 1) {
             return self
                 .video
                 .write_mode13h_u8(offset, value)
@@ -1270,7 +1281,7 @@ impl MachineBus<'_> {
         if rom_offset(address, 1).is_some() {
             self.wait_states.rom
         } else if video_text_offset(address, 1).is_some()
-            || video_mode13h_offset(address, 1).is_some()
+            || vga_planar_offset(address, 1).is_some()
             || margo_lfb_offset(address, 1).is_some()
             || margo_mmio_offset(address, 1).is_some()
         {
@@ -1312,6 +1323,17 @@ fn video_text_offset(address: u32, width: usize) -> Option<usize> {
 
 fn video_mode13h_offset(address: u32, width: usize) -> Option<usize> {
     let end = VGA_MODE13H_BASE + MODE13H_MEMORY_SIZE as u32;
+    if (VGA_MODE13H_BASE..end).contains(&address) && address + width as u32 <= end {
+        Some((address - VGA_MODE13H_BASE) as usize)
+    } else {
+        None
+    }
+}
+
+/// The A0000 window for unchained / 16-color planar access: the full 64 KB the
+/// hardware decodes, wider than the 64000-byte chained mode-13h buffer.
+fn vga_planar_offset(address: u32, width: usize) -> Option<usize> {
+    let end = VGA_MODE13H_BASE + 0x1_0000;
     if (VGA_MODE13H_BASE..end).contains(&address) && address + width as u32 <= end {
         Some((address - VGA_MODE13H_BASE) as usize)
     } else {
@@ -2771,5 +2793,26 @@ mod tests {
         assert_eq!(mem.read_u16(0x1200).unwrap(), 0x0000); // ES from IVT[0x21] (stub segment)
         assert_eq!(mem.read_u16(0x1202).unwrap(), 0x0600); // BX from IVT[0x21] (stub offset)
         assert_eq!(mem.read_u16(0x1204).unwrap(), 0x1100); // AH=48h allocated segment
+    }
+
+    #[test]
+    fn mode_x_a0000_writes_route_to_the_planar_datapath() {
+        let mut machine = test_machine();
+        // Mode 13h then unchained (chain-4 off).
+        machine.video_mut().set_mode13h();
+        machine.video_mut().write_port(0x3C4, 0x04);
+        machine.video_mut().write_port(0x3C5, 0x06);
+        assert_eq!(machine.active_display(), ActiveDisplay::VgaRaster);
+        // Map mask = plane 2, full bit mask, write mode 0 (reset default).
+        machine.video_mut().write_port(0x3C4, 0x02);
+        machine.video_mut().write_port(0x3C5, 0x04); // plane 2
+        machine.video_mut().write_port(0x3CE, 0x08);
+        machine.video_mut().write_port(0x3CF, 0xFF); // bit mask 0xFF
+        machine.write_physical_u8(0x000A_0000 + 5, 0x9C);
+        assert_eq!(machine.video().plane_byte(2, 5), 0x9C);
+        // An offset past the old 64000-byte mode-13h cap is reachable in the 64 KB
+        // unchained planar window.
+        machine.write_physical_u8(0x000A_0000 + 0xFB00, 0x3C);
+        assert_eq!(machine.video().plane_byte(2, 0xFB00), 0x3C);
     }
 }
