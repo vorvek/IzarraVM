@@ -30,6 +30,8 @@ pub struct CrtcTiming {
     pub double_scan: bool,
     pub start_address: u32,
     pub offset: u32,
+    pub mode_control: u8,  // CRTC index 17h
+    pub underline_loc: u8, // CRTC index 14h
 }
 
 impl CrtcTiming {
@@ -50,6 +52,8 @@ impl CrtcTiming {
             double_scan: false,
             start_address: 0,
             offset: 80,
+            mode_control: 0xA3,
+            underline_loc: 0x00,
         }
     }
 
@@ -69,6 +73,8 @@ impl CrtcTiming {
             double_scan: true,
             start_address: 0,
             offset: 20,
+            mode_control: 0xE3,
+            underline_loc: 0x00,
         }
     }
 
@@ -89,6 +95,8 @@ impl CrtcTiming {
             double_scan: true,
             start_address: 0,
             offset: 40,
+            mode_control: 0xE3,
+            underline_loc: 0x00,
         }
     }
 
@@ -108,6 +116,8 @@ impl CrtcTiming {
             double_scan: false,
             start_address: 0,
             offset: 40,
+            mode_control: 0xE3,
+            underline_loc: 0x00,
         }
     }
 
@@ -127,6 +137,8 @@ impl CrtcTiming {
             double_scan: false,
             start_address: 0,
             offset: 40,
+            mode_control: 0xE3,
+            underline_loc: 0x00,
         }
     }
 
@@ -630,6 +642,8 @@ impl Vga {
             0x0E => self.cursor_offset = (self.cursor_offset & 0x00FF) | (u16::from(value) << 8),
             0x0F => self.cursor_offset = (self.cursor_offset & 0xFF00) | u16::from(value),
             0x13 => self.crtc.offset = u32::from(value),
+            0x14 => self.crtc.underline_loc = value,
+            0x17 => self.crtc.mode_control = value,
             _ => {} // full timing programmed via set_mode_0dh in slice 1
         }
     }
@@ -838,6 +852,22 @@ pub fn write_planes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crtc_addressing_registers_are_wired_and_default_per_mode() {
+        let mut vga = Vga::default();
+        vga.set_mode_0dh();
+        // 16-color planar modes power up in byte mode (CR17 = 0xE3).
+        assert_eq!(vga.crtc.mode_control, 0xE3);
+        assert_eq!(vga.crtc.underline_loc, 0x00);
+        // A guest write through the CRTC ports updates the live registers.
+        vga.write_port(0x3D4, 0x17); // CRTC index 17h
+        vga.write_port(0x3D5, 0xA3); // word mode
+        assert_eq!(vga.crtc.mode_control, 0xA3);
+        vga.write_port(0x3D4, 0x14); // CRTC index 14h
+        vga.write_port(0x3D5, 0x40); // doubleword bit
+        assert_eq!(vga.crtc.underline_loc, 0x40);
+    }
 
     #[test]
     fn beam_position_tracks_dots_in_scan_counter_units() {
