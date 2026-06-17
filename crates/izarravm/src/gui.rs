@@ -1,12 +1,21 @@
 use eframe::egui;
 use font8x8::{BASIC_FONTS, UnicodeFonts};
+use izarravm_audio::AudioPlayer;
+use izarravm_dos::HostDrive;
+use izarravm_machine::{ActiveDisplay, Machine, MachineProfile, StopReason};
 use izarravm_video::TextFrame;
+use std::error::Error;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+use tracing::{error, info};
 
 const GLYPH_SIZE: usize = 8;
 const VGA_PALETTE: [u32; 16] = [
     0x000000, 0x0000aa, 0x00aa00, 0x00aaaa, 0xaa0000, 0xaa00aa, 0xaa5500, 0xaaaaaa, 0x555555,
     0x5555ff, 0x55ff55, 0x55ffff, 0xff5555, 0xff55ff, 0xffff55, 0xffffff,
 ];
+
+const OPL_NATIVE_HZ: f64 = 49_716.0;
 
 /// Pack 0x00RRGGBB words into an opaque egui image.
 fn words_to_color_image(words: &[u32], width: usize, height: usize) -> egui::ColorImage {
@@ -101,6 +110,346 @@ fn sharp_prescale(image: &egui::ColorImage, target_w: usize, target_h: usize) ->
         }
     }
     egui::ColorImage::new([dest_w, dest_h], pixels)
+}
+
+/// Emulated clocks to run this tick so the machine tracks wall-clock time,
+/// capped so a host that cannot keep up does not spiral.
+fn pacing_budget(wall_elapsed: Duration, clock_hz: u64, executed: u64, cap: u64) -> u64 {
+    let target = (wall_elapsed.as_secs_f64() * clock_hz as f64) as u64;
+    target.saturating_sub(executed).min(cap)
+}
+
+fn tick_machine(machine: &mut Machine, cycles: u64) -> Option<StopReason> {
+    match machine.run_cycles(cycles) {
+        Ok(StopReason::CycleLimit { .. }) => None,
+        Ok(reason) => Some(reason),
+        Err(err) => Some(StopReason::CpuError(err.to_string())),
+    }
+}
+
+/// The current frame for the active display, native resolution. Takes `&mut`
+/// because the VGA raster path consumes the last presented frame.
+fn current_image(machine: &mut Machine) -> egui::ColorImage {
+    match machine.active_display() {
+        ActiveDisplay::Text => text_to_color_image(&machine.screen_text()),
+        ActiveDisplay::Mode13h => {
+            let palette = machine.palette_argb();
+            let framebuffer = machine.mode13h_framebuffer();
+            indexed_to_color_image(
+                &framebuffer.indexed_pixels,
+                framebuffer.width as usize,
+                framebuffer.height as usize,
+                &palette,
+            )
+        }
+        ActiveDisplay::VgaRaster => {
+            let palette = machine.palette_argb();
+            match machine.vga_raster() {
+                Some(raster) => indexed_to_color_image(
+                    &raster.pixels,
+                    raster.width as usize,
+                    raster.height as usize,
+                    &palette,
+                ),
+                None => egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]),
+            }
+        }
+        ActiveDisplay::MargoLfb => {
+            let palette = machine.palette_argb();
+            let margo = machine.margo();
+            let display = margo.display();
+            words_to_color_image(
+                &margo.scanout_argb(&palette),
+                display.width as usize,
+                display.height as usize,
+            )
+        }
+    }
+}
+
+pub struct GuiApp {
+    profile: MachineProfile,
+    rom: Vec<u8>,
+    c_drive: PathBuf,
+    test_pattern: bool,
+    title: String,
+    machine: Option<Machine>,
+    audio: Option<AudioPlayer>,
+    audio_clocks: u64,
+    audio_sample_debt: f64,
+    epoch: Option<(Instant, u64)>,
+    accuracy: f64,
+    last_pace: Option<(Instant, u64)>,
+    texture: Option<egui::TextureHandle>,
+}
+
+impl GuiApp {
+    fn new(
+        profile: MachineProfile,
+        rom: Vec<u8>,
+        c_drive: PathBuf,
+        audio_enabled: bool,
+        test_pattern: bool,
+    ) -> Self {
+        let audio = if audio_enabled {
+            match AudioPlayer::new() {
+                Ok(player) => Some(player),
+                Err(err) => {
+                    info!(%err, "audio output unavailable; running silently");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let title = format!(
+            "IzarraVM - {} / {} MiB / {}",
+            profile.cpu, profile.memory_mib, profile.video
+        );
+        let mut app = Self {
+            profile,
+            rom,
+            c_drive,
+            test_pattern,
+            title,
+            machine: None,
+            audio,
+            audio_clocks: 0,
+            audio_sample_debt: 0.0,
+            epoch: None,
+            accuracy: 0.0,
+            last_pace: None,
+            texture: None,
+        };
+        app.start();
+        app
+    }
+
+    /// Build a fresh machine, mount C:, and reset the pacing and audio state.
+    fn start(&mut self) {
+        let mut machine = match Machine::new(self.profile.clone(), &self.rom) {
+            Ok(m) => m,
+            Err(err) => {
+                error!(%err, "failed to start machine");
+                return;
+            }
+        };
+        match HostDrive::mount_c(&self.c_drive) {
+            Ok(drive) => machine.mount_c_drive(drive),
+            Err(err) => error!(%err, "failed to mount C: drive"),
+        }
+        if self.test_pattern {
+            load_margo_test_pattern(&mut machine);
+        }
+        self.audio_clocks = 0;
+        self.audio_sample_debt = 0.0;
+        self.epoch = None;
+        self.accuracy = 0.0;
+        self.last_pace = None;
+        self.machine = Some(machine);
+    }
+
+    fn stop(&mut self) {
+        self.machine = None;
+    }
+
+    /// Render OPL audio for the emulated time elapsed since the last pump.
+    fn pump_audio(&mut self) {
+        let (Some(machine), Some(player)) = (&mut self.machine, &self.audio) else {
+            return;
+        };
+        let now = machine.elapsed_clocks();
+        let delta = now.saturating_sub(self.audio_clocks);
+        self.audio_clocks = now;
+        self.audio_sample_debt += delta as f64 * OPL_NATIVE_HZ / self.profile.clock_hz as f64;
+        let samples = self.audio_sample_debt.floor() as usize;
+        self.audio_sample_debt -= samples as f64;
+        if samples == 0 {
+            return;
+        }
+        let pcm = machine.render_audio(samples);
+        player.queue(&pcm);
+    }
+
+    /// Advance the machine to track wall-clock time and update the accuracy EMA.
+    fn run_frame(&mut self) {
+        let clock_hz = self.profile.clock_hz;
+        let Some(machine) = &mut self.machine else {
+            return;
+        };
+        let now = Instant::now();
+        let (epoch, epoch_clocks) = *self.epoch.get_or_insert((now, machine.elapsed_clocks()));
+        let executed = machine.elapsed_clocks().saturating_sub(epoch_clocks);
+        let cap = clock_hz / 20;
+        let budget = pacing_budget(now.duration_since(epoch), clock_hz, executed, cap);
+        if budget == 0 {
+            return;
+        }
+        tick_machine(machine, budget);
+        let ran_to = machine.elapsed_clocks();
+        self.pump_audio();
+        if let Some((then, then_clocks)) = self.last_pace {
+            let wall = now.duration_since(then).as_secs_f64();
+            if wall > 0.0 {
+                let ran = ran_to.saturating_sub(then_clocks) as f64;
+                let ratio = (ran / (wall * clock_hz as f64)).min(1.5);
+                self.accuracy = self.accuracy * 0.9 + ratio * 0.1;
+            }
+        }
+        self.last_pace = Some((now, ran_to));
+    }
+}
+
+/// The largest 4:3 rectangle that fits `area`, centred.
+fn fit_4_3(area: egui::Rect) -> egui::Rect {
+    let (width, height) = if area.width() / area.height() > 4.0 / 3.0 {
+        (area.height() * 4.0 / 3.0, area.height())
+    } else {
+        (area.width(), area.width() * 3.0 / 4.0)
+    };
+    egui::Rect::from_center_size(area.center(), egui::vec2(width, height))
+}
+
+impl GuiApp {
+    fn monitor_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let rect = fit_4_3(ui.max_rect());
+        let Some(machine) = &mut self.machine else {
+            ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
+            return;
+        };
+        let native = current_image(machine);
+        let image = sharp_prescale(
+            &native,
+            rect.width().round() as usize,
+            rect.height().round() as usize,
+        );
+        let options = egui::TextureOptions::LINEAR;
+        let texture = match &mut self.texture {
+            Some(t) => {
+                t.set(image, options);
+                &*t
+            }
+            None => self.texture.insert(ctx.load_texture("monitor", image, options)),
+        };
+        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        ui.painter()
+            .image(texture.id(), rect, uv, egui::Color32::WHITE);
+    }
+
+    fn controls_ui(&mut self, ui: &mut egui::Ui) {
+        let running = self.machine.is_some();
+
+        ui.heading("Machine");
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!running, egui::Button::new("Start"))
+                .clicked()
+            {
+                self.start();
+            }
+            if ui
+                .add_enabled(running, egui::Button::new("Reset"))
+                .clicked()
+            {
+                self.start();
+            }
+            if ui.add_enabled(running, egui::Button::new("Stop")).clicked() {
+                self.stop();
+            }
+        });
+
+        ui.separator();
+        ui.label(format!("Speed: {}", speed_label(self.profile.clock_hz)));
+        ui.label(format!("Accuracy: {:.0}%", self.accuracy * 100.0));
+        ui.label(format!("Memory: {} MB", self.profile.memory_mib));
+
+        ui.separator();
+        ui.heading("Drives");
+        ui.horizontal(|ui| {
+            if ui.button("Mount C: folder...").clicked() {
+                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                    self.c_drive = dir;
+                }
+            }
+        });
+        ui.label(format!("C: {}", self.c_drive.display()));
+        ui.add_enabled(false, egui::Button::new("CD-ROM: not emulated yet"));
+        ui.add_enabled(false, egui::Button::new("Floppy: not emulated yet"));
+
+        ui.separator();
+        ui.heading("COM1");
+        let log = self
+            .machine
+            .as_ref()
+            .map(|m| m.serial_text())
+            .unwrap_or_default();
+        egui::ScrollArea::vertical()
+            .stick_to_bottom(true)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.monospace(log);
+            });
+    }
+}
+
+impl eframe::App for GuiApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.title.clone()));
+        self.run_frame();
+        egui::SidePanel::right("controls")
+            .exact_width(320.0)
+            .resizable(false)
+            .show(ctx, |ui| self.controls_ui(ui));
+        egui::CentralPanel::default().show(ctx, |ui| self.monitor_ui(ui, ctx));
+        ctx.request_repaint();
+    }
+}
+
+/// Fill the Margo LFB with a diagonal gradient. Debug aid behind
+/// --margo-test-pattern; not reapplied automatically other than on Start/Reset.
+fn load_margo_test_pattern(machine: &mut Machine) {
+    machine.set_margo_mode_640x480x8();
+    let display = machine.margo().display();
+    let width = display.width as usize;
+    let height = display.height as usize;
+    let pitch = display.pitch as usize;
+    let vram = machine.margo_mut().vram_mut();
+    for y in 0..height {
+        for x in 0..width {
+            vram[y * pitch + x] = ((x + y) & 0xff) as u8;
+        }
+    }
+}
+
+/// Open the window and run the emulator. Returns when the user closes it.
+pub fn run(
+    profile: MachineProfile,
+    rom: Vec<u8>,
+    c_drive: PathBuf,
+    audio_enabled: bool,
+    test_pattern: bool,
+) -> Result<(), Box<dyn Error>> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1280.0, 720.0])
+            .with_min_inner_size([1280.0, 720.0]),
+        renderer: eframe::Renderer::Wgpu,
+        ..Default::default()
+    };
+    eframe::run_native(
+        "IzarraVM",
+        options,
+        Box::new(move |_cc| {
+            Ok(Box::new(GuiApp::new(
+                profile,
+                rom,
+                c_drive,
+                audio_enabled,
+                test_pattern,
+            )))
+        }),
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
