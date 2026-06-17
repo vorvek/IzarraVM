@@ -2687,6 +2687,45 @@ mod tests {
     }
 
     #[test]
+    fn overlay_color_key_gates_on_the_primary_pixel() {
+        let mut machine = test_machine();
+        machine.margo_mut().set_mode(0x14a); // 640x480x32, pitch 2560
+        // Primary at (10, 20) holds the key; (11, 20) holds an occluding window pixel.
+        let key = 0x0011_2233u32;
+        let occluder = 0x0044_5566u32;
+        let p0 = 20 * 2560 + 10 * 4;
+        let p1 = 20 * 2560 + 11 * 4;
+        for (i, b) in key.to_le_bytes().into_iter().enumerate() {
+            machine.write_physical_u8(MARGO_LFB_BASE + p0 + i as u32, b);
+        }
+        for (i, b) in occluder.to_le_bytes().into_iter().enumerate() {
+            machine.write_physical_u8(MARGO_LFB_BASE + p1 + i as u32, b);
+        }
+        // YUY2 source: Y0=235 (white), Y1=16 (black).
+        let src = 0x0020_0000u32;
+        machine.write_physical_u8(MARGO_LFB_BASE + src, 235);
+        machine.write_physical_u8(MARGO_LFB_BASE + src + 1, 128);
+        machine.write_physical_u8(MARGO_LFB_BASE + src + 2, 16);
+        machine.write_physical_u8(MARGO_LFB_BASE + src + 3, 128);
+
+        write_mmio_reg(&mut machine, 0x44, src);
+        write_mmio_reg(&mut machine, 0x48, 4);
+        write_mmio_reg(&mut machine, 0x4c, (1 << 16) | 2);
+        write_mmio_reg(&mut machine, 0x58, (20 << 16) | 10);
+        write_mmio_reg(&mut machine, 0x5c, (1 << 16) | 2);
+        write_mmio_reg(&mut machine, 0x60, key); // OVL_COLORKEY
+        write_mmio_reg(&mut machine, 0x40, 1 | (1 << 3)); // ENABLE + KEY_EN, FORMAT YUY2
+
+        let palette = machine.palette_argb();
+        let argb = machine.margo().scanout_argb(&palette);
+        // Where the primary equals the key, the overlay shows (white).
+        assert_eq!(argb[20 * 640 + 10], 0x00ff_ffff);
+        // Where another value occludes the key, the overlay is hidden and the
+        // decoded primary pixel (0x00445566 in X8R8G8B8) remains.
+        assert_eq!(argb[20 * 640 + 11], 0x0044_5566);
+    }
+
+    #[test]
     fn overlay_yuy2_composites_through_the_apertures() {
         let mut machine = test_machine();
         machine.margo_mut().set_mode(0x14a); // 640x480x32

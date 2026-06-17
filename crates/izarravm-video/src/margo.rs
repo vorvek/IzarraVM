@@ -918,6 +918,8 @@ impl Margo {
             return;
         }
         let format = (ctrl >> 1) & 0x3;
+        let key_en = ctrl & 0x8 != 0;
+        let colorkey = self.overlay_reg(REG_OVL_COLORKEY);
 
         let width = self.display.width as u64;
         let height = self.display.height as u64;
@@ -945,6 +947,9 @@ impl Margo {
                 if screen_x >= width {
                     continue;
                 }
+                if key_en && !self.primary_keyed(screen_x, screen_y, colorkey) {
+                    continue; // occluded: another surface painted over the key here
+                }
                 let sx = (dx * src_w) / dst_w;
                 let sy = (dy * src_h) / dst_h;
                 let Some((y, u, v)) = self.sample_overlay(format, sx, sy, len) else {
@@ -953,6 +958,29 @@ impl Margo {
                 out[(screen_y * width + screen_x) as usize] = yuv_to_argb(y, u, v);
             }
         }
+    }
+
+    /// True when the raw primary pixel at screen `(x, y)` equals `colorkey` in its
+    /// low `depth` bytes (display format, little-endian), computed with the same
+    /// offset math as `scanout_argb` and bounds-checked. Mirrors COPY's color key
+    /// (section 7.5): the overlay shows only where the application painted the key,
+    /// and is hidden where another window drew over it.
+    fn primary_keyed(&self, x: u64, y: u64, colorkey: u32) -> bool {
+        let depth = bytes_per_pixel(self.display.bpp) as u64;
+        let pitch = self.display.pitch as u64;
+        let start = self.display.start as u64;
+        let len = self.vram.len() as u64;
+        let off = start
+            .saturating_add(y.saturating_mul(pitch))
+            .saturating_add(x.saturating_mul(depth));
+        let mut bytes = [0u8; 4];
+        for (i, slot) in bytes.iter_mut().enumerate().take(depth as usize) {
+            let addr = off.saturating_add(i as u64);
+            if addr < len {
+                *slot = self.vram[addr as usize];
+            }
+        }
+        colorkey.to_le_bytes()[..depth as usize] == bytes[..depth as usize]
     }
 
     /// Fetch the (Y, U, V) triple for source pixel `(sx, sy)` in the configured
