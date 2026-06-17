@@ -123,8 +123,7 @@ pub enum DosAction {
 #[derive(Debug, Default)]
 pub struct DosKernel {
     drive: Option<HostDrive>,
-    // File handles 5 and up; populated by AH=3Dh, read by AH=3Fh/3Eh (next task).
-    #[allow(dead_code)]
+    // File handles 5 and up: AH=3Dh inserts, AH=3Fh/3Eh look up.
     open_files: HashMap<u16, File>,
     stdin: VecDeque<u8>,
     stdout: Vec<u8>,
@@ -238,10 +237,49 @@ impl DosKernel {
                 regs.ax = (regs.ax & 0xff00) | 0x24;
                 Ok(DosAction::Continue)
             }
+            // AH=3Dh: open an existing file at DS:DX (ASCIIZ) for reading. AL is
+            // the access mode but is not enforced: every open is read-only,
+            // because writes (AH=40h) are a later slice. Returns CF=0 + AX=handle
+            // on success, CF=1 + AX=DOS code on error.
+            0x3d => {
+                let name = match read_asciiz(mem, regs.ds, regs.dx)? {
+                    Some(name) => name,
+                    None => {
+                        set_dos_error(regs, 0x03);
+                        return Ok(DosAction::Continue);
+                    }
+                };
+                let path = match &self.drive {
+                    None => {
+                        set_dos_error(regs, 0x02);
+                        return Ok(DosAction::Continue);
+                    }
+                    Some(drive) => match drive.resolve_dos_path(&name) {
+                        Ok(path) => path,
+                        Err(_) => {
+                            set_dos_error(regs, 0x03);
+                            return Ok(DosAction::Continue);
+                        }
+                    },
+                };
+                match File::open(&path) {
+                    Ok(file) => {
+                        let handle = (5u16..)
+                            .find(|h| !self.open_files.contains_key(h))
+                            .expect("a free DOS handle exists at or below u16::MAX");
+                        self.open_files.insert(handle, file);
+                        regs.ax = handle;
+                        regs.cf = false;
+                    }
+                    Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
+                }
+                Ok(DosAction::Continue)
+            }
             // AH=4Ch: terminate with the return code in AL.
             0x4c => Ok(DosAction::Exit((regs.ax & 0x00ff) as u8)),
-            // File I/O (3Dh/3Fh/3Eh) and the other unimplemented functions are later
-            // slices. An unimplemented function is a no-op so the IRET stub returns.
+            // File reads and closes (3Fh/3Eh) and the other unimplemented functions
+            // are later slices. An unimplemented function is a no-op so the IRET stub
+            // returns.
             _ => Ok(DosAction::Continue),
         }
     }
@@ -290,9 +328,45 @@ pub fn load_com(image: &[u8], mem: &mut Memory, segment: u16) -> Result<ProgramE
     })
 }
 
+/// Set the DOS error return convention: CF=1 and AX = the DOS error code.
+fn set_dos_error(regs: &mut DosRegs, code: u16) {
+    regs.cf = true;
+    regs.ax = code;
+}
+
+/// Map a host file io error to a DOS error code. NotFound is 0x02 (file not
+/// found); everything else, including permission failures, maps to 0x05 (access
+/// denied), the closest in-scope code. The host filesystem does not separate
+/// file-not-found from path-not-found, so 0x03 is reserved for path resolution.
+fn dos_io_error_code(err: &std::io::Error) -> u16 {
+    match err.kind() {
+        std::io::ErrorKind::NotFound => 0x02,
+        _ => 0x05,
+    }
+}
+
+/// Read an ASCIIZ string from guest memory at seg:off, scanning for a NUL with a
+/// 128-byte cap (a DOS path is well under this). Returns None if no terminator
+/// appears within the cap (a malformed caller). A memory read fault propagates as
+/// DosError::Memory.
+fn read_asciiz(mem: &Memory, seg: u16, off: u16) -> Result<Option<String>, DosError> {
+    const MAX: usize = 128;
+    let base = usize::from(seg) * 16 + usize::from(off);
+    let mut bytes = Vec::new();
+    for index in 0..MAX {
+        let byte = mem.read_u8(base + index)?;
+        if byte == 0 {
+            return Ok(Some(String::from_utf8_lossy(&bytes).into_owned()));
+        }
+        bytes.push(byte);
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn mounts_existing_directory_as_c_drive() {
@@ -542,5 +616,94 @@ mod tests {
         let (regs, out) = char_io(0x0600, 0x00ff, b""); // AH=06h, DL=0xFF, empty
         assert!(regs.zf); // no character ready
         assert!(out.is_empty());
+    }
+
+    /// Build (kernel mounted on a temp C:, memory with `name` ASCIIZ at DS:DX
+    /// = 0x0100:0x0200, the tempdir kept alive). Write `files` into the drive
+    /// first as (name, contents).
+    fn kernel_with_drive(
+        files: &[(&str, &[u8])],
+        name: &str,
+    ) -> (DosKernel, Memory, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        for (file_name, contents) in files {
+            let mut f = std::fs::File::create(dir.path().join(file_name)).unwrap();
+            f.write_all(contents).unwrap();
+        }
+        let mut kernel = DosKernel::new();
+        kernel.mount_c(HostDrive::mount_c(dir.path()).unwrap());
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let base = 0x0100usize * 16 + 0x0200;
+        for (index, byte) in name.bytes().enumerate() {
+            mem.write_u8(base + index, byte).unwrap();
+        }
+        mem.write_u8(base + name.len(), 0).unwrap(); // NUL terminator
+        (kernel, mem, dir)
+    }
+
+    fn open(kernel: &mut DosKernel, mem: &mut Memory) -> DosRegs {
+        let mut regs = DosRegs {
+            ax: 0x3d00, // AH=3Dh, AL=00 read
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, mem).unwrap();
+        regs
+    }
+
+    #[test]
+    fn open_existing_file_returns_handle_5() {
+        let (mut kernel, mut mem, _dir) = kernel_with_drive(&[("DATA.TXT", b"hi")], r"C:\DATA.TXT");
+        let regs = open(&mut kernel, &mut mem);
+        assert!(!regs.cf);
+        assert_eq!(regs.ax, 5);
+    }
+
+    #[test]
+    fn open_missing_file_sets_cf_and_ax02() {
+        let (mut kernel, mut mem, _dir) = kernel_with_drive(&[], r"C:\NOPE.TXT");
+        let regs = open(&mut kernel, &mut mem);
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x02);
+    }
+
+    #[test]
+    fn open_with_no_drive_mounted_sets_ax02() {
+        let mut kernel = DosKernel::new(); // no drive
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let base = 0x0100usize * 16 + 0x0200;
+        for (index, byte) in r"C:\DATA.TXT".bytes().enumerate() {
+            mem.write_u8(base + index, byte).unwrap();
+        }
+        mem.write_u8(base + r"C:\DATA.TXT".len(), 0).unwrap();
+        let regs = open(&mut kernel, &mut mem);
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x02);
+    }
+
+    #[test]
+    fn open_bad_drive_letter_sets_ax03() {
+        let (mut kernel, mut mem, _dir) = kernel_with_drive(&[], r"D:\DATA.TXT");
+        let regs = open(&mut kernel, &mut mem);
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x03); // resolve_dos_path UnsupportedDrive -> path not found
+    }
+
+    #[test]
+    fn open_unterminated_name_sets_ax03() {
+        // A filename with no NUL within the 128-byte cap is a malformed caller:
+        // read_asciiz returns None and the arm reports path not found (0x03).
+        let dir = tempfile::tempdir().unwrap();
+        let mut kernel = DosKernel::new();
+        kernel.mount_c(HostDrive::mount_c(dir.path()).unwrap());
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let base = 0x0100usize * 16 + 0x0200;
+        for index in 0..200usize {
+            mem.write_u8(base + index, b'A').unwrap(); // no NUL within the 128-byte cap
+        }
+        let regs = open(&mut kernel, &mut mem);
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x03);
     }
 }
