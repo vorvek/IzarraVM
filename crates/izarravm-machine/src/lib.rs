@@ -283,19 +283,22 @@ impl Machine {
         install_boot_bios_stubs(&mut machine.memory)?;
 
         let entry = izarravm_dos::load_com(image, &mut machine.memory, DOS_LOAD_SEGMENT)?;
-        let segment = SegmentRegister::real(entry.segment);
-        for index in [
-            SegmentIndex::Cs,
-            SegmentIndex::Ds,
-            SegmentIndex::Es,
-            SegmentIndex::Ss,
-        ] {
-            machine.cpu.registers.set_segment(index, segment);
-        }
-        machine.cpu.registers.eip = u32::from(entry.ip);
-        machine.cpu.registers.set_esp(u32::from(entry.sp));
-        machine.cpu.registers.eflags = 0x0000_0002;
+        machine.apply_program_entry(entry);
         Ok(machine)
+    }
+
+    /// Set the CPU to a loaded program's entry: CS:IP, SS:SP, DS, ES, and a
+    /// real-mode eflags with IF clear (no BIOS IVT is installed, so a program
+    /// wanting hardware IRQs sets them up and STIs itself).
+    fn apply_program_entry(&mut self, entry: izarravm_dos::ProgramEntry) {
+        let r = &mut self.cpu.registers;
+        r.set_segment(SegmentIndex::Cs, SegmentRegister::real(entry.cs));
+        r.set_segment(SegmentIndex::Ds, SegmentRegister::real(entry.ds));
+        r.set_segment(SegmentIndex::Es, SegmentRegister::real(entry.es));
+        r.set_segment(SegmentIndex::Ss, SegmentRegister::real(entry.ss));
+        r.eip = u32::from(entry.ip);
+        r.set_esp(u32::from(entry.sp));
+        r.eflags = 0x0000_0002;
     }
 
     pub fn profile(&self) -> &MachineProfile {

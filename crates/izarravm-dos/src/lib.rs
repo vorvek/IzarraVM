@@ -330,13 +330,30 @@ impl DosKernel {
 /// The largest .COM image: a 64 KiB segment minus the 256-byte PSP.
 const COM_MAX_LEN: usize = 0x10000 - 0x100;
 
-/// Where to start executing a loaded .COM. All four segment registers point at the
-/// load segment; the entry is at offset 0x100, the stack at 0xFFFE.
+/// Where to start executing a loaded program. A .COM sets all six to its single
+/// load segment; an .EXE sets a distinct CS:IP and SS:SP with DS=ES=PSP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProgramEntry {
-    pub segment: u16, // CS = DS = ES = SS
-    pub ip: u16,      // 0x0100
-    pub sp: u16,      // 0xfffe
+    pub cs: u16,
+    pub ip: u16,
+    pub ss: u16,
+    pub sp: u16,
+    pub ds: u16,
+    pub es: u16,
+}
+
+/// Build the 256-byte PSP at psp_seg:0. INT 20h (CD 20) at offset 0 so a near
+/// RET to PSP:0 terminates; the top-of-memory paragraph at 0x02; an empty
+/// command tail at 0x80. The environment segment, parent PSP, default FCBs, and
+/// the DTA are left zero (later slices).
+fn build_psp(mem: &mut Memory, psp_seg: u16, top_of_mem_paragraph: u16) -> Result<(), DosError> {
+    let base = usize::from(psp_seg) * 16;
+    mem.write_u8(base, 0xcd)?;
+    mem.write_u8(base + 1, 0x20)?;
+    mem.write_u16(base + 2, top_of_mem_paragraph)?;
+    mem.write_u8(base + 0x80, 0x00)?;
+    mem.write_u8(base + 0x81, 0x0d)?;
+    Ok(())
 }
 
 /// Load a .COM image into `mem` at `segment` and build its PSP. Returns the entry
@@ -345,28 +362,23 @@ pub fn load_com(image: &[u8], mem: &mut Memory, segment: u16) -> Result<ProgramE
     if image.len() > COM_MAX_LEN {
         return Err(DosError::ComTooLarge(image.len()));
     }
+    build_psp(mem, segment, segment.wrapping_add(0x1000))?;
     let base = usize::from(segment) * 16;
-    // Minimal PSP. INT 20h (CD 20) at offset 0 so a near RET to PSP:0 terminates.
-    mem.write_u8(base, 0xcd)?;
-    mem.write_u8(base + 1, 0x20)?;
-    // Offset 0x02: segment of the first byte past the program's 64 KiB block.
-    mem.write_u16(base + 2, segment.wrapping_add(0x1000))?;
-    // Offset 0x80: command tail. Empty here: length 0, then a CR. The environment
-    // segment, parent PSP, default FCBs, and DTA are left zero (later slices).
-    mem.write_u8(base + 0x80, 0x00)?;
-    mem.write_u8(base + 0x81, 0x0d)?;
     // Program image at offset 0x100.
     for (index, &byte) in image.iter().enumerate() {
         mem.write_u8(base + 0x100 + index, byte)?;
     }
     // .COM stack: SP=0xFFFE with a 0x0000 return word, so a bare RET lands at
-    // PSP:0 and hits the INT 20h. Written after the image, so a maximum-size image
-    // has its last two bytes overwritten by this word, which is what real DOS does.
+    // PSP:0 and hits the INT 20h. Written after the image, so a maximum-size
+    // image has its last two bytes overwritten, which is what real DOS does.
     mem.write_u16(base + 0xfffe, 0x0000)?;
     Ok(ProgramEntry {
-        segment,
+        cs: segment,
         ip: 0x0100,
+        ss: segment,
         sp: 0xfffe,
+        ds: segment,
+        es: segment,
     })
 }
 
@@ -554,9 +566,12 @@ mod tests {
         assert_eq!(
             entry,
             ProgramEntry {
-                segment: 0x0100,
+                cs: 0x0100,
                 ip: 0x0100,
-                sp: 0xfffe
+                ss: 0x0100,
+                sp: 0xfffe,
+                ds: 0x0100,
+                es: 0x0100,
             }
         );
         let base = 0x0100usize * 16;
