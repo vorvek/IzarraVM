@@ -120,6 +120,7 @@ pub struct Vga {
     pub(crate) frames: u64,
     pub(crate) work: Vec<u8>,
     pub(crate) presented: Option<VgaRaster>,
+    pub(crate) pending_start: Option<u32>,
 }
 
 impl Default for Vga {
@@ -136,6 +137,7 @@ impl Default for Vga {
             frames: 0,
             work: Vec::new(),
             presented: None,
+            pending_start: None,
         }
     }
 }
@@ -262,6 +264,9 @@ impl Vga {
             height: self.raster_height(),
             pixels: self.work.clone(),
         });
+        if let Some(addr) = self.pending_start.take() {
+            self.crtc.start_address = addr; // latched for the next frame
+        }
         self.last_line = 0;
     }
 
@@ -336,6 +341,13 @@ impl Vga {
     ///
     /// Reading this register also resets the Attribute Controller address/data
     /// flip-flop so that the next write to 3C0 is treated as an index.
+    /// Buffer a CRTC start-address change. The value is latched into the active
+    /// start address at the next frame boundary (finalize_frame), so mid-frame
+    /// writes do not tear.
+    pub fn set_start_address(&mut self, addr: u32) {
+        self.pending_start = Some(addr); // snapshot at next vretrace (finalize)
+    }
+
     pub fn read_status1(&mut self) -> u8 {
         self.attr.flip_flop_data = false; // reading 3DA resets the flip-flop
         let mut status = 0u8;
@@ -657,6 +669,27 @@ mod tests {
         vga.attr.pixel_pan = 1;
         let row1 = vga.render_active_row(0);
         assert_eq!(row1[0], row0[1], "pan=1 shifts the row one pixel left");
+    }
+
+    #[test]
+    fn start_address_write_applies_next_frame_not_mid_frame() {
+        let mut vga = Vga::default();
+        vga.set_mode_0dh();
+        vga.advance(htotal_dots(&vga.crtc) * 100); // beam mid-frame, line 100
+        vga.set_start_address(0x2000); // buffered, not active yet
+        assert_eq!(vga.crtc.start_address, 0, "start address unchanged this frame");
+        vga.advance(vga.frame_dots()); // cross the frame boundary
+        assert_eq!(vga.crtc.start_address, 0x2000, "applied on the next frame");
+    }
+
+    #[test]
+    fn start_address_write_during_retrace_still_applies_next_frame() {
+        let mut vga = Vga::default();
+        vga.set_mode_0dh();
+        vga.advance(htotal_dots(&vga.crtc) * (vga.crtc.vretrace_start as u64 + 1));
+        vga.set_start_address(0x4000);
+        vga.advance(vga.frame_dots());
+        assert_eq!(vga.crtc.start_address, 0x4000, "no two-frame lag");
     }
 
     #[test]
