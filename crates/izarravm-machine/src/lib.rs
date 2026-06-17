@@ -2105,6 +2105,22 @@ mod tests {
     }
 
     #[test]
+    fn dos_exe_runs_with_relocation_applied() {
+        // The committed .EXE loads DS from a relocated segment reference, then
+        // prints via AH=09h. Correct output is only possible if load_exe applied
+        // the relocation (otherwise DS is the link-time base and the bytes
+        // diverge), so this doubles as the end-to-end relocation check.
+        let mut machine = Machine::new_dos_program(
+            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            izarravm_firmware::EXEHELLO_EXE,
+        )
+        .unwrap();
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
+        assert_eq!(machine.dos_output(), b"Hello from a relocated .EXE!\r\n");
+    }
+
+    #[test]
     fn dos_com_ah06_zf_reaches_the_guest() {
         // org 0x100: AH=06h DL=0xFF; INT 21h; JZ empty; echo AL via AH=02h; else '!'
         // Proves ZF returned by AH=06h survives the IRET (it is written to the pushed
