@@ -15,8 +15,8 @@ pub struct VbeMode {
     pub bpp: u32,
 }
 
-/// The modes Margo lists, reports, and sets. Slice 2b implements the 8-bit
-/// indexed modes only; hi-color modes arrive in a later slice.
+/// The modes Margo lists, reports, and sets. Includes 8-bit indexed modes
+/// (slice 2b) and hi-color/true-color modes (slice 8): 15bpp, 16bpp, and 32bpp.
 pub const MARGO_VBE_MODES: &[VbeMode] = &[
     VbeMode {
         number: 0x100,
@@ -42,6 +42,60 @@ pub const MARGO_VBE_MODES: &[VbeMode] = &[
         height: 768,
         bpp: 8,
     },
+    VbeMode {
+        number: 0x110,
+        width: 640,
+        height: 480,
+        bpp: 15,
+    },
+    VbeMode {
+        number: 0x111,
+        width: 640,
+        height: 480,
+        bpp: 16,
+    },
+    VbeMode {
+        number: 0x113,
+        width: 800,
+        height: 600,
+        bpp: 15,
+    },
+    VbeMode {
+        number: 0x114,
+        width: 800,
+        height: 600,
+        bpp: 16,
+    },
+    VbeMode {
+        number: 0x116,
+        width: 1024,
+        height: 768,
+        bpp: 15,
+    },
+    VbeMode {
+        number: 0x117,
+        width: 1024,
+        height: 768,
+        bpp: 16,
+    },
+    VbeMode {
+        number: 0x14a,
+        width: 640,
+        height: 480,
+        bpp: 32,
+    },
+    VbeMode {
+        number: 0x14c,
+        width: 800,
+        height: 600,
+        bpp: 32,
+    },
+    VbeMode {
+        number: 0x14e,
+        width: 1024,
+        height: 768,
+        bpp: 32,
+    },
 ];
 
 pub fn vbe_mode(number: u16) -> Option<VbeMode> {
@@ -49,6 +103,84 @@ pub fn vbe_mode(number: u16) -> Option<VbeMode> {
         .iter()
         .copied()
         .find(|mode| mode.number == number)
+}
+
+/// Bytes a pixel of `bpp` occupies in the frame store: 8->1, 15->2, 16->2,
+/// 32->4. The 15bpp case is why this is not `bpp / 8`.
+pub fn bytes_per_pixel(bpp: u32) -> u32 {
+    bpp.div_ceil(8)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Channel {
+    pub pos: u32,  // bit position of the low bit
+    pub size: u32, // bit width
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PixelFormat {
+    pub r: Channel,
+    pub g: Channel,
+    pub b: Channel,
+    pub x: Channel, // unused/reserved bits; size 0 when none
+}
+
+/// Direct-color layout for `bpp`. 8bpp is indexed (palette), not a direct-color
+/// format, so it returns None, as do depths outside the mode table.
+pub fn pixel_format(bpp: u32) -> Option<PixelFormat> {
+    match bpp {
+        15 => Some(PixelFormat {
+            r: Channel { pos: 10, size: 5 },
+            g: Channel { pos: 5, size: 5 },
+            b: Channel { pos: 0, size: 5 },
+            x: Channel { pos: 15, size: 1 },
+        }),
+        16 => Some(PixelFormat {
+            r: Channel { pos: 11, size: 5 },
+            g: Channel { pos: 5, size: 6 },
+            b: Channel { pos: 0, size: 5 },
+            x: Channel { pos: 0, size: 0 },
+        }),
+        32 => Some(PixelFormat {
+            r: Channel { pos: 16, size: 8 },
+            g: Channel { pos: 8, size: 8 },
+            b: Channel { pos: 0, size: 8 },
+            x: Channel { pos: 24, size: 8 },
+        }),
+        _ => None,
+    }
+}
+
+/// Expand a `size`-bit color component to 8 bits by replicating the high bits
+/// into the low ones. Only called with size 5, 6, or 8 (the R/G/B widths here);
+/// the `2 * size - 8` shift assumes size >= 4.
+fn expand_to_8(value: u32, size: u32) -> u32 {
+    if size >= 8 {
+        return value & 0xff;
+    }
+    debug_assert!(
+        size >= 4,
+        "expand_to_8: size {size} below 4 underflows the replicate shift"
+    );
+    let v = value & ((1 << size) - 1);
+    (v << (8 - size)) | (v >> (2 * size - 8))
+}
+
+/// Decode one scanout pixel to host ARGB `0x00RRGGBB`. `bpp` selects the format,
+/// `raw` is the little-endian pixel value already assembled from 1/2/4 bytes,
+/// and `palette` resolves 8-bit indices. Unknown depths decode to black.
+fn decode_argb(bpp: u32, raw: u32, palette: &[u32; 256]) -> u32 {
+    if bpp == 8 {
+        return palette[(raw & 0xff) as usize];
+    }
+    let Some(fmt) = pixel_format(bpp) else {
+        return 0;
+    };
+    // expand_to_8 masks to `size` bits, so the raw shift needs no extra mask.
+    let r = expand_to_8(raw >> fmt.r.pos, fmt.r.size);
+    let g = expand_to_8(raw >> fmt.g.pos, fmt.g.size);
+    let b = expand_to_8(raw >> fmt.b.pos, fmt.b.size);
+    (r << 16) | (g << 8) | b
 }
 
 pub const REG_ID: usize = 0x0000;
@@ -531,7 +663,7 @@ impl Margo {
             width: mode.width,
             height: mode.height,
             bpp: mode.bpp,
-            pitch: mode.width * mode.bpp / 8,
+            pitch: mode.width * bytes_per_pixel(mode.bpp),
             start: 0,
         };
         true
@@ -567,6 +699,38 @@ impl Margo {
         let len = (self.display.pitch as usize).saturating_mul(self.display.height as usize);
         let end = (start + len).min(self.vram.len());
         &self.vram[start..end]
+    }
+
+    /// The visible surface decoded to host ARGB `0x00RRGGBB`, one entry per
+    /// source pixel, `width * height` long. Empty when no mode is set. Reads are
+    /// bounds-checked and default to 0, matching `visible_surface`.
+    pub fn scanout_argb(&self, palette: &[u32; 256]) -> Vec<u32> {
+        let width = self.display.width as usize;
+        let height = self.display.height as usize;
+        let pitch = self.display.pitch as u64;
+        let bpp = self.display.bpp;
+        let depth = bytes_per_pixel(bpp) as u64;
+        let start = self.display.start as u64;
+        let len = self.vram.len() as u64;
+        let mut out = Vec::with_capacity(width * height);
+        for y in 0..height as u64 {
+            for x in 0..width as u64 {
+                // Saturating like the blit paths, so an extreme DISP_START or
+                // pitch skips past the store rather than overflowing the offset.
+                let off = start
+                    .saturating_add(y.saturating_mul(pitch))
+                    .saturating_add(x.saturating_mul(depth));
+                let mut bytes = [0u8; 4];
+                for (i, slot) in bytes.iter_mut().enumerate().take(depth as usize) {
+                    let addr = off.saturating_add(i as u64);
+                    if addr < len {
+                        *slot = self.vram[addr as usize];
+                    }
+                }
+                out.push(decode_argb(bpp, u32::from_le_bytes(bytes), palette));
+            }
+        }
+        out
     }
 
     fn register_u32(&self, reg: usize) -> u32 {
@@ -906,7 +1070,7 @@ mod tests {
     #[test]
     fn set_mode_rejects_modes_outside_the_table() {
         let mut margo = Margo::default();
-        assert!(!margo.set_mode(0x111)); // 640x480x16, not implemented in this slice
+        assert!(!margo.set_mode(0x112)); // 640x480x24 packed, not in the table
         assert_eq!(margo.display(), MargoDisplay::default());
     }
 
@@ -2805,5 +2969,109 @@ mod tests {
         write_reg(&mut margo, REG_COMMAND, 0x03);
         write_reg(&mut margo, REG_MONO_DATA, 0x8000_0000); // one word, col 0 set
         assert_eq!(margo.read_vram_u8(0), 0xaa ^ 0x0f);
+    }
+
+    #[test]
+    fn bytes_per_pixel_rounds_up_to_whole_bytes() {
+        assert_eq!(bytes_per_pixel(8), 1);
+        assert_eq!(bytes_per_pixel(15), 2);
+        assert_eq!(bytes_per_pixel(16), 2);
+        assert_eq!(bytes_per_pixel(32), 4);
+    }
+
+    #[test]
+    fn vbe_mode_lookup_finds_hicolor_modes() {
+        assert_eq!(vbe_mode(0x110).unwrap().bpp, 15);
+        assert_eq!(vbe_mode(0x111).unwrap().bpp, 16);
+        assert_eq!(vbe_mode(0x14a).unwrap().bpp, 32);
+        assert_eq!(vbe_mode(0x14e).unwrap().width, 1024);
+    }
+
+    #[test]
+    fn set_mode_pitch_uses_whole_byte_pixels() {
+        let mut margo = Margo::default();
+        margo.set_mode(0x110); // 640x480x15
+        assert_eq!(margo.display().bpp, 15);
+        assert_eq!(margo.display().pitch, 1280); // 640 * 2, not 640 * 15 / 8
+        margo.set_mode(0x111); // 640x480x16
+        assert_eq!(margo.display().pitch, 1280);
+        margo.set_mode(0x14a); // 640x480x32
+        assert_eq!(margo.display().pitch, 2560);
+    }
+
+    #[test]
+    fn pixel_format_describes_direct_color_layouts() {
+        assert!(pixel_format(8).is_none()); // indexed, not direct color
+        let f16 = pixel_format(16).unwrap();
+        assert_eq!((f16.r.pos, f16.r.size), (11, 5));
+        assert_eq!((f16.g.pos, f16.g.size), (5, 6));
+        assert_eq!((f16.b.pos, f16.b.size), (0, 5));
+        let f15 = pixel_format(15).unwrap();
+        assert_eq!((f15.r.pos, f15.r.size), (10, 5));
+        assert_eq!((f15.x.pos, f15.x.size), (15, 1));
+        let f32 = pixel_format(32).unwrap();
+        assert_eq!((f32.r.pos, f32.r.size), (16, 8));
+        assert_eq!((f32.x.pos, f32.x.size), (24, 8));
+    }
+
+    #[test]
+    fn decode_argb_handles_each_format() {
+        let palette = {
+            let mut p = [0u32; 256];
+            p[7] = 0x0012_3456;
+            p
+        };
+        // 8bpp indexed: straight palette lookup.
+        assert_eq!(decode_argb(8, 7, &palette), 0x0012_3456);
+        // 16bpp R5G6B5: red, green, blue, white, black.
+        assert_eq!(decode_argb(16, 0xf800, &palette), 0x00ff_0000);
+        assert_eq!(decode_argb(16, 0x07e0, &palette), 0x0000_ff00);
+        assert_eq!(decode_argb(16, 0x001f, &palette), 0x0000_00ff);
+        assert_eq!(decode_argb(16, 0xffff, &palette), 0x00ff_ffff);
+        assert_eq!(decode_argb(16, 0x0000, &palette), 0x0000_0000);
+        // 15bpp X1R5G5B5: red, green, blue; the X bit is ignored.
+        assert_eq!(decode_argb(15, 0x7c00, &palette), 0x00ff_0000);
+        assert_eq!(decode_argb(15, 0x03e0, &palette), 0x0000_ff00);
+        assert_eq!(decode_argb(15, 0x001f, &palette), 0x0000_00ff);
+        assert_eq!(decode_argb(15, 0x8000 | 0x7c00, &palette), 0x00ff_0000);
+        // 32bpp X8R8G8B8: the X byte is ignored.
+        assert_eq!(decode_argb(32, 0x0034_5678, &palette), 0x0034_5678);
+        assert_eq!(decode_argb(32, 0xff34_5678, &palette), 0x0034_5678);
+    }
+
+    #[test]
+    fn scanout_argb_decodes_the_visible_surface() {
+        let palette = [0u32; 256];
+        let mut margo = Margo::default();
+        // No mode set yet: empty scanout.
+        assert!(margo.scanout_argb(&palette).is_empty());
+
+        margo.set_mode(0x111); // 640x480x16, pitch 1280
+        // Red pixel at (3, 2): offset 2*1280 + 3*2 = 2566; R5G6B5 red = 0xf800 LE.
+        margo.write_vram_u8(2566, 0x00);
+        margo.write_vram_u8(2567, 0xf8);
+        // Green pixel at (0, 0): 0x07e0 LE.
+        margo.write_vram_u8(0, 0xe0);
+        margo.write_vram_u8(1, 0x07);
+
+        let argb = margo.scanout_argb(&palette);
+        assert_eq!(argb.len(), 640 * 480);
+        assert_eq!(argb[2 * 640 + 3], 0x00ff_0000);
+        assert_eq!(argb[0], 0x0000_ff00);
+        assert_eq!(argb[1], 0x0000_0000); // untouched pixel
+    }
+
+    #[test]
+    fn scanout_argb_decodes_32bpp_pixels() {
+        let palette = [0u32; 256];
+        let mut margo = Margo::default();
+        margo.set_mode(0x14a); // 640x480x32, pitch 2560
+        // X8R8G8B8 0xff345678 at (1, 1): offset 1*2560 + 1*4 = 2564; X byte ignored.
+        for (i, b) in 0xff34_5678u32.to_le_bytes().into_iter().enumerate() {
+            margo.write_vram_u8(2564 + i, b);
+        }
+        let argb = margo.scanout_argb(&palette);
+        assert_eq!(argb.len(), 640 * 480);
+        assert_eq!(argb[640 + 1], 0x0034_5678);
     }
 }

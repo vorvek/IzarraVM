@@ -393,12 +393,9 @@ impl WindowApp {
     fn render_current_frame(&self) -> RenderedFrame {
         match self.machine.active_display() {
             ActiveDisplay::MargoLfb => {
+                let palette = self.machine.palette_argb();
                 let margo = self.machine.margo();
-                render_margo_lfb(
-                    margo.display(),
-                    margo.visible_surface(),
-                    &self.machine.palette_argb(),
-                )
+                render_margo_lfb(margo.display(), &margo.scanout_argb(&palette))
             }
             ActiveDisplay::Mode13h => render_mode13h(
                 self.machine.mode13h_framebuffer(),
@@ -549,18 +546,19 @@ fn load_margo_test_pattern(machine: &mut Machine) {
     }
 }
 
-fn render_margo_lfb(display: MargoDisplay, vram: &[u8], palette: &[u32; 256]) -> RenderedFrame {
+fn render_margo_lfb(display: MargoDisplay, scanout: &[u32]) -> RenderedFrame {
     let width = display.width as usize;
     let height = display.height as usize;
-    let pitch = display.pitch as usize;
     let out_width = width * MARGO_LFB_SCALE;
     let out_height = height * MARGO_LFB_SCALE;
-    let mut pixels = vec![palette[0]; out_width * out_height];
+    let mut pixels = vec![0u32; out_width * out_height];
 
     for source_y in 0..height {
         for source_x in 0..width {
-            let index = vram.get(source_y * pitch + source_x).copied().unwrap_or(0);
-            let color = palette[usize::from(index)];
+            let color = scanout
+                .get(source_y * width + source_x)
+                .copied()
+                .unwrap_or(0);
             for scale_y in 0..MARGO_LFB_SCALE {
                 for scale_x in 0..MARGO_LFB_SCALE {
                     let x = source_x * MARGO_LFB_SCALE + scale_x;
@@ -666,25 +664,19 @@ mod tests {
     }
 
     #[test]
-    fn margo_lfb_renderer_maps_indices_through_palette() {
-        let display = izarravm_video::MargoDisplay {
-            mode: 0x0101,
-            width: 4,
-            height: 2,
-            bpp: 8,
-            pitch: 4,
-            start: 0,
+    fn render_margo_lfb_scales_decoded_pixels() {
+        let display = MargoDisplay {
+            width: 2,
+            height: 1,
+            ..MargoDisplay::default()
         };
-        let vram = [0u8, 1, 0, 0, 0, 0, 0, 0];
-        let mut palette = [0u32; 256];
-        palette[1] = 0x0012_3456;
-
-        let rendered = render_margo_lfb(display, &vram, &palette);
-
-        assert_eq!(rendered.width, 4 * MARGO_LFB_SCALE);
-        assert_eq!(rendered.height, 2 * MARGO_LFB_SCALE);
-        // Source pixel (1,0) has index 1.
-        assert_eq!(rendered.pixels[MARGO_LFB_SCALE], 0x0012_3456);
+        let scanout = [0x00ff_0000u32, 0x0000_00ffu32];
+        let frame = render_margo_lfb(display, &scanout);
+        assert_eq!(frame.width, 2 * MARGO_LFB_SCALE);
+        assert_eq!(frame.height, MARGO_LFB_SCALE);
+        // Top-left block is red, the next block over is blue.
+        assert_eq!(frame.pixels[0], 0x00ff_0000);
+        assert_eq!(frame.pixels[MARGO_LFB_SCALE], 0x0000_00ff);
     }
 
     #[test]

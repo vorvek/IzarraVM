@@ -115,6 +115,33 @@ void plot8(int x, int y, int pitch, unsigned char color) {
 Direct writes are fine for a handful of pixels. For rectangles, text, and
 scrolling, the blit engine is far faster, and that is the rest of this guide.
 
+## Writing pixels in a hi-color mode
+
+A 16-bit mode stores each pixel as `R5G6B5`, two bytes, no palette. Set the mode,
+then pack 8-bit color components down to 5/6/5 and write the 16-bit value.
+
+```c
+/* (verified) */
+#include <dos.h>
+
+void set_mode_640x480x16(void) {
+    union REGS r;
+    r.x.ax = 0x4F02;
+    r.x.bx = 0x0111 | 0x4000;   /* mode 0x111 (R5G6B5), linear frame buffer */
+    int86(0x10, &r, &r);
+}
+
+void plot16(int x, int y, int pitch, int red, int green, int blue) {
+    unsigned short pixel = ((red >> 3) << 11) | ((green >> 2) << 5) | (blue >> 3);
+    unsigned short *p = (unsigned short *)(LFB + y * pitch + x * 2);
+    *p = pixel;
+}
+```
+
+For a 15-bit mode (`0x110`), the layout is `X1R5G5B5`: pack as
+`((red >> 3) << 10) | ((green >> 3) << 5) | (blue >> 3)`. Read `DISP_BPP` and the
+mode's color masks (VBE `4F01h`) rather than assuming the format.
+
 ## Filling a rectangle
 
 The engine model is the same for every operation: latch the parameters, write

@@ -6,7 +6,7 @@ pub use izarravm_video::MARGO_ID_VALUE;
 use izarravm_video::{
     DAC_ENTRIES, Framebuffer, MARGO_MMIO_SIZE, MARGO_VBE_MODES, MARGO_VRAM_SIZE,
     MODE13H_MEMORY_SIZE, Margo, TextFrame, VGA_MODE13H_BASE, VGA_TEXT_BASE, VGA_TEXT_MEMORY_SIZE,
-    VgaTextMode, VideoMode, vbe_mode,
+    VgaTextMode, VideoMode, bytes_per_pixel, pixel_format, vbe_mode,
 };
 use std::collections::VecDeque;
 use thiserror::Error;
@@ -559,7 +559,7 @@ impl Machine {
             self.set_vbe_status(0x014f);
             return;
         };
-        let pitch = (info.width * info.bpp / 8) as u16;
+        let pitch = (info.width * bytes_per_pixel(info.bpp)) as u16;
         let mut block = [0u8; 256];
         block[0x00..0x02].copy_from_slice(&0x009bu16.to_le_bytes()); // ModeAttributes: supported, color, graphics, linear-fb
         block[0x10..0x12].copy_from_slice(&pitch.to_le_bytes()); // BytesPerScanLine
@@ -568,6 +568,16 @@ impl Machine {
         block[0x18] = 1; // NumberOfPlanes
         block[0x19] = info.bpp as u8; // BitsPerPixel
         block[0x1b] = 4; // MemoryModel: packed pixel
+        if let Some(fmt) = pixel_format(info.bpp) {
+            block[0x1f] = fmt.r.size as u8; // RedMaskSize
+            block[0x20] = fmt.r.pos as u8; // RedFieldPosition
+            block[0x21] = fmt.g.size as u8; // GreenMaskSize
+            block[0x22] = fmt.g.pos as u8; // GreenFieldPosition
+            block[0x23] = fmt.b.size as u8; // BlueMaskSize
+            block[0x24] = fmt.b.pos as u8; // BlueFieldPosition
+            block[0x25] = fmt.x.size as u8; // RsvdMaskSize
+            block[0x26] = fmt.x.pos as u8; // RsvdFieldPosition
+        }
         block[0x28..0x2c].copy_from_slice(&MARGO_LFB_BASE.to_le_bytes()); // PhysBasePtr
         let addr = self.vbe_block_ptr();
         self.write_guest_block(addr, &block);
@@ -1531,10 +1541,10 @@ mod tests {
     }
 
     #[test]
-    fn vbe_set_mode_rejects_hi_color_modes() {
+    fn vbe_set_mode_accepts_hi_color_modes() {
         let rom = rom_with_code(&[
             0xb8, 0x02, 0x4f, // mov ax, 4F02h
-            0xbb, 0x11, 0x01, // mov bx, 0111h (640x480x16, not in this slice)
+            0xbb, 0x11, 0x41, // mov bx, 0111h | 4000h (640x480x16, linear frame buffer)
             0xcd, 0x10, // int 10h
             0xf4, // hlt
         ]);
@@ -1543,8 +1553,9 @@ mod tests {
 
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
         assert_eq!(reason, StopReason::Halted);
-        assert_eq!(machine.cpu().registers.eax() as u16, 0x014f);
-        assert_eq!(machine.active_display(), ActiveDisplay::Text);
+        assert_eq!(machine.cpu().registers.eax() as u16, 0x004f);
+        assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
+        assert_eq!(machine.margo().display().bpp, 16);
     }
 
     #[test]
@@ -1883,14 +1894,18 @@ mod tests {
         assert_eq!(read_u32(&mut machine, base + 0x06), 0); // OemStringPtr
         assert_eq!(read_u32(&mut machine, base + 0x0a), 0); // Capabilities
 
-        // VideoModePtr (seg:off) must point at the mode list.
+        // VideoModePtr (seg:off) must point at the mode list, which lists every
+        // entry in MARGO_VBE_MODES (8bpp then hi-color then true-color) and ends
+        // with the 0xffff terminator.
         let ptr = read_u32(&mut machine, base + 0x0e);
         let list = (((ptr >> 16) & 0xffff) << 4) + (ptr & 0xffff);
-        assert_eq!(read_u16(&mut machine, list), 0x0100);
-        assert_eq!(read_u16(&mut machine, list + 2), 0x0101);
-        assert_eq!(read_u16(&mut machine, list + 4), 0x0103);
-        assert_eq!(read_u16(&mut machine, list + 6), 0x0105);
-        assert_eq!(read_u16(&mut machine, list + 8), 0xffff);
+        let expected = [
+            0x0100, 0x0101, 0x0103, 0x0105, 0x0110, 0x0111, 0x0113, 0x0114, 0x0116, 0x0117, 0x014a,
+            0x014c, 0x014e, 0xffff,
+        ];
+        for (i, &mode) in expected.iter().enumerate() {
+            assert_eq!(read_u16(&mut machine, list + (i * 2) as u32), mode);
+        }
     }
 
     #[test]
@@ -1900,7 +1915,7 @@ mod tests {
             0x8e, 0xc0, // mov es, ax
             0xbf, 0x00, 0x00, // mov di, 0
             0xb8, 0x01, 0x4f, // mov ax, 4F01h
-            0xb9, 0x11, 0x01, // mov cx, 0111h (not in the table)
+            0xb9, 0x12, 0x01, // mov cx, 0112h (640x480x24, packed 24-bit not provided)
             0xcd, 0x10, // int 10h
             0xf4, // hlt
         ]);
@@ -2226,5 +2241,83 @@ mod tests {
         assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
         machine.advance_devices(1);
         assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 0);
+    }
+
+    #[test]
+    fn vbe_mode_info_reports_hicolor_masks() {
+        // ES = 0x4000 -> physical 0x40000, DI = 0, mode 0x0111 (R5G6B5).
+        let rom = rom_with_code(&[
+            0xb8, 0x00, 0x40, // mov ax, 4000h
+            0x8e, 0xc0, // mov es, ax
+            0xbf, 0x00, 0x00, // mov di, 0
+            0xb8, 0x01, 0x4f, // mov ax, 4F01h
+            0xb9, 0x11, 0x01, // mov cx, 0111h
+            0xcd, 0x10, // int 10h
+            0xf4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+        assert_eq!(
+            machine.run_until_halt_or_cycles(1_000_000).unwrap(),
+            StopReason::Halted
+        );
+        assert_eq!(machine.cpu().registers.eax() as u16, 0x004f);
+
+        let base = 0x40000;
+        assert_eq!(read_u16(&mut machine, base + 0x10), 1280); // BytesPerScanLine = 640 * 2
+        assert_eq!(machine.read_physical_u8(base + 0x19), 16); // BitsPerPixel
+        assert_eq!(machine.read_physical_u8(base + 0x1f), 5); // RedMaskSize
+        assert_eq!(machine.read_physical_u8(base + 0x20), 11); // RedFieldPosition
+        assert_eq!(machine.read_physical_u8(base + 0x21), 6); // GreenMaskSize
+        assert_eq!(machine.read_physical_u8(base + 0x22), 5); // GreenFieldPosition
+        assert_eq!(machine.read_physical_u8(base + 0x23), 5); // BlueMaskSize
+        assert_eq!(machine.read_physical_u8(base + 0x24), 0); // BlueFieldPosition
+        assert_eq!(machine.read_physical_u8(base + 0x25), 0); // RsvdMaskSize (R5G6B5 has none)
+    }
+
+    #[test]
+    fn vbe_mode_info_reports_15bpp_masks() {
+        // Mode 0x0110 (X1R5G5B5): five-bit channels plus a one-bit reserved field.
+        let rom = rom_with_code(&[
+            0xb8, 0x00, 0x40, // mov ax, 4000h
+            0x8e, 0xc0, // mov es, ax
+            0xbf, 0x00, 0x00, // mov di, 0
+            0xb8, 0x01, 0x4f, // mov ax, 4F01h
+            0xb9, 0x10, 0x01, // mov cx, 0110h
+            0xcd, 0x10, // int 10h
+            0xf4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+        assert_eq!(
+            machine.run_until_halt_or_cycles(1_000_000).unwrap(),
+            StopReason::Halted
+        );
+        assert_eq!(machine.cpu().registers.eax() as u16, 0x004f);
+
+        let base = 0x40000;
+        assert_eq!(read_u16(&mut machine, base + 0x10), 1280); // BytesPerScanLine = 640 * 2
+        assert_eq!(machine.read_physical_u8(base + 0x19), 15); // BitsPerPixel
+        assert_eq!(machine.read_physical_u8(base + 0x1f), 5); // RedMaskSize
+        assert_eq!(machine.read_physical_u8(base + 0x20), 10); // RedFieldPosition
+        assert_eq!(machine.read_physical_u8(base + 0x21), 5); // GreenMaskSize
+        assert_eq!(machine.read_physical_u8(base + 0x22), 5); // GreenFieldPosition
+        assert_eq!(machine.read_physical_u8(base + 0x23), 5); // BlueMaskSize
+        assert_eq!(machine.read_physical_u8(base + 0x24), 0); // BlueFieldPosition
+        assert_eq!(machine.read_physical_u8(base + 0x25), 1); // RsvdMaskSize (the X bit)
+        assert_eq!(machine.read_physical_u8(base + 0x26), 15); // RsvdFieldPosition
+    }
+
+    #[test]
+    fn hicolor_scanout_decodes_through_the_lfb_aperture() {
+        let mut machine = test_machine();
+        machine.margo_mut().set_mode(0x111); // 640x480x16, pitch 1280
+        // Red pixel (0xf800) at (3, 2): offset 2*1280 + 3*2 = 2566.
+        machine.write_physical_u8(MARGO_LFB_BASE + 2566, 0x00);
+        machine.write_physical_u8(MARGO_LFB_BASE + 2567, 0xf8);
+
+        let palette = machine.palette_argb();
+        let argb = machine.margo().scanout_argb(&palette);
+        assert_eq!(argb[2 * 640 + 3], 0x00ff_0000);
     }
 }
