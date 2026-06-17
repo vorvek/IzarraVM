@@ -19,6 +19,14 @@ pub enum DosError {
     Memory(#[from] BusError),
     #[error("COM image is too large at {0} bytes (max 65280)")]
     ComTooLarge(usize),
+    #[error("not an MZ executable (bad signature)")]
+    BadExeSignature,
+    #[error("MZ image is truncated: {0}")]
+    ExeImageTruncated(&'static str),
+    #[error("MZ relocation points outside the load module")]
+    ExeRelocationOutOfRange,
+    #[error("not enough memory to load the MZ image ({needed} paragraphs, {available} available)")]
+    ExeNotEnoughMemory { needed: u32, available: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -330,6 +338,11 @@ impl DosKernel {
 /// The largest .COM image: a 64 KiB segment minus the 256-byte PSP.
 const COM_MAX_LEN: usize = 0x10000 - 0x100;
 
+/// Conventional memory is modeled as one block ending at the 640 KiB video
+/// aperture (paragraph 0xA000). ponytail: single block, no MCB chain / EBDA /
+/// UMB; an .EXE that walks or resizes the memory arena is out of scope.
+const CONVENTIONAL_TOP_PARAGRAPH: u32 = 0xa000;
+
 /// Where to start executing a loaded program. A .COM sets all six to its single
 /// load segment; an .EXE sets a distinct CS:IP and SS:SP with DS=ES=PSP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -379,6 +392,110 @@ pub fn load_com(image: &[u8], mem: &mut Memory, segment: u16) -> Result<ProgramE
         sp: 0xfffe,
         ds: segment,
         es: segment,
+    })
+}
+
+/// Load a DOS MZ/.EXE into `mem`: parse the 0x1C-byte header, copy the load
+/// module to start_seg:0 (start_seg = psp_segment + 0x10), apply each relocation
+/// (add start_seg to the flagged word), build the PSP, and return the entry
+/// state (CS:IP and SS:SP from the header, DS=ES=PSP). Conventional memory is
+/// one block ending at paragraph 0xA000; e_minalloc is enforced and e_maxalloc
+/// clamps the PSP top-of-memory word.
+pub fn load_exe(
+    image: &[u8],
+    mem: &mut Memory,
+    psp_segment: u16,
+) -> Result<ProgramEntry, DosError> {
+    if image.len() < 0x1c {
+        return Err(DosError::ExeImageTruncated(
+            "header shorter than 0x1C bytes",
+        ));
+    }
+    let word = |off: usize| u16::from_le_bytes([image[off], image[off + 1]]);
+    if word(0x00) != 0x5a4d {
+        return Err(DosError::BadExeSignature);
+    }
+    let e_cblp = word(0x02);
+    let e_cp = word(0x04);
+    let e_crlc = word(0x06);
+    let e_cparhdr = word(0x08);
+    let e_minalloc = word(0x0a);
+    let e_maxalloc = word(0x0c);
+    let e_ss = word(0x0e);
+    let e_sp = word(0x10);
+    let e_ip = word(0x14);
+    let e_cs = word(0x16);
+    let e_lfarlc = word(0x18);
+
+    if e_cp == 0 {
+        return Err(DosError::ExeImageTruncated("page count e_cp is zero"));
+    }
+    let header_bytes = usize::from(e_cparhdr) * 16;
+    let last_page = if e_cblp != 0 {
+        512 - usize::from(e_cblp)
+    } else {
+        0
+    };
+    let image_size = usize::from(e_cp) * 512 - last_page;
+    if header_bytes > image_size || image_size > image.len() {
+        return Err(DosError::ExeImageTruncated(
+            "load module extends past the file",
+        ));
+    }
+    let module = &image[header_bytes..image_size];
+    let module_len = module.len();
+    let module_paras = module_len.div_ceil(16) as u32;
+
+    let start_seg = psp_segment.wrapping_add(0x10);
+    let needed = u32::from(start_seg) + module_paras + u32::from(e_minalloc);
+    if needed > CONVENTIONAL_TOP_PARAGRAPH {
+        return Err(DosError::ExeNotEnoughMemory {
+            needed,
+            available: CONVENTIONAL_TOP_PARAGRAPH,
+        });
+    }
+
+    // Top of the program's block: honor e_maxalloc, clamp to conventional memory.
+    let top_paragraph = (u32::from(start_seg) + module_paras + u32::from(e_maxalloc))
+        .min(CONVENTIONAL_TOP_PARAGRAPH) as u16;
+    build_psp(mem, psp_segment, top_paragraph)?;
+
+    // Copy the load module to start_seg:0.
+    let base = usize::from(start_seg) * 16;
+    for (index, &byte) in module.iter().enumerate() {
+        mem.write_u8(base + index, byte)?;
+    }
+
+    // Apply relocations: each (off, seg) names a word at module offset
+    // seg*16+off; add start_seg so the segment reference points at the real load
+    // address. ponytail: out-of-range relocations are rejected rather than
+    // applied blindly as real DOS would (avoids corrupting arbitrary memory).
+    let reloc_end = usize::from(e_lfarlc) + usize::from(e_crlc) * 4;
+    if reloc_end > image.len() {
+        return Err(DosError::ExeImageTruncated(
+            "relocation table extends past the file",
+        ));
+    }
+    for i in 0..usize::from(e_crlc) {
+        let entry = usize::from(e_lfarlc) + i * 4;
+        let off = u16::from_le_bytes([image[entry], image[entry + 1]]);
+        let seg = u16::from_le_bytes([image[entry + 2], image[entry + 3]]);
+        let module_offset = usize::from(seg) * 16 + usize::from(off);
+        if module_offset + 2 > module_len {
+            return Err(DosError::ExeRelocationOutOfRange);
+        }
+        let target = base + module_offset;
+        let value = mem.read_u16(target)?;
+        mem.write_u16(target, value.wrapping_add(start_seg))?;
+    }
+
+    Ok(ProgramEntry {
+        cs: start_seg.wrapping_add(e_cs),
+        ip: e_ip,
+        ss: start_seg.wrapping_add(e_ss),
+        sp: e_sp,
+        ds: psp_segment,
+        es: psp_segment,
     })
 }
 
@@ -878,5 +995,156 @@ mod tests {
         close(&mut kernel, &mut mem, h1);
         let h3 = open_data(&mut kernel, &mut mem);
         assert_eq!(h3, 5); // lowest free handle reused
+    }
+
+    /// Build a minimal MZ image: a 32-byte (2-paragraph) header so the relocation
+    /// table at 0x1C fits, then the load module. e_cp/e_cblp are chosen so
+    /// image_size == header + module == the returned file length.
+    #[allow(clippy::too_many_arguments)]
+    fn build_mz(
+        module: &[u8],
+        relocs: &[(u16, u16)],
+        e_cs: u16,
+        e_ip: u16,
+        e_ss: u16,
+        e_sp: u16,
+        e_minalloc: u16,
+        e_maxalloc: u16,
+    ) -> Vec<u8> {
+        let e_cparhdr: u16 = 2;
+        let header_bytes = usize::from(e_cparhdr) * 16;
+        assert!(
+            0x1c + relocs.len() * 4 <= header_bytes,
+            "relocs overflow header"
+        );
+        let total = header_bytes + module.len();
+        let e_cp = total.div_ceil(512) as u16;
+        let e_cblp = (total % 512) as u16;
+        let e_lfarlc: u16 = 0x1c;
+        let mut img = vec![0u8; total];
+        img[0..2].copy_from_slice(b"MZ");
+        img[2..4].copy_from_slice(&e_cblp.to_le_bytes());
+        img[4..6].copy_from_slice(&e_cp.to_le_bytes());
+        img[6..8].copy_from_slice(&(relocs.len() as u16).to_le_bytes());
+        img[8..10].copy_from_slice(&e_cparhdr.to_le_bytes());
+        img[10..12].copy_from_slice(&e_minalloc.to_le_bytes());
+        img[12..14].copy_from_slice(&e_maxalloc.to_le_bytes());
+        img[14..16].copy_from_slice(&e_ss.to_le_bytes());
+        img[16..18].copy_from_slice(&e_sp.to_le_bytes());
+        img[20..22].copy_from_slice(&e_ip.to_le_bytes());
+        img[22..24].copy_from_slice(&e_cs.to_le_bytes());
+        img[24..26].copy_from_slice(&e_lfarlc.to_le_bytes());
+        for (i, (off, seg)) in relocs.iter().enumerate() {
+            let p = 0x1c + i * 4;
+            img[p..p + 2].copy_from_slice(&off.to_le_bytes());
+            img[p + 2..p + 4].copy_from_slice(&seg.to_le_bytes());
+        }
+        img[header_bytes..].copy_from_slice(module);
+        img
+    }
+
+    #[test]
+    fn load_exe_parses_entry_and_places_module() {
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let module = [0xaa, 0xbb, 0xcc, 0xdd];
+        let image = build_mz(&module, &[], 0x0002, 0x0010, 0x0001, 0x0200, 0x10, 0xffff);
+        let psp = 0x0100u16;
+        let start_seg = psp + 0x10;
+        let entry = load_exe(&image, &mut mem, psp).unwrap();
+        assert_eq!(entry.cs, start_seg + 0x0002);
+        assert_eq!(entry.ip, 0x0010);
+        assert_eq!(entry.ss, start_seg + 0x0001);
+        assert_eq!(entry.sp, 0x0200);
+        assert_eq!(entry.ds, psp);
+        assert_eq!(entry.es, psp);
+        let base = usize::from(start_seg) * 16;
+        assert_eq!(mem.read_u8(base).unwrap(), 0xaa);
+        assert_eq!(mem.read_u8(base + 3).unwrap(), 0xdd);
+    }
+
+    #[test]
+    fn load_exe_applies_relocation() {
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        // 8-byte module; the word at offset 4 holds 0x0000 (the link-time segment).
+        let module = [0u8; 8];
+        let image = build_mz(&module, &[(4u16, 0u16)], 0, 0, 0, 0x100, 0x10, 0xffff);
+        let psp = 0x0100u16;
+        let start_seg = psp + 0x10;
+        load_exe(&image, &mut mem, psp).unwrap();
+        let target = usize::from(start_seg) * 16 + 4;
+        // The relocation added start_seg to the original 0x0000.
+        assert_eq!(mem.read_u16(target).unwrap(), start_seg);
+    }
+
+    #[test]
+    fn load_exe_builds_psp() {
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let module = [0x90u8; 16];
+        let image = build_mz(&module, &[], 0, 0, 0, 0x100, 0x10, 0x20);
+        let psp = 0x0100u16;
+        load_exe(&image, &mut mem, psp).unwrap();
+        let base = usize::from(psp) * 16;
+        assert_eq!(mem.read_u8(base).unwrap(), 0xcd);
+        assert_eq!(mem.read_u8(base + 1).unwrap(), 0x20);
+        // top = min(0xA000, start_seg(0x110) + module_paras(1) + maxalloc(0x20)) = 0x131
+        assert_eq!(mem.read_u16(base + 2).unwrap(), 0x0131);
+        assert_eq!(mem.read_u8(base + 0x80).unwrap(), 0x00);
+        assert_eq!(mem.read_u8(base + 0x81).unwrap(), 0x0d);
+    }
+
+    #[test]
+    fn load_exe_rejects_bad_signature() {
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let mut image = build_mz(&[0u8; 16], &[], 0, 0, 0, 0x100, 0x10, 0xffff);
+        image[0] = b'X';
+        assert!(matches!(
+            load_exe(&image, &mut mem, 0x100),
+            Err(DosError::BadExeSignature)
+        ));
+    }
+
+    #[test]
+    fn load_exe_rejects_truncated_header() {
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let image = [0x4d, 0x5a, 0x00];
+        assert!(matches!(
+            load_exe(&image, &mut mem, 0x100),
+            Err(DosError::ExeImageTruncated(_))
+        ));
+    }
+
+    #[test]
+    fn load_exe_rejects_truncated_module() {
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let mut image = build_mz(&[0u8; 16], &[], 0, 0, 0, 0x100, 0x10, 0xffff);
+        // Inflate e_cp and clear e_cblp so image_size far exceeds the file length.
+        image[4..6].copy_from_slice(&9u16.to_le_bytes());
+        image[2..4].copy_from_slice(&0u16.to_le_bytes());
+        assert!(matches!(
+            load_exe(&image, &mut mem, 0x100),
+            Err(DosError::ExeImageTruncated(_))
+        ));
+    }
+
+    #[test]
+    fn load_exe_rejects_out_of_bounds_relocation() {
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        // module is 8 bytes; the reloc points at module offset 100 (seg=0, off=100).
+        let image = build_mz(&[0u8; 8], &[(100u16, 0u16)], 0, 0, 0, 0x100, 0x10, 0xffff);
+        assert!(matches!(
+            load_exe(&image, &mut mem, 0x100),
+            Err(DosError::ExeRelocationOutOfRange)
+        ));
+    }
+
+    #[test]
+    fn load_exe_rejects_insufficient_memory() {
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        // e_minalloc overruns paragraph 0xA000.
+        let image = build_mz(&[0u8; 16], &[], 0, 0, 0, 0x100, 0xffff, 0xffff);
+        assert!(matches!(
+            load_exe(&image, &mut mem, 0x100),
+            Err(DosError::ExeNotEnoughMemory { .. })
+        ));
     }
 }
