@@ -2564,6 +2564,43 @@ mod tests {
     }
 
     #[test]
+    fn display_address_wrap_seam_through_the_machine() {
+        let mut machine = test_machine();
+        machine.set_vga_mode_0dh(); // byte mode
+        // Plane 0 datapath: map mask plane 0, full bit mask, write mode 0 (reset default).
+        machine.video_mut().write_port(0x3C4, 0x02);
+        machine.video_mut().write_port(0x3C5, 0x01);
+        machine.video_mut().write_port(0x3CE, 0x08);
+        machine.video_mut().write_port(0x3CF, 0xFF);
+        // Mark the top of VRAM: plane 0 offset 0 = 0xFF (pixels 0..7 -> attribute index 1).
+        machine.write_physical_u8(0x000A_0000, 0xFF);
+        // Identity palette so index 1 -> DAC 1.
+        machine.video_mut().read_status1(); // reset attr flip-flop to index
+        for i in 0..16u8 {
+            machine.video_mut().write_port(0x3C0, i);
+            machine.video_mut().write_port(0x3C0, i);
+        }
+        // Set start_address = 0xFFF8 through the CRTC ports (buffered until vretrace).
+        machine.video_mut().write_port(0x3D4, 0x0C); // start address high
+        machine.video_mut().write_port(0x3D5, 0xFF);
+        machine.video_mut().write_port(0x3D4, 0x0D); // start address low
+        machine.video_mut().write_port(0x3D5, 0xF8);
+        // First frame latches the buffered start address; the second renders with it.
+        machine.advance_devices(400_000);
+        machine.advance_devices(400_000);
+        let raster = machine.vga_raster().expect("a frame presented");
+        let w = raster.width as usize; // 320
+        // Row 0: pixels 0..63 read 0xFFF8..0xFFFF (clear), pixels 64..71 wrap to offset 0.
+        assert_eq!(raster.pixels[0], 0, "pre-wrap pixel reads the cleared tail");
+        assert_eq!(
+            raster.pixels[64], 1,
+            "wrapped scanout pixel equals the top-of-VRAM pixel (no tear)"
+        );
+        // Sanity: still on row 0 of the active area.
+        assert!(w >= 72);
+    }
+
+    #[test]
     fn set_vga_mode_selects_planar_geometry_per_number() {
         let mut machine = test_machine();
 
