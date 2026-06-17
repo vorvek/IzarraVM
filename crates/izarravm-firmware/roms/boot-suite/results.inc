@@ -32,6 +32,7 @@ opl3_record:
      db 'FAIL sound.sb_dsp_reset', 10
 sb_8bit_dma_record:
      db 'FAIL sound.sb_8bit_dma', 10
+sb_16bit_dma_record:
      db 'FAIL sound.sb_16bit_dma', 10
     db 'FAIL sound.sb_adpcm', 10
 timer_record:

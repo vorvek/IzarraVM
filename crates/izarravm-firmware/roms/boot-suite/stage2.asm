@@ -26,8 +26,14 @@ org 0x8000
 %define DMA1_COUNT 0x03
 %define DMA1_PAGE 0x83
 %define DMA1_MASK 0x0A
+%define DMA2_MODE 0xD6
+%define DMA2_ADDR 0xC4
+%define DMA2_COUNT 0xC6
+%define DMA2_PAGE 0x8B
+%define DMA2_MASK 0xD4
 %define SB_DMA_TICKS 0x0610
 %define SB_DMA_BUF 0x0500
+%define SB_DMA_BUF16_SEG 0x2000
 
 stage2_start:
     cli
@@ -77,6 +83,7 @@ stage2_start:
     call test_opl3
     call test_opl2
     call test_sb_8bit_dma
+    call test_sb_16bit_dma
 
     hlt
     jmp $
@@ -379,6 +386,78 @@ test_sb_8bit_dma:
     call wait_for_irq5
     jz .done                ; timeout (counter still 0) -> leave FAIL
     mov di, RESULT_BLOCK + (sb_8bit_dma_record - result_block_template)
+    mov byte [di], 'P'
+    mov byte [di + 2], 'S'
+    mov byte [di + 3], 'S'
+    add word [RESULT_BLOCK + 10], 27
+.done:
+    ret
+
+test_sb_16bit_dma:
+    ; Seed a 32-byte buffer at physical 0x2_0000 (segment 0x2000, offset 0). The
+    ; slave 8237A channel 5 word-addresses its transfers, so page 0x8B=0x01 drives
+    ; byte base (0x01 << 17) = 0x2_0000 (A0 tied low).
+    mov ax, SB_DMA_BUF16_SEG
+    mov es, ax
+    xor di, di
+    mov al, 0x80
+    mov cx, 32
+.fill:
+    stosb
+    add al, 8
+    loop .fill
+    ; Slave ch5 (local ch1): word addr 0, page 0x01, count 15 (16 words),
+    ; auto-init read.
+    mov dx, DMA2_MODE
+    mov al, 0x59
+    out dx, al
+    mov dx, DMA2_ADDR
+    mov al, 0x00
+    out dx, al
+    mov al, 0x00
+    out dx, al
+    mov dx, DMA2_COUNT
+    mov al, 0x0F
+    out dx, al
+    mov al, 0x00
+    out dx, al
+    mov dx, DMA2_PAGE
+    mov al, 0x01
+    out dx, al
+    mov dx, DMA2_MASK
+    mov al, 0x01            ; unmask slave ch1 (channel 5)
+    out dx, al
+    ; DSP: 22050 Hz, 16-bit auto-init output, signed, stereo, count 15 (16 words).
+    mov dx, DSP_WRITE
+    mov al, 0x41
+    out dx, al
+    mov al, 0x56
+    out dx, al
+    mov al, 0x22
+    out dx, al
+    mov al, 0xB6
+    out dx, al
+    mov al, 0x30            ; mode: stereo (bit5) + signed (bit4)
+    out dx, al
+    mov al, 0x0F
+    out dx, al
+    mov al, 0x00
+    out dx, al
+    ; IRQ5 -> vector 0x0D. Re-install the handler, reset the tick counter, and
+    ; unmask IRQ5. The 16-bit path edges the same half/end IRQs as the 8-bit one.
+    xor ax, ax
+    mov es, ax
+    mov word [es:0x34], irq5_handler
+    mov word [es:0x36], 0
+    mov word [SB_DMA_TICKS], 0
+    mov dx, PIC_DATA
+    in al, dx
+    and al, 0xDF            ; clear bit5 -> unmask IRQ5
+    out dx, al
+    mov cx, 16
+    call wait_for_irq5
+    jz .done                ; timeout (counter still 0) -> leave FAIL
+    mov di, RESULT_BLOCK + (sb_16bit_dma_record - result_block_template)
     mov byte [di], 'P'
     mov byte [di + 2], 'S'
     mov byte [di + 3], 'S'

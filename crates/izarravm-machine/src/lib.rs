@@ -1771,7 +1771,7 @@ mod tests {
         assert_eq!(machine.mode13h_framebuffer().indexed_pixels[319], 0x13);
         assert_eq!(machine.mode13h_framebuffer().indexed_pixels[63680], 0x7f);
         assert!(results.records.iter().any(|record| {
-            record.status == izarravm_firmware::SuiteRecordStatus::Fail
+            record.status == izarravm_firmware::SuiteRecordStatus::Pass
                 && record.name == "sound.sb_16bit_dma"
         }));
     }
@@ -2271,6 +2271,25 @@ mod tests {
                     && record.name == "sound.sb_8bit_dma"
             }),
             "boot suite should report PASS sound.sb_8bit_dma (clock-driven single-cycle DMA + IRQ5)"
+        );
+    }
+
+    #[test]
+    fn boot_suite_reports_sb_16bit_dma_pass() {
+        let mut machine = Machine::new_boot_image(
+            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            izarravm_firmware::X86_BOOT_TEST_IMAGE,
+        )
+        .unwrap();
+        let reason = machine.run_until_halt_or_cycles(5_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        let results = izarravm_firmware::parse_result_block(machine.memory().as_slice()).unwrap();
+        assert!(
+            results.records.iter().any(|record| {
+                record.status == izarravm_firmware::SuiteRecordStatus::Pass
+                    && record.name == "sound.sb_16bit_dma"
+            }),
+            "boot suite should report PASS sound.sb_16bit_dma (clock-driven auto-init DMA + IRQ5)"
         );
     }
 
