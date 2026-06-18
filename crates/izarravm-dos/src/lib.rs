@@ -546,14 +546,15 @@ impl DosKernel {
         seg: u16,
         off: u16,
     ) -> Result<(), DosError> {
-        let count = if seg == 0 && off == 0 {
+        let null = seg == 0 && off == 0;
+        let count = if null {
             0u8
         } else {
             let base = usize::from(seg) * 16 + usize::from(off);
             mem.read_u8(base)?.min(127)
         };
         mem.write_u8(psp + 0x80, count)?;
-        if seg != 0 || off != 0 {
+        if !null {
             let base = usize::from(seg) * 16 + usize::from(off);
             for i in 0..usize::from(count) {
                 mem.write_u8(psp + 0x81 + i, mem.read_u8(base + 1 + i)?)?;
@@ -3682,5 +3683,55 @@ mod tests {
         };
         kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
         assert_eq!(regs.ax, 0x0000);
+    }
+
+    #[test]
+    fn ah4b_al0_bad_format_returns_0x0b() {
+        let dir = tempfile::tempdir().unwrap();
+        // A truncated MZ image: claims "MZ" but the header is shorter than 0x1c.
+        std::fs::write(dir.path().join("CHILD.COM"), [0x4du8, 0x5a]).unwrap();
+        let (mut kernel, mut mem) = exec_kernel(dir.path());
+        place_exec_inputs(&mut mem, "C:\\CHILD.COM", 0);
+        let regs = exec_al0(&mut kernel, &mut mem);
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x0b);
+    }
+
+    #[test]
+    fn ah4b_al0_invalid_fcb_drives_yield_ffff_child_ax() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CHILD.COM"), [0xcdu8, 0x20]).unwrap();
+        let (mut kernel, mut mem) = exec_kernel(dir.path());
+        // Name at 0x10000.
+        let name = b"C:\\CHILD.COM";
+        for (i, &b) in name.iter().enumerate() {
+            mem.write_u8(0x10000 + i, b).unwrap();
+        }
+        mem.write_u8(0x10000 + name.len(), 0).unwrap();
+        // A 16-byte FCB at 0x1000:0x80 with an invalid drive byte (27).
+        for i in 0..16 {
+            mem.write_u8(0x10080 + i, if i == 0 { 27 } else { 0 })
+                .unwrap();
+        }
+        // EPB: env=0, null cmdtail, FCB1 and FCB2 both -> 0x1000:0x80.
+        mem.write_u16(0x10040, 0).unwrap();
+        mem.write_u16(0x10042, 0).unwrap();
+        mem.write_u16(0x10044, 0).unwrap();
+        mem.write_u16(0x10046, 0x0080).unwrap();
+        mem.write_u16(0x10048, 0x1000).unwrap();
+        mem.write_u16(0x1004a, 0x0080).unwrap();
+        mem.write_u16(0x1004c, 0x1000).unwrap();
+        let mut regs = DosRegs {
+            ax: 0x4b00,
+            ds: 0x1000,
+            dx: 0,
+            es: 0x1000,
+            bx: 0x40,
+            ..DosRegs::default()
+        };
+        match kernel.dispatch(0x21, &mut regs, &mut mem).unwrap() {
+            DosAction::Exec { child_ax, .. } => assert_eq!(child_ax, 0xffff),
+            other => panic!("expected Exec, got {other:?}"),
+        }
     }
 }
