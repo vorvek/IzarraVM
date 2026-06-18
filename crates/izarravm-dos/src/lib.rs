@@ -332,8 +332,8 @@ struct FindSearch {
 
 /// Saved per-program DOS state, pushed when a child is EXECed (AL=0) and
 /// restored when the child exits. open_files is NOT saved; parent and child
-/// share one handle table (real DOS refcounts handles 0-4 into the child's JFT,
-/// neither of which we model, marked).
+/// share one handle table (real DOS refcounts handles 0-4 into the child's JFT
+/// and closes inherited handles on exit, neither of which we model, marked).
 #[derive(Debug)]
 struct ProgramContext {
     arena: Arena,
@@ -606,6 +606,15 @@ impl DosKernel {
                 return Ok(DosAction::Continue);
             }
         };
+        // The child needs at least a 64 KiB segment: load_com sets SP=0xFFFE and
+        // writes the return word there. A child whose PSP lands too high would
+        // overflow past ARENA_TOP, so reject it as insufficient memory (0x08)
+        // before writing the env block. An MZ child's finer fit is enforced by
+        // load_program below (ExeNotEnoughMemory -> 0x08).
+        if u32::from(child_psp) + 0x1000 > u32::from(ARENA_TOP) {
+            set_dos_error(regs, 0x08);
+            return Ok(DosAction::Continue);
+        }
         let env_linear = usize::from(env_seg) * 16;
         for (i, &byte) in env_bytes.iter().enumerate() {
             mem.write_u8(env_linear + i, byte)?;

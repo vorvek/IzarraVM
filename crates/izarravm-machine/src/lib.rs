@@ -583,6 +583,8 @@ impl Machine {
                     registers: self.cpu.registers.clone(),
                 });
                 self.apply_program_entry(entry);
+                // Only AX is defined on child entry (FCB drive validity); the
+                // other GPRs are undefined, matching real DOS (marked).
                 self.cpu.registers.set_eax(u32::from(child_ax));
                 None // keep looping; the CPU now runs the child
             }
