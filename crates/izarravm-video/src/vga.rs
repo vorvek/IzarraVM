@@ -812,8 +812,14 @@ impl Vga {
             // blink, but is not gated on the attribute-blink enable. The cursor
             // location register (0E/0Fh) is a cell index, so its byte address is
             // cursor_offset*2; it fires when the displayed cell's byte offset
-            // matches, scrolling with the start address.
-            let cursor_here = base == (self.cursor_offset as usize * 2) % VGA_TEXT_MEMORY_SIZE;
+            // matches, scrolling with the start address. The Cursor Skew (0Bh
+            // bits 6-5) delays the onset by that many character clocks, so the
+            // effective cursor cell is cursor_offset + skew (FreeVGA crtcreg.htm
+            // 0Bh; IBM VGA, not the clone "skew 3 = off" variant). See A5 in
+            // dev_docs/reference/vga/text-mode-gaps-confirm-notes.md.
+            let skew = (self.cursor_end >> 5) & 0x03;
+            let cursor_byte = (self.cursor_offset as usize + skew as usize) * 2;
+            let cursor_here = base == cursor_byte % VGA_TEXT_MEMORY_SIZE;
             let cursor_disabled = self.cursor_start & 0x20 != 0;
             let start_line = (self.cursor_start & 0x1F) as usize;
             let end_line = (self.cursor_end & 0x1F) as usize;
@@ -3476,6 +3482,49 @@ mod tests {
             vga.render_text_row(0)[0],
             7,
             "map B 'B' is solid (fg masked to 8 colors in 512-char mode)"
+        );
+    }
+
+    #[test]
+    fn text_cursor_skew_delays_the_cursor_onset() {
+        // The Cursor Skew (0Bh bits 6-5) delays the cursor onset by that many
+        // character clocks, so the cursor appears `skew` cells to the right of the
+        // cursor location. With cursor_offset 0 and skew 1, the cursor fires on
+        // cell 1 instead of cell 0.
+        let mut vga = Vga::default();
+        // Two blank cells; cursor configured as a full block on scanline 0.
+        text_put(&mut vga, 0, 0, b' ', 0x0F);
+        text_put(&mut vga, 0, 1, b' ', 0x0F);
+        vga.cursor_offset = 0;
+        vga.cursor_start = 0x00; // full block
+        vga.cursor_end = 0x0F | (0x01 << 5); // end line 15 + skew 1
+        vga.frames = 0; // show phase
+        let row = vga.render_text_row(0);
+        // Cell 0 (pels 0..8): not the skewed cursor (it moved to cell 1).
+        assert_eq!(row[0], 0, "skew 1: cell 0 is not the cursor");
+        // Cell 1 (pel 9 onward): the cursor, swapped to foreground.
+        assert_eq!(row[9], 15, "skew 1: cursor delayed to cell 1");
+    }
+
+    #[test]
+    fn text_cursor_skew_three_is_max_delay_not_disabled() {
+        // Per A5, a skew of 3 is the maximum delay (3 char clocks), not a disable.
+        // The disable is the separate 0Ah bit 5. With cursor_offset 0 and skew 3,
+        // the cursor fires on cell 3.
+        let mut vga = Vga::default();
+        for col in 0..5 {
+            text_put(&mut vga, 0, col, b' ', 0x0F);
+        }
+        vga.cursor_offset = 0;
+        vga.cursor_start = 0x00; // full block, not disabled (bit 5 clear)
+        vga.cursor_end = 0x0F | (0x03 << 5); // end line 15 + skew 3
+        vga.frames = 0; // show phase
+        let row = vga.render_text_row(0);
+        assert_eq!(row[0], 0, "skew 3: cell 0 not the cursor");
+        assert_eq!(
+            row[3 * 9],
+            15,
+            "skew 3: cursor delayed to cell 3 (max delay, not disabled)"
         );
     }
 }
