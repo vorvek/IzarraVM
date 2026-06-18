@@ -1795,8 +1795,10 @@ impl Cpu386 {
                 0x3e => prefixes.segment_override = Some(SegmentIndex::Ds),
                 0x64 => prefixes.segment_override = Some(SegmentIndex::Fs),
                 0x65 => prefixes.segment_override = Some(SegmentIndex::Gs),
-                0x66 => prefixes.operand_size_override = !prefixes.operand_size_override,
-                0x67 => prefixes.address_size_override = !prefixes.address_size_override,
+                // A prefix is idempotent: repeating 66h/67h keeps the override on,
+                // it does not toggle it back off (so 66 66 op stays operand-size).
+                0x66 => prefixes.operand_size_override = true,
+                0x67 => prefixes.address_size_override = true,
                 0xf0 => prefixes.lock = true,
                 0xf3 => prefixes.rep = Some(RepKind::Repe),
                 0xf2 => prefixes.rep = Some(RepKind::Repne),
@@ -4292,6 +4294,24 @@ mod tests {
         assert!(cpu.flag(FLAG_OF));
         assert!(cpu.flag(FLAG_SF));
         assert_eq!(cpu.registers.eip, 3); // prefix + opcode + modrm
+    }
+
+    #[test]
+    fn repeated_operand_size_prefix_stays_active() {
+        // 66 66 d1 e0 = shl eax,1 with a redundant operand-size prefix. The
+        // second 66 must not cancel the first, so this stays a 32-bit shift.
+        let mut memory = vec![0; 16];
+        memory[0..4].copy_from_slice(&[0x66, 0x66, 0xd1, 0xe0]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_eax(0x4000_0000);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eax(), 0x8000_0000);
+        assert_eq!(cpu.registers.eip, 4); // two prefixes + opcode + modrm
     }
 
     #[test]
