@@ -1127,9 +1127,9 @@ fn parse_exe(image: &[u8]) -> Result<ParsedExe<'_>, DosError> {
 /// Walk `relocs` (4-byte little-endian (offset, segment) entries) and apply each
 /// to the module loaded at linear `base`: read the word at `base + seg*16 + off`,
 /// add `addend`, write it back. `addend` is the load segment for an EXE and the
-/// caller's relocation factor for an overlay. ponytail: out-of-range relocations
-/// are rejected rather than applied blindly as real DOS would, to avoid
-/// corrupting arbitrary memory.
+/// caller's relocation factor for an overlay. Out-of-range relocations are
+/// rejected rather than applied blindly as real DOS would, to avoid corrupting
+/// arbitrary memory (marked).
 fn apply_relocs(
     mem: &mut Memory,
     base: usize,
