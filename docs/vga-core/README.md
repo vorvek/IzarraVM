@@ -188,10 +188,11 @@ Divergences (fidelity directive):
 1. **Mode X combined with the line-compare split landed in slice 6.** The split
    (slice 4) now applies to the mode-X scanout via the shared `split_origin`; see
    "Slice 6 coverage."
-2. **Mode-X pel-pan is not modeled.** The 8-bit 256-color pixel pan is deferred;
+2. **Mode-X pel-pan landed in slice 7.** The 8-bit 256-color pixel pan is now
+   applied as a 0-3 fine column shift via the shared `pel_pan`; see "Slice 7
+   coverage." Chained mode 13h pel-pan (0-7, one pel per byte) stays deferred;
    byte-granular start-address scroll and page flipping (the primary mode-X
-   mechanism) are modeled. The pel-pan-below-split forcing (slice 4) has no value
-   to force in mode X until pel-pan itself lands; it arrives with it.
+   mechanism) remain the coarse-scroll path.
 3. **Only the chain-4 to unchained-planar transition is modeled,** not the full
    odd/even host-addressing matrix.
 4. **The 256-color byte is the DAC index directly.** Attribute Mode Control bit 6
@@ -239,10 +240,59 @@ workload (a locked panel under a scrolling playfield). A specific released-sourc
 
 Divergences (fidelity directive):
 
-1. **Mode-X pel-pan-below-split forcing is deferred with mode-X pel-pan.** Mode X
-   has no pel-pan yet (slice 5 divergence 2), so below the split there is no
-   pel-pan value to force to 0; that forcing lands naturally with the mode-X
-   pel-pan work. The address-only split here has no pel-pan dependency.
+1. **Mode-X pel-pan-below-split forcing landed in slice 7.** Mode X now has
+   pel-pan (0-3), and the AC Mode Control (10h) bit 5 forcing applies to it
+   through the shared `pel_pan`, exactly as slice 6 anticipated. The
+   address-only split here has no further pel-pan dependency.
+
+## Slice 7 coverage
+
+Slice 7 adds the Attribute Horizontal Pixel Panning register (AC index 13h) to
+the unchained 256-color (mode X) scanout, the fine 0-3 pel sub-scroll that
+pairs with the slice-5 start-address coarse scroll to make Abrash's mode-X
+smooth-scroll loop (pan 0 -> 1 -> 2 -> 3, then bump start + 1). It also carries
+the pel-pan-below-split forcing (AC Mode Control 10h bit 5) over to mode X for
+free, restoring the symmetry the 16-color path already had.
+
+| Area | Covered in slice 7 |
+|------|--------------------|
+| Shared pel-pan | `pel_pan`: the effective pel-pan decision (the 13h value masked to 0-15, forced to 0 below the split when AC 10h bit 5 is set) factored out of the 16-color path and shared by both render paths |
+| Mode-X pel-pan | `render_modex_row` derives `pan = pel_pan(below_split) & 0x03` (one plane per pel, so the fine range is 0-3; a pan of 4 equals a start-address bump) and addresses column x as plane `(x+pan)&3` at plane offset `row_base + ((x+pan)>>2)` |
+| Below-split forcing | The AC 10h bit 5 forcing applies to mode X through the same `pel_pan`, so a below-split scanline ignores the pan exactly as the 16-color path does |
+| Live (not latched) | Pel-pan applies at the scanline of the write, so per-scanline mode-X pel-pan raster effects work, as they do for 16-color |
+
+The semantics are pinned to Abrash's Graphics Programming Black Book chapters
+47-49 (Mode X) and chapter 30 (the split / pel-pan principle), with the register
+and the below-split bit confirmed against RBIL `PORTS.B` (AC index 13h,
+table P0668; AC Mode Control 10h bit 5, table P0664). Abrash states the pel-pan
+range as the pixel count between coarse start-address bumps (8 px per byte for
+16-color -> 0-7); applied to mode X's 4-px-per-address-unit organization that is
+0-3. Chained mode 13h pel-pan (0-7) is a different addressing and stays deferred.
+
+The done-signal is equality, proven at unit
+(`vga::tests::mode_x_pel_pan_shifts_the_column_origin_by_the_pan_value`,
+`mode_x_pel_pan_rotates_the_plane_sequence`,
+`mode_x_pel_pan_below_split_is_forced_to_zero_only_when_enabled`) and
+end-to-end (`mode_x_pel_pan_smooth_scroll_through_the_machine`) levels: a
+non-zero pel-pan scans out the fine-shifted plane at the leftmost column, as its
+full 8-bit DAC index.
+
+Target, honesty note: the mode-X smooth scroll is the 256-color scroller genre
+workload (a playfield that scrolls a fraction of a pixel per frame), the same
+genre as the slice-5/6 mode-X coverage. A specific released-source title was not
+inspected, matching the prior honesty notes. Chained mode 13h pel-pan (0-7),
+which a linear-buffer scroller like Doom's mode 13h would use, is out of scope
+here.
+
+Divergences (fidelity directive):
+
+1. **Chained mode 13h pel-pan (0-7) is deferred.** Mode 13h's flat-linear
+   scanout (one pel per byte) has a different fine range and addressing; it is
+   its own slice.
+2. **CRTC 08h byte panning and preset-row-scan re-alignment at the split stay
+   deferred** (slice-4 divergence 4), unchanged for mode X.
+3. **Pel-pan values 4-7 fold into a start-address bump** in mode X and are
+   masked out (`& 0x03`); they are beyond-useful, not a distinct behavior.
 
 ## Latch rules
 
