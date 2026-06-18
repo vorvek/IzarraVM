@@ -32,9 +32,10 @@ pub struct CrtcTiming {
     pub double_scan: bool,
     pub start_address: u32,
     pub offset: u32,
-    pub mode_control: u8,  // CRTC index 17h
-    pub underline_loc: u8, // CRTC index 14h
-    pub line_compare: u32, // assembled 10-bit value: CRTC 18h + 07h.4 + 09h.6
+    pub mode_control: u8,    // CRTC index 17h
+    pub underline_loc: u8,   // CRTC index 14h
+    pub line_compare: u32,   // assembled 10-bit value: CRTC 18h + 07h.4 + 09h.6
+    pub preset_row_scan: u8, // CRTC index 08h: bits 4-0 first font scanline, bits 6-5 byte pan
 }
 
 impl CrtcTiming {
@@ -58,6 +59,7 @@ impl CrtcTiming {
             mode_control: 0xA3,
             underline_loc: 0x00,
             line_compare: 0x3FF,
+            preset_row_scan: 0,
         }
     }
 
@@ -80,6 +82,7 @@ impl CrtcTiming {
             mode_control: 0xE3,
             underline_loc: 0x00,
             line_compare: 0x3FF,
+            preset_row_scan: 0,
         }
     }
 
@@ -103,6 +106,7 @@ impl CrtcTiming {
             mode_control: 0xE3,
             underline_loc: 0x00,
             line_compare: 0x3FF,
+            preset_row_scan: 0,
         }
     }
 
@@ -125,6 +129,7 @@ impl CrtcTiming {
             mode_control: 0xE3,
             underline_loc: 0x00,
             line_compare: 0x3FF,
+            preset_row_scan: 0,
         }
     }
 
@@ -147,6 +152,7 @@ impl CrtcTiming {
             mode_control: 0xE3,
             underline_loc: 0x00,
             line_compare: 0x3FF,
+            preset_row_scan: 0,
         }
     }
 
@@ -172,6 +178,7 @@ impl CrtcTiming {
             mode_control: 0xE3,
             underline_loc: 0x00,
             line_compare: 0x3FF,
+            preset_row_scan: 0,
         }
     }
 
@@ -198,6 +205,7 @@ impl CrtcTiming {
             mode_control: 0xE3,
             underline_loc: 0x00,
             line_compare: 0x3FF,
+            preset_row_scan: 0,
         }
     }
 
@@ -707,8 +715,28 @@ impl Vga {
         // split_origin returns first_line <= counter_line in both branches, so the
         // subtraction never underflows.
         let rel = counter_line - first_line;
-        let char_row = (rel / rows_per_char) as usize;
-        let font_line = (rel % rows_per_char) as usize;
+        // CRTC Preset Row Scan (08h, FreeVGA crtcreg.htm): bits 4-0 offset the
+        // first displayed font scanline (vertical sub-row smooth scroll), bits 6-5
+        // are the byte pan added to the start address. Below the line-compare split
+        // the preset always resets to 0; the byte pan resets to 0 below the split
+        // only when AC 10h bit 5 is set (FreeVGA 18h). See A3 in
+        // dev_docs/reference/vga/text-mode-gaps-confirm-notes.md.
+        let reg = self.crtc.preset_row_scan;
+        let preset_row = if below_split {
+            0
+        } else {
+            u32::from(reg & 0x1F)
+        };
+        let byte_pan = if below_split && self.attr.mode_control & 0x20 != 0 {
+            0
+        } else {
+            ((reg >> 5) & 0x03) as usize
+        };
+        // Effective scanline = rel + preset_row scrolls the display up; char_row
+        // advances when the addition wraps past rows_per_char.
+        let eff = rel + preset_row;
+        let char_row = (eff / rows_per_char) as usize;
+        let font_line = (eff % rows_per_char) as usize;
         let char_width = if self.seq.clocking_mode & 0x01 != 0 {
             8
         } else {
@@ -735,10 +763,12 @@ impl Vga {
         // next cell's leading pixels; the left edge clips cell 0's scrolled-off
         // leading pixels.
         for dc in 0..=VGA_TEXT_COLUMNS {
-            // Absolute cell index (char/attr pair) scrolled by the start address.
+            // Absolute cell index (char/attr pair) scrolled by the start address;
+            // the CRTC byte pan (08h bits 6-5) adds a byte offset to the origin,
+            // so a pan of 2 shifts one whole cell and a pan of 1 lands on the
+            // attribute byte (the real-hardware half-cell scramble).
             let cell_index = start_cells + char_row * row_cells + dc;
-            // Each cell is two bytes (char then attr); wrap at the aperture.
-            let base = (cell_index * 2) % VGA_TEXT_MEMORY_SIZE;
+            let base = (cell_index * 2 + byte_pan) % VGA_TEXT_MEMORY_SIZE;
             let char_byte = self.text_memory.get(base).copied().unwrap_or(b' ');
             let attr = self.text_memory.get(base + 1).copied().unwrap_or(0x07);
             let blink_attr = attr & 0x80 != 0;
@@ -1065,6 +1095,7 @@ impl Vga {
             0x3CC => Some(self.misc_output),
             0x3D4 => Some(self.crtc_index),
             0x3D5 => match self.crtc_index {
+                0x08 => Some(self.crtc.preset_row_scan),
                 0x0A => Some(self.cursor_start),
                 0x0B => Some(self.cursor_end),
                 0x0E => Some((self.cursor_offset >> 8) as u8),
@@ -1135,6 +1166,9 @@ impl Vga {
 
     fn write_crtc(&mut self, index: u8, value: u8) {
         match index {
+            // Preset Row Scan (FreeVGA crtcreg.htm 08h): bits 4-0 first font
+            // scanline (vertical sub-row), bits 6-5 byte pan.
+            0x08 => self.crtc.preset_row_scan = value,
             // Cursor shape (start scanline + disable bit / end scanline + skew).
             0x0A => self.cursor_start = value,
             0x0B => self.cursor_end = value,
@@ -3263,6 +3297,77 @@ mod tests {
             vga.render_text_row(0)[7],
             0,
             "non-box glyph's shifted 9th column is a gap, not a replicate"
+        );
+    }
+
+    #[test]
+    fn text_preset_row_scan_offsets_the_first_font_line() {
+        // CRTC 08h bits 4-0 (preset row scan) scroll the display up within the
+        // character row, so the first displayed scanline reads a later font line.
+        // Load a glyph that is solid only on font line 0; a preset of 1 moves the
+        // solid line off the top scanline.
+        let mut vga = Vga::default();
+        let ch = 0x01usize; // char 0x01: font line 0 solid, lines 1..15 clear
+        vga.font[0][ch * 32] = 0xFF;
+        text_put(&mut vga, 0, 0, 0x01, 0x0F);
+        assert_eq!(
+            vga.render_text_row(0)[0],
+            15,
+            "preset 0: font line 0 is the first displayed scanline (solid)"
+        );
+        vga.crtc.preset_row_scan = 0x01; // scroll up one scanline
+        assert_eq!(
+            vga.render_text_row(0)[0],
+            0,
+            "preset 1: first displayed scanline reads font line 1 (clear)"
+        );
+    }
+
+    #[test]
+    fn text_byte_pan_shifts_whole_cells() {
+        // CRTC 08h bits 6-5 (byte pan) add a byte offset to the start address. In
+        // 9-dot text (2 bytes per cell) a byte pan of 2 shifts one whole cell.
+        let mut vga = Vga::default();
+        text_put(&mut vga, 0, 0, 0xDB, 0x0F); // cell 0: solid (pel 0 lit)
+        text_put(&mut vga, 0, 1, b' ', 0x0F); // cell 1: blank (pel 0 bg)
+        assert_eq!(
+            vga.render_text_row(0)[0],
+            15,
+            "byte pan 0: pel 0 reads cell 0 (solid)"
+        );
+        vga.crtc.preset_row_scan = 0x02 << 5; // byte pan 2 (bits 6-5 = 10)
+        assert_eq!(
+            vga.render_text_row(0)[0],
+            0,
+            "byte pan 2: pel 0 reads cell 1 (blank), one whole cell shifted"
+        );
+    }
+
+    #[test]
+    fn text_preset_row_resets_below_the_split() {
+        // Below the line-compare split the preset row scan resets to 0 (FreeVGA
+        // crtcreg.htm 18h), so the vertical sub-row scroll applies only to the top
+        // region. The same glyph (solid on font line 0) shows the clear line above
+        // the split and the solid line below it.
+        let mut vga = Vga::default();
+        let ch = 0x01usize; // char 0x01: font line 0 solid, rest clear
+        vga.font[0][ch * 32] = 0xFF;
+        text_put(&mut vga, 0, 0, 0x01, 0x0F);
+        text_put(&mut vga, 1, 0, 0x01, 0x0F); // row 1 for the below-split region
+        vga.crtc.preset_row_scan = 0x01; // preset 1
+        vga.crtc.line_compare = 15; // split after the first 16-scanline char row
+        // Top region (scanline 0): preset applies, so pel 0 reads font line 1 (clear).
+        assert_eq!(
+            vga.render_text_row(0)[0],
+            0,
+            "top region: preset row scan offsets the font line"
+        );
+        // Below-split region (scanline 16, char row 0, font line 0): preset reset
+        // to 0, so pel 0 reads font line 0 (solid).
+        assert_eq!(
+            vga.render_text_row(16)[0],
+            15,
+            "below-split region: preset row scan resets to 0 (font line 0 solid)"
         );
     }
 }
