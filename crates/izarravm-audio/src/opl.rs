@@ -768,8 +768,8 @@ impl OplChip {
 
     /// Render one stereo `(left, right)` sample at the chip's native 49716 Hz
     /// rate. OPL3 mode sums all 18 two-op channels; otherwise the 9 OPL2
-    /// channels. (4-op and rhythm mode are added in later layers.) The EG
-    /// counter ticks per sample.
+    /// channels. Rhythm mode renders channels 6-8 as percussion, and 4-op mode
+    /// pairs operators across channel pairs. The EG counter ticks per sample.
     pub fn render_sample(&mut self) -> (i32, i32) {
         self.eg_counter = self.eg_counter.wrapping_add(1);
         self.advance_noise();

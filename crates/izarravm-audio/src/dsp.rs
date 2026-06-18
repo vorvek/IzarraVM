@@ -1,6 +1,7 @@
 //! Sound Blaster 16-class DSP (CT1747) clean-room core: reset handshake,
-//! command/data protocol, and 8-bit single/auto-init DMA playback. 16-bit,
-//! ADPCM, input/ADC, MIDI and the CT1745 mixer are out of scope for this slice.
+//! command/data protocol, and 8-bit plus 16-bit single/auto-init DMA playback.
+//! The CT1745 mixer lives next to this in the machine crate. ADPCM, input/ADC,
+//! and MIDI/MPU-401 are not modeled yet.
 
 use std::collections::VecDeque;
 
@@ -21,6 +22,9 @@ pub struct SbDsp {
     reset_micros: Option<f64>,
     read_data: VecDeque<u8>,
     data_available: bool,
+    // Last byte handed back on the read-data port. The bus holds its last value,
+    // so a read with nothing queued returns this rather than a fixed byte.
+    last_read: u8,
     // Command interpreter: bytes written to 0x22C stream in here.
     pending: Option<PendingCommand>,
     // Immediate-command state.
@@ -58,6 +62,7 @@ impl Default for SbDsp {
             reset_micros: None,
             read_data: VecDeque::new(),
             data_available: false,
+            last_read: 0xFF,
             pending: None,
             direct_dac_byte: None,
             test_reg: 0,
@@ -382,7 +387,12 @@ impl SbDsp {
     pub fn read_port(&mut self, port: u16) -> Option<u8> {
         match port {
             0x22A => {
-                let byte = self.read_data.pop_front().unwrap_or(0xAA);
+                // A real DSP read-data port holds the last byte it drove when the
+                // queue is empty; it does not re-emit the 0xAA reset acknowledge.
+                // Returning a fixed 0xAA here would let a poll mistake an empty
+                // port for a fresh reset.
+                let byte = self.read_data.pop_front().unwrap_or(self.last_read);
+                self.last_read = byte;
                 self.data_available = !self.read_data.is_empty();
                 Some(byte)
             }
@@ -453,6 +463,14 @@ mod tests {
         assert_eq!(dsp.read_port(0x22E), Some(0x80));
         assert_eq!(dsp.read_port(0x22A), Some(0xAA));
         assert_eq!(dsp.read_port(0x22E), Some(0x00), "data consumed");
+    }
+
+    #[test]
+    fn empty_read_data_does_not_fake_a_reset_ack() {
+        // With nothing queued and no reset, the read-data port returns the idle
+        // bus value, not the 0xAA the DSP only emits after a real reset.
+        let mut dsp = SbDsp::default();
+        assert_eq!(dsp.read_port(0x22A), Some(0xFF));
     }
 
     #[test]
