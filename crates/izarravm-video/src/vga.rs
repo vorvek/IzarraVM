@@ -2213,4 +2213,166 @@ mod tests {
             "row 0 pixel 0 is plane 0 offset 0, 8-bit direct"
         );
     }
+
+    #[test]
+    fn mode13h_scanout_is_column_interleaved_8bit_direct() {
+        // Chain-4 routes the A0000 byte at offset N to plane N & 3 at plane
+        // offset N >> 2, so four writes at offsets 0..3 land one byte per plane
+        // at plane offset 0, and the write at offset 4 lands in plane 0 at plane
+        // offset 1. The shared scanout then reads pixel x as plane x & 3 at plane
+        // offset x >> 2, so the raster carries each written byte as the full 8-bit
+        // DAC index (0x40 has bits above 0x3F, proving no 6-bit mask).
+        let mut vga = Vga::default();
+        vga.set_mode13h();
+        vga.cpu_write_chain4(0, 0x10); // plane 0, offset 0 -> pixel 0
+        vga.cpu_write_chain4(1, 0x20); // plane 1, offset 0 -> pixel 1
+        vga.cpu_write_chain4(2, 0x30); // plane 2, offset 0 -> pixel 2
+        vga.cpu_write_chain4(3, 0x40); // plane 3, offset 0 -> pixel 3
+        vga.cpu_write_chain4(4, 0x11); // plane 0, offset 1 -> pixel 4
+        let row = vga.render_256color_row(0);
+        assert_eq!(&row[0..4], &[0x10, 0x20, 0x30, 0x40]);
+        assert_eq!(row[4], 0x11, "pixel 4 wraps to plane 0 at plane offset 1");
+    }
+
+    #[test]
+    fn mode13h_pel_pan_shifts_the_column_origin_by_the_pan_value() {
+        // A distinct byte per plane and plane offset so every column is
+        // recognizable; values reach above 0x3F, re-proving the 8-bit-direct DAC
+        // read. Pel-pan is masked to 0-3 (one plane per pel; a pan of 4 equals a
+        // start-address bump), so pan 1..3 shifts the row by that many pixels and
+        // pan 4 folds to 0.
+        fn byte(plane: usize, off: usize) -> u8 {
+            ((plane as u32 * 0x11 + off as u32 * 7 + 0x40) & 0xFF) as u8
+        }
+        let mut vga = Vga::default();
+        vga.set_mode13h();
+        for plane in 0..VGA_PLANES {
+            for off in 0..VGA_PLANE_SIZE {
+                vga.vram[plane * VGA_PLANE_SIZE + off] = byte(plane, off);
+            }
+        }
+        vga.crtc.start_address = 0;
+        vga.attr.pixel_pan = 0;
+        let reference = vga.render_256color_row(0); // top line, no split forcing
+        for pan in 1..=3u8 {
+            vga.attr.pixel_pan = pan;
+            let row = vga.render_256color_row(0);
+            for x in 0..(reference.len() - pan as usize) {
+                assert_eq!(
+                    row[x],
+                    reference[x + pan as usize],
+                    "pan {pan} shifts the row so column x reads the pan-0 column x+pan"
+                );
+            }
+        }
+        // Pel-pan 4 is masked to 0 (& 0x03), so it reproduces the pan-0 row rather
+        // than shifting by four pixels.
+        vga.attr.pixel_pan = 4;
+        assert_eq!(
+            vga.render_256color_row(0),
+            reference,
+            "pan 4 folds to 0 under the 0-3 mask"
+        );
+        // The four-pixel shift a true pan 4 would perform is reached by bumping the
+        // start address by one plane-offset unit instead: start + 1 at pan 0 equals
+        // the pan-0 row shifted by four columns. This is the smooth-scroll loop
+        // boundary (pan 0->3, then start + 1).
+        vga.attr.pixel_pan = 0;
+        vga.crtc.start_address = 1;
+        let scrolled = vga.render_256color_row(0);
+        for x in 0..(reference.len() - 4) {
+            assert_eq!(
+                scrolled[x],
+                reference[x + 4],
+                "start + 1 at pan 0 scans out the pan-0 row shifted by four columns"
+            );
+        }
+    }
+
+    #[test]
+    fn mode13h_pel_pan_below_split_is_forced_to_zero_only_when_enabled() {
+        // Below the CRTC Line Compare split, render the first split row (source row
+        // 0 at plane offset 0) with distinct bytes per plane so a pel-pan shift is
+        // visible. `mode_control` carries Attribute index 10h, `pan` the pel-pan
+        // value.
+        fn render(mode_control: u8, pan: u8) -> Vec<u8> {
+            let mut vga = Vga::default();
+            vga.set_mode13h();
+            let plane0_byte: [u8; VGA_PLANES] = [0x40, 0x50, 0x60, 0x70];
+            for (plane, &b) in plane0_byte.iter().enumerate() {
+                vga.vram[plane * VGA_PLANE_SIZE] = b;
+            }
+            vga.crtc.line_compare = 100;
+            vga.attr.pixel_pan = pan;
+            vga.attr.mode_control = mode_control;
+            vga.render_256color_row(101) // first split line: below_split, source row 0, offset 0
+        }
+        // bit 5 set: pel-pan forced to 0 below the split, so pan 1 equals pan 0.
+        assert_eq!(
+            render(0x20, 1),
+            render(0x20, 0),
+            "Attribute 10h bit 5 set forces split-region pel-pan to 0"
+        );
+        // bit 5 clear: pel-pan applies below the split, so pan 1 differs from pan 0.
+        assert_ne!(
+            render(0x00, 1),
+            render(0x00, 0),
+            "Attribute 10h bit 5 clear pans the split region"
+        );
+    }
+
+    #[test]
+    fn mode13h_line_compare_split_renders_top_scrolled_and_bottom_from_offset_zero() {
+        // A distinct byte per plane offset so each source row is recognizable. The
+        // values reach above 0x3F, which also proves mode 13h reads the full 8-bit
+        // DAC index directly (no attribute 6-bit mask).
+        fn pattern(off: usize) -> u8 {
+            ((off as u32).wrapping_mul(7).wrapping_add(1) & 0xFF) as u8
+        }
+        // Reference renderer with line compare left at the 0x3FF default (disabled):
+        // produces a single scrolled row via the shared 256-color scanout.
+        fn reference(start: u32, row: u32) -> Vec<u8> {
+            let mut r = Vga::default();
+            r.set_mode13h();
+            for plane in 0..VGA_PLANES {
+                for off in 0..VGA_PLANE_SIZE {
+                    r.vram[plane * VGA_PLANE_SIZE + off] = pattern(off);
+                }
+            }
+            r.crtc.start_address = start;
+            r.render_256color_row(row)
+        }
+
+        let mut vga = Vga::default();
+        vga.set_mode13h(); // 320x200, double-scanned: source_row = counter_line / 2
+        for plane in 0..VGA_PLANES {
+            for off in 0..VGA_PLANE_SIZE {
+                vga.vram[plane * VGA_PLANE_SIZE + off] = pattern(off);
+            }
+        }
+        let start = 0x1000u32;
+        let split = 300u32;
+        vga.crtc.start_address = start;
+        vga.crtc.line_compare = split;
+
+        // Top row 200 (<= split): source row 100, scrolled by start.
+        assert_eq!(
+            vga.render_256color_row(200),
+            reference(start, 200),
+            "top region renders scrolled by start_address"
+        );
+        // First split scanline (split + 1): source row 0 from offset 0.
+        assert_eq!(
+            vga.render_256color_row(split + 1),
+            reference(0, 0),
+            "first split line renders source row 0 from offset 0"
+        );
+        // Deeper split scanline: (counter_line - (split + 1)) / 2 = 10, so source
+        // row 10 from offset 0 matches the reference's source row 10 (row 20 / 2).
+        assert_eq!(
+            vga.render_256color_row(split + 21),
+            reference(0, 20),
+            "split region row 10 renders source row 10 from offset 0"
+        );
+    }
 }
