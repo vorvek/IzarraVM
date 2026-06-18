@@ -1048,6 +1048,32 @@ impl Vga {
         self.attr.overscan
     }
 
+    /// Set one Attribute palette register (0-15). The index is masked to 4 bits,
+    /// the value to 6 bits, matching the 3C0 datapath. Used by INT 10h AH=10h.
+    pub fn set_attr_palette_reg(&mut self, index: u8, value: u8) {
+        self.attr.palette[(index & 0x0F) as usize] = value & 0x3F;
+    }
+
+    pub fn attr_palette_reg(&self, index: u8) -> u8 {
+        self.attr.palette[(index & 0x0F) as usize]
+    }
+
+    pub fn set_dac_entry(&mut self, index: u8, r: u8, g: u8, b: u8) {
+        self.dac.set_entry(index, r, g, b);
+    }
+
+    pub fn dac_entry(&self, index: u8) -> [u8; 3] {
+        self.dac.entry(index)
+    }
+
+    pub fn set_dac_block(&mut self, start: u8, entries: &[[u8; 3]]) {
+        self.dac.set_block(start, entries);
+    }
+
+    pub fn dac_block_bytes(&self, start: u8, count: u16) -> Vec<u8> {
+        self.dac.block_bytes(start, count)
+    }
+
     pub fn palette_argb(&self) -> [u32; DAC_ENTRIES] {
         let mut out = [0u32; DAC_ENTRIES];
         for (index, slot) in out.iter_mut().enumerate() {

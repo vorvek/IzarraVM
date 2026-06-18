@@ -549,7 +549,7 @@ impl Machine {
                 // The 80x25 color text family (2/3) and monochrome text (7), plus
                 // the 40x25 and CGA variants (0/1/4/5/6) which map to the same
                 // single text personality, all return to text mode.
-                0x00 | 0x01 | 0x02 | 0x03 | 0x04 | 0x05 | 0x06 | 0x07 => {
+                0x00..=0x07 => {
                     self.video.set_text_mode();
                     self.margo_active = false;
                     return;
@@ -565,8 +565,72 @@ impl Machine {
             }
             return;
         }
+        if ah == 0x10 {
+            self.handle_int10_palette(al);
+            return;
+        }
         if ah == 0x4f {
             self.handle_vbe(al);
+        }
+    }
+
+    /// INT 10h AH=10h: set/get the ATC palette registers and the DAC. The common
+    /// sub-functions; rare variants (overscan get, intensity/blink, color paging)
+    /// are deferred. Register conventions per RBIL.
+    fn handle_int10_palette(&mut self, al: u8) {
+        let bx = self.cpu.registers.ebx() as u16;
+        let bl = bx as u8;
+        let bh = (bx >> 8) as u8;
+        let cx = self.cpu.registers.ecx() as u16;
+        let ch = (cx >> 8) as u8;
+        let cl = cx as u8;
+        let dx = self.cpu.registers.edx() as u16;
+        let dh = (dx >> 8) as u8;
+        let es_base = self.cpu.registers.segment(SegmentIndex::Es).base;
+        let es_dx = es_base + u32::from(dx);
+        match al {
+            // AL=00: set individual palette register. BL=index (0-15), BH=value.
+            0x00 => self.video.set_attr_palette_reg(bl, bh),
+            // AL=01: set overscan/border color. BH=value (overlap with AH=0Bh).
+            0x01 => self.video.set_overscan(bh),
+            // AL=02: set all 16 palette registers and overscan from ES:DX (17 bytes).
+            0x02 => {
+                let block = self.read_guest_block(es_dx, 17);
+                for i in 0..16u8 {
+                    self.video.set_attr_palette_reg(i, block[i as usize]);
+                }
+                self.video.set_overscan(block[16]);
+            }
+            // AL=07: get individual palette register. BL=index -> BH.
+            0x07 => {
+                let value = self.video.attr_palette_reg(bl);
+                let ebx = (self.cpu.registers.ebx() & !0xFF00) | (u32::from(value) << 8);
+                self.cpu.registers.set_ebx(ebx);
+            }
+            // AL=10: set individual DAC register. BX=index, DH=R, CH=G, CL=B.
+            0x10 => self.video.set_dac_entry(bx as u8, dh, ch, cl),
+            // AL=12: set a block of DAC registers. BX=start, CX=count, ES:DX -> RGB triples.
+            0x12 => {
+                let bytes = self.read_guest_block(es_dx, cx as usize * 3);
+                let entries: Vec<[u8; 3]> =
+                    bytes.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+                self.video.set_dac_block(bx as u8, &entries);
+            }
+            // AL=15: get individual DAC register. BX=index -> DH=R, CH=G, CL=B.
+            0x15 => {
+                let [r, g, b] = self.video.dac_entry(bx as u8);
+                let edx = (self.cpu.registers.edx() & !0xFF00) | (u32::from(r) << 8);
+                self.cpu.registers.set_edx(edx);
+                let ecx_new =
+                    (self.cpu.registers.ecx() & !0xFFFF) | (u32::from(g) << 8) | u32::from(b);
+                self.cpu.registers.set_ecx(ecx_new);
+            }
+            // AL=17: get a block of DAC registers. BX=start, CX=count -> ES:DX.
+            0x17 => {
+                let bytes = self.video.dac_block_bytes(bx as u8, cx);
+                self.write_guest_block(es_dx, &bytes);
+            }
+            _ => {}
         }
     }
 
@@ -747,6 +811,12 @@ impl Machine {
         for (index, &byte) in bytes.iter().enumerate() {
             self.write_physical_u8(addr + index as u32, byte);
         }
+    }
+
+    fn read_guest_block(&mut self, addr: u32, len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|index| self.read_physical_u8(addr + index as u32))
+            .collect()
     }
 
     fn vbe_mode_info(&mut self) {
@@ -3815,6 +3885,84 @@ mod tests {
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
         assert_eq!(reason, StopReason::Halted);
         assert_eq!(machine.video().overscan(), 5);
+    }
+
+    #[test]
+    fn int10_10h_sets_palette_register() {
+        // mov ax,1000h; mov bx,0901h; int 10h; hlt  (AH=10h AL=00, BL=1, BH=9)
+        let rom = rom_with_code(&[0xb8, 0x00, 0x10, 0xbb, 0x01, 0x09, 0xcd, 0x10, 0xf4]);
+        let mut machine =
+            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(machine.video().attr_palette_reg(1), 9);
+    }
+
+    #[test]
+    fn int10_10h_sets_individual_dac() {
+        // mov ax,1010h; mov bx,0028h; mov dx,3f00h; mov cx,0000h; int 10h; hlt
+        // (AH=10h AL=10, BX=40, DH=63 R, CH=0 G, CL=0 B)
+        let rom = rom_with_code(&[
+            0xb8, 0x10, 0x10, 0xbb, 0x28, 0x00, 0xba, 0x00, 0x3f, 0xb9, 0x00, 0x00, 0xcd, 0x10,
+            0xf4,
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(machine.video().dac_entry(40), [63, 0, 0]);
+    }
+
+    #[test]
+    fn int10_10h_sets_dac_block() {
+        // ES:DX -> a 3-triple buffer at 1000:0000 (physical 0x10000).
+        // mov ax,1000h; mov es,ax; mov dx,0; mov ax,1012h; mov bx,000ah; mov cx,3; int 10h; hlt
+        let rom = rom_with_code(&[
+            0xb8, 0x00, 0x10, 0x8e, 0xc0, 0xba, 0x00, 0x00, 0xb8, 0x12, 0x10, 0xbb, 0x0a, 0x00,
+            0xb9, 0x03, 0x00, 0xcd, 0x10, 0xf4,
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+
+        // The three triples at 0x10000: red, green, blue.
+        for (i, &b) in [63u8, 0, 0, 0, 63, 0, 0, 0, 63].iter().enumerate() {
+            machine.write_physical_u8(0x1_0000 + i as u32, b);
+        }
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(machine.video().dac_entry(10), [63, 0, 0]);
+        assert_eq!(machine.video().dac_entry(11), [0, 63, 0]);
+        assert_eq!(machine.video().dac_entry(12), [0, 0, 63]);
+    }
+
+    #[test]
+    fn int10_10h_gets_dac_block() {
+        // AL=17 reads CX DAC entries starting at BX into ES:DX.
+        // mov ax,1000h; mov es,ax; mov dx,0; mov ax,1017h; mov bx,000ah; mov cx,3; int 10h; hlt
+        let rom = rom_with_code(&[
+            0xb8, 0x00, 0x10, 0x8e, 0xc0, 0xba, 0x00, 0x00, 0xb8, 0x17, 0x10, 0xbb, 0x0a, 0x00,
+            0xb9, 0x03, 0x00, 0xcd, 0x10, 0xf4,
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+
+        // Seed DAC entries 10/11/12 with known values, then let the readback run.
+        machine.video_mut().set_dac_entry(10, 12, 34, 56);
+        machine.video_mut().set_dac_entry(11, 1, 2, 3);
+        machine.video_mut().set_dac_entry(12, 63, 63, 63);
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        // The handler wrote CX*3 bytes to 0x10000.
+        assert_eq!(machine.read_physical_u8(0x1_0000), 12);
+        assert_eq!(machine.read_physical_u8(0x1_0001), 34);
+        assert_eq!(machine.read_physical_u8(0x1_0002), 56);
+        assert_eq!(machine.read_physical_u8(0x1_0006), 63);
+        assert_eq!(machine.read_physical_u8(0x1_0007), 63);
+        assert_eq!(machine.read_physical_u8(0x1_0008), 63);
     }
 
     #[test]

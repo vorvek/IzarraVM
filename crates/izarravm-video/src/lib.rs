@@ -392,6 +392,39 @@ impl Dac {
         let [r, g, b] = self.palette[index as usize];
         (expand6(r), expand6(g), expand6(b))
     }
+
+    /// Set one DAC entry directly, bypassing the 3C9 write flip-flop. Used by the
+    /// host-locked INT 10h AH=10h services. Components are masked to 6 bits.
+    pub fn set_entry(&mut self, index: u8, r: u8, g: u8, b: u8) {
+        self.palette[index as usize] = [r & 0x3F, g & 0x3F, b & 0x3F];
+    }
+
+    pub fn entry(&self, index: u8) -> [u8; 3] {
+        self.palette[index as usize]
+    }
+
+    /// Set `entries.len()` consecutive DAC entries starting at `start`. The index
+    /// wraps modulo 256.
+    pub fn set_block(&mut self, start: u8, entries: &[[u8; 3]]) {
+        for (offset, &[r, g, b]) in entries.iter().enumerate() {
+            let index = start.wrapping_add(offset as u8);
+            self.palette[index as usize] = [r & 0x3F, g & 0x3F, b & 0x3F];
+        }
+    }
+
+    /// Serialize `count` consecutive DAC entries starting at `start` as R,G,B
+    /// bytes (6-bit, masked), wrapping modulo 256.
+    pub fn block_bytes(&self, start: u8, count: u16) -> Vec<u8> {
+        let mut out = Vec::with_capacity(count as usize * 3);
+        for offset in 0..count {
+            let index = start.wrapping_add(offset as u8);
+            let [r, g, b] = self.palette[index as usize];
+            out.push(r & 0x3F);
+            out.push(g & 0x3F);
+            out.push(b & 0x3F);
+        }
+        out
+    }
 }
 
 fn expand6(component: u8) -> u8 {
