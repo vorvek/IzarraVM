@@ -206,23 +206,23 @@ fn sound_blaster_env_entries(config: &SoundBlasterConfig) -> Vec<(String, String
 }
 
 impl Machine {
-    pub fn new(profile: MachineProfile, rom: impl AsRef<[u8]>) -> Result<Self, MachineError> {
-        let rom = rom.as_ref();
-        if rom.len() != BIOS_ROM_SIZE {
-            return Err(MachineError::InvalidRomSize(rom.len()));
-        }
-
+    /// Shared field initialization for the public constructors. They differ only
+    /// in the CPU entry state and the ROM image, so each hands those in and
+    /// shares the rest (devices, audio chips, timing accumulators). The caller
+    /// installs the BIOS stubs and any boot/program image afterwards, where the
+    /// ordering relative to those memory writes matters.
+    fn base(profile: MachineProfile, cpu: Cpu386, rom: Vec<u8>) -> Result<Self, MachineError> {
         let mixer = power_on_mixer(&profile);
-        let mut machine = Self {
+        let machine = Self {
             memory: Memory::from_mib(profile.memory_mib)?,
             profile,
-            cpu: Cpu386::default(),
+            cpu,
             video: Box::new(Vga::default()),
             margo: Margo::default(),
             margo_active: false,
             pending_soft_int: None,
             dos: izarravm_dos::DosKernel::default(),
-            rom: rom.to_vec(),
+            rom,
             serial: SerialPort::default(),
             device_ports: DevicePorts::default(),
             pic: pic::Pic8259Pair::default(),
@@ -252,6 +252,16 @@ impl Machine {
             machine.memory.len() as u64 <= u64::from(MARGO_LFB_BASE),
             "system RAM overlaps the Margo LFB aperture at 0xE0000000"
         );
+        Ok(machine)
+    }
+
+    pub fn new(profile: MachineProfile, rom: impl AsRef<[u8]>) -> Result<Self, MachineError> {
+        let rom = rom.as_ref();
+        if rom.len() != BIOS_ROM_SIZE {
+            return Err(MachineError::InvalidRomSize(rom.len()));
+        }
+
+        let mut machine = Self::base(profile, Cpu386::default(), rom.to_vec())?;
         install_boot_bios_stubs(&mut machine.memory)?;
         Ok(machine)
     }
@@ -265,46 +275,7 @@ impl Machine {
             return Err(MachineError::InvalidBootImageSize(image.len()));
         }
 
-        let mixer = power_on_mixer(&profile);
-        let mut machine = Self {
-            memory: Memory::from_mib(profile.memory_mib)?,
-            profile,
-            cpu: boot_sector_cpu(),
-            video: Box::new(Vga::default()),
-            margo: Margo::default(),
-            margo_active: false,
-            pending_soft_int: None,
-            dos: izarravm_dos::DosKernel::default(),
-            rom: vec![0; BIOS_ROM_SIZE],
-            serial: SerialPort::default(),
-            device_ports: DevicePorts::default(),
-            pic: pic::Pic8259Pair::default(),
-            pit: pit::Pit::default(),
-            pit_clocks: 0.0,
-            dma: dma::DmaController::default(),
-            opl: OplChip::default(),
-            resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
-            opl_micros: 0.0,
-            dsp: SbDsp::default(),
-            // Placeholder; sync_dsp_resampler rebuilds this for the live rate on
-            // first use, so the value here never reaches the DAC as-is.
-            dsp_resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
-            dsp_rate_hz: 0,
-            dsp_micros: 0.0,
-            dsp_sample_phase: 0.0,
-            mixer,
-            margo_ns: 0.0,
-            vga_dots: 0.0,
-            trace: BusTrace::default(),
-            elapsed_clocks: 0,
-            program_frames: Vec::new(),
-        };
-        // The Margo LFB aperture is decoded before RAM, so system memory must
-        // stay below it. Validated config caps memory far under this bound.
-        debug_assert!(
-            machine.memory.len() as u64 <= u64::from(MARGO_LFB_BASE),
-            "system RAM overlaps the Margo LFB aperture at 0xE0000000"
-        );
+        let mut machine = Self::base(profile, boot_sector_cpu(), vec![0; BIOS_ROM_SIZE])?;
 
         for (offset, byte) in image[0..512].iter().copied().enumerate() {
             machine
@@ -336,45 +307,8 @@ impl Machine {
     /// and STI itself; the BIOS IVT and an interrupts-enabled handoff come with a
     /// later slice.
     pub fn new_dos_program(profile: MachineProfile, image: &[u8]) -> Result<Self, MachineError> {
-        let mixer = power_on_mixer(&profile);
         let env_entries = sound_blaster_env_entries(&profile.sound_blaster);
-        let mut machine = Self {
-            memory: Memory::from_mib(profile.memory_mib)?,
-            profile,
-            cpu: Cpu386::default(),
-            video: Box::new(Vga::default()),
-            margo: Margo::default(),
-            margo_active: false,
-            pending_soft_int: None,
-            dos: izarravm_dos::DosKernel::default(),
-            rom: vec![0; BIOS_ROM_SIZE],
-            serial: SerialPort::default(),
-            device_ports: DevicePorts::default(),
-            pic: pic::Pic8259Pair::default(),
-            pit: pit::Pit::default(),
-            pit_clocks: 0.0,
-            dma: dma::DmaController::default(),
-            opl: OplChip::default(),
-            resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
-            opl_micros: 0.0,
-            dsp: SbDsp::default(),
-            // Placeholder; sync_dsp_resampler rebuilds this for the live rate on
-            // first use, so the value here never reaches the DAC as-is.
-            dsp_resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
-            dsp_rate_hz: 0,
-            dsp_micros: 0.0,
-            dsp_sample_phase: 0.0,
-            mixer,
-            margo_ns: 0.0,
-            vga_dots: 0.0,
-            trace: BusTrace::default(),
-            elapsed_clocks: 0,
-            program_frames: Vec::new(),
-        };
-        debug_assert!(
-            machine.memory.len() as u64 <= u64::from(MARGO_LFB_BASE),
-            "system RAM overlaps the Margo LFB aperture at 0xE0000000"
-        );
+        let mut machine = Self::base(profile, Cpu386::default(), vec![0; BIOS_ROM_SIZE])?;
         install_boot_bios_stubs(&mut machine.memory)?;
 
         let entry = izarravm_dos::load_program(image, &mut machine.memory, DOS_LOAD_SEGMENT)?;
