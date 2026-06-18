@@ -331,6 +331,8 @@ pub struct Vga {
     pub(crate) text_memory: [u8; VGA_TEXT_MEMORY_SIZE],
     pub(crate) dac: Dac,
     pub(crate) cursor_offset: u16,
+    pub(crate) cursor_start: u8,
+    pub(crate) cursor_end: u8,
     pub(crate) mode: VideoMode,
     pub(crate) misc_output: u8,
     pub(crate) pel_mask: u8,
@@ -364,6 +366,10 @@ impl Default for Vga {
             text_memory,
             dac: Dac::default(),
             cursor_offset: 0,
+            // The text cursor shape the BIOS loads for mode 03h (start scanline
+            // 6, end scanline 7). Stored and read back; rendering is a later slice.
+            cursor_start: 0x06,
+            cursor_end: 0x07,
             mode: VideoMode::Text,
             // Misc Output powers up as mode 03h (text/CGA clock, CRTC at 3Dx); the
             // DAC pel mask defaults to all-pass. Both are stored and read back,
@@ -824,6 +830,8 @@ impl Vga {
             0x3CC => Some(self.misc_output),
             0x3D4 => Some(self.crtc_index),
             0x3D5 => match self.crtc_index {
+                0x0A => Some(self.cursor_start),
+                0x0B => Some(self.cursor_end),
                 0x0E => Some((self.cursor_offset >> 8) as u8),
                 0x0F => Some(self.cursor_offset as u8),
                 _ => Some(0),
@@ -890,6 +898,9 @@ impl Vga {
 
     fn write_crtc(&mut self, index: u8, value: u8) {
         match index {
+            // Cursor shape (start scanline + disable bit / end scanline + skew).
+            0x0A => self.cursor_start = value,
+            0x0B => self.cursor_end = value,
             // Both start-address bytes buffer through the vretrace latch (no mid-frame
             // tearing). Assemble against the pending value, or the active value if none.
             0x0C => {
@@ -1767,6 +1778,23 @@ mod tests {
 
         assert_eq!(text.cursor_offset, 0x1234);
         assert_eq!(text.read_port(0x03d5), Some(0x34));
+    }
+
+    #[test]
+    fn cursor_shape_registers_round_trip() {
+        let mut vga = Vga::default();
+        assert!(vga.write_port(0x3D4, 0x0A));
+        assert!(vga.write_port(0x3D5, 0x0E)); // start scanline 14
+        assert!(vga.write_port(0x3D4, 0x0B));
+        assert!(vga.write_port(0x3D5, 0x0F)); // end scanline 15
+
+        assert_eq!(vga.cursor_start, 0x0E);
+        assert_eq!(vga.cursor_end, 0x0F);
+        // Readback through the CRTC data port.
+        assert!(vga.write_port(0x3D4, 0x0A));
+        assert_eq!(vga.read_port(0x3D5), Some(0x0E));
+        assert!(vga.write_port(0x3D4, 0x0B));
+        assert_eq!(vga.read_port(0x3D5), Some(0x0F));
     }
 
     #[test]
