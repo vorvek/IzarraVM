@@ -444,11 +444,18 @@ impl Vga {
 
     /// The active font table index, decoded from the Sequencer Character Map
     /// Select (index 3) map-A field (bits 0, 1, 4), the font plane 2 displays in
-    /// 256-glyph text. Map B (bits 2, 3, 5) is the second font used only in
-    /// 512-glyph mode, deferred here. (Abrash, Graphics Programming Black Book
-    /// ch.24.)
+    /// 256-glyph text. (Abrash, Graphics Programming Black Book ch.24.)
     pub fn active_font_table(&self) -> usize {
         char_map_a_decode(self.seq.char_map_select)
+    }
+
+    /// The second font table index, decoded from the map-B field of the Sequencer
+    /// Character Map Select (bits 2, 3, 5). In 512-glyph mode each cell's attribute
+    /// bit 3 picks map A (clear) or map B (set); when both maps select the same
+    /// table the cell is 256-glyph and bit 3 stays foreground intensity. See A4 in
+    /// dev_docs/reference/vga/text-mode-gaps-confirm-notes.md.
+    pub fn active_font_table_b(&self) -> usize {
+        char_map_b_decode(self.seq.char_map_select)
     }
 
     /// Decode a block-specifier value (BL) to a font table index with the same
@@ -772,7 +779,24 @@ impl Vga {
             let char_byte = self.text_memory.get(base).copied().unwrap_or(b' ');
             let attr = self.text_memory.get(base + 1).copied().unwrap_or(0x07);
             let blink_attr = attr & 0x80 != 0;
-            let fg_index = (attr & 0x0F) as usize;
+            // 512-glyph mode: when the Sequencer selects two distinct font tables
+            // (map A != map B), attribute bit 3 becomes the per-cell font selector
+            // and is no longer foreground intensity, so the foreground is masked to
+            // 8 colors. See A4 in dev_docs/reference/vga/text-mode-gaps-confirm-notes.md.
+            let table_a = self.active_font_table();
+            let table_b = self.active_font_table_b();
+            let dual_font = table_a != table_b;
+            let font_select = (attr >> 3) & 1 != 0;
+            let font_table = if dual_font && font_select {
+                table_b
+            } else {
+                table_a
+            };
+            let fg_index = if dual_font {
+                (attr & 0x07) as usize
+            } else {
+                (attr & 0x0F) as usize
+            };
             let bg_index = if blink_enabled && blink_attr {
                 ((attr >> 4) & 0x07) as usize
             } else {
@@ -805,8 +829,7 @@ impl Vga {
             // 32-byte slot, bit 7 of a row being the leftmost pixel. font_line
             // beyond the slot is clamped (a taller char cell on a reprogrammed
             // max_scan reads the last row of the slot).
-            let glyph_row =
-                self.font[self.active_font_table()][char_byte as usize * 32 + font_line.min(31)];
+            let glyph_row = self.font[font_table][char_byte as usize * 32 + font_line.min(31)];
             let extend_ninth = (0xC0..=0xDF).contains(&char_byte);
             // Place the cell shifted left by `pan` pels. Use signed math so cell 0's
             // leading `pan` pels (which scroll off the left edge) clip to negative
@@ -1435,6 +1458,17 @@ fn char_map_a_decode(spec: u8) -> usize {
     (spec & 0x01) as usize
         | (((spec >> 1) & 0x01) as usize) << 1
         | (((spec >> 4) & 0x01) as usize) << 2
+}
+
+/// Decode the Sequencer Character Map Select map-B field (bits 2, 3, 5) to a
+/// font table index 0..7, the mirror of `char_map_a_decode` for the second
+/// character set. Per cell, attribute bit 3 selects map B (set) or map A
+/// (clear) in 512-glyph mode. See A4 in
+/// dev_docs/reference/vga/text-mode-gaps-confirm-notes.md.
+fn char_map_b_decode(spec: u8) -> usize {
+    ((spec >> 2) & 0x01) as usize
+        | (((spec >> 3) & 0x01) as usize) << 1
+        | (((spec >> 5) & 0x01) as usize) << 2
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -2992,8 +3026,10 @@ mod tests {
         // Table 0 (default): the glyph is blank, so the pixel is the background.
         assert_eq!(vga.active_font_table(), 0);
         assert_eq!(vga.render_text_row(0)[0], 0, "table 0 'A' is blank");
-        // Selecting table 1 shows its own solid glyph.
-        vga.seq.char_map_select = 0x01; // map-A bit 0 -> table index 1
+        // Selecting table 1 shows its own solid glyph. Set map B = table 1 too so
+        // the cell stays in 256-glyph mode (map A == map B); otherwise the two
+        // distinct maps would engage 512-glyph mode and consume attr bit 3.
+        vga.seq.char_map_select = 0x01 | 0x04; // map-A bit 0, map-B bit 2 -> table 1
         assert_eq!(vga.active_font_table(), 1);
         assert_eq!(
             vga.render_text_row(0)[0],
@@ -3018,7 +3054,9 @@ mod tests {
         assert_eq!(vga.active_font_table(), 0);
         assert_eq!(vga.render_text_row(0)[0], 0);
         vga.write_port(0x3C4, 0x03);
-        vga.write_port(0x3C5, 0x10); // SR3 bit 4 -> map-A bit 2 -> table 4 (solid)
+        // SR3 = 0x30: map-A bit 4 (table 4) and map-B bit 5 (table 4), so the cell
+        // stays 256-glyph (map A == map B) and does not consume attr bit 3.
+        vga.write_port(0x3C5, 0x10 | 0x20); // -> table 4 (solid)
         assert_eq!(vga.active_font_table(), 4);
         assert_eq!(vga.render_text_row(0)[0], 15);
     }
@@ -3368,6 +3406,76 @@ mod tests {
             vga.render_text_row(16)[0],
             15,
             "below-split region: preset row scan resets to 0 (font line 0 solid)"
+        );
+    }
+
+    #[test]
+    fn char_map_b_decode_picks_the_second_font_table() {
+        // The Sequencer Character Map Select map-B field (bits 2, 3, 5) decodes to
+        // a table index with the same shape as map A. Verify each bit and the
+        // composite against active_font_table_b.
+        let mut vga = Vga::default();
+        vga.seq.char_map_select = 0x04; // map-B bit 0 (SR3 bit 2) -> table 1
+        assert_eq!(vga.active_font_table_b(), 1);
+        vga.seq.char_map_select = 0x08; // map-B bit 1 (SR3 bit 3) -> table 2
+        assert_eq!(vga.active_font_table_b(), 2);
+        vga.seq.char_map_select = 0x20; // map-B bit 2 (SR3 bit 5) -> table 4
+        assert_eq!(vga.active_font_table_b(), 4);
+        vga.seq.char_map_select = 0x2C; // all three map-B bits -> table 7
+        assert_eq!(vga.active_font_table_b(), 7);
+    }
+
+    #[test]
+    fn attribute_bit_3_selects_the_font_in_512_char_mode() {
+        // With two distinct font tables selected (map A != map B), attribute bit 3
+        // picks the font per cell: set -> map B, clear -> map A. Load table 0's
+        // glyph blank and table 1's solid, select map A = 0 / map B = 1.
+        let mut vga = Vga::default();
+        let ch = 0x41usize;
+        for row in 0..16usize {
+            vga.font[0][ch * 32 + row] = 0x00; // table 0: blank
+            vga.font[1][ch * 32 + row] = 0xFF; // table 1: solid
+        }
+        text_put(&mut vga, 0, 0, 0x41, 0x07); // bit 3 clear -> map A (blank)
+        // map A = table 0 (SR3 bit 0 clear), map B = table 1 (SR3 bit 2 set).
+        vga.seq.char_map_select = 0x04; // map A 0, map B 1 -> dual-font active
+        assert_eq!(
+            vga.render_text_row(0)[0],
+            0,
+            "bit 3 clear: map A glyph (table 0, blank)"
+        );
+        // Set bit 3 -> map B (table 1, solid). fg is masked to 8 colors now, so the
+        // solid glyph reads palette[attr & 0x07] = palette[7] = 7 (not 15).
+        text_put(&mut vga, 0, 0, 0x41, 0x0F); // bit 3 set -> map B
+        assert_eq!(
+            vga.render_text_row(0)[0],
+            7,
+            "bit 3 set: map B glyph (table 1, solid); fg masked to 8 colors"
+        );
+    }
+
+    #[test]
+    fn int10_11h_loads_two_fonts_for_512_char_text() {
+        // Loading two fonts into distinct tables and selecting them via the
+        // Character Map Select engages 512-glyph mode end-to-end. This mirrors the
+        // AH=11h font-load path: load_font_table into table 0 and table 1, then
+        // set_char_map_select so map A = 0 and map B = 1.
+        let mut vga = Vga::default();
+        let ch = 0x42usize; // 'B'
+        // Table 0: 'B' blank; table 1: 'B' solid (two glyphs).
+        let blank = vec![0x00u8; 16];
+        let solid = vec![0xFFu8; 16];
+        vga.load_font_table(0, ch as u16, 16, &blank);
+        vga.load_font_table(1, ch as u16, 16, &solid);
+        // Map A = 0, map B = 1 (SR3 bit 2 set for map B value 1).
+        vga.set_char_map_select(0x04);
+        text_put(&mut vga, 0, 0, 0x42, 0x07); // bit 3 clear -> map A (blank)
+        assert_eq!(vga.render_text_row(0)[0], 0, "map A 'B' is blank");
+        text_put(&mut vga, 0, 0, 0x42, 0x0F); // bit 3 set -> map B (solid)
+        assert_eq!(
+            vga.render_text_row(0)[0],
+            7,
+            "map B 'B' is solid (fg masked to 8 colors in 512-char mode)"
         );
     }
 }
