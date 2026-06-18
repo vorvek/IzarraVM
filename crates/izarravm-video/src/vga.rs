@@ -716,9 +716,26 @@ impl Vga {
             } else {
                 ((attr >> 4) & 0x0F) as usize
             };
-            let fg = (self.attr.palette[fg_index] & 0x3F) & self.pel_mask;
-            let bg = (self.attr.palette[bg_index] & 0x3F) & self.pel_mask;
+            let mut fg = (self.attr.palette[fg_index] & 0x3F) & self.pel_mask;
+            let mut bg = (self.attr.palette[bg_index] & 0x3F) & self.pel_mask;
             let hide_fg = blink_enabled && blink_attr && blink_hide_phase;
+            // Hardware text cursor (CRTC 0A/0B): on the cursor cell, swap fg/bg
+            // on the active scanlines for reverse video. 0A bit 5 disables the
+            // cursor; bits 0-4 of 0A/0B bound the scanline range (start > end
+            // wraps). The cursor blinks on the same hide phase as attribute
+            // blink, but is not gated on the attribute-blink enable.
+            let cursor_here = cell_index == self.cursor_offset as usize;
+            let cursor_disabled = self.cursor_start & 0x20 != 0;
+            let start_line = (self.cursor_start & 0x1F) as usize;
+            let end_line = (self.cursor_end & 0x1F) as usize;
+            let in_range = if start_line <= end_line {
+                font_line >= start_line && font_line <= end_line
+            } else {
+                font_line >= start_line || font_line <= end_line
+            };
+            if cursor_here && !cursor_disabled && in_range && !blink_hide_phase {
+                std::mem::swap(&mut fg, &mut bg);
+            }
             // The active font table (Sequencer index 3); each glyph occupies a
             // 32-byte slot, bit 7 of a row being the leftmost pixel. font_line
             // beyond the slot is clamped (a taller char cell on a reprogrammed
@@ -2920,5 +2937,92 @@ mod tests {
         vga.write_port(0x3C5, 0x10); // SR3 bit 4 -> map-A bit 2 -> table 4 (solid)
         assert_eq!(vga.active_font_table(), 4);
         assert_eq!(vga.render_text_row(0)[0], 15);
+    }
+
+    #[test]
+    fn text_cursor_renders_reverse_video_on_the_cursor_cell() {
+        let mut vga = Vga::default();
+        // Two blank cells, white on black (0x0F); the cursor sits on cell (0,0).
+        text_put(&mut vga, 0, 0, b' ', 0x0F);
+        text_put(&mut vga, 0, 1, b' ', 0x0F);
+        vga.cursor_offset = 0;
+        vga.cursor_start = 0x00; // full block: scanlines 0..15
+        vga.cursor_end = 0x0F;
+        vga.frames = 0; // show phase
+        let row = vga.render_text_row(0);
+        // Reverse video on a blank cell swaps the background (where the blank
+        // glyph reads) to the foreground, so the cursor cell is solid fg (15).
+        assert_eq!(
+            row[0], 15,
+            "cursor cell scans out as the foreground (reverse video on a blank)"
+        );
+        // The neighbouring blank cell is not the cursor, so it stays the
+        // background (0).
+        assert_eq!(
+            row[9], 0,
+            "a non-cursor blank cell scans out as the background"
+        );
+    }
+
+    #[test]
+    fn text_cursor_respects_start_and_end_scanlines() {
+        let mut vga = Vga::default();
+        text_put(&mut vga, 0, 0, b' ', 0x0F);
+        vga.cursor_offset = 0;
+        vga.cursor_start = 0x0E; // scanlines 14..15
+        vga.cursor_end = 0x0F;
+        vga.frames = 0;
+        assert_eq!(
+            vga.render_text_row(0)[0],
+            0,
+            "scanline 0 is outside [14,15]: no swap"
+        );
+        assert_eq!(vga.render_text_row(14)[0], 15, "scanline 14 swaps");
+        assert_eq!(vga.render_text_row(15)[0], 15, "scanline 15 swaps");
+    }
+
+    #[test]
+    fn text_cursor_disable_bit_hides_it() {
+        let mut vga = Vga::default();
+        text_put(&mut vga, 0, 0, b' ', 0x0F);
+        vga.cursor_offset = 0;
+        vga.cursor_start = 0x20; // bit 5 set: cursor off (start line 0 ignored)
+        vga.cursor_end = 0x0F;
+        vga.frames = 0;
+        for line in [0u32, 7, 15] {
+            assert_eq!(
+                vga.render_text_row(line)[0],
+                0,
+                "disable bit: no swap on any scanline"
+            );
+        }
+    }
+
+    #[test]
+    fn text_cursor_blinks_on_the_frame_phase() {
+        let mut vga = Vga::default();
+        text_put(&mut vga, 0, 0, b' ', 0x0F);
+        vga.cursor_offset = 0;
+        vga.cursor_start = 0x00;
+        vga.cursor_end = 0x0F;
+        vga.frames = 0; // show phase: cursor visible
+        assert_eq!(vga.render_text_row(0)[0], 15, "show phase: cursor swaps");
+        vga.frames = 16; // hide phase: cursor hidden
+        assert_eq!(vga.render_text_row(0)[0], 0, "hide phase: no swap");
+    }
+
+    #[test]
+    fn text_cursor_wrap_shape_covers_two_regions() {
+        let mut vga = Vga::default();
+        text_put(&mut vga, 0, 0, b' ', 0x0F);
+        vga.cursor_offset = 0;
+        vga.cursor_start = 0x0E; // start line 14
+        vga.cursor_end = 0x01; // end line 1: start > end wraps to two regions
+        vga.frames = 0;
+        assert_eq!(vga.render_text_row(0)[0], 15, "wrap: scanline 0 swaps");
+        assert_eq!(vga.render_text_row(1)[0], 15, "wrap: scanline 1 swaps");
+        assert_eq!(vga.render_text_row(7)[0], 0, "wrap: scanline 7 does not");
+        assert_eq!(vga.render_text_row(14)[0], 15, "wrap: scanline 14 swaps");
+        assert_eq!(vga.render_text_row(15)[0], 15, "wrap: scanline 15 swaps");
     }
 }
