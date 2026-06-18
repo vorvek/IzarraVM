@@ -123,6 +123,14 @@ pub struct DosRegs {
 pub enum DosAction {
     Continue, // results are in DosRegs; the IRET stub returns to the caller
     Exit(u8), // terminate the program with this code
+    /// AH=4Bh AL=0: switch the CPU to the child. The kernel has saved the parent
+    /// context and built the child PSP/environment; the machine snapshots the
+    /// parent CPU, applies `entry`, and sets the child AX to `child_ax` (FCB
+    /// drive-validity AL/AH per RBIL). The child runs until it exits.
+    Exec {
+        entry: ProgramEntry,
+        child_ax: u16,
+    },
 }
 
 /// Conventional memory modeled as one block ending at paragraph 0xA000. The
@@ -322,6 +330,17 @@ struct FindSearch {
     next: usize,
 }
 
+/// Saved per-program DOS state, pushed when a child is EXECed (AL=0) and
+/// restored when the child exits. open_files is NOT saved; parent and child
+/// share one handle table (real DOS refcounts handles 0-4 into the child's JFT
+/// and closes inherited handles on exit, neither of which we model, marked).
+#[derive(Debug)]
+struct ProgramContext {
+    arena: Arena,
+    dta: (u16, u16),
+    find_searches: HashMap<(u16, u16), FindSearch>,
+}
+
 /// The stateful DOS kernel. Owns the host-side state that must survive between
 /// INT 21h calls: the open-file handle table and the mounted C: drive, plus the
 /// standard input and output buffers (high-level emulated, HLE). The machine
@@ -337,6 +356,10 @@ pub struct DosKernel {
     arena: Arena,
     dta: (u16, u16),
     find_searches: HashMap<(u16, u16), FindSearch>,
+    // Parent program frames for nested EXEC (AL=0); restored on child exit.
+    program_stack: Vec<ProgramContext>,
+    last_exit_code: u8, // AH=4Dh AL; cleared after it is read
+    last_exit_type: u8, // AH=4Dh AH; always 0x00 (normal termination), marked
 }
 
 impl DosKernel {
@@ -396,6 +419,9 @@ impl DosKernel {
         };
         self.dta = (psp_seg, 0x80);
         self.find_searches.clear();
+        self.program_stack.clear();
+        self.last_exit_code = 0;
+        self.last_exit_type = 0;
     }
 
     /// Resolve the ASCIIZ filename at ds:dx to a host path. Ok(Ok(path)) on
@@ -415,6 +441,250 @@ impl DosKernel {
             return Ok(Err(0x02));
         };
         Ok(drive.resolve_dos_path(&name).map_err(|_| 0x03))
+    }
+
+    /// Resolve DS:DX to a host path and read the program image into an owned
+    /// Vec. Ok(Ok(image)) on success; Ok(Err(code)) when a DOS error code should
+    /// be returned (no drive -> 0x02, bad path -> 0x03, missing file -> 0x02,
+    /// host error -> 0x05); Err(DosError::Memory) for a guest-memory fault.
+    fn read_program_image(
+        &self,
+        mem: &Memory,
+        regs: &DosRegs,
+    ) -> Result<Result<Vec<u8>, u16>, DosError> {
+        let path = match self.resolve_open_path(mem, regs.ds, regs.dx)? {
+            Ok(path) => path,
+            Err(code) => return Ok(Err(code)),
+        };
+        let mut file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(err) => return Ok(Err(dos_io_error_code(&err))),
+        };
+        let mut image = Vec::new();
+        if let Err(err) = file.read_to_end(&mut image) {
+            return Ok(Err(dos_io_error_code(&err)));
+        }
+        Ok(Ok(image))
+    }
+
+    /// AH=4Bh AL=3: load an overlay into the caller-allocated segment named in
+    /// the EPB at ES:BX (#01591: load segment at 0x00, relocation factor at
+    /// 0x02). CF=0 on success; CF=1 + AX on error. A malformed MZ image maps to
+    /// 0x0B (bad format), inherited from the loader's error variants (marked).
+    fn exec_load_overlay(
+        &mut self,
+        mem: &mut Memory,
+        regs: &mut DosRegs,
+    ) -> Result<DosAction, DosError> {
+        let epb_base = usize::from(regs.es) * 16 + usize::from(regs.bx);
+        let load_seg = mem.read_u16(epb_base)?;
+        let reloc_factor = mem.read_u16(epb_base + 2)?;
+        let image = match self.read_program_image(mem, regs)? {
+            Ok(image) => image,
+            Err(code) => {
+                set_dos_error(regs, code);
+                return Ok(DosAction::Continue);
+            }
+        };
+        match load_overlay(&image, mem, load_seg, reloc_factor) {
+            Ok(()) => {
+                regs.cf = false;
+                Ok(DosAction::Continue)
+            }
+            Err(DosError::Memory(e)) => Err(DosError::Memory(e)),
+            Err(_) => {
+                set_dos_error(regs, 0x0b);
+                Ok(DosAction::Continue)
+            }
+        }
+    }
+
+    /// Build the child environment block. env_source 0 -> an empty environment
+    /// (a single terminating NUL). Non-zero -> copy the source block's string
+    /// region (ASCIIZ strings up to the terminating empty string), capped at
+    /// 32 KiB; no terminator within the cap -> Err(0x0A). Only the string region
+    /// is copied, not the optional count + program-name suffix (marked).
+    fn child_environment(
+        &self,
+        mem: &Memory,
+        env_source: u16,
+    ) -> Result<Result<Vec<u8>, u16>, DosError> {
+        if env_source == 0 {
+            return Ok(Ok(vec![0x00]));
+        }
+        let base = usize::from(env_source) * 16;
+        let mut out = Vec::new();
+        let cap = 32_768usize;
+        loop {
+            // Read one ASCIIZ string; its source position is out.len() (the next
+            // unread byte), which advances as bytes are pushed.
+            let string_start = out.len();
+            loop {
+                if out.len() >= cap {
+                    return Ok(Err(0x0a));
+                }
+                let b = mem.read_u8(base + out.len())?;
+                out.push(b);
+                if b == 0 {
+                    break;
+                }
+            }
+            if out.len() - string_start == 1 {
+                break; // just the lone terminating NUL ends the block
+            }
+        }
+        Ok(Ok(out))
+    }
+
+    /// Write the child command tail at PSP offset 0x80 from the EPB command-tail
+    /// pointer (a length byte followed by chars). A null (0:0) pointer writes an
+    /// empty tail (length 0, a 0x0D terminator).
+    fn write_command_tail(
+        &self,
+        mem: &mut Memory,
+        psp: usize,
+        seg: u16,
+        off: u16,
+    ) -> Result<(), DosError> {
+        let null = seg == 0 && off == 0;
+        let count = if null {
+            0u8
+        } else {
+            let base = usize::from(seg) * 16 + usize::from(off);
+            mem.read_u8(base)?.min(127)
+        };
+        mem.write_u8(psp + 0x80, count)?;
+        if !null {
+            let base = usize::from(seg) * 16 + usize::from(off);
+            for i in 0..usize::from(count) {
+                mem.write_u8(psp + 0x81 + i, mem.read_u8(base + 1 + i)?)?;
+            }
+        }
+        mem.write_u8(psp + 0x81 + usize::from(count), 0x0d)?;
+        Ok(())
+    }
+
+    /// AH=4Bh AL=0: load and execute. Reads the name and EPB #01590 at ES:BX,
+    /// builds the child environment and PSP, loads the image, saves the parent
+    /// context, switches to the child context, and returns Exec. Errors set
+    /// CF/AX and return Continue (no child runs).
+    fn exec_load_and_execute(
+        &mut self,
+        mem: &mut Memory,
+        regs: &mut DosRegs,
+    ) -> Result<DosAction, DosError> {
+        let image = match self.read_program_image(mem, regs)? {
+            Ok(image) => image,
+            Err(code) => {
+                set_dos_error(regs, code);
+                return Ok(DosAction::Continue);
+            }
+        };
+        // EPB #01590: env word (0x00), command-tail far ptr (0x02), FCB1 (0x06),
+        // FCB2 (0x0A).
+        let epb_base = usize::from(regs.es) * 16 + usize::from(regs.bx);
+        let env_source = mem.read_u16(epb_base)?;
+        let cmdtail_off = mem.read_u16(epb_base + 2)?;
+        let cmdtail_seg = mem.read_u16(epb_base + 4)?;
+        let fcb1_off = mem.read_u16(epb_base + 6)?;
+        let fcb1_seg = mem.read_u16(epb_base + 8)?;
+        let fcb2_off = mem.read_u16(epb_base + 0x0a)?;
+        let fcb2_seg = mem.read_u16(epb_base + 0x0c)?;
+
+        let env_bytes = match self.child_environment(mem, env_source)? {
+            Ok(bytes) => bytes,
+            Err(code) => {
+                set_dos_error(regs, code);
+                return Ok(DosAction::Continue);
+            }
+        };
+        let env_paras = (env_bytes.len() as u16).div_ceil(16).max(1);
+        let env_seg = self.arena.free_base;
+        let child_psp = match env_seg.checked_add(env_paras) {
+            Some(s) if s < ARENA_TOP => s,
+            _ => {
+                set_dos_error(regs, 0x0a);
+                return Ok(DosAction::Continue);
+            }
+        };
+        // The child needs at least a 64 KiB segment: load_com sets SP=0xFFFE and
+        // writes the return word there. A child whose PSP lands too high would
+        // overflow past ARENA_TOP, so reject it as insufficient memory (0x08)
+        // before writing the env block. An MZ child's finer fit is enforced by
+        // load_program below (ExeNotEnoughMemory -> 0x08).
+        if u32::from(child_psp) + 0x1000 > u32::from(ARENA_TOP) {
+            set_dos_error(regs, 0x08);
+            return Ok(DosAction::Continue);
+        }
+        let env_linear = usize::from(env_seg) * 16;
+        for (i, &byte) in env_bytes.iter().enumerate() {
+            mem.write_u8(env_linear + i, byte)?;
+        }
+
+        let parent_psp = self.arena.psp_seg;
+        let entry = match load_program(&image, mem, child_psp) {
+            Ok(entry) => entry,
+            Err(DosError::ExeNotEnoughMemory { .. }) => {
+                set_dos_error(regs, 0x08);
+                return Ok(DosAction::Continue);
+            }
+            Err(DosError::Memory(e)) => return Err(DosError::Memory(e)),
+            Err(_) => {
+                set_dos_error(regs, 0x0b);
+                return Ok(DosAction::Continue);
+            }
+        };
+
+        // Patch the child PSP.
+        let psp = usize::from(child_psp) * 16;
+        mem.write_u16(psp + 0x02, ARENA_TOP)?; // child owns to the top (DOS default)
+        mem.write_u16(psp + 0x16, parent_psp)?; // parent PSP link
+        mem.write_u16(psp + 0x2c, env_seg)?; // environment segment
+        self.write_command_tail(mem, psp, cmdtail_seg, cmdtail_off)?;
+        // Default JFT at 0x18: stdin/stdout/stderr open, the rest closed.
+        for off in 0x18u16..0x2cu16 {
+            mem.write_u8(psp + usize::from(off), 0)?;
+        }
+        mem.write_u8(psp + 0x18, 0x01)?;
+        mem.write_u8(psp + 0x19, 0x01)?;
+        mem.write_u8(psp + 0x1a, 0x01)?;
+        let fcb1_drive = copy_fcb(mem, psp + 0x5c, fcb1_seg, fcb1_off)?;
+        let fcb2_drive = copy_fcb(mem, psp + 0x6c, fcb2_seg, fcb2_off)?;
+        let child_ax = (u16::from(fcb_drive_validity(fcb2_drive)) << 8)
+            | u16::from(fcb_drive_validity(fcb1_drive));
+
+        // Save the parent context, then switch to the child.
+        let parent = ProgramContext {
+            arena: std::mem::take(&mut self.arena),
+            dta: self.dta,
+            find_searches: std::mem::take(&mut self.find_searches),
+        };
+        self.program_stack.push(parent);
+        self.arena = Arena {
+            psp_seg: child_psp,
+            prog_top: ARENA_TOP,
+            free_base: ARENA_TOP,
+            blocks: Vec::new(),
+        };
+        self.dta = (child_psp, 0x80);
+        // A fresh child has terminated no child of its own.
+        self.last_exit_code = 0;
+        self.last_exit_type = 0;
+
+        Ok(DosAction::Exec { entry, child_ax })
+    }
+
+    /// Restore the parent program's DOS state after a child exits with `code`,
+    /// and record the exit code/type for AH=4Dh. Called by the machine when it
+    /// pops a parent frame.
+    pub fn finish_exec(&mut self, code: u8) {
+        if let Some(parent) = self.program_stack.pop() {
+            self.arena = parent.arena;
+            self.dta = parent.dta;
+            self.find_searches = parent.find_searches;
+        }
+        self.last_exit_code = code;
+        self.last_exit_type = 0x00; // only normal termination is modeled (marked).
     }
 
     /// Split a FindFirst filespec into (host directory, final-component pattern).
@@ -970,6 +1240,28 @@ impl DosKernel {
                 regs.cf = false;
                 Ok(DosAction::Continue)
             }
+            // AH=4Bh: EXEC. AL=0 (load and execute) and AL=3 (load overlay) are
+            // handled; AL=1 (load without execute) and AL=4 (background) are not
+            // implemented and return 0x01 (invalid function), marked.
+            0x4b => match regs.ax as u8 {
+                0x00 => self.exec_load_and_execute(mem, regs),
+                0x03 => self.exec_load_overlay(mem, regs),
+                _ => {
+                    set_dos_error(regs, 0x01);
+                    Ok(DosAction::Continue)
+                }
+            },
+            // AH=4Dh: get the return code of the last child. AL=code, AH=type
+            // (always 0x00 normal; Ctrl-C/critical/TSR are not modeled, marked).
+            // CF is always clear; the stored code is cleared after the read
+            // (one-shot, per RBIL).
+            0x4d => {
+                regs.ax = (u16::from(self.last_exit_type) << 8) | u16::from(self.last_exit_code);
+                self.last_exit_code = 0;
+                self.last_exit_type = 0;
+                regs.cf = false;
+                Ok(DosAction::Continue)
+            }
             // Other file functions (find) and everything else are not yet
             // implemented; later slices fill them in. An unimplemented function
             // returns Continue so the IRET stub returns to the caller.
@@ -1044,17 +1336,22 @@ pub fn load_com(image: &[u8], mem: &mut Memory, segment: u16) -> Result<ProgramE
     })
 }
 
-/// Load a DOS MZ/.EXE into `mem`: parse the 0x1C-byte header, copy the load
-/// module to start_seg:0 (start_seg = psp_segment + 0x10), apply each relocation
-/// (add start_seg to the flagged word), build the PSP, and return the entry
-/// state (CS:IP and SS:SP from the header, DS=ES=PSP). Conventional memory is
-/// one block ending at paragraph 0xA000; e_minalloc is enforced and e_maxalloc
-/// clamps the PSP top-of-memory word.
-pub fn load_exe(
-    image: &[u8],
-    mem: &mut Memory,
-    psp_segment: u16,
-) -> Result<ProgramEntry, DosError> {
+/// A parsed MZ/.EXE image: the entry fields and the load-module slice plus the
+/// raw relocation table. Validates the signature, the page/last-page sizes, and
+/// that the module and the relocation table fit the image; rejects the same
+/// malformations load_exe checked inline.
+struct ParsedExe<'a> {
+    e_ss: u16,
+    e_sp: u16,
+    e_ip: u16,
+    e_cs: u16,
+    e_minalloc: u16,
+    e_maxalloc: u16,
+    module: &'a [u8],
+    relocs: &'a [u8],
+}
+
+fn parse_exe(image: &[u8]) -> Result<ParsedExe<'_>, DosError> {
     if image.len() < 0x1c {
         return Err(DosError::ExeImageTruncated(
             "header shorter than 0x1C bytes",
@@ -1100,57 +1397,92 @@ pub fn load_exe(
         ));
     }
     let module = &image[header_bytes..image_size];
-    let module_len = module.len();
-    let module_paras = module_len.div_ceil(16) as u32;
-
-    let start_seg = psp_segment.wrapping_add(0x10);
-    let needed = u32::from(start_seg) + module_paras + u32::from(e_minalloc);
-    if needed > CONVENTIONAL_TOP_PARAGRAPH {
-        return Err(DosError::ExeNotEnoughMemory {
-            needed,
-            available: CONVENTIONAL_TOP_PARAGRAPH,
-        });
-    }
-
-    // Top of the program's block: honor e_maxalloc, clamp to conventional memory.
-    let top_paragraph = (u32::from(start_seg) + module_paras + u32::from(e_maxalloc))
-        .min(CONVENTIONAL_TOP_PARAGRAPH) as u16;
-    build_psp(mem, psp_segment, top_paragraph)?;
-
-    // Copy the load module to start_seg:0.
-    let base = usize::from(start_seg) * 16;
-    for (index, &byte) in module.iter().enumerate() {
-        mem.write_u8(base + index, byte)?;
-    }
-
-    // Apply relocations: each (off, seg) names a word at module offset
-    // seg*16+off; add start_seg so the segment reference points at the real load
-    // address. Out-of-range relocations are rejected rather than
-    // applied blindly as real DOS would (avoids corrupting arbitrary memory).
     let reloc_end = usize::from(e_lfarlc) + usize::from(e_crlc) * 4;
     if reloc_end > image.len() {
         return Err(DosError::ExeImageTruncated(
             "relocation table extends past the file",
         ));
     }
-    for i in 0..usize::from(e_crlc) {
-        let entry = usize::from(e_lfarlc) + i * 4;
-        let off = u16::from_le_bytes([image[entry], image[entry + 1]]);
-        let seg = u16::from_le_bytes([image[entry + 2], image[entry + 3]]);
+    let relocs = &image[usize::from(e_lfarlc)..reloc_end];
+    Ok(ParsedExe {
+        e_ss,
+        e_sp,
+        e_ip,
+        e_cs,
+        e_minalloc,
+        e_maxalloc,
+        module,
+        relocs,
+    })
+}
+
+/// Walk `relocs` (4-byte little-endian (offset, segment) entries) and apply each
+/// to the module loaded at linear `base`: read the word at `base + seg*16 + off`,
+/// add `addend`, write it back. `addend` is the load segment for an EXE and the
+/// caller's relocation factor for an overlay. Out-of-range relocations are
+/// rejected rather than applied blindly as real DOS would, to avoid corrupting
+/// arbitrary memory (marked).
+fn apply_relocs(
+    mem: &mut Memory,
+    base: usize,
+    module_len: usize,
+    relocs: &[u8],
+    addend: u16,
+) -> Result<(), DosError> {
+    for entry in relocs.chunks_exact(4) {
+        let off = u16::from_le_bytes([entry[0], entry[1]]);
+        let seg = u16::from_le_bytes([entry[2], entry[3]]);
         let module_offset = usize::from(seg) * 16 + usize::from(off);
         if module_offset + 2 > module_len {
             return Err(DosError::ExeRelocationOutOfRange);
         }
         let target = base + module_offset;
         let value = mem.read_u16(target)?;
-        mem.write_u16(target, value.wrapping_add(start_seg))?;
+        mem.write_u16(target, value.wrapping_add(addend))?;
     }
+    Ok(())
+}
+
+/// Load a DOS MZ/.EXE into `mem`: parse the 0x1C-byte header, copy the load
+/// module to start_seg:0 (start_seg = psp_segment + 0x10), apply each relocation
+/// (add start_seg to the flagged word), build the PSP, and return the entry
+/// state (CS:IP and SS:SP from the header, DS=ES=PSP). Conventional memory is
+/// one block ending at paragraph 0xA000; e_minalloc is enforced and e_maxalloc
+/// clamps the PSP top-of-memory word.
+pub fn load_exe(
+    image: &[u8],
+    mem: &mut Memory,
+    psp_segment: u16,
+) -> Result<ProgramEntry, DosError> {
+    let exe = parse_exe(image)?;
+    let module_len = exe.module.len();
+    let module_paras = module_len.div_ceil(16) as u32;
+
+    let start_seg = psp_segment.wrapping_add(0x10);
+    let needed = u32::from(start_seg) + module_paras + u32::from(exe.e_minalloc);
+    if needed > CONVENTIONAL_TOP_PARAGRAPH {
+        return Err(DosError::ExeNotEnoughMemory {
+            needed,
+            available: CONVENTIONAL_TOP_PARAGRAPH,
+        });
+    }
+    // Top of the program's block: honor e_maxalloc, clamp to conventional memory.
+    let top_paragraph = (u32::from(start_seg) + module_paras + u32::from(exe.e_maxalloc))
+        .min(CONVENTIONAL_TOP_PARAGRAPH) as u16;
+    build_psp(mem, psp_segment, top_paragraph)?;
+
+    // Copy the load module to start_seg:0.
+    let base = usize::from(start_seg) * 16;
+    for (index, &byte) in exe.module.iter().enumerate() {
+        mem.write_u8(base + index, byte)?;
+    }
+    apply_relocs(mem, base, module_len, exe.relocs, start_seg)?;
 
     Ok(ProgramEntry {
-        cs: start_seg.wrapping_add(e_cs),
-        ip: e_ip,
-        ss: start_seg.wrapping_add(e_ss),
-        sp: e_sp,
+        cs: start_seg.wrapping_add(exe.e_cs),
+        ip: exe.e_ip,
+        ss: start_seg.wrapping_add(exe.e_ss),
+        sp: exe.e_sp,
         ds: psp_segment,
         es: psp_segment,
     })
@@ -1172,6 +1504,31 @@ pub fn load_program(
     } else {
         load_com(image, mem, psp_segment)
     }
+}
+
+/// AH=4Bh AL=3: load an overlay at the caller-allocated `load_seg`, applying
+/// `reloc_factor` to an MZ image's relocations (0 for a raw .COM-format file).
+/// No PSP, no environment, no execution: the caller owns the memory and decides
+/// how to call the overlay.
+pub fn load_overlay(
+    image: &[u8],
+    mem: &mut Memory,
+    load_seg: u16,
+    reloc_factor: u16,
+) -> Result<(), DosError> {
+    let base = usize::from(load_seg) * 16;
+    if image.len() >= 2 && image[0] == b'M' && image[1] == b'Z' {
+        let exe = parse_exe(image)?;
+        for (i, &byte) in exe.module.iter().enumerate() {
+            mem.write_u8(base + i, byte)?;
+        }
+        apply_relocs(mem, base, exe.module.len(), exe.relocs, reloc_factor)?;
+    } else {
+        for (i, &byte) in image.iter().enumerate() {
+            mem.write_u8(base + i, byte)?;
+        }
+    }
+    Ok(())
 }
 
 /// Set the DOS error return convention: CF=1 and AX = the DOS error code.
@@ -1343,6 +1700,38 @@ fn write_find_record(mem: &mut Memory, dta: (u16, u16), entry: &FindEntry) -> Re
     Ok(())
 }
 
+/// Copy 16 bytes for an FCB from (seg:off) into the child PSP at `dst`, or zero
+/// it for a null (0:0) pointer. Returns the FCB's drive byte (0 for a null FCB).
+fn copy_fcb(mem: &mut Memory, dst: usize, seg: u16, off: u16) -> Result<u8, DosError> {
+    if seg == 0 && off == 0 {
+        for i in 0..16 {
+            mem.write_u8(dst + i, 0)?;
+        }
+        Ok(0)
+    } else {
+        let src = usize::from(seg) * 16 + usize::from(off);
+        let mut drive = 0u8;
+        for i in 0..16 {
+            let b = mem.read_u8(src + i)?;
+            if i == 0 {
+                drive = b;
+            }
+            mem.write_u8(dst + i, b)?;
+        }
+        Ok(drive)
+    }
+}
+
+/// RBIL EXEC note: AL/AH = 00h if the corresponding FCB has a valid drive letter,
+/// FFh if not. Drive 0 (default) and 1..=26 are valid.
+fn fcb_drive_validity(drive: u8) -> u8 {
+    if drive == 0 || (1..=26).contains(&drive) {
+        0
+    } else {
+        0xff
+    }
+}
+
 /// Read an ASCIIZ string from guest memory at seg:off, scanning for a NUL with a
 /// 128-byte cap (a DOS path is well under this). Returns None if no terminator
 /// appears within the cap (a malformed caller). A memory read fault propagates as
@@ -1492,7 +1881,7 @@ mod tests {
     fn unimplemented_int21_function_is_noop() {
         let mut mem = Memory::new(4096).unwrap();
         let mut regs = DosRegs {
-            ax: 0x4b00, // AH=4Bh EXEC, not implemented this slice
+            ax: 0x4400, // AH=44h IOCTL, not implemented
             ..DosRegs::default()
         };
         let mut kernel = DosKernel::new();
@@ -2965,5 +3354,384 @@ mod tests {
             std::fs::metadata(dir.path().join("T.TXT")).unwrap().len(),
             4
         );
+    }
+
+    #[test]
+    fn load_overlay_copies_raw_bytes() {
+        let mut mem = Memory::new(0x10000).unwrap();
+        let image = [0x12u8, 0x34, 0x56];
+        load_overlay(&image, &mut mem, 0x0100, 0).unwrap();
+        let base = 0x0100 * 16;
+        assert_eq!(mem.read_u8(base).unwrap(), 0x12);
+        assert_eq!(mem.read_u8(base + 2).unwrap(), 0x56);
+    }
+
+    #[test]
+    fn load_overlay_applies_relocations() {
+        // A 1-page MZ image: a 0x20-byte header (fixed 0x1c bytes + a 4-byte
+        // relocation table at 0x1c), then one paragraph module holding a word
+        // 0x1000. Load at 0x0200 with a relocation factor of 0x0030; the word
+        // becomes 0x1030.
+        let mut image = vec![0u8; 512];
+        image[0..2].copy_from_slice(&0x5a4du16.to_le_bytes()); // "MZ"
+        image[2..4].copy_from_slice(&512u16.to_le_bytes()); // e_cblp = full page
+        image[4..6].copy_from_slice(&1u16.to_le_bytes()); // e_cp = 1 page
+        image[6..8].copy_from_slice(&1u16.to_le_bytes()); // e_crlc = 1
+        image[8..10].copy_from_slice(&2u16.to_le_bytes()); // e_cparhdr = 0x20 bytes
+        image[0x0a..0x0c].copy_from_slice(&0u16.to_le_bytes()); // e_minalloc
+        image[0x0c..0x0e].copy_from_slice(&0u16.to_le_bytes()); // e_maxalloc
+        image[0x18..0x1a].copy_from_slice(&0x1cu16.to_le_bytes()); // e_lfarlc = 0x1c
+        // relocation entry at 0x1c: (off=0, seg=0) -> module offset 0
+        image[0x1c..0x20].copy_from_slice(&[0, 0, 0, 0]);
+        // module at 0x20..: the word at module (0,0) = 0x1000
+        image[0x20..0x22].copy_from_slice(&0x1000u16.to_le_bytes());
+
+        let mut mem = Memory::new(0x10000).unwrap();
+        load_overlay(&image, &mut mem, 0x0200, 0x0030).unwrap();
+        assert_eq!(mem.read_u16(0x0200 * 16).unwrap(), 0x1030);
+    }
+
+    #[test]
+    fn load_overlay_rejects_truncated_mz() {
+        let mut mem = Memory::new(4096).unwrap();
+        let bad = [0x4du8, 0x5a]; // claims MZ but header shorter than 0x1c
+        assert!(load_overlay(&bad, &mut mem, 0x0100, 0).is_err());
+    }
+
+    #[test]
+    fn load_overlay_rejects_out_of_range_reloc() {
+        let mut image = vec![0u8; 512];
+        image[0..2].copy_from_slice(&0x5a4du16.to_le_bytes());
+        image[2..4].copy_from_slice(&512u16.to_le_bytes());
+        image[4..6].copy_from_slice(&1u16.to_le_bytes());
+        image[6..8].copy_from_slice(&1u16.to_le_bytes()); // one reloc
+        image[8..10].copy_from_slice(&2u16.to_le_bytes()); // header 0x20
+        image[0x18..0x1a].copy_from_slice(&0x1cu16.to_le_bytes()); // reloc table at 0x1c
+        image[0x1c..0x20].copy_from_slice(&[0xff, 0xff, 0xff, 0xff]); // far outside module
+        let mut mem = Memory::new(0x10000).unwrap();
+        assert!(matches!(
+            load_overlay(&image, &mut mem, 0x0200, 0),
+            Err(DosError::ExeRelocationOutOfRange)
+        ));
+    }
+
+    /// A kernel with `dir` as C: and a 1 MiB memory for overlay writes.
+    fn overlay_kernel(dir: &Path) -> (DosKernel, Memory) {
+        let mut kernel = DosKernel::new();
+        kernel.mount_c(HostDrive::mount_c(dir).unwrap());
+        let mem = Memory::new(1024 * 1024).unwrap();
+        (kernel, mem)
+    }
+
+    #[test]
+    fn ah4b_al3_loads_overlay_via_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("OV.BIN"), [0x5au8]).unwrap();
+        let (mut kernel, mut mem) = overlay_kernel(dir.path());
+        // ASCIZ name "C:\OV.BIN" at seg 0x1000:0 (linear 0x10000).
+        let name = b"C:\\OV.BIN";
+        for (i, &b) in name.iter().enumerate() {
+            mem.write_u8(0x10000 + i, b).unwrap();
+        }
+        mem.write_u8(0x10000 + name.len(), 0).unwrap();
+        // EPB #01591 at seg 0x1000:0x40: load_seg=0x0500, reloc=0.
+        mem.write_u16(0x10040, 0x0500).unwrap();
+        mem.write_u16(0x10042, 0).unwrap();
+        let mut regs = DosRegs {
+            ax: 0x4b03,
+            ds: 0x1000,
+            dx: 0x0000,
+            es: 0x1000,
+            bx: 0x0040,
+            ..DosRegs::default()
+        };
+        assert_eq!(
+            kernel.dispatch(0x21, &mut regs, &mut mem).unwrap(),
+            DosAction::Continue
+        );
+        assert!(!regs.cf);
+        assert_eq!(mem.read_u8(0x0500 * 16).unwrap(), 0x5a);
+    }
+
+    #[test]
+    fn ah4b_bad_subfunction_returns_0x01() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut kernel, mut mem) = overlay_kernel(dir.path());
+        for al in [0x01u16, 0x04] {
+            let mut regs = DosRegs {
+                ax: 0x4b00 | al,
+                ..DosRegs::default()
+            };
+            kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+            assert!(regs.cf);
+            assert_eq!(regs.ax, 0x01);
+        }
+    }
+
+    #[test]
+    fn ah4b_missing_overlay_file_returns_0x02() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut kernel, mut mem) = overlay_kernel(dir.path());
+        let name = b"C:\\NOPE.BIN";
+        for (i, &b) in name.iter().enumerate() {
+            mem.write_u8(0x10000 + i, b).unwrap();
+        }
+        mem.write_u8(0x10000 + name.len(), 0).unwrap();
+        mem.write_u16(0x10040, 0x0500).unwrap();
+        mem.write_u16(0x10042, 0).unwrap();
+        let mut regs = DosRegs {
+            ax: 0x4b03,
+            ds: 0x1000,
+            dx: 0x0000,
+            es: 0x1000,
+            bx: 0x0040,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x02);
+    }
+
+    /// A kernel with `dir` as C:, a parent program at PSP 0x0100 owning
+    /// [0x0100, 0x0200), and a 1 MiB memory for the child PSP and inputs.
+    fn exec_kernel(dir: &Path) -> (DosKernel, Memory) {
+        let mut kernel = DosKernel::new();
+        kernel.mount_c(HostDrive::mount_c(dir).unwrap());
+        kernel.init_program(0x0100, 0x0200);
+        let mem = Memory::new(1024 * 1024).unwrap();
+        (kernel, mem)
+    }
+
+    /// Write `name` as ASCIIZ at linear 0x10000 and a 14-byte EPB at 0x10040
+    /// (env word, then null cmdtail/fcb1/fcb2 pointers). The caller sets
+    /// ds=0x1000 dx=0 es=0x1000 bx=0x40.
+    fn place_exec_inputs(mem: &mut Memory, name: &str, env: u16) {
+        let nb = 0x10000usize;
+        for (i, &b) in name.as_bytes().iter().enumerate() {
+            mem.write_u8(nb + i, b).unwrap();
+        }
+        mem.write_u8(nb + name.len(), 0).unwrap();
+        mem.write_u16(0x10040, env).unwrap();
+        mem.write_u16(0x10042, 0).unwrap(); // cmdtail off
+        mem.write_u16(0x10044, 0).unwrap(); // cmdtail seg (0:0 = null)
+        mem.write_u16(0x10046, 0).unwrap(); // fcb1 off
+        mem.write_u16(0x10048, 0).unwrap(); // fcb1 seg
+        mem.write_u16(0x1004a, 0).unwrap(); // fcb2 off
+        mem.write_u16(0x1004c, 0).unwrap(); // fcb2 seg
+    }
+
+    fn exec_al0(kernel: &mut DosKernel, mem: &mut Memory) -> DosRegs {
+        let mut regs = DosRegs {
+            ax: 0x4b00,
+            ds: 0x1000,
+            dx: 0x0000,
+            es: 0x1000,
+            bx: 0x0040,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, mem).unwrap();
+        regs
+    }
+
+    #[test]
+    fn fcb_drive_validity_table() {
+        assert_eq!(fcb_drive_validity(0), 0); // default
+        assert_eq!(fcb_drive_validity(3), 0); // C:
+        assert_eq!(fcb_drive_validity(26), 0);
+        assert_eq!(fcb_drive_validity(27), 0xff);
+    }
+
+    #[test]
+    fn ah4b_al0_builds_child_psp_and_returns_exec() {
+        let dir = tempfile::tempdir().unwrap();
+        // A minimal child .COM: INT 20h (terminate). It never runs in this test.
+        std::fs::write(dir.path().join("CHILD.COM"), [0xcdu8, 0x20]).unwrap();
+        let (mut kernel, mut mem) = exec_kernel(dir.path());
+        place_exec_inputs(&mut mem, "C:\\CHILD.COM", 0);
+        let mut regs = DosRegs {
+            ax: 0x4b00,
+            ds: 0x1000,
+            dx: 0,
+            es: 0x1000,
+            bx: 0x40,
+            ..DosRegs::default()
+        };
+        // env is 1 paragraph at the parent free_base 0x0200, so child PSP = 0x0201.
+        let action = kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        let child_psp = 0x0201usize * 16;
+        match action {
+            DosAction::Exec { child_ax, .. } => {
+                assert_eq!(child_ax, 0x0000); // null FCBs -> valid drives
+                assert_eq!(mem.read_u16(child_psp + 0x02).unwrap(), 0xa000);
+                assert_eq!(mem.read_u16(child_psp + 0x16).unwrap(), 0x0100); // parent
+                assert_eq!(mem.read_u16(child_psp + 0x2c).unwrap(), 0x0200); // env seg
+                assert_eq!(mem.read_u8(child_psp + 0x80).unwrap(), 0); // empty tail
+                assert_eq!(mem.read_u8(child_psp + 0x81).unwrap(), 0x0d);
+                assert_eq!(mem.read_u8(child_psp + 0x18).unwrap(), 0x01); // JFT stdin
+            }
+            other => panic!("expected Exec, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ah4b_al0_inherits_empty_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CHILD.COM"), [0xcdu8, 0x20]).unwrap();
+        let (mut kernel, mut mem) = exec_kernel(dir.path());
+        place_exec_inputs(&mut mem, "C:\\CHILD.COM", 0);
+        let _ = exec_al0(&mut kernel, &mut mem);
+        // env block at 0x0200:0 is a single terminating NUL.
+        assert_eq!(mem.read_u8(0x0200 * 16).unwrap(), 0x00);
+    }
+
+    #[test]
+    fn ah4b_al0_copies_explicit_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CHILD.COM"), [0xcdu8, 0x20]).unwrap();
+        let (mut kernel, mut mem) = exec_kernel(dir.path());
+        // Source env at seg 0x3000: "A=1\0B=2\0\0".
+        let src = 0x3000usize * 16;
+        for (i, &b) in b"A=1\0B=2\0\0".iter().enumerate() {
+            mem.write_u8(src + i, b).unwrap();
+        }
+        place_exec_inputs(&mut mem, "C:\\CHILD.COM", 0x3000);
+        let _ = exec_al0(&mut kernel, &mut mem);
+        // Copied env at 0x0200:0 holds the same bytes.
+        for (i, &b) in b"A=1\0B=2\0\0".iter().enumerate() {
+            assert_eq!(mem.read_u8(0x0200 * 16 + i).unwrap(), b);
+        }
+    }
+
+    #[test]
+    fn ah4b_missing_program_returns_0x02() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut kernel, mut mem) = exec_kernel(dir.path());
+        place_exec_inputs(&mut mem, "C:\\NOPE.COM", 0);
+        let regs = exec_al0(&mut kernel, &mut mem);
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x02);
+        assert!(kernel.program_stack.is_empty()); // no child context pushed
+    }
+
+    #[test]
+    fn finish_exec_restores_parent_context_and_records_code() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CHILD.COM"), [0xcdu8, 0x20]).unwrap();
+        let (mut kernel, mut mem) = exec_kernel(dir.path());
+        place_exec_inputs(&mut mem, "C:\\CHILD.COM", 0);
+        let mut regs = DosRegs {
+            ax: 0x4b00,
+            ds: 0x1000,
+            dx: 0,
+            es: 0x1000,
+            bx: 0x40,
+            ..DosRegs::default()
+        };
+        assert!(matches!(
+            kernel.dispatch(0x21, &mut regs, &mut mem).unwrap(),
+            DosAction::Exec { .. }
+        ));
+        // Now in the child context (psp_seg = 0x0201).
+        assert_eq!(kernel.arena.psp_seg, 0x0201);
+        kernel.finish_exec(7);
+        assert_eq!(kernel.arena.psp_seg, 0x0100); // parent restored
+        assert_eq!(kernel.arena.free_base, 0x0200);
+        assert_eq!(kernel.last_exit_code, 7);
+    }
+
+    #[test]
+    fn ah4d_returns_then_clears_the_exit_code() {
+        let mut kernel = DosKernel::new();
+        kernel.last_exit_code = 7;
+        let mut mem = Memory::new(4096).unwrap();
+        let mut regs = DosRegs {
+            ax: 0x4d00,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf);
+        assert_eq!(regs.ax, 0x0007);
+        // Second read returns 0 (one-shot).
+        regs.ax = 0x4d00;
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(regs.ax, 0x0000);
+    }
+
+    #[test]
+    fn ah4d_in_a_fresh_child_reads_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CHILD.COM"), [0xcdu8, 0x20]).unwrap();
+        let (mut kernel, mut mem) = exec_kernel(dir.path());
+        kernel.last_exit_code = 5; // a prior child's code, must not leak in
+        place_exec_inputs(&mut mem, "C:\\CHILD.COM", 0);
+        let mut regs = DosRegs {
+            ax: 0x4b00,
+            ds: 0x1000,
+            dx: 0,
+            es: 0x1000,
+            bx: 0x40,
+            ..DosRegs::default()
+        };
+        assert!(matches!(
+            kernel.dispatch(0x21, &mut regs, &mut mem).unwrap(),
+            DosAction::Exec { .. }
+        ));
+        // In the child context, AH=4Dh reads 0 (reset on entry).
+        let mut regs = DosRegs {
+            ax: 0x4d00,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(regs.ax, 0x0000);
+    }
+
+    #[test]
+    fn ah4b_al0_bad_format_returns_0x0b() {
+        let dir = tempfile::tempdir().unwrap();
+        // A truncated MZ image: claims "MZ" but the header is shorter than 0x1c.
+        std::fs::write(dir.path().join("CHILD.COM"), [0x4du8, 0x5a]).unwrap();
+        let (mut kernel, mut mem) = exec_kernel(dir.path());
+        place_exec_inputs(&mut mem, "C:\\CHILD.COM", 0);
+        let regs = exec_al0(&mut kernel, &mut mem);
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x0b);
+    }
+
+    #[test]
+    fn ah4b_al0_invalid_fcb_drives_yield_ffff_child_ax() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CHILD.COM"), [0xcdu8, 0x20]).unwrap();
+        let (mut kernel, mut mem) = exec_kernel(dir.path());
+        // Name at 0x10000.
+        let name = b"C:\\CHILD.COM";
+        for (i, &b) in name.iter().enumerate() {
+            mem.write_u8(0x10000 + i, b).unwrap();
+        }
+        mem.write_u8(0x10000 + name.len(), 0).unwrap();
+        // A 16-byte FCB at 0x1000:0x80 with an invalid drive byte (27).
+        for i in 0..16 {
+            mem.write_u8(0x10080 + i, if i == 0 { 27 } else { 0 })
+                .unwrap();
+        }
+        // EPB: env=0, null cmdtail, FCB1 and FCB2 both -> 0x1000:0x80.
+        mem.write_u16(0x10040, 0).unwrap();
+        mem.write_u16(0x10042, 0).unwrap();
+        mem.write_u16(0x10044, 0).unwrap();
+        mem.write_u16(0x10046, 0x0080).unwrap();
+        mem.write_u16(0x10048, 0x1000).unwrap();
+        mem.write_u16(0x1004a, 0x0080).unwrap();
+        mem.write_u16(0x1004c, 0x1000).unwrap();
+        let mut regs = DosRegs {
+            ax: 0x4b00,
+            ds: 0x1000,
+            dx: 0,
+            es: 0x1000,
+            bx: 0x40,
+            ..DosRegs::default()
+        };
+        match kernel.dispatch(0x21, &mut regs, &mut mem).unwrap() {
+            DosAction::Exec { child_ax, .. } => assert_eq!(child_ax, 0xffff),
+            other => panic!("expected Exec, got {other:?}"),
+        }
     }
 }

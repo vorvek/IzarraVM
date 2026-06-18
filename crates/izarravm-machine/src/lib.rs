@@ -1,7 +1,7 @@
 use izarravm_audio::{OplChip, Resampler, SbDsp, SbMixer};
 use izarravm_bus::{BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CpuBus, Memory};
 use izarravm_core::{CpuPreset, HardwareProfile, SoundBlasterConfig, VideoCard};
-use izarravm_cpu::{Cpu386, CpuError, SegmentIndex, SegmentRegister};
+use izarravm_cpu::{Cpu386, CpuError, Registers, SegmentIndex, SegmentRegister};
 pub use izarravm_video::MARGO_ID_VALUE;
 use izarravm_video::{
     DAC_ENTRIES, Framebuffer, MARGO_MMIO_SIZE, MARGO_VBE_MODES, MARGO_VRAM_SIZE,
@@ -112,6 +112,14 @@ pub enum StopReason {
     DosExit { code: u8 },
 }
 
+/// A frozen parent CPU state for EXEC (AH=4Bh AL=0) resume: the register file as
+/// handle_dos_int left it at the parent's AH=4Bh INT, so restoring it lands the
+/// CPU back on the IRET stub with the parent's INT-return frame on the stack.
+#[derive(Debug)]
+struct ProgramFrame {
+    registers: Registers,
+}
+
 /// The OPL3 renders at this native rate; the Resonique 2 DAC outputs at 44100.
 const OPL_NATIVE_HZ: u32 = 49_716;
 const DAC_HZ: u32 = 44_100;
@@ -160,6 +168,8 @@ pub struct Machine {
     vga_dots: f64,    // fractional VGA dot clocks owed to the beam advance
     trace: BusTrace,
     elapsed_clocks: u64,
+    // Parent CPU snapshots for EXEC (AH=4Bh AL=0); popped on child exit.
+    program_frames: Vec<ProgramFrame>,
 }
 
 /// Build the CT1745 mixer from the profile's Sound Blaster power-on routing.
@@ -209,6 +219,7 @@ impl Machine {
             vga_dots: 0.0,
             trace: BusTrace::default(),
             elapsed_clocks: 0,
+            program_frames: Vec::new(),
         };
         // The Margo LFB aperture is decoded before RAM, so system memory must
         // stay below it. Validated config caps memory far under this bound.
@@ -261,6 +272,7 @@ impl Machine {
             vga_dots: 0.0,
             trace: BusTrace::default(),
             elapsed_clocks: 0,
+            program_frames: Vec::new(),
         };
         // The Margo LFB aperture is decoded before RAM, so system memory must
         // stay below it. Validated config caps memory far under this bound.
@@ -331,6 +343,7 @@ impl Machine {
             vga_dots: 0.0,
             trace: BusTrace::default(),
             elapsed_clocks: 0,
+            program_frames: Vec::new(),
         };
         debug_assert!(
             machine.memory.len() as u64 <= u64::from(MARGO_LFB_BASE),
@@ -563,6 +576,18 @@ impl Machine {
         Ok(match action {
             izarravm_dos::DosAction::Continue => None,
             izarravm_dos::DosAction::Exit(code) => Some(code),
+            izarravm_dos::DosAction::Exec { entry, child_ax } => {
+                // Snapshot the parent and switch to the child. The kernel has
+                // already saved its per-program state; we save the CPU side.
+                self.program_frames.push(ProgramFrame {
+                    registers: self.cpu.registers.clone(),
+                });
+                self.apply_program_entry(entry);
+                // Only AX is defined on child entry (FCB drive validity); the
+                // other GPRs are undefined, matching real DOS (marked).
+                self.cpu.registers.set_eax(u32::from(child_ax));
+                None // keep looping; the CPU now runs the child
+            }
         })
     }
 
@@ -1098,7 +1123,27 @@ impl Machine {
                         match vector {
                             0x10 => self.handle_int10(),
                             0x20 | 0x21 => match self.handle_dos_int(vector) {
-                                Ok(Some(code)) => return Ok(StopReason::DosExit { code }),
+                                Ok(Some(code)) => {
+                                    if let Some(frame) = self.program_frames.pop() {
+                                        // A child exited; resume the parent.
+                                        self.cpu.registers = frame.registers;
+                                        self.dos.finish_exec(code);
+                                        // EXEC success: AX=0, CF=0 in the parent's
+                                        // INT-return FLAGS image (SS:SP+4).
+                                        let ss = self.cpu.registers.segment(SegmentIndex::Ss).base;
+                                        let sp = self.cpu.registers.esp() as u16;
+                                        let flags_addr =
+                                            (ss + u32::from(sp.wrapping_add(4))) as usize;
+                                        let mut flags = self.memory.read_u16(flags_addr)?;
+                                        flags &= !0x0001; // CF=0
+                                        self.memory.write_u16(flags_addr, flags)?;
+                                        self.cpu.registers.set_eax(0);
+                                        // fall through: the loop continues, the
+                                        // IRET stub returns to the parent.
+                                    } else {
+                                        return Ok(StopReason::DosExit { code });
+                                    }
+                                }
                                 Ok(None) => {}
                                 Err(error) => {
                                     return Ok(StopReason::CpuError(format!(
@@ -4405,5 +4450,140 @@ mod tests {
         assert_eq!(argb[2 * 640 + 1], 0x008c_868c); // screen (1,2): cell 11
         assert_eq!(argb[2 * 640 + 4], 0x0084_8684); // screen (4,2): cell 3
         assert_eq!(argb[5 * 640 + 2], 0x008c_8a8c); // screen (2,5): cell 14
+    }
+
+    // The EXEC integration fixtures are nasm-assembled .COM programs (nasm 3.01,
+    // -f bin, org 0x100). Their source is in the comment above each const so the
+    // bytes are auditable without re-running the assembler.
+
+    // child.asm: write "CHILD\n" to stdout, exit 7.
+    //   mov ah,0x40; mov bx,1; mov cx,6; mov dx,msg; int 0x21
+    //   mov ax,0x4c07; int 0x21
+    //   msg: db "CHILD",0x0a
+    const CHILD_COM: &[u8] = &[
+        0xb4, 0x40, 0xbb, 0x01, 0x00, 0xb9, 0x06, 0x00, 0xba, 0x12, 0x01, 0xcd, 0x21, 0xb8, 0x07,
+        0x4c, 0xcd, 0x21, 0x43, 0x48, 0x49, 0x4c, 0x44, 0x0a,
+    ];
+
+    // parent.asm: EXEC C:\CHILD.COM, read AH=4Dh, print the code digit, exit 0
+    // (on EXEC failure print '!' and exit 1).
+    //   mov dx,name; mov bx,epb; mov ax,0x4b00; int 0x21; jc fail
+    //   mov ah,0x4d; int 0x21; add al,0x30; mov dl,al; mov ah,0x02; int 0x21
+    //   mov ax,0x4c00; int 0x21
+    //   fail: mov dl,'!'; mov ah,0x02; int 0x21; mov ax,0x4c01; int 0x21
+    //   name: db "C:\CHILD.COM",0
+    //   epb: dw 0,0,0,0,0,0,0
+    const PARENT_COM: &[u8] = &[
+        0xba, 0x29, 0x01, 0xbb, 0x36, 0x01, 0xb8, 0x00, 0x4b, 0xcd, 0x21, 0x72, 0x11, 0xb4, 0x4d,
+        0xcd, 0x21, 0x04, 0x30, 0x88, 0xc2, 0xb4, 0x02, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21,
+        0xb2, 0x21, 0xb4, 0x02, 0xcd, 0x21, 0xb8, 0x01, 0x4c, 0xcd, 0x21, 0x43, 0x3a, 0x5c, 0x43,
+        0x48, 0x49, 0x4c, 0x44, 0x2e, 0x43, 0x4f, 0x4d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    // child20.asm: write "Z" to stdout, then INT 20h (terminate, exit 0).
+    //   mov ah,0x40; mov bx,1; mov cx,1; mov dx,msg; int 0x21; int 0x20
+    //   msg: db "Z"
+    const CHILD20_COM: &[u8] = &[
+        0xb4, 0x40, 0xbb, 0x01, 0x00, 0xb9, 0x01, 0x00, 0xba, 0x0f, 0x01, 0xcd, 0x21, 0xcd, 0x20,
+        0x5a,
+    ];
+
+    // failparent.asm: EXEC a missing C:\NOPE.COM; on CF print 'F' and exit 0.
+    //   mov dx,name; mov bx,epb; mov ax,0x4b00; int 0x21; jnc bad
+    //   mov dl,'F'; mov ah,0x02; int 0x21; mov ax,0x4c00; int 0x21
+    //   bad: mov ax,0x4c02; int 0x21
+    //   name: db "C:\NOPE.COM",0
+    //   epb: dw 0,0,0,0,0,0,0
+    const FAILPARENT_COM: &[u8] = &[
+        0xba, 0x1d, 0x01, 0xbb, 0x29, 0x01, 0xb8, 0x00, 0x4b, 0xcd, 0x21, 0x73, 0x0b, 0xb2, 0x46,
+        0xb4, 0x02, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21, 0xb8, 0x02, 0x4c, 0xcd, 0x21, 0x43,
+        0x3a, 0x5c, 0x4e, 0x4f, 0x50, 0x45, 0x2e, 0x43, 0x4f, 0x4d, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    // ovparent.asm: allocate 16 paragraphs, EXEC AL=3 to load C:\OV.BIN at that
+    // segment, read [es:di] (di=0) and print it (on any failure print '?' and
+    // exit 1). Uses the ModR/M mov r8,[reg] form (0x8a), not the direct-address
+    // moffs8 form (0xa0) which the 80386 core does not implement yet.
+    //   mov ah,0x48; mov bx,16; int 0x21; jc fail
+    //   mov bx,epb; mov [bx],ax; mov dx,name; mov ax,0x4b03; int 0x21; jc fail
+    //   mov bx,epb; mov es,[bx]; xor di,di; mov al,[es:di]
+    //   mov dl,al; mov ah,0x02; int 0x21; mov ax,0x4c00; int 0x21
+    //   fail: mov dl,'?'; mov ah,0x02; int 0x21; mov ax,0x4c01; int 0x21
+    //   name: db "C:\OV.BIN",0
+    //   epb: dw 0,0
+    const OVPARENT_COM: &[u8] = &[
+        0xb4, 0x48, 0xbb, 0x10, 0x00, 0xcd, 0x21, 0x72, 0x24, 0xbb, 0x42, 0x01, 0x89, 0x07, 0xba,
+        0x38, 0x01, 0xb8, 0x03, 0x4b, 0xcd, 0x21, 0x72, 0x15, 0xbb, 0x42, 0x01, 0x8e, 0x07, 0x31,
+        0xff, 0x26, 0x8a, 0x05, 0x88, 0xc2, 0xb4, 0x02, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21,
+        0xb2, 0x3f, 0xb4, 0x02, 0xcd, 0x21, 0xb8, 0x01, 0x4c, 0xcd, 0x21, 0x43, 0x3a, 0x5c, 0x4f,
+        0x56, 0x2e, 0x42, 0x49, 0x4e, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    #[test]
+    fn dos_program_execs_a_child_and_reads_its_return_code() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CHILD.COM"), CHILD_COM).unwrap();
+        let mut machine = Machine::new_dos_program(
+            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            PARENT_COM,
+        )
+        .unwrap();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        let reason = machine.run_until_halt_or_cycles(2_000_000).unwrap();
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
+        let out = machine.dos_output();
+        assert!(
+            out.windows(5).any(|w| w == b"CHILD"),
+            "child output missing"
+        );
+        assert!(out.contains(&b'7'), "return-code digit missing");
+    }
+
+    #[test]
+    fn dos_child_terminating_via_int20_resumes_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CHILD.COM"), CHILD20_COM).unwrap();
+        let mut machine = Machine::new_dos_program(
+            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            PARENT_COM,
+        )
+        .unwrap();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        let reason = machine.run_until_halt_or_cycles(2_000_000).unwrap();
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
+        let out = machine.dos_output();
+        assert!(out.contains(&b'Z'), "child marker missing");
+        assert!(out.contains(&b'0'), "INT 20h exit-code digit missing");
+    }
+
+    #[test]
+    fn dos_failed_exec_leaves_parent_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut machine = Machine::new_dos_program(
+            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            FAILPARENT_COM,
+        )
+        .unwrap();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        let reason = machine.run_until_halt_or_cycles(2_000_000).unwrap();
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
+        assert_eq!(machine.dos_output(), b"F");
+    }
+
+    #[test]
+    fn dos_program_loads_an_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("OV.BIN"), [b'Z']).unwrap();
+        let mut machine = Machine::new_dos_program(
+            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            OVPARENT_COM,
+        )
+        .unwrap();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        let reason = machine.run_until_halt_or_cycles(2_000_000).unwrap();
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
+        assert_eq!(machine.dos_output(), b"Z");
     }
 }
