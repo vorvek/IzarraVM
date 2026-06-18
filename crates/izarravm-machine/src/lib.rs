@@ -4735,4 +4735,47 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn dos_env_blaster_is_visible_to_a_guest_program() {
+        // org 0x100: load the env segment from PSP:0x2C into DS, then AH=40h-write
+        // the first 24 bytes of the env block to stdout. Those bytes are exactly
+        // "BLASTER=A220 I5 D1 H5 T6" (the first env entry), proving a guest that
+        // reads PSP:0x2C and scans the env finds the card exactly as a game would.
+        //   mov ax,[0x2c] ; mov ds,ax ; xor dx,dx ; mov cx,24 ; mov bx,1
+        //   mov ah,0x40   ; int 0x21  ; mov ax,0x4c00 ; int 0x21
+        let com: &[u8] = &[
+            0x8b, 0x06, 0x2c, 0x00, 0x8e, 0xd8, 0x31, 0xd2, 0xb9, 0x18, 0x00, 0xbb, 0x01, 0x00,
+            0xb4, 0x40, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21,
+        ];
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com)
+                .unwrap();
+        let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
+        assert_eq!(machine.dos_output(), b"BLASTER=A220 I5 D1 H5 T6");
+    }
+
+    #[test]
+    fn dos_env_block_carries_the_configured_routing() {
+        // A non-default routing (IRQ7 / DMA3) flows from the host config through
+        // the loader into the env block a guest scans via PSP:0x2C.
+        let mut profile = MachineProfile::i386dx25(16, VideoCard::Et4000Ax);
+        profile.sound_blaster = SoundBlasterConfig {
+            enabled: true,
+            irq: SbIrq::I7,
+            dma: SbDma8::D3,
+            high_dma: SbDma16::D5,
+        };
+        let machine = Machine::new_dos_program(profile, &[0xb8, 0x00, 0x4c, 0xcd, 0x21]).unwrap();
+        let env_seg = psp_env_segment(&machine);
+        assert_ne!(env_seg, 0, "PSP:0x2C must name the env segment");
+        assert_eq!(
+            parse_env_block(&machine, env_seg),
+            vec![
+                ("BLASTER".to_string(), "A220 I7 D3 H5 T6".to_string()),
+                ("SETSOUND".to_string(), "A220 I7 D3 H5 T6".to_string()),
+            ]
+        );
+    }
 }
