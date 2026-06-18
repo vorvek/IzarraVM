@@ -465,6 +465,16 @@ impl Vga {
         char_map_a_decode(block)
     }
 
+    /// The shared blink hide phase, driven by the vertical-retrace (frame)
+    /// counter: 16 frames on, 16 frames off (period 32). At mode 03h's 70 Hz that
+    /// is the documented ~2.19 Hz cursor/attribute blink rate. Both the attribute
+    /// blink (foreground collapse) and the hardware-cursor blink read this single
+    /// source so they stay in lockstep. See A6 in
+    /// dev_docs/reference/vga/text-mode-gaps-confirm-notes.md.
+    pub fn blink_hide_phase(&self) -> bool {
+        (self.frames / 16) % 2 == 1
+    }
+
     /// Write the Sequencer Character Map Select (index 3), picking the active
     /// font table for text. Used by INT 10h AH=11h AL=03.
     pub fn set_char_map_select(&mut self, value: u8) {
@@ -759,10 +769,11 @@ impl Vga {
         // dev_docs/reference/vga/text-mode-gaps-confirm-notes.md.
         let pan = self.pel_pan(below_split).min(char_width - 1);
         let blink_enabled = self.attr.mode_control & 0x08 != 0;
-        // The blink hide phase divides the completed-frame count by 16 and hides
-        // the foreground on odd windows. A first model; the exact ~16 Hz cadence
-        // is a later refinement.
-        let blink_hide_phase = (self.frames / 16) % 2 == 1;
+        // The shared blink hide phase: 16 frames on, 16 off, driven by the frame
+        // (vertical-retrace) counter. Attribute blink and the cursor blink both
+        // read this single source. See A6 in
+        // dev_docs/reference/vga/text-mode-gaps-confirm-notes.md.
+        let blink_hide_phase = self.blink_hide_phase();
         let start_cells = start as usize;
         let row_cells = self.crtc.offset as usize; // cells per character row
         let mut row = vec![0u8; width];
@@ -3526,5 +3537,70 @@ mod tests {
             15,
             "skew 3: cursor delayed to cell 3 (max delay, not disabled)"
         );
+    }
+
+    #[test]
+    fn attribute_blink_runs_at_the_hardware_cadence() {
+        // The attribute blink hides the foreground for 16 frames, then shows it for
+        // 16 (period 32), driven by the vertical-retrace frame counter. A blink
+        // attribute cell toggles at that cadence; a non-blink cell never toggles.
+        let mut vga = Vga::default();
+        vga.attr.mode_control = 0x08; // blink enabled
+        text_put(&mut vga, 0, 0, 0xDB, 0x8F); // blink bit set, white fg
+        // Frames 0..15: show phase (fg visible).
+        for f in [0u64, 1, 7, 15] {
+            vga.frames = f;
+            assert_eq!(
+                vga.render_text_row(0)[0],
+                15,
+                "frame {f}: show phase, foreground visible"
+            );
+        }
+        // Frames 16..31: hide phase (fg collapses to bg).
+        for f in [16u64, 17, 24, 31] {
+            vga.frames = f;
+            assert_eq!(
+                vga.render_text_row(0)[0],
+                0,
+                "frame {f}: hide phase, foreground collapsed"
+            );
+        }
+        // Frame 32: the period repeats, back to show.
+        vga.frames = 32;
+        assert_eq!(
+            vga.render_text_row(0)[0],
+            15,
+            "frame 32: period repeats (show)"
+        );
+    }
+
+    #[test]
+    fn text_cursor_blinks_at_the_hardware_cadence() {
+        // The hardware cursor blinks on the same 16-on/16-off cadence as the
+        // attribute blink, sharing the one frame-counter phase. The cursor is
+        // visible on frames 0..15 and hidden on 16..31, period 32.
+        let mut vga = Vga::default();
+        text_put(&mut vga, 0, 0, b' ', 0x0F);
+        vga.cursor_offset = 0;
+        vga.cursor_start = 0x00; // full block
+        vga.cursor_end = 0x0F;
+        for f in [0u64, 5, 15] {
+            vga.frames = f;
+            assert_eq!(
+                vga.render_text_row(0)[0],
+                15,
+                "frame {f}: cursor visible (show phase)"
+            );
+        }
+        for f in [16u64, 20, 31] {
+            vga.frames = f;
+            assert_eq!(
+                vga.render_text_row(0)[0],
+                0,
+                "frame {f}: cursor hidden (hide phase)"
+            );
+        }
+        vga.frames = 32;
+        assert_eq!(vga.render_text_row(0)[0], 15, "frame 32: period repeats");
     }
 }
