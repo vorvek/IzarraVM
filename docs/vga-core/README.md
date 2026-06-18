@@ -417,21 +417,30 @@ Divergences (fidelity directive):
 
 1. **`AH=11h AL=30` (get font info) and `AL=20-24` (graphics-mode text) are
    deferred.** AL=30 returns a far pointer to the active font; the graphics-mode
-   text services render text in graphics modes. Both are separable follow-ups.
-2. **The hardware text cursor is now rendered (slice 11).** The cursor renders
-   reverse video on the cell at `cursor_offset`; the `frame()` / `TextFrame`
-   cursor offset stays for the headless ASCII view. (See the Slice 11 coverage.)
-3. **The exact blink cadence is not modeled.** Blink hides the foreground on a
-   frame-count divisor (a first model); the hardware ~16 Hz cadence is a timing
-   refinement.
-4. **Text-mode pel-pan (AC 13h) and start-address horizontal smooth scroll are
-   not applied** to text, mirroring how the chained-13h pel-pan was once
-   deferred.
-5. **CRTC 08h preset-row-scan (byte panning / sub-row scroll) is not modeled**
-   anywhere in the core, unchanged from slices 4/7/8.
-6. **512-character / dual-font mode is deferred.** This slice selects a single
-   active font table (the 256-glyph case); the two-map interleaving for 512
-   glyphs rides with the graphics-mode-text follow-up. The Tier-2/3 graphics
+   text services render text in graphics modes. Both are the Slice B follow-up
+   (graphics-mode text); see the Slice A coverage for the text-mode work that did
+   land.
+
+The remaining slice-9 text-mode gaps closed in Slice A:
+
+2. **The hardware text cursor is rendered (slice 11), now including cursor skew
+   (Slice A).** The cursor renders reverse video on the cell at
+   `cursor_offset`; the `frame()` / `TextFrame` cursor offset stays for the
+   headless ASCII view. Cursor skew (CRTC 0Bh bits 5-6) now delays the cursor
+   onset by 0-3 character clocks (see the Slice 11 coverage and Slice A).
+3. **The blink cadence is modeled.** Attribute blink and cursor blink share one
+   16-on / 16-off vertical-retrace phase (`blink_hide_phase`); the hardware
+   cadence is no longer a refinement (Slice A).
+4. **Text-mode pel-pan (AC 13h) and start-address smooth scroll are applied.**
+   The text scanout reads cells from the CRTC start-address origin and shifts the
+   column origin by the AC 13h pel-pan, with the 9-dot replicate shifting with
+   the cell (Slice A).
+5. **CRTC 08h preset-row-scan is modeled.** Bits 4-0 offset the first displayed
+   font scanline (vertical sub-row scroll); bits 6-5 add a byte pan to the
+   origin; both reset below the line-compare split (Slice A).
+6. **512-character / dual-font mode is modeled.** `char_map_b_decode` selects
+   the second font table; attribute bit 3 selects map A vs map B and the
+   foreground drops to 8 colors while active (Slice A). The Tier-2/3 graphics
    register gaps (16-color Color Select 14h, guest vertical timing, odd/even
    addressing) stay parked in the backlog spec; none blocks a standard title.
 
@@ -502,16 +511,73 @@ released-source title was inspected.
 
 Divergences (fidelity directive):
 
-1. **Cursor skew (CRTC 0Bh bits 5-6) is ignored**, treated as zero. Rare
-   and unused by standard titles.
-2. **The exact blink cadence is not modeled.** The cursor reuses the
-   attribute-blink frame-count divisor (a first model); the hardware
-   cursor rate (~1.875 Hz) rides with the parked attribute-blink
-   cadence refinement.
+The slice-11 text-cursor gaps closed in Slice A:
+
+1. **Cursor skew (CRTC 0Bh bits 5-6) is modeled**, as a 0-3 character-clock
+   delay of the cursor onset (3 = max delay, not disable); the separate 0Ah
+   bit 5 remains the cursor disable (Slice A).
+2. **The blink cadence is modeled.** The cursor reuses the attribute-blink
+   16-on / 16-off vertical-retrace phase (`blink_hide_phase`); the hardware
+   cursor rate is no longer a refinement (Slice A).
 3. **Text-mode start-address / pel-pan interaction with the cursor is
-   not modeled.** Slice 9 reads text cells and matches the cursor on the
-   displayed cell index directly (no start-address offset applied); when
-   text start-address scroll lands, the cursor match moves with it.
+   modeled.** The text scanout reads cells from the CRTC start-address
+   origin and matches the cursor on the displayed cell's absolute index, so
+   the cursor match moves with the start address (Slice A).
+
+## Slice A coverage — text-mode addressing, scroll, and polish
+
+Slice A closes the remaining text-mode cell-scanout gaps over seven commits.
+The text aperture grows to the full 32 KB (B8000-BFFFF, eight 4096-byte pages)
+and `render_text_row` is reworked to read cells from the CRTC start-address
+origin, with pel-pan, preset-row-scan, byte pan, dual-font selection, and cursor
+skew applied in the per-cell loop. `frame()` / `TextFrame` / `screen_text()`
+follow the same origin so the headless cell view matches the pixels. The vretrace
+start-address latch is honored and cleared on `set_text_mode`.
+
+| Commit | Area | Covered in Slice A |
+|--------|------|--------------------|
+| C1 | 32 KB aperture + start-address scanout | `VGA_TEXT_MEMORY_SIZE` grows to 32768; `render_text_row` reads from the start-address origin above the line-compare split and from 0 below it; `pending_start` cleared on mode set |
+| C2 | `INT 10h AH=05h` set-display-page | `start_address = page * 2048` (page_size 4096 bytes) routed through the vretrace latch |
+| C3 | AC pel-pan (13h) in text | Column origin shifted by the 0..char_width pel-pan; the 9-dot replicate shifts with the cell; below-split forcing via AC 10h bit 5 reuses the shared `pel_pan` |
+| C4 | CRTC 08h preset-row-scan | Bits 4-0 offset the first displayed font scanline (vertical sub-row scroll); bits 6-5 add a byte pan to the origin; both reset below the split |
+| C5 | 512-character / dual-font | `char_map_b_decode` selects the second font table; attribute bit 3 set selects map B (Abrash/vgabios/Bochs polarity; FreeVGA's opposite wording is recorded as a known conflict and overridden); the foreground drops to 8 colors while active |
+| C6 | Cursor skew (0Bh bits 5-6) | A 0-3 character-clock delay of the cursor onset; skew 3 is max delay, not disable (the disable stays 0Ah bit 5) |
+| C7 | Unified blink cadence | Attribute blink and cursor blink share one `blink_hide_phase` helper at the hardware 16-on / 16-off vertical-retrace rate |
+
+The semantics are pinned to Abrash's *Graphics Programming Black Book*, RBIL
+`PORTS.B` (CRTC 08h preset-row-scan, 0Bh skew, the start-address / cursor-location
+word units) and `INT 10h AH=05h`, the LGPL vgabios, and Bochs/QEMU, recorded in
+the per-slice confirm notes. Mode 03h is word mode, so the start-address and
+cursor-location registers are word/cell addresses (the displayed cell at
+`(row, col)` reads `text_memory[(start + row*offset + col) * 2]`).
+
+The done-signals are equality at unit level:
+`vga::tests::text_start_address_scrolls_the_display_origin`,
+`vga::tests::text_start_address_below_the_split_starts_from_zero`,
+`vga::tests::text_memory_aperture_is_32kb_eight_pages`,
+`vga::tests::frame_cell_view_follows_the_start_address`,
+`vga::tests::text_pel_pan_shifts_the_column_origin`,
+`vga::tests::text_pel_pan_below_split_forces_zero_when_enabled`,
+`vga::tests::text_pel_pan_9dot_replicates_the_shifted_box_glyph`,
+`vga::tests::text_preset_row_scan_offsets_the_first_font_line`,
+`vga::tests::text_byte_pan_shifts_whole_cells`,
+`vga::tests::text_preset_row_resets_below_the_split`,
+`vga::tests::char_map_b_decode_picks_the_second_font_table`,
+`vga::tests::attribute_bit_3_selects_the_font_in_512_char_mode`,
+`vga::tests::int10_11h_loads_two_fonts_for_512_char_text`,
+`vga::tests::text_cursor_skew_delays_the_cursor_onset`,
+`vga::tests::text_cursor_skew_three_is_max_delay_not_disabled`,
+`vga::tests::attribute_blink_runs_at_the_hardware_cadence`, and
+`vga::tests::text_cursor_blinks_at_the_hardware_cadence`, with the page-flip path
+proven end-to-end through the machine at
+`int10_ah05_sets_the_text_page_via_start_address` and
+`int10_ah05_page_flip_scrolls_through_the_machine`.
+
+Out of Slice A (Slice B, graphics-mode text): `AH=11h AL=30` get-font-info and
+`AL=20-24` graphics-mode text setup, plus the graphics-mode text-output services
+(`AH=09/0E/13`) and BIOS cursor tracking (`AH=02/03`). Graphics-mode pel-pan /
+preset-row-scan for the planar paths stay parked as before; this slice applies
+08h / 13h to text only.
 
 ## Latch rules
 
