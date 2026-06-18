@@ -3,7 +3,8 @@ mod gui;
 use clap::Parser;
 use izarravm_audio::AudioSubsystem;
 use izarravm_core::{
-    AppConfig, ConfigOverrides, CpuPreset, HardwareProfile, MidiBackend, VideoCard,
+    AppConfig, ConfigOverrides, CpuPreset, HardwareProfile, MidiBackend, SbDma8, SbDma16, SbIrq,
+    VideoCard,
 };
 use izarravm_dos::{DosKernelServices, HostDrive};
 use izarravm_firmware::{SuiteRecordStatus, boot_test_image, parse_result_block, test_rom};
@@ -36,6 +37,12 @@ struct Cli {
     #[arg(long)]
     midi_backend: Option<MidiBackend>,
     #[arg(long)]
+    sb_irq: Option<SbIrq>,
+    #[arg(long)]
+    sb_dma: Option<SbDma8>,
+    #[arg(long)]
+    sb_high_dma: Option<SbDma16>,
+    #[arg(long)]
     headless_config_check: bool,
     #[arg(long)]
     headless_test_rom: bool,
@@ -65,8 +72,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let cli = Cli::parse();
     let config = load_config(&cli)?;
-    config.validate()?;
-    let hardware = HardwareProfile::from_config(&config.machine)?;
+    let hardware = HardwareProfile::from_config(&config)?;
     let dos = DosKernelServices::new(HostDrive::mount_c(&config.dos.c_drive)?);
     let audio = AudioSubsystem::from_config(&config.audio);
     let input = InputState {
@@ -162,7 +168,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let rom = select_rom(cli.bios.as_deref())?;
-    let audio_enabled = config.audio.opl3 || config.audio.sound_blaster;
+    let audio_enabled = config.audio.opl3 || config.audio.sound_blaster.enabled;
     gui::run(
         MachineProfile::from_hardware_profile(&hardware),
         rom,
@@ -188,6 +194,9 @@ fn load_config(cli: &Cli) -> Result<AppConfig, Box<dyn Error>> {
         c_drive,
         soundfont: cli.soundfont.clone(),
         midi_backend: cli.midi_backend,
+        sb_irq: cli.sb_irq,
+        sb_dma: cli.sb_dma,
+        sb_high_dma: cli.sb_high_dma,
     });
 
     Ok(config)

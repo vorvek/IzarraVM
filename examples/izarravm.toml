@@ -8,8 +8,13 @@ c_drive = "R:\\La Colecci\u00f3n by Neville\\dosroot\\"
 
 [audio]
 pc_speaker = true
-sound_blaster = true
 opl3 = true
+
+[audio.sound_blaster]
+enabled = true
+irq = "5"
+dma = "1"
+high_dma = "5"
 
 [audio.midi]
 backend = "external"

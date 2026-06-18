@@ -128,6 +128,167 @@ impl FromStr for VideoCard {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SbIrq {
+    #[serde(rename = "2")]
+    I2,
+    #[serde(rename = "5")]
+    #[default]
+    I5,
+    #[serde(rename = "7")]
+    I7,
+    #[serde(rename = "10")]
+    I10,
+}
+
+impl SbIrq {
+    /// The PC AT IRQ line number the CT1745 mixer routes the DSP interrupt to.
+    pub const fn line(self) -> u8 {
+        match self {
+            Self::I2 => 2,
+            Self::I5 => 5,
+            Self::I7 => 7,
+            Self::I10 => 10,
+        }
+    }
+
+    pub const fn canonical_name(self) -> &'static str {
+        match self {
+            Self::I2 => "2",
+            Self::I5 => "5",
+            Self::I7 => "7",
+            Self::I10 => "10",
+        }
+    }
+}
+
+impl fmt::Display for SbIrq {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.canonical_name())
+    }
+}
+
+impl FromStr for SbIrq {
+    type Err = ConfigError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match normalize(value).as_str() {
+            "2" | "irq2" => Ok(Self::I2),
+            "5" | "irq5" => Ok(Self::I5),
+            "7" | "irq7" => Ok(Self::I7),
+            "10" | "irq10" => Ok(Self::I10),
+            _ => Err(ConfigError::UnknownPreset {
+                kind: "Sound Blaster IRQ",
+                value: value.to_owned(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SbDma8 {
+    #[serde(rename = "0")]
+    D0,
+    #[serde(rename = "1")]
+    #[default]
+    D1,
+    #[serde(rename = "3")]
+    D3,
+}
+
+impl SbDma8 {
+    /// The 8237A master channel number (0/1/3) the CT1745 routes 8-bit DMA to.
+    pub const fn channel(self) -> usize {
+        match self {
+            Self::D0 => 0,
+            Self::D1 => 1,
+            Self::D3 => 3,
+        }
+    }
+
+    pub const fn canonical_name(self) -> &'static str {
+        match self {
+            Self::D0 => "0",
+            Self::D1 => "1",
+            Self::D3 => "3",
+        }
+    }
+}
+
+impl fmt::Display for SbDma8 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.canonical_name())
+    }
+}
+
+impl FromStr for SbDma8 {
+    type Err = ConfigError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match normalize(value).as_str() {
+            "0" | "dma0" => Ok(Self::D0),
+            "1" | "dma1" => Ok(Self::D1),
+            "3" | "dma3" => Ok(Self::D3),
+            _ => Err(ConfigError::UnknownPreset {
+                kind: "Sound Blaster 8-bit DMA",
+                value: value.to_owned(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SbDma16 {
+    #[serde(rename = "5")]
+    #[default]
+    D5,
+    #[serde(rename = "6")]
+    D6,
+    #[serde(rename = "7")]
+    D7,
+}
+
+impl SbDma16 {
+    /// The 8237A slave channel number (5/6/7) the CT1745 routes 16-bit DMA to.
+    pub const fn channel(self) -> usize {
+        match self {
+            Self::D5 => 5,
+            Self::D6 => 6,
+            Self::D7 => 7,
+        }
+    }
+
+    pub const fn canonical_name(self) -> &'static str {
+        match self {
+            Self::D5 => "5",
+            Self::D6 => "6",
+            Self::D7 => "7",
+        }
+    }
+}
+
+impl fmt::Display for SbDma16 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.canonical_name())
+    }
+}
+
+impl FromStr for SbDma16 {
+    type Err = ConfigError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match normalize(value).as_str() {
+            "5" | "dma5" => Ok(Self::D5),
+            "6" | "dma6" => Ok(Self::D6),
+            "7" | "dma7" => Ok(Self::D7),
+            _ => Err(ConfigError::UnknownPreset {
+                kind: "Sound Blaster 16-bit DMA",
+                value: value.to_owned(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MidiBackend {
     Off,
@@ -227,6 +388,15 @@ impl AppConfig {
         if let Some(midi_backend) = overrides.midi_backend {
             self.audio.midi.backend = midi_backend;
         }
+        if let Some(sb_irq) = overrides.sb_irq {
+            self.audio.sound_blaster.irq = sb_irq;
+        }
+        if let Some(sb_dma) = overrides.sb_dma {
+            self.audio.sound_blaster.dma = sb_dma;
+        }
+        if let Some(sb_high_dma) = overrides.sb_high_dma {
+            self.audio.sound_blaster.high_dma = sb_high_dma;
+        }
     }
 }
 
@@ -262,11 +432,42 @@ impl Default for DosConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SoundBlasterConfig {
+    /// Whether the host constructs the SB16 audio path. Mirrors the former
+    /// `AudioConfig.sound_blaster: bool`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Power-on IRQ line the CT1745 mixer selects (register 0x80). Applied once
+    /// at boot like `SBCONFIG`; a guest mixer reset restores the hardware
+    /// factory default (IRQ5).
+    #[serde(default)]
+    pub irq: SbIrq,
+    /// Power-on 8-bit DMA channel (register 0x81 low bits).
+    #[serde(default)]
+    pub dma: SbDma8,
+    /// Power-on 16-bit DMA channel (register 0x81 high bits).
+    #[serde(default)]
+    pub high_dma: SbDma16,
+}
+
+impl Default for SoundBlasterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            irq: SbIrq::I5,
+            dma: SbDma8::D1,
+            high_dma: SbDma16::D5,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AudioConfig {
     pub pc_speaker: bool,
-    pub sound_blaster: bool,
+    pub sound_blaster: SoundBlasterConfig,
     pub opl3: bool,
     pub midi: MidiConfig,
 }
@@ -275,7 +476,7 @@ impl Default for AudioConfig {
     fn default() -> Self {
         Self {
             pc_speaker: true,
-            sound_blaster: true,
+            sound_blaster: SoundBlasterConfig::default(),
             opl3: true,
             midi: MidiConfig::default(),
         }
@@ -332,6 +533,9 @@ pub struct ConfigOverrides {
     pub c_drive: Option<PathBuf>,
     pub soundfont: Option<PathBuf>,
     pub midi_backend: Option<MidiBackend>,
+    pub sb_irq: Option<SbIrq>,
+    pub sb_dma: Option<SbDma8>,
+    pub sb_high_dma: Option<SbDma16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -340,23 +544,25 @@ pub struct HardwareProfile {
     pub clock_hz: u64,
     pub memory_mib: u16,
     pub video: VideoCard,
+    pub sound_blaster: SoundBlasterConfig,
 }
 
 impl HardwareProfile {
-    pub fn from_config(config: &MachineConfig) -> Result<Self, ConfigError> {
-        AppConfig {
-            machine: config.clone(),
-            ..AppConfig::default()
-        }
-        .validate()?;
+    pub fn from_config(config: &AppConfig) -> Result<Self, ConfigError> {
+        config.validate()?;
 
         Ok(Self {
-            cpu: config.cpu,
-            clock_hz: config.cpu.clock_hz(),
-            memory_mib: config.memory_mib,
-            video: config.video,
+            cpu: config.machine.cpu,
+            clock_hz: config.machine.cpu.clock_hz(),
+            memory_mib: config.machine.memory_mib,
+            video: config.machine.video,
+            sound_blaster: config.audio.sound_blaster,
         })
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn normalize(value: &str) -> String {
@@ -410,6 +616,9 @@ mod tests {
             c_drive: Some(PathBuf::from("games")),
             soundfont: Some(PathBuf::from("gm.sf2")),
             midi_backend: Some(MidiBackend::FluidSynth),
+            sb_irq: Some(SbIrq::I7),
+            sb_dma: Some(SbDma8::D3),
+            sb_high_dma: Some(SbDma16::D6),
         });
 
         assert_eq!(config.machine.cpu, CpuPreset::Pentium133);
@@ -418,6 +627,65 @@ mod tests {
         assert_eq!(config.dos.c_drive, PathBuf::from("games"));
         assert_eq!(config.audio.midi.soundfont, Some(PathBuf::from("gm.sf2")));
         assert_eq!(config.audio.midi.backend, MidiBackend::FluidSynth);
+        assert_eq!(config.audio.sound_blaster.irq, SbIrq::I7);
+        assert_eq!(config.audio.sound_blaster.dma, SbDma8::D3);
+        assert_eq!(config.audio.sound_blaster.high_dma, SbDma16::D6);
+    }
+
+    #[test]
+    fn sound_blaster_overrides_and_aliases_parse() {
+        assert_eq!("7".parse::<SbIrq>().unwrap(), SbIrq::I7);
+        assert_eq!("irq10".parse::<SbIrq>().unwrap(), SbIrq::I10);
+        assert_eq!("3".parse::<SbDma8>().unwrap(), SbDma8::D3);
+        assert_eq!("dma6".parse::<SbDma16>().unwrap(), SbDma16::D6);
+        assert_eq!(SbIrq::I10.line(), 10);
+        assert_eq!(SbDma8::D3.channel(), 3);
+        assert_eq!(SbDma16::D7.channel(), 7);
+    }
+
+    #[test]
+    fn sound_blaster_config_defaults_when_absent_or_partial() {
+        // No [audio.sound_blaster] table: the hardware default (IRQ5/DMA1/DMA5).
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("izarravm.toml");
+        fs::write(
+            &path,
+            r#"
+                [machine]
+                cpu = "i386dx_25"
+                memory_mib = 16
+                video = "et4000_ax"
+            "#,
+        )
+        .unwrap();
+        let config = AppConfig::from_toml_path(path).unwrap();
+        assert_eq!(
+            config.audio.sound_blaster,
+            SoundBlasterConfig {
+                enabled: true,
+                irq: SbIrq::I5,
+                dma: SbDma8::D1,
+                high_dma: SbDma16::D5
+            }
+        );
+
+        // A partial table fills the omitted fields from their defaults.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("izarravm.toml");
+        fs::write(
+            &path,
+            r#"
+                [audio.sound_blaster]
+                enabled = true
+                irq = "7"
+            "#,
+        )
+        .unwrap();
+        let config = AppConfig::from_toml_path(path).unwrap();
+        assert!(config.audio.sound_blaster.enabled);
+        assert_eq!(config.audio.sound_blaster.irq, SbIrq::I7);
+        assert_eq!(config.audio.sound_blaster.dma, SbDma8::D1);
+        assert_eq!(config.audio.sound_blaster.high_dma, SbDma16::D5);
     }
 
     #[test]

@@ -49,7 +49,7 @@ impl AudioSubsystem {
         if config.pc_speaker {
             devices.push(AudioDeviceKind::PcSpeaker);
         }
-        if config.sound_blaster {
+        if config.sound_blaster.enabled {
             devices.push(AudioDeviceKind::SoundBlaster);
         }
         if config.opl3 {
@@ -88,7 +88,7 @@ mod tests {
             vec![AudioDeviceKind::PcSpeaker, AudioDeviceKind::SoundBlaster]
         );
 
-        config.sound_blaster = false;
+        config.sound_blaster.enabled = false;
         let subsystem = AudioSubsystem::from_config(&config);
         assert_eq!(subsystem.devices, vec![AudioDeviceKind::PcSpeaker]);
     }

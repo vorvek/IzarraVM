@@ -1,6 +1,6 @@
 use izarravm_audio::{OplChip, Resampler, SbDsp, SbMixer};
 use izarravm_bus::{BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CpuBus, Memory};
-use izarravm_core::{CpuPreset, HardwareProfile, VideoCard};
+use izarravm_core::{CpuPreset, HardwareProfile, SoundBlasterConfig, VideoCard};
 use izarravm_cpu::{Cpu386, CpuError, SegmentIndex, SegmentRegister};
 pub use izarravm_video::MARGO_ID_VALUE;
 use izarravm_video::{
@@ -67,6 +67,10 @@ pub struct MachineProfile {
     pub clock_hz: u64,
     pub memory_mib: u16,
     pub video: VideoCard,
+    /// Power-on CT1745 mixer routing (IRQ/DMA) + host enable flag, applied to
+    /// the mixer at construction. A guest mixer reset still restores the
+    /// hardware factory default (IRQ5/DMA1/DMA5).
+    pub sound_blaster: SoundBlasterConfig,
     pub wait_states: WaitStateProfile,
     pub address_pipelining: bool,
     pub cache_enabled: bool,
@@ -79,6 +83,7 @@ impl MachineProfile {
             clock_hz: 25_000_000,
             memory_mib,
             video,
+            sound_blaster: SoundBlasterConfig::default(),
             wait_states: WaitStateProfile::default(),
             address_pipelining: false,
             cache_enabled: false,
@@ -91,6 +96,7 @@ impl MachineProfile {
             clock_hz: profile.clock_hz,
             memory_mib: profile.memory_mib,
             video: profile.video,
+            sound_blaster: profile.sound_blaster,
             wait_states: WaitStateProfile::default(),
             address_pipelining: false,
             cache_enabled: false,
@@ -156,6 +162,14 @@ pub struct Machine {
     elapsed_clocks: u64,
 }
 
+/// Build the CT1745 mixer from the profile's Sound Blaster power-on routing.
+/// The host config is applied once at construction like `SBCONFIG`; a guest
+/// mixer reset (write `0x00`) still restores the hardware IRQ5/DMA1/DMA5.
+fn power_on_mixer(profile: &MachineProfile) -> SbMixer {
+    let sb = profile.sound_blaster;
+    SbMixer::with_power_on(sb.irq.line(), sb.dma.channel(), sb.high_dma.channel())
+}
+
 impl Machine {
     pub fn new(profile: MachineProfile, rom: impl AsRef<[u8]>) -> Result<Self, MachineError> {
         let rom = rom.as_ref();
@@ -163,6 +177,7 @@ impl Machine {
             return Err(MachineError::InvalidRomSize(rom.len()));
         }
 
+        let mixer = power_on_mixer(&profile);
         let mut machine = Self {
             memory: Memory::from_mib(profile.memory_mib)?,
             profile,
@@ -189,7 +204,7 @@ impl Machine {
             dsp_rate_hz: 0,
             dsp_micros: 0.0,
             dsp_sample_phase: 0.0,
-            mixer: SbMixer::default(),
+            mixer,
             margo_ns: 0.0,
             vga_dots: 0.0,
             trace: BusTrace::default(),
@@ -214,6 +229,7 @@ impl Machine {
             return Err(MachineError::InvalidBootImageSize(image.len()));
         }
 
+        let mixer = power_on_mixer(&profile);
         let mut machine = Self {
             memory: Memory::from_mib(profile.memory_mib)?,
             profile,
@@ -240,7 +256,7 @@ impl Machine {
             dsp_rate_hz: 0,
             dsp_micros: 0.0,
             dsp_sample_phase: 0.0,
-            mixer: SbMixer::default(),
+            mixer,
             margo_ns: 0.0,
             vga_dots: 0.0,
             trace: BusTrace::default(),
@@ -283,6 +299,7 @@ impl Machine {
     /// and STI itself; the BIOS IVT and an interrupts-enabled handoff come with a
     /// later slice.
     pub fn new_dos_program(profile: MachineProfile, image: &[u8]) -> Result<Self, MachineError> {
+        let mixer = power_on_mixer(&profile);
         let mut machine = Self {
             memory: Memory::from_mib(profile.memory_mib)?,
             profile,
@@ -309,7 +326,7 @@ impl Machine {
             dsp_rate_hz: 0,
             dsp_micros: 0.0,
             dsp_sample_phase: 0.0,
-            mixer: SbMixer::default(),
+            mixer,
             margo_ns: 0.0,
             vga_dots: 0.0,
             trace: BusTrace::default(),
@@ -348,6 +365,12 @@ impl Machine {
 
     pub fn profile(&self) -> &MachineProfile {
         &self.profile
+    }
+
+    /// The IRQ line the CT1745 mixer currently routes the DSP interrupt to
+    /// (decoded from register `0x80`).
+    pub fn sb_selected_irq(&self) -> u8 {
+        self.mixer.selected_irq()
     }
 
     pub fn cpu(&self) -> &Cpu386 {
@@ -1646,6 +1669,7 @@ fn margo_mmio_offset(address: u32, width: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use izarravm_core::{SbDma8, SbDma16, SbIrq};
     use izarravm_firmware::I386DX25_TEST_ROM;
 
     fn test_machine() -> Machine {
@@ -2169,6 +2193,29 @@ mod tests {
             let byte = bus.read_io(0x225, BusWidth::Byte).unwrap();
             assert_eq!(byte, 0x02);
         });
+    }
+
+    #[test]
+    fn machine_applies_host_sound_blaster_config_at_boot() {
+        let mut profile = MachineProfile::i386dx25(16, VideoCard::Et4000Ax);
+        profile.sound_blaster = SoundBlasterConfig {
+            enabled: true,
+            irq: SbIrq::I7,
+            dma: SbDma8::D3,
+            high_dma: SbDma16::D6,
+        };
+        let mut machine = Machine::new(profile, I386DX25_TEST_ROM).unwrap();
+        // The mixer boots on the configured routing, not the hardware IRQ5/DMA1/DMA5.
+        assert_eq!(machine.sb_selected_irq(), 7);
+        let (irq_byte, dma_byte) = with_bus(&mut machine, |bus| {
+            bus.write_io(0x224, BusWidth::Byte, 0x80).unwrap();
+            let irq = u8::try_from(bus.read_io(0x225, BusWidth::Byte).unwrap()).unwrap();
+            bus.write_io(0x224, BusWidth::Byte, 0x81).unwrap();
+            let dma = u8::try_from(bus.read_io(0x225, BusWidth::Byte).unwrap()).unwrap();
+            (irq, dma)
+        });
+        assert_eq!(irq_byte, 0x04, "register 0x80 boots on IRQ7");
+        assert_eq!(dma_byte, 0x48, "register 0x81 boots on DMA3 | DMA6");
     }
 
     #[test]
