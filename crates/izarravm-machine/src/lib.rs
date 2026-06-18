@@ -655,8 +655,13 @@ impl Machine {
             0x00 | 0x10 => {
                 let bp = self.cpu.registers.ebp() as u16;
                 let es_base = self.cpu.registers.segment(SegmentIndex::Es).base;
-                let bytes =
-                    self.read_guest_block(es_base + u32::from(bp), cx as usize * bh as usize);
+                // load_font_table folds character codes modulo 256, so any
+                // glyphs beyond the first 256 only rewrite earlier codes. Cap
+                // the read there to keep a pathological CX (a u16 up to 65535)
+                // from stalling the emulator with up to ~16 million
+                // byte-at-a-time bus reads plus a multi-megabyte allocation.
+                let count = (cx as usize).min(256);
+                let bytes = self.read_guest_block(es_base + u32::from(bp), count * bh as usize);
                 self.video.load_font_table(table, dx, bh, &bytes);
                 if al >= 0x10 {
                     self.video.set_char_height(bh);
@@ -3741,6 +3746,37 @@ mod tests {
         );
         // The ROM reload restored the solid full block; without it the custom
         // blank load would leave the top row as the background (0).
+        assert_eq!(machine.video().render_text_row(0)[0], 15);
+    }
+
+    #[test]
+    fn int10_11h_caps_a_pathological_glyph_count() {
+        // CX = 0xFFFF with BH = 16 would read ~16 MB byte-at-a-time. The handler
+        // caps the read at 256 glyphs (codes fold modulo 256), so the call still
+        // loads the first glyph and returns promptly without stalling or
+        // over-allocating.
+        let rom = rom_with_code(&[
+            0xb8, 0x00, 0x40, // mov ax, 4000h
+            0x8e, 0xc0, // mov es, ax
+            0xbd, 0x00, 0x00, // mov bp, 0
+            0xb9, 0xff, 0xff, // mov cx, 0FFFFh
+            0xba, 0x41, 0x00, // mov dx, 41h ('A')
+            0xbb, 0x00, 0x10, // mov bx, 1000h (BH=16, BL=0)
+            0xb8, 0x00, 0x11, // mov ax, 1100h
+            0xcd, 0x10, // int 10h
+            0xf4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+        // A solid glyph for 'A' at the first 16 bytes; the rest of the 64 KB
+        // page stays zero, so capping the read also proves only the real glyph
+        // data is consulted.
+        machine.write_guest_block(0x40000, &[0xFF; 16]);
+        machine.write_physical_u8(VGA_TEXT_BASE, 0x41);
+        machine.write_physical_u8(VGA_TEXT_BASE + 1, 0x0F);
+        let reason = machine.run_until_halt_or_cycles(2_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        // The first glyph (solid) loaded and renders as the foreground.
         assert_eq!(machine.video().render_text_row(0)[0], 15);
     }
 
