@@ -528,18 +528,34 @@ impl Machine {
     /// flags/CS/IP.
     fn handle_int10(&mut self) {
         let ax = self.cpu.registers.eax() as u16;
-        if ax == 0x0013 {
-            self.video.set_mode13h();
-            self.margo_active = false;
-            return;
+        let ah = (ax >> 8) as u8;
+        let al = ax as u8;
+        if ah == 0x00 {
+            match al {
+                // The 16-color planar modes this slice implements.
+                0x0D | 0x0E | 0x10 | 0x12 => {
+                    self.set_vga_mode(al); // clears the Margo latch internally
+                    return;
+                }
+                // Chained mode 13h.
+                0x13 => {
+                    self.video.set_mode13h();
+                    self.margo_active = false;
+                    return;
+                }
+                // The 80x25 color text family (2/3) and monochrome text (7), plus
+                // the 40x25 and CGA variants (0/1/4/5/6) which map to the same
+                // single text personality, all return to text mode.
+                0x00 | 0x01 | 0x02 | 0x03 | 0x04 | 0x05 | 0x06 | 0x07 => {
+                    self.video.set_text_mode();
+                    self.margo_active = false;
+                    return;
+                }
+                _ => {}
+            }
         }
-        // AH=00h, AL = a planar mode number this slice implements.
-        if (ax >> 8) == 0x00 && matches!(ax as u8, 0x0D | 0x0E | 0x10 | 0x12) {
-            self.set_vga_mode(ax as u8); // clears the Margo latch internally
-            return;
-        }
-        if (ax >> 8) == 0x4f {
-            self.handle_vbe(ax as u8);
+        if ah == 0x4f {
+            self.handle_vbe(al);
         }
     }
 
@@ -3744,6 +3760,38 @@ mod tests {
         assert_eq!(raster.width, 640);
         assert_eq!(raster.height, 525);
         assert_eq!(raster.pixels[0], 1, "top-left pixel is attribute index 1");
+    }
+
+    #[test]
+    fn int10_returns_to_text_mode() {
+        // mov ax,0013h; int 10h; mov ax,0003h; int 10h; hlt
+        let rom = rom_with_code(&[
+            0xb8, 0x13, 0x00, 0xcd, 0x10, 0xb8, 0x03, 0x00, 0xcd, 0x10, 0xf4,
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+
+        // Stamp a recognizable pattern into the text buffer before the toggles.
+        machine.video_mut().write_u8(0, b'X').unwrap();
+        machine.video_mut().write_u8(1, 0x4e).unwrap();
+        machine
+            .video_mut()
+            .write_u8(VGA_TEXT_MEMORY_SIZE - 2, b'Y')
+            .unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        // Returning to text hands the display back to the VGA core text path and
+        // clears the Margo latch.
+        assert_eq!(machine.active_display(), ActiveDisplay::Text);
+        assert_eq!(machine.video().active_mode(), VideoMode::Text);
+        // set_text_mode blanks the buffer to spaces with the 0x07 attribute.
+        assert_eq!(machine.video().read_u8(0).unwrap(), b' ');
+        assert_eq!(machine.video().read_u8(1).unwrap(), 0x07);
+        assert_eq!(
+            machine.video().read_u8(VGA_TEXT_MEMORY_SIZE - 2).unwrap(),
+            b' '
+        );
     }
 
     #[test]

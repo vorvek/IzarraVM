@@ -955,6 +955,25 @@ impl Vga {
         self.resize_work();
     }
 
+    /// Switch to the 80x25 text mode (mode 03h), resetting the beam, clearing the
+    /// text buffer to blank spaces, and dropping any stale graphics frame. The
+    /// BIOS INT 10h AH=00h text-family mode numbers all route here: the core
+    /// carries a single text personality, so the 40x25 and CGA variants return to
+    /// the same 80x25 geometry. Mirrors `set_mode13h`; the work buffer is emptied
+    /// so a later `advance` does not finalize a graphics frame.
+    pub fn set_text_mode(&mut self) {
+        self.crtc = CrtcTiming::text_03h();
+        for cell in self.text_memory.chunks_exact_mut(2) {
+            cell[0] = b' ';
+            cell[1] = 0x07;
+        }
+        self.beam = 0;
+        self.last_line = 0;
+        self.mode = VideoMode::Text;
+        self.presented = None;
+        self.work.clear();
+    }
+
     /// Derive the absolute vertical timing in `crtc` from the raw register bytes in
     /// `crtc_regs`, applying the overflow-bit assembly and the VGA register
     /// conventions (vertical total + 2, vertical display end + 1, the retrace/blank
