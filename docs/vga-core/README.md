@@ -418,10 +418,9 @@ Divergences (fidelity directive):
 1. **`AH=11h AL=30` (get font info) and `AL=20-24` (graphics-mode text) are
    deferred.** AL=30 returns a far pointer to the active font; the graphics-mode
    text services render text in graphics modes. Both are separable follow-ups.
-2. **The hardware text cursor glyph is not rendered.** Slice 10 stores the cursor
-   shape and location; rendering the cursor block is a follow-up, so there is no
-   on-screen cursor until then (the cell `frame()` cursor offset stays for
-   headless use).
+2. **The hardware text cursor is now rendered (slice 11).** The cursor renders
+   reverse video on the cell at `cursor_offset`; the `frame()` / `TextFrame`
+   cursor offset stays for the headless ASCII view. (See the Slice 11 coverage.)
 3. **The exact blink cadence is not modeled.** Blink hides the foreground on a
    frame-count divisor (a first model); the hardware ~16 Hz cadence is a timing
    refinement.
@@ -468,6 +467,51 @@ Divergences (fidelity directive):
    palette/overscan block get (`AL=09`), intensity/blink toggle (`AL=03`), color
    paging (`AL=13/14/1A`), and the font services (`AL=20-24`). The font services
    belong with the loadable-character-generator slice.
+
+## Slice 11 coverage — text-mode hardware cursor
+
+Slice 11 renders the hardware text cursor through the same raster engine
+as the rest of text mode. The cursor shape (`cursor_start` /
+`cursor_end`) and location (`cursor_offset`) were already stored and read
+back in slice 10; slice 11 decodes them in `render_text_row` and applies
+reverse video on the active scanlines.
+
+| Area | Covered in slice 11 |
+|------|---------------------|
+| Cursor fill | Reverse video: on the cell at `cursor_offset`, the foreground and background swap on the active cursor scanlines (the Bochs `draw_char_common` text-cursor path; QEMU's solid-foreground approximation coincides for the blank-cell case) |
+| Cursor shape | CRTC 0A bit 5 disables the cursor; bits 0-4 of 0A/0B bound the scanline range; a start greater than end wraps to two regions (a faithful superset of Bochs, which treats that case as invisible) |
+| Cursor blink | The cursor blinks on the same frame hide phase as attribute blink, but is not gated on the AC Mode Control 10h bit 3 attribute-blink enable |
+
+The semantics are pinned to the IBM VGA character generator and RBIL
+`PORTS.B` (CRTC cursor start/end 0A/0B, the bit-5 disable), cross-checked
+against the Bochs `draw_char_common` and QEMU `vga_draw_text` text-cursor
+paths.
+
+The done-signals are equality at unit level:
+`vga::tests::text_cursor_renders_reverse_video_on_the_cursor_cell`,
+`vga::tests::text_cursor_respects_start_and_end_scanlines`,
+`vga::tests::text_cursor_disable_bit_hides_it`,
+`vga::tests::text_cursor_blinks_on_the_frame_phase`, and
+`vga::tests::text_cursor_wrap_shape_covers_two_regions`.
+
+Target, honesty note: the hardware text cursor is the one visible defect
+left after the slice-9 text scanout, and affects every text title that
+shows a cursor. The reverse-video fill rule, the 0A/0B shape decode, and
+the blink phase are verified directly against the code paths above; no
+released-source title was inspected.
+
+Divergences (fidelity directive):
+
+1. **Cursor skew (CRTC 0Bh bits 5-6) is ignored**, treated as zero. Rare
+   and unused by standard titles.
+2. **The exact blink cadence is not modeled.** The cursor reuses the
+   attribute-blink frame-count divisor (a first model); the hardware
+   cursor rate (~1.875 Hz) rides with the parked attribute-blink
+   cadence refinement.
+3. **Text-mode start-address / pel-pan interaction with the cursor is
+   not modeled.** Slice 9 reads text cells and matches the cursor on the
+   displayed cell index directly (no start-address offset applied); when
+   text start-address scroll lands, the cursor match moves with it.
 
 ## Latch rules
 
