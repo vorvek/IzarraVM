@@ -4342,6 +4342,112 @@ mod tests {
     }
 
     #[test]
+    fn mode13h_320x200_through_the_machine() {
+        let mut machine = test_machine();
+        // INT 10h AH=00h AL=13h installs chained mode 13h; set_mode13h is its
+        // programmatic equivalent (the INT path is proven by
+        // int10_mode13h_routes_a000_through_chain4).
+        machine.video_mut().set_mode13h();
+        assert_eq!(machine.active_display(), ActiveDisplay::VgaRaster);
+        // Chain-4 routes the A0000 byte at offset 6 to plane 6 & 3 = 2 at plane
+        // offset 6 >> 2 = 1. 0xC2 has bits above 0x3F, proving no 6-bit mask.
+        machine.write_physical_u8(0x000A_0000 + 6, 0xC2);
+        // Complete a frame (the standard mode-13h frame is ~359 200 dots; 500 000
+        // clocks is ~503 500 dots, enough to cross one frame and present).
+        machine.advance_devices(500_000);
+        let raster = machine.vga_raster().expect("a frame presented");
+        assert_eq!(raster.width, 320);
+        assert_eq!(raster.height, 449, "mode-13h vertical total");
+        // Column 6 of row 0 scans out the written 0xC2, as the 8-bit DAC index
+        // directly.
+        assert_eq!(
+            raster.pixels[6], 0xC2,
+            "mode-13h pixel scans out at its column with its full 8-bit value"
+        );
+    }
+
+    #[test]
+    fn mode13h_pel_pan_smooth_scroll_through_the_machine() {
+        let mut machine = test_machine();
+        machine.video_mut().set_mode13h();
+        assert_eq!(machine.active_display(), ActiveDisplay::VgaRaster);
+        // Chain-4 writes the byte at A0000 offset p straight to plane p at plane
+        // offset 0, so four writes at offsets 0..3 mark one distinct byte per plane
+        // there (values above 0x3F prove the 8-bit-direct DAC index is scanned out,
+        // not masked to 6 bits).
+        let plane_byte: [u8; 4] = [0x40, 0x50, 0x60, 0x70];
+        for (plane, &val) in plane_byte.iter().enumerate() {
+            machine.write_physical_u8(0x000A_0000 + plane as u32, val);
+        }
+        // For each pel-pan 1..3, reset the attribute flip-flop, write AC index 0x13
+        // then the pan value, run two frame periods, and assert the leftmost column
+        // scans out plane `pan` at plane offset 0: the fine-shifted pixel.
+        for pan in 1u8..=3 {
+            machine.video_mut().read_status1(); // reset attr flip-flop to index mode
+            machine.video_mut().write_port(0x3C0, 0x13); // attr index 0x13 (pixel pan)
+            machine.video_mut().write_port(0x3C0, pan); // pel-pan value
+            // Pel-pan is live (not latched): it takes effect at the scanline of the
+            // write, so the in-progress frame's early rows still hold the prior pan.
+            // Two frame periods flush that frame and then render a clean one whose row
+            // zero is scanned after the write.
+            machine.advance_devices(500_000); // flush the in-progress (mixed-pan) frame
+            machine.advance_devices(500_000); // render a full frame with the new pan
+            let raster = machine.vga_raster().expect("a frame presented");
+            assert_eq!(
+                raster.pixels[0], plane_byte[pan as usize],
+                "pel-pan {pan} scans out plane {pan} at the leftmost column"
+            );
+        }
+    }
+
+    #[test]
+    fn mode13h_line_compare_split_through_the_machine() {
+        let mut machine = test_machine();
+        machine.video_mut().set_mode13h();
+        assert_eq!(machine.active_display(), ActiveDisplay::VgaRaster);
+        // A split at scan-counter line 200, well inside the 400 active scanlines.
+        // The line-compare bits are mode-agnostic (CRTC 18h + 07h.4 + 09h.6), and
+        // mode 13h does not honor guest vertical-CRTC bangs, so writing 07h/09h
+        // here clears only their line-compare bits, leaving the fixed 320x200
+        // timing intact. The default line_compare 0x3FF holds bits 8 and 9 set, so
+        // they must be cleared or the low byte alone yields 0x3C8 (no split).
+        machine.video_mut().write_port(0x3D4, 0x07);
+        machine.video_mut().write_port(0x3D5, 0x00); // clear line-compare bit 8
+        machine.video_mut().write_port(0x3D4, 0x09);
+        machine.video_mut().write_port(0x3D5, 0x00); // clear line-compare bit 9
+        machine.video_mut().write_port(0x3D4, 0x18);
+        machine.video_mut().write_port(0x3D5, 200); // line compare low byte = 200
+        // Mark plane 0, offset 0 (pixel 0 of any scanline reading offset 0). 0xC2
+        // has bits above 0x3F, proving the 8-bit DAC index is read directly.
+        machine.write_physical_u8(0x000A_0000, 0xC2); // chain-4: plane 0, offset 0
+        // Scroll the top region to cleared VRAM, buffered until the next vertical
+        // retrace. Two frame periods: the first latches the start address, the second
+        // renders with it.
+        machine.video_mut().write_port(0x3D4, 0x0C);
+        machine.video_mut().write_port(0x3D5, 0x40); // start address high = 0x40
+        machine.video_mut().write_port(0x3D4, 0x0D);
+        machine.video_mut().write_port(0x3D5, 0x00); // start address low -> 0x4000
+        machine.advance_devices(500_000);
+        machine.advance_devices(500_000);
+        let raster = machine.vga_raster().expect("a frame presented");
+        assert_eq!(raster.width, 320, "mode-13h width");
+        let w = raster.width as usize;
+        // A top scanline (50 < 200) reads the scrolled, cleared region: 0.
+        assert_eq!(
+            raster.pixels[50 * w],
+            0,
+            "top region is scrolled to cleared VRAM"
+        );
+        // The first split scanline (201 = line_compare + 1) reads offset 0 (the
+        // marked byte), as the full 8-bit DAC index.
+        assert_eq!(
+            raster.pixels[201 * w],
+            0xC2,
+            "split region reads offset 0 at the full 8-bit value"
+        );
+    }
+
+    #[test]
     fn dos_program_writes_and_reads_back_a_file() {
         // org 0x100: create C:\OUT.TXT (AH=3Ch), write "HI!" (AH=40h to the file
         // handle), seek to 0 (AH=42h), read 3 bytes back (AH=3Fh), close (AH=3Eh),
