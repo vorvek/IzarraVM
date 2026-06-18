@@ -132,16 +132,6 @@ fn tick_machine(machine: &mut Machine, cycles: u64) -> Option<StopReason> {
 fn current_image(machine: &mut Machine) -> egui::ColorImage {
     match machine.active_display() {
         ActiveDisplay::Text => text_to_color_image(&machine.screen_text()),
-        ActiveDisplay::Mode13h => {
-            let palette = machine.palette_argb();
-            let framebuffer = machine.mode13h_framebuffer();
-            indexed_to_color_image(
-                &framebuffer.indexed_pixels,
-                framebuffer.width as usize,
-                framebuffer.height as usize,
-                &palette,
-            )
-        }
         ActiveDisplay::VgaRaster => {
             let palette = machine.palette_argb();
             match machine.vga_raster() {

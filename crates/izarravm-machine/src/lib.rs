@@ -4,9 +4,9 @@ use izarravm_core::{CpuPreset, HardwareProfile, SoundBlasterConfig, VideoCard};
 use izarravm_cpu::{Cpu386, CpuError, Registers, SegmentIndex, SegmentRegister};
 pub use izarravm_video::MARGO_ID_VALUE;
 use izarravm_video::{
-    DAC_ENTRIES, Framebuffer, MARGO_MMIO_SIZE, MARGO_VBE_MODES, MARGO_VRAM_SIZE,
-    MODE13H_MEMORY_SIZE, Margo, TextFrame, VGA_MODE13H_BASE, VGA_PLANAR_WINDOW_SIZE, VGA_TEXT_BASE,
-    VGA_TEXT_MEMORY_SIZE, Vga, VgaRaster, VideoMode, bytes_per_pixel, pixel_format, vbe_mode,
+    DAC_ENTRIES, MARGO_MMIO_SIZE, MARGO_VBE_MODES, MARGO_VRAM_SIZE, Margo, TextFrame,
+    VGA_MODE13H_BASE, VGA_PLANAR_WINDOW_SIZE, VGA_TEXT_BASE, VGA_TEXT_MEMORY_SIZE, Vga, VgaRaster,
+    VideoMode, bytes_per_pixel, pixel_format, vbe_mode,
 };
 use thiserror::Error;
 
@@ -131,7 +131,6 @@ const VGA_DOT_HZ: u64 = 25_175_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveDisplay {
     Text,
-    Mode13h,
     VgaRaster,
     MargoLfb,
 }
@@ -449,10 +448,6 @@ impl Machine {
         self.video.frame()
     }
 
-    pub fn mode13h_framebuffer(&self) -> &Framebuffer {
-        self.video.mode13h_framebuffer()
-    }
-
     fn make_bus(&mut self) -> MachineBus<'_> {
         MachineBus {
             memory: &mut self.memory,
@@ -768,11 +763,9 @@ impl Machine {
             ActiveDisplay::MargoLfb
         } else if matches!(
             self.video.active_mode(),
-            VideoMode::Planar | VideoMode::ModeX
+            VideoMode::Planar | VideoMode::ModeX | VideoMode::Mode13h
         ) {
             ActiveDisplay::VgaRaster
-        } else if self.video.active_mode() == VideoMode::Mode13h {
-            ActiveDisplay::Mode13h
         } else {
             ActiveDisplay::Text
         }
@@ -1574,26 +1567,24 @@ impl MachineBus<'_> {
                 .collect();
         }
 
-        // Unchained (mode X) and 16-color planar use the 64 KB planar datapath;
-        // chained mode 13h uses the flat 64000-byte buffer. cpu_read loads the VGA
-        // latches as a side effect, so the planar path needs &mut self.
-        if matches!(
-            self.video.active_mode(),
-            VideoMode::Planar | VideoMode::ModeX
-        ) {
-            if let Some(offset) = vga_planar_offset(address, width) {
-                return Ok((0..width)
-                    .map(|i| self.video.cpu_read(offset + i))
-                    .collect());
+        // The 64 KB A0000 window serves all three graphics modes. Unchained (mode
+        // X) and 16-color planar route through the planar datapath (cpu_read loads
+        // the VGA latches as a side effect, so it needs &mut self); chained mode
+        // 13h routes through the chain-4 decode.
+        if let Some(offset) = vga_planar_offset(address, width) {
+            match self.video.active_mode() {
+                VideoMode::Planar | VideoMode::ModeX => {
+                    return Ok((0..width)
+                        .map(|i| self.video.cpu_read(offset + i))
+                        .collect());
+                }
+                VideoMode::Mode13h => {
+                    return Ok((0..width)
+                        .map(|i| self.video.cpu_read_chain4(offset + i))
+                        .collect());
+                }
+                VideoMode::Text => {}
             }
-        } else if let Some(offset) = video_mode13h_offset(address, width) {
-            return (0..width)
-                .map(|index| {
-                    self.video
-                        .read_mode13h_u8(offset + index)
-                        .map_err(|_| BusError::UnmappedMemory { address })
-                })
-                .collect();
         }
 
         if let Some(offset) = margo_lfb_offset(address, width) {
@@ -1630,22 +1621,22 @@ impl MachineBus<'_> {
                 .map_err(|_| BusError::UnmappedMemory { address });
         }
 
-        // Unchained (mode X) and 16-color planar route A0000 through the 64 KB
-        // planar datapath (map mask, write mode, bit mask, latches); chained mode
-        // 13h writes the flat 64000-byte buffer.
-        if matches!(
-            self.video.active_mode(),
-            VideoMode::Planar | VideoMode::ModeX
-        ) {
-            if let Some(offset) = vga_planar_offset(address, 1) {
-                self.video.cpu_write(offset, value);
-                return Ok(());
+        // The 64 KB A0000 window serves all three graphics modes. Unchained (mode
+        // X) and 16-color planar route A0000 through the planar datapath (map mask,
+        // write mode, bit mask, latches); chained mode 13h routes through the
+        // chain-4 decode.
+        if let Some(offset) = vga_planar_offset(address, 1) {
+            match self.video.active_mode() {
+                VideoMode::Planar | VideoMode::ModeX => {
+                    self.video.cpu_write(offset, value);
+                    return Ok(());
+                }
+                VideoMode::Mode13h => {
+                    self.video.cpu_write_chain4(offset, value);
+                    return Ok(());
+                }
+                VideoMode::Text => {}
             }
-        } else if let Some(offset) = video_mode13h_offset(address, 1) {
-            return self
-                .video
-                .write_mode13h_u8(offset, value)
-                .map_err(|_| BusError::UnmappedMemory { address });
         }
 
         if let Some(offset) = margo_lfb_offset(address, 1) {
@@ -1709,17 +1700,8 @@ fn video_text_offset(address: u32, width: usize) -> Option<usize> {
     }
 }
 
-fn video_mode13h_offset(address: u32, width: usize) -> Option<usize> {
-    let end = VGA_MODE13H_BASE + MODE13H_MEMORY_SIZE as u32;
-    if (VGA_MODE13H_BASE..end).contains(&address) && address + width as u32 <= end {
-        Some((address - VGA_MODE13H_BASE) as usize)
-    } else {
-        None
-    }
-}
-
-/// The A0000 window for unchained / 16-color planar access: the full 64 KB the
-/// hardware decodes, wider than the 64000-byte chained mode-13h buffer.
+/// The A0000 window for chained mode 13h and unchained / 16-color planar access:
+/// the full 64 KB the hardware decodes.
 fn vga_planar_offset(address: u32, width: usize) -> Option<usize> {
     let end = VGA_MODE13H_BASE + VGA_PLANAR_WINDOW_SIZE;
     if (VGA_MODE13H_BASE..end).contains(&address) && address + width as u32 <= end {
@@ -1858,7 +1840,7 @@ mod tests {
     }
 
     #[test]
-    fn int10_mode13h_maps_a000_to_framebuffer() {
+    fn int10_mode13h_routes_a000_through_chain4() {
         let rom = rom_with_code(&[
             0xb8, 0x13, 0x00, // mov ax, 0013h
             0xcd, 0x10, // int 10h
@@ -1875,7 +1857,10 @@ mod tests {
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
 
         assert_eq!(reason, StopReason::Halted);
-        assert_eq!(machine.mode13h_framebuffer().indexed_pixels[0x7b], 0x2a);
+        // Chain-4 routes the A0000 byte at offset 0x7B to plane 0x7B & 3 = 3 at
+        // plane offset 0x7B >> 2 = 30.
+        assert_eq!(machine.video().plane_byte(3, 30), 0x2a);
+        assert_eq!(machine.active_display(), ActiveDisplay::VgaRaster);
         assert!(machine.is_graphics_mode());
         assert!(machine.bus_trace().cycles().iter().any(|cycle| {
             cycle.kind == BusAccessKind::InterruptAcknowledge && cycle.address == 0x10
@@ -1929,9 +1914,12 @@ mod tests {
             record.status == izarravm_firmware::SuiteRecordStatus::Pass
                 && record.name == "video.vga_mode13h"
         }));
-        assert_eq!(machine.mode13h_framebuffer().indexed_pixels[0], 0x2a);
-        assert_eq!(machine.mode13h_framebuffer().indexed_pixels[319], 0x13);
-        assert_eq!(machine.mode13h_framebuffer().indexed_pixels[63680], 0x7f);
+        // Chain-4 routes the linear byte at offset N to plane N & 3 at plane
+        // offset N >> 2, so the boot image's three drawn pixels land as:
+        // 0 -> plane 0 @ 0, 319 -> plane 3 @ 79, 63680 -> plane 0 @ 15920.
+        assert_eq!(machine.video().plane_byte(0, 0), 0x2a);
+        assert_eq!(machine.video().plane_byte(3, 79), 0x13);
+        assert_eq!(machine.video().plane_byte(0, 15920), 0x7f);
         assert!(results.records.iter().any(|record| {
             record.status == izarravm_firmware::SuiteRecordStatus::Pass
                 && record.name == "sound.sb_16bit_dma"
@@ -1972,7 +1960,7 @@ mod tests {
         // A guest VGA mode-set must hand the display back to VGA.
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
         assert_eq!(reason, StopReason::Halted);
-        assert_eq!(machine.active_display(), ActiveDisplay::Mode13h);
+        assert_eq!(machine.active_display(), ActiveDisplay::VgaRaster);
     }
 
     #[test]
@@ -2024,7 +2012,7 @@ mod tests {
         // The VGA mode-set hands the display back to VGA, but the 4F02 call must
         // still have set the Margo mode (width stays set; only margo_active clears).
         assert_eq!(machine.margo().display().width, 640);
-        assert_eq!(machine.active_display(), ActiveDisplay::Mode13h);
+        assert_eq!(machine.active_display(), ActiveDisplay::VgaRaster);
     }
 
     #[test]

@@ -2,12 +2,14 @@
 //! cycle-coupled beam clock, and a catch-up rasterizer. This is Margo's
 //! VGA-compatibility personality (one chip, one frame store, one RAMDAC).
 //!
-//! It also carries the text/Mode-13h personality: the 80x25 character buffer,
-//! the linear Mode 13h framebuffer, the RAMDAC, and the CRTC text cursor.
+//! It also carries the text personality: the 80x25 character buffer, the
+//! RAMDAC, and the CRTC text cursor. Chained mode 13h routes through the same
+//! raster engine as the planar and mode-X paths; chain-4 only rewrites the CPU
+//! write/read decode.
 
 use crate::{
-    DAC_ENTRIES, Dac, Framebuffer, TextCell, TextFrame, VGA_TEXT_COLUMNS, VGA_TEXT_MEMORY_SIZE,
-    VGA_TEXT_ROWS, VideoError, VideoMode,
+    DAC_ENTRIES, Dac, TextCell, TextFrame, VGA_TEXT_COLUMNS, VGA_TEXT_MEMORY_SIZE, VGA_TEXT_ROWS,
+    VideoError, VideoMode,
 };
 
 pub const VGA_PLANE_SIZE: usize = 64 * 1024;
@@ -173,6 +175,32 @@ impl CrtcTiming {
         }
     }
 
+    /// Standard chained mode 13h: 320x200 256-color, 70 Hz, double-scanned to
+    /// 400 scanlines (200 source rows), 8-dot chars. The display scanout is
+    /// identical to mode X (chain-4 changes only the CPU write decode), so the
+    /// timing matches `mode_x()`; offset 40 gives 80 bytes per source row per
+    /// plane, the 256-color byte pitch. Installed by `set_mode13h`.
+    pub fn mode13h() -> Self {
+        Self {
+            htotal_chars: 100,
+            char_width: 8,
+            hdisp_end: 320,
+            vtotal: 449,
+            vdisp_end: 400,
+            vblank_start: 407,
+            vblank_end: 442,
+            vretrace_start: 412,
+            vretrace_end: 414,
+            max_scan: 1,
+            double_scan: true,
+            start_address: 0,
+            offset: 40,
+            mode_control: 0xE3,
+            underline_loc: 0x00,
+            line_compare: 0x3FF,
+        }
+    }
+
     /// Total dots per frame = htotal_dots * vtotal (scan-counter lines).
     pub fn frame_dots(&self) -> u64 {
         (self.htotal_chars * self.char_width) as u64 * self.vtotal as u64
@@ -281,9 +309,8 @@ pub struct Vga {
     pub(crate) seq_index: u8,
     pub(crate) gc_index: u8,
     pub(crate) crtc_index: u8,
-    // Legacy text/Mode-13h/RAMDAC/cursor personality, folded in from VgaTextMode.
+    // Legacy text/RAMDAC/cursor personality, folded in from VgaTextMode.
     pub(crate) text_memory: [u8; VGA_TEXT_MEMORY_SIZE],
-    pub(crate) mode13h: Framebuffer,
     pub(crate) dac: Dac,
     pub(crate) cursor_offset: u16,
     pub(crate) mode: VideoMode,
@@ -315,7 +342,6 @@ impl Default for Vga {
             gc_index: 0,
             crtc_index: 0,
             text_memory,
-            mode13h: Framebuffer::mode13h(),
             dac: Dac::default(),
             cursor_offset: 0,
             mode: VideoMode::Text,
@@ -466,19 +492,24 @@ impl Vga {
         row
     }
 
-    /// Assemble one unchained 256-color (mode X) scanline. Four planes are
-    /// column-interleaved: pixel x is plane `x_eff & 3` at plane offset `row_base +
-    /// (x_eff >> 2)`, where `x_eff = x + pan`, and the byte is the 8-bit DAC index
-    /// directly (no attribute palette, no 6-bit mask). `counter_line` is in
-    /// scan-counter units; double-scan maps it to the source row, exactly as the
-    /// 16-color path.
-    /// The CRTC Line Compare split is applied: at and below `line_compare + 1` the
-    /// display-address counter reloads to 0 and row counting restarts there (Abrash,
-    /// Graphics Programming Black Book ch.30). The AC Horizontal Pixel Panning
-    /// register (13h) applies as a fine 0-3 column shift (one plane per pel) through
-    /// the shared `pel_pan`, which also forces it to 0 below the split when AC Mode
-    /// Control (10h) bit 5 is set; chained mode 13h pel-pan (0-7) is deferred.
-    pub fn render_modex_row(&self, counter_line: u32) -> Vec<u8> {
+    /// Assemble one 256-color scanline, shared by chained mode 13h and unchained
+    /// mode X. Chain-4 (Sequencer Memory Mode 04h bit 3) changes only the CPU
+    /// write/read decode, so the CRTC display scanout is identical in both modes:
+    /// Abrash, Graphics Programming Black Book ch.47 gives `M = N/4` (plane
+    /// offset), `P = N mod 4` (plane). Four planes are column-interleaved: pixel
+    /// x is plane `x_eff & 3` at plane offset `row_base + (x_eff >> 2)`, where
+    /// `x_eff = x + pan`, and the byte is the 8-bit DAC index directly (no
+    /// attribute palette, no 6-bit mask). `counter_line` is in scan-counter
+    /// units; double-scan maps it to the source row, exactly as the 16-color
+    /// path.
+    /// The CRTC Line Compare split is applied: at and below `line_compare + 1`
+    /// the display-address counter reloads to 0 and row counting restarts there
+    /// (Abrash, Graphics Programming Black Book ch.30). The AC Horizontal Pixel
+    /// Panning register (13h) applies as a fine 0-3 column shift (one plane per
+    /// pel, four pels per plane-offset address) through the shared `pel_pan`,
+    /// which also forces it to 0 below the split when AC Mode Control (10h) bit 5
+    /// is set.
+    pub fn render_256color_row(&self, counter_line: u32) -> Vec<u8> {
         let width = self.crtc.hdisp_end as usize;
         let below_split = counter_line > self.crtc.line_compare;
         let (start, first_line) = self.split_origin(counter_line);
@@ -519,7 +550,7 @@ impl Vga {
         let width = self.raster_width() as usize;
         let pixels = if counter_line < self.crtc.vdisp_end {
             match self.mode {
-                VideoMode::ModeX => self.render_modex_row(counter_line),
+                VideoMode::Mode13h | VideoMode::ModeX => self.render_256color_row(counter_line),
                 _ => self.render_active_row(counter_line),
             }
         } else {
@@ -553,9 +584,10 @@ impl Vga {
             self.render_scanline(self.last_line);
             self.last_line += 1;
         }
-        // `work` is sized only in planar mode; text/13h leave it empty, so a frame
-        // built from it would have a pixel count that mismatches width*height. Only
-        // publish a raster when there is real planar content to show.
+        // `work` is sized by every graphics mode-set (planar, mode X, and mode
+        // 13h all install timing and resize); text leaves it empty, so a frame
+        // built from it would have a pixel count that mismatches width*height.
+        // Only publish a raster when there is real graphics content to show.
         if !self.work.is_empty() {
             self.presented = Some(VgaRaster {
                 width: self.raster_width(),
@@ -640,6 +672,33 @@ impl Vga {
         let planes = self.plane_slice_mut(offset);
         let gc = self.gc;
         read_planes(&planes, &gc, &mut self.latches)
+    }
+
+    /// Chained mode-13h CPU write: chain-4 (Sequencer Memory Mode 04h bit 3)
+    /// routes byte N straight to plane `N & 3` at plane-offset `N >> 2`, bypassing
+    /// the planar datapath (map mask, write mode, bit mask, latches). This is the
+    /// CPU write decode that mode X turns off; the CRTC display scanout reads the
+    /// same four-plane VRAM either way (Abrash, Graphics Programming Black Book
+    /// ch.47).
+    pub fn cpu_write_chain4(&mut self, offset: usize, data: u8) {
+        let plane = offset & 0x3;
+        let plane_off = offset >> 2;
+        if plane_off < VGA_PLANE_SIZE {
+            self.vram[plane * VGA_PLANE_SIZE + plane_off] = data;
+        }
+    }
+
+    /// Chained mode-13h CPU read: chain-4 selects plane `N & 3` at plane-offset
+    /// `N >> 2` via the low two address bits, the symmetric counterpart to
+    /// `cpu_write_chain4`.
+    pub fn cpu_read_chain4(&self, offset: usize) -> u8 {
+        let plane = offset & 0x3;
+        let plane_off = offset >> 2;
+        if plane_off < VGA_PLANE_SIZE {
+            self.vram[plane * VGA_PLANE_SIZE + plane_off]
+        } else {
+            0xFF
+        }
     }
 
     /// Buffer a CRTC start-address change. The value is latched into the active
@@ -865,31 +924,17 @@ impl Vga {
         Ok(())
     }
 
-    pub fn mode13h_framebuffer(&self) -> &Framebuffer {
-        &self.mode13h
-    }
-
-    pub fn read_mode13h_u8(&self, offset: usize) -> Result<u8, VideoError> {
-        self.mode13h
-            .indexed_pixels
-            .get(offset)
-            .copied()
-            .ok_or(VideoError::Mode13hOutOfBounds { offset })
-    }
-
-    pub fn write_mode13h_u8(&mut self, offset: usize, value: u8) -> Result<(), VideoError> {
-        let slot = self
-            .mode13h
-            .indexed_pixels
-            .get_mut(offset)
-            .ok_or(VideoError::Mode13hOutOfBounds { offset })?;
-        *slot = value;
-        Ok(())
-    }
-
+    /// Switch to chained mode 13h, installing the standard 320x200 70Hz timing
+    /// and routing the scanout through the shared raster engine (the same path
+    /// as the planar and mode-X modes). Chain-4 is the mode-13h-specific CPU
+    /// write decode; the CRTC display scanout is shared with mode X.
     pub fn set_mode13h(&mut self) {
-        self.mode13h = Framebuffer::mode13h();
+        self.crtc = CrtcTiming::mode13h();
+        self.beam = 0;
+        self.last_line = 0;
         self.mode = VideoMode::Mode13h;
+        self.presented = None; // drop any stale frame from a prior mode
+        self.resize_work();
     }
 
     /// Derive the absolute vertical timing in `crtc` from the raw register bytes in
@@ -1519,13 +1564,37 @@ mod tests {
     }
 
     #[test]
-    fn mode13h_memory_write_updates_framebuffer() {
+    fn mode13h_chain4_write_routes_byte_n_to_plane_n_mod_4() {
         let mut video = Vga::default();
         video.set_mode13h();
-        video.write_mode13h_u8(123, 0x2a).unwrap();
-
-        assert_eq!(video.mode13h_framebuffer().indexed_pixels[123], 0x2a);
-        assert_eq!(video.read_mode13h_u8(123).unwrap(), 0x2a);
+        // Chain-4 writes byte 123 (0x7B) to plane 123 & 3 = 3 at plane offset
+        // 123 >> 2 = 30, bypassing the planar datapath. The other planes at that
+        // plane offset stay clear.
+        video.cpu_write_chain4(123, 0x2a);
+        assert_eq!(
+            video.plane_byte(3, 30),
+            0x2a,
+            "byte 123 lands in plane 3 @ 30"
+        );
+        for plane in 0..VGA_PLANES {
+            if plane == 3 {
+                continue;
+            }
+            assert_eq!(
+                video.plane_byte(plane, 30),
+                0,
+                "plane {plane} at offset 30 is untouched"
+            );
+        }
+        // The chain-4 read selects the same plane/offset, so it round-trips.
+        assert_eq!(video.cpu_read_chain4(123), 0x2a);
+        // The shared 256-color scanout reads plane 123 & 3 = 3 at plane offset
+        // 123 >> 2 = 30 as pixel 123, so the raster carries the written byte.
+        assert_eq!(
+            video.render_256color_row(0)[123],
+            0x2a,
+            "pixel 123 scans out the chain-4 written byte"
+        );
     }
 
     #[test]
@@ -1886,7 +1955,7 @@ mod tests {
         vga.vram[2 * VGA_PLANE_SIZE] = 0x30;
         vga.vram[3 * VGA_PLANE_SIZE] = 0x40;
         vga.vram[1] = 0x11; // plane 0, offset 1: pixel 4 must read this
-        let row = vga.render_modex_row(0);
+        let row = vga.render_256color_row(0);
         // Pixels 0..3 are planes 0..3 at offset 0, as full 8-bit DAC indices.
         assert_eq!(&row[0..4], &[0x10, 0x20, 0x30, 0x40]);
         assert_eq!(row[4], 0x11, "pixel 4 wraps to plane 0 at plane offset 1");
@@ -1909,10 +1978,10 @@ mod tests {
             }
         }
         vga.attr.pixel_pan = 0;
-        let reference = vga.render_modex_row(0); // top line, no split forcing
+        let reference = vga.render_256color_row(0); // top line, no split forcing
         for pan in 1..=3u8 {
             vga.attr.pixel_pan = pan;
-            let row = vga.render_modex_row(0);
+            let row = vga.render_256color_row(0);
             for x in 0..(reference.len() - pan as usize) {
                 assert_eq!(
                     row[x],
@@ -1939,7 +2008,7 @@ mod tests {
         // (0,1,2,3) origin rotates to (N, N+1, ...).
         for pan in 0..VGA_PLANES as u8 {
             vga.attr.pixel_pan = pan;
-            let row = vga.render_modex_row(0);
+            let row = vga.render_256color_row(0);
             assert_eq!(
                 row[0], plane0_byte[pan as usize],
                 "pan {pan} rotates column 0 to plane {pan} at plane offset 0"
@@ -1964,7 +2033,7 @@ mod tests {
             vga.crtc.line_compare = 100;
             vga.attr.pixel_pan = pan;
             vga.attr.mode_control = mode_control;
-            vga.render_modex_row(101) // first split line: below_split, source row 0, offset 0
+            vga.render_256color_row(101) // first split line: below_split, source row 0, offset 0
         }
         // bit 5 set: pel-pan forced to 0 below the split, so pan 1 equals pan 0.
         assert_eq!(
@@ -1982,7 +2051,7 @@ mod tests {
 
     #[test]
     fn mode_x_page_flip_reads_the_selected_page() {
-        // Checks render_modex_row's row_base arithmetic directly; the start-address
+        // Checks render_256color_row's row_base arithmetic directly; the start-address
         // vretrace latch is exercised end to end in the machine test (slice-5 task 5).
         let mut vga = Vga::default();
         vga.set_mode13h();
@@ -1991,10 +2060,10 @@ mod tests {
         let page1 = 0x3E80usize; // 16000 plane-bytes: a 320x200 page
         vga.vram[0] = 0xAA; // page 0, plane 0, offset 0
         vga.vram[page1] = 0x55; // page 1, plane 0, offset 0
-        assert_eq!(vga.render_modex_row(0)[0], 0xAA, "start 0 reads page 0");
+        assert_eq!(vga.render_256color_row(0)[0], 0xAA, "start 0 reads page 0");
         vga.crtc.start_address = page1 as u32;
         assert_eq!(
-            vga.render_modex_row(0)[0],
+            vga.render_256color_row(0)[0],
             0x55,
             "start at page 1 reads page 1"
         );
@@ -2021,7 +2090,7 @@ mod tests {
                 }
             }
             r.crtc.start_address = start;
-            r.render_modex_row(row)
+            r.render_256color_row(row)
         }
 
         let mut vga = Vga::default();
@@ -2040,20 +2109,20 @@ mod tests {
 
         // Top row 200 (<= split): source row 100, scrolled by start.
         assert_eq!(
-            vga.render_modex_row(200),
+            vga.render_256color_row(200),
             reference(start, 200),
             "top region renders scrolled by start_address"
         );
         // First split scanline (split + 1): source row 0 from offset 0.
         assert_eq!(
-            vga.render_modex_row(split + 1),
+            vga.render_256color_row(split + 1),
             reference(0, 0),
             "first split line renders source row 0 from offset 0"
         );
         // Deeper split scanline: (counter_line - (split + 1)) / 2 = 10, so source
         // row 10 from offset 0 matches the reference's source row 10 (row 20 / 2).
         assert_eq!(
-            vga.render_modex_row(split + 21),
+            vga.render_256color_row(split + 21),
             reference(0, 20),
             "split region row 10 renders source row 10 from offset 0"
         );
@@ -2072,13 +2141,13 @@ mod tests {
         vga.crtc.line_compare = split;
         // The matching scanline is the last top line: reads start_address (clear).
         assert_eq!(
-            vga.render_modex_row(split)[0],
+            vga.render_256color_row(split)[0],
             0,
             "scanline == line_compare is still the top region"
         );
         // The next scanline is the first split line: reads offset 0 (marked).
         assert_eq!(
-            vga.render_modex_row(split + 1)[0],
+            vga.render_256color_row(split + 1)[0],
             0xFF,
             "scanline line_compare + 1 is the first split line, from offset 0"
         );
@@ -2113,19 +2182,19 @@ mod tests {
         vga.crtc.start_address = 0x4000; // top region reads cleared VRAM
         vga.crtc.line_compare = split;
         assert_eq!(
-            vga.render_modex_row(400)[0],
+            vga.render_256color_row(400)[0],
             0,
             "scanline 400 == line_compare is the last top line"
         );
         // Scanlines 401 and 402 are the first two split scanlines: the same doubled
         // source row 0, read from offset 0.
         assert_eq!(
-            vga.render_modex_row(401)[0],
+            vga.render_256color_row(401)[0],
             0xFF,
             "first split scanline, offset 0"
         );
         assert_eq!(
-            vga.render_modex_row(402)[0],
+            vga.render_256color_row(402)[0],
             0xFF,
             "second scanline holds the same doubled source row 0"
         );
