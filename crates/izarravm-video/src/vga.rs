@@ -702,6 +702,7 @@ impl Vga {
         // col` and reads the char/attr byte pair at that cell index * 2. The byte
         // read wraps at the 32 KB text aperture (FreeVGA 0Dh wrap behavior). See
         // A1 in dev_docs/reference/vga/text-mode-gaps-confirm-notes.md.
+        let below_split = counter_line > self.crtc.line_compare;
         let (start, first_line) = self.split_origin(counter_line);
         // split_origin returns first_line <= counter_line in both branches, so the
         // subtraction never underflows.
@@ -713,6 +714,15 @@ impl Vga {
         } else {
             9
         };
+        // AC 13h Horizontal Pixel Panning shifts the display left by `pan` pels
+        // (FreeVGA attrreg.htm 13h). A non-zero pan reveals the right portion of
+        // each cell and pulls in the leading pixels of the cell after the last
+        // visible column; the leftmost `pan` pels of cell 0 scroll off the left
+        // edge. Range 0..char_width (0-8 for 9-dot, 0-7 for 8-dot); routed through
+        // the shared pel_pan so AC 10h bit 5 forces it to 0 below the line-compare
+        // split (FreeVGA crtcreg.htm 18h). See A2 in
+        // dev_docs/reference/vga/text-mode-gaps-confirm-notes.md.
+        let pan = self.pel_pan(below_split).min(char_width - 1);
         let blink_enabled = self.attr.mode_control & 0x08 != 0;
         // The blink hide phase divides the completed-frame count by 16 and hides
         // the foreground on odd windows. A first model; the exact ~16 Hz cadence
@@ -721,9 +731,12 @@ impl Vga {
         let start_cells = start as usize;
         let row_cells = self.crtc.offset as usize; // cells per character row
         let mut row = vec![0u8; width];
-        for col in 0..VGA_TEXT_COLUMNS {
+        // Render one extra cell column so a non-zero pan's right edge pulls in the
+        // next cell's leading pixels; the left edge clips cell 0's scrolled-off
+        // leading pixels.
+        for dc in 0..=VGA_TEXT_COLUMNS {
             // Absolute cell index (char/attr pair) scrolled by the start address.
-            let cell_index = start_cells + char_row * row_cells + col;
+            let cell_index = start_cells + char_row * row_cells + dc;
             // Each cell is two bytes (char then attr); wrap at the aperture.
             let base = (cell_index * 2) % VGA_TEXT_MEMORY_SIZE;
             let char_byte = self.text_memory.get(base).copied().unwrap_or(b' ');
@@ -765,11 +778,14 @@ impl Vga {
             let glyph_row =
                 self.font[self.active_font_table()][char_byte as usize * 32 + font_line.min(31)];
             let extend_ninth = (0xC0..=0xDF).contains(&char_byte);
-            let base_x = col * char_width as usize;
-            for px in 0..char_width as usize {
-                let x = base_x + px;
-                if x >= width {
-                    break;
+            // Place the cell shifted left by `pan` pels. Use signed math so cell 0's
+            // leading `pan` pels (which scroll off the left edge) clip to negative
+            // positions instead of underflowing usize.
+            let cell_origin = dc as isize * char_width as isize;
+            for px in 0..char_width {
+                let x = cell_origin + px as isize - pan as isize;
+                if x < 0 || x as usize >= width {
+                    continue;
                 }
                 let lit = if px < 8 {
                     (glyph_row >> (7 - px)) & 1 != 0
@@ -777,7 +793,7 @@ impl Vga {
                     // 9th column: replicate the 8th (bit 0) for box glyphs.
                     extend_ninth && (glyph_row & 0x01 != 0)
                 };
-                row[x] = if lit && !hide_fg { fg } else { bg };
+                row[x as usize] = if lit && !hide_fg { fg } else { bg };
             }
         }
         row
@@ -3167,6 +3183,86 @@ mod tests {
             vga.frame().cells.len(),
             VGA_TEXT_COLUMNS * VGA_TEXT_ROWS,
             "frame reports exactly one visible 80x25 page"
+        );
+    }
+
+    #[test]
+    fn text_pel_pan_shifts_the_column_origin() {
+        // AC 13h (pixel panning) shifts the whole text row left by `pan` pels.
+        // With 0xDB (solid box) in cell 0 and blanks after, a pan of 1 moves the
+        // lit/blank boundary one pel left: output[8] goes from cell 0's 9th column
+        // (lit) to cell 1's first pel (blank).
+        let mut vga = Vga::default();
+        text_put(&mut vga, 0, 0, 0xDB, 0x0F); // cell 0: solid, 9 lit pels
+        vga.attr.pixel_pan = 0;
+        assert_eq!(
+            vga.render_text_row(0)[8],
+            15,
+            "pan=0: cell 0's 9th column is lit at output[8]"
+        );
+        vga.attr.pixel_pan = 1;
+        let row = vga.render_text_row(0);
+        assert_eq!(
+            row[0], 15,
+            "pan=1: cell 0 still leads the row (its pel 1 now at output[0])"
+        );
+        assert_eq!(
+            row[8], 0,
+            "pan=1: the column origin shifted left by one pel, so output[8] reads cell 1's blank"
+        );
+    }
+
+    #[test]
+    fn text_pel_pan_below_split_forces_zero_when_enabled() {
+        // AC 10h bit 5 ("pixel panning mode") forces pel-pan to 0 below the line
+        // compare split (FreeVGA crtcreg.htm 18h), so the bottom region is not
+        // panned even when 13h is non-zero. Above the split the pan applies.
+        let mut vga = Vga::default();
+        text_put(&mut vga, 0, 0, 0xDB, 0x0F);
+        vga.attr.pixel_pan = 1;
+        vga.attr.mode_control |= 0x20; // bit 5: force pan to 0 below the split
+        vga.crtc.line_compare = 7; // split after char row 0 (scanlines 0..7 above)
+        // Above the split: pan=1 shifts, so output[8] is cell 1's blank (0).
+        assert_eq!(
+            vga.render_text_row(0)[8],
+            0,
+            "above the split the pel-pan applies"
+        );
+        // Below the split (origin reloads to 0, char row 0): pan forced to 0, so
+        // cell 0's 9th column is lit at output[8].
+        assert_eq!(
+            vga.render_text_row(8)[8],
+            15,
+            "below the split AC 10h bit 5 forces pel-pan to 0"
+        );
+    }
+
+    #[test]
+    fn text_pel_pan_9dot_replicates_the_shifted_box_glyph() {
+        // A 9-dot box glyph's 9th column replicates the 8th; when panned, that
+        // replicate must shift with the cell. Compare a box glyph (0xDB) against a
+        // non-box glyph with the same 8 solid pels: at pan=1 the shifted 9th
+        // column lands at output[7], lit for the box (replicate) and a gap (0) for
+        // the non-box.
+        let mut vga = Vga::default();
+        text_put(&mut vga, 0, 0, 0xDB, 0x0F); // box glyph: 8 solid pels + replicated 9th
+        vga.attr.pixel_pan = 1;
+        assert_eq!(
+            vga.render_text_row(0)[7],
+            15,
+            "0xDB's replicated 9th column shifts into output[7] and stays lit"
+        );
+        // Replace cell 0 with a non-box glyph that is solid in pels 0..7 (0xFF) but
+        // outside the 0xC0-0xDF box range, so its 9th column is the background.
+        // Char 0x01's font slot starts at byte 0x01 * 32 = 32.
+        for row in 0..16usize {
+            vga.font[0][32 + row] = 0xFF;
+        }
+        text_put(&mut vga, 0, 0, 0x01, 0x0F);
+        assert_eq!(
+            vga.render_text_row(0)[7],
+            0,
+            "non-box glyph's shifted 9th column is a gap, not a replicate"
         );
     }
 }
