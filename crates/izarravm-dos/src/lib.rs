@@ -543,18 +543,25 @@ impl DosKernel {
         }
     }
 
-    /// Build the child environment block. env_source 0 -> an empty environment
-    /// (a single terminating NUL). Non-zero -> copy the source block's string
-    /// region (ASCIIZ strings up to the terminating empty string), capped at
-    /// 32 KiB; no terminator within the cap -> Err(0x0A). Only the string region
-    /// is copied, not the optional count + program-name suffix (marked).
+    /// Build the child environment block. env_source 0 -> inherit the caller's
+    /// environment: copy the string region of the block named by the current
+    /// PSP's 0x2C (RBIL INT 21/AH=4Bh EPB word 0: 0 = copy the calling
+    /// process's environment); a caller with no env (0x2C == 0) yields an empty
+    /// block (a single terminating NUL). Non-zero -> copy that source block's
+    /// string region (ASCIIZ strings up to the terminating empty string), capped
+    /// at 32 KiB; no terminator within the cap -> Err(0x0A). Only the string
+    /// region is copied, not the optional count + program-name suffix (marked).
     fn child_environment(
         &self,
         mem: &Memory,
-        env_source: u16,
+        mut env_source: u16,
     ) -> Result<Result<Vec<u8>, u16>, DosError> {
         if env_source == 0 {
-            return Ok(Ok(vec![0x00]));
+            // Inherit: the env block of the current (during EXEC: parent) PSP.
+            env_source = mem.read_u16(usize::from(self.arena.psp_seg) * 16 + 0x2c)?;
+            if env_source == 0 {
+                return Ok(Ok(vec![0x00]));
+            }
         }
         let base = usize::from(env_source) * 16;
         let mut out = Vec::new();
@@ -3664,6 +3671,28 @@ mod tests {
         for (i, &b) in b"A=1\0B=2\0\0".iter().enumerate() {
             assert_eq!(mem.read_u8(0x0200 * 16 + i).unwrap(), b);
         }
+    }
+
+    #[test]
+    fn ah4b_al0_inherits_the_parent_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CHILD.COM"), [0xcdu8, 0x20]).unwrap();
+        let (mut kernel, mut mem) = exec_kernel(dir.path());
+        // Seed the parent's environment exactly as new_dos_program does, so the
+        // parent PSP:0x2C names a BLASTER block the child must inherit.
+        kernel
+            .install_environment(&mut mem, &[("BLASTER", "A220 I5 D1 H5 T6")])
+            .unwrap();
+        place_exec_inputs(&mut mem, "C:\\CHILD.COM", 0); // env_source 0 = inherit
+        let _ = exec_al0(&mut kernel, &mut mem);
+        // EXEC switched in the child; its PSP:0x2C names the inherited env block.
+        let child_env = mem
+            .read_u16(usize::from(kernel.arena.psp_seg) * 16 + 0x2c)
+            .unwrap();
+        assert_eq!(
+            parse_env_block(&mem, child_env),
+            vec![("BLASTER".to_string(), "A220 I5 D1 H5 T6".to_string())]
+        );
     }
 
     #[test]
