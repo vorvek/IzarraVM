@@ -1,4 +1,3 @@
-use izarravm_core::VideoCard;
 use thiserror::Error;
 
 pub mod font;
@@ -490,41 +489,6 @@ impl TextFrame {
     }
 }
 
-pub trait VideoAdapter {
-    fn card(&self) -> VideoCard;
-    fn framebuffer(&self) -> &Framebuffer;
-    fn set_mode13h(&mut self);
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlaceholderVideoAdapter {
-    card: VideoCard,
-    framebuffer: Framebuffer,
-}
-
-impl PlaceholderVideoAdapter {
-    pub fn new(card: VideoCard) -> Self {
-        Self {
-            card,
-            framebuffer: Framebuffer::mode13h(),
-        }
-    }
-}
-
-impl VideoAdapter for PlaceholderVideoAdapter {
-    fn card(&self) -> VideoCard {
-        self.card
-    }
-
-    fn framebuffer(&self) -> &Framebuffer {
-        &self.framebuffer
-    }
-
-    fn set_mode13h(&mut self) {
-        self.framebuffer = Framebuffer::mode13h();
-    }
-}
-
 pub fn preferred_wgpu_backends() -> wgpu::Backends {
     wgpu::Backends::all()
 }
@@ -539,13 +503,6 @@ mod tests {
         assert_eq!(framebuffer.width, 320);
         assert_eq!(framebuffer.height, 200);
         assert_eq!(framebuffer.indexed_pixels.len(), MODE13H_MEMORY_SIZE);
-    }
-
-    #[test]
-    fn placeholder_adapter_tracks_selected_card() {
-        let adapter = PlaceholderVideoAdapter::new(VideoCard::Et4000Ax);
-        assert_eq!(adapter.card(), VideoCard::Et4000Ax);
-        assert_eq!(adapter.framebuffer().indexed_pixels.len(), 64_000);
     }
 
     #[test]
