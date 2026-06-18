@@ -598,6 +598,16 @@ impl Vga {
         drawn
     }
 
+    /// Byte offset of the char/attr pair for a displayed cell at `(char_row, col)`
+    /// relative to the start-address origin `start_cells` (word/cell units), wrapped
+    /// at the 32 KB text aperture. Mode 03h is word mode, so the cell index is
+    /// `start_cells + char_row*offset + col` and the byte pair sits at that index
+    /// times two. Shared by the pixel scanout (`render_text_row`) and the headless
+    /// cell view (`frame`) so the two always agree on the origin.
+    fn text_cell_base(&self, start_cells: usize, char_row: usize, col: usize) -> usize {
+        ((start_cells + char_row * self.crtc.offset as usize + col) * 2) % VGA_TEXT_MEMORY_SIZE
+    }
+
     /// Display-address origin for one scanline, honoring the CRTC Line Compare
     /// split (Abrash, Graphics Programming Black Book ch.30). Returns
     /// `(start_base, first_line)`: above the split the start address scrolls the
@@ -619,11 +629,20 @@ impl Vga {
     /// forced to 0 when bit 5 is set. Returns the raw 13h value masked to 0-15;
     /// the mode-X caller masks further to 0-3.
     fn pel_pan(&self, below_split: bool) -> usize {
-        if below_split && (self.attr.mode_control & 0x20 != 0) {
+        if self.pan_resets_below_split(below_split) {
             0
         } else {
             (self.attr.pixel_pan & 0x0F) as usize
         }
+    }
+
+    /// Whether the horizontal pan (AC 13h pel-pan and CRTC 08h byte pan) is forced
+    /// to 0 below the CRTC Line Compare split: only when AC Mode Control 10h bit 5
+    /// is set (FreeVGA crtcreg.htm 18h). Shared by `pel_pan` and the byte-pan
+    /// computation so the two horizontal pans obey the same rule. The CRTC 08h
+    /// preset-row-scan reset below the split is unconditional and stays separate.
+    fn pan_resets_below_split(&self, below_split: bool) -> bool {
+        below_split && (self.attr.mode_control & 0x20 != 0)
     }
 
     /// Assemble one active scanline into `hdisp_end` DAC indices, applying pel-pan
@@ -744,7 +763,7 @@ impl Vga {
         } else {
             u32::from(reg & 0x1F)
         };
-        let byte_pan = if below_split && self.attr.mode_control & 0x20 != 0 {
+        let byte_pan = if self.pan_resets_below_split(below_split) {
             0
         } else {
             ((reg >> 5) & 0x03) as usize
@@ -775,7 +794,21 @@ impl Vga {
         // dev_docs/reference/vga/text-mode-gaps-confirm-notes.md.
         let blink_hide_phase = self.blink_hide_phase();
         let start_cells = start as usize;
-        let row_cells = self.crtc.offset as usize; // cells per character row
+        // The active font tables and the 512-glyph flag depend only on the
+        // Sequencer Character Map Select, which is constant for the whole
+        // scanline, so decode them once outside the per-cell loop.
+        let table_a = self.active_font_table();
+        let table_b = self.active_font_table_b();
+        let dual_font = table_a != table_b;
+        // Cursor Skew (CRTC 0Bh bits 6-5) delays the onset by that many character
+        // clocks; the effective cursor cell is cursor_offset + skew. The cursor
+        // match target is loop-invariant, so compute it once per scanline.
+        let skew = (self.cursor_end >> 5) & 0x03;
+        let cursor_byte =
+            ((self.cursor_offset as usize + skew as usize) * 2) % VGA_TEXT_MEMORY_SIZE;
+        let cursor_disabled = self.cursor_start & 0x20 != 0;
+        let start_line = (self.cursor_start & 0x1F) as usize;
+        let end_line = (self.cursor_end & 0x1F) as usize;
         let mut row = vec![0u8; width];
         // Render one extra cell column so a non-zero pan's right edge pulls in the
         // next cell's leading pixels; the left edge clips cell 0's scrolled-off
@@ -785,8 +818,8 @@ impl Vga {
             // the CRTC byte pan (08h bits 6-5) adds a byte offset to the origin,
             // so a pan of 2 shifts one whole cell and a pan of 1 lands on the
             // attribute byte (the real-hardware half-cell scramble).
-            let cell_index = start_cells + char_row * row_cells + dc;
-            let base = (cell_index * 2 + byte_pan) % VGA_TEXT_MEMORY_SIZE;
+            let base =
+                (self.text_cell_base(start_cells, char_row, dc) + byte_pan) % VGA_TEXT_MEMORY_SIZE;
             let char_byte = self.text_memory.get(base).copied().unwrap_or(b' ');
             let attr = self.text_memory.get(base + 1).copied().unwrap_or(0x07);
             let blink_attr = attr & 0x80 != 0;
@@ -794,9 +827,6 @@ impl Vga {
             // (map A != map B), attribute bit 3 becomes the per-cell font selector
             // and is no longer foreground intensity, so the foreground is masked to
             // 8 colors. See A4 in dev_docs/reference/vga/text-mode-gaps-confirm-notes.md.
-            let table_a = self.active_font_table();
-            let table_b = self.active_font_table_b();
-            let dual_font = table_a != table_b;
             let font_select = (attr >> 3) & 1 != 0;
             let font_table = if dual_font && font_select {
                 table_b
@@ -827,13 +857,10 @@ impl Vga {
             // bits 6-5) delays the onset by that many character clocks, so the
             // effective cursor cell is cursor_offset + skew (FreeVGA crtcreg.htm
             // 0Bh; IBM VGA, not the clone "skew 3 = off" variant). See A5 in
-            // dev_docs/reference/vga/text-mode-gaps-confirm-notes.md.
-            let skew = (self.cursor_end >> 5) & 0x03;
-            let cursor_byte = (self.cursor_offset as usize + skew as usize) * 2;
-            let cursor_here = base == cursor_byte % VGA_TEXT_MEMORY_SIZE;
-            let cursor_disabled = self.cursor_start & 0x20 != 0;
-            let start_line = (self.cursor_start & 0x1F) as usize;
-            let end_line = (self.cursor_end & 0x1F) as usize;
+            // dev_docs/reference/vga/text-mode-gaps-confirm-notes.md. The skew,
+            // cursor byte, disable bit, and scanline range are decoded once per
+            // scanline above the loop.
+            let cursor_here = base == cursor_byte;
             let in_range = if start_line <= end_line {
                 font_line >= start_line && font_line <= end_line
             } else {
@@ -1447,11 +1474,10 @@ impl Vga {
         // index for (row, col) is start + row*offset + col, and the char/attr
         // byte pair sits at that cell index * 2, wrapped at the 32 KB aperture.
         let start_cells = self.crtc.start_address as usize;
-        let row_cells = self.crtc.offset as usize;
         let mut cells = Vec::with_capacity(VGA_TEXT_COLUMNS * VGA_TEXT_ROWS);
         for row in 0..VGA_TEXT_ROWS {
             for col in 0..VGA_TEXT_COLUMNS {
-                let base = ((start_cells + row * row_cells + col) * 2) % VGA_TEXT_MEMORY_SIZE;
+                let base = self.text_cell_base(start_cells, row, col);
                 cells.push(TextCell {
                     character: self.text_memory.get(base).copied().unwrap_or(b' '),
                     attribute: self.text_memory.get(base + 1).copied().unwrap_or(0x07),
@@ -1468,24 +1494,28 @@ impl Vga {
     }
 }
 
-/// Decode the Sequencer Character Map Select map-A field (bits 0, 1, 4) to a
-/// font table index 0..7. Shared by the active-table read and the block-specifier
-/// load so a loaded font and its display selector always agree.
-fn char_map_a_decode(spec: u8) -> usize {
-    (spec & 0x01) as usize
-        | (((spec >> 1) & 0x01) as usize) << 1
-        | (((spec >> 4) & 0x01) as usize) << 2
+/// Decode a three-bit Sequencer Character Map Select field out of `spec` at bit
+/// positions `b0`, `b1`, `b2` to a font table index 0..7. Map A gathers bits
+/// 0/1/4 and map B gathers bits 2/3/5; the two must stay exact shape-mirrors, so
+/// the gather lives in one place. Shared by the active-table read and the
+/// block-specifier load so a loaded font and its display selector always agree.
+fn char_map_decode(spec: u8, b0: u32, b1: u32, b2: u32) -> usize {
+    ((spec >> b0) & 0x01) as usize
+        | (((spec >> b1) & 0x01) as usize) << 1
+        | (((spec >> b2) & 0x01) as usize) << 2
 }
 
-/// Decode the Sequencer Character Map Select map-B field (bits 2, 3, 5) to a
-/// font table index 0..7, the mirror of `char_map_a_decode` for the second
-/// character set. Per cell, attribute bit 3 selects map B (set) or map A
-/// (clear) in 512-glyph mode. See A4 in
+/// Map-A font table (Sequencer Character Map Select bits 0, 1, 4).
+fn char_map_a_decode(spec: u8) -> usize {
+    char_map_decode(spec, 0, 1, 4)
+}
+
+/// Map-B font table (Sequencer Character Map Select bits 2, 3, 5), the mirror of
+/// `char_map_a_decode` for the second character set. Per cell, attribute bit 3
+/// selects map B (set) or map A (clear) in 512-glyph mode. See A4 in
 /// dev_docs/reference/vga/text-mode-gaps-confirm-notes.md.
 fn char_map_b_decode(spec: u8) -> usize {
-    ((spec >> 2) & 0x01) as usize
-        | (((spec >> 3) & 0x01) as usize) << 1
-        | (((spec >> 5) & 0x01) as usize) << 2
+    char_map_decode(spec, 2, 3, 5)
 }
 
 #[derive(Debug, Clone, Copy, Default)]

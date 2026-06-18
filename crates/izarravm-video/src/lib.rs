@@ -23,8 +23,6 @@ pub const VGA_TEXT_BASE: u32 = 0x000b_8000;
 pub const VGA_TEXT_COLUMNS: usize = 80;
 pub const VGA_TEXT_ROWS: usize = 25;
 pub const VGA_TEXT_CELL_BYTES: usize = 2;
-/// The host-visible size of one 80x25 text page (char/attr pairs).
-pub const VGA_TEXT_PAGE_SIZE: usize = VGA_TEXT_COLUMNS * VGA_TEXT_ROWS * VGA_TEXT_CELL_BYTES;
 /// The INT 10h AH=05h page stride for 80x25 color text: 4096 bytes (0x1000).
 /// This is the BIOS page step (eight pages fill the 32 KB aperture), slightly
 /// larger than the 4000-byte visible page so consecutive pages do not overlap
