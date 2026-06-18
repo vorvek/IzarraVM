@@ -245,7 +245,7 @@ pub struct Sequencer {
 }
 
 /// Attribute Controller register block (3C0/3C1).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct Attribute {
     pub palette: [u8; 16],    // idx 0..15
     pub mode_control: u8,     // idx 0x10
@@ -255,6 +255,24 @@ pub struct Attribute {
     pub color_select: u8,     // idx 0x14
     pub flip_flop_data: bool, // false = next 3C0 write is an index
     pub index: u8,
+}
+
+impl Default for Attribute {
+    fn default() -> Self {
+        // Real VGA powers up with ATC palette register N = N, so a 4-bit plane
+        // index maps straight to DAC N (vgabios video_param_table actl_regs). The
+        // remaining registers reset to zero, as the BIOS mode-set programs them.
+        Self {
+            palette: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            mode_control: 0,
+            overscan: 0,
+            plane_enable: 0,
+            pixel_pan: 0,
+            color_select: 0,
+            flip_flop_data: false,
+            index: 0,
+        }
+    }
 }
 
 /// The pixel-perfect raster the host pulls. Square pixels, no aspect correction.
@@ -1489,6 +1507,17 @@ mod tests {
         vga.write_port(0x3C0, 0x13); // pixel pan index
         vga.write_port(0x3C0, 0x02); // value
         assert_eq!(vga.attr.pixel_pan, 0x02);
+    }
+
+    #[test]
+    fn default_attr_palette_is_identity() {
+        // Real VGA powers up with ATC palette register N = N, so a 4-bit plane
+        // index maps straight to DAC N.
+        let attr = Attribute::default();
+        assert_eq!(
+            attr.palette,
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        );
     }
 
     #[test]
