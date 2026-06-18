@@ -1,6 +1,7 @@
 use izarravm_core::VideoCard;
 use thiserror::Error;
 
+pub mod font;
 pub mod margo;
 pub mod vga;
 pub use vga::{VGA_PLANAR_SIZE, Vga, VgaRaster};

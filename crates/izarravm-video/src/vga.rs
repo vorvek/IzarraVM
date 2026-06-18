@@ -240,8 +240,9 @@ impl CrtcRegs {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Sequencer {
-    pub map_mask: u8,    // idx 2, low 4 bits
-    pub memory_mode: u8, // idx 4
+    pub clocking_mode: u8, // idx 1 (bit 0 set = 8-dot chars; clear = 9-dot)
+    pub map_mask: u8,      // idx 2, low 4 bits
+    pub memory_mode: u8,   // idx 4
 }
 
 /// Attribute Controller register block (3C0/3C1).
@@ -857,6 +858,7 @@ impl Vga {
 
     fn write_seq(&mut self, index: u8, value: u8) {
         match index {
+            0x01 => self.seq.clocking_mode = value,
             0x02 => self.seq.map_mask = value & 0x0F,
             0x04 => {
                 self.seq.memory_mode = value;
