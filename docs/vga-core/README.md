@@ -23,7 +23,7 @@ it. What is in:
 | Area | Covered in slice 1 |
 |------|--------------------|
 | Mode | `0Dh` (320×200×16 planar), set via `set_mode_0dh` / `INT 10h AH=00h` analog |
-| Legacy | Text mode, mode `13h` (chained 256-color, now routed through the same raster engine as the planar and mode-X paths), the 256-entry DAC, the text cursor — folded in from the former `VgaTextMode` |
+| Legacy | Text mode (now a `VgaRaster` through the raster engine, slice 9; `frame()` / `TextFrame` stay as the headless cell view), mode `13h` (chained 256-color, routed through the same raster engine as the planar and mode-X paths), the 256-entry DAC, the text cursor — folded in from the former `VgaTextMode` |
 | Planar memory | Four-plane model, write modes 0–3, read modes 0–1, latches, data-rotate/ALU, Map Mask, Bit Mask, Set/Reset |
 | Sequencer (`3C4/3C5`) | Map Mask (2), Memory Mode (4); Clocking Mode (1) char-width feeds the dot count |
 | Graphics Ctrl (`3CE/3CF`) | Set/Reset (0), Enable Set/Reset (1), Color Compare (2), Data Rotate/Function (3), Read Map (4), Mode (5), Color Don't Care (7), Bit Mask (8) |
@@ -369,6 +369,73 @@ Divergences (fidelity directive):
 3. **Pel-pan values 4-7 fold into a start-address bump** and are masked out
    (`& 0x03`); they are beyond-useful, not a distinct behavior.
 
+## Slice 9 coverage — text-mode scanout and the loadable character generator
+
+Slice 9 routes text mode through the same beam-coupled raster engine as the
+graphics modes, with a built-in CP437 character generator, and makes the font
+store writable through the Sequencer Character Map Select and the `INT 10h AH=11h`
+font services. Text now presents a `VgaRaster` (the GUI no longer rasterizes the
+cells itself); `frame()` / `TextFrame` / `screen_text()` remain as the cell view
+for the headless ASCII dump.
+
+| Area | Covered in slice 9 |
+|------|--------------------|
+| Character generator | The three ROM glyph fonts (8x8, 8x14, 8x16) byte-for-byte from the LGPL VGABios `vgafonts.h`; the 8x16 table is the mode-03h default |
+| Sequencer Clocking Mode (1) | Bit 0 selects 8-dot vs 9-dot text; the renderer derives the effective character width |
+| Text scanout | `render_text_row`: 80 columns of `max_scan + 1` scanlines each (16 for 720x400 mode 03h), the CRTC Line Compare split via the shared `split_origin`, foreground/background nibbles mapped through the 16-entry Attribute palette to DAC indices with the pel mask applied |
+| 9-dot geometry | The 9th pixel column replicates the 8th for the box-drawing glyphs 0xC0-0xDF (a solid line join) and is the background otherwise |
+| Attribute decode | AC Mode Control 10h bit 3 toggles blink (attribute bit 7 = blink, 8 backgrounds) vs background intensity (bit 7 = intensity, 16 backgrounds); blink collapses the foreground to the background on its hide phase |
+| Writable font store | Eight 256-glyph tables (32 bytes per slot) seeded from the ROM 8x16 font; the renderer reads the active table |
+| Sequencer Character Map Select (3) | Map A (bits 0, 1, 4) selects the active table for 256-glyph text |
+| `INT 10h AH=11h` | AL=00/10 user font (ES:BP), AL=01/11 ROM 8x14, AL=02/12 ROM 8x8, AL=04/14 ROM 8x16, AL=03 set block specifier; the 1x variants reprogram the CRTC character height |
+| Presentation | Text mode presents a `VgaRaster` (`ActiveDisplay::VgaRaster`); `frame()` / `TextFrame` stay for the headless cell view |
+
+The semantics are pinned to the IBM VGA character generator and Abrash's
+Graphics Programming Black Book (the 9-dot replicate rule, the Character Map
+Select decode), RBIL `PORTS.B` (AC Mode Control 10h bit 3, the blink/background-
+intensity toggle), and RBIL `INT 10h AH=11h` (register conventions verified
+against the LGPL VGABios `biosfn_load_text_*`).
+
+The done-signals are equality, proven at unit
+(`font::tests::cp437_rom_glyphs_match_the_reference`,
+`vga::tests::text_scanout_renders_cp437_glyph_rows_at_9x16`,
+`vga::tests::text_scanout_maps_attribute_through_the_palette_to_dac`,
+`vga::tests::text_scanout_blink_toggles_foreground_only_when_enabled`,
+`vga::tests::text_scanout_presents_a_720x400_raster`,
+`vga::tests::font_store_is_writable_per_table`,
+`vga::tests::sequencer_char_map_select_picks_the_active_font`) and end-to-end
+(`text_mode_scanout_through_the_machine`, `int10_11h_loads_user_font`,
+`int10_11h_loads_rom_8x16`) levels.
+
+Target, honesty note: text mode covers a large class of titles (text adventures,
+roguelikes, BBS door games, shareware menus, boot/setup screens). The CP437
+glyph data, the 9-dot geometry, the attribute/blink decode, and the font-store
+and AH=11h behavior are verified directly against the code paths above; no
+released-source title was inspected.
+
+Divergences (fidelity directive):
+
+1. **`AH=11h AL=30` (get font info) and `AL=20-24` (graphics-mode text) are
+   deferred.** AL=30 returns a far pointer to the active font; the graphics-mode
+   text services render text in graphics modes. Both are separable follow-ups.
+2. **The hardware text cursor glyph is not rendered.** Slice 10 stores the cursor
+   shape and location; rendering the cursor block is a follow-up, so there is no
+   on-screen cursor until then (the cell `frame()` cursor offset stays for
+   headless use).
+3. **The exact blink cadence is not modeled.** Blink hides the foreground on a
+   frame-count divisor (a first model); the hardware ~16 Hz cadence is a timing
+   refinement.
+4. **Text-mode pel-pan (AC 13h) and start-address horizontal smooth scroll are
+   not applied** to text, mirroring how the chained-13h pel-pan was once
+   deferred.
+5. **CRTC 08h preset-row-scan (byte panning / sub-row scroll) is not modeled**
+   anywhere in the core, unchanged from slices 4/7/8.
+6. **512-character / dual-font mode is deferred.** This slice selects a single
+   active font table (the 256-glyph case); the two-map interleaving for 512
+   glyphs rides with the graphics-mode-text follow-up. The Tier-2/3 graphics
+   register gaps (16-color Color Select 14h, guest vertical timing, odd/even
+   addressing) stay parked in the backlog spec; none blocks a standard title.
+
 ## Slice 10 coverage — default palettes, BIOS video services, and ports
 
 Slice 10 loads the stock default palettes, adds the host-locked (HLE) `INT 10h`
@@ -424,6 +491,8 @@ vertical blank). Each row is colored by the CRTC region it falls in:
 
 - **Active** (`counter_line < Vertical Display End`): the 4-bit planar index per
   pixel, pel-pan-shifted, mapped through the Attribute palette to a DAC index.
+  (Text mode emits the foreground/background DAC index per pixel the same way;
+  see "Slice 9 coverage.")
 - **Border** (`[Vertical Display End, Start Vertical Blank)` and `[End Vertical
   Blank, Vertical Total)`): the Overscan color (this is the border-flash region).
 - **Blank** (`[Start Vertical Blank, End Vertical Blank)`): black.
