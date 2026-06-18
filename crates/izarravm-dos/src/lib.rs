@@ -27,6 +27,8 @@ pub enum DosError {
     ExeRelocationOutOfRange,
     #[error("not enough memory to load the MZ image ({needed} paragraphs, {available} available)")]
     ExeNotEnoughMemory { needed: u32, available: u32 },
+    #[error("not enough conventional memory for the environment segment")]
+    EnvSegmentFull,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -422,6 +424,48 @@ impl DosKernel {
         self.program_stack.clear();
         self.last_exit_code = 0;
         self.last_exit_type = 0;
+    }
+
+    /// Allocate the DOS environment segment, write the env block in the real DOS
+    /// format, and record its segment in `PSP:0x2C`. Each entry becomes an ASCIIZ
+    /// `KEY=VALUE` string; the block ends with the empty-string terminator. The
+    /// segment is allocated in whole paragraphs above the program block via the
+    /// arena, so it sits where real DOS places it and a guest `AH=49h`/`AH=4Ah`
+    /// around it behaves as on real hardware. The machine calls this from
+    /// `new_dos_program` after `init_program`. With no entries a valid (empty)
+    /// environment is still allocated so `PSP:0x2C` is always a live pointer.
+    pub fn install_environment(
+        &mut self,
+        mem: &mut Memory,
+        entries: &[(&str, &str)],
+    ) -> Result<(), DosError> {
+        let block = build_env_block(entries);
+        let paras = u16::try_from(block.len().div_ceil(16)).unwrap_or(u16::MAX);
+        let psp_base = usize::from(self.arena.psp_seg) * 16;
+        // The program block may have claimed all of conventional memory (an .EXE
+        // with a large e_maxalloc sets PSP:0x02 = ARENA_TOP). Carve env room out
+        // of the top of the program block, mirroring real DOS, which sizes the
+        // program block AFTER reserving the environment; PSP:0x02 tracks the
+        // reduced top. For a .COM (PSP:0x02 = segment + 0x1000) there is already
+        // ample room above the program, so no shrink happens.
+        let limit = ARENA_TOP.saturating_sub(paras);
+        if self.arena.prog_top > limit {
+            self.arena.prog_top = limit;
+            if self.arena.blocks.is_empty() {
+                self.arena.free_base = limit;
+            }
+            mem.write_u16(psp_base + 0x02, limit)?;
+        }
+        let env_seg = self
+            .arena
+            .allocate(paras)
+            .map_err(|_| DosError::EnvSegmentFull)?;
+        let env_base = usize::from(env_seg) * 16;
+        for (offset, &byte) in block.iter().enumerate() {
+            mem.write_u8(env_base + offset, byte)?;
+        }
+        mem.write_u16(psp_base + 0x2c, env_seg)?;
+        Ok(())
     }
 
     /// Resolve the ASCIIZ filename at ds:dx to a host path. Ok(Ok(path)) on
@@ -1298,8 +1342,9 @@ pub struct ProgramEntry {
 
 /// Build the 256-byte PSP at psp_seg:0. INT 20h (CD 20) at offset 0 so a near
 /// RET to PSP:0 terminates; the top-of-memory paragraph at 0x02; an empty
-/// command tail at 0x80. The environment segment, parent PSP, default FCBs, and
-/// the DTA are left zero (later slices).
+/// command tail at 0x80. The environment segment (0x2C) is filled in by
+/// `DosKernel::install_environment`; the parent PSP, default FCBs, and the DTA
+/// are left zero (later slices).
 fn build_psp(mem: &mut Memory, psp_seg: u16, top_of_mem_paragraph: u16) -> Result<(), DosError> {
     let base = usize::from(psp_seg) * 16;
     mem.write_u8(base, 0xcd)?;
@@ -1308,6 +1353,25 @@ fn build_psp(mem: &mut Memory, psp_seg: u16, top_of_mem_paragraph: u16) -> Resul
     mem.write_u8(base + 0x80, 0x00)?;
     mem.write_u8(base + 0x81, 0x0d)?;
     Ok(())
+}
+
+/// Format a DOS environment block: a sequence of ASCIIZ `KEY=VALUE` strings
+/// followed by an extra NUL (the empty string that terminates the list). Keys
+/// are stored verbatim, so callers pass uppercase DOS-style keys. With no
+/// entries the block is a single NUL, a valid empty environment. Real DOS then
+/// appends a `0x0001` word and an ASCIIZ argv0 (the program path); that trailer
+/// follows the terminator and is invisible to env scanners, so it is omitted
+/// here (the loader does not track the guest program path today).
+fn build_env_block(entries: &[(&str, &str)]) -> Vec<u8> {
+    let mut block = Vec::new();
+    for (key, value) in entries {
+        block.extend_from_slice(key.as_bytes());
+        block.push(b'=');
+        block.extend_from_slice(value.as_bytes());
+        block.push(0);
+    }
+    block.push(0); // the terminating empty string
+    block
 }
 
 /// Load a .COM image into `mem` at `segment` and build its PSP. Returns the entry
@@ -3733,5 +3797,184 @@ mod tests {
             DosAction::Exec { child_ax, .. } => assert_eq!(child_ax, 0xffff),
             other => panic!("expected Exec, got {other:?}"),
         }
+    }
+
+    // --- environment-segment seeding ---
+
+    #[test]
+    fn build_env_block_formats_entries_as_asciiz_key_value() {
+        // One entry: "FOO=bar" + its NUL, then the empty-string terminator NUL.
+        assert_eq!(build_env_block(&[("FOO", "bar")]), b"FOO=bar\0\0");
+        // Two entries chain, each NUL-terminated, then the terminator.
+        assert_eq!(
+            build_env_block(&[("A", "1"), ("B", "two")]),
+            b"A=1\0B=two\0\0"
+        );
+    }
+
+    #[test]
+    fn build_env_block_with_no_entries_is_just_the_terminator() {
+        // A valid empty environment is a single NUL (the terminating empty string).
+        assert_eq!(build_env_block(&[]), b"\0");
+    }
+
+    /// Walk a written env block back into (KEY, VALUE) pairs, mirroring what a
+    /// DOS game does when it scans the segment named by PSP:0x2C.
+    fn parse_env_block(mem: &Memory, seg: u16) -> Vec<(String, String)> {
+        let base = usize::from(seg) * 16;
+        let mut entries = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let mut bytes = Vec::new();
+            loop {
+                let byte = mem.read_u8(base + offset).unwrap();
+                offset += 1;
+                if byte == 0 {
+                    break;
+                }
+                bytes.push(byte);
+            }
+            if bytes.is_empty() {
+                break; // the terminating empty string
+            }
+            let entry = String::from_utf8(bytes).unwrap();
+            let (key, value) = entry.split_once('=').expect("KEY=VALUE");
+            entries.push((key.to_string(), value.to_string()));
+        }
+        entries
+    }
+
+    /// Build a PSP at 0x0100, seed the arena, and return (kernel, prog_top). The
+    /// loader sets PSP:0x02 to segment + 0x1000 = 0x1100; the install tests build
+    /// on that realistic prog_top.
+    fn env_kernel() -> (DosKernel, Memory, u16) {
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        load_com(&[0xb8, 0x00, 0x4c, 0xcd, 0x21], &mut mem, 0x0100).unwrap();
+        let prog_top = mem.read_u16(0x0100 * 16 + 2).unwrap();
+        let mut kernel = DosKernel::new();
+        kernel.init_program(0x0100, prog_top);
+        (kernel, mem, prog_top)
+    }
+
+    #[test]
+    fn install_environment_seeds_psp_env_pointer_and_parses_back() {
+        let (mut kernel, mut mem, prog_top) = env_kernel();
+        kernel
+            .install_environment(&mut mem, &[("BLASTER", "A220 I5 D1 H5 T6")])
+            .unwrap();
+
+        // PSP:0x2C names the env segment, which sits directly above the program.
+        let env_seg = mem.read_u16(0x0100 * 16 + 0x2c).unwrap();
+        assert_eq!(env_seg, prog_top);
+        // The block at env_seg:0 scans back to the single BLASTER entry.
+        assert_eq!(
+            parse_env_block(&mem, env_seg),
+            vec![("BLASTER".to_string(), "A220 I5 D1 H5 T6".to_string())]
+        );
+    }
+
+    #[test]
+    fn install_environment_advances_the_arena_above_the_block() {
+        let (mut kernel, mut mem, prog_top) = env_kernel();
+        kernel
+            .install_environment(&mut mem, &[("BLASTER", "A220 I5 D1 H5 T6")])
+            .unwrap();
+        // The next AH=48h allocation must land above the env block, proving the
+        // arena's free base advanced by the rounded-up paragraph count.
+        let env_paras = u16::try_from(
+            build_env_block(&[("BLASTER", "A220 I5 D1 H5 T6")])
+                .len()
+                .div_ceil(16),
+        )
+        .unwrap();
+        let mut regs = DosRegs {
+            ax: 0x4800,
+            bx: 0x0001,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf);
+        assert_eq!(regs.ax, prog_top + env_paras);
+    }
+
+    #[test]
+    fn install_environment_leaves_the_psp_load_fields_intact() {
+        let (mut kernel, mut mem, prog_top) = env_kernel();
+        let psp = 0x0100usize * 16;
+        // Snapshot the fields load_com built, then install the env.
+        assert_eq!(mem.read_u8(psp).unwrap(), 0xcd); // INT 20h at PSP:0
+        assert_eq!(mem.read_u8(psp + 1).unwrap(), 0x20);
+        assert_eq!(mem.read_u8(psp + 0x80).unwrap(), 0x00); // empty command tail
+        assert_eq!(mem.read_u8(psp + 0x81).unwrap(), 0x0d);
+        kernel
+            .install_environment(&mut mem, &[("BLASTER", "A220 I5 D1 H5 T6")])
+            .unwrap();
+        // The install writes only PSP:0x2C; the loader's fields are untouched.
+        assert_eq!(mem.read_u8(psp).unwrap(), 0xcd);
+        assert_eq!(mem.read_u8(psp + 1).unwrap(), 0x20);
+        assert_eq!(mem.read_u16(psp + 2).unwrap(), prog_top); // top-of-memory
+        assert_eq!(mem.read_u8(psp + 0x80).unwrap(), 0x00);
+        assert_eq!(mem.read_u8(psp + 0x81).unwrap(), 0x0d);
+        assert_eq!(mem.read_u16(psp + 0x2c).unwrap(), prog_top); // env seg
+    }
+
+    #[test]
+    fn install_environment_with_no_entries_still_allocates_a_segment() {
+        // An empty env (sound disabled) is still a valid block: PSP:0x2C names a
+        // readable segment whose first byte is the terminator NUL.
+        let (mut kernel, mut mem, prog_top) = env_kernel();
+        kernel.install_environment(&mut mem, &[]).unwrap();
+        let env_seg = mem.read_u16(0x0100 * 16 + 0x2c).unwrap();
+        assert_eq!(env_seg, prog_top);
+        assert_eq!(mem.read_u8(usize::from(env_seg) * 16).unwrap(), 0);
+        assert!(parse_env_block(&mem, env_seg).is_empty());
+    }
+
+    #[test]
+    fn ah49_frees_the_seeded_environment_segment() {
+        let (mut kernel, mut mem, _prog_top) = env_kernel();
+        kernel
+            .install_environment(&mut mem, &[("BLASTER", "A220 I5 D1 H5 T6")])
+            .unwrap();
+        let env_seg = mem.read_u16(0x0100 * 16 + 0x2c).unwrap();
+        // AH=49h on the env segment frees it (the arena treats it as a normal block).
+        let mut regs = DosRegs {
+            ax: 0x4900,
+            es: env_seg,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf);
+    }
+
+    #[test]
+    fn install_environment_carves_room_from_a_maxed_program_block() {
+        // An .EXE whose e_maxalloc claims all of conventional memory leaves
+        // PSP:0x02 at ARENA_TOP. The env must still be carved out of the program
+        // block, and PSP:0x02 reduced to match — real DOS sizes the program block
+        // after reserving the environment.
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        build_psp(&mut mem, 0x0100, ARENA_TOP).unwrap();
+        let mut kernel = DosKernel::new();
+        kernel.init_program(0x0100, ARENA_TOP);
+        kernel
+            .install_environment(&mut mem, &[("BLASTER", "A220 I5 D1 H5 T6")])
+            .unwrap();
+        let paras = u16::try_from(
+            build_env_block(&[("BLASTER", "A220 I5 D1 H5 T6")])
+                .len()
+                .div_ceil(16),
+        )
+        .unwrap();
+        let psp = 0x0100usize * 16;
+        // PSP:0x02 is reduced by the env paragraphs ...
+        assert_eq!(mem.read_u16(psp + 2).unwrap(), ARENA_TOP - paras);
+        // ... and PSP:0x2C names the env segment carved from the top.
+        let env_seg = mem.read_u16(psp + 0x2c).unwrap();
+        assert_eq!(env_seg, ARENA_TOP - paras);
+        assert_eq!(
+            parse_env_block(&mem, env_seg),
+            vec![("BLASTER".to_string(), "A220 I5 D1 H5 T6".to_string())]
+        );
     }
 }
