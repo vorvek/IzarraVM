@@ -4719,6 +4719,32 @@ mod tests {
         0x56, 0x2e, 0x42, 0x49, 0x4e, 0x00, 0x00, 0x00, 0x00, 0x00,
     ];
 
+    // envparent.asm: EXEC C:\CHILD.COM with env_source=0 (inherit) and exit 0 on
+    // success (on EXEC failure print '!' and exit 1). The EPB env word is 0, so the
+    // child inherits the parent's environment instead of receiving an empty one.
+    //   mov dx,name; mov bx,epb; mov ax,0x4b00; int 0x21; jc fail
+    //   mov ax,0x4c00; int 0x21
+    //   fail: mov dl,'!'; mov ah,0x02; int 0x21; mov ax,0x4c01; int 0x21
+    //   name: db "C:\CHILD.COM",0
+    //   epb: dw 0,0,0,0,0,0,0
+    const ENV_PARENT_COM: &[u8] = &[
+        0xba, 0x1d, 0x01, 0xbb, 0x2a, 0x01, 0xb8, 0x00, 0x4b, 0xcd, 0x21, 0x72, 0x05, 0xb8, 0x00,
+        0x4c, 0xcd, 0x21, 0xb2, 0x21, 0xb4, 0x02, 0xcd, 0x21, 0xb8, 0x01, 0x4c, 0xcd, 0x21, 0x43,
+        0x3a, 0x5c, 0x43, 0x48, 0x49, 0x4c, 0x44, 0x2e, 0x43, 0x4f, 0x4d, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    // envchild.asm: read the env segment from PSP:0x2C (DS=PSP), point DS at the
+    // inherited env block, AH=40h-write the first 24 bytes (exactly
+    // "BLASTER=A220 I5 D1 H5 T6"), exit 0. Identical bytes to the top-level
+    // BLASTER reader, but reached via EXEC so it observes only the inherited env.
+    //   mov ax,[0x2c]; mov ds,ax; xor dx,dx; mov cx,24; mov bx,1
+    //   mov ah,0x40; int 0x21; mov ax,0x4c00; int 0x21
+    const ENV_CHILD_COM: &[u8] = &[
+        0x8b, 0x06, 0x2c, 0x00, 0x8e, 0xd8, 0x31, 0xd2, 0xb9, 0x18, 0x00, 0xbb, 0x01, 0x00, 0xb4,
+        0x40, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21,
+    ];
+
     #[test]
     fn dos_program_execs_a_child_and_reads_its_return_code() {
         let dir = tempfile::tempdir().unwrap();
@@ -4925,5 +4951,24 @@ mod tests {
                 ("SETSOUND".to_string(), "A220 I7 D3 H5 T6".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn dos_child_inherits_the_parent_blaster_environment() {
+        // The parent is loaded via new_dos_program, so it has a seeded BLASTER env.
+        // It EXECs a child with env_source=0 (inherit). The child reads its own
+        // PSP:0x2C, points DS at the inherited env, and writes the first entry,
+        // proving BLASTER propagated through EXEC to the child process.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CHILD.COM"), ENV_CHILD_COM).unwrap();
+        let mut machine = Machine::new_dos_program(
+            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            ENV_PARENT_COM,
+        )
+        .unwrap();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        let reason = machine.run_until_halt_or_cycles(2_000_000).unwrap();
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
+        assert_eq!(machine.dos_output(), b"BLASTER=A220 I5 D1 H5 T6");
     }
 }
