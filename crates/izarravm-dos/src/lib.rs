@@ -1044,17 +1044,22 @@ pub fn load_com(image: &[u8], mem: &mut Memory, segment: u16) -> Result<ProgramE
     })
 }
 
-/// Load a DOS MZ/.EXE into `mem`: parse the 0x1C-byte header, copy the load
-/// module to start_seg:0 (start_seg = psp_segment + 0x10), apply each relocation
-/// (add start_seg to the flagged word), build the PSP, and return the entry
-/// state (CS:IP and SS:SP from the header, DS=ES=PSP). Conventional memory is
-/// one block ending at paragraph 0xA000; e_minalloc is enforced and e_maxalloc
-/// clamps the PSP top-of-memory word.
-pub fn load_exe(
-    image: &[u8],
-    mem: &mut Memory,
-    psp_segment: u16,
-) -> Result<ProgramEntry, DosError> {
+/// A parsed MZ/.EXE image: the entry fields and the load-module slice plus the
+/// raw relocation table. Validates the signature, the page/last-page sizes, and
+/// that the module and the relocation table fit the image; rejects the same
+/// malformations load_exe checked inline.
+struct ParsedExe<'a> {
+    e_ss: u16,
+    e_sp: u16,
+    e_ip: u16,
+    e_cs: u16,
+    e_minalloc: u16,
+    e_maxalloc: u16,
+    module: &'a [u8],
+    relocs: &'a [u8],
+}
+
+fn parse_exe(image: &[u8]) -> Result<ParsedExe<'_>, DosError> {
     if image.len() < 0x1c {
         return Err(DosError::ExeImageTruncated(
             "header shorter than 0x1C bytes",
@@ -1100,57 +1105,92 @@ pub fn load_exe(
         ));
     }
     let module = &image[header_bytes..image_size];
-    let module_len = module.len();
-    let module_paras = module_len.div_ceil(16) as u32;
-
-    let start_seg = psp_segment.wrapping_add(0x10);
-    let needed = u32::from(start_seg) + module_paras + u32::from(e_minalloc);
-    if needed > CONVENTIONAL_TOP_PARAGRAPH {
-        return Err(DosError::ExeNotEnoughMemory {
-            needed,
-            available: CONVENTIONAL_TOP_PARAGRAPH,
-        });
-    }
-
-    // Top of the program's block: honor e_maxalloc, clamp to conventional memory.
-    let top_paragraph = (u32::from(start_seg) + module_paras + u32::from(e_maxalloc))
-        .min(CONVENTIONAL_TOP_PARAGRAPH) as u16;
-    build_psp(mem, psp_segment, top_paragraph)?;
-
-    // Copy the load module to start_seg:0.
-    let base = usize::from(start_seg) * 16;
-    for (index, &byte) in module.iter().enumerate() {
-        mem.write_u8(base + index, byte)?;
-    }
-
-    // Apply relocations: each (off, seg) names a word at module offset
-    // seg*16+off; add start_seg so the segment reference points at the real load
-    // address. Out-of-range relocations are rejected rather than
-    // applied blindly as real DOS would (avoids corrupting arbitrary memory).
     let reloc_end = usize::from(e_lfarlc) + usize::from(e_crlc) * 4;
     if reloc_end > image.len() {
         return Err(DosError::ExeImageTruncated(
             "relocation table extends past the file",
         ));
     }
-    for i in 0..usize::from(e_crlc) {
-        let entry = usize::from(e_lfarlc) + i * 4;
-        let off = u16::from_le_bytes([image[entry], image[entry + 1]]);
-        let seg = u16::from_le_bytes([image[entry + 2], image[entry + 3]]);
+    let relocs = &image[usize::from(e_lfarlc)..reloc_end];
+    Ok(ParsedExe {
+        e_ss,
+        e_sp,
+        e_ip,
+        e_cs,
+        e_minalloc,
+        e_maxalloc,
+        module,
+        relocs,
+    })
+}
+
+/// Walk `relocs` (4-byte little-endian (offset, segment) entries) and apply each
+/// to the module loaded at linear `base`: read the word at `base + seg*16 + off`,
+/// add `addend`, write it back. `addend` is the load segment for an EXE and the
+/// caller's relocation factor for an overlay. ponytail: out-of-range relocations
+/// are rejected rather than applied blindly as real DOS would, to avoid
+/// corrupting arbitrary memory.
+fn apply_relocs(
+    mem: &mut Memory,
+    base: usize,
+    module_len: usize,
+    relocs: &[u8],
+    addend: u16,
+) -> Result<(), DosError> {
+    for entry in relocs.chunks_exact(4) {
+        let off = u16::from_le_bytes([entry[0], entry[1]]);
+        let seg = u16::from_le_bytes([entry[2], entry[3]]);
         let module_offset = usize::from(seg) * 16 + usize::from(off);
         if module_offset + 2 > module_len {
             return Err(DosError::ExeRelocationOutOfRange);
         }
         let target = base + module_offset;
         let value = mem.read_u16(target)?;
-        mem.write_u16(target, value.wrapping_add(start_seg))?;
+        mem.write_u16(target, value.wrapping_add(addend))?;
     }
+    Ok(())
+}
+
+/// Load a DOS MZ/.EXE into `mem`: parse the 0x1C-byte header, copy the load
+/// module to start_seg:0 (start_seg = psp_segment + 0x10), apply each relocation
+/// (add start_seg to the flagged word), build the PSP, and return the entry
+/// state (CS:IP and SS:SP from the header, DS=ES=PSP). Conventional memory is
+/// one block ending at paragraph 0xA000; e_minalloc is enforced and e_maxalloc
+/// clamps the PSP top-of-memory word.
+pub fn load_exe(
+    image: &[u8],
+    mem: &mut Memory,
+    psp_segment: u16,
+) -> Result<ProgramEntry, DosError> {
+    let exe = parse_exe(image)?;
+    let module_len = exe.module.len();
+    let module_paras = module_len.div_ceil(16) as u32;
+
+    let start_seg = psp_segment.wrapping_add(0x10);
+    let needed = u32::from(start_seg) + module_paras + u32::from(exe.e_minalloc);
+    if needed > CONVENTIONAL_TOP_PARAGRAPH {
+        return Err(DosError::ExeNotEnoughMemory {
+            needed,
+            available: CONVENTIONAL_TOP_PARAGRAPH,
+        });
+    }
+    // Top of the program's block: honor e_maxalloc, clamp to conventional memory.
+    let top_paragraph = (u32::from(start_seg) + module_paras + u32::from(exe.e_maxalloc))
+        .min(CONVENTIONAL_TOP_PARAGRAPH) as u16;
+    build_psp(mem, psp_segment, top_paragraph)?;
+
+    // Copy the load module to start_seg:0.
+    let base = usize::from(start_seg) * 16;
+    for (index, &byte) in exe.module.iter().enumerate() {
+        mem.write_u8(base + index, byte)?;
+    }
+    apply_relocs(mem, base, module_len, exe.relocs, start_seg)?;
 
     Ok(ProgramEntry {
-        cs: start_seg.wrapping_add(e_cs),
-        ip: e_ip,
-        ss: start_seg.wrapping_add(e_ss),
-        sp: e_sp,
+        cs: start_seg.wrapping_add(exe.e_cs),
+        ip: exe.e_ip,
+        ss: start_seg.wrapping_add(exe.e_ss),
+        sp: exe.e_sp,
         ds: psp_segment,
         es: psp_segment,
     })
