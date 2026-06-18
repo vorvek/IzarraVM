@@ -139,7 +139,11 @@ pub struct Machine {
     profile: MachineProfile,
     cpu: Cpu386,
     memory: Memory,
-    video: Vga,
+    // Boxed: Vga is ~99 KB. Inline, the Machine value (and its Result wrapper)
+    // got copied through the constructors enough times in debug builds to
+    // overflow the main-thread stack before the binary did any work. On the heap
+    // it costs one pointer and the copies stay cheap.
+    video: Box<Vga>,
     margo: Margo,
     margo_active: bool,
     pending_soft_int: Option<u8>, // software-INT vector awaiting deferred dispatch
@@ -213,7 +217,7 @@ impl Machine {
             memory: Memory::from_mib(profile.memory_mib)?,
             profile,
             cpu: Cpu386::default(),
-            video: Vga::default(),
+            video: Box::new(Vga::default()),
             margo: Margo::default(),
             margo_active: false,
             pending_soft_int: None,
@@ -266,7 +270,7 @@ impl Machine {
             memory: Memory::from_mib(profile.memory_mib)?,
             profile,
             cpu: boot_sector_cpu(),
-            video: Vga::default(),
+            video: Box::new(Vga::default()),
             margo: Margo::default(),
             margo_active: false,
             pending_soft_int: None,
@@ -338,7 +342,7 @@ impl Machine {
             memory: Memory::from_mib(profile.memory_mib)?,
             profile,
             cpu: Cpu386::default(),
-            video: Vga::default(),
+            video: Box::new(Vga::default()),
             margo: Margo::default(),
             margo_active: false,
             pending_soft_int: None,

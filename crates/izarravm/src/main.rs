@@ -97,74 +97,21 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
+    // Each headless mode that builds a Machine runs in its own function. A Machine
+    // is a large value (CPU, VGA, Margo, audio chips inline); keeping all three
+    // branches inline gave main a ~1.2 MB stack frame that overflowed on the
+    // prologue, before clap could even print --help/--version. One Machine per
+    // frame keeps every path well under the thread stack limit.
     if cli.headless_boot_suite {
-        let mut machine = Machine::new_boot_image(
-            MachineProfile::from_hardware_profile(&hardware),
-            boot_test_image(),
-        )?;
-        let stop_reason = machine.run_until_halt_or_cycles(5_000_000)?;
-        // Report the result block, which holds the runtime outcome (the timer test
-        // patches its record here). The serial dump is an earlier static snapshot.
-        let results = parse_result_block(machine.memory().as_slice())?;
-        for record in &results.records {
-            let status = match record.status {
-                SuiteRecordStatus::Begin => "BEGIN",
-                SuiteRecordStatus::Pass => "PASS",
-                SuiteRecordStatus::Fail => "FAIL",
-                SuiteRecordStatus::Measure => "MEASURE",
-            };
-            match &record.value {
-                Some(value) => println!("{status} {} {value}", record.name),
-                None => println!("{status} {}", record.name),
-            }
-        }
-        println!("records: {}", results.records.len());
-        println!("stop: {stop_reason:?}");
-        return Ok(());
+        return run_boot_suite(&hardware);
     }
 
     if let Some(path) = &cli.headless_run {
-        // Compute the exit code in an inner scope so the machine and the loaded
-        // image drop before process::exit (which does not unwind). The DOS exit
-        // code becomes the process status so a .COM result is scriptable.
-        let code = {
-            let image = std::fs::read(path)?;
-            let mut machine =
-                Machine::new_dos_program(MachineProfile::from_hardware_profile(&hardware), &image)?;
-            // Mount the configured C: drive so INT 21h file calls resolve.
-            machine.mount_c_drive(dos.c_drive.clone());
-            if let Some(text) = &cli.stdin_text {
-                machine.set_dos_stdin(text.as_bytes());
-            }
-            let stop_reason = machine.run_until_halt_or_cycles(50_000_000)?;
-            print!("{}", String::from_utf8_lossy(machine.dos_output()));
-            println!("stop: {stop_reason:?}");
-            match stop_reason {
-                StopReason::DosExit { code } => i32::from(code),
-                _ => 1,
-            }
-        };
-        std::process::exit(code);
+        return run_headless_program(path, &hardware, &dos, cli.stdin_text.as_deref());
     }
 
     if cli.headless_test_rom {
-        let rom = select_rom(cli.bios.as_deref())?;
-        let mut machine = Machine::new(MachineProfile::from_hardware_profile(&hardware), &rom)?;
-        let budget = cli.cycles.unwrap_or(DEFAULT_TEST_ROM_CYCLES);
-        let stop_reason = machine.run_until_halt_or_cycles(budget)?;
-        let screen = machine.screen_text();
-        let screen_text = screen.as_text();
-        info!(
-            ?stop_reason,
-            clocks = machine.elapsed_clocks(),
-            bus_cycles = machine.bus_trace().cycles().len(),
-            first_line = %screen.line_string(0),
-            "test ROM completed"
-        );
-        println!("{screen_text}");
-        println!("post: {:#04x}", machine.io_port(0x80).unwrap_or(0));
-        println!("stop: {stop_reason:?}");
-        return Ok(());
+        return run_test_rom(cli.bios.as_deref(), cli.cycles, &hardware);
     }
 
     let rom = select_rom(cli.bios.as_deref())?;
@@ -176,6 +123,88 @@ fn main() -> Result<(), Box<dyn Error>> {
         audio_enabled,
         cli.margo_test_pattern,
     )?;
+    Ok(())
+}
+
+/// Run the clean-room boot suite and print its result block.
+fn run_boot_suite(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
+    let mut machine = Machine::new_boot_image(
+        MachineProfile::from_hardware_profile(hardware),
+        boot_test_image(),
+    )?;
+    let stop_reason = machine.run_until_halt_or_cycles(5_000_000)?;
+    // Report the result block, which holds the runtime outcome (the timer test
+    // patches its record here). The serial dump is an earlier static snapshot.
+    let results = parse_result_block(machine.memory().as_slice())?;
+    for record in &results.records {
+        let status = match record.status {
+            SuiteRecordStatus::Begin => "BEGIN",
+            SuiteRecordStatus::Pass => "PASS",
+            SuiteRecordStatus::Fail => "FAIL",
+            SuiteRecordStatus::Measure => "MEASURE",
+        };
+        match &record.value {
+            Some(value) => println!("{status} {} {value}", record.name),
+            None => println!("{status} {}", record.name),
+        }
+    }
+    println!("records: {}", results.records.len());
+    println!("stop: {stop_reason:?}");
+    Ok(())
+}
+
+/// Load and run a DOS .COM/.EXE headless, then exit with its DOS exit code.
+fn run_headless_program(
+    path: &Path,
+    hardware: &HardwareProfile,
+    dos: &DosKernelServices,
+    stdin_text: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    // Compute the exit code in an inner scope so the machine and the loaded
+    // image drop before process::exit (which does not unwind). The DOS exit
+    // code becomes the process status so a .COM result is scriptable.
+    let code = {
+        let image = std::fs::read(path)?;
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::from_hardware_profile(hardware), &image)?;
+        // Mount the configured C: drive so INT 21h file calls resolve.
+        machine.mount_c_drive(dos.c_drive.clone());
+        if let Some(text) = stdin_text {
+            machine.set_dos_stdin(text.as_bytes());
+        }
+        let stop_reason = machine.run_until_halt_or_cycles(50_000_000)?;
+        print!("{}", String::from_utf8_lossy(machine.dos_output()));
+        println!("stop: {stop_reason:?}");
+        match stop_reason {
+            StopReason::DosExit { code } => i32::from(code),
+            _ => 1,
+        }
+    };
+    std::process::exit(code);
+}
+
+/// Boot a BIOS/test ROM headless and print the screen text plus POST code.
+fn run_test_rom(
+    bios: Option<&Path>,
+    cycles: Option<u64>,
+    hardware: &HardwareProfile,
+) -> Result<(), Box<dyn Error>> {
+    let rom = select_rom(bios)?;
+    let mut machine = Machine::new(MachineProfile::from_hardware_profile(hardware), &rom)?;
+    let budget = cycles.unwrap_or(DEFAULT_TEST_ROM_CYCLES);
+    let stop_reason = machine.run_until_halt_or_cycles(budget)?;
+    let screen = machine.screen_text();
+    let screen_text = screen.as_text();
+    info!(
+        ?stop_reason,
+        clocks = machine.elapsed_clocks(),
+        bus_cycles = machine.bus_trace().cycles().len(),
+        first_line = %screen.line_string(0),
+        "test ROM completed"
+    );
+    println!("{screen_text}");
+    println!("post: {:#04x}", machine.io_port(0x80).unwrap_or(0));
+    println!("stop: {stop_reason:?}");
     Ok(())
 }
 
