@@ -123,6 +123,14 @@ pub struct DosRegs {
 pub enum DosAction {
     Continue, // results are in DosRegs; the IRET stub returns to the caller
     Exit(u8), // terminate the program with this code
+    /// AH=4Bh AL=0: switch the CPU to the child. The kernel has saved the parent
+    /// context and built the child PSP/environment; the machine snapshots the
+    /// parent CPU, applies `entry`, and sets the child AX to `child_ax` (FCB
+    /// drive-validity AL/AH per RBIL). The child runs until it exits.
+    Exec {
+        entry: ProgramEntry,
+        child_ax: u16,
+    },
 }
 
 /// Conventional memory modeled as one block ending at paragraph 0xA000. The
@@ -322,6 +330,17 @@ struct FindSearch {
     next: usize,
 }
 
+/// Saved per-program DOS state, pushed when a child is EXECed (AL=0) and
+/// restored when the child exits. open_files is NOT saved; parent and child
+/// share one handle table (real DOS refcounts handles 0-4 into the child's JFT,
+/// neither of which we model, marked).
+#[derive(Debug)]
+struct ProgramContext {
+    arena: Arena,
+    dta: (u16, u16),
+    find_searches: HashMap<(u16, u16), FindSearch>,
+}
+
 /// The stateful DOS kernel. Owns the host-side state that must survive between
 /// INT 21h calls: the open-file handle table and the mounted C: drive, plus the
 /// standard input and output buffers (high-level emulated, HLE). The machine
@@ -337,6 +356,10 @@ pub struct DosKernel {
     arena: Arena,
     dta: (u16, u16),
     find_searches: HashMap<(u16, u16), FindSearch>,
+    // Parent program frames for nested EXEC (AL=0); restored on child exit.
+    program_stack: Vec<ProgramContext>,
+    last_exit_code: u8, // AH=4Dh AL; cleared after it is read
+    last_exit_type: u8, // AH=4Dh AH; always 0x00 (normal termination), marked
 }
 
 impl DosKernel {
@@ -396,6 +419,9 @@ impl DosKernel {
         };
         self.dta = (psp_seg, 0x80);
         self.find_searches.clear();
+        self.program_stack.clear();
+        self.last_exit_code = 0;
+        self.last_exit_type = 0;
     }
 
     /// Resolve the ASCIIZ filename at ds:dx to a host path. Ok(Ok(path)) on
@@ -471,6 +497,184 @@ impl DosKernel {
                 Ok(DosAction::Continue)
             }
         }
+    }
+
+    /// Build the child environment block. env_source 0 -> an empty environment
+    /// (a single terminating NUL). Non-zero -> copy the source block's string
+    /// region (ASCIIZ strings up to the terminating empty string), capped at
+    /// 32 KiB; no terminator within the cap -> Err(0x0A). Only the string region
+    /// is copied, not the optional count + program-name suffix (marked).
+    fn child_environment(
+        &self,
+        mem: &Memory,
+        env_source: u16,
+    ) -> Result<Result<Vec<u8>, u16>, DosError> {
+        if env_source == 0 {
+            return Ok(Ok(vec![0x00]));
+        }
+        let base = usize::from(env_source) * 16;
+        let mut out = Vec::new();
+        let cap = 32_768usize;
+        loop {
+            // Read one ASCIIZ string; its source position is out.len() (the next
+            // unread byte), which advances as bytes are pushed.
+            let string_start = out.len();
+            loop {
+                if out.len() >= cap {
+                    return Ok(Err(0x0a));
+                }
+                let b = mem.read_u8(base + out.len())?;
+                out.push(b);
+                if b == 0 {
+                    break;
+                }
+            }
+            if out.len() - string_start == 1 {
+                break; // just the lone terminating NUL ends the block
+            }
+        }
+        Ok(Ok(out))
+    }
+
+    /// Write the child command tail at PSP offset 0x80 from the EPB command-tail
+    /// pointer (a length byte followed by chars). A null (0:0) pointer writes an
+    /// empty tail (length 0, a 0x0D terminator).
+    fn write_command_tail(
+        &self,
+        mem: &mut Memory,
+        psp: usize,
+        seg: u16,
+        off: u16,
+    ) -> Result<(), DosError> {
+        let count = if seg == 0 && off == 0 {
+            0u8
+        } else {
+            let base = usize::from(seg) * 16 + usize::from(off);
+            mem.read_u8(base)?.min(127)
+        };
+        mem.write_u8(psp + 0x80, count)?;
+        if seg != 0 || off != 0 {
+            let base = usize::from(seg) * 16 + usize::from(off);
+            for i in 0..usize::from(count) {
+                mem.write_u8(psp + 0x81 + i, mem.read_u8(base + 1 + i)?)?;
+            }
+        }
+        mem.write_u8(psp + 0x81 + usize::from(count), 0x0d)?;
+        Ok(())
+    }
+
+    /// AH=4Bh AL=0: load and execute. Reads the name and EPB #01590 at ES:BX,
+    /// builds the child environment and PSP, loads the image, saves the parent
+    /// context, switches to the child context, and returns Exec. Errors set
+    /// CF/AX and return Continue (no child runs).
+    fn exec_load_and_execute(
+        &mut self,
+        mem: &mut Memory,
+        regs: &mut DosRegs,
+    ) -> Result<DosAction, DosError> {
+        let image = match self.read_program_image(mem, regs)? {
+            Ok(image) => image,
+            Err(code) => {
+                set_dos_error(regs, code);
+                return Ok(DosAction::Continue);
+            }
+        };
+        // EPB #01590: env word (0x00), command-tail far ptr (0x02), FCB1 (0x06),
+        // FCB2 (0x0A).
+        let epb_base = usize::from(regs.es) * 16 + usize::from(regs.bx);
+        let env_source = mem.read_u16(epb_base)?;
+        let cmdtail_off = mem.read_u16(epb_base + 2)?;
+        let cmdtail_seg = mem.read_u16(epb_base + 4)?;
+        let fcb1_off = mem.read_u16(epb_base + 6)?;
+        let fcb1_seg = mem.read_u16(epb_base + 8)?;
+        let fcb2_off = mem.read_u16(epb_base + 0x0a)?;
+        let fcb2_seg = mem.read_u16(epb_base + 0x0c)?;
+
+        let env_bytes = match self.child_environment(mem, env_source)? {
+            Ok(bytes) => bytes,
+            Err(code) => {
+                set_dos_error(regs, code);
+                return Ok(DosAction::Continue);
+            }
+        };
+        let env_paras = (env_bytes.len() as u16).div_ceil(16).max(1);
+        let env_seg = self.arena.free_base;
+        let child_psp = match env_seg.checked_add(env_paras) {
+            Some(s) if s < ARENA_TOP => s,
+            _ => {
+                set_dos_error(regs, 0x0a);
+                return Ok(DosAction::Continue);
+            }
+        };
+        let env_linear = usize::from(env_seg) * 16;
+        for (i, &byte) in env_bytes.iter().enumerate() {
+            mem.write_u8(env_linear + i, byte)?;
+        }
+
+        let parent_psp = self.arena.psp_seg;
+        let entry = match load_program(&image, mem, child_psp) {
+            Ok(entry) => entry,
+            Err(DosError::ExeNotEnoughMemory { .. }) => {
+                set_dos_error(regs, 0x08);
+                return Ok(DosAction::Continue);
+            }
+            Err(DosError::Memory(e)) => return Err(DosError::Memory(e)),
+            Err(_) => {
+                set_dos_error(regs, 0x0b);
+                return Ok(DosAction::Continue);
+            }
+        };
+
+        // Patch the child PSP.
+        let psp = usize::from(child_psp) * 16;
+        mem.write_u16(psp + 0x02, ARENA_TOP)?; // child owns to the top (DOS default)
+        mem.write_u16(psp + 0x16, parent_psp)?; // parent PSP link
+        mem.write_u16(psp + 0x2c, env_seg)?; // environment segment
+        self.write_command_tail(mem, psp, cmdtail_seg, cmdtail_off)?;
+        // Default JFT at 0x18: stdin/stdout/stderr open, the rest closed.
+        for off in 0x18u16..0x2cu16 {
+            mem.write_u8(psp + usize::from(off), 0)?;
+        }
+        mem.write_u8(psp + 0x18, 0x01)?;
+        mem.write_u8(psp + 0x19, 0x01)?;
+        mem.write_u8(psp + 0x1a, 0x01)?;
+        let fcb1_drive = copy_fcb(mem, psp + 0x5c, fcb1_seg, fcb1_off)?;
+        let fcb2_drive = copy_fcb(mem, psp + 0x6c, fcb2_seg, fcb2_off)?;
+        let child_ax = (u16::from(fcb_drive_validity(fcb2_drive)) << 8)
+            | u16::from(fcb_drive_validity(fcb1_drive));
+
+        // Save the parent context, then switch to the child.
+        let parent = ProgramContext {
+            arena: std::mem::take(&mut self.arena),
+            dta: self.dta,
+            find_searches: std::mem::take(&mut self.find_searches),
+        };
+        self.program_stack.push(parent);
+        self.arena = Arena {
+            psp_seg: child_psp,
+            prog_top: ARENA_TOP,
+            free_base: ARENA_TOP,
+            blocks: Vec::new(),
+        };
+        self.dta = (child_psp, 0x80);
+        // A fresh child has terminated no child of its own.
+        self.last_exit_code = 0;
+        self.last_exit_type = 0;
+
+        Ok(DosAction::Exec { entry, child_ax })
+    }
+
+    /// Restore the parent program's DOS state after a child exits with `code`,
+    /// and record the exit code/type for AH=4Dh. Called by the machine when it
+    /// pops a parent frame.
+    pub fn finish_exec(&mut self, code: u8) {
+        if let Some(parent) = self.program_stack.pop() {
+            self.arena = parent.arena;
+            self.dta = parent.dta;
+            self.find_searches = parent.find_searches;
+        }
+        self.last_exit_code = code;
+        self.last_exit_type = 0x00; // only normal termination is modeled (marked).
     }
 
     /// Split a FindFirst filespec into (host directory, final-component pattern).
@@ -1026,17 +1230,28 @@ impl DosKernel {
                 regs.cf = false;
                 Ok(DosAction::Continue)
             }
-            // AH=4Bh: EXEC. AL=3 (load overlay) is handled here; AL=0 (load and
-            // execute) is a later task in this slice. AL=1 (load without execute)
-            // and AL=4 (background) are not implemented and return 0x01 (invalid
-            // function), marked.
+            // AH=4Bh: EXEC. AL=0 (load and execute) and AL=3 (load overlay) are
+            // handled; AL=1 (load without execute) and AL=4 (background) are not
+            // implemented and return 0x01 (invalid function), marked.
             0x4b => match regs.ax as u8 {
+                0x00 => self.exec_load_and_execute(mem, regs),
                 0x03 => self.exec_load_overlay(mem, regs),
                 _ => {
                     set_dos_error(regs, 0x01);
                     Ok(DosAction::Continue)
                 }
             },
+            // AH=4Dh: get the return code of the last child. AL=code, AH=type
+            // (always 0x00 normal; Ctrl-C/critical/TSR are not modeled, marked).
+            // CF is always clear; the stored code is cleared after the read
+            // (one-shot, per RBIL).
+            0x4d => {
+                regs.ax = (u16::from(self.last_exit_type) << 8) | u16::from(self.last_exit_code);
+                self.last_exit_code = 0;
+                self.last_exit_type = 0;
+                regs.cf = false;
+                Ok(DosAction::Continue)
+            }
             // Other file functions (find) and everything else are not yet
             // implemented; later slices fill them in. An unimplemented function
             // returns Continue so the IRET stub returns to the caller.
@@ -1473,6 +1688,38 @@ fn write_find_record(mem: &mut Memory, dta: (u16, u16), entry: &FindEntry) -> Re
         mem.write_u8(base + 0x1e + i, name.get(i).copied().unwrap_or(0))?;
     }
     Ok(())
+}
+
+/// Copy 16 bytes for an FCB from (seg:off) into the child PSP at `dst`, or zero
+/// it for a null (0:0) pointer. Returns the FCB's drive byte (0 for a null FCB).
+fn copy_fcb(mem: &mut Memory, dst: usize, seg: u16, off: u16) -> Result<u8, DosError> {
+    if seg == 0 && off == 0 {
+        for i in 0..16 {
+            mem.write_u8(dst + i, 0)?;
+        }
+        Ok(0)
+    } else {
+        let src = usize::from(seg) * 16 + usize::from(off);
+        let mut drive = 0u8;
+        for i in 0..16 {
+            let b = mem.read_u8(src + i)?;
+            if i == 0 {
+                drive = b;
+            }
+            mem.write_u8(dst + i, b)?;
+        }
+        Ok(drive)
+    }
+}
+
+/// RBIL EXEC note: AL/AH = 00h if the corresponding FCB has a valid drive letter,
+/// FFh if not. Drive 0 (default) and 1..=26 are valid.
+fn fcb_drive_validity(drive: u8) -> u8 {
+    if drive == 0 || (1..=26).contains(&drive) {
+        0
+    } else {
+        0xff
+    }
 }
 
 /// Read an ASCIIZ string from guest memory at seg:off, scanning for a NUL with a
@@ -3233,5 +3480,198 @@ mod tests {
         kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
         assert!(regs.cf);
         assert_eq!(regs.ax, 0x02);
+    }
+
+    /// A kernel with `dir` as C:, a parent program at PSP 0x0100 owning
+    /// [0x0100, 0x0200), and a 1 MiB memory for the child PSP and inputs.
+    fn exec_kernel(dir: &Path) -> (DosKernel, Memory) {
+        let mut kernel = DosKernel::new();
+        kernel.mount_c(HostDrive::mount_c(dir).unwrap());
+        kernel.init_program(0x0100, 0x0200);
+        let mem = Memory::new(1024 * 1024).unwrap();
+        (kernel, mem)
+    }
+
+    /// Write `name` as ASCIIZ at linear 0x10000 and a 14-byte EPB at 0x10040
+    /// (env word, then null cmdtail/fcb1/fcb2 pointers). The caller sets
+    /// ds=0x1000 dx=0 es=0x1000 bx=0x40.
+    fn place_exec_inputs(mem: &mut Memory, name: &str, env: u16) {
+        let nb = 0x10000usize;
+        for (i, &b) in name.as_bytes().iter().enumerate() {
+            mem.write_u8(nb + i, b).unwrap();
+        }
+        mem.write_u8(nb + name.len(), 0).unwrap();
+        mem.write_u16(0x10040, env).unwrap();
+        mem.write_u16(0x10042, 0).unwrap(); // cmdtail off
+        mem.write_u16(0x10044, 0).unwrap(); // cmdtail seg (0:0 = null)
+        mem.write_u16(0x10046, 0).unwrap(); // fcb1 off
+        mem.write_u16(0x10048, 0).unwrap(); // fcb1 seg
+        mem.write_u16(0x1004a, 0).unwrap(); // fcb2 off
+        mem.write_u16(0x1004c, 0).unwrap(); // fcb2 seg
+    }
+
+    fn exec_al0(kernel: &mut DosKernel, mem: &mut Memory) -> DosRegs {
+        let mut regs = DosRegs {
+            ax: 0x4b00,
+            ds: 0x1000,
+            dx: 0x0000,
+            es: 0x1000,
+            bx: 0x0040,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, mem).unwrap();
+        regs
+    }
+
+    #[test]
+    fn fcb_drive_validity_table() {
+        assert_eq!(fcb_drive_validity(0), 0); // default
+        assert_eq!(fcb_drive_validity(3), 0); // C:
+        assert_eq!(fcb_drive_validity(26), 0);
+        assert_eq!(fcb_drive_validity(27), 0xff);
+    }
+
+    #[test]
+    fn ah4b_al0_builds_child_psp_and_returns_exec() {
+        let dir = tempfile::tempdir().unwrap();
+        // A minimal child .COM: INT 20h (terminate). It never runs in this test.
+        std::fs::write(dir.path().join("CHILD.COM"), [0xcdu8, 0x20]).unwrap();
+        let (mut kernel, mut mem) = exec_kernel(dir.path());
+        place_exec_inputs(&mut mem, "C:\\CHILD.COM", 0);
+        let mut regs = DosRegs {
+            ax: 0x4b00,
+            ds: 0x1000,
+            dx: 0,
+            es: 0x1000,
+            bx: 0x40,
+            ..DosRegs::default()
+        };
+        // env is 1 paragraph at the parent free_base 0x0200, so child PSP = 0x0201.
+        let action = kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        let child_psp = 0x0201usize * 16;
+        match action {
+            DosAction::Exec { child_ax, .. } => {
+                assert_eq!(child_ax, 0x0000); // null FCBs -> valid drives
+                assert_eq!(mem.read_u16(child_psp + 0x02).unwrap(), 0xa000);
+                assert_eq!(mem.read_u16(child_psp + 0x16).unwrap(), 0x0100); // parent
+                assert_eq!(mem.read_u16(child_psp + 0x2c).unwrap(), 0x0200); // env seg
+                assert_eq!(mem.read_u8(child_psp + 0x80).unwrap(), 0); // empty tail
+                assert_eq!(mem.read_u8(child_psp + 0x81).unwrap(), 0x0d);
+                assert_eq!(mem.read_u8(child_psp + 0x18).unwrap(), 0x01); // JFT stdin
+            }
+            other => panic!("expected Exec, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ah4b_al0_inherits_empty_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CHILD.COM"), [0xcdu8, 0x20]).unwrap();
+        let (mut kernel, mut mem) = exec_kernel(dir.path());
+        place_exec_inputs(&mut mem, "C:\\CHILD.COM", 0);
+        let _ = exec_al0(&mut kernel, &mut mem);
+        // env block at 0x0200:0 is a single terminating NUL.
+        assert_eq!(mem.read_u8(0x0200 * 16).unwrap(), 0x00);
+    }
+
+    #[test]
+    fn ah4b_al0_copies_explicit_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CHILD.COM"), [0xcdu8, 0x20]).unwrap();
+        let (mut kernel, mut mem) = exec_kernel(dir.path());
+        // Source env at seg 0x3000: "A=1\0B=2\0\0".
+        let src = 0x3000usize * 16;
+        for (i, &b) in b"A=1\0B=2\0\0".iter().enumerate() {
+            mem.write_u8(src + i, b).unwrap();
+        }
+        place_exec_inputs(&mut mem, "C:\\CHILD.COM", 0x3000);
+        let _ = exec_al0(&mut kernel, &mut mem);
+        // Copied env at 0x0200:0 holds the same bytes.
+        for (i, &b) in b"A=1\0B=2\0\0".iter().enumerate() {
+            assert_eq!(mem.read_u8(0x0200 * 16 + i).unwrap(), b);
+        }
+    }
+
+    #[test]
+    fn ah4b_missing_program_returns_0x02() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut kernel, mut mem) = exec_kernel(dir.path());
+        place_exec_inputs(&mut mem, "C:\\NOPE.COM", 0);
+        let regs = exec_al0(&mut kernel, &mut mem);
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x02);
+        assert!(kernel.program_stack.is_empty()); // no child context pushed
+    }
+
+    #[test]
+    fn finish_exec_restores_parent_context_and_records_code() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CHILD.COM"), [0xcdu8, 0x20]).unwrap();
+        let (mut kernel, mut mem) = exec_kernel(dir.path());
+        place_exec_inputs(&mut mem, "C:\\CHILD.COM", 0);
+        let mut regs = DosRegs {
+            ax: 0x4b00,
+            ds: 0x1000,
+            dx: 0,
+            es: 0x1000,
+            bx: 0x40,
+            ..DosRegs::default()
+        };
+        assert!(matches!(
+            kernel.dispatch(0x21, &mut regs, &mut mem).unwrap(),
+            DosAction::Exec { .. }
+        ));
+        // Now in the child context (psp_seg = 0x0201).
+        assert_eq!(kernel.arena.psp_seg, 0x0201);
+        kernel.finish_exec(7);
+        assert_eq!(kernel.arena.psp_seg, 0x0100); // parent restored
+        assert_eq!(kernel.arena.free_base, 0x0200);
+        assert_eq!(kernel.last_exit_code, 7);
+    }
+
+    #[test]
+    fn ah4d_returns_then_clears_the_exit_code() {
+        let mut kernel = DosKernel::new();
+        kernel.last_exit_code = 7;
+        let mut mem = Memory::new(4096).unwrap();
+        let mut regs = DosRegs {
+            ax: 0x4d00,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf);
+        assert_eq!(regs.ax, 0x0007);
+        // Second read returns 0 (one-shot).
+        regs.ax = 0x4d00;
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(regs.ax, 0x0000);
+    }
+
+    #[test]
+    fn ah4d_in_a_fresh_child_reads_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CHILD.COM"), [0xcdu8, 0x20]).unwrap();
+        let (mut kernel, mut mem) = exec_kernel(dir.path());
+        kernel.last_exit_code = 5; // a prior child's code, must not leak in
+        place_exec_inputs(&mut mem, "C:\\CHILD.COM", 0);
+        let mut regs = DosRegs {
+            ax: 0x4b00,
+            ds: 0x1000,
+            dx: 0,
+            es: 0x1000,
+            bx: 0x40,
+            ..DosRegs::default()
+        };
+        assert!(matches!(
+            kernel.dispatch(0x21, &mut regs, &mut mem).unwrap(),
+            DosAction::Exec { .. }
+        ));
+        // In the child context, AH=4Dh reads 0 (reset on entry).
+        let mut regs = DosRegs {
+            ax: 0x4d00,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(regs.ax, 0x0000);
     }
 }

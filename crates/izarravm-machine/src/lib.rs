@@ -1,7 +1,7 @@
 use izarravm_audio::{OplChip, Resampler, SbDsp, SbMixer};
 use izarravm_bus::{BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CpuBus, Memory};
 use izarravm_core::{CpuPreset, HardwareProfile, SoundBlasterConfig, VideoCard};
-use izarravm_cpu::{Cpu386, CpuError, SegmentIndex, SegmentRegister};
+use izarravm_cpu::{Cpu386, CpuError, Registers, SegmentIndex, SegmentRegister};
 pub use izarravm_video::MARGO_ID_VALUE;
 use izarravm_video::{
     DAC_ENTRIES, Framebuffer, MARGO_MMIO_SIZE, MARGO_VBE_MODES, MARGO_VRAM_SIZE,
@@ -112,6 +112,14 @@ pub enum StopReason {
     DosExit { code: u8 },
 }
 
+/// A frozen parent CPU state for EXEC (AH=4Bh AL=0) resume: the register file as
+/// handle_dos_int left it at the parent's AH=4Bh INT, so restoring it lands the
+/// CPU back on the IRET stub with the parent's INT-return frame on the stack.
+#[derive(Debug)]
+struct ProgramFrame {
+    registers: Registers,
+}
+
 /// The OPL3 renders at this native rate; the Resonique 2 DAC outputs at 44100.
 const OPL_NATIVE_HZ: u32 = 49_716;
 const DAC_HZ: u32 = 44_100;
@@ -160,6 +168,8 @@ pub struct Machine {
     vga_dots: f64,    // fractional VGA dot clocks owed to the beam advance
     trace: BusTrace,
     elapsed_clocks: u64,
+    // Parent CPU snapshots for EXEC (AH=4Bh AL=0); popped on child exit.
+    program_frames: Vec<ProgramFrame>,
 }
 
 /// Build the CT1745 mixer from the profile's Sound Blaster power-on routing.
@@ -209,6 +219,7 @@ impl Machine {
             vga_dots: 0.0,
             trace: BusTrace::default(),
             elapsed_clocks: 0,
+            program_frames: Vec::new(),
         };
         // The Margo LFB aperture is decoded before RAM, so system memory must
         // stay below it. Validated config caps memory far under this bound.
@@ -261,6 +272,7 @@ impl Machine {
             vga_dots: 0.0,
             trace: BusTrace::default(),
             elapsed_clocks: 0,
+            program_frames: Vec::new(),
         };
         // The Margo LFB aperture is decoded before RAM, so system memory must
         // stay below it. Validated config caps memory far under this bound.
@@ -331,6 +343,7 @@ impl Machine {
             vga_dots: 0.0,
             trace: BusTrace::default(),
             elapsed_clocks: 0,
+            program_frames: Vec::new(),
         };
         debug_assert!(
             machine.memory.len() as u64 <= u64::from(MARGO_LFB_BASE),
@@ -563,6 +576,16 @@ impl Machine {
         Ok(match action {
             izarravm_dos::DosAction::Continue => None,
             izarravm_dos::DosAction::Exit(code) => Some(code),
+            izarravm_dos::DosAction::Exec { entry, child_ax } => {
+                // Snapshot the parent and switch to the child. The kernel has
+                // already saved its per-program state; we save the CPU side.
+                self.program_frames.push(ProgramFrame {
+                    registers: self.cpu.registers.clone(),
+                });
+                self.apply_program_entry(entry);
+                self.cpu.registers.set_eax(u32::from(child_ax));
+                None // keep looping; the CPU now runs the child
+            }
         })
     }
 
@@ -1098,7 +1121,27 @@ impl Machine {
                         match vector {
                             0x10 => self.handle_int10(),
                             0x20 | 0x21 => match self.handle_dos_int(vector) {
-                                Ok(Some(code)) => return Ok(StopReason::DosExit { code }),
+                                Ok(Some(code)) => {
+                                    if let Some(frame) = self.program_frames.pop() {
+                                        // A child exited; resume the parent.
+                                        self.cpu.registers = frame.registers;
+                                        self.dos.finish_exec(code);
+                                        // EXEC success: AX=0, CF=0 in the parent's
+                                        // INT-return FLAGS image (SS:SP+4).
+                                        let ss = self.cpu.registers.segment(SegmentIndex::Ss).base;
+                                        let sp = self.cpu.registers.esp() as u16;
+                                        let flags_addr =
+                                            (ss + u32::from(sp.wrapping_add(4))) as usize;
+                                        let mut flags = self.memory.read_u16(flags_addr)?;
+                                        flags &= !0x0001; // CF=0
+                                        self.memory.write_u16(flags_addr, flags)?;
+                                        self.cpu.registers.set_eax(0);
+                                        // fall through: the loop continues, the
+                                        // IRET stub returns to the parent.
+                                    } else {
+                                        return Ok(StopReason::DosExit { code });
+                                    }
+                                }
                                 Ok(None) => {}
                                 Err(error) => {
                                     return Ok(StopReason::CpuError(format!(
