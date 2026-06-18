@@ -4,9 +4,9 @@ use izarravm_core::{CpuPreset, HardwareProfile, SoundBlasterConfig, VideoCard};
 use izarravm_cpu::{Cpu386, CpuError, Registers, SegmentIndex, SegmentRegister};
 pub use izarravm_video::MARGO_ID_VALUE;
 use izarravm_video::{
-    DAC_ENTRIES, Framebuffer, MARGO_MMIO_SIZE, MARGO_VBE_MODES, MARGO_VRAM_SIZE,
-    MODE13H_MEMORY_SIZE, Margo, TextFrame, VGA_MODE13H_BASE, VGA_PLANAR_WINDOW_SIZE, VGA_TEXT_BASE,
-    VGA_TEXT_MEMORY_SIZE, Vga, VgaRaster, VideoMode, bytes_per_pixel, pixel_format, vbe_mode,
+    DAC_ENTRIES, MARGO_MMIO_SIZE, MARGO_VBE_MODES, MARGO_VRAM_SIZE, Margo, TextFrame,
+    VGA_MODE13H_BASE, VGA_PLANAR_WINDOW_SIZE, VGA_TEXT_BASE, VGA_TEXT_MEMORY_SIZE, Vga, VgaRaster,
+    VideoMode, bytes_per_pixel, pixel_format, vbe_mode,
 };
 use thiserror::Error;
 
@@ -131,7 +131,6 @@ const VGA_DOT_HZ: u64 = 25_175_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveDisplay {
     Text,
-    Mode13h,
     VgaRaster,
     MargoLfb,
 }
@@ -449,10 +448,6 @@ impl Machine {
         self.video.frame()
     }
 
-    pub fn mode13h_framebuffer(&self) -> &Framebuffer {
-        self.video.mode13h_framebuffer()
-    }
-
     fn make_bus(&mut self) -> MachineBus<'_> {
         MachineBus {
             memory: &mut self.memory,
@@ -768,11 +763,9 @@ impl Machine {
             ActiveDisplay::MargoLfb
         } else if matches!(
             self.video.active_mode(),
-            VideoMode::Planar | VideoMode::ModeX
+            VideoMode::Planar | VideoMode::ModeX | VideoMode::Mode13h
         ) {
             ActiveDisplay::VgaRaster
-        } else if self.video.active_mode() == VideoMode::Mode13h {
-            ActiveDisplay::Mode13h
         } else {
             ActiveDisplay::Text
         }
@@ -1574,26 +1567,24 @@ impl MachineBus<'_> {
                 .collect();
         }
 
-        // Unchained (mode X) and 16-color planar use the 64 KB planar datapath;
-        // chained mode 13h uses the flat 64000-byte buffer. cpu_read loads the VGA
-        // latches as a side effect, so the planar path needs &mut self.
-        if matches!(
-            self.video.active_mode(),
-            VideoMode::Planar | VideoMode::ModeX
-        ) {
-            if let Some(offset) = vga_planar_offset(address, width) {
-                return Ok((0..width)
-                    .map(|i| self.video.cpu_read(offset + i))
-                    .collect());
+        // The 64 KB A0000 window serves all three graphics modes. Unchained (mode
+        // X) and 16-color planar route through the planar datapath (cpu_read loads
+        // the VGA latches as a side effect, so it needs &mut self); chained mode
+        // 13h routes through the chain-4 decode.
+        if let Some(offset) = vga_planar_offset(address, width) {
+            match self.video.active_mode() {
+                VideoMode::Planar | VideoMode::ModeX => {
+                    return Ok((0..width)
+                        .map(|i| self.video.cpu_read(offset + i))
+                        .collect());
+                }
+                VideoMode::Mode13h => {
+                    return Ok((0..width)
+                        .map(|i| self.video.cpu_read_chain4(offset + i))
+                        .collect());
+                }
+                VideoMode::Text => {}
             }
-        } else if let Some(offset) = video_mode13h_offset(address, width) {
-            return (0..width)
-                .map(|index| {
-                    self.video
-                        .read_mode13h_u8(offset + index)
-                        .map_err(|_| BusError::UnmappedMemory { address })
-                })
-                .collect();
         }
 
         if let Some(offset) = margo_lfb_offset(address, width) {
@@ -1630,22 +1621,22 @@ impl MachineBus<'_> {
                 .map_err(|_| BusError::UnmappedMemory { address });
         }
 
-        // Unchained (mode X) and 16-color planar route A0000 through the 64 KB
-        // planar datapath (map mask, write mode, bit mask, latches); chained mode
-        // 13h writes the flat 64000-byte buffer.
-        if matches!(
-            self.video.active_mode(),
-            VideoMode::Planar | VideoMode::ModeX
-        ) {
-            if let Some(offset) = vga_planar_offset(address, 1) {
-                self.video.cpu_write(offset, value);
-                return Ok(());
+        // The 64 KB A0000 window serves all three graphics modes. Unchained (mode
+        // X) and 16-color planar route A0000 through the planar datapath (map mask,
+        // write mode, bit mask, latches); chained mode 13h routes through the
+        // chain-4 decode.
+        if let Some(offset) = vga_planar_offset(address, 1) {
+            match self.video.active_mode() {
+                VideoMode::Planar | VideoMode::ModeX => {
+                    self.video.cpu_write(offset, value);
+                    return Ok(());
+                }
+                VideoMode::Mode13h => {
+                    self.video.cpu_write_chain4(offset, value);
+                    return Ok(());
+                }
+                VideoMode::Text => {}
             }
-        } else if let Some(offset) = video_mode13h_offset(address, 1) {
-            return self
-                .video
-                .write_mode13h_u8(offset, value)
-                .map_err(|_| BusError::UnmappedMemory { address });
         }
 
         if let Some(offset) = margo_lfb_offset(address, 1) {
@@ -1709,17 +1700,8 @@ fn video_text_offset(address: u32, width: usize) -> Option<usize> {
     }
 }
 
-fn video_mode13h_offset(address: u32, width: usize) -> Option<usize> {
-    let end = VGA_MODE13H_BASE + MODE13H_MEMORY_SIZE as u32;
-    if (VGA_MODE13H_BASE..end).contains(&address) && address + width as u32 <= end {
-        Some((address - VGA_MODE13H_BASE) as usize)
-    } else {
-        None
-    }
-}
-
-/// The A0000 window for unchained / 16-color planar access: the full 64 KB the
-/// hardware decodes, wider than the 64000-byte chained mode-13h buffer.
+/// The A0000 window for chained mode 13h and unchained / 16-color planar access:
+/// the full 64 KB the hardware decodes.
 fn vga_planar_offset(address: u32, width: usize) -> Option<usize> {
     let end = VGA_MODE13H_BASE + VGA_PLANAR_WINDOW_SIZE;
     if (VGA_MODE13H_BASE..end).contains(&address) && address + width as u32 <= end {
@@ -1858,7 +1840,7 @@ mod tests {
     }
 
     #[test]
-    fn int10_mode13h_maps_a000_to_framebuffer() {
+    fn int10_mode13h_routes_a000_through_chain4() {
         let rom = rom_with_code(&[
             0xb8, 0x13, 0x00, // mov ax, 0013h
             0xcd, 0x10, // int 10h
@@ -1875,7 +1857,10 @@ mod tests {
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
 
         assert_eq!(reason, StopReason::Halted);
-        assert_eq!(machine.mode13h_framebuffer().indexed_pixels[0x7b], 0x2a);
+        // Chain-4 routes the A0000 byte at offset 0x7B to plane 0x7B & 3 = 3 at
+        // plane offset 0x7B >> 2 = 30.
+        assert_eq!(machine.video().plane_byte(3, 30), 0x2a);
+        assert_eq!(machine.active_display(), ActiveDisplay::VgaRaster);
         assert!(machine.is_graphics_mode());
         assert!(machine.bus_trace().cycles().iter().any(|cycle| {
             cycle.kind == BusAccessKind::InterruptAcknowledge && cycle.address == 0x10
@@ -1929,9 +1914,12 @@ mod tests {
             record.status == izarravm_firmware::SuiteRecordStatus::Pass
                 && record.name == "video.vga_mode13h"
         }));
-        assert_eq!(machine.mode13h_framebuffer().indexed_pixels[0], 0x2a);
-        assert_eq!(machine.mode13h_framebuffer().indexed_pixels[319], 0x13);
-        assert_eq!(machine.mode13h_framebuffer().indexed_pixels[63680], 0x7f);
+        // Chain-4 routes the linear byte at offset N to plane N & 3 at plane
+        // offset N >> 2, so the boot image's three drawn pixels land as:
+        // 0 -> plane 0 @ 0, 319 -> plane 3 @ 79, 63680 -> plane 0 @ 15920.
+        assert_eq!(machine.video().plane_byte(0, 0), 0x2a);
+        assert_eq!(machine.video().plane_byte(3, 79), 0x13);
+        assert_eq!(machine.video().plane_byte(0, 15920), 0x7f);
         assert!(results.records.iter().any(|record| {
             record.status == izarravm_firmware::SuiteRecordStatus::Pass
                 && record.name == "sound.sb_16bit_dma"
@@ -1972,7 +1960,7 @@ mod tests {
         // A guest VGA mode-set must hand the display back to VGA.
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
         assert_eq!(reason, StopReason::Halted);
-        assert_eq!(machine.active_display(), ActiveDisplay::Mode13h);
+        assert_eq!(machine.active_display(), ActiveDisplay::VgaRaster);
     }
 
     #[test]
@@ -2024,7 +2012,7 @@ mod tests {
         // The VGA mode-set hands the display back to VGA, but the 4F02 call must
         // still have set the Margo mode (width stays set; only margo_active clears).
         assert_eq!(machine.margo().display().width, 640);
-        assert_eq!(machine.active_display(), ActiveDisplay::Mode13h);
+        assert_eq!(machine.active_display(), ActiveDisplay::VgaRaster);
     }
 
     #[test]
@@ -4292,6 +4280,166 @@ mod tests {
         );
         // The first split scanline (201 = line_compare + 1) reads offset 0 (the marked
         // status panel), as the full 8-bit DAC index.
+        assert_eq!(
+            raster.pixels[201 * w],
+            0xC2,
+            "split region reads offset 0 at the full 8-bit value"
+        );
+    }
+
+    #[test]
+    fn mode_x_pel_pan_smooth_scroll_through_the_machine() {
+        let mut machine = test_machine();
+        // Mode 13h, then unchained mode X.
+        machine.video_mut().set_mode13h();
+        machine.video_mut().write_port(0x3C4, 0x04);
+        machine.video_mut().write_port(0x3C5, 0x06);
+        assert_eq!(machine.active_display(), ActiveDisplay::VgaRaster);
+        // Abrash's 320x240 vertical timing through the CRTC ports (Black Book
+        // Listing 47.1): double-scanned, 240 source rows over 480 scanlines.
+        for (idx, val) in [
+            (0x06u8, 0x0Du8),
+            (0x07, 0x3E),
+            (0x09, 0x41),
+            (0x10, 0xEA),
+            (0x11, 0xAC),
+            (0x12, 0xDF),
+            (0x15, 0xE7),
+            (0x16, 0x06),
+        ] {
+            machine.video_mut().write_port(0x3D4, idx);
+            machine.video_mut().write_port(0x3D5, val);
+        }
+        // Distinct bytes per plane at plane offset 0 (values above 0x3F prove the
+        // 8-bit-direct DAC index is scanned out, not masked to 6 bits).
+        let plane_byte: [u8; 4] = [0x40, 0x50, 0x60, 0x70];
+        for (plane, &val) in plane_byte.iter().enumerate() {
+            machine.video_mut().write_port(0x3C4, 0x02);
+            machine.video_mut().write_port(0x3C5, 1u8 << plane); // map mask = this plane
+            machine.video_mut().write_port(0x3CE, 0x08);
+            machine.video_mut().write_port(0x3CF, 0xFF); // bit mask 0xFF, write mode 0
+            machine.write_physical_u8(0x000A_0000, val);
+        }
+        // For each pel-pan 1..3, reset the attribute flip-flop, write AC index 0x13
+        // then the pan value, run two frame periods, and assert the leftmost column
+        // scans out plane `pan` at plane offset 0: the fine-shifted pixel, not plane 0.
+        for pan in 1u8..=3 {
+            machine.video_mut().read_status1(); // reset attr flip-flop to index mode
+            machine.video_mut().write_port(0x3C0, 0x13); // attr index 0x13 (pixel pan)
+            machine.video_mut().write_port(0x3C0, pan); // pel-pan value
+            // Pel-pan is live (not latched): it takes effect at the scanline of the
+            // write, so the in-progress frame's early rows still hold the prior pan.
+            // Two frame periods flush that frame and then render a clean one whose row
+            // zero is scanned after the write.
+            machine.advance_devices(500_000); // flush the in-progress (mixed-pan) frame
+            machine.advance_devices(500_000); // render a full frame with the new pan
+            let raster = machine.vga_raster().expect("a frame presented");
+            assert_eq!(
+                raster.pixels[0], plane_byte[pan as usize],
+                "pel-pan {pan} scans out plane {pan} at the leftmost column"
+            );
+        }
+    }
+
+    #[test]
+    fn mode13h_320x200_through_the_machine() {
+        let mut machine = test_machine();
+        // INT 10h AH=00h AL=13h installs chained mode 13h; set_mode13h is its
+        // programmatic equivalent (the INT path is proven by
+        // int10_mode13h_routes_a000_through_chain4).
+        machine.video_mut().set_mode13h();
+        assert_eq!(machine.active_display(), ActiveDisplay::VgaRaster);
+        // Chain-4 routes the A0000 byte at offset 6 to plane 6 & 3 = 2 at plane
+        // offset 6 >> 2 = 1. 0xC2 has bits above 0x3F, proving no 6-bit mask.
+        machine.write_physical_u8(0x000A_0000 + 6, 0xC2);
+        // Complete a frame (the standard mode-13h frame is ~359 200 dots; 500 000
+        // clocks is ~503 500 dots, enough to cross one frame and present).
+        machine.advance_devices(500_000);
+        let raster = machine.vga_raster().expect("a frame presented");
+        assert_eq!(raster.width, 320);
+        assert_eq!(raster.height, 449, "mode-13h vertical total");
+        // Column 6 of row 0 scans out the written 0xC2, as the 8-bit DAC index
+        // directly.
+        assert_eq!(
+            raster.pixels[6], 0xC2,
+            "mode-13h pixel scans out at its column with its full 8-bit value"
+        );
+    }
+
+    #[test]
+    fn mode13h_pel_pan_smooth_scroll_through_the_machine() {
+        let mut machine = test_machine();
+        machine.video_mut().set_mode13h();
+        assert_eq!(machine.active_display(), ActiveDisplay::VgaRaster);
+        // Chain-4 writes the byte at A0000 offset p straight to plane p at plane
+        // offset 0, so four writes at offsets 0..3 mark one distinct byte per plane
+        // there (values above 0x3F prove the 8-bit-direct DAC index is scanned out,
+        // not masked to 6 bits).
+        let plane_byte: [u8; 4] = [0x40, 0x50, 0x60, 0x70];
+        for (plane, &val) in plane_byte.iter().enumerate() {
+            machine.write_physical_u8(0x000A_0000 + plane as u32, val);
+        }
+        // For each pel-pan 1..3, reset the attribute flip-flop, write AC index 0x13
+        // then the pan value, run two frame periods, and assert the leftmost column
+        // scans out plane `pan` at plane offset 0: the fine-shifted pixel.
+        for pan in 1u8..=3 {
+            machine.video_mut().read_status1(); // reset attr flip-flop to index mode
+            machine.video_mut().write_port(0x3C0, 0x13); // attr index 0x13 (pixel pan)
+            machine.video_mut().write_port(0x3C0, pan); // pel-pan value
+            // Pel-pan is live (not latched): it takes effect at the scanline of the
+            // write, so the in-progress frame's early rows still hold the prior pan.
+            // Two frame periods flush that frame and then render a clean one whose row
+            // zero is scanned after the write.
+            machine.advance_devices(500_000); // flush the in-progress (mixed-pan) frame
+            machine.advance_devices(500_000); // render a full frame with the new pan
+            let raster = machine.vga_raster().expect("a frame presented");
+            assert_eq!(
+                raster.pixels[0], plane_byte[pan as usize],
+                "pel-pan {pan} scans out plane {pan} at the leftmost column"
+            );
+        }
+    }
+
+    #[test]
+    fn mode13h_line_compare_split_through_the_machine() {
+        let mut machine = test_machine();
+        machine.video_mut().set_mode13h();
+        assert_eq!(machine.active_display(), ActiveDisplay::VgaRaster);
+        // A split at scan-counter line 200, well inside the 400 active scanlines.
+        // The line-compare bits are mode-agnostic (CRTC 18h + 07h.4 + 09h.6), and
+        // mode 13h does not honor guest vertical-CRTC bangs, so writing 07h/09h
+        // here clears only their line-compare bits, leaving the fixed 320x200
+        // timing intact. The default line_compare 0x3FF holds bits 8 and 9 set, so
+        // they must be cleared or the low byte alone yields 0x3C8 (no split).
+        machine.video_mut().write_port(0x3D4, 0x07);
+        machine.video_mut().write_port(0x3D5, 0x00); // clear line-compare bit 8
+        machine.video_mut().write_port(0x3D4, 0x09);
+        machine.video_mut().write_port(0x3D5, 0x00); // clear line-compare bit 9
+        machine.video_mut().write_port(0x3D4, 0x18);
+        machine.video_mut().write_port(0x3D5, 200); // line compare low byte = 200
+        // Mark plane 0, offset 0 (pixel 0 of any scanline reading offset 0). 0xC2
+        // has bits above 0x3F, proving the 8-bit DAC index is read directly.
+        machine.write_physical_u8(0x000A_0000, 0xC2); // chain-4: plane 0, offset 0
+        // Scroll the top region to cleared VRAM, buffered until the next vertical
+        // retrace. Two frame periods: the first latches the start address, the second
+        // renders with it.
+        machine.video_mut().write_port(0x3D4, 0x0C);
+        machine.video_mut().write_port(0x3D5, 0x40); // start address high = 0x40
+        machine.video_mut().write_port(0x3D4, 0x0D);
+        machine.video_mut().write_port(0x3D5, 0x00); // start address low -> 0x4000
+        machine.advance_devices(500_000);
+        machine.advance_devices(500_000);
+        let raster = machine.vga_raster().expect("a frame presented");
+        assert_eq!(raster.width, 320, "mode-13h width");
+        let w = raster.width as usize;
+        // A top scanline (50 < 200) reads the scrolled, cleared region: 0.
+        assert_eq!(
+            raster.pixels[50 * w],
+            0,
+            "top region is scrolled to cleared VRAM"
+        );
+        // The first split scanline (201 = line_compare + 1) reads offset 0 (the
+        // marked byte), as the full 8-bit DAC index.
         assert_eq!(
             raster.pixels[201 * w],
             0xC2,

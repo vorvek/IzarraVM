@@ -30,8 +30,6 @@ pub enum VideoError {
     EmptyFramebuffer,
     #[error("VGA text memory offset {offset:#x} is outside the text buffer")]
     TextMemoryOutOfBounds { offset: usize },
-    #[error("VGA Mode 13h offset {offset:#x} is outside the framebuffer")]
-    Mode13hOutOfBounds { offset: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
