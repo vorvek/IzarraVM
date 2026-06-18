@@ -226,4 +226,81 @@ that the handler ran and that real emulated time advanced), matching how
 path. The boot-suite DMA probes themselves use busy-loops rather than `hlt`, so
 they are unaffected by this change.
 
+## CT1745 mixer — IRQ/DMA routing and volume
+
+The CT1745 mixer chip on the SB16 selects the card's IRQ line and DMA channels
+and sets the output volume through an index/data register file at I/O `0x224`
+(write-only index) / `0x225` (read/write data). All values below were re-derived
+from the cached Creative "Sound Blaster 16 Hardware Programming Guide"
+(`dev_docs/reference/sb16/SoundBlaster16-ProgrammingGuide-MIT.txt`); the
+DOSBox/QEMU/Bochs mixer code was not consulted as a source.
+
+- **Index/data protocol** (Guide, "Mixer Chip Programming"; the `0x82` ISR code
+  example writes the index `82h` to `2x4h` then reads `2x5h`). A write to
+  `0x224` latches the register index; the following `0x225` access reads or
+  writes that register. A read of `0x224` is undefined on hardware; the emulator
+  returns the latched index (harmless to a probing routine).
+- **Interrupt Setup, register `0x80`** (Guide, "Configuring DMA and Interrupt
+  Settings"). The byte's `D3..D0` select the IRQ line, the upper bits reserved:
+  `D0(0x01)`=IRQ2, `D1(0x02)`=IRQ5, `D2(0x04)`=IRQ7, `D3(0x08)`=IRQ10. "Only a
+  bit can be set on at any one time"; when several are set the decoder takes the
+  lowest set bit. **Hardware default `0x02` (IRQ5)** — the Resonique 2 / SB16
+  factory setting that keeps the existing IRQ5 host and boot-suite goldens green.
+- **DMA Setup, register `0x81`** (same Guide section). Low bits select the 8-bit
+  channel (`D0(0x01)`=DMA0, `D1(0x02)`=DMA1, `D3(0x08)`=DMA3), high bits the
+  16-bit channel (`D5(0x20)`=DMA5, `D6(0x40)`=DMA6, `D7(0x80)`=DMA7); each group
+  has one bit set. The Guide notes "DSP version 4.xx also supports the transfer
+  of 16-bit digitized sound data through 8-bit DMA channel" — when no 16-bit bit
+  is set, an armed `0xBx` command draws words from the selected 8-bit channel.
+  **Hardware default `0x22` (DMA1 | DMA5).** Decoders take the lowest set bit per
+  group, falling back to the default (DMA1) / 8-bit channel respectively.
+- **Interrupt Status, register `0x82` (read-only)** (Guide, "Sharing of
+  Interrupts"). The ISR reads it to tell whether the shared IRQ is its digitized-
+  sound transfer: `D0(0x01)`=8-bit DMA / SB-MIDI, `D1(0x02)`=16-bit DMA,
+  `D2(0x04)`=MPU-401. The Guide's ISR example confirms 16-bit via `test al,02h`.
+  Writes are ignored. **Lifecycle:** the producer sets the source bit
+  (`set_irq_status(is_16bit)` -> `0x01`/`0x02`) right when it forwards the IRQ to
+  the PIC; the bit clears when the guest acks by reading DSP `0x22E` (8-bit) or
+  `0x22F` (16-bit) — coordinated in `MachineBus::read_io` alongside
+  `SbDsp::read_port`, which clears the DSP's own pending-IRQ flag at the same
+  point. MPU-401 is never set (MIDI is out of scope).
+- **CT1345-compatible volume aliases `0x22`/`0x04`** (Guide, Figure 4-3 "Register
+  Map of CT1745 Mixer", and the per-register notes: these "are actually mapped to
+  the new volume control registers"). Each packs two 4-bit channels (high nibble
+  = L, low nibble = R) and aliases the 5-bit registers: `0x22` -> master
+  `0x30`/`0x31`, `0x04` -> voice `0x32`/`0x33`. Reading packs each side as
+  `level>>1`; writing unpacks as `(nibble<<1)` capped to 31. So the 5-bit default
+  24 reads back through `0x22` as `(24>>1)=12` -> `0xCC`, exactly the CT1345
+  default the Guide states (12 => -12 dB on the 4-bit scale).
+- **Volume register defaults and scales** (Guide, Figure 4-3 per-register notes).
+  Master `0x30`/`0x31` and Voice `0x32`/`0x33`: 5 bits, 32 levels,
+  `0..=31 => -62..0 dB` in 2 dB steps, **default 24 => -14 dB**. Output Gain
+  `0x41`/`0x42`: 2 bits, `0..=3 => 0..+18 dB` in 6 dB steps, **default 0 => 0 dB**
+  (unity). Mic `0x3A`/PC-speaker `0x3B`/Treble-Bass `0x44`-`0x47`/input-output
+  switches `0x3C`-`0x3E` are stored at their datasheet defaults so a setup
+  utility's read-modify-write round-trips preserve guest writes, but have no
+  audio effect this slice (their sources — CD/Line/Mic/MIDI/ADC — are not
+  modeled, and tone is a filter).
+- **dB -> linear gain** (first principles from the Guide's dB scales). Linear
+  gain `g = 10**(db/20)`. Precomputed tables: `VOL5_STEPS[n]` for 5-bit volume
+  (`db = -62 + 2*n`), `OUTGAIN_STEPS[n]` for output gain (`db = 6*n`). Level 0 on
+  a 5-bit register is forced to exactly `0.0` so a "0" write is a hard mute
+  rather than the ~-62 dB floor (`10**(-3.1) ~= 0.00079`).
+- **Where gain is applied.** Voice gain scales each drained DSP frame in
+  `render_dsp_audio` (so a mid-buffer guest volume change applies immediately at
+  drain time, the producer/ring untouched). Master + output gain are applied once
+  to the *summed* `(OPL + DSP)` pair in `render_audio`, giving `DSP·voice·master·outgain`
+  and `OPL·master·outgain`. Defaults (master 24 / voice 24 / outgain 0, i.e.
+  -14 dB / -14 dB / 0 dB) yield a quiet-but-present signal at reset, matching
+  real hardware that boots at -14 dB master.
+- **Host-config default vs guest-reset default.** The host config
+  (`SoundBlasterConfig { enabled, irq, dma, high_dma }`, TOML
+  `[audio.sound_blaster]` + `--sb-irq`/`--sb-dma`/`--sb-high-dma`) sets the
+  mixer's power-on state, applied once at `Machine` construction like `SBCONFIG`.
+  A guest mixer reset (write any value to register `0x00`) restores the
+  *hardware* factory default (IRQ5/DMA1/DMA5) per the datasheet — not the host
+  config — because on real hardware reset always returns the card to factory
+  state and `SBCONFIG` re-runs to re-establish the setting. The guest (or a future
+  Toka re-init) is responsible for re-configuring after a reset.
+
 
