@@ -1038,6 +1038,16 @@ impl Vga {
         self.mode
     }
 
+    /// Set the border/overscan color (Attribute register 11h). Stored raw; the
+    /// raster path masks it to 6 bits when resolving the border color.
+    pub fn set_overscan(&mut self, value: u8) {
+        self.attr.overscan = value;
+    }
+
+    pub fn overscan(&self) -> u8 {
+        self.attr.overscan
+    }
+
     pub fn palette_argb(&self) -> [u32; DAC_ENTRIES] {
         let mut out = [0u32; DAC_ENTRIES];
         for (index, slot) in out.iter_mut().enumerate() {

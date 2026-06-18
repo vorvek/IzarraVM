@@ -530,6 +530,9 @@ impl Machine {
         let ax = self.cpu.registers.eax() as u16;
         let ah = (ax >> 8) as u8;
         let al = ax as u8;
+        let bx = self.cpu.registers.ebx() as u16;
+        let bh = (bx >> 8) as u8;
+        let bl = bx as u8;
         if ah == 0x00 {
             match al {
                 // The 16-color planar modes this slice implements.
@@ -553,6 +556,14 @@ impl Machine {
                 }
                 _ => {}
             }
+        }
+        if ah == 0x0b {
+            // BH=0: BL is the border/overscan color (Attribute register 11h). BH=1
+            // is the CGA palette select, a rarely-used CGA-compat path; deferred.
+            if bh == 0x00 {
+                self.video.set_overscan(bl);
+            }
+            return;
         }
         if ah == 0x4f {
             self.handle_vbe(al);
@@ -3792,6 +3803,18 @@ mod tests {
             machine.video().read_u8(VGA_TEXT_MEMORY_SIZE - 2).unwrap(),
             b' '
         );
+    }
+
+    #[test]
+    fn int10_0bh_sets_border_overscan() {
+        // mov ax,0b00h; mov bx,0005h; int 10h; hlt  (AH=0Bh, BH=0 border, BL=5)
+        let rom = rom_with_code(&[0xb8, 0x00, 0x0b, 0xbb, 0x05, 0x00, 0xcd, 0x10, 0xf4]);
+        let mut machine =
+            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(machine.video().overscan(), 5);
     }
 
     #[test]
