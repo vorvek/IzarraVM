@@ -240,9 +240,10 @@ impl CrtcRegs {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Sequencer {
-    pub clocking_mode: u8, // idx 1 (bit 0 set = 8-dot chars; clear = 9-dot)
-    pub map_mask: u8,      // idx 2, low 4 bits
-    pub memory_mode: u8,   // idx 4
+    pub clocking_mode: u8,   // idx 1 (bit 0 set = 8-dot chars; clear = 9-dot)
+    pub map_mask: u8,        // idx 2, low 4 bits
+    pub char_map_select: u8, // idx 3 (map A bits 0,1,4 select the active font table)
+    pub memory_mode: u8,     // idx 4
 }
 
 /// Attribute Controller register block (3C0/3C1).
@@ -330,6 +331,11 @@ pub struct Vga {
     pub(crate) crtc_index: u8,
     // Legacy text/RAMDAC/cursor personality, folded in from VgaTextMode.
     pub(crate) text_memory: [u8; VGA_TEXT_MEMORY_SIZE],
+    // The writable font store: eight tables of 256 glyphs x 32 bytes (the max
+    // 8x32). Table 0 seeds from the ROM 8x16 font; the rest seed as copies, so a
+    // title that selects an unloaded table still renders. The Sequencer
+    // Character Map Select picks the active table; INT 10h AH=11h loads glyphs.
+    pub(crate) font: [[u8; 256 * 32]; 8],
     pub(crate) dac: Dac,
     pub(crate) cursor_offset: u16,
     pub(crate) cursor_start: u8,
@@ -365,6 +371,7 @@ impl Default for Vga {
             gc_index: 0,
             crtc_index: 0,
             text_memory,
+            font: Self::seed_fonts(),
             dac: Dac::default(),
             cursor_offset: 0,
             // The text cursor shape the BIOS loads for mode 03h (start scanline
@@ -396,6 +403,32 @@ impl Vga {
 
     pub fn frames_completed(&self) -> u64 {
         self.frames
+    }
+
+    /// Seed the eight font tables from the ROM 8x16 font: table 0 holds the
+    /// glyphs (rows 0..15 of each 32-byte slot, the rest zero), and tables 1..7
+    /// are copies so a title that selects an unloaded table still renders.
+    fn seed_fonts() -> [[u8; 256 * 32]; 8] {
+        let mut tables = [[0u8; 256 * 32]; 8];
+        for glyph in 0..256usize {
+            for row in 0..16usize {
+                tables[0][glyph * 32 + row] = crate::font::VGAFONT_8X16[glyph * 16 + row];
+            }
+        }
+        for table in 1..8 {
+            tables[table] = tables[0];
+        }
+        tables
+    }
+
+    /// The active font table index, decoded from the Sequencer Character Map
+    /// Select (index 3) map-A field (bits 0, 1, 4), the font plane 2 displays in
+    /// 256-glyph text. Map B (bits 2, 3, 5) is the second font used only in
+    /// 512-glyph mode, deferred here. (Abrash, Graphics Programming Black Book
+    /// ch.24.)
+    pub fn active_font_table(&self) -> usize {
+        let s = self.seq.char_map_select;
+        (s & 0x01) as usize | (((s >> 1) & 0x01) as usize) << 1 | (((s >> 4) & 0x01) as usize) << 2
     }
 
     /// Install a planar mode's timing and reset the beam to the top of frame.
@@ -623,14 +656,12 @@ impl Vga {
             let fg = (self.attr.palette[fg_index] & 0x3F) & self.pel_mask;
             let bg = (self.attr.palette[bg_index] & 0x3F) & self.pel_mask;
             let hide_fg = blink_enabled && blink_attr && blink_hide_phase;
-            // The 8x16 ROM font; commit 4 swaps this for the writable store. Bit 7
-            // of a font row is the leftmost pixel. font_line beyond the 16-row
-            // glyph is blank (a taller char cell on a reprogrammed max_scan).
-            let glyph_row = if font_line < 16 {
-                crate::font::VGAFONT_8X16[char_byte as usize * 16 + font_line]
-            } else {
-                0
-            };
+            // The active font table (Sequencer index 3); each glyph occupies a
+            // 32-byte slot, bit 7 of a row being the leftmost pixel. font_line
+            // beyond the slot is clamped (a taller char cell on a reprogrammed
+            // max_scan reads the last row of the slot).
+            let glyph_row =
+                self.font[self.active_font_table()][char_byte as usize * 32 + font_line.min(31)];
             let extend_ninth = (0xC0..=0xDF).contains(&char_byte);
             let base_x = col * char_width as usize;
             for px in 0..char_width as usize {
@@ -945,6 +976,7 @@ impl Vga {
         match index {
             0x01 => self.seq.clocking_mode = value,
             0x02 => self.seq.map_mask = value & 0x0F,
+            0x03 => self.seq.char_map_select = value,
             0x04 => {
                 self.seq.memory_mode = value;
                 // Chain-4 (bit 3) cleared while in chained 256-color (mode 13h)
@@ -2773,5 +2805,48 @@ mod tests {
             raster.pixels[border], 0,
             "scanline 400 is the border, not active"
         );
+    }
+
+    #[test]
+    fn font_store_is_writable_per_table() {
+        let mut vga = Vga::default();
+        text_put(&mut vga, 0, 0, 0x41, 0x0F); // 'A', white on black
+        // Make table 0's 'A' blank and table 1's 'A' solid across the glyph rows.
+        for row in 0..16usize {
+            vga.font[0][0x41 * 32 + row] = 0x00;
+            vga.font[1][0x41 * 32 + row] = 0xFF;
+        }
+        // Table 0 (default): the glyph is blank, so the pixel is the background.
+        assert_eq!(vga.active_font_table(), 0);
+        assert_eq!(vga.render_text_row(0)[0], 0, "table 0 'A' is blank");
+        // Selecting table 1 shows its own solid glyph.
+        vga.seq.char_map_select = 0x01; // map-A bit 0 -> table index 1
+        assert_eq!(vga.active_font_table(), 1);
+        assert_eq!(
+            vga.render_text_row(0)[0],
+            15,
+            "table 1 'A' is solid -> foreground"
+        );
+    }
+
+    #[test]
+    fn sequencer_char_map_select_picks_the_active_font() {
+        let mut vga = Vga::default();
+        text_put(&mut vga, 0, 0, 0x41, 0x0F);
+        // Table 4 is selected by map-A bit 2 (Sequencer index 3 bit 4).
+        for row in 0..16usize {
+            vga.font[0][0x41 * 32 + row] = 0x00;
+            vga.font[4][0x41 * 32 + row] = 0xFF;
+        }
+        // Writing the Sequencer Character Map Select (index 3) through the port
+        // switches the active table.
+        vga.write_port(0x3C4, 0x03);
+        vga.write_port(0x3C5, 0x00); // SR3 = 0 -> table 0 (blank)
+        assert_eq!(vga.active_font_table(), 0);
+        assert_eq!(vga.render_text_row(0)[0], 0);
+        vga.write_port(0x3C4, 0x03);
+        vga.write_port(0x3C5, 0x10); // SR3 bit 4 -> map-A bit 2 -> table 4 (solid)
+        assert_eq!(vga.active_font_table(), 4);
+        assert_eq!(vga.render_text_row(0)[0], 15);
     }
 }
