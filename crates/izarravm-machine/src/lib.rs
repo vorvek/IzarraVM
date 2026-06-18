@@ -5,8 +5,8 @@ use izarravm_cpu::{Cpu386, CpuError, Registers, SegmentIndex, SegmentRegister};
 pub use izarravm_video::MARGO_ID_VALUE;
 use izarravm_video::{
     DAC_ENTRIES, MARGO_MMIO_SIZE, MARGO_VBE_MODES, MARGO_VRAM_SIZE, Margo, TextFrame,
-    VGA_MODE13H_BASE, VGA_PLANAR_WINDOW_SIZE, VGA_TEXT_BASE, VGA_TEXT_MEMORY_SIZE, Vga, VgaRaster,
-    VideoMode, bytes_per_pixel, pixel_format, vbe_mode,
+    VGA_MODE13H_BASE, VGA_PLANAR_WINDOW_SIZE, VGA_TEXT_BASE, VGA_TEXT_MEMORY_SIZE,
+    VGA_TEXT_PAGE_STRIDE, Vga, VgaRaster, VideoMode, bytes_per_pixel, pixel_format, vbe_mode,
 };
 use thiserror::Error;
 
@@ -555,6 +555,19 @@ impl Machine {
                 }
                 _ => {}
             }
+        }
+        if ah == 0x05 {
+            // INT 10h AH=05h SELECT ACTIVE DISPLAY PAGE (RBIL INTERRUP.A:2162).
+            // AL is the page number. The 80x25 color text page stride is 4096
+            // bytes (0x1000); the CRTC start address is a word/cell address in
+            // mode 03h's word mode, so page N sits at cell N*2048 and eight pages
+            // fill the 32 KB aperture. Routed through set_start_address so the
+            // change latches at the next vretrace (no mid-frame tear), matching
+            // what the BIOS writes to CRTC 0C/0Dh. Page 0 is the default.
+            let page = u32::from(al);
+            self.video
+                .set_start_address(page * (VGA_TEXT_PAGE_STRIDE / 2) as u32);
+            return;
         }
         if ah == 0x0b {
             // BH=0: BL is the border/overscan color (Attribute register 11h). BH=1
@@ -4053,6 +4066,68 @@ mod tests {
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
         assert_eq!(reason, StopReason::Halted);
         assert_eq!(machine.video().overscan(), 5);
+    }
+
+    #[test]
+    fn int10_ah05_sets_the_text_page_via_start_address() {
+        // mov ax,0501h; int 10h; hlt  (AH=05h, AL=1 -> display page 1)
+        let rom = rom_with_code(&[0xb8, 0x01, 0x05, 0xcd, 0x10, 0xf4]);
+        let mut machine =
+            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        // Page 1 sits at byte 4096 = cell 2048. AH=05h routes through
+        // set_start_address (the vretrace latch), so the value is buffered in
+        // pending_start before the next frame boundary applies it.
+        assert_eq!(
+            machine.video().pending_start_address(),
+            Some(2048),
+            "AH=05h page 1 buffers start address 2048 (cell)"
+        );
+        assert_eq!(
+            machine.video().crtc_start_address(),
+            0,
+            "start address applies at the next vretrace, not mid-frame"
+        );
+    }
+
+    #[test]
+    fn int10_ah05_page_flip_scrolls_through_the_machine() {
+        // Drive a full AH=05h page flip end-to-end: pre-seed page 0 and page 1
+        // with distinct glyphs, call the BIOS service for page 1, run a frame
+        // so the latch applies, and confirm the pixel scanout reads page 1.
+        //   mov ax,0501h ; AH=05h, AL=1 (display page 1)
+        //   int 10h
+        //   hlt
+        let rom = rom_with_code(&[0xb8, 0x01, 0x05, 0xcd, 0x10, 0xf4]);
+        let mut machine =
+            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+
+        // Page 0 cell 0 = 'A'; page 1 cell 0 (cell 2048, byte 4096) = 'Z'.
+        let video = machine.video_mut();
+        video.write_u8(0, b'A').unwrap();
+        video.write_u8(1, 0x0F).unwrap();
+        video.write_u8(4096, b'Z').unwrap();
+        video.write_u8(4097, 0x0F).unwrap();
+
+        machine.run_until_halt_or_cycles(1_000_000).unwrap();
+
+        // The latch is buffered; the start address has not applied yet.
+        let video = machine.video_mut();
+        assert_eq!(
+            video.frame().cells[0].character,
+            b'A',
+            "before vretrace the displayed page is still 0"
+        );
+        // Advance one frame so finalize_frame applies the buffered start address.
+        let dots = video.frame_dots();
+        video.advance(dots);
+        assert_eq!(
+            video.frame().cells[0].character,
+            b'Z',
+            "after vretrace the displayed page scrolls to page 1"
+        );
     }
 
     #[test]

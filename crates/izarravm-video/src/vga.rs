@@ -405,6 +405,19 @@ impl Vga {
         self.frames
     }
 
+    /// The active CRTC Start Address (0C/0Dh), the display-address counter value
+    /// latched at the last frame boundary. In word mode (mode 03h) this is a
+    /// cell/word address into the text buffer.
+    pub fn crtc_start_address(&self) -> u32 {
+        self.crtc.start_address
+    }
+
+    /// The start-address change buffered by the last `set_start_address`, applied
+    /// at the next vretrace (finalize_frame). `None` when no change is pending.
+    pub fn pending_start_address(&self) -> Option<u32> {
+        self.pending_start
+    }
+
     /// Seed the eight font tables from the ROM 8x16 font: table 0 holds the
     /// glyphs (rows 0..15 of each 32-byte slot, the rest zero), and tables 1..7
     /// are copies so a title that selects an unloaded table still renders.
