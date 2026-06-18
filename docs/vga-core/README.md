@@ -23,7 +23,7 @@ it. What is in:
 | Area | Covered in slice 1 |
 |------|--------------------|
 | Mode | `0Dh` (320×200×16 planar), set via `set_mode_0dh` / `INT 10h AH=00h` analog |
-| Legacy | Text mode, mode `13h` (chained 256-color), the 256-entry DAC, the text cursor — folded in from the former `VgaTextMode` |
+| Legacy | Text mode, mode `13h` (chained 256-color, now routed through the same raster engine as the planar and mode-X paths), the 256-entry DAC, the text cursor — folded in from the former `VgaTextMode` |
 | Planar memory | Four-plane model, write modes 0–3, read modes 0–1, latches, data-rotate/ALU, Map Mask, Bit Mask, Set/Reset |
 | Sequencer (`3C4/3C5`) | Map Mask (2), Memory Mode (4); Clocking Mode (1) char-width feeds the dot count |
 | Graphics Ctrl (`3CE/3CF`) | Set/Reset (0), Enable Set/Reset (1), Color Compare (2), Data Rotate/Function (3), Read Map (4), Mode (5), Color Don't Care (7), Bit Mask (8) |
@@ -156,17 +156,20 @@ Divergences (fidelity directive):
 ## Slice 5 coverage
 
 Slice 5 adds the unchained 256-color planar modes: classic Mode X (320x240, square
-pixels) and 320x200 unchained (mode Y). Unlike the chained mode 13h (a flat linear
-64000-byte buffer), these run the 256 KB planar memory with chain-4 off, so each
-pixel is a full 8-bit DAC index living in one of four column-interleaved planes.
+pixels) and 320x200 unchained (mode Y). Unlike the chained mode 13h (whose chain-4
+CPU write decode auto-routes byte N to plane N & 3 at plane-offset N >> 2), these run
+the 256 KB planar memory with chain-4 off, so each CPU write targets the Map Mask
+plane and the raw offset; each pixel is a full 8-bit DAC index living in one of four
+column-interleaved planes. The CRTC display scanout is shared by both (see "Slice 8
+coverage").
 
 | Area | Covered in slice 5 |
 |------|--------------------|
 | Entry | A guest write clearing the Sequencer Memory Mode (04h) chain-4 bit while in mode 13h enters `VideoMode::ModeX` with a 320x200 unchained base; setting the bit again reverts to chained mode 13h |
 | Geometry | Honored guest CRTC vertical timing (06h/07h/09h/10h/11h/12h/15h/16h) via a raw register file and `recompute_vertical_timing`, so Abrash's bang retunes to 320x240 (vtotal 527, vdisp_end 480, 240 source rows double-scanned to 480) and a bare mode Y stays 320x200 |
-| Scanout | `render_modex_row`: `plane = x & 3`, plane offset `row_base + (x >> 2)`, the byte as the 8-bit DAC index directly (no attribute palette, no 6-bit mask) |
+| Scanout | `render_256color_row`: `plane = x & 3`, plane offset `row_base + (x >> 2)`, the byte as the 8-bit DAC index directly (no attribute palette, no 6-bit mask) |
 | Writes | The existing planar datapath (Map Mask + write modes + latches); the A0000 planar aperture is the full 64 KB |
-| Page flipping | The existing start-address vretrace latch; `render_modex_row` bases `row_base` on it |
+| Page flipping | The existing start-address vretrace latch; `render_256color_row` bases `row_base` on it |
 | Presentation | The `VgaRaster` path, pixels resolved through the 256-entry DAC |
 
 The semantics are pinned to Abrash's Graphics Programming Black Book chapters 47-49
@@ -190,9 +193,10 @@ Divergences (fidelity directive):
    "Slice 6 coverage."
 2. **Mode-X pel-pan landed in slice 7.** The 8-bit 256-color pixel pan is now
    applied as a 0-3 fine column shift via the shared `pel_pan`; see "Slice 7
-   coverage." Chained mode 13h pel-pan (0-7, one pel per byte) stays deferred;
-   byte-granular start-address scroll and page flipping (the primary mode-X
-   mechanism) remain the coarse-scroll path.
+   coverage." Byte-granular start-address scroll and page flipping (the primary
+   mode-X mechanism) remain the coarse-scroll path. Chained mode 13h shares the
+   planar scanout and the same 0-3 pel-pan (see "Slice 8 coverage"), so there is no
+   distinct 13h pel-pan to defer.
 3. **Only the chain-4 to unchained-planar transition is modeled,** not the full
    odd/even host-addressing matrix.
 4. **The 256-color byte is the DAC index directly.** Attribute Mode Control bit 6
@@ -217,7 +221,7 @@ unchanged, and only the `row_base` origin changes below the split.
 | Area | Covered in slice 6 |
 |------|--------------------|
 | Shared origin | `split_origin`: the display-address origin decision (start address vs the reload-to-zero below-split region) factored out of the 16-color path and shared by both render paths |
-| Mode-X split | `render_modex_row` routes through `split_origin`; below the compare row the address counter reloads to 0 and source-row counting restarts at `line_compare + 1` |
+| Mode-X split | `render_256color_row` routes through `split_origin`; below the compare row the address counter reloads to 0 and source-row counting restarts at `line_compare + 1` |
 | Comparison units | Scan-counter lines, the same units the beam and the other vertical-timing registers use; not divided by the double-scan factor |
 | Double-scan | Divides the split source row exactly as it divides the top region, so a 320x240 split holds each split source row for two scanlines |
 
@@ -257,7 +261,7 @@ free, restoring the symmetry the 16-color path already had.
 | Area | Covered in slice 7 |
 |------|--------------------|
 | Shared pel-pan | `pel_pan`: the effective pel-pan decision (the 13h value masked to 0-15, forced to 0 below the split when AC 10h bit 5 is set) factored out of the 16-color path and shared by both render paths |
-| Mode-X pel-pan | `render_modex_row` derives `pan = pel_pan(below_split) & 0x03` (one plane per pel, so the fine range is 0-3; a pan of 4 equals a start-address bump) and addresses column x as plane `(x+pan)&3` at plane offset `row_base + ((x+pan)>>2)` |
+| Mode-X pel-pan | `render_256color_row` derives `pan = pel_pan(below_split) & 0x03` (one plane per pel, so the fine range is 0-3; a pan of 4 equals a start-address bump) and addresses column x as plane `(x+pan)&3` at plane offset `row_base + ((x+pan)>>2)` |
 | Below-split forcing | The AC 10h bit 5 forcing applies to mode X through the same `pel_pan`, so a below-split scanline ignores the pan exactly as the 16-color path does |
 | Live (not latched) | Pel-pan applies at the scanline of the write, so per-scanline mode-X pel-pan raster effects work, as they do for 16-color |
 
@@ -267,7 +271,8 @@ and the below-split bit confirmed against RBIL `PORTS.B` (AC index 13h,
 table P0668; AC Mode Control 10h bit 5, table P0664). Abrash states the pel-pan
 range as the pixel count between coarse start-address bumps (8 px per byte for
 16-color -> 0-7); applied to mode X's 4-px-per-address-unit organization that is
-0-3. Chained mode 13h pel-pan (0-7) is a different addressing and stays deferred.
+0-3. Chained mode 13h shares this scanout and the 0-3 range (see "Slice 8
+coverage").
 
 The done-signal is equality, proven at unit
 (`vga::tests::mode_x_pel_pan_shifts_the_column_origin_by_the_pan_value`,
@@ -280,19 +285,88 @@ full 8-bit DAC index.
 Target, honesty note: the mode-X smooth scroll is the 256-color scroller genre
 workload (a playfield that scrolls a fraction of a pixel per frame), the same
 genre as the slice-5/6 mode-X coverage. A specific released-source title was not
-inspected, matching the prior honesty notes. Chained mode 13h pel-pan (0-7),
-which a linear-buffer scroller like Doom's mode 13h would use, is out of scope
-here.
+inspected, matching the prior honesty notes. The chained mode-13h linear-buffer
+scroller (Doom-class mode 13h) is covered in slice 8.
 
 Divergences (fidelity directive):
 
-1. **Chained mode 13h pel-pan (0-7) is deferred.** Mode 13h's flat-linear
-   scanout (one pel per byte) has a different fine range and addressing; it is
-   its own slice.
+1. **Chained mode 13h pel-pan landed in slice 8.** Chained mode 13h shares the
+   planar 256-color scanout with mode X, so it inherits the 0-3 pel-pan (one plane
+   per pel, four pels per plane-offset address) and has no distinct pel-pan to
+   defer; see "Slice 8 coverage."
 2. **CRTC 08h byte panning and preset-row-scan re-alignment at the split stay
    deferred** (slice-4 divergence 4), unchanged for mode X.
 3. **Pel-pan values 4-7 fold into a start-address bump** in mode X and are
    masked out (`& 0x03`); they are beyond-useful, not a distinct behavior.
+
+## Slice 8 coverage
+
+Slice 8 deletes the early linear-buffer shortcut for chained mode 13h and routes
+it through the same raster engine (beam, catch-up, finalize, `VgaRaster`
+presentation) as the planar and mode-X paths. The key finding is that chain-4
+(Sequencer Memory Mode 04h bit 3) changes **only the CPU write/read decode**; the
+CRTC display scanout reads the raw four-plane VRAM identically whether chain-4 is
+on (mode 13h) or off (mode X). So mode 13h reuses the mode-X renderer; the only
+13h-specific behavior is the chain-4 CPU write routing. The stale flat
+`Framebuffer` field, its accessors, the separate `ActiveDisplay::Mode13h`
+presentation, and the 64000-byte aperture cap are all gone.
+
+| Area | Covered in slice 8 |
+|------|--------------------|
+| Renderer | `render_256color_row` (renamed from `render_modex_row`): the shared planar scanout, `plane = x & 3`, plane offset `row_base + (x >> 2)`, the byte as the 8-bit DAC index; `render_scanline` dispatches both `Mode13h` and `ModeX` to it |
+| Chain-4 writes | `cpu_write_chain4` / `cpu_read_chain4`: byte N routes straight to plane `N & 3` at plane-offset `N >> 2`, bypassing the planar datapath (Abrash, Graphics Programming Black Book ch.47) |
+| Timing | `CrtcTiming::mode13h`: standard 320x200 70 Hz, double-scanned to 400 scanlines (200 source rows), offset 40; `set_mode13h` installs it, resets the beam, and resizes the work buffer |
+| Bus | The 64 KB A0000 window serves Planar, ModeX, and Mode13h alike; mode 13h picks the chain-4 decode; `active_display` returns `VgaRaster` for all three |
+| Start-address vretrace latch | The generic CRTC 0C/0D latch applies to mode 13h by construction |
+| CRTC Line Compare split | `split_origin` applies to mode 13h by construction |
+| AC pel-pan (0-3) | The shared `pel_pan` applies to mode 13h by construction (same mask, same below-split forcing as mode X) |
+
+The semantics are pinned to Abrash's Graphics Programming Black Book chapter 47
+("Mode X: 256-Color VGA Magic"): the `M = N/4, P = N mod 4` scanout definition
+and the statement that entering mode X from mode 13h needs "no need to alter any
+horizontal values, because mode 13H and Mode X both have 320-pixel horizontal
+resolutions." The 0-3 pel-pan range is corroborated by RBIL `PORTS.B` (AC Mode
+Control 10h bit 6 PELCLK/2, the 8-bit-color gate set only in mode 13h; AC index
+13h table P0662) and FreeVGA (AC 10h bit 6 "8BIT ... set to 0 in all other
+modes"): in 256-color the serializer emits four pixels per character clock, so
+the useful pel-pan range is 0 to 3.
+
+The done-signal is equality, proven at unit
+(`vga::tests::mode13h_scanout_is_column_interleaved_8bit_direct`,
+`mode13h_chain4_write_routes_byte_n_to_plane_n_mod_4`,
+`mode13h_pel_pan_shifts_the_column_origin_by_the_pan_value`,
+`mode13h_pel_pan_below_split_is_forced_to_zero_only_when_enabled`,
+`mode13h_line_compare_split_renders_top_scrolled_and_bottom_from_offset_zero`) and
+end-to-end (`mode13h_320x200_through_the_machine`,
+`mode13h_pel_pan_smooth_scroll_through_the_machine`,
+`mode13h_line_compare_split_through_the_machine`) levels: a chain-4 write scans
+out at its pixel with its full 8-bit value, the pel-pan rotates the column
+origin, and the split reloads to offset 0.
+
+Presentation dimension note: mode 13h goes from the old 320x200 flat surface to
+the full-frame raster (320 x `vtotal` ~449, active region 400 scanlines = 200
+source rows double-scanned), consistent with how mode 0Dh and mode X already
+present. The active content for a standard linear 320x200 fill is byte-identical
+to the old flat path: chain-4 writes byte N where the shared scanout reads pixel
+N.
+
+Target, honesty note: the workload is the linear-buffer 256-color scroller genre,
+a playfield drawn to the A0000 linear aperture under chain-4 (Doom-class mode
+13h). The chain-4 write pattern and the shared planar scanout are pinned to
+Abrash ch.47. No released-source title was inspected for the chain-4 write
+pattern; the Doom source is public and runs mode 13h, but it was not consulted in
+this slice.
+
+Divergences (fidelity directive):
+
+1. **Mode-13h guest vertical-CRTC-bang retuning is deferred.** Mode 13h installs
+   fixed 320x200 70Hz timing at entry; only mode X honors the guest's vertical
+   CRTC bang. The tweaked-13h geometry (320x400, 360-wide) is mode-X-adjacent
+   territory and stays deferred.
+2. **CRTC 08h byte panning and preset-row-scan re-alignment at the split stay
+   deferred** (slice-4 divergence 4), unchanged for mode 13h.
+3. **Pel-pan values 4-7 fold into a start-address bump** and are masked out
+   (`& 0x03`); they are beyond-useful, not a distinct behavior.
 
 ## Latch rules
 
@@ -364,8 +438,9 @@ These are simplifications recorded for later tightening, not hardware behavior:
   display-address counter and the byte/word/doubleword transform (see "Slice 3
   coverage"); these are no longer approximations.
 - **The A0000 aperture** routes to the planar datapath when the core is in a
-  planar mode, and to the flat mode-13h buffer otherwise; the planar window is the
-  64 KB `A0000..AFFFF` range.
+  planar mode, to the chain-4 decode in mode 13h, and to the unchained planar
+  datapath in mode X; the window is the 64 KB `A0000..AFFFF` range. (Mode 13h was
+  once a separate flat buffer; slice 8 routed it through the raster engine.)
 - **Full CRTC vertical timing** (`text_03h`, `mode_0dh`) uses conventional values;
   per-mode timing tables are added as modes land.
 
