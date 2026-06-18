@@ -467,26 +467,35 @@ impl Vga {
     }
 
     /// Assemble one unchained 256-color (mode X) scanline. Four planes are
-    /// column-interleaved: pixel x is plane `x & 3` at plane offset `row_base +
-    /// (x >> 2)`, and the byte is the 8-bit DAC index directly (no attribute palette,
-    /// no 6-bit mask). `counter_line` is in scan-counter units; double-scan maps it to
-    /// the source row, exactly as the 16-color path.
+    /// column-interleaved: pixel x is plane `x_eff & 3` at plane offset `row_base +
+    /// (x_eff >> 2)`, where `x_eff = x + pan`, and the byte is the 8-bit DAC index
+    /// directly (no attribute palette, no 6-bit mask). `counter_line` is in
+    /// scan-counter units; double-scan maps it to the source row, exactly as the
+    /// 16-color path.
     /// The CRTC Line Compare split is applied: at and below `line_compare + 1` the
     /// display-address counter reloads to 0 and row counting restarts there (Abrash,
-    /// Graphics Programming Black Book ch.30). Pel-pan does not exist for mode X yet,
-    /// so its forced-to-zero-below-split behavior is deferred to backlog slice #2.
+    /// Graphics Programming Black Book ch.30). The AC Horizontal Pixel Panning
+    /// register (13h) applies as a fine 0-3 column shift (one plane per pel) through
+    /// the shared `pel_pan`, which also forces it to 0 below the split when AC Mode
+    /// Control (10h) bit 5 is set; chained mode 13h pel-pan (0-7) is deferred.
     pub fn render_modex_row(&self, counter_line: u32) -> Vec<u8> {
         let width = self.crtc.hdisp_end as usize;
+        let below_split = counter_line > self.crtc.line_compare;
         let (start, first_line) = self.split_origin(counter_line);
         // The split branch returns first_line = line_compare + 1 and is taken only when
         // counter_line > line_compare, so counter_line >= first_line holds: the
         // subtraction never underflows.
         let source_row = (counter_line - first_line) / self.scan_factor();
         let row_base = start + source_row * self.crtc.offset * 2;
+        // Mode-X pel-pan: one plane per pel, so the fine range is 0-3 (a pan of 4
+        // equals a start-address bump). The below-split forcing is shared with the
+        // 16-color path through pel_pan.
+        let pan = (self.pel_pan(below_split) & 0x03) as u32;
         let mut row = vec![0u8; width];
         for (x, slot) in row.iter_mut().enumerate() {
-            let plane = x & 3;
-            let ma = row_base + (x >> 2) as u32;
+            let x_eff = x as u32 + pan;
+            let plane = (x_eff & 3) as usize;
+            let ma = row_base + (x_eff >> 2);
             let off = display_offset(self.crtc.mode_control, self.crtc.underline_loc, ma);
             *slot = self.vram[plane * VGA_PLANE_SIZE + off];
         }
@@ -1881,6 +1890,94 @@ mod tests {
         // Pixels 0..3 are planes 0..3 at offset 0, as full 8-bit DAC indices.
         assert_eq!(&row[0..4], &[0x10, 0x20, 0x30, 0x40]);
         assert_eq!(row[4], 0x11, "pixel 4 wraps to plane 0 at plane offset 1");
+    }
+
+    #[test]
+    fn mode_x_pel_pan_shifts_the_column_origin_by_the_pan_value() {
+        // A distinct byte per plane and plane offset so every column is recognizable;
+        // values reach above 0x3F, re-proving the 8-bit-direct DAC read.
+        fn byte(plane: usize, off: usize) -> u8 {
+            ((plane as u32 * 0x11 + off as u32 * 7 + 0x40) & 0xFF) as u8
+        }
+        let mut vga = Vga::default();
+        vga.set_mode13h();
+        vga.write_port(0x3C4, 0x04);
+        vga.write_port(0x3C5, 0x06); // mode X, 320x200 double-scanned base
+        for plane in 0..VGA_PLANES {
+            for off in 0..VGA_PLANE_SIZE {
+                vga.vram[plane * VGA_PLANE_SIZE + off] = byte(plane, off);
+            }
+        }
+        vga.attr.pixel_pan = 0;
+        let reference = vga.render_modex_row(0); // top line, no split forcing
+        for pan in 1..=3u8 {
+            vga.attr.pixel_pan = pan;
+            let row = vga.render_modex_row(0);
+            for x in 0..(reference.len() - pan as usize) {
+                assert_eq!(
+                    row[x],
+                    reference[x + pan as usize],
+                    "pan {pan} shifts the row so column x reads the pan-0 column x+pan"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mode_x_pel_pan_rotates_the_plane_sequence() {
+        // Distinct bytes per plane at plane offset 0 (values above 0x3F prove the
+        // 8-bit-direct DAC read); other offsets stay cleared.
+        let plane0_byte: [u8; VGA_PLANES] = [0x40, 0x50, 0x60, 0x70];
+        let mut vga = Vga::default();
+        vga.set_mode13h();
+        vga.write_port(0x3C4, 0x04);
+        vga.write_port(0x3C5, 0x06); // mode X
+        for (plane, &b) in plane0_byte.iter().enumerate() {
+            vga.vram[plane * VGA_PLANE_SIZE] = b;
+        }
+        // With pan N (0..3), column 0 reads plane N at plane offset 0: the
+        // (0,1,2,3) origin rotates to (N, N+1, ...).
+        for pan in 0..VGA_PLANES as u8 {
+            vga.attr.pixel_pan = pan;
+            let row = vga.render_modex_row(0);
+            assert_eq!(
+                row[0], plane0_byte[pan as usize],
+                "pan {pan} rotates column 0 to plane {pan} at plane offset 0"
+            );
+        }
+    }
+
+    #[test]
+    fn mode_x_pel_pan_below_split_is_forced_to_zero_only_when_enabled() {
+        // Below the CRTC Line Compare split, render the first split row (source row 0
+        // at plane offset 0) with distinct bytes per plane so a pel-pan shift is
+        // visible. `mode_control` carries Attribute index 10h, `pan` the pel-pan value.
+        fn render(mode_control: u8, pan: u8) -> Vec<u8> {
+            let mut vga = Vga::default();
+            vga.set_mode13h();
+            vga.write_port(0x3C4, 0x04);
+            vga.write_port(0x3C5, 0x06); // mode X
+            let plane0_byte: [u8; VGA_PLANES] = [0x40, 0x50, 0x60, 0x70];
+            for (plane, &b) in plane0_byte.iter().enumerate() {
+                vga.vram[plane * VGA_PLANE_SIZE] = b;
+            }
+            vga.crtc.line_compare = 100;
+            vga.attr.pixel_pan = pan;
+            vga.attr.mode_control = mode_control;
+            vga.render_modex_row(101) // first split line: below_split, source row 0, offset 0
+        }
+        // bit 5 set: pel-pan forced to 0 below the split, so pan 1 equals pan 0.
+        assert_eq!(
+            render(0x20, 1),
+            render(0x20, 0),
+            "Attribute 10h bit 5 set forces split-region pel-pan to 0"
+        );
+        // bit 5 clear: pel-pan applies below the split, so pan 1 differs from pan 0.
+        assert_ne!(
+            render(0x00, 1),
+            render(0x00, 0),
+            "Attribute 10h bit 5 clear pans the split region"
+        );
     }
 
     #[test]
