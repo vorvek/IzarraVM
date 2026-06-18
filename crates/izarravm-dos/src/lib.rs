@@ -417,6 +417,62 @@ impl DosKernel {
         Ok(drive.resolve_dos_path(&name).map_err(|_| 0x03))
     }
 
+    /// Resolve DS:DX to a host path and read the program image into an owned
+    /// Vec. Ok(Ok(image)) on success; Ok(Err(code)) when a DOS error code should
+    /// be returned (no drive -> 0x02, bad path -> 0x03, missing file -> 0x02,
+    /// host error -> 0x05); Err(DosError::Memory) for a guest-memory fault.
+    fn read_program_image(
+        &self,
+        mem: &Memory,
+        regs: &DosRegs,
+    ) -> Result<Result<Vec<u8>, u16>, DosError> {
+        let path = match self.resolve_open_path(mem, regs.ds, regs.dx)? {
+            Ok(path) => path,
+            Err(code) => return Ok(Err(code)),
+        };
+        let mut file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(err) => return Ok(Err(dos_io_error_code(&err))),
+        };
+        let mut image = Vec::new();
+        if let Err(err) = file.read_to_end(&mut image) {
+            return Ok(Err(dos_io_error_code(&err)));
+        }
+        Ok(Ok(image))
+    }
+
+    /// AH=4Bh AL=3: load an overlay into the caller-allocated segment named in
+    /// the EPB at ES:BX (#01591: load segment at 0x00, relocation factor at
+    /// 0x02). CF=0 on success; CF=1 + AX on error. A malformed MZ image maps to
+    /// 0x0B (bad format), inherited from the loader's error variants (marked).
+    fn exec_load_overlay(
+        &mut self,
+        mem: &mut Memory,
+        regs: &mut DosRegs,
+    ) -> Result<DosAction, DosError> {
+        let epb_base = usize::from(regs.es) * 16 + usize::from(regs.bx);
+        let load_seg = mem.read_u16(epb_base)?;
+        let reloc_factor = mem.read_u16(epb_base + 2)?;
+        let image = match self.read_program_image(mem, regs)? {
+            Ok(image) => image,
+            Err(code) => {
+                set_dos_error(regs, code);
+                return Ok(DosAction::Continue);
+            }
+        };
+        match load_overlay(&image, mem, load_seg, reloc_factor) {
+            Ok(()) => {
+                regs.cf = false;
+                Ok(DosAction::Continue)
+            }
+            Err(DosError::Memory(e)) => Err(DosError::Memory(e)),
+            Err(_) => {
+                set_dos_error(regs, 0x0b);
+                Ok(DosAction::Continue)
+            }
+        }
+    }
+
     /// Split a FindFirst filespec into (host directory, final-component pattern).
     /// Ok((dir, pattern)) on success; Err(code) is a DOS error code (0x02 no drive,
     /// 0x03 bad/non-C/traversal path). The pattern is the last path component (may
@@ -970,6 +1026,17 @@ impl DosKernel {
                 regs.cf = false;
                 Ok(DosAction::Continue)
             }
+            // AH=4Bh: EXEC. AL=3 (load overlay) is handled here; AL=0 (load and
+            // execute) is a later task in this slice. AL=1 (load without execute)
+            // and AL=4 (background) are not implemented and return 0x01 (invalid
+            // function), marked.
+            0x4b => match regs.ax as u8 {
+                0x03 => self.exec_load_overlay(mem, regs),
+                _ => {
+                    set_dos_error(regs, 0x01);
+                    Ok(DosAction::Continue)
+                }
+            },
             // Other file functions (find) and everything else are not yet
             // implemented; later slices fill them in. An unimplemented function
             // returns Continue so the IRET stub returns to the caller.
@@ -1212,6 +1279,31 @@ pub fn load_program(
     } else {
         load_com(image, mem, psp_segment)
     }
+}
+
+/// AH=4Bh AL=3: load an overlay at the caller-allocated `load_seg`, applying
+/// `reloc_factor` to an MZ image's relocations (0 for a raw .COM-format file).
+/// No PSP, no environment, no execution: the caller owns the memory and decides
+/// how to call the overlay.
+pub fn load_overlay(
+    image: &[u8],
+    mem: &mut Memory,
+    load_seg: u16,
+    reloc_factor: u16,
+) -> Result<(), DosError> {
+    let base = usize::from(load_seg) * 16;
+    if image.len() >= 2 && image[0] == b'M' && image[1] == b'Z' {
+        let exe = parse_exe(image)?;
+        for (i, &byte) in exe.module.iter().enumerate() {
+            mem.write_u8(base + i, byte)?;
+        }
+        apply_relocs(mem, base, exe.module.len(), exe.relocs, reloc_factor)?;
+    } else {
+        for (i, &byte) in image.iter().enumerate() {
+            mem.write_u8(base + i, byte)?;
+        }
+    }
+    Ok(())
 }
 
 /// Set the DOS error return convention: CF=1 and AX = the DOS error code.
@@ -1532,7 +1624,7 @@ mod tests {
     fn unimplemented_int21_function_is_noop() {
         let mut mem = Memory::new(4096).unwrap();
         let mut regs = DosRegs {
-            ax: 0x4b00, // AH=4Bh EXEC, not implemented this slice
+            ax: 0x4400, // AH=44h IOCTL, not implemented
             ..DosRegs::default()
         };
         let mut kernel = DosKernel::new();
@@ -3005,5 +3097,141 @@ mod tests {
             std::fs::metadata(dir.path().join("T.TXT")).unwrap().len(),
             4
         );
+    }
+
+    #[test]
+    fn load_overlay_copies_raw_bytes() {
+        let mut mem = Memory::new(0x10000).unwrap();
+        let image = [0x12u8, 0x34, 0x56];
+        load_overlay(&image, &mut mem, 0x0100, 0).unwrap();
+        let base = 0x0100 * 16;
+        assert_eq!(mem.read_u8(base).unwrap(), 0x12);
+        assert_eq!(mem.read_u8(base + 2).unwrap(), 0x56);
+    }
+
+    #[test]
+    fn load_overlay_applies_relocations() {
+        // A 1-page MZ image: a 0x20-byte header (fixed 0x1c bytes + a 4-byte
+        // relocation table at 0x1c), then one paragraph module holding a word
+        // 0x1000. Load at 0x0200 with a relocation factor of 0x0030; the word
+        // becomes 0x1030.
+        let mut image = vec![0u8; 512];
+        image[0..2].copy_from_slice(&0x5a4du16.to_le_bytes()); // "MZ"
+        image[2..4].copy_from_slice(&512u16.to_le_bytes()); // e_cblp = full page
+        image[4..6].copy_from_slice(&1u16.to_le_bytes()); // e_cp = 1 page
+        image[6..8].copy_from_slice(&1u16.to_le_bytes()); // e_crlc = 1
+        image[8..10].copy_from_slice(&2u16.to_le_bytes()); // e_cparhdr = 0x20 bytes
+        image[0x0a..0x0c].copy_from_slice(&0u16.to_le_bytes()); // e_minalloc
+        image[0x0c..0x0e].copy_from_slice(&0u16.to_le_bytes()); // e_maxalloc
+        image[0x18..0x1a].copy_from_slice(&0x1cu16.to_le_bytes()); // e_lfarlc = 0x1c
+        // relocation entry at 0x1c: (off=0, seg=0) -> module offset 0
+        image[0x1c..0x20].copy_from_slice(&[0, 0, 0, 0]);
+        // module at 0x20..: the word at module (0,0) = 0x1000
+        image[0x20..0x22].copy_from_slice(&0x1000u16.to_le_bytes());
+
+        let mut mem = Memory::new(0x10000).unwrap();
+        load_overlay(&image, &mut mem, 0x0200, 0x0030).unwrap();
+        assert_eq!(mem.read_u16(0x0200 * 16).unwrap(), 0x1030);
+    }
+
+    #[test]
+    fn load_overlay_rejects_truncated_mz() {
+        let mut mem = Memory::new(4096).unwrap();
+        let bad = [0x4du8, 0x5a]; // claims MZ but header shorter than 0x1c
+        assert!(load_overlay(&bad, &mut mem, 0x0100, 0).is_err());
+    }
+
+    #[test]
+    fn load_overlay_rejects_out_of_range_reloc() {
+        let mut image = vec![0u8; 512];
+        image[0..2].copy_from_slice(&0x5a4du16.to_le_bytes());
+        image[2..4].copy_from_slice(&512u16.to_le_bytes());
+        image[4..6].copy_from_slice(&1u16.to_le_bytes());
+        image[6..8].copy_from_slice(&1u16.to_le_bytes()); // one reloc
+        image[8..10].copy_from_slice(&2u16.to_le_bytes()); // header 0x20
+        image[0x18..0x1a].copy_from_slice(&0x1cu16.to_le_bytes()); // reloc table at 0x1c
+        image[0x1c..0x20].copy_from_slice(&[0xff, 0xff, 0xff, 0xff]); // far outside module
+        let mut mem = Memory::new(0x10000).unwrap();
+        assert!(matches!(
+            load_overlay(&image, &mut mem, 0x0200, 0),
+            Err(DosError::ExeRelocationOutOfRange)
+        ));
+    }
+
+    /// A kernel with `dir` as C: and a 1 MiB memory for overlay writes.
+    fn overlay_kernel(dir: &Path) -> (DosKernel, Memory) {
+        let mut kernel = DosKernel::new();
+        kernel.mount_c(HostDrive::mount_c(dir).unwrap());
+        let mem = Memory::new(1024 * 1024).unwrap();
+        (kernel, mem)
+    }
+
+    #[test]
+    fn ah4b_al3_loads_overlay_via_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("OV.BIN"), [0x5au8]).unwrap();
+        let (mut kernel, mut mem) = overlay_kernel(dir.path());
+        // ASCIZ name "C:\OV.BIN" at seg 0x1000:0 (linear 0x10000).
+        let name = b"C:\\OV.BIN";
+        for (i, &b) in name.iter().enumerate() {
+            mem.write_u8(0x10000 + i, b).unwrap();
+        }
+        mem.write_u8(0x10000 + name.len(), 0).unwrap();
+        // EPB #01591 at seg 0x1000:0x40: load_seg=0x0500, reloc=0.
+        mem.write_u16(0x10040, 0x0500).unwrap();
+        mem.write_u16(0x10042, 0).unwrap();
+        let mut regs = DosRegs {
+            ax: 0x4b03,
+            ds: 0x1000,
+            dx: 0x0000,
+            es: 0x1000,
+            bx: 0x0040,
+            ..DosRegs::default()
+        };
+        assert_eq!(
+            kernel.dispatch(0x21, &mut regs, &mut mem).unwrap(),
+            DosAction::Continue
+        );
+        assert!(!regs.cf);
+        assert_eq!(mem.read_u8(0x0500 * 16).unwrap(), 0x5a);
+    }
+
+    #[test]
+    fn ah4b_bad_subfunction_returns_0x01() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut kernel, mut mem) = overlay_kernel(dir.path());
+        for al in [0x01u16, 0x04] {
+            let mut regs = DosRegs {
+                ax: 0x4b00 | al,
+                ..DosRegs::default()
+            };
+            kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+            assert!(regs.cf);
+            assert_eq!(regs.ax, 0x01);
+        }
+    }
+
+    #[test]
+    fn ah4b_missing_overlay_file_returns_0x02() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut kernel, mut mem) = overlay_kernel(dir.path());
+        let name = b"C:\\NOPE.BIN";
+        for (i, &b) in name.iter().enumerate() {
+            mem.write_u8(0x10000 + i, b).unwrap();
+        }
+        mem.write_u8(0x10000 + name.len(), 0).unwrap();
+        mem.write_u16(0x10040, 0x0500).unwrap();
+        mem.write_u16(0x10042, 0).unwrap();
+        let mut regs = DosRegs {
+            ax: 0x4b03,
+            ds: 0x1000,
+            dx: 0x0000,
+            es: 0x1000,
+            bx: 0x0040,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x02);
     }
 }
