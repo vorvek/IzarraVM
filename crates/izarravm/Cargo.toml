@@ -10,7 +10,6 @@ authors.workspace = true
 [dependencies]
 clap.workspace = true
 eframe.workspace = true
-font8x8.workspace = true
 rfd.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

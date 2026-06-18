@@ -25,7 +25,6 @@ authors = ["IzarraVM contributors"]
 bitflags = "2.6"
 clap = { version = "4.5", features = ["derive", "env"] }
 cpal = "0.15"
-font8x8 = "0.3.1"
 gilrs = "0.11"
 midir = "0.10"
 serde = { version = "1.0", features = ["derive"] }

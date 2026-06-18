@@ -130,7 +130,6 @@ const VGA_DOT_HZ: u64 = 25_175_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveDisplay {
-    Text,
     VgaRaster,
     MargoLfb,
 }
@@ -856,15 +855,12 @@ impl Machine {
     }
 
     pub fn active_display(&self) -> ActiveDisplay {
+        // Every VGA mode (text, planar, mode X, mode 13h) now presents a raster
+        // through the core; Margo's linear framebuffer is the only other path.
         if self.margo_active {
             ActiveDisplay::MargoLfb
-        } else if matches!(
-            self.video.active_mode(),
-            VideoMode::Planar | VideoMode::ModeX | VideoMode::Mode13h
-        ) {
-            ActiveDisplay::VgaRaster
         } else {
-            ActiveDisplay::Text
+            ActiveDisplay::VgaRaster
         }
     }
 
@@ -2063,7 +2059,7 @@ mod tests {
     #[test]
     fn host_mode_set_selects_margo_lfb() {
         let mut machine = test_machine();
-        assert_eq!(machine.active_display(), ActiveDisplay::Text);
+        assert_eq!(machine.active_display(), ActiveDisplay::VgaRaster);
 
         machine.set_margo_mode_640x480x8();
 
@@ -3613,6 +3609,26 @@ mod tests {
     }
 
     #[test]
+    fn text_mode_scanout_through_the_machine() {
+        let mut machine = test_machine();
+        // A CP437 cell at B8000:0 (the solid block 0xDB) with a white-on-black
+        // attribute, written through the bus so it routes to text_memory.
+        machine.write_physical_u8(VGA_TEXT_BASE, 0xDB);
+        machine.write_physical_u8(VGA_TEXT_BASE + 1, 0x0F);
+        // A distinct DAC entry for the foreground index (15): red.
+        machine.video_mut().set_dac_entry(15, 63, 0, 0);
+        // Enough CPU time to finalize at least one frame.
+        machine.advance_devices(600_000);
+        assert!(matches!(machine.active_display(), ActiveDisplay::VgaRaster));
+        let raster = machine.vga_raster().expect("text presents a VgaRaster");
+        assert_eq!(raster.width, 720);
+        // The top-left glyph pixel scans out as DAC index 15 (the foreground).
+        assert_eq!(raster.pixels[0], 15);
+        // Resolved through the live DAC, entry 15 is red.
+        assert_eq!(machine.palette_argb()[15], 0x00FF_0000);
+    }
+
+    #[test]
     fn a0000_writes_route_to_the_planar_datapath_in_mode_0dh() {
         let mut machine = test_machine();
         machine.set_vga_mode_0dh();
@@ -3862,9 +3878,9 @@ mod tests {
 
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
         assert_eq!(reason, StopReason::Halted);
-        // Returning to text hands the display back to the VGA core text path and
-        // clears the Margo latch.
-        assert_eq!(machine.active_display(), ActiveDisplay::Text);
+        // Returning to text hands the display back to the VGA core text path
+        // (now a raster) and clears the Margo latch.
+        assert_eq!(machine.active_display(), ActiveDisplay::VgaRaster);
         assert_eq!(machine.video().active_mode(), VideoMode::Text);
         // set_text_mode blanks the buffer to spaces with the 0x07 attribute.
         assert_eq!(machine.video().read_u8(0).unwrap(), b' ');
