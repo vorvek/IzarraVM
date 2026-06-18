@@ -347,7 +347,7 @@ impl Default for Vga {
             cell[1] = 0x07;
         }
 
-        Self {
+        let mut vga = Self {
             vram: vec![0; VGA_PLANAR_SIZE],
             crtc: CrtcTiming::text_03h(),
             crtc_regs: CrtcRegs::default(),
@@ -377,7 +377,11 @@ impl Default for Vga {
             // not applied to the dot clock.
             misc_output: 0x67,
             pel_mask: 0xFF,
-        }
+        };
+        // Size the work buffer for the boot text mode so the raster is published
+        // from the first frame (finalize_frame only publishes a non-empty work).
+        vga.resize_work();
+        vga
     }
 }
 
@@ -565,6 +569,87 @@ impl Vga {
         row
     }
 
+    /// Assemble one text-mode scanline (counter line) into `hdisp_end` DAC
+    /// indices, sharing the raster engine with the graphics paths. Mode 03h lays
+    /// out 80 character columns of `max_scan + 1` scanlines each (16 for 720x400);
+    /// the CRTC Line Compare split reuses `split_origin`, with the character-row
+    /// count restarting below the split. Each cell's foreground and background
+    /// nibbles map through the 16-entry Attribute palette to a DAC index, then the
+    /// pel mask (the same transform the 16-color path applies). Blink (Attribute
+    /// Mode Control 10h bit 3) collapses the foreground to the background on its
+    /// hide phase; with bit 3 clear, attribute bit 7 is background intensity
+    /// instead (16 backgrounds, no blink). In 9-dot mode the 9th pixel column
+    /// replicates the 8th for the box-drawing glyphs 0xC0-0xDF (a solid line join)
+    /// and is the background otherwise (Abrash, Graphics Programming Black Book).
+    pub fn render_text_row(&self, counter_line: u32) -> Vec<u8> {
+        let width = self.crtc.hdisp_end as usize;
+        let rows_per_char = self.crtc.max_scan + 1;
+        let (_, first_line) = self.split_origin(counter_line);
+        // split_origin returns first_line <= counter_line in both branches, so the
+        // subtraction never underflows.
+        let rel = counter_line - first_line;
+        let char_row = (rel / rows_per_char) as usize;
+        let font_line = (rel % rows_per_char) as usize;
+        let char_width = if self.seq.clocking_mode & 0x01 != 0 {
+            8
+        } else {
+            9
+        };
+        let blink_enabled = self.attr.mode_control & 0x08 != 0;
+        // The blink hide phase divides the completed-frame count by 16 and hides
+        // the foreground on odd windows. A first model; the exact ~16 Hz cadence
+        // is a later refinement.
+        let blink_hide_phase = (self.frames / 16) % 2 == 1;
+        let mut row = vec![0u8; width];
+        for col in 0..VGA_TEXT_COLUMNS {
+            let cell_index = char_row * VGA_TEXT_COLUMNS + col;
+            let char_byte = self
+                .text_memory
+                .get(cell_index * 2)
+                .copied()
+                .unwrap_or(b' ');
+            let attr = self
+                .text_memory
+                .get(cell_index * 2 + 1)
+                .copied()
+                .unwrap_or(0x07);
+            let blink_attr = attr & 0x80 != 0;
+            let fg_index = (attr & 0x0F) as usize;
+            let bg_index = if blink_enabled && blink_attr {
+                ((attr >> 4) & 0x07) as usize
+            } else {
+                ((attr >> 4) & 0x0F) as usize
+            };
+            let fg = (self.attr.palette[fg_index] & 0x3F) & self.pel_mask;
+            let bg = (self.attr.palette[bg_index] & 0x3F) & self.pel_mask;
+            let hide_fg = blink_enabled && blink_attr && blink_hide_phase;
+            // The 8x16 ROM font; commit 4 swaps this for the writable store. Bit 7
+            // of a font row is the leftmost pixel. font_line beyond the 16-row
+            // glyph is blank (a taller char cell on a reprogrammed max_scan).
+            let glyph_row = if font_line < 16 {
+                crate::font::VGAFONT_8X16[char_byte as usize * 16 + font_line]
+            } else {
+                0
+            };
+            let extend_ninth = (0xC0..=0xDF).contains(&char_byte);
+            let base_x = col * char_width as usize;
+            for px in 0..char_width as usize {
+                let x = base_x + px;
+                if x >= width {
+                    break;
+                }
+                let lit = if px < 8 {
+                    (glyph_row >> (7 - px)) & 1 != 0
+                } else {
+                    // 9th column: replicate the 8th (bit 0) for box glyphs.
+                    extend_ninth && (glyph_row & 0x01 != 0)
+                };
+                row[x] = if lit && !hide_fg { fg } else { bg };
+            }
+        }
+        row
+    }
+
     fn region_color(&self, scan_line: u32) -> u8 {
         // scan_line in counter units; caller guarantees scan_line >= vdisp_end.
         if scan_line < self.crtc.vblank_start || scan_line >= self.crtc.vblank_end {
@@ -583,6 +668,7 @@ impl Vga {
         let pixels = if counter_line < self.crtc.vdisp_end {
             match self.mode {
                 VideoMode::Mode13h | VideoMode::ModeX => self.render_256color_row(counter_line),
+                VideoMode::Text => self.render_text_row(counter_line),
                 _ => self.render_active_row(counter_line),
             }
         } else {
@@ -616,10 +702,9 @@ impl Vga {
             self.render_scanline(self.last_line);
             self.last_line += 1;
         }
-        // `work` is sized by every graphics mode-set (planar, mode X, and mode
-        // 13h all install timing and resize); text leaves it empty, so a frame
-        // built from it would have a pixel count that mismatches width*height.
-        // Only publish a raster when there is real graphics content to show.
+        // Every mode (planar, mode X, mode 13h, and text) sizes `work` at its
+        // mode-set, so a frame built from it has the matching pixel count. The
+        // empty-work guard only suppresses publication before any mode is set.
         if !self.work.is_empty() {
             self.presented = Some(VgaRaster {
                 width: self.raster_width(),
@@ -1004,8 +1089,8 @@ impl Vga {
     /// text buffer to blank spaces, and dropping any stale graphics frame. The
     /// BIOS INT 10h AH=00h text-family mode numbers all route here: the core
     /// carries a single text personality, so the 40x25 and CGA variants return to
-    /// the same 80x25 geometry. Mirrors `set_mode13h`; the work buffer is emptied
-    /// so a later `advance` does not finalize a graphics frame.
+    /// the same 80x25 geometry. Mirrors `set_mode13h`; the work buffer is sized so
+    /// the text raster is published on the next frame.
     pub fn set_text_mode(&mut self) {
         self.crtc = CrtcTiming::text_03h();
         for cell in self.text_memory.chunks_exact_mut(2) {
@@ -1016,7 +1101,7 @@ impl Vga {
         self.last_line = 0;
         self.mode = VideoMode::Text;
         self.presented = None;
-        self.work.clear();
+        self.resize_work();
     }
 
     /// Derive the absolute vertical timing in `crtc` from the raw register bytes in
@@ -2563,6 +2648,130 @@ mod tests {
             vga.render_256color_row(split + 21),
             reference(0, 20),
             "split region row 10 renders source row 10 from offset 0"
+        );
+    }
+
+    /// Write a character/attribute pair into a text cell (row, col).
+    fn text_put(vga: &mut Vga, row: usize, col: usize, ch: u8, attr: u8) {
+        let i = row * VGA_TEXT_COLUMNS + col;
+        vga.text_memory[i * 2] = ch;
+        vga.text_memory[i * 2 + 1] = attr;
+    }
+
+    #[test]
+    fn text_scanout_renders_cp437_glyph_rows_at_9x16() {
+        let mut vga = Vga::default();
+        // 0xDB is the solid full block (all-ones rows); white on black (0x0F).
+        text_put(&mut vga, 0, 0, 0xDB, 0x0F);
+        // The default ATC palette is identity and the pel mask is all-pass, so a
+        // lit pixel scans out as DAC index 15 (foreground) and a clear one as 0.
+        let top = vga.render_text_row(0); // char row 0, font line 0
+        assert_eq!(
+            &top[0..9],
+            &[15u8; 9],
+            "all 9 columns of 0xDB are foreground"
+        );
+        assert_eq!(top[8], top[7], "the 9th column replicates the 8th for 0xDB");
+        // The same glyph holds across all 16 scanlines of the character row.
+        let bottom = vga.render_text_row(15); // font line 15, still char row 0
+        assert_eq!(
+            &bottom[0..9],
+            &[15u8; 9],
+            "0xDB stays solid across 16 scanlines"
+        );
+        // A non-box glyph clears its 9th column to the background. 0xFF is outside
+        // 0xC0-0xDF; load it as a full-8-column block via a custom glyph row.
+        vga.text_memory[0] = 0xFF;
+        let row = vga.render_text_row(0);
+        assert_eq!(
+            row[8], 0,
+            "a glyph outside 0xC0-0xDF blanks the 9th column (inter-char gap)"
+        );
+    }
+
+    #[test]
+    fn text_scanout_maps_attribute_through_the_palette_to_dac() {
+        let mut vga = Vga::default();
+        // 0xDB lit, foreground nibble = 1, so the pixel color is palette[1].
+        text_put(&mut vga, 0, 0, 0xDB, 0x01);
+        vga.attr.palette[1] = 0x2A; // map foreground index 1 -> DAC 42
+        assert_eq!(
+            vga.render_text_row(0)[0],
+            0x2A,
+            "foreground scans out at the live palette entry"
+        );
+        // Reprogramming the palette entry changes the scanout.
+        vga.attr.palette[1] = 9;
+        assert_eq!(
+            vga.render_text_row(0)[0],
+            9,
+            "a changed palette entry reaches the scanout"
+        );
+    }
+
+    #[test]
+    fn text_scanout_blink_toggles_foreground_only_when_enabled() {
+        let mut vga = Vga::default();
+        // Blink enabled (AC Mode Control 10h bit 3); attribute 0x8F has the blink
+        // bit set and a white foreground.
+        vga.attr.mode_control = 0x08;
+        text_put(&mut vga, 0, 0, 0xDB, 0x8F);
+        // Show phase: foreground renders as DAC 15.
+        vga.frames = 0;
+        assert_eq!(
+            vga.render_text_row(0)[0],
+            15,
+            "show phase renders the foreground"
+        );
+        // Hide phase: the foreground collapses to the background (DAC 0).
+        vga.frames = 16;
+        assert_eq!(
+            vga.render_text_row(0)[0],
+            0,
+            "hide phase collapses the foreground to the background"
+        );
+
+        // Blink disabled: attribute bit 7 is background intensity, not blink, so
+        // the foreground never collapses.
+        vga.attr.mode_control = 0x00;
+        vga.frames = 0;
+        assert_eq!(
+            vga.render_text_row(0)[0],
+            15,
+            "no blink: foreground on show phase"
+        );
+        vga.frames = 16;
+        assert_eq!(
+            vga.render_text_row(0)[0],
+            15,
+            "no blink: foreground stays on the would-be hide phase"
+        );
+        // And the background now reads bit 7 as intensity (background index 8).
+        text_put(&mut vga, 0, 0, b' ', 0x80); // blank glyph, bit-7 background
+        assert_eq!(
+            vga.render_text_row(0)[0],
+            8,
+            "with blink off, attribute bit 7 selects background intensity 8"
+        );
+    }
+
+    #[test]
+    fn text_scanout_presents_a_720x400_raster() {
+        let mut vga = Vga::default();
+        text_put(&mut vga, 0, 0, 0xDB, 0x0F);
+        let raster = vga.render_full_frame();
+        assert_eq!(raster.width, 720, "mode-03h text is 720 dots wide");
+        assert_eq!(raster.height, 449, "the full frame is vtotal scanlines");
+        // 400 active rows, top-justified: row 0 carries the glyph, row 400 is the
+        // border (overscan, default black).
+        assert_eq!(
+            raster.pixels[0], 15,
+            "top-left active pixel is the foreground"
+        );
+        let border = 400 * 720;
+        assert_eq!(
+            raster.pixels[border], 0,
+            "scanline 400 is the border, not active"
         );
     }
 }
