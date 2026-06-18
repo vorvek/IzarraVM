@@ -568,6 +568,10 @@ impl Machine {
             self.handle_int10_palette(al);
             return;
         }
+        if ah == 0x11 {
+            self.handle_int10_font(al);
+            return;
+        }
         if ah == 0x4f {
             self.handle_vbe(al);
         }
@@ -629,6 +633,54 @@ impl Machine {
                 let bytes = self.video.dac_block_bytes(bx as u8, cx);
                 self.write_guest_block(es_dx, &bytes);
             }
+            _ => {}
+        }
+    }
+
+    /// INT 10h AH=11h: the character-generator font services (RBIL). AL=00/10
+    /// loads a user font at ES:BP (CX glyphs, DX first char, BH bytes/char, BL
+    /// block); AL=01/11, 02/12, 04/14 load the ROM 8x14, 8x8, 8x16 fonts (BL
+    /// block); AL=03 sets the block specifier (BL -> Sequencer index 3). The 1x
+    /// variants also reprogram the CRTC character height. AL=30 (get font info)
+    /// and the graphics-mode text services are deferred. Register conventions
+    /// verified against the LGPL VGABios `biosfn_load_text_*`.
+    fn handle_int10_font(&mut self, al: u8) {
+        let bx = self.cpu.registers.ebx() as u16;
+        let bl = bx as u8;
+        let bh = (bx >> 8) as u8;
+        let cx = self.cpu.registers.ecx() as u16;
+        let dx = self.cpu.registers.edx() as u16;
+        let table = self.video.char_map_table(bl);
+        match al {
+            0x00 | 0x10 => {
+                let bp = self.cpu.registers.ebp() as u16;
+                let es_base = self.cpu.registers.segment(SegmentIndex::Es).base;
+                let bytes =
+                    self.read_guest_block(es_base + u32::from(bp), cx as usize * bh as usize);
+                self.video.load_font_table(table, dx, bh, &bytes);
+                if al >= 0x10 {
+                    self.video.set_char_height(bh);
+                }
+            }
+            0x01 | 0x11 => {
+                self.video.load_rom_font(table, 14);
+                if al >= 0x10 {
+                    self.video.set_char_height(14);
+                }
+            }
+            0x02 | 0x12 => {
+                self.video.load_rom_font(table, 8);
+                if al >= 0x10 {
+                    self.video.set_char_height(8);
+                }
+            }
+            0x04 | 0x14 => {
+                self.video.load_rom_font(table, 16);
+                if al >= 0x10 {
+                    self.video.set_char_height(16);
+                }
+            }
+            0x03 => self.video.set_char_map_select(bl),
             _ => {}
         }
     }
@@ -3626,6 +3678,70 @@ mod tests {
         assert_eq!(raster.pixels[0], 15);
         // Resolved through the live DAC, entry 15 is red.
         assert_eq!(machine.palette_argb()[15], 0x00FF_0000);
+    }
+
+    #[test]
+    fn int10_11h_loads_user_font() {
+        // A 2-glyph user font (two solid 8x16 blocks) at ES:BP = 4000h:0,
+        // overwriting 'A' and 'B'. AL=00 loads it; BH=16 bytes/char, BL=0
+        // (table 0), CX=2, DX=41h.
+        let rom = rom_with_code(&[
+            0xb8, 0x00, 0x40, // mov ax, 4000h
+            0x8e, 0xc0, // mov es, ax
+            0xbd, 0x00, 0x00, // mov bp, 0
+            0xb9, 0x02, 0x00, // mov cx, 2
+            0xba, 0x41, 0x00, // mov dx, 41h (first char 'A')
+            0xbb, 0x00, 0x10, // mov bx, 1000h (BH=16, BL=0)
+            0xb8, 0x00, 0x11, // mov ax, 1100h
+            0xcd, 0x10, // int 10h
+            0xf4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+        machine.write_guest_block(0x40000, &[0xFF; 32]); // two solid glyphs
+        // Display cell 0 = 'A', white on black.
+        machine.write_physical_u8(VGA_TEXT_BASE, 0x41);
+        machine.write_physical_u8(VGA_TEXT_BASE + 1, 0x0F);
+        assert_eq!(
+            machine.run_until_halt_or_cycles(1_000_000).unwrap(),
+            StopReason::Halted
+        );
+        // The custom 'A' is solid, so its top row scans out as the foreground.
+        // The stock 'A' would be blank on the top row (background), so 15
+        // confirms the user font loaded and renders.
+        assert_eq!(machine.video().render_text_row(0)[0], 15);
+    }
+
+    #[test]
+    fn int10_11h_loads_rom_8x16() {
+        // First a custom load blanks glyph 0xDB (AL=00); then AL=04 reloads the
+        // ROM 8x16 font, restoring the solid full block.
+        let rom = rom_with_code(&[
+            0xb8, 0x00, 0x40, // mov ax, 4000h
+            0x8e, 0xc0, // mov es, ax
+            0xbd, 0x00, 0x00, // mov bp, 0
+            0xb9, 0x01, 0x00, // mov cx, 1
+            0xba, 0xdb, 0x00, // mov dx, 0DBh (full block)
+            0xbb, 0x00, 0x10, // mov bx, 1000h (BH=16, BL=0)
+            0xb8, 0x00, 0x11, // mov ax, 1100h (user font)
+            0xcd, 0x10, // int 10h
+            0xbb, 0x00, 0x10, // mov bx, 1000h
+            0xb8, 0x04, 0x11, // mov ax, 1104h (ROM 8x16)
+            0xcd, 0x10, // int 10h
+            0xf4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+        machine.write_guest_block(0x40000, &[0x00; 16]); // a blank glyph for 0xDB
+        machine.write_physical_u8(VGA_TEXT_BASE, 0xDB);
+        machine.write_physical_u8(VGA_TEXT_BASE + 1, 0x0F);
+        assert_eq!(
+            machine.run_until_halt_or_cycles(1_000_000).unwrap(),
+            StopReason::Halted
+        );
+        // The ROM reload restored the solid full block; without it the custom
+        // blank load would leave the top row as the background (0).
+        assert_eq!(machine.video().render_text_row(0)[0], 15);
     }
 
     #[test]

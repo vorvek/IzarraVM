@@ -427,8 +427,71 @@ impl Vga {
     /// 512-glyph mode, deferred here. (Abrash, Graphics Programming Black Book
     /// ch.24.)
     pub fn active_font_table(&self) -> usize {
-        let s = self.seq.char_map_select;
-        (s & 0x01) as usize | (((s >> 1) & 0x01) as usize) << 1 | (((s >> 4) & 0x01) as usize) << 2
+        char_map_a_decode(self.seq.char_map_select)
+    }
+
+    /// Decode a block-specifier value (BL) to a font table index with the same
+    /// map-A field as `active_font_table`, so a font loaded with a block and then
+    /// selected with the same block specifier always displays.
+    pub fn char_map_table(&self, block: u8) -> usize {
+        char_map_a_decode(block)
+    }
+
+    /// Write the Sequencer Character Map Select (index 3), picking the active
+    /// font table for text. Used by INT 10h AH=11h AL=03.
+    pub fn set_char_map_select(&mut self, value: u8) {
+        self.seq.char_map_select = value;
+    }
+
+    /// Load user font glyphs into one table (INT 10h AH=11h AL=00/10). `data` is
+    /// `count` consecutive glyphs of `bytes_per_char` bytes each (bit 7 = leftmost
+    /// pixel), for the character codes starting at `first_char`. Each glyph fills
+    /// the low rows of its 32-byte slot; the rows above are left as-is, matching
+    /// the VGA BIOS byte-copy load.
+    pub fn load_font_table(
+        &mut self,
+        table: usize,
+        first_char: u16,
+        bytes_per_char: u8,
+        data: &[u8],
+    ) {
+        let table = table & 0x07;
+        let bpc = bytes_per_char as usize;
+        if bpc == 0 {
+            return;
+        }
+        let count = data.len() / bpc;
+        for i in 0..count {
+            let code = (first_char as usize).wrapping_add(i) & 0xFF;
+            let slot = code * 32;
+            for row in 0..bpc.min(32) {
+                self.font[table][slot + row] = data[i * bpc + row];
+            }
+        }
+    }
+
+    /// Copy one of the ROM fonts (8x8, 8x14, or 8x16) into all 256 glyph slots of
+    /// a table (INT 10h AH=11h AL=01/02/04). `height` selects the source font.
+    pub fn load_rom_font(&mut self, table: usize, height: u8) {
+        let table = table & 0x07;
+        let (src, h) = match height {
+            8 => (&crate::font::VGAFONT_8X8[..], 8usize),
+            14 => (&crate::font::VGAFONT_8X14[..], 14usize),
+            _ => (&crate::font::VGAFONT_8X16[..], 16usize),
+        };
+        for code in 0..256usize {
+            let slot = code * 32;
+            for row in 0..h {
+                self.font[table][slot + row] = src[code * h + row];
+            }
+        }
+    }
+
+    /// Set the text character height: CRTC Maximum Scan Line (index 09h) low five
+    /// bits = height - 1, reprogramming the renderer's rows-per-character divide.
+    /// Used by the INT 10h AH=11h 1x variants that reprogram the scan lines.
+    pub fn set_char_height(&mut self, height: u8) {
+        self.crtc.max_scan = u32::from(height.saturating_sub(1));
     }
 
     /// Install a planar mode's timing and reset the beam to the top of frame.
@@ -1262,6 +1325,15 @@ impl Vga {
             cursor_offset: self.cursor_offset,
         }
     }
+}
+
+/// Decode the Sequencer Character Map Select map-A field (bits 0, 1, 4) to a
+/// font table index 0..7. Shared by the active-table read and the block-specifier
+/// load so a loaded font and its display selector always agree.
+fn char_map_a_decode(spec: u8) -> usize {
+    (spec & 0x01) as usize
+        | (((spec >> 1) & 0x01) as usize) << 1
+        | (((spec >> 4) & 0x01) as usize) << 2
 }
 
 #[derive(Debug, Clone, Copy, Default)]
