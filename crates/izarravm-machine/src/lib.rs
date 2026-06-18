@@ -4300,6 +4300,60 @@ mod tests {
     }
 
     #[test]
+    fn mode_x_pel_pan_smooth_scroll_through_the_machine() {
+        let mut machine = test_machine();
+        // Mode 13h, then unchained mode X.
+        machine.video_mut().set_mode13h();
+        machine.video_mut().write_port(0x3C4, 0x04);
+        machine.video_mut().write_port(0x3C5, 0x06);
+        assert_eq!(machine.active_display(), ActiveDisplay::VgaRaster);
+        // Abrash's 320x240 vertical timing through the CRTC ports (Black Book
+        // Listing 47.1): double-scanned, 240 source rows over 480 scanlines.
+        for (idx, val) in [
+            (0x06u8, 0x0Du8),
+            (0x07, 0x3E),
+            (0x09, 0x41),
+            (0x10, 0xEA),
+            (0x11, 0xAC),
+            (0x12, 0xDF),
+            (0x15, 0xE7),
+            (0x16, 0x06),
+        ] {
+            machine.video_mut().write_port(0x3D4, idx);
+            machine.video_mut().write_port(0x3D5, val);
+        }
+        // Distinct bytes per plane at plane offset 0 (values above 0x3F prove the
+        // 8-bit-direct DAC index is scanned out, not masked to 6 bits).
+        let plane_byte: [u8; 4] = [0x40, 0x50, 0x60, 0x70];
+        for (plane, &val) in plane_byte.iter().enumerate() {
+            machine.video_mut().write_port(0x3C4, 0x02);
+            machine.video_mut().write_port(0x3C5, 1u8 << plane); // map mask = this plane
+            machine.video_mut().write_port(0x3CE, 0x08);
+            machine.video_mut().write_port(0x3CF, 0xFF); // bit mask 0xFF, write mode 0
+            machine.write_physical_u8(0x000A_0000, val);
+        }
+        // For each pel-pan 1..3, reset the attribute flip-flop, write AC index 0x13
+        // then the pan value, run two frame periods, and assert the leftmost column
+        // scans out plane `pan` at plane offset 0: the fine-shifted pixel, not plane 0.
+        for pan in 1u8..=3 {
+            machine.video_mut().read_status1(); // reset attr flip-flop to index mode
+            machine.video_mut().write_port(0x3C0, 0x13); // attr index 0x13 (pixel pan)
+            machine.video_mut().write_port(0x3C0, pan); // pel-pan value
+            // Pel-pan is live (not latched): it takes effect at the scanline of the
+            // write, so the in-progress frame's early rows still hold the prior pan.
+            // Two frame periods flush that frame and then render a clean one whose row
+            // zero is scanned after the write.
+            machine.advance_devices(500_000); // flush the in-progress (mixed-pan) frame
+            machine.advance_devices(500_000); // render a full frame with the new pan
+            let raster = machine.vga_raster().expect("a frame presented");
+            assert_eq!(
+                raster.pixels[0], plane_byte[pan as usize],
+                "pel-pan {pan} scans out plane {pan} at the leftmost column"
+            );
+        }
+    }
+
+    #[test]
     fn dos_program_writes_and_reads_back_a_file() {
         // org 0x100: create C:\OUT.TXT (AH=3Ch), write "HI!" (AH=40h to the file
         // handle), seek to 0 (AH=42h), read 3 bytes back (AH=3Fh), close (AH=3Eh),
