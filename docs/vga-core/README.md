@@ -27,9 +27,10 @@ it. What is in:
 | Planar memory | Four-plane model, write modes 0–3, read modes 0–1, latches, data-rotate/ALU, Map Mask, Bit Mask, Set/Reset |
 | Sequencer (`3C4/3C5`) | Map Mask (2), Memory Mode (4); Clocking Mode (1) char-width feeds the dot count |
 | Graphics Ctrl (`3CE/3CF`) | Set/Reset (0), Enable Set/Reset (1), Color Compare (2), Data Rotate/Function (3), Read Map (4), Mode (5), Color Don't Care (7), Bit Mask (8) |
-| Attribute (`3C0`) | 16 palette entries, Mode Control (10h), Overscan (11h), Pixel Pan (13h); the `3DA` flip-flop reset. Plane Enable (12h) and Color Select (14h) are **stored, not yet applied** (unused in mode 0Dh; applying 12h's default 0 would blank the screen) |
-| CRTC (`3D4/3D5`) | Start Address Hi/Lo (0C/0D), Offset (13h), text cursor (0E/0F); full vertical timing carried in `CrtcTiming` |
-| DAC (`3C7/3C8/3C9`) | Read/write index + 6-bit RGB data |
+| Attribute (`3C0`) | 16 palette entries (power-up identity: register N = N), Mode Control (10h), Overscan (11h), Pixel Pan (13h), readback through `3C1`; the `3DA` flip-flop reset. Plane Enable (12h) and Color Select (14h) are **stored, not yet applied** (unused in mode 0Dh; applying 12h's default 0 would blank the screen) |
+| CRTC (`3D4/3D5`) | Start Address Hi/Lo (0C/0D), Offset (13h), text cursor location (0E/0F) and shape (0A/0B); full vertical timing carried in `CrtcTiming` |
+| DAC (`3C7/3C8/3C9`) | Read/write index + 6-bit RGB data; the pel mask (`3C6`) is stored and applied to the rendered DAC index. The 256-entry palette powers up to the stock VGA mode-13h default (the 16 EGA colors with brown at index 6, then the gray and color ramps) |
+| Misc (`3C2/3CC`) | Misc Output write/readback (clock-select bits stored, not applied to the dot clock) |
 | Status (`3DA`) | Display-disabled (bit 0), vertical retrace (bit 3), beam-derived |
 | Beam | Cycle-coupled dot clock, catch-up rasterization, per-frame finalize |
 
@@ -368,6 +369,39 @@ Divergences (fidelity directive):
 3. **Pel-pan values 4-7 fold into a start-address bump** and are masked out
    (`& 0x03`); they are beyond-useful, not a distinct behavior.
 
+## Slice 10 coverage — default palettes, BIOS video services, and ports
+
+Slice 10 loads the stock default palettes, adds the host-locked (HLE) `INT 10h`
+video services a title reaches when it drives video through the BIOS rather than
+port-banging, and fills in the remaining unhandled register ports. The raster
+engine's geometry and scanout are unchanged except that the DAC pel mask now
+gates the rendered DAC index (the default `0xFF` is a no-op).
+
+| Area | Covered in slice 10 |
+|------|---------------------|
+| Default palettes | The 16 ATC palette registers power up to identity (N → N), and the 256-entry DAC powers up to the stock VGA mode-13h palette (byte-for-byte from the LGPL VGABios `palette3`) |
+| `INT 10h AH=00h` | Mode set including the text-family return (`AL` 0-7) via `Vga::set_text_mode`, alongside the existing planar (0D-12) and chained-13h branches |
+| `INT 10h AH=0Bh` | Border/overscan color (`BH=0`); the CGA palette select (`BH=1`) is deferred |
+| `INT 10h AH=10h` | ATC palette register set/get individual (`AL=00/07`) and block (`AL=02`), overscan set (`AL=01`), DAC individual (`AL=10/15`) and block (`AL=12/17`) set/get |
+| Ports | Misc Output (`3C2` write / `3CC` read), DAC pel mask (`3C6`), ATC readback (`3C1`); the pel mask is applied in both render paths |
+| CRTC | Cursor-shape registers `0A/0B` are now stored and read back (cursor *location* 0E/0F was already handled) |
+
+The HLE services run *after* the software `INT` retires (registers intact) and
+operate on register state through public `Vga` accessors rather than the port
+flip-flops. VBE (`AH=4Fh`) still routes to Margo; `AH=00/0B/10` route to the VGA
+core. Unhandled `INT 10h` services leave `AX` unchanged, so adding these is
+strictly additive.
+
+Divergences (fidelity directive):
+
+1. **Misc Output clock-select is stored, not applied.** `3C2` bits 2-3 are read
+   back faithfully through `3CC`, but the dot clock stays mode-fixed; retuned
+   refresh (the 360-wide modes) is not modeled.
+2. **The rare `AH=10h` sub-functions are deferred**: overscan get (`AL=08`), the
+   palette/overscan block get (`AL=09`), intensity/blink toggle (`AL=03`), color
+   paging (`AL=13/14/1A`), and the font services (`AL=20-24`). The font services
+   belong with the loadable-character-generator slice.
+
 ## Latch rules
 
 - **CRTC Start Address (0C/0D) latches once per frame, at the start of vertical
@@ -429,6 +463,9 @@ modes land.
 7. **Separate 256 KB VGA buffer.** VGA planar memory is its own buffer, distinct
    from Margo's 4 MB linear VRAM. Unifying matters only if software maps the same
    bytes through both apertures at once — no DOS-era planar game does.
+8. **Misc Output clock-select is stored, not applied.** The `3C2` bits are read
+   back through `3CC`, but the dot clock stays mode-fixed; retuned refresh is not
+   modeled (see Slice 10).
 
 ## Slice-1 implementation approximations
 
