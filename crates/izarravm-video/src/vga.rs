@@ -332,6 +332,8 @@ pub struct Vga {
     pub(crate) dac: Dac,
     pub(crate) cursor_offset: u16,
     pub(crate) mode: VideoMode,
+    pub(crate) misc_output: u8,
+    pub(crate) pel_mask: u8,
 }
 
 impl Default for Vga {
@@ -363,6 +365,11 @@ impl Default for Vga {
             dac: Dac::default(),
             cursor_offset: 0,
             mode: VideoMode::Text,
+            // Misc Output powers up as mode 03h (text/CGA clock, CRTC at 3Dx); the
+            // DAC pel mask defaults to all-pass. Both are stored and read back,
+            // not applied to the dot clock.
+            misc_output: 0x67,
+            pel_mask: 0xFF,
         }
     }
 }
@@ -505,7 +512,7 @@ impl Vga {
                 let b = self.vram[plane * VGA_PLANE_SIZE + off];
                 index |= ((b >> bit) & 1) << plane;
             }
-            *slot = self.attr.palette[index as usize] & 0x3F;
+            *slot = (self.attr.palette[index as usize] & 0x3F) & self.pel_mask;
         }
         row
     }
@@ -546,7 +553,7 @@ impl Vga {
             let plane = (x_eff & 3) as usize;
             let ma = row_base + (x_eff >> 2);
             let off = display_offset(self.crtc.mode_control, self.crtc.underline_loc, ma);
-            *slot = self.vram[plane * VGA_PLANE_SIZE + off];
+            *slot = self.vram[plane * VGA_PLANE_SIZE + off] & self.pel_mask;
         }
         row
     }
@@ -752,6 +759,10 @@ impl Vga {
     pub fn write_port(&mut self, port: u16, value: u8) -> bool {
         self.catch_up();
         match port {
+            0x3C2 => {
+                self.misc_output = value;
+                true
+            }
             0x3C4 => {
                 self.seq_index = value;
                 true
@@ -759,6 +770,10 @@ impl Vga {
             0x3C5 => {
                 let idx = self.seq_index;
                 self.write_seq(idx, value);
+                true
+            }
+            0x3C6 => {
+                self.pel_mask = value;
                 true
             }
             0x3C7 => {
@@ -802,8 +817,11 @@ impl Vga {
     /// Read from a VGA I/O port. Returns `Some(value)` for handled ports.
     pub fn read_port(&mut self, port: u16) -> Option<u8> {
         match port {
+            0x3C1 => Some(self.attr_indexed_read()),
+            0x3C6 => Some(self.pel_mask),
             0x3C8 => Some(self.dac.write_index()),
             0x3C9 => Some(self.dac.read_data()),
+            0x3CC => Some(self.misc_output),
             0x3D4 => Some(self.crtc_index),
             0x3D5 => match self.crtc_index {
                 0x0E => Some((self.cursor_offset >> 8) as u8),
@@ -812,6 +830,20 @@ impl Vga {
             },
             0x3DA => Some(self.read_status1()),
             _ => None,
+        }
+    }
+
+    /// Read the Attribute register selected by the last 3C0 index write (the
+    /// 3C1 readback port). Mirrors `write_attr`'s data phase.
+    fn attr_indexed_read(&self) -> u8 {
+        match self.attr.index {
+            0x00..=0x0F => self.attr.palette[self.attr.index as usize],
+            0x10 => self.attr.mode_control,
+            0x11 => self.attr.overscan,
+            0x12 => self.attr.plane_enable,
+            0x13 => self.attr.pixel_pan,
+            0x14 => self.attr.color_select,
+            _ => 0,
         }
     }
 
@@ -1572,6 +1604,50 @@ mod tests {
         assert_eq!(
             attr.palette,
             [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        );
+    }
+
+    #[test]
+    fn misc_output_round_trips_3c2_3cc() {
+        let mut vga = Vga::default();
+        assert!(vga.write_port(0x3C2, 0x42));
+        assert_eq!(vga.read_port(0x3CC), Some(0x42));
+    }
+
+    #[test]
+    fn pel_mask_round_trips_3c6() {
+        let mut vga = Vga::default();
+        assert!(vga.write_port(0x3C6, 0x0F));
+        assert_eq!(vga.read_port(0x3C6), Some(0x0F));
+    }
+
+    #[test]
+    fn atc_readback_3c1_returns_indexed_register() {
+        let mut vga = Vga::default();
+        vga.read_status1(); // reset the 3C0 flip-flop to "address"
+        vga.write_port(0x3C0, 0x13); // address: select the Pixel Pan register
+        vga.write_port(0x3C0, 0x07); // data: pixel_pan = 7
+        // 3C1 reads back the register selected by the last index write.
+        assert_eq!(vga.read_port(0x3C1), Some(0x07));
+    }
+
+    #[test]
+    fn pel_mask_masks_the_dac_index_in_render() {
+        let mut vga = Vga::default();
+        vga.set_mode_0dh();
+        // Plane 0 set everywhere so every pixel is the 4-bit index 1.
+        for b in vga.vram[0..VGA_PLANE_SIZE].iter_mut() {
+            *b = 0xFF;
+        }
+        vga.attr.palette[1] = 0x2A; // ATC maps index 1 -> DAC 42
+        vga.pel_mask = 0xFF;
+        let full = vga.render_active_row(0);
+        assert_eq!(full[0], 0x2A, "no mask: index 1 reaches DAC 42");
+        vga.pel_mask = 0x0F;
+        let masked = vga.render_active_row(0);
+        assert_eq!(
+            masked[0], 0x0A,
+            "pel mask 0x0F folds DAC 42 to the low nibble"
         );
     }
 
