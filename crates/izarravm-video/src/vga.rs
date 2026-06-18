@@ -680,7 +680,16 @@ impl Vga {
     pub fn render_text_row(&self, counter_line: u32) -> Vec<u8> {
         let width = self.crtc.hdisp_end as usize;
         let rows_per_char = self.crtc.max_scan + 1;
-        let (_, first_line) = self.split_origin(counter_line);
+        // The display origin scrolls with the CRTC Start Address (0C/0Dh). Above
+        // the line-compare split the origin is `start_address`; at and below the
+        // split the counter reloads to 0 (split_origin). Mode 03h is word mode
+        // (CR17 bit 6 clear), so `start_address` is a word/cell address, the same
+        // units as the CRTC cursor location (0E/0Fh): a displayed cell at
+        // (char_row, col) has the absolute cell index `start + char_row*offset +
+        // col` and reads the char/attr byte pair at that cell index * 2. The byte
+        // read wraps at the 32 KB text aperture (FreeVGA 0Dh wrap behavior). See
+        // A1 in dev_docs/reference/vga/text-mode-gaps-confirm-notes.md.
+        let (start, first_line) = self.split_origin(counter_line);
         // split_origin returns first_line <= counter_line in both branches, so the
         // subtraction never underflows.
         let rel = counter_line - first_line;
@@ -696,19 +705,16 @@ impl Vga {
         // the foreground on odd windows. A first model; the exact ~16 Hz cadence
         // is a later refinement.
         let blink_hide_phase = (self.frames / 16) % 2 == 1;
+        let start_cells = start as usize;
+        let row_cells = self.crtc.offset as usize; // cells per character row
         let mut row = vec![0u8; width];
         for col in 0..VGA_TEXT_COLUMNS {
-            let cell_index = char_row * VGA_TEXT_COLUMNS + col;
-            let char_byte = self
-                .text_memory
-                .get(cell_index * 2)
-                .copied()
-                .unwrap_or(b' ');
-            let attr = self
-                .text_memory
-                .get(cell_index * 2 + 1)
-                .copied()
-                .unwrap_or(0x07);
+            // Absolute cell index (char/attr pair) scrolled by the start address.
+            let cell_index = start_cells + char_row * row_cells + col;
+            // Each cell is two bytes (char then attr); wrap at the aperture.
+            let base = (cell_index * 2) % VGA_TEXT_MEMORY_SIZE;
+            let char_byte = self.text_memory.get(base).copied().unwrap_or(b' ');
+            let attr = self.text_memory.get(base + 1).copied().unwrap_or(0x07);
             let blink_attr = attr & 0x80 != 0;
             let fg_index = (attr & 0x0F) as usize;
             let bg_index = if blink_enabled && blink_attr {
@@ -723,8 +729,11 @@ impl Vga {
             // on the active scanlines for reverse video. 0A bit 5 disables the
             // cursor; bits 0-4 of 0A/0B bound the scanline range (start > end
             // wraps). The cursor blinks on the same hide phase as attribute
-            // blink, but is not gated on the attribute-blink enable.
-            let cursor_here = cell_index == self.cursor_offset as usize;
+            // blink, but is not gated on the attribute-blink enable. The cursor
+            // location register (0E/0Fh) is a cell index, so its byte address is
+            // cursor_offset*2; it fires when the displayed cell's byte offset
+            // matches, scrolling with the start address.
+            let cursor_here = base == (self.cursor_offset as usize * 2) % VGA_TEXT_MEMORY_SIZE;
             let cursor_disabled = self.cursor_start & 0x20 != 0;
             let start_line = (self.cursor_start & 0x1F) as usize;
             let end_line = (self.cursor_end & 0x1F) as usize;
@@ -1213,6 +1222,9 @@ impl Vga {
         self.last_line = 0;
         self.mode = VideoMode::Text;
         self.presented = None;
+        // A buffered start-address change from a prior graphics mode must not
+        // carry across the mode switch: the text origin resets to page 0.
+        self.pending_start = None;
         self.resize_work();
     }
 
@@ -1326,14 +1338,23 @@ impl Vga {
     }
 
     pub fn frame(&self) -> TextFrame {
-        let cells = self
-            .text_memory
-            .chunks_exact(2)
-            .map(|cell| TextCell {
-                character: cell[0],
-                attribute: cell[1],
-            })
-            .collect();
+        // The visible 80x25 page, read from the start-address origin so the
+        // headless cell view matches the pixel scanout (render_text_row). Mode
+        // 03h is word mode, so start_address is a word/cell address: the cell
+        // index for (row, col) is start + row*offset + col, and the char/attr
+        // byte pair sits at that cell index * 2, wrapped at the 32 KB aperture.
+        let start_cells = self.crtc.start_address as usize;
+        let row_cells = self.crtc.offset as usize;
+        let mut cells = Vec::with_capacity(VGA_TEXT_COLUMNS * VGA_TEXT_ROWS);
+        for row in 0..VGA_TEXT_ROWS {
+            for col in 0..VGA_TEXT_COLUMNS {
+                let base = ((start_cells + row * row_cells + col) * 2) % VGA_TEXT_MEMORY_SIZE;
+                cells.push(TextCell {
+                    character: self.text_memory.get(base).copied().unwrap_or(b' '),
+                    attribute: self.text_memory.get(base + 1).copied().unwrap_or(0x07),
+                });
+            }
+        }
 
         TextFrame {
             columns: VGA_TEXT_COLUMNS,
@@ -3024,5 +3045,115 @@ mod tests {
         assert_eq!(vga.render_text_row(7)[0], 0, "wrap: scanline 7 does not");
         assert_eq!(vga.render_text_row(14)[0], 15, "wrap: scanline 14 swaps");
         assert_eq!(vga.render_text_row(15)[0], 15, "wrap: scanline 15 swaps");
+    }
+
+    #[test]
+    fn text_start_address_scrolls_the_display_origin() {
+        // The 32 KB aperture holds eight 4096-byte pages. Page 1 starts at cell
+        // 0x800 (byte 4096). Scrolling the start address down one page moves the
+        // displayed cell (0,0) to read the glyph written on page 1.
+        let mut vga = Vga::default();
+        text_put(&mut vga, 0, 0, 0xDB, 0x0F); // page 0 cell 0: solid block
+        // Page 1 cell 0 = cell index 0x800 = byte 0x1000.
+        let page1_cell0 = 0x800usize;
+        vga.text_memory[page1_cell0 * 2] = b' '; // blank glyph, distinct from 0xDB
+        vga.text_memory[page1_cell0 * 2 + 1] = 0x0F;
+        // Start address is a cell/word address (byte offset = start * 2), so the
+        // BIOS page-flip value page * 0x800 maps straight onto it.
+        vga.crtc.start_address = 0x800;
+        // With the origin scrolled to page 1, cell (0,0) reads the blank glyph
+        // there, so the top-left pixel is the background (0), not the solid
+        // block foreground (15) that page 0 holds.
+        assert_eq!(
+            vga.render_text_row(0)[0],
+            0,
+            "origin scrolled to page 1 reads page 1's blank glyph"
+        );
+        // Scrolling back to page 0 restores the solid block.
+        vga.crtc.start_address = 0;
+        assert_eq!(
+            vga.render_text_row(0)[0],
+            15,
+            "origin back at page 0 reads page 0's solid block"
+        );
+    }
+
+    #[test]
+    fn text_start_address_below_the_split_starts_from_zero() {
+        // Line Compare reloads the display address to 0 at and below the split
+        // line, so a scrolled start address affects only the top region; the
+        // bottom region always starts from offset 0 (FreeVGA crtcreg.htm 18h).
+        let mut vga = Vga::default();
+        text_put(&mut vga, 0, 0, 0xDB, 0x0F); // offset 0: solid block (foreground)
+        vga.crtc.start_address = 0x800; // scroll the top region to page 1 (blank)
+        vga.crtc.line_compare = 7; // split after char row 0 (8 scanlines, 0..7)
+        // Top region (scanline 0..=7): origin scrolled to page 1 -> background.
+        assert_eq!(
+            vga.render_text_row(0)[0],
+            0,
+            "top region reads the scrolled (blank) origin"
+        );
+        // First split line: address reloads to 0, so the solid block at offset 0
+        // is shown again.
+        assert_eq!(
+            vga.render_text_row(8)[0],
+            15,
+            "below-split region starts from offset 0 (solid block)"
+        );
+    }
+
+    #[test]
+    fn text_memory_aperture_is_32kb_eight_pages() {
+        // Growing VGA_TEXT_MEMORY_SIZE to 32768 lets the B8000 aperture reach all
+        // eight 4096-byte pages. Each page's last cell (row 24, col 79 = cell
+        // 1999 within the page) must be writable through the bus read/write path
+        // and stay within bounds.
+        let mut vga = Vga::default();
+        let page7_last_cell = 0x800 * 7 + 1999; // page 7, last visible cell
+        let byte = page7_last_cell * 2;
+        assert!(
+            byte < VGA_TEXT_MEMORY_SIZE,
+            "page 7 last cell is inside the 32 KB aperture"
+        );
+        vga.write_u8(byte, 0xDB).unwrap();
+        vga.write_u8(byte + 1, 0x0F).unwrap();
+        assert_eq!(
+            vga.read_u8(byte).unwrap(),
+            0xDB,
+            "writable byte round-trips"
+        );
+        assert_eq!(
+            vga.read_u8(VGA_TEXT_MEMORY_SIZE - 1).unwrap_or(0xFF),
+            0x07,
+            "the very last byte of the 32 KB aperture is reachable"
+        );
+    }
+
+    #[test]
+    fn frame_cell_view_follows_the_start_address() {
+        // The headless cell view (frame) reads the visible page from the
+        // start-address origin, matching the pixel scanout. Scrolling to page 1
+        // makes frame() report page 1's cell (0,0), not page 0's.
+        let mut vga = Vga::default();
+        text_put(&mut vga, 0, 0, b'A', 0x07); // page 0 cell 0 = 'A'
+        let page1_cell0 = 0x800usize;
+        vga.text_memory[page1_cell0 * 2] = b'Z'; // page 1 cell 0 = 'Z'
+        vga.text_memory[page1_cell0 * 2 + 1] = 0x07;
+        assert_eq!(
+            vga.frame().cells[0].character,
+            b'A',
+            "page 0 visible by default"
+        );
+        vga.crtc.start_address = 0x800;
+        assert_eq!(
+            vga.frame().cells[0].character,
+            b'Z',
+            "page 1 visible after scrolling the origin"
+        );
+        assert_eq!(
+            vga.frame().cells.len(),
+            VGA_TEXT_COLUMNS * VGA_TEXT_ROWS,
+            "frame reports exactly one visible 80x25 page"
+        );
     }
 }

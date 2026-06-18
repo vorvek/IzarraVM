@@ -23,7 +23,14 @@ pub const VGA_TEXT_BASE: u32 = 0x000b_8000;
 pub const VGA_TEXT_COLUMNS: usize = 80;
 pub const VGA_TEXT_ROWS: usize = 25;
 pub const VGA_TEXT_CELL_BYTES: usize = 2;
-pub const VGA_TEXT_MEMORY_SIZE: usize = VGA_TEXT_COLUMNS * VGA_TEXT_ROWS * VGA_TEXT_CELL_BYTES;
+/// The host-visible size of one 80x25 text page (char/attr pairs).
+pub const VGA_TEXT_PAGE_SIZE: usize = VGA_TEXT_COLUMNS * VGA_TEXT_ROWS * VGA_TEXT_CELL_BYTES;
+/// The full 32 KB text aperture the VGA decodes at B8000-BFFFF, large enough for
+/// eight 4096-byte 80x25 pages so CRTC start-address scroll and INT 10h AH=05h
+/// page-flip are representable (FreeVGA crtcreg.htm 0C/0Dh; the BIOS 80x25 color
+/// page size is 4096 bytes). Growing this constant grows the B8000 aperture
+/// automatically: the bus mapping in `video_text_offset` derives `end` from it.
+pub const VGA_TEXT_MEMORY_SIZE: usize = 32 * 1024;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum VideoError {
