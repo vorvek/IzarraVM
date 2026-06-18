@@ -180,6 +180,29 @@ fn power_on_mixer(profile: &MachineProfile) -> SbMixer {
     SbMixer::with_power_on(sb.irq.line(), sb.dma.channel(), sb.high_dma.channel())
 }
 
+/// Derive the DOS environment entries that advertise the Sound Blaster to
+/// auto-detecting games. `BLASTER` and `SETSOUND` carry the same value:
+/// `A220` (the fixed Resonique 2 base), `I`/`D`/`H` from the host config, and
+/// `T6` (the SB16 card type). The MPU-401 base (`P`) is omitted until MIDI is
+/// modeled. Returns an empty list when the card is disabled, so no `BLASTER`
+/// leaks into a machine that has no SB16; the value always matches the routing
+/// the CT1745 mixer answers, since both are derived from the same config.
+fn sound_blaster_env_entries(config: &SoundBlasterConfig) -> Vec<(String, String)> {
+    if !config.enabled {
+        return Vec::new();
+    }
+    let value = format!(
+        "A220 I{} D{} H{} T6",
+        config.irq.line(),
+        config.dma.channel(),
+        config.high_dma.channel()
+    );
+    vec![
+        ("BLASTER".to_string(), value.clone()),
+        ("SETSOUND".to_string(), value),
+    ]
+}
+
 impl Machine {
     pub fn new(profile: MachineProfile, rom: impl AsRef<[u8]>) -> Result<Self, MachineError> {
         let rom = rom.as_ref();
@@ -312,6 +335,7 @@ impl Machine {
     /// later slice.
     pub fn new_dos_program(profile: MachineProfile, image: &[u8]) -> Result<Self, MachineError> {
         let mixer = power_on_mixer(&profile);
+        let env_entries = sound_blaster_env_entries(&profile.sound_blaster);
         let mut machine = Self {
             memory: Memory::from_mib(profile.memory_mib)?,
             profile,
@@ -359,6 +383,18 @@ impl Machine {
             .memory
             .read_u16(usize::from(DOS_LOAD_SEGMENT) * 16 + 2)?;
         machine.dos.init_program(DOS_LOAD_SEGMENT, prog_top);
+        // Seed the DOS environment segment (BLASTER=/SETSOUND=) and record it in
+        // PSP:0x2C so auto-detecting games find the SB16. The entries are derived
+        // from the host config above; the borrow is split so the kernel and memory
+        // are reached as disjoint fields.
+        let entries: Vec<(&str, &str)> = env_entries
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        {
+            let Machine { dos, memory, .. } = &mut machine;
+            dos.install_environment(memory, &entries)?;
+        }
         Ok(machine)
     }
 
@@ -4088,7 +4124,7 @@ mod tests {
     fn dos_program_startup_services() {
         // org 0x100:
         //   mov ah,0x30 / int 0x21            ; get version (AL=6, AH=10), no fault
-        //   mov bx,0x10 / mov ah,0x48 / int 21 ; allocate 16 paras -> AX=0x1100
+        //   mov bx,0x10 / mov ah,0x48 / int 21 ; allocate 16 paras
         //   mov [0x0204],ax                    ; store the allocated segment
         //   mov ax,0x3521 / int 0x21           ; get INT 21h vector -> ES=0, BX=0x0600
         //   mov [0x0200],es / mov [0x0202],bx  ; store ES then BX
@@ -4107,7 +4143,21 @@ mod tests {
         // PSP at 0x0100 -> linear 0x1000; the program stored words at offsets 0x200..0x205.
         assert_eq!(mem.read_u16(0x1200).unwrap(), 0x0000); // ES from IVT[0x21] (stub segment)
         assert_eq!(mem.read_u16(0x1202).unwrap(), 0x0600); // BX from IVT[0x21] (stub offset)
-        assert_eq!(mem.read_u16(0x1204).unwrap(), 0x1100); // AH=48h allocated segment
+        // AH=48h returns the first free paragraph, which now follows the seeded
+        // BLASTER=/SETSOUND= env block. Derive the expected segment from that
+        // block so the assertion tracks the env size, not a hardcoded value.
+        let env_seg = mem.read_u16(0x1000 + 0x2c).unwrap();
+        let env_paras = (sound_blaster_env_entries(&SoundBlasterConfig::default())
+            .iter()
+            .map(|(key, value)| key.len() + 1 + value.len() + 1)
+            .sum::<usize>()
+            + 1)
+        .div_ceil(16) as u16;
+        assert_eq!(
+            mem.read_u16(0x1204).unwrap(),
+            env_seg + env_paras,
+            "AH=48h allocated segment follows the env block"
+        );
     }
 
     #[test]
@@ -4585,5 +4635,104 @@ mod tests {
         let reason = machine.run_until_halt_or_cycles(2_000_000).unwrap();
         assert_eq!(reason, StopReason::DosExit { code: 0 });
         assert_eq!(machine.dos_output(), b"Z");
+    }
+
+    // --- BLASTER environment seeding ---
+
+    /// Walk the env block at `seg` back into (KEY, VALUE) pairs, the way a DOS
+    /// game scans the segment named by PSP:0x2C.
+    fn parse_env_block(machine: &Machine, seg: u16) -> Vec<(String, String)> {
+        let mem = machine.memory();
+        let base = usize::from(seg) * 16;
+        let mut entries = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let mut bytes = Vec::new();
+            loop {
+                let byte = mem.read_u8(base + offset).unwrap();
+                offset += 1;
+                if byte == 0 {
+                    break;
+                }
+                bytes.push(byte);
+            }
+            if bytes.is_empty() {
+                break; // the terminating empty string
+            }
+            let entry = String::from_utf8(bytes).unwrap();
+            let (key, value) = entry.split_once('=').expect("KEY=VALUE");
+            entries.push((key.to_string(), value.to_string()));
+        }
+        entries
+    }
+
+    /// The env-segment pointer the loader wrote into PSP:0x2C, or 0 if unset.
+    fn psp_env_segment(machine: &Machine) -> u16 {
+        machine
+            .memory()
+            .read_u16(usize::from(DOS_LOAD_SEGMENT) * 16 + 0x2c)
+            .unwrap()
+    }
+
+    #[test]
+    fn sound_blaster_env_entries_default_config() {
+        let entries = sound_blaster_env_entries(&SoundBlasterConfig::default());
+        assert_eq!(
+            entries,
+            vec![
+                ("BLASTER".to_string(), "A220 I5 D1 H5 T6".to_string()),
+                ("SETSOUND".to_string(), "A220 I5 D1 H5 T6".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn sound_blaster_env_entries_non_default_routing() {
+        let config = SoundBlasterConfig {
+            enabled: true,
+            irq: SbIrq::I7,
+            dma: SbDma8::D3,
+            high_dma: SbDma16::D5,
+        };
+        assert_eq!(
+            sound_blaster_env_entries(&config),
+            vec![
+                ("BLASTER".to_string(), "A220 I7 D3 H5 T6".to_string()),
+                ("SETSOUND".to_string(), "A220 I7 D3 H5 T6".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn sound_blaster_env_entries_disabled_omits_the_string() {
+        let config = SoundBlasterConfig {
+            enabled: false,
+            ..SoundBlasterConfig::default()
+        };
+        assert!(sound_blaster_env_entries(&config).is_empty());
+    }
+
+    #[test]
+    fn new_dos_program_seeds_psp_env_pointer_with_blaster() {
+        // A trivial exit-only program is enough: the env is seeded at load.
+        let com: &[u8] = &[0xb8, 0x00, 0x4c, 0xcd, 0x21];
+        let machine =
+            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com)
+                .unwrap();
+        let env_seg = psp_env_segment(&machine);
+        assert_ne!(env_seg, 0, "PSP:0x2C must name the env segment");
+        // The env sits directly above the 64 KiB .COM program block (PSP:0x02).
+        let prog_top = machine
+            .memory()
+            .read_u16(usize::from(DOS_LOAD_SEGMENT) * 16 + 2)
+            .unwrap();
+        assert_eq!(env_seg, prog_top);
+        assert_eq!(
+            parse_env_block(&machine, env_seg),
+            vec![
+                ("BLASTER".to_string(), "A220 I5 D1 H5 T6".to_string()),
+                ("SETSOUND".to_string(), "A220 I5 D1 H5 T6".to_string()),
+            ]
+        );
     }
 }
