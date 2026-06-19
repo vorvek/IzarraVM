@@ -11,6 +11,9 @@ use izarravm_video::{
 use thiserror::Error;
 
 mod dma;
+// Standalone device; not wired into Machine yet, so its API is unused for now.
+#[allow(dead_code)]
+mod keyboard;
 mod pic;
 mod pit;
 
