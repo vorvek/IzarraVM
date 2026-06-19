@@ -1,6 +1,6 @@
 //! Host audio output: plays queued 44100 Hz stereo PCM through the default
-//! device. The emulator pushes resampled OPL frames with [`AudioPlayer::queue`]
-//! and the cpal callback drains them. This is device glue — it can only be
+//! device. The emulator pushes resampled OPL frames with [`AudioSink::queue`]
+//! and the cpal callback drains them. This is device glue, it can only be
 //! exercised by actually running on a machine with an output device, so it is
 //! kept small and free of synthesis logic.
 
@@ -10,12 +10,35 @@ use std::sync::{Arc, Mutex};
 
 const DAC_HZ: u32 = 44_100;
 
-/// A handle to the running output stream and the queue feeding it. Dropping it
-/// stops playback. Keep it on the thread that drives the emulator.
-pub struct AudioPlayer {
-    _stream: cpal::Stream,
+/// A `Send` handle to the queue feeding the output stream. Clone it onto the
+/// emulation thread to push PCM while the stream itself stays put.
+#[derive(Clone)]
+pub struct AudioSink {
     ring: Arc<Mutex<VecDeque<(i16, i16)>>>,
     capacity: usize,
+}
+
+impl AudioSink {
+    /// Queue resampled frames for playback, dropping the oldest if the backlog
+    /// exceeds ~0.5 s so a faster-than-real-time emulator cannot grow the buffer
+    /// without bound. Mutex ring for now; move to lock-free if it ever glitches.
+    pub fn queue(&self, frames: &[(i16, i16)]) {
+        let mut ring = self.ring.lock().expect("audio ring poisoned");
+        ring.extend(frames.iter().copied());
+        while ring.len() > self.capacity {
+            ring.pop_front();
+        }
+    }
+}
+
+/// A handle to the running output stream and the queue feeding it. Dropping it
+/// stops playback. The `cpal::Stream` is `!Send`, so keep this on the thread
+/// that created it and hand the emulation thread a [`AudioSink`] via [`sink`].
+///
+/// [`sink`]: AudioPlayer::sink
+pub struct AudioPlayer {
+    _stream: cpal::Stream,
+    sink: AudioSink,
 }
 
 impl AudioPlayer {
@@ -53,19 +76,15 @@ impl AudioPlayer {
 
         Ok(Self {
             _stream: stream,
-            ring,
-            capacity: DAC_HZ as usize / 2, // ~0.5 s of backlog
+            sink: AudioSink {
+                ring,
+                capacity: DAC_HZ as usize / 2, // ~0.5 s of backlog
+            },
         })
     }
 
-    /// Queue resampled frames for playback, dropping the oldest if the backlog
-    /// exceeds ~0.5 s so a faster-than-real-time emulator cannot grow the buffer
-    /// without bound. Mutex ring for now; move to lock-free if it ever glitches.
-    pub fn queue(&self, frames: &[(i16, i16)]) {
-        let mut ring = self.ring.lock().expect("audio ring poisoned");
-        ring.extend(frames.iter().copied());
-        while ring.len() > self.capacity {
-            ring.pop_front();
-        }
+    /// A `Send` handle to the playback queue for the emulation thread.
+    pub fn sink(&self) -> AudioSink {
+        self.sink.clone()
     }
 }

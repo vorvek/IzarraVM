@@ -9,7 +9,7 @@ mod resample;
 pub use dsp::SbDsp;
 pub use mixer::SbMixer;
 pub use opl::OplChip;
-pub use output::AudioPlayer;
+pub use output::{AudioPlayer, AudioSink};
 pub use resample::Resampler;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

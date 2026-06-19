@@ -1003,6 +1003,23 @@ impl Machine {
         }
     }
 
+    /// Emulated vertical refresh of the active display, in Hz. The host uses
+    /// this to pace repaints to the guest's frame rate (mode 13h is ~70 Hz,
+    /// mode 12h ~60 Hz). Clamped to a sane range so a CRTC reprogram caught
+    /// mid-mode-set (a zero or absurd frame size) can't yield a degenerate
+    /// repaint interval. Margo's linear framebuffer has no beam model, so it
+    /// reports a plain 60 Hz.
+    pub fn display_refresh_hz(&self) -> f64 {
+        let hz = match self.active_display() {
+            ActiveDisplay::VgaRaster => match self.video.frame_dots() {
+                0 => 60.0,
+                dots => VGA_DOT_HZ as f64 / dots as f64,
+            },
+            ActiveDisplay::MargoLfb => 60.0,
+        };
+        hz.clamp(50.0, 120.0)
+    }
+
     pub fn vga_raster(&mut self) -> Option<VgaRaster> {
         self.video.last_presented().cloned()
     }
@@ -3941,6 +3958,20 @@ mod tests {
         // roughly 10 070 dots — well above zero.
         machine.advance_devices(10_000);
         assert!(machine.video().beam_dots() != before || machine.video().frames_completed() > 0);
+    }
+
+    #[test]
+    fn display_refresh_matches_the_vga_mode() {
+        let mut machine = test_machine();
+        // Mode 0Dh is a ~359 200-dot frame at the 25.175 MHz dot clock, i.e.
+        // ~70 Hz, the classic VGA graphics refresh.
+        machine.set_vga_mode_0dh();
+        let hz = machine.display_refresh_hz();
+        assert!((hz - 70.0).abs() < 1.0, "expected ~70 Hz, got {hz}");
+        // Mode 12h (640x480, 525 lines) is the 60 Hz timing.
+        machine.set_vga_mode(0x12);
+        let hz = machine.display_refresh_hz();
+        assert!((hz - 60.0).abs() < 1.0, "expected ~60 Hz, got {hz}");
     }
 
     #[test]
