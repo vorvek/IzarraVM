@@ -423,6 +423,9 @@ pub struct DosKernel {
     last_exit_type: u8, // AH=4Dh AH; always 0x00 (normal termination), marked
     // AH=0Ch flush-and-invoke: the flush runs once, not again on a WaitForKey re-entry.
     cooked_flush_done: bool,
+    // AH=0Ah buffered input: the running character count keyed by buffer address,
+    // so it survives the per-character WaitForKey re-entries.
+    pending_line: Option<(u32, u8)>,
 }
 
 impl DosKernel {
@@ -868,6 +871,58 @@ impl DosKernel {
         }
     }
 
+    /// AH=0Ah buffered line input into the guest buffer at DS:DX. The buffer is
+    /// [max_len, actual_len, chars...]. Blocks per character; the running count
+    /// is held in `pending_line` keyed by the buffer address so it survives the
+    /// WaitForKey re-entries.
+    fn buffered_input(
+        &mut self,
+        regs: &mut DosRegs,
+        mem: &mut Memory,
+    ) -> Result<DosAction, DosError> {
+        let buf = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+        let addr = buf as u32;
+        let max = mem.read_u8(buf)?;
+        if max == 0 {
+            mem.write_u8(buf + 1, 0)?;
+            return Ok(DosAction::Continue);
+        }
+        let mut count = match self.pending_line {
+            Some((a, c)) if a == addr => c,
+            _ => 0,
+        };
+        loop {
+            let Some((_, ascii)) = kbd_ring_dequeue(mem)? else {
+                self.pending_line = Some((addr, count));
+                return Ok(DosAction::WaitForKey);
+            };
+            match ascii {
+                0x0d => {
+                    mem.write_u8(buf + 2 + usize::from(count), 0x0d)?;
+                    self.stdout.push(0x0d);
+                    mem.write_u8(buf + 1, count)?;
+                    self.pending_line = None;
+                    return Ok(DosAction::Continue);
+                }
+                0x08 => {
+                    if count > 0 {
+                        count -= 1;
+                        self.stdout.extend_from_slice(&[0x08, 0x20, 0x08]);
+                    }
+                }
+                _ => {
+                    if usize::from(count) + 1 < usize::from(max) {
+                        mem.write_u8(buf + 2 + usize::from(count), ascii)?;
+                        count += 1;
+                        self.stdout.push(ascii);
+                    } else {
+                        self.stdout.push(0x07); // buffer full, bell
+                    }
+                }
+            }
+        }
+    }
+
     fn dispatch_int21(
         &mut self,
         regs: &mut DosRegs,
@@ -908,6 +963,8 @@ impl DosKernel {
             0x08 => self.read_char(regs, mem, false),
             // AH=07h: read one character, no echo, no Ctrl-C check. Blocks.
             0x07 => self.read_char(regs, mem, false),
+            // AH=0Ah: buffered line input into DS:DX. Blocks until CR.
+            0x0a => self.buffered_input(regs, mem),
             // AH=0Bh: get input status. ZF set and AL=0 when empty, ZF clear and
             // AL=0xFF when a character is waiting. Does not consume the character.
             0x0b => {
@@ -944,6 +1001,7 @@ impl DosKernel {
                         DosAction::Continue
                     }
                     0x07 | 0x08 => self.read_char(regs, mem, false)?,
+                    0x0a => self.buffered_input(regs, mem)?,
                     _ => DosAction::Continue,
                 };
                 if !matches!(result, DosAction::WaitForKey) {
@@ -1935,6 +1993,60 @@ fn read_asciiz(mem: &Memory, seg: u16, off: u16) -> Result<Option<String>, DosEr
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn ah0a_reads_a_line_until_cr_with_backspace() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let buf = 0x2000usize;
+        mem.write_u8(buf, 8).unwrap(); // max length 8
+        // Type "ab", backspace, "c", CR.
+        seed_keyboard_ring(&mut mem, &[b'a', b'b', 0x08, b'c', 0x0d]).unwrap();
+        let mut regs = DosRegs {
+            ax: 0x0a00,
+            dx: buf as u16,
+            ds: 0,
+            ..Default::default()
+        };
+        let action = kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(action, DosAction::Continue);
+        assert_eq!(mem.read_u8(buf + 1).unwrap(), 2, "two chars: a, c");
+        assert_eq!(mem.read_u8(buf + 2).unwrap(), b'a');
+        assert_eq!(mem.read_u8(buf + 3).unwrap(), b'c');
+        assert_eq!(
+            mem.read_u8(buf + 4).unwrap(),
+            0x0d,
+            "CR stored after the chars"
+        );
+    }
+
+    #[test]
+    fn ah0a_blocks_when_the_line_is_incomplete() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let buf = 0x2000usize;
+        mem.write_u8(buf, 8).unwrap();
+        seed_keyboard_ring(&mut mem, b"ab").unwrap(); // no CR yet
+        let mut regs = DosRegs {
+            ax: 0x0a00,
+            dx: buf as u16,
+            ds: 0,
+            ..Default::default()
+        };
+        let action = kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(action, DosAction::WaitForKey, "no CR -> block");
+        // Supply the rest and re-enter: the count resumes from where it paused.
+        seed_keyboard_ring(&mut mem, &[b'c', 0x0d]).unwrap();
+        let mut regs = DosRegs {
+            ax: 0x0a00,
+            dx: buf as u16,
+            ds: 0,
+            ..Default::default()
+        };
+        let action = kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(action, DosAction::Continue);
+        assert_eq!(mem.read_u8(buf + 1).unwrap(), 3, "abc");
+    }
 
     #[test]
     fn mounts_existing_directory_as_c_drive() {
