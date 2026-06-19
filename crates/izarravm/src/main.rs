@@ -51,6 +51,8 @@ struct Cli {
     #[arg(long)]
     headless_keyboard: bool,
     #[arg(long)]
+    headless_izarra_bios: bool,
+    #[arg(long)]
     headless_run: Option<PathBuf>,
     #[arg(long)]
     stdin_text: Option<String>,
@@ -118,6 +120,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     if cli.headless_keyboard {
         return run_keyboard_demo(&hardware, cli.stdin_text.as_deref());
+    }
+
+    if cli.headless_izarra_bios {
+        return run_izarra_bios(&hardware);
     }
 
     let rom = match cli.bios.as_deref() {
@@ -248,6 +254,37 @@ fn run_keyboard_demo(
         }
     }
     println!("{}", machine.screen_text().as_text());
+    Ok(())
+}
+
+/// Boot the Izarra 3000 BIOS headless, run POST to halt, print the VDTS records.
+/// Its own function because a Machine is a large inline value (combining the
+/// headless paths overflows main's stack frame).
+fn run_izarra_bios(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
+    let mut machine = Machine::new(
+        MachineProfile::from_hardware_profile(hardware),
+        izarravm_firmware::izarra_bios(),
+    )?;
+    // POST is wall-time bound (device settle, keyboard window), so scale the
+    // cycle budget with the clock as the boot suite does (clock_hz / 5 ~ 200 ms).
+    let budget = hardware.clock_hz / 5;
+    let stop_reason = machine.run_until_halt_or_cycles(budget)?;
+    let results = parse_result_block(machine.memory().as_slice())?;
+    for record in &results.records {
+        let status = match record.status {
+            SuiteRecordStatus::Begin => "BEGIN",
+            SuiteRecordStatus::Pass => "PASS",
+            SuiteRecordStatus::Fail => "FAIL",
+            SuiteRecordStatus::Measure => "MEASURE",
+        };
+        match &record.value {
+            Some(value) => println!("{status} {} {value}", record.name),
+            None => println!("{status} {}", record.name),
+        }
+    }
+    println!("records: {}", results.records.len());
+    println!("declared: {}", results.declared_record_count);
+    println!("stop: {stop_reason:?}");
     Ok(())
 }
 

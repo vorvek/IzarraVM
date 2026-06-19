@@ -20,6 +20,8 @@ pub const KBD_RESIDENT_BIOS_SOURCE: &str = include_str!("../roms/kbd-resident.as
 /// handlers run with CS set to this and use cs-relative table lookups, so the
 /// installer must place the image at this segment's offset 0.
 pub const KBD_RESIDENT_BIOS_SEG: u16 = 0xf000;
+pub const IZARRA_BIOS: &[u8] = include_bytes!("../roms/izarra-bios.bin");
+pub const IZARRA_BIOS_SOURCE: &str = include_str!("../roms/izarra-bios.asm");
 
 pub const I386DX25_TEST_ROM_SIZE: usize = 64 * 1024;
 pub const X86_BOOT_TEST_IMAGE_SIZE: usize = 1440 * 1024;
@@ -36,6 +38,10 @@ pub fn kbd_bios() -> &'static [u8] {
 
 pub fn kbd_resident_bios() -> &'static [u8] {
     KBD_RESIDENT_BIOS
+}
+
+pub fn izarra_bios() -> &'static [u8] {
+    IZARRA_BIOS
 }
 
 pub fn boot_test_image() -> &'static [u8] {
@@ -207,6 +213,34 @@ mod tests {
     #[test]
     fn kbd_bios_is_64k() {
         assert_eq!(KBD_BIOS.len(), I386DX25_TEST_ROM_SIZE);
+    }
+
+    #[test]
+    fn izarra_bios_is_64k() {
+        assert_eq!(IZARRA_BIOS.len(), I386DX25_TEST_ROM_SIZE);
+    }
+
+    #[test]
+    fn izarra_bios_reset_far_jump() {
+        // The reset vector at 0xFFF0 far-jumps to ROM_SEG:0000 (reset at offset 0).
+        assert_eq!(
+            &IZARRA_BIOS[0xfff0..0xfff5],
+            &[0xea, 0x00, 0x00, 0x00, 0xf0]
+        );
+    }
+
+    #[test]
+    fn izarra_bios_embeds_8x8_font() {
+        // Glyphs '@' (0x40) and 'A' (0x41) from VGAFONT_8X8, byte-for-byte. A
+        // contiguous 16-byte match proves the font copy did not drift.
+        let at_and_a: [u8; 16] = [
+            0x7c, 0xc6, 0xde, 0xde, 0xde, 0xc0, 0x78, 0x00, // '@'
+            0x30, 0x78, 0xcc, 0xcc, 0xfc, 0xcc, 0xcc, 0x00, // 'A'
+        ];
+        assert!(
+            IZARRA_BIOS.windows(16).any(|window| window == at_and_a),
+            "8x8 font glyphs @/A not found in the Izarra BIOS ROM"
+        );
     }
 
     #[test]

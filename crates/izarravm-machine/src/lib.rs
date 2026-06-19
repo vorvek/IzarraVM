@@ -5819,4 +5819,83 @@ mod tests {
         });
         assert_eq!(code, 2);
     }
+
+    // --- Izarra 3000 BIOS foundation ---------------------------------------
+
+    #[test]
+    fn izarra_bios_post_publishes_result_block() {
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
+        let reason = machine.run_until_halt_or_cycles(5_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        let results = izarravm_firmware::parse_result_block(machine.memory().as_slice()).unwrap();
+        // The live result builder owns the header: declared count must match the
+        // parsed records and the additive checksum must validate (parse succeeded).
+        assert_eq!(
+            usize::from(results.declared_record_count),
+            results.records.len()
+        );
+        // The suite opens with a BEGIN record and the foundation reference step.
+        assert_eq!(
+            results.records[0].status,
+            izarravm_firmware::SuiteRecordStatus::Begin
+        );
+        assert_eq!(results.records[0].name, "suite.izarra");
+        assert!(results.records.iter().any(|record| {
+            record.status == izarravm_firmware::SuiteRecordStatus::Pass
+                && record.name == "self.framework"
+        }));
+        // self.extaccess proves the unreal-mode >1 MiB helpers work in the live BIOS.
+        assert!(results.records.iter().any(|record| {
+            record.status == izarravm_firmware::SuiteRecordStatus::Pass
+                && record.name == "self.extaccess"
+        }));
+    }
+
+    #[test]
+    fn izarra_bios_draws_post_banner_in_mode13h() {
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
+        machine.run_until_halt_or_cycles(5_000_000).unwrap();
+        // The CPU is halted with the banner drawn; advance the beam to scan a frame.
+        machine.advance_devices(600_000);
+        let raster = machine.vga_raster().expect("mode 13h presents a VgaRaster");
+        assert_eq!(raster.width, 320);
+        // gfx_clear painted the frame with COLOR_BG (0): a pixel well below the
+        // banner is background.
+        let w = raster.width as usize;
+        assert_eq!(
+            raster.pixels[150 * w + 160],
+            0,
+            "frame cleared to background"
+        );
+        // gfx_text drew the title in COLOR_TITLE (0x0f). Mode 13h double-scans, so
+        // logical rows 8..16 land at physical rows 16..32. Count foreground pixels
+        // in that band (x 8..144) rather than matching an exact glyph.
+        let title_pixels = (16..32)
+            .flat_map(|y| (8..144).map(move |x| (x, y)))
+            .filter(|&(x, y)| raster.pixels[y * w + x] == 0x0f)
+            .count();
+        assert!(
+            title_pixels > 20,
+            "expected the drawn title glyphs, found {title_pixels} foreground pixels"
+        );
+    }
+
+    #[test]
+    fn izarra_bios_isr_enqueues_injected_key() {
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
+        // Run POST to the idle halt (the boot tail does sti; hlt). Injecting before
+        // PIC init would lose the pending IRQ to the BIOS's own 8259 re-program, so
+        // inject after the BIOS is parked at hlt with IF=1: the key (IRQ1) wakes the
+        // CPU, the installed INT 09h reads it and enqueues into the BDA ring.
+        let reason = machine.run_until_halt_or_cycles(5_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        machine.inject_key_scancodes(&[0x1e, 0x9e]);
+        machine.run_until_halt_or_cycles(2_000_000).unwrap();
+        let head = machine.memory_read_u16_for_test(0x41a);
+        let tail = machine.memory_read_u16_for_test(0x41c);
+        assert_ne!(head, tail, "the installed INT 09h enqueued the key");
+    }
 }

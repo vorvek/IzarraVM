@@ -1,0 +1,178 @@
+; izbios-kbd.inc - foundation: INT 09h / INT 16h keyboard path, lifted from
+; kbd-bios-core.inc, plus kb_getkey / kb_flush for the setup page. The BDA ring
+; offsets (KB_BUF_*) live in izbios-defs.inc. Installed at IVT[09h]/IVT[16h] by
+; core bring-up.
+
+; kb_getkey: thin wrapper over the installed INT 16h.
+;   AH=0 -> blocking read: AL=ASCII, AH=scancode.
+;   AH=1 -> peek: CF=1 if empty; else AL=ASCII, AH=scancode (left in the ring).
+kb_getkey:
+    int 0x16
+    ret
+
+; kb_flush: drop everything in the ring (head = tail).
+kb_flush:
+    push ds
+    push ax
+    push bx
+    mov ax, BDA_SEG
+    mov ds, ax
+    mov bx, [KB_BUF_TAIL]
+    mov [KB_BUF_HEAD], bx
+    pop bx
+    pop ax
+    pop ds
+    ret
+
+; INT 09h: keyboard hardware ISR.
+int09:
+    push ax
+    push bx
+    push ds
+    in al, 0x60
+    mov bl, al
+    test bl, 0x80
+    jnz .break
+    cmp bl, 0x2a
+    je .set_lshift
+    cmp bl, 0x36
+    je .set_rshift
+    push cx
+    push si
+    mov ax, BDA_SEG
+    mov ds, ax
+    movzx si, bl
+    mov al, [cs:scan2ascii + si]
+    test byte [KB_FLAGS], 0x03
+    jz .have_ascii
+    mov al, [cs:scan2ascii_shift + si]
+.have_ascii:
+    mov ah, bl
+    call kb_enqueue
+    pop si
+    pop cx
+    jmp .eoi
+.set_lshift:
+    mov ax, BDA_SEG
+    mov ds, ax
+    or byte [KB_FLAGS], 0x02
+    jmp .eoi
+.set_rshift:
+    mov ax, BDA_SEG
+    mov ds, ax
+    or byte [KB_FLAGS], 0x01
+    jmp .eoi
+.break:
+    and bl, 0x7f
+    cmp bl, 0x2a
+    je .clr_lshift
+    cmp bl, 0x36
+    je .clr_rshift
+    jmp .eoi
+.clr_lshift:
+    mov ax, BDA_SEG
+    mov ds, ax
+    and byte [KB_FLAGS], 0xfd
+    jmp .eoi
+.clr_rshift:
+    mov ax, BDA_SEG
+    mov ds, ax
+    and byte [KB_FLAGS], 0xfe
+.eoi:
+    mov al, 0x20
+    out 0x20, al
+    pop ds
+    pop bx
+    pop ax
+    iret
+
+; INT 16h: keyboard services.
+int16:
+    cmp ah, 0x00
+    je .read
+    cmp ah, 0x01
+    je .peek
+    cmp ah, 0x02
+    je .flags
+    iret
+.read:
+    sti
+.read_wait:
+    push ds
+    mov bx, BDA_SEG
+    mov ds, bx
+    mov bx, [KB_BUF_HEAD]
+    cmp bx, [KB_BUF_TAIL]
+    pop ds
+    je .read_wait
+    push ds
+    mov cx, BDA_SEG
+    mov ds, cx
+    mov bx, [KB_BUF_HEAD]
+    mov ax, [bx]
+    add bx, 2
+    cmp bx, KB_BUF_START + 32
+    jb .read_store
+    mov bx, KB_BUF_START
+.read_store:
+    mov [KB_BUF_HEAD], bx
+    pop ds
+    iret
+.peek:
+    push ds
+    mov bx, BDA_SEG
+    mov ds, bx
+    mov bx, [KB_BUF_HEAD]
+    cmp bx, [KB_BUF_TAIL]
+    je .peek_empty
+    mov ax, [bx]
+    pop ds
+    clc
+    iret
+.peek_empty:
+    pop ds
+    stc
+    iret
+.flags:
+    push ds
+    mov bx, BDA_SEG
+    mov ds, bx
+    mov al, [KB_FLAGS]
+    pop ds
+    xor ah, ah
+    iret
+
+; BDA ring enqueue: AX = scancode:ascii. Enters with DS = BDA_SEG. Drops on full.
+kb_enqueue:
+    push bx
+    push cx
+    mov bx, [KB_BUF_TAIL]
+    mov cx, bx
+    add cx, 2
+    cmp cx, KB_BUF_START + 32
+    jb .no_wrap
+    mov cx, KB_BUF_START
+.no_wrap:
+    cmp cx, [KB_BUF_HEAD]
+    je .full
+    mov [bx], ax
+    mov [KB_BUF_TAIL], cx
+.full:
+    pop cx
+    pop bx
+    ret
+
+; Scancode (Set 1) -> ASCII (US). 0 = no ASCII / handled elsewhere.
+scan2ascii:
+    db 0,    27,  '1','2','3','4','5','6','7','8','9','0','-','=', 8,  9
+    db 'q','w','e','r','t','y','u','i','o','p','[',']', 13, 0,  'a','s'
+    db 'd','f','g','h','j','k','l',';',39, '`', 0,  92, 'z','x','c','v'
+    db 'b','n','m',',','.','/', 0,  '*', 0,  ' '
+    times 0x80 - ($ - scan2ascii) db 0
+
+scan2ascii_shift:
+    db 0,    27,  '!','@','#','$','%','^','&','*','(',')','_','+', 8,  9
+    db 'Q','W','E','R','T','Y','U','I','O','P','{','}', 13, 0,  'A','S'
+    db 'D','F','G','H','J','K','L',':',34, '~', 0,  '|','Z','X','C','V'
+    db 'B','N','M','<','>','?', 0,  '*', 0,  ' '
+    times 0x80 - ($ - scan2ascii_shift) db 0
