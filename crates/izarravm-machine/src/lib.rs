@@ -5417,4 +5417,21 @@ mod tests {
         assert_eq!(reason, StopReason::DosExit { code: 0 });
         assert_eq!(machine.dos_output(), b"BLASTER=A220 I5 D1 H5 T6");
     }
+
+    #[test]
+    fn keyboard_rom_echoes_injected_keys_to_the_screen() {
+        let profile = MachineProfile::i386dx25(1, izarravm_core::VideoCard::Et4000Ax);
+        let mut machine = Machine::new(profile, izarravm_firmware::kbd_bios()).unwrap();
+        // Let the ROM run its init (install vectors, unmask IRQ1, STI, enter loop).
+        machine.run_until_halt_or_cycles(200_000).unwrap();
+        // Inject 'h' then 'i' (Set 1 make+break for H=0x23, I=0x17).
+        machine.inject_key_scancodes(&[0x23, 0xa3, 0x17, 0x97]);
+        machine.run_until_halt_or_cycles(2_000_000).unwrap();
+        let screen = machine.screen_text();
+        assert!(
+            screen.line_string(0).starts_with("hi"),
+            "screen line 0 was {:?}",
+            screen.line_string(0)
+        );
+    }
 }

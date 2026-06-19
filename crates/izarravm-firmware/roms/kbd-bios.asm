@@ -9,6 +9,7 @@ org 0
 %define KB_BUF_HEAD    0x001a      ; BDA: head pointer (offset into 0x40 seg)
 %define KB_BUF_TAIL    0x001c      ; BDA: tail pointer
 %define KB_FLAGS       0x0017      ; BDA: shift flags
+%define CURSOR_OFF     0x0050      ; BDA: cursor offset into the text buffer (RAM)
 
 reset:
     cli
@@ -31,12 +32,29 @@ reset:
     mov word [KB_BUF_TAIL], KB_BUF_START
     mov byte [KB_FLAGS], 0
 
+    ; Program the 8259 PICs so IRQ0..7 map to INT 08h..0Fh (IRQ1 -> INT 09h).
+    ; ICW1 (edge, cascade, ICW4 to follow), ICW2 base, ICW3 cascade, ICW4 8086.
+    mov al, 0x11
+    out 0x20, al           ; master ICW1
+    out 0xa0, al           ; slave  ICW1
+    mov al, 0x08
+    out 0x21, al           ; master ICW2: vector base 08h
+    mov al, 0x70
+    out 0xa1, al           ; slave  ICW2: vector base 70h
+    mov al, 0x04
+    out 0x21, al           ; master ICW3: slave on IR2
+    mov al, 0x02
+    out 0xa1, al           ; slave  ICW3: cascade identity 2
+    mov al, 0x01
+    out 0x21, al           ; master ICW4: 8086 mode
+    out 0xa1, al           ; slave  ICW4: 8086 mode
+
     ; Unmask IRQ1 on the master PIC (clear bit 1 of the 0x21 mask).
     in al, 0x21
     and al, 0xfd
     out 0x21, al
 
-    ; Clear the screen and home the cursor (tracked in DI within ROM_SEG data).
+    ; Clear the screen and home the cursor (cursor tracked in the BDA, in RAM).
     call clear_screen
     sti
 
@@ -190,8 +208,10 @@ kb_enqueue:
     pop bx
     ret
 
-; Text output to B8000 (cursor tracked in cs:cursor)
+; Text output to B8000 (cursor tracked in the BDA at 0040:CURSOR_OFF, in RAM,
+; because writes back into the ROM image are dropped by the bus).
 clear_screen:
+    push ds
     push es
     push di
     mov ax, VGA_TEXT_SEG
@@ -200,19 +220,26 @@ clear_screen:
     mov cx, 80*25
     mov ax, 0x0720         ; space, grey on black
     rep stosw
-    mov word [cs:cursor], 0
+    mov ax, 0x0040
+    mov ds, ax
+    mov word [CURSOR_OFF], 0
     pop di
     pop es
+    pop ds
     ret
 
 ; putchar: AL = ASCII. Handles CR/LF minimally.
 putchar:
+    push ds
     push es
     push di
     push bx
+    push dx
+    mov bx, 0x0040
+    mov ds, bx
     mov bx, VGA_TEXT_SEG
     mov es, bx
-    mov di, [cs:cursor]
+    mov di, [CURSOR_OFF]
     cmp al, 13
     je .cr
     cmp al, 10
@@ -232,13 +259,13 @@ putchar:
 .lf:
     add di, 160
 .save:
-    mov [cs:cursor], di
+    mov [CURSOR_OFF], di
+    pop dx
     pop bx
     pop di
     pop es
+    pop ds
     ret
-
-cursor: dw 0
 
 ; Scancode (Set 1) -> ASCII tables (US). 0 = no ASCII / handled elsewhere.
 ; Index by make scancode (0x00..0x3a covers the main block used by the demo).
