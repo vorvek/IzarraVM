@@ -5,7 +5,6 @@
 use std::collections::VecDeque;
 
 const STATUS_OBF: u8 = 0x01; // output buffer full (data waiting on 0x60)
-const STATUS_IBF: u8 = 0x02; // input buffer full (unread command/data)
 const STATUS_SYS: u8 = 0x04; // system flag, set after a passed self-test
 
 #[derive(Debug, Clone, PartialEq)]

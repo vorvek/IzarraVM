@@ -11,8 +11,6 @@ use izarravm_video::{
 use thiserror::Error;
 
 mod dma;
-// Standalone device; not wired into Machine yet, so its API is unused for now.
-#[allow(dead_code)]
 mod keyboard;
 mod pic;
 mod pit;
@@ -156,6 +154,7 @@ pub struct Machine {
     device_ports: DevicePorts,
     pic: pic::Pic8259Pair,
     pit: pit::Pit,
+    keyboard: keyboard::Keyboard8042,
     pit_clocks: f64, // fractional PIT input clocks owed to the counters
     dma: dma::DmaController,
     opl: OplChip,
@@ -230,6 +229,7 @@ impl Machine {
             device_ports: DevicePorts::default(),
             pic: pic::Pic8259Pair::default(),
             pit: pit::Pit::default(),
+            keyboard: keyboard::Keyboard8042::default(),
             pit_clocks: 0.0,
             dma: dma::DmaController::default(),
             opl: OplChip::default(),
@@ -373,6 +373,26 @@ impl Machine {
         self.serial.output()
     }
 
+    /// Feed Set 1 scancodes to the keyboard controller (make on press, break on
+    /// release). Requests IRQ1 immediately so a halted or idle CPU wakes to it.
+    pub fn inject_key_scancodes(&mut self, codes: &[u8]) {
+        self.keyboard.push_scancodes(codes);
+        if self.keyboard.take_irq() {
+            self.pic.request(1);
+        }
+    }
+
+    #[cfg(test)]
+    fn read_io_port_u8(&mut self, port: u16) -> u8 {
+        let mut bus = self.make_bus();
+        bus.read_io(port, BusWidth::Byte).unwrap_or(0) as u8
+    }
+
+    #[cfg(test)]
+    fn irq1_pending(&self) -> bool {
+        self.pic.irr_bit(1)
+    }
+
     pub fn serial_text(&self) -> String {
         String::from_utf8_lossy(self.serial_output()).into_owned()
     }
@@ -398,6 +418,7 @@ impl Machine {
             device_ports: &mut self.device_ports,
             pic: &mut self.pic,
             pit: &mut self.pit,
+            keyboard: &mut self.keyboard,
             dma: &mut self.dma,
             opl: &mut self.opl,
             dsp: &mut self.dsp,
@@ -952,6 +973,10 @@ impl Machine {
             self.pic.request(0); // channel 0 OUT rising edge is IRQ0
         }
 
+        if self.keyboard.take_irq() {
+            self.pic.request(1); // IRQ1: keyboard output buffer has a scancode
+        }
+
         self.margo_ns += clocks as f64 * 1_000_000_000.0 / self.profile.clock_hz as f64;
         let whole_ns = self.margo_ns.floor();
         self.margo.advance_busy(whole_ns as u64);
@@ -1215,6 +1240,7 @@ impl Machine {
                     device_ports,
                     pic,
                     pit,
+                    keyboard,
                     dma,
                     opl,
                     dsp,
@@ -1232,6 +1258,7 @@ impl Machine {
                     device_ports,
                     pic,
                     pit,
+                    keyboard,
                     dma,
                     opl,
                     dsp,
@@ -1314,6 +1341,7 @@ struct MachineBus<'a> {
     device_ports: &'a mut DevicePorts,
     pic: &'a mut pic::Pic8259Pair,
     pit: &'a mut pit::Pit,
+    keyboard: &'a mut keyboard::Keyboard8042,
     dma: &'a mut dma::DmaController,
     opl: &'a mut OplChip,
     dsp: &'a mut SbDsp,
@@ -1440,6 +1468,9 @@ impl CpuBus for MachineBus<'_> {
         if let Some(value) = self.dma.read_port(port) {
             return Ok(u32::from(value));
         }
+        if let Some(value) = self.keyboard.read_port(port) {
+            return Ok(u32::from(value));
+        }
         self.device_ports
             .read_port(port)
             .map(u32::from)
@@ -1475,6 +1506,7 @@ impl CpuBus for MachineBus<'_> {
             || self.video.write_port(port, value as u8)
             || self.pit.write_port(port, value as u8)
             || self.pic.write_port(port, value as u8)
+            || self.keyboard.write_port(port, value as u8)
             || self.device_ports.write_port(port, value as u8)
         {
             Ok(())
@@ -1543,7 +1575,6 @@ impl DevicePorts {
 fn known_passive_ports() -> impl Iterator<Item = u16> {
     let ranges = [
         0x0000..=0x000f, // DMA controller 1
-        0x0060..=0x0064, // keyboard controller / A20 path
         0x0080..=0x008f, // DMA page registers
         0x0092..=0x0092, // system control port A / fast A20
         0x00c0..=0x00df, // DMA controller 2
@@ -1852,6 +1883,17 @@ mod tests {
         rom[..code.len()].copy_from_slice(code);
         rom[0xfff0..0xfff5].copy_from_slice(&[0xea, 0x00, 0x00, 0x00, 0xf0]);
         rom
+    }
+
+    #[test]
+    fn injected_key_is_readable_on_port_0x60_and_requests_irq1() {
+        // A bare machine: inject a scancode, then read it back through the bus the
+        // way the CPU would, and confirm IRQ1 became pending on the PIC.
+        let profile = MachineProfile::i386dx25(1, izarravm_core::VideoCard::Et4000Ax);
+        let mut machine = Machine::new(profile, vec![0u8; BIOS_ROM_SIZE]).unwrap();
+        machine.inject_key_scancodes(&[0x1e]); // 'A' make
+        assert_eq!(machine.read_io_port_u8(0x60), 0x1e);
+        assert!(machine.irq1_pending(), "injecting a key requests IRQ1");
     }
 
     #[test]
@@ -2495,6 +2537,7 @@ mod tests {
             device_ports: &mut machine.device_ports,
             pic: &mut machine.pic,
             pit: &mut machine.pit,
+            keyboard: &mut machine.keyboard,
             dma: &mut machine.dma,
             opl: &mut machine.opl,
             dsp: &mut machine.dsp,

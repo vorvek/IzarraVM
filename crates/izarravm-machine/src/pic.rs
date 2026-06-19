@@ -188,6 +188,17 @@ impl Pic8259Pair {
         self.irq_unmasked(0)
     }
 
+    /// True when IRQ `irq` (0..15) has a latched request in the IRR. IRQ 0..7 are
+    /// on the master, IRQ 8..15 on the slave. Test-only inspector.
+    #[cfg(test)]
+    pub(crate) fn irr_bit(&self, irq: u8) -> bool {
+        if irq < 8 {
+            self.master.irr & (1 << irq) != 0
+        } else {
+            self.slave.irr & (1 << (irq - 8)) != 0
+        }
+    }
+
     pub(crate) fn request(&mut self, irq: u8) {
         debug_assert!(irq < 16, "the PIC pair has 16 IRQ lines, got {irq}");
         if irq < 8 {
