@@ -144,7 +144,11 @@ fn run_boot_suite(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
         MachineProfile::from_hardware_profile(hardware),
         boot_test_image(),
     )?;
-    let stop_reason = machine.run_until_halt_or_cycles(5_000_000)?;
+    // The suite is wall-time-bound (PIT ticks and device-settle delays), so the
+    // cycle budget scales with the clock to cover the same span at any GSW mode.
+    // 200 ms (clock_hz / 5) matches the original 5,000,000 cycles at 25 MHz.
+    let budget = hardware.clock_hz / 5;
+    let stop_reason = machine.run_until_halt_or_cycles(budget)?;
     // Report the result block, which holds the runtime outcome (the timer test
     // patches its record here). The serial dump is an earlier static snapshot.
     let results = parse_result_block(machine.memory().as_slice())?;

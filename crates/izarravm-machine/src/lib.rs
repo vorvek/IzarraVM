@@ -2269,6 +2269,42 @@ mod tests {
     }
 
     #[test]
+    fn boot_suite_timer_passes_at_native_266mhz() {
+        // The boot suite is wall-time-bound: the timer test waits for ten IRQ0
+        // edges and the PIT runs at a fixed rate regardless of the CPU clock. At
+        // the 266 MHz native default the cycle budget must scale (clock_hz / 5,
+        // about 200 ms) or the timer test never reaches its tick target.
+        let profile = MachineProfile {
+            cpu: GswMode::Gsw586,
+            clock_hz: GswMode::Gsw586.clock_hz(),
+            memory_mib: 16,
+            video: VideoCard::Et4000Ax,
+            sound_blaster: SoundBlasterConfig::default(),
+            wait_states: WaitStateProfile::default(),
+            address_pipelining: false,
+            cache_enabled: false,
+        };
+        let budget = profile.clock_hz / 5;
+        let mut machine =
+            Machine::new_boot_image(profile, izarravm_firmware::X86_BOOT_TEST_IMAGE).unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(budget).unwrap();
+        let results = izarravm_firmware::parse_result_block(machine.memory().as_slice()).unwrap();
+
+        assert_eq!(reason, StopReason::Halted);
+        let timer = results
+            .records
+            .iter()
+            .find(|record| record.name == "timer.irq0")
+            .expect("timer.irq0 record present");
+        assert_eq!(
+            timer.status,
+            izarravm_firmware::SuiteRecordStatus::Pass,
+            "timer.irq0 must pass at 266 MHz with the scaled budget"
+        );
+    }
+
+    #[test]
     fn margo_apertures_route_through_the_bus() {
         let mut machine = test_machine();
 
