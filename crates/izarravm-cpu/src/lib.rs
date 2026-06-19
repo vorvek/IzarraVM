@@ -2229,7 +2229,7 @@ impl Cpu386 {
         offset: u32,
         kind: BusAccessKind,
     ) -> ExecResult<u8> {
-        let physical = self.translate_segmented(bus, segment, offset, 1, kind, false)?;
+        let physical = self.translate_segmented(bus, segment, offset, 1, false)?;
         Ok(bus.read_memory(physical, BusWidth::Byte, kind)? as u8)
     }
 
@@ -2241,7 +2241,7 @@ impl Cpu386 {
         value: u8,
         kind: BusAccessKind,
     ) -> ExecResult<()> {
-        let physical = self.translate_segmented(bus, segment, offset, 1, kind, true)?;
+        let physical = self.translate_segmented(bus, segment, offset, 1, true)?;
         bus.write_memory(physical, BusWidth::Byte, u32::from(value), kind)?;
         Ok(())
     }
@@ -2254,7 +2254,7 @@ impl Cpu386 {
         size: OperandSize,
         kind: BusAccessKind,
     ) -> ExecResult<u32> {
-        let physical = self.translate_segmented(bus, segment, offset, size.bytes(), kind, false)?;
+        let physical = self.translate_segmented(bus, segment, offset, size.bytes(), false)?;
         Ok(bus.read_memory(physical, size.bus_width(), kind)?)
     }
 
@@ -2267,7 +2267,7 @@ impl Cpu386 {
         value: u32,
         kind: BusAccessKind,
     ) -> ExecResult<()> {
-        let physical = self.translate_segmented(bus, segment, offset, size.bytes(), kind, true)?;
+        let physical = self.translate_segmented(bus, segment, offset, size.bytes(), true)?;
         bus.write_memory(physical, size.bus_width(), value, kind)?;
         Ok(())
     }
@@ -2278,7 +2278,6 @@ impl Cpu386 {
         segment: SegmentIndex,
         offset: u32,
         width: u32,
-        kind: BusAccessKind,
         write: bool,
     ) -> ExecResult<u32> {
         let descriptor = self.registers.segment(segment);
@@ -2294,12 +2293,7 @@ impl Cpu386 {
         }
 
         let linear = descriptor.base.wrapping_add(offset);
-        self.translate_linear(
-            bus,
-            linear,
-            write,
-            matches!(kind, BusAccessKind::InstructionPrefetch),
-        )
+        self.translate_linear(bus, linear, write)
     }
 
     fn translate_linear<B: CpuBus>(
@@ -2307,11 +2301,15 @@ impl Cpu386 {
         bus: &mut B,
         linear: u32,
         write: bool,
-        instruction_fetch: bool,
     ) -> ExecResult<u32> {
         if !self.is_paging_enabled() {
             return Ok(linear);
         }
+
+        // 386 paging privilege: CPL 3 is a user access, CPL 0-2 are supervisor.
+        // A 386 has no CR0.WP, so supervisor accesses bypass the R/W and U/S page
+        // bits entirely and only user accesses are protection-checked.
+        let user = self.is_protected_mode() && (self.registers.cs().selector & 3) == 3;
 
         let directory = self.control.cr3 & 0xffff_f000;
         let directory_address = directory + (((linear >> 22) & 0x03ff) * 4);
@@ -2324,7 +2322,7 @@ impl Cpu386 {
             self.control.cr2 = linear;
             return Err(InternalFault::Exception {
                 vector: 14,
-                error_code: Some(page_fault_code(false, write, instruction_fetch)),
+                error_code: Some(page_fault_code(false, write, user)),
             });
         }
         if pde & 0x20 == 0 {
@@ -2344,7 +2342,19 @@ impl Cpu386 {
             self.control.cr2 = linear;
             return Err(InternalFault::Exception {
                 vector: 14,
-                error_code: Some(page_fault_code(false, write, instruction_fetch)),
+                error_code: Some(page_fault_code(false, write, user)),
+            });
+        }
+
+        // User-mode protection: a page is user-accessible only if both the PDE and
+        // PTE U/S bits (bit 2) are set, and writable only if both R/W bits (bit 1)
+        // are set. A user access that violates either faults with present=1.
+        // Checked before the dirty bit is set so a faulting write leaves it clear.
+        if user && (pde & pte & 0x4 == 0 || (write && pde & pte & 0x2 == 0)) {
+            self.control.cr2 = linear;
+            return Err(InternalFault::Exception {
+                vector: 14,
+                error_code: Some(page_fault_code(true, write, user)),
             });
         }
 
@@ -2489,14 +2499,7 @@ impl Cpu386 {
     ) -> ExecResult<u32> {
         let segment = prefixes.segment_override.unwrap_or(SegmentIndex::Ds);
         let offset = self.index_offset(6, address_size); // SI / ESI
-        let physical = self.translate_segmented(
-            bus,
-            segment,
-            offset,
-            width.bytes(),
-            BusAccessKind::DataRead,
-            false,
-        )?;
+        let physical = self.translate_segmented(bus, segment, offset, width.bytes(), false)?;
         Ok(bus.read_memory(physical, width, BusAccessKind::DataRead)?)
     }
 
@@ -2507,14 +2510,8 @@ impl Cpu386 {
         width: BusWidth,
     ) -> ExecResult<u32> {
         let offset = self.index_offset(7, address_size); // DI / EDI
-        let physical = self.translate_segmented(
-            bus,
-            SegmentIndex::Es,
-            offset,
-            width.bytes(),
-            BusAccessKind::DataRead,
-            false,
-        )?;
+        let physical =
+            self.translate_segmented(bus, SegmentIndex::Es, offset, width.bytes(), false)?;
         Ok(bus.read_memory(physical, width, BusAccessKind::DataRead)?)
     }
 
@@ -2542,14 +2539,8 @@ impl Cpu386 {
         value: u32,
     ) -> ExecResult<()> {
         let offset = self.index_offset(7, address_size); // DI / EDI
-        let physical = self.translate_segmented(
-            bus,
-            SegmentIndex::Es,
-            offset,
-            width.bytes(),
-            BusAccessKind::DataWrite,
-            true,
-        )?;
+        let physical =
+            self.translate_segmented(bus, SegmentIndex::Es, offset, width.bytes(), true)?;
         bus.write_memory(physical, width, value, BusAccessKind::DataWrite)?;
         Ok(())
     }
@@ -2724,7 +2715,7 @@ impl Cpu386 {
     }
 
     fn read_system_linear_u32<B: CpuBus>(&mut self, bus: &mut B, linear: u32) -> ExecResult<u32> {
-        let physical = self.translate_linear(bus, linear, false, false)?;
+        let physical = self.translate_linear(bus, linear, false)?;
         Ok(bus.read_memory(physical, BusWidth::Dword, BusAccessKind::DataRead)?)
     }
 
@@ -3463,8 +3454,11 @@ fn parity(value: u8) -> bool {
     value.count_ones() % 2 == 0
 }
 
-fn page_fault_code(present: bool, write: bool, instruction_fetch: bool) -> u32 {
-    u32::from(present) | (u32::from(write) << 1) | (u32::from(instruction_fetch) << 4)
+fn page_fault_code(present: bool, write: bool, user: bool) -> u32 {
+    // 80386 page-fault error code: bit 0 = P (present), bit 1 = W/R (was a write),
+    // bit 2 = U/S (was a user access). The reserved-bit (bit 3, 486+) and
+    // instruction-fetch (bit 4, P6+) bits are later additions a 386 never sets.
+    u32::from(present) | (u32::from(write) << 1) | (u32::from(user) << 2)
 }
 
 #[cfg(test)]
@@ -3645,6 +3639,49 @@ mod tests {
         cpu.cycle(&mut bus).unwrap();
 
         assert_eq!(cpu.registers.eip, 1);
+    }
+
+    #[test]
+    fn user_mode_paging_respects_the_supervisor_bit() {
+        // PD at 0x1000, PT at 0x2000. Linear 0x3000 maps to a present, writable,
+        // supervisor (U/S=0) page at frame 0x5000.
+        let mut memory = vec![0; 0x6000];
+        memory[0x1000..0x1004].copy_from_slice(&0x0000_2007u32.to_le_bytes()); // PDE: PT, present+rw+user
+        memory[0x200c..0x2010].copy_from_slice(&0x0000_5003u32.to_le_bytes()); // PTE[3]: frame, present+rw, U/S=0
+        let mut cpu = Cpu386::default();
+        cpu.control.cr0 |= CR0_PE | CR0_PG;
+        cpu.control.cr3 = 0x1000;
+        let flat_cs = |rpl| SegmentRegister {
+            selector: rpl,
+            base: 0,
+            limit: 0xffff_ffff,
+            access: 0x9b,
+            default_size_32: false,
+        };
+        let mut bus = TestBus::with_memory(memory);
+
+        // CPL 3: a user read of the supervisor page faults with #PF, error code
+        // present|user (0b101 = 0x5), and cr2 set to the faulting linear address.
+        cpu.registers.set_segment(SegmentIndex::Cs, flat_cs(0x0003));
+        let faulted = cpu.translate_linear(&mut bus, 0x3000, false);
+        assert!(
+            matches!(
+                faulted,
+                Err(InternalFault::Exception {
+                    vector: 14,
+                    error_code: Some(0x5)
+                })
+            ),
+            "{faulted:?}"
+        );
+        assert_eq!(cpu.control.cr2, 0x3000);
+
+        // CPL 0: a 386 has no CR0.WP, so supervisor reaches the same page fine.
+        cpu.registers.set_segment(SegmentIndex::Cs, flat_cs(0x0000));
+        assert_eq!(
+            cpu.translate_linear(&mut bus, 0x3000, false).unwrap(),
+            0x5000
+        );
     }
 
     #[test]
