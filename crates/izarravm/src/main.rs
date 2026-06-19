@@ -120,7 +120,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         return run_keyboard_demo(&hardware, cli.stdin_text.as_deref());
     }
 
-    let rom = select_rom(cli.bios.as_deref())?;
+    let rom = match cli.bios.as_deref() {
+        Some(path) => std::fs::read(path)?,
+        None => izarravm_firmware::kbd_bios().to_vec(),
+    };
     let audio_enabled = config.audio.opl3 || config.audio.sound_blaster.enabled;
     gui::run(
         MachineProfile::from_hardware_profile(&hardware),
