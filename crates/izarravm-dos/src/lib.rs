@@ -14,7 +14,6 @@ const KBD_TAIL: usize = 0x1c;
 const KBD_RING_START: u16 = 0x1e;
 const KBD_RING_END: u16 = 0x3e; // exclusive
 
-#[allow(dead_code)]
 fn kbd_ring_is_empty(mem: &Memory) -> Result<bool, DosError> {
     let head = mem.read_u16(KBD_BDA_BASE + KBD_HEAD)?;
     let tail = mem.read_u16(KBD_BDA_BASE + KBD_TAIL)?;
@@ -38,7 +37,6 @@ fn kbd_ring_dequeue(mem: &mut Memory) -> Result<Option<(u8, u8)>, DosError> {
     Ok(Some(((word >> 8) as u8, (word & 0xff) as u8)))
 }
 
-#[allow(dead_code)]
 fn kbd_ring_flush(mem: &mut Memory) -> Result<(), DosError> {
     let tail = mem.read_u16(KBD_BDA_BASE + KBD_TAIL)?;
     mem.write_u16(KBD_BDA_BASE + KBD_HEAD, tail)?;
@@ -49,6 +47,7 @@ fn kbd_ring_flush(mem: &mut Memory) -> Result<(), DosError> {
 /// machine-level convenience seeder. Holds up to 15 bytes; longer inputs should
 /// drive the real INT 09h path instead.
 pub fn seed_keyboard_ring(mem: &mut Memory, ascii: &[u8]) -> Result<(), DosError> {
+    debug_assert!(ascii.len() < 16, "keyboard ring holds 15 entries");
     mem.write_u16(KBD_BDA_BASE + KBD_HEAD, KBD_RING_START)?;
     let mut off = KBD_RING_START;
     for &b in ascii {
@@ -190,9 +189,9 @@ pub enum DosAction {
         entry: ProgramEntry,
         child_ax: u16,
     },
-    /// A blocking console read (AH=01/07/08/0Ah) found the keyboard ring empty.
-    /// The machine rewinds the INT 21h so it re-executes after the ISR refills
-    /// the ring. The kernel leaves the registers unchanged.
+    /// A blocking console read (AH=01/07/08, and AH=0Ah once added) found the
+    /// keyboard ring empty. The machine rewinds the INT 21h so it re-executes
+    /// after the ISR refills the ring. The kernel leaves the registers unchanged.
     WaitForKey,
 }
 
@@ -422,6 +421,8 @@ pub struct DosKernel {
     program_stack: Vec<ProgramContext>,
     last_exit_code: u8, // AH=4Dh AL; cleared after it is read
     last_exit_type: u8, // AH=4Dh AH; always 0x00 (normal termination), marked
+    // AH=0Ch flush-and-invoke: the flush runs once, not again on a WaitForKey re-entry.
+    cooked_flush_done: bool,
 }
 
 impl DosKernel {
@@ -905,6 +906,51 @@ impl DosKernel {
             // AH=08h: read one character without echo from the keyboard ring. An empty
             // ring blocks via WaitForKey, the same as AH=01h.
             0x08 => self.read_char(regs, mem, false),
+            // AH=07h: read one character, no echo, no Ctrl-C check. Blocks.
+            0x07 => self.read_char(regs, mem, false),
+            // AH=0Bh: get input status. ZF set and AL=0 when empty, ZF clear and
+            // AL=0xFF when a character is waiting. Does not consume the character.
+            0x0b => {
+                if kbd_ring_is_empty(mem)? {
+                    regs.ax &= 0xff00;
+                    regs.zf = true;
+                } else {
+                    regs.ax = (regs.ax & 0xff00) | 0xff;
+                    regs.zf = false;
+                }
+                Ok(DosAction::Continue)
+            }
+            // AH=0Ch: flush the input buffer, then invoke the input function named
+            // in AL (01/06/07/08). The flush happens once even across WaitForKey
+            // re-entries, so a key that arrives while blocking is not discarded.
+            0x0c => {
+                if !self.cooked_flush_done {
+                    kbd_ring_flush(mem)?;
+                    self.cooked_flush_done = true;
+                }
+                let al = regs.ax as u8;
+                let result = match al {
+                    0x01 => self.read_char(regs, mem, true)?,
+                    0x06 => {
+                        if regs.dx as u8 == 0xff {
+                            match kbd_ring_dequeue(mem)? {
+                                Some((_, ascii)) => {
+                                    regs.ax = (regs.ax & 0xff00) | u16::from(ascii);
+                                    regs.zf = false;
+                                }
+                                None => regs.zf = true,
+                            }
+                        }
+                        DosAction::Continue
+                    }
+                    0x07 | 0x08 => self.read_char(regs, mem, false)?,
+                    _ => DosAction::Continue,
+                };
+                if !matches!(result, DosAction::WaitForKey) {
+                    self.cooked_flush_done = false;
+                }
+                Ok(result)
+            }
             // AH=09h: print the '$'-terminated string at DS:DX to standard output.
             0x09 => {
                 let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
@@ -1937,6 +1983,61 @@ mod tests {
         assert_eq!(kbd_ring_dequeue(&mut mem).unwrap(), Some((0, b'h')));
         assert_eq!(kbd_ring_dequeue(&mut mem).unwrap(), Some((0, b'i')));
         assert_eq!(kbd_ring_dequeue(&mut mem).unwrap(), None);
+        assert!(kbd_ring_is_empty(&mem).unwrap());
+    }
+
+    #[test]
+    fn ah07_reads_without_echo() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        seed_keyboard_ring(&mut mem, b"x").unwrap();
+        let mut regs = DosRegs {
+            ax: 0x0700,
+            ..Default::default()
+        };
+        let action = kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(action, DosAction::Continue);
+        assert_eq!(regs.ax & 0xff, u16::from(b'x'));
+        assert!(kernel.stdout().is_empty(), "AH=07h does not echo");
+    }
+
+    #[test]
+    fn ah0b_reports_status_without_consuming() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let mut regs = DosRegs {
+            ax: 0x0b00,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(regs.zf, "empty ring -> ZF set, AL=0");
+        assert_eq!(regs.ax & 0xff, 0);
+        seed_keyboard_ring(&mut mem, b"y").unwrap();
+        let mut regs = DosRegs {
+            ax: 0x0b00,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.zf, "key waiting -> ZF clear, AL=0xFF");
+        assert_eq!(regs.ax & 0xff, 0xff);
+        assert!(!kbd_ring_is_empty(&mem).unwrap(), "AH=0Bh does not consume");
+    }
+
+    #[test]
+    fn ah0c_flushes_then_reads_with_subfunction() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        seed_keyboard_ring(&mut mem, b"old").unwrap();
+        let mut regs = DosRegs {
+            ax: 0x0c01,
+            ..Default::default()
+        };
+        let action = kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(
+            action,
+            DosAction::WaitForKey,
+            "flush emptied the ring, AL=01 blocks"
+        );
         assert!(kbd_ring_is_empty(&mem).unwrap());
     }
 
