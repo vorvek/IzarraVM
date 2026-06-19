@@ -150,6 +150,7 @@ fn run_boot_suite(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
     }
     println!("records: {}", results.records.len());
     println!("stop: {stop_reason:?}");
+    print_com1(&machine.serial_text());
     Ok(())
 }
 
@@ -203,6 +204,7 @@ fn run_test_rom(
         "test ROM completed"
     );
     println!("{screen_text}");
+    print_com1(&machine.serial_text());
     println!("post: {:#04x}", machine.io_port(0x80).unwrap_or(0));
     println!("stop: {stop_reason:?}");
     Ok(())
@@ -229,6 +231,20 @@ fn load_config(cli: &Cli) -> Result<AppConfig, Box<dyn Error>> {
     });
 
     Ok(config)
+}
+
+/// Print whatever the guest wrote to COM1 (the serial port), under a header so
+/// it reads apart from the screen dump. Prints nothing when COM1 stayed silent,
+/// so a ROM that only touches the screen keeps a clean output.
+fn print_com1(serial: &str) {
+    if serial.is_empty() {
+        return;
+    }
+    println!("--- COM1 ---");
+    print!("{serial}");
+    if !serial.ends_with('\n') {
+        println!();
+    }
 }
 
 /// The BIOS ROM to boot: the file passed with --bios, or the built-in test ROM.
