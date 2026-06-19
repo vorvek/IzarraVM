@@ -125,7 +125,9 @@ pub struct GuiApp {
     audio_clocks: u64,
     audio_sample_debt: f64,
     epoch: Option<(Instant, u64)>,
-    accuracy: f64,
+    // Emulation speed as a fraction of real time: emulated clocks executed per
+    // wall second divided by the configured clock. EMA-smoothed, clamped at 1.5.
+    speed_ratio: f64,
     last_pace: Option<(Instant, u64)>,
     texture: Option<egui::TextureHandle>,
 }
@@ -164,7 +166,7 @@ impl GuiApp {
             audio_clocks: 0,
             audio_sample_debt: 0.0,
             epoch: None,
-            accuracy: 0.0,
+            speed_ratio: 0.0,
             last_pace: None,
             texture: None,
         };
@@ -191,7 +193,7 @@ impl GuiApp {
         self.audio_clocks = 0;
         self.audio_sample_debt = 0.0;
         self.epoch = None;
-        self.accuracy = 0.0;
+        self.speed_ratio = 0.0;
         self.last_pace = None;
         self.machine = Some(machine);
     }
@@ -218,7 +220,7 @@ impl GuiApp {
         player.queue(&pcm);
     }
 
-    /// Advance the machine to track wall-clock time and update the accuracy EMA.
+    /// Advance the machine to track wall-clock time and update the speed-ratio EMA.
     fn run_frame(&mut self) {
         let clock_hz = self.profile.clock_hz;
         let Some(machine) = &mut self.machine else {
@@ -240,7 +242,7 @@ impl GuiApp {
             if wall > 0.0 {
                 let ran = ran_to.saturating_sub(then_clocks) as f64;
                 let ratio = (ran / (wall * clock_hz as f64)).min(1.5);
-                self.accuracy = self.accuracy * 0.9 + ratio * 0.1;
+                self.speed_ratio = self.speed_ratio * 0.9 + ratio * 0.1;
             }
         }
         self.last_pace = Some((now, ran_to));
@@ -308,8 +310,8 @@ impl GuiApp {
         });
 
         ui.separator();
-        ui.label(format!("Speed: {}", speed_label(self.profile.clock_hz)));
-        ui.label(format!("Accuracy: {:.0}%", self.accuracy * 100.0));
+        ui.label(format!("CPU class: {}", speed_label(self.profile.clock_hz)));
+        ui.label(format!("Emulation speed: {:.0}%", self.speed_ratio * 100.0));
         ui.label(format!("Memory: {} MB", self.profile.memory_mib));
 
         ui.separator();
