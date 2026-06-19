@@ -361,6 +361,12 @@ impl Pit {
             counter.set_gate(level);
         }
     }
+
+    /// The current OUT pin level of a counter. Channel 2 drives the PC speaker.
+    /// Out-of-range channels read false.
+    pub(crate) fn channel_out(&self, channel: usize) -> bool {
+        self.counters.get(channel).map(|c| c.out).unwrap_or(false)
+    }
 }
 
 #[cfg(test)]

@@ -14,8 +14,6 @@ mod dma;
 mod keyboard;
 mod pic;
 mod pit;
-// Wired into Machine in the next task.
-#[allow(dead_code)]
 mod speaker;
 
 pub const HIGH_ROM_BASE: u32 = 0xffff_0000;
@@ -158,6 +156,7 @@ pub struct Machine {
     pic: pic::Pic8259Pair,
     pit: pit::Pit,
     keyboard: keyboard::Keyboard8042,
+    speaker: speaker::Speaker,
     pit_clocks: f64, // fractional PIT input clocks owed to the counters
     dma: dma::DmaController,
     opl: OplChip,
@@ -233,6 +232,7 @@ impl Machine {
             pic: pic::Pic8259Pair::default(),
             pit: pit::Pit::default(),
             keyboard: keyboard::Keyboard8042::default(),
+            speaker: speaker::Speaker::default(),
             pit_clocks: 0.0,
             dma: dma::DmaController::default(),
             opl: OplChip::default(),
@@ -470,6 +470,7 @@ impl Machine {
             pic: &mut self.pic,
             pit: &mut self.pit,
             keyboard: &mut self.keyboard,
+            speaker: &mut self.speaker,
             dma: &mut self.dma,
             opl: &mut self.opl,
             dsp: &mut self.dsp,
@@ -1041,6 +1042,15 @@ impl Machine {
             self.pic.request(0); // channel 0 OUT rising edge is IRQ0
         }
 
+        // PC speaker: sample (ch2 OUT AND data enable) into the speaker ring at
+        // the DAC rate. `clocks` is small (per instruction), so a tone is sampled
+        // finely enough to form a square wave.
+        self.speaker.accumulate(
+            clocks,
+            self.profile.clock_hz as u32,
+            self.pit.channel_out(2),
+        );
+
         if self.keyboard.take_irq() {
             self.pic.request(1); // IRQ1: keyboard output buffer has a scancode
         }
@@ -1185,12 +1195,14 @@ impl Machine {
         let (master_l, master_r) = self.mixer.master_gain();
         let (outgain_l, outgain_r) = self.mixer.outgain_gain();
         let len = opl_out.len().max(dsp_out.len());
+        let spk = self.speaker.drain(len);
         (0..len)
             .map(|i| {
                 let (ol, or) = opl_out.get(i).copied().unwrap_or((0, 0));
                 let (dl, dr) = dsp_out.get(i).copied().unwrap_or((0, 0));
-                let l = ((ol + dl) as f32 * (master_l * outgain_l)) as i32;
-                let r = ((or + dr) as f32 * (master_r * outgain_r)) as i32;
+                let s = i32::from(spk[i]);
+                let l = ((ol + dl) as f32 * (master_l * outgain_l)) as i32 + s;
+                let r = ((or + dr) as f32 * (master_r * outgain_r)) as i32 + s;
                 (clamp_i16(l), clamp_i16(r))
             })
             .collect()
@@ -1309,6 +1321,7 @@ impl Machine {
                     pic,
                     pit,
                     keyboard,
+                    speaker,
                     dma,
                     opl,
                     dsp,
@@ -1327,6 +1340,7 @@ impl Machine {
                     pic,
                     pit,
                     keyboard,
+                    speaker,
                     dma,
                     opl,
                     dsp,
@@ -1410,6 +1424,7 @@ struct MachineBus<'a> {
     pic: &'a mut pic::Pic8259Pair,
     pit: &'a mut pit::Pit,
     keyboard: &'a mut keyboard::Keyboard8042,
+    speaker: &'a mut speaker::Speaker,
     dma: &'a mut dma::DmaController,
     opl: &'a mut OplChip,
     dsp: &'a mut SbDsp,
@@ -1536,6 +1551,12 @@ impl CpuBus for MachineBus<'_> {
         if let Some(value) = self.dma.read_port(port) {
             return Ok(u32::from(value));
         }
+        if port == 0x61 {
+            let value = (self.speaker.control_bits() & 0x03)
+                | (u8::from(self.speaker.refresh_bit()) << 4)
+                | (u8::from(self.pit.channel_out(2)) << 5);
+            return Ok(u32::from(value));
+        }
         if let Some(value) = self.keyboard.read_port(port) {
             return Ok(u32::from(value));
         }
@@ -1568,6 +1589,11 @@ impl CpuBus for MachineBus<'_> {
             return Ok(());
         }
         if self.dma.write_port(port, value as u8) {
+            return Ok(());
+        }
+        if port == 0x61 {
+            self.speaker.write_control(value as u8);
+            self.pit.set_gate(2, value & 1 != 0);
             return Ok(());
         }
         if self.serial.write_port(port, value as u8)
@@ -1643,7 +1669,7 @@ impl DevicePorts {
 fn known_passive_ports() -> impl Iterator<Item = u16> {
     let ranges = [
         0x0000..=0x000f, // DMA controller 1
-        0x0061..=0x0063, // system control port B / PC speaker gate (passive for now)
+        0x0062..=0x0063, // system control port B (speaker now owns 0x61)
         0x0080..=0x008f, // DMA page registers
         0x0092..=0x0092, // system control port A / fast A20
         0x00c0..=0x00df, // DMA controller 2
@@ -2607,6 +2633,7 @@ mod tests {
             pic: &mut machine.pic,
             pit: &mut machine.pit,
             keyboard: &mut machine.keyboard,
+            speaker: &mut machine.speaker,
             dma: &mut machine.dma,
             opl: &mut machine.opl,
             dsp: &mut machine.dsp,
@@ -2616,6 +2643,60 @@ mod tests {
             wait_states: machine.profile.wait_states,
         };
         f(&mut bus)
+    }
+
+    #[test]
+    fn pc_speaker_renders_a_square_wave() {
+        let mut machine = test_machine();
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x43, BusWidth::Byte, 0xb6).unwrap(); // ch2, lo/hi, mode 3
+            bus.write_io(0x42, BusWidth::Byte, 0x00).unwrap(); // divisor low
+            bus.write_io(0x42, BusWidth::Byte, 0x04).unwrap(); // divisor high (0x0400)
+            bus.write_io(0x61, BusWidth::Byte, 0x03).unwrap(); // GATE2 + data enable
+        });
+        let clock_hz = machine.profile.clock_hz;
+        let chunk = clock_hz / 100_000; // ~10 us, mimicking per-instruction advance
+        for _ in 0..2_000 {
+            machine.advance_devices_clocks(chunk); // ~20 ms total
+        }
+        let pcm = machine.render_audio(OPL_NATIVE_HZ as usize / 50);
+        assert!(
+            pcm.iter().any(|&(l, _)| l > 0) && pcm.iter().any(|&(l, _)| l < 0),
+            "a toggling speaker tone should produce both polarities"
+        );
+    }
+
+    #[test]
+    fn port_61_reports_out_gate_enable_and_refresh() {
+        let mut machine = test_machine();
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x43, BusWidth::Byte, 0xb6).unwrap();
+            bus.write_io(0x42, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x42, BusWidth::Byte, 0x04).unwrap();
+            bus.write_io(0x61, BusWidth::Byte, 0x03).unwrap();
+        });
+        let clock_hz = machine.profile.clock_hz;
+        machine.advance_devices_clocks(clock_hz / 100_000); // ~10 us
+        let b = with_bus(&mut machine, |bus| {
+            bus.read_io(0x61, BusWidth::Byte).unwrap() as u8
+        });
+        assert_eq!(
+            (b >> 5) & 1,
+            u8::from(machine.pit.channel_out(2)),
+            "bit 5 = ch2 OUT"
+        );
+        assert_eq!(b & 0x03, 0x03, "bits 0,1 read back GATE2 + data enable");
+        let r0 = (b >> 4) & 1;
+        let us16 = (clock_hz * 16) / 1_000_000; // ~16 us, past one period
+        machine.advance_devices_clocks(us16);
+        let b2 = with_bus(&mut machine, |bus| {
+            bus.read_io(0x61, BusWidth::Byte).unwrap() as u8
+        });
+        assert_ne!(
+            (b2 >> 4) & 1,
+            r0,
+            "refresh bit (4) toggled after one period"
+        );
     }
 
     // Program channel 0 as a keyed sine tone through the given OPL address/data
