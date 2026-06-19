@@ -1575,6 +1575,7 @@ impl DevicePorts {
 fn known_passive_ports() -> impl Iterator<Item = u16> {
     let ranges = [
         0x0000..=0x000f, // DMA controller 1
+        0x0061..=0x0063, // system control port B / PC speaker gate (passive for now)
         0x0080..=0x008f, // DMA page registers
         0x0092..=0x0092, // system control port A / fast A20
         0x00c0..=0x00df, // DMA controller 2
