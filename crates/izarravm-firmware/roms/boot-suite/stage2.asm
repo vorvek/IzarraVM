@@ -10,7 +10,9 @@ org 0x8000
 %define COM1_MCR 0x03fc
 %define COM1_LSR 0x03fd
 %define PIT_CH0 0x40
+%define PIT_CH2 0x42
 %define PIT_CTRL 0x43
+%define PORT_B 0x61
 %define PIC_CMD 0x20
 %define PIC_DATA 0x21
 %define TICK_COUNT 0x0600
@@ -84,6 +86,7 @@ stage2_start:
     call test_opl2
     call test_sb_8bit_dma
     call test_sb_16bit_dma
+    call test_pc_speaker
 
     hlt
     jmp $
@@ -463,6 +466,39 @@ test_sb_16bit_dma:
     mov byte [di + 3], 'S'
     add word [RESULT_BLOCK + 10], 27
 .done:
+    ret
+
+test_pc_speaker:
+    ; Program PIT channel 2: mode 3 square wave, LSB then MSB, divisor 0x0400.
+    mov al, 0xb6
+    out PIT_CTRL, al
+    mov al, 0x00
+    out PIT_CH2, al
+    mov al, 0x04
+    out PIT_CH2, al
+    ; Enable the speaker: port 0x61 bit 0 (GATE2) and bit 1 (data enable).
+    in al, PORT_B
+    or al, 0x03
+    out PORT_B, al
+    ; Sample timer-2 OUT (bit 5), delay, sample again. It must toggle.
+    in al, PORT_B
+    and al, 0x20
+    mov bl, al
+    mov cx, 8
+.spin:
+    call delay
+    in al, PORT_B
+    and al, 0x20
+    cmp al, bl
+    jne .passed
+    loop .spin
+    ret                       ; OUT never toggled: leave the record FAIL
+.passed:
+    mov di, RESULT_BLOCK + (pc_speaker_record - result_block_template)
+    mov byte [di], 'P'
+    mov byte [di + 2], 'S'
+    mov byte [di + 3], 'S'
+    add word [RESULT_BLOCK + 10], 27
     ret
 
 ; Shared: sti, then spin (one delay window per iteration) until the IRQ5 handler
