@@ -244,8 +244,15 @@ fn emulate(
         let budget = slice_budget(dt, clock_hz, cap);
         if budget > 0 {
             let before = machine.elapsed_clocks();
-            let _ = tick_machine(&mut machine, budget);
+            let stop = tick_machine(&mut machine, budget);
             let ran = machine.elapsed_clocks().saturating_sub(before);
+            // A halted guest (POST done, nothing to boot) stops driving the video
+            // beam, so the display would freeze on whatever half-drawn frame was
+            // completing when HLT ran. Keep scanning the VGA so the final, complete
+            // framebuffer is presented instead.
+            if matches!(stop, Some(StopReason::Halted)) {
+                machine.advance_devices_clocks(budget);
+            }
             if let Some(sink) = &sink {
                 pump_audio(
                     &mut machine,
