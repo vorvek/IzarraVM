@@ -49,6 +49,8 @@ struct Cli {
     #[arg(long)]
     headless_boot_suite: bool,
     #[arg(long)]
+    headless_keyboard: bool,
+    #[arg(long)]
     headless_run: Option<PathBuf>,
     #[arg(long)]
     stdin_text: Option<String>,
@@ -112,6 +114,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     if cli.headless_test_rom {
         return run_test_rom(cli.bios.as_deref(), cli.cycles, &hardware);
+    }
+
+    if cli.headless_keyboard {
+        return run_keyboard_demo(&hardware, cli.stdin_text.as_deref());
     }
 
     let rom = select_rom(cli.bios.as_deref())?;
@@ -210,6 +216,70 @@ fn run_test_rom(
     Ok(())
 }
 
+/// Boot the keyboard ROM, type --stdin-text into it, and print the screen.
+fn run_keyboard_demo(
+    hardware: &HardwareProfile,
+    stdin_text: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    use izarravm_firmware::kbd_bios;
+    let mut machine = Machine::new(MachineProfile::from_hardware_profile(hardware), kbd_bios())?;
+    machine.run_until_halt_or_cycles(200_000)?;
+    for ch in stdin_text.unwrap_or("").chars() {
+        for code in ascii_to_set1(ch) {
+            machine.inject_key_scancodes(&[code]);
+            machine.run_until_halt_or_cycles(200_000)?;
+        }
+    }
+    println!("{}", machine.screen_text().as_text());
+    Ok(())
+}
+
+/// Minimal ASCII to Set 1 make+break for the demo (lowercase letters, digits,
+/// space). Extend if the demo needs more than typing words.
+fn ascii_to_set1(ch: char) -> Vec<u8> {
+    let make = match ch {
+        'a' => 0x1e,
+        'b' => 0x30,
+        'c' => 0x2e,
+        'd' => 0x20,
+        'e' => 0x12,
+        'f' => 0x21,
+        'g' => 0x22,
+        'h' => 0x23,
+        'i' => 0x17,
+        'j' => 0x24,
+        'k' => 0x25,
+        'l' => 0x26,
+        'm' => 0x32,
+        'n' => 0x31,
+        'o' => 0x18,
+        'p' => 0x19,
+        'q' => 0x10,
+        'r' => 0x13,
+        's' => 0x1f,
+        't' => 0x14,
+        'u' => 0x16,
+        'v' => 0x2f,
+        'w' => 0x11,
+        'x' => 0x2d,
+        'y' => 0x15,
+        'z' => 0x2c,
+        ' ' => 0x39,
+        '1' => 0x02,
+        '2' => 0x03,
+        '3' => 0x04,
+        '4' => 0x05,
+        '5' => 0x06,
+        '6' => 0x07,
+        '7' => 0x08,
+        '8' => 0x09,
+        '9' => 0x0a,
+        '0' => 0x0b,
+        _ => return Vec::new(),
+    };
+    vec![make, make | 0x80]
+}
+
 fn load_config(cli: &Cli) -> Result<AppConfig, Box<dyn Error>> {
     let mut config = if let Some(path) = &cli.config {
         AppConfig::from_toml_path(path)?
@@ -252,5 +322,16 @@ fn select_rom(bios: Option<&Path>) -> Result<Vec<u8>, Box<dyn Error>> {
     match bios {
         Some(path) => Ok(std::fs::read(path)?),
         None => Ok(test_rom().to_vec()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ascii_to_set1_maps_a_letter_to_make_and_break() {
+        assert_eq!(ascii_to_set1('h'), vec![0x23, 0xa3]);
+        assert!(ascii_to_set1('!').is_empty());
     }
 }
