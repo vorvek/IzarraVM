@@ -124,7 +124,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         Some(path) => std::fs::read(path)?,
         None => izarravm_firmware::kbd_bios().to_vec(),
     };
-    let audio_enabled = config.audio.opl3 || config.audio.sound_blaster.enabled;
+    // The PC speaker is always-present motherboard hardware, so the host audio
+    // output is opened regardless of which sound cards are enabled. AudioPlayer
+    // falls back to silent if the host has no usable device.
+    let audio_enabled = true;
     gui::run(
         MachineProfile::from_hardware_profile(&hardware),
         rom,
