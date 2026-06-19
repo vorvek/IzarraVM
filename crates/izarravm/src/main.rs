@@ -180,7 +180,14 @@ fn run_headless_program(
         // Mount the configured C: drive so INT 21h file calls resolve.
         machine.mount_c_drive(dos.c_drive.clone());
         if let Some(text) = stdin_text {
-            machine.set_dos_stdin(text.as_bytes());
+            // Type the text through the real keyboard path so it reaches the
+            // program via INT 09h and the BDA ring. Typeable ASCII only
+            // (lowercase, digits, space) until ascii_to_set1 is extended.
+            for ch in text.chars() {
+                for code in ascii_to_set1(ch) {
+                    machine.inject_key_scancodes(&[code]);
+                }
+            }
         }
         let stop_reason = machine.run_until_halt_or_cycles(50_000_000)?;
         print!("{}", String::from_utf8_lossy(machine.dos_output()));
