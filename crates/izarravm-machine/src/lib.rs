@@ -30,6 +30,10 @@ pub const RESULT_BLOCK_ADDRESS: usize = 0x9000;
 /// BIOS data area, the BIOS stub at 0x0600, and the boot result block at 0x9000.
 const DOS_LOAD_SEGMENT: u16 = 0x0100;
 
+/// Lotura system-controller identifier, mirroring the Margo card's MARGO_ID_VALUE
+/// convention (a fixed nonzero byte the guest can probe).
+pub const LOTURA_ID_VALUE: u8 = 0x5a;
+
 #[derive(Debug, Error)]
 pub enum MachineError {
     #[error(transparent)]
@@ -164,6 +168,7 @@ impl TimingFactors {
 pub struct Machine {
     profile: MachineProfile,
     active_mode: GswMode,
+    pending_mode: Option<GswMode>,
     timing: TimingFactors,
     cpu: Cpu386,
     memory: Memory,
@@ -244,11 +249,12 @@ impl Machine {
     fn base(profile: MachineProfile, cpu: Cpu386, rom: Vec<u8>) -> Result<Self, MachineError> {
         let mixer = power_on_mixer(&profile);
         let active_mode = profile.cpu;
-        let timing = TimingFactors::for_clock(profile.clock_hz);
+        let timing = TimingFactors::for_clock(active_mode.clock_hz());
         let machine = Self {
             memory: Memory::from_mib(profile.memory_mib)?,
             profile,
             active_mode,
+            pending_mode: None,
             timing,
             cpu,
             video: Box::new(Vga::default()),
@@ -507,6 +513,8 @@ impl Machine {
             mixer: &mut self.mixer,
             trace: &mut self.trace,
             pending_soft_int: &mut self.pending_soft_int,
+            active_mode: self.active_mode,
+            pending_mode: &mut self.pending_mode,
             wait_states: self.profile.wait_states,
         }
     }
@@ -1018,6 +1026,7 @@ impl Machine {
         self.timing = TimingFactors::for_clock(mode.clock_hz());
     }
 
+    /// The live compatibility mode (set at boot, changed by a Lotura mode write).
     pub fn active_mode(&self) -> GswMode {
         self.active_mode
     }
@@ -1304,7 +1313,7 @@ impl Machine {
         }
         let pit_wake = if self.pic.irq0_unmasked() {
             self.clocks_until_timer0_irq().map(|pit_delta| {
-                ((u128::from(pit_delta) * u128::from(self.profile.clock_hz))
+                ((u128::from(pit_delta) * u128::from(self.active_mode.clock_hz()))
                     .div_ceil(u128::from(PIT_INPUT_HZ))) as u64
             })
         } else {
@@ -1312,7 +1321,7 @@ impl Machine {
         };
         let dsp_wake = if self.pic.irq_unmasked(self.mixer.selected_irq()) {
             self.dsp
-                .clocks_until_next_irq(self.dsp.rate_hz(), self.profile.clock_hz)
+                .clocks_until_next_irq(self.dsp.rate_hz(), self.active_mode.clock_hz())
         } else {
             None
         };
@@ -1349,6 +1358,8 @@ impl Machine {
             let outcome = {
                 let Machine {
                     profile,
+                    active_mode,
+                    pending_mode,
                     cpu,
                     memory,
                     video,
@@ -1385,6 +1396,8 @@ impl Machine {
                     mixer,
                     trace,
                     pending_soft_int,
+                    active_mode: *active_mode,
+                    pending_mode,
                     wait_states: profile.wait_states,
                 };
                 cpu.cycle(&mut bus)
@@ -1399,6 +1412,9 @@ impl Machine {
                     // the overflow flag (the synthesis clock is driven separately
                     // by `render_audio`).
                     self.advance_devices(step);
+                    if let Some(mode) = self.pending_mode.take() {
+                        self.set_mode(mode); // live Lotura switch takes effect next instruction
+                    }
                     if let Some(vector) = self.pending_soft_int {
                         match vector {
                             0x10 => self.handle_int10(),
@@ -1469,6 +1485,8 @@ struct MachineBus<'a> {
     mixer: &'a mut SbMixer,
     trace: &'a mut BusTrace,
     pending_soft_int: &'a mut Option<u8>,
+    active_mode: GswMode,                  // a copy, for the 0xE1 read
+    pending_mode: &'a mut Option<GswMode>, // a 0xE1 write records the request here
     wait_states: WaitStateProfile,
 }
 
@@ -1595,6 +1613,12 @@ impl CpuBus for MachineBus<'_> {
                 | (u8::from(self.pit.channel_out(2)) << 5);
             return Ok(u32::from(value));
         }
+        if port == 0x00e0 {
+            return Ok(u32::from(LOTURA_ID_VALUE));
+        }
+        if port == 0x00e1 {
+            return Ok(u32::from(gsw_mode_code(self.active_mode)));
+        }
         if let Some(value) = self.keyboard.read_port(port) {
             return Ok(u32::from(value));
         }
@@ -1632,6 +1656,12 @@ impl CpuBus for MachineBus<'_> {
         if port == 0x61 {
             self.speaker.write_control(value as u8);
             self.pit.set_gate(2, value & 1 != 0);
+            return Ok(());
+        }
+        if port == 0x00e1 {
+            if let Some(mode) = gsw_mode_from_code(value as u8) {
+                *self.pending_mode = Some(mode);
+            }
             return Ok(());
         }
         if self.serial.write_port(port, value as u8)
@@ -1716,6 +1746,23 @@ fn known_passive_ports() -> impl Iterator<Item = u16> {
         0x03b0..=0x03df, // MDA/CGA/EGA/VGA registers
     ];
     ranges.into_iter().flatten()
+}
+
+fn gsw_mode_from_code(code: u8) -> Option<GswMode> {
+    match code {
+        0 => Some(GswMode::Gsw386),
+        1 => Some(GswMode::Gsw486),
+        2 => Some(GswMode::Gsw586),
+        _ => None,
+    }
+}
+
+fn gsw_mode_code(mode: GswMode) -> u8 {
+    match mode {
+        GswMode::Gsw386 => 0,
+        GswMode::Gsw486 => 1,
+        GswMode::Gsw586 => 2,
+    }
 }
 
 /// Map a CPU I/O port to the OPL register port (0x388-0x38B) it addresses, or
@@ -2694,6 +2741,8 @@ mod tests {
             mixer: &mut machine.mixer,
             trace: &mut machine.trace,
             pending_soft_int: &mut machine.pending_soft_int,
+            active_mode: machine.active_mode,
+            pending_mode: &mut machine.pending_mode,
             wait_states: machine.profile.wait_states,
         };
         f(&mut bus)
@@ -5669,5 +5718,38 @@ mod tests {
         let reason = machine.run_until_halt_or_cycles(2_000_000).unwrap();
         assert_eq!(reason, StopReason::DosExit { code: 0 });
         assert_eq!(machine.dos_output(), b"hi");
+    }
+
+    #[test]
+    fn lotura_reports_id_and_switches_mode_live() {
+        // org 0x100: mov al,2; out 0xe1,al; mov ax,4c00h; int 21h
+        let com: &[u8] = &[0xb0, 0x02, 0xe6, 0xe1, 0xb8, 0x00, 0x4c, 0xcd, 0x21];
+        let mut machine = Machine::new_dos_program(
+            MachineProfile::gsw_386(16, izarravm_core::VideoCard::Et4000Ax),
+            com,
+        )
+        .unwrap();
+        assert_eq!(machine.active_mode(), GswMode::Gsw386); // boot mode
+        let id = with_bus(&mut machine, |bus| {
+            bus.read_io(0x00e0, BusWidth::Byte).unwrap() as u8
+        });
+        assert_eq!(id, LOTURA_ID_VALUE);
+        let code = with_bus(&mut machine, |bus| {
+            bus.read_io(0x00e1, BusWidth::Byte).unwrap() as u8
+        });
+        assert_eq!(code, 0);
+        // An out-of-range write records no pending switch.
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x00e1, BusWidth::Byte, 9).unwrap()
+        });
+        assert!(machine.pending_mode.is_none());
+        assert_eq!(machine.active_mode(), GswMode::Gsw386);
+        // Running the program writes 2 to 0xE1; the run loop applies the live switch.
+        machine.run_until_halt_or_cycles(100_000).unwrap();
+        assert_eq!(machine.active_mode(), GswMode::Gsw586);
+        let code = with_bus(&mut machine, |bus| {
+            bus.read_io(0x00e1, BusWidth::Byte).unwrap() as u8
+        });
+        assert_eq!(code, 2);
     }
 }
