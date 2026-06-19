@@ -686,6 +686,21 @@ impl Machine {
             zf: self.cpu.registers.eflags & 0x40 != 0,
         };
         let action = self.dos.dispatch(vector, &mut regs, &mut self.memory)?;
+        if matches!(action, izarravm_dos::DosAction::WaitForKey) {
+            // Blocking read with an empty ring. Rewind the stacked return IP by 2
+            // so the IRET stub re-enters the INT 21h (CD 21), and set IF in the
+            // stacked FLAGS so IRQ1 can run the keyboard ISR before the retry.
+            let ss = self.cpu.registers.segment(SegmentIndex::Ss).base;
+            let sp = self.cpu.registers.esp() as u16;
+            let ip_addr = (ss + u32::from(sp)) as usize;
+            let flags_addr = (ss + u32::from(sp.wrapping_add(4))) as usize;
+            let ret_ip = self.memory.read_u16(ip_addr)?;
+            self.memory.write_u16(ip_addr, ret_ip.wrapping_sub(2))?;
+            let mut flags = self.memory.read_u16(flags_addr)?;
+            flags |= 0x0200; // IF
+            self.memory.write_u16(flags_addr, flags)?;
+            return Ok(None);
+        }
         // Marshal the result back. Every general-purpose register is written
         // unconditionally so a later slice that returns a value in any of them (for
         // example AH=3Fh returns the byte count in CX) needs no change here. Only the
@@ -741,6 +756,8 @@ impl Machine {
                 self.cpu.registers.set_eax(u32::from(child_ax));
                 None // keep looping; the CPU now runs the child
             }
+            // Handled above with an early return; kept so the match stays exhaustive.
+            izarravm_dos::DosAction::WaitForKey => None,
         })
     }
 
@@ -751,11 +768,11 @@ impl Machine {
         self.dos.stdout()
     }
 
-    /// Replace the DOS standard-input buffer, consumed front to back by the
-    /// character-input calls. An exhausted buffer yields ^Z (EOF) for the blocking
-    /// reads (AH=01h/08h); AH=06h reports an empty buffer through ZF.
+    /// Seed the BDA keyboard ring with input bytes for the character-input calls.
+    /// An empty ring blocks the reads (AH=01h/08h) until the keyboard ISR refills
+    /// it; AH=06h reports an empty ring through ZF. Holds up to 15 bytes.
     pub fn set_dos_stdin(&mut self, bytes: &[u8]) {
-        self.dos.set_stdin(bytes);
+        let _ = izarravm_dos::seed_keyboard_ring(&mut self.memory, bytes);
     }
 
     /// Mount a host directory as the guest C: drive for INT 21h file calls.
@@ -3417,7 +3434,10 @@ mod tests {
             izarravm_firmware::ECHO_COM,
         )
         .unwrap();
-        machine.set_dos_stdin(b"hi");
+        // The echo filter reads with AH=08h until it sees ^Z (0x1A). With the
+        // blocking keyboard ring there is no ISR to refill it in this slice, so the
+        // ^Z that ends input has to be seeded along with the data.
+        machine.set_dos_stdin(b"hi\x1a");
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
         assert_eq!(reason, StopReason::DosExit { code: 0 });
         assert_eq!(machine.dos_output(), b"hi");

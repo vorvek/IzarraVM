@@ -1,9 +1,66 @@
 use izarravm_bus::{BusError, Memory};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+
+// BDA keyboard ring (the buffer the resident keyboard BIOS fills). Segment 0x40,
+// head at 0x1a, tail at 0x1c, a 16-entry ring at 0x1e..0x3e. Each entry is a word
+// scancode<<8 | ascii. Empty when head == tail.
+const KBD_BDA_BASE: usize = 0x400;
+const KBD_HEAD: usize = 0x1a;
+const KBD_TAIL: usize = 0x1c;
+const KBD_RING_START: u16 = 0x1e;
+const KBD_RING_END: u16 = 0x3e; // exclusive
+
+#[allow(dead_code)]
+fn kbd_ring_is_empty(mem: &Memory) -> Result<bool, DosError> {
+    let head = mem.read_u16(KBD_BDA_BASE + KBD_HEAD)?;
+    let tail = mem.read_u16(KBD_BDA_BASE + KBD_TAIL)?;
+    Ok(head == tail)
+}
+
+/// Dequeue the next (scancode, ascii) pair, advancing the head with wrap. None
+/// when the ring is empty.
+fn kbd_ring_dequeue(mem: &mut Memory) -> Result<Option<(u8, u8)>, DosError> {
+    let head = mem.read_u16(KBD_BDA_BASE + KBD_HEAD)?;
+    let tail = mem.read_u16(KBD_BDA_BASE + KBD_TAIL)?;
+    if head == tail {
+        return Ok(None);
+    }
+    let word = mem.read_u16(KBD_BDA_BASE + head as usize)?;
+    let mut next = head + 2;
+    if next >= KBD_RING_END {
+        next = KBD_RING_START;
+    }
+    mem.write_u16(KBD_BDA_BASE + KBD_HEAD, next)?;
+    Ok(Some(((word >> 8) as u8, (word & 0xff) as u8)))
+}
+
+#[allow(dead_code)]
+fn kbd_ring_flush(mem: &mut Memory) -> Result<(), DosError> {
+    let tail = mem.read_u16(KBD_BDA_BASE + KBD_TAIL)?;
+    mem.write_u16(KBD_BDA_BASE + KBD_HEAD, tail)?;
+    Ok(())
+}
+
+/// Seed the ring with ASCII bytes (scancode byte left zero), for tests and the
+/// machine-level convenience seeder. Holds up to 15 bytes; longer inputs should
+/// drive the real INT 09h path instead.
+pub fn seed_keyboard_ring(mem: &mut Memory, ascii: &[u8]) -> Result<(), DosError> {
+    mem.write_u16(KBD_BDA_BASE + KBD_HEAD, KBD_RING_START)?;
+    let mut off = KBD_RING_START;
+    for &b in ascii {
+        mem.write_u16(KBD_BDA_BASE + off as usize, u16::from(b))?;
+        off += 2;
+        if off >= KBD_RING_END {
+            off = KBD_RING_START;
+        }
+    }
+    mem.write_u16(KBD_BDA_BASE + KBD_TAIL, off)?;
+    Ok(())
+}
 
 #[derive(Debug, Error)]
 pub enum DosError {
@@ -133,6 +190,10 @@ pub enum DosAction {
         entry: ProgramEntry,
         child_ax: u16,
     },
+    /// A blocking console read (AH=01/07/08/0Ah) found the keyboard ring empty.
+    /// The machine rewinds the INT 21h so it re-executes after the ISR refills
+    /// the ring. The kernel leaves the registers unchanged.
+    WaitForKey,
 }
 
 /// Conventional memory modeled as one block ending at paragraph 0xA000. The
@@ -352,7 +413,6 @@ pub struct DosKernel {
     drive: Option<HostDrive>,
     // File handles 5 and up: AH=3Dh inserts, AH=3Fh/3Eh look up.
     open_files: HashMap<u16, OpenFile>,
-    stdin: VecDeque<u8>,
     stdout: Vec<u8>,
     clock: DosDateTime,
     arena: Arena,
@@ -372,12 +432,6 @@ impl DosKernel {
     /// Mount a host directory as the C: drive. File opens resolve against it.
     pub fn mount_c(&mut self, drive: HostDrive) {
         self.drive = Some(drive);
-    }
-
-    /// Replace the standard-input buffer, consumed front to back by the
-    /// character-input calls.
-    pub fn set_stdin(&mut self, bytes: &[u8]) {
-        self.stdin = bytes.iter().copied().collect();
     }
 
     /// The bytes written to standard output so far.
@@ -793,6 +847,26 @@ impl DosKernel {
         }
     }
 
+    /// Read one character from the keyboard ring. Some -> set AL (and echo when
+    /// asked) and Continue; None -> WaitForKey so the caller re-runs the INT.
+    fn read_char(
+        &mut self,
+        regs: &mut DosRegs,
+        mem: &mut Memory,
+        echo: bool,
+    ) -> Result<DosAction, DosError> {
+        match kbd_ring_dequeue(mem)? {
+            Some((_, ascii)) => {
+                if echo {
+                    self.stdout.push(ascii);
+                }
+                regs.ax = (regs.ax & 0xff00) | u16::from(ascii);
+                Ok(DosAction::Continue)
+            }
+            None => Ok(DosAction::WaitForKey),
+        }
+    }
+
     fn dispatch_int21(
         &mut self,
         regs: &mut DosRegs,
@@ -800,14 +874,9 @@ impl DosKernel {
     ) -> Result<DosAction, DosError> {
         let ah = (regs.ax >> 8) as u8;
         match ah {
-            // AH=01h: read one character with echo. A real keyboard blocks; with a
-            // preloaded buffer an empty buffer yields the redirected-input EOF byte ^Z.
-            0x01 => {
-                let ch = self.stdin.pop_front().unwrap_or(0x1a);
-                self.stdout.push(ch);
-                regs.ax = (regs.ax & 0xff00) | u16::from(ch);
-                Ok(DosAction::Continue)
-            }
+            // AH=01h: read one character with echo from the keyboard ring. An empty
+            // ring blocks: the kernel returns WaitForKey and the machine re-runs the INT.
+            0x01 => self.read_char(regs, mem, true),
             // AH=02h: write the byte in DL to standard output. AL returns it (DOS 2+).
             0x02 => {
                 let ch = regs.dx as u8;
@@ -819,28 +888,23 @@ impl DosKernel {
             // whether a character was ready); any other DL writes DL.
             0x06 => {
                 if regs.dx as u8 == 0xff {
-                    match self.stdin.pop_front() {
-                        Some(ch) => {
-                            regs.ax = (regs.ax & 0xff00) | u16::from(ch);
+                    match kbd_ring_dequeue(mem)? {
+                        Some((_, ascii)) => {
+                            regs.ax = (regs.ax & 0xff00) | u16::from(ascii);
                             regs.zf = false;
                         }
                         None => regs.zf = true,
                     }
                 } else {
-                    // Output form: ZF is undefined for AH=06h output, so leave regs.zf
-                    // at the guest value rather than clobbering it.
                     let ch = regs.dx as u8;
                     self.stdout.push(ch);
                     regs.ax = (regs.ax & 0xff00) | u16::from(ch);
                 }
                 Ok(DosAction::Continue)
             }
-            // AH=08h: read one character without echo. ^Z on an empty buffer, as AH=01h.
-            0x08 => {
-                let ch = self.stdin.pop_front().unwrap_or(0x1a);
-                regs.ax = (regs.ax & 0xff00) | u16::from(ch);
-                Ok(DosAction::Continue)
-            }
+            // AH=08h: read one character without echo from the keyboard ring. An empty
+            // ring blocks via WaitForKey, the same as AH=01h.
+            0x08 => self.read_char(regs, mem, false),
             // AH=09h: print the '$'-terminated string at DS:DX to standard output.
             0x09 => {
                 let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
@@ -1866,6 +1930,17 @@ mod tests {
     }
 
     #[test]
+    fn ring_seed_then_dequeue_returns_bytes_in_order() {
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        seed_keyboard_ring(&mut mem, b"hi").unwrap();
+        assert!(!kbd_ring_is_empty(&mem).unwrap());
+        assert_eq!(kbd_ring_dequeue(&mut mem).unwrap(), Some((0, b'h')));
+        assert_eq!(kbd_ring_dequeue(&mut mem).unwrap(), Some((0, b'i')));
+        assert_eq!(kbd_ring_dequeue(&mut mem).unwrap(), None);
+        assert!(kbd_ring_is_empty(&mem).unwrap());
+    }
+
+    #[test]
     fn ah09_prints_string_up_to_terminator() {
         // DS:DX = 0x0100:0x0010 -> linear 0x1010.
         let mut mem = mem_with(0x1010, b"Hello$");
@@ -1876,7 +1951,6 @@ mod tests {
             ..DosRegs::default()
         };
         let mut kernel = DosKernel::new();
-        kernel.set_stdin(b"");
         let action = kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
         assert_eq!(action, DosAction::Continue);
         assert_eq!(kernel.stdout(), b"Hello");
@@ -1899,7 +1973,6 @@ mod tests {
             ..DosRegs::default()
         };
         let mut kernel = DosKernel::new();
-        kernel.set_stdin(b"");
         assert!(matches!(
             kernel.dispatch(0x21, &mut regs, &mut mem),
             Err(DosError::Memory(_))
@@ -1916,7 +1989,6 @@ mod tests {
             ..DosRegs::default()
         };
         let mut kernel = DosKernel::new();
-        kernel.set_stdin(b"");
         kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
         assert!(kernel.stdout().is_empty());
     }
@@ -1929,7 +2001,6 @@ mod tests {
             ..DosRegs::default()
         };
         let mut kernel = DosKernel::new();
-        kernel.set_stdin(b"");
         assert_eq!(
             kernel.dispatch(0x21, &mut regs, &mut mem).unwrap(),
             DosAction::Exit(7)
@@ -1941,7 +2012,6 @@ mod tests {
         let mut mem = Memory::new(4096).unwrap();
         let mut regs = DosRegs::default();
         let mut kernel = DosKernel::new();
-        kernel.set_stdin(b"");
         assert_eq!(
             kernel.dispatch(0x20, &mut regs, &mut mem).unwrap(),
             DosAction::Exit(0)
@@ -1956,7 +2026,6 @@ mod tests {
             ..DosRegs::default()
         };
         let mut kernel = DosKernel::new();
-        kernel.set_stdin(b"");
         let action = kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
         assert_eq!(action, DosAction::Continue);
         assert!(kernel.stdout().is_empty());
@@ -2027,9 +2096,9 @@ mod tests {
     }
 
     fn char_io(ax: u16, dx: u16, input: &[u8]) -> (DosRegs, Vec<u8>) {
-        let mut mem = Memory::new(4096).unwrap();
+        let mut mem = Memory::new(64 * 1024).unwrap();
         let mut kernel = DosKernel::new();
-        kernel.set_stdin(input);
+        seed_keyboard_ring(&mut mem, input).unwrap();
         let mut regs = DosRegs {
             ax,
             dx,
@@ -2038,6 +2107,20 @@ mod tests {
         let action = kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
         assert_eq!(action, DosAction::Continue);
         (regs, kernel.stdout().to_vec()) // DosRegs is Copy and holds the post-dispatch AX/ZF
+    }
+
+    /// Like char_io but returns the action so blocking-read tests can assert it.
+    fn char_io_action(ax: u16, dx: u16, input: &[u8]) -> (DosAction, DosRegs, Vec<u8>) {
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let mut kernel = DosKernel::new();
+        seed_keyboard_ring(&mut mem, input).unwrap();
+        let mut regs = DosRegs {
+            ax,
+            dx,
+            ..DosRegs::default()
+        };
+        let action = kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        (action, regs, kernel.stdout().to_vec())
     }
 
     #[test]
@@ -2062,15 +2145,19 @@ mod tests {
     }
 
     #[test]
-    fn ah01_on_empty_returns_eof_ctrl_z() {
-        let (regs, _out) = char_io(0x0100, 0, b""); // empty buffer
-        assert_eq!(regs.ax & 0x00ff, 0x1a); // ^Z
+    fn ah01_on_empty_ring_blocks() {
+        let (action, regs, out) = char_io_action(0x0100, 0, b""); // empty ring
+        assert_eq!(action, DosAction::WaitForKey);
+        assert_eq!(regs.ax, 0x0100); // AX unchanged so the retry re-reads AH=01h
+        assert!(out.is_empty());
     }
 
     #[test]
-    fn ah08_on_empty_returns_eof_ctrl_z() {
-        let (regs, _out) = char_io(0x0800, 0, b""); // empty buffer, no echo
-        assert_eq!(regs.ax & 0x00ff, 0x1a); // ^Z
+    fn ah08_on_empty_ring_blocks() {
+        let (action, regs, out) = char_io_action(0x0800, 0, b""); // empty ring, no echo
+        assert_eq!(action, DosAction::WaitForKey);
+        assert_eq!(regs.ax, 0x0800); // AX unchanged
+        assert!(out.is_empty());
     }
 
     #[test]
@@ -2083,9 +2170,9 @@ mod tests {
     #[test]
     fn ah06_input_available_clears_zf() {
         // ZF starts set so the assertion proves the available path clears it.
-        let mut mem = Memory::new(4096).unwrap();
+        let mut mem = Memory::new(64 * 1024).unwrap();
         let mut kernel = DosKernel::new();
-        kernel.set_stdin(b"X");
+        seed_keyboard_ring(&mut mem, b"X").unwrap();
         let mut regs = DosRegs {
             ax: 0x0600,
             dx: 0x00ff,
