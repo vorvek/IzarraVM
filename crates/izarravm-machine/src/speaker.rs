@@ -45,14 +45,13 @@ impl Speaker {
         ((self.elapsed_us / REFRESH_PERIOD_US) as u64) & 1 == 1
     }
 
-    /// Advance emulated time by `clocks` CPU clocks, sampling the membrane
-    /// (`ch2_out && data_enable`) into the ring at the DAC rate. Sample once per
-    /// call; the caller advances in small steps so a tone is sampled finely.
-    pub(crate) fn accumulate(&mut self, clocks: u64, clock_hz: u32, ch2_out: bool) {
-        if clock_hz == 0 {
+    /// Advance emulated time by `clocks` CPU clocks (with `inv_clock` = 1/clock_hz
+    /// from the active mode), sampling the membrane into the ring at the DAC rate.
+    pub(crate) fn accumulate(&mut self, clocks: u64, inv_clock: f64, ch2_out: bool) {
+        if inv_clock <= 0.0 {
             return;
         }
-        let seconds = clocks as f64 / clock_hz as f64;
+        let seconds = clocks as f64 * inv_clock;
         self.elapsed_us += seconds * 1_000_000.0;
         self.sample_phase += seconds * DAC_HZ as f64;
         let level = if self.data_enable {
@@ -92,8 +91,8 @@ mod tests {
     fn enabled_membrane_toggles_with_ch2_out() {
         let mut spk = Speaker::default();
         spk.write_control(0x03); // gate + data enable
-        spk.accumulate(1_000, 1_000_000, true); // ~44 samples high
-        spk.accumulate(1_000, 1_000_000, false); // ~44 samples low
+        spk.accumulate(1_000, 1.0 / 1_000_000.0, true); // ~44 samples high
+        spk.accumulate(1_000, 1.0 / 1_000_000.0, false); // ~44 samples low
         let s = spk.drain(88);
         assert!(s.iter().any(|&v| v > 0), "high half produced +AMP");
         assert!(s.iter().any(|&v| v < 0), "low half produced -AMP");
@@ -102,7 +101,7 @@ mod tests {
     #[test]
     fn disabled_speaker_is_silent() {
         let mut spk = Speaker::default(); // data_enable false
-        spk.accumulate(10_000, 1_000_000, true); // OUT high but disabled
+        spk.accumulate(10_000, 1.0 / 1_000_000.0, true); // OUT high but disabled
         assert!(spk.drain(100).iter().all(|&v| v == 0));
     }
 
@@ -110,7 +109,7 @@ mod tests {
     fn drain_pads_with_zero_on_underrun() {
         let mut spk = Speaker::default();
         spk.write_control(0x03);
-        spk.accumulate(100, 1_000_000, true); // ~4 samples
+        spk.accumulate(100, 1.0 / 1_000_000.0, true); // ~4 samples
         let s = spk.drain(50);
         assert_eq!(s.len(), 50);
         assert!(s[40..].iter().all(|&v| v == 0));
@@ -120,7 +119,7 @@ mod tests {
     fn refresh_bit_toggles_over_time() {
         let mut spk = Speaker::default();
         assert!(!spk.refresh_bit()); // t = 0
-        spk.accumulate(16, 1_000_000, false); // +16 us, past one ~15.085 us period
+        spk.accumulate(16, 1.0 / 1_000_000.0, false); // +16 us, past one ~15.085 us period
         assert!(spk.refresh_bit());
     }
 }

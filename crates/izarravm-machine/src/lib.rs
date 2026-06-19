@@ -136,9 +136,35 @@ pub enum ActiveDisplay {
     MargoLfb,
 }
 
+/// Per-clock conversion factors, recomputed once whenever the active mode (clock)
+/// changes, so the per-instruction device pacing multiplies instead of dividing.
+#[derive(Debug, Clone, Copy)]
+struct TimingFactors {
+    micros_per_clock: f64,   // 1e6 / clock_hz (OPL and DSP settle)
+    pit_per_clock: f64,      // PIT_INPUT_HZ / clock_hz
+    margo_ns_per_clock: f64, // 1e9 / clock_hz
+    vga_dots_per_clock: f64, // VGA_DOT_HZ / clock_hz
+    inv_clock: f64,          // 1 / clock_hz (DSP sample phase and the speaker)
+}
+
+impl TimingFactors {
+    fn for_clock(clock_hz: u64) -> Self {
+        let c = clock_hz as f64;
+        Self {
+            micros_per_clock: 1_000_000.0 / c,
+            pit_per_clock: PIT_INPUT_HZ as f64 / c,
+            margo_ns_per_clock: 1_000_000_000.0 / c,
+            vga_dots_per_clock: VGA_DOT_HZ as f64 / c,
+            inv_clock: 1.0 / c,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Machine {
     profile: MachineProfile,
+    active_mode: GswMode,
+    timing: TimingFactors,
     cpu: Cpu386,
     memory: Memory,
     // Boxed: Vga is ~99 KB. Inline, the Machine value (and its Result wrapper)
@@ -217,9 +243,13 @@ impl Machine {
     /// ordering relative to those memory writes matters.
     fn base(profile: MachineProfile, cpu: Cpu386, rom: Vec<u8>) -> Result<Self, MachineError> {
         let mixer = power_on_mixer(&profile);
+        let active_mode = profile.cpu;
+        let timing = TimingFactors::for_clock(profile.clock_hz);
         let machine = Self {
             memory: Memory::from_mib(profile.memory_mib)?,
             profile,
+            active_mode,
+            timing,
             cpu,
             video: Box::new(Vga::default()),
             margo: Margo::default(),
@@ -981,18 +1011,29 @@ impl Machine {
         self.elapsed_clocks
     }
 
+    /// Switch the active compatibility mode live, recomputing the timing factors
+    /// for the new clock. Called at construction and from the Lotura mode write.
+    pub fn set_mode(&mut self, mode: GswMode) {
+        self.active_mode = mode;
+        self.timing = TimingFactors::for_clock(mode.clock_hz());
+    }
+
+    pub fn active_mode(&self) -> GswMode {
+        self.active_mode
+    }
+
     /// Advance time-based devices by `clocks` of CPU time, carrying fractional
     /// remainders forward for the OPL timers (microseconds), the PIT counters,
     /// and the Margo blit engine (nanoseconds).
     fn advance_devices(&mut self, clocks: u64) {
-        self.opl_micros += clocks as f64 * 1_000_000.0 / self.profile.clock_hz as f64;
+        self.opl_micros += clocks as f64 * self.timing.micros_per_clock;
         let whole = self.opl_micros.floor();
         self.opl.advance_micros(whole as u64);
         self.opl_micros -= whole;
 
         // The DSP reset-settle countdown advances with emulated time so a
         // detection routine's delay loop sees 0xAA become available.
-        self.dsp_micros += clocks as f64 * 1_000_000.0 / self.profile.clock_hz as f64;
+        self.dsp_micros += clocks as f64 * self.timing.micros_per_clock;
         let whole = self.dsp_micros.floor();
         self.dsp.advance_micros(whole);
         self.dsp_micros -= whole;
@@ -1011,7 +1052,7 @@ impl Machine {
         let dma8 = self.mixer.selected_dma_8();
         let dma16 = self.mixer.selected_dma_16();
         if self.dsp.is_playing() && rate > 0 {
-            self.dsp_sample_phase += clocks as f64 * rate as f64 / self.profile.clock_hz as f64;
+            self.dsp_sample_phase += clocks as f64 * rate as f64 * self.timing.inv_clock;
             while self.dsp_sample_phase >= 1.0 {
                 self.dsp_sample_phase -= 1.0;
                 // Borrow dsp/dma/memory together for one sample tick (same shape
@@ -1034,7 +1075,7 @@ impl Machine {
             }
         }
 
-        self.pit_clocks += clocks as f64 * f64::from(PIT_INPUT_HZ) / self.profile.clock_hz as f64;
+        self.pit_clocks += clocks as f64 * self.timing.pit_per_clock;
         let whole = self.pit_clocks.floor();
         self.pit_clocks -= whole;
         let edges = self.pit.tick(whole as u64);
@@ -1045,22 +1086,19 @@ impl Machine {
         // PC speaker: sample (ch2 OUT AND data enable) into the speaker ring at
         // the DAC rate. `clocks` is small (per instruction), so a tone is sampled
         // finely enough to form a square wave.
-        self.speaker.accumulate(
-            clocks,
-            self.profile.clock_hz as u32,
-            self.pit.channel_out(2),
-        );
+        self.speaker
+            .accumulate(clocks, self.timing.inv_clock, self.pit.channel_out(2));
 
         if self.keyboard.take_irq() {
             self.pic.request(1); // IRQ1: keyboard output buffer has a scancode
         }
 
-        self.margo_ns += clocks as f64 * 1_000_000_000.0 / self.profile.clock_hz as f64;
+        self.margo_ns += clocks as f64 * self.timing.margo_ns_per_clock;
         let whole_ns = self.margo_ns.floor();
         self.margo.advance_busy(whole_ns as u64);
         self.margo_ns -= whole_ns;
 
-        self.vga_dots += clocks as f64 * VGA_DOT_HZ as f64 / self.profile.clock_hz as f64;
+        self.vga_dots += clocks as f64 * self.timing.vga_dots_per_clock;
         let whole = self.vga_dots.floor();
         self.video.advance(whole as u64);
         self.vga_dots -= whole;
@@ -1971,6 +2009,22 @@ mod tests {
             I386DX25_TEST_ROM,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn timing_factors_track_the_active_mode() {
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(1, izarravm_core::VideoCard::Et4000Ax),
+            vec![0u8; BIOS_ROM_SIZE],
+        )
+        .unwrap();
+        // Boot mode is 386 @ 25 MHz: the PIT factor is PIT_INPUT_HZ / 25 MHz.
+        assert_eq!(machine.active_mode(), GswMode::Gsw386);
+        assert!((machine.timing.pit_per_clock - PIT_INPUT_HZ as f64 / 25_000_000.0).abs() < 1e-9);
+        // Switching to 586 @ 266 MHz recomputes the factor.
+        machine.set_mode(GswMode::Gsw586);
+        assert_eq!(machine.active_mode(), GswMode::Gsw586);
+        assert!((machine.timing.pit_per_clock - PIT_INPUT_HZ as f64 / 266_000_000.0).abs() < 1e-9);
     }
 
     fn rom_with_code(code: &[u8]) -> Vec<u8> {
