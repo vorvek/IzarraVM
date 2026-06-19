@@ -33,18 +33,6 @@ fn indexed_to_color_image(
     words_to_color_image(&words, width, height)
 }
 
-/// The Very Slow / Slow / Fast readout. The fiction's three modes map to these
-/// clocks; the actual mode is switched from Toka, which is not wired yet, so
-/// this reflects the machine's current clock. Anything unmapped shows its MHz.
-fn speed_label(clock_hz: u64) -> String {
-    match clock_hz {
-        25_000_000 => "Very Slow".to_string(),
-        66_000_000 => "Slow".to_string(),
-        233_000_000 => "Fast".to_string(),
-        other => format!("{} MHz", other / 1_000_000),
-    }
-}
-
 /// Nearest-neighbour integer upscale per axis, as large as fits the target
 /// without exceeding it. The caller then lets egui stretch the small remainder
 /// with bilinear filtering, which gives a sharp-bilinear look without a shader.
@@ -310,7 +298,16 @@ impl GuiApp {
         });
 
         ui.separator();
-        ui.label(format!("CPU class: {}", speed_label(self.profile.clock_hz)));
+        let mode = self
+            .machine
+            .as_ref()
+            .map(|m| m.active_mode())
+            .unwrap_or(self.profile.cpu);
+        ui.label(format!(
+            "CPU: GSW-586 ({} mode, {} MHz)",
+            mode.canonical_name(),
+            mode.clock_hz() / 1_000_000
+        ));
         ui.label(format!("Emulation speed: {:.0}%", self.speed_ratio * 100.0));
         ui.label(format!("Memory: {} MB", self.profile.memory_mib));
 
@@ -520,14 +517,5 @@ mod tests {
         let src = egui::ColorImage::new([4, 4], vec![egui::Color32::BLACK; 16]);
         let out = sharp_prescale(&src, 3, 3);
         assert_eq!(out.size, [4, 4]);
-    }
-
-    #[test]
-    fn speed_label_maps_known_clocks() {
-        assert_eq!(speed_label(25_000_000), "Very Slow");
-        assert_eq!(speed_label(66_000_000), "Slow");
-        assert_eq!(speed_label(233_000_000), "Fast");
-        // Unmapped clocks fall back to a raw MHz label.
-        assert_eq!(speed_label(133_000_000), "133 MHz");
     }
 }
