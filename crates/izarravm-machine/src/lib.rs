@@ -14,6 +14,9 @@ mod dma;
 mod keyboard;
 mod pic;
 mod pit;
+// Wired into Machine in the next task.
+#[allow(dead_code)]
+mod speaker;
 
 pub const HIGH_ROM_BASE: u32 = 0xffff_0000;
 pub const MARGO_LFB_BASE: u32 = 0xE000_0000;
