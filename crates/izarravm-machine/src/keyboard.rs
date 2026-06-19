@@ -37,6 +37,22 @@ impl Keyboard8042 {
         self.latch_next();
     }
 
+    /// Put a controller command response (self-test 0x55, interface test 0x00)
+    /// into the output buffer ahead of keyboard scancodes. A real 8042 holds the
+    /// keyboard while it processes a command and returns the answer immediately, so
+    /// any scancode already latched is pushed back to the front of the queue rather
+    /// than dropped. This keeps a self-test from eating host keystrokes.
+    fn respond_immediately(&mut self, response: u8) {
+        if let Some(latched) = self.output.take() {
+            self.queue.push_front(latched);
+        }
+        self.output = Some(response);
+        self.status |= STATUS_OBF;
+        if self.command_byte & 0x01 != 0 {
+            self.irq_armed = true;
+        }
+    }
+
     /// Move the next queued scancode into the output buffer if it is free.
     fn latch_next(&mut self) {
         if self.output.is_none() {
@@ -90,8 +106,8 @@ impl Keyboard8042 {
             }
             0x64 => {
                 match value {
-                    0xAA => self.push_scancodes(&[0x55]), // controller self-test OK
-                    0xAB => self.push_scancodes(&[0x00]), // interface test OK
+                    0xAA => self.respond_immediately(0x55), // controller self-test OK
+                    0xAB => self.respond_immediately(0x00), // interface test OK
                     0x20 => {
                         // read command byte -> output buffer
                         self.queue.push_front(self.command_byte);

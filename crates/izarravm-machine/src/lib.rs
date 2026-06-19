@@ -642,6 +642,40 @@ impl Machine {
         }
     }
 
+    /// Service the host side of INT 15h. AH=88h returns the extended memory size
+    /// (KiB above 1 MiB) in AX with CF clear, the standard way a BIOS learns RAM
+    /// size on a machine with no probing path. Capped at 0xFFFF KiB (64 MiB) to
+    /// fit the 16-bit AX return; other subfunctions report CF set (unsupported).
+    fn handle_int15(&mut self) {
+        let ah = (self.cpu.registers.eax() as u16 >> 8) as u8;
+        if ah == 0x88 {
+            let extended_kib = u32::from(self.profile.memory_mib.saturating_sub(1)) * 1024;
+            let value = extended_kib.min(0xFFFF) as u16;
+            let eax = (self.cpu.registers.eax() & !0xFFFF) | u32::from(value);
+            self.cpu.registers.set_eax(eax);
+            self.set_int_frame_carry(false);
+        } else {
+            self.set_int_frame_carry(true);
+        }
+    }
+
+    /// Set or clear CF in the FLAGS image the pending IRET stub will pop (SS:SP+4
+    /// after a real-mode INT pushed IP, CS, FLAGS). Host-serviced INTs that report
+    /// status through carry use this so the guest sees the right flag on return.
+    fn set_int_frame_carry(&mut self, carry: bool) {
+        let ss = self.cpu.registers.segment(SegmentIndex::Ss).base;
+        let sp = self.cpu.registers.esp() as u16;
+        let flags_addr = (ss + u32::from(sp.wrapping_add(4))) as usize;
+        if let Ok(mut flags) = self.memory.read_u16(flags_addr) {
+            if carry {
+                flags |= 0x0001;
+            } else {
+                flags &= !0x0001;
+            }
+            let _ = self.memory.write_u16(flags_addr, flags);
+        }
+    }
+
     /// INT 10h AH=10h: set/get the ATC palette registers and the DAC. The common
     /// sub-functions; rare variants (overscan get, intensity/blink, color paging)
     /// are deferred. Register conventions per RBIL.
@@ -1435,6 +1469,7 @@ impl Machine {
                     if let Some(vector) = self.pending_soft_int {
                         match vector {
                             0x10 => self.handle_int10(),
+                            0x15 => self.handle_int15(),
                             0x20 | 0x21 => match self.handle_dos_int(vector) {
                                 Ok(Some(code)) => {
                                     if let Some(frame) = self.program_frames.pop() {
@@ -1714,7 +1749,7 @@ impl CpuBus for MachineBus<'_> {
         // video service; 0x20/0x21 are the DOS kernel. Vector 0x10 reaches here
         // only from a software INT today (the CPU never faults with vector 0x10);
         // revisit if an x87 #MF is added.
-        if matches!(vector, 0x10 | 0x20 | 0x21) {
+        if matches!(vector, 0x10 | 0x15 | 0x20 | 0x21) {
             *self.pending_soft_int = Some(vector);
         }
         Ok(())
@@ -1875,7 +1910,7 @@ fn boot_sector_cpu() -> Cpu386 {
 }
 
 fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
-    for vector in [0x10, 0x13, 0x20, 0x21] {
+    for vector in [0x10, 0x13, 0x15, 0x20, 0x21] {
         let address = vector * 4;
         memory.write_u16(address, BIOS_IRET_STUB_ADDRESS as u16)?;
         memory.write_u16(address + 2, 0)?;

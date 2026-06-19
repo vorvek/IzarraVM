@@ -3,11 +3,34 @@
 ; offsets (KB_BUF_*) live in izbios-defs.inc. Installed at IVT[09h]/IVT[16h] by
 ; core bring-up.
 
-; kb_getkey: thin wrapper over the installed INT 16h.
-;   AH=0 -> blocking read: AL=ASCII, AH=scancode.
+; kb_getkey: keyboard access for the setup page.
+;   AH=0 -> blocking read via INT 16h: AL=ASCII, AH=scancode.
 ;   AH=1 -> peek: CF=1 if empty; else AL=ASCII, AH=scancode (left in the ring).
+; The peek reads the BDA ring directly rather than calling INT 16h AH=1: an ISR
+; cannot return a flag through IRET (which pops the caller's saved FLAGS), so the
+; peek's carry result would be lost. A near return preserves CF correctly.
 kb_getkey:
+    cmp ah, 0x01
+    je .peek
     int 0x16
+    ret
+.peek:
+    push ds
+    push bx
+    mov bx, BDA_SEG
+    mov ds, bx
+    mov bx, [KB_BUF_HEAD]
+    cmp bx, [KB_BUF_TAIL]
+    je .empty
+    mov ax, [bx]                ; AH=scancode, AL=ASCII (not consumed)
+    pop bx
+    pop ds
+    clc
+    ret
+.empty:
+    pop bx
+    pop ds
+    stc
     ret
 
 ; kb_flush: drop everything in the ring (head = tail).

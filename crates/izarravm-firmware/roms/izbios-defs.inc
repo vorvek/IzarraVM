@@ -49,12 +49,15 @@
 
 ; --- Scratch RAM map (segment 0). ROM writes are dropped by the bus, so all
 ; mutable state lives here. Each region is disjoint and owned by one stream;
-; the foundation hands these offsets out and streams never overlap. ---
+; the foundation hands these offsets out and streams never overlap. The map skips
+; 0x0600: the emulator installs its BIOS IRET stub there (the target of the
+; INT 10h/13h/15h/20h/21h vectors), so writing it would corrupt those services. ---
 %define BIOS_VALBUF      0x0500    ; foundation: ASCIIZ value/format buffer (32 B)
 %define BIOS_SCRATCH     0x0520    ; foundation: general scratch (32 B)
-%define RAMTEST_SCRATCH  0x0560    ; STREAM B: detected size + flags (160 B)
-%define SETUP_SCRATCH    0x0600    ; STREAM D: setup working copy (256 B)
-%define PROBE_SCRATCH     0x0700   ; STREAM C: per-probe value buffers (256 B)
+%define RAMTEST_SCRATCH  0x0540    ; STREAM B: detected size + flags (160 B, ends 0x5DF)
+; 0x0600: emulator BIOS IRET stub. Reserved; never write here.
+%define SETUP_SCRATCH    0x0610    ; STREAM D: setup working copy (256 B, 0x610-0x70F)
+%define PROBE_SCRATCH    0x0710    ; STREAM C: per-probe value buffers (240 B, 0x710-0x7FF)
 ; 0x0800..STACK area free; stack top STACK_TOP; result block at RESULT_BLOCK.
 
 ; --- Device ports (read-only contract) ---
