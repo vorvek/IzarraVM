@@ -12,6 +12,8 @@ pub const TYPE_COM: &[u8] = include_bytes!("../roms/dos/type.com");
 pub const TYPE_COM_SOURCE: &str = include_str!("../roms/dos/type.asm");
 pub const EXEHELLO_EXE: &[u8] = include_bytes!("../roms/dos/exehello.exe");
 pub const EXEHELLO_EXE_SOURCE: &str = include_str!("../roms/dos/exehello.asm");
+pub const KBD_BIOS: &[u8] = include_bytes!("../roms/kbd-bios.bin");
+pub const KBD_BIOS_SOURCE: &str = include_str!("../roms/kbd-bios.asm");
 
 pub const I386DX25_TEST_ROM_SIZE: usize = 64 * 1024;
 pub const X86_BOOT_TEST_IMAGE_SIZE: usize = 1440 * 1024;
@@ -20,6 +22,10 @@ pub const X86_BOOT_RESULT_MAGIC: &[u8; 4] = b"VDTS";
 
 pub fn test_rom() -> &'static [u8] {
     I386DX25_TEST_ROM
+}
+
+pub fn kbd_bios() -> &'static [u8] {
+    KBD_BIOS
 }
 
 pub fn boot_test_image() -> &'static [u8] {
@@ -186,6 +192,11 @@ mod tests {
             &I386DX25_TEST_ROM[0xfff0..0xfff5],
             &[0xea, 0x00, 0x00, 0x00, 0xf0]
         );
+    }
+
+    #[test]
+    fn kbd_bios_is_64k() {
+        assert_eq!(KBD_BIOS.len(), I386DX25_TEST_ROM_SIZE);
     }
 
     #[test]
