@@ -61,6 +61,36 @@ pub fn seed_keyboard_ring(mem: &mut Memory, ascii: &[u8]) -> Result<(), DosError
     Ok(())
 }
 
+/// Resolve the C: root: `<base>/c_drive` if it exists (portable mode), else
+/// `<home>/.izarravm/c_drive`. The chosen path is created if missing.
+pub fn resolve_c_root_in(base: &Path, home: &Path) -> PathBuf {
+    let local = base.join("c_drive");
+    let chosen = if local.is_dir() {
+        local
+    } else {
+        home.join(".izarravm").join("c_drive")
+    };
+    let _ = std::fs::create_dir_all(&chosen);
+    chosen
+}
+
+/// Resolve the C: root against the process working directory and the host home
+/// directory. `home_dir` is un-deprecated on the project MSRV and behaves
+/// correctly on Windows and Unix, so no `dirs` crate is pulled in.
+pub fn resolve_c_root() -> PathBuf {
+    let base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    #[allow(deprecated)]
+    let home = std::env::home_dir().unwrap_or_else(|| base.clone());
+    resolve_c_root_in(&base, &home)
+}
+
+/// Build Toka-DOS into the C: root if it is absent. Toka-DOS is not built yet,
+/// so this is a no-op for now. When Toka-DOS exists, lay it down here if a
+/// marker file is missing.
+pub fn ensure_toka_dos(c_root: &Path) {
+    let _ = c_root;
+}
+
 #[derive(Debug, Error)]
 pub enum DosError {
     #[error("C: drive root does not exist: {0}")]
@@ -4305,5 +4335,26 @@ mod tests {
             parse_env_block(&mem, env_seg),
             vec![("BLASTER".to_string(), "A220 I5 D1 H5 T6".to_string())]
         );
+    }
+
+    #[test]
+    fn resolve_c_root_prefers_local_then_creates() {
+        let tmp = std::env::temp_dir().join(format!("izarra_croot_{}", std::process::id()));
+        let local = tmp.join("c_drive");
+        std::fs::create_dir_all(&local).unwrap();
+        // When ./c_drive exists relative to `base`, it wins.
+        let got = resolve_c_root_in(&tmp, &tmp.join("home"));
+        assert_eq!(got, local);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn resolve_c_root_falls_back_to_home_and_creates() {
+        let tmp = std::env::temp_dir().join(format!("izarra_chome_{}", std::process::id()));
+        let home = tmp.join("home");
+        let got = resolve_c_root_in(&tmp.join("nowhere"), &home);
+        assert_eq!(got, home.join(".izarravm").join("c_drive"));
+        assert!(got.is_dir());
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }

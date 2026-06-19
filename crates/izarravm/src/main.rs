@@ -75,7 +75,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     let cli = Cli::parse();
-    let config = load_config(&cli)?;
+    let mut config = load_config(&cli)?;
+    // When the user gave no C: location (no --c_drive, no --dosroot, and the
+    // config left at its "." default), auto-mount from ./c_drive or
+    // ~/.izarravm/c_drive and lay down Toka-DOS if it is missing.
+    if cli.c_drive.is_none() && cli.dosroot.is_none() && config.dos.c_drive == Path::new(".") {
+        let c_root = izarravm_dos::resolve_c_root();
+        izarravm_dos::ensure_toka_dos(&c_root);
+        config.dos.c_drive = c_root;
+    }
     let hardware = HardwareProfile::from_config(&config)?;
     let dos = DosKernelServices::new(HostDrive::mount_c(&config.dos.c_drive)?);
     let audio = AudioSubsystem::from_config(&config.audio);
