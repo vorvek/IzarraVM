@@ -31,11 +31,11 @@ pub enum ConfigError {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GswMode {
     #[serde(rename = "386")]
+    #[default]
     Gsw386,
     #[serde(rename = "486")]
     Gsw486,
     #[serde(rename = "586")]
-    #[default]
     Gsw586,
 }
 
@@ -411,7 +411,7 @@ pub struct MachineConfig {
 impl Default for MachineConfig {
     fn default() -> Self {
         Self {
-            cpu: GswMode::Gsw586,
+            cpu: GswMode::Gsw386,
             memory_mib: 16,
             video: VideoCard::Et4000Ax,
         }
@@ -583,7 +583,7 @@ mod tests {
         assert_eq!(GswMode::Gsw486.clock_hz(), 66_000_000);
         assert_eq!(GswMode::Gsw586.clock_hz(), 266_000_000);
         assert_eq!(GswMode::Gsw586.canonical_name(), "586");
-        assert_eq!(GswMode::default(), GswMode::Gsw586);
+        assert_eq!(GswMode::default(), GswMode::Gsw386);
     }
 
     #[test]
