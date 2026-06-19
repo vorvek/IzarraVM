@@ -5519,4 +5519,21 @@ mod tests {
         let tail = machine.memory_read_u16_for_test(0x41c);
         assert_ne!(head, tail, "ISR enqueued a key into the BDA ring");
     }
+
+    #[test]
+    fn dos_program_reads_typed_keys_through_int21() {
+        // org 0x100: read two chars with AH=01 (each echoes to stdout), then exit.
+        //   mov ah,1 / int 21h / mov ah,1 / int 21h / mov ax,4c00h / int 21h
+        let com: &[u8] = &[
+            0xb4, 0x01, 0xcd, 0x21, 0xb4, 0x01, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21,
+        ];
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com)
+                .unwrap();
+        // Type 'h' then 'i' as Set 1 make+break (H=0x23, I=0x17).
+        machine.inject_key_scancodes(&[0x23, 0xa3, 0x17, 0x97]);
+        let reason = machine.run_until_halt_or_cycles(2_000_000).unwrap();
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
+        assert_eq!(machine.dos_output(), b"hi");
+    }
 }
