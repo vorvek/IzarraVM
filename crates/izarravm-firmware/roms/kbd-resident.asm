@@ -4,8 +4,6 @@
 bits 16
 org 0
 
-%define ROM_SEG 0xf000          ; the handlers run with CS = this segment
-
     dw int09                    ; header word 0: INT 09h entry offset
     dw int16                    ; header word 1: INT 16h entry offset
 

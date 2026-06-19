@@ -16,6 +16,10 @@ pub const KBD_BIOS: &[u8] = include_bytes!("../roms/kbd-bios.bin");
 pub const KBD_BIOS_SOURCE: &str = include_str!("../roms/kbd-bios.asm");
 pub const KBD_RESIDENT_BIOS: &[u8] = include_bytes!("../roms/kbd-resident.bin");
 pub const KBD_RESIDENT_BIOS_SOURCE: &str = include_str!("../roms/kbd-resident.asm");
+/// Segment the resident keyboard BIOS loads at (F000:0000). The INT 09h/16h
+/// handlers run with CS set to this and use cs-relative table lookups, so the
+/// installer must place the image at this segment's offset 0.
+pub const KBD_RESIDENT_BIOS_SEG: u16 = 0xf000;
 
 pub const I386DX25_TEST_ROM_SIZE: usize = 64 * 1024;
 pub const X86_BOOT_TEST_IMAGE_SIZE: usize = 1440 * 1024;

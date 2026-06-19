@@ -304,15 +304,19 @@ impl Machine {
     /// with run_until_halt_or_cycles and read dos_output plus the DosExit stop
     /// reason.
     ///
-    /// Entry eflags has IF clear, unlike real DOS which hands control with
-    /// interrupts enabled. This slice installs no BIOS interrupt handlers (IVT[8]
-    /// and friends are zero), so a program that wants hardware IRQs must set them up
-    /// and STI itself; the BIOS IVT and an interrupts-enabled handoff come with a
-    /// later slice.
+    /// Entry eflags has IF set, matching real DOS which hands control with
+    /// interrupts enabled. The resident keyboard BIOS is installed (IVT[09h]/[16h]
+    /// point at its ROM handlers, the PIC is programmed, and IRQ1 is unmasked), so
+    /// a typed key flows 8042 -> IRQ1 -> INT 09h ISR -> BDA ring. IRQ0 (timer) is
+    /// masked, so with no key injected no hardware interrupt fires.
     pub fn new_dos_program(profile: MachineProfile, image: &[u8]) -> Result<Self, MachineError> {
         let env_entries = sound_blaster_env_entries(&profile.sound_blaster);
-        let mut machine = Self::base(profile, Cpu386::default(), vec![0; BIOS_ROM_SIZE])?;
+        let mut rom = vec![0u8; BIOS_ROM_SIZE];
+        let kb = izarravm_firmware::kbd_resident_bios();
+        rom[..kb.len()].copy_from_slice(kb);
+        let mut machine = Self::base(profile, Cpu386::default(), rom)?;
         install_boot_bios_stubs(&mut machine.memory)?;
+        machine.install_keyboard_bios()?;
 
         let entry = izarravm_dos::load_program(image, &mut machine.memory, DOS_LOAD_SEGMENT)?;
         machine.apply_program_entry(entry);
@@ -338,8 +342,8 @@ impl Machine {
     }
 
     /// Set the CPU to a loaded program's entry: CS:IP, SS:SP, DS, ES, and a
-    /// real-mode eflags with IF clear (no BIOS IVT is installed, so a program
-    /// wanting hardware IRQs sets them up and STIs itself).
+    /// real-mode eflags with IF set, matching real DOS which hands control with
+    /// interrupts enabled so the keyboard ISR can run while a program polls.
     fn apply_program_entry(&mut self, entry: izarravm_dos::ProgramEntry) {
         let r = &mut self.cpu.registers;
         r.set_segment(SegmentIndex::Cs, SegmentRegister::real(entry.cs));
@@ -348,7 +352,46 @@ impl Machine {
         r.set_segment(SegmentIndex::Ss, SegmentRegister::real(entry.ss));
         r.eip = u32::from(entry.ip);
         r.set_esp(u32::from(entry.sp));
-        r.eflags = 0x0000_0002;
+        r.eflags = 0x0000_0202; // IF set: DOS programs start with interrupts on
+    }
+
+    /// Install the resident keyboard BIOS for the DOS machine: point IVT[09h] and
+    /// IVT[16h] at the handlers in the BIOS ROM (mapped at F000:0000), clear the
+    /// BDA ring, program the PIC, and unmask IRQ1. IF is set at program entry so
+    /// the ISR can run while a program polls for input.
+    fn install_keyboard_bios(&mut self) -> Result<(), MachineError> {
+        let kb = izarravm_firmware::kbd_resident_bios();
+        let seg = izarravm_firmware::KBD_RESIDENT_BIOS_SEG;
+        let int09 = u16::from_le_bytes([kb[0], kb[1]]);
+        let int16 = u16::from_le_bytes([kb[2], kb[3]]);
+        self.memory.write_u16(0x09 * 4, int09)?;
+        self.memory.write_u16(0x09 * 4 + 2, seg)?;
+        self.memory.write_u16(0x16 * 4, int16)?;
+        self.memory.write_u16(0x16 * 4 + 2, seg)?;
+        // BDA keyboard ring: head = tail = ring start, shift flags = 0.
+        self.memory.write_u16(0x41a, 0x1e)?;
+        self.memory.write_u16(0x41c, 0x1e)?;
+        self.memory.write_u8(0x417, 0)?;
+        // Program the 8259 pair (master IRQ0..7 -> INT 08h..0Fh), then mask all
+        // but IRQ1 on the master so an unhandled timer INT cannot fire.
+        {
+            let mut bus = self.make_bus();
+            for (port, value) in [
+                (0x20u16, 0x11u16),
+                (0x21, 0x08),
+                (0x21, 0x04),
+                (0x21, 0x01),
+                (0xa0, 0x11),
+                (0xa1, 0x70),
+                (0xa1, 0x02),
+                (0xa1, 0x01),
+                (0x21, 0xfd), // master IMR: unmask IRQ1 only
+                (0xa1, 0xff), // slave IMR: all masked
+            ] {
+                bus.write_io(port, BusWidth::Byte, u32::from(value))?;
+            }
+        }
+        Ok(())
     }
 
     pub fn profile(&self) -> &MachineProfile {
@@ -391,6 +434,11 @@ impl Machine {
     #[cfg(test)]
     fn irq1_pending(&self) -> bool {
         self.pic.irr_bit(1)
+    }
+
+    #[cfg(test)]
+    fn memory_read_u16_for_test(&self, linear: usize) -> u16 {
+        self.memory.read_u16(linear).unwrap_or(0)
     }
 
     pub fn serial_text(&self) -> String {
@@ -5454,5 +5502,21 @@ mod tests {
             "screen line 0 was {:?}",
             screen.line_string(0)
         );
+    }
+
+    #[test]
+    fn dos_machine_routes_irq1_to_the_keyboard_isr() {
+        // A do-nothing program that just spins (jmp $) so the machine keeps running.
+        // org 0x100: jmp $  (EB FE)
+        let com: &[u8] = &[0xeb, 0xfe];
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com)
+                .unwrap();
+        machine.inject_key_scancodes(&[0x1e, 0x9e]); // 'a' make + break
+        machine.run_until_halt_or_cycles(200_000).unwrap();
+        // The real INT 09h ISR should have moved 'a' into the BDA ring.
+        let head = machine.memory_read_u16_for_test(0x41a);
+        let tail = machine.memory_read_u16_for_test(0x41c);
+        assert_ne!(head, tail, "ISR enqueued a key into the BDA ring");
     }
 }
