@@ -1,5 +1,5 @@
 [machine]
-cpu = "i386dx_25"
+cpu = "586"
 memory_mib = 16
 video = "et4000_ax"
 

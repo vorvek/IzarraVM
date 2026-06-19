@@ -19,7 +19,7 @@ DOS computer that arrived just as Windows 95 took over the market.
 Fixed hardware. None of it is user-selectable; the point of the machine is that it
 is one tight design.
 
-- CPU: GSW-586, a Pentium and K6 class part at 200 MHz on a 66 MHz bus. Two
+- CPU: GSW-586, a K6 class part at 266 MHz on a 66 MHz bus. Two
   backward compatibility modes throttle it to behave like the earlier machines in
   the line: 486DX2 at 66 MHz (the Izarra 2000) and 386DX at 25 MHz (the Izarra
   1000), switchable from Toka without a reboot.

@@ -3,7 +3,7 @@ mod gui;
 use clap::Parser;
 use izarravm_audio::AudioSubsystem;
 use izarravm_core::{
-    AppConfig, ConfigOverrides, CpuPreset, HardwareProfile, MidiBackend, SbDma8, SbDma16, SbIrq,
+    AppConfig, ConfigOverrides, GswMode, HardwareProfile, MidiBackend, SbDma8, SbDma16, SbIrq,
     VideoCard,
 };
 use izarravm_dos::{DosKernelServices, HostDrive};
@@ -25,7 +25,7 @@ struct Cli {
     #[arg(long)]
     config: Option<PathBuf>,
     #[arg(long)]
-    cpu: Option<CpuPreset>,
+    cpu: Option<GswMode>,
     #[arg(long)]
     memory_mib: Option<u16>,
     #[arg(long)]

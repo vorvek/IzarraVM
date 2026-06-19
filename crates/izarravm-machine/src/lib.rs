@@ -1,6 +1,6 @@
 use izarravm_audio::{OplChip, Resampler, SbDsp, SbMixer};
 use izarravm_bus::{BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CpuBus, Memory};
-use izarravm_core::{CpuPreset, HardwareProfile, SoundBlasterConfig, VideoCard};
+use izarravm_core::{GswMode, HardwareProfile, SoundBlasterConfig, VideoCard};
 use izarravm_cpu::{Cpu386, CpuError, Registers, SegmentIndex, SegmentRegister};
 pub use izarravm_video::MARGO_ID_VALUE;
 use izarravm_video::{
@@ -65,7 +65,7 @@ impl Default for WaitStateProfile {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineProfile {
-    pub cpu: CpuPreset,
+    pub cpu: GswMode,
     pub clock_hz: u64,
     pub memory_mib: u16,
     pub video: VideoCard,
@@ -79,9 +79,9 @@ pub struct MachineProfile {
 }
 
 impl MachineProfile {
-    pub fn i386dx25(memory_mib: u16, video: VideoCard) -> Self {
+    pub fn gsw_386(memory_mib: u16, video: VideoCard) -> Self {
         Self {
-            cpu: CpuPreset::I386Dx25,
+            cpu: GswMode::Gsw386,
             clock_hz: 25_000_000,
             memory_mib,
             video,
@@ -1967,7 +1967,7 @@ mod tests {
 
     fn test_machine() -> Machine {
         Machine::new(
-            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
             I386DX25_TEST_ROM,
         )
         .unwrap()
@@ -1984,7 +1984,7 @@ mod tests {
     fn injected_key_is_readable_on_port_0x60_and_requests_irq1() {
         // A bare machine: inject a scancode, then read it back through the bus the
         // way the CPU would, and confirm IRQ1 became pending on the PIC.
-        let profile = MachineProfile::i386dx25(1, izarravm_core::VideoCard::Et4000Ax);
+        let profile = MachineProfile::gsw_386(1, izarravm_core::VideoCard::Et4000Ax);
         let mut machine = Machine::new(profile, vec![0u8; BIOS_ROM_SIZE]).unwrap();
         machine.inject_key_scancodes(&[0x1e]); // 'A' make
         assert_eq!(machine.read_io_port_u8(0x60), 0x1e);
@@ -1995,7 +1995,7 @@ mod tests {
     fn io_port_reports_last_post_write() {
         // mov al,0x42; out 0x80,al; hlt
         let mut machine = Machine::new(
-            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
             rom_with_code(&[0xb0, 0x42, 0xe6, 0x80, 0xf4]),
         )
         .unwrap();
@@ -2016,7 +2016,7 @@ mod tests {
     #[test]
     fn rejects_non_64k_roms() {
         let err =
-            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), [0u8; 8]).unwrap_err();
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), [0u8; 8]).unwrap_err();
 
         assert!(matches!(err, MachineError::InvalidRomSize(8)));
     }
@@ -2093,7 +2093,7 @@ mod tests {
             0xf4, // hlt
         ]);
         let mut machine =
-            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
 
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
 
@@ -2111,7 +2111,7 @@ mod tests {
     #[test]
     fn boot_image_starts_at_bios_loaded_boot_sector() {
         let mut machine = Machine::new_boot_image(
-            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
             izarravm_firmware::X86_BOOT_TEST_IMAGE,
         )
         .unwrap();
@@ -2128,7 +2128,7 @@ mod tests {
     #[test]
     fn boot_image_emits_serial_records_and_result_block() {
         let mut machine = Machine::new_boot_image(
-            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
             izarravm_firmware::X86_BOOT_TEST_IMAGE,
         )
         .unwrap();
@@ -2192,7 +2192,7 @@ mod tests {
             0xf4, // hlt
         ]);
         let mut machine =
-            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
 
         // Host path latches Margo as the active display.
         machine.set_margo_mode_640x480x8();
@@ -2225,7 +2225,7 @@ mod tests {
             0xf4, // hlt
         ]);
         let mut machine =
-            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
 
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
         assert_eq!(reason, StopReason::Halted);
@@ -2246,7 +2246,7 @@ mod tests {
             0xf4, // hlt
         ]);
         let mut machine =
-            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
 
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
         assert_eq!(reason, StopReason::Halted);
@@ -2265,7 +2265,7 @@ mod tests {
             0xf4, // hlt
         ]);
         let mut machine =
-            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
 
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
         assert_eq!(reason, StopReason::Halted);
@@ -2285,7 +2285,7 @@ mod tests {
             0xf4, // hlt
         ]);
         let mut machine =
-            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
 
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
         assert_eq!(reason, StopReason::Halted);
@@ -2507,7 +2507,7 @@ mod tests {
 
     #[test]
     fn machine_applies_host_sound_blaster_config_at_boot() {
-        let mut profile = MachineProfile::i386dx25(16, VideoCard::Et4000Ax);
+        let mut profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         profile.sound_blaster = SoundBlasterConfig {
             enabled: true,
             irq: SbIrq::I7,
@@ -2743,7 +2743,7 @@ mod tests {
             0xcf,
         ];
         let mut machine = Machine::new_boot_image(
-            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
             boot_image_with(code),
         )
         .unwrap();
@@ -2767,7 +2767,7 @@ mod tests {
     #[test]
     fn boot_suite_reports_timer_irq0_pass() {
         let mut machine = Machine::new_boot_image(
-            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
             izarravm_firmware::X86_BOOT_TEST_IMAGE,
         )
         .unwrap();
@@ -2790,7 +2790,7 @@ mod tests {
     #[test]
     fn boot_suite_reports_sb_dsp_reset_pass() {
         let mut machine = Machine::new_boot_image(
-            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
             izarravm_firmware::X86_BOOT_TEST_IMAGE,
         )
         .unwrap();
@@ -2809,7 +2809,7 @@ mod tests {
     #[test]
     fn boot_suite_reports_opl3_pass() {
         let mut machine = Machine::new_boot_image(
-            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
             izarravm_firmware::X86_BOOT_TEST_IMAGE,
         )
         .unwrap();
@@ -2827,7 +2827,7 @@ mod tests {
     #[test]
     fn boot_suite_reports_opl2_pass() {
         let mut machine = Machine::new_boot_image(
-            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
             izarravm_firmware::X86_BOOT_TEST_IMAGE,
         )
         .unwrap();
@@ -2845,7 +2845,7 @@ mod tests {
     #[test]
     fn boot_suite_reports_sb_8bit_dma_pass() {
         let mut machine = Machine::new_boot_image(
-            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
             izarravm_firmware::X86_BOOT_TEST_IMAGE,
         )
         .unwrap();
@@ -2864,7 +2864,7 @@ mod tests {
     #[test]
     fn boot_suite_reports_sb_16bit_dma_pass() {
         let mut machine = Machine::new_boot_image(
-            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
             izarravm_firmware::X86_BOOT_TEST_IMAGE,
         )
         .unwrap();
@@ -2887,7 +2887,7 @@ mod tests {
         // deliver the half-buffer IRQ5, so the handler runs and real emulated time
         // advances -- not a genuine no-wake halt. Setup mirrors the 8-bit probe.
         let mut machine = Machine::new(
-            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
             // mov ax,0; mov ds,ax; sti; hlt; cli; hlt
             rom_with_code(&[0xb8, 0x00, 0x00, 0x8e, 0xd8, 0xfb, 0xf4, 0xfa, 0xf4]),
         )
@@ -2945,7 +2945,7 @@ mod tests {
     fn cli_hlt_is_a_genuine_halt() {
         // With interrupts off, HLT must still halt immediately, not spin.
         let mut machine = Machine::new(
-            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
             rom_with_code(&[0xfa, 0xf4]), // cli; hlt
         )
         .unwrap();
@@ -2958,7 +2958,7 @@ mod tests {
         // cli; jmp $ keeps the CPU spinning with interrupts off, so advance_devices
         // ticks the PIT but the raised IRQ0 stays pending (never acknowledged).
         let mut machine = Machine::new(
-            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
             rom_with_code(&[0xfa, 0xeb, 0xfe]),
         )
         .unwrap();
@@ -3224,7 +3224,7 @@ mod tests {
             0xf4, // hlt
         ]);
         let mut machine =
-            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
 
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
         assert_eq!(reason, StopReason::Halted);
@@ -3249,7 +3249,7 @@ mod tests {
             0xf4, // hlt
         ]);
         let mut machine =
-            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
 
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
         assert_eq!(reason, StopReason::Halted);
@@ -3292,7 +3292,7 @@ mod tests {
             0xf4, // hlt
         ]);
         let mut machine =
-            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
 
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
         assert_eq!(reason, StopReason::Halted);
@@ -3364,7 +3364,7 @@ mod tests {
             b'$',
         ];
         let mut machine =
-            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com)
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
                 .unwrap();
         let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
         assert_eq!(reason, StopReason::DosExit { code: 0 });
@@ -3376,7 +3376,7 @@ mod tests {
         // org 0x100: mov ax,4c07; int 21
         let com: &[u8] = &[0xb8, 0x07, 0x4c, 0xcd, 0x21];
         let mut machine =
-            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com)
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
                 .unwrap();
         let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
         assert_eq!(reason, StopReason::DosExit { code: 7 });
@@ -3388,7 +3388,7 @@ mod tests {
         // org 0x100: mov ah,0x30 (unhandled); int 21; mov ax,4c00; int 21
         let com: &[u8] = &[0xb4, 0x30, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21];
         let mut machine =
-            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com)
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
                 .unwrap();
         let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
         assert_eq!(reason, StopReason::DosExit { code: 0 });
@@ -3425,7 +3425,7 @@ mod tests {
     #[test]
     fn dos_com_runs_the_committed_hello_fixture() {
         let mut machine = Machine::new_dos_program(
-            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
             izarravm_firmware::HELLO_COM,
         )
         .unwrap();
@@ -3441,7 +3441,7 @@ mod tests {
         // the relocation (otherwise DS is the link-time base and the bytes
         // diverge), so this doubles as the end-to-end relocation check.
         let mut machine = Machine::new_dos_program(
-            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
             izarravm_firmware::EXEHELLO_EXE,
         )
         .unwrap();
@@ -3461,7 +3461,7 @@ mod tests {
         ];
 
         let mut available =
-            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com)
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
                 .unwrap();
         available.set_dos_stdin(b"X");
         assert_eq!(
@@ -3471,7 +3471,7 @@ mod tests {
         assert_eq!(available.dos_output(), b"X"); // char path taken, AL echoed
 
         let mut empty =
-            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com)
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
                 .unwrap();
         assert_eq!(
             empty.run_until_halt_or_cycles(100_000).unwrap(),
@@ -3487,7 +3487,7 @@ mod tests {
             0xb4, 0x01, 0xcd, 0x21, 0xb4, 0x01, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21,
         ];
         let mut machine =
-            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com)
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
                 .unwrap();
         machine.set_dos_stdin(b"hi");
         assert_eq!(
@@ -3562,7 +3562,7 @@ mod tests {
     #[test]
     fn dos_com_runs_the_committed_echo_fixture() {
         let mut machine = Machine::new_dos_program(
-            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
             izarravm_firmware::ECHO_COM,
         )
         .unwrap();
@@ -3580,7 +3580,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("HELLO.TXT"), b"File data 123").unwrap();
         let mut machine = Machine::new_dos_program(
-            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
             izarravm_firmware::TYPE_COM,
         )
         .unwrap();
@@ -3706,7 +3706,7 @@ mod tests {
             0xf4, // hlt
         ]);
         let mut machine =
-            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
         assert_eq!(
             machine.run_until_halt_or_cycles(1_000_000).unwrap(),
             StopReason::Halted
@@ -3738,7 +3738,7 @@ mod tests {
             0xf4, // hlt
         ]);
         let mut machine =
-            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
         assert_eq!(
             machine.run_until_halt_or_cycles(1_000_000).unwrap(),
             StopReason::Halted
@@ -3852,7 +3852,7 @@ mod tests {
             0xf4, // hlt
         ]);
         let mut machine =
-            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
         machine.write_guest_block(0x40000, &[0xFF; 32]); // two solid glyphs
         // Display cell 0 = 'A', white on black.
         machine.write_physical_u8(VGA_TEXT_BASE, 0x41);
@@ -3886,7 +3886,7 @@ mod tests {
             0xf4, // hlt
         ]);
         let mut machine =
-            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
         machine.write_guest_block(0x40000, &[0x00; 16]); // a blank glyph for 0xDB
         machine.write_physical_u8(VGA_TEXT_BASE, 0xDB);
         machine.write_physical_u8(VGA_TEXT_BASE + 1, 0x0F);
@@ -3917,7 +3917,7 @@ mod tests {
             0xf4, // hlt
         ]);
         let mut machine =
-            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
         // A solid glyph for 'A' at the first 16 bytes; the rest of the 64 KB
         // page stays zero, so capping the read also proves only the real glyph
         // data is consulted.
@@ -4131,7 +4131,7 @@ mod tests {
         // mov ax, 0012h; int 10h; hlt
         let rom = rom_with_code(&[0xb8, 0x12, 0x00, 0xcd, 0x10, 0xf4]);
         let mut machine =
-            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
 
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
         assert_eq!(reason, StopReason::Halted);
@@ -4168,7 +4168,7 @@ mod tests {
             0xb8, 0x13, 0x00, 0xcd, 0x10, 0xb8, 0x03, 0x00, 0xcd, 0x10, 0xf4,
         ]);
         let mut machine =
-            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
 
         // Stamp a recognizable pattern into the text buffer before the toggles.
         machine.video_mut().write_u8(0, b'X').unwrap();
@@ -4198,7 +4198,7 @@ mod tests {
         // mov ax,0b00h; mov bx,0005h; int 10h; hlt  (AH=0Bh, BH=0 border, BL=5)
         let rom = rom_with_code(&[0xb8, 0x00, 0x0b, 0xbb, 0x05, 0x00, 0xcd, 0x10, 0xf4]);
         let mut machine =
-            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
 
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
         assert_eq!(reason, StopReason::Halted);
@@ -4210,7 +4210,7 @@ mod tests {
         // mov ax,0501h; int 10h; hlt  (AH=05h, AL=1 -> display page 1)
         let rom = rom_with_code(&[0xb8, 0x01, 0x05, 0xcd, 0x10, 0xf4]);
         let mut machine =
-            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
 
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
         assert_eq!(reason, StopReason::Halted);
@@ -4239,7 +4239,7 @@ mod tests {
         //   hlt
         let rom = rom_with_code(&[0xb8, 0x01, 0x05, 0xcd, 0x10, 0xf4]);
         let mut machine =
-            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
 
         // Page 0 cell 0 = 'A'; page 1 cell 0 (cell 2048, byte 4096) = 'Z'.
         let video = machine.video_mut();
@@ -4272,7 +4272,7 @@ mod tests {
         // mov ax,1000h; mov bx,0901h; int 10h; hlt  (AH=10h AL=00, BL=1, BH=9)
         let rom = rom_with_code(&[0xb8, 0x00, 0x10, 0xbb, 0x01, 0x09, 0xcd, 0x10, 0xf4]);
         let mut machine =
-            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
 
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
         assert_eq!(reason, StopReason::Halted);
@@ -4288,7 +4288,7 @@ mod tests {
             0xf4,
         ]);
         let mut machine =
-            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
 
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
         assert_eq!(reason, StopReason::Halted);
@@ -4304,7 +4304,7 @@ mod tests {
             0xb9, 0x03, 0x00, 0xcd, 0x10, 0xf4,
         ]);
         let mut machine =
-            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
 
         // The three triples at 0x10000: red, green, blue.
         for (i, &b) in [63u8, 0, 0, 0, 63, 0, 0, 0, 63].iter().enumerate() {
@@ -4327,7 +4327,7 @@ mod tests {
             0xb9, 0x03, 0x00, 0xcd, 0x10, 0xf4,
         ]);
         let mut machine =
-            Machine::new(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), rom).unwrap();
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
 
         // Seed DAC entries 10/11/12 with known values, then let the readback run.
         machine.video_mut().set_dac_entry(10, 12, 34, 56);
@@ -4722,7 +4722,7 @@ mod tests {
             0x00, 0x4c, 0xcd, 0x21,
         ];
         let mut machine =
-            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com)
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
                 .unwrap();
         let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
         assert_eq!(reason, StopReason::DosExit { code: 0 });
@@ -5065,7 +5065,7 @@ mod tests {
         ];
         let dir = tempfile::tempdir().unwrap();
         let mut machine =
-            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com)
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
                 .unwrap();
         machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
@@ -5109,7 +5109,7 @@ mod tests {
         std::fs::write(dir.path().join("ONE.TXT"), b"a").unwrap();
         std::fs::write(dir.path().join("TWO.TXT"), b"bb").unwrap();
         let mut machine =
-            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com)
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
                 .unwrap();
         machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
@@ -5348,11 +5348,9 @@ mod tests {
     fn dos_program_execs_a_child_and_reads_its_return_code() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("CHILD.COM"), CHILD_COM).unwrap();
-        let mut machine = Machine::new_dos_program(
-            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
-            PARENT_COM,
-        )
-        .unwrap();
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), PARENT_COM)
+                .unwrap();
         machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
         let reason = machine.run_until_halt_or_cycles(2_000_000).unwrap();
         assert_eq!(reason, StopReason::DosExit { code: 0 });
@@ -5368,11 +5366,9 @@ mod tests {
     fn dos_child_terminating_via_int20_resumes_parent() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("CHILD.COM"), CHILD20_COM).unwrap();
-        let mut machine = Machine::new_dos_program(
-            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
-            PARENT_COM,
-        )
-        .unwrap();
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), PARENT_COM)
+                .unwrap();
         machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
         let reason = machine.run_until_halt_or_cycles(2_000_000).unwrap();
         assert_eq!(reason, StopReason::DosExit { code: 0 });
@@ -5385,7 +5381,7 @@ mod tests {
     fn dos_failed_exec_leaves_parent_running() {
         let dir = tempfile::tempdir().unwrap();
         let mut machine = Machine::new_dos_program(
-            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
             FAILPARENT_COM,
         )
         .unwrap();
@@ -5400,7 +5396,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("OV.BIN"), [b'Z']).unwrap();
         let mut machine = Machine::new_dos_program(
-            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
             OVPARENT_COM,
         )
         .unwrap();
@@ -5490,7 +5486,7 @@ mod tests {
         // A trivial exit-only program is enough: the env is seeded at load.
         let com: &[u8] = &[0xb8, 0x00, 0x4c, 0xcd, 0x21];
         let machine =
-            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com)
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
                 .unwrap();
         let env_seg = psp_env_segment(&machine);
         assert_ne!(env_seg, 0, "PSP:0x2C must name the env segment");
@@ -5522,7 +5518,7 @@ mod tests {
             0xb4, 0x40, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21,
         ];
         let mut machine =
-            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com)
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
                 .unwrap();
         let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
         assert_eq!(reason, StopReason::DosExit { code: 0 });
@@ -5533,7 +5529,7 @@ mod tests {
     fn dos_env_block_carries_the_configured_routing() {
         // A non-default routing (IRQ7 / DMA3) flows from the host config through
         // the loader into the env block a guest scans via PSP:0x2C.
-        let mut profile = MachineProfile::i386dx25(16, VideoCard::Et4000Ax);
+        let mut profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         profile.sound_blaster = SoundBlasterConfig {
             enabled: true,
             irq: SbIrq::I7,
@@ -5561,7 +5557,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("CHILD.COM"), ENV_CHILD_COM).unwrap();
         let mut machine = Machine::new_dos_program(
-            MachineProfile::i386dx25(16, VideoCard::Et4000Ax),
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
             ENV_PARENT_COM,
         )
         .unwrap();
@@ -5573,7 +5569,7 @@ mod tests {
 
     #[test]
     fn keyboard_rom_echoes_injected_keys_to_the_screen() {
-        let profile = MachineProfile::i386dx25(1, izarravm_core::VideoCard::Et4000Ax);
+        let profile = MachineProfile::gsw_386(1, izarravm_core::VideoCard::Et4000Ax);
         let mut machine = Machine::new(profile, izarravm_firmware::kbd_bios()).unwrap();
         // Let the ROM run its init (install vectors, unmask IRQ1, STI, enter loop).
         machine.run_until_halt_or_cycles(200_000).unwrap();
@@ -5594,7 +5590,7 @@ mod tests {
         // org 0x100: jmp $  (EB FE)
         let com: &[u8] = &[0xeb, 0xfe];
         let mut machine =
-            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com)
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
                 .unwrap();
         machine.inject_key_scancodes(&[0x1e, 0x9e]); // 'a' make + break
         machine.run_until_halt_or_cycles(200_000).unwrap();
@@ -5612,7 +5608,7 @@ mod tests {
             0xb4, 0x01, 0xcd, 0x21, 0xb4, 0x01, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21,
         ];
         let mut machine =
-            Machine::new_dos_program(MachineProfile::i386dx25(16, VideoCard::Et4000Ax), com)
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
                 .unwrap();
         // Type 'h' then 'i' as Set 1 make+break (H=0x23, I=0x17).
         machine.inject_key_scancodes(&[0x23, 0xa3, 0x17, 0x97]);

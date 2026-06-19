@@ -29,53 +29,53 @@ pub enum ConfigError {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CpuPreset {
-    #[serde(rename = "i386dx_25")]
+pub enum GswMode {
+    #[serde(rename = "386")]
+    Gsw386,
+    #[serde(rename = "486")]
+    Gsw486,
+    #[serde(rename = "586")]
     #[default]
-    I386Dx25,
-    #[serde(rename = "i486dx2_66")]
-    I486Dx2_66,
-    #[serde(rename = "pentium_133")]
-    Pentium133,
-    #[serde(rename = "pentium_mmx_233")]
-    PentiumMmx233,
+    Gsw586,
 }
 
-impl CpuPreset {
+impl GswMode {
+    /// The throttled core clock per compatibility mode: 25 MHz (386 mode), 66 MHz
+    /// (486 mode), and 266 MHz native (the K6-266 bin on the 66 MHz bus).
     pub const fn clock_hz(self) -> u64 {
         match self {
-            Self::I386Dx25 => 25_000_000,
-            Self::I486Dx2_66 => 66_000_000,
-            Self::Pentium133 => 133_000_000,
-            Self::PentiumMmx233 => 233_000_000,
+            Self::Gsw386 => 25_000_000,
+            Self::Gsw486 => 66_000_000,
+            Self::Gsw586 => 266_000_000,
         }
     }
 
     pub const fn canonical_name(self) -> &'static str {
         match self {
-            Self::I386Dx25 => "i386dx_25",
-            Self::I486Dx2_66 => "i486dx2_66",
-            Self::Pentium133 => "pentium_133",
-            Self::PentiumMmx233 => "pentium_mmx_233",
+            Self::Gsw386 => "386",
+            Self::Gsw486 => "486",
+            Self::Gsw586 => "586",
         }
     }
 }
 
-impl fmt::Display for CpuPreset {
+impl fmt::Display for GswMode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.canonical_name())
     }
 }
 
-impl FromStr for CpuPreset {
+impl FromStr for GswMode {
     type Err = ConfigError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match normalize(value).as_str() {
-            "i386dx25" | "i386dx_25" | "386dx25" | "386_25" => Ok(Self::I386Dx25),
-            "i486dx266" | "i486dx2_66" | "486dx266" | "486dx2_66" => Ok(Self::I486Dx2_66),
-            "pentium133" | "pentium_133" | "p133" => Ok(Self::Pentium133),
-            "pentiummmx233" | "pentium_mmx_233" | "pmmx233" => Ok(Self::PentiumMmx233),
+            // Primary GSW names plus legacy Intel aliases so old configs parse.
+            "386" | "gsw386" | "386dx25" | "i386dx25" | "i386dx_25" | "386_25" => Ok(Self::Gsw386),
+            "486" | "gsw486" | "486dx266" | "i486dx266" | "i486dx2_66" | "486dx2_66" => {
+                Ok(Self::Gsw486)
+            }
+            "586" | "gsw586" => Ok(Self::Gsw586),
             _ => Err(ConfigError::UnknownPreset {
                 kind: "CPU",
                 value: value.to_owned(),
@@ -403,7 +403,7 @@ impl AppConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MachineConfig {
-    pub cpu: CpuPreset,
+    pub cpu: GswMode,
     pub memory_mib: u16,
     pub video: VideoCard,
 }
@@ -411,7 +411,7 @@ pub struct MachineConfig {
 impl Default for MachineConfig {
     fn default() -> Self {
         Self {
-            cpu: CpuPreset::I386Dx25,
+            cpu: GswMode::Gsw586,
             memory_mib: 16,
             video: VideoCard::Et4000Ax,
         }
@@ -527,7 +527,7 @@ pub struct DiagnosticsConfig {
 
 #[derive(Debug, Clone, Default)]
 pub struct ConfigOverrides {
-    pub cpu: Option<CpuPreset>,
+    pub cpu: Option<GswMode>,
     pub memory_mib: Option<u16>,
     pub video: Option<VideoCard>,
     pub c_drive: Option<PathBuf>,
@@ -540,7 +540,7 @@ pub struct ConfigOverrides {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HardwareProfile {
-    pub cpu: CpuPreset,
+    pub cpu: GswMode,
     pub clock_hz: u64,
     pub memory_mib: u16,
     pub video: VideoCard,
@@ -578,16 +578,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cpu_presets_parse_common_aliases() {
-        assert_eq!("386dx25".parse::<CpuPreset>().unwrap(), CpuPreset::I386Dx25);
-        assert_eq!(
-            "486dx2-66".parse::<CpuPreset>().unwrap(),
-            CpuPreset::I486Dx2_66
-        );
-        assert_eq!(
-            "pentium_mmx_233".parse::<CpuPreset>().unwrap(),
-            CpuPreset::PentiumMmx233
-        );
+    fn gsw_mode_clocks_and_names() {
+        assert_eq!(GswMode::Gsw386.clock_hz(), 25_000_000);
+        assert_eq!(GswMode::Gsw486.clock_hz(), 66_000_000);
+        assert_eq!(GswMode::Gsw586.clock_hz(), 266_000_000);
+        assert_eq!(GswMode::Gsw586.canonical_name(), "586");
+        assert_eq!(GswMode::default(), GswMode::Gsw586);
+    }
+
+    #[test]
+    fn gsw_mode_parses_primary_and_legacy_names() {
+        assert_eq!("386".parse::<GswMode>().unwrap(), GswMode::Gsw386);
+        assert_eq!("486".parse::<GswMode>().unwrap(), GswMode::Gsw486);
+        assert_eq!("586".parse::<GswMode>().unwrap(), GswMode::Gsw586);
+        assert_eq!("i386dx_25".parse::<GswMode>().unwrap(), GswMode::Gsw386);
+        assert!("pentium_133".parse::<GswMode>().is_err());
     }
 
     #[test]
@@ -610,7 +615,7 @@ mod tests {
     fn applies_cli_style_overrides() {
         let mut config = AppConfig::default();
         config.apply_overrides(ConfigOverrides {
-            cpu: Some(CpuPreset::Pentium133),
+            cpu: Some(GswMode::Gsw386),
             memory_mib: Some(32),
             video: Some(VideoCard::S3VirgeDx),
             c_drive: Some(PathBuf::from("games")),
@@ -621,7 +626,7 @@ mod tests {
             sb_high_dma: Some(SbDma16::D6),
         });
 
-        assert_eq!(config.machine.cpu, CpuPreset::Pentium133);
+        assert_eq!(config.machine.cpu, GswMode::Gsw386);
         assert_eq!(config.machine.memory_mib, 32);
         assert_eq!(config.machine.video, VideoCard::S3VirgeDx);
         assert_eq!(config.dos.c_drive, PathBuf::from("games"));
@@ -652,7 +657,7 @@ mod tests {
             &path,
             r#"
                 [machine]
-                cpu = "i386dx_25"
+                cpu = "386"
                 memory_mib = 16
                 video = "et4000_ax"
             "#,
@@ -696,7 +701,7 @@ mod tests {
             &path,
             r#"
                 [machine]
-                cpu = "i386dx_25"
+                cpu = "386"
                 memory_mib = 16
                 video = "et4000_ax"
             "#,
@@ -704,7 +709,7 @@ mod tests {
         .unwrap();
 
         let config = AppConfig::from_toml_path(path).unwrap();
-        assert_eq!(config.machine.cpu, CpuPreset::I386Dx25);
+        assert_eq!(config.machine.cpu, GswMode::Gsw386);
         assert_eq!(config.machine.video, VideoCard::Et4000Ax);
         assert_eq!(config.dos.c_drive, PathBuf::from("."));
     }
