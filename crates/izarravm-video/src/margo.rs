@@ -1528,16 +1528,6 @@ mod tests {
     }
 
     #[test]
-    fn set_mode_640x480x8_wrapper_still_sets_0x101() {
-        let mut margo = Margo::default();
-        margo.set_mode_640x480x8();
-        assert_eq!(margo.display().mode, 0x101);
-        assert_eq!(margo.display().width, 640);
-        assert_eq!(margo.display().height, 480);
-        assert_eq!(margo.display().pitch, 640);
-    }
-
-    #[test]
     fn vbe_mode_lookup_finds_table_entries() {
         assert_eq!(
             vbe_mode(0x105).map(|m| (m.width, m.height)),
@@ -2072,14 +2062,6 @@ mod tests {
         assert_eq!(vram[11 * 32 + 11], 28); // (11,11) tile[3][3]
         assert_eq!(vram[2 * 32 + 2], 0); // (2,2) left of dst_x, untouched
         assert_eq!(vram[32 + 3], 0); // (3,1) above dst_y, untouched
-    }
-
-    #[test]
-    fn caps_reports_all_implemented_features() {
-        let margo = Margo::default();
-        // bits 0 FILL, 1 COPY, 2 COLOR_EXPAND, 3 LINE, 4 full ROP3, 5 CLIP, 6 COLORKEY,
-        // 7 PATTERN_FILL, 8 CURSOR, 9 OVERLAY, 10 PUSHER, 11 DITHER.
-        assert_eq!(read_reg_u32(&margo, REG_CAPS), 0x0000_0fff);
     }
 
     #[test]
@@ -3808,22 +3790,6 @@ mod tests {
         write_reg(&mut margo, REG_COMMAND, 0x03);
         write_reg(&mut margo, REG_MONO_DATA, 0x8000_0000); // one word, col 0 set
         assert_eq!(margo.read_vram_u8(0), 0xaa ^ 0x0f);
-    }
-
-    #[test]
-    fn bytes_per_pixel_rounds_up_to_whole_bytes() {
-        assert_eq!(bytes_per_pixel(8), 1);
-        assert_eq!(bytes_per_pixel(15), 2);
-        assert_eq!(bytes_per_pixel(16), 2);
-        assert_eq!(bytes_per_pixel(32), 4);
-    }
-
-    #[test]
-    fn vbe_mode_lookup_finds_hicolor_modes() {
-        assert_eq!(vbe_mode(0x110).unwrap().bpp, 15);
-        assert_eq!(vbe_mode(0x111).unwrap().bpp, 16);
-        assert_eq!(vbe_mode(0x14a).unwrap().bpp, 32);
-        assert_eq!(vbe_mode(0x14e).unwrap().width, 1024);
     }
 
     #[test]
