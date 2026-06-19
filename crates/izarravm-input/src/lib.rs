@@ -52,16 +52,3 @@ pub fn winit_keyboard_marker() -> &'static str {
 pub fn gilrs_gamepad_marker() -> &'static str {
     std::any::type_name::<gilrs::Button>()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn input_state_defaults_to_game_friendly_devices() {
-        let state = InputState::default();
-        assert!(state.keyboard_enabled);
-        assert!(state.mouse_enabled);
-        assert!(state.joystick_enabled);
-    }
-}

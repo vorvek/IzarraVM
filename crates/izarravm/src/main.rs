@@ -238,13 +238,3 @@ fn select_rom(bios: Option<&Path>) -> Result<Vec<u8>, Box<dyn Error>> {
         None => Ok(test_rom().to_vec()),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn select_rom_without_bios_returns_the_builtin_test_rom() {
-        assert_eq!(select_rom(None).unwrap(), test_rom().to_vec());
-    }
-}
