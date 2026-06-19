@@ -18,9 +18,12 @@ fn run_post() -> Vec<SuiteRecord> {
     let stop = machine
         .run_until_halt_or_cycles(5_000_000)
         .expect("run POST");
-    // POST ends at the BIOS idle halt with no wake source armed, so a clean
-    // Halted stop means the whole step table ran and the result block is final.
-    assert_eq!(stop, StopReason::Halted, "POST should run to the idle halt");
+    // POST runs the whole step table and then the BIOS idles (it keeps running
+    // rather than halting), so the budget is reached with the result block final.
+    assert!(
+        matches!(stop, StopReason::CycleLimit { .. }),
+        "POST completes and the BIOS idles"
+    );
     let results =
         parse_result_block(machine.memory().as_slice()).expect("parse the VDTS result block");
     results.records

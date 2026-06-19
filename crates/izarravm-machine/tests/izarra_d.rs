@@ -32,14 +32,17 @@ fn boot_machine() -> Machine {
 }
 
 #[test]
-fn setup_skipped_without_hotkey_boots_and_halts() {
+fn setup_skipped_without_hotkey_boots_and_idles() {
     let mut machine = boot_machine();
     // No hotkey: inject an ordinary key so the keyboard path is exercised, then run.
     // The setup window peeks, sees no Del, and the BIOS boots straight to its idle
-    // halt. With IRQ0 masked there is no timer wake, so the run ends in Halted.
+    // loop, which keeps running, so the run reaches the cycle budget.
     machine.inject_key_scancodes(&[A_MAKE, A_BREAK]);
     let reason = machine.run_until_halt_or_cycles(12_000_000).unwrap();
-    assert_eq!(reason, StopReason::Halted, "BIOS reaches the idle halt");
+    assert!(
+        matches!(reason, StopReason::CycleLimit { .. }),
+        "BIOS boots and idles"
+    );
     assert_eq!(
         machine.active_mode(),
         GswMode::Gsw386,
@@ -66,7 +69,10 @@ fn setup_save_applies_chosen_gsw_mode() {
         F10_BREAK, // Save
     ]);
     let reason = machine.run_until_halt_or_cycles(12_000_000).unwrap();
-    assert_eq!(reason, StopReason::Halted, "setup saves then boots to halt");
+    assert!(
+        matches!(reason, StopReason::CycleLimit { .. }),
+        "setup saves then boots and idles"
+    );
     assert_eq!(
         machine.active_mode(),
         GswMode::Gsw586,
@@ -88,7 +94,10 @@ fn setup_discard_keeps_boot_mode() {
         ESC_BREAK, // Discard
     ]);
     let reason = machine.run_until_halt_or_cycles(12_000_000).unwrap();
-    assert_eq!(reason, StopReason::Halted, "discard still boots to halt");
+    assert!(
+        matches!(reason, StopReason::CycleLimit { .. }),
+        "discard still boots and idles"
+    );
     assert_eq!(
         machine.active_mode(),
         GswMode::Gsw386,

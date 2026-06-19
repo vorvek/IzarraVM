@@ -100,12 +100,13 @@ enter_setup_or_boot:
     mov bl, COLOR_TITLE
     mov bh, COLOR_BG
     call gfx_text
-    ; Idle with interrupts enabled so a key (IRQ1) still wakes the BIOS. With no
-    ; wake source pending the CPU genuinely halts, so headless runs terminate.
+    ; POST is complete and there is no OS to boot yet, so keep the machine running
+    ; in an idle loop rather than halting. Halting would read as the self test
+    ; powering the computer off; the machine should stay on and ready. Interrupts
+    ; stay enabled so the keyboard path keeps working.
     sti
-.halt:
-    hlt
-    jmp .halt
+.idle:
+    jmp .idle
 str_ready: db 'SYSTEM READY', 0
 
 ; --- Unreal-mode flat access helpers ---------------------------------------

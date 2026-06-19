@@ -15,7 +15,10 @@ fn ramtest_result(memory_mib: u16) -> (SuiteRecordStatus, u32) {
     )
     .unwrap();
     let stop = machine.run_until_halt_or_cycles(5_000_000).unwrap();
-    assert_eq!(stop, StopReason::Halted, "POST runs to the idle halt");
+    assert!(
+        matches!(stop, StopReason::CycleLimit { .. }),
+        "POST completes and the BIOS idles (it does not halt)"
+    );
     let results = parse_result_block(machine.memory().as_slice()).unwrap();
     let ramtest = results
         .records

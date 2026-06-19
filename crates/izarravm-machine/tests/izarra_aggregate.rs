@@ -16,7 +16,10 @@ fn full_post_block_is_consistent_and_every_component_passes() {
     )
     .unwrap();
     let stop = machine.run_until_halt_or_cycles(5_000_000).unwrap();
-    assert_eq!(stop, StopReason::Halted, "POST runs to the idle halt");
+    assert!(
+        matches!(stop, StopReason::CycleLimit { .. }),
+        "POST completes and the BIOS idles (it does not halt)"
+    );
 
     // parse_result_block validates the additive checksum; the declared count must
     // equal the parsed count for the live-append header to be correct.

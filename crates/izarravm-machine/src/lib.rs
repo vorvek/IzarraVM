@@ -5862,7 +5862,8 @@ mod tests {
         let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
         let reason = machine.run_until_halt_or_cycles(5_000_000).unwrap();
-        assert_eq!(reason, StopReason::Halted);
+        // POST completes and the BIOS idles (it keeps running, not halting).
+        assert!(matches!(reason, StopReason::CycleLimit { .. }));
         let results = izarravm_firmware::parse_result_block(machine.memory().as_slice()).unwrap();
         // The live result builder owns the header: declared count must match the
         // parsed records and the additive checksum must validate (parse succeeded).
@@ -5892,7 +5893,7 @@ mod tests {
         let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
         machine.run_until_halt_or_cycles(5_000_000).unwrap();
-        // The CPU is halted with the banner drawn; advance the beam to scan a frame.
+        // The BIOS is idling with the console drawn; advance the beam to scan a frame.
         machine.advance_devices(600_000);
         let raster = machine.vga_raster().expect("mode 13h presents a VgaRaster");
         assert_eq!(raster.width, 320);
@@ -5921,12 +5922,11 @@ mod tests {
     fn izarra_bios_isr_enqueues_injected_key() {
         let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
-        // Run POST to the idle halt (the boot tail does sti; hlt). Injecting before
-        // PIC init would lose the pending IRQ to the BIOS's own 8259 re-program, so
-        // inject after the BIOS is parked at hlt with IF=1: the key (IRQ1) wakes the
-        // CPU, the installed INT 09h reads it and enqueues into the BDA ring.
-        let reason = machine.run_until_halt_or_cycles(5_000_000).unwrap();
-        assert_eq!(reason, StopReason::Halted);
+        // Run POST so the BIOS reaches its idle loop (past the setup hotkey window,
+        // which would otherwise drain the key). Then inject a key: IRQ1 reaches the
+        // installed INT 09h, which enqueues it into the BDA ring. The idle loop does
+        // not consume keys, so it stays there.
+        machine.run_until_halt_or_cycles(5_000_000).unwrap();
         machine.inject_key_scancodes(&[0x1e, 0x9e]);
         machine.run_until_halt_or_cycles(2_000_000).unwrap();
         let head = machine.memory_read_u16_for_test(0x41a);
