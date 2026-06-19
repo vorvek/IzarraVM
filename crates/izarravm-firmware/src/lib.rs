@@ -14,6 +14,8 @@ pub const EXEHELLO_EXE: &[u8] = include_bytes!("../roms/dos/exehello.exe");
 pub const EXEHELLO_EXE_SOURCE: &str = include_str!("../roms/dos/exehello.asm");
 pub const KBD_BIOS: &[u8] = include_bytes!("../roms/kbd-bios.bin");
 pub const KBD_BIOS_SOURCE: &str = include_str!("../roms/kbd-bios.asm");
+pub const KBD_RESIDENT_BIOS: &[u8] = include_bytes!("../roms/kbd-resident.bin");
+pub const KBD_RESIDENT_BIOS_SOURCE: &str = include_str!("../roms/kbd-resident.asm");
 
 pub const I386DX25_TEST_ROM_SIZE: usize = 64 * 1024;
 pub const X86_BOOT_TEST_IMAGE_SIZE: usize = 1440 * 1024;
@@ -26,6 +28,10 @@ pub fn test_rom() -> &'static [u8] {
 
 pub fn kbd_bios() -> &'static [u8] {
     KBD_BIOS
+}
+
+pub fn kbd_resident_bios() -> &'static [u8] {
+    KBD_RESIDENT_BIOS
 }
 
 pub fn boot_test_image() -> &'static [u8] {
@@ -197,6 +203,16 @@ mod tests {
     #[test]
     fn kbd_bios_is_64k() {
         assert_eq!(KBD_BIOS.len(), I386DX25_TEST_ROM_SIZE);
+    }
+
+    #[test]
+    fn kbd_resident_header_offsets_are_in_bounds() {
+        let image = super::KBD_RESIDENT_BIOS;
+        let int09 = u16::from_le_bytes([image[0], image[1]]) as usize;
+        let int16 = u16::from_le_bytes([image[2], image[3]]) as usize;
+        assert!(int09 >= 4 && int09 < image.len(), "int09 offset in image");
+        assert!(int16 >= 4 && int16 < image.len(), "int16 offset in image");
+        assert!(image.len() < 4096, "resident BIOS stays small");
     }
 
     #[test]
