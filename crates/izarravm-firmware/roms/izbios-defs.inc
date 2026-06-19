@@ -37,15 +37,21 @@
 ; Setup hotkey: Del (AT scancode set 1 make code), per Phase 0 decision 5.
 %define SETUP_HOTKEY   0x53
 
-; Status panel layout (mode 13h pixels, 8x8 glyphs).
+; Boot-console layout (mode 13h pixels, 8x8 glyphs). The POST draws a text boot
+; log: a title row, then one line per step with its name and OK/FAIL/value.
 %define STATUS_X       8
 %define STATUS_TITLE_Y 8
-%define STATUS_Y       24
-%define STATUS_LINE_DY 10
-%define COLOR_BG       0x00        ; black
-%define COLOR_TITLE    0x0f        ; white
-%define COLOR_PASS     0x0a        ; bright green
-%define COLOR_FAIL     0x0c        ; bright red
+%define STATUS_Y       24            ; first log row
+%define STATUS_LINE_DY 8             ; row pitch (one glyph tall, packed)
+%define STATUS_VALUE_X 200           ; column for OK / FAIL / measure value
+%define COLOR_BG       0x00          ; black
+%define COLOR_TITLE    0x0f          ; white
+%define COLOR_INFO     0x07          ; light grey (step name)
+%define COLOR_PASS     0x0a          ; bright green
+%define COLOR_FAIL     0x0c          ; bright red
+%define COLOR_MEASURE  0x0b          ; bright cyan (measure value)
+; The console row Y advances here as each line is drawn (foundation scratch word).
+%define CONSOLE_ROW_Y  BIOS_SCRATCH
 
 ; --- Scratch RAM map (segment 0). ROM writes are dropped by the bus, so all
 ; mutable state lives here. Each region is disjoint and owned by one stream;

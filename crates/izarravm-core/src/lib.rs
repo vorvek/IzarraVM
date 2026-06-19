@@ -412,7 +412,7 @@ impl Default for MachineConfig {
     fn default() -> Self {
         Self {
             cpu: GswMode::Gsw386,
-            memory_mib: 16,
+            memory_mib: 24, // Izarra 3000: 24 MB, 3 x 8 MB DIMMs
             video: VideoCard::Et4000Ax,
         }
     }

@@ -38,7 +38,7 @@ fn setup_skipped_without_hotkey_boots_and_halts() {
     // The setup window peeks, sees no Del, and the BIOS boots straight to its idle
     // halt. With IRQ0 masked there is no timer wake, so the run ends in Halted.
     machine.inject_key_scancodes(&[A_MAKE, A_BREAK]);
-    let reason = machine.run_until_halt_or_cycles(5_000_000).unwrap();
+    let reason = machine.run_until_halt_or_cycles(12_000_000).unwrap();
     assert_eq!(reason, StopReason::Halted, "BIOS reaches the idle halt");
     assert_eq!(
         machine.active_mode(),
@@ -65,7 +65,7 @@ fn setup_save_applies_chosen_gsw_mode() {
         F10_MAKE,
         F10_BREAK, // Save
     ]);
-    let reason = machine.run_until_halt_or_cycles(5_000_000).unwrap();
+    let reason = machine.run_until_halt_or_cycles(12_000_000).unwrap();
     assert_eq!(reason, StopReason::Halted, "setup saves then boots to halt");
     assert_eq!(
         machine.active_mode(),
@@ -87,7 +87,7 @@ fn setup_discard_keeps_boot_mode() {
         ESC_MAKE,
         ESC_BREAK, // Discard
     ]);
-    let reason = machine.run_until_halt_or_cycles(5_000_000).unwrap();
+    let reason = machine.run_until_halt_or_cycles(12_000_000).unwrap();
     assert_eq!(reason, StopReason::Halted, "discard still boots to halt");
     assert_eq!(
         machine.active_mode(),
@@ -110,11 +110,11 @@ fn setup_save_then_setup_draws_mode13h() {
         F10_MAKE,
         F10_BREAK,
     ]);
-    machine.run_until_halt_or_cycles(5_000_000).unwrap();
+    machine.run_until_halt_or_cycles(12_000_000).unwrap();
     // Save switched the live mode to 486 (66 MHz), so a full mode-13h frame takes
     // more CPU clocks to scan than at the 386 boot clock. Advance generously so the
     // raster engine completes at least one frame before the snapshot.
-    machine.advance_devices_clocks(15_000_000);
+    machine.advance_devices_clocks(112_000_000);
     let raster = machine
         .vga_raster()
         .expect("the setup page leaves mode 13h presented");

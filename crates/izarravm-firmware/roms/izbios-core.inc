@@ -59,6 +59,7 @@ bios_start:
 ; dw name_ptr, dw handler_ptr. Append a BEGIN suite record, then for each step
 ; call the handler (DS = BDA on entry) and append its result by name.
 run_post:
+    call console_init           ; mode 13h boot console + title (the main window)
     mov al, RESULT_BEGIN
     mov si, str_suite_name
     call result_append          ; BEGIN suite.izarra
@@ -76,6 +77,7 @@ run_post:
     xor cx, cx
     mov ds, cx                  ; DS = 0 for result_append
     pop si                      ; name pointer
+    call console_step_line      ; draw the boot-log line (status AL, value DX)
     inc al                      ; map HRES_* (0/1/2) -> RESULT_* (1/2/3)
     call result_append
     pop bx
@@ -84,16 +86,17 @@ run_post:
 .done:
     ret
 
-; --- Boot / halt tail (foundation default; final boot path is a later task) --
+; --- Boot / halt tail. The boot console is already on screen from run_post, so
+; append a final ready line at the next row rather than clearing it. --
 enter_setup_or_boot:
-    call set_mode13h
-    mov al, COLOR_BG
-    call gfx_clear
+    xor ax, ax
+    mov ds, ax
+    mov ax, [CONSOLE_ROW_Y]     ; next free console row
+    add ax, STATUS_LINE_DY      ; leave one blank line above the message
+    mov di, STATUS_X
     push cs
     pop ds                      ; DS = CS so DS:SI reaches the ROM string
     mov si, str_ready
-    mov di, STATUS_X
-    mov ax, STATUS_TITLE_Y
     mov bl, COLOR_TITLE
     mov bh, COLOR_BG
     call gfx_text
@@ -103,7 +106,7 @@ enter_setup_or_boot:
 .halt:
     hlt
     jmp .halt
-str_ready: db 'IZARRA 3000 READY', 0
+str_ready: db 'SYSTEM READY', 0
 
 ; --- Unreal-mode flat access helpers ---------------------------------------
 ; unreal_init: enter protected mode briefly, widen FS to a 4 GB flat segment,

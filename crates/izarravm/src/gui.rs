@@ -333,10 +333,9 @@ impl GuiApp {
         } else {
             None
         };
-        let title = format!(
-            "IzarraVM - {} / {} MiB / {}",
-            profile.cpu, profile.memory_mib, profile.video
-        );
+        // The machine details (CPU, memory) live in the controls panel; the window
+        // title stays the product name.
+        let title = String::from("IzarraVM");
         let mut app = Self {
             profile,
             rom,

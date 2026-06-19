@@ -216,6 +216,90 @@ status_panel_draw:
     ret
 str_post_title: db 'IZARRA 3000 POST', 0
 
+; console_init: enter mode 13h, clear, draw the boot-console title, and reset the
+; console row. Called once at the start of POST so the main window shows a boot log.
+console_init:
+    call set_mode13h
+    mov al, COLOR_BG
+    call gfx_clear
+    push cs
+    pop ds
+    mov si, str_console_title
+    mov di, STATUS_X
+    mov ax, STATUS_TITLE_Y
+    mov bl, COLOR_TITLE
+    mov bh, COLOR_BG
+    call gfx_text
+    xor ax, ax
+    mov ds, ax
+    mov word [CONSOLE_ROW_Y], STATUS_Y
+    ret
+str_console_title: db 'IZARRA 3000 BIOS   POWER-ON SELF TEST', 0
+
+; console_step_line: draw one boot-log line and advance the console row. SI = step
+; name (CS-relative ROM ptr), AL = handler status (HRES_PASS/FAIL/MEASURE), DX =
+; segment-0 offset of the ASCIIZ value (MEASURE only). CL, DX, SI and BP survive
+; gfx_text (its pusha/popa), so they carry state across the two draws. Preserves
+; all caller registers.
+console_step_line:
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    push bp
+    push ds
+    mov cl, al                  ; CL = status (survives gfx_text)
+    xor ax, ax
+    mov ds, ax
+    mov bp, [CONSOLE_ROW_Y]     ; BP = row Y (survives gfx_text)
+    push cs
+    pop ds                      ; DS = CS for the ROM name string
+    mov di, STATUS_X
+    mov ax, bp
+    mov bx, COLOR_INFO          ; bl = grey, bh = 0
+    call gfx_text               ; SI still = name afterward
+    cmp cl, HRES_MEASURE
+    je .measure
+    cmp cl, HRES_FAIL
+    je .fail
+    push cs
+    pop ds
+    mov si, str_ok
+    mov bx, COLOR_PASS
+    jmp .draw
+.fail:
+    push cs
+    pop ds
+    mov si, str_fail
+    mov bx, COLOR_FAIL
+    jmp .draw
+.measure:
+    xor ax, ax
+    mov ds, ax                  ; the value lives in segment 0
+    mov si, dx
+    mov bx, COLOR_MEASURE
+.draw:
+    mov di, STATUS_VALUE_X
+    mov ax, bp
+    call gfx_text
+    xor ax, ax
+    mov ds, ax
+    add bp, STATUS_LINE_DY
+    mov [CONSOLE_ROW_Y], bp
+    pop ds
+    pop bp
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+str_ok:   db 'OK', 0
+str_fail: db 'FAIL', 0
+
 ; --- 8x8 CP437 font (256 glyphs, 8 bytes each) copied from VGAFONT_8X8. ------
 bios_font:
     db 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7e, 0x81, 0xa5, 0x81, 0xbd, 0x99, 0x81, 0x7e

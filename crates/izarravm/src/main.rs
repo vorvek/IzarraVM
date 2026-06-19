@@ -128,7 +128,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let rom = match cli.bios.as_deref() {
         Some(path) => std::fs::read(path)?,
-        None => izarravm_firmware::kbd_bios().to_vec(),
+        None => izarravm_firmware::izarra_bios().to_vec(),
     };
     // The PC speaker is always-present motherboard hardware, so the host audio
     // output is opened regardless of which sound cards are enabled. AudioPlayer
