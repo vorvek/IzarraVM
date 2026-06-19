@@ -11,6 +11,7 @@ use izarravm_video::{
 use thiserror::Error;
 
 mod dma;
+mod floppy;
 mod keyboard;
 mod pic;
 mod pit;
@@ -207,6 +208,9 @@ pub struct Machine {
     elapsed_clocks: u64,
     // Parent CPU snapshots for EXEC (AH=4Bh AL=0); popped on child exit.
     program_frames: Vec<ProgramFrame>,
+    // Mounted A: floppy image, geometry inferred from the image length. INT 13h
+    // disk services read and write it; None means the drive is empty.
+    floppy: Option<floppy::Floppy>,
 }
 
 /// Build the CT1745 mixer from the profile's Sound Blaster power-on routing.
@@ -287,6 +291,7 @@ impl Machine {
             trace: BusTrace::default(),
             elapsed_clocks: 0,
             program_frames: Vec::new(),
+            floppy: None,
         };
         // The Margo LFB aperture is decoded before RAM, so system memory must
         // stay below it. Validated config caps memory far under this bound.
@@ -306,6 +311,21 @@ impl Machine {
         let mut machine = Self::base(profile, Cpu386::default(), rom.to_vec())?;
         install_boot_bios_stubs(&mut machine.memory)?;
         Ok(machine)
+    }
+
+    /// Mount a raw floppy image into drive A:. The geometry is derived from the
+    /// image length; an unrecognized size returns an error and leaves any
+    /// previously mounted image in place.
+    pub fn mount_floppy(&mut self, bytes: Vec<u8>) -> Result<(), String> {
+        self.floppy = Some(floppy::Floppy::from_image(bytes)?);
+        Ok(())
+    }
+
+    /// Eject the A: floppy, returning its current image bytes (including any
+    /// in-session writes) so the caller can flush them back to disk. Returns
+    /// None when the drive is empty.
+    pub fn eject_floppy(&mut self) -> Option<Vec<u8>> {
+        self.floppy.take().map(|f| f.bytes().to_vec())
     }
 
     pub fn new_boot_image(
