@@ -62,6 +62,17 @@ pub fn toka_dos_rom() -> &'static [u8] {
     TOKA_DOS_ROM
 }
 
+/// The Toka-DOS system files as owned (DOS 8.3 name, bytes) pairs, ready to hand
+/// to `izarravm_dos::toka_dos_install`. Parses the embedded ROM; panics only if
+/// the checked-in blob is malformed, which the fit test would already catch.
+pub fn toka_dos_system_files() -> Vec<(String, Vec<u8>)> {
+    toka_rom::files(TOKA_DOS_ROM)
+        .expect("embedded tokados.rom is well formed")
+        .into_iter()
+        .map(|file| (file.name, file.data.to_vec()))
+        .collect()
+}
+
 /// Reader for the packed Toka-DOS ROM. The format is a small table of contents
 /// followed by concatenated file data:
 ///

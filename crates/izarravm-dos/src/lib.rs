@@ -84,11 +84,66 @@ pub fn resolve_c_root() -> PathBuf {
     resolve_c_root_in(&base, &home)
 }
 
-/// Build Toka-DOS into the C: root if it is absent. Toka-DOS is not built yet,
-/// so this is a no-op for now. When Toka-DOS exists, lay it down here if a
-/// marker file is missing.
-pub fn ensure_toka_dos(c_root: &Path) {
-    let _ = c_root;
+/// How `toka_dos_install` lays the OS down onto the C: drive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallMode {
+    /// Install only if Toka-DOS is absent (first boot). The presence of
+    /// `ICOMMAND.COM` is the marker.
+    EnsureIfMissing,
+    /// Overwrite the system files from ROM, leaving any user files in place.
+    Repair,
+    /// Wipe the drive, then reinstall every system file.
+    Format,
+}
+
+/// The marker file whose presence means Toka-DOS is already installed.
+const TOKA_DOS_MARKER: &str = "ICOMMAND.COM";
+
+fn write_system_files(c_root: &Path, files: &[(String, Vec<u8>)]) -> std::io::Result<()> {
+    std::fs::create_dir_all(c_root)?;
+    for (name, bytes) in files {
+        std::fs::write(c_root.join(name), bytes)?;
+    }
+    Ok(())
+}
+
+fn clear_directory(c_root: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(c_root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(&path)?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Lay Toka-DOS down onto the C: drive. `files` are the OS system files from the
+/// motherboard ROM, as (DOS 8.3 name, bytes) pairs. This is what the first-boot
+/// install, the BIOS "Repair Toka-DOS" option, and the BIOS "Format Drive"
+/// option all call.
+pub fn toka_dos_install(
+    c_root: &Path,
+    files: &[(String, Vec<u8>)],
+    mode: InstallMode,
+) -> std::io::Result<()> {
+    match mode {
+        InstallMode::EnsureIfMissing => {
+            if c_root.join(TOKA_DOS_MARKER).exists() {
+                return Ok(());
+            }
+            write_system_files(c_root, files)
+        }
+        InstallMode::Repair => write_system_files(c_root, files),
+        InstallMode::Format => {
+            if c_root.exists() {
+                clear_directory(c_root)?;
+            }
+            write_system_files(c_root, files)
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -2023,6 +2078,38 @@ fn read_asciiz(mem: &Memory, seg: u16, off: u16) -> Result<Option<String>, DosEr
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn toka_install_ensure_repair_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let files = vec![
+            ("ICOMMAND.COM".to_string(), vec![1u8, 2, 3]),
+            ("VER.COM".to_string(), vec![4u8]),
+        ];
+
+        // Format lays everything down on a fresh drive.
+        toka_dos_install(root, &files, InstallMode::Format).unwrap();
+        assert!(root.join("ICOMMAND.COM").exists());
+        assert!(root.join("VER.COM").exists());
+
+        // EnsureIfMissing is a no-op once the marker is present: a hand-edited
+        // system file is left untouched.
+        std::fs::write(root.join("ICOMMAND.COM"), b"edited").unwrap();
+        toka_dos_install(root, &files, InstallMode::EnsureIfMissing).unwrap();
+        assert_eq!(std::fs::read(root.join("ICOMMAND.COM")).unwrap(), b"edited");
+
+        // Repair overwrites system files but keeps a stray user file.
+        std::fs::write(root.join("USER.TXT"), b"x").unwrap();
+        toka_dos_install(root, &files, InstallMode::Repair).unwrap();
+        assert_eq!(std::fs::read(root.join("ICOMMAND.COM")).unwrap(), vec![1, 2, 3]);
+        assert!(root.join("USER.TXT").exists());
+
+        // Format wipes the stray user file, then reinstalls.
+        toka_dos_install(root, &files, InstallMode::Format).unwrap();
+        assert!(!root.join("USER.TXT").exists());
+        assert!(root.join("ICOMMAND.COM").exists());
+    }
 
     #[test]
     fn ah0a_reads_a_line_until_cr_with_backspace() {

@@ -89,7 +89,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     // ~/.izarravm/c_drive and lay down Toka-DOS if it is missing.
     if cli.c_drive.is_none() && cli.dosroot.is_none() && config.dos.c_drive == Path::new(".") {
         let c_root = izarravm_dos::resolve_c_root();
-        izarravm_dos::ensure_toka_dos(&c_root);
+        let files = izarravm_firmware::toka_dos_system_files();
+        izarravm_dos::toka_dos_install(&c_root, &files, izarravm_dos::InstallMode::EnsureIfMissing)?;
         config.dos.c_drive = c_root;
     }
     let hardware = HardwareProfile::from_config(&config)?;
