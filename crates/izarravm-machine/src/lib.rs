@@ -1,3 +1,4 @@
+pub use fat12::build_fat12;
 use izarravm_audio::{OplChip, Resampler, SbDsp, SbMixer};
 use izarravm_bus::{BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CpuBus, Memory};
 use izarravm_core::{GswMode, HardwareProfile, SoundBlasterConfig, VideoCard};
@@ -11,6 +12,7 @@ use izarravm_video::{
 use thiserror::Error;
 
 mod dma;
+mod fat12;
 mod floppy;
 mod keyboard;
 mod pic;
