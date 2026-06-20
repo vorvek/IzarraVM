@@ -1764,7 +1764,9 @@ dependencies = [
  "izarravm-machine",
  "izarravm-video",
  "rfd",
+ "serde",
  "time",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]
