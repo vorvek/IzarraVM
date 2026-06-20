@@ -569,6 +569,24 @@ impl DosKernel {
         self.last_exit_type = 0;
     }
 
+    /// Stand up a system PSP, arena, and base environment with no running
+    /// program, so a boot stub can EXEC the shell as the first process. This is
+    /// the SYSINIT-equivalent: it gives the first `AH=4Bh` a valid parent context
+    /// (a PSP at `psp_seg` owning just its own paragraphs, an arena up to
+    /// `ARENA_TOP`, and an environment block named by `PSP:0x2C`).
+    pub fn init_shell_base(
+        &mut self,
+        mem: &mut Memory,
+        psp_seg: u16,
+        env: &[(&str, &str)],
+    ) -> Result<(), DosError> {
+        build_psp(mem, psp_seg, ARENA_TOP)?;
+        let prog_top = psp_seg.saturating_add(0x10); // the system PSP is its 256 bytes
+        self.init_program(psp_seg, prog_top);
+        self.install_environment(mem, env)?;
+        Ok(())
+    }
+
     /// Allocate the DOS environment segment, write the env block in the real DOS
     /// format, and record its segment in `PSP:0x2C`. Each entry becomes an ASCIIZ
     /// `KEY=VALUE` string; the block ends with the empty-string terminator. The
