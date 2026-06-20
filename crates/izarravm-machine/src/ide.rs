@@ -14,7 +14,7 @@
 //! limit (cylinder low/high) set and DRQ raised, asserting IRQ15 if interrupts
 //! are enabled. IDENTIFY PACKET DEVICE (0xA1) and the ATA soft-reset path are
 //! handled directly. DMA is not modeled: transfers are PIO, which every ATAPI
-//! driver and MSCDEX supports.
+//! driver and ICDEX supports.
 
 use crate::atapi::{AtapiDevice, CmdResult};
 use crate::cdimage::DATA_SECTOR;

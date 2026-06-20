@@ -353,7 +353,7 @@ impl AtapiDevice {
         let page = cdb[2] & 0x3F;
         let alloc = u16::from_be_bytes([cdb[7], cdb[8]]) as usize;
         // 8-byte MODE SENSE(10) header, then the requested page. We answer the
-        // CD-ROM capabilities page (0x2A) used by MSCDEX/drivers to probe speed.
+        // CD-ROM capabilities page (0x2A) used by ICDEX/drivers to probe speed.
         let mut page_bytes = Vec::new();
         if page == 0x2A || page == 0x3F {
             page_bytes.extend_from_slice(&caps_page_2a());

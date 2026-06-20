@@ -43,8 +43,12 @@ const DOS_LOAD_SEGMENT: u16 = 0x0100;
 /// convention (a fixed nonzero byte the guest can probe).
 pub const LOTURA_ID_VALUE: u8 = 0x5a;
 
-/// Drive number the MSCDEX HLE exposes the CD-ROM at (0 = A:). The CD is D:,
+/// Drive number the ICDEX HLE exposes the CD-ROM at (0 = A:). The CD is D:,
 /// after A: floppy and C: host drive.
+///
+/// ICDEX = Izarra CD-ROM Extensions, the Toka-DOS CD redirector. Its INT 2Fh
+/// interface is intentionally ABI-compatible with the CD extension interface
+/// DOS games probe for, so titles detect the drive without a real driver.
 pub const CD_DRIVE_NUMBER: u8 = 3;
 
 #[derive(Debug, Error)]
@@ -868,19 +872,19 @@ impl Machine {
         }
     }
 
-    /// Service the MSCDEX functions of `INT 2Fh` (the multiplex interrupt) as an
+    /// Service the ICDEX functions of `INT 2Fh` (the multiplex interrupt) as an
     /// HLE bridge, so the guest sees a CD drive without a real driver loaded. The
     /// CD-ROM is exposed at the drive letter `CD_DRIVE_NUMBER` (0 = A:), which is
     /// D: by default. Only the query and device-driver-request functions are
     /// modeled; unrecognized AX values fall through unchanged so other INT 2Fh
-    /// consumers are unaffected. Returns true if the call was an MSCDEX function
+    /// consumers are unaffected. Returns true if the call was an ICDEX function
     /// this bridge handled.
     fn handle_int2f(&mut self) -> bool {
         let ax = self.cpu.registers.eax() as u16;
         match ax {
-            // Network-redirector / MSCDEX installation check (RBIL INTERRUP.K,
+            // Network-redirector / ICDEX installation check (RBIL INTERRUP.K,
             // INT 2F/AX=1100h). The caller pushes a DADAh marker, runs INT 2Fh,
-            // and a present MSCDEX returns AL=FFh and replaces the pushed word
+            // and a present ICDEX returns AL=FFh and replaces the pushed word
             // with ADADh. A strict probe checks that the word changed, so we
             // rewrite it. The INT pushed IP, CS, FLAGS over the marker, so the
             // marker sits at SS:SP+6. Only the DADAh marker is the install check;
@@ -930,7 +934,7 @@ impl Machine {
                 self.write_guest_block(addr, &[CD_DRIVE_NUMBER]);
                 true
             }
-            // Drive check: BX = ADADh signals MSCDEX present; AX nonzero if the
+            // Drive check: BX = ADADh signals ICDEX present; AX nonzero if the
             // drive in CX is a supported CD-ROM.
             0x150B => {
                 let cx = self.cpu.registers.ecx() as u16;
@@ -941,7 +945,7 @@ impl Machine {
                 self.cpu.registers.set_ebx(ebx);
                 true
             }
-            // Get MSCDEX version: BH = major, BL = minor. Report 2.23.
+            // Get ICDEX version: BH = major, BL = minor. Report 2.23.
             0x150C => {
                 let ebx = (self.cpu.registers.ebx() & !0xFFFF) | 0x0217; // 2.23
                 self.cpu.registers.set_ebx(ebx);
@@ -961,7 +965,7 @@ impl Machine {
                 let es = self.cpu.registers.segment(SegmentIndex::Es).base;
                 let bx = self.cpu.registers.ebx() as u16;
                 let header = es.wrapping_add(u32::from(bx));
-                self.mscdex_device_request(header);
+                self.icdex_device_request(header);
                 self.set_int_frame_carry(false);
                 true
             }
@@ -975,7 +979,7 @@ impl Machine {
     /// transfer address and the status word back into the header. Supports the
     /// CD commands a game uses: READ LONG (0x80), SEEK (0x83), PLAY AUDIO (0x84),
     /// STOP (0x85), RESUME (0x88), and IOCTL INPUT (0x03) device-status queries.
-    fn mscdex_device_request(&mut self, header: u32) {
+    fn icdex_device_request(&mut self, header: u32) {
         let command = self.read_physical_u8(header + 2);
         // Status word at offset 3: bit 8 = done, bit 15 = error, low byte = code.
         let mut status: u16 = 0x0100; // done
@@ -4284,7 +4288,7 @@ mod tests {
     }
 
     #[test]
-    fn mscdex_install_check_reports_installed() {
+    fn icdex_install_check_reports_installed() {
         let mut machine = test_machine();
         // The probe pushes DADAh, then the INT pushed IP, CS, FLAGS over it, so
         // the marker sits at SS:SP+6. Stand in for that frame here.
@@ -4305,7 +4309,7 @@ mod tests {
     }
 
     #[test]
-    fn mscdex_install_check_ignores_non_dada_marker() {
+    fn icdex_install_check_ignores_non_dada_marker() {
         let mut machine = test_machine();
         machine
             .cpu
@@ -4322,7 +4326,7 @@ mod tests {
     }
 
     #[test]
-    fn mscdex_drive_check_reports_the_cd_drive() {
+    fn icdex_drive_check_reports_the_cd_drive() {
         let mut machine = test_machine();
         machine.mount_cd(audio_cd(4));
         // AX=1500: BX = drive count, CX = first drive letter (D: = 3).
@@ -4342,7 +4346,7 @@ mod tests {
     }
 
     #[test]
-    fn mscdex_send_request_read_long_loads_a_sector() {
+    fn icdex_send_request_read_long_loads_a_sector() {
         let mut machine = test_machine();
         // A small data ISO with a marker per sector.
         let mut bytes = vec![0u8; 4 * cdimage::DATA_SECTOR];
@@ -4381,7 +4385,7 @@ mod tests {
     }
 
     #[test]
-    fn mscdex_send_request_play_audio_starts_playback() {
+    fn icdex_send_request_play_audio_starts_playback() {
         let mut machine = test_machine();
         machine.mount_cd(audio_cd(40));
         let header = 0x2000u32;
