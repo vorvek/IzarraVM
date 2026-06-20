@@ -119,7 +119,9 @@
 %define PORT_KBD_DATA    0x60
 %define PORT_KBD_CMD     0x64
 %define PORT_PIT_CH0     0x40
+%define PORT_PIT_CH2     0x42
 %define PORT_PIT_CTRL    0x43
+%define PORT_SPEAKER     0x61      ; system control port B: GATE2 (bit 0) + speaker data enable (bit 1)
 %define PORT_PIC_CMD     0x20
 %define PORT_PIC_DATA    0x21
 %define PORT_PIC2_CMD    0xa0

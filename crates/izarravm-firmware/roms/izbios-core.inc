@@ -59,6 +59,7 @@ bios_start:
 ; dw name_ptr, dw handler_ptr. Append a BEGIN suite record, then for each step
 ; call the handler (DS = BDA on entry) and append its result by name.
 run_post:
+    call play_chime             ; power-on rising arpeggio (delay skipped under fast POST)
     call console_init           ; mode 13h boot console + title (the main window)
     mov al, RESULT_BEGIN
     mov si, str_suite_name

@@ -335,6 +335,13 @@ impl Machine {
         self.fast_post = fast;
     }
 
+    /// Whether the PC speaker was ever enabled (port 0x61 bit 1 driven high). The
+    /// power-on chime sets this during POST, so a headless run can assert the
+    /// speaker was exercised without draining the audio ring.
+    pub fn speaker_ever_enabled(&self) -> bool {
+        self.speaker.ever_enabled()
+    }
+
     /// Mount a raw floppy image into drive A:. The geometry is derived from the
     /// image length; an unrecognized size returns an error and leaves any
     /// previously mounted image in place.
@@ -6480,6 +6487,21 @@ mod tests {
         assert!(
             bar_pixels > 50,
             "expected the red progress-bar frame, found {bar_pixels} red pixels"
+        );
+    }
+
+    #[test]
+    fn izarra_bios_plays_the_power_on_chime() {
+        // POST opens with the four-note PC-speaker chime. The note delay is skipped
+        // under the default fast POST, but each note still programs PIT channel 2
+        // and drives port 0x61 bit 1 high, so the speaker enable latch must be set
+        // by the time POST has run.
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
+        machine.run_until_halt_or_cycles(5_000_000).unwrap();
+        assert!(
+            machine.speaker_ever_enabled(),
+            "the power-on chime should enable the PC speaker during POST"
         );
     }
 
