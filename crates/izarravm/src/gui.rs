@@ -933,6 +933,7 @@ impl GuiApp {
         let mut codes: Vec<u8> = Vec::new();
         let mut buttons = self.last_buttons;
         let mut motion = egui::Vec2::ZERO;
+        let mut pointer_moves = 0u32;
         for event in &raw_input.events {
             match event {
                 egui::Event::Key { key, pressed, .. } => {
@@ -941,6 +942,7 @@ impl GuiApp {
                     }
                 }
                 egui::Event::PointerMoved(pos) => {
+                    pointer_moves += 1;
                     if let Some(last) = self.last_pointer {
                         motion += *pos - last;
                     }
@@ -978,6 +980,14 @@ impl GuiApp {
             Some(rect) => screen_to_guest_delta(motion, rect),
             None => (motion.x.round() as i32, motion.y.round() as i32),
         };
+        // TEMP mouse diagnostics (issue 1): log whenever the hook saw pointer
+        // activity, so we can tell if PointerMoved even reaches us under the grab.
+        if pointer_moves > 0 || buttons != self.last_buttons {
+            eprintln!(
+                "[mouse-dbg] hook moves={pointer_moves} motion={motion:?} -> dx={dx} dy={dy} buttons={buttons} rect={:?}",
+                self.screen_rect
+            );
+        }
         // Send when the pointer moved or a button state changed since last packet.
         if dx != 0 || dy != 0 || buttons != self.last_buttons {
             self.last_buttons = buttons;
