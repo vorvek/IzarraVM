@@ -2,7 +2,7 @@ pub use fat12::build_fat12;
 use izarravm_audio::{OplChip, Resampler, SbDsp, SbMixer};
 use izarravm_bus::{BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CpuBus, Memory};
 use izarravm_core::{GswMode, HardwareProfile, SoundBlasterConfig, VideoCard};
-use izarravm_cpu::{Cpu386, CpuError, Registers, SegmentIndex, SegmentRegister};
+use izarravm_cpu::{Cpu386, CpuError, CpuLevel, Registers, SegmentIndex, SegmentRegister};
 pub use izarravm_video::MARGO_ID_VALUE;
 use izarravm_video::{
     DAC_ENTRIES, MARGO_MMIO_SIZE, MARGO_VBE_MODES, MARGO_VRAM_SIZE, Margo, TextFrame,
@@ -1465,10 +1465,22 @@ impl Machine {
     }
 
     /// Switch the active compatibility mode live, recomputing the timing factors
-    /// for the new clock. Called at construction and from the Lotura mode write.
+    /// for the new clock and lowering the CPU's guest-facing instruction-set level
+    /// to match. Called from the Lotura mode write (port 0xE1). The CPU level gate
+    /// is guest-facing only: firmware POST never reaches this path, so it always
+    /// runs at the full ISA the core resets to.
     pub fn set_mode(&mut self, mode: GswMode) {
         self.active_mode = mode;
         self.timing = TimingFactors::for_clock(mode.clock_hz());
+        self.cpu.set_level(cpu_level_for_mode(mode));
+    }
+
+    /// The reported (L1 KB, L2 KB) cache for the live mode. Cosmetic: it models a
+    /// motherboard L2 cache module and feeds the BIOS setup and GUI readout only,
+    /// with no timing effect. Driven from the live CPU level so it tracks a Lotura
+    /// mode switch.
+    pub fn cache_config(&self) -> (u16, u16) {
+        self.cpu.cache_kb()
     }
 
     /// The live compatibility mode (set at boot, changed by a Lotura mode write).
@@ -2227,6 +2239,7 @@ fn gsw_mode_from_code(code: u8) -> Option<GswMode> {
         0 => Some(GswMode::Gsw386),
         1 => Some(GswMode::Gsw486),
         2 => Some(GswMode::Gsw586),
+        3 => Some(GswMode::Gsw286),
         _ => None,
     }
 }
@@ -2236,6 +2249,21 @@ fn gsw_mode_code(mode: GswMode) -> u8 {
         GswMode::Gsw386 => 0,
         GswMode::Gsw486 => 1,
         GswMode::Gsw586 => 2,
+        // 286 (Super Slow) takes code 3 so the original 386/486/586 codes keep their
+        // values and old guests that write 0/1/2 are unaffected.
+        GswMode::Gsw286 => 3,
+    }
+}
+
+/// Map a GSW compatibility mode to the CPU instruction-set level it presents to the
+/// guest. The 586 native default keeps the full ISA; a lower mode lowers the level
+/// so the core raises #UD for instructions that part lacked.
+fn cpu_level_for_mode(mode: GswMode) -> CpuLevel {
+    match mode {
+        GswMode::Gsw286 => CpuLevel::I286,
+        GswMode::Gsw386 => CpuLevel::I386,
+        GswMode::Gsw486 => CpuLevel::I486,
+        GswMode::Gsw586 => CpuLevel::I586,
     }
 }
 
@@ -2621,6 +2649,45 @@ mod tests {
         machine.set_mode(GswMode::Gsw586);
         assert_eq!(machine.active_mode(), GswMode::Gsw586);
         assert!((machine.timing.pit_per_clock - PIT_INPUT_HZ as f64 / 266_000_000.0).abs() < 1e-9);
+        // Super Slow (286) @ 8 MHz.
+        machine.set_mode(GswMode::Gsw286);
+        assert_eq!(machine.active_mode(), GswMode::Gsw286);
+        assert!((machine.timing.pit_per_clock - PIT_INPUT_HZ as f64 / 8_000_000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn set_mode_drives_cpu_level_and_cache_table() {
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(1, izarravm_core::VideoCard::Et4000Ax),
+            vec![0u8; BIOS_ROM_SIZE],
+        )
+        .unwrap();
+        // The CPU boots at the full ISA so POST is never restricted, regardless of the
+        // 386 boot mode, until the guest writes a Lotura mode.
+        assert_eq!(machine.cpu.level(), CpuLevel::I586);
+
+        machine.set_mode(GswMode::Gsw286);
+        assert_eq!(machine.cpu.level(), CpuLevel::I286);
+        assert_eq!(machine.cache_config(), (0, 0));
+
+        machine.set_mode(GswMode::Gsw386);
+        assert_eq!(machine.cpu.level(), CpuLevel::I386);
+        assert_eq!(machine.cache_config(), (0, 64));
+
+        machine.set_mode(GswMode::Gsw486);
+        assert_eq!(machine.cpu.level(), CpuLevel::I486);
+        assert_eq!(machine.cache_config(), (16, 128));
+
+        machine.set_mode(GswMode::Gsw586);
+        assert_eq!(machine.cpu.level(), CpuLevel::I586);
+        assert_eq!(machine.cache_config(), (32, 512));
+    }
+
+    #[test]
+    fn lotura_code_3_selects_286_mode() {
+        assert_eq!(gsw_mode_from_code(3), Some(GswMode::Gsw286));
+        assert_eq!(gsw_mode_code(GswMode::Gsw286), 3);
+        assert_eq!(cpu_level_for_mode(GswMode::Gsw286), CpuLevel::I286);
     }
 
     fn rom_with_code(code: &[u8]) -> Vec<u8> {
