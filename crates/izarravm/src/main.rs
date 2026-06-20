@@ -1,5 +1,6 @@
 mod cmos;
 mod gui;
+mod prefs;
 
 use clap::Parser;
 use izarravm_audio::AudioSubsystem;

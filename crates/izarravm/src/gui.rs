@@ -1,3 +1,4 @@
+use crate::prefs::{self, GuiPrefs};
 use eframe::egui;
 use izarravm_audio::{AudioPlayer, AudioSink};
 use izarravm_core::GswMode;
@@ -5,6 +6,7 @@ use izarravm_dos::HostDrive;
 use izarravm_machine::{ActiveDisplay, Machine, MachineProfile, StopReason};
 use std::error::Error;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -12,6 +14,12 @@ use std::time::{Duration, Instant};
 use tracing::{error, warn};
 
 const OPL_NATIVE_HZ: f64 = 49_716.0;
+
+/// Map a 0..1 master-volume slider to a linear audio gain. This is a cubic
+/// perceptual curve; swap it for a proper dB map if it ever matters.
+fn volume_gain(volume: f32) -> f32 {
+    volume.clamp(0.0, 1.0).powi(3)
+}
 
 /// How long the emulation thread sleeps between work slices. The wall-clock
 /// catch-up pacing absorbs the coarse Windows timer granularity, so realtime
@@ -111,13 +119,16 @@ fn render_words(machine: &mut Machine) -> (Vec<u32>, usize, usize) {
     }
 }
 
-/// Render OPL audio for the emulated time elapsed since the last pump.
+/// Render OPL audio for the emulated time elapsed since the last pump. `gain` is
+/// the host-side master gain (already curved), applied to each sample before it
+/// is queued, independent of the guest's own CT1745 mixer.
 fn pump_audio(
     machine: &mut Machine,
     sink: &AudioSink,
     clock_hz: u64,
     audio_clocks: &mut u64,
     debt: &mut f64,
+    gain: f32,
 ) {
     let now = machine.elapsed_clocks();
     let delta = now.saturating_sub(*audio_clocks);
@@ -137,7 +148,17 @@ fn pump_audio(
     if samples == 0 {
         return;
     }
-    let pcm = machine.render_audio(samples);
+    let mut pcm = machine.render_audio(samples);
+    if gain != 1.0 {
+        for (l, r) in &mut pcm {
+            *l = (*l as f32 * gain)
+                .round()
+                .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+            *r = (*r as f32 * gain)
+                .round()
+                .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+        }
+    }
     sink.queue(&pcm);
 }
 
@@ -254,6 +275,27 @@ fn access_led(ui: &mut egui::Ui, lit: bool) {
     ui.painter().rect_filled(rect.shrink(1.0), 2.0, color);
 }
 
+/// Host-side master audio gain shared between the UI thread (writes it from the
+/// volume slider) and the emulation thread (reads it each audio pump). The f32
+/// gain is stored as its bit pattern so it can ride in a lock-free atomic on the
+/// audio path.
+#[derive(Clone)]
+struct SharedGain(Arc<AtomicU32>);
+
+impl SharedGain {
+    fn new(gain: f32) -> Self {
+        Self(Arc::new(AtomicU32::new(gain.to_bits())))
+    }
+
+    fn set(&self, gain: f32) {
+        self.0.store(gain.to_bits(), Ordering::Relaxed);
+    }
+
+    fn get(&self) -> f32 {
+        f32::from_bits(self.0.load(Ordering::Relaxed))
+    }
+}
+
 /// Handle to the emulation thread: the command channel, the published frame,
 /// and the join handle so it can be shut down cleanly.
 struct Emulator {
@@ -264,6 +306,7 @@ struct Emulator {
 
 impl Emulator {
     /// Spawn the emulation thread for a fresh machine.
+    #[allow(clippy::too_many_arguments)]
     fn spawn(
         profile: MachineProfile,
         rom: Vec<u8>,
@@ -271,6 +314,7 @@ impl Emulator {
         test_pattern: bool,
         sink: Option<AudioSink>,
         rtc_setup: crate::cmos::RtcSetup,
+        gain: SharedGain,
     ) -> Self {
         let frame = Arc::new(Mutex::new(Frame::default()));
         let (commands, rx) = mpsc::channel();
@@ -285,6 +329,7 @@ impl Emulator {
                     test_pattern,
                     sink,
                     rtc_setup,
+                    gain,
                     rx,
                     frame_thread,
                 )
@@ -361,6 +406,7 @@ fn emulate(
     test_pattern: bool,
     sink: Option<AudioSink>,
     rtc_setup: crate::cmos::RtcSetup,
+    gain: SharedGain,
     commands: Receiver<Command>,
     frame: Arc<Mutex<Frame>>,
 ) {
@@ -473,6 +519,7 @@ fn emulate(
                     clock_hz,
                     &mut audio_clocks,
                     &mut audio_debt,
+                    gain.get(),
                 );
             }
             if dt > 0.0 {
@@ -532,6 +579,23 @@ enum FloppySource {
     Folder(PathBuf),
 }
 
+/// Pick the floppy mount to restore from saved prefs, if its source still exists.
+/// A recorded image wins over a folder when both are present; a path that has
+/// since been deleted or moved is skipped (the drive starts empty).
+fn restore_floppy_source(prefs: &GuiPrefs) -> Option<FloppySource> {
+    if let Some(path) = &prefs.last_floppy_image {
+        if path.is_file() {
+            return Some(FloppySource::Image(path.clone()));
+        }
+    }
+    if let Some(dir) = &prefs.last_floppy_folder {
+        if dir.is_dir() {
+            return Some(FloppySource::Folder(dir.clone()));
+        }
+    }
+    None
+}
+
 pub struct GuiApp {
     profile: MachineProfile,
     rom: Vec<u8>,
@@ -581,6 +645,19 @@ pub struct GuiApp {
     cd_label: Option<String>,
     cd_access_seen: u64,
     cd_access_at: Option<Instant>,
+    // Whether the floating COM1 window is open. The sidebar button and the
+    // window's own close control both flip this.
+    show_com1: bool,
+    // Master volume slider position, 0.0..1.0. Cubed into a host-side gain that
+    // the emulation thread reads through `gain`.
+    volume: f32,
+    // The shared gain handed to the emulation thread; the UI writes it whenever
+    // the slider moves so the audio path stays lock-free.
+    gain: SharedGain,
+    // Persisted GUI prefs (volume, last mounts) and where they live on disk. The
+    // file sits next to the C: root and is rewritten on a change.
+    prefs: GuiPrefs,
+    prefs_path: PathBuf,
 }
 
 impl GuiApp {
@@ -608,6 +685,15 @@ impl GuiApp {
         // The machine details (CPU, memory) live in the controls panel; the window
         // title stays the product name.
         let title = String::from("IzarraVM");
+        // Load the GUI prefs (volume, last mounts) from next to the C: root. A
+        // missing or corrupt file falls back to defaults inside load().
+        let prefs_path = prefs::prefs_path(&c_drive);
+        let prefs = GuiPrefs::load(&prefs_path);
+        let volume = prefs.master_volume.clamp(0.0, 1.0);
+        let gain = SharedGain::new(volume_gain(volume));
+        // Restore the last mount if the source still exists on disk. An image
+        // takes priority over a folder when both are recorded.
+        let floppy_source = restore_floppy_source(&prefs);
         let mut app = Self {
             profile,
             rom,
@@ -627,7 +713,7 @@ impl GuiApp {
             host_fps: 0.0,
             input_rate: 0.0,
             floppy_label: None,
-            floppy_source: None,
+            floppy_source,
             floppy_access_seen: 0,
             c_access_seen: 0,
             floppy_access_at: None,
@@ -635,6 +721,11 @@ impl GuiApp {
             cd_label: None,
             cd_access_seen: 0,
             cd_access_at: None,
+            show_com1: false,
+            volume,
+            gain,
+            prefs,
+            prefs_path,
         };
         app.start();
         // Mount a config-provided CD image once the emulation thread is up.
@@ -665,6 +756,7 @@ impl GuiApp {
             self.test_pattern,
             sink,
             self.rtc_setup.clone(),
+            self.gain.clone(),
         ));
         self.texture = None;
         self.frame_seq = 0;
@@ -693,6 +785,9 @@ impl Drop for GuiApp {
         if let Some(mut emu) = self.emu.take() {
             emu.shutdown();
         }
+        // Save-on-exit as a backstop; changes are already persisted as they
+        // happen, so this just catches anything not yet flushed.
+        self.save_prefs();
     }
 }
 
@@ -812,13 +907,12 @@ impl GuiApp {
 
     fn controls_ui(&mut self, ui: &mut egui::Ui) {
         let running = self.emu.is_some();
-        let (mode, speed, serial, floppy_accesses, c_accesses, cd_accesses) = match &self.emu {
+        let (mode, speed, floppy_accesses, c_accesses, cd_accesses) = match &self.emu {
             Some(emu) => {
                 let f = emu.frame.lock().expect("frame snapshot poisoned");
                 (
                     f.mode,
                     f.speed_ratio,
-                    f.serial.clone(),
                     f.floppy_accesses,
                     f.c_accesses,
                     f.cd_accesses,
@@ -827,7 +921,6 @@ impl GuiApp {
             None => (
                 None,
                 0.0,
-                String::new(),
                 self.floppy_access_seen,
                 self.c_access_seen,
                 self.cd_access_seen,
@@ -882,29 +975,86 @@ impl GuiApp {
         ));
 
         ui.separator();
+        ui.heading("Audio");
+        ui.horizontal(|ui| {
+            ui.label("Volume");
+            // Show 0..100% but drive a 0..1 value. On a change, recompute the
+            // host-side gain and persist the new volume to izarravm.conf.
+            let slider = ui.add(
+                egui::Slider::new(&mut self.volume, 0.0..=1.0)
+                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                    .custom_parser(|s| {
+                        s.trim_end_matches('%')
+                            .trim()
+                            .parse::<f64>()
+                            .ok()
+                            .map(|p| (p / 100.0).clamp(0.0, 1.0))
+                    }),
+            );
+            if slider.changed() {
+                self.gain.set(volume_gain(self.volume));
+                self.prefs.master_volume = self.volume;
+                self.save_prefs();
+            }
+        });
+
+        ui.separator();
         ui.heading("Drives");
         self.drives_ui(ui, running);
 
+        // The serial console lives in its own floating window now; a button at the
+        // bottom of the sidebar toggles it.
         ui.separator();
-        ui.heading("COM1");
-        // A console look: black text on white, with a thin scrollbar when the log
-        // overflows.
-        egui::Frame::new()
-            .fill(egui::Color32::WHITE)
-            .inner_margin(egui::Margin::same(4))
-            .show(ui, |ui| {
-                ui.style_mut().spacing.scroll.bar_width = 6.0;
-                egui::ScrollArea::vertical()
-                    .stick_to_bottom(true)
-                    .auto_shrink([false, false])
+        let com1_label = if self.show_com1 { "Hide COM1" } else { "COM1" };
+        if ui.button(com1_label).clicked() {
+            self.show_com1 = !self.show_com1;
+        }
+    }
+
+    /// The floating COM1 window: black monospace serial log on white, auto-scrolled
+    /// to the bottom, the same console look the sidebar used to carry inline. The
+    /// window is draggable, resizable, and closable; its open state is bound to
+    /// `show_com1` so the close control and the sidebar button stay in sync.
+    fn com1_window(&mut self, ctx: &egui::Context) {
+        let serial = match &self.emu {
+            Some(emu) => emu
+                .frame
+                .lock()
+                .expect("frame snapshot poisoned")
+                .serial
+                .clone(),
+            None => String::new(),
+        };
+        let mut open = self.show_com1;
+        egui::Window::new("COM1")
+            .open(&mut open)
+            .resizable(true)
+            .default_size([480.0, 320.0])
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(egui::Color32::WHITE)
+                    .inner_margin(egui::Margin::same(4))
                     .show(ui, |ui| {
-                        ui.add(egui::Label::new(
-                            egui::RichText::new(serial)
-                                .monospace()
-                                .color(egui::Color32::BLACK),
-                        ));
+                        ui.style_mut().spacing.scroll.bar_width = 6.0;
+                        egui::ScrollArea::vertical()
+                            .stick_to_bottom(true)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.add(egui::Label::new(
+                                    egui::RichText::new(serial)
+                                        .monospace()
+                                        .color(egui::Color32::BLACK),
+                                ));
+                            });
                     });
             });
+        self.show_com1 = open;
+    }
+
+    /// Write the current prefs to disk. Best-effort: GuiPrefs::save logs and
+    /// swallows any IO error, so this never interrupts the UI.
+    fn save_prefs(&self) {
+        self.prefs.save(&self.prefs_path);
     }
 
     /// The three drive rows: A: floppy (load IMG/folder, eject), CD-ROM (the same
@@ -946,6 +1096,10 @@ impl GuiApp {
                 }
                 self.floppy_label = None;
                 self.floppy_source = None;
+                // Forget the mount so it is not restored next launch.
+                self.prefs.last_floppy_image = None;
+                self.prefs.last_floppy_folder = None;
+                self.save_prefs();
             }
         });
         ui.label(self.floppy_label.as_deref().unwrap_or("(empty)"));
@@ -1055,6 +1209,20 @@ impl GuiApp {
         };
         emu.mount_floppy(bytes, flush_path);
         self.floppy_label = Some(label);
+        // Remember the mount in prefs so it is restored next launch. An image and
+        // a folder are mutually exclusive in drive A:, so recording one clears the
+        // other.
+        match &source {
+            FloppySource::Image(path) => {
+                self.prefs.last_floppy_image = Some(path.clone());
+                self.prefs.last_floppy_folder = None;
+            }
+            FloppySource::Folder(dir) => {
+                self.prefs.last_floppy_folder = Some(dir.clone());
+                self.prefs.last_floppy_image = None;
+            }
+        }
+        self.save_prefs();
         self.floppy_source = Some(source);
     }
 
@@ -1233,6 +1401,10 @@ impl eframe::App for GuiApp {
             .resizable(false)
             .show(ctx, |ui| self.controls_ui(ui));
         egui::CentralPanel::default().show(ctx, |ui| self.monitor_ui(ui, ctx));
+        // The COM1 console floats over the central panel when toggled open.
+        if self.show_com1 {
+            self.com1_window(ctx);
+        }
         // Repaint at the guest's refresh rate rather than busy-looping at the
         // host vsync. Input still triggers extra repaints, but the emulation
         // runs on its own thread now, so they cannot slow it down.
@@ -1370,6 +1542,20 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn volume_gain_is_cubic_and_clamped() {
+        // Endpoints are exact: silence at 0, unity at full.
+        assert_eq!(volume_gain(0.0), 0.0);
+        assert_eq!(volume_gain(1.0), 1.0);
+        // Halfway on the slider is 0.5^3 = 0.125 of linear gain.
+        assert!((volume_gain(0.5) - 0.125).abs() < 1e-6);
+        // 0.8 (the default) cubes to 0.512.
+        assert!((volume_gain(0.8) - 0.512).abs() < 1e-6);
+        // Out-of-range input is clamped before cubing.
+        assert_eq!(volume_gain(-1.0), 0.0);
+        assert_eq!(volume_gain(2.0), 1.0);
+    }
 
     #[test]
     fn refill_credit_clamps_a_stall() {
