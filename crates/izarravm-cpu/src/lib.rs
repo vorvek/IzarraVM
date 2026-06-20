@@ -13,6 +13,25 @@ const FLAG_OF: u32 = 0x0000_0800;
 
 const CR0_PE: u32 = 0x0000_0001;
 const CR0_PG: u32 = 0x8000_0000;
+// 486 control bits added to the 386's PE/PG. Only WP changes behavior here: it
+// gates supervisor writes to read-only pages in translate_linear. The rest are
+// read/write storage with no modeled effect, kept so MOV CR0 round-trips them:
+//   AM (bit 4)  alignment-check mask; the #AC path that would consult it is a
+//               separate slice, so AM is inert today.
+//   NE (bit 5)  numeric-error reporting; no FPU is emulated, so it is cosmetic.
+//   NW (bit 29) / CD (bit 30) cache control; no cache is modeled, so both are
+//               cosmetic.
+// The cosmetic constants document the bit layout in one place; they are not yet
+// read by the core, hence the allow on the trio that has no consumer.
+const CR0_WP: u32 = 0x0001_0000; // bit 16
+#[allow(dead_code)]
+const CR0_AM: u32 = 0x0000_0010; // bit 4
+#[allow(dead_code)]
+const CR0_NE: u32 = 0x0000_0020; // bit 5
+#[allow(dead_code)]
+const CR0_NW: u32 = 0x2000_0000; // bit 29
+#[allow(dead_code)]
+const CR0_CD: u32 = 0x4000_0000; // bit 30
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum CpuError {
@@ -232,21 +251,14 @@ impl Registers {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Reset state is all zero: PE/PG clear (real mode, no paging) and AM clear. The
+// old 386 reset forced CR0 bit 4 on for the ET bit; this chip uses bit 4 as AM,
+// which powers up masked, so the default is a plain zero (derived).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ControlRegisters {
     pub cr0: u32,
     pub cr2: u32,
     pub cr3: u32,
-}
-
-impl Default for ControlRegisters {
-    fn default() -> Self {
-        Self {
-            cr0: 0x0000_0010,
-            cr2: 0,
-            cr3: 0,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1666,7 +1678,10 @@ impl Cpu386 {
                 }
                 let value = self.read_gpr32(modrm.rm);
                 match modrm.reg {
-                    0 => self.control.cr0 = value | 0x10,
+                    // CR0 is fully read/write here. The 386 core used to force bit 4 on
+                    // (modeling the 386/486 ET bit); on this fantasy chip bit 4 is AM,
+                    // a read/write alignment-check mask, so nothing is forced.
+                    0 => self.control.cr0 = value,
                     2 => self.control.cr2 = value,
                     3 => self.control.cr3 = value & 0xffff_f000,
                     _ => {}
@@ -2525,10 +2540,11 @@ impl Cpu386 {
             return Ok(linear);
         }
 
-        // 386 paging privilege: CPL 3 is a user access, CPL 0-2 are supervisor.
-        // A 386 has no CR0.WP, so supervisor accesses bypass the R/W and U/S page
-        // bits entirely and only user accesses are protection-checked.
+        // Paging privilege: CPL 3 is a user access, CPL 0-2 are supervisor.
         let user = self.is_protected_mode() && (self.registers.cs().selector & 3) == 3;
+        // CR0.WP (a 486 addition) makes supervisor writes obey the page R/W bit too.
+        // With WP clear, supervisor writes to read-only pages succeed (386 behavior).
+        let wp = self.control.cr0 & CR0_WP != 0;
 
         let directory = self.control.cr3 & 0xffff_f000;
         let directory_address = directory + (((linear >> 22) & 0x03ff) * 4);
@@ -2565,11 +2581,24 @@ impl Cpu386 {
             });
         }
 
-        // User-mode protection: a page is user-accessible only if both the PDE and
-        // PTE U/S bits (bit 2) are set, and writable only if both R/W bits (bit 1)
-        // are set. A user access that violates either faults with present=1.
-        // Checked before the dirty bit is set so a faulting write leaves it clear.
-        if user && (pde & pte & 0x4 == 0 || (write && pde & pte & 0x2 == 0)) {
+        // Protection check. The combined R/W and U/S come from ANDing the PDE and
+        // PTE bits (bit 1 and bit 2). A page is user-accessible only if both U/S
+        // bits are set, and writable only if both R/W bits are set.
+        //   - A user access faults if it touches a supervisor page, or writes a
+        //     read-only page.
+        //   - A supervisor write faults only when CR0.WP is set and the page is
+        //     read-only (combined R/W = 0). With WP clear, supervisor writes pass.
+        // Either way the fault is present=1 and the error-code U/S bit reflects the
+        // access (user), not the page. Checked before the dirty bit is set so a
+        // faulting write leaves it clear.
+        let writable = pde & pte & 0x2 != 0;
+        let user_accessible = pde & pte & 0x4 != 0;
+        let protection_fault = if user {
+            !user_accessible || (write && !writable)
+        } else {
+            write && wp && !writable
+        };
+        if protection_fault {
             self.control.cr2 = linear;
             return Err(InternalFault::Exception {
                 vector: 14,
@@ -3943,6 +3972,67 @@ mod tests {
 
         // CPL 0: a 386 has no CR0.WP, so supervisor reaches the same page fine.
         cpu.registers.set_segment(SegmentIndex::Cs, flat_cs(0x0000));
+        assert_eq!(
+            cpu.translate_linear(&mut bus, 0x3000, false).unwrap(),
+            0x5000
+        );
+    }
+
+    #[test]
+    fn cr0_wp_gates_supervisor_writes_to_read_only_pages() {
+        // PD at 0x1000, PT at 0x2000. Linear 0x3000 maps to a present, read-only
+        // (R/W=0), supervisor (U/S=0) page at frame 0x5000.
+        let mut memory = vec![0; 0x6000];
+        memory[0x1000..0x1004].copy_from_slice(&0x0000_2001u32.to_le_bytes()); // PDE: PT, present, R/W=0, U/S=0
+        memory[0x200c..0x2010].copy_from_slice(&0x0000_5001u32.to_le_bytes()); // PTE[3]: frame, present, R/W=0, U/S=0
+        let mut cpu = Cpu386::default();
+        cpu.control.cr0 |= CR0_PE | CR0_PG;
+        cpu.control.cr3 = 0x1000;
+        // Supervisor: CPL 0.
+        cpu.registers.set_segment(
+            SegmentIndex::Cs,
+            SegmentRegister {
+                selector: 0x0000,
+                base: 0,
+                limit: 0xffff_ffff,
+                access: 0x9b,
+                default_size_32: false,
+            },
+        );
+        let mut bus = TestBus::with_memory(memory);
+
+        // WP clear (the 386 default): a supervisor write to the read-only page
+        // succeeds and resolves to the mapped frame.
+        assert_eq!(cpu.control.cr0 & CR0_WP, 0);
+        assert_eq!(
+            cpu.translate_linear(&mut bus, 0x3000, true).unwrap(),
+            0x5000
+        );
+
+        // A supervisor read always passes regardless of WP.
+        assert_eq!(
+            cpu.translate_linear(&mut bus, 0x3000, false).unwrap(),
+            0x5000
+        );
+
+        // WP set (the 486 feature): the same supervisor write now faults #PF with
+        // error code present|write (bits 0 and 1 -> 0b011 = 0x3); the U/S bit is 0
+        // because the access is supervisor, and cr2 holds the faulting address.
+        cpu.control.cr0 |= CR0_WP;
+        let faulted = cpu.translate_linear(&mut bus, 0x3000, true);
+        assert!(
+            matches!(
+                faulted,
+                Err(InternalFault::Exception {
+                    vector: 14,
+                    error_code: Some(0x3)
+                })
+            ),
+            "{faulted:?}"
+        );
+        assert_eq!(cpu.control.cr2, 0x3000);
+
+        // A supervisor read is unaffected by WP and still resolves.
         assert_eq!(
             cpu.translate_linear(&mut bus, 0x3000, false).unwrap(),
             0x5000
