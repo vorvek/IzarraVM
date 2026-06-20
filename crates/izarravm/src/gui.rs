@@ -66,12 +66,14 @@ fn sharp_prescale(image: &egui::ColorImage, target_w: usize, target_h: usize) ->
     egui::ColorImage::new([dest_w, dest_h], pixels)
 }
 
-/// Emulated clocks to run for a slice of `dt` wall seconds, clamped to `cap`.
-/// Clamping forgives a long stall (host busy, OS starving the thread) instead
-/// of banking it, so the emulator does not sprint above 100% to repay a backlog
-/// once the host recovers, which read as a catch-up spike before.
-fn slice_budget(dt: f64, clock_hz: u64, cap: u64) -> u64 {
-    ((dt * clock_hz as f64) as u64).min(cap)
+/// Refill the pacing credit by the wall time elapsed this slice, capping the
+/// backlog at `cap`. The cap forgives a long host stall (the OS starving the
+/// thread) instead of banking it, so the guest never sprints above realtime to
+/// repay it. The caller runs `credit.max(0)` clocks then subtracts what actually
+/// ran, so a floppy read that overshoots its budget drives credit negative and
+/// holds the guest until wall-clock catches up: the drive "grinds" in real time.
+fn refill_credit(credit: i64, dt: f64, clock_hz: u64, cap: u64) -> i64 {
+    (credit + (dt * clock_hz as f64) as i64).min(cap as i64)
 }
 
 fn tick_machine(machine: &mut Machine, cycles: u64) -> Option<StopReason> {
@@ -121,8 +123,17 @@ fn pump_audio(
     let delta = now.saturating_sub(*audio_clocks);
     *audio_clocks = now;
     *debt += delta as f64 * OPL_NATIVE_HZ / clock_hz as f64;
-    let samples = debt.floor() as usize;
+    let mut samples = debt.floor() as usize;
     *debt -= samples as f64;
+    // A floppy stall jumps the guest clock forward by its whole duration at once,
+    // so the catch-up here could ask for seconds of audio in one render. Cap it at
+    // roughly the sink's buffer (~0.5 s): the surplus is the paused drive grind,
+    // which carries no audio and would only be dropped at the queue anyway.
+    let max_samples = OPL_NATIVE_HZ as usize / 2;
+    if samples > max_samples {
+        samples = max_samples;
+        *debt = 0.0;
+    }
     if samples == 0 {
         return;
     }
@@ -332,7 +343,6 @@ fn emulate(
     commands: Receiver<Command>,
     frame: Arc<Mutex<Frame>>,
 ) {
-    let clock_hz = profile.clock_hz;
     let mut machine = match Machine::new(profile, &rom) {
         Ok(m) => m,
         Err(err) => {
@@ -355,10 +365,13 @@ fn emulate(
         load_margo_test_pattern(&mut machine);
     }
 
-    let cap = clock_hz / 20;
     let mut audio_clocks = machine.elapsed_clocks();
     let mut audio_debt = 0.0;
     let mut speed_ratio = 0.0;
+    // Pacing credit (guest clocks the guest is owed). Wall time refills it; the
+    // cycles run drain it. A disk read that consumes more than its slice drives
+    // it negative, pausing the guest for the disk's duration.
+    let mut credit: i64 = 0;
     let mut last = Instant::now();
     let mut published_seq = u64::MAX; // force the first publish
 
@@ -395,17 +408,27 @@ fn emulate(
             }
         }
 
-        // Pace by the wall time since the last slice, clamped. A delayed slice
-        // forgives the lost time rather than banking it, so the guest never
-        // sprints above 100% to repay a backlog once the host frees up.
+        // Pace by the wall time since the last slice. The credit bucket forgives a
+        // host stall (capped backlog, no catch-up sprint) and, in the other
+        // direction, makes a disk read that jumps the guest clock cost real
+        // wall-clock time: the overshoot drives credit negative and the next
+        // slices run nothing until wall time refills it.
         let now = Instant::now();
         let dt = now.duration_since(last).as_secs_f64();
         last = now;
-        let budget = slice_budget(dt, clock_hz, cap);
+        // Pace against the live mode clock, which the guest can change at runtime
+        // (Lotura port 0xE1). Reading it each slice keeps the credit refill in the
+        // same clock domain as the cycles run and as the disk-stall jumps, so a
+        // floppy read pauses for its true wall-clock duration in any GSW mode.
+        let clock_hz = machine.active_mode().clock_hz();
+        let cap = clock_hz / 20;
+        credit = refill_credit(credit, dt, clock_hz, cap);
+        let budget = credit.max(0) as u64;
         if budget > 0 {
             let before = machine.elapsed_clocks();
             let stop = tick_machine(&mut machine, budget);
             let ran = machine.elapsed_clocks().saturating_sub(before);
+            credit -= i64::try_from(ran).unwrap_or(i64::MAX);
             // A halted guest (POST done, nothing to boot) stops driving the video
             // beam, so the display would freeze on whatever half-drawn frame was
             // completing when HLT ran. Keep scanning the VGA so the final, complete
@@ -1055,16 +1078,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn slice_budget_clamps_a_stall() {
+    fn refill_credit_clamps_a_stall() {
         let clock = 266_000_000u64;
         let cap = clock / 20; // 50 ms of guest time
-        // A normal ~15 ms slice runs its full wall-time worth, under the cap.
+        // From empty, a normal ~15 ms slice yields its full wall-time worth.
         assert_eq!(
-            slice_budget(0.015, clock, cap),
-            (0.015 * clock as f64) as u64
+            refill_credit(0, 0.015, clock, cap),
+            (0.015 * clock as f64) as i64
         );
         // A long stall is clamped to the cap, so the backlog is forgiven, not banked.
-        assert_eq!(slice_budget(0.5, clock, cap), cap);
+        assert_eq!(refill_credit(0, 0.5, clock, cap), cap as i64);
+    }
+
+    #[test]
+    fn disk_overshoot_holds_the_guest() {
+        let clock = 266_000_000u64;
+        let cap = clock / 20;
+        // A read that ran ~190 ms past its budget leaves credit deep in debt.
+        let mut credit: i64 = -(clock as i64) / 5;
+        // One short slice cannot lift it out of debt, so the guest's budget stays
+        // zero: it waits in wall-clock time.
+        credit = refill_credit(credit, 0.001, clock, cap);
+        assert!(credit < 0);
+        assert_eq!(credit.max(0) as u64, 0, "no budget while in disk debt");
+        // After enough wall time the debt clears and the guest runs again.
+        credit = refill_credit(credit, 0.5, clock, cap);
+        assert!(credit > 0, "debt repaid once wall-clock catches up");
     }
 
     #[test]

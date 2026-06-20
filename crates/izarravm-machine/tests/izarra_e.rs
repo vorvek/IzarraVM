@@ -82,13 +82,19 @@ fn tab_then_enter_boots_the_floppy() {
     let mut machine = boot_machine();
     machine.mount_floppy(image).expect("720 KB image mounts");
     machine.inject_key_scancodes(&[TAB_MAKE, TAB_BREAK, ENTER_MAKE, ENTER_BREAK]);
-    machine.run_until_halt_or_cycles(50_000_000).unwrap();
-
-    assert_eq!(
-        machine.video().active_mode(),
-        VideoMode::Cga,
-        "the Wizardry booter ran and switched to CGA"
-    );
+    // The floppy now takes realistic mechanical time (seek + rotational latency +
+    // ~31 KB/s for this 720 KB disk), so loading the booter's stage 2 burns far
+    // more guest cycles than an instant read did. Run in chunks and stop as soon
+    // as the booter switches to CGA, rather than burning a fixed huge budget.
+    let mut reached_cga = false;
+    for _ in 0..60 {
+        machine.run_until_halt_or_cycles(10_000_000).unwrap();
+        if machine.video().active_mode() == VideoMode::Cga {
+            reached_cga = true;
+            break;
+        }
+    }
+    assert!(reached_cga, "the Wizardry booter ran and switched to CGA");
 }
 
 // FAT12 layout constants for a 1.44 MB image, matching the synthesizer. Used to
