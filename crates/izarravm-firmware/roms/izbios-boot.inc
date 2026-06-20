@@ -104,8 +104,17 @@ bm_enter_mode13h:
 ; return so the machine idles (the Tab menu handles them interactively, but a
 ; non-interactive boot lands here with whatever default was seeded).
 boot_entry:
+    ; Repaint the graceful POST screen first. The Tab boot menu and the Del setup
+    ; page draw their own mode-13h frames over POST, so without this any boot status
+    ; line below would land on top of the menu and garble it. gfx_post_screen redraws
+    ; the same white field with the red Izarra 3000 logo, and resetting CONSOLE_ROW_Y
+    ; puts boot_status_line back on a clean console. When no menu was opened this just
+    ; repaints the identical screen, and on the floppy success path it is one screen
+    ; paint before the read, which the boot timing does not notice.
+    call gfx_post_screen
     xor ax, ax
     mov ds, ax
+    mov word [CONSOLE_ROW_Y], POST_HINT_Y
     mov al, [BOOT_CHOICE]
     cmp al, BOOT_DEV_DISK
     je .disk

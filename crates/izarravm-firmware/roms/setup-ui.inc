@@ -142,26 +142,54 @@ su_wait_hotkey:
 .hit_setup:
     xor ah, ah
     call kb_getkey                  ; drain the Del make from the ring
+    mov si, su_str_enter_setup
+    call su_post_note               ; brief feedback on the POST screen
     xor al, al                      ; AL=0 -> setup page
     stc
     ret
 .hit_boot:
     xor ah, ah
     call kb_getkey                  ; drain the Tab make from the ring
+    mov si, su_str_enter_boot
+    call su_post_note               ; brief feedback on the POST screen
     mov al, 1                       ; AL=1 -> boot menu
     stc
+    ret
+
+; su_post_note: draw a short status line on the still-visible graceful POST screen
+; when a hotkey is caught, so the press gets immediate feedback before the setup
+; page or boot menu repaints over it. SI = CS-relative ASCIIZ on entry. Black on the
+; white POST field, just under the hint row. Preserves the caller's registers and
+; the CF/AL the hotkey path is about to return.
+su_post_note:
+    pusha
+    push cs
+    pop ds                          ; DS = CS so DS:SI reaches the ROM string
+    mov di, POST_TEXT_X
+    mov ax, POST_HINT_Y + 12        ; one row below the "Del: Setup ..." hint
+    mov bl, GFX_BLACK
+    mov bh, GFX_WHITE
+    call gfx_text
+    popa
     ret
 
 ; su_run_menu: seed the working copy from live hardware and CMOS, draw the main
 ; menu, then loop reading keys until Save or Discard. Clobbers all caller-saved
 ; registers (core calls this directly and nothing after it depends on them).
 su_run_menu:
+    sti                             ; the keyboard ring fills on IRQ1
     call su_seed
     mov byte [SU_CURSOR], SU_ROW_TIME   ; DS = 0 left set by su_seed
     call su_draw
 .loop:
+    ; Non-blocking, modeled on the bootbox loop: peek the ring each pass, fall
+    ; through and re-loop when it is empty, consume and handle a waiting key. The
+    ; menu has no live readout to animate, so the empty pass just spins.
+    mov ah, 0x01
+    call kb_getkey                  ; peek: CF=1 if the ring is empty
+    jc .loop
     xor ah, ah
-    call kb_getkey                  ; blocking read: AH=scancode, AL=ascii
+    call kb_getkey                  ; consume the waiting key: AH=scancode, AL=ascii
     cmp ah, SC_UP
     je .up
     cmp ah, SC_DOWN
@@ -761,10 +789,15 @@ su_put_colon:
 ; Up/Down (and Enter) bump it, Esc returns to the main menu. The first change sets
 ; SU_TIME_EDITED so su_commit knows to write the RTC. DS bounces between 0 and CS.
 su_time_page:
+    sti
     call su_time_draw
 .loop:
+    ; Non-blocking peek loop (Bug 5), matching su_run_menu and the bootbox model.
+    mov ah, 0x01
+    call kb_getkey                  ; peek: CF=1 if the ring is empty
+    jc .loop
     xor ah, ah
-    call kb_getkey
+    call kb_getkey                  ; consume the waiting key
     cmp ah, SC_ESC
     je .back
     cmp ah, SC_LEFT
@@ -1068,27 +1101,39 @@ su_periph_page:
     SU_PROBE su_str_p_opl,    probe_opl, 5
     SU_PROBE su_str_p_margo,  probe_margo, 6
 
+    sti
 .loop:
+    ; Non-blocking peek loop (Bug 5). The probe readouts are drawn once on entry;
+    ; Esc returns. Any other key is consumed and ignored.
+    mov ah, 0x01
+    call kb_getkey                  ; peek: CF=1 if the ring is empty
+    jc .loop
     xor ah, ah
-    call kb_getkey
+    call kb_getkey                  ; consume the waiting key
     cmp ah, SC_ESC
     jne .loop
     ret
 
 ; ============================ Health sub-page ============================
 ; su_health_page: show the voltage rails and temperatures with a small per-refresh
-; jitter from the LFSR. Each refresh re-jitters and repaints; Esc returns. The
-; values are fixed bases plus a signed wobble so the page looks alive without a
+; jitter from the LFSR. Esc returns; any other key re-jitters and repaints at once.
+; The values are fixed bases plus a signed wobble so the page looks alive without a
 ; real hardware monitor port.
+;
+; Non-blocking poll loop (Bug 5), modeled on the bootbox loop: each pass peeks the
+; keyboard, then checks the BDA timer tick word at 0040:006C. When the tick has
+; advanced past SU_HEALTH_TICK the sensors are re-read (re-jittered) and the page
+; redraws, so the readouts animate on the timer with no keypress. The tick is then
+; stored so the next advance triggers the next frame. This replaces the old
+; hlt-based wait, matching the peek model the rest of the setup pages now use.
 su_health_page:
-    sti                             ; the hlt below waits on the timer/keyboard IRQ
+    sti                             ; the keyboard ring and the BDA tick run on IRQs
     call su_health_draw
     call su_health_seed_tick
 .loop:
-    hlt                             ; wake on the next IRQ (timer ~18/s or a key)
     mov ah, 0x01
     call kb_getkey                  ; peek: CF=1 if the ring is empty
-    jc .timer
+    jc .tick
     cmp ah, SC_ESC
     je .back
     xor ah, ah
@@ -1096,8 +1141,10 @@ su_health_page:
     call su_health_draw
     call su_health_seed_tick
     jmp .loop
-.timer:
-    ; Auto-refresh about once a second: 18 BDA ticks ~ 0.99 s at 18.2 Hz.
+.tick:
+    ; Redraw once the BDA tick has advanced, so the readouts animate ~18 times a
+    ; second without input. The tick word is volatile (INT 08h owns it), so read it
+    ; under DS = BDA then bounce back to segment 0 for SU_HEALTH_TICK.
     push ds
     push ax
     push bx
@@ -1106,12 +1153,11 @@ su_health_page:
     mov ax, [BDA_TICKS]             ; low word of the running tick count
     xor bx, bx
     mov ds, bx
-    sub ax, [SU_HEALTH_TICK]
-    cmp ax, 18
+    cmp ax, [SU_HEALTH_TICK]
     pop bx
     pop ax
     pop ds
-    jb .loop
+    je .loop                        ; tick unchanged: keep polling
     call su_health_draw
     call su_health_seed_tick
     jmp .loop
@@ -1322,6 +1368,9 @@ su_str_save:         db 'SAVE AND EXIT', 0
 su_str_discard:      db 'DISCARD AND EXIT', 0
 su_str_hint:         db 'Up/Dn move  L/R edit  Enter  Esc back', 0
 su_str_deadnote:     db 'Note: dead keys emit base character', 0
+; POST hotkey feedback (Bug 4). Drawn on the white POST field, so kept short.
+su_str_enter_setup:  db 'Entering setup...', 0
+su_str_enter_boot:   db 'Opening boot menu...', 0
 su_str_colon:        db ':', 0
 su_str_slash:        db '/', 0
 
