@@ -75,6 +75,9 @@ pub enum VideoMode {
     Mode13h,
     Planar,
     ModeX,
+    /// CGA graphics: 320x200x4 (modes 04h/05h) or 640x200x2 (mode 06h), the
+    /// B800 framebuffer with the classic even/odd scanline interleave.
+    Cga,
 }
 
 pub const DAC_ENTRIES: usize = 256;

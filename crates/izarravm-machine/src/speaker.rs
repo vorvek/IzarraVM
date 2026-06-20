@@ -25,6 +25,7 @@ pub(crate) struct Speaker {
     sample_phase: f64,   // fractional DAC samples owed
     elapsed_us: f64,     // emulated microseconds, for the refresh toggle
     ring: VecDeque<i16>, // produced mono samples awaiting drain
+    ever_enabled: bool,  // sticky: set the first time data enable goes high
 }
 
 impl Speaker {
@@ -33,6 +34,16 @@ impl Speaker {
     pub(crate) fn write_control(&mut self, value: u8) {
         self.control_bits = value & 0x03;
         self.data_enable = value & 0x02 != 0;
+        if self.data_enable {
+            self.ever_enabled = true;
+        }
+    }
+
+    /// Whether the speaker data enable was ever set high. The power-on chime drives
+    /// this during POST, so a headless run can confirm the chime played without
+    /// draining the audio ring.
+    pub(crate) fn ever_enabled(&self) -> bool {
+        self.ever_enabled
     }
 
     /// The low two bits last written to 0x61 (GATE2 and data enable), for readback.
@@ -113,6 +124,18 @@ mod tests {
         let s = spk.drain(50);
         assert_eq!(s.len(), 50);
         assert!(s[40..].iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn ever_enabled_latches_on_first_enable() {
+        let mut spk = Speaker::default();
+        assert!(!spk.ever_enabled());
+        spk.write_control(0x01); // gate only, data enable off
+        assert!(!spk.ever_enabled());
+        spk.write_control(0x03); // data enable on
+        assert!(spk.ever_enabled());
+        spk.write_control(0x00); // off again, but the latch stays set
+        assert!(spk.ever_enabled());
     }
 
     #[test]

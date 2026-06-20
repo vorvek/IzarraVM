@@ -4,7 +4,7 @@ use izarravm_core::GswMode;
 use izarravm_dos::HostDrive;
 use izarravm_machine::{ActiveDisplay, Machine, MachineProfile, StopReason};
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -144,7 +144,33 @@ struct Frame {
 /// UI-to-emulation-thread messages.
 enum Command {
     Keys(Vec<u8>),
+    /// Mount a floppy image into drive A: live. `flush_path` is the source IMG to
+    /// rewrite a dirty image to on eject; folder mounts pass None (read-only).
+    MountFloppy {
+        bytes: Vec<u8>,
+        flush_path: Option<PathBuf>,
+    },
+    /// Eject drive A:, flushing a dirty image back to its source IMG if any.
+    EjectFloppy,
     Shutdown,
+}
+
+/// Open the host file manager at `path`. A small portable shim over the platform
+/// "reveal in file manager" command, kept behind a cfg so no extra crate is
+/// pulled in. Failures are logged rather than surfaced; opening a folder is a
+/// convenience, not a critical path.
+fn open_in_file_manager(path: &Path) {
+    #[cfg(target_os = "windows")]
+    let program = "explorer";
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let program = "xdg-open";
+
+    match std::process::Command::new(program).arg(path).spawn() {
+        Ok(_) => {}
+        Err(err) => error!(%err, path = %path.display(), "failed to open the file manager"),
+    }
 }
 
 /// Handle to the emulation thread: the command channel, the published frame,
@@ -163,13 +189,25 @@ impl Emulator {
         c_drive: PathBuf,
         test_pattern: bool,
         sink: Option<AudioSink>,
+        rtc_setup: crate::cmos::RtcSetup,
     ) -> Self {
         let frame = Arc::new(Mutex::new(Frame::default()));
         let (commands, rx) = mpsc::channel();
         let frame_thread = Arc::clone(&frame);
         let join = std::thread::Builder::new()
             .name("izarravm-emu".into())
-            .spawn(move || emulate(profile, rom, c_drive, test_pattern, sink, rx, frame_thread))
+            .spawn(move || {
+                emulate(
+                    profile,
+                    rom,
+                    c_drive,
+                    test_pattern,
+                    sink,
+                    rtc_setup,
+                    rx,
+                    frame_thread,
+                )
+            })
             .expect("spawn emulation thread");
         Self {
             commands,
@@ -182,6 +220,16 @@ impl Emulator {
         let _ = self.commands.send(Command::Keys(codes));
     }
 
+    fn mount_floppy(&self, bytes: Vec<u8>, flush_path: Option<PathBuf>) {
+        let _ = self
+            .commands
+            .send(Command::MountFloppy { bytes, flush_path });
+    }
+
+    fn eject_floppy(&self) {
+        let _ = self.commands.send(Command::EjectFloppy);
+    }
+
     fn shutdown(&mut self) {
         let _ = self.commands.send(Command::Shutdown);
         if let Some(join) = self.join.take() {
@@ -190,15 +238,36 @@ impl Emulator {
     }
 }
 
+/// Eject the A: floppy, writing a dirty image back to its source IMG. A folder
+/// mount (no flush path) or a clean image is ejected without touching the host.
+/// Clears the flush path so a later eject does not rewrite a stale file.
+fn flush_floppy(machine: &mut Machine, flush_path: &mut Option<PathBuf>) {
+    let dirty = machine.floppy_dirty();
+    let Some(bytes) = machine.eject_floppy() else {
+        *flush_path = None;
+        return;
+    };
+    if dirty {
+        if let Some(path) = flush_path.as_ref() {
+            if let Err(err) = std::fs::write(path, &bytes) {
+                error!(%err, path = %path.display(), "failed to flush floppy image");
+            }
+        }
+    }
+    *flush_path = None;
+}
+
 /// The emulation thread body: build the machine, then pace it by wall clock,
 /// pump audio, and publish a frame snapshot, until told to shut down. Nothing
 /// the UI thread does (input floods, slow repaints) can starve this loop.
+#[allow(clippy::too_many_arguments)]
 fn emulate(
     profile: MachineProfile,
     rom: Vec<u8>,
     c_drive: PathBuf,
     test_pattern: bool,
     sink: Option<AudioSink>,
+    rtc_setup: crate::cmos::RtcSetup,
     commands: Receiver<Command>,
     frame: Arc<Mutex<Frame>>,
 ) {
@@ -210,10 +279,17 @@ fn emulate(
             return;
         }
     };
+    // The GUI runs near real time, so let the BIOS play the full graceful POST:
+    // the ~8 s RAM count-up and the startup chime. Headless runs and tests leave
+    // the default (fast) so they finish inside their cycle budgets.
+    machine.set_fast_post(false);
     match HostDrive::mount_c(&c_drive) {
         Ok(drive) => machine.mount_c_drive(drive),
         Err(err) => error!(%err, "failed to mount C: drive"),
     }
+    // Bring the RTC online: load cmos.bin (or write defaults) and seed the clock
+    // from the host time read on the main thread at startup.
+    rtc_setup.apply(&mut machine);
     if test_pattern {
         load_margo_test_pattern(&mut machine);
     }
@@ -225,13 +301,36 @@ fn emulate(
     let mut last = Instant::now();
     let mut published_seq = u64::MAX; // force the first publish
 
+    let cmos_path = rtc_setup.cmos_path.clone();
+    // The source IMG path of the mounted floppy, when it is a writable image
+    // mount. A dirty image is flushed here on eject and on shutdown. Folder mounts
+    // are read-only and leave this None.
+    let mut floppy_flush_path: Option<PathBuf> = None;
     loop {
         loop {
             match commands.try_recv() {
                 Ok(Command::Keys(codes)) => machine.inject_key_scancodes(&codes),
-                Ok(Command::Shutdown) => return,
+                Ok(Command::MountFloppy { bytes, flush_path }) => {
+                    match machine.mount_floppy(bytes) {
+                        Ok(()) => floppy_flush_path = flush_path,
+                        Err(err) => error!(%err, "failed to mount floppy image"),
+                    }
+                }
+                Ok(Command::EjectFloppy) => {
+                    flush_floppy(&mut machine, &mut floppy_flush_path);
+                }
+                Ok(Command::Shutdown) => {
+                    // Flush the floppy and the final CMOS state before exiting.
+                    flush_floppy(&mut machine, &mut floppy_flush_path);
+                    crate::cmos::save_cmos_file(&cmos_path, &machine.cmos_bytes());
+                    return;
+                }
                 Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return,
+                Err(TryRecvError::Disconnected) => {
+                    flush_floppy(&mut machine, &mut floppy_flush_path);
+                    crate::cmos::save_cmos_file(&cmos_path, &machine.cmos_bytes());
+                    return;
+                }
             }
         }
 
@@ -293,6 +392,12 @@ fn emulate(
         }
         published_seq = seq;
 
+        // Persist cmos.bin when the guest wrote an NVRAM byte (a setup-page
+        // save). take_cmos_dirty clears the flag so we write only on a change.
+        if machine.take_cmos_dirty() {
+            crate::cmos::save_cmos_file(&cmos_path, &machine.cmos_bytes());
+        }
+
         std::thread::sleep(EMU_SLICE);
     }
 }
@@ -302,6 +407,7 @@ pub struct GuiApp {
     rom: Vec<u8>,
     c_drive: PathBuf,
     test_pattern: bool,
+    rtc_setup: crate::cmos::RtcSetup,
     title: String,
     // The cpal stream is !Send, so it stays here on the UI thread; the
     // emulation thread gets a Send sink cloned from it.
@@ -319,6 +425,9 @@ pub struct GuiApp {
     events_since: u32,
     host_fps: f64,
     input_rate: f64,
+    // What is mounted in drive A:, for the label. None shows "(empty)". The
+    // emulation thread owns the actual mount; this string mirrors it for display.
+    floppy_label: Option<String>,
 }
 
 impl GuiApp {
@@ -328,6 +437,7 @@ impl GuiApp {
         c_drive: PathBuf,
         audio_enabled: bool,
         test_pattern: bool,
+        rtc_setup: crate::cmos::RtcSetup,
     ) -> Self {
         let audio = if audio_enabled {
             match AudioPlayer::new() {
@@ -348,6 +458,7 @@ impl GuiApp {
             rom,
             c_drive,
             test_pattern,
+            rtc_setup,
             title,
             audio,
             emu: None,
@@ -358,6 +469,7 @@ impl GuiApp {
             events_since: 0,
             host_fps: 0.0,
             input_rate: 0.0,
+            floppy_label: None,
         };
         app.start();
         app
@@ -375,9 +487,12 @@ impl GuiApp {
             self.c_drive.clone(),
             self.test_pattern,
             sink,
+            self.rtc_setup.clone(),
         ));
         self.texture = None;
         self.frame_seq = 0;
+        // A fresh machine boots with an empty drive A:.
+        self.floppy_label = None;
     }
 
     fn stop(&mut self) {
@@ -386,6 +501,7 @@ impl GuiApp {
         }
         self.texture = None;
         self.frame_seq = 0;
+        self.floppy_label = None;
     }
 }
 
@@ -497,16 +613,7 @@ impl GuiApp {
 
         ui.separator();
         ui.heading("Drives");
-        ui.horizontal(|ui| {
-            if ui.button("Mount C: folder...").clicked() {
-                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                    self.c_drive = dir;
-                }
-            }
-        });
-        ui.label(format!("C: {}", self.c_drive.display()));
-        ui.add_enabled(false, egui::Button::new("CD-ROM: not emulated yet"));
-        ui.add_enabled(false, egui::Button::new("Floppy: not emulated yet"));
+        self.drives_ui(ui, running);
 
         ui.separator();
         ui.heading("COM1");
@@ -516,6 +623,112 @@ impl GuiApp {
             .show(ui, |ui| {
                 ui.monospace(serial);
             });
+    }
+
+    /// The three drive rows: A: floppy (load IMG/folder, eject), CD-ROM (the same
+    /// pair, disabled for now), and C: (open the host folder, no mount). `running`
+    /// gates the floppy actions on a live emulation thread to send commands to.
+    fn drives_ui(&mut self, ui: &mut egui::Ui, running: bool) {
+        // A: floppy.
+        ui.label("A: floppy");
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(running, egui::Button::new("Load IMG..."))
+                .clicked()
+            {
+                self.load_floppy_img();
+            }
+            if ui
+                .add_enabled(running, egui::Button::new("Load folder..."))
+                .clicked()
+            {
+                self.load_floppy_folder();
+            }
+            let mounted = self.floppy_label.is_some();
+            if ui
+                .add_enabled(running && mounted, egui::Button::new("Eject"))
+                .clicked()
+            {
+                if let Some(emu) = &self.emu {
+                    emu.eject_floppy();
+                }
+                self.floppy_label = None;
+            }
+        });
+        ui.label(format!(
+            "A: {}",
+            self.floppy_label.as_deref().unwrap_or("(empty)")
+        ));
+
+        ui.add_space(4.0);
+
+        // CD-ROM: the same shape as A:, disabled until the drive is emulated.
+        ui.label("CD-ROM");
+        ui.horizontal(|ui| {
+            ui.add_enabled(false, egui::Button::new("Load IMG..."));
+            ui.add_enabled(false, egui::Button::new("Load folder..."));
+        });
+        ui.label("CD-ROM: not emulated yet");
+
+        ui.add_space(4.0);
+
+        // C: drive. Auto-mounted; no mount button, just open the host folder.
+        ui.label("C: drive");
+        if ui.button("Open C: folder").clicked() {
+            open_in_file_manager(&self.c_drive);
+        }
+        ui.label(format!("C: {}", self.c_drive.display()));
+    }
+
+    /// Pick a floppy IMG and mount it live. The image is writable in memory and
+    /// flushed back to this file on eject, so the source path travels with it.
+    fn load_floppy_img(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Floppy image", &["img", "ima", "flp"])
+            .pick_file()
+        else {
+            return;
+        };
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                error!(%err, path = %path.display(), "failed to read floppy image");
+                return;
+            }
+        };
+        let label = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        if let Some(emu) = &self.emu {
+            emu.mount_floppy(bytes, Some(path));
+            self.floppy_label = Some(label);
+        }
+    }
+
+    /// Pick a host folder, synthesize a FAT12 image from it, and mount it live.
+    /// Folder mounts are read-only, so there is no flush path back to the host.
+    fn load_floppy_folder(&mut self) {
+        let Some(dir) = rfd::FileDialog::new().pick_folder() else {
+            return;
+        };
+        let bytes = match izarravm_machine::build_fat12(&dir) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                error!(%err, dir = %dir.display(), "failed to build a FAT12 image from the folder");
+                return;
+            }
+        };
+        let label = format!(
+            "{} (folder)",
+            dir.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| dir.display().to_string())
+        );
+        if let Some(emu) = &self.emu {
+            emu.mount_floppy(bytes, None);
+            self.floppy_label = Some(label);
+        }
     }
 }
 
@@ -655,6 +868,7 @@ pub fn run(
     c_drive: PathBuf,
     audio_enabled: bool,
     test_pattern: bool,
+    rtc_setup: crate::cmos::RtcSetup,
 ) -> Result<(), Box<dyn Error>> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -673,6 +887,7 @@ pub fn run(
                 c_drive,
                 audio_enabled,
                 test_pattern,
+                rtc_setup,
             )))
         }),
     )?;

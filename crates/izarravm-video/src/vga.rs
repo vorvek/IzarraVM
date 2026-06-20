@@ -209,6 +209,41 @@ impl CrtcTiming {
         }
     }
 
+    /// CGA 320x200 graphics (modes 04h/05h): 200 active scanlines, ~60 Hz. The
+    /// CGA framebuffer carries its own interleave and decode (see `render_cga_row`),
+    /// so this timing only drives the beam and the active-area extent. Not
+    /// double-scanned in the raster model: 200 source rows map to 200 raster lines.
+    pub fn cga_320x200() -> Self {
+        Self {
+            htotal_chars: 100,
+            char_width: 8,
+            hdisp_end: 320,
+            vtotal: 262,
+            vdisp_end: 200,
+            vblank_start: 200,
+            vblank_end: 255,
+            vretrace_start: 224,
+            vretrace_end: 226,
+            max_scan: 0,
+            double_scan: false,
+            start_address: 0,
+            offset: 40,
+            mode_control: 0xE3,
+            underline_loc: 0x00,
+            line_compare: 0x3FF,
+            preset_row_scan: 0,
+        }
+    }
+
+    /// CGA 640x200 graphics (mode 06h): same vertical timing as 320x200, wider
+    /// active area.
+    pub fn cga_640x200() -> Self {
+        Self {
+            hdisp_end: 640,
+            ..Self::cga_320x200()
+        }
+    }
+
     /// Total dots per frame = htotal_dots * vtotal (scan-counter lines).
     pub fn frame_dots(&self) -> u64 {
         (self.htotal_chars * self.char_width) as u64 * self.vtotal as u64
@@ -285,6 +320,130 @@ impl Default for Attribute {
     }
 }
 
+/// CGA graphics framebuffer size: 16 KiB at B800:0000. Two 8000-byte banks
+/// (100 scanlines x 80 bytes each) hold the even and odd scanlines.
+pub const CGA_FB_SIZE: usize = 16 * 1024;
+/// Byte offset of the odd-scanline bank inside the CGA framebuffer. Even
+/// scanlines (0, 2, 4, ...) live at 0x0000; odd scanlines (1, 3, 5, ...) at
+/// 0x2000. Each bank is 8000 bytes (100 lines x 80 bytes per line).
+pub const CGA_ODD_BANK: usize = 0x2000;
+/// Bytes per scanline in every CGA graphics mode: 80. In 320x200x4 that is 4
+/// pixels per byte; in 640x200x2 it is 8 pixels per byte.
+pub const CGA_BYTES_PER_LINE: usize = 80;
+
+/// The CGA graphics submode the B800 framebuffer is decoded as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CgaMode {
+    /// 320x200, 4 colors, 2 bits per pixel (INT 10h modes 04h and 05h).
+    Graphics320x200,
+    /// 640x200, 2 colors, 1 bit per pixel (INT 10h mode 06h).
+    Graphics640x200,
+}
+
+/// CGA graphics state: the framebuffer plus the two control registers the CGA
+/// exposes (mode control 0x3D8 and color select 0x3D9). The mode-control
+/// register is stored for read-back; the displayed geometry comes from the
+/// `submode` the BIOS mode-set installed. Color decode reads `color_select`.
+#[derive(Debug, Clone)]
+pub struct Cga {
+    pub fb: Vec<u8>,
+    pub submode: CgaMode,
+    /// INT 10h mode number (04h, 05h, or 06h). Mode 05h forces the alternate
+    /// red/cyan/white palette regardless of the color-select palette bit.
+    pub bios_mode: u8,
+    pub mode_control: u8, // port 0x3D8 (stored for read-back)
+    pub color_select: u8, // port 0x3D9
+}
+
+impl Default for Cga {
+    fn default() -> Self {
+        Self {
+            fb: vec![0; CGA_FB_SIZE],
+            submode: CgaMode::Graphics320x200,
+            bios_mode: 0x04,
+            mode_control: 0x00,
+            color_select: 0x00,
+        }
+    }
+}
+
+/// The 16 EGA/CGA color numbers as DAC indices. On the stock VGA palette the
+/// first 16 entries are the EGA colors, so a CGA color number is its own DAC
+/// index. Named for the four-color and two-color palette tables below.
+const CGA_BLACK: u8 = 0;
+const CGA_GREEN: u8 = 2;
+const CGA_CYAN: u8 = 3;
+const CGA_RED: u8 = 4;
+const CGA_MAGENTA: u8 = 5;
+const CGA_BROWN: u8 = 6;
+const CGA_LIGHT_GRAY: u8 = 7;
+const CGA_LIGHT_GREEN: u8 = 10;
+const CGA_LIGHT_CYAN: u8 = 11;
+const CGA_LIGHT_RED: u8 = 12;
+const CGA_LIGHT_MAGENTA: u8 = 13;
+const CGA_YELLOW: u8 = 14;
+const CGA_WHITE: u8 = 15;
+
+impl Cga {
+    /// The three foreground colors (pixel values 1, 2, 3) for 320x200x4, decoded
+    /// from the color-select register (port 0x3D9). Bit 5 selects palette 1
+    /// (cyan/magenta/white) over palette 0 (green/red/brown); bit 4 brightens all
+    /// three to their light variants. Mode 05h overrides the palette to the fixed
+    /// cyan/red/white set (IBM CGA / DOSBox), still honoring the intensity bit.
+    /// Pixel value 0 is the background/border from `background_index`.
+    fn palette_320x200(&self) -> [u8; 3] {
+        let intensity = self.color_select & 0x10 != 0;
+        if self.bios_mode == 0x05 {
+            // Alternate palette: cyan / red / white.
+            return if intensity {
+                [CGA_LIGHT_CYAN, CGA_LIGHT_RED, CGA_WHITE]
+            } else {
+                [CGA_CYAN, CGA_RED, CGA_LIGHT_GRAY]
+            };
+        }
+        let palette1 = self.color_select & 0x20 != 0;
+        match (palette1, intensity) {
+            (false, false) => [CGA_GREEN, CGA_RED, CGA_BROWN],
+            (false, true) => [CGA_LIGHT_GREEN, CGA_LIGHT_RED, CGA_YELLOW],
+            (true, false) => [CGA_CYAN, CGA_MAGENTA, CGA_LIGHT_GRAY],
+            (true, true) => [CGA_LIGHT_CYAN, CGA_LIGHT_MAGENTA, CGA_WHITE],
+        }
+    }
+
+    /// The background/border color (pixel value 0 in 320x200x4, the 0 bit in
+    /// 640x200x2): color-select bits 0-3 with bit 4 as the intensity bit, a full
+    /// 4-bit CGA color number, which is its own DAC index on the stock palette.
+    fn background_index(&self) -> u8 {
+        self.color_select & 0x0F
+    }
+
+    /// The foreground color for the 1 bits in 640x200x2: color-select bits 0-3,
+    /// the same field as the background nibble. The background is always black.
+    fn foreground_640x200(&self) -> u8 {
+        let fg = self.color_select & 0x0F;
+        if fg == 0 { CGA_WHITE } else { fg }
+    }
+
+    /// Decode the four DAC indices a 320x200x4 framebuffer byte holds, MSB-first:
+    /// bits 7-6 are pixel 0, 5-4 pixel 1, 3-2 pixel 2, 1-0 pixel 3. Value 0 is the
+    /// background; values 1-3 select from the active four-color palette.
+    fn decode_byte_320x200(&self, byte: u8) -> [u8; 4] {
+        let bg = self.background_index();
+        let fg = self.palette_320x200();
+        let mut out = [0u8; 4];
+        for (px, slot) in out.iter_mut().enumerate() {
+            let shift = 6 - px * 2;
+            let value = (byte >> shift) & 0x03;
+            *slot = if value == 0 {
+                bg
+            } else {
+                fg[(value - 1) as usize]
+            };
+        }
+        out
+    }
+}
+
 /// The pixel-perfect raster the host pulls. Square pixels, no aspect correction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VgaRaster {
@@ -351,6 +510,7 @@ pub struct Vga {
     pub(crate) mode: VideoMode,
     pub(crate) misc_output: u8,
     pub(crate) pel_mask: u8,
+    pub(crate) cga: Cga,
 }
 
 impl Default for Vga {
@@ -392,6 +552,7 @@ impl Default for Vga {
             // not applied to the dot clock.
             misc_output: 0x67,
             pel_mask: 0xFF,
+            cga: Cga::default(),
         };
         // Size the work buffer for the boot text mode so the raster is published
         // from the first frame (finalize_frame only publishes a non-empty work).
@@ -915,6 +1076,7 @@ impl Vga {
             match self.mode {
                 VideoMode::Mode13h | VideoMode::ModeX => self.render_256color_row(counter_line),
                 VideoMode::Text => self.render_text_row(counter_line),
+                VideoMode::Cga => self.render_cga_row(counter_line),
                 _ => self.render_active_row(counter_line),
             }
         } else {
@@ -1148,6 +1310,20 @@ impl Vga {
                 self.write_attr(value);
                 true
             }
+            // CGA Mode Control register: stored for read-back. The displayed
+            // geometry comes from the BIOS mode-set (set_cga_mode), not this
+            // register, so a title that re-bangs it does not change the resolution.
+            0x3D8 => {
+                self.cga.mode_control = value;
+                true
+            }
+            // CGA Color Select register: background/border nibble (bits 0-3),
+            // intensity (bit 4), and palette select (bit 5). Decoded per scanline
+            // in render_cga_row.
+            0x3D9 => {
+                self.cga.color_select = value;
+                true
+            }
             _ => false,
         }
     }
@@ -1169,6 +1345,8 @@ impl Vga {
                 0x0F => Some(self.cursor_offset as u8),
                 _ => Some(0),
             },
+            0x3D8 => Some(self.cga.mode_control),
+            0x3D9 => Some(self.cga.color_select),
             0x3DA => Some(self.read_status1()),
             _ => None,
         }
@@ -1334,6 +1512,98 @@ impl Vga {
         self.mode = VideoMode::Mode13h;
         self.presented = None; // drop any stale frame from a prior mode
         self.resize_work();
+    }
+
+    /// Switch to a CGA graphics mode by its INT 10h number (04h, 05h, or 06h).
+    /// Installs the CGA timing, marks the framebuffer aperture active, and clears
+    /// the framebuffer (a fresh mode-set starts on a blank screen, like the BIOS
+    /// clear). Returns false for a number this path does not implement, leaving
+    /// the current mode untouched. Mode 05h carries the alternate red/cyan/white
+    /// palette through `Cga::bios_mode`.
+    pub fn set_cga_mode(&mut self, mode: u8) -> bool {
+        let (timing, submode) = match mode {
+            0x04 | 0x05 => (CrtcTiming::cga_320x200(), CgaMode::Graphics320x200),
+            0x06 => (CrtcTiming::cga_640x200(), CgaMode::Graphics640x200),
+            _ => return false,
+        };
+        self.crtc = timing;
+        self.cga.submode = submode;
+        self.cga.bios_mode = mode;
+        // The BIOS mode-set programs the color-select default: background black,
+        // palette 0, no intensity. A title that wants other colors writes 0x3D9.
+        self.cga.color_select = 0x00;
+        self.cga.mode_control = 0x00;
+        for byte in self.cga.fb.iter_mut() {
+            *byte = 0;
+        }
+        self.beam = 0;
+        self.last_line = 0;
+        self.mode = VideoMode::Cga;
+        self.presented = None;
+        self.pending_start = None;
+        self.resize_work();
+        true
+    }
+
+    /// Write one byte into the CGA framebuffer at a B800 aperture offset. The
+    /// offset is the raw byte offset from B800:0000 (0..16383); the interleave
+    /// lives in the layout the guest writes, so the store is a flat copy and the
+    /// scanout (`render_cga_row`) reinterprets the banks.
+    pub fn cga_write(&mut self, offset: usize, value: u8) {
+        if let Some(slot) = self.cga.fb.get_mut(offset & (CGA_FB_SIZE - 1)) {
+            *slot = value;
+        }
+    }
+
+    /// Read one byte from the CGA framebuffer at a B800 aperture offset.
+    pub fn cga_read(&self, offset: usize) -> u8 {
+        self.cga
+            .fb
+            .get(offset & (CGA_FB_SIZE - 1))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Assemble one CGA graphics scanline into `hdisp_end` DAC indices. The
+    /// classic CGA interleave maps display scanline `y` to framebuffer bank
+    /// `(y & 1) * 0x2000` plus `(y >> 1) * 80` bytes; even lines sit in the low
+    /// bank, odd lines in the high bank. 320x200x4 unpacks 4 pixels per byte
+    /// (2 bits each, MSB first) through the four-color palette; 640x200x2 unpacks
+    /// 8 pixels per byte (1 bit each) through the background/foreground pair.
+    pub fn render_cga_row(&self, counter_line: u32) -> Vec<u8> {
+        let width = self.crtc.hdisp_end as usize;
+        let y = counter_line as usize;
+        let bank = (y & 1) * CGA_ODD_BANK;
+        let row_base = bank + (y >> 1) * CGA_BYTES_PER_LINE;
+        let mut row = vec![0u8; width];
+        match self.cga.submode {
+            CgaMode::Graphics320x200 => {
+                for byte_col in 0..CGA_BYTES_PER_LINE {
+                    let byte = self.cga.fb.get(row_base + byte_col).copied().unwrap_or(0);
+                    let pixels = self.cga.decode_byte_320x200(byte);
+                    for (sub, &index) in pixels.iter().enumerate() {
+                        let x = byte_col * 4 + sub;
+                        if x < width {
+                            row[x] = index;
+                        }
+                    }
+                }
+            }
+            CgaMode::Graphics640x200 => {
+                let bg = CGA_BLACK;
+                let fg = self.cga.foreground_640x200();
+                for byte_col in 0..CGA_BYTES_PER_LINE {
+                    let byte = self.cga.fb.get(row_base + byte_col).copied().unwrap_or(0);
+                    for bit in 0..8 {
+                        let x = byte_col * 8 + bit;
+                        if x < width {
+                            row[x] = if (byte >> (7 - bit)) & 1 != 0 { fg } else { bg };
+                        }
+                    }
+                }
+            }
+        }
+        row
     }
 
     /// Switch to the 80x25 text mode (mode 03h), resetting the beam, clearing the
@@ -1649,6 +1919,118 @@ pub fn display_offset(mode_control: u8, underline_loc: u8, ma: u32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cga_320x200_decodes_a_byte_msb_first() {
+        // Mode 04h, default color select (palette 0, low intensity): foreground
+        // colors are green(2)/red(4)/brown(6), background is 0.
+        let mut vga = Vga::default();
+        assert!(vga.set_cga_mode(0x04));
+        // 0b00_01_10_11: px0 = 0 (bg), px1 = 1 (green), px2 = 2 (red), px3 = 3 (brown).
+        let decoded = vga.cga.decode_byte_320x200(0b00_01_10_11);
+        assert_eq!(decoded, [CGA_BLACK, CGA_GREEN, CGA_RED, CGA_BROWN]);
+        // 0b11_10_01_00: the reverse order.
+        let decoded = vga.cga.decode_byte_320x200(0b11_10_01_00);
+        assert_eq!(decoded, [CGA_BROWN, CGA_RED, CGA_GREEN, CGA_BLACK]);
+    }
+
+    #[test]
+    fn cga_color_select_picks_the_palette() {
+        let mut vga = Vga::default();
+        assert!(vga.set_cga_mode(0x04));
+        // Palette 1 (bit 5), low intensity: cyan(3)/magenta(5)/light gray(7).
+        vga.write_port(0x3D9, 0x20);
+        assert_eq!(
+            vga.cga.decode_byte_320x200(0b00_01_10_11),
+            [CGA_BLACK, CGA_CYAN, CGA_MAGENTA, CGA_LIGHT_GRAY]
+        );
+        // Palette 1 with intensity (bit 4 + bit 5): light cyan/light magenta/white.
+        vga.write_port(0x3D9, 0x30);
+        assert_eq!(
+            vga.cga.decode_byte_320x200(0b00_01_10_11),
+            [CGA_BLACK, CGA_LIGHT_CYAN, CGA_LIGHT_MAGENTA, CGA_WHITE]
+        );
+        // Palette 0 with intensity (bit 4 only): light green/light red/yellow.
+        vga.write_port(0x3D9, 0x10);
+        assert_eq!(
+            vga.cga.decode_byte_320x200(0b00_01_10_11),
+            [CGA_BLACK, CGA_LIGHT_GREEN, CGA_LIGHT_RED, CGA_YELLOW]
+        );
+        // The background nibble (bits 0-3) sets pixel value 0.
+        vga.write_port(0x3D9, 0x01); // background = blue(1)
+        assert_eq!(vga.cga.decode_byte_320x200(0b00_00_00_00)[0], 1);
+    }
+
+    #[test]
+    fn cga_mode_05h_forces_the_alternate_palette() {
+        // Mode 05h ignores the palette-select bit and uses cyan/red/white. With
+        // intensity off the canonical IBM/DOSBox set is cyan(3)/red(4)/light
+        // gray(7).
+        let mut vga = Vga::default();
+        assert!(vga.set_cga_mode(0x05));
+        vga.write_port(0x3D9, 0x20); // palette-select bit is ignored in mode 05h
+        assert_eq!(
+            vga.cga.decode_byte_320x200(0b00_01_10_11),
+            [CGA_BLACK, CGA_CYAN, CGA_RED, CGA_LIGHT_GRAY]
+        );
+        // With intensity (bit 4): light cyan/light red/white.
+        vga.write_port(0x3D9, 0x10);
+        assert_eq!(
+            vga.cga.decode_byte_320x200(0b00_01_10_11),
+            [CGA_BLACK, CGA_LIGHT_CYAN, CGA_LIGHT_RED, CGA_WHITE]
+        );
+    }
+
+    #[test]
+    fn cga_interleave_addresses_odd_lines_in_the_high_bank() {
+        // The even/odd interleave: scanline 0 reads framebuffer offset 0x0000,
+        // scanline 1 reads offset 0x2000, scanline 2 reads 0x0050 (80 bytes), and
+        // scanline 3 reads 0x2050.
+        let mut vga = Vga::default();
+        assert!(vga.set_cga_mode(0x04));
+        // Place a distinctive byte at the start of each bank's first two rows.
+        vga.cga_write(0x0000, 0b01_01_01_01); // even bank, row 0: value 1 -> green
+        vga.cga_write(0x2000, 0b10_10_10_10); // odd bank, row 0: value 2 -> red
+        vga.cga_write(0x0050, 0b11_11_11_11); // even bank, row 1 (line 2)
+        vga.cga_write(0x2050, 0b00_01_10_11); // odd bank, row 1 (line 3)
+        // Scanline 1 (odd) must read from 0x2000: every pixel is value 2 -> red.
+        let line1 = vga.render_cga_row(1);
+        assert_eq!(&line1[0..4], &[CGA_RED; 4]);
+        // Scanline 0 (even) reads 0x0000: value 1 -> green for every pixel,
+        // confirming bank selection by scanline parity.
+        let line0 = vga.render_cga_row(0);
+        assert_eq!(&line0[0..4], &[CGA_GREEN; 4]);
+        // Scanline 2 (even, second row) reads 0x0050: value 3 -> brown.
+        let line2 = vga.render_cga_row(2);
+        assert_eq!(&line2[0..4], &[CGA_BROWN; 4]);
+        // Scanline 3 (odd, second row) reads 0x2050: bg/green/red/brown.
+        let line3 = vga.render_cga_row(3);
+        assert_eq!(&line3[0..4], &[CGA_BLACK, CGA_GREEN, CGA_RED, CGA_BROWN]);
+    }
+
+    #[test]
+    fn cga_640x200_unpacks_one_bit_per_pixel() {
+        let mut vga = Vga::default();
+        assert!(vga.set_cga_mode(0x06));
+        assert_eq!(vga.crtc.hdisp_end, 640);
+        assert_eq!(vga.active_mode(), VideoMode::Cga);
+        // Foreground defaults to white (bits 0-3 = 0 -> white); 0b10101010 lights
+        // every other pixel.
+        vga.cga_write(0x0000, 0b1010_1010);
+        let line0 = vga.render_cga_row(0);
+        assert_eq!(&line0[0..8], &[15, 0, 15, 0, 15, 0, 15, 0]);
+    }
+
+    #[test]
+    fn cga_mode_set_installs_geometry_and_mode() {
+        let mut vga = Vga::default();
+        assert!(vga.set_cga_mode(0x04));
+        assert_eq!(vga.active_mode(), VideoMode::Cga);
+        assert_eq!(vga.raster_width(), 320);
+        assert_eq!(vga.crtc.vdisp_end, 200);
+        // An unimplemented number leaves the mode untouched.
+        assert!(!vga.set_cga_mode(0x09));
+    }
 
     #[test]
     fn display_offset_applies_byte_word_dword_transforms() {

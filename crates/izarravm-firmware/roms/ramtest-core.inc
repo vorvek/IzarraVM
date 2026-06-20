@@ -97,6 +97,10 @@ ramtest_run:
     mov bx, BDA_SEG
     mov ds, bx
     mov [0x0013], cx               ; INT 12h word (low 16 bits of KiB)
+    ; The real test and the result records are done. Now run the cosmetic
+    ; count-up and bar (skipped under fast POST), which paces the screen to about
+    ; 8 s and lets Esc fast-forward. It never changes the published size.
+    call ramtest_animate
     mov al, HRES_PASS
     jmp .done
 .fail_pop:
@@ -162,4 +166,153 @@ ramtest_size:
     pop edx
     pop ecx
     pop ebx
+    ret
+
+; --- Cosmetic RAM count-up animation ----------------------------------------
+; ramtest_animate paces the screen to about 8 s: a "Testing memory: NNNNN KB"
+; line counting up to the detected size and a red progress bar that fills, with
+; Esc fast-forwarding to the full size. None of this touches the published
+; RAMTEST_KIB or the result records; it only animates what the real test already
+; measured. Under fast POST (port PORT_FAST_POST reads 1) it draws the final
+; state once and returns, so headless runs and tests stay inside their budgets.
+
+%define ANIM_STEPS     150           ; count-up steps (~1 PIT tick each ~= 8 s)
+%define RAMTEST_TARGET (RAMTEST_SCRATCH + 0x20)   ; word: target KiB (display cap)
+
+ramtest_animate:
+    pusha
+    ; Target KiB for the display, capped at 65535 so the 5-digit field fits.
+    xor ax, ax
+    mov ds, ax
+    mov eax, [RAMTEST_KIB]
+    cmp eax, 65535
+    jbe .have_target
+    mov eax, 65535
+.have_target:
+    mov [RAMTEST_TARGET], ax
+
+    ; Fast POST: skip the pacing, draw the full count and a full bar, return.
+    in al, PORT_FAST_POST
+    test al, 1
+    jz .slow
+    mov ax, [RAMTEST_TARGET]
+    call gfx_post_mem
+    mov ax, 100
+    call gfx_bar_fill
+    jmp .out
+
+.slow:
+    ; Program PIT counter 0: mode 2, LSB/MSB, reload 0 (= 65536) so it wraps at
+    ; ~18.2 Hz of emulated time, giving a real-time tick to pace on.
+    mov al, 0x34
+    out PORT_PIT_CTRL, al
+    xor al, al
+    out PORT_PIT_CH0, al            ; reload LSB
+    out PORT_PIT_CH0, al            ; reload MSB
+
+    mov cx, 1                       ; step index 1..ANIM_STEPS
+.step:
+    ; displayed KiB = target * step / ANIM_STEPS
+    mov ax, [RAMTEST_TARGET]
+    mul cx                          ; DX:AX = target * step (target<=65535, step<=150)
+    mov bx, ANIM_STEPS
+    div bx                          ; AX = displayed KiB
+    call gfx_post_mem
+    ; bar percent = step * 100 / ANIM_STEPS
+    mov ax, cx
+    mov bx, 100
+    mul bx
+    mov bx, ANIM_STEPS
+    xor dx, dx
+    div bx
+    call gfx_bar_fill
+    ; Esc (scancode 0x01) aborts to the full size with a skip note.
+    call ramtest_esc_pressed
+    jc .skipped
+    call ramtest_pit_wait
+    inc cx
+    cmp cx, ANIM_STEPS
+    jbe .step
+    jmp .out
+
+.skipped:
+    ; Fast-forward: show the full detected size, a full bar, and the skip note.
+    mov ax, [RAMTEST_TARGET]
+    call gfx_post_mem
+    mov ax, 100
+    call gfx_bar_fill
+    push cs
+    pop ds
+    mov si, str_post_skip
+    ; gfx_post_note expects DS:SI = CS-relative string; it draws on the mem row.
+    ; The skip note sits just below the bar so the final count stays visible.
+    mov di, POST_TEXT_X
+    mov ax, POST_BAR_Y + POST_BAR_H + 6
+    mov bl, GFX_BLACK
+    mov bh, GFX_WHITE
+    call gfx_text
+.out:
+    popa
+    ret
+
+; ramtest_esc_pressed: CF=1 if Esc (scancode 0x01) is waiting in the BDA ring,
+; else CF=0. Peeks the ring head without consuming; the keyboard ISR (INT 09h)
+; fills it. Preserves all registers except flags.
+ramtest_esc_pressed:
+    push ax
+    push bx
+    push ds
+    mov ax, BDA_SEG
+    mov ds, ax
+    mov bx, [KB_BUF_HEAD]
+    cmp bx, [KB_BUF_TAIL]
+    je .none
+    mov ax, [bx]                    ; AH = scancode, AL = ASCII
+    cmp ah, 0x01                    ; Esc make code
+    jne .none
+    pop ds
+    pop bx
+    pop ax
+    stc
+    ret
+.none:
+    pop ds
+    pop bx
+    pop ax
+    clc
+    ret
+
+; ramtest_pit_wait: block until PIT counter 0 reloads once (~54.9 ms of emulated
+; time). The counter decrements; a wrap is seen when a fresh latch-read reads
+; higher than the previous one. The busy poll also advances emulated time, so the
+; counter actually moves. Preserves all registers.
+ramtest_pit_wait:
+    push ax
+    push bx
+    push cx
+    call ramtest_pit_read           ; BX = initial count
+    mov cx, bx
+.spin:
+    call ramtest_pit_read           ; BX = current count
+    cmp bx, cx                      ; counter wrapped (count rose) -> done
+    ja .done
+    mov cx, bx                      ; track the falling count
+    jmp .spin
+.done:
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; ramtest_pit_read: latch and read PIT counter 0 -> BX = 16-bit count. Preserves
+; AX. Uses the latch command (0x00 to the control port) then LSB, MSB from 0x40.
+ramtest_pit_read:
+    push ax
+    xor al, al                      ; latch counter 0
+    out PORT_PIT_CTRL, al
+    in al, PORT_PIT_CH0             ; LSB
+    mov bl, al
+    in al, PORT_PIT_CH0             ; MSB
+    mov bh, al
+    pop ax
     ret

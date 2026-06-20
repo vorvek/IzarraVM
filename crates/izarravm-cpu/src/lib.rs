@@ -717,6 +717,67 @@ impl Cpu386 {
                 self.load_segment(bus, segment, value as u16)?;
                 Ok(clocks(7))
             }
+            0x8f => {
+                // POP r/m16/32 (group 1A). Only reg=000 is defined; other reg
+                // values are an illegal encoding. The popped value goes to the
+                // r/m operand, which may be a register or memory. No flags change.
+                let modrm = self.fetch_modrm(bus)?;
+                if modrm.reg != 0 {
+                    return Err(CpuError::UnsupportedGroupOpcode {
+                        opcode,
+                        extension: modrm.reg,
+                    }
+                    .into());
+                }
+                // The displacement (if any) is fetched while decoding the operand,
+                // so decode first, then pop. A POP into memory addressed through
+                // ESP would, per Intel, compute the effective address after the
+                // stack increment; that edge case is not exercised here and is
+                // deferred (the common register and disp-addressed forms match).
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
+                let value = self.pop(bus, operand_size)?;
+                self.write_operand_sized(bus, operand, operand_size, value)?;
+                Ok(clocks(5))
+            }
+            0xc4 | 0xc5 => {
+                // LES (0xc4) / LDS (0xc5): load a far pointer from memory. The ModRM r/m
+                // names the memory operand; the low half (operand size) goes into the reg
+                // operand and the next word is loaded into ES (0xc4) or DS (0xc5). No flags
+                // change. mod=3 (a register r/m) is an invalid encoding and faults with #UD.
+                let modrm = self.fetch_modrm(bus)?;
+                let mem = match self.decode_rm_operand(bus, prefixes, address_size, modrm)? {
+                    RmOperand::Memory(mem) => mem,
+                    RmOperand::Register(_) => {
+                        return Err(InternalFault::Exception {
+                            vector: 6,
+                            error_code: None,
+                        });
+                    }
+                };
+                let offset = self.read_memory_sized(
+                    bus,
+                    mem.segment,
+                    mem.offset,
+                    operand_size,
+                    BusAccessKind::DataRead,
+                )?;
+                let selector_offset = mem.offset.wrapping_add(operand_size.bytes());
+                let selector = self.read_memory_sized(
+                    bus,
+                    mem.segment,
+                    selector_offset,
+                    OperandSize::Word,
+                    BusAccessKind::DataRead,
+                )? as u16;
+                let segment = if opcode == 0xc4 {
+                    SegmentIndex::Es
+                } else {
+                    SegmentIndex::Ds
+                };
+                self.load_segment(bus, segment, selector)?;
+                self.write_gpr_sized(modrm.reg, operand_size, offset);
+                Ok(clocks(7))
+            }
             0x90 => Ok(clocks(3)),
             0x91..=0x97 => {
                 // XCHG AX/EAX, reg. The register index is the low 3 opcode bits; 0x90 (index 0,
@@ -793,6 +854,32 @@ impl Cpu386 {
                 let ah = ((self.registers.eflags as u8) & 0xd5) | 0x02;
                 self.write_gpr8(4, ah);
                 Ok(clocks(2))
+            }
+            0xa0 => {
+                // MOV AL, moffs8: byte form, ignores the operand-size prefix and
+                // leaves flags untouched.
+                let offset = self.fetch_moffs(bus, address_size)?;
+                let value = self.read_memory_u8(
+                    bus,
+                    prefixes.segment_override.unwrap_or(SegmentIndex::Ds),
+                    offset,
+                    BusAccessKind::DataRead,
+                )?;
+                self.write_gpr8(0, value);
+                Ok(clocks(4))
+            }
+            0xa2 => {
+                // MOV moffs8, AL: byte counterpart to 0xa3, flags untouched.
+                let offset = self.fetch_moffs(bus, address_size)?;
+                let value = self.read_gpr8(0);
+                self.write_memory_u8(
+                    bus,
+                    prefixes.segment_override.unwrap_or(SegmentIndex::Ds),
+                    offset,
+                    value,
+                    BusAccessKind::DataWrite,
+                )?;
+                Ok(clocks(4))
             }
             0xa1 => {
                 let offset = self.fetch_moffs(bus, address_size)?;
@@ -3624,6 +3711,52 @@ mod tests {
     }
 
     #[test]
+    fn moffs_loads_al_from_direct_offset() {
+        // mov al, [0x0200] (0xa0 0x00 0x02). Byte form ignores the operand-size
+        // prefix and touches only AL. It must not disturb flags.
+        let mut memory = vec![0; 1024];
+        memory[0..3].copy_from_slice(&[0xa0, 0x00, 0x02]);
+        memory[0x200] = 0x7e;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x11ff);
+        let flags_before = cpu.registers.eflags;
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        // AL replaced, AH preserved, instruction is three bytes long.
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x117e);
+        assert_eq!(cpu.registers.eip, 3);
+        assert_eq!(cpu.registers.eflags, flags_before);
+    }
+
+    #[test]
+    fn moffs_stores_al_to_direct_offset() {
+        // mov [0x0200], al (0xa2 0x00 0x02). Byte form writes only one byte and
+        // leaves flags alone.
+        let mut memory = vec![0; 1024];
+        memory[0..3].copy_from_slice(&[0xa2, 0x00, 0x02]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x22a5);
+        let flags_before = cpu.registers.eflags;
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(bus.memory[0x200], 0xa5);
+        // The neighbouring byte is untouched by a byte store.
+        assert_eq!(bus.memory[0x201], 0x00);
+        assert_eq!(cpu.registers.eip, 3);
+        assert_eq!(cpu.registers.eflags, flags_before);
+    }
+
+    #[test]
     fn page_translation_reads_identity_mapped_memory() {
         let mut memory = vec![0; 0x4000];
         memory[0x1000..0x1004].copy_from_slice(&0x0000_2003u32.to_le_bytes());
@@ -5173,6 +5306,77 @@ mod tests {
     }
 
     #[test]
+    fn lds_loads_offset_and_ds() {
+        // lds bx, [0x0200]  (0xc5 0x1e 0x00 0x02). Loads the far pointer at DS:0x0200:
+        // BX <- word[0x0200], DS <- word[0x0202]. No flags change.
+        let mut memory = vec![0; 0x1000];
+        memory[0..4].copy_from_slice(&[0xc5, 0x1e, 0x00, 0x02]);
+        memory[0x0200] = 0x34; // offset low
+        memory[0x0201] = 0x12; // offset high -> 0x1234
+        memory[0x0202] = 0x00; // selector low
+        memory[0x0203] = 0x90; // selector high -> 0x9000
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        let flags_before = cpu.registers.eflags;
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Bx), 0x1234);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ds).selector, 0x9000);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ds).base, 0x9000 << 4);
+        assert_eq!(cpu.registers.eflags, flags_before);
+    }
+
+    #[test]
+    fn les_loads_offset_and_es() {
+        // les di, [bx]  (0xc4 0x3f). With BX=0x0300 it loads DS:0x0300:
+        // DI <- word[0x0300], ES <- word[0x0302]. No flags change.
+        let mut memory = vec![0; 0x1000];
+        memory[0..2].copy_from_slice(&[0xc4, 0x3f]);
+        memory[0x0300] = 0x78; // offset low
+        memory[0x0301] = 0x56; // offset high -> 0x5678
+        memory[0x0302] = 0x00; // selector low
+        memory[0x0303] = 0xb8; // selector high -> 0xb800
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Es, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_ebx(0x0300);
+        let flags_before = cpu.registers.eflags;
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Di), 0x5678);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Es).selector, 0xb800);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Es).base, 0xb800 << 4);
+        assert_eq!(cpu.registers.eflags, flags_before);
+    }
+
+    #[test]
+    fn lds_with_register_operand_delivers_ud() {
+        // lds ax, bx  (0xc5 0xc3, mod=3) is an invalid encoding -> #UD (vector 6).
+        // IVT[6] at 0x18 points to IP 0x00ee, CS 0; the CPU vectors there.
+        let mut memory = vec![0; 1024];
+        memory[0..2].copy_from_slice(&[0xc5, 0xc3]);
+        memory[0x18] = 0xee; // vector 6 IP low byte (IP = 0x00ee)
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eip, 0x00ee);
+    }
+
+    #[test]
     fn cbw_sign_extends_al_into_ax() {
         // cbw (0x98): al = 0x80 (-128) -> ax = 0xff80.
         let mut memory = vec![0; 64];
@@ -5484,6 +5688,95 @@ mod tests {
 
         // SP 0x200 + 32 = 0x220; high half from the discarded slot = 0x5a04.
         assert_eq!(cpu.registers.esp(), 0x5a04_0220);
+    }
+
+    #[test]
+    fn pop_rm16_into_memory_disp16() {
+        // 8F /0 with mod=00 rm=110 disp16: POP word [0x0200]. The encoding the
+        // Wizardry III booter uses (with a CS override). Pops the stack top into
+        // the memory word and advances SP by 2. Arithmetic flags are untouched.
+        let mut memory = vec![0; 1024];
+        memory[0..4].copy_from_slice(&[0x8f, 0x06, 0x00, 0x02]);
+        // Stack top at ss:0x0100 = 0xbeef.
+        memory[0x100..0x102].copy_from_slice(&0xbeefu16.to_le_bytes());
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        cpu.registers.eflags = 0x0000_0ed7; // all arithmetic flags set
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(
+            u16::from_le_bytes([bus.memory[0x200], bus.memory[0x201]]),
+            0xbeef
+        );
+        assert_eq!(cpu.read_gpr16(4), 0x0102); // SP advanced by 2
+        assert_eq!(cpu.registers.eflags, 0x0000_0ed7); // flags unchanged
+    }
+
+    #[test]
+    fn pop_rm16_into_register() {
+        // 8F /0 with mod=11 rm=011: POP BX. Register destination form.
+        let mut memory = vec![0; 1024];
+        memory[0..2].copy_from_slice(&[0x8f, 0xc3]);
+        memory[0x100..0x102].copy_from_slice(&0x1234u16.to_le_bytes());
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Bx), 0x1234);
+        assert_eq!(cpu.read_gpr16(4), 0x0102);
+    }
+
+    #[test]
+    fn pop_rm32_into_register_preserves_high_esp() {
+        // 0x66 8F /0 mod=11 rm=001: POP ECX, 32-bit operand on a 16-bit stack.
+        // The full dword loads into ECX; SP advances by 4 and ESP[31:16] is kept.
+        let mut memory = vec![0; 1024];
+        memory[0..3].copy_from_slice(&[0x66, 0x8f, 0xc1]);
+        memory[0x100..0x104].copy_from_slice(&0xcafe_f00du32.to_le_bytes());
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0xdead_0100);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.ecx(), 0xcafe_f00d);
+        assert_eq!(cpu.registers.esp(), 0xdead_0104);
+    }
+
+    #[test]
+    fn pop_rm_reg_nonzero_is_illegal() {
+        // 8F with reg != 0 is an illegal group encoding (group 1A reserves only /0).
+        let mut memory = vec![0; 1024];
+        memory[0..2].copy_from_slice(&[0x8f, 0xcb]); // mod=11 reg=001 rm=011
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        let mut bus = TestBus::with_memory(memory);
+
+        let err = cpu.cycle(&mut bus).unwrap_err();
+        assert!(matches!(
+            err,
+            CpuError::UnsupportedGroupOpcode {
+                opcode: 0x8f,
+                extension: 1
+            }
+        ));
     }
 
     #[test]

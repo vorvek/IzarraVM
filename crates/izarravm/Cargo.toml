@@ -22,3 +22,4 @@ izarravm-firmware = { path = "../izarravm-firmware" }
 izarravm-input = { path = "../izarravm-input" }
 izarravm-machine = { path = "../izarravm-machine" }
 izarravm-video = { path = "../izarravm-video" }
+time = { version = "0.3.45", default-features = false, features = ["std", "local-offset"] }

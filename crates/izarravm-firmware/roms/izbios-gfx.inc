@@ -216,89 +216,309 @@ status_panel_draw:
     ret
 str_post_title: db 'IZARRA 3000 POST', 0
 
-; console_init: enter mode 13h, clear, draw the boot-console title, and reset the
-; console row. Called once at the start of POST so the main window shows a boot log.
+; console_init: paint the graceful POST screen (white field, red Izarra 3000
+; wordmark, black title and hint lines, empty progress bar). Called once at the
+; start of POST. The per-step boot log moves to COM1; the on-screen experience is
+; the graphical screen plus the RAM count-up, not a scrolling text log.
 console_init:
-    call set_mode13h
-    mov al, COLOR_BG
-    call gfx_clear
-    push cs
-    pop ds
-    mov si, str_console_title
-    mov di, STATUS_X
-    mov ax, STATUS_TITLE_Y
-    mov bl, COLOR_TITLE
-    mov bh, COLOR_BG
-    call gfx_text
+    call gfx_post_screen
     xor ax, ax
     mov ds, ax
-    mov word [CONSOLE_ROW_Y], STATUS_Y
+    mov word [CONSOLE_ROW_Y], POST_HINT_Y
     ret
-str_console_title: db 'IZARRA 3000 BIOS   POWER-ON SELF TEST', 0
 
-; console_step_line: draw one boot-log line and advance the console row. SI = step
-; name (CS-relative ROM ptr), AL = handler status (HRES_PASS/FAIL/MEASURE), DX =
-; segment-0 offset of the ASCIIZ value (MEASURE only). CL, DX, SI and BP survive
-; gfx_text (its pusha/popa), so they carry state across the two draws. Preserves
-; all caller registers.
+; console_step_line: per-step hook kept for the POST sequencer's call site. The
+; graceful screen shows the wordmark and RAM count-up rather than a scrolling
+; text log, so this no longer draws; the per-step PASS/FAIL log is mirrored to
+; COM1 instead (a later stream). It preserves all caller registers so the
+; sequencer's name pointer in SI and status in AL survive across the call.
 console_step_line:
+    ret
+
+; --- Graceful POST screen primitives ---------------------------------------
+; The boot screen is an Amiga/Mac-style white field with black text, a red
+; "Izarra 3000" wordmark across the top, and a red progress bar for the RAM
+; test. The palette below repaints three DAC slots so gfx_clear/gfx_text/the
+; blit all reach those exact colors regardless of the mode-13h defaults.
+
+; gfx_post_palette: program the three boot-screen DAC slots (white background,
+; black text, red accent). Uses INT 10h AH=10h AL=10h per slot. R/G/B are 6-bit.
+gfx_post_palette:
     push ax
     push bx
     push cx
     push dx
-    push si
-    push di
-    push bp
-    push ds
-    mov cl, al                  ; CL = status (survives gfx_text)
-    xor ax, ax
-    mov ds, ax
-    mov bp, [CONSOLE_ROW_Y]     ; BP = row Y (survives gfx_text)
-    push cs
-    pop ds                      ; DS = CS for the ROM name string
-    mov di, STATUS_X
-    mov ax, bp
-    mov bx, COLOR_INFO          ; bl = grey, bh = 0
-    call gfx_text               ; SI still = name afterward
-    cmp cl, HRES_MEASURE
-    je .measure
-    cmp cl, HRES_FAIL
-    je .fail
-    push cs
-    pop ds
-    mov si, str_ok
-    mov bx, COLOR_PASS
-    jmp .draw
-.fail:
-    push cs
-    pop ds
-    mov si, str_fail
-    mov bx, COLOR_FAIL
-    jmp .draw
-.measure:
-    xor ax, ax
-    mov ds, ax                  ; the value lives in segment 0
-    mov si, dx
-    mov bx, COLOR_MEASURE
-.draw:
-    mov di, STATUS_VALUE_X
-    mov ax, bp
-    call gfx_text
-    xor ax, ax
-    mov ds, ax
-    add bp, STATUS_LINE_DY
-    mov [CONSOLE_ROW_Y], bp
-    pop ds
-    pop bp
-    pop di
-    pop si
+    mov bx, GFX_WHITE           ; index 0 -> full white
+    mov dh, 63
+    mov ch, 63
+    mov cl, 63
+    call gfx_set_palette
+    mov bx, GFX_BLACK           ; index 1 -> black
+    xor dh, dh
+    xor ch, ch
+    xor cl, cl
+    call gfx_set_palette
+    mov bx, GFX_RED             ; index 4 -> pure red
+    mov dh, 63
+    xor ch, ch
+    xor cl, cl
+    call gfx_set_palette
     pop dx
     pop cx
     pop bx
     pop ax
     ret
-str_ok:   db 'OK', 0
-str_fail: db 'FAIL', 0
+
+; gfx_blit_1bpp: draw a 1-bpp ROM bitmap, set bits painted in color BL, clear
+; bits left alone so the background shows through. CS:SI = bitmap top row,
+; DI = x, AX = y, CX = width in pixels, DX = height in rows, BH = stride (bytes
+; per source row). Geometry lives in segment-0 scratch (BLIT_*) so the inner
+; loops keep their registers free. The set-bit-only blit keeps the white field
+; intact around the red wordmark.
+gfx_blit_1bpp:
+    pusha
+    push es
+    push ds
+    ; Stash the geometry into segment-0 scratch.
+    push ax                     ; save y for the scratch store
+    xor ax, ax
+    mov ds, ax                  ; DS = 0 for the scratch words
+    mov [BLIT_X], di
+    mov [BLIT_W], cx
+    mov [BLIT_H], dx
+    mov [BLIT_COLOR], bl
+    movzx bx, bh
+    mov [BLIT_STRIDE], bx
+    pop ax                      ; restore y
+    mov [BLIT_Y], ax
+    mov ax, VGA13_SEG
+    mov es, ax                  ; ES = framebuffer
+.row_loop:
+    xor ax, ax
+    mov ds, ax
+    mov dx, [BLIT_H]
+    test dx, dx
+    jz .done
+    ; Row start offset = y*320 + x.
+    mov ax, [BLIT_Y]
+    mov bx, 320
+    mul bx                      ; AX = y*320 (y<200, DX=0)
+    add ax, [BLIT_X]
+    mov di, ax                  ; ES:DI = first pixel of this scanline
+    xor bp, bp                  ; BP = pixel column (survives the shift work)
+.col_loop:
+    cmp bp, [BLIT_W]            ; DS=0 here from the row setup
+    jae .row_end
+    ; bit = source[col>>3], MSB first within the byte.
+    mov bx, bp
+    shr bx, 3                   ; byte index in the source row
+    add bx, si                  ; CS:BX -> source byte
+    mov al, [cs:bx]
+    mov cx, bp
+    and cl, 7
+    mov ah, 7
+    sub ah, cl                  ; AH = bit position (7..0)
+    mov cl, ah
+    shr al, cl                  ; the target bit drops to bit 0
+    test al, 1
+    jz .skip
+    mov ah, [BLIT_COLOR]
+    mov [es:di], ah
+.skip:
+    inc di
+    inc bp
+    jmp .col_loop
+.row_end:
+    mov ax, [BLIT_Y]
+    inc ax
+    mov [BLIT_Y], ax
+    mov ax, [BLIT_STRIDE]
+    add si, ax                  ; advance source to the next row
+    dec word [BLIT_H]
+    jmp .row_loop
+.done:
+    pop ds
+    pop es
+    popa
+    ret
+
+; gfx_post_screen: paint the graceful POST screen. White field, the red Izarra
+; 3000 wordmark centered across the top, black title/version and hint lines, and
+; the empty red-framed progress bar. Called once before the RAM test paces.
+gfx_post_screen:
+    call set_mode13h
+    call gfx_post_palette
+    mov al, GFX_WHITE
+    call gfx_clear
+    ; Logo: blit the red wordmark centered at the top.
+    push cs
+    pop ds
+    mov si, bios_logo_bitmap
+    mov di, LOGO_X
+    mov ax, LOGO_Y
+    mov cx, LOGO_W
+    mov dx, LOGO_H
+    mov bl, GFX_RED
+    mov bh, LOGO_STRIDE
+    call gfx_blit_1bpp
+    ; Title + version line (black on white).
+    push cs
+    pop ds
+    mov si, str_post_name
+    mov di, POST_TEXT_X
+    mov ax, POST_TITLE_Y
+    mov bl, GFX_BLACK
+    mov bh, GFX_WHITE
+    call gfx_text
+    ; Hint line (black on white). Drawn from x=8 so the full string fits inside
+    ; the 320 px width without spilling into the next row.
+    push cs
+    pop ds
+    mov si, str_post_hint
+    mov di, 8
+    mov ax, POST_HINT_Y
+    mov bl, GFX_BLACK
+    mov bh, GFX_WHITE
+    call gfx_text
+    ; Progress-bar frame: a thin red outline around the fill area.
+    call gfx_bar_frame
+    ret
+
+; gfx_bar_frame: draw the red outline of the RAM progress bar (top, bottom, and
+; both sides), leaving the interior white for the fill to grow into.
+gfx_bar_frame:
+    push di
+    push si
+    push cx
+    push dx
+    push bx
+    mov bl, GFX_RED
+    ; top edge
+    mov di, POST_BAR_X
+    mov si, POST_BAR_Y
+    mov cx, POST_BAR_W
+    mov dx, 1
+    call gfx_fill_rect
+    ; bottom edge
+    mov di, POST_BAR_X
+    mov si, POST_BAR_Y + POST_BAR_H - 1
+    mov cx, POST_BAR_W
+    mov dx, 1
+    call gfx_fill_rect
+    ; left edge
+    mov di, POST_BAR_X
+    mov si, POST_BAR_Y
+    mov cx, 1
+    mov dx, POST_BAR_H
+    call gfx_fill_rect
+    ; right edge
+    mov di, POST_BAR_X + POST_BAR_W - 1
+    mov si, POST_BAR_Y
+    mov cx, 1
+    mov dx, POST_BAR_H
+    call gfx_fill_rect
+    pop bx
+    pop dx
+    pop cx
+    pop si
+    pop di
+    ret
+
+; gfx_bar_fill: fill the progress bar to AX percent (0..100) in red. The interior
+; is POST_BAR_W-2 wide; the filled width is interior * pct / 100. Idempotent: it
+; redraws from the left edge each call, so it can be driven by a rising counter.
+gfx_bar_fill:
+    pusha
+    cmp ax, 100
+    jbe .clamp_ok
+    mov ax, 100
+.clamp_ok:
+    mov bx, POST_BAR_W - 2          ; interior width
+    mul bx                          ; AX = pct * interior (fits 16 bits)
+    mov bx, 100
+    xor dx, dx
+    div bx                          ; AX = filled width in pixels
+    test ax, ax
+    jz .done                        ; nothing to draw yet
+    mov cx, ax                      ; width
+    mov di, POST_BAR_X + 1
+    mov si, POST_BAR_Y + 1
+    mov dx, POST_BAR_H - 2          ; interior height
+    mov bl, GFX_RED
+    call gfx_fill_rect
+.done:
+    popa
+    ret
+
+; gfx_post_mem: draw the "Testing memory: NNNNN KB" line with KiB value in AX.
+; The count-up calls this each step with a rising value; it overwrites the prior
+; number by repainting the whole line on the white field.
+gfx_post_mem:
+    pusha
+    push ax                         ; save the KiB value
+    ; Repaint the line's background white so the previous number is erased.
+    mov di, POST_TEXT_X
+    mov si, POST_MEM_Y
+    mov cx, 256
+    mov dx, 8
+    mov bl, GFX_WHITE
+    call gfx_fill_rect
+    ; Label.
+    push cs
+    pop ds
+    mov si, str_post_mem
+    mov di, POST_TEXT_X
+    mov ax, POST_MEM_Y
+    mov bl, GFX_BLACK
+    mov bh, GFX_WHITE
+    call gfx_text
+    ; Number (5-digit, black on white), placed after the label.
+    pop ax                          ; KiB value
+    mov di, POST_TEXT_X + 17 * 8    ; "Testing memory:  " is 17 chars wide
+    mov si, POST_MEM_Y
+    mov bl, GFX_BLACK
+    mov bh, GFX_WHITE
+    call gfx_putdec
+    ; " KB" suffix after the 5 digits.
+    push cs
+    pop ds
+    mov si, str_post_kb
+    mov di, POST_TEXT_X + 23 * 8
+    mov ax, POST_MEM_Y
+    mov bl, GFX_BLACK
+    mov bh, GFX_WHITE
+    call gfx_text
+    popa
+    ret
+
+; gfx_post_note: draw a one-line black status note at the memory-line row,
+; first wiping it white. DS:SI = CS-relative ASCIIZ on entry.
+gfx_post_note:
+    pusha
+    push si
+    mov di, POST_TEXT_X
+    mov si, POST_MEM_Y
+    mov cx, 256
+    mov dx, 8
+    mov bl, GFX_WHITE
+    call gfx_fill_rect
+    pop si                          ; the note pointer (CS-relative)
+    push cs
+    pop ds
+    mov di, POST_TEXT_X
+    mov ax, POST_MEM_Y
+    mov bl, GFX_BLACK
+    mov bh, GFX_WHITE
+    call gfx_text
+    popa
+    ret
+
+str_post_name: db 'Izarra 3000 BIOS  v1.0', 0
+; The hint draws from x=8, so it must fit (320-8)/8 = 39 glyphs. This is 38.
+str_post_hint: db 'Del:Setup  Tab:Boot menu  Esc:skip mem', 0
+str_post_mem:  db 'Testing memory:  ', 0
+str_post_kb:   db ' KB', 0
+str_post_skip: db 'Memory test skipped', 0
 
 ; --- 8x8 CP437 font (256 glyphs, 8 bytes each) copied from VGAFONT_8X8. ------
 bios_font:

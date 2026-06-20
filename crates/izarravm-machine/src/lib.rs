@@ -1,3 +1,4 @@
+pub use fat12::build_fat12;
 use izarravm_audio::{OplChip, Resampler, SbDsp, SbMixer};
 use izarravm_bus::{BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CpuBus, Memory};
 use izarravm_core::{GswMode, HardwareProfile, SoundBlasterConfig, VideoCard};
@@ -11,9 +12,12 @@ use izarravm_video::{
 use thiserror::Error;
 
 mod dma;
+mod fat12;
+mod floppy;
 mod keyboard;
 mod pic;
 mod pit;
+mod rtc;
 mod speaker;
 
 pub const HIGH_ROM_BASE: u32 = 0xffff_0000;
@@ -207,6 +211,19 @@ pub struct Machine {
     elapsed_clocks: u64,
     // Parent CPU snapshots for EXEC (AH=4Bh AL=0); popped on child exit.
     program_frames: Vec<ProgramFrame>,
+    // Mounted A: floppy image, geometry inferred from the image length. INT 13h
+    // disk services read and write it; None means the drive is empty.
+    floppy: Option<floppy::Floppy>,
+    // MC146818 RTC and CMOS NVRAM at ports 0x70/0x71.
+    rtc: rtc::Rtc,
+    // Fractional seconds owed to the RTC from the machine clock; whole seconds
+    // are folded into the clock in advance_devices.
+    rtc_seconds: f64,
+    // Cosmetic POST pacing flag, read by the BIOS at port 0xE2. True (the
+    // default) tells the ROM to skip the ~8 s RAM count-up and chime delays so
+    // headless runs and unit tests finish inside their cycle budgets. The GUI
+    // clears it after construction to keep the full power-on experience.
+    fast_post: bool,
 }
 
 /// Build the CT1745 mixer from the profile's Sound Blaster power-on routing.
@@ -287,6 +304,10 @@ impl Machine {
             trace: BusTrace::default(),
             elapsed_clocks: 0,
             program_frames: Vec::new(),
+            floppy: None,
+            rtc: rtc::Rtc::new(),
+            rtc_seconds: 0.0,
+            fast_post: true,
         };
         // The Margo LFB aperture is decoded before RAM, so system memory must
         // stay below it. Validated config caps memory far under this bound.
@@ -308,6 +329,98 @@ impl Machine {
         Ok(machine)
     }
 
+    /// Control the cosmetic POST pacing the BIOS reads at port 0xE2. The default
+    /// is fast (true): the ROM skips the ~8 s RAM count-up and the chime so
+    /// headless runs and tests stay inside their cycle budgets. Pass false from
+    /// the GUI to keep the full power-on screen and timing.
+    pub fn set_fast_post(&mut self, fast: bool) {
+        self.fast_post = fast;
+    }
+
+    /// Whether the PC speaker was ever enabled (port 0x61 bit 1 driven high). The
+    /// power-on chime sets this during POST, so a headless run can assert the
+    /// speaker was exercised without draining the audio ring.
+    pub fn speaker_ever_enabled(&self) -> bool {
+        self.speaker.ever_enabled()
+    }
+
+    /// Mount a raw floppy image into drive A:. The geometry is derived from the
+    /// image length; an unrecognized size returns an error and leaves any
+    /// previously mounted image in place.
+    pub fn mount_floppy(&mut self, bytes: Vec<u8>) -> Result<(), String> {
+        self.floppy = Some(floppy::Floppy::from_image(bytes)?);
+        Ok(())
+    }
+
+    /// Eject the A: floppy, returning its current image bytes (including any
+    /// in-session writes) so the caller can flush them back to disk. Returns
+    /// None when the drive is empty.
+    pub fn eject_floppy(&mut self) -> Option<Vec<u8>> {
+        self.floppy.take().map(|f| f.bytes().to_vec())
+    }
+
+    /// Whether the mounted A: floppy took a guest write this session. The host
+    /// flushes the image back to its source IMG only when this is true, so an
+    /// unwritten disk is ejected without rewriting the file. False when the drive
+    /// is empty.
+    pub fn floppy_dirty(&self) -> bool {
+        self.floppy.as_ref().is_some_and(|f| f.dirty)
+    }
+
+    /// Seed the RTC clock from host-provided local time. `weekday` is 1..=7 with
+    /// 1 = Sunday. Call this once at startup; the clock self-advances on the
+    /// machine clock afterward.
+    #[allow(clippy::too_many_arguments)]
+    pub fn seed_rtc(
+        &mut self,
+        year: u16,
+        month: u8,
+        day: u8,
+        weekday: u8,
+        hour: u8,
+        minute: u8,
+        second: u8,
+    ) {
+        self.rtc
+            .seed(year, month, day, weekday, hour, minute, second);
+    }
+
+    /// The full 64-byte CMOS image (clock registers plus NVRAM) for persisting
+    /// to cmos.bin.
+    pub fn cmos_bytes(&self) -> [u8; 64] {
+        self.rtc.nvram()
+    }
+
+    /// Load a 64-byte CMOS image from a persisted cmos.bin, restoring NVRAM and
+    /// the saved time. Returns false if the image had a bad NVRAM checksum (the
+    /// bytes are kept and the checksum is repaired), so the host can log it.
+    pub fn load_cmos(&mut self, bytes: &[u8; 64]) -> bool {
+        self.rtc.load_nvram(bytes)
+    }
+
+    /// Whether the guest wrote a CMOS NVRAM byte since the last poll, clearing
+    /// the flag. The host flushes cmos.bin when this returns true.
+    pub fn take_cmos_dirty(&mut self) -> bool {
+        self.rtc.take_nvram_dirty()
+    }
+
+    /// Whether the RTC clock has been seeded from the host.
+    pub fn rtc_seeded(&self) -> bool {
+        self.rtc.is_seeded()
+    }
+
+    /// Read one CMOS NVRAM byte by index (0x00..=0x3F).
+    pub fn cmos_byte(&self, index: usize) -> u8 {
+        self.rtc.nvram_byte(index)
+    }
+
+    /// Set one CMOS NVRAM byte by index and refresh the stored checksum, the way
+    /// a host-side configuration change would. Out-of-range indices are ignored.
+    pub fn set_cmos_byte(&mut self, index: usize, value: u8) {
+        self.rtc.set_nvram(index, value);
+        self.rtc.refresh_checksum();
+    }
+
     pub fn new_boot_image(
         profile: MachineProfile,
         image: impl AsRef<[u8]>,
@@ -317,7 +430,11 @@ impl Machine {
             return Err(MachineError::InvalidBootImageSize(image.len()));
         }
 
-        let mut machine = Self::base(profile, boot_sector_cpu(), vec![0; BIOS_ROM_SIZE])?;
+        // The BIOS service vectors return through the ROM IRET at offset 0xF000
+        // (FF00:0000); supply it even on this synthetic boot ROM.
+        let mut rom = vec![0u8; BIOS_ROM_SIZE];
+        rom[0xF000] = 0xCF;
+        let mut machine = Self::base(profile, boot_sector_cpu(), rom)?;
 
         for (offset, byte) in image[0..512].iter().copied().enumerate() {
             machine
@@ -353,6 +470,10 @@ impl Machine {
         let mut rom = vec![0u8; BIOS_ROM_SIZE];
         let kb = izarravm_firmware::kbd_resident_bios();
         rom[..kb.len()].copy_from_slice(kb);
+        // The BIOS service vectors return through the ROM IRET at offset 0xF000
+        // (FF00:0000); supply it on this synthetic ROM. The resident keyboard
+        // BIOS image is short and never reaches that offset.
+        rom[0xF000] = 0xCF;
         let mut machine = Self::base(profile, Cpu386::default(), rom)?;
         install_boot_bios_stubs(&mut machine.memory)?;
         machine.install_keyboard_bios()?;
@@ -507,6 +628,7 @@ impl Machine {
             pit: &mut self.pit,
             keyboard: &mut self.keyboard,
             speaker: &mut self.speaker,
+            rtc: &mut self.rtc,
             dma: &mut self.dma,
             opl: &mut self.opl,
             dsp: &mut self.dsp,
@@ -515,6 +637,7 @@ impl Machine {
             pending_soft_int: &mut self.pending_soft_int,
             active_mode: self.active_mode,
             pending_mode: &mut self.pending_mode,
+            fast_post: self.fast_post,
             wait_states: self.profile.wait_states,
         }
     }
@@ -539,7 +662,7 @@ impl Machine {
     pub fn is_graphics_mode(&self) -> bool {
         matches!(
             self.video.active_mode(),
-            VideoMode::Mode13h | VideoMode::Planar | VideoMode::ModeX
+            VideoMode::Mode13h | VideoMode::Planar | VideoMode::ModeX | VideoMode::Cga
         )
     }
 
@@ -597,10 +720,16 @@ impl Machine {
                     self.margo_active = false;
                     return;
                 }
-                // The 80x25 color text family (2/3) and monochrome text (7), plus
-                // the 40x25 and CGA variants (0/1/4/5/6) which map to the same
-                // single text personality, all return to text mode.
-                0x00..=0x07 => {
+                // CGA graphics: 04h/05h are 320x200x4, 06h is 640x200x2. The B800
+                // framebuffer renders through the CGA personality (set_cga_mode).
+                0x04..=0x06 => {
+                    self.video.set_cga_mode(al);
+                    self.margo_active = false;
+                    return;
+                }
+                // The 80x25 color text family (2/3), monochrome text (7), and the
+                // 40x25 variants (0/1) map to the single text personality.
+                0x00..=0x03 | 0x07 => {
                     self.video.set_text_mode();
                     self.margo_active = false;
                     return;
@@ -642,6 +771,25 @@ impl Machine {
         }
     }
 
+    /// Service INT 11h (GET EQUIPMENT LIST). Returns the BDA equipment word in AX,
+    /// the way a real BIOS reads it from 0040:0010. The high word of EAX is left
+    /// alone: callers that test the 386 EAX bits clear it themselves before the
+    /// call, per RBIL. No flags change (the IRET restores the caller's FLAGS).
+    fn handle_int11(&mut self) {
+        let word = self.memory.read_u16(0x410).unwrap_or(BIOS_EQUIPMENT_WORD);
+        let eax = (self.cpu.registers.eax() & !0xFFFF) | u32::from(word);
+        self.cpu.registers.set_eax(eax);
+    }
+
+    /// Service INT 12h (GET MEMORY SIZE). Returns the conventional memory size in
+    /// KiB in AX, read from the BDA word at 0040:0013 the way a real BIOS does. No
+    /// flags change (the IRET restores the caller's FLAGS).
+    fn handle_int12(&mut self) {
+        let kib = self.memory.read_u16(0x413).unwrap_or(BIOS_BASE_MEMORY_KIB);
+        let eax = (self.cpu.registers.eax() & !0xFFFF) | u32::from(kib);
+        self.cpu.registers.set_eax(eax);
+    }
+
     /// Service the host side of INT 15h. AH=88h returns the extended memory size
     /// (KiB above 1 MiB) in AX with CF clear, the standard way a BIOS learns RAM
     /// size on a machine with no probing path. Capped at 0xFFFF KiB (64 MiB) to
@@ -657,6 +805,168 @@ impl Machine {
         } else {
             self.set_int_frame_carry(true);
         }
+    }
+
+    /// Service the host side of an `INT 13h` disk request. Only floppy A: (DL=0)
+    /// is backed, by the mounted image. CHS to LBA uses the mounted media
+    /// geometry, so a 720 KB disk reads with 9 sectors per track and a 1.44 MB
+    /// disk with 18. Status is returned through AH and the carry flag the way a
+    /// real BIOS reports it: CF clear and AH=0 on success, CF set with an error
+    /// code in AH on failure.
+    fn handle_int13(&mut self) {
+        // With no image mounted there is no drive to service. Leave the registers
+        // and the IRET FLAGS image untouched so the guest sees the same result the
+        // bare IRET stub gave before this handler existed. The firmware boot suite
+        // relies on this: it places its second stage in memory directly and calls
+        // INT 13h with carry pre-cleared, expecting a no-op success.
+        if self.floppy.is_none() {
+            return;
+        }
+
+        let ax = self.cpu.registers.eax() as u16;
+        let ah = (ax >> 8) as u8;
+        let dx = self.cpu.registers.edx() as u16;
+        let dl = dx as u8;
+
+        match ah {
+            // AH=00 reset disk system. Nothing to do for the in-memory image.
+            0x00 => {
+                self.set_eax_ah(0x00);
+                self.set_int_frame_carry(false);
+            }
+            // AH=02 read sectors, AH=03 write sectors. AL = sector count, CH/CL
+            // carry the cylinder and sector (CL bits 0-5 sector, bits 6-7 the
+            // cylinder high bits), DH = head, DL = drive, ES:BX = buffer.
+            0x02 | 0x03 => self.int13_transfer(ah, dl),
+            // AH=08 read drive parameters. Report the mounted media geometry.
+            0x08 => self.int13_drive_parameters(dl),
+            // AH=15 read disk type. A floppy without a change line.
+            0x15 => {
+                self.set_eax_ah(0x01);
+                self.set_int_frame_carry(false);
+            }
+            // Unimplemented subfunctions succeed quietly rather than fault the
+            // guest. Real booters call a small fixed set; widen this if one needs
+            // a subfunction that must report failure.
+            _ => {
+                self.set_eax_ah(0x00);
+                self.set_int_frame_carry(false);
+            }
+        }
+    }
+
+    /// Carry out the AH=02 read / AH=03 write half of INT 13h.
+    fn int13_transfer(&mut self, ah: u8, dl: u8) {
+        let Some(geom) = self.floppy.as_ref().map(|f| f.geometry()) else {
+            // No media backs the request: report a timeout the way an empty
+            // drive would.
+            self.set_eax_ah(0x80);
+            self.set_int_frame_carry(true);
+            return;
+        };
+        // Only floppy A: is backed.
+        if dl != 0x00 {
+            self.set_eax_ah(0x80);
+            self.set_int_frame_carry(true);
+            return;
+        }
+        let _ = geom;
+
+        let ax = self.cpu.registers.eax() as u16;
+        let count = ax as u8;
+        let cx = self.cpu.registers.ecx() as u16;
+        let cl = cx as u8;
+        let ch = (cx >> 8) as u8;
+        let sector = cl & 0x3f;
+        let cyl = u16::from(ch) | (u16::from(cl & 0xc0) << 2);
+        let head = (self.cpu.registers.edx() as u16 >> 8) as u8;
+        let es = self.cpu.registers.segment(SegmentIndex::Es).base;
+        let bx = self.cpu.registers.ebx() as u16;
+        let buffer = es.wrapping_add(u32::from(bx));
+
+        let mut done: u8 = 0;
+        for i in 0..count {
+            // Multi-sector transfers advance within the current track only. A
+            // booter that crosses a track boundary in one call would need
+            // cross-track wrap added here.
+            let sec = sector + i;
+            let addr = buffer.wrapping_add(u32::from(i) * 512);
+            if ah == 0x02 {
+                let data = self
+                    .floppy
+                    .as_ref()
+                    .and_then(|f| f.read_sector(cyl, head, sec))
+                    .map(<[u8]>::to_vec);
+                match data {
+                    Some(bytes) => self.write_guest_block(addr, &bytes),
+                    None => break,
+                }
+            } else {
+                let bytes = self.read_guest_block(addr, 512);
+                let wrote = self
+                    .floppy
+                    .as_mut()
+                    .map(|f| f.write_sector(cyl, head, sec, &bytes))
+                    .unwrap_or(false);
+                if !wrote {
+                    break;
+                }
+            }
+            done += 1;
+        }
+
+        // AL returns the number of sectors actually transferred.
+        self.set_eax_al(done);
+        if done == count {
+            self.set_eax_ah(0x00);
+            self.set_int_frame_carry(false);
+        } else {
+            // Sector not found / read error.
+            self.set_eax_ah(0x04);
+            self.set_int_frame_carry(true);
+        }
+    }
+
+    /// Carry out the AH=08 read-drive-parameters half of INT 13h.
+    fn int13_drive_parameters(&mut self, dl: u8) {
+        let Some(geom) = self.floppy.as_ref().map(|f| f.geometry()) else {
+            self.set_eax_ah(0x80);
+            self.set_int_frame_carry(true);
+            return;
+        };
+        if dl != 0x00 {
+            self.set_eax_ah(0x80);
+            self.set_int_frame_carry(true);
+            return;
+        }
+        let max_cyl = geom.cylinders.saturating_sub(1);
+        // CL: sectors per track in bits 0-5, cylinder high bits in 6-7.
+        let cl = (geom.sectors & 0x3f) | (((max_cyl >> 8) as u8 & 0x03) << 6);
+        let ch = (max_cyl & 0xff) as u8;
+        let cx = (u16::from(ch) << 8) | u16::from(cl);
+        let ecx = (self.cpu.registers.ecx() & !0xFFFF) | u32::from(cx);
+        self.cpu.registers.set_ecx(ecx);
+        // DH = max head index, DL = number of floppy drives.
+        let dx = (u16::from(geom.heads.saturating_sub(1)) << 8) | 0x01;
+        let edx = (self.cpu.registers.edx() & !0xFFFF) | u32::from(dx);
+        self.cpu.registers.set_edx(edx);
+        // BL = drive type (0x03 = 720 KB, 0x04 = 1.44 MB).
+        let ebx = (self.cpu.registers.ebx() & !0xFF) | u32::from(geom.drive_type);
+        self.cpu.registers.set_ebx(ebx);
+        self.set_eax_ah(0x00);
+        self.set_int_frame_carry(false);
+    }
+
+    /// Replace AH in EAX, leaving AL and the upper 16 bits intact.
+    fn set_eax_ah(&mut self, ah: u8) {
+        let eax = (self.cpu.registers.eax() & !0xFF00) | (u32::from(ah) << 8);
+        self.cpu.registers.set_eax(eax);
+    }
+
+    /// Replace AL in EAX, leaving AH and the upper 16 bits intact.
+    fn set_eax_al(&mut self, al: u8) {
+        let eax = (self.cpu.registers.eax() & !0xFF) | u32::from(al);
+        self.cpu.registers.set_eax(eax);
     }
 
     /// Set or clear CF in the FLAGS image the pending IRET stub will pop (SS:SP+4
@@ -1153,6 +1463,15 @@ impl Machine {
             self.pic.request(1); // IRQ1: keyboard output buffer has a scancode
         }
 
+        // Advance the RTC: inv_clock is 1/clock_hz, so clocks * inv_clock is
+        // elapsed seconds. Fold whole seconds into the clock and carry the rest.
+        self.rtc_seconds += clocks as f64 * self.timing.inv_clock;
+        let whole_secs = self.rtc_seconds.floor();
+        if whole_secs >= 1.0 {
+            self.rtc.tick_seconds(whole_secs as u64);
+            self.rtc_seconds -= whole_secs;
+        }
+
         self.margo_ns += clocks as f64 * self.timing.margo_ns_per_clock;
         let whole_ns = self.margo_ns.floor();
         self.margo.advance_busy(whole_ns as u64);
@@ -1422,12 +1741,14 @@ impl Machine {
                     pit,
                     keyboard,
                     speaker,
+                    rtc,
                     dma,
                     opl,
                     dsp,
                     mixer,
                     trace,
                     pending_soft_int,
+                    fast_post,
                     ..
                 } = self;
                 let mut bus = MachineBus {
@@ -1441,6 +1762,7 @@ impl Machine {
                     pit,
                     keyboard,
                     speaker,
+                    rtc,
                     dma,
                     opl,
                     dsp,
@@ -1449,6 +1771,7 @@ impl Machine {
                     pending_soft_int,
                     active_mode: *active_mode,
                     pending_mode,
+                    fast_post: *fast_post,
                     wait_states: profile.wait_states,
                 };
                 cpu.cycle(&mut bus)
@@ -1469,6 +1792,9 @@ impl Machine {
                     if let Some(vector) = self.pending_soft_int {
                         match vector {
                             0x10 => self.handle_int10(),
+                            0x11 => self.handle_int11(),
+                            0x12 => self.handle_int12(),
+                            0x13 => self.handle_int13(),
                             0x15 => self.handle_int15(),
                             0x20 | 0x21 => match self.handle_dos_int(vector) {
                                 Ok(Some(code)) => {
@@ -1531,6 +1857,7 @@ struct MachineBus<'a> {
     pit: &'a mut pit::Pit,
     keyboard: &'a mut keyboard::Keyboard8042,
     speaker: &'a mut speaker::Speaker,
+    rtc: &'a mut rtc::Rtc,
     dma: &'a mut dma::DmaController,
     opl: &'a mut OplChip,
     dsp: &'a mut SbDsp,
@@ -1539,6 +1866,7 @@ struct MachineBus<'a> {
     pending_soft_int: &'a mut Option<u8>,
     active_mode: GswMode,                  // a copy, for the 0xE1 read
     pending_mode: &'a mut Option<GswMode>, // a 0xE1 write records the request here
+    fast_post: bool,                       // a copy, for the 0xE2 POST-pacing read
     wait_states: WaitStateProfile,
 }
 
@@ -1671,6 +1999,13 @@ impl CpuBus for MachineBus<'_> {
         if port == 0x00e1 {
             return Ok(u32::from(gsw_mode_code(self.active_mode)));
         }
+        if port == 0x00e2 {
+            // Lotura POST-pacing flag: 1 = fast (skip cosmetic delays), 0 = full.
+            return Ok(u32::from(u8::from(self.fast_post)));
+        }
+        if let Some(value) = self.rtc.read_port(port) {
+            return Ok(u32::from(value));
+        }
         if let Some(value) = self.keyboard.read_port(port) {
             return Ok(u32::from(value));
         }
@@ -1716,6 +2051,9 @@ impl CpuBus for MachineBus<'_> {
             }
             return Ok(());
         }
+        if self.rtc.write_port(port, value as u8) {
+            return Ok(());
+        }
         if self.serial.write_port(port, value as u8)
             || self.video.write_port(port, value as u8)
             || self.pit.write_port(port, value as u8)
@@ -1749,7 +2087,7 @@ impl CpuBus for MachineBus<'_> {
         // video service; 0x20/0x21 are the DOS kernel. Vector 0x10 reaches here
         // only from a software INT today (the CPU never faults with vector 0x10);
         // revisit if an x87 #MF is added.
-        if matches!(vector, 0x10 | 0x15 | 0x20 | 0x21) {
+        if matches!(vector, 0x10 | 0x11 | 0x12 | 0x13 | 0x15 | 0x20 | 0x21) {
             *self.pending_soft_int = Some(vector);
         }
         Ok(())
@@ -1909,12 +2247,43 @@ fn boot_sector_cpu() -> Cpu386 {
     cpu
 }
 
+/// BIOS equipment word reported by INT 11h (BDA 0040:0010). Bit 0 set with
+/// bits 7-6 clear means one floppy drive; bits 5-4 = 10b is the 80x25 color
+/// initial video mode. Bit 1 (80x87 coprocessor) stays clear: the Izarra 3000
+/// ships no 387, so software that probes the equipment word skips its FPU path.
+/// See RBIL INT 11h equipment bitfield (dev_docs/reference/rbil/INTERRUP.B).
+const BIOS_EQUIPMENT_WORD: u16 = 0x0021;
+
+/// Conventional memory size in KiB reported by INT 12h (BDA 0040:0013). A PC
+/// caps usable low memory at 640 KiB no matter how much RAM is installed; the
+/// rest is extended memory above 1 MiB (reported by INT 15h AH=88h).
+const BIOS_BASE_MEMORY_KIB: u16 = 640;
+
+/// Segment of the ROM-resident IRET the BIOS keeps at ROM offset 0xF000, i.e.
+/// FF00:0000. The host intercepts the BIOS service interrupts by vector number,
+/// so their IVT targets only need a valid IRET to return on. Pointing them at
+/// the ROM stub instead of the RAM stub at 0x600 keeps them working after a
+/// booter wipes low memory, the way real BIOS handlers (which live in ROM) do.
+const BIOS_ROM_IRET_SEG: u16 = 0xff00;
+
 fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
-    for vector in [0x10, 0x13, 0x15, 0x20, 0x21] {
+    // BIOS service interrupts the host intercepts by vector. Their IVT targets
+    // point at the ROM IRET so they survive a guest low-memory wipe.
+    for vector in [0x10, 0x11, 0x12, 0x13, 0x15] {
+        let address = vector * 4;
+        memory.write_u16(address, 0)?;
+        memory.write_u16(address + 2, BIOS_ROM_IRET_SEG)?;
+    }
+    // The DOS kernel vectors keep the RAM stub: the INT 21h blocking path rewinds
+    // EIP onto the CD 21 the RAM stub returns to, and the DOS path owns its memory.
+    for vector in [0x20, 0x21] {
         let address = vector * 4;
         memory.write_u16(address, BIOS_IRET_STUB_ADDRESS as u16)?;
         memory.write_u16(address + 2, 0)?;
     }
+    // Seed the BDA words INT 11h and INT 12h hand back, like a real BIOS.
+    memory.write_u16(0x410, BIOS_EQUIPMENT_WORD)?;
+    memory.write_u16(0x413, BIOS_BASE_MEMORY_KIB)?;
     memory.write_u8(BIOS_IRET_STUB_ADDRESS, 0xcf)
 }
 
@@ -1925,6 +2294,13 @@ impl MachineBus<'_> {
         }
 
         if let Some(offset) = video_text_offset(address, width) {
+            // In a CGA graphics mode the B800 aperture is the 16 KiB CGA
+            // framebuffer; in text mode it is the character/attribute buffer.
+            if self.video.active_mode() == VideoMode::Cga {
+                return Ok((0..width)
+                    .map(|i| self.video.cga_read(offset + i))
+                    .collect());
+            }
             return (0..width)
                 .map(|index| {
                     self.video
@@ -1950,7 +2326,8 @@ impl MachineBus<'_> {
                         .map(|i| self.video.cpu_read_chain4(offset + i))
                         .collect());
                 }
-                VideoMode::Text => {}
+                // Text and CGA do not decode the A0000 window; fall through.
+                VideoMode::Text | VideoMode::Cga => {}
             }
         }
 
@@ -1982,6 +2359,12 @@ impl MachineBus<'_> {
         }
 
         if let Some(offset) = video_text_offset(address, 1) {
+            // In a CGA graphics mode the B800 aperture is the 16 KiB CGA
+            // framebuffer; in text mode it is the character/attribute buffer.
+            if self.video.active_mode() == VideoMode::Cga {
+                self.video.cga_write(offset, value);
+                return Ok(());
+            }
             return self
                 .video
                 .write_u8(offset, value)
@@ -2002,7 +2385,8 @@ impl MachineBus<'_> {
                     self.video.cpu_write_chain4(offset, value);
                     return Ok(());
                 }
-                VideoMode::Text => {}
+                // Text and CGA do not decode the A0000 window; fall through.
+                VideoMode::Text | VideoMode::Cga => {}
             }
         }
 
@@ -2102,6 +2486,35 @@ mod tests {
     use izarravm_core::{SbDma8, SbDma16, SbIrq};
     use izarravm_firmware::I386DX25_TEST_ROM;
 
+    #[test]
+    fn slow_post_paces_without_null_vector_runaway() {
+        // Under slow POST the BIOS drives PIT channel 0 to pace the chime and the
+        // RAM count-up. Those OUT edges raise IRQ0 with IF set; before INT 08h was
+        // installed the timer vectored through the zeroed IVT[08h] (CS=0000) and ran
+        // away through low memory. Run a slice that covers the chime and the start of
+        // the count-up, then confirm the CPU never left the BIOS region and the INT
+        // 08h handler advanced the BDA tick count.
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .unwrap();
+        machine.set_fast_post(false);
+        let mut max_ticks = 0u32;
+        for _ in 0..400 {
+            let _ = machine.run_until_halt_or_cycles(50_000).unwrap();
+            let cs = machine.cpu().registers.cs().selector;
+            assert_ne!(cs, 0, "CPU vectored to CS=0000 (null IVT runaway)");
+            let lo = u32::from(machine.read_physical_u8(0x46c));
+            let hi = u32::from(machine.read_physical_u8(0x46d));
+            max_ticks = max_ticks.max(lo | (hi << 8));
+        }
+        assert!(
+            max_ticks > 3,
+            "INT 08h did not advance the BDA tick (got {max_ticks})"
+        );
+    }
+
     fn test_machine() -> Machine {
         Machine::new(
             MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
@@ -2129,6 +2542,10 @@ mod tests {
     fn rom_with_code(code: &[u8]) -> Vec<u8> {
         let mut rom = vec![0; BIOS_ROM_SIZE];
         rom[..code.len()].copy_from_slice(code);
+        // The ROM IRET at offset 0xF000 (FF00:0000) the real izarra BIOS emits.
+        // The host-intercepted BIOS service vectors return through it, so the
+        // bare test ROM supplies it too.
+        rom[0xF000] = 0xCF;
         rom[0xfff0..0xfff5].copy_from_slice(&[0xea, 0x00, 0x00, 0x00, 0xf0]);
         rom
     }
@@ -2403,6 +2820,98 @@ mod tests {
         assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
         assert_eq!(machine.margo().display().width, 640);
         assert_eq!(machine.margo().display().height, 480);
+    }
+
+    #[test]
+    fn int13_read_places_sector_in_memory() {
+        // A 720 KB image whose first sector starts with a recognizable marker.
+        let mut img = vec![0u8; 737_280];
+        img[0] = 0xEB;
+        img[1] = 0x55;
+        // Stub: ES=0, BX=0x2000, read 1 sector at CHS(0,0,1) of drive 0 via INT 13h,
+        // then halt. AX=0x0201 (AH=02 read, AL=01 sector), CX=0x0001 (cyl 0,
+        // sector 1), DX=0x0000 (head 0, drive A:). The buffer sits well clear of
+        // the IRET stub the BIOS keeps near 0x0600.
+        let rom = rom_with_code(&[
+            0x31, 0xC0, // xor ax, ax
+            0x8E, 0xC0, // mov es, ax
+            0xBB, 0x00, 0x20, // mov bx, 0x2000
+            0xB8, 0x01, 0x02, // mov ax, 0x0201
+            0xB9, 0x01, 0x00, // mov cx, 0x0001
+            0xBA, 0x00, 0x00, // mov dx, 0x0000
+            0xCD, 0x13, // int 13h
+            0xF4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        machine.mount_floppy(img).unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        // The sector bytes landed at physical 0x2000.
+        assert_eq!(machine.read_physical_u8(0x2000), 0xEB);
+        assert_eq!(machine.read_physical_u8(0x2001), 0x55);
+        // AH cleared, AL reports one sector read, CF clear on success.
+        let ax = machine.cpu().registers.eax() as u16;
+        assert_eq!(ax >> 8, 0x00);
+        assert_eq!(ax & 0xff, 0x01);
+        let flags = machine.cpu().registers.eflags;
+        assert_eq!(flags & 0x0001, 0, "CF must be clear after a good read");
+    }
+
+    #[test]
+    fn int11_returns_equipment_word() {
+        // Stub: INT 11h then halt. AX must hold the seeded BDA equipment word.
+        // The BIOS service vectors return through the ROM IRET at offset 0xF000
+        // that rom_with_code supplies, matching the real izarra BIOS.
+        let rom = rom_with_code(&[
+            0xCD, 0x11, // int 11h
+            0xF4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        let ax = machine.cpu().registers.eax() as u16;
+        assert_eq!(ax, BIOS_EQUIPMENT_WORD);
+        // Bit 1 (80x87 coprocessor) stays clear: the Izarra 3000 has no FPU.
+        assert_eq!(ax & 0x0002, 0, "no coprocessor advertised");
+    }
+
+    #[test]
+    fn int12_returns_conventional_memory_kib() {
+        // Stub: INT 12h then halt. AX must hold the conventional memory size.
+        let rom = rom_with_code(&[
+            0xCD, 0x12, // int 12h
+            0xF4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        let ax = machine.cpu().registers.eax() as u16;
+        assert_eq!(ax, BIOS_BASE_MEMORY_KIB);
+        assert_eq!(ax, 640);
+    }
+
+    #[test]
+    fn bios_service_vectors_survive_low_memory_wipe() {
+        // A booter that zeroes low RAM (including the 0x600 RAM IRET stub) must not
+        // strand INT 11h/12h: their IVT targets point at the ROM IRET, so the
+        // service still returns. Stub: zero 0x600, then INT 11h, then halt.
+        // rom_with_code supplies the ROM IRET at FF00:0000 that survives the wipe.
+        let rom = rom_with_code(&[
+            0x31, 0xC0, // xor ax, ax
+            0x8E, 0xD8, // mov ds, ax
+            0xC7, 0x06, 0x00, 0x06, 0x00, 0x00, // mov word [0x600], 0
+            0xCD, 0x11, // int 11h
+            0xF4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(machine.cpu().registers.eax() as u16, BIOS_EQUIPMENT_WORD);
     }
 
     #[test]
@@ -2823,6 +3332,7 @@ mod tests {
             pit: &mut machine.pit,
             keyboard: &mut machine.keyboard,
             speaker: &mut machine.speaker,
+            rtc: &mut machine.rtc,
             dma: &mut machine.dma,
             opl: &mut machine.opl,
             dsp: &mut machine.dsp,
@@ -2831,9 +3341,66 @@ mod tests {
             pending_soft_int: &mut machine.pending_soft_int,
             active_mode: machine.active_mode,
             pending_mode: &mut machine.pending_mode,
+            fast_post: machine.fast_post,
             wait_states: machine.profile.wait_states,
         };
         f(&mut bus)
+    }
+
+    #[test]
+    fn rtc_ports_round_trip_through_the_bus() {
+        let mut machine = test_machine();
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x70, BusWidth::Byte, 0x00).unwrap(); // select seconds
+            bus.write_io(0x71, BusWidth::Byte, 42).unwrap();
+            bus.write_io(0x70, BusWidth::Byte, 0x00).unwrap();
+            let secs = bus.read_io(0x70 + 1, BusWidth::Byte).unwrap();
+            assert_eq!(secs, 42);
+        });
+    }
+
+    #[test]
+    fn rtc_advances_seconds_on_the_machine_clock() {
+        let mut machine = test_machine();
+        machine.seed_rtc(2026, 6, 20, 6, 12, 0, 0);
+        // Step roughly three seconds of emulated time, in ~10 ms chunks so the
+        // sub-second accumulator carries the way it does during a real run.
+        let clock_hz = machine.profile.clock_hz;
+        let chunk = clock_hz / 100; // ~10 ms
+        for _ in 0..300 {
+            machine.advance_devices_clocks(chunk);
+        }
+        let bytes = machine.cmos_bytes();
+        // Seconds register (0x00) should have advanced to about 3.
+        assert!(
+            (2..=4).contains(&bytes[0x00]),
+            "expected the seconds register near 3, got {}",
+            bytes[0x00]
+        );
+    }
+
+    #[test]
+    fn cmos_persists_and_reloads_via_bytes() {
+        let mut machine = test_machine();
+        // Guest writes a layout byte and a boot-order byte, then refreshes the
+        // checksum the way the setup page would.
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x70, BusWidth::Byte, 0x10).unwrap();
+            bus.write_io(0x71, BusWidth::Byte, 3).unwrap(); // FR layout
+            bus.write_io(0x70, BusWidth::Byte, 0x11).unwrap();
+            bus.write_io(0x71, BusWidth::Byte, 1).unwrap(); // disk-first
+        });
+        assert!(
+            machine.take_cmos_dirty(),
+            "an NVRAM write should mark dirty"
+        );
+        let saved = machine.cmos_bytes();
+
+        // A fresh machine loads the saved image and reads the same bytes back.
+        let mut other = test_machine();
+        other.load_cmos(&saved);
+        assert_eq!(other.cmos_bytes()[0x10], 3);
+        assert_eq!(other.cmos_bytes()[0x11], 1);
     }
 
     #[test]
@@ -4038,6 +4605,37 @@ mod tests {
         assert_eq!(raster.pixels[0], 15);
         // Resolved through the live DAC, entry 15 is red.
         assert_eq!(machine.palette_argb()[15], 0x00FF_0000);
+    }
+
+    #[test]
+    fn cga_graphics_routes_b800_to_the_framebuffer() {
+        let mut machine = test_machine();
+        // Enter CGA mode 04h (320x200x4) the way INT 10h AH=00 AL=04 would.
+        machine.video_mut().set_cga_mode(0x04);
+        assert_eq!(machine.video().active_mode(), VideoMode::Cga);
+        // A byte written to B800:0000 lands in the CGA framebuffer, not the text
+        // buffer. 0b00_01_10_11 decodes to bg/green/red/brown on the default
+        // palette (green=2, red=4, brown=6).
+        machine.write_physical_u8(VGA_TEXT_BASE, 0b00_01_10_11);
+        assert_eq!(machine.read_physical_u8(VGA_TEXT_BASE), 0b00_01_10_11);
+        let raster = machine.video_mut().render_full_frame();
+        assert_eq!(raster.width, 320);
+        assert_eq!(raster.height, 262);
+        // The first four pixels of scanline 0.
+        assert_eq!(&raster.pixels[0..4], &[0, 2, 4, 6]);
+    }
+
+    #[test]
+    fn cga_odd_scanline_reads_the_high_bank_through_the_machine() {
+        let mut machine = test_machine();
+        machine.video_mut().set_cga_mode(0x04);
+        // Scanline 1 of a CGA frame reads framebuffer offset 0x2000 (the odd bank).
+        // Write there through the B800 aperture and confirm it scans out on line 1.
+        machine.write_physical_u8(VGA_TEXT_BASE + 0x2000, 0b01_01_01_01);
+        let raster = machine.video_mut().render_full_frame();
+        // Row 1 starts at offset width*1.
+        let row1 = &raster.pixels[320..320 + 4];
+        assert_eq!(row1, &[2, 2, 2, 2]); // value 1 -> green(2)
     }
 
     #[test]
@@ -5889,33 +6487,194 @@ mod tests {
     }
 
     #[test]
-    fn izarra_bios_draws_post_banner_in_mode13h() {
+    fn izarra_bios_draws_graceful_post_screen() {
+        // The graceful screen is a white field (DAC index GFX_WHITE = 0) with the
+        // red "Izarra 3000" wordmark (index GFX_RED = 4) across the top and a red
+        // progress-bar frame lower down. The raster carries DAC indices, not RGB,
+        // so the palette remap to white/red does not change the index values here.
         let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
         machine.run_until_halt_or_cycles(5_000_000).unwrap();
-        // The BIOS is idling with the console drawn; advance the beam to scan a frame.
+        // The BIOS is idling with the screen drawn; advance the beam to scan a frame.
         machine.advance_devices(600_000);
         let raster = machine.vga_raster().expect("mode 13h presents a VgaRaster");
         assert_eq!(raster.width, 320);
-        // gfx_clear painted the frame with COLOR_BG (0): a pixel well below the
-        // banner is background.
         let w = raster.width as usize;
+        // A clear spot (no logo, no text, no bar) is the white field, index 0.
+        // Logical y 64 -> physical 128 under the mode-13h double scan.
         assert_eq!(
-            raster.pixels[150 * w + 160],
+            raster.pixels[128 * w + 12],
             0,
-            "frame cleared to background"
+            "the background field cleared to white (index 0)"
         );
-        // gfx_text drew the title in COLOR_TITLE (0x0f). Mode 13h double-scans, so
-        // logical rows 8..16 land at physical rows 16..32. Count foreground pixels
-        // in that band (x 8..144) rather than matching an exact glyph.
-        let title_pixels = (16..32)
-            .flat_map(|y| (8..144).map(move |x| (x, y)))
-            .filter(|&(x, y)| raster.pixels[y * w + x] == 0x0f)
+        // The red wordmark sits at logical y 8..29, x 62..257. Mode 13h double-
+        // scans, so that band lands at physical rows 16..58. Count index-4 pixels.
+        let logo_pixels = (16..58)
+            .flat_map(|y| (62..257).map(move |x| (x, y)))
+            .filter(|&(x, y)| raster.pixels[y * w + x] == 0x04)
             .count();
         assert!(
-            title_pixels > 20,
-            "expected the drawn title glyphs, found {title_pixels} foreground pixels"
+            logo_pixels > 200,
+            "expected the red Izarra 3000 wordmark, found {logo_pixels} red pixels"
         );
+        // The progress-bar frame is red too. Its top edge is logical y 128 ->
+        // physical 256, spanning x 32..288. Find red pixels along that row band.
+        let bar_pixels = (256..260)
+            .flat_map(|y| (32..288).map(move |x| (x, y)))
+            .filter(|&(x, y)| raster.pixels[y * w + x] == 0x04)
+            .count();
+        assert!(
+            bar_pixels > 50,
+            "expected the red progress-bar frame, found {bar_pixels} red pixels"
+        );
+    }
+
+    #[test]
+    fn izarra_bios_plays_the_power_on_chime() {
+        // POST opens with the four-note PC-speaker chime. The note delay is skipped
+        // under the default fast POST, but each note still programs PIT channel 2
+        // and drives port 0x61 bit 1 high, so the speaker enable latch must be set
+        // by the time POST has run.
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
+        machine.run_until_halt_or_cycles(5_000_000).unwrap();
+        assert!(
+            machine.speaker_ever_enabled(),
+            "the power-on chime should enable the PC speaker during POST"
+        );
+    }
+
+    #[test]
+    fn serial_tx_is_captured_and_lsr_reports_empty() {
+        // A write to the COM1 transmit register (0x3F8) with DLAB clear appends to
+        // the text serial_text() surfaces, and the line status register (0x3FD)
+        // always reports transmitter empty (THRE|TEMT) so a poll loop never stalls.
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x03f8, BusWidth::Byte, u32::from(b'H'))
+                .unwrap();
+            bus.write_io(0x03f8, BusWidth::Byte, u32::from(b'i'))
+                .unwrap();
+        });
+        assert!(machine.serial_text().ends_with("Hi"));
+        let lsr = machine.read_io_port_u8(0x03fd);
+        assert_ne!(lsr & 0x20, 0, "THRE set");
+        assert_ne!(lsr & 0x40, 0, "TEMT set");
+    }
+
+    #[test]
+    fn izarra_bios_mirrors_post_log_to_com1() {
+        // POST initializes COM1 and writes each step's status and name to 0x3F8.
+        // After a full POST run the serial log carries the header and the
+        // foundation reference step, proving the mirror is live.
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
+        machine.run_until_halt_or_cycles(5_000_000).unwrap();
+        let serial = machine.serial_text();
+        assert!(
+            serial.contains("Izarra 3000 POST"),
+            "COM1 log missing the POST header: {serial:?}"
+        );
+        assert!(
+            serial.contains("PASS self.framework"),
+            "COM1 log missing the framework step line: {serial:?}"
+        );
+    }
+
+    #[test]
+    fn fast_post_port_reflects_the_flag() {
+        // Port 0xE2 is the Lotura POST-pacing flag the BIOS reads before the
+        // cosmetic RAM count-up. It defaults to fast (1) so headless runs and
+        // tests skip the ~8 s pacing; the GUI clears it for the full experience.
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
+        let fast = with_bus(&mut machine, |bus| {
+            bus.read_io(0x00e2, BusWidth::Byte).unwrap() as u8
+        });
+        assert_eq!(fast, 1, "fast POST is the default");
+        machine.set_fast_post(false);
+        let full = with_bus(&mut machine, |bus| {
+            bus.read_io(0x00e2, BusWidth::Byte).unwrap() as u8
+        });
+        assert_eq!(full, 0, "clearing the flag selects the full-pacing path");
+    }
+
+    #[test]
+    fn izarra_bios_int19_boots_floppy_sector_zero() {
+        // INT 19h must load sector 0 of the mounted floppy to 0000:7C00 and far
+        // jump there with no signature check. The boot sector writes a sentinel
+        // and halts; if the sentinel lands, the bootstrap loaded and jumped.
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
+
+        let mut img = vec![0u8; 737_280];
+        // Boot sector at 0000:7C00: mov bx,0x0500; mov al,0x99; mov [bx],al; hlt.
+        // boot_entry enters with DS=0, so [bx] addresses 0000:0500.
+        let boot = [0xBB, 0x00, 0x05, 0xB0, 0x99, 0x88, 0x07, 0xF4];
+        img[..boot.len()].copy_from_slice(&boot);
+        machine.mount_floppy(img).unwrap();
+
+        machine.run_until_halt_or_cycles(50_000_000).unwrap();
+        assert_eq!(
+            machine.read_physical_u8(0x0500),
+            0x99,
+            "the boot sector ran from 0000:7C00, so INT 19h loaded and jumped"
+        );
+    }
+
+    #[test]
+    fn int13_through_ff00_0000_returns_to_caller() {
+        // Period PC booters (e.g. Wizardry III) repoint IVT[0x13] to FF00:0000 to
+        // chain disk calls through the ROM-BIOS handler, then issue INT 13h. The
+        // host intercepts the INT 13h instruction by vector number regardless of
+        // the IVT target, so it still services the read; the redirected vector at
+        // FF00:0000 only needs a valid IRET to land on. This test proves control
+        // returns to the caller (no reset, no runaway) and the disk read happened.
+        let mut img = vec![0u8; 737_280];
+        img[0] = 0xEB;
+        img[1] = 0x55;
+        let rom = rom_with_code(&[
+            // Point IVT[0x13] (at 0000:004C) to FF00:0000.
+            0x31, 0xC0, // xor ax, ax
+            0x8E, 0xD8, // mov ds, ax
+            0xC7, 0x06, 0x4C, 0x00, 0x00, 0x00, // mov word [0x004C], 0x0000 (offset)
+            0xC7, 0x06, 0x4E, 0x00, 0x00, 0xFF, // mov word [0x004E], 0xFF00 (segment)
+            // Read 1 sector at CHS(0,0,1) of drive 0 into ES:BX = 0000:2000.
+            0x8E, 0xC0, // mov es, ax
+            0xBB, 0x00, 0x20, // mov bx, 0x2000
+            0xB8, 0x01, 0x02, // mov ax, 0x0201
+            0xB9, 0x01, 0x00, // mov cx, 0x0001
+            0xBA, 0x00, 0x00, // mov dx, 0x0000
+            0xCD, 0x13, // int 13h  -> vector now targets FF00:0000
+            // If the IRET at FF00:0000 returned cleanly, we reach this marker.
+            0xBB, 0x00, 0x05, // mov bx, 0x0500
+            0xB0, 0x42, // mov al, 0x42
+            0x88, 0x07, // mov [bx], al   (DS=0, so writes 0000:0500)
+            0xF4, // hlt
+        ]);
+        // The Izarra BIOS emits an IRET at ROM offset 0xF000 (FF00:0000); the
+        // synthetic test ROM gets the same stub so the redirected vector lands on
+        // a clean return point.
+        let mut rom = rom;
+        rom[0xF000] = 0xCF; // iret
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        machine.mount_floppy(img).unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        // The INT 13h read still placed the sector bytes at 0x2000.
+        assert_eq!(machine.read_physical_u8(0x2000), 0xEB);
+        assert_eq!(machine.read_physical_u8(0x2001), 0x55);
+        // The IRET at FF00:0000 returned to the caller, which ran the marker store.
+        assert_eq!(
+            machine.read_physical_u8(0x0500),
+            0x42,
+            "control returned past the redirected INT 13h vector"
+        );
+        let flags = machine.cpu().registers.eflags;
+        assert_eq!(flags & 0x0001, 0, "CF must be clear after a good read");
     }
 
     #[test]
@@ -5932,5 +6691,55 @@ mod tests {
         let head = machine.memory_read_u16_for_test(0x41a);
         let tail = machine.memory_read_u16_for_test(0x41c);
         assert_ne!(head, tail, "the installed INT 09h enqueued the key");
+    }
+
+    #[test]
+    fn izarra_setup_saves_a_changed_value_to_cmos() {
+        // Drive the Del setup page end to end: enter it during POST, change the
+        // keyboard layout (CMOS 0x10, default 0 = en-US) to the next entry, save,
+        // and confirm the persisted CMOS byte changed. The setup menu blocks on a
+        // keyboard read between keystrokes, so each key is injected then run.
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
+        assert_eq!(
+            machine.cmos_byte(0x10),
+            0,
+            "the keyboard-layout NVRAM byte starts at en-US (0)"
+        );
+
+        // Queue Del before POST reaches the hotkey window so the window finds it.
+        // Make + break; only the make enqueues into the BDA ring (0x53 = Del).
+        machine.inject_key_scancodes(&[0x53, 0xd3]);
+        // Run past POST. The window consumes Del and enters the menu, which then
+        // blocks on a keyboard read, so the rest of the budget just spins there.
+        machine.run_until_halt_or_cycles(5_000_000).unwrap();
+
+        // Down moves the highlight from Time (row 0) to Keyboard (row 1).
+        machine.inject_key_scancodes(&[0x50, 0xd0]); // Down
+        machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        // Right cycles the keyboard layout forward (en-US -> UK).
+        machine.inject_key_scancodes(&[0x4d, 0xcd]); // Right
+        machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        // F10 saves: writes CMOS 0x10/0x12, refreshes the checksum, and exits.
+        machine.inject_key_scancodes(&[0x44, 0xc4]); // F10
+        machine.run_until_halt_or_cycles(2_000_000).unwrap();
+
+        assert_eq!(
+            machine.cmos_byte(0x10),
+            1,
+            "saving the setup page persisted the new keyboard layout to CMOS 0x10"
+        );
+        // The save also refreshes the NVRAM checksum, so a reload validates.
+        let saved = machine.cmos_bytes();
+        let mut reloaded = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .unwrap();
+        assert!(
+            reloaded.load_cmos(&saved),
+            "the saved CMOS image carries a valid checksum"
+        );
+        assert_eq!(reloaded.cmos_byte(0x10), 1);
     }
 }

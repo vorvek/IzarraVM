@@ -1,3 +1,4 @@
+mod cmos;
 mod gui;
 
 use clap::Parser;
@@ -18,6 +19,10 @@ use tracing::info;
 /// reaches its POST-0x03 fault out of the box; halting ROMs return at their HLT
 /// well before this, and --cycles tunes it down for quick runs.
 const DEFAULT_TEST_ROM_CYCLES: u64 = 200_000_000;
+
+/// Default cycle budget for --headless-boot-floppy. Well past POST plus the boot
+/// sector's early work; --cycles tunes it up for a longer investigation.
+const DEFAULT_BOOT_FLOPPY_CYCLES: u64 = 50_000_000;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "IzarraVM emulator scaffold")]
@@ -53,6 +58,8 @@ struct Cli {
     #[arg(long)]
     headless_izarra_bios: bool,
     #[arg(long)]
+    headless_boot_floppy: Option<PathBuf>,
+    #[arg(long)]
     headless_run: Option<PathBuf>,
     #[arg(long)]
     stdin_text: Option<String>,
@@ -75,7 +82,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     let cli = Cli::parse();
-    let config = load_config(&cli)?;
+    let mut config = load_config(&cli)?;
+    // When the user gave no C: location (no --c_drive, no --dosroot, and the
+    // config left at its "." default), auto-mount from ./c_drive or
+    // ~/.izarravm/c_drive and lay down Toka-DOS if it is missing.
+    if cli.c_drive.is_none() && cli.dosroot.is_none() && config.dos.c_drive == Path::new(".") {
+        let c_root = izarravm_dos::resolve_c_root();
+        izarravm_dos::ensure_toka_dos(&c_root);
+        config.dos.c_drive = c_root;
+    }
     let hardware = HardwareProfile::from_config(&config)?;
     let dos = DosKernelServices::new(HostDrive::mount_c(&config.dos.c_drive)?);
     let audio = AudioSubsystem::from_config(&config.audio);
@@ -126,6 +141,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         return run_izarra_bios(&hardware);
     }
 
+    if let Some(path) = &cli.headless_boot_floppy {
+        return run_boot_floppy(path, cli.cycles, &hardware);
+    }
+
     let rom = match cli.bios.as_deref() {
         Some(path) => std::fs::read(path)?,
         None => izarravm_firmware::izarra_bios().to_vec(),
@@ -134,12 +153,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     // output is opened regardless of which sound cards are enabled. AudioPlayer
     // falls back to silent if the host has no usable device.
     let audio_enabled = true;
+    // Read host local time and resolve cmos.bin now, on the main thread, before
+    // the emulation thread spawns. now_local() is sound only single-threaded.
+    let rtc_setup = cmos::RtcSetup::from_c_root(&config.dos.c_drive);
     gui::run(
         MachineProfile::from_hardware_profile(&hardware),
         rom,
         config.dos.c_drive.clone(),
         audio_enabled,
         cli.margo_test_pattern,
+        rtc_setup,
     )?;
     Ok(())
 }
@@ -286,6 +309,122 @@ fn run_izarra_bios(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
     println!("declared: {}", results.declared_record_count);
     println!("stop: {stop_reason:?}");
     Ok(())
+}
+
+/// Mount a floppy IMG, run the Izarra BIOS so INT 19h bootstraps it, and print
+/// CS:IP plus a short trace of low memory. A human reads the trace to confirm the
+/// boot sector executed: CS:IP leaving the BIOS region (CS far below 0xF000) and
+/// the boot sector bytes sitting at 0000:7C00 mean INT 19h loaded and jumped.
+fn run_boot_floppy(
+    path: &Path,
+    cycles: Option<u64>,
+    hardware: &HardwareProfile,
+) -> Result<(), Box<dyn Error>> {
+    let image = std::fs::read(path)?;
+    let image_len = image.len();
+    let mut machine = Machine::new(
+        MachineProfile::from_hardware_profile(hardware),
+        izarravm_firmware::izarra_bios(),
+    )?;
+    machine.mount_floppy(image).map_err(|message| {
+        format!(
+            "cannot mount {} ({image_len} bytes): {message}",
+            path.display()
+        )
+    })?;
+    // The bootstrap runs after POST, which is wall-time bound, so the default budget
+    // sits well past POST plus the boot sector's own early work. A long headless
+    // investigation passes --cycles to run further, so honor it when given.
+    let budget = cycles.unwrap_or(DEFAULT_BOOT_FLOPPY_CYCLES);
+    let stop_reason = machine.run_until_halt_or_cycles(budget)?;
+
+    let cs = machine.cpu().registers.cs().selector;
+    let ip = machine.cpu().registers.eip as u16;
+    println!("image: {} ({image_len} bytes)", path.display());
+    println!("stop: {stop_reason:?}");
+    println!("CS:IP = {cs:04X}:{ip:04X}");
+    // The first bytes of the loaded boot sector and where the CPU landed. A boot
+    // sector that ran leaves CS below the BIOS region (0xF000).
+    let mut at_7c00 = [0u8; 16];
+    for (offset, byte) in at_7c00.iter_mut().enumerate() {
+        *byte = machine.read_physical_u8(0x7c00 + offset as u32);
+    }
+    let hex: Vec<String> = at_7c00.iter().map(|byte| format!("{byte:02X}")).collect();
+    println!("0000:7C00 = {}", hex.join(" "));
+    if cs < 0xf000 {
+        println!("boot: boot sector is executing outside the BIOS region");
+    } else {
+        println!("boot: still in the BIOS (no boot, or read error)");
+    }
+    print_video_summary(&mut machine);
+    Ok(())
+}
+
+/// After a headless run, report the active video mode and whether the screen
+/// holds meaningful content. It renders a full frame and counts non-background
+/// pixels with a small histogram of the busiest DAC indices; in text mode it
+/// also prints the 80x25 page. A human reads this to confirm a booter drew its
+/// title or menu rather than sitting on a blank screen.
+fn print_video_summary(machine: &mut Machine) {
+    use izarravm_video::VideoMode;
+
+    let mode = machine.video().active_mode();
+    let mode_name = match mode {
+        VideoMode::Text => "text (03h)",
+        VideoMode::Mode13h => "mode 13h (320x200x256)",
+        VideoMode::Planar => "planar (EGA/VGA 16-color)",
+        VideoMode::ModeX => "mode X (unchained 256-color)",
+        VideoMode::Cga => "CGA graphics (320x200x4 / 640x200x2)",
+    };
+    println!("video mode: {mode_name}");
+
+    if matches!(mode, VideoMode::Text) {
+        let frame = machine.screen_text();
+        let text = frame.as_text();
+        let printable = text.chars().filter(|c| !c.is_whitespace()).count();
+        println!("text non-blank glyphs: {printable}");
+        println!("--- 80x25 text ---");
+        println!("{text}");
+        println!("--- end text ---");
+    }
+
+    // Render one full frame and summarize the pixel indices (works for text and
+    // graphics modes alike: render_full_frame walks the CRTC scanlines). The
+    // background is DAC index 0 (black on the stock palette), so non-zero pixels
+    // mean the guest drew something.
+    let raster = machine.video_mut().render_full_frame();
+    let total = raster.pixels.len();
+    let nonzero = raster.pixels.iter().filter(|&&p| p != 0).count();
+    println!(
+        "framebuffer: {}x{} ({total} px)",
+        raster.width, raster.height
+    );
+    println!(
+        "non-zero pixels: {nonzero} ({:.1}%)",
+        if total == 0 {
+            0.0
+        } else {
+            100.0 * nonzero as f64 / total as f64
+        }
+    );
+    let mut histogram = [0u32; 256];
+    for &index in &raster.pixels {
+        histogram[index as usize] += 1;
+    }
+    let mut entries: Vec<(usize, u32)> = histogram
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|&(_, count)| count > 0)
+        .collect();
+    entries.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
+    let top: Vec<String> = entries
+        .iter()
+        .take(8)
+        .map(|(index, count)| format!("idx {index}: {count}"))
+        .collect();
+    println!("distinct colors: {}", entries.len());
+    println!("top indices: {}", top.join(", "));
 }
 
 /// Minimal ASCII to Set 1 make+break for the demo (lowercase letters, digits,

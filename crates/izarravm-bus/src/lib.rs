@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -182,20 +184,65 @@ impl BusCycle {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// Default cap on the number of retained bus cycles. A run of many hundred
+/// million cycles would otherwise grow the trace toward gigabytes and run the
+/// host out of memory. Holding the most recent few million keeps the trace
+/// bounded to tens of megabytes while still covering any halting test ROM in
+/// full (their total bus traffic stays well under this) and leaving recent
+/// history intact for the long runs that drive the bound.
+pub const DEFAULT_BUS_TRACE_CAPACITY: usize = 4_000_000;
+
+/// A bounded record of recent bus cycles plus the running clock total.
+///
+/// `push` keeps the most recent `capacity` cycles and drops the oldest once the
+/// cap is reached. `elapsed_clocks` always reflects every pushed cycle, evicted
+/// or not, so timing accounting stays exact no matter how long a run goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BusTrace {
-    cycles: Vec<BusCycle>,
+    cycles: VecDeque<BusCycle>,
+    capacity: usize,
     elapsed_clocks: u64,
 }
 
+impl Default for BusTrace {
+    fn default() -> Self {
+        Self::with_capacity(DEFAULT_BUS_TRACE_CAPACITY)
+    }
+}
+
 impl BusTrace {
-    pub fn push(&mut self, cycle: BusCycle) {
-        self.elapsed_clocks += u64::from(cycle.clocks);
-        self.cycles.push(cycle);
+    /// A trace that retains at most `capacity` recent cycles. A capacity of zero
+    /// keeps no cycle history but still totals `elapsed_clocks`.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            cycles: VecDeque::new(),
+            capacity,
+            elapsed_clocks: 0,
+        }
     }
 
-    pub fn cycles(&self) -> &[BusCycle] {
+    pub fn push(&mut self, cycle: BusCycle) {
+        self.elapsed_clocks += u64::from(cycle.clocks);
+        if self.capacity == 0 {
+            return;
+        }
+        if self.cycles.len() == self.capacity {
+            self.cycles.pop_front();
+        }
+        self.cycles.push_back(cycle);
+    }
+
+    /// The retained cycles, oldest first. Bounded to the configured capacity, so
+    /// after a long run this holds the most recent window rather than all history.
+    /// `VecDeque` indexes (`cycles()[0]`), reports `len()`, and yields `iter()`,
+    /// so existing callers read it the same as the old slice.
+    pub fn cycles(&self) -> &VecDeque<BusCycle> {
         &self.cycles
+    }
+
+    /// The most recent cycle, or `None` when no cycle has been pushed.
+    pub fn last(&self) -> Option<&BusCycle> {
+        self.cycles.back()
     }
 
     pub fn elapsed_clocks(&self) -> u64 {
@@ -312,6 +359,38 @@ mod tests {
             vec![BusState::T1, BusState::T2, BusState::Tw, BusState::Tw]
         );
         assert_eq!(cycle.clocks, 4);
+    }
+
+    #[test]
+    fn bus_trace_caps_retained_cycles_but_keeps_total_clocks() {
+        let mut trace = BusTrace::with_capacity(3);
+        for index in 0..10u32 {
+            trace.push(BusCycle::new(
+                BusAccessKind::DataRead,
+                index,
+                BusWidth::Byte,
+                0,
+            ));
+        }
+
+        // Only the three most recent cycles survive, oldest first.
+        assert_eq!(trace.cycles().len(), 3);
+        assert_eq!(trace.cycles()[0].address, 7);
+        assert_eq!(trace.cycles()[2].address, 9);
+        assert_eq!(trace.last().unwrap().address, 9);
+        // Every pushed cycle still counts toward the clock total (BusState::T1+T2
+        // with no wait states is two clocks each, ten cycles is twenty clocks).
+        assert_eq!(trace.elapsed_clocks(), 20);
+    }
+
+    #[test]
+    fn bus_trace_zero_capacity_keeps_no_history_but_totals_clocks() {
+        let mut trace = BusTrace::with_capacity(0);
+        trace.push(BusCycle::new(BusAccessKind::DataRead, 0, BusWidth::Byte, 0));
+
+        assert_eq!(trace.cycles().len(), 0);
+        assert_eq!(trace.last(), None);
+        assert_eq!(trace.elapsed_clocks(), 2);
     }
 
     #[test]
