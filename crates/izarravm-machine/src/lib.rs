@@ -3259,6 +3259,78 @@ mod tests {
     }
 
     #[test]
+    fn bios_aux_enable_then_packet_reads_back_with_no_stray_keyboard_byte() {
+        // Drive the exact sequence the BIOS bootbox menu runs (izbios-bootbox.inc
+        // bx2_aux_init): read the controller command byte, set the IRQ1+IRQ12
+        // enable bits, then enable AUX reporting via the 0xD4 prefix and drain the
+        // mouse ACK. The two things this guards that the menu has no automated
+        // coverage for: the injected packet reads back on 0x60 with the AUX status
+        // bit set, AND the enable handshake never drops a stray byte into the
+        // keyboard scancode ring (which the keyboard ISR reads unconditionally).
+        let profile = MachineProfile::gsw_386(1, VideoCard::Et4000Ax);
+        let mut machine = Machine::new(profile, vec![0u8; BIOS_ROM_SIZE]).unwrap();
+        {
+            let mut bus = machine.make_bus();
+            // Read CCB (0x20) -> 0x60, OR in IRQ1 (bit0) + IRQ12 (bit1), write back.
+            bus.write_io(0x64, BusWidth::Byte, 0x20).unwrap();
+            let ccb = bus.read_io(0x60, BusWidth::Byte).unwrap() as u8;
+            let new_ccb = ccb | 0x01 | 0x02;
+            bus.write_io(0x64, BusWidth::Byte, 0x60).unwrap();
+            bus.write_io(0x60, BusWidth::Byte, new_ccb as u32).unwrap();
+            // Enable AUX data reporting: 0xD4 routes 0xF4 to the mouse.
+            bus.write_io(0x64, BusWidth::Byte, 0xD4).unwrap();
+            bus.write_io(0x60, BusWidth::Byte, 0xF4).unwrap();
+            // Drain the AUX ACK (0xFA): it must arrive flagged as an AUX byte.
+            let status = bus.read_io(0x64, BusWidth::Byte).unwrap() as u8;
+            assert_eq!(status & 0x01, 0x01, "ACK waiting (OBF)");
+            assert_eq!(status & 0x20, 0x20, "ACK is an AUX byte, not a key");
+            assert_eq!(
+                bus.read_io(0x60, BusWidth::Byte).unwrap(),
+                0xFA,
+                "mouse ACK"
+            );
+        }
+        // The enable handshake must not have armed IRQ1 or queued a keyboard byte.
+        assert!(
+            !machine.irq1_pending(),
+            "AUX enable must not arm the keyboard interrupt"
+        );
+        assert_eq!(
+            machine.read_io_port_u8(0x64) & 0x01,
+            0,
+            "no byte left in the output buffer after the ACK drain"
+        );
+
+        // Now a host move queues a three-byte packet, flagged AUX, with IRQ12.
+        machine.inject_mouse(6, -3, 0x01); // right 6, up 3, left button down
+        assert!(machine.irq12_pending(), "movement requests IRQ12");
+        assert_eq!(
+            machine.read_io_port_u8(0x64) & 0x20,
+            0x20,
+            "packet byte is flagged AUX"
+        );
+        let b0 = machine.read_io_port_u8(0x60);
+        assert_eq!(b0 & 0x08, 0x08, "sync bit");
+        assert_eq!(b0 & 0x01, 0x01, "left button");
+        assert_eq!(machine.read_io_port_u8(0x60), 6, "dx byte");
+        assert_eq!(
+            machine.read_io_port_u8(0x60),
+            3,
+            "dy byte (screen up -> +3)"
+        );
+        // The packet drained cleanly: nothing left, and still no keyboard IRQ.
+        assert_eq!(
+            machine.read_io_port_u8(0x64) & 0x01,
+            0,
+            "output buffer empty after the packet"
+        );
+        assert!(
+            !machine.irq1_pending(),
+            "the AUX packet never touched the keyboard interrupt"
+        );
+    }
+
+    #[test]
     fn int33_set_then_get_position_round_trips() {
         // Stub: set the cursor to (100, 50) via AX=0004, then read it back via
         // AX=0003. The host injects a left-button-down move first so the get

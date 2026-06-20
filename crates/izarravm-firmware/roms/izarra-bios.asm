@@ -30,6 +30,7 @@ reset:                          ; ROM offset 0; the reset vector far-jumps here
 %include "probes/probe-margo.inc"    ; STREAM C
 %include "setup-ui.inc"              ; STREAM D
 %include "izbios-boot.inc"           ; STREAM E: INT 19h bootstrap (boot_entry)
+%include "izbios-bootbox.inc"        ; STREAM E: boxed two-pane boot+speed menu
 %include "izbios-chime.inc"          ; STREAM E: power-on PC-speaker chime (play_chime)
 %include "izbios-logo.inc"           ; STREAM E: red "Izarra 3000" wordmark bitmap
 %include "izbios-tables.inc"    ; foundation: MUST be last (emits the step table)

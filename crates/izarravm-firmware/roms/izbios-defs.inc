@@ -158,3 +158,90 @@
 %define PORT_COM1_BASE   0x3f8
 %define PORT_COM1_LSR    0x3fd
 %define PORT_COM1_SCR    0x3ff
+
+; --- Boxed two-pane boot+speed menu (izbios-bootbox.inc) -------------------
+; Feature switch for the polled PS/2 AUX mouse layer. The 8042 AUX channel and
+; IRQ12 are implemented in the machine (see crates/izarravm-machine/src/
+; keyboard.rs), so the mouse path is built in this ROM. Set to 0 to assemble the
+; keyboard-only menu.
+%define BMX_MOUSE 1
+
+; 8042 controller command-byte bits, as the machine model honors them
+; (keyboard.rs latch_next): bit 0 enables IRQ1 (keyboard), bit 1 enables IRQ12
+; (the mouse). There is no "disable mouse clock" bit in this model, so enabling
+; the mouse is just "set bit 1" on top of the keyboard's bit 0.
+%define KBC_CMD_IRQ1     0x01
+%define KBC_CMD_IRQ12    0x02
+; 8042 commands the AUX path uses.
+%define KBC_READ_CCB     0x20      ; read controller command byte to 0x60
+%define KBC_WRITE_CCB    0x60      ; next 0x60 byte sets the command byte
+%define KBC_WRITE_AUX    0xd4      ; route the next 0x60 byte to the mouse
+; PS/2 mouse device commands (sent through the 0xD4 prefix).
+%define PS2_ENABLE_REPORT 0xf4
+%define PS2_DISABLE_REPORT 0xf5
+; Status bits on port 0x64 (keyboard.rs STATUS_OBF / STATUS_AUX).
+%define KBC_STATUS_OBF   0x01      ; output buffer full (byte waiting on 0x60)
+%define KBC_STATUS_AUX   0x20      ; the latched byte came from the mouse
+
+; Boxed-menu state block (segment 0, free 0x0800+ region, clear of BIOS_SCRATCH,
+; SETUP_SCRATCH, PROBE_SCRATCH and the 0x0600 IRET stub; far below 0x7C00). The
+; keyboard build reads only 0x0900..0x0906; the mouse fields are reserved
+; unconditionally so both builds share one map.
+%define BMX_BASE         0x0900
+%define BMX_FOCUS_PANE   0x0900    ; DEV / SPD / BTN
+%define BMX_FOCUS_IDX    0x0901    ; row within the focused pane
+%define BMX_MARK_DEV     0x0902    ; marked device 0..2
+%define BMX_MARK_SPD     0x0903    ; marked speed 0..3
+%define BMX_BTN_FROM     0x0904    ; pane to return to on Up from a button
+%define BMX_AVAIL        0x0905    ; availability bits: b0 HDD, b1 CD
+%define BMX_LIVE_MODE    0x0906    ; 0xE1 read at entry (reset decision)
+%define BMX_EXIT         0x0907    ; menu exit flag: 1 after Accept/Cancel
+%define BMX_CUR_X        0x0908    ; cursor X word (0..303)
+%define BMX_CUR_Y        0x090a    ; cursor Y word (0..183)
+%define BMX_LMB          0x090c    ; last left-button state (edge detect)
+%define BMX_LAST_REGION  0x090d    ; last hovered region id
+%define BMX_PKT_IDX      0x090e    ; PS/2 packet assembler index 0..2
+%define BMX_PKT          0x0910    ; 3-byte PS/2 packet buffer
+%define BMX_SAVE         0x0920    ; 16x16 cursor background save buffer (256 B)
+
+; Boxed-menu draw scratch (segment 0 RAM, above BMX_SAVE which ends at 0x0A1F).
+; The renderer is single-threaded, so these are reused freely between helpers.
+; They MUST be in RAM, not the ROM code segment: a mov into a CS label is dropped
+; by the bus (ROM is read-only), which silently breaks the value.
+%define BMX_DI           0x0a20    ; draw row index (byte)
+%define BMX_DCOLOR       0x0a21    ; computed label color (byte)
+%define BMX_DFOCUSED     0x0a22    ; this row is the focused one (byte)
+%define BMX_DCODE        0x0a23    ; Accept: chosen GSW code (byte)
+%define BMX_DGLYPH       0x0a24    ; 1-char ASCIIZ marker buffer (2 bytes)
+%define BMX_DROWY        0x0a26    ; row top Y (word)
+%define BMX_DFX          0x0a28    ; frame x (word)
+%define BMX_DFY          0x0a2a    ; frame y (word)
+%define BMX_DFW          0x0a2c    ; frame w (word)
+%define BMX_DFH          0x0a2e    ; frame h (word)
+%define BMX_DTX          0x0a30    ; button label x (word)
+%define BMX_DSTRP        0x0a32    ; button label string pointer (word)
+
+; Focus-pane identifiers (held in BMX_FOCUS_PANE / BMX_BTN_FROM).
+%define BMX_PANE_DEV     0
+%define BMX_PANE_SPD     1
+%define BMX_PANE_BTN     2
+
+; Pane row counts.
+%define BMX_DEV_COUNT    3
+%define BMX_SPD_COUNT    4
+%define BMX_BTN_COUNT    2
+
+; Speed rows (right pane). The 0xE1/CMOS 0x12 code per row is the real hardware
+; encoding (gsw_mode_from_code: 0=386, 1=486, 2=586, 3=286), NOT a row index.
+%define BMX_SPD_FAST     0         ; 586, code 2
+%define BMX_SPD_SLOW     1         ; 486, code 1
+%define BMX_SPD_VSLOW    2         ; 386, code 0
+%define BMX_SPD_SSLOW    3         ; 286, code 3
+
+; Cursor sprite geometry (16x16, 2-byte stride, set-bit-only blit).
+%define BMX_CUR_W        16
+%define BMX_CUR_H        16
+%define BMX_CUR_STRIDE   2
+; Cursor clamp bounds keep the 16x16 sprite fully on the 320x200 field.
+%define BMX_CUR_X_MAX    303       ; 320 - 16 - 1
+%define BMX_CUR_Y_MAX    183       ; 200 - 16 - 1
