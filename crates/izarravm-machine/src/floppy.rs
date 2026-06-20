@@ -14,10 +14,6 @@ pub struct Geometry {
     pub drive_type: u8,
 }
 
-// The geometry and per-sector accessors below are exercised by this module's
-// tests and consumed by the INT 13h disk service that lands in a later slice.
-// Until that handler is wired in, the non-test build sees them as unread.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct Floppy {
     bytes: Vec<u8>,
@@ -25,7 +21,6 @@ pub struct Floppy {
     pub dirty: bool,
 }
 
-#[allow(dead_code)]
 const SECTOR: usize = 512;
 
 /// Map a raw image length to a CHS geometry, or None for an unrecognized size.
@@ -59,7 +54,6 @@ pub fn geometry_for(size: usize) -> Option<Geometry> {
     })
 }
 
-#[allow(dead_code)]
 impl Floppy {
     pub fn from_image(bytes: Vec<u8>) -> Result<Self, String> {
         let geom = geometry_for(bytes.len())

@@ -679,6 +679,168 @@ impl Machine {
         }
     }
 
+    /// Service the host side of an `INT 13h` disk request. Only floppy A: (DL=0)
+    /// is backed, by the mounted image. CHS to LBA uses the mounted media
+    /// geometry, so a 720 KB disk reads with 9 sectors per track and a 1.44 MB
+    /// disk with 18. Status is returned through AH and the carry flag the way a
+    /// real BIOS reports it: CF clear and AH=0 on success, CF set with an error
+    /// code in AH on failure.
+    fn handle_int13(&mut self) {
+        // With no image mounted there is no drive to service. Leave the registers
+        // and the IRET FLAGS image untouched so the guest sees the same result the
+        // bare IRET stub gave before this handler existed. The firmware boot suite
+        // relies on this: it places its second stage in memory directly and calls
+        // INT 13h with carry pre-cleared, expecting a no-op success.
+        if self.floppy.is_none() {
+            return;
+        }
+
+        let ax = self.cpu.registers.eax() as u16;
+        let ah = (ax >> 8) as u8;
+        let dx = self.cpu.registers.edx() as u16;
+        let dl = dx as u8;
+
+        match ah {
+            // AH=00 reset disk system. Nothing to do for the in-memory image.
+            0x00 => {
+                self.set_eax_ah(0x00);
+                self.set_int_frame_carry(false);
+            }
+            // AH=02 read sectors, AH=03 write sectors. AL = sector count, CH/CL
+            // carry the cylinder and sector (CL bits 0-5 sector, bits 6-7 the
+            // cylinder high bits), DH = head, DL = drive, ES:BX = buffer.
+            0x02 | 0x03 => self.int13_transfer(ah, dl),
+            // AH=08 read drive parameters. Report the mounted media geometry.
+            0x08 => self.int13_drive_parameters(dl),
+            // AH=15 read disk type. A floppy without a change line.
+            0x15 => {
+                self.set_eax_ah(0x01);
+                self.set_int_frame_carry(false);
+            }
+            // Unimplemented subfunctions succeed quietly rather than fault the
+            // guest. Real booters call a small fixed set; widen this if one needs
+            // a subfunction that must report failure.
+            _ => {
+                self.set_eax_ah(0x00);
+                self.set_int_frame_carry(false);
+            }
+        }
+    }
+
+    /// Carry out the AH=02 read / AH=03 write half of INT 13h.
+    fn int13_transfer(&mut self, ah: u8, dl: u8) {
+        let Some(geom) = self.floppy.as_ref().map(|f| f.geometry()) else {
+            // No media backs the request: report a timeout the way an empty
+            // drive would.
+            self.set_eax_ah(0x80);
+            self.set_int_frame_carry(true);
+            return;
+        };
+        // Only floppy A: is backed.
+        if dl != 0x00 {
+            self.set_eax_ah(0x80);
+            self.set_int_frame_carry(true);
+            return;
+        }
+        let _ = geom;
+
+        let ax = self.cpu.registers.eax() as u16;
+        let count = ax as u8;
+        let cx = self.cpu.registers.ecx() as u16;
+        let cl = cx as u8;
+        let ch = (cx >> 8) as u8;
+        let sector = cl & 0x3f;
+        let cyl = u16::from(ch) | (u16::from(cl & 0xc0) << 2);
+        let head = (self.cpu.registers.edx() as u16 >> 8) as u8;
+        let es = self.cpu.registers.segment(SegmentIndex::Es).base;
+        let bx = self.cpu.registers.ebx() as u16;
+        let buffer = es.wrapping_add(u32::from(bx));
+
+        let mut done: u8 = 0;
+        for i in 0..count {
+            // Multi-sector transfers advance within the current track only. A
+            // booter that crosses a track boundary in one call would need
+            // cross-track wrap added here.
+            let sec = sector + i;
+            let addr = buffer.wrapping_add(u32::from(i) * 512);
+            if ah == 0x02 {
+                let data = self
+                    .floppy
+                    .as_ref()
+                    .and_then(|f| f.read_sector(cyl, head, sec))
+                    .map(<[u8]>::to_vec);
+                match data {
+                    Some(bytes) => self.write_guest_block(addr, &bytes),
+                    None => break,
+                }
+            } else {
+                let bytes = self.read_guest_block(addr, 512);
+                let wrote = self
+                    .floppy
+                    .as_mut()
+                    .map(|f| f.write_sector(cyl, head, sec, &bytes))
+                    .unwrap_or(false);
+                if !wrote {
+                    break;
+                }
+            }
+            done += 1;
+        }
+
+        // AL returns the number of sectors actually transferred.
+        self.set_eax_al(done);
+        if done == count {
+            self.set_eax_ah(0x00);
+            self.set_int_frame_carry(false);
+        } else {
+            // Sector not found / read error.
+            self.set_eax_ah(0x04);
+            self.set_int_frame_carry(true);
+        }
+    }
+
+    /// Carry out the AH=08 read-drive-parameters half of INT 13h.
+    fn int13_drive_parameters(&mut self, dl: u8) {
+        let Some(geom) = self.floppy.as_ref().map(|f| f.geometry()) else {
+            self.set_eax_ah(0x80);
+            self.set_int_frame_carry(true);
+            return;
+        };
+        if dl != 0x00 {
+            self.set_eax_ah(0x80);
+            self.set_int_frame_carry(true);
+            return;
+        }
+        let max_cyl = geom.cylinders.saturating_sub(1);
+        // CL: sectors per track in bits 0-5, cylinder high bits in 6-7.
+        let cl = (geom.sectors & 0x3f) | (((max_cyl >> 8) as u8 & 0x03) << 6);
+        let ch = (max_cyl & 0xff) as u8;
+        let cx = (u16::from(ch) << 8) | u16::from(cl);
+        let ecx = (self.cpu.registers.ecx() & !0xFFFF) | u32::from(cx);
+        self.cpu.registers.set_ecx(ecx);
+        // DH = max head index, DL = number of floppy drives.
+        let dx = (u16::from(geom.heads.saturating_sub(1)) << 8) | 0x01;
+        let edx = (self.cpu.registers.edx() & !0xFFFF) | u32::from(dx);
+        self.cpu.registers.set_edx(edx);
+        // BL = drive type (0x03 = 720 KB, 0x04 = 1.44 MB).
+        let ebx = (self.cpu.registers.ebx() & !0xFF) | u32::from(geom.drive_type);
+        self.cpu.registers.set_ebx(ebx);
+        self.set_eax_ah(0x00);
+        self.set_int_frame_carry(false);
+    }
+
+    /// Replace AH in EAX, leaving AL and the upper 16 bits intact.
+    fn set_eax_ah(&mut self, ah: u8) {
+        let eax = (self.cpu.registers.eax() & !0xFF00) | (u32::from(ah) << 8);
+        self.cpu.registers.set_eax(eax);
+    }
+
+    /// Replace AL in EAX, leaving AH and the upper 16 bits intact.
+    fn set_eax_al(&mut self, al: u8) {
+        let eax = (self.cpu.registers.eax() & !0xFF) | u32::from(al);
+        self.cpu.registers.set_eax(eax);
+    }
+
     /// Set or clear CF in the FLAGS image the pending IRET stub will pop (SS:SP+4
     /// after a real-mode INT pushed IP, CS, FLAGS). Host-serviced INTs that report
     /// status through carry use this so the guest sees the right flag on return.
@@ -1489,6 +1651,7 @@ impl Machine {
                     if let Some(vector) = self.pending_soft_int {
                         match vector {
                             0x10 => self.handle_int10(),
+                            0x13 => self.handle_int13(),
                             0x15 => self.handle_int15(),
                             0x20 | 0x21 => match self.handle_dos_int(vector) {
                                 Ok(Some(code)) => {
@@ -1769,7 +1932,7 @@ impl CpuBus for MachineBus<'_> {
         // video service; 0x20/0x21 are the DOS kernel. Vector 0x10 reaches here
         // only from a software INT today (the CPU never faults with vector 0x10);
         // revisit if an x87 #MF is added.
-        if matches!(vector, 0x10 | 0x15 | 0x20 | 0x21) {
+        if matches!(vector, 0x10 | 0x13 | 0x15 | 0x20 | 0x21) {
             *self.pending_soft_int = Some(vector);
         }
         Ok(())
@@ -2423,6 +2586,43 @@ mod tests {
         assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
         assert_eq!(machine.margo().display().width, 640);
         assert_eq!(machine.margo().display().height, 480);
+    }
+
+    #[test]
+    fn int13_read_places_sector_in_memory() {
+        // A 720 KB image whose first sector starts with a recognizable marker.
+        let mut img = vec![0u8; 737_280];
+        img[0] = 0xEB;
+        img[1] = 0x55;
+        // Stub: ES=0, BX=0x2000, read 1 sector at CHS(0,0,1) of drive 0 via INT 13h,
+        // then halt. AX=0x0201 (AH=02 read, AL=01 sector), CX=0x0001 (cyl 0,
+        // sector 1), DX=0x0000 (head 0, drive A:). The buffer sits well clear of
+        // the IRET stub the BIOS keeps near 0x0600.
+        let rom = rom_with_code(&[
+            0x31, 0xC0, // xor ax, ax
+            0x8E, 0xC0, // mov es, ax
+            0xBB, 0x00, 0x20, // mov bx, 0x2000
+            0xB8, 0x01, 0x02, // mov ax, 0x0201
+            0xB9, 0x01, 0x00, // mov cx, 0x0001
+            0xBA, 0x00, 0x00, // mov dx, 0x0000
+            0xCD, 0x13, // int 13h
+            0xF4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        machine.mount_floppy(img).unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        // The sector bytes landed at physical 0x2000.
+        assert_eq!(machine.read_physical_u8(0x2000), 0xEB);
+        assert_eq!(machine.read_physical_u8(0x2001), 0x55);
+        // AH cleared, AL reports one sector read, CF clear on success.
+        let ax = machine.cpu().registers.eax() as u16;
+        assert_eq!(ax >> 8, 0x00);
+        assert_eq!(ax & 0xff, 0x01);
+        let flags = machine.cpu().registers.eflags;
+        assert_eq!(flags & 0x0001, 0, "CF must be clear after a good read");
     }
 
     #[test]
