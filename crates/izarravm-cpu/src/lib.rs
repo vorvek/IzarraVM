@@ -833,6 +833,32 @@ impl Cpu386 {
                 self.write_gpr8(4, ah);
                 Ok(clocks(2))
             }
+            0xa0 => {
+                // MOV AL, moffs8: byte form, ignores the operand-size prefix and
+                // leaves flags untouched.
+                let offset = self.fetch_moffs(bus, address_size)?;
+                let value = self.read_memory_u8(
+                    bus,
+                    prefixes.segment_override.unwrap_or(SegmentIndex::Ds),
+                    offset,
+                    BusAccessKind::DataRead,
+                )?;
+                self.write_gpr8(0, value);
+                Ok(clocks(4))
+            }
+            0xa2 => {
+                // MOV moffs8, AL: byte counterpart to 0xa3, flags untouched.
+                let offset = self.fetch_moffs(bus, address_size)?;
+                let value = self.read_gpr8(0);
+                self.write_memory_u8(
+                    bus,
+                    prefixes.segment_override.unwrap_or(SegmentIndex::Ds),
+                    offset,
+                    value,
+                    BusAccessKind::DataWrite,
+                )?;
+                Ok(clocks(4))
+            }
             0xa1 => {
                 let offset = self.fetch_moffs(bus, address_size)?;
                 let value = self.read_memory_sized(
@@ -3660,6 +3686,52 @@ mod tests {
             u16::from_le_bytes([bus.memory[0x200], bus.memory[0x201]]),
             0x4f56
         );
+    }
+
+    #[test]
+    fn moffs_loads_al_from_direct_offset() {
+        // mov al, [0x0200] (0xa0 0x00 0x02). Byte form ignores the operand-size
+        // prefix and touches only AL. It must not disturb flags.
+        let mut memory = vec![0; 1024];
+        memory[0..3].copy_from_slice(&[0xa0, 0x00, 0x02]);
+        memory[0x200] = 0x7e;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x11ff);
+        let flags_before = cpu.registers.eflags;
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        // AL replaced, AH preserved, instruction is three bytes long.
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x117e);
+        assert_eq!(cpu.registers.eip, 3);
+        assert_eq!(cpu.registers.eflags, flags_before);
+    }
+
+    #[test]
+    fn moffs_stores_al_to_direct_offset() {
+        // mov [0x0200], al (0xa2 0x00 0x02). Byte form writes only one byte and
+        // leaves flags alone.
+        let mut memory = vec![0; 1024];
+        memory[0..3].copy_from_slice(&[0xa2, 0x00, 0x02]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x22a5);
+        let flags_before = cpu.registers.eflags;
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(bus.memory[0x200], 0xa5);
+        // The neighbouring byte is untouched by a byte store.
+        assert_eq!(bus.memory[0x201], 0x00);
+        assert_eq!(cpu.registers.eip, 3);
+        assert_eq!(cpu.registers.eflags, flags_before);
     }
 
     #[test]
