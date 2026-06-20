@@ -217,6 +217,11 @@ pub struct Machine {
     // Fractional seconds owed to the RTC from the machine clock; whole seconds
     // are folded into the clock in advance_devices.
     rtc_seconds: f64,
+    // Cosmetic POST pacing flag, read by the BIOS at port 0xE2. True (the
+    // default) tells the ROM to skip the ~8 s RAM count-up and chime delays so
+    // headless runs and unit tests finish inside their cycle budgets. The GUI
+    // clears it after construction to keep the full power-on experience.
+    fast_post: bool,
 }
 
 /// Build the CT1745 mixer from the profile's Sound Blaster power-on routing.
@@ -300,6 +305,7 @@ impl Machine {
             floppy: None,
             rtc: rtc::Rtc::new(),
             rtc_seconds: 0.0,
+            fast_post: true,
         };
         // The Margo LFB aperture is decoded before RAM, so system memory must
         // stay below it. Validated config caps memory far under this bound.
@@ -319,6 +325,14 @@ impl Machine {
         let mut machine = Self::base(profile, Cpu386::default(), rom.to_vec())?;
         install_boot_bios_stubs(&mut machine.memory)?;
         Ok(machine)
+    }
+
+    /// Control the cosmetic POST pacing the BIOS reads at port 0xE2. The default
+    /// is fast (true): the ROM skips the ~8 s RAM count-up and the chime so
+    /// headless runs and tests stay inside their cycle budgets. Pass false from
+    /// the GUI to keep the full power-on screen and timing.
+    pub fn set_fast_post(&mut self, fast: bool) {
+        self.fast_post = fast;
     }
 
     /// Mount a raw floppy image into drive A:. The geometry is derived from the
@@ -606,6 +620,7 @@ impl Machine {
             pending_soft_int: &mut self.pending_soft_int,
             active_mode: self.active_mode,
             pending_mode: &mut self.pending_mode,
+            fast_post: self.fast_post,
             wait_states: self.profile.wait_states,
         }
     }
@@ -1716,6 +1731,7 @@ impl Machine {
                     mixer,
                     trace,
                     pending_soft_int,
+                    fast_post,
                     ..
                 } = self;
                 let mut bus = MachineBus {
@@ -1738,6 +1754,7 @@ impl Machine {
                     pending_soft_int,
                     active_mode: *active_mode,
                     pending_mode,
+                    fast_post: *fast_post,
                     wait_states: profile.wait_states,
                 };
                 cpu.cycle(&mut bus)
@@ -1832,6 +1849,7 @@ struct MachineBus<'a> {
     pending_soft_int: &'a mut Option<u8>,
     active_mode: GswMode,                  // a copy, for the 0xE1 read
     pending_mode: &'a mut Option<GswMode>, // a 0xE1 write records the request here
+    fast_post: bool,                       // a copy, for the 0xE2 POST-pacing read
     wait_states: WaitStateProfile,
 }
 
@@ -1963,6 +1981,10 @@ impl CpuBus for MachineBus<'_> {
         }
         if port == 0x00e1 {
             return Ok(u32::from(gsw_mode_code(self.active_mode)));
+        }
+        if port == 0x00e2 {
+            // Lotura POST-pacing flag: 1 = fast (skip cosmetic delays), 0 = full.
+            return Ok(u32::from(u8::from(self.fast_post)));
         }
         if let Some(value) = self.rtc.read_port(port) {
             return Ok(u32::from(value));
@@ -3273,6 +3295,7 @@ mod tests {
             pending_soft_int: &mut machine.pending_soft_int,
             active_mode: machine.active_mode,
             pending_mode: &mut machine.pending_mode,
+            fast_post: machine.fast_post,
             wait_states: machine.profile.wait_states,
         };
         f(&mut bus)
@@ -6418,33 +6441,64 @@ mod tests {
     }
 
     #[test]
-    fn izarra_bios_draws_post_banner_in_mode13h() {
+    fn izarra_bios_draws_graceful_post_screen() {
+        // The graceful screen is a white field (DAC index GFX_WHITE = 0) with the
+        // red "Izarra 3000" wordmark (index GFX_RED = 4) across the top and a red
+        // progress-bar frame lower down. The raster carries DAC indices, not RGB,
+        // so the palette remap to white/red does not change the index values here.
         let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
         machine.run_until_halt_or_cycles(5_000_000).unwrap();
-        // The BIOS is idling with the console drawn; advance the beam to scan a frame.
+        // The BIOS is idling with the screen drawn; advance the beam to scan a frame.
         machine.advance_devices(600_000);
         let raster = machine.vga_raster().expect("mode 13h presents a VgaRaster");
         assert_eq!(raster.width, 320);
-        // gfx_clear painted the frame with COLOR_BG (0): a pixel well below the
-        // banner is background.
         let w = raster.width as usize;
+        // A clear spot (no logo, no text, no bar) is the white field, index 0.
+        // Logical y 64 -> physical 128 under the mode-13h double scan.
         assert_eq!(
-            raster.pixels[150 * w + 160],
+            raster.pixels[128 * w + 12],
             0,
-            "frame cleared to background"
+            "the background field cleared to white (index 0)"
         );
-        // gfx_text drew the title in COLOR_TITLE (0x0f). Mode 13h double-scans, so
-        // logical rows 8..16 land at physical rows 16..32. Count foreground pixels
-        // in that band (x 8..144) rather than matching an exact glyph.
-        let title_pixels = (16..32)
-            .flat_map(|y| (8..144).map(move |x| (x, y)))
-            .filter(|&(x, y)| raster.pixels[y * w + x] == 0x0f)
+        // The red wordmark sits at logical y 8..29, x 62..257. Mode 13h double-
+        // scans, so that band lands at physical rows 16..58. Count index-4 pixels.
+        let logo_pixels = (16..58)
+            .flat_map(|y| (62..257).map(move |x| (x, y)))
+            .filter(|&(x, y)| raster.pixels[y * w + x] == 0x04)
             .count();
         assert!(
-            title_pixels > 20,
-            "expected the drawn title glyphs, found {title_pixels} foreground pixels"
+            logo_pixels > 200,
+            "expected the red Izarra 3000 wordmark, found {logo_pixels} red pixels"
         );
+        // The progress-bar frame is red too. Its top edge is logical y 128 ->
+        // physical 256, spanning x 32..288. Find red pixels along that row band.
+        let bar_pixels = (256..260)
+            .flat_map(|y| (32..288).map(move |x| (x, y)))
+            .filter(|&(x, y)| raster.pixels[y * w + x] == 0x04)
+            .count();
+        assert!(
+            bar_pixels > 50,
+            "expected the red progress-bar frame, found {bar_pixels} red pixels"
+        );
+    }
+
+    #[test]
+    fn fast_post_port_reflects_the_flag() {
+        // Port 0xE2 is the Lotura POST-pacing flag the BIOS reads before the
+        // cosmetic RAM count-up. It defaults to fast (1) so headless runs and
+        // tests skip the ~8 s pacing; the GUI clears it for the full experience.
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
+        let fast = with_bus(&mut machine, |bus| {
+            bus.read_io(0x00e2, BusWidth::Byte).unwrap() as u8
+        });
+        assert_eq!(fast, 1, "fast POST is the default");
+        machine.set_fast_post(false);
+        let full = with_bus(&mut machine, |bus| {
+            bus.read_io(0x00e2, BusWidth::Byte).unwrap() as u8
+        });
+        assert_eq!(full, 0, "clearing the flag selects the full-pacing path");
     }
 
     #[test]

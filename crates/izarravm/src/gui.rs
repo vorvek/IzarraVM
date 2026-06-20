@@ -224,6 +224,10 @@ fn emulate(
             return;
         }
     };
+    // The GUI runs near real time, so let the BIOS play the full graceful POST:
+    // the ~8 s RAM count-up and the startup chime. Headless runs and tests leave
+    // the default (fast) so they finish inside their cycle budgets.
+    machine.set_fast_post(false);
     match HostDrive::mount_c(&c_drive) {
         Ok(drive) => machine.mount_c_drive(drive),
         Err(err) => error!(%err, "failed to mount C: drive"),

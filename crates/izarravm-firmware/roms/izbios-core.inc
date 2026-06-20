@@ -97,8 +97,8 @@ enter_setup_or_boot:
     push cs
     pop ds                      ; DS = CS so DS:SI reaches the ROM string
     mov si, str_ready
-    mov bl, COLOR_TITLE
-    mov bh, COLOR_BG
+    mov bl, GFX_BLACK
+    mov bh, GFX_WHITE
     call gfx_text
     ; POST is complete: hand off to the INT 19h bootstrap. If a bootable floppy is
     ; mounted, boot_entry far jumps into its boot sector and never returns. With no

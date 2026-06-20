@@ -52,6 +52,45 @@
 %define COLOR_MEASURE  0x0b          ; bright cyan (measure value)
 ; The console row Y advances here as each line is drawn (foundation scratch word).
 %define CONSOLE_ROW_Y  BIOS_SCRATCH
+; gfx_blit_1bpp working words (segment 0). The blit is not reentrant with the
+; console, and POST is single-threaded, so these share the foundation scratch
+; region just above CONSOLE_ROW_Y. Five words, 0x0522..0x052B.
+%define BLIT_X         (BIOS_SCRATCH + 0x02)   ; left x
+%define BLIT_Y         (BIOS_SCRATCH + 0x04)   ; current scanline y
+%define BLIT_W         (BIOS_SCRATCH + 0x06)   ; width in pixels
+%define BLIT_H         (BIOS_SCRATCH + 0x08)   ; rows remaining
+%define BLIT_STRIDE    (BIOS_SCRATCH + 0x0a)   ; bytes per source row
+%define BLIT_COLOR     (BIOS_SCRATCH + 0x0c)   ; fill color (byte)
+
+; --- Graceful POST screen (Amiga/Mac-style: white field, black text, red logo).
+; These DAC indices are reprogrammed by gfx_post_palette before the screen draws,
+; so the numeric value is just a slot, not a default mode-13h color.
+%define GFX_WHITE      0x00          ; background field (gfx_clear paints this)
+%define GFX_BLACK      0x01          ; body text
+%define GFX_RED        0x04          ; logo and progress-bar fill
+
+; Lotura POST-pacing port: reads 1 for fast POST (skip cosmetic delays, the
+; headless/test default) or 0 for the full GUI experience.
+%define PORT_FAST_POST   0xe2
+
+; Red "Izarra 3000" wordmark geometry (the bitmap bytes live in izbios-logo.inc,
+; emitted late; these defines let izbios-gfx.inc blit it). 195x21 px, 25 B/row.
+%define LOGO_W         195
+%define LOGO_H         21
+%define LOGO_STRIDE    25
+
+; Graceful-screen layout (mode 13h pixels). The logo spans the top centered; the
+; text lines and the RAM progress bar sit below it.
+%define LOGO_X         62            ; (320 - 195) / 2, centered
+%define LOGO_Y         8
+%define POST_TITLE_Y   40            ; "Izarra 3000 BIOS" + version
+%define POST_MEM_Y     112           ; "Testing memory: NNNNN KB"
+%define POST_BAR_X     32
+%define POST_BAR_Y     128
+%define POST_BAR_W     256           ; full-width frame; fill grows left to right
+%define POST_BAR_H     12
+%define POST_HINT_Y    176           ; "Del: Setup ..."
+%define POST_TEXT_X    32
 
 ; --- Scratch RAM map (segment 0). ROM writes are dropped by the bus, so all
 ; mutable state lives here. Each region is disjoint and owned by one stream;

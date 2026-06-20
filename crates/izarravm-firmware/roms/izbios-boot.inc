@@ -48,8 +48,8 @@ boot_entry:
     add ax, STATUS_LINE_DY
     mov di, STATUS_X
     mov si, str_boot_error
-    mov bl, COLOR_FAIL
-    mov bh, COLOR_BG
+    mov bl, GFX_RED
+    mov bh, GFX_WHITE
     call gfx_text
     ret
 
