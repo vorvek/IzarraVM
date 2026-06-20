@@ -14,15 +14,21 @@
 ; gfx_fill_rect edges (a picture-frame border), not CP437 line glyphs, so the
 ; geometry is free of the 8 px glyph grid and lines up with the 16 px row pitch.
 
-; --- Field colors (default mode-13h palette) -------------------------------
+; --- Field colors (BIOS white/black/red skin) ------------------------------
+; The menu wears the same skin as the graceful POST screen: a white field with
+; black text and a red title. bootbox_menu programs the DAC with gfx_post_palette
+; (slot 0 white, slot 1 black, slot 4 red), so these slots reach those exact
+; colors. Slot 7 keeps its default mode-13h light grey for the frame and the
+; greyed-out labels. The focus indicator is an inverse cell: a black bar (slot 1)
+; with white text (slot 0) at the focused item's own rectangle.
 %define BX_C_BORDER      0x07      ; light grey pane/button frame
-%define BX_C_TITLE       0x0e      ; yellow heading
-%define BX_C_LABEL       0x0f      ; white unfocused label
-%define BX_C_BAND        0x0b      ; bright cyan focus band
-%define BX_C_BANDTXT     0x00      ; black label on the cyan band
-%define BX_C_DISABLED    0x08      ; dark grey disabled label / caption
-%define BX_C_MARK        0x0b      ; bright cyan marker diamond
-%define BX_C_HINT        0x07      ; light grey footer hint
+%define BX_C_TITLE       GFX_RED   ; red heading (slot 4)
+%define BX_C_LABEL       GFX_BLACK ; black unfocused label (slot 1)
+%define BX_C_BAND        GFX_BLACK ; black inverse focus bar (slot 1)
+%define BX_C_BANDTXT     GFX_WHITE ; white text/marker on the inverse bar (slot 0)
+%define BX_C_DISABLED    0x07      ; light grey disabled label / caption
+%define BX_C_MARK        GFX_BLACK ; black marker diamond on the white field
+%define BX_C_HINT        GFX_BLACK ; black footer hint
 
 ; --- Layout (mode 13h pixels) ----------------------------------------------
 %define BX_TITLE_X       8
@@ -53,11 +59,13 @@
 %define BX_RP_MARK_X     296       ; speed marker well
 %define BX_SPD0_Y        44        ; first speed row top
 %define BX_SPD_DY        16        ; speed row pitch
-; One cache caption in the free space below the four speed rows (which end at
-; y=108). It updates to the focused speed; there is no per-row caption (those
-; would crowd the 16 px rows), so no two text cells overlap.
+; The cache caption sits in the free space below the four speed rows (which end at
+; y=108) and inside the right pane (which ends at y=139). It updates to the focused
+; speed. Two short lines ("L1 cache: NNN" then "L2 cache: NNN") so neither runs past
+; the pane edge; there is no per-row caption (those would crowd the 16 px rows).
 %define BX_CACHE_X       172
-%define BX_CACHE_Y       120
+%define BX_CACHE_Y       116       ; L1 line top
+%define BX_CACHE_DY      10        ; pitch to the L2 line (y=126, +8 glyph -> 134)
 
 ; Button bar: frame x 8..311, y 146..167.
 %define BX_BB_X          8
@@ -109,9 +117,10 @@
 ; (setup_maybe_enter) on Accept/Cancel. Clobbers all caller-saved registers.
 ; ===========================================================================
 bootbox_menu:
-    call bm_enter_mode13h           ; reuse izbios-boot.inc: mode 13h, index 0 black
+    call set_mode13h                ; mode 13h framebuffer
+    call gfx_post_palette           ; BIOS skin: slot 0 white, 1 black, 4 red
     mov al, COLOR_BG
-    call gfx_clear
+    call gfx_clear                  ; white field
     call bx2_seed
 %if BMX_MOUSE
     call bx2_aux_init
@@ -153,13 +162,12 @@ bx2_check_exit:
 ; ===========================================================================
 ; State seeding.
 ; ===========================================================================
-; bx2_seed: read 0xE1 (live mode) FIRST so the Accept reset compare is valid, then
-; CMOS 0x11 (order) and 0x12 (speed). Leaves DS = 0. Clobbers AX, BX, CX.
+; bx2_seed: read CMOS 0x11 (order) and 0x12 (speed) to set the marked device and
+; speed. Accept applies the speed as a live 0xE1 switch, so there is no entry-mode
+; snapshot to take here. Leaves DS = 0. Clobbers AX, BX, CX.
 bx2_seed:
     xor cx, cx
     mov ds, cx                      ; DS = 0 for the state block
-    in al, PORT_LOTURA_MODE          ; live GSW mode, BEFORE any out 0xE1
-    mov [BMX_LIVE_MODE], al
     call bx2_compute_avail          ; -> BMX_AVAIL (DS stays 0)
     ; Marked device from CMOS 0x11: 1 (disk-first) -> HDD if available, else Floppy.
     mov al, BOOT_CMOS_ORDER
@@ -450,11 +458,13 @@ bx2_draw_dev_row:
     xor cx, cx
     mov ds, cx
     mov byte [BMX_DCOLOR], BX_C_BANDTXT
+    mov byte [BMX_DBG], BX_C_BAND   ; glyph background = the inverse bar
     jmp .draw_label
 .label_color:
-    ; Off-band label color: white if available, dark grey if not.
+    ; Off-bar text sits on the white field; greyed when the device is unavailable.
     xor cx, cx
     mov ds, cx
+    mov byte [BMX_DBG], COLOR_BG
     mov al, [BMX_DI]
     call bx2_dev_avail              ; reads BMX_AVAIL; AL=1 available, 0 not
     xor cx, cx
@@ -476,9 +486,9 @@ bx2_draw_dev_row:
     mov ds, cx
     mov ax, [BMX_DROWY]
     mov bl, [BMX_DCOLOR]
+    mov bh, [BMX_DBG]
     pop ds                          ; DS = CS (the label segment)
     add ax, BX_ROW_TXT_DY
-    mov bh, COLOR_BG
     call gfx_text
 
     ; Marker diamond if this is the marked device.
@@ -493,12 +503,12 @@ bx2_draw_dev_row:
     mov di, BX_LP_MARK_X
     mov ax, [BMX_DROWY]
     add ax, BX_ROW_TXT_DY
-    mov bl, BX_C_MARK               ; cyan off-band
+    mov bl, BX_C_MARK               ; black diamond on the white field
+    mov bh, [BMX_DBG]
     cmp byte [BMX_DFOCUSED], 0
     je .mark_draw
-    mov bl, BX_C_BANDTXT            ; black on the cyan band
+    mov bl, BX_C_BANDTXT            ; white diamond on the inverse bar
 .mark_draw:
-    mov bh, COLOR_BG
     call gfx_text                   ; DS = 0, SI -> BMX_DGLYPH
 .done:
     popa
@@ -539,10 +549,12 @@ bx2_draw_spd_row:
     xor cx, cx
     mov ds, cx
     mov byte [BMX_DCOLOR], BX_C_BANDTXT
+    mov byte [BMX_DBG], BX_C_BAND   ; glyph background = the inverse bar
     jmp .draw_label
 .label_color:
     xor cx, cx
     mov ds, cx
+    mov byte [BMX_DBG], COLOR_BG
     mov al, [BMX_DI]
     call bx2_spd_avail              ; AL=1 available, 0 not
     xor cx, cx
@@ -564,9 +576,9 @@ bx2_draw_spd_row:
     mov ds, cx
     mov ax, [BMX_DROWY]
     mov bl, [BMX_DCOLOR]
+    mov bh, [BMX_DBG]
     pop ds
     add ax, BX_ROW_TXT_DY
-    mov bh, COLOR_BG
     call gfx_text
 
     ; Marker diamond if this is the marked speed.
@@ -582,30 +594,33 @@ bx2_draw_spd_row:
     mov ax, [BMX_DROWY]
     add ax, BX_ROW_TXT_DY
     mov bl, BX_C_MARK
+    mov bh, [BMX_DBG]
     cmp byte [BMX_DFOCUSED], 0
     je .mark_draw
     mov bl, BX_C_BANDTXT
 .mark_draw:
-    mov bh, COLOR_BG
     call gfx_text
 .done:
     popa
     ret
 
 ; ---------------------------------------------------------------------------
-; bx2_draw_cache_caption: one dark-grey caption under the speed rows giving the
-; focused speed's L1/L2. If the focus is not on the speed pane, it shows the marked
-; speed's cache instead. Clears the caption line first. DS bounces.
+; bx2_draw_cache_caption: a two-line grey caption under the speed rows giving the
+; focused speed's L1 and L2 (one short line each so neither overflows the pane). If
+; the focus is not on the speed pane, it shows the marked speed's cache instead.
+; The two lines are consecutive ASCIIZ strings (L1 then L2 per speed), so the L2
+; pointer is the L1 pointer advanced past its NUL. Clears the caption area first.
+; DS bounces.
 ; ---------------------------------------------------------------------------
 bx2_draw_cache_caption:
     pusha
-    ; Wipe the caption line to background.
+    ; Wipe both caption lines to background.
     push cs
     pop ds
     mov di, BX_CACHE_X
     mov si, BX_CACHE_Y
     mov cx, 128
-    mov dx, 8
+    mov dx, BX_CACHE_DY + 8
     mov bl, COLOR_BG
     call gfx_fill_rect
     ; Pick the speed row to describe: focused speed if the speed pane is focused,
@@ -622,9 +637,23 @@ bx2_draw_cache_caption:
 .have_row:
     push cs
     pop ds
-    call bx2_cache_ptr              ; DS:SI -> caption string for speed row AL
+    call bx2_cache_ptr              ; DS:SI -> L1 string for speed row AL (DS = CS)
+    ; Line 1 (L1).
     mov di, BX_CACHE_X
     mov ax, BX_CACHE_Y
+    mov bl, BX_C_DISABLED
+    mov bh, COLOR_BG
+    call gfx_text
+    ; Advance SI past the L1 string's NUL to reach the L2 string.
+.skip_l1:
+    lodsb                           ; DS:SI -> next byte (DS = CS)
+    test al, al
+    jnz .skip_l1                    ; SI now points just past the NUL = L2 start
+    ; Line 2 (L2).
+    push cs
+    pop ds
+    mov di, BX_CACHE_X
+    mov ax, BX_CACHE_Y + BX_CACHE_DY
     mov bl, BX_C_DISABLED
     mov bh, COLOR_BG
     call gfx_text
@@ -687,7 +716,7 @@ bx2_draw_one_button:
     mov si, bx_str_cancel
 .have_geom:
     mov [BMX_DSTRP], si
-    ; Fill the cell: cyan band if focused, background otherwise.
+    ; Fill the cell: inverse bar if focused, white field otherwise.
     mov di, [BMX_DFX]
     mov si, BX_BTN_Y0
     mov cx, [BMX_DFW]
@@ -695,9 +724,11 @@ bx2_draw_one_button:
     cmp byte [BMX_DCOLOR], 0
     je .fill_bg
     mov bl, BX_C_BAND
+    mov byte [BMX_DBG], BX_C_BAND   ; glyph background = the inverse bar
     jmp .do_fill
 .fill_bg:
     mov bl, COLOR_BG
+    mov byte [BMX_DBG], COLOR_BG
 .do_fill:
     call gfx_fill_rect
     ; Label: DS = CS for the string bytes, geometry from RAM scratch.
@@ -706,6 +737,7 @@ bx2_draw_one_button:
     mov si, [BMX_DSTRP]
     mov di, [BMX_DTX]
     mov bl, BX_C_LABEL
+    mov bh, [BMX_DBG]
     cmp byte [BMX_DCOLOR], 0
     je .label_draw
     mov bl, BX_C_BANDTXT
@@ -713,7 +745,6 @@ bx2_draw_one_button:
     push cs
     pop ds                          ; DS = CS so DS:SI reaches the label
     mov ax, BX_BTN_TXT_Y
-    mov bh, COLOR_BG
     call gfx_text
     popa
     ret
@@ -1044,7 +1075,7 @@ bx2_note:
     mov di, BX_TITLE_X
     mov si, BX_HINT1_Y
     mov cx, 304
-    mov dx, 16                      ; cover both hint lines (y 172..187)
+    mov dx, 18                      ; cover both hint lines (y 172..189)
     mov bl, COLOR_BG
     call gfx_fill_rect
     pop si
@@ -1062,9 +1093,9 @@ bx2_note:
 ; Accept / Cancel.
 ; ===========================================================================
 ; bx2_accept: commit the marked device and speed, then exit. Mirrors su_commit for
-; the CMOS/checksum/0xE1 writes. The exit either falls through into boot_entry (no
-; speed change) or cold-resets (speed changed). Reached as a tail target from the
-; key handlers, so it never returns to bx2_handle_key.
+; the CMOS/checksum/0xE1 writes. The 0xE1 write is a live switch, so the exit always
+; falls through into boot_entry at the chosen speed with no cold reset. Reached as a
+; tail target from the key handlers, so it never returns to bx2_handle_key.
 bx2_accept:
     ; Map the marked speed row to the 0xE1/CMOS code (real hardware encoding:
     ; 586=2, 486=1, 386=0, 286=3). Stash the code in RAM scratch so su_cmos_checksum
@@ -1119,18 +1150,15 @@ bx2_accept:
 .choice_cd:
     mov byte [BOOT_CHOICE], BOOT_DEV_CDROM
 .decide:
-    ; Reset only if the speed actually changed; otherwise fall through to boot.
+    ; The 0xE1 write above is a live mode switch (the Lotura register takes effect
+    ; on the next instruction, lowering the CPU level and retiming the clock), so a
+    ; speed change needs no cold reset. Re-running POST would break audio on the
+    ; 486/586 tiers and stall the 286 switch, so always flag the loop to exit and
+    ; fall through into boot_entry at the chosen speed.
     xor cx, cx
     mov ds, cx
-    mov al, [BMX_LIVE_MODE]
-    cmp al, [BMX_DCODE]
-    jne .reset
-    ; No change: flag the menu loop to exit, returning into boot_entry.
     mov byte [BMX_EXIT], 1
     ret
-.reset:
-    cli
-    jmp ROM_SEG:reset
 
 ; bx2_cancel: discard all edits. Write nothing to 0xE1 or CMOS. Set BOOT_CHOICE to
 ; floppy so boot_entry runs the default order floppy -> HDD -> CD-ROM, then return.
@@ -1657,16 +1685,22 @@ bx_str_spd_fast:   db 'Fast   586', 0
 bx_str_spd_slow:   db 'Slow   486', 0
 bx_str_spd_vslow:  db 'VSlow  386', 0
 bx_str_spd_sslow:  db 'SSlow  286', 0
-bx_str_cache_fast: db 'Cache L1 32K L2 512K', 0
-bx_str_cache_slow: db 'Cache L1 16K L2 128K', 0
-bx_str_cache_vslow:db 'Cache L1 0   L2 64K', 0
-bx_str_cache_sslow:db 'Cache L1 0   L2 0', 0
+; Each cache caption is two consecutive ASCIIZ lines (L1 then L2). bx2_cache_ptr
+; returns the L1 pointer; the draw routine walks past its NUL to find the L2 line.
+bx_str_cache_fast: db 'L1 cache: 32K', 0
+                   db 'L2 cache: 512K', 0
+bx_str_cache_slow: db 'L1 cache: 16K', 0
+                   db 'L2 cache: 128K', 0
+bx_str_cache_vslow:db 'L1 cache: 0', 0
+                   db 'L2 cache: 64K', 0
+bx_str_cache_sslow:db 'L1 cache: 0', 0
+                   db 'L2 cache: 0', 0
 bx_str_accept:     db 'Accept', 0
 bx_str_cancel:     db 'Cancel', 0
 bx_str_286_msg:    db '286 mode not available', 0
 %if BMX_MOUSE
-bx_str_hint1:      db 'Click/arrows move  Enter mark  Tab pane', 0
+bx_str_hint1:      db 'Arrows/click move  Enter marks', 0
 %else
-bx_str_hint1:      db 'Arrows move  Enter mark  Tab pane', 0
+bx_str_hint1:      db 'Arrows move  Enter marks', 0
 %endif
-bx_str_hint2:      db 'Accept boots marked  Cancel default order', 0
+bx_str_hint2:      db 'Tab pane  Accept=mark  Cancel=default', 0

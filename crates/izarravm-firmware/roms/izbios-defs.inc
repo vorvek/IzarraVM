@@ -194,7 +194,7 @@
 %define BMX_MARK_SPD     0x0903    ; marked speed 0..3
 %define BMX_BTN_FROM     0x0904    ; pane to return to on Up from a button
 %define BMX_AVAIL        0x0905    ; availability bits: b0 HDD, b1 CD
-%define BMX_LIVE_MODE    0x0906    ; 0xE1 read at entry (reset decision)
+%define BMX_LIVE_MODE    0x0906    ; reserved (Accept applies speed as a live switch)
 %define BMX_EXIT         0x0907    ; menu exit flag: 1 after Accept/Cancel
 %define BMX_CUR_X        0x0908    ; cursor X word (0..303)
 %define BMX_CUR_Y        0x090a    ; cursor Y word (0..183)
@@ -220,6 +220,7 @@
 %define BMX_DFH          0x0a2e    ; frame h (word)
 %define BMX_DTX          0x0a30    ; button label x (word)
 %define BMX_DSTRP        0x0a32    ; button label string pointer (word)
+%define BMX_DBG          0x0a34    ; per-cell text background (byte): bar vs field
 
 ; Focus-pane identifiers (held in BMX_FOCUS_PANE / BMX_BTN_FROM).
 %define BMX_PANE_DEV     0

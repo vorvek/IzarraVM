@@ -9,8 +9,8 @@
 // drives the floppy path, which reads the boot sector and far jumps to 0000:7C00.
 //
 // Cases:
-//   1. Tab during POST opens the menu: mode 13h with the menu's heading and the
-//      cyan focus band that the plain POST screen does not use.
+//   1. Tab during POST opens the menu: mode 13h with the menu's red title and grey
+//      pane frames that the plain POST screen does not paint.
 //   2. A host mouse move hot-tracks focus to the speed pane; a click marks a row.
 //   3. Tab then F10 (Accept) on the default Floppy boots the mounted image: the
 //      Wizardry III booter takes over and switches the card to CGA.
@@ -54,9 +54,9 @@ fn boot_machine() -> Machine {
 #[test]
 fn tab_opens_the_boot_menu_in_mode13h() {
     // Tab during POST opens the menu and stops there blocking on a key. The menu
-    // draws on a mode-13h field with a yellow heading (index 0x0e) and a cyan
-    // highlight on the default Floppy entry (index 0x0b). The graceful POST screen
-    // uses neither index, so their presence proves the menu painted.
+    // wears the BIOS white/black/red skin: a red title (DAC slot 0x04) and light
+    // grey pane/button frames (slot 0x07). The graceful POST screen paints red too,
+    // but never slot 0x07, so the grey frame proves the menu painted on top of POST.
     let mut machine = boot_machine();
     machine.inject_key_scancodes(&[TAB_MAKE, TAB_BREAK]);
     machine.run_until_halt_or_cycles(12_000_000).unwrap();
@@ -67,11 +67,11 @@ fn tab_opens_the_boot_menu_in_mode13h() {
         "the boot menu draws in mode 13h"
     );
     let raster = machine.video_mut().render_full_frame();
-    let has_heading = raster.pixels.contains(&0x0e);
-    let has_highlight = raster.pixels.contains(&0x0b);
+    let has_title = raster.pixels.contains(&0x04);
+    let has_frame = raster.pixels.contains(&0x07);
     assert!(
-        has_heading && has_highlight,
-        "the menu heading and highlighted entry are on screen"
+        has_title && has_frame,
+        "the red menu title and grey pane frames are on screen"
     );
 }
 
@@ -182,10 +182,10 @@ fn tab_then_accept_boots_the_floppy() {
 fn accept_super_slow_commits_the_286_tier() {
     // Open the menu, cross to the speed pane, walk down to the Super Slow (286) row,
     // mark it with Enter, then Accept with F10. The Accept maps the marked row to GSW
-    // code 3, writes it to the live Lotura register (port 0xE1) and to CMOS 0x12, then
-    // cold-resets because the live mode changed from the 386 boot default. The live
-    // mode field persists across the guest reset, so active_mode() reads back Gsw286
-    // and CMOS 0x12 holds 3, mirroring the other speed tiers.
+    // code 3 and writes it to the live Lotura register (port 0xE1) and to CMOS 0x12.
+    // The 0xE1 write is a live switch (no cold reset), so the firmware keeps running
+    // at the new speed; active_mode() reads back Gsw286 and CMOS 0x12 holds 3,
+    // mirroring the other speed tiers.
     let mut machine = boot_machine();
     assert_eq!(machine.active_mode(), GswMode::Gsw386, "boot mode is 386");
 
@@ -207,7 +207,8 @@ fn accept_super_slow_commits_the_286_tier() {
         F10_MAKE,
         F10_BREAK, // Accept
     ]);
-    // Accept cold-resets, so the BIOS runs its POST again. Give it room to settle.
+    // Accept applies the speed live and falls through into the boot path. Give the
+    // firmware room to settle on the new tier.
     machine.run_until_halt_or_cycles(24_000_000).unwrap();
 
     assert_eq!(
