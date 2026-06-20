@@ -47,197 +47,12 @@
 %define BM_SC_UP         0x48
 %define BM_SC_DOWN       0x50
 
-; boot_menu: the Tab boot-device menu. Seeds the highlight from CMOS 0x11 (boot
-; order), draws Floppy / Disk / CD-ROM, and loops on Up/Down/Enter/Esc. Enter on
-; Floppy stores BOOT_DEV_FLOPPY and returns so boot_entry boots it. Enter on Disk
-; shows "Toka-DOS not installed yet" and stays on the menu. CD-ROM is unavailable.
-; Esc leaves the highlight at the seeded default. DS bounces between 0 and CS.
-; Clobbers all caller-saved registers (core calls this directly).
+; boot_menu: shim. The two-pane boxed boot+speed menu lives in izbios-bootbox.inc
+; as bootbox_menu. setup-ui.inc calls this label by name (call boot_menu), so the
+; label must stay resolvable here; it just forwards into the new menu. Keep the
+; name; do NOT rename it.
 boot_menu:
-    ; Seed the highlighted entry from the persisted boot order in CMOS 0x11.
-    ; 0 floppy-first -> Floppy, 1 disk-first -> Disk; anything else -> Floppy.
-    mov al, BOOT_CMOS_ORDER
-    out 0x70, al
-    in al, 0x71
-    cmp al, 1
-    je .seed_disk
-    mov al, BM_ROW_FLOPPY
-    jmp .seed_store
-.seed_disk:
-    mov al, BM_ROW_DISK
-.seed_store:
-    xor cx, cx
-    mov ds, cx
-    mov [BOOT_MENU_CURSOR], al
-    call bm_draw
-.loop:
-    xor ah, ah
-    call kb_getkey                  ; blocking read: AH=scancode, AL=ascii
-    cmp ah, BM_SC_UP
-    je .up
-    cmp ah, BM_SC_DOWN
-    je .down
-    cmp ah, BM_SC_ENTER
-    je .enter
-    cmp ah, BM_SC_ESC
-    je .back
-    jmp .loop
-.up:
-    call bm_cursor_dec
-    call bm_draw
-    jmp .loop
-.down:
-    call bm_cursor_inc
-    call bm_draw
-    jmp .loop
-.enter:
-    xor cx, cx
-    mov ds, cx
-    mov al, [BOOT_MENU_CURSOR]
-    cmp al, BM_ROW_FLOPPY
-    je .pick_floppy
-    cmp al, BM_ROW_DISK
-    je .pick_disk
-    ; CD-ROM: unavailable, stay on the menu.
-    push cs
-    pop ds
-    mov si, bm_str_cd_msg
-    call bm_note
-    jmp .loop
-.pick_disk:
-    ; Disk boots Toka-DOS on C:, which is not built yet. Report and stay put.
-    push cs
-    pop ds
-    mov si, bm_str_disk_msg
-    call bm_note
-    jmp .loop
-.pick_floppy:
-    xor cx, cx
-    mov ds, cx
-    mov byte [BOOT_CHOICE], BOOT_DEV_FLOPPY
-    ret
-.back:
-    ; Esc leaves BOOT_CHOICE at the boot-time default seeded in bios_start.
-    ret
-
-; bm_cursor_dec / bm_cursor_inc: move the highlight, wrapping. DS = 0. Clobbers
-; AX, BX.
-bm_cursor_dec:
-    xor ax, ax
-    mov ds, ax
-    mov bx, BOOT_MENU_CURSOR
-    mov al, [bx]
-    test al, al
-    jnz .ok
-    mov al, BM_ROW_COUNT
-.ok:
-    dec al
-    mov [bx], al
-    ret
-bm_cursor_inc:
-    xor ax, ax
-    mov ds, ax
-    mov bx, BOOT_MENU_CURSOR
-    mov al, [bx]
-    inc al
-    cmp al, BM_ROW_COUNT
-    jb .ok
-    xor al, al
-.ok:
-    mov [bx], al
-    ret
-
-; bm_draw: paint the boot menu from scratch. Switch to mode 13h on a black field,
-; draw the title, the three entries (highlighting the cursor row), and a hint.
-; Sets DS = CS for the ROM strings; reads BOOT_MENU_CURSOR from segment 0.
-bm_draw:
-    call bm_enter_mode13h
-    mov al, COLOR_BG
-    call gfx_clear
-    push cs
-    pop ds                          ; DS = CS for the label strings
-
-    ; Title.
-    mov si, bm_str_title
-    mov di, BM_MENU_X
-    mov ax, BM_TITLE_Y
-    mov bl, BM_COLOR_HEAD
-    mov bh, COLOR_BG
-    call gfx_text
-
-    ; Floppy entry.
-    mov bl, BM_ROW_FLOPPY
-    call bm_row_color
-    mov si, bm_str_floppy
-    mov di, BM_MENU_X
-    mov ax, BM_FIRST_Y
-    mov bh, COLOR_BG
-    call gfx_text
-
-    ; Disk entry (label, then the "not available yet" note in grey).
-    mov bl, BM_ROW_DISK
-    call bm_row_color
-    mov si, bm_str_disk
-    mov di, BM_MENU_X
-    mov ax, BM_FIRST_Y + BM_ROW_DY
-    mov bh, COLOR_BG
-    call gfx_text
-    push cs
-    pop ds
-    mov si, bm_str_disk_tag
-    mov di, BM_MENU_X + 13 * 8
-    mov ax, BM_FIRST_Y + BM_ROW_DY
-    mov bl, BM_COLOR_NOTE
-    mov bh, COLOR_BG
-    call gfx_text
-
-    ; CD-ROM entry (label, then the unavailable note in grey).
-    mov bl, BM_ROW_CDROM
-    call bm_row_color
-    mov si, bm_str_cdrom
-    mov di, BM_MENU_X
-    mov ax, BM_FIRST_Y + BM_ROW_DY * 2
-    mov bh, COLOR_BG
-    call gfx_text
-    push cs
-    pop ds
-    mov si, bm_str_cd_tag
-    mov di, BM_MENU_X + 13 * 8
-    mov ax, BM_FIRST_Y + BM_ROW_DY * 2
-    mov bl, BM_COLOR_NOTE
-    mov bh, COLOR_BG
-    call gfx_text
-
-    ; Hint footer.
-    push cs
-    pop ds
-    mov si, bm_str_hint
-    mov di, 8
-    mov ax, BM_HINT_Y
-    mov bl, BM_COLOR_INFO
-    mov bh, COLOR_BG
-    call gfx_text
-    ret
-
-; bm_row_color: BL = entry index on entry; returns BL = the highlight color if that
-; entry is the cursor, else the plain row color. Restores DS = CS for the caller's
-; gfx_text. Clobbers AX, CX.
-bm_row_color:
-    push cx
-    mov cl, bl                      ; save the input row index across the DS:BX load
-    xor ax, ax
-    mov ds, ax
-    mov bx, BOOT_MENU_CURSOR
-    mov al, [bx]
-    cmp al, cl
-    mov bl, BM_COLOR_ROW
-    jne .done
-    mov bl, BM_COLOR_HILITE
-.done:
-    pop cx
-    push cs
-    pop ds                          ; restore DS = CS for the caller's gfx_text
-    ret
+    jmp bootbox_menu
 
 ; bm_note: draw a one-line message at the hint row, first wiping the row to the
 ; background so a prior note is erased. DS:SI = CS-relative ASCIIZ on entry.
@@ -326,22 +141,25 @@ boot_entry:
     mov dl, 0                   ; DL = boot drive (A:)
     jmp 0x0000:0x7c00
 
+.read_error:
+    ; The floppy read failed. Chain to the next device in the default boot order
+    ; (floppy -> hard disk -> CD-ROM). Print the floppy error, then fall into the
+    ; disk stub. With the HDD and CD-ROM backends still stubbed this collapses to
+    ; floppy-or-idle, but the fall-through is wired so the order lights up the
+    ; moment those boots become real.
+    mov si, str_boot_error
+    call boot_status_line
+    ; fall through into .disk
+
 .disk:
-    ; Disk boots Toka-DOS on C:, which is not built yet. Report and return.
+    ; Disk boots Toka-DOS on C:, which is not built yet. Report and chain to CD-ROM.
     mov si, bm_str_disk_msg
     call boot_status_line
-    ret
+    ; fall through into .cdrom
 
 .cdrom:
-    ; No CD-ROM drive is present. Report and return.
+    ; No CD-ROM drive is present. Report and idle (return to the caller's loop).
     mov si, bm_str_cd_msg
-    call boot_status_line
-    ret
-
-.read_error:
-    ; The floppy read failed. Print a short message and fall back to the caller's
-    ; idle loop so the machine stays on rather than appearing to power off.
-    mov si, str_boot_error
     call boot_status_line
     ret
 

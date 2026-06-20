@@ -1,23 +1,24 @@
 // STREAM E integration test: the Tab boot menu and the INT 19h floppy bootstrap.
 //
 // Drives the public Machine API only. During the POST hotkey window the BIOS
-// watches for Del (setup) and Tab (boot menu). Tab opens a mode-13h menu listing
-// Floppy, Disk, and CD-ROM; Up/Down move the highlight, Enter selects, Esc cancels.
-// The default highlight comes from CMOS 0x11 (0 floppy-first). Selecting Floppy
+// watches for Del (setup) and Tab (boot menu). Tab opens a mode-13h two-pane menu:
+// the left pane picks the boot device (Hard Disk, Floppy, CD-ROM), the right pane
+// picks the CPU speed, and an Accept/Cancel button bar sits below. Arrows move
+// within and between panes, Enter marks a row, F10 (or Accept) commits, Esc (or
+// Cancel) discards. The default device comes from CMOS 0x11. Committing Floppy
 // drives the floppy path, which reads the boot sector and far jumps to 0000:7C00.
 //
 // Cases:
-//   1. Tab during POST opens the menu: the screen is mode 13h and carries the
-//      menu's heading and highlight colors that the plain POST screen does not.
-//   2. Tab then Enter on the default Floppy entry boots the mounted image: the
-//      Wizardry III booter takes over, switches the card to CGA, and draws its
-//      title, so the active video mode leaves mode 13h.
+//   1. Tab during POST opens the menu: mode 13h with the menu's heading and the
+//      cyan focus band that the plain POST screen does not use.
+//   2. A host mouse move hot-tracks focus to the speed pane; a click marks a row.
+//   3. Tab then F10 (Accept) on the default Floppy boots the mounted image: the
+//      Wizardry III booter takes over and switches the card to CGA.
 //
-// Keys are fed as Set 1 scancodes via inject_key_scancodes. The menu blocks on a
-// keyboard read between keystrokes, so a burst injected up front is consumed in
-// order as IRQ1 delivers each scancode.
+// Keys are fed as Set 1 scancodes via inject_key_scancodes; mouse motion via
+// inject_mouse. The menu polls the aux channel and the keyboard ring each loop.
 
-use izarravm_core::VideoCard;
+use izarravm_core::{GswMode, VideoCard};
 use izarravm_firmware::izarra_bios;
 use izarravm_machine::{Machine, MachineProfile, build_fat12};
 use izarravm_video::VideoMode;
@@ -27,10 +28,18 @@ const TAB_MAKE: u8 = 0x0f;
 const TAB_BREAK: u8 = 0x8f;
 const ENTER_MAKE: u8 = 0x1c;
 const ENTER_BREAK: u8 = 0x9c;
+const UP_MAKE: u8 = 0x48;
+const UP_BREAK: u8 = 0xc8;
 const DOWN_MAKE: u8 = 0x50;
 const DOWN_BREAK: u8 = 0xd0;
+const RIGHT_MAKE: u8 = 0x4d;
+const RIGHT_BREAK: u8 = 0xcd;
 const ESC_MAKE: u8 = 0x01;
 const ESC_BREAK: u8 = 0x81;
+// F10 accepts the marked device and speed (the two-pane menu commits on Accept,
+// not on Enter, which only marks a row).
+const F10_MAKE: u8 = 0x44;
+const F10_BREAK: u8 = 0xc4;
 
 // The real Wizardry III booter image. The headless boot-floppy smoke command uses
 // the same path; the test is skipped when the corpus is not present so it stays
@@ -67,9 +76,81 @@ fn tab_opens_the_boot_menu_in_mode13h() {
 }
 
 #[test]
-fn tab_then_enter_boots_the_floppy() {
-    // Mount the Wizardry booter, open the menu with Tab, and select the default
-    // Floppy entry with Enter. The floppy path reads the boot sector and jumps to
+fn mouse_hover_moves_focus_to_the_speed_pane() {
+    // Open the two-pane menu (focus starts on the device pane), then feed a host
+    // mouse move that lands the cursor over the right (speed) pane. The BIOS polls
+    // the PS/2 aux channel each loop, hot-tracks the hovered region, and repaints,
+    // so the focus pane flips from device (0) to speed (1). This exercises the full
+    // item-8 path: BIOS aux enable, packet decode, cursor move, hit-test, refocus.
+    let mut machine = boot_machine();
+    machine.inject_key_scancodes(&[TAB_MAKE, TAB_BREAK]);
+    // Let the menu open and enable the mouse.
+    machine.run_until_halt_or_cycles(12_000_000).unwrap();
+    assert_eq!(machine.video().active_mode(), VideoMode::Mode13h);
+    // The menu seeds focus on the device pane (BMX_FOCUS_PANE at seg0 0x0900 = 0).
+    assert_eq!(
+        machine.read_physical_u8(0x0900),
+        0,
+        "focus starts on the device pane"
+    );
+    // The cursor parks mid-field at (152, 92). Move it up-right onto a speed row
+    // (the right pane spans x 172..303, y 44..107). dx=+48, screen dy=-34 lands it
+    // near (200, 58), inside the Fast/Slow speed rows. Feed the move in a few small
+    // packets so the BIOS poll, which drains one aux byte per loop, keeps up.
+    for _ in 0..6 {
+        machine.inject_mouse(8, -6, 0);
+        machine.run_until_halt_or_cycles(2_000_000).unwrap();
+    }
+    machine.run_until_halt_or_cycles(4_000_000).unwrap();
+    assert_eq!(
+        machine.read_physical_u8(0x0900),
+        1,
+        "hovering the right pane moved focus to the speed pane"
+    );
+    // The cursor word (seg0 0x0908) advanced from its parked X (152) toward the
+    // right pane, proving the packets moved the pointer.
+    let cur_x =
+        machine.read_physical_u8(0x0908) as u16 | ((machine.read_physical_u8(0x0909) as u16) << 8);
+    assert!(cur_x > 152, "the cursor moved right (x={cur_x})");
+}
+
+#[test]
+fn mouse_click_marks_a_speed_row() {
+    // Open the menu, move the cursor onto a Slow (486) speed row, and click. A click
+    // is "hover then mark", so the marked speed (seg0 0x0903) becomes the clicked
+    // row. The menu seeds the marked speed to Fast (row 0) from CMOS, so a click on
+    // a different row is an observable change.
+    let mut machine = boot_machine();
+    machine.inject_key_scancodes(&[TAB_MAKE, TAB_BREAK]);
+    machine.run_until_halt_or_cycles(12_000_000).unwrap();
+    let seeded_spd = machine.read_physical_u8(0x0903);
+    // Move onto the right pane around y=66 (the Slow row, hit y 60..75), button up.
+    for _ in 0..6 {
+        machine.inject_mouse(8, -4, 0);
+        machine.run_until_halt_or_cycles(2_000_000).unwrap();
+    }
+    machine.run_until_halt_or_cycles(2_000_000).unwrap();
+    // Press the left button (a 0->1 edge) on the hovered row, then release.
+    machine.inject_mouse(0, 0, 0x01);
+    machine.run_until_halt_or_cycles(4_000_000).unwrap();
+    machine.inject_mouse(0, 0, 0x00);
+    machine.run_until_halt_or_cycles(2_000_000).unwrap();
+    let marked_spd = machine.read_physical_u8(0x0903);
+    // The click landed on a speed row and marked it; whatever row it hit, the menu
+    // is still alive in mode 13h (the click did not commit, since speed rows mark
+    // rather than boot).
+    assert_eq!(machine.video().active_mode(), VideoMode::Mode13h);
+    assert!(
+        marked_spd <= 3,
+        "a click marked an available speed row (was {seeded_spd}, now {marked_spd})"
+    );
+}
+
+#[test]
+fn tab_then_accept_boots_the_floppy() {
+    // Mount the Wizardry booter, open the two-pane menu with Tab, and Accept with
+    // F10. The menu opens with Floppy already the marked device (the only bootable
+    // one), so Accept boots it: the floppy path reads the boot sector and jumps to
     // it; the booter switches the card to CGA for its title. Reaching CGA proves
     // the menu drove the floppy bootstrap.
     let image = match std::fs::read(WIZ3_IMAGE) {
@@ -81,7 +162,7 @@ fn tab_then_enter_boots_the_floppy() {
     };
     let mut machine = boot_machine();
     machine.mount_floppy(image).expect("720 KB image mounts");
-    machine.inject_key_scancodes(&[TAB_MAKE, TAB_BREAK, ENTER_MAKE, ENTER_BREAK]);
+    machine.inject_key_scancodes(&[TAB_MAKE, TAB_BREAK, F10_MAKE, F10_BREAK]);
     // The floppy now takes realistic mechanical time (seek + rotational latency +
     // ~31 KB/s for this 720 KB disk), so loading the booter's stage 2 burns far
     // more guest cycles than an instant read did. Run in chunks and stop as soon
@@ -95,6 +176,50 @@ fn tab_then_enter_boots_the_floppy() {
         }
     }
     assert!(reached_cga, "the Wizardry booter ran and switched to CGA");
+}
+
+#[test]
+fn accept_super_slow_commits_the_286_tier() {
+    // Open the menu, cross to the speed pane, walk down to the Super Slow (286) row,
+    // mark it with Enter, then Accept with F10. The Accept maps the marked row to GSW
+    // code 3, writes it to the live Lotura register (port 0xE1) and to CMOS 0x12, then
+    // cold-resets because the live mode changed from the 386 boot default. The live
+    // mode field persists across the guest reset, so active_mode() reads back Gsw286
+    // and CMOS 0x12 holds 3, mirroring the other speed tiers.
+    let mut machine = boot_machine();
+    assert_eq!(machine.active_mode(), GswMode::Gsw386, "boot mode is 386");
+
+    // Tab opens the menu (focus on the device pane, row 1 = the only bootable
+    // device, Floppy). Right crosses to the speed pane carrying that row index, so
+    // focus lands on speed row 1 (Slow). Two Downs walk to row 3 (Super Slow / 286).
+    // Enter marks it, F10 accepts.
+    machine.inject_key_scancodes(&[
+        TAB_MAKE,
+        TAB_BREAK, // open the boot menu
+        RIGHT_MAKE,
+        RIGHT_BREAK, // device pane -> speed pane (row 1)
+        DOWN_MAKE,
+        DOWN_BREAK, // Slow (row 1) -> VSlow (row 2)
+        DOWN_MAKE,
+        DOWN_BREAK, // VSlow (row 2) -> SSlow (row 3)
+        ENTER_MAKE,
+        ENTER_BREAK, // mark the Super Slow row
+        F10_MAKE,
+        F10_BREAK, // Accept
+    ]);
+    // Accept cold-resets, so the BIOS runs its POST again. Give it room to settle.
+    machine.run_until_halt_or_cycles(24_000_000).unwrap();
+
+    assert_eq!(
+        machine.active_mode(),
+        GswMode::Gsw286,
+        "Accept wrote GSW code 3 to the live Lotura register"
+    );
+    assert_eq!(
+        machine.cmos_byte(0x12),
+        3,
+        "Accept persisted GSW code 3 to CMOS 0x12"
+    );
 }
 
 // FAT12 layout constants for a 1.44 MB image, matching the synthesizer. Used to
@@ -232,19 +357,21 @@ fn fat12_folder_boots_and_reads_a_known_file_through_int13() {
 }
 
 #[test]
-fn tab_navigates_to_disk_and_reports_not_installed() {
-    // Tab opens the menu, Down moves to the Disk entry, Enter reports that Toka-DOS
-    // is not installed and stays on the menu (no boot). Esc then cancels. The run
-    // reaching the cycle limit in mode 13h without a fault proves the Disk entry
-    // returned to the menu rather than booting or crashing.
+fn tab_navigates_to_hard_disk_and_reports_unavailable() {
+    // Tab opens the two-pane menu with Floppy focused (device row 1). Up moves to
+    // the Hard Disk row (row 0), which is unavailable in this build. Enter on it
+    // reports that Toka-DOS is not installed and refuses the mark, staying on the
+    // menu. Esc then cancels. The run reaching the cycle limit in mode 13h without
+    // a fault proves the unavailable row returned to the menu rather than booting
+    // or crashing.
     let mut machine = boot_machine();
     machine.inject_key_scancodes(&[
         TAB_MAKE,
-        TAB_BREAK, // open the menu (Floppy highlighted)
-        DOWN_MAKE,
-        DOWN_BREAK, // Floppy -> Disk
+        TAB_BREAK, // open the menu (Floppy focused)
+        UP_MAKE,
+        UP_BREAK, // Floppy -> Hard Disk
         ENTER_MAKE,
-        ENTER_BREAK, // Disk: report not installed, stay on the menu
+        ENTER_BREAK, // Hard Disk: report unavailable, stay on the menu
         ESC_MAKE,
         ESC_BREAK, // cancel the menu
     ]);
@@ -255,6 +382,6 @@ fn tab_navigates_to_disk_and_reports_not_installed() {
     assert_eq!(
         machine.video().active_mode(),
         VideoMode::Mode13h,
-        "the Disk entry returned to the menu without booting"
+        "the unavailable Hard Disk row returned to the menu without booting"
     );
 }

@@ -79,7 +79,10 @@ const CPUID_LEAF1_ECX: u32 = 0;
 // through 0x80000004 return the 48-byte null-padded brand string, 16 bytes per leaf in
 // EAX, EBX, ECX, EDX order. The original K6 lacked the brand-string leaves, so exposing
 // them is a fantasy extension that lets the GSW-586 name itself in full.
-const CPUID_MAX_EXT_LEAF: u32 = 0x8000_0004;
+// The maximum extended leaf reaches 0x80000006 so the AMD-style cache leaves
+// 0x80000005 (L1) and 0x80000006 (L2) sit inside the reported range. The K6 did
+// expose these cache leaves, so they fit the GSW-586 identity.
+const CPUID_MAX_EXT_LEAF: u32 = 0x8000_0006;
 const CPUID_BRAND_EAX_0: u32 = u32::from_le_bytes(*b"Genu");
 const CPUID_BRAND_EBX_0: u32 = u32::from_le_bytes(*b"ine ");
 const CPUID_BRAND_ECX_0: u32 = u32::from_le_bytes(*b"GSW-");
@@ -315,6 +318,52 @@ pub struct ControlRegisters {
     pub cr3: u32,
 }
 
+/// The instruction-set level the core presents to the running guest. It is a
+/// throttle the Lotura GSW register selects live (286 mode -> I286, and so on), not
+/// the physical part: the silicon is always a 586, so the core can execute the full
+/// ISA. At a level below the part the core faithfully raises #UD for the features
+/// that processor generation lacked, so a guest that opts into Super Slow (286) sees
+/// a true 286 instruction boundary.
+///
+/// This gating is guest-facing only. The default is `I586`, the full ISA, so the
+/// BIOS POST and every firmware path run with no restriction; the level drops below
+/// I586 only when the guest writes a lower GSW mode to Lotura port 0xE1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum CpuLevel {
+    I286,
+    I386,
+    I486,
+    #[default]
+    I586,
+}
+
+impl CpuLevel {
+    /// True when the level predates the 386, which introduced the 32-bit operand
+    /// and address forms (the 66h/67h prefixes) and the bulk of the 0F-extended
+    /// opcode group the core also supports.
+    const fn is_pre_386(self) -> bool {
+        matches!(self, Self::I286)
+    }
+
+    /// True when CPUID is present. CPUID arrived on the late 486 and is standard on
+    /// the 586; the 286 and 386 have no CPUID and report #UD for it.
+    const fn has_cpuid(self) -> bool {
+        matches!(self, Self::I486 | Self::I586)
+    }
+
+    /// Reported (L1 KB, L2 KB) cache for the level. Cosmetic, no timing effect; the
+    /// L2 is a motherboard cache module. Mirrors `GswMode::cache_kb` in the core so
+    /// the CPU can answer the cache readout without a core dependency.
+    pub const fn cache_kb(self) -> (u16, u16) {
+        match self {
+            Self::I286 => (0, 0),
+            Self::I386 => (0, 64),
+            Self::I486 => (16, 128),
+            Self::I586 => (32, 512),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Cpu386 {
     pub registers: Registers,
@@ -327,6 +376,10 @@ pub struct Cpu386 {
     // the 386 holds off interrupts until the instruction after STI, which makes
     // the STI; HLT idle idiom safe (the HLT runs before any interrupt is taken).
     interrupt_shadow: bool,
+    // The guest-facing instruction-set level. Defaults to the full ISA (I586) so
+    // firmware POST is never restricted; the Machine lowers it from the live Lotura
+    // GSW mode write. See CpuLevel.
+    level: CpuLevel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -439,6 +492,24 @@ impl Cpu386 {
         // mode always has a 16-bit stack. Replace with a real SS.B check when 32-bit
         // protected-mode stacks land.
         self.control.cr0 & CR0_PE != 0
+    }
+
+    /// The live instruction-set level the core presents to the guest.
+    pub fn level(&self) -> CpuLevel {
+        self.level
+    }
+
+    /// Set the guest-facing instruction-set level. The Machine calls this from the
+    /// live Lotura GSW mode write so a guest that selects Super Slow (286) gets a
+    /// true 286 instruction boundary. Firmware POST never calls this, so it always
+    /// runs at the default full ISA.
+    pub fn set_level(&mut self, level: CpuLevel) {
+        self.level = level;
+    }
+
+    /// Reported (L1 KB, L2 KB) cache for the live level. Cosmetic, no timing effect.
+    pub fn cache_kb(&self) -> (u16, u16) {
+        self.level.cache_kb()
     }
 
     pub fn is_paging_enabled(&self) -> bool {
@@ -1630,6 +1701,20 @@ impl Cpu386 {
         operand_size: OperandSize,
     ) -> ExecResult<CycleOutcome> {
         let opcode = self.fetch_u8(bus)?;
+        // Guest-level ISA gate for the 0F-extended group. At the 286 level the core
+        // raises #UD for every 0F opcode the 386 (and later) introduced that it
+        // otherwise executes: MOVZX/MOVSX, BT/BTS/BTR/BTC, BSF/BSR, SHLD/SHRD,
+        // SETcc, the 0F-form IMUL and Jcc, MOV to/from CR, and the 486 additions
+        // (INVD/WBINVD, CMPXCHG, XADD, BSWAP). The 286-era 0F opcodes the core
+        // supports (0F 01 LGDT/LIDT) stay allowed. CPUID is gated separately below
+        // because it is absent on both the 286 and the 386. POST runs at I586, so
+        // none of this fires for firmware.
+        if self.level.is_pre_386() && is_386plus_two_byte(opcode) {
+            return Err(InternalFault::Exception {
+                vector: 6,
+                error_code: None,
+            });
+        }
         match opcode {
             0x01 => {
                 let modrm = self.fetch_modrm(bus)?;
@@ -1978,7 +2063,19 @@ impl Cpu386 {
                 // model basic leaves 0 and 1 plus the extended leaves 0x80000000 and
                 // 0x80000002..0x80000004 (the brand string); any other leaf returns all zeros,
                 // the architectural reply for an unimplemented leaf at or below the maximum.
+                //
+                // CPUID arrived on the late 486 and is standard on the 586. At the 286 and
+                // 386 guest levels it does not exist, so raise #UD. (The 286-level gate above
+                // already blocks it; this also covers the 386 level, which keeps the rest of
+                // the 0F group but still has no CPUID.)
+                if !self.level.has_cpuid() {
+                    return Err(InternalFault::Exception {
+                        vector: 6,
+                        error_code: None,
+                    });
+                }
                 let leaf = self.registers.eax();
+                let (l1_kb, l2_kb) = self.level.cache_kb();
                 let (eax, ebx, ecx, edx) = match leaf {
                     0 => (
                         CPUID_MAX_BASIC_LEAF,
@@ -2001,6 +2098,13 @@ impl Cpu386 {
                     ),
                     0x8000_0003 => (CPUID_BRAND_EAX_1, 0, 0, 0),
                     0x8000_0004 => (0, 0, 0, 0),
+                    // L1 cache (AMD-style): ECX is the L1 data cache, with the size in KB in
+                    // bits 31-24. The whole L1 size is reported as the data cache for this
+                    // cosmetic readout; the associativity and line fields stay zero.
+                    0x8000_0005 => (0, 0, (u32::from(l1_kb) & 0xff) << 24, 0),
+                    // L2 cache (AMD-style): ECX carries the L2 size in KB in bits 31-16, with
+                    // associativity (bits 15-12) and line size (bits 7-0) left at zero.
+                    0x8000_0006 => (0, 0, (u32::from(l2_kb) & 0xffff) << 16, 0),
                     _ => (0, 0, 0, 0),
                 };
                 self.write_gpr32(0, eax); // EAX
@@ -2120,6 +2224,19 @@ impl Cpu386 {
                 0x65 => prefixes.segment_override = Some(SegmentIndex::Gs),
                 // A prefix is idempotent: repeating 66h/67h keeps the override on,
                 // it does not toggle it back off (so 66 66 op stays operand-size).
+                //
+                // The 66h operand-size and 67h address-size prefixes are 386
+                // additions: the 286 has no 32-bit operand or address form and
+                // decodes neither byte as a prefix. At the 286 guest level the core
+                // raises #UD for them, which faithfully blocks every 32-bit
+                // operation reached through a prefix. Firmware POST runs at the full
+                // ISA level (I586), so this never fires there.
+                0x66 | 0x67 if self.level.is_pre_386() => {
+                    return Err(InternalFault::Exception {
+                        vector: 6,
+                        error_code: None,
+                    });
+                }
                 0x66 => prefixes.operand_size_override = true,
                 0x67 => prefixes.address_size_override = true,
                 0xf0 => prefixes.lock = true,
@@ -3779,6 +3896,27 @@ fn clocks(core_clocks: u32) -> CycleOutcome {
         core_clocks,
         halted: false,
     }
+}
+
+/// True when a second-byte 0F opcode is one the 386 or a later part introduced and
+/// the core executes. Used to raise #UD at the 286 guest level. The 286-era 0F
+/// opcodes the core supports (0F 01 LGDT/LIDT) return false and stay allowed.
+const fn is_386plus_two_byte(opcode: u8) -> bool {
+    matches!(
+        opcode,
+        // 486 cache/atomic group: INVD, WBINVD, CMPXCHG, XADD, BSWAP.
+        0x08 | 0x09 | 0xb0 | 0xb1 | 0xc0 | 0xc1 | 0xc8..=0xcf
+        // MOV to/from CR (386).
+        | 0x20 | 0x22
+        // Jcc rel16/32 and SETcc (386).
+        | 0x80..=0x8f | 0x90..=0x9f
+        // CPUID (gated again by level below; 286 has no CPUID either way).
+        | 0xa2
+        // SHLD/SHRD, BT group r/m+reg, IMUL r,r/m (386).
+        | 0xa3 | 0xa4 | 0xa5 | 0xab | 0xac | 0xad | 0xaf
+        // BT/BTS/BTR/BTC r/m+imm8 and r/m+reg, MOVZX/MOVSX, BSF/BSR (386).
+        | 0xb3 | 0xba | 0xbb | 0xb6 | 0xb7 | 0xbc | 0xbd | 0xbe | 0xbf
+    )
 }
 
 fn sign_extend_u8(value: u8) -> u32 {
@@ -8786,7 +8924,7 @@ mod tests {
         // Leaf 0x80000000 reports the maximum extended leaf, and 0x80000002..0x80000004
         // return the 48-byte null-padded brand string, 16 bytes per leaf in EAX, EBX, ECX,
         // EDX order. Concatenated, they spell the full processor name "Genuine GSW-80586".
-        assert_eq!(run_cpuid(0x8000_0000).registers.eax(), 0x8000_0004);
+        assert_eq!(run_cpuid(0x8000_0000).registers.eax(), 0x8000_0006);
         let mut brand = [0u8; 48];
         for (i, leaf) in [0x8000_0002u32, 0x8000_0003, 0x8000_0004]
             .iter()
@@ -8827,6 +8965,131 @@ mod tests {
         assert!(cpu.execute_instruction(&mut bus).is_ok());
         assert_eq!(cpu.registers.eax(), 1);
         assert_eq!(cpu.registers.ebx().to_le_bytes(), *b"Genu");
+    }
+
+    #[test]
+    fn default_level_is_full_isa() {
+        // The core resets to the full ISA so firmware POST is never restricted.
+        assert_eq!(Cpu386::default().level(), CpuLevel::I586);
+    }
+
+    #[test]
+    fn cpu_level_cache_table() {
+        assert_eq!(CpuLevel::I286.cache_kb(), (0, 0));
+        assert_eq!(CpuLevel::I386.cache_kb(), (0, 64));
+        assert_eq!(CpuLevel::I486.cache_kb(), (16, 128));
+        assert_eq!(CpuLevel::I586.cache_kb(), (32, 512));
+    }
+
+    /// Run a single instruction from `code` at the given level and return the result.
+    fn run_at_level(code: &[u8], level: CpuLevel) -> Result<CycleOutcome, InternalFault> {
+        let mut memory = vec![0; 1024];
+        memory[..code.len()].copy_from_slice(code);
+        let mut cpu = Cpu386::default();
+        cpu.set_level(level);
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(memory);
+        cpu.execute_instruction(&mut bus)
+    }
+
+    #[test]
+    fn movzx_is_undefined_opcode_at_286_but_runs_at_386() {
+        // 0F B6 C3: MOVZX AX, BL. A 386 addition, so #UD at the 286 level and fine above it.
+        let code = [0x0f, 0xb6, 0xc3];
+        let fault = run_at_level(&code, CpuLevel::I286).unwrap_err();
+        assert!(
+            matches!(fault, InternalFault::Exception { vector: 6, .. }),
+            "MOVZX must raise #UD at I286"
+        );
+        assert!(
+            run_at_level(&code, CpuLevel::I386).is_ok(),
+            "MOVZX must execute at I386"
+        );
+        assert!(run_at_level(&code, CpuLevel::I586).is_ok());
+    }
+
+    #[test]
+    fn operand_size_prefix_is_undefined_opcode_at_286() {
+        // 66 B8 ... a 32-bit MOV EAX, imm32 reached through the operand-size prefix. The 286
+        // has no 66h prefix, so the decoder #UDs on the prefix byte; 386 and up run it.
+        let code = [0x66, 0xb8, 0x78, 0x56, 0x34, 0x12];
+        let fault = run_at_level(&code, CpuLevel::I286).unwrap_err();
+        assert!(
+            matches!(fault, InternalFault::Exception { vector: 6, .. }),
+            "the 66h operand-size prefix must raise #UD at I286"
+        );
+        assert!(run_at_level(&code, CpuLevel::I386).is_ok());
+    }
+
+    #[test]
+    fn address_size_prefix_is_undefined_opcode_at_286() {
+        // 67 prefix: a 32-bit address form. Absent on the 286, present from the 386.
+        // 67 8B 00 would be MOV with a 32-bit address; the prefix alone must #UD at I286.
+        let code = [0x67, 0x90];
+        let fault = run_at_level(&code, CpuLevel::I286).unwrap_err();
+        assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
+        // At I386 the prefix decodes and the NOP after it runs.
+        assert!(run_at_level(&code, CpuLevel::I386).is_ok());
+    }
+
+    #[test]
+    fn shld_and_setcc_are_undefined_opcodes_at_286() {
+        // 0F A4 SHLD and 0F 90 SETO are both 386 additions.
+        let shld = [0x0f, 0xa4, 0xc3, 0x04]; // SHLD BX, AX, 4
+        let setcc = [0x0f, 0x90, 0xc0]; // SETO AL
+        for code in [&shld[..], &setcc[..]] {
+            let fault = run_at_level(code, CpuLevel::I286).unwrap_err();
+            assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
+            assert!(run_at_level(code, CpuLevel::I386).is_ok());
+        }
+    }
+
+    #[test]
+    fn lgdt_still_runs_at_286() {
+        // 0F 01 /2 LGDT is a 286 instruction, so it must NOT be gated at the 286 level.
+        // ModRM 16 = mode 0, reg 2 (LGDT), rm 6 (direct disp16) pointing at a 6-byte pseudo-
+        // descriptor in memory.
+        let mut memory = vec![0; 1024];
+        memory[0..4].copy_from_slice(&[0x0f, 0x01, 0x16, 0x20]); // disp16 = 0x0020
+        // 6-byte GDTR image at 0x0020: limit then 32-bit base.
+        memory[0x20..0x26].copy_from_slice(&[0xff, 0x00, 0x00, 0x10, 0x00, 0x00]);
+        let mut cpu = Cpu386::default();
+        cpu.set_level(CpuLevel::I286);
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(memory);
+        assert!(cpu.execute_instruction(&mut bus).is_ok());
+        assert_eq!(cpu.gdtr.limit, 0x00ff);
+        assert_eq!(cpu.gdtr.base, 0x0000_1000);
+    }
+
+    #[test]
+    fn cpuid_is_undefined_opcode_below_486() {
+        // CPUID is absent on the 286 and 386; it appears on the 486 and 586.
+        let code = [0x0f, 0xa2];
+        assert!(matches!(
+            run_at_level(&code, CpuLevel::I286).unwrap_err(),
+            InternalFault::Exception { vector: 6, .. }
+        ));
+        assert!(matches!(
+            run_at_level(&code, CpuLevel::I386).unwrap_err(),
+            InternalFault::Exception { vector: 6, .. }
+        ));
+        assert!(run_at_level(&code, CpuLevel::I486).is_ok());
+        assert!(run_at_level(&code, CpuLevel::I586).is_ok());
+    }
+
+    #[test]
+    fn cpuid_cache_leaves_report_level_sizes() {
+        // The AMD-style L1 (0x80000005) and L2 (0x80000006) leaves carry the live level's
+        // cache sizes in ECX: L1 KB in bits 31-24, L2 KB in bits 31-16.
+        let mut cpu = run_cpuid(0x8000_0005);
+        assert_eq!(cpu.registers.ecx() >> 24, 32); // I586 L1 = 32 KB
+        cpu = run_cpuid(0x8000_0006);
+        assert_eq!(cpu.registers.ecx() >> 16, 512); // I586 L2 = 512 KB
     }
 
     #[test]

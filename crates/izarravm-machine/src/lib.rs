@@ -2,7 +2,7 @@ pub use fat12::build_fat12;
 use izarravm_audio::{OplChip, Resampler, SbDsp, SbMixer};
 use izarravm_bus::{BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CpuBus, Memory};
 use izarravm_core::{GswMode, HardwareProfile, SoundBlasterConfig, VideoCard};
-use izarravm_cpu::{Cpu386, CpuError, Registers, SegmentIndex, SegmentRegister};
+use izarravm_cpu::{Cpu386, CpuError, CpuLevel, Registers, SegmentIndex, SegmentRegister};
 pub use izarravm_video::MARGO_ID_VALUE;
 use izarravm_video::{
     DAC_ENTRIES, MARGO_MMIO_SIZE, MARGO_VBE_MODES, MARGO_VRAM_SIZE, Margo, TextFrame,
@@ -90,7 +90,7 @@ impl MachineProfile {
     pub fn gsw_386(memory_mib: u16, video: VideoCard) -> Self {
         Self {
             cpu: GswMode::Gsw386,
-            clock_hz: 25_000_000,
+            clock_hz: GswMode::Gsw386.clock_hz(),
             memory_mib,
             video,
             sound_blaster: SoundBlasterConfig::default(),
@@ -233,6 +233,71 @@ pub struct Machine {
     // headless runs and unit tests finish inside their cycle budgets. The GUI
     // clears it after construction to keep the full power-on experience.
     fast_post: bool,
+    // INT 33h mouse-driver HLE state: virtual cursor position, button mask,
+    // visibility, motion-counter accumulators, and the configured ranges. The
+    // PS/2 aux device is the hardware side; this is the DOS driver a game calls.
+    mouse: MouseState,
+}
+
+/// INT 33h mouse-driver state. Coordinates are in a virtual screen space that
+/// matches mode 13h (320x200) doubled horizontally, so x runs 0..639 and y runs
+/// 0..199, the convention the Microsoft driver presents to graphics-mode games.
+/// Host pixel deltas drive both this position and the mickey counters.
+#[derive(Debug, Clone, PartialEq)]
+struct MouseState {
+    x: i32,          // virtual cursor column (clamped to [min_x, max_x])
+    y: i32,          // virtual cursor row (clamped to [min_y, max_y])
+    buttons: u8,     // bit0 left, bit1 right, bit2 middle
+    show_count: i32, // cursor visibility counter (>=0 visible); hide decrements
+    mickey_x: i32,   // horizontal motion accumulator (mickeys) since last read
+    mickey_y: i32,   // vertical motion accumulator (mickeys) since last read
+    min_x: i32,
+    max_x: i32,
+    min_y: i32,
+    max_y: i32,
+}
+
+impl Default for MouseState {
+    fn default() -> Self {
+        Self {
+            x: MOUSE_MAX_X / 2,
+            y: MOUSE_MAX_Y / 2,
+            buttons: 0,
+            show_count: -1, // hidden until the driver calls Show (AX=0001)
+            mickey_x: 0,
+            mickey_y: 0,
+            min_x: 0,
+            max_x: MOUSE_MAX_X,
+            min_y: 0,
+            max_y: MOUSE_MAX_Y,
+        }
+    }
+}
+
+/// Virtual-screen bounds for the INT 33h cursor: a mode-13h game sees 0..639 x
+/// 0..199. 320-wide modes scale x internally; the driver always reports this
+/// doubled space, matching the Microsoft convention.
+const MOUSE_MAX_X: i32 = 639;
+const MOUSE_MAX_Y: i32 = 199;
+
+/// Return `(min, max)` so a range function accepts its limits in either order.
+fn order(a: i32, b: i32) -> (i32, i32) {
+    if a <= b { (a, b) } else { (b, a) }
+}
+
+impl MouseState {
+    /// Fold a host pixel delta into the cursor position and the mickey counters,
+    /// and latch the new button mask. The mapping is one mickey per host pixel
+    /// (a sane 1:1 default), so the cursor tracks the host pointer directly. The
+    /// position is clamped to the configured ranges; the mickey counters are
+    /// raw motion and are not clamped (they reset on read, AX=000Bh).
+    fn apply_motion(&mut self, dx: i32, dy: i32, buttons: u8) {
+        self.mickey_x += dx;
+        self.mickey_y += dy;
+        self.x = (self.x + dx).clamp(self.min_x, self.max_x);
+        self.y = (self.y + dy).clamp(self.min_y, self.max_y);
+        self.buttons = buttons & 0x07;
+    }
 }
 
 /// Build the CT1745 mixer from the profile's Sound Blaster power-on routing.
@@ -320,6 +385,7 @@ impl Machine {
             rtc: rtc::Rtc::new(),
             rtc_seconds: 0.0,
             fast_post: true,
+            mouse: MouseState::default(),
         };
         // The Margo LFB aperture is decoded before RAM, so system memory must
         // stay below it. Validated config caps memory far under this bound.
@@ -603,6 +669,19 @@ impl Machine {
         }
     }
 
+    /// Feed a host mouse delta and button mask to the PS/2 aux device. `dx`/`dy`
+    /// are host pixels (y down positive); `buttons` is bit0 left, bit1 right,
+    /// bit2 middle. The aux device queues a movement packet and, when data
+    /// reporting is enabled, this requests IRQ12 so a guest ISR runs. The same
+    /// delta drives the INT 33h cursor and mickey counters so the HLE driver
+    /// tracks the pointer even when no guest ISR consumes the hardware packets.
+    pub fn inject_mouse(&mut self, dx: i32, dy: i32, buttons: u8) {
+        if self.keyboard.inject_mouse(dx, dy, buttons) {
+            self.pic.request(12);
+        }
+        self.mouse.apply_motion(dx, dy, buttons);
+    }
+
     #[cfg(test)]
     fn read_io_port_u8(&mut self, port: u16) -> u8 {
         let mut bus = self.make_bus();
@@ -612,6 +691,11 @@ impl Machine {
     #[cfg(test)]
     fn irq1_pending(&self) -> bool {
         self.pic.irr_bit(1)
+    }
+
+    #[cfg(test)]
+    fn irq12_pending(&self) -> bool {
+        self.pic.irr_bit(12)
     }
 
     #[cfg(test)]
@@ -822,6 +906,96 @@ impl Machine {
             self.set_int_frame_carry(false);
         } else {
             self.set_int_frame_carry(true);
+        }
+    }
+
+    /// Replace the low 16 bits of EAX, leaving the upper 16 intact.
+    fn set_ax(&mut self, ax: u16) {
+        let eax = (self.cpu.registers.eax() & !0xFFFF) | u32::from(ax);
+        self.cpu.registers.set_eax(eax);
+    }
+
+    /// Replace the low 16 bits of EBX.
+    fn set_bx(&mut self, bx: u16) {
+        let ebx = (self.cpu.registers.ebx() & !0xFFFF) | u32::from(bx);
+        self.cpu.registers.set_ebx(ebx);
+    }
+
+    /// Replace the low 16 bits of ECX.
+    fn set_cx(&mut self, cx: u16) {
+        let ecx = (self.cpu.registers.ecx() & !0xFFFF) | u32::from(cx);
+        self.cpu.registers.set_ecx(ecx);
+    }
+
+    /// Replace the low 16 bits of EDX.
+    fn set_dx(&mut self, dx: u16) {
+        let edx = (self.cpu.registers.edx() & !0xFFFF) | u32::from(dx);
+        self.cpu.registers.set_edx(edx);
+    }
+
+    /// Service the INT 33h mouse driver (Microsoft API). The subset DOS games
+    /// rely on: reset/detect, show/hide cursor, get position+buttons, set
+    /// position, define horizontal/vertical ranges, and read the mickey motion
+    /// counters. The PS/2 aux device is the hardware behind it; this HLE tracks
+    /// the same position the host feeds through `inject_mouse`, so a game that
+    /// polls INT 33h sees the pointer without writing its own IRQ12 ISR.
+    /// Functions outside this subset return with the registers unchanged.
+    fn handle_int33(&mut self) {
+        let ax = self.cpu.registers.eax() as u16;
+        let cx = self.cpu.registers.ecx() as u16;
+        let dx = self.cpu.registers.edx() as u16;
+        match ax {
+            // AX=0000: reset driver and read status. Re-centre the cursor, hide
+            // it, clear motion, and report "installed, 2 buttons".
+            0x0000 => {
+                self.mouse = MouseState::default();
+                self.set_ax(0xFFFF); // driver installed
+                self.set_bx(0x0002); // two-button mouse
+            }
+            // AX=0001: show cursor (increment the visibility counter).
+            0x0001 => {
+                self.mouse.show_count = (self.mouse.show_count + 1).min(0);
+            }
+            // AX=0002: hide cursor (decrement the visibility counter).
+            0x0002 => {
+                self.mouse.show_count -= 1;
+            }
+            // AX=0003: return position and button status.
+            0x0003 => {
+                self.set_bx(u16::from(self.mouse.buttons));
+                self.set_cx(self.mouse.x as u16);
+                self.set_dx(self.mouse.y as u16);
+            }
+            // AX=0004: position the cursor at CX (column), DX (row), clamped.
+            0x0004 => {
+                self.mouse.x = i32::from(cx).clamp(self.mouse.min_x, self.mouse.max_x);
+                self.mouse.y = i32::from(dx).clamp(self.mouse.min_y, self.mouse.max_y);
+            }
+            // AX=0007: define horizontal range (CX..DX). A reversed pair is
+            // swapped, the way the driver normalizes the limits.
+            0x0007 => {
+                let (lo, hi) = order(i32::from(cx), i32::from(dx));
+                self.mouse.min_x = lo.clamp(0, MOUSE_MAX_X);
+                self.mouse.max_x = hi.clamp(0, MOUSE_MAX_X);
+                self.mouse.x = self.mouse.x.clamp(self.mouse.min_x, self.mouse.max_x);
+            }
+            // AX=0008: define vertical range (CX..DX).
+            0x0008 => {
+                let (lo, hi) = order(i32::from(cx), i32::from(dx));
+                self.mouse.min_y = lo.clamp(0, MOUSE_MAX_Y);
+                self.mouse.max_y = hi.clamp(0, MOUSE_MAX_Y);
+                self.mouse.y = self.mouse.y.clamp(self.mouse.min_y, self.mouse.max_y);
+            }
+            // AX=000B: read and clear the mickey motion counters. Returned as
+            // 16-bit signed deltas; positive is right/down.
+            0x000B => {
+                self.set_cx(self.mouse.mickey_x as i16 as u16);
+                self.set_dx(self.mouse.mickey_y as i16 as u16);
+                self.mouse.mickey_x = 0;
+                self.mouse.mickey_y = 0;
+            }
+            // Other functions are accepted as no-ops, leaving registers as-is.
+            _ => {}
         }
     }
 
@@ -1465,10 +1639,22 @@ impl Machine {
     }
 
     /// Switch the active compatibility mode live, recomputing the timing factors
-    /// for the new clock. Called at construction and from the Lotura mode write.
+    /// for the new clock and lowering the CPU's guest-facing instruction-set level
+    /// to match. Called from the Lotura mode write (port 0xE1). The CPU level gate
+    /// is guest-facing only: firmware POST never reaches this path, so it always
+    /// runs at the full ISA the core resets to.
     pub fn set_mode(&mut self, mode: GswMode) {
         self.active_mode = mode;
         self.timing = TimingFactors::for_clock(mode.clock_hz());
+        self.cpu.set_level(cpu_level_for_mode(mode));
+    }
+
+    /// The reported (L1 KB, L2 KB) cache for the live mode. Cosmetic: it models a
+    /// motherboard L2 cache module and feeds the BIOS setup and GUI readout only,
+    /// with no timing effect. Driven from the live CPU level so it tracks a Lotura
+    /// mode switch.
+    pub fn cache_config(&self) -> (u16, u16) {
+        self.cpu.cache_kb()
     }
 
     /// The live compatibility mode (set at boot, changed by a Lotura mode write).
@@ -1545,6 +1731,9 @@ impl Machine {
 
         if self.keyboard.take_irq() {
             self.pic.request(1); // IRQ1: keyboard output buffer has a scancode
+        }
+        if self.keyboard.take_irq12() {
+            self.pic.request(12); // IRQ12: mouse output buffer has an aux byte
         }
 
         // Advance the RTC: inv_clock is 1/clock_hz, so clocks * inv_clock is
@@ -1880,6 +2069,7 @@ impl Machine {
                             0x12 => self.handle_int12(),
                             0x13 => self.handle_int13(),
                             0x15 => self.handle_int15(),
+                            0x33 => self.handle_int33(),
                             0x20 | 0x21 => match self.handle_dos_int(vector) {
                                 Ok(Some(code)) => {
                                     if let Some(frame) = self.program_frames.pop() {
@@ -2171,7 +2361,10 @@ impl CpuBus for MachineBus<'_> {
         // video service; 0x20/0x21 are the DOS kernel. Vector 0x10 reaches here
         // only from a software INT today (the CPU never faults with vector 0x10);
         // revisit if an x87 #MF is added.
-        if matches!(vector, 0x10 | 0x11 | 0x12 | 0x13 | 0x15 | 0x20 | 0x21) {
+        if matches!(
+            vector,
+            0x10 | 0x11 | 0x12 | 0x13 | 0x15 | 0x20 | 0x21 | 0x33
+        ) {
             *self.pending_soft_int = Some(vector);
         }
         Ok(())
@@ -2227,6 +2420,7 @@ fn gsw_mode_from_code(code: u8) -> Option<GswMode> {
         0 => Some(GswMode::Gsw386),
         1 => Some(GswMode::Gsw486),
         2 => Some(GswMode::Gsw586),
+        3 => Some(GswMode::Gsw286),
         _ => None,
     }
 }
@@ -2236,6 +2430,21 @@ fn gsw_mode_code(mode: GswMode) -> u8 {
         GswMode::Gsw386 => 0,
         GswMode::Gsw486 => 1,
         GswMode::Gsw586 => 2,
+        // 286 (Super Slow) takes code 3 so the original 386/486/586 codes keep their
+        // values and old guests that write 0/1/2 are unaffected.
+        GswMode::Gsw286 => 3,
+    }
+}
+
+/// Map a GSW compatibility mode to the CPU instruction-set level it presents to the
+/// guest. The 586 native default keeps the full ISA; a lower mode lowers the level
+/// so the core raises #UD for instructions that part lacked.
+fn cpu_level_for_mode(mode: GswMode) -> CpuLevel {
+    match mode {
+        GswMode::Gsw286 => CpuLevel::I286,
+        GswMode::Gsw386 => CpuLevel::I386,
+        GswMode::Gsw486 => CpuLevel::I486,
+        GswMode::Gsw586 => CpuLevel::I586,
     }
 }
 
@@ -2352,8 +2561,9 @@ const BIOS_ROM_IRET_SEG: u16 = 0xff00;
 
 fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     // BIOS service interrupts the host intercepts by vector. Their IVT targets
-    // point at the ROM IRET so they survive a guest low-memory wipe.
-    for vector in [0x10, 0x11, 0x12, 0x13, 0x15] {
+    // point at the ROM IRET so they survive a guest low-memory wipe. INT 33h is
+    // the mouse driver: the same shape (a stub the HLE handler returns through).
+    for vector in [0x10, 0x11, 0x12, 0x13, 0x15, 0x33] {
         let address = vector * 4;
         memory.write_u16(address, 0)?;
         memory.write_u16(address + 2, BIOS_ROM_IRET_SEG)?;
@@ -2614,13 +2824,52 @@ mod tests {
             vec![0u8; BIOS_ROM_SIZE],
         )
         .unwrap();
-        // Boot mode is 386 @ 25 MHz: the PIT factor is PIT_INPUT_HZ / 25 MHz.
+        // Boot mode is 386 @ 22 MHz: the PIT factor is PIT_INPUT_HZ / 22 MHz.
         assert_eq!(machine.active_mode(), GswMode::Gsw386);
-        assert!((machine.timing.pit_per_clock - PIT_INPUT_HZ as f64 / 25_000_000.0).abs() < 1e-9);
+        assert!((machine.timing.pit_per_clock - PIT_INPUT_HZ as f64 / 22_000_000.0).abs() < 1e-9);
         // Switching to 586 @ 266 MHz recomputes the factor.
         machine.set_mode(GswMode::Gsw586);
         assert_eq!(machine.active_mode(), GswMode::Gsw586);
         assert!((machine.timing.pit_per_clock - PIT_INPUT_HZ as f64 / 266_000_000.0).abs() < 1e-9);
+        // Super Slow (286) @ 8.33 MHz.
+        machine.set_mode(GswMode::Gsw286);
+        assert_eq!(machine.active_mode(), GswMode::Gsw286);
+        assert!((machine.timing.pit_per_clock - PIT_INPUT_HZ as f64 / 8_333_333.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn set_mode_drives_cpu_level_and_cache_table() {
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(1, izarravm_core::VideoCard::Et4000Ax),
+            vec![0u8; BIOS_ROM_SIZE],
+        )
+        .unwrap();
+        // The CPU boots at the full ISA so POST is never restricted, regardless of the
+        // 386 boot mode, until the guest writes a Lotura mode.
+        assert_eq!(machine.cpu.level(), CpuLevel::I586);
+
+        machine.set_mode(GswMode::Gsw286);
+        assert_eq!(machine.cpu.level(), CpuLevel::I286);
+        assert_eq!(machine.cache_config(), (0, 0));
+
+        machine.set_mode(GswMode::Gsw386);
+        assert_eq!(machine.cpu.level(), CpuLevel::I386);
+        assert_eq!(machine.cache_config(), (0, 64));
+
+        machine.set_mode(GswMode::Gsw486);
+        assert_eq!(machine.cpu.level(), CpuLevel::I486);
+        assert_eq!(machine.cache_config(), (16, 128));
+
+        machine.set_mode(GswMode::Gsw586);
+        assert_eq!(machine.cpu.level(), CpuLevel::I586);
+        assert_eq!(machine.cache_config(), (32, 512));
+    }
+
+    #[test]
+    fn lotura_code_3_selects_286_mode() {
+        assert_eq!(gsw_mode_from_code(3), Some(GswMode::Gsw286));
+        assert_eq!(gsw_mode_code(GswMode::Gsw286), 3);
+        assert_eq!(cpu_level_for_mode(GswMode::Gsw286), CpuLevel::I286);
     }
 
     fn rom_with_code(code: &[u8]) -> Vec<u8> {
@@ -2976,6 +3225,156 @@ mod tests {
         let ax = machine.cpu().registers.eax() as u16;
         assert_eq!(ax, BIOS_BASE_MEMORY_KIB);
         assert_eq!(ax, 640);
+    }
+
+    #[test]
+    fn mouse_movement_requests_irq12_after_enable() {
+        // Bring up the PS/2 mouse the way a driver does (command byte bit 1 set
+        // for the mouse interrupt, then 0xF4 enable reporting via the 0xD4 path),
+        // then inject a host move and confirm IRQ12 is pending on the PIC and the
+        // three-byte packet is readable on port 0x60 with the AUX status bit set.
+        let profile = MachineProfile::gsw_386(1, VideoCard::Et4000Ax);
+        let mut machine = Machine::new(profile, vec![0u8; BIOS_ROM_SIZE]).unwrap();
+        // Drive the controller through the bus the way the CPU would.
+        {
+            let mut bus = machine.make_bus();
+            bus.write_io(0x64, BusWidth::Byte, 0x60).unwrap(); // write command byte
+            bus.write_io(0x60, BusWidth::Byte, 0x03).unwrap(); // IRQ1 + IRQ12 enabled
+            bus.write_io(0x64, BusWidth::Byte, 0xD4).unwrap(); // next byte to aux
+            bus.write_io(0x60, BusWidth::Byte, 0xF4).unwrap(); // enable data reporting
+            assert_eq!(bus.read_io(0x60, BusWidth::Byte).unwrap(), 0xFA); // mouse ACK
+        }
+        // Move right 4, down 2, left button down.
+        machine.inject_mouse(4, 2, 0x01);
+        assert!(machine.irq12_pending(), "movement requests IRQ12");
+        // The packet is on port 0x60 and the status reports an AUX byte.
+        assert_eq!(machine.read_io_port_u8(0x64) & 0x20, 0x20, "AUX status bit");
+        let b0 = machine.read_io_port_u8(0x60);
+        assert_eq!(b0 & 0x08, 0x08, "always-one bit");
+        assert_eq!(b0 & 0x01, 0x01, "left button");
+        assert_eq!(b0 & 0x10, 0x00, "X positive");
+        assert_eq!(b0 & 0x20, 0x20, "Y sign set (screen-down move)");
+        assert_eq!(machine.read_io_port_u8(0x60), 4, "dx byte");
+        assert_eq!(machine.read_io_port_u8(0x60) as i8 as i32, -2, "dy byte");
+    }
+
+    #[test]
+    fn bios_aux_enable_then_packet_reads_back_with_no_stray_keyboard_byte() {
+        // Drive the exact sequence the BIOS bootbox menu runs (izbios-bootbox.inc
+        // bx2_aux_init): read the controller command byte, set the IRQ1+IRQ12
+        // enable bits, then enable AUX reporting via the 0xD4 prefix and drain the
+        // mouse ACK. The two things this guards that the menu has no automated
+        // coverage for: the injected packet reads back on 0x60 with the AUX status
+        // bit set, AND the enable handshake never drops a stray byte into the
+        // keyboard scancode ring (which the keyboard ISR reads unconditionally).
+        let profile = MachineProfile::gsw_386(1, VideoCard::Et4000Ax);
+        let mut machine = Machine::new(profile, vec![0u8; BIOS_ROM_SIZE]).unwrap();
+        {
+            let mut bus = machine.make_bus();
+            // Read CCB (0x20) -> 0x60, OR in IRQ1 (bit0) + IRQ12 (bit1), write back.
+            bus.write_io(0x64, BusWidth::Byte, 0x20).unwrap();
+            let ccb = bus.read_io(0x60, BusWidth::Byte).unwrap() as u8;
+            let new_ccb = ccb | 0x01 | 0x02;
+            bus.write_io(0x64, BusWidth::Byte, 0x60).unwrap();
+            bus.write_io(0x60, BusWidth::Byte, new_ccb as u32).unwrap();
+            // Enable AUX data reporting: 0xD4 routes 0xF4 to the mouse.
+            bus.write_io(0x64, BusWidth::Byte, 0xD4).unwrap();
+            bus.write_io(0x60, BusWidth::Byte, 0xF4).unwrap();
+            // Drain the AUX ACK (0xFA): it must arrive flagged as an AUX byte.
+            let status = bus.read_io(0x64, BusWidth::Byte).unwrap() as u8;
+            assert_eq!(status & 0x01, 0x01, "ACK waiting (OBF)");
+            assert_eq!(status & 0x20, 0x20, "ACK is an AUX byte, not a key");
+            assert_eq!(
+                bus.read_io(0x60, BusWidth::Byte).unwrap(),
+                0xFA,
+                "mouse ACK"
+            );
+        }
+        // The enable handshake must not have armed IRQ1 or queued a keyboard byte.
+        assert!(
+            !machine.irq1_pending(),
+            "AUX enable must not arm the keyboard interrupt"
+        );
+        assert_eq!(
+            machine.read_io_port_u8(0x64) & 0x01,
+            0,
+            "no byte left in the output buffer after the ACK drain"
+        );
+
+        // Now a host move queues a three-byte packet, flagged AUX, with IRQ12.
+        machine.inject_mouse(6, -3, 0x01); // right 6, up 3, left button down
+        assert!(machine.irq12_pending(), "movement requests IRQ12");
+        assert_eq!(
+            machine.read_io_port_u8(0x64) & 0x20,
+            0x20,
+            "packet byte is flagged AUX"
+        );
+        let b0 = machine.read_io_port_u8(0x60);
+        assert_eq!(b0 & 0x08, 0x08, "sync bit");
+        assert_eq!(b0 & 0x01, 0x01, "left button");
+        assert_eq!(machine.read_io_port_u8(0x60), 6, "dx byte");
+        assert_eq!(
+            machine.read_io_port_u8(0x60),
+            3,
+            "dy byte (screen up -> +3)"
+        );
+        // The packet drained cleanly: nothing left, and still no keyboard IRQ.
+        assert_eq!(
+            machine.read_io_port_u8(0x64) & 0x01,
+            0,
+            "output buffer empty after the packet"
+        );
+        assert!(
+            !machine.irq1_pending(),
+            "the AUX packet never touched the keyboard interrupt"
+        );
+    }
+
+    #[test]
+    fn int33_set_then_get_position_round_trips() {
+        // Stub: set the cursor to (100, 50) via AX=0004, then read it back via
+        // AX=0003. The host injects a left-button-down move first so the get
+        // reports the button mask too. After the get, BX=buttons, CX=col, DX=row.
+        let rom = rom_with_code(&[
+            0xB8, 0x04, 0x00, // mov ax, 0x0004 (set position)
+            0xB9, 0x64, 0x00, // mov cx, 100 (column)
+            0xBA, 0x32, 0x00, // mov dx, 50 (row)
+            0xCD, 0x33, // int 33h
+            0xB8, 0x03, 0x00, // mov ax, 0x0003 (get position + buttons)
+            0xCD, 0x33, // int 33h
+            0xF4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        // A prior host move sets the left button; position is overwritten by the
+        // AX=0004 set, so only the button mask survives into the get.
+        machine.inject_mouse(0, 0, 0x01);
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        let bx = machine.cpu().registers.ebx() as u16;
+        let cx = machine.cpu().registers.ecx() as u16;
+        let dx = machine.cpu().registers.edx() as u16;
+        assert_eq!(cx, 100, "column round-trips through set/get");
+        assert_eq!(dx, 50, "row round-trips through set/get");
+        assert_eq!(bx, 0x0001, "left button reported in BX");
+    }
+
+    #[test]
+    fn int33_reset_reports_present_and_two_buttons() {
+        // Stub: AX=0000 reset/detect, then halt. AX=FFFFh (installed), BX=2.
+        let rom = rom_with_code(&[
+            0x31, 0xC0, // xor ax, ax (AX=0000)
+            0xCD, 0x33, // int 33h
+            0xF4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        let ax = machine.cpu().registers.eax() as u16;
+        let bx = machine.cpu().registers.ebx() as u16;
+        assert_eq!(ax, 0xFFFF, "driver reports installed");
+        assert_eq!(bx, 0x0002, "two-button mouse");
     }
 
     #[test]
@@ -3598,7 +3997,7 @@ mod tests {
             machine.memory().as_slice()[0x0501],
         ]);
         assert_eq!(tick, 1, "the IRQ0 handler should have run once");
-        // One tick is about 1000 PIT clocks, near 21000 CPU clocks at 25 MHz, so a
+        // One tick is about 1000 PIT clocks, near 18000 CPU clocks at 22 MHz, so a
         // real fast-forward clears this slack floor while a no-op halt would not.
         assert!(
             machine.elapsed_clocks() > 10_000,
@@ -3776,7 +4175,7 @@ mod tests {
             | (u16::from(machine.read_physical_u8(0x0611)) << 8);
         assert!(ticks >= 1, "the IRQ5 handler should have run");
         // The fast-forward crossed a real sample window (half-buffer at 8 samples
-        // ~= 18k CPU clocks at 25 MHz), not a no-op halt.
+        // ~= 16k CPU clocks at 22 MHz), not a no-op halt.
         assert!(
             machine.elapsed_clocks() > 15_000,
             "the fast-forward should advance emulated time across the DSP sample window"
@@ -4190,8 +4589,8 @@ mod tests {
         // BUSY is set right after the command.
         assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
 
-        // 4 pixels -> busy_ns = 100 + 4*10 = 140 ns. At 25 MHz (40 ns/clock),
-        // three clocks (120 ns) leave it busy; the fourth clears it.
+        // 4 pixels -> busy_ns = 100 + 4*10 = 140 ns. At 22 MHz (45.4545 ns/clock),
+        // three clocks (136 ns drained) leave it busy; the fourth clears it.
         machine.advance_devices(3);
         assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
         machine.advance_devices(1);
@@ -4256,8 +4655,8 @@ mod tests {
         // BUSY is set right after the command.
         assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
 
-        // 20 pixels -> busy_ns = 100 + 20*5 = 200 ns = 5 clocks at 25 MHz.
-        // Four clocks (160 ns) leave it busy; the fifth clears it.
+        // 20 pixels -> busy_ns = 100 + 20*5 = 200 ns. At 22 MHz (45.4545 ns/clock),
+        // four clocks (181 ns drained) leave it busy; the fifth clears it.
         machine.advance_devices(4);
         assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
         machine.advance_devices(1);
@@ -4392,8 +4791,8 @@ mod tests {
             0x00
         ); // row 1, col 0 clear
 
-        // 2 pixels written -> busy_ns = 100 + 2*5 = 110 ns. At 25 MHz (40 ns/clock),
-        // two clocks (80 ns) leave it busy; the third clears it.
+        // 2 pixels written -> busy_ns = 100 + 2*5 = 110 ns. At 22 MHz (45.4545 ns/clock),
+        // two clocks (90 ns drained) leave it busy; the third clears it.
         assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
         machine.advance_devices(2);
         assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
@@ -4455,8 +4854,8 @@ mod tests {
         // BUSY set right after the command.
         assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
 
-        // 5 pixels -> busy_ns = 100 + 5*10 = 150 ns. At 25 MHz (40 ns/clock), three
-        // clocks (120 ns) leave it busy; the fourth clears it.
+        // 5 pixels -> busy_ns = 100 + 5*10 = 150 ns. At 22 MHz (45.4545 ns/clock),
+        // three clocks (136 ns drained) leave it busy; the fourth clears it.
         machine.advance_devices(3);
         assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
         machine.advance_devices(1);
@@ -4493,9 +4892,9 @@ mod tests {
         assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 2 * 640 + 2), 0); // left of the rect
         assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1); // BUSY set
 
-        // 16 pixels -> busy_ns = 100 + 16*5 = 180 ns. At 25 MHz (40 ns/clock), four
-        // clocks (160 ns) leave it busy; the fifth clears it.
-        machine.advance_devices(4);
+        // 16 pixels -> busy_ns = 100 + 16*5 = 180 ns. At 22 MHz (45.4545 ns/clock),
+        // three clocks (136 ns drained) leave it busy; the fourth clears it.
+        machine.advance_devices(3);
         assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
         machine.advance_devices(1);
         assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 0);
@@ -4640,8 +5039,8 @@ mod tests {
         let mut machine = test_machine();
         machine.set_vga_mode_0dh();
         let before = machine.video().beam_dots();
-        // 10 000 CPU clocks at 25 MHz with a 25.175 MHz dot clock advances
-        // roughly 10 070 dots — well above zero.
+        // 10 000 CPU clocks at 22 MHz with a 25.175 MHz dot clock advances
+        // roughly 11 443 dots, well above zero.
         machine.advance_devices(10_000);
         assert!(machine.video().beam_dots() != before || machine.video().frames_completed() > 0);
     }
@@ -4664,8 +5063,8 @@ mod tests {
     fn planar_mode_presents_a_vga_raster() {
         let mut machine = test_machine();
         machine.set_vga_mode_0dh();
-        // Mode 0Dh frame is ~359 200 dots; 600 000 CPU clocks at 25 MHz yields
-        // ~603 600 dot clocks — enough to complete at least one full frame.
+        // Mode 0Dh frame is ~359 200 dots; 600 000 CPU clocks at 22 MHz yields
+        // ~686 600 dot clocks, enough to complete at least one full frame.
         machine.advance_devices(600_000);
         assert!(matches!(machine.active_display(), ActiveDisplay::VgaRaster));
         assert!(machine.vga_raster().is_some());
@@ -5525,7 +5924,7 @@ mod tests {
         assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 3 * 8 + 3), 0x00); // (3,3) not yet
 
         // Enough ticks to drain fill 1's busy_ns (a 1-pixel fill is 105 ns; 10
-        // clocks at 25 MHz = 400 ns), letting the pump consume fill 2.
+        // clocks at 22 MHz = ~454 ns), letting the pump consume fill 2.
         machine.advance_devices(10);
         assert_eq!(read_mmio_reg(&mut machine, 0x90), put); // GET caught up
         assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 3 * 8 + 3), 0xbb); // (3,3) now

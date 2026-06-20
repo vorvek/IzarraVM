@@ -30,6 +30,8 @@ pub enum ConfigError {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GswMode {
+    #[serde(rename = "286")]
+    Gsw286,
     #[serde(rename = "386")]
     #[default]
     Gsw386,
@@ -40,18 +42,33 @@ pub enum GswMode {
 }
 
 impl GswMode {
-    /// The throttled core clock per compatibility mode: 25 MHz (386 mode), 66 MHz
+    /// The throttled core clock per compatibility mode: 8.33 MHz (286 mode, the Super
+    /// Slow setting), 22 MHz (386 mode, picked for the early-386 game range), 66 MHz
     /// (486 mode), and 266 MHz native (the K6-266 bin on the 66 MHz bus).
     pub const fn clock_hz(self) -> u64 {
         match self {
-            Self::Gsw386 => 25_000_000,
+            Self::Gsw286 => 8_333_333,
+            Self::Gsw386 => 22_000_000,
             Self::Gsw486 => 66_000_000,
             Self::Gsw586 => 266_000_000,
         }
     }
 
+    /// Reported cache sizes per compatibility mode as (L1 KB, L2 KB). The L2 is a
+    /// motherboard cache module; the whole table is cosmetic and feeds the cache
+    /// readout only, with no timing effect.
+    pub const fn cache_kb(self) -> (u16, u16) {
+        match self {
+            Self::Gsw286 => (0, 0),
+            Self::Gsw386 => (0, 64),
+            Self::Gsw486 => (16, 128),
+            Self::Gsw586 => (32, 512),
+        }
+    }
+
     pub const fn canonical_name(self) -> &'static str {
         match self {
+            Self::Gsw286 => "286",
             Self::Gsw386 => "386",
             Self::Gsw486 => "486",
             Self::Gsw586 => "586",
@@ -71,6 +88,7 @@ impl FromStr for GswMode {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match normalize(value).as_str() {
             // Primary GSW names plus legacy Intel aliases so old configs parse.
+            "286" | "gsw286" | "286_8" | "i286" | "286super" | "superslow" => Ok(Self::Gsw286),
             "386" | "gsw386" | "386dx25" | "i386dx25" | "i386dx_25" | "386_25" => Ok(Self::Gsw386),
             "486" | "gsw486" | "486dx266" | "i486dx266" | "i486dx2_66" | "486dx2_66" => {
                 Ok(Self::Gsw486)
@@ -579,15 +597,26 @@ mod tests {
 
     #[test]
     fn gsw_mode_clocks_and_names() {
-        assert_eq!(GswMode::Gsw386.clock_hz(), 25_000_000);
+        assert_eq!(GswMode::Gsw286.clock_hz(), 8_333_333);
+        assert_eq!(GswMode::Gsw386.clock_hz(), 22_000_000);
         assert_eq!(GswMode::Gsw486.clock_hz(), 66_000_000);
         assert_eq!(GswMode::Gsw586.clock_hz(), 266_000_000);
+        assert_eq!(GswMode::Gsw286.canonical_name(), "286");
         assert_eq!(GswMode::Gsw586.canonical_name(), "586");
         assert_eq!(GswMode::default(), GswMode::Gsw386);
     }
 
     #[test]
+    fn gsw_mode_cache_table_per_mode() {
+        assert_eq!(GswMode::Gsw286.cache_kb(), (0, 0));
+        assert_eq!(GswMode::Gsw386.cache_kb(), (0, 64));
+        assert_eq!(GswMode::Gsw486.cache_kb(), (16, 128));
+        assert_eq!(GswMode::Gsw586.cache_kb(), (32, 512));
+    }
+
+    #[test]
     fn gsw_mode_parses_primary_and_legacy_names() {
+        assert_eq!("286".parse::<GswMode>().unwrap(), GswMode::Gsw286);
         assert_eq!("386".parse::<GswMode>().unwrap(), GswMode::Gsw386);
         assert_eq!("486".parse::<GswMode>().unwrap(), GswMode::Gsw486);
         assert_eq!("586".parse::<GswMode>().unwrap(), GswMode::Gsw586);
