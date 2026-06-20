@@ -351,7 +351,74 @@ fn run_boot_floppy(
     } else {
         println!("boot: still in the BIOS (no boot, or read error)");
     }
+    print_video_summary(&mut machine);
     Ok(())
+}
+
+/// After a headless run, report the active video mode and whether the screen
+/// holds meaningful content. It renders a full frame and counts non-background
+/// pixels with a small histogram of the busiest DAC indices; in text mode it
+/// also prints the 80x25 page. A human reads this to confirm a booter drew its
+/// title or menu rather than sitting on a blank screen.
+fn print_video_summary(machine: &mut Machine) {
+    use izarravm_video::VideoMode;
+
+    let mode = machine.video().active_mode();
+    let mode_name = match mode {
+        VideoMode::Text => "text (03h)",
+        VideoMode::Mode13h => "mode 13h (320x200x256)",
+        VideoMode::Planar => "planar (EGA/VGA 16-color)",
+        VideoMode::ModeX => "mode X (unchained 256-color)",
+    };
+    println!("video mode: {mode_name}");
+
+    if matches!(mode, VideoMode::Text) {
+        let frame = machine.screen_text();
+        let text = frame.as_text();
+        let printable = text.chars().filter(|c| !c.is_whitespace()).count();
+        println!("text non-blank glyphs: {printable}");
+        println!("--- 80x25 text ---");
+        println!("{text}");
+        println!("--- end text ---");
+    }
+
+    // Render one full frame and summarize the pixel indices (works for text and
+    // graphics modes alike: render_full_frame walks the CRTC scanlines). The
+    // background is DAC index 0 (black on the stock palette), so non-zero pixels
+    // mean the guest drew something.
+    let raster = machine.video_mut().render_full_frame();
+    let total = raster.pixels.len();
+    let nonzero = raster.pixels.iter().filter(|&&p| p != 0).count();
+    println!(
+        "framebuffer: {}x{} ({total} px)",
+        raster.width, raster.height
+    );
+    println!(
+        "non-zero pixels: {nonzero} ({:.1}%)",
+        if total == 0 {
+            0.0
+        } else {
+            100.0 * nonzero as f64 / total as f64
+        }
+    );
+    let mut histogram = [0u32; 256];
+    for &index in &raster.pixels {
+        histogram[index as usize] += 1;
+    }
+    let mut entries: Vec<(usize, u32)> = histogram
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|&(_, count)| count > 0)
+        .collect();
+    entries.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
+    let top: Vec<String> = entries
+        .iter()
+        .take(8)
+        .map(|(index, count)| format!("idx {index}: {count}"))
+        .collect();
+    println!("distinct colors: {}", entries.len());
+    println!("top indices: {}", top.join(", "));
 }
 
 /// Minimal ASCII to Set 1 make+break for the demo (lowercase letters, digits,
