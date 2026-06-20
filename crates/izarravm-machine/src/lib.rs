@@ -6506,6 +6506,44 @@ mod tests {
     }
 
     #[test]
+    fn serial_tx_is_captured_and_lsr_reports_empty() {
+        // A write to the COM1 transmit register (0x3F8) with DLAB clear appends to
+        // the text serial_text() surfaces, and the line status register (0x3FD)
+        // always reports transmitter empty (THRE|TEMT) so a poll loop never stalls.
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x03f8, BusWidth::Byte, u32::from(b'H'))
+                .unwrap();
+            bus.write_io(0x03f8, BusWidth::Byte, u32::from(b'i'))
+                .unwrap();
+        });
+        assert!(machine.serial_text().ends_with("Hi"));
+        let lsr = machine.read_io_port_u8(0x03fd);
+        assert_ne!(lsr & 0x20, 0, "THRE set");
+        assert_ne!(lsr & 0x40, 0, "TEMT set");
+    }
+
+    #[test]
+    fn izarra_bios_mirrors_post_log_to_com1() {
+        // POST initializes COM1 and writes each step's status and name to 0x3F8.
+        // After a full POST run the serial log carries the header and the
+        // foundation reference step, proving the mirror is live.
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
+        machine.run_until_halt_or_cycles(5_000_000).unwrap();
+        let serial = machine.serial_text();
+        assert!(
+            serial.contains("Izarra 3000 POST"),
+            "COM1 log missing the POST header: {serial:?}"
+        );
+        assert!(
+            serial.contains("PASS self.framework"),
+            "COM1 log missing the framework step line: {serial:?}"
+        );
+    }
+
+    #[test]
     fn fast_post_port_reflects_the_flag() {
         // Port 0xE2 is the Lotura POST-pacing flag the BIOS reads before the
         // cosmetic RAM count-up. It defaults to fast (1) so headless runs and
