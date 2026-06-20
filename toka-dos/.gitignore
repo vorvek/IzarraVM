@@ -1,0 +1,3 @@
+# Intermediate build artifacts. The committed source of truth is the packed
+# tokados.rom under crates/izarravm-firmware/roms, produced by build.ps1.
+/build/
