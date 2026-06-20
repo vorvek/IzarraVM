@@ -186,13 +186,6 @@ impl Keyboard8042 {
     /// reporting is enabled. Returns true if that should pulse IRQ12.
     pub fn inject_mouse(&mut self, dx: i32, dy: i32, buttons: u8) -> bool {
         let reporting = self.mouse.queue_movement(dx, dy, buttons);
-        // TEMP mouse diagnostics (issue 1): confirm the packet reached the aux and
-        // whether the BIOS has enabled reporting yet.
-        eprintln!(
-            "[mouse-dbg] inject dx={dx} dy={dy} buttons={buttons} reporting={reporting} aux_q={} armed12={}",
-            self.mouse.queue.len(),
-            self.irq12_armed
-        );
         self.latch_next();
         reporting && self.irq12_armed
     }

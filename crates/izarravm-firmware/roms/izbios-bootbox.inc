@@ -1295,37 +1295,68 @@ bx2_aux_drain:
 .done:
     ret
 
-; bx2_poll_mouse: read at most one waiting AUX byte and, when a full 3-byte packet
-; is assembled, apply the motion and the left-button edge. Reads 0x64; if no AUX
-; byte is waiting, returns at once. DS bounces. Clobbers caller-saved regs.
+; bx2_poll_mouse: read the absolute cursor position from the INT 33h mouse HLE.
+; The host maps the OS pointer's position over the screen straight to the guest
+; cursor (set_mouse_absolute), so there is no relative drift and nothing to
+; confine. AX=0003h returns CX = x (0..639, doubled in mode 13h), DX = y (0..199),
+; BX = buttons. The position is scaled to the 0..319 cursor space, clamped, and
+; turned into a relative packet for bx2_apply_packet (which moves the sprite,
+; hot-tracks focus, and fires the left-button click). The per-call delta is capped
+; to one signed byte, so a far jump catches up over a few of these fast poll
+; iterations. Nothing happens when neither the position nor the left button moved.
+; DS bounces. Clobbers caller-saved regs.
 bx2_poll_mouse:
-    in al, PORT_KBD_CMD
-    mov ah, al
-    test al, KBC_STATUS_OBF
-    jz .ret                         ; nothing waiting
-    test ah, KBC_STATUS_AUX
-    jz .ret                         ; a keyboard byte: leave it for the key path
-    in al, PORT_KBD_DATA            ; AL = the AUX byte
-    ; Assemble into BMX_PKT[BMX_PKT_IDX].
-    xor cx, cx
-    mov ds, cx
-    mov bl, [BMX_PKT_IDX]
-    test bl, bl
-    jnz .store                      ; not the sync byte: store wherever we are
-    ; Byte 0 must have bit 3 set (sync); if not, drop and resync.
-    test al, 0x08
-    jz .ret
-.store:
-    movzx bx, bl
-    mov [BMX_PKT + bx], al
-    inc bl
-    mov [BMX_PKT_IDX], bl
-    cmp bl, 3
-    jb .ret
-    ; Full packet: reset the index and act on it.
-    mov byte [BMX_PKT_IDX], 0
+    mov ax, 0x0003
+    int 0x33                        ; CX = x, DX = y, BX = buttons
+    shr cx, 1                       ; INT 33h x is doubled in mode 13h -> 0..319
+    cmp cx, BMX_CUR_X_MAX
+    jbe .cx_ok
+    mov cx, BMX_CUR_X_MAX
+.cx_ok:
+    cmp dx, BMX_CUR_Y_MAX
+    jbe .dx_ok
+    mov dx, BMX_CUR_Y_MAX
+.dx_ok:
+    xor ax, ax
+    mov ds, ax
+    ; Skip the work when the position and the left button both match last frame.
+    cmp cx, [BMX_CUR_X]
+    jne .changed
+    cmp dx, [BMX_CUR_Y]
+    jne .changed
+    mov al, bl
+    and al, 0x01
+    cmp al, [BMX_LMB]
+    je .ret
+.changed:
+    ; Flags byte: left button in bit 0, no overflow bits.
+    mov al, bl
+    and al, 0x07
+    mov [BMX_PKT], al
+    ; dx delta = target_x - cur_x, capped to a signed byte.
+    mov ax, cx
+    sub ax, [BMX_CUR_X]
+    call bx2_clamp_sbyte
+    mov [BMX_PKT + 1], al
+    ; dy byte = cur_y - target_y (bx2_apply_packet subtracts dy from Y).
+    mov ax, [BMX_CUR_Y]
+    sub ax, dx
+    call bx2_clamp_sbyte
+    mov [BMX_PKT + 2], al
     call bx2_apply_packet
 .ret:
+    ret
+
+; bx2_clamp_sbyte: clamp the signed value in AX to [-128, 127]; result in AL.
+bx2_clamp_sbyte:
+    cmp ax, 127
+    jle .lo_chk
+    mov ax, 127
+.lo_chk:
+    cmp ax, -128
+    jge .done
+    mov ax, -128
+.done:
     ret
 
 ; bx2_apply_packet: consume BMX_PKT (flags, dx, dy). Update the cursor with motion
@@ -1334,6 +1365,10 @@ bx2_poll_mouse:
 bx2_apply_packet:
     xor cx, cx
     mov ds, cx
+    ; Restore the background at the OLD cursor spot BEFORE updating BMX_CUR_X/Y,
+    ; while they still point where the cursor is currently drawn. Restoring after
+    ; the move erases the new spot and leaves the old cursor behind as a trail.
+    call bx2_cursor_restore
     ; --- X delta (signed) ---
     mov al, [BMX_PKT + 1]           ; dx byte
     movsx bx, al                    ; BX = sign-extended dx
@@ -1374,9 +1409,8 @@ bx2_apply_packet:
 .y_hi_ok:
     mov [BMX_CUR_Y], ax
 
-    ; Move the cursor sprite: restore the old background, save the new background,
-    ; redraw. Pure motion does NOT repaint the panes.
-    call bx2_cursor_restore
+    ; Save the background under the new spot and draw the cursor there. The old
+    ; spot was already restored at the top, before BMX_CUR_X/Y were updated.
     call bx2_cursor_save
     call bx2_cursor_draw
 

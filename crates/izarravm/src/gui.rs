@@ -15,12 +15,6 @@ use tracing::{error, warn};
 
 const OPL_NATIVE_HZ: f64 = 49_716.0;
 
-/// The guest framebuffer resolution the capture path scales pointer motion to.
-/// Mode 13h is 320x200; the host-points-to-guest-pixels ratio uses these so a
-/// full sweep across the window maps to a full sweep of the guest screen.
-const GUEST_WIDTH: f32 = 320.0;
-const GUEST_HEIGHT: f32 = 200.0;
-
 /// Map a 0..1 master-volume slider to a linear audio gain. This is a cubic
 /// perceptual curve; swap it for a proper dB map if it ever matters.
 fn volume_gain(volume: f32) -> f32 {
@@ -186,13 +180,19 @@ struct Frame {
     cd_accesses: u64,      // monotonic CD access count, drives the LED
 }
 
+/// The guest cursor coordinate range the INT 33h mouse uses (matches the machine's
+/// MOUSE_MAX_X / MOUSE_MAX_Y): x spans 0..639, y spans 0..199.
+const MOUSE_GUEST_MAX_X: i32 = 639;
+const MOUSE_GUEST_MAX_Y: i32 = 199;
+
 /// UI-to-emulation-thread messages.
 enum Command {
     Keys(Vec<u8>),
-    /// A host mouse update: relative motion (dx, dy in host pixels, y down
-    /// positive) and the current button mask (bit0 left, bit1 right, bit2
-    /// middle). Forwarded only while input capture is active.
-    Mouse(i32, i32, u8),
+    /// An absolute host mouse position mapped onto the guest screen: `x` 0..639,
+    /// `y` 0..199, plus the button mask. The host pointer's position over the
+    /// framebuffer rect maps straight to the guest cursor (no relative drift, no
+    /// confinement), which the BIOS menus read through INT 33h. Capture only.
+    MouseAbsolute(i32, i32, u8),
     /// Mount a floppy image into drive A: live. `flush_path` is the source IMG to
     /// rewrite a dirty image to on eject; folder mounts pass None (read-only).
     MountFloppy {
@@ -352,8 +352,8 @@ impl Emulator {
         let _ = self.commands.send(Command::Keys(codes));
     }
 
-    fn send_mouse(&self, dx: i32, dy: i32, buttons: u8) {
-        let _ = self.commands.send(Command::Mouse(dx, dy, buttons));
+    fn send_mouse_absolute(&self, x: i32, y: i32, buttons: u8) {
+        let _ = self.commands.send(Command::MouseAbsolute(x, y, buttons));
     }
 
     fn mount_floppy(&self, bytes: Vec<u8>, flush_path: Option<PathBuf>) {
@@ -457,7 +457,9 @@ fn emulate(
         loop {
             match commands.try_recv() {
                 Ok(Command::Keys(codes)) => machine.inject_key_scancodes(&codes),
-                Ok(Command::Mouse(dx, dy, buttons)) => machine.inject_mouse(dx, dy, buttons),
+                Ok(Command::MouseAbsolute(x, y, buttons)) => {
+                    machine.set_mouse_absolute(x, y, buttons)
+                }
                 Ok(Command::MountFloppy { bytes, flush_path }) => {
                     match machine.mount_floppy(bytes) {
                         Ok(()) => floppy_flush_path = flush_path,
@@ -622,10 +624,12 @@ pub struct GuiApp {
     // path scales host pointer motion across it into guest pixels. None until the
     // monitor has been drawn at least once.
     screen_rect: Option<egui::Rect>,
-    // Last pointer position seen while captured, so a PointerMoved yields a
-    // relative delta. Reset to None on capture enter and leave so the first move
-    // after a grab does not jump.
+    // Last pointer position seen while captured, reused for a button-only frame
+    // (a click in place). Reset to None on capture enter and leave.
     last_pointer: Option<egui::Pos2>,
+    // Last absolute guest cursor cell (0..639 x 0..199) sent to the VM, so an
+    // unchanged position is not re-sent every frame. Reset on capture enter/leave.
+    last_abs: Option<(i32, i32)>,
     // The cpal stream is !Send, so it stays here on the UI thread; the
     // emulation thread gets a Send sink cloned from it.
     audio: Option<AudioPlayer>,
@@ -719,6 +723,7 @@ impl GuiApp {
             last_buttons: 0,
             screen_rect: None,
             last_pointer: None,
+            last_abs: None,
             audio,
             emu: None,
             texture: None,
@@ -871,23 +876,24 @@ impl GuiApp {
         }
     }
 
-    /// Enter or leave input capture: confine and hide the OS cursor while
-    /// captured, release and show it otherwise. `Confined` keeps the absolute
-    /// cursor over the window so the relative-delta path stays meaningful;
-    /// `Locked` is the fallback for platforms that do not support confinement.
+    /// Enter or leave input capture. While captured we hide the OS cursor and
+    /// route keyboard and pointer to the guest (which draws its own cursor);
+    /// Ctrl+F2 releases. We deliberately do NOT confine/grab the cursor: on
+    /// Windows a confined cursor pins at the window edge and stops emitting
+    /// PointerMoved, which kills the relative-motion path (observed as moves=0).
+    /// Leaving it ungrabbed keeps motion reliable.
     fn set_capture(&mut self, ctx: &egui::Context, capture: bool) {
         if self.input_captured == capture {
             return;
         }
         self.input_captured = capture;
         self.last_buttons = 0;
-        // Drop the tracked pointer so the first move after a grab (or release)
-        // reports no delta instead of a jump from a stale position.
+        // Drop the tracked pointer/position so a stale value is not reused after a
+        // capture or release.
         self.last_pointer = None;
+        self.last_abs = None;
         if capture {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(
-                egui::CursorGrab::Confined,
-            ));
+            ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::None));
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
         } else {
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::None));
@@ -928,12 +934,12 @@ impl GuiApp {
             return;
         }
 
-        // Collect Set 1 scancodes and the latest pointer state, then strip every
-        // keyboard and pointer event so egui never acts on them.
+        // Collect Set 1 scancodes, the latest pointer position, and the button
+        // mask, then strip every keyboard and pointer event so egui never acts on
+        // them (TAB never moves sidebar focus; the sidebar stays pointer-inert).
         let mut codes: Vec<u8> = Vec::new();
         let mut buttons = self.last_buttons;
-        let mut motion = egui::Vec2::ZERO;
-        let mut pointer_moves = 0u32;
+        let mut latest_pos: Option<egui::Pos2> = None;
         for event in &raw_input.events {
             match event {
                 egui::Event::Key { key, pressed, .. } => {
@@ -941,15 +947,12 @@ impl GuiApp {
                         codes.push(if *pressed { make } else { make | 0x80 });
                     }
                 }
-                egui::Event::PointerMoved(pos) => {
-                    pointer_moves += 1;
-                    if let Some(last) = self.last_pointer {
-                        motion += *pos - last;
-                    }
-                    self.last_pointer = Some(*pos);
-                }
+                egui::Event::PointerMoved(pos) => latest_pos = Some(*pos),
                 egui::Event::PointerButton {
-                    button, pressed, ..
+                    button,
+                    pressed,
+                    pos,
+                    ..
                 } => {
                     let bit = match button {
                         egui::PointerButton::Primary => 0x01,
@@ -962,6 +965,7 @@ impl GuiApp {
                     } else {
                         buttons &= !bit;
                     }
+                    latest_pos = Some(*pos);
                 }
                 _ => {}
             }
@@ -974,25 +978,40 @@ impl GuiApp {
             }
         }
 
-        // Scale the host motion across the framebuffer rect into guest pixels. With
-        // no rect yet (monitor not drawn) the host motion passes through unscaled.
-        let (dx, dy) = match self.screen_rect {
-            Some(rect) => screen_to_guest_delta(motion, rect),
-            None => (motion.x.round() as i32, motion.y.round() as i32),
-        };
-        // TEMP mouse diagnostics (issue 1): log whenever the hook saw pointer
-        // activity, so we can tell if PointerMoved even reaches us under the grab.
-        if pointer_moves > 0 || buttons != self.last_buttons {
-            eprintln!(
-                "[mouse-dbg] hook moves={pointer_moves} motion={motion:?} -> dx={dx} dy={dy} buttons={buttons} rect={:?}",
-                self.screen_rect
-            );
-        }
-        // Send when the pointer moved or a button state changed since last packet.
-        if dx != 0 || dy != 0 || buttons != self.last_buttons {
-            self.last_buttons = buttons;
-            if let Some(emu) = &self.emu {
-                emu.send_mouse(dx, dy, buttons);
+        // Absolute-pointer mode: map the host pointer's position over the
+        // framebuffer rect straight to the guest cursor (0..639 x 0..199), clamped
+        // to the screen. No relative motion and no cursor grab or warp, so the OS
+        // pointer roams freely (even onto another monitor) without breaking
+        // anything: the guest cursor pins to the nearest edge and resumes the
+        // instant the pointer returns. The BIOS menus read this via INT 33h. A
+        // button change with no move this frame reuses the last position.
+        let pos = latest_pos.or(self.last_pointer);
+        if let (Some(pos), Some(rect)) = (pos, self.screen_rect) {
+            let fx = ((pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
+            let fy = ((pos.y - rect.top()) / rect.height().max(1.0)).clamp(0.0, 1.0);
+            let gx = (fx * MOUSE_GUEST_MAX_X as f32).round() as i32;
+            let gy = (fy * MOUSE_GUEST_MAX_Y as f32).round() as i32;
+            self.last_pointer = Some(pos);
+            if Some((gx, gy)) != self.last_abs || buttons != self.last_buttons {
+                self.last_abs = Some((gx, gy));
+                self.last_buttons = buttons;
+                if let Some(emu) = &self.emu {
+                    emu.send_mouse_absolute(gx, gy, buttons);
+                }
+            }
+            // Confine the OS pointer to the video-output rect: if it strays outside
+            // (toward the sidebar or another monitor), warp it back to the nearest
+            // edge. We cannot use CursorGrab::Confined here, since on Windows a
+            // confined+hidden cursor stops emitting PointerMoved and tracking dies;
+            // ungrabbed keeps tracking reliable. The guest cursor already tracks the
+            // clamped position, so even a dropped warp (egui flags CursorPosition as
+            // unreliable) leaves the on-screen arrow correct.
+            if !rect.contains(pos) {
+                let back = egui::pos2(
+                    pos.x.clamp(rect.left(), rect.right()),
+                    pos.y.clamp(rect.top(), rect.bottom()),
+                );
+                ctx.send_viewport_cmd(egui::ViewportCommand::CursorPosition(back));
             }
         }
     }
@@ -1500,24 +1519,6 @@ fn is_captured_input_event(event: &egui::Event) -> bool {
     )
 }
 
-/// Scale a host pointer motion (in egui points) across the framebuffer `rect`
-/// into a guest-pixel delta. The guest screen is GUEST_WIDTH x GUEST_HEIGHT, so a
-/// motion spanning the whole rect maps to a motion spanning the whole guest
-/// screen. A zero-sized rect axis contributes no motion on that axis.
-fn screen_to_guest_delta(motion: egui::Vec2, rect: egui::Rect) -> (i32, i32) {
-    let scale = |d: f32, span: f32, guest: f32| -> i32 {
-        if span > 0.0 {
-            (d * guest / span).round() as i32
-        } else {
-            0
-        }
-    };
-    (
-        scale(motion.x, rect.width(), GUEST_WIDTH),
-        scale(motion.y, rect.height(), GUEST_HEIGHT),
-    )
-}
-
 /// egui Key to Set 1 scancode (make code). Covers the keys a user types at a
 /// DOS prompt; extend as the setup page needs more.
 fn egui_key_to_set1(key: egui::Key) -> Option<u8> {
@@ -1713,34 +1714,5 @@ mod tests {
         let src = egui::ColorImage::new([4, 4], vec![egui::Color32::BLACK; 16]);
         let out = sharp_prescale(&src, 3, 3);
         assert_eq!(out.size, [4, 4]);
-    }
-
-    #[test]
-    fn guest_delta_scales_motion_across_the_rect() {
-        // A 640x400 rect is exactly 2x the 320x200 guest, so host motion halves.
-        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(640.0, 400.0));
-        assert_eq!(
-            screen_to_guest_delta(egui::vec2(20.0, 40.0), rect),
-            (10, 20)
-        );
-        // Sign is preserved on both axes.
-        assert_eq!(
-            screen_to_guest_delta(egui::vec2(-20.0, -40.0), rect),
-            (-10, -20)
-        );
-        // A rect matching the guest size passes motion through one-to-one.
-        let exact = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(320.0, 200.0));
-        assert_eq!(screen_to_guest_delta(egui::vec2(7.0, -3.0), exact), (7, -3));
-    }
-
-    #[test]
-    fn guest_delta_is_zero_on_a_degenerate_rect() {
-        // A zero-width (or zero-height) rect contributes no motion on that axis
-        // instead of dividing by zero.
-        let flat = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(0.0, 200.0));
-        assert_eq!(
-            screen_to_guest_delta(egui::vec2(50.0, 100.0), flat),
-            (0, 100)
-        );
     }
 }

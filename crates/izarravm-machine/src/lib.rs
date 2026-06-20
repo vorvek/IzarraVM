@@ -728,6 +728,18 @@ impl Machine {
         self.mouse.apply_motion(dx, dy, buttons);
     }
 
+    /// Set the absolute INT 33h cursor position directly, for the GUI's
+    /// absolute-pointer mode: the host maps the pointer's position over the screen
+    /// straight to the guest cursor, so there is no relative drift and nothing to
+    /// confine. `x` is 0..639, `y` is 0..199; both clamp to the active range.
+    /// Buttons use the same bit layout as `inject_mouse` (bit0 left, bit1 right,
+    /// bit2 middle). The BIOS setup/boot menus read this through INT 33h AX=0003h.
+    pub fn set_mouse_absolute(&mut self, x: i32, y: i32, buttons: u8) {
+        self.mouse.x = x.clamp(self.mouse.min_x, self.mouse.max_x);
+        self.mouse.y = y.clamp(self.mouse.min_y, self.mouse.max_y);
+        self.mouse.buttons = buttons;
+    }
+
     #[cfg(test)]
     fn read_io_port_u8(&mut self, port: u16) -> u8 {
         let mut bus = self.make_bus();
