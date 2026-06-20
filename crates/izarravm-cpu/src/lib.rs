@@ -527,6 +527,17 @@ impl Cpu386 {
         }
     }
 
+    /// True when CS points into the BIOS ROM: the real-mode F-segment aperture
+    /// (0xF0000..0xFFFFF, which also covers the FF00:0000 IRET stub) or its high
+    /// reset alias. The instruction-set gate skips ROM code so firmware always runs
+    /// the full ISA. After the guest picks a lower GSW mode through the boot menu,
+    /// the BIOS still finishes Accept, services interrupts, and boots unrestricted;
+    /// only guest code, which never executes from the ROM, is held to the level.
+    fn cs_in_firmware_rom(&self) -> bool {
+        let base = self.registers.cs().base;
+        (0x000F_0000..=0x000F_FFFF).contains(&base) || base >= 0xFFFF_0000
+    }
+
     pub fn linear_eip(&self) -> u32 {
         self.registers.cs().base.wrapping_add(self.registers.eip)
     }
@@ -1707,9 +1718,10 @@ impl Cpu386 {
         // SETcc, the 0F-form IMUL and Jcc, MOV to/from CR, and the 486 additions
         // (INVD/WBINVD, CMPXCHG, XADD, BSWAP). The 286-era 0F opcodes the core
         // supports (0F 01 LGDT/LIDT) stay allowed. CPUID is gated separately below
-        // because it is absent on both the 286 and the 386. POST runs at I586, so
-        // none of this fires for firmware.
-        if self.level.is_pre_386() && is_386plus_two_byte(opcode) {
+        // because it is absent on both the 286 and the 386. Code fetched from the
+        // BIOS ROM is exempt (see cs_in_firmware_rom), so the gate only ever holds
+        // guest code that selected a lower GSW mode.
+        if self.level.is_pre_386() && !self.cs_in_firmware_rom() && is_386plus_two_byte(opcode) {
             return Err(InternalFault::Exception {
                 vector: 6,
                 error_code: None,
@@ -2067,8 +2079,8 @@ impl Cpu386 {
                 // CPUID arrived on the late 486 and is standard on the 586. At the 286 and
                 // 386 guest levels it does not exist, so raise #UD. (The 286-level gate above
                 // already blocks it; this also covers the 386 level, which keeps the rest of
-                // the 0F group but still has no CPUID.)
-                if !self.level.has_cpuid() {
+                // the 0F group but still has no CPUID.) Firmware in the BIOS ROM is exempt.
+                if !self.level.has_cpuid() && !self.cs_in_firmware_rom() {
                     return Err(InternalFault::Exception {
                         vector: 6,
                         error_code: None,
@@ -2229,9 +2241,9 @@ impl Cpu386 {
                 // additions: the 286 has no 32-bit operand or address form and
                 // decodes neither byte as a prefix. At the 286 guest level the core
                 // raises #UD for them, which faithfully blocks every 32-bit
-                // operation reached through a prefix. Firmware POST runs at the full
-                // ISA level (I586), so this never fires there.
-                0x66 | 0x67 if self.level.is_pre_386() => {
+                // operation reached through a prefix. Code fetched from the BIOS ROM
+                // is exempt (see cs_in_firmware_rom), so firmware is never blocked.
+                0x66 | 0x67 if self.level.is_pre_386() && !self.cs_in_firmware_rom() => {
                     return Err(InternalFault::Exception {
                         vector: 6,
                         error_code: None,
@@ -9008,6 +9020,35 @@ mod tests {
             "MOVZX must execute at I386"
         );
         assert!(run_at_level(&code, CpuLevel::I586).is_ok());
+    }
+
+    #[test]
+    fn firmware_rom_cs_is_exempt_from_the_286_gate() {
+        // MOVZX AX, BL is a 386 op: guest code at the 286 level #UDs on it, but the
+        // BIOS ROM must keep running the full ISA so a lowered GSW mode never faults
+        // firmware (Accept, interrupt service, boot). CS in the F-segment ROM
+        // aperture (base 0xF0000) is the exemption.
+        let code = [0x0f, 0xb6, 0xc3];
+        assert!(
+            matches!(
+                run_at_level(&code, CpuLevel::I286).unwrap_err(),
+                InternalFault::Exception { vector: 6, .. }
+            ),
+            "guest MOVZX must still #UD at I286"
+        );
+        let mut memory = vec![0u8; 0x10_0000];
+        let base = 0x000F_0000usize;
+        memory[base..base + code.len()].copy_from_slice(&code);
+        let mut cpu = Cpu386::default();
+        cpu.set_level(CpuLevel::I286);
+        cpu.load_segment_real(SegmentIndex::Cs, 0xF000);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(memory);
+        assert!(
+            cpu.execute_instruction(&mut bus).is_ok(),
+            "MOVZX fetched from BIOS ROM must run even at I286"
+        );
     }
 
     #[test]
