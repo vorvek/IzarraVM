@@ -21,11 +21,39 @@ bios_start:
     xor ax, ax
     mov ds, ax                  ; DS = 0 for the IVT and the result block
 
-    ; Install IVT[09h] -> int09, IVT[16h] -> int16 (CS = ROM_SEG).
+    ; Install the interrupt vectors (CS = ROM_SEG for every entry):
+    ;   INT 08h -> int08   timer tick (IRQ0), maintains the BDA tick count
+    ;   INT 09h -> int09   keyboard ISR (IRQ1)
+    ;   INT 16h -> int16   keyboard services
+    ;   INT 1Ch -> int1c   user timer-tick hook, a bare IRET by default
+    ; Then point every remaining hardware-IRQ slot at a stub that just sends EOI
+    ; and returns. The RAM count-up and the chime drive PIT channel 0 to pace on,
+    ; so IRQ0 fires during POST; without these handlers a hardware interrupt would
+    ; vector through a zeroed IVT entry (CS=0000) and run away through low memory.
+    mov word [0x08 * 4], int08
+    mov word [0x08 * 4 + 2], ROM_SEG
     mov word [0x09 * 4], int09
     mov word [0x09 * 4 + 2], ROM_SEG
     mov word [0x16 * 4], int16
     mov word [0x16 * 4 + 2], ROM_SEG
+    mov word [0x1c * 4], int1c
+    mov word [0x1c * 4 + 2], ROM_SEG
+    ; Master IRQ2..7 -> INT 0Ah..0Fh: spurious stub that EOIs the master PIC.
+    mov cx, 6
+    mov di, 0x0a * 4
+.fill_master:
+    mov word [di], irq_stub_master
+    mov word [di + 2], ROM_SEG
+    add di, 4
+    loop .fill_master
+    ; Slave IRQ8..15 -> INT 70h..77h: spurious stub that EOIs both PICs.
+    mov cx, 8
+    mov di, 0x70 * 4
+.fill_slave:
+    mov word [di], irq_stub_slave
+    mov word [di + 2], ROM_SEG
+    add di, 4
+    loop .fill_slave
 
     ; 8259 PIC init (verbatim from kbd-bios): IRQ0..7 -> INT 08h..0Fh.
     mov al, 0x11
@@ -42,9 +70,10 @@ bios_start:
     mov al, 0x01
     out PORT_PIC_DATA, al
     out PORT_PIC2_DATA, al
-    ; Unmask IRQ1 (keyboard); leave IRQ0 (timer) masked - no INT 08h handler yet.
+    ; Unmask IRQ0 (timer) and IRQ1 (keyboard) on the master; the timer ISR is now
+    ; installed, so the IRQ0 edges raised while pacing the count-up land on int08.
     in al, PORT_PIC_DATA
-    and al, 0xfd
+    and al, 0xfc
     out PORT_PIC_DATA, al
 
     call unreal_init            ; widen FS to 4 GB for peek32/poke32/read_margo_reg
@@ -53,6 +82,60 @@ bios_start:
     call run_post              ; walk the POST step table, append each record
     call setup_maybe_enter     ; STREAM D setup-page hook (foundation stub: ret)
     jmp enter_setup_or_boot
+
+; --- Hardware-interrupt service routines ------------------------------------
+; INT 08h: IRQ0 timer tick. Increment the BDA tick count (a dword at 0040:006C),
+; rolling over after 24 hours (0x1800B0 ticks ~= 18.2 Hz * 86400 s) and setting
+; the rollover flag at 0040:0070, then chain INT 1Ch (the user tick hook) and
+; send a non-specific EOI to the master PIC. The standard PC timer-tick contract,
+; here mainly so the count-up and chime can pace on PIT channel 0 without the IRQ
+; vectoring through a null IVT entry; DOS and games rely on this tick later too.
+int08:
+    push ax
+    push ds
+    mov ax, BDA_SEG
+    mov ds, ax
+    add word [BDA_TICKS], 1
+    adc word [BDA_TICKS + 2], 0
+    ; Rollover at 1,573,040 ticks (one day): zero the count and flag the wrap.
+    cmp word [BDA_TICKS + 2], (BDA_TICK_ROLLOVER >> 16)
+    jb .no_rollover
+    cmp word [BDA_TICKS], (BDA_TICK_ROLLOVER & 0xffff)
+    jb .no_rollover
+    mov word [BDA_TICKS], 0
+    mov word [BDA_TICKS + 2], 0
+    mov byte [BDA_TICK_FLAG], 1
+.no_rollover:
+    int 0x1c                     ; user timer-tick hook (default: a bare IRET)
+    mov al, 0x20
+    out PORT_PIC_CMD, al         ; non-specific EOI to the master PIC
+    pop ds
+    pop ax
+    iret
+
+; INT 1Ch: the user timer-tick hook. The BIOS default is a bare IRET; software
+; that wants a per-tick callback repoints this vector.
+int1c:
+    iret
+
+; irq_stub_master: spurious master-PIC interrupt (IRQ2..7 with no installed
+; handler). Send the master EOI so the line does not stay in service, then IRET.
+irq_stub_master:
+    push ax
+    mov al, 0x20
+    out PORT_PIC_CMD, al
+    pop ax
+    iret
+
+; irq_stub_slave: spurious slave-PIC interrupt (IRQ8..15). EOI both the slave and
+; the master (the cascade owes a master EOI on IR2), then IRET.
+irq_stub_slave:
+    push ax
+    mov al, 0x20
+    out PORT_PIC2_CMD, al        ; EOI the slave first
+    out PORT_PIC_CMD, al         ; then the master cascade line (IR2)
+    pop ax
+    iret
 
 ; --- POST sequencer ---------------------------------------------------------
 ; Walk post_step_table (emitted last by izbios-tables.inc). Each entry is

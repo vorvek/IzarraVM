@@ -14,6 +14,13 @@
 %define KB_BUF_TAIL    0x001c
 %define KB_FLAGS       0x0017
 
+; BDA timer tick (offsets into BDA_SEG), maintained by the INT 08h handler.
+; The standard PC layout: a dword count at 0x6C and a one-byte 24-hour rollover
+; flag at 0x70. The count wraps at 0x1800B0 (18.2 Hz times 86400 s, one day).
+%define BDA_TICKS          0x006c
+%define BDA_TICK_FLAG      0x0070
+%define BDA_TICK_ROLLOVER  0x001800b0
+
 ; Unreal-mode flat data selector (GDT index 1) for ramtest_peek32/poke32 and
 ; read_margo_reg. FS is loaded with this once at bring-up and never reloaded.
 %define UNREAL_SEL     0x08

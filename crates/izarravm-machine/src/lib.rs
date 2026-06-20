@@ -2476,6 +2476,35 @@ mod tests {
     use izarravm_core::{SbDma8, SbDma16, SbIrq};
     use izarravm_firmware::I386DX25_TEST_ROM;
 
+    #[test]
+    fn slow_post_paces_without_null_vector_runaway() {
+        // Under slow POST the BIOS drives PIT channel 0 to pace the chime and the
+        // RAM count-up. Those OUT edges raise IRQ0 with IF set; before INT 08h was
+        // installed the timer vectored through the zeroed IVT[08h] (CS=0000) and ran
+        // away through low memory. Run a slice that covers the chime and the start of
+        // the count-up, then confirm the CPU never left the BIOS region and the INT
+        // 08h handler advanced the BDA tick count.
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .unwrap();
+        machine.set_fast_post(false);
+        let mut max_ticks = 0u32;
+        for _ in 0..400 {
+            let _ = machine.run_until_halt_or_cycles(50_000).unwrap();
+            let cs = machine.cpu().registers.cs().selector;
+            assert_ne!(cs, 0, "CPU vectored to CS=0000 (null IVT runaway)");
+            let lo = u32::from(machine.read_physical_u8(0x46c));
+            let hi = u32::from(machine.read_physical_u8(0x46d));
+            max_ticks = max_ticks.max(lo | (hi << 8));
+        }
+        assert!(
+            max_ticks > 3,
+            "INT 08h did not advance the BDA tick (got {max_ticks})"
+        );
+    }
+
     fn test_machine() -> Machine {
         Machine::new(
             MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
