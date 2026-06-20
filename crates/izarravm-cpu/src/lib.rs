@@ -44,12 +44,14 @@ const CR0_CD: u32 = 0x4000_0000; // bit 30
 // identity is changed in one place.
 //
 // Leaf 0 returns the maximum basic leaf in EAX and the 12-byte vendor string
-// "IzarraGSW586" split across EBX, EDX, ECX in that standard order. Each register holds
-// four string bytes little-endian, so EBX's low byte is 'I', and so on.
+// "Genuine GSW " split across EBX, EDX, ECX in that standard order (each register holds
+// four string bytes little-endian, so EBX's low byte is 'G', and so on). The full
+// processor name "Genuine GSW-80586" does not fit the 12-byte vendor field, so it lives
+// in the brand string returned by the extended leaves below.
 const CPUID_MAX_BASIC_LEAF: u32 = 1;
-const CPUID_VENDOR_EBX: u32 = u32::from_le_bytes(*b"Izar");
-const CPUID_VENDOR_EDX: u32 = u32::from_le_bytes(*b"raGS");
-const CPUID_VENDOR_ECX: u32 = u32::from_le_bytes(*b"W586");
+const CPUID_VENDOR_EBX: u32 = u32::from_le_bytes(*b"Genu");
+const CPUID_VENDOR_EDX: u32 = u32::from_le_bytes(*b"ine ");
+const CPUID_VENDOR_ECX: u32 = u32::from_le_bytes(*b"GSW ");
 
 // Leaf 1 EAX packs type (bits 13-12), family (bits 11-8), model (bits 7-4) and stepping
 // (bits 3-0). Family 5 marks the 586/K6 class; the model and stepping are chosen values.
@@ -71,6 +73,18 @@ const CPUID_FEATURES_EDX: u32 = CPUID_FEATURE_MMX;
 const CPUID_LEAF1_EBX: u32 = 0;
 // Leaf 1 ECX: no extended feature is claimed.
 const CPUID_LEAF1_ECX: u32 = 0;
+
+// Extended leaves expose the brand string "Genuine GSW-80586", the full human-readable
+// processor name. Leaf 0x80000000 reports the maximum extended leaf; leaves 0x80000002
+// through 0x80000004 return the 48-byte null-padded brand string, 16 bytes per leaf in
+// EAX, EBX, ECX, EDX order. The original K6 lacked the brand-string leaves, so exposing
+// them is a fantasy extension that lets the GSW-586 name itself in full.
+const CPUID_MAX_EXT_LEAF: u32 = 0x8000_0004;
+const CPUID_BRAND_EAX_0: u32 = u32::from_le_bytes(*b"Genu");
+const CPUID_BRAND_EBX_0: u32 = u32::from_le_bytes(*b"ine ");
+const CPUID_BRAND_ECX_0: u32 = u32::from_le_bytes(*b"GSW-");
+const CPUID_BRAND_EDX_0: u32 = u32::from_le_bytes(*b"8058");
+const CPUID_BRAND_EAX_1: u32 = u32::from_le_bytes([b'6', 0, 0, 0]);
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum CpuError {
@@ -1961,7 +1975,8 @@ impl Cpu386 {
             0xa2 => {
                 // CPUID (0F A2). Not privileged: it runs at any CPL. The leaf selector is in
                 // EAX. The result registers are EAX, EBX, ECX, EDX (full 32-bit writes). We
-                // model only basic leaves 0 and 1; any other leaf returns all zeros, which is
+                // model basic leaves 0 and 1 plus the extended leaves 0x80000000 and
+                // 0x80000002..0x80000004 (the brand string); any other leaf returns all zeros,
                 // the architectural reply for an unimplemented leaf at or below the maximum.
                 let leaf = self.registers.eax();
                 let (eax, ebx, ecx, edx) = match leaf {
@@ -1977,6 +1992,15 @@ impl Cpu386 {
                         CPUID_LEAF1_ECX,
                         CPUID_FEATURES_EDX,
                     ),
+                    0x8000_0000 => (CPUID_MAX_EXT_LEAF, 0, 0, 0),
+                    0x8000_0002 => (
+                        CPUID_BRAND_EAX_0,
+                        CPUID_BRAND_EBX_0,
+                        CPUID_BRAND_ECX_0,
+                        CPUID_BRAND_EDX_0,
+                    ),
+                    0x8000_0003 => (CPUID_BRAND_EAX_1, 0, 0, 0),
+                    0x8000_0004 => (0, 0, 0, 0),
                     _ => (0, 0, 0, 0),
                 };
                 self.write_gpr32(0, eax); // EAX
@@ -8718,17 +8742,17 @@ mod tests {
         let cpu = run_cpuid(0);
         // Max basic leaf is 1.
         assert_eq!(cpu.registers.eax(), 1);
-        // Vendor string "IzarraGSW586" in the standard EBX, EDX, ECX order, four bytes
+        // Vendor string "Genuine GSW " in the standard EBX, EDX, ECX order, four bytes
         // little-endian per register.
-        assert_eq!(cpu.registers.ebx().to_le_bytes(), *b"Izar");
-        assert_eq!(cpu.registers.edx().to_le_bytes(), *b"raGS");
-        assert_eq!(cpu.registers.ecx().to_le_bytes(), *b"W586");
+        assert_eq!(cpu.registers.ebx().to_le_bytes(), *b"Genu");
+        assert_eq!(cpu.registers.edx().to_le_bytes(), *b"ine ");
+        assert_eq!(cpu.registers.ecx().to_le_bytes(), *b"GSW ");
         // Concatenating EBX:EDX:ECX yields the full 12-byte vendor string.
         let mut vendor = [0u8; 12];
         vendor[0..4].copy_from_slice(&cpu.registers.ebx().to_le_bytes());
         vendor[4..8].copy_from_slice(&cpu.registers.edx().to_le_bytes());
         vendor[8..12].copy_from_slice(&cpu.registers.ecx().to_le_bytes());
-        assert_eq!(&vendor, b"IzarraGSW586");
+        assert_eq!(&vendor, b"Genuine GSW ");
     }
 
     #[test]
@@ -8758,6 +8782,29 @@ mod tests {
     }
 
     #[test]
+    fn cpuid_brand_string_reports_genuine_gsw_80586() {
+        // Leaf 0x80000000 reports the maximum extended leaf, and 0x80000002..0x80000004
+        // return the 48-byte null-padded brand string, 16 bytes per leaf in EAX, EBX, ECX,
+        // EDX order. Concatenated, they spell the full processor name "Genuine GSW-80586".
+        assert_eq!(run_cpuid(0x8000_0000).registers.eax(), 0x8000_0004);
+        let mut brand = [0u8; 48];
+        for (i, leaf) in [0x8000_0002u32, 0x8000_0003, 0x8000_0004]
+            .iter()
+            .enumerate()
+        {
+            let cpu = run_cpuid(*leaf);
+            let base = i * 16;
+            brand[base..base + 4].copy_from_slice(&cpu.registers.eax().to_le_bytes());
+            brand[base + 4..base + 8].copy_from_slice(&cpu.registers.ebx().to_le_bytes());
+            brand[base + 8..base + 12].copy_from_slice(&cpu.registers.ecx().to_le_bytes());
+            brand[base + 12..base + 16].copy_from_slice(&cpu.registers.edx().to_le_bytes());
+        }
+        let mut expected = [0u8; 48];
+        expected[..17].copy_from_slice(b"Genuine GSW-80586");
+        assert_eq!(brand, expected);
+    }
+
+    #[test]
     fn cpuid_is_not_privileged_at_cpl3() {
         // CPUID runs at any privilege level. In protected mode at CPL 3 it must execute,
         // not fault, and still report the GSW-586 identity.
@@ -8779,7 +8826,7 @@ mod tests {
 
         assert!(cpu.execute_instruction(&mut bus).is_ok());
         assert_eq!(cpu.registers.eax(), 1);
-        assert_eq!(cpu.registers.ebx().to_le_bytes(), *b"Izar");
+        assert_eq!(cpu.registers.ebx().to_le_bytes(), *b"Genu");
     }
 
     #[test]
@@ -8815,6 +8862,6 @@ mod tests {
         // Detection concluded CPUID is present; execute it and confirm the GSW-586 vendor.
         cpu.cycle(&mut bus).unwrap(); // cpuid
         assert_eq!(cpu.registers.eax(), 1);
-        assert_eq!(cpu.registers.ebx().to_le_bytes(), *b"Izar");
+        assert_eq!(cpu.registers.ebx().to_le_bytes(), *b"Genu");
     }
 }
