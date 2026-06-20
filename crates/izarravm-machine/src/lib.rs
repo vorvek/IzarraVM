@@ -6139,6 +6139,29 @@ mod tests {
     }
 
     #[test]
+    fn izarra_bios_int19_boots_floppy_sector_zero() {
+        // INT 19h must load sector 0 of the mounted floppy to 0000:7C00 and far
+        // jump there with no signature check. The boot sector writes a sentinel
+        // and halts; if the sentinel lands, the bootstrap loaded and jumped.
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
+
+        let mut img = vec![0u8; 737_280];
+        // Boot sector at 0000:7C00: mov bx,0x0500; mov al,0x99; mov [bx],al; hlt.
+        // boot_entry enters with DS=0, so [bx] addresses 0000:0500.
+        let boot = [0xBB, 0x00, 0x05, 0xB0, 0x99, 0x88, 0x07, 0xF4];
+        img[..boot.len()].copy_from_slice(&boot);
+        machine.mount_floppy(img).unwrap();
+
+        machine.run_until_halt_or_cycles(50_000_000).unwrap();
+        assert_eq!(
+            machine.read_physical_u8(0x0500),
+            0x99,
+            "the boot sector ran from 0000:7C00, so INT 19h loaded and jumped"
+        );
+    }
+
+    #[test]
     fn izarra_bios_isr_enqueues_injected_key() {
         let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();

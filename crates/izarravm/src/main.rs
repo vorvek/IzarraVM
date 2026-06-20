@@ -53,6 +53,8 @@ struct Cli {
     #[arg(long)]
     headless_izarra_bios: bool,
     #[arg(long)]
+    headless_boot_floppy: Option<PathBuf>,
+    #[arg(long)]
     headless_run: Option<PathBuf>,
     #[arg(long)]
     stdin_text: Option<String>,
@@ -132,6 +134,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     if cli.headless_izarra_bios {
         return run_izarra_bios(&hardware);
+    }
+
+    if let Some(path) = &cli.headless_boot_floppy {
+        return run_boot_floppy(path, &hardware);
     }
 
     let rom = match cli.bios.as_deref() {
@@ -293,6 +299,48 @@ fn run_izarra_bios(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
     println!("records: {}", results.records.len());
     println!("declared: {}", results.declared_record_count);
     println!("stop: {stop_reason:?}");
+    Ok(())
+}
+
+/// Mount a floppy IMG, run the Izarra BIOS so INT 19h bootstraps it, and print
+/// CS:IP plus a short trace of low memory. A human reads the trace to confirm the
+/// boot sector executed: CS:IP leaving the BIOS region (CS far below 0xF000) and
+/// the boot sector bytes sitting at 0000:7C00 mean INT 19h loaded and jumped.
+fn run_boot_floppy(path: &Path, hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
+    let image = std::fs::read(path)?;
+    let image_len = image.len();
+    let mut machine = Machine::new(
+        MachineProfile::from_hardware_profile(hardware),
+        izarravm_firmware::izarra_bios(),
+    )?;
+    machine.mount_floppy(image).map_err(|message| {
+        format!(
+            "cannot mount {} ({image_len} bytes): {message}",
+            path.display()
+        )
+    })?;
+    // The bootstrap runs after POST, which is wall-time bound, so give it a budget
+    // well past POST plus the boot sector's own early work.
+    let stop_reason = machine.run_until_halt_or_cycles(50_000_000)?;
+
+    let cs = machine.cpu().registers.cs().selector;
+    let ip = machine.cpu().registers.eip as u16;
+    println!("image: {} ({image_len} bytes)", path.display());
+    println!("stop: {stop_reason:?}");
+    println!("CS:IP = {cs:04X}:{ip:04X}");
+    // The first bytes of the loaded boot sector and where the CPU landed. A boot
+    // sector that ran leaves CS below the BIOS region (0xF000).
+    let mut at_7c00 = [0u8; 16];
+    for (offset, byte) in at_7c00.iter_mut().enumerate() {
+        *byte = machine.read_physical_u8(0x7c00 + offset as u32);
+    }
+    let hex: Vec<String> = at_7c00.iter().map(|byte| format!("{byte:02X}")).collect();
+    println!("0000:7C00 = {}", hex.join(" "));
+    if cs < 0xf000 {
+        println!("boot: boot sector is executing outside the BIOS region");
+    } else {
+        println!("boot: still in the BIOS (no boot, or read error)");
+    }
     Ok(())
 }
 

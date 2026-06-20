@@ -28,6 +28,7 @@ reset:                          ; ROM offset 0; the reset vector far-jumps here
 %include "probes/probe-opl.inc"      ; STREAM C
 %include "probes/probe-margo.inc"    ; STREAM C
 %include "setup-ui.inc"              ; STREAM D
+%include "izbios-boot.inc"           ; STREAM E: INT 19h bootstrap (boot_entry)
 %include "izbios-tables.inc"    ; foundation: MUST be last (emits the step table)
 
 ; Reset vector at 0xFFFF0 (file offset 0xFFF0 in a 64 KiB ROM). The exact-64K

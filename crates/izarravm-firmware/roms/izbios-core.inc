@@ -100,11 +100,13 @@ enter_setup_or_boot:
     mov bl, COLOR_TITLE
     mov bh, COLOR_BG
     call gfx_text
-    ; POST is complete and there is no OS to boot yet, so keep the machine running
-    ; in an idle loop rather than halting. Halting would read as the self test
-    ; powering the computer off; the machine should stay on and ready. Interrupts
-    ; stay enabled so the keyboard path keeps working.
+    ; POST is complete: hand off to the INT 19h bootstrap. If a bootable floppy is
+    ; mounted, boot_entry far jumps into its boot sector and never returns. With no
+    ; media (or a read error) it returns here and the machine idles rather than
+    ; halting, so the self test does not read as powering the computer off.
+    ; Interrupts stay enabled so the keyboard path keeps working.
     sti
+    call boot_entry
 .idle:
     jmp .idle
 str_ready: db 'SYSTEM READY', 0
