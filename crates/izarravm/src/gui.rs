@@ -624,12 +624,11 @@ pub struct GuiApp {
     // path scales host pointer motion across it into guest pixels. None until the
     // monitor has been drawn at least once.
     screen_rect: Option<egui::Rect>,
-    // Last pointer position seen while captured, reused for a button-only frame
-    // (a click in place). Reset to None on capture enter and leave.
-    last_pointer: Option<egui::Pos2>,
-    // Last absolute guest cursor cell (0..639 x 0..199) sent to the VM, so an
-    // unchanged position is not re-sent every frame. Reset on capture enter/leave.
-    last_abs: Option<(i32, i32)>,
+    // Accumulated guest cursor position (0..639 x 0..199) while captured: raw
+    // relative motion from the locked cursor adds into it, clamped to the screen.
+    // Reset to the centre on capture enter.
+    abs_x: f32,
+    abs_y: f32,
     // The cpal stream is !Send, so it stays here on the UI thread; the
     // emulation thread gets a Send sink cloned from it.
     audio: Option<AudioPlayer>,
@@ -722,8 +721,8 @@ impl GuiApp {
             input_captured: false,
             last_buttons: 0,
             screen_rect: None,
-            last_pointer: None,
-            last_abs: None,
+            abs_x: 0.0,
+            abs_y: 0.0,
             audio,
             emu: None,
             texture: None,
@@ -876,24 +875,23 @@ impl GuiApp {
         }
     }
 
-    /// Enter or leave input capture. While captured we hide the OS cursor and
-    /// route keyboard and pointer to the guest (which draws its own cursor);
-    /// Ctrl+F2 releases. We deliberately do NOT confine/grab the cursor: on
-    /// Windows a confined cursor pins at the window edge and stops emitting
-    /// PointerMoved, which kills the relative-motion path (observed as moves=0).
-    /// Leaving it ungrabbed keeps motion reliable.
+    /// Enter or leave input capture. While captured we lock and hide the OS cursor
+    /// (winit Locked: pinned in place, cannot move on screen or leave the window)
+    /// and route keyboard and mouse to the guest, which draws its own cursor.
+    /// Ctrl+F2 releases. Locked delivers motion as raw relative deltas, which we
+    /// accumulate into the guest cursor position (clamped to the screen), so there
+    /// is nothing for the OS cursor to escape and no warp to fight.
     fn set_capture(&mut self, ctx: &egui::Context, capture: bool) {
         if self.input_captured == capture {
             return;
         }
         self.input_captured = capture;
         self.last_buttons = 0;
-        // Drop the tracked pointer/position so a stale value is not reused after a
-        // capture or release.
-        self.last_pointer = None;
-        self.last_abs = None;
         if capture {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::None));
+            // Start the guest cursor centred; raw motion accumulates from there.
+            self.abs_x = MOUSE_GUEST_MAX_X as f32 / 2.0;
+            self.abs_y = MOUSE_GUEST_MAX_Y as f32 / 2.0;
+            ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::Locked));
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
         } else {
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::None));
@@ -934,12 +932,13 @@ impl GuiApp {
             return;
         }
 
-        // Collect Set 1 scancodes, the latest pointer position, and the button
-        // mask, then strip every keyboard and pointer event so egui never acts on
-        // them (TAB never moves sidebar focus; the sidebar stays pointer-inert).
+        // Collect Set 1 scancodes, raw relative mouse motion, and the button mask,
+        // then strip every keyboard and pointer event so egui never acts on them
+        // (TAB never moves sidebar focus; the sidebar stays pointer-inert).
         let mut codes: Vec<u8> = Vec::new();
         let mut buttons = self.last_buttons;
-        let mut latest_pos: Option<egui::Pos2> = None;
+        let mut moved = false;
+        let ppp = ctx.pixels_per_point().max(0.01);
         for event in &raw_input.events {
             match event {
                 egui::Event::Key { key, pressed, .. } => {
@@ -947,12 +946,24 @@ impl GuiApp {
                         codes.push(if *pressed { make } else { make | 0x80 });
                     }
                 }
-                egui::Event::PointerMoved(pos) => latest_pos = Some(*pos),
+                // Raw relative motion from the locked, hidden cursor (winit
+                // DeviceEvent::MouseMotion, surfaced as MouseMoved). The cursor is
+                // pinned and cannot leave, so we accumulate the deltas into the guest
+                // position ourselves, scaled so a full sweep across the video-output
+                // rect covers the full guest range, and clamped to the screen.
+                egui::Event::MouseMoved(delta) => {
+                    if let Some(rect) = self.screen_rect {
+                        let sx = MOUSE_GUEST_MAX_X as f32 / (rect.width() * ppp).max(1.0);
+                        let sy = MOUSE_GUEST_MAX_Y as f32 / (rect.height() * ppp).max(1.0);
+                        self.abs_x =
+                            (self.abs_x + delta.x * sx).clamp(0.0, MOUSE_GUEST_MAX_X as f32);
+                        self.abs_y =
+                            (self.abs_y + delta.y * sy).clamp(0.0, MOUSE_GUEST_MAX_Y as f32);
+                        moved = true;
+                    }
+                }
                 egui::Event::PointerButton {
-                    button,
-                    pressed,
-                    pos,
-                    ..
+                    button, pressed, ..
                 } => {
                     let bit = match button {
                         egui::PointerButton::Primary => 0x01,
@@ -965,7 +976,6 @@ impl GuiApp {
                     } else {
                         buttons &= !bit;
                     }
-                    latest_pos = Some(*pos);
                 }
                 _ => {}
             }
@@ -978,40 +988,16 @@ impl GuiApp {
             }
         }
 
-        // Absolute-pointer mode: map the host pointer's position over the
-        // framebuffer rect straight to the guest cursor (0..639 x 0..199), clamped
-        // to the screen. No relative motion and no cursor grab or warp, so the OS
-        // pointer roams freely (even onto another monitor) without breaking
-        // anything: the guest cursor pins to the nearest edge and resumes the
-        // instant the pointer returns. The BIOS menus read this via INT 33h. A
-        // button change with no move this frame reuses the last position.
-        let pos = latest_pos.or(self.last_pointer);
-        if let (Some(pos), Some(rect)) = (pos, self.screen_rect) {
-            let fx = ((pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
-            let fy = ((pos.y - rect.top()) / rect.height().max(1.0)).clamp(0.0, 1.0);
-            let gx = (fx * MOUSE_GUEST_MAX_X as f32).round() as i32;
-            let gy = (fy * MOUSE_GUEST_MAX_Y as f32).round() as i32;
-            self.last_pointer = Some(pos);
-            if Some((gx, gy)) != self.last_abs || buttons != self.last_buttons {
-                self.last_abs = Some((gx, gy));
-                self.last_buttons = buttons;
-                if let Some(emu) = &self.emu {
-                    emu.send_mouse_absolute(gx, gy, buttons);
-                }
-            }
-            // Confine the OS pointer to the video-output rect: if it strays outside
-            // (toward the sidebar or another monitor), warp it back to the nearest
-            // edge. We cannot use CursorGrab::Confined here, since on Windows a
-            // confined+hidden cursor stops emitting PointerMoved and tracking dies;
-            // ungrabbed keeps tracking reliable. The guest cursor already tracks the
-            // clamped position, so even a dropped warp (egui flags CursorPosition as
-            // unreliable) leaves the on-screen arrow correct.
-            if !rect.contains(pos) {
-                let back = egui::pos2(
-                    pos.x.clamp(rect.left(), rect.right()),
-                    pos.y.clamp(rect.top(), rect.bottom()),
-                );
-                ctx.send_viewport_cmd(egui::ViewportCommand::CursorPosition(back));
+        // Send the accumulated absolute guest position when it or the buttons
+        // changed. The cursor is locked (pinned and hidden) so there is nothing to
+        // confine or warp: the guest cursor is purely the accumulated motion clamped
+        // to the screen, and the BIOS menus read it via INT 33h.
+        if moved || buttons != self.last_buttons {
+            self.last_buttons = buttons;
+            let gx = self.abs_x.round() as i32;
+            let gy = self.abs_y.round() as i32;
+            if let Some(emu) = &self.emu {
+                emu.send_mouse_absolute(gx, gy, buttons);
             }
         }
     }
@@ -1512,6 +1498,7 @@ fn is_captured_input_event(event: &egui::Event) -> bool {
         egui::Event::Key { .. }
             | egui::Event::Text(_)
             | egui::Event::PointerMoved(_)
+            | egui::Event::MouseMoved(_)
             | egui::Event::PointerButton { .. }
             | egui::Event::MouseWheel { .. }
             | egui::Event::Zoom(_)
