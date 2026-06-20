@@ -19,7 +19,7 @@
 
 use izarravm_core::VideoCard;
 use izarravm_firmware::izarra_bios;
-use izarravm_machine::{Machine, MachineProfile};
+use izarravm_machine::{Machine, MachineProfile, build_fat12};
 use izarravm_video::VideoMode;
 
 // Set 1 make/break codes used by the boot menu.
@@ -88,6 +88,140 @@ fn tab_then_enter_boots_the_floppy() {
         machine.video().active_mode(),
         VideoMode::Cga,
         "the Wizardry booter ran and switched to CGA"
+    );
+}
+
+// FAT12 layout constants for a 1.44 MB image, matching the synthesizer. Used to
+// locate a file's first data sector so the boot stub can read it through INT 13h.
+const SECTOR: usize = 512;
+const RESERVED_SECTORS: usize = 1;
+const NUM_FATS: usize = 2;
+const SECTORS_PER_FAT: usize = 9;
+const ROOT_ENTRIES: usize = 224;
+const DIR_ENTRY_SIZE: usize = 32;
+const ROOT_DIR_SECTORS: usize = (ROOT_ENTRIES * DIR_ENTRY_SIZE) / SECTOR; // 14
+const FIRST_DATA_SECTOR: usize = RESERVED_SECTORS + NUM_FATS * SECTORS_PER_FAT + ROOT_DIR_SECTORS; // 33
+// 1.44 MB media geometry: 80 cylinders, 2 heads, 18 sectors per track.
+const SPT: usize = 18;
+const HEADS: usize = 2;
+
+fn temp_dir(tag: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!(
+        "izarra_e_fat12_{tag}_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+/// Find a root-directory entry by its 11-byte 8.3 name, returning its first
+/// cluster. Mirrors the on-disk layout the synthesizer produces.
+fn root_first_cluster(img: &[u8], name11: &[u8; 11]) -> Option<u16> {
+    let root_off = (RESERVED_SECTORS + NUM_FATS * SECTORS_PER_FAT) * SECTOR;
+    for i in 0..ROOT_ENTRIES {
+        let off = root_off + i * DIR_ENTRY_SIZE;
+        let e = &img[off..off + DIR_ENTRY_SIZE];
+        if e[0] == 0x00 {
+            break;
+        }
+        if &e[..11] == name11 {
+            return Some(u16::from_le_bytes([e[26], e[27]]));
+        }
+    }
+    None
+}
+
+/// 1-based-sector CHS for a linear block address on the 1.44 MB geometry.
+fn lba_to_chs(lba: usize) -> (u16, u8, u8) {
+    let cyl = lba / (HEADS * SPT);
+    let head = (lba / SPT) % HEADS;
+    let sector = lba % SPT + 1;
+    (cyl as u16, head as u8, sector as u8)
+}
+
+#[test]
+fn fat12_folder_boots_and_reads_a_known_file_through_int13() {
+    // End-to-end: synthesize a FAT12 image from a host folder, mount it as the A:
+    // floppy, and read a known file's first data sector back through the INT 13h
+    // path the BIOS bootstrap uses. The folder mount must produce an image whose
+    // boot sector is loadable (sector 0 reaches 0000:7C00 via INT 19h) and whose
+    // file data is reachable by CHS read.
+    let dir = temp_dir("readback");
+    let payload = b"IZARRA-FAT12-PAYLOAD";
+    std::fs::write(dir.join("HELLO.TXT"), payload).unwrap();
+    let mut img = build_fat12(&dir).unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(
+        img.len(),
+        1_474_560,
+        "the folder synthesized a 1.44 MB image"
+    );
+
+    // Locate HELLO.TXT's first data sector so the boot stub can read it.
+    let cluster = root_first_cluster(&img, b"HELLO   TXT").expect("HELLO.TXT in root");
+    let lba = FIRST_DATA_SECTOR + (usize::from(cluster) - 2);
+    let (cyl, head, sector) = lba_to_chs(lba);
+    assert!(
+        cyl < 256,
+        "the test file lands within the first 256 cylinders"
+    );
+
+    // Confirm the synthesizer put the payload where we will read it from. This is
+    // the same bytes the INT 13h read should deliver into guest memory.
+    let data_off = lba * SECTOR;
+    assert_eq!(
+        &img[data_off..data_off + payload.len()],
+        payload,
+        "the synthesized image holds the file at the computed data sector"
+    );
+
+    // Replace sector 0 with a boot stub. INT 19h loads it to 0000:7C00 and jumps
+    // with DS=0. The stub reads HELLO.TXT's data sector into 0000:0600 through
+    // INT 13h AH=02, then halts. If the payload lands, the folder mount and the
+    // INT 13h read path both work.
+    let boot: &[u8] = &[
+        0x31,
+        0xC0, // xor ax, ax
+        0x8E,
+        0xC0, // mov es, ax          ; ES = 0
+        0xBB,
+        0x00,
+        0x06, // mov bx, 0x0600       ; ES:BX = 0000:0600
+        0xB8,
+        0x01,
+        0x02, // mov ax, 0x0201       ; AH=02 read, AL=1 sector
+        // mov cx, (cyl<<8) | sector. CL bits 0-5 hold the sector, bits 6-7 the
+        // cylinder high bits; cyl < 256 here, so those stay clear and CH is the
+        // whole cylinder.
+        0xB9,
+        sector,
+        (cyl & 0xff) as u8,
+        // mov dx, (head<<8) | 0   ; DH=head, DL=0 (drive A:)
+        0xBA,
+        0x00,
+        head,
+        0xCD,
+        0x13, // int 13h
+        0xF4, // hlt
+    ];
+    img[..boot.len()].copy_from_slice(boot);
+
+    let mut machine = boot_machine();
+    machine.mount_floppy(img).expect("synthesized image mounts");
+    machine.run_until_halt_or_cycles(50_000_000).unwrap();
+
+    // The stub's INT 13h read placed the file's first data sector at 0000:0600.
+    let mut got = Vec::new();
+    for i in 0..payload.len() {
+        got.push(machine.read_physical_u8(0x0600 + i as u32));
+    }
+    assert_eq!(
+        &got, payload,
+        "INT 13h delivered HELLO.TXT's bytes from the FAT12 folder mount"
     );
 }
 

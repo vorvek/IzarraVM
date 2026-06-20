@@ -359,6 +359,14 @@ impl Machine {
         self.floppy.take().map(|f| f.bytes().to_vec())
     }
 
+    /// Whether the mounted A: floppy took a guest write this session. The host
+    /// flushes the image back to its source IMG only when this is true, so an
+    /// unwritten disk is ejected without rewriting the file. False when the drive
+    /// is empty.
+    pub fn floppy_dirty(&self) -> bool {
+        self.floppy.as_ref().is_some_and(|f| f.dirty)
+    }
+
     /// Seed the RTC clock from host-provided local time. `weekday` is 1..=7 with
     /// 1 = Sunday. Call this once at startup; the clock self-advances on the
     /// machine clock afterward.
