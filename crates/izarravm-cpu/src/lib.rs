@@ -27,8 +27,10 @@ const CR0_PG: u32 = 0x8000_0000;
 //               cosmetic.
 // The cosmetic constants document the bit layout in one place; they are not yet
 // read by the core, hence the allow on the trio that has no consumer.
+// AM is CR0 bit 18. CR0 bit 4 is ET (extension type), which we leave as 0 because no
+// x87 FPU is emulated, consistent with CPUID reporting the FPU feature off.
 const CR0_WP: u32 = 0x0001_0000; // bit 16
-const CR0_AM: u32 = 0x0000_0010; // bit 4
+const CR0_AM: u32 = 0x0004_0000; // bit 18
 #[allow(dead_code)]
 const CR0_NE: u32 = 0x0000_0020; // bit 5
 #[allow(dead_code)]
@@ -288,9 +290,10 @@ impl Registers {
     }
 }
 
-// Reset state is all zero: PE/PG clear (real mode, no paging) and AM clear. The
-// old 386 reset forced CR0 bit 4 on for the ET bit; this chip uses bit 4 as AM,
-// which powers up masked, so the default is a plain zero (derived).
+// Reset state is all zero: PE/PG clear (real mode, no paging) and AM clear. AM is
+// correctly CR0 bit 18, so it powers up masked at zero. Bit 4 is ET, which an old
+// 386 reset forced on; here it stays 0 since no x87 FPU is emulated, so the default
+// is a plain zero (derived).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ControlRegisters {
     pub cr0: u32,
@@ -1717,9 +1720,10 @@ impl Cpu386 {
                 }
                 let value = self.read_gpr32(modrm.rm);
                 match modrm.reg {
-                    // CR0 is fully read/write here. The 386 core used to force bit 4 on
-                    // (modeling the 386/486 ET bit); on this fantasy chip bit 4 is AM,
-                    // a read/write alignment-check mask, so nothing is forced.
+                    // CR0 is fully read/write here, so bit 18 (AM) round-trips. The 386
+                    // core used to force bit 4 on (the ET extension-type bit); here ET
+                    // stays whatever software writes, with no FPU modeled, so nothing is
+                    // forced.
                     0 => self.control.cr0 = value,
                     2 => self.control.cr2 = value,
                     3 => self.control.cr3 = value & 0xffff_f000,
@@ -8626,7 +8630,9 @@ mod tests {
     #[test]
     fn misaligned_word_read_no_fault_without_cr0_am() {
         // EFLAGS.AC set but CR0.AM clear: the alignment check stays masked, no fault.
+        // Set CR0 bit 4 (ET) too: it is not AM, so it must not arm the check.
         let (mut cpu, mut bus) = cpl3_word_read_at(0x0041);
+        cpu.control.cr0 |= 0x0000_0010; // bit 4 (ET), not AM
         cpu.set_flag(FLAG_AC, true);
 
         assert!(cpu.execute_instruction(&mut bus).is_ok());
