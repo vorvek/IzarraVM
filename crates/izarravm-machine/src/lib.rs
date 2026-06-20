@@ -6162,6 +6162,60 @@ mod tests {
     }
 
     #[test]
+    fn int13_through_ff00_0000_returns_to_caller() {
+        // Period PC booters (e.g. Wizardry III) repoint IVT[0x13] to FF00:0000 to
+        // chain disk calls through the ROM-BIOS handler, then issue INT 13h. The
+        // host intercepts the INT 13h instruction by vector number regardless of
+        // the IVT target, so it still services the read; the redirected vector at
+        // FF00:0000 only needs a valid IRET to land on. This test proves control
+        // returns to the caller (no reset, no runaway) and the disk read happened.
+        let mut img = vec![0u8; 737_280];
+        img[0] = 0xEB;
+        img[1] = 0x55;
+        let rom = rom_with_code(&[
+            // Point IVT[0x13] (at 0000:004C) to FF00:0000.
+            0x31, 0xC0, // xor ax, ax
+            0x8E, 0xD8, // mov ds, ax
+            0xC7, 0x06, 0x4C, 0x00, 0x00, 0x00, // mov word [0x004C], 0x0000 (offset)
+            0xC7, 0x06, 0x4E, 0x00, 0x00, 0xFF, // mov word [0x004E], 0xFF00 (segment)
+            // Read 1 sector at CHS(0,0,1) of drive 0 into ES:BX = 0000:2000.
+            0x8E, 0xC0, // mov es, ax
+            0xBB, 0x00, 0x20, // mov bx, 0x2000
+            0xB8, 0x01, 0x02, // mov ax, 0x0201
+            0xB9, 0x01, 0x00, // mov cx, 0x0001
+            0xBA, 0x00, 0x00, // mov dx, 0x0000
+            0xCD, 0x13, // int 13h  -> vector now targets FF00:0000
+            // If the IRET at FF00:0000 returned cleanly, we reach this marker.
+            0xBB, 0x00, 0x05, // mov bx, 0x0500
+            0xB0, 0x42, // mov al, 0x42
+            0x88, 0x07, // mov [bx], al   (DS=0, so writes 0000:0500)
+            0xF4, // hlt
+        ]);
+        // The Izarra BIOS emits an IRET at ROM offset 0xF000 (FF00:0000); the
+        // synthetic test ROM gets the same stub so the redirected vector lands on
+        // a clean return point.
+        let mut rom = rom;
+        rom[0xF000] = 0xCF; // iret
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        machine.mount_floppy(img).unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        // The INT 13h read still placed the sector bytes at 0x2000.
+        assert_eq!(machine.read_physical_u8(0x2000), 0xEB);
+        assert_eq!(machine.read_physical_u8(0x2001), 0x55);
+        // The IRET at FF00:0000 returned to the caller, which ran the marker store.
+        assert_eq!(
+            machine.read_physical_u8(0x0500),
+            0x42,
+            "control returned past the redirected INT 13h vector"
+        );
+        let flags = machine.cpu().registers.eflags;
+        assert_eq!(flags & 0x0001, 0, "CF must be clear after a good read");
+    }
+
+    #[test]
     fn izarra_bios_isr_enqueues_injected_key() {
         let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();

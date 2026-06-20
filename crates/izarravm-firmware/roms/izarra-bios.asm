@@ -31,6 +31,16 @@ reset:                          ; ROM offset 0; the reset vector far-jumps here
 %include "izbios-boot.inc"           ; STREAM E: INT 19h bootstrap (boot_entry)
 %include "izbios-tables.inc"    ; foundation: MUST be last (emits the step table)
 
+; INT 13h ROM entry at ROM offset 0xF000 (linear 0xFF000, i.e. FF00:0000).
+; Period PC booters often repoint IVT[0x13] to FF00:0000 to chain disk calls
+; through the ROM-BIOS handler, then issue INT 13h. The host services the disk
+; work by intercepting the INT 13h instruction itself (keyed on the vector
+; number, not the IVT target), so the redirected vector only needs a valid IRET
+; to land on. This stub provides that return point.
+    times 0xf000 - ($ - $$) db 0
+int13_rom_entry:
+    iret
+
 ; Reset vector at 0xFFFF0 (file offset 0xFFF0 in a 64 KiB ROM). The exact-64K
 ; tail and the far jump to ROM_SEG:reset mirror the other Izarra ROMs.
     times 0xfff0 - ($ - $$) db 0
