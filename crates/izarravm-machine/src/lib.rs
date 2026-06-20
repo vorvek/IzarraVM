@@ -233,6 +233,71 @@ pub struct Machine {
     // headless runs and unit tests finish inside their cycle budgets. The GUI
     // clears it after construction to keep the full power-on experience.
     fast_post: bool,
+    // INT 33h mouse-driver HLE state: virtual cursor position, button mask,
+    // visibility, motion-counter accumulators, and the configured ranges. The
+    // PS/2 aux device is the hardware side; this is the DOS driver a game calls.
+    mouse: MouseState,
+}
+
+/// INT 33h mouse-driver state. Coordinates are in a virtual screen space that
+/// matches mode 13h (320x200) doubled horizontally, so x runs 0..639 and y runs
+/// 0..199, the convention the Microsoft driver presents to graphics-mode games.
+/// Host pixel deltas drive both this position and the mickey counters.
+#[derive(Debug, Clone, PartialEq)]
+struct MouseState {
+    x: i32,          // virtual cursor column (clamped to [min_x, max_x])
+    y: i32,          // virtual cursor row (clamped to [min_y, max_y])
+    buttons: u8,     // bit0 left, bit1 right, bit2 middle
+    show_count: i32, // cursor visibility counter (>=0 visible); hide decrements
+    mickey_x: i32,   // horizontal motion accumulator (mickeys) since last read
+    mickey_y: i32,   // vertical motion accumulator (mickeys) since last read
+    min_x: i32,
+    max_x: i32,
+    min_y: i32,
+    max_y: i32,
+}
+
+impl Default for MouseState {
+    fn default() -> Self {
+        Self {
+            x: MOUSE_MAX_X / 2,
+            y: MOUSE_MAX_Y / 2,
+            buttons: 0,
+            show_count: -1, // hidden until the driver calls Show (AX=0001)
+            mickey_x: 0,
+            mickey_y: 0,
+            min_x: 0,
+            max_x: MOUSE_MAX_X,
+            min_y: 0,
+            max_y: MOUSE_MAX_Y,
+        }
+    }
+}
+
+/// Virtual-screen bounds for the INT 33h cursor: a mode-13h game sees 0..639 x
+/// 0..199. 320-wide modes scale x internally; the driver always reports this
+/// doubled space, matching the Microsoft convention.
+const MOUSE_MAX_X: i32 = 639;
+const MOUSE_MAX_Y: i32 = 199;
+
+/// Return `(min, max)` so a range function accepts its limits in either order.
+fn order(a: i32, b: i32) -> (i32, i32) {
+    if a <= b { (a, b) } else { (b, a) }
+}
+
+impl MouseState {
+    /// Fold a host pixel delta into the cursor position and the mickey counters,
+    /// and latch the new button mask. The mapping is one mickey per host pixel
+    /// (a sane 1:1 default), so the cursor tracks the host pointer directly. The
+    /// position is clamped to the configured ranges; the mickey counters are
+    /// raw motion and are not clamped (they reset on read, AX=000Bh).
+    fn apply_motion(&mut self, dx: i32, dy: i32, buttons: u8) {
+        self.mickey_x += dx;
+        self.mickey_y += dy;
+        self.x = (self.x + dx).clamp(self.min_x, self.max_x);
+        self.y = (self.y + dy).clamp(self.min_y, self.max_y);
+        self.buttons = buttons & 0x07;
+    }
 }
 
 /// Build the CT1745 mixer from the profile's Sound Blaster power-on routing.
@@ -320,6 +385,7 @@ impl Machine {
             rtc: rtc::Rtc::new(),
             rtc_seconds: 0.0,
             fast_post: true,
+            mouse: MouseState::default(),
         };
         // The Margo LFB aperture is decoded before RAM, so system memory must
         // stay below it. Validated config caps memory far under this bound.
@@ -603,6 +669,19 @@ impl Machine {
         }
     }
 
+    /// Feed a host mouse delta and button mask to the PS/2 aux device. `dx`/`dy`
+    /// are host pixels (y down positive); `buttons` is bit0 left, bit1 right,
+    /// bit2 middle. The aux device queues a movement packet and, when data
+    /// reporting is enabled, this requests IRQ12 so a guest ISR runs. The same
+    /// delta drives the INT 33h cursor and mickey counters so the HLE driver
+    /// tracks the pointer even when no guest ISR consumes the hardware packets.
+    pub fn inject_mouse(&mut self, dx: i32, dy: i32, buttons: u8) {
+        if self.keyboard.inject_mouse(dx, dy, buttons) {
+            self.pic.request(12);
+        }
+        self.mouse.apply_motion(dx, dy, buttons);
+    }
+
     #[cfg(test)]
     fn read_io_port_u8(&mut self, port: u16) -> u8 {
         let mut bus = self.make_bus();
@@ -612,6 +691,11 @@ impl Machine {
     #[cfg(test)]
     fn irq1_pending(&self) -> bool {
         self.pic.irr_bit(1)
+    }
+
+    #[cfg(test)]
+    fn irq12_pending(&self) -> bool {
+        self.pic.irr_bit(12)
     }
 
     #[cfg(test)]
@@ -822,6 +906,96 @@ impl Machine {
             self.set_int_frame_carry(false);
         } else {
             self.set_int_frame_carry(true);
+        }
+    }
+
+    /// Replace the low 16 bits of EAX, leaving the upper 16 intact.
+    fn set_ax(&mut self, ax: u16) {
+        let eax = (self.cpu.registers.eax() & !0xFFFF) | u32::from(ax);
+        self.cpu.registers.set_eax(eax);
+    }
+
+    /// Replace the low 16 bits of EBX.
+    fn set_bx(&mut self, bx: u16) {
+        let ebx = (self.cpu.registers.ebx() & !0xFFFF) | u32::from(bx);
+        self.cpu.registers.set_ebx(ebx);
+    }
+
+    /// Replace the low 16 bits of ECX.
+    fn set_cx(&mut self, cx: u16) {
+        let ecx = (self.cpu.registers.ecx() & !0xFFFF) | u32::from(cx);
+        self.cpu.registers.set_ecx(ecx);
+    }
+
+    /// Replace the low 16 bits of EDX.
+    fn set_dx(&mut self, dx: u16) {
+        let edx = (self.cpu.registers.edx() & !0xFFFF) | u32::from(dx);
+        self.cpu.registers.set_edx(edx);
+    }
+
+    /// Service the INT 33h mouse driver (Microsoft API). The subset DOS games
+    /// rely on: reset/detect, show/hide cursor, get position+buttons, set
+    /// position, define horizontal/vertical ranges, and read the mickey motion
+    /// counters. The PS/2 aux device is the hardware behind it; this HLE tracks
+    /// the same position the host feeds through `inject_mouse`, so a game that
+    /// polls INT 33h sees the pointer without writing its own IRQ12 ISR.
+    /// Functions outside this subset return with the registers unchanged.
+    fn handle_int33(&mut self) {
+        let ax = self.cpu.registers.eax() as u16;
+        let cx = self.cpu.registers.ecx() as u16;
+        let dx = self.cpu.registers.edx() as u16;
+        match ax {
+            // AX=0000: reset driver and read status. Re-centre the cursor, hide
+            // it, clear motion, and report "installed, 2 buttons".
+            0x0000 => {
+                self.mouse = MouseState::default();
+                self.set_ax(0xFFFF); // driver installed
+                self.set_bx(0x0002); // two-button mouse
+            }
+            // AX=0001: show cursor (increment the visibility counter).
+            0x0001 => {
+                self.mouse.show_count = (self.mouse.show_count + 1).min(0);
+            }
+            // AX=0002: hide cursor (decrement the visibility counter).
+            0x0002 => {
+                self.mouse.show_count -= 1;
+            }
+            // AX=0003: return position and button status.
+            0x0003 => {
+                self.set_bx(u16::from(self.mouse.buttons));
+                self.set_cx(self.mouse.x as u16);
+                self.set_dx(self.mouse.y as u16);
+            }
+            // AX=0004: position the cursor at CX (column), DX (row), clamped.
+            0x0004 => {
+                self.mouse.x = i32::from(cx).clamp(self.mouse.min_x, self.mouse.max_x);
+                self.mouse.y = i32::from(dx).clamp(self.mouse.min_y, self.mouse.max_y);
+            }
+            // AX=0007: define horizontal range (CX..DX). A reversed pair is
+            // swapped, the way the driver normalizes the limits.
+            0x0007 => {
+                let (lo, hi) = order(i32::from(cx), i32::from(dx));
+                self.mouse.min_x = lo.clamp(0, MOUSE_MAX_X);
+                self.mouse.max_x = hi.clamp(0, MOUSE_MAX_X);
+                self.mouse.x = self.mouse.x.clamp(self.mouse.min_x, self.mouse.max_x);
+            }
+            // AX=0008: define vertical range (CX..DX).
+            0x0008 => {
+                let (lo, hi) = order(i32::from(cx), i32::from(dx));
+                self.mouse.min_y = lo.clamp(0, MOUSE_MAX_Y);
+                self.mouse.max_y = hi.clamp(0, MOUSE_MAX_Y);
+                self.mouse.y = self.mouse.y.clamp(self.mouse.min_y, self.mouse.max_y);
+            }
+            // AX=000B: read and clear the mickey motion counters. Returned as
+            // 16-bit signed deltas; positive is right/down.
+            0x000B => {
+                self.set_cx(self.mouse.mickey_x as i16 as u16);
+                self.set_dx(self.mouse.mickey_y as i16 as u16);
+                self.mouse.mickey_x = 0;
+                self.mouse.mickey_y = 0;
+            }
+            // Other functions are accepted as no-ops, leaving registers as-is.
+            _ => {}
         }
     }
 
@@ -1558,6 +1732,9 @@ impl Machine {
         if self.keyboard.take_irq() {
             self.pic.request(1); // IRQ1: keyboard output buffer has a scancode
         }
+        if self.keyboard.take_irq12() {
+            self.pic.request(12); // IRQ12: mouse output buffer has an aux byte
+        }
 
         // Advance the RTC: inv_clock is 1/clock_hz, so clocks * inv_clock is
         // elapsed seconds. Fold whole seconds into the clock and carry the rest.
@@ -1892,6 +2069,7 @@ impl Machine {
                             0x12 => self.handle_int12(),
                             0x13 => self.handle_int13(),
                             0x15 => self.handle_int15(),
+                            0x33 => self.handle_int33(),
                             0x20 | 0x21 => match self.handle_dos_int(vector) {
                                 Ok(Some(code)) => {
                                     if let Some(frame) = self.program_frames.pop() {
@@ -2183,7 +2361,10 @@ impl CpuBus for MachineBus<'_> {
         // video service; 0x20/0x21 are the DOS kernel. Vector 0x10 reaches here
         // only from a software INT today (the CPU never faults with vector 0x10);
         // revisit if an x87 #MF is added.
-        if matches!(vector, 0x10 | 0x11 | 0x12 | 0x13 | 0x15 | 0x20 | 0x21) {
+        if matches!(
+            vector,
+            0x10 | 0x11 | 0x12 | 0x13 | 0x15 | 0x20 | 0x21 | 0x33
+        ) {
             *self.pending_soft_int = Some(vector);
         }
         Ok(())
@@ -2380,8 +2561,9 @@ const BIOS_ROM_IRET_SEG: u16 = 0xff00;
 
 fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     // BIOS service interrupts the host intercepts by vector. Their IVT targets
-    // point at the ROM IRET so they survive a guest low-memory wipe.
-    for vector in [0x10, 0x11, 0x12, 0x13, 0x15] {
+    // point at the ROM IRET so they survive a guest low-memory wipe. INT 33h is
+    // the mouse driver: the same shape (a stub the HLE handler returns through).
+    for vector in [0x10, 0x11, 0x12, 0x13, 0x15, 0x33] {
         let address = vector * 4;
         memory.write_u16(address, 0)?;
         memory.write_u16(address + 2, BIOS_ROM_IRET_SEG)?;
@@ -3043,6 +3225,84 @@ mod tests {
         let ax = machine.cpu().registers.eax() as u16;
         assert_eq!(ax, BIOS_BASE_MEMORY_KIB);
         assert_eq!(ax, 640);
+    }
+
+    #[test]
+    fn mouse_movement_requests_irq12_after_enable() {
+        // Bring up the PS/2 mouse the way a driver does (command byte bit 1 set
+        // for the mouse interrupt, then 0xF4 enable reporting via the 0xD4 path),
+        // then inject a host move and confirm IRQ12 is pending on the PIC and the
+        // three-byte packet is readable on port 0x60 with the AUX status bit set.
+        let profile = MachineProfile::gsw_386(1, VideoCard::Et4000Ax);
+        let mut machine = Machine::new(profile, vec![0u8; BIOS_ROM_SIZE]).unwrap();
+        // Drive the controller through the bus the way the CPU would.
+        {
+            let mut bus = machine.make_bus();
+            bus.write_io(0x64, BusWidth::Byte, 0x60).unwrap(); // write command byte
+            bus.write_io(0x60, BusWidth::Byte, 0x03).unwrap(); // IRQ1 + IRQ12 enabled
+            bus.write_io(0x64, BusWidth::Byte, 0xD4).unwrap(); // next byte to aux
+            bus.write_io(0x60, BusWidth::Byte, 0xF4).unwrap(); // enable data reporting
+            assert_eq!(bus.read_io(0x60, BusWidth::Byte).unwrap(), 0xFA); // mouse ACK
+        }
+        // Move right 4, down 2, left button down.
+        machine.inject_mouse(4, 2, 0x01);
+        assert!(machine.irq12_pending(), "movement requests IRQ12");
+        // The packet is on port 0x60 and the status reports an AUX byte.
+        assert_eq!(machine.read_io_port_u8(0x64) & 0x20, 0x20, "AUX status bit");
+        let b0 = machine.read_io_port_u8(0x60);
+        assert_eq!(b0 & 0x08, 0x08, "always-one bit");
+        assert_eq!(b0 & 0x01, 0x01, "left button");
+        assert_eq!(b0 & 0x10, 0x00, "X positive");
+        assert_eq!(b0 & 0x20, 0x20, "Y sign set (screen-down move)");
+        assert_eq!(machine.read_io_port_u8(0x60), 4, "dx byte");
+        assert_eq!(machine.read_io_port_u8(0x60) as i8 as i32, -2, "dy byte");
+    }
+
+    #[test]
+    fn int33_set_then_get_position_round_trips() {
+        // Stub: set the cursor to (100, 50) via AX=0004, then read it back via
+        // AX=0003. The host injects a left-button-down move first so the get
+        // reports the button mask too. After the get, BX=buttons, CX=col, DX=row.
+        let rom = rom_with_code(&[
+            0xB8, 0x04, 0x00, // mov ax, 0x0004 (set position)
+            0xB9, 0x64, 0x00, // mov cx, 100 (column)
+            0xBA, 0x32, 0x00, // mov dx, 50 (row)
+            0xCD, 0x33, // int 33h
+            0xB8, 0x03, 0x00, // mov ax, 0x0003 (get position + buttons)
+            0xCD, 0x33, // int 33h
+            0xF4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        // A prior host move sets the left button; position is overwritten by the
+        // AX=0004 set, so only the button mask survives into the get.
+        machine.inject_mouse(0, 0, 0x01);
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        let bx = machine.cpu().registers.ebx() as u16;
+        let cx = machine.cpu().registers.ecx() as u16;
+        let dx = machine.cpu().registers.edx() as u16;
+        assert_eq!(cx, 100, "column round-trips through set/get");
+        assert_eq!(dx, 50, "row round-trips through set/get");
+        assert_eq!(bx, 0x0001, "left button reported in BX");
+    }
+
+    #[test]
+    fn int33_reset_reports_present_and_two_buttons() {
+        // Stub: AX=0000 reset/detect, then halt. AX=FFFFh (installed), BX=2.
+        let rom = rom_with_code(&[
+            0x31, 0xC0, // xor ax, ax (AX=0000)
+            0xCD, 0x33, // int 33h
+            0xF4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        let ax = machine.cpu().registers.eax() as u16;
+        let bx = machine.cpu().registers.ebx() as u16;
+        assert_eq!(ax, 0xFFFF, "driver reports installed");
+        assert_eq!(bx, 0x0002, "two-button mouse");
     }
 
     #[test]
