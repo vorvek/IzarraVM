@@ -36,6 +36,40 @@ const CR0_NW: u32 = 0x2000_0000; // bit 29
 #[allow(dead_code)]
 const CR0_CD: u32 = 0x4000_0000; // bit 30
 
+// GSW-586 CPUID identity. The GSW-586 is the fantasy chip's physical part (a K6-class
+// 586). CPUID always reports this identity regardless of the GswMode throttle, which is
+// a clock control rather than an ISA switch. Keep every tunable value here so the
+// identity is changed in one place.
+//
+// Leaf 0 returns the maximum basic leaf in EAX and the 12-byte vendor string
+// "IzarraGSW586" split across EBX, EDX, ECX in that standard order. Each register holds
+// four string bytes little-endian, so EBX's low byte is 'I', and so on.
+const CPUID_MAX_BASIC_LEAF: u32 = 1;
+const CPUID_VENDOR_EBX: u32 = u32::from_le_bytes(*b"Izar");
+const CPUID_VENDOR_EDX: u32 = u32::from_le_bytes(*b"raGS");
+const CPUID_VENDOR_ECX: u32 = u32::from_le_bytes(*b"W586");
+
+// Leaf 1 EAX packs type (bits 13-12), family (bits 11-8), model (bits 7-4) and stepping
+// (bits 3-0). Family 5 marks the 586/K6 class; the model and stepping are chosen values.
+const CPUID_TYPE: u32 = 0; // original OEM part
+const CPUID_FAMILY: u32 = 5; // 586 / K6 class
+const CPUID_MODEL: u32 = 6; // chosen GSW-586 model
+const CPUID_STEPPING: u32 = 1; // chosen stepping
+const CPUID_VERSION_EAX: u32 =
+    (CPUID_TYPE << 12) | (CPUID_FAMILY << 8) | (CPUID_MODEL << 4) | CPUID_STEPPING;
+
+// Leaf 1 feature flags. Only bits for features the core actually emulates are set. FPU
+// (bit 0) is off (no FPU is modeled); MMX (bit 23) is on to match the GSW-586 lore. No
+// other feature is claimed yet (TSC, paging-extension, and the rest stay off until the
+// matching behavior exists).
+const CPUID_FEATURE_MMX: u32 = 1 << 23;
+const CPUID_FEATURES_EDX: u32 = CPUID_FEATURE_MMX;
+
+// Leaf 1 EBX: brand index 0 (no brand string), CLFLUSH line size and other fields stay 0.
+const CPUID_LEAF1_EBX: u32 = 0;
+// Leaf 1 ECX: no extended feature is claimed.
+const CPUID_LEAF1_ECX: u32 = 0;
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum CpuError {
     #[error(transparent)]
@@ -1919,6 +1953,33 @@ impl Cpu386 {
                     self.write_gpr_sized(modrm.reg, operand_size, dest);
                 }
                 Ok(clocks(4))
+            }
+            0xa2 => {
+                // CPUID (0F A2). Not privileged: it runs at any CPL. The leaf selector is in
+                // EAX. The result registers are EAX, EBX, ECX, EDX (full 32-bit writes). We
+                // model only basic leaves 0 and 1; any other leaf returns all zeros, which is
+                // the architectural reply for an unimplemented leaf at or below the maximum.
+                let leaf = self.registers.eax();
+                let (eax, ebx, ecx, edx) = match leaf {
+                    0 => (
+                        CPUID_MAX_BASIC_LEAF,
+                        CPUID_VENDOR_EBX,
+                        CPUID_VENDOR_ECX,
+                        CPUID_VENDOR_EDX,
+                    ),
+                    1 => (
+                        CPUID_VERSION_EAX,
+                        CPUID_LEAF1_EBX,
+                        CPUID_LEAF1_ECX,
+                        CPUID_FEATURES_EDX,
+                    ),
+                    _ => (0, 0, 0, 0),
+                };
+                self.write_gpr32(0, eax); // EAX
+                self.write_gpr32(3, ebx); // EBX
+                self.write_gpr32(1, ecx); // ECX
+                self.write_gpr32(2, edx); // EDX
+                Ok(clocks(14))
             }
             0xc8..=0xcf => {
                 // BSWAP r32 (0F C8+r): reverse the byte order of a 32-bit register. The low
@@ -8630,5 +8691,124 @@ mod tests {
 
         assert!(cpu.flag(FLAG_AC));
         assert!(cpu.flag(FLAG_ID));
+    }
+
+    fn run_cpuid(leaf: u32) -> Cpu386 {
+        // CPUID (0F A2) with the leaf selector in EAX. Returns the CPU after one step so the
+        // caller can read EAX/EBX/ECX/EDX.
+        let mut memory = vec![0; 64];
+        memory[0..2].copy_from_slice(&[0x0f, 0xa2]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_eax(leaf);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        cpu
+    }
+
+    #[test]
+    fn cpuid_leaf0_reports_vendor_string_and_max_leaf() {
+        let cpu = run_cpuid(0);
+        // Max basic leaf is 1.
+        assert_eq!(cpu.registers.eax(), 1);
+        // Vendor string "IzarraGSW586" in the standard EBX, EDX, ECX order, four bytes
+        // little-endian per register.
+        assert_eq!(cpu.registers.ebx().to_le_bytes(), *b"Izar");
+        assert_eq!(cpu.registers.edx().to_le_bytes(), *b"raGS");
+        assert_eq!(cpu.registers.ecx().to_le_bytes(), *b"W586");
+        // Concatenating EBX:EDX:ECX yields the full 12-byte vendor string.
+        let mut vendor = [0u8; 12];
+        vendor[0..4].copy_from_slice(&cpu.registers.ebx().to_le_bytes());
+        vendor[4..8].copy_from_slice(&cpu.registers.edx().to_le_bytes());
+        vendor[8..12].copy_from_slice(&cpu.registers.ecx().to_le_bytes());
+        assert_eq!(&vendor, b"IzarraGSW586");
+    }
+
+    #[test]
+    fn cpuid_leaf1_reports_family5_and_mmx_without_fpu() {
+        let cpu = run_cpuid(1);
+        let eax = cpu.registers.eax();
+        // Family is bits 11-8 and must be 5 (586 / K6 class).
+        assert_eq!((eax >> 8) & 0xf, 5);
+        // Type is bits 13-12 (OEM = 0).
+        assert_eq!((eax >> 12) & 0x3, 0);
+        // MMX is bit 23 of EDX; FPU is bit 0 and must be off.
+        let edx = cpu.registers.edx();
+        assert_ne!(edx & (1 << 23), 0, "MMX bit should be set");
+        assert_eq!(edx & 1, 0, "FPU bit should be clear");
+        // Brand index 0 and no extended feature claimed.
+        assert_eq!(cpu.registers.ebx(), 0);
+        assert_eq!(cpu.registers.ecx(), 0);
+    }
+
+    #[test]
+    fn cpuid_unknown_leaf_returns_zeros() {
+        let cpu = run_cpuid(0x4000_0000);
+        assert_eq!(cpu.registers.eax(), 0);
+        assert_eq!(cpu.registers.ebx(), 0);
+        assert_eq!(cpu.registers.ecx(), 0);
+        assert_eq!(cpu.registers.edx(), 0);
+    }
+
+    #[test]
+    fn cpuid_is_not_privileged_at_cpl3() {
+        // CPUID runs at any privilege level. In protected mode at CPL 3 it must execute,
+        // not fault, and still report the GSW-586 identity.
+        let mut cpu = Cpu386::default();
+        cpu.control.cr0 |= CR0_PE;
+        cpu.registers.set_segment(
+            SegmentIndex::Cs,
+            SegmentRegister {
+                selector: 0x0003,
+                base: 0,
+                limit: 0xffff_ffff,
+                access: 0x9b,
+                default_size_32: false,
+            },
+        );
+        cpu.registers.eip = 0;
+        cpu.registers.set_eax(0);
+        let mut bus = TestBus::with_memory(vec![0x0f, 0xa2, 0, 0]);
+
+        assert!(cpu.execute_instruction(&mut bus).is_ok());
+        assert_eq!(cpu.registers.eax(), 1);
+        assert_eq!(cpu.registers.ebx().to_le_bytes(), *b"Izar");
+    }
+
+    #[test]
+    fn id_flag_toggle_detection_sequence_finds_cpuid() {
+        // The standard CPUID-presence probe: read EFLAGS, flip ID (bit 21), write it back,
+        // read EFLAGS again, and conclude CPUID exists if ID changed. Model that here using
+        // PUSHFD/POPFD plus a software toggle of FLAG_ID, then run CPUID leaf 0 to confirm
+        // the detection concludes correctly.
+        let mut memory = vec![0; 1024];
+        // 66 9c PUSHFD ; 66 9d POPFD to round-trip the dword image carrying ID.
+        memory[0..2].copy_from_slice(&[0x66, 0x9c]);
+        memory[2..4].copy_from_slice(&[0x66, 0x9d]);
+        // 0f a2 CPUID with EAX = 0 already loaded.
+        memory[4..6].copy_from_slice(&[0x0f, 0xa2]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        cpu.registers.set_eax(0);
+        let mut bus = TestBus::with_memory(memory);
+
+        // Establish ID = 0, flip it on, and confirm the flag image carries the change so a
+        // detection routine would observe ID as toggleable (CPUID present).
+        let before = cpu.flag(FLAG_ID);
+        cpu.set_flag(FLAG_ID, !before);
+        cpu.cycle(&mut bus).unwrap(); // pushfd captures ID = 1
+        cpu.set_flag(FLAG_ID, before); // perturb
+        cpu.cycle(&mut bus).unwrap(); // popfd restores ID = 1
+        let toggled = cpu.flag(FLAG_ID);
+        assert_eq!(toggled, !before, "ID flag must be toggleable");
+
+        // Detection concluded CPUID is present; execute it and confirm the GSW-586 vendor.
+        cpu.cycle(&mut bus).unwrap(); // cpuid
+        assert_eq!(cpu.registers.eax(), 1);
+        assert_eq!(cpu.registers.ebx().to_le_bytes(), *b"Izar");
     }
 }
