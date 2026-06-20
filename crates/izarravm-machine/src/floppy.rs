@@ -19,9 +19,24 @@ pub struct Floppy {
     bytes: Vec<u8>,
     geom: Geometry,
     pub dirty: bool,
+    /// Tracked head position, so a seek's distance (and thus its time) is the
+    /// real cylinder delta rather than a fixed cost.
+    current_cylinder: u16,
 }
 
 const SECTOR: usize = 512;
+
+/// One revolution at 300 RPM. Half of it is the average rotational latency: the
+/// wait for the target sector to come under the head after a seek.
+const REVOLUTION_SECS: f64 = 0.2;
+/// Head step time per cylinder, clamped so a full stroke lands in the period
+/// 3-100 ms seek envelope.
+const SEEK_PER_TRACK_SECS: f64 = 0.003;
+const SEEK_MAX_SECS: f64 = 0.100;
+/// Sustained transfer rate. High-density media (1.2/1.44 MB, 500 kbit/s) moves
+/// ~62.5 KB/s; double-density (360/720 KB, 250 kbit/s) is half that.
+const HD_BYTES_PER_SEC: f64 = 62_500.0;
+const DD_BYTES_PER_SEC: f64 = 31_250.0;
 
 /// Map a raw image length to a CHS geometry, or None for an unrecognized size.
 pub fn geometry_for(size: usize) -> Option<Geometry> {
@@ -62,11 +77,35 @@ impl Floppy {
             bytes,
             geom,
             dirty: false,
+            current_cylinder: 0,
         })
     }
 
     pub fn geometry(&self) -> Geometry {
         self.geom
+    }
+
+    /// Emulated seconds an access at `target_cyl` moving `bytes` of data takes on
+    /// the real drive: seek from the tracked head position, plus the average
+    /// rotational latency when the head moved, plus the transfer time. Updates the
+    /// tracked position to `target_cyl`. `bytes` = 0 models a bare seek/recalibrate.
+    pub fn access_duration_secs(&mut self, target_cyl: u16, bytes: usize) -> f64 {
+        let delta = (i32::from(target_cyl) - i32::from(self.current_cylinder)).unsigned_abs();
+        self.current_cylinder = target_cyl;
+        let (seek, latency) = if delta == 0 {
+            // Same track: no step, and sequential sectors arrive without a fresh
+            // rotational wait.
+            (0.0, 0.0)
+        } else {
+            let seek = (SEEK_PER_TRACK_SECS * f64::from(delta)).min(SEEK_MAX_SECS);
+            (seek, REVOLUTION_SECS / 2.0)
+        };
+        let rate = if self.geom.drive_type == 0x04 {
+            HD_BYTES_PER_SEC
+        } else {
+            DD_BYTES_PER_SEC
+        };
+        seek + latency + bytes as f64 / rate
     }
 
     pub fn bytes(&self) -> &[u8] {
@@ -135,6 +174,36 @@ mod tests {
         assert_eq!(f.chs_offset(0, 0, 10), None);
         // Sector 0 is not a valid 1-based sector.
         assert_eq!(f.chs_offset(0, 0, 0), None);
+    }
+
+    #[test]
+    fn access_duration_models_seek_latency_and_transfer() {
+        let mut f = Floppy::from_image(vec![0u8; 1_474_560]).unwrap(); // 1.44M, HD
+        // First read at track 0 (head starts there): no seek, no latency, just
+        // the transfer of one sector at 62.5 KB/s.
+        let one_sector = f.access_duration_secs(0, 512);
+        assert!((one_sector - 512.0 / 62_500.0).abs() < 1e-9);
+        // A read on the same track is transfer-only again (no fresh latency).
+        assert!((f.access_duration_secs(0, 512) - 512.0 / 62_500.0).abs() < 1e-9);
+        // Seeking to track 10 costs 10 steps of seek plus half a revolution of
+        // rotational latency, on top of the transfer.
+        let seek_read = f.access_duration_secs(10, 512);
+        let expect = 0.003 * 10.0 + 0.2 / 2.0 + 512.0 / 62_500.0;
+        assert!((seek_read - expect).abs() < 1e-9, "{seek_read} vs {expect}");
+        // A full-stroke seek is clamped to 100 ms.
+        f.access_duration_secs(0, 0);
+        let full = f.access_duration_secs(79, 0);
+        assert!((full - (0.100 + 0.2 / 2.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn double_density_transfers_at_half_the_rate() {
+        let mut hd = Floppy::from_image(vec![0u8; 1_474_560]).unwrap();
+        let mut dd = Floppy::from_image(vec![0u8; 737_280]).unwrap();
+        // Same bytes, same track: DD takes twice as long to transfer as HD.
+        let hd_t = hd.access_duration_secs(0, 4096);
+        let dd_t = dd.access_duration_secs(0, 4096);
+        assert!((dd_t - 2.0 * hd_t).abs() < 1e-9);
     }
 
     #[test]

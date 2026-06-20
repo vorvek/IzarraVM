@@ -820,6 +820,21 @@ impl Machine {
         }
     }
 
+    /// Consume `secs` of emulated time for a device operation that blocks the
+    /// guest (a floppy seek/read). Advancing both the master clock and the devices
+    /// by the same amount keeps timekeeping coupled, the way an instruction's own
+    /// clocks do. The guest clock jumps forward; the GUI's realtime pacing then
+    /// turns that jump into a visible wall-clock wait. `clock_hz` is the live mode
+    /// rate so the cost scales with the active GSW speed.
+    fn stall_for(&mut self, secs: f64) {
+        if secs <= 0.0 {
+            return;
+        }
+        let extra = (secs * self.active_mode.clock_hz() as f64) as u64;
+        self.elapsed_clocks += extra;
+        self.advance_devices(extra);
+    }
+
     /// Service the host side of an `INT 13h` disk request. Only floppy A: (DL=0)
     /// is backed, by the mounted image. CHS to LBA uses the mounted media
     /// geometry, so a 720 KB disk reads with 9 sectors per track and a 1.44 MB
@@ -842,8 +857,14 @@ impl Machine {
         let dl = dx as u8;
 
         match ah {
-            // AH=00 reset disk system. Nothing to do for the in-memory image.
+            // AH=00 reset disk system: the heads recalibrate back to track 0,
+            // which steps the drive and takes time.
             0x00 => {
+                let secs = self
+                    .floppy
+                    .as_mut()
+                    .map_or(0.0, |f| f.access_duration_secs(0, 0));
+                self.stall_for(secs);
                 self.set_eax_ah(0x00);
                 self.set_int_frame_carry(false);
             }
@@ -929,6 +950,19 @@ impl Machine {
                 }
             }
             done += 1;
+        }
+
+        // Charge the drive's mechanical time for the access: seek from the head's
+        // tracked position, rotational latency, and the transfer of the sectors
+        // moved. This is what makes a load take wall-clock time (see stall_clocks)
+        // instead of completing instantly.
+        if done > 0 {
+            let bytes = usize::from(done) * 512;
+            let secs = self
+                .floppy
+                .as_mut()
+                .map_or(0.0, |f| f.access_duration_secs(cyl, bytes));
+            self.stall_for(secs);
         }
 
         // AL returns the number of sectors actually transferred.
