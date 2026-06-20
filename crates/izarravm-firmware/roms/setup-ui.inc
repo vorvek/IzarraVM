@@ -42,9 +42,11 @@
 %define SU_ROW_GSW        2
 %define SU_ROW_PERIPH     3
 %define SU_ROW_HEALTH     4
-%define SU_ROW_SAVE       5
-%define SU_ROW_DISCARD    6
-%define SU_SEL_COUNT      7
+%define SU_ROW_REPAIR     5
+%define SU_ROW_FORMAT     6
+%define SU_ROW_SAVE       7
+%define SU_ROW_DISCARD    8
+%define SU_SEL_COUNT      9
 
 ; Time sub-page fields, in Left/Right edit order.
 %define SU_TF_HOUR        0
@@ -232,6 +234,10 @@ su_run_menu:
     je .open_periph
     cmp al, SU_ROW_HEALTH
     je .open_health
+    cmp al, SU_ROW_REPAIR
+    je .repair
+    cmp al, SU_ROW_FORMAT
+    je .format
     cmp al, SU_ROW_SAVE
     je .save
     cmp al, SU_ROW_DISCARD
@@ -239,6 +245,29 @@ su_run_menu:
     ; LAYOUT and GSW are inline: Enter cycles them forward, like Right.
     call su_edit_right
     call su_draw
+    jmp .loop
+.repair:
+    mov al, 1                       ; Lotura service: Repair Toka-DOS
+    mov si, su_str_repaired
+    jmp .service
+.format:
+    mov al, 2                       ; Lotura service: Format Drive
+    mov si, su_str_formatted
+.service:
+    ; Ask the machine to install or reinstall Toka-DOS, then read the status. The
+    ; run loop performs the host-side work between this OUT and the next IN.
+    out 0xE3, al
+    in  al, 0xE3
+    push ax                         ; save status across the repaint
+    push si                         ; save the success message
+    call su_draw                    ; repaint the menu under the note
+    pop si
+    pop ax
+    test al, al
+    jz .service_note                ; status 0 -> success message in SI
+    mov si, su_str_svc_fail
+.service_note:
+    call su_service_note
     jmp .loop
 .open_time:
     call su_time_page
@@ -607,12 +636,30 @@ su_draw:
     mov bh, COLOR_BG
     call gfx_text
 
+    ; Repair Toka-DOS row.
+    mov bl, SU_ROW_REPAIR
+    call su_row_color
+    mov si, su_str_repair
+    mov di, SU_MENU_X
+    mov ax, SU_MENU_Y + SU_ROW_DY * 5
+    mov bh, COLOR_BG
+    call gfx_text
+
+    ; Format Drive row.
+    mov bl, SU_ROW_FORMAT
+    call su_row_color
+    mov si, su_str_format
+    mov di, SU_MENU_X
+    mov ax, SU_MENU_Y + SU_ROW_DY * 6
+    mov bh, COLOR_BG
+    call gfx_text
+
     ; Save row.
     mov bl, SU_ROW_SAVE
     call su_row_color
     mov si, su_str_save
     mov di, SU_MENU_X
-    mov ax, SU_MENU_Y + SU_ROW_DY * 6
+    mov ax, SU_MENU_Y + SU_ROW_DY * 7
     mov bh, COLOR_BG
     call gfx_text
 
@@ -621,7 +668,7 @@ su_draw:
     call su_row_color
     mov si, su_str_discard
     mov di, SU_MENU_X
-    mov ax, SU_MENU_Y + SU_ROW_DY * 7
+    mov ax, SU_MENU_Y + SU_ROW_DY * 8
     mov bh, COLOR_BG
     call gfx_text
 
@@ -630,7 +677,7 @@ su_draw:
     pop ds
     mov si, su_str_hint
     mov di, 8                       ; from x=8 so the line fits inside 320 px
-    mov ax, SU_MENU_Y + SU_ROW_DY * 9 + 4
+    mov ax, SU_MENU_Y + SU_ROW_DY * 10 + 4
     mov bl, SU_COLOR_INFO
     mov bh, COLOR_BG
     call gfx_text
@@ -640,8 +687,21 @@ su_draw:
     pop ds
     mov si, su_str_deadnote
     mov di, 8
-    mov ax, SU_MENU_Y + SU_ROW_DY * 10 + 4
+    mov ax, SU_MENU_Y + SU_ROW_DY * 11 + 4
     mov bl, SU_COLOR_INFO
+    mov bh, COLOR_BG
+    call gfx_text
+    ret
+
+; su_service_note: draw a one-line Repair/Format result at SI (CS string) in the
+; row gap below Discard, bright cyan. Persists until the next key repaints. Sets
+; DS = CS. Clobbers AX, DI.
+su_service_note:
+    push cs
+    pop ds
+    mov di, SU_MENU_X
+    mov ax, SU_MENU_Y + SU_ROW_DY * 9
+    mov bl, SU_COLOR_VALUE
     mov bh, COLOR_BG
     call gfx_text
     ret
@@ -1364,6 +1424,11 @@ su_str_layout:       db 'KEYBOARD', 0
 su_str_gsw:          db 'CPU MODE', 0
 su_str_periph:       db 'PERIPHERALS', 0
 su_str_health:       db 'HEALTH', 0
+su_str_repair:       db 'REPAIR TOKA-DOS', 0
+su_str_format:       db 'FORMAT DRIVE', 0
+su_str_repaired:     db 'Toka-DOS repaired', 0
+su_str_formatted:    db 'Drive formatted', 0
+su_str_svc_fail:     db 'No Toka-DOS image', 0
 su_str_save:         db 'SAVE AND EXIT', 0
 su_str_discard:      db 'DISCARD AND EXIT', 0
 su_str_hint:         db 'Up/Dn move  L/R edit  Enter  Esc back', 0
