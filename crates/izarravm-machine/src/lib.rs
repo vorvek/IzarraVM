@@ -830,9 +830,20 @@ impl Machine {
         if secs <= 0.0 {
             return;
         }
-        let extra = (secs * self.active_mode.clock_hz() as f64) as u64;
-        self.elapsed_clocks += extra;
-        self.advance_devices(extra);
+        // Jump the master clock so the GUI's realtime pacing turns the access into
+        // a wall-clock wait. Keep the time-of-day RTC advancing (O(1)), but do NOT
+        // step the PIT/speaker/sound devices per clock: pushing a multi-million-
+        // clock jump through advance_devices is the O(n) spin the HLT wake path is
+        // careful to clamp, and the guest runs no instructions during the stall, so
+        // it cannot observe their intermediate state. They resume cleanly from the
+        // next instruction's own advance.
+        self.elapsed_clocks += (secs * self.active_mode.clock_hz() as f64) as u64;
+        self.rtc_seconds += secs;
+        let whole = self.rtc_seconds.floor();
+        if whole >= 1.0 {
+            self.rtc.tick_seconds(whole as u64);
+            self.rtc_seconds -= whole;
+        }
     }
 
     /// Service the host side of an `INT 13h` disk request. Only floppy A: (DL=0)

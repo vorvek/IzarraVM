@@ -123,8 +123,17 @@ fn pump_audio(
     let delta = now.saturating_sub(*audio_clocks);
     *audio_clocks = now;
     *debt += delta as f64 * OPL_NATIVE_HZ / clock_hz as f64;
-    let samples = debt.floor() as usize;
+    let mut samples = debt.floor() as usize;
     *debt -= samples as f64;
+    // A floppy stall jumps the guest clock forward by its whole duration at once,
+    // so the catch-up here could ask for seconds of audio in one render. Cap it at
+    // roughly the sink's buffer (~0.5 s): the surplus is the paused drive grind,
+    // which carries no audio and would only be dropped at the queue anyway.
+    let max_samples = OPL_NATIVE_HZ as usize / 2;
+    if samples > max_samples {
+        samples = max_samples;
+        *debt = 0.0;
+    }
     if samples == 0 {
         return;
     }
@@ -334,7 +343,6 @@ fn emulate(
     commands: Receiver<Command>,
     frame: Arc<Mutex<Frame>>,
 ) {
-    let clock_hz = profile.clock_hz;
     let mut machine = match Machine::new(profile, &rom) {
         Ok(m) => m,
         Err(err) => {
@@ -357,7 +365,6 @@ fn emulate(
         load_margo_test_pattern(&mut machine);
     }
 
-    let cap = clock_hz / 20;
     let mut audio_clocks = machine.elapsed_clocks();
     let mut audio_debt = 0.0;
     let mut speed_ratio = 0.0;
@@ -409,6 +416,12 @@ fn emulate(
         let now = Instant::now();
         let dt = now.duration_since(last).as_secs_f64();
         last = now;
+        // Pace against the live mode clock, which the guest can change at runtime
+        // (Lotura port 0xE1). Reading it each slice keeps the credit refill in the
+        // same clock domain as the cycles run and as the disk-stall jumps, so a
+        // floppy read pauses for its true wall-clock duration in any GSW mode.
+        let clock_hz = machine.active_mode().clock_hz();
+        let cap = clock_hz / 20;
         credit = refill_credit(credit, dt, clock_hz, cap);
         let budget = credit.max(0) as u64;
         if budget > 0 {
