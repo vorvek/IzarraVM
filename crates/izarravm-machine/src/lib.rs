@@ -878,12 +878,25 @@ impl Machine {
     fn handle_int2f(&mut self) -> bool {
         let ax = self.cpu.registers.eax() as u16;
         match ax {
-            // Network-redirector / MSCDEX installation check. The standard
-            // MSCDEX probe pushes a DADAh marker and expects FFh in AL. We report
-            // installed unconditionally so a game's CD detection succeeds.
+            // Network-redirector / MSCDEX installation check (RBIL INTERRUP.K,
+            // INT 2F/AX=1100h). The caller pushes a DADAh marker, runs INT 2Fh,
+            // and a present MSCDEX returns AL=FFh and replaces the pushed word
+            // with ADADh. A strict probe checks that the word changed, so we
+            // rewrite it. The INT pushed IP, CS, FLAGS over the marker, so the
+            // marker sits at SS:SP+6. Only the DADAh marker is the install check;
+            // any other pushed value is some other 1100h subfunction and is left
+            // unhandled rather than falsely reporting installed.
             0x1100 => {
-                self.set_eax_al(0xFF);
-                true
+                let ss = self.cpu.registers.segment(SegmentIndex::Ss).base;
+                let sp = self.cpu.registers.esp() as u16;
+                let marker_addr = ss + u32::from(sp.wrapping_add(6));
+                if self.read_guest_word(marker_addr) == 0xDADA {
+                    let _ = self.memory.write_u16(marker_addr as usize, 0xADAD);
+                    self.set_eax_al(0xFF);
+                    true
+                } else {
+                    false
+                }
             }
             // CD-ROM installation check: BX = number of CD drives, CX = first
             // drive letter (0 = A:).
@@ -4273,10 +4286,39 @@ mod tests {
     #[test]
     fn mscdex_install_check_reports_installed() {
         let mut machine = test_machine();
+        // The probe pushes DADAh, then the INT pushed IP, CS, FLAGS over it, so
+        // the marker sits at SS:SP+6. Stand in for that frame here.
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Ss, SegmentRegister::real(0x9000));
+        machine.cpu.registers.set_esp(0x0100);
+        let marker_addr = 0x9000 * 16 + (0x0100 + 6);
+        machine.memory.write_u16(marker_addr, 0xDADA).unwrap();
         machine.cpu.registers.set_eax(0x1100);
         assert!(machine.handle_int2f());
         // AL = FFh means installed.
         assert_eq!(machine.cpu.registers.eax() as u8, 0xFF);
+        // The pushed marker is rewritten to ADADh so a strict probe sees the
+        // word change (RBIL INTERRUP.K, INT 2F/AX=1100h).
+        assert_eq!(machine.memory.read_u16(marker_addr).unwrap(), 0xADAD);
+    }
+
+    #[test]
+    fn mscdex_install_check_ignores_non_dada_marker() {
+        let mut machine = test_machine();
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Ss, SegmentRegister::real(0x9000));
+        machine.cpu.registers.set_esp(0x0100);
+        let marker_addr = 0x9000 * 16 + (0x0100 + 6);
+        // A pushed word other than DADAh is some other 1100h subfunction. We must
+        // not claim installed or touch the stack word.
+        machine.memory.write_u16(marker_addr, 0x1234).unwrap();
+        machine.cpu.registers.set_eax(0x1100);
+        assert!(!machine.handle_int2f());
+        assert_eq!(machine.memory.read_u16(marker_addr).unwrap(), 0x1234);
     }
 
     #[test]
