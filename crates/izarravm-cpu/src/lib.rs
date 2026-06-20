@@ -717,6 +717,45 @@ impl Cpu386 {
                 self.load_segment(bus, segment, value as u16)?;
                 Ok(clocks(7))
             }
+            0xc4 | 0xc5 => {
+                // LES (0xc4) / LDS (0xc5): load a far pointer from memory. The ModRM r/m
+                // names the memory operand; the low half (operand size) goes into the reg
+                // operand and the next word is loaded into ES (0xc4) or DS (0xc5). No flags
+                // change. mod=3 (a register r/m) is an invalid encoding and faults with #UD.
+                let modrm = self.fetch_modrm(bus)?;
+                let mem = match self.decode_rm_operand(bus, prefixes, address_size, modrm)? {
+                    RmOperand::Memory(mem) => mem,
+                    RmOperand::Register(_) => {
+                        return Err(InternalFault::Exception {
+                            vector: 6,
+                            error_code: None,
+                        });
+                    }
+                };
+                let offset = self.read_memory_sized(
+                    bus,
+                    mem.segment,
+                    mem.offset,
+                    operand_size,
+                    BusAccessKind::DataRead,
+                )?;
+                let selector_offset = mem.offset.wrapping_add(operand_size.bytes());
+                let selector = self.read_memory_sized(
+                    bus,
+                    mem.segment,
+                    selector_offset,
+                    OperandSize::Word,
+                    BusAccessKind::DataRead,
+                )? as u16;
+                let segment = if opcode == 0xc4 {
+                    SegmentIndex::Es
+                } else {
+                    SegmentIndex::Ds
+                };
+                self.load_segment(bus, segment, selector)?;
+                self.write_gpr_sized(modrm.reg, operand_size, offset);
+                Ok(clocks(7))
+            }
             0x90 => Ok(clocks(3)),
             0x91..=0x97 => {
                 // XCHG AX/EAX, reg. The register index is the low 3 opcode bits; 0x90 (index 0,
@@ -5170,6 +5209,77 @@ mod tests {
 
         assert_eq!(cpu.registers.eip, 0x00ee);
         assert!(!cpu.flag(FLAG_IF));
+    }
+
+    #[test]
+    fn lds_loads_offset_and_ds() {
+        // lds bx, [0x0200]  (0xc5 0x1e 0x00 0x02). Loads the far pointer at DS:0x0200:
+        // BX <- word[0x0200], DS <- word[0x0202]. No flags change.
+        let mut memory = vec![0; 0x1000];
+        memory[0..4].copy_from_slice(&[0xc5, 0x1e, 0x00, 0x02]);
+        memory[0x0200] = 0x34; // offset low
+        memory[0x0201] = 0x12; // offset high -> 0x1234
+        memory[0x0202] = 0x00; // selector low
+        memory[0x0203] = 0x90; // selector high -> 0x9000
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        let flags_before = cpu.registers.eflags;
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Bx), 0x1234);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ds).selector, 0x9000);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ds).base, 0x9000 << 4);
+        assert_eq!(cpu.registers.eflags, flags_before);
+    }
+
+    #[test]
+    fn les_loads_offset_and_es() {
+        // les di, [bx]  (0xc4 0x3f). With BX=0x0300 it loads DS:0x0300:
+        // DI <- word[0x0300], ES <- word[0x0302]. No flags change.
+        let mut memory = vec![0; 0x1000];
+        memory[0..2].copy_from_slice(&[0xc4, 0x3f]);
+        memory[0x0300] = 0x78; // offset low
+        memory[0x0301] = 0x56; // offset high -> 0x5678
+        memory[0x0302] = 0x00; // selector low
+        memory[0x0303] = 0xb8; // selector high -> 0xb800
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Es, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_ebx(0x0300);
+        let flags_before = cpu.registers.eflags;
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg16(Reg16::Di), 0x5678);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Es).selector, 0xb800);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Es).base, 0xb800 << 4);
+        assert_eq!(cpu.registers.eflags, flags_before);
+    }
+
+    #[test]
+    fn lds_with_register_operand_delivers_ud() {
+        // lds ax, bx  (0xc5 0xc3, mod=3) is an invalid encoding -> #UD (vector 6).
+        // IVT[6] at 0x18 points to IP 0x00ee, CS 0; the CPU vectors there.
+        let mut memory = vec![0; 1024];
+        memory[0..2].copy_from_slice(&[0xc5, 0xc3]);
+        memory[0x18] = 0xee; // vector 6 IP low byte (IP = 0x00ee)
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eip, 0x00ee);
     }
 
     #[test]
