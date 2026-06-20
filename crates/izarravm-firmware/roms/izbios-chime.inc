@@ -83,8 +83,8 @@ chime_note:
     ret
 
 ; chime_delay: block for about 120 ms by polling two PIT channel-0 reloads
-; (~54.9 ms each). Mirrors ramtest_pit_wait but is self-contained so the chime
-; does not depend on the RAM count-up having run. Preserves all registers.
+; (~54.9 ms each). Self-contained so the chime does not depend on the RAM test
+; having run. Preserves all registers.
 chime_delay:
     push cx
     mov cx, 2
