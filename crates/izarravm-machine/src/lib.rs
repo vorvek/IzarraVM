@@ -6580,6 +6580,12 @@ mod tests {
             serial.contains("PASS self.framework"),
             "COM1 log missing the framework step line: {serial:?}"
         );
+        // MEASURE steps must carry their value: this 16 MB machine reports 16384 KiB
+        // detected, so the COM1 line ends with the eight-digit value, not a bare name.
+        assert!(
+            serial.contains("MEASURE memory.detected_kib 00016384"),
+            "COM1 MEASURE line missing its value: {serial:?}"
+        );
     }
 
     #[test]
