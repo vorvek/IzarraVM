@@ -19,6 +19,10 @@ use tracing::info;
 /// well before this, and --cycles tunes it down for quick runs.
 const DEFAULT_TEST_ROM_CYCLES: u64 = 200_000_000;
 
+/// Default cycle budget for --headless-boot-floppy. Well past POST plus the boot
+/// sector's early work; --cycles tunes it up for a longer investigation.
+const DEFAULT_BOOT_FLOPPY_CYCLES: u64 = 50_000_000;
+
 #[derive(Debug, Parser)]
 #[command(version, about = "IzarraVM emulator scaffold")]
 struct Cli {
@@ -137,7 +141,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     if let Some(path) = &cli.headless_boot_floppy {
-        return run_boot_floppy(path, &hardware);
+        return run_boot_floppy(path, cli.cycles, &hardware);
     }
 
     let rom = match cli.bios.as_deref() {
@@ -306,7 +310,11 @@ fn run_izarra_bios(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
 /// CS:IP plus a short trace of low memory. A human reads the trace to confirm the
 /// boot sector executed: CS:IP leaving the BIOS region (CS far below 0xF000) and
 /// the boot sector bytes sitting at 0000:7C00 mean INT 19h loaded and jumped.
-fn run_boot_floppy(path: &Path, hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
+fn run_boot_floppy(
+    path: &Path,
+    cycles: Option<u64>,
+    hardware: &HardwareProfile,
+) -> Result<(), Box<dyn Error>> {
     let image = std::fs::read(path)?;
     let image_len = image.len();
     let mut machine = Machine::new(
@@ -319,9 +327,11 @@ fn run_boot_floppy(path: &Path, hardware: &HardwareProfile) -> Result<(), Box<dy
             path.display()
         )
     })?;
-    // The bootstrap runs after POST, which is wall-time bound, so give it a budget
-    // well past POST plus the boot sector's own early work.
-    let stop_reason = machine.run_until_halt_or_cycles(50_000_000)?;
+    // The bootstrap runs after POST, which is wall-time bound, so the default budget
+    // sits well past POST plus the boot sector's own early work. A long headless
+    // investigation passes --cycles to run further, so honor it when given.
+    let budget = cycles.unwrap_or(DEFAULT_BOOT_FLOPPY_CYCLES);
+    let stop_reason = machine.run_until_halt_or_cycles(budget)?;
 
     let cs = machine.cpu().registers.cs().selector;
     let ip = machine.cpu().registers.eip as u16;
