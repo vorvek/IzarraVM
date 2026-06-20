@@ -693,6 +693,16 @@ impl Vga {
         self.crtc.max_scan = u32::from(height.saturating_sub(1));
     }
 
+    /// Reload the power-on default DAC palette, attribute palette, and pel mask.
+    /// Real hardware reprograms the RAMDAC to the mode's defaults on a mode set,
+    /// so a prior program's custom palette (the BIOS, say) does not leak into the
+    /// program that sets the next mode.
+    fn reset_palette_defaults(&mut self) {
+        self.dac = Dac::default();
+        self.attr = Attribute::default();
+        self.pel_mask = 0xFF;
+    }
+
     /// Install a planar mode's timing and reset the beam to the top of frame.
     fn set_planar_mode(&mut self, timing: CrtcTiming) {
         self.crtc = timing;
@@ -700,6 +710,7 @@ impl Vga {
         self.last_line = 0;
         self.mode = VideoMode::Planar;
         self.presented = None; // drop any stale frame from a prior mode
+        self.reset_palette_defaults();
         self.resize_work();
     }
 
@@ -1511,6 +1522,7 @@ impl Vga {
         self.last_line = 0;
         self.mode = VideoMode::Mode13h;
         self.presented = None; // drop any stale frame from a prior mode
+        self.reset_palette_defaults();
         self.resize_work();
     }
 
@@ -1541,6 +1553,7 @@ impl Vga {
         self.mode = VideoMode::Cga;
         self.presented = None;
         self.pending_start = None;
+        self.reset_palette_defaults();
         self.resize_work();
         true
     }
@@ -1625,6 +1638,7 @@ impl Vga {
         // A buffered start-address change from a prior graphics mode must not
         // carry across the mode switch: the text origin resets to page 0.
         self.pending_start = None;
+        self.reset_palette_defaults();
         self.resize_work();
     }
 

@@ -214,6 +214,11 @@ pub struct Machine {
     // Mounted A: floppy image, geometry inferred from the image length. INT 13h
     // disk services read and write it; None means the drive is empty.
     floppy: Option<floppy::Floppy>,
+    // Monotonic counters bumped each time drive A: (INT 13h) or C: (DOS file I/O)
+    // is touched. The GUI samples them per frame to flash a drive-access LED; a
+    // counter never misses an event the way a poll-and-clear bool would.
+    floppy_accesses: u64,
+    c_accesses: u64,
     // MC146818 RTC and CMOS NVRAM at ports 0x70/0x71.
     rtc: rtc::Rtc,
     // Fractional seconds owed to the RTC from the machine clock; whole seconds
@@ -305,6 +310,8 @@ impl Machine {
             elapsed_clocks: 0,
             program_frames: Vec::new(),
             floppy: None,
+            floppy_accesses: 0,
+            c_accesses: 0,
             rtc: rtc::Rtc::new(),
             rtc_seconds: 0.0,
             fast_post: true,
@@ -365,6 +372,12 @@ impl Machine {
     /// is empty.
     pub fn floppy_dirty(&self) -> bool {
         self.floppy.as_ref().is_some_and(|f| f.dirty)
+    }
+
+    /// Monotonic access counts for drives A: (floppy) and C: (host). The GUI
+    /// samples these per frame and flashes a drive LED when one advances.
+    pub fn drive_access_counts(&self) -> (u64, u64) {
+        (self.floppy_accesses, self.c_accesses)
     }
 
     /// Seed the RTC clock from host-provided local time. `weekday` is 1..=7 with
@@ -884,6 +897,9 @@ impl Machine {
         let bx = self.cpu.registers.ebx() as u16;
         let buffer = es.wrapping_add(u32::from(bx));
 
+        // The drive is being serviced: flash the GUI access LED.
+        self.floppy_accesses += 1;
+
         let mut done: u8 = 0;
         for i in 0..count {
             // Multi-sector transfers advance within the current track only. A
@@ -1119,6 +1135,14 @@ impl Machine {
             cf: self.cpu.registers.eflags & 0x1 != 0,
             zf: self.cpu.registers.eflags & 0x40 != 0,
         };
+        // C: is the only mounted host drive, so a DOS file-I/O call is a C:
+        // access for the GUI LED: open/create/close/read/write/seek/find.
+        if vector == 0x21 {
+            let ah = (regs.ax >> 8) as u8;
+            if matches!(ah, 0x3C | 0x3D | 0x3E | 0x3F | 0x40 | 0x42 | 0x4E | 0x4F) {
+                self.c_accesses += 1;
+            }
+        }
         let action = self.dos.dispatch(vector, &mut regs, &mut self.memory)?;
         if matches!(action, izarravm_dos::DosAction::WaitForKey) {
             // Blocking read with an empty ring. Rewind the stacked return IP by 2

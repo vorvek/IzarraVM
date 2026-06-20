@@ -34,6 +34,7 @@
 %define SU_TIME_MONTH     SETUP_SCRATCH + 9
 %define SU_TIME_YEAR      SETUP_SCRATCH + 10   ; two-digit year (0..99)
 %define SU_LFSR_LO        SETUP_SCRATCH + 12   ; health-page jitter LFSR (word)
+%define SU_HEALTH_TICK    SETUP_SCRATCH + 14   ; last BDA tick the health page drew (word)
 
 ; Main-menu selectable rows, in highlight order.
 %define SU_ROW_TIME       0
@@ -225,9 +226,11 @@ su_run_menu:
     jmp .loop
 .save:
     call su_commit
-    ret
+    ; Fall through: leaving setup resets the machine, the way a real BIOS reboots
+    ; on exit, so changes take effect from a clean POST.
 .discard:
-    ret                             ; nothing written
+    cli
+    jmp ROM_SEG:reset               ; cold-start the BIOS (replays POST)
 
 ; su_seed: load the working copy from the live GSW mode, CMOS NVRAM layout, and
 ; the RTC clock. Sets DS = 0 and leaves it there. Clobbers AX, BX, CX.
@@ -1078,15 +1081,60 @@ su_periph_page:
 ; values are fixed bases plus a signed wobble so the page looks alive without a
 ; real hardware monitor port.
 su_health_page:
+    sti                             ; the hlt below waits on the timer/keyboard IRQ
     call su_health_draw
+    call su_health_seed_tick
 .loop:
-    xor ah, ah
-    call kb_getkey
+    hlt                             ; wake on the next IRQ (timer ~18/s or a key)
+    mov ah, 0x01
+    call kb_getkey                  ; peek: CF=1 if the ring is empty
+    jc .timer
     cmp ah, SC_ESC
     je .back
-    call su_health_draw             ; any other key re-jitters and repaints
+    xor ah, ah
+    call kb_getkey                  ; drain the key; any key re-jitters and repaints
+    call su_health_draw
+    call su_health_seed_tick
+    jmp .loop
+.timer:
+    ; Auto-refresh about once a second: 18 BDA ticks ~ 0.99 s at 18.2 Hz.
+    push ds
+    push ax
+    push bx
+    mov bx, BDA_SEG
+    mov ds, bx
+    mov ax, [BDA_TICKS]             ; low word of the running tick count
+    xor bx, bx
+    mov ds, bx
+    sub ax, [SU_HEALTH_TICK]
+    cmp ax, 18
+    pop bx
+    pop ax
+    pop ds
+    jb .loop
+    call su_health_draw
+    call su_health_seed_tick
     jmp .loop
 .back:
+    xor ah, ah
+    call kb_getkey                  ; consume the Esc make
+    ret
+
+; su_health_seed_tick: store the current BDA tick low word so the health loop can
+; tell when about a second has elapsed. DS bounces 0040 -> 0.
+su_health_seed_tick:
+    push ds
+    push ax
+    push bx
+    mov bx, BDA_SEG
+    mov ds, bx
+    mov ax, [BDA_TICKS]
+    xor bx, bx
+    mov ds, bx
+    mov [SU_HEALTH_TICK], ax
+    pop bx
+    pop ax
+    pop ds
     ret
 
 ; su_lfsr_step: advance the 16-bit Galois LFSR at SU_LFSR_LO and return AL = a
@@ -1236,7 +1284,14 @@ su_draw_temp:
     mov bh, COLOR_BG
     call gfx_text                   ; SI = label
     call su_lfsr_step               ; AL = 0..4 (DS = 0 after)
-    add al, cl                      ; base degrees + jitter
+    ; Clamp the temperature wobble to +/-1 degree: (AL mod 3) - 1 gives -1/0/+1,
+    ; tighter than the voltage rails, which keep their wider raw ripple.
+    mov ah, 0
+    mov bl, 3
+    div bl                          ; AH = AL mod 3 (0..2)
+    mov al, ah
+    dec al                          ; -1, 0, or +1
+    add al, cl                      ; base degrees +/- 1
     mov ah, 0
     mov bl, 10
     div bl                          ; AL = tens, AH = units
