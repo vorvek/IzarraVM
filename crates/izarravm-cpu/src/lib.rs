@@ -10,9 +10,67 @@ const FLAG_TF: u32 = 0x0000_0100;
 const FLAG_IF: u32 = 0x0000_0200;
 const FLAG_DF: u32 = 0x0000_0400;
 const FLAG_OF: u32 = 0x0000_0800;
+// 486 EFLAGS additions. AC (bit 18) is the alignment-check enable consulted by the
+// #AC path together with CR0.AM; ID (bit 21) is the toggleable bit software flips to
+// probe for CPUID. Both are plain read/write storage otherwise, and both survive a
+// PUSHFD/POPFD round-trip (the dword flag image carries them).
+const FLAG_AC: u32 = 0x0004_0000; // bit 18
+const FLAG_ID: u32 = 0x0020_0000; // bit 21
 
 const CR0_PE: u32 = 0x0000_0001;
 const CR0_PG: u32 = 0x8000_0000;
+// 486 control bits added to the 386's PE/PG. WP gates supervisor writes to read-only
+// pages in translate_linear, and AM enables the #AC alignment-check path. The rest are
+// read/write storage with no modeled effect, kept so MOV CR0 round-trips them:
+//   NE (bit 5)  numeric-error reporting; no FPU is emulated, so it is cosmetic.
+//   NW (bit 29) / CD (bit 30) cache control; no cache is modeled, so both are
+//               cosmetic.
+// The cosmetic constants document the bit layout in one place; they are not yet
+// read by the core, hence the allow on the trio that has no consumer.
+// AM is CR0 bit 18. CR0 bit 4 is ET (extension type), which we leave as 0 because no
+// x87 FPU is emulated, consistent with CPUID reporting the FPU feature off.
+const CR0_WP: u32 = 0x0001_0000; // bit 16
+const CR0_AM: u32 = 0x0004_0000; // bit 18
+#[allow(dead_code)]
+const CR0_NE: u32 = 0x0000_0020; // bit 5
+#[allow(dead_code)]
+const CR0_NW: u32 = 0x2000_0000; // bit 29
+#[allow(dead_code)]
+const CR0_CD: u32 = 0x4000_0000; // bit 30
+
+// GSW-586 CPUID identity. The GSW-586 is the fantasy chip's physical part (a K6-class
+// 586). CPUID always reports this identity regardless of the GswMode throttle, which is
+// a clock control rather than an ISA switch. Keep every tunable value here so the
+// identity is changed in one place.
+//
+// Leaf 0 returns the maximum basic leaf in EAX and the 12-byte vendor string
+// "IzarraGSW586" split across EBX, EDX, ECX in that standard order. Each register holds
+// four string bytes little-endian, so EBX's low byte is 'I', and so on.
+const CPUID_MAX_BASIC_LEAF: u32 = 1;
+const CPUID_VENDOR_EBX: u32 = u32::from_le_bytes(*b"Izar");
+const CPUID_VENDOR_EDX: u32 = u32::from_le_bytes(*b"raGS");
+const CPUID_VENDOR_ECX: u32 = u32::from_le_bytes(*b"W586");
+
+// Leaf 1 EAX packs type (bits 13-12), family (bits 11-8), model (bits 7-4) and stepping
+// (bits 3-0). Family 5 marks the 586/K6 class; the model and stepping are chosen values.
+const CPUID_TYPE: u32 = 0; // original OEM part
+const CPUID_FAMILY: u32 = 5; // 586 / K6 class
+const CPUID_MODEL: u32 = 6; // chosen GSW-586 model
+const CPUID_STEPPING: u32 = 1; // chosen stepping
+const CPUID_VERSION_EAX: u32 =
+    (CPUID_TYPE << 12) | (CPUID_FAMILY << 8) | (CPUID_MODEL << 4) | CPUID_STEPPING;
+
+// Leaf 1 feature flags. Only bits for features the core actually emulates are set. FPU
+// (bit 0) is off (no FPU is modeled); MMX (bit 23) is on to match the GSW-586 lore. No
+// other feature is claimed yet (TSC, paging-extension, and the rest stay off until the
+// matching behavior exists).
+const CPUID_FEATURE_MMX: u32 = 1 << 23;
+const CPUID_FEATURES_EDX: u32 = CPUID_FEATURE_MMX;
+
+// Leaf 1 EBX: brand index 0 (no brand string), CLFLUSH line size and other fields stay 0.
+const CPUID_LEAF1_EBX: u32 = 0;
+// Leaf 1 ECX: no extended feature is claimed.
+const CPUID_LEAF1_ECX: u32 = 0;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum CpuError {
@@ -232,21 +290,15 @@ impl Registers {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Reset state is all zero: PE/PG clear (real mode, no paging) and AM clear. AM is
+// correctly CR0 bit 18, so it powers up masked at zero. Bit 4 is ET, which an old
+// 386 reset forced on; here it stays 0 since no x87 FPU is emulated, so the default
+// is a plain zero (derived).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ControlRegisters {
     pub cr0: u32,
     pub cr2: u32,
     pub cr3: u32,
-}
-
-impl Default for ControlRegisters {
-    fn default() -> Self {
-        Self {
-            cr0: 0x0000_0010,
-            cr2: 0,
-            cr3: 0,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -377,6 +429,17 @@ impl Cpu386 {
 
     pub fn is_paging_enabled(&self) -> bool {
         self.control.cr0 & CR0_PG != 0
+    }
+
+    /// Current privilege level. The CPL lives in the low two bits of the CS selector. Real
+    /// mode has no protection rings, so it is always CPL 0 there; only protected mode can
+    /// run at a lower privilege.
+    fn current_privilege_level(&self) -> u8 {
+        if self.is_protected_mode() {
+            (self.registers.cs().selector & 3) as u8
+        } else {
+            0
+        }
     }
 
     pub fn linear_eip(&self) -> u32 {
@@ -826,12 +889,14 @@ impl Cpu386 {
                 Ok(clocks(2))
             }
             0x9c => {
-                // PUSHF / PUSHFD. The 386 EFLAGS defines no bits above 15 except RF and
-                // VM, both of which PUSHFD clears in the pushed image, so both forms push
-                // the identical low 16 flag bits; the dword form just zero-extends to 32.
-                // Confirmed against the 669C vectors. operand_size still drives whether
-                // push writes 2 or 4 bytes.
-                let value = self.registers.eflags & 0xffff;
+                // PUSHF / PUSHFD. The low 16 flag bits push the same in both forms. The
+                // dword form additionally carries the 486 AC and ID bits (RF and VM are
+                // masked to 0 in the pushed image, so they never appear). operand_size
+                // drives whether push writes 2 or 4 bytes.
+                let value = match operand_size {
+                    OperandSize::Word => self.registers.eflags & 0xffff,
+                    OperandSize::Dword => self.registers.eflags & (0xffff | FLAG_AC | FLAG_ID),
+                };
                 self.push(bus, value, operand_size)?;
                 Ok(clocks(3))
             }
@@ -1558,6 +1623,14 @@ impl Cpu386 {
                 let memory = match operand {
                     RmOperand::Memory(memory) => memory,
                     RmOperand::Register(_) => {
+                        // INVLPG (/7) with a register operand is #UD; the other group members
+                        // (LGDT/LIDT here) report the unsupported register form as before.
+                        if modrm.reg == 7 {
+                            return Err(InternalFault::Exception {
+                                vector: 6,
+                                error_code: None,
+                            });
+                        }
                         return Err(CpuError::UnsupportedGroupOpcode {
                             opcode,
                             extension: modrm.reg,
@@ -1565,6 +1638,20 @@ impl Cpu386 {
                         .into());
                     }
                 };
+                // INVLPG m (0F 01 /7): privileged on the 486; invalidate the TLB entry for the
+                // page containing the operand. We model no TLB, so after the privilege check it
+                // is a no-op. The memory operand is decoded (and so its segment/address checks
+                // run) but no value is read from it.
+                if modrm.reg == 7 {
+                    if self.current_privilege_level() != 0 {
+                        return Err(InternalFault::Exception {
+                            vector: 6,
+                            error_code: None,
+                        });
+                    }
+                    let _ = memory;
+                    return Ok(clocks(12));
+                }
                 let limit = self.read_memory_sized(
                     bus,
                     memory.segment,
@@ -1633,7 +1720,11 @@ impl Cpu386 {
                 }
                 let value = self.read_gpr32(modrm.rm);
                 match modrm.reg {
-                    0 => self.control.cr0 = value | 0x10,
+                    // CR0 is fully read/write here, so bit 18 (AM) round-trips. The 386
+                    // core used to force bit 4 on (the ET extension-type bit); here ET
+                    // stays whatever software writes, with no FPU modeled, so nothing is
+                    // forced.
+                    0 => self.control.cr0 = value,
                     2 => self.control.cr2 = value,
                     3 => self.control.cr3 = value & 0xffff_f000,
                     _ => {}
@@ -1785,6 +1876,127 @@ impl Cpu386 {
                 let result = self.double_shift(opcode == 0xa5, dest, src, count, operand_size);
                 self.write_operand_sized(bus, operand, operand_size, result)?;
                 Ok(clocks(3))
+            }
+            0x08 | 0x09 => {
+                // INVD (08) / WBINVD (09): flush the internal caches. Both are privileged and
+                // raise #UD outside CPL 0. We model no cache, so they are no-ops after the
+                // privilege check. WBINVD differs only by writing dirty lines back first, which
+                // has no observable effect here.
+                if self.current_privilege_level() != 0 {
+                    return Err(InternalFault::Exception {
+                        vector: 6,
+                        error_code: None,
+                    });
+                }
+                Ok(clocks(4))
+            }
+            0xb0 | 0xb1 => {
+                // CMPXCHG r/m, r. B0 is the byte form, B1 the word/dword form. Compare the
+                // accumulator (AL/AX/EAX) with the destination exactly like CMP (acc - dest),
+                // setting every ALU flag from that subtraction. If they are equal (ZF set after
+                // the compare) the source register is stored into the destination; otherwise the
+                // destination value is loaded into the accumulator. Either way the destination is
+                // written once, which is what makes the LOCK form meaningful.
+                let modrm = self.fetch_modrm(bus)?;
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
+                let size = if opcode == 0xb0 {
+                    None
+                } else {
+                    Some(operand_size)
+                };
+                match size {
+                    None => {
+                        let dest = self.read_operand_u8(bus, operand)?;
+                        let acc = self.read_gpr8(0);
+                        self.alu_sub(u32::from(acc), u32::from(dest), 0, BusWidth::Byte);
+                        if self.flag(FLAG_ZF) {
+                            let src = self.read_gpr8(modrm.reg);
+                            self.write_operand_u8(bus, operand, src)?;
+                        } else {
+                            self.write_gpr8(0, dest);
+                            // Re-write the destination with its own value so the bus sees a write
+                            // even on the unequal branch, matching the architectural read-modify-
+                            // write of CMPXCHG.
+                            self.write_operand_u8(bus, operand, dest)?;
+                        }
+                    }
+                    Some(size) => {
+                        let dest = self.read_operand_sized(bus, operand, size)?;
+                        let acc = self.read_gpr_sized(0, size);
+                        self.alu_sub(acc, dest, 0, size.bus_width());
+                        if self.flag(FLAG_ZF) {
+                            let src = self.read_gpr_sized(modrm.reg, size);
+                            self.write_operand_sized(bus, operand, size, src)?;
+                        } else {
+                            self.write_gpr_sized(0, size, dest);
+                            self.write_operand_sized(bus, operand, size, dest)?;
+                        }
+                    }
+                }
+                Ok(clocks(6))
+            }
+            0xc0 | 0xc1 => {
+                // XADD r/m, r. C0 is the byte form, C1 the word/dword form. The exchange-and-add
+                // first saves the destination, then writes dest + src back to the destination and
+                // copies the saved destination into the source register. The flags come out
+                // exactly like ADD of the two operands (reuse alu_add).
+                let modrm = self.fetch_modrm(bus)?;
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
+                if opcode == 0xc0 {
+                    let dest = self.read_operand_u8(bus, operand)?;
+                    let src = self.read_gpr8(modrm.reg);
+                    let sum =
+                        self.alu_add(u32::from(dest), u32::from(src), 0, BusWidth::Byte) as u8;
+                    self.write_operand_u8(bus, operand, sum)?;
+                    self.write_gpr8(modrm.reg, dest);
+                } else {
+                    let dest = self.read_operand_sized(bus, operand, operand_size)?;
+                    let src = self.read_gpr_sized(modrm.reg, operand_size);
+                    let sum = self.alu_add(dest, src, 0, operand_size.bus_width());
+                    self.write_operand_sized(bus, operand, operand_size, sum)?;
+                    self.write_gpr_sized(modrm.reg, operand_size, dest);
+                }
+                Ok(clocks(4))
+            }
+            0xa2 => {
+                // CPUID (0F A2). Not privileged: it runs at any CPL. The leaf selector is in
+                // EAX. The result registers are EAX, EBX, ECX, EDX (full 32-bit writes). We
+                // model only basic leaves 0 and 1; any other leaf returns all zeros, which is
+                // the architectural reply for an unimplemented leaf at or below the maximum.
+                let leaf = self.registers.eax();
+                let (eax, ebx, ecx, edx) = match leaf {
+                    0 => (
+                        CPUID_MAX_BASIC_LEAF,
+                        CPUID_VENDOR_EBX,
+                        CPUID_VENDOR_ECX,
+                        CPUID_VENDOR_EDX,
+                    ),
+                    1 => (
+                        CPUID_VERSION_EAX,
+                        CPUID_LEAF1_EBX,
+                        CPUID_LEAF1_ECX,
+                        CPUID_FEATURES_EDX,
+                    ),
+                    _ => (0, 0, 0, 0),
+                };
+                self.write_gpr32(0, eax); // EAX
+                self.write_gpr32(3, ebx); // EBX
+                self.write_gpr32(1, ecx); // ECX
+                self.write_gpr32(2, edx); // EDX
+                Ok(clocks(14))
+            }
+            0xc8..=0xcf => {
+                // BSWAP r32 (0F C8+r): reverse the byte order of a 32-bit register. The low
+                // three bits of the opcode pick the register. The 16-bit-operand form is
+                // architecturally undefined; we follow the documented Intel note and the common
+                // emulator choice of leaving the register contents undefined-but-unchanged, so a
+                // 66h-prefixed BSWAP here is a no-op rather than corrupting the value.
+                let reg = opcode & 0x07;
+                if matches!(operand_size, OperandSize::Dword) {
+                    let value = self.read_gpr32(reg);
+                    self.write_gpr32(reg, value.swap_bytes());
+                }
+                Ok(clocks(1))
             }
             _ => Err(CpuError::UnsupportedTwoByteOpcode {
                 opcode,
@@ -1941,6 +2153,11 @@ impl Cpu386 {
                         let modrm = self.peek_u8(bus, eip.wrapping_add(1))?;
                         modrm >> 6 != 3 && matches!((modrm >> 3) & 7, 5..=7)
                     }
+                    // CMPXCHG (B0/B1) and XADD (C0/C1) read-modify-write the r/m destination, so
+                    // LOCK is allowed only with a memory operand. The register-dest form is #UD.
+                    0xb0 | 0xb1 | 0xc0 | 0xc1 => self.peek_u8(bus, eip.wrapping_add(1))? >> 6 != 3,
+                    // BSWAP (C8+r) has a register destination and no memory form; INVD (08) and
+                    // WBINVD (09) take no operand. LOCK on any of them is #UD (the false arm).
                     _ => false,
                 }
             }
@@ -2341,6 +2558,7 @@ impl Cpu386 {
         size: OperandSize,
         kind: BusAccessKind,
     ) -> ExecResult<u32> {
+        self.check_alignment(offset, size.bytes())?;
         let physical = self.translate_segmented(bus, segment, offset, size.bytes(), false)?;
         Ok(bus.read_memory(physical, size.bus_width(), kind)?)
     }
@@ -2354,8 +2572,31 @@ impl Cpu386 {
         value: u32,
         kind: BusAccessKind,
     ) -> ExecResult<()> {
+        self.check_alignment(offset, size.bytes())?;
         let physical = self.translate_segmented(bus, segment, offset, size.bytes(), true)?;
         bus.write_memory(physical, size.bus_width(), value, kind)?;
+        Ok(())
+    }
+
+    // #AC alignment check (486). A data access faults vector 17 (no error code) when
+    // CR0.AM and EFLAGS.AC are both set and the access runs at CPL 3, and the effective
+    // address is not naturally aligned for its width (word on a 2-byte boundary, dword on
+    // a 4-byte boundary). Supervisor accesses (CPL < 3) and instruction fetches are exempt;
+    // fetches never route through this helper. Byte accesses (width 1) are always aligned.
+    fn check_alignment(&self, offset: u32, width: u32) -> ExecResult<()> {
+        if width <= 1 {
+            return Ok(());
+        }
+        let am = self.control.cr0 & CR0_AM != 0;
+        let ac = self.registers.eflags & FLAG_AC != 0;
+        if am && ac && self.current_privilege_level() == 3 && offset % width != 0 {
+            // Real 486 #AC pushes a zero error code; this core models it without one,
+            // matching the rest of the spec's fault contract. Flagged as a divergence.
+            return Err(InternalFault::Exception {
+                vector: 17,
+                error_code: None,
+            });
+        }
         Ok(())
     }
 
@@ -2393,10 +2634,11 @@ impl Cpu386 {
             return Ok(linear);
         }
 
-        // 386 paging privilege: CPL 3 is a user access, CPL 0-2 are supervisor.
-        // A 386 has no CR0.WP, so supervisor accesses bypass the R/W and U/S page
-        // bits entirely and only user accesses are protection-checked.
+        // Paging privilege: CPL 3 is a user access, CPL 0-2 are supervisor.
         let user = self.is_protected_mode() && (self.registers.cs().selector & 3) == 3;
+        // CR0.WP (a 486 addition) makes supervisor writes obey the page R/W bit too.
+        // With WP clear, supervisor writes to read-only pages succeed (386 behavior).
+        let wp = self.control.cr0 & CR0_WP != 0;
 
         let directory = self.control.cr3 & 0xffff_f000;
         let directory_address = directory + (((linear >> 22) & 0x03ff) * 4);
@@ -2433,11 +2675,24 @@ impl Cpu386 {
             });
         }
 
-        // User-mode protection: a page is user-accessible only if both the PDE and
-        // PTE U/S bits (bit 2) are set, and writable only if both R/W bits (bit 1)
-        // are set. A user access that violates either faults with present=1.
-        // Checked before the dirty bit is set so a faulting write leaves it clear.
-        if user && (pde & pte & 0x4 == 0 || (write && pde & pte & 0x2 == 0)) {
+        // Protection check. The combined R/W and U/S come from ANDing the PDE and
+        // PTE bits (bit 1 and bit 2). A page is user-accessible only if both U/S
+        // bits are set, and writable only if both R/W bits are set.
+        //   - A user access faults if it touches a supervisor page, or writes a
+        //     read-only page.
+        //   - A supervisor write faults only when CR0.WP is set and the page is
+        //     read-only (combined R/W = 0). With WP clear, supervisor writes pass.
+        // Either way the fault is present=1 and the error-code U/S bit reflects the
+        // access (user), not the page. Checked before the dirty bit is set so a
+        // faulting write leaves it clear.
+        let writable = pde & pte & 0x2 != 0;
+        let user_accessible = pde & pte & 0x4 != 0;
+        let protection_fault = if user {
+            !user_accessible || (write && !writable)
+        } else {
+            write && wp && !writable
+        };
+        if protection_fault {
             self.control.cr2 = linear;
             return Err(InternalFault::Exception {
                 vector: 14,
@@ -3811,6 +4066,67 @@ mod tests {
 
         // CPL 0: a 386 has no CR0.WP, so supervisor reaches the same page fine.
         cpu.registers.set_segment(SegmentIndex::Cs, flat_cs(0x0000));
+        assert_eq!(
+            cpu.translate_linear(&mut bus, 0x3000, false).unwrap(),
+            0x5000
+        );
+    }
+
+    #[test]
+    fn cr0_wp_gates_supervisor_writes_to_read_only_pages() {
+        // PD at 0x1000, PT at 0x2000. Linear 0x3000 maps to a present, read-only
+        // (R/W=0), supervisor (U/S=0) page at frame 0x5000.
+        let mut memory = vec![0; 0x6000];
+        memory[0x1000..0x1004].copy_from_slice(&0x0000_2001u32.to_le_bytes()); // PDE: PT, present, R/W=0, U/S=0
+        memory[0x200c..0x2010].copy_from_slice(&0x0000_5001u32.to_le_bytes()); // PTE[3]: frame, present, R/W=0, U/S=0
+        let mut cpu = Cpu386::default();
+        cpu.control.cr0 |= CR0_PE | CR0_PG;
+        cpu.control.cr3 = 0x1000;
+        // Supervisor: CPL 0.
+        cpu.registers.set_segment(
+            SegmentIndex::Cs,
+            SegmentRegister {
+                selector: 0x0000,
+                base: 0,
+                limit: 0xffff_ffff,
+                access: 0x9b,
+                default_size_32: false,
+            },
+        );
+        let mut bus = TestBus::with_memory(memory);
+
+        // WP clear (the 386 default): a supervisor write to the read-only page
+        // succeeds and resolves to the mapped frame.
+        assert_eq!(cpu.control.cr0 & CR0_WP, 0);
+        assert_eq!(
+            cpu.translate_linear(&mut bus, 0x3000, true).unwrap(),
+            0x5000
+        );
+
+        // A supervisor read always passes regardless of WP.
+        assert_eq!(
+            cpu.translate_linear(&mut bus, 0x3000, false).unwrap(),
+            0x5000
+        );
+
+        // WP set (the 486 feature): the same supervisor write now faults #PF with
+        // error code present|write (bits 0 and 1 -> 0b011 = 0x3); the U/S bit is 0
+        // because the access is supervisor, and cr2 holds the faulting address.
+        cpu.control.cr0 |= CR0_WP;
+        let faulted = cpu.translate_linear(&mut bus, 0x3000, true);
+        assert!(
+            matches!(
+                faulted,
+                Err(InternalFault::Exception {
+                    vector: 14,
+                    error_code: Some(0x3)
+                })
+            ),
+            "{faulted:?}"
+        );
+        assert_eq!(cpu.control.cr2, 0x3000);
+
+        // A supervisor read is unaffected by WP and still resolves.
         assert_eq!(
             cpu.translate_linear(&mut bus, 0x3000, false).unwrap(),
             0x5000
@@ -5627,8 +5943,9 @@ mod tests {
 
     #[test]
     fn pushfd_pushes_only_defined_eflags_bits() {
-        // 0x66 0x9c PUSHFD. EFLAGS carries garbage in the high bits; the 386 pushes
-        // only the defined low 16, so the dword on the stack is 0x0000_0493.
+        // 0x66 0x9c PUSHFD. EFLAGS carries garbage in the high bits; the 486 pushes
+        // the defined low 16 plus AC (bit 18) and ID (bit 21). With every high bit
+        // set in the source, the dword on the stack is 0x0024_0493.
         let mut memory = vec![0; 1024];
         memory[0..2].copy_from_slice(&[0x66, 0x9c]);
         let mut cpu = Cpu386::default();
@@ -5647,7 +5964,7 @@ mod tests {
             bus.memory[0xfe],
             bus.memory[0xff],
         ]);
-        assert_eq!(pushed, 0x0000_0493);
+        assert_eq!(pushed, 0x0024_0493);
         assert_eq!(cpu.registers.esp(), 0x0000_00fc);
     }
 
@@ -7769,6 +8086,197 @@ mod tests {
     }
 
     #[test]
+    fn bswap_reverses_dword_byte_order() {
+        // bswap eax (0x0f 0xc8). eax = 0x12345678 -> 0x78563412 in 32-bit operand mode.
+        let mut memory = vec![0; 64];
+        memory[0..2].copy_from_slice(&[0x0f, 0xc8]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        // A 32-bit code segment so the default operand size is dword.
+        let mut cs = cpu.registers.cs();
+        cs.default_size_32 = true;
+        cpu.registers.set_segment(SegmentIndex::Cs, cs);
+        cpu.write_gpr32(0, 0x1234_5678);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_gpr32(0), 0x7856_3412);
+        // A second BSWAP restores the original (round-trip).
+        cpu.registers.eip = 0;
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.read_gpr32(0), 0x1234_5678);
+    }
+
+    #[test]
+    fn invd_and_wbinvd_noop_at_cpl0() {
+        // invd (0x0f 0x08) then wbinvd (0x0f 0x09) in real mode (CPL 0). Both are no-ops:
+        // they advance past their two bytes and touch no register or flag.
+        let mut memory = vec![0; 64];
+        memory[0..4].copy_from_slice(&[0x0f, 0x08, 0x0f, 0x09]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        let flags_before = cpu.registers.eflags;
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.eip, 2);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.eip, 4);
+        assert_eq!(cpu.registers.eflags, flags_before);
+    }
+
+    #[test]
+    fn invd_at_cpl3_delivers_ud() {
+        // invd (0x0f 0x08) at CPL 3 in protected mode raises #UD (vector 6).
+        let mut cpu = Cpu386::default();
+        cpu.control.cr0 |= CR0_PE;
+        cpu.registers.set_segment(
+            SegmentIndex::Cs,
+            SegmentRegister {
+                selector: 0x0003,
+                base: 0,
+                limit: 0xffff_ffff,
+                access: 0x9b,
+                default_size_32: false,
+            },
+        );
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(vec![0x0f, 0x08, 0, 0]);
+
+        let result = cpu.execute_instruction(&mut bus);
+
+        assert!(
+            matches!(
+                result,
+                Err(InternalFault::Exception {
+                    vector: 6,
+                    error_code: None
+                })
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn wbinvd_at_cpl3_delivers_ud() {
+        // wbinvd (0x0f 0x09) at CPL 3 in protected mode raises #UD (vector 6).
+        let mut cpu = Cpu386::default();
+        cpu.control.cr0 |= CR0_PE;
+        cpu.registers.set_segment(
+            SegmentIndex::Cs,
+            SegmentRegister {
+                selector: 0x0003,
+                base: 0,
+                limit: 0xffff_ffff,
+                access: 0x9b,
+                default_size_32: false,
+            },
+        );
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(vec![0x0f, 0x09, 0, 0]);
+
+        let result = cpu.execute_instruction(&mut bus);
+
+        assert!(
+            matches!(
+                result,
+                Err(InternalFault::Exception {
+                    vector: 6,
+                    error_code: None
+                })
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn invlpg_memory_noop_at_cpl0() {
+        // invlpg [0x40] (0x0f 0x01 0x3e 0x40 0x00, /7 with a memory operand) in real mode.
+        // No TLB is modeled, so it is a no-op that advances past its bytes and leaves the
+        // pointed-at memory untouched.
+        let mut memory = vec![0; 128];
+        memory[0..5].copy_from_slice(&[0x0f, 0x01, 0x3e, 0x40, 0x00]);
+        memory[0x40] = 0xaa;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eip, 5);
+        assert_eq!(bus.memory[0x40], 0xaa);
+    }
+
+    #[test]
+    fn invlpg_at_cpl3_delivers_ud() {
+        // invlpg [0x40] at CPL 3 in protected mode raises #UD (vector 6).
+        let mut cpu = Cpu386::default();
+        cpu.control.cr0 |= CR0_PE;
+        cpu.registers.set_segment(
+            SegmentIndex::Cs,
+            SegmentRegister {
+                selector: 0x0003,
+                base: 0,
+                limit: 0xffff_ffff,
+                access: 0x9b,
+                default_size_32: false,
+            },
+        );
+        cpu.registers.set_segment(
+            SegmentIndex::Ds,
+            SegmentRegister {
+                selector: 0x0003,
+                base: 0,
+                limit: 0xffff_ffff,
+                access: 0x93,
+                default_size_32: false,
+            },
+        );
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(vec![0x0f, 0x01, 0x3e, 0x40, 0x00, 0, 0, 0]);
+
+        let result = cpu.execute_instruction(&mut bus);
+
+        assert!(
+            matches!(
+                result,
+                Err(InternalFault::Exception {
+                    vector: 6,
+                    error_code: None
+                })
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn invlpg_register_form_delivers_ud() {
+        // 0F 01 /7 with a register operand (mod=3) is #UD. ModRM 0xff = mod 3, reg 7, rm 7.
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(vec![0x0f, 0x01, 0xff, 0, 0]);
+
+        let result = cpu.execute_instruction(&mut bus);
+
+        assert!(
+            matches!(
+                result,
+                Err(InternalFault::Exception {
+                    vector: 6,
+                    error_code: None
+                })
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
     fn hardware_irq_injects_when_if_enabled() {
         // IVT[8] (physical 0x20) -> IP 0x00cc, CS 0. With IF=1 and a pending IRQ,
         // cycle() vectors to the handler before the NOP at eip 0 can execute.
@@ -7852,5 +8360,461 @@ mod tests {
         cpu.set_flag(FLAG_IF, false);
         bus.pending_irq = Some(8);
         assert!(cpu.cycle(&mut bus).unwrap().halted);
+    }
+
+    // --- 486 read-modify-write opcodes: XADD and CMPXCHG ---
+
+    #[test]
+    fn xadd_byte_swaps_and_adds_with_add_flags() {
+        // 0F C0 /r XADD r/m8, r8. ModRM C3: mode 3, reg = AL(0), rm = BL(3).
+        // dest = BL, src = AL. After: BL = BL + AL, AL = old BL, flags like ADD(BL, AL).
+        let mut memory = vec![0; 16];
+        memory[0..3].copy_from_slice(&[0x0f, 0xc0, 0xc3]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_gpr8(0, 0x01); // AL (src)
+        cpu.write_gpr8(3, 0xff); // BL (dest)
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_gpr8(3), 0x00); // dest = 0xff + 0x01
+        assert_eq!(cpu.read_gpr8(0), 0xff); // src = old dest
+        // 0xff + 0x01 wraps to 0 with carry, half-carry, and a zero result.
+        assert!(cpu.flag(FLAG_CF));
+        assert!(cpu.flag(FLAG_ZF));
+        assert!(cpu.flag(FLAG_AF));
+        assert!(!cpu.flag(FLAG_OF));
+        assert!(!cpu.flag(FLAG_SF));
+    }
+
+    #[test]
+    fn xadd_word_matches_add_flags() {
+        // 0F C1 /r XADD r/m16, r16. ModRM C3: reg = AX(0), rm = BX(3).
+        let mut memory = vec![0; 16];
+        memory[0..3].copy_from_slice(&[0x0f, 0xc1, 0xc3]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_gpr16(0, 0x7fff); // AX (src)
+        cpu.write_gpr16(3, 0x0001); // BX (dest)
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_gpr16(3), 0x8000); // 0x0001 + 0x7fff
+        assert_eq!(cpu.read_gpr16(0), 0x0001); // old dest
+        // Signed overflow: positive + positive crossed into the sign bit.
+        assert!(cpu.flag(FLAG_OF));
+        assert!(cpu.flag(FLAG_SF));
+        assert!(!cpu.flag(FLAG_CF));
+        assert!(!cpu.flag(FLAG_ZF));
+    }
+
+    #[test]
+    fn xadd_dword_matches_add_flags() {
+        // 66h is not needed: with a 32-bit operand prefix on a real-mode CS, 66 0F C1 /r.
+        // ModRM C3: reg = EAX(0), rm = EBX(3).
+        let mut memory = vec![0; 16];
+        memory[0..4].copy_from_slice(&[0x66, 0x0f, 0xc1, 0xc3]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_eax(0x1111_1111); // src
+        cpu.registers.set_ebx(0x2222_2222); // dest
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.ebx(), 0x3333_3333);
+        assert_eq!(cpu.registers.eax(), 0x2222_2222);
+        assert!(!cpu.flag(FLAG_CF));
+        assert!(!cpu.flag(FLAG_OF));
+        assert!(!cpu.flag(FLAG_ZF));
+        assert!(!cpu.flag(FLAG_SF));
+    }
+
+    #[test]
+    fn cmpxchg_byte_equal_stores_source() {
+        // 0F B0 /r CMPXCHG r/m8, r8. ModRM C3: reg = CL(1, src), rm = BL(3, dest).
+        // AL == BL so ZF is set and the source (CL) is stored into BL; AL is unchanged.
+        let mut memory = vec![0; 16];
+        memory[0..3].copy_from_slice(&[0x0f, 0xb0, 0xcb]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_gpr8(0, 0x42); // AL (accumulator)
+        cpu.write_gpr8(3, 0x42); // BL (dest), equal to AL
+        cpu.write_gpr8(1, 0x99); // CL (src)
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert!(cpu.flag(FLAG_ZF)); // equal compare
+        assert_eq!(cpu.read_gpr8(3), 0x99); // dest = src
+        assert_eq!(cpu.read_gpr8(0), 0x42); // accumulator unchanged
+    }
+
+    #[test]
+    fn cmpxchg_byte_unequal_loads_destination() {
+        // AL != BL: ZF clear, AL = BL, BL unchanged.
+        let mut memory = vec![0; 16];
+        memory[0..3].copy_from_slice(&[0x0f, 0xb0, 0xcb]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_gpr8(0, 0x42); // AL
+        cpu.write_gpr8(3, 0x10); // BL (dest), not equal
+        cpu.write_gpr8(1, 0x99); // CL (src)
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert!(!cpu.flag(FLAG_ZF)); // unequal compare
+        assert_eq!(cpu.read_gpr8(0), 0x10); // accumulator = dest
+        assert_eq!(cpu.read_gpr8(3), 0x10); // dest unchanged
+        // Flags must match CMP(0x42, 0x10) = 0x32: no borrow, positive, nonzero.
+        assert!(!cpu.flag(FLAG_CF));
+        assert!(!cpu.flag(FLAG_SF));
+    }
+
+    #[test]
+    fn cmpxchg_word_equal_stores_source() {
+        // 0F B1 /r CMPXCHG r/m16, r16. ModRM C3: reg = CX(1, src), rm = BX(3, dest).
+        let mut memory = vec![0; 16];
+        memory[0..3].copy_from_slice(&[0x0f, 0xb1, 0xcb]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_gpr16(0, 0x1234); // AX
+        cpu.write_gpr16(3, 0x1234); // BX, equal
+        cpu.write_gpr16(1, 0xbeef); // CX (src)
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert!(cpu.flag(FLAG_ZF));
+        assert_eq!(cpu.read_gpr16(3), 0xbeef);
+        assert_eq!(cpu.read_gpr16(0), 0x1234);
+    }
+
+    #[test]
+    fn cmpxchg_dword_unequal_loads_destination() {
+        // 66 0F B1 /r CMPXCHG r/m32, r32. ModRM C3: reg = ECX(1, src), rm = EBX(3, dest).
+        let mut memory = vec![0; 16];
+        memory[0..4].copy_from_slice(&[0x66, 0x0f, 0xb1, 0xcb]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_eax(0xaaaa_aaaa); // EAX
+        cpu.registers.set_ebx(0x5555_5555); // EBX (dest), not equal
+        cpu.registers.set_ecx(0xdead_beef); // ECX (src)
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert!(!cpu.flag(FLAG_ZF));
+        assert_eq!(cpu.registers.eax(), 0x5555_5555); // accumulator = dest
+        assert_eq!(cpu.registers.ebx(), 0x5555_5555); // dest unchanged
+    }
+
+    #[test]
+    fn lock_xadd_to_memory_is_accepted() {
+        // F0 0F C1 06 00 02: LOCK XADD [0x0200], AX. ModRM 06 is mode 0 rm 6 (direct disp16),
+        // a memory destination, so the LOCK is legal and the instruction runs.
+        let mut memory = vec![0; 1024];
+        memory[0..6].copy_from_slice(&[0xf0, 0x0f, 0xc1, 0x06, 0x00, 0x02]);
+        memory[0x200..0x202].copy_from_slice(&0x0010u16.to_le_bytes());
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        cpu.write_gpr16(0, 0x0001); // AX (src)
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        // [0x0200] = 0x0010 + 0x0001, AX = old [0x0200].
+        assert_eq!(
+            u16::from_le_bytes([bus.memory[0x200], bus.memory[0x201]]),
+            0x0011
+        );
+        assert_eq!(cpu.read_gpr16(0), 0x0010);
+    }
+
+    #[test]
+    fn lock_xadd_to_register_is_undefined_opcode() {
+        // F0 0F C1 C3: LOCK XADD BX, AX. The register destination makes the LOCK prefix illegal,
+        // so the decoder raises #UD (vector 6) before executing.
+        let mut memory = vec![0; 16];
+        memory[0..4].copy_from_slice(&[0xf0, 0x0f, 0xc1, 0xc3]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(memory);
+
+        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
+    }
+
+    #[test]
+    fn lock_bswap_is_undefined_opcode() {
+        // F0 0F C8: LOCK BSWAP EAX. BSWAP has no memory form, so LOCK is always #UD.
+        let mut memory = vec![0; 16];
+        memory[0..3].copy_from_slice(&[0xf0, 0x0f, 0xc8]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(memory);
+
+        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
+    }
+
+    // Build a CPL-3 protected-mode CPU whose CS and DS are flat user segments, running
+    // MOV AX, moffs16 (0xa1) that reads a word from DS:moffs. The caller picks the
+    // moffs so the access lands on an even or odd boundary.
+    fn cpl3_word_read_at(moffs: u16) -> (Cpu386, TestBus) {
+        let mut memory = vec![0; 256];
+        memory[0] = 0xa1;
+        memory[1..3].copy_from_slice(&moffs.to_le_bytes());
+        let mut cpu = Cpu386::default();
+        cpu.control.cr0 |= CR0_PE;
+        cpu.registers.set_segment(
+            SegmentIndex::Cs,
+            SegmentRegister {
+                selector: 0x0003,
+                base: 0,
+                limit: 0xffff_ffff,
+                access: 0x9b,
+                default_size_32: false,
+            },
+        );
+        cpu.registers.set_segment(
+            SegmentIndex::Ds,
+            SegmentRegister {
+                selector: 0x0003,
+                base: 0,
+                limit: 0xffff_ffff,
+                access: 0x93,
+                default_size_32: false,
+            },
+        );
+        cpu.registers.eip = 0;
+        (cpu, TestBus::with_memory(memory))
+    }
+
+    #[test]
+    fn misaligned_word_read_faults_ac_when_am_and_ac_set_at_cpl3() {
+        // CR0.AM and EFLAGS.AC both set, CPL 3, odd word address: #AC (vector 17, no
+        // error code).
+        let (mut cpu, mut bus) = cpl3_word_read_at(0x0041);
+        cpu.control.cr0 |= CR0_AM;
+        cpu.set_flag(FLAG_AC, true);
+
+        let result = cpu.execute_instruction(&mut bus);
+
+        assert!(
+            matches!(
+                result,
+                Err(InternalFault::Exception {
+                    vector: 17,
+                    error_code: None
+                })
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn misaligned_word_read_no_fault_without_cr0_am() {
+        // EFLAGS.AC set but CR0.AM clear: the alignment check stays masked, no fault.
+        // Set CR0 bit 4 (ET) too: it is not AM, so it must not arm the check.
+        let (mut cpu, mut bus) = cpl3_word_read_at(0x0041);
+        cpu.control.cr0 |= 0x0000_0010; // bit 4 (ET), not AM
+        cpu.set_flag(FLAG_AC, true);
+
+        assert!(cpu.execute_instruction(&mut bus).is_ok());
+    }
+
+    #[test]
+    fn misaligned_word_read_no_fault_without_eflags_ac() {
+        // CR0.AM set but EFLAGS.AC clear: software has not opted in, no fault.
+        let (mut cpu, mut bus) = cpl3_word_read_at(0x0041);
+        cpu.control.cr0 |= CR0_AM;
+
+        assert!(cpu.execute_instruction(&mut bus).is_ok());
+    }
+
+    #[test]
+    fn misaligned_word_read_no_fault_at_supervisor() {
+        // AM and AC both set, but CPL 0 (supervisor): exempt, no fault. Reuse the
+        // CPL-3 setup and drop CS/DS RPL to 0.
+        let (mut cpu, mut bus) = cpl3_word_read_at(0x0041);
+        cpu.control.cr0 |= CR0_AM;
+        cpu.set_flag(FLAG_AC, true);
+        let mut cs = cpu.registers.cs();
+        cs.selector = 0x0000;
+        cpu.registers.set_segment(SegmentIndex::Cs, cs);
+        let mut ds = cpu.registers.segment(SegmentIndex::Ds);
+        ds.selector = 0x0000;
+        cpu.registers.set_segment(SegmentIndex::Ds, ds);
+
+        assert!(cpu.execute_instruction(&mut bus).is_ok());
+    }
+
+    #[test]
+    fn aligned_word_read_never_faults_with_am_and_ac() {
+        // Even word address: aligned, so no #AC even with AM and AC set at CPL 3.
+        let (mut cpu, mut bus) = cpl3_word_read_at(0x0040);
+        cpu.control.cr0 |= CR0_AM;
+        cpu.set_flag(FLAG_AC, true);
+
+        assert!(cpu.execute_instruction(&mut bus).is_ok());
+    }
+
+    #[test]
+    fn eflags_ac_and_id_survive_pushf_popf_round_trip() {
+        // 66 9c PUSHFD ; 66 9d POPFD. Set AC and ID, perturb both after they reach the
+        // stack, and confirm POPFD restores them from the dword flag image.
+        let mut memory = vec![0; 1024];
+        memory[0..2].copy_from_slice(&[0x66, 0x9c]);
+        memory[2..4].copy_from_slice(&[0x66, 0x9d]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        cpu.set_flag(FLAG_AC, true);
+        cpu.set_flag(FLAG_ID, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap(); // pushfd
+        cpu.set_flag(FLAG_AC, false); // perturb after the image is on the stack
+        cpu.set_flag(FLAG_ID, false);
+        cpu.cycle(&mut bus).unwrap(); // popfd
+
+        assert!(cpu.flag(FLAG_AC));
+        assert!(cpu.flag(FLAG_ID));
+    }
+
+    fn run_cpuid(leaf: u32) -> Cpu386 {
+        // CPUID (0F A2) with the leaf selector in EAX. Returns the CPU after one step so the
+        // caller can read EAX/EBX/ECX/EDX.
+        let mut memory = vec![0; 64];
+        memory[0..2].copy_from_slice(&[0x0f, 0xa2]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_eax(leaf);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        cpu
+    }
+
+    #[test]
+    fn cpuid_leaf0_reports_vendor_string_and_max_leaf() {
+        let cpu = run_cpuid(0);
+        // Max basic leaf is 1.
+        assert_eq!(cpu.registers.eax(), 1);
+        // Vendor string "IzarraGSW586" in the standard EBX, EDX, ECX order, four bytes
+        // little-endian per register.
+        assert_eq!(cpu.registers.ebx().to_le_bytes(), *b"Izar");
+        assert_eq!(cpu.registers.edx().to_le_bytes(), *b"raGS");
+        assert_eq!(cpu.registers.ecx().to_le_bytes(), *b"W586");
+        // Concatenating EBX:EDX:ECX yields the full 12-byte vendor string.
+        let mut vendor = [0u8; 12];
+        vendor[0..4].copy_from_slice(&cpu.registers.ebx().to_le_bytes());
+        vendor[4..8].copy_from_slice(&cpu.registers.edx().to_le_bytes());
+        vendor[8..12].copy_from_slice(&cpu.registers.ecx().to_le_bytes());
+        assert_eq!(&vendor, b"IzarraGSW586");
+    }
+
+    #[test]
+    fn cpuid_leaf1_reports_family5_and_mmx_without_fpu() {
+        let cpu = run_cpuid(1);
+        let eax = cpu.registers.eax();
+        // Family is bits 11-8 and must be 5 (586 / K6 class).
+        assert_eq!((eax >> 8) & 0xf, 5);
+        // Type is bits 13-12 (OEM = 0).
+        assert_eq!((eax >> 12) & 0x3, 0);
+        // MMX is bit 23 of EDX; FPU is bit 0 and must be off.
+        let edx = cpu.registers.edx();
+        assert_ne!(edx & (1 << 23), 0, "MMX bit should be set");
+        assert_eq!(edx & 1, 0, "FPU bit should be clear");
+        // Brand index 0 and no extended feature claimed.
+        assert_eq!(cpu.registers.ebx(), 0);
+        assert_eq!(cpu.registers.ecx(), 0);
+    }
+
+    #[test]
+    fn cpuid_unknown_leaf_returns_zeros() {
+        let cpu = run_cpuid(0x4000_0000);
+        assert_eq!(cpu.registers.eax(), 0);
+        assert_eq!(cpu.registers.ebx(), 0);
+        assert_eq!(cpu.registers.ecx(), 0);
+        assert_eq!(cpu.registers.edx(), 0);
+    }
+
+    #[test]
+    fn cpuid_is_not_privileged_at_cpl3() {
+        // CPUID runs at any privilege level. In protected mode at CPL 3 it must execute,
+        // not fault, and still report the GSW-586 identity.
+        let mut cpu = Cpu386::default();
+        cpu.control.cr0 |= CR0_PE;
+        cpu.registers.set_segment(
+            SegmentIndex::Cs,
+            SegmentRegister {
+                selector: 0x0003,
+                base: 0,
+                limit: 0xffff_ffff,
+                access: 0x9b,
+                default_size_32: false,
+            },
+        );
+        cpu.registers.eip = 0;
+        cpu.registers.set_eax(0);
+        let mut bus = TestBus::with_memory(vec![0x0f, 0xa2, 0, 0]);
+
+        assert!(cpu.execute_instruction(&mut bus).is_ok());
+        assert_eq!(cpu.registers.eax(), 1);
+        assert_eq!(cpu.registers.ebx().to_le_bytes(), *b"Izar");
+    }
+
+    #[test]
+    fn id_flag_toggle_detection_sequence_finds_cpuid() {
+        // The standard CPUID-presence probe: read EFLAGS, flip ID (bit 21), write it back,
+        // read EFLAGS again, and conclude CPUID exists if ID changed. Model that here using
+        // PUSHFD/POPFD plus a software toggle of FLAG_ID, then run CPUID leaf 0 to confirm
+        // the detection concludes correctly.
+        let mut memory = vec![0; 1024];
+        // 66 9c PUSHFD ; 66 9d POPFD to round-trip the dword image carrying ID.
+        memory[0..2].copy_from_slice(&[0x66, 0x9c]);
+        memory[2..4].copy_from_slice(&[0x66, 0x9d]);
+        // 0f a2 CPUID with EAX = 0 already loaded.
+        memory[4..6].copy_from_slice(&[0x0f, 0xa2]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        cpu.registers.set_eax(0);
+        let mut bus = TestBus::with_memory(memory);
+
+        // Establish ID = 0, flip it on, and confirm the flag image carries the change so a
+        // detection routine would observe ID as toggleable (CPUID present).
+        let before = cpu.flag(FLAG_ID);
+        cpu.set_flag(FLAG_ID, !before);
+        cpu.cycle(&mut bus).unwrap(); // pushfd captures ID = 1
+        cpu.set_flag(FLAG_ID, before); // perturb
+        cpu.cycle(&mut bus).unwrap(); // popfd restores ID = 1
+        let toggled = cpu.flag(FLAG_ID);
+        assert_eq!(toggled, !before, "ID flag must be toggleable");
+
+        // Detection concluded CPUID is present; execute it and confirm the GSW-586 vendor.
+        cpu.cycle(&mut bus).unwrap(); // cpuid
+        assert_eq!(cpu.registers.eax(), 1);
+        assert_eq!(cpu.registers.ebx().to_le_bytes(), *b"Izar");
     }
 }
