@@ -10,21 +10,24 @@ const FLAG_TF: u32 = 0x0000_0100;
 const FLAG_IF: u32 = 0x0000_0200;
 const FLAG_DF: u32 = 0x0000_0400;
 const FLAG_OF: u32 = 0x0000_0800;
+// 486 EFLAGS additions. AC (bit 18) is the alignment-check enable consulted by the
+// #AC path together with CR0.AM; ID (bit 21) is the toggleable bit software flips to
+// probe for CPUID. Both are plain read/write storage otherwise, and both survive a
+// PUSHFD/POPFD round-trip (the dword flag image carries them).
+const FLAG_AC: u32 = 0x0004_0000; // bit 18
+const FLAG_ID: u32 = 0x0020_0000; // bit 21
 
 const CR0_PE: u32 = 0x0000_0001;
 const CR0_PG: u32 = 0x8000_0000;
-// 486 control bits added to the 386's PE/PG. Only WP changes behavior here: it
-// gates supervisor writes to read-only pages in translate_linear. The rest are
+// 486 control bits added to the 386's PE/PG. WP gates supervisor writes to read-only
+// pages in translate_linear, and AM enables the #AC alignment-check path. The rest are
 // read/write storage with no modeled effect, kept so MOV CR0 round-trips them:
-//   AM (bit 4)  alignment-check mask; the #AC path that would consult it is a
-//               separate slice, so AM is inert today.
 //   NE (bit 5)  numeric-error reporting; no FPU is emulated, so it is cosmetic.
 //   NW (bit 29) / CD (bit 30) cache control; no cache is modeled, so both are
 //               cosmetic.
 // The cosmetic constants document the bit layout in one place; they are not yet
 // read by the core, hence the allow on the trio that has no consumer.
 const CR0_WP: u32 = 0x0001_0000; // bit 16
-#[allow(dead_code)]
 const CR0_AM: u32 = 0x0000_0010; // bit 4
 #[allow(dead_code)]
 const CR0_NE: u32 = 0x0000_0020; // bit 5
@@ -849,12 +852,14 @@ impl Cpu386 {
                 Ok(clocks(2))
             }
             0x9c => {
-                // PUSHF / PUSHFD. The 386 EFLAGS defines no bits above 15 except RF and
-                // VM, both of which PUSHFD clears in the pushed image, so both forms push
-                // the identical low 16 flag bits; the dword form just zero-extends to 32.
-                // Confirmed against the 669C vectors. operand_size still drives whether
-                // push writes 2 or 4 bytes.
-                let value = self.registers.eflags & 0xffff;
+                // PUSHF / PUSHFD. The low 16 flag bits push the same in both forms. The
+                // dword form additionally carries the 486 AC and ID bits (RF and VM are
+                // masked to 0 in the pushed image, so they never appear). operand_size
+                // drives whether push writes 2 or 4 bytes.
+                let value = match operand_size {
+                    OperandSize::Word => self.registers.eflags & 0xffff,
+                    OperandSize::Dword => self.registers.eflags & (0xffff | FLAG_AC | FLAG_ID),
+                };
                 self.push(bus, value, operand_size)?;
                 Ok(clocks(3))
             }
@@ -2488,6 +2493,7 @@ impl Cpu386 {
         size: OperandSize,
         kind: BusAccessKind,
     ) -> ExecResult<u32> {
+        self.check_alignment(offset, size.bytes())?;
         let physical = self.translate_segmented(bus, segment, offset, size.bytes(), false)?;
         Ok(bus.read_memory(physical, size.bus_width(), kind)?)
     }
@@ -2501,8 +2507,31 @@ impl Cpu386 {
         value: u32,
         kind: BusAccessKind,
     ) -> ExecResult<()> {
+        self.check_alignment(offset, size.bytes())?;
         let physical = self.translate_segmented(bus, segment, offset, size.bytes(), true)?;
         bus.write_memory(physical, size.bus_width(), value, kind)?;
+        Ok(())
+    }
+
+    // #AC alignment check (486). A data access faults vector 17 (no error code) when
+    // CR0.AM and EFLAGS.AC are both set and the access runs at CPL 3, and the effective
+    // address is not naturally aligned for its width (word on a 2-byte boundary, dword on
+    // a 4-byte boundary). Supervisor accesses (CPL < 3) and instruction fetches are exempt;
+    // fetches never route through this helper. Byte accesses (width 1) are always aligned.
+    fn check_alignment(&self, offset: u32, width: u32) -> ExecResult<()> {
+        if width <= 1 {
+            return Ok(());
+        }
+        let am = self.control.cr0 & CR0_AM != 0;
+        let ac = self.registers.eflags & FLAG_AC != 0;
+        if am && ac && self.current_privilege_level() == 3 && offset % width != 0 {
+            // Real 486 #AC pushes a zero error code; this core models it without one,
+            // matching the rest of the spec's fault contract. Flagged as a divergence.
+            return Err(InternalFault::Exception {
+                vector: 17,
+                error_code: None,
+            });
+        }
         Ok(())
     }
 
@@ -5849,8 +5878,9 @@ mod tests {
 
     #[test]
     fn pushfd_pushes_only_defined_eflags_bits() {
-        // 0x66 0x9c PUSHFD. EFLAGS carries garbage in the high bits; the 386 pushes
-        // only the defined low 16, so the dword on the stack is 0x0000_0493.
+        // 0x66 0x9c PUSHFD. EFLAGS carries garbage in the high bits; the 486 pushes
+        // the defined low 16 plus AC (bit 18) and ID (bit 21). With every high bit
+        // set in the source, the dword on the stack is 0x0024_0493.
         let mut memory = vec![0; 1024];
         memory[0..2].copy_from_slice(&[0x66, 0x9c]);
         let mut cpu = Cpu386::default();
@@ -5869,7 +5899,7 @@ mod tests {
             bus.memory[0xfe],
             bus.memory[0xff],
         ]);
-        assert_eq!(pushed, 0x0000_0493);
+        assert_eq!(pushed, 0x0024_0493);
         assert_eq!(cpu.registers.esp(), 0x0000_00fc);
     }
 
@@ -8475,5 +8505,130 @@ mod tests {
 
         let fault = cpu.execute_instruction(&mut bus).unwrap_err();
         assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
+    }
+
+    // Build a CPL-3 protected-mode CPU whose CS and DS are flat user segments, running
+    // MOV AX, moffs16 (0xa1) that reads a word from DS:moffs. The caller picks the
+    // moffs so the access lands on an even or odd boundary.
+    fn cpl3_word_read_at(moffs: u16) -> (Cpu386, TestBus) {
+        let mut memory = vec![0; 256];
+        memory[0] = 0xa1;
+        memory[1..3].copy_from_slice(&moffs.to_le_bytes());
+        let mut cpu = Cpu386::default();
+        cpu.control.cr0 |= CR0_PE;
+        cpu.registers.set_segment(
+            SegmentIndex::Cs,
+            SegmentRegister {
+                selector: 0x0003,
+                base: 0,
+                limit: 0xffff_ffff,
+                access: 0x9b,
+                default_size_32: false,
+            },
+        );
+        cpu.registers.set_segment(
+            SegmentIndex::Ds,
+            SegmentRegister {
+                selector: 0x0003,
+                base: 0,
+                limit: 0xffff_ffff,
+                access: 0x93,
+                default_size_32: false,
+            },
+        );
+        cpu.registers.eip = 0;
+        (cpu, TestBus::with_memory(memory))
+    }
+
+    #[test]
+    fn misaligned_word_read_faults_ac_when_am_and_ac_set_at_cpl3() {
+        // CR0.AM and EFLAGS.AC both set, CPL 3, odd word address: #AC (vector 17, no
+        // error code).
+        let (mut cpu, mut bus) = cpl3_word_read_at(0x0041);
+        cpu.control.cr0 |= CR0_AM;
+        cpu.set_flag(FLAG_AC, true);
+
+        let result = cpu.execute_instruction(&mut bus);
+
+        assert!(
+            matches!(
+                result,
+                Err(InternalFault::Exception {
+                    vector: 17,
+                    error_code: None
+                })
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn misaligned_word_read_no_fault_without_cr0_am() {
+        // EFLAGS.AC set but CR0.AM clear: the alignment check stays masked, no fault.
+        let (mut cpu, mut bus) = cpl3_word_read_at(0x0041);
+        cpu.set_flag(FLAG_AC, true);
+
+        assert!(cpu.execute_instruction(&mut bus).is_ok());
+    }
+
+    #[test]
+    fn misaligned_word_read_no_fault_without_eflags_ac() {
+        // CR0.AM set but EFLAGS.AC clear: software has not opted in, no fault.
+        let (mut cpu, mut bus) = cpl3_word_read_at(0x0041);
+        cpu.control.cr0 |= CR0_AM;
+
+        assert!(cpu.execute_instruction(&mut bus).is_ok());
+    }
+
+    #[test]
+    fn misaligned_word_read_no_fault_at_supervisor() {
+        // AM and AC both set, but CPL 0 (supervisor): exempt, no fault. Reuse the
+        // CPL-3 setup and drop CS/DS RPL to 0.
+        let (mut cpu, mut bus) = cpl3_word_read_at(0x0041);
+        cpu.control.cr0 |= CR0_AM;
+        cpu.set_flag(FLAG_AC, true);
+        let mut cs = cpu.registers.cs();
+        cs.selector = 0x0000;
+        cpu.registers.set_segment(SegmentIndex::Cs, cs);
+        let mut ds = cpu.registers.segment(SegmentIndex::Ds);
+        ds.selector = 0x0000;
+        cpu.registers.set_segment(SegmentIndex::Ds, ds);
+
+        assert!(cpu.execute_instruction(&mut bus).is_ok());
+    }
+
+    #[test]
+    fn aligned_word_read_never_faults_with_am_and_ac() {
+        // Even word address: aligned, so no #AC even with AM and AC set at CPL 3.
+        let (mut cpu, mut bus) = cpl3_word_read_at(0x0040);
+        cpu.control.cr0 |= CR0_AM;
+        cpu.set_flag(FLAG_AC, true);
+
+        assert!(cpu.execute_instruction(&mut bus).is_ok());
+    }
+
+    #[test]
+    fn eflags_ac_and_id_survive_pushf_popf_round_trip() {
+        // 66 9c PUSHFD ; 66 9d POPFD. Set AC and ID, perturb both after they reach the
+        // stack, and confirm POPFD restores them from the dword flag image.
+        let mut memory = vec![0; 1024];
+        memory[0..2].copy_from_slice(&[0x66, 0x9c]);
+        memory[2..4].copy_from_slice(&[0x66, 0x9d]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x0100);
+        cpu.set_flag(FLAG_AC, true);
+        cpu.set_flag(FLAG_ID, true);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap(); // pushfd
+        cpu.set_flag(FLAG_AC, false); // perturb after the image is on the stack
+        cpu.set_flag(FLAG_ID, false);
+        cpu.cycle(&mut bus).unwrap(); // popfd
+
+        assert!(cpu.flag(FLAG_AC));
+        assert!(cpu.flag(FLAG_ID));
     }
 }
