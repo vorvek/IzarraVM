@@ -83,7 +83,12 @@ ramtest_run:
     mov [RAMTEST_KIB], ebx         ; total KiB (segment 0)
     mov cx, BDA_SEG
     mov ds, cx
-    mov [0x0013], bx               ; INT 12h word (low 16 bits of KiB)
+    ; The INT 12h word reports conventional memory only, which a PC caps at
+    ; 640 KiB however much RAM is installed. Booters size their heap off this
+    ; word; handing them the full total puts their arena above 640 KiB in
+    ; ROM/unmapped space and corrupts it on the first free. The full total
+    ; still lands in RAMTEST_KIB and the on-screen counter.
+    mov word [0x0013], 640         ; INT 12h conventional-memory word
     pop ecx                        ; ECX = extended KiB (no longer needed)
 
     ; --- choose both strides from the POST-pacing port. ECX takes the conventional

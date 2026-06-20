@@ -41,6 +41,27 @@ const DD_BYTES_PER_SEC: f64 = 31_250.0;
 /// Map a raw image length to a CHS geometry, or None for an unrecognized size.
 pub fn geometry_for(size: usize) -> Option<Geometry> {
     Some(match size {
+        // The early 5.25" formats. All double-density (250 kbit/s), so they share
+        // the 0x03 drive type the 360 KB disk uses; only the head and sector
+        // counts differ. 160/180 KB are single-sided.
+        163_840 => Geometry {
+            cylinders: 40,
+            heads: 1,
+            sectors: 8,
+            drive_type: 0x03,
+        },
+        184_320 => Geometry {
+            cylinders: 40,
+            heads: 1,
+            sectors: 9,
+            drive_type: 0x03,
+        },
+        327_680 => Geometry {
+            cylinders: 40,
+            heads: 2,
+            sectors: 8,
+            drive_type: 0x03,
+        },
         368_640 => Geometry {
             cylinders: 40,
             heads: 2,
@@ -161,6 +182,27 @@ mod tests {
         assert_eq!(geometry_for(368_640).unwrap().sectors, 9);
         assert_eq!(geometry_for(1_228_800).unwrap().sectors, 15);
         assert_eq!(geometry_for(1_474_560).unwrap().sectors, 18);
+    }
+
+    #[test]
+    fn early_525_formats_map_to_geometry() {
+        // 160 KB and 180 KB are single-sided; 320 KB and 360 KB are double-sided.
+        let g160 = geometry_for(163_840).unwrap();
+        assert_eq!((g160.cylinders, g160.heads, g160.sectors), (40, 1, 8));
+        let g180 = geometry_for(184_320).unwrap();
+        assert_eq!((g180.cylinders, g180.heads, g180.sectors), (40, 1, 9));
+        let g320 = geometry_for(327_680).unwrap();
+        assert_eq!((g320.cylinders, g320.heads, g320.sectors), (40, 2, 8));
+        // Each maps to a full disk: cyl * heads * sectors * 512 == file size.
+        for size in [163_840, 184_320, 327_680] {
+            let g = geometry_for(size).unwrap();
+            let bytes =
+                usize::from(g.cylinders) * usize::from(g.heads) * usize::from(g.sectors) * 512;
+            assert_eq!(
+                bytes, size,
+                "geometry for {size} must cover the whole image"
+            );
+        }
     }
 
     #[test]
