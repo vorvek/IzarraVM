@@ -42,13 +42,13 @@ pub enum GswMode {
 }
 
 impl GswMode {
-    /// The throttled core clock per compatibility mode: 8 MHz (286 mode, the Super
-    /// Slow setting), 25 MHz (386 mode), 66 MHz (486 mode), and 266 MHz native (the
-    /// K6-266 bin on the 66 MHz bus).
+    /// The throttled core clock per compatibility mode: 8.33 MHz (286 mode, the Super
+    /// Slow setting), 22 MHz (386 mode, picked for the early-386 game range), 66 MHz
+    /// (486 mode), and 266 MHz native (the K6-266 bin on the 66 MHz bus).
     pub const fn clock_hz(self) -> u64 {
         match self {
-            Self::Gsw286 => 8_000_000,
-            Self::Gsw386 => 25_000_000,
+            Self::Gsw286 => 8_333_333,
+            Self::Gsw386 => 22_000_000,
             Self::Gsw486 => 66_000_000,
             Self::Gsw586 => 266_000_000,
         }
@@ -597,8 +597,8 @@ mod tests {
 
     #[test]
     fn gsw_mode_clocks_and_names() {
-        assert_eq!(GswMode::Gsw286.clock_hz(), 8_000_000);
-        assert_eq!(GswMode::Gsw386.clock_hz(), 25_000_000);
+        assert_eq!(GswMode::Gsw286.clock_hz(), 8_333_333);
+        assert_eq!(GswMode::Gsw386.clock_hz(), 22_000_000);
         assert_eq!(GswMode::Gsw486.clock_hz(), 66_000_000);
         assert_eq!(GswMode::Gsw586.clock_hz(), 266_000_000);
         assert_eq!(GswMode::Gsw286.canonical_name(), "286");

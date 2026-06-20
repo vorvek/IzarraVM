@@ -90,7 +90,7 @@ impl MachineProfile {
     pub fn gsw_386(memory_mib: u16, video: VideoCard) -> Self {
         Self {
             cpu: GswMode::Gsw386,
-            clock_hz: 25_000_000,
+            clock_hz: GswMode::Gsw386.clock_hz(),
             memory_mib,
             video,
             sound_blaster: SoundBlasterConfig::default(),
@@ -2642,17 +2642,17 @@ mod tests {
             vec![0u8; BIOS_ROM_SIZE],
         )
         .unwrap();
-        // Boot mode is 386 @ 25 MHz: the PIT factor is PIT_INPUT_HZ / 25 MHz.
+        // Boot mode is 386 @ 22 MHz: the PIT factor is PIT_INPUT_HZ / 22 MHz.
         assert_eq!(machine.active_mode(), GswMode::Gsw386);
-        assert!((machine.timing.pit_per_clock - PIT_INPUT_HZ as f64 / 25_000_000.0).abs() < 1e-9);
+        assert!((machine.timing.pit_per_clock - PIT_INPUT_HZ as f64 / 22_000_000.0).abs() < 1e-9);
         // Switching to 586 @ 266 MHz recomputes the factor.
         machine.set_mode(GswMode::Gsw586);
         assert_eq!(machine.active_mode(), GswMode::Gsw586);
         assert!((machine.timing.pit_per_clock - PIT_INPUT_HZ as f64 / 266_000_000.0).abs() < 1e-9);
-        // Super Slow (286) @ 8 MHz.
+        // Super Slow (286) @ 8.33 MHz.
         machine.set_mode(GswMode::Gsw286);
         assert_eq!(machine.active_mode(), GswMode::Gsw286);
-        assert!((machine.timing.pit_per_clock - PIT_INPUT_HZ as f64 / 8_000_000.0).abs() < 1e-9);
+        assert!((machine.timing.pit_per_clock - PIT_INPUT_HZ as f64 / 8_333_333.0).abs() < 1e-9);
     }
 
     #[test]
@@ -3665,7 +3665,7 @@ mod tests {
             machine.memory().as_slice()[0x0501],
         ]);
         assert_eq!(tick, 1, "the IRQ0 handler should have run once");
-        // One tick is about 1000 PIT clocks, near 21000 CPU clocks at 25 MHz, so a
+        // One tick is about 1000 PIT clocks, near 18000 CPU clocks at 22 MHz, so a
         // real fast-forward clears this slack floor while a no-op halt would not.
         assert!(
             machine.elapsed_clocks() > 10_000,
@@ -3843,7 +3843,7 @@ mod tests {
             | (u16::from(machine.read_physical_u8(0x0611)) << 8);
         assert!(ticks >= 1, "the IRQ5 handler should have run");
         // The fast-forward crossed a real sample window (half-buffer at 8 samples
-        // ~= 18k CPU clocks at 25 MHz), not a no-op halt.
+        // ~= 16k CPU clocks at 22 MHz), not a no-op halt.
         assert!(
             machine.elapsed_clocks() > 15_000,
             "the fast-forward should advance emulated time across the DSP sample window"
@@ -4257,8 +4257,8 @@ mod tests {
         // BUSY is set right after the command.
         assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
 
-        // 4 pixels -> busy_ns = 100 + 4*10 = 140 ns. At 25 MHz (40 ns/clock),
-        // three clocks (120 ns) leave it busy; the fourth clears it.
+        // 4 pixels -> busy_ns = 100 + 4*10 = 140 ns. At 22 MHz (45.4545 ns/clock),
+        // three clocks (136 ns drained) leave it busy; the fourth clears it.
         machine.advance_devices(3);
         assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
         machine.advance_devices(1);
@@ -4323,8 +4323,8 @@ mod tests {
         // BUSY is set right after the command.
         assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
 
-        // 20 pixels -> busy_ns = 100 + 20*5 = 200 ns = 5 clocks at 25 MHz.
-        // Four clocks (160 ns) leave it busy; the fifth clears it.
+        // 20 pixels -> busy_ns = 100 + 20*5 = 200 ns. At 22 MHz (45.4545 ns/clock),
+        // four clocks (181 ns drained) leave it busy; the fifth clears it.
         machine.advance_devices(4);
         assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
         machine.advance_devices(1);
@@ -4459,8 +4459,8 @@ mod tests {
             0x00
         ); // row 1, col 0 clear
 
-        // 2 pixels written -> busy_ns = 100 + 2*5 = 110 ns. At 25 MHz (40 ns/clock),
-        // two clocks (80 ns) leave it busy; the third clears it.
+        // 2 pixels written -> busy_ns = 100 + 2*5 = 110 ns. At 22 MHz (45.4545 ns/clock),
+        // two clocks (90 ns drained) leave it busy; the third clears it.
         assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
         machine.advance_devices(2);
         assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
@@ -4522,8 +4522,8 @@ mod tests {
         // BUSY set right after the command.
         assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
 
-        // 5 pixels -> busy_ns = 100 + 5*10 = 150 ns. At 25 MHz (40 ns/clock), three
-        // clocks (120 ns) leave it busy; the fourth clears it.
+        // 5 pixels -> busy_ns = 100 + 5*10 = 150 ns. At 22 MHz (45.4545 ns/clock),
+        // three clocks (136 ns drained) leave it busy; the fourth clears it.
         machine.advance_devices(3);
         assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
         machine.advance_devices(1);
@@ -4560,9 +4560,9 @@ mod tests {
         assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 2 * 640 + 2), 0); // left of the rect
         assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1); // BUSY set
 
-        // 16 pixels -> busy_ns = 100 + 16*5 = 180 ns. At 25 MHz (40 ns/clock), four
-        // clocks (160 ns) leave it busy; the fifth clears it.
-        machine.advance_devices(4);
+        // 16 pixels -> busy_ns = 100 + 16*5 = 180 ns. At 22 MHz (45.4545 ns/clock),
+        // three clocks (136 ns drained) leave it busy; the fourth clears it.
+        machine.advance_devices(3);
         assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 1);
         machine.advance_devices(1);
         assert_eq!(read_mmio_reg(&mut machine, 0x008) & 1, 0);
@@ -4707,8 +4707,8 @@ mod tests {
         let mut machine = test_machine();
         machine.set_vga_mode_0dh();
         let before = machine.video().beam_dots();
-        // 10 000 CPU clocks at 25 MHz with a 25.175 MHz dot clock advances
-        // roughly 10 070 dots — well above zero.
+        // 10 000 CPU clocks at 22 MHz with a 25.175 MHz dot clock advances
+        // roughly 11 443 dots, well above zero.
         machine.advance_devices(10_000);
         assert!(machine.video().beam_dots() != before || machine.video().frames_completed() > 0);
     }
@@ -4731,8 +4731,8 @@ mod tests {
     fn planar_mode_presents_a_vga_raster() {
         let mut machine = test_machine();
         machine.set_vga_mode_0dh();
-        // Mode 0Dh frame is ~359 200 dots; 600 000 CPU clocks at 25 MHz yields
-        // ~603 600 dot clocks — enough to complete at least one full frame.
+        // Mode 0Dh frame is ~359 200 dots; 600 000 CPU clocks at 22 MHz yields
+        // ~686 600 dot clocks, enough to complete at least one full frame.
         machine.advance_devices(600_000);
         assert!(matches!(machine.active_display(), ActiveDisplay::VgaRaster));
         assert!(machine.vga_raster().is_some());
@@ -5592,7 +5592,7 @@ mod tests {
         assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 3 * 8 + 3), 0x00); // (3,3) not yet
 
         // Enough ticks to drain fill 1's busy_ns (a 1-pixel fill is 105 ns; 10
-        // clocks at 25 MHz = 400 ns), letting the pump consume fill 2.
+        // clocks at 22 MHz = ~454 ns), letting the pump consume fill 2.
         machine.advance_devices(10);
         assert_eq!(read_mmio_reg(&mut machine, 0x90), put); // GET caught up
         assert_eq!(machine.read_physical_u8(MARGO_LFB_BASE + 3 * 8 + 3), 0xbb); // (3,3) now
