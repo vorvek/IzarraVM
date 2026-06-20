@@ -15,6 +15,12 @@ use tracing::{error, warn};
 
 const OPL_NATIVE_HZ: f64 = 49_716.0;
 
+/// The guest framebuffer resolution the capture path scales pointer motion to.
+/// Mode 13h is 320x200; the host-points-to-guest-pixels ratio uses these so a
+/// full sweep across the window maps to a full sweep of the guest screen.
+const GUEST_WIDTH: f32 = 320.0;
+const GUEST_HEIGHT: f32 = 200.0;
+
 /// Map a 0..1 master-volume slider to a linear audio gain. This is a cubic
 /// perceptual curve; swap it for a proper dB map if it ever matters.
 fn volume_gain(volume: f32) -> f32 {
@@ -612,6 +618,14 @@ pub struct GuiApp {
     // Last button mask forwarded to the VM, so a button press or release is sent
     // even on a frame with no pointer motion.
     last_buttons: u8,
+    // The framebuffer image rect from the last frame, in egui points. The capture
+    // path scales host pointer motion across it into guest pixels. None until the
+    // monitor has been drawn at least once.
+    screen_rect: Option<egui::Rect>,
+    // Last pointer position seen while captured, so a PointerMoved yields a
+    // relative delta. Reset to None on capture enter and leave so the first move
+    // after a grab does not jump.
+    last_pointer: Option<egui::Pos2>,
     // The cpal stream is !Send, so it stays here on the UI thread; the
     // emulation thread gets a Send sink cloned from it.
     audio: Option<AudioPlayer>,
@@ -703,6 +717,8 @@ impl GuiApp {
             title,
             input_captured: false,
             last_buttons: 0,
+            screen_rect: None,
+            last_pointer: None,
             audio,
             emu: None,
             texture: None,
@@ -804,6 +820,9 @@ fn fit_4_3(area: egui::Rect) -> egui::Rect {
 impl GuiApp {
     fn monitor_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let rect = fit_4_3(ui.max_rect());
+        // Record the image rect so the capture path can scale host pointer motion
+        // across it into guest pixels.
+        self.screen_rect = Some(rect);
         let Some(emu) = &self.emu else {
             ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
             return;
@@ -862,6 +881,9 @@ impl GuiApp {
         }
         self.input_captured = capture;
         self.last_buttons = 0;
+        // Drop the tracked pointer so the first move after a grab (or release)
+        // reports no delta instead of a jump from a stale position.
+        self.last_pointer = None;
         if capture {
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(
                 egui::CursorGrab::Confined,
@@ -874,29 +896,89 @@ impl GuiApp {
         self.title = capture_title(capture);
     }
 
-    /// While captured, forward the host pointer to the VM: the per-frame motion
-    /// delta and the current button mask. The motion delta uses egui's pointer
-    /// delta (relative motion), which a confined cursor keeps producing without
-    /// drifting to a window edge. A frame with no motion and no button change is
-    /// skipped so an idle pointer does not flood the channel.
-    fn forward_mouse(&mut self, ctx: &egui::Context) {
-        let (delta, buttons) = ctx.input(|i| {
-            let d = i.pointer.delta();
-            let mut buttons = 0u8;
-            if i.pointer.button_down(egui::PointerButton::Primary) {
-                buttons |= 0x01;
+    /// Drain the captured input out of `raw_input` before egui sees it, routing it
+    /// to the guest instead. Runs from `raw_input_hook`, ahead of egui's own
+    /// processing, so a captured TAB never reaches the sidebar focus traversal and
+    /// the sidebar stays pointer-inert while the screen holds the grab.
+    ///
+    /// Ctrl+F2 is checked first and releases the grab without forwarding anything,
+    /// so the combo never lands in the guest. Otherwise every keyboard and pointer
+    /// event is consumed: keys become Set 1 scancodes, pointer motion becomes a
+    /// relative guest-pixel delta scaled across the framebuffer rect, and the
+    /// button mask is rebuilt from the pointer-button events.
+    fn process_captured_raw_input(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        // Ctrl+F2 releases the grab. Handle it before anything else and forward
+        // nothing this frame so the combo does not reach the guest.
+        let release_combo = raw_input.modifiers.ctrl
+            && raw_input.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key {
+                        key: egui::Key::F2,
+                        pressed: true,
+                        ..
+                    }
+                )
+            });
+        if release_combo {
+            self.set_capture(ctx, false);
+            // Drop the captured keys, the F2 press, and any pointer events so none
+            // of them slip through to egui or the guest on the release frame.
+            raw_input.events.retain(|e| !is_captured_input_event(e));
+            return;
+        }
+
+        // Collect Set 1 scancodes and the latest pointer state, then strip every
+        // keyboard and pointer event so egui never acts on them.
+        let mut codes: Vec<u8> = Vec::new();
+        let mut buttons = self.last_buttons;
+        let mut motion = egui::Vec2::ZERO;
+        for event in &raw_input.events {
+            match event {
+                egui::Event::Key { key, pressed, .. } => {
+                    if let Some(make) = egui_key_to_set1(*key) {
+                        codes.push(if *pressed { make } else { make | 0x80 });
+                    }
+                }
+                egui::Event::PointerMoved(pos) => {
+                    if let Some(last) = self.last_pointer {
+                        motion += *pos - last;
+                    }
+                    self.last_pointer = Some(*pos);
+                }
+                egui::Event::PointerButton {
+                    button, pressed, ..
+                } => {
+                    let bit = match button {
+                        egui::PointerButton::Primary => 0x01,
+                        egui::PointerButton::Secondary => 0x02,
+                        egui::PointerButton::Middle => 0x04,
+                        _ => 0,
+                    };
+                    if *pressed {
+                        buttons |= bit;
+                    } else {
+                        buttons &= !bit;
+                    }
+                }
+                _ => {}
             }
-            if i.pointer.button_down(egui::PointerButton::Secondary) {
-                buttons |= 0x02;
+        }
+        raw_input.events.retain(|e| !is_captured_input_event(e));
+
+        if !codes.is_empty() {
+            if let Some(emu) = &self.emu {
+                emu.send_keys(codes);
             }
-            if i.pointer.button_down(egui::PointerButton::Middle) {
-                buttons |= 0x04;
-            }
-            (d, buttons)
-        });
-        let dx = delta.x.round() as i32;
-        let dy = delta.y.round() as i32;
-        // Send when the pointer moved or a button state changed since last frame.
+        }
+
+        // Scale the host motion across the framebuffer rect into guest pixels. With
+        // no rect yet (monitor not drawn) the host motion passes through unscaled.
+        let (dx, dy) = match self.screen_rect {
+            Some(rect) => screen_to_guest_delta(motion, rect),
+            None => (motion.x.round() as i32, motion.y.round() as i32),
+        };
+        // Send when the pointer moved or a button state changed since last packet.
         if dx != 0 || dy != 0 || buttons != self.last_buttons {
             self.last_buttons = buttons;
             if let Some(emu) = &self.emu {
@@ -1327,59 +1409,11 @@ impl eframe::App for GuiApp {
             self.events_since = 0;
             self.metrics_mark = Some(now);
         }
-        // Ctrl+F2 releases the input capture. Checked before keyboard routing so
-        // the release combo is never forwarded to the guest as keystrokes.
-        let mut released_now = false;
-        if self.input_captured {
-            let release = ctx.input(|i| {
-                i.modifiers.ctrl
-                    && i.events.iter().any(|e| {
-                        matches!(
-                            e,
-                            egui::Event::Key {
-                                key: egui::Key::F2,
-                                pressed: true,
-                                ..
-                            }
-                        )
-                    })
-            });
-            if release {
-                self.set_capture(ctx, false);
-                released_now = true;
-            }
-        }
-
-        // Route keyboard input. While captured, every key goes to the guest and
-        // egui must not consume it (notably TAB, which it uses for focus
-        // traversal): drain the key events with input_mut so the guest sees TAB,
-        // arrows, and the rest. The frame that releases capture forwards nothing,
-        // so the Ctrl+F2 combo never reaches the guest. When not captured, keep
-        // the gated behavior that yields to egui widgets that want the keyboard.
-        if released_now {
-            // Nothing forwarded this frame: the release combo stays out of the VM.
-        } else if self.input_captured {
-            let codes: Vec<u8> = ctx.input_mut(|i| {
-                let mut codes = Vec::new();
-                i.events.retain(|e| match e {
-                    egui::Event::Key { key, pressed, .. } => {
-                        if let Some(make) = egui_key_to_set1(*key) {
-                            codes.push(if *pressed { make } else { make | 0x80 });
-                        }
-                        false // consume so egui does not act on it (e.g. TAB focus)
-                    }
-                    egui::Event::Text(_) => false, // swallow text echoes while captured
-                    _ => true,
-                });
-                codes
-            });
-            if !codes.is_empty() {
-                if let Some(emu) = &self.emu {
-                    emu.send_keys(codes);
-                }
-            }
-            self.forward_mouse(ctx);
-        } else if !ctx.wants_keyboard_input() {
+        // While captured, all keyboard and pointer input was already drained and
+        // routed to the guest in raw_input_hook, ahead of egui's processing. Only
+        // the non-captured path runs here: forward keys to the guest when no egui
+        // widget wants the keyboard, otherwise yield so the user can type in the UI.
+        if !self.input_captured && !ctx.wants_keyboard_input() {
             let codes: Vec<u8> = ctx.input(|i| {
                 i.events
                     .iter()
@@ -1418,6 +1452,16 @@ impl eframe::App for GuiApp {
         });
         ctx.request_repaint_after(Duration::from_secs_f64(1.0 / refresh_hz));
     }
+
+    /// Intercept input before egui processes the frame. While captured this strips
+    /// the keyboard and pointer events out of the raw input and routes them to the
+    /// guest, so egui's focus traversal (TAB) and the sidebar never see them and
+    /// input stays trapped in the screen until Ctrl+F2 releases it.
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if self.input_captured {
+            self.process_captured_raw_input(ctx, raw_input);
+        }
+    }
 }
 
 /// The window title for the current capture state. While captured it tells the
@@ -1428,6 +1472,40 @@ fn capture_title(captured: bool) -> String {
     } else {
         String::from("IzarraVM")
     }
+}
+
+/// Is this an input event the capture path swallows so egui never sees it?
+/// Covers keyboard and every pointer event; everything else (window focus,
+/// screenshots, paste, and so on) is left for egui to handle.
+fn is_captured_input_event(event: &egui::Event) -> bool {
+    matches!(
+        event,
+        egui::Event::Key { .. }
+            | egui::Event::Text(_)
+            | egui::Event::PointerMoved(_)
+            | egui::Event::PointerButton { .. }
+            | egui::Event::MouseWheel { .. }
+            | egui::Event::Zoom(_)
+            | egui::Event::Touch { .. }
+    )
+}
+
+/// Scale a host pointer motion (in egui points) across the framebuffer `rect`
+/// into a guest-pixel delta. The guest screen is GUEST_WIDTH x GUEST_HEIGHT, so a
+/// motion spanning the whole rect maps to a motion spanning the whole guest
+/// screen. A zero-sized rect axis contributes no motion on that axis.
+fn screen_to_guest_delta(motion: egui::Vec2, rect: egui::Rect) -> (i32, i32) {
+    let scale = |d: f32, span: f32, guest: f32| -> i32 {
+        if span > 0.0 {
+            (d * guest / span).round() as i32
+        } else {
+            0
+        }
+    };
+    (
+        scale(motion.x, rect.width(), GUEST_WIDTH),
+        scale(motion.y, rect.height(), GUEST_HEIGHT),
+    )
 }
 
 /// egui Key to Set 1 scancode (make code). Covers the keys a user types at a
@@ -1625,5 +1703,34 @@ mod tests {
         let src = egui::ColorImage::new([4, 4], vec![egui::Color32::BLACK; 16]);
         let out = sharp_prescale(&src, 3, 3);
         assert_eq!(out.size, [4, 4]);
+    }
+
+    #[test]
+    fn guest_delta_scales_motion_across_the_rect() {
+        // A 640x400 rect is exactly 2x the 320x200 guest, so host motion halves.
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(640.0, 400.0));
+        assert_eq!(
+            screen_to_guest_delta(egui::vec2(20.0, 40.0), rect),
+            (10, 20)
+        );
+        // Sign is preserved on both axes.
+        assert_eq!(
+            screen_to_guest_delta(egui::vec2(-20.0, -40.0), rect),
+            (-10, -20)
+        );
+        // A rect matching the guest size passes motion through one-to-one.
+        let exact = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(320.0, 200.0));
+        assert_eq!(screen_to_guest_delta(egui::vec2(7.0, -3.0), exact), (7, -3));
+    }
+
+    #[test]
+    fn guest_delta_is_zero_on_a_degenerate_rect() {
+        // A zero-width (or zero-height) rect contributes no motion on that axis
+        // instead of dividing by zero.
+        let flat = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(0.0, 200.0));
+        assert_eq!(
+            screen_to_guest_delta(egui::vec2(50.0, 100.0), flat),
+            (0, 100)
+        );
     }
 }
