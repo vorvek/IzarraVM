@@ -440,12 +440,18 @@ impl Default for MachineConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct DosConfig {
     pub c_drive: PathBuf,
+    /// Optional CD image (an `.iso` or a `.cue`) mounted into the ATAPI drive at
+    /// startup. None leaves the optical drive empty; the GUI can still mount a
+    /// disc live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cd_image: Option<PathBuf>,
 }
 
 impl Default for DosConfig {
     fn default() -> Self {
         Self {
             c_drive: PathBuf::from("."),
+            cd_image: None,
         }
     }
 }
