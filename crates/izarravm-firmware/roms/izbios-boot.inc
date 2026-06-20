@@ -161,7 +161,24 @@ boot_entry:
     ; fall through into .disk
 
 .disk:
-    ; Disk boots Toka-DOS on C:, which is not built yet. Report and chain to CD-ROM.
+    ; Boot Toka-DOS from C:. The C: drive is host-backed, so the "sector" read is
+    ; HLE: ask the machine (Lotura service port 0xE3) to place the Toka-DOS boot
+    ; record at 0000:7C00, then read the status. 0 means it is loaded and the DOS
+    ; base context is ready; anything else means Toka-DOS is not installed.
+    mov al, 0x10                ; LoadBootRecord
+    out 0xE3, al
+    in  al, 0xE3                ; status: 0 = loaded
+    test al, al
+    jnz .disk_absent
+
+    ; Enter the boot record exactly like a real INT 19h hard-disk boot.
+    xor ax, ax
+    mov ds, ax
+    mov es, ax
+    mov dl, 0x80               ; DL = first hard disk
+    jmp 0x0000:0x7c00
+
+.disk_absent:
     mov si, bm_str_disk_msg
     call boot_status_line
     ; fall through into .cdrom

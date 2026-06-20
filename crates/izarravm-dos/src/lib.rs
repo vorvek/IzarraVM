@@ -2120,7 +2120,10 @@ mod tests {
         // Repair overwrites system files but keeps a stray user file.
         std::fs::write(root.join("USER.TXT"), b"x").unwrap();
         toka_dos_install(root, &files, InstallMode::Repair).unwrap();
-        assert_eq!(std::fs::read(root.join("ICOMMAND.COM")).unwrap(), vec![1, 2, 3]);
+        assert_eq!(
+            std::fs::read(root.join("ICOMMAND.COM")).unwrap(),
+            vec![1, 2, 3]
+        );
         assert!(root.join("USER.TXT").exists());
 
         // Format wipes the stray user file, then reinstalls.

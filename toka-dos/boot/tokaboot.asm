@@ -25,16 +25,11 @@ start:
         mov ax, 0x0003
         int 0x10
 
-        ; Print "Starting Toka-DOS v3.0..." via BIOS teletype.
-        mov si, msg
-.print:
-        lodsb
-        test al, al
-        jz .launch
-        mov ah, 0x0E
-        mov bx, 0x0007
-        int 0x10
-        jmp .print
+        ; Print the startup line through the DOS console (AH=09h), so it lands on
+        ; the VGA text screen through the same path ICOMMAND's output uses.
+        mov dx, msg
+        mov ah, 0x09
+        int 0x21
 
 .launch:
         ; EXEC C:\ICOMMAND.COM. DS:DX -> program path, ES:BX -> parameter block.
@@ -50,7 +45,7 @@ start:
         hlt
         jmp .halt
 
-msg:    db "Starting Toka-DOS v3.0...", 13, 10, 0
+msg:    db "Starting Toka-DOS v3.0...", 13, 10, "$"
 path:   db "C:\ICOMMAND.COM", 0
 
         align 2

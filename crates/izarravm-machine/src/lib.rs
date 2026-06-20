@@ -203,6 +203,10 @@ pub struct Machine {
     pending_toka_service: Option<u8>,
     toka_service_status: u8,
     toka_c_root: Option<std::path::PathBuf>, // host C: root for Repair/Format
+    // How many bytes of the DOS console output have already been teletyped onto
+    // the VGA text screen. DOS CON output goes to the kernel's stdout buffer; the
+    // machine mirrors the new bytes onto the framebuffer so the screen shows them.
+    dos_screen_shown: usize,
     dos: izarravm_dos::DosKernel, // DOS kernel state: open files, drive, stdin/stdout
     rom: Vec<u8>,
     serial: SerialPort,
@@ -381,6 +385,7 @@ impl Machine {
             pending_toka_service: None,
             toka_service_status: 0,
             toka_c_root: None,
+            dos_screen_shown: 0,
             dos: izarravm_dos::DosKernel::default(),
             rom,
             serial: SerialPort::default(),
@@ -904,6 +909,9 @@ impl Machine {
                 0x00..=0x03 | 0x07 => {
                     self.video.set_text_mode();
                     self.margo_active = false;
+                    // A mode set clears the screen and homes the BDA cursor, so
+                    // teletyped output starts at the top left.
+                    let _ = self.memory.write_u16(0x450, 0);
                     return;
                 }
                 _ => {}
@@ -1781,6 +1789,16 @@ impl Machine {
     /// base context so the boot record's EXEC of ICOMMAND.COM works. The BIOS
     /// then jumps to 0x7C00 like a real INT 19h boot.
     fn toka_load_boot_record(&mut self) -> u8 {
+        // Toka-DOS is bootable only when it is installed on C: (ICOMMAND.COM
+        // present). The boot record always lives in the ROM, so without this
+        // check the machine would "boot" a drive that carries no OS.
+        let installed = self
+            .toka_c_root
+            .as_ref()
+            .is_some_and(|root| root.join("ICOMMAND.COM").exists());
+        if !installed {
+            return 1; // not installed: the BIOS reports and idles
+        }
         let Some(boot) = izarravm_firmware::toka_boot_record() else {
             return 1; // ROM carries no boot record
         };
@@ -1820,6 +1838,77 @@ impl Machine {
         let Machine { dos, memory, .. } = self;
         dos.init_shell_base(memory, DOS_LOAD_SEGMENT, &env)?;
         Ok(())
+    }
+
+    /// Mirror any DOS console output produced since the last call onto the VGA
+    /// text screen. DOS programs write CON through INT 21h, which the kernel
+    /// buffers; real DOS renders that to the screen via the BIOS teletype. We do
+    /// the same here so a Toka-DOS session is visible on the framebuffer, sharing
+    /// the BDA cursor at 0040:0050 with the BIOS.
+    fn flush_dos_console_to_screen(&mut self) {
+        let total = self.dos_output().len();
+        if self.dos_screen_shown >= total {
+            return;
+        }
+        let pending: Vec<u8> = self.dos_output()[self.dos_screen_shown..].to_vec();
+        self.dos_screen_shown = total;
+        for byte in pending {
+            self.teletype_char(byte);
+        }
+    }
+
+    /// Write one character to the VGA text screen at the BDA cursor, advancing it
+    /// with CR, LF, backspace, tab, and bottom-of-screen scroll, the way the BIOS
+    /// teletype (INT 10h AH=0Eh) does. Attribute 0x07 is light grey on black.
+    fn teletype_char(&mut self, byte: u8) {
+        let cursor = self.memory.read_u16(0x450).unwrap_or(0);
+        let mut col = usize::from(cursor & 0x00ff);
+        let mut row = usize::from(cursor >> 8);
+        match byte {
+            b'\r' => col = 0,
+            b'\n' => row += 1,
+            0x08 => col = col.saturating_sub(1), // backspace
+            0x07 => {}                           // bell: no visible effect
+            b'\t' => {
+                col = (col + 8) & !7;
+                if col >= 80 {
+                    col = 0;
+                    row += 1;
+                }
+            }
+            _ => {
+                let offset = (row * 80 + col) * 2;
+                let _ = self.video.write_u8(offset, byte);
+                let _ = self.video.write_u8(offset + 1, 0x07);
+                col += 1;
+                if col >= 80 {
+                    col = 0;
+                    row += 1;
+                }
+            }
+        }
+        while row >= 25 {
+            self.scroll_text_up();
+            row -= 1;
+        }
+        let _ = self
+            .memory
+            .write_u16(0x450, ((row as u16) << 8) | col as u16);
+    }
+
+    /// Scroll the 80x25 text screen up one line, clearing the bottom row to
+    /// spaces with the normal attribute.
+    fn scroll_text_up(&mut self) {
+        const ROW_BYTES: usize = 80 * 2;
+        for offset in 0..(24 * ROW_BYTES) {
+            let byte = self.video.read_u8(offset + ROW_BYTES).unwrap_or(b' ');
+            let _ = self.video.write_u8(offset, byte);
+        }
+        let last = 24 * ROW_BYTES;
+        for col in 0..80 {
+            let _ = self.video.write_u8(last + col * 2, b' ');
+            let _ = self.video.write_u8(last + col * 2 + 1, 0x07);
+        }
     }
 
     /// VBE (`INT 10h`, `AH=4Fh`). `function` is `AL`. Unimplemented functions
@@ -2537,6 +2626,8 @@ impl Machine {
                             _ => {}
                         }
                     }
+                    // Mirror any DOS console output onto the VGA text screen.
+                    self.flush_dos_console_to_screen();
                     if outcome.halted {
                         match self.next_timer_wake(deadline) {
                             Some(wake_step) => {
@@ -2574,11 +2665,11 @@ struct MachineBus<'a> {
     ide: &'a mut ide::IdeChannel,
     trace: &'a mut BusTrace,
     pending_soft_int: &'a mut Option<u8>,
-    active_mode: GswMode,                  // a copy, for the 0xE1 read
-    pending_mode: &'a mut Option<GswMode>, // a 0xE1 write records the request here
-    fast_post: bool,                       // a copy, for the 0xE2 POST-pacing read
+    active_mode: GswMode,                     // a copy, for the 0xE1 read
+    pending_mode: &'a mut Option<GswMode>,    // a 0xE1 write records the request here
+    fast_post: bool,                          // a copy, for the 0xE2 POST-pacing read
     pending_toka_service: &'a mut Option<u8>, // a 0xE3 write records the command
-    toka_service_status: u8,               // a copy, for the 0xE3 status read
+    toka_service_status: u8,                  // a copy, for the 0xE3 status read
     wait_states: WaitStateProfile,
 }
 
@@ -7617,7 +7708,42 @@ mod tests {
             BIOS_IRET_STUB_ADDRESS as u16
         );
         assert_eq!(machine.memory_read_u16_for_test(0x21 * 4 + 2), 0);
-        assert_eq!(machine.read_physical_u8(BIOS_IRET_STUB_ADDRESS as u32), 0xcf);
+        assert_eq!(
+            machine.read_physical_u8(BIOS_IRET_STUB_ADDRESS as u32),
+            0xcf
+        );
+    }
+
+    #[test]
+    fn toka_dos_boots_through_the_bios_to_the_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        // Lay Toka-DOS down on the temp C: the way first boot does.
+        let files = izarravm_firmware::toka_dos_system_files();
+        izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format)
+            .unwrap();
+
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .unwrap();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        machine.set_toka_c_root(dir.path().to_path_buf());
+
+        // POST, fall through the (absent) floppy to the disk boot, TOKABOOT, and
+        // into ICOMMAND. One clock-second of cycles is ample with fast POST.
+        machine.run_until_halt_or_cycles(22_000_000).unwrap();
+
+        let screen = machine.screen_text();
+        let text = screen.as_text();
+        assert!(
+            text.contains("Toka-DOS v3.0"),
+            "startup banner on the VGA screen; got:\n{text}"
+        );
+        assert!(
+            text.contains("C:\\>"),
+            "ICOMMAND prompt on the VGA screen; got:\n{text}"
+        );
     }
 
     // --- Izarra 3000 BIOS foundation ---------------------------------------

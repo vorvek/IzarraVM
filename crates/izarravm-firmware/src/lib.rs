@@ -161,9 +161,7 @@ pub mod toka_rom {
             let flags = raw[11];
             let off = u32::from_le_bytes([raw[12], raw[13], raw[14], raw[15]]) as usize;
             let len = u32::from_le_bytes([raw[16], raw[17], raw[18], raw[19]]) as usize;
-            let data = rom
-                .get(off..off + len)
-                .ok_or(RomError::DataOutOfRange)?;
+            let data = rom.get(off..off + len).ok_or(RomError::DataOutOfRange)?;
             out.push(File { name, flags, data });
         }
         Ok(out)
@@ -367,7 +365,9 @@ mod tests {
         let boot = toka_boot_record().expect("ROM has a boot record");
         assert_eq!(boot.len(), 512, "boot record is one sector");
         assert!(
-            !toka_dos_system_files().iter().any(|(n, _)| n == "TOKABOOT.BIN"),
+            !toka_dos_system_files()
+                .iter()
+                .any(|(n, _)| n == "TOKABOOT.BIN"),
             "boot record must not install onto C:"
         );
     }

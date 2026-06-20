@@ -59,6 +59,8 @@ struct Cli {
     #[arg(long)]
     headless_izarra_bios: bool,
     #[arg(long)]
+    headless_toka: bool,
+    #[arg(long)]
     headless_boot_floppy: Option<PathBuf>,
     #[arg(long)]
     headless_run: Option<PathBuf>,
@@ -90,7 +92,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     if cli.c_drive.is_none() && cli.dosroot.is_none() && config.dos.c_drive == Path::new(".") {
         let c_root = izarravm_dos::resolve_c_root();
         let files = izarravm_firmware::toka_dos_system_files();
-        izarravm_dos::toka_dos_install(&c_root, &files, izarravm_dos::InstallMode::EnsureIfMissing)?;
+        izarravm_dos::toka_dos_install(
+            &c_root,
+            &files,
+            izarravm_dos::InstallMode::EnsureIfMissing,
+        )?;
         config.dos.c_drive = c_root;
     }
     let hardware = HardwareProfile::from_config(&config)?;
@@ -141,6 +147,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     if cli.headless_izarra_bios {
         return run_izarra_bios(&hardware);
+    }
+
+    if cli.headless_toka {
+        return run_headless_toka(&hardware, &dos, cli.stdin_text.as_deref());
     }
 
     if let Some(path) = &cli.headless_boot_floppy {
@@ -311,6 +321,45 @@ fn run_izarra_bios(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
     println!("records: {}", results.records.len());
     println!("declared: {}", results.declared_record_count);
     println!("stop: {stop_reason:?}");
+    Ok(())
+}
+
+/// Boot the Izarra 3000 BIOS into Toka-DOS, type an optional script at the
+/// ICOMMAND prompt, and print the VGA text screen. With no floppy mounted the
+/// BIOS falls through to the hard-disk boot, which brings up Toka-DOS from C:.
+fn run_headless_toka(
+    hardware: &HardwareProfile,
+    dos: &DosKernelServices,
+    stdin_text: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let mut machine = Machine::new(
+        MachineProfile::from_hardware_profile(hardware),
+        izarravm_firmware::izarra_bios(),
+    )?;
+    machine.mount_c_drive(dos.c_drive.clone());
+    machine.set_toka_c_root(dos.c_drive.root().to_path_buf());
+
+    // Boot through POST and into the ICOMMAND prompt. POST is fast (fast_post),
+    // so roughly a second of cycles is ample to reach the prompt.
+    machine.run_until_halt_or_cycles(hardware.clock_hz)?;
+
+    // Feed the script one line at a time. The BDA keyboard ring holds only 15
+    // entries, so typing a whole multi-line script at once would overflow it;
+    // typing a line and letting ICOMMAND consume it keeps the ring drained.
+    if let Some(text) = stdin_text {
+        let line_budget = hardware.clock_hz / 2;
+        for raw in text.split('\n') {
+            let line = raw.trim_end_matches('\r');
+            for ch in line.chars().chain(std::iter::once('\r')) {
+                for code in ascii_to_set1(ch) {
+                    machine.inject_key_scancodes(&[code]);
+                }
+            }
+            machine.run_until_halt_or_cycles(line_budget)?;
+        }
+    }
+
+    println!("{}", machine.screen_text().as_text());
     Ok(())
 }
 
