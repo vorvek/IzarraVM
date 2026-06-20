@@ -369,6 +369,7 @@ fn print_video_summary(machine: &mut Machine) {
         VideoMode::Mode13h => "mode 13h (320x200x256)",
         VideoMode::Planar => "planar (EGA/VGA 16-color)",
         VideoMode::ModeX => "mode X (unchained 256-color)",
+        VideoMode::Cga => "CGA graphics (320x200x4 / 640x200x2)",
     };
     println!("video mode: {mode_name}");
 

@@ -567,7 +567,7 @@ impl Machine {
     pub fn is_graphics_mode(&self) -> bool {
         matches!(
             self.video.active_mode(),
-            VideoMode::Mode13h | VideoMode::Planar | VideoMode::ModeX
+            VideoMode::Mode13h | VideoMode::Planar | VideoMode::ModeX | VideoMode::Cga
         )
     }
 
@@ -625,10 +625,16 @@ impl Machine {
                     self.margo_active = false;
                     return;
                 }
-                // The 80x25 color text family (2/3) and monochrome text (7), plus
-                // the 40x25 and CGA variants (0/1/4/5/6) which map to the same
-                // single text personality, all return to text mode.
-                0x00..=0x07 => {
+                // CGA graphics: 04h/05h are 320x200x4, 06h is 640x200x2. The B800
+                // framebuffer renders through the CGA personality (set_cga_mode).
+                0x04..=0x06 => {
+                    self.video.set_cga_mode(al);
+                    self.margo_active = false;
+                    return;
+                }
+                // The 80x25 color text family (2/3), monochrome text (7), and the
+                // 40x25 variants (0/1) map to the single text personality.
+                0x00..=0x03 | 0x07 => {
                     self.video.set_text_mode();
                     self.margo_active = false;
                     return;
@@ -2168,6 +2174,13 @@ impl MachineBus<'_> {
         }
 
         if let Some(offset) = video_text_offset(address, width) {
+            // In a CGA graphics mode the B800 aperture is the 16 KiB CGA
+            // framebuffer; in text mode it is the character/attribute buffer.
+            if self.video.active_mode() == VideoMode::Cga {
+                return Ok((0..width)
+                    .map(|i| self.video.cga_read(offset + i))
+                    .collect());
+            }
             return (0..width)
                 .map(|index| {
                     self.video
@@ -2193,7 +2206,8 @@ impl MachineBus<'_> {
                         .map(|i| self.video.cpu_read_chain4(offset + i))
                         .collect());
                 }
-                VideoMode::Text => {}
+                // Text and CGA do not decode the A0000 window; fall through.
+                VideoMode::Text | VideoMode::Cga => {}
             }
         }
 
@@ -2225,6 +2239,12 @@ impl MachineBus<'_> {
         }
 
         if let Some(offset) = video_text_offset(address, 1) {
+            // In a CGA graphics mode the B800 aperture is the 16 KiB CGA
+            // framebuffer; in text mode it is the character/attribute buffer.
+            if self.video.active_mode() == VideoMode::Cga {
+                self.video.cga_write(offset, value);
+                return Ok(());
+            }
             return self
                 .video
                 .write_u8(offset, value)
@@ -2245,7 +2265,8 @@ impl MachineBus<'_> {
                     self.video.cpu_write_chain4(offset, value);
                     return Ok(());
                 }
-                VideoMode::Text => {}
+                // Text and CGA do not decode the A0000 window; fall through.
+                VideoMode::Text | VideoMode::Cga => {}
             }
         }
 
@@ -4377,6 +4398,37 @@ mod tests {
         assert_eq!(raster.pixels[0], 15);
         // Resolved through the live DAC, entry 15 is red.
         assert_eq!(machine.palette_argb()[15], 0x00FF_0000);
+    }
+
+    #[test]
+    fn cga_graphics_routes_b800_to_the_framebuffer() {
+        let mut machine = test_machine();
+        // Enter CGA mode 04h (320x200x4) the way INT 10h AH=00 AL=04 would.
+        machine.video_mut().set_cga_mode(0x04);
+        assert_eq!(machine.video().active_mode(), VideoMode::Cga);
+        // A byte written to B800:0000 lands in the CGA framebuffer, not the text
+        // buffer. 0b00_01_10_11 decodes to bg/green/red/brown on the default
+        // palette (green=2, red=4, brown=6).
+        machine.write_physical_u8(VGA_TEXT_BASE, 0b00_01_10_11);
+        assert_eq!(machine.read_physical_u8(VGA_TEXT_BASE), 0b00_01_10_11);
+        let raster = machine.video_mut().render_full_frame();
+        assert_eq!(raster.width, 320);
+        assert_eq!(raster.height, 262);
+        // The first four pixels of scanline 0.
+        assert_eq!(&raster.pixels[0..4], &[0, 2, 4, 6]);
+    }
+
+    #[test]
+    fn cga_odd_scanline_reads_the_high_bank_through_the_machine() {
+        let mut machine = test_machine();
+        machine.video_mut().set_cga_mode(0x04);
+        // Scanline 1 of a CGA frame reads framebuffer offset 0x2000 (the odd bank).
+        // Write there through the B800 aperture and confirm it scans out on line 1.
+        machine.write_physical_u8(VGA_TEXT_BASE + 0x2000, 0b01_01_01_01);
+        let raster = machine.video_mut().render_full_frame();
+        // Row 1 starts at offset width*1.
+        let row1 = &raster.pixels[320..320 + 4];
+        assert_eq!(row1, &[2, 2, 2, 2]); // value 1 -> green(2)
     }
 
     #[test]
