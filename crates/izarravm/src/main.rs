@@ -160,6 +160,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         MachineProfile::from_hardware_profile(&hardware),
         rom,
         config.dos.c_drive.clone(),
+        config.dos.cd_image.clone(),
         audio_enabled,
         cli.margo_test_pattern,
         rtc_setup,

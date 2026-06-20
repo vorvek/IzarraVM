@@ -156,6 +156,7 @@ struct Frame {
     refresh_hz: f64,       // guest vertical refresh, paces the UI repaint
     floppy_accesses: u64,  // monotonic A: access count, drives the LED
     c_accesses: u64,       // monotonic C: access count, drives the LED
+    cd_accesses: u64,      // monotonic CD access count, drives the LED
 }
 
 /// UI-to-emulation-thread messages.
@@ -169,6 +170,10 @@ enum Command {
     },
     /// Eject drive A:, flushing a dirty image back to its source IMG if any.
     EjectFloppy,
+    /// Mount a parsed CD image into the ATAPI drive (D:).
+    MountCd(izarravm_machine::CdImage),
+    /// Eject the CD.
+    EjectCd,
     Shutdown,
 }
 
@@ -302,6 +307,14 @@ impl Emulator {
         let _ = self.commands.send(Command::EjectFloppy);
     }
 
+    fn mount_cd(&self, image: izarravm_machine::CdImage) {
+        let _ = self.commands.send(Command::MountCd(image));
+    }
+
+    fn eject_cd(&self) {
+        let _ = self.commands.send(Command::EjectCd);
+    }
+
     fn shutdown(&mut self) {
         let _ = self.commands.send(Command::Shutdown);
         if let Some(join) = self.join.take() {
@@ -393,6 +406,8 @@ fn emulate(
                 Ok(Command::EjectFloppy) => {
                     flush_floppy(&mut machine, &mut floppy_flush_path);
                 }
+                Ok(Command::MountCd(image)) => machine.mount_cd(image),
+                Ok(Command::EjectCd) => machine.eject_cd(),
                 Ok(Command::Shutdown) => {
                     // Flush the floppy and the final CMOS state before exiting.
                     flush_floppy(&mut machine, &mut floppy_flush_path);
@@ -469,6 +484,7 @@ fn emulate(
         let mode = machine.active_mode();
         let refresh_hz = machine.display_refresh_hz();
         let (floppy_accesses, c_accesses) = machine.drive_access_counts();
+        let cd_accesses = machine.cd_access_count();
         {
             let mut f = frame.lock().expect("frame snapshot poisoned");
             if let Some((words, width, height)) = rendered {
@@ -485,6 +501,7 @@ fn emulate(
             f.speed_ratio = speed_ratio;
             f.floppy_accesses = floppy_accesses;
             f.c_accesses = c_accesses;
+            f.cd_accesses = cd_accesses;
         }
         published_seq = seq;
 
@@ -541,13 +558,20 @@ pub struct GuiApp {
     c_access_seen: u64,
     floppy_access_at: Option<Instant>,
     c_access_at: Option<Instant>,
+    // What is mounted in the CD-ROM drive (D:), for the label. None shows
+    // "(empty)". The emulation thread owns the mount; this mirrors it.
+    cd_label: Option<String>,
+    cd_access_seen: u64,
+    cd_access_at: Option<Instant>,
 }
 
 impl GuiApp {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         profile: MachineProfile,
         rom: Vec<u8>,
         c_drive: PathBuf,
+        cd_image: Option<PathBuf>,
         audio_enabled: bool,
         test_pattern: bool,
         rtc_setup: crate::cmos::RtcSetup,
@@ -588,8 +612,23 @@ impl GuiApp {
             c_access_seen: 0,
             floppy_access_at: None,
             c_access_at: None,
+            cd_label: None,
+            cd_access_seen: 0,
+            cd_access_at: None,
         };
         app.start();
+        // Mount a config-provided CD image once the emulation thread is up.
+        if let Some(path) = cd_image {
+            match load_cd_image_from_path(&path) {
+                Ok(image) => {
+                    if let Some(emu) = &app.emu {
+                        emu.mount_cd(image);
+                    }
+                    app.cd_label = path.file_name().map(|n| n.to_string_lossy().into_owned());
+                }
+                Err(err) => error!(%err, path = %path.display(), "failed to mount config CD image"),
+            }
+        }
         app
     }
 
@@ -694,7 +733,7 @@ impl GuiApp {
 
     fn controls_ui(&mut self, ui: &mut egui::Ui) {
         let running = self.emu.is_some();
-        let (mode, speed, serial, floppy_accesses, c_accesses) = match &self.emu {
+        let (mode, speed, serial, floppy_accesses, c_accesses, cd_accesses) = match &self.emu {
             Some(emu) => {
                 let f = emu.frame.lock().expect("frame snapshot poisoned");
                 (
@@ -703,6 +742,7 @@ impl GuiApp {
                     f.serial.clone(),
                     f.floppy_accesses,
                     f.c_accesses,
+                    f.cd_accesses,
                 )
             }
             None => (
@@ -711,6 +751,7 @@ impl GuiApp {
                 String::new(),
                 self.floppy_access_seen,
                 self.c_access_seen,
+                self.cd_access_seen,
             ),
         };
         // Light a drive LED whenever its access count advanced since last frame.
@@ -722,6 +763,10 @@ impl GuiApp {
         if c_accesses != self.c_access_seen {
             self.c_access_seen = c_accesses;
             self.c_access_at = Some(now);
+        }
+        if cd_accesses != self.cd_access_seen {
+            self.cd_access_seen = cd_accesses;
+            self.cd_access_at = Some(now);
         }
 
         ui.heading("Machine");
@@ -790,6 +835,7 @@ impl GuiApp {
         let lit = |at: Option<Instant>| at.is_some_and(|t| t.elapsed() < LED_GLOW);
         let floppy_lit = lit(self.floppy_access_at);
         let c_lit = lit(self.c_access_at);
+        let cd_lit = lit(self.cd_access_at);
 
         // A: floppy. Icon, name, then the access LED on the header row; the drive
         // letter in the header makes the status line below it letter-free.
@@ -827,17 +873,31 @@ impl GuiApp {
 
         ui.add_space(4.0);
 
-        // CD-ROM: the same shape as A:, disabled until the drive is emulated.
+        // CD-ROM (D:): mount an ISO or a CUE/BIN into the ATAPI drive live.
         ui.horizontal(|ui| {
             drive_icon(ui, DriveIcon::Cd);
-            ui.label("CD-ROM");
-            access_led(ui, false);
+            ui.label("D: CD-ROM");
+            access_led(ui, cd_lit);
         });
         ui.horizontal(|ui| {
-            ui.add_enabled(false, egui::Button::new("Load IMG..."));
-            ui.add_enabled(false, egui::Button::new("Load folder..."));
+            if ui
+                .add_enabled(running, egui::Button::new("Load ISO/CUE..."))
+                .clicked()
+            {
+                self.load_cd_image();
+            }
+            let mounted = self.cd_label.is_some();
+            if ui
+                .add_enabled(running && mounted, egui::Button::new("Eject"))
+                .clicked()
+            {
+                if let Some(emu) = &self.emu {
+                    emu.eject_cd();
+                }
+                self.cd_label = None;
+            }
         });
-        ui.label("not emulated yet");
+        ui.label(self.cd_label.as_deref().unwrap_or("(empty)"));
 
         ui.add_space(4.0);
 
@@ -918,6 +978,86 @@ impl GuiApp {
         self.floppy_label = Some(label);
         self.floppy_source = Some(source);
     }
+
+    /// Pick a CD image (an `.iso` or a `.cue`) and mount it into the ATAPI drive.
+    /// A `.cue` is parsed against its companion `.bin`; an `.iso` mounts as a
+    /// single data track. Errors are logged and leave the drive unchanged.
+    fn load_cd_image(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("CD image", &["iso", "cue", "bin"])
+            .pick_file()
+        else {
+            return;
+        };
+        let image = match load_cd_image_from_path(&path) {
+            Ok(image) => image,
+            Err(err) => {
+                error!(%err, path = %path.display(), "failed to load CD image");
+                return;
+            }
+        };
+        let Some(emu) = &self.emu else {
+            return;
+        };
+        let label = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        emu.mount_cd(image);
+        self.cd_label = Some(label);
+    }
+}
+
+/// Build a `CdImage` from a host path. A `.cue` is read as text and parsed
+/// against the BIN its `FILE` line names (resolved next to the CUE); any other
+/// extension is treated as a raw ISO. Returns a human-readable error string.
+fn load_cd_image_from_path(path: &Path) -> Result<izarravm_machine::CdImage, String> {
+    let is_cue = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("cue"));
+    if is_cue {
+        let cue = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let bin_path = cue_bin_path(path, &cue);
+        let bin = std::fs::read(&bin_path)
+            .map_err(|e| format!("reading BIN {}: {e}", bin_path.display()))?;
+        izarravm_machine::CdImage::from_cue(&cue, bin)
+    } else {
+        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+        izarravm_machine::CdImage::from_iso(bytes)
+    }
+}
+
+/// Resolve the BIN file a CUE references. The `FILE "name" BINARY` line names it
+/// relative to the CUE's directory; if no FILE line is found, fall back to the
+/// CUE's own stem with a `.bin` extension.
+fn cue_bin_path(cue_path: &Path, cue: &str) -> PathBuf {
+    let dir = cue_path.parent().unwrap_or_else(|| Path::new("."));
+    for line in cue.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("FILE ").or_else(|| {
+            trimmed
+                .strip_prefix("file ")
+                .or_else(|| trimmed.strip_prefix("File "))
+        }) {
+            // The name is the quoted token, or the first whitespace token.
+            let name = rest
+                .split('"')
+                .nth(1)
+                .or_else(|| rest.split_whitespace().next())
+                .unwrap_or("");
+            if !name.is_empty() {
+                return dir.join(name);
+            }
+        }
+    }
+    dir.join(format!(
+        "{}.bin",
+        cue_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    ))
 }
 
 impl eframe::App for GuiApp {
@@ -1054,6 +1194,7 @@ pub fn run(
     profile: MachineProfile,
     rom: Vec<u8>,
     c_drive: PathBuf,
+    cd_image: Option<PathBuf>,
     audio_enabled: bool,
     test_pattern: bool,
     rtc_setup: crate::cmos::RtcSetup,
@@ -1073,6 +1214,7 @@ pub fn run(
                 profile,
                 rom,
                 c_drive,
+                cd_image,
                 audio_enabled,
                 test_pattern,
                 rtc_setup,

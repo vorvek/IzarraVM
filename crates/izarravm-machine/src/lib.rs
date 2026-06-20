@@ -11,14 +11,19 @@ use izarravm_video::{
 };
 use thiserror::Error;
 
+mod atapi;
+mod cdimage;
 mod dma;
 mod fat12;
 mod floppy;
+mod ide;
 mod keyboard;
 mod pic;
 mod pit;
 mod rtc;
 mod speaker;
+
+pub use cdimage::CdImage;
 
 pub const HIGH_ROM_BASE: u32 = 0xffff_0000;
 pub const MARGO_LFB_BASE: u32 = 0xE000_0000;
@@ -37,6 +42,10 @@ const DOS_LOAD_SEGMENT: u16 = 0x0100;
 /// Lotura system-controller identifier, mirroring the Margo card's MARGO_ID_VALUE
 /// convention (a fixed nonzero byte the guest can probe).
 pub const LOTURA_ID_VALUE: u8 = 0x5a;
+
+/// Drive number the MSCDEX HLE exposes the CD-ROM at (0 = A:). The CD is D:,
+/// after A: floppy and C: host drive.
+pub const CD_DRIVE_NUMBER: u8 = 3;
 
 #[derive(Debug, Error)]
 pub enum MachineError {
@@ -223,6 +232,13 @@ pub struct Machine {
     // counter never misses an event the way a poll-and-clear bool would.
     floppy_accesses: u64,
     c_accesses: u64,
+    // ATAPI CD-ROM on the secondary IDE channel (0x170-0x177/0x376, IRQ15). It
+    // owns the mounted disc image, the ATA register file, and the CD-audio
+    // playback state the mixer streams.
+    ide: ide::IdeChannel,
+    cd_accesses: u64,
+    // Fractional Red Book frames owed to the CD-audio mixer from the DAC clock.
+    cd_audio_frac: f64,
     // MC146818 RTC and CMOS NVRAM at ports 0x70/0x71.
     rtc: rtc::Rtc,
     // Fractional seconds owed to the RTC from the machine clock; whole seconds
@@ -317,6 +333,9 @@ impl Machine {
             floppy: None,
             floppy_accesses: 0,
             c_accesses: 0,
+            ide: ide::IdeChannel::new(),
+            cd_accesses: 0,
+            cd_audio_frac: 0.0,
             rtc: rtc::Rtc::new(),
             rtc_seconds: 0.0,
             fast_post: true,
@@ -383,6 +402,29 @@ impl Machine {
     /// samples these per frame and flashes a drive LED when one advances.
     pub fn drive_access_counts(&self) -> (u64, u64) {
         (self.floppy_accesses, self.c_accesses)
+    }
+
+    /// Monotonic CD-ROM access count. The GUI samples this to flash the optical
+    /// drive's access LED; it advances on every data read the ATAPI device serves.
+    pub fn cd_access_count(&self) -> u64 {
+        self.cd_accesses
+    }
+
+    /// Mount a CD image into the ATAPI drive. The image is a parsed `CdImage`
+    /// built by the caller from an ISO or a CUE/BIN pair, so the machine stays
+    /// agnostic to the host file layout.
+    pub fn mount_cd(&mut self, image: CdImage) {
+        self.ide.device_mut().insert(image);
+    }
+
+    /// Eject the CD, leaving the ATAPI drive empty.
+    pub fn eject_cd(&mut self) {
+        self.ide.device_mut().eject();
+    }
+
+    /// Whether a disc is currently mounted in the ATAPI drive.
+    pub fn cd_loaded(&self) -> bool {
+        self.ide.device().is_loaded()
     }
 
     /// Seed the RTC clock from host-provided local time. `weekday` is 1..=7 with
@@ -651,6 +693,7 @@ impl Machine {
             opl: &mut self.opl,
             dsp: &mut self.dsp,
             mixer: &mut self.mixer,
+            ide: &mut self.ide,
             trace: &mut self.trace,
             pending_soft_int: &mut self.pending_soft_int,
             active_mode: self.active_mode,
@@ -823,6 +866,207 @@ impl Machine {
         } else {
             self.set_int_frame_carry(true);
         }
+    }
+
+    /// Service the MSCDEX functions of `INT 2Fh` (the multiplex interrupt) as an
+    /// HLE bridge, so the guest sees a CD drive without a real driver loaded. The
+    /// CD-ROM is exposed at the drive letter `CD_DRIVE_NUMBER` (0 = A:), which is
+    /// D: by default. Only the query and device-driver-request functions are
+    /// modeled; unrecognized AX values fall through unchanged so other INT 2Fh
+    /// consumers are unaffected. Returns true if the call was an MSCDEX function
+    /// this bridge handled.
+    fn handle_int2f(&mut self) -> bool {
+        let ax = self.cpu.registers.eax() as u16;
+        match ax {
+            // Network-redirector / MSCDEX installation check. The standard
+            // MSCDEX probe pushes a DADAh marker and expects FFh in AL. We report
+            // installed unconditionally so a game's CD detection succeeds.
+            0x1100 => {
+                self.set_eax_al(0xFF);
+                true
+            }
+            // CD-ROM installation check: BX = number of CD drives, CX = first
+            // drive letter (0 = A:).
+            0x1500 => {
+                // One CD drive is always present (D:), even with no disc loaded:
+                // a game maps the drive letter before inserting media.
+                let bx = 1u16;
+                let ebx = (self.cpu.registers.ebx() & !0xFFFF) | u32::from(bx);
+                self.cpu.registers.set_ebx(ebx);
+                let ecx = (self.cpu.registers.ecx() & !0xFFFF) | u32::from(CD_DRIVE_NUMBER);
+                self.cpu.registers.set_ecx(ecx);
+                true
+            }
+            // Get drive device list: ES:BX -> 5 bytes per drive (subunit + driver
+            // header far pointer). We write one entry: subunit 0, a null header
+            // pointer (the guest only needs the drive count/letter to map the
+            // drive; the header is informational for our HLE path).
+            0x1501 => {
+                let es = self.cpu.registers.segment(SegmentIndex::Es).base;
+                let bx = self.cpu.registers.ebx() as u16;
+                let addr = es.wrapping_add(u32::from(bx));
+                self.write_guest_block(addr, &[0u8; 5]); // subunit 0, header 0:0
+                true
+            }
+            // Get CD-ROM drive letters: ES:BX -> one byte per drive letter, the
+            // drive number (0 = A:). One CD drive.
+            0x150D => {
+                let es = self.cpu.registers.segment(SegmentIndex::Es).base;
+                let bx = self.cpu.registers.ebx() as u16;
+                let addr = es.wrapping_add(u32::from(bx));
+                self.write_guest_block(addr, &[CD_DRIVE_NUMBER]);
+                true
+            }
+            // Drive check: BX = ADADh signals MSCDEX present; AX nonzero if the
+            // drive in CX is a supported CD-ROM.
+            0x150B => {
+                let cx = self.cpu.registers.ecx() as u16;
+                let supported = u16::from(cx == u16::from(CD_DRIVE_NUMBER));
+                let eax = (self.cpu.registers.eax() & !0xFFFF) | u32::from(supported);
+                self.cpu.registers.set_eax(eax);
+                let ebx = (self.cpu.registers.ebx() & !0xFFFF) | 0xADAD;
+                self.cpu.registers.set_ebx(ebx);
+                true
+            }
+            // Get MSCDEX version: BH = major, BL = minor. Report 2.23.
+            0x150C => {
+                let ebx = (self.cpu.registers.ebx() & !0xFFFF) | 0x0217; // 2.23
+                self.cpu.registers.set_ebx(ebx);
+                true
+            }
+            // Send device driver request: ES:BX -> a CD-ROM device driver request
+            // header. CX = drive number. Dispatch it to the ATAPI device.
+            0x1510 => {
+                let cx = self.cpu.registers.ecx() as u16;
+                if cx != u16::from(CD_DRIVE_NUMBER) {
+                    // Invalid drive: CF set, AX = 000Fh.
+                    let eax = (self.cpu.registers.eax() & !0xFFFF) | 0x000F;
+                    self.cpu.registers.set_eax(eax);
+                    self.set_int_frame_carry(true);
+                    return true;
+                }
+                let es = self.cpu.registers.segment(SegmentIndex::Es).base;
+                let bx = self.cpu.registers.ebx() as u16;
+                let header = es.wrapping_add(u32::from(bx));
+                self.mscdex_device_request(header);
+                self.set_int_frame_carry(false);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Execute one CD-ROM device driver request whose header begins at linear
+    /// `header`. Decodes the command code and the per-command fields (see RBIL
+    /// table 02597) and drives the ATAPI device, writing data back to the
+    /// transfer address and the status word back into the header. Supports the
+    /// CD commands a game uses: READ LONG (0x80), SEEK (0x83), PLAY AUDIO (0x84),
+    /// STOP (0x85), RESUME (0x88), and IOCTL INPUT (0x03) device-status queries.
+    fn mscdex_device_request(&mut self, header: u32) {
+        let command = self.read_physical_u8(header + 2);
+        // Status word at offset 3: bit 8 = done, bit 15 = error, low byte = code.
+        let mut status: u16 = 0x0100; // done
+        match command {
+            // READ LONG: read `count` sectors starting at the given sector into
+            // the transfer address. Addressing mode 0 = HSG (LBA), 1 = Red Book.
+            0x80 => {
+                let addr_mode = self.read_physical_u8(header + 0x0D);
+                let xfer = self.read_guest_dword(header + 0x0E);
+                let count = self.read_guest_word(header + 0x12);
+                let start = self.read_guest_dword(header + 0x14);
+                let lba = self.driver_addr_to_lba(addr_mode, start);
+                let mut ok = true;
+                for i in 0..u32::from(count) {
+                    match self
+                        .ide
+                        .device()
+                        .image()
+                        .and_then(|img| img.read_data_sector(lba + i))
+                    {
+                        Some(sector) => {
+                            self.write_guest_block(
+                                xfer.wrapping_add(i * cdimage::DATA_SECTOR as u32),
+                                &sector,
+                            );
+                        }
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                self.cd_accesses += 1;
+                if !ok {
+                    status = 0x8000 | 0x0100 | 0x000F; // error + done, sector not found
+                }
+            }
+            // SEEK: advisory; accept it (the timing model does not need it).
+            0x83 => {}
+            // PLAY AUDIO: start playback at the given sector for `count` sectors.
+            0x84 => {
+                let addr_mode = self.read_physical_u8(header + 0x0D);
+                let start = self.read_guest_dword(header + 0x0E);
+                let count = self.read_guest_dword(header + 0x12);
+                let lba = self.driver_addr_to_lba(addr_mode, start);
+                let mut cdb = [0u8; 12];
+                cdb[0] = 0x45; // PLAY AUDIO(10)
+                cdb[2..6].copy_from_slice(&lba.to_be_bytes());
+                let frames = count.min(u32::from(u16::MAX)) as u16;
+                cdb[7..9].copy_from_slice(&frames.to_be_bytes());
+                if matches!(self.ide.device_mut().execute(&cdb), atapi::CmdResult::Error) {
+                    status = 0x8000 | 0x0100 | 0x000F;
+                }
+            }
+            // STOP AUDIO.
+            0x85 => {
+                let mut cdb = [0u8; 12];
+                cdb[0] = 0x4E;
+                let _ = self.ide.device_mut().execute(&cdb);
+            }
+            // RESUME AUDIO.
+            0x88 => {
+                let mut cdb = [0u8; 12];
+                cdb[0] = 0x4B;
+                cdb[8] = 0x01; // resume bit
+                let _ = self.ide.device_mut().execute(&cdb);
+            }
+            // IOCTL INPUT and any other command: report done with no data. A
+            // real driver answers control-block queries here; a game that only
+            // needs the data/audio path tolerates a benign success.
+            _ => {}
+        }
+        // Write the status word back into the header (offset 3).
+        let _ = self.memory.write_u16(header as usize + 3, status);
+    }
+
+    /// Convert a CD device-driver address (HSG LBA when `addr_mode` == 0, packed
+    /// Red Book frame/second/minute when 1) to a logical LBA.
+    fn driver_addr_to_lba(&self, addr_mode: u8, raw: u32) -> u32 {
+        if addr_mode == 0 {
+            raw // HSG = logical sector number = LBA
+        } else {
+            // Red Book packed as frame/second/minute/unused in the low bytes.
+            let frame = raw as u8;
+            let second = (raw >> 8) as u8;
+            let minute = (raw >> 16) as u8;
+            cdimage::msf_to_lba(minute, second, frame)
+        }
+    }
+
+    fn read_guest_word(&mut self, addr: u32) -> u16 {
+        let lo = self.read_physical_u8(addr);
+        let hi = self.read_physical_u8(addr + 1);
+        u16::from_le_bytes([lo, hi])
+    }
+
+    fn read_guest_dword(&mut self, addr: u32) -> u32 {
+        let bytes = [
+            self.read_physical_u8(addr),
+            self.read_physical_u8(addr + 1),
+            self.read_physical_u8(addr + 2),
+            self.read_physical_u8(addr + 3),
+        ];
+        u32::from_le_bytes(bytes)
     }
 
     /// Consume `secs` of emulated time for a device operation that blocks the
@@ -1547,6 +1791,16 @@ impl Machine {
             self.pic.request(1); // IRQ1: keyboard output buffer has a scancode
         }
 
+        // ATAPI command completion forwards IRQ15 (the secondary channel) to the
+        // PIC, the way a real drive interrupts the host when a packet finishes.
+        if self.ide.take_irq() {
+            self.pic.request(ide::SECONDARY_IRQ);
+        }
+        // Flash the GUI CD LED for any data the drive just served.
+        if self.ide.take_access_bytes() > 0 {
+            self.cd_accesses += 1;
+        }
+
         // Advance the RTC: inv_clock is 1/clock_hz, so clocks * inv_clock is
         // elapsed seconds. Fold whole seconds into the clock and carry the rest.
         self.rtc_seconds += clocks as f64 * self.timing.inv_clock;
@@ -1697,16 +1951,63 @@ impl Machine {
         let (outgain_l, outgain_r) = self.mixer.outgain_gain();
         let len = opl_out.len().max(dsp_out.len());
         let spk = self.speaker.drain(len);
+        // CD-Audio: pull the matching count of Red Book samples (44.1 kHz, the
+        // DAC rate, so no resample) and attenuate by the CT1745 CD volume. A drive
+        // that is not playing returns silence, so this is a no-op when no PLAY
+        // AUDIO is active. This realizes CD audio through the ReSonique 2 DAC.
+        let (cd_l_gain, cd_r_gain) = self.mixer.cd_gain();
+        let cd = self.pull_cd_audio_samples(len);
         (0..len)
             .map(|i| {
                 let (ol, or) = opl_out.get(i).copied().unwrap_or((0, 0));
                 let (dl, dr) = dsp_out.get(i).copied().unwrap_or((0, 0));
                 let s = i32::from(spk[i]);
-                let l = ((ol + dl) as f32 * (master_l * outgain_l)) as i32 + s;
-                let r = ((or + dr) as f32 * (master_r * outgain_r)) as i32 + s;
+                let (cl, cr) = cd.get(i).copied().unwrap_or((0, 0));
+                let cl = (cl as f32 * cd_l_gain) as i32;
+                let cr = (cr as f32 * cd_r_gain) as i32;
+                let l = ((ol + dl) as f32 * (master_l * outgain_l)) as i32 + s + cl;
+                let r = ((or + dr) as f32 * (master_r * outgain_r)) as i32 + s + cr;
                 (clamp_i16(l), clamp_i16(r))
             })
             .collect()
+    }
+
+    /// Pull `count` stereo CD-audio samples (44.1 kHz, the DAC rate) from the
+    /// ATAPI drive's active PLAY AUDIO, advancing the playback position. Each Red
+    /// Book frame (one CD sector) holds 588 stereo 16-bit samples; the helper
+    /// reads frames on demand and tracks the fractional frame consumed so the
+    /// stream is continuous across calls. Returns silence when no audio is
+    /// playing.
+    fn pull_cd_audio_samples(&mut self, count: usize) -> Vec<(i32, i32)> {
+        const SAMPLES_PER_FRAME: usize = crate::cdimage::RAW_SECTOR / 4; // 588
+        let mut out = Vec::with_capacity(count);
+        if !self.ide.device().playback().playing {
+            self.cd_audio_frac = 0.0;
+            return out;
+        }
+        // cd_audio_frac is the next sample index within the current frame, carried
+        // across render calls so the stream stays continuous. Peek the current
+        // frame, drain its remaining samples, then step to the next frame.
+        let mut sample_in_frame = self.cd_audio_frac as usize;
+        while out.len() < count {
+            let Some(buf) = self.ide.device().peek_audio_frame() else {
+                break; // playback reached its end mid-window
+            };
+            while sample_in_frame < SAMPLES_PER_FRAME && out.len() < count {
+                let base = sample_in_frame * 4;
+                let l = i16::from_le_bytes([buf[base], buf[base + 1]]);
+                let r = i16::from_le_bytes([buf[base + 2], buf[base + 3]]);
+                out.push((i32::from(l), i32::from(r)));
+                sample_in_frame += 1;
+            }
+            if sample_in_frame >= SAMPLES_PER_FRAME {
+                // Consumed the whole frame: step the play position forward.
+                self.ide.device_mut().advance_play(1);
+                sample_in_frame = 0;
+            }
+        }
+        self.cd_audio_frac = sample_in_frame as f64;
+        out
     }
 
     /// Raise a hardware interrupt request line into the PIC. The PIT and other
@@ -1830,6 +2131,7 @@ impl Machine {
                     opl,
                     dsp,
                     mixer,
+                    ide,
                     trace,
                     pending_soft_int,
                     fast_post,
@@ -1851,6 +2153,7 @@ impl Machine {
                     opl,
                     dsp,
                     mixer,
+                    ide,
                     trace,
                     pending_soft_int,
                     active_mode: *active_mode,
@@ -1870,6 +2173,14 @@ impl Machine {
                     // the overflow flag (the synthesis clock is driven separately
                     // by `render_audio`).
                     self.advance_devices(step);
+                    // Charge the CD-ROM's seek + transfer time for a read the
+                    // instruction just issued, the way the floppy stalls. The
+                    // guest clock jumps; the GUI's realtime pacing turns that into
+                    // a visible wait.
+                    let cd_secs = self.ide.take_stall_secs();
+                    if cd_secs > 0.0 {
+                        self.stall_for(cd_secs);
+                    }
                     if let Some(mode) = self.pending_mode.take() {
                         self.set_mode(mode); // live Lotura switch takes effect next instruction
                     }
@@ -1880,6 +2191,9 @@ impl Machine {
                             0x12 => self.handle_int12(),
                             0x13 => self.handle_int13(),
                             0x15 => self.handle_int15(),
+                            0x2F => {
+                                self.handle_int2f();
+                            }
                             0x20 | 0x21 => match self.handle_dos_int(vector) {
                                 Ok(Some(code)) => {
                                     if let Some(frame) = self.program_frames.pop() {
@@ -1946,6 +2260,7 @@ struct MachineBus<'a> {
     opl: &'a mut OplChip,
     dsp: &'a mut SbDsp,
     mixer: &'a mut SbMixer,
+    ide: &'a mut ide::IdeChannel,
     trace: &'a mut BusTrace,
     pending_soft_int: &'a mut Option<u8>,
     active_mode: GswMode,                  // a copy, for the 0xE1 read
@@ -2054,6 +2369,9 @@ impl CpuBus for MachineBus<'_> {
         if let Some(value) = self.mixer.read_port(port) {
             return Ok(u32::from(value));
         }
+        if ide::IdeChannel::owns_port(port) {
+            return Ok(u32::from(self.ide.read_port(port).unwrap_or(0xff)));
+        }
         if let Some(value) = self.dsp.read_port(port) {
             // A guest ISR acknowledges the DSP interrupt by reading 0x22E (8-bit)
             // or 0x22F (16-bit); that read also clears the mixer's 0x82 source bit.
@@ -2118,6 +2436,10 @@ impl CpuBus for MachineBus<'_> {
         if self.mixer.write_port(port, value as u8) {
             return Ok(());
         }
+        if ide::IdeChannel::owns_port(port) {
+            self.ide.write_port(port, value as u8);
+            return Ok(());
+        }
         if self.dsp.write_port(port, value as u8) {
             return Ok(());
         }
@@ -2171,7 +2493,10 @@ impl CpuBus for MachineBus<'_> {
         // video service; 0x20/0x21 are the DOS kernel. Vector 0x10 reaches here
         // only from a software INT today (the CPU never faults with vector 0x10);
         // revisit if an x87 #MF is added.
-        if matches!(vector, 0x10 | 0x11 | 0x12 | 0x13 | 0x15 | 0x20 | 0x21) {
+        if matches!(
+            vector,
+            0x10 | 0x11 | 0x12 | 0x13 | 0x15 | 0x20 | 0x21 | 0x2F
+        ) {
             *self.pending_soft_int = Some(vector);
         }
         Ok(())
@@ -2353,7 +2678,7 @@ const BIOS_ROM_IRET_SEG: u16 = 0xff00;
 fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     // BIOS service interrupts the host intercepts by vector. Their IVT targets
     // point at the ROM IRET so they survive a guest low-memory wipe.
-    for vector in [0x10, 0x11, 0x12, 0x13, 0x15] {
+    for vector in [0x10, 0x11, 0x12, 0x13, 0x15, 0x2F] {
         let address = vector * 4;
         memory.write_u16(address, 0)?;
         memory.write_u16(address + 2, BIOS_ROM_IRET_SEG)?;
@@ -3421,6 +3746,7 @@ mod tests {
             opl: &mut machine.opl,
             dsp: &mut machine.dsp,
             mixer: &mut machine.mixer,
+            ide: &mut machine.ide,
             trace: &mut machine.trace,
             pending_soft_int: &mut machine.pending_soft_int,
             active_mode: machine.active_mode,
@@ -3875,6 +4201,163 @@ mod tests {
             pcm.iter().any(|&(l, _)| l != 0),
             "the OPL should produce audio via the SB base aliases"
         );
+    }
+
+    /// Build a CD image with one data sector and a stretch of loud audio frames,
+    /// for the CD-audio mixing test.
+    fn audio_cd(frames: u32) -> CdImage {
+        let cue = "TRACK 01 MODE1/2048\nINDEX 01 00:00:00\n\
+                   TRACK 02 AUDIO\nINDEX 01 00:00:01\n";
+        let mut bin = vec![0u8; cdimage::DATA_SECTOR + frames as usize * cdimage::RAW_SECTOR];
+        // Fill the audio region with a loud constant so the mix is clearly nonzero.
+        for chunk in bin[cdimage::DATA_SECTOR..].chunks_exact_mut(2) {
+            chunk.copy_from_slice(&8000i16.to_le_bytes());
+        }
+        CdImage::from_cue(cue, bin).unwrap()
+    }
+
+    #[test]
+    fn play_audio_mixes_cd_audio_into_render_audio() {
+        let mut machine = test_machine();
+        machine.mount_cd(audio_cd(20));
+        // Open the CD volume to full (5-bit registers 0x36/0x37) via the mixer.
+        with_bus(&mut machine, |bus| {
+            for (index, value) in [(0x36u32, 31u32), (0x37, 31)] {
+                bus.write_io(0x224, BusWidth::Byte, index).unwrap();
+                bus.write_io(0x225, BusWidth::Byte, value).unwrap();
+            }
+        });
+        // Issue PLAY AUDIO(10) over the secondary-channel ATAPI ports: PACKET
+        // command, then the 12-byte CDB. Play from LBA 1 (audio start) for 16
+        // frames.
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x177, BusWidth::Byte, 0xA0).unwrap(); // PACKET command
+            let mut cdb = [0u8; 12];
+            cdb[0] = 0x45; // PLAY AUDIO(10)
+            cdb[5] = 1; // starting LBA 1
+            cdb[8] = 16; // 16 frames
+            for b in cdb {
+                bus.write_io(0x170, BusWidth::Byte, u32::from(b)).unwrap();
+            }
+        });
+        assert!(machine.cd_loaded());
+        let pcm = machine.render_audio(2000);
+        assert!(
+            pcm.iter().any(|&(l, r)| l != 0 || r != 0),
+            "PLAY AUDIO should mix nonzero CD audio into the DAC output"
+        );
+    }
+
+    #[test]
+    fn cd_audio_is_silent_with_the_volume_muted() {
+        let mut machine = test_machine();
+        machine.mount_cd(audio_cd(20));
+        // Leave CD volume at its muted default (0). Start playback.
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x177, BusWidth::Byte, 0xA0).unwrap();
+            let mut cdb = [0u8; 12];
+            cdb[0] = 0x45;
+            cdb[5] = 1;
+            cdb[8] = 16;
+            for b in cdb {
+                bus.write_io(0x170, BusWidth::Byte, u32::from(b)).unwrap();
+            }
+        });
+        let pcm = machine.render_audio(2000);
+        assert!(
+            pcm.iter().all(|&(l, r)| l == 0 && r == 0),
+            "a muted CD volume yields silence even while playing"
+        );
+    }
+
+    #[test]
+    fn mscdex_install_check_reports_installed() {
+        let mut machine = test_machine();
+        machine.cpu.registers.set_eax(0x1100);
+        assert!(machine.handle_int2f());
+        // AL = FFh means installed.
+        assert_eq!(machine.cpu.registers.eax() as u8, 0xFF);
+    }
+
+    #[test]
+    fn mscdex_drive_check_reports_the_cd_drive() {
+        let mut machine = test_machine();
+        machine.mount_cd(audio_cd(4));
+        // AX=1500: BX = drive count, CX = first drive letter (D: = 3).
+        machine.cpu.registers.set_eax(0x1500);
+        assert!(machine.handle_int2f());
+        assert_eq!(machine.cpu.registers.ebx() as u16, 1);
+        assert_eq!(
+            machine.cpu.registers.ecx() as u16,
+            u16::from(CD_DRIVE_NUMBER)
+        );
+        // AX=150B drive check for D:: BX = ADADh, AX nonzero (supported).
+        machine.cpu.registers.set_eax(0x150B);
+        machine.cpu.registers.set_ecx(u32::from(CD_DRIVE_NUMBER));
+        assert!(machine.handle_int2f());
+        assert_eq!(machine.cpu.registers.ebx() as u16, 0xADAD);
+        assert_ne!(machine.cpu.registers.eax() as u16, 0);
+    }
+
+    #[test]
+    fn mscdex_send_request_read_long_loads_a_sector() {
+        let mut machine = test_machine();
+        // A small data ISO with a marker per sector.
+        let mut bytes = vec![0u8; 4 * cdimage::DATA_SECTOR];
+        bytes[2 * cdimage::DATA_SECTOR] = 0x99; // LBA 2 marker
+        machine.mount_cd(CdImage::from_iso(bytes).unwrap());
+
+        // Build a READ LONG (0x80) device request header at linear 0x2000, with a
+        // transfer buffer at 0x4000. ES:BX -> header via ES base 0, BX = 0x2000.
+        let header = 0x2000u32;
+        let xfer = 0x4000u32;
+        machine.write_physical_u8(header + 2, 0x80); // command READ LONG
+        machine.write_physical_u8(header + 0x0D, 0x00); // HSG addressing
+        // transfer address dword at 0x0E
+        for (i, b) in xfer.to_le_bytes().iter().enumerate() {
+            machine.write_physical_u8(header + 0x0E + i as u32, *b);
+        }
+        // sector count (1) at 0x12
+        machine.write_physical_u8(header + 0x12, 1);
+        machine.write_physical_u8(header + 0x13, 0);
+        // starting sector (LBA 2) dword at 0x14
+        for (i, b) in 2u32.to_le_bytes().iter().enumerate() {
+            machine.write_physical_u8(header + 0x14 + i as u32, *b);
+        }
+
+        machine.cpu.registers.set_eax(0x1510);
+        machine.cpu.registers.set_ebx(header); // ES base 0, BX = header
+        machine.cpu.registers.set_ecx(u32::from(CD_DRIVE_NUMBER));
+        assert!(machine.handle_int2f());
+
+        // The sector landed at the transfer address.
+        assert_eq!(machine.read_physical_u8(xfer), 0x99);
+        // Status word (offset 3) has the done bit set, no error.
+        let status = machine.read_guest_word(header + 3);
+        assert_eq!(status & 0x8000, 0, "no error bit");
+        assert_ne!(status & 0x0100, 0, "done bit set");
+    }
+
+    #[test]
+    fn mscdex_send_request_play_audio_starts_playback() {
+        let mut machine = test_machine();
+        machine.mount_cd(audio_cd(40));
+        let header = 0x2000u32;
+        machine.write_physical_u8(header + 2, 0x84); // PLAY AUDIO
+        machine.write_physical_u8(header + 0x0D, 0x00); // HSG
+        // start sector (LBA 1, the audio track) dword at 0x0E
+        for (i, b) in 1u32.to_le_bytes().iter().enumerate() {
+            machine.write_physical_u8(header + 0x0E + i as u32, *b);
+        }
+        // play count (8 frames) dword at 0x12
+        for (i, b) in 8u32.to_le_bytes().iter().enumerate() {
+            machine.write_physical_u8(header + 0x12 + i as u32, *b);
+        }
+        machine.cpu.registers.set_eax(0x1510);
+        machine.cpu.registers.set_ebx(header);
+        machine.cpu.registers.set_ecx(u32::from(CD_DRIVE_NUMBER));
+        assert!(machine.handle_int2f());
+        assert!(machine.ide.device().playback().playing);
     }
 
     #[test]

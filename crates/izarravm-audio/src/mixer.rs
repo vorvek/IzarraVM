@@ -170,6 +170,17 @@ impl SbMixer {
         )
     }
 
+    /// (Left, Right) linear CD-Audio gain from registers `0x36`/`0x37` (the 5-bit
+    /// CD volume), applied to the Red Book stream the ATAPI drive streams into the
+    /// mix. The CT1345-compatible alias at `0x28` mirrors these registers, so a
+    /// guest that programs either path attenuates the same source.
+    pub fn cd_gain(&self) -> (f32, f32) {
+        (
+            VOL5_STEPS[(self.inert[0x36] & 0x1F) as usize],
+            VOL5_STEPS[(self.inert[0x37] & 0x1F) as usize],
+        )
+    }
+
     /// Decode the `0x224`/`0x225` port pair. Returns `true` if the port belongs
     /// to the mixer.
     pub fn write_port(&mut self, port: u16, value: u8) -> bool {
@@ -229,6 +240,15 @@ impl SbMixer {
                 let (l, r) = unpack_compat(value);
                 self.master_l = l;
                 self.master_r = r;
+            }
+            // CT1345-compatible CD volume alias: like 0x04/0x22, it maps into the
+            // 5-bit CD registers (0x36/0x37) so cd_gain() sees either path. The
+            // compat byte is also kept so a read of 0x28 round-trips.
+            0x28 => {
+                let (l, r) = unpack_compat(value);
+                self.inert[0x36] = l;
+                self.inert[0x37] = r;
+                self.inert[0x28] = value;
             }
             0x30 => self.master_l = value & 0x1F,
             0x31 => self.master_r = value & 0x1F,
@@ -396,6 +416,27 @@ mod tests {
         let mut mixer = SbMixer::default();
         write_reg(&mut mixer, 0x80, 0x04);
         assert_eq!(read_reg(&mut mixer, 0x80), 0x04);
+    }
+
+    #[test]
+    fn cd_volume_attenuates_via_both_register_paths() {
+        let mut mixer = SbMixer::default();
+        // Default CD volume is muted.
+        assert_eq!(mixer.cd_gain(), (0.0, 0.0));
+        // The 5-bit CD registers set the gain directly.
+        write_reg(&mut mixer, 0x36, 31);
+        write_reg(&mut mixer, 0x37, 31);
+        let (l, r) = mixer.cd_gain();
+        assert!(l > 0.9 && r > 0.9, "full CD volume is near unity: {l},{r}");
+        // The CT1345 compat alias maps into the same 5-bit registers. The 4-bit
+        // max nibble maps to 5-bit level 30 (level<<1), ~0.79 gain, well above
+        // the muted floor.
+        let mut compat = SbMixer::default();
+        write_reg(&mut compat, 0x28, 0xFF); // both nibbles max
+        let (cl, cr) = compat.cd_gain();
+        assert!(cl > 0.5 && cr > 0.5, "compat CD volume is loud: {cl},{cr}");
+        // A read of 0x28 round-trips the compat byte.
+        assert_eq!(read_reg(&mut compat, 0x28), 0xFF);
     }
 
     #[test]
