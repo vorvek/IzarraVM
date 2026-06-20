@@ -64,13 +64,22 @@ int09:
     push si
     mov ax, BDA_SEG
     mov ds, ax
-    movzx si, bl
-    mov al, [cs:scan2ascii + si]
-    test byte [KB_FLAGS], 0x03
-    jz .have_ascii
-    mov al, [cs:scan2ascii_shift + si]
-.have_ascii:
-    mov ah, bl
+    ; Compute the active layout's table base: kbd_layout_tables + layout*256,
+    ; plus 128 when a shift is held. SI then indexes the half by scancode.
+    mov al, [KB_LAYOUT]             ; cached layout index 0..5 (DS = BDA)
+    mov ah, KBD_LAYOUT_STRIDE >> 1  ; 128, halved stride; the shift add doubles it
+    mul ah                          ; AX = layout * 128
+    shl ax, 1                       ; AX = layout * 256 (the block offset)
+    test byte [KB_FLAGS], 0x03      ; either shift held?
+    jz .no_shift
+    add ax, KBD_LAYOUT_STRIDE >> 1  ; +128 selects the shifted half
+.no_shift:
+    mov si, ax
+    add si, kbd_layout_tables       ; SI = table base for this layout/shift
+    movzx cx, bl                    ; CX = scancode
+    add si, cx
+    mov al, [cs:si]                 ; AL = ASCII (0 if none)
+    mov ah, bl                      ; AH = scancode
     call kb_enqueue
     pop si
     pop cx
@@ -185,17 +194,5 @@ kb_enqueue:
     pop bx
     ret
 
-; Scancode (Set 1) -> ASCII (US). 0 = no ASCII / handled elsewhere.
-scan2ascii:
-    db 0,    27,  '1','2','3','4','5','6','7','8','9','0','-','=', 8,  9
-    db 'q','w','e','r','t','y','u','i','o','p','[',']', 13, 0,  'a','s'
-    db 'd','f','g','h','j','k','l',';',39, '`', 0,  92, 'z','x','c','v'
-    db 'b','n','m',',','.','/', 0,  '*', 0,  ' '
-    times 0x80 - ($ - scan2ascii) db 0
-
-scan2ascii_shift:
-    db 0,    27,  '!','@','#','$','%','^','&','*','(',')','_','+', 8,  9
-    db 'Q','W','E','R','T','Y','U','I','O','P','{','}', 13, 0,  'A','S'
-    db 'D','F','G','H','J','K','L',':',34, '~', 0,  '|','Z','X','C','V'
-    db 'B','N','M','<','>','?', 0,  '*', 0,  ' '
-    times 0x80 - ($ - scan2ascii_shift) db 0
+; The scancode -> ASCII tables for every layout live in kbd-layouts.inc, indexed
+; above by the cached KB_LAYOUT byte.

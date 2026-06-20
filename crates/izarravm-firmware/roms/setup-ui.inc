@@ -416,6 +416,15 @@ su_commit:
     mov al, [bx]
     mov ah, SU_NVRAM_LAYOUT
     call su_cmos_write
+    ; Refresh the live INT 09h layout cache so the new table applies at once,
+    ; without waiting for a reboot to re-read CMOS. DS bounces to the BDA and back.
+    mov bx, SU_WORKING_LAYOUT
+    mov al, [bx]                    ; DS is still 0 here
+    push ds
+    mov bx, BDA_SEG
+    mov ds, bx
+    mov [KB_LAYOUT], al
+    pop ds
     ; CMOS 0x12 = GSW default.
     mov bx, SU_WORKING_MODE
     mov al, [bx]

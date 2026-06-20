@@ -18,6 +18,17 @@ bios_start:
     mov word [KB_BUF_HEAD], KB_BUF_START
     mov word [KB_BUF_TAIL], KB_BUF_START
     mov byte [KB_FLAGS], 0
+    ; Cache the keyboard layout from CMOS 0x10 into the BDA so the INT 09h ISR
+    ; translates against the right table. Clamp out-of-range values to en-US (0).
+    ; The setup page refreshes this byte live when it changes the layout.
+    mov al, KB_CMOS_LAYOUT
+    out 0x70, al
+    in al, 0x71
+    cmp al, 6
+    jb .layout_ok
+    xor al, al
+.layout_ok:
+    mov [KB_LAYOUT], al
     xor ax, ax
     mov ds, ax                  ; DS = 0 for the IVT and the result block
 

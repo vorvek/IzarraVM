@@ -13,6 +13,15 @@
 %define KB_BUF_HEAD    0x001a
 %define KB_BUF_TAIL    0x001c
 %define KB_FLAGS       0x0017
+; Cached active keyboard-layout index (0..5), read once from CMOS 0x10 at boot
+; and refreshed live when the setup page changes it. Lives in a BDA byte the rest
+; of this BIOS does not use (0x96 is the AT keyboard status-flags-3 slot), so the
+; INT 09h ISR can read it with DS already pointing at the BDA segment.
+%define KB_LAYOUT      0x0096
+; CMOS index of the persisted layout (MC146818 ports 0x70/0x71). en-US is 0.
+%define KB_CMOS_LAYOUT 0x10
+; Bytes per keyboard-layout block in kbd-layouts.inc (128 unshifted + 128 shifted).
+%define KBD_LAYOUT_STRIDE 256
 
 ; BDA timer tick (offsets into BDA_SEG), maintained by the INT 08h handler.
 ; The standard PC layout: a dword count at 0x6C and a one-byte 24-hour rollover
