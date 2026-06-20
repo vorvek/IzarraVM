@@ -432,48 +432,87 @@ fn print_video_summary(machine: &mut Machine) {
 
 /// Minimal ASCII to Set 1 make+break for the demo (lowercase letters, digits,
 /// space). Extend if the demo needs more than typing words.
+/// US-layout Set 1 make codes for the 26 letters, indexed a..=z.
+const LETTER_MAKE: [u8; 26] = [
+    0x1e, 0x30, 0x2e, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17, 0x24, 0x25, 0x26, 0x32, 0x31, 0x18, 0x19,
+    0x10, 0x13, 0x1f, 0x14, 0x16, 0x2f, 0x11, 0x2d, 0x15, 0x2c,
+];
+
+/// Map an ASCII character to its US-layout Set 1 make code and whether Shift is
+/// held to produce it. Returns None for characters with no single-key mapping.
+fn ascii_key(ch: char) -> Option<(u8, bool)> {
+    let plain = |make: u8| Some((make, false));
+    let shifted = |make: u8| Some((make, true));
+    match ch {
+        'a'..='z' => plain(LETTER_MAKE[ch as usize - 'a' as usize]),
+        'A'..='Z' => shifted(LETTER_MAKE[ch as usize - 'A' as usize]),
+        ' ' => plain(0x39),
+        '\r' | '\n' => plain(0x1c),
+        '\t' => plain(0x0f),
+        '\x08' => plain(0x0e),
+        '\x1b' => plain(0x01),
+        '1' => plain(0x02),
+        '2' => plain(0x03),
+        '3' => plain(0x04),
+        '4' => plain(0x05),
+        '5' => plain(0x06),
+        '6' => plain(0x07),
+        '7' => plain(0x08),
+        '8' => plain(0x09),
+        '9' => plain(0x0a),
+        '0' => plain(0x0b),
+        '!' => shifted(0x02),
+        '@' => shifted(0x03),
+        '#' => shifted(0x04),
+        '$' => shifted(0x05),
+        '%' => shifted(0x06),
+        '^' => shifted(0x07),
+        '&' => shifted(0x08),
+        '*' => shifted(0x09),
+        '(' => shifted(0x0a),
+        ')' => shifted(0x0b),
+        '-' => plain(0x0c),
+        '_' => shifted(0x0c),
+        '=' => plain(0x0d),
+        '+' => shifted(0x0d),
+        '[' => plain(0x1a),
+        '{' => shifted(0x1a),
+        ']' => plain(0x1b),
+        '}' => shifted(0x1b),
+        ';' => plain(0x27),
+        ':' => shifted(0x27),
+        '\'' => plain(0x28),
+        '"' => shifted(0x28),
+        '`' => plain(0x29),
+        '~' => shifted(0x29),
+        '\\' => plain(0x2b),
+        '|' => shifted(0x2b),
+        ',' => plain(0x33),
+        '<' => shifted(0x33),
+        '.' => plain(0x34),
+        '>' => shifted(0x34),
+        '/' => plain(0x35),
+        '?' => shifted(0x35),
+        _ => None,
+    }
+}
+
+/// Build the Set 1 scancode sequence for typing a character: the make and break
+/// of the key, wrapped in left-Shift make/break when the glyph needs Shift.
 fn ascii_to_set1(ch: char) -> Vec<u8> {
-    let make = match ch {
-        'a' => 0x1e,
-        'b' => 0x30,
-        'c' => 0x2e,
-        'd' => 0x20,
-        'e' => 0x12,
-        'f' => 0x21,
-        'g' => 0x22,
-        'h' => 0x23,
-        'i' => 0x17,
-        'j' => 0x24,
-        'k' => 0x25,
-        'l' => 0x26,
-        'm' => 0x32,
-        'n' => 0x31,
-        'o' => 0x18,
-        'p' => 0x19,
-        'q' => 0x10,
-        'r' => 0x13,
-        's' => 0x1f,
-        't' => 0x14,
-        'u' => 0x16,
-        'v' => 0x2f,
-        'w' => 0x11,
-        'x' => 0x2d,
-        'y' => 0x15,
-        'z' => 0x2c,
-        ' ' => 0x39,
-        '1' => 0x02,
-        '2' => 0x03,
-        '3' => 0x04,
-        '4' => 0x05,
-        '5' => 0x06,
-        '6' => 0x07,
-        '7' => 0x08,
-        '8' => 0x09,
-        '9' => 0x0a,
-        '0' => 0x0b,
-        _ => return Vec::new(),
+    let Some((make, shift)) = ascii_key(ch) else {
+        return Vec::new();
     };
-    vec![make, make | 0x80]
+    let mut codes = Vec::with_capacity(4);
+    if shift {
+        codes.push(0x2a); // left Shift make
+    }
+    codes.push(make);
+    codes.push(make | 0x80); // key break
+    if shift {
+        codes.push(0xaa); // left Shift break
+    }
+    codes
 }
 
 fn load_config(cli: &Cli) -> Result<AppConfig, Box<dyn Error>> {
@@ -528,6 +567,13 @@ mod tests {
     #[test]
     fn ascii_to_set1_maps_a_letter_to_make_and_break() {
         assert_eq!(ascii_to_set1('h'), vec![0x23, 0xa3]);
-        assert!(ascii_to_set1('!').is_empty());
+        // Uppercase wraps the key in left-Shift make/break.
+        assert_eq!(ascii_to_set1('H'), vec![0x2a, 0x23, 0xa3, 0xaa]);
+        // Enter is the unshifted return key.
+        assert_eq!(ascii_to_set1('\r'), vec![0x1c, 0x9c]);
+        // A shifted number-row glyph holds Shift over the digit key.
+        assert_eq!(ascii_to_set1('!'), vec![0x2a, 0x02, 0x82, 0xaa]);
+        // Characters with no US-layout key produce nothing.
+        assert!(ascii_to_set1('\u{00f1}').is_empty());
     }
 }
