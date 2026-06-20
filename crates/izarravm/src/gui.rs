@@ -9,7 +9,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use tracing::{error, info};
+use tracing::{error, warn};
 
 const OPL_NATIVE_HZ: f64 = 49_716.0;
 
@@ -524,7 +524,7 @@ impl GuiApp {
             match AudioPlayer::new() {
                 Ok(player) => Some(player),
                 Err(err) => {
-                    info!(%err, "audio output unavailable; running silently");
+                    warn!(%err, "audio output unavailable; running silently");
                     None
                 }
             }
