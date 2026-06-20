@@ -276,6 +276,18 @@ com1_log_step:
     call com1_puts               ; "PASS " / "FAIL " / "MEASURE "
     pop si                       ; name pointer
     call com1_puts               ; the dotted step name
+    ; MEASURE steps carry a value string in segment 0 at offset DX; append " <value>".
+    cmp al, HRES_MEASURE
+    jne .crlf
+    mov si, com1_str_space
+    call com1_puts               ; one space, still DS = CS
+    mov si, dx                   ; SI = value offset in segment 0
+    xor bx, bx
+    mov ds, bx                   ; DS = 0 for the value string
+    call com1_puts               ; the measured value (ASCIIZ)
+    push cs
+    pop ds                       ; restore DS = CS for the trailing CRLF
+.crlf:
     mov si, com1_str_crlf
     call com1_puts
     pop ds
@@ -313,6 +325,7 @@ com1_puts:
 
 com1_str_header: db 'Izarra 3000 POST', 0x0d, 0x0a, 0
 com1_str_crlf:   db 0x0d, 0x0a, 0
+com1_str_space:  db ' ', 0
 ; HRES_PASS=0, HRES_FAIL=1, HRES_MEASURE=2 select these prefixes.
 com1_prefix_pass:    db 'PASS ', 0
 com1_prefix_fail:    db 'FAIL ', 0
