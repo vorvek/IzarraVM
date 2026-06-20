@@ -163,13 +163,25 @@ impl Emulator {
         c_drive: PathBuf,
         test_pattern: bool,
         sink: Option<AudioSink>,
+        rtc_setup: crate::cmos::RtcSetup,
     ) -> Self {
         let frame = Arc::new(Mutex::new(Frame::default()));
         let (commands, rx) = mpsc::channel();
         let frame_thread = Arc::clone(&frame);
         let join = std::thread::Builder::new()
             .name("izarravm-emu".into())
-            .spawn(move || emulate(profile, rom, c_drive, test_pattern, sink, rx, frame_thread))
+            .spawn(move || {
+                emulate(
+                    profile,
+                    rom,
+                    c_drive,
+                    test_pattern,
+                    sink,
+                    rtc_setup,
+                    rx,
+                    frame_thread,
+                )
+            })
             .expect("spawn emulation thread");
         Self {
             commands,
@@ -193,12 +205,14 @@ impl Emulator {
 /// The emulation thread body: build the machine, then pace it by wall clock,
 /// pump audio, and publish a frame snapshot, until told to shut down. Nothing
 /// the UI thread does (input floods, slow repaints) can starve this loop.
+#[allow(clippy::too_many_arguments)]
 fn emulate(
     profile: MachineProfile,
     rom: Vec<u8>,
     c_drive: PathBuf,
     test_pattern: bool,
     sink: Option<AudioSink>,
+    rtc_setup: crate::cmos::RtcSetup,
     commands: Receiver<Command>,
     frame: Arc<Mutex<Frame>>,
 ) {
@@ -214,6 +228,9 @@ fn emulate(
         Ok(drive) => machine.mount_c_drive(drive),
         Err(err) => error!(%err, "failed to mount C: drive"),
     }
+    // Bring the RTC online: load cmos.bin (or write defaults) and seed the clock
+    // from the host time read on the main thread at startup.
+    rtc_setup.apply(&mut machine);
     if test_pattern {
         load_margo_test_pattern(&mut machine);
     }
@@ -225,13 +242,21 @@ fn emulate(
     let mut last = Instant::now();
     let mut published_seq = u64::MAX; // force the first publish
 
+    let cmos_path = rtc_setup.cmos_path.clone();
     loop {
         loop {
             match commands.try_recv() {
                 Ok(Command::Keys(codes)) => machine.inject_key_scancodes(&codes),
-                Ok(Command::Shutdown) => return,
+                Ok(Command::Shutdown) => {
+                    // Flush the final CMOS state before the thread exits.
+                    crate::cmos::save_cmos_file(&cmos_path, &machine.cmos_bytes());
+                    return;
+                }
                 Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return,
+                Err(TryRecvError::Disconnected) => {
+                    crate::cmos::save_cmos_file(&cmos_path, &machine.cmos_bytes());
+                    return;
+                }
             }
         }
 
@@ -293,6 +318,12 @@ fn emulate(
         }
         published_seq = seq;
 
+        // Persist cmos.bin when the guest wrote an NVRAM byte (a setup-page
+        // save). take_cmos_dirty clears the flag so we write only on a change.
+        if machine.take_cmos_dirty() {
+            crate::cmos::save_cmos_file(&cmos_path, &machine.cmos_bytes());
+        }
+
         std::thread::sleep(EMU_SLICE);
     }
 }
@@ -302,6 +333,7 @@ pub struct GuiApp {
     rom: Vec<u8>,
     c_drive: PathBuf,
     test_pattern: bool,
+    rtc_setup: crate::cmos::RtcSetup,
     title: String,
     // The cpal stream is !Send, so it stays here on the UI thread; the
     // emulation thread gets a Send sink cloned from it.
@@ -328,6 +360,7 @@ impl GuiApp {
         c_drive: PathBuf,
         audio_enabled: bool,
         test_pattern: bool,
+        rtc_setup: crate::cmos::RtcSetup,
     ) -> Self {
         let audio = if audio_enabled {
             match AudioPlayer::new() {
@@ -348,6 +381,7 @@ impl GuiApp {
             rom,
             c_drive,
             test_pattern,
+            rtc_setup,
             title,
             audio,
             emu: None,
@@ -375,6 +409,7 @@ impl GuiApp {
             self.c_drive.clone(),
             self.test_pattern,
             sink,
+            self.rtc_setup.clone(),
         ));
         self.texture = None;
         self.frame_seq = 0;
@@ -655,6 +690,7 @@ pub fn run(
     c_drive: PathBuf,
     audio_enabled: bool,
     test_pattern: bool,
+    rtc_setup: crate::cmos::RtcSetup,
 ) -> Result<(), Box<dyn Error>> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -673,6 +709,7 @@ pub fn run(
                 c_drive,
                 audio_enabled,
                 test_pattern,
+                rtc_setup,
             )))
         }),
     )?;

@@ -1,3 +1,4 @@
+mod cmos;
 mod gui;
 
 use clap::Parser;
@@ -152,12 +153,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     // output is opened regardless of which sound cards are enabled. AudioPlayer
     // falls back to silent if the host has no usable device.
     let audio_enabled = true;
+    // Read host local time and resolve cmos.bin now, on the main thread, before
+    // the emulation thread spawns. now_local() is sound only single-threaded.
+    let rtc_setup = cmos::RtcSetup::from_c_root(&config.dos.c_drive);
     gui::run(
         MachineProfile::from_hardware_profile(&hardware),
         rom,
         config.dos.c_drive.clone(),
         audio_enabled,
         cli.margo_test_pattern,
+        rtc_setup,
     )?;
     Ok(())
 }

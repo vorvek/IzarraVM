@@ -15,6 +15,7 @@ mod floppy;
 mod keyboard;
 mod pic;
 mod pit;
+mod rtc;
 mod speaker;
 
 pub const HIGH_ROM_BASE: u32 = 0xffff_0000;
@@ -211,6 +212,11 @@ pub struct Machine {
     // Mounted A: floppy image, geometry inferred from the image length. INT 13h
     // disk services read and write it; None means the drive is empty.
     floppy: Option<floppy::Floppy>,
+    // MC146818 RTC and CMOS NVRAM at ports 0x70/0x71.
+    rtc: rtc::Rtc,
+    // Fractional seconds owed to the RTC from the machine clock; whole seconds
+    // are folded into the clock in advance_devices.
+    rtc_seconds: f64,
 }
 
 /// Build the CT1745 mixer from the profile's Sound Blaster power-on routing.
@@ -292,6 +298,8 @@ impl Machine {
             elapsed_clocks: 0,
             program_frames: Vec::new(),
             floppy: None,
+            rtc: rtc::Rtc::new(),
+            rtc_seconds: 0.0,
         };
         // The Margo LFB aperture is decoded before RAM, so system memory must
         // stay below it. Validated config caps memory far under this bound.
@@ -326,6 +334,60 @@ impl Machine {
     /// None when the drive is empty.
     pub fn eject_floppy(&mut self) -> Option<Vec<u8>> {
         self.floppy.take().map(|f| f.bytes().to_vec())
+    }
+
+    /// Seed the RTC clock from host-provided local time. `weekday` is 1..=7 with
+    /// 1 = Sunday. Call this once at startup; the clock self-advances on the
+    /// machine clock afterward.
+    #[allow(clippy::too_many_arguments)]
+    pub fn seed_rtc(
+        &mut self,
+        year: u16,
+        month: u8,
+        day: u8,
+        weekday: u8,
+        hour: u8,
+        minute: u8,
+        second: u8,
+    ) {
+        self.rtc
+            .seed(year, month, day, weekday, hour, minute, second);
+    }
+
+    /// The full 64-byte CMOS image (clock registers plus NVRAM) for persisting
+    /// to cmos.bin.
+    pub fn cmos_bytes(&self) -> [u8; 64] {
+        self.rtc.nvram()
+    }
+
+    /// Load a 64-byte CMOS image from a persisted cmos.bin, restoring NVRAM and
+    /// the saved time. Returns false if the image had a bad NVRAM checksum (the
+    /// bytes are kept and the checksum is repaired), so the host can log it.
+    pub fn load_cmos(&mut self, bytes: &[u8; 64]) -> bool {
+        self.rtc.load_nvram(bytes)
+    }
+
+    /// Whether the guest wrote a CMOS NVRAM byte since the last poll, clearing
+    /// the flag. The host flushes cmos.bin when this returns true.
+    pub fn take_cmos_dirty(&mut self) -> bool {
+        self.rtc.take_nvram_dirty()
+    }
+
+    /// Whether the RTC clock has been seeded from the host.
+    pub fn rtc_seeded(&self) -> bool {
+        self.rtc.is_seeded()
+    }
+
+    /// Read one CMOS NVRAM byte by index (0x00..=0x3F).
+    pub fn cmos_byte(&self, index: usize) -> u8 {
+        self.rtc.nvram_byte(index)
+    }
+
+    /// Set one CMOS NVRAM byte by index and refresh the stored checksum, the way
+    /// a host-side configuration change would. Out-of-range indices are ignored.
+    pub fn set_cmos_byte(&mut self, index: usize, value: u8) {
+        self.rtc.set_nvram(index, value);
+        self.rtc.refresh_checksum();
     }
 
     pub fn new_boot_image(
@@ -535,6 +597,7 @@ impl Machine {
             pit: &mut self.pit,
             keyboard: &mut self.keyboard,
             speaker: &mut self.speaker,
+            rtc: &mut self.rtc,
             dma: &mut self.dma,
             opl: &mut self.opl,
             dsp: &mut self.dsp,
@@ -1368,6 +1431,15 @@ impl Machine {
             self.pic.request(1); // IRQ1: keyboard output buffer has a scancode
         }
 
+        // Advance the RTC: inv_clock is 1/clock_hz, so clocks * inv_clock is
+        // elapsed seconds. Fold whole seconds into the clock and carry the rest.
+        self.rtc_seconds += clocks as f64 * self.timing.inv_clock;
+        let whole_secs = self.rtc_seconds.floor();
+        if whole_secs >= 1.0 {
+            self.rtc.tick_seconds(whole_secs as u64);
+            self.rtc_seconds -= whole_secs;
+        }
+
         self.margo_ns += clocks as f64 * self.timing.margo_ns_per_clock;
         let whole_ns = self.margo_ns.floor();
         self.margo.advance_busy(whole_ns as u64);
@@ -1637,6 +1709,7 @@ impl Machine {
                     pit,
                     keyboard,
                     speaker,
+                    rtc,
                     dma,
                     opl,
                     dsp,
@@ -1656,6 +1729,7 @@ impl Machine {
                     pit,
                     keyboard,
                     speaker,
+                    rtc,
                     dma,
                     opl,
                     dsp,
@@ -1749,6 +1823,7 @@ struct MachineBus<'a> {
     pit: &'a mut pit::Pit,
     keyboard: &'a mut keyboard::Keyboard8042,
     speaker: &'a mut speaker::Speaker,
+    rtc: &'a mut rtc::Rtc,
     dma: &'a mut dma::DmaController,
     opl: &'a mut OplChip,
     dsp: &'a mut SbDsp,
@@ -1889,6 +1964,9 @@ impl CpuBus for MachineBus<'_> {
         if port == 0x00e1 {
             return Ok(u32::from(gsw_mode_code(self.active_mode)));
         }
+        if let Some(value) = self.rtc.read_port(port) {
+            return Ok(u32::from(value));
+        }
         if let Some(value) = self.keyboard.read_port(port) {
             return Ok(u32::from(value));
         }
@@ -1932,6 +2010,9 @@ impl CpuBus for MachineBus<'_> {
             if let Some(mode) = gsw_mode_from_code(value as u8) {
                 *self.pending_mode = Some(mode);
             }
+            return Ok(());
+        }
+        if self.rtc.write_port(port, value as u8) {
             return Ok(());
         }
         if self.serial.write_port(port, value as u8)
@@ -3183,6 +3264,7 @@ mod tests {
             pit: &mut machine.pit,
             keyboard: &mut machine.keyboard,
             speaker: &mut machine.speaker,
+            rtc: &mut machine.rtc,
             dma: &mut machine.dma,
             opl: &mut machine.opl,
             dsp: &mut machine.dsp,
@@ -3194,6 +3276,62 @@ mod tests {
             wait_states: machine.profile.wait_states,
         };
         f(&mut bus)
+    }
+
+    #[test]
+    fn rtc_ports_round_trip_through_the_bus() {
+        let mut machine = test_machine();
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x70, BusWidth::Byte, 0x00).unwrap(); // select seconds
+            bus.write_io(0x71, BusWidth::Byte, 42).unwrap();
+            bus.write_io(0x70, BusWidth::Byte, 0x00).unwrap();
+            let secs = bus.read_io(0x70 + 1, BusWidth::Byte).unwrap();
+            assert_eq!(secs, 42);
+        });
+    }
+
+    #[test]
+    fn rtc_advances_seconds_on_the_machine_clock() {
+        let mut machine = test_machine();
+        machine.seed_rtc(2026, 6, 20, 6, 12, 0, 0);
+        // Step roughly three seconds of emulated time, in ~10 ms chunks so the
+        // sub-second accumulator carries the way it does during a real run.
+        let clock_hz = machine.profile.clock_hz;
+        let chunk = clock_hz / 100; // ~10 ms
+        for _ in 0..300 {
+            machine.advance_devices_clocks(chunk);
+        }
+        let bytes = machine.cmos_bytes();
+        // Seconds register (0x00) should have advanced to about 3.
+        assert!(
+            (2..=4).contains(&bytes[0x00]),
+            "expected the seconds register near 3, got {}",
+            bytes[0x00]
+        );
+    }
+
+    #[test]
+    fn cmos_persists_and_reloads_via_bytes() {
+        let mut machine = test_machine();
+        // Guest writes a layout byte and a boot-order byte, then refreshes the
+        // checksum the way the setup page would.
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x70, BusWidth::Byte, 0x10).unwrap();
+            bus.write_io(0x71, BusWidth::Byte, 3).unwrap(); // FR layout
+            bus.write_io(0x70, BusWidth::Byte, 0x11).unwrap();
+            bus.write_io(0x71, BusWidth::Byte, 1).unwrap(); // disk-first
+        });
+        assert!(
+            machine.take_cmos_dirty(),
+            "an NVRAM write should mark dirty"
+        );
+        let saved = machine.cmos_bytes();
+
+        // A fresh machine loads the saved image and reads the same bytes back.
+        let mut other = test_machine();
+        other.load_cmos(&saved);
+        assert_eq!(other.cmos_bytes()[0x10], 3);
+        assert_eq!(other.cmos_bytes()[0x11], 1);
     }
 
     #[test]
