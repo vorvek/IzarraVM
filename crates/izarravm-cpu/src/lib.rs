@@ -1832,6 +1832,74 @@ impl Cpu386 {
                 }
                 Ok(clocks(4))
             }
+            0xb0 | 0xb1 => {
+                // CMPXCHG r/m, r. B0 is the byte form, B1 the word/dword form. Compare the
+                // accumulator (AL/AX/EAX) with the destination exactly like CMP (acc - dest),
+                // setting every ALU flag from that subtraction. If they are equal (ZF set after
+                // the compare) the source register is stored into the destination; otherwise the
+                // destination value is loaded into the accumulator. Either way the destination is
+                // written once, which is what makes the LOCK form meaningful.
+                let modrm = self.fetch_modrm(bus)?;
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
+                let size = if opcode == 0xb0 {
+                    None
+                } else {
+                    Some(operand_size)
+                };
+                match size {
+                    None => {
+                        let dest = self.read_operand_u8(bus, operand)?;
+                        let acc = self.read_gpr8(0);
+                        self.alu_sub(u32::from(acc), u32::from(dest), 0, BusWidth::Byte);
+                        if self.flag(FLAG_ZF) {
+                            let src = self.read_gpr8(modrm.reg);
+                            self.write_operand_u8(bus, operand, src)?;
+                        } else {
+                            self.write_gpr8(0, dest);
+                            // Re-write the destination with its own value so the bus sees a write
+                            // even on the unequal branch, matching the architectural read-modify-
+                            // write of CMPXCHG.
+                            self.write_operand_u8(bus, operand, dest)?;
+                        }
+                    }
+                    Some(size) => {
+                        let dest = self.read_operand_sized(bus, operand, size)?;
+                        let acc = self.read_gpr_sized(0, size);
+                        self.alu_sub(acc, dest, 0, size.bus_width());
+                        if self.flag(FLAG_ZF) {
+                            let src = self.read_gpr_sized(modrm.reg, size);
+                            self.write_operand_sized(bus, operand, size, src)?;
+                        } else {
+                            self.write_gpr_sized(0, size, dest);
+                            self.write_operand_sized(bus, operand, size, dest)?;
+                        }
+                    }
+                }
+                Ok(clocks(6))
+            }
+            0xc0 | 0xc1 => {
+                // XADD r/m, r. C0 is the byte form, C1 the word/dword form. The exchange-and-add
+                // first saves the destination, then writes dest + src back to the destination and
+                // copies the saved destination into the source register. The flags come out
+                // exactly like ADD of the two operands (reuse alu_add).
+                let modrm = self.fetch_modrm(bus)?;
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
+                if opcode == 0xc0 {
+                    let dest = self.read_operand_u8(bus, operand)?;
+                    let src = self.read_gpr8(modrm.reg);
+                    let sum =
+                        self.alu_add(u32::from(dest), u32::from(src), 0, BusWidth::Byte) as u8;
+                    self.write_operand_u8(bus, operand, sum)?;
+                    self.write_gpr8(modrm.reg, dest);
+                } else {
+                    let dest = self.read_operand_sized(bus, operand, operand_size)?;
+                    let src = self.read_gpr_sized(modrm.reg, operand_size);
+                    let sum = self.alu_add(dest, src, 0, operand_size.bus_width());
+                    self.write_operand_sized(bus, operand, operand_size, sum)?;
+                    self.write_gpr_sized(modrm.reg, operand_size, dest);
+                }
+                Ok(clocks(4))
+            }
             0xc8..=0xcf => {
                 // BSWAP r32 (0F C8+r): reverse the byte order of a 32-bit register. The low
                 // three bits of the opcode pick the register. The 16-bit-operand form is
@@ -2000,6 +2068,11 @@ impl Cpu386 {
                         let modrm = self.peek_u8(bus, eip.wrapping_add(1))?;
                         modrm >> 6 != 3 && matches!((modrm >> 3) & 7, 5..=7)
                     }
+                    // CMPXCHG (B0/B1) and XADD (C0/C1) read-modify-write the r/m destination, so
+                    // LOCK is allowed only with a memory operand. The register-dest form is #UD.
+                    0xb0 | 0xb1 | 0xc0 | 0xc1 => self.peek_u8(bus, eip.wrapping_add(1))? >> 6 != 3,
+                    // BSWAP (C8+r) has a register destination and no memory form; INVD (08) and
+                    // WBINVD (09) take no operand. LOCK on any of them is #UD (the false arm).
                     _ => false,
                 }
             }
@@ -8102,5 +8175,215 @@ mod tests {
         cpu.set_flag(FLAG_IF, false);
         bus.pending_irq = Some(8);
         assert!(cpu.cycle(&mut bus).unwrap().halted);
+    }
+
+    // --- 486 read-modify-write opcodes: XADD and CMPXCHG ---
+
+    #[test]
+    fn xadd_byte_swaps_and_adds_with_add_flags() {
+        // 0F C0 /r XADD r/m8, r8. ModRM C3: mode 3, reg = AL(0), rm = BL(3).
+        // dest = BL, src = AL. After: BL = BL + AL, AL = old BL, flags like ADD(BL, AL).
+        let mut memory = vec![0; 16];
+        memory[0..3].copy_from_slice(&[0x0f, 0xc0, 0xc3]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_gpr8(0, 0x01); // AL (src)
+        cpu.write_gpr8(3, 0xff); // BL (dest)
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_gpr8(3), 0x00); // dest = 0xff + 0x01
+        assert_eq!(cpu.read_gpr8(0), 0xff); // src = old dest
+        // 0xff + 0x01 wraps to 0 with carry, half-carry, and a zero result.
+        assert!(cpu.flag(FLAG_CF));
+        assert!(cpu.flag(FLAG_ZF));
+        assert!(cpu.flag(FLAG_AF));
+        assert!(!cpu.flag(FLAG_OF));
+        assert!(!cpu.flag(FLAG_SF));
+    }
+
+    #[test]
+    fn xadd_word_matches_add_flags() {
+        // 0F C1 /r XADD r/m16, r16. ModRM C3: reg = AX(0), rm = BX(3).
+        let mut memory = vec![0; 16];
+        memory[0..3].copy_from_slice(&[0x0f, 0xc1, 0xc3]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_gpr16(0, 0x7fff); // AX (src)
+        cpu.write_gpr16(3, 0x0001); // BX (dest)
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_gpr16(3), 0x8000); // 0x0001 + 0x7fff
+        assert_eq!(cpu.read_gpr16(0), 0x0001); // old dest
+        // Signed overflow: positive + positive crossed into the sign bit.
+        assert!(cpu.flag(FLAG_OF));
+        assert!(cpu.flag(FLAG_SF));
+        assert!(!cpu.flag(FLAG_CF));
+        assert!(!cpu.flag(FLAG_ZF));
+    }
+
+    #[test]
+    fn xadd_dword_matches_add_flags() {
+        // 66h is not needed: with a 32-bit operand prefix on a real-mode CS, 66 0F C1 /r.
+        // ModRM C3: reg = EAX(0), rm = EBX(3).
+        let mut memory = vec![0; 16];
+        memory[0..4].copy_from_slice(&[0x66, 0x0f, 0xc1, 0xc3]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_eax(0x1111_1111); // src
+        cpu.registers.set_ebx(0x2222_2222); // dest
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.ebx(), 0x3333_3333);
+        assert_eq!(cpu.registers.eax(), 0x2222_2222);
+        assert!(!cpu.flag(FLAG_CF));
+        assert!(!cpu.flag(FLAG_OF));
+        assert!(!cpu.flag(FLAG_ZF));
+        assert!(!cpu.flag(FLAG_SF));
+    }
+
+    #[test]
+    fn cmpxchg_byte_equal_stores_source() {
+        // 0F B0 /r CMPXCHG r/m8, r8. ModRM C3: reg = CL(1, src), rm = BL(3, dest).
+        // AL == BL so ZF is set and the source (CL) is stored into BL; AL is unchanged.
+        let mut memory = vec![0; 16];
+        memory[0..3].copy_from_slice(&[0x0f, 0xb0, 0xcb]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_gpr8(0, 0x42); // AL (accumulator)
+        cpu.write_gpr8(3, 0x42); // BL (dest), equal to AL
+        cpu.write_gpr8(1, 0x99); // CL (src)
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert!(cpu.flag(FLAG_ZF)); // equal compare
+        assert_eq!(cpu.read_gpr8(3), 0x99); // dest = src
+        assert_eq!(cpu.read_gpr8(0), 0x42); // accumulator unchanged
+    }
+
+    #[test]
+    fn cmpxchg_byte_unequal_loads_destination() {
+        // AL != BL: ZF clear, AL = BL, BL unchanged.
+        let mut memory = vec![0; 16];
+        memory[0..3].copy_from_slice(&[0x0f, 0xb0, 0xcb]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_gpr8(0, 0x42); // AL
+        cpu.write_gpr8(3, 0x10); // BL (dest), not equal
+        cpu.write_gpr8(1, 0x99); // CL (src)
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert!(!cpu.flag(FLAG_ZF)); // unequal compare
+        assert_eq!(cpu.read_gpr8(0), 0x10); // accumulator = dest
+        assert_eq!(cpu.read_gpr8(3), 0x10); // dest unchanged
+        // Flags must match CMP(0x42, 0x10) = 0x32: no borrow, positive, nonzero.
+        assert!(!cpu.flag(FLAG_CF));
+        assert!(!cpu.flag(FLAG_SF));
+    }
+
+    #[test]
+    fn cmpxchg_word_equal_stores_source() {
+        // 0F B1 /r CMPXCHG r/m16, r16. ModRM C3: reg = CX(1, src), rm = BX(3, dest).
+        let mut memory = vec![0; 16];
+        memory[0..3].copy_from_slice(&[0x0f, 0xb1, 0xcb]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_gpr16(0, 0x1234); // AX
+        cpu.write_gpr16(3, 0x1234); // BX, equal
+        cpu.write_gpr16(1, 0xbeef); // CX (src)
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert!(cpu.flag(FLAG_ZF));
+        assert_eq!(cpu.read_gpr16(3), 0xbeef);
+        assert_eq!(cpu.read_gpr16(0), 0x1234);
+    }
+
+    #[test]
+    fn cmpxchg_dword_unequal_loads_destination() {
+        // 66 0F B1 /r CMPXCHG r/m32, r32. ModRM C3: reg = ECX(1, src), rm = EBX(3, dest).
+        let mut memory = vec![0; 16];
+        memory[0..4].copy_from_slice(&[0x66, 0x0f, 0xb1, 0xcb]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_eax(0xaaaa_aaaa); // EAX
+        cpu.registers.set_ebx(0x5555_5555); // EBX (dest), not equal
+        cpu.registers.set_ecx(0xdead_beef); // ECX (src)
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert!(!cpu.flag(FLAG_ZF));
+        assert_eq!(cpu.registers.eax(), 0x5555_5555); // accumulator = dest
+        assert_eq!(cpu.registers.ebx(), 0x5555_5555); // dest unchanged
+    }
+
+    #[test]
+    fn lock_xadd_to_memory_is_accepted() {
+        // F0 0F C1 06 00 02: LOCK XADD [0x0200], AX. ModRM 06 is mode 0 rm 6 (direct disp16),
+        // a memory destination, so the LOCK is legal and the instruction runs.
+        let mut memory = vec![0; 1024];
+        memory[0..6].copy_from_slice(&[0xf0, 0x0f, 0xc1, 0x06, 0x00, 0x02]);
+        memory[0x200..0x202].copy_from_slice(&0x0010u16.to_le_bytes());
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        cpu.write_gpr16(0, 0x0001); // AX (src)
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        // [0x0200] = 0x0010 + 0x0001, AX = old [0x0200].
+        assert_eq!(
+            u16::from_le_bytes([bus.memory[0x200], bus.memory[0x201]]),
+            0x0011
+        );
+        assert_eq!(cpu.read_gpr16(0), 0x0010);
+    }
+
+    #[test]
+    fn lock_xadd_to_register_is_undefined_opcode() {
+        // F0 0F C1 C3: LOCK XADD BX, AX. The register destination makes the LOCK prefix illegal,
+        // so the decoder raises #UD (vector 6) before executing.
+        let mut memory = vec![0; 16];
+        memory[0..4].copy_from_slice(&[0xf0, 0x0f, 0xc1, 0xc3]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(memory);
+
+        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
+    }
+
+    #[test]
+    fn lock_bswap_is_undefined_opcode() {
+        // F0 0F C8: LOCK BSWAP EAX. BSWAP has no memory form, so LOCK is always #UD.
+        let mut memory = vec![0; 16];
+        memory[0..3].copy_from_slice(&[0xf0, 0x0f, 0xc8]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(memory);
+
+        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
     }
 }
