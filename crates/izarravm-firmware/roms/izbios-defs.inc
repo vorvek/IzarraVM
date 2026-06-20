@@ -52,6 +52,19 @@
 
 ; Setup hotkey: Del (AT scancode set 1 make code), per Phase 0 decision 5.
 %define SETUP_HOTKEY   0x53
+; Boot-menu hotkey: Tab (Set 1 make code). Pressed during the POST hotkey window
+; it opens the boot-device menu instead of the setup page.
+%define BOOTMENU_HOTKEY 0x0f
+
+; CMOS NVRAM byte 0x11 holds the boot order: 0 = floppy-first, 1 = disk-first.
+; The boot menu seeds its default highlight from this byte.
+%define BOOT_CMOS_ORDER 0x11
+
+; Boot-device choice (segment 0 byte), written by the boot menu and read by
+; boot_entry: 0 = floppy, 1 = disk (Toka-DOS on C:), 2 = CD-ROM. It lives in the
+; free tail of the foundation BIOS_SCRATCH region (BLIT_* ends at 0x052D), so it
+; does not collide with the Stream D/C scratch areas. Defaults to floppy.
+%define BOOT_CHOICE    (BIOS_SCRATCH + 0x0e)   ; 0x052E
 
 ; Boot-console layout (mode 13h pixels, 8x8 glyphs). The POST draws a text boot
 ; log: a title row, then one line per step with its name and OK/FAIL/value.

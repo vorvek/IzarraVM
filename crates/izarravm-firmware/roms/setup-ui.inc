@@ -98,20 +98,26 @@
 %define SU_COLOR_FAIL     0x0c        ; bright red
 %define SU_COLOR_VALUE    0x0b        ; bright cyan (a measured/edited value)
 
-; setup_maybe_enter: the core hook. Returns with no side effects unless the hotkey
-; is pressed during the poll window.
+; setup_maybe_enter: the core hook. During the POST poll window it watches for two
+; hotkeys: Del opens the setup page, Tab opens the boot-device menu. Returns with no
+; side effects if neither key is pressed during the window.
 setup_maybe_enter:
     call su_wait_hotkey
-    jc .enter                       ; CF=1 -> Del was waiting
+    jnc .done                       ; CF=0 -> no hotkey, just boot
+    test al, al
+    jnz .boot_menu                  ; AL=1 -> Tab opened the boot menu
+    call su_run_menu                ; AL=0 -> Del opened the setup page
     ret
-.enter:
-    call su_run_menu
+.boot_menu:
+    call boot_menu                  ; Stream E: the Tab boot-device menu
+.done:
     ret
 
-; su_wait_hotkey: peek the keyboard ring for the setup hotkey for a bounded spin.
-; Returns CF=1 if Del (SETUP_HOTKEY) was seen (and consumed), CF=0 otherwise. Any
-; other key seen during the window is consumed and ignored so it does not leak into
-; the boot path. Clobbers AX, CX.
+; su_wait_hotkey: peek the keyboard ring for the setup or boot-menu hotkey for a
+; bounded spin. Returns CF=1 with AL=0 if Del (SETUP_HOTKEY) was seen, or CF=1 with
+; AL=1 if Tab (BOOTMENU_HOTKEY) was seen; CF=0 if the window elapsed with neither.
+; The hotkey make is consumed from the ring. Any other key seen during the window is
+; consumed and ignored so it does not leak into the boot path. Clobbers AX, CX.
 su_wait_hotkey:
     mov cx, SU_HOTKEY_SPINS
 .spin:
@@ -119,8 +125,10 @@ su_wait_hotkey:
     call kb_getkey                  ; peek: CF=1 if empty
     jc .next
     cmp ah, SETUP_HOTKEY
-    je .hit
-    ; some other key: drain it and keep watching for Del.
+    je .hit_setup
+    cmp ah, BOOTMENU_HOTKEY
+    je .hit_boot
+    ; some other key: drain it and keep watching for a hotkey.
     push cx
     xor ah, ah
     call kb_getkey
@@ -130,9 +138,16 @@ su_wait_hotkey:
     loop .spin
     clc                             ; window elapsed, no hotkey
     ret
-.hit:
+.hit_setup:
     xor ah, ah
     call kb_getkey                  ; drain the Del make from the ring
+    xor al, al                      ; AL=0 -> setup page
+    stc
+    ret
+.hit_boot:
+    xor ah, ah
+    call kb_getkey                  ; drain the Tab make from the ring
+    mov al, 1                       ; AL=1 -> boot menu
     stc
     ret
 
