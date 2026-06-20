@@ -379,6 +379,17 @@ impl Cpu386 {
         self.control.cr0 & CR0_PG != 0
     }
 
+    /// Current privilege level. The CPL lives in the low two bits of the CS selector. Real
+    /// mode has no protection rings, so it is always CPL 0 there; only protected mode can
+    /// run at a lower privilege.
+    fn current_privilege_level(&self) -> u8 {
+        if self.is_protected_mode() {
+            (self.registers.cs().selector & 3) as u8
+        } else {
+            0
+        }
+    }
+
     pub fn linear_eip(&self) -> u32 {
         self.registers.cs().base.wrapping_add(self.registers.eip)
     }
@@ -1558,6 +1569,14 @@ impl Cpu386 {
                 let memory = match operand {
                     RmOperand::Memory(memory) => memory,
                     RmOperand::Register(_) => {
+                        // INVLPG (/7) with a register operand is #UD; the other group members
+                        // (LGDT/LIDT here) report the unsupported register form as before.
+                        if modrm.reg == 7 {
+                            return Err(InternalFault::Exception {
+                                vector: 6,
+                                error_code: None,
+                            });
+                        }
                         return Err(CpuError::UnsupportedGroupOpcode {
                             opcode,
                             extension: modrm.reg,
@@ -1565,6 +1584,20 @@ impl Cpu386 {
                         .into());
                     }
                 };
+                // INVLPG m (0F 01 /7): privileged on the 486; invalidate the TLB entry for the
+                // page containing the operand. We model no TLB, so after the privilege check it
+                // is a no-op. The memory operand is decoded (and so its segment/address checks
+                // run) but no value is read from it.
+                if modrm.reg == 7 {
+                    if self.current_privilege_level() != 0 {
+                        return Err(InternalFault::Exception {
+                            vector: 6,
+                            error_code: None,
+                        });
+                    }
+                    let _ = memory;
+                    return Ok(clocks(12));
+                }
                 let limit = self.read_memory_sized(
                     bus,
                     memory.segment,
@@ -1785,6 +1818,32 @@ impl Cpu386 {
                 let result = self.double_shift(opcode == 0xa5, dest, src, count, operand_size);
                 self.write_operand_sized(bus, operand, operand_size, result)?;
                 Ok(clocks(3))
+            }
+            0x08 | 0x09 => {
+                // INVD (08) / WBINVD (09): flush the internal caches. Both are privileged and
+                // raise #UD outside CPL 0. We model no cache, so they are no-ops after the
+                // privilege check. WBINVD differs only by writing dirty lines back first, which
+                // has no observable effect here.
+                if self.current_privilege_level() != 0 {
+                    return Err(InternalFault::Exception {
+                        vector: 6,
+                        error_code: None,
+                    });
+                }
+                Ok(clocks(4))
+            }
+            0xc8..=0xcf => {
+                // BSWAP r32 (0F C8+r): reverse the byte order of a 32-bit register. The low
+                // three bits of the opcode pick the register. The 16-bit-operand form is
+                // architecturally undefined; we follow the documented Intel note and the common
+                // emulator choice of leaving the register contents undefined-but-unchanged, so a
+                // 66h-prefixed BSWAP here is a no-op rather than corrupting the value.
+                let reg = opcode & 0x07;
+                if matches!(operand_size, OperandSize::Dword) {
+                    let value = self.read_gpr32(reg);
+                    self.write_gpr32(reg, value.swap_bytes());
+                }
+                Ok(clocks(1))
             }
             _ => Err(CpuError::UnsupportedTwoByteOpcode {
                 opcode,
@@ -7766,6 +7825,197 @@ mod tests {
 
         assert_eq!(cpu.registers.eip, 0x00ee);
         assert!(!cpu.flag(FLAG_IF));
+    }
+
+    #[test]
+    fn bswap_reverses_dword_byte_order() {
+        // bswap eax (0x0f 0xc8). eax = 0x12345678 -> 0x78563412 in 32-bit operand mode.
+        let mut memory = vec![0; 64];
+        memory[0..2].copy_from_slice(&[0x0f, 0xc8]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        // A 32-bit code segment so the default operand size is dword.
+        let mut cs = cpu.registers.cs();
+        cs.default_size_32 = true;
+        cpu.registers.set_segment(SegmentIndex::Cs, cs);
+        cpu.write_gpr32(0, 0x1234_5678);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.read_gpr32(0), 0x7856_3412);
+        // A second BSWAP restores the original (round-trip).
+        cpu.registers.eip = 0;
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.read_gpr32(0), 0x1234_5678);
+    }
+
+    #[test]
+    fn invd_and_wbinvd_noop_at_cpl0() {
+        // invd (0x0f 0x08) then wbinvd (0x0f 0x09) in real mode (CPL 0). Both are no-ops:
+        // they advance past their two bytes and touch no register or flag.
+        let mut memory = vec![0; 64];
+        memory[0..4].copy_from_slice(&[0x0f, 0x08, 0x0f, 0x09]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        let flags_before = cpu.registers.eflags;
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.eip, 2);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.eip, 4);
+        assert_eq!(cpu.registers.eflags, flags_before);
+    }
+
+    #[test]
+    fn invd_at_cpl3_delivers_ud() {
+        // invd (0x0f 0x08) at CPL 3 in protected mode raises #UD (vector 6).
+        let mut cpu = Cpu386::default();
+        cpu.control.cr0 |= CR0_PE;
+        cpu.registers.set_segment(
+            SegmentIndex::Cs,
+            SegmentRegister {
+                selector: 0x0003,
+                base: 0,
+                limit: 0xffff_ffff,
+                access: 0x9b,
+                default_size_32: false,
+            },
+        );
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(vec![0x0f, 0x08, 0, 0]);
+
+        let result = cpu.execute_instruction(&mut bus);
+
+        assert!(
+            matches!(
+                result,
+                Err(InternalFault::Exception {
+                    vector: 6,
+                    error_code: None
+                })
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn wbinvd_at_cpl3_delivers_ud() {
+        // wbinvd (0x0f 0x09) at CPL 3 in protected mode raises #UD (vector 6).
+        let mut cpu = Cpu386::default();
+        cpu.control.cr0 |= CR0_PE;
+        cpu.registers.set_segment(
+            SegmentIndex::Cs,
+            SegmentRegister {
+                selector: 0x0003,
+                base: 0,
+                limit: 0xffff_ffff,
+                access: 0x9b,
+                default_size_32: false,
+            },
+        );
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(vec![0x0f, 0x09, 0, 0]);
+
+        let result = cpu.execute_instruction(&mut bus);
+
+        assert!(
+            matches!(
+                result,
+                Err(InternalFault::Exception {
+                    vector: 6,
+                    error_code: None
+                })
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn invlpg_memory_noop_at_cpl0() {
+        // invlpg [0x40] (0x0f 0x01 0x3e 0x40 0x00, /7 with a memory operand) in real mode.
+        // No TLB is modeled, so it is a no-op that advances past its bytes and leaves the
+        // pointed-at memory untouched.
+        let mut memory = vec![0; 128];
+        memory[0..5].copy_from_slice(&[0x0f, 0x01, 0x3e, 0x40, 0x00]);
+        memory[0x40] = 0xaa;
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eip, 5);
+        assert_eq!(bus.memory[0x40], 0xaa);
+    }
+
+    #[test]
+    fn invlpg_at_cpl3_delivers_ud() {
+        // invlpg [0x40] at CPL 3 in protected mode raises #UD (vector 6).
+        let mut cpu = Cpu386::default();
+        cpu.control.cr0 |= CR0_PE;
+        cpu.registers.set_segment(
+            SegmentIndex::Cs,
+            SegmentRegister {
+                selector: 0x0003,
+                base: 0,
+                limit: 0xffff_ffff,
+                access: 0x9b,
+                default_size_32: false,
+            },
+        );
+        cpu.registers.set_segment(
+            SegmentIndex::Ds,
+            SegmentRegister {
+                selector: 0x0003,
+                base: 0,
+                limit: 0xffff_ffff,
+                access: 0x93,
+                default_size_32: false,
+            },
+        );
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(vec![0x0f, 0x01, 0x3e, 0x40, 0x00, 0, 0, 0]);
+
+        let result = cpu.execute_instruction(&mut bus);
+
+        assert!(
+            matches!(
+                result,
+                Err(InternalFault::Exception {
+                    vector: 6,
+                    error_code: None
+                })
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn invlpg_register_form_delivers_ud() {
+        // 0F 01 /7 with a register operand (mod=3) is #UD. ModRM 0xff = mod 3, reg 7, rm 7.
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(vec![0x0f, 0x01, 0xff, 0, 0]);
+
+        let result = cpu.execute_instruction(&mut bus);
+
+        assert!(
+            matches!(
+                result,
+                Err(InternalFault::Exception {
+                    vector: 6,
+                    error_code: None
+                })
+            ),
+            "{result:?}"
+        );
     }
 
     #[test]
