@@ -337,7 +337,11 @@ impl Machine {
             return Err(MachineError::InvalidBootImageSize(image.len()));
         }
 
-        let mut machine = Self::base(profile, boot_sector_cpu(), vec![0; BIOS_ROM_SIZE])?;
+        // The BIOS service vectors return through the ROM IRET at offset 0xF000
+        // (FF00:0000); supply it even on this synthetic boot ROM.
+        let mut rom = vec![0u8; BIOS_ROM_SIZE];
+        rom[0xF000] = 0xCF;
+        let mut machine = Self::base(profile, boot_sector_cpu(), rom)?;
 
         for (offset, byte) in image[0..512].iter().copied().enumerate() {
             machine
@@ -373,6 +377,10 @@ impl Machine {
         let mut rom = vec![0u8; BIOS_ROM_SIZE];
         let kb = izarravm_firmware::kbd_resident_bios();
         rom[..kb.len()].copy_from_slice(kb);
+        // The BIOS service vectors return through the ROM IRET at offset 0xF000
+        // (FF00:0000); supply it on this synthetic ROM. The resident keyboard
+        // BIOS image is short and never reaches that offset.
+        rom[0xF000] = 0xCF;
         let mut machine = Self::base(profile, Cpu386::default(), rom)?;
         install_boot_bios_stubs(&mut machine.memory)?;
         machine.install_keyboard_bios()?;
@@ -660,6 +668,25 @@ impl Machine {
         if ah == 0x4f {
             self.handle_vbe(al);
         }
+    }
+
+    /// Service INT 11h (GET EQUIPMENT LIST). Returns the BDA equipment word in AX,
+    /// the way a real BIOS reads it from 0040:0010. The high word of EAX is left
+    /// alone: callers that test the 386 EAX bits clear it themselves before the
+    /// call, per RBIL. No flags change (the IRET restores the caller's FLAGS).
+    fn handle_int11(&mut self) {
+        let word = self.memory.read_u16(0x410).unwrap_or(BIOS_EQUIPMENT_WORD);
+        let eax = (self.cpu.registers.eax() & !0xFFFF) | u32::from(word);
+        self.cpu.registers.set_eax(eax);
+    }
+
+    /// Service INT 12h (GET MEMORY SIZE). Returns the conventional memory size in
+    /// KiB in AX, read from the BDA word at 0040:0013 the way a real BIOS does. No
+    /// flags change (the IRET restores the caller's FLAGS).
+    fn handle_int12(&mut self) {
+        let kib = self.memory.read_u16(0x413).unwrap_or(BIOS_BASE_MEMORY_KIB);
+        let eax = (self.cpu.registers.eax() & !0xFFFF) | u32::from(kib);
+        self.cpu.registers.set_eax(eax);
     }
 
     /// Service the host side of INT 15h. AH=88h returns the extended memory size
@@ -1651,6 +1678,8 @@ impl Machine {
                     if let Some(vector) = self.pending_soft_int {
                         match vector {
                             0x10 => self.handle_int10(),
+                            0x11 => self.handle_int11(),
+                            0x12 => self.handle_int12(),
                             0x13 => self.handle_int13(),
                             0x15 => self.handle_int15(),
                             0x20 | 0x21 => match self.handle_dos_int(vector) {
@@ -1932,7 +1961,7 @@ impl CpuBus for MachineBus<'_> {
         // video service; 0x20/0x21 are the DOS kernel. Vector 0x10 reaches here
         // only from a software INT today (the CPU never faults with vector 0x10);
         // revisit if an x87 #MF is added.
-        if matches!(vector, 0x10 | 0x13 | 0x15 | 0x20 | 0x21) {
+        if matches!(vector, 0x10 | 0x11 | 0x12 | 0x13 | 0x15 | 0x20 | 0x21) {
             *self.pending_soft_int = Some(vector);
         }
         Ok(())
@@ -2092,12 +2121,43 @@ fn boot_sector_cpu() -> Cpu386 {
     cpu
 }
 
+/// BIOS equipment word reported by INT 11h (BDA 0040:0010). Bit 0 set with
+/// bits 7-6 clear means one floppy drive; bits 5-4 = 10b is the 80x25 color
+/// initial video mode. Bit 1 (80x87 coprocessor) stays clear: the Izarra 3000
+/// ships no 387, so software that probes the equipment word skips its FPU path.
+/// See RBIL INT 11h equipment bitfield (dev_docs/reference/rbil/INTERRUP.B).
+const BIOS_EQUIPMENT_WORD: u16 = 0x0021;
+
+/// Conventional memory size in KiB reported by INT 12h (BDA 0040:0013). A PC
+/// caps usable low memory at 640 KiB no matter how much RAM is installed; the
+/// rest is extended memory above 1 MiB (reported by INT 15h AH=88h).
+const BIOS_BASE_MEMORY_KIB: u16 = 640;
+
+/// Segment of the ROM-resident IRET the BIOS keeps at ROM offset 0xF000, i.e.
+/// FF00:0000. The host intercepts the BIOS service interrupts by vector number,
+/// so their IVT targets only need a valid IRET to return on. Pointing them at
+/// the ROM stub instead of the RAM stub at 0x600 keeps them working after a
+/// booter wipes low memory, the way real BIOS handlers (which live in ROM) do.
+const BIOS_ROM_IRET_SEG: u16 = 0xff00;
+
 fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
-    for vector in [0x10, 0x13, 0x15, 0x20, 0x21] {
+    // BIOS service interrupts the host intercepts by vector. Their IVT targets
+    // point at the ROM IRET so they survive a guest low-memory wipe.
+    for vector in [0x10, 0x11, 0x12, 0x13, 0x15] {
+        let address = vector * 4;
+        memory.write_u16(address, 0)?;
+        memory.write_u16(address + 2, BIOS_ROM_IRET_SEG)?;
+    }
+    // The DOS kernel vectors keep the RAM stub: the INT 21h blocking path rewinds
+    // EIP onto the CD 21 the RAM stub returns to, and the DOS path owns its memory.
+    for vector in [0x20, 0x21] {
         let address = vector * 4;
         memory.write_u16(address, BIOS_IRET_STUB_ADDRESS as u16)?;
         memory.write_u16(address + 2, 0)?;
     }
+    // Seed the BDA words INT 11h and INT 12h hand back, like a real BIOS.
+    memory.write_u16(0x410, BIOS_EQUIPMENT_WORD)?;
+    memory.write_u16(0x413, BIOS_BASE_MEMORY_KIB)?;
     memory.write_u8(BIOS_IRET_STUB_ADDRESS, 0xcf)
 }
 
@@ -2312,6 +2372,10 @@ mod tests {
     fn rom_with_code(code: &[u8]) -> Vec<u8> {
         let mut rom = vec![0; BIOS_ROM_SIZE];
         rom[..code.len()].copy_from_slice(code);
+        // The ROM IRET at offset 0xF000 (FF00:0000) the real izarra BIOS emits.
+        // The host-intercepted BIOS service vectors return through it, so the
+        // bare test ROM supplies it too.
+        rom[0xF000] = 0xCF;
         rom[0xfff0..0xfff5].copy_from_slice(&[0xea, 0x00, 0x00, 0x00, 0xf0]);
         rom
     }
@@ -2623,6 +2687,61 @@ mod tests {
         assert_eq!(ax & 0xff, 0x01);
         let flags = machine.cpu().registers.eflags;
         assert_eq!(flags & 0x0001, 0, "CF must be clear after a good read");
+    }
+
+    #[test]
+    fn int11_returns_equipment_word() {
+        // Stub: INT 11h then halt. AX must hold the seeded BDA equipment word.
+        // The BIOS service vectors return through the ROM IRET at offset 0xF000
+        // that rom_with_code supplies, matching the real izarra BIOS.
+        let rom = rom_with_code(&[
+            0xCD, 0x11, // int 11h
+            0xF4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        let ax = machine.cpu().registers.eax() as u16;
+        assert_eq!(ax, BIOS_EQUIPMENT_WORD);
+        // Bit 1 (80x87 coprocessor) stays clear: the Izarra 3000 has no FPU.
+        assert_eq!(ax & 0x0002, 0, "no coprocessor advertised");
+    }
+
+    #[test]
+    fn int12_returns_conventional_memory_kib() {
+        // Stub: INT 12h then halt. AX must hold the conventional memory size.
+        let rom = rom_with_code(&[
+            0xCD, 0x12, // int 12h
+            0xF4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        let ax = machine.cpu().registers.eax() as u16;
+        assert_eq!(ax, BIOS_BASE_MEMORY_KIB);
+        assert_eq!(ax, 640);
+    }
+
+    #[test]
+    fn bios_service_vectors_survive_low_memory_wipe() {
+        // A booter that zeroes low RAM (including the 0x600 RAM IRET stub) must not
+        // strand INT 11h/12h: their IVT targets point at the ROM IRET, so the
+        // service still returns. Stub: zero 0x600, then INT 11h, then halt.
+        // rom_with_code supplies the ROM IRET at FF00:0000 that survives the wipe.
+        let rom = rom_with_code(&[
+            0x31, 0xC0, // xor ax, ax
+            0x8E, 0xD8, // mov ds, ax
+            0xC7, 0x06, 0x00, 0x06, 0x00, 0x00, // mov word [0x600], 0
+            0xCD, 0x11, // int 11h
+            0xF4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(machine.cpu().registers.eax() as u16, BIOS_EQUIPMENT_WORD);
     }
 
     #[test]
