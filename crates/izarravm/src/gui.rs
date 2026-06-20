@@ -426,8 +426,14 @@ fn emulate(
         let budget = credit.max(0) as u64;
         if budget > 0 {
             let before = machine.elapsed_clocks();
+            let stall_before = machine.io_stall_clocks();
             let stop = tick_machine(&mut machine, budget);
             let ran = machine.elapsed_clocks().saturating_sub(before);
+            // Of those clocks, some may be a device-I/O stall (a floppy seek/read)
+            // that jumped the clock without executing instructions. Drain the full
+            // ran from the credit so the stall still costs wall-clock time, but
+            // exclude it from the speed measurement below.
+            let stalled = machine.io_stall_clocks().saturating_sub(stall_before);
             credit -= i64::try_from(ran).unwrap_or(i64::MAX);
             // A halted guest (POST done, nothing to boot) stops driving the video
             // beam, so the display would freeze on whatever half-drawn frame was
@@ -446,7 +452,10 @@ fn emulate(
                 );
             }
             if dt > 0.0 {
-                let ratio = (ran as f64 / (dt * clock_hz as f64)).min(1.5);
+                // Speed reflects instructions executed vs wall time; a drive stall
+                // is intentional wait, not the emulator running fast.
+                let executed = ran.saturating_sub(stalled);
+                let ratio = (executed as f64 / (dt * clock_hz as f64)).min(1.5);
                 speed_ratio = speed_ratio * 0.9 + ratio * 0.1;
             }
         }

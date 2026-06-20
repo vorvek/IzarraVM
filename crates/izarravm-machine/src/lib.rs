@@ -209,6 +209,10 @@ pub struct Machine {
     vga_dots: f64,    // fractional VGA dot clocks owed to the beam advance
     trace: BusTrace,
     elapsed_clocks: u64,
+    // Of elapsed_clocks, the clocks consumed by device I/O stalls (floppy seek/
+    // read, later ATA) rather than executed instructions. A realtime host can
+    // subtract these so blocking on a drive does not read as running over 100%.
+    io_stall_clocks: u64,
     // Parent CPU snapshots for EXEC (AH=4Bh AL=0); popped on child exit.
     program_frames: Vec<ProgramFrame>,
     // Mounted A: floppy image, geometry inferred from the image length. INT 13h
@@ -308,6 +312,7 @@ impl Machine {
             vga_dots: 0.0,
             trace: BusTrace::default(),
             elapsed_clocks: 0,
+            io_stall_clocks: 0,
             program_frames: Vec::new(),
             floppy: None,
             floppy_accesses: 0,
@@ -837,7 +842,9 @@ impl Machine {
         // careful to clamp, and the guest runs no instructions during the stall, so
         // it cannot observe their intermediate state. They resume cleanly from the
         // next instruction's own advance.
-        self.elapsed_clocks += (secs * self.active_mode.clock_hz() as f64) as u64;
+        let extra = (secs * self.active_mode.clock_hz() as f64) as u64;
+        self.elapsed_clocks += extra;
+        self.io_stall_clocks += extra;
         self.rtc_seconds += secs;
         let whole = self.rtc_seconds.floor();
         if whole >= 1.0 {
@@ -1447,6 +1454,14 @@ impl Machine {
 
     pub fn elapsed_clocks(&self) -> u64 {
         self.elapsed_clocks
+    }
+
+    /// Cumulative guest clocks spent blocked on device I/O (floppy, later ATA)
+    /// rather than executing instructions. A realtime host subtracts these from
+    /// the clocks run when it gauges emulation speed, so a drive grind does not
+    /// read as the emulator running fast.
+    pub fn io_stall_clocks(&self) -> u64 {
+        self.io_stall_clocks
     }
 
     /// Switch the active compatibility mode live, recomputing the timing factors
