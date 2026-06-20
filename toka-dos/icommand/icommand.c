@@ -89,8 +89,9 @@ int main(void)
     char word[16];
     char *rest;
 
-    t_setmode3();
-    t_putln(VERSION_LINE);
+    /* TOKABOOT already set 80x25 text mode and printed the startup line. Like a
+     * real COMMAND.COM we print below it rather than clearing, so the
+     * "Starting Toka-DOS v3.0..." line stays on screen. */
     t_putln("");
 
     for (;;) {
