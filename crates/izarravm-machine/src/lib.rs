@@ -6682,4 +6682,54 @@ mod tests {
         let tail = machine.memory_read_u16_for_test(0x41c);
         assert_ne!(head, tail, "the installed INT 09h enqueued the key");
     }
+
+    #[test]
+    fn izarra_setup_saves_a_changed_value_to_cmos() {
+        // Drive the Del setup page end to end: enter it during POST, change the
+        // keyboard layout (CMOS 0x10, default 0 = en-US) to the next entry, save,
+        // and confirm the persisted CMOS byte changed. The setup menu blocks on a
+        // keyboard read between keystrokes, so each key is injected then run.
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
+        assert_eq!(
+            machine.cmos_byte(0x10),
+            0,
+            "the keyboard-layout NVRAM byte starts at en-US (0)"
+        );
+
+        // Queue Del before POST reaches the hotkey window so the window finds it.
+        // Make + break; only the make enqueues into the BDA ring (0x53 = Del).
+        machine.inject_key_scancodes(&[0x53, 0xd3]);
+        // Run past POST. The window consumes Del and enters the menu, which then
+        // blocks on a keyboard read, so the rest of the budget just spins there.
+        machine.run_until_halt_or_cycles(5_000_000).unwrap();
+
+        // Down moves the highlight from Time (row 0) to Keyboard (row 1).
+        machine.inject_key_scancodes(&[0x50, 0xd0]); // Down
+        machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        // Right cycles the keyboard layout forward (en-US -> UK).
+        machine.inject_key_scancodes(&[0x4d, 0xcd]); // Right
+        machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        // F10 saves: writes CMOS 0x10/0x12, refreshes the checksum, and exits.
+        machine.inject_key_scancodes(&[0x44, 0xc4]); // F10
+        machine.run_until_halt_or_cycles(2_000_000).unwrap();
+
+        assert_eq!(
+            machine.cmos_byte(0x10),
+            1,
+            "saving the setup page persisted the new keyboard layout to CMOS 0x10"
+        );
+        // The save also refreshes the NVRAM checksum, so a reload validates.
+        let saved = machine.cmos_bytes();
+        let mut reloaded = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .unwrap();
+        assert!(
+            reloaded.load_cmos(&saved),
+            "the saved CMOS image carries a valid checksum"
+        );
+        assert_eq!(reloaded.cmos_byte(0x10), 1);
+    }
 }
