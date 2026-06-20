@@ -63,14 +63,27 @@ pub fn toka_dos_rom() -> &'static [u8] {
 }
 
 /// The Toka-DOS system files as owned (DOS 8.3 name, bytes) pairs, ready to hand
-/// to `izarravm_dos::toka_dos_install`. Parses the embedded ROM; panics only if
-/// the checked-in blob is malformed, which the fit test would already catch.
+/// to `izarravm_dos::toka_dos_install`. Only files flagged as system files are
+/// returned, so the boot record (which lives in the ROM but is not a C: file)
+/// is skipped. Panics only if the checked-in blob is malformed, which the fit
+/// test would already catch.
 pub fn toka_dos_system_files() -> Vec<(String, Vec<u8>)> {
     toka_rom::files(TOKA_DOS_ROM)
         .expect("embedded tokados.rom is well formed")
         .into_iter()
+        .filter(|file| file.flags & toka_rom::FLAG_SYSTEM != 0)
         .map(|file| (file.name, file.data.to_vec()))
         .collect()
+}
+
+/// The Toka-DOS boot record (TOKABOOT): the image the BIOS places at 0x7C00 to
+/// start the OS. None if the ROM carries no boot record.
+pub fn toka_boot_record() -> Option<&'static [u8]> {
+    toka_rom::files(TOKA_DOS_ROM)
+        .ok()?
+        .into_iter()
+        .find(|file| file.name.eq_ignore_ascii_case("TOKABOOT.BIN"))
+        .map(|file| file.data)
 }
 
 /// Reader for the packed Toka-DOS ROM. The format is a small table of contents
@@ -97,6 +110,8 @@ pub mod toka_rom {
     pub const NAME_LEN: usize = 11;
     pub const MAGIC: &[u8; 4] = b"TOKA";
     pub const VERSION: u16 = 1;
+    /// flags bit0: a system file the installer lays onto C:.
+    pub const FLAG_SYSTEM: u8 = 0x01;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum RomError {
@@ -342,6 +357,19 @@ mod tests {
         for file in &files {
             assert!(!file.name.is_empty(), "ROM file has an empty name");
         }
+
+        // The shell and the boot record are present; the boot record is a real
+        // 512-byte sector and is not flagged as a C: system file.
+        assert!(
+            files.iter().any(|f| f.name == "ICOMMAND.COM"),
+            "ICOMMAND.COM missing from the ROM"
+        );
+        let boot = toka_boot_record().expect("ROM has a boot record");
+        assert_eq!(boot.len(), 512, "boot record is one sector");
+        assert!(
+            !toka_dos_system_files().iter().any(|(n, _)| n == "TOKABOOT.BIN"),
+            "boot record must not install onto C:"
+        );
     }
 
     #[test]
