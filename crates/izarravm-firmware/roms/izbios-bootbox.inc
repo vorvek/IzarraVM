@@ -239,17 +239,12 @@ bx2_dev_avail:
     xor al, al
     ret
 
-; bx2_spd_avail: AL = speed row index. Returns AL = 1 if markable, 0 if not. Rows
-; 0/1/2 (586/486/386) are available; row 3 (286) is shown but non-markable here.
-; The 286 mode IS a real machine mode (GswMode::Gsw286, port 0xE1 code 3); it is
-; held back only because the menu has no separate confirmation for that tier yet.
+; bx2_spd_avail: AL = speed row index. Returns AL = 1 if markable, 0 if not. All
+; four rows (586/486/386/286) are available. Row 3 (286) maps to GswMode::Gsw286
+; (port 0xE1 code 3). The reject path below stays as a guard for any future row
+; that has no machine mode yet.
 bx2_spd_avail:
-    cmp al, BMX_SPD_SSLOW
-    je .no
     mov al, 1
-    ret
-.no:
-    xor al, al
     ret
 
 ; ===========================================================================
@@ -1151,8 +1146,7 @@ bx2_cancel:
 
 ; bx2_spd_row_to_code: AL = speed row index -> AL = the 0xE1/CMOS GSW code. Real
 ; hardware encoding (gsw_mode_from_code): Fast(586)=2, Slow(486)=1, VSlow(386)=0,
-; SSlow(286)=3. SSlow is non-markable, so it cannot be the marked row; if it ever
-; is, clamp to VSlow (0) so a 286 is never committed without the proper tier.
+; SSlow(286)=3. Any out-of-range row falls back to VSlow (0).
 bx2_spd_row_to_code:
     cmp al, BMX_SPD_FAST
     je .fast
@@ -1160,7 +1154,9 @@ bx2_spd_row_to_code:
     je .slow
     cmp al, BMX_SPD_VSLOW
     je .vslow
-    ; SSlow / out of range -> clamp to VSlow (386).
+    cmp al, BMX_SPD_SSLOW
+    je .sslow
+    ; Out of range -> fall back to VSlow (386).
     xor al, al
     ret
 .fast:
@@ -1171,6 +1167,9 @@ bx2_spd_row_to_code:
     ret
 .vslow:
     xor al, al
+    ret
+.sslow:
+    mov al, 3
     ret
 
 %if BMX_MOUSE

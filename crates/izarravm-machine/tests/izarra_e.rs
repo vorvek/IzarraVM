@@ -18,7 +18,7 @@
 // Keys are fed as Set 1 scancodes via inject_key_scancodes; mouse motion via
 // inject_mouse. The menu polls the aux channel and the keyboard ring each loop.
 
-use izarravm_core::VideoCard;
+use izarravm_core::{GswMode, VideoCard};
 use izarravm_firmware::izarra_bios;
 use izarravm_machine::{Machine, MachineProfile, build_fat12};
 use izarravm_video::VideoMode;
@@ -30,6 +30,10 @@ const ENTER_MAKE: u8 = 0x1c;
 const ENTER_BREAK: u8 = 0x9c;
 const UP_MAKE: u8 = 0x48;
 const UP_BREAK: u8 = 0xc8;
+const DOWN_MAKE: u8 = 0x50;
+const DOWN_BREAK: u8 = 0xd0;
+const RIGHT_MAKE: u8 = 0x4d;
+const RIGHT_BREAK: u8 = 0xcd;
 const ESC_MAKE: u8 = 0x01;
 const ESC_BREAK: u8 = 0x81;
 // F10 accepts the marked device and speed (the two-pane menu commits on Accept,
@@ -137,7 +141,7 @@ fn mouse_click_marks_a_speed_row() {
     // rather than boot).
     assert_eq!(machine.video().active_mode(), VideoMode::Mode13h);
     assert!(
-        marked_spd <= 2,
+        marked_spd <= 3,
         "a click marked an available speed row (was {seeded_spd}, now {marked_spd})"
     );
 }
@@ -172,6 +176,50 @@ fn tab_then_accept_boots_the_floppy() {
         }
     }
     assert!(reached_cga, "the Wizardry booter ran and switched to CGA");
+}
+
+#[test]
+fn accept_super_slow_commits_the_286_tier() {
+    // Open the menu, cross to the speed pane, walk down to the Super Slow (286) row,
+    // mark it with Enter, then Accept with F10. The Accept maps the marked row to GSW
+    // code 3, writes it to the live Lotura register (port 0xE1) and to CMOS 0x12, then
+    // cold-resets because the live mode changed from the 386 boot default. The live
+    // mode field persists across the guest reset, so active_mode() reads back Gsw286
+    // and CMOS 0x12 holds 3, mirroring the other speed tiers.
+    let mut machine = boot_machine();
+    assert_eq!(machine.active_mode(), GswMode::Gsw386, "boot mode is 386");
+
+    // Tab opens the menu (focus on the device pane, row 1 = the only bootable
+    // device, Floppy). Right crosses to the speed pane carrying that row index, so
+    // focus lands on speed row 1 (Slow). Two Downs walk to row 3 (Super Slow / 286).
+    // Enter marks it, F10 accepts.
+    machine.inject_key_scancodes(&[
+        TAB_MAKE,
+        TAB_BREAK, // open the boot menu
+        RIGHT_MAKE,
+        RIGHT_BREAK, // device pane -> speed pane (row 1)
+        DOWN_MAKE,
+        DOWN_BREAK, // Slow (row 1) -> VSlow (row 2)
+        DOWN_MAKE,
+        DOWN_BREAK, // VSlow (row 2) -> SSlow (row 3)
+        ENTER_MAKE,
+        ENTER_BREAK, // mark the Super Slow row
+        F10_MAKE,
+        F10_BREAK, // Accept
+    ]);
+    // Accept cold-resets, so the BIOS runs its POST again. Give it room to settle.
+    machine.run_until_halt_or_cycles(24_000_000).unwrap();
+
+    assert_eq!(
+        machine.active_mode(),
+        GswMode::Gsw286,
+        "Accept wrote GSW code 3 to the live Lotura register"
+    );
+    assert_eq!(
+        machine.cmos_byte(0x12),
+        3,
+        "Accept persisted GSW code 3 to CMOS 0x12"
+    );
 }
 
 // FAT12 layout constants for a 1.44 MB image, matching the synthesizer. Used to
