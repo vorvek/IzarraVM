@@ -161,6 +161,10 @@ struct Frame {
 /// UI-to-emulation-thread messages.
 enum Command {
     Keys(Vec<u8>),
+    /// A host mouse update: relative motion (dx, dy in host pixels, y down
+    /// positive) and the current button mask (bit0 left, bit1 right, bit2
+    /// middle). Forwarded only while input capture is active.
+    Mouse(i32, i32, u8),
     /// Mount a floppy image into drive A: live. `flush_path` is the source IMG to
     /// rewrite a dirty image to on eject; folder mounts pass None (read-only).
     MountFloppy {
@@ -292,6 +296,10 @@ impl Emulator {
         let _ = self.commands.send(Command::Keys(codes));
     }
 
+    fn send_mouse(&self, dx: i32, dy: i32, buttons: u8) {
+        let _ = self.commands.send(Command::Mouse(dx, dy, buttons));
+    }
+
     fn mount_floppy(&self, bytes: Vec<u8>, flush_path: Option<PathBuf>) {
         let _ = self
             .commands
@@ -384,6 +392,7 @@ fn emulate(
         loop {
             match commands.try_recv() {
                 Ok(Command::Keys(codes)) => machine.inject_key_scancodes(&codes),
+                Ok(Command::Mouse(dx, dy, buttons)) => machine.inject_mouse(dx, dy, buttons),
                 Ok(Command::MountFloppy { bytes, flush_path }) => {
                     match machine.mount_floppy(bytes) {
                         Ok(()) => floppy_flush_path = flush_path,
@@ -513,6 +522,15 @@ pub struct GuiApp {
     test_pattern: bool,
     rtc_setup: crate::cmos::RtcSetup,
     title: String,
+    // Input-capture state, the single source of truth for routing. When true the
+    // OS cursor is confined and hidden over the window, all keyboard input goes
+    // to the guest (egui does not consume it, including TAB), and host mouse
+    // motion and buttons are forwarded to the VM. Ctrl+F2 releases it. Entered
+    // by clicking the framebuffer image.
+    input_captured: bool,
+    // Last button mask forwarded to the VM, so a button press or release is sent
+    // even on a frame with no pointer motion.
+    last_buttons: u8,
     // The cpal stream is !Send, so it stays here on the UI thread; the
     // emulation thread gets a Send sink cloned from it.
     audio: Option<AudioPlayer>,
@@ -573,6 +591,8 @@ impl GuiApp {
             test_pattern,
             rtc_setup,
             title,
+            input_captured: false,
+            last_buttons: 0,
             audio,
             emu: None,
             texture: None,
@@ -688,6 +708,65 @@ impl GuiApp {
             }
             None => {
                 ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
+            }
+        }
+        // Clicking the screen grabs the input: the OS cursor is confined and
+        // hidden, and keyboard/mouse route to the guest until Ctrl+F2 releases.
+        let response = ui.interact(rect, ui.id().with("monitor-capture"), egui::Sense::click());
+        if response.clicked() && !self.input_captured {
+            self.set_capture(ctx, true);
+        }
+    }
+
+    /// Enter or leave input capture: confine and hide the OS cursor while
+    /// captured, release and show it otherwise. `Confined` keeps the absolute
+    /// cursor over the window so the relative-delta path stays meaningful;
+    /// `Locked` is the fallback for platforms that do not support confinement.
+    fn set_capture(&mut self, ctx: &egui::Context, capture: bool) {
+        if self.input_captured == capture {
+            return;
+        }
+        self.input_captured = capture;
+        self.last_buttons = 0;
+        if capture {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(
+                egui::CursorGrab::Confined,
+            ));
+            ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
+        } else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::None));
+            ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
+        }
+        self.title = capture_title(capture);
+    }
+
+    /// While captured, forward the host pointer to the VM: the per-frame motion
+    /// delta and the current button mask. The motion delta uses egui's pointer
+    /// delta (relative motion), which a confined cursor keeps producing without
+    /// drifting to a window edge. A frame with no motion and no button change is
+    /// skipped so an idle pointer does not flood the channel.
+    fn forward_mouse(&mut self, ctx: &egui::Context) {
+        let (delta, buttons) = ctx.input(|i| {
+            let d = i.pointer.delta();
+            let mut buttons = 0u8;
+            if i.pointer.button_down(egui::PointerButton::Primary) {
+                buttons |= 0x01;
+            }
+            if i.pointer.button_down(egui::PointerButton::Secondary) {
+                buttons |= 0x02;
+            }
+            if i.pointer.button_down(egui::PointerButton::Middle) {
+                buttons |= 0x04;
+            }
+            (d, buttons)
+        });
+        let dx = delta.x.round() as i32;
+        let dy = delta.y.round() as i32;
+        // Send when the pointer moved or a button state changed since last frame.
+        if dx != 0 || dy != 0 || buttons != self.last_buttons {
+            self.last_buttons = buttons;
+            if let Some(emu) = &self.emu {
+                emu.send_mouse(dx, dy, buttons);
             }
         }
     }
@@ -922,6 +1001,9 @@ impl GuiApp {
 
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Keep the title in sync with the capture state every frame, so a
+        // capture toggle is reflected even if set_capture ran mid-frame.
+        self.title = capture_title(self.input_captured);
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.title.clone()));
         // Host-loop diagnostics: count this update() and the input events egui
         // saw, rolling the rates up once a second.
@@ -937,8 +1019,59 @@ impl eframe::App for GuiApp {
             self.events_since = 0;
             self.metrics_mark = Some(now);
         }
-        // Forward key presses to the emulation thread as Set 1 scancodes.
-        if !ctx.wants_keyboard_input() {
+        // Ctrl+F2 releases the input capture. Checked before keyboard routing so
+        // the release combo is never forwarded to the guest as keystrokes.
+        let mut released_now = false;
+        if self.input_captured {
+            let release = ctx.input(|i| {
+                i.modifiers.ctrl
+                    && i.events.iter().any(|e| {
+                        matches!(
+                            e,
+                            egui::Event::Key {
+                                key: egui::Key::F2,
+                                pressed: true,
+                                ..
+                            }
+                        )
+                    })
+            });
+            if release {
+                self.set_capture(ctx, false);
+                released_now = true;
+            }
+        }
+
+        // Route keyboard input. While captured, every key goes to the guest and
+        // egui must not consume it (notably TAB, which it uses for focus
+        // traversal): drain the key events with input_mut so the guest sees TAB,
+        // arrows, and the rest. The frame that releases capture forwards nothing,
+        // so the Ctrl+F2 combo never reaches the guest. When not captured, keep
+        // the gated behavior that yields to egui widgets that want the keyboard.
+        if released_now {
+            // Nothing forwarded this frame: the release combo stays out of the VM.
+        } else if self.input_captured {
+            let codes: Vec<u8> = ctx.input_mut(|i| {
+                let mut codes = Vec::new();
+                i.events.retain(|e| match e {
+                    egui::Event::Key { key, pressed, .. } => {
+                        if let Some(make) = egui_key_to_set1(*key) {
+                            codes.push(if *pressed { make } else { make | 0x80 });
+                        }
+                        false // consume so egui does not act on it (e.g. TAB focus)
+                    }
+                    egui::Event::Text(_) => false, // swallow text echoes while captured
+                    _ => true,
+                });
+                codes
+            });
+            if !codes.is_empty() {
+                if let Some(emu) = &self.emu {
+                    emu.send_keys(codes);
+                }
+            }
+            self.forward_mouse(ctx);
+        } else if !ctx.wants_keyboard_input() {
             let codes: Vec<u8> = ctx.input(|i| {
                 i.events
                     .iter()
@@ -972,6 +1105,16 @@ impl eframe::App for GuiApp {
             if hz > 0.0 { hz } else { 60.0 }
         });
         ctx.request_repaint_after(Duration::from_secs_f64(1.0 / refresh_hz));
+    }
+}
+
+/// The window title for the current capture state. While captured it tells the
+/// user how to release the grab; otherwise it is just the product name.
+fn capture_title(captured: bool) -> String {
+    if captured {
+        String::from("IzarraVM - [Press Ctrl+F2 to release the input]")
+    } else {
+        String::from("IzarraVM")
     }
 }
 
