@@ -19,6 +19,10 @@ const OPL_NATIVE_HZ: f64 = 49_716.0;
 /// the clock_hz/20 budget cap (50 ms of guest time).
 const EMU_SLICE: Duration = Duration::from_millis(1);
 
+/// How long a drive-access LED stays lit after the last access, so a burst of
+/// fast reads reads as a steady glow rather than an imperceptible flicker.
+const LED_GLOW: Duration = Duration::from_millis(150);
+
 /// Pack 0x00RRGGBB words into an opaque egui image.
 fn words_to_color_image(words: &[u32], width: usize, height: usize) -> egui::ColorImage {
     let mut rgba = vec![0u8; width * height * 4];
@@ -139,6 +143,8 @@ struct Frame {
     speed_ratio: f64,      // EMA, fraction of real time
     mode: Option<GswMode>, // live CPU mode for the label
     refresh_hz: f64,       // guest vertical refresh, paces the UI repaint
+    floppy_accesses: u64,  // monotonic A: access count, drives the LED
+    c_accesses: u64,       // monotonic C: access count, drives the LED
 }
 
 /// UI-to-emulation-thread messages.
@@ -171,6 +177,61 @@ fn open_in_file_manager(path: &Path) {
         Ok(_) => {}
         Err(err) => error!(%err, path = %path.display(), "failed to open the file manager"),
     }
+}
+
+#[derive(Clone, Copy)]
+enum DriveIcon {
+    Floppy,
+    Cd,
+    Hdd,
+}
+
+/// Draw a small drive-type glyph inline and advance the cursor. Painter shapes
+/// rather than emoji, so it renders the same regardless of the font's emoji
+/// coverage.
+fn drive_icon(ui: &mut egui::Ui, kind: DriveIcon) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+    let col = ui.visuals().text_color();
+    let dim = egui::Color32::from_gray(120);
+    let stroke = egui::Stroke::new(1.0, col);
+    let p = ui.painter();
+    let body = rect.shrink(2.0);
+    match kind {
+        DriveIcon::Floppy => {
+            p.rect_stroke(body, 1.0, stroke, egui::StrokeKind::Inside);
+            // Metal shutter at the top, label patch at the bottom.
+            let shutter = egui::Rect::from_min_size(
+                body.left_top() + egui::vec2(body.width() * 0.5, 1.0),
+                egui::vec2(body.width() * 0.3, body.height() * 0.35),
+            );
+            p.rect_filled(shutter, 0.0, dim);
+            let label = egui::Rect::from_min_max(
+                body.left_bottom() + egui::vec2(2.0, -body.height() * 0.4),
+                body.right_bottom() + egui::vec2(-2.0, -1.0),
+            );
+            p.rect_filled(label, 0.0, dim);
+        }
+        DriveIcon::Cd => {
+            let c = body.center();
+            p.circle_stroke(c, body.width() * 0.45, stroke);
+            p.circle_filled(c, 1.5, col);
+        }
+        DriveIcon::Hdd => {
+            p.rect_stroke(body, 2.0, stroke, egui::StrokeKind::Inside);
+            p.circle_filled(body.right_bottom() + egui::vec2(-3.5, -3.5), 1.5, col);
+        }
+    }
+}
+
+/// A small square LED that glows green when a drive was just accessed.
+fn access_led(ui: &mut egui::Ui, lit: bool) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+    let color = if lit {
+        egui::Color32::from_rgb(48, 220, 64)
+    } else {
+        egui::Color32::from_rgb(28, 52, 30)
+    };
+    ui.painter().rect_filled(rect.shrink(1.0), 2.0, color);
 }
 
 /// Handle to the emulation thread: the command channel, the published frame,
@@ -375,6 +436,7 @@ fn emulate(
         let serial = new_frame.then(|| machine.serial_text());
         let mode = machine.active_mode();
         let refresh_hz = machine.display_refresh_hz();
+        let (floppy_accesses, c_accesses) = machine.drive_access_counts();
         {
             let mut f = frame.lock().expect("frame snapshot poisoned");
             if let Some((words, width, height)) = rendered {
@@ -389,6 +451,8 @@ fn emulate(
             f.mode = Some(mode);
             f.refresh_hz = refresh_hz;
             f.speed_ratio = speed_ratio;
+            f.floppy_accesses = floppy_accesses;
+            f.c_accesses = c_accesses;
         }
         published_seq = seq;
 
@@ -400,6 +464,14 @@ fn emulate(
 
         std::thread::sleep(EMU_SLICE);
     }
+}
+
+/// What is in drive A:, remembered so a Reset can remount the same media. Image
+/// mounts replay from the source IMG (a reset flushes dirty guest writes back to
+/// it first, so the re-read keeps them); folder mounts rebuild from the folder.
+enum FloppySource {
+    Image(PathBuf),
+    Folder(PathBuf),
 }
 
 pub struct GuiApp {
@@ -428,6 +500,15 @@ pub struct GuiApp {
     // What is mounted in drive A:, for the label. None shows "(empty)". The
     // emulation thread owns the actual mount; this string mirrors it for display.
     floppy_label: Option<String>,
+    // The source behind that mount, kept so a Reset remounts the same media
+    // instead of leaving the drive empty. Cleared on Stop and Eject.
+    floppy_source: Option<FloppySource>,
+    // Drive-access LED state: the last access count seen from the frame snapshot
+    // and when it last advanced, so the LED lights briefly on each access.
+    floppy_access_seen: u64,
+    c_access_seen: u64,
+    floppy_access_at: Option<Instant>,
+    c_access_at: Option<Instant>,
 }
 
 impl GuiApp {
@@ -470,6 +551,11 @@ impl GuiApp {
             host_fps: 0.0,
             input_rate: 0.0,
             floppy_label: None,
+            floppy_source: None,
+            floppy_access_seen: 0,
+            c_access_seen: 0,
+            floppy_access_at: None,
+            c_access_at: None,
         };
         app.start();
         app
@@ -491,8 +577,13 @@ impl GuiApp {
         ));
         self.texture = None;
         self.frame_seq = 0;
-        // A fresh machine boots with an empty drive A:.
+        // A fresh machine boots with an empty drive A:, then we remount whatever
+        // was in it so a Reset keeps the disk in the drive (no race to re-mount
+        // before the BIOS boots).
         self.floppy_label = None;
+        if let Some(source) = self.floppy_source.take() {
+            self.mount_floppy_source(source);
+        }
     }
 
     fn stop(&mut self) {
@@ -502,6 +593,7 @@ impl GuiApp {
         self.texture = None;
         self.frame_seq = 0;
         self.floppy_label = None;
+        self.floppy_source = None;
     }
 }
 
@@ -570,13 +662,35 @@ impl GuiApp {
 
     fn controls_ui(&mut self, ui: &mut egui::Ui) {
         let running = self.emu.is_some();
-        let (mode, speed, serial) = match &self.emu {
+        let (mode, speed, serial, floppy_accesses, c_accesses) = match &self.emu {
             Some(emu) => {
                 let f = emu.frame.lock().expect("frame snapshot poisoned");
-                (f.mode, f.speed_ratio, f.serial.clone())
+                (
+                    f.mode,
+                    f.speed_ratio,
+                    f.serial.clone(),
+                    f.floppy_accesses,
+                    f.c_accesses,
+                )
             }
-            None => (None, 0.0, String::new()),
+            None => (
+                None,
+                0.0,
+                String::new(),
+                self.floppy_access_seen,
+                self.c_access_seen,
+            ),
         };
+        // Light a drive LED whenever its access count advanced since last frame.
+        let now = Instant::now();
+        if floppy_accesses != self.floppy_access_seen {
+            self.floppy_access_seen = floppy_accesses;
+            self.floppy_access_at = Some(now);
+        }
+        if c_accesses != self.c_access_seen {
+            self.c_access_seen = c_accesses;
+            self.c_access_at = Some(now);
+        }
 
         ui.heading("Machine");
         ui.horizontal(|ui| {
@@ -617,11 +731,23 @@ impl GuiApp {
 
         ui.separator();
         ui.heading("COM1");
-        egui::ScrollArea::vertical()
-            .stick_to_bottom(true)
-            .auto_shrink([false, false])
+        // A console look: black text on white, with a thin scrollbar when the log
+        // overflows.
+        egui::Frame::new()
+            .fill(egui::Color32::WHITE)
+            .inner_margin(egui::Margin::same(4))
             .show(ui, |ui| {
-                ui.monospace(serial);
+                ui.style_mut().spacing.scroll.bar_width = 6.0;
+                egui::ScrollArea::vertical()
+                    .stick_to_bottom(true)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add(egui::Label::new(
+                            egui::RichText::new(serial)
+                                .monospace()
+                                .color(egui::Color32::BLACK),
+                        ));
+                    });
             });
     }
 
@@ -629,8 +755,17 @@ impl GuiApp {
     /// pair, disabled for now), and C: (open the host folder, no mount). `running`
     /// gates the floppy actions on a live emulation thread to send commands to.
     fn drives_ui(&mut self, ui: &mut egui::Ui, running: bool) {
-        // A: floppy.
-        ui.label("A: floppy");
+        let lit = |at: Option<Instant>| at.is_some_and(|t| t.elapsed() < LED_GLOW);
+        let floppy_lit = lit(self.floppy_access_at);
+        let c_lit = lit(self.c_access_at);
+
+        // A: floppy. Icon, name, then the access LED on the header row; the drive
+        // letter in the header makes the status line below it letter-free.
+        ui.horizontal(|ui| {
+            drive_icon(ui, DriveIcon::Floppy);
+            ui.label("A: floppy");
+            access_led(ui, floppy_lit);
+        });
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(running, egui::Button::new("Load IMG..."))
@@ -653,31 +788,37 @@ impl GuiApp {
                     emu.eject_floppy();
                 }
                 self.floppy_label = None;
+                self.floppy_source = None;
             }
         });
-        ui.label(format!(
-            "A: {}",
-            self.floppy_label.as_deref().unwrap_or("(empty)")
-        ));
+        ui.label(self.floppy_label.as_deref().unwrap_or("(empty)"));
 
         ui.add_space(4.0);
 
         // CD-ROM: the same shape as A:, disabled until the drive is emulated.
-        ui.label("CD-ROM");
+        ui.horizontal(|ui| {
+            drive_icon(ui, DriveIcon::Cd);
+            ui.label("CD-ROM");
+            access_led(ui, false);
+        });
         ui.horizontal(|ui| {
             ui.add_enabled(false, egui::Button::new("Load IMG..."));
             ui.add_enabled(false, egui::Button::new("Load folder..."));
         });
-        ui.label("CD-ROM: not emulated yet");
+        ui.label("not emulated yet");
 
         ui.add_space(4.0);
 
         // C: drive. Auto-mounted; no mount button, just open the host folder.
-        ui.label("C: drive");
+        ui.horizontal(|ui| {
+            drive_icon(ui, DriveIcon::Hdd);
+            ui.label("C: drive");
+            access_led(ui, c_lit);
+        });
         if ui.button("Open C: folder").clicked() {
             open_in_file_manager(&self.c_drive);
         }
-        ui.label(format!("C: {}", self.c_drive.display()));
+        ui.label(self.c_drive.display().to_string());
     }
 
     /// Pick a floppy IMG and mount it live. The image is writable in memory and
@@ -689,21 +830,7 @@ impl GuiApp {
         else {
             return;
         };
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                error!(%err, path = %path.display(), "failed to read floppy image");
-                return;
-            }
-        };
-        let label = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string());
-        if let Some(emu) = &self.emu {
-            emu.mount_floppy(bytes, Some(path));
-            self.floppy_label = Some(label);
-        }
+        self.mount_floppy_source(FloppySource::Image(path));
     }
 
     /// Pick a host folder, synthesize a FAT12 image from it, and mount it live.
@@ -712,23 +839,52 @@ impl GuiApp {
         let Some(dir) = rfd::FileDialog::new().pick_folder() else {
             return;
         };
-        let bytes = match izarravm_machine::build_fat12(&dir) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                error!(%err, dir = %dir.display(), "failed to build a FAT12 image from the folder");
-                return;
+        self.mount_floppy_source(FloppySource::Folder(dir));
+    }
+
+    /// Read or build the image for `source`, mount it into the live emulation
+    /// thread, and remember it so a Reset can remount the same media. Errors are
+    /// logged and leave the drive unchanged. Used by both the Load buttons and
+    /// the remount on Reset.
+    fn mount_floppy_source(&mut self, source: FloppySource) {
+        let (bytes, flush_path, label) = match &source {
+            FloppySource::Image(path) => {
+                let bytes = match std::fs::read(path) {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        error!(%err, path = %path.display(), "failed to read floppy image");
+                        return;
+                    }
+                };
+                let label = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                (bytes, Some(path.clone()), label)
+            }
+            FloppySource::Folder(dir) => {
+                let bytes = match izarravm_machine::build_fat12(dir) {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        error!(%err, dir = %dir.display(), "failed to build a FAT12 image from the folder");
+                        return;
+                    }
+                };
+                let label = format!(
+                    "{} (folder)",
+                    dir.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| dir.display().to_string())
+                );
+                (bytes, None, label)
             }
         };
-        let label = format!(
-            "{} (folder)",
-            dir.file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| dir.display().to_string())
-        );
-        if let Some(emu) = &self.emu {
-            emu.mount_floppy(bytes, None);
-            self.floppy_label = Some(label);
-        }
+        let Some(emu) = &self.emu else {
+            return;
+        };
+        emu.mount_floppy(bytes, flush_path);
+        self.floppy_label = Some(label);
+        self.floppy_source = Some(source);
     }
 }
 
