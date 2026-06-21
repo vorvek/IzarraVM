@@ -14,6 +14,18 @@ const FLAG_TF: u32 = 0x0000_0100;
 const FLAG_IF: u32 = 0x0000_0200;
 const FLAG_DF: u32 = 0x0000_0400;
 const FLAG_OF: u32 = 0x0000_0800;
+const FLAG_NT: u32 = 0x0000_4000; // bit 14, nested task
+
+/// Segment-selector slots in a 386 TSS, in memory order from offset 72 (ES, CS, SS,
+/// DS, FS, GS). Used by the task-switch save and restore.
+const TASK_SEGMENTS: [SegmentIndex; 6] = [
+    SegmentIndex::Es,
+    SegmentIndex::Cs,
+    SegmentIndex::Ss,
+    SegmentIndex::Ds,
+    SegmentIndex::Fs,
+    SegmentIndex::Gs,
+];
 // 486 EFLAGS additions. AC (bit 18) is the alignment-check enable consulted by the
 // #AC path together with CR0.AM; ID (bit 21) is the toggleable bit software flips to
 // probe for CPUID. Both are plain read/write storage otherwise, and both survive a
@@ -3354,7 +3366,7 @@ impl Cpu386 {
         if self.is_protected_mode() {
             let (low, high) = self.read_transfer_descriptor(bus, selector)?;
             if (high >> 8) & 0x10 == 0 {
-                return self.far_call_gate(bus, selector, low, high);
+                return self.far_system_transfer(bus, selector, low, high, true);
             }
         }
         // Direct far call (real mode, or a protected-mode code segment). Push CS first
@@ -3401,12 +3413,36 @@ impl Cpu386 {
         if self.is_protected_mode() {
             let (low, high) = self.read_transfer_descriptor(bus, selector)?;
             if (high >> 8) & 0x10 == 0 {
-                return self.far_jump_gate(bus, selector, low, high);
+                return self.far_system_transfer(bus, selector, low, high, false);
             }
         }
         self.load_segment(bus, SegmentIndex::Cs, selector)?;
         self.registers.eip = offset & operand_size.mask();
         Ok(())
+    }
+
+    /// Dispatch a far CALL/JMP to a system descriptor: a call gate, a task gate, or a
+    /// TSS (a direct task switch). `is_call` distinguishes CALL from JMP.
+    fn far_system_transfer<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        selector: u16,
+        low: u32,
+        high: u32,
+        is_call: bool,
+    ) -> ExecResult<()> {
+        match (high >> 8) & 0x0f {
+            0x04 | 0x0c if is_call => self.far_call_gate(bus, selector, low, high),
+            0x04 | 0x0c => self.far_jump_gate(bus, selector, low, high),
+            // Available 386 TSS: a direct task switch.
+            0x09 => self.task_switch(bus, selector, is_call),
+            // Task gate: switch to the TSS the gate names.
+            0x05 => {
+                let tss_selector = ((low >> 16) & 0xffff) as u16;
+                self.task_switch(bus, tss_selector, is_call)
+            }
+            _ => Err(CpuError::GeneralProtection { selector }.into()),
+        }
     }
 
     /// Read a descriptor for a far transfer from the GDT or LDT, faulting (#GP) on a
@@ -3592,6 +3628,154 @@ impl Cpu386 {
         self.load_segment(bus, SegmentIndex::Ss, new_ss)?;
         self.registers.set_esp(new_esp);
         Ok((old_ss, old_esp))
+    }
+
+    /// 386 hardware task switch. Saves the outgoing task's state into the current TSS,
+    /// loads the incoming one, juggles the busy bits, and (for a CALL) links back to
+    /// the caller and sets NT. ponytail: TSS memory is accessed unpaged, and the 286
+    /// (short) TSS form is not modeled.
+    fn task_switch<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        new_selector: u16,
+        is_call: bool,
+    ) -> ExecResult<()> {
+        let (low, high) = self.read_transfer_descriptor(bus, new_selector)?;
+        let access = (high >> 8) & 0xff;
+        // Present, available 386 TSS (type 0x09). Busy or wrong type is #GP.
+        if access & 0x80 == 0 || access & 0x1f != 0x09 {
+            return Err(CpuError::GeneralProtection {
+                selector: new_selector,
+            }
+            .into());
+        }
+        let new_tss = self.descriptor_to_segment(new_selector, low, high);
+        let old_selector = self.tr.selector;
+
+        self.save_task_state(bus)?;
+        if !is_call {
+            self.set_tss_busy(bus, old_selector, false)?;
+        }
+        self.load_task_state(bus, new_tss.base)?;
+        if is_call {
+            // Write the back-link and set NT so the inner IRET returns to the caller.
+            bus.write_memory(
+                new_tss.base,
+                BusWidth::Word,
+                u32::from(old_selector),
+                BusAccessKind::DataWrite,
+            )?;
+            self.registers.eflags |= FLAG_NT;
+        }
+        self.set_tss_busy(bus, new_selector, true)?;
+        self.tr = new_tss;
+        self.tr.access |= 0x02;
+        self.control.cr0 |= CR0_TS;
+        Ok(())
+    }
+
+    fn save_task_state<B: CpuBus>(&mut self, bus: &mut B) -> ExecResult<()> {
+        let base = self.tr.base;
+        bus.write_memory(
+            base + 32,
+            BusWidth::Dword,
+            self.registers.eip,
+            BusAccessKind::DataWrite,
+        )?;
+        bus.write_memory(
+            base + 36,
+            BusWidth::Dword,
+            self.registers.eflags,
+            BusAccessKind::DataWrite,
+        )?;
+        for i in 0..8u32 {
+            bus.write_memory(
+                base + 40 + i * 4,
+                BusWidth::Dword,
+                self.read_gpr32(i as u8),
+                BusAccessKind::DataWrite,
+            )?;
+        }
+        for (k, segment) in TASK_SEGMENTS.iter().enumerate() {
+            bus.write_memory(
+                base + 72 + k as u32 * 4,
+                BusWidth::Word,
+                u32::from(self.registers.segment(*segment).selector),
+                BusAccessKind::DataWrite,
+            )?;
+        }
+        bus.write_memory(
+            base + 96,
+            BusWidth::Word,
+            u32::from(self.ldtr.selector),
+            BusAccessKind::DataWrite,
+        )?;
+        Ok(())
+    }
+
+    fn load_task_state<B: CpuBus>(&mut self, bus: &mut B, base: u32) -> ExecResult<()> {
+        if self.control.cr0 & CR0_PG != 0 {
+            self.control.cr3 =
+                bus.read_memory(base + 28, BusWidth::Dword, BusAccessKind::DataRead)?;
+        }
+        // The LDTR is loaded first so segment loads that reference the LDT resolve.
+        let ldtr = bus.read_memory(base + 96, BusWidth::Word, BusAccessKind::DataRead)? as u16;
+        self.load_ldtr(bus, ldtr)?;
+        let eip = bus.read_memory(base + 32, BusWidth::Dword, BusAccessKind::DataRead)?;
+        let eflags = bus.read_memory(base + 36, BusWidth::Dword, BusAccessKind::DataRead)?;
+        for i in 0..8u32 {
+            let value =
+                bus.read_memory(base + 40 + i * 4, BusWidth::Dword, BusAccessKind::DataRead)?;
+            self.write_gpr32(i as u8, value);
+        }
+        self.registers.eflags = eflags | 0x2;
+        self.registers.eip = eip;
+        for (k, segment) in TASK_SEGMENTS.iter().enumerate() {
+            let selector = bus.read_memory(
+                base + 72 + k as u32 * 4,
+                BusWidth::Word,
+                BusAccessKind::DataRead,
+            )? as u16;
+            // A null data segment (ES/DS/FS/GS) is legal and just unusable; CS and SS
+            // must be loadable.
+            if selector & !0x7 == 0 && !matches!(segment, SegmentIndex::Cs | SegmentIndex::Ss) {
+                self.registers.set_segment(
+                    *segment,
+                    SegmentRegister {
+                        selector,
+                        ..Default::default()
+                    },
+                );
+            } else {
+                self.load_segment(bus, *segment, selector)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn set_tss_busy<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        selector: u16,
+        busy: bool,
+    ) -> ExecResult<()> {
+        if selector & !0x7 == 0 {
+            return Ok(());
+        }
+        let addr = self.gdtr.base + u32::from(selector & !0x7) + 5;
+        let mut access = bus.read_memory(addr, BusWidth::Byte, BusAccessKind::DataRead)? as u8;
+        if busy {
+            access |= 0x02;
+        } else {
+            access &= !0x02;
+        }
+        bus.write_memory(
+            addr,
+            BusWidth::Byte,
+            u32::from(access),
+            BusAccessKind::DataWrite,
+        )?;
+        Ok(())
     }
 
     fn relative_jump(&mut self, relative: i32, operand_size: OperandSize) {
@@ -11959,5 +12143,55 @@ mod tests {
             u32::from_le_bytes(bus.memory[0xe0..0xe4].try_into().unwrap()),
             0x1111
         );
+    }
+
+    // ---- Phase 4 slice D: hardware task switch ----
+
+    #[test]
+    fn jmp_to_tss_performs_a_task_switch() {
+        // New 386 TSS at 0x380 (selector 0x18), old busy TSS at 0x300 (selector 0x20).
+        let new_tss = (0x18u16, 0x0380_0067, 0x0000_8900);
+        let old_tss = (0x20u16, 0x0300_0067, 0x0000_8b00);
+        let ring0_data = (0x10u16, 0x0000_ffff, 0x00cf_9300);
+        let (mut cpu, mut memory) = protected_cpu_with_gdt(
+            &[0xea, 0x00, 0x00, 0x18, 0x00],
+            &[RING0_CODE, ring0_data, new_tss, old_tss],
+        );
+        cpu.tr = SegmentRegister {
+            selector: 0x20,
+            base: 0x300,
+            limit: 0x67,
+            access: 0x8b,
+            default_size_32: false,
+        };
+        let put32 =
+            |m: &mut [u8], off: usize, v: u32| m[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        let put16 =
+            |m: &mut [u8], off: usize, v: u16| m[off..off + 2].copy_from_slice(&v.to_le_bytes());
+        put32(&mut memory, 0x380 + 32, 0x200); // EIP
+        put32(&mut memory, 0x380 + 36, 0x0000_0002); // EFLAGS
+        put32(&mut memory, 0x380 + 40, 0xaaaa); // EAX
+        put32(&mut memory, 0x380 + 56, 0x00f0); // ESP
+        put16(&mut memory, 0x380 + 72, 0x10); // ES
+        put16(&mut memory, 0x380 + 76, 0x08); // CS
+        put16(&mut memory, 0x380 + 80, 0x10); // SS
+        put16(&mut memory, 0x380 + 84, 0x10); // DS
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.cs().selector, 0x08, "loaded new task CS");
+        assert_eq!(cpu.registers.eip, 0x200);
+        assert_eq!(cpu.registers.eax(), 0xaaaa);
+        assert_eq!(cpu.registers.esp(), 0x00f0);
+        assert_eq!(cpu.tr.selector, 0x18, "task register points at the new TSS");
+        assert_ne!(cpu.control.cr0 & CR0_TS, 0, "TS set on a task switch");
+        // The outgoing task's EIP (past the 5-byte JMP) was saved into the old TSS.
+        assert_eq!(
+            u32::from_le_bytes(bus.memory[0x320..0x324].try_into().unwrap()),
+            5
+        );
+        // JMP clears the old TSS busy bit in its GDT descriptor (0x8b -> 0x89).
+        assert_eq!(bus.memory[0x100 + 0x20 + 5], 0x89);
     }
 }
