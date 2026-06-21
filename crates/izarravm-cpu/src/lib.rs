@@ -1,6 +1,9 @@
 use izarravm_bus::{BusAccessKind, BusError, BusWidth, CpuBus};
 use thiserror::Error;
 
+mod fpu;
+pub use fpu::X87;
+
 const FLAG_CF: u32 = 0x0000_0001;
 const FLAG_PF: u32 = 0x0000_0004;
 const FLAG_AF: u32 = 0x0000_0010;
@@ -367,6 +370,7 @@ impl CpuLevel {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Cpu386 {
     pub registers: Registers,
+    pub fpu: X87,
     pub control: ControlRegisters,
     pub gdtr: DescriptorTable,
     pub idtr: DescriptorTable,
@@ -1334,6 +1338,7 @@ impl Cpu386 {
                 self.write_gpr8(0, value);
                 Ok(clocks(2))
             }
+            0xd8..=0xdf => self.execute_fpu(bus, opcode, prefixes, address_size),
             0xe0 | 0xe1 => {
                 // LOOPNE (E0) / LOOPE (E1): decrement (E)CX, branch while non-zero and ZF matches.
                 let rel = self.fetch_i8(bus)? as i32;
@@ -4108,6 +4113,618 @@ fn page_fault_code(present: bool, write: bool, user: bool) -> u32 {
     // bit 2 = U/S (was a user access). The reserved-bit (bit 3, 486+) and
     // instruction-fetch (bit 4, P6+) bits are later additions a 386 never sets.
     u32::from(present) | (u32::from(write) << 1) | (u32::from(user) << 2)
+}
+
+/// Two-operand x87 arithmetic. `op` is the group-1 /digit: 0 add, 1 mul, 4 sub
+/// (a-b), 5 reverse-sub (b-a), 6 div (a/b), 7 reverse-div (b/a). 2 and 3 are the
+/// compare encodings and are handled by the caller, never here.
+fn fpu_arith(op: u8, a: f64, b: f64) -> f64 {
+    match op {
+        0 => a + b,
+        1 => a * b,
+        4 => a - b,
+        5 => b - a,
+        6 => a / b,
+        7 => b / a,
+        _ => a,
+    }
+}
+
+/// FIST/FISTP rounding. ponytail: round-to-nearest-even only; the control-word RC
+/// field is not yet honored (it almost always is round-to-nearest anyway).
+fn fpu_round_to_i64(value: f64) -> i64 {
+    value.round_ties_even() as i64
+}
+
+impl Cpu386 {
+    // ============================ x87 FPU (387-class) ============================
+    // Escape opcodes 0xD8-0xDF. Registers are f64 (see fpu.rs for the precision
+    // ceiling). Transcendental functions, 80-bit-extended and BCD memory operands,
+    // integer-operand arithmetic (the FIADD family on 0xDA/0xDE memory), FCMOVcc,
+    // and the environment save/restore set are not implemented yet and return
+    // UnsupportedOpcode so they stay visible rather than silently wrong. See
+    // dev_docs/coverage-roadmap.md phase 2.
+
+    fn execute_fpu<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        opcode: u8,
+        prefixes: Prefixes,
+        address_size: AddressSize,
+    ) -> ExecResult<CycleOutcome> {
+        let modrm = self.fetch_modrm(bus)?;
+        if modrm.mode == 3 {
+            self.execute_fpu_register(opcode, modrm)
+        } else {
+            let mem = match self.decode_rm_operand(bus, prefixes, address_size, modrm)? {
+                RmOperand::Memory(memory) => memory,
+                RmOperand::Register(_) => unreachable!("mode != 3 decodes to a memory operand"),
+            };
+            self.execute_fpu_memory(bus, opcode, modrm.reg, mem)
+        }
+    }
+
+    fn execute_fpu_memory<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        opcode: u8,
+        reg: u8,
+        mem: MemoryOperand,
+    ) -> ExecResult<CycleOutcome> {
+        match opcode {
+            0xd8 => {
+                let operand = self.read_real32(bus, mem)?;
+                self.fpu_mem_arith(reg, operand);
+                Ok(clocks(20))
+            }
+            0xdc => {
+                let operand = self.read_real64(bus, mem)?;
+                self.fpu_mem_arith(reg, operand);
+                Ok(clocks(20))
+            }
+            0xd9 => match reg {
+                0 => {
+                    let v = self.read_real32(bus, mem)?;
+                    self.fpu.push(v);
+                    Ok(clocks(14))
+                }
+                2 | 3 => {
+                    let v = self.fpu.get(0);
+                    self.write_real32(bus, mem, v)?;
+                    if reg == 3 {
+                        self.fpu.pop();
+                    }
+                    Ok(clocks(14))
+                }
+                5 => {
+                    let cw = self.read_memory_sized(
+                        bus,
+                        mem.segment,
+                        mem.offset,
+                        OperandSize::Word,
+                        BusAccessKind::DataRead,
+                    )?;
+                    self.fpu.control = cw as u16;
+                    Ok(clocks(4))
+                }
+                7 => {
+                    let cw = u32::from(self.fpu.control);
+                    self.write_memory_sized(
+                        bus,
+                        mem.segment,
+                        mem.offset,
+                        OperandSize::Word,
+                        cw,
+                        BusAccessKind::DataWrite,
+                    )?;
+                    Ok(clocks(14))
+                }
+                _ => self.fpu_unsupported(opcode),
+            },
+            0xdd => match reg {
+                0 => {
+                    let v = self.read_real64(bus, mem)?;
+                    self.fpu.push(v);
+                    Ok(clocks(14))
+                }
+                2 | 3 => {
+                    let v = self.fpu.get(0);
+                    self.write_real64(bus, mem, v)?;
+                    if reg == 3 {
+                        self.fpu.pop();
+                    }
+                    Ok(clocks(14))
+                }
+                7 => {
+                    let sw = u32::from(self.fpu.status);
+                    self.write_memory_sized(
+                        bus,
+                        mem.segment,
+                        mem.offset,
+                        OperandSize::Word,
+                        sw,
+                        BusAccessKind::DataWrite,
+                    )?;
+                    Ok(clocks(14))
+                }
+                _ => self.fpu_unsupported(opcode),
+            },
+            0xdb => match reg {
+                0 => {
+                    let v = self.read_int32(bus, mem)?;
+                    self.fpu.push(v);
+                    Ok(clocks(14))
+                }
+                2 | 3 => {
+                    let v = self.fpu.get(0);
+                    self.write_int32(bus, mem, v)?;
+                    if reg == 3 {
+                        self.fpu.pop();
+                    }
+                    Ok(clocks(14))
+                }
+                _ => self.fpu_unsupported(opcode),
+            },
+            0xdf => match reg {
+                0 => {
+                    let v = self.read_int16(bus, mem)?;
+                    self.fpu.push(v);
+                    Ok(clocks(14))
+                }
+                2 | 3 => {
+                    let v = self.fpu.get(0);
+                    self.write_int16(bus, mem, v)?;
+                    if reg == 3 {
+                        self.fpu.pop();
+                    }
+                    Ok(clocks(14))
+                }
+                5 => {
+                    let v = self.read_int64(bus, mem)?;
+                    self.fpu.push(v);
+                    Ok(clocks(14))
+                }
+                7 => {
+                    let v = self.fpu.get(0);
+                    self.write_int64(bus, mem, v)?;
+                    self.fpu.pop();
+                    Ok(clocks(14))
+                }
+                _ => self.fpu_unsupported(opcode),
+            },
+            _ => self.fpu_unsupported(opcode),
+        }
+    }
+
+    fn execute_fpu_register(&mut self, opcode: u8, modrm: ModRm) -> ExecResult<CycleOutcome> {
+        let reg = modrm.reg;
+        let i = modrm.rm;
+        let byte = 0xc0 | (reg << 3) | modrm.rm;
+        match opcode {
+            0xd8 => self.fpu_reg_arith_st0(reg, i),
+            0xdc => self.fpu_reg_arith_sti(reg, i, false),
+            0xde => {
+                if byte == 0xd9 {
+                    // FCOMPP: compare ST(0) with ST(1), then pop both.
+                    let a = self.fpu.get(0);
+                    let b = self.fpu.get(1);
+                    self.fpu_compare(a, b);
+                    self.fpu.pop();
+                    self.fpu.pop();
+                    Ok(clocks(5))
+                } else {
+                    self.fpu_reg_arith_sti(reg, i, true)
+                }
+            }
+            0xd9 => self.fpu_d9_register(byte, i),
+            0xdb => self.fpu_db_register(byte),
+            0xdd => self.fpu_dd_register(reg, i),
+            0xdf => {
+                if byte == 0xe0 {
+                    // FNSTSW AX.
+                    let sw = self.fpu.status;
+                    self.write_gpr16(0, sw);
+                    Ok(clocks(3))
+                } else {
+                    self.fpu_unsupported(opcode)
+                }
+            }
+            _ => self.fpu_unsupported(opcode),
+        }
+    }
+
+    fn fpu_mem_arith(&mut self, reg: u8, operand: f64) {
+        let a = self.fpu.get(0);
+        match reg {
+            2 => self.fpu_compare(a, operand),
+            3 => {
+                self.fpu_compare(a, operand);
+                self.fpu.pop();
+            }
+            op => {
+                let r = fpu_arith(op, a, operand);
+                self.fpu.set(0, r);
+            }
+        }
+    }
+
+    fn fpu_reg_arith_st0(&mut self, reg: u8, i: u8) -> ExecResult<CycleOutcome> {
+        let a = self.fpu.get(0);
+        let b = self.fpu.get(i);
+        match reg {
+            2 => self.fpu_compare(a, b),
+            3 => {
+                self.fpu_compare(a, b);
+                self.fpu.pop();
+            }
+            op => {
+                let r = fpu_arith(op, a, b);
+                self.fpu.set(0, r);
+            }
+        }
+        Ok(clocks(20))
+    }
+
+    fn fpu_reg_arith_sti(&mut self, reg: u8, i: u8, pop: bool) -> ExecResult<CycleOutcome> {
+        if reg == 2 || reg == 3 {
+            return self.fpu_unsupported(if pop { 0xde } else { 0xdc });
+        }
+        // The DC/DE register encodings swap sub<->reverse-sub and div<->reverse-div
+        // relative to the D8 forms; the destination is ST(i) and the source ST(0).
+        let op = match reg {
+            4 => 5,
+            5 => 4,
+            6 => 7,
+            7 => 6,
+            other => other,
+        };
+        let a = self.fpu.get(i);
+        let b = self.fpu.get(0);
+        let r = fpu_arith(op, a, b);
+        self.fpu.set(i, r);
+        if pop {
+            self.fpu.pop();
+        }
+        Ok(clocks(20))
+    }
+
+    fn fpu_d9_register(&mut self, byte: u8, i: u8) -> ExecResult<CycleOutcome> {
+        match byte {
+            0xc0..=0xc7 => {
+                // FLD ST(i): push a copy.
+                let v = self.fpu.get(i);
+                self.fpu.push(v);
+                Ok(clocks(4))
+            }
+            0xc8..=0xcf => {
+                self.fpu.exchange(i);
+                Ok(clocks(4))
+            }
+            0xd0 => Ok(clocks(4)), // FNOP
+            0xe0 => {
+                let v = -self.fpu.get(0);
+                self.fpu.set(0, v);
+                Ok(clocks(6))
+            }
+            0xe1 => {
+                let v = self.fpu.get(0).abs();
+                self.fpu.set(0, v);
+                Ok(clocks(6))
+            }
+            0xe4 => {
+                let a = self.fpu.get(0);
+                self.fpu_compare(a, 0.0);
+                Ok(clocks(4))
+            }
+            0xe5 => {
+                self.fpu_examine();
+                Ok(clocks(8))
+            }
+            0xe8 => {
+                self.fpu.push(1.0);
+                Ok(clocks(4))
+            }
+            0xe9 => {
+                self.fpu.push(std::f64::consts::LOG2_10);
+                Ok(clocks(8))
+            }
+            0xea => {
+                self.fpu.push(std::f64::consts::LOG2_E);
+                Ok(clocks(8))
+            }
+            0xeb => {
+                self.fpu.push(std::f64::consts::PI);
+                Ok(clocks(8))
+            }
+            0xec => {
+                self.fpu.push(std::f64::consts::LOG10_2);
+                Ok(clocks(8))
+            }
+            0xed => {
+                self.fpu.push(std::f64::consts::LN_2);
+                Ok(clocks(8))
+            }
+            0xee => {
+                self.fpu.push(0.0);
+                Ok(clocks(4))
+            }
+            0xfa => {
+                let v = self.fpu.get(0).sqrt();
+                self.fpu.set(0, v);
+                Ok(clocks(70))
+            }
+            0xfc => {
+                let v = self.fpu.get(0).round_ties_even();
+                self.fpu.set(0, v);
+                Ok(clocks(20))
+            }
+            0xf6 => {
+                self.fpu.dec_top();
+                Ok(clocks(4))
+            }
+            0xf7 => {
+                self.fpu.inc_top();
+                Ok(clocks(4))
+            }
+            // Transcendentals (F0-F5, F8-FF except above) are deferred to phase 2.
+            _ => self.fpu_unsupported(0xd9),
+        }
+    }
+
+    fn fpu_db_register(&mut self, byte: u8) -> ExecResult<CycleOutcome> {
+        match byte {
+            0xe0 | 0xe1 | 0xe4 => Ok(clocks(2)), // FNENI / FNDISI / FNSETPM: 387 no-ops
+            0xe2 => {
+                self.fpu.clear_exceptions();
+                Ok(clocks(2))
+            }
+            0xe3 => {
+                self.fpu.finit();
+                Ok(clocks(3))
+            }
+            _ => self.fpu_unsupported(0xdb), // FCMOVcc (P6) deferred
+        }
+    }
+
+    fn fpu_dd_register(&mut self, reg: u8, i: u8) -> ExecResult<CycleOutcome> {
+        match reg {
+            0 => {
+                self.fpu.free(i);
+                Ok(clocks(3))
+            }
+            2 | 3 => {
+                let v = self.fpu.get(0);
+                self.fpu.set(i, v);
+                if reg == 3 {
+                    self.fpu.pop();
+                }
+                Ok(clocks(3))
+            }
+            4 | 5 => {
+                // FUCOM / FUCOMP. ponytail: treated like FCOM/FCOMP; the unordered-vs-
+                // signaling NaN distinction is not yet modeled (no exceptions).
+                let a = self.fpu.get(0);
+                let b = self.fpu.get(i);
+                self.fpu_compare(a, b);
+                if reg == 5 {
+                    self.fpu.pop();
+                }
+                Ok(clocks(4))
+            }
+            _ => self.fpu_unsupported(0xdd),
+        }
+    }
+
+    fn fpu_compare(&mut self, a: f64, b: f64) {
+        let (c3, c2, c0) = if a.is_nan() || b.is_nan() {
+            (true, true, true) // unordered
+        } else if a < b {
+            (false, false, true)
+        } else if a > b {
+            (false, false, false)
+        } else {
+            (true, false, false) // equal
+        };
+        self.fpu.set_condition(c3, c2, false, c0);
+    }
+
+    fn fpu_examine(&mut self) {
+        // FXAM: classify ST(0) into C3/C2/C0, with C1 = sign. Denormals are not
+        // distinguished from normals here.
+        let v = self.fpu.get(0);
+        let sign = v.is_sign_negative();
+        let (c3, c2, c0) = if self.fpu.is_empty(0) {
+            (true, false, true)
+        } else if v.is_nan() {
+            (false, false, true)
+        } else if v.is_infinite() {
+            (false, true, true)
+        } else if v == 0.0 {
+            (true, false, false)
+        } else {
+            (false, true, false)
+        };
+        self.fpu.set_condition(c3, c2, sign, c0);
+    }
+
+    fn fpu_unsupported(&self, opcode: u8) -> ExecResult<CycleOutcome> {
+        Err(CpuError::UnsupportedOpcode {
+            opcode,
+            cs: self.registers.cs().selector,
+            eip: self.registers.eip,
+        }
+        .into())
+    }
+
+    fn read_real32<B: CpuBus>(&mut self, bus: &mut B, mem: MemoryOperand) -> ExecResult<f64> {
+        let bits = self.read_memory_sized(
+            bus,
+            mem.segment,
+            mem.offset,
+            OperandSize::Dword,
+            BusAccessKind::DataRead,
+        )?;
+        Ok(f64::from(f32::from_bits(bits)))
+    }
+
+    fn read_real64<B: CpuBus>(&mut self, bus: &mut B, mem: MemoryOperand) -> ExecResult<f64> {
+        let lo = self.read_memory_sized(
+            bus,
+            mem.segment,
+            mem.offset,
+            OperandSize::Dword,
+            BusAccessKind::DataRead,
+        )?;
+        let hi = self.read_memory_sized(
+            bus,
+            mem.segment,
+            mem.offset.wrapping_add(4),
+            OperandSize::Dword,
+            BusAccessKind::DataRead,
+        )?;
+        Ok(f64::from_bits((u64::from(hi) << 32) | u64::from(lo)))
+    }
+
+    fn write_real32<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        mem: MemoryOperand,
+        value: f64,
+    ) -> ExecResult<()> {
+        let bits = (value as f32).to_bits();
+        self.write_memory_sized(
+            bus,
+            mem.segment,
+            mem.offset,
+            OperandSize::Dword,
+            bits,
+            BusAccessKind::DataWrite,
+        )
+    }
+
+    fn write_real64<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        mem: MemoryOperand,
+        value: f64,
+    ) -> ExecResult<()> {
+        let bits = value.to_bits();
+        self.write_memory_sized(
+            bus,
+            mem.segment,
+            mem.offset,
+            OperandSize::Dword,
+            (bits & 0xffff_ffff) as u32,
+            BusAccessKind::DataWrite,
+        )?;
+        self.write_memory_sized(
+            bus,
+            mem.segment,
+            mem.offset.wrapping_add(4),
+            OperandSize::Dword,
+            (bits >> 32) as u32,
+            BusAccessKind::DataWrite,
+        )
+    }
+
+    fn read_int16<B: CpuBus>(&mut self, bus: &mut B, mem: MemoryOperand) -> ExecResult<f64> {
+        let v = self.read_memory_sized(
+            bus,
+            mem.segment,
+            mem.offset,
+            OperandSize::Word,
+            BusAccessKind::DataRead,
+        )?;
+        Ok(f64::from(v as u16 as i16))
+    }
+
+    fn read_int32<B: CpuBus>(&mut self, bus: &mut B, mem: MemoryOperand) -> ExecResult<f64> {
+        let v = self.read_memory_sized(
+            bus,
+            mem.segment,
+            mem.offset,
+            OperandSize::Dword,
+            BusAccessKind::DataRead,
+        )?;
+        Ok(f64::from(v as i32))
+    }
+
+    fn read_int64<B: CpuBus>(&mut self, bus: &mut B, mem: MemoryOperand) -> ExecResult<f64> {
+        let lo = self.read_memory_sized(
+            bus,
+            mem.segment,
+            mem.offset,
+            OperandSize::Dword,
+            BusAccessKind::DataRead,
+        )?;
+        let hi = self.read_memory_sized(
+            bus,
+            mem.segment,
+            mem.offset.wrapping_add(4),
+            OperandSize::Dword,
+            BusAccessKind::DataRead,
+        )?;
+        Ok(((u64::from(hi) << 32) | u64::from(lo)) as i64 as f64)
+    }
+
+    fn write_int16<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        mem: MemoryOperand,
+        value: f64,
+    ) -> ExecResult<()> {
+        let v = fpu_round_to_i64(value) as i16 as u16;
+        self.write_memory_sized(
+            bus,
+            mem.segment,
+            mem.offset,
+            OperandSize::Word,
+            u32::from(v),
+            BusAccessKind::DataWrite,
+        )
+    }
+
+    fn write_int32<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        mem: MemoryOperand,
+        value: f64,
+    ) -> ExecResult<()> {
+        let v = fpu_round_to_i64(value) as i32 as u32;
+        self.write_memory_sized(
+            bus,
+            mem.segment,
+            mem.offset,
+            OperandSize::Dword,
+            v,
+            BusAccessKind::DataWrite,
+        )
+    }
+
+    fn write_int64<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        mem: MemoryOperand,
+        value: f64,
+    ) -> ExecResult<()> {
+        let bits = fpu_round_to_i64(value) as u64;
+        self.write_memory_sized(
+            bus,
+            mem.segment,
+            mem.offset,
+            OperandSize::Dword,
+            (bits & 0xffff_ffff) as u32,
+            BusAccessKind::DataWrite,
+        )?;
+        self.write_memory_sized(
+            bus,
+            mem.segment,
+            mem.offset.wrapping_add(4),
+            OperandSize::Dword,
+            (bits >> 32) as u32,
+            BusAccessKind::DataWrite,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -9482,5 +10099,89 @@ mod tests {
         cpu.cycle(&mut bus).unwrap();
         assert_eq!(cpu.registers.eip, 1);
         assert_eq!(cpu.registers.eflags, flags_before);
+    }
+
+    // ---- Phase 2 slice A: x87 FPU foundation (see dev_docs/coverage-roadmap.md) ----
+
+    #[test]
+    fn fninit_then_fld1_pushes_one() {
+        // FNINIT (DB E3) then FLD1 (D9 E8).
+        let (mut cpu, memory) = real_mode_cpu(&[0xdb, 0xe3, 0xd9, 0xe8], 0x20);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.fpu.get(0), 1.0);
+        assert_eq!(cpu.fpu.top(), 7);
+    }
+
+    #[test]
+    fn fld_fadd_fstp_round_trips_m64() {
+        // FLD m64 [0x100]; FADD m64 [0x108]; FSTP m64 [0x110]. 2.5 + 1.25 = 3.75.
+        let code = [
+            0xdd, 0x06, 0x00, 0x01, 0xdc, 0x06, 0x08, 0x01, 0xdd, 0x1e, 0x10, 0x01,
+        ];
+        let (mut cpu, mut memory) = real_mode_cpu(&code, 0x200);
+        memory[0x100..0x108].copy_from_slice(&2.5f64.to_le_bytes());
+        memory[0x108..0x110].copy_from_slice(&1.25f64.to_le_bytes());
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        cpu.cycle(&mut bus).unwrap();
+        cpu.cycle(&mut bus).unwrap();
+        let stored = f64::from_le_bytes(bus.memory[0x110..0x118].try_into().unwrap());
+        assert_eq!(stored, 3.75);
+    }
+
+    #[test]
+    fn fxch_swaps_st0_and_st1() {
+        // FLD1 (D9 E8); FLDZ (D9 EE); FXCH ST(1) (D9 C9). ST0 ends as 1.0.
+        let (mut cpu, memory) = real_mode_cpu(&[0xd9, 0xe8, 0xd9, 0xee, 0xd9, 0xc9], 0x20);
+        let mut bus = TestBus::with_memory(memory);
+        for _ in 0..3 {
+            cpu.cycle(&mut bus).unwrap();
+        }
+        assert_eq!(cpu.fpu.get(0), 1.0);
+        assert_eq!(cpu.fpu.get(1), 0.0);
+    }
+
+    #[test]
+    fn fnstsw_ax_reports_top_in_status() {
+        // FLD1 (D9 E8) then FNSTSW AX (DF E0): TOP=7 lands in AX bits 11-13.
+        let (mut cpu, memory) = real_mode_cpu(&[0xd9, 0xe8, 0xdf, 0xe0], 0x20);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!((cpu.read_reg16(Reg16::Ax) >> 11) & 0x7, 7);
+    }
+
+    #[test]
+    fn fild_fmulp_fistp_integer_path() {
+        // FILD m32 [0x100]=5; FILD m32 [0x104]=3; FMULP ST1,ST0 (DE C9); FISTP m32 [0x108].
+        let code = [
+            0xdb, 0x06, 0x00, 0x01, 0xdb, 0x06, 0x04, 0x01, 0xde, 0xc9, 0xdb, 0x1e, 0x08, 0x01,
+        ];
+        let (mut cpu, mut memory) = real_mode_cpu(&code, 0x200);
+        memory[0x100..0x104].copy_from_slice(&5i32.to_le_bytes());
+        memory[0x104..0x108].copy_from_slice(&3i32.to_le_bytes());
+        let mut bus = TestBus::with_memory(memory);
+        for _ in 0..4 {
+            cpu.cycle(&mut bus).unwrap();
+        }
+        let stored = i32::from_le_bytes(bus.memory[0x108..0x10c].try_into().unwrap());
+        assert_eq!(stored, 15);
+    }
+
+    #[test]
+    fn fsub_reverse_forms_differ() {
+        // D8 /5 FSUBR ST0,ST(i): ST0 = ST(i) - ST0. Start ST0=2, ST1=10 -> 8.
+        // FLD m64 [0x100]=10; FLD m64 [0x108]=2; FSUBR ST0,ST1 (D8 E9).
+        let code = [0xdd, 0x06, 0x00, 0x01, 0xdd, 0x06, 0x08, 0x01, 0xd8, 0xe9];
+        let (mut cpu, mut memory) = real_mode_cpu(&code, 0x200);
+        memory[0x100..0x108].copy_from_slice(&10.0f64.to_le_bytes());
+        memory[0x108..0x110].copy_from_slice(&2.0f64.to_le_bytes());
+        let mut bus = TestBus::with_memory(memory);
+        for _ in 0..3 {
+            cpu.cycle(&mut bus).unwrap();
+        }
+        assert_eq!(cpu.fpu.get(0), 8.0);
     }
 }
