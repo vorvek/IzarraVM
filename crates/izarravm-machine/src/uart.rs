@@ -170,6 +170,10 @@ impl Uart16450 {
                 self.mcr = value & 0x1f; // reserved bits 5-7 read back 0
                 if self.mcr & MCR_LOOP != 0 {
                     self.update_loopback_msr(old);
+                } else if old & MCR_LOOP != 0 {
+                    // Leaving loopback reconnects MSR to the real modem inputs,
+                    // which read low with no device attached.
+                    self.clear_loopback_msr();
                 }
             }
             5 => {} // LSR is read-only in hardware; ignore writes
@@ -231,6 +235,26 @@ impl Uart16450 {
         self.msr = msr;
     }
 
+    /// Leaving loopback: the four MSR input bits (CTS/DSR/RI/DCD) return to the
+    /// no-modem low state. Flag a delta for each input that was high so a guest
+    /// polling MSR sees the change, and keep any delta bits not yet read.
+    fn clear_loopback_msr(&mut self) {
+        let mut deltas = self.msr & (MSR_DCTS | MSR_DDSR | MSR_TERI | MSR_DDCD);
+        if self.msr & MSR_CTS != 0 {
+            deltas |= MSR_DCTS;
+        }
+        if self.msr & MSR_DSR != 0 {
+            deltas |= MSR_DDSR;
+        }
+        if self.msr & MSR_RI != 0 {
+            deltas |= MSR_TERI;
+        }
+        if self.msr & MSR_DCD != 0 {
+            deltas |= MSR_DDCD;
+        }
+        self.msr = deltas;
+    }
+
     /// Build the IIR byte and clear a serviced THR-empty source. Reading IIR
     /// acknowledges only the THRE source; the others clear on their own register
     /// read (RBR for RX data, LSR for line status, MSR for modem status).
@@ -268,6 +292,9 @@ impl Uart16450 {
 
     /// Recompute whether the interrupt line is asserted and arm the edge.
     /// The line drives IRQ4 only when MCR OUT2 gates it.
+    // ponytail: edge-armed on register access, not a continuously level-held
+    // line; sufficient because the 8259 takes IRQ4 as an edge and every guest
+    // interaction touches a UART port.
     fn refresh_irq(&mut self) {
         let asserted = self.mcr & MCR_OUT2 != 0 && self.pending_code() != IIR_NONE;
         if asserted {
@@ -371,6 +398,24 @@ mod tests {
         // The delta bits were set by the change; reading MSR cleared them.
         let after = uart.read_port(MSR).unwrap();
         assert_eq!(after & 0x0f, 0, "delta bits clear after read");
+    }
+
+    #[test]
+    fn leaving_loopback_drops_msr_inputs_to_no_modem() {
+        let mut uart = Uart16450::default();
+        uart.write_port(MCR, MCR_LOOP | MCR_DTR | MCR_RTS);
+        uart.read_port(MSR); // consume the entering-loopback deltas
+        // Leave loopback: the cross-wired inputs disconnect and read low again.
+        uart.write_port(MCR, MCR_DTR | MCR_RTS);
+        let msr = uart.read_port(MSR).unwrap();
+        assert_eq!(
+            msr & (MSR_CTS | MSR_DSR | MSR_RI | MSR_DCD),
+            0,
+            "inputs low"
+        );
+        // The two that were high (CTS from RTS, DSR from DTR) flagged a delta.
+        assert_ne!(msr & MSR_DCTS, 0, "CTS dropped");
+        assert_ne!(msr & MSR_DDSR, 0, "DSR dropped");
     }
 
     #[test]
