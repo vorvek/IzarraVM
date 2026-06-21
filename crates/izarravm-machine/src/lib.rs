@@ -994,6 +994,8 @@ impl Machine {
     fn handle_int1a(&mut self) {
         let ah = (self.cpu.registers.eax() as u16 >> 8) as u8;
         match ah {
+            // AH=00h/01h read and set the BIOS tick count; neither reports status
+            // in CF, so leaving the carry flag untouched here is intentional.
             0x00 => {
                 let ticks = self.read_guest_dword(0x46c);
                 let rollover = self.read_physical_u8(0x470);
@@ -3891,8 +3893,16 @@ mod tests {
 
     #[test]
     fn int1a_ah02_ah04_return_bcd_clock() {
+        // AH=04h clobbers CX/DX, so the AH=02h time result must be stashed to
+        // memory before the date call overwrites it. Set DS=0, run AH=02h, store
+        // CX/DX into BIOS scratch at 0:0500h, then run AH=04h and HLT. The date
+        // result stays live in CX/DX; the time result is read back from scratch.
         let rom = rom_with_code(&[
+            0x31, 0xC0, // xor ax, ax
+            0x8E, 0xD8, // mov ds, ax (DS = 0)
             0xB4, 0x02, 0xCD, 0x1A, // int 1Ah AH=02h (time)
+            0x89, 0x0E, 0x00, 0x05, // mov [0500h], cx
+            0x89, 0x16, 0x02, 0x05, // mov [0502h], dx
             0xB4, 0x04, 0xCD, 0x1A, // int 1Ah AH=04h (date)
             0xF4,
         ]);
@@ -3906,6 +3916,13 @@ mod tests {
         let dx = machine.cpu().registers.edx() as u16;
         assert_eq!(cx, 0x2026);
         assert_eq!(dx, 0x0621);
+        // AH=02h stashed time: CH=hour 0x13, CL=minute 0x45, DH=second 0x30, DL=0.
+        let time_cx = u16::from(machine.read_physical_u8(0x0500))
+            | (u16::from(machine.read_physical_u8(0x0501)) << 8);
+        let time_dx = u16::from(machine.read_physical_u8(0x0502))
+            | (u16::from(machine.read_physical_u8(0x0503)) << 8);
+        assert_eq!(time_cx, 0x1345, "CH=hour BCD, CL=minute BCD");
+        assert_eq!(time_dx, 0x3000, "DH=second BCD, DL=0");
     }
 
     #[test]
