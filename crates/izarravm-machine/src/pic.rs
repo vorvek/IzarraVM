@@ -2,21 +2,27 @@
 //!
 //! Built clean-room from the Intel 8259A datasheet cached at
 //! dev_docs/reference/8259a/. Fixed priority, edge latched, 8086 vector mode.
-//! Rotating priority, special mask mode, the poll command, special fully nested
-//! mode, and buffered mode are not modeled; the PC BIOS and DOS do not use them.
+//! Rotating priority and special fully nested mode are not modeled; the PC BIOS
+//! and DOS do not use them.
 
 /// One 8259A. The pair owns two of these plus the cascade routing.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct Pic {
-    irr: u8,           // interrupt request register (latched requests)
-    isr: u8,           // in-service register
-    imr: u8,           // interrupt mask register (1 = masked)
-    icw2: u8,          // vector base; vector(irq) = (icw2 & 0xF8) | irq
-    init: InitStage,   // odd-port initialization sequence position
-    expect_icw4: bool, // ICW1 bit0 (IC4)
-    single: bool,      // ICW1 bit1 (SNGL): skip ICW3
-    auto_eoi: bool,    // ICW4 bit1 (AEOI)
-    read_isr: bool,    // OCW3 read select: false = IRR, true = ISR
+    irr: u8,               // interrupt request register (latched requests)
+    isr: u8,               // in-service register
+    imr: u8,               // interrupt mask register (1 = masked)
+    icw2: u8,              // vector base; vector(irq) = (icw2 & 0xF8) | irq
+    icw3: u8,              // cascade wiring: master IR pin bitmask, or slave id
+    init: InitStage,       // odd-port initialization sequence position
+    expect_icw4: bool,     // ICW1 bit0 (IC4)
+    single: bool,          // ICW1 bit1 (SNGL): skip ICW3
+    level_triggered: bool, // ICW1 bit3 (LTIM): level mode, stored only
+    auto_eoi: bool,        // ICW4 bit1 (AEOI)
+    buffered: bool,        // ICW4 bit3 (BUF), stored only
+    is_master: bool,       // ICW4 bit2 (M/S) when buffered, stored only
+    read_isr: bool,        // OCW3 read select: false = IRR, true = ISR
+    poll_pending: bool,    // OCW3 P=1: the next data read is a poll command
+    special_mask: bool,    // OCW3 SMM: special mask mode active
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -40,12 +46,22 @@ impl Pic {
                 self.read_isr = false;
                 self.expect_icw4 = value & 0x01 != 0;
                 self.single = value & 0x02 != 0;
+                // ponytail: LTIM is decoded and stored, but the request path stays
+                // edge-pulsed; level-triggered re-assertion is not modeled.
+                self.level_triggered = value & 0x08 != 0;
                 self.init = InitStage::ExpectIcw2;
             } else if value & 0x08 != 0 {
-                // OCW3: only the read-register select is modeled. Poll and the
-                // special mask mode are not used by the PC BIOS or DOS.
+                // OCW3: read-register select, poll command, and special mask mode.
                 if value & 0x02 != 0 {
                     self.read_isr = value & 0x01 != 0;
+                }
+                if value & 0x04 != 0 {
+                    // P=1: the next data-port read is serviced as a poll.
+                    self.poll_pending = true;
+                }
+                if value & 0x20 != 0 {
+                    // ESMM=1: load the special mask mode bit (SMM).
+                    self.special_mask = value & 0x40 != 0;
                 }
             } else {
                 // OCW2: end of interrupt.
@@ -65,7 +81,9 @@ impl Pic {
                     };
                 }
                 InitStage::ExpectIcw3 => {
-                    // Cascade wiring is fixed in the pair; the ICW3 value is consumed.
+                    // Cascade wiring. On the master this is a bitmask of IR pins
+                    // that carry a slave; on a slave it is the slave id in bits 2-0.
+                    self.icw3 = value;
                     self.init = if self.expect_icw4 {
                         InitStage::ExpectIcw4
                     } else {
@@ -74,6 +92,8 @@ impl Pic {
                 }
                 InitStage::ExpectIcw4 => {
                     self.auto_eoi = value & 0x02 != 0;
+                    self.buffered = value & 0x08 != 0;
+                    self.is_master = value & 0x04 != 0;
                     self.init = InitStage::Ready;
                 }
                 InitStage::Ready => {
@@ -84,11 +104,30 @@ impl Pic {
         }
     }
 
-    fn read_port(&self, port: u16) -> u8 {
+    fn read_port(&mut self, port: u16) -> u8 {
+        if self.poll_pending {
+            // A poll command armed by OCW3 P=1 overrides the register read on the
+            // next access to either port and behaves like an INTA pulse.
+            self.poll_pending = false;
+            return self.poll();
+        }
         if port & 1 == 0 {
             if self.read_isr { self.isr } else { self.irr }
         } else {
             self.imr
+        }
+    }
+
+    /// Poll command: acknowledge the highest-priority deliverable request in
+    /// software. Sets its IS bit and returns `I 0 0 0 0 W2 W1 W0` where bit 7 is
+    /// interrupt-present and bits 2-0 are the level; 0x00 when nothing is pending.
+    fn poll(&mut self) -> u8 {
+        match self.highest_pending() {
+            Some(level) => {
+                self.set_in_service(level);
+                0x80 | level
+            }
+            None => 0x00,
         }
     }
 
@@ -111,13 +150,18 @@ impl Pic {
         (0..8u8).find(|&irq| self.isr & (1 << irq) != 0)
     }
 
-    /// Highest-priority deliverable request, or None. A request outranks the
-    /// in-service set only if no equal-or-higher ISR bit is set (fully nested).
+    /// Highest-priority deliverable request, or None. In fully nested mode a
+    /// request outranks the in-service set only if no equal-or-higher ISR bit is
+    /// set. In special mask mode a level is skipped only when its own ISR bit is
+    /// set, so a lower unmasked request can still be delivered.
     fn highest_pending(&self) -> Option<u8> {
         let requests = self.irr & !self.imr;
         for irq in 0..8u8 {
             let bit = 1 << irq;
             if self.isr & bit != 0 {
+                if self.special_mask {
+                    continue;
+                }
                 return None;
             }
             if requests & bit != 0 {
@@ -141,12 +185,13 @@ impl Pic {
     }
 }
 
-/// The master/slave 8259A pair. The slave's INT output drives master IR2, modeled
-/// by mirroring any slave request onto master IR2 so the single-chip resolver
-/// handles both levels. The mirror is edge latched: a second slave request latched
-/// while another slave level is in service must be re-raised through `request`,
-/// because the master IR2 bit is not held across its EOI. The PIT (IRQ0, master)
-/// does not exercise this; add a held slave INT line if a cascaded device needs it.
+/// The master/slave 8259A pair. The slave's INT output drives one master IR pin,
+/// the one selected by the slave's ICW3 id, modeled by mirroring any slave request
+/// onto that master pin so the single-chip resolver handles both levels. The mirror
+/// is edge latched: a second slave request latched while another slave level is in
+/// service must be re-raised through `request`, because the master cascade bit is
+/// not held across its EOI. The PIT (IRQ0, master) does not exercise this; add a
+/// held slave INT line if a cascaded device needs it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct Pic8259Pair {
     master: Pic,
@@ -163,7 +208,7 @@ impl Pic8259Pair {
         true
     }
 
-    pub(crate) fn read_port(&self, port: u16) -> Option<u8> {
+    pub(crate) fn read_port(&mut self, port: u16) -> Option<u8> {
         match port {
             0x20 | 0x21 => Some(self.master.read_port(port)),
             0xa0 | 0xa1 => Some(self.slave.read_port(port)),
@@ -205,7 +250,10 @@ impl Pic8259Pair {
             self.master.irr |= 1 << irq;
         } else if irq < 16 {
             self.slave.irr |= 1 << (irq - 8);
-            self.master.irr |= 1 << 2; // the slave INT line is wired to master IR2
+            // The slave INT line is wired to the master IR pin named by the
+            // slave's ICW3 id (bits 2-0); the AT default is master IR2.
+            let cascade_pin = self.slave.icw3 & 0x07;
+            self.master.irr |= 1 << cascade_pin;
         }
         // irq >= 16 is not a PC interrupt line; ignore it in release builds.
     }
@@ -217,7 +265,11 @@ impl Pic8259Pair {
     pub(crate) fn acknowledge(&mut self) -> Option<u8> {
         let master_irq = self.master.highest_pending()?;
         self.master.set_in_service(master_irq);
-        if master_irq != 2 {
+        // A pin is a cascade only if the master ICW3 bitmask flags it and the
+        // slave's ICW3 id names the same pin (AT default: master IR2, slave id 2).
+        let pin_has_slave = self.master.icw3 & (1 << master_irq) != 0;
+        let cascade_pin = self.slave.icw3 & 0x07;
+        if !pin_has_slave || master_irq != cascade_pin {
             return Some(self.master.vector(master_irq));
         }
         // Cascade: the master selected the slave. A non-AEOI EOI is later owed to
@@ -341,5 +393,83 @@ mod tests {
         assert_eq!(pic.acknowledge(), Some(0x77)); // slave base 0x70 | 7, spurious
         assert_eq!(pic.master.isr, 0x04); // master IR2 is in service, owes a master EOI
         assert_eq!(pic.slave.isr, 0x00); // no slave ISR set on a spurious IR7
+    }
+
+    #[test]
+    fn cascade_routing_follows_stored_icw3_id() {
+        // Wire the slave onto master IR5 instead of the AT default IR2. Both chips
+        // must agree: master ICW3 flags pin 5, slave ICW3 id is 5.
+        let mut pic = Pic8259Pair::default();
+        pic.write_port(0x20, 0x11); // master ICW1
+        pic.write_port(0x21, 0x08); // master ICW2 base 0x08
+        pic.write_port(0x21, 0x20); // master ICW3 slave on IR5
+        pic.write_port(0x21, 0x01); // master ICW4 8086
+        pic.write_port(0xa0, 0x11); // slave ICW1
+        pic.write_port(0xa1, 0x70); // slave ICW2 base 0x70
+        pic.write_port(0xa1, 0x05); // slave ICW3 id 5
+        pic.write_port(0xa1, 0x01); // slave ICW4 8086
+        pic.request(9); // slave line 1
+        assert_eq!(pic.master.irr, 0x20); // mirrored onto master IR5, not IR2
+        assert_eq!(pic.acknowledge(), Some(0x71)); // slave base 0x70 | 1
+        assert_eq!(pic.master.isr, 0x20); // master IR5 in service
+        assert_eq!(pic.slave.isr, 0x02);
+    }
+
+    #[test]
+    fn poll_command_returns_level_and_sets_isr() {
+        let mut pic = master_initialized();
+        pic.request(3);
+        pic.write_port(0x20, 0x0c); // OCW3 with P=1 (D3=1, P=1)
+        assert_eq!(pic.read_port(0x20), Some(0x83)); // present, level 3
+        assert_eq!(pic.master.isr, 0x08); // poll set IR3 in service
+        // The poll is consumed: a following read returns the selected register (IRR).
+        let irr = pic.master.irr;
+        assert_eq!(pic.read_port(0x20), Some(irr));
+    }
+
+    #[test]
+    fn poll_command_with_no_request_returns_zero() {
+        let mut pic = master_initialized();
+        pic.write_port(0x20, 0x0c); // OCW3 with P=1
+        assert_eq!(pic.read_port(0x20), Some(0x00));
+        assert_eq!(pic.master.isr, 0x00);
+    }
+
+    #[test]
+    fn special_mask_mode_delivers_lower_unmasked_request() {
+        let mut pic = master_initialized();
+        pic.request(2);
+        pic.acknowledge(); // IR2 in service
+        assert_eq!(pic.master.isr, 0x04);
+        pic.request(4);
+        // Fully nested: IR4 stays blocked behind the in-service IR2.
+        assert!(!pic.interrupt_pending());
+        pic.write_port(0x20, 0x68); // OCW3 ESMM=1, SMM=1
+        pic.write_port(0x21, 0x04); // OCW1 mask IR2
+        // Special mask mode now lets the lower unmasked IR4 through.
+        assert!(pic.interrupt_pending());
+        assert_eq!(pic.acknowledge(), Some(0x0c)); // IR4 vector
+    }
+
+    #[test]
+    fn without_special_mask_lower_request_stays_blocked() {
+        let mut pic = master_initialized();
+        pic.request(2);
+        pic.acknowledge(); // IR2 in service
+        pic.request(4);
+        pic.write_port(0x21, 0x04); // OCW1 mask IR2, but no special mask mode
+        assert!(!pic.interrupt_pending()); // IR4 still blocked by IR2 in service
+    }
+
+    #[test]
+    fn icw1_ltim_and_icw4_buffered_bits_are_stored() {
+        let mut pic = Pic8259Pair::default();
+        pic.write_port(0x20, 0x19); // ICW1 with LTIM (bit3) and IC4
+        pic.write_port(0x21, 0x08); // ICW2
+        pic.write_port(0x21, 0x04); // ICW3
+        pic.write_port(0x21, 0x0d); // ICW4 8086, buffered master (BUF + M/S)
+        assert!(pic.master.level_triggered);
+        assert!(pic.master.buffered);
+        assert!(pic.master.is_master);
     }
 }
