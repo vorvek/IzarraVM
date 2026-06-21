@@ -406,9 +406,10 @@ impl AtapiDevice {
         let loej = cdb[4] & 0x02 != 0;
         let start = cdb[4] & 0x01 != 0;
         if loej && !start {
-            // Eject request.
+            // Eject request. SFF-8020i (Tables 84/156/157) requires sense key NOT READY,
+            // not ILLEGAL REQUEST, when the medium is locked by PREVENT/ALLOW.
             if self.prevent_removal {
-                return self.fail(sense_key::ILLEGAL_REQUEST, asc::MEDIUM_REMOVAL_PREVENTED);
+                return self.fail(sense_key::NOT_READY, asc::MEDIUM_REMOVAL_PREVENTED);
             }
             self.eject();
             return CmdResult::Data(Vec::new());
@@ -1038,7 +1039,7 @@ mod tests {
         let mut eject = cdb(0x1B);
         eject[4] = 0x02; // eject
         assert!(matches!(dev.execute(&eject), CmdResult::Error));
-        assert_eq!(dev.sense_key, sense_key::ILLEGAL_REQUEST);
+        assert_eq!(dev.sense_key, sense_key::NOT_READY);
         assert_eq!((dev.asc, dev.ascq), asc::MEDIUM_REMOVAL_PREVENTED);
         assert!(dev.is_loaded()); // still mounted
     }
