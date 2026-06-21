@@ -113,12 +113,15 @@ impl Pic {
         }
     }
 
-    fn read_port(&mut self, port: u16) -> u8 {
+    /// `cascade_exempt` carries the same special-fully-nested-mode exemption as
+    /// `highest_pending`: the pair passes the master's exempt cascade pin so a
+    /// poll resolves the same level acknowledge() would, and `None` for the slave.
+    fn read_port(&mut self, port: u16, cascade_exempt: Option<u8>) -> u8 {
         if self.poll_pending {
             // A poll command armed by OCW3 P=1 overrides the register read on the
             // next access to either port and behaves like an INTA pulse.
             self.poll_pending = false;
-            return self.poll();
+            return self.poll(cascade_exempt);
         }
         if port & 1 == 0 {
             if self.read_isr { self.isr } else { self.irr }
@@ -130,8 +133,11 @@ impl Pic {
     /// Poll command: acknowledge the highest-priority deliverable request in
     /// software. Sets its IS bit and returns `I 0 0 0 0 W2 W1 W0` where bit 7 is
     /// interrupt-present and bits 2-0 are the level; 0x00 when nothing is pending.
-    fn poll(&mut self) -> u8 {
-        match self.highest_pending() {
+    /// A software poll is an INTA in software, so it resolves through the same
+    /// special-fully-nested-mode rule as acknowledge(): `cascade_exempt` relaxes
+    /// the master's busy cascade pin so a higher slave line can win the poll.
+    fn poll(&mut self, cascade_exempt: Option<u8>) -> u8 {
+        match self.highest_pending(cascade_exempt) {
             Some(level) => {
                 self.set_in_service(level);
                 0x80 | level
@@ -198,34 +204,18 @@ impl Pic {
     /// set. In special mask mode a level is skipped only when its own ISR bit is
     /// set, so a lower unmasked request can still be delivered. Levels are walked
     /// in the current rotated priority order, not a fixed 0..7.
-    fn highest_pending(&self) -> Option<u8> {
+    ///
+    /// `cascade_exempt` names a master cascade pin running special fully nested
+    /// mode: that pin's in-service bit does not inhibit a fresh request on the
+    /// same pin, so a higher-priority slave line can preempt one already being
+    /// serviced. Every other level keeps the fully nested rule, and the slave's
+    /// own internal priority orders the two slave requests. Pass `None` for the
+    /// plain fully nested resolution used by a slave or a non-SFNM master.
+    fn highest_pending(&self, cascade_exempt: Option<u8>) -> Option<u8> {
         let requests = self.irr & !self.imr;
         for irq in self.priority_order() {
             let bit = 1 << irq;
-            if self.isr & bit != 0 {
-                if self.special_mask {
-                    continue;
-                }
-                return None;
-            }
-            if requests & bit != 0 {
-                return Some(irq);
-            }
-        }
-        None
-    }
-
-    /// Master resolver for special fully nested mode. The cascade pin that is in
-    /// service for the slave does not inhibit a fresh request on that same pin, so
-    /// a higher-priority slave line can preempt one already being serviced. Every
-    /// other level keeps the fully nested rule. The slave's own internal priority
-    /// is what orders the two slave requests; here the master only needs to stop
-    /// treating its busy cascade pin as a hard block.
-    fn highest_pending_sfnm(&self, cascade_pin: u8) -> Option<u8> {
-        let requests = self.irr & !self.imr;
-        for irq in self.priority_order() {
-            let bit = 1 << irq;
-            if self.isr & bit != 0 && irq != cascade_pin {
+            if self.isr & bit != 0 && cascade_exempt != Some(irq) {
                 if self.special_mask {
                     continue;
                 }
@@ -281,8 +271,16 @@ impl Pic8259Pair {
 
     pub(crate) fn read_port(&mut self, port: u16) -> Option<u8> {
         match port {
-            0x20 | 0x21 => Some(self.master.read_port(port)),
-            0xa0 | 0xa1 => Some(self.slave.read_port(port)),
+            0x20 | 0x21 => {
+                // A master poll is an INTA in software, so it must resolve under
+                // the same SFNM exemption acknowledge() uses, or poll and ack
+                // would disagree on which level wins the master cascade pin.
+                let cascade_exempt = self.master_cascade_exempt();
+                Some(self.master.read_port(port, cascade_exempt))
+            }
+            // The slave never owns a cascade pin of its own, so the plain fully
+            // nested poll resolution applies.
+            0xa0 | 0xa1 => Some(self.slave.read_port(port, None)),
             _ => None,
         }
     }
@@ -329,23 +327,27 @@ impl Pic8259Pair {
         // irq >= 16 is not a PC interrupt line; ignore it in release builds.
     }
 
-    /// The master's highest-priority deliverable level. When the master runs in
-    /// special fully nested mode and its cascade pin is already in service for the
-    /// slave, that pin no longer blocks a fresh slave request, so a higher slave
-    /// line can preempt the one being serviced.
+    /// The master cascade pin exempt from the fully nested block, or `None`. When
+    /// the master runs special fully nested mode and its wired cascade pin carries
+    /// the slave, an in-service bit on that pin no longer blocks a fresh request on
+    /// it, so a higher slave line can preempt the one being serviced. Both the
+    /// interrupt resolution (acknowledge) and the software poll consult this so the
+    /// two paths agree.
+    fn master_cascade_exempt(&self) -> Option<u8> {
+        let cascade_pin = self.slave.icw3 & 0x07;
+        let pin_has_slave = self.master.icw3 & (1 << cascade_pin) != 0;
+        (self.master.sfnm && pin_has_slave).then_some(cascade_pin)
+    }
+
+    /// The master's highest-priority deliverable level, resolved under the same
+    /// special-fully-nested-mode rule the poll path uses.
     //
     // ponytail: SFNM here is just the master-side block relaxation. The datasheet
     // also asks software to poll the slave's ISR after a slave EOI and skip the
     // master EOI while the slave still has work in service. That slave-EOI dance
     // is left to the guest; this models the request-resolution half only.
     fn master_pending(&self) -> Option<u8> {
-        let cascade_pin = self.slave.icw3 & 0x07;
-        let pin_has_slave = self.master.icw3 & (1 << cascade_pin) != 0;
-        if self.master.sfnm && pin_has_slave {
-            self.master.highest_pending_sfnm(cascade_pin)
-        } else {
-            self.master.highest_pending()
-        }
+        self.master.highest_pending(self.master_cascade_exempt())
     }
 
     pub(crate) fn interrupt_pending(&self) -> bool {
@@ -364,7 +366,8 @@ impl Pic8259Pair {
         }
         // Cascade: the master selected the slave. A non-AEOI EOI is later owed to
         // both chips (the slave then the master); under AEOI each ISR self-clears.
-        match self.slave.highest_pending() {
+        // The slave resolves under the plain fully nested rule (no exempt pin).
+        match self.slave.highest_pending(None) {
             Some(slave_irq) => {
                 self.slave.set_in_service(slave_irq);
                 Some(self.slave.vector(slave_irq))
@@ -704,6 +707,71 @@ mod tests {
         // slave line cannot get through until the master EOIs IR2.
         pic.request(8);
         assert!(!pic.interrupt_pending());
+    }
+
+    #[test]
+    fn sfnm_master_poll_agrees_with_acknowledge() {
+        // A software poll is an INTA in software, so it must apply the same SFNM
+        // block relaxation acknowledge() does. With the busy cascade pin in
+        // service for the slave, a master poll has to report the pin as present,
+        // not blocked, exactly as an interrupt acknowledge would.
+        let mut pic = master_initialized_sfnm();
+        slave_initialized(&mut pic);
+        pic.request(9); // slave line 1
+        assert_eq!(pic.acknowledge(), Some(0x71)); // master IR2 + slave line 1
+        assert_eq!(pic.master.isr, 0x04); // master IR2 cascade in service
+        // A higher slave line requests, mirroring onto the in-service master IR2.
+        pic.request(8);
+        // Poll the master. Under the plain fully nested rule the in-service IR2
+        // would block the poll and return 0x00; the SFNM-aware poll instead
+        // reports IR2 present at level 2, agreeing with interrupt_pending().
+        assert!(pic.interrupt_pending());
+        pic.write_port(0x20, 0x0c); // OCW3 P=1 on the master
+        assert_eq!(pic.read_port(0x20), Some(0x82)); // present, level 2 (cascade pin)
+        assert_eq!(pic.master.isr, 0x04); // poll set (kept) IR2 in service
+    }
+
+    #[test]
+    fn sfnm_slave_eoi_protocol_defers_master_eoi() {
+        // The full special-fully-nested-mode slave-EOI dance, the guest software
+        // sequence the datasheet prescribes: after EOIing the slave, software
+        // reads the slave ISR and only EOIs the master once the slave ISR clears.
+        let mut pic = master_initialized_sfnm();
+        slave_initialized(&mut pic);
+
+        // A lower slave line goes into service through the cascade.
+        pic.request(9); // slave line 1
+        assert_eq!(pic.acknowledge(), Some(0x71));
+        assert_eq!(pic.master.isr, 0x04); // master IR2 cascade
+        assert_eq!(pic.slave.isr, 0x02); // slave line 1
+
+        // A higher slave line preempts it. SFNM relaxes the master cascade pin,
+        // and the slave's own nesting lets line 0 outrank the in-service line 1.
+        pic.request(8); // slave line 0, higher priority
+        assert!(pic.interrupt_pending());
+        assert_eq!(pic.acknowledge(), Some(0x70));
+        assert_eq!(pic.slave.isr, 0x03); // both slave lines now in service
+
+        // The higher handler finishes. Non-specific EOI to the slave clears its
+        // top in-service line (line 0), leaving line 1 still in service.
+        pic.write_port(0xa0, 0x20);
+        assert_eq!(pic.slave.isr, 0x02);
+
+        // Software reads the slave ISR via OCW3 (read-ISR select) to decide
+        // whether to EOI the master. The remaining in-service bit is visible.
+        pic.write_port(0xa0, 0x0b); // OCW3: read ISR (D3=1, RR=1, RIS=1)
+        assert_eq!(pic.read_port(0xa0), Some(0x02));
+        // The slave ISR is non-zero, so the guest correctly skips the master EOI:
+        // the master cascade pin must stay in service while the slave is busy.
+        assert_eq!(pic.master.isr, 0x04);
+
+        // The lower handler finishes. Non-specific EOI to the slave clears the
+        // last in-service line, so the slave ISR read now shows it empty.
+        pic.write_port(0xa0, 0x20);
+        assert_eq!(pic.read_port(0xa0), Some(0x00)); // OCW3 read-ISR still latched
+        // Now, and only now, the guest issues the deferred master EOI.
+        pic.write_port(0x20, 0x20);
+        assert_eq!(pic.master.isr, 0x00);
     }
 
     fn master_initialized_sfnm() -> Pic8259Pair {
