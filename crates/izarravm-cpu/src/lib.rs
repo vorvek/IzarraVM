@@ -83,11 +83,28 @@ const CPUID_VERSION_EAX: u32 =
     (CPUID_TYPE << 12) | (CPUID_FAMILY << 8) | (CPUID_MODEL << 4) | CPUID_STEPPING;
 
 // Leaf 1 feature flags. Only bits for features the core actually emulates are set. FPU
-// (bit 0) is off (no FPU is modeled); MMX (bit 23) is on to match the GSW-586 lore. No
-// other feature is claimed yet (TSC, paging-extension, and the rest stay off until the
-// matching behavior exists).
+// (bit 0) is off (no FPU is modeled). TSC (bit 4) and MSR (bit 5) are on: RDTSC and
+// RDMSR/WRMSR with the K6 model-specific register set are implemented. MMX (bit 23) is
+// on to match the GSW-586 lore. The rest stay off until the matching behavior exists.
+const CPUID_FEATURE_TSC: u32 = 1 << 4;
+const CPUID_FEATURE_MSR: u32 = 1 << 5;
 const CPUID_FEATURE_MMX: u32 = 1 << 23;
-const CPUID_FEATURES_EDX: u32 = CPUID_FEATURE_MMX;
+const CPUID_FEATURES_EDX: u32 = CPUID_FEATURE_TSC | CPUID_FEATURE_MSR | CPUID_FEATURE_MMX;
+
+// CR4 bits with a modeled effect. TSD (bit 2) makes RDTSC privileged: when set, RDTSC
+// outside CPL 0 raises #GP(0). The other CR4 bits are storage only.
+const CR4_TSD: u32 = 0x0000_0004;
+
+// K6 model-specific register addresses (the value the RDMSR/WRMSR ECX selector carries).
+// This is the full software-visible set from the AMD-K6 BIOS and Software Tools guide:
+// the two machine-check registers, the time-stamp counter, the AMD extended-feature and
+// SYSCALL-target registers, and the write-handling control register.
+const MSR_MCAR: u32 = 0x0000_0000; // machine-check address
+const MSR_MCTR: u32 = 0x0000_0001; // machine-check type
+const MSR_TSC: u32 = 0x0000_0010; // time-stamp counter
+const MSR_EFER: u32 = 0xc000_0080; // extended feature enable (bit 0 = SCE)
+const MSR_STAR: u32 = 0xc000_0081; // SYSCALL/SYSRET target address
+const MSR_WHCR: u32 = 0xc000_0082; // write handling control
 
 // Leaf 1 EBX: brand index 0 (no brand string), CLFLUSH line size and other fields stay 0.
 const CPUID_LEAF1_EBX: u32 = 0;
@@ -336,6 +353,24 @@ pub struct ControlRegisters {
     pub cr0: u32,
     pub cr2: u32,
     pub cr3: u32,
+    // CR4 arrived on the 586. Only TSD (bit 2) has a modeled effect here (it gates
+    // RDTSC outside CPL 0); the rest is plain read/write storage so MOV CR4 round-
+    // trips. Reset is all zero.
+    pub cr4: u32,
+}
+
+/// The K6 model-specific register file behind RDMSR/WRMSR. MCAR/MCTR/WHCR are plain
+/// 64-bit storage with no modeled effect (no machine-check or write-allocate logic is
+/// emulated). EFER bit 0 (SCE) and STAR feed SYSCALL/SYSRET. `tsc_offset` is added to
+/// the running core-clock count so a WRMSR to the TSC can rebase it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Msrs {
+    pub mcar: u64,
+    pub mctr: u64,
+    pub whcr: u64,
+    pub efer: u64,
+    pub star: u64,
+    pub tsc_offset: u64,
 }
 
 /// The instruction-set level the core presents to the running guest. It is a
@@ -371,6 +406,13 @@ impl CpuLevel {
         matches!(self, Self::I486 | Self::I586)
     }
 
+    /// True when the 586-class instruction additions are present (RDTSC, RDMSR/WRMSR,
+    /// CMOVcc, CMPXCHG8B, SYSCALL/SYSRET, RSM). The physical part is always a 586, so
+    /// only a guest that throttled to a lower GSW mode sees these as #UD.
+    const fn has_pentium_isa(self) -> bool {
+        matches!(self, Self::I586)
+    }
+
     /// Reported (L1 KB, L2 KB) cache for the level. Cosmetic, no timing effect; the
     /// L2 is a motherboard cache module. Mirrors `GswMode::cache_kb` in the core so
     /// the CPU can answer the cache readout without a core dependency.
@@ -389,6 +431,7 @@ pub struct Cpu386 {
     pub registers: Registers,
     pub fpu: X87,
     pub control: ControlRegisters,
+    pub msr: Msrs,
     pub gdtr: DescriptorTable,
     pub idtr: DescriptorTable,
     /// Local descriptor table register and task register. The selector plus the
@@ -1999,6 +2042,18 @@ impl Cpu386 {
                 error_code: None,
             });
         }
+        // The 586-class additions (RDTSC, RDMSR/WRMSR, CMOVcc, CMPXCHG8B, SYSCALL/SYSRET,
+        // RSM) raise #UD when the guest has throttled below the 586 level, the same way
+        // CPUID is gated. Firmware running from ROM is exempt.
+        if !self.level.has_pentium_isa()
+            && !self.cs_in_firmware_rom()
+            && is_586plus_two_byte(opcode)
+        {
+            return Err(InternalFault::Exception {
+                vector: 6,
+                error_code: None,
+            });
+        }
         match opcode {
             // ponytail: MMX is not gated to 586+; a throttled 386/486 GSW mode would
             // wrongly accept it. Gate it with the others if that fidelity gap matters.
@@ -2012,6 +2067,64 @@ impl Cpu386 {
                 self.require_cpl0()?;
                 self.control.cr0 &= !CR0_TS;
                 Ok(clocks(2))
+            }
+            0x30 => {
+                // WRMSR: write EDX:EAX into the model-specific register selected by ECX.
+                // Privileged (#GP(0) outside CPL 0). An undefined MSR selector also #GP(0)s.
+                self.require_cpl0()?;
+                let value = self.read_edx_eax();
+                match self.read_gpr32(1) {
+                    MSR_MCAR => self.msr.mcar = value,
+                    MSR_MCTR => self.msr.mctr = value,
+                    // Rebase the time-stamp counter: store the offset that makes the running
+                    // core-clock count read back as the written value.
+                    MSR_TSC => self.msr.tsc_offset = value.wrapping_sub(self.elapsed_clocks),
+                    MSR_EFER => self.msr.efer = value,
+                    MSR_STAR => self.msr.star = value,
+                    MSR_WHCR => self.msr.whcr = value,
+                    _ => {
+                        return Err(InternalFault::Exception {
+                            vector: 13,
+                            error_code: Some(0),
+                        });
+                    }
+                }
+                Ok(clocks(30))
+            }
+            0x31 => {
+                // RDTSC: read the time-stamp counter into EDX:EAX. When CR4.TSD is set the
+                // instruction is privileged and #GP(0)s outside CPL 0; with TSD clear (the
+                // default) it runs at any level.
+                if self.control.cr4 & CR4_TSD != 0 && self.current_privilege_level() != 0 {
+                    return Err(InternalFault::Exception {
+                        vector: 13,
+                        error_code: Some(0),
+                    });
+                }
+                let tsc = self.time_stamp_counter();
+                self.set_edx_eax(tsc);
+                Ok(clocks(11))
+            }
+            0x32 => {
+                // RDMSR: read the model-specific register selected by ECX into EDX:EAX.
+                // Privileged; an undefined selector #GP(0)s.
+                self.require_cpl0()?;
+                let value = match self.read_gpr32(1) {
+                    MSR_MCAR => self.msr.mcar,
+                    MSR_MCTR => self.msr.mctr,
+                    MSR_TSC => self.time_stamp_counter(),
+                    MSR_EFER => self.msr.efer,
+                    MSR_STAR => self.msr.star,
+                    MSR_WHCR => self.msr.whcr,
+                    _ => {
+                        return Err(InternalFault::Exception {
+                            vector: 13,
+                            error_code: Some(0),
+                        });
+                    }
+                };
+                self.set_edx_eax(value);
+                Ok(clocks(11))
             }
             0x20 => {
                 let modrm = self.fetch_modrm(bus)?;
@@ -2027,6 +2140,7 @@ impl Cpu386 {
                     0 => self.control.cr0,
                     2 => self.control.cr2,
                     3 => self.control.cr3,
+                    4 => self.control.cr4,
                     _ => 0,
                 };
                 self.write_gpr32(modrm.rm, value);
@@ -2051,6 +2165,7 @@ impl Cpu386 {
                     0 => self.control.cr0 = value,
                     2 => self.control.cr2 = value,
                     3 => self.control.cr3 = value & 0xffff_f000,
+                    4 => self.control.cr4 = value,
                     _ => {}
                 }
                 Ok(clocks(6))
@@ -3968,6 +4083,24 @@ impl Cpu386 {
         self.registers.gpr[usize::from(index & 7)] = value;
     }
 
+    /// The EDX:EAX register pair as one 64-bit value (EDX is the high dword). Used by the
+    /// 64-bit MSR and time-stamp instructions.
+    fn read_edx_eax(&self) -> u64 {
+        (u64::from(self.read_gpr32(2)) << 32) | u64::from(self.read_gpr32(0))
+    }
+
+    /// Split a 64-bit value into EDX:EAX (EDX high, EAX low).
+    fn set_edx_eax(&mut self, value: u64) {
+        self.write_gpr32(0, value as u32);
+        self.write_gpr32(2, (value >> 32) as u32);
+    }
+
+    /// The time-stamp counter: the running core-clock count plus whatever offset a WRMSR
+    /// to the TSC last rebased it by.
+    fn time_stamp_counter(&self) -> u64 {
+        self.elapsed_clocks.wrapping_add(self.msr.tsc_offset)
+    }
+
     fn read_gpr16(&self, index: u8) -> u16 {
         self.registers.gpr[usize::from(index & 7)] as u16
     }
@@ -4515,6 +4648,16 @@ const fn is_386plus_two_byte(opcode: u8) -> bool {
         | 0xa3 | 0xa4 | 0xa5 | 0xab | 0xac | 0xad | 0xaf
         // BT/BTS/BTR/BTC r/m+imm8 and r/m+reg, MOVZX/MOVSX, BSF/BSR (386).
         | 0xb3 | 0xba | 0xbb | 0xb6 | 0xb7 | 0xbc | 0xbd | 0xbe | 0xbf
+    )
+}
+
+/// True when a second-byte 0F opcode is a 586-class addition the core executes only at
+/// the full GSW level. Used to raise #UD when the guest throttled to 286/386/486.
+const fn is_586plus_two_byte(opcode: u8) -> bool {
+    matches!(
+        opcode,
+        // WRMSR, RDTSC, RDMSR.
+        0x30..=0x32
     )
 }
 
@@ -11314,6 +11457,153 @@ mod tests {
         assert_eq!(CpuLevel::I386.cache_kb(), (0, 64));
         assert_eq!(CpuLevel::I486.cache_kb(), (16, 128));
         assert_eq!(CpuLevel::I586.cache_kb(), (32, 512));
+    }
+
+    // --- Phase 5 Slice A: RDTSC, RDMSR/WRMSR, the K6 MSR set, CR4 ---
+
+    fn cpl3_code(code: &[u8]) -> (Cpu386, TestBus) {
+        // Protected mode with a flat CPL-3 code segment (selector RPL 3), the same shape
+        // the #AC/CPUID privilege tests use, but loaded with arbitrary code.
+        let mut memory = vec![0u8; 256];
+        memory[..code.len()].copy_from_slice(code);
+        let mut cpu = Cpu386::default();
+        cpu.control.cr0 |= CR0_PE;
+        cpu.registers.set_segment(
+            SegmentIndex::Cs,
+            SegmentRegister {
+                selector: 0x0003,
+                base: 0,
+                limit: 0xffff_ffff,
+                access: 0x9b,
+                default_size_32: true,
+            },
+        );
+        cpu.registers.eip = 0;
+        (cpu, TestBus::with_memory(memory))
+    }
+
+    #[test]
+    fn rdtsc_reads_elapsed_core_clocks_into_edx_eax() {
+        // 0F 31. EDX:EAX take the 64-bit time-stamp counter (the running core-clock count).
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x31], 0x20);
+        cpu.elapsed_clocks = 0x1_0000_0002;
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.eax(), 0x0000_0002);
+        assert_eq!(cpu.registers.edx(), 0x0000_0001);
+    }
+
+    #[test]
+    fn wrmsr_rdmsr_round_trip_whcr() {
+        // 0F 30 WRMSR then 0F 32 RDMSR with ECX selecting WHCR. EDX:EAX is the 64-bit value.
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x30, 0x0f, 0x32], 0x20);
+        cpu.registers.set_ecx(MSR_WHCR);
+        cpu.registers.set_edx(0xdead_beef);
+        cpu.registers.set_eax(0x0bad_f00d);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap(); // wrmsr
+        assert_eq!(cpu.msr.whcr, 0xdead_beef_0bad_f00d);
+        cpu.registers.set_eax(0);
+        cpu.registers.set_edx(0);
+        cpu.cycle(&mut bus).unwrap(); // rdmsr
+        assert_eq!(cpu.registers.edx(), 0xdead_beef);
+        assert_eq!(cpu.registers.eax(), 0x0bad_f00d);
+    }
+
+    #[test]
+    fn wrmsr_tsc_rebases_so_the_counter_reads_the_written_value() {
+        // Writing the TSC stores an offset such that the running core-clock count reads
+        // back as the written value. execute_instruction does not advance elapsed_clocks,
+        // so the read is exact.
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x30], 0x20);
+        cpu.elapsed_clocks = 500;
+        cpu.registers.set_ecx(MSR_TSC);
+        cpu.registers.set_edx(0);
+        cpu.registers.set_eax(1_000_000);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.execute_instruction(&mut bus).unwrap();
+        assert_eq!(cpu.time_stamp_counter(), 1_000_000);
+    }
+
+    #[test]
+    fn wrmsr_is_general_protection_at_cpl3() {
+        let (mut cpu, mut bus) = cpl3_code(&[0x0f, 0x30]);
+        cpu.registers.set_ecx(MSR_WHCR);
+        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        assert!(matches!(
+            fault,
+            InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0)
+            }
+        ));
+    }
+
+    #[test]
+    fn rdmsr_unknown_selector_is_general_protection() {
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x32], 0x20);
+        cpu.registers.set_ecx(0x1234_5678);
+        let mut bus = TestBus::with_memory(memory);
+        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        assert!(matches!(
+            fault,
+            InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0)
+            }
+        ));
+    }
+
+    #[test]
+    fn rdtsc_is_general_protection_when_tsd_set_at_cpl3() {
+        let (mut cpu, mut bus) = cpl3_code(&[0x0f, 0x31]);
+        cpu.control.cr4 |= CR4_TSD;
+        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        assert!(matches!(
+            fault,
+            InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0)
+            }
+        ));
+    }
+
+    #[test]
+    fn rdtsc_runs_at_cpl3_when_tsd_clear() {
+        let (mut cpu, mut bus) = cpl3_code(&[0x0f, 0x31]);
+        cpu.elapsed_clocks = 42;
+        assert!(cpu.execute_instruction(&mut bus).is_ok());
+        assert_eq!(cpu.registers.eax(), 42);
+    }
+
+    #[test]
+    fn mov_cr4_round_trips() {
+        // 0F 22 E0 = MOV CR4, EAX (reg=4, rm=EAX); 0F 20 E3 = MOV EBX, CR4 (reg=4, rm=EBX).
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x22, 0xe0, 0x0f, 0x20, 0xe3], 0x20);
+        cpu.registers.set_eax(CR4_TSD);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.control.cr4, CR4_TSD);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.ebx(), CR4_TSD);
+    }
+
+    #[test]
+    fn cpuid_leaf1_reports_tsc_and_msr() {
+        let edx = run_cpuid(1).registers.edx();
+        assert_ne!(edx & (1 << 4), 0, "TSC feature bit should be set");
+        assert_ne!(edx & (1 << 5), 0, "MSR feature bit should be set");
+    }
+
+    #[test]
+    fn rdtsc_is_undefined_opcode_below_586() {
+        // RDTSC is a 586 addition: #UD at the throttled 486 level, fine at 586.
+        let code = [0x0f, 0x31];
+        assert!(matches!(
+            run_at_level(&code, CpuLevel::I486).unwrap_err(),
+            InternalFault::Exception { vector: 6, .. }
+        ));
+        assert!(run_at_level(&code, CpuLevel::I586).is_ok());
     }
 
     /// Run a single instruction from `code` at the given level and return the result.
