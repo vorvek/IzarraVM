@@ -1894,6 +1894,9 @@ impl Machine {
         let _ = self
             .memory
             .write_u16(0x450, ((row as u16) << 8) | col as u16);
+        // Track the visible hardware cursor (CRTC 0E/0Fh) with the BDA cursor, the
+        // way the BIOS teletype does, so it sits where the next char lands.
+        self.video.set_cursor_offset((row * 80 + col) as u16);
     }
 
     /// Scroll the 80x25 text screen up one line, clearing the bottom row to
