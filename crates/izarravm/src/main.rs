@@ -59,6 +59,8 @@ struct Cli {
     #[arg(long)]
     headless_izarra_bios: bool,
     #[arg(long)]
+    headless_toka: bool,
+    #[arg(long)]
     headless_boot_floppy: Option<PathBuf>,
     #[arg(long)]
     headless_run: Option<PathBuf>,
@@ -89,7 +91,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     // ~/.izarravm/c_drive and lay down Toka-DOS if it is missing.
     if cli.c_drive.is_none() && cli.dosroot.is_none() && config.dos.c_drive == Path::new(".") {
         let c_root = izarravm_dos::resolve_c_root();
-        izarravm_dos::ensure_toka_dos(&c_root);
+        let files = izarravm_firmware::toka_dos_system_files();
+        izarravm_dos::toka_dos_install(
+            &c_root,
+            &files,
+            izarravm_dos::InstallMode::EnsureIfMissing,
+        )?;
         config.dos.c_drive = c_root;
     }
     let hardware = HardwareProfile::from_config(&config)?;
@@ -140,6 +147,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     if cli.headless_izarra_bios {
         return run_izarra_bios(&hardware);
+    }
+
+    if cli.headless_toka {
+        return run_headless_toka(&hardware, &dos, cli.stdin_text.as_deref());
     }
 
     if let Some(path) = &cli.headless_boot_floppy {
@@ -313,6 +324,45 @@ fn run_izarra_bios(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Boot the Izarra 3000 BIOS into Toka-DOS, type an optional script at the
+/// ICOMMAND prompt, and print the VGA text screen. With no floppy mounted the
+/// BIOS falls through to the hard-disk boot, which brings up Toka-DOS from C:.
+fn run_headless_toka(
+    hardware: &HardwareProfile,
+    dos: &DosKernelServices,
+    stdin_text: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let mut machine = Machine::new(
+        MachineProfile::from_hardware_profile(hardware),
+        izarravm_firmware::izarra_bios(),
+    )?;
+    machine.mount_c_drive(dos.c_drive.clone());
+    machine.set_toka_c_root(dos.c_drive.root().to_path_buf());
+
+    // Boot through POST and into the ICOMMAND prompt. POST is fast (fast_post),
+    // so roughly a second of cycles is ample to reach the prompt.
+    machine.run_until_halt_or_cycles(hardware.clock_hz)?;
+
+    // Feed the script one line at a time. The BDA keyboard ring holds only 15
+    // entries, so typing a whole multi-line script at once would overflow it;
+    // typing a line and letting ICOMMAND consume it keeps the ring drained.
+    if let Some(text) = stdin_text {
+        let line_budget = hardware.clock_hz / 2;
+        for raw in text.split('\n') {
+            let line = raw.trim_end_matches('\r');
+            for ch in line.chars().chain(std::iter::once('\r')) {
+                for code in ascii_to_set1(ch) {
+                    machine.inject_key_scancodes(&[code]);
+                }
+            }
+            machine.run_until_halt_or_cycles(line_budget)?;
+        }
+    }
+
+    println!("{}", machine.screen_text().as_text());
+    Ok(())
+}
+
 /// Mount a floppy IMG, run the Izarra BIOS so INT 19h bootstraps it, and print
 /// CS:IP plus a short trace of low memory. A human reads the trace to confirm the
 /// boot sector executed: CS:IP leaving the BIOS region (CS far below 0xF000) and
@@ -431,48 +481,87 @@ fn print_video_summary(machine: &mut Machine) {
 
 /// Minimal ASCII to Set 1 make+break for the demo (lowercase letters, digits,
 /// space). Extend if the demo needs more than typing words.
+/// US-layout Set 1 make codes for the 26 letters, indexed a..=z.
+const LETTER_MAKE: [u8; 26] = [
+    0x1e, 0x30, 0x2e, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17, 0x24, 0x25, 0x26, 0x32, 0x31, 0x18, 0x19,
+    0x10, 0x13, 0x1f, 0x14, 0x16, 0x2f, 0x11, 0x2d, 0x15, 0x2c,
+];
+
+/// Map an ASCII character to its US-layout Set 1 make code and whether Shift is
+/// held to produce it. Returns None for characters with no single-key mapping.
+fn ascii_key(ch: char) -> Option<(u8, bool)> {
+    let plain = |make: u8| Some((make, false));
+    let shifted = |make: u8| Some((make, true));
+    match ch {
+        'a'..='z' => plain(LETTER_MAKE[ch as usize - 'a' as usize]),
+        'A'..='Z' => shifted(LETTER_MAKE[ch as usize - 'A' as usize]),
+        ' ' => plain(0x39),
+        '\r' | '\n' => plain(0x1c),
+        '\t' => plain(0x0f),
+        '\x08' => plain(0x0e),
+        '\x1b' => plain(0x01),
+        '1' => plain(0x02),
+        '2' => plain(0x03),
+        '3' => plain(0x04),
+        '4' => plain(0x05),
+        '5' => plain(0x06),
+        '6' => plain(0x07),
+        '7' => plain(0x08),
+        '8' => plain(0x09),
+        '9' => plain(0x0a),
+        '0' => plain(0x0b),
+        '!' => shifted(0x02),
+        '@' => shifted(0x03),
+        '#' => shifted(0x04),
+        '$' => shifted(0x05),
+        '%' => shifted(0x06),
+        '^' => shifted(0x07),
+        '&' => shifted(0x08),
+        '*' => shifted(0x09),
+        '(' => shifted(0x0a),
+        ')' => shifted(0x0b),
+        '-' => plain(0x0c),
+        '_' => shifted(0x0c),
+        '=' => plain(0x0d),
+        '+' => shifted(0x0d),
+        '[' => plain(0x1a),
+        '{' => shifted(0x1a),
+        ']' => plain(0x1b),
+        '}' => shifted(0x1b),
+        ';' => plain(0x27),
+        ':' => shifted(0x27),
+        '\'' => plain(0x28),
+        '"' => shifted(0x28),
+        '`' => plain(0x29),
+        '~' => shifted(0x29),
+        '\\' => plain(0x2b),
+        '|' => shifted(0x2b),
+        ',' => plain(0x33),
+        '<' => shifted(0x33),
+        '.' => plain(0x34),
+        '>' => shifted(0x34),
+        '/' => plain(0x35),
+        '?' => shifted(0x35),
+        _ => None,
+    }
+}
+
+/// Build the Set 1 scancode sequence for typing a character: the make and break
+/// of the key, wrapped in left-Shift make/break when the glyph needs Shift.
 fn ascii_to_set1(ch: char) -> Vec<u8> {
-    let make = match ch {
-        'a' => 0x1e,
-        'b' => 0x30,
-        'c' => 0x2e,
-        'd' => 0x20,
-        'e' => 0x12,
-        'f' => 0x21,
-        'g' => 0x22,
-        'h' => 0x23,
-        'i' => 0x17,
-        'j' => 0x24,
-        'k' => 0x25,
-        'l' => 0x26,
-        'm' => 0x32,
-        'n' => 0x31,
-        'o' => 0x18,
-        'p' => 0x19,
-        'q' => 0x10,
-        'r' => 0x13,
-        's' => 0x1f,
-        't' => 0x14,
-        'u' => 0x16,
-        'v' => 0x2f,
-        'w' => 0x11,
-        'x' => 0x2d,
-        'y' => 0x15,
-        'z' => 0x2c,
-        ' ' => 0x39,
-        '1' => 0x02,
-        '2' => 0x03,
-        '3' => 0x04,
-        '4' => 0x05,
-        '5' => 0x06,
-        '6' => 0x07,
-        '7' => 0x08,
-        '8' => 0x09,
-        '9' => 0x0a,
-        '0' => 0x0b,
-        _ => return Vec::new(),
+    let Some((make, shift)) = ascii_key(ch) else {
+        return Vec::new();
     };
-    vec![make, make | 0x80]
+    let mut codes = Vec::with_capacity(4);
+    if shift {
+        codes.push(0x2a); // left Shift make
+    }
+    codes.push(make);
+    codes.push(make | 0x80); // key break
+    if shift {
+        codes.push(0xaa); // left Shift break
+    }
+    codes
 }
 
 fn load_config(cli: &Cli) -> Result<AppConfig, Box<dyn Error>> {
@@ -527,6 +616,13 @@ mod tests {
     #[test]
     fn ascii_to_set1_maps_a_letter_to_make_and_break() {
         assert_eq!(ascii_to_set1('h'), vec![0x23, 0xa3]);
-        assert!(ascii_to_set1('!').is_empty());
+        // Uppercase wraps the key in left-Shift make/break.
+        assert_eq!(ascii_to_set1('H'), vec![0x2a, 0x23, 0xa3, 0xaa]);
+        // Enter is the unshifted return key.
+        assert_eq!(ascii_to_set1('\r'), vec![0x1c, 0x9c]);
+        // A shifted number-row glyph holds Shift over the digit key.
+        assert_eq!(ascii_to_set1('!'), vec![0x2a, 0x02, 0x82, 0xaa]);
+        // Characters with no US-layout key produce nothing.
+        assert!(ascii_to_set1('\u{00f1}').is_empty());
     }
 }

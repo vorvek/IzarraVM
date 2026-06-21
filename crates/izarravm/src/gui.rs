@@ -431,6 +431,9 @@ fn emulate(
         Ok(drive) => machine.mount_c_drive(drive),
         Err(err) => error!(%err, "failed to mount C: drive"),
     }
+    // Let the BIOS boot Toka-DOS from this drive and the setup-menu Repair and
+    // Format options act on it.
+    machine.set_toka_c_root(c_drive.clone());
     // Bring the RTC online: load cmos.bin (or write defaults) and seed the clock
     // from the host time read on the main thread at startup.
     rtc_setup.apply(&mut machine);
