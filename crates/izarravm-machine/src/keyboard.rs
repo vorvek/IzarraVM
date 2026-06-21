@@ -313,12 +313,23 @@ impl Keyboard8042 {
         armed
     }
 
-    /// State of the A20 gate driven by the controller output port (bit 1). The
-    /// address-mask wiring that consults this lives outside the controller.
-    // ponytail: no caller yet; the lib.rs address mask is a separate task.
-    #[allow(dead_code)]
+    /// State of the A20 gate driven by the controller output port (bit 1). Port
+    /// 0x92 (fast A20) and INT 15h AH=24h read this so every A20 method agrees.
     pub fn a20_enabled(&self) -> bool {
         self.output_port & 0x02 != 0
+    }
+
+    /// Drive the A20 gate from outside the keyboard path (the fast-A20 port 0x92
+    /// and the INT 15h AH=24h BIOS service), keeping output-port bit 1 the single
+    /// source of truth. The other output-port bits (reset line, etc.) are left
+    /// alone. The flat address space is not actually masked; this tracks state so
+    /// the reported A20 status stays coherent across all three methods.
+    pub fn set_a20(&mut self, enabled: bool) {
+        if enabled {
+            self.output_port |= 0x02;
+        } else {
+            self.output_port &= !0x02;
+        }
     }
 
     pub fn read_port(&mut self, port: u16) -> Option<u8> {
