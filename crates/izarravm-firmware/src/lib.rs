@@ -397,37 +397,40 @@ mod tests {
 
     #[test]
     fn izarra_bios_int16_dispatch_has_enhanced_aliases() {
-        // The INT 16h dispatch aliases the enhanced functions onto the base ones
-        // (AH=10h->00h, 11h->01h, 12h->02h), adds the AH=05h buffer write, then the
-        // AH=03h/09h/0Ah trio (set typematic, get functionality, get keyboard id).
-        // Each arm is a `cmp ah, imm8` (opcode 80 FC). The base/alias/05h arms reach
-        // their targets with a short `je rel8` (74); the 03h/09h/0Ah handlers sit
-        // past all that code, so NASM emits the near `je rel16` form (0F 84). Assert
-        // the whole chain appears in order, ending in the bare iret fall-through.
-        // Runtime coverage of this handler is infeasible without booting the full ROM
-        // into a guest stub (the DOS-program test harness installs a different
-        // keyboard ROM, kbd-bios-core.inc), so this asserts the assembled bytes.
+        // The INT 16h dispatch routes each function to its own handler: AH=00h/10h
+        // (legacy/enhanced read), 01h/11h (legacy/enhanced peek), 02h/12h (legacy
+        // flags / extended shift status), 05h buffer write, then 03h/09h/0Ah (set
+        // typematic, get functionality, get keyboard id). Each arm is a `cmp ah,
+        // imm8` (opcode 80 FC). Only AH=00h/10h reach their nearby read handlers
+        // with a short `je rel8` (74); every later handler sits past the grown
+        // read/peek/flags code, so NASM emits the near `je rel16` form (0F 84).
+        // Assert the whole chain appears in order, ending in the bare iret
+        // fall-through. Runtime coverage of this handler is infeasible without
+        // booting the full ROM into a guest stub (the DOS-program test harness
+        // installs a different keyboard ROM, kbd-bios-core.inc), so this asserts
+        // the assembled bytes. Re-derive the displacements from the rebuilt .bin
+        // (read the bytes at the dispatch site) whenever a handler is added.
         let dispatch: &[u8] = &[
             0x80, 0xfc, 0x00, // cmp ah, 0x00 (read)
-            0x74, 0x34, //       je .read
-            0x80, 0xfc, 0x10, // cmp ah, 0x10 (enhanced read -> .read)
-            0x74, 0x2f, //       je .read
+            0x74, 0x3e, //       je .read
+            0x80, 0xfc, 0x10, // cmp ah, 0x10 (enhanced read)
+            0x74, 0x6e, //       je .read16
             0x80, 0xfc, 0x01, // cmp ah, 0x01 (peek)
-            0x74, 0x59, //       je .peek
-            0x80, 0xfc, 0x11, // cmp ah, 0x11 (enhanced peek -> .peek)
-            0x74, 0x54, //       je .peek
+            0x0f, 0x84, 0x96, 0x00, // je .peek
+            0x80, 0xfc, 0x11, // cmp ah, 0x11 (enhanced peek)
+            0x0f, 0x84, 0xad, 0x00, // je .peek16
             0x80, 0xfc, 0x02, // cmp ah, 0x02 (flags)
-            0x74, 0x67, //       je .flags
-            0x80, 0xfc, 0x12, // cmp ah, 0x12 (enhanced shift status -> .flags)
-            0x74, 0x62, //       je .flags
+            0x0f, 0x84, 0xbe, 0x00, // je .flags
+            0x80, 0xfc, 0x12, // cmp ah, 0x12 (extended shift status)
+            0x0f, 0x84, 0xc4, 0x00, // je .flags12
             0x80, 0xfc, 0x05, // cmp ah, 0x05 (buffer write)
-            0x74, 0x6a, //       je .bufwrite
-            0x80, 0xfc, 0x03, //       cmp ah, 0x03 (set typematic rate and delay)
-            0x0f, 0x84, 0x91, 0x00, // je .typematic
-            0x80, 0xfc, 0x09, //       cmp ah, 0x09 (get keyboard functionality)
-            0x0f, 0x84, 0xd0, 0x00, // je .funcs
-            0x80, 0xfc, 0x0a, //       cmp ah, 0x0a (get keyboard id)
-            0x0f, 0x84, 0xce, 0x00, // je .kbid
+            0x0f, 0x84, 0xcc, 0x00, // je .bufwrite
+            0x80, 0xfc, 0x03, // cmp ah, 0x03 (set typematic rate and delay)
+            0x0f, 0x84, 0xf3, 0x00, // je .typematic
+            0x80, 0xfc, 0x09, // cmp ah, 0x09 (get keyboard functionality)
+            0x0f, 0x84, 0x32, 0x01, // je .funcs
+            0x80, 0xfc, 0x0a, // cmp ah, 0x0a (get keyboard id)
+            0x0f, 0x84, 0x30, 0x01, // je .kbid
             0xcf, //             iret (unhandled fall-through)
         ];
         assert!(
@@ -436,6 +439,49 @@ mod tests {
                 .any(|window| window == dispatch),
             "INT 16h enhanced-function dispatch not found in the Izarra BIOS ROM"
         );
+    }
+
+    #[test]
+    fn izarra_bios_int16_enhanced_handlers_have_distinct_behavior() {
+        // The enhanced functions are real handlers, not aliases. Three assembled
+        // signatures prove it, and they must appear in both keyboard ROMs (the
+        // izbios-kbd.inc core in the full BIOS and the byte-for-byte kbd-bios-core.inc
+        // the resident DOS ROM uses), so this checks each ROM for all three.
+        //
+        // 1. AH=12h extended shift status reads BOTH flag bytes: push ds; mov bx,40h;
+        //    mov ds,bx; mov al,[17h] (KB_FLAGS); mov ah,[18h] (KB_FLAGS_1); pop ds.
+        //    The legacy AH=02h handler instead clears AH (xor ah,ah), so a sequence
+        //    that loads AH from 0x18 can only be the AH=12h path.
+        let flags12: &[u8] = &[
+            0x1e, // push ds
+            0xbb, 0x40, 0x00, // mov bx, 0x0040
+            0x8e, 0xdb, // mov ds, bx
+            0xa0, 0x17, 0x00, // mov al, [0x0017]  (KB_FLAGS -> AL)
+            0x8a, 0x26, 0x18, 0x00, // mov ah, [0x0018]  (KB_FLAGS_1 -> AH)
+            0x1f, // pop ds
+        ];
+        // 2. Legacy read collapses the 0xE0 gray-key marker to AL=0 before iret:
+        //    cmp al,0xe0; jne +2; xor al,al; iret.
+        let read_collapse: &[u8] = &[0x3c, 0xe0, 0x75, 0x02, 0x30, 0xc0, 0xcf];
+        // 3. Legacy peek collapses it the same way but returns CF clear: ...; clc; iret.
+        let peek_collapse: &[u8] = &[0x3c, 0xe0, 0x75, 0x02, 0x30, 0xc0, 0xf8, 0xcf];
+
+        let roms: [(&str, &[u8]); 2] = [
+            ("izarra-bios.bin", IZARRA_BIOS),
+            ("kbd-resident.bin", super::KBD_RESIDENT_BIOS),
+        ];
+        for (name, rom) in roms {
+            for (label, sig) in [
+                ("AH=12h two-byte flags read", flags12),
+                ("legacy read 0xE0 collapse", read_collapse),
+                ("legacy peek 0xE0 collapse", peek_collapse),
+            ] {
+                assert!(
+                    rom.windows(sig.len()).any(|window| window == sig),
+                    "{name} is missing the {label} sequence"
+                );
+            }
+        }
     }
 
     #[test]

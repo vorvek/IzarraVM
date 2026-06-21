@@ -71,6 +71,18 @@ int09:
     ja .enqueue
     and al, 0x1f
 .enqueue:
+    ; Mark a 101/102-key extended key that carries no normal ASCII (BH is the E0
+    ; prefix flag, AL=0 means the layout gave nothing): store AL=0xE0 as the MF-II
+    ; gray-key marker. INT 16h AH=00h/01h collapse this marker back to AL=0 so
+    ; legacy callers see "extended, no ASCII"; AH=10h/11h leave it so an enhanced
+    ; caller can tell the gray cursor pad from the numeric pad. Gray keys that do
+    ; carry ASCII (gray Enter, gray '/') keep their real AL and read alike on both.
+    test bh, bh
+    jz .enqueue_store
+    test al, al
+    jnz .enqueue_store
+    mov al, 0xe0
+.enqueue_store:
     mov ah, bl                     ; scancode in AH, ASCII in AL
     call kb_enqueue
     pop si
@@ -90,15 +102,27 @@ int09:
     mov ax, 0x0040
     mov ds, ax
     or byte [KB_FLAGS], 0x04
+    ; Track left vs right Ctrl in KB_FLAGS_1 (BH is the E0 prefix flag): bit 2 is
+    ; right Ctrl, bit 0 is left Ctrl. INT 16h AH=12h returns this byte as AH.
+    test bh, bh
+    jz .set_lctrl
+    or byte [KB_FLAGS_1], 0x04
+    jmp .eoi
+.set_lctrl:
+    or byte [KB_FLAGS_1], 0x01
     jmp .eoi
 .set_altgr:
+    mov ax, 0x0040
+    mov ds, ax
     test bh, bh
     jz .set_alt
     mov byte [KB_ALTGR], 1
     or byte [KB_FLAGS], 0x08
+    or byte [KB_FLAGS_1], 0x08      ; right Alt -> AH=12h bit 3
     jmp .eoi
 .set_alt:
     or byte [KB_FLAGS], 0x08
+    or byte [KB_FLAGS_1], 0x02      ; left Alt -> AH=12h bit 1
     jmp .eoi
 .make_caps:
     mov ax, 0x0040
@@ -167,6 +191,13 @@ int09:
     mov ax, 0x0040
     mov ds, ax
     and byte [KB_FLAGS], 0xfb
+    ; Clear the matching left/right Ctrl bit in KB_FLAGS_1 (BH is the E0 prefix).
+    test bh, bh
+    jz .clr_lctrl
+    and byte [KB_FLAGS_1], 0xfb     ; clear right Ctrl (bit 2)
+    jmp .eoi
+.clr_lctrl:
+    and byte [KB_FLAGS_1], 0xfe     ; clear left Ctrl (bit 0)
     jmp .eoi
 .clr_rshift:
     mov ax, 0x0040
@@ -174,13 +205,17 @@ int09:
     and byte [KB_FLAGS], 0xfe
     jmp .eoi
 .clr_altgr:
+    mov ax, 0x0040
+    mov ds, ax
     test bh, bh
     jz .clr_alt
     mov byte [KB_ALTGR], 0
     and byte [KB_FLAGS], 0xf7
+    and byte [KB_FLAGS_1], 0xf7     ; clear right Alt (bit 3)
     jmp .eoi
 .clr_alt:
     and byte [KB_FLAGS], 0xf7
+    and byte [KB_FLAGS_1], 0xfd     ; clear left Alt (bit 1)
     jmp .eoi
 .clr_caps_held:
     mov ax, 0x0040
@@ -213,16 +248,16 @@ int09:
 int16:
     cmp ah, 0x00
     je .read
-    cmp ah, 0x10        ; enhanced read -> same as AH=00h
-    je .read
+    cmp ah, 0x10        ; enhanced read keystroke (101/102-key)
+    je .read16
     cmp ah, 0x01
     je .peek
-    cmp ah, 0x11        ; enhanced peek -> same as AH=01h
-    je .peek
+    cmp ah, 0x11        ; enhanced peek keystroke
+    je .peek16
     cmp ah, 0x02
     je .flags
-    cmp ah, 0x12        ; enhanced shift status -> same as AH=02h
-    je .flags
+    cmp ah, 0x12        ; extended shift status
+    je .flags12
     cmp ah, 0x05        ; keyboard buffer write
     je .bufwrite
     cmp ah, 0x03        ; set typematic rate and delay
@@ -254,6 +289,40 @@ int16:
 .read_store:
     mov [KB_BUF_HEAD], bx
     pop ds
+    ; Legacy read collapses the MF-II gray-key marker: a key the ISR tagged with
+    ; AL=0xE0 (extended key, no normal ASCII) reads back as AL=0 here, so a 1981
+    ; program sees the scancode in AH and an empty ASCII byte. Enhanced AH=10h
+    ; below keeps the 0xE0 so a 101/102-key-aware program can tell them apart.
+    cmp al, 0xe0
+    jne .read_done
+    xor al, al
+.read_done:
+    iret
+.read16:
+    ; Enhanced read (AH=10h): same ring as AH=00h but never collapses the gray-key
+    ; marker, so extended cursor-pad keys keep their full scancode in AH and the
+    ; 0xE0 marker in AL.
+    sti
+.read16_wait:
+    push ds
+    mov bx, 0x0040
+    mov ds, bx
+    mov bx, [KB_BUF_HEAD]
+    cmp bx, [KB_BUF_TAIL]
+    pop ds
+    je .read16_wait
+    push ds
+    mov cx, 0x0040
+    mov ds, cx
+    mov bx, [KB_BUF_HEAD]
+    mov ax, [bx]
+    add bx, 2
+    cmp bx, KB_BUF_START + 32
+    jb .read16_store
+    mov bx, KB_BUF_START
+.read16_store:
+    mov [KB_BUF_HEAD], bx
+    pop ds
     iret
 .peek:
     push ds
@@ -264,9 +333,30 @@ int16:
     je .peek_empty
     mov ax, [bx]
     pop ds
+    ; Legacy peek collapses the gray-key marker the same way the legacy read does.
+    cmp al, 0xe0
+    jne .peek_done
+    xor al, al
+.peek_done:
     clc
     iret
 .peek_empty:
+    pop ds
+    stc
+    iret
+.peek16:
+    ; Enhanced peek (AH=11h): leaves the key in the ring and keeps the 0xE0 marker.
+    push ds
+    mov bx, 0x0040
+    mov ds, bx
+    mov bx, [KB_BUF_HEAD]
+    cmp bx, [KB_BUF_TAIL]
+    je .peek16_empty
+    mov ax, [bx]
+    pop ds
+    clc
+    iret
+.peek16_empty:
     pop ds
     stc
     iret
@@ -277,6 +367,18 @@ int16:
     mov al, [KB_FLAGS]
     pop ds
     xor ah, ah
+    iret
+.flags12:
+    ; AH=12h extended shift status. AL = the standard shift flags (KB_FLAGS, the
+    ; same byte AH=02h returns). AH = the second shift-flags byte (KB_FLAGS_1):
+    ; bit 0 left Ctrl, bit 1 left Alt, bit 2 right Ctrl, bit 3 right Alt, plus the
+    ; lock-pressed bits the ISR keeps in bits 4-7. Returns AX.
+    push ds
+    mov bx, 0x0040
+    mov ds, bx
+    mov al, [KB_FLAGS]
+    mov ah, [KB_FLAGS_1]
+    pop ds
     iret
 .bufwrite:
     push ds
