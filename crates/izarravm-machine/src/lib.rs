@@ -3738,6 +3738,31 @@ mod tests {
         assert_eq!(int16_read_after(&[0x1d, 0x1f, 0x9f, 0x9d]), 0x1f13);
     }
 
+    /// Same path as `int16_read_after`, but the program reads with AH=10h (the
+    /// enhanced read). Before the DOS keyboard ROM aliased AH=10h to the AH=00h
+    /// reader, this fell through the int16 dispatch and returned stale AX.
+    fn int16_enhanced_read_after(scancodes: &[u8]) -> u16 {
+        // mov ah,0x10; int 16h; mov [0x200],ax; int 20h
+        const PROG: [u8; 9] = [0xB4, 0x10, 0xCD, 0x16, 0xA3, 0x00, 0x02, 0xCD, 0x20];
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
+                .unwrap();
+        machine.inject_key_scancodes(scancodes);
+        machine.run_until_halt_or_cycles(3_000_000).unwrap();
+        read_u16(&mut machine, (u32::from(DOS_LOAD_SEGMENT) << 4) + 0x200)
+    }
+
+    #[test]
+    fn int16_enhanced_read_matches_plain_read() {
+        // AH=10h must hand a DOS program the same ring entry AH=00h does. Up
+        // arrow gives scancode 0x48 / ASCII 0, the editor-navigation case.
+        assert_eq!(int16_enhanced_read_after(&[0x48, 0xC8]), 0x4800);
+        assert_eq!(
+            int16_enhanced_read_after(&[0x48, 0xC8]),
+            int16_read_after(&[0x48, 0xC8]),
+        );
+    }
+
     #[test]
     fn io_port_reports_last_post_write() {
         // mov al,0x42; out 0x80,al; hlt
