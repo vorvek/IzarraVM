@@ -1472,11 +1472,17 @@ impl Machine {
                 self.set_ax(0xFFFF); // driver installed
                 self.set_bx(0x0002); // two-button mouse
             }
-            // AX=0001: show cursor (increment the visibility counter).
+            // AX=0001: show cursor. The visibility counter counts up toward 0 and
+            // saturates there, never going positive. From the reset value of -1 a single
+            // Show reaches the visible state (0); the saturation keeps extra Shows from
+            // banking credit, so N hides require exactly N shows to undo (RBIL INT 33h
+            // AX=0002 note). `.min(0)` is the high-end cap, not a clamp to a maximum of 0
+            // from below.
             0x0001 => {
                 self.mouse.show_count = (self.mouse.show_count + 1).min(0);
             }
-            // AX=0002: hide cursor (decrement the visibility counter).
+            // AX=0002: hide cursor. Decrement without a lower bound, so successive hides
+            // stack and each needs a matching show to reverse.
             0x0002 => {
                 self.mouse.show_count -= 1;
             }
@@ -4031,6 +4037,39 @@ mod tests {
         assert_eq!(days_since_1980(1980, 1, 1), 0);
         assert_eq!(days_since_1980(1980, 3, 1), 60); // 1980 is a leap year (31+29)
         assert_eq!(days_since_1980(1981, 1, 1), 366);
+    }
+
+    #[test]
+    fn int33_show_hide_cursor_counter_follows_microsoft_contract() {
+        let mut m = int15_machine(16);
+        // AX=0000 reset: the visibility counter starts hidden at -1.
+        m.cpu.registers.set_eax(0x0000);
+        m.handle_int33();
+        assert_eq!(m.mouse.show_count, -1);
+        // One Show (AX=0001) reaches the visible state (0).
+        m.cpu.registers.set_eax(0x0001);
+        m.handle_int33();
+        assert_eq!(m.mouse.show_count, 0);
+        // A second Show saturates at 0 rather than going positive.
+        m.cpu.registers.set_eax(0x0001);
+        m.handle_int33();
+        assert_eq!(m.mouse.show_count, 0);
+        // RBIL: N hides require N shows to unhide. Three hides take it to -3.
+        for _ in 0..3 {
+            m.cpu.registers.set_eax(0x0002);
+            m.handle_int33();
+        }
+        assert_eq!(m.mouse.show_count, -3);
+        // Two shows are not enough; the cursor stays hidden (< 0).
+        for _ in 0..2 {
+            m.cpu.registers.set_eax(0x0001);
+            m.handle_int33();
+        }
+        assert!(m.mouse.show_count < 0);
+        // The third show finally restores the visible state.
+        m.cpu.registers.set_eax(0x0001);
+        m.handle_int33();
+        assert_eq!(m.mouse.show_count, 0);
     }
 
     #[test]
