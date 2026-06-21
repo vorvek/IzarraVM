@@ -7983,6 +7983,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn toka_runs_a_system_tool_and_an_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = izarravm_firmware::toka_dos_system_files();
+        izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format)
+            .unwrap();
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .unwrap();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        machine.set_toka_c_root(dir.path().to_path_buf());
+        machine.run_until_halt_or_cycles(22_000_000).unwrap();
+
+        let type_line = |machine: &mut Machine, text: &str| {
+            for ch in text.chars() {
+                for code in toka_key_codes(ch) {
+                    machine.inject_key_scancodes(&[code]);
+                }
+                machine.run_until_halt_or_cycles(400_000).unwrap();
+            }
+            for code in toka_key_codes('\r') {
+                machine.inject_key_scancodes(&[code]);
+            }
+            machine.run_until_halt_or_cycles(4_000_000).unwrap();
+        };
+
+        // BASIC is the install-time alias for IBASIC, so running it proves both
+        // the alias file and the EXEC path for a P3 tool.
+        type_line(&mut machine, "BASIC");
+        let text = machine.screen_text().as_text();
+        assert!(
+            text.contains("Izarra BASIC"),
+            "the BASIC alias ran IBASIC; got:\n{text}"
+        );
+    }
+
     // --- Izarra 3000 BIOS foundation ---------------------------------------
 
     #[test]

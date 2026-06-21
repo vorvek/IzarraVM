@@ -34,7 +34,12 @@ const BOOT_RECORD: &str = "TOKABOOT.BIN";
 
 /// Duplicate-name aliases: (canonical, alias). Emitted only when the canonical
 /// file is present in the build.
-const ALIASES: &[(&str, &str)] = &[("ICOMMAND.COM", "COMMAND.COM")];
+const ALIASES: &[(&str, &str)] = &[
+    ("ICOMMAND.COM", "COMMAND.COM"),
+    ("ICDEX.COM", "MSCDEX.COM"),
+    ("IBASIC.COM", "BASIC.COM"),
+    ("EDITOR.COM", "EDIT.COM"),
+];
 
 struct PackFile {
     name: String,
