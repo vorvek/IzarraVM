@@ -859,18 +859,18 @@ impl Vga {
     /// 16-color and text paths the attribute palette is 6 bits wide; the Color
     /// Select supplies the top DAC bits (FreeVGA attrreg.htm 10h/14h):
     ///
-    /// - AC Mode Control (10h) bit 7 clear: the 6-bit palette value is bits 5-0,
-    ///   Color Select bits 1-0 -> DAC bits 7-6, Color Select bits 3-2 -> DAC
-    ///   bits 5-4. (The 8-bit-DAC-index assembly the BIOS uses for palette banks.)
-    /// - AC Mode Control (10h) bit 7 set: the palette value's bits 5-4 are
-    ///   replaced by Color Select bits 1-0, and Color Select bits 3-2 supply DAC
-    ///   bits 7-6. This is the "P5/P4 from C0/C1" page-select mode.
+    /// DAC index bits 7-6 always come from Color Select (14h) bits 3-2. Bits 3-0 always
+    /// come from the palette register. Bits 5-4 depend on AC Mode Control (10h) bit 7:
+    /// - bit 7 clear: DAC bits 5-4 are the palette register's own bits 5-4 (the full 6-bit
+    ///   palette value passes through), with Color Select 3-2 supplying bits 7-6.
+    /// - bit 7 set: the palette value's bits 5-4 are replaced by Color Select bits 1-0
+    ///   (the "P5/P4 from C0/C1" page-select mode), with Color Select 3-2 still bits 7-6.
     ///
     /// The pel mask (3C6) gates the final index in both cases.
     fn dac_index(&self, palette_6bit: u8) -> u8 {
         let cs = self.attr.color_select;
         let index = if self.attr.mode_control & 0x80 == 0 {
-            (palette_6bit & 0x3F) | ((cs & 0x03) << 6) | ((cs & 0x0C) << 2)
+            (palette_6bit & 0x3F) | ((cs & 0x0C) << 4)
         } else {
             (palette_6bit & 0x0F) | ((cs & 0x03) << 4) | ((cs & 0x0C) << 4)
         };
@@ -4191,8 +4191,8 @@ mod tests {
 
     #[test]
     fn color_select_folds_into_the_dac_index_when_bit7_clear() {
-        // AC Mode Control 10h bit 7 clear: the 6-bit palette value is DAC bits
-        // 5-0, Color Select 14h bits 1-0 -> DAC bits 7-6, bits 3-2 -> DAC bits 5-4.
+        // AC Mode Control 10h bit 7 clear: the full 6-bit palette value is DAC bits 5-0,
+        // and Color Select 14h bits 3-2 supply DAC bits 7-6.
         let mut vga = Vga::default();
         vga.set_mode_0dh();
         for b in vga.vram[0..VGA_PLANE_SIZE].iter_mut() {
@@ -4200,9 +4200,9 @@ mod tests {
         }
         vga.attr.palette[1] = 0x05; // 6-bit palette value 0b00_0101
         vga.attr.mode_control = 0x00; // bit 7 clear
-        vga.attr.color_select = 0x0F; // bits 1-0 = 11 -> DAC 7-6; bits 3-2 = 11 -> DAC 5-4
-        // DAC = 0b11_11_0101 = 0xF5.
-        assert_eq!(vga.render_active_row(0)[0], 0xF5);
+        vga.attr.color_select = 0x0F; // bits 3-2 = 11 -> DAC bits 7-6
+        // DAC = 0b11_00_0101 = 0xC5 (palette bits 5-4 untouched).
+        assert_eq!(vga.render_active_row(0)[0], 0xC5);
         // Color Select 0 leaves the bare 6-bit palette value.
         vga.attr.color_select = 0x00;
         assert_eq!(vga.render_active_row(0)[0], 0x05);
@@ -4232,7 +4232,7 @@ mod tests {
         text_put(&mut vga, 0, 0, 0xDB, 0x01); // solid glyph, fg index 1
         vga.attr.palette[1] = 0x01;
         vga.attr.mode_control = 0x00; // bit 7 clear (and blink off)
-        vga.attr.color_select = 0x03; // bits 1-0 -> DAC 7-6
+        vga.attr.color_select = 0x0C; // bits 3-2 -> DAC 7-6
         // DAC = 0b11_00_0001 = 0xC1.
         assert_eq!(vga.render_text_row(0)[0], 0xC1);
     }
