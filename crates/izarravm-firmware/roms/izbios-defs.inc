@@ -13,6 +13,10 @@
 %define KB_BUF_HEAD    0x001a
 %define KB_BUF_TAIL    0x001c
 %define KB_FLAGS       0x0017
+; Second shift-flags byte (standard AT BIOS slot). The INT 09h ISR uses bits 4-7
+; as the transient "lock key held" guard so a held CapsLock/NumLock/ScrollLock/
+; Insert key toggles KB_FLAGS once per press, not once per auto-repeat.
+%define KB_FLAGS_1     0x0018
 ; Cached active keyboard-layout index (0..5), read once from CMOS 0x10 at boot
 ; and refreshed live when the setup page changes it. Lives in a BDA byte the rest
 ; of this BIOS does not use (0x96 is the AT keyboard status-flags-3 slot), so the
