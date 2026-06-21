@@ -2,9 +2,9 @@
 //!
 //! Built clean-room from the Intel 8254 datasheet cached at
 //! dev_docs/reference/8254/. Channel 0's OUT drives IRQ0. All six counter modes
-//! are modeled at input-CLK granularity. BCD counting is not modeled (the bit is
-//! stored and counting stays binary); the nanosecond AC timing and channel 1/2
-//! OUT consumers are out of scope for this slice.
+//! are modeled at input-CLK granularity. BCD counting decrements in decimal
+//! (reload 0 means 10000). The nanosecond AC timing and channel 1/2 OUT
+//! consumers are out of scope for this slice.
 
 /// One 8254 counter. The counting element `count` decrements on each input CLK;
 /// `reload` is the programmed count (0 means 65536). All six modes are modeled.
@@ -12,7 +12,7 @@
 pub(crate) struct Counter {
     mode: u8, // 0..=5
     rw: RwMode,
-    bcd: bool,   // stored only; counting is always binary (ceiling)
+    bcd: bool,   // when set, the CE counts in BCD (decimal) rather than binary
     count: u32,  // CE, current value (u32 so 65536 fits)
     reload: u16, // CR, programmed count; 0 reads as 65536
     out: bool,   // OUT pin
@@ -63,9 +63,54 @@ impl Default for Counter {
 impl Counter {
     fn effective_reload(&self) -> u32 {
         if self.reload == 0 {
-            65536
+            // 0 means the full range. The same load value (0x10000) serves both
+            // radices: in binary it counts down 65536 clocks to 0; in BCD the first
+            // decrement masks to 0x0000 and wraps to 0x9999, giving a 10000-clock
+            // period. (0x10000 == 65536, so one literal covers both.)
+            0x10000
         } else {
             u32::from(self.reload)
+        }
+    }
+
+    /// Decrement a packed-BCD count by `by` (1 or 2), borrowing per nibble. The
+    /// count is stored as the guest wrote it: four BCD digits, one per nibble
+    /// (0x0100 is decimal 100, not 256). On underflow it wraps to 0x9999, matching
+    /// the chip's four-decade decimal counting element.
+    fn bcd_dec(value: u32, by: u32) -> u32 {
+        let mut result = value & 0xffff;
+        for _ in 0..by {
+            if result == 0 {
+                result = 0x9999;
+                continue;
+            }
+            // Subtract one, propagating a borrow across BCD nibbles.
+            let mut digits = [
+                result & 0xf,
+                (result >> 4) & 0xf,
+                (result >> 8) & 0xf,
+                (result >> 12) & 0xf,
+            ];
+            let mut place = 0;
+            loop {
+                if digits[place] > 0 {
+                    digits[place] -= 1;
+                    break;
+                }
+                digits[place] = 9;
+                place += 1;
+            }
+            result = digits[0] | (digits[1] << 4) | (digits[2] << 8) | (digits[3] << 12);
+        }
+        result
+    }
+
+    /// Decrement the counting element by one step in the active radix.
+    fn dec(&self, value: u32, by: u32) -> u32 {
+        if self.bcd {
+            Self::bcd_dec(value, by)
+        } else {
+            value.wrapping_sub(by)
         }
     }
 
@@ -99,10 +144,19 @@ impl Counter {
 
     fn arm(&mut self) {
         self.null_count = true;
-        self.state = match self.mode {
-            1 | 5 => CounterState::WaitGate,
-            _ => CounterState::LoadDelay,
-        };
+        match self.mode {
+            // Modes 1 and 5 are retriggerable one-shots. A new count written
+            // mid-pulse is staged into `reload` (already done by the caller) and
+            // the live pulse keeps running on the old value; the new reload loads
+            // on the next GATE rising edge. Only arm to WaitGate when not already
+            // counting, so an in-flight pulse is not aborted.
+            1 | 5 => {
+                if self.state != CounterState::Counting {
+                    self.state = CounterState::WaitGate;
+                }
+            }
+            _ => self.state = CounterState::LoadDelay,
+        }
     }
 
     fn write_count(&mut self, value: u8) {
@@ -185,6 +239,7 @@ impl Counter {
 
     fn set_gate(&mut self, level: bool) {
         let rising = !self.gate && level;
+        let falling = self.gate && !level;
         self.gate = level;
         if rising {
             match self.mode {
@@ -201,6 +256,10 @@ impl Counter {
                 2 | 3 => self.state = CounterState::LoadDelay, // reload on next CLK
                 _ => {}
             }
+        } else if falling && matches!(self.mode, 2 | 3) {
+            // GATE low forces OUT high immediately in modes 2 and 3, with no wait
+            // for the next CLK. step_counting keeps a lazy force as a safety net.
+            self.out = true;
         }
     }
 
@@ -229,7 +288,7 @@ impl Counter {
         }
         match self.mode {
             0 | 1 => {
-                self.count = self.count.wrapping_sub(1);
+                self.count = self.dec(self.count, 1);
                 if self.count == 0 && !self.out {
                     self.out = true;
                     if self.mode != 0 {
@@ -240,13 +299,17 @@ impl Counter {
                 false
             }
             2 => {
+                // ponytail: the datasheet forbids a mode-2 count of 1 (count 2 is
+                // the minimum). A count of 1 never holds OUT low for a clock; we
+                // leave that out-of-spec input to reload here rather than special-
+                // case it, matching how real parts treat the illegal value loosely.
                 if self.count <= 1 {
                     self.count = self.effective_reload();
                     let rose = !self.out;
                     self.out = true;
                     rose
                 } else {
-                    self.count -= 1;
+                    self.count = self.dec(self.count, 1);
                     if self.count == 1 {
                         self.out = false;
                     }
@@ -261,7 +324,7 @@ impl Counter {
                 } else {
                     // Decrement by two. Exact for even counts (the PC timer case);
                     // odd-count duty asymmetry is not modeled.
-                    self.count -= 2;
+                    self.count = self.dec(self.count, 2);
                     false
                 }
             }
@@ -271,7 +334,7 @@ impl Counter {
                 // edge that fires IRQ0 is that return to high, so the strobe lands N+1
                 // clocks after the count is loaded.
                 if self.out {
-                    self.count = self.count.wrapping_sub(1);
+                    self.count = self.dec(self.count, 1);
                     if self.count == 0 {
                         self.out = false; // strobe low for one clock
                     }
@@ -307,8 +370,14 @@ impl Pit {
         let sc = (value >> 6) & 0x3;
         if sc == 3 {
             // Read-back command: latch count and/or status for the selected counters.
+            // D5 low (0x20) selects latch-count, D4 low (0x10) selects latch-status.
             let latch_count = value & 0x20 == 0;
             let latch_status = value & 0x10 == 0;
+            // Both bits high means "latch nothing": a reserved/no-op form. Skip the
+            // per-counter loop so it has no effect at all.
+            if !latch_count && !latch_status {
+                return;
+            }
             for (i, counter) in self.counters.iter_mut().enumerate() {
                 if value & (1 << (i + 1)) != 0 {
                     if latch_count {
@@ -492,5 +561,145 @@ mod tests {
         let lo = pit.read_port(0x40).unwrap();
         let hi = pit.read_port(0x40).unwrap();
         assert_eq!(u16::from_le_bytes([lo, hi]), 0x1234);
+    }
+
+    // Slice 1: BCD counting. Control words set bit 0 (BCD).
+    const CW_MODE0_BCD: u8 = CW_MODE0 | 1;
+    const CW_MODE2_BCD: u8 = CW_MODE2 | 1;
+
+    #[test]
+    fn bcd_dec_borrows_across_packed_nibbles() {
+        // Values are packed BCD: 0x0100 is decimal 100, decrementing to 0x0099.
+        assert_eq!(Counter::bcd_dec(0x0100, 1), 0x0099);
+        assert_eq!(Counter::bcd_dec(0x0001, 1), 0x0000);
+        assert_eq!(Counter::bcd_dec(0x0000, 1), 0x9999); // underflow wraps to top
+        assert_eq!(Counter::bcd_dec(0x1000, 1), 0x0999);
+        assert_eq!(Counter::bcd_dec(0x0000, 2), 0x9998); // two-step wrap
+        assert_eq!(Counter::bcd_dec(0x0100, 2), 0x0098);
+    }
+
+    #[test]
+    fn bcd_reload_zero_is_full_decimal_range() {
+        // Reload 0 in BCD loads 0x10000 so the first decrement wraps to 0x9999 and
+        // the period is exactly 10000 input clocks; in binary it is 65536.
+        let mut c = Counter {
+            bcd: true,
+            reload: 0,
+            ..Default::default()
+        };
+        assert_eq!(c.effective_reload(), 0x10000);
+        c.bcd = false;
+        assert_eq!(c.effective_reload(), 65536);
+
+        // The packed-BCD decrement takes 10000 steps from the full-range load to 0.
+        let mut count = 0x10000u32;
+        let mut steps = 0u32;
+        loop {
+            count = Counter::bcd_dec(count, 1);
+            steps += 1;
+            if count == 0 {
+                break;
+            }
+        }
+        assert_eq!(steps, 10000);
+    }
+
+    #[test]
+    fn bcd_mode2_counts_in_decimal() {
+        // Program ch0 mode 2 BCD with count 0x0100 (= 100 decimal). The period in
+        // input clocks must be 100, not 256.
+        let mut pit = Pit::default();
+        program_ch0(&mut pit, CW_MODE2_BCD, 0x0100);
+        pit.tick(1); // load
+        assert_eq!(pit.clocks_until_channel0_irq(), Some(100));
+        assert_eq!(pit.tick(100), 1);
+        assert_eq!(pit.tick(100), 1); // periodic
+    }
+
+    #[test]
+    fn bcd_mode0_one_shot_decimal() {
+        // Mode 0 BCD one-shot: count 0x0050 (= 50 decimal) fires once at clock 50.
+        let mut pit = Pit::default();
+        program_ch0(&mut pit, CW_MODE0_BCD, 0x0050);
+        pit.tick(1); // load
+        assert_eq!(pit.clocks_until_channel0_irq(), Some(50));
+        assert_eq!(pit.tick(50), 1);
+        assert_eq!(pit.tick(1000), 0); // no repeat
+    }
+
+    #[test]
+    fn mode1_new_count_mid_pulse_waits_for_next_gate() {
+        // Slice 2: a longer count written during a live mode-1 pulse must not abort
+        // the pulse. The original count completes; the new count loads on the next
+        // GATE rising edge.
+        let mut pit = Pit::default();
+        program_ch0(&mut pit, CW_MODE1, 4);
+        // Trigger the one-shot with a GATE rising edge, then count partway.
+        pit.set_gate(0, false);
+        pit.set_gate(0, true);
+        assert_eq!(pit.tick(2), 0); // two of four clocks consumed, pulse still live
+
+        // Write a longer count (10) mid-pulse. The live pulse keeps its old count.
+        pit.write_port(0x40, 10);
+        pit.write_port(0x40, 0);
+        assert!(!pit.channel_out(0)); // pulse still low, not aborted
+        assert_eq!(pit.tick(2), 1); // original 4-clock pulse completes here
+        assert!(pit.channel_out(0));
+
+        // The new count only applies after the next GATE rising edge.
+        pit.set_gate(0, false);
+        pit.set_gate(0, true);
+        assert_eq!(pit.tick(9), 0); // nine of the new ten clocks, still low
+        assert_eq!(pit.tick(1), 1); // tenth clock completes the new pulse
+    }
+
+    #[test]
+    fn mode3_gate_falling_forces_out_high_immediately() {
+        // Slice 3: dropping GATE in mode 2/3 forces OUT high at once, no tick.
+        let mut pit = Pit::default();
+        // Use channel 2 so the wiring is exercised on a non-IRQ counter.
+        pit.write_port(0x43, 0xb6); // counter 2, LSB/MSB, mode 3, binary
+        pit.write_port(0x42, 10);
+        pit.write_port(0x42, 0);
+        pit.tick(1); // load
+        // Raise then drop GATE on channel 2.
+        pit.set_gate(2, true);
+        pit.set_gate(2, false);
+        assert!(pit.channel_out(2)); // high immediately, with no intervening tick
+    }
+
+    #[test]
+    fn read_back_latch_nothing_is_a_no_op() {
+        // Slice 4: a read-back with D5=D4=1 latches nothing. A following read must
+        // still return the live count, not a stale latch.
+        let mut pit = Pit::default();
+        program_ch0(&mut pit, CW_MODE3, 100);
+        pit.tick(1); // load: count = 100
+        pit.tick(4); // mode 3 steps by two: 100 -> 92
+        // Read-back, counter 0 selected, but neither count nor status latched.
+        pit.write_port(0x43, 0xf2); // sc=11, D5=1, D4=1, counter-0 bit set
+        pit.tick(4); // keeps counting: 92 -> 84
+        // No latch was taken, so a normal read tracks the live count.
+        pit.write_port(0x43, 0x00); // now latch for real
+        let lo = pit.read_port(0x40).unwrap();
+        let hi = pit.read_port(0x40).unwrap();
+        assert_eq!(u16::from_le_bytes([lo, hi]), 84);
+    }
+
+    #[test]
+    fn read_back_latch_nothing_does_not_latch_status() {
+        // The no-op form must not produce a status byte either: a plain read after
+        // it returns the count, not a latched status.
+        let mut pit = Pit::default();
+        program_ch0(&mut pit, CW_MODE0, 0x1234);
+        pit.tick(1); // load: count = 0x1234
+        pit.tick(1); // first real decrement: 0x1234 -> 0x1233
+        pit.write_port(0x43, 0xf2); // read-back latch-nothing, counter 0
+        pit.write_port(0x43, 0x00); // counter-latch command -> count latched
+        let lo = pit.read_port(0x40).unwrap();
+        let hi = pit.read_port(0x40).unwrap();
+        // The latch-nothing read-back left no status latched, so the read returns
+        // the live count: 0x1234 loaded, decremented once to 0x1233.
+        assert_eq!(u16::from_le_bytes([lo, hi]), 0x1233);
     }
 }
