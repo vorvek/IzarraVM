@@ -382,10 +382,12 @@ impl Arena {
     }
 
     /// AH=31h KEEP PROCESS: trim the program block to `paras` paragraphs and mark
-    /// it resident. The tail above `psp_seg + paras` (and any AH=48h blocks, which
-    /// a TSR is not expected to hold) is released back to the free pool; the
-    /// resident program block stays so a later memory walk still sees it. `paras`
-    /// is clamped so the block never grows past its current top.
+    /// it resident. The resident program block stays so a later memory walk still
+    /// sees it. `paras` is clamped so the block never grows past its current top.
+    // ponytail: also releases any AH=48h blocks, which real DOS would keep. The
+    // common TSR pattern shrinks the PSP block (AH=4Ah) and goes resident without
+    // holding separate AH=48h allocations, so this is a faithful-enough ceiling;
+    // a real MCB chain (Phase 9c) is where per-block residency would live.
     fn keep_resident(&mut self, paras: u16) {
         let want = u32::from(self.psp_seg) + u32::from(paras);
         let new_top = want.min(u32::from(self.prog_top)) as u16;
@@ -1163,18 +1165,20 @@ impl DosKernel {
         };
         let mut buffer = vec![0u8; usize::from(size)];
         let filled = read_at(&mut file, pos, &mut buffer)?;
-        let dta = usize::from(self.dta.0) * 16 + usize::from(self.dta.1);
-        for (i, &byte) in buffer.iter().enumerate() {
-            mem.write_u8(dta + i, byte)?;
-        }
         let al = if filled == 0 {
-            0x01 // at or past EOF, no data
-        } else if filled < usize::from(size) {
-            fcb_advance_record(mem, base, block, current)?;
-            0x03 // a partial final record
+            // At or past EOF: no data, and DOS leaves the DTA untouched.
+            0x01
         } else {
+            let dta = usize::from(self.dta.0) * 16 + usize::from(self.dta.1);
+            for (i, &byte) in buffer.iter().enumerate() {
+                mem.write_u8(dta + i, byte)?;
+            }
             fcb_advance_record(mem, base, block, current)?;
-            0x00 // a full record
+            if filled < usize::from(size) {
+                0x03 // a partial final record
+            } else {
+                0x00 // a full record
+            }
         };
         regs.ax = (regs.ax & 0xff00) | al;
         Ok(DosAction::Continue)
@@ -2643,7 +2647,7 @@ fn build_env_block_with_argv0(entries: &[(&str, &str)], argv0: &str) -> Vec<u8> 
 /// The argv0 path placed in the environment trailer. ponytail: the loader does
 /// not know the guest program's path, so a single plausible default stands in;
 /// in-scope callers read the env strings, not this trailer.
-const DEFAULT_ARGV0: &str = "C:\\PROGRAM.EXE";
+pub const DEFAULT_ARGV0: &str = "C:\\PROGRAM.EXE";
 
 /// Load a .COM image into `mem` at `segment` and build its PSP. Returns the entry
 /// state for the caller to apply to the CPU.

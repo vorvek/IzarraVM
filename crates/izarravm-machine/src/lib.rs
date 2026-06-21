@@ -9751,7 +9751,7 @@ mod tests {
             .map(|(key, value)| key.len() + 1 + value.len() + 1)
             .sum::<usize>()
             + 1; // the terminating empty string
-        let argv0_trailer = 2 + "C:\\PROGRAM.EXE".len() + 1; // WORD count + ASCIIZ path
+        let argv0_trailer = 2 + izarravm_dos::DEFAULT_ARGV0.len() + 1; // WORD count + ASCIIZ path
         let env_paras = (strings + argv0_trailer).div_ceil(16) as u16;
         assert_eq!(
             mem.read_u16(0x1204).unwrap(),
