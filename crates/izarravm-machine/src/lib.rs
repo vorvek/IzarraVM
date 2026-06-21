@@ -1162,8 +1162,96 @@ impl Machine {
             }
             // AH=87h block move: ES:SI -> GDT; copy CX words src->dst across 1 MB.
             0x87 => self.int15_block_move(),
+            // AH=8Ah extended memory size in KiB as a 32-bit DX:AX (the >64 MB-capable
+            // sibling of AH=88h, which saturates at 0xFFFF).
+            0x8A => {
+                let ext_kib = u32::from(self.profile.memory_mib).saturating_sub(1) * 1024;
+                self.set_ax(ext_kib as u16);
+                self.set_dx((ext_kib >> 16) as u16);
+                self.set_int_frame_carry(false);
+            }
+            // AX=E801h/E820h/E881h memory-size and memory-map queries (AH=E8h group).
+            0xE8 => match self.cpu.registers.eax() as u8 {
+                0x01 => self.int15_e801(false),
+                0x81 => self.int15_e801(true),
+                0x20 => self.int15_e820(),
+                _ => self.set_int_frame_carry(true),
+            },
+            // AH=90h device-wait / AH=91h device-post are OS hooks. With no OS hook
+            // installed the BIOS returns "no wait performed" with CF clear, rather than
+            // the unsupported-function carry the catch-all would set.
+            0x90 | 0x91 => self.set_int_frame_carry(false),
             _ => self.set_int_frame_carry(true),
         }
+    }
+
+    /// INT 15h AX=E801h (and the AX=E881h 32-bit variant). Reports extended memory in two
+    /// pieces the way DOS extenders and HIMEM expect: the 1-16 MB range in KB (AX/CX,
+    /// capped at 0x3C00 = 15 MB) and the memory above 16 MB in 64 KB blocks (BX/DX). E881h
+    /// returns the same magnitudes in the full 32-bit registers.
+    fn int15_e801(&mut self, wide: bool) {
+        let ext_kib = u32::from(self.profile.memory_mib) * 1024;
+        let ext_kib = ext_kib.saturating_sub(1024); // memory above the first 1 MB
+        let below_16m = ext_kib.min(15 * 1024); // 1-16 MB range, max 0x3C00 KB
+        let above_16m_blocks = ext_kib.saturating_sub(15 * 1024) / 64; // 64 KB blocks
+        if wide {
+            self.cpu.registers.set_eax(below_16m);
+            self.cpu.registers.set_ebx(above_16m_blocks);
+            self.cpu.registers.set_ecx(below_16m);
+            self.cpu.registers.set_edx(above_16m_blocks);
+        } else {
+            self.set_ax(below_16m as u16);
+            self.set_bx(above_16m_blocks as u16);
+            self.set_cx(below_16m as u16);
+            self.set_dx(above_16m_blocks as u16);
+        }
+        self.set_int_frame_carry(false);
+    }
+
+    /// The system memory map E820h enumerates: 640 KB of conventional RAM, the reserved
+    /// video/ROM hole below 1 MB, and a single available region for everything above 1 MB.
+    fn e820_regions(&self) -> Vec<(u64, u64, u32)> {
+        let total = u64::from(self.profile.memory_mib) * 0x10_0000;
+        let mut regions = vec![
+            (0x0u64, 0xA_0000u64, 1u32), // 640 KB conventional, available
+            (0xA_0000, 0x6_0000, 2),     // video + ROM BIOS hole, reserved
+        ];
+        if total > 0x10_0000 {
+            regions.push((0x10_0000, total - 0x10_0000, 1)); // extended RAM, available
+        }
+        regions
+    }
+
+    /// INT 15h AX=E820h. Walks the memory map one 20-byte descriptor per call: EDX must
+    /// carry 'SMAP', EBX is the continuation index (0 to start), ES:DI is the buffer. Each
+    /// call returns EAX='SMAP', ECX=20, the descriptor written, and EBX advanced to the
+    /// next index or 0 once the last region has been returned.
+    fn int15_e820(&mut self) {
+        const SMAP: u32 = 0x534D_4150;
+        if self.cpu.registers.edx() != SMAP || (self.cpu.registers.ecx() as u16) < 20 {
+            self.set_int_frame_carry(true);
+            return;
+        }
+        let regions = self.e820_regions();
+        let index = self.cpu.registers.ebx() as usize;
+        let Some(&(base, len, kind)) = regions.get(index) else {
+            self.set_int_frame_carry(true);
+            return;
+        };
+        let es = self.cpu.registers.segment(SegmentIndex::Es).base;
+        let di = self.cpu.registers.edi() as u16;
+        let addr = es.wrapping_add(u32::from(di));
+        let mut desc = [0u8; 20];
+        desc[0..8].copy_from_slice(&base.to_le_bytes());
+        desc[8..16].copy_from_slice(&len.to_le_bytes());
+        desc[16..20].copy_from_slice(&kind.to_le_bytes());
+        self.write_guest_block(addr, &desc);
+        self.cpu.registers.set_eax(SMAP);
+        self.cpu.registers.set_ecx(20);
+        let next = index + 1;
+        let continuation = if next < regions.len() { next as u32 } else { 0 };
+        self.cpu.registers.set_ebx(continuation);
+        self.set_int_frame_carry(false);
     }
 
     /// INT 15h AH=87h. ES:SI points at a 48-byte GDT the caller built; the source
@@ -1183,7 +1271,9 @@ impl Machine {
         };
         let src = base_at(self, gdt + 0x10);
         let dst = base_at(self, gdt + 0x18);
-        let bytes = usize::from(self.cpu.registers.ecx() as u16) * 2;
+        // CX is a word count capped at 0x8000 (64 KB); larger requests are clamped.
+        let words = (self.cpu.registers.ecx() as u16).min(0x8000);
+        let bytes = usize::from(words) * 2;
         let data = self.read_guest_block(src, bytes);
         self.write_guest_block(dst, &data);
         self.set_eax_ah(0x00);
@@ -3694,6 +3784,76 @@ mod tests {
             I386DX25_TEST_ROM,
         )
         .unwrap()
+    }
+
+    fn int15_machine(mem_mib: u16) -> Machine {
+        Machine::new(
+            MachineProfile::gsw_386(mem_mib, VideoCard::Et4000Ax),
+            vec![0u8; BIOS_ROM_SIZE],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn int15_8a_reports_extended_memory_as_dx_ax() {
+        let mut m = int15_machine(24);
+        m.cpu.registers.set_eax(0x8A00);
+        m.handle_int15();
+        // 23 MB above the first 1 MB = 23552 KB = 0x5C00 (fits in AX, DX = 0).
+        assert_eq!(m.cpu.registers.eax() as u16, 0x5C00);
+        assert_eq!(m.cpu.registers.edx() as u16, 0x0000);
+    }
+
+    #[test]
+    fn int15_e801_splits_memory_at_16m() {
+        let mut m = int15_machine(24);
+        m.cpu.registers.set_eax(0xE801);
+        m.handle_int15();
+        // 1-16 MB capped at 0x3C00 KB; 8 MB above 16 MB = 128 64KB-blocks = 0x80.
+        assert_eq!(m.cpu.registers.eax() as u16, 0x3C00);
+        assert_eq!(m.cpu.registers.ebx() as u16, 0x80);
+        assert_eq!(m.cpu.registers.ecx() as u16, 0x3C00);
+        assert_eq!(m.cpu.registers.edx() as u16, 0x80);
+    }
+
+    #[test]
+    fn int15_e820_walks_the_memory_map() {
+        let mut m = int15_machine(24);
+        // ES = 0, DI = 0: the descriptor lands at physical 0 in test RAM.
+        let mut ebx = 0u32;
+        let mut regions = Vec::new();
+        loop {
+            m.cpu.registers.set_eax(0xE820);
+            m.cpu.registers.set_edx(0x534D_4150);
+            m.cpu.registers.set_ecx(20);
+            m.cpu.registers.set_ebx(ebx);
+            m.handle_int15();
+            assert_eq!(m.cpu.registers.eax(), 0x534D_4150);
+            assert_eq!(m.cpu.registers.ecx(), 20);
+            let base = m.read_guest_dword(0);
+            let len = m.read_guest_dword(8);
+            let kind = m.read_guest_dword(16);
+            regions.push((base, len, kind));
+            ebx = m.cpu.registers.ebx();
+            if ebx == 0 {
+                break;
+            }
+        }
+        assert_eq!(regions.len(), 3);
+        assert_eq!(regions[0], (0x0, 0xA_0000, 1)); // 640 KB conventional
+        assert_eq!(regions[1], (0xA_0000, 0x6_0000, 2)); // reserved hole
+        assert_eq!(regions[2], (0x10_0000, 23 * 0x10_0000, 1)); // extended RAM
+    }
+
+    #[test]
+    fn int15_e820_rejects_a_bad_smap_signature() {
+        let mut m = int15_machine(24);
+        m.cpu.registers.set_eax(0xE820);
+        m.cpu.registers.set_edx(0); // not 'SMAP'
+        m.cpu.registers.set_ecx(20);
+        m.handle_int15();
+        // EAX must not be rewritten to 'SMAP' when the call is rejected.
+        assert_ne!(m.cpu.registers.eax(), 0x534D_4150);
     }
 
     #[test]
