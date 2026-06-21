@@ -133,6 +133,19 @@ impl CrtcTiming {
         }
     }
 
+    /// Mode 0Fh: 640x350 monochrome (2-colour) planar. Shares mode 10h's
+    /// 640x350 timing; only the colour count differs, and the scanout handles
+    /// that through the attribute palette (the BIOS programs a 2-colour set).
+    pub fn mode_0fh() -> Self {
+        Self::mode_10h()
+    }
+
+    /// Mode 11h: 640x480 monochrome (2-colour) planar. Shares mode 12h's
+    /// 640x480 timing; 2-colour, like 0Fh against 10h.
+    pub fn mode_11h() -> Self {
+        Self::mode_12h()
+    }
+
     /// Mode 12h: 640x480x16 planar, 60 Hz, not double-scanned, 8-dot chars.
     pub fn mode_12h() -> Self {
         Self {
@@ -283,6 +296,7 @@ impl CrtcRegs {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Sequencer {
+    pub reset: u8,           // idx 0 (bit 0 async reset, bit 1 sync reset); read-back only
     pub clocking_mode: u8,   // idx 1 (bit 0 set = 8-dot chars; clear = 9-dot)
     pub map_mask: u8,        // idx 2, low 4 bits
     pub char_map_select: u8, // idx 3 (map A bits 0,1,4 select the active font table)
@@ -300,6 +314,9 @@ pub struct Attribute {
     pub color_select: u8,     // idx 0x14
     pub flip_flop_data: bool, // false = next 3C0 write is an index
     pub index: u8,
+    // Palette Address Source (3C0 index bit 5): set = normal display, clear =
+    // screen blanked while the palette is being programmed.
+    pub pas: bool,
 }
 
 impl Default for Attribute {
@@ -316,6 +333,9 @@ impl Default for Attribute {
             color_select: 0,
             flip_flop_data: false,
             index: 0,
+            // Powers up display-enabled so the boot screen shows before any 3C0
+            // program; the BIOS sets PAS to 1 at the end of every mode-set.
+            pas: true,
         }
     }
 }
@@ -510,6 +530,16 @@ pub struct Vga {
     pub(crate) mode: VideoMode,
     pub(crate) misc_output: u8,
     pub(crate) pel_mask: u8,
+    // Feature Control (read 3CA, write 3DA color / 3BA mono). Stored read-back
+    // only; the FEAT0/FEAT1 lines drive nothing in this core.
+    pub(crate) feature_control: u8,
+    // Video Subsystem Enable (3C3, bit 0). Stored read-back only; gating the
+    // legacy A0000/B8000 aperture lives in the machine bus, not this register.
+    pub(crate) video_subsystem_enable: u8,
+    // DAC State (read 3C7, bits 1-0): 0b11 after a write-index (3C8) write,
+    // 0b00 after a read-index (3C7) write. Tracks which DAC access mode was
+    // armed last so a program polling 3C7 sees the documented state.
+    pub(crate) dac_state: u8,
     pub(crate) cga: Cga,
 }
 
@@ -552,6 +582,11 @@ impl Default for Vga {
             // not applied to the dot clock.
             misc_output: 0x67,
             pel_mask: 0xFF,
+            feature_control: 0x00,
+            // Video subsystem powers up enabled so the framebuffer aperture is live.
+            video_subsystem_enable: 0x01,
+            // DAC powers up armed for writes (3C8 path), so the state reads 0b11.
+            dac_state: 0x03,
             cga: Cga::default(),
         };
         // Size the work buffer for the boot text mode so the raster is published
@@ -726,7 +761,9 @@ impl Vga {
         let timing = match mode {
             0x0D => CrtcTiming::mode_0dh(),
             0x0E => CrtcTiming::mode_0eh(),
+            0x0F => CrtcTiming::mode_0fh(),
             0x10 => CrtcTiming::mode_10h(),
+            0x11 => CrtcTiming::mode_11h(),
             0x12 => CrtcTiming::mode_12h(),
             _ => return false,
         };
@@ -817,6 +854,29 @@ impl Vga {
         below_split && (self.attr.mode_control & 0x20 != 0)
     }
 
+    /// Fold the Attribute Color Select register (14h) into a 6-bit attribute
+    /// palette value to form the 8-bit DAC index, then apply the pel mask. In the
+    /// 16-color and text paths the attribute palette is 6 bits wide; the Color
+    /// Select supplies the top DAC bits (FreeVGA attrreg.htm 10h/14h):
+    ///
+    /// DAC index bits 7-6 always come from Color Select (14h) bits 3-2. Bits 3-0 always
+    /// come from the palette register. Bits 5-4 depend on AC Mode Control (10h) bit 7:
+    /// - bit 7 clear: DAC bits 5-4 are the palette register's own bits 5-4 (the full 6-bit
+    ///   palette value passes through), with Color Select 3-2 supplying bits 7-6.
+    /// - bit 7 set: the palette value's bits 5-4 are replaced by Color Select bits 1-0
+    ///   (the "P5/P4 from C0/C1" page-select mode), with Color Select 3-2 still bits 7-6.
+    ///
+    /// The pel mask (3C6) gates the final index in both cases.
+    fn dac_index(&self, palette_6bit: u8) -> u8 {
+        let cs = self.attr.color_select;
+        let index = if self.attr.mode_control & 0x80 == 0 {
+            (palette_6bit & 0x3F) | ((cs & 0x0C) << 4)
+        } else {
+            (palette_6bit & 0x0F) | ((cs & 0x03) << 4) | ((cs & 0x0C) << 4)
+        };
+        index & self.pel_mask
+    }
+
     /// Assemble one active scanline into `hdisp_end` DAC indices, applying pel-pan
     /// and the attribute palette. `counter_line` is the scanline in scan-counter
     /// units; double-scan maps it to source row `counter_line / scan_factor`, so a
@@ -848,7 +908,7 @@ impl Vga {
                 let b = self.vram[plane * VGA_PLANE_SIZE + off];
                 index |= ((b >> bit) & 1) << plane;
             }
-            *slot = (self.attr.palette[index as usize] & 0x3F) & self.pel_mask;
+            *slot = self.dac_index(self.attr.palette[index as usize] & 0x3F);
         }
         row
     }
@@ -1015,8 +1075,8 @@ impl Vga {
             } else {
                 ((attr >> 4) & 0x0F) as usize
             };
-            let mut fg = (self.attr.palette[fg_index] & 0x3F) & self.pel_mask;
-            let mut bg = (self.attr.palette[bg_index] & 0x3F) & self.pel_mask;
+            let mut fg = self.dac_index(self.attr.palette[fg_index] & 0x3F);
+            let mut bg = self.dac_index(self.attr.palette[bg_index] & 0x3F);
             let hide_fg = blink_enabled && blink_attr && blink_hide_phase;
             // Hardware text cursor (CRTC 0A/0B): on the cursor cell, swap fg/bg
             // on the active scanlines for reverse video. 0A bit 5 disables the
@@ -1084,11 +1144,19 @@ impl Vga {
     fn render_scanline(&mut self, counter_line: u32) {
         let width = self.raster_width() as usize;
         let pixels = if counter_line < self.crtc.vdisp_end {
-            match self.mode {
-                VideoMode::Mode13h | VideoMode::ModeX => self.render_256color_row(counter_line),
-                VideoMode::Text => self.render_text_row(counter_line),
-                VideoMode::Cga => self.render_cga_row(counter_line),
-                _ => self.render_active_row(counter_line),
+            // Attribute Palette Address Source (3C0 index bit 5) clear blanks the
+            // active display to black while the host programs the palette; the
+            // border region (below vdisp_end) is unaffected. CGA carries its own
+            // register file, so the gate only covers the attribute-driven modes.
+            if !self.attr.pas && self.mode != VideoMode::Cga {
+                vec![0u8; width]
+            } else {
+                match self.mode {
+                    VideoMode::Mode13h | VideoMode::ModeX => self.render_256color_row(counter_line),
+                    VideoMode::Text => self.render_text_row(counter_line),
+                    VideoMode::Cga => self.render_cga_row(counter_line),
+                    _ => self.render_active_row(counter_line),
+                }
             }
         } else {
             vec![self.region_color(counter_line); width]
@@ -1271,6 +1339,25 @@ impl Vga {
         status
     }
 
+    /// Read Input Status Register 0 (port 3C2h).
+    ///
+    /// Bit 4: switch sense / DAC comparator output. A program drives the DAC
+    /// comparator (3C7/3C8 + 3C6) and reads this bit to identify the attached
+    /// monitor; with no comparison driven it reads back as a fixed color-monitor
+    /// sense (set), matching a wired colour display.
+    /// Bit 7: vertical retrace active (the CRT interrupt status the BIOS polls).
+    pub fn read_status0(&mut self) -> u8 {
+        self.catch_up(); // a 3C2 read catches the raster up, like 3DA
+        let mut status = 0u8;
+        // ponytail: fixed colour-monitor sense. The DAC comparator path is not
+        // modeled, so bit 4 always reports the wired colour display.
+        status |= 0x10;
+        if beam_vretrace(&self.crtc, self.beam) {
+            status |= 0x80; // vertical retrace -> CRT interrupt status
+        }
+        status
+    }
+
     /// Write to a VGA I/O port. Calls `catch_up()` first so any lines already
     /// past the beam are rendered with the previous register state before the
     /// new value takes effect. Returns `true` if the port is handled.
@@ -1294,12 +1381,18 @@ impl Vga {
                 self.pel_mask = value;
                 true
             }
+            0x3C3 => {
+                self.video_subsystem_enable = value & 0x01;
+                true
+            }
             0x3C7 => {
                 self.dac.set_read_index(value);
+                self.dac_state = 0x00; // armed for a DAC read
                 true
             }
             0x3C8 => {
                 self.dac.set_write_index(value);
+                self.dac_state = 0x03; // armed for a DAC write
                 true
             }
             0x3C9 => {
@@ -1342,6 +1435,13 @@ impl Vga {
                 self.cga.color_select = value;
                 true
             }
+            // Feature Control: written at 3DA in colour setups, 3BA in mono.
+            // Read back at 3CA. The two write addresses are the colour/mono
+            // alias of the same register.
+            0x3DA | 0x3BA => {
+                self.feature_control = value;
+                true
+            }
             _ => false,
         }
     }
@@ -1349,8 +1449,12 @@ impl Vga {
     /// Read from a VGA I/O port. Returns `Some(value)` for handled ports.
     pub fn read_port(&mut self, port: u16) -> Option<u8> {
         match port {
+            0x3C2 => Some(self.read_status0()),
             0x3C1 => Some(self.attr_indexed_read()),
+            0x3C3 => Some(self.video_subsystem_enable),
             0x3C6 => Some(self.pel_mask),
+            0x3C7 => Some(self.dac_state & 0x03),
+            0x3CA => Some(self.feature_control),
             0x3C8 => Some(self.dac.write_index()),
             0x3C9 => Some(self.dac.read_data()),
             0x3CC => Some(self.misc_output),
@@ -1386,6 +1490,10 @@ impl Vga {
 
     fn write_seq(&mut self, index: u8, value: u8) {
         match index {
+            // ponytail: store the Reset register (bit 0 async, bit 1 sync) for
+            // read-back only. No datapath gate: a real reset halts the sequencer
+            // dot clock, which the cycle-coupled beam model does not act on.
+            0x00 => self.seq.reset = value,
             0x01 => self.seq.clocking_mode = value,
             0x02 => self.seq.map_mask = value & 0x0F,
             0x03 => self.seq.char_map_select = value,
@@ -1488,6 +1596,10 @@ impl Vga {
     fn write_attr(&mut self, value: u8) {
         if !self.attr.flip_flop_data {
             self.attr.index = value & 0x1F;
+            // Bit 5 is the Palette Address Source: set = normal display, clear =
+            // screen blanked while the palette is programmed. It rides on the
+            // index write and is dropped from the index itself (masked to 0x1F).
+            self.attr.pas = value & 0x20 != 0;
             self.attr.flip_flop_data = true;
         } else {
             match self.attr.index {
@@ -2451,7 +2563,9 @@ mod tests {
         vga.attr.palette = core::array::from_fn(|i| i as u8); // index 1 -> DAC 1
         // Run to counter line 50, then repaint palette[1] = 9 via the attribute port.
         vga.advance(htotal_dots(&vga.crtc) * 50);
-        vga.write_port(0x3C0, 0x01); // attr index 1
+        // Index 1 with bit 5 (Palette Address Source) set keeps the display on
+        // while the palette register is rewritten, so the screen does not blank.
+        vga.write_port(0x3C0, 0x20 | 0x01); // attr index 1, PAS on
         vga.write_port(0x3C0, 9); // palette[1] = 9
         // Finish the frame.
         vga.advance(vga.frame_dots());
@@ -4041,5 +4155,180 @@ mod tests {
         }
         vga.frames = 32;
         assert_eq!(vga.render_text_row(0)[0], 15, "frame 32: period repeats");
+    }
+
+    #[test]
+    fn sequencer_reset_register_round_trips() {
+        // Sequencer index 0 (Reset) is stored read-back only: a write through
+        // 3C4/3C5 lands in seq.reset without gating the datapath.
+        let mut vga = Vga::default();
+        vga.write_port(0x3C4, 0x00);
+        vga.write_port(0x3C5, 0x02); // synchronous reset asserted
+        assert_eq!(vga.seq.reset, 0x02);
+        vga.write_port(0x3C5, 0x03); // both reset bits (index 0 still selected)
+        assert_eq!(vga.seq.reset, 0x03);
+    }
+
+    #[test]
+    fn input_status0_reports_retrace_and_a_fixed_color_sense() {
+        let mut vga = Vga::default();
+        vga.set_mode_0dh();
+        // Bit 4 is the colour-monitor sense, always set in this core.
+        let htotal = htotal_dots(&vga.crtc);
+        vga.beam = htotal * (vga.crtc.vdisp_end as u64); // active off, not in retrace
+        let active = vga.read_port(0x3C2).unwrap();
+        assert_eq!(
+            active & 0x10,
+            0x10,
+            "bit 4 reports the colour-monitor sense"
+        );
+        assert_eq!(active & 0x80, 0x00, "bit 7 clear outside vertical retrace");
+        // Park the beam in vertical retrace: bit 7 (CRT interrupt status) sets.
+        vga.beam = htotal * (vga.crtc.vretrace_start as u64);
+        let retrace = vga.read_port(0x3C2).unwrap();
+        assert_eq!(retrace & 0x80, 0x80, "bit 7 set during vertical retrace");
+    }
+
+    #[test]
+    fn color_select_folds_into_the_dac_index_when_bit7_clear() {
+        // AC Mode Control 10h bit 7 clear: the full 6-bit palette value is DAC bits 5-0,
+        // and Color Select 14h bits 3-2 supply DAC bits 7-6.
+        let mut vga = Vga::default();
+        vga.set_mode_0dh();
+        for b in vga.vram[0..VGA_PLANE_SIZE].iter_mut() {
+            *b = 0xFF; // every pixel is attribute index 1
+        }
+        vga.attr.palette[1] = 0x05; // 6-bit palette value 0b00_0101
+        vga.attr.mode_control = 0x00; // bit 7 clear
+        vga.attr.color_select = 0x0F; // bits 3-2 = 11 -> DAC bits 7-6
+        // DAC = 0b11_00_0101 = 0xC5 (palette bits 5-4 untouched).
+        assert_eq!(vga.render_active_row(0)[0], 0xC5);
+        // Color Select 0 leaves the bare 6-bit palette value.
+        vga.attr.color_select = 0x00;
+        assert_eq!(vga.render_active_row(0)[0], 0x05);
+    }
+
+    #[test]
+    fn color_select_replaces_palette_bits_5_4_when_bit7_set() {
+        // AC Mode Control 10h bit 7 set: palette bits 5-4 are replaced by Color
+        // Select bits 1-0, and Color Select bits 3-2 supply DAC bits 7-6.
+        let mut vga = Vga::default();
+        vga.set_mode_0dh();
+        for b in vga.vram[0..VGA_PLANE_SIZE].iter_mut() {
+            *b = 0xFF;
+        }
+        vga.attr.palette[1] = 0x3A; // 0b11_1010; bits 5-4 (0b11) get replaced
+        vga.attr.mode_control = 0x80; // bit 7 set
+        vga.attr.color_select = 0x06; // bits 1-0 = 10 -> P5/P4; bits 3-2 = 01 -> DAC 7-6
+        // DAC = bits 7-6 (01) | bits 5-4 (10) | palette bits 3-0 (1010) = 0b01_10_1010 = 0x6A.
+        assert_eq!(vga.render_active_row(0)[0], 0x6A);
+    }
+
+    #[test]
+    fn color_select_folds_into_text_foreground() {
+        // The text path routes the same fold: a foreground palette value picks up
+        // the Color Select high bits.
+        let mut vga = Vga::default();
+        text_put(&mut vga, 0, 0, 0xDB, 0x01); // solid glyph, fg index 1
+        vga.attr.palette[1] = 0x01;
+        vga.attr.mode_control = 0x00; // bit 7 clear (and blink off)
+        vga.attr.color_select = 0x0C; // bits 3-2 -> DAC 7-6
+        // DAC = 0b11_00_0001 = 0xC1.
+        assert_eq!(vga.render_text_row(0)[0], 0xC1);
+    }
+
+    #[test]
+    fn feature_control_round_trips_3ca_with_color_and_mono_writes() {
+        let mut vga = Vga::default();
+        assert_eq!(vga.read_port(0x3CA), Some(0x00), "powers up at 0");
+        assert!(vga.write_port(0x3DA, 0x0A)); // colour write address
+        assert_eq!(vga.read_port(0x3CA), Some(0x0A));
+        assert!(vga.write_port(0x3BA, 0x05)); // mono alias of the same register
+        assert_eq!(vga.read_port(0x3CA), Some(0x05));
+    }
+
+    #[test]
+    fn video_subsystem_enable_round_trips_3c3() {
+        let mut vga = Vga::default();
+        assert_eq!(vga.read_port(0x3C3), Some(0x01), "powers up enabled");
+        assert!(vga.write_port(0x3C3, 0x00));
+        assert_eq!(vga.read_port(0x3C3), Some(0x00));
+        // Only bit 0 is stored.
+        assert!(vga.write_port(0x3C3, 0xFF));
+        assert_eq!(vga.read_port(0x3C3), Some(0x01));
+    }
+
+    #[test]
+    fn dac_state_reports_the_armed_access_mode() {
+        let mut vga = Vga::default();
+        // Powers up armed for a write (3C8 path): state 0b11.
+        assert_eq!(vga.read_port(0x3C7), Some(0x03));
+        // A read-index write (3C7) arms a read: state 0b00.
+        assert!(vga.write_port(0x3C7, 5));
+        assert_eq!(vga.read_port(0x3C7), Some(0x00));
+        // A write-index write (3C8) arms a write again: state 0b11.
+        assert!(vga.write_port(0x3C8, 7));
+        assert_eq!(vga.read_port(0x3C7), Some(0x03));
+    }
+
+    #[test]
+    fn set_mode_installs_the_two_color_640_modes_0f_and_11() {
+        let mut vga = Vga::default();
+        // 0Fh shares 10h's 640x350 timing.
+        assert!(vga.set_mode(0x0F));
+        assert_eq!(vga.raster_width(), 640);
+        assert_eq!(vga.crtc.vdisp_end, 350);
+        assert_eq!(vga.active_mode(), VideoMode::Planar);
+        assert_eq!(CrtcTiming::mode_0fh(), CrtcTiming::mode_10h());
+        // 11h shares 12h's 640x480 timing.
+        assert!(vga.set_mode(0x11));
+        assert_eq!(vga.raster_width(), 640);
+        assert_eq!(vga.crtc.vdisp_end, 480);
+        assert_eq!(CrtcTiming::mode_11h(), CrtcTiming::mode_12h());
+    }
+
+    #[test]
+    fn palette_address_source_clear_blanks_the_active_display() {
+        let mut vga = Vga::default();
+        vga.set_mode_0dh();
+        for b in vga.vram[0..VGA_PLANE_SIZE].iter_mut() {
+            *b = 0xFF; // active content present
+        }
+        vga.attr.palette = core::array::from_fn(|i| i as u8);
+        // PAS set (the mode-set default): the active region renders content.
+        let on = vga.render_full_frame();
+        assert_ne!(on.pixels[0], 0, "PAS set shows the active content");
+        // Write the 3C0 index with bit 5 clear: screen blanks while the palette is
+        // programmed. The border keeps its overscan colour (default 0 here).
+        vga.read_status1(); // reset the flip-flop to the index phase
+        vga.write_port(0x3C0, 0x00); // index 0, bit 5 clear -> PAS off
+        assert!(!vga.attr.pas);
+        let off = vga.render_full_frame();
+        assert_eq!(
+            off.pixels[0], 0,
+            "PAS clear blanks the active display to black"
+        );
+        // Re-enabling PAS (bit 5 set on the index write) restores the display.
+        vga.read_status1();
+        vga.write_port(0x3C0, 0x20); // index 0 with bit 5 set -> PAS on
+        assert!(vga.attr.pas);
+        let back = vga.render_full_frame();
+        assert_ne!(
+            back.pixels[0], 0,
+            "PAS set again restores the active content"
+        );
+    }
+
+    #[test]
+    fn palette_address_source_bit_does_not_leak_into_the_attr_index() {
+        // Bit 5 of the 3C0 index drives PAS but is masked off the stored index, so
+        // the following data write still lands on the low-5-bit register.
+        let mut vga = Vga::default();
+        vga.read_status1(); // index phase
+        vga.write_port(0x3C0, 0x20 | 0x13); // PAS on + index 0x13 (pixel pan)
+        assert_eq!(vga.attr.index, 0x13);
+        assert!(vga.attr.pas);
+        vga.write_port(0x3C0, 0x07); // data: pixel_pan = 7
+        assert_eq!(vga.attr.pixel_pan, 0x07);
     }
 }
