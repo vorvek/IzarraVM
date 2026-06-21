@@ -4,6 +4,8 @@
 //! dev_docs/reference/8237a/. Single-transfer and auto-init modes are modeled
 //! (the two the Sound Blaster uses for 8-bit playback), plus the command
 //! register's controller-disable gate and the memory-to-memory block transfer.
+//! Both transfer directions run: memory->device (Sound Blaster playback) and
+//! device->memory (the floppy controller's READ DATA on channel 2).
 //! Demand, block and cascade modes are out of scope.
 
 use izarravm_bus::Memory;
@@ -115,11 +117,8 @@ impl DmaChannel {
 
     /// Write one byte to memory (device->memory write transfer) and step the
     /// channel. Returns None when masked, not programmed for a write transfer, or
-    /// already at terminal count.
-    // ponytail: ceiling is the datapath itself; no Machine-level helper wires
-    // device->memory or verify transfers yet (that would need an edit to
-    // izarravm-machine/src/lib.rs, deliberately out of scope here).
-    #[allow(dead_code)]
+    /// already at terminal count. The floppy controller's READ DATA path lands
+    /// sector bytes through here on channel 2.
     pub(crate) fn write_byte(&mut self, memory: &mut Memory, byte: u8) -> Option<()> {
         if self.mask || self.transfer_kind != 1 {
             return None;
@@ -418,8 +417,8 @@ impl DmaChip {
     }
 
     /// Write one byte from the device (device->memory) on local channel `ci`,
-    /// latching terminal-count into the status register.
-    #[allow(dead_code)] // ponytail: no Machine-level write wiring yet (see DmaChannel::write_byte).
+    /// latching terminal-count into the status register. The FDC READ DATA
+    /// datapath reaches memory through here.
     fn write_byte(&mut self, ci: usize, memory: &mut Memory, byte: u8) -> Option<()> {
         if self.controller_disabled() {
             return None;
@@ -592,6 +591,46 @@ impl DmaController {
         } else {
             self.slave.read_word(channel - 4, memory)
         }
+    }
+
+    /// Write one byte to memory for DMA channel `channel` (device->memory, the
+    /// write transfer direction). The floppy controller drives channel 2 this way
+    /// to land read sector bytes in the guest's buffer; the channel's programmed
+    /// address, page, count and terminal count all apply. Returns None when the
+    /// channel is masked, not programmed for a write transfer, the controller is
+    /// disabled, or the channel has already reached terminal count.
+    pub(crate) fn write_byte(
+        &mut self,
+        channel: usize,
+        memory: &mut Memory,
+        byte: u8,
+    ) -> Option<()> {
+        if channel < 4 {
+            self.master.write_byte(channel, memory, byte)
+        } else {
+            self.slave.write_byte(channel - 4, memory, byte)
+        }
+    }
+
+    /// Read one byte from memory for DMA channel `channel` on the byte-addressed
+    /// (8-bit) path. The floppy controller drives channel 2 this way to pull
+    /// WRITE DATA bytes out of the guest's buffer. Mirrors `read_byte` but is kept
+    /// distinct so the call site reads as a device->disk pull. Returns None when
+    /// masked, not a read transfer, the controller is disabled, or at TC.
+    pub(crate) fn pull_byte(&mut self, channel: usize, memory: &mut Memory) -> Option<u8> {
+        self.read_byte(channel, memory)
+    }
+
+    /// Whether DMA `channel` has reached terminal count. The floppy bridge checks
+    /// this to stop a transfer at the programmed byte count even when the disk
+    /// could supply more sectors.
+    pub(crate) fn at_terminal_count(&self, channel: usize) -> bool {
+        let (chip, local) = if channel < 4 {
+            (&self.master, channel)
+        } else {
+            (&self.slave, channel - 4)
+        };
+        chip.channels[local].reached_tc
     }
 
     /// Run a memory-to-memory block transfer on the master controller, the only
