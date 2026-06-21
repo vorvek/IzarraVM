@@ -9742,14 +9742,17 @@ mod tests {
         assert_eq!(mem.read_u16(0x1202).unwrap(), 0x0600); // BX from IVT[0x21] (stub offset)
         // AH=48h returns the first free paragraph, which now follows the seeded
         // BLASTER=/SETSOUND= env block. Derive the expected segment from that
-        // block so the assertion tracks the env size, not a hardcoded value.
+        // block so the assertion tracks the env size, not a hardcoded value. The
+        // block ends with the DOS 3.0+ argv0 trailer: a terminator NUL, a WORD
+        // count of 1, and the ASCIIZ program path, so account for it here.
         let env_seg = mem.read_u16(0x1000 + 0x2c).unwrap();
-        let env_paras = (sound_blaster_env_entries(&SoundBlasterConfig::default())
+        let strings = sound_blaster_env_entries(&SoundBlasterConfig::default())
             .iter()
             .map(|(key, value)| key.len() + 1 + value.len() + 1)
             .sum::<usize>()
-            + 1)
-        .div_ceil(16) as u16;
+            + 1; // the terminating empty string
+        let argv0_trailer = 2 + izarravm_dos::DEFAULT_ARGV0.len() + 1; // WORD count + ASCIIZ path
+        let env_paras = (strings + argv0_trailer).div_ceil(16) as u16;
         assert_eq!(
             mem.read_u16(0x1204).unwrap(),
             env_seg + env_paras,
