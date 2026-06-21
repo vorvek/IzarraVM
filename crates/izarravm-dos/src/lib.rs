@@ -1002,7 +1002,17 @@ impl DosKernel {
     ) -> Result<DosAction, DosError> {
         match vector {
             0x20 => Ok(DosAction::Exit(0)),
-            0x21 => self.dispatch_int21(regs, mem),
+            0x21 => {
+                let action = self.dispatch_int21(regs, mem)?;
+                // Any INT 21h call returning with carry set has placed its DOS
+                // error code in AX. Record it here so a later AH=59h reports the
+                // most recent failure, covering every set_dos_error site, not just
+                // the handlers that route through fail().
+                if regs.cf {
+                    self.last_error = regs.ax;
+                }
+                Ok(action)
+            }
             // The machine only records 0x10/0x20/0x21 and routes 0x10 elsewhere, so
             // this is unreachable today. Treat it as a no-op rather than panic.
             _ => Ok(DosAction::Continue),
@@ -2061,14 +2071,15 @@ impl DosKernel {
             }
             // AH=59h GET EXTENDED ERROR: report the last DOS error. AX = the saved
             // code, BH = error class, BL = suggested action, CH = locus. We use one
-            // fixed mapping for every code: class 0x0D (media/hardware-neutral
-            // generic), action 0x05 (apply user correction and retry), locus 0x01
-            // (unknown). ponytail: real DOS derives class/action/locus per code from
-            // a table; in-scope callers only read AX, so the coarse mapping suffices.
+            // fixed mapping for every code: class 0x0D (unknown/other), action 0x05
+            // (immediate abort), locus 0x01 (unknown). ponytail: real DOS derives
+            // class/action/locus per code from a table; in-scope callers only read
+            // AX, so the coarse mapping suffices.
             0x59 => {
                 regs.ax = self.last_error;
                 regs.bx = (0x0d << 8) | 0x05; // BH = class, BL = action
                 regs.cx = (regs.cx & 0x00ff) | (0x01 << 8); // CH = locus, CL preserved
+                regs.cf = false; // the query itself succeeds; do not overwrite last_error
                 Ok(DosAction::Continue)
             }
             // AH=5Ah CREATE TEMPORARY FILE: DS:DX points at an ASCIIZ directory path
@@ -5674,6 +5685,26 @@ mod tests {
         assert_eq!(err.bx >> 8, 0x0d); // BH = class
         assert_eq!(err.bx & 0xff, 0x05); // BL = action
         assert_eq!(err.cx >> 8, 0x01); // CH = locus
+    }
+
+    #[test]
+    fn ah59_tracks_errors_from_ordinary_handlers() {
+        // A plain AH=3Dh open of a missing file fails through set_dos_error, not
+        // the new fail() helper. The dispatcher must still record it so AH=59h
+        // reports the true error, the classic recover-the-error-after-a-failed-call
+        // idiom.
+        let (mut kernel, mut mem, _dir) = kernel_with_drive(&[], r"C:\GONE.TXT");
+        let open = open(&mut kernel, &mut mem);
+        assert!(open.cf);
+        assert_eq!(open.ax, 0x02); // file not found
+
+        let mut err = DosRegs {
+            ax: 0x5900,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut err, &mut mem).unwrap();
+        assert_eq!(err.ax, 0x02, "AH=59h reports the open's error code");
+        assert!(!err.cf, "the query itself clears carry");
     }
 
     #[test]
