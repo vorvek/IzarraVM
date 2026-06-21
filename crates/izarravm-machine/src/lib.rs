@@ -18,6 +18,7 @@ mod atapi;
 mod cdimage;
 mod dma;
 mod fat12;
+mod fdc;
 mod floppy;
 mod ide;
 mod keyboard;
@@ -244,6 +245,10 @@ pub struct Machine {
     speaker: speaker::Speaker,
     pit_clocks: f64, // fractional PIT input clocks owed to the counters
     dma: dma::DmaController,
+    // 8272A floppy disk controller (ports 0x3F0-0x3F7). A guest that programs the
+    // FDC directly drives it here; the INT 13h path stays HLE and does not use it.
+    // READ/WRITE DATA move sector bytes over DMA channel 2 against `floppy`.
+    fdc: fdc::Fdc,
     opl: OplChip,
     resampler: Resampler,
     opl_micros: f64, // fractional microseconds owed to the OPL timers
@@ -436,6 +441,7 @@ impl Machine {
             speaker: speaker::Speaker::default(),
             pit_clocks: 0.0,
             dma: dma::DmaController::default(),
+            fdc: fdc::Fdc::default(),
             opl: OplChip::default(),
             resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
             opl_micros: 0.0,
@@ -508,6 +514,9 @@ impl Machine {
     pub fn mount_floppy(&mut self, bytes: Vec<u8>) -> Result<(), String> {
         self.floppy = Some(floppy::Floppy::from_image(bytes)?);
         self.set_equipment_floppy(true);
+        // Tell the FDC media is present so SENSE DRIVE STATUS reports the drive
+        // ready and a DIR read latches the disk-change line.
+        self.fdc.set_media_present(true);
         Ok(())
     }
 
@@ -530,6 +539,7 @@ impl Machine {
     pub fn eject_floppy(&mut self) -> Option<Vec<u8>> {
         let bytes = self.floppy.take().map(|f| f.bytes().to_vec());
         self.set_equipment_floppy(false);
+        self.fdc.set_media_present(false);
         bytes
     }
 
@@ -898,6 +908,8 @@ impl Machine {
             speaker: &mut self.speaker,
             rtc: &mut self.rtc,
             dma: &mut self.dma,
+            fdc: &mut self.fdc,
+            floppy: &mut self.floppy,
             opl: &mut self.opl,
             dsp: &mut self.dsp,
             mixer: &mut self.mixer,
@@ -3986,6 +3998,13 @@ impl Machine {
             self.pic.request(7);
         }
 
+        // The floppy disk controller raises IRQ6 on command completion and seek
+        // end. The DOR DMA/IRQ gate is honored inside take_irq, so a guest that
+        // polls the FDC with the gate off does not get a spurious line.
+        if self.fdc.take_irq() {
+            self.pic.request(6);
+        }
+
         // ATAPI command completion forwards IRQ15 (the secondary channel) to the
         // PIC, the way a real drive interrupts the host when a packet finishes.
         if self.ide.take_irq() {
@@ -4354,6 +4373,8 @@ impl Machine {
                     speaker,
                     rtc,
                     dma,
+                    fdc,
+                    floppy,
                     opl,
                     dsp,
                     mixer,
@@ -4382,6 +4403,8 @@ impl Machine {
                     speaker,
                     rtc,
                     dma,
+                    fdc,
+                    floppy,
                     opl,
                     dsp,
                     mixer,
@@ -4554,6 +4577,11 @@ struct MachineBus<'a> {
     speaker: &'a mut speaker::Speaker,
     rtc: &'a mut rtc::Rtc,
     dma: &'a mut dma::DmaController,
+    fdc: &'a mut fdc::Fdc,
+    // The mounted A: image the FDC transfers against. The borrowed bus needs it
+    // alongside `dma` and `memory` so a READ/WRITE DATA port write can run the
+    // floppy + DMA datapath in one place.
+    floppy: &'a mut Option<floppy::Floppy>,
     opl: &'a mut OplChip,
     dsp: &'a mut SbDsp,
     mixer: &'a mut SbMixer,
@@ -4693,6 +4721,9 @@ impl CpuBus for MachineBus<'_> {
                 .unwrap_or(0xff);
             return Ok(u32::from(value));
         }
+        if fdc::Fdc::owns_port(port) {
+            return Ok(u32::from(self.fdc.read_port(port).unwrap_or(0xff)));
+        }
         if let Some(value) = self.dsp.read_port(port) {
             // A guest ISR acknowledges the DSP interrupt by reading 0x22E (8-bit)
             // or 0x22F (16-bit); that read also clears the mixer's 0x82 source bit.
@@ -4782,6 +4813,16 @@ impl CpuBus for MachineBus<'_> {
             // channel must not fault. A mounted disk takes the task-file write.
             if let Some(disk) = self.ata.as_mut() {
                 disk.write_port(port, value as u8);
+            }
+            return Ok(());
+        }
+        if fdc::Fdc::owns_port(port) {
+            self.fdc.write_port(port, value as u8);
+            // A READ/WRITE DATA command stages an execution-phase transfer the
+            // chip cannot run on its own; the bus owns the floppy image and the
+            // DMA channel, so run it here and feed the result phase back.
+            if let Some(req) = self.fdc.take_transfer() {
+                self.run_fdc_transfer(req);
             }
             return Ok(());
         }
@@ -5407,6 +5448,105 @@ impl MachineBus<'_> {
         }
 
         Err(BusError::UnmappedMemory { address })
+    }
+
+    /// Run a floppy READ/WRITE DATA execution phase the FDC staged: move sector
+    /// bytes between the mounted image and guest memory over DMA channel 2, then
+    /// hand the result phase back to the chip.
+    ///
+    /// The transfer walks sectors from the start id up to EOT on the addressed
+    /// track, but the DMA terminal count is the real limit: the channel's
+    /// programmed byte count decides how much actually moves, exactly as on
+    /// hardware where the FDC streams until the DMAC asserts /TC. A read with no
+    /// disk, an off-media address, or a masked/misprogrammed channel terminates
+    /// abnormally.
+    fn run_fdc_transfer(&mut self, req: fdc::TransferRequest) {
+        const FDC_DMA_CHANNEL: usize = 2;
+        let Some(geom) = self.floppy.as_ref().map(|f| f.geometry()) else {
+            // No media: abnormal termination at the requested address.
+            self.fdc
+                .complete_transfer(req, req.cylinder, req.head, req.sector, false);
+            return;
+        };
+
+        let cyl = u16::from(req.cylinder);
+        let mut sector = req.sector;
+        let mut last_sector = req.sector;
+        let mut moved_any = false;
+        let mut ok = true;
+
+        // Walk sectors up to EOT, stopping early at DMA terminal count. EOT bounds
+        // the track; the spec's sector ids are 1-based.
+        while sector <= req.end_sector && sector <= geom.sectors {
+            if self.dma.at_terminal_count(FDC_DMA_CHANNEL) {
+                break;
+            }
+            if req.read {
+                // Disk -> memory: copy the sector out of the image first (an
+                // immutable borrow), then push the bytes through DMA channel 2.
+                let Some(data) = self
+                    .floppy
+                    .as_ref()
+                    .and_then(|f| f.read_sector(cyl, req.head, sector))
+                    .map(|s| s.to_vec())
+                else {
+                    ok = false;
+                    break;
+                };
+                let mut pushed = 0usize;
+                for &byte in &data {
+                    if self
+                        .dma
+                        .write_byte(FDC_DMA_CHANNEL, self.memory, byte)
+                        .is_none()
+                    {
+                        // DMA reached terminal count (or the channel is not
+                        // programmed for a write transfer): stop streaming.
+                        break;
+                    }
+                    pushed += 1;
+                }
+                if pushed == 0 {
+                    // A masked or unprogrammed channel moved no bytes: abnormal
+                    // termination, not a clean completion (matches the write path).
+                    break;
+                }
+            } else {
+                // Memory -> disk: pull a sector's worth out of the DMA channel,
+                // then commit it to the image.
+                let mut data = vec![0u8; usize::from(req.bytes_per_sec)];
+                let mut filled = 0usize;
+                for slot in data.iter_mut() {
+                    match self.dma.pull_byte(FDC_DMA_CHANNEL, self.memory) {
+                        Some(byte) => {
+                            *slot = byte;
+                            filled += 1;
+                        }
+                        None => break,
+                    }
+                }
+                if filled == 0 {
+                    break; // nothing left to write
+                }
+                let wrote = self
+                    .floppy
+                    .as_mut()
+                    .map(|f| f.write_sector(cyl, req.head, sector, &data))
+                    .unwrap_or(false);
+                if !wrote {
+                    ok = false;
+                    break;
+                }
+            }
+            moved_any = true;
+            last_sector = sector;
+            sector += 1;
+        }
+
+        // Success means at least one sector moved without an off-media fault.
+        let success = ok && moved_any;
+        self.fdc
+            .complete_transfer(req, req.cylinder, req.head, last_sector, success);
     }
 
     fn memory_wait_states(&self, address: u32) -> u8 {
@@ -7922,6 +8062,8 @@ mod tests {
             speaker: &mut machine.speaker,
             rtc: &mut machine.rtc,
             dma: &mut machine.dma,
+            fdc: &mut machine.fdc,
+            floppy: &mut machine.floppy,
             opl: &mut machine.opl,
             dsp: &mut machine.dsp,
             mixer: &mut machine.mixer,
@@ -8385,6 +8527,80 @@ mod tests {
             1,
             "a clock below the DAC rate must floor to 1, not 0"
         );
+    }
+
+    #[test]
+    fn fdc_read_data_streams_a_sector_into_memory_over_dma_channel_2() {
+        // A guest that programs the FDC directly: arm DMA channel 2 for a
+        // device->memory write, then issue READ DATA. The sector bytes must land
+        // in the guest buffer through the channel-2 datapath, and the controller
+        // must raise IRQ6 and present its result phase.
+        let mut machine = test_machine();
+
+        // 720 KB image (9 sectors/track, 2 heads). Seed CHS(2,0,3) with a marker.
+        // LBA = (cyl*heads + head)*spt + (sector-1) = (2*2+0)*9 + 2 = 38.
+        let mut img = vec![0u8; 737_280];
+        // LBA for CHS(2,0,3) on a 9-spt, 2-head disk: (2*2 + 0)*9 + (3-1) = 38.
+        let lba = 38usize;
+        let off = lba * 512;
+        for (i, slot) in img[off..off + 512].iter_mut().enumerate() {
+            *slot = (0xA0 + (i & 0x0F)) as u8;
+        }
+        machine.mount_floppy(img).unwrap();
+
+        // Guest DMA target buffer at physical 0x2000 (512 bytes).
+        const BUF: u16 = 0x2000;
+
+        with_bus(&mut machine, |bus| {
+            // --- Program DMA channel 2: device->memory (write), single, count 512.
+            bus.write_io(0x0B, BusWidth::Byte, 0x46).unwrap(); // mode ch2: single, write
+            bus.write_io(0x0C, BusWidth::Byte, 0x00).unwrap(); // clear the flip-flop
+            bus.write_io(0x04, BusWidth::Byte, u32::from(BUF & 0xFF))
+                .unwrap();
+            bus.write_io(0x04, BusWidth::Byte, u32::from(BUF >> 8))
+                .unwrap();
+            bus.write_io(0x81, BusWidth::Byte, 0x00).unwrap(); // page (A16-A23) = 0
+            bus.write_io(0x05, BusWidth::Byte, 0xFF).unwrap(); // count low (511)
+            bus.write_io(0x05, BusWidth::Byte, 0x01).unwrap(); // count high -> 0x01FF
+            bus.write_io(0x0A, BusWidth::Byte, 0x02).unwrap(); // unmask channel 2
+
+            // --- Drive the FDC.
+            bus.write_io(0x3F2, BusWidth::Byte, 0x1C).unwrap(); // DOR: motor A, gate, out of reset, drive 0
+            bus.write_io(0x3F5, BusWidth::Byte, 0x08).unwrap(); // SENSE INT (clear power-up irq)
+            while bus.read_io(0x3F4, BusWidth::Byte).unwrap() & 0x40 != 0 {
+                bus.read_io(0x3F5, BusWidth::Byte).unwrap();
+            }
+            // READ DATA: HDS+DS=0, C=2, H=0, R=3, N=2(512), EOT=3, GPL=0x1B, DTL=0xFF.
+            for &b in &[0xE6u8, 0x00, 0x02, 0x00, 0x03, 0x02, 0x03, 0x1B, 0xFF] {
+                bus.write_io(0x3F5, BusWidth::Byte, u32::from(b)).unwrap();
+            }
+        });
+
+        // The sector landed in the guest buffer over channel 2.
+        for i in 0..512usize {
+            let got = machine.read_physical_u8(u32::from(BUF) + i as u32);
+            let want = (0xA0 + (i & 0x0F)) as u8;
+            assert_eq!(got, want, "byte {i} of the sector in memory");
+        }
+
+        // The completion interrupt is IRQ6 (the controller raised it; advance the
+        // device pump so the bus collects it into the PIC).
+        machine.advance_devices(1);
+        let pending = with_bus(&mut machine, |bus| bus.interrupt_pending());
+        assert!(pending, "FDC completion raised IRQ6");
+
+        // The result phase is seven status bytes ending at sector 3.
+        let result = with_bus(&mut machine, |bus| {
+            let mut out = Vec::new();
+            while bus.read_io(0x3F4, BusWidth::Byte).unwrap() & 0x40 != 0 {
+                out.push(bus.read_io(0x3F5, BusWidth::Byte).unwrap() as u8);
+            }
+            out
+        });
+        assert_eq!(result.len(), 7, "ST0..N result phase");
+        assert_eq!(result[0] & 0xC0, 0x00, "normal termination");
+        assert_eq!(result[3], 2, "ending cylinder 2");
+        assert_eq!(result[5], 3, "ending sector 3");
     }
 
     #[test]
