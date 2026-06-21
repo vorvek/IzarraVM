@@ -31,6 +31,26 @@ const REG_B_DEFAULT: u8 = 0x06;
 /// Register D power-on value: VRT set (bit 7), meaning the battery is good.
 const REG_D_DEFAULT: u8 = 0x80;
 
+/// Register B interrupt-enable bits (MC146818 datasheet). PIE gates the
+/// periodic interrupt at the Register A rate, AIE the once-per-day alarm, and
+/// UIE the once-per-second update-ended interrupt.
+const REG_B_PIE: u8 = 0x40; // bit 6: periodic interrupt enable
+const REG_B_AIE: u8 = 0x20; // bit 5: alarm interrupt enable
+const REG_B_UIE: u8 = 0x10; // bit 4: update-ended interrupt enable
+
+/// Register C flag bits. IRQF is the wire-OR of the three sources gated by
+/// their enables; PF/AF/UF are the raw sources. A read of Register C returns
+/// these and clears all four (see `read_data`).
+const REG_C_IRQF: u8 = 0x80; // bit 7: interrupt request (any enabled source)
+const REG_C_PF: u8 = 0x40; // bit 6: periodic flag
+const REG_C_AF: u8 = 0x20; // bit 5: alarm flag
+const REG_C_UF: u8 = 0x10; // bit 4: update-ended flag
+
+/// Alarm-match registers (the seconds/minutes/hours the AIE compares against).
+const REG_SECONDS_ALARM: u8 = 0x01;
+const REG_MINUTES_ALARM: u8 = 0x03;
+const REG_HOURS_ALARM: u8 = 0x05;
+
 /// First and last NVRAM byte the checksum covers (the Izarra general area).
 const NVRAM_CHECKSUM_LO: usize = 0x10;
 const NVRAM_CHECKSUM_HI: usize = 0x2d;
@@ -225,6 +245,66 @@ impl Rtc {
         self.write_time_registers();
     }
 
+    /// Decide which RTC interrupt sources fired over `elapsed_seconds` of clock
+    /// advance and, for each enabled source, latch its Register C flag plus the
+    /// shared IRQF bit. Returns true when IRQF newly latched, so the machine
+    /// raises IRQ8. The caller advances the clock with `tick_seconds` first, then
+    /// calls this so the alarm compares against the new time.
+    ///
+    /// Sources (MC146818): the update-ended interrupt (UF) fires once per second;
+    /// the alarm (AF) fires when the time matches the alarm registers; the
+    /// periodic interrupt (PF) fires at the Register A rate. A flag latches only
+    /// when its Register B enable is set, matching real hardware where a disabled
+    /// source still sets nothing the guest can see through Register C.
+    ///
+    /// ponytail: the periodic granularity is one tick (a whole second), not the
+    /// programmed Register A rate. Every standard rate is at least once per second,
+    /// so a guest that polls Register C for PF still sees it set each second, but a
+    /// guest counting periodic interrupts to measure sub-second time gets one per
+    /// second instead of up to 1024. To lift this, drive a fractional periodic
+    /// accumulator from advance_devices at the Register A frequency and raise IRQ8
+    /// per period instead of per second.
+    pub fn tick_interrupts(&mut self, elapsed_seconds: u64) -> bool {
+        if elapsed_seconds == 0 {
+            return false;
+        }
+        let enables = self.ram[usize::from(REG_B)];
+        let mut new_flags = 0u8;
+        // UF: the update cycle ends once per second, so any whole second elapsed
+        // raises it when UIE is set.
+        if enables & REG_B_UIE != 0 {
+            new_flags |= REG_C_UF;
+        }
+        // PF: latched at second granularity (see the ponytail above).
+        if enables & REG_B_PIE != 0 {
+            new_flags |= REG_C_PF;
+        }
+        // AF: fires when the current time matches the alarm registers. A "don't
+        // care" alarm byte (top two bits set, value >= 0xC0) matches any value,
+        // the MC146818 wildcard convention.
+        if enables & REG_B_AIE != 0 && self.alarm_matches() {
+            new_flags |= REG_C_AF;
+        }
+        if new_flags == 0 {
+            return false;
+        }
+        let was_pending = self.ram[usize::from(REG_C)] & REG_C_IRQF != 0;
+        self.ram[usize::from(REG_C)] |= new_flags | REG_C_IRQF;
+        // Signal the machine to raise IRQ8 only on the rising edge of IRQF; while a
+        // flag is already pending (the guest has not read Register C to ack), the
+        // line stays asserted and no new edge is reported.
+        !was_pending
+    }
+
+    /// Whether the current time matches the seconds/minutes/hours alarm registers.
+    /// A byte of 0xC0 or higher is a "don't care" wildcard that matches any value.
+    fn alarm_matches(&self) -> bool {
+        let matches = |alarm: u8, now: u8| alarm >= 0xc0 || alarm == now;
+        matches(self.ram[usize::from(REG_SECONDS_ALARM)], self.time.second)
+            && matches(self.ram[usize::from(REG_MINUTES_ALARM)], self.time.minute)
+            && matches(self.ram[usize::from(REG_HOURS_ALARM)], self.time.hour)
+    }
+
     /// Read the byte the index port currently selects. Status and clock reads
     /// return the live values; reading Register C clears its interrupt flags.
     pub fn read_data(&mut self) -> u8 {
@@ -254,6 +334,19 @@ impl Rtc {
                 let century = (self.time.year / 100) * 100;
                 self.time.year = century + u16::from(value % 100);
             }
+            // Alarm-match registers: stored but not part of the broken-down clock
+            // and not battery-backed NVRAM, so they bypass the dirty flag.
+            REG_SECONDS_ALARM | REG_MINUTES_ALARM | REG_HOURS_ALARM => {
+                self.ram[usize::from(reg)] = value;
+            }
+            // Register A: the OS programs the rate-select and time-base bits here.
+            // UIP (bit 7) is read-only and always reads 0 on this device (no
+            // update cycle is modeled), so mask it off on write.
+            REG_A => self.ram[usize::from(REG_A)] = value & 0x7f,
+            // Register B: interrupt enables and format bits. The format bits stay
+            // forced (binary, 24-hour) so the BIOS format never changes underfoot,
+            // but the enable bits the guest sets drive `tick_interrupts`.
+            REG_B => self.ram[usize::from(REG_B)] = value | REG_B_DEFAULT,
             REG_C | REG_D => { /* status C and D are read-only */ }
             _ => {
                 self.ram[usize::from(reg)] = value;
@@ -644,5 +737,95 @@ mod tests {
         assert_eq!(r.nvram_byte(REG_CENTURY_ALT), 0x19);
         let (year, ..) = r.clock();
         assert_eq!(year, 1926);
+    }
+
+    #[test]
+    fn disabled_periodic_interrupt_latches_nothing() {
+        let mut r = Rtc::new();
+        // Power-on Register B has every enable clear.
+        assert!(!r.tick_interrupts(1));
+        r.write_port(0x70, REG_C);
+        assert_eq!(r.read_port(0x71), Some(0));
+    }
+
+    #[test]
+    fn enabled_periodic_interrupt_sets_pf_and_irqf_then_clears_on_read() {
+        let mut r = Rtc::new();
+        // Enable the periodic interrupt (PIE, bit 6).
+        r.write_port(0x70, REG_B);
+        r.write_port(0x71, REG_B_PIE);
+        assert!(r.tick_interrupts(1)); // rising edge of IRQF
+        r.write_port(0x70, REG_C);
+        let c = r.read_port(0x71).unwrap();
+        assert_ne!(c & REG_C_PF, 0, "PF set");
+        assert_ne!(c & REG_C_IRQF, 0, "IRQF set");
+        // Reading Register C cleared the flags.
+        r.write_port(0x70, REG_C);
+        assert_eq!(r.read_port(0x71), Some(0));
+    }
+
+    #[test]
+    fn pending_flag_reports_no_new_edge_until_acked() {
+        let mut r = Rtc::new();
+        r.write_port(0x70, REG_B);
+        r.write_port(0x71, REG_B_UIE);
+        assert!(r.tick_interrupts(1)); // first edge
+        assert!(!r.tick_interrupts(1)); // still pending, no new edge
+        // Ack by reading Register C, then a tick edges again.
+        r.write_port(0x70, REG_C);
+        let _ = r.read_port(0x71);
+        assert!(r.tick_interrupts(1));
+    }
+
+    #[test]
+    fn alarm_fires_only_on_a_time_match() {
+        let mut r = Rtc::new();
+        r.seed(2026, 6, 22, 1, 10, 30, 45);
+        // Enable the alarm and set it for 10:30:45.
+        r.write_port(0x70, REG_B);
+        r.write_port(0x71, REG_B_AIE);
+        r.write_port(0x70, REG_SECONDS_ALARM);
+        r.write_port(0x71, 45);
+        r.write_port(0x70, REG_MINUTES_ALARM);
+        r.write_port(0x71, 30);
+        r.write_port(0x70, REG_HOURS_ALARM);
+        r.write_port(0x71, 10);
+        assert!(r.tick_interrupts(1));
+        r.write_port(0x70, REG_C);
+        assert_ne!(r.read_port(0x71).unwrap() & REG_C_AF, 0);
+
+        // Move the clock off the alarm time: no match, no flag.
+        r.seed(2026, 6, 22, 1, 10, 30, 46);
+        assert!(!r.tick_interrupts(1));
+    }
+
+    #[test]
+    fn alarm_wildcard_byte_matches_any_value() {
+        let mut r = Rtc::new();
+        r.seed(2026, 6, 22, 1, 7, 15, 3);
+        r.write_port(0x70, REG_B);
+        r.write_port(0x71, REG_B_AIE);
+        // 0xFF seconds/minutes/hours are all "don't care": the alarm fires every
+        // second.
+        r.write_port(0x70, REG_SECONDS_ALARM);
+        r.write_port(0x71, 0xff);
+        r.write_port(0x70, REG_MINUTES_ALARM);
+        r.write_port(0x71, 0xff);
+        r.write_port(0x70, REG_HOURS_ALARM);
+        r.write_port(0x71, 0xff);
+        assert!(r.tick_interrupts(1));
+    }
+
+    #[test]
+    fn writing_register_b_keeps_format_bits_forced() {
+        let mut r = Rtc::new();
+        // Try to clear the format bits and set PIE; the format bits stay set.
+        r.write_port(0x70, REG_B);
+        r.write_port(0x71, REG_B_PIE);
+        r.write_port(0x70, REG_B);
+        let b = r.read_port(0x71).unwrap();
+        assert_ne!(b & REG_B_PIE, 0); // enable took
+        assert_ne!(b & 0x04, 0); // DM still set (binary)
+        assert_ne!(b & 0x02, 0); // 24-hour still set
     }
 }
