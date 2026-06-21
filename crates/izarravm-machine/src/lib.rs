@@ -1322,8 +1322,50 @@ impl Machine {
                 self.set_dx(dx);
                 self.set_int_frame_carry(false);
             }
-            // Set time/date/alarm: the clock is host-driven, so accept and ignore.
-            0x03 | 0x05 | 0x06 | 0x07 => self.set_int_frame_carry(false),
+            // AH=03h set RTC time: CH/CL/DH are BCD hours/minutes/seconds (DL = DST flag,
+            // not modeled). Re-seed the clock keeping the current date.
+            0x03 => {
+                let cx = self.cpu.registers.ecx() as u16;
+                let dx = self.cpu.registers.edx() as u16;
+                let hour = bcd_to_bin((cx >> 8) as u8);
+                let minute = bcd_to_bin(cx as u8);
+                let second = bcd_to_bin((dx >> 8) as u8);
+                let (year, month, day, weekday, ..) = self.rtc.clock();
+                self.rtc
+                    .seed(year, month, day, weekday, hour, minute, second);
+                self.set_int_frame_carry(false);
+            }
+            // AH=05h set RTC date: CH/CL are BCD century/year, DH/DL BCD month/day.
+            // Re-seed keeping the current time.
+            0x05 => {
+                let cx = self.cpu.registers.ecx() as u16;
+                let dx = self.cpu.registers.edx() as u16;
+                let century = bcd_to_bin((cx >> 8) as u8);
+                let yy = bcd_to_bin(cx as u8);
+                let month = bcd_to_bin((dx >> 8) as u8);
+                let day = bcd_to_bin(dx as u8);
+                let year = u16::from(century) * 100 + u16::from(yy);
+                let (_, _, _, weekday, hour, minute, second) = self.rtc.clock();
+                self.rtc
+                    .seed(year, month, day, weekday, hour, minute, second);
+                self.set_int_frame_carry(false);
+            }
+            // AH=0Ah read the system-timer day counter: CX = days since 1980-01-01,
+            // derived from the host-authoritative RTC calendar. AL = 0 (no rollover).
+            0x0A => {
+                let (year, month, day, ..) = self.rtc.clock();
+                self.set_cx(days_since_1980(year, month, day));
+                self.set_eax_al(0);
+                self.set_int_frame_carry(false);
+            }
+            // AH=06h/07h set/cancel alarm: no alarm hardware modeled, accept and ignore.
+            // AH=0Bh set day counter: the RTC calendar is authoritative, so accept it.
+            // AH=08h/0Ch set power-on alarm/date, AH=0Dh reset, AH=0Fh initialize RTC: all
+            // documented as succeeding, and the host-driven clock makes them no-ops.
+            // ponytail: power-management and alarm hardware are not modeled; these return
+            // success without persisting state. Read-back alarm calls (AH=09h/0Eh) keep the
+            // default carry since there is no alarm to report.
+            0x06 | 0x07 | 0x0B | 0x08 | 0x0C | 0x0D | 0x0F => self.set_int_frame_carry(false),
             _ => self.set_int_frame_carry(true),
         }
     }
@@ -3484,6 +3526,31 @@ fn bin_to_bcd(n: u8) -> u8 {
     ((n / 10) << 4) | (n % 10)
 }
 
+/// Convert packed BCD back to binary. The inverse of `bin_to_bcd`, used when a guest
+/// sets the clock through INT 1Ah AH=03h/05h with BCD register fields.
+fn bcd_to_bin(n: u8) -> u8 {
+    (n >> 4) * 10 + (n & 0x0f)
+}
+
+/// Days elapsed from 1980-01-01 to the given calendar date, the count INT 1Ah AH=0Ah
+/// reports. Gregorian leap years; the date is assumed valid (the RTC clamps it).
+fn days_since_1980(year: u16, month: u8, day: u8) -> u16 {
+    const MONTH_DAYS: [u16; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let is_leap = |y: u16| (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let mut days = 0u32;
+    for y in 1980..year {
+        days += if is_leap(y) { 366 } else { 365 };
+    }
+    for m in 1..u16::from(month) {
+        days += u32::from(MONTH_DAYS[(m - 1) as usize]);
+        if m == 2 && is_leap(year) {
+            days += 1;
+        }
+    }
+    days += u32::from(day.saturating_sub(1));
+    days as u16
+}
+
 fn boot_sector_cpu() -> Cpu386 {
     let mut cpu = Cpu386::default();
     for segment in [
@@ -3854,6 +3921,55 @@ mod tests {
         m.handle_int15();
         // EAX must not be rewritten to 'SMAP' when the call is rejected.
         assert_ne!(m.cpu.registers.eax(), 0x534D_4150);
+    }
+
+    #[test]
+    fn int1a_set_and_read_date_round_trips() {
+        let mut m = int15_machine(16);
+        // AH=05h set date: CH/CL century/year BCD, DH/DL month/day BCD -> 2021-07-15.
+        m.cpu.registers.set_eax(0x0500);
+        m.cpu.registers.set_ecx(0x2021);
+        m.cpu.registers.set_edx(0x0715);
+        m.handle_int1a();
+        // AH=04h read date back.
+        m.cpu.registers.set_eax(0x0400);
+        m.handle_int1a();
+        assert_eq!(m.cpu.registers.ecx() as u16, 0x2021);
+        assert_eq!(m.cpu.registers.edx() as u16, 0x0715);
+    }
+
+    #[test]
+    fn int1a_set_and_read_time_round_trips() {
+        let mut m = int15_machine(16);
+        // AH=03h set time: CH/CL hours/minutes BCD, DH seconds BCD -> 13:45:30.
+        m.cpu.registers.set_eax(0x0300);
+        m.cpu.registers.set_ecx(0x1345);
+        m.cpu.registers.set_edx(0x3000);
+        m.handle_int1a();
+        m.cpu.registers.set_eax(0x0200);
+        m.handle_int1a();
+        assert_eq!(m.cpu.registers.ecx() as u16, 0x1345);
+        assert_eq!((m.cpu.registers.edx() as u16) >> 8, 0x30);
+    }
+
+    #[test]
+    fn int1a_day_counter_matches_calendar() {
+        let mut m = int15_machine(16);
+        // 1980-01-02 is day 1 since the 1980-01-01 epoch.
+        m.cpu.registers.set_eax(0x0500);
+        m.cpu.registers.set_ecx(0x1980);
+        m.cpu.registers.set_edx(0x0102);
+        m.handle_int1a();
+        m.cpu.registers.set_eax(0x0A00);
+        m.handle_int1a();
+        assert_eq!(m.cpu.registers.ecx() as u16, 1);
+    }
+
+    #[test]
+    fn days_since_1980_handles_leap_years() {
+        assert_eq!(days_since_1980(1980, 1, 1), 0);
+        assert_eq!(days_since_1980(1980, 3, 1), 60); // 1980 is a leap year (31+29)
+        assert_eq!(days_since_1980(1981, 1, 1), 366);
     }
 
     #[test]
