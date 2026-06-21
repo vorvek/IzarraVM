@@ -516,6 +516,11 @@ pub struct DosKernel {
     // the format AH=47h returns. The current directory is global in DOS, so it is
     // not saved or restored across EXEC.
     cwd: String,
+    // AH=2Eh/54h write-verify flag. The HLE writes host files directly, so this has
+    // no datapath effect; it only round-trips for guests that read it back.
+    verify_flag: bool,
+    // AH=58h memory-allocation strategy. The bump arena ignores it; stored for read-back.
+    alloc_strategy: u16,
 }
 
 impl DosKernel {
@@ -1750,6 +1755,75 @@ impl DosKernel {
                 regs.cf = false;
                 Ok(DosAction::Continue)
             }
+            // AH=00h: terminate the program, the old .COM exit path. Equivalent to
+            // INT 20h: return with exit code 0.
+            0x00 => Ok(DosAction::Exit(0)),
+            // AH=50h: set the current PSP segment (SET PID). AH=51h/62h get it. The
+            // kernel tracks the active PSP as the arena's program segment.
+            0x50 => {
+                self.arena.psp_seg = regs.bx;
+                Ok(DosAction::Continue)
+            }
+            0x51 | 0x62 => {
+                regs.bx = self.arena.psp_seg;
+                Ok(DosAction::Continue)
+            }
+            // AH=0Dh DISK RESET: the HLE writes host files directly, so there are no
+            // DOS buffers to flush. Succeed with CF clear.
+            0x0d => {
+                regs.cf = false;
+                Ok(DosAction::Continue)
+            }
+            // AH=18h/1Dh/1Eh/20h: CP/M-compatibility null functions. Real DOS returns
+            // AL=00h and does nothing else.
+            0x18 | 0x1d | 0x1e | 0x20 => {
+                regs.ax &= 0xff00;
+                Ok(DosAction::Continue)
+            }
+            // AH=2Eh SET VERIFY FLAG (from AL) / AH=54h GET VERIFY FLAG (into AL). The
+            // flag has no effect on the direct host writes; it only round-trips.
+            0x2e => {
+                self.verify_flag = (regs.ax & 0xff) != 0;
+                Ok(DosAction::Continue)
+            }
+            0x54 => {
+                regs.ax = (regs.ax & 0xff00) | u16::from(self.verify_flag);
+                Ok(DosAction::Continue)
+            }
+            // AH=58h GET/SET MEMORY ALLOCATION STRATEGY. AL=00 get (AX=strategy), AL=01
+            // set (BX=strategy). The bump arena ignores the strategy; stored for read-back.
+            0x58 => match regs.ax as u8 {
+                0x00 => {
+                    regs.ax = self.alloc_strategy;
+                    regs.cf = false;
+                    Ok(DosAction::Continue)
+                }
+                0x01 => {
+                    self.alloc_strategy = regs.bx;
+                    regs.cf = false;
+                    Ok(DosAction::Continue)
+                }
+                _ => {
+                    set_dos_error(regs, 0x01); // invalid subfunction
+                    Ok(DosAction::Continue)
+                }
+            },
+            // AH=67h SET HANDLE COUNT: the handle table is an unbounded map, so the
+            // requested count always fits. Succeed.
+            0x67 => {
+                regs.cf = false;
+                Ok(DosAction::Continue)
+            }
+            // AH=68h/6Ah COMMIT FILE (fflush): host writes are unbuffered at the DOS
+            // layer, so there is nothing to flush. Succeed for a valid open handle.
+            0x68 | 0x6a => {
+                if self.open_files.contains_key(&regs.bx) {
+                    regs.cf = false;
+                } else {
+                    set_dos_error(regs, 0x06); // invalid handle
+                }
+                Ok(DosAction::Continue)
+            }
             // Other file functions (find) and everything else are not yet
             // implemented; later slices fill them in. An unimplemented function
             // returns Continue so the IRET stub returns to the caller.
@@ -2322,6 +2396,114 @@ mod tests {
             0x0d,
             "CR stored after the chars"
         );
+    }
+
+    #[test]
+    fn ah00_terminates_the_program() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let mut regs = DosRegs {
+            ax: 0x0000,
+            ..Default::default()
+        };
+        let action = kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(action, DosAction::Exit(0));
+    }
+
+    #[test]
+    fn ah50_51_62_get_and_set_current_psp() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let mut regs = DosRegs {
+            ax: 0x5000,
+            bx: 0x1234,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap(); // set PSP
+        for ah in [0x5100u16, 0x6200] {
+            let mut regs = DosRegs {
+                ax: ah,
+                ..Default::default()
+            };
+            kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+            assert_eq!(regs.bx, 0x1234);
+        }
+    }
+
+    #[test]
+    fn ah2e_54_verify_flag_round_trips() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let mut regs = DosRegs {
+            ax: 0x2e01,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap(); // set verify on
+        let mut regs = DosRegs {
+            ax: 0x5400,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(regs.ax & 0xff, 1);
+    }
+
+    #[test]
+    fn ah58_alloc_strategy_round_trips() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let mut regs = DosRegs {
+            ax: 0x5801,
+            bx: 0x0002,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap(); // set strategy
+        assert!(!regs.cf);
+        let mut regs = DosRegs {
+            ax: 0x5800,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf);
+        assert_eq!(regs.ax, 2);
+    }
+
+    #[test]
+    fn ah18_null_function_returns_al_zero() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let mut regs = DosRegs {
+            ax: 0x18ff,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(regs.ax & 0xff, 0);
+    }
+
+    #[test]
+    fn ah0d_disk_reset_succeeds() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let mut regs = DosRegs {
+            ax: 0x0d00,
+            cf: true,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf);
+    }
+
+    #[test]
+    fn ah68_commit_invalid_handle_errors() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let mut regs = DosRegs {
+            ax: 0x6800,
+            bx: 0x0099,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x06);
     }
 
     #[test]
