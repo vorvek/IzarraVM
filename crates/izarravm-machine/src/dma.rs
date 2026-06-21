@@ -322,6 +322,17 @@ impl DmaChip {
         self.command & 0x04 != 0
     }
 
+    /// Whether a software DREQ on channel 0 is currently armed to launch a
+    /// memory-to-memory transfer: mem-to-mem enabled (command bit0), the
+    /// controller live, channel 0 unmasked, and its request-register bit set. The
+    /// machine checks this after a write to the request register to fire the copy.
+    fn mem_to_mem_request_armed(&self) -> bool {
+        self.mem_to_mem_enabled()
+            && !self.controller_disabled()
+            && !self.channels[0].mask
+            && self.request_reg & 0x01 != 0
+    }
+
     /// Read one byte from the device (memory->device) on local channel `ci`,
     /// latching terminal-count into the status register. Returns None when the
     /// controller is disabled by command bit2.
@@ -399,6 +410,10 @@ impl DmaChip {
                 break;
             }
         }
+        // The 8237A resets the software DREQ when the channel reaches terminal
+        // count. Clear the source/dest request bits so a later unrelated write to
+        // the request register cannot re-trigger this copy.
+        self.request_reg &= !0x03;
         Some(copied)
     }
 
@@ -586,9 +601,15 @@ impl DmaController {
     /// count copied, or None when not enabled or the controller is disabled.
     // ponytail: only the master pair carries the mem-to-mem hardware; the slave
     // 8237A never does on the PC/AT, so no slave variant exists.
-    #[allow(dead_code)] // ponytail: no Machine-level mem-to-mem wiring yet (see DmaChannel::write_byte).
     pub(crate) fn mem_to_mem(&mut self, memory: &mut Memory) -> Option<usize> {
         self.master.mem_to_mem(memory)
+    }
+
+    /// Whether a software DREQ on master channel 0 is armed to launch a
+    /// memory-to-memory transfer. The machine checks this after a request-register
+    /// write (port 0x09) and, when true, calls `mem_to_mem` to move the block.
+    pub(crate) fn mem_to_mem_request_armed(&self) -> bool {
+        self.master.mem_to_mem_request_armed()
     }
 }
 
@@ -1129,6 +1150,37 @@ mod tests {
         // Both address counters advanced past the block.
         assert_eq!(dma.master.channels[0].cur_addr, 0x0104, "source advanced");
         assert_eq!(dma.master.channels[1].cur_addr, 0x0204, "dest advanced");
+    }
+
+    #[test]
+    fn mem_to_mem_software_request_is_reset_at_terminal_count() {
+        let mut dma = DmaController::default();
+        dma.write_port(0x00, 0x00); // ch0 source 0x0100
+        dma.write_port(0x00, 0x01);
+        dma.write_port(0x01, 0x0A); // ch0 count 10: large enough not to self-reach TC
+        dma.write_port(0x01, 0x00);
+        dma.write_port(0x02, 0x00); // ch1 dest 0x0200
+        dma.write_port(0x02, 0x02);
+        dma.write_port(0x03, 0x01); // ch1 count 1 -> 2 bytes
+        dma.write_port(0x03, 0x00);
+        dma.write_port(0x0A, 0x00); // unmask ch0
+        dma.write_port(0x08, 0x01); // mem-to-mem enable
+        dma.write_port(0x09, 0x04); // software request: set channel 0
+        assert!(
+            dma.mem_to_mem_request_armed(),
+            "request armed before the copy"
+        );
+
+        let mut mem = Memory::new(0x0300).unwrap();
+        dma.mem_to_mem(&mut mem).expect("a block copy");
+
+        // Channel 0 did not exhaust its count, so it is not self-masked; the request
+        // is no longer armed only because the software DREQ was reset at TC.
+        assert!(!dma.master.channels[0].mask, "ch0 still unmasked");
+        assert!(
+            !dma.mem_to_mem_request_armed(),
+            "software request reset at terminal count, no spurious re-arm"
+        );
     }
 
     #[test]

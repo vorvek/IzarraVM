@@ -365,10 +365,34 @@ impl Counter {
     }
 }
 
+/// The AT DRAM-refresh divisor: channel 1 runs mode 2 with this count so its OUT
+/// pulses at the refresh rate. A real AT BIOS POST programs 18 (0x12); the exact
+/// period is approximate, the value only needs to make port 0x61 bit 4 toggle.
+// ponytail: 18 is the canonical AT refresh divisor but the precise refresh
+// timing is not modeled to the nanosecond; this only seeds a live heartbeat.
+const REFRESH_DIVISOR: u16 = 18;
+
 /// The three-counter 8254. Channel 0's OUT rising edge is IRQ0.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Pit {
     counters: [Counter; 3],
+}
+
+impl Default for Pit {
+    /// Power-on state with channel 1 pre-seeded as the AT DRAM-refresh timer
+    /// (mode 2, count 18). A guest that never programs channel 1 still sees port
+    /// 0x61 bit 4 toggle, the "memory refresh is alive" heartbeat some guests spin
+    /// on, exactly as a real AT does after its BIOS programs the refresh timer.
+    fn default() -> Self {
+        let mut pit = Self {
+            counters: [Counter::default(), Counter::default(), Counter::default()],
+        };
+        // Counter 1, LSB/MSB, mode 2, binary: SC=01, RW=11, mode=010 -> 0x74.
+        pit.write_control_word(0x74);
+        pit.counters[1].write_count((REFRESH_DIVISOR & 0xff) as u8);
+        pit.counters[1].write_count((REFRESH_DIVISOR >> 8) as u8);
+        pit
+    }
 }
 
 impl Pit {
