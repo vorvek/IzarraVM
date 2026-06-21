@@ -469,6 +469,8 @@ enum StringOp {
     Scas,
     Stos,
     Lods,
+    Ins,
+    Outs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -783,6 +785,79 @@ impl Cpu386 {
                 let imm = sign_extend_u8(self.fetch_u8(bus)?);
                 let result = self.imul_truncated(src, imm, operand_size);
                 self.write_gpr_sized(modrm.reg, operand_size, result);
+                Ok(clocks(14))
+            }
+            0x62 => {
+                // BOUND r, m: the memory operand holds the signed lower and upper array
+                // bounds; if the register is outside [lower, upper] raise #BR (vector 5).
+                let modrm = self.fetch_modrm(bus)?;
+                let memory = match self.decode_rm_operand(bus, prefixes, address_size, modrm)? {
+                    RmOperand::Memory(memory) => memory,
+                    RmOperand::Register(_) => {
+                        return Err(InternalFault::Exception {
+                            vector: 6,
+                            error_code: None,
+                        });
+                    }
+                };
+                let size = operand_size.bytes();
+                let lower = self.read_memory_sized(
+                    bus,
+                    memory.segment,
+                    memory.offset,
+                    operand_size,
+                    BusAccessKind::DataRead,
+                )?;
+                let upper = self.read_memory_sized(
+                    bus,
+                    memory.segment,
+                    memory.offset + size,
+                    operand_size,
+                    BusAccessKind::DataRead,
+                )?;
+                let index = self.read_gpr_sized(modrm.reg, operand_size);
+                let (index, lower, upper) = match operand_size {
+                    OperandSize::Word => (
+                        i32::from(index as u16 as i16),
+                        i32::from(lower as u16 as i16),
+                        i32::from(upper as u16 as i16),
+                    ),
+                    OperandSize::Dword => (index as i32, lower as i32, upper as i32),
+                };
+                if index < lower || index > upper {
+                    return Err(InternalFault::Exception {
+                        vector: 5,
+                        error_code: None,
+                    });
+                }
+                Ok(clocks(10))
+            }
+            0x6c => {
+                self.run_string(bus, StringOp::Ins, BusWidth::Byte, prefixes, address_size)?;
+                Ok(clocks(15))
+            }
+            0x6d => {
+                self.run_string(
+                    bus,
+                    StringOp::Ins,
+                    operand_size.bus_width(),
+                    prefixes,
+                    address_size,
+                )?;
+                Ok(clocks(15))
+            }
+            0x6e => {
+                self.run_string(bus, StringOp::Outs, BusWidth::Byte, prefixes, address_size)?;
+                Ok(clocks(14))
+            }
+            0x6f => {
+                self.run_string(
+                    bus,
+                    StringOp::Outs,
+                    operand_size.bus_width(),
+                    prefixes,
+                    address_size,
+                )?;
                 Ok(clocks(14))
             }
             0x70..=0x7f => {
@@ -3181,6 +3256,18 @@ impl Cpu386 {
             StringOp::Lods => {
                 let value = self.read_string_src(bus, prefixes, address_size, width)?;
                 self.acc_write(width, value);
+                self.adjust_index_register(6, address_size, bytes);
+            }
+            StringOp::Ins => {
+                // INS: [ES:DI] <- port[DX]. ES cannot be overridden.
+                let value = bus.read_io(self.read_gpr16(2), width)?;
+                self.write_string_dst(bus, address_size, width, value)?;
+                self.adjust_index_register(7, address_size, bytes);
+            }
+            StringOp::Outs => {
+                // OUTS: port[DX] <- [DS:SI] (segment overridable).
+                let value = self.read_string_src(bus, prefixes, address_size, width)?;
+                bus.write_io(self.read_gpr16(2), width, value)?;
                 self.adjust_index_register(6, address_size, bytes);
             }
         }
@@ -12193,5 +12280,71 @@ mod tests {
         );
         // JMP clears the old TSS busy bit in its GDT descriptor (0x8b -> 0x89).
         assert_eq!(bus.memory[0x100 + 0x20 + 5], 0x89);
+    }
+
+    // ---- Phase 1 slice 2 cleanup: BOUND and INS/OUTS ----
+
+    #[test]
+    fn bound_passes_when_in_range() {
+        // BOUND AX, [0x100] (62 06 00 01); bounds [10, 20]; AX = 15.
+        let (mut cpu, mut memory) = real_mode_cpu(&[0x62, 0x06, 0x00, 0x01], 0x200);
+        memory[0x100..0x102].copy_from_slice(&10u16.to_le_bytes());
+        memory[0x102..0x104].copy_from_slice(&20u16.to_le_bytes());
+        cpu.write_reg16(Reg16::Ax, 15);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.eip, 4);
+    }
+
+    #[test]
+    fn bound_raises_br_out_of_range() {
+        let (mut cpu, mut memory) = real_mode_cpu(&[0x62, 0x06, 0x00, 0x01], 0x200);
+        memory[0x100..0x102].copy_from_slice(&10u16.to_le_bytes());
+        memory[0x102..0x104].copy_from_slice(&20u16.to_le_bytes());
+        cpu.write_reg16(Reg16::Ax, 25);
+        let mut bus = TestBus::with_memory(memory);
+        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        assert!(matches!(fault, InternalFault::Exception { vector: 5, .. }));
+    }
+
+    #[test]
+    fn insb_stores_port_byte_to_es_di() {
+        // INSB (0x6C): [ES:DI] <- port[DX]. TestBus returns 0, so the 0xFF clears.
+        let (mut cpu, mut memory) = real_mode_cpu(&[0x6c], 0x200);
+        memory[0x100] = 0xff;
+        cpu.write_reg16(Reg16::Dx, 0x03f8);
+        cpu.write_reg16(Reg16::Di, 0x0100);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(bus.memory[0x100], 0x00);
+        assert_eq!(cpu.read_reg16(Reg16::Di), 0x0101);
+        assert!(
+            bus.trace
+                .cycles()
+                .iter()
+                .any(|c| c.kind == BusAccessKind::IoRead && c.address == 0x03f8)
+        );
+    }
+
+    #[test]
+    fn rep_outsw_writes_words_from_ds_si() {
+        // REP OUTSW (F3 6F): write CX words from [DS:SI] to port[DX].
+        let (mut cpu, memory) = real_mode_cpu(&[0xf3, 0x6f], 0x200);
+        cpu.write_reg16(Reg16::Cx, 2);
+        cpu.write_reg16(Reg16::Si, 0x0100);
+        cpu.write_reg16(Reg16::Dx, 0x03f8);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        let writes = bus
+            .trace
+            .cycles()
+            .iter()
+            .filter(|c| {
+                c.kind == BusAccessKind::IoWrite && c.width == BusWidth::Word && c.address == 0x03f8
+            })
+            .count();
+        assert_eq!(writes, 2);
+        assert_eq!(cpu.read_reg16(Reg16::Cx), 0);
+        assert_eq!(cpu.read_reg16(Reg16::Si), 0x0104);
     }
 }
