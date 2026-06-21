@@ -29,6 +29,7 @@ mod rtc;
 mod speaker;
 mod uart;
 mod unittester;
+mod xms;
 
 pub use cdimage::CdImage;
 
@@ -314,6 +315,10 @@ pub struct Machine {
     // Where the unit tester's Snapshot command writes PPM frames, set by the
     // host. None disables snapshots (the command becomes a no-op).
     test_snapshot_path: Option<std::path::PathBuf>,
+    // XMS (eXtended Memory Specification) driver state: the EMB allocator over
+    // RAM above 1 MB, the HMA-allocation flag, and the local-A20 nesting count. A
+    // guest reaches it via INT 2Fh AX=4310h (an INT 66h entry stub in ROM).
+    xms: xms::XmsState,
 }
 
 /// INT 33h mouse-driver state. Coordinates are in a virtual screen space that
@@ -414,10 +419,18 @@ impl Machine {
     /// shares the rest (devices, audio chips, timing accumulators). The caller
     /// installs the BIOS stubs and any boot/program image afterwards, where the
     /// ordering relative to those memory writes matters.
-    fn base(profile: MachineProfile, cpu: Cpu386, rom: Vec<u8>) -> Result<Self, MachineError> {
+    fn base(profile: MachineProfile, cpu: Cpu386, mut rom: Vec<u8>) -> Result<Self, MachineError> {
         let mixer = power_on_mixer(&profile);
         let active_mode = profile.cpu;
+        let memory_mib = profile.memory_mib;
         let timing = TimingFactors::for_clock(active_mode.clock_hz());
+        // Lay the XMS driver entry stub into ROM. INT 2Fh AX=4310h hands the guest
+        // a far pointer to it; a guest FAR-CALLs there, the INT 66h traps into the
+        // host XMS handler, and the RETF returns. Placed at a fixed ROM offset that
+        // no other BIOS stub uses (the IRET is at 0xF000, the reset vector at
+        // 0xFFF0). See XMS_ENTRY_ROM_OFFSET for the bytes.
+        rom[XMS_ENTRY_ROM_OFFSET..XMS_ENTRY_ROM_OFFSET + XMS_ENTRY_STUB.len()]
+            .copy_from_slice(&XMS_ENTRY_STUB);
         let machine = Self {
             memory: Memory::from_mib(profile.memory_mib)?,
             profile,
@@ -478,6 +491,7 @@ impl Machine {
             mouse: MouseState::default(),
             unittester: unittester::UnitTester::default(),
             test_snapshot_path: None,
+            xms: xms::XmsState::new(memory_mib),
         };
         // The Margo LFB aperture is decoded before RAM, so system memory must
         // stay below it. Validated config caps memory far under this bound.
@@ -2195,17 +2209,21 @@ impl Machine {
                 self.cpu.registers.set_ebx(ebx);
                 true
             }
-            // XMS install check (INT 2F/AX=4300h). No XMS/HIMEM driver is loaded, so
-            // the honest answer is AL=00h (not installed). A guest that wants extended
-            // memory uses the INT 15h paths (AH=88h/E801h/E820h) instead.
+            // XMS install check (INT 2F/AX=4300h). The host XMS driver is present, so
+            // report AL=80h. The guest then asks for the entry point with AX=4310h.
             0x4300 => {
-                self.set_eax_al(0x00);
+                self.set_eax_al(0x80);
                 true
             }
-            // Get XMS driver entry point (AX=4310h): with no driver installed there is
-            // no ES:BX entry to hand back, so leave the registers unchanged and report
-            // unhandled. The install check already told the guest XMS is absent.
-            0x4310 => false,
+            // Get XMS driver entry point (AX=4310h): return ES:BX -> the INT 66h entry
+            // stub in ROM. The guest FAR-CALLs it to reach the XMS functions.
+            0x4310 => {
+                self.cpu
+                    .registers
+                    .set_segment(SegmentIndex::Es, SegmentRegister::real(XMS_ENTRY_SEG));
+                self.set_bx(XMS_ENTRY_OFF);
+                true
+            }
             // Get ICDEX version: BH = major, BL = minor. Report 2.23.
             0x150C => {
                 let ebx = (self.cpu.registers.ebx() & !0xFFFF) | 0x0217; // 2.23
@@ -2232,6 +2250,247 @@ impl Machine {
             }
             _ => false,
         }
+    }
+
+    /// Service the XMS driver, reached when a guest FAR-CALLs the entry point
+    /// (INT 2Fh AX=4310h) and the stub runs `INT 66h`. The function is in AH; on
+    /// return AX=1 means success, AX=0 means failure with the error code in BL.
+    /// Register conventions follow the XMS 3.0 specification. The pure allocator
+    /// and HMA/A20 bookkeeping live in `xms.rs`; this method moves values between
+    /// the guest registers/memory and that state, and routes A20 to the 8042.
+    fn handle_xms(&mut self) {
+        let ah = (self.cpu.registers.eax() as u16 >> 8) as u8;
+        match ah {
+            // 00h: get version. AX = XMS version (3.00), BX = driver revision,
+            // DX = 1 if the HMA exists. This call never fails.
+            0x00 => {
+                self.set_ax(0x0300);
+                self.set_bx(xms::DRIVER_REVISION);
+                self.set_dx(u16::from(self.xms.hma_exists()));
+            }
+            // 01h request HMA, 02h release HMA.
+            0x01 => {
+                let result = self.xms.request_hma();
+                self.xms_result(result);
+            }
+            0x02 => {
+                let result = self.xms.release_hma();
+                self.xms_result(result);
+            }
+            // 03h global enable A20, 04h global disable A20. Route to the single
+            // A20 source of truth (the 8042 output port, shared with port 0x92).
+            0x03 => {
+                self.keyboard.set_a20(true);
+                self.xms_success();
+            }
+            0x04 => {
+                self.keyboard.set_a20(false);
+                self.xms_success();
+            }
+            // 05h local enable A20, 06h local disable A20. Keep the nesting count
+            // and drive the gate only on the 0<->1 transition.
+            0x05 => {
+                if self.xms.local_enable_a20() {
+                    self.keyboard.set_a20(true);
+                }
+                self.xms_success();
+            }
+            0x06 => {
+                if self.xms.local_disable_a20() {
+                    self.keyboard.set_a20(false);
+                }
+                self.xms_success();
+            }
+            // 07h query A20: AX = 1 if enabled, else 0. BL = 0 (this is a query,
+            // not an error path), per the XMS 3.0 spec.
+            0x07 => {
+                self.set_ax(u16::from(self.keyboard.a20_enabled()));
+                self.set_eax_bl_ok();
+            }
+            // 08h query free extended memory: AX = largest free block KB,
+            // DX = total free KB. BL = 0 on success.
+            0x08 => {
+                let (largest, total) = self.xms.query_free();
+                self.set_ax(largest.min(0xFFFF) as u16);
+                self.set_dx(total.min(0xFFFF) as u16);
+                self.set_eax_bl_ok();
+            }
+            // 09h allocate EMB: DX = KB requested -> DX = handle. AX = 1 / BL = err.
+            0x09 => {
+                let kb = self.cpu.registers.edx() as u16;
+                match self.xms.allocate(kb) {
+                    Ok(handle) => {
+                        self.set_dx(handle);
+                        self.xms_success();
+                    }
+                    Err(code) => self.xms_failure(code),
+                }
+            }
+            // 0Ah free EMB: DX = handle.
+            0x0A => {
+                let handle = self.cpu.registers.edx() as u16;
+                let result = self.xms.free(handle);
+                self.xms_result(result);
+            }
+            // 0Bh move EMB: DS:SI -> the move descriptor.
+            0x0B => self.xms_move(),
+            // 0Ch lock EMB: DX = handle -> DX:BX = 32-bit linear address, lock++.
+            0x0C => {
+                let handle = self.cpu.registers.edx() as u16;
+                match self.xms.lock(handle) {
+                    Ok(linear) => {
+                        self.set_dx((linear >> 16) as u16);
+                        self.set_bx(linear as u16);
+                        self.xms_success();
+                    }
+                    Err(code) => self.xms_failure(code),
+                }
+            }
+            // 0Dh unlock EMB: DX = handle.
+            0x0D => {
+                let handle = self.cpu.registers.edx() as u16;
+                let result = self.xms.unlock(handle);
+                self.xms_result(result);
+            }
+            // 0Eh get EMB handle info: DX = handle -> BH = lock count,
+            // BL = free handles, DX = size KB.
+            0x0E => {
+                let handle = self.cpu.registers.edx() as u16;
+                match self.xms.handle_info(handle) {
+                    Ok((lock, free_handles, size_kb)) => {
+                        self.set_bx((u16::from(lock) << 8) | u16::from(free_handles));
+                        self.set_dx(size_kb);
+                        // 0Eh signals success with AX=1 and leaves BL as the free
+                        // handle count, so set AX without touching BL.
+                        self.set_ax(0x0001);
+                    }
+                    Err(code) => self.xms_failure(code),
+                }
+            }
+            // 0Fh resize EMB: BX = new KB, DX = handle.
+            0x0F => {
+                let kb = self.cpu.registers.ebx() as u16;
+                let handle = self.cpu.registers.edx() as u16;
+                let result = self.xms.resize(handle, kb);
+                self.xms_result(result);
+            }
+            // 10h request UMB, 11h release UMB. No upper memory blocks are modeled,
+            // so 10h fails "no UMBs available" (BL=B1h) with the largest available
+            // block in DX=0; 11h fails "invalid segment" (BL=B2h). A guest reads
+            // this as "no UMB" and falls back to conventional memory.
+            // ponytail: no UMB region exists yet. The upgrade path is the memory
+            // mapper backing a UMB window in the 0xC000-0xEFFF hole and answering
+            // 10h/11h from it.
+            0x10 => {
+                self.set_dx(0x0000);
+                self.xms_failure(0xB1);
+            }
+            0x11 => self.xms_failure(0xB2),
+            // Unimplemented function: AX=0, BL=80h (not implemented).
+            _ => self.xms_failure(xms::err::NOT_IMPLEMENTED),
+        }
+    }
+
+    /// Report XMS success: AX = 1, BL = 0.
+    fn xms_success(&mut self) {
+        self.set_ax(0x0001);
+        self.set_eax_bl_ok();
+    }
+
+    /// Report XMS failure: AX = 0, BL = error code.
+    fn xms_failure(&mut self, code: u8) {
+        self.set_ax(0x0000);
+        let ebx = (self.cpu.registers.ebx() & !0xFF) | u32::from(code);
+        self.cpu.registers.set_ebx(ebx);
+    }
+
+    /// Map a `Result<(), u8>` from the XMS state onto the AX/BL convention.
+    fn xms_result(&mut self, result: Result<(), u8>) {
+        match result {
+            Ok(()) => self.xms_success(),
+            Err(code) => self.xms_failure(code),
+        }
+    }
+
+    /// Clear BL (the low byte of EBX), leaving the rest of EBX intact. Success
+    /// returns BL = 0.
+    fn set_eax_bl_ok(&mut self) {
+        let ebx = self.cpu.registers.ebx() & !0xFF;
+        self.cpu.registers.set_ebx(ebx);
+    }
+
+    /// XMS function 0Bh: move memory between EMBs and/or conventional memory using
+    /// the move descriptor at DS:SI. The descriptor is, little-endian:
+    ///   +0  DWORD length in bytes
+    ///   +4  WORD  source handle (0 = real-mode pointer)
+    ///   +6  DWORD source offset (or seg:off if handle 0)
+    ///   +10 WORD  dest handle (0 = real-mode pointer)
+    ///   +12 DWORD dest offset (or seg:off if handle 0)
+    /// A zero length is a legal no-op success. Both endpoints are resolved to
+    /// linear addresses and bounds-checked; the copy goes byte by byte through the
+    /// flat address space, so overlapping ranges copy correctly when dest < src.
+    fn xms_move(&mut self) {
+        let ds = self.cpu.registers.segment(SegmentIndex::Ds).base;
+        let si = self.cpu.registers.esi() as u16;
+        let desc = ds.wrapping_add(u32::from(si));
+        let length = self.read_guest_dword(desc);
+        let src_handle = self.read_guest_word(desc + 4);
+        let src_offset = self.read_guest_dword(desc + 6);
+        let dst_handle = self.read_guest_word(desc + 10);
+        let dst_offset = self.read_guest_dword(desc + 12);
+
+        if length == 0 {
+            self.xms_success();
+            return;
+        }
+        // The XMS spec requires an even byte count; an odd length is error A7h.
+        if length % 2 != 0 {
+            self.xms_failure(xms::err::INVALID_LENGTH);
+            return;
+        }
+
+        let src = match self.xms.move_endpoint(
+            src_handle,
+            src_offset,
+            length,
+            xms::err::INVALID_SOURCE_HANDLE,
+            xms::err::INVALID_SOURCE_OFFSET,
+        ) {
+            Ok(addr) => addr,
+            Err(code) => {
+                self.xms_failure(code);
+                return;
+            }
+        };
+        let dst = match self.xms.move_endpoint(
+            dst_handle,
+            dst_offset,
+            length,
+            xms::err::INVALID_DEST_HANDLE,
+            xms::err::INVALID_DEST_OFFSET,
+        ) {
+            Ok(addr) => addr,
+            Err(code) => {
+                self.xms_failure(code);
+                return;
+            }
+        };
+
+        // Copy through the flat space. Overlap-safe: when dest is below source,
+        // copy ascending; otherwise descending. (The XMS spec leaves overlapping
+        // behavior undefined, but a real HIMEM does the non-clobbering direction.)
+        if dst <= src {
+            for i in 0..length {
+                let byte = self.read_physical_u8(src + i);
+                self.write_physical_u8(dst + i, byte);
+            }
+        } else {
+            for i in (0..length).rev() {
+                let byte = self.read_physical_u8(src + i);
+                self.write_physical_u8(dst + i, byte);
+            }
+        }
+        self.xms_success();
     }
 
     /// Service INT 28h (DOS idle). DOS calls this from its keyboard-wait loop so a
@@ -4529,6 +4788,7 @@ impl Machine {
                             0x2F => {
                                 self.handle_int2f();
                             }
+                            0x66 => self.handle_xms(),
                             0x20 | 0x21 => match self.handle_dos_int(vector) {
                                 Ok(Some(code)) => {
                                     if let Some(frame) = self.program_frames.pop() {
@@ -4949,6 +5209,7 @@ impl CpuBus for MachineBus<'_> {
                 | 0x29
                 | 0x2F
                 | 0x33
+                | 0x66
         ) {
             *self.pending_soft_int = Some(vector);
         }
@@ -5146,6 +5407,28 @@ const BIOS_HALT_STUB_ADDRESS: usize = 0x0620;
 /// offset word then segment word; INT 15h AX=C208h reads it back.
 const EBDA_MOUSE_HANDLER_OFF: u32 = 0x0022;
 
+/// Soft-INT vector the XMS driver entry stub triggers to trap into the host. INT
+/// 66h sits in the user-reserved range (RBIL: INT 60h-66h are free for
+/// application use, and EMS is the next vector, 67h), so claiming it does not
+/// collide with any DOS/BIOS service or with EMS. It is dispatched only as a
+/// software INT from the entry stub; the CPU never faults with this vector.
+const XMS_INT_VECTOR: u8 = 0x66;
+
+/// ROM offset of the XMS driver entry stub. The ROM maps at LOW_BIOS_BASE
+/// (0xF0000), so offset 0xF010 is physical 0xFF010, i.e. segment:offset
+/// FF00:0010. That clears the ROM IRET at 0xF000 and the reset vector at 0xFFF0.
+const XMS_ENTRY_ROM_OFFSET: usize = 0xf010;
+
+/// Real-mode segment:offset of the XMS entry stub, handed back in ES:BX by INT
+/// 2Fh AX=4310h.
+const XMS_ENTRY_SEG: u16 = 0xff00;
+const XMS_ENTRY_OFF: u16 = 0x0010;
+
+/// The XMS entry stub bytes: `INT 66h` then `RETF`. A guest FAR-CALLs the entry,
+/// the INT traps into the host XMS handler (which sets AX/BX/DX/etc. from the
+/// function in AH), and the RETF returns to the caller.
+const XMS_ENTRY_STUB: [u8; 3] = [0xcd, XMS_INT_VECTOR, 0xcb];
+
 /// Real-mode segment of the 1 KB extended BIOS data area (EBDA), reserved at the
 /// top of conventional memory. Segment 0x9FC0 is physical 0x9FC00, so the EBDA
 /// runs 0x9FC00-0x9FFFF and the conventional-memory word at 0040:0013 drops from
@@ -5166,10 +5449,11 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     // host-serviced boot and diskless vectors (the run loop services them and
     // redirects CS:IP itself, so the IRET target is only a fallback). INT 1Bh is
     // the Ctrl-Break hook: no host handler, just a default IRET so a guest that
-    // hooks it or calls it through the vector has a valid target.
+    // hooks it or calls it through the vector has a valid target. INT 66h is the
+    // XMS driver entry trap, host-intercepted the same way.
     for vector in [
         0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x25, 0x26, 0x28, 0x29,
-        0x2F, 0x33,
+        0x2F, 0x33, 0x66,
     ] {
         let address = vector * 4;
         memory.write_u16(address, 0)?;
@@ -6027,6 +6311,191 @@ mod tests {
     }
 
     #[test]
+    fn xms_install_check_reports_present_and_entry_point() {
+        let mut m = int15_machine(16);
+        // INT 2Fh AX=4300h: AL = 80h means XMS present.
+        m.cpu.registers.set_eax(0x4300);
+        assert!(m.handle_int2f(), "4300h handled");
+        assert_eq!(m.cpu.registers.eax() as u8, 0x80, "AL=80h XMS present");
+        // INT 2Fh AX=4310h: ES:BX -> the entry stub. The stub bytes are INT 66h; RETF.
+        m.cpu.registers.set_eax(0x4310);
+        assert!(m.handle_int2f(), "4310h handled");
+        let es = m.cpu.registers.segment(SegmentIndex::Es).selector;
+        let bx = m.cpu.registers.ebx() as u16;
+        assert_eq!(es, XMS_ENTRY_SEG);
+        assert_eq!(bx, XMS_ENTRY_OFF);
+        let linear = (u32::from(es) << 4) + u32::from(bx);
+        assert_eq!(
+            m.read_physical_u8(linear),
+            0xCD,
+            "stub starts with the INT opcode"
+        );
+        assert_eq!(m.read_physical_u8(linear + 1), XMS_INT_VECTOR, "INT 66h");
+        assert_eq!(m.read_physical_u8(linear + 2), 0xCB, "RETF");
+    }
+
+    #[test]
+    fn xms_version_reports_three_oh_oh() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x0000); // AH=00h get version
+        m.handle_xms();
+        assert_eq!(m.cpu.registers.eax() as u16, 0x0300, "AX=3.00");
+        assert_eq!(m.cpu.registers.ebx() as u16, xms::DRIVER_REVISION, "BX rev");
+        assert_eq!(m.cpu.registers.edx() as u16, 0x0001, "DX=1 HMA exists");
+    }
+
+    #[test]
+    fn xms_allocate_lock_unlock_free_round_trip() {
+        let mut m = int15_machine(16);
+        // Query free first (AH=08h): record the total.
+        m.cpu.registers.set_eax(0x0800);
+        m.handle_xms();
+        let total_before = m.cpu.registers.edx() as u16;
+        assert!(
+            total_before > 0,
+            "extended memory is free on a 16 MB machine"
+        );
+
+        // Allocate 64 KB (AH=09h, DX=KB).
+        m.cpu.registers.set_eax(0x0900);
+        m.cpu.registers.set_edx(64);
+        m.handle_xms();
+        assert_eq!(m.cpu.registers.eax() as u16, 0x0001, "alloc success");
+        let handle = m.cpu.registers.edx() as u16;
+        assert_ne!(handle, 0);
+
+        // Lock (AH=0Ch, DX=handle) -> DX:BX linear address.
+        m.cpu.registers.set_eax(0x0C00);
+        m.cpu.registers.set_edx(handle.into());
+        m.handle_xms();
+        assert_eq!(m.cpu.registers.eax() as u16, 0x0001, "lock success");
+        let linear = (u32::from(m.cpu.registers.edx() as u16) << 16)
+            | u32::from(m.cpu.registers.ebx() as u16);
+        assert!(
+            linear >= 0x10_0000,
+            "locked EMB linear address is above 1 MB, got {linear:#x}"
+        );
+
+        // Query free now shows 64 KB less.
+        m.cpu.registers.set_eax(0x0800);
+        m.handle_xms();
+        let total_locked = m.cpu.registers.edx() as u16;
+        assert_eq!(total_before - total_locked, 64, "alloc consumed 64 KB");
+
+        // A locked block cannot be freed (AH=0Ah): AX=0, BL=ABh.
+        m.cpu.registers.set_eax(0x0A00);
+        m.cpu.registers.set_edx(handle.into());
+        m.handle_xms();
+        assert_eq!(m.cpu.registers.eax() as u16, 0x0000, "free of locked fails");
+        assert_eq!(m.cpu.registers.ebx() as u8, xms::err::BLOCK_LOCKED);
+
+        // Unlock (AH=0Dh) then free (AH=0Ah) succeed.
+        m.cpu.registers.set_eax(0x0D00);
+        m.cpu.registers.set_edx(handle.into());
+        m.handle_xms();
+        assert_eq!(m.cpu.registers.eax() as u16, 0x0001, "unlock success");
+        m.cpu.registers.set_eax(0x0A00);
+        m.cpu.registers.set_edx(handle.into());
+        m.handle_xms();
+        assert_eq!(m.cpu.registers.eax() as u16, 0x0001, "free success");
+
+        // The KB came back.
+        m.cpu.registers.set_eax(0x0800);
+        m.handle_xms();
+        assert_eq!(m.cpu.registers.edx() as u16, total_before, "KB returned");
+    }
+
+    #[test]
+    fn xms_global_enable_a20_is_visible_at_port_92() {
+        let mut m = int15_machine(16);
+        // Disable A20 first so the enable is a real transition.
+        m.cpu.registers.set_eax(0x0400); // AH=04h global disable A20
+        m.handle_xms();
+        assert!(!m.keyboard.a20_enabled(), "A20 off after global disable");
+
+        // Global enable (AH=03h).
+        m.cpu.registers.set_eax(0x0300);
+        m.handle_xms();
+        assert_eq!(m.cpu.registers.eax() as u16, 0x0001, "enable success");
+
+        // Query A20 (AH=07h) reports enabled.
+        m.cpu.registers.set_eax(0x0700);
+        m.handle_xms();
+        assert_eq!(m.cpu.registers.eax() as u16, 0x0001, "A20 query enabled");
+
+        // And it is visible at port 0x92 bit 1, the single source of truth.
+        let mut bus = m.make_bus();
+        assert_eq!(
+            bus.read_io(0x0092, BusWidth::Byte).unwrap() & 0x02,
+            0x02,
+            "port 0x92 bit1 set"
+        );
+    }
+
+    #[test]
+    fn xms_move_copies_between_conventional_and_emb() {
+        let mut m = int15_machine(16);
+        // Allocate a 64 KB EMB and lock it to learn its linear base.
+        m.cpu.registers.set_eax(0x0900);
+        m.cpu.registers.set_edx(64);
+        m.handle_xms();
+        let handle = m.cpu.registers.edx() as u16;
+        m.cpu.registers.set_eax(0x0C00);
+        m.cpu.registers.set_edx(handle.into());
+        m.handle_xms();
+        let emb_base = (u32::from(m.cpu.registers.edx() as u16) << 16)
+            | u32::from(m.cpu.registers.ebx() as u16);
+
+        // Put a known 8-byte pattern in conventional memory at 0x2000:0000.
+        let src_seg = 0x2000u16;
+        let src_lin = u32::from(src_seg) << 4;
+        let pattern = [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04];
+        m.write_guest_block(src_lin, &pattern);
+
+        // Build the move descriptor at 0x3000:0000: len=8, src handle 0 / seg:off
+        // 2000:0000, dst handle / offset into the EMB.
+        let desc_lin = 0x3000u32 << 4;
+        m.write_guest_block(desc_lin, &8u32.to_le_bytes()); // length
+        m.write_guest_block(desc_lin + 4, &0u16.to_le_bytes()); // src handle 0
+        let src_ptr = u32::from(src_seg) << 16; // seg:off real pointer (offset 0)
+        m.write_guest_block(desc_lin + 6, &src_ptr.to_le_bytes());
+        m.write_guest_block(desc_lin + 10, &handle.to_le_bytes()); // dst handle
+        m.write_guest_block(desc_lin + 12, &0u32.to_le_bytes()); // dst offset 0
+
+        // DS:SI -> descriptor. AH=0Bh move.
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x3000));
+        m.cpu.registers.set_esi(0);
+        m.cpu.registers.set_eax(0x0B00);
+        m.handle_xms();
+        assert_eq!(m.cpu.registers.eax() as u16, 0x0001, "move success");
+
+        // The pattern landed at the EMB base.
+        let got = m.read_guest_block(emb_base, 8);
+        assert_eq!(got.as_slice(), &pattern, "EMB now holds the pattern");
+    }
+
+    #[test]
+    fn xms_odd_length_move_is_rejected() {
+        let mut m = int15_machine(16);
+        let desc_lin = 0x3000u32 << 4;
+        m.write_guest_block(desc_lin, &7u32.to_le_bytes()); // odd length
+        m.write_guest_block(desc_lin + 4, &0u16.to_le_bytes());
+        m.write_guest_block(desc_lin + 6, &0u32.to_le_bytes());
+        m.write_guest_block(desc_lin + 10, &0u16.to_le_bytes());
+        m.write_guest_block(desc_lin + 12, &0u32.to_le_bytes());
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x3000));
+        m.cpu.registers.set_esi(0);
+        m.cpu.registers.set_eax(0x0B00);
+        m.handle_xms();
+        assert_eq!(m.cpu.registers.eax() as u16, 0x0000, "odd length fails");
+        assert_eq!(m.cpu.registers.ebx() as u8, xms::err::INVALID_LENGTH);
+    }
+
+    #[test]
     fn int1a_set_and_read_date_round_trips() {
         let mut m = int15_machine(16);
         // AH=05h set date: CH/CL century/year BCD, DH/DL month/day BCD -> 2021-07-15.
@@ -6203,17 +6672,6 @@ mod tests {
         assert_eq!(bus.read_io(0x0278, BusWidth::Byte).unwrap(), 0x42);
         // The LPT2 status port reports the always-ready idle byte.
         assert_eq!(bus.read_io(0x0279, BusWidth::Byte).unwrap(), 0xdf);
-    }
-
-    #[test]
-    fn int2f_xms_install_check_reports_not_installed() {
-        let mut m = int15_machine(16);
-        m.cpu.registers.set_eax(0x4300);
-        assert!(m.handle_int2f());
-        assert_eq!(m.cpu.registers.eax() as u8, 0x00, "AL = XMS not installed");
-        // The entry-point query (AX=4310h) is unhandled: no driver to point at.
-        m.cpu.registers.set_eax(0x4310);
-        assert!(!m.handle_int2f());
     }
 
     #[test]
