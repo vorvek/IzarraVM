@@ -3349,10 +3349,17 @@ impl Cpu386 {
         offset: u32,
         operand_size: OperandSize,
     ) -> ExecResult<()> {
-        // Push CS first (higher stack address), then the return offset (lower
-        // address). RETF pops in the opposite order: offset first, then CS.
-        // self.registers.eip already points past the instruction, because the
-        // far pointer operands have been fetched.
+        // A protected-mode far call to a system descriptor goes through a call gate,
+        // which supplies its own CS:offset (the instruction's offset is ignored).
+        if self.is_protected_mode() {
+            let (low, high) = self.read_transfer_descriptor(bus, selector)?;
+            if (high >> 8) & 0x10 == 0 {
+                return self.far_call_gate(bus, selector, low, high);
+            }
+        }
+        // Direct far call (real mode, or a protected-mode code segment). Push CS first
+        // (higher stack address), then the return offset. RETF pops offset then CS.
+        // self.registers.eip already points past the instruction.
         self.push(bus, u32::from(self.registers.cs().selector), operand_size)?;
         self.push(bus, self.registers.eip, operand_size)?;
         self.load_segment(bus, SegmentIndex::Cs, selector)?;
@@ -3391,9 +3398,200 @@ impl Cpu386 {
         offset: u32,
         operand_size: OperandSize,
     ) -> ExecResult<()> {
+        if self.is_protected_mode() {
+            let (low, high) = self.read_transfer_descriptor(bus, selector)?;
+            if (high >> 8) & 0x10 == 0 {
+                return self.far_jump_gate(bus, selector, low, high);
+            }
+        }
         self.load_segment(bus, SegmentIndex::Cs, selector)?;
         self.registers.eip = offset & operand_size.mask();
         Ok(())
+    }
+
+    /// Read a descriptor for a far transfer from the GDT or LDT, faulting (#GP) on a
+    /// null or out-of-range selector.
+    fn read_transfer_descriptor<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        selector: u16,
+    ) -> ExecResult<(u32, u32)> {
+        let in_ldt = selector & 0x4 != 0;
+        let index = u32::from(selector & !0x7);
+        let (base, limit) = if in_ldt {
+            (self.ldtr.base, self.ldtr.limit)
+        } else {
+            (self.gdtr.base, u32::from(self.gdtr.limit))
+        };
+        if index == 0 || index + 7 > limit {
+            return Err(CpuError::GeneralProtection { selector }.into());
+        }
+        let addr = base + index;
+        let low = bus.read_memory(addr, BusWidth::Dword, BusAccessKind::DataRead)?;
+        let high = bus.read_memory(addr + 4, BusWidth::Dword, BusAccessKind::DataRead)?;
+        Ok((low, high))
+    }
+
+    /// Decode a call-gate descriptor into (target selector, entry offset, operand size,
+    /// parameter count). 386 gates (type 0x0C) carry a 32-bit offset and a dword count;
+    /// 286 gates (type 0x04) a 16-bit offset and a word count.
+    fn decode_call_gate(low: u32, high: u32) -> (u16, u32, OperandSize, usize) {
+        let is_32 = (high >> 8) & 0x0f == 0x0c;
+        let target = ((low >> 16) & 0xffff) as u16;
+        let offset = if is_32 {
+            (low & 0xffff) | (high & 0xffff_0000)
+        } else {
+            low & 0xffff
+        };
+        let op = if is_32 {
+            OperandSize::Dword
+        } else {
+            OperandSize::Word
+        };
+        (target, offset, op, (high & 0x1f) as usize)
+    }
+
+    fn far_call_gate<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        gate_selector: u16,
+        low: u32,
+        high: u32,
+    ) -> ExecResult<()> {
+        let access = (high >> 8) & 0xff;
+        let gate_type = access & 0x0f;
+        if gate_type != 0x0c && gate_type != 0x04 {
+            return Err(CpuError::GeneralProtection {
+                selector: gate_selector,
+            }
+            .into());
+        }
+        let gate_dpl = ((access >> 5) & 3) as u8;
+        let cpl = self.current_privilege_level();
+        let rpl = (gate_selector & 3) as u8;
+        if access & 0x80 == 0 || gate_dpl < cpl.max(rpl) {
+            return Err(CpuError::GeneralProtection {
+                selector: gate_selector,
+            }
+            .into());
+        }
+        let (target_selector, gate_offset, op, param_count) = Self::decode_call_gate(low, high);
+        let (tl, th) = self.read_transfer_descriptor(bus, target_selector)?;
+        let target_access = (th >> 8) & 0xff;
+        // Target must be a present code segment (S = 1 and the executable bit set).
+        if target_access & 0x80 == 0 || target_access & 0x18 != 0x18 {
+            return Err(CpuError::GeneralProtection {
+                selector: target_selector,
+            }
+            .into());
+        }
+        let target_dpl = ((target_access >> 5) & 3) as u8;
+        let conforming = target_access & 0x04 != 0;
+        let mut target = self.descriptor_to_segment(target_selector, tl, th);
+        let return_cs = self.registers.cs().selector;
+        let return_eip = self.registers.eip;
+
+        if !conforming && target_dpl < cpl {
+            // Inter-privilege call: copy parameters off the outer stack, switch to the
+            // inner stack from the TSS, then rebuild the frame there.
+            let mut params = [0u32; 32];
+            let psize = op.bytes();
+            let outer_esp = self.registers.esp();
+            for (k, slot) in params.iter_mut().enumerate().take(param_count) {
+                *slot = self.read_memory_sized(
+                    bus,
+                    SegmentIndex::Ss,
+                    outer_esp + k as u32 * psize,
+                    op,
+                    BusAccessKind::DataRead,
+                )?;
+            }
+            let (old_ss, old_esp) = self.switch_to_inner_stack(bus, target_dpl)?;
+            self.push(bus, u32::from(old_ss), op)?;
+            self.push(bus, old_esp, op)?;
+            for k in (0..param_count).rev() {
+                self.push(bus, params[k], op)?;
+            }
+            self.push(bus, u32::from(return_cs), op)?;
+            self.push(bus, return_eip, op)?;
+            target.selector = (target_selector & !3) | u16::from(target_dpl);
+        } else {
+            // Same privilege (or a conforming target): push the return frame on the
+            // current stack.
+            self.push(bus, u32::from(return_cs), op)?;
+            self.push(bus, return_eip, op)?;
+            target.selector = (target_selector & !3) | u16::from(cpl);
+        }
+        self.registers.set_segment(SegmentIndex::Cs, target);
+        self.registers.eip = gate_offset & op.mask();
+        Ok(())
+    }
+
+    fn far_jump_gate<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        gate_selector: u16,
+        low: u32,
+        high: u32,
+    ) -> ExecResult<()> {
+        let access = (high >> 8) & 0xff;
+        let gate_type = access & 0x0f;
+        if gate_type != 0x0c && gate_type != 0x04 {
+            return Err(CpuError::GeneralProtection {
+                selector: gate_selector,
+            }
+            .into());
+        }
+        let gate_dpl = ((access >> 5) & 3) as u8;
+        let cpl = self.current_privilege_level();
+        let rpl = (gate_selector & 3) as u8;
+        if access & 0x80 == 0 || gate_dpl < cpl.max(rpl) {
+            return Err(CpuError::GeneralProtection {
+                selector: gate_selector,
+            }
+            .into());
+        }
+        let (target_selector, gate_offset, op, _) = Self::decode_call_gate(low, high);
+        let (tl, th) = self.read_transfer_descriptor(bus, target_selector)?;
+        let target_access = (th >> 8) & 0xff;
+        if target_access & 0x80 == 0 || target_access & 0x18 != 0x18 {
+            return Err(CpuError::GeneralProtection {
+                selector: target_selector,
+            }
+            .into());
+        }
+        let target_dpl = ((target_access >> 5) & 3) as u8;
+        let conforming = target_access & 0x04 != 0;
+        // A JMP through a gate cannot change privilege: a non-conforming target must be
+        // at the current level; a conforming one no more privileged.
+        if (!conforming && target_dpl != cpl) || (conforming && target_dpl > cpl) {
+            return Err(CpuError::GeneralProtection {
+                selector: target_selector,
+            }
+            .into());
+        }
+        let mut target = self.descriptor_to_segment(target_selector, tl, th);
+        target.selector = (target_selector & !3) | u16::from(cpl);
+        self.registers.set_segment(SegmentIndex::Cs, target);
+        self.registers.eip = gate_offset & op.mask();
+        Ok(())
+    }
+
+    /// Switch to the inner-ring stack for `target_dpl`, read from the current TSS
+    /// (386 layout: ESPn at 4 + 8n, SSn at 8 + 8n). Returns the outgoing SS:ESP.
+    fn switch_to_inner_stack<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        target_dpl: u8,
+    ) -> ExecResult<(u16, u32)> {
+        let old_ss = self.registers.segment(SegmentIndex::Ss).selector;
+        let old_esp = self.registers.esp();
+        let esp_addr = self.tr.base + 4 + 8 * u32::from(target_dpl);
+        let new_esp = bus.read_memory(esp_addr, BusWidth::Dword, BusAccessKind::DataRead)?;
+        let new_ss = bus.read_memory(esp_addr + 4, BusWidth::Word, BusAccessKind::DataRead)? as u16;
+        self.load_segment(bus, SegmentIndex::Ss, new_ss)?;
+        self.registers.set_esp(new_esp);
+        Ok((old_ss, old_esp))
     }
 
     fn relative_jump(&mut self, relative: i32, operand_size: OperandSize) {
@@ -11636,5 +11834,130 @@ mod tests {
         for _ in 0..4 {
             cpu.cycle(&mut bus).unwrap();
         }
+    }
+
+    // ---- Phase 4 slice C: call gates and privilege-level stack switching ----
+
+    /// Protected-mode CPU with a GDT at 0x100 holding the given (selector, low, high)
+    /// descriptors. CS/SS default to ring 0 (real-mode shells, base 0); SP at 0x80.
+    fn protected_cpu_with_gdt(code: &[u8], descriptors: &[(u16, u32, u32)]) -> (Cpu386, Vec<u8>) {
+        let mut memory = vec![0u8; 0x400];
+        memory[..code.len()].copy_from_slice(code);
+        for &(sel, low, high) in descriptors {
+            let off = 0x100 + (sel & !0x7) as usize;
+            memory[off..off + 4].copy_from_slice(&low.to_le_bytes());
+            memory[off + 4..off + 8].copy_from_slice(&high.to_le_bytes());
+        }
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_esp(0x80);
+        cpu.gdtr = DescriptorTable {
+            base: 0x100,
+            limit: 0xff,
+        };
+        cpu.control.cr0 |= CR0_PE;
+        (cpu, memory)
+    }
+
+    // Flat ring-0 code at 0x08, and a 386 call gate at 0x10 -> 0x08:0x40.
+    const RING0_CODE: (u16, u32, u32) = (0x08, 0x0000_ffff, 0x00cf_9b00);
+    const CALL_GATE_DPL0: (u16, u32, u32) = (0x10, 0x0008_0040, 0x0000_8c00);
+
+    #[test]
+    fn call_gate_same_privilege_transfers() {
+        // CALL FAR 0x10:0 -> through the gate to 0x08:0x40, return pushed.
+        let (mut cpu, memory) = protected_cpu_with_gdt(
+            &[0x9a, 0x00, 0x00, 0x10, 0x00],
+            &[RING0_CODE, CALL_GATE_DPL0],
+        );
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.cs().selector, 0x08);
+        assert_eq!(cpu.registers.eip, 0x40);
+        // The gate is a 386 (32-bit) gate, so the return CS:EIP is two dwords.
+        assert_eq!(
+            cpu.registers.esp(),
+            0x80 - 8,
+            "return offset+selector pushed"
+        );
+    }
+
+    #[test]
+    fn jmp_gate_transfers_without_pushing_return() {
+        // JMP FAR 0x10:0 -> same target, no return frame.
+        let (mut cpu, memory) = protected_cpu_with_gdt(
+            &[0xea, 0x00, 0x00, 0x10, 0x00],
+            &[RING0_CODE, CALL_GATE_DPL0],
+        );
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.cs().selector, 0x08);
+        assert_eq!(cpu.registers.eip, 0x40);
+        assert_eq!(cpu.registers.esp(), 0x80, "JMP pushes nothing");
+    }
+
+    #[test]
+    fn call_gate_inter_privilege_switches_stack() {
+        // Ring-3 caller through a DPL-3 gate into ring-0 code, copying two dword params.
+        let ring0_data = (0x10u16, 0x0000_ffff, 0x00cf_9300);
+        let gate_dpl3 = (0x30u16, 0x0008_0040, 0x0000_ec02); // DPL3 386 gate, 2 params
+        let (mut cpu, mut memory) = protected_cpu_with_gdt(
+            &[0x9a, 0x00, 0x00, 0x30, 0x00],
+            &[RING0_CODE, ring0_data, gate_dpl3],
+        );
+        // Run at CPL 3 with a ring-3 CS and SS (set the cached registers directly).
+        cpu.registers.set_segment(
+            SegmentIndex::Cs,
+            SegmentRegister {
+                selector: 0x1b,
+                base: 0,
+                limit: 0xf_ffff,
+                access: 0xfb,
+                default_size_32: false,
+            },
+        );
+        cpu.registers.set_segment(
+            SegmentIndex::Ss,
+            SegmentRegister {
+                selector: 0x23,
+                base: 0,
+                limit: 0xf_ffff,
+                access: 0xf3,
+                default_size_32: false,
+            },
+        );
+        cpu.registers.set_esp(0xc0);
+        // Two parameters on the outer stack.
+        memory[0xc0..0xc4].copy_from_slice(&0x1111u32.to_le_bytes());
+        memory[0xc4..0xc8].copy_from_slice(&0x2222u32.to_le_bytes());
+        // TSS at 0x300 with the ring-0 stack: ESP0 at +4, SS0 at +8.
+        cpu.tr.base = 0x300;
+        memory[0x304..0x308].copy_from_slice(&0x00f0u32.to_le_bytes());
+        memory[0x308..0x30a].copy_from_slice(&0x0010u16.to_le_bytes());
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.cs().selector, 0x08, "entered ring-0 code");
+        assert_eq!(cpu.registers.eip, 0x40);
+        assert_eq!(
+            cpu.registers.segment(SegmentIndex::Ss).selector,
+            0x10,
+            "switched to SS0"
+        );
+        // Frame on the new stack: 6 dwords pushed below ESP0 = 0xF0.
+        assert_eq!(cpu.registers.esp(), 0xf0 - 24);
+        // Return EIP (5, past the CALL) at the top; param0 above the return frame.
+        assert_eq!(
+            u32::from_le_bytes(bus.memory[0xd8..0xdc].try_into().unwrap()),
+            5
+        );
+        assert_eq!(
+            u32::from_le_bytes(bus.memory[0xe0..0xe4].try_into().unwrap()),
+            0x1111
+        );
     }
 }
