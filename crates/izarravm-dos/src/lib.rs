@@ -299,6 +299,11 @@ struct Arena {
 
 const ARENA_TOP: u16 = 0xa000; // matches CONVENTIONAL_TOP_PARAGRAPH in the loader
 
+/// Kernel-reserved paragraph holding the AH=52h list-of-lists (SysVars) table.
+/// 0x0050 = linear 0x500, just above the BIOS data area (0x400-0x4FF) and below
+/// where programs load (psp_seg >= 0x0100), so it collides with neither.
+const SYSVARS_SEG: u16 = 0x0050;
+
 enum ResizeError {
     TooBig(u16), // largest paragraphs that would fit
     InvalidBlock,
@@ -396,6 +401,103 @@ impl Arena {
         self.free_base = new_top;
         self.resident = true;
     }
+
+    /// The arena as a contiguous MCB chain to materialize: (mcb_seg, owner, size).
+    /// A real MCB occupies [mcb_seg, mcb_seg + 1 + size): a one-paragraph header
+    /// then `size` data paragraphs. The next MCB sits at mcb_seg + 1 + size, so the
+    /// chain is back to back with no gaps. The first MCB is psp_seg-1 (the header
+    /// paragraph below the PSP), and the chain spans [psp_seg-1, ARENA_TOP).
+    ///
+    /// The regions, in order: the program block (owner = PSP), each AH=48h block
+    /// (owner = its own segment), then the free remainder (owner 0). Each region's
+    /// header paragraph is carved from the span, so a block's `size` is its arena
+    /// paragraph count and the running cursor steps over the extra header paragraph.
+    /// The arena hands a guest the data segment S whose MCB this places at S-1; the
+    /// header paragraphs are an accounting view over the same bytes the bump arena
+    /// already tracks, not separately reserved storage (see the ponytail on
+    /// materialize_mcb_chain).
+    fn mcb_layout(&self) -> Vec<McbEntry> {
+        let mut entries = Vec::new();
+        let mut cursor = self.psp_seg.wrapping_sub(1); // header paragraph below the PSP
+        // The program block: header at psp_seg-1, data [psp_seg, prog_top).
+        let prog_size = self.prog_top.wrapping_sub(self.psp_seg);
+        entries.push(McbEntry {
+            mcb_seg: cursor,
+            owner: self.psp_seg,
+            size: prog_size,
+        });
+        cursor = cursor.wrapping_add(1).wrapping_add(prog_size); // = prog_top
+        // AH=48h blocks in ascending segment order. Each one's header takes the
+        // paragraph the cursor is on; its data is the paragraph count it was given.
+        let mut sorted = self.blocks.clone();
+        sorted.sort_by_key(|&(seg, _)| seg);
+        for &(seg, paras) in &sorted {
+            entries.push(McbEntry {
+                mcb_seg: cursor,
+                owner: seg,
+                size: paras,
+            });
+            cursor = cursor.wrapping_add(1).wrapping_add(paras);
+        }
+        // The free remainder up to ARENA_TOP: a header at the cursor, the rest data.
+        if cursor < ARENA_TOP {
+            entries.push(McbEntry {
+                mcb_seg: cursor,
+                owner: 0,
+                size: ARENA_TOP - cursor - 1,
+            });
+        }
+        entries
+    }
+
+    /// Write the MCB chain into guest memory as a faithful view of the current
+    /// arena, returning the first MCB segment (psp_seg-1) for the list-of-lists.
+    /// Each header is 'M' for a link or 'Z' for the last block, the owner PSP word,
+    /// the size word, 3 reserved bytes, and an 8-byte owner name.
+    // ponytail: this is a recomputed VIEW over the bump arena, not a real
+    // coalescing free-list. The headers are rewritten on demand (the guest reads
+    // them through AH=52h), so allocations stay observable, but adjacent free
+    // blocks are not merged and a guest cannot hand DOS a block by editing a header.
+    // The upgrade path is to make the chain authoritative: walk and mutate it in
+    // allocate/free/resize instead of keeping the Vec<(seg,paras)>, which turns the
+    // arena into a true MCB free-list and lets a guest drive allocation directly.
+    fn materialize_mcb_chain(&self, mem: &mut Memory) -> Result<u16, DosError> {
+        let entries = self.mcb_layout();
+        let first = entries.first().map(|e| e.mcb_seg).unwrap_or(0);
+        let last = entries.len().saturating_sub(1);
+        for (i, entry) in entries.iter().enumerate() {
+            let base = usize::from(entry.mcb_seg) * 16;
+            let sig = if i == last { b'Z' } else { b'M' };
+            mem.write_u8(base, sig)?;
+            mem.write_u16(base + 1, entry.owner)?;
+            mem.write_u16(base + 3, entry.size)?;
+            for off in 5..8 {
+                mem.write_u8(base + off, 0)?; // 3 reserved bytes
+            }
+            // The 8-byte program name. The program block carries a name; the rest
+            // are blank. ponytail: a fixed "TOKAPROG" stands in for the real loaded
+            // name, which the loader does not thread down here; guests that read the
+            // MCB name (rare) see a stable placeholder.
+            let name: &[u8; 8] = if entry.owner == self.psp_seg && entry.owner != 0 {
+                b"TOKAPROG"
+            } else {
+                b"\0\0\0\0\0\0\0\0"
+            };
+            for (off, &b) in name.iter().enumerate() {
+                mem.write_u8(base + 8 + off, b)?;
+            }
+        }
+        Ok(first)
+    }
+}
+
+/// One materialized MCB: the header paragraph, the owner PSP (0 = free), and the
+/// size of the data block in paragraphs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct McbEntry {
+    mcb_seg: u16,
+    owner: u16,
+    size: u16,
 }
 
 /// Toka-DOS wall clock. Deterministic by default (a fixed 1997 instant) so unit
@@ -1256,6 +1358,296 @@ impl DosKernel {
         Ok(DosAction::Continue)
     }
 
+    /// AH=21h RANDOM READ. Read the single record the FCB random-record field at
+    /// 0x21 selects into the DTA, leaving the random-record field unchanged but
+    /// syncing the current block/record to it (RBIL: AH=21h sets the block/record
+    /// from the random record). AL=00 read in full, 01 EOF (no data, DTA left
+    /// untouched), 03 partial final record (zero-padded). 0xFF if the FCB names no
+    /// resolvable file.
+    fn fcb_random_read(
+        &mut self,
+        mem: &mut Memory,
+        regs: &mut DosRegs,
+    ) -> Result<DosAction, DosError> {
+        let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+        let path = match self.fcb_path(mem, regs)? {
+            Ok(path) => path,
+            Err(()) => {
+                regs.ax = (regs.ax & 0xff00) | 0xff;
+                return Ok(DosAction::Continue);
+            }
+        };
+        let record_size = mem.read_u16(base + FCB_RECSIZE)?;
+        let random = mem.read_u32(base + FCB_RANDREC)?;
+        fcb_sync_block_record_from_random(mem, base, random)?;
+        let size = if record_size == 0 { 128 } else { record_size };
+        let pos = u64::from(random) * u64::from(size);
+        let mut file = match File::open(&path) {
+            Ok(f) => f,
+            Err(_) => {
+                regs.ax = (regs.ax & 0xff00) | 0xff;
+                return Ok(DosAction::Continue);
+            }
+        };
+        let mut buffer = vec![0u8; usize::from(size)];
+        let filled = read_at(&mut file, pos, &mut buffer)?;
+        let al = if filled == 0 {
+            0x01 // at or past EOF: no data, DTA left as is (matches AH=14h)
+        } else {
+            let dta = usize::from(self.dta.0) * 16 + usize::from(self.dta.1);
+            for (i, &byte) in buffer.iter().enumerate() {
+                mem.write_u8(dta + i, byte)?;
+            }
+            if filled < usize::from(size) {
+                0x03
+            } else {
+                0x00
+            }
+        };
+        regs.ax = (regs.ax & 0xff00) | al;
+        Ok(DosAction::Continue)
+    }
+
+    /// AH=22h RANDOM WRITE. Write the single record at the DTA to the position the
+    /// FCB random-record field selects. The current block/record sync to the random
+    /// record. AL=00 success, 0xFF on a host error or an unresolvable FCB.
+    fn fcb_random_write(
+        &mut self,
+        mem: &mut Memory,
+        regs: &mut DosRegs,
+    ) -> Result<DosAction, DosError> {
+        let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+        let path = match self.fcb_path(mem, regs)? {
+            Ok(path) => path,
+            Err(()) => {
+                regs.ax = (regs.ax & 0xff00) | 0xff;
+                return Ok(DosAction::Continue);
+            }
+        };
+        let record_size = mem.read_u16(base + FCB_RECSIZE)?;
+        let random = mem.read_u32(base + FCB_RANDREC)?;
+        fcb_sync_block_record_from_random(mem, base, random)?;
+        let size = if record_size == 0 { 128 } else { record_size };
+        let pos = u64::from(random) * u64::from(size);
+        let dta = usize::from(self.dta.0) * 16 + usize::from(self.dta.1);
+        let mut record = vec![0u8; usize::from(size)];
+        for (i, slot) in record.iter_mut().enumerate() {
+            *slot = mem.read_u8(dta + i)?;
+        }
+        let mut file = match OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(f) => f,
+            Err(_) => {
+                regs.ax = (regs.ax & 0xff00) | 0xff;
+                return Ok(DosAction::Continue);
+            }
+        };
+        if file.seek(SeekFrom::Start(pos)).is_err() || file.write_all(&record).is_err() {
+            regs.ax = (regs.ax & 0xff00) | 0xff;
+            return Ok(DosAction::Continue);
+        }
+        if let Ok(meta) = file.metadata() {
+            mem.write_u32(base + FCB_FILESIZE, meta.len() as u32)?;
+        }
+        regs.ax &= 0xff00; // AL = 00
+        Ok(DosAction::Continue)
+    }
+
+    /// AH=24h SET RANDOM RECORD. Compute the FCB random-record field from the
+    /// current block and record: random = block * 128 + current-record. No file
+    /// access; this is pure FCB field math. AL is undocumented and left as is.
+    fn fcb_set_random(&self, mem: &mut Memory, regs: &mut DosRegs) -> Result<DosAction, DosError> {
+        let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+        let block = mem.read_u16(base + FCB_BLOCK)?;
+        let current = mem.read_u8(base + FCB_CURREC)?;
+        let random = u32::from(block) * 128 + u32::from(current);
+        mem.write_u32(base + FCB_RANDREC, random)?;
+        Ok(DosAction::Continue)
+    }
+
+    /// AH=27h RANDOM BLOCK READ. Read CX records starting at the random record into
+    /// the DTA, packed back to back. CX returns the count actually read; the random
+    /// record and the block/record cursor advance past the last record. AL=00 all
+    /// records read, 01 EOF reached mid-block (a clean stop on a record boundary),
+    /// 03 a partial final record (zero-padded). 0xFF if the FCB does not resolve.
+    fn fcb_random_block_read(
+        &mut self,
+        mem: &mut Memory,
+        regs: &mut DosRegs,
+    ) -> Result<DosAction, DosError> {
+        let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+        let path = match self.fcb_path(mem, regs)? {
+            Ok(path) => path,
+            Err(()) => {
+                regs.ax = (regs.ax & 0xff00) | 0xff;
+                return Ok(DosAction::Continue);
+            }
+        };
+        let record_size = mem.read_u16(base + FCB_RECSIZE)?;
+        let size = if record_size == 0 { 128 } else { record_size };
+        let start = mem.read_u32(base + FCB_RANDREC)?;
+        let wanted = regs.cx;
+        let mut file = match File::open(&path) {
+            Ok(f) => f,
+            Err(_) => {
+                regs.ax = (regs.ax & 0xff00) | 0xff;
+                return Ok(DosAction::Continue);
+            }
+        };
+        let dta = usize::from(self.dta.0) * 16 + usize::from(self.dta.1);
+        let mut read = 0u16;
+        let mut al = 0x00u8;
+        for index in 0..wanted {
+            let record = u64::from(start) + u64::from(index);
+            let pos = record * u64::from(size);
+            let mut buffer = vec![0u8; usize::from(size)];
+            let filled = read_at(&mut file, pos, &mut buffer)?;
+            if filled == 0 {
+                al = 0x01; // EOF on a record boundary, no partial record
+                break;
+            }
+            let target = dta + usize::from(read) * usize::from(size);
+            for (i, &byte) in buffer.iter().enumerate() {
+                mem.write_u8(target + i, byte)?;
+            }
+            read += 1;
+            if filled < usize::from(size) {
+                al = 0x03; // partial final record, counted in CX
+                break;
+            }
+        }
+        regs.cx = read;
+        // Advance the random record and the block/record cursor past what was read.
+        let next = start + u32::from(read);
+        mem.write_u32(base + FCB_RANDREC, next)?;
+        fcb_sync_block_record_from_random(mem, base, next)?;
+        regs.ax = (regs.ax & 0xff00) | u16::from(al);
+        Ok(DosAction::Continue)
+    }
+
+    /// AH=28h RANDOM BLOCK WRITE. Write CX records from the DTA starting at the
+    /// random record. The documented quirk: CX=0 sets the file size (truncates or
+    /// extends) to the random record without writing data. CX returns the count
+    /// written; the random record and block/record cursor advance. AL=00 success,
+    /// 0xFF on a host error or unresolvable FCB.
+    fn fcb_random_block_write(
+        &mut self,
+        mem: &mut Memory,
+        regs: &mut DosRegs,
+    ) -> Result<DosAction, DosError> {
+        let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+        let path = match self.fcb_path(mem, regs)? {
+            Ok(path) => path,
+            Err(()) => {
+                regs.ax = (regs.ax & 0xff00) | 0xff;
+                return Ok(DosAction::Continue);
+            }
+        };
+        let record_size = mem.read_u16(base + FCB_RECSIZE)?;
+        let size = if record_size == 0 { 128 } else { record_size };
+        let start = mem.read_u32(base + FCB_RANDREC)?;
+        let wanted = regs.cx;
+        let mut file = match OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(f) => f,
+            Err(_) => {
+                regs.ax = (regs.ax & 0xff00) | 0xff;
+                return Ok(DosAction::Continue);
+            }
+        };
+        if wanted == 0 {
+            // CX=0: set the file size to start*record-size, no record transfer.
+            let len = u64::from(start) * u64::from(size);
+            if file.set_len(len).is_err() {
+                regs.ax = (regs.ax & 0xff00) | 0xff;
+                return Ok(DosAction::Continue);
+            }
+            mem.write_u32(base + FCB_FILESIZE, len as u32)?;
+            regs.ax &= 0xff00; // AL = 00
+            return Ok(DosAction::Continue);
+        }
+        let dta = usize::from(self.dta.0) * 16 + usize::from(self.dta.1);
+        for index in 0..wanted {
+            let record = u64::from(start) + u64::from(index);
+            let pos = record * u64::from(size);
+            let mut buffer = vec![0u8; usize::from(size)];
+            let source = dta + usize::from(index) * usize::from(size);
+            for (i, slot) in buffer.iter_mut().enumerate() {
+                *slot = mem.read_u8(source + i)?;
+            }
+            if file.seek(SeekFrom::Start(pos)).is_err() || file.write_all(&buffer).is_err() {
+                regs.cx = index;
+                regs.ax = (regs.ax & 0xff00) | 0xff;
+                return Ok(DosAction::Continue);
+            }
+        }
+        regs.cx = wanted;
+        if let Ok(meta) = file.metadata() {
+            mem.write_u32(base + FCB_FILESIZE, meta.len() as u32)?;
+        }
+        let next = start + u32::from(wanted);
+        mem.write_u32(base + FCB_RANDREC, next)?;
+        fcb_sync_block_record_from_random(mem, base, next)?;
+        regs.ax &= 0xff00; // AL = 00
+        Ok(DosAction::Continue)
+    }
+
+    /// AH=29h PARSE FILENAME. Parse the command-line filename at DS:SI into the FCB
+    /// at ES:DI, honoring the AL option bits, then return AL: 0 no wildcards, 1 the
+    /// name held a '*' or '?', 0xFF the parsed drive was invalid. SI advances past
+    /// the parsed text. The DOS option bits (RBIL #01172):
+    ///   bit0: scan past leading separators before the name
+    ///   bit1: keep the FCB drive byte unless a drive is given (else set it)
+    ///   bit2: keep the FCB name unless a name is given (else set it)
+    ///   bit3: keep the FCB ext unless an ext is given (else set it)
+    fn fcb_parse_filename(
+        &self,
+        mem: &mut Memory,
+        regs: &mut DosRegs,
+    ) -> Result<DosAction, DosError> {
+        let opts = regs.ax as u8;
+        let src = usize::from(regs.ds) * 16 + usize::from(regs.si);
+        let fcb = usize::from(regs.es) * 16 + usize::from(regs.di);
+        // Read a bounded run of the source so the parse cannot wander off; a real
+        // filename plus separators is far under this. ponytail: a fixed 64-byte
+        // window, not a true scan-to-CR; command tails parsed here are short.
+        let mut text = Vec::with_capacity(64);
+        for i in 0..64 {
+            text.push(mem.read_u8(src + i)?);
+        }
+        let parsed = parse_fcb_filename(&text, opts);
+        // Advance SI past the bytes the parser consumed.
+        regs.si = regs.si.wrapping_add(parsed.consumed as u16);
+        if parsed.invalid_drive {
+            regs.ax = (regs.ax & 0xff00) | 0xff;
+            return Ok(DosAction::Continue);
+        }
+        if let Some(drive) = parsed.drive {
+            mem.write_u8(fcb, drive)?;
+        } else if opts & 0x02 == 0 {
+            mem.write_u8(fcb, 0)?; // default drive
+        }
+        if let Some(name) = parsed.name {
+            for (i, &b) in name.iter().enumerate() {
+                mem.write_u8(fcb + FCB_NAME + i, b)?;
+            }
+        } else if opts & 0x04 == 0 {
+            for i in 0..8 {
+                mem.write_u8(fcb + FCB_NAME + i, b' ')?;
+            }
+        }
+        if let Some(ext) = parsed.ext {
+            for (i, &b) in ext.iter().enumerate() {
+                mem.write_u8(fcb + FCB_EXT + i, b)?;
+            }
+        } else if opts & 0x08 == 0 {
+            for i in 0..3 {
+                mem.write_u8(fcb + FCB_EXT + i, b' ')?;
+            }
+        }
+        let al = if parsed.wildcards { 0x01 } else { 0x00 };
+        regs.ax = (regs.ax & 0xff00) | al;
+        Ok(DosAction::Continue)
+    }
+
     /// Service a software interrupt the DOS kernel handles. `vector` is the INT
     /// number (0x20 terminate, 0x21 the AH-dispatched set). Reads and writes
     /// `regs`, reads/writes guest memory through `mem`. DOS services are emulated
@@ -2069,6 +2461,28 @@ impl DosKernel {
                 regs.bx = self.arena.psp_seg;
                 Ok(DosAction::Continue)
             }
+            // AH=52h GET LIST OF LISTS (SysVars). Returns ES:BX -> the DOS internal
+            // variable table. The only field guests reliably read is the word at
+            // [BX-2], the segment of the first MCB; we materialize the MCB chain
+            // from the current arena and publish that. The SysVars table lives at a
+            // kernel-reserved low paragraph so it does not collide with a program
+            // loaded at 0x0100+. ponytail: only the first-MCB pointer is filled; the
+            // rest of SysVars (DPB chain, SFT, CLOCK$, etc.) is zeroed because no
+            // guest in scope walks it. Lift this by populating the documented fields
+            // as their backing structures gain a guest-visible representation.
+            0x52 => {
+                let first_mcb = self.arena.materialize_mcb_chain(mem)?;
+                let base = usize::from(SYSVARS_SEG) * 16;
+                // [BX-2] = first MCB segment (BX returns 0x0002, so this is offset 0).
+                mem.write_u16(base, first_mcb)?;
+                // Zero a small span of the table for the fields a probe might touch.
+                for off in 2..0x40usize {
+                    mem.write_u8(base + off, 0)?;
+                }
+                regs.es = SYSVARS_SEG;
+                regs.bx = 0x0002;
+                Ok(DosAction::Continue)
+            }
             // AH=0Dh DISK RESET: the HLE writes host files directly, so there are no
             // DOS buffers to flush. Succeed with CF clear.
             0x0d => {
@@ -2526,9 +2940,9 @@ impl DosKernel {
             }
             // The FCB (File Control Block) file API: handle-free file ops keyed by
             // the FCB at DS:DX. AL=00 success, AL=0xFF failure (no CF). The
-            // sequential ops transfer one record through the DTA. Random-access FCB
-            // ops (AH=21h/22h/24h/27h/28h) and parse-filename (AH=29h) are not
-            // implemented (marked); CP/M-era programs that need them are out of scope.
+            // sequential ops transfer one record through the DTA; the random-access
+            // ops (AH=21h/22h/24h/27h/28h) use the random-record field at 0x21.
+            // AH=29h parses a filename into an FCB.
             0x0f => self.fcb_open_or_create(mem, regs, false),
             0x16 => self.fcb_open_or_create(mem, regs, true),
             0x10 => self.fcb_close(mem, regs),
@@ -2536,7 +2950,13 @@ impl DosKernel {
             0x17 => self.fcb_rename(mem, regs),
             0x14 => self.fcb_seq_read(mem, regs),
             0x15 => self.fcb_seq_write(mem, regs),
+            0x21 => self.fcb_random_read(mem, regs),
+            0x22 => self.fcb_random_write(mem, regs),
             0x23 => self.fcb_file_size(mem, regs),
+            0x24 => self.fcb_set_random(mem, regs),
+            0x27 => self.fcb_random_block_read(mem, regs),
+            0x28 => self.fcb_random_block_write(mem, regs),
+            0x29 => self.fcb_parse_filename(mem, regs),
             // Other file functions (find) and everything else are not yet
             // implemented; later slices fill them in. An unimplemented function
             // returns Continue so the IRET stub returns to the caller.
@@ -2586,7 +3006,10 @@ fn build_psp(mem: &mut Memory, psp_seg: u16, top_of_mem_paragraph: u16) -> Resul
     mem.write_u16(base + 2, top_of_mem_paragraph)?;
     // PSP:0x0A/0x0E/0x12 are the terminate (INT 22h), Ctrl-C (INT 23h), and
     // critical-error (INT 24h) far vectors DOS saves so a child can restore them
-    // on exit. Snapshot the live IVT entries (offset then segment) at AL*4.
+    // on exit. Snapshot the live IVT entries (offset then segment) at AL*4. The
+    // PSP copy and the IVT entry stay consistent because the PSP mirrors the IVT;
+    // a guest installing its own INT 24h handler writes the IVT, and the next
+    // build_psp captures it here.
     for (psp_off, int_no) in [(0x0au16, 0x22u8), (0x0e, 0x23), (0x12, 0x24)] {
         let ivt = usize::from(int_no) * 4;
         mem.write_u16(base + usize::from(psp_off), mem.read_u16(ivt)?)?;
@@ -2614,6 +3037,54 @@ fn build_psp(mem: &mut Memory, psp_seg: u16, top_of_mem_paragraph: u16) -> Resul
 
 /// The default Job File Table length DOS reports in PSP:0x32 (20 handles).
 const JFT_LEN: usize = 20;
+
+/// A critical-error handler's return code, the value an INT 24h handler leaves in
+/// AL for DOS to act on (RBIL INT 24h "Return:"). DOS reads only the low two bits,
+/// so 4..255 alias back into this set; we mask the same way.
+// Scaffolding for the deferred INT 24h far-call (see psp_saved_vector); exercised
+// by tests but not yet on a live code path, so allow dead_code until the machine
+// crate's host->guest call seam invokes a handler.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CriticalErrorResponse {
+    Ignore, // 0: ignore the error and return success to the caller
+    Retry,  // 1: retry the failing operation
+    Abort,  // 2: abort the program through INT 23h
+    Fail,   // 3: fail the system call (DOS 3.1+)
+}
+
+impl CriticalErrorResponse {
+    /// Decode the AL a critical-error handler returns. Only AL bits 0-1 are
+    /// significant, so a handler that returns 0x07 (a common "leave AL untouched"
+    /// accident) decodes the same as 0x03 Fail, matching DOS.
+    #[allow(dead_code)] // scaffolding for the deferred INT 24h far-call; exercised by tests
+    fn from_al(al: u8) -> Self {
+        match al & 0x03 {
+            0 => CriticalErrorResponse::Ignore,
+            1 => CriticalErrorResponse::Retry,
+            2 => CriticalErrorResponse::Abort,
+            _ => CriticalErrorResponse::Fail,
+        }
+    }
+}
+
+/// The far pointer (segment, offset) a PSP holds for one of the saved INT 22h/23h/
+/// 24h vectors. `psp_off` is 0x0A terminate, 0x0E Ctrl-C, 0x12 critical-error. The
+/// vector is stored offset-then-segment, the IVT layout DOS copies it from.
+// ponytail: the INT 24h vector is stored in the PSP and the IVT, and
+// CriticalErrorResponse decodes a handler's reply, but nothing calls the handler:
+// the HLE file path goes straight to the host filesystem, so no failing block
+// device exists to raise a critical error. The far-call into the guest handler is
+// deferred until a block device can fault; that needs the outbound host->guest
+// call seam from the machine crate (which would push a fake IRET frame and run the
+// vector here at PSP:0x12), at which point this reader supplies the address.
+#[allow(dead_code)]
+fn psp_saved_vector(mem: &Memory, psp_seg: u16, psp_off: u16) -> Result<(u16, u16), DosError> {
+    let base = usize::from(psp_seg) * 16 + usize::from(psp_off);
+    let offset = mem.read_u16(base)?;
+    let segment = mem.read_u16(base + 2)?;
+    Ok((segment, offset))
+}
 
 /// Format a DOS environment block: a sequence of ASCIIZ `KEY=VALUE` strings
 /// followed by an extra NUL (the empty string that terminates the list). Keys
@@ -3208,6 +3679,125 @@ fn fcb_advance_record(
     mem.write_u16(base + FCB_BLOCK, next_block)?;
     mem.write_u8(base + FCB_CURREC, next_record)?;
     Ok(())
+}
+
+/// Sync an FCB's current block/record fields to a random-record number: block =
+/// random / 128, current-record = random % 128. The random-access ops set the
+/// sequential cursor this way so a following sequential read picks up where the
+/// random op left off (RBIL: AH=21h/22h set the block and record from the random
+/// field).
+fn fcb_sync_block_record_from_random(
+    mem: &mut Memory,
+    base: usize,
+    random: u32,
+) -> Result<(), DosError> {
+    let block = (random / 128) as u16;
+    let record = (random % 128) as u8;
+    mem.write_u16(base + FCB_BLOCK, block)?;
+    mem.write_u8(base + FCB_CURREC, record)?;
+    Ok(())
+}
+
+/// The result of parsing a command-line filename into FCB fields (AH=29h). Each
+/// of drive/name/ext is Some only when the source supplied it, so the caller can
+/// honor the "keep the existing field" option bits. `consumed` is how many source
+/// bytes the parse advanced over, for updating SI.
+struct ParsedFcbName {
+    drive: Option<u8>,     // 1-based drive number (A=1), or None for none given
+    name: Option<[u8; 8]>, // blank-padded 8-char name, or None
+    ext: Option<[u8; 3]>,  // blank-padded 3-char ext, or None
+    wildcards: bool,       // a '*' or '?' appeared (AL=1)
+    invalid_drive: bool,   // a drive letter outside A-Z (AL=0xFF)
+    consumed: usize,
+}
+
+/// Parse a DOS command-line filename (AH=29h). `opts` is AL: bit0 scans past
+/// leading separators first. A '*' fills the rest of its field with '?'. The
+/// separator set is the DOS filename terminators (whitespace and the shell
+/// punctuation); a name component stops at the first such byte, '.', or ':'.
+fn parse_fcb_filename(text: &[u8], opts: u8) -> ParsedFcbName {
+    // DOS treats these as filename separators/terminators (RBIL AH=29h notes).
+    const SEPARATORS: &[u8] = b":.;,=+ \t/\"[]<>|";
+    let mut i = 0usize;
+    if opts & 0x01 != 0 {
+        // Skip leading separators (but not '.' or ':', which start fields).
+        while i < text.len() && matches!(text[i], b' ' | b'\t' | b';' | b',' | b'=' | b'+') {
+            i += 1;
+        }
+    }
+    let mut wildcards = false;
+    // Optional drive: a letter followed by ':'.
+    let mut drive = None;
+    let mut invalid_drive = false;
+    if i + 1 < text.len() && text[i + 1] == b':' {
+        let letter = text[i];
+        if letter.is_ascii_alphabetic() {
+            drive = Some(letter.to_ascii_uppercase() - b'A' + 1);
+            i += 2;
+        } else {
+            invalid_drive = true;
+            i += 2;
+        }
+    }
+    // Name field: up to 8 chars, stopping at a separator. '*' pads with '?'.
+    let parse_field = |text: &[u8], i: &mut usize, width: usize, wildcards: &mut bool| {
+        let mut field = vec![b' '; width];
+        let mut wrote = false;
+        let mut pos = 0usize;
+        while *i < text.len() && pos < width {
+            let b = text[*i];
+            if b == 0 || SEPARATORS.contains(&b) {
+                break;
+            }
+            wrote = true;
+            if b == b'*' {
+                *wildcards = true;
+                for slot in field.iter_mut().skip(pos) {
+                    *slot = b'?';
+                }
+                *i += 1;
+                // A '*' consumes the rest of the field; skip remaining name chars.
+                while *i < text.len() && text[*i] != 0 && !SEPARATORS.contains(&text[*i]) {
+                    *i += 1;
+                }
+                break;
+            }
+            if b == b'?' {
+                *wildcards = true;
+            }
+            field[pos] = b.to_ascii_uppercase();
+            pos += 1;
+            *i += 1;
+        }
+        // Drop any name chars past the field width that did not fit.
+        while *i < text.len() && text[*i] != 0 && !SEPARATORS.contains(&text[*i]) {
+            *i += 1;
+        }
+        if wrote { Some(field) } else { None }
+    };
+    let name = parse_field(text, &mut i, 8, &mut wildcards).map(|v| {
+        let mut a = [b' '; 8];
+        a.copy_from_slice(&v);
+        a
+    });
+    // Extension: only if a '.' follows.
+    let mut ext = None;
+    if i < text.len() && text[i] == b'.' {
+        i += 1;
+        ext = parse_field(text, &mut i, 3, &mut wildcards).map(|v| {
+            let mut a = [b' '; 3];
+            a.copy_from_slice(&v);
+            a
+        });
+    }
+    ParsedFcbName {
+        drive,
+        name,
+        ext,
+        wildcards,
+        invalid_drive,
+        consumed: i,
+    }
 }
 
 /// Read an ASCIIZ string from guest memory at seg:off, scanning for a NUL with a
@@ -4701,6 +5291,132 @@ mod tests {
         assert_eq!(a.ax, 0x1100); // next allocation still at free_base
     }
 
+    /// Walk the materialized MCB chain from a first-MCB segment, returning the
+    /// (sig, owner, size) of each block until a 'Z' header (or a stop after a
+    /// generous bound so a corrupt chain cannot loop forever).
+    fn walk_mcb_chain(mem: &Memory, first: u16) -> Vec<(u8, u16, u16)> {
+        let mut out = Vec::new();
+        let mut seg = first;
+        for _ in 0..64 {
+            let base = usize::from(seg) * 16;
+            let sig = mem.read_u8(base).unwrap();
+            let owner = mem.read_u16(base + 1).unwrap();
+            let size = mem.read_u16(base + 3).unwrap();
+            out.push((sig, owner, size));
+            if sig == b'Z' {
+                break;
+            }
+            // Next MCB is at this header's data + size; data is seg+1.
+            seg = seg.wrapping_add(1).wrapping_add(size);
+        }
+        out
+    }
+
+    #[test]
+    fn ah52_mcb_chain_walk_sums_to_arena_and_ends_in_z() {
+        // arena_kernel: psp 0x0100, prog_top 0x1100, free_base 0x1100. The chain is
+        // the program block, then the free remainder; sigs M..Z, sizes cover the
+        // arena from psp_seg to ARENA_TOP.
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let mut kernel = arena_kernel();
+        let mut regs = DosRegs {
+            ax: 0x5200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        // ES:BX-2 holds the first MCB segment.
+        let ptr = usize::from(regs.es) * 16 + usize::from(regs.bx);
+        let first = mem.read_u16(ptr - 2).unwrap();
+        assert_eq!(first, 0x0100 - 1, "first MCB is psp_seg-1");
+        let chain = walk_mcb_chain(&mem, first);
+        // Two blocks: program (M, owner 0x0100) then free (Z, owner 0).
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].0, b'M');
+        assert_eq!(chain[0].1, 0x0100, "program block owner = PSP");
+        assert_eq!(chain[1].0, b'Z', "last block is Z");
+        assert_eq!(chain[1].1, 0, "free block owner 0");
+        // The two data blocks plus their two header paragraphs span psp_seg-1
+        // (0xFF) up to ARENA_TOP (0xA000): 2 headers + sum of sizes.
+        let total: u32 = chain.iter().map(|&(_, _, s)| u32::from(s)).sum();
+        assert_eq!(
+            total + chain.len() as u32,
+            u32::from(ARENA_TOP) - (0x0100 - 1),
+            "headers + data fill the arena"
+        );
+    }
+
+    #[test]
+    fn ah52_mcb_chain_reflects_an_allocation() {
+        // After an AH=48h allocation, the chain has three blocks: program, the new
+        // block (owner = its own segment), and the free remainder.
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let mut kernel = arena_kernel();
+        let mut alloc = DosRegs {
+            ax: 0x4800,
+            bx: 0x0010,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut alloc, &mut mem).unwrap();
+        let new_seg = alloc.ax; // 0x1100
+        let mut regs = DosRegs {
+            ax: 0x5200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        let ptr = usize::from(regs.es) * 16 + usize::from(regs.bx);
+        let first = mem.read_u16(ptr - 2).unwrap();
+        let chain = walk_mcb_chain(&mem, first);
+        assert_eq!(chain.len(), 3);
+        assert_eq!(chain[1].1, new_seg, "AH=48h block owned by its segment");
+        assert_eq!(chain[1].2, 0x0010, "block size in paragraphs");
+        assert_eq!(chain[2].0, b'Z');
+    }
+
+    #[test]
+    fn critical_error_response_decodes_low_two_bits() {
+        assert_eq!(
+            CriticalErrorResponse::from_al(0),
+            CriticalErrorResponse::Ignore
+        );
+        assert_eq!(
+            CriticalErrorResponse::from_al(1),
+            CriticalErrorResponse::Retry
+        );
+        assert_eq!(
+            CriticalErrorResponse::from_al(2),
+            CriticalErrorResponse::Abort
+        );
+        assert_eq!(
+            CriticalErrorResponse::from_al(3),
+            CriticalErrorResponse::Fail
+        );
+        // High bits ignored: 0x07 aliases to Fail, 0x05 to Retry.
+        assert_eq!(
+            CriticalErrorResponse::from_al(0x07),
+            CriticalErrorResponse::Fail
+        );
+        assert_eq!(
+            CriticalErrorResponse::from_al(0x05),
+            CriticalErrorResponse::Retry
+        );
+    }
+
+    #[test]
+    fn psp_saves_int24_vector_consistent_with_ivt() {
+        // Install an INT 24h vector in the IVT, build a PSP, and confirm PSP:0x12
+        // mirrors it (segment,offset) and psp_saved_vector reads it back.
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        // IVT entry 0x24 = offset 0xBEEF, segment 0xF000.
+        mem.write_u16(0x24 * 4, 0xbeef).unwrap();
+        mem.write_u16(0x24 * 4 + 2, 0xf000).unwrap();
+        build_psp(&mut mem, 0x0100, 0x1100).unwrap();
+        let psp = 0x0100usize * 16;
+        assert_eq!(mem.read_u16(psp + 0x12).unwrap(), 0xbeef, "PSP offset");
+        assert_eq!(mem.read_u16(psp + 0x14).unwrap(), 0xf000, "PSP segment");
+        let (seg, off) = psp_saved_vector(&mem, 0x0100, 0x12).unwrap();
+        assert_eq!((seg, off), (0xf000, 0xbeef));
+    }
+
     #[test]
     fn ah1a_2f_dta_round_trips_with_default_at_psp_0x80() {
         let mut mem = Memory::new(4096).unwrap();
@@ -5878,6 +6594,191 @@ mod tests {
         let regs = fcb_call(&mut kernel, &mut mem, 0x23);
         assert_eq!(regs.ax & 0xff, 0x00);
         assert_eq!(mem.read_u32(base + 0x21).unwrap(), 3, "3 records");
+    }
+
+    /// Point the DTA at 0x0500:0x0000 (clear of the FCB at 0x0100:0x0200).
+    fn set_dta_0500(kernel: &mut DosKernel, mem: &mut Memory) {
+        let mut regs = DosRegs {
+            ax: 0x1a00,
+            ds: 0x0500,
+            dx: 0x0000,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, mem).unwrap();
+    }
+
+    #[test]
+    fn fcb_random_write_then_read_round_trips_a_record() {
+        // Create a fresh file, set the random record to 2, write a record there,
+        // then read it back and confirm the bytes match.
+        let (mut kernel, mut mem, _dir) = fcb_kernel(&[]);
+        place_fcb(&mut mem, 3, "RAND.BIN");
+        assert_eq!(fcb_call(&mut kernel, &mut mem, 0x16).ax & 0xff, 0x00); // create
+        set_dta_0500(&mut kernel, &mut mem);
+        let base = 0x0100usize * 16 + 0x0200;
+        let dta = 0x0500usize * 16;
+        // Random record 2 with the default 128-byte record size.
+        mem.write_u32(base + 0x21, 2).unwrap();
+        for i in 0..128usize {
+            mem.write_u8(dta + i, (i as u8).wrapping_mul(3)).unwrap();
+        }
+        let write = fcb_call(&mut kernel, &mut mem, 0x22);
+        assert_eq!(write.ax & 0xff, 0x00, "random write succeeds");
+        // The block/record cursor synced to random 2: block 0, record 2.
+        assert_eq!(mem.read_u16(base + 0x0c).unwrap(), 0);
+        assert_eq!(mem.read_u8(base + 0x20).unwrap(), 2);
+        // Clear the DTA, then random-read the same record back.
+        for i in 0..128usize {
+            mem.write_u8(dta + i, 0).unwrap();
+        }
+        mem.write_u32(base + 0x21, 2).unwrap();
+        let read = fcb_call(&mut kernel, &mut mem, 0x21);
+        assert_eq!(read.ax & 0xff, 0x00, "random read full record");
+        for i in 0..128usize {
+            assert_eq!(mem.read_u8(dta + i).unwrap(), (i as u8).wrapping_mul(3));
+        }
+    }
+
+    #[test]
+    fn fcb_random_read_past_eof_returns_01_and_leaves_dta() {
+        // A one-record file; random read of record 5 is EOF and must not clobber
+        // the DTA (the consistency fix carried from the sequential path).
+        let (mut kernel, mut mem, _dir) = fcb_kernel(&[("ONE.BIN", &[0xabu8; 128])]);
+        place_fcb(&mut mem, 3, "ONE.BIN");
+        assert_eq!(fcb_call(&mut kernel, &mut mem, 0x0f).ax & 0xff, 0x00); // open
+        set_dta_0500(&mut kernel, &mut mem);
+        let base = 0x0100usize * 16 + 0x0200;
+        let dta = 0x0500usize * 16;
+        mem.write_u8(dta, 0x77).unwrap(); // sentinel
+        mem.write_u32(base + 0x21, 5).unwrap();
+        let read = fcb_call(&mut kernel, &mut mem, 0x21);
+        assert_eq!(read.ax & 0xff, 0x01, "EOF");
+        assert_eq!(mem.read_u8(dta).unwrap(), 0x77, "DTA left untouched");
+    }
+
+    #[test]
+    fn fcb_set_random_record_computes_from_block_and_record() {
+        // AH=24h: random = block * 128 + current-record.
+        let (mut kernel, mut mem, _dir) = fcb_kernel(&[("X.BIN", b"x")]);
+        place_fcb(&mut mem, 3, "X.BIN");
+        let base = 0x0100usize * 16 + 0x0200;
+        mem.write_u16(base + 0x0c, 3).unwrap(); // block 3
+        mem.write_u8(base + 0x20, 7).unwrap(); // record 7
+        fcb_call(&mut kernel, &mut mem, 0x24);
+        assert_eq!(mem.read_u32(base + 0x21).unwrap(), 3 * 128 + 7);
+    }
+
+    #[test]
+    fn fcb_random_block_read_reads_cx_records_and_advances() {
+        // A 3-record file (384 bytes). Read 2 records from random 0; CX returns 2,
+        // the random record and block/record advance to 2.
+        let mut data = vec![0u8; 384];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let (mut kernel, mut mem, _dir) = fcb_kernel(&[("BLK.BIN", &data)]);
+        place_fcb(&mut mem, 3, "BLK.BIN");
+        assert_eq!(fcb_call(&mut kernel, &mut mem, 0x0f).ax & 0xff, 0x00);
+        set_dta_0500(&mut kernel, &mut mem);
+        let base = 0x0100usize * 16 + 0x0200;
+        let dta = 0x0500usize * 16;
+        mem.write_u32(base + 0x21, 0).unwrap();
+        let mut regs = DosRegs {
+            ax: 0x2700,
+            ds: 0x0100,
+            dx: 0x0200,
+            cx: 2,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(regs.ax & 0xff, 0x00, "all records read");
+        assert_eq!(regs.cx, 2, "2 records read");
+        assert_eq!(mem.read_u8(dta).unwrap(), 0); // record 0 byte 0
+        assert_eq!(mem.read_u8(dta + 128).unwrap(), 128u8); // record 1 byte 0
+        assert_eq!(
+            mem.read_u32(base + 0x21).unwrap(),
+            2,
+            "random advanced to 2"
+        );
+        assert_eq!(mem.read_u16(base + 0x0c).unwrap(), 0);
+        assert_eq!(mem.read_u8(base + 0x20).unwrap(), 2);
+    }
+
+    #[test]
+    fn fcb_random_block_write_cx0_sets_file_size() {
+        // CX=0 truncates/extends the file to random * record-size without writing.
+        let (mut kernel, mut mem, dir) = fcb_kernel(&[("SZ.BIN", &[0u8; 512])]);
+        place_fcb(&mut mem, 3, "SZ.BIN");
+        assert_eq!(fcb_call(&mut kernel, &mut mem, 0x0f).ax & 0xff, 0x00);
+        let base = 0x0100usize * 16 + 0x0200;
+        mem.write_u32(base + 0x21, 2).unwrap(); // 2 records * 128 = 256 bytes
+        let mut regs = DosRegs {
+            ax: 0x2800,
+            ds: 0x0100,
+            dx: 0x0200,
+            cx: 0,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(regs.ax & 0xff, 0x00);
+        let len = std::fs::metadata(dir.path().join("SZ.BIN")).unwrap().len();
+        assert_eq!(len, 256, "file truncated to 2 records");
+        assert_eq!(
+            mem.read_u32(base + 0x10).unwrap(),
+            256,
+            "FCB file-size updated"
+        );
+    }
+
+    #[test]
+    fn fcb_parse_filename_wildcard_sets_al1_and_fields() {
+        // AH=29h parse of "B:FILE*.TX" with no option bits. The '*' fills the name
+        // tail with '?', so AL=1 and the FCB name/ext carry the parsed bytes.
+        let (mut kernel, mut mem, _dir) = fcb_kernel(&[]);
+        // Source at DS:SI = 0x0100:0x0300, FCB at ES:DI = 0x0100:0x0200.
+        let src = 0x0100usize * 16 + 0x0300;
+        for (i, &b) in b"B:FILE*.TX\0".iter().enumerate() {
+            mem.write_u8(src + i, b).unwrap();
+        }
+        let mut regs = DosRegs {
+            ax: 0x2900, // AL = 0 (no option bits)
+            ds: 0x0100,
+            si: 0x0300,
+            es: 0x0100,
+            di: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(regs.ax & 0xff, 0x01, "wildcards present -> AL=1");
+        let fcb = 0x0100usize * 16 + 0x0200;
+        assert_eq!(mem.read_u8(fcb).unwrap(), 2, "drive B: -> 2");
+        // Name "FILE" then '?'-padded to 8 from the '*'.
+        assert_eq!(&read_fcb_field(&mem, fcb + 0x01, 8), b"FILE????");
+        // Ext "TX" blank-padded to 3.
+        assert_eq!(&read_fcb_field(&mem, fcb + 0x09, 3), b"TX ");
+    }
+
+    #[test]
+    fn fcb_parse_filename_invalid_drive_returns_ff() {
+        let (mut kernel, mut mem, _dir) = fcb_kernel(&[]);
+        let src = 0x0100usize * 16 + 0x0300;
+        for (i, &b) in b"5:NAME.EXT\0".iter().enumerate() {
+            mem.write_u8(src + i, b).unwrap();
+        }
+        let mut regs = DosRegs {
+            ax: 0x2900,
+            ds: 0x0100,
+            si: 0x0300,
+            es: 0x0100,
+            di: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(regs.ax & 0xff, 0xff, "non-letter drive -> AL=0xFF");
+    }
+
+    fn read_fcb_field(mem: &Memory, base: usize, len: usize) -> Vec<u8> {
+        (0..len).map(|i| mem.read_u8(base + i).unwrap()).collect()
     }
 
     #[test]
