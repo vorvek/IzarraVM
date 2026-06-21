@@ -1244,6 +1244,13 @@ impl Vga {
         self.pending_start = Some(addr); // snapshot at next vretrace (finalize)
     }
 
+    /// Move the hardware text cursor (CRTC 0E/0Fh) to a cell offset. The HLE
+    /// teletype uses this so the visible cursor tracks the BDA cursor without a
+    /// round trip through CRTC port writes.
+    pub fn set_cursor_offset(&mut self, offset: u16) {
+        self.cursor_offset = offset;
+    }
+
     /// Read Input Status Register 1 (port 3DAh).
     ///
     /// Bit 0: display disabled (beam is in blank or retrace).
