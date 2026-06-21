@@ -22,6 +22,7 @@ mod pic;
 mod pit;
 mod rtc;
 mod speaker;
+mod uart;
 
 pub use cdimage::CdImage;
 
@@ -209,7 +210,7 @@ pub struct Machine {
     dos_screen_shown: usize,
     dos: izarravm_dos::DosKernel, // DOS kernel state: open files, drive, stdin/stdout
     rom: Vec<u8>,
-    serial: SerialPort,
+    serial: uart::Uart16450,
     device_ports: DevicePorts,
     pic: pic::Pic8259Pair,
     pit: pit::Pit,
@@ -388,7 +389,7 @@ impl Machine {
             dos_screen_shown: 0,
             dos: izarravm_dos::DosKernel::default(),
             rom,
-            serial: SerialPort::default(),
+            serial: uart::Uart16450::default(),
             device_ports: DevicePorts::default(),
             pic: pic::Pic8259Pair::default(),
             pit: pit::Pit::default(),
@@ -2697,6 +2698,9 @@ impl Machine {
         if self.keyboard.take_irq() {
             self.pic.request(1); // IRQ1: keyboard output buffer has a scancode
         }
+        if self.serial.take_irq() {
+            self.pic.request(4); // IRQ4: COM1 (0x3F8) has a pending UART interrupt
+        }
         if self.keyboard.take_irq12() {
             self.pic.request(12); // IRQ12: mouse output buffer has an aux byte
         }
@@ -3170,7 +3174,7 @@ struct MachineBus<'a> {
     video: &'a mut Vga,
     margo: &'a mut Margo,
     rom: &'a [u8],
-    serial: &'a mut SerialPort,
+    serial: &'a mut uart::Uart16450,
     device_ports: &'a mut DevicePorts,
     pic: &'a mut pic::Pic8259Pair,
     pit: &'a mut pit::Pit,
@@ -3533,58 +3537,6 @@ fn opl_port(port: u16) -> Option<u16> {
 /// Saturate an OPL mix value to the 16-bit DAC range.
 fn clamp_i16(value: i32) -> i16 {
     value.clamp(i16::MIN as i32, i16::MAX as i32) as i16
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SerialPort {
-    registers: [u8; 8],
-    output: Vec<u8>,
-}
-
-impl Default for SerialPort {
-    fn default() -> Self {
-        let mut registers = [0; 8];
-        registers[5] = 0x60;
-        Self {
-            registers,
-            output: Vec::new(),
-        }
-    }
-}
-
-impl SerialPort {
-    fn output(&self) -> &[u8] {
-        &self.output
-    }
-
-    fn read_port(&self, port: u16) -> Option<u8> {
-        let offset = serial_offset(port)?;
-        if offset == 5 {
-            Some(0x60)
-        } else {
-            Some(self.registers[offset])
-        }
-    }
-
-    fn write_port(&mut self, port: u16, value: u8) -> bool {
-        let Some(offset) = serial_offset(port) else {
-            return false;
-        };
-
-        self.registers[offset] = value;
-        if offset == 0 && self.registers[3] & 0x80 == 0 {
-            self.output.push(value);
-        }
-        true
-    }
-}
-
-fn serial_offset(port: u16) -> Option<usize> {
-    if (0x03f8..=0x03ff).contains(&port) {
-        Some(usize::from(port - 0x03f8))
-    } else {
-        None
-    }
 }
 
 /// Convert a binary value 0..=99 to packed BCD. Values above 99 saturate the
