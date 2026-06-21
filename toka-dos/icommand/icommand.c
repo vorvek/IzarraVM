@@ -97,13 +97,170 @@ static unsigned long dword_at(const unsigned char *p)
 #define DTA_SIZE 0x1A
 #define DTA_NAME 0x1E
 
-static void print_prompt(void)
+/* The master environment: a DOS-format block of KEY=VALUE strings, each NUL
+ * terminated, ended by an empty string (a double NUL). ICOMMAND owns it and
+ * seeds it with the same defaults the boot environment carries. SET/PATH/PROMPT
+ * edit it and the prompt reads it. (Children still inherit the boot environment,
+ * so a SET after boot is not yet propagated into a launched program.) */
+static char master_env[2048] =
+    "PATH=C:\\;C:\\DOS\0PROMPT=$p$g\0COMSPEC=C:\\ICOMMAND.COM\0";
+
+static int key_matches(const char *entry, const char *name, int namelen)
+{
+    int i;
+    for (i = 0; i < namelen; i++) {
+        if (up(entry[i]) != up(name[i])) {
+            return 0;
+        }
+    }
+    return entry[namelen] == '=';
+}
+
+/* Return a pointer to the value of NAME in the environment, or NULL. */
+static char *env_get(const char *name)
+{
+    char *p = master_env;
+    int namelen = (int)strlen(name);
+    while (*p) {
+        if (key_matches(p, name, namelen)) {
+            return p + namelen + 1;
+        }
+        p += strlen(p) + 1;
+    }
+    return 0;
+}
+
+/* Set NAME=VALUE in the environment. An empty value removes NAME. The key is
+ * stored uppercased, the DOS convention. */
+static void env_set(const char *name, const char *value)
+{
+    char tmp[2048];
+    int t = 0, i;
+    int namelen = (int)strlen(name);
+    char *p = master_env;
+    while (*p) {
+        int entrylen = (int)strlen(p);
+        if (!key_matches(p, name, namelen)) {
+            memcpy(tmp + t, p, entrylen + 1);
+            t += entrylen + 1;
+        }
+        p += entrylen + 1;
+    }
+    if (value[0]) {
+        for (i = 0; i < namelen; i++) {
+            tmp[t++] = up(name[i]);
+        }
+        tmp[t++] = '=';
+        strcpy(tmp + t, value);
+        t += (int)strlen(value) + 1;
+    }
+    tmp[t++] = 0; /* the terminating empty string */
+    memcpy(master_env, tmp, t);
+}
+
+static void env_list(void)
+{
+    char *p = master_env;
+    while (*p) {
+        t_putln(p);
+        p += strlen(p) + 1;
+    }
+}
+
+/* Draw the prompt from the PROMPT variable, expanding the $ codes. Falls back to
+ * $p$g (current path then '>') when PROMPT is unset. */
+static void render_prompt(void)
 {
     char cwd[64];
-    t_getcwd(cwd);
-    t_puts("C:\\");
-    t_puts(cwd); /* no leading slash; empty at the root */
-    t_puts(">");
+    char *p = env_get("PROMPT");
+    if (!p || !*p) {
+        t_puts("C:\\");
+        t_getcwd(cwd);
+        t_puts(cwd);
+        t_puts(">");
+        return;
+    }
+    while (*p) {
+        if (*p == '$' && p[1]) {
+            p++;
+            switch (up(*p)) {
+            case 'P':
+                t_puts("C:\\");
+                t_getcwd(cwd);
+                t_puts(cwd);
+                break;
+            case 'G':
+                t_putc('>');
+                break;
+            case 'L':
+                t_putc('<');
+                break;
+            case 'B':
+                t_putc('|');
+                break;
+            case 'N':
+                t_putc('C');
+                break;
+            case 'Q':
+                t_putc('=');
+                break;
+            case '$':
+                t_putc('$');
+                break;
+            case '_':
+                t_putc('\r');
+                t_putc('\n');
+                break;
+            default:
+                t_putc('$');
+                t_putc(*p);
+                break;
+            }
+            p++;
+        } else {
+            t_putc(*p++);
+        }
+    }
+}
+
+static void cmd_set(char *rest)
+{
+    char *eq;
+    if (rest[0] == 0) {
+        env_list();
+        return;
+    }
+    eq = strchr(rest, '=');
+    if (!eq) {
+        char *value = env_get(rest);
+        if (value) {
+            t_puts(rest);
+            t_puts("=");
+            t_putln(value);
+        } else {
+            t_putln("Environment variable not defined");
+        }
+        return;
+    }
+    *eq = 0;
+    env_set(rest, eq + 1);
+}
+
+static void cmd_path(char *rest)
+{
+    char *value;
+    if (rest[0] == 0) {
+        value = env_get("PATH");
+        t_puts("PATH=");
+        t_putln(value ? value : "");
+        return;
+    }
+    env_set("PATH", rest);
+}
+
+static void cmd_prompt(char *rest)
+{
+    env_set("PROMPT", rest[0] ? rest : "$p$g");
 }
 
 static void cmd_dir(const char *arg)
@@ -382,6 +539,12 @@ static void dispatch(char *word, char *rest)
         t_putln(" Volume in drive C is TOKA-DOS");
     } else if (eqi(word, "VERIFY")) {
         t_putln("VERIFY is off");
+    } else if (eqi(word, "SET")) {
+        cmd_set(rest);
+    } else if (eqi(word, "PATH")) {
+        cmd_path(rest);
+    } else if (eqi(word, "PROMPT")) {
+        cmd_prompt(rest);
     } else {
         if (!run_external(word, rest)) {
             t_putln("Bad command or file name");
@@ -400,7 +563,7 @@ int main(void)
     t_putln("");
 
     for (;;) {
-        print_prompt();
+        render_prompt();
         t_getline(line, LINE_MAX);
         rest = split_word(line, word, sizeof word);
         if (word[0] == 0) {

@@ -17,7 +17,10 @@ New-Item -ItemType Directory -Force $build | Out-Null
 function Compile($src, $objName) {
     # Emit the .obj into the build dir so the link step uses bare, space-free
     # names (wlink's `file a,b` directive does not tolerate quoted paths well).
-    & wcc -ms -0 -q -I"$root\runtime" -fo="$build\$objName" $src
+    # -s drops stack-overflow checks: the .COM model does not set up the
+    # stack-limit symbol __STK relies on, so the check fires falsely on larger
+    # stack frames.
+    & wcc -ms -0 -s -q -I"$root\runtime" -fo="$build\$objName" $src
     if ($LASTEXITCODE -ne 0) { throw "wcc failed on $src" }
 }
 

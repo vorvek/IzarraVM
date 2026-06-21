@@ -7806,6 +7806,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn toka_path_command_shows_the_default_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = izarravm_firmware::toka_dos_system_files();
+        izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format)
+            .unwrap();
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .unwrap();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        machine.set_toka_c_root(dir.path().to_path_buf());
+        machine.run_until_halt_or_cycles(22_000_000).unwrap();
+
+        // Type "path" (ICOMMAND uppercases the verb) then Enter, lowercase so no
+        // Shift is needed.
+        fn key_codes(ch: char) -> Vec<u8> {
+            let make: u8 = match ch {
+                'p' => 0x19,
+                'a' => 0x1e,
+                't' => 0x14,
+                'h' => 0x23,
+                '\r' => 0x1c,
+                _ => return Vec::new(),
+            };
+            vec![make, make | 0x80]
+        }
+        for ch in "path\r".chars() {
+            for code in key_codes(ch) {
+                machine.inject_key_scancodes(&[code]);
+            }
+            machine.run_until_halt_or_cycles(400_000).unwrap();
+        }
+
+        let text = machine.screen_text().as_text();
+        assert!(
+            text.contains("C:\\;C:\\DOS"),
+            "PATH prints the default search path; got:\n{text}"
+        );
+    }
+
     // --- Izarra 3000 BIOS foundation ---------------------------------------
 
     #[test]
