@@ -16,7 +16,7 @@ pub(crate) struct DmaChannel {
     pub page: u8,             // high address byte A16-A23 (page register)
     pub addr_decrement: bool, // mode bit5
     pub auto_init: bool,      // mode bit4
-    pub transfer_kind: u8,    // mode bits2-3: 0 verify, 1 write(m->i/o), 2 read(i/o->m)
+    pub transfer_kind: u8,    // mode bits2-3: 0 verify, 1 write(i/o->mem), 2 read(mem->i/o)
     pub transfer_mode: u8,    // mode bits6-7: 0 demand, 1 single, 2 block, 3 cascade
     pub mask: bool,           // mask register bit
     pub reached_tc: bool,
