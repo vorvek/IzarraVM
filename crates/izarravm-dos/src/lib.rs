@@ -1947,6 +1947,76 @@ impl DosKernel {
                 }
                 Ok(DosAction::Continue)
             }
+            // AH=44h IOCTL. The subfunction is in AL. The load-bearing one is AL=00h get
+            // device info, which programs use to tell a console (bit 7 ISDEV set) from a
+            // redirected file (clear) so they can decide whether to buffer output.
+            // ponytail: the character-device info word populates only the console bits
+            // that matter (ISDEV + stdin/stdout); NUL/clock/binary/special are not set.
+            0x44 => {
+                let handle = regs.bx;
+                let valid = handle <= 4 || self.open_files.contains_key(&handle);
+                match regs.ax as u8 {
+                    0x00 => {
+                        if handle <= 2 {
+                            // stdin(0) is a console input device, stdout(1)/stderr(2) output.
+                            let io = if handle == 0 { 0x01 } else { 0x02 };
+                            regs.dx = 0x80 | io; // bit 7 ISDEV + the console direction bit
+                            regs.cf = false;
+                        } else if self.open_files.contains_key(&handle) {
+                            // A regular file on C: (drive index 2); bit 7 clear means a file.
+                            regs.dx = 0x0002;
+                            regs.cf = false;
+                        } else {
+                            set_dos_error(regs, 0x06); // invalid handle
+                        }
+                    }
+                    0x01 => {
+                        // Set device info: the attribute bits have no host effect; accept.
+                        if valid {
+                            regs.cf = false;
+                        } else {
+                            set_dos_error(regs, 0x06);
+                        }
+                    }
+                    0x06 => {
+                        // Get input status: AL=0xFF ready, 0x00 not. Console input (handle 0)
+                        // is ready only when a key waits; files and outputs are always ready.
+                        if valid {
+                            let ready = handle != 0 || !kbd_ring_is_empty(mem)?;
+                            regs.ax = (regs.ax & 0xff00) | if ready { 0xff } else { 0x00 };
+                            regs.cf = false;
+                        } else {
+                            set_dos_error(regs, 0x06);
+                        }
+                    }
+                    0x07 => {
+                        // Get output status: host writes never block, so always ready.
+                        if valid {
+                            regs.ax = (regs.ax & 0xff00) | 0xff;
+                            regs.cf = false;
+                        } else {
+                            set_dos_error(regs, 0x06);
+                        }
+                    }
+                    0x08 => {
+                        // Block device removable? AX=1 fixed (C: is a fixed disk).
+                        regs.ax = 1;
+                        regs.cf = false;
+                    }
+                    0x09 => {
+                        // Is drive remote? DX bit 12 clear: C: is local.
+                        regs.dx = 0;
+                        regs.cf = false;
+                    }
+                    0x0a => {
+                        // Is handle remote? DX bit 15 clear: local.
+                        regs.dx = 0;
+                        regs.cf = false;
+                    }
+                    _ => set_dos_error(regs, 0x01), // unsupported IOCTL subfunction
+                }
+                Ok(DosAction::Continue)
+            }
             // Other file functions (find) and everything else are not yet
             // implemented; later slices fill them in. An unimplemented function
             // returns Continue so the IRET stub returns to the caller.
@@ -2627,6 +2697,74 @@ mod tests {
         kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
         assert!(regs.cf);
         assert_eq!(regs.ax, 0x06);
+    }
+
+    #[test]
+    fn ah44_get_device_info_distinguishes_console_from_file() {
+        // Console handle 1 (stdout): the ISDEV bit (7) is set.
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let mut regs = DosRegs {
+            ax: 0x4400,
+            bx: 1,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf);
+        assert_ne!(regs.dx & 0x80, 0, "console is a character device");
+        // A regular file handle: the ISDEV bit is clear.
+        let (mut kernel, mut mem, _dir) = kernel_with_drive(&[("DATA.TXT", b"hi")], r"C:\DATA.TXT");
+        let handle = open(&mut kernel, &mut mem).ax;
+        let mut regs = DosRegs {
+            ax: 0x4400,
+            bx: handle,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf);
+        assert_eq!(regs.dx & 0x80, 0, "a file is not a character device");
+    }
+
+    #[test]
+    fn ah44_get_device_info_invalid_handle_errors() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let mut regs = DosRegs {
+            ax: 0x4400,
+            bx: 50,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x06);
+    }
+
+    #[test]
+    fn ah44_output_status_reports_ready() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let mut regs = DosRegs {
+            ax: 0x4407,
+            bx: 1,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf);
+        assert_eq!(regs.ax & 0xff, 0xff);
+    }
+
+    #[test]
+    fn ah44_input_status_empty_console_is_not_ready() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let mut regs = DosRegs {
+            ax: 0x4406,
+            bx: 0,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf);
+        assert_eq!(regs.ax & 0xff, 0x00);
     }
 
     #[test]
