@@ -310,12 +310,13 @@ int16:
     mov al, 0xf3            ; keyboard command: set typematic rate/delay
     out 0x60, al
     call .typ_drain
-    ; Build the rate byte: BL low 5 bits are the repeat rate, BH bits 6-5 the
-    ; initial delay. Mask each to its field and OR them.
+    ; Build the rate byte: BL low 5 bits are the repeat rate, BH is a 0-3 delay
+    ; value (00h=250ms..03h=1000ms) placed into bits 5-6. Mask and OR them.
     mov al, bl
     and al, 0x1f
     mov ah, bh
-    and ah, 0x60
+    and ah, 0x03
+    shl ah, 5
     or al, ah
     out 0x60, al            ; rate/delay parameter
     call .typ_drain
