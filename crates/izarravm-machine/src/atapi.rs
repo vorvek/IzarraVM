@@ -47,8 +47,8 @@ pub mod asc {
 /// and cleared when the result phase is ready. The IDE register file (`ide.rs`)
 /// runs each command synchronously, so the busy window is momentary; this device
 /// models the bit so the register file can publish it on the status port.
-// ponytail: ide.rs owns the status port and is out of scope for this module, so
-// this const and the interrupt-reason API below have no in-crate consumer yet.
+// ponytail: the synchronous model never opens a real busy window, so ide.rs has
+// no place to publish this bit; it stays defined for fidelity but uncalled.
 #[allow(dead_code)]
 pub const BSY: u8 = 0x80;
 
@@ -58,8 +58,6 @@ pub const BSY: u8 = 0x80;
 /// packet command moves through map to three byte values.
 pub mod interrupt_reason {
     /// Awaiting the command packet (CDB): C/D=1, I/O=0.
-    // ponytail: set by arm_packet, which ide.rs would call; no lib consumer yet.
-    #[allow(dead_code)]
     pub const AWAIT_PACKET: u8 = 0x01;
     /// Data-in armed (device-to-host): C/D=0, I/O=1.
     pub const DATA_IN: u8 = 0x02;
@@ -118,9 +116,8 @@ pub struct AtapiDevice {
     /// drivers that stop then start the unit see the flag flip.
     started: bool,
     /// The interrupt-reason byte (C/D, I/O) for the current packet phase. The IDE
-    /// register file publishes this on the sector-count port. ponytail: the
-    /// register file owns the actual port; this is the device-side source of truth
-    /// the wiring would read.
+    /// register file reads this through [`Self::interrupt_reason`] and publishes it
+    /// on the sector-count port; this is the device-side source of truth.
     interrupt_reason: u8,
 }
 
@@ -161,8 +158,8 @@ impl AtapiDevice {
         self.play
     }
 
-    // ponytail: the four queries below feed ide.rs (status/sector-count ports),
-    // which is out of scope for this module, so they have no in-crate caller yet.
+    // ponytail: these two tray/spin queries feed ide.rs (status port), which does
+    // not surface them on any ATA register, so they have no in-crate caller yet.
     /// Whether PREVENT/ALLOW MEDIUM REMOVAL currently locks the tray.
     #[allow(dead_code)]
     pub fn removal_prevented(&self) -> bool {
@@ -178,7 +175,6 @@ impl AtapiDevice {
     /// The interrupt-reason (C/D, I/O) byte for the phase the last command left
     /// the device in. The IDE register file reads this to drive the sector-count
     /// port. Awaiting a packet is signalled by [`Self::arm_packet`].
-    #[allow(dead_code)]
     pub fn interrupt_reason(&self) -> u8 {
         self.interrupt_reason
     }
@@ -186,7 +182,6 @@ impl AtapiDevice {
     /// Mark the device as awaiting the command packet (CDB write phase). Sets the
     /// interrupt reason to C/D=1, I/O=0. Called by the register file when the host
     /// issues the ATA PACKET command, before the CDB arrives.
-    #[allow(dead_code)]
     pub fn arm_packet(&mut self) {
         self.interrupt_reason = interrupt_reason::AWAIT_PACKET;
     }

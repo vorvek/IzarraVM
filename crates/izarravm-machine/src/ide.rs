@@ -16,7 +16,7 @@
 //! handled directly. DMA is not modeled: transfers are PIO, which every ATAPI
 //! driver and ICDEX supports.
 
-use crate::atapi::{AtapiDevice, CmdResult};
+use crate::atapi::{self, AtapiDevice, CmdResult};
 use crate::cdimage::DATA_SECTOR;
 
 /// Secondary-channel command-block base (0x170-0x177).
@@ -289,6 +289,11 @@ impl IdeChannel {
         // before issuing PACKET. Capture it now so run_packet can chunk a large
         // data-in transfer into DRQ blocks no bigger than the limit.
         self.byte_count_limit = u16::from_le_bytes([self.lba_mid, self.lba_high]) as usize;
+        // Arm the CDB phase: the device sets C/D=1, I/O=0 (command, from host).
+        // Publish it on the sector-count (interrupt-reason) port so a host that
+        // polls the reason before feeding the CDB sees the command phase.
+        self.device.arm_packet();
+        self.publish_interrupt_reason();
         self.status = status::DRDY | status::DRQ;
         self.error = 0;
     }
@@ -323,11 +328,13 @@ impl IdeChannel {
         let byte = self.data_in.get(self.data_in_pos).copied().unwrap_or(0);
         self.data_in_pos += 1;
         if self.data_in_pos >= self.data_in.len() {
-            // Whole transfer complete: drop DRQ, go idle.
+            // Whole transfer complete: drop DRQ, go idle. The data phase is over,
+            // so the interrupt reason advances to command-complete (C/D=1, I/O=1).
             self.phase = Phase::Idle;
             self.data_in.clear();
             self.data_in_pos = 0;
             self.data_in_block_end = 0;
+            self.sector_count = atapi::interrupt_reason::COMMAND_COMPLETE;
             self.status = status::DRDY | status::DSC;
         } else if self.data_in_pos >= self.data_in_block_end {
             // Block done but more data remains: arm the next DRQ block and pulse
@@ -359,13 +366,15 @@ impl IdeChannel {
             CmdResult::Data(buf) => {
                 self.charge_time(cdb[0], &buf);
                 if buf.is_empty() {
-                    // Non-data command: complete with DRDY, raise the IRQ.
+                    // Non-data command: complete with DRDY, raise the IRQ. The
+                    // device left the reason on command-complete (C/D=1, I/O=1).
                     self.phase = Phase::Idle;
                     self.status = status::DRDY | status::DSC;
                     self.error = 0;
                 } else {
                     // Data-in: present the first DRQ block. The host byte-count
                     // limit caps each block; the rest go out as the host drains.
+                    // The device left the reason on data-in (C/D=0, I/O=1).
                     self.data_in = buf;
                     self.data_in_pos = 0;
                     self.phase = Phase::DataIn;
@@ -374,11 +383,16 @@ impl IdeChannel {
                 }
             }
             CmdResult::Error => {
+                // The device left the reason on command-complete; the host reads
+                // CHECK CONDITION from the status/error registers.
                 self.phase = Phase::Idle;
                 self.status = status::DRDY | status::ERR;
                 self.error = 0x04; // ABRT / CHECK CONDITION (sense already latched)
             }
         }
+        // Publish the phase the command landed in onto the sector-count
+        // (interrupt-reason) port the host polls.
+        self.publish_interrupt_reason();
         self.raise_irq();
     }
 
@@ -414,6 +428,12 @@ impl IdeChannel {
             self.pending_stall += seek + transfer;
         }
         let _ = DATA_SECTOR;
+    }
+
+    /// Copy the device's current interrupt reason (C/D, I/O) onto the sector-count
+    /// register, which is the ATAPI Interrupt Reason register the host polls.
+    fn publish_interrupt_reason(&mut self) {
+        self.sector_count = self.device.interrupt_reason();
     }
 
     fn raise_irq(&mut self) {
@@ -673,5 +693,46 @@ mod tests {
         assert_eq!(out.len(), total);
         assert_eq!(out[0], 0x50); // sector 0 marker
         assert_eq!(out[DATA_SECTOR], 0x51); // sector 1 marker
+    }
+
+    #[test]
+    fn interrupt_reason_walks_the_packet_phases() {
+        use crate::atapi::interrupt_reason as ir;
+        const SECTOR_COUNT: u16 = SECONDARY_CMD_BASE + 2; // interrupt-reason register
+
+        let mut ch = IdeChannel::new();
+        ch.device_mut().insert(data_disc(8));
+        // Clear the post-insert unit attention with a TEST UNIT READY.
+        ch.write_port(SECONDARY_CMD_BASE + 7, 0xA0);
+        for b in [0u8; 12] {
+            ch.write_port(SECONDARY_CMD_BASE, b);
+        }
+
+        // PACKET (0xA0): awaiting the CDB. C/D=1, I/O=0 (command, from host).
+        ch.write_port(SECONDARY_CMD_BASE + 7, 0xA0);
+        assert_eq!(ch.read_port(SECTOR_COUNT).unwrap(), ir::AWAIT_PACKET);
+        assert_eq!(ir::AWAIT_PACKET, 0x01);
+
+        // Feed a READ(10) of one sector. The data phase arms: C/D=0, I/O=1.
+        let mut cdb = [0u8; 12];
+        cdb[0] = 0x28;
+        cdb[5] = 0; // lba 0
+        cdb[8] = 1; // one sector
+        for b in cdb {
+            ch.write_port(SECONDARY_CMD_BASE, b);
+        }
+        assert_eq!(ch.status & status::DRQ, status::DRQ);
+        assert_eq!(ch.read_port(SECTOR_COUNT).unwrap(), ir::DATA_IN);
+        assert_eq!(ir::DATA_IN, 0x02);
+
+        // Drain the data block. The reason holds at data-in until the last byte.
+        for _ in 0..DATA_SECTOR {
+            ch.read_port(SECONDARY_CMD_BASE).unwrap();
+        }
+
+        // Transfer complete: C/D=1, I/O=1 (status phase).
+        assert_eq!(ch.status & status::DRQ, 0);
+        assert_eq!(ch.read_port(SECTOR_COUNT).unwrap(), ir::COMMAND_COMPLETE);
+        assert_eq!(ir::COMMAND_COMPLETE, 0x03);
     }
 }
