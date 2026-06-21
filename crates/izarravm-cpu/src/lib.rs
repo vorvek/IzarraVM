@@ -4263,8 +4263,33 @@ impl Cpu386 {
                     }
                     Ok(clocks(14))
                 }
+                5 => {
+                    // FLD m80: load an 80-bit extended-precision real.
+                    let v = self.read_extended80(bus, mem)?;
+                    self.fpu.push(v);
+                    Ok(clocks(14))
+                }
+                7 => {
+                    // FSTP m80: store ST(0) as 80-bit extended, then pop.
+                    let v = self.fpu.get(0);
+                    self.write_extended80(bus, mem, v)?;
+                    self.fpu.pop();
+                    Ok(clocks(14))
+                }
                 _ => self.fpu_unsupported(opcode),
             },
+            0xda => {
+                // FIADD/FIMUL/FICOM/FICOMP/FISUB/FISUBR/FIDIV/FIDIVR m32int.
+                let operand = self.read_int32(bus, mem)?;
+                self.fpu_mem_arith(reg, operand);
+                Ok(clocks(20))
+            }
+            0xde => {
+                // Integer-operand arithmetic with an m16 source.
+                let operand = self.read_int16(bus, mem)?;
+                self.fpu_mem_arith(reg, operand);
+                Ok(clocks(20))
+            }
             0xdf => match reg {
                 0 => {
                     let v = self.read_int16(bus, mem)?;
@@ -4838,6 +4863,105 @@ impl Cpu386 {
             mem.offset.wrapping_add(4),
             OperandSize::Dword,
             (bits >> 32) as u32,
+            BusAccessKind::DataWrite,
+        )
+    }
+
+    fn read_extended80<B: CpuBus>(&mut self, bus: &mut B, mem: MemoryOperand) -> ExecResult<f64> {
+        let lo = self.read_memory_sized(
+            bus,
+            mem.segment,
+            mem.offset,
+            OperandSize::Dword,
+            BusAccessKind::DataRead,
+        )?;
+        let mid = self.read_memory_sized(
+            bus,
+            mem.segment,
+            mem.offset.wrapping_add(4),
+            OperandSize::Dword,
+            BusAccessKind::DataRead,
+        )?;
+        let se = self.read_memory_sized(
+            bus,
+            mem.segment,
+            mem.offset.wrapping_add(8),
+            OperandSize::Word,
+            BusAccessKind::DataRead,
+        )?;
+        let mantissa = (u64::from(mid) << 32) | u64::from(lo);
+        let sign = (se >> 15) & 1 == 1;
+        let exponent = (se & 0x7fff) as i32;
+        let value = if exponent == 0 && mantissa == 0 {
+            0.0
+        } else if exponent == 0x7fff {
+            // Integer bit set with an empty fraction is infinity; otherwise NaN.
+            if mantissa == 0x8000_0000_0000_0000 {
+                f64::INFINITY
+            } else {
+                f64::NAN
+            }
+        } else {
+            // value = mantissa * 2^(exponent - bias - 63), where the 64-bit mantissa
+            // carries the explicit integer bit. f64 keeps 53 of those bits.
+            (mantissa as f64) * 2.0f64.powi(exponent - 16383 - 63)
+        };
+        Ok(if sign { -value } else { value })
+    }
+
+    fn write_extended80<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        mem: MemoryOperand,
+        value: f64,
+    ) -> ExecResult<()> {
+        let sign = value.is_sign_negative();
+        let (mantissa, exponent) = if value == 0.0 {
+            (0u64, 0u16)
+        } else if value.is_nan() {
+            (0xc000_0000_0000_0000, 0x7fff)
+        } else if value.is_infinite() {
+            (0x8000_0000_0000_0000, 0x7fff)
+        } else {
+            let bits = value.abs().to_bits();
+            let biased = ((bits >> 52) & 0x7ff) as i32;
+            let fraction = bits & 0x000f_ffff_ffff_ffff;
+            if biased == 0 {
+                // Subnormal f64. ponytail: rare path normalized by scaling, not exact bits.
+                let e = value.abs().log2().floor() as i32;
+                let m = (value.abs() / 2.0f64.powi(e) * 2.0f64.powi(63)) as u64;
+                (m, (e + 16383) as u16)
+            } else {
+                // Move the implicit integer bit out and shift the 52-bit fraction up.
+                (
+                    (1u64 << 63) | (fraction << 11),
+                    (biased - 1023 + 16383) as u16,
+                )
+            }
+        };
+        let se = (u16::from(sign) << 15) | exponent;
+        self.write_memory_sized(
+            bus,
+            mem.segment,
+            mem.offset,
+            OperandSize::Dword,
+            (mantissa & 0xffff_ffff) as u32,
+            BusAccessKind::DataWrite,
+        )?;
+        self.write_memory_sized(
+            bus,
+            mem.segment,
+            mem.offset.wrapping_add(4),
+            OperandSize::Dword,
+            (mantissa >> 32) as u32,
+            BusAccessKind::DataWrite,
+        )?;
+        self.write_memory_sized(
+            bus,
+            mem.segment,
+            mem.offset.wrapping_add(8),
+            OperandSize::Word,
+            u32::from(se),
             BusAccessKind::DataWrite,
         )
     }
@@ -10349,5 +10473,35 @@ mod tests {
         cpu.cycle(&mut bus).unwrap();
         assert_eq!(cpu.fpu.get(0), 1.0);
         assert_eq!(cpu.fpu.get(1), 0.0);
+    }
+
+    // ---- Phase 2 slice C: integer-operand arithmetic + 80-bit extended ----
+
+    #[test]
+    fn fidiv_divides_by_an_integer_operand() {
+        // FILD m32 [0x100]=20; FIDIV m32 [0x104]=4 (DA /6). 20 / 4 = 5.
+        let code = [0xdb, 0x06, 0x00, 0x01, 0xda, 0x36, 0x04, 0x01];
+        let (mut cpu, mut memory) = real_mode_cpu(&code, 0x200);
+        memory[0x100..0x104].copy_from_slice(&20i32.to_le_bytes());
+        memory[0x104..0x108].copy_from_slice(&4i32.to_le_bytes());
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.fpu.get(0), 5.0);
+    }
+
+    #[test]
+    fn extended80_round_trips_through_memory() {
+        // FLD m64 [0x100]=3.5; FSTP m80 [0x108] (DB /7); FLD m80 [0x108] (DB /5).
+        let code = [
+            0xdd, 0x06, 0x00, 0x01, 0xdb, 0x3e, 0x08, 0x01, 0xdb, 0x2e, 0x08, 0x01,
+        ];
+        let (mut cpu, mut memory) = real_mode_cpu(&code, 0x200);
+        memory[0x100..0x108].copy_from_slice(&3.5f64.to_le_bytes());
+        let mut bus = TestBus::with_memory(memory);
+        for _ in 0..3 {
+            cpu.cycle(&mut bus).unwrap();
+        }
+        assert_eq!(cpu.fpu.get(0), 3.5);
     }
 }
