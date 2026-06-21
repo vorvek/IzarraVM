@@ -1626,10 +1626,10 @@ impl Machine {
     /// (C201), set sample rate (C202), set resolution (C203), get device type
     /// (C204), initialize (C205), and the extended-command group (C206). The aux
     /// device is the same standard PS/2 mouse INT 33h models, so the reset reports
-    /// the self-test-passed/device-id bytes a real mouse returns. ponytail: C207
-    /// (set the far-call device handler) and C208/C209 (read/write the device port)
-    /// need the outbound callback and raw port path, which this HLE does not wire, so
-    /// they report function-not-supported (AH=86h, CF set).
+    /// the self-test-passed/device-id bytes a real mouse returns. C207 (set the
+    /// device handler) stores the ES:BX far pointer in the EBDA and returns success;
+    /// the pointer is never called yet (see the C207 arm). C208/C209 (read/write the
+    /// raw device port) report function-not-supported (AH=86h, CF set).
     fn int15_c2_pointing_device(&mut self, al: u8) {
         let bh = (self.cpu.registers.ebx() as u16 >> 8) as u8;
         match al {
@@ -1687,8 +1687,26 @@ impl Machine {
                 self.set_eax_ah(0x00);
                 self.set_int_frame_carry(false);
             }
-            // C207 set device handler, C208/C209 port read/write: the outbound
-            // far-call and raw-port paths are not wired. Report function-not-supported.
+            // C207 set device handler: store the ES:BX far pointer the guest is
+            // installing into the EBDA (offset word then segment word) and report
+            // success. ES=0:BX=0 deregisters. ponytail: the handler far-pointer is
+            // stored but never called: invocation needs the outbound host->guest
+            // far-call trampoline plus a mouse-packet source, and no producer is
+            // wired, so this is deferred until a producer exists. C208/C209 (the
+            // raw device-port read/write) stay unsupported for the same reason.
+            0x07 => {
+                // The far pointer's segment is the literal ES the guest passed (the
+                // selector), not the derived physical base.
+                let es = self.cpu.registers.segment(SegmentIndex::Es).selector;
+                let bx = self.cpu.registers.ebx() as u16;
+                let base = (u32::from(EBDA_SEGMENT) << 4) + EBDA_MOUSE_HANDLER_OFF;
+                self.write_guest_block(base, &bx.to_le_bytes());
+                self.write_guest_block(base + 2, &es.to_le_bytes());
+                self.set_eax_ah(0x00);
+                self.set_int_frame_carry(false);
+            }
+            // C208/C209 raw device-port read/write: no raw aux-port path is wired.
+            // Report function-not-supported.
             _ => {
                 self.set_eax_ah(0x86);
                 self.set_int_frame_carry(true);
@@ -1889,6 +1907,72 @@ impl Machine {
             0x06 | 0x07 | 0x08 | 0x0C | 0x0D | 0x0F => self.set_int_frame_carry(false),
             _ => self.set_int_frame_carry(true),
         }
+    }
+
+    /// Point CS:IP at a real-mode far address. Used by the boot vectors to
+    /// redirect execution instead of returning through the INT's IRET stub: the
+    /// run loop steps the CPU from these registers on its next iteration, so the
+    /// guest resumes at `seg:off` as if the BIOS had far-jumped there.
+    fn set_cs_ip(&mut self, seg: u16, off: u16) {
+        self.cpu
+            .registers
+            .set_segment(SegmentIndex::Cs, SegmentRegister::real(seg));
+        self.cpu.registers.eip = u32::from(off);
+    }
+
+    /// Service INT 19h (BOOTSTRAP LOADER). Re-run the boot: load the boot sector of
+    /// the default drive to 0000:7C00 and jump there. The default drive is A: when
+    /// a floppy is mounted, otherwise C: (the Toka-DOS HLE boot). When neither is
+    /// bootable, fall through to the INT 18h path. DL carries the drive the loaded
+    /// code booted from (00h floppy, 80h fixed disk), the way a real BIOS leaves it.
+    ///
+    /// This mirrors the izarra-bios ROM's own INT 19h: a mounted floppy is treated
+    /// as bootable and sector 0 is loaded with no 0xAA55 signature check, so a guest
+    /// re-invoking INT 19h gets the same outcome the ROM gives at power-on.
+    ///
+    /// ponytail: the floppy boot copies sector 0 and jumps; it does not retry on a
+    /// read error. C: boots the bundled Toka-DOS through the existing HLE record, not
+    /// an arbitrary MBR. To lift this, read the C: partition table and load a
+    /// guest-supplied MBR the same way the floppy path loads its boot sector.
+    fn handle_int19(&mut self) {
+        // A: floppy first. Copy its boot sector (CHS 0,0,1) to 0000:7C00 and jump
+        // there. A mounted floppy is bootable (matching the ROM path); only an
+        // unreadable sector 0 falls through.
+        if let Some(sector) = self
+            .floppy
+            .as_ref()
+            .and_then(|f| f.read_sector(0, 0, 1))
+            .filter(|s| s.len() >= 512)
+            .map(<[u8]>::to_vec)
+        {
+            self.write_guest_block(BOOT_SECTOR_ADDRESS as u32, &sector[..512]);
+            self.cpu.registers.set_edx(0x00); // DL = 00h: booted from floppy A:
+            self.set_cs_ip(0x0000, BOOT_SECTOR_ADDRESS as u16);
+            return;
+        }
+        // No bootable floppy: try the C: Toka-DOS HLE boot. A zero status means the
+        // boot record landed at 0x7C00 and the DOS base is set up; jump to it.
+        if self.toka_load_boot_record() == 0 {
+            self.cpu.registers.set_edx(0x80); // DL = 80h: booted from fixed disk C:
+            self.set_cs_ip(0x0000, BOOT_SECTOR_ADDRESS as u16);
+            return;
+        }
+        // Nothing bootable: hand off to the diskless/no-boot path.
+        self.handle_int18();
+    }
+
+    /// Service INT 18h (DISKLESS BOOT HOOK). On a real PC this entered ROM BASIC;
+    /// the Izarra 3000 has none, so it reports no bootable device and halts. The
+    /// halt stub clears IF first, so the machine genuinely stops rather than
+    /// spinning on the timer tick.
+    fn handle_int18(&mut self) {
+        // A real BIOS prints a "no bootable device" message here. The text screen
+        // is the BIOS's, so write the line through the same teletype path the rest
+        // of the BIOS uses, then jump to the CLI;HLT stub.
+        for &byte in b"No bootable device\r\n" {
+            self.teletype_char(byte);
+        }
+        self.set_cs_ip(0x0000, BIOS_HALT_STUB_ADDRESS as u16);
     }
 
     /// Replace the low 16 bits of EAX, leaving the upper 16 intact.
@@ -3534,7 +3618,15 @@ impl Machine {
         self.rtc_seconds += clocks as f64 * self.timing.inv_clock;
         let whole_secs = self.rtc_seconds.floor();
         if whole_secs >= 1.0 {
-            self.rtc.tick_seconds(whole_secs as u64);
+            let secs = whole_secs as u64;
+            self.rtc.tick_seconds(secs);
+            // Advance the clock first, then evaluate the RTC interrupt sources so
+            // an enabled alarm compares against the new time. tick_interrupts
+            // returns true only on the rising edge of IRQF (a guest that has not
+            // read Register C to ack keeps the line asserted without a new edge).
+            if self.rtc.tick_interrupts(secs) {
+                self.pic.request(8); // IRQ8: RTC periodic/alarm/update interrupt
+            }
             self.rtc_seconds -= whole_secs;
         }
 
@@ -3990,6 +4082,8 @@ impl Machine {
                             0x14 => self.handle_int14(),
                             0x15 => self.handle_int15(),
                             0x17 => self.handle_int17(),
+                            0x18 => self.handle_int18(),
+                            0x19 => self.handle_int19(),
                             0x1A => self.handle_int1a(),
                             0x25 => self.handle_int25(),
                             0x26 => self.handle_int26(),
@@ -4361,6 +4455,8 @@ impl CpuBus for MachineBus<'_> {
                 | 0x14
                 | 0x15
                 | 0x17
+                | 0x18
+                | 0x19
                 | 0x1A
                 | 0x20
                 | 0x21
@@ -4549,6 +4645,23 @@ const BDA_DAY_COUNT: usize = 0x4f0;
 /// booter wipes low memory, the way real BIOS handlers (which live in ROM) do.
 const BIOS_ROM_IRET_SEG: u16 = 0xff00;
 
+/// RAM address of the default INT 70h (IRQ8) handler, a few bytes past the IRET
+/// stub at 0x600 in the free BIOS scratch below the .COM load segment (0x1000).
+/// Unlike the host-serviced service INTs, the RTC interrupt arrives as a real
+/// hardware IRQ, so its ISR is genuine guest code: it acknowledges Register C
+/// and sends EOI to both 8259s before IRET.
+const BIOS_RTC_ISR_ADDRESS: usize = 0x0610;
+
+/// RAM address of the INT 18h "no bootable device" stub: CLI then HLT. Clearing
+/// IF makes the HLT a genuine stop (the run loop will not wake a CPU whose
+/// interrupts are masked), matching a real BIOS that gives up and halts.
+const BIOS_HALT_STUB_ADDRESS: usize = 0x0620;
+
+/// EBDA offset of the far pointer to the user pointing-device (mouse) handler the
+/// guest installs with INT 15h AX=C207h. The IBM PS/2 BIOS keeps it here as
+/// offset word then segment word; INT 15h AX=C208h reads it back.
+const EBDA_MOUSE_HANDLER_OFF: u32 = 0x0022;
+
 /// Real-mode segment of the 1 KB extended BIOS data area (EBDA), reserved at the
 /// top of conventional memory. Segment 0x9FC0 is physical 0x9FC00, so the EBDA
 /// runs 0x9FC00-0x9FFFF and the conventional-memory word at 0040:0013 drops from
@@ -4565,14 +4678,28 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     // point at the ROM IRET so they survive a guest low-memory wipe. INT 33h is
     // the mouse driver and INT 2Fh is the ICDEX CD bridge; INT 28h/29h are the DOS
     // idle and fast-console hooks; INT 25h/26h are the DOS absolute disk read/write:
-    // the same stub shape the HLE handler returns through.
+    // the same stub shape the HLE handler returns through. INT 18h/19h are the
+    // host-serviced boot and diskless vectors (the run loop services them and
+    // redirects CS:IP itself, so the IRET target is only a fallback). INT 1Bh is
+    // the Ctrl-Break hook: no host handler, just a default IRET so a guest that
+    // hooks it or calls it through the vector has a valid target.
     for vector in [
-        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x17, 0x1A, 0x25, 0x26, 0x28, 0x29, 0x2F, 0x33,
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x25, 0x26, 0x28, 0x29,
+        0x2F, 0x33,
     ] {
         let address = vector * 4;
         memory.write_u16(address, 0)?;
         memory.write_u16(address + 2, BIOS_ROM_IRET_SEG)?;
     }
+    // INT 70h (IRQ8) is a real hardware interrupt, not a host-serviced INT, so its
+    // vector points at the RAM ISR stub that acks Register C and EOIs both PICs.
+    memory.write_u16(0x70 * 4, BIOS_RTC_ISR_ADDRESS as u16)?;
+    memory.write_u16(0x70 * 4 + 2, 0)?;
+    install_rtc_isr_stub(memory)?;
+    // INT 18h's halt target: CLI;HLT in low RAM. The run loop's INT 18h handler
+    // points CS:IP here when no device is bootable.
+    memory.write_u8(BIOS_HALT_STUB_ADDRESS, 0xfa)?; // CLI
+    memory.write_u8(BIOS_HALT_STUB_ADDRESS + 1, 0xf4)?; // HLT
     // The DOS kernel vectors keep the RAM stub: the INT 21h blocking path rewinds
     // EIP onto the CD 21 the RAM stub returns to, and the DOS path owns its memory.
     for vector in [0x20, 0x21] {
@@ -4626,7 +4753,55 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     memory.write_u8(0x475, 0)?; // number of fixed disks
     memory.write_u8(0x471, 0)?; // Ctrl-Break flag
     memory.write_u16(0x472, 0x1234)?; // warm-boot magic
+    // Keyboard data area. The two shift-flag bytes start clear (no key held). The
+    // 32-byte INT 16h ring runs 0040:001E-003D; head and tail both point at its
+    // start (empty), and the start/end pointers (0040:0080/0082) bracket it. A
+    // guest that reads the BDA ring directly, or an INT 16h ROM that walks these
+    // pointers, finds the standard empty-buffer layout.
+    memory.write_u8(0x417, 0)?; // shift flags 1
+    memory.write_u8(0x418, 0)?; // shift flags 2
+    memory.write_u16(0x41a, 0x001e)?; // buffer head pointer (offset into segment 0040)
+    memory.write_u16(0x41c, 0x001e)?; // buffer tail pointer (head == tail: empty)
+    memory.write_u16(0x480, 0x001e)?; // buffer start
+    memory.write_u16(0x482, 0x003e)?; // buffer end (32 bytes -> 16 key slots)
+    memory.write_u8(0x496, 0)?; // keyboard mode/type flags
+    memory.write_u8(0x497, 0)?; // keyboard LED flags
+    // Disk status bytes start clear (no error). 0040:0041 is the floppy/INT 13h
+    // last status (AH=01h reads it); 0040:0074 is the fixed-disk last status.
+    memory.write_u8(0x43e, 0)?; // floppy recalibrate/seek status
+    memory.write_u8(0x441, 0)?; // last floppy disk status
+    memory.write_u8(0x474, 0)?; // last fixed-disk status
     memory.write_u8(BIOS_IRET_STUB_ADDRESS, 0xcf)
+}
+
+/// Write the default INT 70h (IRQ8) handler into low RAM: acknowledge the RTC by
+/// reading Register C (which clears its flags and de-asserts the line) and send
+/// end-of-interrupt to both 8259 PICs, then IRET. This is the minimum a real BIOS
+/// INT 70h does before chaining to any user routine. A guest that masks IRQ8 or
+/// installs its own handler simply overwrites this vector.
+///
+/// ponytail: the real BIOS INT 70h also tests the RTC wait flag (0040:00A0) and
+/// signals the INT 15h AH=83h/86h event-wait completion at 0040:0098. No wait
+/// flag is modeled here, so the stub only acks and EOIs; wire those BDA bytes and
+/// an INT 15h AH=83h path to lift it.
+fn install_rtc_isr_stub(memory: &mut Memory) -> Result<(), BusError> {
+    // push ax; mov al,0Ch; out 70h,al; in al,71h; (ack Register C)
+    // mov al,20h; out A0h,al; out 20h,al; (EOI slave then master)
+    // pop ax; iret
+    const STUB: [u8; 14] = [
+        0x50, // push ax
+        0xb0, 0x0c, // mov al,0Ch (select Register C)
+        0xe6, 0x70, // out 70h,al
+        0xe4, 0x71, // in al,71h (read clears the flags)
+        0xb0, 0x20, // mov al,20h (non-specific EOI)
+        0xe6, 0xa0, // out A0h,al (slave PIC)
+        0xe6, 0x20, // out 20h,al (master PIC)
+        0x58, // pop ax
+    ];
+    for (offset, &byte) in STUB.iter().enumerate() {
+        memory.write_u8(BIOS_RTC_ISR_ADDRESS + offset, byte)?;
+    }
+    memory.write_u8(BIOS_RTC_ISR_ADDRESS + STUB.len(), 0xcf) // iret
 }
 
 /// Seed the INT 15h AH=C0h system-configuration table at BIOS_CONFIG_TABLE_ADDR.
@@ -5059,10 +5234,32 @@ mod tests {
     }
 
     #[test]
-    fn int15_c207_set_handler_reports_unsupported() {
-        // C207 (set device handler) is deferred: AH=0x86, CF set.
+    fn int15_c207_set_handler_stores_pointer_and_succeeds() {
+        // C207 (set device handler) now registers the ES:BX far pointer in the EBDA
+        // and returns success (AH=0, CF clear). The pointer is stored but not yet
+        // called (no mouse-packet producer is wired).
         let mut m = int15_machine(16);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0xABCD));
+        m.cpu.registers.set_ebx(0x0042);
         m.cpu.registers.set_eax(0xC207);
+        m.handle_int15();
+        assert_eq!(
+            (m.cpu.registers.eax() as u16 >> 8) as u8,
+            0x00,
+            "AH=0 success"
+        );
+        let base = (u32::from(EBDA_SEGMENT) << 4) + EBDA_MOUSE_HANDLER_OFF;
+        assert_eq!(read_u16(&mut m, base), 0x0042);
+        assert_eq!(read_u16(&mut m, base + 2), 0xABCD);
+    }
+
+    #[test]
+    fn int15_c208_still_reports_unsupported() {
+        // C208 (read raw device port) has no wired path: AH=0x86 unsupported.
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0xC208);
         m.handle_int15();
         assert_eq!(
             (m.cpu.registers.eax() as u16 >> 8) as u8,
@@ -11494,5 +11691,119 @@ mod tests {
             marker_pixels(&machine, 48).contains(&0),
             "the focused 586 row has a white diamond"
         );
+    }
+
+    #[test]
+    fn int1b_vector_points_at_a_valid_iret_handler() {
+        // Use a ROM that carries the IRET byte at FF00:0000, the way the real BIOS
+        // does, so the seeded vector lands on a genuine IRET.
+        let mut m = Machine::new(
+            MachineProfile::gsw_386(4, VideoCard::Et4000Ax),
+            rom_with_code(&[]),
+        )
+        .unwrap();
+        // IVT[0x1B] is the Ctrl-Break vector: offset word then segment word.
+        let off = read_u16(&mut m, 0x1b * 4);
+        let seg = read_u16(&mut m, 0x1b * 4 + 2);
+        assert_eq!(
+            seg, BIOS_ROM_IRET_SEG,
+            "INT 1Bh targets the ROM IRET segment"
+        );
+        let target = (u32::from(seg) << 4) + u32::from(off);
+        assert_eq!(
+            m.read_physical_u8(target),
+            0xcf,
+            "INT 1Bh target is an IRET"
+        );
+    }
+
+    #[test]
+    fn int70_vector_points_at_the_rtc_isr_stub() {
+        let mut m = int15_machine(4);
+        let off = read_u16(&mut m, 0x70 * 4);
+        let seg = read_u16(&mut m, 0x70 * 4 + 2);
+        assert_eq!(seg, 0);
+        assert_eq!(off, BIOS_RTC_ISR_ADDRESS as u16);
+        // The stub starts with PUSH AX and ends with IRET.
+        assert_eq!(m.read_physical_u8(BIOS_RTC_ISR_ADDRESS as u32), 0x50);
+        assert_eq!(m.read_physical_u8(BIOS_RTC_ISR_ADDRESS as u32 + 14), 0xcf);
+    }
+
+    #[test]
+    fn enabled_rtc_periodic_interrupt_requests_irq8() {
+        let mut m = int15_machine(4);
+        // Enable the periodic interrupt (select Reg B, set PIE bit 6).
+        m.rtc.write_port(0x70, 0x0b);
+        m.rtc.write_port(0x71, 0x40);
+        // Advance enough clocks for at least one whole RTC second to elapse.
+        let one_second = m.active_mode.clock_hz();
+        m.advance_devices(one_second + 1);
+        assert!(m.pic.irr_bit(8), "IRQ8 became pending");
+    }
+
+    #[test]
+    fn c207_stores_the_mouse_handler_far_pointer_in_the_ebda() {
+        let mut m = int15_machine(4);
+        // ES:BX = 1234:5678, the handler the guest installs.
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x1234));
+        m.cpu.registers.set_ebx(0x5678);
+        m.cpu.registers.set_eax(0xC207);
+        m.handle_int15();
+        // CF clear, AH=0: success.
+        let flags_carry = {
+            let ss = m.cpu.registers.segment(SegmentIndex::Ss).base;
+            let sp = m.cpu.registers.esp() as u16;
+            read_u16(&mut m, ss + u32::from(sp.wrapping_add(4))) & 1
+        };
+        assert_eq!(flags_carry, 0, "C207 returns CF clear");
+        assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x00);
+        // The EBDA holds the far pointer: offset word then segment word.
+        let base = (u32::from(EBDA_SEGMENT) << 4) + EBDA_MOUSE_HANDLER_OFF;
+        assert_eq!(read_u16(&mut m, base), 0x5678, "offset stored");
+        assert_eq!(read_u16(&mut m, base + 2), 0x1234, "segment stored");
+    }
+
+    #[test]
+    fn int19_floppy_boot_loads_sector_and_jumps_to_7c00() {
+        let mut m = int15_machine(4);
+        // A 360 KB image with a marker byte at the start of sector 0.
+        let mut image = vec![0u8; 368_640];
+        image[0] = 0xeb; // a plausible boot-sector first byte (JMP short)
+        image[1] = 0x3c;
+        m.mount_floppy(image).unwrap();
+        m.handle_int19();
+        // Boot sector copied to 0000:7C00, DL = 0 (floppy), CS:IP = 0000:7C00.
+        assert_eq!(m.read_physical_u8(BOOT_SECTOR_ADDRESS as u32), 0xeb);
+        assert_eq!(m.read_physical_u8(BOOT_SECTOR_ADDRESS as u32 + 1), 0x3c);
+        assert_eq!(m.cpu.registers.edx() as u8, 0x00);
+        assert_eq!(m.cpu.registers.segment(SegmentIndex::Cs).selector, 0x0000);
+        assert_eq!(m.cpu.registers.eip, BOOT_SECTOR_ADDRESS as u32);
+    }
+
+    #[test]
+    fn int19_without_bootable_media_falls_to_int18_halt_stub() {
+        let mut m = int15_machine(4);
+        // No floppy and no Toka-DOS install: INT 19h must reach the INT 18h halt.
+        m.handle_int19();
+        assert_eq!(
+            m.cpu.registers.segment(SegmentIndex::Cs).selector,
+            0x0000,
+            "CS points at the low-RAM halt stub"
+        );
+        assert_eq!(m.cpu.registers.eip, BIOS_HALT_STUB_ADDRESS as u32);
+        // The stub is CLI;HLT, which halts the machine for good.
+        assert_eq!(m.read_physical_u8(BIOS_HALT_STUB_ADDRESS as u32), 0xfa);
+        assert_eq!(m.read_physical_u8(BIOS_HALT_STUB_ADDRESS as u32 + 1), 0xf4);
+    }
+
+    #[test]
+    fn int18_halt_stub_actually_stops_the_machine() {
+        let mut m = int15_machine(4);
+        m.handle_int18();
+        // Run from the halt stub: CLI then HLT, with IF cleared, gives a genuine stop.
+        let reason = m.run_until_halt_or_cycles(10_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
     }
 }
