@@ -24,6 +24,7 @@ mod pit;
 mod rtc;
 mod speaker;
 mod uart;
+mod unittester;
 
 pub use cdimage::CdImage;
 
@@ -132,9 +133,18 @@ impl MachineProfile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopReason {
     Halted,
-    CycleLimit { requested: u64 },
+    CycleLimit {
+        requested: u64,
+    },
     CpuError(String),
-    DosExit { code: u8 },
+    DosExit {
+        code: u8,
+    },
+    /// The guest issued the unit tester's Exit command (Lotura port 0xE6) with
+    /// this code. A CI harness maps it straight to a process exit status.
+    TestExit {
+        code: u8,
+    },
 }
 
 /// A frozen parent CPU state for EXEC (AH=4Bh AL=0) resume: the register file as
@@ -270,6 +280,13 @@ pub struct Machine {
     // visibility, motion-counter accumulators, and the configured ranges. The
     // PS/2 aux device is the hardware side; this is the DOS driver a game calls.
     mouse: MouseState,
+    // Guest-visible regression-test device (Lotura ports 0xE4-0xE6). A command
+    // write records the request here; the run loop performs it after the cycle
+    // (it needs &mut self for the framebuffer, host I/O, and the stop).
+    unittester: unittester::UnitTester,
+    // Where the unit tester's Snapshot command writes PPM frames, set by the
+    // host. None disables snapshots (the command becomes a no-op).
+    test_snapshot_path: Option<std::path::PathBuf>,
 }
 
 /// INT 33h mouse-driver state. Coordinates are in a virtual screen space that
@@ -427,6 +444,8 @@ impl Machine {
             rtc_seconds: 0.0,
             fast_post: true,
             mouse: MouseState::default(),
+            unittester: unittester::UnitTester::default(),
+            test_snapshot_path: None,
         };
         // The Margo LFB aperture is decoded before RAM, so system memory must
         // stay below it. Validated config caps memory far under this bound.
@@ -846,6 +865,7 @@ impl Machine {
             fast_post: self.fast_post,
             pending_toka_service: &mut self.pending_toka_service,
             toka_service_status: self.toka_service_status,
+            unittester: &mut self.unittester,
             wait_states: self.profile.wait_states,
         }
     }
@@ -2747,6 +2767,98 @@ impl Machine {
         self.video.palette_argb()
     }
 
+    /// The active display as native-resolution `0x00RRGGBB` words plus
+    /// `(width, height)`. Mirrors the GUI's scanout so the unit tester's CRC and
+    /// snapshot see exactly what is presented on screen.
+    pub fn frame_argb(&mut self) -> (Vec<u32>, usize, usize) {
+        let palette = self.palette_argb();
+        match self.active_display() {
+            ActiveDisplay::VgaRaster => match self.vga_raster() {
+                Some(raster) => {
+                    let words = raster
+                        .pixels
+                        .iter()
+                        .map(|&index| palette[usize::from(index)])
+                        .collect();
+                    (words, raster.width as usize, raster.height as usize)
+                }
+                None => (vec![0], 1, 1),
+            },
+            ActiveDisplay::MargoLfb => {
+                let display = self.margo.display();
+                let (width, height) = (display.width as usize, display.height as usize);
+                (self.margo.scanout_argb(&palette), width, height)
+            }
+        }
+    }
+
+    /// zlib/IEEE CRC-32 of a framebuffer rectangle, each pixel hashed as its four
+    /// `0x00RRGGBB` bytes (little-endian). The rectangle is clamped to the frame;
+    /// one fully outside it hashes nothing (CRC of empty input, 0). This is the
+    /// value the unit tester returns at `REG_CRC`, and a handy Rust-side check
+    /// for the boot suite.
+    pub fn screen_crc32(&mut self, x: u16, y: u16, w: u16, h: u16) -> u32 {
+        let (words, frame_w, frame_h) = self.frame_argb();
+        let x = usize::from(x);
+        let y = usize::from(y);
+        let x_end = x.saturating_add(usize::from(w)).min(frame_w);
+        let y_end = y.saturating_add(usize::from(h)).min(frame_h);
+        let mut bytes = Vec::new();
+        for row in y..y_end {
+            for col in x..x_end {
+                bytes.extend_from_slice(&words[row * frame_w + col].to_le_bytes());
+            }
+        }
+        unittester::crc32(&bytes)
+    }
+
+    /// Set where the unit tester's Snapshot command writes PPM frames. `None`
+    /// (the default) makes Snapshot a no-op. Each Snapshot overwrites this path.
+    // ponytail: single path, overwrite. Add an index suffix if a test ever needs
+    // to capture multiple frames in one run.
+    pub fn set_test_snapshot_path(&mut self, path: Option<std::path::PathBuf>) {
+        self.test_snapshot_path = path;
+    }
+
+    /// Execute a unit-tester command deferred from a 0xE6 write. Returns the exit
+    /// code for `CMD_EXIT` so the run loop can stop; `None` otherwise.
+    fn perform_unittester(&mut self, cmd: u8) -> Option<u8> {
+        match cmd {
+            unittester::CMD_CRC => {
+                let (x, y, w, h) = self.unittester.rect();
+                let crc = self.screen_crc32(x, y, w, h);
+                self.unittester.set_crc(crc);
+                None
+            }
+            unittester::CMD_SNAPSHOT => {
+                if let Some(path) = self.test_snapshot_path.clone() {
+                    if let Err(err) = self.write_snapshot_ppm(&path) {
+                        eprintln!("unit tester: snapshot to {} failed: {err}", path.display());
+                    }
+                }
+                None
+            }
+            unittester::CMD_EXIT => Some(self.unittester.exit_code()),
+            _ => None, // unknown command: ignore, like an unused port write
+        }
+    }
+
+    /// Write the current frame to `path` as a binary PPM (P6). PPM keeps a PNG
+    /// encoder out of the dependency tree for a baseline-capture convenience; any
+    /// image viewer or `pnmtopng` opens it.
+    fn write_snapshot_ppm(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let (words, width, height) = self.frame_argb();
+        let mut out = Vec::with_capacity(width * height * 3 + 32);
+        write!(out, "P6\n{width} {height}\n255\n")?;
+        for &word in &words {
+            out.push((word >> 16) as u8); // R
+            out.push((word >> 8) as u8); // G
+            out.push(word as u8); // B
+        }
+        std::fs::write(path, out)
+    }
+
     pub fn bus_trace(&self) -> &BusTrace {
         &self.trace
     }
@@ -3217,6 +3329,7 @@ impl Machine {
                     fast_post,
                     pending_toka_service,
                     toka_service_status,
+                    unittester,
                     ..
                 } = self;
                 let mut bus = MachineBus {
@@ -3244,6 +3357,7 @@ impl Machine {
                     fast_post: *fast_post,
                     pending_toka_service,
                     toka_service_status: *toka_service_status,
+                    unittester,
                     wait_states: profile.wait_states,
                 };
                 cpu.cycle(&mut bus)
@@ -3271,6 +3385,11 @@ impl Machine {
                     }
                     if let Some(cmd) = self.pending_toka_service.take() {
                         self.perform_toka_service(cmd); // Repair/Format/LoadBootRecord
+                    }
+                    if let Some(cmd) = self.unittester.take_pending() {
+                        if let Some(code) = self.perform_unittester(cmd) {
+                            return Ok(StopReason::TestExit { code });
+                        }
                     }
                     if let Some(vector) = self.pending_soft_int {
                         match vector {
@@ -3358,11 +3477,12 @@ struct MachineBus<'a> {
     ide: &'a mut ide::IdeChannel,
     trace: &'a mut BusTrace,
     pending_soft_int: &'a mut Option<u8>,
-    active_mode: GswMode,                     // a copy, for the 0xE1 read
-    pending_mode: &'a mut Option<GswMode>,    // a 0xE1 write records the request here
-    fast_post: bool,                          // a copy, for the 0xE2 POST-pacing read
-    pending_toka_service: &'a mut Option<u8>, // a 0xE3 write records the command
-    toka_service_status: u8,                  // a copy, for the 0xE3 status read
+    active_mode: GswMode,                       // a copy, for the 0xE1 read
+    pending_mode: &'a mut Option<GswMode>,      // a 0xE1 write records the request here
+    fast_post: bool,                            // a copy, for the 0xE2 POST-pacing read
+    pending_toka_service: &'a mut Option<u8>,   // a 0xE3 write records the command
+    toka_service_status: u8,                    // a copy, for the 0xE3 status read
+    unittester: &'a mut unittester::UnitTester, // Lotura ports 0xE4-0xE6
     wait_states: WaitStateProfile,
 }
 
@@ -3514,6 +3634,9 @@ impl CpuBus for MachineBus<'_> {
             // port is the single source of truth). Other bits read 0.
             return Ok(u32::from(u8::from(self.keyboard.a20_enabled()) << 1));
         }
+        if let Some(value) = self.unittester.read_port(port) {
+            return Ok(u32::from(value));
+        }
         if let Some(value) = self.rtc.read_port(port) {
             return Ok(u32::from(value));
         }
@@ -3576,6 +3699,9 @@ impl CpuBus for MachineBus<'_> {
             // Toka-DOS service command: 1 Repair, 2 Format, 0x10 LoadBootRecord.
             // The run loop performs it after this cycle (it needs &mut self).
             *self.pending_toka_service = Some(value as u8);
+            return Ok(());
+        }
+        if self.unittester.write_port(port, value as u8) {
             return Ok(());
         }
         if self.rtc.write_port(port, value as u8) {
@@ -4662,6 +4788,53 @@ mod tests {
     }
 
     #[test]
+    fn unittester_exit_command_stops_with_the_guest_code() {
+        // index=REG_EXIT; data=42; command=CMD_EXIT.
+        let rom = rom_with_code(&[
+            0xB0, 0x0C, 0xE6, 0xE4, // mov al,12; out 0E4h,al  (index = REG_EXIT)
+            0xB0, 0x2A, 0xE6, 0xE5, // mov al,42; out 0E5h,al  (exit code 42)
+            0xB0, 0x03, 0xE6, 0xE6, // mov al,3;  out 0E6h,al  (CMD_EXIT)
+            0xF4, // hlt (not reached)
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::TestExit { code: 42 });
+    }
+
+    #[test]
+    fn unittester_crc_command_matches_the_rust_helper() {
+        // Program a 2x2 rectangle and issue CMD_CRC; the run loop computes it and
+        // stores it at REG_CRC, where the guest (here, a bus read) can read it.
+        let rom = rom_with_code(&[
+            0xB0, 0x00, 0xE6, 0xE4, // index = REG_X (0)
+            0xB0, 0x00, 0xE6, 0xE5, // X lo
+            0xB0, 0x00, 0xE6, 0xE5, // X hi
+            0xB0, 0x00, 0xE6, 0xE5, // Y lo
+            0xB0, 0x00, 0xE6, 0xE5, // Y hi
+            0xB0, 0x02, 0xE6, 0xE5, // W lo = 2
+            0xB0, 0x00, 0xE6, 0xE5, // W hi
+            0xB0, 0x02, 0xE6, 0xE5, // H lo = 2
+            0xB0, 0x00, 0xE6, 0xE5, // H hi
+            0xB0, 0x01, 0xE6, 0xE6, // CMD_CRC
+            0xF4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        machine.run_until_halt_or_cycles(1_000_000).unwrap();
+
+        let reported = with_bus(&mut machine, |bus| {
+            bus.write_io(0xE4, BusWidth::Byte, 8).unwrap(); // index = REG_CRC
+            let mut crc = [0u8; 4];
+            for byte in &mut crc {
+                *byte = bus.read_io(0xE5, BusWidth::Byte).unwrap() as u8;
+            }
+            u32::from_le_bytes(crc)
+        });
+        assert_eq!(reported, machine.screen_crc32(0, 0, 2, 2));
+    }
+
+    #[test]
     fn int10_ah0f_reports_mode_after_set() {
         // Set mode 13h, then AH=0Fh returns AL=mode, AH=columns.
         let rom = rom_with_code(&[
@@ -5629,6 +5802,7 @@ mod tests {
             fast_post: machine.fast_post,
             pending_toka_service: &mut machine.pending_toka_service,
             toka_service_status: machine.toka_service_status,
+            unittester: &mut machine.unittester,
             wait_states: machine.profile.wait_states,
         };
         f(&mut bus)

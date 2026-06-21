@@ -242,7 +242,7 @@ fn run_headless_program(
         print!("{}", String::from_utf8_lossy(machine.dos_output()));
         println!("stop: {stop_reason:?}");
         match stop_reason {
-            StopReason::DosExit { code } => i32::from(code),
+            StopReason::DosExit { code } | StopReason::TestExit { code } => i32::from(code),
             _ => 1,
         }
     };
