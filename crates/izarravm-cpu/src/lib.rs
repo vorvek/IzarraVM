@@ -22,6 +22,9 @@ const FLAG_AC: u32 = 0x0004_0000; // bit 18
 const FLAG_ID: u32 = 0x0020_0000; // bit 21
 
 const CR0_PE: u32 = 0x0000_0001;
+const CR0_MP: u32 = 0x0000_0002;
+const CR0_EM: u32 = 0x0000_0004;
+const CR0_TS: u32 = 0x0000_0008;
 const CR0_PG: u32 = 0x8000_0000;
 // 486 control bits added to the 386's PE/PG. WP gates supervisor writes to read-only
 // pages in translate_linear, and AM enables the #AC alignment-check path. The rest are
@@ -167,7 +170,7 @@ impl SegmentIndex {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SegmentRegister {
     pub selector: u16,
     pub base: u32,
@@ -375,6 +378,10 @@ pub struct Cpu386 {
     pub control: ControlRegisters,
     pub gdtr: DescriptorTable,
     pub idtr: DescriptorTable,
+    /// Local descriptor table register and task register. The selector plus the
+    /// hidden base/limit cached from the system descriptor at load time.
+    pub ldtr: SegmentRegister,
+    pub tr: SegmentRegister,
     pub elapsed_clocks: u64,
     pub halted: bool,
     // STI sets this to block maskable interrupt delivery for one instruction:
@@ -1870,77 +1877,15 @@ impl Cpu386 {
             // ponytail: MMX is not gated to 586+; a throttled 386/486 GSW mode would
             // wrongly accept it. Gate it with the others if that fidelity gap matters.
             op if is_mmx_two_byte(op) => self.execute_mmx(bus, op, prefixes, address_size),
-            0x01 => {
-                let modrm = self.fetch_modrm(bus)?;
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                let memory = match operand {
-                    RmOperand::Memory(memory) => memory,
-                    RmOperand::Register(_) => {
-                        // INVLPG (/7) with a register operand is #UD; the other group members
-                        // (LGDT/LIDT here) report the unsupported register form as before.
-                        if modrm.reg == 7 {
-                            return Err(InternalFault::Exception {
-                                vector: 6,
-                                error_code: None,
-                            });
-                        }
-                        return Err(CpuError::UnsupportedGroupOpcode {
-                            opcode,
-                            extension: modrm.reg,
-                        }
-                        .into());
-                    }
-                };
-                // INVLPG m (0F 01 /7): privileged on the 486; invalidate the TLB entry for the
-                // page containing the operand. We model no TLB, so after the privilege check it
-                // is a no-op. The memory operand is decoded (and so its segment/address checks
-                // run) but no value is read from it.
-                if modrm.reg == 7 {
-                    if self.current_privilege_level() != 0 {
-                        return Err(InternalFault::Exception {
-                            vector: 6,
-                            error_code: None,
-                        });
-                    }
-                    let _ = memory;
-                    return Ok(clocks(12));
-                }
-                let limit = self.read_memory_sized(
-                    bus,
-                    memory.segment,
-                    memory.offset,
-                    OperandSize::Word,
-                    BusAccessKind::DataRead,
-                )? as u16;
-                let base_low = self.read_memory_sized(
-                    bus,
-                    memory.segment,
-                    memory.offset + 2,
-                    OperandSize::Dword,
-                    BusAccessKind::DataRead,
-                )?;
-                match modrm.reg {
-                    2 => {
-                        self.gdtr = DescriptorTable {
-                            base: base_low,
-                            limit,
-                        }
-                    }
-                    3 => {
-                        self.idtr = DescriptorTable {
-                            base: base_low,
-                            limit,
-                        }
-                    }
-                    _ => {
-                        return Err(CpuError::UnsupportedGroupOpcode {
-                            opcode,
-                            extension: modrm.reg,
-                        }
-                        .into());
-                    }
-                }
-                Ok(clocks(11))
+            0x00 => self.execute_descriptor_segment_group(bus, prefixes, address_size, opcode),
+            0x01 => self.execute_descriptor_table_group(bus, prefixes, address_size, opcode),
+            0x02 => self.execute_lar(bus, prefixes, address_size, operand_size),
+            0x03 => self.execute_lsl(bus, prefixes, address_size, operand_size),
+            0x06 => {
+                // CLTS: clear the task-switched flag. Privileged.
+                self.require_cpl0()?;
+                self.control.cr0 &= !CR0_TS;
+                Ok(clocks(2))
             }
             0x20 => {
                 let modrm = self.fetch_modrm(bus)?;
@@ -3488,20 +3433,7 @@ impl Cpu386 {
         if access & 0x80 == 0 {
             return Err(CpuError::GeneralProtection { selector }.into());
         }
-
-        let base = ((low >> 16) & 0xffff) | ((high & 0x0000_00ff) << 16) | (high & 0xff00_0000);
-        let mut limit = (low & 0xffff) | (high & 0x000f_0000);
-        if high & 0x0080_0000 != 0 {
-            limit = (limit << 12) | 0x0fff;
-        }
-
-        Ok(SegmentRegister {
-            selector,
-            base,
-            limit,
-            access,
-            default_size_32: high & 0x0040_0000 != 0,
-        })
+        Ok(self.descriptor_to_segment(selector, low, high))
     }
 
     fn segment_from_reg_field(&self, reg: u8) -> SegmentRegister {
@@ -5362,6 +5294,451 @@ impl Cpu386 {
             }
             RmOperand::Memory(mem) => self.write_qword(bus, mem, value),
         }
+    }
+}
+
+impl Cpu386 {
+    // ===================== Protected-mode system instructions =====================
+    // The 0F 00 / 0F 01 groups plus LAR/LSL/CLTS. LDTR/TR live in the CPU state; the
+    // segment-verify and access-rights instructions read descriptors from the GDT or
+    // the LDT and never fault on a bad selector (they clear ZF instead).
+
+    fn require_cpl0(&self) -> ExecResult<()> {
+        if self.current_privilege_level() != 0 {
+            return Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0),
+            });
+        }
+        Ok(())
+    }
+
+    /// Decode an 8-byte descriptor into a cached segment register. Shared by the
+    /// segment loader and the system-register loads.
+    fn descriptor_to_segment(&self, selector: u16, low: u32, high: u32) -> SegmentRegister {
+        let access = ((high >> 8) & 0xff) as u8;
+        let base = ((low >> 16) & 0xffff) | ((high & 0x0000_00ff) << 16) | (high & 0xff00_0000);
+        let mut limit = (low & 0xffff) | (high & 0x000f_0000);
+        if high & 0x0080_0000 != 0 {
+            limit = (limit << 12) | 0x0fff;
+        }
+        SegmentRegister {
+            selector,
+            base,
+            limit,
+            access,
+            default_size_32: high & 0x0040_0000 != 0,
+        }
+    }
+
+    /// Read a descriptor for VERR/VERW/LAR/LSL: from the GDT or the LDT, returning
+    /// None (rather than faulting) for a null or out-of-range selector.
+    fn try_read_descriptor<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        selector: u16,
+    ) -> ExecResult<Option<(u32, u32)>> {
+        let in_ldt = selector & 0x4 != 0;
+        let index = u32::from(selector & !0x7);
+        let (base, limit) = if in_ldt {
+            (self.ldtr.base, self.ldtr.limit)
+        } else {
+            if index == 0 {
+                return Ok(None);
+            }
+            (self.gdtr.base, u32::from(self.gdtr.limit))
+        };
+        if index + 7 > limit {
+            return Ok(None);
+        }
+        let addr = base + index;
+        let low = bus.read_memory(addr, BusWidth::Dword, BusAccessKind::DataRead)?;
+        let high = bus.read_memory(addr + 4, BusWidth::Dword, BusAccessKind::DataRead)?;
+        Ok(Some((low, high)))
+    }
+
+    /// Read a GDT descriptor for LLDT/LTR, which #GP on a null or out-of-range selector.
+    fn read_gdt_descriptor<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        selector: u16,
+    ) -> ExecResult<(u32, u32)> {
+        let index = u32::from(selector & !0x7);
+        if index == 0 || index + 7 > u32::from(self.gdtr.limit) {
+            return Err(CpuError::GeneralProtection { selector }.into());
+        }
+        let addr = self.gdtr.base + index;
+        let low = bus.read_memory(addr, BusWidth::Dword, BusAccessKind::DataRead)?;
+        let high = bus.read_memory(addr + 4, BusWidth::Dword, BusAccessKind::DataRead)?;
+        Ok((low, high))
+    }
+
+    fn execute_descriptor_table_group<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        prefixes: Prefixes,
+        address_size: AddressSize,
+        opcode: u8,
+    ) -> ExecResult<CycleOutcome> {
+        let modrm = self.fetch_modrm(bus)?;
+        match modrm.reg {
+            4 => {
+                // SMSW r/m16: store the machine status word (low 16 bits of CR0).
+                let msw = self.control.cr0 as u16;
+                self.write_rm_sized(
+                    bus,
+                    prefixes,
+                    address_size,
+                    OperandSize::Word,
+                    modrm,
+                    u32::from(msw),
+                )?;
+                Ok(clocks(2))
+            }
+            6 => {
+                // LMSW r/m16: load MP/EM/TS; PE can be set but not cleared. Privileged.
+                self.require_cpl0()?;
+                let msw =
+                    self.read_rm_sized(bus, prefixes, address_size, OperandSize::Word, modrm)?;
+                let switchable = CR0_MP | CR0_EM | CR0_TS;
+                let mut cr0 = (self.control.cr0 & !switchable) | (msw & switchable);
+                if msw & CR0_PE != 0 {
+                    cr0 |= CR0_PE;
+                }
+                self.control.cr0 = cr0;
+                Ok(clocks(3))
+            }
+            reg => {
+                let memory = match self.decode_rm_operand(bus, prefixes, address_size, modrm)? {
+                    RmOperand::Memory(memory) => memory,
+                    RmOperand::Register(_) => {
+                        // SGDT/SIDT/LGDT/LIDT/INVLPG all require a memory operand.
+                        return Err(InternalFault::Exception {
+                            vector: 6,
+                            error_code: None,
+                        });
+                    }
+                };
+                match reg {
+                    0 => {
+                        // SGDT m: store the GDTR pseudo-descriptor.
+                        self.store_descriptor_table(bus, memory, self.gdtr)?;
+                        Ok(clocks(11))
+                    }
+                    1 => {
+                        // SIDT m: store the IDTR pseudo-descriptor.
+                        self.store_descriptor_table(bus, memory, self.idtr)?;
+                        Ok(clocks(11))
+                    }
+                    2 | 3 => {
+                        let limit = self.read_memory_sized(
+                            bus,
+                            memory.segment,
+                            memory.offset,
+                            OperandSize::Word,
+                            BusAccessKind::DataRead,
+                        )? as u16;
+                        let base = self.read_memory_sized(
+                            bus,
+                            memory.segment,
+                            memory.offset + 2,
+                            OperandSize::Dword,
+                            BusAccessKind::DataRead,
+                        )?;
+                        let table = DescriptorTable { base, limit };
+                        if reg == 2 {
+                            self.gdtr = table;
+                        } else {
+                            self.idtr = table;
+                        }
+                        Ok(clocks(11))
+                    }
+                    7 => {
+                        // INVLPG m: privileged on the 486. We model no TLB, so it is a no-op
+                        // after the privilege check.
+                        if self.current_privilege_level() != 0 {
+                            return Err(InternalFault::Exception {
+                                vector: 6,
+                                error_code: None,
+                            });
+                        }
+                        Ok(clocks(12))
+                    }
+                    _ => Err(CpuError::UnsupportedGroupOpcode {
+                        opcode,
+                        extension: reg,
+                    }
+                    .into()),
+                }
+            }
+        }
+    }
+
+    fn store_descriptor_table<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        memory: MemoryOperand,
+        table: DescriptorTable,
+    ) -> ExecResult<()> {
+        // ponytail: the 16-bit-operand quirk (base masked to 24 bits) is not modeled;
+        // the full 32-bit base is always stored.
+        self.write_memory_sized(
+            bus,
+            memory.segment,
+            memory.offset,
+            OperandSize::Word,
+            u32::from(table.limit),
+            BusAccessKind::DataWrite,
+        )?;
+        self.write_memory_sized(
+            bus,
+            memory.segment,
+            memory.offset + 2,
+            OperandSize::Dword,
+            table.base,
+            BusAccessKind::DataWrite,
+        )
+    }
+
+    fn execute_descriptor_segment_group<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        prefixes: Prefixes,
+        address_size: AddressSize,
+        opcode: u8,
+    ) -> ExecResult<CycleOutcome> {
+        // The whole 0F 00 group is invalid outside protected mode.
+        if !self.is_protected_mode() {
+            return Err(InternalFault::Exception {
+                vector: 6,
+                error_code: None,
+            });
+        }
+        let modrm = self.fetch_modrm(bus)?;
+        match modrm.reg {
+            0 => {
+                // SLDT r/m16: store the LDTR selector.
+                let selector = u32::from(self.ldtr.selector);
+                self.write_rm_sized(
+                    bus,
+                    prefixes,
+                    address_size,
+                    OperandSize::Word,
+                    modrm,
+                    selector,
+                )?;
+                Ok(clocks(2))
+            }
+            1 => {
+                // STR r/m16: store the task-register selector.
+                let selector = u32::from(self.tr.selector);
+                self.write_rm_sized(
+                    bus,
+                    prefixes,
+                    address_size,
+                    OperandSize::Word,
+                    modrm,
+                    selector,
+                )?;
+                Ok(clocks(2))
+            }
+            2 => {
+                // LLDT r/m16: load the local descriptor table register. Privileged.
+                self.require_cpl0()?;
+                let selector =
+                    self.read_rm_sized(bus, prefixes, address_size, OperandSize::Word, modrm)?
+                        as u16;
+                self.load_ldtr(bus, selector)?;
+                Ok(clocks(11))
+            }
+            3 => {
+                // LTR r/m16: load the task register. Privileged.
+                self.require_cpl0()?;
+                let selector =
+                    self.read_rm_sized(bus, prefixes, address_size, OperandSize::Word, modrm)?
+                        as u16;
+                self.load_tr(bus, selector)?;
+                Ok(clocks(11))
+            }
+            4 | 5 => {
+                // VERR (/4) / VERW (/5): set ZF if the segment is readable / writable.
+                let selector =
+                    self.read_rm_sized(bus, prefixes, address_size, OperandSize::Word, modrm)?
+                        as u16;
+                let ok = self.verify_segment(bus, selector, modrm.reg == 5)?;
+                self.set_flag(FLAG_ZF, ok);
+                Ok(clocks(10))
+            }
+            reg => Err(CpuError::UnsupportedGroupOpcode {
+                opcode,
+                extension: reg,
+            }
+            .into()),
+        }
+    }
+
+    fn load_ldtr<B: CpuBus>(&mut self, bus: &mut B, selector: u16) -> ExecResult<()> {
+        if selector & 0x4 != 0 {
+            // The LDT descriptor must live in the GDT (TI = 0).
+            return Err(CpuError::GeneralProtection { selector }.into());
+        }
+        if selector & !0x7 == 0 {
+            // A null selector marks the LDTR invalid.
+            self.ldtr = SegmentRegister {
+                selector,
+                ..Default::default()
+            };
+            return Ok(());
+        }
+        let (low, high) = self.read_gdt_descriptor(bus, selector)?;
+        let access = (high >> 8) & 0xff;
+        // Present LDT system descriptor (S = 0, type = 2).
+        if access & 0x80 == 0 || access & 0x1f != 0x02 {
+            return Err(CpuError::GeneralProtection { selector }.into());
+        }
+        self.ldtr = self.descriptor_to_segment(selector, low, high);
+        Ok(())
+    }
+
+    fn load_tr<B: CpuBus>(&mut self, bus: &mut B, selector: u16) -> ExecResult<()> {
+        if selector & 0x4 != 0 || selector & !0x7 == 0 {
+            return Err(CpuError::GeneralProtection { selector }.into());
+        }
+        let (low, high) = self.read_gdt_descriptor(bus, selector)?;
+        let access = (high >> 8) & 0xff;
+        let descriptor_type = access & 0x1f;
+        // Present available TSS: type 1 (286) or 9 (386).
+        if access & 0x80 == 0 || (descriptor_type != 0x01 && descriptor_type != 0x09) {
+            return Err(CpuError::GeneralProtection { selector }.into());
+        }
+        let mut segment = self.descriptor_to_segment(selector, low, high);
+        // Mark the TSS busy, both in the cache and back in the GDT descriptor.
+        segment.access |= 0x02;
+        let index = u32::from(selector & !0x7);
+        let access_byte = (access | 0x02) as u8;
+        bus.write_memory(
+            self.gdtr.base + index + 5,
+            BusWidth::Byte,
+            u32::from(access_byte),
+            BusAccessKind::DataWrite,
+        )?;
+        self.tr = segment;
+        Ok(())
+    }
+
+    fn verify_segment<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        selector: u16,
+        write: bool,
+    ) -> ExecResult<bool> {
+        let Some((_, high)) = self.try_read_descriptor(bus, selector)? else {
+            return Ok(false);
+        };
+        let access = (high >> 8) & 0xff;
+        let present = access & 0x80 != 0;
+        let is_segment = access & 0x10 != 0; // S bit
+        if !present || !is_segment {
+            return Ok(false);
+        }
+        let descriptor_type = access & 0x0f;
+        let is_code = descriptor_type & 0x8 != 0;
+        let dpl = ((access >> 5) & 3) as u8;
+        let rpl = (selector & 3) as u8;
+        let privilege_ok = dpl >= self.current_privilege_level().max(rpl);
+        let ok = if write {
+            // VERW: writable data segment.
+            !is_code && descriptor_type & 0x2 != 0 && privilege_ok
+        } else {
+            // VERR: readable. Data is always readable; code needs the readable bit.
+            // Conforming code skips the privilege check.
+            let readable = if is_code {
+                descriptor_type & 0x2 != 0
+            } else {
+                true
+            };
+            let conforming = is_code && descriptor_type & 0x4 != 0;
+            readable && (conforming || privilege_ok)
+        };
+        Ok(ok)
+    }
+
+    fn descriptor_accessible(&self, selector: u16, high: u32) -> bool {
+        let access = (high >> 8) & 0xff;
+        if access & 0x80 == 0 {
+            return false; // not present
+        }
+        let dpl = ((access >> 5) & 3) as u8;
+        let rpl = (selector & 3) as u8;
+        let is_segment = access & 0x10 != 0;
+        let descriptor_type = access & 0x0f;
+        let conforming_code =
+            is_segment && descriptor_type & 0x8 != 0 && descriptor_type & 0x4 != 0;
+        // Conforming code is reachable from any privilege; everything else needs
+        // DPL >= max(CPL, RPL).
+        conforming_code || dpl >= self.current_privilege_level().max(rpl)
+    }
+
+    fn execute_lar<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        prefixes: Prefixes,
+        address_size: AddressSize,
+        operand_size: OperandSize,
+    ) -> ExecResult<CycleOutcome> {
+        if !self.is_protected_mode() {
+            return Err(InternalFault::Exception {
+                vector: 6,
+                error_code: None,
+            });
+        }
+        let modrm = self.fetch_modrm(bus)?;
+        let selector =
+            self.read_rm_sized(bus, prefixes, address_size, OperandSize::Word, modrm)? as u16;
+        match self.try_read_descriptor(bus, selector)? {
+            Some((_, high)) if self.descriptor_accessible(selector, high) => {
+                // The access-rights bytes: the access byte plus, for a dword operand, the
+                // G/D/B/AVL attribute nibble.
+                let mask = match operand_size {
+                    OperandSize::Word => 0x0000_ff00,
+                    OperandSize::Dword => 0x00f0_ff00,
+                };
+                self.write_gpr_sized(modrm.reg, operand_size, high & mask);
+                self.set_flag(FLAG_ZF, true);
+            }
+            _ => self.set_flag(FLAG_ZF, false),
+        }
+        Ok(clocks(11))
+    }
+
+    fn execute_lsl<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        prefixes: Prefixes,
+        address_size: AddressSize,
+        operand_size: OperandSize,
+    ) -> ExecResult<CycleOutcome> {
+        if !self.is_protected_mode() {
+            return Err(InternalFault::Exception {
+                vector: 6,
+                error_code: None,
+            });
+        }
+        let modrm = self.fetch_modrm(bus)?;
+        let selector =
+            self.read_rm_sized(bus, prefixes, address_size, OperandSize::Word, modrm)? as u16;
+        match self.try_read_descriptor(bus, selector)? {
+            Some((low, high)) if self.descriptor_accessible(selector, high) => {
+                let mut limit = (low & 0xffff) | (high & 0x000f_0000);
+                if high & 0x0080_0000 != 0 {
+                    limit = (limit << 12) | 0x0fff;
+                }
+                self.write_gpr_sized(modrm.reg, operand_size, limit);
+                self.set_flag(FLAG_ZF, true);
+            }
+            _ => self.set_flag(FLAG_ZF, false),
+        }
+        Ok(clocks(11))
     }
 }
 
@@ -11013,5 +11390,143 @@ mod tests {
         cpu.cycle(&mut bus).unwrap();
         // low dword loaded; word lanes 0x0002 and 0x0001 each shift left by 4.
         assert_eq!(cpu.fpu.mm(0) & 0xffff_ffff, 0x0010_0020);
+    }
+
+    // ---- Phase 4 slice A: protected-mode system instructions ----
+
+    /// Protected-mode CPU with a GDT (base 0x100, limit 0x1f) holding one descriptor
+    /// at selector 0x08. CS selector 0 => CPL 0.
+    fn protected_cpu(code: &[u8], descriptor_low: u32, descriptor_high: u32) -> (Cpu386, Vec<u8>) {
+        let mut memory = vec![0u8; 0x200];
+        memory[..code.len()].copy_from_slice(code);
+        memory[0x108..0x10c].copy_from_slice(&descriptor_low.to_le_bytes());
+        memory[0x10c..0x110].copy_from_slice(&descriptor_high.to_le_bytes());
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.gdtr = DescriptorTable {
+            base: 0x100,
+            limit: 0x1f,
+        };
+        cpu.control.cr0 |= CR0_PE;
+        (cpu, memory)
+    }
+
+    #[test]
+    fn smsw_stores_machine_status_word() {
+        // SMSW eax (0F 01 E0).
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x01, 0xe0], 0x20);
+        cpu.control.cr0 = CR0_TS | CR0_MP; // 0x0A
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.eax() & 0xffff, 0x000a);
+    }
+
+    #[test]
+    fn lmsw_sets_protection_enable() {
+        // LMSW ax (0F 01 F0) with AX bit 0 set turns on CR0.PE.
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x01, 0xf0], 0x20);
+        cpu.write_reg16(Reg16::Ax, 0x0001);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_ne!(cpu.control.cr0 & CR0_PE, 0);
+    }
+
+    #[test]
+    fn clts_clears_task_switched() {
+        // CLTS (0F 06).
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x06], 0x20);
+        cpu.control.cr0 |= CR0_TS;
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.control.cr0 & CR0_TS, 0);
+    }
+
+    #[test]
+    fn sgdt_stores_the_gdtr() {
+        // SGDT [0x100] (0F 01 06 00 01): limit word then base dword.
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x01, 0x06, 0x00, 0x01], 0x200);
+        cpu.gdtr = DescriptorTable {
+            base: 0x1234_5678,
+            limit: 0x0abc,
+        };
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(
+            u16::from_le_bytes([bus.memory[0x100], bus.memory[0x101]]),
+            0x0abc
+        );
+        assert_eq!(
+            u32::from_le_bytes(bus.memory[0x102..0x106].try_into().unwrap()),
+            0x1234_5678
+        );
+    }
+
+    #[test]
+    fn sldt_stores_the_ldtr_selector() {
+        // SLDT ax (0F 00 C0), protected mode only.
+        let (mut cpu, memory) = protected_cpu(&[0x0f, 0x00, 0xc0], 0, 0);
+        cpu.ldtr.selector = 0x0028;
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x0028);
+    }
+
+    #[test]
+    fn sldt_is_invalid_in_real_mode() {
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x00, 0xc0], 0x20);
+        let mut bus = TestBus::with_memory(memory);
+        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
+    }
+
+    #[test]
+    fn lldt_loads_the_descriptor() {
+        // LDT descriptor at selector 0x08: base 0x0004_0000, limit 0x0fff, access 0x82.
+        let low = 0x0000_0fff; // limit low, base low 16 = 0
+        let high = 0x0000_8204; // base[23:16]=0x04, access=0x82
+        let (mut cpu, memory) = protected_cpu(&[0x0f, 0x00, 0xd0], low, high);
+        cpu.write_reg16(Reg16::Ax, 0x0008);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.ldtr.selector, 0x0008);
+        assert_eq!(cpu.ldtr.base, 0x0004_0000);
+        assert_eq!(cpu.ldtr.limit, 0x0fff);
+    }
+
+    #[test]
+    fn verr_sets_zf_for_a_readable_segment() {
+        // Readable data segment: access 0x92 (P, S, data, writable -> readable).
+        let (mut cpu, memory) = protected_cpu(&[0x0f, 0x00, 0xe0], 0x0000_ffff, 0x0000_9200);
+        cpu.write_reg16(Reg16::Ax, 0x0008);
+        cpu.set_flag(FLAG_ZF, false);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert!(
+            cpu.flag(FLAG_ZF),
+            "VERR should set ZF for a readable segment"
+        );
+    }
+
+    #[test]
+    fn lar_and_lsl_read_descriptor_fields() {
+        // Data segment access 0x92, byte-granular limit 0xffff.
+        // LAR ax, cx (0F 02 C1); CX holds the selector.
+        let (mut cpu, memory) = protected_cpu(&[0x0f, 0x02, 0xc1], 0x0000_ffff, 0x0000_9200);
+        cpu.write_reg16(Reg16::Cx, 0x0008);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert!(cpu.flag(FLAG_ZF));
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x9200);
+
+        // LSL ax, cx (0F 03 C1) -> the byte-granular limit.
+        let (mut cpu, memory) = protected_cpu(&[0x0f, 0x03, 0xc1], 0x0000_ffff, 0x0000_9200);
+        cpu.write_reg16(Reg16::Cx, 0x0008);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert!(cpu.flag(FLAG_ZF));
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0xffff);
     }
 }
