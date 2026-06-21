@@ -8425,4 +8425,41 @@ mod tests {
         );
         assert_eq!(reloaded.cmos_byte(0x10), 1);
     }
+
+    #[test]
+    fn boot_menu_removes_the_old_speed_marker() {
+        fn marker_pixels(machine: &Machine, y: u32) -> Vec<u8> {
+            (y * 2..(y + 8) * 2)
+                .step_by(2)
+                .flat_map(|row| machine.video().render_256color_row(row)[296..304].to_vec())
+                .collect()
+        }
+
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
+
+        machine.inject_key_scancodes(&[0x0f, 0x8f]); // Tab opens the boot menu.
+        machine.run_until_halt_or_cycles(5_000_000).unwrap();
+        assert!(
+            marker_pixels(&machine, 80).contains(&1),
+            "the initial 386 row has a black diamond"
+        );
+
+        for key in [[0x4d, 0xcd], [0x48, 0xc8]] {
+            machine.inject_key_scancodes(&key); // Right, Up focuses 586.
+            machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        }
+        machine.inject_key_scancodes(&[0x1c, 0x9c]); // Enter selects 586.
+        machine.run_until_halt_or_cycles(5_000_000).unwrap();
+
+        let old_marker = marker_pixels(&machine, 80);
+        assert!(
+            old_marker.iter().all(|&pixel| pixel == 0),
+            "the old 386 diamond is erased: {old_marker:?}"
+        );
+        assert!(
+            marker_pixels(&machine, 48).contains(&0),
+            "the focused 586 row has a white diamond"
+        );
+    }
 }

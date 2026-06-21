@@ -512,14 +512,16 @@ bx2_draw_dev_row:
     add ax, BX_ROW_TXT_DY
     call gfx_text
 
-    ; Marker diamond if this is the marked device.
+    ; Draw a diamond for the marked device or a blank cell to erase an old mark.
     xor cx, cx
     mov ds, cx
+    mov byte [BMX_DGLYPH], ' '
+    mov byte [BMX_DGLYPH + 1], 0
     mov al, [BMX_MARK_DEV]
     cmp al, [BMX_DI]
-    jne .done
+    jne .marker_ready
     mov byte [BMX_DGLYPH], BX_GLYPH_DIAMOND
-    mov byte [BMX_DGLYPH + 1], 0
+.marker_ready:
     mov si, BMX_DGLYPH              ; DS:SI -> 1-char ASCIIZ (DS = 0)
     mov di, BX_LP_MARK_X
     mov ax, [BMX_DROWY]
@@ -610,14 +612,16 @@ bx2_draw_spd_row:
     add ax, BX_ROW_TXT_DY
     call gfx_text
 
-    ; Marker diamond if this is the marked speed.
+    ; Draw a diamond for the marked speed or a blank cell to erase an old mark.
     xor cx, cx
     mov ds, cx
+    mov byte [BMX_DGLYPH], ' '
+    mov byte [BMX_DGLYPH + 1], 0
     mov al, [BMX_MARK_SPD]
     cmp al, [BMX_DI]
-    jne .done
+    jne .marker_ready
     mov byte [BMX_DGLYPH], BX_GLYPH_DIAMOND
-    mov byte [BMX_DGLYPH + 1], 0
+.marker_ready:
     mov si, BMX_DGLYPH
     mov di, BX_RP_MARK_X
     mov ax, [BMX_DROWY]
