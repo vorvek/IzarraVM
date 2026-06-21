@@ -396,6 +396,41 @@ mod tests {
     }
 
     #[test]
+    fn izarra_bios_int16_dispatch_has_enhanced_aliases() {
+        // The INT 16h dispatch aliases the enhanced functions onto the base ones
+        // (AH=10h->00h, 11h->01h, 12h->02h) and adds the AH=05h buffer write. Each
+        // is a `cmp ah, imm8` (opcode 80 FC) followed by `je rel8` (74). Assert the
+        // dispatch chain appears in order: base read/peek/flags, each enhanced alias
+        // right after its base case, then AH=05h. Runtime coverage of this handler is
+        // infeasible without booting the full ROM into a guest stub (the DOS-program
+        // test harness installs a different keyboard ROM, kbd-bios-core.inc), so this
+        // asserts the assembled dispatch bytes instead.
+        let dispatch: &[u8] = &[
+            0x80, 0xfc, 0x00, // cmp ah, 0x00 (read)
+            0x74, 0x1f, //       je .read
+            0x80, 0xfc, 0x10, // cmp ah, 0x10 (enhanced read -> .read)
+            0x74, 0x1a, //       je .read
+            0x80, 0xfc, 0x01, // cmp ah, 0x01 (peek)
+            0x74, 0x44, //       je .peek
+            0x80, 0xfc, 0x11, // cmp ah, 0x11 (enhanced peek -> .peek)
+            0x74, 0x3f, //       je .peek
+            0x80, 0xfc, 0x02, // cmp ah, 0x02 (flags)
+            0x74, 0x52, //       je .flags
+            0x80, 0xfc, 0x12, // cmp ah, 0x12 (enhanced shift status -> .flags)
+            0x74, 0x4d, //       je .flags
+            0x80, 0xfc, 0x05, // cmp ah, 0x05 (buffer write)
+            0x74, 0x55, //       je .bufwrite
+            0xcf, //             iret (unhandled fall-through)
+        ];
+        assert!(
+            IZARRA_BIOS
+                .windows(dispatch.len())
+                .any(|window| window == dispatch),
+            "INT 16h enhanced-function dispatch not found in the Izarra BIOS ROM"
+        );
+    }
+
+    #[test]
     fn kbd_resident_header_offsets_are_in_bounds() {
         let image = super::KBD_RESIDENT_BIOS;
         let int09 = u16::from_le_bytes([image[0], image[1]]) as usize;
