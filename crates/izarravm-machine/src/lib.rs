@@ -1115,12 +1115,10 @@ impl Machine {
         if offset >= 320 * 200 {
             return;
         }
-        let value = if al & 0x80 != 0 {
-            self.video.cpu_read_chain4(offset) ^ (al & 0x7f)
-        } else {
-            al
-        };
-        self.video.cpu_write_chain4(offset, value);
+        // Mode 13h is a 256-color mode: AL is the full 8-bit pixel value, bit 7
+        // included. The bit-7 XOR-onto-screen convention applies only to the
+        // 16-color planar modes, which this handler does not service.
+        self.video.cpu_write_chain4(offset, al);
     }
 
     /// INT 10h AH=0Dh READ GRAPHICS PIXEL. CX = column, DX = row; returns AL = the
@@ -1208,16 +1206,17 @@ impl Machine {
     /// INT 10h AH=1Ch SAVE/RESTORE VIDEO STATE. AL=00 returns the buffer size in
     /// 64-byte blocks (BX), AL=01 saves the modeled state into ES:BX, AL=02 restores
     /// it. CX is the requested-state bitmap (bit 0 hardware, bit 1 BDA, bit 2 DAC).
-    /// ponytail: only the BDA video bytes 0x449-0x466 are snapshotted (one 64-byte
-    /// block); the hardware-register and DAC-palette state (CX bits 0 and 2) are not
-    /// captured, so a save/restore round-trips the BDA mode/cursor block, not the
-    /// full VGA hardware. AL is set to 0x1C so callers detect the service.
+    /// Saves and restores the full BDA video state (0040:0049-0040:00A8, 96 bytes,
+    /// two 64-byte blocks) per RBIL. ponytail: the hardware-register and DAC-palette
+    /// state (CX bits 0 and 2) are not captured, so a save/restore round-trips the
+    /// BDA block, not the full VGA hardware. AL is set to 0x1C so callers detect the
+    /// service.
     fn int10_save_restore_state(&mut self, al: u8) {
         const BDA_VIDEO_START: u32 = 0x449;
-        const BDA_VIDEO_LEN: usize = 0x466 - 0x449 + 1; // 30 bytes, one 64-byte block
+        const BDA_VIDEO_LEN: usize = 0x4a8 - 0x449 + 1; // 96 bytes, two 64-byte blocks
         match al {
             0x00 => {
-                self.set_bx(1); // one 64-byte block holds the modeled BDA state
+                self.set_bx(2); // two 64-byte blocks hold the 96-byte BDA video state
                 self.set_eax_al(0x1c);
                 self.set_int_frame_carry(false);
             }
@@ -1632,7 +1631,8 @@ impl Machine {
     fn e820_regions(&self) -> Vec<(u64, u64, u32)> {
         let total = u64::from(self.profile.memory_mib) * 0x10_0000;
         let mut regions = vec![
-            (0x0u64, 0xA_0000u64, 1u32), // 640 KB conventional, available
+            (0x0u64, 0x9_FC00u64, 1u32), // 639 KB conventional, available (below the EBDA)
+            (0x9_FC00, 0x400, 2),        // 1 KB extended BIOS data area, reserved
             (0xA_0000, 0x6_0000, 2),     // video + ROM BIOS hole, reserved
         ];
         if total > 0x10_0000 {
@@ -4323,11 +4323,11 @@ fn seed_bios_config_table(memory: &mut Memory) -> Result<(), BusError> {
     // Feature byte 1 (RBIL INTERRUP.B, AH=C0h):
     //   bit6 second 8259 PIC present (the AT has IRQ8-15) -> set
     //   bit5 RTC present (INT 1Ah / CMOS clock)           -> set
-    //   bit4 INT 15h/AH=4Fh keyboard-intercept issued     -> set
+    //   bit4 INT 15h/AH=4Fh keyboard-intercept issued     -> clear (no AH=4Fh callout)
     //   bit3 wait-for-external-event (AH=41h) supported    -> clear (not implemented)
     //   bit2 extended BIOS data area allocated             -> set (AH=C1h present)
     //   bit1 Micro Channel bus                             -> clear (ISA)
-    const FEATURE_1: u8 = 0x40 | 0x20 | 0x10 | 0x04; // 0x74
+    const FEATURE_1: u8 = 0x40 | 0x20 | 0x04; // 0x64
     let base = BIOS_CONFIG_TABLE_ADDR as usize;
     let table: [u8; 10] = [
         0x08, 0x00, // WORD length: 8 bytes follow
@@ -4631,10 +4631,11 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(regions.len(), 3);
-        assert_eq!(regions[0], (0x0, 0xA_0000, 1)); // 640 KB conventional
-        assert_eq!(regions[1], (0xA_0000, 0x6_0000, 2)); // reserved hole
-        assert_eq!(regions[2], (0x10_0000, 23 * 0x10_0000, 1)); // extended RAM
+        assert_eq!(regions.len(), 4);
+        assert_eq!(regions[0], (0x0, 0x9_FC00, 1)); // 639 KB conventional (below EBDA)
+        assert_eq!(regions[1], (0x9_FC00, 0x400, 2)); // 1 KB EBDA, reserved
+        assert_eq!(regions[2], (0xA_0000, 0x6_0000, 2)); // reserved hole
+        assert_eq!(regions[3], (0x10_0000, 23 * 0x10_0000, 1)); // extended RAM
     }
 
     #[test]
@@ -5568,8 +5569,9 @@ mod tests {
             0x43,
             "pixel reads back its colour"
         );
-        // AL bit 7 set XORs the low 7 bits into the existing pixel: 0x43 ^ 0x0F = 0x4C.
-        m.cpu.registers.set_eax(0x0C8F); // bit7 set, low bits 0x0F
+        // Mode 13h is a 256-color mode: AL is the full 8-bit colour, bit 7 included,
+        // with no XOR. Writing 0x8F stores colour 0x8F (143), not an XOR.
+        m.cpu.registers.set_eax(0x0C8F); // colour 0x8F, bit7 part of the value
         m.cpu.registers.set_ecx(5);
         m.cpu.registers.set_edx(2);
         m.handle_int10();
@@ -5579,8 +5581,8 @@ mod tests {
         m.handle_int10();
         assert_eq!(
             m.cpu.registers.eax() as u8,
-            0x4C,
-            "XOR pixel toggles the low bits"
+            0x8F,
+            "high colours write directly, no bit-7 XOR in 256-colour mode"
         );
     }
 
@@ -5640,10 +5642,10 @@ mod tests {
     #[test]
     fn int10_save_restore_state_round_trips_the_bda_block() {
         let mut m = int15_machine(16);
-        // AL=00 reports the buffer size in 64-byte blocks.
+        // AL=00 reports the buffer size in 64-byte blocks (96 bytes -> 2 blocks).
         m.cpu.registers.set_eax(0x1C00);
         m.handle_int10();
-        assert_eq!(m.cpu.registers.ebx() as u16, 1, "one 64-byte block");
+        assert_eq!(m.cpu.registers.ebx() as u16, 2, "two 64-byte blocks");
         assert_eq!(m.cpu.registers.eax() as u8, 0x1C);
         // Mark the BDA mode byte, save into ES:BX, change it, then restore.
         let _ = m.memory.write_u8(0x449, 0x12);
@@ -5683,6 +5685,11 @@ mod tests {
         assert_eq!(feature1 & 0x40, 0x40, "second PIC present");
         assert_eq!(feature1 & 0x20, 0x20, "RTC present");
         assert_eq!(feature1 & 0x04, 0x04, "EBDA allocated");
+        assert_eq!(
+            feature1 & 0x10,
+            0x00,
+            "no AH=4Fh keyboard-intercept callout"
+        );
         assert_eq!(feature1 & 0x08, 0x00, "wait-for-event not supported");
         assert_eq!(feature1 & 0x02, 0x00, "ISA bus, not Micro Channel");
     }
