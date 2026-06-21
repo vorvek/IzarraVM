@@ -1211,6 +1211,118 @@ impl Machine {
         self.cpu.registers.set_eax(eax);
     }
 
+    /// Service INT 14h (SERIAL) over the COM1 UART. DX selects the port; only COM1
+    /// (DX=0) is wired. AH=00h initializes from the AL parameter byte, AH=01h sends
+    /// AL, AH=02h receives into AL, AH=03h reads status. AH returns the line-status
+    /// byte and AL the modem-status byte, the way the BIOS reports the 16450
+    /// registers.
+    fn handle_int14(&mut self) {
+        const COM1: u16 = 0x03f8;
+        let ax = self.cpu.registers.eax() as u16;
+        let ah = (ax >> 8) as u8;
+        let al = ax as u8;
+        if self.cpu.registers.edx() as u16 != 0 {
+            self.set_eax_ah(0x80); // bit7 timeout: no such serial port
+            return;
+        }
+        match ah {
+            0x00 => {
+                self.uart_init(al);
+                let lsr = self.serial.read_port(COM1 + 5).unwrap_or(0);
+                let msr = self.serial.read_port(COM1 + 6).unwrap_or(0);
+                self.set_eax_ah(lsr);
+                self.set_eax_al(msr);
+            }
+            0x01 => {
+                // THRE is always set (instant transmit), so the send never times out.
+                self.serial.write_port(COM1, al);
+                let lsr = self.serial.read_port(COM1 + 5).unwrap_or(0);
+                self.set_eax_ah(lsr & 0x7f); // bit7 clear = sent
+            }
+            0x02 => {
+                let lsr = self.serial.read_port(COM1 + 5).unwrap_or(0);
+                if lsr & 0x01 != 0 {
+                    let byte = self.serial.read_port(COM1).unwrap_or(0);
+                    self.set_eax_al(byte);
+                    self.set_eax_ah(lsr & 0x1e); // line status, data-ready/timeout clear
+                } else {
+                    // No byte available, and no serial input source is wired, so the
+                    // honest result is a receive timeout.
+                    self.set_eax_ah(0x80);
+                }
+            }
+            0x03 => {
+                let lsr = self.serial.read_port(COM1 + 5).unwrap_or(0);
+                let msr = self.serial.read_port(COM1 + 6).unwrap_or(0);
+                self.set_eax_ah(lsr);
+                self.set_eax_al(msr);
+            }
+            _ => self.set_eax_ah(0x80),
+        }
+    }
+
+    /// Program the COM1 UART from an INT 14h AH=00h parameter byte: bits 7-5 baud
+    /// rate, 4-3 parity, 2 stop bits, 1-0 word length. The divisor is stored for
+    /// fidelity but does not gate transmit timing.
+    fn uart_init(&mut self, params: u8) {
+        const COM1: u16 = 0x03f8;
+        let divisor: u16 = match params >> 5 {
+            0 => 1047, // 110 baud at 1.8432 MHz
+            1 => 768,  // 150
+            2 => 384,  // 300
+            3 => 192,  // 600
+            4 => 96,   // 1200
+            5 => 48,   // 2400
+            6 => 24,   // 4800
+            _ => 12,   // 9600
+        };
+        // Word length (bits 1-0) and stop bits (bit 2) sit in the same positions in
+        // the LCR; add the parity bits from AL bits 4-3 (01 odd, 11 even).
+        let mut lcr = params & 0x07;
+        match (params >> 3) & 0x03 {
+            0b01 => lcr |= 0x08,        // parity enable, odd
+            0b11 => lcr |= 0x08 | 0x10, // parity enable, even
+            _ => {}                     // no parity
+        }
+        self.serial.write_port(COM1 + 3, 0x80); // LCR DLAB=1
+        self.serial.write_port(COM1, (divisor & 0xff) as u8); // DLL
+        self.serial.write_port(COM1 + 1, (divisor >> 8) as u8); // DLM
+        self.serial.write_port(COM1 + 3, lcr); // LCR, clears DLAB
+    }
+
+    /// Service INT 17h (PRINTER) over LPT1. DX selects the port; only LPT1 (DX=0)
+    /// is wired. AH=00h prints AL, AH=01h initializes, AH=02h reads status. AH
+    /// returns the BIOS printer-status byte.
+    fn handle_int17(&mut self) {
+        const LPT1: u16 = 0x0378;
+        let ax = self.cpu.registers.eax() as u16;
+        let ah = (ax >> 8) as u8;
+        let al = ax as u8;
+        if self.cpu.registers.edx() as u16 != 0 {
+            self.set_eax_ah(0x01); // bit0 timeout: no such printer
+            return;
+        }
+        if ah == 0x00 {
+            // Latch the byte and pulse -Strobe so the LPT captures it.
+            self.lpt.write_port(LPT1, al);
+            let base = self.lpt.read_port(LPT1 + 2).unwrap_or(0) & 0x1e; // keep bits 1-4
+            self.lpt.write_port(LPT1 + 2, base | 0x01); // assert -Strobe (edge captures)
+            self.lpt.write_port(LPT1 + 2, base); // de-assert
+        }
+        // AH=01h initialize and AH=02h status are status-only on this always-ready
+        // model, so every subfunction returns the current printer status.
+        let status = self.int17_printer_status();
+        self.set_eax_ah(status);
+    }
+
+    /// Translate the LPT1 status port into the INT 17h status byte: keep bits 7-3
+    /// and flip -ACK (bit6) and -Error (bit3) so "acknowledge" and "I/O error" read
+    /// in the BIOS sense. An always-ready printer yields 0x90 (not busy, selected).
+    fn int17_printer_status(&self) -> u8 {
+        let port = self.lpt.read_port(0x0379).unwrap_or(0);
+        (port & 0xf8) ^ 0x48
+    }
+
     /// Service the host side of INT 15h. AH=88h returns the extended memory size
     /// (KiB above 1 MiB) in AX with CF clear, the standard way a BIOS learns RAM
     /// size on a machine with no probing path. Capped at 0xFFFF KiB (64 MiB) to
@@ -3133,7 +3245,9 @@ impl Machine {
                             0x11 => self.handle_int11(),
                             0x12 => self.handle_int12(),
                             0x13 => self.handle_int13(),
+                            0x14 => self.handle_int14(),
                             0x15 => self.handle_int15(),
+                            0x17 => self.handle_int17(),
                             0x1A => self.handle_int1a(),
                             0x33 => self.handle_int33(),
                             0x2F => {
@@ -3459,7 +3573,7 @@ impl CpuBus for MachineBus<'_> {
         // revisit if an x87 #MF is added.
         if matches!(
             vector,
-            0x10 | 0x11 | 0x12 | 0x13 | 0x15 | 0x1A | 0x20 | 0x21 | 0x2F | 0x33
+            0x10 | 0x11 | 0x12 | 0x13 | 0x14 | 0x15 | 0x17 | 0x1A | 0x20 | 0x21 | 0x2F | 0x33
         ) {
             *self.pending_soft_int = Some(vector);
         }
@@ -3641,7 +3755,7 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     // point at the ROM IRET so they survive a guest low-memory wipe. INT 33h is
     // the mouse driver and INT 2Fh is the ICDEX CD bridge: the same stub shape
     // the HLE handler returns through.
-    for vector in [0x10, 0x11, 0x12, 0x13, 0x15, 0x1A, 0x2F, 0x33] {
+    for vector in [0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x17, 0x1A, 0x2F, 0x33] {
         let address = vector * 4;
         memory.write_u16(address, 0)?;
         memory.write_u16(address + 2, BIOS_ROM_IRET_SEG)?;
@@ -3656,6 +3770,14 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     // Seed the BDA words INT 11h and INT 12h hand back, like a real BIOS.
     memory.write_u16(0x410, BIOS_EQUIPMENT_WORD)?;
     memory.write_u16(0x413, BIOS_BASE_MEMORY_KIB)?;
+    // Serial and parallel port base addresses POST detected: COM1 at 0040:0000 and
+    // LPT1 at 0040:0008, matching the equipment word. INT 14h/17h drive these ports,
+    // and software that reads the base straight from the BDA finds them here. The
+    // timeout bytes (0040:007C serial, 0040:0078 printer) get the usual defaults.
+    memory.write_u16(0x400, 0x03f8)?; // COM1 base
+    memory.write_u16(0x408, 0x0378)?; // LPT1 base
+    memory.write_u8(0x47c, 0x01)?; // COM1 timeout
+    memory.write_u8(0x478, 0x14)?; // LPT1 timeout
     // Seed the BDA video state to text 80x25 (mode 03h) like a real BIOS POST.
     memory.write_u8(0x449, 0x03)?;
     memory.write_u16(0x44a, 80)?;
@@ -3968,6 +4090,93 @@ mod tests {
         m.handle_int15();
         // EAX must not be rewritten to 'SMAP' when the call is rejected.
         assert_ne!(m.cpu.registers.eax(), 0x534D_4150);
+    }
+
+    #[test]
+    fn int14_status_reports_uart_registers() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x0300); // AH=03h read status
+        m.cpu.registers.set_edx(0); // COM1
+        m.handle_int14();
+        // LSR reads 0x60 (THRE|TEMT) on the idle UART; MSR reads 0x00.
+        assert_eq!(
+            (m.cpu.registers.eax() >> 8) as u8,
+            0x60,
+            "line status in AH"
+        );
+        assert_eq!(m.cpu.registers.eax() as u8, 0x00, "modem status in AL");
+    }
+
+    #[test]
+    fn int14_send_writes_a_byte_to_the_uart() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x0158); // AH=01h send AL='X'
+        m.cpu.registers.set_edx(0);
+        m.handle_int14();
+        assert_eq!(
+            m.serial.output(),
+            b"X",
+            "byte reached the UART capture sink"
+        );
+        // THRE is always set, so the send succeeds with bit7 clear.
+        assert_eq!((m.cpu.registers.eax() >> 8) as u8 & 0x80, 0, "no timeout");
+    }
+
+    #[test]
+    fn int14_unwired_port_times_out() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x0300);
+        m.cpu.registers.set_edx(1); // COM2 is not wired
+        m.handle_int14();
+        assert_eq!(
+            (m.cpu.registers.eax() >> 8) as u8 & 0x80,
+            0x80,
+            "timeout bit set"
+        );
+    }
+
+    #[test]
+    fn int17_print_captures_and_reports_ready() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x0050); // AH=00h print AL='P'
+        m.cpu.registers.set_edx(0); // LPT1
+        m.handle_int17();
+        assert_eq!(m.lpt_output(), b"P", "byte reached the LPT capture sink");
+        // An always-ready printer reports 0x90: not busy, selected, no error/timeout.
+        assert_eq!(
+            (m.cpu.registers.eax() >> 8) as u8,
+            0x90,
+            "ready status in AH"
+        );
+    }
+
+    #[test]
+    fn int17_status_reports_ready_printer() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x0200); // AH=02h read status
+        m.cpu.registers.set_edx(0);
+        m.handle_int17();
+        assert_eq!(
+            (m.cpu.registers.eax() >> 8) as u8,
+            0x90,
+            "ready status in AH"
+        );
+        assert!(m.lpt_output().is_empty(), "status query prints nothing");
+    }
+
+    #[test]
+    fn bda_seeds_serial_and_parallel_port_bases() {
+        let m = int15_machine(16);
+        assert_eq!(
+            m.memory.read_u16(0x400).unwrap(),
+            0x03f8,
+            "COM1 base at 0040:0000"
+        );
+        assert_eq!(
+            m.memory.read_u16(0x408).unwrap(),
+            0x0378,
+            "LPT1 base at 0040:0008"
+        );
     }
 
     #[test]
