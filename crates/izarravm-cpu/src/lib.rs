@@ -4760,7 +4760,9 @@ impl Cpu386 {
         Ok(f64::from(f32::from_bits(bits)))
     }
 
-    fn read_real64<B: CpuBus>(&mut self, bus: &mut B, mem: MemoryOperand) -> ExecResult<f64> {
+    /// Read eight bytes as a little-endian u64. The one primitive behind FLD m64,
+    /// FILD m64, the FLD m80 mantissa, FNSAVE/FRSTOR, and the MMX 64-bit transfers.
+    fn read_qword<B: CpuBus>(&mut self, bus: &mut B, mem: MemoryOperand) -> ExecResult<u64> {
         let lo = self.read_memory_sized(
             bus,
             mem.segment,
@@ -4775,7 +4777,35 @@ impl Cpu386 {
             OperandSize::Dword,
             BusAccessKind::DataRead,
         )?;
-        Ok(f64::from_bits((u64::from(hi) << 32) | u64::from(lo)))
+        Ok((u64::from(hi) << 32) | u64::from(lo))
+    }
+
+    fn write_qword<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        mem: MemoryOperand,
+        value: u64,
+    ) -> ExecResult<()> {
+        self.write_memory_sized(
+            bus,
+            mem.segment,
+            mem.offset,
+            OperandSize::Dword,
+            value as u32,
+            BusAccessKind::DataWrite,
+        )?;
+        self.write_memory_sized(
+            bus,
+            mem.segment,
+            mem.offset.wrapping_add(4),
+            OperandSize::Dword,
+            (value >> 32) as u32,
+            BusAccessKind::DataWrite,
+        )
+    }
+
+    fn read_real64<B: CpuBus>(&mut self, bus: &mut B, mem: MemoryOperand) -> ExecResult<f64> {
+        Ok(f64::from_bits(self.read_qword(bus, mem)?))
     }
 
     fn write_real32<B: CpuBus>(
@@ -4801,23 +4831,7 @@ impl Cpu386 {
         mem: MemoryOperand,
         value: f64,
     ) -> ExecResult<()> {
-        let bits = value.to_bits();
-        self.write_memory_sized(
-            bus,
-            mem.segment,
-            mem.offset,
-            OperandSize::Dword,
-            (bits & 0xffff_ffff) as u32,
-            BusAccessKind::DataWrite,
-        )?;
-        self.write_memory_sized(
-            bus,
-            mem.segment,
-            mem.offset.wrapping_add(4),
-            OperandSize::Dword,
-            (bits >> 32) as u32,
-            BusAccessKind::DataWrite,
-        )
+        self.write_qword(bus, mem, value.to_bits())
     }
 
     fn read_int16<B: CpuBus>(&mut self, bus: &mut B, mem: MemoryOperand) -> ExecResult<f64> {
@@ -4843,21 +4857,7 @@ impl Cpu386 {
     }
 
     fn read_int64<B: CpuBus>(&mut self, bus: &mut B, mem: MemoryOperand) -> ExecResult<f64> {
-        let lo = self.read_memory_sized(
-            bus,
-            mem.segment,
-            mem.offset,
-            OperandSize::Dword,
-            BusAccessKind::DataRead,
-        )?;
-        let hi = self.read_memory_sized(
-            bus,
-            mem.segment,
-            mem.offset.wrapping_add(4),
-            OperandSize::Dword,
-            BusAccessKind::DataRead,
-        )?;
-        Ok(((u64::from(hi) << 32) | u64::from(lo)) as i64 as f64)
+        Ok(self.read_qword(bus, mem)? as i64 as f64)
     }
 
     fn write_int16<B: CpuBus>(
@@ -4900,40 +4900,11 @@ impl Cpu386 {
         mem: MemoryOperand,
         value: f64,
     ) -> ExecResult<()> {
-        let bits = fpu_round_to_i64(value) as u64;
-        self.write_memory_sized(
-            bus,
-            mem.segment,
-            mem.offset,
-            OperandSize::Dword,
-            (bits & 0xffff_ffff) as u32,
-            BusAccessKind::DataWrite,
-        )?;
-        self.write_memory_sized(
-            bus,
-            mem.segment,
-            mem.offset.wrapping_add(4),
-            OperandSize::Dword,
-            (bits >> 32) as u32,
-            BusAccessKind::DataWrite,
-        )
+        self.write_qword(bus, mem, fpu_round_to_i64(value) as u64)
     }
 
     fn read_extended80<B: CpuBus>(&mut self, bus: &mut B, mem: MemoryOperand) -> ExecResult<f64> {
-        let lo = self.read_memory_sized(
-            bus,
-            mem.segment,
-            mem.offset,
-            OperandSize::Dword,
-            BusAccessKind::DataRead,
-        )?;
-        let mid = self.read_memory_sized(
-            bus,
-            mem.segment,
-            mem.offset.wrapping_add(4),
-            OperandSize::Dword,
-            BusAccessKind::DataRead,
-        )?;
+        let mantissa = self.read_qword(bus, mem)?;
         let se = self.read_memory_sized(
             bus,
             mem.segment,
@@ -4941,7 +4912,6 @@ impl Cpu386 {
             OperandSize::Word,
             BusAccessKind::DataRead,
         )?;
-        let mantissa = (u64::from(mid) << 32) | u64::from(lo);
         let sign = (se >> 15) & 1 == 1;
         let exponent = (se & 0x7fff) as i32;
         let value = if exponent == 0 && mantissa == 0 {
@@ -4992,22 +4962,7 @@ impl Cpu386 {
             }
         };
         let se = (u16::from(sign) << 15) | exponent;
-        self.write_memory_sized(
-            bus,
-            mem.segment,
-            mem.offset,
-            OperandSize::Dword,
-            (mantissa & 0xffff_ffff) as u32,
-            BusAccessKind::DataWrite,
-        )?;
-        self.write_memory_sized(
-            bus,
-            mem.segment,
-            mem.offset.wrapping_add(4),
-            OperandSize::Dword,
-            (mantissa >> 32) as u32,
-            BusAccessKind::DataWrite,
-        )?;
+        self.write_qword(bus, mem, mantissa)?;
         self.write_memory_sized(
             bus,
             mem.segment,
@@ -5407,48 +5362,6 @@ impl Cpu386 {
             }
             RmOperand::Memory(mem) => self.write_qword(bus, mem, value),
         }
-    }
-
-    fn read_qword<B: CpuBus>(&mut self, bus: &mut B, mem: MemoryOperand) -> ExecResult<u64> {
-        let lo = self.read_memory_sized(
-            bus,
-            mem.segment,
-            mem.offset,
-            OperandSize::Dword,
-            BusAccessKind::DataRead,
-        )?;
-        let hi = self.read_memory_sized(
-            bus,
-            mem.segment,
-            mem.offset.wrapping_add(4),
-            OperandSize::Dword,
-            BusAccessKind::DataRead,
-        )?;
-        Ok((u64::from(hi) << 32) | u64::from(lo))
-    }
-
-    fn write_qword<B: CpuBus>(
-        &mut self,
-        bus: &mut B,
-        mem: MemoryOperand,
-        value: u64,
-    ) -> ExecResult<()> {
-        self.write_memory_sized(
-            bus,
-            mem.segment,
-            mem.offset,
-            OperandSize::Dword,
-            value as u32,
-            BusAccessKind::DataWrite,
-        )?;
-        self.write_memory_sized(
-            bus,
-            mem.segment,
-            mem.offset.wrapping_add(4),
-            OperandSize::Dword,
-            (value >> 32) as u32,
-            BusAccessKind::DataWrite,
-        )
     }
 }
 
