@@ -1553,7 +1553,7 @@ impl Machine {
             }
             0x04 => {
                 let (year, month, day, ..) = self.rtc.clock();
-                let century = bin_to_bcd((year / 100) as u8);
+                let century = bin_to_bcd(self.rtc.century());
                 let yy = bin_to_bcd((year % 100) as u8);
                 let cx = (u16::from(century) << 8) | u16::from(yy);
                 let dx = (u16::from(bin_to_bcd(month)) << 8) | u16::from(bin_to_bcd(day));
@@ -1587,6 +1587,8 @@ impl Machine {
                 let (_, _, _, weekday, hour, minute, second) = self.rtc.clock();
                 self.rtc
                     .seed(year, month, day, weekday, hour, minute, second);
+                // Persist the century to CMOS 0x32 so it survives an NVRAM reload.
+                self.rtc.set_century(century);
                 self.set_int_frame_carry(false);
             }
             // AH=0Ah read the system-timer day counter: CX = days since 1980-01-01,
@@ -4524,6 +4526,27 @@ mod tests {
         m.handle_int1a();
         assert_eq!(m.cpu.registers.ecx() as u16, 0x2021);
         assert_eq!(m.cpu.registers.edx() as u16, 0x0715);
+    }
+
+    #[test]
+    fn int1a_date_persists_a_non_default_century() {
+        let mut m = int15_machine(16);
+        // AH=05h set date to 1999-12-31 (CH=century 0x19, CL=year 0x99).
+        m.cpu.registers.set_eax(0x0500);
+        m.cpu.registers.set_ecx(0x1999);
+        m.cpu.registers.set_edx(0x1231);
+        m.handle_int1a();
+        // The century reached CMOS 0x32 (binary 19), not just the in-memory year.
+        assert_eq!(m.rtc.century(), 19, "century persisted to CMOS 0x32");
+        // AH=04h reads the full BCD date back through the century accessor.
+        m.cpu.registers.set_eax(0x0400);
+        m.handle_int1a();
+        assert_eq!(
+            m.cpu.registers.ecx() as u16,
+            0x1999,
+            "century and year round-trip"
+        );
+        assert_eq!(m.cpu.registers.edx() as u16, 0x1231);
     }
 
     #[test]
