@@ -987,6 +987,52 @@ impl Machine {
         }
     }
 
+    /// Service INT 1Ah. AH=00h/01h read and set the BDA timer tick the ROM int08
+    /// maintains; AH=02h/04h read the RTC time and date as BCD (the documented
+    /// contract, converted from the binary CMOS). AH=03h/05h/06h/07h are accepted
+    /// as no-ops with CF clear, since the host drives the clock.
+    fn handle_int1a(&mut self) {
+        let ah = (self.cpu.registers.eax() as u16 >> 8) as u8;
+        match ah {
+            0x00 => {
+                let ticks = self.read_guest_dword(0x46c);
+                let rollover = self.read_physical_u8(0x470);
+                let _ = self.memory.write_u8(0x470, 0);
+                self.set_eax_al(rollover);
+                self.set_cx((ticks >> 16) as u16);
+                self.set_dx(ticks as u16);
+            }
+            0x01 => {
+                let cx = self.cpu.registers.ecx() as u16;
+                let dx = self.cpu.registers.edx() as u16;
+                let _ = self.memory.write_u16(0x46c, dx);
+                let _ = self.memory.write_u16(0x46e, cx);
+                let _ = self.memory.write_u8(0x470, 0);
+            }
+            0x02 => {
+                let (_, _, _, _, hour, minute, second) = self.rtc.clock();
+                let cx = (u16::from(bin_to_bcd(hour)) << 8) | u16::from(bin_to_bcd(minute));
+                let dx = u16::from(bin_to_bcd(second)) << 8; // DL = 0 (no DST)
+                self.set_cx(cx);
+                self.set_dx(dx);
+                self.set_int_frame_carry(false);
+            }
+            0x04 => {
+                let (year, month, day, ..) = self.rtc.clock();
+                let century = bin_to_bcd((year / 100) as u8);
+                let yy = bin_to_bcd((year % 100) as u8);
+                let cx = (u16::from(century) << 8) | u16::from(yy);
+                let dx = (u16::from(bin_to_bcd(month)) << 8) | u16::from(bin_to_bcd(day));
+                self.set_cx(cx);
+                self.set_dx(dx);
+                self.set_int_frame_carry(false);
+            }
+            // Set time/date/alarm: the clock is host-driven, so accept and ignore.
+            0x03 | 0x05 | 0x06 | 0x07 => self.set_int_frame_carry(false),
+            _ => self.set_int_frame_carry(true),
+        }
+    }
+
     /// Replace the low 16 bits of EAX, leaving the upper 16 intact.
     fn set_ax(&mut self, ax: u16) {
         let eax = (self.cpu.registers.eax() & !0xFFFF) | u32::from(ax);
@@ -2593,6 +2639,7 @@ impl Machine {
                             0x12 => self.handle_int12(),
                             0x13 => self.handle_int13(),
                             0x15 => self.handle_int15(),
+                            0x1A => self.handle_int1a(),
                             0x33 => self.handle_int33(),
                             0x2F => {
                                 self.handle_int2f();
@@ -2912,7 +2959,7 @@ impl CpuBus for MachineBus<'_> {
         // revisit if an x87 #MF is added.
         if matches!(
             vector,
-            0x10 | 0x11 | 0x12 | 0x13 | 0x15 | 0x20 | 0x21 | 0x2F | 0x33
+            0x10 | 0x11 | 0x12 | 0x13 | 0x15 | 0x1A | 0x20 | 0x21 | 0x2F | 0x33
         ) {
             *self.pending_soft_int = Some(vector);
         }
@@ -3071,6 +3118,12 @@ fn serial_offset(port: u16) -> Option<usize> {
     }
 }
 
+/// Convert a binary value 0..=99 to packed BCD. Values above 99 saturate the
+/// high nibble, which is enough for the clock fields INT 1Ah returns.
+fn bin_to_bcd(n: u8) -> u8 {
+    ((n / 10) << 4) | (n % 10)
+}
+
 fn boot_sector_cpu() -> Cpu386 {
     let mut cpu = Cpu386::default();
     for segment in [
@@ -3113,7 +3166,7 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     // point at the ROM IRET so they survive a guest low-memory wipe. INT 33h is
     // the mouse driver and INT 2Fh is the ICDEX CD bridge: the same stub shape
     // the HLE handler returns through.
-    for vector in [0x10, 0x11, 0x12, 0x13, 0x15, 0x2F, 0x33] {
+    for vector in [0x10, 0x11, 0x12, 0x13, 0x15, 0x1A, 0x2F, 0x33] {
         let address = vector * 4;
         memory.write_u16(address, 0)?;
         memory.write_u16(address + 2, BIOS_ROM_IRET_SEG)?;
@@ -3806,6 +3859,53 @@ mod tests {
         let ax = machine.cpu().registers.eax() as u16;
         assert_eq!(ax, BIOS_BASE_MEMORY_KIB);
         assert_eq!(ax, 640);
+    }
+
+    #[test]
+    fn int1a_ah00_reads_bda_tick() {
+        // Seed the BDA tick to 0x00012345, then INT 1Ah AH=00h returns CX:DX.
+        let rom = rom_with_code(&[
+            0xB4, 0x00, // mov ah, 0
+            0xCD, 0x1A, // int 1Ah
+            0xF4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        machine.write_physical_u8(0x46c, 0x45);
+        machine.write_physical_u8(0x46d, 0x23);
+        machine.write_physical_u8(0x46e, 0x01);
+        machine.write_physical_u8(0x46f, 0x00);
+        machine.write_physical_u8(0x470, 0x00); // no rollover
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        let cx = machine.cpu().registers.ecx() as u16;
+        let dx = machine.cpu().registers.edx() as u16;
+        assert_eq!(cx, 0x0001, "CX = high word of tick");
+        assert_eq!(dx, 0x2345, "DX = low word of tick");
+        assert_eq!(
+            machine.cpu().registers.eax() as u8,
+            0x00,
+            "AL = rollover count"
+        );
+    }
+
+    #[test]
+    fn int1a_ah02_ah04_return_bcd_clock() {
+        let rom = rom_with_code(&[
+            0xB4, 0x02, 0xCD, 0x1A, // int 1Ah AH=02h (time)
+            0xB4, 0x04, 0xCD, 0x1A, // int 1Ah AH=04h (date)
+            0xF4,
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        machine.seed_rtc(2026, 6, 21, 1, 13, 45, 30); // helper forwards to rtc.seed
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        // After AH=04h: CH=century 0x20, CL=year 0x26, DH=month 0x06, DL=day 0x21.
+        let cx = machine.cpu().registers.ecx() as u16;
+        let dx = machine.cpu().registers.edx() as u16;
+        assert_eq!(cx, 0x2026);
+        assert_eq!(dx, 0x0621);
     }
 
     #[test]

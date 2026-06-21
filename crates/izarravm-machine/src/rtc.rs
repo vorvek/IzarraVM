@@ -330,6 +330,15 @@ impl Rtc {
         self.seeded
     }
 
+    /// Broken-down local time as (year, month, day, weekday, hour, minute,
+    /// second). The values are binary; INT 1Ah converts them to BCD.
+    pub fn clock(&self) -> (u16, u8, u8, u8, u8, u8, u8) {
+        let t = self.time;
+        (
+            t.year, t.month, t.day, t.weekday, t.hour, t.minute, t.second,
+        )
+    }
+
     /// Return whether the guest wrote NVRAM since the last call, clearing the
     /// flag. The host polls this to flush cmos.bin only when something changed.
     pub fn take_nvram_dirty(&mut self) -> bool {
