@@ -466,6 +466,103 @@ impl CpuLevel {
     }
 }
 
+/// Direct-mapped TLB size (entries). Covers TLB_ENTRIES * 4 KiB before two pages
+/// collide on a slot; a 386/486 had 32, this keeps a few more so a fetch/execute
+/// loop's interleaved code and data pages do not evict each other every step.
+const TLB_ENTRIES: usize = 64;
+
+#[derive(Clone, Copy)]
+struct TlbEntry {
+    /// Linear page number (linear >> 12). Meaningful only when `generation` is current.
+    tag: u32,
+    /// Physical page base (pte & 0xffff_f000).
+    phys: u32,
+    /// Live only while equal to the owning Tlb's `generation`.
+    generation: u32,
+    /// Cached combined PDE&PTE R/W bit (page is writable).
+    writable: bool,
+    /// Cached combined PDE&PTE U/S bit (page is user-accessible).
+    user: bool,
+    /// PTE dirty bit already set, so a write hit needs no page-table update.
+    dirty: bool,
+}
+
+impl TlbEntry {
+    const EMPTY: Self = Self {
+        tag: 0,
+        phys: 0,
+        generation: 0,
+        writable: false,
+        user: false,
+        dirty: false,
+    };
+}
+
+/// Direct-mapped linear->physical translation cache. `generation` bumps to flush
+/// in O(1); an entry is live only while its `generation` matches. Contents are
+/// microarchitectural, so the TLB is transparent to Cpu386 equality and prints
+/// terse. Non-snooping, which matches real x86: a guest must INVLPG or reload CR3
+/// after editing a page-table entry, and IzarraVM flushes on exactly those events.
+#[derive(Clone)]
+struct Tlb {
+    entries: [TlbEntry; TLB_ENTRIES],
+    generation: u32,
+}
+
+impl Default for Tlb {
+    fn default() -> Self {
+        Self {
+            entries: [TlbEntry::EMPTY; TLB_ENTRIES],
+            generation: 1,
+        }
+    }
+}
+
+impl Tlb {
+    fn slot(page: u32) -> usize {
+        (page as usize) & (TLB_ENTRIES - 1)
+    }
+
+    fn lookup(&self, page: u32) -> Option<TlbEntry> {
+        let e = self.entries[Self::slot(page)];
+        (e.generation == self.generation && e.tag == page).then_some(e)
+    }
+
+    fn insert(&mut self, page: u32, phys: u32, writable: bool, user: bool, dirty: bool) {
+        self.entries[Self::slot(page)] = TlbEntry {
+            tag: page,
+            phys,
+            generation: self.generation,
+            writable,
+            user,
+            dirty,
+        };
+    }
+
+    /// Drop every cached translation (CR0/CR3 write, task switch, INVLPG). The rare
+    /// generation wrap clears the table so stale gen-0 entries cannot alias.
+    fn flush(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.entries = [TlbEntry::EMPTY; TLB_ENTRIES];
+            self.generation = 1;
+        }
+    }
+}
+
+impl PartialEq for Tlb {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for Tlb {}
+
+impl std::fmt::Debug for Tlb {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Tlb {{ {TLB_ENTRIES} entries }}")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Cpu386 {
     pub registers: Registers,
@@ -488,6 +585,10 @@ pub struct Cpu386 {
     // firmware POST is never restricted; the Machine lowers it from the live Lotura
     // GSW mode write. See CpuLevel.
     level: CpuLevel,
+    // Caches linear->physical page translations so paged protected mode (DOS
+    // extenders, Win9x) does not re-walk the two-level page table on every access.
+    // Flushed on CR0/CR3 writes, task switch, and INVLPG.
+    tlb: Tlb,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2229,9 +2330,17 @@ impl Cpu386 {
                     // core used to force bit 4 on (the ET extension-type bit); here ET
                     // stays whatever software writes, with no FPU modeled, so nothing is
                     // forced.
-                    0 => self.control.cr0 = value,
+                    // CR0 (paging enable / WP) and CR3 (page-table base) both
+                    // change translations, so flush the TLB. CR2/CR4 do not.
+                    0 => {
+                        self.control.cr0 = value;
+                        self.tlb.flush();
+                    }
                     2 => self.control.cr2 = value,
-                    3 => self.control.cr3 = value & 0xffff_f000,
+                    3 => {
+                        self.control.cr3 = value & 0xffff_f000;
+                        self.tlb.flush();
+                    }
                     4 => self.control.cr4 = value,
                     _ => {}
                 }
@@ -3238,6 +3347,32 @@ impl Cpu386 {
         // With WP clear, supervisor writes to read-only pages succeed (386 behavior).
         let wp = self.control.cr0 & CR0_WP != 0;
 
+        // TLB fast path: a cached entry skips the two page-table reads (and the
+        // accessed-bit write the fill already did). The protection check is redone
+        // from the cached page bits against the *current* accessor (CPL can change
+        // without a flush); WP changes flush, so `wp` is consistent within a
+        // generation. A write to a page whose dirty bit is not yet set falls through
+        // to the walk so the PTE's D bit is updated.
+        let page = linear >> 12;
+        if let Some(e) = self.tlb.lookup(page) {
+            let protection_fault = if user {
+                !e.user || (write && !e.writable)
+            } else {
+                write && wp && !e.writable
+            };
+            if protection_fault {
+                self.control.cr2 = linear;
+                return Err(InternalFault::Exception {
+                    vector: 14,
+                    error_code: Some(page_fault_code(true, write, user)),
+                });
+            }
+            // Serve the hit for a read, or a write to an already-dirty page.
+            if !write || e.dirty {
+                return Ok(e.phys | (linear & 0x0000_0fff));
+            }
+        }
+
         let directory = self.control.cr3 & 0xffff_f000;
         let directory_address = directory + (((linear >> 22) & 0x03ff) * 4);
         let mut pde = bus.read_memory(
@@ -3309,6 +3444,18 @@ impl Cpu386 {
                 BusAccessKind::PageWalkWrite,
             )?;
         }
+
+        // Cache the completed translation. Only reached on the success path, so a
+        // page that faulted (not present / protection) is never cached. `dirty`
+        // records whether the PTE's D bit is now set, so a later read hits but a
+        // first write to a still-clean page re-walks to set it.
+        self.tlb.insert(
+            page,
+            pte & 0xffff_f000,
+            writable,
+            user_accessible,
+            pte & 0x40 != 0,
+        );
 
         Ok((pte & 0xffff_f000) | (linear & 0x0000_0fff))
     }
@@ -4070,6 +4217,9 @@ impl Cpu386 {
         if self.control.cr0 & CR0_PG != 0 {
             self.control.cr3 =
                 bus.read_memory(base + 28, BusWidth::Dword, BusAccessKind::DataRead)?;
+            // The incoming task reloads CR3, so its page mappings replace the old
+            // task's: drop the previous task's cached translations.
+            self.tlb.flush();
         }
         // The LDTR is loaded first so segment loads that reference the LDT resolve.
         let ldtr = bus.read_memory(base + 96, BusWidth::Word, BusAccessKind::DataRead)? as u16;
@@ -6413,14 +6563,17 @@ impl Cpu386 {
                         Ok(clocks(11))
                     }
                     7 => {
-                        // INVLPG m: privileged on the 486. We model no TLB, so it is a no-op
-                        // after the privilege check.
+                        // INVLPG m: privileged on the 486. Flush the whole TLB (a
+                        // single-page invalidate is a permitted superset and keeps
+                        // the decode here simple); rare enough in DOS-era code that
+                        // the extra refills do not matter.
                         if self.current_privilege_level() != 0 {
                             return Err(InternalFault::Exception {
                                 vector: 6,
                                 error_code: None,
                             });
                         }
+                        self.tlb.flush();
                         Ok(clocks(12))
                     }
                     _ => Err(CpuError::UnsupportedGroupOpcode {
@@ -6967,6 +7120,73 @@ mod tests {
         assert_eq!(
             cpu.translate_linear(&mut bus, 0x3000, false).unwrap(),
             0x5000
+        );
+    }
+
+    // Paged-mode fetch throughput; the case the TLB targets. Run with:
+    // cargo test --release -p izarravm-cpu -- --ignored --nocapture tlb_paged
+    #[test]
+    #[ignore]
+    fn tlb_paged_fetch_throughput() {
+        let mut memory = vec![0u8; 0x10000];
+        memory[0..3].copy_from_slice(&[0xfa, 0xeb, 0xfe]); // cli; jmp $
+        memory[0x1000..0x1004].copy_from_slice(&0x0000_2007u32.to_le_bytes()); // PDE[0] -> PT
+        for i in 0..16u32 {
+            let off = 0x2000 + (i as usize) * 4;
+            memory[off..off + 4].copy_from_slice(&((i << 12) | 0x007).to_le_bytes()); // identity PTEs
+        }
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.control.cr3 = 0x1000;
+        cpu.control.cr0 |= CR0_PG;
+        let mut bus = TestBus::with_memory(memory);
+
+        let iters = 50_000_000u64;
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            cpu.cycle(&mut bus).unwrap();
+        }
+        let secs = t.elapsed().as_secs_f64();
+        println!(
+            "tlb_paged_fetch_throughput: {iters} paged instructions in {secs:.3}s = {:.1} M instr/s",
+            iters as f64 / secs / 1.0e6
+        );
+    }
+
+    #[test]
+    fn tlb_caches_translations_and_is_non_snooping_until_flushed() {
+        // PD at 0x1000, PT at 0x2000. Linear 0x3000 -> present+rw+user frame 0x5000.
+        let mut memory = vec![0; 0x7000];
+        memory[0x1000..0x1004].copy_from_slice(&0x0000_2007u32.to_le_bytes()); // PDE[0]
+        memory[0x200c..0x2010].copy_from_slice(&0x0000_5007u32.to_le_bytes()); // PTE[3]
+        let mut cpu = Cpu386::default();
+        cpu.control.cr0 |= CR0_PG;
+        cpu.control.cr3 = 0x1000;
+        let mut bus = TestBus::with_memory(memory);
+
+        // First translation walks the table and fills the TLB.
+        assert_eq!(
+            cpu.translate_linear(&mut bus, 0x3000, false).unwrap(),
+            0x5000
+        );
+
+        // Repoint the PTE to frame 0x6000 in memory with no INVLPG / CR3 reload.
+        bus.memory[0x200c..0x2010].copy_from_slice(&0x0000_6007u32.to_le_bytes());
+
+        // Real x86 TLBs do not snoop page-table writes: the stale cached frame is
+        // returned until an explicit flush -- the faithful behavior a guest relies
+        // on (it must INVLPG / reload CR3 after editing a PTE).
+        assert_eq!(
+            cpu.translate_linear(&mut bus, 0x3000, false).unwrap(),
+            0x5000
+        );
+
+        // After a flush the next access re-walks and sees the new mapping.
+        cpu.tlb.flush();
+        assert_eq!(
+            cpu.translate_linear(&mut bus, 0x3000, false).unwrap(),
+            0x6000
         );
     }
 
