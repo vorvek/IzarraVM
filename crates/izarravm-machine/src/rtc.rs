@@ -38,6 +38,31 @@ const NVRAM_CHECKSUM_HI: usize = 0x2d;
 const NVRAM_CHECKSUM_HIGH: usize = 0x2e;
 const NVRAM_CHECKSUM_LOW: usize = 0x2f;
 
+/// CMOS diagnostic status byte (the AT's "shutdown reason / POST status" slot).
+/// Bit 6 flags a bad NVRAM checksum, bit 7 flags lost RTC power.
+const REG_DIAGNOSTIC: usize = 0x0e;
+const DIAG_BAD_CHECKSUM: u8 = 0x40; // bit 6
+const DIAG_POWER_LOST: u8 = 0x80; // bit 7
+
+/// CMOS century byte (packed BCD), the AT/PS-2 convention. The Izarra defaults
+/// to century 20 (the machine runs in the 2000s).
+const REG_CENTURY: usize = 0x32;
+/// PS/2 alternate century slot. Some BIOSes mirror 0x32 here, so keep them in
+/// step. Both sit outside the 0x10..=0x2D checksum range.
+const REG_CENTURY_ALT: usize = 0x37;
+/// Default century in packed BCD (20 -> 0x20).
+const CENTURY_DEFAULT: u8 = 0x20;
+
+/// Convert a binary value 0..=99 to packed BCD.
+fn bin_to_bcd(n: u8) -> u8 {
+    ((n / 10) << 4) | (n % 10)
+}
+
+/// Convert packed BCD back to binary.
+fn bcd_to_bin(n: u8) -> u8 {
+    (n >> 4) * 10 + (n & 0x0f)
+}
+
 /// Days in each month for a non-leap year, indexed 1..=12.
 const DAYS_IN_MONTH: [u8; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 
@@ -100,6 +125,8 @@ impl Rtc {
         ram[usize::from(REG_B)] = REG_B_DEFAULT;
         ram[usize::from(REG_C)] = 0x00;
         ram[usize::from(REG_D)] = REG_D_DEFAULT;
+        ram[REG_CENTURY] = CENTURY_DEFAULT;
+        ram[REG_CENTURY_ALT] = CENTURY_DEFAULT;
         let mut rtc = Self {
             ram,
             index: 0,
@@ -231,6 +258,12 @@ impl Rtc {
             _ => {
                 self.ram[usize::from(reg)] = value;
                 self.nvram_dirty = true;
+                if usize::from(reg) == REG_CENTURY {
+                    // A direct century write moves the clock with it: keep the
+                    // alternate slot in step and re-derive the full year.
+                    self.ram[REG_CENTURY_ALT] = value;
+                    self.read_time_registers();
+                }
             }
         }
         if reg <= REG_YEAR {
@@ -285,17 +318,40 @@ impl Rtc {
 
     /// Replace the whole CMOS image from a persisted file. The clock fields are
     /// re-derived from the loaded registers so a reload restores both NVRAM and
-    /// the saved time. A bad NVRAM checksum is repaired in place (the bytes are
-    /// kept but the stored checksum is refreshed) and `false` is returned, so the
-    /// caller can log that the file was inconsistent.
+    /// the saved time.
+    ///
+    /// A bad NVRAM checksum is recorded before it is repaired: diagnostic byte
+    /// 0x0E gets bit 6 (incorrect-checksum) set so a guest can detect a tampered
+    /// or corrupt image. Bit 7 (RTC power lost) follows Register D's VRT bit: a
+    /// cleared VRT in the file means the battery died. The stored checksum is
+    /// then refreshed in place (the data bytes are kept) and `false` is
+    /// returned, so the caller can log that the file was inconsistent.
     pub fn load_nvram(&mut self, bytes: &[u8; 64]) -> bool {
         self.ram = *bytes;
+        // A century byte of 0 means an older image without one; fall back to the
+        // default so the year does not resolve to year 0.
+        if self.ram[REG_CENTURY] == 0 {
+            self.ram[REG_CENTURY] = CENTURY_DEFAULT;
+            self.ram[REG_CENTURY_ALT] = CENTURY_DEFAULT;
+        }
+        // Record power-loss from the loaded Register D before we force VRT on.
+        let power_lost = self.ram[usize::from(REG_D)] & 0x80 == 0;
         // Keep the status registers sane regardless of the file: force binary
         // 24-hour mode and VRT so the BIOS reads a known format.
         self.ram[usize::from(REG_B)] |= 0x06;
         self.ram[usize::from(REG_D)] |= 0x80;
         self.read_time_registers();
         let valid = self.checksum_valid();
+        // Stamp the diagnostic byte before repairing so a guest can still see
+        // that the image was inconsistent.
+        let mut diag = 0u8;
+        if !valid {
+            diag |= DIAG_BAD_CHECKSUM;
+        }
+        if power_lost {
+            diag |= DIAG_POWER_LOST;
+        }
+        self.ram[REG_DIAGNOSTIC] = diag;
         if !valid {
             self.refresh_checksum();
         }
@@ -339,6 +395,28 @@ impl Rtc {
         )
     }
 
+    /// The century stored in CMOS byte 0x32, as a binary number (e.g. 20). The
+    /// INT 1Ah AH=04h handler reads this to report the full date in BCD.
+    // ponytail: unused until the INT 1Ah AH=04h/05h wiring lands in lib.rs; that
+    // is a separate follow-up, so allow dead code rather than stub a caller here.
+    #[allow(dead_code)]
+    pub fn century(&self) -> u8 {
+        bcd_to_bin(self.ram[REG_CENTURY])
+    }
+
+    /// Set the century (binary, e.g. 19 or 20) into CMOS byte 0x32 as packed
+    /// BCD, mirror it to the PS/2 alternate slot 0x37, and roll the clock's full
+    /// year to match. Both slots sit outside the checksum range, so this does
+    /// not disturb the NVRAM checksum.
+    // ponytail: unused until the INT 1Ah AH=05h wiring lands in lib.rs.
+    #[allow(dead_code)]
+    pub fn set_century(&mut self, century: u8) {
+        let bcd = bin_to_bcd(century);
+        self.ram[REG_CENTURY] = bcd;
+        self.ram[REG_CENTURY_ALT] = bcd;
+        self.read_time_registers();
+    }
+
     /// Return whether the guest wrote NVRAM since the last call, clearing the
     /// flag. The host polls this to flush cmos.bin only when something changed.
     pub fn take_nvram_dirty(&mut self) -> bool {
@@ -346,6 +424,9 @@ impl Rtc {
     }
 
     /// Copy the broken-down time into the register bytes (binary, 24-hour).
+    /// The two-digit year register tracks `year % 100`; the century byte at
+    /// 0x32 (and its PS/2 mirror at 0x37) carries the rest in packed BCD so a
+    /// reload reconstructs the full year.
     fn write_time_registers(&mut self) {
         self.ram[usize::from(REG_SECONDS)] = self.time.second;
         self.ram[usize::from(REG_MINUTES)] = self.time.minute;
@@ -354,15 +435,19 @@ impl Rtc {
         self.ram[usize::from(REG_DAY)] = self.time.day;
         self.ram[usize::from(REG_MONTH)] = self.time.month;
         self.ram[usize::from(REG_YEAR)] = (self.time.year % 100) as u8;
+        let century = bin_to_bcd((self.time.year / 100) as u8);
+        self.ram[REG_CENTURY] = century;
+        self.ram[REG_CENTURY_ALT] = century;
     }
 
     /// Re-derive the broken-down time from the register bytes after a reload.
-    /// The century is assumed to be 2000 since this is a 1990s-era fantasy
-    /// machine running in the 2000s; a two-digit year of 90+ maps to 19xx so a
-    /// game that writes 95 still reads back as 1995.
+    /// The full year is the century byte at 0x32 (packed BCD) times 100 plus the
+    /// two-digit year register, so a saved 0x19 century reads back as 19xx and
+    /// the default 0x20 as 20xx.
     fn read_time_registers(&mut self) {
         let yy = u16::from(self.ram[usize::from(REG_YEAR)] % 100);
-        let year = if yy >= 90 { 1900 + yy } else { 2000 + yy };
+        let century = u16::from(bcd_to_bin(self.ram[REG_CENTURY]));
+        let year = century * 100 + yy;
         self.time = Time {
             year,
             month: self.ram[usize::from(REG_MONTH)].clamp(1, 12),
@@ -478,5 +563,91 @@ mod tests {
         r.write_port(0x71, 30); // guest writes "30"
         r.write_port(0x70, REG_YEAR);
         assert_eq!(r.read_port(0x71), Some(30));
+    }
+
+    #[test]
+    fn fresh_device_has_clear_diagnostic_byte() {
+        let r = Rtc::new();
+        assert_eq!(r.nvram_byte(REG_DIAGNOSTIC), 0);
+    }
+
+    #[test]
+    fn clean_image_load_leaves_diagnostic_clear() {
+        let mut r = Rtc::new();
+        r.set_nvram(0x12, 7);
+        r.refresh_checksum();
+        let saved = r.nvram();
+        let mut r2 = Rtc::new();
+        assert!(r2.load_nvram(&saved));
+        assert_eq!(r2.nvram_byte(REG_DIAGNOSTIC), 0);
+    }
+
+    #[test]
+    fn tampered_image_sets_diagnostic_bad_checksum_bit() {
+        let mut r = Rtc::new();
+        r.set_nvram(0x12, 7);
+        r.refresh_checksum();
+        let mut saved = r.nvram();
+        // Flip a checksummed byte without updating the stored checksum.
+        saved[0x13] ^= 0xff;
+        let mut r2 = Rtc::new();
+        assert!(!r2.load_nvram(&saved));
+        assert_ne!(r2.nvram_byte(REG_DIAGNOSTIC) & DIAG_BAD_CHECKSUM, 0);
+    }
+
+    #[test]
+    fn power_lost_image_sets_diagnostic_power_bit() {
+        let r = Rtc::new();
+        let mut saved = r.nvram();
+        // Clear Register D VRT to mark a dead battery; keep the checksum valid.
+        saved[usize::from(REG_D)] &= !0x80;
+        let mut r2 = Rtc::new();
+        assert!(r2.load_nvram(&saved));
+        assert_ne!(r2.nvram_byte(REG_DIAGNOSTIC) & DIAG_POWER_LOST, 0);
+    }
+
+    #[test]
+    fn century_default_is_2000s() {
+        let r = Rtc::new();
+        assert_eq!(r.nvram_byte(REG_CENTURY), 0x20);
+        assert_eq!(r.century(), 20);
+        let (year, ..) = r.clock();
+        assert_eq!(year / 100, 20);
+    }
+
+    #[test]
+    fn century_byte_drives_the_year_on_load() {
+        let mut r = Rtc::new();
+        r.seed(2095, 6, 20, 6, 12, 0, 0);
+        // Force the 1900s century into the saved image.
+        r.set_nvram(REG_CENTURY, 0x19);
+        r.refresh_checksum();
+        let saved = r.nvram();
+        let mut r2 = Rtc::new();
+        r2.load_nvram(&saved);
+        let (year, ..) = r2.clock();
+        assert_eq!(year, 1995);
+
+        // The default 0x20 century resolves the same two-digit year as 20xx.
+        let mut r3 = Rtc::new();
+        r3.seed(2095, 6, 20, 6, 12, 0, 0);
+        let saved2 = r3.nvram();
+        assert_eq!(saved2[REG_CENTURY], 0x20);
+        let mut r4 = Rtc::new();
+        r4.load_nvram(&saved2);
+        let (year2, ..) = r4.clock();
+        assert_eq!(year2, 2095);
+    }
+
+    #[test]
+    fn set_century_rolls_the_year_and_mirrors_alt_slot() {
+        let mut r = Rtc::new();
+        r.seed(2026, 6, 20, 6, 12, 0, 0);
+        r.set_century(19);
+        assert_eq!(r.century(), 19);
+        assert_eq!(r.nvram_byte(REG_CENTURY), 0x19);
+        assert_eq!(r.nvram_byte(REG_CENTURY_ALT), 0x19);
+        let (year, ..) = r.clock();
+        assert_eq!(year, 1926);
     }
 }
