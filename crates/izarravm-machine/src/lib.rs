@@ -4202,9 +4202,16 @@ mod tests {
         let before = machine.elapsed_clocks();
         let reason = machine.run_until_halt_or_cycles(10_000_000).unwrap();
         assert_eq!(reason, StopReason::Halted);
+        // CX:DX = 0x00004240 = 16960 microseconds. stall_for converts that to guest
+        // clocks at the active mode's rate, so the elapsed-clock jump must dwarf the
+        // handful of setup-instruction clocks. Require at least half the expected
+        // stall to leave margin for the rounding in stall_for.
+        let wait_secs = 16_960.0 / 1_000_000.0;
+        let expected_stall = (wait_secs * machine.active_mode().clock_hz() as f64) as u64;
+        let advanced = machine.elapsed_clocks() - before;
         assert!(
-            machine.elapsed_clocks() > before,
-            "AH=86h stalled the guest clock"
+            advanced >= expected_stall / 2,
+            "AH=86h stall too small: advanced {advanced} clocks, expected ~{expected_stall}"
         );
         let flags = machine.cpu().registers.eflags;
         assert_eq!(flags & 0x0001, 0, "CF clear after WAIT");
