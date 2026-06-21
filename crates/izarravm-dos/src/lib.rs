@@ -2017,6 +2017,32 @@ impl DosKernel {
                 }
                 Ok(DosAction::Continue)
             }
+            // AH=57h GET/SET a file's last-written date and time on the open handle in BX.
+            // AL=00 returns the packed time/date in CX/DX; AL=01 sets them from CX/DX.
+            // Archivers and compilers use this to preserve timestamps across a copy.
+            0x57 => {
+                let Some(of) = self.open_files.get(&regs.bx) else {
+                    set_dos_error(regs, 0x06); // invalid handle
+                    return Ok(DosAction::Continue);
+                };
+                match regs.ax as u8 {
+                    0x00 => match of.file.metadata().and_then(|m| m.modified()) {
+                        Ok(modified) => {
+                            let (time, date) = dos_time_date(modified);
+                            regs.cx = time;
+                            regs.dx = date;
+                            regs.cf = false;
+                        }
+                        Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
+                    },
+                    0x01 => match of.file.set_modified(systemtime_from_dos(regs.cx, regs.dx)) {
+                        Ok(()) => regs.cf = false,
+                        Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
+                    },
+                    _ => set_dos_error(regs, 0x01),
+                }
+                Ok(DosAction::Continue)
+            }
             // Other file functions (find) and everything else are not yet
             // implemented; later slices fill them in. An unimplemented function
             // returns Continue so the IRET stub returns to the caller.
@@ -2370,6 +2396,33 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
     let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
     (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+/// Days from the Unix epoch (1970-01-01) to a civil date, the inverse of
+/// `civil_from_days` (Howard Hinnant's days_from_civil). Used to turn a packed DOS
+/// date back into a host timestamp for AH=57h AL=01.
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * i64::from(mp) + 2) / 5 + i64::from(day) - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
+}
+
+/// Convert a packed DOS (time, date) pair to a host SystemTime, treating the fields as
+/// UTC the same way `dos_time_date` reads them back. Out-of-range fields are clamped.
+fn systemtime_from_dos(time: u16, date: u16) -> std::time::SystemTime {
+    let year = 1980 + i64::from(date >> 9);
+    let month = u32::from((date >> 5) & 0x0f).clamp(1, 12);
+    let day = u32::from(date & 0x1f).clamp(1, 31);
+    let hour = u32::from(time >> 11).min(23);
+    let minute = u32::from((time >> 5) & 0x3f).min(59);
+    let second = u32::from(time & 0x1f) * 2; // DOS stores seconds/2
+    let days = days_from_civil(year, month, day).max(0) as u64;
+    let secs = days * 86_400 + u64::from(hour) * 3600 + u64::from(minute) * 60 + u64::from(second);
+    std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)
 }
 
 /// Build the blank-padded 11-byte 8.3 template for a host file name, uppercased.
@@ -2765,6 +2818,49 @@ mod tests {
         kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
         assert!(!regs.cf);
         assert_eq!(regs.ax & 0xff, 0x00);
+    }
+
+    #[test]
+    fn ah57_gets_and_sets_a_file_timestamp() {
+        let (mut kernel, mut mem, _dir) = kernel_with_drive(&[("T.TXT", b"x")], r"C:\T.TXT");
+        // Open read-write so the host permits set_modified.
+        let mut regs = DosRegs {
+            ax: 0x3d02,
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        let handle = regs.ax;
+        // 2021-07-15 13:45:30 (DOS packs seconds/2, so 30 -> 15).
+        let date = ((2021u16 - 1980) << 9) | (7 << 5) | 15;
+        let time = (13u16 << 11) | (45 << 5) | 15;
+        let mut regs = DosRegs {
+            ax: 0x5701,
+            bx: handle,
+            cx: time,
+            dx: date,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf);
+        let mut regs = DosRegs {
+            ax: 0x5700,
+            bx: handle,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf);
+        assert_eq!(regs.dx, date);
+        assert_eq!(regs.cx, time);
+    }
+
+    #[test]
+    fn days_from_civil_inverts_civil_from_days() {
+        for &days in &[0i64, 3652, 10_000, 20_000] {
+            let (y, m, d) = civil_from_days(days);
+            assert_eq!(days_from_civil(y, m, d), days);
+        }
     }
 
     #[test]
