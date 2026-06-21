@@ -6342,6 +6342,81 @@ mod tests {
     }
 
     #[test]
+    fn int10_scroll_window_down_blanks_top() {
+        // No mode set here: setting a text mode clears the framebuffer, which
+        // would wipe the marker the host seeds below before the scroll runs.
+        let rom = rom_with_code(&[
+            0xB8, 0x01, 0x07, // mov ax,0701h (AH=07h scroll down 1 line)
+            0xB7, 0x07, // mov bh,07h (fill attr)
+            0xB9, 0x00, 0x00, // mov cx,0000h (top-left 0,0)
+            0xBA, 0x4F, 0x18, // mov dx,184Fh (bottom-right row 24 col 79)
+            0xCD, 0x10, 0xF4,
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        // Put a non-space at row 0 col 0; after scroll-down by 1 it lands at row 1.
+        machine.write_physical_u8(VGA_TEXT_BASE, b'Y');
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(
+            machine.read_physical_u8(VGA_TEXT_BASE + 80 * 2),
+            b'Y',
+            "row 0 scrolled to row 1"
+        );
+        assert_eq!(
+            machine.read_physical_u8(VGA_TEXT_BASE),
+            b' ',
+            "top row blanked"
+        );
+    }
+
+    #[test]
+    fn int10_scroll_subwindow_up() {
+        // No mode set here: setting a text mode clears the framebuffer, which
+        // would wipe the marker the host seeds below before the scroll runs.
+        // CX = top-left, DX = bottom-right; for each, the high byte is the row
+        // and the low byte is the column: CX=(row<<8)|col, DX=(row<<8)|col.
+        let rom = rom_with_code(&[
+            0xB8, 0x01, 0x06, // mov ax,0601h (AH=06h scroll up 1 line)
+            0xB7, 0x07, // mov bh,07h (fill attr)
+            0xB9, 0x04, 0x01, // mov cx,0104h (top-left row 1 col 4)
+            0xBA, 0x0A, 0x03, // mov dx,030Ah (bottom-right row 3 col 10)
+            0xCD, 0x10, 0xF4,
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        // Marker inside the window at row 2 col 5; after scroll-up by 1 it lands
+        // at row 1 col 5.
+        machine.write_physical_u8(VGA_TEXT_BASE + ((2 * 80) + 5) * 2, b'W');
+        // Sentinels in cells outside the window (the framebuffer is otherwise
+        // pre-blanked with spaces, so seed distinct bytes to prove the scroll's
+        // row and column clamping never wrote here): row 0 col 0 is above the
+        // window, row 2 col 0 is left of the col-4 left edge.
+        machine.write_physical_u8(VGA_TEXT_BASE, b'A');
+        machine.write_physical_u8(VGA_TEXT_BASE + (2 * 80) * 2, b'B');
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(
+            machine.read_physical_u8(VGA_TEXT_BASE + (80 + 5) * 2),
+            b'W',
+            "row 2 col 5 scrolled to row 1 col 5"
+        );
+        // A cell above the window (row 0 col 0) is untouched.
+        assert_eq!(
+            machine.read_physical_u8(VGA_TEXT_BASE),
+            b'A',
+            "row 0 col 0 outside window left untouched"
+        );
+        // A cell to the left of the window (row 2 col 0, left edge is col 4) is
+        // untouched.
+        assert_eq!(
+            machine.read_physical_u8(VGA_TEXT_BASE + (2 * 80) * 2),
+            b'B',
+            "row 2 col 0 left of window left untouched"
+        );
+    }
+
+    #[test]
     fn a0000_writes_route_to_the_planar_datapath_in_mode_0dh() {
         let mut machine = test_machine();
         machine.set_vga_mode_0dh();
