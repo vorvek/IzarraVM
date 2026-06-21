@@ -88,8 +88,10 @@ const CPUID_VERSION_EAX: u32 =
 // on to match the GSW-586 lore. The rest stay off until the matching behavior exists.
 const CPUID_FEATURE_TSC: u32 = 1 << 4;
 const CPUID_FEATURE_MSR: u32 = 1 << 5;
+const CPUID_FEATURE_CX8: u32 = 1 << 8; // CMPXCHG8B
 const CPUID_FEATURE_MMX: u32 = 1 << 23;
-const CPUID_FEATURES_EDX: u32 = CPUID_FEATURE_TSC | CPUID_FEATURE_MSR | CPUID_FEATURE_MMX;
+const CPUID_FEATURES_EDX: u32 =
+    CPUID_FEATURE_TSC | CPUID_FEATURE_MSR | CPUID_FEATURE_CX8 | CPUID_FEATURE_MMX;
 
 // CR4 bits with a modeled effect. TSD (bit 2) makes RDTSC privileged: when set, RDTSC
 // outside CPL 0 raises #GP(0). The other CR4 bits are storage only.
@@ -2465,6 +2467,37 @@ impl Cpu386 {
                 self.write_gpr32(2, edx); // EDX
                 Ok(clocks(14))
             }
+            0xc7 => {
+                // CMPXCHG8B m64 (0F C7 /1): compare EDX:EAX with the 64-bit memory operand.
+                // Equal -> ZF set and ECX:EBX stored; unequal -> ZF clear and the memory
+                // value loaded into EDX:EAX. Only ZF changes. The register form and any other
+                // group-7 extension are #UD.
+                let modrm = self.fetch_modrm(bus)?;
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
+                let mem = match operand {
+                    RmOperand::Memory(mem) if modrm.reg == 1 => mem,
+                    _ => {
+                        return Err(InternalFault::Exception {
+                            vector: 6,
+                            error_code: None,
+                        });
+                    }
+                };
+                let current = self.read_qword(bus, mem)?;
+                if current == self.read_edx_eax() {
+                    let source =
+                        (u64::from(self.read_gpr32(1)) << 32) | u64::from(self.read_gpr32(3));
+                    self.write_qword(bus, mem, source)?;
+                    self.set_flag(FLAG_ZF, true);
+                } else {
+                    self.set_edx_eax(current);
+                    // Re-write the destination with its own value so the bus still sees a
+                    // write on the unequal branch, matching the locked read-modify-write.
+                    self.write_qword(bus, mem, current)?;
+                    self.set_flag(FLAG_ZF, false);
+                }
+                Ok(clocks(10))
+            }
             0xc8..=0xcf => {
                 // BSWAP r32 (0F C8+r): reverse the byte order of a 32-bit register. The low
                 // three bits of the opcode pick the register. The 16-bit-operand form is
@@ -2649,6 +2682,9 @@ impl Cpu386 {
                     // CMPXCHG (B0/B1) and XADD (C0/C1) read-modify-write the r/m destination, so
                     // LOCK is allowed only with a memory operand. The register-dest form is #UD.
                     0xb0 | 0xb1 | 0xc0 | 0xc1 => self.peek_u8(bus, eip.wrapping_add(1))? >> 6 != 3,
+                    // CMPXCHG8B (C7 /1) likewise read-modify-writes its m64. LOCK needs a memory
+                    // operand; the register form is #UD with or without LOCK.
+                    0xc7 => self.peek_u8(bus, eip.wrapping_add(1))? >> 6 != 3,
                     // BSWAP (C8+r) has a register destination and no memory form; INVD (08) and
                     // WBINVD (09) take no operand. LOCK on any of them is #UD (the false arm).
                     _ => false,
@@ -4668,8 +4704,8 @@ const fn is_386plus_two_byte(opcode: u8) -> bool {
 const fn is_586plus_two_byte(opcode: u8) -> bool {
     matches!(
         opcode,
-        // WRMSR, RDTSC, RDMSR; CMOVcc.
-        0x30..=0x32 | 0x40..=0x4f
+        // WRMSR, RDTSC, RDMSR; CMOVcc; CMPXCHG8B.
+        0x30..=0x32 | 0x40..=0x4f | 0xc7
     )
 }
 
@@ -11813,6 +11849,101 @@ mod tests {
         cpu.cycle(&mut bus).unwrap();
         assert!(cpu.flag(FLAG_ZF));
         assert_eq!(cpu.fpu.top(), (top_before + 1) & 7);
+    }
+
+    // --- Phase 5 Slice C: CMPXCHG8B ---
+
+    fn read_dword(memory: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes([memory[at], memory[at + 1], memory[at + 2], memory[at + 3]])
+    }
+
+    #[test]
+    fn cmpxchg8b_equal_stores_ecx_ebx_and_sets_zf() {
+        // 0F C7 0E 40 00: CMPXCHG8B [0x0040] (reg=/1, mod=0 rm=6 direct disp16).
+        let (mut cpu, mut memory) = real_mode_cpu(&[0x0f, 0xc7, 0x0e, 0x40, 0x00], 0x80);
+        memory[0x40..0x44].copy_from_slice(&0x5566_7788u32.to_le_bytes());
+        memory[0x44..0x48].copy_from_slice(&0x1122_3344u32.to_le_bytes());
+        cpu.registers.set_eax(0x5566_7788); // EDX:EAX equals the memory value
+        cpu.registers.set_edx(0x1122_3344);
+        cpu.registers.set_ebx(0xcafe_babe); // ECX:EBX is the value to store
+        cpu.registers.set_ecx(0xdead_beef);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert!(cpu.flag(FLAG_ZF));
+        assert_eq!(read_dword(&bus.memory, 0x40), 0xcafe_babe);
+        assert_eq!(read_dword(&bus.memory, 0x44), 0xdead_beef);
+    }
+
+    #[test]
+    fn cmpxchg8b_unequal_loads_edx_eax_and_clears_zf() {
+        let (mut cpu, mut memory) = real_mode_cpu(&[0x0f, 0xc7, 0x0e, 0x40, 0x00], 0x80);
+        memory[0x40..0x44].copy_from_slice(&0xaaaa_bbbbu32.to_le_bytes());
+        memory[0x44..0x48].copy_from_slice(&0xcccc_ddddu32.to_le_bytes());
+        cpu.registers.set_eax(0x0000_0001); // EDX:EAX differs from memory
+        cpu.registers.set_edx(0x0000_0002);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert!(!cpu.flag(FLAG_ZF));
+        assert_eq!(cpu.registers.eax(), 0xaaaa_bbbb);
+        assert_eq!(cpu.registers.edx(), 0xcccc_dddd);
+        assert_eq!(read_dword(&bus.memory, 0x40), 0xaaaa_bbbb); // memory unchanged
+    }
+
+    #[test]
+    fn cmpxchg8b_register_form_is_undefined_opcode() {
+        // 0F C7 C9: mod=3 register form is #UD.
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0xc7, 0xc9], 0x20);
+        let mut bus = TestBus::with_memory(memory);
+        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
+    }
+
+    #[test]
+    fn cmpxchg8b_wrong_group_extension_is_undefined_opcode() {
+        // 0F C7 06 40 00: reg=/0, not CMPXCHG8B -> #UD.
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0xc7, 0x06, 0x40, 0x00], 0x80);
+        let mut bus = TestBus::with_memory(memory);
+        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
+    }
+
+    #[test]
+    fn lock_cmpxchg8b_to_memory_is_accepted() {
+        // F0 0F C7 0E 40 00: LOCK CMPXCHG8B [0x0040].
+        let (mut cpu, mut memory) = real_mode_cpu(&[0xf0, 0x0f, 0xc7, 0x0e, 0x40, 0x00], 0x80);
+        memory[0x40..0x48].copy_from_slice(&0u64.to_le_bytes());
+        cpu.registers.set_ebx(0x11);
+        cpu.registers.set_ecx(0x22);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert!(cpu.flag(FLAG_ZF)); // EDX:EAX = 0 equals zeroed memory
+        assert_eq!(read_dword(&bus.memory, 0x40), 0x11);
+        assert_eq!(read_dword(&bus.memory, 0x44), 0x22);
+    }
+
+    #[test]
+    fn lock_cmpxchg8b_register_form_is_undefined_opcode() {
+        // F0 0F C7 C9: LOCK on the register form -> #UD.
+        let (mut cpu, memory) = real_mode_cpu(&[0xf0, 0x0f, 0xc7, 0xc9], 0x20);
+        let mut bus = TestBus::with_memory(memory);
+        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
+    }
+
+    #[test]
+    fn cpuid_leaf1_reports_cx8() {
+        let edx = run_cpuid(1).registers.edx();
+        assert_ne!(edx & (1 << 8), 0, "CX8 feature bit should be set");
+    }
+
+    #[test]
+    fn cmpxchg8b_is_undefined_opcode_below_586() {
+        let code = [0x0f, 0xc7, 0x0e, 0x40, 0x00];
+        assert!(matches!(
+            run_at_level(&code, CpuLevel::I486).unwrap_err(),
+            InternalFault::Exception { vector: 6, .. }
+        ));
+        assert!(run_at_level(&code, CpuLevel::I586).is_ok());
     }
 
     /// Run a single instruction from `code` at the given level and return the result.
