@@ -889,12 +889,15 @@ impl Machine {
                 // The 16-color planar modes this slice implements.
                 0x0D | 0x0E | 0x10 | 0x12 => {
                     self.set_vga_mode(al); // clears the Margo latch internally
+                    let cols = if al == 0x0D { 40 } else { 80 };
+                    self.set_bda_video_mode(al, cols, 25);
                     return;
                 }
                 // Chained mode 13h.
                 0x13 => {
                     self.video.set_mode13h();
                     self.margo_active = false;
+                    self.set_bda_video_mode(0x13, 40, 25);
                     return;
                 }
                 // CGA graphics: 04h/05h are 320x200x4, 06h is 640x200x2. The B800
@@ -902,6 +905,8 @@ impl Machine {
                 0x04..=0x06 => {
                     self.video.set_cga_mode(al);
                     self.margo_active = false;
+                    let cols = if al == 0x06 { 80 } else { 40 };
+                    self.set_bda_video_mode(al, cols, 25);
                     return;
                 }
                 // The 80x25 color text family (2/3), monochrome text (7), and the
@@ -909,6 +914,8 @@ impl Machine {
                 0x00..=0x03 | 0x07 => {
                     self.video.set_text_mode();
                     self.margo_active = false;
+                    let cols = if al <= 0x01 { 40 } else { 80 };
+                    self.set_bda_video_mode(al, cols, 25);
                     // A mode set clears the screen and homes the BDA cursor, so
                     // teletyped output starts at the top left.
                     let _ = self.memory.write_u16(0x450, 0);
@@ -946,8 +953,168 @@ impl Machine {
             self.handle_int10_font(al);
             return;
         }
+        if matches!(
+            ah,
+            0x01 | 0x02 | 0x03 | 0x06 | 0x07 | 0x08 | 0x09 | 0x0A | 0x0E
+        ) {
+            self.handle_int10_text(ah);
+            return;
+        }
+        if ah == 0x0f {
+            let mode = self.read_physical_u8(0x449);
+            let cols = self.read_guest_word(0x44a);
+            let eax = (self.cpu.registers.eax() & !0xFFFF)
+                | (u32::from(cols & 0xff) << 8)
+                | u32::from(mode);
+            self.cpu.registers.set_eax(eax);
+            // BH = active page 0; leave the rest of EBX intact.
+            let ebx = self.cpu.registers.ebx() & !0xFF00;
+            self.cpu.registers.set_ebx(ebx);
+            return;
+        }
         if ah == 0x4f {
             self.handle_vbe(al);
+        }
+    }
+
+    /// Record the current video mode in the BDA so apps that read it directly
+    /// (and INT 10h AH=0Fh) see a sane state. Columns and rows are the text-cell
+    /// geometry the BIOS publishes for the mode.
+    fn set_bda_video_mode(&mut self, mode: u8, columns: u16, rows: u8) {
+        let _ = self.memory.write_u8(0x449, mode);
+        let _ = self.memory.write_u16(0x44a, columns);
+        let _ = self.memory.write_u8(0x484, rows.saturating_sub(1));
+        let _ = self.memory.write_u16(0x463, 0x03d4); // VGA CRTC base port
+    }
+
+    /// INT 10h text-mode output and cursor services. Operates on the same VGA text
+    /// framebuffer and BDA cursor (0040:0050) the teletype helper uses. Page
+    /// arguments are ignored: this BIOS renders page 0 only.
+    fn handle_int10_text(&mut self, ah: u8) {
+        let ax = self.cpu.registers.eax() as u16;
+        let al = ax as u8;
+        let bx = self.cpu.registers.ebx() as u16;
+        let bl = bx as u8;
+        let cx = self.cpu.registers.ecx() as u16;
+        let dx = self.cpu.registers.edx() as u16;
+        let dl = dx as u8;
+        let dh = (dx >> 8) as u8;
+        match ah {
+            // AH=01h set cursor shape: store CX in the BDA cursor-type word.
+            0x01 => {
+                let _ = self.memory.write_u16(0x460, cx);
+            }
+            // AH=02h set cursor position: DH=row, DL=col.
+            0x02 => {
+                let _ = self
+                    .memory
+                    .write_u16(0x450, (u16::from(dh) << 8) | u16::from(dl));
+                self.video
+                    .set_cursor_offset(u16::from(dh) * 80 + u16::from(dl));
+            }
+            // AH=03h get cursor position and shape.
+            0x03 => {
+                let pos = self.read_guest_word(0x450);
+                let edx = (self.cpu.registers.edx() & !0xFFFF) | u32::from(pos);
+                self.cpu.registers.set_edx(edx);
+                let shape = self.read_guest_word(0x460);
+                let shape = if shape == 0 { 0x0607 } else { shape };
+                let ecx = (self.cpu.registers.ecx() & !0xFFFF) | u32::from(shape);
+                self.cpu.registers.set_ecx(ecx);
+            }
+            // AH=06h/07h scroll the window up/down. AL=0 blanks it.
+            0x06 | 0x07 => self.scroll_window(ah == 0x06, al, bx >> 8, cx, dx),
+            // AH=08h read char+attr at the cursor.
+            0x08 => {
+                let pos = self.read_guest_word(0x450);
+                let off = (usize::from(pos >> 8) * 80 + usize::from(pos & 0xff)) * 2;
+                let ch = self.video.read_u8(off).unwrap_or(b' ');
+                let at = self.video.read_u8(off + 1).unwrap_or(0x07);
+                let eax =
+                    (self.cpu.registers.eax() & !0xFFFF) | (u32::from(at) << 8) | u32::from(ch);
+                self.cpu.registers.set_eax(eax);
+            }
+            // AH=09h write char+attr, AH=0Ah write char only, CX times, no advance.
+            0x09 | 0x0A => {
+                let pos = self.read_guest_word(0x450);
+                let base = (usize::from(pos >> 8) * 80 + usize::from(pos & 0xff)) * 2;
+                for i in 0..usize::from(cx) {
+                    let off = base + i * 2;
+                    let _ = self.video.write_u8(off, al);
+                    if ah == 0x09 {
+                        let _ = self.video.write_u8(off + 1, bl);
+                    }
+                }
+            }
+            // AH=0Eh teletype.
+            0x0E => self.teletype_char(al),
+            _ => {}
+        }
+    }
+
+    /// Scroll a text window. `up` selects direction; `lines`==0 blanks the whole
+    /// window. `attr` fills the vacated rows; `cx`=top-left (CH row, CL col),
+    /// `dx`=bottom-right (DH row, DL col). Clamped to the 80x25 screen.
+    fn scroll_window(&mut self, up: bool, lines: u8, attr: u16, cx: u16, dx: u16) {
+        let attr = attr as u8;
+        let top = usize::from((cx >> 8) as u8).min(24);
+        let left = usize::from(cx as u8).min(79);
+        let bottom = usize::from((dx >> 8) as u8).min(24).max(top);
+        let right = usize::from(dx as u8).min(79).max(left);
+        let height = bottom - top + 1;
+        let n = if lines == 0 {
+            height
+        } else {
+            usize::from(lines)
+        };
+        if n >= height {
+            for row in top..=bottom {
+                self.blank_text_row(row, left, right, attr);
+            }
+            return;
+        }
+        if up {
+            for row in top..=(bottom - n) {
+                self.copy_text_row(row + n, row, left, right, attr);
+            }
+            for row in (bottom - n + 1)..=bottom {
+                self.blank_text_row(row, left, right, attr);
+            }
+        } else {
+            for row in ((top + n)..=bottom).rev() {
+                self.copy_text_row(row - n, row, left, right, attr);
+            }
+            for row in top..(top + n) {
+                self.blank_text_row(row, left, right, attr);
+            }
+        }
+    }
+
+    /// Copy a span of text cells from `src_row` to `dst_row` (inclusive columns).
+    fn copy_text_row(
+        &mut self,
+        src_row: usize,
+        dst_row: usize,
+        left: usize,
+        right: usize,
+        attr: u8,
+    ) {
+        for col in left..=right {
+            let src = (src_row * 80 + col) * 2;
+            let dst = (dst_row * 80 + col) * 2;
+            let b0 = self.video.read_u8(src).unwrap_or(b' ');
+            let b1 = self.video.read_u8(src + 1).unwrap_or(attr);
+            let _ = self.video.write_u8(dst, b0);
+            let _ = self.video.write_u8(dst + 1, b1);
+        }
+    }
+
+    /// Blank a span of text cells to spaces with `attr` (inclusive columns).
+    fn blank_text_row(&mut self, row: usize, left: usize, right: usize, attr: u8) {
+        for col in left..=right {
+            let off = (row * 80 + col) * 2;
+            let _ = self.video.write_u8(off, b' ');
+            let _ = self.video.write_u8(off + 1, attr);
         }
     }
 
@@ -976,14 +1143,98 @@ impl Machine {
     /// fit the 16-bit AX return; other subfunctions report CF set (unsupported).
     fn handle_int15(&mut self) {
         let ah = (self.cpu.registers.eax() as u16 >> 8) as u8;
-        if ah == 0x88 {
-            let extended_kib = u32::from(self.profile.memory_mib.saturating_sub(1)) * 1024;
-            let value = extended_kib.min(0xFFFF) as u16;
-            let eax = (self.cpu.registers.eax() & !0xFFFF) | u32::from(value);
-            self.cpu.registers.set_eax(eax);
-            self.set_int_frame_carry(false);
-        } else {
-            self.set_int_frame_carry(true);
+        match ah {
+            // AH=88h extended memory size in KiB (existing behavior).
+            0x88 => {
+                let extended_kib = u32::from(self.profile.memory_mib.saturating_sub(1)) * 1024;
+                let value = extended_kib.min(0xFFFF) as u16;
+                let eax = (self.cpu.registers.eax() & !0xFFFF) | u32::from(value);
+                self.cpu.registers.set_eax(eax);
+                self.set_int_frame_carry(false);
+            }
+            // AH=86h WAIT: CX:DX microseconds. Convert to seconds and stall.
+            0x86 => {
+                let micros = (u64::from(self.cpu.registers.ecx() as u16) << 16)
+                    | u64::from(self.cpu.registers.edx() as u16);
+                self.stall_for(micros as f64 / 1_000_000.0);
+                self.set_eax_ah(0x00);
+                self.set_int_frame_carry(false);
+            }
+            // AH=87h block move: ES:SI -> GDT; copy CX words src->dst across 1 MB.
+            0x87 => self.int15_block_move(),
+            _ => self.set_int_frame_carry(true),
+        }
+    }
+
+    /// INT 15h AH=87h. ES:SI points at a 48-byte GDT the caller built; the source
+    /// descriptor is at +0x10 and the destination at +0x18. Each descriptor holds
+    /// a 24-bit base across bytes 2,3,4 and the high 8 bits at byte 7. Copies CX
+    /// words. This is the standard path HIMEM and DOS extenders use to reach
+    /// extended memory from real mode.
+    fn int15_block_move(&mut self) {
+        let es = self.cpu.registers.segment(SegmentIndex::Es).base;
+        let si = self.cpu.registers.esi() as u16;
+        let gdt = es.wrapping_add(u32::from(si));
+        let base_at = |s: &mut Self, desc: u32| -> u32 {
+            u32::from(s.read_physical_u8(desc + 2))
+                | (u32::from(s.read_physical_u8(desc + 3)) << 8)
+                | (u32::from(s.read_physical_u8(desc + 4)) << 16)
+                | (u32::from(s.read_physical_u8(desc + 7)) << 24)
+        };
+        let src = base_at(self, gdt + 0x10);
+        let dst = base_at(self, gdt + 0x18);
+        let bytes = usize::from(self.cpu.registers.ecx() as u16) * 2;
+        let data = self.read_guest_block(src, bytes);
+        self.write_guest_block(dst, &data);
+        self.set_eax_ah(0x00);
+        self.set_int_frame_carry(false);
+    }
+
+    /// Service INT 1Ah. AH=00h/01h read and set the BDA timer tick the ROM int08
+    /// maintains; AH=02h/04h read the RTC time and date as BCD (the documented
+    /// contract, converted from the binary CMOS). AH=03h/05h/06h/07h are accepted
+    /// as no-ops with CF clear, since the host drives the clock.
+    fn handle_int1a(&mut self) {
+        let ah = (self.cpu.registers.eax() as u16 >> 8) as u8;
+        match ah {
+            // AH=00h/01h read and set the BIOS tick count; neither reports status
+            // in CF, so leaving the carry flag untouched here is intentional.
+            0x00 => {
+                let ticks = self.read_guest_dword(0x46c);
+                let rollover = self.read_physical_u8(0x470);
+                let _ = self.memory.write_u8(0x470, 0);
+                self.set_eax_al(rollover);
+                self.set_cx((ticks >> 16) as u16);
+                self.set_dx(ticks as u16);
+            }
+            0x01 => {
+                let cx = self.cpu.registers.ecx() as u16;
+                let dx = self.cpu.registers.edx() as u16;
+                let _ = self.memory.write_u16(0x46c, dx);
+                let _ = self.memory.write_u16(0x46e, cx);
+                let _ = self.memory.write_u8(0x470, 0);
+            }
+            0x02 => {
+                let (_, _, _, _, hour, minute, second) = self.rtc.clock();
+                let cx = (u16::from(bin_to_bcd(hour)) << 8) | u16::from(bin_to_bcd(minute));
+                let dx = u16::from(bin_to_bcd(second)) << 8; // DL = 0 (no DST)
+                self.set_cx(cx);
+                self.set_dx(dx);
+                self.set_int_frame_carry(false);
+            }
+            0x04 => {
+                let (year, month, day, ..) = self.rtc.clock();
+                let century = bin_to_bcd((year / 100) as u8);
+                let yy = bin_to_bcd((year % 100) as u8);
+                let cx = (u16::from(century) << 8) | u16::from(yy);
+                let dx = (u16::from(bin_to_bcd(month)) << 8) | u16::from(bin_to_bcd(day));
+                self.set_cx(cx);
+                self.set_dx(dx);
+                self.set_int_frame_carry(false);
+            }
+            // Set time/date/alarm: the clock is host-driven, so accept and ignore.
+            0x03 | 0x05 | 0x06 | 0x07 => self.set_int_frame_carry(false),
+            _ => self.set_int_frame_carry(true),
         }
     }
 
@@ -1350,26 +1601,84 @@ impl Machine {
                     .map_or(0.0, |f| f.access_duration_secs(0, 0));
                 self.stall_for(secs);
                 self.set_eax_ah(0x00);
+                self.set_disk_status(0x00);
                 self.set_int_frame_carry(false);
+            }
+            // AH=01 get last disk status: AH=0, AL=BDA 0040:0041, CF if nonzero.
+            0x01 => {
+                let status = self.read_physical_u8(0x441);
+                self.set_eax_ah(0x00);
+                self.set_eax_al(status);
+                self.set_int_frame_carry(status != 0);
             }
             // AH=02 read sectors, AH=03 write sectors. AL = sector count, CH/CL
             // carry the cylinder and sector (CL bits 0-5 sector, bits 6-7 the
             // cylinder high bits), DH = head, DL = drive, ES:BX = buffer.
             0x02 | 0x03 => self.int13_transfer(ah, dl),
+            // AH=04 verify sectors: read without copying, report sectors checked.
+            0x04 => self.int13_verify(dl),
             // AH=08 read drive parameters. Report the mounted media geometry.
             0x08 => self.int13_drive_parameters(dl),
             // AH=15 read disk type. A floppy without a change line.
             0x15 => {
                 self.set_eax_ah(0x01);
+                self.set_disk_status(0x00);
                 self.set_int_frame_carry(false);
             }
-            // Unimplemented subfunctions succeed quietly rather than fault the
-            // guest. Real booters call a small fixed set; widen this if one needs
-            // a subfunction that must report failure.
+            // Genuinely unknown subfunctions report invalid-function, the way a
+            // real BIOS does, instead of a false success.
             _ => {
-                self.set_eax_ah(0x00);
-                self.set_int_frame_carry(false);
+                self.set_eax_ah(0x01);
+                self.set_disk_status(0x01);
+                self.set_int_frame_carry(true);
             }
+        }
+    }
+
+    /// Record the INT 13h result in BDA 0040:0041 (last disk status) so AH=01h can
+    /// report it. 0x00 is success; any other value is the error code.
+    fn set_disk_status(&mut self, status: u8) {
+        let _ = self.memory.write_u8(0x441, status);
+    }
+
+    /// AH=04h verify: confirm the requested sectors are readable without copying
+    /// them into the caller buffer. AL returns the count verified.
+    fn int13_verify(&mut self, dl: u8) {
+        if dl != 0x00 || self.floppy.is_none() {
+            self.set_eax_ah(0x80);
+            self.set_disk_status(0x80);
+            self.set_int_frame_carry(true);
+            return;
+        }
+        let ax = self.cpu.registers.eax() as u16;
+        let count = ax as u8;
+        let cx = self.cpu.registers.ecx() as u16;
+        let cl = cx as u8;
+        let ch = (cx >> 8) as u8;
+        let sector = cl & 0x3f;
+        let cyl = u16::from(ch) | (u16::from(cl & 0xc0) << 2);
+        let head = (self.cpu.registers.edx() as u16 >> 8) as u8;
+        let mut done = 0u8;
+        for i in 0..count {
+            let present = self
+                .floppy
+                .as_ref()
+                .and_then(|f| f.read_sector(cyl, head, sector + i))
+                .is_some();
+            if !present {
+                break;
+            }
+            done += 1;
+        }
+        self.set_eax_al(done);
+        if done == count {
+            self.set_eax_ah(0x00);
+            self.set_disk_status(0x00);
+            self.set_int_frame_carry(false);
+        } else {
+            self.set_eax_ah(0x04);
+            self.set_disk_status(0x04);
+            self.set_int_frame_carry(true);
         }
     }
 
@@ -1379,12 +1688,14 @@ impl Machine {
             // No media backs the request: report a timeout the way an empty
             // drive would.
             self.set_eax_ah(0x80);
+            self.set_disk_status(0x80);
             self.set_int_frame_carry(true);
             return;
         };
         // Only floppy A: is backed.
         if dl != 0x00 {
             self.set_eax_ah(0x80);
+            self.set_disk_status(0x80);
             self.set_int_frame_carry(true);
             return;
         }
@@ -1453,10 +1764,12 @@ impl Machine {
         self.set_eax_al(done);
         if done == count {
             self.set_eax_ah(0x00);
+            self.set_disk_status(0x00);
             self.set_int_frame_carry(false);
         } else {
             // Sector not found / read error.
             self.set_eax_ah(0x04);
+            self.set_disk_status(0x04);
             self.set_int_frame_carry(true);
         }
     }
@@ -1465,11 +1778,13 @@ impl Machine {
     fn int13_drive_parameters(&mut self, dl: u8) {
         let Some(geom) = self.floppy.as_ref().map(|f| f.geometry()) else {
             self.set_eax_ah(0x80);
+            self.set_disk_status(0x80);
             self.set_int_frame_carry(true);
             return;
         };
         if dl != 0x00 {
             self.set_eax_ah(0x80);
+            self.set_disk_status(0x80);
             self.set_int_frame_carry(true);
             return;
         }
@@ -1488,6 +1803,7 @@ impl Machine {
         let ebx = (self.cpu.registers.ebx() & !0xFF) | u32::from(geom.drive_type);
         self.cpu.registers.set_ebx(ebx);
         self.set_eax_ah(0x00);
+        self.set_disk_status(0x00);
         self.set_int_frame_carry(false);
     }
 
@@ -2593,6 +2909,7 @@ impl Machine {
                             0x12 => self.handle_int12(),
                             0x13 => self.handle_int13(),
                             0x15 => self.handle_int15(),
+                            0x1A => self.handle_int1a(),
                             0x33 => self.handle_int33(),
                             0x2F => {
                                 self.handle_int2f();
@@ -2912,7 +3229,7 @@ impl CpuBus for MachineBus<'_> {
         // revisit if an x87 #MF is added.
         if matches!(
             vector,
-            0x10 | 0x11 | 0x12 | 0x13 | 0x15 | 0x20 | 0x21 | 0x2F | 0x33
+            0x10 | 0x11 | 0x12 | 0x13 | 0x15 | 0x1A | 0x20 | 0x21 | 0x2F | 0x33
         ) {
             *self.pending_soft_int = Some(vector);
         }
@@ -3071,6 +3388,12 @@ fn serial_offset(port: u16) -> Option<usize> {
     }
 }
 
+/// Convert a binary value 0..=99 to packed BCD. Values above 99 saturate the
+/// high nibble, which is enough for the clock fields INT 1Ah returns.
+fn bin_to_bcd(n: u8) -> u8 {
+    ((n / 10) << 4) | (n % 10)
+}
+
 fn boot_sector_cpu() -> Cpu386 {
     let mut cpu = Cpu386::default();
     for segment in [
@@ -3091,10 +3414,11 @@ fn boot_sector_cpu() -> Cpu386 {
 
 /// BIOS equipment word reported by INT 11h (BDA 0040:0010). Bit 0 set with
 /// bits 7-6 clear means one floppy drive; bits 5-4 = 10b is the 80x25 color
-/// initial video mode. Bit 1 (80x87 coprocessor) stays clear: the Izarra 3000
-/// ships no 387, so software that probes the equipment word skips its FPU path.
-/// See RBIL INT 11h equipment bitfield (dev_docs/reference/rbil/INTERRUP.B).
-const BIOS_EQUIPMENT_WORD: u16 = 0x0021;
+/// initial video mode; bits 11-9 = 001b advertises one serial port (COM1 is
+/// emulated). Bit 1 (80x87 coprocessor) stays clear: the Izarra 3000 ships no
+/// 387, so software that probes the equipment word skips its FPU path. See RBIL
+/// INT 11h equipment bitfield (dev_docs/reference/rbil/INTERRUP.B).
+const BIOS_EQUIPMENT_WORD: u16 = 0x0221;
 
 /// Conventional memory size in KiB reported by INT 12h (BDA 0040:0013). A PC
 /// caps usable low memory at 640 KiB no matter how much RAM is installed; the
@@ -3113,7 +3437,7 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     // point at the ROM IRET so they survive a guest low-memory wipe. INT 33h is
     // the mouse driver and INT 2Fh is the ICDEX CD bridge: the same stub shape
     // the HLE handler returns through.
-    for vector in [0x10, 0x11, 0x12, 0x13, 0x15, 0x2F, 0x33] {
+    for vector in [0x10, 0x11, 0x12, 0x13, 0x15, 0x1A, 0x2F, 0x33] {
         let address = vector * 4;
         memory.write_u16(address, 0)?;
         memory.write_u16(address + 2, BIOS_ROM_IRET_SEG)?;
@@ -3128,6 +3452,11 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     // Seed the BDA words INT 11h and INT 12h hand back, like a real BIOS.
     memory.write_u16(0x410, BIOS_EQUIPMENT_WORD)?;
     memory.write_u16(0x413, BIOS_BASE_MEMORY_KIB)?;
+    // Seed the BDA video state to text 80x25 (mode 03h) like a real BIOS POST.
+    memory.write_u8(0x449, 0x03)?;
+    memory.write_u16(0x44a, 80)?;
+    memory.write_u8(0x484, 24)?;
+    memory.write_u16(0x463, 0x03d4)?;
     memory.write_u8(BIOS_IRET_STUB_ADDRESS, 0xcf)
 }
 
@@ -3475,6 +3804,31 @@ mod tests {
         assert_eq!(int16_read_after(&[0x1d, 0x1f, 0x9f, 0x9d]), 0x1f13);
     }
 
+    /// Same path as `int16_read_after`, but the program reads with AH=10h (the
+    /// enhanced read). Before the DOS keyboard ROM aliased AH=10h to the AH=00h
+    /// reader, this fell through the int16 dispatch and returned stale AX.
+    fn int16_enhanced_read_after(scancodes: &[u8]) -> u16 {
+        // mov ah,0x10; int 16h; mov [0x200],ax; int 20h
+        const PROG: [u8; 9] = [0xB4, 0x10, 0xCD, 0x16, 0xA3, 0x00, 0x02, 0xCD, 0x20];
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
+                .unwrap();
+        machine.inject_key_scancodes(scancodes);
+        machine.run_until_halt_or_cycles(3_000_000).unwrap();
+        read_u16(&mut machine, (u32::from(DOS_LOAD_SEGMENT) << 4) + 0x200)
+    }
+
+    #[test]
+    fn int16_enhanced_read_matches_plain_read() {
+        // AH=10h must hand a DOS program the same ring entry AH=00h does. Up
+        // arrow gives scancode 0x48 / ASCII 0, the editor-navigation case.
+        assert_eq!(int16_enhanced_read_after(&[0x48, 0xC8]), 0x4800);
+        assert_eq!(
+            int16_enhanced_read_after(&[0x48, 0xC8]),
+            int16_read_after(&[0x48, 0xC8]),
+        );
+    }
+
     #[test]
     fn io_port_reports_last_post_write() {
         // mov al,0x42; out 0x80,al; hlt
@@ -3590,6 +3944,23 @@ mod tests {
         assert!(machine.bus_trace().cycles().iter().any(|cycle| {
             cycle.kind == BusAccessKind::InterruptAcknowledge && cycle.address == 0x10
         }));
+    }
+
+    #[test]
+    fn int10_ah0f_reports_mode_after_set() {
+        // Set mode 13h, then AH=0Fh returns AL=mode, AH=columns.
+        let rom = rom_with_code(&[
+            0xB8, 0x13, 0x00, 0xCD, 0x10, // mov ax,0013h; int 10h (set mode 13h)
+            0xB4, 0x0F, 0xCD, 0x10, // mov ah,0Fh; int 10h (get mode)
+            0xF4,
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        let ax = machine.cpu().registers.eax() as u16;
+        assert_eq!(ax & 0xff, 0x13, "AL = current mode");
+        assert_eq!(ax >> 8, 40, "AH = column count for mode 13h");
     }
 
     #[test]
@@ -3788,6 +4159,8 @@ mod tests {
         assert_eq!(reason, StopReason::Halted);
         let ax = machine.cpu().registers.eax() as u16;
         assert_eq!(ax, BIOS_EQUIPMENT_WORD);
+        // Bits 11-9 = 001b: one serial port advertised for the emulated COM1.
+        assert_eq!((ax >> 9) & 0x07, 1, "one serial port advertised");
         // Bit 1 (80x87 coprocessor) stays clear: the Izarra 3000 has no FPU.
         assert_eq!(ax & 0x0002, 0, "no coprocessor advertised");
     }
@@ -3806,6 +4179,135 @@ mod tests {
         let ax = machine.cpu().registers.eax() as u16;
         assert_eq!(ax, BIOS_BASE_MEMORY_KIB);
         assert_eq!(ax, 640);
+    }
+
+    #[test]
+    fn int1a_ah00_reads_bda_tick() {
+        // Seed the BDA tick to 0x00012345, then INT 1Ah AH=00h returns CX:DX.
+        let rom = rom_with_code(&[
+            0xB4, 0x00, // mov ah, 0
+            0xCD, 0x1A, // int 1Ah
+            0xF4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        machine.write_physical_u8(0x46c, 0x45);
+        machine.write_physical_u8(0x46d, 0x23);
+        machine.write_physical_u8(0x46e, 0x01);
+        machine.write_physical_u8(0x46f, 0x00);
+        machine.write_physical_u8(0x470, 0x00); // no rollover
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        let cx = machine.cpu().registers.ecx() as u16;
+        let dx = machine.cpu().registers.edx() as u16;
+        assert_eq!(cx, 0x0001, "CX = high word of tick");
+        assert_eq!(dx, 0x2345, "DX = low word of tick");
+        assert_eq!(
+            machine.cpu().registers.eax() as u8,
+            0x00,
+            "AL = rollover count"
+        );
+    }
+
+    #[test]
+    fn int1a_ah02_ah04_return_bcd_clock() {
+        // AH=04h clobbers CX/DX, so the AH=02h time result must be stashed to
+        // memory before the date call overwrites it. Set DS=0, run AH=02h, store
+        // CX/DX into BIOS scratch at 0:0500h, then run AH=04h and HLT. The date
+        // result stays live in CX/DX; the time result is read back from scratch.
+        let rom = rom_with_code(&[
+            0x31, 0xC0, // xor ax, ax
+            0x8E, 0xD8, // mov ds, ax (DS = 0)
+            0xB4, 0x02, 0xCD, 0x1A, // int 1Ah AH=02h (time)
+            0x89, 0x0E, 0x00, 0x05, // mov [0500h], cx
+            0x89, 0x16, 0x02, 0x05, // mov [0502h], dx
+            0xB4, 0x04, 0xCD, 0x1A, // int 1Ah AH=04h (date)
+            0xF4,
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        machine.seed_rtc(2026, 6, 21, 1, 13, 45, 30); // helper forwards to rtc.seed
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        // After AH=04h: CH=century 0x20, CL=year 0x26, DH=month 0x06, DL=day 0x21.
+        let cx = machine.cpu().registers.ecx() as u16;
+        let dx = machine.cpu().registers.edx() as u16;
+        assert_eq!(cx, 0x2026);
+        assert_eq!(dx, 0x0621);
+        // AH=02h stashed time: CH=hour 0x13, CL=minute 0x45, DH=second 0x30, DL=0.
+        let time_cx = u16::from(machine.read_physical_u8(0x0500))
+            | (u16::from(machine.read_physical_u8(0x0501)) << 8);
+        let time_dx = u16::from(machine.read_physical_u8(0x0502))
+            | (u16::from(machine.read_physical_u8(0x0503)) << 8);
+        assert_eq!(time_cx, 0x1345, "CH=hour BCD, CL=minute BCD");
+        assert_eq!(time_dx, 0x3000, "DH=second BCD, DL=0");
+    }
+
+    #[test]
+    fn int15_ah87_block_move_across_1mb() {
+        // Build a GDT in low RAM with source = 0x20000, dest = 0x30000, move 4 words.
+        let rom = rom_with_code(&[
+            0xB4, 0x87, // mov ah,87h
+            0xB9, 0x04, 0x00, // mov cx,4 (words)
+            0xBE, 0x00, 0x10, // mov si,1000h (GDT offset)
+            0xCD, 0x15, 0xF4,
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        // ES = 0 so the GDT sits at linear 0x1000. Descriptors at +0x10 (src), +0x18 (dst).
+        let gdt = 0x1000u32;
+        let write_desc = |m: &mut Machine, at: u32, base: u32| {
+            m.write_physical_u8(at, 0xFF); // limit low
+            m.write_physical_u8(at + 1, 0xFF);
+            m.write_physical_u8(at + 2, base as u8); // base 0..7
+            m.write_physical_u8(at + 3, (base >> 8) as u8); // base 8..15
+            m.write_physical_u8(at + 4, (base >> 16) as u8); // base 16..23
+            m.write_physical_u8(at + 5, 0x93); // access
+            m.write_physical_u8(at + 6, 0x00);
+            m.write_physical_u8(at + 7, (base >> 24) as u8); // base 24..31
+        };
+        write_desc(&mut machine, gdt + 0x10, 0x20000);
+        write_desc(&mut machine, gdt + 0x18, 0x30000);
+        for i in 0..8u32 {
+            machine.write_physical_u8(0x20000 + i, 0xA0 + i as u8);
+        }
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        for i in 0..8u32 {
+            assert_eq!(machine.read_physical_u8(0x30000 + i), 0xA0 + i as u8);
+        }
+        assert_eq!(
+            (machine.cpu().registers.eax() as u16 >> 8) as u8,
+            0x00,
+            "AH=0 success"
+        );
+    }
+
+    #[test]
+    fn int15_ah86_wait_advances_guest_clock() {
+        let rom = rom_with_code(&[
+            0xB4, 0x86, 0xB9, 0x00, 0x00, // CX=0
+            0xBA, 0x40, 0x42, // DX=0x4240 -> with CX=0 that is 16960 us
+            0xCD, 0x15, 0xF4,
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        let before = machine.elapsed_clocks();
+        let reason = machine.run_until_halt_or_cycles(10_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        // CX:DX = 0x00004240 = 16960 microseconds. stall_for converts that to guest
+        // clocks at the active mode's rate, so the elapsed-clock jump must dwarf the
+        // handful of setup-instruction clocks. Require at least half the expected
+        // stall to leave margin for the rounding in stall_for.
+        let wait_secs = 16_960.0 / 1_000_000.0;
+        let expected_stall = (wait_secs * machine.active_mode().clock_hz() as f64) as u64;
+        let advanced = machine.elapsed_clocks() - before;
+        assert!(
+            advanced >= expected_stall / 2,
+            "AH=86h stall too small: advanced {advanced} clocks, expected ~{expected_stall}"
+        );
+        let flags = machine.cpu().registers.eflags;
+        assert_eq!(flags & 0x0001, 0, "CF clear after WAIT");
     }
 
     #[test]
@@ -5984,6 +6486,130 @@ mod tests {
         assert_eq!(reason, StopReason::Halted);
         // The first glyph (solid) loaded and renders as the foreground.
         assert_eq!(machine.video().render_text_row(0)[0], 15);
+    }
+
+    #[test]
+    fn int10_teletype_and_cursor() {
+        let rom = rom_with_code(&[
+            0xB8, 0x03, 0x00, 0xCD, 0x10, // set text mode 03h (homes cursor)
+            0xB4, 0x0E, 0xB0, b'H', 0xCD, 0x10, // AH=0Eh teletype 'H'
+            0xB4, 0x0E, 0xB0, b'i', 0xCD, 0x10, // AH=0Eh teletype 'i'
+            0xB4, 0x03, 0xB7, 0x00, 0xCD, 0x10, // AH=03h get cursor (page 0)
+            0xF4,
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        // 'H' then 'i' landed at row 0 cols 0,1; cursor now at row 0 col 2.
+        assert_eq!(machine.read_physical_u8(VGA_TEXT_BASE), b'H');
+        assert_eq!(machine.read_physical_u8(VGA_TEXT_BASE + 2), b'i');
+        let dx = machine.cpu().registers.edx() as u16;
+        assert_eq!(dx, 0x0002, "DH=row 0, DL=col 2");
+    }
+
+    #[test]
+    fn int10_scroll_window_up_blanks_bottom() {
+        // No mode set here: setting a text mode clears the framebuffer, which
+        // would wipe the marker the host seeds below before the scroll runs.
+        let rom = rom_with_code(&[
+            0xB8, 0x01, 0x06, // mov ax,0601h (AH=06h scroll up 1 line)
+            0xB7, 0x07, // mov bh,07h (fill attr)
+            0xB9, 0x00, 0x00, // mov cx,0000h (top-left 0,0)
+            0xBA, 0x4F, 0x18, // mov dx,184Fh (bottom-right row 24 col 79)
+            0xCD, 0x10, 0xF4,
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        // Put a non-space at row 1 col 0; after scroll-up by 1 it lands at row 0.
+        machine.write_physical_u8(VGA_TEXT_BASE + 80 * 2, b'X');
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(
+            machine.read_physical_u8(VGA_TEXT_BASE),
+            b'X',
+            "row 1 scrolled to row 0"
+        );
+        assert_eq!(
+            machine.read_physical_u8(VGA_TEXT_BASE + 24 * 80 * 2),
+            b' ',
+            "bottom row blanked"
+        );
+    }
+
+    #[test]
+    fn int10_scroll_window_down_blanks_top() {
+        // No mode set here: setting a text mode clears the framebuffer, which
+        // would wipe the marker the host seeds below before the scroll runs.
+        let rom = rom_with_code(&[
+            0xB8, 0x01, 0x07, // mov ax,0701h (AH=07h scroll down 1 line)
+            0xB7, 0x07, // mov bh,07h (fill attr)
+            0xB9, 0x00, 0x00, // mov cx,0000h (top-left 0,0)
+            0xBA, 0x4F, 0x18, // mov dx,184Fh (bottom-right row 24 col 79)
+            0xCD, 0x10, 0xF4,
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        // Put a non-space at row 0 col 0; after scroll-down by 1 it lands at row 1.
+        machine.write_physical_u8(VGA_TEXT_BASE, b'Y');
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(
+            machine.read_physical_u8(VGA_TEXT_BASE + 80 * 2),
+            b'Y',
+            "row 0 scrolled to row 1"
+        );
+        assert_eq!(
+            machine.read_physical_u8(VGA_TEXT_BASE),
+            b' ',
+            "top row blanked"
+        );
+    }
+
+    #[test]
+    fn int10_scroll_subwindow_up() {
+        // No mode set here: setting a text mode clears the framebuffer, which
+        // would wipe the marker the host seeds below before the scroll runs.
+        // CX = top-left, DX = bottom-right; for each, the high byte is the row
+        // and the low byte is the column: CX=(row<<8)|col, DX=(row<<8)|col.
+        let rom = rom_with_code(&[
+            0xB8, 0x01, 0x06, // mov ax,0601h (AH=06h scroll up 1 line)
+            0xB7, 0x07, // mov bh,07h (fill attr)
+            0xB9, 0x04, 0x01, // mov cx,0104h (top-left row 1 col 4)
+            0xBA, 0x0A, 0x03, // mov dx,030Ah (bottom-right row 3 col 10)
+            0xCD, 0x10, 0xF4,
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        // Marker inside the window at row 2 col 5; after scroll-up by 1 it lands
+        // at row 1 col 5.
+        machine.write_physical_u8(VGA_TEXT_BASE + ((2 * 80) + 5) * 2, b'W');
+        // Sentinels in cells outside the window (the framebuffer is otherwise
+        // pre-blanked with spaces, so seed distinct bytes to prove the scroll's
+        // row and column clamping never wrote here): row 0 col 0 is above the
+        // window, row 2 col 0 is left of the col-4 left edge.
+        machine.write_physical_u8(VGA_TEXT_BASE, b'A');
+        machine.write_physical_u8(VGA_TEXT_BASE + (2 * 80) * 2, b'B');
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(
+            machine.read_physical_u8(VGA_TEXT_BASE + (80 + 5) * 2),
+            b'W',
+            "row 2 col 5 scrolled to row 1 col 5"
+        );
+        // A cell above the window (row 0 col 0) is untouched.
+        assert_eq!(
+            machine.read_physical_u8(VGA_TEXT_BASE),
+            b'A',
+            "row 0 col 0 outside window left untouched"
+        );
+        // A cell to the left of the window (row 2 col 0, left edge is col 4) is
+        // untouched.
+        assert_eq!(
+            machine.read_physical_u8(VGA_TEXT_BASE + (2 * 80) * 2),
+            b'B',
+            "row 2 col 0 left of window left untouched"
+        );
     }
 
     #[test]
@@ -8361,6 +8987,27 @@ mod tests {
         );
         let flags = machine.cpu().registers.eflags;
         assert_eq!(flags & 0x0001, 0, "CF must be clear after a good read");
+    }
+
+    #[test]
+    fn int13_ah01_returns_last_status() {
+        // A failed read (drive B:, unbacked) sets the last status; AH=01h reads it back.
+        let rom = rom_with_code(&[
+            0xB4, 0x02, 0xB0, 0x01, // AH=02h read, AL=1 sector
+            0xB5, 0x00, 0xB1, 0x01, // CH=0 cyl, CL=1 sector
+            0xB6, 0x00, 0xB2, 0x01, // DH=0 head, DL=1 (drive B:, unbacked)
+            0xCD, 0x13, 0xB4, 0x01, 0xCD, 0x13, // AH=01h get last status
+            0xF4,
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        // Mount media in A: so handle_int13 runs; the read targets B:, which is unbacked.
+        machine.mount_floppy(vec![0u8; 737_280]).unwrap();
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        // Drive B: is unbacked: the transfer reported AH=0x80 (timeout); AH=01h echoes it in AL.
+        let al = machine.cpu().registers.eax() as u8;
+        assert_eq!(al, 0x80, "AL = last disk status");
     }
 
     #[test]

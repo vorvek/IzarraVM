@@ -192,10 +192,18 @@ int09:
 int16:
     cmp ah, 0x00
     je .read
+    cmp ah, 0x10        ; enhanced read -> same as AH=00h
+    je .read
     cmp ah, 0x01
+    je .peek
+    cmp ah, 0x11        ; enhanced peek -> same as AH=01h
     je .peek
     cmp ah, 0x02
     je .flags
+    cmp ah, 0x12        ; enhanced shift status -> same as AH=02h
+    je .flags
+    cmp ah, 0x05        ; keyboard buffer write
+    je .bufwrite
     iret
 .read:
     sti
@@ -242,6 +250,36 @@ int16:
     mov al, [KB_FLAGS]
     pop ds
     xor ah, ah
+    iret
+.bufwrite:
+    push ds
+    push bx
+    push cx
+    mov bx, BDA_SEG
+    mov ds, bx
+    ; kb_enqueue wants AX = AH:scancode AL:ascii. CH=scancode, CL=ascii already
+    ; match that order, so AX = CX.
+    mov ax, cx
+    ; Detect a full ring: compare the would-be tail to head before enqueuing.
+    mov bx, [KB_BUF_TAIL]
+    add bx, 2
+    cmp bx, KB_BUF_START + 32
+    jb .bw_nowrap
+    mov bx, KB_BUF_START
+.bw_nowrap:
+    cmp bx, [KB_BUF_HEAD]
+    je .bw_full
+    call kb_enqueue
+    pop cx
+    pop bx
+    pop ds
+    mov al, 0x00
+    iret
+.bw_full:
+    pop cx
+    pop bx
+    pop ds
+    mov al, 0x01
     iret
 
 ; BDA ring enqueue: AX = scancode:ascii. Enters with DS = BDA_SEG. Drops on full.
