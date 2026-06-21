@@ -59,9 +59,10 @@ impl Pic {
                     // P=1: the next data-port read is serviced as a poll.
                     self.poll_pending = true;
                 }
-                if value & 0x20 != 0 {
-                    // ESMM=1: load the special mask mode bit (SMM).
-                    self.special_mask = value & 0x40 != 0;
+                if value & 0x40 != 0 {
+                    // ESMM=1 (D6): the SMM bit (D5) then sets or resets special mask mode.
+                    // ESMM=1/SMM=0 reverts to normal mask mode; ESMM=0 leaves it unchanged.
+                    self.special_mask = value & 0x20 != 0;
                 }
             } else {
                 // OCW2: end of interrupt.
@@ -449,6 +450,20 @@ mod tests {
         // Special mask mode now lets the lower unmasked IR4 through.
         assert!(pic.interrupt_pending());
         assert_eq!(pic.acknowledge(), Some(0x0c)); // IR4 vector
+    }
+
+    #[test]
+    fn special_mask_mode_reverts_to_normal_on_esmm_clear() {
+        let mut pic = master_initialized();
+        pic.request(2);
+        pic.acknowledge(); // IR2 in service
+        pic.request(4);
+        pic.write_port(0x20, 0x68); // ESMM=1, SMM=1: enable special mask mode
+        pic.write_port(0x21, 0x04); // mask IR2 so SMM lets the lower IR4 through
+        assert!(pic.interrupt_pending());
+        // ESMM=1, SMM=0 reverts to normal mask mode: the in-service IR2 blocks IR4 again.
+        pic.write_port(0x20, 0x48);
+        assert!(!pic.interrupt_pending());
     }
 
     #[test]
