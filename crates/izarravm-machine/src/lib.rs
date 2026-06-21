@@ -3441,6 +3441,37 @@ mod tests {
         assert!(machine.irq1_pending(), "injecting a key requests IRQ1");
     }
 
+    /// Run a .COM that reads one key via INT 16h AH=00h and stores AX at DS:0x200,
+    /// after injecting `scancodes`. Returns the value INT 16h handed the program.
+    /// This is the editor's keyboard path end to end: 8042 -> IRQ1 -> INT 09h ISR
+    /// -> BDA ring -> INT 16h read.
+    fn int16_read_after(scancodes: &[u8]) -> u16 {
+        // mov ah,0; int 16h; mov [0x200],ax; int 20h
+        const PROG: [u8; 9] = [0xB4, 0x00, 0xCD, 0x16, 0xA3, 0x00, 0x02, 0xCD, 0x20];
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
+                .unwrap();
+        machine.inject_key_scancodes(scancodes);
+        machine.run_until_halt_or_cycles(3_000_000).unwrap();
+        read_u16(&mut machine, (u32::from(DOS_LOAD_SEGMENT) << 4) + 0x200)
+    }
+
+    #[test]
+    fn int16_returns_extended_scancode_for_up_arrow() {
+        // Up arrow is the bare scancode 0x48 (make) / 0xC8 (break); no 0xE0 prefix.
+        // The layout table has no ASCII for it, so INT 16h returns scancode 0x48
+        // with ASCII 0 -- the value a full-screen editor keys arrow navigation off.
+        assert_eq!(int16_read_after(&[0x48, 0xC8]), 0x4800);
+    }
+
+    #[test]
+    fn int16_emits_control_code_for_ctrl_s() {
+        // Ctrl down, S, S up, Ctrl up. Holding Ctrl turns S into the DC3 control
+        // code (0x13), the way a real BIOS does, so the editor reads Ctrl-S as a
+        // single ring entry (scancode 0x1f, ASCII 0x13) with no modifier polling.
+        assert_eq!(int16_read_after(&[0x1d, 0x1f, 0x9f, 0x9d]), 0x1f13);
+    }
+
     #[test]
     fn io_port_reports_last_post_write() {
         // mov al,0x42; out 0x80,al; hlt
