@@ -1329,6 +1329,7 @@ impl Machine {
     /// fit the 16-bit AX return; other subfunctions report CF set (unsupported).
     fn handle_int15(&mut self) {
         let ah = (self.cpu.registers.eax() as u16 >> 8) as u8;
+        let al = self.cpu.registers.eax() as u8;
         match ah {
             // AH=88h extended memory size in KiB (existing behavior).
             0x88 => {
@@ -1362,6 +1363,38 @@ impl Machine {
                 0x81 => self.int15_e801(true),
                 0x20 => self.int15_e820(),
                 _ => self.set_int_frame_carry(true),
+            },
+            // AH=24h A20 gate (later PS/2s). The 8042 output-port bit 1 is the
+            // single A20 state, shared with the fast-A20 port 0x92. The address
+            // space is already flat, so this tracks and reports state without
+            // masking. AL selects: 00 disable, 01 enable, 02 status, 03 support.
+            0x24 => match al {
+                0x00 => {
+                    self.keyboard.set_a20(false);
+                    self.set_eax_ah(0x00);
+                    self.set_int_frame_carry(false);
+                }
+                0x01 => {
+                    self.keyboard.set_a20(true);
+                    self.set_eax_ah(0x00);
+                    self.set_int_frame_carry(false);
+                }
+                0x02 => {
+                    self.set_eax_ah(0x00);
+                    self.set_eax_al(u8::from(self.keyboard.a20_enabled()));
+                    self.set_int_frame_carry(false);
+                }
+                0x03 => {
+                    self.set_eax_ah(0x00);
+                    // Bit 0 keyboard controller, bit 1 port 0x92: both supported.
+                    self.set_bx(0x0003);
+                    self.set_int_frame_carry(false);
+                }
+                // Undefined subfunction: report function-not-supported.
+                _ => {
+                    self.set_eax_ah(0x86);
+                    self.set_int_frame_carry(true);
+                }
             },
             // AH=90h device-wait / AH=91h device-post are OS hooks. With no OS hook
             // installed the BIOS returns "no wait performed" with CF clear, rather than
@@ -3476,6 +3509,11 @@ impl CpuBus for MachineBus<'_> {
             // Toka-DOS service status: 0 ok, 1 absent, other = error.
             return Ok(u32::from(self.toka_service_status));
         }
+        if port == 0x0092 {
+            // System control port A: bit 1 mirrors the A20 gate (the 8042 output
+            // port is the single source of truth). Other bits read 0.
+            return Ok(u32::from(u8::from(self.keyboard.a20_enabled()) << 1));
+        }
         if let Some(value) = self.rtc.read_port(port) {
             return Ok(u32::from(value));
         }
@@ -3520,6 +3558,12 @@ impl CpuBus for MachineBus<'_> {
         if port == 0x61 {
             self.speaker.write_control(value as u8);
             self.pit.set_gate(2, value & 1 != 0);
+            return Ok(());
+        }
+        if port == 0x0092 {
+            // Fast A20 gate: bit 1 drives A20, routed through the 8042 so every A20
+            // method agrees. Bit 0 (fast CPU reset) is not modeled.
+            self.keyboard.set_a20(value & 0x02 != 0);
             return Ok(());
         }
         if port == 0x00e1 {
@@ -3592,7 +3636,6 @@ impl Default for DevicePorts {
         for port in known_passive_ports() {
             ports.insert(port, 0xff);
         }
-        ports.insert(0x0092, 0x00);
         Self { ports }
     }
 }
@@ -3616,7 +3659,6 @@ fn known_passive_ports() -> impl Iterator<Item = u16> {
         0x0000..=0x000f, // DMA controller 1
         0x0062..=0x0063, // system control port B (speaker now owns 0x61)
         0x0080..=0x008f, // DMA page registers
-        0x0092..=0x0092, // system control port A / fast A20
         0x00c0..=0x00df, // DMA controller 2
         0x0220..=0x022f, // Sound Blaster base
         0x0388..=0x038b, // OPL2/OPL3 (intercepted by the chip, kept as a fallback)
@@ -4177,6 +4219,78 @@ mod tests {
             0x0378,
             "LPT1 base at 0040:0008"
         );
+    }
+
+    #[test]
+    fn int15_a20_status_enable_and_disable() {
+        let mut m = int15_machine(16);
+        // The 8042 output port defaults to A20 on, so status reads enabled.
+        m.cpu.registers.set_eax(0x2402);
+        m.handle_int15();
+        assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x00, "AH=0 success");
+        assert_eq!(m.cpu.registers.eax() as u8, 0x01, "A20 enabled by default");
+        // AH=2400h disable.
+        m.cpu.registers.set_eax(0x2400);
+        m.handle_int15();
+        assert!(
+            !m.keyboard.a20_enabled(),
+            "8042 A20 state off after disable"
+        );
+        m.cpu.registers.set_eax(0x2402);
+        m.handle_int15();
+        assert_eq!(m.cpu.registers.eax() as u8, 0x00, "status reports disabled");
+        // AH=2401h enable.
+        m.cpu.registers.set_eax(0x2401);
+        m.handle_int15();
+        assert!(m.keyboard.a20_enabled(), "8042 A20 state on after enable");
+    }
+
+    #[test]
+    fn int15_a20_query_support_reports_both_methods() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x2403);
+        m.handle_int15();
+        assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x00, "AH=0 success");
+        // Bit 0 keyboard controller, bit 1 port 0x92.
+        assert_eq!(
+            m.cpu.registers.ebx() as u16,
+            0x0003,
+            "both A20 methods supported"
+        );
+    }
+
+    #[test]
+    fn port_92_and_int15_a20_stay_coherent() {
+        let mut m = int15_machine(16);
+        // Disable A20 through the fast-A20 port; it reads back off.
+        {
+            let mut bus = m.make_bus();
+            bus.write_io(0x0092, BusWidth::Byte, 0x00).unwrap();
+            assert_eq!(
+                bus.read_io(0x0092, BusWidth::Byte).unwrap(),
+                0x00,
+                "port 0x92 A20 off"
+            );
+        }
+        assert!(!m.keyboard.a20_enabled(), "8042 agrees A20 is off");
+        m.cpu.registers.set_eax(0x2402);
+        m.handle_int15();
+        assert_eq!(
+            m.cpu.registers.eax() as u8,
+            0x00,
+            "INT 15h status agrees A20 is off"
+        );
+        // Enable through the port again; bit 1 reads back set.
+        {
+            let mut bus = m.make_bus();
+            bus.write_io(0x0092, BusWidth::Byte, 0x02).unwrap();
+            assert_eq!(
+                bus.read_io(0x0092, BusWidth::Byte).unwrap(),
+                0x02,
+                "port 0x92 A20 on"
+            );
+        }
+        assert!(m.keyboard.a20_enabled(), "8042 agrees A20 is on");
     }
 
     #[test]
