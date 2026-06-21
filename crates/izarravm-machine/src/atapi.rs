@@ -8,11 +8,12 @@
 //! command set so each is testable on its own.
 //!
 //! Command set implemented (per the SFF-8020i / MMC packet command set): TEST
-//! UNIT READY, REQUEST SENSE, INQUIRY, START/STOP UNIT, READ CAPACITY, READ
-//! TOC/PMA/ATIP, READ(10), READ(12), MODE SENSE(10), and the CD-Audio set PLAY
-//! AUDIO(10), PLAY AUDIO MSF, PAUSE/RESUME, STOP, READ SUB-CHANNEL. IDENTIFY
-//! PACKET DEVICE is answered by the register file directly since it is an ATA
-//! command, not a packet command.
+//! UNIT READY, REQUEST SENSE, INQUIRY (standard + EVPD pages 0x00/0x80/0x83),
+//! START/STOP UNIT, PREVENT/ALLOW MEDIUM REMOVAL, READ CAPACITY, SEEK, READ
+//! HEADER, READ TOC/PMA/ATIP, READ(10), READ(12), MODE SENSE(10), and the
+//! CD-Audio set PLAY AUDIO(10), PLAY AUDIO MSF, PAUSE/RESUME, STOP, READ
+//! SUB-CHANNEL. IDENTIFY PACKET DEVICE is answered by the register file directly
+//! since it is an ATA command, not a packet command.
 
 use crate::cdimage::{CdImage, DATA_SECTOR, lba_to_msf, msf_to_lba};
 
@@ -39,6 +40,31 @@ pub mod asc {
     pub const INVALID_FIELD_IN_CDB: (u8, u8) = (0x24, 0x00);
     pub const LBA_OUT_OF_RANGE: (u8, u8) = (0x21, 0x00);
     pub const MEDIUM_MAY_HAVE_CHANGED: (u8, u8) = (0x28, 0x00);
+    pub const MEDIUM_REMOVAL_PREVENTED: (u8, u8) = (0x53, 0x02);
+}
+
+/// ATA status BSY bit (0x80). Asserted while a command or packet is in flight
+/// and cleared when the result phase is ready. The IDE register file (`ide.rs`)
+/// runs each command synchronously, so the busy window is momentary; this device
+/// models the bit so the register file can publish it on the status port.
+// ponytail: ide.rs owns the status port and is out of scope for this module, so
+// this const and the interrupt-reason API below have no in-crate consumer yet.
+#[allow(dead_code)]
+pub const BSY: u8 = 0x80;
+
+/// The ATAPI Interrupt Reason register is the sector-count register, reinterpreted
+/// during a packet transfer: bit0 = C/D (1 = command/CDB phase, 0 = data phase),
+/// bit1 = I/O (1 = transfer to host, 0 = transfer from host). The three states a
+/// packet command moves through map to three byte values.
+pub mod interrupt_reason {
+    /// Awaiting the command packet (CDB): C/D=1, I/O=0.
+    // ponytail: set by arm_packet, which ide.rs would call; no lib consumer yet.
+    #[allow(dead_code)]
+    pub const AWAIT_PACKET: u8 = 0x01;
+    /// Data-in armed (device-to-host): C/D=0, I/O=1.
+    pub const DATA_IN: u8 = 0x02;
+    /// Command complete: C/D=1, I/O=1.
+    pub const COMMAND_COMPLETE: u8 = 0x03;
 }
 
 /// Outcome of interpreting one CDB.
@@ -79,9 +105,23 @@ pub struct AtapiDevice {
     sense_key: u8,
     asc: u8,
     ascq: u8,
+    /// Failing LBA latched for an LBA-out-of-range error, surfaced by REQUEST
+    /// SENSE in the INFORMATION field with the VALID bit set.
+    sense_information: Option<u32>,
     /// Set on a fresh mount so the first TEST UNIT READY reports UNIT ATTENTION
     /// (medium changed), as a real drive does after a disc swap.
     media_changed: bool,
+    /// Latched by PREVENT/ALLOW MEDIUM REMOVAL (0x1E). While true, START STOP UNIT
+    /// refuses to eject the tray.
+    prevent_removal: bool,
+    /// START STOP UNIT spin state. Cosmetic: the model serves data regardless, but
+    /// drivers that stop then start the unit see the flag flip.
+    started: bool,
+    /// The interrupt-reason byte (C/D, I/O) for the current packet phase. The IDE
+    /// register file publishes this on the sector-count port. ponytail: the
+    /// register file owns the actual port; this is the device-side source of truth
+    /// the wiring would read.
+    interrupt_reason: u8,
 }
 
 impl AtapiDevice {
@@ -121,6 +161,36 @@ impl AtapiDevice {
         self.play
     }
 
+    // ponytail: the four queries below feed ide.rs (status/sector-count ports),
+    // which is out of scope for this module, so they have no in-crate caller yet.
+    /// Whether PREVENT/ALLOW MEDIUM REMOVAL currently locks the tray.
+    #[allow(dead_code)]
+    pub fn removal_prevented(&self) -> bool {
+        self.prevent_removal
+    }
+
+    /// Whether START STOP UNIT has the unit spun up.
+    #[allow(dead_code)]
+    pub fn started(&self) -> bool {
+        self.started
+    }
+
+    /// The interrupt-reason (C/D, I/O) byte for the phase the last command left
+    /// the device in. The IDE register file reads this to drive the sector-count
+    /// port. Awaiting a packet is signalled by [`Self::arm_packet`].
+    #[allow(dead_code)]
+    pub fn interrupt_reason(&self) -> u8 {
+        self.interrupt_reason
+    }
+
+    /// Mark the device as awaiting the command packet (CDB write phase). Sets the
+    /// interrupt reason to C/D=1, I/O=0. Called by the register file when the host
+    /// issues the ATA PACKET command, before the CDB arrives.
+    #[allow(dead_code)]
+    pub fn arm_packet(&mut self) {
+        self.interrupt_reason = interrupt_reason::AWAIT_PACKET;
+    }
+
     fn set_sense(&mut self, key: u8, asc: u8, ascq: u8) {
         self.sense_key = key;
         self.asc = asc;
@@ -130,6 +200,13 @@ impl AtapiDevice {
     fn fail(&mut self, key: u8, code: (u8, u8)) -> CmdResult {
         self.set_sense(key, code.0, code.1);
         CmdResult::Error
+    }
+
+    /// Latch a failing LBA alongside a sense condition so REQUEST SENSE can report
+    /// it in the INFORMATION field with the VALID bit set.
+    fn fail_at_lba(&mut self, key: u8, code: (u8, u8), lba: u32) -> CmdResult {
+        self.sense_information = Some(lba);
+        self.fail(key, code)
     }
 
     /// Advance audio playback by `frames` Red Book frames, stopping at the end
@@ -173,16 +250,18 @@ impl AtapiDevice {
     /// latched sense). `alloc_len` caps the returned buffer the way the ATA byte
     /// count limit register does on hardware; callers truncate to it.
     pub fn execute(&mut self, cdb: &[u8; 12]) -> CmdResult {
-        match cdb[0] {
+        let result = match cdb[0] {
             0x00 => self.test_unit_ready(),
             0x03 => self.request_sense(cdb),
             0x12 => self.inquiry(cdb),
             0x1B => self.start_stop_unit(cdb),
-            0x1E => CmdResult::Data(Vec::new()), // PREVENT/ALLOW MEDIUM REMOVAL: accept
+            0x1E => self.prevent_allow_removal(cdb),
             0x25 => self.read_capacity(),
             0x28 => self.read10(cdb),
+            0x2B => self.seek(cdb),
             0x42 => self.read_subchannel(cdb),
             0x43 => self.read_toc(cdb),
+            0x44 => self.read_header(cdb),
             0x45 => self.play_audio10(cdb),
             0x47 => self.play_audio_msf(cdb),
             0x4B => self.pause_resume(cdb),
@@ -191,7 +270,17 @@ impl AtapiDevice {
             0xA8 => self.read12(cdb),
             0xBD => self.mechanism_status(cdb),
             _ => self.fail(sense_key::ILLEGAL_REQUEST, asc::INVALID_COMMAND),
-        }
+        };
+        // Reflect the resulting transfer phase in the interrupt reason: a data-in
+        // buffer leaves the device armed for the data phase, while a no-data
+        // success and any error land on command-complete (C/D=1, I/O=1). The IDE
+        // register file flips DATA_IN back to COMMAND_COMPLETE once the buffer
+        // drains; this device exposes the entry value.
+        self.interrupt_reason = match &result {
+            CmdResult::Data(buf) if !buf.is_empty() => interrupt_reason::DATA_IN,
+            _ => interrupt_reason::COMMAND_COMPLETE,
+        };
+        result
     }
 
     fn test_unit_ready(&mut self) -> CmdResult {
@@ -209,7 +298,13 @@ impl AtapiDevice {
         // Fixed-format sense data (18 bytes), SPC.
         let alloc = cdb[4] as usize;
         let mut buf = vec![0u8; 18];
-        buf[0] = 0x70; // current error, fixed format, valid bit clear
+        buf[0] = 0x70; // current error, fixed format
+        // When a failing LBA was latched (LBA out of range), set the VALID bit
+        // (byte 0 bit 7) and place the LBA in the INFORMATION field (bytes 3-6).
+        if let Some(lba) = self.sense_information {
+            buf[0] |= 0x80; // VALID
+            buf[3..7].copy_from_slice(&lba.to_be_bytes());
+        }
         buf[2] = self.sense_key & 0x0F;
         buf[7] = 10; // additional sense length (bytes beyond index 7)
         buf[12] = self.asc;
@@ -220,11 +315,21 @@ impl AtapiDevice {
             asc::NO_ADDITIONAL.0,
             asc::NO_ADDITIONAL.1,
         );
+        self.sense_information = None;
         truncate(buf, alloc)
     }
 
     fn inquiry(&mut self, cdb: &[u8; 12]) -> CmdResult {
         let alloc = cdb[4] as usize;
+        let evpd = cdb[1] & 0x01 != 0;
+        let page = cdb[2];
+        if evpd {
+            return self.inquiry_vpd(page, alloc);
+        }
+        // A non-EVPD request with a nonzero page code is illegal.
+        if page != 0 {
+            return self.fail(sense_key::ILLEGAL_REQUEST, asc::INVALID_FIELD_IN_CDB);
+        }
         let mut buf = vec![0u8; 36];
         buf[0] = 0x05; // peripheral device type 5 = CD-ROM
         buf[1] = 0x80; // RMB: removable medium
@@ -237,10 +342,84 @@ impl AtapiDevice {
         truncate(buf, alloc)
     }
 
+    /// INQUIRY with EVPD set: a vital product data page. Page 0x00 is the supported
+    /// page list, 0x80 the unit serial number; any other page is an illegal field.
+    fn inquiry_vpd(&mut self, page: u8, alloc: usize) -> CmdResult {
+        const SERIAL: &str = "IZARRA-CD-0001";
+        match page {
+            0x00 => {
+                // Supported VPD pages: header (4 bytes) then the page-code list.
+                let pages = [0x00u8, 0x80, 0x83];
+                let mut buf = vec![0u8; 4];
+                buf[0] = 0x05; // peripheral device type
+                buf[1] = 0x00; // page code
+                buf[3] = pages.len() as u8; // page length
+                buf.extend_from_slice(&pages);
+                truncate(buf, alloc)
+            }
+            0x80 => {
+                // Unit serial number page.
+                let serial = SERIAL.as_bytes();
+                let mut buf = vec![0u8; 4];
+                buf[0] = 0x05;
+                buf[1] = 0x80;
+                buf[3] = serial.len() as u8;
+                buf.extend_from_slice(serial);
+                truncate(buf, alloc)
+            }
+            0x83 => {
+                // Device identification: a single ASCII (codeset 2) identifier
+                // carrying the serial, the minimum a probe expects from page 0x83.
+                let serial = SERIAL.as_bytes();
+                let mut desc = vec![0u8; 4];
+                desc[0] = 0x02; // ASCII codeset, vendor-specific id type
+                desc[3] = serial.len() as u8;
+                desc.extend_from_slice(serial);
+                let mut buf = vec![0u8; 4];
+                buf[0] = 0x05;
+                buf[1] = 0x83;
+                let len = desc.len() as u16;
+                buf[2..4].copy_from_slice(&len.to_be_bytes());
+                buf.extend_from_slice(&desc);
+                truncate(buf, alloc)
+            }
+            _ => self.fail(sense_key::ILLEGAL_REQUEST, asc::INVALID_FIELD_IN_CDB),
+        }
+    }
+
+    /// PREVENT/ALLOW MEDIUM REMOVAL (0x1E). Byte 4 bit 0 latches the prevent flag,
+    /// locking the tray against an eject. NOT READY when the drive is empty.
+    fn prevent_allow_removal(&mut self, cdb: &[u8; 12]) -> CmdResult {
+        if self.image.is_none() {
+            return self.fail(sense_key::NOT_READY, asc::NOT_READY_NO_MEDIUM);
+        }
+        self.prevent_removal = cdb[4] & 0x01 != 0;
+        CmdResult::Data(Vec::new())
+    }
+
+    /// START STOP UNIT (0x1B). Byte 4: LoEj (bit 1) requests a tray eject, Start
+    /// (bit 0) spins the unit up or down. LoEj with Start clear ejects, but only
+    /// when removal is not prevented; otherwise CHECK CONDITION with medium-removal
+    /// prevented. ponytail: the GUI owns the host file, so an eject-on-command only
+    /// marks the tray state, it does not close the backing image.
     fn start_stop_unit(&mut self, cdb: &[u8; 12]) -> CmdResult {
-        // LoEj (bit 1) + Start (bit 0) of byte 4. Eject is accepted but does not
-        // detach the host image (the GUI owns the media); spin-up is a no-op.
-        let _ = cdb[4];
+        let loej = cdb[4] & 0x02 != 0;
+        let start = cdb[4] & 0x01 != 0;
+        if loej && !start {
+            // Eject request.
+            if self.prevent_removal {
+                return self.fail(sense_key::ILLEGAL_REQUEST, asc::MEDIUM_REMOVAL_PREVENTED);
+            }
+            self.eject();
+            return CmdResult::Data(Vec::new());
+        }
+        if loej && start {
+            // Load (close tray): nothing host-side to load, accept.
+            self.started = true;
+            return CmdResult::Data(Vec::new());
+        }
+        // No eject: Start bit flips the spin state.
+        self.started = start;
         CmdResult::Data(Vec::new())
     }
 
@@ -268,6 +447,46 @@ impl AtapiDevice {
         self.read_sectors(lba, count)
     }
 
+    /// SEEK (0x2B). LBA in bytes 2-5 big-endian, no data phase. Validates the LBA
+    /// against the disc capacity and reports NOT READY when empty. A successful
+    /// seek returns an empty data buffer; the model has no head to move.
+    fn seek(&mut self, cdb: &[u8; 12]) -> CmdResult {
+        let lba = u32::from_be_bytes([cdb[2], cdb[3], cdb[4], cdb[5]]);
+        let Some(image) = &self.image else {
+            return self.fail(sense_key::NOT_READY, asc::NOT_READY_NO_MEDIUM);
+        };
+        if lba >= image.total_sectors() {
+            return self.fail_at_lba(sense_key::ILLEGAL_REQUEST, asc::LBA_OUT_OF_RANGE, lba);
+        }
+        CmdResult::Data(Vec::new())
+    }
+
+    /// READ HEADER (0x44). Bytes 2-5 hold the LBA; byte 1 bit 1 selects an MSF
+    /// address over LBA. Returns a 4-byte header followed by the 4-byte address:
+    /// the data-mode byte (0x01 for a MODE1 data sector, 0x00 for an audio or hole)
+    /// then three reserved bytes, then the requested address. ponytail: the model
+    /// does not synthesize the full CD sub-header, just the mode and address a
+    /// driver probes.
+    fn read_header(&mut self, cdb: &[u8; 12]) -> CmdResult {
+        let msf = cdb[1] & 0x02 != 0;
+        let lba = u32::from_be_bytes([cdb[2], cdb[3], cdb[4], cdb[5]]);
+        let alloc = u16::from_be_bytes([cdb[7], cdb[8]]) as usize;
+        let Some(image) = &self.image else {
+            return self.fail(sense_key::NOT_READY, asc::NOT_READY_NO_MEDIUM);
+        };
+        if lba >= image.total_sectors() {
+            return self.fail_at_lba(sense_key::ILLEGAL_REQUEST, asc::LBA_OUT_OF_RANGE, lba);
+        }
+        let data_mode = match image.track_at_lba(lba) {
+            Some(t) if !t.mode.is_audio() => 0x01,
+            _ => 0x00,
+        };
+        let mut buf = vec![0u8; 8];
+        buf[0] = data_mode;
+        put_addr(&mut buf[4..8], lba, msf);
+        truncate(buf, alloc)
+    }
+
     fn read_sectors(&mut self, lba: u32, count: u32) -> CmdResult {
         let Some(image) = &self.image else {
             return self.fail(sense_key::NOT_READY, asc::NOT_READY_NO_MEDIUM);
@@ -277,7 +496,7 @@ impl AtapiDevice {
         }
         let end = lba.saturating_add(count);
         if end > image.total_sectors() {
-            return self.fail(sense_key::ILLEGAL_REQUEST, asc::LBA_OUT_OF_RANGE);
+            return self.fail_at_lba(sense_key::ILLEGAL_REQUEST, asc::LBA_OUT_OF_RANGE, lba);
         }
         let mut buf = Vec::with_capacity(count as usize * DATA_SECTOR);
         for l in lba..end {
@@ -729,5 +948,263 @@ mod tests {
         assert!(matches!(dev.execute(&cdb(0xFF)), CmdResult::Error));
         assert_eq!(dev.sense_key, sense_key::ILLEGAL_REQUEST);
         assert_eq!(dev.asc, asc::INVALID_COMMAND.0);
+    }
+
+    // Slice A: interrupt reason (C/D, I/O) + BSY const.
+
+    #[test]
+    fn arm_packet_sets_await_packet_reason() {
+        let mut dev = AtapiDevice::new();
+        dev.arm_packet();
+        assert_eq!(dev.interrupt_reason(), interrupt_reason::AWAIT_PACKET);
+        assert_eq!(interrupt_reason::AWAIT_PACKET, 0x01); // C/D=1, I/O=0
+    }
+
+    #[test]
+    fn data_in_command_leaves_data_in_reason() {
+        let mut dev = AtapiDevice::new();
+        dev.insert(data_disc(8));
+        let _ = dev.execute(&cdb(0x00)); // clear unit attention
+        let mut c = cdb(0x28); // READ(10), returns a sector
+        c[5] = 0;
+        c[8] = 1;
+        let _ = dev.execute(&c);
+        assert_eq!(dev.interrupt_reason(), interrupt_reason::DATA_IN);
+        assert_eq!(interrupt_reason::DATA_IN, 0x02); // C/D=0, I/O=1
+    }
+
+    #[test]
+    fn no_data_command_lands_on_command_complete() {
+        let mut dev = AtapiDevice::new();
+        dev.insert(data_disc(2));
+        let _ = dev.execute(&cdb(0x00)); // clear unit attention
+        let _ = dev.execute(&cdb(0x00)); // TEST UNIT READY, no data
+        assert_eq!(dev.interrupt_reason(), interrupt_reason::COMMAND_COMPLETE);
+        assert_eq!(interrupt_reason::COMMAND_COMPLETE, 0x03); // C/D=1, I/O=1
+    }
+
+    #[test]
+    fn error_lands_on_command_complete_reason() {
+        let mut dev = AtapiDevice::new();
+        // No medium: TEST UNIT READY errors.
+        assert!(matches!(dev.execute(&cdb(0x00)), CmdResult::Error));
+        assert_eq!(dev.interrupt_reason(), interrupt_reason::COMMAND_COMPLETE);
+    }
+
+    #[test]
+    fn bsy_const_is_the_high_bit() {
+        assert_eq!(BSY, 0x80);
+    }
+
+    // Slice B: START STOP UNIT (0x1B) + PREVENT/ALLOW (0x1E).
+
+    #[test]
+    fn prevent_allow_latches_the_flag() {
+        let mut dev = AtapiDevice::new();
+        dev.insert(data_disc(2));
+        let mut c = cdb(0x1E);
+        c[4] = 0x01; // prevent
+        assert!(matches!(dev.execute(&c), CmdResult::Data(_)));
+        assert!(dev.removal_prevented());
+        c[4] = 0x00; // allow
+        let _ = dev.execute(&c);
+        assert!(!dev.removal_prevented());
+    }
+
+    #[test]
+    fn prevent_allow_not_ready_when_empty() {
+        let mut dev = AtapiDevice::new();
+        assert!(matches!(dev.execute(&cdb(0x1E)), CmdResult::Error));
+        assert_eq!(dev.sense_key, sense_key::NOT_READY);
+    }
+
+    #[test]
+    fn start_stop_eject_clears_the_disc() {
+        let mut dev = AtapiDevice::new();
+        dev.insert(data_disc(2));
+        let mut c = cdb(0x1B);
+        c[4] = 0x02; // LoEj=1, Start=0: eject
+        assert!(matches!(dev.execute(&c), CmdResult::Data(_)));
+        assert!(!dev.is_loaded());
+    }
+
+    #[test]
+    fn start_stop_eject_blocked_when_removal_prevented() {
+        let mut dev = AtapiDevice::new();
+        dev.insert(data_disc(2));
+        let mut prevent = cdb(0x1E);
+        prevent[4] = 0x01;
+        let _ = dev.execute(&prevent);
+        let mut eject = cdb(0x1B);
+        eject[4] = 0x02; // eject
+        assert!(matches!(dev.execute(&eject), CmdResult::Error));
+        assert_eq!(dev.sense_key, sense_key::ILLEGAL_REQUEST);
+        assert_eq!((dev.asc, dev.ascq), asc::MEDIUM_REMOVAL_PREVENTED);
+        assert!(dev.is_loaded()); // still mounted
+    }
+
+    #[test]
+    fn start_stop_flips_started_flag() {
+        let mut dev = AtapiDevice::new();
+        dev.insert(data_disc(2));
+        let mut start = cdb(0x1B);
+        start[4] = 0x01; // Start=1
+        let _ = dev.execute(&start);
+        assert!(dev.started());
+        let mut stop = cdb(0x1B);
+        stop[4] = 0x00; // Start=0, no eject
+        let _ = dev.execute(&stop);
+        assert!(!dev.started());
+        assert!(dev.is_loaded()); // a plain stop does not eject
+    }
+
+    // Slice C: SEEK (0x2B).
+
+    #[test]
+    fn seek_in_range_succeeds_with_no_data() {
+        let mut dev = AtapiDevice::new();
+        dev.insert(data_disc(8));
+        let mut c = cdb(0x2B);
+        c[5] = 4; // LBA 4, in range
+        let buf = data(dev.execute(&c));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn seek_past_end_is_lba_out_of_range() {
+        let mut dev = AtapiDevice::new();
+        dev.insert(data_disc(4));
+        let mut c = cdb(0x2B);
+        c[5] = 4; // LBA 4 on a 4-sector disc
+        assert!(matches!(dev.execute(&c), CmdResult::Error));
+        assert_eq!(dev.sense_key, sense_key::ILLEGAL_REQUEST);
+        assert_eq!(dev.asc, asc::LBA_OUT_OF_RANGE.0);
+    }
+
+    #[test]
+    fn seek_not_ready_when_empty() {
+        let mut dev = AtapiDevice::new();
+        assert!(matches!(dev.execute(&cdb(0x2B)), CmdResult::Error));
+        assert_eq!(dev.sense_key, sense_key::NOT_READY);
+    }
+
+    // Slice D: REQUEST SENSE info field, INQUIRY EVPD, READ HEADER.
+
+    #[test]
+    fn request_sense_carries_failing_lba_with_valid_bit() {
+        let mut dev = AtapiDevice::new();
+        dev.insert(data_disc(4));
+        let _ = dev.execute(&cdb(0x00)); // clear unit attention
+        // SEEK past the end latches the failing LBA.
+        let mut seek = cdb(0x2B);
+        seek[5] = 7;
+        assert!(matches!(dev.execute(&seek), CmdResult::Error));
+        let mut c = cdb(0x03);
+        c[4] = 18;
+        let buf = data(dev.execute(&c));
+        assert_eq!(buf[0] & 0x80, 0x80); // VALID bit
+        let info = u32::from_be_bytes([buf[3], buf[4], buf[5], buf[6]]);
+        assert_eq!(info, 7);
+        // A clean error (no LBA) leaves the VALID bit clear next time.
+        let _ = dev.execute(&cdb(0x00)); // ready, no latch
+        let buf2 = data(dev.execute(&c));
+        assert_eq!(buf2[0] & 0x80, 0x00);
+    }
+
+    #[test]
+    fn inquiry_evpd_supported_pages() {
+        let mut dev = AtapiDevice::new();
+        dev.insert(data_disc(2));
+        let mut c = cdb(0x12);
+        c[1] = 0x01; // EVPD
+        c[2] = 0x00; // supported pages
+        c[4] = 32;
+        let buf = data(dev.execute(&c));
+        assert_eq!(buf[1], 0x00); // page code
+        let len = buf[3] as usize;
+        let pages = &buf[4..4 + len];
+        assert!(pages.contains(&0x00));
+        assert!(pages.contains(&0x80));
+        assert!(pages.contains(&0x83));
+    }
+
+    #[test]
+    fn inquiry_evpd_unit_serial() {
+        let mut dev = AtapiDevice::new();
+        dev.insert(data_disc(2));
+        let mut c = cdb(0x12);
+        c[1] = 0x01; // EVPD
+        c[2] = 0x80; // unit serial
+        c[4] = 64;
+        let buf = data(dev.execute(&c));
+        assert_eq!(buf[1], 0x80);
+        let len = buf[3] as usize;
+        let serial = &buf[4..4 + len];
+        assert_eq!(serial, b"IZARRA-CD-0001");
+    }
+
+    #[test]
+    fn inquiry_evpd_unknown_page_is_illegal() {
+        let mut dev = AtapiDevice::new();
+        dev.insert(data_disc(2));
+        let mut c = cdb(0x12);
+        c[1] = 0x01; // EVPD
+        c[2] = 0x55; // unsupported page
+        c[4] = 32;
+        assert!(matches!(dev.execute(&c), CmdResult::Error));
+        assert_eq!(dev.sense_key, sense_key::ILLEGAL_REQUEST);
+    }
+
+    #[test]
+    fn inquiry_nonzero_page_without_evpd_is_illegal() {
+        let mut dev = AtapiDevice::new();
+        dev.insert(data_disc(2));
+        let mut c = cdb(0x12);
+        c[2] = 0x80; // page code without EVPD
+        c[4] = 36;
+        assert!(matches!(dev.execute(&c), CmdResult::Error));
+        assert_eq!(dev.sense_key, sense_key::ILLEGAL_REQUEST);
+    }
+
+    #[test]
+    fn read_header_reports_data_mode_and_address() {
+        let mut dev = AtapiDevice::new();
+        dev.insert(data_disc(8));
+        let _ = dev.execute(&cdb(0x00)); // clear unit attention
+        let mut c = cdb(0x44);
+        c[5] = 3; // LBA 3
+        c[8] = 8; // allocation
+        let buf = data(dev.execute(&c));
+        assert_eq!(buf.len(), 8);
+        assert_eq!(buf[0], 0x01); // MODE1 data
+        let lba = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        assert_eq!(lba, 3);
+    }
+
+    #[test]
+    fn read_header_msf_address() {
+        let mut dev = AtapiDevice::new();
+        dev.insert(data_disc(8));
+        let _ = dev.execute(&cdb(0x00));
+        let mut c = cdb(0x44);
+        c[1] = 0x02; // MSF
+        c[5] = 0; // LBA 0 -> 00:02:00 with lead-in
+        c[8] = 8;
+        let buf = data(dev.execute(&c));
+        // Byte 4 reserved (0), then M, S, F.
+        assert_eq!((buf[5], buf[6], buf[7]), (0, 2, 0));
+    }
+
+    #[test]
+    fn read_header_past_end_is_out_of_range() {
+        let mut dev = AtapiDevice::new();
+        dev.insert(data_disc(4));
+        let _ = dev.execute(&cdb(0x00));
+        let mut c = cdb(0x44);
+        c[5] = 9;
+        c[8] = 8;
+        assert!(matches!(dev.execute(&c), CmdResult::Error));
+        assert_eq!(dev.sense_key, sense_key::ILLEGAL_REQUEST);
+        assert_eq!(dev.asc, asc::LBA_OUT_OF_RANGE.0);
     }
 }
