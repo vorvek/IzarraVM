@@ -22,6 +22,8 @@ int t_getline(char *out, int max);
 /* Screen control via INT 10h. */
 void t_setmode3(void);            /* 80x25 text, mode 03h (also clears)       */
 void t_cls(void);                 /* clear the screen                         */
+/* Update one text cell only when its character or attribute changed. */
+void t_putcell(int row, int col, char ch, unsigned char attr);
 
 /* The command tail from the PSP (PSP:0x80), copied and NUL-terminated, with the
  * leading length byte and the trailing CR dropped. Includes the leading blank

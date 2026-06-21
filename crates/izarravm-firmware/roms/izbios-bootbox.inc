@@ -331,6 +331,24 @@ bx2_draw:
     call bx2_draw_buttons
 
     ; Footer hints.
+    call bx2_draw_hints
+
+%if BMX_MOUSE
+    call bx2_cursor_save            ; save the background under the cursor
+    call bx2_cursor_draw            ; then draw the cursor on top of the fresh frame
+%endif
+    ret
+
+; bx2_draw_hints: restore the two footer hint lines after a transient note.
+bx2_draw_hints:
+    push cs
+    pop ds
+    mov di, BX_TITLE_X
+    mov si, BX_HINT1_Y
+    mov cx, 304
+    mov dx, 18
+    mov bl, COLOR_BG
+    call gfx_fill_rect
     push cs
     pop ds
     mov si, bx_str_hint1
@@ -345,11 +363,6 @@ bx2_draw:
     mov bl, BX_C_HINT
     mov bh, COLOR_BG
     call gfx_text
-
-%if BMX_MOUSE
-    call bx2_cursor_save            ; save the background under the cursor
-    call bx2_cursor_draw            ; then draw the cursor on top of the fresh frame
-%endif
     ret
 
 ; ---------------------------------------------------------------------------
@@ -464,6 +477,14 @@ bx2_draw_dev_row:
     ; Off-bar text sits on the white field; greyed when the device is unavailable.
     xor cx, cx
     mov ds, cx
+    mov di, BX_LP_BAND_X
+    mov si, [BMX_DROWY]
+    mov cx, BX_LP_BAND_W
+    mov dx, BX_ROW_H
+    mov bl, COLOR_BG
+    call gfx_fill_rect
+    xor cx, cx
+    mov ds, cx
     mov byte [BMX_DBG], COLOR_BG
     mov al, [BMX_DI]
     call bx2_dev_avail              ; reads BMX_AVAIL; AL=1 available, 0 not
@@ -552,6 +573,14 @@ bx2_draw_spd_row:
     mov byte [BMX_DBG], BX_C_BAND   ; glyph background = the inverse bar
     jmp .draw_label
 .label_color:
+    xor cx, cx
+    mov ds, cx
+    mov di, BX_RP_BAND_X
+    mov si, [BMX_DROWY]
+    mov cx, BX_RP_BAND_W
+    mov dx, BX_ROW_H
+    mov bl, COLOR_BG
+    call gfx_fill_rect
     xor cx, cx
     mov ds, cx
     mov byte [BMX_DBG], COLOR_BG
@@ -1059,10 +1088,38 @@ bx2_key_btn:
     jz bx2_accept
     jmp bx2_cancel
 
-; bx2_repaint: tail-called by the per-key handlers. Repaints and returns to the
-; loop (so it returns to bx2_handle_key's caller).
+; bx2_repaint: repaint only the interactive regions. The initial draw owns the
+; static title and frames. Rows repaint their whole hit cell so old focus bars
+; and markers are removed without clearing the framebuffer.
 bx2_repaint:
-    call bx2_draw
+%if BMX_MOUSE
+    call bx2_cursor_restore
+%endif
+    xor cx, cx
+.dev_rows:
+    push cx
+    mov al, cl
+    call bx2_draw_dev_row
+    pop cx
+    inc cx
+    cmp cx, BMX_DEV_COUNT
+    jb .dev_rows
+    xor cx, cx
+.spd_rows:
+    push cx
+    mov al, cl
+    call bx2_draw_spd_row
+    pop cx
+    inc cx
+    cmp cx, BMX_SPD_COUNT
+    jb .spd_rows
+    call bx2_draw_cache_caption
+    call bx2_draw_buttons
+    call bx2_draw_hints
+%if BMX_MOUSE
+    call bx2_cursor_save
+    call bx2_cursor_draw
+%endif
     ret
 
 ; bx2_note: like bm_note but at the bootbox footer row. Wipe both hint lines, draw
@@ -1426,7 +1483,7 @@ bx2_apply_packet:
     mov [BMX_LAST_REGION], bl
     mov al, bl
     call bx2_focus_from_region      ; set focus_pane/idx from the region id
-    call bx2_draw
+    call bx2_repaint
     jmp .check_click
 .no_focus:
     mov bl, al
@@ -1501,7 +1558,7 @@ bx2_click_region:
     xor cx, cx
     mov ds, cx
     mov [BMX_MARK_SPD], bl
-    call bx2_draw
+    call bx2_repaint
 .ret:
     ret
 .spd_reject:
@@ -1519,7 +1576,7 @@ bx2_click_region:
     xor cx, cx
     mov ds, cx
     mov [BMX_MARK_DEV], bl
-    call bx2_draw
+    call bx2_repaint
     ret
 .dev_reject:
     cmp bl, BMX_RG_DEV_HDD

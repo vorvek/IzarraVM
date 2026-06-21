@@ -83,6 +83,17 @@ void t_cls(void)
     t_setmode3();
 }
 
+void t_putcell(int row, int col, char ch, unsigned char attr)
+{
+    unsigned short far *cell = (unsigned short far *)MK_FP(
+        0xB800, (unsigned)((row * 80 + col) * 2));
+    unsigned short value = (unsigned short)(unsigned char)ch |
+                           ((unsigned short)attr << 8);
+    if (*cell != value) {
+        *cell = value;
+    }
+}
+
 char *t_cmdtail(void)
 {
     static char tail[128];

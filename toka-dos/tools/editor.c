@@ -6,16 +6,14 @@
  * or Ctrl-S, and quits with Esc (asking to save when the buffer is dirty).
  *
  * Keys come from the BIOS keyboard (INT 16h) so the editor sees raw scancodes for
- * the extended keys, which carry ASCII 0. The screen is drawn straight to the
- * B800 text buffer for a fast full redraw, and the hardware cursor is placed with
- * INT 10h.
+ * the extended keys, which carry ASCII 0. Changed cells are written straight to
+ * the B800 text buffer, and the hardware cursor is placed with INT 10h.
  *
  * The file is held in a fixed line array. A file with more lines than MAX_LINES,
  * or any line longer than MAX_COLS, is refused at open time rather than loaded in
  * part: a partial load that was later saved would silently destroy the rest of
  * the file.
  */
-#include <dos.h>
 #include <string.h>
 #include "toka.h"
 
@@ -34,15 +32,6 @@ static int  leftcol;               /* first visible column (horizontal scroll)  
 static int  dirty;
 static char fname[80];
 static const char *flash;          /* transient status message, or 0            */
-
-static unsigned char far *screen;  /* B800 text buffer                          */
-
-static void putcell(int row, int col, char ch, unsigned char attr)
-{
-    unsigned off = (unsigned)((row * COLS + col) * 2);
-    screen[off] = (unsigned char)ch;
-    screen[off + 1] = attr;
-}
 
 static int putnum(char *p, int v)
 {
@@ -110,7 +99,7 @@ static void draw_status(void)
         buf[n++] = ' ';
     }
     for (i = 0; i < COLS; i++) {
-        putcell(TEXTROWS, i, buf[i], 0x70);
+        t_putcell(TEXTROWS, i, buf[i], 0x70);
     }
 }
 
@@ -135,7 +124,7 @@ static void render(void)
                     ch = line[fr][sc];
                 }
             }
-            putcell(r, c, ch, 0x07);
+            t_putcell(r, c, ch, 0x07);
         }
     }
     draw_status();
@@ -350,7 +339,7 @@ static int prompt_name(void)
             buf[bn++] = ' ';
         }
         for (i = 0; i < COLS; i++) {
-            putcell(TEXTROWS, i, buf[i], 0x70);
+            t_putcell(TEXTROWS, i, buf[i], 0x70);
         }
         t_setcursor(TEXTROWS, 9 + n);
         k = t_readkey16();
@@ -415,8 +404,6 @@ int main(void)
 {
     char *tail;
     int k, sc, asc, i;
-
-    screen = (unsigned char far *)MK_FP(0xB800, 0);
 
     tail = t_cmdtail();
     while (*tail == ' ') {
