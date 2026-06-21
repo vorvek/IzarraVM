@@ -176,6 +176,23 @@ impl X87 {
         self.tag = 0xffff;
     }
 
+    /// Set one of the six exception flags (IE 0x01, DE 0x02, ZE 0x04, OE 0x08,
+    /// UE 0x10, PE 0x20) and refresh the error-summary (ES) and busy (B) bits. ES
+    /// follows whether any *unmasked* exception is now pending; the control word's
+    /// low six bits are the masks.
+    pub fn raise_exception(&mut self, flag: u16) {
+        self.status |= flag;
+        if self.pending_unmasked_exception() {
+            self.status |= 0x80 | 0x8000; // ES + B
+        }
+    }
+
+    /// True when an exception flag is set whose mask is clear: the next waiting FPU
+    /// instruction (or FWAIT) must trap with #MF.
+    pub fn pending_unmasked_exception(&self) -> bool {
+        self.status & 0x3f & !(self.control & 0x3f) != 0
+    }
+
     /// Set the four condition-code bits (used by FCOM/FXAM/FTST later).
     pub fn set_condition(&mut self, c3: bool, c2: bool, c1: bool, c0: bool) {
         let mut status = self.status & !(C0 | C1 | C2 | C3);

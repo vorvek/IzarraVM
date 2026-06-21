@@ -1473,10 +1473,15 @@ impl Cpu386 {
                 Ok(clocks(7))
             }
             0x9b => {
-                // WAIT/FWAIT: synchronize with the x87. With no FPU implemented there is no
-                // pending numeric exception to test, so it retires as a no-op.
-                // ponytail: no-op until the x87 core lands; then this must trap (#MF) on an
-                // unmasked pending FPU exception.
+                // WAIT/FWAIT: trap with #MF if the x87 has a pending unmasked exception
+                // (gated on CR0.NE; otherwise the FERR#/IRQ13 path the PC uses applies and
+                // is not modeled). With nothing pending it retires as a no-op.
+                if self.control.cr0 & CR0_NE != 0 && self.fpu.pending_unmasked_exception() {
+                    return Err(InternalFault::Exception {
+                        vector: 16,
+                        error_code: None,
+                    });
+                }
                 Ok(clocks(6))
             }
             0x9a => {
@@ -3287,8 +3292,10 @@ impl Cpu386 {
             OperandSize::Dword,
         )?;
         self.push(bus, self.registers.eip, OperandSize::Dword)?;
-        if let Some(error_code) = error_code {
-            self.push(bus, error_code, OperandSize::Dword)?;
+        // The error code is pushed only for the vectors that carry one, regardless of
+        // what the caller supplied: 8 #DF, 10 #TS, 11 #NP, 12 #SS, 13 #GP, 14 #PF, 17 #AC.
+        if vector_pushes_error_code(vector) {
+            self.push(bus, error_code.unwrap_or(0), OperandSize::Dword)?;
         }
         self.set_flag(FLAG_IF | FLAG_TF, false);
         self.load_segment(bus, SegmentIndex::Cs, selector)?;
@@ -4044,6 +4051,13 @@ fn parity(value: u8) -> bool {
     value.count_ones() % 2 == 0
 }
 
+/// The processor pushes a 32-bit error code after the return frame for these
+/// vectors: 8 #DF, 10 #TS, 11 #NP, 12 #SS, 13 #GP, 14 #PF, 17 #AC. Every other
+/// vector (including the software INT n forms) pushes no error code.
+const fn vector_pushes_error_code(vector: u8) -> bool {
+    matches!(vector, 8 | 10 | 11 | 12 | 13 | 14 | 17)
+}
+
 fn page_fault_code(present: bool, write: bool, user: bool) -> u32 {
     // 80386 page-fault error code: bit 0 = P (present), bit 1 = W/R (was a write),
     // bit 2 = U/S (was a user access). The reserved-bit (bit 3, 486+) and
@@ -4089,6 +4103,21 @@ impl Cpu386 {
         address_size: AddressSize,
     ) -> ExecResult<CycleOutcome> {
         let modrm = self.fetch_modrm(bus)?;
+        // A pending unmasked exception traps with #MF on the next waiting FPU
+        // instruction. The no-wait control ops (FNINIT, FNCLEX) are exempt so they can
+        // clear the state. Gated on CR0.NE; with NE clear the part would drive FERR#
+        // and IRQ13 instead, which is not modeled.
+        let is_no_wait_clear =
+            opcode == 0xdb && modrm.mode == 3 && modrm.reg == 4 && matches!(modrm.rm, 2 | 3);
+        if !is_no_wait_clear
+            && self.control.cr0 & CR0_NE != 0
+            && self.fpu.pending_unmasked_exception()
+        {
+            return Err(InternalFault::Exception {
+                vector: 16,
+                error_code: None,
+            });
+        }
         if modrm.mode == 3 {
             self.execute_fpu_register(opcode, modrm)
         } else {
@@ -4352,6 +4381,7 @@ impl Cpu386 {
             }
             op => {
                 let r = fpu_arith(op, a, operand);
+                self.fpu_record_exceptions(op, a, operand, r);
                 self.fpu.set(0, r);
             }
         }
@@ -4368,10 +4398,27 @@ impl Cpu386 {
             }
             op => {
                 let r = fpu_arith(op, a, b);
+                self.fpu_record_exceptions(op, a, b, r);
                 self.fpu.set(0, r);
             }
         }
         Ok(clocks(20))
+    }
+
+    /// Set the IE (invalid) and ZE (divide-by-zero) status flags after an arithmetic
+    /// op. ponytail: only these two classes are detected from the f64 result; overflow,
+    /// underflow, denormal, and precision are not (f64's wider range rarely trips them).
+    fn fpu_record_exceptions(&mut self, op: u8, a: f64, b: f64, result: f64) {
+        if matches!(op, 6 | 7) {
+            let (dividend, divisor) = if op == 6 { (a, b) } else { (b, a) };
+            if divisor == 0.0 && dividend != 0.0 && dividend.is_finite() {
+                self.fpu.raise_exception(0x04); // ZE
+                return;
+            }
+        }
+        if result.is_nan() && !a.is_nan() && !b.is_nan() {
+            self.fpu.raise_exception(0x01); // IE
+        }
     }
 
     fn fpu_reg_arith_sti(&mut self, reg: u8, i: u8, pop: bool) -> ExecResult<CycleOutcome> {
@@ -4390,6 +4437,7 @@ impl Cpu386 {
         let a = self.fpu.get(i);
         let b = self.fpu.get(0);
         let r = fpu_arith(op, a, b);
+        self.fpu_record_exceptions(op, a, b, r);
         self.fpu.set(i, r);
         if pop {
             self.fpu.pop();
@@ -4458,7 +4506,11 @@ impl Cpu386 {
                 Ok(clocks(4))
             }
             0xfa => {
-                let v = self.fpu.get(0).sqrt();
+                let operand = self.fpu.get(0);
+                let v = operand.sqrt();
+                if v.is_nan() && !operand.is_nan() {
+                    self.fpu.raise_exception(0x01); // IE: sqrt of a negative
+                }
                 self.fpu.set(0, v);
                 Ok(clocks(70))
             }
@@ -11528,5 +11580,61 @@ mod tests {
         cpu.cycle(&mut bus).unwrap();
         assert!(cpu.flag(FLAG_ZF));
         assert_eq!(cpu.read_reg16(Reg16::Ax), 0xffff);
+    }
+
+    // ---- Phase 4 slice B: exception error codes and FPU #MF ----
+
+    #[test]
+    fn error_code_vectors_are_classified() {
+        for v in [8u8, 10, 11, 12, 13, 14, 17] {
+            assert!(
+                vector_pushes_error_code(v),
+                "vector {v} should carry a code"
+            );
+        }
+        for v in [0u8, 1, 3, 4, 5, 6, 7, 9, 16, 18, 19] {
+            assert!(!vector_pushes_error_code(v), "vector {v} carries no code");
+        }
+    }
+
+    /// FLDZ; FLD1; FDIV ST0,ST1 (divide 1 by 0); FWAIT.
+    const DIV_BY_ZERO_THEN_WAIT: [u8; 7] = [0xd9, 0xee, 0xd9, 0xe8, 0xd8, 0xf1, 0x9b];
+
+    #[test]
+    fn unmasked_divide_by_zero_traps_mf_on_fwait() {
+        let (mut cpu, memory) = real_mode_cpu(&DIV_BY_ZERO_THEN_WAIT, 0x40);
+        cpu.fpu.control = 0x037b; // default mask with ZM (bit 2) cleared
+        cpu.control.cr0 |= CR0_NE;
+        let mut bus = TestBus::with_memory(memory);
+        for _ in 0..3 {
+            cpu.cycle(&mut bus).unwrap(); // FLDZ, FLD1, FDIV
+        }
+        assert_ne!(cpu.fpu.status & 0x04, 0, "ZE flag set");
+        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        assert!(matches!(fault, InternalFault::Exception { vector: 16, .. }));
+    }
+
+    #[test]
+    fn masked_divide_by_zero_does_not_trap() {
+        let (mut cpu, memory) = real_mode_cpu(&DIV_BY_ZERO_THEN_WAIT, 0x40);
+        // Default control 0x037F masks every exception.
+        cpu.control.cr0 |= CR0_NE;
+        let mut bus = TestBus::with_memory(memory);
+        for _ in 0..4 {
+            cpu.cycle(&mut bus).unwrap(); // FWAIT retires normally
+        }
+        assert_ne!(cpu.fpu.status & 0x04, 0, "ZE flag still latched");
+    }
+
+    #[test]
+    fn mf_is_suppressed_when_ne_is_clear() {
+        // Unmasked exception but CR0.NE clear: the PC's FERR/IRQ13 path applies, so no
+        // internal #MF. FWAIT retires.
+        let (mut cpu, memory) = real_mode_cpu(&DIV_BY_ZERO_THEN_WAIT, 0x40);
+        cpu.fpu.control = 0x037b;
+        let mut bus = TestBus::with_memory(memory);
+        for _ in 0..4 {
+            cpu.cycle(&mut bus).unwrap();
+        }
     }
 }
