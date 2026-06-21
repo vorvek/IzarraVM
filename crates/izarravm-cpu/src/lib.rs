@@ -4466,9 +4466,125 @@ impl Cpu386 {
                 self.fpu.inc_top();
                 Ok(clocks(4))
             }
-            // Transcendentals (F0-F5, F8-FF except above) are deferred to phase 2.
+            0xf0 => {
+                // F2XM1: ST0 = 2^ST0 - 1.
+                let v = self.fpu.get(0);
+                self.fpu.set(0, v.exp2() - 1.0);
+                Ok(clocks(200))
+            }
+            0xf1 => {
+                // FYL2X: ST1 = ST1 * log2(ST0), then pop.
+                let x = self.fpu.get(0);
+                let y = self.fpu.get(1);
+                self.fpu.set(1, y * x.log2());
+                self.fpu.pop();
+                Ok(clocks(300))
+            }
+            0xf2 => {
+                // FPTAN: ST0 = tan(ST0), then push 1.0. C2 cleared (reduction complete).
+                let v = self.fpu.get(0);
+                self.fpu.set(0, v.tan());
+                self.fpu.push(1.0);
+                self.fpu.set_condition(false, false, false, false);
+                Ok(clocks(300))
+            }
+            0xf3 => {
+                // FPATAN: ST1 = atan2(ST1, ST0), then pop.
+                let x = self.fpu.get(0);
+                let y = self.fpu.get(1);
+                self.fpu.set(1, y.atan2(x));
+                self.fpu.pop();
+                Ok(clocks(300))
+            }
+            0xf4 => {
+                // FXTRACT: ST0 = unbiased exponent, then push the significand (in [1,2)).
+                let v = self.fpu.get(0);
+                if v == 0.0 || !v.is_finite() {
+                    let exponent = if v == 0.0 { f64::NEG_INFINITY } else { v };
+                    self.fpu.set(0, exponent);
+                    self.fpu.push(v);
+                } else {
+                    let exponent = v.abs().log2().floor();
+                    let significand = v / exponent.exp2();
+                    self.fpu.set(0, exponent);
+                    self.fpu.push(significand);
+                }
+                Ok(clocks(70))
+            }
+            0xf5 => {
+                // FPREM1: IEEE partial remainder (round-to-nearest quotient).
+                self.fpu_partial_remainder(true);
+                Ok(clocks(100))
+            }
+            0xf8 => {
+                // FPREM: 8087-style partial remainder (truncated quotient).
+                self.fpu_partial_remainder(false);
+                Ok(clocks(100))
+            }
+            0xf9 => {
+                // FYL2XP1: ST1 = ST1 * log2(ST0 + 1), then pop.
+                let x = self.fpu.get(0);
+                let y = self.fpu.get(1);
+                self.fpu.set(1, y * (x.ln_1p() / std::f64::consts::LN_2));
+                self.fpu.pop();
+                Ok(clocks(300))
+            }
+            0xfb => {
+                // FSINCOS: ST0 = sin, then push cos. Result: ST1 = sin, ST0 = cos.
+                let v = self.fpu.get(0);
+                self.fpu.set(0, v.sin());
+                self.fpu.push(v.cos());
+                self.fpu.set_condition(false, false, false, false);
+                Ok(clocks(300))
+            }
+            0xfd => {
+                // FSCALE: ST0 = ST0 * 2^trunc(ST1).
+                let st0 = self.fpu.get(0);
+                let st1 = self.fpu.get(1);
+                self.fpu.set(0, st0 * st1.trunc().exp2());
+                Ok(clocks(30))
+            }
+            0xfe => {
+                // FSIN.
+                let v = self.fpu.get(0);
+                self.fpu.set(0, v.sin());
+                self.fpu.set_condition(false, false, false, false);
+                Ok(clocks(300))
+            }
+            0xff => {
+                // FCOS.
+                let v = self.fpu.get(0);
+                self.fpu.set(0, v.cos());
+                self.fpu.set_condition(false, false, false, false);
+                Ok(clocks(300))
+            }
             _ => self.fpu_unsupported(0xd9),
         }
+    }
+
+    fn fpu_partial_remainder(&mut self, round_nearest: bool) {
+        // ponytail: computes the full remainder in one step and reports reduction
+        // complete (C2=0). Real hardware reduces partially and may take several FPREM
+        // iterations for large quotients; FPU exceptions are not modeled yet.
+        let dividend = self.fpu.get(0);
+        let divisor = self.fpu.get(1);
+        if divisor == 0.0 || !dividend.is_finite() || !divisor.is_finite() {
+            self.fpu.set_condition(false, false, false, false);
+            return;
+        }
+        let ratio = dividend / divisor;
+        let quotient = if round_nearest {
+            ratio.round_ties_even()
+        } else {
+            ratio.trunc()
+        };
+        let remainder = dividend - divisor * quotient;
+        self.fpu.set(0, remainder);
+        let q = quotient as i64;
+        let c0 = (q >> 2) & 1 != 0;
+        let c3 = (q >> 1) & 1 != 0;
+        let c1 = q & 1 != 0;
+        self.fpu.set_condition(c3, false, c1, c0);
     }
 
     fn fpu_db_register(&mut self, byte: u8) -> ExecResult<CycleOutcome> {
@@ -10183,5 +10299,55 @@ mod tests {
             cpu.cycle(&mut bus).unwrap();
         }
         assert_eq!(cpu.fpu.get(0), 8.0);
+    }
+
+    // ---- Phase 2 slice B: x87 transcendentals ----
+
+    #[test]
+    fn f2xm1_of_one_is_one() {
+        // FLD1 (D9 E8); F2XM1 (D9 F0): 2^1 - 1 = 1.
+        let (mut cpu, memory) = real_mode_cpu(&[0xd9, 0xe8, 0xd9, 0xf0], 0x20);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.fpu.get(0), 1.0);
+    }
+
+    #[test]
+    fn fyl2x_computes_y_times_log2_x() {
+        // FLD1 (ST1=1); FLD m64 [0x100]=2 (ST0=2); FYL2X (D9 F1): 1 * log2(2) = 1.
+        let code = [0xd9, 0xe8, 0xdd, 0x06, 0x00, 0x01, 0xd9, 0xf1];
+        let (mut cpu, mut memory) = real_mode_cpu(&code, 0x200);
+        memory[0x100..0x108].copy_from_slice(&2.0f64.to_le_bytes());
+        let mut bus = TestBus::with_memory(memory);
+        for _ in 0..3 {
+            cpu.cycle(&mut bus).unwrap();
+        }
+        assert_eq!(cpu.fpu.get(0), 1.0);
+    }
+
+    #[test]
+    fn fscale_scales_by_power_of_two() {
+        // FLD m64 [0x100]=2 (ST1); FLD m64 [0x108]=3 (ST0); FSCALE (D9 FD): 3 * 2^2 = 12.
+        let code = [0xdd, 0x06, 0x00, 0x01, 0xdd, 0x06, 0x08, 0x01, 0xd9, 0xfd];
+        let (mut cpu, mut memory) = real_mode_cpu(&code, 0x200);
+        memory[0x100..0x108].copy_from_slice(&2.0f64.to_le_bytes());
+        memory[0x108..0x110].copy_from_slice(&3.0f64.to_le_bytes());
+        let mut bus = TestBus::with_memory(memory);
+        for _ in 0..3 {
+            cpu.cycle(&mut bus).unwrap();
+        }
+        assert_eq!(cpu.fpu.get(0), 12.0);
+    }
+
+    #[test]
+    fn fptan_replaces_st0_and_pushes_one() {
+        // FLDZ (D9 EE); FPTAN (D9 F2): tan(0)=0 in ST1, 1.0 pushed into ST0.
+        let (mut cpu, memory) = real_mode_cpu(&[0xd9, 0xee, 0xd9, 0xf2], 0x20);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.fpu.get(0), 1.0);
+        assert_eq!(cpu.fpu.get(1), 0.0);
     }
 }
