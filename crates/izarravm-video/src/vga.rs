@@ -542,10 +542,10 @@ impl Default for Vga {
             font: Self::seed_fonts(),
             dac: Dac::default(),
             cursor_offset: 0,
-            // The text cursor shape the BIOS loads for mode 03h (start scanline
-            // 6, end scanline 7). Stored and read back; rendering is a later slice.
-            cursor_start: 0x06,
-            cursor_end: 0x07,
+            // Mode 03h uses an 8x16 font, so the bottom two scanlines form the
+            // normal underscore cursor.
+            cursor_start: 0x0E,
+            cursor_end: 0x0F,
             mode: VideoMode::Text,
             // Misc Output powers up as mode 03h (text/CGA clock, CRTC at 3Dx); the
             // DAC pel mask defaults to all-pass. Both are stored and read back,
@@ -1634,6 +1634,8 @@ impl Vga {
     /// the text raster is published on the next frame.
     pub fn set_text_mode(&mut self) {
         self.crtc = CrtcTiming::text_03h();
+        self.cursor_start = 0x0E;
+        self.cursor_end = 0x0F;
         for cell in self.text_memory.chunks_exact_mut(2) {
             cell[0] = b' ';
             cell[1] = 0x07;
@@ -2496,6 +2498,7 @@ mod tests {
         assert_eq!(frame.rows, 25);
         assert_eq!(frame.cells.len(), 2000);
         assert!(frame.line_string(0).is_empty());
+        assert_eq!((text.cursor_start, text.cursor_end), (0x0E, 0x0F));
     }
 
     #[test]
@@ -3349,7 +3352,10 @@ mod tests {
 
     #[test]
     fn text_scanout_renders_cp437_glyph_rows_at_9x16() {
-        let mut vga = Vga::default();
+        let mut vga = Vga {
+            cursor_start: 0x20,
+            ..Default::default()
+        };
         // 0xDB is the solid full block (all-ones rows); white on black (0x0F).
         text_put(&mut vga, 0, 0, 0xDB, 0x0F);
         // The default ATC palette is identity and the pel mask is all-pass, so a

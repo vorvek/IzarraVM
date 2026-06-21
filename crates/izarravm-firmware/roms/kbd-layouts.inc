@@ -1,13 +1,13 @@
 ; kbd-layouts.inc - keyboard stream: six Set-1 scancode -> ASCII tables, each an
-; unshifted half and a shifted half. The INT 09h ISR (izbios-kbd.inc) picks the
+; unshifted, shifted, and AltGr table. The INT 09h ISR (izbios-kbd.inc) picks the
 ; active layout from the cached CMOS layout byte and indexes these.
 ;
 ; Layout indices match the CMOS 0x10 / setup-page order:
 ;   0 en-US   1 UK   2 ES   3 FR (AZERTY)   4 DE (QWERTZ)   5 IT (QWERTZ)
 ;
-; Table geometry: each layout is one 256-byte block, the unshifted 128 bytes
-; first and the shifted 128 bytes second. The ISR computes
-;   base = kbd_layout_tables + layout*256 (+128 when a shift is held)
+; Table geometry: each layout is one 384-byte block: unshifted, shifted, then
+; AltGr, each 128 bytes. The ISR computes
+;   base = kbd_layout_tables + layout*384 + modifier offset
 ; then reads [base + scancode]. A 0 byte means the key emits no ASCII here.
 ;
 ; Coverage is the main typing block (scancodes 0x00..0x39); 0x3a and up read 0.
@@ -37,6 +37,8 @@ kbd_layout_tables:
     db 'D','F','G','H','J','K','L',':',34, '~', 0,  '|','Z','X','C','V'      ; 20-2f
     db 'B','N','M','<','>','?', 0,  '*', 0,  ' '                            ; 30-39
     times 0x80 - ($ - .us_hi) db 0
+.us_altgr:
+    times 0x80 db 0
 
 ; ------------------------------- 1: UK -------------------------------------
 ; British ISO. Letters match US. 2 carries the double quote, 3 the pound sign
@@ -55,6 +57,8 @@ kbd_layout_tables:
     db 'D','F','G','H','J','K','L',':','@', 0xaa,0, '~','Z','X','C','V'      ; 20-2f
     db 'B','N','M','<','>','?', 0,  '*', 0,  ' '                            ; 30-39
     times 0x80 - ($ - .uk_hi) db 0
+.uk_altgr:
+    times 0x80 db 0
 
 ; ------------------------------- 2: ES -------------------------------------
 ; Spanish QWERTY. The headline key is n-tilde on the scancode US uses for the
@@ -74,6 +78,11 @@ kbd_layout_tables:
     db 'D','F','G','H','J','K','L',0xa5,0, 0,  0,  0xe8,'Z','X','C','V'       ; 20-2f  (0x27 = N-tilde)
     db 'B','N','M',';',':','_', 0,  '*', 0,  ' '                            ; 30-39
     times 0x80 - ($ - .es_hi) db 0
+.es_altgr:
+    db 0, 0, '|','@','#','~',0,0xaa,0,0,0,0, 0,  0,  0,  0                 ; 00-0f
+    db 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, '[',']', 0, 0, 0, 0                 ; 10-1f
+    db 0, 0, 0, 0, 0, 0, 0, 0,'{',92, 0, '}', 0, 0, 0, 0                 ; 20-2f
+    times 0x80 - ($ - .es_altgr) db 0
 
 ; ------------------------------- 3: FR -------------------------------------
 ; French AZERTY. A and Q swap, Z and W swap, and M moves to the scancode US uses
@@ -92,6 +101,9 @@ kbd_layout_tables:
     db 'D','F','G','H','J','K','L','M','%', 0xe6,0, 0xe6,'W','X','C','V'      ; 20-2f
     db 'B','N','?','.','/', 0xa7,0, '*', 0,  ' '                            ; 30-39
     times 0x80 - ($ - .fr_hi) db 0
+.fr_altgr:
+    db 0, 0, 0,'~','#','{','[','|','`',92,'^','@',']','}',0,0             ; 00-0f
+    times 0x80 - ($ - .fr_altgr) db 0
 
 ; ------------------------------- 4: DE -------------------------------------
 ; German QWERTZ. Y and Z swap. The scancode US uses for minus (0x0c) carries the
@@ -110,6 +122,10 @@ kbd_layout_tables:
     db 'D','F','G','H','J','K','L', 0x99,0x8e,0xf8,0, 39, 'Y','X','C','V'     ; 20-2f
     db 'B','N','M',';',':','_', 0,  '*', 0,  ' '                            ; 30-39
     times 0x80 - ($ - .de_hi) db 0
+.de_altgr:
+    db 0, 0, 0,0,0,0,0,0,'{','[',']','}',92,0,0,0                        ; 00-0f
+    db '@',0,0,0,0,0,0,0,0,0,0,0,0,0,0,0                                ; 10-1f
+    times 0x80 - ($ - .de_altgr) db 0
 
 ; ------------------------------- 5: IT -------------------------------------
 ; Italian, treated as QWERTZ for this slice (Y and Z swap). The scancode US uses
@@ -128,3 +144,8 @@ kbd_layout_tables:
     db 'D','F','G','H','J','K','L','@','#', '|', 0,  0xa7,'Y','X','C','V'     ; 20-2f
     db 'B','N','M',';',':','_', 0,  '*', 0,  ' '                            ; 30-39
     times 0x80 - ($ - .it_hi) db 0
+.it_altgr:
+    db 0, 0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0                             ; 00-0f
+    db 0, 0, 0,0,0,0,0,0,0,0,'[',']',0,0,0,0                           ; 10-1f
+    db 0, 0, 0,0,0,0,0,'@','#',0,0,0,0,0,0,0                           ; 20-2f
+    times 0x80 - ($ - .it_altgr) db 0

@@ -2,6 +2,8 @@
 %define KB_BUF_HEAD    0x001a      ; BDA: head pointer (offset into 0x40 seg)
 %define KB_BUF_TAIL    0x001c      ; BDA: tail pointer
 %define KB_FLAGS       0x0017      ; BDA: shift flags
+%define KB_PREFIX      0x0097      ; pending E0 extended-key prefix
+%define KB_ALTGR       0x0098      ; right Alt held
 
 ; INT 09h: keyboard hardware ISR
 int09:
@@ -10,6 +12,12 @@ int09:
     push ds
     in al, 0x60            ; read scancode
     mov bl, al
+    cmp bl, 0xe0
+    je .prefix
+    mov ax, 0x0040
+    mov ds, ax
+    mov bh, [KB_PREFIX]
+    mov byte [KB_PREFIX], 0
     test bl, 0x80          ; break code? update shift state, do not enqueue
     jnz .break
     ; Make of a shift/Ctrl key sets the held bit and never enqueues ASCII.
@@ -19,6 +27,8 @@ int09:
     je .set_rshift
     cmp bl, 0x1d
     je .set_ctrl
+    cmp bl, 0x38
+    je .set_altgr
     ; Map scancode -> ASCII using the shift state, then enqueue (scancode:ascii).
     push cx
     push si
@@ -30,6 +40,10 @@ int09:
     jz .have_ascii
     mov al, [cs:scan2ascii_shift + si]
 .have_ascii:
+    test byte [KB_FLAGS], 0x08
+    jz .not_alt
+    xor al, al
+.not_alt:
     ; Ctrl + letter -> control code (Ctrl-A = 1 .. Ctrl-Z = 26), as a real BIOS
     ; does, so a full-screen program reads Ctrl-S as ASCII 0x13 from INT 16h.
     test byte [KB_FLAGS], 0x04
@@ -62,6 +76,20 @@ int09:
     mov ds, ax
     or byte [KB_FLAGS], 0x04
     jmp .eoi
+.set_altgr:
+    test bh, bh
+    jz .set_alt
+    mov byte [KB_ALTGR], 1
+    or byte [KB_FLAGS], 0x08
+    jmp .eoi
+.set_alt:
+    or byte [KB_FLAGS], 0x08
+    jmp .eoi
+.prefix:
+    mov ax, 0x0040
+    mov ds, ax
+    mov byte [KB_PREFIX], 1
+    jmp .eoi
 .break:
     and bl, 0x7f
     ; Left shift (0x2a) / right shift (0x36) / Ctrl (0x1d): clear the held bit.
@@ -71,6 +99,8 @@ int09:
     je .clr_rshift
     cmp bl, 0x1d
     je .clr_ctrl
+    cmp bl, 0x38
+    je .clr_altgr
     jmp .eoi
 .clr_lshift:
     mov ax, 0x0040
@@ -86,6 +116,15 @@ int09:
     mov ax, 0x0040
     mov ds, ax
     and byte [KB_FLAGS], 0xfe
+    jmp .eoi
+.clr_altgr:
+    test bh, bh
+    jz .clr_alt
+    mov byte [KB_ALTGR], 0
+    and byte [KB_FLAGS], 0xf7
+    jmp .eoi
+.clr_alt:
+    and byte [KB_FLAGS], 0xf7
 .eoi:
     mov al, 0x20
     out 0x20, al           ; EOI to master PIC

@@ -944,11 +944,17 @@ impl GuiApp {
         let ppp = ctx.pixels_per_point().max(0.01);
         for event in &raw_input.events {
             match event {
-                egui::Event::Key { key, pressed, .. } => {
-                    if let Some(make) = egui_key_to_set1(*key) {
-                        codes.push(if *pressed { make } else { make | 0x80 });
-                    }
-                }
+                egui::Event::Key {
+                    key,
+                    physical_key,
+                    pressed,
+                    modifiers,
+                    ..
+                } => codes.extend(key_event_to_set1(
+                    physical_key.unwrap_or(*key),
+                    *pressed,
+                    *modifiers,
+                )),
                 // Raw relative motion from the locked, hidden cursor (winit
                 // DeviceEvent::MouseMotion, surfaced as MouseMoved). The cursor is
                 // pinned and cannot leave, so we accumulate the deltas into the guest
@@ -1435,10 +1441,15 @@ impl eframe::App for GuiApp {
             let codes: Vec<u8> = ctx.input(|i| {
                 i.events
                     .iter()
-                    .filter_map(|e| match e {
-                        egui::Event::Key { key, pressed, .. } => egui_key_to_set1(*key)
-                            .map(|make| if *pressed { make } else { make | 0x80 }),
-                        _ => None,
+                    .flat_map(|e| match e {
+                        egui::Event::Key {
+                            key,
+                            physical_key,
+                            pressed,
+                            modifiers,
+                            ..
+                        } => key_event_to_set1(physical_key.unwrap_or(*key), *pressed, *modifiers),
+                        _ => Vec::new(),
                     })
                     .collect()
             });
@@ -1550,21 +1561,84 @@ fn egui_key_to_set1(key: egui::Key) -> Option<u8> {
         Num7 => 0x08,
         Num8 => 0x09,
         Num9 => 0x0a,
+        Minus => 0x0c,
+        Equals | Plus => 0x0d,
+        OpenBracket | OpenCurlyBracket => 0x1a,
+        CloseBracket | CloseCurlyBracket => 0x1b,
+        Semicolon | Colon => 0x27,
+        Quote => 0x28,
+        Backtick => 0x29,
+        Backslash | Pipe => 0x2b,
+        Comma => 0x33,
+        Period => 0x34,
+        Slash | Questionmark => 0x35,
+        Exclamationmark => 0x02,
         Space => 0x39,
         Enter => 0x1c,
         Backspace => 0x0e,
         Escape => 0x01,
         Tab => 0x0f,
+        Home => 0x47,
         ArrowUp => 0x48,
+        PageUp => 0x49,
         ArrowDown => 0x50,
+        End => 0x4f,
+        PageDown => 0x51,
+        Insert => 0x52,
         ArrowLeft => 0x4b,
         ArrowRight => 0x4d,
         Delete => 0x53,
         F1 => 0x3b,
         F2 => 0x3c,
+        F3 => 0x3d,
+        F4 => 0x3e,
+        F5 => 0x3f,
+        F6 => 0x40,
+        F7 => 0x41,
+        F8 => 0x42,
+        F9 => 0x43,
         F10 => 0x44,
+        F11 => 0x57,
+        F12 => 0x58,
         _ => return None,
     })
+}
+
+/// Turn one host key event into Set 1 bytes. egui does not emit modifier keys as
+/// key events, so bracket the physical key with their make/break codes. Windows
+/// reports AltGr as Ctrl+Alt; send that pair as the right-Alt extended key.
+fn key_event_to_set1(key: egui::Key, pressed: bool, modifiers: egui::Modifiers) -> Vec<u8> {
+    let Some(make) = egui_key_to_set1(key) else {
+        return Vec::new();
+    };
+    let mut codes = Vec::with_capacity(7);
+    let altgr = modifiers.alt && modifiers.ctrl;
+    if pressed {
+        if altgr {
+            codes.extend_from_slice(&[0xe0, 0x38]);
+        } else if modifiers.alt {
+            codes.push(0x38);
+        } else if modifiers.ctrl {
+            codes.push(0x1d);
+        }
+        if modifiers.shift {
+            codes.push(0x2a);
+        }
+        codes.push(make);
+    } else {
+        codes.push(make | 0x80);
+        if modifiers.shift {
+            codes.push(0xaa);
+        }
+        if altgr {
+            codes.extend_from_slice(&[0xe0, 0xb8]);
+        } else if modifiers.alt {
+            codes.push(0xb8);
+        } else if modifiers.ctrl {
+            codes.push(0x9d);
+        }
+    }
+    codes
 }
 
 /// Fill the Margo LFB with a diagonal gradient. Debug aid behind
@@ -1704,5 +1778,32 @@ mod tests {
         let src = egui::ColorImage::new([4, 4], vec![egui::Color32::BLACK; 16]);
         let out = sharp_prescale(&src, 3, 3);
         assert_eq!(out.size, [4, 4]);
+    }
+
+    #[test]
+    fn host_keys_emit_dos_modifiers_and_symbol_scancodes() {
+        let shift = egui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            key_event_to_set1(egui::Key::Num7, true, shift),
+            [0x2a, 0x08]
+        );
+        assert_eq!(
+            key_event_to_set1(egui::Key::Num7, false, shift),
+            [0x88, 0xaa]
+        );
+
+        let altgr = egui::Modifiers {
+            alt: true,
+            ctrl: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            key_event_to_set1(egui::Key::Num2, true, altgr),
+            [0xe0, 0x38, 0x03]
+        );
+        assert_eq!(egui_key_to_set1(egui::Key::Backslash), Some(0x2b));
     }
 }

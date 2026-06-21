@@ -41,6 +41,10 @@ fn break_of(make: u8) -> u8 {
 /// ring. No setup hotkey is pressed, so POST runs and the BIOS parks at idle, where
 /// nothing drains the ring before the read.
 fn translate(layout: u8, scancode: u8) -> u8 {
+    translate_sequence(layout, &[scancode, break_of(scancode)])
+}
+
+fn translate_sequence(layout: u8, scancodes: &[u8]) -> u8 {
     let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
     let mut machine = Machine::new(profile, izarra_bios()).unwrap();
     // The bring-up caches CMOS 0x10 into the BDA, so set the layout before any run.
@@ -48,7 +52,7 @@ fn translate(layout: u8, scancode: u8) -> u8 {
     // Run past POST and the setup-hotkey window to the idle loop.
     machine.run_until_halt_or_cycles(12_000_000).unwrap();
     // Inject the key and let IRQ1 -> INT 09h translate and enqueue it.
-    machine.inject_key_scancodes(&[scancode, break_of(scancode)]);
+    machine.inject_key_scancodes(scancodes);
     machine.run_until_halt_or_cycles(2_000_000).unwrap();
     // Read the ring head and the ASCII byte (low byte of the stored word) there.
     let head_lo = machine.read_physical_u8(BDA_BASE + KB_BUF_HEAD);
@@ -79,6 +83,15 @@ fn es_semicolon_key_is_enye() {
 }
 
 #[test]
+fn es_shift_and_altgr_emit_symbols() {
+    assert_eq!(translate_sequence(2, &[0x2a, 0x08, 0x88, 0xaa]), b'/');
+    assert_eq!(
+        translate_sequence(2, &[0xe0, 0x38, 0x03, 0x83, 0xe0, 0xb8]),
+        b'@'
+    );
+}
+
+#[test]
 fn fr_azerty_swaps_q_to_a() {
     // Layout 3: AZERTY puts 'a' where US QWERTY has 'q'.
     assert_eq!(translate(3, SC_Q_POS), b'a');
@@ -100,4 +113,8 @@ fn it_qwertz_minus_key_is_apostrophe() {
     // apostrophe (not the eszett) on the US minus scancode, separating the two.
     assert_eq!(translate(5, SC_MINUS), b'\'');
     assert_eq!(translate(5, 0x15), b'z');
+    assert_eq!(
+        translate_sequence(5, &[0xe0, 0x38, SC_SEMI, break_of(SC_SEMI), 0xe0, 0xb8]),
+        b'@'
+    );
 }

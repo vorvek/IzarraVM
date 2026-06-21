@@ -18,10 +18,14 @@
 ; of this BIOS does not use (0x96 is the AT keyboard status-flags-3 slot), so the
 ; INT 09h ISR can read it with DS already pointing at the BDA segment.
 %define KB_LAYOUT      0x0096
+; Extended-key prefix and right-Alt state used by INT 09h. These occupy the two
+; following AT keyboard status bytes in the BDA.
+%define KB_PREFIX      0x0097
+%define KB_ALTGR       0x0098
 ; CMOS index of the persisted layout (MC146818 ports 0x70/0x71). en-US is 0.
 %define KB_CMOS_LAYOUT 0x10
-; Bytes per keyboard-layout block in kbd-layouts.inc (128 unshifted + 128 shifted).
-%define KBD_LAYOUT_STRIDE 256
+; Bytes per layout block: 128 each for unshifted, shifted, and AltGr.
+%define KBD_LAYOUT_STRIDE 384
 
 ; BDA timer tick (offsets into BDA_SEG), maintained by the INT 08h handler.
 ; The standard PC layout: a dword count at 0x6C and a one-byte 24-hour rollover

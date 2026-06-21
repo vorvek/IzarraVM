@@ -54,6 +54,12 @@ int09:
     push ds
     in al, 0x60
     mov bl, al
+    cmp bl, 0xe0
+    je .prefix
+    mov ax, BDA_SEG
+    mov ds, ax
+    mov bh, [KB_PREFIX]
+    mov byte [KB_PREFIX], 0
     test bl, 0x80
     jnz .break
     cmp bl, 0x2a
@@ -62,25 +68,38 @@ int09:
     je .set_rshift
     cmp bl, 0x1d
     je .set_ctrl
+    cmp bl, 0x38
+    je .set_altgr
     push cx
     push si
     mov ax, BDA_SEG
     mov ds, ax
-    ; Compute the active layout's table base: kbd_layout_tables + layout*256,
-    ; plus 128 when a shift is held. SI then indexes the half by scancode.
-    mov al, [KB_LAYOUT]             ; cached layout index 0..5 (DS = BDA)
-    mov ah, KBD_LAYOUT_STRIDE >> 1  ; 128, halved stride; the shift add doubles it
-    mul ah                          ; AX = layout * 128
-    shl ax, 1                       ; AX = layout * 256 (the block offset)
+    ; Compute layout*384 as layout*128 + layout*256, then select its modifier
+    ; table. SI finally indexes that 128-byte table by make scancode.
+    movzx si, byte [KB_LAYOUT]
+    mov ax, si
+    shl si, 7
+    shl ax, 8
+    add si, ax
+    cmp byte [KB_ALTGR], 0
+    jne .altgr
     test byte [KB_FLAGS], 0x03      ; either shift held?
     jz .no_shift
-    add ax, KBD_LAYOUT_STRIDE >> 1  ; +128 selects the shifted half
+    add si, 128
+    jmp .no_shift
+.altgr:
+    add si, 256
 .no_shift:
-    mov si, ax
     add si, kbd_layout_tables       ; SI = table base for this layout/shift
     movzx cx, bl                    ; CX = scancode
     add si, cx
     mov al, [cs:si]                 ; AL = ASCII (0 if none)
+    test byte [KB_FLAGS], 0x08
+    jz .not_left_alt
+    cmp byte [KB_ALTGR], 0
+    jne .not_left_alt
+    xor al, al
+.not_left_alt:
     ; Ctrl + letter -> control code (Ctrl-A = 1 .. Ctrl-Z = 26), as a real BIOS
     ; does, so a full-screen program reads Ctrl-S as ASCII 0x13 from INT 16h.
     test byte [KB_FLAGS], 0x04
@@ -113,6 +132,20 @@ int09:
     mov ds, ax
     or byte [KB_FLAGS], 0x04
     jmp .eoi
+.set_altgr:
+    test bh, bh
+    jz .set_alt
+    mov byte [KB_ALTGR], 1
+    or byte [KB_FLAGS], 0x08
+    jmp .eoi
+.set_alt:
+    or byte [KB_FLAGS], 0x08
+    jmp .eoi
+.prefix:
+    mov ax, BDA_SEG
+    mov ds, ax
+    mov byte [KB_PREFIX], 1
+    jmp .eoi
 .break:
     and bl, 0x7f
     cmp bl, 0x2a
@@ -121,6 +154,8 @@ int09:
     je .clr_rshift
     cmp bl, 0x1d
     je .clr_ctrl
+    cmp bl, 0x38
+    je .clr_altgr
     jmp .eoi
 .clr_lshift:
     mov ax, BDA_SEG
@@ -136,6 +171,15 @@ int09:
     mov ax, BDA_SEG
     mov ds, ax
     and byte [KB_FLAGS], 0xfe
+    jmp .eoi
+.clr_altgr:
+    test bh, bh
+    jz .clr_alt
+    mov byte [KB_ALTGR], 0
+    and byte [KB_FLAGS], 0xf7
+    jmp .eoi
+.clr_alt:
+    and byte [KB_FLAGS], 0xf7
 .eoi:
     mov al, 0x20
     out 0x20, al
