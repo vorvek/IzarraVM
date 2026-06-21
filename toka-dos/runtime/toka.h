@@ -70,6 +70,12 @@ void t_gettime(int *hour, int *min, int *sec);
 int t_lastexit(void);
 /* Read one key without echo (AH=07h); returns the ASCII byte. */
 int t_getkey(void);
+/* Read one key via the BIOS keyboard (INT 16h AH=00h). Returns the full word:
+ * the scancode in the high byte and the ASCII in the low byte, so callers can
+ * see extended keys (arrows, Home/End, F-keys) that carry ASCII 0. */
+int t_readkey16(void);
+/* Move the hardware text cursor (INT 10h AH=02h, page 0). */
+void t_setcursor(int row, int col);
 /* True if `path` exists (a file or, with a wildcard, any match). */
 int t_exists(const char *path);
 
