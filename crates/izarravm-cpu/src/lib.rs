@@ -93,6 +93,22 @@ const CPUID_FEATURE_MMX: u32 = 1 << 23;
 const CPUID_FEATURES_EDX: u32 =
     CPUID_FEATURE_TSC | CPUID_FEATURE_MSR | CPUID_FEATURE_CX8 | CPUID_FEATURE_MMX;
 
+// Extended-leaf (0x80000001) feature flags. The AMD Processor Recognition app note (Table
+// 6) places three K6 additions at their own bit positions: SYSCALL/SYSRET (bit 10), integer
+// CMOVcc (bit 15) and FP FCMOVcc (bit 16). TSC/MSR/CX8/MMX share the standard positions. As
+// with leaf 1, only emulated features are set, so FPU/VME/DE/PSE/MCE/PGE stay clear (the
+// GSW-586 emulates none of them, and the real K6 generates no machine-check exception).
+const CPUID_EXT_FEATURE_SYSCALL: u32 = 1 << 10;
+const CPUID_EXT_FEATURE_CMOV: u32 = 1 << 15;
+const CPUID_EXT_FEATURE_FCMOV: u32 = 1 << 16;
+const CPUID_EXT_FEATURES_EDX: u32 = CPUID_FEATURE_TSC
+    | CPUID_FEATURE_MSR
+    | CPUID_FEATURE_CX8
+    | CPUID_FEATURE_MMX
+    | CPUID_EXT_FEATURE_SYSCALL
+    | CPUID_EXT_FEATURE_CMOV
+    | CPUID_EXT_FEATURE_FCMOV;
+
 // CR4 bits with a modeled effect. TSD (bit 2) makes RDTSC privileged: when set, RDTSC
 // outside CPL 0 raises #GP(0). The other CR4 bits are storage only.
 const CR4_TSD: u32 = 0x0000_0004;
@@ -2470,6 +2486,10 @@ impl Cpu386 {
                         CPUID_FEATURES_EDX,
                     ),
                     0x8000_0000 => (CPUID_MAX_EXT_LEAF, 0, 0, 0),
+                    // Extended leaf 1: the AMD processor signature in EAX (same family/model/
+                    // stepping packing as leaf 1) and the extended feature flags in EDX. EBX
+                    // and ECX are reserved.
+                    0x8000_0001 => (CPUID_VERSION_EAX, 0, 0, CPUID_EXT_FEATURES_EDX),
                     0x8000_0002 => (
                         CPUID_BRAND_EAX_0,
                         CPUID_BRAND_EBX_0,
@@ -12251,6 +12271,25 @@ mod tests {
         ));
         assert!(run_at_level(&code, CpuLevel::I486).is_ok());
         assert!(run_at_level(&code, CpuLevel::I586).is_ok());
+    }
+
+    #[test]
+    fn cpuid_extended_leaf1_reports_amd_feature_flags() {
+        let cpu = run_cpuid(0x8000_0001);
+        // EAX carries the processor signature: family 5.
+        assert_eq!((cpu.registers.eax() >> 8) & 0xf, 5);
+        let edx = cpu.registers.edx();
+        // The implemented instructions sit at their AMD extended-leaf bit positions.
+        assert_ne!(edx & (1 << 10), 0, "SYSCALL/SYSRET (bit 10)");
+        assert_ne!(edx & (1 << 15), 0, "integer CMOVcc (bit 15)");
+        assert_ne!(edx & (1 << 16), 0, "FP FCMOVcc (bit 16)");
+        assert_ne!(edx & (1 << 4), 0, "TSC");
+        assert_ne!(edx & (1 << 5), 0, "MSR");
+        assert_ne!(edx & (1 << 8), 0, "CX8");
+        assert_ne!(edx & (1 << 23), 0, "MMX");
+        // Features the GSW-586 does not emulate stay clear.
+        assert_eq!(edx & 1, 0, "FPU off");
+        assert_eq!(edx & (1 << 7), 0, "no machine-check exception");
     }
 
     #[test]
