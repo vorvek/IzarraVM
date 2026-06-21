@@ -2,6 +2,10 @@
 %define KB_BUF_HEAD    0x001a      ; BDA: head pointer (offset into 0x40 seg)
 %define KB_BUF_TAIL    0x001c      ; BDA: tail pointer
 %define KB_FLAGS       0x0017      ; BDA: shift flags
+; Second shift-flags byte (standard AT BIOS slot). Bits 4-7 are the transient
+; "lock key held" guard so a held CapsLock/NumLock/ScrollLock/Insert key toggles
+; the matching KB_FLAGS bit once per press, not once per auto-repeat.
+%define KB_FLAGS_1     0x0018      ; BDA: second shift-flags byte
 %define KB_PREFIX      0x0097      ; pending E0 extended-key prefix
 %define KB_ALTGR       0x0098      ; right Alt held
 
@@ -29,6 +33,17 @@ int09:
     je .set_ctrl
     cmp bl, 0x38
     je .set_altgr
+    ; Lock/toggle keys flip a KB_FLAGS bit on make and enqueue no ASCII. The
+    ; matching KB_FLAGS_1 transient bit guards against auto-repeat so a held key
+    ; toggles once per press. INT 16h AH=02h then reports the live lock state.
+    cmp bl, 0x3a
+    je .make_caps
+    cmp bl, 0x45
+    je .make_num
+    cmp bl, 0x46
+    je .make_scroll
+    cmp bl, 0x52
+    je .make_ins
     ; Map scancode -> ASCII using the shift state, then enqueue (scancode:ascii).
     push cx
     push si
@@ -85,6 +100,38 @@ int09:
 .set_alt:
     or byte [KB_FLAGS], 0x08
     jmp .eoi
+.make_caps:
+    mov ax, 0x0040
+    mov ds, ax
+    test byte [KB_FLAGS_1], 0x40    ; already held? skip the auto-repeat
+    jnz .eoi
+    or byte [KB_FLAGS_1], 0x40
+    xor byte [KB_FLAGS], 0x40       ; toggle CapsLock
+    jmp .eoi
+.make_num:
+    mov ax, 0x0040
+    mov ds, ax
+    test byte [KB_FLAGS_1], 0x20
+    jnz .eoi
+    or byte [KB_FLAGS_1], 0x20
+    xor byte [KB_FLAGS], 0x20       ; toggle NumLock
+    jmp .eoi
+.make_scroll:
+    mov ax, 0x0040
+    mov ds, ax
+    test byte [KB_FLAGS_1], 0x10
+    jnz .eoi
+    or byte [KB_FLAGS_1], 0x10
+    xor byte [KB_FLAGS], 0x10       ; toggle ScrollLock
+    jmp .eoi
+.make_ins:
+    mov ax, 0x0040
+    mov ds, ax
+    test byte [KB_FLAGS_1], 0x80
+    jnz .eoi
+    or byte [KB_FLAGS_1], 0x80
+    xor byte [KB_FLAGS], 0x80       ; toggle Insert
+    jmp .eoi
 .prefix:
     mov ax, 0x0040
     mov ds, ax
@@ -101,6 +148,15 @@ int09:
     je .clr_ctrl
     cmp bl, 0x38
     je .clr_altgr
+    ; Release of a lock key clears its transient guard so the next press toggles.
+    cmp bl, 0x3a
+    je .clr_caps_held
+    cmp bl, 0x45
+    je .clr_num_held
+    cmp bl, 0x46
+    je .clr_scroll_held
+    cmp bl, 0x52
+    je .clr_ins_held
     jmp .eoi
 .clr_lshift:
     mov ax, 0x0040
@@ -125,6 +181,26 @@ int09:
     jmp .eoi
 .clr_alt:
     and byte [KB_FLAGS], 0xf7
+    jmp .eoi
+.clr_caps_held:
+    mov ax, 0x0040
+    mov ds, ax
+    and byte [KB_FLAGS_1], 0xbf
+    jmp .eoi
+.clr_num_held:
+    mov ax, 0x0040
+    mov ds, ax
+    and byte [KB_FLAGS_1], 0xdf
+    jmp .eoi
+.clr_scroll_held:
+    mov ax, 0x0040
+    mov ds, ax
+    and byte [KB_FLAGS_1], 0xef
+    jmp .eoi
+.clr_ins_held:
+    mov ax, 0x0040
+    mov ds, ax
+    and byte [KB_FLAGS_1], 0x7f
 .eoi:
     mov al, 0x20
     out 0x20, al           ; EOI to master PIC
