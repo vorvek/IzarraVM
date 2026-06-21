@@ -113,7 +113,13 @@ impl Default for IdeChannel {
 
 impl IdeChannel {
     pub fn new() -> Self {
-        Self::default()
+        let mut channel = Self::default();
+        // Power-up presents the same diagnostic code and ATAPI signature as a
+        // hardware reset (ATA 5.2.9): device 0 passed in the Error register and
+        // the packet-device signature in the byte-count registers, so the BIOS
+        // sees them immediately without first issuing a reset.
+        channel.soft_reset();
+        channel
     }
 
     pub fn device(&self) -> &AtapiDevice {
@@ -224,8 +230,8 @@ impl IdeChannel {
         self.data_in_block_end = 0;
         self.byte_count_limit = 0;
         self.status = status::DRDY | status::DSC;
-        // Diagnostic code: device 0 passed (ATA 5.2.9). The reset path doubles as
-        // the power-up state, where the same code is expected.
+        // Diagnostic code: device 0 passed (ATA 5.2.9). `new` runs this on
+        // construction so power-up presents the same code, as real hardware does.
         self.error = 0x01;
         // ATAPI signature on the byte-count registers so the host can tell a
         // packet device from an ATA disk after reset.
@@ -614,10 +620,17 @@ mod tests {
             ch.write_port(SECONDARY_CMD_BASE, b);
         }
 
+        // Discard the TUR completion interrupt so the block IRQs below are the
+        // only ones the assertions see.
+        ch.take_irq();
+
         // Read two sectors so the data-in buffer is larger than one limit block.
+        // The limit is deliberately NOT a divisor of the total, so the final block
+        // is a short remainder (1500, 1500, 1096 over 4096) exercising the partial
+        // block path, not just full-limit blocks.
         let sectors = 2usize;
-        let total = sectors * DATA_SECTOR;
-        let limit = 512usize;
+        let total = sectors * DATA_SECTOR; // 4096
+        let limit = 1500usize;
 
         // Program a byte-count limit smaller than the data before PACKET.
         ch.write_port(SECONDARY_CMD_BASE + 4, (limit & 0xFF) as u8); // cyl low
@@ -632,8 +645,11 @@ mod tests {
             ch.write_port(SECONDARY_CMD_BASE, b);
         }
 
+        // The first DRQ block arms an interrupt.
+        assert!(ch.take_irq(), "the first data block raises IRQ15");
+
         // Drain block by block. Each block's byte count is the limit, except the
-        // last, which is the remainder.
+        // last, which is the remainder. Each new block re-raises the interrupt.
         let mut out = Vec::with_capacity(total);
         let mut drained = 0usize;
         while drained < total {
@@ -645,6 +661,9 @@ mod tests {
                 out.push(ch.read_port(SECONDARY_CMD_BASE).unwrap());
             }
             drained += count;
+            if drained < total {
+                assert!(ch.take_irq(), "each new data block re-raises IRQ15");
+            }
         }
 
         // After the last block, DRQ drops and the channel is idle/ready.
