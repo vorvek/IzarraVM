@@ -4160,7 +4160,8 @@ impl Cpu386 {
                 RmOperand::Memory(memory) => memory,
                 RmOperand::Register(_) => unreachable!("mode != 3 decodes to a memory operand"),
             };
-            self.execute_fpu_memory(bus, opcode, modrm.reg, mem)
+            let operand_size = self.operand_size(prefixes);
+            self.execute_fpu_memory(bus, opcode, modrm.reg, mem, operand_size)
         }
     }
 
@@ -4170,6 +4171,7 @@ impl Cpu386 {
         opcode: u8,
         reg: u8,
         mem: MemoryOperand,
+        operand_size: OperandSize,
     ) -> ExecResult<CycleOutcome> {
         match opcode {
             0xd8 => {
@@ -4219,6 +4221,16 @@ impl Cpu386 {
                     )?;
                     Ok(clocks(14))
                 }
+                4 => {
+                    // FLDENV: load the control, status, and tag words.
+                    self.fpu_load_environment(bus, mem.segment, mem.offset, operand_size)?;
+                    Ok(clocks(44))
+                }
+                6 => {
+                    // FNSTENV: store the FPU environment.
+                    self.fpu_store_environment(bus, mem.segment, mem.offset, operand_size)?;
+                    Ok(clocks(56))
+                }
                 _ => self.fpu_unsupported(opcode),
             },
             0xdd => match reg {
@@ -4246,6 +4258,16 @@ impl Cpu386 {
                         BusAccessKind::DataWrite,
                     )?;
                     Ok(clocks(14))
+                }
+                4 => {
+                    // FRSTOR: restore the environment and all eight registers.
+                    self.fpu_restore_state(bus, mem.segment, mem.offset, operand_size)?;
+                    Ok(clocks(75))
+                }
+                6 => {
+                    // FNSAVE: store the environment and registers, then reinitialize.
+                    self.fpu_save_state(bus, mem.segment, mem.offset, operand_size)?;
+                    Ok(clocks(150))
                 }
                 _ => self.fpu_unsupported(opcode),
             },
@@ -4315,6 +4337,19 @@ impl Cpu386 {
                     self.fpu.pop();
                     Ok(clocks(14))
                 }
+                4 => {
+                    // FBLD: load an 80-bit packed-BCD integer.
+                    let v = self.read_bcd80(bus, mem.segment, mem.offset)?;
+                    self.fpu.push(v);
+                    Ok(clocks(75))
+                }
+                6 => {
+                    // FBSTP: store ST(0) as 80-bit packed BCD, then pop.
+                    let v = self.fpu.get(0);
+                    self.write_bcd80(bus, mem.segment, mem.offset, v)?;
+                    self.fpu.pop();
+                    Ok(clocks(160))
+                }
                 _ => self.fpu_unsupported(opcode),
             },
             _ => self.fpu_unsupported(opcode),
@@ -4339,6 +4374,19 @@ impl Cpu386 {
                     Ok(clocks(5))
                 } else {
                     self.fpu_reg_arith_sti(reg, i, true)
+                }
+            }
+            0xda => {
+                if byte == 0xe9 {
+                    // FUCOMPP: unordered compare ST(0) with ST(1), then pop both.
+                    let a = self.fpu.get(0);
+                    let b = self.fpu.get(1);
+                    self.fpu_compare(a, b);
+                    self.fpu.pop();
+                    self.fpu.pop();
+                    Ok(clocks(5))
+                } else {
+                    self.fpu_unsupported(opcode) // FCMOVcc (P6) deferred to phase 5
                 }
             }
             0xd9 => self.fpu_d9_register(byte, i),
@@ -4962,6 +5010,208 @@ impl Cpu386 {
             mem.offset.wrapping_add(8),
             OperandSize::Word,
             u32::from(se),
+            BusAccessKind::DataWrite,
+        )
+    }
+
+    fn fpu_store_environment<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        segment: SegmentIndex,
+        offset: u32,
+        operand_size: OperandSize,
+    ) -> ExecResult<u32> {
+        // ponytail: the instruction and data pointers (the last four env slots) are
+        // written as zero; the core does not track the last FPU instruction or
+        // operand address yet. Control/status/tag are exact. Returns the env size.
+        let control = u32::from(self.fpu.control);
+        let status = u32::from(self.fpu.status);
+        let tag = u32::from(self.fpu.tag);
+        let (size, step) = match operand_size {
+            OperandSize::Word => (OperandSize::Word, 2u32),
+            OperandSize::Dword => (OperandSize::Dword, 4u32),
+        };
+        for (slot, value) in [control, status, tag].into_iter().enumerate() {
+            let at = offset + step * slot as u32;
+            self.write_memory_sized(bus, segment, at, size, value, BusAccessKind::DataWrite)?;
+        }
+        for slot in 3..7 {
+            let at = offset + step * slot;
+            self.write_memory_sized(bus, segment, at, size, 0, BusAccessKind::DataWrite)?;
+        }
+        Ok(step * 7)
+    }
+
+    fn fpu_load_environment<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        segment: SegmentIndex,
+        offset: u32,
+        operand_size: OperandSize,
+    ) -> ExecResult<u32> {
+        let (size, step) = match operand_size {
+            OperandSize::Word => (OperandSize::Word, 2u32),
+            OperandSize::Dword => (OperandSize::Dword, 4u32),
+        };
+        let control =
+            self.read_memory_sized(bus, segment, offset, size, BusAccessKind::DataRead)?;
+        let status =
+            self.read_memory_sized(bus, segment, offset + step, size, BusAccessKind::DataRead)?;
+        let tag = self.read_memory_sized(
+            bus,
+            segment,
+            offset + step * 2,
+            size,
+            BusAccessKind::DataRead,
+        )?;
+        self.fpu.control = control as u16;
+        self.fpu.status = status as u16;
+        self.fpu.tag = tag as u16;
+        Ok(step * 7)
+    }
+
+    fn fpu_save_state<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        segment: SegmentIndex,
+        offset: u32,
+        operand_size: OperandSize,
+    ) -> ExecResult<()> {
+        // ponytail: registers are saved in stack order ST(0)..ST(7); hardware uses
+        // physical order R0..R7. This round-trips with fpu_restore_state, which is the
+        // common use; software that hand-parses the image would see a different order.
+        let env = self.fpu_store_environment(bus, segment, offset, operand_size)?;
+        for i in 0..8u32 {
+            let value = self.fpu.get(i as u8);
+            let mem = MemoryOperand {
+                segment,
+                offset: offset + env + i * 10,
+            };
+            self.write_extended80(bus, mem, value)?;
+        }
+        self.fpu.finit();
+        Ok(())
+    }
+
+    fn fpu_restore_state<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        segment: SegmentIndex,
+        offset: u32,
+        operand_size: OperandSize,
+    ) -> ExecResult<()> {
+        let env = self.fpu_load_environment(bus, segment, offset, operand_size)?;
+        let saved_tag = self.fpu.tag;
+        for i in 0..8u32 {
+            let mem = MemoryOperand {
+                segment,
+                offset: offset + env + i * 10,
+            };
+            let value = self.read_extended80(bus, mem)?;
+            self.fpu.set(i as u8, value);
+        }
+        // set() recomputed tags from the values; the saved tag word is authoritative.
+        self.fpu.tag = saved_tag;
+        Ok(())
+    }
+
+    fn read_bcd80<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        segment: SegmentIndex,
+        offset: u32,
+    ) -> ExecResult<f64> {
+        let d0 = self.read_memory_sized(
+            bus,
+            segment,
+            offset,
+            OperandSize::Dword,
+            BusAccessKind::DataRead,
+        )?;
+        let d1 = self.read_memory_sized(
+            bus,
+            segment,
+            offset + 4,
+            OperandSize::Dword,
+            BusAccessKind::DataRead,
+        )?;
+        let w = self.read_memory_sized(
+            bus,
+            segment,
+            offset + 8,
+            OperandSize::Word,
+            BusAccessKind::DataRead,
+        )?;
+        // Nine magnitude bytes (18 packed digits), least significant first; the sign is
+        // bit 7 of the tenth byte.
+        let raw = [
+            d0 as u8,
+            (d0 >> 8) as u8,
+            (d0 >> 16) as u8,
+            (d0 >> 24) as u8,
+            d1 as u8,
+            (d1 >> 8) as u8,
+            (d1 >> 16) as u8,
+            (d1 >> 24) as u8,
+            w as u8,
+        ];
+        let negative = (w >> 8) & 0x80 != 0;
+        let mut value: i64 = 0;
+        for &b in raw.iter().rev() {
+            value = value * 100 + i64::from((b >> 4) * 10 + (b & 0x0f));
+        }
+        let v = value as f64;
+        Ok(if negative { -v } else { v })
+    }
+
+    fn write_bcd80<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        segment: SegmentIndex,
+        offset: u32,
+        value: f64,
+    ) -> ExecResult<()> {
+        let negative = value.is_sign_negative();
+        let mut magnitude = fpu_round_to_i64(value.abs()).unsigned_abs();
+        let mut raw = [0u8; 9];
+        for slot in raw.iter_mut() {
+            let lo = (magnitude % 10) as u8;
+            magnitude /= 10;
+            let hi = (magnitude % 10) as u8;
+            magnitude /= 10;
+            *slot = (hi << 4) | lo;
+        }
+        let d0 = u32::from(raw[0])
+            | (u32::from(raw[1]) << 8)
+            | (u32::from(raw[2]) << 16)
+            | (u32::from(raw[3]) << 24);
+        let d1 = u32::from(raw[4])
+            | (u32::from(raw[5]) << 8)
+            | (u32::from(raw[6]) << 16)
+            | (u32::from(raw[7]) << 24);
+        let w = u32::from(raw[8]) | if negative { 0x8000 } else { 0 };
+        self.write_memory_sized(
+            bus,
+            segment,
+            offset,
+            OperandSize::Dword,
+            d0,
+            BusAccessKind::DataWrite,
+        )?;
+        self.write_memory_sized(
+            bus,
+            segment,
+            offset + 4,
+            OperandSize::Dword,
+            d1,
+            BusAccessKind::DataWrite,
+        )?;
+        self.write_memory_sized(
+            bus,
+            segment,
+            offset + 8,
+            OperandSize::Word,
+            w,
             BusAccessKind::DataWrite,
         )
     }
@@ -10503,5 +10753,64 @@ mod tests {
             cpu.cycle(&mut bus).unwrap();
         }
         assert_eq!(cpu.fpu.get(0), 3.5);
+    }
+
+    // ---- Phase 2 slice D: BCD, environment, state save/restore, FUCOMPP ----
+
+    #[test]
+    fn fbld_fbstp_round_trips_packed_bcd() {
+        // FILD m32 [0x100]=12345; FBSTP m80 [0x108] (DF /6); FBLD m80 [0x108] (DF /4).
+        let code = [
+            0xdb, 0x06, 0x00, 0x01, 0xdf, 0x36, 0x08, 0x01, 0xdf, 0x26, 0x08, 0x01,
+        ];
+        let (mut cpu, mut memory) = real_mode_cpu(&code, 0x200);
+        memory[0x100..0x104].copy_from_slice(&12345i32.to_le_bytes());
+        let mut bus = TestBus::with_memory(memory);
+        for _ in 0..3 {
+            cpu.cycle(&mut bus).unwrap();
+        }
+        assert_eq!(cpu.fpu.get(0), 12345.0);
+    }
+
+    #[test]
+    fn fnsave_frstor_round_trips_registers() {
+        // FLD1; FLD m64 [0x180]=2.5; FNSAVE [0x100] (DD /6); FRSTOR [0x100] (DD /4).
+        let code = [
+            0xd9, 0xe8, 0xdd, 0x06, 0x80, 0x01, 0xdd, 0x36, 0x00, 0x01, 0xdd, 0x26, 0x00, 0x01,
+        ];
+        let (mut cpu, mut memory) = real_mode_cpu(&code, 0x200);
+        memory[0x180..0x188].copy_from_slice(&2.5f64.to_le_bytes());
+        let mut bus = TestBus::with_memory(memory);
+        for _ in 0..4 {
+            cpu.cycle(&mut bus).unwrap();
+        }
+        assert_eq!(cpu.fpu.get(0), 2.5);
+        assert_eq!(cpu.fpu.get(1), 1.0);
+    }
+
+    #[test]
+    fn fnstenv_fldenv_round_trips_top() {
+        // FLD1 (TOP=7); FNSTENV [0x100] (D9 /6); FNINIT (TOP=0); FLDENV [0x100] (D9 /4).
+        let code = [
+            0xd9, 0xe8, 0xd9, 0x36, 0x00, 0x01, 0xdb, 0xe3, 0xd9, 0x26, 0x00, 0x01,
+        ];
+        let (mut cpu, memory) = real_mode_cpu(&code, 0x200);
+        let mut bus = TestBus::with_memory(memory);
+        for _ in 0..4 {
+            cpu.cycle(&mut bus).unwrap();
+        }
+        assert_eq!(cpu.fpu.top(), 7);
+    }
+
+    #[test]
+    fn fucompp_sets_equal_condition() {
+        // FLD1; FLD1; FUCOMPP (DA E9): equal -> C3 set, both popped.
+        let (mut cpu, memory) = real_mode_cpu(&[0xd9, 0xe8, 0xd9, 0xe8, 0xda, 0xe9], 0x20);
+        let mut bus = TestBus::with_memory(memory);
+        for _ in 0..3 {
+            cpu.cycle(&mut bus).unwrap();
+        }
+        assert_eq!((cpu.fpu.status >> 14) & 1, 1, "C3 set on equal");
+        assert_eq!(cpu.fpu.top(), 0, "both operands popped");
     }
 }
