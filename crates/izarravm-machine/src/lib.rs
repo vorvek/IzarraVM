@@ -4055,6 +4055,13 @@ impl CpuBus for MachineBus<'_> {
             return Ok(());
         }
         if self.dma.write_port(port, value as u8) {
+            // The 8237A runs a memory-to-memory block transfer when the guest
+            // arms a software DREQ on channel 0 (a write to the request register,
+            // port 0x09) with mem-to-mem enabled in the command register. The
+            // write above recorded the request; fire the block copy here.
+            if port == 0x09 && self.dma.mem_to_mem_request_armed() {
+                self.dma.mem_to_mem(self.memory);
+            }
             return Ok(());
         }
         if port == 0x61 {
@@ -6593,6 +6600,69 @@ mod tests {
             machine.dma_read_word(5).is_some(),
             "auto-init keeps feeding"
         );
+    }
+
+    #[test]
+    fn dma_software_request_drives_a_mem_to_mem_block_copy() {
+        // Program the 8237A through the ports for a memory-to-memory copy, then
+        // arm it with a software DREQ on channel 0 (a write to the request
+        // register) and confirm the destination block in guest memory matches the
+        // source. The machine fires the burst on that request-register write.
+        let mut machine = test_machine();
+        let src = [0xDE, 0xAD, 0xBE, 0xEFu8];
+        for (i, &b) in src.iter().enumerate() {
+            machine.write_physical_u8(0x0100 + i as u32, b);
+        }
+        with_bus(&mut machine, |bus| {
+            // Channel 0 source address 0x0100, channel 1 dest address 0x0200.
+            bus.write_io(0x00, BusWidth::Byte, 0x00).unwrap(); // ch0 addr LSB
+            bus.write_io(0x00, BusWidth::Byte, 0x01).unwrap(); // ch0 addr MSB -> 0x0100
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap(); // ch1 addr LSB
+            bus.write_io(0x02, BusWidth::Byte, 0x02).unwrap(); // ch1 addr MSB -> 0x0200
+            bus.write_io(0x03, BusWidth::Byte, 0x03).unwrap(); // ch1 count LSB
+            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap(); // ch1 count MSB -> 3 (4 bytes)
+            bus.write_io(0x87, BusWidth::Byte, 0x00).unwrap(); // ch0 page 0
+            bus.write_io(0x83, BusWidth::Byte, 0x00).unwrap(); // ch1 page 0
+            bus.write_io(0x0A, BusWidth::Byte, 0x00).unwrap(); // unmask ch0 (the requester)
+            bus.write_io(0x08, BusWidth::Byte, 0x01).unwrap(); // command: mem-to-mem enable
+            // Arm the software DREQ on channel 0: bit2 set, channel bits 0-1 = 0.
+            // This write triggers the block copy.
+            bus.write_io(0x09, BusWidth::Byte, 0x04).unwrap();
+        });
+        for (i, &b) in src.iter().enumerate() {
+            assert_eq!(
+                machine.read_physical_u8(0x0200 + i as u32),
+                b,
+                "dest byte {i} copied from the source block"
+            );
+        }
+    }
+
+    #[test]
+    fn dma_software_request_without_mem_to_mem_enable_does_nothing() {
+        // The same request-register write, but with mem-to-mem disabled (command
+        // bit0 clear), must not move any memory: the destination stays zero.
+        let mut machine = test_machine();
+        for i in 0..4 {
+            machine.write_physical_u8(0x0100 + i, 0xAB);
+        }
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x00, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x00, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x02).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x03).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x0A, BusWidth::Byte, 0x00).unwrap(); // unmask ch0
+            bus.write_io(0x09, BusWidth::Byte, 0x04).unwrap(); // arm, but command bit0 not set
+        });
+        for i in 0..4 {
+            assert_eq!(
+                machine.read_physical_u8(0x0200 + i),
+                0x00,
+                "no copy when mem-to-mem is disabled"
+            );
+        }
     }
 
     // Run one closure against a freshly-borrowed bus over the whole machine.

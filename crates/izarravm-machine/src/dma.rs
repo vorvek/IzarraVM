@@ -322,6 +322,17 @@ impl DmaChip {
         self.command & 0x04 != 0
     }
 
+    /// Whether a software DREQ on channel 0 is currently armed to launch a
+    /// memory-to-memory transfer: mem-to-mem enabled (command bit0), the
+    /// controller live, channel 0 unmasked, and its request-register bit set. The
+    /// machine checks this after a write to the request register to fire the copy.
+    fn mem_to_mem_request_armed(&self) -> bool {
+        self.mem_to_mem_enabled()
+            && !self.controller_disabled()
+            && !self.channels[0].mask
+            && self.request_reg & 0x01 != 0
+    }
+
     /// Read one byte from the device (memory->device) on local channel `ci`,
     /// latching terminal-count into the status register. Returns None when the
     /// controller is disabled by command bit2.
@@ -586,9 +597,15 @@ impl DmaController {
     /// count copied, or None when not enabled or the controller is disabled.
     // ponytail: only the master pair carries the mem-to-mem hardware; the slave
     // 8237A never does on the PC/AT, so no slave variant exists.
-    #[allow(dead_code)] // ponytail: no Machine-level mem-to-mem wiring yet (see DmaChannel::write_byte).
     pub(crate) fn mem_to_mem(&mut self, memory: &mut Memory) -> Option<usize> {
         self.master.mem_to_mem(memory)
+    }
+
+    /// Whether a software DREQ on master channel 0 is armed to launch a
+    /// memory-to-memory transfer. The machine checks this after a request-register
+    /// write (port 0x09) and, when true, calls `mem_to_mem` to move the block.
+    pub(crate) fn mem_to_mem_request_armed(&self) -> bool {
+        self.master.mem_to_mem_request_armed()
     }
 }
 
