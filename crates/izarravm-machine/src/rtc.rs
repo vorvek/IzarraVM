@@ -397,9 +397,6 @@ impl Rtc {
 
     /// The century stored in CMOS byte 0x32, as a binary number (e.g. 20). The
     /// INT 1Ah AH=04h handler reads this to report the full date in BCD.
-    // ponytail: unused until the INT 1Ah AH=04h/05h wiring lands in lib.rs; that
-    // is a separate follow-up, so allow dead code rather than stub a caller here.
-    #[allow(dead_code)]
     pub fn century(&self) -> u8 {
         bcd_to_bin(self.ram[REG_CENTURY])
     }
@@ -408,8 +405,6 @@ impl Rtc {
     /// BCD, mirror it to the PS/2 alternate slot 0x37, and roll the clock's full
     /// year to match. Both slots sit outside the checksum range, so this does
     /// not disturb the NVRAM checksum.
-    // ponytail: unused until the INT 1Ah AH=05h wiring lands in lib.rs.
-    #[allow(dead_code)]
     pub fn set_century(&mut self, century: u8) {
         let bcd = bin_to_bcd(century);
         self.ram[REG_CENTURY] = bcd;
