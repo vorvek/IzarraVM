@@ -2,6 +2,7 @@ use izarravm_bus::{BusAccessKind, BusError, BusWidth, CpuBus};
 use thiserror::Error;
 
 mod fpu;
+mod mmx;
 pub use fpu::X87;
 
 const FLAG_CF: u32 = 0x0000_0001;
@@ -1866,6 +1867,9 @@ impl Cpu386 {
             });
         }
         match opcode {
+            // ponytail: MMX is not gated to 586+; a throttled 386/486 GSW mode would
+            // wrongly accept it. Gate it with the others if that fidelity gap matters.
+            op if is_mmx_two_byte(op) => self.execute_mmx(bus, op, prefixes, address_size),
             0x01 => {
                 let modrm = self.fetch_modrm(bus)?;
                 let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
@@ -5212,6 +5216,237 @@ impl Cpu386 {
             offset + 8,
             OperandSize::Word,
             w,
+            BusAccessKind::DataWrite,
+        )
+    }
+}
+
+/// The base MMX second-byte opcodes (after 0F). Excludes the SSE/SSE2 additions
+/// that share the integer-SIMD ranges (PADDQ 0F D4, PAVGB 0F E0, etc.).
+const fn is_mmx_two_byte(opcode: u8) -> bool {
+    matches!(
+        opcode,
+        0x60..=0x6b
+            | 0x6e
+            | 0x6f
+            | 0x71..=0x77
+            | 0x7e
+            | 0x7f
+            | 0xd1..=0xd3
+            | 0xd5
+            | 0xd8
+            | 0xd9
+            | 0xdb
+            | 0xdc
+            | 0xdd
+            | 0xdf
+            | 0xe1
+            | 0xe2
+            | 0xe5
+            | 0xe8
+            | 0xe9
+            | 0xeb
+            | 0xec
+            | 0xed
+            | 0xef
+            | 0xf1..=0xf3
+            | 0xf5
+            | 0xf8..=0xfa
+            | 0xfc..=0xfe
+    )
+}
+
+impl Cpu386 {
+    // ================================ MMX ================================
+    // 0F-extended integer SIMD on the eight 64-bit MMX registers (mmx.rs holds the
+    // lane math). EMMS takes no operand; the shift-by-immediate forms (0F 71/72/73)
+    // and MOVD/MOVQ have their own operand shapes; everything else is the regular
+    // Pxxx mm, mm/m64 form.
+
+    fn execute_mmx<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        opcode: u8,
+        prefixes: Prefixes,
+        address_size: AddressSize,
+    ) -> ExecResult<CycleOutcome> {
+        if opcode == 0x77 {
+            self.fpu.emms();
+            return Ok(clocks(6));
+        }
+        let modrm = self.fetch_modrm(bus)?;
+
+        if matches!(opcode, 0x71..=0x73) {
+            // Shift mm by an immediate; modrm.reg selects the shift, modrm.rm the register.
+            let count = u64::from(self.fetch_u8(bus)?);
+            let target = modrm.rm;
+            let a = self.fpu.mm(target);
+            let result = match (opcode, modrm.reg) {
+                (0x71, 2) => mmx::psrlw(a, count),
+                (0x71, 4) => mmx::psraw(a, count),
+                (0x71, 6) => mmx::psllw(a, count),
+                (0x72, 2) => mmx::psrld(a, count),
+                (0x72, 4) => mmx::psrad(a, count),
+                (0x72, 6) => mmx::pslld(a, count),
+                (0x73, 2) => mmx::psrlq(a, count),
+                (0x73, 6) => mmx::psllq(a, count),
+                _ => return self.fpu_unsupported(opcode),
+            };
+            self.fpu.set_mm(target, result);
+            return Ok(clocks(6));
+        }
+
+        let dest = modrm.reg;
+        match opcode {
+            0x6e => {
+                // MOVD mm, r/m32: zero-extend a dword into the register.
+                let v =
+                    self.read_rm_sized(bus, prefixes, address_size, OperandSize::Dword, modrm)?;
+                self.fpu.set_mm(dest, u64::from(v));
+                return Ok(clocks(4));
+            }
+            0x7e => {
+                // MOVD r/m32, mm: store the low dword.
+                let v = self.fpu.mm(dest) as u32;
+                self.write_rm_sized(bus, prefixes, address_size, OperandSize::Dword, modrm, v)?;
+                return Ok(clocks(4));
+            }
+            0x6f => {
+                // MOVQ mm, mm/m64.
+                let v = self.read_mmx_operand(bus, prefixes, address_size, modrm)?;
+                self.fpu.set_mm(dest, v);
+                return Ok(clocks(4));
+            }
+            0x7f => {
+                // MOVQ mm/m64, mm.
+                let v = self.fpu.mm(dest);
+                self.write_mmx_operand(bus, prefixes, address_size, modrm, v)?;
+                return Ok(clocks(4));
+            }
+            _ => {}
+        }
+
+        let src = self.read_mmx_operand(bus, prefixes, address_size, modrm)?;
+        let a = self.fpu.mm(dest);
+        let result = match opcode {
+            0x60 => mmx::punpcklbw(a, src),
+            0x61 => mmx::punpcklwd(a, src),
+            0x62 => mmx::punpckldq(a, src),
+            0x63 => mmx::packsswb(a, src),
+            0x64 => mmx::pcmpgt_b(a, src),
+            0x65 => mmx::pcmpgt_w(a, src),
+            0x66 => mmx::pcmpgt_d(a, src),
+            0x67 => mmx::packuswb(a, src),
+            0x68 => mmx::punpckhbw(a, src),
+            0x69 => mmx::punpckhwd(a, src),
+            0x6a => mmx::punpckhdq(a, src),
+            0x6b => mmx::packssdw(a, src),
+            0x74 => mmx::pcmpeq_b(a, src),
+            0x75 => mmx::pcmpeq_w(a, src),
+            0x76 => mmx::pcmpeq_d(a, src),
+            0xd1 => mmx::psrlw(a, src),
+            0xd2 => mmx::psrld(a, src),
+            0xd3 => mmx::psrlq(a, src),
+            0xd5 => mmx::pmullw(a, src),
+            0xd8 => mmx::psubus_b(a, src),
+            0xd9 => mmx::psubus_w(a, src),
+            0xdb => mmx::pand(a, src),
+            0xdc => mmx::paddus_b(a, src),
+            0xdd => mmx::paddus_w(a, src),
+            0xdf => mmx::pandn(a, src),
+            0xe1 => mmx::psraw(a, src),
+            0xe2 => mmx::psrad(a, src),
+            0xe5 => mmx::pmulhw(a, src),
+            0xe8 => mmx::psubs_b(a, src),
+            0xe9 => mmx::psubs_w(a, src),
+            0xeb => mmx::por(a, src),
+            0xec => mmx::padds_b(a, src),
+            0xed => mmx::padds_w(a, src),
+            0xef => mmx::pxor(a, src),
+            0xf1 => mmx::psllw(a, src),
+            0xf2 => mmx::pslld(a, src),
+            0xf3 => mmx::psllq(a, src),
+            0xf5 => mmx::pmaddwd(a, src),
+            0xf8 => mmx::psub_b(a, src),
+            0xf9 => mmx::psub_w(a, src),
+            0xfa => mmx::psub_d(a, src),
+            0xfc => mmx::padd_b(a, src),
+            0xfd => mmx::padd_w(a, src),
+            0xfe => mmx::padd_d(a, src),
+            _ => return self.fpu_unsupported(opcode),
+        };
+        self.fpu.set_mm(dest, result);
+        Ok(clocks(4))
+    }
+
+    fn read_mmx_operand<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        prefixes: Prefixes,
+        address_size: AddressSize,
+        modrm: ModRm,
+    ) -> ExecResult<u64> {
+        match self.decode_rm_operand(bus, prefixes, address_size, modrm)? {
+            RmOperand::Register(index) => Ok(self.fpu.mm(index)),
+            RmOperand::Memory(mem) => self.read_qword(bus, mem),
+        }
+    }
+
+    fn write_mmx_operand<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        prefixes: Prefixes,
+        address_size: AddressSize,
+        modrm: ModRm,
+        value: u64,
+    ) -> ExecResult<()> {
+        match self.decode_rm_operand(bus, prefixes, address_size, modrm)? {
+            RmOperand::Register(index) => {
+                self.fpu.set_mm(index, value);
+                Ok(())
+            }
+            RmOperand::Memory(mem) => self.write_qword(bus, mem, value),
+        }
+    }
+
+    fn read_qword<B: CpuBus>(&mut self, bus: &mut B, mem: MemoryOperand) -> ExecResult<u64> {
+        let lo = self.read_memory_sized(
+            bus,
+            mem.segment,
+            mem.offset,
+            OperandSize::Dword,
+            BusAccessKind::DataRead,
+        )?;
+        let hi = self.read_memory_sized(
+            bus,
+            mem.segment,
+            mem.offset.wrapping_add(4),
+            OperandSize::Dword,
+            BusAccessKind::DataRead,
+        )?;
+        Ok((u64::from(hi) << 32) | u64::from(lo))
+    }
+
+    fn write_qword<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        mem: MemoryOperand,
+        value: u64,
+    ) -> ExecResult<()> {
+        self.write_memory_sized(
+            bus,
+            mem.segment,
+            mem.offset,
+            OperandSize::Dword,
+            value as u32,
+            BusAccessKind::DataWrite,
+        )?;
+        self.write_memory_sized(
+            bus,
+            mem.segment,
+            mem.offset.wrapping_add(4),
+            OperandSize::Dword,
+            (value >> 32) as u32,
             BusAccessKind::DataWrite,
         )
     }
@@ -10812,5 +11047,58 @@ mod tests {
         }
         assert_eq!((cpu.fpu.status >> 14) & 1, 1, "C3 set on equal");
         assert_eq!(cpu.fpu.top(), 0, "both operands popped");
+    }
+
+    // ---- Phase 3: MMX execute path (lane math is unit-tested in mmx.rs) ----
+
+    #[test]
+    fn movd_then_movq_copies_registers() {
+        // MOVD mm0, eax (0F 6E C0); MOVQ mm1, mm0 (0F 6F C8).
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x6e, 0xc0, 0x0f, 0x6f, 0xc8], 0x20);
+        cpu.registers.set_eax(0x0a0b_0c0d);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.fpu.mm(0), 0x0a0b_0c0d);
+        assert_eq!(cpu.fpu.mm(1), 0x0a0b_0c0d);
+    }
+
+    #[test]
+    fn paddb_adds_packed_bytes_from_memory() {
+        // MOVQ mm0, [0x100]; PADDB mm0, [0x108].
+        let code = [0x0f, 0x6f, 0x06, 0x00, 0x01, 0x0f, 0xfc, 0x06, 0x08, 0x01];
+        let (mut cpu, mut memory) = real_mode_cpu(&code, 0x200);
+        memory[0x100..0x108].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        memory[0x108..0x110].copy_from_slice(&[10, 10, 10, 10, 10, 10, 10, 10]);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(
+            cpu.fpu.mm(0).to_le_bytes(),
+            [11, 12, 13, 14, 15, 16, 17, 18]
+        );
+    }
+
+    #[test]
+    fn emms_marks_the_x87_stack_empty() {
+        // MOVD mm0, eax marks the tags valid; EMMS (0F 77) empties them.
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x6e, 0xc0, 0x0f, 0x77], 0x20);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.fpu.tag, 0x0000, "MMX write marks tags valid");
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.fpu.tag, 0xffff, "EMMS empties the tag word");
+    }
+
+    #[test]
+    fn psllw_immediate_shifts_each_word() {
+        // MOVD mm0, eax (0x0001_0002); PSLLW mm0, 4 (0F 71 /6 imm8).
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x6e, 0xc0, 0x0f, 0x71, 0xf0, 0x04], 0x20);
+        cpu.registers.set_eax(0x0001_0002);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        cpu.cycle(&mut bus).unwrap();
+        // low dword loaded; word lanes 0x0002 and 0x0001 each shift left by 4.
+        assert_eq!(cpu.fpu.mm(0) & 0xffff_ffff, 0x0010_0020);
     }
 }
