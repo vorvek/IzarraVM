@@ -16,7 +16,8 @@ pub(crate) struct DmaChannel {
     pub page: u8,             // high address byte A16-A23 (page register)
     pub addr_decrement: bool, // mode bit5
     pub auto_init: bool,      // mode bit4
-    pub transfer_kind: u8,    // mode bits2-3: 0 verify, 1 write(m->i/o), 2 read(i/o->m)
+    pub transfer_kind: u8,    // mode bits2-3: 0 verify, 1 write(i/o->mem), 2 read(mem->i/o)
+    pub transfer_mode: u8,    // mode bits6-7: 0 demand, 1 single, 2 block, 3 cascade
     pub mask: bool,           // mask register bit
     pub reached_tc: bool,
 }
@@ -32,6 +33,7 @@ impl Default for DmaChannel {
             addr_decrement: false,
             auto_init: false,
             transfer_kind: 0,
+            transfer_mode: 0,
             mask: true,
             reached_tc: false,
         }
@@ -39,11 +41,14 @@ impl Default for DmaChannel {
 }
 
 impl DmaChannel {
-    /// Mode register write (bits 2-3 transfer kind, bit4 auto-init, bit5 addr dec).
+    /// Mode register write (bits 2-3 transfer kind, bit4 auto-init, bit5 addr dec,
+    /// bits 6-7 transfer mode). Only single transfer has a datapath; the other
+    /// mode encodings are stored but otherwise stepped one transfer at a time.
     pub(crate) fn set_mode(&mut self, value: u8) {
         self.transfer_kind = (value >> 2) & 0x3;
         self.auto_init = value & 0x10 != 0;
         self.addr_decrement = value & 0x20 != 0;
+        self.transfer_mode = (value >> 6) & 0x3;
     }
 
     /// Byte address the master (8-bit) drives: page in A23-A16, cur_addr in A15-A0.
@@ -60,7 +65,7 @@ impl DmaChannel {
 
     /// Shared per-transfer step: advance the address counter, decrement the count
     /// through zero to terminal count, then reload (auto-init) or mask (single).
-    fn step_after_read(&mut self) {
+    fn step_transfer(&mut self) {
         self.cur_addr = if self.addr_decrement {
             self.cur_addr.wrapping_sub(1)
         } else {
@@ -81,29 +86,74 @@ impl DmaChannel {
     }
 
     /// Read one byte from memory (memory->device read transfer) and step the
-    /// channel. Returns None when masked or already at terminal count.
+    /// channel. Returns None when masked, not programmed for a read transfer, or
+    /// already at terminal count.
     pub(crate) fn read_byte(&mut self, memory: &mut Memory) -> Option<u8> {
-        if self.mask {
+        if self.mask || self.transfer_kind != 2 {
             return None;
         }
         let byte = memory.read_u8(self.byte_address() as usize).ok()?;
-        self.step_after_read();
+        self.step_transfer();
         Some(byte)
     }
 
     /// Read one little-endian word from memory on the slave's word-addressed path
     /// (memory->device, 16-bit DMA). The counter steps in words, exactly as the
     /// byte path steps in bytes; only the address formation differs. Returns None
-    /// when masked or already at terminal count.
+    /// when masked, not programmed for a read transfer, or at terminal count.
     pub(crate) fn read_word(&mut self, memory: &mut Memory) -> Option<u16> {
-        if self.mask {
+        if self.mask || self.transfer_kind != 2 {
             return None;
         }
         let addr = self.word_address() as usize;
         let lo = memory.read_u8(addr).ok()?;
         let hi = memory.read_u8(addr + 1).ok()?;
-        self.step_after_read();
+        self.step_transfer();
         Some(u16::from_le_bytes([lo, hi]))
+    }
+
+    /// Write one byte to memory (device->memory write transfer) and step the
+    /// channel. Returns None when masked, not programmed for a write transfer, or
+    /// already at terminal count.
+    // ponytail: ceiling is the datapath itself; no Machine-level helper wires
+    // device->memory or verify transfers yet (that would need an edit to
+    // izarravm-machine/src/lib.rs, deliberately out of scope here).
+    #[allow(dead_code)]
+    pub(crate) fn write_byte(&mut self, memory: &mut Memory, byte: u8) -> Option<()> {
+        if self.mask || self.transfer_kind != 1 {
+            return None;
+        }
+        memory.write_u8(self.byte_address() as usize, byte).ok()?;
+        self.step_transfer();
+        Some(())
+    }
+
+    /// Write one little-endian word to memory on the slave's word-addressed path
+    /// (device->memory, 16-bit DMA) and step the channel. Returns None when
+    /// masked, not programmed for a write transfer, or at terminal count.
+    #[allow(dead_code)] // ponytail: no Machine-level write wiring yet (see write_byte).
+    pub(crate) fn write_word(&mut self, memory: &mut Memory, word: u16) -> Option<()> {
+        if self.mask || self.transfer_kind != 1 {
+            return None;
+        }
+        let addr = self.word_address() as usize;
+        let [lo, hi] = word.to_le_bytes();
+        memory.write_u8(addr, lo).ok()?;
+        memory.write_u8(addr + 1, hi).ok()?;
+        self.step_transfer();
+        Some(())
+    }
+
+    /// Verify transfer (transfer_kind 0): step address and count with no memory
+    /// access, exactly as the 8237A does for a verify cycle. Returns None when
+    /// masked, not programmed for a verify transfer, or already at terminal count.
+    #[allow(dead_code)] // ponytail: no Machine-level verify wiring yet (see write_byte).
+    pub(crate) fn verify(&mut self) -> Option<()> {
+        if self.mask || self.transfer_kind != 0 {
+            return None;
+        }
+        self.step_transfer();
+        Some(())
     }
 }
 
@@ -186,8 +236,10 @@ impl DmaChip {
         } else {
             match local {
                 8 => {
-                    // Status read returns terminal-count bits and clears them.
-                    let s = self.status;
+                    // Status read: bits 0-3 are terminal-count (read-clear), bits
+                    // 4-7 are the per-channel DREQ-active level taken from the low
+                    // nibble of the request register (level, not read-cleared).
+                    let s = (self.status & 0x0F) | ((self.request_reg & 0x0F) << 4);
                     self.status = 0;
                     Some(s)
                 }
@@ -270,6 +322,39 @@ impl DmaChip {
         }
         Some(word)
     }
+
+    /// Write one byte from the device (device->memory) on local channel `ci`,
+    /// latching terminal-count into the status register.
+    #[allow(dead_code)] // ponytail: no Machine-level write wiring yet (see DmaChannel::write_byte).
+    fn write_byte(&mut self, ci: usize, memory: &mut Memory, byte: u8) -> Option<()> {
+        self.channels[ci].write_byte(memory, byte)?;
+        if self.channels[ci].reached_tc {
+            self.status |= 1 << ci;
+        }
+        Some(())
+    }
+
+    /// Write one 16-bit word from the device (device->memory) on local channel
+    /// `ci`, latching terminal-count into the status register.
+    #[allow(dead_code)] // ponytail: no Machine-level write wiring yet (see DmaChannel::write_byte).
+    fn write_word(&mut self, ci: usize, memory: &mut Memory, word: u16) -> Option<()> {
+        self.channels[ci].write_word(memory, word)?;
+        if self.channels[ci].reached_tc {
+            self.status |= 1 << ci;
+        }
+        Some(())
+    }
+
+    /// Run one verify transfer on local channel `ci`, latching terminal-count
+    /// into the status register. No memory is touched.
+    #[allow(dead_code)] // ponytail: no Machine-level verify wiring yet (see DmaChannel::write_byte).
+    fn verify(&mut self, ci: usize) -> Option<()> {
+        self.channels[ci].verify()?;
+        if self.channels[ci].reached_tc {
+            self.status |= 1 << ci;
+        }
+        Some(())
+    }
 }
 
 /// The master/slave 8237A pair. Channels 0-3 are the master (8-bit); channels
@@ -278,6 +363,13 @@ impl DmaChip {
 pub(crate) struct DmaController {
     pub(crate) master: DmaChip,
     slave: DmaChip,
+    /// Scratch latches for the page ports that the PC/AT decodes but does not
+    /// wire to a DMA channel (0x80, 0x84, 0x85, 0x86, 0x88, 0x8C, 0x8D, 0x8E).
+    /// Software reads them back as plain R/W bytes; indexed by port low nibble.
+    page_scratch: [u8; 16],
+    /// Refresh page register at 0x8F; a read/write latch unrelated to any DMA
+    /// channel (the refresh DRAM controller's page on the AT).
+    refresh_page: u8,
 }
 
 impl DmaController {
@@ -301,8 +393,9 @@ impl DmaController {
 
     /// IBM PC/AT page-register wiring. Note the address order is NOT channel
     /// order: 0x83->ch1, 0x81->ch2, 0x82->ch3, 0x87->ch0 (and the slave set).
+    /// 0x8F is the refresh page and 0x84-0x86/0x8C-0x8E/0x80/0x88 are scratch,
+    /// so neither appears here. Returns ("master"|"slave", local channel 0..3).
     fn page_target(port: u16) -> Option<(&'static str, usize)> {
-        // Returns ("master"|"slave", local channel index 0..3).
         match port {
             0x83 => Some(("master", 1)),
             0x81 => Some(("master", 2)),
@@ -311,9 +404,18 @@ impl DmaController {
             0x8B => Some(("slave", 1)),
             0x89 => Some(("slave", 2)),
             0x8A => Some(("slave", 3)),
-            0x8F => Some(("slave", 0)),
             _ => None,
         }
+    }
+
+    /// The page ports the AT decodes but leaves unconnected to any DMA channel.
+    /// They behave as plain read/write scratch latches.
+    // ponytail: 0x80 is the AT's POST/manufacturing-test port and the rest of the
+    // machine already latches it as a passive diagnostic register, so the DMA
+    // scratch set deliberately excludes it (0x84-0x8E only). Claiming 0x80 here
+    // would shadow that POST latch, which is wired ahead of the passive map.
+    fn is_scratch_page(port: u16) -> bool {
+        matches!(port, 0x84 | 0x85 | 0x86 | 0x88 | 0x8C | 0x8D | 0x8E)
     }
 
     pub(crate) fn write_port(&mut self, port: u16, value: u8) -> bool {
@@ -332,6 +434,14 @@ impl DmaController {
             }
             return true;
         }
+        if port == 0x8F {
+            self.refresh_page = value;
+            return true;
+        }
+        if Self::is_scratch_page(port) {
+            self.page_scratch[(port & 0x0F) as usize] = value;
+            return true;
+        }
         false
     }
 
@@ -342,7 +452,21 @@ impl DmaController {
         if let Some(local) = Self::slave_local(port) {
             return self.slave.read_local(local);
         }
-        // Page registers are write-only on the PC; reads fall through to open bus.
+        // Page ports are plain R/W latches on the AT, so they read back what was
+        // last written: channel pages mirror the channel register, 0x8F is the
+        // refresh page, and the rest come from the scratch array.
+        if let Some((chip, ci)) = Self::page_target(port) {
+            return Some(match chip {
+                "master" => self.master.channels[ci].page,
+                _ => self.slave.channels[ci].page,
+            });
+        }
+        if port == 0x8F {
+            return Some(self.refresh_page);
+        }
+        if Self::is_scratch_page(port) {
+            return Some(self.page_scratch[(port & 0x0F) as usize]);
+        }
         None
     }
 
@@ -531,5 +655,295 @@ mod tests {
         // After reload the address is back at the base, so the next word repeats.
         assert_eq!(w0, 0x5678);
         assert_eq!(dma.read_word(5, &mut mem), Some(0x5678), "buffer restarts");
+    }
+
+    // --- Slice 1: page register read-back ---
+
+    #[test]
+    fn channel_page_ports_read_back_what_was_written() {
+        let mut dma = DmaController::default();
+        // Master channel pages, in the AT's non-channel-order wiring.
+        for (port, want) in [(0x83, 0xA1), (0x81, 0xA2), (0x82, 0xA3), (0x87, 0xA0)] {
+            dma.write_port(port, want);
+            assert_eq!(dma.read_port(port), Some(want), "master page {port:#x}");
+        }
+        // Slave channel pages (channels 5-7; 0x8F is no longer slave ch0).
+        for (port, want) in [(0x8B, 0xB1), (0x89, 0xB2), (0x8A, 0xB3)] {
+            dma.write_port(port, want);
+            assert_eq!(dma.read_port(port), Some(want), "slave page {port:#x}");
+        }
+    }
+
+    #[test]
+    fn scratch_page_ports_are_plain_read_write_latches() {
+        let mut dma = DmaController::default();
+        for (i, port) in [0x84u16, 0x85, 0x86, 0x88, 0x8C, 0x8D, 0x8E]
+            .into_iter()
+            .enumerate()
+        {
+            let val = 0x10 + i as u8;
+            assert_eq!(
+                dma.read_port(port),
+                Some(0),
+                "scratch {port:#x} starts zero"
+            );
+            assert!(
+                dma.write_port(port, val),
+                "scratch {port:#x} accepts a write"
+            );
+            assert_eq!(
+                dma.read_port(port),
+                Some(val),
+                "scratch {port:#x} round trip"
+            );
+        }
+    }
+
+    #[test]
+    fn dma_does_not_claim_the_post_diagnostic_port_0x80() {
+        // 0x80 stays with the machine's passive POST latch, so the DMA controller
+        // must decline both reads and writes for it.
+        let mut dma = DmaController::default();
+        assert!(
+            !dma.write_port(0x80, 0x42),
+            "0x80 is not a DMA scratch latch"
+        );
+        assert_eq!(dma.read_port(0x80), None, "0x80 reads fall through DMA");
+    }
+
+    #[test]
+    fn refresh_page_0x8f_is_its_own_latch_not_slave_channel_zero() {
+        let mut dma = DmaController::default();
+        dma.write_port(0x8F, 0x77);
+        assert_eq!(dma.read_port(0x8F), Some(0x77), "0x8F reads back");
+        assert_eq!(dma.refresh_page, 0x77);
+        // Writing 0x8F must not bleed into slave channel 0 (the cascade channel).
+        assert_eq!(dma.slave.channels[0].page, 0x00);
+    }
+
+    // --- Slice 2: status request-active bits ---
+
+    #[test]
+    fn status_reflects_software_request_bits_without_clearing_them() {
+        let mut dma = DmaController::default();
+        // Request register write: bit2 sets, bits0-1 select the channel (ch2).
+        dma.write_port(0x09, 0x06); // set DREQ for channel 2
+        let s = dma.read_port(0x08).unwrap();
+        assert_eq!(s & (1 << (4 + 2)), 1 << 6, "request bit appears at 4+ci");
+        // Request bits are level, not read-cleared: a second read still shows it.
+        let s2 = dma.read_port(0x08).unwrap();
+        assert_eq!(
+            s2 & (1 << 6),
+            1 << 6,
+            "request bit is level, survives a read"
+        );
+    }
+
+    #[test]
+    fn status_tc_bits_clear_but_request_bits_persist() {
+        let mut dma = DmaController::default();
+        // Channel 0: one transfer to latch a TC bit, plus a software request.
+        dma.write_port(0x0B, 0x48); // mode ch0: single, read
+        dma.write_port(0x00, 0x00); // address LSB
+        dma.write_port(0x00, 0x00); // address MSB -> 0
+        dma.write_port(0x01, 0x00); // count -> 0 (one transfer)
+        dma.write_port(0x01, 0x00);
+        dma.write_port(0x0A, 0x00); // unmask ch0 (low 2 bits select the channel)
+        dma.write_port(0x09, 0x05); // software DREQ for channel 1
+        let mut mem = mem_with(0x0000, &[0x99]);
+        assert_eq!(dma.read_byte(0, &mut mem), Some(0x99));
+        let s = dma.read_port(0x08).unwrap();
+        assert_eq!(s & 0x01, 0x01, "ch0 TC latched");
+        assert_eq!(s & (1 << 5), 1 << 5, "ch1 request active");
+        let s2 = dma.read_port(0x08).unwrap();
+        assert_eq!(s2 & 0x01, 0x00, "TC bit cleared on read");
+        assert_eq!(s2 & (1 << 5), 1 << 5, "request bit remains");
+    }
+
+    // --- Slice 3: mode register transfer-mode field ---
+
+    #[test]
+    fn set_mode_decodes_the_transfer_mode_field() {
+        for (bits76, want) in [(0u8, 0u8), (1, 1), (2, 2), (3, 3)] {
+            let mut ch = DmaChannel::default();
+            // bits 6-7 carry the mode; keep the rest at a benign read encoding.
+            ch.set_mode((bits76 << 6) | 0x08);
+            assert_eq!(ch.transfer_mode, want, "mode bits {bits76:02b}");
+        }
+    }
+
+    // --- Slice 4: device->memory write and verify datapaths ---
+
+    #[test]
+    fn write_transfer_stores_to_memory_steps_and_signals_tc() {
+        // Channel programmed for a write (device->memory): kind 1, single mode.
+        let mut ch = DmaChannel {
+            base_addr: 0x0020,
+            cur_addr: 0x0020,
+            base_count: 2, // 3 transfers (n+1)
+            cur_count: 2,
+            mask: false,
+            ..Default::default()
+        };
+        ch.set_mode(0x45); // single, write (kind 1), auto-init off, ch1
+
+        let mut mem = Memory::new(0x0020 + 4).unwrap();
+        ch.write_byte(&mut mem, 0xDE).unwrap();
+        ch.write_byte(&mut mem, 0xAD).unwrap();
+        ch.write_byte(&mut mem, 0xBE).unwrap();
+        assert_eq!(mem.read_u8(0x0020).unwrap(), 0xDE);
+        assert_eq!(mem.read_u8(0x0021).unwrap(), 0xAD);
+        assert_eq!(mem.read_u8(0x0022).unwrap(), 0xBE);
+        assert!(ch.reached_tc);
+        assert!(ch.mask, "single mode masks the channel at TC");
+        assert_eq!(ch.write_byte(&mut mem, 0x00), None, "no writes after TC");
+    }
+
+    #[test]
+    fn write_transfer_auto_init_reloads_from_base() {
+        let mut ch = DmaChannel {
+            base_addr: 0x0010,
+            cur_addr: 0x0010,
+            base_count: 1, // 2 transfers per cycle
+            cur_count: 1,
+            mask: false,
+            ..Default::default()
+        };
+        ch.set_mode(0x55); // single, write, auto-init on
+
+        let mut mem = Memory::new(0x0010 + 4).unwrap();
+        ch.write_byte(&mut mem, 0x01).unwrap();
+        ch.write_byte(&mut mem, 0x02).unwrap(); // TC -> reload
+        assert!(ch.reached_tc);
+        assert!(!ch.mask, "auto-init keeps the channel unmasked");
+        assert_eq!(ch.cur_addr, ch.base_addr, "address reloaded from base");
+        assert_eq!(ch.cur_count, ch.base_count, "count reloaded from base");
+        // After reload the next write lands back at the base address.
+        ch.write_byte(&mut mem, 0x03).unwrap();
+        assert_eq!(mem.read_u8(0x0010).unwrap(), 0x03, "buffer restarts");
+    }
+
+    #[test]
+    fn write_word_stores_little_endian_on_the_slave_path() {
+        let mut ch = DmaChannel {
+            base_addr: 0x0008,
+            cur_addr: 0x0008,
+            base_count: 0,
+            cur_count: 0,
+            page: 0x01,
+            mask: false,
+            ..Default::default()
+        };
+        ch.set_mode(0x45); // single, write (kind 1)
+
+        let byte_addr = ((0x01u32 << 17) | (0x0008u32 << 1)) as usize;
+        let mut mem = Memory::new(byte_addr + 4).unwrap();
+        ch.write_word(&mut mem, 0xBEEF).unwrap();
+        assert_eq!(mem.read_u8(byte_addr).unwrap(), 0xEF, "low byte first");
+        assert_eq!(mem.read_u8(byte_addr + 1).unwrap(), 0xBE, "high byte next");
+        assert!(ch.reached_tc);
+    }
+
+    #[test]
+    fn transfer_kind_gates_the_datapaths() {
+        // A read-programmed channel refuses writes; a write-programmed one refuses
+        // reads; and verify only runs when kind is 0.
+        let mut read_ch = DmaChannel {
+            cur_count: 1,
+            mask: false,
+            ..Default::default()
+        };
+        read_ch.set_mode(0x48); // kind 2 (read)
+        let mut mem = Memory::new(8).unwrap();
+        assert_eq!(
+            read_ch.write_byte(&mut mem, 0xFF),
+            None,
+            "read channel refuses a write"
+        );
+        assert_eq!(read_ch.verify(), None, "read channel refuses a verify");
+        assert!(read_ch.read_byte(&mut mem).is_some(), "read channel reads");
+
+        let mut write_ch = DmaChannel {
+            cur_count: 1,
+            mask: false,
+            ..Default::default()
+        };
+        write_ch.set_mode(0x44); // kind 1 (write)
+        assert_eq!(
+            write_ch.read_byte(&mut mem),
+            None,
+            "write channel refuses a read"
+        );
+        assert!(
+            write_ch.write_byte(&mut mem, 0x01).is_some(),
+            "write channel writes"
+        );
+    }
+
+    #[test]
+    fn verify_transfer_steps_without_touching_memory() {
+        let mut ch = DmaChannel {
+            base_addr: 0x0030,
+            cur_addr: 0x0030,
+            base_count: 1, // 2 transfers
+            cur_count: 1,
+            mask: false,
+            ..Default::default()
+        };
+        ch.set_mode(0x40); // single, verify (kind 0)
+        ch.verify().unwrap();
+        assert_eq!(ch.cur_addr, 0x0031, "verify still advances the address");
+        assert_eq!(ch.cur_count, 0, "verify still decrements the count");
+        ch.verify().unwrap(); // TC
+        assert!(ch.reached_tc);
+        assert!(ch.mask, "single mode masks the channel at verify TC");
+        assert_eq!(ch.verify(), None, "no verify after TC");
+    }
+
+    #[test]
+    fn chip_write_latches_terminal_count_into_status() {
+        // Drive the chip-level write wrapper so its TC-latch path is exercised.
+        let mut chip = DmaChip::default();
+        chip.channels[2].mask = false;
+        chip.channels[2].cur_addr = 0x0040;
+        chip.channels[2].base_addr = 0x0040;
+        chip.channels[2].cur_count = 0; // one transfer -> immediate TC
+        chip.channels[2].set_mode(0x44); // kind 1 (write), ch2 bits ignored here
+        let mut mem = Memory::new(0x0040 + 2).unwrap();
+        chip.write_byte(2, &mut mem, 0x5A).unwrap();
+        assert_eq!(mem.read_u8(0x0040).unwrap(), 0x5A);
+        // Status read returns the latched TC for channel 2 and clears it.
+        assert_eq!(chip.read_local(8), Some(0x04));
+        assert_eq!(chip.read_local(8), Some(0x00));
+    }
+
+    #[test]
+    fn chip_verify_latches_terminal_count_into_status() {
+        let mut chip = DmaChip::default();
+        chip.channels[3].mask = false;
+        chip.channels[3].cur_count = 0; // one transfer -> immediate TC
+        chip.channels[3].set_mode(0x40); // kind 0 (verify)
+        chip.verify(3).unwrap();
+        assert_eq!(chip.read_local(8), Some(0x08), "ch3 TC latched by verify");
+    }
+
+    #[test]
+    fn chip_write_word_latches_terminal_count_into_status() {
+        let mut chip = DmaChip::default();
+        chip.channels[1].mask = false;
+        chip.channels[1].cur_addr = 0x0004;
+        chip.channels[1].page = 0x00;
+        chip.channels[1].cur_count = 0; // one transfer -> immediate TC
+        chip.channels[1].set_mode(0x44); // kind 1 (write)
+        let byte_addr = (0x0004u32 << 1) as usize;
+        let mut mem = Memory::new(byte_addr + 4).unwrap();
+        chip.write_word(1, &mut mem, 0x1234).unwrap();
+        assert_eq!(mem.read_u8(byte_addr).unwrap(), 0x34);
+        assert_eq!(mem.read_u8(byte_addr + 1).unwrap(), 0x12);
+        assert_eq!(
+            chip.read_local(8),
+            Some(0x02),
+            "ch1 TC latched by word write"
+        );
     }
 }
