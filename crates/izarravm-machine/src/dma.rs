@@ -2,8 +2,9 @@
 //!
 //! Built clean-room from the Intel 8237A datasheet cached at
 //! dev_docs/reference/8237a/. Single-transfer and auto-init modes are modeled
-//! (the two the Sound Blaster uses for 8-bit playback); demand, block, cascade
-//! and memory-to-memory modes are out of scope.
+//! (the two the Sound Blaster uses for 8-bit playback), plus the command
+//! register's controller-disable gate and the memory-to-memory block transfer.
+//! Demand, block and cascade modes are out of scope.
 
 use izarravm_bus::Memory;
 
@@ -303,9 +304,31 @@ impl DmaChip {
         self.channels.iter_mut().for_each(|c| c.mask = true);
     }
 
+    /// Command-register bit0: memory-to-memory transfers enabled.
+    fn mem_to_mem_enabled(&self) -> bool {
+        self.command & 0x01 != 0
+    }
+
+    /// Command-register bit1: channel-0 address hold. When set during a
+    /// memory-to-memory transfer the source address does not advance, so one
+    /// source byte fills the whole destination block.
+    fn channel0_hold(&self) -> bool {
+        self.command & 0x02 != 0
+    }
+
+    /// Command-register bit2: controller disable. When set, the whole chip is
+    /// inhibited and no transfer runs.
+    fn controller_disabled(&self) -> bool {
+        self.command & 0x04 != 0
+    }
+
     /// Read one byte from the device (memory->device) on local channel `ci`,
-    /// latching terminal-count into the status register.
+    /// latching terminal-count into the status register. Returns None when the
+    /// controller is disabled by command bit2.
     fn read_byte(&mut self, ci: usize, memory: &mut Memory) -> Option<u8> {
+        if self.controller_disabled() {
+            return None;
+        }
         let byte = self.channels[ci].read_byte(memory)?;
         if self.channels[ci].reached_tc {
             self.status |= 1 << ci;
@@ -314,8 +337,12 @@ impl DmaChip {
     }
 
     /// Read one 16-bit word from the device (memory->device) on local channel
-    /// `ci`, latching terminal-count into the status register.
+    /// `ci`, latching terminal-count into the status register. Returns None when
+    /// the controller is disabled by command bit2.
     fn read_word(&mut self, ci: usize, memory: &mut Memory) -> Option<u16> {
+        if self.controller_disabled() {
+            return None;
+        }
         let word = self.channels[ci].read_word(memory)?;
         if self.channels[ci].reached_tc {
             self.status |= 1 << ci;
@@ -323,10 +350,65 @@ impl DmaChip {
         Some(word)
     }
 
+    /// Run the 8237A memory-to-memory transfer the command register enables
+    /// (bit0). A software request on channel 0 copies a block from channel 0's
+    /// current address (the source) to channel 1's current address (the dest),
+    /// for channel 1's current word count, one byte per transfer, until channel
+    /// 1 reaches terminal count. Channel-0 address hold (command bit1) freezes
+    /// the source address so a single source byte fills the destination block.
+    ///
+    /// Both channels step through the shared `step_transfer` datapath, so address
+    /// increment/decrement, the count-through-zero terminal count, and auto-init
+    /// reload all match a normal channel. Returns the number of bytes copied, or
+    /// None when the controller is disabled, mem-to-mem is not enabled, or
+    /// channel 0 is masked.
+    // ponytail: ceiling is a single-shot block copy in one call, not a per-cycle
+    // DREQ/HRQ/HLDA handshake. The 8237A runs mem-to-mem as a burst that holds
+    // the bus until channel-1 TC, so doing it in one pass is faithful to the
+    // observable result; cycle-accurate bus arbitration is out of scope.
+    fn mem_to_mem(&mut self, memory: &mut Memory) -> Option<usize> {
+        if self.controller_disabled() || !self.mem_to_mem_enabled() {
+            return None;
+        }
+        if self.channels[0].mask {
+            return None;
+        }
+        let hold = self.channel0_hold();
+        let mut copied = 0usize;
+        loop {
+            let src = self.channels[0].byte_address() as usize;
+            let dst = self.channels[1].byte_address() as usize;
+            let byte = memory.read_u8(src).ok()?;
+            memory.write_u8(dst, byte).ok()?;
+            copied += 1;
+
+            // Channel 1 (the destination) owns the word count and terminal count.
+            self.channels[1].step_transfer();
+            // Channel 0 (the source) advances its address and count too, unless
+            // address hold freezes it for a memory fill.
+            if hold {
+                let c0 = &mut self.channels[0];
+                let next = c0.cur_count.wrapping_sub(1);
+                c0.cur_count = next;
+            } else {
+                self.channels[0].step_transfer();
+            }
+
+            if self.channels[1].reached_tc {
+                self.status |= 1 << 1;
+                break;
+            }
+        }
+        Some(copied)
+    }
+
     /// Write one byte from the device (device->memory) on local channel `ci`,
     /// latching terminal-count into the status register.
     #[allow(dead_code)] // ponytail: no Machine-level write wiring yet (see DmaChannel::write_byte).
     fn write_byte(&mut self, ci: usize, memory: &mut Memory, byte: u8) -> Option<()> {
+        if self.controller_disabled() {
+            return None;
+        }
         self.channels[ci].write_byte(memory, byte)?;
         if self.channels[ci].reached_tc {
             self.status |= 1 << ci;
@@ -338,6 +420,9 @@ impl DmaChip {
     /// `ci`, latching terminal-count into the status register.
     #[allow(dead_code)] // ponytail: no Machine-level write wiring yet (see DmaChannel::write_byte).
     fn write_word(&mut self, ci: usize, memory: &mut Memory, word: u16) -> Option<()> {
+        if self.controller_disabled() {
+            return None;
+        }
         self.channels[ci].write_word(memory, word)?;
         if self.channels[ci].reached_tc {
             self.status |= 1 << ci;
@@ -349,6 +434,9 @@ impl DmaChip {
     /// into the status register. No memory is touched.
     #[allow(dead_code)] // ponytail: no Machine-level verify wiring yet (see DmaChannel::write_byte).
     fn verify(&mut self, ci: usize) -> Option<()> {
+        if self.controller_disabled() {
+            return None;
+        }
         self.channels[ci].verify()?;
         if self.channels[ci].reached_tc {
             self.status |= 1 << ci;
@@ -489,6 +577,18 @@ impl DmaController {
         } else {
             self.slave.read_word(channel - 4, memory)
         }
+    }
+
+    /// Run a memory-to-memory block transfer on the master controller, the only
+    /// 8237A that wires mem-to-mem (channel 0 source, channel 1 dest). Driven by
+    /// the master's command register: bit0 enables the path, bit1 holds the
+    /// source for a fill, bit2 disables the whole controller. Returns the byte
+    /// count copied, or None when not enabled or the controller is disabled.
+    // ponytail: only the master pair carries the mem-to-mem hardware; the slave
+    // 8237A never does on the PC/AT, so no slave variant exists.
+    #[allow(dead_code)] // ponytail: no Machine-level mem-to-mem wiring yet (see DmaChannel::write_byte).
+    pub(crate) fn mem_to_mem(&mut self, memory: &mut Memory) -> Option<usize> {
+        self.master.mem_to_mem(memory)
     }
 }
 
@@ -945,5 +1045,137 @@ mod tests {
             Some(0x02),
             "ch1 TC latched by word write"
         );
+    }
+
+    // --- Slice 5: command register and memory-to-memory transfer ---
+
+    #[test]
+    fn command_register_round_trips_through_port_0x08() {
+        let mut dma = DmaController::default();
+        // Set every command bit and read each decoder back.
+        dma.write_port(0x08, 0xFF);
+        assert_eq!(dma.master.command, 0xFF, "command stored verbatim");
+        assert!(dma.master.mem_to_mem_enabled(), "bit0 mem-to-mem enable");
+        assert!(dma.master.channel0_hold(), "bit1 channel-0 address hold");
+        assert!(dma.master.controller_disabled(), "bit2 controller disable");
+
+        // Clear it and confirm the decoders flip back.
+        dma.write_port(0x08, 0x00);
+        assert_eq!(dma.master.command, 0x00);
+        assert!(!dma.master.mem_to_mem_enabled());
+        assert!(!dma.master.channel0_hold());
+        assert!(!dma.master.controller_disabled());
+
+        // A single bit at a time decodes independently.
+        dma.write_port(0x08, 0x01);
+        assert!(dma.master.mem_to_mem_enabled());
+        assert!(!dma.master.channel0_hold());
+        assert!(!dma.master.controller_disabled());
+        dma.write_port(0x08, 0x04);
+        assert!(!dma.master.mem_to_mem_enabled());
+        assert!(dma.master.controller_disabled());
+    }
+
+    #[test]
+    fn controller_disable_bit_inhibits_a_transfer() {
+        let mut dma = DmaController::default();
+        // Program channel 1 for a normal read of one byte.
+        dma.write_port(0x0B, 0x49); // mode ch1: single, read
+        dma.write_port(0x02, 0x10); // address 0x0010
+        dma.write_port(0x02, 0x00);
+        dma.write_port(0x03, 0x00); // count 0 -> one transfer
+        dma.write_port(0x03, 0x00);
+        dma.write_port(0x0A, 0x01); // unmask ch1
+        let mut mem = mem_with(0x0010, &[0x77]);
+
+        // Controller disabled (command bit2): the read is inhibited.
+        dma.write_port(0x08, 0x04);
+        assert_eq!(
+            dma.read_byte(1, &mut mem),
+            None,
+            "disabled controller refuses a read"
+        );
+        // Clearing the disable bit lets the same transfer through.
+        dma.write_port(0x08, 0x00);
+        assert_eq!(dma.read_byte(1, &mut mem), Some(0x77));
+    }
+
+    #[test]
+    fn mem_to_mem_copies_a_block_from_ch0_to_ch1() {
+        let mut dma = DmaController::default();
+        // Source at 0x0100, destination at 0x0200, four bytes (count 3 = n+1).
+        dma.write_port(0x00, 0x00); // ch0 address 0x0100
+        dma.write_port(0x00, 0x01);
+        dma.write_port(0x02, 0x00); // ch1 address 0x0200
+        dma.write_port(0x02, 0x02);
+        dma.write_port(0x03, 0x03); // ch1 count 3 -> 4 bytes
+        dma.write_port(0x03, 0x00);
+        dma.write_port(0x0A, 0x00); // unmask ch0 (the requester)
+        dma.write_port(0x08, 0x01); // command: mem-to-mem enable
+
+        let mut mem = Memory::new(0x0300).unwrap();
+        for (i, b) in [0xDE, 0xAD, 0xBE, 0xEF].into_iter().enumerate() {
+            mem.write_u8(0x0100 + i, b).unwrap();
+        }
+
+        let copied = dma.mem_to_mem(&mut mem).expect("a block copy");
+        assert_eq!(copied, 4, "copied ch1 count + 1 bytes");
+        for (i, b) in [0xDE, 0xAD, 0xBE, 0xEF].into_iter().enumerate() {
+            assert_eq!(mem.read_u8(0x0200 + i).unwrap(), b, "dest byte {i}");
+        }
+        // Channel 1 (the destination) reached terminal count and latched it.
+        assert!(dma.master.channels[1].reached_tc);
+        assert_eq!(dma.read_port(0x08).map(|s| s & 0x02), Some(0x02), "ch1 TC");
+        // Both address counters advanced past the block.
+        assert_eq!(dma.master.channels[0].cur_addr, 0x0104, "source advanced");
+        assert_eq!(dma.master.channels[1].cur_addr, 0x0204, "dest advanced");
+    }
+
+    #[test]
+    fn mem_to_mem_address_hold_turns_the_copy_into_a_fill() {
+        let mut dma = DmaController::default();
+        // Source one byte at 0x0040, destination block at 0x0050, four bytes.
+        dma.write_port(0x00, 0x40); // ch0 address 0x0040
+        dma.write_port(0x00, 0x00);
+        dma.write_port(0x02, 0x50); // ch1 address 0x0050
+        dma.write_port(0x02, 0x00);
+        dma.write_port(0x03, 0x03); // ch1 count 3 -> 4 bytes
+        dma.write_port(0x03, 0x00);
+        dma.write_port(0x0A, 0x00); // unmask ch0
+        dma.write_port(0x08, 0x03); // command: mem-to-mem enable + ch0 hold
+
+        let mut mem = Memory::new(0x0100).unwrap();
+        mem.write_u8(0x0040, 0x5A).unwrap();
+
+        let copied = dma.mem_to_mem(&mut mem).expect("a fill");
+        assert_eq!(copied, 4);
+        for i in 0..4 {
+            assert_eq!(mem.read_u8(0x0050 + i).unwrap(), 0x5A, "fill byte {i}");
+        }
+        // The held source address never moved; only the count drained.
+        assert_eq!(dma.master.channels[0].cur_addr, 0x0040, "source held");
+        assert_eq!(dma.master.channels[1].cur_addr, 0x0054, "dest advanced");
+    }
+
+    #[test]
+    fn mem_to_mem_is_gated_by_enable_and_disable_bits() {
+        let mut dma = DmaController::default();
+        dma.write_port(0x02, 0x00); // ch1 address 0
+        dma.write_port(0x02, 0x00);
+        dma.write_port(0x03, 0x00); // ch1 count 0 -> one byte
+        dma.write_port(0x03, 0x00);
+        dma.write_port(0x0A, 0x00); // unmask ch0
+        let mut mem = Memory::new(0x10).unwrap();
+
+        // Mem-to-mem not enabled (bit0 clear): no transfer.
+        dma.write_port(0x08, 0x00);
+        assert_eq!(dma.mem_to_mem(&mut mem), None, "disabled mem-to-mem path");
+        // Enabled but the controller is disabled (bit2): still no transfer.
+        dma.write_port(0x08, 0x05);
+        assert_eq!(dma.mem_to_mem(&mut mem), None, "controller disabled");
+        // Enabled with channel 0 masked: the requester cannot run.
+        dma.write_port(0x08, 0x01);
+        dma.write_port(0x0A, 0x04); // mask ch0
+        assert_eq!(dma.mem_to_mem(&mut mem), None, "masked channel 0");
     }
 }
