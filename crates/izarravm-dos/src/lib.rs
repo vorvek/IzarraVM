@@ -1957,10 +1957,15 @@ impl DosKernel {
                 let valid = handle <= 4 || self.open_files.contains_key(&handle);
                 match regs.ax as u8 {
                     0x00 => {
-                        if handle <= 2 {
-                            // stdin(0) is a console input device, stdout(1)/stderr(2) output.
-                            let io = if handle == 0 { 0x01 } else { 0x02 };
-                            regs.dx = 0x80 | io; // bit 7 ISDEV + the console direction bit
+                        if handle <= 4 {
+                            // The five standard handles are all character devices: stdin(0)
+                            // input, stdout(1)/stderr(2)/stdprn(4) output, stdaux(3) both.
+                            let io = match handle {
+                                0 => 0x01,
+                                3 => 0x03,
+                                _ => 0x02,
+                            };
+                            regs.dx = 0x80 | io; // bit 7 ISDEV + the console direction bits
                             regs.cf = false;
                         } else if self.open_files.contains_key(&handle) {
                             // A regular file on C: (drive index 2); bit 7 clear means a file.
@@ -2790,6 +2795,22 @@ mod tests {
         kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
         assert!(regs.cf);
         assert_eq!(regs.ax, 0x06);
+    }
+
+    #[test]
+    fn ah44_standard_handles_are_character_devices() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        for handle in 0u16..=4 {
+            let mut regs = DosRegs {
+                ax: 0x4400,
+                bx: handle,
+                ..DosRegs::default()
+            };
+            kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+            assert!(!regs.cf, "standard handle {handle} is valid");
+            assert_ne!(regs.dx & 0x80, 0, "handle {handle} is a character device");
+        }
     }
 
     #[test]
