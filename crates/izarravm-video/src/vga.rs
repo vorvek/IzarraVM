@@ -265,9 +265,16 @@ impl CrtcTiming {
 
 /// Raw CRTC vertical-timing register bytes, honored only while unchained (mode X)
 /// so the geometry follows whatever the guest programs. Seeded at mode-X entry and
-/// derived into `CrtcTiming` by `recompute_vertical_timing`.
+/// derived into `CrtcTiming` by `recompute_vertical_timing`. The horizontal group
+/// (r00-r05) is stored for read-back only; nothing derives geometry from it yet.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CrtcRegs {
+    pub r00: u8, // horizontal total
+    pub r01: u8, // horizontal display end
+    pub r02: u8, // start horizontal blanking
+    pub r03: u8, // end horizontal blanking (bits 4-0 end, 6-5 display skew, 7 reserved)
+    pub r04: u8, // start horizontal retrace
+    pub r05: u8, // end horizontal retrace (bits 4-0 end, 6-5 delay, 7 EHB bit 5)
     pub r06: u8, // vertical total (low 8)
     pub r07: u8, // overflow (high bits of several fields)
     pub r09: u8, // maximum scan line (double-scan, max_scan, line-compare bit 9)
@@ -279,9 +286,17 @@ pub struct CrtcRegs {
 }
 
 impl CrtcRegs {
-    /// The 320x200 unchained register set, matching `CrtcTiming::mode_x()`.
+    /// The 320x200 unchained register set, matching `CrtcTiming::mode_x()`. The
+    /// horizontal group (r00-r05) carries the stock 320-pixel CRTC values so a
+    /// guest that reads them back before reprogramming sees the mode default.
     pub fn mode_x_320x200() -> Self {
         Self {
+            r00: 0x5F,
+            r01: 0x4F,
+            r02: 0x50,
+            r03: 0x82,
+            r04: 0x54,
+            r05: 0x80,
             r06: 0xBF,
             r07: 0x1F,
             r09: 0x41,
@@ -1456,8 +1471,16 @@ impl Vga {
             0x3C8 => Some(self.dac.write_index()),
             0x3C9 => Some(self.dac.read_data()),
             0x3CC => Some(self.misc_output),
+            0x3CF => Some(self.read_gc(self.gc_index)),
             0x3D4 => Some(self.crtc_index),
             0x3D5 => match self.crtc_index {
+                // Horizontal timing group: read back the byte last written (00h-05h).
+                0x00 => Some(self.crtc_regs.r00),
+                0x01 => Some(self.crtc_regs.r01),
+                0x02 => Some(self.crtc_regs.r02),
+                0x03 => Some(self.crtc_regs.r03),
+                0x04 => Some(self.crtc_regs.r04),
+                0x05 => Some(self.crtc_regs.r05),
                 0x08 => Some(self.crtc.preset_row_scan),
                 0x0A => Some(self.cursor_start),
                 0x0B => Some(self.cursor_end),
@@ -1527,14 +1550,50 @@ impl Vga {
                 self.gc.write_mode = value & 3;
                 self.gc.read_mode = (value >> 3) & 1;
             }
+            // ponytail: Miscellaneous Graphics (06h) decode + read-back only. The
+            // bus still routes A0000/B8000 by its own fixed map, so the selected
+            // aperture (gc.aperture()) is exposed but not yet consulted by the
+            // machine-crate memory routing; that is a separate lib.rs follow-up.
+            0x06 => self.gc.misc = value & 0x0F,
             0x07 => self.gc.color_dont_care = value & 0x0F,
             0x08 => self.gc.bit_mask = value,
             _ => {}
         }
     }
 
+    /// Read back a Graphics Controller register (3CF data port). Each index
+    /// returns the value last written, reassembled where one port packs two
+    /// fields (03h rotate+logic, 05h write+read mode). Unmodeled indices read 0.
+    fn read_gc(&self, index: u8) -> u8 {
+        match index {
+            0x00 => self.gc.set_reset,
+            0x01 => self.gc.enable_set_reset,
+            0x02 => self.gc.color_compare,
+            0x03 => self.gc.rotate | (self.gc.logic << 3),
+            0x04 => self.gc.read_map,
+            0x05 => self.gc.write_mode | (self.gc.read_mode << 3),
+            0x06 => self.gc.misc,
+            0x07 => self.gc.color_dont_care,
+            0x08 => self.gc.bit_mask,
+            _ => 0,
+        }
+    }
+
     fn write_crtc(&mut self, index: u8, value: u8) {
         match index {
+            // Horizontal timing group (FreeVGA crtcreg.htm 00h-05h): horizontal
+            // total, display end, start/end blanking, start/end retrace. Stored as
+            // written for exact read-back; no geometry is derived from them yet, so
+            // they do not retune the active mode. The End Horizontal Blanking field
+            // splits across 03h bits 4-0 and 05h bit 7, and End Horizontal Retrace
+            // across 05h bits 4-0; the whole register byte round-trips, the field
+            // masks apply only when a future path decodes these into dot counts.
+            0x00 => self.crtc_regs.r00 = value,
+            0x01 => self.crtc_regs.r01 = value,
+            0x02 => self.crtc_regs.r02 = value,
+            0x03 => self.crtc_regs.r03 = value,
+            0x04 => self.crtc_regs.r04 = value,
+            0x05 => self.crtc_regs.r05 = value,
             // Preset Row Scan (FreeVGA crtcreg.htm 08h): bits 4-0 first font
             // scanline (vertical sub-row), bits 6-5 byte pan.
             0x08 => self.crtc.preset_row_scan = value,
@@ -1825,6 +1884,14 @@ impl Vga {
         self.mode
     }
 
+    /// The CPU aperture window the Graphics Controller Miscellaneous register
+    /// (06h) selects, plus the graphics and chain-odd-even flags. The machine bus
+    /// can consult this to route the legacy A0000/B0000 mapping once the routing
+    /// follow-up lands; this core only decodes and exposes it.
+    pub fn gfx_aperture(&self) -> GfxAperture {
+        self.gc.aperture()
+    }
+
     /// Set the border/overscan color (Attribute register 11h). Stored raw; the
     /// raster path masks it to 6 bits when resolving the border color.
     pub fn set_overscan(&mut self, value: u8) {
@@ -1933,6 +2000,46 @@ pub struct GfxController {
     pub read_mode: u8,        // idx 5 bit 3
     pub color_dont_care: u8,  // idx 7
     pub bit_mask: u8,         // idx 8
+    // idx 6 Miscellaneous Graphics: bit 0 graphics (vs alphanumeric), bit 1 chain
+    // odd/even, bits 3-2 memory map select. Stored as written; the fields are
+    // decoded by `aperture` (FreeVGA gfxreg.htm 06h).
+    pub misc: u8,
+}
+
+/// The decoded Graphics Controller Miscellaneous register (index 06h): the CPU
+/// aperture window the legacy A0000/B0000 mapping points at, plus the two mode
+/// flags the bus and the read/write decode consult.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GfxAperture {
+    /// Aperture base linear address (A0000, A0000, B0000, or B8000).
+    pub base: u32,
+    /// Aperture length in bytes (0x20000, 0x10000, 0x8000, or 0x8000).
+    pub length: u32,
+    /// Misc bit 0: graphics mode (clear = alphanumeric/text).
+    pub graphics: bool,
+    /// Misc bit 1: chain odd/even enable.
+    pub chain_odd_even: bool,
+}
+
+impl GfxController {
+    /// Decode the Miscellaneous register (06h) into the selected aperture window
+    /// and the graphics / chain-odd-even flags. Memory Map Select (bits 3-2):
+    /// 00 = A0000-BFFFF (128K), 01 = A0000-AFFFF (64K), 10 = B0000-B7FFF (32K),
+    /// 11 = B8000-BFFFF (32K). FreeVGA gfxreg.htm 06h.
+    pub fn aperture(&self) -> GfxAperture {
+        let (base, length) = match (self.misc >> 2) & 0x03 {
+            0b00 => (0xA_0000, 0x2_0000),
+            0b01 => (0xA_0000, 0x1_0000),
+            0b10 => (0xB_0000, 0x0_8000),
+            _ => (0xB_8000, 0x0_8000),
+        };
+        GfxAperture {
+            base,
+            length,
+            graphics: self.misc & 0x01 != 0,
+            chain_odd_even: self.misc & 0x02 != 0,
+        }
+    }
 }
 
 fn apply_logic(logic: u8, value: u8, latch: u8) -> u8 {
@@ -2484,6 +2591,70 @@ mod tests {
         vga.write_port(0x3CF, 0x0F);
         assert_eq!(vga.gc.bit_mask, 0x0F);
         assert_eq!(vga.last_line, 4); // the write caught up through line 4
+    }
+
+    #[test]
+    fn gc06_memory_map_select_decodes_four_apertures() {
+        // Memory Map Select (bits 3-2) picks the CPU aperture window.
+        let mut vga = Vga::default();
+        for (sel, base, length) in [
+            (0b00u8, 0xA_0000u32, 0x2_0000u32), // A0000-BFFFF, 128K
+            (0b01, 0xA_0000, 0x1_0000),         // A0000-AFFFF, 64K
+            (0b10, 0xB_0000, 0x0_8000),         // B0000-B7FFF, 32K
+            (0b11, 0xB_8000, 0x0_8000),         // B8000-BFFFF, 32K
+        ] {
+            vga.write_port(0x3CE, 0x06); // GC index 06h
+            vga.write_port(0x3CF, sel << 2);
+            let ap = vga.gfx_aperture();
+            assert_eq!(ap.base, base, "base for map select {sel:#04b}");
+            assert_eq!(ap.length, length, "length for map select {sel:#04b}");
+        }
+    }
+
+    #[test]
+    fn gc06_graphics_and_chain_odd_even_flags_read_back() {
+        let mut vga = Vga::default();
+        vga.write_port(0x3CE, 0x06);
+        // bit 0 graphics, bit 1 chain odd/even, both set.
+        vga.write_port(0x3CF, 0x03);
+        let ap = vga.gfx_aperture();
+        assert!(ap.graphics, "bit 0 set selects graphics mode");
+        assert!(ap.chain_odd_even, "bit 1 set enables chain odd/even");
+        // The raw register reads back through 3CF (low 4 bits stored).
+        assert_eq!(vga.read_port(0x3CF), Some(0x03));
+
+        // Clearing both flags reads back as alphanumeric, no chaining.
+        vga.write_port(0x3CF, 0x00);
+        let ap = vga.gfx_aperture();
+        assert!(!ap.graphics);
+        assert!(!ap.chain_odd_even);
+    }
+
+    #[test]
+    fn horizontal_crtc_timing_registers_round_trip() {
+        // Indices 00h-05h are the horizontal timing group; each reads back the
+        // exact byte written, including the split-field registers 03h and 05h.
+        let mut vga = Vga::default();
+        let writes = [
+            (0x00u8, 0x5Fu8),
+            (0x01, 0x4F),
+            (0x02, 0x50),
+            (0x03, 0x82),
+            (0x04, 0x54),
+            (0x05, 0x80),
+        ];
+        for (index, value) in writes {
+            vga.write_port(0x3D4, index);
+            vga.write_port(0x3D5, value);
+        }
+        for (index, value) in writes {
+            vga.write_port(0x3D4, index);
+            assert_eq!(
+                vga.read_port(0x3D5),
+                Some(value),
+                "horizontal CRTC index {index:#04x} round-trips"
+            );
+        }
     }
 
     #[test]
