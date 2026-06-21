@@ -127,6 +127,13 @@ const MSR_WHCR: u32 = 0xc000_0082; // write handling control
 // EFER bit 0: System Call Extension. SYSCALL and SYSRET raise #UD when it is clear.
 const EFER_SCE: u64 = 0x1;
 
+// Writable masks for the two MSRs with reserved bits. Per the AMD-K6 guide (EFER Table 40,
+// STAR Table 41) writing a 1 to any reserved bit raises #GP(0). EFER defines only SCE (bits
+// 63-1 reserved); STAR holds the target EIP (31-0) and the CS/SS selector base (47-32), with
+// bits 63-48 reserved.
+const EFER_WRITABLE: u64 = EFER_SCE;
+const STAR_WRITABLE: u64 = 0x0000_ffff_ffff_ffff;
+
 // Leaf 1 EBX: brand index 0 (no brand string), CLFLUSH line size and other fields stay 0.
 const CPUID_LEAF1_EBX: u32 = 0;
 // Leaf 1 ECX: no extended feature is claimed.
@@ -2112,8 +2119,24 @@ impl Cpu386 {
                     // Rebase the time-stamp counter: store the offset that makes the running
                     // core-clock count read back as the written value.
                     MSR_TSC => self.msr.tsc_offset = value.wrapping_sub(self.elapsed_clocks),
-                    MSR_EFER => self.msr.efer = value,
-                    MSR_STAR => self.msr.star = value,
+                    MSR_EFER => {
+                        if value & !EFER_WRITABLE != 0 {
+                            return Err(InternalFault::Exception {
+                                vector: 13,
+                                error_code: Some(0),
+                            });
+                        }
+                        self.msr.efer = value;
+                    }
+                    MSR_STAR => {
+                        if value & !STAR_WRITABLE != 0 {
+                            return Err(InternalFault::Exception {
+                                vector: 13,
+                                error_code: Some(0),
+                            });
+                        }
+                        self.msr.star = value;
+                    }
                     MSR_WHCR => self.msr.whcr = value,
                     _ => {
                         return Err(InternalFault::Exception {
@@ -11743,6 +11766,59 @@ mod tests {
         cpu.cycle(&mut bus).unwrap(); // rdmsr
         assert_eq!(cpu.registers.edx(), 0xdead_beef);
         assert_eq!(cpu.registers.eax(), 0x0bad_f00d);
+    }
+
+    #[test]
+    fn wrmsr_efer_rejects_reserved_bits() {
+        // Only EFER.SCE (bit 0) is writable; any reserved bit set raises #GP(0).
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x30], 0x20);
+        cpu.registers.set_ecx(MSR_EFER);
+        cpu.registers.set_edx(0);
+        cpu.registers.set_eax(0x2); // bit 1 is reserved
+        let mut bus = TestBus::with_memory(memory);
+        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        assert!(matches!(
+            fault,
+            InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0)
+            }
+        ));
+    }
+
+    #[test]
+    fn wrmsr_star_rejects_reserved_bits() {
+        // STAR bits 63-48 are reserved; setting one raises #GP(0).
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x30], 0x20);
+        cpu.registers.set_ecx(MSR_STAR);
+        cpu.registers.set_edx(0x0001_0000); // bit 48 set
+        cpu.registers.set_eax(0);
+        let mut bus = TestBus::with_memory(memory);
+        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        assert!(matches!(
+            fault,
+            InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0)
+            }
+        ));
+    }
+
+    #[test]
+    fn wrmsr_efer_and_star_accept_their_defined_bits() {
+        // SCE in EFER and the selector base / target EIP in STAR write without faulting.
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x30, 0x0f, 0x30], 0x20);
+        cpu.registers.set_ecx(MSR_EFER);
+        cpu.registers.set_edx(0);
+        cpu.registers.set_eax(EFER_SCE as u32);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.msr.efer, EFER_SCE);
+        cpu.registers.set_ecx(MSR_STAR);
+        cpu.registers.set_edx(0x0000_ffff); // selector base in 47-32
+        cpu.registers.set_eax(0x0001_0000); // target EIP in 31-0
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.msr.star, 0x0000_ffff_0001_0000);
     }
 
     #[test]
