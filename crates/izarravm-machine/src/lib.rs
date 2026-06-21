@@ -2719,7 +2719,10 @@ impl Machine {
             self.pic.request(12); // IRQ12: mouse output buffer has an aux byte
         }
         if self.lpt.take_irq() {
-            self.pic.request(7); // IRQ7: LPT1 -ACK after a strobed byte
+            // IRQ7: LPT1 -ACK after a strobed byte. The Sound Blaster DSP can also
+            // route to IRQ7, so this line is shared; the LPT only requests it on a
+            // real strobed byte with control bit 4 set.
+            self.pic.request(7);
         }
 
         // ATAPI command completion forwards IRQ15 (the secondary channel) to the
@@ -4550,6 +4553,8 @@ mod tests {
         assert_eq!(ax, BIOS_EQUIPMENT_WORD);
         // Bits 11-9 = 001b: one serial port advertised for the emulated COM1.
         assert_eq!((ax >> 9) & 0x07, 1, "one serial port advertised");
+        // Bits 15-14 = 01b: one parallel printer port advertised for LPT1.
+        assert_eq!((ax >> 14) & 0x03, 1, "one parallel port advertised");
         // Bit 1 (80x87 coprocessor) stays clear: the Izarra 3000 has no FPU.
         assert_eq!(ax & 0x0002, 0, "no coprocessor advertised");
     }
