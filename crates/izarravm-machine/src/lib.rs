@@ -18,6 +18,7 @@ mod fat12;
 mod floppy;
 mod ide;
 mod keyboard;
+mod lpt;
 mod pic;
 mod pit;
 mod rtc;
@@ -211,6 +212,7 @@ pub struct Machine {
     dos: izarravm_dos::DosKernel, // DOS kernel state: open files, drive, stdin/stdout
     rom: Vec<u8>,
     serial: uart::Uart16450,
+    lpt: lpt::Lpt,
     device_ports: DevicePorts,
     pic: pic::Pic8259Pair,
     pit: pit::Pit,
@@ -390,6 +392,7 @@ impl Machine {
             dos: izarravm_dos::DosKernel::default(),
             rom,
             serial: uart::Uart16450::default(),
+            lpt: lpt::Lpt::default(),
             device_ports: DevicePorts::default(),
             pic: pic::Pic8259Pair::default(),
             pit: pit::Pit::default(),
@@ -737,6 +740,16 @@ impl Machine {
         self.serial.output()
     }
 
+    /// Bytes captured by the LPT1 printer port (strobed prints, in order).
+    pub fn lpt_output(&self) -> &[u8] {
+        self.lpt.output()
+    }
+
+    /// The LPT1 capture decoded as text, the printer-side mirror of serial_text.
+    pub fn lpt_text(&self) -> String {
+        String::from_utf8_lossy(self.lpt_output()).into_owned()
+    }
+
     /// Feed Set 1 scancodes to the keyboard controller (make on press, break on
     /// release). Requests IRQ1 immediately so a halted or idle CPU wakes to it.
     pub fn inject_key_scancodes(&mut self, codes: &[u8]) {
@@ -814,6 +827,7 @@ impl Machine {
             margo: &mut self.margo,
             rom: &self.rom,
             serial: &mut self.serial,
+            lpt: &mut self.lpt,
             device_ports: &mut self.device_ports,
             pic: &mut self.pic,
             pit: &mut self.pit,
@@ -2704,6 +2718,9 @@ impl Machine {
         if self.keyboard.take_irq12() {
             self.pic.request(12); // IRQ12: mouse output buffer has an aux byte
         }
+        if self.lpt.take_irq() {
+            self.pic.request(7); // IRQ7: LPT1 -ACK after a strobed byte
+        }
 
         // ATAPI command completion forwards IRQ15 (the secondary channel) to the
         // PIC, the way a real drive interrupts the host when a packet finishes.
@@ -3035,6 +3052,7 @@ impl Machine {
                     margo,
                     rom,
                     serial,
+                    lpt,
                     device_ports,
                     pic,
                     pit,
@@ -3059,6 +3077,7 @@ impl Machine {
                     margo,
                     rom,
                     serial,
+                    lpt,
                     device_ports,
                     pic,
                     pit,
@@ -3175,6 +3194,7 @@ struct MachineBus<'a> {
     margo: &'a mut Margo,
     rom: &'a [u8],
     serial: &'a mut uart::Uart16450,
+    lpt: &'a mut lpt::Lpt,
     device_ports: &'a mut DevicePorts,
     pic: &'a mut pic::Pic8259Pair,
     pit: &'a mut pit::Pit,
@@ -3284,6 +3304,9 @@ impl CpuBus for MachineBus<'_> {
         }
 
         if let Some(value) = self.serial.read_port(port) {
+            return Ok(u32::from(value));
+        }
+        if let Some(value) = self.lpt.read_port(port) {
             return Ok(u32::from(value));
         }
         if let Some(value) = self.video.read_port(port) {
@@ -3398,6 +3421,7 @@ impl CpuBus for MachineBus<'_> {
             return Ok(());
         }
         if self.serial.write_port(port, value as u8)
+            || self.lpt.write_port(port, value as u8)
             || self.video.write_port(port, value as u8)
             || self.pit.write_port(port, value as u8)
             || self.pic.write_port(port, value as u8)
@@ -3591,10 +3615,11 @@ fn boot_sector_cpu() -> Cpu386 {
 /// BIOS equipment word reported by INT 11h (BDA 0040:0010). Bit 0 set with
 /// bits 7-6 clear means one floppy drive; bits 5-4 = 10b is the 80x25 color
 /// initial video mode; bits 11-9 = 001b advertises one serial port (COM1 is
+/// emulated); bits 15-14 = 01b advertises one parallel printer port (LPT1 is
 /// emulated). Bit 1 (80x87 coprocessor) stays clear: the Izarra 3000 ships no
 /// 387, so software that probes the equipment word skips its FPU path. See RBIL
 /// INT 11h equipment bitfield (dev_docs/reference/rbil/INTERRUP.B).
-const BIOS_EQUIPMENT_WORD: u16 = 0x0221;
+const BIOS_EQUIPMENT_WORD: u16 = 0x4221;
 
 /// Conventional memory size in KiB reported by INT 12h (BDA 0040:0013). A PC
 /// caps usable low memory at 640 KiB no matter how much RAM is installed; the
@@ -5257,6 +5282,7 @@ mod tests {
             margo: &mut machine.margo,
             rom: &machine.rom,
             serial: &mut machine.serial,
+            lpt: &mut machine.lpt,
             device_ports: &mut machine.device_ports,
             pic: &mut machine.pic,
             pit: &mut machine.pit,
