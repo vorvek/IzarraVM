@@ -877,16 +877,6 @@ impl Machine {
     /// Service the host side of an `INT 10h` after the instruction retires.
     /// The CPU registers are intact here: a software interrupt only pushes
     /// flags/CS/IP.
-    /// Record the current video mode in the BDA so apps that read it directly
-    /// (and INT 10h AH=0Fh) see a sane state. Columns and rows are the text-cell
-    /// geometry the BIOS publishes for the mode.
-    fn set_bda_video_mode(&mut self, mode: u8, columns: u16, rows: u8) {
-        let _ = self.memory.write_u8(0x449, mode);
-        let _ = self.memory.write_u16(0x44a, columns);
-        let _ = self.memory.write_u8(0x484, rows.saturating_sub(1));
-        let _ = self.memory.write_u16(0x463, 0x03d4); // VGA CRTC base port
-    }
-
     fn handle_int10(&mut self) {
         let ax = self.cpu.registers.eax() as u16;
         let ah = (ax >> 8) as u8;
@@ -978,6 +968,16 @@ impl Machine {
         if ah == 0x4f {
             self.handle_vbe(al);
         }
+    }
+
+    /// Record the current video mode in the BDA so apps that read it directly
+    /// (and INT 10h AH=0Fh) see a sane state. Columns and rows are the text-cell
+    /// geometry the BIOS publishes for the mode.
+    fn set_bda_video_mode(&mut self, mode: u8, columns: u16, rows: u8) {
+        let _ = self.memory.write_u8(0x449, mode);
+        let _ = self.memory.write_u16(0x44a, columns);
+        let _ = self.memory.write_u8(0x484, rows.saturating_sub(1));
+        let _ = self.memory.write_u16(0x463, 0x03d4); // VGA CRTC base port
     }
 
     /// Service INT 11h (GET EQUIPMENT LIST). Returns the BDA equipment word in AX,
