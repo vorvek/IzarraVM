@@ -2170,6 +2170,18 @@ impl Cpu386 {
                 }
                 Ok(clocks(6))
             }
+            0x40..=0x4f => {
+                // CMOVcc r, r/m: the source is always read (so a memory source still faults
+                // when it should), but the destination register is written only when the
+                // condition in the low nibble holds. A false condition leaves it untouched.
+                let modrm = self.fetch_modrm(bus)?;
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
+                let value = self.read_operand_sized(bus, operand, operand_size)?;
+                if self.condition(opcode & 0x0f) {
+                    self.write_gpr_sized(modrm.reg, operand_size, value);
+                }
+                Ok(clocks(1))
+            }
             0x80..=0x8f => {
                 let rel = self.fetch_relative(bus, operand_size)?;
                 if self.condition(opcode & 0x0f) {
@@ -4656,8 +4668,8 @@ const fn is_386plus_two_byte(opcode: u8) -> bool {
 const fn is_586plus_two_byte(opcode: u8) -> bool {
     matches!(
         opcode,
-        // WRMSR, RDTSC, RDMSR.
-        0x30..=0x32
+        // WRMSR, RDTSC, RDMSR; CMOVcc.
+        0x30..=0x32 | 0x40..=0x4f
     )
 }
 
@@ -4990,8 +5002,8 @@ impl Cpu386 {
                     self.fpu_reg_arith_sti(reg, i, true)
                 }
             }
-            0xda => {
-                if byte == 0xe9 {
+            0xda => match byte {
+                0xe9 => {
                     // FUCOMPP: unordered compare ST(0) with ST(1), then pop both.
                     let a = self.fpu.get(0);
                     let b = self.fpu.get(1);
@@ -4999,23 +5011,49 @@ impl Cpu386 {
                     self.fpu.pop();
                     self.fpu.pop();
                     Ok(clocks(5))
-                } else {
-                    self.fpu_unsupported(opcode) // FCMOVcc (P6) deferred to phase 5
                 }
-            }
+                0xc0..=0xdf => {
+                    // FCMOVcc ST(0), ST(i): move ST(i) into ST(0) when the integer-flag
+                    // condition holds. The row picks B(CF), E(ZF), BE(CF|ZF) or U(PF).
+                    let cc = match (byte >> 3) & 3 {
+                        0 => 0x2, // FCMOVB
+                        1 => 0x4, // FCMOVE
+                        2 => 0x6, // FCMOVBE
+                        _ => 0xa, // FCMOVU
+                    };
+                    let take = self.condition(cc);
+                    self.fpu_cmov(take, byte & 7)
+                }
+                _ => self.fpu_unsupported(opcode),
+            },
             0xd9 => self.fpu_d9_register(byte, i),
             0xdb => self.fpu_db_register(byte),
             0xdd => self.fpu_dd_register(reg, i),
-            0xdf => {
-                if byte == 0xe0 {
+            0xdf => match byte {
+                0xe0 => {
                     // FNSTSW AX.
                     let sw = self.fpu.status;
                     self.write_gpr16(0, sw);
                     Ok(clocks(3))
-                } else {
-                    self.fpu_unsupported(opcode)
                 }
-            }
+                0xe8..=0xef => {
+                    // FUCOMIP ST(0), ST(i): compare, set the integer flags, then pop ST(0).
+                    let a = self.fpu.get(0);
+                    let b = self.fpu.get(byte & 7);
+                    self.fpu_compare_set_eflags(a, b);
+                    self.fpu.pop();
+                    Ok(clocks(4))
+                }
+                0xf0..=0xf7 => {
+                    // FCOMIP ST(0), ST(i): same as FUCOMIP in this model, then pop.
+                    let a = self.fpu.get(0);
+                    let b = self.fpu.get(byte & 7);
+                    self.fpu_compare_set_eflags(a, b);
+                    self.fpu.pop();
+                    Ok(clocks(4))
+                }
+                _ => self.fpu_unsupported(opcode),
+            },
             _ => self.fpu_unsupported(opcode),
         }
     }
@@ -5052,6 +5090,38 @@ impl Cpu386 {
             }
         }
         Ok(clocks(20))
+    }
+
+    /// FCMOVcc: copy ST(i) into ST(0) when the integer-flag condition holds, leaving the
+    /// stack untouched otherwise. The condition was already evaluated by the caller.
+    fn fpu_cmov(&mut self, take: bool, i: u8) -> ExecResult<CycleOutcome> {
+        if take {
+            let v = self.fpu.get(i);
+            self.fpu.set(0, v);
+        }
+        Ok(clocks(4))
+    }
+
+    /// FCOMI/FUCOMI: set the integer EFLAGS ZF/PF/CF from comparing ST(0) with ST(i), the
+    /// way SAHF would after FNSTSW. Unordered (a NaN operand) sets all three. OF/SF/AF are
+    /// cleared. ponytail: FCOMI's SNaN-vs-QNaN #IA distinction is not modeled, so FCOMI and
+    /// FUCOMI behave identically here.
+    fn fpu_compare_set_eflags(&mut self, a: f64, b: f64) {
+        let (zf, pf, cf) = if a.is_nan() || b.is_nan() {
+            (true, true, true)
+        } else if a > b {
+            (false, false, false)
+        } else if a < b {
+            (false, false, true)
+        } else {
+            (true, false, false)
+        };
+        self.set_flag(FLAG_ZF, zf);
+        self.set_flag(FLAG_PF, pf);
+        self.set_flag(FLAG_CF, cf);
+        self.set_flag(FLAG_OF, false);
+        self.set_flag(FLAG_SF, false);
+        self.set_flag(FLAG_AF, false);
     }
 
     /// Set the IE (invalid) and ZE (divide-by-zero) status flags after an arithmetic
@@ -5308,7 +5378,33 @@ impl Cpu386 {
                 self.fpu.finit();
                 Ok(clocks(3))
             }
-            _ => self.fpu_unsupported(0xdb), // FCMOVcc (P6) deferred
+            0xc0..=0xdf => {
+                // FCMOVNcc ST(0), ST(i): the negated conditions of the DA forms.
+                let cc = match (byte >> 3) & 3 {
+                    0 => 0x3, // FCMOVNB
+                    1 => 0x5, // FCMOVNE
+                    2 => 0x7, // FCMOVNBE
+                    _ => 0xb, // FCMOVNU
+                };
+                let take = self.condition(cc);
+                self.fpu_cmov(take, byte & 7)
+            }
+            0xe8..=0xef => {
+                // FUCOMI ST(0), ST(i): compare and set the integer flags ZF/PF/CF directly.
+                let a = self.fpu.get(0);
+                let b = self.fpu.get(byte & 7);
+                self.fpu_compare_set_eflags(a, b);
+                Ok(clocks(4))
+            }
+            0xf0..=0xf7 => {
+                // FCOMI ST(0), ST(i): identical here to FUCOMI (the SNaN/QNaN #IA split is
+                // not modeled, see fpu_compare_set_eflags).
+                let a = self.fpu.get(0);
+                let b = self.fpu.get(byte & 7);
+                self.fpu_compare_set_eflags(a, b);
+                Ok(clocks(4))
+            }
+            _ => self.fpu_unsupported(0xdb),
         }
     }
 
@@ -11604,6 +11700,119 @@ mod tests {
             InternalFault::Exception { vector: 6, .. }
         ));
         assert!(run_at_level(&code, CpuLevel::I586).is_ok());
+    }
+
+    // --- Phase 5 Slice B: CMOVcc, FCMOVcc, FCOMI/FUCOMI ---
+
+    #[test]
+    fn cmove_word_moves_low_half_when_zf_set() {
+        // 0F 44 C3: CMOVE AX, BX (16-bit operand in real mode).
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x44, 0xc3], 0x20);
+        cpu.registers.set_eax(0x1111_1111);
+        cpu.registers.set_ebx(0xaaaa_bbbb);
+        cpu.set_flag(FLAG_ZF, true);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        // A 16-bit move writes only the low word; the upper half of EAX is preserved.
+        assert_eq!(cpu.registers.eax(), 0x1111_bbbb);
+    }
+
+    #[test]
+    fn cmove_does_not_move_when_zf_clear() {
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x44, 0xc3], 0x20);
+        cpu.registers.set_eax(0x1111_1111);
+        cpu.registers.set_ebx(0xaaaa_bbbb);
+        cpu.set_flag(FLAG_ZF, false);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.eax(), 0x1111_1111);
+    }
+
+    #[test]
+    fn cmovne_dword_moves_when_zf_clear() {
+        // 66 0F 45 C3: CMOVNE EAX, EBX (32-bit operand).
+        let (mut cpu, memory) = real_mode_cpu(&[0x66, 0x0f, 0x45, 0xc3], 0x20);
+        cpu.registers.set_eax(0x1111_1111);
+        cpu.registers.set_ebx(0xaaaa_bbbb);
+        cpu.set_flag(FLAG_ZF, false);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.eax(), 0xaaaa_bbbb);
+    }
+
+    #[test]
+    fn cmovcc_is_undefined_opcode_below_586() {
+        let code = [0x0f, 0x44, 0xc3];
+        assert!(matches!(
+            run_at_level(&code, CpuLevel::I486).unwrap_err(),
+            InternalFault::Exception { vector: 6, .. }
+        ));
+        assert!(run_at_level(&code, CpuLevel::I586).is_ok());
+    }
+
+    #[test]
+    fn fcmove_moves_st1_into_st0_when_zf_set() {
+        // DA C9: FCMOVE ST(0), ST(1).
+        let (mut cpu, memory) = real_mode_cpu(&[0xda, 0xc9], 0x20);
+        cpu.fpu.push(2.0); // ST(1)
+        cpu.fpu.push(1.0); // ST(0)
+        cpu.set_flag(FLAG_ZF, true);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.fpu.get(0), 2.0);
+    }
+
+    #[test]
+    fn fcmove_leaves_st0_when_zf_clear() {
+        let (mut cpu, memory) = real_mode_cpu(&[0xda, 0xc9], 0x20);
+        cpu.fpu.push(2.0);
+        cpu.fpu.push(1.0);
+        cpu.set_flag(FLAG_ZF, false);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.fpu.get(0), 1.0);
+    }
+
+    #[test]
+    fn fcmovnb_moves_st1_into_st0_when_cf_clear() {
+        // DB C1: FCMOVNB ST(0), ST(1).
+        let (mut cpu, memory) = real_mode_cpu(&[0xdb, 0xc1], 0x20);
+        cpu.fpu.push(7.0); // ST(1)
+        cpu.fpu.push(3.0); // ST(0)
+        cpu.set_flag(FLAG_CF, false);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.fpu.get(0), 7.0);
+    }
+
+    #[test]
+    fn fcomi_sets_integer_flags_from_the_comparison() {
+        // DB F1: FCOMI ST(0), ST(1). The result lands in ZF/PF/CF.
+        fn run(st0: f64, st1: f64) -> (bool, bool, bool) {
+            let (mut cpu, memory) = real_mode_cpu(&[0xdb, 0xf1], 0x40);
+            cpu.fpu.push(st1);
+            cpu.fpu.push(st0);
+            let mut bus = TestBus::with_memory(memory);
+            cpu.cycle(&mut bus).unwrap();
+            (cpu.flag(FLAG_ZF), cpu.flag(FLAG_PF), cpu.flag(FLAG_CF))
+        }
+        assert_eq!(run(2.0, 1.0), (false, false, false)); // ST0 > ST1
+        assert_eq!(run(1.0, 2.0), (false, false, true)); // ST0 < ST1
+        assert_eq!(run(1.0, 1.0), (true, false, false)); // equal
+        assert_eq!(run(f64::NAN, 1.0), (true, true, true)); // unordered
+    }
+
+    #[test]
+    fn fcomip_compares_then_pops() {
+        // DF F1: FCOMIP ST(0), ST(1). Equal operands set ZF, then ST(0) is popped.
+        let (mut cpu, memory) = real_mode_cpu(&[0xdf, 0xf1], 0x40);
+        cpu.fpu.push(2.0);
+        cpu.fpu.push(2.0);
+        let top_before = cpu.fpu.top();
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert!(cpu.flag(FLAG_ZF));
+        assert_eq!(cpu.fpu.top(), (top_before + 1) & 7);
     }
 
     /// Run a single instruction from `code` at the given level and return the result.
