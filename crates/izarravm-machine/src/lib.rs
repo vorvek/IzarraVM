@@ -996,12 +996,28 @@ impl Machine {
             }
             return;
         }
+        if ah == 0x0c {
+            self.int10_write_pixel(al);
+            return;
+        }
+        if ah == 0x0d {
+            self.int10_read_pixel();
+            return;
+        }
         if ah == 0x10 {
             self.handle_int10_palette(al);
             return;
         }
         if ah == 0x11 {
             self.handle_int10_font(al);
+            return;
+        }
+        if ah == 0x13 {
+            self.int10_write_string();
+            return;
+        }
+        if ah == 0x1c {
+            self.int10_save_restore_state(al);
             return;
         }
         if matches!(
@@ -1079,6 +1095,151 @@ impl Machine {
         let _ = self.memory.write_u16(0x44a, columns);
         let _ = self.memory.write_u8(0x484, rows.saturating_sub(1));
         let _ = self.memory.write_u16(0x463, 0x03d4); // VGA CRTC base port
+    }
+
+    /// INT 10h AH=0Ch WRITE GRAPHICS PIXEL. AL = colour (bit 7 set XORs into the
+    /// existing pixel), CX = column, DX = row. In mode 13h the pixel is the byte at
+    /// `row*320 + col` in the A0000 framebuffer; the chain-4 datapath routes that
+    /// linear offset to the right plane the same way the CPU bus write does.
+    /// ponytail: only the linear 320x200 mode 13h is handled; the 16-colour planar
+    /// modes (0Dh/0Eh/10h/12h) need a read-modify-write through the bit-mask and
+    /// map-mask, which is not wired here, so a pixel write in those modes is ignored.
+    /// In text mode the call does nothing, matching a real BIOS.
+    fn int10_write_pixel(&mut self, al: u8) {
+        if self.video.active_mode() != VideoMode::Mode13h {
+            return;
+        }
+        let col = self.cpu.registers.ecx() as u16;
+        let row = self.cpu.registers.edx() as u16;
+        let offset = usize::from(row) * 320 + usize::from(col);
+        if offset >= 320 * 200 {
+            return;
+        }
+        // Mode 13h is a 256-color mode: AL is the full 8-bit pixel value, bit 7
+        // included. The bit-7 XOR-onto-screen convention applies only to the
+        // 16-color planar modes, which this handler does not service.
+        self.video.cpu_write_chain4(offset, al);
+    }
+
+    /// INT 10h AH=0Dh READ GRAPHICS PIXEL. CX = column, DX = row; returns AL = the
+    /// pixel colour at `row*320 + col`. Only mode 13h is read back (see
+    /// int10_write_pixel); other modes return AL = 0.
+    fn int10_read_pixel(&mut self) {
+        let color = if self.video.active_mode() == VideoMode::Mode13h {
+            let col = self.cpu.registers.ecx() as u16;
+            let row = self.cpu.registers.edx() as u16;
+            let offset = usize::from(row) * 320 + usize::from(col);
+            if offset < 320 * 200 {
+                self.video.cpu_read_chain4(offset)
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        self.set_eax_al(color);
+    }
+
+    /// INT 10h AH=13h WRITE STRING. AL = write mode (bit 0 advance cursor, bit 1
+    /// the source carries interleaved attribute bytes), BH = page (ignored, page 0
+    /// only), BL = attribute when bit 1 is clear, CX = character count, DH/DL =
+    /// start row/col, ES:BP = the string. Characters land in the page-0 text buffer
+    /// with their attribute, advancing the column and wrapping rows; the cursor is
+    /// left at the end only when AL bit 0 is set.
+    fn int10_write_string(&mut self) {
+        let al = self.cpu.registers.eax() as u8;
+        let bx = self.cpu.registers.ebx() as u16;
+        let bl = bx as u8;
+        let count = self.cpu.registers.ecx() as u16;
+        let dx = self.cpu.registers.edx() as u16;
+        let mut row = usize::from((dx >> 8) as u8);
+        let mut col = usize::from(dx as u8);
+        let es = self.cpu.registers.segment(SegmentIndex::Es).base;
+        let bp = self.cpu.registers.ebp() as u16;
+        let mut src = es.wrapping_add(u32::from(bp));
+        let with_attr = al & 0x02 != 0;
+        for _ in 0..count {
+            let ch = self.read_physical_u8(src);
+            src += 1;
+            let attr = if with_attr {
+                let a = self.read_physical_u8(src);
+                src += 1;
+                a
+            } else {
+                bl
+            };
+            // Control characters move the cursor without placing a glyph, the way
+            // the BIOS write-string handles CR/LF/BS/BEL.
+            match ch {
+                b'\r' => col = 0,
+                b'\n' => row += 1,
+                0x08 => col = col.saturating_sub(1),
+                0x07 => {}
+                _ => {
+                    if row < 25 && col < 80 {
+                        let off = (row * 80 + col) * 2;
+                        let _ = self.video.write_u8(off, ch);
+                        let _ = self.video.write_u8(off + 1, attr);
+                    }
+                    col += 1;
+                    if col >= 80 {
+                        col = 0;
+                        row += 1;
+                    }
+                }
+            }
+            while row >= 25 {
+                self.scroll_text_up();
+                row -= 1;
+            }
+        }
+        // AL bit 0: leave the cursor at the end of the string; otherwise the caller
+        // keeps its prior cursor (the BDA cursor is untouched).
+        if al & 0x01 != 0 {
+            let row = row.min(24) as u16;
+            let col = col.min(79) as u16;
+            let _ = self.memory.write_u16(0x450, (row << 8) | col);
+            self.video.set_cursor_offset(row * 80 + col);
+        }
+    }
+
+    /// INT 10h AH=1Ch SAVE/RESTORE VIDEO STATE. AL=00 returns the buffer size in
+    /// 64-byte blocks (BX), AL=01 saves the modeled state into ES:BX, AL=02 restores
+    /// it. CX is the requested-state bitmap (bit 0 hardware, bit 1 BDA, bit 2 DAC).
+    /// Saves and restores the full BDA video state (0040:0049-0040:00A8, 96 bytes,
+    /// two 64-byte blocks) per RBIL. ponytail: the hardware-register and DAC-palette
+    /// state (CX bits 0 and 2) are not captured, so a save/restore round-trips the
+    /// BDA block, not the full VGA hardware. AL is set to 0x1C so callers detect the
+    /// service.
+    fn int10_save_restore_state(&mut self, al: u8) {
+        const BDA_VIDEO_START: u32 = 0x449;
+        const BDA_VIDEO_LEN: usize = 0x4a8 - 0x449 + 1; // 96 bytes, two 64-byte blocks
+        match al {
+            0x00 => {
+                self.set_bx(2); // two 64-byte blocks hold the 96-byte BDA video state
+                self.set_eax_al(0x1c);
+                self.set_int_frame_carry(false);
+            }
+            0x01 => {
+                let es = self.cpu.registers.segment(SegmentIndex::Es).base;
+                let bx = self.cpu.registers.ebx() as u16;
+                let dst = es.wrapping_add(u32::from(bx));
+                let block = self.read_guest_block(BDA_VIDEO_START, BDA_VIDEO_LEN);
+                self.write_guest_block(dst, &block);
+                self.set_eax_al(0x1c);
+                self.set_int_frame_carry(false);
+            }
+            0x02 => {
+                let es = self.cpu.registers.segment(SegmentIndex::Es).base;
+                let bx = self.cpu.registers.ebx() as u16;
+                let from = es.wrapping_add(u32::from(bx));
+                let block = self.read_guest_block(from, BDA_VIDEO_LEN);
+                self.write_guest_block(BDA_VIDEO_START, &block);
+                self.set_eax_al(0x1c);
+                self.set_int_frame_carry(false);
+            }
+            _ => self.set_int_frame_carry(true),
+        }
     }
 
     /// INT 10h text-mode output and cursor services. Operates on the same VGA text
@@ -1420,6 +1581,24 @@ impl Machine {
             // installed the BIOS returns "no wait performed" with CF clear, rather than
             // the unsupported-function carry the catch-all would set.
             0x90 | 0x91 => self.set_int_frame_carry(false),
+            // AH=C0h get system-configuration table: ES:BX -> the table seeded at POST.
+            0xC0 => {
+                let seg = (BIOS_CONFIG_TABLE_ADDR >> 4) as u16;
+                let off = (BIOS_CONFIG_TABLE_ADDR & 0xf) as u16;
+                self.cpu
+                    .registers
+                    .set_segment(SegmentIndex::Es, SegmentRegister::real(seg));
+                self.set_bx(off);
+                self.set_eax_ah(0x00);
+                self.set_int_frame_carry(false);
+            }
+            // AH=C1h get extended BIOS data area segment: ES = the EBDA segment.
+            0xC1 => {
+                self.cpu
+                    .registers
+                    .set_segment(SegmentIndex::Es, SegmentRegister::real(EBDA_SEGMENT));
+                self.set_int_frame_carry(false);
+            }
             _ => self.set_int_frame_carry(true),
         }
     }
@@ -1452,7 +1631,8 @@ impl Machine {
     fn e820_regions(&self) -> Vec<(u64, u64, u32)> {
         let total = u64::from(self.profile.memory_mib) * 0x10_0000;
         let mut regions = vec![
-            (0x0u64, 0xA_0000u64, 1u32), // 640 KB conventional, available
+            (0x0u64, 0x9_FC00u64, 1u32), // 639 KB conventional, available (below the EBDA)
+            (0x9_FC00, 0x400, 2),        // 1 KB extended BIOS data area, reserved
             (0xA_0000, 0x6_0000, 2),     // video + ROM BIOS hole, reserved
         ];
         if total > 0x10_0000 {
@@ -2029,6 +2209,8 @@ impl Machine {
             0x02 | 0x03 => self.int13_transfer(ah, dl),
             // AH=04 verify sectors: read without copying, report sectors checked.
             0x04 => self.int13_verify(dl),
+            // AH=05 format track: fill the addressed track with the format filler.
+            0x05 => self.int13_format_track(dl),
             // AH=08 read drive parameters. Report the mounted media geometry.
             0x08 => self.int13_drive_parameters(dl),
             // AH=15 get DASD type. DL selects the drive. A mounted floppy reports
@@ -2093,6 +2275,73 @@ impl Machine {
         } else {
             self.set_eax_ah(0x04);
             self.set_disk_status(0x04);
+            self.set_int_frame_carry(true);
+        }
+    }
+
+    /// AH=05h format track. AL = sectors per track to format, CH = cylinder, DH =
+    /// head, ES:BX = a list of 4-byte address-field records (C,H,R,N). Only floppy
+    /// A: is backed; the records describe the standard sequential layout this drive
+    /// already uses, so the cylinder/head address is taken from CH/DH and every
+    /// sector of that track is filled with the DOS format filler 0xF6. ponytail:
+    /// the address-field records are not parsed for nonstandard interleave or sector
+    /// sizes; the in-memory image is a fixed-geometry linear array, so a track is
+    /// formatted by zero-fill of its sectors at the mounted geometry.
+    fn int13_format_track(&mut self, dl: u8) {
+        // No fixed-disk path: any hard-disk unit reports no such drive.
+        if dl >= 0x80 {
+            self.set_eax_ah(0x80);
+            self.set_disk_status(0x80);
+            self.set_int_frame_carry(true);
+            return;
+        }
+        let Some(geom) = self.floppy.as_ref().map(|f| f.geometry()) else {
+            self.set_eax_ah(0x80);
+            self.set_disk_status(0x80);
+            self.set_int_frame_carry(true);
+            return;
+        };
+        // Only floppy A: is backed.
+        if dl != 0x00 {
+            self.set_eax_ah(0x80);
+            self.set_disk_status(0x80);
+            self.set_int_frame_carry(true);
+            return;
+        }
+        let al = self.cpu.registers.eax() as u8;
+        let cx = self.cpu.registers.ecx() as u16;
+        let ch = (cx >> 8) as u8;
+        let cl = cx as u8;
+        let cyl = u16::from(ch) | (u16::from(cl & 0xc0) << 2);
+        let head = (self.cpu.registers.edx() as u16 >> 8) as u8;
+        // A track off the mounted media, or a sector count past the media's
+        // sectors-per-track, is a bad-track request (AH=0Ch).
+        if cyl >= geom.cylinders || head >= geom.heads || al > geom.sectors {
+            self.set_eax_ah(0x0c);
+            self.set_disk_status(0x0c);
+            self.set_int_frame_carry(true);
+            return;
+        }
+        self.floppy_accesses += 1;
+        let ok = self
+            .floppy
+            .as_mut()
+            .map(|f| f.format_track(cyl, head, 0xf6))
+            .unwrap_or(false);
+        // Charge the seek to the formatted track plus a full-track write.
+        let bytes = usize::from(geom.sectors) * 512;
+        let secs = self
+            .floppy
+            .as_mut()
+            .map_or(0.0, |f| f.access_duration_secs(cyl, bytes));
+        self.stall_for(secs);
+        if ok {
+            self.set_eax_ah(0x00);
+            self.set_disk_status(0x00);
+            self.set_int_frame_carry(false);
+        } else {
+            self.set_eax_ah(0x0c);
+            self.set_disk_status(0x0c);
             self.set_int_frame_carry(true);
         }
     }
@@ -3986,6 +4235,17 @@ const BDA_DAY_COUNT: usize = 0x4f0;
 /// booter wipes low memory, the way real BIOS handlers (which live in ROM) do.
 const BIOS_ROM_IRET_SEG: u16 = 0xff00;
 
+/// Real-mode segment of the 1 KB extended BIOS data area (EBDA), reserved at the
+/// top of conventional memory. Segment 0x9FC0 is physical 0x9FC00, so the EBDA
+/// runs 0x9FC00-0x9FFFF and the conventional-memory word at 0040:0013 drops from
+/// 640 to 639 KB. INT 15h AH=C1h returns this segment in ES.
+const EBDA_SEGMENT: u16 = 0x9FC0;
+
+/// Physical base of the INT 15h AH=C0h system-configuration table. It lives inside
+/// the reserved EBDA (after the size byte at offset 0), so it is consistent with
+/// the lowered conventional-memory size and out of the BDA's way.
+const BIOS_CONFIG_TABLE_ADDR: u32 = 0x9FC10;
+
 fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     // BIOS service interrupts the host intercepts by vector. Their IVT targets
     // point at the ROM IRET so they survive a guest low-memory wipe. INT 33h is
@@ -4005,9 +4265,15 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
         memory.write_u16(address, BIOS_IRET_STUB_ADDRESS as u16)?;
         memory.write_u16(address + 2, 0)?;
     }
-    // Seed the BDA words INT 11h and INT 12h hand back, like a real BIOS.
+    // Seed the BDA words INT 11h and INT 12h hand back, like a real BIOS. The 1 KB
+    // EBDA reserved below 640 KB lowers the conventional-memory word by 1 (to 639),
+    // so INT 12h and the EBDA stay consistent.
     memory.write_u16(0x410, BIOS_EQUIPMENT_WORD)?;
-    memory.write_u16(0x413, BIOS_BASE_MEMORY_KIB)?;
+    memory.write_u16(0x413, BIOS_BASE_MEMORY_KIB - 1)?;
+    // Reserve the 1 KB EBDA at 0x9FC00 and write its size byte (1 = 1 KB) at offset
+    // 0, the way a real BIOS POST does. INT 15h AH=C1h returns its segment.
+    memory.write_u8((usize::from(EBDA_SEGMENT)) << 4, 1)?;
+    seed_bios_config_table(memory)?;
     // Serial and parallel port base address tables POST detected (0040:0000 COM1-4,
     // 0040:0008 LPT1-4). Only COM1 (0x03F8) and LPT1 (0x0378) are wired, matching the
     // equipment word; the rest read 0 (absent). INT 14h/17h drive the COM1/LPT1 ports,
@@ -4046,6 +4312,34 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     memory.write_u8(0x471, 0)?; // Ctrl-Break flag
     memory.write_u16(0x472, 0x1234)?; // warm-boot magic
     memory.write_u8(BIOS_IRET_STUB_ADDRESS, 0xcf)
+}
+
+/// Seed the INT 15h AH=C0h system-configuration table at BIOS_CONFIG_TABLE_ADDR.
+/// The layout is the AT-class table the BIOS hands back in ES:BX: a WORD byte
+/// count, then model/submodel/revision and the five feature bytes. Only feature
+/// byte 1 carries set bits, and each is set only when the matching service is
+/// actually present, per the honest-reporting rule.
+fn seed_bios_config_table(memory: &mut Memory) -> Result<(), BusError> {
+    // Feature byte 1 (RBIL INTERRUP.B, AH=C0h):
+    //   bit6 second 8259 PIC present (the AT has IRQ8-15) -> set
+    //   bit5 RTC present (INT 1Ah / CMOS clock)           -> set
+    //   bit4 INT 15h/AH=4Fh keyboard-intercept issued     -> clear (no AH=4Fh callout)
+    //   bit3 wait-for-external-event (AH=41h) supported    -> clear (not implemented)
+    //   bit2 extended BIOS data area allocated             -> set (AH=C1h present)
+    //   bit1 Micro Channel bus                             -> clear (ISA)
+    const FEATURE_1: u8 = 0x40 | 0x20 | 0x04; // 0x64
+    let base = BIOS_CONFIG_TABLE_ADDR as usize;
+    let table: [u8; 10] = [
+        0x08, 0x00, // WORD length: 8 bytes follow
+        0xFC, // model: AT-class
+        0x00, // submodel
+        0x00, // BIOS revision
+        FEATURE_1, 0x00, 0x00, 0x00, 0x00, // feature bytes 1-5
+    ];
+    for (i, &byte) in table.iter().enumerate() {
+        memory.write_u8(base + i, byte)?;
+    }
+    Ok(())
 }
 
 impl MachineBus<'_> {
@@ -4337,10 +4631,11 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(regions.len(), 3);
-        assert_eq!(regions[0], (0x0, 0xA_0000, 1)); // 640 KB conventional
-        assert_eq!(regions[1], (0xA_0000, 0x6_0000, 2)); // reserved hole
-        assert_eq!(regions[2], (0x10_0000, 23 * 0x10_0000, 1)); // extended RAM
+        assert_eq!(regions.len(), 4);
+        assert_eq!(regions[0], (0x0, 0x9_FC00, 1)); // 639 KB conventional (below EBDA)
+        assert_eq!(regions[1], (0x9_FC00, 0x400, 2)); // 1 KB EBDA, reserved
+        assert_eq!(regions[2], (0xA_0000, 0x6_0000, 2)); // reserved hole
+        assert_eq!(regions[3], (0x10_0000, 23 * 0x10_0000, 1)); // extended RAM
     }
 
     #[test]
@@ -5255,6 +5550,229 @@ mod tests {
     }
 
     #[test]
+    fn int10_pixel_write_read_round_trips_in_mode13h() {
+        let mut m = int15_machine(16);
+        m.video_mut().set_mode13h();
+        // AH=0Ch write pixel: AL=colour 0x43 (bit7 clear = plain write), CX=col 5,
+        // DX=row 2 -> framebuffer offset 2*320+5.
+        m.cpu.registers.set_eax(0x0C43);
+        m.cpu.registers.set_ecx(5);
+        m.cpu.registers.set_edx(2);
+        m.handle_int10();
+        // AH=0Dh read the same pixel back into AL.
+        m.cpu.registers.set_eax(0x0D00);
+        m.cpu.registers.set_ecx(5);
+        m.cpu.registers.set_edx(2);
+        m.handle_int10();
+        assert_eq!(
+            m.cpu.registers.eax() as u8,
+            0x43,
+            "pixel reads back its colour"
+        );
+        // Mode 13h is a 256-color mode: AL is the full 8-bit colour, bit 7 included,
+        // with no XOR. Writing 0x8F stores colour 0x8F (143), not an XOR.
+        m.cpu.registers.set_eax(0x0C8F); // colour 0x8F, bit7 part of the value
+        m.cpu.registers.set_ecx(5);
+        m.cpu.registers.set_edx(2);
+        m.handle_int10();
+        m.cpu.registers.set_eax(0x0D00);
+        m.cpu.registers.set_ecx(5);
+        m.cpu.registers.set_edx(2);
+        m.handle_int10();
+        assert_eq!(
+            m.cpu.registers.eax() as u8,
+            0x8F,
+            "high colours write directly, no bit-7 XOR in 256-colour mode"
+        );
+    }
+
+    #[test]
+    fn int10_write_string_places_chars_and_attr_in_text_buffer() {
+        let mut m = int15_machine(16);
+        m.video_mut().set_text_mode();
+        // Place a 3-char string "Hi!" at ES:BP = 0x0000:0x4000 (physical 0x4000).
+        m.write_physical_u8(0x4000, b'H');
+        m.write_physical_u8(0x4001, b'i');
+        m.write_physical_u8(0x4002, b'!');
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x0000));
+        m.cpu.registers.set_ebp(0x4000);
+        // AH=13h AL=01 (advance cursor, no attr bytes), BL=attr 0x1E, CX=3,
+        // DH=row 4, DL=col 10.
+        m.cpu.registers.set_eax(0x1301);
+        m.cpu.registers.set_ebx(0x001E);
+        m.cpu.registers.set_ecx(3);
+        m.cpu.registers.set_edx((4 << 8) | 10);
+        m.handle_int10();
+        // The chars and attribute landed at row 4, col 10.. of the text buffer.
+        let base = (4 * 80 + 10) * 2;
+        assert_eq!(m.video().read_u8(base).unwrap(), b'H');
+        assert_eq!(m.video().read_u8(base + 1).unwrap(), 0x1E);
+        assert_eq!(m.video().read_u8(base + 2).unwrap(), b'i');
+        assert_eq!(m.video().read_u8(base + 4).unwrap(), b'!');
+        // AL bit 0 set leaves the BDA cursor at the end of the string (col 13).
+        assert_eq!(m.memory.read_u16(0x450).unwrap(), (4 << 8) | 13);
+    }
+
+    #[test]
+    fn int10_write_string_honors_interleaved_attribute_bytes() {
+        let mut m = int15_machine(16);
+        m.video_mut().set_text_mode();
+        // AL bit 1 set: the source is char,attr,char,attr. "Ab" with attrs 0x12,0x34.
+        m.write_physical_u8(0x5000, b'A');
+        m.write_physical_u8(0x5001, 0x12);
+        m.write_physical_u8(0x5002, b'b');
+        m.write_physical_u8(0x5003, 0x34);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x0000));
+        m.cpu.registers.set_ebp(0x5000);
+        m.cpu.registers.set_eax(0x1302); // AL bit1 = interleaved attrs, bit0 clear
+        m.cpu.registers.set_ebx(0x0000);
+        m.cpu.registers.set_ecx(2);
+        m.cpu.registers.set_edx(0); // row 0, col 0
+        m.handle_int10();
+        assert_eq!(m.video().read_u8(0).unwrap(), b'A');
+        assert_eq!(m.video().read_u8(1).unwrap(), 0x12);
+        assert_eq!(m.video().read_u8(2).unwrap(), b'b');
+        assert_eq!(m.video().read_u8(3).unwrap(), 0x34);
+    }
+
+    #[test]
+    fn int10_save_restore_state_round_trips_the_bda_block() {
+        let mut m = int15_machine(16);
+        // AL=00 reports the buffer size in 64-byte blocks (96 bytes -> 2 blocks).
+        m.cpu.registers.set_eax(0x1C00);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.ebx() as u16, 2, "two 64-byte blocks");
+        assert_eq!(m.cpu.registers.eax() as u8, 0x1C);
+        // Mark the BDA mode byte, save into ES:BX, change it, then restore.
+        let _ = m.memory.write_u8(0x449, 0x12);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x0000));
+        m.cpu.registers.set_ebx(0x6000);
+        m.cpu.registers.set_eax(0x1C01); // save
+        m.cpu.registers.set_ecx(0x0007);
+        m.handle_int10();
+        // Corrupt the live BDA, then restore it from the saved buffer.
+        let _ = m.memory.write_u8(0x449, 0x99);
+        m.cpu.registers.set_ebx(0x6000);
+        m.cpu.registers.set_eax(0x1C02); // restore
+        m.handle_int10();
+        assert_eq!(m.memory.read_u8(0x449).unwrap(), 0x12, "BDA mode restored");
+    }
+
+    #[test]
+    fn int15_c0_reports_honest_feature_byte() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0xC000);
+        m.handle_int15();
+        assert_eq!(
+            (m.cpu.registers.eax() >> 8) as u8,
+            0x00,
+            "AH = 00 on success"
+        );
+        // ES:BX points at the seeded config table.
+        let es = m.cpu.registers.segment(SegmentIndex::Es).base;
+        let bx = m.cpu.registers.ebx() as u16;
+        let addr = es + u32::from(bx);
+        let len = m.read_guest_word(addr);
+        assert_eq!(len, 8, "table reports 8 bytes following");
+        assert_eq!(m.read_physical_u8(addr + 2), 0xFC, "AT-class model byte");
+        let feature1 = m.read_physical_u8(addr + 5);
+        assert_eq!(feature1 & 0x40, 0x40, "second PIC present");
+        assert_eq!(feature1 & 0x20, 0x20, "RTC present");
+        assert_eq!(feature1 & 0x04, 0x04, "EBDA allocated");
+        assert_eq!(
+            feature1 & 0x10,
+            0x00,
+            "no AH=4Fh keyboard-intercept callout"
+        );
+        assert_eq!(feature1 & 0x08, 0x00, "wait-for-event not supported");
+        assert_eq!(feature1 & 0x02, 0x00, "ISA bus, not Micro Channel");
+    }
+
+    #[test]
+    fn int15_c1_returns_ebda_segment_and_size_byte() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0xC100);
+        m.handle_int15();
+        assert_eq!(
+            m.cpu.registers.segment(SegmentIndex::Es).selector,
+            0x9FC0,
+            "ES = EBDA segment"
+        );
+        // The EBDA size byte at 0x9FC00 reports 1 KB, and INT 12h dropped to 639.
+        assert_eq!(m.memory.read_u8(0x9FC00).unwrap(), 1, "EBDA size = 1 KB");
+        assert_eq!(
+            m.memory.read_u16(0x413).unwrap(),
+            639,
+            "conventional lowered"
+        );
+    }
+
+    #[test]
+    fn int13_ah05_format_track_fills_with_f6() {
+        let mut m = int15_machine(16);
+        m.mount_floppy(vec![0u8; 737_280]).unwrap(); // 720 KB, 9 spt
+        // AH=05 AL=9 sectors, CH=3 (track 3), DH=1 (head 1), DL=0 (A:).
+        m.cpu.registers.set_eax(0x0509);
+        m.cpu.registers.set_ecx(0x0300); // CH=3, CL=0
+        m.cpu.registers.set_edx(0x0100); // DH=1, DL=0
+        m.handle_int13();
+        assert_eq!(
+            (m.cpu.registers.eax() >> 8) as u8,
+            0x00,
+            "AH = 00 on success"
+        );
+        // The BDA last-disk-status byte records success. (CF rides the IRET frame,
+        // which a direct handler call has no real stack for; AH and 0040:0041 carry
+        // the result either way.)
+        assert_eq!(
+            m.memory.read_u8(0x441).unwrap(),
+            0x00,
+            "disk status = success"
+        );
+        // A CHS read of that track returns the 0xF6 filler.
+        let sector = m
+            .floppy
+            .as_ref()
+            .unwrap()
+            .read_sector(3, 1, 1)
+            .unwrap()
+            .to_vec();
+        assert_eq!(sector[0], 0xF6);
+        assert_eq!(sector[511], 0xF6);
+    }
+
+    #[test]
+    fn int13_ah05_format_track_rejects_bad_track_and_fixed_disk() {
+        let mut m = int15_machine(16);
+        m.mount_floppy(vec![0u8; 737_280]).unwrap(); // 80 cylinders, 2 heads
+        // Track 80 is off an 80-cylinder disk: AH=0Ch bad track.
+        m.cpu.registers.set_eax(0x0509);
+        m.cpu.registers.set_ecx(0x5000); // CH=0x50 = 80
+        m.cpu.registers.set_edx(0x0000);
+        m.handle_int13();
+        assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x0C, "bad-track error");
+        assert_eq!(m.memory.read_u8(0x441).unwrap(), 0x0C, "status = bad track");
+        // The track was not formatted: its first sector is still zero, not 0xF6.
+        assert_eq!(
+            m.floppy.as_ref().unwrap().read_sector(0, 0, 1).unwrap()[0],
+            0x00
+        );
+        // A fixed-disk unit (DL>=0x80) reports no such drive (AH=0x80).
+        m.cpu.registers.set_eax(0x0509);
+        m.cpu.registers.set_ecx(0x0000);
+        m.cpu.registers.set_edx(0x0080); // DL = 0x80
+        m.handle_int13();
+        assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x80, "no fixed disk");
+        assert_eq!(m.memory.read_u8(0x441).unwrap(), 0x80, "status = no drive");
+    }
+
+    #[test]
     fn int11_returns_equipment_word() {
         // Stub: INT 11h then halt. AX must hold the seeded BDA equipment word.
         // The BIOS service vectors return through the ROM IRET at offset 0xF000
@@ -5279,7 +5797,8 @@ mod tests {
 
     #[test]
     fn int12_returns_conventional_memory_kib() {
-        // Stub: INT 12h then halt. AX must hold the conventional memory size.
+        // Stub: INT 12h then halt. AX must hold the conventional memory size. The
+        // 1 KB EBDA reserved at POST drops the reported size from 640 to 639 KB.
         let rom = rom_with_code(&[
             0xCD, 0x12, // int 12h
             0xF4, // hlt
@@ -5289,8 +5808,8 @@ mod tests {
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
         assert_eq!(reason, StopReason::Halted);
         let ax = machine.cpu().registers.eax() as u16;
-        assert_eq!(ax, BIOS_BASE_MEMORY_KIB);
-        assert_eq!(ax, 640);
+        assert_eq!(ax, BIOS_BASE_MEMORY_KIB - 1);
+        assert_eq!(ax, 639);
     }
 
     #[test]

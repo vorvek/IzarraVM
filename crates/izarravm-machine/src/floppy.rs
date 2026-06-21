@@ -164,6 +164,22 @@ impl Floppy {
         self.dirty = true;
         true
     }
+
+    /// Fill every sector of the addressed track with `fill_byte`, the way INT 13h
+    /// AH=05h formats a track. Returns false if the cylinder/head are off the
+    /// mounted media. The standard DOS format filler is 0xF6.
+    pub fn format_track(&mut self, cyl: u16, head: u8, fill_byte: u8) -> bool {
+        if head >= self.geom.heads || cyl >= self.geom.cylinders {
+            return false;
+        }
+        for sector in 1..=self.geom.sectors {
+            if let Some(off) = self.chs_offset(cyl, head, sector) {
+                self.bytes[off..off + SECTOR].fill(fill_byte);
+            }
+        }
+        self.dirty = true;
+        true
+    }
 }
 
 #[cfg(test)]
@@ -256,6 +272,27 @@ mod tests {
         assert!(f.write_sector(1, 1, 5, &buf));
         assert_eq!(f.read_sector(1, 1, 5).unwrap()[0], 0xAB);
         assert!(f.dirty);
+    }
+
+    #[test]
+    fn format_track_fills_the_addressed_track() {
+        let mut f = Floppy::from_image(vec![0u8; 737_280]).unwrap(); // 720 KB, 9 spt
+        assert!(f.format_track(2, 1, 0xF6));
+        // Every sector of track (cyl 2, head 1) reads back the filler.
+        for sector in 1..=9 {
+            assert_eq!(f.read_sector(2, 1, sector).unwrap()[0], 0xF6);
+            assert_eq!(f.read_sector(2, 1, sector).unwrap()[511], 0xF6);
+        }
+        // A neighbouring track is untouched.
+        assert_eq!(f.read_sector(2, 0, 1).unwrap()[0], 0x00);
+        assert!(f.dirty);
+    }
+
+    #[test]
+    fn format_track_rejects_out_of_range_track() {
+        let mut f = Floppy::from_image(vec![0u8; 737_280]).unwrap();
+        assert!(!f.format_track(80, 0, 0xF6)); // cyl 80 is off an 80-cyl disk
+        assert!(!f.format_track(0, 2, 0xF6)); // head 2 is off a 2-head disk
     }
 
     #[test]
