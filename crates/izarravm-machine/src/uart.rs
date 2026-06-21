@@ -1,10 +1,12 @@
-//! 16450/16550 UART as software sees it. Models COM1 at base 0x3F8 on IRQ4:
-//! the eight register offsets, the DLAB divisor latches, the IIR priority
-//! encoder, loopback (MCR bit4), and the scratch register a 16450-vs-16550
-//! probe reads back. Transmit drains instantly into a capture sink the POST
-//! log reads, so there is no host backpressure and no baud timing.
+//! 16450/16550 UART as software sees it. Models a COM port (COM1 at base 0x3F8
+//! on IRQ4, COM2 at 0x2F8 on IRQ3): the eight register offsets, the DLAB divisor
+//! latches, the IIR priority encoder, loopback (MCR bit4), and the scratch
+//! register a 16450-vs-16550 probe reads back. Transmit drains instantly into a
+//! capture sink the POST log reads, so there is no host backpressure and no baud
+//! timing.
 
 const COM1_BASE: u16 = 0x03f8;
+const COM2_BASE: u16 = 0x02f8;
 
 // Line status register (offset 5) bits.
 const LSR_DR: u8 = 0x01; // data ready in RBR
@@ -49,6 +51,7 @@ const FCR_FIFO_ENABLE: u8 = 0x01;
 /// reset value and read/write side effects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Uart16450 {
+    base: u16,    // first I/O port (0x3F8 for COM1, 0x2F8 for COM2)
     rbr: u8,      // receive buffer (read side of offset 0)
     ier: u8,      // interrupt enable
     fcr: u8,      // FIFO control (write side of offset 2)
@@ -69,6 +72,7 @@ pub struct Uart16450 {
 impl Default for Uart16450 {
     fn default() -> Self {
         Self {
+            base: COM1_BASE,
             rbr: 0,
             ier: 0,
             fcr: 0,
@@ -87,6 +91,15 @@ impl Default for Uart16450 {
 }
 
 impl Uart16450 {
+    /// A second UART decoded at the COM2 base (0x2F8). Same register model as
+    /// COM1; only the port window differs. The machine pulses IRQ3 for it.
+    pub fn com2() -> Self {
+        Self {
+            base: COM2_BASE,
+            ..Self::default()
+        }
+    }
+
     /// Captured transmit bytes. serial_output()/serial_text() and the POST log
     /// boot-suite test read this.
     pub fn output(&self) -> &[u8] {
@@ -97,17 +110,17 @@ impl Uart16450 {
         self.lcr & 0x80 != 0
     }
 
-    fn map_offset(port: u16) -> Option<u8> {
-        if (COM1_BASE..=COM1_BASE + 7).contains(&port) {
-            Some((port - COM1_BASE) as u8)
+    fn map_offset(&self, port: u16) -> Option<u8> {
+        if (self.base..=self.base + 7).contains(&port) {
+            Some((port - self.base) as u8)
         } else {
             None
         }
     }
 
-    /// Read a COM1 register, applying read side effects. None if not our port.
+    /// Read a UART register, applying read side effects. None if not our port.
     pub fn read_port(&mut self, port: u16) -> Option<u8> {
-        let offset = Self::map_offset(port)?;
+        let offset = self.map_offset(port)?;
         let value = match offset {
             0 => {
                 if self.dlab() {
@@ -143,9 +156,9 @@ impl Uart16450 {
         Some(value)
     }
 
-    /// Write a COM1 register, applying write side effects. false if not ours.
+    /// Write a UART register, applying write side effects. false if not ours.
     pub fn write_port(&mut self, port: u16, value: u8) -> bool {
-        let Some(offset) = Self::map_offset(port) else {
+        let Some(offset) = self.map_offset(port) else {
             return false;
         };
         match offset {
@@ -291,7 +304,8 @@ impl Uart16450 {
     }
 
     /// Recompute whether the interrupt line is asserted and arm the edge.
-    /// The line drives IRQ4 only when MCR OUT2 gates it.
+    /// The line drives the port's IRQ (IRQ4 for COM1, IRQ3 for COM2) only when
+    /// MCR OUT2 gates it.
     // ponytail: edge-armed on register access, not a continuously level-held
     // line; sufficient because the 8259 takes IRQ4 as an edge and every guest
     // interaction touches a UART port.
@@ -479,5 +493,28 @@ mod tests {
         assert!(uart.take_irq(), "RDA edge armed");
         let iir = uart.read_port(IIR).unwrap();
         assert_eq!(iir & 0x0f, IIR_RDA, "IIR reports received data available");
+    }
+
+    #[test]
+    fn com2_decodes_its_own_window_and_ignores_com1() {
+        let mut uart = Uart16450::com2();
+        // The scratch register at the COM2 base round-trips like COM1's does.
+        uart.write_port(COM2_BASE + 7, 0x5a);
+        assert_eq!(uart.read_port(COM2_BASE + 7), Some(0x5a), "COM2 scratch");
+        // COM2 ignores the COM1 window, and a COM1 instance ignores COM2's.
+        assert_eq!(uart.read_port(COM1_BASE + 7), None, "COM2 skips COM1 ports");
+        let mut com1 = Uart16450::default();
+        assert_eq!(com1.read_port(COM2_BASE + 7), None, "COM1 skips COM2 ports");
+    }
+
+    #[test]
+    fn com2_transmit_captures_like_com1() {
+        let mut uart = Uart16450::com2();
+        // THR at the COM2 base (DLAB clear) drains into the capture sink.
+        uart.write_port(COM2_BASE, b'O');
+        uart.write_port(COM2_BASE, b'k');
+        assert_eq!(uart.output(), b"Ok");
+        let lsr = uart.read_port(COM2_BASE + 5).unwrap();
+        assert_ne!(lsr & LSR_THRE, 0, "THRE set");
     }
 }

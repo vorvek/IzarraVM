@@ -1,10 +1,12 @@
-//! LPT1 parallel printer port (base 0x378, IRQ7) as software sees it: the data
-//! latch, a status register that reports a printer that is always ready, and a
-//! control register with the strobe/init/IRQ-enable bits. Printed bytes are
-//! captured into an output sink on the strobe pulse, so a polled or interrupt
-//! INT 17h driver runs without ever blocking on a real printer.
+//! Parallel printer port as software sees it (LPT1 at base 0x378 on IRQ7, LPT2
+//! at 0x278 on IRQ5): the data latch, a status register that reports a printer
+//! that is always ready, and a control register with the strobe/init/IRQ-enable
+//! bits. Printed bytes are captured into an output sink on the strobe pulse, so a
+//! polled or interrupt INT 17h driver runs without ever blocking on a real
+//! printer.
 
-const BASE: u16 = 0x0378;
+const LPT1_BASE: u16 = 0x0378;
+const LPT2_BASE: u16 = 0x0278;
 
 // Status register (0x379) bits. The data lines from the printer are active-low
 // for Busy/Ack/Error, so a "good idle" state reads them as 1. PaperEnd is
@@ -28,23 +30,47 @@ const CONTROL_STROBE: u8 = 0x01; // bit0 -Strobe
 const CONTROL_IRQ_ENABLE: u8 = 0x10; // bit4 ACK interrupt enable
 const CONTROL_RESERVED: u8 = 0xC0; // bits6-7 read as 1
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Lpt {
-    data: u8,              // data latch (0x378)
-    control: u8,           // control latch (0x37A), software view
+    base: u16,             // first I/O port (0x378 for LPT1, 0x278 for LPT2)
+    data: u8,              // data latch (base+0)
+    control: u8,           // control latch (base+2), software view
     strobe_asserted: bool, // last seen strobe state, to capture once per pulse
     output: Vec<u8>,       // captured printed bytes
-    irq_armed: bool,       // a strobed byte armed the -ACK IRQ7 edge
+    irq_armed: bool,       // a strobed byte armed the -ACK IRQ edge
+}
+
+impl Default for Lpt {
+    fn default() -> Self {
+        Self {
+            base: LPT1_BASE,
+            data: 0,
+            control: 0,
+            strobe_asserted: false,
+            output: Vec::new(),
+            irq_armed: false,
+        }
+    }
 }
 
 impl Lpt {
+    /// A second printer port decoded at the LPT2 base (0x278). Same model as
+    /// LPT1; only the port window differs. The machine pulses IRQ5 for it.
+    pub fn lpt2() -> Self {
+        Self {
+            base: LPT2_BASE,
+            ..Self::default()
+        }
+    }
+
     /// The bytes captured from strobed prints, in order.
     pub fn output(&self) -> &[u8] {
         &self.output
     }
 
-    /// Take the pending -ACK edge; the caller pulses IRQ7. Only armed when the
-    /// control register had IRQ-enable (bit4) set at the strobe.
+    /// Take the pending -ACK edge; the caller pulses the port's IRQ (IRQ7 for
+    /// LPT1, IRQ5 for LPT2). Only armed when the control register had IRQ-enable
+    /// (bit4) set at the strobe.
     pub fn take_irq(&mut self) -> bool {
         let armed = self.irq_armed;
         self.irq_armed = false;
@@ -52,7 +78,7 @@ impl Lpt {
     }
 
     pub fn read_port(&self, port: u16) -> Option<u8> {
-        match port.checked_sub(BASE) {
+        match port.checked_sub(self.base) {
             Some(0) => Some(self.data),
             Some(1) => Some(STATUS_IDLE),
             Some(2) => Some(self.control | CONTROL_RESERVED),
@@ -61,7 +87,7 @@ impl Lpt {
     }
 
     pub fn write_port(&mut self, port: u16, value: u8) -> bool {
-        match port.checked_sub(BASE) {
+        match port.checked_sub(self.base) {
             Some(0) => {
                 self.data = value;
                 true
@@ -72,8 +98,8 @@ impl Lpt {
                 // Capture once on the de-asserted -> asserted edge of -Strobe.
                 if strobe_now && !self.strobe_asserted {
                     self.output.push(self.data);
-                    // The -ACK pulse after the latched byte raises IRQ7 when the
-                    // control register has IRQ-enable set.
+                    // The -ACK pulse after the latched byte raises the port's IRQ
+                    // when the control register has IRQ-enable set.
                     // ponytail: instant printer, no real busy/ack timing window.
                     if value & CONTROL_IRQ_ENABLE != 0 {
                         self.irq_armed = true;
@@ -143,5 +169,18 @@ mod tests {
         assert_eq!(lpt.read_port(0x037B), None);
         assert!(!lpt.write_port(0x0377, 0));
         assert!(!lpt.write_port(0x037B, 0));
+    }
+
+    #[test]
+    fn lpt2_decodes_its_own_window_and_captures() {
+        let mut lpt = Lpt::lpt2();
+        // LPT2's window is 0x278-0x27A; the LPT1 window is not claimed.
+        assert_eq!(lpt.read_port(0x0279), Some(0xDF), "LPT2 idle status");
+        assert_eq!(lpt.read_port(0x0379), None, "LPT2 skips the LPT1 window");
+        // A data write then a strobe edge captures one byte at the LPT2 base.
+        lpt.write_port(0x0278, b'P');
+        lpt.write_port(0x027A, 0x01);
+        lpt.write_port(0x027A, 0x00);
+        assert_eq!(lpt.output(), b"P");
     }
 }

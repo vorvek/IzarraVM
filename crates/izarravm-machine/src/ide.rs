@@ -417,7 +417,7 @@ impl IdeChannel {
     /// way the floppy charges seek + transfer. Only the data-returning READ
     /// commands cost time; control commands are instant.
     fn charge_time(&mut self, opcode: u8, buf: &[u8]) {
-        if matches!(opcode, 0x28 | 0xA8) && !buf.is_empty() {
+        if matches!(opcode, 0x28 | 0xA8 | 0xBE) && !buf.is_empty() {
             let bytes = buf.len();
             self.last_access_bytes = bytes;
             // A fixed seek component plus the 12x transfer time. Pragmatic: a
