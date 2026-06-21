@@ -37,4 +37,33 @@ void t_exit(int code);
  * AX if the program could not be loaded (2 = not found). */
 int t_exec(const char *path, const char *tail);
 
+/* --- DOS file and directory services (INT 21h) ------------------------------
+ * Path-based calls take a DOS path (drive-qualified, absolute, or relative to
+ * the current directory). Directory calls return 0 on success or the DOS error
+ * code on failure. */
+
+/* File handles. t_open mode: 0 read, 1 write, 2 read/write. Handle >= 5 on
+ * success, -1 on error. */
+int t_open(const char *path, int mode);
+int t_create(const char *path);
+int t_read(int handle, void *buf, int count);  /* bytes read, -1 on error */
+int t_write(int handle, const void *buf, int count);
+void t_close(int handle);
+
+int t_mkdir(const char *path);
+int t_rmdir(const char *path);
+int t_chdir(const char *path);
+int t_delete(const char *path);
+int t_rename(const char *oldpath, const char *newpath);
+void t_getcwd(char *buf);   /* current dir from root, no leading slash, into buf */
+
+/* Find first/next. `dta` is a 43-byte buffer the result is written into; read
+ * the 8.3 name at dta+0x1E (ASCIIZ), attribute at dta+0x15, size dword at
+ * dta+0x1A. Returns 0 when a match was written, nonzero when none. */
+int t_findfirst(const char *spec, int attr, void *dta);
+int t_findnext(void *dta);
+
+void t_getdate(int *year, int *month, int *day, int *dow);
+void t_gettime(int *hour, int *min, int *sec);
+
 #endif /* TOKA_H */

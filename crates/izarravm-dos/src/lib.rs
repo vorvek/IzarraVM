@@ -511,6 +511,11 @@ pub struct DosKernel {
     // AH=0Ah buffered input: the running character count keyed by buffer address,
     // so it survives the per-character WaitForKey re-entries.
     pending_line: Option<(u32, u8)>,
+    // Current directory on C:, as a path from the root with no leading or trailing
+    // backslash ("" is the root, "DOS" is \DOS, "DOS\\NET" is \DOS\NET). This is
+    // the format AH=47h returns. The current directory is global in DOS, so it is
+    // not saved or restored across EXEC.
+    cwd: String,
 }
 
 impl DosKernel {
@@ -642,10 +647,52 @@ impl DosKernel {
         let Some(name) = read_asciiz(mem, ds, dx)? else {
             return Ok(Err(0x03));
         };
+        Ok(self.resolve_name(&name))
+    }
+
+    /// Resolve a DOS filename (drive-qualified, absolute, or relative to the
+    /// current directory) to a host path under the mounted C: drive, or a DOS
+    /// error code (0x02 no drive).
+    fn resolve_name(&self, name: &str) -> Result<PathBuf, u16> {
         let Some(drive) = self.drive.as_ref() else {
-            return Ok(Err(0x02));
+            return Err(0x02);
         };
-        Ok(drive.resolve_dos_path(&name).map_err(|_| 0x03))
+        // A drive letter other than C: names a drive that is not mounted.
+        let bytes = name.as_bytes();
+        if bytes.len() >= 2 && bytes[1] == b':' && !bytes[0].eq_ignore_ascii_case(&b'C') {
+            return Err(0x03);
+        }
+        let absolute = self.absolute_dos_path(name);
+        let mut host = drive.root().to_path_buf();
+        for component in absolute.split('\\').filter(|c| !c.is_empty()) {
+            host.push(component);
+        }
+        Ok(host)
+    }
+
+    /// Fold a DOS filename and the current directory into an absolute path from
+    /// the root, resolving `.` and `..`. The result has no leading backslash
+    /// ("" is the root), the same format the current directory is stored in. A
+    /// `..` at the root is ignored, so a guest cannot escape the mounted drive.
+    fn absolute_dos_path(&self, name: &str) -> String {
+        let after_drive = name
+            .strip_prefix("C:")
+            .or_else(|| name.strip_prefix("c:"))
+            .unwrap_or(name);
+        let mut components: Vec<&str> = Vec::new();
+        if !after_drive.starts_with(['\\', '/']) {
+            components.extend(self.cwd.split('\\').filter(|c| !c.is_empty()));
+        }
+        for part in after_drive.split(['\\', '/']).filter(|c| !c.is_empty()) {
+            match part {
+                "." => {}
+                ".." => {
+                    components.pop();
+                }
+                other => components.push(other),
+            }
+        }
+        components.join("\\")
     }
 
     /// Resolve DS:DX to a host path and read the program image into an owned
@@ -1381,6 +1428,125 @@ impl DosKernel {
                     }
                     Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
                 }
+                Ok(DosAction::Continue)
+            }
+            // AH=39h: create the directory named at DS:DX. CF=0 on success; CF=1 +
+            // AX=0x03 (path) or 0x05 (access) on failure.
+            0x39 => {
+                let path = match self.resolve_open_path(mem, regs.ds, regs.dx)? {
+                    Ok(path) => path,
+                    Err(code) => {
+                        set_dos_error(regs, code);
+                        return Ok(DosAction::Continue);
+                    }
+                };
+                match std::fs::create_dir(&path) {
+                    Ok(()) => regs.cf = false,
+                    Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
+                }
+                Ok(DosAction::Continue)
+            }
+            // AH=3Ah: remove the directory named at DS:DX.
+            0x3a => {
+                let path = match self.resolve_open_path(mem, regs.ds, regs.dx)? {
+                    Ok(path) => path,
+                    Err(code) => {
+                        set_dos_error(regs, code);
+                        return Ok(DosAction::Continue);
+                    }
+                };
+                match std::fs::remove_dir(&path) {
+                    Ok(()) => regs.cf = false,
+                    Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
+                }
+                Ok(DosAction::Continue)
+            }
+            // AH=3Bh: set the current directory to DS:DX. The path must name an
+            // existing directory; the current directory is global in DOS.
+            0x3b => {
+                let Some(name) = read_asciiz(mem, regs.ds, regs.dx)? else {
+                    set_dos_error(regs, 0x03);
+                    return Ok(DosAction::Continue);
+                };
+                match self.resolve_name(&name) {
+                    Ok(path) if path.is_dir() => {
+                        self.cwd = self.absolute_dos_path(&name);
+                        regs.cf = false;
+                    }
+                    Ok(_) => set_dos_error(regs, 0x03),
+                    Err(code) => set_dos_error(regs, code),
+                }
+                Ok(DosAction::Continue)
+            }
+            // AH=41h: delete the file named at DS:DX.
+            0x41 => {
+                let path = match self.resolve_open_path(mem, regs.ds, regs.dx)? {
+                    Ok(path) => path,
+                    Err(code) => {
+                        set_dos_error(regs, code);
+                        return Ok(DosAction::Continue);
+                    }
+                };
+                match std::fs::remove_file(&path) {
+                    Ok(()) => regs.cf = false,
+                    Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
+                }
+                Ok(DosAction::Continue)
+            }
+            // AH=47h: get the current directory for the drive in DL (0=default,
+            // 3=C:) into the 64-byte buffer at DS:SI, with no leading backslash.
+            0x47 => {
+                let base = usize::from(regs.ds) * 16 + usize::from(regs.si);
+                let bytes = self.cwd.as_bytes();
+                let written = bytes.len().min(63);
+                for (index, &byte) in bytes.iter().take(written).enumerate() {
+                    mem.write_u8(base + index, byte)?;
+                }
+                mem.write_u8(base + written, 0)?;
+                regs.ax = 0x0100; // AX is undocumented; some callers expect 0x0100
+                regs.cf = false;
+                Ok(DosAction::Continue)
+            }
+            // AH=56h: rename DS:DX to ES:DI (both ASCIIZ). CF=0 on success.
+            0x56 => {
+                let old = match self.resolve_open_path(mem, regs.ds, regs.dx)? {
+                    Ok(path) => path,
+                    Err(code) => {
+                        set_dos_error(regs, code);
+                        return Ok(DosAction::Continue);
+                    }
+                };
+                let Some(new_name) = read_asciiz(mem, regs.es, regs.di)? else {
+                    set_dos_error(regs, 0x03);
+                    return Ok(DosAction::Continue);
+                };
+                let new = match self.resolve_name(&new_name) {
+                    Ok(path) => path,
+                    Err(code) => {
+                        set_dos_error(regs, code);
+                        return Ok(DosAction::Continue);
+                    }
+                };
+                match std::fs::rename(&old, &new) {
+                    Ok(()) => regs.cf = false,
+                    Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
+                }
+                Ok(DosAction::Continue)
+            }
+            // AH=36h: get free disk space for the drive in DL (0=default, 3=C:).
+            // Cosmetic but plausible over the host-filesystem C:: 32 KiB clusters
+            // on a ~2 GiB volume. AX=sectors/cluster, BX=free clusters,
+            // CX=bytes/sector, DX=total clusters; AX=0xFFFF means an invalid drive.
+            0x36 => {
+                let drive = (regs.dx & 0xff) as u8;
+                if drive != 0 && drive != 3 {
+                    regs.ax = 0xffff;
+                    return Ok(DosAction::Continue);
+                }
+                regs.ax = 64; // sectors per cluster (64 * 512 = 32 KiB)
+                regs.cx = 512; // bytes per sector
+                regs.dx = 0xffff; // total clusters (~2 GiB)
+                regs.bx = 0xf000; // free clusters
                 Ok(DosAction::Continue)
             }
             // AH=40h: write CX bytes from DS:DX to the handle in BX. BX=1/2 route to
@@ -3493,6 +3659,168 @@ mod tests {
         kernel.dispatch(0x21, &mut bad, &mut mem).unwrap();
         assert!(bad.cf);
         assert_eq!(bad.ax, 0x01);
+    }
+
+    #[test]
+    fn dir_ops_mkdir_chdir_rename_delete_with_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut kernel = DosKernel::new();
+        kernel.mount_c(HostDrive::mount_c(dir.path()).unwrap());
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let seg = 0x0100u16;
+        let p1 = 0x0200usize;
+        let p2 = 0x0300usize;
+        let buf = 0x0400usize;
+        let put = |mem: &mut Memory, off: usize, s: &str| {
+            for (i, b) in s.bytes().enumerate() {
+                mem.write_u8(off + i, b).unwrap();
+            }
+            mem.write_u8(off + s.len(), 0).unwrap();
+        };
+        let base = |off: usize| usize::from(seg) * 16 + off;
+        let mut call = |kernel: &mut DosKernel, mem: &mut Memory, regs: DosRegs| {
+            let mut regs = regs;
+            kernel.dispatch(0x21, &mut regs, mem).unwrap();
+            regs
+        };
+
+        // MKDIR C:\DOS (drive-qualified, absolute).
+        put(&mut mem, base(p1), r"C:\DOS");
+        let r = call(
+            &mut kernel,
+            &mut mem,
+            DosRegs {
+                ax: 0x3900,
+                ds: seg,
+                dx: p1 as u16,
+                ..DosRegs::default()
+            },
+        );
+        assert!(!r.cf, "mkdir");
+        assert!(dir.path().join("DOS").is_dir());
+
+        // CHDIR DOS (relative), then get-cwd returns "DOS" with no leading slash.
+        put(&mut mem, base(p1), "DOS");
+        let r = call(
+            &mut kernel,
+            &mut mem,
+            DosRegs {
+                ax: 0x3b00,
+                ds: seg,
+                dx: p1 as u16,
+                ..DosRegs::default()
+            },
+        );
+        assert!(!r.cf, "chdir");
+        call(
+            &mut kernel,
+            &mut mem,
+            DosRegs {
+                ax: 0x4700,
+                ds: seg,
+                si: buf as u16,
+                ..DosRegs::default()
+            },
+        );
+        let mut cwd = String::new();
+        let mut i = 0;
+        loop {
+            let byte = mem.read_u8(base(buf) + i).unwrap();
+            if byte == 0 {
+                break;
+            }
+            cwd.push(byte as char);
+            i += 1;
+        }
+        assert_eq!(cwd, "DOS");
+
+        // Create a file with a relative name: it lands inside C:\DOS.
+        put(&mut mem, base(p1), "A.TXT");
+        let r = call(
+            &mut kernel,
+            &mut mem,
+            DosRegs {
+                ax: 0x3c00,
+                ds: seg,
+                dx: p1 as u16,
+                ..DosRegs::default()
+            },
+        );
+        assert!(!r.cf);
+        assert!(dir.path().join("DOS").join("A.TXT").exists());
+
+        // RENAME A.TXT -> B.TXT (both relative to the current directory).
+        put(&mut mem, base(p1), "A.TXT");
+        put(&mut mem, base(p2), "B.TXT");
+        let r = call(
+            &mut kernel,
+            &mut mem,
+            DosRegs {
+                ax: 0x5600,
+                ds: seg,
+                dx: p1 as u16,
+                es: seg,
+                di: p2 as u16,
+                ..DosRegs::default()
+            },
+        );
+        assert!(!r.cf, "rename");
+        assert!(dir.path().join("DOS").join("B.TXT").exists());
+        assert!(!dir.path().join("DOS").join("A.TXT").exists());
+
+        // DELETE B.TXT.
+        put(&mut mem, base(p1), "B.TXT");
+        let r = call(
+            &mut kernel,
+            &mut mem,
+            DosRegs {
+                ax: 0x4100,
+                ds: seg,
+                dx: p1 as u16,
+                ..DosRegs::default()
+            },
+        );
+        assert!(!r.cf, "delete");
+        assert!(!dir.path().join("DOS").join("B.TXT").exists());
+
+        // CHDIR .. back to the root, then RMDIR the now-empty C:\DOS.
+        put(&mut mem, base(p1), "..");
+        call(
+            &mut kernel,
+            &mut mem,
+            DosRegs {
+                ax: 0x3b00,
+                ds: seg,
+                dx: p1 as u16,
+                ..DosRegs::default()
+            },
+        );
+        put(&mut mem, base(p1), r"C:\DOS");
+        let r = call(
+            &mut kernel,
+            &mut mem,
+            DosRegs {
+                ax: 0x3a00,
+                ds: seg,
+                dx: p1 as u16,
+                ..DosRegs::default()
+            },
+        );
+        assert!(!r.cf, "rmdir");
+        assert!(!dir.path().join("DOS").exists());
+
+        // AH=36h reports a valid C: drive with plausible geometry.
+        let r = call(
+            &mut kernel,
+            &mut mem,
+            DosRegs {
+                ax: 0x3600,
+                dx: 3,
+                ..DosRegs::default()
+            },
+        );
+        assert_ne!(r.ax, 0xffff);
+        assert_eq!(r.cx, 512);
     }
 
     #[test]

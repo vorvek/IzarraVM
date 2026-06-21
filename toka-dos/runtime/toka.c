@@ -154,3 +154,150 @@ int t_exec(const char *path, const char *tail)
     }
     return 0;
 }
+
+int t_open(const char *path, int mode)
+{
+    union REGS r;
+    r.h.ah = 0x3d;
+    r.h.al = (unsigned char)mode;
+    r.x.dx = (unsigned)path;
+    int86(0x21, &r, &r);
+    return r.x.cflag ? -1 : (int)r.x.ax;
+}
+
+int t_create(const char *path)
+{
+    union REGS r;
+    r.h.ah = 0x3c;
+    r.x.cx = 0; /* normal attribute */
+    r.x.dx = (unsigned)path;
+    int86(0x21, &r, &r);
+    return r.x.cflag ? -1 : (int)r.x.ax;
+}
+
+int t_read(int handle, void *buf, int count)
+{
+    union REGS r;
+    r.h.ah = 0x3f;
+    r.x.bx = (unsigned)handle;
+    r.x.cx = (unsigned)count;
+    r.x.dx = (unsigned)buf;
+    int86(0x21, &r, &r);
+    return r.x.cflag ? -1 : (int)r.x.ax;
+}
+
+int t_write(int handle, const void *buf, int count)
+{
+    union REGS r;
+    r.h.ah = 0x40;
+    r.x.bx = (unsigned)handle;
+    r.x.cx = (unsigned)count;
+    r.x.dx = (unsigned)buf;
+    int86(0x21, &r, &r);
+    return r.x.cflag ? -1 : (int)r.x.ax;
+}
+
+void t_close(int handle)
+{
+    union REGS r;
+    r.h.ah = 0x3e;
+    r.x.bx = (unsigned)handle;
+    int86(0x21, &r, &r);
+}
+
+/* Shared body for the path-only directory calls that return CF/AX. */
+static int dir_call(unsigned char ah, const char *path)
+{
+    union REGS r;
+    r.h.ah = ah;
+    r.x.dx = (unsigned)path;
+    int86(0x21, &r, &r);
+    return r.x.cflag ? (int)r.x.ax : 0;
+}
+
+int t_mkdir(const char *path)
+{
+    return dir_call(0x39, path);
+}
+
+int t_rmdir(const char *path)
+{
+    return dir_call(0x3a, path);
+}
+
+int t_chdir(const char *path)
+{
+    return dir_call(0x3b, path);
+}
+
+int t_delete(const char *path)
+{
+    return dir_call(0x41, path);
+}
+
+int t_rename(const char *oldpath, const char *newpath)
+{
+    union REGS r;
+    struct SREGS s;
+    segread(&s);
+    r.h.ah = 0x56;
+    r.x.dx = (unsigned)oldpath; /* DS:DX = old name */
+    r.x.di = (unsigned)newpath; /* ES:DI = new name */
+    s.es = s.ds;
+    int86x(0x21, &r, &r, &s);
+    return r.x.cflag ? (int)r.x.ax : 0;
+}
+
+void t_getcwd(char *buf)
+{
+    union REGS r;
+    r.h.ah = 0x47;
+    r.h.dl = 0; /* default drive */
+    r.x.si = (unsigned)buf;
+    int86(0x21, &r, &r);
+}
+
+int t_findfirst(const char *spec, int attr, void *dta)
+{
+    union REGS r;
+    r.h.ah = 0x1a; /* set DTA to our buffer */
+    r.x.dx = (unsigned)dta;
+    int86(0x21, &r, &r);
+    r.h.ah = 0x4e;
+    r.x.cx = (unsigned)attr;
+    r.x.dx = (unsigned)spec;
+    int86(0x21, &r, &r);
+    return r.x.cflag ? (int)r.x.ax : 0;
+}
+
+int t_findnext(void *dta)
+{
+    union REGS r;
+    r.h.ah = 0x1a;
+    r.x.dx = (unsigned)dta;
+    int86(0x21, &r, &r);
+    r.h.ah = 0x4f;
+    int86(0x21, &r, &r);
+    return r.x.cflag ? (int)r.x.ax : 0;
+}
+
+void t_getdate(int *year, int *month, int *day, int *dow)
+{
+    union REGS r;
+    r.h.ah = 0x2a;
+    int86(0x21, &r, &r);
+    *year = (int)r.x.cx;
+    *month = (int)r.h.dh;
+    *day = (int)r.h.dl;
+    *dow = (int)r.h.al;
+}
+
+void t_gettime(int *hour, int *min, int *sec)
+{
+    union REGS r;
+    r.h.ah = 0x2c;
+    int86(0x21, &r, &r);
+    *hour = (int)r.h.ch;
+    *min = (int)r.h.cl;
+    *sec = (int)r.h.dh;
+}

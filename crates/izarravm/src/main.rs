@@ -343,17 +343,23 @@ fn run_headless_toka(
     // so roughly a second of cycles is ample to reach the prompt.
     machine.run_until_halt_or_cycles(hardware.clock_hz)?;
 
-    // Feed the script one line at a time. The BDA keyboard ring holds only 15
-    // entries, so typing a whole multi-line script at once would overflow it;
-    // typing a line and letting ICOMMAND consume it keeps the ring drained.
+    // Feed the script character by character. The BDA keyboard ring holds only
+    // 15 entries, so injecting a whole line at once overflows it on a long
+    // command. Typing one character and running briefly lets ICOMMAND's line
+    // input drain the ring before the next character, so any line length works.
     if let Some(text) = stdin_text {
+        let per_char = 200_000u64;
         let line_budget = hardware.clock_hz / 2;
         for raw in text.split('\n') {
             let line = raw.trim_end_matches('\r');
-            for ch in line.chars().chain(std::iter::once('\r')) {
+            for ch in line.chars() {
                 for code in ascii_to_set1(ch) {
                     machine.inject_key_scancodes(&[code]);
                 }
+                machine.run_until_halt_or_cycles(per_char)?;
+            }
+            for code in ascii_to_set1('\r') {
+                machine.inject_key_scancodes(&[code]);
             }
             machine.run_until_halt_or_cycles(line_budget)?;
         }
