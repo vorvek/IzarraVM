@@ -735,6 +735,32 @@ impl Cpu386 {
                 self.push(bus, value, operand_size)?;
                 Ok(clocks(2))
             }
+            0x69 => {
+                // IMUL r, r/m, imm16/32: signed multiply of r/m by a full-width immediate.
+                let modrm = self.fetch_modrm(bus)?;
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
+                let src = self.read_operand_sized(bus, operand, operand_size)?;
+                let imm = self.fetch_immediate(bus, operand_size)?;
+                let result = self.imul_truncated(src, imm, operand_size);
+                self.write_gpr_sized(modrm.reg, operand_size, result);
+                Ok(clocks(14))
+            }
+            0x6a => {
+                // PUSH imm8: sign-extend the byte to the operand size, then push it.
+                let value = sign_extend_u8(self.fetch_u8(bus)?);
+                self.push(bus, value, operand_size)?;
+                Ok(clocks(2))
+            }
+            0x6b => {
+                // IMUL r, r/m, imm8: signed multiply of r/m by a sign-extended byte immediate.
+                let modrm = self.fetch_modrm(bus)?;
+                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
+                let src = self.read_operand_sized(bus, operand, operand_size)?;
+                let imm = sign_extend_u8(self.fetch_u8(bus)?);
+                let result = self.imul_truncated(src, imm, operand_size);
+                self.write_gpr_sized(modrm.reg, operand_size, result);
+                Ok(clocks(14))
+            }
             0x70..=0x7f => {
                 let rel = self.fetch_i8(bus)? as i32;
                 if self.condition(opcode & 0x0f) {
@@ -742,7 +768,8 @@ impl Cpu386 {
                 }
                 Ok(clocks(3))
             }
-            0x80 => {
+            // 0x82 is an undocumented alias of 0x80 (group-1 r/m8, imm8): identical encoding.
+            0x80 | 0x82 => {
                 let modrm = self.fetch_modrm(bus)?;
                 let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
                 let imm = u32::from(self.fetch_u8(bus)?);
@@ -1218,6 +1245,51 @@ impl Cpu386 {
                 self.write_operand_sized(bus, operand, operand_size, value)?;
                 Ok(clocks(2))
             }
+            0xc8 => {
+                // ENTER imm16, imm8: build a stack frame. NestingLevel is taken mod 32.
+                // Counterpart to LEAVE. Stack-pointer width follows push's real-mode-vs-
+                // protected model (the SS B-bit refinement is deferred there too).
+                let alloc = self.fetch_u16(bus)?;
+                let level = u32::from(self.fetch_u8(bus)? & 0x1f);
+                let size = operand_size.bytes();
+                let frame_bp = self.read_gpr_sized(5, operand_size);
+                self.push(bus, frame_bp, operand_size)?;
+                let frame_temp = self.read_gpr_sized(4, operand_size);
+                if level > 0 {
+                    // Copy the display: the saved frame pointers of the enclosing scopes.
+                    let mut bp = self.read_gpr_sized(5, operand_size);
+                    for _ in 1..level {
+                        bp = bp.wrapping_sub(size) & operand_size.mask();
+                        self.write_gpr_sized(5, operand_size, bp);
+                        let display = self.read_memory_sized(
+                            bus,
+                            SegmentIndex::Ss,
+                            bp,
+                            operand_size,
+                            BusAccessKind::DataRead,
+                        )?;
+                        self.push(bus, display, operand_size)?;
+                    }
+                    self.push(bus, frame_temp, operand_size)?;
+                }
+                self.write_gpr_sized(5, operand_size, frame_temp);
+                match operand_size {
+                    OperandSize::Word => {
+                        let sp = self.read_gpr16(4).wrapping_sub(alloc);
+                        self.write_gpr16(4, sp);
+                    }
+                    OperandSize::Dword => {
+                        if self.is_protected_mode() {
+                            let esp = self.registers.esp().wrapping_sub(u32::from(alloc));
+                            self.registers.set_esp(esp);
+                        } else {
+                            let sp = self.read_gpr16(4).wrapping_sub(alloc);
+                            self.write_gpr16(4, sp);
+                        }
+                    }
+                }
+                Ok(clocks(10))
+            }
             0xc9 => {
                 // LEAVE: (E)SP <- (E)BP, then (E)BP <- pop. The stack-pointer move
                 // follows the stack width: a 16-bit real-mode stack moves only SP and
@@ -1233,14 +1305,34 @@ impl Cpu386 {
                 self.write_gpr_sized(5, operand_size, saved);
                 Ok(clocks(4))
             }
+            0xcc => {
+                // INT 3: one-byte breakpoint trap to vector 3.
+                self.software_interrupt(bus, 3)?;
+                Ok(clocks(33))
+            }
             0xcd => {
                 let vector = self.fetch_u8(bus)?;
                 self.software_interrupt(bus, vector)?;
                 Ok(clocks(37))
             }
+            0xce => {
+                // INTO: trap to vector 4 only when OF is set; otherwise a no-op.
+                if self.flag(FLAG_OF) {
+                    self.software_interrupt(bus, 4)?;
+                    Ok(clocks(35))
+                } else {
+                    Ok(clocks(3))
+                }
+            }
             0xcf => {
                 self.iret(bus, operand_size)?;
                 Ok(clocks(22))
+            }
+            0xd6 => {
+                // SALC/SETALC (undocumented): AL = CF ? 0xFF : 0x00. Flags unaffected.
+                let value = if self.flag(FLAG_CF) { 0xff } else { 0x00 };
+                self.write_gpr8(0, value);
+                Ok(clocks(2))
             }
             0xe0 | 0xe1 => {
                 // LOOPNE (E0) / LOOPE (E1): decrement (E)CX, branch while non-zero and ZF matches.
@@ -1317,6 +1409,40 @@ impl Cpu386 {
                 bus.write_io(port, BusWidth::Byte, u32::from(self.read_gpr8(0)))?;
                 Ok(clocks(10))
             }
+            0xe5 => {
+                // IN AX/EAX, imm8: word/dword port input into the accumulator.
+                let port = u16::from(self.fetch_u8(bus)?);
+                let value = bus.read_io(port, operand_size.bus_width())?;
+                self.write_gpr_sized(0, operand_size, value);
+                Ok(clocks(12))
+            }
+            0xe7 => {
+                // OUT imm8, AX/EAX: word/dword port output from the accumulator.
+                let port = u16::from(self.fetch_u8(bus)?);
+                bus.write_io(
+                    port,
+                    operand_size.bus_width(),
+                    self.read_gpr_sized(0, operand_size),
+                )?;
+                Ok(clocks(10))
+            }
+            0xed => {
+                // IN AX/EAX, DX: word/dword port input addressed by DX.
+                let port = self.read_gpr16(2);
+                let value = bus.read_io(port, operand_size.bus_width())?;
+                self.write_gpr_sized(0, operand_size, value);
+                Ok(clocks(12))
+            }
+            0xef => {
+                // OUT DX, AX/EAX: word/dword port output addressed by DX.
+                let port = self.read_gpr16(2);
+                bus.write_io(
+                    port,
+                    operand_size.bus_width(),
+                    self.read_gpr_sized(0, operand_size),
+                )?;
+                Ok(clocks(10))
+            }
             0xe8 => {
                 let rel = self.fetch_relative(bus, operand_size)?;
                 self.push(bus, self.registers.eip, operand_size)?;
@@ -1332,6 +1458,13 @@ impl Cpu386 {
                 let rel = self.fetch_i8(bus)? as i32;
                 self.relative_jump(rel, operand_size);
                 Ok(clocks(7))
+            }
+            0x9b => {
+                // WAIT/FWAIT: synchronize with the x87. With no FPU implemented there is no
+                // pending numeric exception to test, so it retires as a no-op.
+                // ponytail: no-op until the x87 core lands; then this must trap (#MF) on an
+                // unmasked pending FPU exception.
+                Ok(clocks(6))
             }
             0x9a => {
                 let offset = match operand_size {
@@ -9167,5 +9300,187 @@ mod tests {
         cpu.cycle(&mut bus).unwrap(); // cpuid
         assert_eq!(cpu.registers.eax(), 1);
         assert_eq!(cpu.registers.ebx().to_le_bytes(), *b"Genu");
+    }
+
+    // ---- Slice 1: real-mode integer opcode completion (see dev_docs/COVERAGE.md) ----
+
+    fn real_mode_cpu(code: &[u8], mem_len: usize) -> (Cpu386, Vec<u8>) {
+        let mut memory = vec![0u8; mem_len];
+        memory[..code.len()].copy_from_slice(code);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        (cpu, memory)
+    }
+
+    #[test]
+    fn int3_traps_to_vector_3() {
+        // 0xCC. IVT[3] (linear 12) -> CS:IP = 0000:0100.
+        let (mut cpu, mut memory) = real_mode_cpu(&[0xcc], 0x200);
+        memory[12..14].copy_from_slice(&0x0100u16.to_le_bytes());
+        memory[14..16].copy_from_slice(&0x0000u16.to_le_bytes());
+        cpu.write_reg16(Reg16::Sp, 0x0200);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap();
+
+        assert_eq!(cpu.registers.eip, 0x0100);
+        assert_eq!(cpu.registers.cs().selector, 0);
+        // flags, CS, return-IP(=1) were pushed: SP fell by 6, return IP word is 1.
+        assert_eq!(cpu.read_reg16(Reg16::Sp), 0x01fa);
+        assert_eq!(
+            u16::from_le_bytes([bus.memory[0x1fa], bus.memory[0x1fb]]),
+            1
+        );
+    }
+
+    #[test]
+    fn into_traps_only_when_overflow_set() {
+        // 0xCE with OF=1 traps to vector 4 (IVT[4] linear 16 -> 0000:0200).
+        let (mut cpu, mut memory) = real_mode_cpu(&[0xce], 0x300);
+        memory[16..18].copy_from_slice(&0x0200u16.to_le_bytes());
+        cpu.write_reg16(Reg16::Sp, 0x0280);
+        cpu.set_flag(FLAG_OF, true);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.eip, 0x0200, "OF set: INTO must trap");
+
+        // OF=0: INTO is a no-op, just advances past the one byte.
+        let (mut cpu, memory) = real_mode_cpu(&[0xce], 0x40);
+        cpu.set_flag(FLAG_OF, false);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.eip, 1, "OF clear: INTO must fall through");
+    }
+
+    #[test]
+    fn word_in_out_use_word_width() {
+        // IN AX, DX (0xED): word port read lands in AX (TestBus returns 0).
+        let (mut cpu, memory) = real_mode_cpu(&[0xed], 0x10);
+        cpu.write_reg16(Reg16::Ax, 0xffff);
+        cpu.write_reg16(Reg16::Dx, 0x03f8);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x0000);
+        assert!(
+            bus.trace
+                .cycles()
+                .iter()
+                .any(|c| c.kind == BusAccessKind::IoRead
+                    && c.width == BusWidth::Word
+                    && c.address == 0x03f8)
+        );
+
+        // OUT DX, AX (0xEF): word port write at DX.
+        let (mut cpu, memory) = real_mode_cpu(&[0xef], 0x10);
+        cpu.write_reg16(Reg16::Ax, 0x1234);
+        cpu.write_reg16(Reg16::Dx, 0x03f8);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert!(
+            bus.trace
+                .cycles()
+                .iter()
+                .any(|c| c.kind == BusAccessKind::IoWrite
+                    && c.width == BusWidth::Word
+                    && c.address == 0x03f8)
+        );
+    }
+
+    #[test]
+    fn push_imm8_sign_extends_to_word() {
+        // 0x6A 0x80 -> push 0xFF80 onto a 16-bit stack.
+        let (mut cpu, memory) = real_mode_cpu(&[0x6a, 0x80], 0x120);
+        cpu.write_reg16(Reg16::Sp, 0x0100);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.read_reg16(Reg16::Sp), 0x00fe);
+        assert_eq!(
+            u16::from_le_bytes([bus.memory[0xfe], bus.memory[0xff]]),
+            0xff80
+        );
+    }
+
+    #[test]
+    fn imul_imm8_sign_extended() {
+        // IMUL AX, AX, -1  (0x6B 0xC0 0xFF): 2 * -1 = -2, fits, CF/OF clear.
+        let (mut cpu, memory) = real_mode_cpu(&[0x6b, 0xc0, 0xff], 0x10);
+        cpu.write_reg16(Reg16::Ax, 0x0002);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0xfffe);
+        assert!(!cpu.flag(FLAG_CF) && !cpu.flag(FLAG_OF));
+    }
+
+    #[test]
+    fn imul_imm16_overflow_sets_carry_and_overflow() {
+        // IMUL AX, AX, 0x0004 (0x69 0xC0 0x04 0x00) with AX=0x4000 -> 0x10000, truncates.
+        let (mut cpu, memory) = real_mode_cpu(&[0x69, 0xc0, 0x04, 0x00], 0x10);
+        cpu.write_reg16(Reg16::Ax, 0x4000);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x0000);
+        assert!(cpu.flag(FLAG_CF) && cpu.flag(FLAG_OF));
+    }
+
+    #[test]
+    fn enter_level_zero_builds_frame() {
+        // ENTER 4, 0 (0xC8 0x04 0x00 0x00): push BP, BP=SP, SP-=4.
+        let (mut cpu, memory) = real_mode_cpu(&[0xc8, 0x04, 0x00, 0x00], 0x120);
+        cpu.write_reg16(Reg16::Bp, 0xbbbb);
+        cpu.write_reg16(Reg16::Sp, 0x0100);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(
+            cpu.read_reg16(Reg16::Bp),
+            0x00fe,
+            "BP = frame after PUSH BP"
+        );
+        assert_eq!(cpu.read_reg16(Reg16::Sp), 0x00fa, "SP -= alloc");
+        assert_eq!(
+            u16::from_le_bytes([bus.memory[0xfe], bus.memory[0xff]]),
+            0xbbbb
+        );
+    }
+
+    #[test]
+    fn salc_sets_al_from_carry() {
+        // 0xD6 with CF=1 -> AL=0xFF (AH preserved).
+        let (mut cpu, memory) = real_mode_cpu(&[0xd6], 0x10);
+        cpu.write_reg16(Reg16::Ax, 0x1234);
+        cpu.set_flag(FLAG_CF, true);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x12ff);
+
+        // CF=0 -> AL=0x00.
+        let (mut cpu, memory) = real_mode_cpu(&[0xd6], 0x10);
+        cpu.write_reg16(Reg16::Ax, 0x1234);
+        cpu.set_flag(FLAG_CF, false);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x1200);
+    }
+
+    #[test]
+    fn opcode_82_aliases_80_add() {
+        // ADD AL, 5 encoded with the undocumented 0x82 group-1 opcode.
+        let (mut cpu, memory) = real_mode_cpu(&[0x82, 0xc0, 0x05], 0x10);
+        cpu.write_reg16(Reg16::Ax, 0x0010);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.read_reg16(Reg16::Ax) & 0xff, 0x15);
+    }
+
+    #[test]
+    fn wait_is_a_nop_without_fpu() {
+        let (mut cpu, memory) = real_mode_cpu(&[0x9b], 0x10);
+        let flags_before = cpu.registers.eflags;
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.eip, 1);
+        assert_eq!(cpu.registers.eflags, flags_before);
     }
 }
