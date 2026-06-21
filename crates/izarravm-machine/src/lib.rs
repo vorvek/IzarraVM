@@ -7848,6 +7848,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn toka_runs_a_batch_file_with_goto() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = izarravm_firmware::toka_dos_system_files();
+        izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format)
+            .unwrap();
+        // A batch that echoes, jumps over a line with GOTO, and resumes at a label.
+        std::fs::write(
+            dir.path().join("TEST.BAT"),
+            "@ECHO OFF\r\nECHO alpha\r\nGOTO skip\r\nECHO beta\r\n:skip\r\nECHO gamma\r\n",
+        )
+        .unwrap();
+
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .unwrap();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        machine.set_toka_c_root(dir.path().to_path_buf());
+        machine.run_until_halt_or_cycles(22_000_000).unwrap();
+
+        fn key_codes(ch: char) -> Vec<u8> {
+            let make: u8 = match ch {
+                't' => 0x14,
+                'e' => 0x12,
+                's' => 0x1f,
+                '\r' => 0x1c,
+                _ => return Vec::new(),
+            };
+            vec![make, make | 0x80]
+        }
+        for ch in "test\r".chars() {
+            for code in key_codes(ch) {
+                machine.inject_key_scancodes(&[code]);
+            }
+            machine.run_until_halt_or_cycles(600_000).unwrap();
+        }
+
+        let text = machine.screen_text().as_text();
+        assert!(text.contains("alpha"), "ECHO ran; got:\n{text}");
+        assert!(
+            text.contains("gamma"),
+            "the label after GOTO ran; got:\n{text}"
+        );
+        assert!(
+            !text.contains("beta"),
+            "GOTO skipped the line in between; got:\n{text}"
+        );
+    }
+
     // --- Izarra 3000 BIOS foundation ---------------------------------------
 
     #[test]

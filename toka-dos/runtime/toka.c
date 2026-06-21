@@ -301,3 +301,25 @@ void t_gettime(int *hour, int *min, int *sec)
     *min = (int)r.h.cl;
     *sec = (int)r.h.dh;
 }
+
+int t_lastexit(void)
+{
+    union REGS r;
+    r.h.ah = 0x4d;
+    int86(0x21, &r, &r);
+    return (int)r.h.al;
+}
+
+int t_getkey(void)
+{
+    union REGS r;
+    r.h.ah = 0x07; /* read without echo, no Ctrl-C check */
+    int86(0x21, &r, &r);
+    return (int)r.h.al;
+}
+
+int t_exists(const char *path)
+{
+    unsigned char dta[43];
+    return t_findfirst(path, 0x10, dta) == 0;
+}

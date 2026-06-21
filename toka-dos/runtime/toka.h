@@ -66,4 +66,11 @@ int t_findnext(void *dta);
 void t_getdate(int *year, int *month, int *day, int *dow);
 void t_gettime(int *hour, int *min, int *sec);
 
+/* The exit code of the last EXEC'd child (AH=4Dh), for ERRORLEVEL. */
+int t_lastexit(void);
+/* Read one key without echo (AH=07h); returns the ASCII byte. */
+int t_getkey(void);
+/* True if `path` exists (a file or, with a wildcard, any match). */
+int t_exists(const char *path);
+
 #endif /* TOKA_H */

@@ -3678,7 +3678,7 @@ mod tests {
             mem.write_u8(off + s.len(), 0).unwrap();
         };
         let base = |off: usize| usize::from(seg) * 16 + off;
-        let mut call = |kernel: &mut DosKernel, mem: &mut Memory, regs: DosRegs| {
+        let call = |kernel: &mut DosKernel, mem: &mut Memory, regs: DosRegs| {
             let mut regs = regs;
             kernel.dispatch(0x21, &mut regs, mem).unwrap();
             regs

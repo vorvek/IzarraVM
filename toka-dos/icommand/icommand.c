@@ -484,7 +484,333 @@ static void cmd_time(void)
     t_putln("");
 }
 
-/* Run `name` as C:\NAME.COM then C:\NAME.EXE, passing `tail`. 1 if launched. */
+static void dispatch(char *word, char *rest);
+
+/* ERRORLEVEL: the exit code of the last external program. */
+static int errorlevel = 0;
+
+/* --- Batch (.BAT) interpreter -----------------------------------------------
+ * A batch file is loaded whole, split into lines, and run with a line index so
+ * GOTO can jump. One level is supported (a batch that runs another .BAT does not
+ * resume afterward; the depth guard keeps the state from being clobbered). */
+#define BAT_MAX 8192
+#define BAT_LINES 256
+
+static char bat_text[BAT_MAX];
+static char *bat_line[BAT_LINES];
+static int bat_nlines;
+static int bat_ip;
+static int bat_echo;
+static int bat_depth;
+static char bat_arg[10][64]; /* %0..%9 */
+
+static int small_atoi(const char *s)
+{
+    int value = 0;
+    while (*s >= '0' && *s <= '9') {
+        value = value * 10 + (*s - '0');
+        s++;
+    }
+    return value;
+}
+
+/* Find "==" in `s`; return its index or -1. */
+static int find_eqeq(const char *s)
+{
+    int i;
+    for (i = 0; s[i]; i++) {
+        if (s[i] == '=' && s[i + 1] == '=') {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Expand %0..%9 and %VAR% (and %% to %) from `src` into `dst`. */
+static void bat_expand(const char *src, char *dst)
+{
+    int d = 0;
+    while (*src && d < 250) {
+        if (*src == '%') {
+            src++;
+            if (*src == '%') {
+                dst[d++] = '%';
+                src++;
+            } else if (*src >= '0' && *src <= '9') {
+                const char *a = bat_arg[*src - '0'];
+                src++;
+                while (*a && d < 250) {
+                    dst[d++] = *a++;
+                }
+            } else {
+                char name[32];
+                int k = 0;
+                char *value;
+                while (*src && *src != '%' && k < 31) {
+                    name[k++] = *src++;
+                }
+                name[k] = 0;
+                if (*src == '%') {
+                    src++;
+                }
+                value = env_get(name);
+                if (value) {
+                    while (*value && d < 250) {
+                        dst[d++] = *value++;
+                    }
+                }
+            }
+        } else {
+            dst[d++] = *src++;
+        }
+    }
+    dst[d] = 0;
+}
+
+static void bat_goto(const char *label)
+{
+    int i;
+    if (*label == ':') {
+        label++;
+    }
+    for (i = 0; i < bat_nlines; i++) {
+        char *p = skip_ws(bat_line[i]);
+        if (*p == ':') {
+            char name[32];
+            int k = 0;
+            p++;
+            while (p[k] && p[k] != ' ' && p[k] != '\t' && k < 31) {
+                name[k] = p[k];
+                k++;
+            }
+            name[k] = 0;
+            if (eqi(name, label)) {
+                bat_ip = i;
+                return;
+            }
+        }
+    }
+    t_putln("Label not found");
+    bat_ip = bat_nlines;
+}
+
+static void bat_echo_cmd(char *rest)
+{
+    if (eqi(rest, "ON")) {
+        bat_echo = 1;
+    } else if (eqi(rest, "OFF")) {
+        bat_echo = 0;
+    } else if (rest[0] == 0) {
+        t_putln(bat_echo ? "ECHO is on" : "ECHO is off");
+    } else if (rest[0] == '.') {
+        t_putln(rest + 1);
+    } else {
+        t_putln(rest);
+    }
+}
+
+static void bat_if(char *rest)
+{
+    int negate = 0, cond = 0, eq;
+    char tok[40];
+    char *p = split_word(rest, tok, sizeof tok);
+    if (eqi(tok, "NOT")) {
+        negate = 1;
+        p = split_word(p, tok, sizeof tok);
+    }
+    if (eqi(tok, "ERRORLEVEL")) {
+        char num[8];
+        p = split_word(p, num, sizeof num);
+        cond = errorlevel >= small_atoi(num);
+    } else if (eqi(tok, "EXIST")) {
+        char path[80];
+        p = split_word(p, path, sizeof path);
+        cond = t_exists(path);
+    } else if ((eq = find_eqeq(tok)) >= 0) {
+        /* s1==s2 with no spaces around ==. */
+        char left[20];
+        int i;
+        for (i = 0; i < eq && i < 19; i++) {
+            left[i] = tok[i];
+        }
+        left[i] = 0;
+        cond = (strcmp(left, tok + eq + 2) == 0);
+    }
+    if (negate) {
+        cond = !cond;
+    }
+    if (cond) {
+        char word[16];
+        char *r2 = split_word(p, word, sizeof word);
+        dispatch(word, r2);
+    }
+}
+
+static void bat_for(char *rest)
+{
+    char var, items[256], tok[8];
+    char *p = skip_ws(rest);
+    int n = 0;
+    char *it, *cmd;
+    if (p[0] == '%' && p[1] == '%') {
+        var = p[2];
+        p += 3;
+    } else {
+        return;
+    }
+    p = split_word(skip_ws(p), tok, sizeof tok); /* IN */
+    p = skip_ws(p);
+    if (*p != '(') {
+        return;
+    }
+    p++;
+    while (*p && *p != ')' && n < 255) {
+        items[n++] = *p++;
+    }
+    items[n] = 0;
+    if (*p == ')') {
+        p++;
+    }
+    p = split_word(skip_ws(p), tok, sizeof tok); /* DO */
+    cmd = skip_ws(p);
+    it = items;
+    for (;;) {
+        char item[64], built[256], word[16];
+        int k = 0, b = 0;
+        char *c = cmd, *r2;
+        it = skip_ws(it);
+        while (*it && *it != ' ' && *it != '\t' && k < 63) {
+            item[k++] = *it++;
+        }
+        item[k] = 0;
+        if (k == 0) {
+            break;
+        }
+        while (*c && b < 250) {
+            if (c[0] == '%' && c[1] == '%' && c[2] == var) {
+                int m = 0;
+                while (item[m] && b < 250) {
+                    built[b++] = item[m++];
+                }
+                c += 3;
+            } else {
+                built[b++] = *c++;
+            }
+        }
+        built[b] = 0;
+        r2 = split_word(built, word, sizeof word);
+        dispatch(word, r2);
+    }
+}
+
+static void bat_exec_line(char *raw)
+{
+    char expanded[256], word[16];
+    char *p = skip_ws(raw);
+    char *rest;
+    int at = 0;
+    if (*p == ':') {
+        return; /* a label */
+    }
+    if (*p == '@') {
+        at = 1;
+        p = skip_ws(p + 1);
+    }
+    if (*p == 0) {
+        return;
+    }
+    bat_expand(p, expanded);
+    if (bat_echo && !at) {
+        render_prompt();
+        t_putln(expanded);
+    }
+    rest = split_word(expanded, word, sizeof word);
+    if (eqi(word, "ECHO")) {
+        bat_echo_cmd(rest);
+    } else if (eqi(word, "REM")) {
+        /* comment */
+    } else if (eqi(word, "GOTO")) {
+        bat_goto(rest);
+    } else if (eqi(word, "IF")) {
+        bat_if(rest);
+    } else if (eqi(word, "FOR")) {
+        bat_for(rest);
+    } else if (eqi(word, "SHIFT")) {
+        int i;
+        for (i = 0; i < 9; i++) {
+            strcpy(bat_arg[i], bat_arg[i + 1]);
+        }
+        bat_arg[9][0] = 0;
+    } else if (eqi(word, "PAUSE")) {
+        t_putln("Press any key to continue . . .");
+        t_getkey();
+    } else if (eqi(word, "CALL")) {
+        char *r2 = split_word(rest, word, sizeof word);
+        dispatch(word, r2);
+    } else {
+        dispatch(word, rest);
+    }
+}
+
+/* Run a .BAT file at `path` with command-tail `tail` as %1..%9. */
+static void run_batch(const char *path, const char *tail)
+{
+    int handle, total, i;
+    char *t;
+
+    if (bat_depth > 0) {
+        /* One batch level: a nested .BAT runs but does not resume the caller. */
+    }
+    handle = t_open(path, 0);
+    if (handle < 0) {
+        return;
+    }
+    total = t_read(handle, bat_text, BAT_MAX - 1);
+    t_close(handle);
+    if (total < 0) {
+        return;
+    }
+    bat_text[total] = 0;
+
+    /* Split into NUL-terminated lines, stripping CR. */
+    bat_nlines = 0;
+    bat_line[bat_nlines++] = bat_text;
+    for (i = 0; i < total; i++) {
+        if (bat_text[i] == '\r') {
+            bat_text[i] = 0;
+        } else if (bat_text[i] == '\n') {
+            bat_text[i] = 0;
+            if (bat_nlines < BAT_LINES) {
+                bat_line[bat_nlines++] = &bat_text[i + 1];
+            }
+        }
+    }
+
+    /* %0 = the batch name; %1.. = the tail words. */
+    for (i = 0; i < 10; i++) {
+        bat_arg[i][0] = 0;
+    }
+    strncpy(bat_arg[0], path, 63);
+    t = (char *)tail;
+    for (i = 1; i < 10; i++) {
+        char w[64];
+        t = split_word(t, w, sizeof w);
+        strcpy(bat_arg[i], w);
+        if (w[0] == 0) {
+            break;
+        }
+    }
+
+    bat_echo = 1;
+    bat_depth++;
+    for (bat_ip = 0; bat_ip < bat_nlines; bat_ip++) {
+        bat_exec_line(bat_line[bat_ip]);
+    }
+    bat_depth--;
+}
+
+/* Run `name` as C:\NAME.COM, C:\NAME.EXE, then C:\NAME.BAT, passing `tail`.
+ * Returns 1 if something ran. Sets errorlevel from a launched program. */
 static int run_external(const char *name, const char *tail)
 {
     char path[24];
@@ -492,12 +818,21 @@ static int run_external(const char *name, const char *tail)
     strncat(path, name, 12);
     strcat(path, ".COM");
     if (t_exec(path, tail) != 2) {
+        errorlevel = t_lastexit();
         return 1;
     }
     strcpy(path, "C:\\");
     strncat(path, name, 12);
     strcat(path, ".EXE");
     if (t_exec(path, tail) != 2) {
+        errorlevel = t_lastexit();
+        return 1;
+    }
+    strcpy(path, "C:\\");
+    strncat(path, name, 12);
+    strcat(path, ".BAT");
+    if (t_exists(path)) {
+        run_batch(path, tail);
         return 1;
     }
     return 0;
@@ -561,6 +896,11 @@ int main(void)
     /* TOKABOOT already set 80x25 text mode and printed the startup line; print
      * below it rather than clearing. */
     t_putln("");
+
+    /* Run the startup batch if present, the way DOS does. */
+    if (t_exists("C:\\AUTOEXEC.BAT")) {
+        run_batch("C:\\AUTOEXEC.BAT", "");
+    }
 
     for (;;) {
         render_prompt();
