@@ -877,6 +877,16 @@ impl Machine {
     /// Service the host side of an `INT 10h` after the instruction retires.
     /// The CPU registers are intact here: a software interrupt only pushes
     /// flags/CS/IP.
+    /// Record the current video mode in the BDA so apps that read it directly
+    /// (and INT 10h AH=0Fh) see a sane state. Columns and rows are the text-cell
+    /// geometry the BIOS publishes for the mode.
+    fn set_bda_video_mode(&mut self, mode: u8, columns: u16, rows: u8) {
+        let _ = self.memory.write_u8(0x449, mode);
+        let _ = self.memory.write_u16(0x44a, columns);
+        let _ = self.memory.write_u8(0x484, rows.saturating_sub(1));
+        let _ = self.memory.write_u16(0x463, 0x03d4); // VGA CRTC base port
+    }
+
     fn handle_int10(&mut self) {
         let ax = self.cpu.registers.eax() as u16;
         let ah = (ax >> 8) as u8;
@@ -889,12 +899,15 @@ impl Machine {
                 // The 16-color planar modes this slice implements.
                 0x0D | 0x0E | 0x10 | 0x12 => {
                     self.set_vga_mode(al); // clears the Margo latch internally
+                    let cols = if al == 0x0D { 40 } else { 80 };
+                    self.set_bda_video_mode(al, cols, 25);
                     return;
                 }
                 // Chained mode 13h.
                 0x13 => {
                     self.video.set_mode13h();
                     self.margo_active = false;
+                    self.set_bda_video_mode(0x13, 40, 25);
                     return;
                 }
                 // CGA graphics: 04h/05h are 320x200x4, 06h is 640x200x2. The B800
@@ -902,6 +915,8 @@ impl Machine {
                 0x04..=0x06 => {
                     self.video.set_cga_mode(al);
                     self.margo_active = false;
+                    let cols = if al == 0x06 { 80 } else { 40 };
+                    self.set_bda_video_mode(al, cols, 25);
                     return;
                 }
                 // The 80x25 color text family (2/3), monochrome text (7), and the
@@ -909,6 +924,8 @@ impl Machine {
                 0x00..=0x03 | 0x07 => {
                     self.video.set_text_mode();
                     self.margo_active = false;
+                    let cols = if al <= 0x01 { 40 } else { 80 };
+                    self.set_bda_video_mode(al, cols, 25);
                     // A mode set clears the screen and homes the BDA cursor, so
                     // teletyped output starts at the top left.
                     let _ = self.memory.write_u16(0x450, 0);
@@ -944,6 +961,18 @@ impl Machine {
         }
         if ah == 0x11 {
             self.handle_int10_font(al);
+            return;
+        }
+        if ah == 0x0f {
+            let mode = self.read_physical_u8(0x449);
+            let cols = self.read_guest_word(0x44a);
+            let eax = (self.cpu.registers.eax() & !0xFFFF)
+                | (u32::from(cols & 0xff) << 8)
+                | u32::from(mode);
+            self.cpu.registers.set_eax(eax);
+            // BH = active page 0; leave the rest of EBX intact.
+            let ebx = self.cpu.registers.ebx() & !0xFF00;
+            self.cpu.registers.set_ebx(ebx);
             return;
         }
         if ah == 0x4f {
@@ -3183,6 +3212,11 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     // Seed the BDA words INT 11h and INT 12h hand back, like a real BIOS.
     memory.write_u16(0x410, BIOS_EQUIPMENT_WORD)?;
     memory.write_u16(0x413, BIOS_BASE_MEMORY_KIB)?;
+    // Seed the BDA video state to text 80x25 (mode 03h) like a real BIOS POST.
+    memory.write_u8(0x449, 0x03)?;
+    memory.write_u16(0x44a, 80)?;
+    memory.write_u8(0x484, 24)?;
+    memory.write_u16(0x463, 0x03d4)?;
     memory.write_u8(BIOS_IRET_STUB_ADDRESS, 0xcf)
 }
 
@@ -3645,6 +3679,23 @@ mod tests {
         assert!(machine.bus_trace().cycles().iter().any(|cycle| {
             cycle.kind == BusAccessKind::InterruptAcknowledge && cycle.address == 0x10
         }));
+    }
+
+    #[test]
+    fn int10_ah0f_reports_mode_after_set() {
+        // Set mode 13h, then AH=0Fh returns AL=mode, AH=columns.
+        let rom = rom_with_code(&[
+            0xB8, 0x13, 0x00, 0xCD, 0x10, // mov ax,0013h; int 10h (set mode 13h)
+            0xB4, 0x0F, 0xCD, 0x10, // mov ah,0Fh; int 10h (get mode)
+            0xF4,
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        let ax = machine.cpu().registers.eax() as u16;
+        assert_eq!(ax & 0xff, 0x13, "AL = current mode");
+        assert_eq!(ax >> 8, 40, "AH = column count for mode 13h");
     }
 
     #[test]
