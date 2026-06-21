@@ -521,6 +521,9 @@ pub struct DosKernel {
     verify_flag: bool,
     // AH=58h memory-allocation strategy. The bump arena ignores it; stored for read-back.
     alloc_strategy: u16,
+    // AH=59h extended error: the last DOS error code reported to a guest. Held until
+    // the next error overwrites it (DOS does not clear it on a successful call).
+    last_error: u16,
 }
 
 impl DosKernel {
@@ -999,7 +1002,17 @@ impl DosKernel {
     ) -> Result<DosAction, DosError> {
         match vector {
             0x20 => Ok(DosAction::Exit(0)),
-            0x21 => self.dispatch_int21(regs, mem),
+            0x21 => {
+                let action = self.dispatch_int21(regs, mem)?;
+                // Any INT 21h call returning with carry set has placed its DOS
+                // error code in AX. Record it here so a later AH=59h reports the
+                // most recent failure, covering every set_dos_error site, not just
+                // the handlers that route through fail().
+                if regs.cf {
+                    self.last_error = regs.ax;
+                }
+                Ok(action)
+            }
             // The machine only records 0x10/0x20/0x21 and routes 0x10 elsewhere, so
             // this is unreachable today. Treat it as a no-op rather than panic.
             _ => Ok(DosAction::Continue),
@@ -1076,6 +1089,14 @@ impl DosKernel {
                 }
             }
         }
+    }
+
+    /// Record a DOS error code for AH=59h, then set the standard CF/AX error
+    /// return. The new (AH=59h-aware) handlers route their failures through this
+    /// so the extended-error query has a value to report.
+    fn fail(&mut self, regs: &mut DosRegs, code: u16) {
+        self.last_error = code;
+        set_dos_error(regs, code);
     }
 
     fn dispatch_int21(
@@ -2046,6 +2067,181 @@ impl DosKernel {
                     },
                     _ => set_dos_error(regs, 0x01),
                 }
+                Ok(DosAction::Continue)
+            }
+            // AH=59h GET EXTENDED ERROR: report the last DOS error. AX = the saved
+            // code, BH = error class, BL = suggested action, CH = locus. We use one
+            // fixed mapping for every code: class 0x0D (unknown/other), action 0x05
+            // (immediate abort), locus 0x01 (unknown). ponytail: real DOS derives
+            // class/action/locus per code from a table; in-scope callers only read
+            // AX, so the coarse mapping suffices.
+            0x59 => {
+                regs.ax = self.last_error;
+                regs.bx = (0x0d << 8) | 0x05; // BH = class, BL = action
+                regs.cx = (regs.cx & 0x00ff) | (0x01 << 8); // CH = locus, CL preserved
+                regs.cf = false; // the query itself succeeds; do not overwrite last_error
+                Ok(DosAction::Continue)
+            }
+            // AH=5Ah CREATE TEMPORARY FILE: DS:DX points at an ASCIIZ directory path
+            // ending in '\'. Generate a unique 8.3 name, append it (with its NUL) so
+            // the caller can read back the full path, then create it create-exclusive.
+            // CF=0 + AX=handle on success; on a name collision after a bounded number
+            // of tries, or a host error, CF=1 with the DOS code.
+            0x5a => {
+                let Some(dir) = read_asciiz(mem, regs.ds, regs.dx)? else {
+                    self.fail(regs, 0x03);
+                    return Ok(DosAction::Continue);
+                };
+                // Try a sequence of names until one does not yet exist. The host
+                // create-exclusive open is the real guard; this loop just picks a
+                // free candidate. ponytail: a fixed 0..4096 sweep, not DOS's clock
+                // seed; ample for the temp files a single program run creates.
+                let mut created = None;
+                for n in 0u16..4096 {
+                    let candidate = format!("{dir}{n:04X}.$$$");
+                    let path = match self.resolve_name(&candidate) {
+                        Ok(path) => path,
+                        Err(code) => {
+                            self.fail(regs, code);
+                            return Ok(DosAction::Continue);
+                        }
+                    };
+                    match OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)
+                    {
+                        Ok(file) => {
+                            created = Some((file, candidate));
+                            break;
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                        Err(err) => {
+                            self.fail(regs, dos_io_error_code(&err));
+                            return Ok(DosAction::Continue);
+                        }
+                    }
+                }
+                let Some((file, name)) = created else {
+                    self.fail(regs, 0x05); // every candidate was taken
+                    return Ok(DosAction::Continue);
+                };
+                // Append the generated name after the directory path at DS:DX so the
+                // caller can read the full path back.
+                let suffix = &name[dir.len()..];
+                let tail = usize::from(regs.ds) * 16 + usize::from(regs.dx) + dir.len();
+                for (i, &byte) in suffix.as_bytes().iter().enumerate() {
+                    mem.write_u8(tail + i, byte)?;
+                }
+                mem.write_u8(tail + suffix.len(), 0)?;
+                let handle = (5u16..)
+                    .find(|h| !self.open_files.contains_key(h))
+                    .expect("a free DOS handle exists at or below u16::MAX");
+                self.open_files.insert(
+                    handle,
+                    OpenFile {
+                        file,
+                        mode: AccessMode::ReadWrite,
+                    },
+                );
+                regs.ax = handle;
+                regs.cf = false;
+                Ok(DosAction::Continue)
+            }
+            // AH=6Ch EXTENDED OPEN/CREATE: a superset of AH=3Dh open and AH=3Ch
+            // create. BX = access/share mode (low 3 bits are the access mode), CX =
+            // attributes for a created file (ignored, as in 3Ch), DX = action flags
+            // (bit 0 open-if-exists, bit 1 replace/truncate-if-exists, bit 4
+            // create-if-not-exists), DS:SI = ASCIIZ filename. On success CF=0,
+            // AX=handle, CX=action taken (1 opened, 2 created, 3 truncated). On
+            // failure CF=1 with the DOS code.
+            0x6c => {
+                let path = match self.resolve_open_path(mem, regs.ds, regs.si)? {
+                    Ok(path) => path,
+                    Err(code) => {
+                        self.fail(regs, code);
+                        return Ok(DosAction::Continue);
+                    }
+                };
+                let exists = path.exists();
+                let open_if = regs.dx & 0x0001 != 0;
+                let truncate_if = regs.dx & 0x0002 != 0;
+                let create_if = regs.dx & 0x0010 != 0;
+                let mode = AccessMode::from_open_al(regs.bx as u8);
+                // Pick the host action from the flags and whether the file exists.
+                // action_taken: 1 opened, 2 created, 3 truncated (replaced).
+                let (result, action_taken) = if exists {
+                    if truncate_if {
+                        (
+                            OpenOptions::new()
+                                .read(true)
+                                .write(true)
+                                .truncate(true)
+                                .open(&path),
+                            3u16,
+                        )
+                    } else if open_if {
+                        (open_host_file(&path, mode), 1u16)
+                    } else {
+                        // The file is there but neither open nor replace is allowed.
+                        self.fail(regs, 0x50); // file already exists
+                        return Ok(DosAction::Continue);
+                    }
+                } else if create_if {
+                    (
+                        OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .create_new(true)
+                            .open(&path),
+                        2u16,
+                    )
+                } else {
+                    self.fail(regs, 0x02); // file not found and create not allowed
+                    return Ok(DosAction::Continue);
+                };
+                match result {
+                    Ok(file) => {
+                        let handle = (5u16..)
+                            .find(|h| !self.open_files.contains_key(h))
+                            .expect("a free DOS handle exists at or below u16::MAX");
+                        self.open_files.insert(handle, OpenFile { file, mode });
+                        regs.ax = handle;
+                        regs.cx = action_taken;
+                        regs.cf = false;
+                    }
+                    Err(err) => self.fail(regs, dos_io_error_code(&err)),
+                }
+                Ok(DosAction::Continue)
+            }
+            // AH=60h TRUENAME: canonicalize the ASCIIZ path at DS:SI into the
+            // 128-byte buffer at ES:DI as a fully qualified, drive-letter-prefixed,
+            // uppercase path (C:\...). Folds '.'/'..' and the current directory the
+            // same way the file calls resolve a name. CF=0 on success; CF=1 with the
+            // DOS code on a bad path.
+            0x60 => {
+                let Some(name) = read_asciiz(mem, regs.ds, regs.si)? else {
+                    self.fail(regs, 0x03);
+                    return Ok(DosAction::Continue);
+                };
+                // A drive letter other than C: names an unmounted drive.
+                let bytes = name.as_bytes();
+                if bytes.len() >= 2 && bytes[1] == b':' && !bytes[0].eq_ignore_ascii_case(&b'C') {
+                    self.fail(regs, 0x03);
+                    return Ok(DosAction::Continue);
+                }
+                let canonical =
+                    format!("C:\\{}", self.absolute_dos_path(&name).to_ascii_uppercase());
+                let base = usize::from(regs.es) * 16 + usize::from(regs.di);
+                // The output buffer is 128 bytes including the terminator.
+                let bytes = canonical.as_bytes();
+                let written = bytes.len().min(127);
+                for (i, &byte) in bytes.iter().take(written).enumerate() {
+                    mem.write_u8(base + i, byte)?;
+                }
+                mem.write_u8(base + written, 0)?;
+                regs.cf = false;
                 Ok(DosAction::Continue)
             }
             // Other file functions (find) and everything else are not yet
@@ -5462,5 +5658,148 @@ mod tests {
         assert_eq!(got, home.join(".izarravm").join("c_drive"));
         assert!(got.is_dir());
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn ah59_reports_the_last_dos_error() {
+        // Drive a failing extended open (AH=6Ch open-only on a missing file) to
+        // record an error, then read it back with AH=59h.
+        let (mut kernel, mut mem, _dir) = kernel_with_drive(&[], r"C:\GONE.TXT");
+        let mut open = DosRegs {
+            ax: 0x6c00,
+            bx: 0x0000, // read access
+            dx: 0x0001, // open-if-exists only (no create)
+            ds: 0x0100,
+            si: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut open, &mut mem).unwrap();
+        assert!(open.cf);
+        assert_eq!(open.ax, 0x02); // file not found
+        let mut err = DosRegs {
+            ax: 0x5900,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut err, &mut mem).unwrap();
+        assert_eq!(err.ax, 0x02); // the saved code
+        assert_eq!(err.bx >> 8, 0x0d); // BH = class
+        assert_eq!(err.bx & 0xff, 0x05); // BL = action
+        assert_eq!(err.cx >> 8, 0x01); // CH = locus
+    }
+
+    #[test]
+    fn ah59_tracks_errors_from_ordinary_handlers() {
+        // A plain AH=3Dh open of a missing file fails through set_dos_error, not
+        // the new fail() helper. The dispatcher must still record it so AH=59h
+        // reports the true error, the classic recover-the-error-after-a-failed-call
+        // idiom.
+        let (mut kernel, mut mem, _dir) = kernel_with_drive(&[], r"C:\GONE.TXT");
+        let open = open(&mut kernel, &mut mem);
+        assert!(open.cf);
+        assert_eq!(open.ax, 0x02); // file not found
+
+        let mut err = DosRegs {
+            ax: 0x5900,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut err, &mut mem).unwrap();
+        assert_eq!(err.ax, 0x02, "AH=59h reports the open's error code");
+        assert!(!err.cf, "the query itself clears carry");
+    }
+
+    #[test]
+    fn ah5a_creates_a_unique_temp_file_and_appends_the_name() {
+        // DS:DX points at the directory path "C:\" (ending in '\'). The handler
+        // appends a generated name and creates it create-exclusive.
+        let (mut kernel, mut mem, _dir) = kernel_with_drive(&[], "C:\\");
+        let mut regs = DosRegs {
+            ax: 0x5a00,
+            cx: 0,
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf, "create temp failed: ax={:#06x}", regs.ax);
+        assert!(regs.ax >= 5);
+        // Read the full ASCIIZ path back from DS:DX: it starts with "C:\" and the
+        // appended name names a file that now exists on the host.
+        let base = 0x0100usize * 16 + 0x0200;
+        let mut path = String::new();
+        let mut i = 0;
+        loop {
+            let byte = mem.read_u8(base + i).unwrap();
+            if byte == 0 {
+                break;
+            }
+            path.push(byte as char);
+            i += 1;
+        }
+        assert!(path.starts_with("C:\\"), "path was {path}");
+        let host_name = &path[3..]; // strip "C:\"
+        assert!(_dir.path().join(host_name).exists(), "missing {host_name}");
+    }
+
+    #[test]
+    fn ah6c_opens_an_existing_file_and_creates_a_new_one() {
+        // Open-existing: bit 0 set (open-if-exists). CX reports 1 (opened).
+        let (mut kernel, mut mem, _dir) = kernel_with_drive(&[("HAVE.TXT", b"hi")], r"C:\HAVE.TXT");
+        let mut open = DosRegs {
+            ax: 0x6c00,
+            bx: 0x0000,
+            dx: 0x0001,
+            ds: 0x0100,
+            si: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut open, &mut mem).unwrap();
+        assert!(!open.cf, "open failed: ax={:#06x}", open.ax);
+        assert_eq!(open.ax, 5);
+        assert_eq!(open.cx, 1); // opened
+
+        // Create-new: bit 4 set (create-if-not-exists), file absent. CX reports 2.
+        let (mut kernel, mut mem, dir) = kernel_with_drive(&[], r"C:\MADE.TXT");
+        let mut create = DosRegs {
+            ax: 0x6c00,
+            bx: 0x0002, // write access
+            cx: 0,
+            dx: 0x0010, // create-if-not-exists
+            ds: 0x0100,
+            si: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut create, &mut mem).unwrap();
+        assert!(!create.cf, "create failed: ax={:#06x}", create.ax);
+        assert_eq!(create.cx, 2); // created
+        assert!(dir.path().join("MADE.TXT").exists());
+    }
+
+    #[test]
+    fn ah60_truename_canonicalizes_to_a_drive_qualified_uppercase_path() {
+        let (mut kernel, mut mem, _dir) = kernel_with_drive(&[], r"sub\..\game.exe");
+        // Input ASCIIZ at DS:SI = 0x0100:0x0200; output buffer at ES:DI = 0x0100:0x0600.
+        let mut regs = DosRegs {
+            ax: 0x6000,
+            ds: 0x0100,
+            si: 0x0200,
+            es: 0x0100,
+            di: 0x0600,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf);
+        let base = 0x0100usize * 16 + 0x0600;
+        let mut out = String::new();
+        let mut i = 0;
+        loop {
+            let byte = mem.read_u8(base + i).unwrap();
+            if byte == 0 {
+                break;
+            }
+            out.push(byte as char);
+            i += 1;
+        }
+        // "sub\..\game.exe" folds the "sub\.." away and uppercases to C:\GAME.EXE.
+        assert_eq!(out, r"C:\GAME.EXE");
     }
 }
