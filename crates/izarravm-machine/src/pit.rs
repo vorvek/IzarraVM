@@ -1,10 +1,11 @@
 //! Intel 8254 programmable interval timer: three independent counters.
 //!
 //! Built clean-room from the Intel 8254 datasheet cached at
-//! dev_docs/reference/8254/. Channel 0's OUT drives IRQ0. All six counter modes
-//! are modeled at input-CLK granularity. BCD counting decrements in decimal
-//! (reload 0 means 10000). The nanosecond AC timing and channel 1/2 OUT
-//! consumers are out of scope for this slice.
+//! dev_docs/reference/8254/. Channel 0's OUT drives IRQ0; channel 1 is the AT
+//! DRAM-refresh timer (mode 2) and channel 2 the PC speaker. All six counter modes
+//! are modeled at input-CLK granularity, including the mode-3 odd-count asymmetry.
+//! BCD counting decrements in decimal (reload 0 means 10000). Channel 1 and 2 OUT
+//! are exposed through channel_out; the nanosecond AC timing is out of scope.
 
 /// One 8254 counter. The counting element `count` decrements on each input CLK;
 /// `reload` is the programmed count (0 means 65536). All six modes are modeled.
@@ -73,7 +74,7 @@ impl Counter {
         }
     }
 
-    /// Decrement a packed-BCD count by `by` (1 or 2), borrowing per nibble. The
+    /// Decrement a packed-BCD count by `by` (1, 2, or 3), borrowing per nibble. The
     /// count is stored as the guest wrote it: four BCD digits, one per nibble
     /// (0x0100 is decimal 100, not 256). On underflow it wraps to 0x9999, matching
     /// the chip's four-decade decimal counting element.
@@ -317,14 +318,28 @@ impl Counter {
                 }
             }
             3 => {
-                if self.count <= 2 {
+                // ponytail: a mode-3 count of 1 is illegal per the datasheet (count 2
+                // is the minimum). effective_reload of 1 reaches here and reloads every
+                // clock with no half-period, which is a loose handling of the bad input.
+                //
+                // The counting element steps by two so a half-period spans count/2
+                // clocks. An odd count splits asymmetrically: the chip trims the count
+                // even on the first clock of each half-period. With OUT high it
+                // decrements by one (high phase is (N+1)/2 clocks); with OUT low it
+                // decrements by three (low phase is (N-1)/2 clocks). The count only
+                // stays odd on that first clock, so an odd count is the marker for it.
+                let first_half_clock = self.count & 1 == 1;
+                let by = if first_half_clock {
+                    if self.out { 1 } else { 3 }
+                } else {
+                    2
+                };
+                if self.count <= by {
                     self.count = self.effective_reload();
                     self.out = !self.out;
                     self.out // rising edge when OUT returns high
                 } else {
-                    // Decrement by two. Exact for even counts (the PC timer case);
-                    // odd-count duty asymmetry is not modeled.
-                    self.count = self.dec(self.count, 2);
+                    self.count = self.dec(self.count, by);
                     false
                 }
             }
@@ -701,5 +716,116 @@ mod tests {
         // The latch-nothing read-back left no status latched, so the read returns
         // the live count: 0x1234 loaded, decremented once to 0x1233.
         assert_eq!(u16::from_le_bytes([lo, hi]), 0x1233);
+    }
+
+    // Measure one full mode-3 period of channel 0 as (high_clocks, low_clocks) by
+    // counting input CLKs between OUT edges. The pit must already be loaded and
+    // counting. Counts the clocks OUT spends high then the clocks it spends low over
+    // the next complete cycle, so it is immune to where in the period we start.
+    fn measure_high_low(pit: &mut Pit) -> (usize, usize) {
+        // Step to a falling edge: the clock after which OUT first reads low.
+        let mut prev = pit.channel_out(0);
+        loop {
+            pit.tick(1);
+            let now = pit.channel_out(0);
+            if prev && !now {
+                break; // falling edge: OUT just went low
+            }
+            prev = now;
+        }
+        // OUT is low now. Count low clocks until the rising edge.
+        let mut low = 1; // the clock that drove OUT low counts as the first low clock
+        loop {
+            pit.tick(1);
+            if pit.channel_out(0) {
+                break; // rising edge: OUT back high
+            }
+            low += 1;
+        }
+        // OUT is high now. Count high clocks until the next falling edge.
+        let mut high = 1; // the clock that drove OUT high is the first high clock
+        loop {
+            pit.tick(1);
+            if !pit.channel_out(0) {
+                break; // next falling edge ends the high phase
+            }
+            high += 1;
+        }
+        (high, low)
+    }
+
+    #[test]
+    fn mode3_odd_count_high_phase_is_one_clock_longer() {
+        // Datasheet: an odd count N holds OUT high for (N+1)/2 clocks and low for
+        // (N-1)/2 clocks, for a full period of N. Count 5 must give high 3, low 2.
+        let mut pit = Pit::default();
+        program_ch0(&mut pit, CW_MODE3, 5);
+        pit.tick(1); // load
+        let (high, low) = measure_high_low(&mut pit);
+        assert_eq!((high, low), (3, 2));
+        assert_eq!(high + low, 5); // halves still sum to the full count
+    }
+
+    #[test]
+    fn mode3_even_count_stays_symmetric() {
+        // An even count N is symmetric: high N/2, low N/2. Count 6 gives 3 and 3.
+        let mut pit = Pit::default();
+        program_ch0(&mut pit, CW_MODE3, 6);
+        pit.tick(1); // load
+        let (high, low) = measure_high_low(&mut pit);
+        assert_eq!((high, low), (3, 3));
+    }
+
+    #[test]
+    fn mode3_odd_count_period_is_exact() {
+        // Over a full period the asymmetric halves still sum to N input clocks, so
+        // exactly one rising edge lands per N clocks for an odd count.
+        let mut pit = Pit::default();
+        program_ch0(&mut pit, CW_MODE3, 5);
+        pit.tick(1);
+        assert_eq!(pit.clocks_until_channel0_irq(), Some(5));
+        assert_eq!(pit.tick(5), 1);
+        assert_eq!(pit.tick(5), 1); // periodic
+        assert_eq!(pit.tick(15), 3); // three more whole periods
+    }
+
+    #[test]
+    fn channel1_mode2_refresh_out_toggles_at_its_period() {
+        // Channel 1 is the AT DRAM-refresh timer: mode 2, a short count. Its OUT
+        // pulses low for one clock at the terminal count of every period, which a
+        // refresh consumer reads through channel_out(1). Drive a count of 18 (the
+        // typical AT refresh divisor) and confirm the OUT pin pulses once per period.
+        let mut pit = Pit::default();
+        // Counter 1, LSB/MSB, mode 2, binary: SC=01, RW=11, mode=010 -> 0x74.
+        pit.write_port(0x43, 0x74);
+        pit.write_port(0x41, 18);
+        pit.write_port(0x41, 0);
+        pit.tick(1); // load: count = 18, OUT high
+        assert!(pit.channel_out(1), "mode 2 holds OUT high after load");
+
+        // Walk one whole period at single-clock granularity and count the clocks
+        // where OUT samples low. Mode 2 drops OUT for exactly one clock per period.
+        let mut low_clocks = 0;
+        for _ in 0..18 {
+            pit.tick(1);
+            if !pit.channel_out(1) {
+                low_clocks += 1;
+            }
+        }
+        assert_eq!(low_clocks, 1, "OUT pulses low once per refresh period");
+        assert!(
+            pit.channel_out(1),
+            "OUT is back high at the period boundary"
+        );
+
+        // The next period repeats the single low pulse: the refresh timer is steady.
+        let mut low_clocks = 0;
+        for _ in 0..18 {
+            pit.tick(1);
+            if !pit.channel_out(1) {
+                low_clocks += 1;
+            }
+        }
+        assert_eq!(low_clocks, 1, "refresh OUT keeps pulsing every period");
     }
 }
