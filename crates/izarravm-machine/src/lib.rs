@@ -1614,7 +1614,85 @@ impl Machine {
                     .set_segment(SegmentIndex::Es, SegmentRegister::real(EBDA_SEGMENT));
                 self.set_int_frame_carry(false);
             }
+            // AH=C2h PS/2 pointing-device (mouse) BIOS interface. AL selects the
+            // subfunction.
+            0xC2 => self.int15_c2_pointing_device(al),
             _ => self.set_int_frame_carry(true),
+        }
+    }
+
+    /// INT 15h AH=C2h PS/2 pointing-device interface (RBIL INTERRUP.C). Handles the
+    /// query subset a guest probes the BIOS mouse with: enable/disable (C200), reset
+    /// (C201), set sample rate (C202), set resolution (C203), get device type
+    /// (C204), initialize (C205), and the extended-command group (C206). The aux
+    /// device is the same standard PS/2 mouse INT 33h models, so the reset reports
+    /// the self-test-passed/device-id bytes a real mouse returns. ponytail: C207
+    /// (set the far-call device handler) and C208/C209 (read/write the device port)
+    /// need the outbound callback and raw port path, which this HLE does not wire, so
+    /// they report function-not-supported (AH=86h, CF set).
+    fn int15_c2_pointing_device(&mut self, al: u8) {
+        let bh = (self.cpu.registers.ebx() as u16 >> 8) as u8;
+        match al {
+            // C200 enable/disable (BH=0 disable, 1 enable). Accept either; the cursor
+            // visibility is driven through INT 33h, so this only acknowledges.
+            0x00 => {
+                self.set_eax_ah(0x00);
+                self.set_int_frame_carry(false);
+            }
+            // C201 reset: BH=0x00 (device id, a standard mouse), BL=0xAA (the
+            // reset-complete/BAT-passed signature the device returns; drivers probe
+            // for AAh here). Re-centre the modeled mouse like a reset.
+            0x01 => {
+                self.mouse = MouseState::default();
+                let ebx = (self.cpu.registers.ebx() & !0xFFFF) | 0x00AA;
+                self.cpu.registers.set_ebx(ebx);
+                self.set_eax_ah(0x00);
+                self.set_int_frame_carry(false);
+            }
+            // C202 set sample rate (BH=rate code 0-6) and C203 set resolution
+            // (BH=0-3): no hardware rate/resolution is modeled, so accept and ignore.
+            0x02 | 0x03 => {
+                self.set_eax_ah(0x00);
+                self.set_int_frame_carry(false);
+            }
+            // C204 get device type: BH=0x00 (a standard PS/2 mouse).
+            0x04 => {
+                let ebx = self.cpu.registers.ebx() & !0xFF00; // BH=0
+                self.cpu.registers.set_ebx(ebx);
+                self.set_eax_ah(0x00);
+                self.set_int_frame_carry(false);
+            }
+            // C205 initialize (BH=packet size, 3 for a standard mouse): reset the
+            // modeled state and acknowledge.
+            0x05 => {
+                self.mouse = MouseState::default();
+                self.set_eax_ah(0x00);
+                self.set_int_frame_carry(false);
+            }
+            // C206 extended commands: BH=00 return device status (3 bytes in BL/CL/DL),
+            // BH=01/02 set scaling 1:1 / 2:1, BH=03 set resolution. The status bytes
+            // describe a stream-mode, scaling-1:1, enabled mouse at the default
+            // resolution and sample rate.
+            0x06 => {
+                if bh == 0x00 {
+                    // Status byte 1 (BL): bit5 mouse enabled. Status byte 2 (CL):
+                    // resolution code 2. Status byte 3 (DL): sample rate 100.
+                    let ebx = (self.cpu.registers.ebx() & !0xFF) | 0x20;
+                    self.cpu.registers.set_ebx(ebx);
+                    let ecx = (self.cpu.registers.ecx() & !0xFF) | 0x02;
+                    self.cpu.registers.set_ecx(ecx);
+                    let edx = (self.cpu.registers.edx() & !0xFF) | 100;
+                    self.cpu.registers.set_edx(edx);
+                }
+                self.set_eax_ah(0x00);
+                self.set_int_frame_carry(false);
+            }
+            // C207 set device handler, C208/C209 port read/write: the outbound
+            // far-call and raw-port paths are not wired. Report function-not-supported.
+            _ => {
+                self.set_eax_ah(0x86);
+                self.set_int_frame_carry(true);
+            }
         }
     }
 
@@ -2253,6 +2331,105 @@ impl Machine {
         let _ = self.memory.write_u8(0x441, status);
     }
 
+    /// INT 25h ABSOLUTE DISK READ (DOS). AL=drive (0=A:), CX=sector count, DX=first
+    /// logical (LBA) sector, DS:BX=buffer. Classic form only; the >32 MB packet form
+    /// (CX=0xFFFF, DS:BX -> a parameter block) is out of scope. On success AX=0 and
+    /// CF clear; on error CF set and AX=0x40xx. ponytail: the real INT 25h/26h leave
+    /// the original FLAGS on the stack for the caller to discard with its own POPF,
+    /// but this HLE returns through the standard IRET stub, so the result CF is
+    /// written into the IRET FLAGS image (set_int_frame_carry) like every other
+    /// host-serviced INT here.
+    fn handle_int25(&mut self) {
+        self.int25_26_transfer(false);
+    }
+
+    /// INT 26h ABSOLUTE DISK WRITE (DOS). Same register layout as INT 25h; the
+    /// DS:BX buffer is the source. See handle_int25 for the FLAGS-frame note.
+    fn handle_int26(&mut self) {
+        self.int25_26_transfer(true);
+    }
+
+    /// Shared body of INT 25h/26h. Converts each logical sector to CHS through the
+    /// mounted floppy geometry and reads or writes it against the DS:BX buffer.
+    fn int25_26_transfer(&mut self, write: bool) {
+        let al = self.cpu.registers.eax() as u8;
+        let count = self.cpu.registers.ecx() as u16;
+        let start_lba = self.cpu.registers.edx() as u16;
+        let ds = self.cpu.registers.segment(SegmentIndex::Ds).base;
+        let bx = self.cpu.registers.ebx() as u16;
+        let buffer = ds.wrapping_add(u32::from(bx));
+
+        // Only floppy A: is backed. Any other drive, or no media, reports a
+        // drive-not-ready error (AX low byte 0x02 = drive not ready, high byte 0x40
+        // = seek failed, per the DOS error-byte convention).
+        let Some(geom) = self.floppy.as_ref().map(|f| f.geometry()) else {
+            self.set_ax(0x4002);
+            self.set_int_frame_carry(true);
+            return;
+        };
+        if al != 0x00 {
+            self.set_ax(0x4002);
+            self.set_int_frame_carry(true);
+            return;
+        }
+
+        self.floppy_accesses += 1;
+        let spt = u16::from(geom.sectors);
+        let heads = u16::from(geom.heads);
+        let mut last_cyl = 0u16;
+        for i in 0..count {
+            let lba = start_lba.wrapping_add(i);
+            // LBA -> CHS for the mounted geometry. The floppy sector index is 1-based.
+            let sector = (lba % spt) as u8 + 1;
+            let head = ((lba / spt) % heads) as u8;
+            let cyl = lba / spt / heads;
+            last_cyl = cyl;
+            let addr = buffer.wrapping_add(u32::from(i) * 512);
+            if write {
+                let bytes = self.read_guest_block(addr, 512);
+                let ok = self
+                    .floppy
+                    .as_mut()
+                    .map(|f| f.write_sector(cyl, head, sector, &bytes))
+                    .unwrap_or(false);
+                if !ok {
+                    // Sector off the mounted media: sector-not-found (0x40 = seek
+                    // failed, 0x08 = sector not found).
+                    self.set_ax(0x4008);
+                    self.set_int_frame_carry(true);
+                    return;
+                }
+            } else {
+                let data = self
+                    .floppy
+                    .as_ref()
+                    .and_then(|f| f.read_sector(cyl, head, sector))
+                    .map(<[u8]>::to_vec);
+                match data {
+                    Some(bytes) => self.write_guest_block(addr, &bytes),
+                    None => {
+                        self.set_ax(0x4008);
+                        self.set_int_frame_carry(true);
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Charge the drive's mechanical time for the access the way INT 13h does.
+        if count > 0 {
+            let bytes = usize::from(count) * 512;
+            let secs = self
+                .floppy
+                .as_mut()
+                .map_or(0.0, |f| f.access_duration_secs(last_cyl, bytes));
+            self.stall_for(secs);
+        }
+
+        self.set_ax(0x0000);
+        self.set_int_frame_carry(false);
+    }
+
     /// AH=04h verify: confirm the requested sectors are readable without copying
     /// them into the caller buffer. AL returns the count verified.
     fn int13_verify(&mut self, dl: u8) {
@@ -2528,9 +2705,13 @@ impl Machine {
         }
     }
 
-    /// INT 10h AH=10h: set/get the ATC palette registers and the DAC. The common
-    /// sub-functions; rare variants (overscan get, intensity/blink, color paging)
-    /// are deferred. Register conventions per RBIL.
+    /// INT 10h AH=10h: set/get the ATC palette registers and the DAC. Covers the
+    /// set/get forms for the attribute palette (00/01/02/07/08/09) and the DAC
+    /// (10/12/13/15/17/1A/1B). Register conventions per RBIL (INT 10/AH=10h).
+    /// ponytail: the attribute-controller mode bits behind a few sub-functions
+    /// (AL=03 blink/intensity toggle, AL=13h color-page select) have no public
+    /// setter on the video core, so they are accepted as no-ops with CF clear; the
+    /// DAC paging state (AL=1Ah) reports the power-up default (mode 0, page 0).
     fn handle_int10_palette(&mut self, al: u8) {
         let bx = self.cpu.registers.ebx() as u16;
         let bl = bx as u8;
@@ -2555,11 +2736,30 @@ impl Machine {
                 }
                 self.video.set_overscan(block[16]);
             }
+            // AL=03: toggle intensify/blink (BL bit0). ponytail: the attribute mode
+            // control bit 3 has no public setter on the video core, so this is a
+            // no-op; CF stays clear so the caller sees the call succeed.
+            0x03 => {}
             // AL=07: get individual palette register. BL=index -> BH.
             0x07 => {
                 let value = self.video.attr_palette_reg(bl);
                 let ebx = (self.cpu.registers.ebx() & !0xFF00) | (u32::from(value) << 8);
                 self.cpu.registers.set_ebx(ebx);
+            }
+            // AL=08: read overscan/border color -> BH.
+            0x08 => {
+                let value = self.video.overscan();
+                let ebx = (self.cpu.registers.ebx() & !0xFF00) | (u32::from(value) << 8);
+                self.cpu.registers.set_ebx(ebx);
+            }
+            // AL=09: read all 16 palette registers + overscan into ES:DX (17 bytes).
+            0x09 => {
+                let mut block = [0u8; 17];
+                for (i, slot) in block.iter_mut().take(16).enumerate() {
+                    *slot = self.video.attr_palette_reg(i as u8);
+                }
+                block[16] = self.video.overscan();
+                self.write_guest_block(es_dx, &block);
             }
             // AL=10: set individual DAC register. BX=index, DH=R, CH=G, CL=B.
             0x10 => self.video.set_dac_entry(bx as u8, dh, ch, cl),
@@ -2570,6 +2770,10 @@ impl Machine {
                     bytes.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
                 self.video.set_dac_block(bx as u8, &entries);
             }
+            // AL=13: select color page / paging mode (BL=0 select mode in BH, BL=1
+            // select page in BH). ponytail: the attribute color-select datapath has
+            // no public setter, so this is a no-op; CF stays clear.
+            0x13 => {}
             // AL=15: get individual DAC register. BX=index -> DH=R, CH=G, CL=B.
             0x15 => {
                 let [r, g, b] = self.video.dac_entry(bx as u8);
@@ -2583,6 +2787,26 @@ impl Machine {
             0x17 => {
                 let bytes = self.video.dac_block_bytes(bx as u8, cx);
                 self.write_guest_block(es_dx, &bytes);
+            }
+            // AL=1A: read DAC page state -> BL=paging mode, BH=current page.
+            // ponytail: color paging is not modeled, so the power-up default is
+            // reported (mode 0 = four pages of 64, page 0).
+            0x1A => {
+                let ebx = self.cpu.registers.ebx() & !0xFFFF; // BL=0, BH=0
+                self.cpu.registers.set_ebx(ebx);
+            }
+            // AL=1B: sum a block of DAC registers to gray scale. BX=start, CX=count.
+            // The NTSC luma weights (30% R, 59% G, 11% B) collapse each entry to a
+            // single gray level, the way the BIOS gray-scale-summing routine does.
+            0x1B => {
+                let start = bx as u8;
+                for offset in 0..cx {
+                    let index = start.wrapping_add(offset as u8);
+                    let [r, g, b] = self.video.dac_entry(index);
+                    let gray =
+                        ((u16::from(r) * 77 + u16::from(g) * 151 + u16::from(b) * 28) >> 8) as u8;
+                    self.video.set_dac_entry(index, gray, gray, gray);
+                }
             }
             _ => {}
         }
@@ -3767,6 +3991,8 @@ impl Machine {
                             0x15 => self.handle_int15(),
                             0x17 => self.handle_int17(),
                             0x1A => self.handle_int1a(),
+                            0x25 => self.handle_int25(),
+                            0x26 => self.handle_int26(),
                             0x28 => self.handle_int28(),
                             0x29 => self.handle_int29(),
                             0x33 => self.handle_int33(),
@@ -4138,6 +4364,8 @@ impl CpuBus for MachineBus<'_> {
                 | 0x1A
                 | 0x20
                 | 0x21
+                | 0x25
+                | 0x26
                 | 0x28
                 | 0x29
                 | 0x2F
@@ -4336,9 +4564,10 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     // BIOS service interrupts the host intercepts by vector. Their IVT targets
     // point at the ROM IRET so they survive a guest low-memory wipe. INT 33h is
     // the mouse driver and INT 2Fh is the ICDEX CD bridge; INT 28h/29h are the DOS
-    // idle and fast-console hooks: the same stub shape the HLE handler returns through.
+    // idle and fast-console hooks; INT 25h/26h are the DOS absolute disk read/write:
+    // the same stub shape the HLE handler returns through.
     for vector in [
-        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x17, 0x1A, 0x28, 0x29, 0x2F, 0x33,
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x17, 0x1A, 0x25, 0x26, 0x28, 0x29, 0x2F, 0x33,
     ] {
         let address = vector * 4;
         memory.write_u16(address, 0)?;
@@ -4794,6 +5023,52 @@ mod tests {
         assert_eq!(regions[1], (0x9_FC00, 0x400, 2)); // 1 KB EBDA, reserved
         assert_eq!(regions[2], (0xA_0000, 0x6_0000, 2)); // reserved hole
         assert_eq!(regions[3], (0x10_0000, 23 * 0x10_0000, 1)); // extended RAM
+    }
+
+    #[test]
+    fn int15_c201_reset_reports_present_standard_mouse() {
+        // C201 resets the PS/2 mouse: BH=0x00 (standard device id), BL=0xAA (the
+        // reset-complete signature drivers probe for), AH=0x00, CF clear.
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0xC201);
+        m.cpu.registers.set_ebx(0xFFFF);
+        m.handle_int15();
+        assert_eq!(m.cpu.registers.ebx() as u16, 0x00AA, "BH=00 BL=AA");
+        assert_eq!((m.cpu.registers.eax() as u16 >> 8) as u8, 0x00, "AH=00");
+    }
+
+    #[test]
+    fn int15_c204_reports_standard_device_type() {
+        // C204 get device type: BH=0x00 (standard PS/2 mouse), AH=0x00.
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0xC204);
+        m.cpu.registers.set_ebx(0xFF00);
+        m.handle_int15();
+        assert_eq!((m.cpu.registers.ebx() as u16 >> 8) as u8, 0x00, "BH=00");
+        assert_eq!((m.cpu.registers.eax() as u16 >> 8) as u8, 0x00, "AH=00");
+    }
+
+    #[test]
+    fn int15_c206_status_describes_an_enabled_mouse() {
+        // C206 BH=00 returns the three status bytes. BL bit5 = mouse enabled.
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0xC206);
+        m.cpu.registers.set_ebx(0x0000); // BH=00
+        m.handle_int15();
+        assert_eq!(m.cpu.registers.ebx() as u8 & 0x20, 0x20, "BL bit5 enabled");
+    }
+
+    #[test]
+    fn int15_c207_set_handler_reports_unsupported() {
+        // C207 (set device handler) is deferred: AH=0x86, CF set.
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0xC207);
+        m.handle_int15();
+        assert_eq!(
+            (m.cpu.registers.eax() as u16 >> 8) as u8,
+            0x86,
+            "AH=86 unsupported"
+        );
     }
 
     #[test]
@@ -5928,6 +6203,82 @@ mod tests {
         m.handle_int13();
         assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x80, "no fixed disk");
         assert_eq!(m.memory.read_u8(0x441).unwrap(), 0x80, "status = no drive");
+    }
+
+    #[test]
+    fn int26_write_then_int25_read_round_trips_a_sector() {
+        let mut m = int15_machine(16);
+        m.mount_floppy(vec![0u8; 1_474_560]).unwrap(); // 1.44 MB, 18 spt, 2 heads
+        // Seed a pattern in a guest buffer at DS:BX = 2000:0000 (physical 0x20000).
+        for i in 0..512u32 {
+            m.write_physical_u8(0x2_0000 + i, (i & 0xff) as u8);
+        }
+        // INT 26h: AL=0 (A:), CX=1 sector, DX=LBA 40, DS:BX -> 0x20000.
+        m.cpu.registers.set_eax(0x0000);
+        m.cpu.registers.set_ecx(0x0001);
+        m.cpu.registers.set_edx(40);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x2000));
+        m.cpu.registers.set_ebx(0x0000);
+        m.handle_int26();
+        assert_eq!(m.cpu.registers.eax() as u16, 0x0000, "write AX=0");
+
+        // LBA 40 with 18 spt, 2 heads: cyl=1, head=0, sector=5 (40 = 1*36 + 0*18 + 4).
+        let on_disk = m.floppy.as_ref().unwrap().read_sector(1, 0, 5).unwrap();
+        assert_eq!(on_disk[0], 0x00);
+        assert_eq!(on_disk[5], 0x05);
+        assert_eq!(on_disk[511], 0xFF);
+
+        // INT 25h reads it back into a fresh buffer at 3000:0000.
+        m.cpu.registers.set_eax(0x0000);
+        m.cpu.registers.set_ecx(0x0001);
+        m.cpu.registers.set_edx(40);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x3000));
+        m.cpu.registers.set_ebx(0x0000);
+        m.handle_int25();
+        assert_eq!(m.cpu.registers.eax() as u16, 0x0000, "read AX=0");
+        for i in 0..512u32 {
+            assert_eq!(m.read_physical_u8(0x3_0000 + i), (i & 0xff) as u8);
+        }
+    }
+
+    #[test]
+    fn int25_out_of_range_sector_sets_carry() {
+        let mut m = int15_machine(16);
+        m.mount_floppy(vec![0u8; 737_280]).unwrap(); // 720 KB = 1440 sectors (0..1439)
+        // LBA 5000 is well past the media; the read must report an error.
+        m.cpu.registers.set_eax(0x0000);
+        m.cpu.registers.set_ecx(0x0001);
+        m.cpu.registers.set_edx(5000);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x2000));
+        m.cpu.registers.set_ebx(0x0000);
+        m.handle_int25();
+        assert_ne!(
+            m.cpu.registers.eax() as u16,
+            0x0000,
+            "AX carries an error code"
+        );
+        assert_eq!(
+            (m.cpu.registers.eax() as u16 >> 8) as u8,
+            0x40,
+            "high byte 0x40"
+        );
+    }
+
+    #[test]
+    fn int25_no_media_sets_carry() {
+        // No floppy mounted: the absolute read reports drive-not-ready.
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x0000);
+        m.cpu.registers.set_ecx(0x0001);
+        m.cpu.registers.set_edx(0);
+        m.handle_int25();
+        assert_eq!(m.cpu.registers.eax() as u16, 0x4002, "drive not ready");
     }
 
     #[test]
@@ -8940,6 +9291,68 @@ mod tests {
         assert_eq!(machine.read_physical_u8(0x1_0006), 63);
         assert_eq!(machine.read_physical_u8(0x1_0007), 63);
         assert_eq!(machine.read_physical_u8(0x1_0008), 63);
+    }
+
+    #[test]
+    fn int10_10h_reads_overscan() {
+        // AL=01 sets the overscan to BH=0x2A, then AL=08 reads it back into BH.
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x1001);
+        m.cpu.registers.set_ebx(0x2A00); // BH = 0x2A
+        m.handle_int10();
+        m.cpu.registers.set_eax(0x1008);
+        m.cpu.registers.set_ebx(0x0000);
+        m.handle_int10();
+        assert_eq!((m.cpu.registers.ebx() as u16 >> 8) as u8, 0x2A);
+    }
+
+    #[test]
+    fn int10_10h_reads_all_palette_registers() {
+        // AL=09 writes the 16 palette registers + overscan to ES:DX. With the
+        // power-up palette (reg N = N) and overscan 0, expect 0,1,...,15,0.
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x1009);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x1000));
+        m.cpu.registers.set_edx(0x0000);
+        m.handle_int10();
+        for i in 0..16u8 {
+            assert_eq!(m.read_physical_u8(0x1_0000 + u32::from(i)), i);
+        }
+        assert_eq!(
+            m.read_physical_u8(0x1_0010),
+            0,
+            "overscan trails the 16 regs"
+        );
+    }
+
+    #[test]
+    fn int10_10h_sums_dac_block_to_gray() {
+        // AL=1B sums BX..BX+CX DAC entries to gray with NTSC luma weights.
+        let mut m = int15_machine(16);
+        m.video_mut().set_dac_entry(5, 63, 0, 0); // pure red
+        m.video_mut().set_dac_entry(6, 0, 63, 0); // pure green
+        m.cpu.registers.set_eax(0x101B);
+        m.cpu.registers.set_ebx(0x0005); // start at index 5
+        m.cpu.registers.set_ecx(0x0002); // two entries
+        m.handle_int10();
+        // Red gray = 63*77>>8 = 18; green gray = 63*151>>8 = 37. Each entry is now
+        // an equal-component gray.
+        let [r5, g5, b5] = m.video().dac_entry(5);
+        assert_eq!((r5, g5, b5), (18, 18, 18));
+        let [r6, g6, b6] = m.video().dac_entry(6);
+        assert_eq!((r6, g6, b6), (37, 37, 37));
+    }
+
+    #[test]
+    fn int10_10h_reads_dac_page_state_default() {
+        // AL=1A reports the power-up DAC paging state: mode 0 (BL), page 0 (BH).
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x101A);
+        m.cpu.registers.set_ebx(0xFFFF);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.ebx() as u16, 0x0000);
     }
 
     #[test]
