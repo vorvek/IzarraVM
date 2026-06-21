@@ -155,6 +155,10 @@ pub struct Keyboard8042 {
     expecting_command_data: Option<u8>, // a 0x64 command awaiting its 0x60 data
     irq_armed: bool,                    // a freshly latched keyboard byte to pulse IRQ1
     irq12_armed: bool,                  // a freshly latched mouse byte to pulse IRQ12
+    output_port: u8,                    // 8042 output port (bit1 = A20 gate, bit0 = reset)
+    kbd_expecting_data: Option<u8>,     // a keyboard-device command awaiting its parameter
+    scan_set: u8,                       // active scancode set (0xF0 select; default 2)
+    last_byte: u8,                      // last scancode latched, for 0xFE resend
     mouse: Ps2Mouse,
 }
 
@@ -169,6 +173,10 @@ impl Default for Keyboard8042 {
             expecting_command_data: None,
             irq_armed: false,
             irq12_armed: false,
+            output_port: 0x03, // A20 enabled (bit1), reset line high (bit0)
+            kbd_expecting_data: None,
+            scan_set: 2, // PS/2 keyboards power up in set 2
+            last_byte: 0,
             mouse: Ps2Mouse::default(),
         }
     }
@@ -188,6 +196,50 @@ impl Keyboard8042 {
         let reporting = self.mouse.queue_movement(dx, dy, buttons);
         self.latch_next();
         reporting && self.irq12_armed
+    }
+
+    /// Handle a byte the guest wrote straight to the keyboard device (the 0x60
+    /// non-data path). Mirrors the aux handshake: most commands ACK with 0xFA,
+    /// a few queue extra report bytes, and a parameter-taking command records
+    /// the next byte. Replies go through the scancode queue so OBF/IRQ1 framing
+    /// matches a real keystroke.
+    fn write_keyboard_byte(&mut self, value: u8) {
+        if let Some(cmd) = self.kbd_expecting_data.take() {
+            match cmd {
+                0xF0 => {
+                    // Set/get scancode set. Param 0 reports the current set,
+                    // 1/2/3 store it; either way the keyboard ACKs first.
+                    self.queue.push_back(0xFA);
+                    if value == 0x00 {
+                        self.queue.push_back(self.scan_set);
+                    } else if (1..=3).contains(&value) {
+                        self.scan_set = value;
+                    }
+                }
+                // 0xF3 set typematic rate/delay: swallow the rate byte, ACK it.
+                0xF3 => self.queue.push_back(0xFA),
+                _ => self.queue.push_back(0xFA),
+            }
+            self.latch_next();
+            return;
+        }
+        match value {
+            0xFF => self.push_scancodes(&[0xFA, 0xAA]), // reset: ACK then self-test pass
+            0xEE => self.push_scancodes(&[0xEE]),       // echo answers 0xEE, not an ACK
+            0xF2 => self.push_scancodes(&[0xFA, 0xAB, 0x41]), // read-ID: ACK then MF2 id
+            0xF0 | 0xF3 => {
+                // Scancode-set select / set-typematic: ACK, then take one param.
+                self.kbd_expecting_data = Some(value);
+                self.push_scancodes(&[0xFA]);
+            }
+            0xFE => {
+                // Resend: re-queue the last latched scancode (no ACK).
+                let last = self.last_byte;
+                self.push_scancodes(&[last]);
+            }
+            // 0xF4 enable, 0xF5 disable, 0xF6 set-defaults: plain ACK.
+            _ => self.push_scancodes(&[0xFA]),
+        }
     }
 
     /// Put a controller command response (self-test 0x55, interface test 0x00)
@@ -220,21 +272,29 @@ impl Keyboard8042 {
         if self.output.is_some() {
             return;
         }
-        if let Some(code) = self.queue.pop_front() {
+        // Command-byte bit4 masks the keyboard, bit5 the aux device. A masked
+        // stream stays queued (not dropped) so its bytes latch on re-enable.
+        let kbd_disabled = self.command_byte & 0x10 != 0;
+        let aux_disabled = self.command_byte & 0x20 != 0;
+        if !kbd_disabled && !self.queue.is_empty() {
+            let code = self.queue.pop_front().unwrap();
             self.output = Some(code);
             self.output_is_aux = false;
+            self.last_byte = code; // remember for a 0xFE resend
             self.status |= STATUS_OBF;
             self.status &= !STATUS_AUX;
             if self.command_byte & 0x01 != 0 {
                 self.irq_armed = true;
             }
-        } else if let Some(code) = self.mouse.queue.pop_front() {
-            self.output = Some(code);
-            self.output_is_aux = true;
-            self.status |= STATUS_OBF | STATUS_AUX;
-            // Command byte bit 1 enables the mouse interrupt (IRQ12).
-            if self.command_byte & 0x02 != 0 {
-                self.irq12_armed = true;
+        } else if !aux_disabled {
+            if let Some(code) = self.mouse.queue.pop_front() {
+                self.output = Some(code);
+                self.output_is_aux = true;
+                self.status |= STATUS_OBF | STATUS_AUX;
+                // Command byte bit 1 enables the mouse interrupt (IRQ12).
+                if self.command_byte & 0x02 != 0 {
+                    self.irq12_armed = true;
+                }
             }
         }
     }
@@ -251,6 +311,14 @@ impl Keyboard8042 {
         let armed = self.irq12_armed;
         self.irq12_armed = false;
         armed
+    }
+
+    /// State of the A20 gate driven by the controller output port (bit 1). The
+    /// address-mask wiring that consults this lives outside the controller.
+    // ponytail: no caller yet; the lib.rs address mask is a separate task.
+    #[allow(dead_code)]
+    pub fn a20_enabled(&self) -> bool {
+        self.output_port & 0x02 != 0
     }
 
     pub fn read_port(&mut self, port: u16) -> Option<u8> {
@@ -279,34 +347,46 @@ impl Keyboard8042 {
                             self.mouse.write_byte(value);
                             self.latch_next();
                         }
+                        0xD1 => self.output_port = value, // drive the output port (A20)
                         _ => {} // other command-data writes ignored until needed
                     }
                 } else {
-                    // Keyboard device commands. Ack everything; reset/enable also
-                    // queue 0xFA (ACK) and, for reset, 0xAA (self-test passed).
-                    match value {
-                        0xFF => self.push_scancodes(&[0xFA, 0xAA]),
-                        _ => self.push_scancodes(&[0xFA]),
-                    }
+                    self.write_keyboard_byte(value);
                 }
                 true
             }
             0x64 => {
                 match value {
                     0xAA => self.respond_immediately(0x55), // controller self-test OK
-                    0xAB => self.respond_immediately(0x00), // interface test OK
+                    0xAB => self.respond_immediately(0x00), // keyboard interface test OK
+                    0xA9 => self.respond_immediately(0x00), // aux (mouse) interface test OK
                     0x20 => {
-                        // read command byte -> output buffer
-                        self.queue.push_front(self.command_byte);
-                        self.latch_next();
+                        // Read command byte. This is a controller-generated response, so it
+                        // goes straight to the output buffer and is not held back by the
+                        // keyboard-disable bit the way a queued scancode would be.
+                        let cb = self.command_byte;
+                        self.respond_immediately(cb);
                     }
                     0x60 => self.expecting_command_data = Some(0x60), // write command byte
-                    0xA8 | 0xA7 => {} // enable / disable aux (mouse): accepted
-                    0xA9 => self.respond_immediately(0x00), // aux interface test OK
+                    0xA7 => self.command_byte |= 0x20, // disable aux (mouse): set bit5
+                    0xA8 => {
+                        // enable aux (mouse): clear bit5, then drain any byte
+                        // that queued up while it was masked.
+                        self.command_byte &= !0x20;
+                        self.latch_next();
+                    }
                     0xD4 => self.expecting_command_data = Some(0xD4), // write next byte to aux
-                    0xAE | 0xAD => {} // enable / disable keyboard: accepted
-                    0xD1 => self.expecting_command_data = Some(0xD1), // output port (A20)
-                    _ => {}           // Rest accepted and ignored
+                    0xAD => self.command_byte |= 0x10,                // disable keyboard: set bit4
+                    0xAE => {
+                        // enable keyboard: clear bit4, then drain a held scancode.
+                        self.command_byte &= !0x10;
+                        self.latch_next();
+                    }
+                    0xD0 => self.respond_immediately(self.output_port), // read output port (A20 state)
+                    0xC0 => self.respond_immediately(0xA0), // read input port: kbd unlocked (bit7), normal (bit5)
+                    0xE0 => self.respond_immediately(0x03), // read test inputs: kbd clock+data idle high
+                    0xD1 => self.expecting_command_data = Some(0xD1), // write output port (A20)
+                    _ => {}                                 // Rest accepted and ignored
                 }
                 true
             }
@@ -429,5 +509,186 @@ mod tests {
         assert_eq!(bx as i8 as i32, -4, "dx is -4 two's complement");
         let by = kbd.read_port(0x60).unwrap();
         assert_eq!(by as i8 as i32, -7, "dy is -7 (down)");
+    }
+
+    // Slice A: output port and A20 gate state.
+
+    #[test]
+    fn a20_enabled_by_default() {
+        let kbd = Keyboard8042::default();
+        assert!(kbd.a20_enabled(), "default output port 0x03 has A20 on");
+    }
+
+    #[test]
+    fn write_output_port_toggles_a20() {
+        let mut kbd = Keyboard8042::default();
+        kbd.write_port(0x64, 0xD1); // arm: next 0x60 byte drives the output port
+        kbd.write_port(0x60, 0x01); // A20 bit clear, reset line high
+        assert!(!kbd.a20_enabled(), "A20 off after clearing bit 1");
+        kbd.write_port(0x64, 0xD1);
+        kbd.write_port(0x60, 0x03); // A20 bit set again
+        assert!(kbd.a20_enabled(), "A20 back on after setting bit 1");
+    }
+
+    // Slice B: read-port commands on 0x64.
+
+    #[test]
+    fn read_output_port_returns_live_state() {
+        let mut kbd = Keyboard8042::default();
+        kbd.write_port(0x64, 0xD1);
+        kbd.write_port(0x60, 0x02); // A20 on, reset low
+        kbd.write_port(0x64, 0xD0); // read output port
+        assert_eq!(
+            kbd.read_port(0x60),
+            Some(0x02),
+            "0xD0 reads what 0xD1 wrote"
+        );
+    }
+
+    #[test]
+    fn read_input_port_reports_unlocked_normal() {
+        let mut kbd = Keyboard8042::default();
+        kbd.write_port(0x64, 0xC0);
+        let byte = kbd.read_port(0x60).unwrap();
+        assert_eq!(byte & 0x80, 0x80, "bit7 set: keyboard not locked");
+        assert_eq!(byte & 0x20, 0x20, "bit5 set: normal");
+    }
+
+    #[test]
+    fn read_test_inputs_idle_high() {
+        let mut kbd = Keyboard8042::default();
+        kbd.write_port(0x64, 0xE0);
+        assert_eq!(kbd.read_port(0x60), Some(0x03), "kbd clock+data idle high");
+    }
+
+    // Slice C: interface-test labels.
+
+    #[test]
+    fn keyboard_interface_test_returns_zero() {
+        let mut kbd = Keyboard8042::default();
+        kbd.write_port(0x64, 0xAB); // keyboard interface test
+        assert_eq!(kbd.read_port(0x60), Some(0x00), "0xAB reports no error");
+    }
+
+    #[test]
+    fn aux_interface_test_returns_zero() {
+        let mut kbd = Keyboard8042::default();
+        kbd.write_port(0x64, 0xA9); // aux/mouse interface test
+        assert_eq!(kbd.read_port(0x60), Some(0x00), "0xA9 reports no error");
+    }
+
+    #[test]
+    fn read_command_byte_is_not_blocked_by_keyboard_disable() {
+        // The BIOS idiom disables the keyboard (0xAD, command-byte bit4) before reading
+        // the command byte. The 0x20 controller response must still reach the output
+        // buffer, since the disable bit only holds back queued scancodes.
+        let mut kbd = Keyboard8042::default();
+        kbd.write_port(0x64, 0x60); // write command byte
+        kbd.write_port(0x60, 0x10); // bit4 set: keyboard clock disabled
+        kbd.write_port(0x64, 0x20); // read command byte
+        assert_eq!(kbd.read_port(0x60), Some(0x10));
+    }
+
+    // Slice D: keyboard-device command set on the 0x60 non-data path.
+
+    #[test]
+    fn echo_answers_ee_not_ack() {
+        let mut kbd = Keyboard8042::default();
+        kbd.write_port(0x60, 0xEE); // echo
+        assert_eq!(
+            kbd.read_port(0x60),
+            Some(0xEE),
+            "echo replies 0xEE, not 0xFA"
+        );
+    }
+
+    #[test]
+    fn read_id_returns_ack_then_mf2_id() {
+        let mut kbd = Keyboard8042::default();
+        kbd.write_port(0x60, 0xF2); // read ID
+        assert_eq!(kbd.read_port(0x60), Some(0xFA), "ACK first");
+        assert_eq!(kbd.read_port(0x60), Some(0xAB), "ID low byte");
+        assert_eq!(kbd.read_port(0x60), Some(0x41), "ID high byte");
+    }
+
+    #[test]
+    fn scan_set_store_then_get_roundtrips() {
+        let mut kbd = Keyboard8042::default();
+        kbd.write_port(0x60, 0xF0); // select scancode set
+        assert_eq!(kbd.read_port(0x60), Some(0xFA), "ACK the command");
+        kbd.write_port(0x60, 0x01); // store set 1
+        assert_eq!(kbd.read_port(0x60), Some(0xFA), "ACK the parameter");
+        kbd.write_port(0x60, 0xF0); // ask again
+        assert_eq!(kbd.read_port(0x60), Some(0xFA), "ACK the query");
+        kbd.write_port(0x60, 0x00); // get current set
+        assert_eq!(kbd.read_port(0x60), Some(0xFA), "ACK the get");
+        assert_eq!(kbd.read_port(0x60), Some(0x01), "reports the stored set");
+    }
+
+    #[test]
+    fn set_typematic_consumes_rate_without_spurious_ack() {
+        let mut kbd = Keyboard8042::default();
+        kbd.write_port(0x60, 0xF3); // set typematic rate/delay
+        assert_eq!(kbd.read_port(0x60), Some(0xFA), "ACK the command");
+        kbd.write_port(0x60, 0x2A); // the rate byte (consumed as a parameter)
+        assert_eq!(kbd.read_port(0x60), Some(0xFA), "ACK the rate byte");
+        // The rate byte must not be mistaken for a fresh command: no extra ACK.
+        assert_eq!(
+            kbd.read_port(0x64).unwrap() & STATUS_OBF,
+            0,
+            "no spurious second response"
+        );
+    }
+
+    #[test]
+    fn resend_repushes_last_scancode() {
+        let mut kbd = Keyboard8042::default();
+        kbd.push_scancodes(&[0x1E]); // 'A' make
+        assert_eq!(kbd.read_port(0x60), Some(0x1E));
+        kbd.write_port(0x60, 0xFE); // resend
+        assert_eq!(kbd.read_port(0x60), Some(0x1E), "resend repeats last byte");
+    }
+
+    #[test]
+    fn reset_acks_then_self_tests() {
+        let mut kbd = Keyboard8042::default();
+        kbd.write_port(0x60, 0xFF); // keyboard reset
+        assert_eq!(kbd.read_port(0x60), Some(0xFA), "ACK");
+        assert_eq!(kbd.read_port(0x60), Some(0xAA), "BAT self-test pass");
+    }
+
+    #[test]
+    fn enable_disable_keyboard_holds_then_releases_scancodes() {
+        let mut kbd = Keyboard8042::default();
+        kbd.write_port(0x64, 0xAD); // disable keyboard (cmd-byte bit4)
+        kbd.push_scancodes(&[0x1E]);
+        assert_eq!(
+            kbd.read_port(0x64).unwrap() & STATUS_OBF,
+            0,
+            "masked scancode stays queued, not latched"
+        );
+        kbd.write_port(0x64, 0xAE); // re-enable keyboard
+        assert_eq!(
+            kbd.read_port(0x60),
+            Some(0x1E),
+            "held scancode latches on re-enable"
+        );
+    }
+
+    #[test]
+    fn disable_aux_holds_then_releases_mouse_bytes() {
+        let mut kbd = Keyboard8042::default();
+        enable_mouse(&mut kbd);
+        kbd.write_port(0x64, 0xA7); // disable aux (cmd-byte bit5)
+        kbd.inject_mouse(3, 0, 0);
+        assert_eq!(
+            kbd.read_port(0x64).unwrap() & STATUS_OBF,
+            0,
+            "masked mouse byte stays queued"
+        );
+        kbd.write_port(0x64, 0xA8); // re-enable aux
+        let status = kbd.read_port(0x64).unwrap();
+        assert_eq!(status & STATUS_OBF, STATUS_OBF, "byte latches on re-enable");
+        assert_eq!(status & STATUS_AUX, STATUS_AUX, "it is an aux byte");
     }
 }
