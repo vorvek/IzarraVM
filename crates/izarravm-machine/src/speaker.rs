@@ -11,9 +11,6 @@ const SPEAKER_AMPLITUDE: i16 = 8000;
 /// The host DAC rate the ring is produced at.
 const DAC_HZ: u32 = 44_100;
 
-/// DRAM refresh toggle period in microseconds (port 0x61 bit 4).
-const REFRESH_PERIOD_US: f64 = 15.085;
-
 /// Cap the ring so a headless run (which never drains) cannot grow it without
 /// bound. The GUI drains every frame, so it never reaches this.
 const RING_CAP: usize = 2 * DAC_HZ as usize;
@@ -23,7 +20,6 @@ pub(crate) struct Speaker {
     data_enable: bool,   // port 0x61 bit 1
     control_bits: u8,    // low bits last written to 0x61, for readback (bits 0,1)
     sample_phase: f64,   // fractional DAC samples owed
-    elapsed_us: f64,     // emulated microseconds, for the refresh toggle
     ring: VecDeque<i16>, // produced mono samples awaiting drain
     ever_enabled: bool,  // sticky: set the first time data enable goes high
 }
@@ -51,11 +47,6 @@ impl Speaker {
         self.control_bits
     }
 
-    /// Port 0x61 bit 4: a refresh toggle flipping on a roughly 15 us period.
-    pub(crate) fn refresh_bit(&self) -> bool {
-        ((self.elapsed_us / REFRESH_PERIOD_US) as u64) & 1 == 1
-    }
-
     /// Advance emulated time by `clocks` CPU clocks (with `inv_clock` = 1/clock_hz
     /// from the active mode), sampling the membrane into the ring at the DAC rate.
     pub(crate) fn accumulate(&mut self, clocks: u64, inv_clock: f64, ch2_out: bool) {
@@ -63,7 +54,6 @@ impl Speaker {
             return;
         }
         let seconds = clocks as f64 * inv_clock;
-        self.elapsed_us += seconds * 1_000_000.0;
         self.sample_phase += seconds * DAC_HZ as f64;
         let level = if self.data_enable {
             if ch2_out {
@@ -136,13 +126,5 @@ mod tests {
         assert!(spk.ever_enabled());
         spk.write_control(0x00); // off again, but the latch stays set
         assert!(spk.ever_enabled());
-    }
-
-    #[test]
-    fn refresh_bit_toggles_over_time() {
-        let mut spk = Speaker::default();
-        assert!(!spk.refresh_bit()); // t = 0
-        spk.accumulate(16, 1.0 / 1_000_000.0, false); // +16 us, past one ~15.085 us period
-        assert!(spk.refresh_bit());
     }
 }

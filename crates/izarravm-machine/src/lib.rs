@@ -3985,8 +3985,11 @@ impl CpuBus for MachineBus<'_> {
             return Ok(u32::from(value));
         }
         if port == 0x61 {
+            // Bit 4 is the DRAM-refresh heartbeat: PIT channel 1 OUT (the AT
+            // refresh timer, mode 2), not the speaker's standalone toggle. The PIT
+            // seeds channel 1 at power-on so this pulses without guest programming.
             let value = (self.speaker.control_bits() & 0x03)
-                | (u8::from(self.speaker.refresh_bit()) << 4)
+                | (u8::from(self.pit.channel_out(1)) << 4)
                 | (u8::from(self.pit.channel_out(2)) << 5);
             return Ok(u32::from(value));
         }
@@ -6723,16 +6726,35 @@ mod tests {
             "bit 5 = ch2 OUT"
         );
         assert_eq!(b & 0x03, 0x03, "bits 0,1 read back GATE2 + data enable");
-        let r0 = (b >> 4) & 1;
-        let us16 = (clock_hz * 16) / 1_000_000; // ~16 us, past one period
-        machine.advance_devices_clocks(us16);
-        let b2 = with_bus(&mut machine, |bus| {
-            bus.read_io(0x61, BusWidth::Byte).unwrap() as u8
-        });
-        assert_ne!(
-            (b2 >> 4) & 1,
-            r0,
-            "refresh bit (4) toggled after one period"
+
+        // Bit 4 is now PIT channel 1 OUT (the AT DRAM-refresh timer, mode 2),
+        // pre-seeded at power-on. This guest never programmed channel 1, yet the
+        // bit must still toggle. Mode 2 pulses OUT low for one input clock per
+        // refresh period, so over a couple of periods sampled finely bit 4 reads
+        // both high (the bulk) and low (the short pulse).
+        let mut saw_high = false;
+        let mut saw_low = false;
+        // Advance one PIT input clock at a time; one CPU step worth of clocks is
+        // clock_hz / PIT_INPUT_HZ, so step that to move roughly one PIT tick.
+        let per_pit_clock = (clock_hz / u64::from(PIT_INPUT_HZ)).max(1);
+        for _ in 0..40 {
+            machine.advance_devices_clocks(per_pit_clock);
+            let bit4 = with_bus(&mut machine, |bus| {
+                (bus.read_io(0x61, BusWidth::Byte).unwrap() as u8 >> 4) & 1
+            });
+            if bit4 == 1 {
+                saw_high = true;
+            } else {
+                saw_low = true;
+            }
+        }
+        assert!(
+            saw_high,
+            "refresh bit (4) reads high for the bulk of a period"
+        );
+        assert!(
+            saw_low,
+            "refresh bit (4) pulses low once per refresh period"
         );
     }
 
