@@ -1601,26 +1601,84 @@ impl Machine {
                     .map_or(0.0, |f| f.access_duration_secs(0, 0));
                 self.stall_for(secs);
                 self.set_eax_ah(0x00);
+                self.set_disk_status(0x00);
                 self.set_int_frame_carry(false);
+            }
+            // AH=01 get last disk status: AH=0, AL=BDA 0040:0041, CF if nonzero.
+            0x01 => {
+                let status = self.read_physical_u8(0x441);
+                self.set_eax_ah(0x00);
+                self.set_eax_al(status);
+                self.set_int_frame_carry(status != 0);
             }
             // AH=02 read sectors, AH=03 write sectors. AL = sector count, CH/CL
             // carry the cylinder and sector (CL bits 0-5 sector, bits 6-7 the
             // cylinder high bits), DH = head, DL = drive, ES:BX = buffer.
             0x02 | 0x03 => self.int13_transfer(ah, dl),
+            // AH=04 verify sectors: read without copying, report sectors checked.
+            0x04 => self.int13_verify(dl),
             // AH=08 read drive parameters. Report the mounted media geometry.
             0x08 => self.int13_drive_parameters(dl),
             // AH=15 read disk type. A floppy without a change line.
             0x15 => {
                 self.set_eax_ah(0x01);
+                self.set_disk_status(0x00);
                 self.set_int_frame_carry(false);
             }
-            // Unimplemented subfunctions succeed quietly rather than fault the
-            // guest. Real booters call a small fixed set; widen this if one needs
-            // a subfunction that must report failure.
+            // Genuinely unknown subfunctions report invalid-function, the way a
+            // real BIOS does, instead of a false success.
             _ => {
-                self.set_eax_ah(0x00);
-                self.set_int_frame_carry(false);
+                self.set_eax_ah(0x01);
+                self.set_disk_status(0x01);
+                self.set_int_frame_carry(true);
             }
+        }
+    }
+
+    /// Record the INT 13h result in BDA 0040:0041 (last disk status) so AH=01h can
+    /// report it. 0x00 is success; any other value is the error code.
+    fn set_disk_status(&mut self, status: u8) {
+        let _ = self.memory.write_u8(0x441, status);
+    }
+
+    /// AH=04h verify: confirm the requested sectors are readable without copying
+    /// them into the caller buffer. AL returns the count verified.
+    fn int13_verify(&mut self, dl: u8) {
+        if dl != 0x00 || self.floppy.is_none() {
+            self.set_eax_ah(0x80);
+            self.set_disk_status(0x80);
+            self.set_int_frame_carry(true);
+            return;
+        }
+        let ax = self.cpu.registers.eax() as u16;
+        let count = ax as u8;
+        let cx = self.cpu.registers.ecx() as u16;
+        let cl = cx as u8;
+        let ch = (cx >> 8) as u8;
+        let sector = cl & 0x3f;
+        let cyl = u16::from(ch) | (u16::from(cl & 0xc0) << 2);
+        let head = (self.cpu.registers.edx() as u16 >> 8) as u8;
+        let mut done = 0u8;
+        for i in 0..count {
+            let present = self
+                .floppy
+                .as_ref()
+                .and_then(|f| f.read_sector(cyl, head, sector + i))
+                .is_some();
+            if !present {
+                break;
+            }
+            done += 1;
+        }
+        self.set_eax_al(done);
+        if done == count {
+            self.set_eax_ah(0x00);
+            self.set_disk_status(0x00);
+            self.set_int_frame_carry(false);
+        } else {
+            self.set_eax_ah(0x04);
+            self.set_disk_status(0x04);
+            self.set_int_frame_carry(true);
         }
     }
 
@@ -1630,12 +1688,14 @@ impl Machine {
             // No media backs the request: report a timeout the way an empty
             // drive would.
             self.set_eax_ah(0x80);
+            self.set_disk_status(0x80);
             self.set_int_frame_carry(true);
             return;
         };
         // Only floppy A: is backed.
         if dl != 0x00 {
             self.set_eax_ah(0x80);
+            self.set_disk_status(0x80);
             self.set_int_frame_carry(true);
             return;
         }
@@ -1704,10 +1764,12 @@ impl Machine {
         self.set_eax_al(done);
         if done == count {
             self.set_eax_ah(0x00);
+            self.set_disk_status(0x00);
             self.set_int_frame_carry(false);
         } else {
             // Sector not found / read error.
             self.set_eax_ah(0x04);
+            self.set_disk_status(0x04);
             self.set_int_frame_carry(true);
         }
     }
@@ -1716,11 +1778,13 @@ impl Machine {
     fn int13_drive_parameters(&mut self, dl: u8) {
         let Some(geom) = self.floppy.as_ref().map(|f| f.geometry()) else {
             self.set_eax_ah(0x80);
+            self.set_disk_status(0x80);
             self.set_int_frame_carry(true);
             return;
         };
         if dl != 0x00 {
             self.set_eax_ah(0x80);
+            self.set_disk_status(0x80);
             self.set_int_frame_carry(true);
             return;
         }
@@ -1739,6 +1803,7 @@ impl Machine {
         let ebx = (self.cpu.registers.ebx() & !0xFF) | u32::from(geom.drive_type);
         self.cpu.registers.set_ebx(ebx);
         self.set_eax_ah(0x00);
+        self.set_disk_status(0x00);
         self.set_int_frame_carry(false);
     }
 
@@ -8919,6 +8984,27 @@ mod tests {
         );
         let flags = machine.cpu().registers.eflags;
         assert_eq!(flags & 0x0001, 0, "CF must be clear after a good read");
+    }
+
+    #[test]
+    fn int13_ah01_returns_last_status() {
+        // A failed read (drive B:, unbacked) sets the last status; AH=01h reads it back.
+        let rom = rom_with_code(&[
+            0xB4, 0x02, 0xB0, 0x01, // AH=02h read, AL=1 sector
+            0xB5, 0x00, 0xB1, 0x01, // CH=0 cyl, CL=1 sector
+            0xB6, 0x00, 0xB2, 0x01, // DH=0 head, DL=1 (drive B:, unbacked)
+            0xCD, 0x13, 0xB4, 0x01, 0xCD, 0x13, // AH=01h get last status
+            0xF4,
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        // Mount media in A: so handle_int13 runs; the read targets B:, which is unbacked.
+        machine.mount_floppy(vec![0u8; 737_280]).unwrap();
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        // Drive B: is unbacked: the transfer reported AH=0x80 (timeout); AH=01h echoes it in AL.
+        let al = machine.cpu().registers.eax() as u8;
+        assert_eq!(al, 0x80, "AL = last disk status");
     }
 
     #[test]
