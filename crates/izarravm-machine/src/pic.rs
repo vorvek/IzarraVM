@@ -1,9 +1,9 @@
 //! Intel 8259A programmable interrupt controller, a master/slave cascade pair.
 //!
 //! Built clean-room from the Intel 8259A datasheet cached at
-//! dev_docs/reference/8259a/. Fixed priority, edge latched, 8086 vector mode.
-//! Rotating priority and special fully nested mode are not modeled; the PC BIOS
-//! and DOS do not use them.
+//! dev_docs/reference/8259a/. Edge latched, 8086 vector mode. Priority order is
+//! rotatable through OCW2 (a per-controller lowest-priority pointer), and ICW4
+//! special fully nested mode is decoded and honored in the cascade decision.
 
 /// One 8259A. The pair owns two of these plus the cascade routing.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -23,6 +23,9 @@ pub(crate) struct Pic {
     read_isr: bool,        // OCW3 read select: false = IRR, true = ISR
     poll_pending: bool,    // OCW3 P=1: the next data read is a poll command
     special_mask: bool,    // OCW3 SMM: special mask mode active
+    sfnm: bool,            // ICW4 bit4 (SFNM): special fully nested mode
+    lowest: u8,            // OCW2 rotation: the level holding lowest priority
+    auto_rotate: bool,     // OCW2 R=1 with EOI bit 0: rotate in automatic EOI mode
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -44,6 +47,10 @@ impl Pic {
                 self.isr = 0;
                 self.imr = 0;
                 self.read_isr = false;
+                // Reset priority: IR0 highest, IR7 lowest. The pointer names the
+                // level that currently holds lowest priority.
+                self.lowest = 7;
+                self.auto_rotate = false;
                 self.expect_icw4 = value & 0x01 != 0;
                 self.single = value & 0x02 != 0;
                 // ponytail: LTIM is decoded and stored, but the request path stays
@@ -95,6 +102,7 @@ impl Pic {
                     self.auto_eoi = value & 0x02 != 0;
                     self.buffered = value & 0x08 != 0;
                     self.is_master = value & 0x04 != 0;
+                    self.sfnm = value & 0x10 != 0;
                     self.init = InitStage::Ready;
                 }
                 InitStage::Ready => {
@@ -132,34 +140,92 @@ impl Pic {
         }
     }
 
-    fn end_of_interrupt(&mut self, ocw2: u8) {
-        if ocw2 & 0x20 == 0 {
-            // No EOI bit: a rotate-only or set-priority command. Priority rotation
-            // is not modeled, so there is nothing to do.
-            return;
+    /// The eight levels in priority order, highest first. The level just below
+    /// `lowest` is highest, so `(lowest + 1) % 8` leads and `lowest` trails. With
+    /// the reset pointer of 7 this is the fixed 0..7 order.
+    fn priority_order(&self) -> [u8; 8] {
+        let mut order = [0u8; 8];
+        for (slot, item) in order.iter_mut().enumerate() {
+            *item = (self.lowest + 1 + slot as u8) % 8;
         }
-        if ocw2 & 0x40 != 0 {
-            // Specific EOI: clear the named level.
-            self.isr &= !(1 << (ocw2 & 0x07));
-        } else if let Some(level) = self.highest_in_service() {
-            // Non-specific EOI: clear the highest-priority in-service level.
-            self.isr &= !(1 << level);
+        order
+    }
+
+    /// OCW2: end of interrupt and priority rotation. Bits 7-5 select the command,
+    /// bits 2-0 name a level for the specific variants.
+    fn end_of_interrupt(&mut self, ocw2: u8) {
+        let level = ocw2 & 0x07;
+        match ocw2 >> 5 {
+            // 000 / 100: clear or set rotate-in-automatic-EOI mode, no EOI.
+            0b000 | 0b100 => self.auto_rotate = ocw2 & 0x80 != 0,
+            // 001: non-specific EOI, clear the highest-priority in-service level.
+            0b001 => {
+                if let Some(level) = self.highest_in_service() {
+                    self.isr &= !(1 << level);
+                }
+            }
+            // 011: specific EOI, clear the named level.
+            0b011 => self.isr &= !(1 << level),
+            // 101: rotate on non-specific EOI. Clear the highest in-service level
+            // and move it to lowest priority.
+            0b101 => {
+                if let Some(level) = self.highest_in_service() {
+                    self.isr &= !(1 << level);
+                    self.lowest = level;
+                }
+            }
+            // 110: set priority, no EOI. The named level becomes lowest priority.
+            0b110 => self.lowest = level,
+            // 111: rotate on specific EOI. Clear the named level and move it to
+            // lowest priority.
+            0b111 => {
+                self.isr &= !(1 << level);
+                self.lowest = level;
+            }
+            // 010: no-op.
+            _ => {}
         }
     }
 
     fn highest_in_service(&self) -> Option<u8> {
-        (0..8u8).find(|&irq| self.isr & (1 << irq) != 0)
+        self.priority_order()
+            .into_iter()
+            .find(|&irq| self.isr & (1 << irq) != 0)
     }
 
     /// Highest-priority deliverable request, or None. In fully nested mode a
     /// request outranks the in-service set only if no equal-or-higher ISR bit is
     /// set. In special mask mode a level is skipped only when its own ISR bit is
-    /// set, so a lower unmasked request can still be delivered.
+    /// set, so a lower unmasked request can still be delivered. Levels are walked
+    /// in the current rotated priority order, not a fixed 0..7.
     fn highest_pending(&self) -> Option<u8> {
         let requests = self.irr & !self.imr;
-        for irq in 0..8u8 {
+        for irq in self.priority_order() {
             let bit = 1 << irq;
             if self.isr & bit != 0 {
+                if self.special_mask {
+                    continue;
+                }
+                return None;
+            }
+            if requests & bit != 0 {
+                return Some(irq);
+            }
+        }
+        None
+    }
+
+    /// Master resolver for special fully nested mode. The cascade pin that is in
+    /// service for the slave does not inhibit a fresh request on that same pin, so
+    /// a higher-priority slave line can preempt one already being serviced. Every
+    /// other level keeps the fully nested rule. The slave's own internal priority
+    /// is what orders the two slave requests; here the master only needs to stop
+    /// treating its busy cascade pin as a hard block.
+    fn highest_pending_sfnm(&self, cascade_pin: u8) -> Option<u8> {
+        let requests = self.irr & !self.imr;
+        for irq in self.priority_order() {
+            let bit = 1 << irq;
+            if self.isr & bit != 0 && irq != cascade_pin {
                 if self.special_mask {
                     continue;
                 }
@@ -182,6 +248,10 @@ impl Pic {
         self.irr &= !bit;
         if self.auto_eoi {
             self.isr &= !bit;
+            if self.auto_rotate {
+                // Rotate-in-automatic-EOI: the acknowledged level drops to lowest.
+                self.lowest = irq;
+            }
         }
     }
 }
@@ -259,12 +329,31 @@ impl Pic8259Pair {
         // irq >= 16 is not a PC interrupt line; ignore it in release builds.
     }
 
+    /// The master's highest-priority deliverable level. When the master runs in
+    /// special fully nested mode and its cascade pin is already in service for the
+    /// slave, that pin no longer blocks a fresh slave request, so a higher slave
+    /// line can preempt the one being serviced.
+    //
+    // ponytail: SFNM here is just the master-side block relaxation. The datasheet
+    // also asks software to poll the slave's ISR after a slave EOI and skip the
+    // master EOI while the slave still has work in service. That slave-EOI dance
+    // is left to the guest; this models the request-resolution half only.
+    fn master_pending(&self) -> Option<u8> {
+        let cascade_pin = self.slave.icw3 & 0x07;
+        let pin_has_slave = self.master.icw3 & (1 << cascade_pin) != 0;
+        if self.master.sfnm && pin_has_slave {
+            self.master.highest_pending_sfnm(cascade_pin)
+        } else {
+            self.master.highest_pending()
+        }
+    }
+
     pub(crate) fn interrupt_pending(&self) -> bool {
-        self.master.highest_pending().is_some()
+        self.master_pending().is_some()
     }
 
     pub(crate) fn acknowledge(&mut self) -> Option<u8> {
-        let master_irq = self.master.highest_pending()?;
+        let master_irq = self.master_pending()?;
         self.master.set_in_service(master_irq);
         // A pin is a cascade only if the master ICW3 bitmask flags it and the
         // slave's ICW3 id names the same pin (AT default: master IR2, slave id 2).
@@ -486,5 +575,144 @@ mod tests {
         assert!(pic.master.level_triggered);
         assert!(pic.master.buffered);
         assert!(pic.master.is_master);
+    }
+
+    #[test]
+    fn icw1_resets_priority_pointer_to_seven() {
+        let pic = master_initialized();
+        // Reset order is IR0 highest, IR7 lowest.
+        assert_eq!(pic.master.lowest, 7);
+        assert_eq!(pic.master.priority_order(), [0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn icw4_sfnm_bit_is_decoded() {
+        let mut pic = Pic8259Pair::default();
+        pic.write_port(0x20, 0x11); // ICW1 cascade, ICW4 follows
+        pic.write_port(0x21, 0x08); // ICW2 base 0x08
+        pic.write_port(0x21, 0x04); // ICW3 slave on IR2
+        pic.write_port(0x21, 0x11); // ICW4 8086 + SFNM (bit4)
+        assert!(pic.master.sfnm);
+
+        // The same sequence without bit4 leaves SFNM clear.
+        let plain = master_initialized();
+        assert!(!plain.master.sfnm);
+    }
+
+    #[test]
+    fn set_priority_command_moves_rotation_pointer() {
+        let mut pic = master_initialized();
+        // OCW2 110 (set priority), level 4: IR4 becomes lowest, so IR5 leads.
+        pic.write_port(0x20, 0xc4);
+        assert_eq!(pic.master.lowest, 4);
+        assert_eq!(pic.master.priority_order(), [5, 6, 7, 0, 1, 2, 3, 4]);
+        // No EOI bit, so a clear ISR stays clear.
+        assert_eq!(pic.master.isr, 0x00);
+    }
+
+    #[test]
+    fn rotate_on_non_specific_eoi_demotes_serviced_level() {
+        let mut pic = master_initialized();
+        pic.request(2);
+        pic.acknowledge(); // IR2 in service, highest priority by reset order
+        assert_eq!(pic.master.isr, 0x04);
+        // OCW2 101 (rotate on non-specific EOI): clear IR2 and make it lowest.
+        pic.write_port(0x20, 0xa0);
+        assert_eq!(pic.master.isr, 0x00);
+        assert_eq!(pic.master.lowest, 2);
+        // IR3 now leads the order: an equal-priority contest with IR4 favors IR3,
+        // and the just-serviced IR2 trails everything.
+        assert_eq!(pic.master.priority_order(), [3, 4, 5, 6, 7, 0, 1, 2]);
+        pic.request(2);
+        pic.request(4);
+        // After rotation IR4 outranks the demoted IR2.
+        assert_eq!(pic.acknowledge(), Some(0x0c)); // IR4 vector
+    }
+
+    #[test]
+    fn rotate_on_specific_eoi_clears_and_demotes_named_level() {
+        let mut pic = master_initialized();
+        pic.request(1);
+        pic.request(5);
+        pic.acknowledge(); // IR1 in service (higher than IR5)
+        pic.master.set_in_service(5); // force IR5 in service too for the test
+        assert_eq!(pic.master.isr, 0x22);
+        // OCW2 111 (rotate on specific EOI), level 1: clear IR1, make it lowest.
+        pic.write_port(0x20, 0xe1);
+        assert_eq!(pic.master.isr & 0x02, 0x00); // IR1 cleared
+        assert_eq!(pic.master.lowest, 1);
+        assert_eq!(pic.master.priority_order(), [2, 3, 4, 5, 6, 7, 0, 1]);
+    }
+
+    #[test]
+    fn non_specific_eoi_clears_highest_in_rotated_order() {
+        let mut pic = master_initialized();
+        // Rotate so IR4 is lowest priority and IR5 leads.
+        pic.write_port(0x20, 0xc4); // set priority, level 4 lowest
+        pic.master.set_in_service(0);
+        pic.master.set_in_service(5);
+        assert_eq!(pic.master.isr, 0x21);
+        // Non-specific EOI clears the highest by the rotated order. IR5 leads IR0,
+        // so IR5 is cleared first, not IR0.
+        pic.write_port(0x20, 0x20);
+        assert_eq!(pic.master.isr, 0x01); // IR0 still in service, IR5 cleared
+    }
+
+    #[test]
+    fn rotate_in_auto_eoi_demotes_acknowledged_level() {
+        let mut pic = master_initialized();
+        // Re-init with AEOI set (ICW4 bit1) on top of the 8086 mode.
+        pic.write_port(0x20, 0x11);
+        pic.write_port(0x21, 0x08);
+        pic.write_port(0x21, 0x04);
+        pic.write_port(0x21, 0x03); // ICW4 8086 + AEOI
+        // OCW2 100: set rotate-in-automatic-EOI mode.
+        pic.write_port(0x20, 0x80);
+        assert!(pic.master.auto_rotate);
+        pic.request(3);
+        pic.acknowledge(); // AEOI self-clears IR3 and rotation demotes it
+        assert_eq!(pic.master.isr, 0x00);
+        assert_eq!(pic.master.lowest, 3);
+        // OCW2 000 clears rotate-in-automatic-EOI mode again.
+        pic.write_port(0x20, 0x00);
+        assert!(!pic.master.auto_rotate);
+    }
+
+    #[test]
+    fn sfnm_master_lets_higher_slave_line_preempt() {
+        let mut pic = master_initialized_sfnm();
+        slave_initialized(&mut pic);
+        pic.request(9); // slave line 1
+        assert_eq!(pic.acknowledge(), Some(0x71)); // slave base 0x70 | 1
+        assert_eq!(pic.master.isr, 0x04); // master IR2 cascade in service
+        assert_eq!(pic.slave.isr, 0x02);
+        // A higher-priority slave line (IR8 = slave line 0) requests while the
+        // master cascade pin is still in service. SFNM does not block it.
+        pic.request(8);
+        assert!(pic.interrupt_pending());
+        assert_eq!(pic.acknowledge(), Some(0x70)); // slave base 0x70 | 0
+    }
+
+    #[test]
+    fn without_sfnm_master_blocks_second_slave_line() {
+        let mut pic = master_initialized();
+        slave_initialized(&mut pic);
+        pic.request(9); // slave line 1
+        pic.acknowledge(); // master IR2 + slave line 1 in service
+        assert!(!pic.master.sfnm);
+        // The fully nested master treats its busy IR2 as a hard block, so a higher
+        // slave line cannot get through until the master EOIs IR2.
+        pic.request(8);
+        assert!(!pic.interrupt_pending());
+    }
+
+    fn master_initialized_sfnm() -> Pic8259Pair {
+        let mut pic = Pic8259Pair::default();
+        // Same as master_initialized but ICW4 sets SFNM (bit4) alongside 8086 mode.
+        pic.write_port(0x20, 0x11);
+        pic.write_port(0x21, 0x08);
+        pic.write_port(0x21, 0x04);
+        pic.write_port(0x21, 0x11);
+        pic
     }
 }
