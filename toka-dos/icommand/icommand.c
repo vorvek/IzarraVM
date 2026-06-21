@@ -263,6 +263,35 @@ static void cmd_prompt(char *rest)
     env_set("PROMPT", rest[0] ? rest : "$p$g");
 }
 
+/* TRUENAME: print the fully qualified path of the argument. */
+static void cmd_truename(const char *arg)
+{
+    char cwd[64];
+    if (arg[0] == 0) {
+        t_getcwd(cwd);
+        t_puts("C:\\");
+        t_putln(cwd);
+        return;
+    }
+    if (arg[1] == ':') {
+        /* already drive-qualified */
+        t_putln(arg);
+        return;
+    }
+    if (arg[0] == '\\' || arg[0] == '/') {
+        t_puts("C:");
+        t_putln(arg);
+        return;
+    }
+    t_getcwd(cwd);
+    t_puts("C:\\");
+    if (cwd[0]) {
+        t_puts(cwd);
+        t_putc('\\');
+    }
+    t_putln(arg);
+}
+
 static void cmd_dir(const char *arg)
 {
     static unsigned char dta[43];
@@ -880,6 +909,21 @@ static void dispatch(char *word, char *rest)
         cmd_path(rest);
     } else if (eqi(word, "PROMPT")) {
         cmd_prompt(rest);
+    } else if (eqi(word, "BREAK")) {
+        t_putln(eqi(rest, "ON") ? "BREAK is on" : "BREAK is off");
+    } else if (eqi(word, "CHCP")) {
+        t_putln("Active code page: 437");
+    } else if (eqi(word, "DOSSIZE")) {
+        t_putln("Toka-DOS resident size: 16384 bytes");
+    } else if (eqi(word, "TRUENAME")) {
+        cmd_truename(rest);
+    } else if (eqi(word, "LOADHIGH") || eqi(word, "LH") || eqi(word, "LOADFIX")) {
+        /* No UMB model: just run the program that follows. */
+        char w2[16];
+        char *r2 = split_word(rest, w2, sizeof w2);
+        if (w2[0]) {
+            dispatch(w2, r2);
+        }
     } else {
         if (!run_external(word, rest)) {
             t_putln("Bad command or file name");
