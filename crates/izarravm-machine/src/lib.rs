@@ -2,7 +2,9 @@ pub use fat12::build_fat12;
 use izarravm_audio::{OplChip, Resampler, SbDsp, SbMixer};
 use izarravm_bus::{BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CpuBus, Memory};
 use izarravm_core::{GswMode, HardwareProfile, SoundBlasterConfig, VideoCard};
-use izarravm_cpu::{Cpu386, CpuError, CpuLevel, Registers, SegmentIndex, SegmentRegister};
+use izarravm_cpu::{
+    Cpu386, CpuError, CpuLevel, CycleOutcome, Registers, SegmentIndex, SegmentRegister,
+};
 pub use izarravm_video::MARGO_ID_VALUE;
 use izarravm_video::{
     DAC_ENTRIES, MARGO_MMIO_SIZE, MARGO_VBE_MODES, MARGO_VRAM_SIZE, Margo, TextFrame,
@@ -178,6 +180,12 @@ struct TimingFactors {
     margo_ns_per_clock: f64, // 1e9 / clock_hz
     vga_dots_per_clock: f64, // VGA_DOT_HZ / clock_hz
     inv_clock: f64,          // 1 / clock_hz (DSP sample phase and the speaker)
+    // CPU clocks in one 44.1 kHz DAC sample. The run loop batches instructions
+    // up to this many clocks before servicing devices once, so the per-clock
+    // fine-samplers (the PC speaker reads ch2 OUT once per advance_devices, the
+    // DSP/CD producers step at the DAC rate) still see at most one sample of
+    // time per call and never alias. >=1 in every mode (clock_hz >> 44100).
+    clocks_per_audio_sample: u64,
 }
 
 impl TimingFactors {
@@ -189,6 +197,7 @@ impl TimingFactors {
             margo_ns_per_clock: 1_000_000_000.0 / c,
             vga_dots_per_clock: VGA_DOT_HZ as f64 / c,
             inv_clock: 1.0 / c,
+            clocks_per_audio_sample: (clock_hz / u64::from(DAC_HZ)).max(1),
         }
     }
 }
@@ -209,6 +218,10 @@ pub struct Machine {
     margo: Margo,
     margo_active: bool,
     pending_soft_int: Option<u8>, // software-INT vector awaiting deferred dispatch
+    // Set by MachineBus on any port I/O; the run loop's instruction batch reads
+    // it to know when to stop and service devices (see run_until_clock). A field
+    // rather than a loop local so make_bus's one-off host accesses share it.
+    io_touched: bool,
     // Toka-DOS service (Lotura port 0xE3): a write records the command here, the
     // run loop performs it after the cycle (it needs &mut self for host I/O), and
     // the resulting status is read back at 0xE3.
@@ -402,6 +415,7 @@ impl Machine {
             margo: Margo::default(),
             margo_active: false,
             pending_soft_int: None,
+            io_touched: false,
             pending_toka_service: None,
             toka_service_status: 0,
             toka_c_root: None,
@@ -867,6 +881,7 @@ impl Machine {
             toka_service_status: self.toka_service_status,
             unittester: &mut self.unittester,
             wait_states: self.profile.wait_states,
+            io_touched: &mut self.io_touched,
         }
     }
 
@@ -3598,7 +3613,19 @@ impl Machine {
     ) -> Result<StopReason, MachineError> {
         while self.elapsed_clocks < deadline {
             self.pending_soft_int = None;
+            self.io_touched = false;
             let trace_before = self.trace.elapsed_clocks();
+            // Run a batch of straight-line instructions against one MachineBus,
+            // then service devices once. The cap holds the batch to at most one
+            // DAC sample of CPU time so the per-clock fine-samplers stay exact; a
+            // port access, an HLE INT, a HLT, or a fault ends it sooner. This is
+            // the global-TSC / event-batched model (research item 2.3): it drops
+            // the per-instruction bus rebuild + 14-device fan-out that dominated
+            // the old loop, and is the prerequisite for the recompiler (item 2.2).
+            let cap = self
+                .timing
+                .clocks_per_audio_sample
+                .min(deadline - self.elapsed_clocks);
             let outcome = {
                 let Machine {
                     profile,
@@ -3628,6 +3655,7 @@ impl Machine {
                     pending_toka_service,
                     toka_service_status,
                     unittester,
+                    io_touched,
                     ..
                 } = self;
                 let mut bus = MachineBus {
@@ -3657,8 +3685,48 @@ impl Machine {
                     toka_service_status: *toka_service_status,
                     unittester,
                     wait_states: profile.wait_states,
+                    io_touched,
                 };
-                cpu.cycle(&mut bus)
+                // Collapse the batch into one CycleOutcome so every downstream
+                // service step (device advance, CD stall, pending INT/mode/Toka/
+                // unittester, console flush, HLT fast-forward) is unchanged:
+                // core_clocks is the batch sum, halted is set iff the batch ended
+                // on a HLT. core_clocks can't overflow u32 (cap is ~one audio
+                // sample, a few thousand clocks at most).
+                let mut batch_core = 0u32;
+                let mut halted = false;
+                let mut fault = None;
+                loop {
+                    match cpu.cycle(&mut bus) {
+                        Ok(o) => {
+                            batch_core = batch_core.saturating_add(o.core_clocks);
+                            if o.halted {
+                                halted = true;
+                                break;
+                            }
+                            // A port access read or changed time-dependent device
+                            // state; an HLE INT (pending_soft_int) needs &mut self.
+                            // Stop so the run loop services them at this instant.
+                            if *bus.io_touched || bus.pending_soft_int.is_some() {
+                                break;
+                            }
+                            if u64::from(batch_core) >= cap {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            fault = Some(e);
+                            break;
+                        }
+                    }
+                }
+                match fault {
+                    Some(e) => Err(e),
+                    None => Ok(CycleOutcome {
+                        core_clocks: batch_core,
+                        halted,
+                    }),
+                }
             };
 
             match outcome {
@@ -3784,6 +3852,12 @@ struct MachineBus<'a> {
     toka_service_status: u8,                    // a copy, for the 0xE3 status read
     unittester: &'a mut unittester::UnitTester, // Lotura ports 0xE4-0xE6
     wait_states: WaitStateProfile,
+    // Set true by any port I/O this batch. The run loop batches straight-line
+    // instructions and services devices once per batch; a port access (a PIT
+    // latch read, 0x3DA retrace poll, RTC read, a PIT/PIC/DSP/mode write) reads
+    // or changes time-dependent device state, so it ends the batch to keep that
+    // state exact. Memory/MMIO (framebuffer blits, the hot path) does not set it.
+    io_touched: &'a mut bool,
 }
 
 impl CpuBus for MachineBus<'_> {
@@ -3862,6 +3936,7 @@ impl CpuBus for MachineBus<'_> {
     }
 
     fn read_io(&mut self, port: u16, width: BusWidth) -> Result<u32, BusError> {
+        *self.io_touched = true;
         self.trace.push(BusCycle::new(
             BusAccessKind::IoRead,
             u32::from(port),
@@ -3950,6 +4025,7 @@ impl CpuBus for MachineBus<'_> {
     }
 
     fn write_io(&mut self, port: u16, width: BusWidth, value: u32) -> Result<(), BusError> {
+        *self.io_touched = true;
         self.trace.push(BusCycle::new(
             BusAccessKind::IoWrite,
             u32::from(port),
@@ -6545,6 +6621,7 @@ mod tests {
             toka_service_status: machine.toka_service_status,
             unittester: &mut machine.unittester,
             wait_states: machine.profile.wait_states,
+            io_touched: &mut machine.io_touched,
         };
         f(&mut bus)
     }
@@ -6932,6 +7009,47 @@ mod tests {
         assert!(
             pending,
             "channel 0 should have raised IRQ0 over 4000 cycles"
+        );
+    }
+
+    // Throughput probe for the run-loop batching (item 2.3). Not a correctness
+    // test; run with: cargo test --release -- --ignored --nocapture batch_throughput
+    #[test]
+    #[ignore]
+    fn batch_throughput() {
+        // cli; jmp $ — a tight interrupt-free loop with no port I/O, the case the
+        // batch fully amortizes (one bus build + device fan-out per ~thousands of
+        // instructions instead of per instruction).
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            rom_with_code(&[0xfa, 0xeb, 0xfe]),
+        )
+        .unwrap();
+        let budget = 2_000_000_000u64;
+        let t = std::time::Instant::now();
+        machine.run_cycles(budget).unwrap();
+        let secs = t.elapsed().as_secs_f64();
+        println!(
+            "batch_throughput: {budget} guest clocks in {secs:.3}s = {:.1} M guest-clocks/s",
+            budget as f64 / secs / 1.0e6
+        );
+    }
+
+    #[test]
+    fn audio_sample_cap_is_one_dac_sample_and_never_zero() {
+        // The run-loop batch services devices once per cap clocks; the cap must be
+        // exactly one 44.1 kHz DAC sample so the PC speaker (samples ch2 OUT once
+        // per advance_devices) and the DSP/CD producers never alias, and never 0
+        // (which would stall the batch). Checked at the live 266 MHz default and a
+        // pathologically slow clock where the floor division would otherwise be 0.
+        assert_eq!(
+            TimingFactors::for_clock(266_000_000).clocks_per_audio_sample,
+            266_000_000 / u64::from(DAC_HZ)
+        );
+        assert_eq!(
+            TimingFactors::for_clock(40_000).clocks_per_audio_sample,
+            1,
+            "a clock below the DAC rate must floor to 1, not 0"
         );
     }
 
