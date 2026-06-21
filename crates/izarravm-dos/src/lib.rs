@@ -1824,6 +1824,129 @@ impl DosKernel {
                 }
                 Ok(DosAction::Continue)
             }
+            // AH=45h DUP: duplicate the handle in BX onto a new handle. The clone shares
+            // the underlying open file (and its position) via File::try_clone.
+            0x45 => {
+                let cloned = match self.open_files.get(&regs.bx) {
+                    Some(of) => of.file.try_clone().map(|file| OpenFile {
+                        file,
+                        mode: of.mode,
+                    }),
+                    None => {
+                        set_dos_error(regs, 0x06); // invalid handle
+                        return Ok(DosAction::Continue);
+                    }
+                };
+                match cloned {
+                    Ok(open) => {
+                        let handle = (5u16..)
+                            .find(|h| !self.open_files.contains_key(h))
+                            .expect("a free DOS handle exists at or below u16::MAX");
+                        self.open_files.insert(handle, open);
+                        regs.ax = handle;
+                        regs.cf = false;
+                    }
+                    Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
+                }
+                Ok(DosAction::Continue)
+            }
+            // AH=46h DUP2/FORCEDUP: force handle CX to refer to the same open file as BX,
+            // closing whatever CX referred to first (insert drops the old File via RAII).
+            0x46 => {
+                let cloned = match self.open_files.get(&regs.bx) {
+                    Some(of) => of.file.try_clone().map(|file| OpenFile {
+                        file,
+                        mode: of.mode,
+                    }),
+                    None => {
+                        set_dos_error(regs, 0x06);
+                        return Ok(DosAction::Continue);
+                    }
+                };
+                match cloned {
+                    Ok(open) => {
+                        self.open_files.insert(regs.cx, open);
+                        regs.cf = false;
+                    }
+                    Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
+                }
+                Ok(DosAction::Continue)
+            }
+            // AH=43h CHMOD: AL=00 get attributes (CX), AL=01 set. ponytail: only the
+            // read-only bit (0x01) maps to a host permission; hidden/system/archive are
+            // not represented, so get reports archive (0x20) for files and 0x10 for dirs.
+            0x43 => {
+                let path = match self.resolve_open_path(mem, regs.ds, regs.dx)? {
+                    Ok(path) => path,
+                    Err(code) => {
+                        set_dos_error(regs, code);
+                        return Ok(DosAction::Continue);
+                    }
+                };
+                match regs.ax as u8 {
+                    0x00 => match std::fs::metadata(&path) {
+                        Ok(meta) => {
+                            let mut attr = if meta.is_dir() { 0x10u16 } else { 0x20 };
+                            if meta.permissions().readonly() {
+                                attr |= 0x01;
+                            }
+                            regs.cx = attr;
+                            regs.cf = false;
+                        }
+                        Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
+                    },
+                    0x01 => match std::fs::metadata(&path) {
+                        Ok(meta) => {
+                            let mut perms = meta.permissions();
+                            perms.set_readonly(regs.cx & 0x01 != 0);
+                            match std::fs::set_permissions(&path, perms) {
+                                Ok(()) => regs.cf = false,
+                                Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
+                            }
+                        }
+                        Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
+                    },
+                    _ => set_dos_error(regs, 0x01),
+                }
+                Ok(DosAction::Continue)
+            }
+            // AH=5Bh CREATE NEW FILE: like AH=3Ch but fails with 0x50 (file exists) when
+            // the file is already present, the create-exclusive semantic.
+            0x5b => {
+                let path = match self.resolve_open_path(mem, regs.ds, regs.dx)? {
+                    Ok(path) => path,
+                    Err(code) => {
+                        set_dos_error(regs, code);
+                        return Ok(DosAction::Continue);
+                    }
+                };
+                match OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                {
+                    Ok(file) => {
+                        let handle = (5u16..)
+                            .find(|h| !self.open_files.contains_key(h))
+                            .expect("a free DOS handle exists at or below u16::MAX");
+                        self.open_files.insert(
+                            handle,
+                            OpenFile {
+                                file,
+                                mode: AccessMode::ReadWrite,
+                            },
+                        );
+                        regs.ax = handle;
+                        regs.cf = false;
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                        set_dos_error(regs, 0x50) // file already exists
+                    }
+                    Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
+                }
+                Ok(DosAction::Continue)
+            }
             // Other file functions (find) and everything else are not yet
             // implemented; later slices fill them in. An unimplemented function
             // returns Continue so the IRET stub returns to the caller.
@@ -2939,6 +3062,116 @@ mod tests {
         let regs = open(&mut kernel, &mut mem);
         assert!(regs.cf);
         assert_eq!(regs.ax, 0x02);
+    }
+
+    #[test]
+    fn ah45_dup_returns_the_next_free_handle() {
+        let (mut kernel, mut mem, _dir) = kernel_with_drive(&[("DATA.TXT", b"hi")], r"C:\DATA.TXT");
+        assert_eq!(open(&mut kernel, &mut mem).ax, 5);
+        let mut regs = DosRegs {
+            ax: 0x4500,
+            bx: 5,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf);
+        assert_eq!(regs.ax, 6);
+    }
+
+    #[test]
+    fn ah45_dup_invalid_handle_errors() {
+        let (mut kernel, mut mem, _dir) = kernel_with_drive(&[], r"C:\X.TXT");
+        let mut regs = DosRegs {
+            ax: 0x4500,
+            bx: 99,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x06);
+    }
+
+    #[test]
+    fn ah46_dup2_forces_a_target_handle() {
+        let (mut kernel, mut mem, _dir) = kernel_with_drive(&[("DATA.TXT", b"hi")], r"C:\DATA.TXT");
+        assert_eq!(open(&mut kernel, &mut mem).ax, 5);
+        let mut regs = DosRegs {
+            ax: 0x4600,
+            bx: 5,
+            cx: 9,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf);
+        // Handle 9 now aliases the file: closing it succeeds.
+        let mut regs = DosRegs {
+            ax: 0x3e00,
+            bx: 9,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf);
+    }
+
+    #[test]
+    fn ah5b_create_new_fails_if_the_file_exists() {
+        let (mut kernel, mut mem, _dir) =
+            kernel_with_drive(&[("EXISTS.TXT", b"x")], r"C:\EXISTS.TXT");
+        let mut regs = DosRegs {
+            ax: 0x5b00,
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x50);
+    }
+
+    #[test]
+    fn ah5b_create_new_succeeds_for_a_fresh_name() {
+        let (mut kernel, mut mem, _dir) = kernel_with_drive(&[], r"C:\FRESH.TXT");
+        let mut regs = DosRegs {
+            ax: 0x5b00,
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf);
+        assert_eq!(regs.ax, 5);
+    }
+
+    #[test]
+    fn ah43_chmod_reports_and_sets_readonly() {
+        let (mut kernel, mut mem, _dir) = kernel_with_drive(&[("F.TXT", b"x")], r"C:\F.TXT");
+        let mut regs = DosRegs {
+            ax: 0x4300,
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf);
+        assert_eq!(regs.cx & 0x20, 0x20); // archive
+        assert_eq!(regs.cx & 0x01, 0x00); // not read-only yet
+        let mut regs = DosRegs {
+            ax: 0x4301,
+            ds: 0x0100,
+            dx: 0x0200,
+            cx: 0x01,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf);
+        let mut regs = DosRegs {
+            ax: 0x4300,
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(regs.cx & 0x01, 0x01); // read-only now set
     }
 
     #[test]
