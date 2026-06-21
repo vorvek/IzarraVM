@@ -108,6 +108,9 @@ const MSR_EFER: u32 = 0xc000_0080; // extended feature enable (bit 0 = SCE)
 const MSR_STAR: u32 = 0xc000_0081; // SYSCALL/SYSRET target address
 const MSR_WHCR: u32 = 0xc000_0082; // write handling control
 
+// EFER bit 0: System Call Extension. SYSCALL and SYSRET raise #UD when it is clear.
+const EFER_SCE: u64 = 0x1;
+
 // Leaf 1 EBX: brand index 0 (no brand string), CLFLUSH line size and other fields stay 0.
 const CPUID_LEAF1_EBX: u32 = 0;
 // Leaf 1 ECX: no extended feature is claimed.
@@ -229,6 +232,18 @@ impl SegmentRegister {
             limit: 0x0000_ffff,
             access: 0x9b,
             default_size_32: false,
+        }
+    }
+
+    /// A 4-GByte flat 32-bit segment (base 0, full limit). Used by SYSCALL/SYSRET, which
+    /// load fixed flat descriptors from the selector in STAR without touching the GDT.
+    pub const fn flat(selector: u16, access: u8) -> Self {
+        Self {
+            selector,
+            base: 0,
+            limit: 0xffff_ffff,
+            access,
+            default_size_32: true,
         }
     }
 }
@@ -2127,6 +2142,17 @@ impl Cpu386 {
                 };
                 self.set_edx_eax(value);
                 Ok(clocks(11))
+            }
+            0x05 => self.syscall(),
+            0x07 => self.sysret(),
+            0xaa => {
+                // RSM: return from System Management Mode. No SMI source is modeled, so the
+                // processor is never in SMM and RSM outside SMM is #UD, as on real hardware.
+                // ponytail: SMM entry is not implemented; RSM is therefore always invalid.
+                Err(InternalFault::Exception {
+                    vector: 6,
+                    error_code: None,
+                })
             }
             0x20 => {
                 let modrm = self.fetch_modrm(bus)?;
@@ -4704,8 +4730,8 @@ const fn is_386plus_two_byte(opcode: u8) -> bool {
 const fn is_586plus_two_byte(opcode: u8) -> bool {
     matches!(
         opcode,
-        // WRMSR, RDTSC, RDMSR; CMOVcc; CMPXCHG8B.
-        0x30..=0x32 | 0x40..=0x4f | 0xc7
+        // SYSCALL/SYSRET; WRMSR, RDTSC, RDMSR; CMOVcc; RSM; CMPXCHG8B.
+        0x05 | 0x07 | 0x30..=0x32 | 0x40..=0x4f | 0xaa | 0xc7
     )
 }
 
@@ -6144,6 +6170,63 @@ impl Cpu386 {
             });
         }
         Ok(())
+    }
+
+    /// SYSCALL (0F 05): the K6 fast system-call entry. Saves the return EIP in ECX, jumps
+    /// to the STAR target, and loads fixed flat CS/SS from STAR[47:32] with CPL forced to
+    /// 0. IF and VM are cleared. #UD when EFER.SCE is clear. No privilege or mode checks.
+    fn syscall(&mut self) -> ExecResult<CycleOutcome> {
+        if self.msr.efer & EFER_SCE == 0 {
+            return Err(InternalFault::Exception {
+                vector: 6,
+                error_code: None,
+            });
+        }
+        let star = self.msr.star;
+        // EIP already points past SYSCALL, so it is the return address.
+        let return_eip = self.registers.eip;
+        self.write_gpr32(1, return_eip); // ECX
+        self.registers.eip = star as u32; // STAR[31:0]
+        self.set_flag(FLAG_IF, false);
+        self.set_flag(FLAG_VM, false);
+        // STAR[47:32] is the CS/SS selector base; force the CS RPL to 0 so CPL reads 0.
+        let cs_sel = ((star >> 32) as u16) & 0xfffc;
+        self.registers
+            .set_segment(SegmentIndex::Cs, SegmentRegister::flat(cs_sel, 0x9b));
+        self.registers.set_segment(
+            SegmentIndex::Ss,
+            SegmentRegister::flat(cs_sel.wrapping_add(8), 0x93),
+        );
+        Ok(clocks(10))
+    }
+
+    /// SYSRET (0F 07): the matching return. Restores EIP from ECX and loads flat CS/SS
+    /// from STAR[47:32] with the RPL forced to 3 (SS selector is the base + 16). IF is set.
+    /// #UD when EFER.SCE is clear, #GP(0) outside CPL 0.
+    fn sysret(&mut self) -> ExecResult<CycleOutcome> {
+        if self.msr.efer & EFER_SCE == 0 {
+            return Err(InternalFault::Exception {
+                vector: 6,
+                error_code: None,
+            });
+        }
+        if self.current_privilege_level() != 0 {
+            return Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0),
+            });
+        }
+        let star = self.msr.star;
+        self.registers.eip = self.read_gpr32(1); // ECX -> EIP
+        self.set_flag(FLAG_IF, true);
+        let base = (star >> 32) as u16; // STAR[47:32]
+        let cs_sel = (base & 0xfffc) | 3; // CPL 3
+        let ss_sel = (base.wrapping_add(16) & 0xfffc) | 3; // SS = base + 16, RPL 3
+        self.registers
+            .set_segment(SegmentIndex::Cs, SegmentRegister::flat(cs_sel, 0xfb));
+        self.registers
+            .set_segment(SegmentIndex::Ss, SegmentRegister::flat(ss_sel, 0xf3));
+        Ok(clocks(10))
     }
 
     /// Decode an 8-byte descriptor into a cached segment register. Shared by the
@@ -11944,6 +12027,100 @@ mod tests {
             InternalFault::Exception { vector: 6, .. }
         ));
         assert!(run_at_level(&code, CpuLevel::I586).is_ok());
+    }
+
+    // --- Phase 5 Slice D: SYSCALL/SYSRET and RSM ---
+
+    #[test]
+    fn syscall_jumps_to_star_target_and_loads_flat_segments() {
+        // 0F 05 SYSCALL. STAR: target EIP = 0x0001_0000, CS/SS selector base = 0x08.
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x05], 0x40);
+        cpu.msr.efer = EFER_SCE;
+        cpu.msr.star = (0x0008u64 << 32) | 0x0001_0000;
+        cpu.set_flag(FLAG_IF, true);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.ecx(), 2); // return address (EIP past the 2-byte SYSCALL)
+        assert_eq!(cpu.registers.eip, 0x0001_0000);
+        let cs = cpu.registers.cs();
+        assert_eq!(cs.selector, 0x08);
+        assert_eq!(cs.base, 0);
+        assert_eq!(cs.limit, 0xffff_ffff);
+        assert!(cs.default_size_32);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ss).selector, 0x10); // base + 8
+        assert!(!cpu.flag(FLAG_IF)); // SYSCALL clears IF
+    }
+
+    #[test]
+    fn syscall_is_undefined_opcode_without_sce() {
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x05], 0x20);
+        cpu.msr.efer = 0;
+        let mut bus = TestBus::with_memory(memory);
+        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
+    }
+
+    #[test]
+    fn sysret_returns_to_ecx_with_cpl3_and_sets_if() {
+        // 0F 07 SYSRET. STAR CS/SS base = 0x08; SYSRET forces RPL 3 and SS = base + 16.
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x07], 0x20);
+        cpu.msr.efer = EFER_SCE;
+        cpu.msr.star = 0x0008u64 << 32;
+        cpu.registers.set_ecx(0x0002_0000);
+        cpu.set_flag(FLAG_IF, false);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.eip, 0x0002_0000);
+        assert_eq!(cpu.registers.cs().selector, 0x0b); // 0x08 | 3
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ss).selector, 0x1b); // (0x08 + 16) | 3
+        assert!(cpu.flag(FLAG_IF)); // SYSRET sets IF
+    }
+
+    #[test]
+    fn sysret_is_general_protection_at_cpl3() {
+        let (mut cpu, mut bus) = cpl3_code(&[0x0f, 0x07]);
+        cpu.msr.efer = EFER_SCE;
+        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        assert!(matches!(
+            fault,
+            InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0)
+            }
+        ));
+    }
+
+    #[test]
+    fn sysret_is_undefined_opcode_without_sce() {
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x07], 0x20);
+        cpu.msr.efer = 0;
+        let mut bus = TestBus::with_memory(memory);
+        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
+    }
+
+    #[test]
+    fn rsm_is_undefined_opcode_outside_smm() {
+        // No SMM is modeled, so RSM always faults #UD.
+        let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0xaa], 0x20);
+        let mut bus = TestBus::with_memory(memory);
+        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
+    }
+
+    #[test]
+    fn syscall_is_undefined_opcode_below_586() {
+        // Even with SCE enabled, a throttled 486-level guest sees #UD from the 586 gate.
+        let mut memory = vec![0u8; 64];
+        memory[..2].copy_from_slice(&[0x0f, 0x05]);
+        let mut cpu = Cpu386::default();
+        cpu.set_level(CpuLevel::I486);
+        cpu.msr.efer = EFER_SCE;
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(memory);
+        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
     }
 
     /// Run a single instruction from `code` at the given level and return the result.
