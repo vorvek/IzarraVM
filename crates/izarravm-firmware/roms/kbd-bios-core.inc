@@ -149,6 +149,12 @@ int16:
     je .flags
     cmp ah, 0x05        ; keyboard buffer write
     je .bufwrite
+    cmp ah, 0x03        ; set typematic rate and delay
+    je .typematic
+    cmp ah, 0x09        ; get keyboard functionality
+    je .funcs
+    cmp ah, 0x0a        ; get keyboard id
+    je .kbid
     iret
 .read:
     sti
@@ -225,6 +231,74 @@ int16:
     pop bx
     pop ds
     mov al, 0x01
+    iret
+.typematic:
+    ; AH=03h set typematic rate and delay. AL selects the sub-function:
+    ;   00h default rate/delay, 01h..04h on/off and click variants -> return
+    ;   cleanly, 05h program rate from BL (low 5 bits) and delay from BH (bits
+    ;   6-5). Only 05h touches the keyboard; the rest are accepted no-ops so a
+    ;   caller that just wants the default does not fault.
+    cmp al, 0x05
+    jne .typ_done
+    push ax
+    push bx
+    ; The 0xF3 command and its rate byte each draw an ACK (0xFA) through the
+    ; keyboard output buffer, which arms IRQ1. Mask IRQ1 and run with interrupts
+    ; off so INT 09h cannot read the ACK and mistake it for a scancode, then
+    ; drain each ACK ourselves.
+    pushf
+    cli
+    in al, 0x21
+    push ax                 ; save the live master PIC mask
+    or al, 0x02             ; mask IRQ1
+    out 0x21, al
+    mov al, 0xf3            ; keyboard command: set typematic rate/delay
+    out 0x60, al
+    call .typ_drain
+    ; Build the rate byte: BL low 5 bits are the repeat rate, BH bits 6-5 the
+    ; initial delay. Mask each to its field and OR them.
+    mov al, bl
+    and al, 0x1f
+    mov ah, bh
+    and ah, 0x60
+    or al, ah
+    out 0x60, al            ; rate/delay parameter
+    call .typ_drain
+    pop ax                  ; AL = saved PIC mask
+    out 0x21, al
+    popf
+    pop bx
+    pop ax
+.typ_done:
+    clc
+    iret
+; .typ_drain: read and discard a pending keyboard byte (the 0xFA ACK). Bounded.
+; Skips an AUX byte so a mouse report is left for its owner. Clobbers AX, CX.
+.typ_drain:
+    mov cx, 16
+.typ_spin:
+    in al, 0x64
+    mov ah, al
+    test al, 0x01           ; output buffer full?
+    jz .typ_drained
+    test ah, 0x20           ; AUX byte? leave it
+    jnz .typ_drained
+    in al, 0x60             ; discard the keyboard ACK
+    loop .typ_spin
+.typ_drained:
+    ret
+.funcs:
+    ; AH=09h get keyboard functionality. AL = a bitmap of the INT 16h functions
+    ; present (RBIL table 00585): bit 0 AX=0300h, bit 1 AX=0304h, bit 2 AX=0305h,
+    ; bit 4 AH=0Ah, bit 5 AH=10h-12h. Bit 3 (AX=0306h) and bit 6 (122-key) are
+    ; not implemented, so they stay clear.
+    mov al, 0x37
+    xor ah, ah
+    iret
+.kbid:
+    ; AH=0Ah get keyboard ID. BX = MF2 enhanced-keyboard ID (BH=0xAB, BL=0x41).
+    mov bx, 0xab41
+    clc
     iret
 
 ; BDA ring enqueue: AX = scancode:ascii
