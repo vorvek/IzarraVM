@@ -1143,15 +1143,51 @@ impl Machine {
     /// fit the 16-bit AX return; other subfunctions report CF set (unsupported).
     fn handle_int15(&mut self) {
         let ah = (self.cpu.registers.eax() as u16 >> 8) as u8;
-        if ah == 0x88 {
-            let extended_kib = u32::from(self.profile.memory_mib.saturating_sub(1)) * 1024;
-            let value = extended_kib.min(0xFFFF) as u16;
-            let eax = (self.cpu.registers.eax() & !0xFFFF) | u32::from(value);
-            self.cpu.registers.set_eax(eax);
-            self.set_int_frame_carry(false);
-        } else {
-            self.set_int_frame_carry(true);
+        match ah {
+            // AH=88h extended memory size in KiB (existing behavior).
+            0x88 => {
+                let extended_kib = u32::from(self.profile.memory_mib.saturating_sub(1)) * 1024;
+                let value = extended_kib.min(0xFFFF) as u16;
+                let eax = (self.cpu.registers.eax() & !0xFFFF) | u32::from(value);
+                self.cpu.registers.set_eax(eax);
+                self.set_int_frame_carry(false);
+            }
+            // AH=86h WAIT: CX:DX microseconds. Convert to seconds and stall.
+            0x86 => {
+                let micros = (u64::from(self.cpu.registers.ecx() as u16) << 16)
+                    | u64::from(self.cpu.registers.edx() as u16);
+                self.stall_for(micros as f64 / 1_000_000.0);
+                self.set_eax_ah(0x00);
+                self.set_int_frame_carry(false);
+            }
+            // AH=87h block move: ES:SI -> GDT; copy CX words src->dst across 1 MB.
+            0x87 => self.int15_block_move(),
+            _ => self.set_int_frame_carry(true),
         }
+    }
+
+    /// INT 15h AH=87h. ES:SI points at a 48-byte GDT the caller built; the source
+    /// descriptor is at +0x10 and the destination at +0x18. Each descriptor holds
+    /// a 24-bit base across bytes 2,3,4 and the high 8 bits at byte 7. Copies CX
+    /// words. This is the standard path HIMEM and DOS extenders use to reach
+    /// extended memory from real mode.
+    fn int15_block_move(&mut self) {
+        let es = self.cpu.registers.segment(SegmentIndex::Es).base;
+        let si = self.cpu.registers.esi() as u16;
+        let gdt = es.wrapping_add(u32::from(si));
+        let base_at = |s: &mut Self, desc: u32| -> u32 {
+            u32::from(s.read_physical_u8(desc + 2))
+                | (u32::from(s.read_physical_u8(desc + 3)) << 8)
+                | (u32::from(s.read_physical_u8(desc + 4)) << 16)
+                | (u32::from(s.read_physical_u8(desc + 7)) << 24)
+        };
+        let src = base_at(self, gdt + 0x10);
+        let dst = base_at(self, gdt + 0x18);
+        let bytes = usize::from(self.cpu.registers.ecx() as u16) * 2;
+        let data = self.read_guest_block(src, bytes);
+        self.write_guest_block(dst, &data);
+        self.set_eax_ah(0x00);
+        self.set_int_frame_carry(false);
     }
 
     /// Service INT 1Ah. AH=00h/01h read and set the BDA timer tick the ROM int08
@@ -4112,6 +4148,66 @@ mod tests {
             | (u16::from(machine.read_physical_u8(0x0503)) << 8);
         assert_eq!(time_cx, 0x1345, "CH=hour BCD, CL=minute BCD");
         assert_eq!(time_dx, 0x3000, "DH=second BCD, DL=0");
+    }
+
+    #[test]
+    fn int15_ah87_block_move_across_1mb() {
+        // Build a GDT in low RAM with source = 0x20000, dest = 0x30000, move 4 words.
+        let rom = rom_with_code(&[
+            0xB4, 0x87, // mov ah,87h
+            0xB9, 0x04, 0x00, // mov cx,4 (words)
+            0xBE, 0x00, 0x10, // mov si,1000h (GDT offset)
+            0xCD, 0x15, 0xF4,
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        // ES = 0 so the GDT sits at linear 0x1000. Descriptors at +0x10 (src), +0x18 (dst).
+        let gdt = 0x1000u32;
+        let write_desc = |m: &mut Machine, at: u32, base: u32| {
+            m.write_physical_u8(at, 0xFF); // limit low
+            m.write_physical_u8(at + 1, 0xFF);
+            m.write_physical_u8(at + 2, base as u8); // base 0..7
+            m.write_physical_u8(at + 3, (base >> 8) as u8); // base 8..15
+            m.write_physical_u8(at + 4, (base >> 16) as u8); // base 16..23
+            m.write_physical_u8(at + 5, 0x93); // access
+            m.write_physical_u8(at + 6, 0x00);
+            m.write_physical_u8(at + 7, (base >> 24) as u8); // base 24..31
+        };
+        write_desc(&mut machine, gdt + 0x10, 0x20000);
+        write_desc(&mut machine, gdt + 0x18, 0x30000);
+        for i in 0..8u32 {
+            machine.write_physical_u8(0x20000 + i, 0xA0 + i as u8);
+        }
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        for i in 0..8u32 {
+            assert_eq!(machine.read_physical_u8(0x30000 + i), 0xA0 + i as u8);
+        }
+        assert_eq!(
+            (machine.cpu().registers.eax() as u16 >> 8) as u8,
+            0x00,
+            "AH=0 success"
+        );
+    }
+
+    #[test]
+    fn int15_ah86_wait_advances_guest_clock() {
+        let rom = rom_with_code(&[
+            0xB4, 0x86, 0xB9, 0x00, 0x00, // CX=0
+            0xBA, 0x40, 0x42, // DX=0x4240 -> with CX=0 that is 16960 us
+            0xCD, 0x15, 0xF4,
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        let before = machine.elapsed_clocks();
+        let reason = machine.run_until_halt_or_cycles(10_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert!(
+            machine.elapsed_clocks() > before,
+            "AH=86h stalled the guest clock"
+        );
+        let flags = machine.cpu().registers.eflags;
+        assert_eq!(flags & 0x0001, 0, "CF clear after WAIT");
     }
 
     #[test]
