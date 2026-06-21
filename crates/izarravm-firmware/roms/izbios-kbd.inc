@@ -60,6 +60,8 @@ int09:
     je .set_lshift
     cmp bl, 0x36
     je .set_rshift
+    cmp bl, 0x1d
+    je .set_ctrl
     push cx
     push si
     mov ax, BDA_SEG
@@ -79,6 +81,18 @@ int09:
     movzx cx, bl                    ; CX = scancode
     add si, cx
     mov al, [cs:si]                 ; AL = ASCII (0 if none)
+    ; Ctrl + letter -> control code (Ctrl-A = 1 .. Ctrl-Z = 26), as a real BIOS
+    ; does, so a full-screen program reads Ctrl-S as ASCII 0x13 from INT 16h.
+    test byte [KB_FLAGS], 0x04
+    jz .enqueue
+    mov ah, al
+    and ah, 0xdf                    ; fold case for the A..Z range test
+    cmp ah, 'A'
+    jb .enqueue
+    cmp ah, 'Z'
+    ja .enqueue
+    and al, 0x1f
+.enqueue:
     mov ah, bl                      ; AH = scancode
     call kb_enqueue
     pop si
@@ -94,17 +108,29 @@ int09:
     mov ds, ax
     or byte [KB_FLAGS], 0x01
     jmp .eoi
+.set_ctrl:
+    mov ax, BDA_SEG
+    mov ds, ax
+    or byte [KB_FLAGS], 0x04
+    jmp .eoi
 .break:
     and bl, 0x7f
     cmp bl, 0x2a
     je .clr_lshift
     cmp bl, 0x36
     je .clr_rshift
+    cmp bl, 0x1d
+    je .clr_ctrl
     jmp .eoi
 .clr_lshift:
     mov ax, BDA_SEG
     mov ds, ax
     and byte [KB_FLAGS], 0xfd
+    jmp .eoi
+.clr_ctrl:
+    mov ax, BDA_SEG
+    mov ds, ax
+    and byte [KB_FLAGS], 0xfb
     jmp .eoi
 .clr_rshift:
     mov ax, BDA_SEG

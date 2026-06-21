@@ -12,11 +12,13 @@ int09:
     mov bl, al
     test bl, 0x80          ; break code? update shift state, do not enqueue
     jnz .break
-    ; Make of a shift key sets the held bit; shift keys never enqueue ASCII.
+    ; Make of a shift/Ctrl key sets the held bit and never enqueues ASCII.
     cmp bl, 0x2a
     je .set_lshift
     cmp bl, 0x36
     je .set_rshift
+    cmp bl, 0x1d
+    je .set_ctrl
     ; Map scancode -> ASCII using the shift state, then enqueue (scancode:ascii).
     push cx
     push si
@@ -28,6 +30,18 @@ int09:
     jz .have_ascii
     mov al, [cs:scan2ascii_shift + si]
 .have_ascii:
+    ; Ctrl + letter -> control code (Ctrl-A = 1 .. Ctrl-Z = 26), as a real BIOS
+    ; does, so a full-screen program reads Ctrl-S as ASCII 0x13 from INT 16h.
+    test byte [KB_FLAGS], 0x04
+    jz .enqueue
+    mov ah, al
+    and ah, 0xdf                   ; fold case for the A..Z range test
+    cmp ah, 'A'
+    jb .enqueue
+    cmp ah, 'Z'
+    ja .enqueue
+    and al, 0x1f
+.enqueue:
     mov ah, bl                     ; scancode in AH, ASCII in AL
     call kb_enqueue
     pop si
@@ -43,18 +57,30 @@ int09:
     mov ds, ax
     or byte [KB_FLAGS], 0x01
     jmp .eoi
+.set_ctrl:
+    mov ax, 0x0040
+    mov ds, ax
+    or byte [KB_FLAGS], 0x04
+    jmp .eoi
 .break:
     and bl, 0x7f
-    ; Left shift (0x2a) / right shift (0x36): clear the held bit on break.
+    ; Left shift (0x2a) / right shift (0x36) / Ctrl (0x1d): clear the held bit.
     cmp bl, 0x2a
     je .clr_lshift
     cmp bl, 0x36
     je .clr_rshift
+    cmp bl, 0x1d
+    je .clr_ctrl
     jmp .eoi
 .clr_lshift:
     mov ax, 0x0040
     mov ds, ax
     and byte [KB_FLAGS], 0xfd
+    jmp .eoi
+.clr_ctrl:
+    mov ax, 0x0040
+    mov ds, ax
+    and byte [KB_FLAGS], 0xfb
     jmp .eoi
 .clr_rshift:
     mov ax, 0x0040

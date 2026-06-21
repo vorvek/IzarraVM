@@ -318,6 +318,24 @@ int t_getkey(void)
     return (int)r.h.al;
 }
 
+int t_readkey16(void)
+{
+    union REGS r;
+    r.h.ah = 0x00; /* read keystroke: AH=scancode, AL=ASCII */
+    int86(0x16, &r, &r);
+    return (int)r.x.ax;
+}
+
+void t_setcursor(int row, int col)
+{
+    union REGS r;
+    r.h.ah = 0x02;
+    r.h.bh = 0; /* page 0 */
+    r.h.dh = (unsigned char)row;
+    r.h.dl = (unsigned char)col;
+    int86(0x10, &r, &r);
+}
+
 int t_exists(const char *path)
 {
     unsigned char dta[43];

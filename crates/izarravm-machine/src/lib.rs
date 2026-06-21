@@ -3441,6 +3441,37 @@ mod tests {
         assert!(machine.irq1_pending(), "injecting a key requests IRQ1");
     }
 
+    /// Run a .COM that reads one key via INT 16h AH=00h and stores AX at DS:0x200,
+    /// after injecting `scancodes`. Returns the value INT 16h handed the program.
+    /// This is the editor's keyboard path end to end: 8042 -> IRQ1 -> INT 09h ISR
+    /// -> BDA ring -> INT 16h read.
+    fn int16_read_after(scancodes: &[u8]) -> u16 {
+        // mov ah,0; int 16h; mov [0x200],ax; int 20h
+        const PROG: [u8; 9] = [0xB4, 0x00, 0xCD, 0x16, 0xA3, 0x00, 0x02, 0xCD, 0x20];
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
+                .unwrap();
+        machine.inject_key_scancodes(scancodes);
+        machine.run_until_halt_or_cycles(3_000_000).unwrap();
+        read_u16(&mut machine, (u32::from(DOS_LOAD_SEGMENT) << 4) + 0x200)
+    }
+
+    #[test]
+    fn int16_returns_extended_scancode_for_up_arrow() {
+        // Up arrow is the bare scancode 0x48 (make) / 0xC8 (break); no 0xE0 prefix.
+        // The layout table has no ASCII for it, so INT 16h returns scancode 0x48
+        // with ASCII 0 -- the value a full-screen editor keys arrow navigation off.
+        assert_eq!(int16_read_after(&[0x48, 0xC8]), 0x4800);
+    }
+
+    #[test]
+    fn int16_emits_control_code_for_ctrl_s() {
+        // Ctrl down, S, S up, Ctrl up. Holding Ctrl turns S into the DC3 control
+        // code (0x13), the way a real BIOS does, so the editor reads Ctrl-S as a
+        // single ring entry (scancode 0x1f, ASCII 0x13) with no modifier polling.
+        assert_eq!(int16_read_after(&[0x1d, 0x1f, 0x9f, 0x9d]), 0x1f13);
+    }
+
     #[test]
     fn io_port_reports_last_post_write() {
         // mov al,0x42; out 0x80,al; hlt
@@ -8018,6 +8049,84 @@ mod tests {
         assert!(
             text.contains("Izarra BASIC"),
             "the BASIC alias ran IBASIC; got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn toka_editor_opens_edits_and_saves_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = izarravm_firmware::toka_dos_system_files();
+        izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format)
+            .unwrap();
+        std::fs::write(dir.path().join("NOTE.TXT"), "hello\r\n").unwrap();
+
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .unwrap();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        machine.set_toka_c_root(dir.path().to_path_buf());
+        machine.run_until_halt_or_cycles(22_000_000).unwrap();
+
+        // Type printable text through the existing US-layout helper.
+        let type_text = |machine: &mut Machine, text: &str| {
+            for ch in text.chars() {
+                for code in toka_key_codes(ch) {
+                    machine.inject_key_scancodes(&[code]);
+                }
+                machine.run_until_halt_or_cycles(400_000).unwrap();
+            }
+        };
+        // Press one key by make scancode (make + break) and let it settle.
+        let press = |machine: &mut Machine, make: u8| {
+            machine.inject_key_scancodes(&[make, make | 0x80]);
+            machine.run_until_halt_or_cycles(800_000).unwrap();
+        };
+
+        // Launch the editor on NOTE.TXT and give it time to load and redraw.
+        type_text(&mut machine, "EDITOR NOTE.TXT");
+        press(&mut machine, 0x1c); // Enter runs the command
+        machine.run_until_halt_or_cycles(10_000_000).unwrap();
+
+        let opened = machine.screen_text().as_text();
+        assert!(
+            opened.contains("hello"),
+            "the editor opened the file on screen; got:\n{opened}"
+        );
+
+        // Move to end of line with End, then append " world". The editor redraws
+        // the whole screen per key, so let it drain the ring before reading back.
+        press(&mut machine, 0x4f); // End
+        type_text(&mut machine, " world");
+        machine.run_until_halt_or_cycles(6_000_000).unwrap();
+        let edited = machine.screen_text().as_text();
+        assert!(
+            edited.contains("hello world"),
+            "the typed edit shows on screen; got:\n{edited}"
+        );
+
+        // Left arrow moves the cursor back one cell; typing there proves arrow
+        // navigation drives the edit point. "hello world" -> "hello worlXd".
+        press(&mut machine, 0x4b); // Left
+        type_text(&mut machine, "X");
+        machine.run_until_halt_or_cycles(3_000_000).unwrap();
+        let arrowed = machine.screen_text().as_text();
+        assert!(
+            arrowed.contains("hello worlXd"),
+            "Left arrow positioned the cursor for the insert; got:\n{arrowed}"
+        );
+
+        // Ctrl-S saves, then Esc quits (no longer dirty, so it exits at once).
+        machine.inject_key_scancodes(&[0x1d, 0x1f, 0x9f, 0x9d]);
+        machine.run_until_halt_or_cycles(6_000_000).unwrap();
+        press(&mut machine, 0x01); // Esc
+        machine.run_until_halt_or_cycles(6_000_000).unwrap();
+
+        let saved = std::fs::read_to_string(dir.path().join("NOTE.TXT")).unwrap();
+        assert!(
+            saved.contains("hello worlXd"),
+            "the file was saved with the edit; got: {saved:?}"
         );
     }
 
