@@ -953,6 +953,13 @@ impl Machine {
             self.handle_int10_font(al);
             return;
         }
+        if matches!(
+            ah,
+            0x01 | 0x02 | 0x03 | 0x06 | 0x07 | 0x08 | 0x09 | 0x0A | 0x0E
+        ) {
+            self.handle_int10_text(ah);
+            return;
+        }
         if ah == 0x0f {
             let mode = self.read_physical_u8(0x449);
             let cols = self.read_guest_word(0x44a);
@@ -978,6 +985,137 @@ impl Machine {
         let _ = self.memory.write_u16(0x44a, columns);
         let _ = self.memory.write_u8(0x484, rows.saturating_sub(1));
         let _ = self.memory.write_u16(0x463, 0x03d4); // VGA CRTC base port
+    }
+
+    /// INT 10h text-mode output and cursor services. Operates on the same VGA text
+    /// framebuffer and BDA cursor (0040:0050) the teletype helper uses. Page
+    /// arguments are ignored: this BIOS renders page 0 only.
+    fn handle_int10_text(&mut self, ah: u8) {
+        let ax = self.cpu.registers.eax() as u16;
+        let al = ax as u8;
+        let bx = self.cpu.registers.ebx() as u16;
+        let bl = bx as u8;
+        let cx = self.cpu.registers.ecx() as u16;
+        let dx = self.cpu.registers.edx() as u16;
+        let dl = dx as u8;
+        let dh = (dx >> 8) as u8;
+        match ah {
+            // AH=01h set cursor shape: store CX in the BDA cursor-type word.
+            0x01 => {
+                let _ = self.memory.write_u16(0x460, cx);
+            }
+            // AH=02h set cursor position: DH=row, DL=col.
+            0x02 => {
+                let _ = self
+                    .memory
+                    .write_u16(0x450, (u16::from(dh) << 8) | u16::from(dl));
+                self.video
+                    .set_cursor_offset(u16::from(dh) * 80 + u16::from(dl));
+            }
+            // AH=03h get cursor position and shape.
+            0x03 => {
+                let pos = self.read_guest_word(0x450);
+                let edx = (self.cpu.registers.edx() & !0xFFFF) | u32::from(pos);
+                self.cpu.registers.set_edx(edx);
+                let shape = self.read_guest_word(0x460);
+                let shape = if shape == 0 { 0x0607 } else { shape };
+                let ecx = (self.cpu.registers.ecx() & !0xFFFF) | u32::from(shape);
+                self.cpu.registers.set_ecx(ecx);
+            }
+            // AH=06h/07h scroll the window up/down. AL=0 blanks it.
+            0x06 | 0x07 => self.scroll_window(ah == 0x06, al, bx >> 8, cx, dx),
+            // AH=08h read char+attr at the cursor.
+            0x08 => {
+                let pos = self.read_guest_word(0x450);
+                let off = (usize::from(pos >> 8) * 80 + usize::from(pos & 0xff)) * 2;
+                let ch = self.video.read_u8(off).unwrap_or(b' ');
+                let at = self.video.read_u8(off + 1).unwrap_or(0x07);
+                let eax =
+                    (self.cpu.registers.eax() & !0xFFFF) | (u32::from(at) << 8) | u32::from(ch);
+                self.cpu.registers.set_eax(eax);
+            }
+            // AH=09h write char+attr, AH=0Ah write char only, CX times, no advance.
+            0x09 | 0x0A => {
+                let pos = self.read_guest_word(0x450);
+                let base = (usize::from(pos >> 8) * 80 + usize::from(pos & 0xff)) * 2;
+                for i in 0..usize::from(cx) {
+                    let off = base + i * 2;
+                    let _ = self.video.write_u8(off, al);
+                    if ah == 0x09 {
+                        let _ = self.video.write_u8(off + 1, bl);
+                    }
+                }
+            }
+            // AH=0Eh teletype.
+            0x0E => self.teletype_char(al),
+            _ => {}
+        }
+    }
+
+    /// Scroll a text window. `up` selects direction; `lines`==0 blanks the whole
+    /// window. `attr` fills the vacated rows; `cx`=top-left (CH row, CL col),
+    /// `dx`=bottom-right (DH row, DL col). Clamped to the 80x25 screen.
+    fn scroll_window(&mut self, up: bool, lines: u8, attr: u16, cx: u16, dx: u16) {
+        let attr = attr as u8;
+        let top = usize::from((cx >> 8) as u8).min(24);
+        let left = usize::from(cx as u8).min(79);
+        let bottom = usize::from((dx >> 8) as u8).min(24).max(top);
+        let right = usize::from(dx as u8).min(79).max(left);
+        let height = bottom - top + 1;
+        let n = if lines == 0 {
+            height
+        } else {
+            usize::from(lines)
+        };
+        if n >= height {
+            for row in top..=bottom {
+                self.blank_text_row(row, left, right, attr);
+            }
+            return;
+        }
+        if up {
+            for row in top..=(bottom - n) {
+                self.copy_text_row(row + n, row, left, right, attr);
+            }
+            for row in (bottom - n + 1)..=bottom {
+                self.blank_text_row(row, left, right, attr);
+            }
+        } else {
+            for row in ((top + n)..=bottom).rev() {
+                self.copy_text_row(row - n, row, left, right, attr);
+            }
+            for row in top..(top + n) {
+                self.blank_text_row(row, left, right, attr);
+            }
+        }
+    }
+
+    /// Copy a span of text cells from `src_row` to `dst_row` (inclusive columns).
+    fn copy_text_row(
+        &mut self,
+        src_row: usize,
+        dst_row: usize,
+        left: usize,
+        right: usize,
+        attr: u8,
+    ) {
+        for col in left..=right {
+            let src = (src_row * 80 + col) * 2;
+            let dst = (dst_row * 80 + col) * 2;
+            let b0 = self.video.read_u8(src).unwrap_or(b' ');
+            let b1 = self.video.read_u8(src + 1).unwrap_or(attr);
+            let _ = self.video.write_u8(dst, b0);
+            let _ = self.video.write_u8(dst + 1, b1);
+        }
+    }
+
+    /// Blank a span of text cells to spaces with `attr` (inclusive columns).
+    fn blank_text_row(&mut self, row: usize, left: usize, right: usize, attr: u8) {
+        for col in left..=right {
+            let off = (row * 80 + col) * 2;
+            let _ = self.video.write_u8(off, b' ');
+            let _ = self.video.write_u8(off + 1, attr);
+        }
     }
 
     /// Service INT 11h (GET EQUIPMENT LIST). Returns the BDA equipment word in AX,
@@ -6152,6 +6290,55 @@ mod tests {
         assert_eq!(reason, StopReason::Halted);
         // The first glyph (solid) loaded and renders as the foreground.
         assert_eq!(machine.video().render_text_row(0)[0], 15);
+    }
+
+    #[test]
+    fn int10_teletype_and_cursor() {
+        let rom = rom_with_code(&[
+            0xB8, 0x03, 0x00, 0xCD, 0x10, // set text mode 03h (homes cursor)
+            0xB4, 0x0E, 0xB0, b'H', 0xCD, 0x10, // AH=0Eh teletype 'H'
+            0xB4, 0x0E, 0xB0, b'i', 0xCD, 0x10, // AH=0Eh teletype 'i'
+            0xB4, 0x03, 0xB7, 0x00, 0xCD, 0x10, // AH=03h get cursor (page 0)
+            0xF4,
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        // 'H' then 'i' landed at row 0 cols 0,1; cursor now at row 0 col 2.
+        assert_eq!(machine.read_physical_u8(VGA_TEXT_BASE), b'H');
+        assert_eq!(machine.read_physical_u8(VGA_TEXT_BASE + 2), b'i');
+        let dx = machine.cpu().registers.edx() as u16;
+        assert_eq!(dx, 0x0002, "DH=row 0, DL=col 2");
+    }
+
+    #[test]
+    fn int10_scroll_window_up_blanks_bottom() {
+        // No mode set here: setting a text mode clears the framebuffer, which
+        // would wipe the marker the host seeds below before the scroll runs.
+        let rom = rom_with_code(&[
+            0xB8, 0x01, 0x06, // mov ax,0601h (AH=06h scroll up 1 line)
+            0xB7, 0x07, // mov bh,07h (fill attr)
+            0xB9, 0x00, 0x00, // mov cx,0000h (top-left 0,0)
+            0xBA, 0x4F, 0x18, // mov dx,184Fh (bottom-right row 24 col 79)
+            0xCD, 0x10, 0xF4,
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        // Put a non-space at row 1 col 0; after scroll-up by 1 it lands at row 0.
+        machine.write_physical_u8(VGA_TEXT_BASE + 80 * 2, b'X');
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(
+            machine.read_physical_u8(VGA_TEXT_BASE),
+            b'X',
+            "row 1 scrolled to row 0"
+        );
+        assert_eq!(
+            machine.read_physical_u8(VGA_TEXT_BASE + 24 * 80 * 2),
+            b' ',
+            "bottom row blanked"
+        );
     }
 
     #[test]
