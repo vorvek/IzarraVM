@@ -361,9 +361,11 @@ impl Keyboard8042 {
                     0xAB => self.respond_immediately(0x00), // keyboard interface test OK
                     0xA9 => self.respond_immediately(0x00), // aux (mouse) interface test OK
                     0x20 => {
-                        // read command byte -> output buffer
-                        self.queue.push_front(self.command_byte);
-                        self.latch_next();
+                        // Read command byte. This is a controller-generated response, so it
+                        // goes straight to the output buffer and is not held back by the
+                        // keyboard-disable bit the way a queued scancode would be.
+                        let cb = self.command_byte;
+                        self.respond_immediately(cb);
                     }
                     0x60 => self.expecting_command_data = Some(0x60), // write command byte
                     0xA7 => self.command_byte |= 0x20, // disable aux (mouse): set bit5
@@ -573,6 +575,18 @@ mod tests {
         let mut kbd = Keyboard8042::default();
         kbd.write_port(0x64, 0xA9); // aux/mouse interface test
         assert_eq!(kbd.read_port(0x60), Some(0x00), "0xA9 reports no error");
+    }
+
+    #[test]
+    fn read_command_byte_is_not_blocked_by_keyboard_disable() {
+        // The BIOS idiom disables the keyboard (0xAD, command-byte bit4) before reading
+        // the command byte. The 0x20 controller response must still reach the output
+        // buffer, since the disable bit only holds back queued scancodes.
+        let mut kbd = Keyboard8042::default();
+        kbd.write_port(0x64, 0x60); // write command byte
+        kbd.write_port(0x60, 0x10); // bit4 set: keyboard clock disabled
+        kbd.write_port(0x64, 0x20); // read command byte
+        assert_eq!(kbd.read_port(0x60), Some(0x10));
     }
 
     // Slice D: keyboard-device command set on the 0x60 non-data path.
