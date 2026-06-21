@@ -4429,9 +4429,39 @@ fn seed_bios_config_table(memory: &mut Memory) -> Result<(), BusError> {
 }
 
 impl MachineBus<'_> {
+    /// The plane-window offset for an access that the guest-selected GC06 graphics
+    /// aperture redirects, or None when the access is not in a moved graphics
+    /// window. Only graphics modes consult the aperture; text and CGA keep the
+    /// fixed B8000 decode. A power-on / default (128 KB) aperture is left to the
+    /// fixed A0000 routing so every mode's default behavior is unchanged.
+    fn vga_gfx_offset(&self, address: u32, width: usize) -> Option<usize> {
+        match self.video.active_mode() {
+            VideoMode::Planar | VideoMode::ModeX | VideoMode::Mode13h => {
+                let ap = self.video.gfx_aperture();
+                vga_gfx_aperture_offset(ap.base, ap.length, address, width)
+            }
+            VideoMode::Text | VideoMode::Cga => None,
+        }
+    }
+
     fn read_memory_bytes(&mut self, address: u32, width: usize) -> Result<Vec<u8>, BusError> {
         if let Some(offset) = rom_offset(address, width) {
             return Ok(self.rom[offset..offset + width].to_vec());
+        }
+
+        // A guest that moves the graphics aperture through GC06 (memory map select)
+        // redirects the framebuffer window. When the active mode is a graphics mode
+        // and GC06 points at a moved window, route the access through the planar /
+        // chain-4 datapath before the fixed text/CGA window decode below.
+        if let Some(offset) = self.vga_gfx_offset(address, width) {
+            return Ok(match self.video.active_mode() {
+                VideoMode::Mode13h => (0..width)
+                    .map(|i| self.video.cpu_read_chain4(offset + i))
+                    .collect(),
+                _ => (0..width)
+                    .map(|i| self.video.cpu_read(offset + i))
+                    .collect(),
+            });
         }
 
         if let Some(offset) = video_text_offset(address, width) {
@@ -4499,6 +4529,17 @@ impl MachineBus<'_> {
             return Ok(());
         }
 
+        // A guest that moves the graphics aperture through GC06 redirects the
+        // framebuffer window; route through the planar / chain-4 write datapath
+        // before the fixed text/CGA window decode below.
+        if let Some(offset) = self.vga_gfx_offset(address, 1) {
+            match self.video.active_mode() {
+                VideoMode::Mode13h => self.video.cpu_write_chain4(offset, value),
+                _ => self.video.cpu_write(offset, value),
+            }
+            return Ok(());
+        }
+
         if let Some(offset) = video_text_offset(address, 1) {
             // In a CGA graphics mode the B800 aperture is the 16 KiB CGA
             // framebuffer; in text mode it is the character/attribute buffer.
@@ -4551,7 +4592,8 @@ impl MachineBus<'_> {
     fn memory_wait_states(&self, address: u32) -> u8 {
         if rom_offset(address, 1).is_some() {
             self.wait_states.rom
-        } else if video_text_offset(address, 1).is_some()
+        } else if self.vga_gfx_offset(address, 1).is_some()
+            || video_text_offset(address, 1).is_some()
             || vga_planar_offset(address, 1).is_some()
             || margo_lfb_offset(address, 1).is_some()
             || margo_mmio_offset(address, 1).is_some()
@@ -4598,6 +4640,36 @@ fn vga_planar_offset(address: u32, width: usize) -> Option<usize> {
     let end = VGA_MODE13H_BASE + VGA_PLANAR_WINDOW_SIZE;
     if (VGA_MODE13H_BASE..end).contains(&address) && address + width as u32 <= end {
         Some((address - VGA_MODE13H_BASE) as usize)
+    } else {
+        None
+    }
+}
+
+/// The graphics-mode CPU window the guest selected through Graphics Controller
+/// register 06h (memory map select), as a plane-window offset for the VGA
+/// datapath. Returns Some(offset) when the access falls in a guest-moved aperture
+/// that the fixed A0000 window does not already cover.
+///
+/// The aperture's `base`/`length` come from `Vga::gfx_aperture`. The plane window
+/// is 64 KB, so the offset is `address - base` capped to that window; a 128 KB
+/// aperture is clamped to the low 64 KB the datapath addresses.
+// ponytail: the power-on / map-select-00 aperture (A0000, 128 KB) is left to the
+// fixed A0000 64 KB routing, so the default behavior of every mode is byte-for-
+// byte unchanged. Only a guest that programs a smaller, moved window (64 KB at
+// A0000, or 32 KB at B0000 / B8000) is routed here. Power-on and an explicit
+// 128 KB selection are indistinguishable (both read misc bits 3-2 as 00), so the
+// rarely used full-128 KB decode stays on the legacy path rather than extending
+// graphics routing across B0000-BFFFF.
+fn vga_gfx_aperture_offset(base: u32, length: u32, address: u32, width: usize) -> Option<usize> {
+    // A 128 KB window is the default/legacy decode; do not reroute it here.
+    if length >= VGA_PLANAR_WINDOW_SIZE * 2 {
+        return None;
+    }
+    let end = base + length;
+    if (base..end).contains(&address) && address + width as u32 <= end {
+        let offset = (address - base) as usize;
+        // The planar/chain-4 datapath indexes a 64 KB plane window.
+        (offset + width <= VGA_PLANAR_WINDOW_SIZE as usize).then_some(offset)
     } else {
         None
     }
@@ -9298,6 +9370,56 @@ mod tests {
         machine.video_mut().write_port(0x3CF, 0x02); // plane 2
         assert_eq!(machine.read_physical_u8(0x000A_0000 + 5), 0x9C);
         assert_eq!(machine.read_physical_u8(0x000A_0000 + 0xFB00), 0x3C);
+    }
+
+    #[test]
+    fn gc06_moved_aperture_routes_graphics_access_to_the_vga() {
+        // Mode 13h: the default GC06 leaves the framebuffer at A0000, so an A0000
+        // write still lands in the chain-4 plane (offset 6 -> plane 2, plane-offset
+        // 1). Then move the aperture to the 32 KB B8000 window through GC06 and
+        // confirm a B8000 access now routes to the VGA, while the default A0000
+        // path stays exactly as it was.
+        let mut machine = test_machine();
+        machine.video_mut().set_mode13h();
+        assert_eq!(machine.active_display(), ActiveDisplay::VgaRaster);
+
+        // Default aperture: A0000 access routes to the chain-4 datapath unchanged.
+        machine.write_physical_u8(0x000A_0000 + 6, 0xA5);
+        assert_eq!(
+            machine.video().plane_byte(2, 1),
+            0xA5,
+            "default A0000 window still routes to the VGA"
+        );
+
+        // Move the aperture to B8000 (GC06 memory map select = 0b11, a 32 KB
+        // window): write index 06h then value 0b1100.
+        machine.video_mut().write_port(0x3CE, 0x06);
+        machine.video_mut().write_port(0x3CF, 0b1100);
+        let ap = machine.video().gfx_aperture();
+        assert_eq!((ap.base, ap.length), (0x000B_8000, 0x0000_8000));
+
+        // A B8000 access in the moved window routes to the VGA chain-4 datapath.
+        // Offset 10 -> plane 10 & 3 = 2, plane-offset 10 >> 2 = 2.
+        machine.write_physical_u8(0x000B_8000 + 10, 0x7E);
+        assert_eq!(
+            machine.video().plane_byte(2, 2),
+            0x7E,
+            "the moved B8000 window routes to the VGA, not the text buffer"
+        );
+        // Read-back through the moved window returns the byte from the plane.
+        assert_eq!(machine.read_physical_u8(0x000B_8000 + 10), 0x7E);
+    }
+
+    #[test]
+    fn gc06_default_aperture_keeps_text_routing_at_b8000() {
+        // In text mode the B8000 window is the character buffer regardless of GC06;
+        // the moved-aperture routing only applies to graphics modes. Writing a
+        // char/attr pair at B8000 must reach the text buffer, not a VGA plane.
+        let mut machine = test_machine();
+        machine.write_physical_u8(VGA_TEXT_BASE, b'Z');
+        machine.write_physical_u8(VGA_TEXT_BASE + 1, 0x0F);
+        assert_eq!(machine.read_physical_u8(VGA_TEXT_BASE), b'Z');
+        assert_eq!(machine.read_physical_u8(VGA_TEXT_BASE + 1), 0x0F);
     }
 
     #[test]
