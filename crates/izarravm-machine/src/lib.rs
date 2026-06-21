@@ -237,7 +237,11 @@ pub struct Machine {
     dos: izarravm_dos::DosKernel, // DOS kernel state: open files, drive, stdin/stdout
     rom: Vec<u8>,
     serial: uart::Uart16450,
+    // COM2 (0x2F8-0x2FF, IRQ3). Same UART model as COM1; no host input source.
+    serial2: uart::Uart16450,
     lpt: lpt::Lpt,
+    // LPT2 (0x278-0x27A, IRQ5). Same printer model as LPT1.
+    lpt2: lpt::Lpt,
     device_ports: DevicePorts,
     pic: pic::Pic8259Pair,
     pit: pit::Pit,
@@ -433,7 +437,9 @@ impl Machine {
             dos: izarravm_dos::DosKernel::default(),
             rom,
             serial: uart::Uart16450::default(),
+            serial2: uart::Uart16450::com2(),
             lpt: lpt::Lpt::default(),
+            lpt2: lpt::Lpt::lpt2(),
             device_ports: DevicePorts::default(),
             pic: pic::Pic8259Pair::default(),
             pit: pit::Pit::default(),
@@ -900,7 +906,9 @@ impl Machine {
             margo: &mut self.margo,
             rom: &self.rom,
             serial: &mut self.serial,
+            serial2: &mut self.serial2,
             lpt: &mut self.lpt,
+            lpt2: &mut self.lpt2,
             device_ports: &mut self.device_ports,
             pic: &mut self.pic,
             pit: &mut self.pit,
@@ -3988,6 +3996,9 @@ impl Machine {
         if self.serial.take_irq() {
             self.pic.request(4); // IRQ4: COM1 (0x3F8) has a pending UART interrupt
         }
+        if self.serial2.take_irq() {
+            self.pic.request(3); // IRQ3: COM2 (0x2F8) has a pending UART interrupt
+        }
         if self.keyboard.take_irq12() {
             self.pic.request(12); // IRQ12: mouse output buffer has an aux byte
         }
@@ -3996,6 +4007,9 @@ impl Machine {
             // route to IRQ7, so this line is shared; the LPT only requests it on a
             // real strobed byte with control bit 4 set.
             self.pic.request(7);
+        }
+        if self.lpt2.take_irq() {
+            self.pic.request(5); // IRQ5: LPT2 (0x278) -ACK after a strobed byte
         }
 
         // The floppy disk controller raises IRQ6 on command completion and seek
@@ -4365,7 +4379,9 @@ impl Machine {
                     margo,
                     rom,
                     serial,
+                    serial2,
                     lpt,
+                    lpt2,
                     device_ports,
                     pic,
                     pit,
@@ -4395,7 +4411,9 @@ impl Machine {
                     margo,
                     rom,
                     serial,
+                    serial2,
                     lpt,
+                    lpt2,
                     device_ports,
                     pic,
                     pit,
@@ -4569,7 +4587,9 @@ struct MachineBus<'a> {
     margo: &'a mut Margo,
     rom: &'a [u8],
     serial: &'a mut uart::Uart16450,
+    serial2: &'a mut uart::Uart16450,
     lpt: &'a mut lpt::Lpt,
+    lpt2: &'a mut lpt::Lpt,
     device_ports: &'a mut DevicePorts,
     pic: &'a mut pic::Pic8259Pair,
     pit: &'a mut pit::Pit,
@@ -4695,7 +4715,13 @@ impl CpuBus for MachineBus<'_> {
         if let Some(value) = self.serial.read_port(port) {
             return Ok(u32::from(value));
         }
+        if let Some(value) = self.serial2.read_port(port) {
+            return Ok(u32::from(value));
+        }
         if let Some(value) = self.lpt.read_port(port) {
+            return Ok(u32::from(value));
+        }
+        if let Some(value) = self.lpt2.read_port(port) {
             return Ok(u32::from(value));
         }
         if let Some(value) = self.video.read_port(port) {
@@ -4869,7 +4895,9 @@ impl CpuBus for MachineBus<'_> {
             return Ok(());
         }
         if self.serial.write_port(port, value as u8)
+            || self.serial2.write_port(port, value as u8)
             || self.lpt.write_port(port, value as u8)
+            || self.lpt2.write_port(port, value as u8)
             || self.video.write_port(port, value as u8)
             || self.pit.write_port(port, value as u8)
             || self.pic.write_port(port, value as u8)
@@ -5076,12 +5104,13 @@ fn boot_sector_cpu() -> Cpu386 {
 
 /// BIOS equipment word reported by INT 11h (BDA 0040:0010). Bit 0 set with
 /// bits 7-6 clear means one floppy drive; bits 5-4 = 10b is the 80x25 color
-/// initial video mode; bits 11-9 = 001b advertises one serial port (COM1 is
-/// emulated); bits 15-14 = 01b advertises one parallel printer port (LPT1 is
-/// emulated). Bit 1 (80x87 coprocessor) stays clear: the Izarra 3000 ships no
-/// 387, so software that probes the equipment word skips its FPU path. See RBIL
-/// INT 11h equipment bitfield (dev_docs/reference/rbil/INTERRUP.B).
-const BIOS_EQUIPMENT_WORD: u16 = 0x4221;
+/// initial video mode; bits 11-9 = 010b advertises two serial ports (COM1 and
+/// COM2 are emulated); bits 15-14 = 10b advertises two parallel printer ports
+/// (LPT1 and LPT2 are emulated). Bit 1 (80x87 coprocessor) stays clear: the
+/// Izarra 3000 ships no 387, so software that probes the equipment word skips
+/// its FPU path. See RBIL INT 11h equipment bitfield
+/// (dev_docs/reference/rbil/INTERRUP.B).
+const BIOS_EQUIPMENT_WORD: u16 = 0x8421;
 
 /// Conventional memory size in KiB reported by INT 12h (BDA 0040:0013). A PC
 /// caps usable low memory at 640 KiB no matter how much RAM is installed; the
@@ -5172,15 +5201,16 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     memory.write_u8((usize::from(EBDA_SEGMENT)) << 4, 1)?;
     seed_bios_config_table(memory)?;
     // Serial and parallel port base address tables POST detected (0040:0000 COM1-4,
-    // 0040:0008 LPT1-4). Only COM1 (0x03F8) and LPT1 (0x0378) are wired, matching the
-    // equipment word; the rest read 0 (absent). INT 14h/17h drive the COM1/LPT1 ports,
-    // and software that reads a base straight from the BDA finds it here.
+    // 0040:0008 LPT1-4). COM1 (0x03F8) + COM2 (0x02F8) and LPT1 (0x0378) + LPT2
+    // (0x0278) are wired, matching the equipment word; the rest read 0 (absent).
+    // INT 14h/17h drive the ports, and software that reads a base straight from the
+    // BDA finds it here.
     memory.write_u16(0x400, 0x03f8)?; // COM1 base
-    memory.write_u16(0x402, 0)?; // COM2 absent
+    memory.write_u16(0x402, 0x02f8)?; // COM2 base
     memory.write_u16(0x404, 0)?; // COM3 absent
     memory.write_u16(0x406, 0)?; // COM4 absent
     memory.write_u16(0x408, 0x0378)?; // LPT1 base
-    memory.write_u16(0x40a, 0)?; // LPT2 absent
+    memory.write_u16(0x40a, 0x0278)?; // LPT2 base
     memory.write_u16(0x40c, 0)?; // LPT3 absent
     memory.write_u16(0x40e, 0)?; // LPT4 absent
     // Per-port timeout tables: serial 0040:007C-007F, printer 0040:0078-007B. The
@@ -5869,7 +5899,9 @@ mod tests {
     fn int14_unwired_port_times_out() {
         let mut m = int15_machine(16);
         m.cpu.registers.set_eax(0x0300);
-        m.cpu.registers.set_edx(1); // COM2 is not wired
+        // INT 14h only services COM1 (DX=0); the COM2 hardware exists but the
+        // BIOS service does not drive it, so DX=1 reads as a timeout.
+        m.cpu.registers.set_edx(1);
         m.handle_int14();
         assert_eq!(
             (m.cpu.registers.eax() >> 8) as u8 & 0x80,
@@ -6135,11 +6167,11 @@ mod tests {
     #[test]
     fn bda_seeds_serial_parallel_and_video_state() {
         let m = int15_machine(16);
-        // Serial/parallel base tables: only COM1 and LPT1 are wired.
+        // Serial/parallel base tables: COM1 + COM2 and LPT1 + LPT2 are wired.
         assert_eq!(m.memory.read_u16(0x400).unwrap(), 0x03f8); // COM1
-        assert_eq!(m.memory.read_u16(0x402).unwrap(), 0); // COM2 absent
+        assert_eq!(m.memory.read_u16(0x402).unwrap(), 0x02f8); // COM2
         assert_eq!(m.memory.read_u16(0x408).unwrap(), 0x0378); // LPT1
-        assert_eq!(m.memory.read_u16(0x40a).unwrap(), 0); // LPT2 absent
+        assert_eq!(m.memory.read_u16(0x40a).unwrap(), 0x0278); // LPT2
         // Timeout tables across all four ports each.
         assert_eq!(m.memory.read_u8(0x47f).unwrap(), 0x01); // COM4 timeout
         assert_eq!(m.memory.read_u8(0x47b).unwrap(), 0x14); // LPT4 timeout
@@ -6148,6 +6180,29 @@ mod tests {
         assert_eq!(m.memory.read_u8(0x485).unwrap(), 16); // char cell height
         assert_eq!(m.memory.read_u8(0x475).unwrap(), 0); // no fixed disks
         assert_eq!(m.memory.read_u16(0x472).unwrap(), 0x1234); // warm-boot magic
+    }
+
+    #[test]
+    fn com2_scratch_round_trips_through_the_bus() {
+        // A write then read of the COM2 scratch register (0x2FF) routes through the
+        // serial2 port arm exactly the way COM1's (0x3FF) does.
+        let mut m = int15_machine(16);
+        let mut bus = m.make_bus();
+        bus.write_io(0x02ff, BusWidth::Byte, 0xa5).unwrap();
+        assert_eq!(bus.read_io(0x02ff, BusWidth::Byte).unwrap(), 0xa5);
+        // COM1 stays separate: writing COM2 did not disturb COM1's scratch.
+        assert_eq!(bus.read_io(0x03ff, BusWidth::Byte).unwrap(), 0x00);
+    }
+
+    #[test]
+    fn lpt2_data_round_trips_through_the_bus() {
+        // The LPT2 data latch at 0x278 reads back through the lpt2 port arm.
+        let mut m = int15_machine(16);
+        let mut bus = m.make_bus();
+        bus.write_io(0x0278, BusWidth::Byte, 0x42).unwrap();
+        assert_eq!(bus.read_io(0x0278, BusWidth::Byte).unwrap(), 0x42);
+        // The LPT2 status port reports the always-ready idle byte.
+        assert_eq!(bus.read_io(0x0279, BusWidth::Byte).unwrap(), 0xdf);
     }
 
     #[test]
@@ -7254,10 +7309,10 @@ mod tests {
         assert_eq!(reason, StopReason::Halted);
         let ax = machine.cpu().registers.eax() as u16;
         assert_eq!(ax, BIOS_EQUIPMENT_WORD);
-        // Bits 11-9 = 001b: one serial port advertised for the emulated COM1.
-        assert_eq!((ax >> 9) & 0x07, 1, "one serial port advertised");
-        // Bits 15-14 = 01b: one parallel printer port advertised for LPT1.
-        assert_eq!((ax >> 14) & 0x03, 1, "one parallel port advertised");
+        // Bits 11-9 = 010b: two serial ports advertised (COM1 + COM2).
+        assert_eq!((ax >> 9) & 0x07, 2, "two serial ports advertised");
+        // Bits 15-14 = 10b: two parallel printer ports advertised (LPT1 + LPT2).
+        assert_eq!((ax >> 14) & 0x03, 2, "two parallel ports advertised");
         // Bit 1 (80x87 coprocessor) stays clear: the Izarra 3000 has no FPU.
         assert_eq!(ax & 0x0002, 0, "no coprocessor advertised");
     }
@@ -8054,7 +8109,9 @@ mod tests {
             margo: &mut machine.margo,
             rom: &machine.rom,
             serial: &mut machine.serial,
+            serial2: &mut machine.serial2,
             lpt: &mut machine.lpt,
+            lpt2: &mut machine.lpt2,
             device_ports: &mut machine.device_ports,
             pic: &mut machine.pic,
             pit: &mut machine.pit,

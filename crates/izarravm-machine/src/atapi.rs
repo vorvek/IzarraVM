@@ -10,7 +10,8 @@
 //! Command set implemented (per the SFF-8020i / MMC packet command set): TEST
 //! UNIT READY, REQUEST SENSE, INQUIRY (standard + EVPD pages 0x00/0x80/0x83),
 //! START/STOP UNIT, PREVENT/ALLOW MEDIUM REMOVAL, READ CAPACITY, SEEK, READ
-//! HEADER, READ TOC/PMA/ATIP, READ(10), READ(12), MODE SENSE(10), and the
+//! HEADER, READ TOC/PMA/ATIP, READ(10), READ(12), READ CD, MODE SENSE(10),
+//! MODE SELECT(10) (pages 0x0E audio control, 0x2A capabilities), and the
 //! CD-Audio set PLAY AUDIO(10), PLAY AUDIO MSF, PAUSE/RESUME, STOP, READ
 //! SUB-CHANNEL. IDENTIFY PACKET DEVICE is answered by the register file directly
 //! since it is an ATA command, not a packet command.
@@ -119,11 +120,28 @@ pub struct AtapiDevice {
     /// register file reads this through [`Self::interrupt_reason`] and publishes it
     /// on the sector-count port; this is the device-side source of truth.
     interrupt_reason: u8,
+    /// CD audio control (mode page 0x0E) output-port volumes, ports 0 and 1.
+    /// MODE SELECT(10) stores them; MODE SENSE(10) reports them. 0xFF is full
+    /// volume, the reset value a drive powers up with.
+    audio_volume: [u8; 2],
 }
 
 impl AtapiDevice {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            // A drive powers up with both audio output ports at full volume.
+            audio_volume: [0xFF, 0xFF],
+            ..Self::default()
+        }
+    }
+
+    /// Current CD-audio output volume (mode page 0x0E ports 0 and 1), 0xFF full.
+    /// The mixer can scale the CD-audio stream by these once it consults them.
+    // ponytail: stored and reported but not yet applied to the mixer; the audio
+    // path can read these to attenuate the streamed frames.
+    #[allow(dead_code)]
+    pub fn audio_volume(&self) -> [u8; 2] {
+        self.audio_volume
     }
 
     /// Mount a CD image, raising the medium-changed condition the next command
@@ -261,9 +279,11 @@ impl AtapiDevice {
             0x47 => self.play_audio_msf(cdb),
             0x4B => self.pause_resume(cdb),
             0x4E => self.stop_audio(),
+            0x55 => self.mode_select10(cdb),
             0x5A => self.mode_sense10(cdb),
             0xA8 => self.read12(cdb),
             0xBD => self.mechanism_status(cdb),
+            0xBE => self.read_cd(cdb),
             _ => self.fail(sense_key::ILLEGAL_REQUEST, asc::INVALID_COMMAND),
         };
         // Reflect the resulting transfer phase in the interrupt reason: a data-in
@@ -443,6 +463,46 @@ impl AtapiDevice {
         self.read_sectors(lba, count)
     }
 
+    /// READ CD (0xBE). Byte 1 bits 7-5 are the expected sector type, bytes 2-5 the
+    /// starting LBA, bytes 6-8 the transfer length in sectors (24-bit big-endian),
+    /// byte 9 the main-channel selection. The model serves the 2048-byte user data
+    /// of Mode 1 / Mode 2 Form 1 sectors, behaving like READ(10) when the host asks
+    /// for user data. The expected sector type is validated against the track at
+    /// the LBA: type 1 (CD-DA) over a data track, or a data type over an audio
+    /// track, is an illegal field.
+    // ponytail: only the 2048-byte user-data main-channel field is returned. The
+    // sync header, sub-header, and C2/EDC/ECC selections (byte 9 other bits) are
+    // not synthesized; a guest that asks for raw 2352-byte frames gets user data.
+    fn read_cd(&mut self, cdb: &[u8; 12]) -> CmdResult {
+        // Expected sector type is byte 1 bits 7-5 (bit 4 is DAP, bit 0 RELADR).
+        let expected_type = (cdb[1] >> 5) & 0x07;
+        let lba = u32::from_be_bytes([cdb[2], cdb[3], cdb[4], cdb[5]]);
+        let count = u32::from_be_bytes([0, cdb[6], cdb[7], cdb[8]]);
+        // The main-channel selection (byte 9) must request the user data field
+        // (bit 4); a request for no main-channel data returns nothing.
+        let want_user_data = cdb[9] & 0x10 != 0;
+        let Some(image) = &self.image else {
+            return self.fail(sense_key::NOT_READY, asc::NOT_READY_NO_MEDIUM);
+        };
+        if count == 0 || !want_user_data {
+            return CmdResult::Data(Vec::new());
+        }
+        let end = lba.saturating_add(count);
+        if end > image.total_sectors() {
+            return self.fail_at_lba(sense_key::ILLEGAL_REQUEST, asc::LBA_OUT_OF_RANGE, lba);
+        }
+        // Validate the expected sector type against the track. Type 0 (any) skips
+        // the check; type 1 is CD-DA (audio); types 2-5 are the data modes.
+        let is_audio = image.track_at_lba(lba).map(|t| t.mode.is_audio());
+        match (expected_type, is_audio) {
+            (1, Some(false)) | (2..=5, Some(true)) => {
+                return self.fail(sense_key::ILLEGAL_REQUEST, asc::INVALID_FIELD_IN_CDB);
+            }
+            _ => {}
+        }
+        self.read_sectors(lba, count)
+    }
+
     /// SEEK (0x2B). LBA in bytes 2-5 big-endian, no data phase. Validates the LBA
     /// against the disc capacity and reports NOT READY when empty. A successful
     /// seek returns an empty data buffer; the model has no head to move.
@@ -564,14 +624,25 @@ impl AtapiDevice {
         truncate(buf, alloc)
     }
 
+    /// MODE SENSE(10) (0x5A). Byte 2 bits 5-0 are the page code, bits 7-6 the
+    /// page-control field (0 current, 1 changeable, 2 default, 3 saved); the model
+    /// reports the same values for every control. Returns an 8-byte header then the
+    /// requested page(s). Page 0x2A is CD/DVD capabilities, 0x0E CD audio control,
+    /// and 0x3F asks for every supported page. An unsupported page is an illegal
+    /// field.
     fn mode_sense10(&mut self, cdb: &[u8; 12]) -> CmdResult {
         let page = cdb[2] & 0x3F;
         let alloc = u16::from_be_bytes([cdb[7], cdb[8]]) as usize;
-        // 8-byte MODE SENSE(10) header, then the requested page. We answer the
-        // CD-ROM capabilities page (0x2A) used by ICDEX/drivers to probe speed.
         let mut page_bytes = Vec::new();
-        if page == 0x2A || page == 0x3F {
-            page_bytes.extend_from_slice(&caps_page_2a());
+        match page {
+            0x2A => page_bytes.extend_from_slice(&caps_page_2a()),
+            0x0E => page_bytes.extend_from_slice(&audio_page_0e(self.audio_volume)),
+            0x3F => {
+                // All supported pages, ascending page-code order.
+                page_bytes.extend_from_slice(&audio_page_0e(self.audio_volume));
+                page_bytes.extend_from_slice(&caps_page_2a());
+            }
+            _ => return self.fail(sense_key::ILLEGAL_REQUEST, asc::INVALID_FIELD_IN_CDB),
         }
         let mut buf = vec![0u8; 8];
         let total = (page_bytes.len() + 6) as u16; // mode data length excludes its own 2 bytes
@@ -579,6 +650,58 @@ impl AtapiDevice {
         buf[2] = 0x05; // medium type: CD-ROM
         buf.extend_from_slice(&page_bytes);
         truncate(buf, alloc)
+    }
+
+    /// MODE SELECT(10) (0x55). The CDB names a parameter-list length (bytes 7-8);
+    /// the parameter list itself (header plus mode pages) arrives in a data-out
+    /// phase. This call acknowledges the command; the page list is applied through
+    /// [`Self::mode_select_data`].
+    // ponytail: the IDE register file (ide.rs) has no data-out phase yet, so the
+    // parameter list is never delivered and the command only acks. Wire a write
+    // buffer through run_packet that calls mode_select_data to apply the pages.
+    fn mode_select10(&mut self, _cdb: &[u8; 12]) -> CmdResult {
+        CmdResult::Data(Vec::new())
+    }
+
+    /// Apply a MODE SELECT(10) parameter list (the header plus mode pages the host
+    /// wrote in the data-out phase). Walks the pages and stores the ones the model
+    /// tracks (page 0x0E CD audio control: the two output-port volumes). Unknown
+    /// pages are skipped, the way a forgiving drive treats vendor pages. Returns
+    /// Error with latched sense on a malformed list.
+    // ponytail: ready for the IDE data-out phase but not yet reachable from it
+    // (only the tests call it). Lifting the ponytail on mode_select10 wires this in.
+    #[allow(dead_code)]
+    pub fn mode_select_data(&mut self, params: &[u8]) -> CmdResult {
+        // 8-byte MODE SELECT(10) parameter header, then a block-descriptor area
+        // whose length is bytes 6-7, then the mode pages.
+        if params.len() < 8 {
+            return self.fail(sense_key::ILLEGAL_REQUEST, asc::INVALID_FIELD_IN_CDB);
+        }
+        let bd_len = u16::from_be_bytes([params[6], params[7]]) as usize;
+        let mut idx = 8 + bd_len;
+        while idx + 2 <= params.len() {
+            let page_code = params[idx] & 0x3F;
+            let page_len = params[idx + 1] as usize;
+            let body_start = idx + 2;
+            let body_end = body_start + page_len;
+            if body_end > params.len() {
+                return self.fail(sense_key::ILLEGAL_REQUEST, asc::INVALID_FIELD_IN_CDB);
+            }
+            if page_code == 0x0E {
+                // CD audio control page. Output port 0 volume is byte 9, output
+                // port 1 volume is byte 11 of the page (offsets 7 and 9 past the
+                // 2-byte page header).
+                let body = &params[body_start..body_end];
+                if body.len() >= 8 {
+                    self.audio_volume[0] = body[7];
+                }
+                if body.len() >= 10 {
+                    self.audio_volume[1] = body[9];
+                }
+            }
+            idx = body_end;
+        }
+        CmdResult::Data(Vec::new())
     }
 
     fn play_audio10(&mut self, cdb: &[u8; 12]) -> CmdResult {
@@ -715,17 +838,42 @@ fn track_control(is_audio: bool) -> u8 {
     }
 }
 
-/// The CD-ROM Capabilities and Mechanical Status page (0x2A), enough fields for
-/// a driver to read the 12x speed. Length byte plus the speed words.
+/// The CD-ROM Capabilities and Mechanical Status page (0x2A) per MMC. The read
+/// speeds let a driver size the drive at 12x; the format bytes advertise what the
+/// drive can read and play.
 fn caps_page_2a() -> Vec<u8> {
     let mut p = vec![0u8; 22];
     p[0] = 0x2A; // page code
-    p[1] = 20; // page length
-    p[2] = 0x01; // CD-R read supported bit (cosmetic)
-    // Max read speed in KB/s (byte 8-9) and current read speed (byte 14-15).
+    p[1] = 20; // page length (20 bytes after this header byte)
+    // Read-format support (byte 2): bit0 CD-R, bit1 CD-RW, bit2 method-2 (the
+    // drive can read written CD-R/RW media).
+    p[2] = 0x07;
+    // No write support (byte 3 stays 0: this is a read-only drive).
+    // Mechanism/format support (byte 4): bit0 audio play, bit4 Mode 2 Form 1,
+    // bit5 Mode 2 Form 2, bit6 multisession.
+    p[4] = 0x71;
+    // CD-DA capabilities (byte 5): bit0 CD-DA commands supported, bit1 CD-DA
+    // stream is accurate.
+    p[5] = 0x03;
+    // Max read speed in KB/s (bytes 8-9) and current read speed (bytes 14-15).
     let speed = (CD_BYTES_PER_SEC / 1024.0) as u16;
     p[8..10].copy_from_slice(&speed.to_be_bytes());
     p[14..16].copy_from_slice(&speed.to_be_bytes());
+    p
+}
+
+/// The CD audio control mode page (0x0E) per MMC. Carries the two CD-audio
+/// output-port selections and volumes; the model reports the stored volumes.
+/// Output port 0 is byte 8 (channel select) and byte 9 (volume); output port 1
+/// is byte 10/11. Channels are wired stereo: port 0 = left, port 1 = right.
+fn audio_page_0e(volume: [u8; 2]) -> Vec<u8> {
+    let mut p = vec![0u8; 16];
+    p[0] = 0x0E; // page code
+    p[1] = 14; // page length (14 bytes after this header byte)
+    p[8] = 0x01; // output port 0 -> channel 0 (left)
+    p[9] = volume[0]; // output port 0 volume
+    p[10] = 0x02; // output port 1 -> channel 1 (right)
+    p[11] = volume[1]; // output port 1 volume
     p
 }
 
@@ -1202,5 +1350,144 @@ mod tests {
         assert!(matches!(dev.execute(&c), CmdResult::Error));
         assert_eq!(dev.sense_key, sense_key::ILLEGAL_REQUEST);
         assert_eq!(dev.asc, asc::LBA_OUT_OF_RANGE.0);
+    }
+
+    // Slice 9a-3: READ CD (0xBE), MODE SENSE(10) pages, MODE SELECT(10).
+
+    #[test]
+    fn read_cd_returns_user_data_like_read10() {
+        let mut dev = AtapiDevice::new();
+        dev.insert(data_disc(8));
+        let _ = dev.execute(&cdb(0x00)); // clear unit attention
+        let mut c = cdb(0xBE);
+        c[1] = 0x04 << 5; // expected sector type 4 (Mode 2 Form 1) over a data track
+        c[5] = 3; // LBA 3
+        c[8] = 2; // 2 sectors of transfer length
+        c[9] = 0x10; // main-channel: user data
+        let buf = data(dev.execute(&c));
+        assert_eq!(buf.len(), 2 * DATA_SECTOR);
+        assert_eq!(buf[0], 0x43); // 0x40 + 3
+        assert_eq!(buf[DATA_SECTOR], 0x44); // next sector marker
+    }
+
+    #[test]
+    fn read_cd_without_user_data_selection_returns_nothing() {
+        let mut dev = AtapiDevice::new();
+        dev.insert(data_disc(8));
+        let _ = dev.execute(&cdb(0x00));
+        let mut c = cdb(0xBE);
+        c[5] = 0;
+        c[8] = 1;
+        c[9] = 0x00; // no main-channel data requested
+        let buf = data(dev.execute(&c));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn read_cd_past_end_is_out_of_range() {
+        let mut dev = AtapiDevice::new();
+        dev.insert(data_disc(4));
+        let _ = dev.execute(&cdb(0x00));
+        let mut c = cdb(0xBE);
+        c[5] = 4; // LBA 4 on a 4-sector disc
+        c[8] = 1;
+        c[9] = 0x10;
+        assert!(matches!(dev.execute(&c), CmdResult::Error));
+        assert_eq!(dev.sense_key, sense_key::ILLEGAL_REQUEST);
+        assert_eq!(dev.asc, asc::LBA_OUT_OF_RANGE.0);
+    }
+
+    #[test]
+    fn read_cd_wrong_sector_type_is_illegal() {
+        let mut dev = AtapiDevice::new();
+        dev.insert(data_disc(8));
+        let _ = dev.execute(&cdb(0x00));
+        let mut c = cdb(0xBE);
+        c[1] = 0x01 << 5; // expected type 1 (CD-DA) over a data track
+        c[5] = 0;
+        c[8] = 1;
+        c[9] = 0x10;
+        assert!(matches!(dev.execute(&c), CmdResult::Error));
+        assert_eq!(dev.sense_key, sense_key::ILLEGAL_REQUEST);
+        assert_eq!(dev.asc, asc::INVALID_FIELD_IN_CDB.0);
+    }
+
+    #[test]
+    fn mode_sense10_page_2a_is_well_formed() {
+        let mut dev = AtapiDevice::new();
+        dev.insert(data_disc(2));
+        let mut c = cdb(0x5A);
+        c[2] = 0x2A; // capabilities page
+        c[8] = 200; // allocation, plenty
+        let buf = data(dev.execute(&c));
+        // 8-byte MODE SENSE(10) header: mode data length (2), medium type at [2].
+        let data_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+        assert_eq!(data_len, buf.len() - 2, "mode data length spans the rest");
+        assert_eq!(buf[2], 0x05, "medium type CD-ROM");
+        // The page follows the 8-byte header: page code then page length.
+        let page = &buf[8..];
+        assert_eq!(page[0] & 0x3F, 0x2A, "page code 0x2A");
+        assert_eq!(page[1], 20, "page length");
+        // The reported max read speed is the 12x figure.
+        let speed = u16::from_be_bytes([page[8], page[9]]);
+        assert_eq!(speed, (CD_BYTES_PER_SEC / 1024.0) as u16);
+    }
+
+    #[test]
+    fn mode_sense10_page_0e_reports_audio_volume() {
+        let mut dev = AtapiDevice::new();
+        dev.insert(data_disc(2));
+        let mut c = cdb(0x5A);
+        c[2] = 0x0E; // audio control page
+        c[8] = 200;
+        let buf = data(dev.execute(&c));
+        let page = &buf[8..];
+        assert_eq!(page[0] & 0x3F, 0x0E, "page code 0x0E");
+        assert_eq!(page[1], 14, "page length");
+        // Default power-up volume is full on both output ports.
+        assert_eq!(page[9], 0xFF, "port 0 volume full");
+        assert_eq!(page[11], 0xFF, "port 1 volume full");
+    }
+
+    #[test]
+    fn mode_sense10_unknown_page_is_illegal() {
+        let mut dev = AtapiDevice::new();
+        dev.insert(data_disc(2));
+        let mut c = cdb(0x5A);
+        c[2] = 0x12; // a page the model does not carry
+        c[8] = 64;
+        assert!(matches!(dev.execute(&c), CmdResult::Error));
+        assert_eq!(dev.sense_key, sense_key::ILLEGAL_REQUEST);
+    }
+
+    #[test]
+    fn mode_select_stores_audio_volume_read_back_by_mode_sense() {
+        let mut dev = AtapiDevice::new();
+        dev.insert(data_disc(2));
+        // The CDB only acks; the parameter list applies through mode_select_data.
+        assert!(matches!(dev.execute(&cdb(0x55)), CmdResult::Data(_)));
+        // Build an 8-byte header (no block descriptors) then a 16-byte page 0x0E
+        // with both output-port volumes set to 0x40.
+        let mut params = vec![0u8; 8];
+        let mut page = audio_page_0e([0x40, 0x40]);
+        params.append(&mut page);
+        assert!(matches!(dev.mode_select_data(&params), CmdResult::Data(_)));
+        // MODE SENSE(10) now reports the stored volumes.
+        let mut c = cdb(0x5A);
+        c[2] = 0x0E;
+        c[8] = 64;
+        let buf = data(dev.execute(&c));
+        let sense_page = &buf[8..];
+        assert_eq!(sense_page[9], 0x40, "port 0 volume stored");
+        assert_eq!(sense_page[11], 0x40, "port 1 volume stored");
+    }
+
+    #[test]
+    fn mode_select_malformed_list_is_illegal() {
+        let mut dev = AtapiDevice::new();
+        dev.insert(data_disc(2));
+        // A too-short parameter list (under the 8-byte header) is an illegal field.
+        assert!(matches!(dev.mode_select_data(&[0u8; 4]), CmdResult::Error));
+        assert_eq!(dev.sense_key, sense_key::ILLEGAL_REQUEST);
     }
 }
