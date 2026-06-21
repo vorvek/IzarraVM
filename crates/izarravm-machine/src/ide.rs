@@ -69,6 +69,12 @@ pub struct IdeChannel {
     /// The data-in buffer being drained on the data port, and the cursor into it.
     data_in: Vec<u8>,
     data_in_pos: usize,
+    /// End offset (exclusive) of the DRQ block currently presented to the host.
+    /// When the cursor reaches it the next block is armed, or the phase ends.
+    data_in_block_end: usize,
+    /// Per-command host byte-count limit (cylinder low/high at PACKET time). Zero
+    /// means no limit was programmed, so the whole buffer goes out in one block.
+    byte_count_limit: usize,
     /// Set when a command completes so the machine forwards IRQ15 to the PIC.
     irq_pending: bool,
     /// Pending mechanical time (seconds) for the last data command, drained by
@@ -96,6 +102,8 @@ impl Default for IdeChannel {
             packet_filled: 0,
             data_in: Vec::new(),
             data_in_pos: 0,
+            data_in_block_end: 0,
+            byte_count_limit: 0,
             irq_pending: false,
             pending_stall: 0.0,
             last_access_bytes: 0,
@@ -105,7 +113,13 @@ impl Default for IdeChannel {
 
 impl IdeChannel {
     pub fn new() -> Self {
-        Self::default()
+        let mut channel = Self::default();
+        // Power-up presents the same diagnostic code and ATAPI signature as a
+        // hardware reset (ATA 5.2.9): device 0 passed in the Error register and
+        // the packet-device signature in the byte-count registers, so the BIOS
+        // sees them immediately without first issuing a reset.
+        channel.soft_reset();
+        channel
     }
 
     pub fn device(&self) -> &AtapiDevice {
@@ -213,8 +227,12 @@ impl IdeChannel {
         self.packet_filled = 0;
         self.data_in.clear();
         self.data_in_pos = 0;
+        self.data_in_block_end = 0;
+        self.byte_count_limit = 0;
         self.status = status::DRDY | status::DSC;
-        self.error = 0;
+        // Diagnostic code: device 0 passed (ATA 5.2.9). `new` runs this on
+        // construction so power-up presents the same code, as real hardware does.
+        self.error = 0x01;
         // ATAPI signature on the byte-count registers so the host can tell a
         // packet device from an ATA disk after reset.
         self.sector_count = 0x01;
@@ -234,7 +252,12 @@ impl IdeChannel {
             0xA1 => self.identify_packet_device(),
             0x08 => self.soft_reset(),   // DEVICE RESET
             0xEC => self.identify_nak(), // IDENTIFY DEVICE: ATAPI aborts it
-            0x00 => { /* NOP */ }
+            0x90 => self.execute_diagnostic(),
+            0x00 => {
+                // NOP (ATA-3 7.13): always aborts, never a silent success.
+                self.status = status::DRDY | status::ERR;
+                self.error = 0x04; // ABRT
+            }
             _ => {
                 // Unsupported command: abort.
                 self.status = status::DRDY | status::ERR;
@@ -243,12 +266,29 @@ impl IdeChannel {
         }
     }
 
+    /// EXECUTE DEVICE DIAGNOSTIC (0x90): mandatory, and the BIOS probes through
+    /// it. Report device 0 passed and leave the ATAPI signature so detection
+    /// still sees a packet device. Completes without ERR and raises the IRQ.
+    fn execute_diagnostic(&mut self) {
+        self.error = 0x01; // device 0 passed diagnostics
+        self.sector_count = 0x01;
+        self.lba_low = 0x01;
+        self.lba_mid = 0x14;
+        self.lba_high = 0xEB;
+        self.status = status::DRDY | status::DSC;
+        self.raise_irq();
+    }
+
     /// ATA PACKET (0xA0): the device prepares to receive the 12-byte CDB on the
     /// data register, raising DRQ.
     fn begin_packet(&mut self) {
         self.phase = Phase::AwaitPacket;
         self.packet_filled = 0;
         self.packet = [0u8; 12];
+        // The host has already written the byte-count limit (cylinder low/high)
+        // before issuing PACKET. Capture it now so run_packet can chunk a large
+        // data-in transfer into DRQ blocks no bigger than the limit.
+        self.byte_count_limit = u16::from_le_bytes([self.lba_mid, self.lba_high]) as usize;
         self.status = status::DRDY | status::DRQ;
         self.error = 0;
     }
@@ -259,11 +299,9 @@ impl IdeChannel {
         self.data_in = block;
         self.data_in_pos = 0;
         self.phase = Phase::DataIn;
-        // Set the byte count to the full block.
-        let len = self.data_in.len() as u16;
-        self.lba_mid = (len & 0xFF) as u8;
-        self.lba_high = (len >> 8) as u8;
-        self.status = status::DRDY | status::DRQ | status::DSC;
+        // IDENTIFY ignores the host byte-count limit: the whole block is one DRQ.
+        self.byte_count_limit = 0;
+        self.present_data_block();
         self.raise_irq();
     }
 
@@ -285,11 +323,17 @@ impl IdeChannel {
         let byte = self.data_in.get(self.data_in_pos).copied().unwrap_or(0);
         self.data_in_pos += 1;
         if self.data_in_pos >= self.data_in.len() {
-            // Transfer complete: drop DRQ, go idle.
+            // Whole transfer complete: drop DRQ, go idle.
             self.phase = Phase::Idle;
             self.data_in.clear();
             self.data_in_pos = 0;
+            self.data_in_block_end = 0;
             self.status = status::DRDY | status::DSC;
+        } else if self.data_in_pos >= self.data_in_block_end {
+            // Block done but more data remains: arm the next DRQ block and pulse
+            // the IRQ, the way ATAPI signals the host to drain the next block.
+            self.present_data_block();
+            self.raise_irq();
         }
         byte
     }
@@ -311,9 +355,6 @@ impl IdeChannel {
     /// data-in phase (or completion) accordingly.
     fn run_packet(&mut self) {
         let cdb = self.packet;
-        // The byte-count limit the host programmed (cylinder low/high) caps the
-        // bytes presented per data block; we present the whole buffer at once
-        // since the data register read drains it linearly.
         match self.device.execute(&cdb) {
             CmdResult::Data(buf) => {
                 self.charge_time(cdb[0], &buf);
@@ -323,14 +364,13 @@ impl IdeChannel {
                     self.status = status::DRDY | status::DSC;
                     self.error = 0;
                 } else {
+                    // Data-in: present the first DRQ block. The host byte-count
+                    // limit caps each block; the rest go out as the host drains.
                     self.data_in = buf;
                     self.data_in_pos = 0;
                     self.phase = Phase::DataIn;
-                    let len = self.data_in.len() as u16;
-                    self.lba_mid = (len & 0xFF) as u8;
-                    self.lba_high = (len >> 8) as u8;
-                    self.status = status::DRDY | status::DRQ | status::DSC;
                     self.error = 0;
+                    self.present_data_block();
                 }
             }
             CmdResult::Error => {
@@ -340,6 +380,23 @@ impl IdeChannel {
             }
         }
         self.raise_irq();
+    }
+
+    /// Arm the next data-in DRQ block at the current cursor: set the byte count
+    /// to this block's size, raise DRQ, and raise the IRQ. The block is the
+    /// remaining bytes capped by the host byte-count limit, or the whole
+    /// remainder when no limit (or a limit at least as large) was programmed.
+    fn present_data_block(&mut self) {
+        let remaining = self.data_in.len() - self.data_in_pos;
+        let block = if self.byte_count_limit > 0 && self.byte_count_limit < remaining {
+            self.byte_count_limit
+        } else {
+            remaining
+        };
+        self.data_in_block_end = self.data_in_pos + block;
+        self.lba_mid = (block & 0xFF) as u8;
+        self.lba_high = ((block >> 8) & 0xFF) as u8;
+        self.status = status::DRDY | status::DRQ | status::DSC;
     }
 
     /// Charge the mechanical time and access-byte count for a read command, the
@@ -527,5 +584,94 @@ mod tests {
         let secs = ch.take_stall_secs();
         assert!(secs > 0.0);
         assert_eq!(ch.take_access_bytes(), DATA_SECTOR);
+    }
+
+    #[test]
+    fn nop_command_always_aborts() {
+        let mut ch = IdeChannel::new();
+        ch.write_port(SECONDARY_CMD_BASE + 7, 0x00); // NOP
+        assert_eq!(ch.status & status::DRDY, status::DRDY);
+        assert_eq!(ch.status & status::ERR, status::ERR);
+        assert_eq!(ch.error, 0x04);
+    }
+
+    #[test]
+    fn execute_diagnostic_passes_with_atapi_signature() {
+        let mut ch = IdeChannel::new();
+        ch.write_port(SECONDARY_CMD_BASE + 7, 0x90); // EXECUTE DEVICE DIAGNOSTIC
+        // Device 0 passed and no error bit, so BIOS detection still sees it.
+        assert_eq!(ch.error, 0x01);
+        assert_eq!(ch.status & status::ERR, 0);
+        assert_eq!(ch.status & status::DRDY, status::DRDY);
+        // The ATAPI signature stays in the byte-count registers.
+        assert_eq!((ch.sector_count, ch.lba_low), (0x01, 0x01));
+        assert_eq!((ch.lba_mid, ch.lba_high), (0x14, 0xEB));
+        // Completion raises the IRQ.
+        assert!(ch.take_irq());
+    }
+
+    #[test]
+    fn packet_read_chunks_to_the_byte_count_limit() {
+        let mut ch = IdeChannel::new();
+        ch.device_mut().insert(data_disc(8));
+        // Clear the post-insert unit attention with a TEST UNIT READY.
+        ch.write_port(SECONDARY_CMD_BASE + 7, 0xA0);
+        for b in [0u8; 12] {
+            ch.write_port(SECONDARY_CMD_BASE, b);
+        }
+
+        // Discard the TUR completion interrupt so the block IRQs below are the
+        // only ones the assertions see.
+        ch.take_irq();
+
+        // Read two sectors so the data-in buffer is larger than one limit block.
+        // The limit is deliberately NOT a divisor of the total, so the final block
+        // is a short remainder (1500, 1500, 1096 over 4096) exercising the partial
+        // block path, not just full-limit blocks.
+        let sectors = 2usize;
+        let total = sectors * DATA_SECTOR; // 4096
+        let limit = 1500usize;
+
+        // Program a byte-count limit smaller than the data before PACKET.
+        ch.write_port(SECONDARY_CMD_BASE + 4, (limit & 0xFF) as u8); // cyl low
+        ch.write_port(SECONDARY_CMD_BASE + 5, (limit >> 8) as u8); // cyl high
+        ch.write_port(SECONDARY_CMD_BASE + 7, 0xA0); // PACKET
+        let mut cdb = [0u8; 12];
+        cdb[0] = 0x28; // READ(10)
+        cdb[2..6].copy_from_slice(&0u32.to_be_bytes()); // lba 0
+        cdb[7] = 0;
+        cdb[8] = sectors as u8;
+        for b in cdb {
+            ch.write_port(SECONDARY_CMD_BASE, b);
+        }
+
+        // The first DRQ block arms an interrupt.
+        assert!(ch.take_irq(), "the first data block raises IRQ15");
+
+        // Drain block by block. Each block's byte count is the limit, except the
+        // last, which is the remainder. Each new block re-raises the interrupt.
+        let mut out = Vec::with_capacity(total);
+        let mut drained = 0usize;
+        while drained < total {
+            assert_eq!(ch.status & status::DRQ, status::DRQ);
+            let count = u16::from_le_bytes([ch.lba_mid, ch.lba_high]) as usize;
+            let expected = (total - drained).min(limit);
+            assert_eq!(count, expected);
+            for _ in 0..count {
+                out.push(ch.read_port(SECONDARY_CMD_BASE).unwrap());
+            }
+            drained += count;
+            if drained < total {
+                assert!(ch.take_irq(), "each new data block re-raises IRQ15");
+            }
+        }
+
+        // After the last block, DRQ drops and the channel is idle/ready.
+        assert_eq!(ch.status & status::DRQ, 0);
+        assert_eq!(ch.status & status::DRDY, status::DRDY);
+        // The reassembled data matches the two sectors read from lba 0.
+        assert_eq!(out.len(), total);
+        assert_eq!(out[0], 0x50); // sector 0 marker
+        assert_eq!(out[DATA_SECTOR], 0x51); // sector 1 marker
     }
 }
