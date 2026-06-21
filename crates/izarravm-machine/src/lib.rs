@@ -1795,10 +1795,12 @@ impl Machine {
                 self.set_disk_status(0x00);
                 self.set_int_frame_carry(false);
             }
-            // AH=01 get last disk status: AH=0, AL=BDA 0040:0041, CF if nonzero.
+            // AH=01 get last disk status. The documented result register is AH; PS/2
+            // BIOSes mirror the status into AL as well. CF reflects a nonzero (error)
+            // status. The status byte itself lives in BDA 0040:0041.
             0x01 => {
                 let status = self.read_physical_u8(0x441);
-                self.set_eax_ah(0x00);
+                self.set_eax_ah(status);
                 self.set_eax_al(status);
                 self.set_int_frame_carry(status != 0);
             }
@@ -9376,9 +9378,11 @@ mod tests {
         machine.mount_floppy(vec![0u8; 737_280]).unwrap();
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
         assert_eq!(reason, StopReason::Halted);
-        // Drive B: is unbacked: the transfer reported AH=0x80 (timeout); AH=01h echoes it in AL.
-        let al = machine.cpu().registers.eax() as u8;
-        assert_eq!(al, 0x80, "AL = last disk status");
+        // Drive B: is unbacked: the transfer reported AH=0x80 (timeout); AH=01h returns it
+        // in AH (the documented register) and mirrors it into AL for PS/2 compatibility.
+        let ax = machine.cpu().registers.eax() as u16;
+        assert_eq!(ax as u8, 0x80, "AL = last disk status");
+        assert_eq!((ax >> 8) as u8, 0x80, "AH = last disk status");
     }
 
     #[test]
