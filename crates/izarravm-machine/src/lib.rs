@@ -972,9 +972,52 @@ impl Machine {
             self.cpu.registers.set_ebx(ebx);
             return;
         }
+        if ah == 0x1a {
+            // AH=1Ah display combination code. AL=00h reads, AL=01h writes (the write
+            // is cosmetic here). Report a VGA with an analog colour monitor: AL=1Ah
+            // marks the function supported, BL=08h is the active display code.
+            self.set_eax_al(0x1A);
+            if al == 0x00 {
+                self.set_bx(0x0008);
+            }
+            return;
+        }
+        if ah == 0x1b {
+            // AH=1Bh functionality/state information (VGA). Fills the 64-byte block at
+            // ES:DI and returns AL=1Bh so callers detect a VGA BIOS.
+            self.int10_state_info();
+            return;
+        }
         if ah == 0x4f {
             self.handle_vbe(al);
         }
+    }
+
+    /// INT 10h AH=1Bh. Writes the 64-byte video state-information block at ES:DI with the
+    /// live mode, geometry, and display-combination fields, plus a static functionality
+    /// table pointer. ponytail: only the commonly-read fields are populated and the static
+    /// table is pointed at the video BIOS segment rather than a fully built table; the
+    /// VGA-present check that programs run only tests AL == 0x1B.
+    fn int10_state_info(&mut self) {
+        let es = self.cpu.registers.segment(SegmentIndex::Es).base;
+        let di = self.cpu.registers.edi() as u16;
+        let addr = es.wrapping_add(u32::from(di));
+        let mode = self.read_physical_u8(0x449);
+        let cols = self.read_guest_word(0x44a);
+        let page = self.read_physical_u8(0x462);
+        let rows_minus_1 = self.read_physical_u8(0x484);
+        let mut block = [0u8; 64];
+        block[0..4].copy_from_slice(&0xC000_0000u32.to_le_bytes()); // C000:0000 func table
+        block[4] = mode;
+        block[5..7].copy_from_slice(&cols.to_le_bytes());
+        block[0x1D] = page;
+        block[0x1E..0x20].copy_from_slice(&0x03D4u16.to_le_bytes()); // CRTC base port
+        block[0x22] = rows_minus_1.wrapping_add(1); // rows on screen
+        block[0x25] = 0x08; // active display combination code (VGA colour)
+        block[0x29] = 8; // pages
+        block[0x2A] = 0x03; // 480 scan lines (VGA)
+        self.write_guest_block(addr, &block);
+        self.set_eax_al(0x1B);
     }
 
     /// Record the current video mode in the BDA so apps that read it directly
@@ -3970,6 +4013,28 @@ mod tests {
         assert_eq!(days_since_1980(1980, 1, 1), 0);
         assert_eq!(days_since_1980(1980, 3, 1), 60); // 1980 is a leap year (31+29)
         assert_eq!(days_since_1980(1981, 1, 1), 366);
+    }
+
+    #[test]
+    fn int10_1a_reports_vga_color_dcc() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x1A00);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.eax() as u8, 0x1A); // AL = function supported
+        assert_eq!(m.cpu.registers.ebx() as u8, 0x08); // BL = VGA colour DCC
+    }
+
+    #[test]
+    fn int10_1b_fills_state_block_and_signals_vga() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x0003); // mode 03h so the BDA has a known mode
+        m.handle_int10();
+        m.cpu.registers.set_eax(0x1B00); // ES:DI = 0:0 -> block at physical 0
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.eax() as u8, 0x1B);
+        assert_eq!(m.read_physical_u8(4), 0x03); // video mode at +4
+        assert_eq!(m.read_physical_u8(0x25), 0x08); // active DCC
+        assert_eq!(m.read_physical_u8(0x2A), 0x03); // 480 scan lines (VGA)
     }
 
     #[test]
