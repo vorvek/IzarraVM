@@ -464,14 +464,30 @@ impl Machine {
     /// previously mounted image in place.
     pub fn mount_floppy(&mut self, bytes: Vec<u8>) -> Result<(), String> {
         self.floppy = Some(floppy::Floppy::from_image(bytes)?);
+        self.set_equipment_floppy(true);
         Ok(())
+    }
+
+    /// Track drive A: in the BDA equipment word (0040:0010) that INT 11h returns. Bit 0 is
+    /// the floppy-installed flag and bits 7-6 the drive count minus one; with one drive
+    /// modeled, present means bit 0 set with bits 7-6 clear, absent means both cleared.
+    fn set_equipment_floppy(&mut self, present: bool) {
+        let mut word = self.memory.read_u16(0x410).unwrap_or(BIOS_EQUIPMENT_WORD);
+        if present {
+            word = (word & !0x00C0) | 0x0001;
+        } else {
+            word &= !0x00C1;
+        }
+        let _ = self.memory.write_u16(0x410, word);
     }
 
     /// Eject the A: floppy, returning its current image bytes (including any
     /// in-session writes) so the caller can flush them back to disk. Returns
     /// None when the drive is empty.
     pub fn eject_floppy(&mut self) -> Option<Vec<u8>> {
-        self.floppy.take().map(|f| f.bytes().to_vec())
+        let bytes = self.floppy.take().map(|f| f.bytes().to_vec());
+        self.set_equipment_floppy(false);
+        bytes
     }
 
     /// Whether the mounted A: floppy took a guest write this session. The host
@@ -4013,6 +4029,20 @@ mod tests {
         assert_eq!(days_since_1980(1980, 1, 1), 0);
         assert_eq!(days_since_1980(1980, 3, 1), 60); // 1980 is a leap year (31+29)
         assert_eq!(days_since_1980(1981, 1, 1), 366);
+    }
+
+    #[test]
+    fn int11_equipment_word_tracks_floppy_mount() {
+        let mut m = int15_machine(16);
+        // Mounting sets the floppy-installed bit; ejecting clears the floppy field.
+        m.mount_floppy(vec![0u8; 1_474_560]).unwrap();
+        m.cpu.registers.set_eax(0);
+        m.handle_int11();
+        assert_eq!(m.cpu.registers.eax() as u16 & 0x0001, 0x0001);
+        m.eject_floppy();
+        m.cpu.registers.set_eax(0);
+        m.handle_int11();
+        assert_eq!(m.cpu.registers.eax() as u16 & 0x00C1, 0x0000);
     }
 
     #[test]
