@@ -15,6 +15,7 @@ const FLAG_IF: u32 = 0x0000_0200;
 const FLAG_DF: u32 = 0x0000_0400;
 const FLAG_OF: u32 = 0x0000_0800;
 const FLAG_NT: u32 = 0x0000_4000; // bit 14, nested task
+const FLAG_VM: u32 = 0x0002_0000; // bit 17, virtual-8086 mode
 
 /// Segment-selector slots in a 386 TSS, in memory order from offset 72 (ES, CS, SS,
 /// DS, FS, GS). Used by the task-switch save and restore.
@@ -542,11 +543,36 @@ impl Cpu386 {
         self.control.cr0 & CR0_PG != 0
     }
 
+    /// Virtual-8086 mode: the VM flag set while in protected mode. A V86 task runs
+    /// 8086 code with real-mode segment addressing but always at CPL 3.
+    fn is_v86_mode(&self) -> bool {
+        self.is_protected_mode() && self.registers.eflags & FLAG_VM != 0
+    }
+
+    /// The I/O privilege level (EFLAGS bits 12-13).
+    fn iopl(&self) -> u8 {
+        ((self.registers.eflags >> 12) & 3) as u8
+    }
+
+    /// IOPL-sensitive instructions (CLI, STI, PUSHF/POPF, INT n) fault to the monitor
+    /// inside a V86 task when IOPL is below 3.
+    fn check_v86_iopl(&self) -> ExecResult<()> {
+        if self.is_v86_mode() && self.iopl() < 3 {
+            return Err(InternalFault::Exception {
+                vector: 13,
+                error_code: Some(0),
+            });
+        }
+        Ok(())
+    }
+
     /// Current privilege level. The CPL lives in the low two bits of the CS selector. Real
-    /// mode has no protection rings, so it is always CPL 0 there; only protected mode can
-    /// run at a lower privilege.
+    /// mode has no protection rings, so it is always CPL 0 there; a V86 task is always
+    /// CPL 3; otherwise protected mode can run at a lower privilege.
     fn current_privilege_level(&self) -> u8 {
-        if self.is_protected_mode() {
+        if self.is_v86_mode() {
+            3
+        } else if self.is_protected_mode() {
             (self.registers.cs().selector & 3) as u8
         } else {
             0
@@ -1115,6 +1141,7 @@ impl Cpu386 {
                 // dword form additionally carries the 486 AC and ID bits (RF and VM are
                 // masked to 0 in the pushed image, so they never appear). operand_size
                 // drives whether push writes 2 or 4 bytes.
+                self.check_v86_iopl()?;
                 let value = match operand_size {
                     OperandSize::Word => self.registers.eflags & 0xffff,
                     OperandSize::Dword => self.registers.eflags & (0xffff | FLAG_AC | FLAG_ID),
@@ -1124,6 +1151,7 @@ impl Cpu386 {
             }
             0x9d => {
                 // POPF / POPFD: load the popped image through the shared flag-load.
+                self.check_v86_iopl()?;
                 let value = self.pop(bus, operand_size)?;
                 self.load_flags(value, operand_size);
                 Ok(clocks(4))
@@ -1410,6 +1438,9 @@ impl Cpu386 {
                 Ok(clocks(33))
             }
             0xcd => {
+                // INT n. IOPL-sensitive in V86 so the monitor can virtualize software
+                // interrupts; otherwise it dispatches through the IVT/IDT.
+                self.check_v86_iopl()?;
                 let vector = self.fetch_u8(bus)?;
                 self.software_interrupt(bus, vector)?;
                 Ok(clocks(37))
@@ -1681,12 +1712,15 @@ impl Cpu386 {
                 Ok(clocks(2))
             }
             0xfa => {
+                // CLI. IOPL-sensitive: faults to the monitor in a V86 task below IOPL 3.
+                self.check_v86_iopl()?;
                 self.set_flag(FLAG_IF, false);
                 Ok(clocks(3))
             }
             0xfb => {
                 // STI sets IF and arms the one-instruction shadow so the instruction
                 // immediately after STI always executes before any interrupt is taken.
+                self.check_v86_iopl()?;
                 self.set_flag(FLAG_IF, true);
                 self.interrupt_shadow = true;
                 Ok(clocks(3))
@@ -3875,7 +3909,10 @@ impl Cpu386 {
         segment: SegmentIndex,
         selector: u16,
     ) -> ExecResult<()> {
-        if self.is_protected_mode() {
+        if self.is_v86_mode() {
+            // A V86 task addresses memory like the 8086: base = selector << 4, 64 KB.
+            self.load_segment_real(segment, selector);
+        } else if self.is_protected_mode() {
             let register = self.load_protected_segment(bus, selector)?;
             self.registers.set_segment(segment, register);
         } else {
@@ -12346,5 +12383,42 @@ mod tests {
         assert_eq!(writes, 2);
         assert_eq!(cpu.read_reg16(Reg16::Cx), 0);
         assert_eq!(cpu.read_reg16(Reg16::Si), 0x0104);
+    }
+
+    // ---- Phase 4 slice E: virtual-8086 mode ----
+
+    #[test]
+    fn v86_segment_load_uses_real_mode_base() {
+        // MOV DS, AX (8E D8) in a V86 task: DS base = selector << 4.
+        let (mut cpu, memory) = real_mode_cpu(&[0x8e, 0xd8], 0x40);
+        cpu.control.cr0 |= CR0_PE;
+        cpu.registers.eflags |= FLAG_VM;
+        cpu.write_reg16(Reg16::Ax, 0x1234);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ds).base, 0x1_2340);
+        assert_eq!(cpu.registers.segment(SegmentIndex::Ds).selector, 0x1234);
+    }
+
+    #[test]
+    fn cli_faults_in_v86_below_iopl3() {
+        // CLI (0xFA) in a V86 task with IOPL 0 traps to the monitor with #GP(0).
+        let (mut cpu, memory) = real_mode_cpu(&[0xfa], 0x40);
+        cpu.control.cr0 |= CR0_PE;
+        cpu.registers.eflags = 0x2 | FLAG_VM; // IOPL 0
+        let mut bus = TestBus::with_memory(memory);
+        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        assert!(matches!(fault, InternalFault::Exception { vector: 13, .. }));
+    }
+
+    #[test]
+    fn cli_runs_in_v86_at_iopl3() {
+        // With IOPL 3 the V86 task may touch IF directly.
+        let (mut cpu, memory) = real_mode_cpu(&[0xfa], 0x40);
+        cpu.control.cr0 |= CR0_PE;
+        cpu.registers.eflags = 0x2 | FLAG_VM | 0x3000 | FLAG_IF; // IOPL 3, IF set
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert!(!cpu.flag(FLAG_IF), "CLI cleared IF");
     }
 }
