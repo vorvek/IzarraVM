@@ -1597,14 +1597,21 @@ impl Machine {
                 self.set_eax_al(0);
                 self.set_int_frame_carry(false);
             }
+            // AH=0Bh set the system-timer day counter: store CX in the BDA scratch
+            // word so a later read returns it. The RTC calendar stays authoritative
+            // for AH=0Ah, so this is a write-through latch the BIOS keeps for the OS.
+            0x0B => {
+                let cx = self.cpu.registers.ecx() as u16;
+                let _ = self.memory.write_u16(BDA_DAY_COUNT, cx);
+                self.set_int_frame_carry(false);
+            }
             // AH=06h/07h set/cancel alarm: no alarm hardware modeled, accept and ignore.
-            // AH=0Bh set day counter: the RTC calendar is authoritative, so accept it.
             // AH=08h/0Ch set power-on alarm/date, AH=0Dh reset, AH=0Fh initialize RTC: all
             // documented as succeeding, and the host-driven clock makes them no-ops.
             // ponytail: power-management and alarm hardware are not modeled; these return
             // success without persisting state. Read-back alarm calls (AH=09h/0Eh) keep the
             // default carry since there is no alarm to report.
-            0x06 | 0x07 | 0x0B | 0x08 | 0x0C | 0x0D | 0x0F => self.set_int_frame_carry(false),
+            0x06 | 0x07 | 0x08 | 0x0C | 0x0D | 0x0F => self.set_int_frame_carry(false),
             _ => self.set_int_frame_carry(true),
         }
     }
@@ -1778,6 +1785,17 @@ impl Machine {
                 self.cpu.registers.set_ebx(ebx);
                 true
             }
+            // XMS install check (INT 2F/AX=4300h). No XMS/HIMEM driver is loaded, so
+            // the honest answer is AL=00h (not installed). A guest that wants extended
+            // memory uses the INT 15h paths (AH=88h/E801h/E820h) instead.
+            0x4300 => {
+                self.set_eax_al(0x00);
+                true
+            }
+            // Get XMS driver entry point (AX=4310h): with no driver installed there is
+            // no ES:BX entry to hand back, so leave the registers unchanged and report
+            // unhandled. The install check already told the guest XMS is absent.
+            0x4310 => false,
             // Get ICDEX version: BH = major, BL = minor. Report 2.23.
             0x150C => {
                 let ebx = (self.cpu.registers.ebx() & !0xFFFF) | 0x0217; // 2.23
@@ -1804,6 +1822,19 @@ impl Machine {
             }
             _ => false,
         }
+    }
+
+    /// Service INT 28h (DOS idle). DOS calls this from its keyboard-wait loop so a
+    /// TSR can do background work. With no TSR installed it is a no-op return; the
+    /// guest's FLAGS image is untouched, the way the default IRET stub left it.
+    fn handle_int28(&mut self) {}
+
+    /// Service INT 29h (DOS fast console output). The character is in AL; write it to
+    /// the active page through the same teletype path INT 10h AH=0Eh uses, the way
+    /// the DOS CON device's fast-output hook does.
+    fn handle_int29(&mut self) {
+        let al = self.cpu.registers.eax() as u8;
+        self.teletype_char(al);
     }
 
     /// Execute one CD-ROM device driver request whose header begins at linear
@@ -1998,9 +2029,12 @@ impl Machine {
             0x04 => self.int13_verify(dl),
             // AH=08 read drive parameters. Report the mounted media geometry.
             0x08 => self.int13_drive_parameters(dl),
-            // AH=15 read disk type. A floppy without a change line.
-            0x15 => {
-                self.set_eax_ah(0x01);
+            // AH=15 get DASD type. DL selects the drive. A mounted floppy reports
+            // AH=01 (no change-line), an absent floppy AH=00 (no such drive). No
+            // fixed-disk path yet, so DL>=0x80 falls through to the unknown arm.
+            0x15 if dl < 0x80 => {
+                let mounted = dl == 0x00 && self.floppy.is_some();
+                self.set_eax_ah(if mounted { 0x01 } else { 0x00 });
                 self.set_disk_status(0x00);
                 self.set_int_frame_carry(false);
             }
@@ -2174,8 +2208,9 @@ impl Machine {
         let cx = (u16::from(ch) << 8) | u16::from(cl);
         let ecx = (self.cpu.registers.ecx() & !0xFFFF) | u32::from(cx);
         self.cpu.registers.set_ecx(ecx);
-        // DH = max head index, DL = number of floppy drives.
-        let dx = (u16::from(geom.heads.saturating_sub(1)) << 8) | 0x01;
+        // DH = max head index, DL = number of floppy drives, read from the
+        // equipment word so it tracks the mounted drives rather than a fixed 1.
+        let dx = (u16::from(geom.heads.saturating_sub(1)) << 8) | u16::from(self.floppy_count());
         let edx = (self.cpu.registers.edx() & !0xFFFF) | u32::from(dx);
         self.cpu.registers.set_edx(edx);
         // BL = drive type (0x03 = 720 KB, 0x04 = 1.44 MB).
@@ -2184,6 +2219,18 @@ impl Machine {
         self.set_eax_ah(0x00);
         self.set_disk_status(0x00);
         self.set_int_frame_carry(false);
+    }
+
+    /// Number of floppy drives the BDA equipment word advertises (0040:0010): bit 0
+    /// is the floppy-installed flag, bits 7-6 are the drive count minus one. INT 13h
+    /// AH=08h reports this in DL so it tracks the mounted drives.
+    fn floppy_count(&self) -> u8 {
+        let word = self.memory.read_u16(0x410).unwrap_or(BIOS_EQUIPMENT_WORD);
+        if word & 0x0001 == 0 {
+            0
+        } else {
+            ((word >> 6) & 0x03) as u8 + 1
+        }
     }
 
     /// Replace AH in EAX, leaving AL and the upper 16 bits intact.
@@ -3401,6 +3448,8 @@ impl Machine {
                             0x15 => self.handle_int15(),
                             0x17 => self.handle_int17(),
                             0x1A => self.handle_int1a(),
+                            0x28 => self.handle_int28(),
+                            0x29 => self.handle_int29(),
                             0x33 => self.handle_int33(),
                             0x2F => {
                                 self.handle_int2f();
@@ -3743,7 +3792,19 @@ impl CpuBus for MachineBus<'_> {
         // revisit if an x87 #MF is added.
         if matches!(
             vector,
-            0x10 | 0x11 | 0x12 | 0x13 | 0x14 | 0x15 | 0x17 | 0x1A | 0x20 | 0x21 | 0x2F | 0x33
+            0x10 | 0x11
+                | 0x12
+                | 0x13
+                | 0x14
+                | 0x15
+                | 0x17
+                | 0x1A
+                | 0x20
+                | 0x21
+                | 0x28
+                | 0x29
+                | 0x2F
+                | 0x33
         ) {
             *self.pending_soft_int = Some(vector);
         }
@@ -3911,6 +3972,11 @@ const BIOS_EQUIPMENT_WORD: u16 = 0x4221;
 /// rest is extended memory above 1 MiB (reported by INT 15h AH=88h).
 const BIOS_BASE_MEMORY_KIB: u16 = 640;
 
+/// BDA scratch word INT 1Ah AH=0Bh latches the system-timer day count into, for a
+/// later read. It sits in the inter-application scratch area at 0040:00F0, which no
+/// other field here uses.
+const BDA_DAY_COUNT: usize = 0x4f0;
+
 /// Segment of the ROM-resident IRET the BIOS keeps at ROM offset 0xF000, i.e.
 /// FF00:0000. The host intercepts the BIOS service interrupts by vector number,
 /// so their IVT targets only need a valid IRET to return on. Pointing them at
@@ -3921,9 +3987,11 @@ const BIOS_ROM_IRET_SEG: u16 = 0xff00;
 fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     // BIOS service interrupts the host intercepts by vector. Their IVT targets
     // point at the ROM IRET so they survive a guest low-memory wipe. INT 33h is
-    // the mouse driver and INT 2Fh is the ICDEX CD bridge: the same stub shape
-    // the HLE handler returns through.
-    for vector in [0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x17, 0x1A, 0x2F, 0x33] {
+    // the mouse driver and INT 2Fh is the ICDEX CD bridge; INT 28h/29h are the DOS
+    // idle and fast-console hooks: the same stub shape the HLE handler returns through.
+    for vector in [
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x17, 0x1A, 0x28, 0x29, 0x2F, 0x33,
+    ] {
         let address = vector * 4;
         memory.write_u16(address, 0)?;
         memory.write_u16(address + 2, BIOS_ROM_IRET_SEG)?;
@@ -3938,19 +4006,43 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     // Seed the BDA words INT 11h and INT 12h hand back, like a real BIOS.
     memory.write_u16(0x410, BIOS_EQUIPMENT_WORD)?;
     memory.write_u16(0x413, BIOS_BASE_MEMORY_KIB)?;
-    // Serial and parallel port base addresses POST detected: COM1 at 0040:0000 and
-    // LPT1 at 0040:0008, matching the equipment word. INT 14h/17h drive these ports,
-    // and software that reads the base straight from the BDA finds them here. The
-    // timeout bytes (0040:007C serial, 0040:0078 printer) get the usual defaults.
+    // Serial and parallel port base address tables POST detected (0040:0000 COM1-4,
+    // 0040:0008 LPT1-4). Only COM1 (0x03F8) and LPT1 (0x0378) are wired, matching the
+    // equipment word; the rest read 0 (absent). INT 14h/17h drive the COM1/LPT1 ports,
+    // and software that reads a base straight from the BDA finds it here.
     memory.write_u16(0x400, 0x03f8)?; // COM1 base
+    memory.write_u16(0x402, 0)?; // COM2 absent
+    memory.write_u16(0x404, 0)?; // COM3 absent
+    memory.write_u16(0x406, 0)?; // COM4 absent
     memory.write_u16(0x408, 0x0378)?; // LPT1 base
-    memory.write_u8(0x47c, 0x01)?; // COM1 timeout
-    memory.write_u8(0x478, 0x14)?; // LPT1 timeout
+    memory.write_u16(0x40a, 0)?; // LPT2 absent
+    memory.write_u16(0x40c, 0)?; // LPT3 absent
+    memory.write_u16(0x40e, 0)?; // LPT4 absent
+    // Per-port timeout tables: serial 0040:007C-007F, printer 0040:0078-007B. The
+    // BIOS defaults a serial timeout of 0x01 and a printer timeout of 0x14.
+    for offset in 0x47c..=0x47f {
+        memory.write_u8(offset, 0x01)?; // COM1-4 timeouts
+    }
+    for offset in 0x478..=0x47b {
+        memory.write_u8(offset, 0x14)?; // LPT1-4 timeouts
+    }
     // Seed the BDA video state to text 80x25 (mode 03h) like a real BIOS POST.
-    memory.write_u8(0x449, 0x03)?;
-    memory.write_u16(0x44a, 80)?;
-    memory.write_u8(0x484, 24)?;
-    memory.write_u16(0x463, 0x03d4)?;
+    memory.write_u8(0x449, 0x03)?; // current video mode
+    memory.write_u16(0x44a, 80)?; // columns on screen
+    memory.write_u16(0x44c, 0x1000)?; // regen (page) size in bytes
+    memory.write_u16(0x44e, 0)?; // active page start in regen buffer
+    memory.write_u8(0x462, 0)?; // active display page
+    memory.write_u16(0x463, 0x03d4)?; // CRTC base port
+    memory.write_u8(0x484, 24)?; // rows on screen minus one
+    memory.write_u8(0x485, 16)?; // character cell height in scan lines
+    memory.write_u8(0x487, 0x60)?; // EGA/VGA control: 350-line, no cursor emulation
+    memory.write_u8(0x488, 0xf9)?; // EGA/VGA switches / feature bits
+    memory.write_u8(0x489, 0x00)?; // VGA flags (mode-set control)
+    // Fixed-disk count: none modeled. Ctrl-Break flag clear. Warm-boot magic 0x1234
+    // tells the BIOS to skip the memory test on the next reset.
+    memory.write_u8(0x475, 0)?; // number of fixed disks
+    memory.write_u8(0x471, 0)?; // Ctrl-Break flag
+    memory.write_u16(0x472, 0x1234)?; // warm-boot magic
     memory.write_u8(BIOS_IRET_STUB_ADDRESS, 0xcf)
 }
 
@@ -4466,6 +4558,113 @@ mod tests {
         assert_eq!(days_since_1980(1980, 1, 1), 0);
         assert_eq!(days_since_1980(1980, 3, 1), 60); // 1980 is a leap year (31+29)
         assert_eq!(days_since_1980(1981, 1, 1), 366);
+    }
+
+    #[test]
+    fn int1a_set_day_counter_round_trips() {
+        let mut m = int15_machine(16);
+        // AH=0Bh latches CX into the BDA scratch word; it reads back unchanged.
+        m.cpu.registers.set_eax(0x0B00);
+        m.cpu.registers.set_ecx(0x1234);
+        m.handle_int1a();
+        assert_eq!(m.memory.read_u16(BDA_DAY_COUNT).unwrap(), 0x1234);
+        // CF clear: the call succeeded.
+        let ss = m.cpu.registers.segment(SegmentIndex::Ss).base;
+        let sp = m.cpu.registers.esp() as u16;
+        let flags = m
+            .memory
+            .read_u16((ss + u32::from(sp.wrapping_add(4))) as usize)
+            .unwrap();
+        assert_eq!(flags & 0x0001, 0, "CF clear");
+    }
+
+    #[test]
+    fn int13_drive_parameters_report_real_floppy_count() {
+        let mut m = int15_machine(16);
+        m.mount_floppy(vec![0u8; 1_474_560]).unwrap(); // 1.44 MB
+        m.cpu.registers.set_eax(0x0800);
+        m.cpu.registers.set_edx(0x0000); // DL=0 drive A:
+        m.handle_int13();
+        // One drive is mounted: DL reports 1, derived from the equipment word.
+        assert_eq!(m.cpu.registers.edx() as u8, 0x01, "DL = floppy count");
+        assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x00, "AH = success");
+    }
+
+    #[test]
+    fn int13_drive_parameters_reject_fixed_disk() {
+        let mut m = int15_machine(16);
+        m.mount_floppy(vec![0u8; 1_474_560]).unwrap();
+        m.cpu.registers.set_eax(0x0800);
+        m.cpu.registers.set_edx(0x0080); // DL=0x80 fixed disk, none modeled
+        m.handle_int13();
+        assert_eq!(
+            (m.cpu.registers.eax() >> 8) as u8,
+            0x80,
+            "AH = timeout/no drive"
+        );
+    }
+
+    #[test]
+    fn int13_dasd_type_honors_drive_presence() {
+        let mut m = int15_machine(16);
+        m.mount_floppy(vec![0u8; 1_474_560]).unwrap();
+        // DL=0 with a floppy mounted: AH=01 (floppy, no change line), CF clear.
+        m.cpu.registers.set_eax(0x1500);
+        m.cpu.registers.set_edx(0x0000);
+        m.handle_int13();
+        assert_eq!(
+            (m.cpu.registers.eax() >> 8) as u8,
+            0x01,
+            "AH = floppy, no change line"
+        );
+        // DL=1 is an absent second floppy: AH=00 (no such drive).
+        m.cpu.registers.set_eax(0x1500);
+        m.cpu.registers.set_edx(0x0001);
+        m.handle_int13();
+        assert_eq!(
+            (m.cpu.registers.eax() >> 8) as u8,
+            0x00,
+            "AH = no such drive"
+        );
+    }
+
+    #[test]
+    fn bda_seeds_serial_parallel_and_video_state() {
+        let m = int15_machine(16);
+        // Serial/parallel base tables: only COM1 and LPT1 are wired.
+        assert_eq!(m.memory.read_u16(0x400).unwrap(), 0x03f8); // COM1
+        assert_eq!(m.memory.read_u16(0x402).unwrap(), 0); // COM2 absent
+        assert_eq!(m.memory.read_u16(0x408).unwrap(), 0x0378); // LPT1
+        assert_eq!(m.memory.read_u16(0x40a).unwrap(), 0); // LPT2 absent
+        // Timeout tables across all four ports each.
+        assert_eq!(m.memory.read_u8(0x47f).unwrap(), 0x01); // COM4 timeout
+        assert_eq!(m.memory.read_u8(0x47b).unwrap(), 0x14); // LPT4 timeout
+        // Static video-state block and the system flags.
+        assert_eq!(m.memory.read_u16(0x44c).unwrap(), 0x1000); // regen page size
+        assert_eq!(m.memory.read_u8(0x485).unwrap(), 16); // char cell height
+        assert_eq!(m.memory.read_u8(0x475).unwrap(), 0); // no fixed disks
+        assert_eq!(m.memory.read_u16(0x472).unwrap(), 0x1234); // warm-boot magic
+    }
+
+    #[test]
+    fn int2f_xms_install_check_reports_not_installed() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x4300);
+        assert!(m.handle_int2f());
+        assert_eq!(m.cpu.registers.eax() as u8, 0x00, "AL = XMS not installed");
+        // The entry-point query (AX=4310h) is unhandled: no driver to point at.
+        m.cpu.registers.set_eax(0x4310);
+        assert!(!m.handle_int2f());
+    }
+
+    #[test]
+    fn int29_writes_the_character_to_the_screen() {
+        let mut m = int15_machine(16);
+        // Place the cursor at the top-left so the byte lands at video offset 0.
+        m.memory.write_u16(0x450, 0).unwrap();
+        m.cpu.registers.set_eax(u32::from(b'Z'));
+        m.handle_int29();
+        assert_eq!(m.video.read_u8(0).unwrap(), b'Z');
     }
 
     #[test]
