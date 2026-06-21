@@ -310,27 +310,35 @@ enum ResizeError {
 }
 
 impl Arena {
-    /// AH=48h: allocate `paras` paragraphs. Ok(segment) or Err(largest-available).
+    /// AH=48h: allocate `paras` paragraphs. Ok(data-segment) or Err(largest-available
+    /// data paragraphs). Each block reserves a one-paragraph MCB header at the current
+    /// free_base; the data segment handed to the guest is one paragraph higher, and
+    /// free_base advances past header and data. The largest-available figure already
+    /// subtracts the header paragraph, so a guest retry with that count fits exactly.
     fn allocate(&mut self, paras: u16) -> Result<u16, u16> {
-        let end = u32::from(self.free_base) + u32::from(paras);
+        let data_seg = u32::from(self.free_base) + 1; // header sits at free_base
+        let end = data_seg + u32::from(paras); // first free paragraph after the data
         if end <= u32::from(ARENA_TOP) {
-            let seg = self.free_base;
+            let seg = data_seg as u16;
             self.blocks.push((seg, paras));
             self.free_base = end as u16;
             Ok(seg)
         } else {
-            Err(ARENA_TOP - self.free_base)
+            // Room for the header plus this many data paragraphs, never below zero.
+            Err((u32::from(ARENA_TOP).saturating_sub(data_seg)) as u16)
         }
     }
 
     /// AH=4Ah: resize the block at `seg` to `paras` paragraphs.
     fn resize(&mut self, seg: u16, paras: u16) -> Result<(), ResizeError> {
         if seg == self.psp_seg {
-            // The program block. Its ceiling is the lowest AH=48h block, or ARENA_TOP.
+            // The program block. Its ceiling is the header paragraph of the lowest
+            // AH=48h block (its data segment minus one), or ARENA_TOP with no blocks,
+            // so the program data never overlaps the next block's MCB header.
             let limit = self
                 .blocks
                 .iter()
-                .map(|&(s, _)| s)
+                .map(|&(s, _)| s.wrapping_sub(1))
                 .min()
                 .unwrap_or(ARENA_TOP);
             let new_top = u32::from(self.psp_seg) + u32::from(paras);
@@ -378,7 +386,7 @@ impl Arena {
             let is_top = idx + 1 == self.blocks.len();
             let (_, paras) = self.blocks.remove(idx);
             if is_top {
-                self.free_base -= paras; // LIFO reclaim
+                self.free_base -= paras + 1; // LIFO reclaim of the data plus its header
             }
             Ok(())
         } else {
@@ -412,10 +420,10 @@ impl Arena {
     /// (owner = its own segment), then the free remainder (owner 0). Each region's
     /// header paragraph is carved from the span, so a block's `size` is its arena
     /// paragraph count and the running cursor steps over the extra header paragraph.
-    /// The arena hands a guest the data segment S whose MCB this places at S-1; the
-    /// header paragraphs are an accounting view over the same bytes the bump arena
-    /// already tracks, not separately reserved storage (see the ponytail on
-    /// materialize_mcb_chain).
+    /// The arena reserves that header paragraph for real: an AH=48h block's data
+    /// segment S is one paragraph above its header, so this places the header at S-1,
+    /// below the bytes the guest holds. The cursor lands on S-1 for each block because
+    /// the bump allocator stepped over the same header when it handed out S.
     fn mcb_layout(&self) -> Vec<McbEntry> {
         let mut entries = Vec::new();
         let mut cursor = self.psp_seg.wrapping_sub(1); // header paragraph below the PSP
@@ -458,6 +466,8 @@ impl Arena {
     // coalescing free-list. The headers are rewritten on demand (the guest reads
     // them through AH=52h), so allocations stay observable, but adjacent free
     // blocks are not merged and a guest cannot hand DOS a block by editing a header.
+    // Each header lands in a paragraph the allocator reserved for it (one below the
+    // block's data segment), so materializing the chain never overwrites guest data.
     // The upgrade path is to make the chain authoritative: walk and mutate it in
     // allocate/free/resize instead of keeping the Vec<(seg,paras)>, which turns the
     // arena into a true MCB free-list and lets a guest drive allocation directly.
@@ -747,8 +757,9 @@ impl DosKernel {
         // of the top of the program block, mirroring real DOS, which sizes the
         // program block AFTER reserving the environment; PSP:0x02 tracks the
         // reduced top. For a .COM (PSP:0x02 = segment + 0x1000) there is already
-        // ample room above the program, so no shrink happens.
-        let limit = ARENA_TOP.saturating_sub(paras);
+        // ample room above the program, so no shrink happens. The env allocation
+        // also reserves a one-paragraph MCB header, so leave room for paras+1.
+        let limit = ARENA_TOP.saturating_sub(paras.saturating_add(1));
         if self.arena.prog_top > limit {
             self.arena.prog_top = limit;
             if self.arena.blocks.is_empty() {
@@ -5119,7 +5130,8 @@ mod tests {
         };
         kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
         assert!(!regs.cf);
-        assert_eq!(regs.ax, 0x1100); // first free paragraph = prog_top
+        // The header paragraph sits at prog_top (0x1100); the data segment is one higher.
+        assert_eq!(regs.ax, 0x1101);
     }
 
     #[test]
@@ -5135,7 +5147,8 @@ mod tests {
         };
         kernel.dispatch(0x21, &mut resize, &mut mem).unwrap();
         assert!(!resize.cf);
-        // Now AH=48h allocates from the freed tail: new free_base = 0x0100 + 0x0800 = 0x0900.
+        // Now AH=48h allocates from the freed tail: free_base = 0x0100 + 0x0800 = 0x0900,
+        // its MCB header lands there, and the data segment is one paragraph higher.
         let mut alloc = DosRegs {
             ax: 0x4800,
             bx: 0x0010,
@@ -5143,14 +5156,15 @@ mod tests {
         };
         kernel.dispatch(0x21, &mut alloc, &mut mem).unwrap();
         assert!(!alloc.cf);
-        assert_eq!(alloc.ax, 0x0900);
+        assert_eq!(alloc.ax, 0x0901);
     }
 
     #[test]
     fn ah48_past_the_ceiling_returns_largest_available() {
         let mut mem = Memory::new(4096).unwrap();
         let mut kernel = arena_kernel();
-        // Request more than fits: free_base=0x1100, ceiling 0xA000 -> available 0x8F00.
+        // Request more than fits: free_base=0x1100, header at 0x1100, data starts at
+        // 0x1101, ceiling 0xA000 -> largest data that fits is 0xA000 - 0x1101 = 0x8EFF.
         let mut regs = DosRegs {
             ax: 0x4800,
             bx: 0x9000,
@@ -5159,7 +5173,7 @@ mod tests {
         kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
         assert!(regs.cf);
         assert_eq!(regs.ax, 0x08);
-        assert_eq!(regs.bx, 0x8f00); // 0xA000 - 0x1100
+        assert_eq!(regs.bx, 0x8eff); // 0xA000 - 0x1101 (header paragraph excluded)
     }
 
     #[test]
@@ -5189,7 +5203,7 @@ mod tests {
             ..DosRegs::default()
         };
         kernel.dispatch(0x21, &mut a, &mut mem).unwrap();
-        let seg = a.ax; // 0x1100
+        let seg = a.ax; // data segment 0x1101 (header at 0x1100)
         let mut free = DosRegs {
             ax: 0x4900,
             es: seg,
@@ -5197,7 +5211,7 @@ mod tests {
         };
         kernel.dispatch(0x21, &mut free, &mut mem).unwrap();
         assert!(!free.cf);
-        // The next allocation reuses the reclaimed paragraph.
+        // The next allocation reuses the reclaimed header and data paragraphs.
         let mut b = DosRegs {
             ax: 0x4800,
             bx: 0x0008,
@@ -5233,45 +5247,48 @@ mod tests {
             ..DosRegs::default()
         };
         kernel.dispatch(0x21, &mut a, &mut mem).unwrap();
-        assert_eq!(a.ax, 0x1100);
+        // Header at 0x1100, data at 0x1101; free_base ends at 0x1111.
+        assert_eq!(a.ax, 0x1101);
         let mut b = DosRegs {
             ax: 0x4800,
             bx: 0x0010,
             ..DosRegs::default()
         };
         kernel.dispatch(0x21, &mut b, &mut mem).unwrap();
-        assert_eq!(b.ax, 0x1110);
+        // B's header at 0x1111, data at 0x1112; free_base ends at 0x1122.
+        assert_eq!(b.ax, 0x1112);
         // Free the lower block A (non-top): the hole is not reclaimed.
         let mut free_a = DosRegs {
             ax: 0x4900,
-            es: 0x1100,
+            es: 0x1101,
             ..DosRegs::default()
         };
         kernel.dispatch(0x21, &mut free_a, &mut mem).unwrap();
         assert!(!free_a.cf);
-        // Free the top block B: reclaims its paragraphs, no underflow.
+        // Free the top block B: reclaims its data plus header, no underflow.
         let mut free_b = DosRegs {
             ax: 0x4900,
-            es: 0x1110,
+            es: 0x1112,
             ..DosRegs::default()
         };
         kernel.dispatch(0x21, &mut free_b, &mut mem).unwrap();
         assert!(!free_b.cf);
-        // A fresh allocation starts at 0x1110 (B's reclaimed top); A's hole at
-        // 0x1100 is leaked, as documented.
+        // A fresh allocation reuses B's reclaimed span: header at 0x1111, data at
+        // 0x1112; A's hole at 0x1101 is leaked, as documented.
         let mut c = DosRegs {
             ax: 0x4800,
             bx: 0x0008,
             ..DosRegs::default()
         };
         kernel.dispatch(0x21, &mut c, &mut mem).unwrap();
-        assert_eq!(c.ax, 0x1110);
+        assert_eq!(c.ax, 0x1112);
     }
 
     #[test]
-    fn ah48_zero_paragraphs_returns_a_segment_without_advancing() {
-        // A zero-paragraph allocation is a legal DOS request: it returns the
-        // current free_base and does not advance it.
+    fn ah48_zero_paragraphs_reserves_only_its_header() {
+        // A zero-paragraph allocation is a legal DOS request: it still carries an
+        // MCB header, so it returns a data segment one paragraph above free_base and
+        // advances free_base past that single header paragraph.
         let mut mem = Memory::new(4096).unwrap();
         let mut kernel = arena_kernel();
         let mut z = DosRegs {
@@ -5281,14 +5298,16 @@ mod tests {
         };
         kernel.dispatch(0x21, &mut z, &mut mem).unwrap();
         assert!(!z.cf);
-        assert_eq!(z.ax, 0x1100); // free_base, unchanged
+        assert_eq!(z.ax, 0x1101); // header at 0x1100, data at 0x1101
         let mut a = DosRegs {
             ax: 0x4800,
             bx: 0x0010,
             ..DosRegs::default()
         };
         kernel.dispatch(0x21, &mut a, &mut mem).unwrap();
-        assert_eq!(a.ax, 0x1100); // next allocation still at free_base
+        // free_base advanced by the zero block's header, so the next data segment is
+        // one higher again: header at 0x1101, data at 0x1102.
+        assert_eq!(a.ax, 0x1102);
     }
 
     /// Walk the materialized MCB chain from a first-MCB segment, returning the
@@ -5357,7 +5376,11 @@ mod tests {
             ..DosRegs::default()
         };
         kernel.dispatch(0x21, &mut alloc, &mut mem).unwrap();
-        let new_seg = alloc.ax; // 0x1100
+        let new_seg = alloc.ax; // data segment 0x1101 (header at 0x1100)
+        // Drop a sentinel into the allocated block's data. Materializing the chain
+        // must not overwrite it: the block's MCB header lives one paragraph below.
+        let sentinel_addr = usize::from(new_seg) * 16;
+        mem.write_u8(sentinel_addr, 0xa5).unwrap();
         let mut regs = DosRegs {
             ax: 0x5200,
             ..DosRegs::default()
@@ -5370,6 +5393,21 @@ mod tests {
         assert_eq!(chain[1].1, new_seg, "AH=48h block owned by its segment");
         assert_eq!(chain[1].2, 0x0010, "block size in paragraphs");
         assert_eq!(chain[2].0, b'Z');
+        // The chain reports the block's data at mcb_seg+1. The block MCB sits just
+        // past the program MCB (first + 1 + program size), so the data segment the
+        // chain advertises must equal what AH=48h handed the guest.
+        let block_mcb = first.wrapping_add(1).wrapping_add(chain[0].2);
+        assert_eq!(
+            block_mcb.wrapping_add(1),
+            new_seg,
+            "chain reports the AH=48h data segment, not one paragraph above it"
+        );
+        // The sentinel survives: no 'M'/'Z' header was written over the guest data.
+        assert_eq!(
+            mem.read_u8(sentinel_addr).unwrap(),
+            0xa5,
+            "materialize_mcb_chain must not clobber the allocated block's data"
+        );
     }
 
     #[test]
@@ -7061,9 +7099,10 @@ mod tests {
             .install_environment(&mut mem, &[("BLASTER", "A220 I5 D1 H5 T6")])
             .unwrap();
 
-        // PSP:0x2C names the env segment, which sits directly above the program.
+        // PSP:0x2C names the env segment. Its MCB header sits at prog_top, so the env
+        // data segment is one paragraph above the program block.
         let env_seg = mem.read_u16(0x0100 * 16 + 0x2c).unwrap();
-        assert_eq!(env_seg, prog_top);
+        assert_eq!(env_seg, prog_top + 1);
         // The block at env_seg:0 scans back to the single BLASTER entry.
         assert_eq!(
             parse_env_block(&mem, env_seg),
@@ -7152,7 +7191,8 @@ mod tests {
         // The arena trimmed the program block to psp_seg + DX and flagged it.
         assert!(kernel.arena.resident);
         assert_eq!(kernel.arena.prog_top, 0x0100 + 0x0020);
-        // The freed tail is available: the next allocation lands at the trimmed top.
+        // The freed tail is available: the next allocation puts its MCB header at the
+        // trimmed top (0x0120) and hands back the data segment one paragraph higher.
         let mut alloc = DosRegs {
             ax: 0x4800,
             bx: 0x0001,
@@ -7160,7 +7200,7 @@ mod tests {
         };
         kernel.dispatch(0x21, &mut alloc, &mut mem).unwrap();
         assert!(!alloc.cf);
-        assert_eq!(alloc.ax, 0x0100 + 0x0020);
+        assert_eq!(alloc.ax, 0x0100 + 0x0020 + 1);
     }
 
     #[test]
@@ -7185,7 +7225,8 @@ mod tests {
         };
         kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
         assert!(!regs.cf);
-        assert_eq!(regs.ax, prog_top + env_paras);
+        // Two header paragraphs sit in the way: the env block's and this allocation's.
+        assert_eq!(regs.ax, prog_top + env_paras + 2);
     }
 
     #[test]
@@ -7206,7 +7247,8 @@ mod tests {
         assert_eq!(mem.read_u16(psp + 2).unwrap(), prog_top); // top-of-memory
         assert_eq!(mem.read_u8(psp + 0x80).unwrap(), 0x00);
         assert_eq!(mem.read_u8(psp + 0x81).unwrap(), 0x0d);
-        assert_eq!(mem.read_u16(psp + 0x2c).unwrap(), prog_top); // env seg
+        // env data sits one paragraph above the program block, past its MCB header.
+        assert_eq!(mem.read_u16(psp + 0x2c).unwrap(), prog_top + 1); // env seg
     }
 
     #[test]
@@ -7216,7 +7258,7 @@ mod tests {
         let (mut kernel, mut mem, prog_top) = env_kernel();
         kernel.install_environment(&mut mem, &[]).unwrap();
         let env_seg = mem.read_u16(0x0100 * 16 + 0x2c).unwrap();
-        assert_eq!(env_seg, prog_top);
+        assert_eq!(env_seg, prog_top + 1); // data above the env block's MCB header
         assert_eq!(mem.read_u8(usize::from(env_seg) * 16).unwrap(), 0);
         assert!(parse_env_block(&mem, env_seg).is_empty());
     }
@@ -7258,9 +7300,11 @@ mod tests {
         )
         .unwrap();
         let psp = 0x0100usize * 16;
-        // PSP:0x02 is reduced by the env paragraphs ...
-        assert_eq!(mem.read_u16(psp + 2).unwrap(), ARENA_TOP - paras);
-        // ... and PSP:0x2C names the env segment carved from the top.
+        // PSP:0x02 drops by the env paragraphs plus the env block's one MCB header,
+        // so the program data stops just below that header ...
+        assert_eq!(mem.read_u16(psp + 2).unwrap(), ARENA_TOP - paras - 1);
+        // ... and PSP:0x2C names the env data segment carved from the top, one
+        // paragraph above its header.
         let env_seg = mem.read_u16(psp + 0x2c).unwrap();
         assert_eq!(env_seg, ARENA_TOP - paras);
         assert_eq!(
