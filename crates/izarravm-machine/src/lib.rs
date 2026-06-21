@@ -3414,10 +3414,11 @@ fn boot_sector_cpu() -> Cpu386 {
 
 /// BIOS equipment word reported by INT 11h (BDA 0040:0010). Bit 0 set with
 /// bits 7-6 clear means one floppy drive; bits 5-4 = 10b is the 80x25 color
-/// initial video mode. Bit 1 (80x87 coprocessor) stays clear: the Izarra 3000
-/// ships no 387, so software that probes the equipment word skips its FPU path.
-/// See RBIL INT 11h equipment bitfield (dev_docs/reference/rbil/INTERRUP.B).
-const BIOS_EQUIPMENT_WORD: u16 = 0x0021;
+/// initial video mode; bits 11-9 = 001b advertises one serial port (COM1 is
+/// emulated). Bit 1 (80x87 coprocessor) stays clear: the Izarra 3000 ships no
+/// 387, so software that probes the equipment word skips its FPU path. See RBIL
+/// INT 11h equipment bitfield (dev_docs/reference/rbil/INTERRUP.B).
+const BIOS_EQUIPMENT_WORD: u16 = 0x0221;
 
 /// Conventional memory size in KiB reported by INT 12h (BDA 0040:0013). A PC
 /// caps usable low memory at 640 KiB no matter how much RAM is installed; the
@@ -4158,6 +4159,8 @@ mod tests {
         assert_eq!(reason, StopReason::Halted);
         let ax = machine.cpu().registers.eax() as u16;
         assert_eq!(ax, BIOS_EQUIPMENT_WORD);
+        // Bits 11-9 = 001b: one serial port advertised for the emulated COM1.
+        assert_eq!((ax >> 9) & 0x07, 1, "one serial port advertised");
         // Bit 1 (80x87 coprocessor) stays clear: the Izarra 3000 has no FPU.
         assert_eq!(ax & 0x0002, 0, "no coprocessor advertised");
     }
