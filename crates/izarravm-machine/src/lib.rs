@@ -1639,11 +1639,12 @@ impl Machine {
                 self.set_eax_ah(0x00);
                 self.set_int_frame_carry(false);
             }
-            // C201 reset: BH=0xAA (basic-assurance-test passed), BL=0x00 (device id,
-            // a standard two-button mouse). Re-centre the modeled mouse like a reset.
+            // C201 reset: BH=0x00 (device id, a standard mouse), BL=0xAA (the
+            // reset-complete/BAT-passed signature the device returns; drivers probe
+            // for AAh here). Re-centre the modeled mouse like a reset.
             0x01 => {
                 self.mouse = MouseState::default();
-                let ebx = (self.cpu.registers.ebx() & !0xFFFF) | 0xAA00;
+                let ebx = (self.cpu.registers.ebx() & !0xFFFF) | 0x00AA;
                 self.cpu.registers.set_ebx(ebx);
                 self.set_eax_ah(0x00);
                 self.set_int_frame_carry(false);
@@ -5026,13 +5027,13 @@ mod tests {
 
     #[test]
     fn int15_c201_reset_reports_present_standard_mouse() {
-        // C201 resets the PS/2 mouse: BH=0xAA (BAT passed), BL=0x00 (standard id),
-        // AH=0x00, CF clear.
+        // C201 resets the PS/2 mouse: BH=0x00 (standard device id), BL=0xAA (the
+        // reset-complete signature drivers probe for), AH=0x00, CF clear.
         let mut m = int15_machine(16);
         m.cpu.registers.set_eax(0xC201);
         m.cpu.registers.set_ebx(0xFFFF);
         m.handle_int15();
-        assert_eq!(m.cpu.registers.ebx() as u16, 0xAA00, "BH=AA BL=00");
+        assert_eq!(m.cpu.registers.ebx() as u16, 0x00AA, "BH=00 BL=AA");
         assert_eq!((m.cpu.registers.eax() as u16 >> 8) as u8, 0x00, "AH=00");
     }
 
