@@ -7746,6 +7746,66 @@ mod tests {
         );
     }
 
+    #[test]
+    fn toka_md_and_cd_update_the_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = izarravm_firmware::toka_dos_system_files();
+        izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format)
+            .unwrap();
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .unwrap();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        machine.set_toka_c_root(dir.path().to_path_buf());
+        machine.run_until_halt_or_cycles(22_000_000).unwrap();
+
+        // Minimal ASCII to Set 1 for the characters this test types, with Shift
+        // for uppercase letters.
+        fn key_codes(ch: char) -> Vec<u8> {
+            let make: u8 = match ch.to_ascii_lowercase() {
+                'm' => 0x32,
+                'd' => 0x20,
+                's' => 0x1f,
+                'u' => 0x16,
+                'b' => 0x30,
+                'c' => 0x2e,
+                ' ' => 0x39,
+                '\r' => 0x1c,
+                _ => return Vec::new(),
+            };
+            let mut codes = Vec::new();
+            if ch.is_ascii_uppercase() {
+                codes.push(0x2a);
+            }
+            codes.push(make);
+            codes.push(make | 0x80);
+            if ch.is_ascii_uppercase() {
+                codes.push(0xaa);
+            }
+            codes
+        }
+        let type_str = |machine: &mut Machine, text: &str| {
+            for ch in text.chars() {
+                for code in key_codes(ch) {
+                    machine.inject_key_scancodes(&[code]);
+                }
+                machine.run_until_halt_or_cycles(400_000).unwrap();
+            }
+        };
+
+        type_str(&mut machine, "MD SUB\r");
+        type_str(&mut machine, "CD SUB\r");
+
+        assert!(dir.path().join("SUB").is_dir(), "MD created the directory");
+        let text = machine.screen_text().as_text();
+        assert!(
+            text.contains("C:\\SUB>"),
+            "the prompt shows the new directory; got:\n{text}"
+        );
+    }
+
     // --- Izarra 3000 BIOS foundation ---------------------------------------
 
     #[test]
