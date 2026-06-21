@@ -37,11 +37,15 @@ function LinkCom($name, $objNames) {
 # Shared runtime, compiled once and linked into every tool.
 Compile "$root\runtime\toka.c" 'toka.obj'
 
-# The shell. External tools join this list as later phases land them.
-$tools = @('icommand')
-foreach ($t in $tools) {
-    Compile "$root\$t\$t.c" "$t.obj"
-    LinkCom $t @("$t.obj", 'toka.obj')
+# The shell.
+Compile "$root\icommand\icommand.c" 'icommand.obj'
+LinkCom 'icommand' @('icommand.obj', 'toka.obj')
+
+# External tools: one .c per tool under tools/, each linked with the runtime.
+Get-ChildItem "$root\tools\*.c" -ErrorAction SilentlyContinue | ForEach-Object {
+    $name = $_.BaseName
+    Compile $_.FullName "$name.obj"
+    LinkCom $name @("$name.obj", 'toka.obj')
 }
 
 # The boot record.

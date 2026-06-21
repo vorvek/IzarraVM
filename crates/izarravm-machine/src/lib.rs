@@ -7899,6 +7899,90 @@ mod tests {
         );
     }
 
+    /// Set 1 scancodes for an ASCII character (letters, digits, space, dot,
+    /// quote, slash, backslash, colon), with Shift for uppercase and quote.
+    fn toka_key_codes(ch: char) -> Vec<u8> {
+        const LETTER: [u8; 26] = [
+            0x1e, 0x30, 0x2e, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17, 0x24, 0x25, 0x26, 0x32, 0x31,
+            0x18, 0x19, 0x10, 0x13, 0x1f, 0x14, 0x16, 0x2f, 0x11, 0x2d, 0x15, 0x2c,
+        ];
+        let (make, shift) = match ch {
+            'a'..='z' => (LETTER[ch as usize - 'a' as usize], false),
+            'A'..='Z' => (LETTER[ch as usize - 'A' as usize], true),
+            ' ' => (0x39, false),
+            '.' => (0x34, false),
+            '\\' => (0x2b, false),
+            ':' => (0x27, true),
+            '"' => (0x28, true),
+            '\r' | '\n' => (0x1c, false),
+            _ => return Vec::new(),
+        };
+        let mut codes = Vec::new();
+        if shift {
+            codes.push(0x2a);
+        }
+        codes.push(make);
+        codes.push(make | 0x80);
+        if shift {
+            codes.push(0xaa);
+        }
+        codes
+    }
+
+    #[test]
+    fn toka_external_tools_move_and_find() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = izarravm_firmware::toka_dos_system_files();
+        izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format)
+            .unwrap();
+        std::fs::write(
+            dir.path().join("POEM.TXT"),
+            "roses are red\r\nsky is blue\r\n",
+        )
+        .unwrap();
+
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .unwrap();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        machine.set_toka_c_root(dir.path().to_path_buf());
+        machine.run_until_halt_or_cycles(22_000_000).unwrap();
+
+        let type_line = |machine: &mut Machine, text: &str| {
+            for ch in text.chars() {
+                for code in toka_key_codes(ch) {
+                    machine.inject_key_scancodes(&[code]);
+                }
+                machine.run_until_halt_or_cycles(400_000).unwrap();
+            }
+            for code in toka_key_codes('\r') {
+                machine.inject_key_scancodes(&[code]);
+            }
+            machine.run_until_halt_or_cycles(4_000_000).unwrap();
+        };
+
+        // MOVE renames the file (checked on the host filesystem).
+        type_line(&mut machine, "MOVE POEM.TXT VERSE.TXT");
+        assert!(
+            dir.path().join("VERSE.TXT").exists(),
+            "MOVE created VERSE.TXT"
+        );
+        assert!(
+            !dir.path().join("POEM.TXT").exists(),
+            "MOVE removed POEM.TXT"
+        );
+
+        // FIND launches via EXEC and prints the matching line on the screen.
+        type_line(&mut machine, "FIND \"roses\" VERSE.TXT");
+        let text = machine.screen_text().as_text();
+        assert!(
+            text.contains("roses are red"),
+            "FIND printed the matching line; got:\n{text}"
+        );
+    }
+
     // --- Izarra 3000 BIOS foundation ---------------------------------------
 
     #[test]
