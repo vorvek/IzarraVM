@@ -33,6 +33,11 @@ pub struct SbDsp {
     speaker_on: bool,
     // 8-bit DMA playback state (Tasks 5-6).
     rate_hz: u32,
+    // Whether rate_hz was programmed as an interleaved BYTE rate (the 0x40 time
+    // constant pre-multiplies by the channel count for stereo) rather than a
+    // per-channel rate. The 0x41 set-sample-rate command programs the
+    // per-channel rate directly, so it must not be halved for SB Pro stereo.
+    rate_is_byte_rate: bool,
     block_size: u32,
     block_remaining: u32,
     auto_init: bool,
@@ -45,6 +50,9 @@ pub struct SbDsp {
     dma_16bit: bool,
     stereo: bool,
     sample_signed: bool,
+    // SB Pro 8-bit stereo (mixer register 0x0E bit1): interleaves two bytes per
+    // output frame (left then right). Set from the mixer each producer tick.
+    sbpro_stereo: bool,
     // Rendered stereo frames produced by the per-CPU-clock producer, drained by
     // the host audio path. See DSP_RING_CAP for the cap/drop-oldest policy.
     rendered: VecDeque<(i16, i16)>,
@@ -68,6 +76,7 @@ impl Default for SbDsp {
             test_reg: 0,
             speaker_on: false,
             rate_hz: 22_050,
+            rate_is_byte_rate: true,
             block_size: 0,
             block_remaining: 0,
             auto_init: false,
@@ -77,6 +86,7 @@ impl Default for SbDsp {
             dma_16bit: false,
             stereo: false,
             sample_signed: false,
+            sbpro_stereo: false,
             rendered: VecDeque::new(),
         }
     }
@@ -155,18 +165,25 @@ impl SbDsp {
                 }
             }
             0x40 => {
-                // Set time constant: rate = 1_000_000 / (256 - tc).
+                // Set time constant: rate = 1_000_000 / (256 - tc). The stereo
+                // time constant encodes the interleaved byte rate (the guest
+                // pre-multiplies by the channel count), so this is a byte rate.
                 if let Some(&tc) = args.first() {
                     let divisor = 256u32.wrapping_sub(u32::from(tc));
                     if let Some(rate) = 1_000_000u32.checked_div(divisor) {
                         self.rate_hz = rate;
+                        self.rate_is_byte_rate = true;
                     }
                 }
             }
             0x41 => {
-                // Set sample rate in Hz, high byte then low byte (SB16).
+                // Set sample rate in Hz, high byte then low byte (SB16). Unlike
+                // the time constant, this is already the per-channel rate for
+                // stereo (no channel-count pre-multiply), so it is not a byte
+                // rate and must not be halved for SB Pro stereo.
                 if args.len() >= 2 {
                     self.rate_hz = (u32::from(args[0]) << 8) | u32::from(args[1]);
+                    self.rate_is_byte_rate = false;
                 }
             }
             0x48 => {
@@ -176,8 +193,13 @@ impl SbDsp {
                     self.block_size = count;
                 }
             }
-            0x14 | 0x90 => self.arm_dma(false),
-            0x1C => self.arm_dma(true),
+            0x14 => self.arm_dma(false), // 8-bit single output, normal speed
+            0x1C => self.arm_dma(true),  // 8-bit auto-init output, normal speed
+            // 0x90/0x91 are the SB Pro high-speed variants of auto-init/single.
+            // ponytail: high-speed command-lockout (DSP ignores commands until
+            // reset) not modeled; games exit via the DSP reset handled below.
+            0x90 => self.arm_dma(true),  // 8-bit auto-init, high-speed
+            0x91 => self.arm_dma(false), // 8-bit single, high-speed
             0xB0..=0xBF => self.arm_16bit(command, args),
             0xD0 => self.playing = false,   // halt DMA (position kept)
             0xD4 => self.playing = true,    // continue DMA
@@ -246,6 +268,20 @@ impl SbDsp {
         self.stereo
     }
 
+    /// Set the SB Pro 8-bit stereo flag from the mixer (register 0x0E bit1).
+    pub fn set_sbpro_stereo(&mut self, on: bool) {
+        self.sbpro_stereo = on;
+    }
+
+    /// Whether SB Pro 8-bit stereo is selected by the mixer. This is a derived
+    /// view of the mixer's 0x0E bit1 and is sticky across mode changes (it is
+    /// not cleared when a 16-bit 0xBx mode is armed). Every consumer MUST AND it
+    /// with `!is_16bit()`, since SB Pro byte-interleave only applies to the
+    /// 8-bit DMA path; `render_frame` and `output_frame_rate` both do.
+    pub fn is_sbpro_stereo(&self) -> bool {
+        self.sbpro_stereo
+    }
+
     pub fn block_remaining(&self) -> u32 {
         self.block_remaining
     }
@@ -280,9 +316,15 @@ impl SbDsp {
     /// is not playing. The next edge is the sooner of the half-buffer point
     /// (`block_remaining - block_size/2`, unless already reached) and the
     /// end-of-buffer point (`block_remaining`). Converted to CPU clocks via
-    /// `ceil(samples * clock_hz / rate_hz)`, clamped to at least one. For stereo
-    /// modes the block counter advances in words, so this is a conservative
-    /// (never under-) estimate, which is what the HLT fast-forward needs.
+    /// `ceil(samples * clock_hz / rate_hz)`, clamped to at least one. `rate_hz`
+    /// must be the rate at which the block counter actually drains (the raw
+    /// byte/word rate from [`rate_hz`](Self::rate_hz), not the per-channel
+    /// output frame rate): the counter ticks in bytes for 8-bit and words for
+    /// 16-bit. With the byte/word rate this is exact for every 8-bit mode
+    /// (including SB Pro stereo, which drains two bytes per frame at the full
+    /// byte rate). For 16-bit stereo the counter advances two words per frame
+    /// while `rate_hz` is per-frame, so this stays a conservative (never under-)
+    /// estimate, which is what the HLT fast-forward needs.
     pub fn clocks_until_next_irq(&self, rate_hz: u32, clock_hz: u64) -> Option<u64> {
         if !self.playing || rate_hz == 0 {
             return None;
@@ -328,10 +370,30 @@ impl SbDsp {
             let words = if self.stereo { 2 } else { 1 };
             self.advance_block(words);
             Some((left, right))
+        } else if self.sbpro_stereo {
+            // SB Pro 8-bit stereo: two interleaved bytes per frame, left then
+            // right, advancing the block counter by both bytes consumed.
+            let left = sample_u8(byte_fetch()?);
+            let right = sample_u8(byte_fetch()?);
+            self.advance_block(2);
+            Some((left, right))
         } else {
             let s = sample_u8(byte_fetch()?);
             self.advance_block(1);
             Some((s, s))
+        }
+    }
+
+    /// Per-channel output frame rate. The SB Pro time constant (0x40) programs
+    /// the interleaved BYTE rate, so in 8-bit stereo each channel runs at half
+    /// that. The 0x41 set-sample-rate command instead programs the per-channel
+    /// rate directly (no channel-count pre-multiply), so it must not be halved.
+    /// Every other mode (mono, or any 16-bit) frames at the programmed rate.
+    pub fn output_frame_rate(&self) -> u32 {
+        if self.sbpro_stereo && !self.dma_16bit && self.rate_is_byte_rate {
+            self.rate_hz / 2
+        } else {
+            self.rate_hz
         }
     }
 
@@ -418,6 +480,20 @@ impl SbDsp {
                     self.reset_micros = Some(100.0);
                     self.read_data.clear();
                     self.data_available = false;
+                    // Real hardware halts playback and clears the interrupt
+                    // latch on reset; clear the DMA state so a high-speed game's
+                    // reset stops the channel cleanly. Clearing irq_pending here
+                    // (and never re-arming it in arm_dma/arm_16bit) prevents a
+                    // half/end IRQ that went pending before the reset from firing
+                    // spuriously on the next re-armed playback. rate_hz and
+                    // block_size are intentionally preserved: this is the
+                    // halt-on-reset behavior, not a power-on parameter wipe.
+                    self.playing = false;
+                    self.auto_init = false;
+                    self.block_remaining = 0;
+                    self.half_reached = false;
+                    self.irq_pending = false;
+                    self.pending = None;
                 }
                 true
             }
@@ -670,6 +746,165 @@ mod tests {
         write_cmd(&mut dsp, &[0x41, 0x2B, 0x11, 0x48, 0x01, 0x00, 0x14]); // 8-bit mono single
         let f = dsp.render_frame(|| Some(0x80), || panic!("word fetch unused in 8-bit mode"));
         assert_eq!(f, Some((0, 0)), "0x80 -> silence on both channels");
+    }
+
+    #[test]
+    fn high_speed_auto_init_command_0x90_arms_auto_init() {
+        let mut dsp = SbDsp::default();
+        write_cmd(&mut dsp, &[0x48, 0x07, 0x00]); // block size 8
+        write_cmd(&mut dsp, &[0x90]); // SB Pro high-speed 8-bit auto-init
+        assert!(dsp.is_playing() && dsp.is_auto_init());
+        assert!(!dsp.is_16bit(), "high-speed 0x90 is an 8-bit mode");
+    }
+
+    #[test]
+    fn high_speed_single_command_0x91_arms_single() {
+        let mut dsp = SbDsp::default();
+        write_cmd(&mut dsp, &[0x48, 0x07, 0x00]); // block size 8
+        write_cmd(&mut dsp, &[0x91]); // SB Pro high-speed 8-bit single
+        assert!(dsp.is_playing());
+        assert!(!dsp.is_auto_init(), "high-speed 0x91 is single-cycle");
+    }
+
+    #[test]
+    fn reset_during_active_playback_clears_playing_and_auto_init() {
+        let mut dsp = SbDsp::default();
+        write_cmd(&mut dsp, &[0x48, 0x07, 0x00, 0x90]); // block 8, high-speed auto-init
+        assert!(dsp.is_playing() && dsp.is_auto_init());
+        // Render past the block midpoint so half_reached latches, and leave a
+        // half-byte command partially assembled so `pending` is non-empty.
+        for _ in 0..5 {
+            let _ = dsp.render_sample(|| Some(0x80));
+        }
+        assert!(dsp.half_reached, "midpoint crossed before reset");
+        let _ = dsp.take_irq(); // drop any IRQ raised by the half-buffer edge
+        // Re-establish a pending IRQ and a partial command to prove reset clears them.
+        dsp.irq_pending = true;
+        dsp.write_command_byte(0x48); // arity-2 command, no args yet -> pending set
+        assert!(dsp.pending.is_some(), "partial command queued before reset");
+        // A DSP reset (write 0 to 0x226) halts playback, the way a game exits
+        // high-speed mode.
+        dsp.write_port(0x226, 0x00);
+        assert!(!dsp.is_playing(), "reset halts playback");
+        assert!(!dsp.is_auto_init(), "reset clears the auto-init latch");
+        assert_eq!(dsp.block_remaining(), 0);
+        assert!(!dsp.half_reached, "reset clears the half-buffer latch");
+        assert!(dsp.pending.is_none(), "reset drops the partial command");
+        // Real hardware clears the interrupt latch on reset, so a pre-reset
+        // pending IRQ does not fire on the next re-armed playback.
+        assert!(!dsp.take_irq(), "reset clears the pending IRQ latch");
+        // rate/block-size are intentionally preserved across the halt-on-reset.
+        assert_eq!(
+            dsp.block_size, 8,
+            "reset preserves the programmed block size"
+        );
+    }
+
+    #[test]
+    fn sbpro_8bit_stereo_consumes_two_bytes_and_yields_distinct_l_r() {
+        let mut dsp = SbDsp::default();
+        write_cmd(&mut dsp, &[0x48, 0x03, 0x00, 0x14]); // block 4 bytes, 8-bit single
+        dsp.set_sbpro_stereo(true);
+        // Left 0xFF (near full positive), right 0x00 (full negative) interleaved.
+        let pattern = [0xFFu8, 0x00];
+        let mut i = 0;
+        let f = dsp.render_frame(
+            || {
+                let b = pattern[i % pattern.len()];
+                i += 1;
+                Some(b)
+            },
+            || panic!("word fetch unused in 8-bit stereo"),
+        );
+        assert_eq!(i, 2, "two bytes consumed per stereo frame");
+        let (l, r) = f.expect("a stereo frame");
+        assert!(
+            l > 0 && r < 0,
+            "distinct L/R from the byte pattern: {l},{r}"
+        );
+        assert_eq!(dsp.block_remaining(), 2, "block advanced by both bytes");
+    }
+
+    #[test]
+    fn sbpro_8bit_stereo_edges_half_and_end_irqs_consuming_two_bytes_per_frame() {
+        let mut dsp = SbDsp::default();
+        // Block 4 bytes, 8-bit single, SB Pro stereo: advance_block(2) per frame,
+        // so the block drains in 2 frames. Half fires when remaining <= 2 (after
+        // frame 1), end fires when remaining == 0 (after frame 2), then single
+        // mode stops.
+        write_cmd(&mut dsp, &[0x48, 0x03, 0x00, 0x14]); // block 4
+        dsp.set_sbpro_stereo(true);
+        let mut feed = || Some(0x80u8);
+        // Frame 1: remaining 4 -> 2, half IRQ.
+        assert!(dsp.render_frame(&mut feed, || panic!("no words")).is_some());
+        assert_eq!(dsp.block_remaining(), 2);
+        assert!(dsp.take_irq(), "half-buffer IRQ after frame 1");
+        // Frame 2: remaining 2 -> 0, end IRQ, single mode stops.
+        assert!(dsp.render_frame(&mut feed, || panic!("no words")).is_some());
+        assert!(dsp.take_irq(), "end-buffer IRQ after frame 2");
+        assert!(!dsp.is_playing(), "single mode stops at end of block");
+    }
+
+    #[test]
+    fn high_speed_0x90_clears_stale_16bit_stereo_signed_latches() {
+        let mut dsp = SbDsp::default();
+        // First arm a 16-bit signed stereo auto-init mode (0xB6, mode 0x30).
+        write_cmd(&mut dsp, &[0xB6, 0x30, 0x07, 0x00]);
+        assert!(dsp.is_16bit() && dsp.is_stereo() && dsp.sample_signed);
+        // A high-speed 8-bit command must reset those latches to the 8-bit
+        // defaults; arm_dma clears them. The render path then pulls bytes.
+        write_cmd(&mut dsp, &[0x48, 0x03, 0x00]); // block 4
+        write_cmd(&mut dsp, &[0x90]); // high-speed auto-init 8-bit
+        assert!(!dsp.is_16bit(), "0x90 clears the 16-bit latch");
+        assert!(!dsp.is_stereo(), "0x90 clears the 16-bit stereo latch");
+        assert!(!dsp.sample_signed, "0x90 clears the signed latch");
+        // The 8-bit render path must run (pull a byte, never a word).
+        let f = dsp.render_frame(|| Some(0x80), || panic!("word fetch unused in 8-bit mode"));
+        assert_eq!(f, Some((0, 0)), "8-bit render path taken after 0x90");
+    }
+
+    #[test]
+    fn output_frame_rate_halves_for_8bit_stereo_only() {
+        let mut dsp = SbDsp::default();
+        // 0x40 time constant programs the interleaved BYTE rate. tc for ~22.05k
+        // byte rate: 256 - 1_000_000/22_050 = 256 - 45 = 211 (0xD3), giving
+        // 1_000_000 / 45 = 22_222.
+        write_cmd(&mut dsp, &[0x40, 0xD3]);
+        let byte_rate = dsp.rate_hz();
+        // 8-bit mono: per-channel rate is the programmed rate.
+        write_cmd(&mut dsp, &[0x14]);
+        assert_eq!(dsp.output_frame_rate(), byte_rate, "8-bit mono is unhalved");
+        // 8-bit stereo: the time constant is the byte rate, so each channel halves.
+        dsp.set_sbpro_stereo(true);
+        assert_eq!(
+            dsp.output_frame_rate(),
+            byte_rate / 2,
+            "8-bit stereo halves a time-constant (byte) rate"
+        );
+        // 16-bit stereo: the rate command programs the per-channel rate already,
+        // so the SB Pro byte-interleave halving must not apply.
+        write_cmd(&mut dsp, &[0xB6, 0x30, 0x07, 0x00]); // 16-bit signed stereo
+        assert_eq!(dsp.rate_hz(), byte_rate, "16-bit stereo unchanged");
+        assert_eq!(
+            dsp.output_frame_rate(),
+            byte_rate,
+            "16-bit stereo unchanged"
+        );
+    }
+
+    #[test]
+    fn output_frame_rate_does_not_halve_a_0x41_rate_for_8bit_stereo() {
+        // Per the SB16 guide, 0x41 programs the per-channel rate directly (no
+        // channel-count pre-multiply), so SB Pro stereo must NOT halve it.
+        let mut dsp = SbDsp::default();
+        write_cmd(&mut dsp, &[0x41, 0x2B, 0x11]); // 0x2B11 = 11025 Hz, per-channel
+        write_cmd(&mut dsp, &[0x14]); // 8-bit single
+        dsp.set_sbpro_stereo(true);
+        assert_eq!(
+            dsp.output_frame_rate(),
+            11_025,
+            "a 0x41 per-channel rate is not halved for SB Pro stereo"
+        );
     }
 
     #[test]

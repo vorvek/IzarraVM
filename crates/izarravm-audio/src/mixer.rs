@@ -170,6 +170,15 @@ impl SbMixer {
         )
     }
 
+    /// SB Pro output mode (register `0x0E`) bit1: stereo when set, mono when
+    /// clear. The DSP samples this to interleave two bytes per 8-bit frame. The
+    /// output-filter bit (bit5) is cosmetic and ignored. Register `0x0E` is an
+    /// inert store, so this read round-trips a guest's write. Reset leaves it 0
+    /// (mono): `default_inert` does not set `0x0E`.
+    pub fn sbpro_stereo(&self) -> bool {
+        self.inert[0x0E] & 0x02 != 0
+    }
+
     /// (Left, Right) linear CD-Audio gain from registers `0x36`/`0x37` (the 5-bit
     /// CD volume), applied to the Red Book stream the ATAPI drive streams into the
     /// mix. The CT1345-compatible alias at `0x28` mirrors these registers, so a
@@ -573,6 +582,20 @@ mod tests {
         assert_eq!(mixer.selected_irq(), 5);
         assert_eq!(mixer.selected_dma_8(), 1);
         assert_eq!(mixer.selected_dma_16(), 5);
+    }
+
+    #[test]
+    fn sbpro_stereo_bit_in_register_0x0e_round_trips_and_decodes() {
+        let mut mixer = SbMixer::default();
+        // Reset/default leaves 0x0E = 0, so mono.
+        assert!(!mixer.sbpro_stereo(), "default 0x0E is mono");
+        // Writing bit1 selects stereo and the register still reads back.
+        write_reg(&mut mixer, 0x0E, 0x02);
+        assert!(mixer.sbpro_stereo(), "0x0E bit1 selects SB Pro stereo");
+        assert_eq!(read_reg(&mut mixer, 0x0E), 0x02, "0x0E round-trips");
+        // The output-filter bit (bit5) alone is cosmetic, not stereo.
+        write_reg(&mut mixer, 0x0E, 0x20);
+        assert!(!mixer.sbpro_stereo(), "bit5 alone is mono");
     }
 
     #[test]
