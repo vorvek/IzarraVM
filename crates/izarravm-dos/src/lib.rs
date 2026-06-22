@@ -5479,6 +5479,16 @@ mod tests {
             0x8004,
             "NUL attribute: char device + NUL bit"
         );
+        assert_eq!(
+            mem.read_u16(nul + 6).unwrap(),
+            0xffff,
+            "NUL strategy entry (none)"
+        );
+        assert_eq!(
+            mem.read_u16(nul + 8).unwrap(),
+            0xffff,
+            "NUL interrupt entry (none)"
+        );
         let name: Vec<u8> = (0..8)
             .map(|i| mem.read_u8(nul + 0x0a + i).unwrap())
             .collect();
