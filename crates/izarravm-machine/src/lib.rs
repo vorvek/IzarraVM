@@ -440,9 +440,10 @@ pub struct Machine {
     // RAM above 1 MB, the HMA-allocation flag, and the local-A20 nesting count. A
     // guest reaches it via INT 2Fh AX=4310h (an INT 66h entry stub in ROM).
     xms: xms::XmsState,
-    // LIM EMS 4.0 expanded-memory state, present only when the EMM386 mode is RAM.
-    // Its 16 KiB pages are backed by a region of extended RAM partitioned away from
-    // the XMS pool; the bus aliases page-frame accesses onto them.
+    // LIM EMS 4.0 expanded-memory state, present under RAM (a real page frame backed
+    // by a region of extended RAM partitioned away from the XMS pool, which the bus
+    // aliases frame accesses onto) and NOEMS (a frameless manager: the EMMXXXX0 device
+    // and INT 67h answer, but no frame and zero pages). None only for HIMEM-only.
     ems: Option<ems::EmsState>,
     // The UMA reservation map: the single authority over the 0xC0000-0xEFFFF
     // upper-memory window. ROM is reserved up front; the remaining hole is handed
@@ -3035,7 +3036,8 @@ impl Machine {
         }
     }
 
-    /// The EMS manager, asserting it is present (INT 67h is intercepted only then).
+    /// The EMS manager, asserting it is present (INT 67h is intercepted whenever a
+    /// manager is built: the full API under RAM, a frameless manager under NOEMS).
     fn ems(&self) -> &ems::EmsState {
         self.ems.as_ref().expect("INT 67h serviced without EMS")
     }
@@ -8572,6 +8574,32 @@ mod tests {
         assert_eq!(
             machine.pending_soft_int, None,
             "INT 67h is not intercepted when no manager is built"
+        );
+    }
+
+    #[test]
+    fn noems_machine_presents_the_emmxxxx0_device_to_dos() {
+        // The EMMXXXX0 device is present whenever a manager is built, so a guest
+        // detects expanded memory by opening it or walking the device chain. RAM
+        // (real frame) and NOEMS (frameless manager) both present it; only HIMEM-only
+        // has none. This closes the wiring seam furnish drives from the built `ems`.
+        const PROG: [u8; 2] = [0xCD, 0x20];
+        let build = |mode: Emm386Mode| {
+            let mut p = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+            p.emm386 = mode;
+            Machine::new_dos_program(p, &PROG).unwrap()
+        };
+        assert!(
+            build(Emm386Mode::Ram).dos.ems_present(),
+            "RAM presents the EMMXXXX0 device"
+        );
+        assert!(
+            build(Emm386Mode::NoEms).dos.ems_present(),
+            "NOEMS presents the frameless EMMXXXX0 device"
+        );
+        assert!(
+            !build(Emm386Mode::Unloaded).dos.ems_present(),
+            "HIMEM-only presents no EMMXXXX0 device"
         );
     }
 
