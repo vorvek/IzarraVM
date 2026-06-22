@@ -374,6 +374,8 @@ impl SbDsp {
         } else if self.sbpro_stereo {
             // SB Pro 8-bit stereo: two interleaved bytes per frame, left then
             // right, advancing the block counter by both bytes consumed.
+            // The SB Pro silent-byte priming / L<->R channel-swap alignment quirk
+            // is not modeled, so the first byte of each frame is always Left.
             let left = sample_u8(byte_fetch()?);
             let right = sample_u8(byte_fetch()?);
             self.advance_block(2);
@@ -392,6 +394,8 @@ impl SbDsp {
     /// Every other mode (mono, or any 16-bit) frames at the programmed rate.
     pub fn output_frame_rate(&self) -> u32 {
         if self.sbpro_stereo && !self.dma_16bit && self.rate_is_byte_rate {
+            // `rate_hz / 2` truncates on an odd byte rate; acceptable, since it
+            // stays within the time-constant's own quantization.
             self.rate_hz / 2
         } else {
             self.rate_hz
@@ -779,7 +783,9 @@ mod tests {
     fn sbpro_8bit_stereo_consumes_two_bytes_and_yields_distinct_l_r() {
         let mut dsp = SbDsp::default();
         write_cmd(&mut dsp, &[0x48, 0x03, 0x00, 0x14]); // block 4 bytes, 8-bit single
+        assert!(!dsp.is_sbpro_stereo(), "SB Pro stereo off by default");
         dsp.set_sbpro_stereo(true);
+        assert!(dsp.is_sbpro_stereo(), "set_sbpro_stereo(true) latches");
         // Left 0xFF (near full positive), right 0x00 (full negative) interleaved.
         let pattern = [0xFFu8, 0x00];
         let mut i = 0;
