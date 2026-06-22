@@ -297,7 +297,14 @@ struct Arena {
     resident: bool,
 }
 
-const ARENA_TOP: u16 = 0xa000; // matches CONVENTIONAL_TOP_PARAGRAPH in the loader
+/// The top of conventional memory in paragraphs: the 640 KiB line (0xA000
+/// paragraphs = 0xA0000 bytes) where the video aperture begins. This is the one
+/// source for that boundary across the DOS layer: the allocation arena ends
+/// here, the MCB chain spans up to it, and the .EXE loader clamps a program's
+/// block to it. It matches the hardware-side conventional boundary the region
+/// classifier names (izarravm-machine `memmap::CONVENTIONAL_TOP`); the dos crate
+/// does not depend on that crate, so the value is repeated here, not imported.
+const ARENA_TOP: u16 = 0xa000;
 
 /// Kernel-reserved paragraph holding the AH=52h list-of-lists (SysVars) table.
 /// 0x0050 = linear 0x500, just above the BIOS data area (0x400-0x4FF) and below
@@ -2985,11 +2992,6 @@ const TOKA_DOS_OEM: u8 = 0xff;
 /// The largest .COM image: a 64 KiB segment minus the 256-byte PSP.
 const COM_MAX_LEN: usize = 0x10000 - 0x100;
 
-/// Conventional memory is modeled as one block ending at the 640 KiB video
-/// aperture (paragraph 0xA000). Single block, no MCB chain / EBDA /
-/// UMB; an .EXE that walks or resizes the memory arena is out of scope.
-const CONVENTIONAL_TOP_PARAGRAPH: u32 = 0xa000;
-
 /// Where to start executing a loaded program. A .COM sets all six to its single
 /// load segment; an .EXE sets a distinct CS:IP and SS:SP with DS=ES=PSP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3281,15 +3283,15 @@ pub fn load_exe(
 
     let start_seg = psp_segment.wrapping_add(0x10);
     let needed = u32::from(start_seg) + module_paras + u32::from(exe.e_minalloc);
-    if needed > CONVENTIONAL_TOP_PARAGRAPH {
+    if needed > u32::from(ARENA_TOP) {
         return Err(DosError::ExeNotEnoughMemory {
             needed,
-            available: CONVENTIONAL_TOP_PARAGRAPH,
+            available: u32::from(ARENA_TOP),
         });
     }
     // Top of the program's block: honor e_maxalloc, clamp to conventional memory.
     let top_paragraph = (u32::from(start_seg) + module_paras + u32::from(exe.e_maxalloc))
-        .min(CONVENTIONAL_TOP_PARAGRAPH) as u16;
+        .min(u32::from(ARENA_TOP)) as u16;
     build_psp(mem, psp_segment, top_paragraph)?;
 
     // Copy the load module to start_seg:0.
