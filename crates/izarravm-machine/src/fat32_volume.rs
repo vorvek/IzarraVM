@@ -54,11 +54,14 @@ impl Fat32Volume {
     /// sectors read as zeros.
     pub fn read_sector(&self, lba: u32) -> [u8; SECTOR] {
         let geo = &self.geo;
-        // Boot sector (and its backup copy).
+        // Boot sector (and its backup copy at BPB_BkBootSec).
         if lba == 0 || lba == u32::from(geo.backup_boot_sector) {
             return fat32_boot_sector(geo, self.volume_id);
         }
-        if lba == u32::from(geo.fsinfo_sector) {
+        // FSInfo at its sector, and the backup copy that rides the boot-record
+        // backup at the same offset (fatgen103: the backup record is a full copy).
+        let fsinfo_backup = u32::from(geo.backup_boot_sector) + u32::from(geo.fsinfo_sector);
+        if lba == u32::from(geo.fsinfo_sector) || lba == fsinfo_backup {
             return fat32_fsinfo_sector(self.free_count, self.next_free);
         }
         // FAT region: num_fats identical copies, each fat_size_sectors long.
@@ -166,6 +169,8 @@ impl Builder {
             match self.alloc_one() {
                 Some(c) => chain.push(c),
                 None => {
+                    // Best-effort: the dropped entries' file/subdir clusters
+                    // stay allocated (orphaned), harmless on a near-full volume.
                     eprintln!("fat32: out of space extending a directory; truncating it");
                     break;
                 }
@@ -499,5 +504,48 @@ mod tests {
         let r = build_fat32(&dir, 16 * 1024 * 1024, 1);
         std::fs::remove_dir_all(&dir).ok();
         assert!(r.is_err(), "a sub-FAT32 volume size is rejected");
+    }
+
+    #[test]
+    fn multi_sector_cluster_round_trips() {
+        let dir = temp_dir("bigcluster");
+        // A 512 MB volume uses 8 sectors per cluster (4 KiB), so a payload that
+        // crosses a cluster exercises the sector-within-cluster math and a
+        // multi-cluster file chain at once.
+        let payload: Vec<u8> = (0..10_000u32).map(|i| (i % 253) as u8).collect();
+        std::fs::write(dir.join("big.bin"), &payload).unwrap();
+        let vol = build_fat32(&dir, 512 * 1024 * 1024, 1).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(vol.geometry().sectors_per_cluster > 1, "spc > 1 for 512 MB");
+
+        let root = read_dir_entries(&vol, vol.geometry().root_cluster);
+        let (cluster, size) = find_entry(&root, b"BIG     BIN").expect("BIG.BIN in root");
+        assert_eq!(size as usize, payload.len());
+        assert_eq!(read_file(&vol, cluster, size), payload);
+    }
+
+    #[test]
+    fn directory_spanning_multiple_clusters_is_complete() {
+        let dir = temp_dir("bigdir");
+        // On the 64 MB volume a cluster is one sector (16 entries). 30 root
+        // entries overflow a single cluster, forcing a 2-cluster directory chain.
+        for i in 0..30 {
+            std::fs::write(dir.join(format!("F{i:02}.TXT")), format!("file {i}")).unwrap();
+        }
+        let vol = build_fat32(&dir, TEST_BYTES, 1).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        let root = read_dir_entries(&vol, vol.geometry().root_cluster);
+        for i in 0..30 {
+            let name = format!("F{i:02}     TXT");
+            let name11: [u8; 11] = name.as_bytes().try_into().unwrap();
+            let (cluster, size) = find_entry(&root, &name11).unwrap_or_else(|| {
+                panic!("F{i:02}.TXT survived the multi-cluster directory");
+            });
+            assert_eq!(
+                read_file(&vol, cluster, size),
+                format!("file {i}").into_bytes()
+            );
+        }
     }
 }
