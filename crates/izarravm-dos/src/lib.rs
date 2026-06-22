@@ -550,12 +550,14 @@ enum AccessMode {
 }
 
 impl AccessMode {
-    /// Validate AL's low 3 bits as a DOS access mode: 0=read, 1=write,
-    /// 2=read/write. Modes 3-7 are reserved, and a real DOS open rejects them with
-    /// error 0x0C (invalid access code) rather than silently treating them as read.
-    /// The high bits (sharing, inheritance) are ignored, there being no SHARE.
+    /// Validate the access mode in the low nibble of an open byte: 0=read,
+    /// 1=write, 2=read/write. Any other value (3-15, including a set reserved
+    /// bit 3) is invalid, and a real DOS open rejects it with error 0x0C rather
+    /// than silently treating it as read. The MS-DOS source masks the full nibble
+    /// (access_mask = 0x0F). The sharing and inheritance bits in the high nibble
+    /// are not validated here.
     fn try_from_open_al(al: u8) -> Option<Self> {
-        match al & 0x07 {
+        match al & 0x0f {
             0 => Some(AccessMode::Read),
             1 => Some(AccessMode::Write),
             2 => Some(AccessMode::ReadWrite),
@@ -1880,16 +1882,18 @@ impl DosKernel {
             // the access mode (0=read, 1=write, 2=read/write), honored and enforced
             // per handle. CF=0 + AX=handle on success, CF=1 + AX=DOS code on error.
             0x3d => {
-                let Some(mode) = AccessMode::try_from_open_al(regs.ax as u8) else {
-                    set_dos_error(regs, 0x0c); // invalid access code
-                    return Ok(DosAction::Continue);
-                };
                 let path = match self.resolve_open_path(mem, regs.ds, regs.dx)? {
                     Ok(path) => path,
                     Err(code) => {
                         set_dos_error(regs, code);
                         return Ok(DosAction::Continue);
                     }
+                };
+                // Validate the access mode after the path, matching DOS order: a
+                // bad path reports its own error before the invalid-access code.
+                let Some(mode) = AccessMode::try_from_open_al(regs.ax as u8) else {
+                    set_dos_error(regs, 0x0c);
+                    return Ok(DosAction::Continue);
                 };
                 match open_host_file(&path, mode) {
                     Ok(file) => {
@@ -2867,16 +2871,17 @@ impl DosKernel {
             // AX=handle, CX=action taken (1 opened, 2 created, 3 truncated). On
             // failure CF=1 with the DOS code.
             0x6c => {
-                let Some(mode) = AccessMode::try_from_open_al(regs.bx as u8) else {
-                    self.fail(regs, 0x0c); // invalid access code
-                    return Ok(DosAction::Continue);
-                };
                 let path = match self.resolve_open_path(mem, regs.ds, regs.si)? {
                     Ok(path) => path,
                     Err(code) => {
                         self.fail(regs, code);
                         return Ok(DosAction::Continue);
                     }
+                };
+                // Validate the access mode after the path, matching DOS order.
+                let Some(mode) = AccessMode::try_from_open_al(regs.bx as u8) else {
+                    self.fail(regs, 0x0c);
+                    return Ok(DosAction::Continue);
                 };
                 let exists = path.exists();
                 let open_if = regs.dx & 0x0001 != 0;
@@ -4579,7 +4584,7 @@ mod tests {
         // AH=3Dh with the access bits = 3 (reserved). The open is rejected with the
         // invalid-access-code error even though the file exists.
         let mut regs = DosRegs {
-            ax: 0x3d03,
+            ax: 0x3df3, // AL=0xF3: reserved access nibble 3, sharing/inherit bits set
             ds: 0x0100,
             dx: 0x0200,
             ..DosRegs::default()
@@ -4596,7 +4601,7 @@ mod tests {
         // DS:SI and open-if-exists is set, but the bad mode is rejected first.
         let mut regs = DosRegs {
             ax: 0x6c00,
-            bx: 0x0005,
+            bx: 0x00c5, // BL=0xC5: reserved access nibble 5, high bits set
             dx: 0x0001,
             ds: 0x0100,
             si: 0x0200,
