@@ -99,10 +99,51 @@ pub enum InstallMode {
 /// The marker file whose presence means Toka-DOS is already installed.
 const TOKA_DOS_MARKER: &str = "ICOMMAND.COM";
 
+/// System files that stay at the C: root: the shell and its COMMAND.COM alias,
+/// the COMSPEC the boot path launches. Every other system file is a tool and
+/// installs under C:\DOS, where the shell's PATH search finds it.
+const ROOT_SYSTEM_FILES: &[&str] = &["ICOMMAND.COM", "COMMAND.COM"];
+
+fn is_root_system_file(name: &str) -> bool {
+    ROOT_SYSTEM_FILES
+        .iter()
+        .any(|root| root.eq_ignore_ascii_case(name))
+}
+
+/// The default AUTOEXEC.BAT: put the tools directory on the PATH and set a
+/// path-showing prompt. DOS line endings (CRLF).
+const DEFAULT_AUTOEXEC_BAT: &str = "@ECHO OFF\r\nPATH=C:\\DOS\r\nPROMPT=$P$G\r\n";
+
+/// The default CONFIG.SYS: the directives a period DOS carries. The DEVICE= lines
+/// for the memory manager (IEMM, not built yet) and the CD extension are left out
+/// until those drivers exist; the HLE does not yet interpret CONFIG.SYS anyway.
+const DEFAULT_CONFIG_SYS: &str = "DOS=HIGH,UMB\r\nFILES=40\r\nBUFFERS=20\r\nLASTDRIVE=E\r\n";
+
 fn write_system_files(c_root: &Path, files: &[(String, Vec<u8>)]) -> std::io::Result<()> {
     std::fs::create_dir_all(c_root)?;
+    let dos_dir = c_root.join("DOS");
+    std::fs::create_dir_all(&dos_dir)?;
     for (name, bytes) in files {
-        std::fs::write(c_root.join(name), bytes)?;
+        let dir = if is_root_system_file(name) {
+            c_root
+        } else {
+            dos_dir.as_path()
+        };
+        std::fs::write(dir.join(name), bytes)?;
+    }
+    write_default_boot_config(c_root)
+}
+
+/// Write the default AUTOEXEC.BAT and CONFIG.SYS at the C: root, but only when
+/// each is absent, so a reinstall or repair never clobbers a user's edits.
+fn write_default_boot_config(c_root: &Path) -> std::io::Result<()> {
+    let autoexec = c_root.join("AUTOEXEC.BAT");
+    if !autoexec.exists() {
+        std::fs::write(autoexec, DEFAULT_AUTOEXEC_BAT)?;
+    }
+    let config = c_root.join("CONFIG.SYS");
+    if !config.exists() {
+        std::fs::write(config, DEFAULT_CONFIG_SYS)?;
     }
     Ok(())
 }
@@ -3843,10 +3884,12 @@ mod tests {
             ("VER.COM".to_string(), vec![4u8]),
         ];
 
-        // Format lays everything down on a fresh drive.
+        // Format lays everything down on a fresh drive: the shell stays at the
+        // root, tools install under C:\DOS (the user-requested layout).
         toka_dos_install(root, &files, InstallMode::Format).unwrap();
         assert!(root.join("ICOMMAND.COM").exists());
-        assert!(root.join("VER.COM").exists());
+        assert!(root.join("DOS").join("VER.COM").exists());
+        assert!(!root.join("VER.COM").exists());
 
         // EnsureIfMissing is a no-op once the marker is present: a hand-edited
         // system file is left untouched.
@@ -3867,6 +3910,44 @@ mod tests {
         toka_dos_install(root, &files, InstallMode::Format).unwrap();
         assert!(!root.join("USER.TXT").exists());
         assert!(root.join("ICOMMAND.COM").exists());
+    }
+
+    #[test]
+    fn install_relocates_tools_under_dos_and_generates_boot_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let files = vec![
+            ("ICOMMAND.COM".to_string(), vec![1u8]),
+            ("COMMAND.COM".to_string(), vec![1u8]),
+            ("MEM.COM".to_string(), vec![2u8]),
+        ];
+        toka_dos_install(root, &files, InstallMode::Format).unwrap();
+
+        // The shell and its COMMAND.COM alias stay at the root (the boot COMSPEC).
+        assert!(root.join("ICOMMAND.COM").exists());
+        assert!(root.join("COMMAND.COM").exists());
+        // A tool installs under C:\DOS, not the root.
+        assert!(root.join("DOS").join("MEM.COM").exists());
+        assert!(!root.join("MEM.COM").exists());
+
+        // The default boot config is generated.
+        let autoexec = std::fs::read_to_string(root.join("AUTOEXEC.BAT")).unwrap();
+        assert!(
+            autoexec.contains("PATH=C:\\DOS"),
+            "AUTOEXEC sets the DOS path"
+        );
+        let config = std::fs::read_to_string(root.join("CONFIG.SYS")).unwrap();
+        assert!(config.contains("DOS=HIGH,UMB"));
+        assert!(config.contains("LASTDRIVE=E"));
+
+        // A user-edited config survives a reinstall (generated only when absent).
+        std::fs::write(root.join("AUTOEXEC.BAT"), b"REM mine").unwrap();
+        toka_dos_install(root, &files, InstallMode::Repair).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("AUTOEXEC.BAT")).unwrap(),
+            "REM mine",
+            "Repair keeps the user's AUTOEXEC.BAT"
+        );
     }
 
     #[test]

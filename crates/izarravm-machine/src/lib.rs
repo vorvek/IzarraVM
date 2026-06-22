@@ -12444,6 +12444,55 @@ mod tests {
     }
 
     #[test]
+    fn toka_runs_a_relocated_tool_from_dos_through_the_path() {
+        // The install lays the external tools under C:\DOS; the shell's PATH
+        // search must find one by its bare name. MEM lives only in C:\DOS now.
+        let dir = tempfile::tempdir().unwrap();
+        let files = izarravm_firmware::toka_dos_system_files();
+        izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format)
+            .unwrap();
+        assert!(
+            dir.path().join("DOS").join("MEM.COM").exists(),
+            "MEM installed under C:\\DOS"
+        );
+        assert!(
+            !dir.path().join("MEM.COM").exists(),
+            "MEM is not at the root"
+        );
+
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .unwrap();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        machine.set_toka_c_root(dir.path().to_path_buf());
+        machine.run_until_halt_or_cycles(22_000_000).unwrap();
+
+        fn key_codes(ch: char) -> Vec<u8> {
+            let make: u8 = match ch.to_ascii_lowercase() {
+                'm' => 0x32,
+                'e' => 0x12,
+                '\r' => 0x1c,
+                _ => return Vec::new(),
+            };
+            vec![make, make | 0x80]
+        }
+        for ch in "mem\r".chars() {
+            for code in key_codes(ch) {
+                machine.inject_key_scancodes(&[code]);
+            }
+            machine.run_until_halt_or_cycles(400_000).unwrap();
+        }
+
+        let text = machine.screen_text().as_text();
+        assert!(
+            text.contains("conventional memory"),
+            "MEM (in C:\\DOS) ran via the PATH search; got:\n{text}"
+        );
+    }
+
+    #[test]
     fn toka_runs_a_batch_file_with_goto() {
         let dir = tempfile::tempdir().unwrap();
         let files = izarravm_firmware::toka_dos_system_files();
