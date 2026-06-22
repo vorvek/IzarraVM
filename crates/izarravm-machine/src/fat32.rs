@@ -252,6 +252,9 @@ pub fn fat32_dir_entry(
 /// parent's first cluster, or 0 when the parent is the root (fatgen103 Section
 /// 6.5). Returns the two 32-byte entries back to back.
 pub fn fat32_dot_entries(self_cluster: u32, parent_cluster: u32) -> [u8; 64] {
+    // The dot entries carry a zero write time/date, matching the fat12 convention.
+    // fatgen103 6.5 suggests the containing directory's timestamp, but DOS reads a
+    // zero timestamp without complaint and no caller threads one through yet.
     let mut dot = [b' '; 11];
     dot[0] = b'.';
     let mut dotdot = [b' '; 11];
@@ -550,6 +553,23 @@ mod tests {
         assert!(
             e[12..20].iter().all(|&b| b == 0),
             "DIR_NTRes / creation / last-access stay zero"
+        );
+    }
+
+    #[test]
+    fn dir_entry_small_cluster_leaves_fstclushi_zero() {
+        // The common early-volume case: a sub-64K cluster sits entirely in
+        // FstClusLO with FstClusHI zero (guards the >>16 split direction).
+        let e = fat32_dir_entry(b"DATA    BIN", 0x20, 2, 0, 0, 0);
+        assert_eq!(
+            &e[20..22],
+            &[0, 0],
+            "FstClusHI is zero for a sub-64K cluster"
+        );
+        assert_eq!(
+            u16::from_le_bytes([e[26], e[27]]),
+            2,
+            "FstClusLO carries it"
         );
     }
 
