@@ -13,12 +13,13 @@ pub use mixer::SbMixer;
 pub use opl::OplChip;
 pub use output::{AudioPlayer, AudioSink};
 pub use resample::Resampler;
-pub use wss::Ad1848;
+pub use wss::{Ad1848, Ad1848Config};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioDeviceKind {
     PcSpeaker,
     SoundBlaster,
+    Wss,
     Opl3,
 }
 
@@ -55,6 +56,9 @@ impl AudioSubsystem {
         if config.sound_blaster.enabled {
             devices.push(AudioDeviceKind::SoundBlaster);
         }
+        if config.wss.enabled {
+            devices.push(AudioDeviceKind::Wss);
+        }
         if config.opl3 {
             devices.push(AudioDeviceKind::Opl3);
         }
@@ -85,6 +89,7 @@ mod tests {
             opl3: false,
             ..AudioConfig::default()
         };
+        config.wss.enabled = false;
         let subsystem = AudioSubsystem::from_config(&config);
         assert_eq!(
             subsystem.devices,
@@ -94,5 +99,32 @@ mod tests {
         config.sound_blaster.enabled = false;
         let subsystem = AudioSubsystem::from_config(&config);
         assert_eq!(subsystem.devices, vec![AudioDeviceKind::PcSpeaker]);
+    }
+
+    #[test]
+    fn wss_device_present_when_enabled_and_absent_when_disabled() {
+        // The AD1848 codec is always present on the ReSonique 2 combo card, so the
+        // default config enables it: the Wss device sits after SoundBlaster.
+        let config = AudioConfig::default();
+        assert!(config.wss.enabled, "WSS enabled by default");
+        let subsystem = AudioSubsystem::from_config(&config);
+        assert!(
+            subsystem.devices.contains(&AudioDeviceKind::Wss),
+            "Wss device present when enabled"
+        );
+
+        // Disabling it drops the Wss device while leaving the rest intact.
+        let config = AudioConfig {
+            wss: izarravm_core::WssConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..AudioConfig::default()
+        };
+        let subsystem = AudioSubsystem::from_config(&config);
+        assert!(
+            !subsystem.devices.contains(&AudioDeviceKind::Wss),
+            "Wss device absent when disabled"
+        );
     }
 }

@@ -1,7 +1,7 @@
 pub use fat12::build_fat12;
-use izarravm_audio::{OplChip, Resampler, SbDsp, SbMixer};
+use izarravm_audio::{Ad1848, Ad1848Config, OplChip, Resampler, SbDsp, SbMixer};
 use izarravm_bus::{BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CpuBus, Memory};
-use izarravm_core::{GswMode, HardwareProfile, SoundBlasterConfig, VideoCard};
+use izarravm_core::{GswMode, HardwareProfile, SoundBlasterConfig, VideoCard, WssConfig};
 use izarravm_cpu::{
     Cpu386, CpuError, CpuLevel, CycleOutcome, Registers, SegmentIndex, SegmentRegister,
 };
@@ -102,6 +102,10 @@ pub struct MachineProfile {
     /// the mixer at construction. A guest mixer reset still restores the
     /// hardware factory default (IRQ5/DMA1/DMA5).
     pub sound_blaster: SoundBlasterConfig,
+    /// Power-on Windows Sound System (AD1848 codec) base/IRQ/DMA + enable flag.
+    /// The codec decodes its own resources concurrently with the SB16; disabling
+    /// it leaves the SB16/OPL paths untouched.
+    pub wss: WssConfig,
     pub wait_states: WaitStateProfile,
     pub address_pipelining: bool,
     pub cache_enabled: bool,
@@ -115,6 +119,7 @@ impl MachineProfile {
             memory_mib,
             video,
             sound_blaster: SoundBlasterConfig::default(),
+            wss: WssConfig::default(),
             wait_states: WaitStateProfile::default(),
             address_pipelining: false,
             cache_enabled: false,
@@ -128,6 +133,7 @@ impl MachineProfile {
             memory_mib: profile.memory_mib,
             video: profile.video,
             sound_blaster: profile.sound_blaster,
+            wss: profile.wss,
             wait_states: WaitStateProfile::default(),
             address_pipelining: false,
             cache_enabled: false,
@@ -167,6 +173,13 @@ const DAC_HZ: u32 = 44_100;
 const PIT_INPUT_HZ: u32 = 1_193_182;
 /// VGA 25.175 MHz dot clock (standard 640x480 and related modes).
 const VGA_DOT_HZ: u64 = 25_175_000;
+/// Fallback cadence (Hz) for retiring the AD1848 autocal (ACI) window when the
+/// programmed sample rate is one of the two unsupported XTAL1 selects
+/// (`rate_hz()==0`). On real hardware the autocal converter clock retires the
+/// ~128-sample window regardless of the programmed rate; this is only used to
+/// clock the ACI countdown, never to produce audio. 8000 Hz is the lowest
+/// documented WSS rate (XTAL1, CFS=0).
+const WSS_AUTOCAL_FALLBACK_HZ: u32 = 8000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveDisplay {
@@ -265,6 +278,21 @@ pub struct Machine {
     dsp_micros: f64,  // fractional microseconds owed to the DSP reset-settle clock
     dsp_sample_phase: f64, // fractional DSP samples owed to the DMA playback clock
     mixer: SbMixer,   // the CT1745 mixer: IRQ/DMA routing + volume attenuation
+    // AD1848 / Windows Sound System codec. An always-on combo-card device that
+    // decodes its own base/IRQ/DMA concurrently with the SB16 + OPL3 (no mode
+    // switch). The codec is independent of the CT1745 mixer; its I6/I7 DAC
+    // attenuation is applied inside the codec at drain time, so render_audio sums
+    // its resampled stream directly without the SB16 voice/master gain.
+    wss: Ad1848,
+    /// WSS PCM resampler (output_frame_rate -> 44100), rebuilt when the codec's
+    /// programmed rate changes. Summed with the OPL + DSP streams in render_audio.
+    wss_resampler: Resampler,
+    wss_rate_hz: u32, // input rate the wss_resampler is currently configured for
+    wss_sample_phase: f64, // fractional WSS frames owed to the DMA playback clock
+    wss_base: u16,    // I/O base of the 4-port config region (codec sits at base+4)
+    wss_irq: u8,      // PIC line the codec's terminal-count interrupt forwards to
+    wss_dma: usize,   // byte-wide DMA channel the codec pulls playback bytes from
+    wss_enabled: bool, // false drops all WSS work (port decode, tick, IRQ, render)
     margo_ns: f64,    // fractional nanoseconds owed to the Margo busy countdown
     vga_dots: f64,    // fractional VGA dot clocks owed to the beam advance
     trace: BusTrace,
@@ -421,6 +449,19 @@ impl Machine {
     /// ordering relative to those memory writes matters.
     fn base(profile: MachineProfile, cpu: Cpu386, mut rom: Vec<u8>) -> Result<Self, MachineError> {
         let mixer = power_on_mixer(&profile);
+        // Build the AD1848 codec from the WSS board config. The codec's IRQ/DMA
+        // jumper readback comes from the same WssConfig the env/detection use, so
+        // the config region answers exactly what the codec is wired to. The base
+        // and resource numbers are cached on the bus for the port decode and the
+        // advance_devices DMA/IRQ feed (kept separate from the SB16's mixer).
+        let wss_enabled = profile.wss.enabled;
+        let wss_base = profile.wss.base;
+        let wss_irq = profile.wss.irq.line();
+        let wss_dma = profile.wss.dma.channel();
+        let wss = Ad1848::new(Ad1848Config {
+            irq: wss_irq,
+            dma: wss_dma as u8,
+        });
         let active_mode = profile.cpu;
         let memory_mib = profile.memory_mib;
         let timing = TimingFactors::for_clock(active_mode.clock_hz());
@@ -472,6 +513,16 @@ impl Machine {
             dsp_micros: 0.0,
             dsp_sample_phase: 0.0,
             mixer,
+            wss,
+            // Placeholder; sync_wss_resampler rebuilds this for the live rate on
+            // first use, so the value here never reaches the DAC as-is.
+            wss_resampler: Resampler::new(OPL_NATIVE_HZ, DAC_HZ),
+            wss_rate_hz: 0,
+            wss_sample_phase: 0.0,
+            wss_base,
+            wss_irq,
+            wss_dma,
+            wss_enabled,
             margo_ns: 0.0,
             vga_dots: 0.0,
             trace: BusTrace::default(),
@@ -935,6 +986,9 @@ impl Machine {
             opl: &mut self.opl,
             dsp: &mut self.dsp,
             mixer: &mut self.mixer,
+            wss: &mut self.wss,
+            wss_base: self.wss_base,
+            wss_enabled: self.wss_enabled,
             ide: &mut self.ide,
             ata: &mut self.ata,
             trace: &mut self.trace,
@@ -4239,6 +4293,63 @@ impl Machine {
             }
         }
 
+        // AD1848 / Windows Sound System playback, clock-driven exactly like the
+        // SB16 DSP above but on the codec's own base/IRQ/DMA -- no cross-talk with
+        // the SB16's mixer-selected IRQ/DMA. The codec pulls 1/2/4 byte-wide DMA
+        // reads per output frame internally (8/16-bit, mono/stereo), so a single
+        // byte fetcher feeds tick_sample. advance_autocal retires the post-MCE ACI
+        // window one output period per frame, and the terminal-count IRQ forwards
+        // to the configured PIC line. Gated entirely on wss_enabled.
+        if self.wss_enabled {
+            let programmed_rate = self.wss.output_frame_rate();
+            let autocal_active = self.wss.autocal_active();
+            // The output sample clock paces both the DMA render and the autocal
+            // (ACI) countdown. On real hardware the autocal converter clock retires
+            // its ~128-sample window regardless of the *programmed* sample rate, so
+            // when ACI is draining while I8 selects one of the two unsupported XTAL1
+            // selects (rate_hz()==0) we fall back to the lowest documented WSS rate
+            // (8000 Hz) just to clock the ACI countdown -- otherwise a guest that
+            // clears MCE under an invalid rate would leave ACI asserted forever.
+            // DMA render is still gated on a *valid* programmed rate below, so no
+            // audio is produced at the fallback cadence.
+            let wss_rate = if programmed_rate > 0 {
+                programmed_rate
+            } else if autocal_active {
+                WSS_AUTOCAL_FALLBACK_HZ
+            } else {
+                0
+            };
+            let wss_dma = self.wss_dma;
+            let wss_irq = self.wss_irq;
+            // Run the sample clock whenever there is actual per-frame work pending:
+            // either playback is armed (and the rate is valid), or the post-MCE ACI
+            // window is still retiring (a driver clears MCE and polls ACI before
+            // setting PEN). Gating on work mirrors the DSP path's `is_playing()`
+            // check so an idle codec -- the default state on every machine at
+            // power-on (rate 8000 Hz, not playing, no autocal) -- skips the
+            // accumulation entirely instead of spinning ~8000 times/sec.
+            let playing_at_valid_rate = programmed_rate > 0 && self.wss.is_playing();
+            if wss_rate > 0 && (playing_at_valid_rate || autocal_active) {
+                self.wss_sample_phase += clocks as f64 * wss_rate as f64 * self.timing.inv_clock;
+                while self.wss_sample_phase >= 1.0 {
+                    self.wss_sample_phase -= 1.0;
+                    let Machine {
+                        wss, dma, memory, ..
+                    } = self;
+                    // The codec pulls the 1/2/4 bytes a frame needs internally; an
+                    // idle (unarmed) codec, or one running only to retire ACI under
+                    // an invalid rate, ignores the fetcher and renders nothing.
+                    if playing_at_valid_rate {
+                        wss.tick_sample(|| dma.read_byte(wss_dma, memory));
+                    }
+                    wss.advance_autocal();
+                }
+                if self.wss.take_irq() {
+                    self.pic.request(wss_irq);
+                }
+            }
+        }
+
         self.pit_clocks += clocks as f64 * self.timing.pit_per_clock;
         let whole = self.pit_clocks.floor();
         self.pit_clocks -= whole;
@@ -4410,6 +4521,23 @@ impl Machine {
         out
     }
 
+    /// Render `native_samples` of AD1848 / WSS DMA output as stereo frames by
+    /// draining the codec's rendered-frame ring (filled by the clock-driven
+    /// producer in advance_devices). The codec already applies its own I6/I7 DAC
+    /// attenuation inside drain_frame's source path, and it is independent of the
+    /// CT1745 mixer, so NO SB16 voice/master gain is applied here. An idle codec
+    /// drains nothing, so it contributes silence (the OPL/DSP pass through).
+    pub fn render_wss_audio(&mut self, native_samples: usize) -> Vec<(i16, i16)> {
+        let mut out = Vec::with_capacity(native_samples);
+        for _ in 0..native_samples {
+            match self.wss.drain_frame() {
+                Some(frame) => out.push(frame),
+                None => break,
+            }
+        }
+        out
+    }
+
     /// Drive the internal per-clock device advance (PIT, OPL, DSP reset-settle,
     /// and the clock-driven DMA playback producer). Exposed so a host test or a
     /// frontend can flush device time without running the CPU, and so the DMA
@@ -4425,6 +4553,17 @@ impl Machine {
         if rate != self.dsp_rate_hz {
             self.dsp_resampler = Resampler::new(rate, DAC_HZ);
             self.dsp_rate_hz = rate;
+        }
+    }
+
+    /// Rebuild the WSS resampler when the codec's programmed sample rate changes,
+    /// so it always runs output_frame_rate -> 44100. Mirrors sync_dsp_resampler;
+    /// `.max(1)` guards the two unsupported XTAL1 clock selects that decode to 0.
+    fn sync_wss_resampler(&mut self) {
+        let rate = self.wss.output_frame_rate().max(1);
+        if rate != self.wss_rate_hz {
+            self.wss_resampler = Resampler::new(rate, DAC_HZ);
+            self.wss_rate_hz = rate;
         }
     }
 
@@ -4451,14 +4590,34 @@ impl Machine {
             .collect();
         let dsp_out = self.dsp_resampler.process(&dsp_stereo);
 
+        // AD1848 / WSS: the same wall-clock window's worth of codec frames,
+        // resampled to the DAC rate. The codec is independent of the CT1745 mixer
+        // (its I6/I7 DAC attenuation is already applied inside the frames), so it
+        // is summed directly below WITHOUT the SB16 master/voice/outgain scaling.
+        let wss_out = if self.wss_enabled {
+            self.sync_wss_resampler();
+            let wss_native_count = (native_samples as f64 * self.wss.output_frame_rate() as f64
+                / OPL_NATIVE_HZ as f64)
+                .round() as usize;
+            let wss_stereo: Vec<(i32, i32)> = self
+                .render_wss_audio(wss_native_count)
+                .iter()
+                .map(|&(l, r)| (i32::from(l), i32::from(r)))
+                .collect();
+            self.wss_resampler.process(&wss_stereo)
+        } else {
+            Vec::new()
+        };
+
         // Apply master + output gain (0x30/0x31, 0x41/0x42) once to the summed
         // pair. The DSP frames already carry the voice gain from render_dsp_audio,
         // so this single scaling pass gives DSP·voice·master·outgain and
         // OPL·master·outgain. A silent (idle) DSP yields no frames, so the OPL
         // passes through (attenuated only by master/outgain) when no DMA is armed.
+        // The WSS stream is summed in raw afterward (independent of the mixer).
         let (master_l, master_r) = self.mixer.master_gain();
         let (outgain_l, outgain_r) = self.mixer.outgain_gain();
-        let len = opl_out.len().max(dsp_out.len());
+        let len = opl_out.len().max(dsp_out.len()).max(wss_out.len());
         let spk = self.speaker.drain(len);
         // CD-Audio: pull the matching count of Red Book samples (44.1 kHz, the
         // DAC rate, so no resample) and attenuate by the CT1745 CD volume. A drive
@@ -4470,12 +4629,16 @@ impl Machine {
             .map(|i| {
                 let (ol, or) = opl_out.get(i).copied().unwrap_or((0, 0));
                 let (dl, dr) = dsp_out.get(i).copied().unwrap_or((0, 0));
+                let (wl, wr) = wss_out.get(i).copied().unwrap_or((0, 0));
                 let s = i32::from(spk[i]);
                 let (cl, cr) = cd.get(i).copied().unwrap_or((0, 0));
                 let cl = (cl as f32 * cd_l_gain) as i32;
                 let cr = (cr as f32 * cd_r_gain) as i32;
-                let l = ((ol + dl) as f32 * (master_l * outgain_l)) as i32 + s + cl;
-                let r = ((or + dr) as f32 * (master_r * outgain_r)) as i32 + s + cr;
+                // OPL + SB16 DSP take the CT1745 master/outgain; the WSS codec is
+                // summed in raw (its own attenuation already applied), like the
+                // speaker and CD streams that bypass the SB16 mixer.
+                let l = ((ol + dl) as f32 * (master_l * outgain_l)) as i32 + wl + s + cl;
+                let r = ((or + dr) as f32 * (master_r * outgain_r)) as i32 + wr + s + cr;
                 (clamp_i16(l), clamp_i16(r))
             })
             .collect()
@@ -4583,7 +4746,7 @@ impl Machine {
         } else {
             None
         };
-        let dsp_wake = if self.pic.irq_unmasked(self.mixer.selected_irq()) {
+        let dsp_wake = if self.pic.deliverable(self.mixer.selected_irq()) {
             // clocks_until_next_irq reasons in block-counter units (bytes for
             // 8-bit, words for 16-bit), so it must be fed the rate at which that
             // counter drains -- the raw byte/word rate -- not the per-channel
@@ -4598,12 +4761,22 @@ impl Machine {
         } else {
             None
         };
-        // The sooner of whichever wakes apply; None only when neither can fire.
-        let wake = match (pit_wake, dsp_wake) {
-            (None, None) => return None,
-            (Some(a), Some(b)) => a.min(b),
-            (Some(a), None) | (None, Some(a)) => a,
+        // The AD1848 / WSS terminal-count wake, on the codec's own (config) IRQ
+        // line. The codec drains one Current Count per output frame, so its IRQ
+        // estimator is fed the frame rate directly (no byte/word-counter scaling
+        // like the SB16's). Considered only when that line can actually deliver
+        // (`deliverable` also requires the master IR2 cascade pin for a slave line
+        // 9/10/11) and the codec is enabled; clocks_until_next_irq also returns
+        // None when IEN is clear (the underflow then sets only the sticky Status
+        // bit, no pin edge).
+        let wss_wake = if self.wss_enabled && self.pic.deliverable(self.wss_irq) {
+            self.wss
+                .clocks_until_next_irq(self.wss.rate_hz(), self.active_mode.clock_hz())
+        } else {
+            None
         };
+        // The sooner of whichever wakes apply; None only when none can fire.
+        let wake = [pit_wake, dsp_wake, wss_wake].into_iter().flatten().min()?;
         Some(wake.max(1).min(remaining))
     }
 
@@ -4666,6 +4839,9 @@ impl Machine {
                     opl,
                     dsp,
                     mixer,
+                    wss,
+                    wss_base,
+                    wss_enabled,
                     ide,
                     ata,
                     trace,
@@ -4698,6 +4874,9 @@ impl Machine {
                     opl,
                     dsp,
                     mixer,
+                    wss,
+                    wss_base: *wss_base,
+                    wss_enabled: *wss_enabled,
                     ide,
                     ata,
                     trace,
@@ -4878,6 +5057,12 @@ struct MachineBus<'a> {
     opl: &'a mut OplChip,
     dsp: &'a mut SbDsp,
     mixer: &'a mut SbMixer,
+    // The AD1848 codec and its config-region base. The port decode routes the 8
+    // ports in [wss_base, wss_base+8) to read_port/write_port when enabled; the
+    // DMA/IRQ feed lives on the owning Machine in advance_devices, not here.
+    wss: &'a mut Ad1848,
+    wss_base: u16,
+    wss_enabled: bool,
     ide: &'a mut ide::IdeChannel,
     ata: &'a mut Option<ata::AtaDisk>,
     trace: &'a mut BusTrace,
@@ -5007,6 +5192,14 @@ impl CpuBus for MachineBus<'_> {
         if let Some(value) = self.mixer.read_port(port) {
             return Ok(u32::from(value));
         }
+        // AD1848 / Windows Sound System: 4 config-region ports at wss_base plus
+        // the 4 codec ports at wss_base+4. read_port takes the in-region offset
+        // and returns a u8, so the range MUST be checked before the call. The
+        // region (default 0x530-0x537) never overlaps the SB16 (0x220-0x22F),
+        // CT1745 mixer (0x224/5), or OPL (0x388/9) ports.
+        if let Some(offset) = self.wss_offset(port) {
+            return Ok(u32::from(self.wss.read_port(offset)));
+        }
         if ide::IdeChannel::owns_port(port) {
             return Ok(u32::from(self.ide.read_port(port).unwrap_or(0xff)));
         }
@@ -5101,6 +5294,12 @@ impl CpuBus for MachineBus<'_> {
             return Ok(());
         }
         if self.mixer.write_port(port, value as u8) {
+            return Ok(());
+        }
+        // AD1848 / Windows Sound System write path. write_port takes the in-region
+        // offset and returns (), so the range is checked first (mirrors read_io).
+        if let Some(offset) = self.wss_offset(port) {
+            self.wss.write_port(offset, value as u8);
             return Ok(());
         }
         if ide::IdeChannel::owns_port(port) {
@@ -5617,6 +5816,17 @@ fn seed_bios_config_table(memory: &mut Memory) -> Result<(), BusError> {
 }
 
 impl MachineBus<'_> {
+    /// In-region offset (0..=7) of `port` within the AD1848 / WSS port window
+    /// `[wss_base, wss_base + 8)`, or `None` when the codec is disabled or the
+    /// port lies outside the window. The codec's read_port/write_port take this
+    /// offset; the caller dispatches to them only on `Some`.
+    fn wss_offset(&self, port: u16) -> Option<u16> {
+        if !self.wss_enabled {
+            return None;
+        }
+        port.checked_sub(self.wss_base).filter(|&off| off < 8)
+    }
+
     /// The plane-window offset for an access that the guest-selected GC06 graphics
     /// aperture redirects, or None when the access is not in a moved graphics
     /// window. Only graphics modes consult the aperture; text and CGA keep the
@@ -7151,6 +7361,7 @@ mod tests {
             memory_mib: 16,
             video: VideoCard::Et4000Ax,
             sound_blaster: SoundBlasterConfig::default(),
+            wss: WssConfig::default(),
             wait_states: WaitStateProfile::default(),
             address_pipelining: false,
             cache_enabled: false,
@@ -8566,6 +8777,718 @@ mod tests {
         );
     }
 
+    // ---- AD1848 / Windows Sound System integration ------------------------
+
+    // The default WSS board: config region at 0x530, codec direct registers at
+    // 0x534-0x537 (base+4), IRQ7, byte-wide DMA channel 0.
+    const WSS_CODEC: u16 = 0x534; // R0 Index
+    const WSS_DATA: u16 = 0x535; // R1 Indexed Data
+
+    /// Write one AD1848 indirect register through the codec's R0 (index) + R1
+    /// (data) direct ports on the machine bus.
+    fn wss_write_indirect(bus: &mut MachineBus, index: u8, value: u8) {
+        bus.write_io(WSS_CODEC, BusWidth::Byte, u32::from(index))
+            .unwrap();
+        bus.write_io(WSS_DATA, BusWidth::Byte, u32::from(value))
+            .unwrap();
+    }
+
+    #[test]
+    fn wss_16bit_stereo_dma_plays_and_irqs_through_the_machine() {
+        let mut machine = test_machine();
+        // 8 signed-LE 16-bit stereo frames (32 bytes) at byte base 0x01_0000 over
+        // the WSS byte-wide DMA channel 0. Each frame is asymmetric: L = +1
+        // (0x0001), R = -2 (0xFFFE), so a real de-interleave yields L != R and the
+        // codec's left-before-right ordering is observable.
+        let frame: [u8; 4] = [0x01, 0x00, 0xFE, 0xFF];
+        for i in 0..8u32 {
+            for (j, &b) in frame.iter().enumerate() {
+                machine.write_physical_u8(0x1_0000 + i * 4 + j as u32, b);
+            }
+        }
+        with_bus(&mut machine, |bus| {
+            // DMA ch0 (the WSS default): byte addr 0x0000, page 0x01 -> 0x01_0000,
+            // count 31 (32 bytes), single read. Channel 0 ports: addr 0x00,
+            // count 0x01, mode 0x0B, page 0x87, single-mask 0x0A.
+            bus.write_io(0x0B, BusWidth::Byte, 0x48).unwrap(); // mode ch0: single, read
+            bus.write_io(0x00, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x00, BusWidth::Byte, 0x00).unwrap(); // addr 0x0000
+            bus.write_io(0x01, BusWidth::Byte, 0x1F).unwrap();
+            bus.write_io(0x01, BusWidth::Byte, 0x00).unwrap(); // count 31 -> 32 bytes
+            bus.write_io(0x87, BusWidth::Byte, 0x01).unwrap(); // ch0 page -> 0x01_0000
+            bus.write_io(0x0A, BusWidth::Byte, 0x00).unwrap(); // unmask ch0
+
+            // Program the codec for 16-bit signed stereo at 48000 Hz (XTAL1 CFS6).
+            // I8 = FMT(0x40) | S/M(0x10) | CFS6(0x0C) -> 0x5C, MCE-gated.
+            bus.write_io(WSS_CODEC, BusWidth::Byte, u32::from(0x40u8 | 0x08))
+                .unwrap(); // R0: MCE | index 8
+            bus.write_io(WSS_DATA, BusWidth::Byte, 0x5C).unwrap();
+            bus.write_io(WSS_CODEC, BusWidth::Byte, 0x08).unwrap(); // clear MCE
+            // Enable the external INT pin (I10 IEN, bit1) so terminal count forwards.
+            wss_write_indirect(bus, 10, 0x02);
+            // Base count 7 -> underflow at frame 8 (N+1 cadence).
+            wss_write_indirect(bus, 15, 0x07); // I15 lower count
+            wss_write_indirect(bus, 14, 0x00); // I14 upper count (loads current)
+            // Arm playback: I9 PEN (bit0) + ACAL (bit3).
+            wss_write_indirect(bus, 9, 0x09);
+            // Unmute both DACs at 0 dB so the decoded samples pass through.
+            wss_write_indirect(bus, 6, 0x00);
+            wss_write_indirect(bus, 7, 0x00);
+        });
+
+        // Drain the codec ring directly to prove de-interleave (render_audio mixes
+        // OPL in, which would mask the exact values).
+        machine.advance_devices_clocks(200_000);
+        let mut frames = Vec::new();
+        while let Some(f) = machine.wss.drain_frame() {
+            frames.push(f);
+        }
+        assert!(!frames.is_empty(), "WSS produced rendered frames");
+        assert_eq!(
+            frames[0],
+            (1, -2),
+            "16-bit LE de-interleave, left before right"
+        );
+        assert!(
+            frames.iter().any(|&(l, r)| l != r),
+            "asymmetric L/R proves a real stereo de-interleave (not a mono dup)"
+        );
+
+        // The terminal-count interrupt reached the PIC on the WSS line (IRQ7).
+        assert!(
+            machine.pic.irr_bit(7),
+            "WSS terminal count raised its IRQ on the configured line"
+        );
+
+        // render_audio still produces a full mix here (this drained the WSS ring
+        // above, so the WSS contribution is proven through render_audio separately
+        // in wss_stream_reaches_the_mixed_render_output_through_render_audio; this
+        // only checks the OPL/DSP/speaker mix is not truncated by the WSS path).
+        let mixed = machine.render_audio(64);
+        assert!(
+            !mixed.is_empty(),
+            "render_audio still mixes the other streams after the WSS ring is drained"
+        );
+    }
+
+    #[test]
+    fn wss_coexists_with_sb16_and_opl_without_cross_talk() {
+        // With WSS enabled, the SB16 DSP + OPL must still function and there must
+        // be no port/IRQ/DMA cross-talk: WSS uses base 0x530 / IRQ7 / DMA0, the
+        // SB16 uses 0x220-0x22F / IRQ5 / DMA1, the OPL uses 0x388/9.
+        let mut machine = test_machine();
+
+        // SB16 8-bit mono playback on DMA ch1 (the SB default), exactly like the
+        // standalone DSP golden, at byte base 0x02_0000.
+        let bytes: Vec<u8> = (0..16).map(|i| (i * 16) as u8).collect();
+        for (i, &b) in bytes.iter().enumerate() {
+            machine.write_physical_u8(0x2_0000 + i as u32, b);
+        }
+        // A distinct WSS 8-bit mono buffer on DMA ch0 at byte base 0x01_0000:
+        // a constant near-full-positive value so the WSS stream is unmistakable.
+        for i in 0..16u32 {
+            machine.write_physical_u8(0x1_0000 + i, 0xFF);
+        }
+
+        with_bus(&mut machine, |bus| {
+            // --- SB16 DMA ch1 + DSP (IRQ5/DMA1, ports 0x220-0x22F) ---
+            bus.write_io(0x0B, BusWidth::Byte, 0x49).unwrap(); // mode ch1: single, read
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x0F).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x83, BusWidth::Byte, 0x02).unwrap(); // ch1 page -> 0x02_0000
+            bus.write_io(0x0A, BusWidth::Byte, 0x01).unwrap(); // unmask ch1
+            for &b in &[0x41u8, 0x2B, 0x11, 0x48, 0x0F, 0x00, 0x14] {
+                bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
+            }
+            // OPL: key a full sustained tone on channel 0 (modulator + carrier +
+            // key-on) so the OPL stream is genuinely audible, not just touched.
+            program_tone(bus, 0x388, 0x389);
+
+            // --- WSS DMA ch0 + codec (IRQ7/DMA0, ports 0x530-0x537) ---
+            bus.write_io(0x0B, BusWidth::Byte, 0x48).unwrap(); // mode ch0: single, read
+            bus.write_io(0x00, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x00, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x01, BusWidth::Byte, 0x0F).unwrap();
+            bus.write_io(0x01, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x87, BusWidth::Byte, 0x01).unwrap(); // ch0 page -> 0x01_0000
+            bus.write_io(0x0A, BusWidth::Byte, 0x00).unwrap(); // unmask ch0
+            // Codec: 8-bit unsigned PCM mono at 48000 Hz (I8 = CFS6 only -> 0x0C).
+            bus.write_io(WSS_CODEC, BusWidth::Byte, u32::from(0x40u8 | 0x08))
+                .unwrap();
+            bus.write_io(WSS_DATA, BusWidth::Byte, 0x0C).unwrap();
+            bus.write_io(WSS_CODEC, BusWidth::Byte, 0x08).unwrap();
+            wss_write_indirect(bus, 10, 0x02); // IEN
+            wss_write_indirect(bus, 15, 0x07); // count low
+            wss_write_indirect(bus, 14, 0x00); // count high
+            wss_write_indirect(bus, 9, 0x09); // PEN | ACAL
+            wss_write_indirect(bus, 6, 0x00);
+            wss_write_indirect(bus, 7, 0x00);
+        });
+
+        machine.advance_devices_clocks(200_000);
+
+        // Both producers filled their own rings independently.
+        let mut wss_frames = Vec::new();
+        while let Some(f) = machine.wss.drain_frame() {
+            wss_frames.push(f);
+        }
+        assert!(!wss_frames.is_empty(), "WSS still plays alongside the SB16");
+        assert!(
+            wss_frames.iter().all(|&(l, r)| l == r && l > 0),
+            "WSS 8-bit unsigned 0xFF -> near-full-positive mono dup, undisturbed"
+        );
+        let dsp_out = machine.render_dsp_audio(16);
+        assert_eq!(dsp_out.len(), 16, "SB16 DSP still plays its own buffer");
+
+        // No IRQ cross-talk: WSS fired IRQ7, the SB16 fired its mixer-selected
+        // IRQ5, and neither stepped on the other.
+        assert_eq!(
+            machine.sb_selected_irq(),
+            5,
+            "SB16 default IRQ unchanged by WSS"
+        );
+        assert!(machine.pic.irr_bit(7), "WSS raised IRQ7");
+        assert!(
+            machine.pic.irr_bit(machine.sb_selected_irq()),
+            "SB16 raised its own (IRQ5) line"
+        );
+
+        // No DMA cross-talk: the WSS drew from ch0, the SB16 from ch1; both single
+        // channels reached terminal count on their own.
+        assert_eq!(machine.dma_read_byte(0), None, "WSS ch0 reached TC");
+        assert_eq!(machine.dma_read_byte(1), None, "SB16 ch1 reached TC");
+
+        // The OPL really produces output (the keyed note is audible), not just a
+        // non-empty render_audio that the speaker/WSS streams alone would satisfy.
+        // Render the OPL in isolation and assert a non-zero sample magnitude.
+        let opl_nonsilent = (0..512)
+            .map(|_| machine.opl.render_sample())
+            .any(|(l, r)| l != 0 || r != 0);
+        assert!(
+            opl_nonsilent,
+            "OPL still synthesizes its keyed note alongside the WSS and SB16"
+        );
+
+        // The full mix is non-empty (OPL + SB16 + WSS all summed).
+        let mixed = machine.render_audio(64);
+        assert!(!mixed.is_empty());
+    }
+
+    /// Program DMA channel 0 (the WSS default) for a single-cycle 8-bit read of
+    /// `count + 1` bytes at physical `0x01_0000`, then arm the AD1848 codec for
+    /// 8-bit unsigned mono at 48000 Hz with IEN set and `count` base count.
+    fn wss_arm_8bit_mono(bus: &mut MachineBus, count: u8) {
+        // DMA ch0: mode single+read, addr 0x0000, count, page 0x01, unmask.
+        bus.write_io(0x0B, BusWidth::Byte, 0x48).unwrap();
+        bus.write_io(0x00, BusWidth::Byte, 0x00).unwrap();
+        bus.write_io(0x00, BusWidth::Byte, 0x00).unwrap();
+        bus.write_io(0x01, BusWidth::Byte, u32::from(count))
+            .unwrap();
+        bus.write_io(0x01, BusWidth::Byte, 0x00).unwrap();
+        bus.write_io(0x87, BusWidth::Byte, 0x01).unwrap();
+        bus.write_io(0x0A, BusWidth::Byte, 0x00).unwrap();
+        // Codec: 8-bit unsigned PCM mono at 48000 Hz (I8 = CFS6 -> 0x0C), MCE-gated.
+        bus.write_io(WSS_CODEC, BusWidth::Byte, u32::from(0x40u8 | 0x08))
+            .unwrap();
+        bus.write_io(WSS_DATA, BusWidth::Byte, 0x0C).unwrap();
+        bus.write_io(WSS_CODEC, BusWidth::Byte, 0x08).unwrap(); // clear MCE
+        wss_write_indirect(bus, 10, 0x02); // I10 IEN
+        wss_write_indirect(bus, 15, count); // I15 lower count
+        wss_write_indirect(bus, 14, 0x00); // I14 upper count (loads current)
+        wss_write_indirect(bus, 9, 0x09); // I9 PEN | ACAL
+        wss_write_indirect(bus, 6, 0x00);
+        wss_write_indirect(bus, 7, 0x00);
+    }
+
+    #[test]
+    fn wss_irq7_wakes_a_halted_cpu_via_fast_forward() {
+        // Mirror sb_dma_irq5_wakes_a_halted_cpu_via_fast_forward for the WSS wake
+        // branch in next_device_wake: a guest arms WSS playback with IEN set and
+        // IRQ7 unmasked, then sti;hlt. The run loop must fast-forward across the
+        // codec's terminal-count window and deliver IRQ7 -- proving the wss_wake
+        // estimator drives the machine, not just the wss.rs unit test.
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            // mov ax,0; mov ds,ax; sti; hlt; cli; hlt
+            rom_with_code(&[0xb8, 0x00, 0x00, 0x8e, 0xd8, 0xfb, 0xf4, 0xfa, 0xf4]),
+        )
+        .unwrap();
+        // 64-byte buffer at 0x01_0000 (DMA ch0 page 0x01) so the codec never
+        // underruns before terminal count.
+        for i in 0..64u32 {
+            machine.write_physical_u8(0x1_0000 + i, 0x80);
+        }
+        // IRQ7 handler at 0x0700: inc word [0x0610]; mov al,0x20; out 0x20,al; iret.
+        let handler: [u8; 9] = [0xff, 0x06, 0x10, 0x06, 0xb0, 0x20, 0xe6, 0x20, 0xcf];
+        for (i, &b) in handler.iter().enumerate() {
+            machine.write_physical_u8(0x0700 + i as u32, b);
+        }
+        // IVT[0x0F] (IRQ7 with PIC base 0x08) -> 0x0000:0x0700; clear the counter.
+        machine.write_physical_u8(0x3C, 0x00);
+        machine.write_physical_u8(0x3D, 0x07);
+        machine.write_physical_u8(0x3E, 0x00);
+        machine.write_physical_u8(0x3F, 0x00);
+        machine.write_physical_u8(0x0610, 0x00);
+        machine.write_physical_u8(0x0611, 0x00);
+        with_bus(&mut machine, |bus| {
+            // PIC base 0x08 so IRQ7 -> vector 0x0F; all IRQs unmasked.
+            bus.write_io(0x20, BusWidth::Byte, 0x11).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x08).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x04).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x00).unwrap(); // unmask all
+            // Base count 31 -> terminal count after 32 frames.
+            wss_arm_8bit_mono(bus, 31);
+        });
+        let reason = machine.run_until_halt_or_cycles(5_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        let ticks = u16::from(machine.read_physical_u8(0x0610))
+            | (u16::from(machine.read_physical_u8(0x0611)) << 8);
+        assert!(ticks >= 1, "the WSS IRQ7 handler should have run");
+        // The fast-forward crossed a real sample window (32 frames at 48 kHz ~=
+        // 14.6k CPU clocks at 22 MHz), not a no-op halt.
+        assert!(
+            machine.elapsed_clocks() > 10_000,
+            "the fast-forward should advance emulated time across the WSS window"
+        );
+    }
+
+    #[test]
+    fn wss_honors_a_configured_slave_irq11_end_to_end() {
+        // The default integration tests only exercise IRQ7 (master). Prove a machine
+        // configured with a slave line (IRQ11) actually raises THAT line: wss_irq is
+        // taken from profile.wss.irq.line() and fed to pic.request(wss_irq), so a
+        // transposed or hardcoded line would route the terminal-count IRQ to the
+        // wrong pin. Arm the codec and advance device time across its window; the
+        // configured line must latch in the PIC's IRR and IRQ7 must stay clear.
+        let mut profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        profile.wss = WssConfig {
+            irq: izarravm_core::WssIrq::I11,
+            ..WssConfig::default()
+        };
+        let mut machine = Machine::new(profile, I386DX25_TEST_ROM).unwrap();
+        for i in 0..64u32 {
+            machine.write_physical_u8(0x1_0000 + i, 0x80);
+        }
+        with_bus(&mut machine, |bus| {
+            wss_arm_8bit_mono(bus, 31); // base count 31 -> TC after 32 frames
+        });
+        machine.advance_devices_clocks(200_000);
+        assert!(
+            machine.pic.irr_bit(11),
+            "the codec raised its configured IRQ11 (slave line)"
+        );
+        assert!(
+            !machine.pic.irr_bit(7),
+            "the default IRQ7 was NOT raised when IRQ11 is configured"
+        );
+    }
+
+    #[test]
+    fn wss_masked_irq7_does_not_wake_the_cpu() {
+        // The IRQ-masked path: with IRQ7 masked, next_device_wake's wss branch must
+        // be None (it gates on pic.deliverable), so sti;hlt is a genuine halt the
+        // codec cannot wake. We mask EVERY line (IMR = 0xFF) so the WSS is the only
+        // armed device and no other source can confound the wake -- the run loop
+        // therefore halts at the first hlt and the handler never runs, even with
+        // interrupts enabled. (The sticky Status INT bit is proven separately in
+        // wss_masked_ien_clear_sets_sticky_status_without_a_pic_edge.)
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            // mov ax,0; mov ds,ax; sti; hlt; cli; hlt
+            rom_with_code(&[0xb8, 0x00, 0x00, 0x8e, 0xd8, 0xfb, 0xf4, 0xfa, 0xf4]),
+        )
+        .unwrap();
+        for i in 0..64u32 {
+            machine.write_physical_u8(0x1_0000 + i, 0x80);
+        }
+        // IRQ7 handler that bumps a counter, so we can prove it never runs.
+        let handler: [u8; 9] = [0xff, 0x06, 0x10, 0x06, 0xb0, 0x20, 0xe6, 0x20, 0xcf];
+        for (i, &b) in handler.iter().enumerate() {
+            machine.write_physical_u8(0x0700 + i as u32, b);
+        }
+        machine.write_physical_u8(0x3C, 0x00);
+        machine.write_physical_u8(0x3D, 0x07);
+        machine.write_physical_u8(0x0610, 0x00);
+        machine.write_physical_u8(0x0611, 0x00);
+        with_bus(&mut machine, |bus| {
+            // PIC base 0x08, then mask ALL lines (IMR = 0xFF) so only the codec is
+            // armed and nothing can wake the CPU.
+            bus.write_io(0x20, BusWidth::Byte, 0x11).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x08).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x04).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x21, BusWidth::Byte, 0xFF).unwrap(); // mask every line
+            wss_arm_8bit_mono(bus, 31);
+        });
+        // Run long enough that, were the WSS line a wake source, the codec would
+        // fast-forward to terminal count and the CPU would advance well past the
+        // window. A genuine halt makes no progress at the first hlt.
+        let reason = machine.run_until_halt_or_cycles(2_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        let ticks = u16::from(machine.read_physical_u8(0x0610))
+            | (u16::from(machine.read_physical_u8(0x0611)) << 8);
+        assert_eq!(ticks, 0, "masked IRQ7 must not deliver the WSS interrupt");
+        assert!(
+            !machine.pic.irq_unmasked(7),
+            "IRQ7 stayed masked for the duration"
+        );
+        // The codec did NOT wake the CPU: a masked WSS line is not a wake source,
+        // so the run loop genuinely halted instead of fast-forwarding across the
+        // ~32-frame codec window (which would have advanced emulated time by 10k+
+        // clocks, as the unmasked twin test asserts).
+        assert!(
+            machine.elapsed_clocks() < 5_000,
+            "a genuine halt does not fast-forward across the masked codec window"
+        );
+    }
+
+    #[test]
+    fn wss_masked_ien_clear_sets_sticky_status_without_a_pic_edge() {
+        // Underflow sets the codec's *internal* sticky Status INT bit regardless of
+        // IEN (datasheet: the internal INT bit becomes one on counter underflow even
+        // if IEN is zero), but the external INT *pin* -- and hence the PIC forward in
+        // advance_devices -- is gated by IEN. Arm with IEN CLEAR and drive the codec
+        // to terminal count directly (advance_devices, no CPU); the sticky bit must
+        // be set while no edge ever reaches the PIC, proving the two are distinct.
+        const R2_INT: u8 = 0x01;
+        let mut machine = test_machine();
+        for i in 0..64u32 {
+            machine.write_physical_u8(0x1_0000 + i, 0x80);
+        }
+        with_bus(&mut machine, |bus| {
+            // DMA ch0 for 32 bytes at 0x01_0000, 8-bit unsigned mono at 48 kHz, but
+            // with IEN CLEAR (I10 = 0) so the underflow forwards no pin edge.
+            bus.write_io(0x0B, BusWidth::Byte, 0x48).unwrap();
+            bus.write_io(0x00, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x00, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x01, BusWidth::Byte, 0x1F).unwrap();
+            bus.write_io(0x01, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x87, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x0A, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(WSS_CODEC, BusWidth::Byte, u32::from(0x40u8 | 0x08))
+                .unwrap();
+            bus.write_io(WSS_DATA, BusWidth::Byte, 0x0C).unwrap();
+            bus.write_io(WSS_CODEC, BusWidth::Byte, 0x08).unwrap();
+            wss_write_indirect(bus, 10, 0x00); // IEN CLEAR
+            wss_write_indirect(bus, 15, 0x1F); // base count 31 -> TC after 32 frames
+            wss_write_indirect(bus, 14, 0x00);
+            wss_write_indirect(bus, 9, 0x09); // PEN | ACAL
+            wss_write_indirect(bus, 6, 0x00);
+            wss_write_indirect(bus, 7, 0x00);
+        });
+        // Advance device time across the full ~32-frame window at 48 kHz (~14.6k CPU
+        // clocks at 22 MHz; use a generous budget so terminal count is reached).
+        machine.advance_devices_clocks(200_000);
+        assert_ne!(
+            machine.wss.status() & R2_INT,
+            0,
+            "underflow sets the internal sticky Status INT bit even with IEN clear"
+        );
+        assert!(
+            !machine.pic.irr_bit(7),
+            "IEN clear forwards no pin edge, so the PIC line stays clear"
+        );
+    }
+
+    #[test]
+    fn wss_disabled_leaves_its_ports_undecoded() {
+        // With the codec disabled, its config/codec ports must NOT decode at all:
+        // 0x530-0x537 is not in known_passive_ports(), so the bus must return
+        // Err(UnsupportedPort) for both reads and writes -- not a swallowed error
+        // and not a stale latched value. Contrast with the enabled machine, which
+        // answers the I12 revision read with 0x0A, so the test proves the gate
+        // toggles real decode rather than relying on an error either way.
+        let mut profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        profile.wss = WssConfig {
+            enabled: false,
+            ..WssConfig::default()
+        };
+        let mut machine = Machine::new(profile, I386DX25_TEST_ROM).unwrap();
+        with_bus(&mut machine, |bus| {
+            // A write to the index port must not decode.
+            assert!(
+                matches!(
+                    bus.write_io(WSS_CODEC, BusWidth::Byte, 0x0C),
+                    Err(BusError::UnsupportedPort { port }) if port == WSS_CODEC
+                ),
+                "disabled WSS index write does not decode"
+            );
+            // A read of the data port (where an enabled codec would surface the
+            // I12 revision) must not decode either.
+            assert!(
+                matches!(
+                    bus.read_io(WSS_DATA, BusWidth::Byte),
+                    Err(BusError::UnsupportedPort { port }) if port == WSS_DATA
+                ),
+                "disabled WSS data read does not decode"
+            );
+            // The window edges (base+7) are likewise undecoded.
+            assert!(
+                matches!(
+                    bus.read_io(0x537, BusWidth::Byte),
+                    Err(BusError::UnsupportedPort { port }) if port == 0x537
+                ),
+                "disabled WSS upper window edge does not decode"
+            );
+        });
+
+        // The same index-12 read on an ENABLED machine DOES decode to 0x0A, so the
+        // disabled assertions above are a genuine contrast, not a vacuous pass.
+        let mut enabled = test_machine();
+        with_bus(&mut enabled, |bus| {
+            bus.write_io(WSS_CODEC, BusWidth::Byte, 0x0C).unwrap(); // select I12
+            assert_eq!(
+                bus.read_io(WSS_DATA, BusWidth::Byte).unwrap(),
+                0x0A,
+                "enabled WSS answers the I12 revision read"
+            );
+        });
+    }
+
+    #[test]
+    fn wss_disabled_advance_and_render_run_cleanly_and_stay_silent() {
+        // The disabled-codec branches in the producer loop (`if self.wss_enabled`)
+        // and in render_audio (the `} else { Vec::new() }` WSS arm) are never reached
+        // by the port-decode disabled test, which exits before any audio work. Run a
+        // disabled machine through advance_devices AND render_audio to prove those
+        // branches execute cleanly (no panic) and the WSS contributes silence. We
+        // arm DMA/codec ports first to confirm a disabled codec ignores them entirely
+        // -- but the ports do not decode, so the writes that would land on the codec
+        // are skipped; only the DMA programming (separate decoder) is set up.
+        let mut profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        profile.wss = WssConfig {
+            enabled: false,
+            ..WssConfig::default()
+        };
+        let mut machine = Machine::new(profile, I386DX25_TEST_ROM).unwrap();
+        for i in 0..64u32 {
+            machine.write_physical_u8(0x1_0000 + i, 0xFF);
+        }
+        with_bus(&mut machine, |bus| {
+            // Program DMA ch0 (a separate decoder, still live) so the producer loop,
+            // had it run the codec, would have data to read. The codec ports do not
+            // decode while disabled, so we do not touch them here.
+            bus.write_io(0x0B, BusWidth::Byte, 0x48).unwrap();
+            bus.write_io(0x00, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x00, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x01, BusWidth::Byte, 0x3F).unwrap();
+            bus.write_io(0x01, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x87, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x0A, BusWidth::Byte, 0x00).unwrap();
+        });
+        // The disabled producer branch must be a no-op: this runs cleanly and queues
+        // no codec frames.
+        machine.advance_devices_clocks(200_000);
+        assert!(
+            machine.wss.drain_frame().is_none(),
+            "a disabled codec renders no frames"
+        );
+        // The disabled render_audio arm (Vec::new()) must contribute nothing; with
+        // OPL/DSP idle and the speaker silent the whole mix is silence.
+        let mixed = machine.render_audio(64);
+        assert!(
+            mixed.iter().all(|&(l, r)| l == 0 && r == 0),
+            "a disabled WSS adds nothing; idle OPL/DSP/speaker leave silence"
+        );
+    }
+
+    /// Program DMA channel 0 and the codec for 16-bit signed stereo at 48 kHz with
+    /// IEN set, drawing `frames` frames (4 bytes each) at physical 0x01_0000.
+    fn wss_arm_16bit_stereo(bus: &mut MachineBus, frames: u8) {
+        let byte_count = u16::from(frames) * 4 - 1; // count is bytes-1
+        bus.write_io(0x0B, BusWidth::Byte, 0x48).unwrap(); // mode ch0: single, read
+        bus.write_io(0x00, BusWidth::Byte, 0x00).unwrap();
+        bus.write_io(0x00, BusWidth::Byte, 0x00).unwrap();
+        bus.write_io(0x01, BusWidth::Byte, u32::from(byte_count & 0xFF))
+            .unwrap();
+        bus.write_io(0x01, BusWidth::Byte, u32::from(byte_count >> 8))
+            .unwrap();
+        bus.write_io(0x87, BusWidth::Byte, 0x01).unwrap();
+        bus.write_io(0x0A, BusWidth::Byte, 0x00).unwrap();
+        // I8 = FMT(0x40) | S/M(0x10) | CFS6(0x0C) -> 0x5C, MCE-gated.
+        bus.write_io(WSS_CODEC, BusWidth::Byte, u32::from(0x40u8 | 0x08))
+            .unwrap();
+        bus.write_io(WSS_DATA, BusWidth::Byte, 0x5C).unwrap();
+        bus.write_io(WSS_CODEC, BusWidth::Byte, 0x08).unwrap(); // clear MCE
+        wss_write_indirect(bus, 10, 0x02); // IEN
+        let count = u16::from(frames) - 1;
+        wss_write_indirect(bus, 15, (count & 0xFF) as u8);
+        wss_write_indirect(bus, 14, (count >> 8) as u8);
+        wss_write_indirect(bus, 9, 0x09); // PEN | ACAL
+        wss_write_indirect(bus, 6, 0x00); // left DAC 0 dB
+        wss_write_indirect(bus, 7, 0x00); // right DAC 0 dB
+    }
+
+    /// Load `frames` asymmetric 16-bit LE stereo frames at 0x01_0000: L = +0x4000,
+    /// R = -0x4000, so the de-interleaved, mixed output carries L > 0 and R < 0.
+    fn load_asymmetric_stereo(machine: &mut Machine, frames: u32) {
+        // L = 0x4000 (+16384) -> bytes 0x00,0x40; R = 0xC000 (-16384) -> 0x00,0xC0.
+        let frame: [u8; 4] = [0x00, 0x40, 0x00, 0xC0];
+        for i in 0..frames {
+            for (j, &b) in frame.iter().enumerate() {
+                machine.write_physical_u8(0x1_0000 + i * 4 + j as u32, b);
+            }
+        }
+    }
+
+    #[test]
+    fn wss_stream_reaches_the_mixed_render_output_through_render_audio() {
+        // Finding: the de-interleave smoke test pre-drains the ring before calling
+        // render_audio, so the resampler + L/R summation path is never proven to
+        // carry WSS audio. Here we arm an asymmetric stereo buffer, advance devices,
+        // and call render_audio WITHOUT draining -- with OPL/DSP idle and the speaker
+        // silent, the only possible signal is the WSS stream, so the mixed output
+        // must show the codec's L>0 / R<0 sign pattern. Disabling WSS for the same
+        // buffer must then yield silence, proving the contribution came from the
+        // WSS mix path and not from some other stream.
+        let mut machine = test_machine();
+        load_asymmetric_stereo(&mut machine, 64);
+        with_bus(&mut machine, |bus| wss_arm_16bit_stereo(bus, 64));
+        machine.advance_devices_clocks(200_000);
+        let mixed = machine.render_audio(64);
+        assert!(
+            mixed.iter().any(|&(l, r)| l > 0 && r < 0),
+            "the WSS stream reaches the mixed L/R output with its asymmetric sign \
+             pattern (left positive, right negative)"
+        );
+
+        // The identical buffer with WSS disabled produces silence: nothing else is
+        // sounding, so the signal above was the WSS mix path, not a stray stream.
+        let mut silent_profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        silent_profile.wss = WssConfig {
+            enabled: false,
+            ..WssConfig::default()
+        };
+        let mut silent = Machine::new(silent_profile, I386DX25_TEST_ROM).unwrap();
+        load_asymmetric_stereo(&mut silent, 64);
+        silent.advance_devices_clocks(200_000);
+        let quiet = silent.render_audio(64);
+        assert!(
+            quiet.iter().all(|&(l, r)| l == 0 && r == 0),
+            "with WSS disabled the same buffer mixes to silence"
+        );
+    }
+
+    #[test]
+    fn wss_is_summed_raw_bypassing_the_ct1745_master_gain() {
+        // Design contract: the WSS stream is summed into render_audio WITHOUT the
+        // CT1745 master/voice/outgain scaling that OPL and the SB16 DSP take. Prove
+        // it by HARD-MUTING the CT1745 master (level 0 = exactly 0.0 gain): an OPL
+        // tone is silenced, but the WSS stream must still reach the output unchanged.
+        let mut machine = test_machine();
+        load_asymmetric_stereo(&mut machine, 64);
+        with_bus(&mut machine, |bus| {
+            // Hard-mute the CT1745 master (0x30/0x31 = 0) -- this scales OPL+DSP to
+            // exactly zero but, per the contract, must NOT touch the WSS stream.
+            bus.write_io(0x224, BusWidth::Byte, 0x30).unwrap();
+            bus.write_io(0x225, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x224, BusWidth::Byte, 0x31).unwrap();
+            bus.write_io(0x225, BusWidth::Byte, 0x00).unwrap();
+            // Key a loud OPL tone: with the master muted it must contribute zero.
+            program_tone(bus, 0x388, 0x389);
+            wss_arm_16bit_stereo(bus, 64);
+        });
+        machine.advance_devices_clocks(200_000);
+        let mixed = machine.render_audio(64);
+        assert!(
+            mixed.iter().any(|&(l, r)| l > 0 && r < 0),
+            "the WSS stream survives a hard-muted CT1745 master (summed raw)"
+        );
+
+        // Control: the SAME muted master with the OPL tone but WSS disabled yields
+        // silence -- confirming the master mute really does zero the OPL/DSP path,
+        // so the non-silence above is the raw WSS sum and not a leaking OPL tone.
+        let mut control = test_machine();
+        with_bus(&mut control, |bus| {
+            bus.write_io(0x224, BusWidth::Byte, 0x30).unwrap();
+            bus.write_io(0x225, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x224, BusWidth::Byte, 0x31).unwrap();
+            bus.write_io(0x225, BusWidth::Byte, 0x00).unwrap();
+            program_tone(bus, 0x388, 0x389);
+        });
+        control.advance_devices_clocks(200_000);
+        let muted = control.render_audio(64);
+        assert!(
+            muted.iter().all(|&(l, r)| l == 0 && r == 0),
+            "a hard-muted master zeroes the OPL/DSP path (proving the mute is live)"
+        );
+    }
+
+    #[test]
+    fn wss_autocal_window_drains_even_under_an_invalid_sample_rate() {
+        // The autocal converter clock retires the ~128-sample ACI window regardless
+        // of the programmed sample rate. If the producer only advanced the autocal
+        // when rate_hz() > 0, a guest that cleared MCE while I8 selects one of the
+        // two unsupported XTAL1 rates (rate_hz() == 0) would leave ACI asserted
+        // forever. Arm an invalid rate (XTAL1 CFS4 -> 0 Hz), trigger autocal by an
+        // MCE clear, and advance device time: ACI must retire on the fallback clock.
+        let mut machine = test_machine();
+        with_bus(&mut machine, |bus| {
+            // Select an UNSUPPORTED rate: I8 = CFS4 (bits3:1 = 4 -> 0x08), CSS=0
+            // (XTAL1). rate_hz() decodes this to 0. Set MCE to latch I8, then clear
+            // MCE to assert ACI.
+            bus.write_io(WSS_CODEC, BusWidth::Byte, u32::from(0x40u8 | 0x08))
+                .unwrap(); // MCE | index 8
+            bus.write_io(WSS_DATA, BusWidth::Byte, 0x08).unwrap(); // CFS4, XTAL1 -> 0 Hz
+            bus.write_io(WSS_CODEC, BusWidth::Byte, 0x08).unwrap(); // clear MCE -> ACI
+        });
+        assert!(
+            machine.wss.autocal_active(),
+            "clearing MCE asserts the ACI autocal window"
+        );
+        assert_eq!(
+            machine.wss.rate_hz(),
+            0,
+            "the selected rate is one of the unsupported (0 Hz) XTAL1 cells"
+        );
+        // Advance well past the 128-sample window at the 8000 Hz fallback cadence
+        // (~16 ms; 200k clocks at 22 MHz is ~9 ms, so use a larger budget).
+        machine.advance_devices_clocks(1_000_000);
+        assert!(
+            !machine.wss.autocal_active(),
+            "the ACI window retires on the fallback converter clock despite rate 0"
+        );
+    }
+
+    #[test]
+    fn wss_port_window_edges_and_config_region_decode_through_the_bus() {
+        // Pin the wss_offset window math (`port.checked_sub(base).filter(|o| o < 8)`)
+        // at its boundaries through the machine bus, plus the config-region readback
+        // the decode comment promises does not overlap the SB16/mixer/OPL ranges:
+        //   base+1 (0x531) -> IRQ7/DMA0 jumper byte 0x70,
+        //   base+7 (0x537) -> decodes (Ok),
+        //   base+8 (0x538) and base-1 (0x52F) -> Err(UnsupportedPort).
+        let mut machine = test_machine();
+        with_bus(&mut machine, |bus| {
+            assert_eq!(
+                bus.read_io(0x531, BusWidth::Byte).unwrap(),
+                0x70,
+                "config region reads the IRQ7/DMA0 jumper byte"
+            );
+            assert!(
+                bus.read_io(0x537, BusWidth::Byte).is_ok(),
+                "base+7 is the last decoded WSS port"
+            );
+            assert!(
+                matches!(
+                    bus.read_io(0x538, BusWidth::Byte),
+                    Err(BusError::UnsupportedPort { port }) if port == 0x538
+                ),
+                "base+8 is past the 8-port window"
+            );
+            assert!(
+                matches!(
+                    bus.read_io(0x52F, BusWidth::Byte),
+                    Err(BusError::UnsupportedPort { port }) if port == 0x52F
+                ),
+                "base-1 is below the window"
+            );
+        });
+    }
+
     #[test]
     fn dma_software_request_drives_a_mem_to_mem_block_copy() {
         // Program the 8237A through the ports for a memory-to-memory copy, then
@@ -8652,6 +9575,9 @@ mod tests {
             opl: &mut machine.opl,
             dsp: &mut machine.dsp,
             mixer: &mut machine.mixer,
+            wss: &mut machine.wss,
+            wss_base: machine.wss_base,
+            wss_enabled: machine.wss_enabled,
             ide: &mut machine.ide,
             ata: &mut machine.ata,
             trace: &mut machine.trace,

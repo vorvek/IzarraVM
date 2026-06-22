@@ -103,16 +103,17 @@ const REVISION_K_GRADE: u8 = 0b1010;
 // ponytail: fixed ~128-sample autocal window
 const AUTOCAL_SAMPLES: u32 = 128;
 
-/// WSS board config/ID region (4 ports at the card base, codec sits at base+4).
+/// AD1848 board config/ID region (4 ports at the card base, codec sits at base+4).
 /// Carries the IRQ/DMA jumper readback so codec-aware detection can confirm the
-/// resources. Defaults match the design's `WssConfig` (IRQ7, DMA0).
+/// resources. Defaults match the design (IRQ7, DMA0). This is the device-init
+/// config; the user-facing `WssConfig` lives in `izarravm-core`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WssConfig {
+pub struct Ad1848Config {
     pub irq: u8,
     pub dma: u8,
 }
 
-impl Default for WssConfig {
+impl Default for Ad1848Config {
     fn default() -> Self {
         // base 0x530, IRQ7, DMA0 -- chosen to avoid the SB16 defaults (IRQ5/DMA1).
         Self { irq: 7, dma: 0 }
@@ -146,7 +147,7 @@ pub struct Ad1848 {
     /// means ACI is asserted with `n` ticks remaining; `None` means settled.
     aci_remaining: Option<u32>,
     /// IRQ/DMA jumper readback for the config region.
-    config: WssConfig,
+    config: Ad1848Config,
     /// Pending IRQ edge from a terminal-count underflow; taken by `take_irq`.
     irq_pending: bool,
     /// Current DMA count, in sample periods (decrements by one per output frame,
@@ -161,7 +162,7 @@ pub struct Ad1848 {
 
 impl Default for Ad1848 {
     fn default() -> Self {
-        Self::new(WssConfig::default())
+        Self::new(Ad1848Config::default())
     }
 }
 
@@ -169,7 +170,7 @@ impl Ad1848 {
     /// Build a codec with the given IRQ/DMA jumper config. Registers come up in
     /// their datasheet reset states for the bits the playback path observes; the
     /// rest are zeroed (round-trip only). I12 carries the K-grade revision.
-    pub fn new(config: WssConfig) -> Self {
+    pub fn new(config: Ad1848Config) -> Self {
         let mut regs = [0u8; 16];
         // I6/I7 DAC controls power up muted ("1x00 0000").
         regs[IDX_LEFT_DAC] = DAC_MUTE;
@@ -194,8 +195,9 @@ impl Ad1848 {
         }
     }
 
-    /// Set the IRQ/DMA jumper readback (the machine wires this from `WssConfig`).
-    pub fn set_config(&mut self, config: WssConfig) {
+    /// Set the IRQ/DMA jumper readback (the machine wires this from the core
+    /// `WssConfig` via `Ad1848Config`).
+    pub fn set_config(&mut self, config: Ad1848Config) {
         self.config = config;
     }
 
@@ -226,7 +228,15 @@ impl Ad1848 {
     pub fn write_port(&mut self, offset: u16, value: u8) {
         match offset {
             0..=3 => {
-                // Config/ID region: jumper readback is fixed; writes are inert.
+                // Config/ID region: resource selection is JUMPER-ONLY in this
+                // model. The board exposes a fixed IRQ/DMA readback (see
+                // `read_config`) and codec-aware detection keys solely off the I12
+                // revision, so a guest driver that expects to *select* IRQ/DMA by
+                // writing this region (the writable-config-register variant some
+                // real WSS board glue offers) has its writes intentionally dropped.
+                // There is no datasheet for this region (per the WSS README), so
+                // modelling it as writable would mean inventing an encoding; the
+                // read-back jumper model is the deliberate fidelity tradeoff.
             }
             4 => self.write_index(value),
             5 => self.write_indexed_data(value),
@@ -418,9 +428,55 @@ impl Ad1848 {
         self.playing
     }
 
+    /// Whether the post-MCE autocalibrate (ACI) window is still retiring. The
+    /// integration loop must keep advancing the output-sample clock while this is
+    /// true so the ~128-sample window drains even before playback arms; once it is
+    /// false and playback is idle there is no per-frame work to do.
+    pub fn autocal_active(&self) -> bool {
+        self.aci_remaining.is_some()
+    }
+
     /// Current DMA count remaining before terminal count.
     pub fn current_count(&self) -> u32 {
         self.current_count
+    }
+
+    /// CPU clocks until the next terminal-count IRQ, or `None` when nothing can
+    /// raise one (idle, IEN clear, or an invalid `rate_hz`). Mirrors
+    /// `SbDsp::clocks_until_next_irq`: it lets a halted CPU fast-forward to the
+    /// codec's next interrupt instead of single-stepping the HLT.
+    ///
+    /// The AD1848 Current Count drains one sample period per output frame, and
+    /// the underflow that latches the IRQ happens the period *after* the count
+    /// reaches zero -- so a count of `current_count` reaches the interrupt in
+    /// `current_count + 1` output frames (the same N+1 cadence `advance_count`
+    /// enforces). At `rate_hz` frames per second over a `clock_hz` CPU, that is
+    /// `(current_count + 1) * clock_hz / rate_hz` clocks, rounded up and clamped
+    /// to at least one so the run loop always advances.
+    ///
+    /// The external INT pin is gated by I10 IEN, so a codec armed with IEN clear
+    /// sets only the sticky Status bit on underflow and never forwards the line;
+    /// such a configuration cannot wake the CPU and returns `None`.
+    ///
+    /// The TRD count-gate (R0 bit5) is also honored: while TRD is set and the
+    /// sticky INT bit is still pending the host's ack, `advance_count` freezes the
+    /// Current Count (datasheet: "the DMA Current Counter will not decrement while
+    /// both the TRD bit is set and the INT bit is a one"), so no further underflow
+    /// -- hence no new IRQ -- is generated until the host acks. The estimator must
+    /// mirror that gate and return `None`, or the run loop would fast-forward a
+    /// halted CPU to a wake the producer never actually generates.
+    pub fn clocks_until_next_irq(&self, rate_hz: u32, clock_hz: u64) -> Option<u64> {
+        if !self.playing || rate_hz == 0 {
+            return None;
+        }
+        if self.regs[IDX_PIN_CONTROL] & I10_IEN == 0 {
+            return None;
+        }
+        if self.trd && (self.status & R2_INT) != 0 {
+            return None;
+        }
+        let frames = u64::from(self.current_count) + 1;
+        Some((frames * clock_hz).div_ceil(u64::from(rate_hz)).max(1))
     }
 
     /// Decode one mono sample of the current format from the byte-wide DMA. 8-bit
@@ -849,11 +905,11 @@ mod tests {
 
     #[test]
     fn config_region_reports_id_version_and_irq_dma_jumpers() {
-        let mut dev = Ad1848::new(WssConfig { irq: 7, dma: 0 });
+        let mut dev = Ad1848::new(Ad1848Config { irq: 7, dma: 0 });
         assert_eq!(dev.read_port(0), 0x04, "config region board/version ID");
         // High nibble IRQ, low nibble DMA (IRQ7, DMA0 -> 0x70).
         assert_eq!(dev.read_port(1), 0x70, "IRQ/DMA jumper readback");
-        dev.set_config(WssConfig { irq: 9, dma: 3 });
+        dev.set_config(Ad1848Config { irq: 9, dma: 3 });
         assert_eq!(dev.read_port(1), (9 << 4) | 3, "config setter reflected");
     }
 
@@ -1241,6 +1297,55 @@ mod tests {
         assert!(
             render_one(I8_LC | I8_FMT, 0x2A).0 < 0,
             "A-law 0x2A is negative"
+        );
+    }
+
+    #[test]
+    fn clocks_until_next_irq_tracks_count_and_gates() {
+        // Idle codec: nothing can wake the CPU.
+        let mut dev = Ad1848::default();
+        assert_eq!(dev.clocks_until_next_irq(48_000, 1_000_000), None);
+
+        // Armed 8-bit mono with IEN set, base count 4 -> N+1 = 5 frames to the
+        // first underflow. At rate == clock_hz that is exactly 5 clocks.
+        arm_8bit_mono(&mut dev, 4);
+        assert_eq!(dev.clocks_until_next_irq(1_000, 1_000), Some(5));
+        // div_ceil: 5 frames at 1000 Hz over a 10_000 Hz clock -> 50 clocks.
+        assert_eq!(dev.clocks_until_next_irq(1_000, 10_000), Some(50));
+        // Invalid rate (the unsupported XTAL1 cells decode to 0) -> None.
+        assert_eq!(dev.clocks_until_next_irq(0, 1_000), None);
+
+        // Same arming but with IEN clear: the external pin never forwards, so no
+        // wake. arm_format leaves IEN set, so write I10 back to 0 explicitly.
+        let mut dev = Ad1848::default();
+        arm_8bit_mono(&mut dev, 4);
+        write_indirect(&mut dev, IDX_PIN_CONTROL as u8, 0);
+        assert_eq!(
+            dev.clocks_until_next_irq(1_000, 1_000),
+            None,
+            "IEN clear cannot wake the CPU"
+        );
+
+        // TRD count-gate: once TRD is set AND the sticky INT bit is pending,
+        // advance_count freezes the count, so no further underflow is generated
+        // until the host acks INT. The estimator must mirror that and return None,
+        // not a finite estimate the producer will never honor.
+        let mut dev = Ad1848::default();
+        arm_8bit_mono(&mut dev, 1);
+        dev.write_port(R0_INDEX, R0_TRD); // latch TRD
+        let _ = dev.render_frame(|| Some(0x80)); // count 1 -> 0
+        let _ = dev.render_frame(|| Some(0x80)); // underflow: INT set, count held
+        assert!(dev.take_irq(), "the underflow forwarded the first edge");
+        assert_eq!(
+            dev.clocks_until_next_irq(1_000, 1_000),
+            None,
+            "TRD + sticky INT freezes the count, so no further wake is generated"
+        );
+        // Acking INT (R2 write) clears the gate; the estimator returns finite again.
+        dev.write_port(R2_STATUS, 0x00);
+        assert!(
+            dev.clocks_until_next_irq(1_000, 1_000).is_some(),
+            "acking INT releases the TRD gate so the codec can wake again"
         );
     }
 }
