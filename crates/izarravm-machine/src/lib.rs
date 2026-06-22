@@ -87,6 +87,10 @@ struct XferEnd {
 /// source of truth for the partition: `Machine::base` builds it at construction and
 /// `set_emm386_mode` rebuilds it at SYSINIT, so a config-time and a CONFIG.SYS mode
 /// always agree.
+///
+/// NOEMS keeps a frameless manager present (EMMXXXX0 + a 0-page INT 67h, the way a
+/// real EMM386 NOEMS install answers) but carves no backing region, so XMS owns all
+/// of extended memory.
 fn build_xms_ems(memory_mib: u16, emm386: Emm386Mode) -> (xms::XmsState, Option<ems::EmsState>) {
     let ems_want_kb = if emm386.provides_ems() {
         let extended_kb = (u32::from(memory_mib) * 1024).saturating_sub(1024 + 64);
@@ -95,8 +99,13 @@ fn build_xms_ems(memory_mib: u16, emm386: Emm386Mode) -> (xms::XmsState, Option<
         0
     };
     let (xms, ems_region) = xms::XmsState::new_with_ems(memory_mib, ems_want_kb);
-    let ems = ems_region
-        .map(|region| ems::EmsState::new(EMS_FRAME_DEFAULT_SEG, region.base, region.total_pages));
+    let ems = if emm386 == Emm386Mode::NoEms {
+        Some(ems::EmsState::frameless())
+    } else {
+        ems_region.map(|region| {
+            ems::EmsState::new(EMS_FRAME_DEFAULT_SEG, region.base, region.total_pages)
+        })
+    };
     (xms, ems)
 }
 
@@ -975,8 +984,10 @@ impl Machine {
         debug_assert!(reserved, "the VGA BIOS span fits the empty upper window");
         let mode = self.profile.emm386;
         // Tell the DOS kernel whether the EMMXXXX0 device is present, so a guest's
-        // open-by-name or device-chain detection matches the EMM386 mode.
-        self.dos.set_ems_present(mode.provides_ems());
+        // open-by-name or device-chain detection matches the EMM386 mode. The device
+        // is installed whenever the manager answers (RAM or NOEMS); only HIMEM-only
+        // (Unloaded) has no manager, so this mirrors the built `ems` Option.
+        self.dos.set_ems_present(self.ems.is_some());
         // RAM mode reserves the EMS page frame first (at the default top-of-window
         // address) so the UMB pool carves around it; if a future ROM ever sat on the
         // default address, fall back to a first-fit hole.
@@ -2731,11 +2742,18 @@ impl Machine {
         match ah {
             // 40h GET MANAGER STATUS: present, so success.
             0x40 => self.set_ah(ems::status::OK),
-            // 41h GET PAGE FRAME SEGMENT.
+            // 41h GET PAGE FRAME SEGMENT. RAM reports the frame; NOEMS has no frame
+            // and returns SOFTWARE_MALFUNCTION (BX=0), the way EMM386 NOEMS signals
+            // a configured no-page-frame state.
             0x41 => {
-                let seg = self.ems().frame_segment();
-                self.set_bx(seg);
-                self.set_ah(ems::status::OK);
+                if self.ems().has_frame() {
+                    let seg = self.ems().frame_segment();
+                    self.set_bx(seg);
+                    self.set_ah(ems::status::OK);
+                } else {
+                    self.set_bx(0);
+                    self.set_ah(ems::status::SOFTWARE_MALFUNCTION);
+                }
             }
             // 42h GET NUMBER OF PAGES: BX = unallocated, DX = total.
             0x42 => {
@@ -2822,20 +2840,21 @@ impl Machine {
             // AL=1 exchange.
             0x57 => self.ems_move_exchange(al == 0x01),
             // 58h GET MAPPABLE PHYSICAL ADDRESS ARRAY: AL=0 array to ES:DI, AL=1 count
-            // only; CX = the four frame slots.
+            // only; CX = the mappable slot count (four for RAM, zero for NOEMS).
             0x58 => {
+                let count = self.ems().mappable_count();
                 if al == 0x00 {
                     let es = self.cpu.registers.segment(SegmentIndex::Es).base;
                     let di = self.cpu.registers.edi() as u16;
                     let mut addr = es as usize + usize::from(di);
-                    for phys in 0..ems::FRAME_SLOTS as u8 {
+                    for phys in 0..count {
                         let seg = self.ems().slot_segment(phys);
                         let _ = self.memory.write_u16(addr, seg);
                         let _ = self.memory.write_u16(addr + 2, u16::from(phys));
                         addr += 4;
                     }
                 }
-                self.set_cx(ems::FRAME_SLOTS as u16);
+                self.set_cx(u16::from(count));
                 self.set_ah(ems::status::OK);
             }
             // OS-only (alt-map register sets, page-map jump/call, partial page map)
@@ -6079,9 +6098,10 @@ impl CpuBus for MachineBus<'_> {
             vector,
             0x20 | 0x21 | 0x25 | 0x26 | 0x28 | 0x29 | 0x2F | 0x66 | 0x67
         );
-        // INT 67h is intercepted only when EMS is actually provisioned (RAM mode);
-        // in NOEMS / unloaded the vector runs the ROM IRET so a guest probe finds no
-        // manager, the way HIMEM-only or EMM386 NOEMS leaves no working EMS.
+        // INT 67h is intercepted whenever a manager is built: RAM answers the full
+        // EMS API, NOEMS answers a frameless manager (present, 0 pages, no frame).
+        // Only HIMEM-only (unloaded) has no manager, so the vector runs the ROM IRET
+        // there, the way a box with no EMM386 leaves no working EMS.
         let intercepted = matches!(
             vector,
             0x10 | 0x11
@@ -8166,14 +8186,22 @@ mod tests {
         );
         assert!(ram.ems.is_some(), "RAM provisions an EMS manager");
 
-        // NOEMS: a UMB pool spanning the whole hole, no EMS frame, no manager.
+        // NOEMS: a UMB pool spanning the whole hole, no EMS frame, but a frameless
+        // manager that keeps the EMMXXXX0 device and a 0-page INT 67h present, the
+        // way a real EMM386 NOEMS install answers (a hand-poker sees the manager).
         let noems = build(Emm386Mode::NoEms);
         assert!(kinds(&noems).contains(&UmaUse::Umb), "NOEMS provides UMBs");
         assert!(
             !kinds(&noems).contains(&UmaUse::EmsFrame),
             "NOEMS reserves no EMS frame"
         );
-        assert!(noems.ems.is_none(), "NOEMS provisions no EMS");
+        let noems_ems = noems.ems.as_ref().expect("NOEMS keeps a frameless manager");
+        assert!(!noems_ems.has_frame(), "NOEMS has no frame");
+        assert_eq!(
+            noems_ems.page_counts(),
+            (0, 0),
+            "NOEMS has no backing pages"
+        );
 
         // Unloaded: only the VGA BIOS ROM; no UMB arena, no EMS frame, no manager.
         let off = build(Emm386Mode::Unloaded);
@@ -8194,10 +8222,20 @@ mod tests {
                 .unwrap();
         assert!(machine.ems.is_some(), "RAM provisions EMS at construction");
 
-        // A CONFIG.SYS NOEMS line re-applies at SYSINIT: EMS goes away, UMBs stay,
-        // and the EMS frame is no longer reserved (the UMB pool grows over it).
+        // A CONFIG.SYS NOEMS line re-applies at SYSINIT: the manager becomes
+        // frameless (no backing pages, no frame) but stays present, UMBs stay, and
+        // the EMS frame is no longer reserved (the UMB pool grows over it).
         machine.set_emm386_mode(Emm386Mode::NoEms).unwrap();
-        assert!(machine.ems.is_none(), "NOEMS drops the EMS manager");
+        let noems_ems = machine
+            .ems
+            .as_ref()
+            .expect("NOEMS keeps a frameless manager present");
+        assert!(!noems_ems.has_frame(), "NOEMS has no frame");
+        assert_eq!(
+            noems_ems.page_counts(),
+            (0, 0),
+            "NOEMS has no backing pages"
+        );
         let kinds: Vec<_> = machine.uma.reservations().iter().map(|r| r.kind).collect();
         assert!(kinds.contains(&UmaUse::Umb), "NOEMS keeps UMBs");
         assert!(
@@ -8263,13 +8301,26 @@ mod tests {
                 .unwrap();
         assert!(machine.ems.is_some(), "RAM is the construction default");
         machine.set_toka_c_root(dir.path().to_path_buf());
-        // The SYSINIT read parses NOEMS; re-applying it drops the EMS frame/manager
-        // while keeping UMBs, the way the CONFIG.SYS line would at boot.
+        // The SYSINIT read parses NOEMS; re-applying it swaps the manager to the
+        // frameless state (present, no frame/pages) while keeping UMBs, the way the
+        // CONFIG.SYS line would at boot.
         let cfg = machine.read_config_sys().expect("CONFIG.SYS is readable");
         assert_eq!(cfg.emm386, Emm386Mode::NoEms);
         assert!(cfg.dos_umb);
         machine.set_emm386_mode(cfg.emm386).unwrap();
-        assert!(machine.ems.is_none(), "the NOEMS line drops EMS");
+        let noems_ems = machine
+            .ems
+            .as_ref()
+            .expect("NOEMS keeps a frameless manager present");
+        assert!(
+            !noems_ems.has_frame(),
+            "the NOEMS line makes the manager frameless"
+        );
+        assert_eq!(
+            noems_ems.page_counts(),
+            (0, 0),
+            "no backing pages under NOEMS"
+        );
         assert!(
             machine
                 .uma
@@ -8423,6 +8474,104 @@ mod tests {
             reason,
             StopReason::TestExit { code: 0 },
             "the guest EMS allocate/map/round-trip self-check passes"
+        );
+    }
+
+    #[test]
+    fn noems_manager_intercepts_int67_and_answers_present_but_frameless() {
+        // EMM386 NOEMS keeps the manager installed: INT 67h is intercepted, status
+        // reports present, version is 4.0, but there is no frame (41h -> 80h) and no
+        // backing pages (42h -> 0/0, 43h -> 87h, 58h -> 0 mappable slots). A guest
+        // probing expanded memory under NOEMS sees the genuine manager, not silence.
+        const PROG: [u8; 2] = [0xCD, 0x20];
+        let mut p = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        p.emm386 = Emm386Mode::NoEms;
+        let mut machine = Machine::new_dos_program(p, &PROG).unwrap();
+        let ems = machine
+            .ems
+            .as_ref()
+            .expect("NOEMS builds a frameless manager");
+        assert!(!ems.has_frame(), "NOEMS has no page frame");
+        assert_eq!(ems.page_counts(), (0, 0), "NOEMS has no backing pages");
+
+        // The 0x67 vector is intercepted under NOEMS (the manager answers), unlike
+        // HIMEM-only where it falls through to the ROM IRET.
+        machine.make_bus().interrupt_acknowledge(0x67, 0).unwrap();
+        assert_eq!(
+            machine.pending_soft_int,
+            Some(0x67),
+            "INT 67h is intercepted under NOEMS"
+        );
+        machine.pending_soft_int = None;
+
+        // 40h GET STATUS: the manager is present.
+        machine.cpu.registers.set_eax(0x4000);
+        machine.handle_int67();
+        assert_eq!(
+            (machine.cpu.registers.eax() >> 8) as u8,
+            ems::status::OK,
+            "40h reports the manager present"
+        );
+
+        // 42h GET NUMBER OF PAGES: zero free, zero total.
+        machine.cpu.registers.set_eax(0x4200);
+        machine.handle_int67();
+        assert_eq!(machine.cpu.registers.ebx() as u16, 0, "zero free pages");
+        assert_eq!(machine.cpu.registers.edx() as u16, 0, "zero total pages");
+
+        // 41h GET PAGE FRAME SEGMENT: no frame -> SOFTWARE_MALFUNCTION (0x80), BX=0.
+        machine.cpu.registers.set_eax(0x4100);
+        machine.handle_int67();
+        assert_eq!(
+            (machine.cpu.registers.eax() >> 8) as u8,
+            ems::status::SOFTWARE_MALFUNCTION,
+            "41h reports no page frame via 80h"
+        );
+        assert_eq!(machine.cpu.registers.ebx() as u16, 0);
+
+        // 46h GET VERSION: still reports EMS 4.0.
+        machine.cpu.registers.set_eax(0x4600);
+        machine.handle_int67();
+        assert_eq!(
+            machine.cpu.registers.eax() as u8,
+            ems::EMS_VERSION_BCD,
+            "46h reports version 4.0"
+        );
+
+        // 43h ALLOCATE: the zero-page pool rejects any request (TOTAL_EXCEEDED).
+        machine.cpu.registers.set_eax(0x4300);
+        machine.cpu.registers.set_ebx(1);
+        machine.handle_int67();
+        assert_eq!(
+            (machine.cpu.registers.eax() >> 8) as u8,
+            ems::status::TOTAL_EXCEEDED,
+            "43h cannot allocate with no pages"
+        );
+
+        // 58h GET MAPPABLE ARRAY: the count is zero (no mappable slots).
+        machine.cpu.registers.set_eax(0x5801);
+        machine.handle_int67();
+        assert_eq!(
+            machine.cpu.registers.ecx() as u16,
+            0,
+            "58h reports zero mappable slots under NOEMS"
+        );
+    }
+
+    #[test]
+    fn unloaded_mode_leaves_int67_unintercepted() {
+        // HIMEM-only (EMM386 unloaded) builds no manager, so INT 67h runs the ROM
+        // IRET and a guest probe finds no EMS. This is the contrast to NOEMS, which
+        // keeps a frameless manager present.
+        const PROG: [u8; 2] = [0xCD, 0x20];
+        let mut p = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        p.emm386 = Emm386Mode::Unloaded;
+        let mut machine = Machine::new_dos_program(p, &PROG).unwrap();
+        assert!(machine.ems.is_none(), "HIMEM-only provisions no manager");
+        machine.make_bus().interrupt_acknowledge(0x67, 0).unwrap();
+        assert_eq!(
+            machine.pending_soft_int, None,
+            "INT 67h is not intercepted when no manager is built"
         );
     }
 
