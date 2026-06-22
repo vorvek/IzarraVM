@@ -1696,8 +1696,6 @@ impl DosKernel {
         }
     }
 
-    /// Read one character from the keyboard ring. Some -> set AL (and echo when
-    /// asked) and Continue; None -> WaitForKey so the caller re-runs the INT.
     /// Pull the next byte for cooked single-character input (AH=01/06/07/08 and the
     /// AH=0Ch forms). Returns the byte to place in AL and whether it is half of an
     /// extended-key sequence (the 0x00 lead byte or the trailing scancode), which
@@ -1710,6 +1708,8 @@ impl DosKernel {
             return Ok(Some((scancode, true)));
         }
         match kbd_ring_dequeue(mem)? {
+            // A real key with a zero ascii is an extended/function key. The keyboard
+            // BIOS never enqueues an all-zero word, so a non-zero scancode is implied.
             Some((scancode, 0)) => {
                 self.pending_scancode = Some(scancode);
                 Ok(Some((0, true)))
@@ -1719,6 +1719,8 @@ impl DosKernel {
         }
     }
 
+    /// Read one character from the keyboard ring. Some -> set AL (and echo when
+    /// asked) and Continue; None -> WaitForKey so the caller re-runs the INT.
     fn read_char(
         &mut self,
         regs: &mut DosRegs,
@@ -1727,6 +1729,9 @@ impl DosKernel {
     ) -> Result<DosAction, DosError> {
         match self.next_cooked_char(mem)? {
             Some((ch, extended)) => {
+                // Divergence (marked): real DOS echoes the 0x00 lead byte of an
+                // extended key and suppresses only the scancode. We suppress both,
+                // so neither a NUL nor a raw scancode is ever pushed to stdout.
                 if echo && !extended {
                     self.stdout.push(ch);
                 }
@@ -1746,6 +1751,9 @@ impl DosKernel {
         regs: &mut DosRegs,
         mem: &mut Memory,
     ) -> Result<DosAction, DosError> {
+        // A half-read extended key from a prior single-char call does not carry into
+        // line input; drop the held scancode so it cannot leak into a later read.
+        self.pending_scancode = None;
         let buf = usize::from(regs.ds) * 16 + usize::from(regs.dx);
         let addr = buf as u32;
         let max = mem.read_u8(buf)?;
@@ -3932,6 +3940,18 @@ mod tests {
             .unwrap();
     }
 
+    // Seed several raw (scancode<<8 | ascii) words into the ring in order.
+    fn seed_ring_words(mem: &mut Memory, words: &[u16]) {
+        mem.write_u16(KBD_BDA_BASE + KBD_HEAD, KBD_RING_START)
+            .unwrap();
+        let mut off = KBD_RING_START;
+        for &w in words {
+            mem.write_u16(KBD_BDA_BASE + off as usize, w).unwrap();
+            off += 2;
+        }
+        mem.write_u16(KBD_BDA_BASE + KBD_TAIL, off).unwrap();
+    }
+
     #[test]
     fn extended_key_returns_zero_then_scancode_across_two_reads() {
         let mut kernel = DosKernel::new();
@@ -4003,6 +4023,76 @@ mod tests {
             kernel.stdout().is_empty(),
             "neither the 0x00 lead nor the scancode is echoed"
         );
+    }
+
+    #[test]
+    fn extended_key_lead_does_not_leak_into_later_line_then_read() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let buf = 0x2000usize;
+        mem.write_u8(buf, 8).unwrap();
+        // F1 lead, then a complete line "hi" + CR.
+        seed_ring_words(
+            &mut mem,
+            &[0x3b00, u16::from(b'h'), u16::from(b'i'), 0x000d],
+        );
+
+        // Read the F1 lead via AH=08h; the scancode is now pending.
+        let mut r1 = DosRegs {
+            ax: 0x0800,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut r1, &mut mem).unwrap();
+        assert_eq!(r1.ax & 0xff, 0x00);
+
+        // Switch to AH=0Ah line input; the pending scancode must not derail it.
+        let mut rl = DosRegs {
+            ax: 0x0a00,
+            dx: buf as u16,
+            ds: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            kernel.dispatch(0x21, &mut rl, &mut mem).unwrap(),
+            DosAction::Continue
+        );
+        assert_eq!(mem.read_u8(buf + 1).unwrap(), 2, "the line is 'hi'");
+
+        // A following single-char read finds an empty ring and blocks; the orphaned
+        // scancode must not surface as a bare byte.
+        let mut r2 = DosRegs {
+            ax: 0x0800,
+            ..Default::default()
+        };
+        assert_eq!(
+            kernel.dispatch(0x21, &mut r2, &mut mem).unwrap(),
+            DosAction::WaitForKey
+        );
+    }
+
+    #[test]
+    fn ah0c_flush_clears_a_pending_scancode() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        seed_ring_word(&mut mem, 0x3b00); // F1
+
+        // AH=08h reads the lead byte; the scancode is pending.
+        let mut r1 = DosRegs {
+            ax: 0x0800,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut r1, &mut mem).unwrap();
+        assert_eq!(r1.ax & 0xff, 0x00);
+
+        // AH=0Ch AL=06h DL=0xFF: flush, then a no-wait read. The flush drops the
+        // pending scancode, so the read reports nothing ready.
+        let mut r2 = DosRegs {
+            ax: 0x0c06,
+            dx: 0x00ff,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut r2, &mut mem).unwrap();
+        assert!(r2.zf, "the flush cleared the pending scancode");
     }
 
     #[test]
