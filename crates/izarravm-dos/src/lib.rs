@@ -550,14 +550,18 @@ enum AccessMode {
 }
 
 impl AccessMode {
-    /// AL's low 3 bits select the access mode (the high bits are sharing and
-    /// inheritance, ignored). 0=read, 1=write, 2=read/write; 3-7 are unused by
-    /// real programs and map to Read (marked).
-    fn from_open_al(al: u8) -> Self {
-        match al & 0x07 {
-            1 => AccessMode::Write,
-            2 => AccessMode::ReadWrite,
-            _ => AccessMode::Read,
+    /// Validate the access mode in the low nibble of an open byte: 0=read,
+    /// 1=write, 2=read/write. Any other value (3-15, including a set reserved
+    /// bit 3) is invalid, and a real DOS open rejects it with error 0x0C rather
+    /// than silently treating it as read. The MS-DOS source masks the full nibble
+    /// (access_mask = 0x0F). The sharing and inheritance bits in the high nibble
+    /// are not validated here.
+    fn try_from_open_al(al: u8) -> Option<Self> {
+        match al & 0x0f {
+            0 => Some(AccessMode::Read),
+            1 => Some(AccessMode::Write),
+            2 => Some(AccessMode::ReadWrite),
+            _ => None,
         }
     }
 
@@ -1912,13 +1916,18 @@ impl DosKernel {
             // the access mode (0=read, 1=write, 2=read/write), honored and enforced
             // per handle. CF=0 + AX=handle on success, CF=1 + AX=DOS code on error.
             0x3d => {
-                let mode = AccessMode::from_open_al(regs.ax as u8);
                 let path = match self.resolve_open_path(mem, regs.ds, regs.dx)? {
                     Ok(path) => path,
                     Err(code) => {
                         set_dos_error(regs, code);
                         return Ok(DosAction::Continue);
                     }
+                };
+                // Validate the access mode after the path, matching DOS order: a
+                // bad path reports its own error before the invalid-access code.
+                let Some(mode) = AccessMode::try_from_open_al(regs.ax as u8) else {
+                    set_dos_error(regs, 0x0c);
+                    return Ok(DosAction::Continue);
                 };
                 match open_host_file(&path, mode) {
                     Ok(file) => {
@@ -2903,11 +2912,15 @@ impl DosKernel {
                         return Ok(DosAction::Continue);
                     }
                 };
+                // Validate the access mode after the path, matching DOS order.
+                let Some(mode) = AccessMode::try_from_open_al(regs.bx as u8) else {
+                    self.fail(regs, 0x0c);
+                    return Ok(DosAction::Continue);
+                };
                 let exists = path.exists();
                 let open_if = regs.dx & 0x0001 != 0;
                 let truncate_if = regs.dx & 0x0002 != 0;
                 let create_if = regs.dx & 0x0010 != 0;
-                let mode = AccessMode::from_open_al(regs.bx as u8);
                 // Pick the host action from the flags and whether the file exists.
                 // action_taken: 1 opened, 2 created, 3 truncated (replaced).
                 let (result, action_taken) = if exists {
@@ -4763,6 +4776,40 @@ mod tests {
         let regs = open(&mut kernel, &mut mem);
         assert!(regs.cf);
         assert_eq!(regs.ax, 0x02);
+    }
+
+    #[test]
+    fn open_with_invalid_access_mode_returns_0x0c() {
+        let (mut kernel, mut mem, _dir) = kernel_with_drive(&[("DATA.TXT", b"hi")], r"C:\DATA.TXT");
+        // AH=3Dh with the access bits = 3 (reserved). The open is rejected with the
+        // invalid-access-code error even though the file exists.
+        let mut regs = DosRegs {
+            ax: 0x3df3, // AL=0xF3: reserved access nibble 3, sharing/inherit bits set
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x0c);
+    }
+
+    #[test]
+    fn extended_open_with_invalid_access_mode_returns_0x0c() {
+        let (mut kernel, mut mem, _dir) = kernel_with_drive(&[("DATA.TXT", b"hi")], r"C:\DATA.TXT");
+        // AH=6Ch takes the access mode in BL; bits = 5 are reserved. The path is at
+        // DS:SI and open-if-exists is set, but the bad mode is rejected first.
+        let mut regs = DosRegs {
+            ax: 0x6c00,
+            bx: 0x00c5, // BL=0xC5: reserved access nibble 5, high bits set
+            dx: 0x0001,
+            ds: 0x0100,
+            si: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x0c);
     }
 
     #[test]
