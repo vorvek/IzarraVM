@@ -2318,6 +2318,17 @@ impl DosKernel {
                     regs.cf = false;
                     return Ok(DosAction::Continue);
                 }
+                // AUX (3, COM1) and PRN (4, LPT1): accept the write and report every
+                // byte written, but discard the data. The HLE has no serial or
+                // printer capture at the INT 21h layer (marked). Handle 0 (stdin) is
+                // left returning 0x06: whether a stdin write should route to CON is
+                // ambiguous, and changing it would alter the pinned invalid-handle
+                // test, so it is deferred to a human-reviewed slice.
+                if handle == 3 || handle == 4 {
+                    regs.ax = regs.cx;
+                    regs.cf = false;
+                    return Ok(DosAction::Continue);
+                }
                 let Some(of) = self.open_files.get_mut(&handle) else {
                     set_dos_error(regs, 0x06);
                     return Ok(DosAction::Continue);
@@ -5923,6 +5934,46 @@ mod tests {
         kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
         assert!(regs.cf);
         assert_eq!(regs.ax, 0x06);
+    }
+
+    #[test]
+    fn ah40_to_aux_and_prn_accept_and_discard() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let buf = 0x2000usize;
+        for (i, b) in b"data".iter().enumerate() {
+            mem.write_u8(buf + i, *b).unwrap();
+        }
+        for handle in [3u16, 4] {
+            let mut regs = DosRegs {
+                ax: 0x4000,
+                bx: handle,
+                cx: 4,
+                ds: 0,
+                dx: buf as u16,
+                ..DosRegs::default()
+            };
+            kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+            assert!(!regs.cf, "AUX/PRN write does not error");
+            assert_eq!(regs.ax, 4, "all bytes reported written");
+        }
+        // CX=0 to a device reports zero bytes and does not error (no truncation,
+        // which is the file-handle behavior).
+        let mut zero = DosRegs {
+            ax: 0x4000,
+            bx: 3,
+            cx: 0,
+            ds: 0,
+            dx: buf as u16,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut zero, &mut mem).unwrap();
+        assert!(!zero.cf);
+        assert_eq!(zero.ax, 0, "CX=0 device write reports zero bytes");
+        assert!(
+            kernel.stdout().is_empty(),
+            "AUX/PRN output is not echoed to the console"
+        );
     }
 
     #[test]
