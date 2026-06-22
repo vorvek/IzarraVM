@@ -23,6 +23,7 @@ mod floppy;
 mod ide;
 mod keyboard;
 mod lpt;
+mod memmap;
 mod pic;
 mod pit;
 mod rtc;
@@ -32,6 +33,10 @@ mod unittester;
 mod xms;
 
 pub use cdimage::CdImage;
+pub use memmap::{
+    CONVENTIONAL_TOP, HMA_BASE, HMA_TOP, MemRegion, SYSTEM_ROM_BASE, UPPER_MEMORY_BASE,
+    VIDEO_RAM_BASE, classify, is_hma, is_umb_window,
+};
 
 pub const HIGH_ROM_BASE: u32 = 0xffff_0000;
 pub const MARGO_LFB_BASE: u32 = 0xE000_0000;
