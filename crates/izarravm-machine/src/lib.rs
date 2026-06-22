@@ -943,6 +943,12 @@ impl Machine {
             dos.install_environment(memory, &entries)?;
         }
         machine.furnish_dos_upper_memory()?;
+        // A directly-loaded program runs in a DOS=UMB environment (the default), so
+        // it sees the UMB area linked, the way a program inherits the boot link
+        // state on a real DOS=HIGH,UMB box.
+        if machine.dos.has_umb_arena() {
+            machine.dos.set_umb_link(true);
+        }
         Ok(machine)
     }
 
@@ -4465,8 +4471,29 @@ impl Machine {
             let Machine { dos, memory, .. } = self;
             dos.init_shell_base(memory, DOS_LOAD_SEGMENT, &env)?;
         }
-        self.furnish_dos_upper_memory()?;
+        // CONFIG.SYS DEVICE=EMM386 / DOS=UMB drive the memory manager at SYSINIT.
+        // A present, readable file overrides the izarravm.conf mode (re-laying the
+        // layout); otherwise the config-time mode stands and the shipped default's
+        // DOS=UMB links the area. Either way, DOS=UMB links a non-empty arena so a
+        // default box comes up with UMBs linked, like a real DOS=HIGH,UMB machine.
+        let config = self.read_config_sys();
+        match config {
+            Some(cfg) => self.set_emm386_mode(cfg.emm386)?,
+            None => self.furnish_dos_upper_memory()?,
+        }
+        let dos_umb = config.map(|c| c.dos_umb).unwrap_or(true);
+        if dos_umb && self.dos.has_umb_arena() {
+            self.dos.set_umb_link(true);
+        }
         Ok(())
+    }
+
+    /// Read and parse C:\CONFIG.SYS for the memory-manager intent, or None when the
+    /// C: root is unset or the file is missing or unreadable.
+    fn read_config_sys(&self) -> Option<izarravm_core::ConfigSysMemory> {
+        let root = self.toka_c_root.as_ref()?;
+        let text = std::fs::read_to_string(root.join("CONFIG.SYS")).ok()?;
+        Some(izarravm_core::parse_config_sys(&text))
     }
 
     /// Mirror any DOS console output produced since the last call onto the VGA
@@ -8182,6 +8209,37 @@ mod tests {
         // Re-applying RAM brings the frame and EMS back.
         machine.set_emm386_mode(Emm386Mode::Ram).unwrap();
         assert!(machine.ems.is_some(), "RAM restores EMS");
+    }
+
+    #[test]
+    fn config_sys_noems_line_drives_the_boot_mode() {
+        const PROG: [u8; 2] = [0xCD, 0x20];
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("CONFIG.SYS"),
+            "DEVICE=C:\\DOS\\HIMEM.SYS\r\nDEVICE=C:\\DOS\\EMM386.EXE NOEMS\r\nDOS=HIGH,UMB\r\n",
+        )
+        .unwrap();
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
+                .unwrap();
+        assert!(machine.ems.is_some(), "RAM is the construction default");
+        machine.set_toka_c_root(dir.path().to_path_buf());
+        // The SYSINIT read parses NOEMS; re-applying it drops the EMS frame/manager
+        // while keeping UMBs, the way the CONFIG.SYS line would at boot.
+        let cfg = machine.read_config_sys().expect("CONFIG.SYS is readable");
+        assert_eq!(cfg.emm386, Emm386Mode::NoEms);
+        assert!(cfg.dos_umb);
+        machine.set_emm386_mode(cfg.emm386).unwrap();
+        assert!(machine.ems.is_none(), "the NOEMS line drops EMS");
+        assert!(
+            machine
+                .uma
+                .reservations()
+                .iter()
+                .any(|r| r.kind == UmaUse::Umb),
+            "UMBs stay under NOEMS"
+        );
     }
 
     #[test]

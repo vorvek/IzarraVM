@@ -114,10 +114,12 @@ fn is_root_system_file(name: &str) -> bool {
 /// path-showing prompt. DOS line endings (CRLF).
 const DEFAULT_AUTOEXEC_BAT: &str = "@ECHO OFF\r\nPATH=C:\\DOS\r\nPROMPT=$P$G\r\n";
 
-/// The default CONFIG.SYS: the directives a period DOS carries. The DEVICE= lines
-/// for the memory manager (IEMM, not built yet) and the CD extension are left out
-/// until those drivers exist; the HLE does not yet interpret CONFIG.SYS anyway.
-const DEFAULT_CONFIG_SYS: &str = "DOS=HIGH,UMB\r\nFILES=40\r\nBUFFERS=20\r\nLASTDRIVE=E\r\n";
+/// The default CONFIG.SYS: the directives a period DOS carries. The HIMEM.SYS and
+/// EMM386.EXE RAM lines select the IEMM RAM mode (UMBs plus the EMS page frame) at
+/// SYSINIT, the way a real DOS=HIGH,UMB box is configured; the machine parses these
+/// to drive the memory layout. The CD-extension DEVICE= line is still left out
+/// until that driver exists.
+const DEFAULT_CONFIG_SYS: &str = "DEVICE=C:\\DOS\\HIMEM.SYS /TESTMEM:OFF\r\nDEVICE=C:\\DOS\\EMM386.EXE RAM\r\nDOS=HIGH,UMB\r\nFILES=40\r\nBUFFERS=20\r\nLASTDRIVE=E\r\n";
 
 fn write_system_files(c_root: &Path, files: &[(String, Vec<u8>)]) -> std::io::Result<()> {
     std::fs::create_dir_all(c_root)?;
@@ -3359,6 +3361,12 @@ impl DosKernel {
                     Ok(DosAction::Continue)
                 }
                 0x03 => {
+                    // With no UMB area to link (no EMM386 / DOS not loaded with UMB),
+                    // the call fails with AX=0001h, the way real DOS reports it.
+                    if self.umb.is_none() {
+                        set_dos_error(regs, 0x01);
+                        return Ok(DosAction::Continue);
+                    }
                     // BX = 0 unlink UMBs, 1 link them. Anything else is invalid.
                     match regs.bx {
                         0x0000 => {
@@ -5136,7 +5144,9 @@ mod tests {
     #[test]
     fn ah58_umb_link_state_round_trips() {
         let mut kernel = DosKernel::new();
-        let mut mem = Memory::new(64 * 1024).unwrap();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        // A UMB area must exist for the link to be meaningful.
+        kernel.set_umb_region(0xc800, 0x2800, &mut mem).unwrap();
         // UMBs are unlinked by default.
         let mut regs = DosRegs {
             ax: 0x5802,
@@ -5167,6 +5177,22 @@ mod tests {
         };
         kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
         assert!(regs.cf, "an invalid link state sets CF");
+        assert_eq!(regs.ax, 0x01);
+    }
+
+    #[test]
+    fn ah5803_link_fails_without_a_umb_arena() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        // No UMB area furnished: linking fails with AX=0001h, the way real DOS
+        // reports a machine loaded without DOS=UMB.
+        let mut regs = DosRegs {
+            ax: 0x5803,
+            bx: 0x0001,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(regs.cf, "linking with no UMB area fails");
         assert_eq!(regs.ax, 0x01);
     }
 
@@ -5347,6 +5373,7 @@ mod tests {
         let mut kernel = DosKernel::new();
         let mut mem = Memory::new(1024 * 1024).unwrap();
         kernel.init_program(0x0100, 0x1100, &mut mem).unwrap();
+        kernel.set_umb_region(0xc800, 0x2800, &mut mem).unwrap();
         // A guest links UMBs and picks a high strategy.
         link_umbs(&mut kernel, &mut mem);
         set_alloc_strategy(&mut kernel, &mut mem, 0x0040);
