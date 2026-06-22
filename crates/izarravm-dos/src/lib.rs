@@ -311,6 +311,10 @@ const ARENA_TOP: u16 = 0xa000;
 /// where programs load (psp_seg >= 0x0100), so it collides with neither.
 const SYSVARS_SEG: u16 = 0x0050;
 
+/// DOS default LASTDRIVE, reported in the list of lists: drives A: through E:.
+/// The CONFIG.SYS `LASTDRIVE=` line will override this once that wiring exists.
+const DEFAULT_LASTDRIVE: u8 = 5;
+
 enum ResizeError {
     TooBig(u16), // largest paragraphs that would fit
     InvalidBlock,
@@ -2656,22 +2660,43 @@ impl DosKernel {
                 Ok(DosAction::Continue)
             }
             // AH=52h GET LIST OF LISTS (SysVars). Returns ES:BX -> the DOS internal
-            // variable table. The only field guests reliably read is the word at
-            // [BX-2], the segment of the first MCB; we materialize the MCB chain
-            // from the current arena and publish that. The SysVars table lives at a
-            // kernel-reserved low paragraph so it does not collide with a program
-            // loaded at 0x0100+. ponytail: only the first-MCB pointer is filled; the
-            // rest of SysVars (DPB chain, SFT, CLOCK$, etc.) is zeroed because no
-            // guest in scope walks it. Lift this by populating the documented fields
-            // as their backing structures gain a guest-visible representation.
+            // variable table. The first-MCB segment at [BX-2] is materialized from
+            // the live arena; the scalar fields a guest reads to size the system
+            // (max bytes per block, LASTDRIVE) and the NUL device header that heads
+            // the driver chain are filled inline. The DWORD chain pointers (DPB,
+            // SFT, CLOCK$, CON, CDS, FCB tables, disk buffers) stay zero: their
+            // backing structures are not modeled yet and no guest in scope walks
+            // them. The table lives at a kernel-reserved low paragraph so it does
+            // not collide with a program loaded at 0x0100+. Offsets are written as
+            // base + 2 + off so the comments can use the documented BX-relative off.
             0x52 => {
                 let first_mcb = self.arena.materialize_mcb_chain(mem)?;
                 let base = usize::from(SYSVARS_SEG) * 16;
                 // [BX-2] = first MCB segment (BX returns 0x0002, so this is offset 0).
                 mem.write_u16(base, first_mcb)?;
-                // Zero a small span of the table for the fields a probe might touch.
+                // Clear the documented field span, then fill the known fields over it.
                 for off in 2..0x40usize {
                     mem.write_u8(base + off, 0)?;
+                }
+                // [BX+0x10] WORD: the largest bytes-per-block of any block device,
+                // a 512-byte sector here.
+                mem.write_u16(base + 2 + 0x10, 512)?;
+                // [BX+0x21] BYTE: LASTDRIVE.
+                mem.write_u8(base + 2 + 0x21, DEFAULT_LASTDRIVE)?;
+                // [BX+0x22]: the NUL device header, the head of the device-driver
+                // chain. It is an inline 18-byte structure, not a pointer: a
+                // FFFF:FFFF next link (NUL is the only modeled device, so the chain
+                // ends here), the character-device + NUL attribute 0x8004, no
+                // strategy or interrupt routine, and the 8-byte name "NUL     ".
+                // The CON and CLOCK$ headers are parked (not modeled yet).
+                let nul = base + 2 + 0x22;
+                mem.write_u16(nul, 0xffff)?; // next routine offset
+                mem.write_u16(nul + 2, 0xffff)?; // next routine segment (FFFF:FFFF = end)
+                mem.write_u16(nul + 4, 0x8004)?; // attribute: char device, NUL bit
+                mem.write_u16(nul + 6, 0xffff)?; // strategy entry (none)
+                mem.write_u16(nul + 8, 0xffff)?; // interrupt entry (none)
+                for (i, &byte) in b"NUL     ".iter().enumerate() {
+                    mem.write_u8(nul + 0x0a + i, byte)?;
                 }
                 regs.es = SYSVARS_SEG;
                 regs.bx = 0x0002;
@@ -5971,6 +5996,73 @@ mod tests {
             mem.read_u8(sentinel_addr).unwrap(),
             0xa5,
             "materialize_mcb_chain must not clobber the allocated block's data"
+        );
+    }
+
+    #[test]
+    fn ah52_publishes_sysvars_scalar_fields_and_the_nul_device() {
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let mut kernel = arena_kernel();
+        let mut regs = DosRegs {
+            ax: 0x5200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        let bx = usize::from(regs.bx);
+        let base = usize::from(regs.es) * 16 + bx;
+
+        // The first-MCB pointer at [BX-2] is still published (the existing contract).
+        assert_eq!(
+            mem.read_u16(base - 2).unwrap(),
+            0x0100 - 1,
+            "first MCB at [BX-2]"
+        );
+        // [BX+0x10] max bytes per block = a 512-byte sector.
+        assert_eq!(
+            mem.read_u16(base + 0x10).unwrap(),
+            512,
+            "max bytes per block"
+        );
+        // [BX+0x21] LASTDRIVE = E:.
+        assert_eq!(mem.read_u8(base + 0x21).unwrap(), 5, "LASTDRIVE");
+
+        // [BX+0x22] the NUL device header heads the driver chain.
+        let nul = base + 0x22;
+        assert_eq!(
+            mem.read_u16(nul).unwrap(),
+            0xffff,
+            "NUL next link offset is FFFF (end of chain)"
+        );
+        assert_eq!(
+            mem.read_u16(nul + 2).unwrap(),
+            0xffff,
+            "NUL next link segment"
+        );
+        assert_eq!(
+            mem.read_u16(nul + 4).unwrap(),
+            0x8004,
+            "NUL attribute: char device + NUL bit"
+        );
+        assert_eq!(
+            mem.read_u16(nul + 6).unwrap(),
+            0xffff,
+            "NUL strategy entry (none)"
+        );
+        assert_eq!(
+            mem.read_u16(nul + 8).unwrap(),
+            0xffff,
+            "NUL interrupt entry (none)"
+        );
+        let name: Vec<u8> = (0..8)
+            .map(|i| mem.read_u8(nul + 0x0a + i).unwrap())
+            .collect();
+        assert_eq!(&name, b"NUL     ", "NUL device name");
+
+        // A parked chain pointer (the first DPB at [BX+0]) stays zero for now.
+        assert_eq!(
+            mem.read_u16(base).unwrap(),
+            0,
+            "the unmodeled DPB pointer is left zero"
         );
     }
 
