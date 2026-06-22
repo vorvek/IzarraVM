@@ -2277,8 +2277,10 @@ impl DosKernel {
                 }
                 // AUX (3, COM1) and PRN (4, LPT1): accept the write and report every
                 // byte written, but discard the data. The HLE has no serial or
-                // printer capture at the INT 21h layer (marked). Handle 0 (CON) write
-                // is deferred: it would change the pinned invalid-handle test.
+                // printer capture at the INT 21h layer (marked). Handle 0 (stdin) is
+                // left returning 0x06: whether a stdin write should route to CON is
+                // ambiguous, and changing it would alter the pinned invalid-handle
+                // test, so it is deferred to a human-reviewed slice.
                 if handle == 3 || handle == 4 {
                     regs.ax = regs.cx;
                     regs.cf = false;
@@ -5684,6 +5686,19 @@ mod tests {
             assert!(!regs.cf, "AUX/PRN write does not error");
             assert_eq!(regs.ax, 4, "all bytes reported written");
         }
+        // CX=0 to a device reports zero bytes and does not error (no truncation,
+        // which is the file-handle behavior).
+        let mut zero = DosRegs {
+            ax: 0x4000,
+            bx: 3,
+            cx: 0,
+            ds: 0,
+            dx: buf as u16,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut zero, &mut mem).unwrap();
+        assert!(!zero.cf);
+        assert_eq!(zero.ax, 0, "CX=0 device write reports zero bytes");
         assert!(
             kernel.stdout().is_empty(),
             "AUX/PRN output is not echoed to the console"
