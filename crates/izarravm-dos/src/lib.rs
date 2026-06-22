@@ -662,6 +662,10 @@ pub struct DosKernel {
     verify_flag: bool,
     // AH=58h memory-allocation strategy. The bump arena ignores it; stored for read-back.
     alloc_strategy: u16,
+    // AH=58h AL=03 UMB link state. UMBs are not yet linked into the arena (that is
+    // P5), so this only stores and reports whether a guest asked for them; the
+    // chain is unchanged either way. DOS defaults to unlinked (false).
+    umb_link: bool,
     // AH=59h extended error: the last DOS error code reported to a guest. Held until
     // the next error overwrites it (DOS does not clear it on a successful call).
     last_error: u16,
@@ -2688,8 +2692,11 @@ impl DosKernel {
                 regs.ax = (regs.ax & 0xff00) | u16::from(self.verify_flag);
                 Ok(DosAction::Continue)
             }
-            // AH=58h GET/SET MEMORY ALLOCATION STRATEGY. AL=00 get (AX=strategy), AL=01
-            // set (BX=strategy). The bump arena ignores the strategy; stored for read-back.
+            // AH=58h memory-allocation strategy and UMB link state, the seam the
+            // IEMM UMB layer (P5) consumes. AL=00/01 get/set the strategy, AL=02/03
+            // get/set the UMB link state. The bump arena does not honor the strategy
+            // or link UMBs yet; both round-trip through here so a guest (and P5) can
+            // observe them.
             0x58 => match regs.ax as u8 {
                 0x00 => {
                     regs.ax = self.alloc_strategy;
@@ -2697,8 +2704,36 @@ impl DosKernel {
                     Ok(DosAction::Continue)
                 }
                 0x01 => {
-                    self.alloc_strategy = regs.bx;
+                    // DOS 5+ keys off BL (BH is expected 0 and ignored). The nine
+                    // valid strategies: low 2 bits select the fit, bits 6-7 the
+                    // memory area. DOS rejects anything else.
+                    let strategy = regs.bx & 0x00ff;
+                    if is_valid_alloc_strategy(strategy) {
+                        self.alloc_strategy = strategy;
+                        regs.cf = false;
+                    } else {
+                        set_dos_error(regs, 0x01); // invalid strategy
+                    }
+                    Ok(DosAction::Continue)
+                }
+                0x02 => {
+                    regs.ax = u16::from(self.umb_link); // AL = current link state
                     regs.cf = false;
+                    Ok(DosAction::Continue)
+                }
+                0x03 => {
+                    // BX = 0 unlink UMBs, 1 link them. Anything else is invalid.
+                    match regs.bx {
+                        0x0000 => {
+                            self.umb_link = false;
+                            regs.cf = false;
+                        }
+                        0x0001 => {
+                            self.umb_link = true;
+                            regs.cf = false;
+                        }
+                        _ => set_dos_error(regs, 0x01), // invalid link state
+                    }
                     Ok(DosAction::Continue)
                 }
                 _ => {
@@ -3536,6 +3571,16 @@ fn set_dos_error(regs: &mut DosRegs, code: u16) {
     regs.ax = code;
 }
 
+/// The nine valid AH=58h allocation strategies: the low two bits pick the fit
+/// (first / best / last) and bits 6-7 pick the memory area (low, high, or high
+/// then low). Any other value is rejected on a set-strategy call.
+fn is_valid_alloc_strategy(strategy: u16) -> bool {
+    matches!(
+        strategy,
+        0x00 | 0x01 | 0x02 | 0x40 | 0x41 | 0x42 | 0x80 | 0x81 | 0x82
+    )
+}
+
 /// Map a host file io error to a DOS error code. NotFound is 0x02 (file not
 /// found); everything else, including permission failures, maps to 0x05 (access
 /// denied), the closest in-scope code. The host filesystem does not separate
@@ -4359,6 +4404,92 @@ mod tests {
         kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
         assert!(!regs.cf);
         assert_eq!(regs.ax, 2);
+    }
+
+    #[test]
+    fn ah58_invalid_strategy_is_rejected() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        // Set a valid strategy first.
+        let mut regs = DosRegs {
+            ax: 0x5801,
+            bx: 0x0001,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf);
+        // 0x03 is not a valid strategy: rejected, and the stored one is unchanged.
+        let mut regs = DosRegs {
+            ax: 0x5801,
+            bx: 0x0003,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(regs.cf, "an invalid strategy sets CF");
+        assert_eq!(regs.ax, 0x01, "AX = invalid-function error");
+        let mut regs = DosRegs {
+            ax: 0x5800,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf, "the get after a rejected set still clears CF");
+        assert_eq!(
+            regs.ax, 0x0001,
+            "the valid strategy survived the rejected set"
+        );
+
+        // A high-memory strategy (0x40 last-fit area bits) round-trips too, so the
+        // full nine-value set is honored, not just the low-memory three.
+        let mut regs = DosRegs {
+            ax: 0x5801,
+            bx: 0x0042,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf, "a high-memory strategy is accepted");
+        let mut regs = DosRegs {
+            ax: 0x5800,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(regs.ax, 0x0042, "the high-memory strategy reads back");
+    }
+
+    #[test]
+    fn ah58_umb_link_state_round_trips() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        // UMBs are unlinked by default.
+        let mut regs = DosRegs {
+            ax: 0x5802,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf);
+        assert_eq!(regs.ax & 0xff, 0x00, "UMBs unlinked by default");
+        // Link them, then read the state back.
+        let mut regs = DosRegs {
+            ax: 0x5803,
+            bx: 0x0001,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf);
+        let mut regs = DosRegs {
+            ax: 0x5802,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(regs.ax & 0xff, 0x01, "UMBs report linked after the set");
+        // An invalid link state is rejected.
+        let mut regs = DosRegs {
+            ax: 0x5803,
+            bx: 0x0002,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(regs.cf, "an invalid link state sets CF");
+        assert_eq!(regs.ax, 0x01);
     }
 
     #[test]
