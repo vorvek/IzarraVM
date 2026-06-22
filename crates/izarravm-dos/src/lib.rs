@@ -2556,6 +2556,14 @@ impl DosKernel {
             0x3f => {
                 let handle = regs.bx;
                 let count = usize::from(regs.cx);
+                // A read from the EMMXXXX0 character device returns end-of-file (0
+                // bytes), the way a real EMM driver answers a DOS read; its control
+                // traffic goes through INT 67h, not the file handle.
+                if self.ems_handles.contains(&handle) {
+                    regs.ax = 0;
+                    regs.cf = false;
+                    return Ok(DosAction::Continue);
+                }
                 let Some(of) = self.open_files.get_mut(&handle) else {
                     set_dos_error(regs, 0x06);
                     return Ok(DosAction::Continue);
@@ -2779,9 +2787,7 @@ impl DosKernel {
                     .open(&path)
                 {
                     Ok(file) => {
-                        let handle = (5u16..)
-                            .find(|h| !self.open_files.contains_key(h))
-                            .expect("a free DOS handle exists at or below u16::MAX");
+                        let handle = self.alloc_handle();
                         self.open_files.insert(
                             handle,
                             OpenFile {
@@ -2928,6 +2934,14 @@ impl DosKernel {
                         let byte = mem.read_u8(base + index)?;
                         self.stdout.push(byte);
                     }
+                    regs.ax = regs.cx;
+                    regs.cf = false;
+                    return Ok(DosAction::Continue);
+                }
+                // A write to the EMMXXXX0 character device is accepted and discarded,
+                // reporting every byte written, the way a real EMM driver answers a
+                // DOS write (its real traffic is INT 67h, not the file handle).
+                if self.ems_handles.contains(&handle) {
                     regs.ax = regs.cx;
                     regs.cf = false;
                     return Ok(DosAction::Continue);
@@ -3333,9 +3347,7 @@ impl DosKernel {
                 };
                 match cloned {
                     Ok(open) => {
-                        let handle = (5u16..)
-                            .find(|h| !self.open_files.contains_key(h))
-                            .expect("a free DOS handle exists at or below u16::MAX");
+                        let handle = self.alloc_handle();
                         self.open_files.insert(handle, open);
                         regs.ax = handle;
                         regs.cf = false;
@@ -3421,9 +3433,7 @@ impl DosKernel {
                     .open(&path)
                 {
                     Ok(file) => {
-                        let handle = (5u16..)
-                            .find(|h| !self.open_files.contains_key(h))
-                            .expect("a free DOS handle exists at or below u16::MAX");
+                        let handle = self.alloc_handle();
                         self.open_files.insert(
                             handle,
                             OpenFile {
@@ -3616,9 +3626,7 @@ impl DosKernel {
                     mem.write_u8(tail + i, byte)?;
                 }
                 mem.write_u8(tail + suffix.len(), 0)?;
-                let handle = (5u16..)
-                    .find(|h| !self.open_files.contains_key(h))
-                    .expect("a free DOS handle exists at or below u16::MAX");
+                let handle = self.alloc_handle();
                 self.open_files.insert(
                     handle,
                     OpenFile {
@@ -3688,9 +3696,7 @@ impl DosKernel {
                 };
                 match result {
                     Ok(file) => {
-                        let handle = (5u16..)
-                            .find(|h| !self.open_files.contains_key(h))
-                            .expect("a free DOS handle exists at or below u16::MAX");
+                        let handle = self.alloc_handle();
                         self.open_files.insert(handle, OpenFile { file, mode });
                         regs.ax = handle;
                         regs.cx = action_taken;
@@ -5405,6 +5411,53 @@ mod tests {
             &read_chain_name(false),
             b"\0\0\0\0\0\0\0\0",
             "no EMS leaves NUL ending the chain"
+        );
+    }
+
+    #[test]
+    fn an_open_emmxxxx0_handle_does_not_collide_with_a_created_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut kernel = DosKernel::new();
+        kernel.mount_c(HostDrive::mount_c(dir.path()).unwrap());
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        kernel.set_ems_present(true);
+        // Open the EMS device.
+        let (ds, dx) = put_asciiz(&mut mem, 0x2000, b"EMMXXXX0");
+        let mut regs = DosRegs {
+            ax: 0x3d00,
+            ds,
+            dx,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        let ems_handle = regs.ax;
+        // Create a file through a different handle-minting path (AH=3Ch).
+        let (ds, dx) = put_asciiz(&mut mem, 0x3000, b"DATA.TXT");
+        let mut regs = DosRegs {
+            ax: 0x3c00,
+            ds,
+            dx,
+            cx: 0,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf, "the file is created");
+        let file_handle = regs.ax;
+        assert_ne!(
+            ems_handle, file_handle,
+            "the EMS device and the file get distinct handles"
+        );
+        // IOCTL 4400h on the file must report a file (bit 7 clear), not the device.
+        let mut regs = DosRegs {
+            ax: 0x4400,
+            bx: file_handle,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(
+            regs.dx & 0x0080,
+            0,
+            "the file is not misreported as a character device"
         );
     }
 

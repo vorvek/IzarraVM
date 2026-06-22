@@ -543,7 +543,11 @@ impl Machine {
         // mode, simulated from a slice of extended memory the XMS pool excludes (so
         // installed RAM stays honest). The page frame sits at the default segment.
         let ems_want_kb = if profile.emm386.provides_ems() {
-            EMS_DEFAULT_KIB
+            // Cap the default to half of extended RAM so a small machine still keeps
+            // an XMS pool, the way a real manager sizes the EMS share rather than
+            // swallowing all of extended memory.
+            let extended_kb = (u32::from(memory_mib) * 1024).saturating_sub(1024 + 64);
+            EMS_DEFAULT_KIB.min(extended_kb / 2)
         } else {
             0
         };
@@ -2834,6 +2838,23 @@ impl Machine {
             offset: self.memory.read_u16(d + 14).unwrap_or(0),
             seg_or_page: self.memory.read_u16(d + 16).unwrap_or(0),
         };
+        // Validate the whole region up front, the way a real EMM does, before
+        // touching any memory: a length over 1 MiB is rejected (96h), and each
+        // endpoint must fit (an EMS region within the handle's pages, a
+        // conventional region below the 1 MiB line). This also caps the buffer
+        // allocation below, so a guest-supplied length cannot exhaust host memory.
+        // ponytail: the 92h source-overwritten and 97h same-handle-exchange-overlap
+        // warnings are not emitted; the buffered copy is overlap-safe, so a move
+        // still completes correctly, only without the advisory code.
+        if length > 0x10_0000 {
+            return self.set_ah(ems::status::LENGTH_EXCEEDS_1M);
+        }
+        if let Err(code) = self.ems_xfer_validate(&src, length) {
+            return self.set_ah(code);
+        }
+        if let Err(code) = self.ems_xfer_validate(&dst, length) {
+            return self.set_ah(code);
+        }
         // Read the source (and, for exchange, the destination) into buffers first.
         let mut src_buf = vec![0u8; length as usize];
         for (i, byte) in src_buf.iter_mut().enumerate() {
@@ -2875,6 +2896,36 @@ impl Machine {
             Ok((u32::from(end.seg_or_page) << 4) + pos)
         } else {
             self.ems().backing_addr(end.handle, end.seg_or_page, pos)
+        }
+    }
+
+    /// Check that a move/exchange endpoint's whole region is in range before any
+    /// transfer: a conventional region must not cross the 1 MiB line (A2h); an EMS
+    /// region must start on a page the handle owns (8Ah) and stay within its pages
+    /// (93h).
+    fn ems_xfer_validate(&self, end: &XferEnd, length: u32) -> Result<(), u8> {
+        if length == 0 {
+            return Ok(());
+        }
+        if end.kind == 0 {
+            // The region's end address (one past the last byte). The real EMM flags
+            // a wrap when it reaches the 1 MiB line, not only when it passes it.
+            let end_addr = (u32::from(end.seg_or_page) << 4) + u32::from(end.offset) + length;
+            if end_addr >= 0x10_0000 {
+                return Err(ems::status::MEMORY_WRAP);
+            }
+            Ok(())
+        } else {
+            let pages = u32::from(self.ems().pages_for_handle(end.handle)?);
+            if u32::from(end.seg_or_page) >= pages {
+                return Err(ems::status::INVALID_LOGICAL_PAGE);
+            }
+            let last_byte = u32::from(end.offset) + length - 1;
+            let last_page = u32::from(end.seg_or_page) + last_byte / ems::EMS_PAGE_SIZE;
+            if last_page >= pages {
+                return Err(ems::status::REGION_EXCEEDS_PAGES);
+            }
+            Ok(())
         }
     }
 
@@ -8043,6 +8094,35 @@ mod tests {
         machine.ems.as_mut().unwrap().map(0, 0, handle).unwrap();
         assert_eq!(machine.read_physical_u8(0x0E_0000), 0xDE);
         assert_eq!(machine.read_physical_u8(0x0E_0003), 0xEF);
+    }
+
+    #[test]
+    fn ems_57h_rejects_an_over_1mib_length_instead_of_allocating() {
+        const PROG: [u8; 2] = [0xCD, 0x20];
+        let mut p = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        p.emm386 = Emm386Mode::Ram;
+        let mut machine = Machine::new_dos_program(p, &PROG).unwrap();
+        let handle = machine.ems.as_mut().unwrap().allocate(1).unwrap();
+        // A descriptor whose region length is far over 1 MiB. The validation must
+        // reject it (96h) before allocating a buffer, not try to allocate ~4 GiB.
+        let d = 0x2000usize;
+        machine.memory.write_u32(d, 0xFFFF_FFFE).unwrap();
+        machine.memory.write_u8(d + 4, 0).unwrap(); // src conventional
+        machine.memory.write_u16(d + 9, 0x1000).unwrap();
+        machine.memory.write_u8(d + 11, 1).unwrap(); // dst EMS
+        machine.memory.write_u16(d + 12, handle).unwrap();
+        machine.cpu.registers.set_eax(0x5700);
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0));
+        machine.cpu.registers.set_esi(0x2000);
+        machine.handle_int67();
+        assert_eq!(
+            (machine.cpu.registers.eax() >> 8) & 0xff,
+            0x96,
+            "an over-1 MiB region length is rejected"
+        );
     }
 
     #[test]

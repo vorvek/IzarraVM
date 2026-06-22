@@ -35,6 +35,12 @@ pub mod status {
     pub const INVALID_PHYSICAL_PAGE: u8 = 0x8b;
     pub const CONTEXT_ALREADY_SAVED: u8 = 0x8d;
     pub const NO_SAVED_CONTEXT: u8 = 0x8e;
+    /// Move/exchange (57h) region is larger than the handle's allocated pages.
+    pub const REGION_EXCEEDS_PAGES: u8 = 0x93;
+    /// Move/exchange (57h) region length is more than 1 MiB.
+    pub const LENGTH_EXCEEDS_1M: u8 = 0x96;
+    /// Move/exchange (57h) conventional region crosses the 1 MiB boundary.
+    pub const MEMORY_WRAP: u8 = 0xa2;
 }
 
 /// One physical-frame slot's mapping: the owning handle and the backing-page index
@@ -180,8 +186,9 @@ impl EmsState {
         Ok(())
     }
 
-    /// Function 45h: release a handle and its pages, clearing any frame slots it
-    /// holds and its saved context.
+    /// Function 45h: release a handle and its pages, clearing any live or saved
+    /// frame slot that referenced one of its pages so a later restore cannot
+    /// reinstate a slot aliasing a reassigned page.
     pub fn release(&mut self, handle: u16) -> Result<(), u8> {
         let idx = usize::from(handle);
         let h = self
@@ -189,16 +196,33 @@ impl EmsState {
             .get_mut(idx)
             .and_then(|slot| slot.take())
             .ok_or(status::INVALID_HANDLE)?;
-        for page in h.pages {
-            self.free[page as usize] = true;
+        let freed = h.pages;
+        for page in &freed {
+            self.free[*page as usize] = true;
         }
+        self.invalidate_freed(&freed);
+        self.saved.remove(&handle);
+        Ok(())
+    }
+
+    /// Drop every live and saved frame slot that references one of `freed` backing
+    /// pages. A saved mapping context (function 47h) snapshots resolved backing
+    /// indices, so once a page is freed and reassigned, a stale snapshot would let
+    /// a restore (48h) alias another handle's expanded memory. Scrubbing both the
+    /// live map and the saved contexts keeps that from ever happening.
+    fn invalidate_freed(&mut self, freed: &[u32]) {
         for slot in &mut self.frame_map {
-            if matches!(slot, Some(s) if s.handle == handle) {
+            if matches!(slot, Some(s) if freed.contains(&s.backing)) {
                 *slot = None;
             }
         }
-        self.saved.remove(&handle);
-        Ok(())
+        for saved in self.saved.values_mut() {
+            for slot in saved.iter_mut() {
+                if matches!(slot, Some(s) if freed.contains(&s.backing)) {
+                    *slot = None;
+                }
+            }
+        }
     }
 
     /// Function 4Ch: the number of pages owned by `handle`.
@@ -266,11 +290,7 @@ impl EmsState {
                 for page in &freed {
                     self.free[*page as usize] = true;
                 }
-                for slot in &mut self.frame_map {
-                    if matches!(slot, Some(s) if freed.contains(&s.backing)) {
-                        *slot = None;
-                    }
-                }
+                self.invalidate_freed(&freed);
             }
             std::cmp::Ordering::Equal => {}
         }
@@ -443,6 +463,43 @@ mod tests {
             ems.resolve(0xE_0000),
             None,
             "the slot on a freed page is cleared"
+        );
+    }
+
+    #[test]
+    fn restore_cannot_alias_a_page_reassigned_after_a_shrink() {
+        let mut ems = manager(); // 64 pages
+        let a = ems.allocate(4).unwrap(); // backing 0,1,2,3
+        ems.map(0, 3, a).unwrap(); // slot 0 -> backing 3
+        ems.save_context(a).unwrap(); // snapshot slot 0 = backing 3
+        ems.map(0, 0, a).unwrap(); // remap slot 0 -> backing 0 (survives the shrink)
+        ems.reallocate(a, 1).unwrap(); // frees backing 1,2,3 and scrubs the saved slot
+        let b = ems.allocate(3).unwrap(); // first-fit reclaims backing 1,2,3
+        ems.map(0, 2, b).unwrap(); // B owns backing 3 now (its logical page 2)
+        ems.restore_context(a).unwrap();
+        // A's saved slot referenced a freed page, so the restore leaves it unmapped
+        // rather than aliasing B's reassigned page.
+        assert_eq!(
+            ems.resolve(0xE_0000),
+            None,
+            "the restore must not alias B's page"
+        );
+    }
+
+    #[test]
+    fn release_scrubs_other_handles_saved_contexts_for_the_freed_pages() {
+        let mut ems = manager();
+        let a = ems.allocate(2).unwrap(); // backing 0,1
+        ems.map(0, 0, a).unwrap(); // slot 0 -> A's backing 0
+        let c = ems.allocate(1).unwrap(); // backing 2
+        ems.save_context(c).unwrap(); // C snapshots slot 0 = {A, backing 0}
+        ems.release(a).unwrap(); // frees A's pages 0,1 and scrubs C's saved slot
+        let _b = ems.allocate(2).unwrap(); // reclaims backing 0,1
+        ems.restore_context(c).unwrap();
+        assert_eq!(
+            ems.resolve(0xE_0000),
+            None,
+            "C's restore must not alias the reassigned page"
         );
     }
 
