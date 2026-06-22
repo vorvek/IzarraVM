@@ -12,6 +12,10 @@ $env:PATH    = "$env:WATCOM\binnt;$env:PATH"
 $env:INCLUDE = "$env:WATCOM\h"
 
 $build = Join-Path $root 'build'
+# Wipe the build dir first so a renamed or removed tool cannot linger in it and
+# get packed into the ROM (a stale build/emm386.com would otherwise ship next to
+# the renamed iemm.com, breaking reproducibility from a clean checkout).
+if (Test-Path $build) { Remove-Item -Recurse -Force $build }
 New-Item -ItemType Directory -Force $build | Out-Null
 
 function Compile($src, $objName) {
@@ -57,5 +61,9 @@ if ($LASTEXITCODE -ne 0) { throw "nasm failed on tokaboot" }
 $rom = Join-Path $root '..\crates\izarravm-firmware\roms\tokados.rom'
 & cargo run -q --manifest-path "$root\pack\Cargo.toml" -- "$build" "$rom"
 if ($LASTEXITCODE -ne 0) { throw "pack failed" }
+
+# wcc leaves <name>.err warning logs in the working directory (its CWD, not the
+# build dir); drop them so an authoring run leaves the tree clean.
+Get-ChildItem "$root\..\*.err" -ErrorAction SilentlyContinue | Remove-Item -Force
 
 Write-Host "Toka-DOS build complete: $rom"

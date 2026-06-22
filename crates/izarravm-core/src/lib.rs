@@ -228,12 +228,15 @@ pub struct ConfigSysMemory {
     pub dos_umb: bool,
 }
 
-/// Read the memory-manager intent out of a CONFIG.SYS. EMM386.EXE provides upper
-/// memory only when HIMEM.SYS loads first, matching real DOS, so an EMM386 line
-/// with no preceding HIMEM line (or no EMM386 line at all) yields Unloaded:
+/// Read the memory-manager intent out of a CONFIG.SYS. The IEMM memory manager
+/// (filed as IEMM.EXE in Toka-DOS, or the real-DOS EMM386.EXE) provides upper
+/// memory only when HIMEM.SYS loads first, matching real DOS, so an IEMM/EMM386
+/// line with no preceding HIMEM line (or no such line at all) yields Unloaded:
 /// - HIMEM.SYS only -> Unloaded (XMS, no UMB/EMS)
-/// - HIMEM.SYS + EMM386.EXE NOEMS -> NoEms (UMBs, no EMS frame)
-/// - HIMEM.SYS + EMM386.EXE RAM (or no arg) -> Ram (UMBs + EMS frame)
+/// - HIMEM.SYS + IEMM.EXE NOEMS -> NoEms (UMBs, no EMS frame)
+/// - HIMEM.SYS + IEMM.EXE RAM (or no arg) -> Ram (UMBs + EMS frame)
+///
+/// EMM386.EXE is accepted as an alias so a pasted real-DOS CONFIG.SYS still works.
 ///
 /// DOS=UMB (or DOS=HIGH,UMB) sets `dos_umb`.
 pub fn parse_config_sys(text: &str) -> ConfigSysMemory {
@@ -251,8 +254,14 @@ pub fn parse_config_sys(text: &str) -> ConfigSysMemory {
             let name = path.rsplit(['\\', '/']).next().unwrap_or(path);
             if name == "HIMEM.SYS" {
                 himem = true;
-            } else if (name == "EMM386.EXE" || name == "EMM386") && himem {
-                // EMM386 loads only with a prior HIMEM. NOEMS omits the EMS frame.
+            } else if (name == "IEMM.EXE"
+                || name == "IEMM"
+                || name == "EMM386.EXE"
+                || name == "EMM386")
+                && himem
+            {
+                // IEMM (the Toka-DOS manager) or its real-DOS alias EMM386 loads
+                // only with a prior HIMEM. NOEMS omits the EMS frame.
                 let noems = rest
                     .split_whitespace()
                     .skip(1)
@@ -993,6 +1002,23 @@ mod tests {
         // An empty CONFIG.SYS is the no-manager case.
         assert_eq!(
             parse_config_sys("FILES=40\r\n").emm386,
+            Emm386Mode::Unloaded
+        );
+
+        // IEMM.EXE is the Toka-DOS memory manager name; it drives the mode the
+        // same way EMM386.EXE does. Both the full and the bare name work.
+        let iemm_ram = parse_config_sys("DEVICE=HIMEM.SYS\r\nDEVICE=IEMM.EXE RAM\r\n");
+        assert_eq!(iemm_ram.emm386, Emm386Mode::Ram);
+        let iemm_noems = parse_config_sys("DEVICE=HIMEM.SYS\r\nDEVICE=IEMM.EXE NOEMS\r\n");
+        assert_eq!(iemm_noems.emm386, Emm386Mode::NoEms);
+        let iemm_bare = parse_config_sys("DEVICE=HIMEM.SYS\r\nDEVICE=IEMM\r\n");
+        assert_eq!(iemm_bare.emm386, Emm386Mode::Ram);
+        // The real-DOS EMM386 name stays accepted (a pasted real-DOS config works).
+        let emm386_bare = parse_config_sys("DEVICE=HIMEM.SYS\r\nDEVICE=EMM386\r\n");
+        assert_eq!(emm386_bare.emm386, Emm386Mode::Ram);
+        // IEMM without a preceding HIMEM cannot load either.
+        assert_eq!(
+            parse_config_sys("DEVICE=IEMM.EXE RAM\r\n").emm386,
             Emm386Mode::Unloaded
         );
     }
