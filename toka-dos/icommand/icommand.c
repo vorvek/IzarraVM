@@ -838,31 +838,78 @@ static void run_batch(const char *path, const char *tail)
     bat_depth--;
 }
 
-/* Run `name` as C:\NAME.COM, C:\NAME.EXE, then C:\NAME.BAT, passing `tail`.
- * Returns 1 if something ran. Sets errorlevel from a launched program. */
-static int run_external(const char *name, const char *tail)
+/* Join `dir` + `name` (up to 12 chars) + `ext` into `out` with exactly one
+ * backslash between the directory and the file. `dir` may or may not end in a
+ * backslash. `out` must hold at least 100 bytes (a 79-char dir plus 8.3 name). */
+static void join_path(char *out, const char *dir, const char *name, const char *ext)
 {
-    char path[24];
-    strcpy(path, "C:\\");
-    strncat(path, name, 12);
-    strcat(path, ".COM");
+    int n = (int)strlen(dir);
+    strcpy(out, dir);
+    if (n == 0 || out[n - 1] != '\\') {
+        out[n++] = '\\';
+        out[n] = 0;
+    }
+    strncat(out, name, 12);
+    strcat(out, ext);
+}
+
+/* Try to run `dir`\`name` as .COM, then .EXE, then .BAT (the DOS extension
+ * order). Returns 1 if a match exists in `dir` (and is run, or its launch error
+ * is reported through errorlevel); 0 if no such file exists there. */
+static int try_dir(const char *dir, const char *name, const char *tail)
+{
+    char path[100];
+    join_path(path, dir, name, ".COM");
     if (t_exec(path, tail) != 2) {
         errorlevel = t_lastexit();
         return 1;
     }
-    strcpy(path, "C:\\");
-    strncat(path, name, 12);
-    strcat(path, ".EXE");
+    join_path(path, dir, name, ".EXE");
     if (t_exec(path, tail) != 2) {
         errorlevel = t_lastexit();
         return 1;
     }
-    strcpy(path, "C:\\");
-    strncat(path, name, 12);
-    strcat(path, ".BAT");
+    join_path(path, dir, name, ".BAT");
     if (t_exists(path)) {
         run_batch(path, tail);
         return 1;
+    }
+    return 0;
+}
+
+/* Run `name` as an external .COM/.EXE/.BAT, searching the current directory
+ * first (the DOS order, and the fallback that keeps commands resolvable when
+ * PATH is empty) and then each semicolon-separated entry of PATH. Returns 1 if
+ * something ran. Sets errorlevel from a launched program. */
+static int run_external(const char *name, const char *tail)
+{
+    char dir[80];
+    char *path;
+
+    /* The current directory: "C:\" plus the cwd relative to the root. */
+    strcpy(dir, "C:\\");
+    t_getcwd(dir + 3);
+    if (try_dir(dir, name, tail)) {
+        return 1;
+    }
+
+    /* Then each ';'-separated PATH entry in turn. */
+    path = env_get("PATH");
+    while (path && *path) {
+        int n = 0;
+        while (*path && *path != ';') {
+            if (n < (int)sizeof(dir) - 1) {
+                dir[n++] = *path;
+            }
+            path++;
+        }
+        dir[n] = 0;
+        if (n > 0 && try_dir(dir, name, tail)) {
+            return 1;
+        }
+        if (*path == ';') {
+            path++;
+        }
     }
     return 0;
 }
