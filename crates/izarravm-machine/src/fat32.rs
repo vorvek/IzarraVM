@@ -5,6 +5,8 @@
 //! DskTableFAT32 cluster-size table and the FATSz32 computation. A later slice
 //! builds the actual boot sector, FATs, and directory tree from this geometry.
 
+// The DskTableFAT32 cluster table and the FATSz32 math are only valid for
+// 512-byte sectors (a fatgen103 precondition), so this stays 512.
 const BYTES_PER_SECTOR: u16 = 512;
 /// FAT32 reserves 32 sectors before the first FAT (fatgen103 default).
 const RESERVED_SECTORS: u16 = 32;
