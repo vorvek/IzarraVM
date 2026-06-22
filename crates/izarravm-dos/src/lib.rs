@@ -331,6 +331,11 @@ pub enum DosAction {
 #[derive(Debug, Default)]
 struct Arena {
     psp_seg: u16,
+    // The first MCB of this process's chain. For a directly-loaded program it is
+    // psp_seg-1 (the program block heads the chain). An EXEC child's chain starts
+    // one block lower, at its environment block's header, so a guest walking the
+    // child chain sees env -> program -> free.
+    chain_first: u16,
     // AH=31h KEEP PROCESS: the program block stays allocated at termination. Set
     // once a TSR keeps itself resident; a later free of the program block is a
     // no-op the same as a normal exit, so the flag only records that the
@@ -395,7 +400,7 @@ impl Arena {
     /// The program block's MCB header sits one paragraph below the PSP; the chain
     /// is walked from here.
     fn first_mcb(&self) -> u16 {
-        self.psp_seg.wrapping_sub(1)
+        self.chain_first
     }
 
     /// Walk the authoritative chain from the first MCB.
@@ -450,10 +455,13 @@ impl Arena {
     /// block's size word in the chain. Falls back to psp_seg only if the chain is
     /// unwritten, which never happens after init_program.
     fn prog_top(&self, mem: &Memory) -> u16 {
-        match self.chain(mem).first() {
-            Some(prog) => prog.mcb_seg.wrapping_add(1).wrapping_add(prog.size),
-            None => self.psp_seg,
-        }
+        // The program block is the one whose data segment is the PSP (an EXEC
+        // child's chain starts at the env block, so it is not necessarily first).
+        self.chain(mem)
+            .iter()
+            .find(|m| m.mcb_seg.wrapping_add(1) == self.psp_seg)
+            .map(|m| m.mcb_seg.wrapping_add(1).wrapping_add(m.size))
+            .unwrap_or(self.psp_seg)
     }
 
     /// The first free paragraph above the program block and any allocations: the
@@ -544,14 +552,19 @@ impl Arena {
     ) -> Result<Result<(), ResizeError>, DosError> {
         let chain = self.chain(mem);
         if seg == self.psp_seg {
-            // The program block (the first MCB). Its ceiling is the lowest still-
-            // OWNED block's header above it; leaked owner-0 holes and the free tail
-            // are not ceilings, the program grows through them up to that owned
-            // block (or ARENA_TOP when nothing above is owned).
-            let Some(prog) = chain.first().copied() else {
+            // The program block (data segment == PSP; for an EXEC child it follows
+            // the env block, so it is not necessarily chain[0]). Its ceiling is the
+            // lowest still-OWNED block ABOVE it; leaked owner-0 holes, the free tail,
+            // and the env below it are not ceilings, the program grows through holes
+            // up to that owned block (or ARENA_TOP when nothing above is owned).
+            let Some(pos) = chain
+                .iter()
+                .position(|m| m.mcb_seg.wrapping_add(1) == self.psp_seg)
+            else {
                 return Ok(Err(ResizeError::InvalidBlock));
             };
-            let owned_above = chain.iter().skip(1).find(|m| m.owner != 0).copied();
+            let prog = chain[pos];
+            let owned_above = chain.iter().skip(pos + 1).find(|m| m.owner != 0).copied();
             let limit = owned_above.map(|m| m.mcb_seg).unwrap_or(ARENA_TOP);
             let new_top = u32::from(self.psp_seg) + u32::from(paras);
             if new_top > u32::from(limit) {
@@ -635,10 +648,14 @@ impl Arena {
         let cur_top = self.prog_top(mem);
         let want = u32::from(self.psp_seg) + u32::from(paras);
         let new_top = want.min(u32::from(cur_top)) as u16;
+        // The program block's own header is psp_seg-1 (not first_mcb(), which for an
+        // EXEC child is the env block below the program). Any AH=48h block above the
+        // program is released into the free tail; an env block below stays owned.
+        let prog_mcb = self.psp_seg.wrapping_sub(1);
         if new_top < ARENA_TOP {
             write_mcb_header(
                 mem,
-                self.first_mcb(),
+                prog_mcb,
                 b'M',
                 self.psp_seg,
                 new_top - self.psp_seg,
@@ -648,7 +665,7 @@ impl Arena {
         } else {
             write_mcb_header(
                 mem,
-                self.first_mcb(),
+                prog_mcb,
                 b'Z',
                 self.psp_seg,
                 new_top - self.psp_seg,
@@ -824,10 +841,10 @@ struct ProgramContext {
     arena: Arena,
     dta: (u16, u16),
     find_searches: HashMap<(u16, u16), FindSearch>,
-    // The parent's free-tail segment at the moment of EXEC. The child runs in the
-    // parent's free region and overwrites that 'Z' header, so finish_exec restores
-    // it: the child's memory returns to the parent. (A bridge until the EXEC memory
-    // model carves the child as a real owned MCB block freed by owner on exit.)
+    // The parent's free-tail segment at the moment of EXEC. The child's env and
+    // program blocks are carved from here upward, so on the child's exit finish_exec
+    // frees the parent's memory back from this segment, capped below any resident
+    // (TSR) region the child or a descendant left above it.
     free_base: u16,
 }
 
@@ -847,6 +864,10 @@ pub struct DosKernel {
     find_searches: HashMap<(u16, u16), FindSearch>,
     // Parent program frames for nested EXEC (AL=0); restored on child exit.
     program_stack: Vec<ProgramContext>,
+    // Base segments of resident (AH=31h TSR) MCB regions. An ancestor exiting must
+    // not reclaim memory at or above a resident region, so a free-tail restore is
+    // capped below the lowest resident base above it. Never pruned (TSRs persist).
+    resident_regions: Vec<u16>,
     last_exit_code: u8, // AH=4Dh AL; cleared after it is read
     last_exit_type: u8, // AH=4Dh AH; always 0x00 (normal termination), marked
     // AH=0Ch flush-and-invoke: the flush runs once, not again on a WaitForKey re-entry.
@@ -927,6 +948,7 @@ impl DosKernel {
     ) -> Result<(), DosError> {
         self.arena = Arena {
             psp_seg,
+            chain_first: psp_seg.wrapping_sub(1),
             resident: false,
         };
         self.arena.write_initial_chain(mem, prog_top)?;
@@ -1227,31 +1249,25 @@ impl DosKernel {
             }
         };
         let env_paras = (env_bytes.len() as u16).div_ceil(16).max(1);
-        let env_seg = self.arena.free_base(mem);
-        // The child's program block needs its own MCB header one paragraph below
-        // the PSP, just above the environment block: env [env_seg, env_seg+env_paras),
-        // child MCB header at env_seg+env_paras, child PSP one paragraph higher.
-        let child_psp = match env_seg.checked_add(env_paras + 1) {
-            Some(s) if s < ARENA_TOP => s,
+        // Carve the child's blocks from the parent's free tail as real owned MCBs.
+        // The environment block heads the child's chain: its MCB header sits at the
+        // parent free base, env data one paragraph up. The child program block's
+        // header sits just above the env data, its PSP one paragraph higher again.
+        let env_mcb = self.arena.free_base(mem);
+        // The child needs at least a 64 KiB program segment (load_com sets SP=0xFFFE
+        // and writes the return word there). Too little conventional memory left is
+        // insufficient memory (0x08), reported before any child memory is written.
+        let child_psp = match env_mcb.checked_add(env_paras + 2) {
+            Some(s) if u32::from(s) + 0x1000 <= u32::from(ARENA_TOP) => s,
             _ => {
-                set_dos_error(regs, 0x0a);
+                set_dos_error(regs, 0x08);
                 return Ok(DosAction::Continue);
             }
         };
-        // The child needs at least a 64 KiB segment: load_com sets SP=0xFFFE and
-        // writes the return word there. A child whose PSP lands too high would
-        // overflow past ARENA_TOP, so reject it as insufficient memory (0x08)
-        // before writing the env block. An MZ child's finer fit is enforced by
-        // load_program below (ExeNotEnoughMemory -> 0x08).
-        if u32::from(child_psp) + 0x1000 > u32::from(ARENA_TOP) {
-            set_dos_error(regs, 0x08);
-            return Ok(DosAction::Continue);
-        }
-        let env_linear = usize::from(env_seg) * 16;
-        for (i, &byte) in env_bytes.iter().enumerate() {
-            mem.write_u8(env_linear + i, byte)?;
-        }
+        let env_seg = env_mcb + 1; // PSP:0x2C points at the env data, above its header
 
+        // Load the child image FIRST: a failed load must leave the parent's chain
+        // untouched (no env header written over the parent's free tail to roll back).
         let parent_psp = self.arena.psp_seg;
         let entry = match load_program(&image, mem, child_psp) {
             Ok(entry) => entry,
@@ -1265,6 +1281,14 @@ impl DosKernel {
                 return Ok(DosAction::Continue);
             }
         };
+
+        // The load succeeded: now write the environment MCB block (owner = the child
+        // PSP) over the parent's old free tail, and the env bytes into its data area.
+        write_mcb_header(mem, env_mcb, b'M', child_psp, env_paras, NO_NAME)?;
+        let env_linear = usize::from(env_seg) * 16;
+        for (i, &byte) in env_bytes.iter().enumerate() {
+            mem.write_u8(env_linear + i, byte)?;
+        }
 
         // Patch the child PSP.
         let psp = usize::from(child_psp) * 16;
@@ -1284,25 +1308,31 @@ impl DosKernel {
         let child_ax = (u16::from(fcb_drive_validity(fcb2_drive)) << 8)
             | u16::from(fcb_drive_validity(fcb1_drive));
 
-        // Save the parent context (its free tail, to restore when the child exits),
-        // then switch to the child. The child owns conventional memory to the top;
-        // its own MCB chain is not authoritative until the EXEC memory re-model
-        // (the env block and child PSP are packed without a header gap here).
+        // Save the parent context (its free tail, to restore when the child's blocks
+        // are freed on exit), then switch to the child.
         let parent = ProgramContext {
             arena: std::mem::take(&mut self.arena),
             dta: self.dta,
             find_searches: std::mem::take(&mut self.find_searches),
-            free_base: env_seg,
+            free_base: env_mcb,
         };
         self.program_stack.push(parent);
         self.arena = Arena {
             psp_seg: child_psp,
+            chain_first: env_mcb, // the chain starts at the env block
             resident: false,
         };
-        // The child's authoritative chain: its program block owns conventional
-        // memory to the top, with its MCB header just above the environment block.
-        // The child shrinks this (AH=4Ah) to free room for its own children.
-        self.arena.write_initial_chain(mem, ARENA_TOP)?;
+        // Write the child program block: owned by the child PSP, the last block,
+        // filling conventional memory to the top. Its header sits just above the env
+        // data, so the child chain reads env -> program -> (free tail once shrunk).
+        write_mcb_header(
+            mem,
+            child_psp.wrapping_sub(1),
+            b'Z',
+            child_psp,
+            ARENA_TOP - child_psp,
+            PROG_NAME,
+        )?;
         self.dta = (child_psp, 0x80);
         // A fresh child has terminated no child of its own.
         self.last_exit_code = 0;
@@ -1315,22 +1345,38 @@ impl DosKernel {
     /// and record the exit code/type for AH=4Dh. Called by the machine when it
     /// pops a parent frame.
     pub fn finish_exec(&mut self, code: u8, mem: &mut Memory) -> Result<(), DosError> {
+        // The exiting child's blocks (env + program, above the parent free base) are
+        // freed back to the parent, UNLESS the child itself kept resident (a TSR), in
+        // which case keep_resident already left a correct free tail above its block.
+        let child_resident = self.arena.resident;
         if let Some(parent) = self.program_stack.pop() {
             self.arena = parent.arena;
             self.dta = parent.dta;
             self.find_searches = parent.find_searches;
-            // The child ran in the parent's free region and overwrote the parent's
-            // free-tail header. Restore it so the parent's authoritative chain is
-            // whole again: the child's memory is freed back to the parent.
-            if parent.free_base < ARENA_TOP {
-                write_mcb_header(
-                    mem,
-                    parent.free_base,
-                    b'Z',
-                    0,
-                    ARENA_TOP - parent.free_base - 1,
-                    NO_NAME,
-                )?;
+            if !child_resident {
+                // A resident TSR carved by this child or a descendant sits above the
+                // freed region; cap the restored free block below the lowest such
+                // resident base so the TSR is preserved (the EXEC chain unwinds past
+                // it). With nothing resident above, the region reaches ARENA_TOP.
+                let cap = self
+                    .resident_regions
+                    .iter()
+                    .copied()
+                    .filter(|&base| base > parent.free_base)
+                    .min()
+                    .unwrap_or(ARENA_TOP);
+                if parent.free_base < cap {
+                    // 'M' when a resident block follows (a link to it), else the tail.
+                    let sig = if cap < ARENA_TOP { b'M' } else { b'Z' };
+                    write_mcb_header(
+                        mem,
+                        parent.free_base,
+                        sig,
+                        0,
+                        cap - parent.free_base - 1,
+                        NO_NAME,
+                    )?;
+                }
             }
         }
         self.last_exit_code = code;
@@ -2462,6 +2508,9 @@ impl DosKernel {
             // path is otherwise identical to AH=4Ch, so the machine frees nothing.
             0x31 => {
                 self.arena.keep_resident(regs.dx, mem)?;
+                // Record the resident region's base so an ancestor's exit will not
+                // reclaim it (the EXEC chain can unwind past this resident block).
+                self.resident_regions.push(self.arena.chain_first);
                 Ok(DosAction::Exit((regs.ax & 0x00ff) as u8))
             }
             // AH=33h: Ctrl-Break flag. Stub: AL=00 (get) returns DL=0 (off);
@@ -2884,8 +2933,9 @@ impl DosKernel {
             }
             // AH=52h GET LIST OF LISTS (SysVars). Returns ES:BX -> the DOS internal
             // variable table. The first-MCB segment at [BX-2] points at the live
-            // in-RAM MCB chain (psp_seg-1), which the allocator owns and a guest can
-            // walk and edit. The fields a guest reads to size the system (max bytes
+            // in-RAM MCB chain (psp_seg-1 for a directly-loaded program; for an EXEC
+            // child the environment block that heads its chain), which the allocator
+            // owns and a guest can walk and edit. The fields a guest reads (max bytes
             // per block, LASTDRIVE) and the NUL device header that heads the driver
             // chain are filled inline. The DWORD chain pointers (DPB, SFT, CLOCK$,
             // CON, CDS, FCB tables, disk buffers) stay zero: their backing
@@ -8364,16 +8414,16 @@ mod tests {
             bx: 0x40,
             ..DosRegs::default()
         };
-        // env is 1 paragraph at the parent free_base 0x0200, its MCB header at
-        // 0x0201, so the child PSP is 0x0202.
+        // env MCB header at the parent free_base 0x0200, env data at 0x0201, the
+        // child program MCB header at 0x0202, so the child PSP is 0x0203.
         let action = kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
-        let child_psp = 0x0202usize * 16;
+        let child_psp = 0x0203usize * 16;
         match action {
             DosAction::Exec { child_ax, .. } => {
                 assert_eq!(child_ax, 0x0000); // null FCBs -> valid drives
                 assert_eq!(mem.read_u16(child_psp + 0x02).unwrap(), 0xa000);
                 assert_eq!(mem.read_u16(child_psp + 0x16).unwrap(), 0x0100); // parent
-                assert_eq!(mem.read_u16(child_psp + 0x2c).unwrap(), 0x0200); // env seg
+                assert_eq!(mem.read_u16(child_psp + 0x2c).unwrap(), 0x0201); // env data seg
                 assert_eq!(mem.read_u8(child_psp + 0x80).unwrap(), 0); // empty tail
                 assert_eq!(mem.read_u8(child_psp + 0x81).unwrap(), 0x0d);
                 assert_eq!(mem.read_u8(child_psp + 0x18).unwrap(), 0x01); // JFT stdin
@@ -8389,8 +8439,8 @@ mod tests {
         let (mut kernel, mut mem) = exec_kernel(dir.path());
         place_exec_inputs(&mut mem, "C:\\CHILD.COM", 0);
         let _ = exec_al0(&mut kernel, &mut mem);
-        // env block at 0x0200:0 is a single terminating NUL.
-        assert_eq!(mem.read_u8(0x0200 * 16).unwrap(), 0x00);
+        // env data at 0x0201:0 (above its MCB header at 0x0200) is a terminating NUL.
+        assert_eq!(mem.read_u8(0x0201 * 16).unwrap(), 0x00);
     }
 
     #[test]
@@ -8405,9 +8455,9 @@ mod tests {
         }
         place_exec_inputs(&mut mem, "C:\\CHILD.COM", 0x3000);
         let _ = exec_al0(&mut kernel, &mut mem);
-        // Copied env at 0x0200:0 holds the same bytes.
+        // Copied env data at 0x0201:0 (above its MCB header) holds the same bytes.
         for (i, &b) in b"A=1\0B=2\0\0".iter().enumerate() {
-            assert_eq!(mem.read_u8(0x0200 * 16 + i).unwrap(), b);
+            assert_eq!(mem.read_u8(0x0201 * 16 + i).unwrap(), b);
         }
     }
 
@@ -8462,13 +8512,83 @@ mod tests {
             kernel.dispatch(0x21, &mut regs, &mut mem).unwrap(),
             DosAction::Exec { .. }
         ));
-        // Now in the child context (psp_seg = 0x0202, above the env's MCB header).
-        assert_eq!(kernel.arena.psp_seg, 0x0202);
+        // Now in the child context (psp_seg = 0x0203, above the env block + header).
+        assert_eq!(kernel.arena.psp_seg, 0x0203);
         kernel.finish_exec(7, &mut mem).unwrap();
         assert_eq!(kernel.arena.psp_seg, 0x0100); // parent restored
-        // The child's memory was returned to the parent: its free tail is back.
+        // The child's memory (env + program) was freed back to the parent: its free
+        // tail is restored at the old free base.
         assert_eq!(kernel.arena.free_base(&mem), 0x0200);
         assert_eq!(kernel.last_exit_code, 7);
+    }
+
+    #[test]
+    fn exec_child_chain_shows_the_env_block_then_the_program() {
+        // Commit 2 fidelity: a child's MCB chain (via AH=52h) starts at its
+        // environment block (owned by the child PSP), then the program block, so a
+        // guest walking the chain sees env -> program.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CHILD.COM"), [0xcdu8, 0x20]).unwrap();
+        let (mut kernel, mut mem) = exec_kernel(dir.path());
+        place_exec_inputs(&mut mem, "C:\\CHILD.COM", 0);
+        let _ = exec_al0(&mut kernel, &mut mem);
+        let child_psp = kernel.arena.psp_seg;
+        let mut q = DosRegs {
+            ax: 0x5200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut q, &mut mem).unwrap();
+        let first = mem
+            .read_u16(usize::from(q.es) * 16 + usize::from(q.bx) - 2)
+            .unwrap();
+        let chain = read_mcb_chain(&mem, first);
+        assert!(chain.len() >= 2);
+        // First block is the env (data segment = PSP:0x2C), owned by the child.
+        assert_eq!(chain[0].owner, child_psp, "env block owned by the child");
+        let env_seg = mem.read_u16(usize::from(child_psp) * 16 + 0x2c).unwrap();
+        assert_eq!(
+            chain[0].mcb_seg.wrapping_add(1),
+            env_seg,
+            "env data = PSP:0x2C"
+        );
+        // Then the program block (data segment = child PSP), also owned by the child.
+        assert_eq!(
+            chain[1].owner, child_psp,
+            "program block owned by the child"
+        );
+        assert_eq!(
+            chain[1].mcb_seg.wrapping_add(1),
+            child_psp,
+            "program data = PSP"
+        );
+    }
+
+    #[test]
+    fn finish_exec_keeps_a_resident_child_block() {
+        // A child that keeps itself resident (AH=31h TSR) is NOT reclaimed on exit:
+        // its program block stays owned and the parent's free tail sits above it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CHILD.COM"), [0xcdu8, 0x20]).unwrap();
+        let (mut kernel, mut mem) = exec_kernel(dir.path());
+        place_exec_inputs(&mut mem, "C:\\CHILD.COM", 0);
+        let _ = exec_al0(&mut kernel, &mut mem);
+        let child_psp = kernel.arena.psp_seg;
+        let mut tsr = DosRegs {
+            ax: 0x3100,
+            dx: 0x0040,
+            ..DosRegs::default()
+        };
+        assert!(matches!(
+            kernel.dispatch(0x21, &mut tsr, &mut mem).unwrap(),
+            DosAction::Exit(_)
+        ));
+        kernel.finish_exec(0, &mut mem).unwrap();
+        // The resident block survived: the parent's free base is above it, not back
+        // at the old 0x0200.
+        assert!(
+            kernel.arena.free_base(&mem) > child_psp,
+            "the resident child block was not reclaimed"
+        );
     }
 
     #[test]
@@ -8527,6 +8647,69 @@ mod tests {
         let regs = exec_al0(&mut kernel, &mut mem);
         assert!(regs.cf);
         assert_eq!(regs.ax, 0x0b);
+    }
+
+    #[test]
+    fn exec_of_a_bad_program_leaves_the_parent_arena_intact() {
+        // A failed child load must not corrupt the parent's chain or lose its free
+        // memory: the env block is written only after the load succeeds.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CHILD.COM"), [0x4du8, 0x5a]).unwrap(); // truncated MZ
+        let (mut kernel, mut mem) = exec_kernel(dir.path());
+        let before = kernel.arena.free_base(&mem);
+        place_exec_inputs(&mut mem, "C:\\CHILD.COM", 0);
+        let regs = exec_al0(&mut kernel, &mut mem);
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x0b);
+        // The parent's free base is unchanged: no env header clobbered its free tail.
+        assert_eq!(
+            kernel.arena.free_base(&mem),
+            before,
+            "parent free memory preserved across a failed EXEC"
+        );
+        assert!(kernel.program_stack.is_empty(), "no child frame pushed");
+    }
+
+    #[test]
+    fn finish_exec_preserves_a_resident_region_above_the_freed_child() {
+        // An ancestor exiting must not reclaim a deeper resident TSR: a resident
+        // region recorded above the parent's free base caps the restored free region.
+        let (mut kernel, mut mem) = arena_kernel(); // parent psp 0x100, free tail 0x1100
+        // A resident TSR: a small owned program block at 0x4000 with a free tail above.
+        write_mcb_header(&mut mem, 0x4000, b'M', 0x4001, 0x40, NO_NAME).unwrap();
+        write_mcb_header(&mut mem, 0x4041, b'Z', 0, ARENA_TOP - 0x4041 - 1, NO_NAME).unwrap();
+        kernel.resident_regions.push(0x4000);
+        // A child frame whose free base is below the resident region.
+        let dta = kernel.dta;
+        kernel.program_stack.push(ProgramContext {
+            arena: std::mem::take(&mut kernel.arena),
+            dta,
+            find_searches: HashMap::new(),
+            free_base: 0x1100,
+        });
+        kernel.arena = Arena {
+            psp_seg: 0x1200,
+            chain_first: 0x1100,
+            resident: false,
+        };
+        kernel.finish_exec(0, &mut mem).unwrap();
+        // The TSR block survives and the freed child region below it is capped.
+        let chain = read_mcb_chain(&mem, kernel.arena.first_mcb());
+        assert!(
+            chain
+                .iter()
+                .any(|m| m.mcb_seg == 0x4000 && m.owner == 0x4001),
+            "the resident TSR above the freed child survives"
+        );
+        assert!(
+            chain.iter().any(|m| m.mcb_seg == 0x1100 && m.owner == 0),
+            "the child's memory is freed below the TSR"
+        );
+        assert_eq!(
+            kernel.arena.free_base(&mem),
+            0x4041,
+            "free tail above the TSR"
+        );
     }
 
     #[test]
