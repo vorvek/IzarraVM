@@ -49,6 +49,8 @@ struct SlotMap {
 struct EmsHandle {
     /// Backing-page indices this handle owns, in logical-page order.
     pages: Vec<u32>,
+    /// The 8-byte handle name (functions 53h get/set); blank until set.
+    name: [u8; 8],
 }
 
 /// The expanded-memory manager state for one machine.
@@ -135,7 +137,10 @@ impl EmsState {
             }
         };
         let backing = self.take_free_pages(usize::from(pages));
-        self.handles[id] = Some(EmsHandle { pages: backing });
+        self.handles[id] = Some(EmsHandle {
+            pages: backing,
+            name: [0; 8],
+        });
         Ok(id as u16)
     }
 
@@ -231,6 +236,81 @@ impl EmsState {
         let map = self.saved.remove(&handle).ok_or(status::NO_SAVED_CONTEXT)?;
         self.frame_map = map;
         Ok(())
+    }
+
+    /// Function 51h: grow or shrink `handle` to `new_pages`. Growing draws more
+    /// free pages (88h when too few); shrinking returns the trailing pages and
+    /// unmaps any frame slot that pointed at one.
+    pub fn reallocate(&mut self, handle: u16, new_pages: u16) -> Result<(), u8> {
+        let cur = self.handle(handle)?.pages.len();
+        let new = usize::from(new_pages);
+        match new.cmp(&cur) {
+            std::cmp::Ordering::Greater => {
+                let need = new - cur;
+                if need > self.free_pages() {
+                    return Err(status::FREE_EXCEEDED);
+                }
+                let extra = self.take_free_pages(need);
+                self.handles[usize::from(handle)]
+                    .as_mut()
+                    .unwrap()
+                    .pages
+                    .extend(extra);
+            }
+            std::cmp::Ordering::Less => {
+                let freed = self.handles[usize::from(handle)]
+                    .as_mut()
+                    .unwrap()
+                    .pages
+                    .split_off(new);
+                for page in &freed {
+                    self.free[*page as usize] = true;
+                }
+                for slot in &mut self.frame_map {
+                    if matches!(slot, Some(s) if freed.contains(&s.backing)) {
+                        *slot = None;
+                    }
+                }
+            }
+            std::cmp::Ordering::Equal => {}
+        }
+        Ok(())
+    }
+
+    /// Function 53h AL=01: set the 8-byte handle name.
+    pub fn set_name(&mut self, handle: u16, name: [u8; 8]) -> Result<(), u8> {
+        let idx = usize::from(handle);
+        let h = self
+            .handles
+            .get_mut(idx)
+            .and_then(|x| x.as_mut())
+            .ok_or(status::INVALID_HANDLE)?;
+        h.name = name;
+        Ok(())
+    }
+
+    /// Function 53h AL=00: get the 8-byte handle name.
+    pub fn name(&self, handle: u16) -> Result<[u8; 8], u8> {
+        self.handle(handle).map(|h| h.name)
+    }
+
+    /// The physical RAM address of byte `offset` within logical page `logical` of
+    /// `handle`, for the move/exchange copy (function 57h). `offset` may run past a
+    /// page; the page step is followed through the handle's (not necessarily
+    /// contiguous) backing pages. Errors on a bad handle or an out-of-range page.
+    pub fn backing_addr(&self, handle: u16, logical: u16, offset: u32) -> Result<u32, u8> {
+        let h = self.handle(handle)?;
+        let page = usize::from(logical) + (offset / EMS_PAGE_SIZE) as usize;
+        let within = offset % EMS_PAGE_SIZE;
+        let backing = *h.pages.get(page).ok_or(status::INVALID_LOGICAL_PAGE)?;
+        Ok(self.region_base + backing * EMS_PAGE_SIZE + within)
+    }
+
+    /// The page-frame segment of physical slot `phys` (0-3), for function 58h's
+    /// mappable-address array. Each slot is 16 KiB (0x400 paragraphs) on from the
+    /// frame base.
+    pub fn slot_segment(&self, phys: u8) -> u16 {
+        self.frame_seg + u16::from(phys) * 0x400
     }
 
     /// Whether `addr` lies in the 64 KiB page-frame window. The bus uses this to
@@ -344,6 +424,61 @@ mod tests {
         ems.restore_context(h).unwrap();
         assert_eq!(ems.resolve(0xE_0000).unwrap(), mapped);
         assert_eq!(ems.restore_context(h), Err(status::NO_SAVED_CONTEXT));
+    }
+
+    #[test]
+    fn reallocate_grows_then_shrinks_and_clears_a_freed_slot() {
+        let mut ems = manager();
+        let h = ems.allocate(4).unwrap();
+        ems.reallocate(h, 10).unwrap();
+        assert_eq!(ems.pages_for_handle(h).unwrap(), 10);
+        assert_eq!(ems.page_counts().0, 64 - 10);
+        // Map a high logical page, then shrink below it: its frame slot must clear.
+        ems.map(0, 8, h).unwrap();
+        assert!(ems.resolve(0xE_0000).is_some());
+        ems.reallocate(h, 4).unwrap();
+        assert_eq!(ems.pages_for_handle(h).unwrap(), 4);
+        assert_eq!(ems.page_counts().0, 64 - 4, "the trailing pages are freed");
+        assert_eq!(
+            ems.resolve(0xE_0000),
+            None,
+            "the slot on a freed page is cleared"
+        );
+    }
+
+    #[test]
+    fn handle_name_round_trips() {
+        let mut ems = manager();
+        let h = ems.allocate(1).unwrap();
+        assert_eq!(ems.name(h).unwrap(), [0u8; 8]);
+        ems.set_name(h, *b"MYHANDLE").unwrap();
+        assert_eq!(&ems.name(h).unwrap(), b"MYHANDLE");
+        assert_eq!(ems.set_name(99, [0u8; 8]), Err(status::INVALID_HANDLE));
+    }
+
+    #[test]
+    fn backing_addr_steps_through_a_handles_pages() {
+        let mut ems = manager();
+        let h = ems.allocate(3).unwrap();
+        assert_eq!(ems.backing_addr(h, 0, 0x100).unwrap(), 0x11_0000 + 0x100);
+        // An offset past a page boundary steps to the next logical (backing) page.
+        assert_eq!(
+            ems.backing_addr(h, 0, EMS_PAGE_SIZE + 5).unwrap(),
+            0x11_0000 + EMS_PAGE_SIZE + 5
+        );
+        // Past the handle's last page is an invalid logical page.
+        assert_eq!(
+            ems.backing_addr(h, 0, 3 * EMS_PAGE_SIZE),
+            Err(status::INVALID_LOGICAL_PAGE)
+        );
+    }
+
+    #[test]
+    fn slot_segment_steps_by_16k() {
+        let ems = manager(); // frame at 0xE000
+        assert_eq!(ems.slot_segment(0), 0xE000);
+        assert_eq!(ems.slot_segment(1), 0xE400);
+        assert_eq!(ems.slot_segment(3), 0xEC00);
     }
 
     #[test]

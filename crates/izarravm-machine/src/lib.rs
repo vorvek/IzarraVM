@@ -71,6 +71,16 @@ const EMS_FRAME_DEFAULT_SEG: u16 = (EMS_FRAME_DEFAULT_BASE >> 4) as u16; // 0xE0
 /// slice of the 24 MiB machine's extended RAM. Carved from the pool XMS shares.
 const EMS_DEFAULT_KIB: u32 = 8 * 1024;
 
+/// One endpoint of an EMS move/exchange (function 57h): conventional memory (kind
+/// 0, addressed by `seg_or_page`:`offset`) or expanded memory (kind 1, addressed
+/// by `handle` + logical page `seg_or_page` + `offset`).
+struct XferEnd {
+    kind: u8,
+    handle: u16,
+    offset: u16,
+    seg_or_page: u16,
+}
+
 pub const HIGH_ROM_BASE: u32 = 0xffff_0000;
 pub const MARGO_LFB_BASE: u32 = 0xE000_0000;
 pub const MARGO_MMIO_BASE: u32 = 0xE040_0000;
@@ -2704,9 +2714,167 @@ impl Machine {
                 self.set_bx(handles.len() as u16);
                 self.set_ah(ems::status::OK);
             }
-            // OS-only, partial-page-map, alter-map, move/exchange, and the rest of
-            // the 4.0 set are not modeled yet: undefined function.
+            // 50h MAP/UNMAP MULTIPLE PAGES: DX = handle, CX = count, DS:SI = array of
+            // {WORD logical-or-FFFFh, WORD physical-page (AL=0) or segment (AL=1)}.
+            0x50 => self.ems_map_multiple(al, dx, self.cpu.registers.ecx() as u16),
+            // 51h REALLOCATE PAGES: DX = handle, BX = new count; BX = actual on ok.
+            0x51 => match self.ems_mut().reallocate(dx, bx) {
+                Ok(()) => {
+                    self.set_bx(bx);
+                    self.set_ah(ems::status::OK);
+                }
+                Err(code) => self.set_ah(code),
+            },
+            // 53h GET/SET HANDLE NAME: DX = handle, AL=0 get (ES:DI), AL=1 set (DS:SI).
+            0x53 => self.ems_handle_name(al, dx),
+            // 57h MOVE/EXCHANGE MEMORY REGION: DS:SI = 18-byte descriptor, AL=0 move,
+            // AL=1 exchange.
+            0x57 => self.ems_move_exchange(al == 0x01),
+            // 58h GET MAPPABLE PHYSICAL ADDRESS ARRAY: AL=0 array to ES:DI, AL=1 count
+            // only; CX = the four frame slots.
+            0x58 => {
+                if al == 0x00 {
+                    let es = self.cpu.registers.segment(SegmentIndex::Es).base;
+                    let di = self.cpu.registers.edi() as u16;
+                    let mut addr = es as usize + usize::from(di);
+                    for phys in 0..ems::FRAME_SLOTS as u8 {
+                        let seg = self.ems().slot_segment(phys);
+                        let _ = self.memory.write_u16(addr, seg);
+                        let _ = self.memory.write_u16(addr + 2, u16::from(phys));
+                        addr += 4;
+                    }
+                }
+                self.set_cx(ems::FRAME_SLOTS as u16);
+                self.set_ah(ems::status::OK);
+            }
+            // OS-only (alt-map register sets, page-map jump/call, partial page map)
+            // and any other function are not modeled: undefined function.
             _ => self.set_ah(0x84),
+        }
+    }
+
+    /// EMS function 50h: apply an array of map/unmap operations from DS:SI. AL=0
+    /// takes a physical page number (0-3); AL=1 takes a frame-slot segment.
+    fn ems_map_multiple(&mut self, sub: u8, handle: u16, count: u16) {
+        let ds = self.cpu.registers.segment(SegmentIndex::Ds).base;
+        let si = self.cpu.registers.esi() as u16;
+        let mut addr = ds as usize + usize::from(si);
+        let frame_seg = self.ems().frame_segment();
+        for _ in 0..count {
+            let logical = self.memory.read_u16(addr).unwrap_or(0);
+            let second = self.memory.read_u16(addr + 2).unwrap_or(0);
+            addr += 4;
+            let phys = if sub == 0x00 {
+                second as u8
+            } else {
+                // Segment form: the slot whose base segment matches, else invalid.
+                let delta = second.wrapping_sub(frame_seg);
+                if second < frame_seg || delta % 0x400 != 0 {
+                    self.set_ah(ems::status::INVALID_PHYSICAL_PAGE);
+                    return;
+                }
+                (delta / 0x400) as u8
+            };
+            if let Err(code) = self.ems_mut().map(phys, logical, handle) {
+                self.set_ah(code);
+                return;
+            }
+        }
+        self.set_ah(ems::status::OK);
+    }
+
+    /// EMS function 53h: get (AL=0, into ES:DI) or set (AL=1, from DS:SI) the
+    /// 8-byte name of `handle`.
+    fn ems_handle_name(&mut self, sub: u8, handle: u16) {
+        match sub {
+            0x00 => match self.ems().name(handle) {
+                Ok(name) => {
+                    let es = self.cpu.registers.segment(SegmentIndex::Es).base;
+                    let di = self.cpu.registers.edi() as u16;
+                    let base = es as usize + usize::from(di);
+                    for (i, &byte) in name.iter().enumerate() {
+                        let _ = self.memory.write_u8(base + i, byte);
+                    }
+                    self.set_ah(ems::status::OK);
+                }
+                Err(code) => self.set_ah(code),
+            },
+            0x01 => {
+                let ds = self.cpu.registers.segment(SegmentIndex::Ds).base;
+                let si = self.cpu.registers.esi() as u16;
+                let base = ds as usize + usize::from(si);
+                let mut name = [0u8; 8];
+                for (i, slot) in name.iter_mut().enumerate() {
+                    *slot = self.memory.read_u8(base + i).unwrap_or(0);
+                }
+                let code = self.ems_mut().set_name(handle, name).err().unwrap_or(0);
+                self.set_ah(code);
+            }
+            _ => self.set_ah(0x8f), // undefined subfunction
+        }
+    }
+
+    /// EMS function 57h: copy (or exchange) a region between conventional memory
+    /// and expanded memory per the 18-byte descriptor at DS:SI. The copy goes
+    /// through temporary buffers so overlapping move regions stay correct.
+    fn ems_move_exchange(&mut self, exchange: bool) {
+        let ds = self.cpu.registers.segment(SegmentIndex::Ds).base;
+        let si = self.cpu.registers.esi() as u16;
+        let d = ds as usize + usize::from(si);
+        let length = self.memory.read_u32(d).unwrap_or(0);
+        let src = XferEnd {
+            kind: self.memory.read_u8(d + 4).unwrap_or(0),
+            handle: self.memory.read_u16(d + 5).unwrap_or(0),
+            offset: self.memory.read_u16(d + 7).unwrap_or(0),
+            seg_or_page: self.memory.read_u16(d + 9).unwrap_or(0),
+        };
+        let dst = XferEnd {
+            kind: self.memory.read_u8(d + 11).unwrap_or(0),
+            handle: self.memory.read_u16(d + 12).unwrap_or(0),
+            offset: self.memory.read_u16(d + 14).unwrap_or(0),
+            seg_or_page: self.memory.read_u16(d + 16).unwrap_or(0),
+        };
+        // Read the source (and, for exchange, the destination) into buffers first.
+        let mut src_buf = vec![0u8; length as usize];
+        for (i, byte) in src_buf.iter_mut().enumerate() {
+            match self.ems_xfer_addr(&src, i as u32) {
+                Ok(addr) => *byte = self.memory.read_u8(addr as usize).unwrap_or(0),
+                Err(code) => return self.set_ah(code),
+            }
+        }
+        if exchange {
+            let mut dst_buf = vec![0u8; length as usize];
+            for (i, byte) in dst_buf.iter_mut().enumerate() {
+                match self.ems_xfer_addr(&dst, i as u32) {
+                    Ok(addr) => *byte = self.memory.read_u8(addr as usize).unwrap_or(0),
+                    Err(code) => return self.set_ah(code),
+                }
+            }
+            for i in 0..length {
+                if let Ok(addr) = self.ems_xfer_addr(&src, i) {
+                    let _ = self.memory.write_u8(addr as usize, dst_buf[i as usize]);
+                }
+            }
+        }
+        for i in 0..length {
+            match self.ems_xfer_addr(&dst, i) {
+                Ok(addr) => {
+                    let _ = self.memory.write_u8(addr as usize, src_buf[i as usize]);
+                }
+                Err(code) => return self.set_ah(code),
+            }
+        }
+        self.set_ah(ems::status::OK);
+    }
+
+    /// The physical address of byte `i` of a move/exchange endpoint: a flat
+    /// segment:offset for conventional memory, or the backing page for EMS.
+    fn ems_xfer_addr(&self, end: &XferEnd, i: u32) -> Result<u32, u8> {
+        let pos = u32::from(end.offset) + i;
+        if end.kind == 0 {
+            Ok((u32::from(end.seg_or_page) << 4) + pos)
+        } else {
+            self.ems().backing_addr(end.handle, end.seg_or_page, pos)
         }
     }
 
@@ -7834,6 +8002,47 @@ mod tests {
             0x00,
             "an unmapped slot falls through to flat RAM"
         );
+    }
+
+    #[test]
+    fn ems_57h_moves_conventional_memory_into_expanded_memory() {
+        const PROG: [u8; 2] = [0xCD, 0x20];
+        let mut p = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        p.emm386 = Emm386Mode::Ram;
+        let mut machine = Machine::new_dos_program(p, &PROG).unwrap();
+        let handle = machine.ems.as_mut().unwrap().allocate(1).unwrap();
+        // Source bytes in conventional memory at 0x10000 (segment 0x1000:0).
+        for (i, byte) in [0xDE, 0xAD, 0xBE, 0xEF].iter().enumerate() {
+            machine.write_physical_u8(0x1_0000 + i as u32, *byte);
+        }
+        // An 18-byte move descriptor at 0000:2000: 4 bytes, conventional 0x1000:0 ->
+        // EMS handle, logical page 0, offset 0.
+        let d = 0x2000usize;
+        machine.memory.write_u32(d, 4).unwrap();
+        machine.memory.write_u8(d + 4, 0).unwrap(); // src kind: conventional
+        machine.memory.write_u16(d + 5, 0).unwrap();
+        machine.memory.write_u16(d + 7, 0).unwrap(); // src offset
+        machine.memory.write_u16(d + 9, 0x1000).unwrap(); // src segment
+        machine.memory.write_u8(d + 11, 1).unwrap(); // dst kind: EMS
+        machine.memory.write_u16(d + 12, handle).unwrap();
+        machine.memory.write_u16(d + 14, 0).unwrap(); // dst offset
+        machine.memory.write_u16(d + 16, 0).unwrap(); // dst logical page
+        machine.cpu.registers.set_eax(0x5700); // AH=57h move
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0));
+        machine.cpu.registers.set_esi(0x2000);
+        machine.handle_int67();
+        assert_eq!(
+            (machine.cpu.registers.eax() >> 8) & 0xff,
+            0,
+            "the move reports success (AH=0)"
+        );
+        // Map the destination page into the frame and read the moved bytes back.
+        machine.ems.as_mut().unwrap().map(0, 0, handle).unwrap();
+        assert_eq!(machine.read_physical_u8(0x0E_0000), 0xDE);
+        assert_eq!(machine.read_physical_u8(0x0E_0003), 0xEF);
     }
 
     #[test]
