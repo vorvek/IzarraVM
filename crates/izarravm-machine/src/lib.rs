@@ -677,10 +677,18 @@ impl Machine {
     /// from the new mode. Must run before any guest XMS or EMS allocation; at
     /// SYSINIT none has happened yet, so re-partitioning strands no live handle.
     pub fn set_emm386_mode(&mut self, mode: Emm386Mode) -> Result<(), MachineError> {
-        self.profile.emm386 = mode;
-        let (xms, ems) = build_xms_ems(self.profile.memory_mib, mode);
-        self.xms = xms;
-        self.ems = ems;
+        // Rebuild the XMS/EMS partition only when the mode actually changes. A warm
+        // reboot (INT 19h) re-enters SYSINIT with the same CONFIG.SYS, so the mode is
+        // unchanged and the live XMS EMBs, HMA claim, A20 nesting, and EMS pages are
+        // left intact; wholesale-replacing them would strand a guest's allocations
+        // while the CPU, RAM, and A20 gate keep running. A genuine mode change runs
+        // only at the first SYSINIT (before any guest allocation), so it is safe.
+        if self.profile.emm386 != mode {
+            self.profile.emm386 = mode;
+            let (xms, ems) = build_xms_ems(self.profile.memory_mib, mode);
+            self.xms = xms;
+            self.ems = ems;
+        }
         self.furnish_dos_upper_memory()
     }
 
@@ -943,9 +951,10 @@ impl Machine {
             dos.install_environment(memory, &entries)?;
         }
         machine.furnish_dos_upper_memory()?;
-        // A directly-loaded program runs in a DOS=UMB environment (the default), so
-        // it sees the UMB area linked, the way a program inherits the boot link
-        // state on a real DOS=HIGH,UMB box.
+        // A directly-loaded program runs in the default DOS=UMB environment, so it
+        // inherits the boot link state of a real DOS=HIGH,UMB box: AH=5803h is
+        // allowed and the UMB area comes up linked.
+        machine.dos.set_dos_umb(true);
         if machine.dos.has_umb_arena() {
             machine.dos.set_umb_link(true);
         }
@@ -2650,9 +2659,12 @@ impl Machine {
                 };
                 match result {
                     Ok(Ok(seg)) => {
-                        // AX=1 success, BX=segment, DX=size. Set AX directly rather
-                        // than xms_success(), which would zero BL and corrupt the
-                        // low byte of the returned segment.
+                        // AX=1 success, BX=segment, DX=size. DX echoes the granted
+                        // size rather than the larger ceiling the block could grow to;
+                        // that is conservative (a guest never over-allocates) and a
+                        // 12h reallocate discovers the real ceiling. Set AX directly
+                        // rather than xms_success(), which would zero BL and corrupt
+                        // the low byte of the returned segment.
                         self.set_bx(seg);
                         self.set_dx(paras);
                         self.set_ax(1);
@@ -2694,12 +2706,11 @@ impl Machine {
                 };
                 match result {
                     Ok(Ok(())) => self.xms_success(),
-                    Ok(Err(0)) => self.xms_failure(xms::err::INVALID_UMB_SEGMENT),
-                    Ok(Err(largest)) => {
+                    Ok(Err(Some(largest))) => {
                         self.set_dx(largest);
                         self.xms_failure(xms::err::UMB_SMALLER_AVAILABLE);
                     }
-                    Err(_) => self.xms_failure(xms::err::INVALID_UMB_SEGMENT),
+                    Ok(Err(None)) | Err(_) => self.xms_failure(xms::err::INVALID_UMB_SEGMENT),
                 }
             }
             // Unimplemented function: AX=0, BL=80h (not implemented).
@@ -4472,16 +4483,18 @@ impl Machine {
             dos.init_shell_base(memory, DOS_LOAD_SEGMENT, &env)?;
         }
         // CONFIG.SYS DEVICE=EMM386 / DOS=UMB drive the memory manager at SYSINIT.
-        // A present, readable file overrides the izarravm.conf mode (re-laying the
-        // layout); otherwise the config-time mode stands and the shipped default's
-        // DOS=UMB links the area. Either way, DOS=UMB links a non-empty arena so a
-        // default box comes up with UMBs linked, like a real DOS=HIGH,UMB machine.
+        // A present, readable file applies its mode (re-laying the layout only when
+        // it differs from the current mode); with no readable file the last-applied
+        // mode stands (the construction mode on a cold boot) and the shipped
+        // default's DOS=UMB is assumed. DOS=UMB links a non-empty arena so a default
+        // box comes up with UMBs linked, like a real DOS=HIGH,UMB machine.
         let config = self.read_config_sys();
         match config {
             Some(cfg) => self.set_emm386_mode(cfg.emm386)?,
             None => self.furnish_dos_upper_memory()?,
         }
         let dos_umb = config.map(|c| c.dos_umb).unwrap_or(true);
+        self.dos.set_dos_umb(dos_umb);
         if dos_umb && self.dos.has_umb_arena() {
             self.dos.set_umb_link(true);
         }
@@ -8209,6 +8222,31 @@ mod tests {
         // Re-applying RAM brings the frame and EMS back.
         machine.set_emm386_mode(Emm386Mode::Ram).unwrap();
         assert!(machine.ems.is_some(), "RAM restores EMS");
+    }
+
+    #[test]
+    fn re_applying_the_same_mode_preserves_live_xms_allocations() {
+        const PROG: [u8; 2] = [0xCD, 0x20];
+        let mut m =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
+                .unwrap();
+        // A guest allocates a 64 KB XMS EMB (AH=09h).
+        m.cpu.registers.set_eax(0x0900);
+        m.cpu.registers.set_edx(64);
+        m.handle_xms();
+        assert_eq!(m.cpu.registers.eax() as u16, 1, "alloc ok");
+        let handle = m.cpu.registers.edx() as u16;
+        // A warm reboot re-applies the same mode. The destructive rebuild must be
+        // skipped, so the live EMB survives: locking it (AH=0Ch) still succeeds.
+        m.set_emm386_mode(Emm386Mode::Ram).unwrap();
+        m.cpu.registers.set_eax(0x0c00);
+        m.cpu.registers.set_edx(u32::from(handle));
+        m.handle_xms();
+        assert_eq!(
+            m.cpu.registers.eax() as u16,
+            1,
+            "the EMB survives a same-mode re-apply, not stranded"
+        );
     }
 
     #[test]

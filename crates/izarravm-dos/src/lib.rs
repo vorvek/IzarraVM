@@ -988,6 +988,11 @@ pub struct DosKernel {
     // machine sets it from the EMM386 mode; it gates opening the EMMXXXX0 device
     // and listing it in the device chain, the way a guest detects expanded memory.
     ems_present: bool,
+    // Whether CONFIG.SYS carried DOS=UMB. Real DOS lets a program link the upper
+    // area through AH=5803h only when the box was loaded with DOS=UMB; without it,
+    // upper memory is reachable only through the XMS Request UMB primitive. The
+    // machine sets this from the parsed CONFIG.SYS.
+    dos_umb: bool,
     // Handles a guest has opened on the EMMXXXX0 device (AH=3Dh), so AH=44h IOCTL
     // and AH=3Eh close treat them as the device rather than a host file.
     ems_handles: HashSet<u16>,
@@ -1070,7 +1075,10 @@ impl DosKernel {
         mem: &mut Memory,
     ) -> Result<(), DosError> {
         if paras < 2 {
+            // No upper memory: drop the arena and the link, keeping the invariant
+            // that a linked state always has an arena behind it.
             self.umb = None;
+            self.umb_link = false;
             return Ok(());
         }
         // One free 'Z' block: the header takes the first paragraph, the rest is the
@@ -1182,6 +1190,12 @@ impl DosKernel {
         self.umb_link = linked;
     }
 
+    /// Record whether CONFIG.SYS carried DOS=UMB, which gates whether AH=5803h may
+    /// link the upper area at all. The machine sets this at SYSINIT.
+    pub fn set_dos_umb(&mut self, configured: bool) {
+        self.dos_umb = configured;
+    }
+
     /// XMS function 10h Request UMB: carve `paras` paragraphs from the SAME
     /// upper-memory MCB chain the AH=48h-high path uses, so the two never hand out
     /// the same paragraph. Ok(Ok(segment)), Ok(Err(largest data paras / 0 when the
@@ -1211,24 +1225,25 @@ impl DosKernel {
     }
 
     /// XMS function 12h Reallocate UMB: resize the upper-memory block at `seg` to
-    /// `paras`. Ok(Ok(())), Ok(Err(largest data paras)) when a grow does not fit,
-    /// Ok(Err(0)) when `seg` is not a UMB block.
+    /// `paras`. Ok(Ok(())); Ok(Err(Some(largest))) when a grow does not fit (the
+    /// caller maps it to B0h with the largest size); Ok(Err(None)) when `seg` is not
+    /// a UMB block (B2h).
     pub fn resize_umb(
         &mut self,
         seg: u16,
         paras: u16,
         mem: &mut Memory,
-    ) -> Result<Result<(), u16>, DosError> {
+    ) -> Result<Result<(), Option<u16>>, DosError> {
         let Some(u) = self.umb else {
-            return Ok(Err(0));
+            return Ok(Err(None));
         };
         if !(u.first_mcb..u.top).contains(&seg) {
-            return Ok(Err(0));
+            return Ok(Err(None));
         }
         match resize_block(u.first_mcb, u.top, seg, paras, mem)? {
             Ok(()) => Ok(Ok(())),
-            Err(ResizeError::TooBig(largest)) => Ok(Err(largest)),
-            Err(ResizeError::InvalidBlock) => Ok(Err(0)),
+            Err(ResizeError::TooBig(largest)) => Ok(Err(Some(largest))),
+            Err(ResizeError::InvalidBlock) => Ok(Err(None)),
         }
     }
 
@@ -3361,9 +3376,11 @@ impl DosKernel {
                     Ok(DosAction::Continue)
                 }
                 0x03 => {
-                    // With no UMB area to link (no EMM386 / DOS not loaded with UMB),
-                    // the call fails with AX=0001h, the way real DOS reports it.
-                    if self.umb.is_none() {
+                    // Linking the upper area is allowed only when the box was loaded
+                    // with DOS=UMB and an arena exists. Without either, the call fails
+                    // with AX=0001h, the way real DOS reports a machine loaded without
+                    // DOS=UMB (a program must then use the XMS Request UMB primitive).
+                    if !self.dos_umb || self.umb.is_none() {
                         set_dos_error(regs, 0x01);
                         return Ok(DosAction::Continue);
                     }
@@ -5145,8 +5162,9 @@ mod tests {
     fn ah58_umb_link_state_round_trips() {
         let mut kernel = DosKernel::new();
         let mut mem = Memory::new(1024 * 1024).unwrap();
-        // A UMB area must exist for the link to be meaningful.
+        // A DOS=UMB box with a UMB area, so the link is allowed and meaningful.
         kernel.set_umb_region(0xc800, 0x2800, &mut mem).unwrap();
+        kernel.set_dos_umb(true);
         // UMBs are unlinked by default.
         let mut regs = DosRegs {
             ax: 0x5802,
@@ -5194,6 +5212,49 @@ mod tests {
         kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
         assert!(regs.cf, "linking with no UMB area fails");
         assert_eq!(regs.ax, 0x01);
+    }
+
+    #[test]
+    fn ah5803_link_fails_when_dos_umb_was_not_configured() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        // EMM386 furnished a UMB arena, but CONFIG.SYS had no DOS=UMB, so the DOS
+        // link path is unavailable (a program must use XMS Request UMB instead).
+        kernel.set_umb_region(0xc800, 0x2800, &mut mem).unwrap();
+        kernel.set_dos_umb(false);
+        let mut regs = DosRegs {
+            ax: 0x5803,
+            bx: 0x0001,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(regs.cf, "linking without DOS=UMB fails even with an arena");
+        assert_eq!(regs.ax, 0x01);
+        // The XMS Request UMB primitive still works without DOS=UMB.
+        assert!(matches!(kernel.request_umb(0x10, &mut mem), Ok(Ok(_))));
+    }
+
+    #[test]
+    fn resize_umb_distinguishes_too_big_from_an_invalid_segment() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        kernel.set_umb_region(0xc800, 0x2800, &mut mem).unwrap();
+        let a = match kernel.request_umb(0x10, &mut mem).unwrap() {
+            Ok(seg) => seg,
+            other => panic!("expected a UMB, got {other:?}"),
+        };
+        // Carve a second block so A is no longer the top block.
+        let _b = kernel.request_umb(0x10, &mut mem).unwrap();
+        // Growing the now-non-top block A has nowhere to go: Some(largest) -> B0h.
+        match kernel.resize_umb(a, 0x100, &mut mem).unwrap() {
+            Err(Some(largest)) => assert_eq!(largest, 0x10, "B0h reports the current size"),
+            other => panic!("expected Err(Some(_)), got {other:?}"),
+        }
+        // A segment that is not a UMB is None -> B2h.
+        assert!(matches!(
+            kernel.resize_umb(0x0050, 0x10, &mut mem),
+            Ok(Err(None))
+        ));
     }
 
     #[test]
@@ -5274,9 +5335,11 @@ mod tests {
     fn umb_test_kernel() -> (DosKernel, Memory) {
         let mut kernel = DosKernel::new();
         let mut mem = Memory::new(1024 * 1024).unwrap();
-        // Conventional program 0x0100-0x1100, then a 160 KiB UMB pool at 0xC800.
+        // Conventional program 0x0100-0x1100, then a 160 KiB UMB pool at 0xC800,
+        // on a DOS=UMB box so AH=5803h may link it.
         kernel.init_program(0x0100, 0x1100, &mut mem).unwrap();
         kernel.set_umb_region(0xc800, 0x2800, &mut mem).unwrap();
+        kernel.set_dos_umb(true);
         (kernel, mem)
     }
 
@@ -5374,6 +5437,7 @@ mod tests {
         let mut mem = Memory::new(1024 * 1024).unwrap();
         kernel.init_program(0x0100, 0x1100, &mut mem).unwrap();
         kernel.set_umb_region(0xc800, 0x2800, &mut mem).unwrap();
+        kernel.set_dos_umb(true);
         // A guest links UMBs and picks a high strategy.
         link_umbs(&mut kernel, &mut mem);
         set_alloc_strategy(&mut kernel, &mut mem, 0x0040);
@@ -5391,6 +5455,7 @@ mod tests {
         // A program filling almost all of conventional memory: a tiny free tail.
         kernel.init_program(0x0100, 0x9f00, &mut mem).unwrap();
         kernel.set_umb_region(0xc800, 0x2800, &mut mem).unwrap();
+        kernel.set_dos_umb(true);
         link_umbs(&mut kernel, &mut mem);
         set_alloc_strategy(&mut kernel, &mut mem, 0x0080); // high then low
         // Request more than either arena holds: both fail. The larger free tail is
