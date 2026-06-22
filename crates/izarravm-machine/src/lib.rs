@@ -304,6 +304,11 @@ pub struct Machine {
     // headless runs and unit tests finish inside their cycle budgets. The GUI
     // clears it after construction to keep the full power-on experience.
     fast_post: bool,
+    // Booter-inert mode: when set, the Toka-DOS HLE and IEMM stand down so a
+    // self-booting disk owns the DOS/memory-manager interrupts through the IVT
+    // (the BIOS services stay intercepted). The single chokepoint that other
+    // phases branch on; nothing auto-detects a booter yet, so it defaults off.
+    booter_inert: bool,
     // INT 33h mouse-driver HLE state: virtual cursor position, button mask,
     // visibility, motion-counter accumulators, and the configured ranges. The
     // PS/2 aux device is the hardware side; this is the DOS driver a game calls.
@@ -488,6 +493,7 @@ impl Machine {
             rtc: rtc::Rtc::new(),
             rtc_seconds: 0.0,
             fast_post: true,
+            booter_inert: false,
             mouse: MouseState::default(),
             unittester: unittester::UnitTester::default(),
             test_snapshot_path: None,
@@ -519,6 +525,20 @@ impl Machine {
     /// the GUI to keep the full power-on screen and timing.
     pub fn set_fast_post(&mut self, fast: bool) {
         self.fast_post = fast;
+    }
+
+    /// Enter or leave booter-inert mode. When set, the Toka-DOS HLE and IEMM stop
+    /// intercepting the DOS/memory-manager interrupts (0x20/0x21/0x25/0x26/0x28/
+    /// 0x29/0x2F/0x66), so a self-booting disk's own handlers run through the IVT;
+    /// the BIOS services stay intercepted. The booter track sets this; nothing
+    /// auto-detects a booter yet.
+    pub fn set_booter_inert(&mut self, inert: bool) {
+        self.booter_inert = inert;
+    }
+
+    /// Whether booter-inert mode is active.
+    pub fn booter_inert(&self) -> bool {
+        self.booter_inert
     }
 
     /// Whether the PC speaker was ever enabled (port 0x61 bit 1 driven high). The
@@ -942,6 +962,7 @@ impl Machine {
             active_mode: self.active_mode,
             pending_mode: &mut self.pending_mode,
             fast_post: self.fast_post,
+            booter_inert: self.booter_inert,
             pending_toka_service: &mut self.pending_toka_service,
             toka_service_status: self.toka_service_status,
             unittester: &mut self.unittester,
@@ -4658,6 +4679,7 @@ impl Machine {
                     trace,
                     pending_soft_int,
                     fast_post,
+                    booter_inert,
                     pending_toka_service,
                     toka_service_status,
                     unittester,
@@ -4692,6 +4714,7 @@ impl Machine {
                     active_mode: *active_mode,
                     pending_mode,
                     fast_post: *fast_post,
+                    booter_inert: *booter_inert,
                     pending_toka_service,
                     toka_service_status: *toka_service_status,
                     unittester,
@@ -4872,6 +4895,7 @@ struct MachineBus<'a> {
     active_mode: GswMode,                       // a copy, for the 0xE1 read
     pending_mode: &'a mut Option<GswMode>,      // a 0xE1 write records the request here
     fast_post: bool,                            // a copy, for the 0xE2 POST-pacing read
+    booter_inert: bool,                         // a copy, stands the HLE down at INT-ack
     pending_toka_service: &'a mut Option<u8>,   // a 0xE3 write records the command
     toka_service_status: u8,                    // a copy, for the 0xE3 status read
     unittester: &'a mut unittester::UnitTester, // Lotura ports 0xE4-0xE6
@@ -5190,7 +5214,15 @@ impl CpuBus for MachineBus<'_> {
         // video service; 0x20/0x21 are the DOS kernel. Vector 0x10 reaches here
         // only from a software INT today (the CPU never faults with vector 0x10);
         // revisit if an x87 #MF is added.
-        if matches!(
+        //
+        // In booter-inert mode the DOS kernel, absolute-disk, multiplex, and XMS
+        // vectors stand down so a self-booting disk owns them through the IVT; the
+        // BIOS hardware services (0x10-0x1A) and the mouse stay intercepted.
+        let dos_or_iemm = matches!(
+            vector,
+            0x20 | 0x21 | 0x25 | 0x26 | 0x28 | 0x29 | 0x2F | 0x66
+        );
+        let intercepted = matches!(
             vector,
             0x10 | 0x11
                 | 0x12
@@ -5210,7 +5242,8 @@ impl CpuBus for MachineBus<'_> {
                 | 0x2F
                 | 0x33
                 | 0x66
-        ) {
+        );
+        if intercepted && !(self.booter_inert && dos_or_iemm) {
             *self.pending_soft_int = Some(vector);
         }
         Ok(())
@@ -7753,6 +7786,52 @@ mod tests {
     }
 
     #[test]
+    fn booter_inert_stands_down_dos_vectors_but_keeps_the_bios() {
+        let mut m = int15_machine(16);
+
+        // By default the HLE intercepts INT 21h (the DOS kernel).
+        m.make_bus().interrupt_acknowledge(0x21, 0).unwrap();
+        assert_eq!(
+            m.pending_soft_int,
+            Some(0x21),
+            "INT 21h is intercepted by default"
+        );
+        m.pending_soft_int = None;
+
+        // Booter-inert mode stands the DOS/IEMM vectors down so the guest's own
+        // handlers run through the IVT.
+        m.set_booter_inert(true);
+        assert!(m.booter_inert());
+        m.make_bus().interrupt_acknowledge(0x21, 0).unwrap();
+        assert_eq!(
+            m.pending_soft_int, None,
+            "INT 21h stands down in booter mode"
+        );
+        m.make_bus().interrupt_acknowledge(0x2f, 0).unwrap();
+        assert_eq!(
+            m.pending_soft_int, None,
+            "INT 2Fh (multiplex/XMS) stands down too"
+        );
+        m.make_bus().interrupt_acknowledge(0x66, 0).unwrap();
+        assert_eq!(m.pending_soft_int, None, "INT 66h (XMS) stands down too");
+
+        // The BIOS hardware services stay intercepted even in booter mode.
+        m.make_bus().interrupt_acknowledge(0x10, 0).unwrap();
+        assert_eq!(
+            m.pending_soft_int,
+            Some(0x10),
+            "INT 10h (BIOS video) stays intercepted"
+        );
+        m.pending_soft_int = None;
+        m.make_bus().interrupt_acknowledge(0x13, 0).unwrap();
+        assert_eq!(
+            m.pending_soft_int,
+            Some(0x13),
+            "INT 13h (BIOS disk) stays intercepted"
+        );
+    }
+
+    #[test]
     fn int11_returns_equipment_word() {
         // Stub: INT 11h then halt. AX must hold the seeded BDA equipment word.
         // The BIOS service vectors return through the ROM IRET at offset 0xF000
@@ -8589,6 +8668,7 @@ mod tests {
             active_mode: machine.active_mode,
             pending_mode: &mut machine.pending_mode,
             fast_post: machine.fast_post,
+            booter_inert: machine.booter_inert,
             pending_toka_service: &mut machine.pending_toka_service,
             toka_service_status: machine.toka_service_status,
             unittester: &mut machine.unittester,
