@@ -39,8 +39,8 @@ pub enum MemRegion {
     UpperMemory,
     /// System BIOS ROM, 0xF0000-0xFFFFF.
     SystemRom,
-    /// Extended memory, 0x100000 and up. The first ~64 KiB is also the HMA (see
-    /// `is_hma`); physically it is the same extended RAM.
+    /// Extended memory, 0x100000 and up. The first 64 KiB minus 16 bytes is also
+    /// the HMA (see `is_hma`); physically it is the same extended RAM.
     Extended,
 }
 
@@ -48,10 +48,10 @@ pub enum MemRegion {
 /// 1 MiB boundary are Extended (use `is_hma` to pick out the HMA window within).
 pub fn classify(addr: u32) -> MemRegion {
     match addr {
-        a if a < CONVENTIONAL_TOP => MemRegion::Conventional,
-        a if a < UPPER_MEMORY_BASE => MemRegion::VideoRam,
-        a if a < SYSTEM_ROM_BASE => MemRegion::UpperMemory,
-        a if a < HMA_BASE => MemRegion::SystemRom,
+        0..CONVENTIONAL_TOP => MemRegion::Conventional,
+        CONVENTIONAL_TOP..UPPER_MEMORY_BASE => MemRegion::VideoRam,
+        UPPER_MEMORY_BASE..SYSTEM_ROM_BASE => MemRegion::UpperMemory,
+        SYSTEM_ROM_BASE..HMA_BASE => MemRegion::SystemRom,
         _ => MemRegion::Extended,
     }
 }
