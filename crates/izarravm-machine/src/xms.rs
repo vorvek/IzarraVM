@@ -315,10 +315,13 @@ impl XmsState {
         }
     }
 
-    /// Set the `/HMAMIN=` threshold in KB (HIMEM accepts 0-63). Function 01h then
-    /// rejects a request below this size with [`err::HMA_MIN_NOT_MET`].
+    /// Set the `/HMAMIN=` threshold in KB. Function 01h then rejects a request
+    /// below this size with [`err::HMA_MIN_NOT_MET`]. HIMEM accepts 0-63; the
+    /// value is clamped to 63 so the threshold can never exceed the HMA itself
+    /// (a threshold of 64 KB or more would reject even the 0xFFFF whole-HMA
+    /// request and leave the HMA permanently unclaimable).
     pub fn set_hma_min_kb(&mut self, kb: u16) {
-        self.hma_min_bytes = u32::from(kb) * 1024;
+        self.hma_min_bytes = u32::from(kb.min(63)) * 1024;
     }
 
     /// Function 00h reports DX=1 when the HMA exists. The Izarra 3000 always has
@@ -553,6 +556,16 @@ mod tests {
         // With no /HMAMIN, even a zero-size request is granted (HIMEM default).
         xms.request_hma(0)
             .expect("default /HMAMIN=0 grants any request");
+    }
+
+    #[test]
+    fn hmamin_is_clamped_so_the_hma_stays_claimable() {
+        let mut xms = XmsState::new(16);
+        // An out-of-range /HMAMIN must not exceed the HMA: the whole-HMA request
+        // still succeeds rather than the HMA becoming permanently unclaimable.
+        xms.set_hma_min_kb(64);
+        xms.request_hma(0xFFFF)
+            .expect("a clamped /HMAMIN still admits the whole-HMA request");
     }
 
     #[test]
