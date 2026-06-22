@@ -7829,6 +7829,14 @@ mod tests {
             Some(0x13),
             "INT 13h (BIOS disk) stays intercepted"
         );
+
+        // A vector the HLE never intercepts is recorded in neither mode.
+        m.pending_soft_int = None;
+        m.make_bus().interrupt_acknowledge(0x80, 0).unwrap();
+        assert_eq!(
+            m.pending_soft_int, None,
+            "an un-intercepted vector is ignored"
+        );
     }
 
     #[test]
