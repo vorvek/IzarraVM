@@ -1284,6 +1284,10 @@ impl DosKernel {
             return Ok(DosAction::Continue);
         };
         write_fcb_find_record(mem, self.dta, &first)?;
+        // The cursor is keyed by the DTA, the same map the handle find (AH=4Eh/4Fh)
+        // uses. Real DOS keeps an FCB search's cursor in the search FCB at DS:DX, so
+        // a guest that moves the DTA between AH=11h and AH=12h, or interleaves a
+        // handle find at the same DTA, is not honored (a documented HLE limitation).
         self.find_searches
             .insert(self.dta, FindSearch { entries, next: 1 });
         regs.ax &= 0xff00; // AL=00h found
@@ -3652,14 +3656,14 @@ fn write_fcb_find_record(
     }
     mem.write_u8(base, FCB_FIND_DRIVE)?;
     fcb_set_name(mem, base, &entry.name)?; // name at +1, ext at +9 (the entry name field)
-    mem.write_u8(base + 0x0c, entry.attr)?; // entry +11 attribute
-    // entry +12 reserved (10 bytes) stays zero
-    mem.write_u16(base + 0x17, entry.time)?; // entry +22 time
-    mem.write_u16(base + 0x19, entry.date)?; // entry +24 date
-    // entry +26 starting cluster: the HLE has no FAT, so this is a placeholder
+    mem.write_u8(base + 0x0c, entry.attr)?; // entry+0x0B attribute
+    // entry+0x0C reserved (10 bytes) stays zero
+    mem.write_u16(base + 0x17, entry.time)?; // entry+0x16 time
+    mem.write_u16(base + 0x19, entry.date)?; // entry+0x18 date
+    // entry+0x1A starting cluster: the HLE has no FAT, so this is a placeholder
     // until the FAT32 facade lands. FAT-walking copy protection is out of scope.
     mem.write_u16(base + 0x1b, 0)?;
-    mem.write_u32(base + 0x1d, entry.size)?; // entry +28 file size
+    mem.write_u32(base + 0x1d, entry.size)?; // entry+0x1C file size (truncated past 4 GiB)
     Ok(())
 }
 
@@ -6720,6 +6724,15 @@ mod tests {
             fcb_kernel(&[("A.TXT", b"aa"), ("B.TXT", b"bbb"), ("C.DAT", b"c")]);
         place_fcb(&mut mem, 0, "????????.TXT");
 
+        // Read-dir order is filesystem-dependent, so collect both names as a set.
+        let stem = |mem: &Memory| -> String {
+            (0..8)
+                .map(|i| mem.read_u8(FCB_DTA + 0x01 + i).unwrap() as char)
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+
         let r1 = fcb_call(&mut kernel, &mut mem, 0x11);
         assert_eq!(r1.ax & 0xff, 0x00, "first .TXT match found");
         assert_eq!(mem.read_u8(FCB_DTA).unwrap(), 3, "drive C: = 3");
@@ -6727,9 +6740,19 @@ mod tests {
             .map(|i| mem.read_u8(FCB_DTA + 0x09 + i).unwrap())
             .collect();
         assert_eq!(&ext, b"TXT", "the extension field is TXT");
+        let first = stem(&mem);
 
         let r2 = fcb_call(&mut kernel, &mut mem, 0x12);
         assert_eq!(r2.ax & 0xff, 0x00, "second .TXT match found");
+        let second = stem(&mem);
+
+        let mut got = [first, second];
+        got.sort();
+        assert_eq!(
+            got,
+            ["A".to_string(), "B".to_string()],
+            "both .TXT files, distinct records"
+        );
 
         let r3 = fcb_call(&mut kernel, &mut mem, 0x12);
         assert_eq!(r3.ax & 0xff, 0xff, "only two .TXT files, then exhausted");
@@ -6756,6 +6779,21 @@ mod tests {
             100,
             "file size dword"
         );
+        assert_eq!(
+            mem.read_u16(FCB_DTA + 0x1b).unwrap(),
+            0,
+            "starting cluster is the no-FAT placeholder"
+        );
+        // The 10 reserved bytes between the attribute and the time stay zero, which
+        // also pins that the attribute, time, date, cluster, and size offsets do not
+        // overlap.
+        for off in 0x0d..0x17 {
+            assert_eq!(
+                mem.read_u8(FCB_DTA + off).unwrap(),
+                0,
+                "reserved byte cleared"
+            );
+        }
     }
 
     #[test]
@@ -6764,6 +6802,24 @@ mod tests {
         place_fcb(&mut mem, 0, "NOPE.ZZZ");
         let r = fcb_call(&mut kernel, &mut mem, 0x11);
         assert_eq!(r.ax & 0xff, 0xff);
+    }
+
+    #[test]
+    fn fcb_find_excludes_directories() {
+        let (mut kernel, mut mem, dir) = fcb_kernel(&[("FILE.TXT", b"x")]);
+        std::fs::create_dir(dir.path().join("SUBDIR")).unwrap();
+        place_fcb(&mut mem, 0, "????????.???");
+
+        let r1 = fcb_call(&mut kernel, &mut mem, 0x11);
+        assert_eq!(r1.ax & 0xff, 0x00);
+        let name: Vec<u8> = (0..8)
+            .map(|i| mem.read_u8(FCB_DTA + 0x01 + i).unwrap())
+            .collect();
+        assert_eq!(&name, b"FILE    ", "the file, not the directory");
+        // The directory was filtered by attr_matches(attr, 0), so only the file
+        // matched and find-next is immediately exhausted.
+        let r2 = fcb_call(&mut kernel, &mut mem, 0x12);
+        assert_eq!(r2.ax & 0xff, 0xff, "the SUBDIR directory was excluded");
     }
 
     #[test]
