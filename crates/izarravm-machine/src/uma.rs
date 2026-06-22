@@ -67,6 +67,13 @@ impl UmaReservationMap {
         &self.reservations
     }
 
+    /// Drop every reservation, returning the window to fully free. The memory
+    /// manager re-runs its layout from scratch on each DOS init (SYSINIT), so
+    /// reservations do not carry across a warm reboot.
+    pub fn reset(&mut self) {
+        self.reservations.clear();
+    }
+
     /// Mark a fixed ROM span occupied so it is never handed out as a UMB or the
     /// EMS frame. Returns false (and reserves nothing) if the span falls outside
     /// the window or overlaps an existing reservation.
@@ -130,6 +137,13 @@ impl UmaReservationMap {
     /// Total free bytes left in the window.
     pub fn total_free(&self) -> u32 {
         self.free_holes().iter().map(|&(_, size)| size).sum()
+    }
+
+    /// The largest contiguous free hole as (base, size), or None when the window
+    /// is full. Used to hand the whole upper-memory pool to one consumer and to
+    /// report the largest block an XMS Request UMB could satisfy.
+    pub fn largest_free_hole(&self) -> Option<(u32, u32)> {
+        self.free_holes().into_iter().max_by_key(|&(_, size)| size)
     }
 
     /// The free holes between reservations, as (base, size), in address order.
