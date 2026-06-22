@@ -23,6 +23,8 @@ pub mod err {
     pub const HMA_DOES_NOT_EXIST: u8 = 0x90;
     /// HMA is already in use.
     pub const HMA_IN_USE: u8 = 0x91;
+    /// DX (space requested) is less than the /HMAMIN= parameter.
+    pub const HMA_MIN_NOT_MET: u8 = 0x92;
     /// HMA is not allocated.
     pub const HMA_NOT_ALLOCATED: u8 = 0x93;
     /// All extended memory is allocated.
@@ -284,6 +286,10 @@ pub struct XmsState {
     backend: Box<dyn EmbBackend + Send>,
     /// True once a guest has claimed the HMA (function 01h) and not released it.
     hma_allocated: bool,
+    /// The `/HMAMIN=` threshold in bytes: function 01h rejects a request whose DX
+    /// (space needed) is below this, so the HMA stays free for a larger claimant.
+    /// Default 0 grants any request, matching HIMEM with no /HMAMIN given.
+    hma_min_bytes: u32,
     /// Local-enable nesting count for A20 functions 05h/06h. The spec lets a
     /// program enable A20 locally several times; A20 only drops when the count
     /// reaches zero again. The actual gate lives in the 8042, driven by the caller.
@@ -304,8 +310,18 @@ impl XmsState {
         Self {
             backend: Box::new(FlatEmbAllocator::new(pool_base, pool_kb)),
             hma_allocated: false,
+            hma_min_bytes: 0,
             local_a20_count: 0,
         }
+    }
+
+    /// Set the `/HMAMIN=` threshold in KB. Function 01h then rejects a request
+    /// below this size with [`err::HMA_MIN_NOT_MET`]. HIMEM accepts 0-63; the
+    /// value is clamped to 63 so the threshold can never exceed the HMA itself
+    /// (a threshold of 64 KB or more would reject even the 0xFFFF whole-HMA
+    /// request and leave the HMA permanently unclaimable).
+    pub fn set_hma_min_kb(&mut self, kb: u16) {
+        self.hma_min_bytes = u32::from(kb.min(63)) * 1024;
     }
 
     /// Function 00h reports DX=1 when the HMA exists. The Izarra 3000 always has
@@ -314,15 +330,19 @@ impl XmsState {
         true
     }
 
-    /// Try to claim the HMA (function 01h). Real HIMEM checks the requested size
-    /// in DX against an `/HMAMIN`; we grant any request as long as the HMA is
-    /// free. Returns the error code on failure.
-    pub fn request_hma(&mut self) -> Result<(), u8> {
+    /// Try to claim the HMA (function 01h). `space_needed` is DX, the bytes the
+    /// caller wants (an application passes 0xFFFF for the whole HMA). Per the XMS
+    /// spec the order is: exists, not already in use, then the /HMAMIN size gate.
+    /// Returns the error code on failure.
+    pub fn request_hma(&mut self, space_needed: u16) -> Result<(), u8> {
         if !self.hma_exists() {
             return Err(err::HMA_DOES_NOT_EXIST);
         }
         if self.hma_allocated {
             return Err(err::HMA_IN_USE);
+        }
+        if u32::from(space_needed) < self.hma_min_bytes {
+            return Err(err::HMA_MIN_NOT_MET);
         }
         self.hma_allocated = true;
         Ok(())
@@ -510,10 +530,42 @@ mod tests {
     #[test]
     fn hma_claim_is_exclusive() {
         let mut xms = XmsState::new(16);
-        xms.request_hma().expect("first claim");
-        assert_eq!(xms.request_hma(), Err(err::HMA_IN_USE));
+        // 0xFFFF is the "application wants the whole HMA" request.
+        xms.request_hma(0xFFFF).expect("first claim");
+        assert_eq!(xms.request_hma(0xFFFF), Err(err::HMA_IN_USE));
         xms.release_hma().expect("release");
         assert_eq!(xms.release_hma(), Err(err::HMA_NOT_ALLOCATED));
+    }
+
+    #[test]
+    fn hma_request_below_hmamin_is_rejected() {
+        let mut xms = XmsState::new(16);
+        xms.set_hma_min_kb(16); // /HMAMIN=16 -> 16384 bytes
+        // A small TSR-sized request is refused so the HMA stays free for DOS.
+        assert_eq!(xms.request_hma(8 * 1024), Err(err::HMA_MIN_NOT_MET));
+        // The HMA is still free after a rejected request.
+        assert!(!xms.hma_allocated);
+        // A request at or above the threshold (or the whole-HMA sentinel) succeeds.
+        xms.request_hma(0xFFFF)
+            .expect("a full-HMA claim clears /HMAMIN");
+    }
+
+    #[test]
+    fn default_hmamin_grants_any_size() {
+        let mut xms = XmsState::new(16);
+        // With no /HMAMIN, even a zero-size request is granted (HIMEM default).
+        xms.request_hma(0)
+            .expect("default /HMAMIN=0 grants any request");
+    }
+
+    #[test]
+    fn hmamin_is_clamped_so_the_hma_stays_claimable() {
+        let mut xms = XmsState::new(16);
+        // An out-of-range /HMAMIN must not exceed the HMA: the whole-HMA request
+        // still succeeds rather than the HMA becoming permanently unclaimable.
+        xms.set_hma_min_kb(64);
+        xms.request_hma(0xFFFF)
+            .expect("a clamped /HMAMIN still admits the whole-HMA request");
     }
 
     #[test]

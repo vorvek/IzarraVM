@@ -2351,9 +2351,11 @@ impl Machine {
                 self.set_bx(xms::DRIVER_REVISION);
                 self.set_dx(u16::from(self.xms.hma_exists()));
             }
-            // 01h request HMA, 02h release HMA.
+            // 01h request HMA, 02h release HMA. DX carries the space the caller
+            // needs (0xFFFF means the whole HMA); request_hma gates it on /HMAMIN.
             0x01 => {
-                let result = self.xms.request_hma();
+                let space_needed = self.cpu.registers.edx() as u16;
+                let result = self.xms.request_hma(space_needed);
                 self.xms_result(result);
             }
             0x02 => {
@@ -4217,6 +4219,14 @@ impl Machine {
         self.test_snapshot_path = path;
     }
 
+    /// Set the HMA minimum-request threshold in KB, the `/HMAMIN=` HIMEM
+    /// parameter. XMS function 01h then refuses a request below this size so the
+    /// HMA stays free for a larger claimant (such as DOS=HIGH). The config wiring
+    /// that parses the CONFIG.SYS HIMEM line will drive this.
+    pub fn set_hma_min_kb(&mut self, kb: u16) {
+        self.xms.set_hma_min_kb(kb);
+    }
+
     /// Execute a unit-tester command deferred from a 0xE6 write. Returns the exit
     /// code for `CMD_EXIT` so the run loop can stop; `None` otherwise.
     fn perform_unittester(&mut self, cmd: u8) -> Option<u8> {
@@ -5142,6 +5152,17 @@ struct MachineBus<'a> {
     io_touched: &'a mut bool,
 }
 
+/// The A20 gate clears address line 20 when it is closed. With the gate off, any
+/// physical address with bit 20 set folds down by 0x100000, so a real-mode
+/// program reaching 0x100000-0x10FFEF (the most a seg:off pair can address) wraps
+/// back to 0x0-0xFFEF, the classic 1 MiB wraparound the HMA depends on. The
+/// effect is intentionally global, matching A20M# on real hardware: bit 20 is
+/// cleared on every physical address, so high ROM (0xFFFF0000) and the upper half
+/// of the Margo LFB alias down too when the gate is closed. That is unreachable
+/// in normal use, since A20 powers on enabled and stays so unless a guest
+/// deliberately closes it.
+const A20_MASK: u32 = !(1 << 20);
+
 impl CpuBus for MachineBus<'_> {
     fn read_memory(
         &mut self,
@@ -5149,6 +5170,7 @@ impl CpuBus for MachineBus<'_> {
         width: BusWidth,
         kind: BusAccessKind,
     ) -> Result<u32, BusError> {
+        let address = self.apply_a20(address);
         if should_split(address, width) {
             let mut value = 0u32;
             for offset in 0..width.bytes() {
@@ -5181,6 +5203,7 @@ impl CpuBus for MachineBus<'_> {
         value: u32,
         kind: BusAccessKind,
     ) -> Result<(), BusError> {
+        let address = self.apply_a20(address);
         if should_split(address, width) {
             for offset in 0..width.bytes() {
                 self.write_memory(
@@ -5887,6 +5910,20 @@ impl MachineBus<'_> {
         port.checked_sub(self.wss_base).filter(|&off| off < 8)
     }
 
+    /// Apply the A20 gate to a physical address before it reaches memory. The gate
+    /// is the single 8042 output-port bit (shared with fast-A20 port 0x92); when
+    /// it is closed, address line 20 is forced low. This is the motherboard-level
+    /// effect, so it sits at the one CPU bus seam and covers fetches and data
+    /// alike. Host-side pokes (write_physical_u8 and friends) deliberately bypass
+    /// it: they address exact physical cells, not the guest's gated bus.
+    fn apply_a20(&self, address: u32) -> u32 {
+        if self.keyboard.a20_enabled() {
+            address
+        } else {
+            address & A20_MASK
+        }
+    }
+
     /// The plane-window offset for an access that the guest-selected GC06 graphics
     /// aperture redirects, or None when the access is not in a moved graphics
     /// window. Only graphics modes consult the aperture; text and CGA keep the
@@ -6591,6 +6628,189 @@ mod tests {
             );
         }
         assert!(m.keyboard.a20_enabled(), "8042 agrees A20 is on");
+    }
+
+    #[test]
+    fn a20_off_folds_the_hma_onto_low_memory() {
+        let mut m = int15_machine(16);
+        // A20 is on by default, so 0x0 and 0x100000 are distinct cells.
+        {
+            let mut bus = m.make_bus();
+            bus.write_memory(0x0, BusWidth::Byte, 0xAA, BusAccessKind::DataWrite)
+                .unwrap();
+            bus.write_memory(0x10_0000, BusWidth::Byte, 0xBB, BusAccessKind::DataWrite)
+                .unwrap();
+            assert_eq!(
+                bus.read_memory(0x10_0000, BusWidth::Byte, BusAccessKind::DataRead)
+                    .unwrap(),
+                0xBB,
+                "a distinct extended cell with A20 on"
+            );
+        }
+        // Close the gate: a write to 0x100000 now folds onto 0x0.
+        m.keyboard.set_a20(false);
+        {
+            let mut bus = m.make_bus();
+            bus.write_memory(0x10_0000, BusWidth::Byte, 0xCC, BusAccessKind::DataWrite)
+                .unwrap();
+            assert_eq!(
+                bus.read_memory(0x0, BusWidth::Byte, BusAccessKind::DataRead)
+                    .unwrap(),
+                0xCC,
+                "the HMA write reached 0x0 through the closed gate"
+            );
+        }
+        // Reopen the gate: the real extended cell was never touched (still 0xBB).
+        m.keyboard.set_a20(true);
+        {
+            let mut bus = m.make_bus();
+            assert_eq!(
+                bus.read_memory(0x10_0000, BusWidth::Byte, BusAccessKind::DataRead)
+                    .unwrap(),
+                0xBB,
+                "the aliased write left the extended cell alone"
+            );
+        }
+    }
+
+    #[test]
+    fn a20_off_folds_a_split_word_in_the_hma() {
+        let mut m = int15_machine(16);
+        m.keyboard.set_a20(false);
+        let mut bus = m.make_bus();
+        // 0x100001 is odd, so the word splits; with the gate closed each byte
+        // folds down by 0x100000, landing the pair at 0x1 and 0x2. (The byte just
+        // below 1 MiB, 0xFFFFF, is BIOS ROM, so the genuinely straddling write is
+        // not observable there; the odd HMA word proves the same split masking.)
+        bus.write_memory(0x10_0001, BusWidth::Word, 0xBEEF, BusAccessKind::DataWrite)
+            .unwrap();
+        assert_eq!(
+            bus.read_memory(0x1, BusWidth::Byte, BusAccessKind::DataRead)
+                .unwrap(),
+            0xEF,
+            "low byte folded to 0x1"
+        );
+        assert_eq!(
+            bus.read_memory(0x2, BusWidth::Byte, BusAccessKind::DataRead)
+                .unwrap(),
+            0xBE,
+            "high byte folded to 0x2"
+        );
+        assert_eq!(
+            bus.read_memory(0x10_0001, BusWidth::Word, BusAccessKind::DataRead)
+                .unwrap(),
+            0xBEEF,
+            "the folded word reads back through the HMA alias"
+        );
+    }
+
+    #[test]
+    fn a20_off_folds_a_split_dword_and_reads_back() {
+        let mut m = int15_machine(16);
+        m.keyboard.set_a20(false);
+        let mut bus = m.make_bus();
+        // 0x100001 is not 4-aligned, so the dword splits into four bytes, each
+        // folding down by 0x100000 to 0x1..0x4.
+        bus.write_memory(
+            0x10_0001,
+            BusWidth::Dword,
+            0xDEAD_BEEF,
+            BusAccessKind::DataWrite,
+        )
+        .unwrap();
+        // The read side folds too: the dword reads back through the alias.
+        assert_eq!(
+            bus.read_memory(0x10_0001, BusWidth::Dword, BusAccessKind::DataRead)
+                .unwrap(),
+            0xDEAD_BEEF,
+            "the dword reads back through the HMA alias"
+        );
+        // The low-memory bytes hold the little-endian image.
+        assert_eq!(
+            bus.read_memory(0x1, BusWidth::Byte, BusAccessKind::DataRead)
+                .unwrap(),
+            0xEF,
+            "byte 0 folded to 0x1"
+        );
+        assert_eq!(
+            bus.read_memory(0x4, BusWidth::Byte, BusAccessKind::DataRead)
+                .unwrap(),
+            0xDE,
+            "byte 3 folded to 0x4"
+        );
+    }
+
+    #[test]
+    fn a20_on_keeps_a_split_word_in_the_hma() {
+        let mut m = int15_machine(16); // A20 on by default
+        let mut bus = m.make_bus();
+        bus.write_memory(0x10_0001, BusWidth::Word, 0xBEEF, BusAccessKind::DataWrite)
+            .unwrap();
+        // Low memory is untouched; the word stays at the real HMA cells.
+        assert_eq!(
+            bus.read_memory(0x1, BusWidth::Byte, BusAccessKind::DataRead)
+                .unwrap(),
+            0x00,
+            "0x1 untouched with A20 on"
+        );
+        assert_eq!(
+            bus.read_memory(0x10_0001, BusWidth::Word, BusAccessKind::DataRead)
+                .unwrap(),
+            0xBEEF,
+            "the word stayed in the HMA"
+        );
+    }
+
+    #[test]
+    fn hma_is_claimable_and_a20_gates_its_visibility() {
+        let mut m = int15_machine(16);
+        // Claim the HMA through XMS function 01h (DX=0xFFFF: the whole HMA).
+        m.cpu.registers.set_eax(0x0100);
+        m.cpu.registers.set_edx(0xFFFF);
+        m.handle_xms();
+        assert_eq!(
+            m.cpu.registers.eax() as u16,
+            0x0001,
+            "AH=01h claim succeeds"
+        );
+
+        // With A20 on (default), the HMA is real RAM: write FFFF:0010 (0x100000)
+        // and read it back.
+        {
+            let mut bus = m.make_bus();
+            bus.write_memory(0x10_0000, BusWidth::Word, 0x1234, BusAccessKind::DataWrite)
+                .unwrap();
+            assert_eq!(
+                bus.read_memory(0x10_0000, BusWidth::Word, BusAccessKind::DataRead)
+                    .unwrap(),
+                0x1234,
+                "the HMA holds the write with A20 open"
+            );
+        }
+
+        // A second claim is refused while the HMA is held.
+        m.cpu.registers.set_eax(0x0100);
+        m.cpu.registers.set_edx(0xFFFF);
+        m.handle_xms();
+        assert_eq!(m.cpu.registers.eax() as u16, 0x0000, "second claim fails");
+        assert_eq!(
+            m.cpu.registers.ebx() as u8,
+            xms::err::HMA_IN_USE,
+            "BL = HMA already in use"
+        );
+
+        // Closing A20 hides the HMA: 0x100000 folds down to low memory (0x0,
+        // still zero), so the previously written value is no longer visible.
+        m.keyboard.set_a20(false);
+        {
+            let mut bus = m.make_bus();
+            assert_eq!(
+                bus.read_memory(0x10_0000, BusWidth::Word, BusAccessKind::DataRead)
+                    .unwrap(),
+                0x0000,
+                "with A20 closed the HMA folds away and 0x100000 reads low memory"
+            );
+        }
     }
 
     #[test]
