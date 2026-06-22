@@ -2532,10 +2532,12 @@ impl DosKernel {
                     Ok(DosAction::Continue)
                 }
                 0x01 => {
-                    // The nine valid strategies: low 2 bits select the fit, bits 6-7
-                    // the memory area. DOS rejects anything else.
-                    if is_valid_alloc_strategy(regs.bx) {
-                        self.alloc_strategy = regs.bx;
+                    // DOS 5+ keys off BL (BH is expected 0 and ignored). The nine
+                    // valid strategies: low 2 bits select the fit, bits 6-7 the
+                    // memory area. DOS rejects anything else.
+                    let strategy = regs.bx & 0x00ff;
+                    if is_valid_alloc_strategy(strategy) {
+                        self.alloc_strategy = strategy;
                         regs.cf = false;
                     } else {
                         set_dos_error(regs, 0x01); // invalid strategy
@@ -4033,10 +4035,27 @@ mod tests {
             ..Default::default()
         };
         kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf, "the get after a rejected set still clears CF");
         assert_eq!(
             regs.ax, 0x0001,
             "the valid strategy survived the rejected set"
         );
+
+        // A high-memory strategy (0x40 last-fit area bits) round-trips too, so the
+        // full nine-value set is honored, not just the low-memory three.
+        let mut regs = DosRegs {
+            ax: 0x5801,
+            bx: 0x0042,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf, "a high-memory strategy is accepted");
+        let mut regs = DosRegs {
+            ax: 0x5800,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(regs.ax, 0x0042, "the high-memory strategy reads back");
     }
 
     #[test]
