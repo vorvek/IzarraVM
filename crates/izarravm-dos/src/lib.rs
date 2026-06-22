@@ -1239,6 +1239,100 @@ impl DosKernel {
         Ok(DosAction::Continue)
     }
 
+    /// AH=11h FIND FIRST using an FCB. The search FCB at DS:DX holds an 8.3 name
+    /// with '?'/'*' wildcards. Enumerate C:, snapshot the matches, write the first
+    /// as a directory entry into the DTA, and keep the cursor for AH=12h. AL=00h
+    /// found, 0xFFh on no match or no drive. An extended FCB (0xFF prefix) carries
+    /// a search attribute so directories, hidden, and system entries can be
+    /// returned; a normal FCB returns normal files only. Volume-label search
+    /// (attribute 0x08) is not modeled, the HLE having no volume label.
+    fn fcb_find_first(
+        &mut self,
+        mem: &mut Memory,
+        regs: &mut DosRegs,
+    ) -> Result<DosAction, DosError> {
+        let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+        let (name_base, search_attr, extended) = fcb_search_header(mem, base)?;
+        let name = fcb_name(mem, name_base, FCB_NAME)?;
+        let Some(drive) = self.drive.as_ref() else {
+            regs.ax = (regs.ax & 0xff00) | 0xff;
+            return Ok(DosAction::Continue);
+        };
+        let pattern = pattern_to_8_3(&name.to_ascii_uppercase());
+        let mut entries = Vec::new();
+        if let Ok(read_dir) = std::fs::read_dir(drive.root()) {
+            for dirent in read_dir.flatten() {
+                let raw = dirent.file_name();
+                let Some(host) = raw.to_str() else { continue };
+                let Some(template) = host_name_to_8_3(host) else {
+                    continue;
+                };
+                if !template_matches(&template, &pattern) {
+                    continue;
+                }
+                let Ok(metadata) = dirent.metadata() else {
+                    continue;
+                };
+                let attr = if metadata.is_dir() { 0x10 } else { 0x00 };
+                // A normal FCB (search attribute 0) returns only normal files; an
+                // extended FCB's attribute also admits directories, hidden, etc.
+                if !attr_matches(attr, search_attr) {
+                    continue;
+                }
+                let (time, date) =
+                    dos_time_date(metadata.modified().unwrap_or(std::time::UNIX_EPOCH));
+                entries.push(FindEntry {
+                    attr,
+                    time,
+                    date,
+                    size: metadata.len() as u32,
+                    name: host.to_ascii_uppercase(),
+                });
+            }
+        }
+        let Some(first) = entries.first().cloned() else {
+            regs.ax = (regs.ax & 0xff00) | 0xff;
+            return Ok(DosAction::Continue);
+        };
+        write_fcb_find_record(mem, self.dta, &first, extended)?;
+        // The cursor is keyed by the DTA, the same map the handle find (AH=4Eh/4Fh)
+        // uses. Real DOS keeps an FCB search's cursor in the search FCB at DS:DX, so
+        // a guest that moves the DTA between AH=11h and AH=12h, or interleaves a
+        // handle find at the same DTA, is not honored (a documented HLE limitation).
+        self.find_searches
+            .insert(self.dta, FindSearch { entries, next: 1 });
+        regs.ax &= 0xff00; // AL=00h found
+        Ok(DosAction::Continue)
+    }
+
+    /// AH=12h FIND NEXT using an FCB. Continue the search keyed by the current DTA,
+    /// writing the next directory entry in the normal or extended result format
+    /// (re-read from the unchanged search FCB's 0xFF prefix). AL=00h, or 0xFFh
+    /// when exhausted.
+    fn fcb_find_next(
+        &mut self,
+        mem: &mut Memory,
+        regs: &mut DosRegs,
+    ) -> Result<DosAction, DosError> {
+        let dta = self.dta;
+        // The search FCB is unchanged across the find (RBIL), so re-read whether it
+        // is extended to choose the result format.
+        let extended = mem.read_u8(usize::from(regs.ds) * 16 + usize::from(regs.dx))? == 0xff;
+        let Some(search) = self.find_searches.get_mut(&dta) else {
+            regs.ax = (regs.ax & 0xff00) | 0xff;
+            return Ok(DosAction::Continue);
+        };
+        let Some(entry) = search.entries.get(search.next).cloned() else {
+            self.find_searches.remove(&dta);
+            regs.ax = (regs.ax & 0xff00) | 0xff;
+            return Ok(DosAction::Continue);
+        };
+        search.next += 1;
+        write_fcb_find_record(mem, dta, &entry, extended)?;
+        regs.ax &= 0xff00; // AL=00h
+        Ok(DosAction::Continue)
+    }
+
     /// AH=17h RENAME FCB. The FCB at DS:DX holds the old 8.3 name at 0x01 and the
     /// new 8.3 name at 0x11. AL=00 on success, 0xFF on a missing source or host
     /// error. Wildcards in the names are not expanded (marked); the common case is
@@ -3050,9 +3144,11 @@ impl DosKernel {
             0x27 => self.fcb_random_block_read(mem, regs),
             0x28 => self.fcb_random_block_write(mem, regs),
             0x29 => self.fcb_parse_filename(mem, regs),
-            // Other file functions (find) and everything else are not yet
-            // implemented; later slices fill them in. An unimplemented function
-            // returns Continue so the IRET stub returns to the caller.
+            0x11 => self.fcb_find_first(mem, regs),
+            0x12 => self.fcb_find_next(mem, regs),
+            // Everything else is not yet implemented; later slices fill it in. An
+            // unimplemented function returns Continue so the IRET stub returns to
+            // the caller.
             _ => Ok(DosAction::Continue),
         }
     }
@@ -3627,6 +3723,59 @@ fn write_find_record(mem: &mut Memory, dta: (u16, u16), entry: &FindEntry) -> Re
     for i in 0..13 {
         mem.write_u8(base + 0x1e + i, name.get(i).copied().unwrap_or(0))?;
     }
+    Ok(())
+}
+
+/// Drive number (1-based) the FCB find result reports. C: is the only mounted
+/// FCB drive, so a normal-FCB find always reports drive 3.
+const FCB_FIND_DRIVE: u8 = 3;
+
+/// Inspect a search FCB at `base`. A normal FCB has its name at +1 and searches
+/// for normal files only. An extended FCB starts with 0xFF: five reserved bytes,
+/// a search-attribute byte at +6, a drive byte at +7, then the normal FCB fields
+/// at +7 onward, so the name is at +8. Returns the base `fcb_name` reads the name
+/// from, the search attribute (0 for a normal FCB), and whether it is extended.
+fn fcb_search_header(mem: &Memory, base: usize) -> Result<(usize, u8, bool), DosError> {
+    if mem.read_u8(base)? == 0xff {
+        Ok((base + 7, mem.read_u8(base + 6)?, true))
+    } else {
+        Ok((base, 0, false))
+    }
+}
+
+/// Write an FCB find result (AH=11h/12h) into the DTA. A normal result is the
+/// drive number at +0 followed by the 32-byte directory entry at +1. An extended
+/// result prepends the extended header: 0xFF at +0, five reserved bytes, the
+/// found file's attribute at +6, the drive at +7, then the directory entry at +8.
+/// fcb_set_name lands the name/ext exactly on the entry's name field, and the
+/// whole thing doubles as an unopened FCB.
+fn write_fcb_find_record(
+    mem: &mut Memory,
+    dta: (u16, u16),
+    entry: &FindEntry,
+    extended: bool,
+) -> Result<(), DosError> {
+    let base = usize::from(dta.0) * 16 + usize::from(dta.1);
+    let dirent = if extended { base + 8 } else { base + 1 };
+    for i in base..dirent + 0x20 {
+        mem.write_u8(i, 0)?;
+    }
+    if extended {
+        mem.write_u8(base, 0xff)?;
+        mem.write_u8(base + 6, entry.attr)?; // extended-header attribute byte
+        mem.write_u8(base + 7, FCB_FIND_DRIVE)?;
+    } else {
+        mem.write_u8(base, FCB_FIND_DRIVE)?;
+    }
+    fcb_set_name(mem, dirent - 1, &entry.name)?; // name at the entry start, ext +8
+    mem.write_u8(dirent + 0x0b, entry.attr)?; // entry+0x0B attribute
+    // entry+0x0C reserved (10 bytes) stays zero
+    mem.write_u16(dirent + 0x16, entry.time)?; // entry+0x16 time
+    mem.write_u16(dirent + 0x18, entry.date)?; // entry+0x18 date
+    // entry+0x1A starting cluster: the HLE has no FAT, so this is a placeholder
+    // until the FAT32 facade lands. FAT-walking copy protection is out of scope.
+    mem.write_u16(dirent + 0x1a, 0)?;
+    mem.write_u32(dirent + 0x1c, entry.size)?; // entry+0x1C file size (truncated past 4 GiB)
     Ok(())
 }
 
@@ -6973,6 +7122,229 @@ mod tests {
         assert!(!dir.path().join("A.DAT").exists());
         assert!(!dir.path().join("B.DAT").exists());
         assert!(dir.path().join("KEEP.TXT").exists(), "non-match kept");
+    }
+
+    // The DTA the FCB helpers use: init_program sets it to PSP:0x80 = 0x1080.
+    const FCB_DTA: usize = 0x0100 * 16 + 0x80;
+
+    #[test]
+    fn fcb_find_first_and_next_enumerate_txt_files() {
+        let (mut kernel, mut mem, _dir) =
+            fcb_kernel(&[("A.TXT", b"aa"), ("B.TXT", b"bbb"), ("C.DAT", b"c")]);
+        place_fcb(&mut mem, 0, "????????.TXT");
+
+        // Read-dir order is filesystem-dependent, so collect both names as a set.
+        let stem = |mem: &Memory| -> String {
+            (0..8)
+                .map(|i| mem.read_u8(FCB_DTA + 0x01 + i).unwrap() as char)
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+
+        let r1 = fcb_call(&mut kernel, &mut mem, 0x11);
+        assert_eq!(r1.ax & 0xff, 0x00, "first .TXT match found");
+        assert_eq!(mem.read_u8(FCB_DTA).unwrap(), 3, "drive C: = 3");
+        let ext: Vec<u8> = (0..3)
+            .map(|i| mem.read_u8(FCB_DTA + 0x09 + i).unwrap())
+            .collect();
+        assert_eq!(&ext, b"TXT", "the extension field is TXT");
+        let first = stem(&mem);
+
+        let r2 = fcb_call(&mut kernel, &mut mem, 0x12);
+        assert_eq!(r2.ax & 0xff, 0x00, "second .TXT match found");
+        let second = stem(&mem);
+
+        let mut got = [first, second];
+        got.sort();
+        assert_eq!(
+            got,
+            ["A".to_string(), "B".to_string()],
+            "both .TXT files, distinct records"
+        );
+
+        let r3 = fcb_call(&mut kernel, &mut mem, 0x12);
+        assert_eq!(r3.ax & 0xff, 0xff, "only two .TXT files, then exhausted");
+    }
+
+    #[test]
+    fn fcb_find_first_fills_name_attribute_and_size() {
+        let (mut kernel, mut mem, _dir) = fcb_kernel(&[("DATA.BIN", &[0u8; 100])]);
+        place_fcb(&mut mem, 0, "DATA.BIN");
+
+        let r = fcb_call(&mut kernel, &mut mem, 0x11);
+        assert_eq!(r.ax & 0xff, 0x00);
+        let name: Vec<u8> = (0..8)
+            .map(|i| mem.read_u8(FCB_DTA + 0x01 + i).unwrap())
+            .collect();
+        assert_eq!(&name, b"DATA    ", "8-char blank-padded name");
+        assert_eq!(
+            mem.read_u8(FCB_DTA + 0x0c).unwrap(),
+            0x00,
+            "normal file attribute"
+        );
+        assert_eq!(
+            mem.read_u32(FCB_DTA + 0x1d).unwrap(),
+            100,
+            "file size dword"
+        );
+        assert_eq!(
+            mem.read_u16(FCB_DTA + 0x1b).unwrap(),
+            0,
+            "starting cluster is the no-FAT placeholder"
+        );
+        // The 10 reserved bytes between the attribute and the time stay zero, which
+        // also pins that the attribute, time, date, cluster, and size offsets do not
+        // overlap.
+        for off in 0x0d..0x17 {
+            assert_eq!(
+                mem.read_u8(FCB_DTA + off).unwrap(),
+                0,
+                "reserved byte cleared"
+            );
+        }
+    }
+
+    #[test]
+    fn fcb_find_first_no_match_returns_ff() {
+        let (mut kernel, mut mem, _dir) = fcb_kernel(&[("A.TXT", b"x")]);
+        place_fcb(&mut mem, 0, "NOPE.ZZZ");
+        let r = fcb_call(&mut kernel, &mut mem, 0x11);
+        assert_eq!(r.ax & 0xff, 0xff);
+    }
+
+    #[test]
+    fn fcb_find_excludes_directories() {
+        let (mut kernel, mut mem, dir) = fcb_kernel(&[("FILE.TXT", b"x")]);
+        std::fs::create_dir(dir.path().join("SUBDIR")).unwrap();
+        place_fcb(&mut mem, 0, "????????.???");
+
+        let r1 = fcb_call(&mut kernel, &mut mem, 0x11);
+        assert_eq!(r1.ax & 0xff, 0x00);
+        let name: Vec<u8> = (0..8)
+            .map(|i| mem.read_u8(FCB_DTA + 0x01 + i).unwrap())
+            .collect();
+        assert_eq!(&name, b"FILE    ", "the file, not the directory");
+        // The directory was filtered by attr_matches(attr, 0), so only the file
+        // matched and find-next is immediately exhausted.
+        let r2 = fcb_call(&mut kernel, &mut mem, 0x12);
+        assert_eq!(r2.ax & 0xff, 0xff, "the SUBDIR directory was excluded");
+    }
+
+    // Place an extended search FCB at DS:DX=0100:0200: 0xFF header, five reserved
+    // bytes, the search attribute at +6, the drive at +7, and the 8.3 name at +8.
+    fn place_extended_fcb(mem: &mut Memory, search_attr: u8, drive: u8, name: &str) {
+        let base = 0x0100usize * 16 + 0x0200;
+        mem.write_u8(base, 0xff).unwrap();
+        for i in 1..6 {
+            mem.write_u8(base + i, 0).unwrap();
+        }
+        mem.write_u8(base + 6, search_attr).unwrap();
+        mem.write_u8(base + 7, drive).unwrap();
+        let (stem, ext) = name.split_once('.').unwrap_or((name, ""));
+        for i in 0..8 {
+            mem.write_u8(
+                base + 8 + i,
+                stem.as_bytes().get(i).copied().unwrap_or(b' '),
+            )
+            .unwrap();
+        }
+        for i in 0..3 {
+            mem.write_u8(
+                base + 16 + i,
+                ext.as_bytes().get(i).copied().unwrap_or(b' '),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn fcb_extended_find_returns_a_directory_a_normal_fcb_excludes() {
+        let (mut kernel, mut mem, dir) = fcb_kernel(&[]);
+        std::fs::create_dir(dir.path().join("SUBDIR")).unwrap();
+
+        // A normal FCB find excludes the directory.
+        place_fcb(&mut mem, 0, "????????.???");
+        let n = fcb_call(&mut kernel, &mut mem, 0x11);
+        assert_eq!(
+            n.ax & 0xff,
+            0xff,
+            "a normal FCB find does not return a directory"
+        );
+
+        // An extended FCB carrying the directory search attribute returns it, in the
+        // extended result format (0xFF header, attribute at +6, drive at +7, the
+        // directory entry at +8).
+        place_extended_fcb(&mut mem, 0x10, 0, "????????.???");
+        let e = fcb_call(&mut kernel, &mut mem, 0x11);
+        assert_eq!(e.ax & 0xff, 0x00, "the extended search finds the directory");
+        assert_eq!(mem.read_u8(FCB_DTA).unwrap(), 0xff, "extended FCB header");
+        assert_eq!(mem.read_u8(FCB_DTA + 7).unwrap(), 3, "drive C: = 3");
+        let name: Vec<u8> = (0..8)
+            .map(|i| mem.read_u8(FCB_DTA + 8 + i).unwrap())
+            .collect();
+        assert_eq!(&name, b"SUBDIR  ", "the directory name in the entry");
+        assert_eq!(
+            mem.read_u8(FCB_DTA + 8 + 0x0b).unwrap(),
+            0x10,
+            "directory attribute in the entry"
+        );
+    }
+
+    #[test]
+    fn fcb_extended_find_normal_file_uses_extended_result_format() {
+        let (mut kernel, mut mem, _dir) = fcb_kernel(&[("DATA.BIN", &[0u8; 50])]);
+        place_extended_fcb(&mut mem, 0x00, 0, "DATA.BIN");
+
+        let r = fcb_call(&mut kernel, &mut mem, 0x11);
+        assert_eq!(r.ax & 0xff, 0x00);
+        assert_eq!(mem.read_u8(FCB_DTA).unwrap(), 0xff, "extended header");
+        assert_eq!(
+            mem.read_u8(FCB_DTA + 6).unwrap(),
+            0x00,
+            "the file attribute in the header"
+        );
+        assert_eq!(mem.read_u8(FCB_DTA + 7).unwrap(), 3, "drive");
+        let name: Vec<u8> = (0..8)
+            .map(|i| mem.read_u8(FCB_DTA + 8 + i).unwrap())
+            .collect();
+        assert_eq!(&name, b"DATA    ");
+        assert_eq!(
+            mem.read_u32(FCB_DTA + 8 + 0x1c).unwrap(),
+            50,
+            "size in the entry"
+        );
+    }
+
+    #[test]
+    fn fcb_extended_find_next_keeps_the_extended_format() {
+        let (mut kernel, mut mem, _dir) = fcb_kernel(&[("A.TXT", b"a"), ("B.TXT", b"b")]);
+        place_extended_fcb(&mut mem, 0x00, 0, "????????.TXT");
+
+        let r1 = fcb_call(&mut kernel, &mut mem, 0x11);
+        assert_eq!(r1.ax & 0xff, 0x00, "first .TXT match");
+        assert_eq!(
+            mem.read_u8(FCB_DTA).unwrap(),
+            0xff,
+            "find-first extended header"
+        );
+
+        // Find-next re-reads the unchanged FCB and keeps the extended format.
+        let r2 = fcb_call(&mut kernel, &mut mem, 0x12);
+        assert_eq!(r2.ax & 0xff, 0x00, "second .TXT match");
+        assert_eq!(
+            mem.read_u8(FCB_DTA).unwrap(),
+            0xff,
+            "find-next keeps the extended header"
+        );
+        assert_eq!(
+            mem.read_u8(FCB_DTA + 7).unwrap(),
+            3,
+            "drive in the extended header"
+        );
+
+        let r3 = fcb_call(&mut kernel, &mut mem, 0x12);
+        assert_eq!(r3.ax & 0xff, 0xff, "exhausted");
     }
 
     #[test]
