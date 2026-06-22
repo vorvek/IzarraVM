@@ -1,4 +1,5 @@
 pub use fat12::build_fat12;
+pub use fat32::{Fat32Geometry, fat32_geometry};
 use izarravm_audio::{OplChip, Resampler, SbDsp, SbMixer};
 use izarravm_bus::{BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CpuBus, Memory};
 use izarravm_core::{GswMode, HardwareProfile, SoundBlasterConfig, VideoCard};
@@ -18,6 +19,7 @@ mod atapi;
 mod cdimage;
 mod dma;
 mod fat12;
+mod fat32;
 mod fdc;
 mod floppy;
 mod ide;
