@@ -8046,6 +8046,46 @@ mod tests {
     }
 
     #[test]
+    fn ems_guest_self_check_allocates_maps_and_round_trips_through_the_frame() {
+        // A guest program that drives the EMS manager end to end through the real
+        // INT 67h path: allocate a page (AH=43h), map it into frame slot 0 (AH=44h),
+        // write a byte at the frame and read it back, then report pass (0) or fail
+        // (non-zero) to the Lotura unit-tester exit command. This exercises the whole
+        // path a real game would: the CPU INT, the host interception, and the bus
+        // alias, not the methods in isolation.
+        let rom = rom_with_code(&[
+            0xB4, 0x43, // mov ah, 43h
+            0xBB, 0x01, 0x00, // mov bx, 1
+            0xCD, 0x67, // int 67h            allocate 1 page -> DX = handle
+            0xB4, 0x44, // mov ah, 44h
+            0xB0, 0x00, // mov al, 0
+            0xBB, 0x00, 0x00, // mov bx, 0
+            0xCD, 0x67, // int 67h            map logical 0 -> physical slot 0
+            0xB8, 0x00, 0xE0, // mov ax, E000h
+            0x8E, 0xC0, // mov es, ax
+            0x26, 0xC6, 0x06, 0x00, 0x00, 0x5A, // mov byte [es:0], 5Ah
+            0x26, 0xA0, 0x00, 0x00, // mov al, [es:0]   read back through the frame
+            0x2C, 0x5A, // sub al, 5Ah        AL = 0 when the byte round-trips
+            0x88, 0xC3, // mov bl, al         BL = exit code (0 = pass)
+            0xB0, 0x0C, // mov al, 12         Lotura REG_EXIT index
+            0xE6, 0xE4, // out 0E4h, al
+            0x88, 0xD8, // mov al, bl
+            0xE6, 0xE5, // out 0E5h, al       [12] = exit code
+            0xB0, 0x03, // mov al, 3          CMD_EXIT
+            0xE6, 0xE6, // out 0E6h, al
+            0xF4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(
+            reason,
+            StopReason::TestExit { code: 0 },
+            "the guest EMS allocate/map/round-trip self-check passes"
+        );
+    }
+
+    #[test]
     fn rejects_non_64k_roms() {
         let err =
             Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), [0u8; 8]).unwrap_err();
