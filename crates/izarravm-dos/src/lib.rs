@@ -301,9 +301,9 @@ struct Arena {
 /// paragraphs = 0xA0000 bytes) where the video aperture begins. This is the one
 /// source for that boundary across the DOS layer: the allocation arena ends
 /// here, the MCB chain spans up to it, and the .EXE loader clamps a program's
-/// block to it. It matches the hardware-side conventional boundary the region
-/// classifier names (izarravm-machine `memmap::CONVENTIONAL_TOP`); the dos crate
-/// does not depend on that crate, so the value is repeated here, not imported.
+/// block to it. It is the same 640 KiB conventional ceiling the hardware side
+/// models at 0xA0000; the dos crate does not depend on the machine crate, so the
+/// value lives here independently rather than being shared across the two.
 const ARENA_TOP: u16 = 0xa000;
 
 /// Kernel-reserved paragraph holding the AH=52h list-of-lists (SysVars) table.
