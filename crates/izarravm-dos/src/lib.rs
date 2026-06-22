@@ -321,20 +321,25 @@ pub enum DosAction {
     WaitForKey,
 }
 
-/// Conventional memory modeled as one block ending at paragraph 0xA000. The
-/// program owns [psp_seg, prog_top); AH=48h blocks stack upward from free_base.
-/// Bump allocator with a single resizable program block and LIFO
-/// reclaim; no MCB chain, no free-list coalescing, no UMB/HIMEM.
+/// Conventional memory modeled as an authoritative in-RAM MCB chain ending at
+/// paragraph 0xA000. The chain is the source of truth: allocate/free/resize walk
+/// and mutate the real headers a guest reads through AH=52h, so a memory manager
+/// that rewrites a header in place drives the allocator. The arena itself holds
+/// only the current program's PSP and the resident flag; the program top and free
+/// base are read back from the chain. LIFO reclaim, no free-list coalescing (a
+/// freed non-top block leaks until the blocks above it are freed); no UMB/HIMEM.
 #[derive(Debug, Default)]
 struct Arena {
     psp_seg: u16,
-    prog_top: u16,
-    free_base: u16,
-    blocks: Vec<(u16, u16)>, // (segment, paragraphs) in allocation order
-    // AH=31h KEEP PROCESS: the program block stays allocated at termination.
-    // Set once a TSR keeps itself resident; a later free of the program block
-    // is honored as a no-op the same as a normal exit, so nothing changes the
-    // datapath here, but the flag records that the paragraphs are reserved.
+    // The first MCB of this process's chain. For a directly-loaded program it is
+    // psp_seg-1 (the program block heads the chain). An EXEC child's chain starts
+    // one block lower, at its environment block's header, so a guest walking the
+    // child chain sees env -> program -> free.
+    chain_first: u16,
+    // AH=31h KEEP PROCESS: the program block stays allocated at termination. Set
+    // once a TSR keeps itself resident; a later free of the program block is a
+    // no-op the same as a normal exit, so the flag only records that the
+    // paragraphs are reserved.
     resident: bool,
 }
 
@@ -361,223 +366,315 @@ enum ResizeError {
     InvalidBlock,
 }
 
+/// The 8-byte MCB owner name. The program block carries a fixed placeholder (the
+/// loader does not thread the real loaded name down here); other blocks are blank.
+const PROG_NAME: &[u8; 8] = b"TOKAPROG";
+const NO_NAME: &[u8; 8] = b"\0\0\0\0\0\0\0\0";
+
+/// Write one MCB header into guest RAM: the signature ('M' link or 'Z' last), the
+/// owner PSP word (0 = free), the data size in paragraphs, three reserved bytes,
+/// and the 8-byte owner name. The header occupies the paragraph at `seg`; the
+/// block's data starts at `seg + 1`.
+fn write_mcb_header(
+    mem: &mut Memory,
+    seg: u16,
+    sig: u8,
+    owner: u16,
+    size: u16,
+    name: &[u8; 8],
+) -> Result<(), DosError> {
+    let base = usize::from(seg) * 16;
+    mem.write_u8(base, sig)?;
+    mem.write_u16(base + 1, owner)?;
+    mem.write_u16(base + 3, size)?;
+    for off in 5..8 {
+        mem.write_u8(base + off, 0)?;
+    }
+    for (off, &b) in name.iter().enumerate() {
+        mem.write_u8(base + 8 + off, b)?;
+    }
+    Ok(())
+}
+
 impl Arena {
-    /// AH=48h: allocate `paras` paragraphs. Ok(data-segment) or Err(largest-available
-    /// data paragraphs). Each block reserves a one-paragraph MCB header at the current
-    /// free_base; the data segment handed to the guest is one paragraph higher, and
-    /// free_base advances past header and data. The largest-available figure already
-    /// subtracts the header paragraph, so a guest retry with that count fits exactly.
-    fn allocate(&mut self, paras: u16) -> Result<u16, u16> {
-        let data_seg = u32::from(self.free_base) + 1; // header sits at free_base
+    /// The program block's MCB header sits one paragraph below the PSP; the chain
+    /// is walked from here.
+    fn first_mcb(&self) -> u16 {
+        self.chain_first
+    }
+
+    /// Walk the authoritative chain from the first MCB.
+    fn chain(&self, mem: &Memory) -> Vec<RamMcb> {
+        read_mcb_chain(mem, self.first_mcb())
+    }
+
+    /// Write the initial chain at program load: the program block, then the free
+    /// remainder up to ARENA_TOP. When the program fills the arena (prog_top ==
+    /// ARENA_TOP) it is itself the last block and there is no free tail. The chain
+    /// is authoritative from here; allocate/free/resize mutate it in place.
+    fn write_initial_chain(&self, mem: &mut Memory, prog_top: u16) -> Result<(), DosError> {
+        let prog_size = prog_top.wrapping_sub(self.psp_seg);
+        if prog_top < ARENA_TOP {
+            write_mcb_header(
+                mem,
+                self.first_mcb(),
+                b'M',
+                self.psp_seg,
+                prog_size,
+                PROG_NAME,
+            )?;
+            write_mcb_header(mem, prog_top, b'Z', 0, ARENA_TOP - prog_top - 1, NO_NAME)?;
+        } else {
+            write_mcb_header(
+                mem,
+                self.first_mcb(),
+                b'Z',
+                self.psp_seg,
+                prog_size,
+                PROG_NAME,
+            )?;
+        }
+        // The chain must read back through the same walker the allocator uses.
+        debug_assert!(
+            self.chain(mem).last().is_some_and(|z| z.sig == b'Z'),
+            "the initial MCB chain must end in a Z block"
+        );
+        Ok(())
+    }
+
+    /// The free tail: (header seg, data size) of the last block when it is free
+    /// (owner 0). None when the arena is full (the last block is owned).
+    fn free_region(&self, mem: &Memory) -> Option<(u16, u16)> {
+        match self.chain(mem).last() {
+            Some(last) if last.owner == 0 => Some((last.mcb_seg, last.size)),
+            _ => None,
+        }
+    }
+
+    /// The program's top-of-memory paragraph (PSP:0x02), derived from the program
+    /// block's size word in the chain. Falls back to psp_seg only if the chain is
+    /// unwritten, which never happens after init_program.
+    fn prog_top(&self, mem: &Memory) -> u16 {
+        // The program block is the one whose data segment is the PSP (an EXEC
+        // child's chain starts at the env block, so it is not necessarily first).
+        self.chain(mem)
+            .iter()
+            .find(|m| m.mcb_seg.wrapping_add(1) == self.psp_seg)
+            .map(|m| m.mcb_seg.wrapping_add(1).wrapping_add(m.size))
+            .unwrap_or(self.psp_seg)
+    }
+
+    /// The first free paragraph above the program block and any allocations: the
+    /// free tail's header segment, where the next AH=48h block lands. ARENA_TOP
+    /// when the arena is full.
+    fn free_base(&self, mem: &Memory) -> u16 {
+        self.free_region(mem)
+            .map(|(seg, _)| seg)
+            .unwrap_or(ARENA_TOP)
+    }
+
+    /// AH=48h: allocate `paras` paragraphs from the free tail. Ok(Ok(data segment))
+    /// on success, Ok(Err(largest-available data paragraphs)) when it does not fit,
+    /// Err(DosError) on a guest memory fault. The block reserves a one-paragraph
+    /// header at the free tail; the data segment handed out is one paragraph higher,
+    /// and the tail shrinks past header and data. Allocation comes only from the
+    /// tail (no first-fit scan of freed holes), preserving LIFO reclaim. The
+    /// largest-available figure already subtracts the header paragraph.
+    fn allocate(&mut self, paras: u16, mem: &mut Memory) -> Result<Result<u16, u16>, DosError> {
+        let Some((free_seg, _)) = self.free_region(mem) else {
+            return Ok(Err(0)); // arena full: no free tail to carve
+        };
+        let data_seg = u32::from(free_seg) + 1; // header sits at free_seg
         let end = data_seg + u32::from(paras); // first free paragraph after the data
         if end <= u32::from(ARENA_TOP) {
             let seg = data_seg as u16;
-            self.blocks.push((seg, paras));
-            self.free_base = end as u16;
-            Ok(seg)
+            if end < u32::from(ARENA_TOP) {
+                // A free tail remains above the new block.
+                write_mcb_header(mem, free_seg, b'M', seg, paras, NO_NAME)?;
+                let new_free = end as u16;
+                write_mcb_header(mem, new_free, b'Z', 0, ARENA_TOP - new_free - 1, NO_NAME)?;
+            } else {
+                // The carve consumes the tail exactly: the new block is the last.
+                write_mcb_header(mem, free_seg, b'Z', seg, paras, NO_NAME)?;
+            }
+            Ok(Ok(seg))
         } else {
-            // Room for the header plus this many data paragraphs, never below zero.
-            Err((u32::from(ARENA_TOP).saturating_sub(data_seg)) as u16)
+            Ok(Err((u32::from(ARENA_TOP).saturating_sub(data_seg)) as u16))
         }
     }
 
-    /// AH=4Ah: resize the block at `seg` to `paras` paragraphs.
-    fn resize(&mut self, seg: u16, paras: u16) -> Result<(), ResizeError> {
+    /// AH=49h: free the block whose data segment is `seg`. Ok(Ok(())) on success,
+    /// Ok(Err(())) for an unknown block, Err(DosError) on a guest memory fault. A
+    /// block immediately below the free tail is merged back into it (LIFO reclaim);
+    /// any other freed block becomes an owner-0 hole that leaks until the blocks
+    /// above it are freed (the documented no-coalesce ceiling).
+    fn free(&mut self, seg: u16, mem: &mut Memory) -> Result<Result<(), ()>, DosError> {
         if seg == self.psp_seg {
-            // The program block. Its ceiling is the header paragraph of the lowest
-            // AH=48h block (its data segment minus one), or ARENA_TOP with no blocks,
-            // so the program data never overlaps the next block's MCB header.
-            let limit = self
-                .blocks
+            return Ok(Ok(())); // freeing the program block (e.g. at termination)
+        }
+        let chain = self.chain(mem);
+        let Some(pos) = chain
+            .iter()
+            .position(|m| m.owner != 0 && m.mcb_seg == seg.wrapping_sub(1))
+        else {
+            return Ok(Err(()));
+        };
+        let block = chain[pos];
+        let block_end = block.mcb_seg.wrapping_add(1).wrapping_add(block.size);
+        match chain.last() {
+            Some(tail) if tail.owner == 0 && block_end == tail.mcb_seg => {
+                // LIFO reclaim: extend the free tail down over this block.
+                write_mcb_header(
+                    mem,
+                    block.mcb_seg,
+                    b'Z',
+                    0,
+                    ARENA_TOP - block.mcb_seg - 1,
+                    NO_NAME,
+                )?;
+            }
+            _ => {
+                // Non-top free: mark the block free in place; the hole leaks.
+                mem.write_u16(usize::from(block.mcb_seg) * 16 + 1, 0)?;
+            }
+        }
+        Ok(Ok(()))
+    }
+
+    /// AH=4Ah: resize the block whose segment is `seg` to `paras` paragraphs.
+    /// Ok(Ok(())) on success, Ok(Err(ResizeError)) on a DOS error, Err(DosError) on
+    /// a guest memory fault.
+    fn resize(
+        &mut self,
+        seg: u16,
+        paras: u16,
+        mem: &mut Memory,
+    ) -> Result<Result<(), ResizeError>, DosError> {
+        let chain = self.chain(mem);
+        if seg == self.psp_seg {
+            // The program block (data segment == PSP; for an EXEC child it follows
+            // the env block, so it is not necessarily chain[0]). Its ceiling is the
+            // lowest still-OWNED block ABOVE it; leaked owner-0 holes, the free tail,
+            // and the env below it are not ceilings, the program grows through holes
+            // up to that owned block (or ARENA_TOP when nothing above is owned).
+            let Some(pos) = chain
                 .iter()
-                .map(|&(s, _)| s.wrapping_sub(1))
-                .min()
-                .unwrap_or(ARENA_TOP);
-            let new_top = u32::from(self.psp_seg) + u32::from(paras);
-            if new_top <= u32::from(limit) {
-                self.prog_top = new_top as u16;
-                if self.blocks.is_empty() {
-                    self.free_base = self.prog_top;
-                }
-                Ok(())
-            } else {
-                Err(ResizeError::TooBig(limit - self.psp_seg))
-            }
-        } else if let Some(idx) = self.blocks.iter().position(|&(s, _)| s == seg) {
-            if idx + 1 == self.blocks.len() {
-                // Top block: grow/shrink against the ceiling, moving free_base.
-                let new_end = u32::from(seg) + u32::from(paras);
-                if new_end <= u32::from(ARENA_TOP) {
-                    self.blocks[idx].1 = paras;
-                    self.free_base = new_end as u16;
-                    Ok(())
-                } else {
-                    Err(ResizeError::TooBig(ARENA_TOP - seg))
-                }
-            } else {
-                // Non-top block: shrink updates the size (no reclaim); grow fails.
-                let cur = self.blocks[idx].1;
-                if paras <= cur {
-                    self.blocks[idx].1 = paras;
-                    Ok(())
-                } else {
-                    Err(ResizeError::TooBig(cur))
-                }
-            }
-        } else {
-            Err(ResizeError::InvalidBlock)
-        }
-    }
-
-    /// AH=49h: free the block at `seg`. Ok(()) or Err(()) for an unknown block.
-    fn free(&mut self, seg: u16) -> Result<(), ()> {
-        if seg == self.psp_seg {
-            return Ok(()); // freeing the program block (e.g. at termination)
-        }
-        if let Some(idx) = self.blocks.iter().position(|&(s, _)| s == seg) {
-            let is_top = idx + 1 == self.blocks.len();
-            let (_, paras) = self.blocks.remove(idx);
-            if is_top {
-                self.free_base -= paras + 1; // LIFO reclaim of the data plus its header
-            }
-            Ok(())
-        } else {
-            Err(())
-        }
-    }
-
-    /// AH=31h KEEP PROCESS: trim the program block to `paras` paragraphs and mark
-    /// it resident. The resident program block stays so a later memory walk still
-    /// sees it. `paras` is clamped so the block never grows past its current top.
-    // ponytail: also releases any AH=48h blocks, which real DOS would keep. The
-    // common TSR pattern shrinks the PSP block (AH=4Ah) and goes resident without
-    // holding separate AH=48h allocations, so this is a faithful-enough ceiling;
-    // a real MCB chain (Phase 9c) is where per-block residency would live.
-    fn keep_resident(&mut self, paras: u16) {
-        let want = u32::from(self.psp_seg) + u32::from(paras);
-        let new_top = want.min(u32::from(self.prog_top)) as u16;
-        self.prog_top = new_top;
-        self.blocks.clear();
-        self.free_base = new_top;
-        self.resident = true;
-    }
-
-    /// The arena as a contiguous MCB chain to materialize: (mcb_seg, owner, size).
-    /// A real MCB occupies [mcb_seg, mcb_seg + 1 + size): a one-paragraph header
-    /// then `size` data paragraphs. The next MCB sits at mcb_seg + 1 + size, so the
-    /// chain is back to back with no gaps. The first MCB is psp_seg-1 (the header
-    /// paragraph below the PSP), and the chain spans [psp_seg-1, ARENA_TOP).
-    ///
-    /// The regions, in order: the program block (owner = PSP), each AH=48h block
-    /// (owner = its own segment), then the free remainder (owner 0). Each region's
-    /// header paragraph is carved from the span, so a block's `size` is its arena
-    /// paragraph count and the running cursor steps over the extra header paragraph.
-    /// The arena reserves that header paragraph for real: an AH=48h block's data
-    /// segment S is one paragraph above its header, so this places the header at S-1,
-    /// below the bytes the guest holds. The cursor lands on S-1 for each block because
-    /// the bump allocator stepped over the same header when it handed out S.
-    fn mcb_layout(&self) -> Vec<McbEntry> {
-        let mut entries = Vec::new();
-        let mut cursor = self.psp_seg.wrapping_sub(1); // header paragraph below the PSP
-        // The program block: header at psp_seg-1, data [psp_seg, prog_top).
-        let prog_size = self.prog_top.wrapping_sub(self.psp_seg);
-        entries.push(McbEntry {
-            mcb_seg: cursor,
-            owner: self.psp_seg,
-            size: prog_size,
-        });
-        cursor = cursor.wrapping_add(1).wrapping_add(prog_size); // = prog_top
-        // AH=48h blocks in ascending segment order. Each one's header takes the
-        // paragraph the cursor is on; its data is the paragraph count it was given.
-        let mut sorted = self.blocks.clone();
-        sorted.sort_by_key(|&(seg, _)| seg);
-        for &(seg, paras) in &sorted {
-            entries.push(McbEntry {
-                mcb_seg: cursor,
-                owner: seg,
-                size: paras,
-            });
-            cursor = cursor.wrapping_add(1).wrapping_add(paras);
-        }
-        // The free remainder up to ARENA_TOP: a header at the cursor, the rest data.
-        if cursor < ARENA_TOP {
-            entries.push(McbEntry {
-                mcb_seg: cursor,
-                owner: 0,
-                size: ARENA_TOP - cursor - 1,
-            });
-        }
-        entries
-    }
-
-    /// Write the MCB chain into guest memory as a faithful view of the current
-    /// arena, returning the first MCB segment (psp_seg-1) for the list-of-lists.
-    /// Each header is 'M' for a link or 'Z' for the last block, the owner PSP word,
-    /// the size word, 3 reserved bytes, and an 8-byte owner name.
-    // ponytail: this is a recomputed VIEW over the bump arena, not a real
-    // coalescing free-list. The headers are rewritten on demand (the guest reads
-    // them through AH=52h), so allocations stay observable, but adjacent free
-    // blocks are not merged and a guest cannot hand DOS a block by editing a header.
-    // Each header lands in a paragraph the allocator reserved for it (one below the
-    // block's data segment), so materializing the chain never overwrites guest data.
-    // The upgrade path is to make the chain authoritative: walk and mutate it in
-    // allocate/free/resize instead of keeping the Vec<(seg,paras)>, which turns the
-    // arena into a true MCB free-list and lets a guest drive allocation directly.
-    fn materialize_mcb_chain(&self, mem: &mut Memory) -> Result<u16, DosError> {
-        let entries = self.mcb_layout();
-        let first = entries.first().map(|e| e.mcb_seg).unwrap_or(0);
-        let last = entries.len().saturating_sub(1);
-        for (i, entry) in entries.iter().enumerate() {
-            let base = usize::from(entry.mcb_seg) * 16;
-            let sig = if i == last { b'Z' } else { b'M' };
-            mem.write_u8(base, sig)?;
-            mem.write_u16(base + 1, entry.owner)?;
-            mem.write_u16(base + 3, entry.size)?;
-            for off in 5..8 {
-                mem.write_u8(base + off, 0)?; // 3 reserved bytes
-            }
-            // The 8-byte program name. The program block carries a name; the rest
-            // are blank. ponytail: a fixed "TOKAPROG" stands in for the real loaded
-            // name, which the loader does not thread down here; guests that read the
-            // MCB name (rare) see a stable placeholder.
-            let name: &[u8; 8] = if entry.owner == self.psp_seg && entry.owner != 0 {
-                b"TOKAPROG"
-            } else {
-                b"\0\0\0\0\0\0\0\0"
+                .position(|m| m.mcb_seg.wrapping_add(1) == self.psp_seg)
+            else {
+                return Ok(Err(ResizeError::InvalidBlock));
             };
-            for (off, &b) in name.iter().enumerate() {
-                mem.write_u8(base + 8 + off, b)?;
+            let prog = chain[pos];
+            let owned_above = chain.iter().skip(pos + 1).find(|m| m.owner != 0).copied();
+            let limit = owned_above.map(|m| m.mcb_seg).unwrap_or(ARENA_TOP);
+            let new_top = u32::from(self.psp_seg) + u32::from(paras);
+            if new_top > u32::from(limit) {
+                return Ok(Err(ResizeError::TooBig(limit - self.psp_seg)));
             }
+            let new_top = new_top as u16;
+            // The program links to a successor (a hole, or the free tail) unless it
+            // now reaches ARENA_TOP with nothing owned above.
+            let prog_sig = if owned_above.is_some() || new_top < ARENA_TOP {
+                b'M'
+            } else {
+                b'Z'
+            };
+            write_mcb_header(
+                mem,
+                prog.mcb_seg,
+                prog_sig,
+                self.psp_seg,
+                new_top - self.psp_seg,
+                PROG_NAME,
+            )?;
+            if let Some(owned) = owned_above {
+                // The freed gap below the owned block leaks as an owner-0 hole.
+                if new_top < owned.mcb_seg {
+                    write_mcb_header(mem, new_top, b'M', 0, owned.mcb_seg - new_top - 1, NO_NAME)?;
+                }
+            } else if new_top < ARENA_TOP {
+                // Nothing owned above: the remainder is the free tail.
+                write_mcb_header(mem, new_top, b'Z', 0, ARENA_TOP - new_top - 1, NO_NAME)?;
+            }
+            return Ok(Ok(()));
         }
-        // The chain just written must read back identically through the in-RAM
-        // walker: same segments, signatures, owners, and sizes. This pins the
-        // writer/reader agreement the authoritative allocator will depend on when
-        // it walks and mutates these headers directly.
-        debug_assert!(
-            {
-                let read = read_mcb_chain(mem, first);
-                read.len() == entries.len()
-                    && read.iter().enumerate().all(|(i, m)| {
-                        let want_sig = if i == last { b'Z' } else { b'M' };
-                        m.mcb_seg == entries[i].mcb_seg
-                            && m.sig == want_sig
-                            && m.owner == entries[i].owner
-                            && m.size == entries[i].size
-                    })
-            },
-            "the materialized MCB chain must read back identically"
-        );
-        Ok(first)
+        // An AH=48h block: its header is at seg-1 and it is owned.
+        let Some(pos) = chain
+            .iter()
+            .position(|m| m.owner != 0 && m.mcb_seg == seg.wrapping_sub(1))
+        else {
+            return Ok(Err(ResizeError::InvalidBlock));
+        };
+        let block = chain[pos];
+        let block_end = block.mcb_seg.wrapping_add(1).wrapping_add(block.size);
+        // The block resizes against the free tail when one sits directly above it,
+        // or when it is itself the last block (an exact-fill allocation that became
+        // 'Z'): both move or create the free tail against ARENA_TOP.
+        let tail_above = matches!(chain.last(), Some(t) if t.owner == 0 && block_end == t.mcb_seg);
+        let is_last = pos + 1 == chain.len();
+        if tail_above || is_last {
+            let new_end = u32::from(seg) + u32::from(paras);
+            if new_end > u32::from(ARENA_TOP) {
+                return Ok(Err(ResizeError::TooBig(ARENA_TOP - seg)));
+            }
+            let new_end = new_end as u16;
+            if new_end < ARENA_TOP {
+                write_mcb_header(mem, block.mcb_seg, b'M', seg, paras, NO_NAME)?;
+                write_mcb_header(mem, new_end, b'Z', 0, ARENA_TOP - new_end - 1, NO_NAME)?;
+            } else {
+                write_mcb_header(mem, block.mcb_seg, b'Z', seg, paras, NO_NAME)?;
+            }
+            Ok(Ok(()))
+        } else if paras <= block.size {
+            // Non-top block with a successor: shrink in place; the gap leaks as an
+            // owner-0 hole.
+            write_mcb_header(mem, block.mcb_seg, b'M', seg, paras, NO_NAME)?;
+            let gap_seg = seg.wrapping_add(paras);
+            let next = chain[pos + 1].mcb_seg;
+            if gap_seg < next {
+                write_mcb_header(mem, gap_seg, b'M', 0, next - gap_seg - 1, NO_NAME)?;
+            }
+            Ok(Ok(()))
+        } else {
+            // Non-top block: a grow has nowhere to go.
+            Ok(Err(ResizeError::TooBig(block.size)))
+        }
     }
-}
 
-/// One materialized MCB: the header paragraph, the owner PSP (0 = free), and the
-/// size of the data block in paragraphs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct McbEntry {
-    mcb_seg: u16,
-    owner: u16,
-    size: u16,
+    /// AH=31h KEEP PROCESS: trim the program block to `paras` paragraphs and mark it
+    /// resident. Everything above the resident block becomes a single free tail (the
+    /// AH=48h blocks are released, the common TSR pattern holds no separate
+    /// allocations). `paras` is clamped so the block never grows past its current top.
+    fn keep_resident(&mut self, paras: u16, mem: &mut Memory) -> Result<(), DosError> {
+        let cur_top = self.prog_top(mem);
+        let want = u32::from(self.psp_seg) + u32::from(paras);
+        let new_top = want.min(u32::from(cur_top)) as u16;
+        // The program block's own header is psp_seg-1 (not first_mcb(), which for an
+        // EXEC child is the env block below the program). Any AH=48h block above the
+        // program is released into the free tail; an env block below stays owned.
+        let prog_mcb = self.psp_seg.wrapping_sub(1);
+        if new_top < ARENA_TOP {
+            write_mcb_header(
+                mem,
+                prog_mcb,
+                b'M',
+                self.psp_seg,
+                new_top - self.psp_seg,
+                PROG_NAME,
+            )?;
+            write_mcb_header(mem, new_top, b'Z', 0, ARENA_TOP - new_top - 1, NO_NAME)?;
+        } else {
+            write_mcb_header(
+                mem,
+                prog_mcb,
+                b'Z',
+                self.psp_seg,
+                new_top - self.psp_seg,
+                PROG_NAME,
+            )?;
+        }
+        self.resident = true;
+        Ok(())
+    }
 }
 
 /// Safety cap on an MCB walk: a valid chain cannot have more headers than there
@@ -597,11 +694,11 @@ struct RamMcb {
 }
 
 /// Walk the in-RAM MCB chain from `first_mcb`, the inverse of
-/// [`Arena::materialize_mcb_chain`]: read each header's signature, owner, and
-/// size, and follow the data-plus-size step to the next, stopping at a 'Z'
-/// last-block header or an unreadable / invalid signature. This reads the chain
-/// as the guest sees it in memory, so an edit a guest (or a future authoritative
-/// allocator) makes to a header is observed here rather than in a shadow copy.
+/// [`Arena::write_initial_chain`]: read each header's signature, owner, and size,
+/// and follow the data-plus-size step to the next, stopping at a 'Z' last-block
+/// header or an unreadable / invalid signature. This reads the chain as the guest
+/// sees it in memory, so an edit a guest (or the authoritative allocator) makes to
+/// a header is observed here, the chain being the source of truth.
 fn read_mcb_chain(mem: &Memory, first_mcb: u16) -> Vec<RamMcb> {
     let mut out = Vec::new();
     let mut seg = first_mcb;
@@ -744,6 +841,11 @@ struct ProgramContext {
     arena: Arena,
     dta: (u16, u16),
     find_searches: HashMap<(u16, u16), FindSearch>,
+    // The parent's free-tail segment at the moment of EXEC. The child's env and
+    // program blocks are carved from here upward, so on the child's exit finish_exec
+    // frees the parent's memory back from this segment, capped below any resident
+    // (TSR) region the child or a descendant left above it.
+    free_base: u16,
 }
 
 /// The stateful DOS kernel. Owns the host-side state that must survive between
@@ -762,6 +864,10 @@ pub struct DosKernel {
     find_searches: HashMap<(u16, u16), FindSearch>,
     // Parent program frames for nested EXEC (AL=0); restored on child exit.
     program_stack: Vec<ProgramContext>,
+    // Base segments of resident (AH=31h TSR) MCB regions. An ancestor exiting must
+    // not reclaim memory at or above a resident region, so a free-tail restore is
+    // capped below the lowest resident base above it. Never pruned (TSRs persist).
+    resident_regions: Vec<u16>,
     last_exit_code: u8, // AH=4Dh AL; cleared after it is read
     last_exit_type: u8, // AH=4Dh AH; always 0x00 (normal termination), marked
     // AH=0Ch flush-and-invoke: the flush runs once, not again on a WaitForKey re-entry.
@@ -834,19 +940,24 @@ impl DosKernel {
     /// Seed per-program state after a program loads: the memory arena spanning
     /// [psp_seg, ARENA_TOP) with the program owning [psp_seg, prog_top). The
     /// machine calls this from new_dos_program; prog_top is the PSP:0x02 value.
-    pub fn init_program(&mut self, psp_seg: u16, prog_top: u16) {
+    pub fn init_program(
+        &mut self,
+        psp_seg: u16,
+        prog_top: u16,
+        mem: &mut Memory,
+    ) -> Result<(), DosError> {
         self.arena = Arena {
             psp_seg,
-            prog_top,
-            free_base: prog_top,
-            blocks: Vec::new(),
+            chain_first: psp_seg.wrapping_sub(1),
             resident: false,
         };
+        self.arena.write_initial_chain(mem, prog_top)?;
         self.dta = (psp_seg, 0x80);
         self.find_searches.clear();
         self.program_stack.clear();
         self.last_exit_code = 0;
         self.last_exit_type = 0;
+        Ok(())
     }
 
     /// Stand up a system PSP, arena, and base environment with no running
@@ -862,7 +973,7 @@ impl DosKernel {
     ) -> Result<(), DosError> {
         build_psp(mem, psp_seg, ARENA_TOP)?;
         let prog_top = psp_seg.saturating_add(0x10); // the system PSP is its 256 bytes
-        self.init_program(psp_seg, prog_top);
+        self.init_program(psp_seg, prog_top, mem)?;
         self.install_environment(mem, env)?;
         Ok(())
     }
@@ -884,7 +995,8 @@ impl DosKernel {
     ) -> Result<(), DosError> {
         let block = build_env_block_with_argv0(entries, DEFAULT_ARGV0);
         let paras = u16::try_from(block.len().div_ceil(16)).unwrap_or(u16::MAX);
-        let psp_base = usize::from(self.arena.psp_seg) * 16;
+        let psp = self.arena.psp_seg;
+        let psp_base = usize::from(psp) * 16;
         // The program block may have claimed all of conventional memory (an .EXE
         // with a large e_maxalloc sets PSP:0x02 = ARENA_TOP). Carve env room out
         // of the top of the program block, mirroring real DOS, which sizes the
@@ -893,17 +1005,18 @@ impl DosKernel {
         // ample room above the program, so no shrink happens. The env allocation
         // also reserves a one-paragraph MCB header, so leave room for paras+1.
         let limit = ARENA_TOP.saturating_sub(paras.saturating_add(1));
-        if self.arena.prog_top > limit {
-            self.arena.prog_top = limit;
-            if self.arena.blocks.is_empty() {
-                self.arena.free_base = limit;
-            }
+        if self.arena.prog_top(mem) > limit {
+            // saturating: a pathological env larger than conventional memory would
+            // drive limit below psp; the resize then fails cleanly as EnvSegmentFull.
+            self.arena
+                .resize(psp, limit.saturating_sub(psp), mem)?
+                .map_err(|_| DosError::EnvSegmentFull)?;
             mem.write_u16(psp_base + 0x02, limit)?;
         }
-        let env_seg = self
-            .arena
-            .allocate(paras)
-            .map_err(|_| DosError::EnvSegmentFull)?;
+        let env_seg = match self.arena.allocate(paras, mem)? {
+            Ok(seg) => seg,
+            Err(_) => return Err(DosError::EnvSegmentFull),
+        };
         let env_base = usize::from(env_seg) * 16;
         for (offset, &byte) in block.iter().enumerate() {
             mem.write_u8(env_base + offset, byte)?;
@@ -1136,28 +1249,25 @@ impl DosKernel {
             }
         };
         let env_paras = (env_bytes.len() as u16).div_ceil(16).max(1);
-        let env_seg = self.arena.free_base;
-        let child_psp = match env_seg.checked_add(env_paras) {
-            Some(s) if s < ARENA_TOP => s,
+        // Carve the child's blocks from the parent's free tail as real owned MCBs.
+        // The environment block heads the child's chain: its MCB header sits at the
+        // parent free base, env data one paragraph up. The child program block's
+        // header sits just above the env data, its PSP one paragraph higher again.
+        let env_mcb = self.arena.free_base(mem);
+        // The child needs at least a 64 KiB program segment (load_com sets SP=0xFFFE
+        // and writes the return word there). Too little conventional memory left is
+        // insufficient memory (0x08), reported before any child memory is written.
+        let child_psp = match env_mcb.checked_add(env_paras + 2) {
+            Some(s) if u32::from(s) + 0x1000 <= u32::from(ARENA_TOP) => s,
             _ => {
-                set_dos_error(regs, 0x0a);
+                set_dos_error(regs, 0x08);
                 return Ok(DosAction::Continue);
             }
         };
-        // The child needs at least a 64 KiB segment: load_com sets SP=0xFFFE and
-        // writes the return word there. A child whose PSP lands too high would
-        // overflow past ARENA_TOP, so reject it as insufficient memory (0x08)
-        // before writing the env block. An MZ child's finer fit is enforced by
-        // load_program below (ExeNotEnoughMemory -> 0x08).
-        if u32::from(child_psp) + 0x1000 > u32::from(ARENA_TOP) {
-            set_dos_error(regs, 0x08);
-            return Ok(DosAction::Continue);
-        }
-        let env_linear = usize::from(env_seg) * 16;
-        for (i, &byte) in env_bytes.iter().enumerate() {
-            mem.write_u8(env_linear + i, byte)?;
-        }
+        let env_seg = env_mcb + 1; // PSP:0x2C points at the env data, above its header
 
+        // Load the child image FIRST: a failed load must leave the parent's chain
+        // untouched (no env header written over the parent's free tail to roll back).
         let parent_psp = self.arena.psp_seg;
         let entry = match load_program(&image, mem, child_psp) {
             Ok(entry) => entry,
@@ -1171,6 +1281,14 @@ impl DosKernel {
                 return Ok(DosAction::Continue);
             }
         };
+
+        // The load succeeded: now write the environment MCB block (owner = the child
+        // PSP) over the parent's old free tail, and the env bytes into its data area.
+        write_mcb_header(mem, env_mcb, b'M', child_psp, env_paras, NO_NAME)?;
+        let env_linear = usize::from(env_seg) * 16;
+        for (i, &byte) in env_bytes.iter().enumerate() {
+            mem.write_u8(env_linear + i, byte)?;
+        }
 
         // Patch the child PSP.
         let psp = usize::from(child_psp) * 16;
@@ -1190,20 +1308,31 @@ impl DosKernel {
         let child_ax = (u16::from(fcb_drive_validity(fcb2_drive)) << 8)
             | u16::from(fcb_drive_validity(fcb1_drive));
 
-        // Save the parent context, then switch to the child.
+        // Save the parent context (its free tail, to restore when the child's blocks
+        // are freed on exit), then switch to the child.
         let parent = ProgramContext {
             arena: std::mem::take(&mut self.arena),
             dta: self.dta,
             find_searches: std::mem::take(&mut self.find_searches),
+            free_base: env_mcb,
         };
         self.program_stack.push(parent);
         self.arena = Arena {
             psp_seg: child_psp,
-            prog_top: ARENA_TOP,
-            free_base: ARENA_TOP,
-            blocks: Vec::new(),
+            chain_first: env_mcb, // the chain starts at the env block
             resident: false,
         };
+        // Write the child program block: owned by the child PSP, the last block,
+        // filling conventional memory to the top. Its header sits just above the env
+        // data, so the child chain reads env -> program -> (free tail once shrunk).
+        write_mcb_header(
+            mem,
+            child_psp.wrapping_sub(1),
+            b'Z',
+            child_psp,
+            ARENA_TOP - child_psp,
+            PROG_NAME,
+        )?;
         self.dta = (child_psp, 0x80);
         // A fresh child has terminated no child of its own.
         self.last_exit_code = 0;
@@ -1215,14 +1344,44 @@ impl DosKernel {
     /// Restore the parent program's DOS state after a child exits with `code`,
     /// and record the exit code/type for AH=4Dh. Called by the machine when it
     /// pops a parent frame.
-    pub fn finish_exec(&mut self, code: u8) {
+    pub fn finish_exec(&mut self, code: u8, mem: &mut Memory) -> Result<(), DosError> {
+        // The exiting child's blocks (env + program, above the parent free base) are
+        // freed back to the parent, UNLESS the child itself kept resident (a TSR), in
+        // which case keep_resident already left a correct free tail above its block.
+        let child_resident = self.arena.resident;
         if let Some(parent) = self.program_stack.pop() {
             self.arena = parent.arena;
             self.dta = parent.dta;
             self.find_searches = parent.find_searches;
+            if !child_resident {
+                // A resident TSR carved by this child or a descendant sits above the
+                // freed region; cap the restored free block below the lowest such
+                // resident base so the TSR is preserved (the EXEC chain unwinds past
+                // it). With nothing resident above, the region reaches ARENA_TOP.
+                let cap = self
+                    .resident_regions
+                    .iter()
+                    .copied()
+                    .filter(|&base| base > parent.free_base)
+                    .min()
+                    .unwrap_or(ARENA_TOP);
+                if parent.free_base < cap {
+                    // 'M' when a resident block follows (a link to it), else the tail.
+                    let sig = if cap < ARENA_TOP { b'M' } else { b'Z' };
+                    write_mcb_header(
+                        mem,
+                        parent.free_base,
+                        sig,
+                        0,
+                        cap - parent.free_base - 1,
+                        NO_NAME,
+                    )?;
+                }
+            }
         }
         self.last_exit_code = code;
         self.last_exit_type = 0x00; // only normal termination is modeled (marked).
+        Ok(())
     }
 
     /// Split a FindFirst filespec into (host directory, final-component pattern).
@@ -2287,7 +2446,7 @@ impl DosKernel {
             // AH=48h: allocate BX paragraphs. CF=0 AX=segment, or CF=1 AX=0x08
             // BX=largest-available.
             0x48 => {
-                match self.arena.allocate(regs.bx) {
+                match self.arena.allocate(regs.bx, mem)? {
                     Ok(seg) => {
                         regs.ax = seg;
                         regs.cf = false;
@@ -2302,7 +2461,7 @@ impl DosKernel {
             }
             // AH=49h: free the block in ES. CF=0, or CF=1 AX=0x09 (invalid block).
             0x49 => {
-                match self.arena.free(regs.es) {
+                match self.arena.free(regs.es, mem)? {
                     Ok(()) => regs.cf = false,
                     Err(()) => {
                         regs.cf = true;
@@ -2314,7 +2473,7 @@ impl DosKernel {
             // AH=4Ah: resize the block in ES to BX paragraphs. CF=0, or CF=1 with
             // AX=0x08 BX=largest-available (too big) / AX=0x09 (invalid block).
             0x4a => {
-                match self.arena.resize(regs.es, regs.bx) {
+                match self.arena.resize(regs.es, regs.bx, mem)? {
                     Ok(()) => regs.cf = false,
                     Err(ResizeError::TooBig(largest)) => {
                         regs.cf = true;
@@ -2348,7 +2507,10 @@ impl DosKernel {
             // in the arena only (no MCB chain, no INT 21h vector hand-off); the exit
             // path is otherwise identical to AH=4Ch, so the machine frees nothing.
             0x31 => {
-                self.arena.keep_resident(regs.dx);
+                self.arena.keep_resident(regs.dx, mem)?;
+                // Record the resident region's base so an ancestor's exit will not
+                // reclaim it (the EXEC chain can unwind past this resident block).
+                self.resident_regions.push(self.arena.chain_first);
                 Ok(DosAction::Exit((regs.ax & 0x00ff) as u8))
             }
             // AH=33h: Ctrl-Break flag. Stub: AL=00 (get) returns DL=0 (off);
@@ -2770,17 +2932,19 @@ impl DosKernel {
                 Ok(DosAction::Continue)
             }
             // AH=52h GET LIST OF LISTS (SysVars). Returns ES:BX -> the DOS internal
-            // variable table. The first-MCB segment at [BX-2] is materialized from
-            // the live arena; the scalar fields a guest reads to size the system
-            // (max bytes per block, LASTDRIVE) and the NUL device header that heads
-            // the driver chain are filled inline. The DWORD chain pointers (DPB,
-            // SFT, CLOCK$, CON, CDS, FCB tables, disk buffers) stay zero: their
-            // backing structures are not modeled yet and no guest in scope walks
-            // them. The table lives at a kernel-reserved low paragraph so it does
-            // not collide with a program loaded at 0x0100+. Offsets are written as
-            // base + 2 + off so the comments can use the documented BX-relative off.
+            // variable table. The first-MCB segment at [BX-2] points at the live
+            // in-RAM MCB chain (psp_seg-1 for a directly-loaded program; for an EXEC
+            // child the environment block that heads its chain), which the allocator
+            // owns and a guest can walk and edit. The fields a guest reads (max bytes
+            // per block, LASTDRIVE) and the NUL device header that heads the driver
+            // chain are filled inline. The DWORD chain pointers (DPB, SFT, CLOCK$,
+            // CON, CDS, FCB tables, disk buffers) stay zero: their backing
+            // structures are not modeled yet and no guest in scope walks them. The
+            // table lives at a kernel-reserved low paragraph so it does not collide
+            // with a program loaded at 0x0100+. Offsets are written as base + 2 + off
+            // so the comments can use the documented BX-relative off.
             0x52 => {
-                let first_mcb = self.arena.materialize_mcb_chain(mem)?;
+                let first_mcb = self.arena.first_mcb();
                 let base = usize::from(SYSVARS_SEG) * 16;
                 // [BX-2] = first MCB segment (BX returns 0x0002, so this is offset 0).
                 mem.write_u16(base, first_mcb)?;
@@ -5857,17 +6021,19 @@ mod tests {
         assert_eq!(entry.sp, 0xfffe);
     }
 
-    fn arena_kernel() -> DosKernel {
+    fn arena_kernel() -> (DosKernel, Memory) {
+        // Conventional memory must span the whole arena (up to ARENA_TOP) now that
+        // the MCB chain lives in guest RAM, not a shadow Vec.
+        let mut mem = Memory::new(1024 * 1024).unwrap();
         let mut kernel = DosKernel::new();
         // Program PSP at 0x0100, block top at 0x1100 (a .COM-style 64 KiB block).
-        kernel.init_program(0x0100, 0x1100);
-        kernel
+        kernel.init_program(0x0100, 0x1100, &mut mem).unwrap();
+        (kernel, mem)
     }
 
     #[test]
     fn ah48_allocates_above_the_program_block() {
-        let mut mem = Memory::new(4096).unwrap();
-        let mut kernel = arena_kernel();
+        let (mut kernel, mut mem) = arena_kernel();
         let mut regs = DosRegs {
             ax: 0x4800,
             bx: 0x0010,
@@ -5881,8 +6047,7 @@ mod tests {
 
     #[test]
     fn ah4a_shrink_program_block_then_ah48_allocates_the_tail() {
-        let mut mem = Memory::new(4096).unwrap();
-        let mut kernel = arena_kernel();
+        let (mut kernel, mut mem) = arena_kernel();
         // Shrink the program block (ES = PSP) to 0x0800 paragraphs.
         let mut resize = DosRegs {
             ax: 0x4a00,
@@ -5906,8 +6071,7 @@ mod tests {
 
     #[test]
     fn ah48_past_the_ceiling_returns_largest_available() {
-        let mut mem = Memory::new(4096).unwrap();
-        let mut kernel = arena_kernel();
+        let (mut kernel, mut mem) = arena_kernel();
         // Request more than fits: free_base=0x1100, header at 0x1100, data starts at
         // 0x1101, ceiling 0xA000 -> largest data that fits is 0xA000 - 0x1101 = 0x8EFF.
         let mut regs = DosRegs {
@@ -5923,8 +6087,7 @@ mod tests {
 
     #[test]
     fn ah4a_grow_program_block_too_big_fails_with_largest() {
-        let mut mem = Memory::new(4096).unwrap();
-        let mut kernel = arena_kernel();
+        let (mut kernel, mut mem) = arena_kernel();
         // No allocations yet, so limit is ARENA_TOP. Ask for more than fits.
         let mut regs = DosRegs {
             ax: 0x4a00,
@@ -5939,9 +6102,175 @@ mod tests {
     }
 
     #[test]
+    fn ah4a_grow_program_past_a_leaked_hole_is_capped_by_the_owned_block() {
+        // A leaked owner-0 hole sitting directly above the program must not let a
+        // program grow run over a still-owned block further up the chain. The
+        // ceiling is the lowest OWNED header, skipping holes, not the immediate
+        // successor.
+        let (mut kernel, mut mem) = arena_kernel(); // psp 0x100, prog_top 0x1100
+        let mut a = DosRegs {
+            ax: 0x4800,
+            bx: 0x0010,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut a, &mut mem).unwrap();
+        assert_eq!(a.ax, 0x1101);
+        let mut b = DosRegs {
+            ax: 0x4800,
+            bx: 0x0010,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut b, &mut mem).unwrap();
+        assert_eq!(b.ax, 0x1112);
+        // Free A (non-top): it becomes a leaked owner-0 hole directly above the program.
+        let mut free_a = DosRegs {
+            ax: 0x4900,
+            es: 0x1101,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut free_a, &mut mem).unwrap();
+        assert!(!free_a.cf);
+        // Grow the program: it is capped at B's header (0x1111), not ARENA_TOP.
+        let mut grow = DosRegs {
+            ax: 0x4a00,
+            es: 0x0100,
+            bx: 0x2000,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut grow, &mut mem).unwrap();
+        assert!(grow.cf, "a grow over the owned block B must fail");
+        assert_eq!(grow.ax, 0x08);
+        assert_eq!(grow.bx, 0x1011, "largest = B header 0x1111 - psp 0x0100");
+        // B (owner 0x1112) is still a live block in the chain, not clobbered.
+        let mut q = DosRegs {
+            ax: 0x5200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut q, &mut mem).unwrap();
+        let first = mem
+            .read_u16(usize::from(q.es) * 16 + usize::from(q.bx) - 2)
+            .unwrap();
+        assert!(
+            read_mcb_chain(&mem, first)
+                .iter()
+                .any(|m| m.owner == 0x1112),
+            "B survives the rejected grow"
+        );
+    }
+
+    #[test]
+    fn ah4a_shrink_an_exact_fill_block_opens_a_free_tail() {
+        // An AH=48h allocation that exactly fills the arena becomes the last 'Z'
+        // block (owned). Shrinking it must open a free tail, not panic on a
+        // missing successor.
+        let (mut kernel, mut mem) = arena_kernel(); // psp 0x100, prog_top 0x1100
+        // Largest data that fits is 0xA000 - 0x1101 = 0x8EFF; this consumes the tail.
+        let mut a = DosRegs {
+            ax: 0x4800,
+            bx: 0x8eff,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut a, &mut mem).unwrap();
+        assert!(!a.cf);
+        assert_eq!(a.ax, 0x1101);
+        // Shrink it: succeeds and opens a free tail above it.
+        let mut shrink = DosRegs {
+            ax: 0x4a00,
+            es: 0x1101,
+            bx: 0x0010,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut shrink, &mut mem).unwrap();
+        assert!(!shrink.cf);
+        // A fresh allocation lands in the freed tail: header 0x1111, data 0x1112.
+        let mut b = DosRegs {
+            ax: 0x4800,
+            bx: 0x0010,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut b, &mut mem).unwrap();
+        assert!(!b.cf);
+        assert_eq!(b.ax, 0x1112);
+    }
+
+    #[test]
+    fn ah4a_shrink_a_non_top_block_keeps_the_block_above_intact() {
+        // Shrinking a non-top AH=48h block leaks a hole in the gap (no reclaim) and
+        // must leave the owned block above it a valid, freeable block.
+        let (mut kernel, mut mem) = arena_kernel();
+        let mut a = DosRegs {
+            ax: 0x4800,
+            bx: 0x0020,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut a, &mut mem).unwrap();
+        assert_eq!(a.ax, 0x1101);
+        let mut b = DosRegs {
+            ax: 0x4800,
+            bx: 0x0010,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut b, &mut mem).unwrap();
+        let b_seg = b.ax;
+        // Shrink A (non-top) in place.
+        let mut shrink = DosRegs {
+            ax: 0x4a00,
+            es: 0x1101,
+            bx: 0x0008,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut shrink, &mut mem).unwrap();
+        assert!(!shrink.cf);
+        // B is still a valid owned block (freeing it succeeds).
+        let mut free_b = DosRegs {
+            ax: 0x4900,
+            es: b_seg,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut free_b, &mut mem).unwrap();
+        assert!(
+            !free_b.cf,
+            "the block above the shrunk non-top block survives"
+        );
+    }
+
+    #[test]
+    fn ah31_keep_resident_releases_a_block_above_the_program() {
+        // The TSR pattern: allocate a block, then keep-resident trimming the program.
+        // Everything above the resident block, including the AH=48h block, is
+        // released into a single free tail at the trimmed program top.
+        let (mut kernel, mut mem) = arena_kernel(); // psp 0x100, prog_top 0x1100
+        let mut a = DosRegs {
+            ax: 0x4800,
+            bx: 0x0010,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut a, &mut mem).unwrap();
+        assert_eq!(a.ax, 0x1101);
+        let mut tsr = DosRegs {
+            ax: 0x3100,
+            dx: 0x0020,
+            ..DosRegs::default()
+        };
+        let action = kernel.dispatch(0x21, &mut tsr, &mut mem).unwrap();
+        assert!(matches!(action, DosAction::Exit(_)));
+        // The free tail begins at the resident top 0x120; the released block's space
+        // is reused.
+        let mut next = DosRegs {
+            ax: 0x4800,
+            bx: 0x0010,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut next, &mut mem).unwrap();
+        assert_eq!(
+            next.ax, 0x0121,
+            "free tail begins at the trimmed program top"
+        );
+    }
+
+    #[test]
     fn ah49_frees_top_block_lifo_then_reuses() {
-        let mut mem = Memory::new(4096).unwrap();
-        let mut kernel = arena_kernel();
+        let (mut kernel, mut mem) = arena_kernel();
         let mut a = DosRegs {
             ax: 0x4800,
             bx: 0x0010,
@@ -5968,8 +6297,7 @@ mod tests {
 
     #[test]
     fn ah49_unknown_block_returns_ax09() {
-        let mut mem = Memory::new(4096).unwrap();
-        let mut kernel = arena_kernel();
+        let (mut kernel, mut mem) = arena_kernel();
         let mut regs = DosRegs {
             ax: 0x4900,
             es: 0x5555,
@@ -5984,8 +6312,7 @@ mod tests {
     fn ah49_non_top_free_leaves_a_hole_without_underflow() {
         // Free a lower (non-top) block, then the top block: free_base must not
         // underflow, and the lower hole stays leaked (the documented LIFO ceiling).
-        let mut mem = Memory::new(4096).unwrap();
-        let mut kernel = arena_kernel(); // psp 0x100, prog_top 0x1100
+        let (mut kernel, mut mem) = arena_kernel(); // psp 0x100, prog_top 0x1100
         let mut a = DosRegs {
             ax: 0x4800,
             bx: 0x0010,
@@ -6034,8 +6361,7 @@ mod tests {
         // A zero-paragraph allocation is a legal DOS request: it still carries an
         // MCB header, so it returns a data segment one paragraph above free_base and
         // advances free_base past that single header paragraph.
-        let mut mem = Memory::new(4096).unwrap();
-        let mut kernel = arena_kernel();
+        let (mut kernel, mut mem) = arena_kernel();
         let mut z = DosRegs {
             ax: 0x4800,
             bx: 0x0000,
@@ -6081,8 +6407,7 @@ mod tests {
         // arena_kernel: psp 0x0100, prog_top 0x1100, free_base 0x1100. The chain is
         // the program block, then the free remainder; sigs M..Z, sizes cover the
         // arena from psp_seg to ARENA_TOP.
-        let mut mem = Memory::new(1024 * 1024).unwrap();
-        let mut kernel = arena_kernel();
+        let (mut kernel, mut mem) = arena_kernel();
         let mut regs = DosRegs {
             ax: 0x5200,
             ..DosRegs::default()
@@ -6113,8 +6438,7 @@ mod tests {
     fn ah52_mcb_chain_reflects_an_allocation() {
         // After an AH=48h allocation, the chain has three blocks: program, the new
         // block (owner = its own segment), and the free remainder.
-        let mut mem = Memory::new(1024 * 1024).unwrap();
-        let mut kernel = arena_kernel();
+        let (mut kernel, mut mem) = arena_kernel();
         let mut alloc = DosRegs {
             ax: 0x4800,
             bx: 0x0010,
@@ -6156,9 +6480,66 @@ mod tests {
     }
 
     #[test]
+    fn mcb_chain_is_authoritative_a_guest_edit_drives_the_allocator() {
+        // THE GATE for the authoritative flip. The in-RAM MCB chain is the source
+        // of truth, not a shadow Vec. A guest (a memory manager) rewrites the chain
+        // in place: it shrinks the program block and lays a fresh free-tail header
+        // at the new boundary. Two things must then hold: a re-query does not
+        // clobber the edit, and the NEXT AH=48h carves from the guest's boundary.
+        // That second check is what forces a real flip: freezing the materialize
+        // alone would survive the re-query but still allocate from the stale shadow.
+        let (mut kernel, mut mem) = arena_kernel(); // psp 0x100, prog_top 0x1100
+
+        // First AH=52h: the chain lands in RAM; ES:BX-2 holds the first MCB segment.
+        let mut q1 = DosRegs {
+            ax: 0x5200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut q1, &mut mem).unwrap();
+        let first = mem
+            .read_u16(usize::from(q1.es) * 16 + usize::from(q1.bx) - 2)
+            .unwrap();
+        assert_eq!(first, 0x00ff, "first MCB is psp_seg-1");
+
+        // A guest shrinks the program block to 0x0800 paragraphs and writes a new
+        // free-tail header at the new boundary 0x0900, a consistent in-place edit.
+        mem.write_u16(usize::from(first) * 16 + 3, 0x0800).unwrap();
+        let new_tail = 0x0900usize;
+        mem.write_u8(new_tail * 16, b'Z').unwrap();
+        mem.write_u16(new_tail * 16 + 1, 0).unwrap(); // owner 0 (free)
+        mem.write_u16(new_tail * 16 + 3, ARENA_TOP - 0x0900 - 1)
+            .unwrap();
+
+        // Re-query: the edit survives, the chain is not re-materialized over.
+        let mut q2 = DosRegs {
+            ax: 0x5200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut q2, &mut mem).unwrap();
+        assert_eq!(
+            mem.read_u16(usize::from(first) * 16 + 3).unwrap(),
+            0x0800,
+            "AH=52h must not clobber a guest edit to the MCB header"
+        );
+
+        // The allocator reads the guest's chain: AH=48h carves from the free tail
+        // the guest placed at 0x0900, so the data segment is 0x0901, not 0x1101.
+        let mut alloc = DosRegs {
+            ax: 0x4800,
+            bx: 0x0010,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut alloc, &mut mem).unwrap();
+        assert!(!alloc.cf);
+        assert_eq!(
+            alloc.ax, 0x0901,
+            "AH=48h carves from the guest-edited free tail, not the shadow"
+        );
+    }
+
+    #[test]
     fn read_mcb_chain_reconstructs_the_chain_and_reflects_a_guest_edit() {
-        let mut mem = Memory::new(1024 * 1024).unwrap();
-        let mut kernel = arena_kernel();
+        let (mut kernel, mut mem) = arena_kernel();
         // AH=52h materializes the MCB chain in guest RAM and returns the first MCB.
         let mut regs = DosRegs {
             ax: 0x5200,
@@ -6193,8 +6574,7 @@ mod tests {
 
     #[test]
     fn read_mcb_chain_steps_over_an_intermediate_block() {
-        let mut mem = Memory::new(1024 * 1024).unwrap();
-        let mut kernel = arena_kernel();
+        let (mut kernel, mut mem) = arena_kernel();
         // An AH=48h allocation puts a middle 'M' link between the program block
         // and the free remainder, exercising the reader's next-MCB stepping.
         let mut alloc = DosRegs {
@@ -6226,8 +6606,7 @@ mod tests {
 
     #[test]
     fn ah52_publishes_sysvars_scalar_fields_and_the_nul_device() {
-        let mut mem = Memory::new(1024 * 1024).unwrap();
-        let mut kernel = arena_kernel();
+        let (mut kernel, mut mem) = arena_kernel();
         let mut regs = DosRegs {
             ax: 0x5200,
             ..DosRegs::default()
@@ -6338,9 +6717,9 @@ mod tests {
 
     #[test]
     fn ah1a_2f_dta_round_trips_with_default_at_psp_0x80() {
-        let mut mem = Memory::new(4096).unwrap();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
         let mut kernel = DosKernel::new();
-        kernel.init_program(0x0100, 0x1100);
+        kernel.init_program(0x0100, 0x1100, &mut mem).unwrap();
         // Default DTA = PSP:0x80.
         let mut get = DosRegs {
             ax: 0x2f00,
@@ -7379,10 +7758,10 @@ mod tests {
     /// A kernel with `dir` as C:, a parent program at PSP 0x0100 owning
     /// [0x0100, 0x0200), and a 1 MiB memory for the child PSP and inputs.
     fn exec_kernel(dir: &Path) -> (DosKernel, Memory) {
+        let mut mem = Memory::new(1024 * 1024).unwrap();
         let mut kernel = DosKernel::new();
         kernel.mount_c(HostDrive::mount_c(dir).unwrap());
-        kernel.init_program(0x0100, 0x0200);
-        let mem = Memory::new(1024 * 1024).unwrap();
+        kernel.init_program(0x0100, 0x0200, &mut mem).unwrap();
         (kernel, mem)
     }
 
@@ -7434,10 +7813,10 @@ mod tests {
         for (name, contents) in files {
             std::fs::write(dir.path().join(name), contents).unwrap();
         }
+        let mut mem = Memory::new(1024 * 1024).unwrap();
         let mut kernel = DosKernel::new();
         kernel.mount_c(HostDrive::mount_c(dir.path()).unwrap());
-        kernel.init_program(0x0100, 0x1100); // arena + DTA seed
-        let mem = Memory::new(1024 * 1024).unwrap();
+        kernel.init_program(0x0100, 0x1100, &mut mem).unwrap(); // arena + DTA seed
         (kernel, mem, dir)
     }
 
@@ -8035,15 +8414,16 @@ mod tests {
             bx: 0x40,
             ..DosRegs::default()
         };
-        // env is 1 paragraph at the parent free_base 0x0200, so child PSP = 0x0201.
+        // env MCB header at the parent free_base 0x0200, env data at 0x0201, the
+        // child program MCB header at 0x0202, so the child PSP is 0x0203.
         let action = kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
-        let child_psp = 0x0201usize * 16;
+        let child_psp = 0x0203usize * 16;
         match action {
             DosAction::Exec { child_ax, .. } => {
                 assert_eq!(child_ax, 0x0000); // null FCBs -> valid drives
                 assert_eq!(mem.read_u16(child_psp + 0x02).unwrap(), 0xa000);
                 assert_eq!(mem.read_u16(child_psp + 0x16).unwrap(), 0x0100); // parent
-                assert_eq!(mem.read_u16(child_psp + 0x2c).unwrap(), 0x0200); // env seg
+                assert_eq!(mem.read_u16(child_psp + 0x2c).unwrap(), 0x0201); // env data seg
                 assert_eq!(mem.read_u8(child_psp + 0x80).unwrap(), 0); // empty tail
                 assert_eq!(mem.read_u8(child_psp + 0x81).unwrap(), 0x0d);
                 assert_eq!(mem.read_u8(child_psp + 0x18).unwrap(), 0x01); // JFT stdin
@@ -8059,8 +8439,8 @@ mod tests {
         let (mut kernel, mut mem) = exec_kernel(dir.path());
         place_exec_inputs(&mut mem, "C:\\CHILD.COM", 0);
         let _ = exec_al0(&mut kernel, &mut mem);
-        // env block at 0x0200:0 is a single terminating NUL.
-        assert_eq!(mem.read_u8(0x0200 * 16).unwrap(), 0x00);
+        // env data at 0x0201:0 (above its MCB header at 0x0200) is a terminating NUL.
+        assert_eq!(mem.read_u8(0x0201 * 16).unwrap(), 0x00);
     }
 
     #[test]
@@ -8075,9 +8455,9 @@ mod tests {
         }
         place_exec_inputs(&mut mem, "C:\\CHILD.COM", 0x3000);
         let _ = exec_al0(&mut kernel, &mut mem);
-        // Copied env at 0x0200:0 holds the same bytes.
+        // Copied env data at 0x0201:0 (above its MCB header) holds the same bytes.
         for (i, &b) in b"A=1\0B=2\0\0".iter().enumerate() {
-            assert_eq!(mem.read_u8(0x0200 * 16 + i).unwrap(), b);
+            assert_eq!(mem.read_u8(0x0201 * 16 + i).unwrap(), b);
         }
     }
 
@@ -8132,12 +8512,83 @@ mod tests {
             kernel.dispatch(0x21, &mut regs, &mut mem).unwrap(),
             DosAction::Exec { .. }
         ));
-        // Now in the child context (psp_seg = 0x0201).
-        assert_eq!(kernel.arena.psp_seg, 0x0201);
-        kernel.finish_exec(7);
+        // Now in the child context (psp_seg = 0x0203, above the env block + header).
+        assert_eq!(kernel.arena.psp_seg, 0x0203);
+        kernel.finish_exec(7, &mut mem).unwrap();
         assert_eq!(kernel.arena.psp_seg, 0x0100); // parent restored
-        assert_eq!(kernel.arena.free_base, 0x0200);
+        // The child's memory (env + program) was freed back to the parent: its free
+        // tail is restored at the old free base.
+        assert_eq!(kernel.arena.free_base(&mem), 0x0200);
         assert_eq!(kernel.last_exit_code, 7);
+    }
+
+    #[test]
+    fn exec_child_chain_shows_the_env_block_then_the_program() {
+        // Commit 2 fidelity: a child's MCB chain (via AH=52h) starts at its
+        // environment block (owned by the child PSP), then the program block, so a
+        // guest walking the chain sees env -> program.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CHILD.COM"), [0xcdu8, 0x20]).unwrap();
+        let (mut kernel, mut mem) = exec_kernel(dir.path());
+        place_exec_inputs(&mut mem, "C:\\CHILD.COM", 0);
+        let _ = exec_al0(&mut kernel, &mut mem);
+        let child_psp = kernel.arena.psp_seg;
+        let mut q = DosRegs {
+            ax: 0x5200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut q, &mut mem).unwrap();
+        let first = mem
+            .read_u16(usize::from(q.es) * 16 + usize::from(q.bx) - 2)
+            .unwrap();
+        let chain = read_mcb_chain(&mem, first);
+        assert!(chain.len() >= 2);
+        // First block is the env (data segment = PSP:0x2C), owned by the child.
+        assert_eq!(chain[0].owner, child_psp, "env block owned by the child");
+        let env_seg = mem.read_u16(usize::from(child_psp) * 16 + 0x2c).unwrap();
+        assert_eq!(
+            chain[0].mcb_seg.wrapping_add(1),
+            env_seg,
+            "env data = PSP:0x2C"
+        );
+        // Then the program block (data segment = child PSP), also owned by the child.
+        assert_eq!(
+            chain[1].owner, child_psp,
+            "program block owned by the child"
+        );
+        assert_eq!(
+            chain[1].mcb_seg.wrapping_add(1),
+            child_psp,
+            "program data = PSP"
+        );
+    }
+
+    #[test]
+    fn finish_exec_keeps_a_resident_child_block() {
+        // A child that keeps itself resident (AH=31h TSR) is NOT reclaimed on exit:
+        // its program block stays owned and the parent's free tail sits above it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CHILD.COM"), [0xcdu8, 0x20]).unwrap();
+        let (mut kernel, mut mem) = exec_kernel(dir.path());
+        place_exec_inputs(&mut mem, "C:\\CHILD.COM", 0);
+        let _ = exec_al0(&mut kernel, &mut mem);
+        let child_psp = kernel.arena.psp_seg;
+        let mut tsr = DosRegs {
+            ax: 0x3100,
+            dx: 0x0040,
+            ..DosRegs::default()
+        };
+        assert!(matches!(
+            kernel.dispatch(0x21, &mut tsr, &mut mem).unwrap(),
+            DosAction::Exit(_)
+        ));
+        kernel.finish_exec(0, &mut mem).unwrap();
+        // The resident block survived: the parent's free base is above it, not back
+        // at the old 0x0200.
+        assert!(
+            kernel.arena.free_base(&mem) > child_psp,
+            "the resident child block was not reclaimed"
+        );
     }
 
     #[test]
@@ -8196,6 +8647,69 @@ mod tests {
         let regs = exec_al0(&mut kernel, &mut mem);
         assert!(regs.cf);
         assert_eq!(regs.ax, 0x0b);
+    }
+
+    #[test]
+    fn exec_of_a_bad_program_leaves_the_parent_arena_intact() {
+        // A failed child load must not corrupt the parent's chain or lose its free
+        // memory: the env block is written only after the load succeeds.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CHILD.COM"), [0x4du8, 0x5a]).unwrap(); // truncated MZ
+        let (mut kernel, mut mem) = exec_kernel(dir.path());
+        let before = kernel.arena.free_base(&mem);
+        place_exec_inputs(&mut mem, "C:\\CHILD.COM", 0);
+        let regs = exec_al0(&mut kernel, &mut mem);
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x0b);
+        // The parent's free base is unchanged: no env header clobbered its free tail.
+        assert_eq!(
+            kernel.arena.free_base(&mem),
+            before,
+            "parent free memory preserved across a failed EXEC"
+        );
+        assert!(kernel.program_stack.is_empty(), "no child frame pushed");
+    }
+
+    #[test]
+    fn finish_exec_preserves_a_resident_region_above_the_freed_child() {
+        // An ancestor exiting must not reclaim a deeper resident TSR: a resident
+        // region recorded above the parent's free base caps the restored free region.
+        let (mut kernel, mut mem) = arena_kernel(); // parent psp 0x100, free tail 0x1100
+        // A resident TSR: a small owned program block at 0x4000 with a free tail above.
+        write_mcb_header(&mut mem, 0x4000, b'M', 0x4001, 0x40, NO_NAME).unwrap();
+        write_mcb_header(&mut mem, 0x4041, b'Z', 0, ARENA_TOP - 0x4041 - 1, NO_NAME).unwrap();
+        kernel.resident_regions.push(0x4000);
+        // A child frame whose free base is below the resident region.
+        let dta = kernel.dta;
+        kernel.program_stack.push(ProgramContext {
+            arena: std::mem::take(&mut kernel.arena),
+            dta,
+            find_searches: HashMap::new(),
+            free_base: 0x1100,
+        });
+        kernel.arena = Arena {
+            psp_seg: 0x1200,
+            chain_first: 0x1100,
+            resident: false,
+        };
+        kernel.finish_exec(0, &mut mem).unwrap();
+        // The TSR block survives and the freed child region below it is capped.
+        let chain = read_mcb_chain(&mem, kernel.arena.first_mcb());
+        assert!(
+            chain
+                .iter()
+                .any(|m| m.mcb_seg == 0x4000 && m.owner == 0x4001),
+            "the resident TSR above the freed child survives"
+        );
+        assert!(
+            chain.iter().any(|m| m.mcb_seg == 0x1100 && m.owner == 0),
+            "the child's memory is freed below the TSR"
+        );
+        assert_eq!(
+            kernel.arena.free_base(&mem),
+            0x4041,
+            "free tail above the TSR"
+        );
     }
 
     #[test]
@@ -8289,7 +8803,7 @@ mod tests {
         load_com(&[0xb8, 0x00, 0x4c, 0xcd, 0x21], &mut mem, 0x0100).unwrap();
         let prog_top = mem.read_u16(0x0100 * 16 + 2).unwrap();
         let mut kernel = DosKernel::new();
-        kernel.init_program(0x0100, prog_top);
+        kernel.init_program(0x0100, prog_top, &mut mem).unwrap();
         (kernel, mem, prog_top)
     }
 
@@ -8391,7 +8905,7 @@ mod tests {
         assert_eq!(action, DosAction::Exit(7));
         // The arena trimmed the program block to psp_seg + DX and flagged it.
         assert!(kernel.arena.resident);
-        assert_eq!(kernel.arena.prog_top, 0x0100 + 0x0020);
+        assert_eq!(kernel.arena.prog_top(&mem), 0x0100 + 0x0020);
         // The freed tail is available: the next allocation puts its MCB header at the
         // trimmed top (0x0120) and hands back the data segment one paragraph higher.
         let mut alloc = DosRegs {
@@ -8490,7 +9004,7 @@ mod tests {
         let mut mem = Memory::new(1024 * 1024).unwrap();
         build_psp(&mut mem, 0x0100, ARENA_TOP).unwrap();
         let mut kernel = DosKernel::new();
-        kernel.init_program(0x0100, ARENA_TOP);
+        kernel.init_program(0x0100, ARENA_TOP, &mut mem).unwrap();
         kernel
             .install_environment(&mut mem, &[("BLASTER", "A220 I5 D1 H5 T6")])
             .unwrap();

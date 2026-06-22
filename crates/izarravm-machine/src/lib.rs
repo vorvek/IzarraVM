@@ -844,7 +844,10 @@ impl Machine {
         let prog_top = machine
             .memory
             .read_u16(usize::from(DOS_LOAD_SEGMENT) * 16 + 2)?;
-        machine.dos.init_program(DOS_LOAD_SEGMENT, prog_top);
+        {
+            let Machine { dos, memory, .. } = &mut machine;
+            dos.init_program(DOS_LOAD_SEGMENT, prog_top, memory)?;
+        }
         // Seed the DOS environment segment (BLASTER=/SETSOUND=) and record it in
         // PSP:0x2C so auto-detecting games find the SB16. The entries are derived
         // from the host config above; the borrow is split so the kernel and memory
@@ -5092,7 +5095,7 @@ impl Machine {
                                     if let Some(frame) = self.program_frames.pop() {
                                         // A child exited; resume the parent.
                                         self.cpu.registers = frame.registers;
-                                        self.dos.finish_exec(code);
+                                        self.dos.finish_exec(code, &mut self.memory)?;
                                         // EXEC success: AX=0, CF=0 in the parent's
                                         // INT-return FLAGS image (SS:SP+4).
                                         let ss = self.cpu.registers.segment(SegmentIndex::Ss).base;
