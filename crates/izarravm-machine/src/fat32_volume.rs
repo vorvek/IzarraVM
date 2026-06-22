@@ -26,7 +26,7 @@ const DIR_ENTRY_SIZE: usize = 32;
 const ATTR_ARCHIVE: u8 = 0x20;
 
 /// A read-only synthesized FAT32 volume answered one 512-byte sector at a time.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Fat32Volume {
     geo: Fat32Geometry,
     volume_id: u32,

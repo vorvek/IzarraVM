@@ -2799,15 +2799,17 @@ impl Machine {
                 self.set_int_frame_carry(true);
                 return;
             }
-            let sectors: Vec<[u8; 512]> = {
-                let vol = self.fat32_c.as_ref().unwrap();
-                (0..count)
-                    .map(|i| vol.read_sector(u32::from(start_lba.wrapping_add(i))))
-                    .collect()
-            };
-            for (i, sector) in sectors.iter().enumerate() {
-                let addr = buffer.wrapping_add(i as u32 * 512);
-                self.write_guest_block(addr, sector);
+            // Stream one sector at a time: each read borrows the volume only until
+            // the [u8;512] is returned by value, freeing self for the write, so a
+            // 512-byte buffer suffices rather than materializing up to 32 MB.
+            for i in 0..count {
+                let sector = self
+                    .fat32_c
+                    .as_ref()
+                    .unwrap()
+                    .read_sector(u32::from(start_lba.wrapping_add(i)));
+                let addr = buffer.wrapping_add(u32::from(i) * 512);
+                self.write_guest_block(addr, &sector);
             }
             self.set_ax(0);
             self.set_int_frame_carry(false);
@@ -7821,9 +7823,10 @@ mod tests {
         let mut m = int15_machine(16);
         m.mount_fat32(vol);
 
-        // INT 25h: AL=2 (C:), CX=1 sector, DX=0 (the boot sector), DS:BX -> 0x20000.
+        // INT 25h: AL=2 (C:), CX=2 sectors from LBA 0 (boot + FSInfo), DS:BX ->
+        // 0x20000. Two sectors exercise the i*512 buffer stepping.
         m.cpu.registers.set_eax(0x0002);
-        m.cpu.registers.set_ecx(0x0001);
+        m.cpu.registers.set_ecx(0x0002);
         m.cpu.registers.set_edx(0x0000);
         m.cpu
             .registers
@@ -7831,14 +7834,24 @@ mod tests {
         m.cpu.registers.set_ebx(0x0000);
         m.handle_int25();
         assert_eq!(m.cpu.registers.eax() as u16, 0x0000, "INT 25h read AX=0");
-        // The boot sector landed in the buffer: the FAT32 type string and the
-        // 0x55AA signature prove the volume's sector reached guest RAM.
+        // Sector 0 (the boot sector) landed at buffer+0: the FAT32 type string and
+        // the 0x55AA signature prove the volume's sector reached guest RAM.
         let fstype: Vec<u8> = (0..8u32)
             .map(|i| m.read_physical_u8(0x2_0000 + 82 + i))
             .collect();
         assert_eq!(&fstype, b"FAT32   ", "boot sector filesystem type");
         assert_eq!(m.read_physical_u8(0x2_0000 + 510), 0x55, "signature lo");
         assert_eq!(m.read_physical_u8(0x2_0000 + 511), 0xAA, "signature hi");
+        // Sector 1 (FSInfo) landed at buffer+512: its lead signature 0x41615252
+        // confirms the second sector stepped to the right offset.
+        let fsi_lead: Vec<u8> = (0..4u32)
+            .map(|i| m.read_physical_u8(0x2_0000 + 512 + i))
+            .collect();
+        assert_eq!(
+            &fsi_lead,
+            &0x4161_5252u32.to_le_bytes(),
+            "FSInfo lead signature"
+        );
 
         // INT 26h write to the read-only volume is write-protected.
         m.cpu.registers.set_eax(0x0002);
@@ -7854,6 +7867,18 @@ mod tests {
             0x0300,
             "INT 26h write to a read-only volume is write-protected"
         );
+    }
+
+    #[test]
+    fn int25_drive_c_without_a_volume_is_drive_not_ready() {
+        // AL=2 with no FAT32 volume mounted falls through to the drive-not-ready
+        // path, the same as before this wiring existed.
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x0002);
+        m.cpu.registers.set_ecx(0x0001);
+        m.cpu.registers.set_edx(0x0000);
+        m.handle_int25();
+        assert_eq!(m.cpu.registers.eax() as u16, 0x4002, "drive not ready");
     }
 
     #[test]
