@@ -355,8 +355,10 @@ pub struct Machine {
     fast_post: bool,
     // Booter-inert mode: when set, the Toka-DOS HLE and IEMM stand down so a
     // self-booting disk owns the DOS/memory-manager interrupts through the IVT
-    // (the BIOS services stay intercepted). The single chokepoint that other
-    // phases branch on; nothing auto-detects a booter yet, so it defaults off.
+    // (the BIOS services stay intercepted). INT 19h sets it by boot source: a
+    // floppy boot turns it on (the disk's sector-0 code is the OS), a C: Toka-DOS
+    // boot turns it off (the HLE is the OS), re-evaluated on every boot so a warm
+    // reboot flips it. It starts off and stays off until the first boot.
     booter_inert: bool,
     // INT 33h mouse-driver HLE state: virtual cursor position, button mask,
     // visibility, motion-counter accumulators, and the configured ranges. The
@@ -2116,6 +2118,11 @@ impl Machine {
         {
             self.write_guest_block(BOOT_SECTOR_ADDRESS as u32, &sector[..512]);
             self.cpu.registers.set_edx(0x00); // DL = 00h: booted from floppy A:
+            // The floppy's own sector-0 code is the OS now, so the HLE Toka-DOS
+            // and IEMM stand down and the disk owns the DOS interrupts through the
+            // IVT. Real hardware just runs whatever sector 0 holds; this confines
+            // the HLE injection to the C: boot below.
+            self.booter_inert = true;
             self.set_cs_ip(0x0000, BOOT_SECTOR_ADDRESS as u16);
             return;
         }
@@ -2123,6 +2130,10 @@ impl Machine {
         // boot record landed at 0x7C00 and the DOS base is set up; jump to it.
         if self.toka_load_boot_record() == 0 {
             self.cpu.registers.set_edx(0x80); // DL = 80h: booted from fixed disk C:
+            // The bundled Toka-DOS is the OS, so the HLE is live again. Clearing
+            // here is what makes a warm reboot from C: take the machine back from
+            // a booter floppy that set the flag on a previous INT 19h.
+            self.booter_inert = false;
             self.set_cs_ip(0x0000, BOOT_SECTOR_ADDRESS as u16);
             return;
         }
@@ -8418,6 +8429,64 @@ mod tests {
         assert_eq!(
             m.pending_soft_int, None,
             "an un-intercepted vector is ignored"
+        );
+    }
+
+    #[test]
+    fn int19_floppy_boot_marks_the_machine_booter_inert() {
+        // Booting any floppy hands the machine to the disk's own sector-0 code,
+        // so the HLE Toka-DOS stands down the way it would on real hardware:
+        // whatever is in the boot sector is the OS now, not the HLE.
+        let mut m = int15_machine(16);
+        m.mount_floppy(vec![0u8; 1_474_560]).unwrap(); // 1.44 MB, readable sector 0
+        assert!(!m.booter_inert(), "booter-inert defaults off");
+        m.handle_int19();
+        assert!(
+            m.booter_inert(),
+            "a floppy boot stands the HLE down so the disk owns the DOS interrupts"
+        );
+        assert_eq!(
+            m.cpu.registers.edx() as u8,
+            0x00,
+            "DL=00h: the floppy branch ran"
+        );
+    }
+
+    #[test]
+    fn int19_c_drive_boot_clears_booter_inert() {
+        // Booting the bundled Toka-DOS on C: makes the HLE the OS again, so a
+        // prior booter boot's inert flag is cleared. INT 19h re-evaluates every
+        // time, which is how a warm reboot from C: takes the machine back from a
+        // booter floppy.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ICOMMAND.COM"), b"stub").unwrap();
+        let mut m = int15_machine(16);
+        m.set_toka_c_root(dir.path().to_path_buf());
+        m.set_booter_inert(true); // simulate a prior booter boot
+        m.handle_int19(); // no floppy mounted -> the C: Toka-DOS HLE path
+        assert!(
+            !m.booter_inert(),
+            "a Toka-DOS C: boot makes the HLE the OS again"
+        );
+        assert_eq!(
+            m.cpu.registers.edx() as u8,
+            0x80,
+            "DL=80h: the C: branch ran"
+        );
+    }
+
+    #[test]
+    fn floppy_booted_machine_stands_dos_down_at_interrupt_ack() {
+        // The end-to-end guarantee: after a floppy boot the next INT 21h must
+        // stand down so the disk's own handler runs, not the HLE. This catches a
+        // stale booter-inert snapshot in the per-interrupt bus.
+        let mut m = int15_machine(16);
+        m.mount_floppy(vec![0u8; 1_474_560]).unwrap();
+        m.handle_int19();
+        m.make_bus().interrupt_acknowledge(0x21, 0).unwrap();
+        assert_eq!(
+            m.pending_soft_int, None,
+            "INT 21h stands down once a floppy has booted"
         );
     }
 
