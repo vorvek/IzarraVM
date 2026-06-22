@@ -2614,18 +2614,70 @@ impl Machine {
                 let result = self.xms.resize(handle, kb);
                 self.xms_result(result);
             }
-            // 10h request UMB, 11h release UMB. No upper memory blocks are modeled,
-            // so 10h fails "no UMBs available" (BL=B1h) with the largest available
-            // block in DX=0; 11h fails "invalid segment" (BL=B2h). A guest reads
-            // this as "no UMB" and falls back to conventional memory.
-            // ponytail: no UMB region exists yet. The upgrade path is the memory
-            // mapper backing a UMB window in the 0xC000-0xEFFF hole and answering
-            // 10h/11h from it.
+            // 10h Request UMB: DX = paragraphs. Carves from the same upper-memory MCB
+            // chain the AH=48h-high path uses (never double-handing a paragraph).
+            // Success: AX=1, BX=segment, DX=actual paras. Failure: a smaller block
+            // available -> B0h with DX=largest; nothing -> B1h with DX=0.
             0x10 => {
-                self.set_dx(0x0000);
-                self.xms_failure(0xB1);
+                let paras = self.cpu.registers.edx() as u16;
+                let result = {
+                    let Machine { dos, memory, .. } = self;
+                    dos.request_umb(paras, memory)
+                };
+                match result {
+                    Ok(Ok(seg)) => {
+                        // AX=1 success, BX=segment, DX=size. Set AX directly rather
+                        // than xms_success(), which would zero BL and corrupt the
+                        // low byte of the returned segment.
+                        self.set_bx(seg);
+                        self.set_dx(paras);
+                        self.set_ax(1);
+                    }
+                    Ok(Err(largest)) => {
+                        self.set_dx(largest);
+                        self.xms_failure(if largest == 0 {
+                            xms::err::NO_UMB_AVAILABLE
+                        } else {
+                            xms::err::UMB_SMALLER_AVAILABLE
+                        });
+                    }
+                    Err(_) => {
+                        self.set_dx(0);
+                        self.xms_failure(xms::err::NO_UMB_AVAILABLE);
+                    }
+                }
             }
-            0x11 => self.xms_failure(0xB2),
+            // 11h Release UMB: DX = segment. B2h on a segment that is not a UMB.
+            0x11 => {
+                let seg = self.cpu.registers.edx() as u16;
+                let result = {
+                    let Machine { dos, memory, .. } = self;
+                    dos.release_umb(seg, memory)
+                };
+                match result {
+                    Ok(Ok(())) => self.xms_success(),
+                    _ => self.xms_failure(xms::err::INVALID_UMB_SEGMENT),
+                }
+            }
+            // 12h Reallocate UMB: BX = new paragraphs, DX = segment. A grow that
+            // does not fit -> B0h with DX=largest; an unknown segment -> B2h.
+            0x12 => {
+                let paras = self.cpu.registers.ebx() as u16;
+                let seg = self.cpu.registers.edx() as u16;
+                let result = {
+                    let Machine { dos, memory, .. } = self;
+                    dos.resize_umb(seg, paras, memory)
+                };
+                match result {
+                    Ok(Ok(())) => self.xms_success(),
+                    Ok(Err(0)) => self.xms_failure(xms::err::INVALID_UMB_SEGMENT),
+                    Ok(Err(largest)) => {
+                        self.set_dx(largest);
+                        self.xms_failure(xms::err::UMB_SMALLER_AVAILABLE);
+                    }
+                    Err(_) => self.xms_failure(xms::err::INVALID_UMB_SEGMENT),
+                }
+            }
             // Unimplemented function: AX=0, BL=80h (not implemented).
             _ => self.xms_failure(xms::err::NOT_IMPLEMENTED),
         }
@@ -7445,6 +7497,62 @@ mod tests {
             0x02,
             "port 0x92 bit1 set"
         );
+    }
+
+    #[test]
+    fn xms_request_release_and_reallocate_umb_from_the_shared_pool() {
+        const PROG: [u8; 2] = [0xCD, 0x20]; // int 20h
+        let mut m =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
+                .unwrap();
+        // Request a 0x100-paragraph UMB (AH=10h, DX=paras).
+        m.cpu.registers.set_eax(0x1000);
+        m.cpu.registers.set_edx(0x0100);
+        m.handle_xms();
+        assert_eq!(m.cpu.registers.eax() as u16, 1, "request succeeds");
+        let seg = m.cpu.registers.ebx() as u16;
+        assert!(
+            (0xc800..0xf000).contains(&seg),
+            "the UMB sits in the upper window, got {seg:#06x}"
+        );
+        assert_eq!(
+            m.cpu.registers.edx() as u16,
+            0x0100,
+            "granted size echoes the request"
+        );
+        // The block is RAM the guest can use.
+        let addr = (u32::from(seg) << 4) + 4;
+        m.write_physical_u8(addr, 0x5a);
+        assert_eq!(m.read_physical_u8(addr), 0x5a);
+
+        // A request larger than the pool reports the largest available (B0h).
+        m.cpu.registers.set_eax(0x1000);
+        m.cpu.registers.set_edx(0x9000);
+        m.handle_xms();
+        assert_eq!(
+            m.cpu.registers.eax() as u16,
+            0,
+            "an over-large request fails"
+        );
+        assert_eq!(
+            m.cpu.registers.ebx() & 0xff,
+            0xb0,
+            "BL=B0h smaller available"
+        );
+        assert!(m.cpu.registers.edx() as u16 > 0, "DX = largest available");
+
+        // Release the block (AH=11h, DX=segment).
+        m.cpu.registers.set_eax(0x1100);
+        m.cpu.registers.set_edx(u32::from(seg));
+        m.handle_xms();
+        assert_eq!(m.cpu.registers.eax() as u16, 1, "release succeeds");
+
+        // Releasing a segment that is not a UMB is B2h.
+        m.cpu.registers.set_eax(0x1100);
+        m.cpu.registers.set_edx(0x0050);
+        m.handle_xms();
+        assert_eq!(m.cpu.registers.eax() as u16, 0, "bogus release fails");
+        assert_eq!(m.cpu.registers.ebx() & 0xff, 0xb2, "BL=B2h invalid segment");
     }
 
     #[test]

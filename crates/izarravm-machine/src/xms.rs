@@ -49,6 +49,13 @@ pub mod err {
     pub const BLOCK_LOCKED: u8 = 0xab;
     /// Lock count overflowed.
     pub const LOCK_COUNT_OVERFLOW: u8 = 0xac;
+    /// Request UMB (10h) / Reallocate UMB (12h): only a smaller block is available;
+    /// DX holds the largest available size.
+    pub const UMB_SMALLER_AVAILABLE: u8 = 0xb0;
+    /// Request UMB (10h): no upper memory blocks are available.
+    pub const NO_UMB_AVAILABLE: u8 = 0xb1;
+    /// Release/Reallocate UMB (11h/12h): the UMB segment number is invalid.
+    pub const INVALID_UMB_SEGMENT: u8 = 0xb2;
 }
 
 /// Linear base address of extended memory: the first byte above the 1 MB line.

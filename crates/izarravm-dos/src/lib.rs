@@ -1168,6 +1168,68 @@ impl DosKernel {
         self.arena.resize(seg, paras, mem)
     }
 
+    /// Whether an upper-memory-block arena is furnished (the EMM386 manager is
+    /// loaded with UMBs). The XMS UMB calls and the AH=5803h link gate on this.
+    pub fn has_umb_arena(&self) -> bool {
+        self.umb.is_some()
+    }
+
+    /// Set the AH=5803h UMB link state. The machine calls this at SYSINIT to link
+    /// the arena when CONFIG.SYS carries DOS=UMB, so a default box comes up linked.
+    pub fn set_umb_link(&mut self, linked: bool) {
+        self.umb_link = linked;
+    }
+
+    /// XMS function 10h Request UMB: carve `paras` paragraphs from the SAME
+    /// upper-memory MCB chain the AH=48h-high path uses, so the two never hand out
+    /// the same paragraph. Ok(Ok(segment)), Ok(Err(largest data paras / 0 when the
+    /// pool is full)), Err(DosError) on a memory fault. Independent of the AH=5803h
+    /// link: XMS Request UMB is the manager primitive, available whenever the pool
+    /// exists.
+    pub fn request_umb(
+        &mut self,
+        paras: u16,
+        mem: &mut Memory,
+    ) -> Result<Result<u16, u16>, DosError> {
+        match self.umb {
+            Some(u) => carve_from_tail(u.first_mcb, u.top, paras, mem),
+            None => Ok(Err(0)),
+        }
+    }
+
+    /// XMS function 11h Release UMB: free the upper-memory block whose segment is
+    /// `seg`. Ok(Ok(())), or Ok(Err(())) when `seg` is not a UMB block.
+    pub fn release_umb(&mut self, seg: u16, mem: &mut Memory) -> Result<Result<(), ()>, DosError> {
+        match self.umb {
+            Some(u) if (u.first_mcb..u.top).contains(&seg) => {
+                free_block(u.first_mcb, u.top, seg, mem)
+            }
+            _ => Ok(Err(())),
+        }
+    }
+
+    /// XMS function 12h Reallocate UMB: resize the upper-memory block at `seg` to
+    /// `paras`. Ok(Ok(())), Ok(Err(largest data paras)) when a grow does not fit,
+    /// Ok(Err(0)) when `seg` is not a UMB block.
+    pub fn resize_umb(
+        &mut self,
+        seg: u16,
+        paras: u16,
+        mem: &mut Memory,
+    ) -> Result<Result<(), u16>, DosError> {
+        let Some(u) = self.umb else {
+            return Ok(Err(0));
+        };
+        if !(u.first_mcb..u.top).contains(&seg) {
+            return Ok(Err(0));
+        }
+        match resize_block(u.first_mcb, u.top, seg, paras, mem)? {
+            Ok(()) => Ok(Ok(())),
+            Err(ResizeError::TooBig(largest)) => Ok(Err(largest)),
+            Err(ResizeError::InvalidBlock) => Ok(Err(0)),
+        }
+    }
+
     /// Stand up a system PSP, arena, and base environment with no running
     /// program, so a boot stub can EXEC the shell as the first process. This is
     /// the SYSINIT-equivalent: it gives the first `AH=4Bh` a valid parent context
