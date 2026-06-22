@@ -99,11 +99,13 @@ static unsigned long dword_at(const unsigned char *p)
 
 /* The master environment: a DOS-format block of KEY=VALUE strings, each NUL
  * terminated, ended by an empty string (a double NUL). ICOMMAND owns it and
- * seeds it with the same defaults the boot environment carries. SET/PATH/PROMPT
- * edit it and the prompt reads it. (Children still inherit the boot environment,
- * so a SET after boot is not yet propagated into a launched program.) */
-static char master_env[2048] =
-    "PATH=C:\\;C:\\DOS\0PROMPT=$p$g\0COMSPEC=C:\\ICOMMAND.COM\0";
+ * seeds it. PATH is deliberately absent at boot, the way real COMMAND.COM leaves
+ * it: AUTOEXEC.BAT sets it (the default config carries PATH=C:\DOS), and until
+ * then external commands resolve from the current directory. SET/PATH/PROMPT
+ * edit this block and the prompt reads it. (Children still inherit the boot
+ * environment, so a SET after boot is not yet propagated into a launched
+ * program.) */
+static char master_env[2048] = "PROMPT=$p$g\0COMSPEC=C:\\ICOMMAND.COM\0";
 
 static int key_matches(const char *entry, const char *name, int namelen)
 {
@@ -251,8 +253,12 @@ static void cmd_path(char *rest)
     char *value;
     if (rest[0] == 0) {
         value = env_get("PATH");
-        t_puts("PATH=");
-        t_putln(value ? value : "");
+        if (value && *value) {
+            t_puts("PATH=");
+            t_putln(value);
+        } else {
+            t_putln("No Path"); /* the DOS message when no path is set */
+        }
         return;
     }
     env_set("PATH", rest);
@@ -261,6 +267,42 @@ static void cmd_path(char *rest)
 static void cmd_prompt(char *rest)
 {
     env_set("PROMPT", rest[0] ? rest : "$p$g");
+}
+
+/* Case-insensitive test that `s` begins with `prefix`. */
+static int starts_ci(const char *s, const char *prefix)
+{
+    while (*prefix) {
+        if (up(*s) != up(*prefix)) {
+            return 0;
+        }
+        s++;
+        prefix++;
+    }
+    return 1;
+}
+
+/* PATH=x and PROMPT=x are the no-space assignment forms of these internal
+ * commands. Real COMMAND.COM treats PATH=x like PATH x, so an AUTOEXEC.BAT line
+ * such as "PATH=C:\DOS" works, and a bare "PATH=" clears the search path. The
+ * value is read from the whole line so it is not clipped by the 16-byte
+ * command-word buffer that split_word fills. PATH goes straight through env_set
+ * (an empty value removes the variable) rather than cmd_path, whose no-argument
+ * path prints instead of clearing. Recognized at the prompt and as a top-level
+ * batch line; the nested IF/FOR/CALL forms still take the spaced or SET spelling.
+ * Returns 1 when it handled the line. */
+static int run_assignment(char *line)
+{
+    char *p = skip_ws(line);
+    if (starts_ci(p, "PATH=")) {
+        env_set("PATH", p + 5);
+        return 1;
+    }
+    if (starts_ci(p, "PROMPT=")) {
+        cmd_prompt(p + 7);
+        return 1;
+    }
+    return 0;
 }
 
 /* TRUENAME: print the fully qualified path of the argument. */
@@ -776,7 +818,7 @@ static void bat_exec_line(char *raw)
     } else if (eqi(word, "CALL")) {
         char *r2 = split_word(rest, word, sizeof word);
         dispatch(word, r2);
-    } else {
+    } else if (!run_assignment(expanded)) {
         dispatch(word, rest);
     }
 }
@@ -998,6 +1040,9 @@ int main(void)
         t_getline(line, LINE_MAX);
         rest = split_word(line, word, sizeof word);
         if (word[0] == 0) {
+            continue;
+        }
+        if (run_assignment(line)) {
             continue;
         }
         dispatch(word, rest);
