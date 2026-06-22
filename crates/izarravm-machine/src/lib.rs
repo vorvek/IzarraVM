@@ -1,4 +1,9 @@
 pub use fat12::build_fat12;
+pub use fat32::{
+    FAT_ATTR_DIRECTORY, FAT32_EOC, Fat32Geometry, Fat32Table, fat32_boot_sector, fat32_dir_entry,
+    fat32_dot_entries, fat32_fsinfo_sector, fat32_geometry, fat32_is_eoc,
+};
+pub use fat32_volume::{Fat32Volume, build_fat32};
 use izarravm_audio::{Ad1848, Ad1848Config, OplChip, Resampler, SbDsp, SbMixer};
 use izarravm_bus::{BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CpuBus, Memory};
 use izarravm_core::{GswMode, HardwareProfile, SoundBlasterConfig, VideoCard, WssConfig};
@@ -18,6 +23,9 @@ mod atapi;
 mod cdimage;
 mod dma;
 mod fat12;
+mod fat32;
+mod fat32_volume;
+mod fat_name;
 mod fdc;
 mod floppy;
 mod ide;
@@ -319,6 +327,12 @@ pub struct Machine {
     // boot drive C:; None when no image is mounted. INT 13h DL>=0x80 and the
     // primary-channel ports drive it.
     ata: Option<ata::AtaDisk>,
+    // Synthesized read-only FAT32 volume serving drive C: to the DOS absolute-disk
+    // interface (INT 25h read; INT 26h write is write-protected). Optional and
+    // consulted only by INT 25h/26h for AL=2, so it does not touch the ATA / INT
+    // 13h path. None until one is mounted. The eventual single C: backing (ATA
+    // vs this) is the install-layout decision (P2).
+    fat32_c: Option<Fat32Volume>,
     cd_accesses: u64,
     // Fractional Red Book frames owed to the CD-audio mixer from the DAC clock.
     cd_audio_frac: f64,
@@ -534,6 +548,7 @@ impl Machine {
             c_accesses: 0,
             ide: ide::IdeChannel::new(),
             ata: None,
+            fat32_c: None,
             cd_accesses: 0,
             cd_audio_frac: 0.0,
             rtc: rtc::Rtc::new(),
@@ -653,6 +668,13 @@ impl Machine {
     pub fn mount_hdd(&mut self, bytes: Vec<u8>) {
         self.ata = Some(ata::AtaDisk::new(bytes));
         let _ = self.memory.write_u8(0x475, 1); // BDA fixed-disk count
+    }
+
+    /// Mount a synthesized FAT32 volume as drive C: for the DOS absolute-disk
+    /// interface. INT 25h reads its sectors; INT 26h writes are write-protected
+    /// (the volume is read-only). Build one with `build_fat32`.
+    pub fn mount_fat32(&mut self, volume: Fat32Volume) {
+        self.fat32_c = Some(volume);
     }
 
     /// Eject the hard disk, returning its current image bytes (including any
@@ -2816,6 +2838,37 @@ impl Machine {
         let ds = self.cpu.registers.segment(SegmentIndex::Ds).base;
         let bx = self.cpu.registers.ebx() as u16;
         let buffer = ds.wrapping_add(u32::from(bx));
+
+        // Drive C: (AL=2) is served by the synthesized FAT32 volume when one is
+        // mounted. Every 16-bit logical sector falls in the first 32 MB of any
+        // FAT32 volume (its sector count exceeds 0xFFFF), so the classic form
+        // addresses a valid sector and never reports out of range here. The
+        // packet form (CX=FFFFh / AH=7305h) for sectors past 32 MB is a follow-up.
+        if al == 0x02 && self.fat32_c.is_some() {
+            if write {
+                // The volume is read-only: an absolute write is write-protected.
+                // AL=00h is the write-protect error (INT 24h code); AH=03h is the
+                // write-protected disk status.
+                self.set_ax(0x0300);
+                self.set_int_frame_carry(true);
+                return;
+            }
+            // Stream one sector at a time: each read borrows the volume only until
+            // the [u8;512] is returned by value, freeing self for the write, so a
+            // 512-byte buffer suffices rather than materializing up to 32 MB.
+            for i in 0..count {
+                let sector = self
+                    .fat32_c
+                    .as_ref()
+                    .unwrap()
+                    .read_sector(u32::from(start_lba.wrapping_add(i)));
+                let addr = buffer.wrapping_add(u32::from(i) * 512);
+                self.write_guest_block(addr, &sector);
+            }
+            self.set_ax(0);
+            self.set_int_frame_carry(false);
+            return;
+        }
 
         // Only floppy A: is backed. Any other drive, or no media, reports a
         // drive-not-ready error (AX low byte 0x02 = drive not ready, high byte 0x40
@@ -7972,6 +8025,82 @@ mod tests {
         m.cpu.registers.set_eax(0x0000);
         m.cpu.registers.set_ecx(0x0001);
         m.cpu.registers.set_edx(0);
+        m.handle_int25();
+        assert_eq!(m.cpu.registers.eax() as u16, 0x4002, "drive not ready");
+    }
+
+    #[test]
+    fn int25_reads_the_fat32_volume_and_int26_is_write_protected() {
+        let dir = std::env::temp_dir().join(format!(
+            "izarra_int25_fat32_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("HELLO.TXT"), b"hi").unwrap();
+        let vol = build_fat32(&dir, 64 * 1024 * 1024, 0x1234_5678).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        let mut m = int15_machine(16);
+        m.mount_fat32(vol);
+
+        // INT 25h: AL=2 (C:), CX=2 sectors from LBA 0 (boot + FSInfo), DS:BX ->
+        // 0x20000. Two sectors exercise the i*512 buffer stepping.
+        m.cpu.registers.set_eax(0x0002);
+        m.cpu.registers.set_ecx(0x0002);
+        m.cpu.registers.set_edx(0x0000);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x2000));
+        m.cpu.registers.set_ebx(0x0000);
+        m.handle_int25();
+        assert_eq!(m.cpu.registers.eax() as u16, 0x0000, "INT 25h read AX=0");
+        // Sector 0 (the boot sector) landed at buffer+0: the FAT32 type string and
+        // the 0x55AA signature prove the volume's sector reached guest RAM.
+        let fstype: Vec<u8> = (0..8u32)
+            .map(|i| m.read_physical_u8(0x2_0000 + 82 + i))
+            .collect();
+        assert_eq!(&fstype, b"FAT32   ", "boot sector filesystem type");
+        assert_eq!(m.read_physical_u8(0x2_0000 + 510), 0x55, "signature lo");
+        assert_eq!(m.read_physical_u8(0x2_0000 + 511), 0xAA, "signature hi");
+        // Sector 1 (FSInfo) landed at buffer+512: its lead signature 0x41615252
+        // confirms the second sector stepped to the right offset.
+        let fsi_lead: Vec<u8> = (0..4u32)
+            .map(|i| m.read_physical_u8(0x2_0000 + 512 + i))
+            .collect();
+        assert_eq!(
+            &fsi_lead,
+            &0x4161_5252u32.to_le_bytes(),
+            "FSInfo lead signature"
+        );
+
+        // INT 26h write to the read-only volume is write-protected.
+        m.cpu.registers.set_eax(0x0002);
+        m.cpu.registers.set_ecx(0x0001);
+        m.cpu.registers.set_edx(0x0000);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x2000));
+        m.cpu.registers.set_ebx(0x0000);
+        m.handle_int26();
+        assert_eq!(
+            m.cpu.registers.eax() as u16,
+            0x0300,
+            "INT 26h write to a read-only volume is write-protected"
+        );
+    }
+
+    #[test]
+    fn int25_drive_c_without_a_volume_is_drive_not_ready() {
+        // AL=2 with no FAT32 volume mounted falls through to the drive-not-ready
+        // path, the same as before this wiring existed.
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x0002);
+        m.cpu.registers.set_ecx(0x0001);
+        m.cpu.registers.set_edx(0x0000);
         m.handle_int25();
         assert_eq!(m.cpu.registers.eax() as u16, 0x4002, "drive not ready");
     }
