@@ -1,5 +1,5 @@
 use izarravm_bus::{BusError, Memory};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -114,10 +114,12 @@ fn is_root_system_file(name: &str) -> bool {
 /// path-showing prompt. DOS line endings (CRLF).
 const DEFAULT_AUTOEXEC_BAT: &str = "@ECHO OFF\r\nPATH=C:\\DOS\r\nPROMPT=$P$G\r\n";
 
-/// The default CONFIG.SYS: the directives a period DOS carries. The DEVICE= lines
-/// for the memory manager (IEMM, not built yet) and the CD extension are left out
-/// until those drivers exist; the HLE does not yet interpret CONFIG.SYS anyway.
-const DEFAULT_CONFIG_SYS: &str = "DOS=HIGH,UMB\r\nFILES=40\r\nBUFFERS=20\r\nLASTDRIVE=E\r\n";
+/// The default CONFIG.SYS: the directives a period DOS carries. The HIMEM.SYS and
+/// EMM386.EXE RAM lines select the IEMM RAM mode (UMBs plus the EMS page frame) at
+/// SYSINIT, the way a real DOS=HIGH,UMB box is configured; the machine parses these
+/// to drive the memory layout. The CD-extension DEVICE= line is still left out
+/// until that driver exists.
+const DEFAULT_CONFIG_SYS: &str = "DEVICE=C:\\DOS\\HIMEM.SYS /TESTMEM:OFF\r\nDEVICE=C:\\DOS\\EMM386.EXE RAM\r\nDOS=HIGH,UMB\r\nFILES=40\r\nBUFFERS=20\r\nLASTDRIVE=E\r\n";
 
 fn write_system_files(c_root: &Path, files: &[(String, Vec<u8>)]) -> std::io::Result<()> {
     std::fs::create_dir_all(c_root)?;
@@ -882,6 +884,19 @@ fn open_host_file(path: &Path, mode: AccessMode) -> std::io::Result<File> {
     }
 }
 
+/// Whether a DOS filename names the EMMXXXX0 character device. DOS matches a
+/// device by its base name regardless of drive, path, or extension, so EMMXXXX0,
+/// C:\EMMXXXX0, and EMMXXXX0.SYS all refer to the device.
+fn is_ems_device_name(name: &str) -> bool {
+    name.rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(name)
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .eq_ignore_ascii_case("EMMXXXX0")
+}
+
 /// One entry of a FindFirst/FindNext result: the documented DTA fields plus the
 /// uppercase 8.3 name to write into the 13-byte ASCIIZ slot.
 #[derive(Debug, Clone)]
@@ -969,6 +984,18 @@ pub struct DosKernel {
     // The upper-memory-block arena, when the machine has furnished one (see
     // `set_umb_region`). None on a machine with no UMB-able memory.
     umb: Option<UmbArena>,
+    // Whether the EMS manager (the EMMXXXX0 character device) is present. The
+    // machine sets it from the EMM386 mode; it gates opening the EMMXXXX0 device
+    // and listing it in the device chain, the way a guest detects expanded memory.
+    ems_present: bool,
+    // Whether CONFIG.SYS carried DOS=UMB. Real DOS lets a program link the upper
+    // area through AH=5803h only when the box was loaded with DOS=UMB; without it,
+    // upper memory is reachable only through the XMS Request UMB primitive. The
+    // machine sets this from the parsed CONFIG.SYS.
+    dos_umb: bool,
+    // Handles a guest has opened on the EMMXXXX0 device (AH=3Dh), so AH=44h IOCTL
+    // and AH=3Eh close treat them as the device rather than a host file.
+    ems_handles: HashSet<u16>,
     // AH=59h extended error: the last DOS error code reported to a guest. Held until
     // the next error overwrites it (DOS does not clear it on a successful call).
     last_error: u16,
@@ -1048,7 +1075,10 @@ impl DosKernel {
         mem: &mut Memory,
     ) -> Result<(), DosError> {
         if paras < 2 {
+            // No upper memory: drop the arena and the link, keeping the invariant
+            // that a linked state always has an arena behind it.
             self.umb = None;
+            self.umb_link = false;
             return Ok(());
         }
         // One free 'Z' block: the header takes the first paragraph, the rest is the
@@ -1060,6 +1090,21 @@ impl DosKernel {
             top: seg.wrapping_add(paras),
         });
         Ok(())
+    }
+
+    /// Set whether the EMS manager (the EMMXXXX0 device) is present. The machine
+    /// calls this from the EMM386 mode at DOS init: a guest then detects expanded
+    /// memory by opening EMMXXXX0 or walking the device chain.
+    pub fn set_ems_present(&mut self, present: bool) {
+        self.ems_present = present;
+    }
+
+    /// The lowest free file handle (>= 5), skipping both host files and the open
+    /// EMS-device handles so the two never collide.
+    fn alloc_handle(&self) -> u16 {
+        (5u16..)
+            .find(|h| !self.open_files.contains_key(h) && !self.ems_handles.contains(h))
+            .expect("a free DOS handle exists at or below u16::MAX")
     }
 
     /// Walk the upper-memory arena's MCB chain, empty when no UMB pool is furnished.
@@ -1131,6 +1176,75 @@ impl DosKernel {
             }
         }
         self.arena.resize(seg, paras, mem)
+    }
+
+    /// Whether an upper-memory-block arena is furnished (the EMM386 manager is
+    /// loaded with UMBs). The XMS UMB calls and the AH=5803h link gate on this.
+    pub fn has_umb_arena(&self) -> bool {
+        self.umb.is_some()
+    }
+
+    /// Set the AH=5803h UMB link state. The machine calls this at SYSINIT to link
+    /// the arena when CONFIG.SYS carries DOS=UMB, so a default box comes up linked.
+    pub fn set_umb_link(&mut self, linked: bool) {
+        self.umb_link = linked;
+    }
+
+    /// Record whether CONFIG.SYS carried DOS=UMB, which gates whether AH=5803h may
+    /// link the upper area at all. The machine sets this at SYSINIT.
+    pub fn set_dos_umb(&mut self, configured: bool) {
+        self.dos_umb = configured;
+    }
+
+    /// XMS function 10h Request UMB: carve `paras` paragraphs from the SAME
+    /// upper-memory MCB chain the AH=48h-high path uses, so the two never hand out
+    /// the same paragraph. Ok(Ok(segment)), Ok(Err(largest data paras / 0 when the
+    /// pool is full)), Err(DosError) on a memory fault. Independent of the AH=5803h
+    /// link: XMS Request UMB is the manager primitive, available whenever the pool
+    /// exists.
+    pub fn request_umb(
+        &mut self,
+        paras: u16,
+        mem: &mut Memory,
+    ) -> Result<Result<u16, u16>, DosError> {
+        match self.umb {
+            Some(u) => carve_from_tail(u.first_mcb, u.top, paras, mem),
+            None => Ok(Err(0)),
+        }
+    }
+
+    /// XMS function 11h Release UMB: free the upper-memory block whose segment is
+    /// `seg`. Ok(Ok(())), or Ok(Err(())) when `seg` is not a UMB block.
+    pub fn release_umb(&mut self, seg: u16, mem: &mut Memory) -> Result<Result<(), ()>, DosError> {
+        match self.umb {
+            Some(u) if (u.first_mcb..u.top).contains(&seg) => {
+                free_block(u.first_mcb, u.top, seg, mem)
+            }
+            _ => Ok(Err(())),
+        }
+    }
+
+    /// XMS function 12h Reallocate UMB: resize the upper-memory block at `seg` to
+    /// `paras`. Ok(Ok(())); Ok(Err(Some(largest))) when a grow does not fit (the
+    /// caller maps it to B0h with the largest size); Ok(Err(None)) when `seg` is not
+    /// a UMB block (B2h).
+    pub fn resize_umb(
+        &mut self,
+        seg: u16,
+        paras: u16,
+        mem: &mut Memory,
+    ) -> Result<Result<(), Option<u16>>, DosError> {
+        let Some(u) = self.umb else {
+            return Ok(Err(None));
+        };
+        if !(u.first_mcb..u.top).contains(&seg) {
+            return Ok(Err(None));
+        }
+        match resize_block(u.first_mcb, u.top, seg, paras, mem)? {
+            Ok(()) => Ok(Ok(())),
+            Err(ResizeError::TooBig(largest)) => Ok(Err(Some(largest))),
+            Err(ResizeError::InvalidBlock) => Ok(Err(None)),
+        }
     }
 
     /// Stand up a system PSP, arena, and base environment with no running
@@ -2481,6 +2595,19 @@ impl DosKernel {
             // the access mode (0=read, 1=write, 2=read/write), honored and enforced
             // per handle. CF=0 + AX=handle on success, CF=1 + AX=DOS code on error.
             0x3d => {
+                // A character-device name opens the device, not a file. The EMMXXXX0
+                // EMS manager is the one we model: open it when present so a guest's
+                // detection (open + IOCTL) succeeds; when absent let it fall through
+                // to a host-file open that fails, so the guest reads "no EMS".
+                if let Some(name) = read_asciiz(mem, regs.ds, regs.dx)? {
+                    if is_ems_device_name(&name) && self.ems_present {
+                        let handle = self.alloc_handle();
+                        self.ems_handles.insert(handle);
+                        regs.ax = handle;
+                        regs.cf = false;
+                        return Ok(DosAction::Continue);
+                    }
+                }
                 let path = match self.resolve_open_path(mem, regs.ds, regs.dx)? {
                     Ok(path) => path,
                     Err(code) => {
@@ -2496,9 +2623,7 @@ impl DosKernel {
                 };
                 match open_host_file(&path, mode) {
                     Ok(file) => {
-                        let handle = (5u16..)
-                            .find(|h| !self.open_files.contains_key(h))
-                            .expect("a free DOS handle exists at or below u16::MAX");
+                        let handle = self.alloc_handle();
                         self.open_files.insert(handle, OpenFile { file, mode });
                         regs.ax = handle;
                         regs.cf = false;
@@ -2510,6 +2635,14 @@ impl DosKernel {
             0x3f => {
                 let handle = regs.bx;
                 let count = usize::from(regs.cx);
+                // A read from the EMMXXXX0 character device returns end-of-file (0
+                // bytes), the way a real EMM driver answers a DOS read; its control
+                // traffic goes through INT 67h, not the file handle.
+                if self.ems_handles.contains(&handle) {
+                    regs.ax = 0;
+                    regs.cf = false;
+                    return Ok(DosAction::Continue);
+                }
                 let Some(of) = self.open_files.get_mut(&handle) else {
                     set_dos_error(regs, 0x06);
                     return Ok(DosAction::Continue);
@@ -2541,7 +2674,7 @@ impl DosKernel {
             // AH=3Eh: close the handle in BX. Dropping the File closes it (RAII).
             // CF=0 if the handle was open, CF=1 + AX=0x06 if it was not.
             0x3e => {
-                if self.open_files.remove(&regs.bx).is_some() {
+                if self.open_files.remove(&regs.bx).is_some() || self.ems_handles.remove(&regs.bx) {
                     regs.cf = false;
                 } else {
                     set_dos_error(regs, 0x06);
@@ -2733,9 +2866,7 @@ impl DosKernel {
                     .open(&path)
                 {
                     Ok(file) => {
-                        let handle = (5u16..)
-                            .find(|h| !self.open_files.contains_key(h))
-                            .expect("a free DOS handle exists at or below u16::MAX");
+                        let handle = self.alloc_handle();
                         self.open_files.insert(
                             handle,
                             OpenFile {
@@ -2882,6 +3013,14 @@ impl DosKernel {
                         let byte = mem.read_u8(base + index)?;
                         self.stdout.push(byte);
                     }
+                    regs.ax = regs.cx;
+                    regs.cf = false;
+                    return Ok(DosAction::Continue);
+                }
+                // A write to the EMMXXXX0 character device is accepted and discarded,
+                // reporting every byte written, the way a real EMM driver answers a
+                // DOS write (its real traffic is INT 67h, not the file handle).
+                if self.ems_handles.contains(&handle) {
                     regs.ax = regs.cx;
                     regs.cf = false;
                     return Ok(DosAction::Continue);
@@ -3150,14 +3289,36 @@ impl DosKernel {
                 // ends here), the character-device + NUL attribute 0x8004, no
                 // strategy or interrupt routine, and the 8-byte name "NUL     ".
                 // The CON and CLOCK$ headers are parked (not modeled yet).
-                let nul = base + 2 + 0x22;
-                mem.write_u16(nul, 0xffff)?; // next routine offset
-                mem.write_u16(nul + 2, 0xffff)?; // next routine segment (FFFF:FFFF = end)
+                let nul_off = 0x22usize; // BX-relative offset of the NUL header
+                let ems_off = nul_off + 0x12; // the EMMXXXX0 header right after NUL
+                let nul = base + 2 + nul_off;
+                // NUL's next link ends the chain, unless EMS is present, in which case
+                // the EMMXXXX0 device follows it.
+                if self.ems_present {
+                    mem.write_u16(nul, (2 + ems_off) as u16)?; // next offset
+                    mem.write_u16(nul + 2, SYSVARS_SEG)?; // next segment
+                } else {
+                    mem.write_u16(nul, 0xffff)?;
+                    mem.write_u16(nul + 2, 0xffff)?; // FFFF:FFFF = end
+                }
                 mem.write_u16(nul + 4, 0x8004)?; // attribute: char device, NUL bit
                 mem.write_u16(nul + 6, 0xffff)?; // strategy entry (none)
                 mem.write_u16(nul + 8, 0xffff)?; // interrupt entry (none)
                 for (i, &byte) in b"NUL     ".iter().enumerate() {
                     mem.write_u8(nul + 0x0a + i, byte)?;
+                }
+                // The EMMXXXX0 device header terminates the chain when EMS is present,
+                // so a guest walking the device list finds the manager by name.
+                if self.ems_present {
+                    let ems = base + 2 + ems_off;
+                    mem.write_u16(ems, 0xffff)?; // next offset
+                    mem.write_u16(ems + 2, 0xffff)?; // next segment (end)
+                    mem.write_u16(ems + 4, 0xc000)?; // attribute: character device
+                    mem.write_u16(ems + 6, 0xffff)?; // strategy entry (none)
+                    mem.write_u16(ems + 8, 0xffff)?; // interrupt entry (none)
+                    for (i, &byte) in b"EMMXXXX0".iter().enumerate() {
+                        mem.write_u8(ems + 0x0a + i, byte)?;
+                    }
                 }
                 regs.es = SYSVARS_SEG;
                 regs.bx = 0x0002;
@@ -3215,6 +3376,14 @@ impl DosKernel {
                     Ok(DosAction::Continue)
                 }
                 0x03 => {
+                    // Linking the upper area is allowed only when the box was loaded
+                    // with DOS=UMB and an arena exists. Without either, the call fails
+                    // with AX=0001h, the way real DOS reports a machine loaded without
+                    // DOS=UMB (a program must then use the XMS Request UMB primitive).
+                    if !self.dos_umb || self.umb.is_none() {
+                        set_dos_error(regs, 0x01);
+                        return Ok(DosAction::Continue);
+                    }
                     // BX = 0 unlink UMBs, 1 link them. Anything else is invalid.
                     match regs.bx {
                         0x0000 => {
@@ -3265,9 +3434,7 @@ impl DosKernel {
                 };
                 match cloned {
                     Ok(open) => {
-                        let handle = (5u16..)
-                            .find(|h| !self.open_files.contains_key(h))
-                            .expect("a free DOS handle exists at or below u16::MAX");
+                        let handle = self.alloc_handle();
                         self.open_files.insert(handle, open);
                         regs.ax = handle;
                         regs.cf = false;
@@ -3353,9 +3520,7 @@ impl DosKernel {
                     .open(&path)
                 {
                     Ok(file) => {
-                        let handle = (5u16..)
-                            .find(|h| !self.open_files.contains_key(h))
-                            .expect("a free DOS handle exists at or below u16::MAX");
+                        let handle = self.alloc_handle();
                         self.open_files.insert(
                             handle,
                             OpenFile {
@@ -3380,7 +3545,9 @@ impl DosKernel {
             // that matter (ISDEV + stdin/stdout); NUL/clock/binary/special are not set.
             0x44 => {
                 let handle = regs.bx;
-                let valid = handle <= 4 || self.open_files.contains_key(&handle);
+                let valid = handle <= 4
+                    || self.open_files.contains_key(&handle)
+                    || self.ems_handles.contains(&handle);
                 match regs.ax as u8 {
                     0x00 => {
                         if handle <= 4 {
@@ -3392,6 +3559,12 @@ impl DosKernel {
                                 _ => 0x02,
                             };
                             regs.dx = 0x80 | io; // bit 7 ISDEV + the console direction bits
+                            regs.cf = false;
+                        } else if self.ems_handles.contains(&handle) {
+                            // The EMMXXXX0 device: bit 7 ISDEV (so a guest knows it is a
+                            // device, not a file) plus the IOCTL-supported bit, the way an
+                            // EMM driver answers the open-then-IOCTL detection.
+                            regs.dx = 0xc080;
                             regs.cf = false;
                         } else if self.open_files.contains_key(&handle) {
                             // A regular file on C: (drive index 2); bit 7 clear means a file.
@@ -3540,9 +3713,7 @@ impl DosKernel {
                     mem.write_u8(tail + i, byte)?;
                 }
                 mem.write_u8(tail + suffix.len(), 0)?;
-                let handle = (5u16..)
-                    .find(|h| !self.open_files.contains_key(h))
-                    .expect("a free DOS handle exists at or below u16::MAX");
+                let handle = self.alloc_handle();
                 self.open_files.insert(
                     handle,
                     OpenFile {
@@ -3612,9 +3783,7 @@ impl DosKernel {
                 };
                 match result {
                     Ok(file) => {
-                        let handle = (5u16..)
-                            .find(|h| !self.open_files.contains_key(h))
-                            .expect("a free DOS handle exists at or below u16::MAX");
+                        let handle = self.alloc_handle();
                         self.open_files.insert(handle, OpenFile { file, mode });
                         regs.ax = handle;
                         regs.cx = action_taken;
@@ -4992,7 +5161,10 @@ mod tests {
     #[test]
     fn ah58_umb_link_state_round_trips() {
         let mut kernel = DosKernel::new();
-        let mut mem = Memory::new(64 * 1024).unwrap();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        // A DOS=UMB box with a UMB area, so the link is allowed and meaningful.
+        kernel.set_umb_region(0xc800, 0x2800, &mut mem).unwrap();
+        kernel.set_dos_umb(true);
         // UMBs are unlinked by default.
         let mut regs = DosRegs {
             ax: 0x5802,
@@ -5024,6 +5196,65 @@ mod tests {
         kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
         assert!(regs.cf, "an invalid link state sets CF");
         assert_eq!(regs.ax, 0x01);
+    }
+
+    #[test]
+    fn ah5803_link_fails_without_a_umb_arena() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        // No UMB area furnished: linking fails with AX=0001h, the way real DOS
+        // reports a machine loaded without DOS=UMB.
+        let mut regs = DosRegs {
+            ax: 0x5803,
+            bx: 0x0001,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(regs.cf, "linking with no UMB area fails");
+        assert_eq!(regs.ax, 0x01);
+    }
+
+    #[test]
+    fn ah5803_link_fails_when_dos_umb_was_not_configured() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        // EMM386 furnished a UMB arena, but CONFIG.SYS had no DOS=UMB, so the DOS
+        // link path is unavailable (a program must use XMS Request UMB instead).
+        kernel.set_umb_region(0xc800, 0x2800, &mut mem).unwrap();
+        kernel.set_dos_umb(false);
+        let mut regs = DosRegs {
+            ax: 0x5803,
+            bx: 0x0001,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(regs.cf, "linking without DOS=UMB fails even with an arena");
+        assert_eq!(regs.ax, 0x01);
+        // The XMS Request UMB primitive still works without DOS=UMB.
+        assert!(matches!(kernel.request_umb(0x10, &mut mem), Ok(Ok(_))));
+    }
+
+    #[test]
+    fn resize_umb_distinguishes_too_big_from_an_invalid_segment() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        kernel.set_umb_region(0xc800, 0x2800, &mut mem).unwrap();
+        let a = match kernel.request_umb(0x10, &mut mem).unwrap() {
+            Ok(seg) => seg,
+            other => panic!("expected a UMB, got {other:?}"),
+        };
+        // Carve a second block so A is no longer the top block.
+        let _b = kernel.request_umb(0x10, &mut mem).unwrap();
+        // Growing the now-non-top block A has nowhere to go: Some(largest) -> B0h.
+        match kernel.resize_umb(a, 0x100, &mut mem).unwrap() {
+            Err(Some(largest)) => assert_eq!(largest, 0x10, "B0h reports the current size"),
+            other => panic!("expected Err(Some(_)), got {other:?}"),
+        }
+        // A segment that is not a UMB is None -> B2h.
+        assert!(matches!(
+            kernel.resize_umb(0x0050, 0x10, &mut mem),
+            Ok(Err(None))
+        ));
     }
 
     #[test]
@@ -5104,9 +5335,11 @@ mod tests {
     fn umb_test_kernel() -> (DosKernel, Memory) {
         let mut kernel = DosKernel::new();
         let mut mem = Memory::new(1024 * 1024).unwrap();
-        // Conventional program 0x0100-0x1100, then a 160 KiB UMB pool at 0xC800.
+        // Conventional program 0x0100-0x1100, then a 160 KiB UMB pool at 0xC800,
+        // on a DOS=UMB box so AH=5803h may link it.
         kernel.init_program(0x0100, 0x1100, &mut mem).unwrap();
         kernel.set_umb_region(0xc800, 0x2800, &mut mem).unwrap();
+        kernel.set_dos_umb(true);
         (kernel, mem)
     }
 
@@ -5203,6 +5436,8 @@ mod tests {
         let mut kernel = DosKernel::new();
         let mut mem = Memory::new(1024 * 1024).unwrap();
         kernel.init_program(0x0100, 0x1100, &mut mem).unwrap();
+        kernel.set_umb_region(0xc800, 0x2800, &mut mem).unwrap();
+        kernel.set_dos_umb(true);
         // A guest links UMBs and picks a high strategy.
         link_umbs(&mut kernel, &mut mem);
         set_alloc_strategy(&mut kernel, &mut mem, 0x0040);
@@ -5220,6 +5455,7 @@ mod tests {
         // A program filling almost all of conventional memory: a tiny free tail.
         kernel.init_program(0x0100, 0x9f00, &mut mem).unwrap();
         kernel.set_umb_region(0xc800, 0x2800, &mut mem).unwrap();
+        kernel.set_dos_umb(true);
         link_umbs(&mut kernel, &mut mem);
         set_alloc_strategy(&mut kernel, &mut mem, 0x0080); // high then low
         // Request more than either arena holds: both fail. The larger free tail is
@@ -5228,6 +5464,155 @@ mod tests {
         assert!(regs.cf, "neither arena can satisfy it");
         assert_eq!(regs.ax, 0x08);
         assert_eq!(regs.bx, 0x27ff, "BX is the upper arena's largest, not 0xff");
+    }
+
+    /// Write an ASCIIZ string at 0000:`off` and return DS/DX for it.
+    fn put_asciiz(mem: &mut Memory, off: u16, text: &[u8]) -> (u16, u16) {
+        for (i, &b) in text.iter().enumerate() {
+            mem.write_u8(usize::from(off) + i, b).unwrap();
+        }
+        mem.write_u8(usize::from(off) + text.len(), 0).unwrap();
+        (0, off)
+    }
+
+    #[test]
+    fn emmxxxx0_opens_as_a_character_device_when_ems_is_present() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let (ds, dx) = put_asciiz(&mut mem, 0x2000, b"EMMXXXX0");
+
+        // With no EMS the device is not openable (it falls through to a host-file
+        // open, which fails), so a guest reads "no EMS".
+        let mut regs = DosRegs {
+            ax: 0x3d00,
+            ds,
+            dx,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(regs.cf, "EMMXXXX0 does not open without EMS");
+
+        // With EMS present the open succeeds, IOCTL reports a character device that
+        // is ready, and the handle closes.
+        kernel.set_ems_present(true);
+        let mut regs = DosRegs {
+            ax: 0x3d00,
+            ds,
+            dx,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf, "EMMXXXX0 opens when EMS is present");
+        let handle = regs.ax;
+
+        let mut regs = DosRegs {
+            ax: 0x4400,
+            bx: handle,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf);
+        assert_ne!(
+            regs.dx & 0x0080,
+            0,
+            "bit 7 ISDEV marks it a device, not a file"
+        );
+
+        let mut regs = DosRegs {
+            ax: 0x4407,
+            bx: handle,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(regs.ax & 0xff, 0xff, "the device reports ready");
+
+        let mut regs = DosRegs {
+            ax: 0x3e00,
+            bx: handle,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf, "the device handle closes");
+    }
+
+    #[test]
+    fn emmxxxx0_heads_the_device_chain_only_when_present() {
+        let read_chain_name = |present: bool| -> [u8; 8] {
+            let mut kernel = DosKernel::new();
+            let mut mem = Memory::new(1024 * 1024).unwrap();
+            kernel.set_ems_present(present);
+            let mut regs = DosRegs {
+                ax: 0x5200,
+                ..Default::default()
+            };
+            kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+            let sysvars = usize::from(regs.es) * 16 + usize::from(regs.bx);
+            let nul = sysvars + 0x22; // NUL header at [BX+0x22]
+            let next_off = mem.read_u16(nul).unwrap();
+            let next_seg = mem.read_u16(nul + 2).unwrap();
+            if (next_off, next_seg) == (0xffff, 0xffff) {
+                return *b"\0\0\0\0\0\0\0\0"; // chain ends at NUL
+            }
+            let next = usize::from(next_seg) * 16 + usize::from(next_off);
+            let mut name = [0u8; 8];
+            for (i, slot) in name.iter_mut().enumerate() {
+                *slot = mem.read_u8(next + 0x0a + i).unwrap();
+            }
+            name
+        };
+        assert_eq!(&read_chain_name(true), b"EMMXXXX0", "EMS chains after NUL");
+        assert_eq!(
+            &read_chain_name(false),
+            b"\0\0\0\0\0\0\0\0",
+            "no EMS leaves NUL ending the chain"
+        );
+    }
+
+    #[test]
+    fn an_open_emmxxxx0_handle_does_not_collide_with_a_created_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut kernel = DosKernel::new();
+        kernel.mount_c(HostDrive::mount_c(dir.path()).unwrap());
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        kernel.set_ems_present(true);
+        // Open the EMS device.
+        let (ds, dx) = put_asciiz(&mut mem, 0x2000, b"EMMXXXX0");
+        let mut regs = DosRegs {
+            ax: 0x3d00,
+            ds,
+            dx,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        let ems_handle = regs.ax;
+        // Create a file through a different handle-minting path (AH=3Ch).
+        let (ds, dx) = put_asciiz(&mut mem, 0x3000, b"DATA.TXT");
+        let mut regs = DosRegs {
+            ax: 0x3c00,
+            ds,
+            dx,
+            cx: 0,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf, "the file is created");
+        let file_handle = regs.ax;
+        assert_ne!(
+            ems_handle, file_handle,
+            "the EMS device and the file get distinct handles"
+        );
+        // IOCTL 4400h on the file must report a file (bit 7 clear), not the device.
+        let mut regs = DosRegs {
+            ax: 0x4400,
+            bx: file_handle,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(
+            regs.dx & 0x0080,
+            0,
+            "the file is not misreported as a character device"
+        );
     }
 
     #[test]

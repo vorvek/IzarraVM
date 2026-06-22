@@ -157,6 +157,122 @@ impl FromStr for VideoCard {
     }
 }
 
+/// The state of the EMM386-equivalent role of the IEMM memory manager, the way a
+/// period CONFIG.SYS selects it. HIMEM (XMS + the HMA) is a separate, always-on
+/// facility; this governs only upper memory and expanded memory, the part a 386
+/// needs the manager's address remapping for:
+/// - `Unloaded`: HIMEM only, no EMM386. No UMBs and no EMS (a 386 cannot map the
+///   upper area without the manager). This is the `DEVICE=HIMEM.SYS` block.
+/// - `NoEms`: EMM386 with NOEMS. UMBs, but no EMS page frame and no INT 67h.
+/// - `Ram`: EMM386 with RAM. UMBs plus the LIM EMS 4.0 page frame and INT 67h.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Emm386Mode {
+    #[serde(rename = "unloaded")]
+    Unloaded,
+    #[serde(rename = "noems")]
+    NoEms,
+    #[serde(rename = "ram")]
+    #[default]
+    Ram,
+}
+
+impl Emm386Mode {
+    pub const fn canonical_name(self) -> &'static str {
+        match self {
+            Self::Unloaded => "unloaded",
+            Self::NoEms => "noems",
+            Self::Ram => "ram",
+        }
+    }
+
+    /// Whether upper memory blocks are provided (EMM386 loaded in either mode).
+    pub const fn provides_umb(self) -> bool {
+        matches!(self, Self::NoEms | Self::Ram)
+    }
+
+    /// Whether the EMS page frame and INT 67h expanded memory are provided.
+    pub const fn provides_ems(self) -> bool {
+        matches!(self, Self::Ram)
+    }
+}
+
+impl fmt::Display for Emm386Mode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.canonical_name())
+    }
+}
+
+impl FromStr for Emm386Mode {
+    type Err = ConfigError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match normalize(value).as_str() {
+            "unloaded" | "off" | "none" | "himemonly" => Ok(Self::Unloaded),
+            "noems" => Ok(Self::NoEms),
+            "ram" | "ems" | "on" => Ok(Self::Ram),
+            _ => Err(ConfigError::UnknownPreset {
+                kind: "emm386",
+                value: value.to_owned(),
+            }),
+        }
+    }
+}
+
+/// The memory-manager configuration a CONFIG.SYS declares: the EMM386 mode its
+/// DEVICE= lines select, and whether DOS=UMB asks for the UMB area to be linked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigSysMemory {
+    pub emm386: Emm386Mode,
+    pub dos_umb: bool,
+}
+
+/// Read the memory-manager intent out of a CONFIG.SYS. EMM386.EXE provides upper
+/// memory only when HIMEM.SYS loads first, matching real DOS, so an EMM386 line
+/// with no preceding HIMEM line (or no EMM386 line at all) yields Unloaded:
+/// - HIMEM.SYS only -> Unloaded (XMS, no UMB/EMS)
+/// - HIMEM.SYS + EMM386.EXE NOEMS -> NoEms (UMBs, no EMS frame)
+/// - HIMEM.SYS + EMM386.EXE RAM (or no arg) -> Ram (UMBs + EMS frame)
+///
+/// DOS=UMB (or DOS=HIGH,UMB) sets `dos_umb`.
+pub fn parse_config_sys(text: &str) -> ConfigSysMemory {
+    let mut himem = false;
+    let mut emm386 = None;
+    let mut dos_umb = false;
+    for line in text.lines() {
+        let upper = line.trim().to_ascii_uppercase();
+        let device = upper
+            .strip_prefix("DEVICEHIGH=")
+            .or_else(|| upper.strip_prefix("DEVICE="));
+        if let Some(rest) = device {
+            let rest = rest.trim_start();
+            let path = rest.split_whitespace().next().unwrap_or("");
+            let name = path.rsplit(['\\', '/']).next().unwrap_or(path);
+            if name == "HIMEM.SYS" {
+                himem = true;
+            } else if (name == "EMM386.EXE" || name == "EMM386") && himem {
+                // EMM386 loads only with a prior HIMEM. NOEMS omits the EMS frame.
+                let noems = rest
+                    .split_whitespace()
+                    .skip(1)
+                    .any(|token| token == "NOEMS");
+                emm386 = Some(if noems {
+                    Emm386Mode::NoEms
+                } else {
+                    Emm386Mode::Ram
+                });
+            }
+        } else if let Some(rest) = upper.strip_prefix("DOS=") {
+            if rest.split([',', ' ']).any(|token| token.trim() == "UMB") {
+                dos_umb = true;
+            }
+        }
+    }
+    ConfigSysMemory {
+        emm386: emm386.unwrap_or(Emm386Mode::Unloaded),
+        dos_umb,
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SbIrq {
     #[serde(rename = "2")]
@@ -520,6 +636,9 @@ pub struct MachineConfig {
     pub cpu: GswMode,
     pub memory_mib: u16,
     pub video: VideoCard,
+    /// The IEMM EMM386-role state: unloaded (HIMEM only), noems (UMBs only), or
+    /// ram (UMBs plus the EMS page frame). Defaults to the do-it-right `ram` box.
+    pub emm386: Emm386Mode,
 }
 
 impl Default for MachineConfig {
@@ -528,6 +647,7 @@ impl Default for MachineConfig {
             cpu: GswMode::Gsw386,
             memory_mib: 24, // Izarra 3000: 24 MB, 3 x 8 MB DIMMs
             video: VideoCard::Et4000Ax,
+            emm386: Emm386Mode::Ram,
         }
     }
 }
@@ -755,6 +875,7 @@ pub struct HardwareProfile {
     pub video: VideoCard,
     pub sound_blaster: SoundBlasterConfig,
     pub wss: WssConfig,
+    pub emm386: Emm386Mode,
 }
 
 impl HardwareProfile {
@@ -768,6 +889,7 @@ impl HardwareProfile {
             video: config.machine.video,
             sound_blaster: config.audio.sound_blaster,
             wss: config.audio.wss,
+            emm386: config.machine.emm386,
         })
     }
 }
@@ -823,6 +945,54 @@ mod tests {
         assert_eq!("586".parse::<GswMode>().unwrap(), GswMode::Gsw586);
         assert_eq!("i386dx_25".parse::<GswMode>().unwrap(), GswMode::Gsw386);
         assert!("pentium_133".parse::<GswMode>().is_err());
+    }
+
+    #[test]
+    fn emm386_mode_parses_and_gates_features() {
+        assert_eq!(Emm386Mode::default(), Emm386Mode::Ram);
+        assert_eq!("noems".parse::<Emm386Mode>().unwrap(), Emm386Mode::NoEms);
+        assert_eq!(
+            "unloaded".parse::<Emm386Mode>().unwrap(),
+            Emm386Mode::Unloaded
+        );
+        assert!("bogus".parse::<Emm386Mode>().is_err());
+        // RAM provides both UMBs and EMS; NOEMS only UMBs; unloaded neither.
+        assert!(Emm386Mode::Ram.provides_ems() && Emm386Mode::Ram.provides_umb());
+        assert!(!Emm386Mode::NoEms.provides_ems() && Emm386Mode::NoEms.provides_umb());
+        assert!(!Emm386Mode::Unloaded.provides_umb());
+        // The [machine] table accepts the mode; a config without it defaults to ram.
+        let cfg: AppConfig = toml::from_str("[machine]\nemm386 = \"noems\"\n").unwrap();
+        assert_eq!(cfg.machine.emm386, Emm386Mode::NoEms);
+        assert_eq!(AppConfig::default().machine.emm386, Emm386Mode::Ram);
+    }
+
+    #[test]
+    fn config_sys_drives_the_emm386_mode() {
+        let ram = parse_config_sys(
+            "DEVICE=C:\\DOS\\HIMEM.SYS /TESTMEM:OFF\r\nDEVICE=C:\\DOS\\EMM386.EXE RAM\r\nDOS=HIGH,UMB\r\n",
+        );
+        assert_eq!(ram.emm386, Emm386Mode::Ram);
+        assert!(ram.dos_umb);
+
+        let noems = parse_config_sys("DEVICE=HIMEM.SYS\r\nDEVICE=EMM386.EXE NOEMS\r\nDOS=HIGH\r\n");
+        assert_eq!(noems.emm386, Emm386Mode::NoEms);
+        assert!(!noems.dos_umb);
+
+        // HIMEM alone provides no UMB/EMS manager.
+        assert_eq!(
+            parse_config_sys("DEVICE=C:\\DOS\\HIMEM.SYS\r\n").emm386,
+            Emm386Mode::Unloaded
+        );
+        // EMM386 without a preceding HIMEM cannot load.
+        assert_eq!(
+            parse_config_sys("DEVICE=EMM386.EXE RAM\r\n").emm386,
+            Emm386Mode::Unloaded
+        );
+        // An empty CONFIG.SYS is the no-manager case.
+        assert_eq!(
+            parse_config_sys("FILES=40\r\n").emm386,
+            Emm386Mode::Unloaded
+        );
     }
 
     #[test]
