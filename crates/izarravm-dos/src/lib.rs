@@ -2318,29 +2318,53 @@ impl DosKernel {
             // absolute position; AL>2 -> CF=1 + AX=0x01 (invalid function).
             0x42 => {
                 let handle = regs.bx;
+                let offset = (u32::from(regs.cx) << 16) | u32::from(regs.dx);
+                let whence = regs.ax as u8;
                 let Some(of) = self.open_files.get_mut(&handle) else {
                     set_dos_error(regs, 0x06);
                     return Ok(DosAction::Continue);
                 };
-                let offset = (u32::from(regs.cx) << 16) | u32::from(regs.dx);
-                let seek = match regs.ax as u8 {
-                    0 => SeekFrom::Start(u64::from(offset)),
-                    1 => SeekFrom::Current(i64::from(offset as i32)),
-                    2 => SeekFrom::End(i64::from(offset as i32)),
+                // Resolve the base the offset applies to. whence 0 takes the offset
+                // unsigned; 1 (current) and 2 (end) take it signed. DOS lets the
+                // resulting pointer fall before the start of the file with no error:
+                // the 32-bit pointer wraps, and a later read/write at that spot fails.
+                let base = match whence {
+                    0 => 0i64,
+                    1 => match of.file.stream_position() {
+                        Ok(p) => p as i64,
+                        Err(err) => {
+                            set_dos_error(regs, dos_io_error_code(&err));
+                            return Ok(DosAction::Continue);
+                        }
+                    },
+                    2 => match of.file.seek(SeekFrom::End(0)) {
+                        Ok(p) => p as i64,
+                        Err(err) => {
+                            set_dos_error(regs, dos_io_error_code(&err));
+                            return Ok(DosAction::Continue);
+                        }
+                    },
                     _ => {
                         set_dos_error(regs, 0x01);
                         return Ok(DosAction::Continue);
                     }
                 };
-                match of.file.seek(seek) {
-                    Ok(pos) => {
-                        let pos = pos as u32;
-                        regs.ax = pos as u16;
-                        regs.dx = (pos >> 16) as u16;
-                        regs.cf = false;
-                    }
-                    Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
+                let signed = if whence == 0 {
+                    i64::from(offset)
+                } else {
+                    i64::from(offset as i32)
+                };
+                // A before-start pointer wraps to its 32-bit two's complement, the
+                // value DOS reports. Seeking the host past EOF is harmless; a read
+                // there returns 0 bytes, the HLE's stand-in for DOS's failed I/O.
+                let pos = (base + signed) as u32;
+                if let Err(err) = of.file.seek(SeekFrom::Start(u64::from(pos))) {
+                    set_dos_error(regs, dos_io_error_code(&err));
+                    return Ok(DosAction::Continue);
                 }
+                regs.ax = pos as u16;
+                regs.dx = (pos >> 16) as u16;
+                regs.cf = false;
                 Ok(DosAction::Continue)
             }
             // AH=4Eh: find first matching file. CX = attribute mask, DS:DX = ASCIIZ
@@ -5728,6 +5752,63 @@ mod tests {
         kernel.dispatch(0x21, &mut bad, &mut mem).unwrap();
         assert!(bad.cf);
         assert_eq!(bad.ax, 0x01);
+    }
+
+    #[test]
+    fn ah42_seek_before_start_wraps_without_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("S.TXT"), b"01234").unwrap(); // 5 bytes
+        let mut kernel = DosKernel::new();
+        kernel.mount_c(HostDrive::mount_c(dir.path()).unwrap());
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let name_base = 0x0100usize * 16 + 0x0200;
+        for (i, b) in r"C:\S.TXT".bytes().enumerate() {
+            mem.write_u8(name_base + i, b).unwrap();
+        }
+        mem.write_u8(name_base + r"C:\S.TXT".len(), 0).unwrap();
+        let mut open = DosRegs {
+            ax: 0x3d00,
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut open, &mut mem).unwrap();
+        let handle = open.ax;
+
+        // END - 10 on a 5-byte file is position -5. DOS reports it as 0xFFFFFFFB
+        // with no error rather than failing the seek.
+        let neg = (-10i32) as u32;
+        let mut s = DosRegs {
+            ax: 0x4202,
+            bx: handle,
+            cx: (neg >> 16) as u16,
+            dx: neg as u16,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut s, &mut mem).unwrap();
+        assert!(!s.cf, "a before-start seek does not error");
+        assert_eq!(
+            (u32::from(s.dx) << 16) | u32::from(s.ax),
+            0xFFFF_FFFB,
+            "5 - 10 = -5 wraps to the 32-bit pointer"
+        );
+
+        // A read at that wrapped (past-EOF) position returns no bytes, the HLE's
+        // stand-in for DOS's failed I/O before the start of the file.
+        let mut rd = DosRegs {
+            ax: 0x3f00,
+            bx: handle,
+            cx: 4,
+            ds: 0x0100,
+            dx: 0x0300,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut rd, &mut mem).unwrap();
+        assert!(!rd.cf);
+        assert_eq!(
+            rd.ax, 0,
+            "a read at a before-start position returns 0 bytes"
+        );
     }
 
     #[test]
