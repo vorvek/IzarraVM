@@ -118,6 +118,30 @@ impl UmaReservationMap {
         self.alloc(EMS_FRAME_SIZE, EMS_FRAME_ALIGN, UmaUse::EmsFrame)
     }
 
+    /// Reserve the 64 KiB EMS page frame at a specific 16 KiB-aligned base, the way
+    /// a memory manager honors a `FRAME=` directive. Returns the base on success, or
+    /// None (reserving nothing) if it is misaligned, out of the window, or overlaps
+    /// an existing reservation. Prefer this over `alloc_ems_frame` when the frame
+    /// address is configured rather than auto-placed.
+    pub fn reserve_ems_frame_at(&mut self, base: u32) -> Option<u32> {
+        if base % EMS_FRAME_ALIGN != 0 || base < WINDOW_BASE {
+            return None;
+        }
+        match base.checked_add(EMS_FRAME_SIZE) {
+            Some(end) if end <= WINDOW_END => {}
+            _ => return None,
+        }
+        if self.overlaps(base, EMS_FRAME_SIZE) {
+            return None;
+        }
+        self.insert(UmaReservation {
+            base,
+            size: EMS_FRAME_SIZE,
+            kind: UmaUse::EmsFrame,
+        });
+        Some(base)
+    }
+
     /// Release a previously handed-out UMB or EMS frame at `base`, returning its
     /// space to the free holes. ROM reservations are permanent: freeing one (or a
     /// base that is not reserved) returns false and changes nothing.

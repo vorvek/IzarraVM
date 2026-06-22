@@ -6,7 +6,9 @@ pub use fat32::{
 pub use fat32_volume::{Fat32Volume, build_fat32};
 use izarravm_audio::{Ad1848, Ad1848Config, OplChip, Resampler, SbDsp, SbMixer};
 use izarravm_bus::{BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CpuBus, Memory};
-use izarravm_core::{GswMode, HardwareProfile, SoundBlasterConfig, VideoCard, WssConfig};
+use izarravm_core::{
+    Emm386Mode, GswMode, HardwareProfile, SoundBlasterConfig, VideoCard, WssConfig,
+};
 use izarravm_cpu::{
     Cpu386, CpuError, CpuLevel, CycleOutcome, Registers, SegmentIndex, SegmentRegister,
 };
@@ -54,6 +56,13 @@ pub use uma::{EMS_FRAME_SIZE, UmaReservation, UmaReservationMap, UmaUse};
 /// even though this machine does not yet map a BIOS image into that span.
 const VGA_BIOS_BASE: u32 = UPPER_MEMORY_BASE; // 0xC0000
 const VGA_BIOS_SIZE: u32 = 0x8000; // 32 KiB
+
+/// The default LIM EMS 4.0 page-frame base: segment 0xE000, the top 64 KiB of the
+/// upper-memory window. This is the 386MAX and DOSBox default, and on the Izarra
+/// 3000 it is free (system ROM starts at 0xF0000). Placing it at the top keeps the
+/// UMB pool one contiguous chain below it. A guest discovers it via INT 67h AH=41h,
+/// so the exact address only matters for fidelity, not function.
+const EMS_FRAME_DEFAULT_BASE: u32 = 0x0E_0000; // segment 0xE000
 
 pub const HIGH_ROM_BASE: u32 = 0xffff_0000;
 pub const MARGO_LFB_BASE: u32 = 0xE000_0000;
@@ -131,6 +140,8 @@ pub struct MachineProfile {
     pub wait_states: WaitStateProfile,
     pub address_pipelining: bool,
     pub cache_enabled: bool,
+    /// The IEMM EMM386-role state (UMB / EMS provisioning); see `Emm386Mode`.
+    pub emm386: Emm386Mode,
 }
 
 impl MachineProfile {
@@ -145,6 +156,7 @@ impl MachineProfile {
             wait_states: WaitStateProfile::default(),
             address_pipelining: false,
             cache_enabled: false,
+            emm386: Emm386Mode::default(),
         }
     }
 
@@ -159,6 +171,7 @@ impl MachineProfile {
             wait_states: WaitStateProfile::default(),
             address_pipelining: false,
             cache_enabled: false,
+            emm386: profile.emm386,
         }
     }
 }
@@ -889,15 +902,32 @@ impl Machine {
         self.uma.reset();
         let reserved = self.uma.reserve_rom(VGA_BIOS_BASE, VGA_BIOS_SIZE);
         debug_assert!(reserved, "the VGA BIOS span fits the empty upper window");
-        // The carved pool, or (0, 0) when the window has no room for one. Always
-        // call set_umb_region so a reboot with no free upper memory clears any arena
-        // a prior session left, rather than leaving the kernel on a stale pool.
-        let (seg, paras) = match self.uma.largest_free_hole() {
-            Some((_, size)) => match self.uma.alloc_umb(size) {
-                Some(base) => ((base >> 4) as u16, (size >> 4) as u16),
+        let mode = self.profile.emm386;
+        // RAM mode reserves the EMS page frame first (at the default top-of-window
+        // address) so the UMB pool carves around it; if a future ROM ever sat on the
+        // default address, fall back to a first-fit hole.
+        if mode.provides_ems()
+            && self
+                .uma
+                .reserve_ems_frame_at(EMS_FRAME_DEFAULT_BASE)
+                .is_none()
+        {
+            self.uma.alloc_ems_frame();
+        }
+        // With EMM386 unloaded there is no upper memory; otherwise carve the UMB
+        // pool from the largest remaining hole. Always call set_umb_region (with
+        // (0, 0) when there is no pool) so a reboot clears any arena a prior session
+        // left rather than stranding the kernel on a stale pool.
+        let (seg, paras) = if mode.provides_umb() {
+            match self.uma.largest_free_hole() {
+                Some((_, size)) => match self.uma.alloc_umb(size) {
+                    Some(base) => ((base >> 4) as u16, (size >> 4) as u16),
+                    None => (0, 0),
+                },
                 None => (0, 0),
-            },
-            None => (0, 0),
+            }
+        } else {
+            (0, 0)
         };
         let Machine { dos, memory, .. } = self;
         dos.set_umb_region(seg, paras, memory)?;
@@ -7558,6 +7588,45 @@ mod tests {
     }
 
     #[test]
+    fn emm386_mode_governs_the_upper_memory_layout() {
+        const PROG: [u8; 2] = [0xCD, 0x20]; // int 20h
+        let build = |mode: Emm386Mode| {
+            let mut p = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+            p.emm386 = mode;
+            Machine::new_dos_program(p, &PROG).unwrap()
+        };
+        let kinds =
+            |m: &Machine| -> Vec<UmaUse> { m.uma.reservations().iter().map(|r| r.kind).collect() };
+
+        // RAM: VGA BIOS ROM + UMB pool + the EMS frame at the default top-of-window.
+        let ram = build(Emm386Mode::Ram);
+        assert!(kinds(&ram).contains(&UmaUse::Umb), "RAM provides UMBs");
+        assert!(
+            ram.uma
+                .reservations()
+                .iter()
+                .any(|r| r.kind == UmaUse::EmsFrame && r.base == EMS_FRAME_DEFAULT_BASE),
+            "RAM reserves the EMS frame at 0xE0000"
+        );
+
+        // NOEMS: a UMB pool spanning the whole hole, no EMS frame.
+        let noems = build(Emm386Mode::NoEms);
+        assert!(kinds(&noems).contains(&UmaUse::Umb), "NOEMS provides UMBs");
+        assert!(
+            !kinds(&noems).contains(&UmaUse::EmsFrame),
+            "NOEMS reserves no EMS frame"
+        );
+
+        // Unloaded: only the VGA BIOS ROM; no UMB arena, no EMS frame.
+        let off = build(Emm386Mode::Unloaded);
+        assert_eq!(
+            kinds(&off),
+            vec![UmaUse::Rom],
+            "HIMEM-only provides neither UMBs nor EMS"
+        );
+    }
+
+    #[test]
     fn rejects_non_64k_roms() {
         let err =
             Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), [0u8; 8]).unwrap_err();
@@ -7791,6 +7860,7 @@ mod tests {
             wait_states: WaitStateProfile::default(),
             address_pipelining: false,
             cache_enabled: false,
+            emm386: Emm386Mode::default(),
         };
         let budget = profile.clock_hz / 5;
         let mut machine =
