@@ -4,13 +4,16 @@ mod dsp;
 mod mixer;
 mod opl;
 mod output;
+mod pcm;
 mod resample;
+mod wss;
 
 pub use dsp::SbDsp;
 pub use mixer::SbMixer;
 pub use opl::OplChip;
 pub use output::{AudioPlayer, AudioSink};
 pub use resample::Resampler;
+pub use wss::Ad1848;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioDeviceKind {
