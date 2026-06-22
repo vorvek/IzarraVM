@@ -22,8 +22,9 @@ pub const EMS_FRAME_SIZE: u32 = 64 * 1024;
 /// The page frame aligns to a 16 KiB page boundary within the window.
 const EMS_FRAME_ALIGN: u32 = 16 * 1024;
 
-fn align_up(x: u32, align: u32) -> u32 {
-    x.div_ceil(align) * align
+/// Round `x` up to the next multiple of `align`, or None if that overflows u32.
+fn align_up(x: u32, align: u32) -> Option<u32> {
+    x.checked_next_multiple_of(align)
 }
 
 /// What a reserved span is used for.
@@ -70,8 +71,15 @@ impl UmaReservationMap {
     /// EMS frame. Returns false (and reserves nothing) if the span falls outside
     /// the window or overlaps an existing reservation.
     pub fn reserve_rom(&mut self, base: u32, size: u32) -> bool {
-        if size == 0 || base < WINDOW_BASE || base + size > WINDOW_END {
+        if size == 0 || base < WINDOW_BASE {
             return false;
+        }
+        // checked_add rejects a span whose end overflows u32, which would
+        // otherwise wrap below WINDOW_END and slip an out-of-window ROM past the
+        // bound check, corrupting the hole math.
+        match base.checked_add(size) {
+            Some(end) if end <= WINDOW_END => {}
+            _ => return false,
         }
         if self.overlaps(base, size) {
             return false;
@@ -91,7 +99,7 @@ impl UmaReservationMap {
         if size == 0 {
             return None;
         }
-        let size = align_up(size, PARAGRAPH);
+        let size = align_up(size, PARAGRAPH)?;
         self.alloc(size, PARAGRAPH, UmaUse::Umb)
     }
 
@@ -143,9 +151,17 @@ impl UmaReservationMap {
     /// Allocate `size` bytes from the first hole that fits it at `align`.
     fn alloc(&mut self, size: u32, align: u32, kind: UmaUse) -> Option<u32> {
         for (hole_base, hole_size) in self.free_holes() {
-            let base = align_up(hole_base, align);
-            // base >= hole_base, and the window stays below 1 MiB, so no overflow.
-            if base + size <= hole_base + hole_size {
+            // Align the start up within the hole; skip the hole if that overflows.
+            let Some(base) = align_up(hole_base, align) else {
+                continue;
+            };
+            // hole_base + hole_size stays below 1 MiB (every hole is window-
+            // clamped), so the right side cannot overflow; checked_add guards the
+            // left side in case a caller asked for a near-u32::MAX size.
+            if base
+                .checked_add(size)
+                .is_some_and(|end| end <= hole_base + hole_size)
+            {
                 self.insert(UmaReservation { base, size, kind });
                 return Some(base);
             }
@@ -270,6 +286,46 @@ mod tests {
         assert_eq!(map.total_free(), 0);
         assert!(map.alloc_ems_frame().is_none(), "no fourth frame");
         assert!(map.alloc_umb(PARAGRAPH).is_none(), "no room for a UMB");
+        assert_no_overlap(&map);
+    }
+
+    #[test]
+    fn reserve_rom_rejects_an_overflowing_span() {
+        let mut map = UmaReservationMap::new();
+        // base + size wraps below WINDOW_END; it must be rejected, not accepted.
+        assert!(!map.reserve_rom(u32::MAX, 1));
+        assert!(!map.reserve_rom(0xFFFF_FFF0, 0x20));
+        assert!(
+            map.reservations().is_empty(),
+            "no out-of-window ROM slipped in"
+        );
+        assert_eq!(map.total_free(), WINDOW_SIZE);
+    }
+
+    #[test]
+    fn a_freed_hole_is_reused_by_the_next_alloc() {
+        let mut map = UmaReservationMap::new();
+        assert!(map.reserve_rom(WINDOW_BASE, 0x4000));
+        let first = map.alloc_umb(0x1000).expect("a UMB after the ROM");
+        assert!(map.free(first));
+        // First-fit reclaims the freed hole: the re-alloc lands at the same base.
+        let second = map
+            .alloc_umb(0x1000)
+            .expect("re-alloc into the reclaimed hole");
+        assert_eq!(second, first);
+        assert_no_overlap(&map);
+    }
+
+    #[test]
+    fn ems_frame_skips_to_the_next_16k_boundary_past_an_unaligned_rom() {
+        let mut map = UmaReservationMap::new();
+        // A 0x5000 ROM (not 16 KiB-aligned) ends at 0xC5000; the frame must skip
+        // up to the next 16 KiB boundary, 0xC8000.
+        assert!(map.reserve_rom(WINDOW_BASE, 0x5000));
+        let frame = map.alloc_ems_frame().expect("the frame fits past the ROM");
+        assert!(frame >= WINDOW_BASE + 0x5000, "frame starts past the ROM");
+        assert_eq!(frame % EMS_FRAME_ALIGN, 0, "frame is 16 KiB-aligned");
+        assert_eq!(frame, WINDOW_BASE + 0x8000);
         assert_no_overlap(&map);
     }
 }
