@@ -220,6 +220,63 @@ impl Fat32Table {
     }
 }
 
+/// Directory-entry attribute bit for a subdirectory (fatgen103 Section 6.2).
+pub const FAT_ATTR_DIRECTORY: u8 = 0x10;
+
+/// Build one 32-byte FAT32 directory entry. The starting cluster splits across
+/// DIR_FstClusHI (offset 20) and DIR_FstClusLO (offset 26), the FAT32 difference
+/// from FAT12/16 which keep the whole cluster at offset 26. `name83` is the
+/// 11-byte 8.3 name field (offset 0). fatgen103 Section 6.
+pub fn fat32_dir_entry(
+    name83: &[u8; 11],
+    attr: u8,
+    cluster: u32,
+    write_time: u16,
+    write_date: u16,
+    size: u32,
+) -> [u8; 32] {
+    let mut e = [0u8; 32];
+    e[0..11].copy_from_slice(name83);
+    e[11] = attr;
+    // e[12..20]: DIR_NTRes, creation time/date, and last-access date stay zero.
+    e[20..22].copy_from_slice(&((cluster >> 16) as u16).to_le_bytes()); // DIR_FstClusHI
+    e[22..24].copy_from_slice(&write_time.to_le_bytes()); // DIR_WrtTime
+    e[24..26].copy_from_slice(&write_date.to_le_bytes()); // DIR_WrtDate
+    e[26..28].copy_from_slice(&(cluster as u16).to_le_bytes()); // DIR_FstClusLO
+    e[28..32].copy_from_slice(&size.to_le_bytes()); // DIR_FileSize
+    e
+}
+
+/// The "." and ".." entries that begin every FAT32 subdirectory (the root has
+/// none). "." points at the directory's own first cluster; ".." points at the
+/// parent's first cluster, or 0 when the parent is the root (fatgen103 Section
+/// 6.5). Returns the two 32-byte entries back to back.
+pub fn fat32_dot_entries(self_cluster: u32, parent_cluster: u32) -> [u8; 64] {
+    let mut dot = [b' '; 11];
+    dot[0] = b'.';
+    let mut dotdot = [b' '; 11];
+    dotdot[0] = b'.';
+    dotdot[1] = b'.';
+    let mut out = [0u8; 64];
+    out[0..32].copy_from_slice(&fat32_dir_entry(
+        &dot,
+        FAT_ATTR_DIRECTORY,
+        self_cluster,
+        0,
+        0,
+        0,
+    ));
+    out[32..64].copy_from_slice(&fat32_dir_entry(
+        &dotdot,
+        FAT_ATTR_DIRECTORY,
+        parent_cluster,
+        0,
+        0,
+        0,
+    ));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,5 +524,68 @@ mod tests {
             FAT32_EOC,
             "the last cluster round-trips through to_bytes"
         );
+    }
+
+    fn dir_cluster(e: &[u8], hi: usize, lo: usize) -> u32 {
+        (u32::from(u16::from_le_bytes([e[hi], e[hi + 1]])) << 16)
+            | u32::from(u16::from_le_bytes([e[lo], e[lo + 1]]))
+    }
+
+    #[test]
+    fn dir_entry_splits_the_cluster_across_hi_and_lo() {
+        let name = *b"FILE    TXT";
+        let e = fat32_dir_entry(&name, 0x20, 0x0123_4567, 0xbeef, 0xcafe, 42);
+        assert_eq!(&e[0..11], b"FILE    TXT", "name field");
+        assert_eq!(e[11], 0x20, "attribute");
+        assert_eq!(u16::from_le_bytes([e[20], e[21]]), 0x0123, "FstClusHI");
+        assert_eq!(u16::from_le_bytes([e[22], e[23]]), 0xbeef, "WrtTime");
+        assert_eq!(u16::from_le_bytes([e[24], e[25]]), 0xcafe, "WrtDate");
+        assert_eq!(u16::from_le_bytes([e[26], e[27]]), 0x4567, "FstClusLO");
+        assert_eq!(
+            dir_cluster(&e, 20, 26),
+            0x0123_4567,
+            "the cluster reassembles"
+        );
+        assert_eq!(u32::from_le_bytes([e[28], e[29], e[30], e[31]]), 42, "size");
+        assert!(
+            e[12..20].iter().all(|&b| b == 0),
+            "DIR_NTRes / creation / last-access stay zero"
+        );
+    }
+
+    #[test]
+    fn dot_entries_point_at_self_and_parent() {
+        let entries = fat32_dot_entries(5, 2);
+        assert_eq!(entries[0], b'.');
+        assert!(
+            entries[1..11].iter().all(|&b| b == b' '),
+            ". is dot + spaces"
+        );
+        assert_eq!(entries[11], FAT_ATTR_DIRECTORY);
+        assert_eq!(
+            dir_cluster(&entries[0..32], 20, 26),
+            5,
+            ". points at itself"
+        );
+
+        assert_eq!(entries[32], b'.');
+        assert_eq!(entries[33], b'.');
+        assert!(
+            entries[34..43].iter().all(|&b| b == b' '),
+            ".. is dotdot + spaces"
+        );
+        assert_eq!(entries[43], FAT_ATTR_DIRECTORY);
+        assert_eq!(
+            dir_cluster(&entries[32..64], 20, 26),
+            2,
+            ".. points at parent"
+        );
+    }
+
+    #[test]
+    fn dotdot_is_zero_when_the_parent_is_the_root() {
+        // fatgen103: a top-level subdirectory's ".." cluster is 0, not the root's 2.
+        let entries = fat32_dot_entries(7, 0);
+        assert_eq!(dir_cluster(&entries[32..64], 20, 26), 0);
     }
 }
