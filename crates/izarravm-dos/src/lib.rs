@@ -445,10 +445,7 @@ impl Arena {
     /// The free tail: (header seg, data size) of the last block when it is free
     /// (owner 0). None when the arena is full (the last block is owned).
     fn free_region(&self, mem: &Memory) -> Option<(u16, u16)> {
-        match self.chain(mem).last() {
-            Some(last) if last.owner == 0 => Some((last.mcb_seg, last.size)),
-            _ => None,
-        }
+        free_tail(self.first_mcb(), mem)
     }
 
     /// The program's top-of-memory paragraph (PSP:0x02), derived from the program
@@ -481,26 +478,7 @@ impl Arena {
     /// tail (no first-fit scan of freed holes), preserving LIFO reclaim. The
     /// largest-available figure already subtracts the header paragraph.
     fn allocate(&mut self, paras: u16, mem: &mut Memory) -> Result<Result<u16, u16>, DosError> {
-        let Some((free_seg, _)) = self.free_region(mem) else {
-            return Ok(Err(0)); // arena full: no free tail to carve
-        };
-        let data_seg = u32::from(free_seg) + 1; // header sits at free_seg
-        let end = data_seg + u32::from(paras); // first free paragraph after the data
-        if end <= u32::from(ARENA_TOP) {
-            let seg = data_seg as u16;
-            if end < u32::from(ARENA_TOP) {
-                // A free tail remains above the new block.
-                write_mcb_header(mem, free_seg, b'M', seg, paras, NO_NAME)?;
-                let new_free = end as u16;
-                write_mcb_header(mem, new_free, b'Z', 0, ARENA_TOP - new_free - 1, NO_NAME)?;
-            } else {
-                // The carve consumes the tail exactly: the new block is the last.
-                write_mcb_header(mem, free_seg, b'Z', seg, paras, NO_NAME)?;
-            }
-            Ok(Ok(seg))
-        } else {
-            Ok(Err((u32::from(ARENA_TOP).saturating_sub(data_seg)) as u16))
-        }
+        carve_from_tail(self.first_mcb(), ARENA_TOP, paras, mem)
     }
 
     /// AH=49h: free the block whose data segment is `seg`. Ok(Ok(())) on success,
@@ -512,33 +490,7 @@ impl Arena {
         if seg == self.psp_seg {
             return Ok(Ok(())); // freeing the program block (e.g. at termination)
         }
-        let chain = self.chain(mem);
-        let Some(pos) = chain
-            .iter()
-            .position(|m| m.owner != 0 && m.mcb_seg == seg.wrapping_sub(1))
-        else {
-            return Ok(Err(()));
-        };
-        let block = chain[pos];
-        let block_end = block.mcb_seg.wrapping_add(1).wrapping_add(block.size);
-        match chain.last() {
-            Some(tail) if tail.owner == 0 && block_end == tail.mcb_seg => {
-                // LIFO reclaim: extend the free tail down over this block.
-                write_mcb_header(
-                    mem,
-                    block.mcb_seg,
-                    b'Z',
-                    0,
-                    ARENA_TOP - block.mcb_seg - 1,
-                    NO_NAME,
-                )?;
-            }
-            _ => {
-                // Non-top free: mark the block free in place; the hole leaks.
-                mem.write_u16(usize::from(block.mcb_seg) * 16 + 1, 0)?;
-            }
-        }
-        Ok(Ok(()))
+        free_block(self.first_mcb(), ARENA_TOP, seg, mem)
     }
 
     /// AH=4Ah: resize the block whose segment is `seg` to `paras` paragraphs.
@@ -597,47 +549,9 @@ impl Arena {
             }
             return Ok(Ok(()));
         }
-        // An AH=48h block: its header is at seg-1 and it is owned.
-        let Some(pos) = chain
-            .iter()
-            .position(|m| m.owner != 0 && m.mcb_seg == seg.wrapping_sub(1))
-        else {
-            return Ok(Err(ResizeError::InvalidBlock));
-        };
-        let block = chain[pos];
-        let block_end = block.mcb_seg.wrapping_add(1).wrapping_add(block.size);
-        // The block resizes against the free tail when one sits directly above it,
-        // or when it is itself the last block (an exact-fill allocation that became
-        // 'Z'): both move or create the free tail against ARENA_TOP.
-        let tail_above = matches!(chain.last(), Some(t) if t.owner == 0 && block_end == t.mcb_seg);
-        let is_last = pos + 1 == chain.len();
-        if tail_above || is_last {
-            let new_end = u32::from(seg) + u32::from(paras);
-            if new_end > u32::from(ARENA_TOP) {
-                return Ok(Err(ResizeError::TooBig(ARENA_TOP - seg)));
-            }
-            let new_end = new_end as u16;
-            if new_end < ARENA_TOP {
-                write_mcb_header(mem, block.mcb_seg, b'M', seg, paras, NO_NAME)?;
-                write_mcb_header(mem, new_end, b'Z', 0, ARENA_TOP - new_end - 1, NO_NAME)?;
-            } else {
-                write_mcb_header(mem, block.mcb_seg, b'Z', seg, paras, NO_NAME)?;
-            }
-            Ok(Ok(()))
-        } else if paras <= block.size {
-            // Non-top block with a successor: shrink in place; the gap leaks as an
-            // owner-0 hole.
-            write_mcb_header(mem, block.mcb_seg, b'M', seg, paras, NO_NAME)?;
-            let gap_seg = seg.wrapping_add(paras);
-            let next = chain[pos + 1].mcb_seg;
-            if gap_seg < next {
-                write_mcb_header(mem, gap_seg, b'M', 0, next - gap_seg - 1, NO_NAME)?;
-            }
-            Ok(Ok(()))
-        } else {
-            // Non-top block: a grow has nowhere to go.
-            Ok(Err(ResizeError::TooBig(block.size)))
-        }
+        // An AH=48h block: shares the free-tail resize engine with the upper-memory
+        // arena, bounded by the conventional ceiling.
+        resize_block(self.first_mcb(), ARENA_TOP, seg, paras, mem)
     }
 
     /// AH=31h KEEP PROCESS: trim the program block to `paras` paragraphs and mark it
@@ -726,6 +640,165 @@ fn read_mcb_chain(mem: &Memory, first_mcb: u16) -> Vec<RamMcb> {
         seg = seg.wrapping_add(1).wrapping_add(size);
     }
     out
+}
+
+/// The DOS upper-memory-block arena: a second authoritative MCB chain living in
+/// the UMB-able window above conventional memory (0xC0000-0xEFFFF), in the holes
+/// the memory manager leaves between option and system ROM. The machine's UMA
+/// reservation map decides where it sits and how big it is and furnishes it
+/// through `set_umb_region`; the chain itself is real MCB headers in guest RAM,
+/// so a debugger pointed at the pool reads them like any other arena.
+///
+/// It is kept separate from the conventional chain rather than bridged across the
+/// video aperture: a contiguous walk would have to plant an MCB header in the
+/// 0xA0000 frame buffer. The link state (AH=5803h) gates whether allocation is
+/// routed here, not whether the arena exists.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct UmbArena {
+    /// Header paragraph of the first UMB MCB (the pool's base segment).
+    first_mcb: u16,
+    /// One paragraph past the pool: the ceiling the free tail reaches, the UMB
+    /// analogue of `ARENA_TOP` for the conventional arena.
+    top: u16,
+}
+
+// The shared free-tail allocation engine. The conventional arena and the
+// upper-memory arena are both bump-with-LIFO-reclaim regions over an in-RAM MCB
+// chain: carve from the free tail only (no first-fit), and free either merges the
+// block back into the tail (when it is the tail's lower neighbour) or leaks an
+// owner-0 hole. Parameterising on `first_mcb` (the chain root) and `top` (one
+// paragraph past the region) lets both arenas run the exact same code, so a fix
+// to one is a fix to both. The conventional arena's program block adds its own
+// branches on top of these; the upper-memory arena has only AH=48h-style blocks.
+
+/// The free tail of the chain rooted at `first_mcb`: (header seg, data size) of
+/// the last block when it is free (owner 0), else None when the region is full.
+fn free_tail(first_mcb: u16, mem: &Memory) -> Option<(u16, u16)> {
+    match read_mcb_chain(mem, first_mcb).last() {
+        Some(last) if last.owner == 0 => Some((last.mcb_seg, last.size)),
+        _ => None,
+    }
+}
+
+/// Carve `paras` paragraphs from the free tail of the region `[first_mcb, top)`.
+/// Reserves a one-paragraph header at the tail; the data segment handed out is one
+/// paragraph higher. Ok(Ok(data seg)), or Ok(Err(largest data paras)) when it does
+/// not fit (already net of the header).
+fn carve_from_tail(
+    first_mcb: u16,
+    top: u16,
+    paras: u16,
+    mem: &mut Memory,
+) -> Result<Result<u16, u16>, DosError> {
+    let Some((free_seg, _)) = free_tail(first_mcb, mem) else {
+        return Ok(Err(0)); // region full: no free tail to carve
+    };
+    let data_seg = u32::from(free_seg) + 1; // header sits at free_seg
+    let end = data_seg + u32::from(paras); // first free paragraph after the data
+    if end <= u32::from(top) {
+        let seg = data_seg as u16;
+        if end < u32::from(top) {
+            // A free tail remains above the new block.
+            write_mcb_header(mem, free_seg, b'M', seg, paras, NO_NAME)?;
+            let new_free = end as u16;
+            write_mcb_header(mem, new_free, b'Z', 0, top - new_free - 1, NO_NAME)?;
+        } else {
+            // The carve consumes the tail exactly: the new block is the last.
+            write_mcb_header(mem, free_seg, b'Z', seg, paras, NO_NAME)?;
+        }
+        Ok(Ok(seg))
+    } else {
+        Ok(Err((u32::from(top).saturating_sub(data_seg)) as u16))
+    }
+}
+
+/// Free the owned block whose data segment is `seg` in the region `[first_mcb,
+/// top)`. A block directly below the free tail merges into it (LIFO reclaim); any
+/// other freed block becomes an owner-0 hole that leaks until the blocks above it
+/// are freed. Ok(Ok(())) on success, Ok(Err(())) for an unknown block.
+fn free_block(
+    first_mcb: u16,
+    top: u16,
+    seg: u16,
+    mem: &mut Memory,
+) -> Result<Result<(), ()>, DosError> {
+    let chain = read_mcb_chain(mem, first_mcb);
+    let Some(pos) = chain
+        .iter()
+        .position(|m| m.owner != 0 && m.mcb_seg == seg.wrapping_sub(1))
+    else {
+        return Ok(Err(()));
+    };
+    let block = chain[pos];
+    let block_end = block.mcb_seg.wrapping_add(1).wrapping_add(block.size);
+    match chain.last() {
+        Some(tail) if tail.owner == 0 && block_end == tail.mcb_seg => {
+            // LIFO reclaim: extend the free tail down over this block.
+            write_mcb_header(
+                mem,
+                block.mcb_seg,
+                b'Z',
+                0,
+                top - block.mcb_seg - 1,
+                NO_NAME,
+            )?;
+        }
+        _ => {
+            // Non-top free: mark the block free in place; the hole leaks.
+            mem.write_u16(usize::from(block.mcb_seg) * 16 + 1, 0)?;
+        }
+    }
+    Ok(Ok(()))
+}
+
+/// Resize the owned AH=48h-style block whose data segment is `seg` in the region
+/// `[first_mcb, top)` to `paras` paragraphs. Same `ResizeError` codes as the
+/// conventional path: a block at (or whose free tail sits directly above) the top
+/// moves the tail; a non-top block shrinks in place and leaks the gap, and a
+/// non-top grow has nowhere to go.
+fn resize_block(
+    first_mcb: u16,
+    top: u16,
+    seg: u16,
+    paras: u16,
+    mem: &mut Memory,
+) -> Result<Result<(), ResizeError>, DosError> {
+    let chain = read_mcb_chain(mem, first_mcb);
+    let Some(pos) = chain
+        .iter()
+        .position(|m| m.owner != 0 && m.mcb_seg == seg.wrapping_sub(1))
+    else {
+        return Ok(Err(ResizeError::InvalidBlock));
+    };
+    let block = chain[pos];
+    let block_end = block.mcb_seg.wrapping_add(1).wrapping_add(block.size);
+    let tail_above = matches!(chain.last(), Some(t) if t.owner == 0 && block_end == t.mcb_seg);
+    let is_last = pos + 1 == chain.len();
+    if tail_above || is_last {
+        let new_end = u32::from(seg) + u32::from(paras);
+        if new_end > u32::from(top) {
+            return Ok(Err(ResizeError::TooBig(top - seg)));
+        }
+        let new_end = new_end as u16;
+        if new_end < top {
+            write_mcb_header(mem, block.mcb_seg, b'M', seg, paras, NO_NAME)?;
+            write_mcb_header(mem, new_end, b'Z', 0, top - new_end - 1, NO_NAME)?;
+        } else {
+            write_mcb_header(mem, block.mcb_seg, b'Z', seg, paras, NO_NAME)?;
+        }
+        Ok(Ok(()))
+    } else if paras <= block.size {
+        // Non-top block with a successor: shrink in place; the gap leaks.
+        write_mcb_header(mem, block.mcb_seg, b'M', seg, paras, NO_NAME)?;
+        let gap_seg = seg.wrapping_add(paras);
+        let next = chain[pos + 1].mcb_seg;
+        if gap_seg < next {
+            write_mcb_header(mem, gap_seg, b'M', 0, next - gap_seg - 1, NO_NAME)?;
+        }
+        Ok(Ok(()))
+    } else {
+        Ok(Err(ResizeError::TooBig(block.size)))
+    }
 }
 
 /// Toka-DOS wall clock. Deterministic by default (a fixed 1997 instant) so unit
@@ -889,10 +962,13 @@ pub struct DosKernel {
     verify_flag: bool,
     // AH=58h memory-allocation strategy. The bump arena ignores it; stored for read-back.
     alloc_strategy: u16,
-    // AH=58h AL=03 UMB link state. UMBs are not yet linked into the arena (that is
-    // P5), so this only stores and reports whether a guest asked for them; the
-    // chain is unchanged either way. DOS defaults to unlinked (false).
+    // AH=58h AL=03 UMB link state. Gates whether a high or high-then-low allocation
+    // strategy is routed into the upper-memory arena; the arena itself exists in RAM
+    // regardless. DOS defaults to unlinked (false).
     umb_link: bool,
+    // The upper-memory-block arena, when the machine has furnished one (see
+    // `set_umb_region`). None on a machine with no UMB-able memory.
+    umb: Option<UmbArena>,
     // AH=59h extended error: the last DOS error code reported to a guest. Held until
     // the next error overwrites it (DOS does not clear it on a successful call).
     last_error: u16,
@@ -960,6 +1036,103 @@ impl DosKernel {
         Ok(())
     }
 
+    /// Furnish the upper-memory-block arena: the machine's UMA reservation map
+    /// reserves the ROM in the 0xC0000-0xEFFFF window and hands the remaining hole
+    /// here as `[seg, seg + paras)`. This lays a single free MCB spanning the pool,
+    /// so a guest (or a debugger) reads a real upper-memory arena from the start.
+    /// `paras` below 2 leaves no room for a header plus data and clears the arena.
+    pub fn set_umb_region(
+        &mut self,
+        seg: u16,
+        paras: u16,
+        mem: &mut Memory,
+    ) -> Result<(), DosError> {
+        if paras < 2 {
+            self.umb = None;
+            return Ok(());
+        }
+        // One free 'Z' block: the header takes the first paragraph, the rest is the
+        // free upper memory. Owner 0 marks it free, the same as the conventional
+        // free tail.
+        write_mcb_header(mem, seg, b'Z', 0, paras - 1, NO_NAME)?;
+        self.umb = Some(UmbArena {
+            first_mcb: seg,
+            top: seg.wrapping_add(paras),
+        });
+        Ok(())
+    }
+
+    /// Walk the upper-memory arena's MCB chain, empty when no UMB pool is furnished.
+    #[cfg(test)]
+    fn umb_chain(&self, mem: &Memory) -> Vec<RamMcb> {
+        match self.umb {
+            Some(arena) => read_mcb_chain(mem, arena.first_mcb),
+            None => Vec::new(),
+        }
+    }
+
+    /// The linked upper-memory arena, if UMBs are both furnished and linked into
+    /// the allocation system (AH=5803h). None routes everything to conventional
+    /// memory, the way DOS behaves before `DOS=UMB` links the upper arena.
+    fn linked_umb(&self) -> Option<UmbArena> {
+        match (self.umb_link, self.umb) {
+            (true, Some(arena)) => Some(arena),
+            _ => None,
+        }
+    }
+
+    /// AH=48h allocation honouring the AH=58h strategy and the UMB link state.
+    /// Bits 6-7 of the strategy pick the area: 01 high (upper memory only), 10
+    /// high-then-low (upper first, then conventional). Low (00), an unlinked arena,
+    /// or no upper memory all allocate from conventional memory.
+    fn allocate_strategy(
+        &mut self,
+        paras: u16,
+        mem: &mut Memory,
+    ) -> Result<Result<u16, u16>, DosError> {
+        let area = self.alloc_strategy & 0x00c0; // bits 6-7
+        match (area, self.linked_umb()) {
+            (0x40, Some(u)) => carve_from_tail(u.first_mcb, u.top, paras, mem),
+            (0x80, Some(u)) => match carve_from_tail(u.first_mcb, u.top, paras, mem)? {
+                Ok(seg) => Ok(Ok(seg)),
+                // Upper memory could not satisfy it: fall back to conventional. On a
+                // double failure report the larger of the two arenas' free tails,
+                // the way DOS's single-chain walk reports the global largest block.
+                Err(hi) => match self.arena.allocate(paras, mem)? {
+                    Ok(seg) => Ok(Ok(seg)),
+                    Err(lo) => Ok(Err(hi.max(lo))),
+                },
+            },
+            _ => self.arena.allocate(paras, mem),
+        }
+    }
+
+    /// AH=49h free routed to the arena that owns `seg`: the upper-memory arena when
+    /// the segment falls in its window, the conventional arena otherwise.
+    fn free_routed(&mut self, seg: u16, mem: &mut Memory) -> Result<Result<(), ()>, DosError> {
+        if let Some(u) = self.umb {
+            if (u.first_mcb..u.top).contains(&seg) {
+                return free_block(u.first_mcb, u.top, seg, mem);
+            }
+        }
+        self.arena.free(seg, mem)
+    }
+
+    /// AH=4Ah resize routed to the arena that owns `seg` (see `free_routed`).
+    fn resize_routed(
+        &mut self,
+        seg: u16,
+        paras: u16,
+        mem: &mut Memory,
+    ) -> Result<Result<(), ResizeError>, DosError> {
+        if let Some(u) = self.umb {
+            if (u.first_mcb..u.top).contains(&seg) {
+                return resize_block(u.first_mcb, u.top, seg, paras, mem);
+            }
+        }
+        self.arena.resize(seg, paras, mem)
+    }
+
     /// Stand up a system PSP, arena, and base environment with no running
     /// program, so a boot stub can EXEC the shell as the first process. This is
     /// the SYSINIT-equivalent: it gives the first `AH=4Bh` a valid parent context
@@ -971,6 +1144,12 @@ impl DosKernel {
         psp_seg: u16,
         env: &[(&str, &str)],
     ) -> Result<(), DosError> {
+        // SYSINIT resets the allocation-manager state: a warm reboot comes back
+        // with UMBs unlinked and the low-first allocation strategy, not the prior
+        // session's AH=58h settings. The upper arena's chain is re-laid separately
+        // by the machine's furnish step (set_umb_region) on the same boot.
+        self.umb_link = false;
+        self.alloc_strategy = 0;
         build_psp(mem, psp_seg, ARENA_TOP)?;
         let prog_top = psp_seg.saturating_add(0x10); // the system PSP is its 256 bytes
         self.init_program(psp_seg, prog_top, mem)?;
@@ -1348,6 +1527,14 @@ impl DosKernel {
         // The exiting child's blocks (env + program, above the parent free base) are
         // freed back to the parent, UNLESS the child itself kept resident (a TSR), in
         // which case keep_resident already left a correct free tail above its block.
+        //
+        // Upper-memory (UMB) blocks a child allocated with a high strategy are NOT
+        // reclaimed here, so they leak past the child (marked): the conventional
+        // reclaim is positional (it resets the parent free tail), and AH=48h blocks
+        // carry their own segment as the owner rather than the PSP, so there is no
+        // owner key to sweep the upper arena by. Real DOS frees a process's upper
+        // memory on exit; an owner-keyed sweep waits on the owner=PSP convention.
+        // In practice high allocators are TSRs that stay resident and keep theirs.
         let child_resident = self.arena.resident;
         if let Some(parent) = self.program_stack.pop() {
             self.arena = parent.arena;
@@ -2446,7 +2633,7 @@ impl DosKernel {
             // AH=48h: allocate BX paragraphs. CF=0 AX=segment, or CF=1 AX=0x08
             // BX=largest-available.
             0x48 => {
-                match self.arena.allocate(regs.bx, mem)? {
+                match self.allocate_strategy(regs.bx, mem)? {
                     Ok(seg) => {
                         regs.ax = seg;
                         regs.cf = false;
@@ -2461,7 +2648,7 @@ impl DosKernel {
             }
             // AH=49h: free the block in ES. CF=0, or CF=1 AX=0x09 (invalid block).
             0x49 => {
-                match self.arena.free(regs.es, mem)? {
+                match self.free_routed(regs.es, mem)? {
                     Ok(()) => regs.cf = false,
                     Err(()) => {
                         regs.cf = true;
@@ -2473,7 +2660,7 @@ impl DosKernel {
             // AH=4Ah: resize the block in ES to BX paragraphs. CF=0, or CF=1 with
             // AX=0x08 BX=largest-available (too big) / AX=0x09 (invalid block).
             0x4a => {
-                match self.arena.resize(regs.es, regs.bx, mem)? {
+                match self.resize_routed(regs.es, regs.bx, mem)? {
                     Ok(()) => regs.cf = false,
                     Err(ResizeError::TooBig(largest)) => {
                         regs.cf = true;
@@ -4837,6 +5024,210 @@ mod tests {
         kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
         assert!(regs.cf, "an invalid link state sets CF");
         assert_eq!(regs.ax, 0x01);
+    }
+
+    #[test]
+    fn set_umb_region_lays_a_free_block_a_guest_can_read() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        // A 160 KiB pool at 0xC800, the hole above a 32 KiB VGA BIOS at 0xC0000.
+        kernel.set_umb_region(0xc800, 0x2800, &mut mem).unwrap();
+        // A guest or debugger reads a single free 'Z' MCB spanning the pool.
+        let chain = kernel.umb_chain(&mem);
+        assert_eq!(chain.len(), 1, "the pool starts as one free block");
+        let block = chain[0];
+        assert_eq!(block.mcb_seg, 0xc800, "the chain heads at the pool base");
+        assert_eq!(block.sig, b'Z', "a single block is the last block");
+        assert_eq!(block.owner, 0, "the pool starts free");
+        assert_eq!(block.size, 0x2800 - 1, "the header takes one paragraph");
+    }
+
+    #[test]
+    fn the_umb_arena_exists_independent_of_the_link_state() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        kernel.set_umb_region(0xc800, 0x2800, &mut mem).unwrap();
+        // The default link state is unlinked, yet the arena is already in RAM: the
+        // manager builds it at load, the link only gates allocation routing.
+        assert!(!kernel.umb_link);
+        assert_eq!(kernel.umb_chain(&mem).len(), 1);
+        // A guest edit to the pool header survives, the chain being authoritative.
+        mem.write_u16(0xc800 * 16 + 1, 0x0123).unwrap(); // claim it for PSP 0x0123
+        assert_eq!(kernel.umb_chain(&mem)[0].owner, 0x0123);
+    }
+
+    #[test]
+    fn set_umb_region_with_no_room_clears_the_arena() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        kernel.set_umb_region(0xc800, 0x2800, &mut mem).unwrap();
+        assert!(kernel.umb.is_some());
+        // A degenerate pool (no room for a header plus data) leaves no arena.
+        kernel.set_umb_region(0xc800, 1, &mut mem).unwrap();
+        assert!(kernel.umb.is_none());
+        assert!(kernel.umb_chain(&mem).is_empty());
+    }
+
+    /// Set the AH=58h allocation strategy through the dispatch path.
+    fn set_alloc_strategy(kernel: &mut DosKernel, mem: &mut Memory, strategy: u16) {
+        let mut regs = DosRegs {
+            ax: 0x5801,
+            bx: strategy,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, mem).unwrap();
+        assert!(!regs.cf, "the strategy {strategy:#06x} is valid");
+    }
+
+    /// Link the upper-memory arena through AH=5803h.
+    fn link_umbs(kernel: &mut DosKernel, mem: &mut Memory) {
+        let mut regs = DosRegs {
+            ax: 0x5803,
+            bx: 0x0001,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, mem).unwrap();
+        assert!(!regs.cf);
+    }
+
+    /// AH=48h allocate `paras`, returning the dispatch result registers.
+    fn dos_alloc(kernel: &mut DosKernel, mem: &mut Memory, paras: u16) -> DosRegs {
+        let mut regs = DosRegs {
+            ax: 0x4800,
+            bx: paras,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, mem).unwrap();
+        regs
+    }
+
+    fn umb_test_kernel() -> (DosKernel, Memory) {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        // Conventional program 0x0100-0x1100, then a 160 KiB UMB pool at 0xC800.
+        kernel.init_program(0x0100, 0x1100, &mut mem).unwrap();
+        kernel.set_umb_region(0xc800, 0x2800, &mut mem).unwrap();
+        (kernel, mem)
+    }
+
+    #[test]
+    fn ah48_high_strategy_allocates_from_the_upper_arena_when_linked() {
+        let (mut kernel, mut mem) = umb_test_kernel();
+        link_umbs(&mut kernel, &mut mem);
+        set_alloc_strategy(&mut kernel, &mut mem, 0x0040); // high memory only
+        let regs = dos_alloc(&mut kernel, &mut mem, 0x0100);
+        assert!(!regs.cf, "the upper allocation succeeds");
+        assert!(
+            (0xc800..0xf000).contains(&regs.ax),
+            "the block lands in the UMB window, got {:#06x}",
+            regs.ax
+        );
+        // The upper arena now owns the block; the conventional free tail is intact.
+        assert!(kernel.umb_chain(&mem).iter().any(|m| m.owner == regs.ax));
+        assert_eq!(kernel.arena.free_base(&mem), 0x1100);
+    }
+
+    #[test]
+    fn ah48_high_strategy_falls_back_to_conventional_when_unlinked() {
+        let (mut kernel, mut mem) = umb_test_kernel();
+        // Strategy is high, but UMBs are not linked: DOS allocates conventional.
+        set_alloc_strategy(&mut kernel, &mut mem, 0x0040);
+        let regs = dos_alloc(&mut kernel, &mut mem, 0x0100);
+        assert!(!regs.cf);
+        assert!(
+            (0x0100..0xa000).contains(&regs.ax),
+            "an unlinked high request stays in conventional memory"
+        );
+        assert!(kernel.umb_chain(&mem).iter().all(|m| m.owner == 0));
+    }
+
+    #[test]
+    fn ah48_high_then_low_falls_back_when_upper_memory_is_full() {
+        let (mut kernel, mut mem) = umb_test_kernel();
+        link_umbs(&mut kernel, &mut mem);
+        set_alloc_strategy(&mut kernel, &mut mem, 0x0080); // high then low
+        // Drain the upper arena: ask for more than its ~160 KiB holds.
+        let big = dos_alloc(&mut kernel, &mut mem, 0x2000);
+        assert!(
+            (0xc800..0xf000).contains(&big.ax),
+            "first lands in upper memory"
+        );
+        // The next high-then-low request no longer fits up high and falls to low.
+        let low = dos_alloc(&mut kernel, &mut mem, 0x1000);
+        assert!(!low.cf);
+        assert!(
+            (0x0100..0xa000).contains(&low.ax),
+            "the fallback allocation is conventional, got {:#06x}",
+            low.ax
+        );
+    }
+
+    #[test]
+    fn ah49_and_ah4a_route_to_the_upper_arena_by_address() {
+        let (mut kernel, mut mem) = umb_test_kernel();
+        link_umbs(&mut kernel, &mut mem);
+        set_alloc_strategy(&mut kernel, &mut mem, 0x0040);
+        let seg = dos_alloc(&mut kernel, &mut mem, 0x0100).ax;
+        // Resize the upper block up against its free tail.
+        let mut regs = DosRegs {
+            ax: 0x4a00,
+            bx: 0x0400,
+            es: seg,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf, "the upper resize succeeds");
+        assert!(
+            kernel
+                .umb_chain(&mem)
+                .iter()
+                .any(|m| m.owner == seg && m.size == 0x0400)
+        );
+        // Free it: LIFO reclaim folds it back into the upper free tail.
+        let mut regs = DosRegs {
+            ax: 0x4900,
+            es: seg,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf, "the upper free succeeds");
+        // Back to a single free block spanning the whole pool.
+        let chain = kernel.umb_chain(&mem);
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].owner, 0);
+        assert_eq!(chain[0].mcb_seg, 0xc800);
+    }
+
+    #[test]
+    fn init_shell_base_resets_the_allocation_manager_state() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        kernel.init_program(0x0100, 0x1100, &mut mem).unwrap();
+        // A guest links UMBs and picks a high strategy.
+        link_umbs(&mut kernel, &mut mem);
+        set_alloc_strategy(&mut kernel, &mut mem, 0x0040);
+        assert!(kernel.umb_link);
+        // SYSINIT (a warm reboot's boot-base setup) clears both to the defaults.
+        kernel.init_shell_base(&mut mem, 0x0100, &[]).unwrap();
+        assert!(!kernel.umb_link, "a reboot unlinks UMBs");
+        assert_eq!(kernel.alloc_strategy, 0, "a reboot resets the strategy");
+    }
+
+    #[test]
+    fn ah48_high_then_low_double_failure_reports_the_global_largest() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        // A program filling almost all of conventional memory: a tiny free tail.
+        kernel.init_program(0x0100, 0x9f00, &mut mem).unwrap();
+        kernel.set_umb_region(0xc800, 0x2800, &mut mem).unwrap();
+        link_umbs(&mut kernel, &mut mem);
+        set_alloc_strategy(&mut kernel, &mut mem, 0x0080); // high then low
+        // Request more than either arena holds: both fail. The larger free tail is
+        // the upper arena's, so BX must report it, not the tiny conventional one.
+        let regs = dos_alloc(&mut kernel, &mut mem, 0x3000);
+        assert!(regs.cf, "neither arena can satisfy it");
+        assert_eq!(regs.ax, 0x08);
+        assert_eq!(regs.bx, 0x27ff, "BX is the upper arena's largest, not 0xff");
     }
 
     #[test]

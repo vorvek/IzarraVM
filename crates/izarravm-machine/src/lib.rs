@@ -48,6 +48,13 @@ pub use memmap::{
 };
 pub use uma::{EMS_FRAME_SIZE, UmaReservation, UmaReservationMap, UmaUse};
 
+/// The video BIOS ROM sits in the first 32 KiB of the upper-memory window on a
+/// VGA machine (0xC0000-0xC7FFF). It is reserved in the UMA map so no UMB or EMS
+/// frame is handed out over it, matching where a real adapter's option ROM lives
+/// even though this machine does not yet map a BIOS image into that span.
+const VGA_BIOS_BASE: u32 = UPPER_MEMORY_BASE; // 0xC0000
+const VGA_BIOS_SIZE: u32 = 0x8000; // 32 KiB
+
 pub const HIGH_ROM_BASE: u32 = 0xffff_0000;
 pub const MARGO_LFB_BASE: u32 = 0xE000_0000;
 pub const MARGO_MMIO_BASE: u32 = 0xE040_0000;
@@ -375,6 +382,11 @@ pub struct Machine {
     // RAM above 1 MB, the HMA-allocation flag, and the local-A20 nesting count. A
     // guest reaches it via INT 2Fh AX=4310h (an INT 66h entry stub in ROM).
     xms: xms::XmsState,
+    // The UMA reservation map: the single authority over the 0xC0000-0xEFFFF
+    // upper-memory window. ROM is reserved up front; the remaining hole is handed
+    // to the DOS kernel as its upper-memory-block (UMB) arena, and a later slice
+    // also carves the EMS page frame from it.
+    uma: UmaReservationMap,
 }
 
 /// INT 33h mouse-driver state. Coordinates are in a virtual screen space that
@@ -573,6 +585,7 @@ impl Machine {
             unittester: unittester::UnitTester::default(),
             test_snapshot_path: None,
             xms: xms::XmsState::new(memory_mib),
+            uma: UmaReservationMap::new(),
         };
         // The Margo LFB aperture is decoded before RAM, so system memory must
         // stay below it. Validated config caps memory far under this bound.
@@ -860,7 +873,35 @@ impl Machine {
             let Machine { dos, memory, .. } = &mut machine;
             dos.install_environment(memory, &entries)?;
         }
+        machine.furnish_dos_upper_memory()?;
         Ok(machine)
+    }
+
+    /// Lay out the upper-memory window and hand the DOS kernel its UMB arena: the
+    /// IEMM SYSINIT step. Reserve the ROM, then carve the largest remaining hole as
+    /// the UMB pool. With no upper memory free, the kernel keeps no arena.
+    ///
+    /// This rebuilds the window from scratch every call, so a warm reboot (INT 19h
+    /// re-enters this through setup_toka_dos_base) brings the upper arena back as a
+    /// single free block like the conventional arena, rather than keeping the prior
+    /// session's chain.
+    fn furnish_dos_upper_memory(&mut self) -> Result<(), MachineError> {
+        self.uma.reset();
+        let reserved = self.uma.reserve_rom(VGA_BIOS_BASE, VGA_BIOS_SIZE);
+        debug_assert!(reserved, "the VGA BIOS span fits the empty upper window");
+        // The carved pool, or (0, 0) when the window has no room for one. Always
+        // call set_umb_region so a reboot with no free upper memory clears any arena
+        // a prior session left, rather than leaving the kernel on a stale pool.
+        let (seg, paras) = match self.uma.largest_free_hole() {
+            Some((_, size)) => match self.uma.alloc_umb(size) {
+                Some(base) => ((base >> 4) as u16, (size >> 4) as u16),
+                None => (0, 0),
+            },
+            None => (0, 0),
+        };
+        let Machine { dos, memory, .. } = self;
+        dos.set_umb_region(seg, paras, memory)?;
+        Ok(())
     }
 
     /// Set the CPU to a loaded program's entry: CS:IP, SS:SP, DS, ES, and a
@@ -3964,8 +4005,11 @@ impl Machine {
             ("PATH", "C:\\;C:\\DOS"),
             ("PROMPT", "$p$g"),
         ];
-        let Machine { dos, memory, .. } = self;
-        dos.init_shell_base(memory, DOS_LOAD_SEGMENT, &env)?;
+        {
+            let Machine { dos, memory, .. } = self;
+            dos.init_shell_base(memory, DOS_LOAD_SEGMENT, &env)?;
+        }
+        self.furnish_dos_upper_memory()?;
         Ok(())
     }
 
@@ -7458,6 +7502,59 @@ mod tests {
 
     fn read_u32(machine: &mut Machine, addr: u32) -> u32 {
         u32::from(read_u16(machine, addr)) | (u32::from(read_u16(machine, addr + 2)) << 16)
+    }
+
+    #[test]
+    fn a_dos_machine_furnishes_an_upper_memory_block_arena() {
+        const PROG: [u8; 2] = [0xCD, 0x20]; // int 20h
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
+                .unwrap();
+        // The VGA BIOS is reserved, so the pool starts at 0xC800, the hole above the
+        // 32 KiB option-ROM span. A free 'Z' MCB heads the upper-memory arena there.
+        let base = 0xc800u32 << 4;
+        assert_eq!(machine.read_physical_u8(base), b'Z');
+        assert_eq!(read_u16(&mut machine, base + 1), 0, "the pool starts free");
+        // The map records the VGA BIOS ROM and the carved UMB pool as disjoint spans.
+        let kinds = machine.uma.reservations();
+        assert!(
+            kinds.iter().any(|r| r.kind == UmaUse::Rom),
+            "VGA BIOS reserved"
+        );
+        assert!(
+            kinds.iter().any(|r| r.kind == UmaUse::Umb),
+            "UMB pool carved"
+        );
+    }
+
+    #[test]
+    fn refurnishing_resets_the_upper_arena_like_a_warm_reboot() {
+        const PROG: [u8; 2] = [0xCD, 0x20]; // int 20h
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
+                .unwrap();
+        let base = (0xc800u32 << 4) as usize;
+        // Dirty the pool the way a prior session would: an owned (non-free) block at
+        // the pool head, the stale chain the warm-reboot blocker would have kept.
+        machine.memory.write_u8(base, b'M').unwrap();
+        machine.memory.write_u16(base + 1, 0x1234).unwrap(); // owner = a dead PSP
+        // Re-furnish: the INT 19h SYSINIT path runs this again. It must re-lay the
+        // arena, not early-out on a window the prior carve left fully reserved.
+        machine.furnish_dos_upper_memory().unwrap();
+        assert_eq!(machine.read_physical_u8(base as u32), b'Z', "arena re-laid");
+        assert_eq!(
+            read_u16(&mut machine, base as u32 + 1),
+            0,
+            "pool free again"
+        );
+        // The map did not accumulate stale reservations: one ROM, one UMB.
+        let umb = machine
+            .uma
+            .reservations()
+            .iter()
+            .filter(|r| r.kind == UmaUse::Umb)
+            .count();
+        assert_eq!(umb, 1, "no duplicate UMB reservation after re-furnish");
     }
 
     #[test]
