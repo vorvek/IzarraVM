@@ -927,6 +927,9 @@ impl Machine {
         let reserved = self.uma.reserve_rom(VGA_BIOS_BASE, VGA_BIOS_SIZE);
         debug_assert!(reserved, "the VGA BIOS span fits the empty upper window");
         let mode = self.profile.emm386;
+        // Tell the DOS kernel whether the EMMXXXX0 device is present, so a guest's
+        // open-by-name or device-chain detection matches the EMM386 mode.
+        self.dos.set_ems_present(mode.provides_ems());
         // RAM mode reserves the EMS page frame first (at the default top-of-window
         // address) so the UMB pool carves around it; if a future ROM ever sat on the
         // default address, fall back to a first-fit hole.

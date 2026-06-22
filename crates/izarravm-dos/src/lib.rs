@@ -1,5 +1,5 @@
 use izarravm_bus::{BusError, Memory};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -882,6 +882,19 @@ fn open_host_file(path: &Path, mode: AccessMode) -> std::io::Result<File> {
     }
 }
 
+/// Whether a DOS filename names the EMMXXXX0 character device. DOS matches a
+/// device by its base name regardless of drive, path, or extension, so EMMXXXX0,
+/// C:\EMMXXXX0, and EMMXXXX0.SYS all refer to the device.
+fn is_ems_device_name(name: &str) -> bool {
+    name.rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(name)
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .eq_ignore_ascii_case("EMMXXXX0")
+}
+
 /// One entry of a FindFirst/FindNext result: the documented DTA fields plus the
 /// uppercase 8.3 name to write into the 13-byte ASCIIZ slot.
 #[derive(Debug, Clone)]
@@ -969,6 +982,13 @@ pub struct DosKernel {
     // The upper-memory-block arena, when the machine has furnished one (see
     // `set_umb_region`). None on a machine with no UMB-able memory.
     umb: Option<UmbArena>,
+    // Whether the EMS manager (the EMMXXXX0 character device) is present. The
+    // machine sets it from the EMM386 mode; it gates opening the EMMXXXX0 device
+    // and listing it in the device chain, the way a guest detects expanded memory.
+    ems_present: bool,
+    // Handles a guest has opened on the EMMXXXX0 device (AH=3Dh), so AH=44h IOCTL
+    // and AH=3Eh close treat them as the device rather than a host file.
+    ems_handles: HashSet<u16>,
     // AH=59h extended error: the last DOS error code reported to a guest. Held until
     // the next error overwrites it (DOS does not clear it on a successful call).
     last_error: u16,
@@ -1060,6 +1080,21 @@ impl DosKernel {
             top: seg.wrapping_add(paras),
         });
         Ok(())
+    }
+
+    /// Set whether the EMS manager (the EMMXXXX0 device) is present. The machine
+    /// calls this from the EMM386 mode at DOS init: a guest then detects expanded
+    /// memory by opening EMMXXXX0 or walking the device chain.
+    pub fn set_ems_present(&mut self, present: bool) {
+        self.ems_present = present;
+    }
+
+    /// The lowest free file handle (>= 5), skipping both host files and the open
+    /// EMS-device handles so the two never collide.
+    fn alloc_handle(&self) -> u16 {
+        (5u16..)
+            .find(|h| !self.open_files.contains_key(h) && !self.ems_handles.contains(h))
+            .expect("a free DOS handle exists at or below u16::MAX")
     }
 
     /// Walk the upper-memory arena's MCB chain, empty when no UMB pool is furnished.
@@ -2481,6 +2516,19 @@ impl DosKernel {
             // the access mode (0=read, 1=write, 2=read/write), honored and enforced
             // per handle. CF=0 + AX=handle on success, CF=1 + AX=DOS code on error.
             0x3d => {
+                // A character-device name opens the device, not a file. The EMMXXXX0
+                // EMS manager is the one we model: open it when present so a guest's
+                // detection (open + IOCTL) succeeds; when absent let it fall through
+                // to a host-file open that fails, so the guest reads "no EMS".
+                if let Some(name) = read_asciiz(mem, regs.ds, regs.dx)? {
+                    if is_ems_device_name(&name) && self.ems_present {
+                        let handle = self.alloc_handle();
+                        self.ems_handles.insert(handle);
+                        regs.ax = handle;
+                        regs.cf = false;
+                        return Ok(DosAction::Continue);
+                    }
+                }
                 let path = match self.resolve_open_path(mem, regs.ds, regs.dx)? {
                     Ok(path) => path,
                     Err(code) => {
@@ -2496,9 +2544,7 @@ impl DosKernel {
                 };
                 match open_host_file(&path, mode) {
                     Ok(file) => {
-                        let handle = (5u16..)
-                            .find(|h| !self.open_files.contains_key(h))
-                            .expect("a free DOS handle exists at or below u16::MAX");
+                        let handle = self.alloc_handle();
                         self.open_files.insert(handle, OpenFile { file, mode });
                         regs.ax = handle;
                         regs.cf = false;
@@ -2541,7 +2587,7 @@ impl DosKernel {
             // AH=3Eh: close the handle in BX. Dropping the File closes it (RAII).
             // CF=0 if the handle was open, CF=1 + AX=0x06 if it was not.
             0x3e => {
-                if self.open_files.remove(&regs.bx).is_some() {
+                if self.open_files.remove(&regs.bx).is_some() || self.ems_handles.remove(&regs.bx) {
                     regs.cf = false;
                 } else {
                     set_dos_error(regs, 0x06);
@@ -3150,14 +3196,36 @@ impl DosKernel {
                 // ends here), the character-device + NUL attribute 0x8004, no
                 // strategy or interrupt routine, and the 8-byte name "NUL     ".
                 // The CON and CLOCK$ headers are parked (not modeled yet).
-                let nul = base + 2 + 0x22;
-                mem.write_u16(nul, 0xffff)?; // next routine offset
-                mem.write_u16(nul + 2, 0xffff)?; // next routine segment (FFFF:FFFF = end)
+                let nul_off = 0x22usize; // BX-relative offset of the NUL header
+                let ems_off = nul_off + 0x12; // the EMMXXXX0 header right after NUL
+                let nul = base + 2 + nul_off;
+                // NUL's next link ends the chain, unless EMS is present, in which case
+                // the EMMXXXX0 device follows it.
+                if self.ems_present {
+                    mem.write_u16(nul, (2 + ems_off) as u16)?; // next offset
+                    mem.write_u16(nul + 2, SYSVARS_SEG)?; // next segment
+                } else {
+                    mem.write_u16(nul, 0xffff)?;
+                    mem.write_u16(nul + 2, 0xffff)?; // FFFF:FFFF = end
+                }
                 mem.write_u16(nul + 4, 0x8004)?; // attribute: char device, NUL bit
                 mem.write_u16(nul + 6, 0xffff)?; // strategy entry (none)
                 mem.write_u16(nul + 8, 0xffff)?; // interrupt entry (none)
                 for (i, &byte) in b"NUL     ".iter().enumerate() {
                     mem.write_u8(nul + 0x0a + i, byte)?;
+                }
+                // The EMMXXXX0 device header terminates the chain when EMS is present,
+                // so a guest walking the device list finds the manager by name.
+                if self.ems_present {
+                    let ems = base + 2 + ems_off;
+                    mem.write_u16(ems, 0xffff)?; // next offset
+                    mem.write_u16(ems + 2, 0xffff)?; // next segment (end)
+                    mem.write_u16(ems + 4, 0xc000)?; // attribute: character device
+                    mem.write_u16(ems + 6, 0xffff)?; // strategy entry (none)
+                    mem.write_u16(ems + 8, 0xffff)?; // interrupt entry (none)
+                    for (i, &byte) in b"EMMXXXX0".iter().enumerate() {
+                        mem.write_u8(ems + 0x0a + i, byte)?;
+                    }
                 }
                 regs.es = SYSVARS_SEG;
                 regs.bx = 0x0002;
@@ -3380,7 +3448,9 @@ impl DosKernel {
             // that matter (ISDEV + stdin/stdout); NUL/clock/binary/special are not set.
             0x44 => {
                 let handle = regs.bx;
-                let valid = handle <= 4 || self.open_files.contains_key(&handle);
+                let valid = handle <= 4
+                    || self.open_files.contains_key(&handle)
+                    || self.ems_handles.contains(&handle);
                 match regs.ax as u8 {
                     0x00 => {
                         if handle <= 4 {
@@ -3392,6 +3462,12 @@ impl DosKernel {
                                 _ => 0x02,
                             };
                             regs.dx = 0x80 | io; // bit 7 ISDEV + the console direction bits
+                            regs.cf = false;
+                        } else if self.ems_handles.contains(&handle) {
+                            // The EMMXXXX0 device: bit 7 ISDEV (so a guest knows it is a
+                            // device, not a file) plus the IOCTL-supported bit, the way an
+                            // EMM driver answers the open-then-IOCTL detection.
+                            regs.dx = 0xc080;
                             regs.cf = false;
                         } else if self.open_files.contains_key(&handle) {
                             // A regular file on C: (drive index 2); bit 7 clear means a file.
@@ -5228,6 +5304,108 @@ mod tests {
         assert!(regs.cf, "neither arena can satisfy it");
         assert_eq!(regs.ax, 0x08);
         assert_eq!(regs.bx, 0x27ff, "BX is the upper arena's largest, not 0xff");
+    }
+
+    /// Write an ASCIIZ string at 0000:`off` and return DS/DX for it.
+    fn put_asciiz(mem: &mut Memory, off: u16, text: &[u8]) -> (u16, u16) {
+        for (i, &b) in text.iter().enumerate() {
+            mem.write_u8(usize::from(off) + i, b).unwrap();
+        }
+        mem.write_u8(usize::from(off) + text.len(), 0).unwrap();
+        (0, off)
+    }
+
+    #[test]
+    fn emmxxxx0_opens_as_a_character_device_when_ems_is_present() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let (ds, dx) = put_asciiz(&mut mem, 0x2000, b"EMMXXXX0");
+
+        // With no EMS the device is not openable (it falls through to a host-file
+        // open, which fails), so a guest reads "no EMS".
+        let mut regs = DosRegs {
+            ax: 0x3d00,
+            ds,
+            dx,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(regs.cf, "EMMXXXX0 does not open without EMS");
+
+        // With EMS present the open succeeds, IOCTL reports a character device that
+        // is ready, and the handle closes.
+        kernel.set_ems_present(true);
+        let mut regs = DosRegs {
+            ax: 0x3d00,
+            ds,
+            dx,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf, "EMMXXXX0 opens when EMS is present");
+        let handle = regs.ax;
+
+        let mut regs = DosRegs {
+            ax: 0x4400,
+            bx: handle,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf);
+        assert_ne!(
+            regs.dx & 0x0080,
+            0,
+            "bit 7 ISDEV marks it a device, not a file"
+        );
+
+        let mut regs = DosRegs {
+            ax: 0x4407,
+            bx: handle,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(regs.ax & 0xff, 0xff, "the device reports ready");
+
+        let mut regs = DosRegs {
+            ax: 0x3e00,
+            bx: handle,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf, "the device handle closes");
+    }
+
+    #[test]
+    fn emmxxxx0_heads_the_device_chain_only_when_present() {
+        let read_chain_name = |present: bool| -> [u8; 8] {
+            let mut kernel = DosKernel::new();
+            let mut mem = Memory::new(1024 * 1024).unwrap();
+            kernel.set_ems_present(present);
+            let mut regs = DosRegs {
+                ax: 0x5200,
+                ..Default::default()
+            };
+            kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+            let sysvars = usize::from(regs.es) * 16 + usize::from(regs.bx);
+            let nul = sysvars + 0x22; // NUL header at [BX+0x22]
+            let next_off = mem.read_u16(nul).unwrap();
+            let next_seg = mem.read_u16(nul + 2).unwrap();
+            if (next_off, next_seg) == (0xffff, 0xffff) {
+                return *b"\0\0\0\0\0\0\0\0"; // chain ends at NUL
+            }
+            let next = usize::from(next_seg) * 16 + usize::from(next_off);
+            let mut name = [0u8; 8];
+            for (i, slot) in name.iter_mut().enumerate() {
+                *slot = mem.read_u8(next + 0x0a + i).unwrap();
+            }
+            name
+        };
+        assert_eq!(&read_chain_name(true), b"EMMXXXX0", "EMS chains after NUL");
+        assert_eq!(
+            &read_chain_name(false),
+            b"\0\0\0\0\0\0\0\0",
+            "no EMS leaves NUL ending the chain"
+        );
     }
 
     #[test]
