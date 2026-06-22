@@ -90,6 +90,72 @@ pub fn fat32_geometry(volume_bytes: u64) -> Option<Fat32Geometry> {
     })
 }
 
+/// OEM name in the boot sector. fatgen103 recommends "MSWIN4.1" because some FAT
+/// drivers check this field; the floppy path (fat12.rs) uses a house name, but
+/// the FAT32 volume is meant to be read by arbitrary software, so it follows the
+/// spec recommendation.
+const FAT32_OEM_NAME: &[u8; 8] = b"MSWIN4.1";
+
+/// Build the 512-byte FAT32 boot sector (sector 0) for `geo`, with `volume_id`
+/// as the volume serial. No bootstrap code (a data volume), but it carries the
+/// full FAT32 BPB and the 0x55AA signature so a FAT driver mounts it. All
+/// multi-byte fields are little-endian, per fatgen103.
+pub fn fat32_boot_sector(geo: &Fat32Geometry, volume_id: u32) -> [u8; 512] {
+    let mut s = [0u8; 512];
+    // JMP short to the boot code at 0x5A (the FAT32 BPB reaches 0x59), then NOP.
+    s[0] = 0xeb;
+    s[1] = 0x58;
+    s[2] = 0x90;
+    s[3..11].copy_from_slice(FAT32_OEM_NAME);
+    // Common BPB (offsets 11..36).
+    s[11..13].copy_from_slice(&geo.bytes_per_sector.to_le_bytes());
+    s[13] = geo.sectors_per_cluster;
+    s[14..16].copy_from_slice(&geo.reserved_sectors.to_le_bytes());
+    s[16] = geo.num_fats;
+    s[17..19].copy_from_slice(&0u16.to_le_bytes()); // RootEntCnt: 0 on FAT32
+    s[19..21].copy_from_slice(&0u16.to_le_bytes()); // TotSec16: 0 on FAT32
+    s[21] = 0xf8; // media descriptor: fixed disk
+    s[22..24].copy_from_slice(&0u16.to_le_bytes()); // FATSz16: 0 on FAT32
+    s[24..26].copy_from_slice(&63u16.to_le_bytes()); // sectors/track (CHS, cosmetic under LBA)
+    s[26..28].copy_from_slice(&255u16.to_le_bytes()); // heads (CHS, cosmetic under LBA)
+    s[28..32].copy_from_slice(&0u32.to_le_bytes()); // hidden sectors (whole volume, not a partition)
+    s[32..36].copy_from_slice(&geo.total_sectors.to_le_bytes()); // TotSec32
+    // FAT32 extended BPB (offsets 36..90).
+    s[36..40].copy_from_slice(&geo.fat_size_sectors.to_le_bytes()); // BPB_FATSz32
+    s[40..42].copy_from_slice(&0u16.to_le_bytes()); // BPB_ExtFlags: FAT mirroring active
+    s[42..44].copy_from_slice(&0u16.to_le_bytes()); // BPB_FSVer 0.0
+    s[44..48].copy_from_slice(&geo.root_cluster.to_le_bytes()); // BPB_RootClus
+    s[48..50].copy_from_slice(&geo.fsinfo_sector.to_le_bytes()); // BPB_FSInfo
+    s[50..52].copy_from_slice(&geo.backup_boot_sector.to_le_bytes()); // BPB_BkBootSec
+    // s[52..64] BPB_Reserved stays zero.
+    s[64] = 0x80; // BS_DrvNum: first hard disk
+    s[65] = 0x00; // BS_Reserved1
+    s[66] = 0x29; // BS_BootSig: the volume-id/label/type fields follow
+    s[67..71].copy_from_slice(&volume_id.to_le_bytes()); // BS_VolID
+    s[71..82].copy_from_slice(b"NO NAME    "); // BS_VolLab (11 bytes)
+    s[82..90].copy_from_slice(b"FAT32   "); // BS_FilSysType (8 bytes)
+    // s[90..510] boot code stays zero.
+    s[510] = 0x55;
+    s[511] = 0xaa;
+    s
+}
+
+/// Build the 512-byte FAT32 FSInfo sector (BPB_FSInfo names its location, usually
+/// sector 1). `free_count` is the last known free-cluster count and `next_free`
+/// a hint for the next free cluster to allocate; 0xFFFFFFFF means "unknown" for
+/// either (fatgen103 Section 5).
+pub fn fat32_fsinfo_sector(free_count: u32, next_free: u32) -> [u8; 512] {
+    let mut s = [0u8; 512];
+    s[0..4].copy_from_slice(&0x4161_5252u32.to_le_bytes()); // FSI_LeadSig
+    // s[4..484] FSI_Reserved1 stays zero.
+    s[484..488].copy_from_slice(&0x6141_7272u32.to_le_bytes()); // FSI_StrucSig
+    s[488..492].copy_from_slice(&free_count.to_le_bytes()); // FSI_Free_Count
+    s[492..496].copy_from_slice(&next_free.to_le_bytes()); // FSI_Nxt_Free
+    // s[496..508] FSI_Reserved2 stays zero.
+    s[508..512].copy_from_slice(&0xaa55_0000u32.to_le_bytes()); // FSI_TrailSig
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +235,68 @@ mod tests {
             g.first_data_sector,
             u32::from(g.reserved_sectors) + u32::from(g.num_fats) * g.fat_size_sectors
         );
+    }
+
+    fn le16(s: &[u8; 512], at: usize) -> u16 {
+        u16::from_le_bytes([s[at], s[at + 1]])
+    }
+    fn le32(s: &[u8; 512], at: usize) -> u32 {
+        u32::from_le_bytes([s[at], s[at + 1], s[at + 2], s[at + 3]])
+    }
+
+    #[test]
+    fn boot_sector_has_the_fat32_bpb() {
+        let geo = fat32_geometry(1024 * 1024 * 1024).unwrap();
+        let s = fat32_boot_sector(&geo, 0x1234_5678);
+        assert_eq!(s[0], 0xeb, "jmp opcode");
+        assert_eq!(s[2], 0x90, "nop after jmp");
+        assert_eq!(&s[3..11], b"MSWIN4.1");
+        assert_eq!(le16(&s, 11), 512, "bytes per sector");
+        assert_eq!(s[13], geo.sectors_per_cluster, "sectors per cluster");
+        assert_eq!(le16(&s, 14), 32, "reserved sectors");
+        assert_eq!(s[16], 2, "num FATs");
+        assert_eq!(le16(&s, 17), 0, "RootEntCnt is 0 on FAT32");
+        assert_eq!(le16(&s, 19), 0, "TotSec16 is 0 on FAT32");
+        assert_eq!(s[21], 0xf8, "fixed-disk media descriptor");
+        assert_eq!(le16(&s, 22), 0, "FATSz16 is 0 on FAT32");
+        assert_eq!(le32(&s, 32), geo.total_sectors, "TotSec32");
+        assert_eq!(le32(&s, 36), geo.fat_size_sectors, "BPB_FATSz32");
+        assert_eq!(le32(&s, 44), 2, "BPB_RootClus");
+        assert_eq!(le16(&s, 48), 1, "BPB_FSInfo");
+        assert_eq!(le16(&s, 50), 6, "BPB_BkBootSec");
+        assert_eq!(s[64], 0x80, "BS_DrvNum");
+        assert_eq!(s[66], 0x29, "BS_BootSig");
+        assert_eq!(le32(&s, 67), 0x1234_5678, "BS_VolID");
+        assert_eq!(&s[82..90], b"FAT32   ", "BS_FilSysType");
+        assert_eq!(s[510], 0x55, "signature lo");
+        assert_eq!(s[511], 0xaa, "signature hi");
+    }
+
+    #[test]
+    fn fsinfo_sector_has_the_signatures_and_counts() {
+        let s = fat32_fsinfo_sector(261_000, 3);
+        assert_eq!(le32(&s, 0), 0x4161_5252, "FSI_LeadSig");
+        assert_eq!(le32(&s, 484), 0x6141_7272, "FSI_StrucSig");
+        assert_eq!(le32(&s, 488), 261_000, "FSI_Free_Count");
+        assert_eq!(le32(&s, 492), 3, "FSI_Nxt_Free");
+        assert_eq!(le32(&s, 508), 0xaa55_0000, "FSI_TrailSig");
+        assert_eq!(s[510], 0x55, "trail sig carries the 0x55AA at 510/511");
+        assert_eq!(s[511], 0xaa);
+        assert!(
+            s[4..484].iter().all(|&b| b == 0),
+            "the reserved gap is zero"
+        );
+    }
+
+    #[test]
+    fn boot_sector_round_trips_through_the_geometry() {
+        // A reader recomputing the cluster count from the written BPB must get the
+        // same number the geometry function produced.
+        let geo = fat32_geometry(64 * 1024 * 1024).unwrap();
+        let s = fat32_boot_sector(&geo, 0);
+        let total = le32(&s, 32);
+        let fatsz = le32(&s, 36);
+        let data = total - (u32::from(le16(&s, 14)) + u32::from(s[16]) * fatsz);
+        assert_eq!(data / u32::from(s[13]), geo.count_of_clusters);
     }
 }
