@@ -302,6 +302,23 @@ impl Pic8259Pair {
         self.irq_unmasked(0)
     }
 
+    /// True when an edge on IRQ `irq` (0..15) can actually reach the CPU, i.e. the
+    /// line is unmasked *and*, for a slave line (8..15), the master cascade pin the
+    /// slave INT is wired to (slave ICW3 id, AT default IR2) is also unmasked.
+    /// `irq_unmasked` alone only checks the slave IMR bit; if a guest masks the
+    /// cascade line but leaves the slave bit open, the slave latches the IRR but no
+    /// edge forwards to the master, so the CPU never wakes. Wake estimators must use
+    /// this -- not `irq_unmasked` -- so a halted CPU is not fast-forwarded to a wake
+    /// that delivery can never produce.
+    pub(crate) fn deliverable(&self, irq: u8) -> bool {
+        if irq < 8 {
+            self.irq_unmasked(irq)
+        } else {
+            let cascade_pin = self.slave.icw3 & 0x07;
+            self.irq_unmasked(irq) && self.master.imr & (1 << cascade_pin) == 0
+        }
+    }
+
     /// True when IRQ `irq` (0..15) has a latched request in the IRR. IRQ 0..7 are
     /// on the master, IRQ 8..15 on the slave. Test-only inspector.
     #[cfg(test)]

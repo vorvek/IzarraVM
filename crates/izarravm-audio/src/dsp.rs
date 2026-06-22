@@ -3,6 +3,7 @@
 //! The CT1745 mixer lives next to this in the machine crate. ADPCM, input/ADC,
 //! and MIDI/MPU-401 are not modeled yet.
 
+use crate::pcm::{sample_i16, sample_u8, sample_u16};
 use std::collections::VecDeque;
 
 pub const DSP_VERSION_HI: u8 = 4;
@@ -506,25 +507,6 @@ impl SbDsp {
     }
 }
 
-/// Convert one 8-bit Sound Blaster PCM sample (unsigned) to a centered signed
-/// 16-bit value for the mixer: (byte - 128) * 256.
-fn sample_u8(byte: u8) -> i16 {
-    (i32::from(byte) - 128).clamp(-128, 127) as i16 * 256
-}
-
-/// Convert one signed 16-bit DMA sample directly (no centering): the SB16 16-bit
-/// path is already signed PCM, so the bit pattern maps straight to i16.
-fn sample_i16(word: u16) -> i16 {
-    word as i16
-}
-
-/// Convert one unsigned 16-bit DMA sample (rare, mode-byte-selected) by
-/// re-centering around 0x8000: the upper half (>= 0x8000) maps to 0..=32767 and
-/// the lower half wraps to -32768..=-1.
-fn sample_u16(word: u16) -> i16 {
-    word.wrapping_sub(0x8000) as i16
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,13 +643,6 @@ mod tests {
         assert!(dsp.is_playing());
         write_cmd(&mut dsp, &[0xDA]); // exit auto-init
         assert!(!dsp.is_auto_init(), "exit-auto-init clears the mode");
-    }
-
-    #[test]
-    fn sample_u8_centers_unsigned_bytes() {
-        assert_eq!(sample_u8(0x00), -32_768, "0x00 -> full negative");
-        assert_eq!(sample_u8(0x80), 0, "0x80 -> silence");
-        assert_eq!(sample_u8(0xFF), 32_512, "0xFF -> near full positive");
     }
 
     #[test]
