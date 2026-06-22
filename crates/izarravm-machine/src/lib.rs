@@ -81,6 +81,25 @@ struct XferEnd {
     seg_or_page: u16,
 }
 
+/// Partition extended RAM into the XMS pool and (in RAM mode) the EMS backing
+/// region, returning the XMS state and the EMS manager. The EMS share is capped at
+/// half of extended RAM so a small machine still keeps an XMS pool. This is the one
+/// source of truth for the partition: `Machine::base` builds it at construction and
+/// `set_emm386_mode` rebuilds it at SYSINIT, so a config-time and a CONFIG.SYS mode
+/// always agree.
+fn build_xms_ems(memory_mib: u16, emm386: Emm386Mode) -> (xms::XmsState, Option<ems::EmsState>) {
+    let ems_want_kb = if emm386.provides_ems() {
+        let extended_kb = (u32::from(memory_mib) * 1024).saturating_sub(1024 + 64);
+        EMS_DEFAULT_KIB.min(extended_kb / 2)
+    } else {
+        0
+    };
+    let (xms, ems_region) = xms::XmsState::new_with_ems(memory_mib, ems_want_kb);
+    let ems = ems_region
+        .map(|region| ems::EmsState::new(EMS_FRAME_DEFAULT_SEG, region.base, region.total_pages));
+    (xms, ems)
+}
+
 pub const HIGH_ROM_BASE: u32 = 0xffff_0000;
 pub const MARGO_LFB_BASE: u32 = 0xE000_0000;
 pub const MARGO_MMIO_BASE: u32 = 0xE040_0000;
@@ -539,22 +558,8 @@ impl Machine {
         let active_mode = profile.cpu;
         let memory_mib = profile.memory_mib;
         let timing = TimingFactors::for_clock(active_mode.clock_hz());
-        // Partition extended RAM between XMS and EMS. EMS is provisioned only in RAM
-        // mode, simulated from a slice of extended memory the XMS pool excludes (so
-        // installed RAM stays honest). The page frame sits at the default segment.
-        let ems_want_kb = if profile.emm386.provides_ems() {
-            // Cap the default to half of extended RAM so a small machine still keeps
-            // an XMS pool, the way a real manager sizes the EMS share rather than
-            // swallowing all of extended memory.
-            let extended_kb = (u32::from(memory_mib) * 1024).saturating_sub(1024 + 64);
-            EMS_DEFAULT_KIB.min(extended_kb / 2)
-        } else {
-            0
-        };
-        let (xms, ems_region) = xms::XmsState::new_with_ems(memory_mib, ems_want_kb);
-        let ems = ems_region.map(|region| {
-            ems::EmsState::new(EMS_FRAME_DEFAULT_SEG, region.base, region.total_pages)
-        });
+        // Partition extended RAM between XMS and EMS from the EMM386 mode.
+        let (xms, ems) = build_xms_ems(memory_mib, profile.emm386);
         // Lay the XMS driver entry stub into ROM. INT 2Fh AX=4310h hands the guest
         // a far pointer to it; a guest FAR-CALLs there, the INT 66h traps into the
         // host XMS handler, and the RETF returns. Placed at a fixed ROM offset that
@@ -664,6 +669,19 @@ impl Machine {
     /// the GUI to keep the full power-on screen and timing.
     pub fn set_fast_post(&mut self, fast: bool) {
         self.fast_post = fast;
+    }
+
+    /// Re-apply the EMM386 memory-manager mode, the way a CONFIG.SYS DEVICE=EMM386
+    /// line drives it at SYSINIT. Rebuilds the XMS/EMS partition and re-lays the
+    /// upper-memory window (UMB pool, EMS frame, EMMXXXX0 presence, INT 67h gate)
+    /// from the new mode. Must run before any guest XMS or EMS allocation; at
+    /// SYSINIT none has happened yet, so re-partitioning strands no live handle.
+    pub fn set_emm386_mode(&mut self, mode: Emm386Mode) -> Result<(), MachineError> {
+        self.profile.emm386 = mode;
+        let (xms, ems) = build_xms_ems(self.profile.memory_mib, mode);
+        self.xms = xms;
+        self.ems = ems;
+        self.furnish_dos_upper_memory()
     }
 
     /// Enter or leave booter-inert mode. When set, the Toka-DOS HLE and IEMM stop
@@ -8125,6 +8143,45 @@ mod tests {
             "HIMEM-only provides neither UMBs nor EMS"
         );
         assert!(off.ems.is_none(), "HIMEM-only provisions no EMS");
+    }
+
+    #[test]
+    fn set_emm386_mode_re_applies_the_layout_at_boot() {
+        const PROG: [u8; 2] = [0xCD, 0x20];
+        // Construct in RAM mode (EMS provisioned, frame reserved).
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
+                .unwrap();
+        assert!(machine.ems.is_some(), "RAM provisions EMS at construction");
+
+        // A CONFIG.SYS NOEMS line re-applies at SYSINIT: EMS goes away, UMBs stay,
+        // and the EMS frame is no longer reserved (the UMB pool grows over it).
+        machine.set_emm386_mode(Emm386Mode::NoEms).unwrap();
+        assert!(machine.ems.is_none(), "NOEMS drops the EMS manager");
+        let kinds: Vec<_> = machine.uma.reservations().iter().map(|r| r.kind).collect();
+        assert!(kinds.contains(&UmaUse::Umb), "NOEMS keeps UMBs");
+        assert!(
+            !kinds.contains(&UmaUse::EmsFrame),
+            "NOEMS reserves no frame"
+        );
+
+        // Unloaded drops UMBs too; only the VGA BIOS stays reserved.
+        machine.set_emm386_mode(Emm386Mode::Unloaded).unwrap();
+        assert!(machine.ems.is_none());
+        assert_eq!(
+            machine
+                .uma
+                .reservations()
+                .iter()
+                .map(|r| r.kind)
+                .collect::<Vec<_>>(),
+            vec![UmaUse::Rom],
+            "HIMEM-only reserves neither UMBs nor EMS"
+        );
+
+        // Re-applying RAM brings the frame and EMS back.
+        machine.set_emm386_mode(Emm386Mode::Ram).unwrap();
+        assert!(machine.ems.is_some(), "RAM restores EMS");
     }
 
     #[test]
