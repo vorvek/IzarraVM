@@ -11290,11 +11290,12 @@ mod tests {
         // PSP at 0x0100 -> linear 0x1000; the program stored words at offsets 0x200..0x205.
         assert_eq!(mem.read_u16(0x1200).unwrap(), 0x0000); // ES from IVT[0x21] (stub segment)
         assert_eq!(mem.read_u16(0x1202).unwrap(), 0x0600); // BX from IVT[0x21] (stub offset)
-        // AH=48h returns the first free paragraph, which now follows the seeded
-        // BLASTER=/SETSOUND= env block. Derive the expected segment from that
-        // block so the assertion tracks the env size, not a hardcoded value. The
-        // block ends with the DOS 3.0+ argv0 trailer: a terminator NUL, a WORD
-        // count of 1, and the ASCIIZ program path, so account for it here.
+        // AH=48h returns a data segment that follows the seeded BLASTER=/SETSOUND=
+        // env block plus the new block's own reserved MCB header. Derive the
+        // expected segment from the env block so the assertion tracks the env size,
+        // not a hardcoded value. The block ends with the DOS 3.0+ argv0 trailer: a
+        // terminator NUL, a WORD count of 1, and the ASCIIZ program path, so account
+        // for it here.
         let env_seg = mem.read_u16(0x1000 + 0x2c).unwrap();
         let strings = sound_blaster_env_entries(&SoundBlasterConfig::default())
             .iter()
@@ -11303,10 +11304,12 @@ mod tests {
             + 1; // the terminating empty string
         let argv0_trailer = 2 + izarravm_dos::DEFAULT_ARGV0.len() + 1; // WORD count + ASCIIZ path
         let env_paras = (strings + argv0_trailer).div_ceil(16) as u16;
+        // env_seg + env_paras is the env block's first free paragraph (its MCB header
+        // slot); the AH=48h data segment is one paragraph above that header.
         assert_eq!(
             mem.read_u16(0x1204).unwrap(),
-            env_seg + env_paras,
-            "AH=48h allocated segment follows the env block"
+            env_seg + env_paras + 1,
+            "AH=48h allocated segment follows the env block and its MCB header"
         );
     }
 
@@ -12103,12 +12106,13 @@ mod tests {
                 .unwrap();
         let env_seg = psp_env_segment(&machine);
         assert_ne!(env_seg, 0, "PSP:0x2C must name the env segment");
-        // The env sits directly above the 64 KiB .COM program block (PSP:0x02).
+        // The env data sits one paragraph above the 64 KiB .COM program block
+        // (PSP:0x02), past the env block's reserved MCB header.
         let prog_top = machine
             .memory()
             .read_u16(usize::from(DOS_LOAD_SEGMENT) * 16 + 2)
             .unwrap();
-        assert_eq!(env_seg, prog_top);
+        assert_eq!(env_seg, prog_top + 1);
         assert_eq!(
             parse_env_block(&machine, env_seg),
             vec![
