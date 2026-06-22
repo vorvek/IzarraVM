@@ -270,6 +270,17 @@ mod tests {
         assert_eq!(&s[82..90], b"FAT32   ", "BS_FilSysType");
         assert_eq!(s[510], 0x55, "signature lo");
         assert_eq!(s[511], 0xaa, "signature hi");
+        // Fields that must read as zero on FAT32, plus the reserved and boot-code
+        // regions, so a stray nonzero byte in the BPB cannot slip through.
+        assert_eq!(le32(&s, 28), 0, "HiddSec");
+        assert_eq!(le16(&s, 40), 0, "BPB_ExtFlags");
+        assert_eq!(le16(&s, 42), 0, "BPB_FSVer");
+        assert_eq!(&s[71..82], b"NO NAME    ", "BS_VolLab");
+        assert!(s[52..64].iter().all(|&b| b == 0), "BPB_Reserved is zero");
+        assert!(
+            s[90..510].iter().all(|&b| b == 0),
+            "boot-code region is zero"
+        );
     }
 
     #[test]
@@ -286,6 +297,16 @@ mod tests {
             s[4..484].iter().all(|&b| b == 0),
             "the reserved gap is zero"
         );
+    }
+
+    #[test]
+    fn fsinfo_unknown_sentinel_round_trips() {
+        let s = fat32_fsinfo_sector(0xFFFF_FFFF, 0xFFFF_FFFF);
+        assert_eq!(le32(&s, 488), 0xFFFF_FFFF, "free count unknown");
+        assert_eq!(le32(&s, 492), 0xFFFF_FFFF, "next free unknown");
+        // The signatures stay present alongside the sentinel counts.
+        assert_eq!(le32(&s, 0), 0x4161_5252);
+        assert_eq!(le32(&s, 508), 0xaa55_0000);
     }
 
     #[test]
