@@ -1232,11 +1232,12 @@ impl DosKernel {
     }
 
     /// AH=11h FIND FIRST using an FCB. The search FCB at DS:DX holds an 8.3 name
-    /// with '?'/'*' wildcards. Enumerate C:, snapshot the normal-file matches,
-    /// write the first as a directory entry into the DTA, and keep the cursor for
-    /// AH=12h. AL=00h found, 0xFFh on no match or no drive. Normal FCB only;
-    /// extended-FCB (0xFFh) search attributes are a later slice, so directories
-    /// and volume labels are not returned.
+    /// with '?'/'*' wildcards. Enumerate C:, snapshot the matches, write the first
+    /// as a directory entry into the DTA, and keep the cursor for AH=12h. AL=00h
+    /// found, 0xFFh on no match or no drive. An extended FCB (0xFF prefix) carries
+    /// a search attribute so directories, hidden, and system entries can be
+    /// returned; a normal FCB returns normal files only. Volume-label search
+    /// (attribute 0x08) is not modeled, the HLE having no volume label.
     fn fcb_find_first(
         &mut self,
         mem: &mut Memory,
@@ -1297,7 +1298,9 @@ impl DosKernel {
     }
 
     /// AH=12h FIND NEXT using an FCB. Continue the search keyed by the current DTA,
-    /// writing the next directory entry. AL=00h, or 0xFFh when exhausted.
+    /// writing the next directory entry in the normal or extended result format
+    /// (re-read from the unchanged search FCB's 0xFF prefix). AL=00h, or 0xFFh
+    /// when exhausted.
     fn fcb_find_next(
         &mut self,
         mem: &mut Memory,
@@ -6932,6 +6935,37 @@ mod tests {
             50,
             "size in the entry"
         );
+    }
+
+    #[test]
+    fn fcb_extended_find_next_keeps_the_extended_format() {
+        let (mut kernel, mut mem, _dir) = fcb_kernel(&[("A.TXT", b"a"), ("B.TXT", b"b")]);
+        place_extended_fcb(&mut mem, 0x00, 0, "????????.TXT");
+
+        let r1 = fcb_call(&mut kernel, &mut mem, 0x11);
+        assert_eq!(r1.ax & 0xff, 0x00, "first .TXT match");
+        assert_eq!(
+            mem.read_u8(FCB_DTA).unwrap(),
+            0xff,
+            "find-first extended header"
+        );
+
+        // Find-next re-reads the unchanged FCB and keeps the extended format.
+        let r2 = fcb_call(&mut kernel, &mut mem, 0x12);
+        assert_eq!(r2.ax & 0xff, 0x00, "second .TXT match");
+        assert_eq!(
+            mem.read_u8(FCB_DTA).unwrap(),
+            0xff,
+            "find-next keeps the extended header"
+        );
+        assert_eq!(
+            mem.read_u8(FCB_DTA + 7).unwrap(),
+            3,
+            "drive in the extended header"
+        );
+
+        let r3 = fcb_call(&mut kernel, &mut mem, 0x12);
+        assert_eq!(r3.ax & 0xff, 0xff, "exhausted");
     }
 
     #[test]
