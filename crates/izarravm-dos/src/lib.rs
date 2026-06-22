@@ -1231,6 +1231,88 @@ impl DosKernel {
         Ok(DosAction::Continue)
     }
 
+    /// AH=11h FIND FIRST using an FCB. The search FCB at DS:DX holds an 8.3 name
+    /// with '?'/'*' wildcards. Enumerate C:, snapshot the normal-file matches,
+    /// write the first as a directory entry into the DTA, and keep the cursor for
+    /// AH=12h. AL=00h found, 0xFFh on no match or no drive. Normal FCB only;
+    /// extended-FCB (0xFFh) search attributes are a later slice, so directories
+    /// and volume labels are not returned.
+    fn fcb_find_first(
+        &mut self,
+        mem: &mut Memory,
+        regs: &mut DosRegs,
+    ) -> Result<DosAction, DosError> {
+        let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+        let name = fcb_name(mem, base, FCB_NAME)?;
+        let Some(drive) = self.drive.as_ref() else {
+            regs.ax = (regs.ax & 0xff00) | 0xff;
+            return Ok(DosAction::Continue);
+        };
+        let pattern = pattern_to_8_3(&name.to_ascii_uppercase());
+        let mut entries = Vec::new();
+        if let Ok(read_dir) = std::fs::read_dir(drive.root()) {
+            for dirent in read_dir.flatten() {
+                let raw = dirent.file_name();
+                let Some(host) = raw.to_str() else { continue };
+                let Some(template) = host_name_to_8_3(host) else {
+                    continue;
+                };
+                if !template_matches(&template, &pattern) {
+                    continue;
+                }
+                let Ok(metadata) = dirent.metadata() else {
+                    continue;
+                };
+                let attr = if metadata.is_dir() { 0x10 } else { 0x00 };
+                // A normal FCB search (attribute 0) returns only normal files.
+                if !attr_matches(attr, 0) {
+                    continue;
+                }
+                let (time, date) =
+                    dos_time_date(metadata.modified().unwrap_or(std::time::UNIX_EPOCH));
+                entries.push(FindEntry {
+                    attr,
+                    time,
+                    date,
+                    size: metadata.len() as u32,
+                    name: host.to_ascii_uppercase(),
+                });
+            }
+        }
+        let Some(first) = entries.first().cloned() else {
+            regs.ax = (regs.ax & 0xff00) | 0xff;
+            return Ok(DosAction::Continue);
+        };
+        write_fcb_find_record(mem, self.dta, &first)?;
+        self.find_searches
+            .insert(self.dta, FindSearch { entries, next: 1 });
+        regs.ax &= 0xff00; // AL=00h found
+        Ok(DosAction::Continue)
+    }
+
+    /// AH=12h FIND NEXT using an FCB. Continue the search keyed by the current DTA,
+    /// writing the next directory entry. AL=00h, or 0xFFh when exhausted.
+    fn fcb_find_next(
+        &mut self,
+        mem: &mut Memory,
+        regs: &mut DosRegs,
+    ) -> Result<DosAction, DosError> {
+        let dta = self.dta;
+        let Some(search) = self.find_searches.get_mut(&dta) else {
+            regs.ax = (regs.ax & 0xff00) | 0xff;
+            return Ok(DosAction::Continue);
+        };
+        let Some(entry) = search.entries.get(search.next).cloned() else {
+            self.find_searches.remove(&dta);
+            regs.ax = (regs.ax & 0xff00) | 0xff;
+            return Ok(DosAction::Continue);
+        };
+        search.next += 1;
+        write_fcb_find_record(mem, dta, &entry)?;
+        regs.ax &= 0xff00; // AL=00h
+        Ok(DosAction::Continue)
+    }
+
     /// AH=17h RENAME FCB. The FCB at DS:DX holds the old 8.3 name at 0x01 and the
     /// new 8.3 name at 0x11. AL=00 on success, 0xFF on a missing source or host
     /// error. Wildcards in the names are not expanded (marked); the common case is
@@ -2968,9 +3050,11 @@ impl DosKernel {
             0x27 => self.fcb_random_block_read(mem, regs),
             0x28 => self.fcb_random_block_write(mem, regs),
             0x29 => self.fcb_parse_filename(mem, regs),
-            // Other file functions (find) and everything else are not yet
-            // implemented; later slices fill them in. An unimplemented function
-            // returns Continue so the IRET stub returns to the caller.
+            0x11 => self.fcb_find_first(mem, regs),
+            0x12 => self.fcb_find_next(mem, regs),
+            // Everything else is not yet implemented; later slices fill it in. An
+            // unimplemented function returns Continue so the IRET stub returns to
+            // the caller.
             _ => Ok(DosAction::Continue),
         }
     }
@@ -3545,6 +3629,37 @@ fn write_find_record(mem: &mut Memory, dta: (u16, u16), entry: &FindEntry) -> Re
     for i in 0..13 {
         mem.write_u8(base + 0x1e + i, name.get(i).copied().unwrap_or(0))?;
     }
+    Ok(())
+}
+
+/// Drive number (1-based) the FCB find result reports. C: is the only mounted
+/// FCB drive, so a normal-FCB find always reports drive 3.
+const FCB_FIND_DRIVE: u8 = 3;
+
+/// Write an FCB find result (AH=11h/12h) into the DTA: the drive number at +0
+/// followed by the 32-byte directory entry at +1 (name, ext, attribute,
+/// reserved, time, date, starting cluster, size). The whole thing doubles as an
+/// unopened FCB. fcb_set_name lands the name at +1 and the extension at +9,
+/// which is exactly the directory entry's name field since the entry starts at +1.
+fn write_fcb_find_record(
+    mem: &mut Memory,
+    dta: (u16, u16),
+    entry: &FindEntry,
+) -> Result<(), DosError> {
+    let base = usize::from(dta.0) * 16 + usize::from(dta.1);
+    for i in 0..0x21 {
+        mem.write_u8(base + i, 0)?;
+    }
+    mem.write_u8(base, FCB_FIND_DRIVE)?;
+    fcb_set_name(mem, base, &entry.name)?; // name at +1, ext at +9 (the entry name field)
+    mem.write_u8(base + 0x0c, entry.attr)?; // entry +11 attribute
+    // entry +12 reserved (10 bytes) stays zero
+    mem.write_u16(base + 0x17, entry.time)?; // entry +22 time
+    mem.write_u16(base + 0x19, entry.date)?; // entry +24 date
+    // entry +26 starting cluster: the HLE has no FAT, so this is a placeholder
+    // until the FAT32 facade lands. FAT-walking copy protection is out of scope.
+    mem.write_u16(base + 0x1b, 0)?;
+    mem.write_u32(base + 0x1d, entry.size)?; // entry +28 file size
     Ok(())
 }
 
@@ -6594,6 +6709,61 @@ mod tests {
         assert!(!dir.path().join("A.DAT").exists());
         assert!(!dir.path().join("B.DAT").exists());
         assert!(dir.path().join("KEEP.TXT").exists(), "non-match kept");
+    }
+
+    // The DTA the FCB helpers use: init_program sets it to PSP:0x80 = 0x1080.
+    const FCB_DTA: usize = 0x0100 * 16 + 0x80;
+
+    #[test]
+    fn fcb_find_first_and_next_enumerate_txt_files() {
+        let (mut kernel, mut mem, _dir) =
+            fcb_kernel(&[("A.TXT", b"aa"), ("B.TXT", b"bbb"), ("C.DAT", b"c")]);
+        place_fcb(&mut mem, 0, "????????.TXT");
+
+        let r1 = fcb_call(&mut kernel, &mut mem, 0x11);
+        assert_eq!(r1.ax & 0xff, 0x00, "first .TXT match found");
+        assert_eq!(mem.read_u8(FCB_DTA).unwrap(), 3, "drive C: = 3");
+        let ext: Vec<u8> = (0..3)
+            .map(|i| mem.read_u8(FCB_DTA + 0x09 + i).unwrap())
+            .collect();
+        assert_eq!(&ext, b"TXT", "the extension field is TXT");
+
+        let r2 = fcb_call(&mut kernel, &mut mem, 0x12);
+        assert_eq!(r2.ax & 0xff, 0x00, "second .TXT match found");
+
+        let r3 = fcb_call(&mut kernel, &mut mem, 0x12);
+        assert_eq!(r3.ax & 0xff, 0xff, "only two .TXT files, then exhausted");
+    }
+
+    #[test]
+    fn fcb_find_first_fills_name_attribute_and_size() {
+        let (mut kernel, mut mem, _dir) = fcb_kernel(&[("DATA.BIN", &[0u8; 100])]);
+        place_fcb(&mut mem, 0, "DATA.BIN");
+
+        let r = fcb_call(&mut kernel, &mut mem, 0x11);
+        assert_eq!(r.ax & 0xff, 0x00);
+        let name: Vec<u8> = (0..8)
+            .map(|i| mem.read_u8(FCB_DTA + 0x01 + i).unwrap())
+            .collect();
+        assert_eq!(&name, b"DATA    ", "8-char blank-padded name");
+        assert_eq!(
+            mem.read_u8(FCB_DTA + 0x0c).unwrap(),
+            0x00,
+            "normal file attribute"
+        );
+        assert_eq!(
+            mem.read_u32(FCB_DTA + 0x1d).unwrap(),
+            100,
+            "file size dword"
+        );
+    }
+
+    #[test]
+    fn fcb_find_first_no_match_returns_ff() {
+        let (mut kernel, mut mem, _dir) = fcb_kernel(&[("A.TXT", b"x")]);
+        place_fcb(&mut mem, 0, "NOPE.ZZZ");
+        let r = fcb_call(&mut kernel, &mut mem, 0x11);
+        assert_eq!(r.ax & 0xff, 0xff);
     }
 
     #[test]
