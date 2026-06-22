@@ -114,12 +114,14 @@ fn is_root_system_file(name: &str) -> bool {
 /// path-showing prompt. DOS line endings (CRLF).
 const DEFAULT_AUTOEXEC_BAT: &str = "@ECHO OFF\r\nPATH=C:\\DOS\r\nPROMPT=$P$G\r\n";
 
-/// The default CONFIG.SYS: the directives a period DOS carries. The HIMEM.SYS and
-/// EMM386.EXE RAM lines select the IEMM RAM mode (UMBs plus the EMS page frame) at
-/// SYSINIT, the way a real DOS=HIGH,UMB box is configured; the machine parses these
-/// to drive the memory layout. The CD-extension DEVICE= line is still left out
-/// until that driver exists.
-const DEFAULT_CONFIG_SYS: &str = "DEVICE=C:\\DOS\\HIMEM.SYS /TESTMEM:OFF\r\nDEVICE=C:\\DOS\\EMM386.EXE RAM\r\nDOS=HIGH,UMB\r\nFILES=40\r\nBUFFERS=20\r\nLASTDRIVE=E\r\n";
+/// The default CONFIG.SYS: the directives a period DOS carries. The HIMEM.SYS
+/// and IEMM.EXE RAM lines select the IEMM RAM mode (UMBs plus the EMS page
+/// frame) at SYSINIT, the way a real DOS=HIGH,UMB box is configured; the machine
+/// parses these to drive the memory layout. IEMM.EXE is the Toka-DOS memory
+/// manager; the parser also accepts the real-DOS EMM386.EXE name so a pasted
+/// real-DOS config still drives the mode. The CD-extension DEVICE= line is still
+/// left out until that driver exists.
+const DEFAULT_CONFIG_SYS: &str = "DEVICE=C:\\DOS\\HIMEM.SYS /TESTMEM:OFF\r\nDEVICE=C:\\DOS\\IEMM.EXE RAM\r\nDOS=HIGH,UMB\r\nFILES=40\r\nBUFFERS=20\r\nLASTDRIVE=E\r\n";
 
 fn write_system_files(c_root: &Path, files: &[(String, Vec<u8>)]) -> std::io::Result<()> {
     std::fs::create_dir_all(c_root)?;
@@ -4838,6 +4840,12 @@ mod tests {
         let config = std::fs::read_to_string(root.join("CONFIG.SYS")).unwrap();
         assert!(config.contains("DOS=HIGH,UMB"));
         assert!(config.contains("LASTDRIVE=E"));
+        // The shipped default names the Toka-DOS memory manager IEMM.EXE (the
+        // parser also accepts the real-DOS EMM386.EXE alias).
+        assert!(
+            config.contains("DEVICE=C:\\DOS\\IEMM.EXE RAM"),
+            "the default CONFIG.SYS loads the IEMM manager"
+        );
 
         // A user-edited config survives a reinstall (generated only when absent).
         std::fs::write(root.join("AUTOEXEC.BAT"), b"REM mine").unwrap();
