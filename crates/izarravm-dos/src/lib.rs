@@ -5516,6 +5516,39 @@ mod tests {
     }
 
     #[test]
+    fn read_mcb_chain_steps_over_an_intermediate_block() {
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let mut kernel = arena_kernel();
+        // An AH=48h allocation puts a middle 'M' link between the program block
+        // and the free remainder, exercising the reader's next-MCB stepping.
+        let mut alloc = DosRegs {
+            ax: 0x4800,
+            bx: 0x0010,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut alloc, &mut mem).unwrap();
+        let block_seg = alloc.ax;
+
+        let mut regs = DosRegs {
+            ax: 0x5200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        let ptr = usize::from(regs.es) * 16 + usize::from(regs.bx);
+        let first = mem.read_u16(ptr - 2).unwrap();
+
+        let chain = read_mcb_chain(&mem, first);
+        assert_eq!(chain.len(), 3, "program + AH=48h block + free remainder");
+        assert_eq!(chain[1].sig, b'M', "the middle block is a link");
+        assert_eq!(
+            chain[1].owner, block_seg,
+            "the AH=48h block is owned by its own data segment"
+        );
+        assert_eq!(chain[1].size, 0x0010, "the block's size in paragraphs");
+        assert_eq!(chain[2].sig, b'Z', "the free remainder ends the chain");
+    }
+
+    #[test]
     fn critical_error_response_decodes_low_two_bits() {
         assert_eq!(
             CriticalErrorResponse::from_al(0),
