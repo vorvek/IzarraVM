@@ -13948,9 +13948,65 @@ mod tests {
         }
 
         let text = machine.screen_text().as_text();
+        // The default AUTOEXEC.BAT runs at boot and sets PATH=C:\DOS, so the path
+        // command shows that. The boot environment no longer pre-seeds a PATH, so
+        // the old C:\;C:\DOS default is gone: AUTOEXEC owns the path now.
         assert!(
-            text.contains("C:\\;C:\\DOS"),
-            "PATH prints the default search path; got:\n{text}"
+            text.contains("PATH=C:\\DOS"),
+            "PATH prints the path AUTOEXEC set; got:\n{text}"
+        );
+        assert!(
+            !text.contains("C:\\;C:\\DOS"),
+            "the old boot-env default path is gone; AUTOEXEC owns PATH; got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn toka_path_assignment_with_empty_value_clears_the_path() {
+        // Real COMMAND.COM: "PATH=" with no value clears the search path, and a
+        // bare PATH then prints "No Path". AUTOEXEC sets PATH=C:\DOS at boot, so
+        // this proves a user can clear it the faithful way.
+        let dir = tempfile::tempdir().unwrap();
+        let files = izarravm_firmware::toka_dos_system_files();
+        izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format)
+            .unwrap();
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .unwrap();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        machine.set_toka_c_root(dir.path().to_path_buf());
+        machine.run_until_halt_or_cycles(22_000_000).unwrap();
+
+        fn key_codes(ch: char) -> Vec<u8> {
+            let make: u8 = match ch {
+                'p' => 0x19,
+                'a' => 0x1e,
+                't' => 0x14,
+                'h' => 0x23,
+                '=' => 0x0d,
+                '\r' => 0x1c,
+                _ => return Vec::new(),
+            };
+            vec![make, make | 0x80]
+        }
+        let type_str = |machine: &mut Machine, text: &str| {
+            for ch in text.chars() {
+                for code in key_codes(ch) {
+                    machine.inject_key_scancodes(&[code]);
+                }
+                machine.run_until_halt_or_cycles(400_000).unwrap();
+            }
+        };
+
+        type_str(&mut machine, "path=\r"); // clear it
+        type_str(&mut machine, "path\r"); // then ask
+
+        let text = machine.screen_text().as_text();
+        assert!(
+            text.contains("No Path"),
+            "PATH= clears the path, so a later PATH prints No Path; got:\n{text}"
         );
     }
 
