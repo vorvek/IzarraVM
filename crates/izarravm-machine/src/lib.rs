@@ -4204,7 +4204,11 @@ impl Machine {
         // render_frame edges is forwarded to the PIC here, so playback timing and
         // IRQ5 no longer depend on the host frontend pulling audio. The host path
         // (render_dsp_audio) only drains what the clock already produced.
-        let rate = self.dsp.rate_hz();
+        // The mixer's SB Pro stereo bit (0x0E bit1) selects 8-bit byte
+        // interleaving, which halves the per-channel frame rate; sample it before
+        // computing the rate the DSP frames at.
+        self.dsp.set_sbpro_stereo(self.mixer.sbpro_stereo());
+        let rate = self.dsp.output_frame_rate();
         // The mixer selects the IRQ line and DMA channels (registers 0x80/0x81);
         // read them before the borrow-splitting loop below so the loop's
         // `let Machine { dsp, dma, memory, .. } = self;` shape is untouched.
@@ -4417,7 +4421,7 @@ impl Machine {
     /// Rebuild the DSP resampler when the programmed sample rate changes, so it
     /// always runs rate_hz -> 44100.
     fn sync_dsp_resampler(&mut self) {
-        let rate = self.dsp.rate_hz().max(1);
+        let rate = self.dsp.output_frame_rate().max(1);
         if rate != self.dsp_rate_hz {
             self.dsp_resampler = Resampler::new(rate, DAC_HZ);
             self.dsp_rate_hz = rate;
@@ -4436,7 +4440,7 @@ impl Machine {
 
         self.sync_dsp_resampler();
         // DSP native samples spanning the same wall-clock window as the OPL.
-        let dsp_native_count = (native_samples as f64 * self.dsp.rate_hz() as f64
+        let dsp_native_count = (native_samples as f64 * self.dsp.output_frame_rate() as f64
             / OPL_NATIVE_HZ as f64)
             .round() as usize;
         // The DSP already produces stereo frames; widen to i32 and resample.
@@ -4580,6 +4584,15 @@ impl Machine {
             None
         };
         let dsp_wake = if self.pic.irq_unmasked(self.mixer.selected_irq()) {
+            // clocks_until_next_irq reasons in block-counter units (bytes for
+            // 8-bit, words for 16-bit), so it must be fed the rate at which that
+            // counter drains -- the raw byte/word rate -- not the per-channel
+            // output frame rate. In SB Pro 8-bit stereo the counter ticks two
+            // bytes per frame at the full byte rate (rate_hz), so passing
+            // output_frame_rate() (= rate_hz/2) would over-estimate the wake by
+            // 2x. rate_hz() is exact for every 8-bit path and keeps the
+            // documented conservative estimate for 16-bit stereo (counter in
+            // words, drained at 2x the per-channel frame rate).
             self.dsp
                 .clocks_until_next_irq(self.dsp.rate_hz(), self.active_mode.clock_hz())
         } else {
@@ -8440,6 +8453,63 @@ mod tests {
         );
         // Single mode masks channel 1 at terminal count.
         assert_eq!(machine.dma_read_byte(1), None);
+    }
+
+    #[test]
+    fn sb_pro_8bit_stereo_deinterleaves_two_bytes_per_frame_at_the_halved_rate() {
+        let mut machine = test_machine();
+        // A 16-byte unsigned interleaved L/R pattern in conventional memory:
+        // bytes 0,16,32,... so each frame's left byte differs from its right.
+        let bytes: Vec<u8> = (0..16).map(|i| (i * 16) as u8).collect();
+        for (i, &b) in bytes.iter().enumerate() {
+            machine.write_physical_u8(0x1_0000 + i as u32, b);
+        }
+        with_bus(&mut machine, |bus| {
+            // DMA ch1: address 0x0000, page 0x01, count 15, single read.
+            bus.write_io(0x0B, BusWidth::Byte, 0x49).unwrap(); // mode ch1
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x0F).unwrap();
+            bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x83, BusWidth::Byte, 0x01).unwrap(); // page -> 0x01_0000
+            bus.write_io(0x0A, BusWidth::Byte, 0x01).unwrap(); // unmask ch1
+            // Mixer register 0x0E bit1: SB Pro stereo.
+            bus.write_io(0x224, BusWidth::Byte, 0x0E).unwrap();
+            bus.write_io(0x225, BusWidth::Byte, 0x02).unwrap();
+            // Voice volume to unity so the decoded L/R samples survive the mixer.
+            bus.write_io(0x224, BusWidth::Byte, 0x32).unwrap();
+            bus.write_io(0x225, BusWidth::Byte, 0x1F).unwrap();
+            bus.write_io(0x224, BusWidth::Byte, 0x33).unwrap();
+            bus.write_io(0x225, BusWidth::Byte, 0x1F).unwrap();
+            // DSP: set the interleaved byte rate via the 0x40 TIME CONSTANT
+            // (tc 0xD3 -> 1_000_000/45 = 22_222 byte/s; SB Pro stereo halves it
+            // to the per-channel frame rate), block 16, single 8-bit DMA output.
+            for &b in &[0x40u8, 0xD3, 0x48, 0x0F, 0x00, 0x14] {
+                bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
+            }
+        });
+        // Advance well past the 16-byte block (8 stereo frames at 2 bytes/frame).
+        machine.advance_devices_clocks(200_000);
+        // Drain the raw producer ring: each frame must carry DISTINCT L/R pulled
+        // from two interleaved DMA bytes (left = even byte, right = odd byte).
+        let raw = machine.render_dsp_audio(8);
+        assert_eq!(raw.len(), 8, "8 stereo frames from a 16-byte block");
+        // Frame 0: left byte 0 (= -32768), right byte 16 (= -28672); distinct.
+        assert_ne!(raw[0].0, raw[0].1, "frame 0 de-interleaves distinct L/R");
+        assert!(
+            raw.iter().any(|&(l, r)| l != r),
+            "stereo de-interleave yields a per-channel L != R through the DMA path"
+        );
+        // Single mode masks channel 1 at terminal count.
+        assert_eq!(machine.dma_read_byte(1), None);
+        // And the resampler runs at the HALVED per-channel rate: byte rate 22_222
+        // (1_000_000/45) -> 11_111 Hz.
+        let out = machine.render_audio(OPL_NATIVE_HZ as usize / 50);
+        assert!(!out.is_empty(), "SB Pro stereo produces output");
+        assert_eq!(
+            machine.dsp_rate_hz, 11_111,
+            "DSP resampler configured at the halved per-channel rate"
+        );
     }
 
     #[test]
