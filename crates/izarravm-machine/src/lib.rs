@@ -3,6 +3,7 @@ pub use fat32::{
     FAT_ATTR_DIRECTORY, FAT32_EOC, Fat32Geometry, Fat32Table, fat32_boot_sector, fat32_dir_entry,
     fat32_dot_entries, fat32_fsinfo_sector, fat32_geometry, fat32_is_eoc,
 };
+pub use fat32_volume::{Fat32Volume, build_fat32};
 use izarravm_audio::{OplChip, Resampler, SbDsp, SbMixer};
 use izarravm_bus::{BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CpuBus, Memory};
 use izarravm_core::{GswMode, HardwareProfile, SoundBlasterConfig, VideoCard};
@@ -23,6 +24,7 @@ mod cdimage;
 mod dma;
 mod fat12;
 mod fat32;
+mod fat32_volume;
 mod fat_name;
 mod fdc;
 mod floppy;
