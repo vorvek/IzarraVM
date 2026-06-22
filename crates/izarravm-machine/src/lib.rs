@@ -2268,9 +2268,11 @@ impl Machine {
                 self.set_bx(xms::DRIVER_REVISION);
                 self.set_dx(u16::from(self.xms.hma_exists()));
             }
-            // 01h request HMA, 02h release HMA.
+            // 01h request HMA, 02h release HMA. DX carries the space the caller
+            // needs (0xFFFF means the whole HMA); request_hma gates it on /HMAMIN.
             0x01 => {
-                let result = self.xms.request_hma();
+                let space_needed = self.cpu.registers.edx() as u16;
+                let result = self.xms.request_hma(space_needed);
                 self.xms_result(result);
             }
             0x02 => {
@@ -4101,6 +4103,14 @@ impl Machine {
     // to capture multiple frames in one run.
     pub fn set_test_snapshot_path(&mut self, path: Option<std::path::PathBuf>) {
         self.test_snapshot_path = path;
+    }
+
+    /// Set the HMA minimum-request threshold in KB, the `/HMAMIN=` HIMEM
+    /// parameter. XMS function 01h then refuses a request below this size so the
+    /// HMA stays free for a larger claimant (such as DOS=HIGH). The config wiring
+    /// that parses the CONFIG.SYS HIMEM line will drive this.
+    pub fn set_hma_min_kb(&mut self, kb: u16) {
+        self.xms.set_hma_min_kb(kb);
     }
 
     /// Execute a unit-tester command deferred from a 0xE6 write. Returns the exit
@@ -6466,6 +6476,58 @@ mod tests {
             0xBEEF,
             "the word stayed in the HMA"
         );
+    }
+
+    #[test]
+    fn hma_is_claimable_and_a20_gates_its_visibility() {
+        let mut m = int15_machine(16);
+        // Claim the HMA through XMS function 01h (DX=0xFFFF: the whole HMA).
+        m.cpu.registers.set_eax(0x0100);
+        m.cpu.registers.set_edx(0xFFFF);
+        m.handle_xms();
+        assert_eq!(
+            m.cpu.registers.eax() as u16,
+            0x0001,
+            "AH=01h claim succeeds"
+        );
+
+        // With A20 on (default), the HMA is real RAM: write FFFF:0010 (0x100000)
+        // and read it back.
+        {
+            let mut bus = m.make_bus();
+            bus.write_memory(0x10_0000, BusWidth::Word, 0x1234, BusAccessKind::DataWrite)
+                .unwrap();
+            assert_eq!(
+                bus.read_memory(0x10_0000, BusWidth::Word, BusAccessKind::DataRead)
+                    .unwrap(),
+                0x1234,
+                "the HMA holds the write with A20 open"
+            );
+        }
+
+        // A second claim is refused while the HMA is held.
+        m.cpu.registers.set_eax(0x0100);
+        m.cpu.registers.set_edx(0xFFFF);
+        m.handle_xms();
+        assert_eq!(m.cpu.registers.eax() as u16, 0x0000, "second claim fails");
+        assert_eq!(
+            m.cpu.registers.ebx() as u8,
+            xms::err::HMA_IN_USE,
+            "BL = HMA already in use"
+        );
+
+        // Closing A20 hides the HMA: 0x100000 folds down to low memory (0x0,
+        // still zero), so the previously written value is no longer visible.
+        m.keyboard.set_a20(false);
+        {
+            let mut bus = m.make_bus();
+            assert_eq!(
+                bus.read_memory(0x10_0000, BusWidth::Word, BusAccessKind::DataRead)
+                    .unwrap(),
+                0x0000,
+                "with A20 closed the HMA folds away and 0x100000 reads low memory"
+            );
+        }
     }
 
     #[test]
