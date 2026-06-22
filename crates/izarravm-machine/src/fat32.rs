@@ -162,6 +162,8 @@ pub fn fat32_fsinfo_sector(free_count: u32, next_free: u32) -> [u8; 512] {
 pub const FAT32_EOC: u32 = 0x0fff_ffff;
 
 /// Only the low 28 bits of a FAT32 entry are significant; the high 4 are reserved.
+/// This equals FAT32_EOC numerically by coincidence; the two mean different things
+/// (a significant-bits mask vs. a writable end-of-chain value) and stay separate.
 const FAT32_ENTRY_MASK: u32 = 0x0fff_ffff;
 
 /// True if a FAT32 entry (low 28 bits) marks the last cluster of a chain.
@@ -190,13 +192,15 @@ impl Fat32Table {
 
     /// Set cluster `cluster`'s entry to a next-cluster link or FAT32_EOC. Only the
     /// low 28 bits are stored; the reserved high 4 bits are preserved (fatgen103
-    /// requires implementations to keep them across a modify).
+    /// requires implementations to keep them across a modify). Panics if `cluster`
+    /// is out of range (>= count_of_clusters + 2).
     pub fn set(&mut self, cluster: u32, value: u32) {
         let e = &mut self.entries[cluster as usize];
         *e = (*e & !FAT32_ENTRY_MASK) | (value & FAT32_ENTRY_MASK);
     }
 
-    /// The low 28 bits of cluster `cluster`'s entry.
+    /// The low 28 bits of cluster `cluster`'s entry. Panics if `cluster` is out of
+    /// range (>= count_of_clusters + 2).
     pub fn get(&self, cluster: u32) -> u32 {
         self.entries[cluster as usize] & FAT32_ENTRY_MASK
     }
@@ -440,6 +444,28 @@ mod tests {
         assert!(
             fat32_is_eoc(0xffff_ffff),
             "the reserved high bits are ignored"
+        );
+    }
+
+    #[test]
+    fn last_cluster_entry_survives_serialization() {
+        // The highest data cluster's entry must land inside the FAT region (the
+        // size invariant) and round-trip through to_bytes without the padding
+        // guard clipping it.
+        let geo = fat32_geometry(64 * 1024 * 1024).unwrap();
+        let last = geo.count_of_clusters + 1;
+        let mut fat = Fat32Table::new(&geo);
+        fat.set(last, FAT32_EOC);
+        let bytes = fat.to_bytes(&geo);
+        let off = last as usize * 4;
+        assert!(
+            off + 4 <= bytes.len(),
+            "the last entry is inside the FAT region"
+        );
+        assert_eq!(
+            u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]),
+            FAT32_EOC,
+            "the last cluster round-trips through to_bytes"
         );
     }
 }
