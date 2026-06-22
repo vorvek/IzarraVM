@@ -279,6 +279,15 @@ impl FlatEmbAllocator {
     }
 }
 
+/// The backing region reserved for EMS at the top of extended RAM: its physical
+/// base and how many 16 KiB pages it holds. The XMS/EMS partition returns this so
+/// the machine builds the EMS manager over the same physical pool XMS draws from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmsRegion {
+    pub base: u32,
+    pub total_pages: u16,
+}
+
 /// Driver-level XMS state: the EMB allocator behind the [`EmbBackend`] seam, the
 /// HMA-allocation flag, and the local-A20 nesting counter.
 #[derive(Debug)]
@@ -297,22 +306,37 @@ pub struct XmsState {
 }
 
 impl XmsState {
-    /// Build the state for a machine with `memory_mib` of RAM. The allocator
-    /// manages everything above the HMA: extended memory is the RAM over 1 MB,
-    /// and the top 64 KB of that first megabyte-plus is reserved for the HMA.
+    /// Build the state for a machine with `memory_mib` of RAM, with no EMS
+    /// reservation (XMS owns all of extended memory above the HMA).
     pub fn new(memory_mib: u16) -> Self {
+        Self::new_with_ems(memory_mib, 0).0
+    }
+
+    /// Partition extended RAM between XMS and EMS. EMS takes `ems_want_kb` (clamped
+    /// to whole 16 KiB pages and to what extended memory can spare) at the TOP of
+    /// the pool; XMS gets the rest. EMS is simulated from extended memory the way
+    /// EMM386 does, so the two share one physical pool rather than double-counting.
+    /// Returns the XMS state and, when the EMS share is non-zero, its backing region.
+    pub fn new_with_ems(memory_mib: u16, ems_want_kb: u32) -> (Self, Option<EmsRegion>) {
         let total_kb = u32::from(memory_mib) * 1024;
-        // Extended memory is RAM above 1 MB. Reserve the HMA out of it; the rest
-        // is the EMB pool. A machine with <= 1 MB has no extended memory.
+        // Extended memory is RAM above 1 MB; the top 64 KB of it is the HMA.
         let extended_kb = total_kb.saturating_sub(1024);
-        let pool_kb = extended_kb.saturating_sub(u32::from(HMA_SIZE_KB));
+        let usable_kb = extended_kb.saturating_sub(u32::from(HMA_SIZE_KB));
+        // EMS is carved in whole 16 KiB pages and never takes more than is there.
+        let ems_kb = (ems_want_kb.min(usable_kb) / 16) * 16;
+        let xms_pool_kb = usable_kb - ems_kb;
         let pool_base = EXTENDED_MEMORY_BASE + u32::from(HMA_SIZE_KB) * 1024;
-        Self {
-            backend: Box::new(FlatEmbAllocator::new(pool_base, pool_kb)),
+        let state = Self {
+            backend: Box::new(FlatEmbAllocator::new(pool_base, xms_pool_kb)),
             hma_allocated: false,
             hma_min_bytes: 0,
             local_a20_count: 0,
-        }
+        };
+        let region = (ems_kb > 0).then(|| EmsRegion {
+            base: pool_base + xms_pool_kb * 1024,
+            total_pages: (ems_kb / 16) as u16,
+        });
+        (state, region)
     }
 
     /// Set the `/HMAMIN=` threshold in KB. Function 01h then rejects a request

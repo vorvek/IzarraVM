@@ -24,6 +24,7 @@ mod ata;
 mod atapi;
 mod cdimage;
 mod dma;
+mod ems;
 mod fat12;
 mod fat32;
 mod fat32_volume;
@@ -63,6 +64,12 @@ const VGA_BIOS_SIZE: u32 = 0x8000; // 32 KiB
 /// UMB pool one contiguous chain below it. A guest discovers it via INT 67h AH=41h,
 /// so the exact address only matters for fidelity, not function.
 const EMS_FRAME_DEFAULT_BASE: u32 = 0x0E_0000; // segment 0xE000
+/// The page-frame segment a guest reads back from INT 67h AH=41h.
+const EMS_FRAME_DEFAULT_SEG: u16 = (EMS_FRAME_DEFAULT_BASE >> 4) as u16; // 0xE000
+/// Default expanded-memory pool: 8 MiB, clearing the demanding corpus titles
+/// (Master of Magic's 2700 KiB is the high-water mark) with headroom, and a small
+/// slice of the 24 MiB machine's extended RAM. Carved from the pool XMS shares.
+const EMS_DEFAULT_KIB: u32 = 8 * 1024;
 
 pub const HIGH_ROM_BASE: u32 = 0xffff_0000;
 pub const MARGO_LFB_BASE: u32 = 0xE000_0000;
@@ -395,6 +402,10 @@ pub struct Machine {
     // RAM above 1 MB, the HMA-allocation flag, and the local-A20 nesting count. A
     // guest reaches it via INT 2Fh AX=4310h (an INT 66h entry stub in ROM).
     xms: xms::XmsState,
+    // LIM EMS 4.0 expanded-memory state, present only when the EMM386 mode is RAM.
+    // Its 16 KiB pages are backed by a region of extended RAM partitioned away from
+    // the XMS pool; the bus aliases page-frame accesses onto them.
+    ems: Option<ems::EmsState>,
     // The UMA reservation map: the single authority over the 0xC0000-0xEFFFF
     // upper-memory window. ROM is reserved up front; the remaining hole is handed
     // to the DOS kernel as its upper-memory-block (UMB) arena, and a later slice
@@ -518,6 +529,18 @@ impl Machine {
         let active_mode = profile.cpu;
         let memory_mib = profile.memory_mib;
         let timing = TimingFactors::for_clock(active_mode.clock_hz());
+        // Partition extended RAM between XMS and EMS. EMS is provisioned only in RAM
+        // mode, simulated from a slice of extended memory the XMS pool excludes (so
+        // installed RAM stays honest). The page frame sits at the default segment.
+        let ems_want_kb = if profile.emm386.provides_ems() {
+            EMS_DEFAULT_KIB
+        } else {
+            0
+        };
+        let (xms, ems_region) = xms::XmsState::new_with_ems(memory_mib, ems_want_kb);
+        let ems = ems_region.map(|region| {
+            ems::EmsState::new(EMS_FRAME_DEFAULT_SEG, region.base, region.total_pages)
+        });
         // Lay the XMS driver entry stub into ROM. INT 2Fh AX=4310h hands the guest
         // a far pointer to it; a guest FAR-CALLs there, the INT 66h traps into the
         // host XMS handler, and the RETF returns. Placed at a fixed ROM offset that
@@ -597,7 +620,8 @@ impl Machine {
             mouse: MouseState::default(),
             unittester: unittester::UnitTester::default(),
             test_snapshot_path: None,
-            xms: xms::XmsState::new(memory_mib),
+            xms,
+            ems,
             uma: UmaReservationMap::new(),
         };
         // The Margo LFB aperture is decoded before RAM, so system memory must
@@ -1094,6 +1118,7 @@ impl Machine {
             memory: &mut self.memory,
             video: &mut self.video,
             margo: &mut self.margo,
+            ems: self.ems.as_ref(),
             rom: &self.rom,
             serial: &mut self.serial,
             serial2: &mut self.serial2,
@@ -2253,6 +2278,13 @@ impl Machine {
         self.cpu.registers.set_edx(edx);
     }
 
+    /// Replace AH (bits 8-15 of EAX), leaving AL and the upper half intact. EMS
+    /// functions return their status code here.
+    fn set_ah(&mut self, ah: u8) {
+        let eax = (self.cpu.registers.eax() & !0xFF00) | (u32::from(ah) << 8);
+        self.cpu.registers.set_eax(eax);
+    }
+
     /// Service the INT 33h mouse driver (Microsoft API). The subset DOS games
     /// rely on: reset/detect, show/hide cursor, get position+buttons, set
     /// position, define horizontal/vertical ranges, and read the mickey motion
@@ -2580,6 +2612,108 @@ impl Machine {
             // Unimplemented function: AX=0, BL=80h (not implemented).
             _ => self.xms_failure(xms::err::NOT_IMPLEMENTED),
         }
+    }
+
+    /// Service INT 67h, the LIM EMS 4.0 expanded-memory manager. Reached only when
+    /// EMS is provisioned (the EMM386 RAM mode), so `self.ems` is always Some here.
+    /// AH selects the function; the status returns in AH (0 = success) with results
+    /// in BX/DX/AL. The OS-only and not-yet-modeled functions return 84h (undefined
+    /// function), the same as a real manager that lacks them.
+    fn handle_int67(&mut self) {
+        let ah = (self.cpu.registers.eax() as u16 >> 8) as u8;
+        let bx = self.cpu.registers.ebx() as u16;
+        let dx = self.cpu.registers.edx() as u16;
+        let al = self.cpu.registers.eax() as u8;
+        match ah {
+            // 40h GET MANAGER STATUS: present, so success.
+            0x40 => self.set_ah(ems::status::OK),
+            // 41h GET PAGE FRAME SEGMENT.
+            0x41 => {
+                let seg = self.ems().frame_segment();
+                self.set_bx(seg);
+                self.set_ah(ems::status::OK);
+            }
+            // 42h GET NUMBER OF PAGES: BX = unallocated, DX = total.
+            0x42 => {
+                let (free, total) = self.ems().page_counts();
+                self.set_bx(free);
+                self.set_dx(total);
+                self.set_ah(ems::status::OK);
+            }
+            // 43h ALLOCATE PAGES: BX = pages in, DX = handle out.
+            0x43 => match self.ems_mut().allocate(bx) {
+                Ok(handle) => {
+                    self.set_dx(handle);
+                    self.set_ah(ems::status::OK);
+                }
+                Err(code) => self.set_ah(code),
+            },
+            // 44h MAP MEMORY: AL = physical page 0-3, BX = logical page, DX = handle.
+            0x44 => {
+                let result = self.ems_mut().map(al, bx, dx);
+                self.set_ah(result.err().unwrap_or(ems::status::OK));
+            }
+            // 45h RELEASE HANDLE AND MEMORY: DX = handle.
+            0x45 => {
+                let result = self.ems_mut().release(dx);
+                self.set_ah(result.err().unwrap_or(ems::status::OK));
+            }
+            // 46h GET VERSION: AL = BCD version, AH = 0.
+            0x46 => {
+                let version = self.ems().version();
+                self.set_ax(u16::from(version));
+            }
+            // 47h SAVE / 48h RESTORE MAPPING CONTEXT: DX = handle.
+            0x47 => {
+                let result = self.ems_mut().save_context(dx);
+                self.set_ah(result.err().unwrap_or(ems::status::OK));
+            }
+            0x48 => {
+                let result = self.ems_mut().restore_context(dx);
+                self.set_ah(result.err().unwrap_or(ems::status::OK));
+            }
+            // 4Bh GET NUMBER OF EMM HANDLES: BX = count.
+            0x4b => {
+                let count = self.ems().handle_count();
+                self.set_bx(count);
+                self.set_ah(ems::status::OK);
+            }
+            // 4Ch GET PAGES OWNED BY HANDLE: DX = handle, BX = pages.
+            0x4c => match self.ems().pages_for_handle(dx) {
+                Ok(pages) => {
+                    self.set_bx(pages);
+                    self.set_ah(ems::status::OK);
+                }
+                Err(code) => self.set_ah(code),
+            },
+            // 4Dh GET PAGES FOR ALL HANDLES: ES:DI = array of {WORD handle, WORD
+            // pages}, BX = count.
+            0x4d => {
+                let handles = self.ems().all_handles();
+                let es = self.cpu.registers.segment(SegmentIndex::Es).base;
+                let di = self.cpu.registers.edi() as u16;
+                let mut addr = es as usize + usize::from(di);
+                for (handle, pages) in &handles {
+                    let _ = self.memory.write_u16(addr, *handle);
+                    let _ = self.memory.write_u16(addr + 2, *pages);
+                    addr += 4;
+                }
+                self.set_bx(handles.len() as u16);
+                self.set_ah(ems::status::OK);
+            }
+            // OS-only, partial-page-map, alter-map, move/exchange, and the rest of
+            // the 4.0 set are not modeled yet: undefined function.
+            _ => self.set_ah(0x84),
+        }
+    }
+
+    /// The EMS manager, asserting it is present (INT 67h is intercepted only then).
+    fn ems(&self) -> &ems::EmsState {
+        self.ems.as_ref().expect("INT 67h serviced without EMS")
+    }
+
+    fn ems_mut(&mut self) -> &mut ems::EmsState {
+        self.ems.as_mut().expect("INT 67h serviced without EMS")
     }
 
     /// Report XMS success: AX = 1, BL = 0.
@@ -5003,6 +5137,7 @@ impl Machine {
                     memory,
                     video,
                     margo,
+                    ems,
                     rom,
                     serial,
                     serial2,
@@ -5039,6 +5174,7 @@ impl Machine {
                     memory,
                     video,
                     margo,
+                    ems: ems.as_ref(),
                     rom,
                     serial,
                     serial2,
@@ -5164,6 +5300,7 @@ impl Machine {
                                 self.handle_int2f();
                             }
                             0x66 => self.handle_xms(),
+                            0x67 => self.handle_int67(),
                             0x20 | 0x21 => match self.handle_dos_int(vector) {
                                 Ok(Some(code)) => {
                                     if let Some(frame) = self.program_frames.pop() {
@@ -5220,6 +5357,9 @@ struct MachineBus<'a> {
     memory: &'a mut Memory,
     video: &'a mut Vga,
     margo: &'a mut Margo,
+    // The EMS manager, when expanded memory is provisioned. The bus reads its frame
+    // map to alias page-frame accesses onto the mapped backing pages in RAM.
+    ems: Option<&'a ems::EmsState>,
     rom: &'a [u8],
     serial: &'a mut uart::Uart16450,
     serial2: &'a mut uart::Uart16450,
@@ -5605,8 +5745,11 @@ impl CpuBus for MachineBus<'_> {
         // BIOS hardware services (0x10-0x1A) and the mouse stay intercepted.
         let dos_or_iemm = matches!(
             vector,
-            0x20 | 0x21 | 0x25 | 0x26 | 0x28 | 0x29 | 0x2F | 0x66
+            0x20 | 0x21 | 0x25 | 0x26 | 0x28 | 0x29 | 0x2F | 0x66 | 0x67
         );
+        // INT 67h is intercepted only when EMS is actually provisioned (RAM mode);
+        // in NOEMS / unloaded the vector runs the ROM IRET so a guest probe finds no
+        // manager, the way HIMEM-only or EMM386 NOEMS leaves no working EMS.
         let intercepted = matches!(
             vector,
             0x10 | 0x11
@@ -5627,7 +5770,7 @@ impl CpuBus for MachineBus<'_> {
                 | 0x2F
                 | 0x33
                 | 0x66
-        );
+        ) || (vector == 0x67 && self.ems.is_some());
         if intercepted && !(self.booter_inert && dos_or_iemm) {
             *self.pending_soft_int = Some(vector);
         }
@@ -5871,7 +6014,7 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     // XMS driver entry trap, host-intercepted the same way.
     for vector in [
         0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x25, 0x26, 0x28, 0x29,
-        0x2F, 0x33, 0x66,
+        0x2F, 0x33, 0x66, 0x67,
     ] {
         let address = vector * 4;
         memory.write_u16(address, 0)?;
@@ -6132,6 +6275,22 @@ impl MachineBus<'_> {
                 .collect());
         }
 
+        // EMS page-frame aliasing: when expanded memory is provisioned and the
+        // access touches the 64 KiB frame, route each byte to its mapped backing
+        // page, or to flat RAM where the slot is unmapped.
+        if let Some(ems) = self.ems {
+            let last = address + (width as u32).saturating_sub(1);
+            if ems.in_frame(address) || ems.in_frame(last) {
+                return (0..width)
+                    .map(|index| {
+                        let addr = address + index as u32;
+                        let backing = ems.resolve(addr).unwrap_or(addr) as usize;
+                        self.memory.read_u8(backing)
+                    })
+                    .collect();
+            }
+        }
+
         let end = address as usize + width;
         if end <= self.memory.len() {
             return (0..width)
@@ -6198,6 +6357,14 @@ impl MachineBus<'_> {
         if let Some(offset) = margo_mmio_offset(address, 1) {
             self.margo.write_mmio_u8(offset, value);
             return Ok(());
+        }
+
+        // EMS page-frame aliasing: a write to a mapped frame slot lands on its
+        // backing page; an unmapped slot falls through to flat RAM below.
+        if let Some(ems) = self.ems {
+            if let Some(backing) = ems.resolve(address) {
+                return self.memory.write_u8(backing as usize, value);
+            }
         }
 
         if (address as usize) < self.memory.len() {
@@ -7598,7 +7765,8 @@ mod tests {
         let kinds =
             |m: &Machine| -> Vec<UmaUse> { m.uma.reservations().iter().map(|r| r.kind).collect() };
 
-        // RAM: VGA BIOS ROM + UMB pool + the EMS frame at the default top-of-window.
+        // RAM: VGA BIOS ROM + UMB pool + the EMS frame at the default top-of-window,
+        // and an EMS manager is provisioned.
         let ram = build(Emm386Mode::Ram);
         assert!(kinds(&ram).contains(&UmaUse::Umb), "RAM provides UMBs");
         assert!(
@@ -7608,21 +7776,60 @@ mod tests {
                 .any(|r| r.kind == UmaUse::EmsFrame && r.base == EMS_FRAME_DEFAULT_BASE),
             "RAM reserves the EMS frame at 0xE0000"
         );
+        assert!(ram.ems.is_some(), "RAM provisions an EMS manager");
 
-        // NOEMS: a UMB pool spanning the whole hole, no EMS frame.
+        // NOEMS: a UMB pool spanning the whole hole, no EMS frame, no manager.
         let noems = build(Emm386Mode::NoEms);
         assert!(kinds(&noems).contains(&UmaUse::Umb), "NOEMS provides UMBs");
         assert!(
             !kinds(&noems).contains(&UmaUse::EmsFrame),
             "NOEMS reserves no EMS frame"
         );
+        assert!(noems.ems.is_none(), "NOEMS provisions no EMS");
 
-        // Unloaded: only the VGA BIOS ROM; no UMB arena, no EMS frame.
+        // Unloaded: only the VGA BIOS ROM; no UMB arena, no EMS frame, no manager.
         let off = build(Emm386Mode::Unloaded);
         assert_eq!(
             kinds(&off),
             vec![UmaUse::Rom],
             "HIMEM-only provides neither UMBs nor EMS"
+        );
+        assert!(off.ems.is_none(), "HIMEM-only provisions no EMS");
+    }
+
+    #[test]
+    fn ram_mode_aliases_a_mapped_ems_page_through_the_frame() {
+        const PROG: [u8; 2] = [0xCD, 0x20]; // int 20h
+        let mut p = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        p.emm386 = Emm386Mode::Ram;
+        let mut machine = Machine::new_dos_program(p, &PROG).unwrap();
+        // Allocate two pages and map logical page 0 into physical slot 0 (the frame
+        // base, 0xE0000).
+        let handle = {
+            let ems = machine.ems.as_mut().unwrap();
+            let h = ems.allocate(2).unwrap();
+            ems.map(0, 0, h).unwrap();
+            h
+        };
+        // A write through the frame lands on the backing page, not on the flat RAM
+        // byte the frame address otherwise shadows: read it back through the frame.
+        machine.write_physical_u8(0x0E_0000, 0xAB);
+        assert_eq!(
+            machine.read_physical_u8(0x0E_0000),
+            0xAB,
+            "the frame aliases the mapped backing page"
+        );
+        // Unmapping the slot makes the frame read its own (untouched) flat RAM byte.
+        machine
+            .ems
+            .as_mut()
+            .unwrap()
+            .map(0, 0xFFFF, handle)
+            .unwrap();
+        assert_eq!(
+            machine.read_physical_u8(0x0E_0000),
+            0x00,
+            "an unmapped slot falls through to flat RAM"
         );
     }
 
@@ -8561,6 +8768,16 @@ mod tests {
         );
         m.pending_soft_int = None;
 
+        // INT 67h (EMS) is intercepted by default too, since RAM mode provisions a
+        // manager.
+        m.make_bus().interrupt_acknowledge(0x67, 0).unwrap();
+        assert_eq!(
+            m.pending_soft_int,
+            Some(0x67),
+            "INT 67h (EMS) is intercepted in RAM mode"
+        );
+        m.pending_soft_int = None;
+
         // Booter-inert mode stands the DOS/IEMM vectors down so the guest's own
         // handlers run through the IVT.
         m.set_booter_inert(true);
@@ -8577,6 +8794,8 @@ mod tests {
         );
         m.make_bus().interrupt_acknowledge(0x66, 0).unwrap();
         assert_eq!(m.pending_soft_int, None, "INT 66h (XMS) stands down too");
+        m.make_bus().interrupt_acknowledge(0x67, 0).unwrap();
+        assert_eq!(m.pending_soft_int, None, "INT 67h (EMS) stands down too");
 
         // The BIOS hardware services stay intercepted even in booter mode.
         m.make_bus().interrupt_acknowledge(0x10, 0).unwrap();
@@ -10242,6 +10461,7 @@ mod tests {
             memory: &mut machine.memory,
             video: &mut machine.video,
             margo: &mut machine.margo,
+            ems: machine.ems.as_ref(),
             rom: &machine.rom,
             serial: &mut machine.serial,
             serial2: &mut machine.serial2,
