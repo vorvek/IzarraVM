@@ -3942,11 +3942,17 @@ mod tests {
 
         // A user-edited config survives a reinstall (generated only when absent).
         std::fs::write(root.join("AUTOEXEC.BAT"), b"REM mine").unwrap();
+        std::fs::write(root.join("CONFIG.SYS"), b"REM cfg").unwrap();
         toka_dos_install(root, &files, InstallMode::Repair).unwrap();
         assert_eq!(
             std::fs::read_to_string(root.join("AUTOEXEC.BAT")).unwrap(),
             "REM mine",
             "Repair keeps the user's AUTOEXEC.BAT"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("CONFIG.SYS")).unwrap(),
+            "REM cfg",
+            "Repair keeps the user's CONFIG.SYS"
         );
     }
 
