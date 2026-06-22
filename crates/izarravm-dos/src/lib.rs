@@ -1099,6 +1099,13 @@ impl DosKernel {
         self.ems_present = present;
     }
 
+    /// Whether the EMS manager (the EMMXXXX0 device) is present. The machine sets
+    /// this from the built `ems` Option at DOS init, so it is true under both RAM
+    /// and NOEMS (the frameless manager) and false only for HIMEM-only.
+    pub fn ems_present(&self) -> bool {
+        self.ems_present
+    }
+
     /// The lowest free file handle (>= 5), skipping both host files and the open
     /// EMS-device handles so the two never collide.
     fn alloc_handle(&self) -> u16 {

@@ -26,6 +26,11 @@ pub const EMS_VERSION_BCD: u8 = 0x40;
 /// INT 67h status codes returned in AH; 0x00 is success.
 pub mod status {
     pub const OK: u8 = 0x00;
+    /// EMM software malfunction (LIM 0x80). EMM386 NOEMS returns it from the
+    /// page-frame query (41h) to signal a configured no-page-frame state: the
+    /// manager is installed and INT 67h answers, but there is no frame. The
+    /// mappable-address count (58h) is zero in that state rather than an error.
+    pub const SOFTWARE_MALFUNCTION: u8 = 0x80;
     pub const INVALID_HANDLE: u8 = 0x83;
     pub const NO_MORE_HANDLES: u8 = 0x85;
     pub const TOTAL_EXCEEDED: u8 = 0x87;
@@ -65,6 +70,12 @@ pub struct EmsState {
     frame_seg: u16,
     region_base: u32,
     total_pages: u16,
+    /// Whether a page frame is provisioned. False only for the frameless manager
+    /// an EMM386 NOEMS install presents: the device and INT 67h answer (status
+    /// present, version reported), but there is no frame and no backing pages.
+    /// Guards `frame_segment`/`in_frame`/`resolve` so a frame_seg of 0 never
+    /// claims the low megabyte as a frame window.
+    has_frame: bool,
     /// Per backing-page free flag; the index is the backing-page number.
     free: Vec<bool>,
     /// Handle id -> handle (None for a free slot). Index 0 is the reserved OS
@@ -87,6 +98,7 @@ impl EmsState {
             frame_seg,
             region_base,
             total_pages,
+            has_frame: true,
             free: vec![true; usize::from(total_pages)],
             handles: vec![None], // index 0 reserved for the OS handle
             frame_map: [None; FRAME_SLOTS],
@@ -94,7 +106,39 @@ impl EmsState {
         }
     }
 
-    /// The page-frame segment (function 41h).
+    /// Build the frameless manager an EMM386 NOEMS install presents: the EMMXXXX0
+    /// device is present and INT 67h answers (status OK, version 4.0), but there
+    /// is no page frame and zero backing pages, so allocate (43h) fails with
+    /// TOTAL_EXCEEDED and the page-frame query (41h) returns SOFTWARE_MALFUNCTION.
+    /// The freed extended RAM stays with XMS.
+    pub fn frameless() -> Self {
+        Self {
+            frame_seg: 0,
+            region_base: 0,
+            total_pages: 0,
+            has_frame: false,
+            free: Vec::new(),
+            handles: vec![None],
+            frame_map: [None; FRAME_SLOTS],
+            saved: HashMap::new(),
+        }
+    }
+
+    /// Whether a page frame is provisioned. The 41h and 58h handlers branch on
+    /// this; the bus EMS alias uses it through `in_frame`/`resolve`.
+    pub fn has_frame(&self) -> bool {
+        self.has_frame
+    }
+
+    /// The number of mappable physical page-frame slots reported by 58h: four
+    /// when a frame exists, zero for the frameless (NOEMS) manager.
+    pub fn mappable_count(&self) -> u8 {
+        if self.has_frame { FRAME_SLOTS as u8 } else { 0 }
+    }
+
+    /// The page-frame segment (function 41h). Only meaningful when `has_frame`;
+    /// the dispatcher returns SOFTWARE_MALFUNCTION instead for the frameless
+    /// manager, so this value is used only on the RAM path.
     pub fn frame_segment(&self) -> u16 {
         self.frame_seg
     }
@@ -334,8 +378,12 @@ impl EmsState {
     }
 
     /// Whether `addr` lies in the 64 KiB page-frame window. The bus uses this to
-    /// keep the non-EMS hot path off the per-byte resolve.
+    /// keep the non-EMS hot path off the per-byte resolve. The frameless manager
+    /// (NOEMS) has no frame, so this is always false even though `frame_seg` is 0.
     pub fn in_frame(&self, addr: u32) -> bool {
+        if !self.has_frame {
+            return false;
+        }
         let base = u32::from(self.frame_seg) << 4;
         (base..base + (FRAME_SLOTS as u32) * EMS_PAGE_SIZE).contains(&addr)
     }
@@ -343,8 +391,12 @@ impl EmsState {
     /// Resolve a physical address inside the page frame to the backing RAM address
     /// of the mapped page, or None when the address is outside the frame or its
     /// slot is unmapped (the bus then leaves the access on flat RAM). This is the
-    /// read path the MachineBus EMS alias uses.
+    /// read path the MachineBus EMS alias uses. Always None for the frameless
+    /// manager, so it never aliases the low megabyte that `frame_seg` 0 would span.
     pub fn resolve(&self, addr: u32) -> Option<u32> {
+        if !self.has_frame {
+            return None;
+        }
         let frame_base = u32::from(self.frame_seg) << 4;
         let frame_end = frame_base + (FRAME_SLOTS as u32) * EMS_PAGE_SIZE;
         if addr < frame_base || addr >= frame_end {
@@ -546,5 +598,44 @@ mod tests {
         }
         assert_eq!(ems.handle_count(), EmsState::MAX_HANDLES as u16);
         assert_eq!(ems.allocate(1), Err(status::NO_MORE_HANDLES));
+    }
+
+    #[test]
+    fn frameless_manager_reports_present_with_no_frame_or_pages() {
+        let ems = EmsState::frameless();
+        assert!(!ems.has_frame(), "NOEMS has no page frame");
+        assert_eq!(ems.mappable_count(), 0, "no mappable slots");
+        assert_eq!(ems.page_counts(), (0, 0), "zero pages free and total");
+        assert_eq!(ems.version(), EMS_VERSION_BCD, "still reports EMS 4.0");
+        assert_eq!(ems.handle_count(), 0, "no app handles");
+    }
+
+    #[test]
+    fn frameless_manager_has_no_frame_alias() {
+        let ems = EmsState::frameless();
+        // frame_seg is 0, but the frameless guard must keep the low megabyte
+        // (0x0-0xFFFF) from being treated as a frame window.
+        assert!(!ems.in_frame(0x0000));
+        assert!(!ems.in_frame(0xFFFF));
+        assert_eq!(ems.resolve(0x0000), None);
+    }
+
+    #[test]
+    fn frameless_manager_rejects_allocation_with_total_exceeded() {
+        let mut ems = EmsState::frameless();
+        // NoEMS: any nonzero request is larger than the zero-page pool, so 87h
+        // (TOTAL_EXCEEDED). A zero-page request is its own 89h error.
+        assert_eq!(ems.allocate(1), Err(status::TOTAL_EXCEEDED));
+        assert_eq!(ems.allocate(0), Err(status::ZERO_PAGES));
+    }
+
+    #[test]
+    fn ram_manager_has_a_frame_and_four_mappable_slots() {
+        let ems = manager();
+        assert!(ems.has_frame());
+        assert_eq!(ems.mappable_count(), FRAME_SLOTS as u8);
+        assert!(ems.in_frame(0xE_0000));
+        assert!(ems.in_frame(0xE_FFFF));
+        assert!(!ems.in_frame(0xF_0000));
     }
 }

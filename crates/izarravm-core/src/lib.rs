@@ -163,7 +163,9 @@ impl FromStr for VideoCard {
 /// needs the manager's address remapping for:
 /// - `Unloaded`: HIMEM only, no EMM386. No UMBs and no EMS (a 386 cannot map the
 ///   upper area without the manager). This is the `DEVICE=HIMEM.SYS` block.
-/// - `NoEms`: EMM386 with NOEMS. UMBs, but no EMS page frame and no INT 67h.
+/// - `NoEms`: EMM386 with NOEMS. UMBs plus a frameless EMS manager: the
+///   EMMXXXX0 device and INT 67h answer (status present, version 4.0), but there
+///   is no page frame and zero backing pages, so allocation fails.
 /// - `Ram`: EMM386 with RAM. UMBs plus the LIM EMS 4.0 page frame and INT 67h.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Emm386Mode {
