@@ -156,6 +156,66 @@ pub fn fat32_fsinfo_sector(free_count: u32, next_free: u32) -> [u8; 512] {
     s
 }
 
+/// FAT32 end-of-chain marker written for the last cluster of a chain. Any entry
+/// whose low 28 bits are >= 0x0FFFFFF8 ends a chain (fatgen103 Section 4); this
+/// is the value we write.
+pub const FAT32_EOC: u32 = 0x0fff_ffff;
+
+/// Only the low 28 bits of a FAT32 entry are significant; the high 4 are reserved.
+const FAT32_ENTRY_MASK: u32 = 0x0fff_ffff;
+
+/// True if a FAT32 entry (low 28 bits) marks the last cluster of a chain.
+pub fn fat32_is_eoc(entry: u32) -> bool {
+    (entry & FAT32_ENTRY_MASK) >= 0x0fff_fff8
+}
+
+/// An in-memory FAT32 file allocation table: one 32-bit entry per cluster,
+/// indexed by cluster number. Clusters 0 and 1 are reserved; a data cluster's
+/// entry is the next cluster in its chain, FAT32_EOC for the last one, or 0 when
+/// free. Only the low 28 bits are significant.
+pub struct Fat32Table {
+    entries: Vec<u32>,
+}
+
+impl Fat32Table {
+    /// A fresh FAT for `geo`, sized to clusters 0..(count_of_clusters + 2). FAT[0]
+    /// holds the media byte (0xF8) with the upper bits set, FAT[1] is EOC, and
+    /// every data cluster starts free (0).
+    pub fn new(geo: &Fat32Geometry) -> Self {
+        let mut entries = vec![0u32; geo.count_of_clusters as usize + 2];
+        entries[0] = 0x0fff_fff8; // BPB_Media 0xF8 in the low 8 bits, rest ones
+        entries[1] = FAT32_EOC;
+        Self { entries }
+    }
+
+    /// Set cluster `cluster`'s entry to a next-cluster link or FAT32_EOC. Only the
+    /// low 28 bits are stored; the reserved high 4 bits are preserved (fatgen103
+    /// requires implementations to keep them across a modify).
+    pub fn set(&mut self, cluster: u32, value: u32) {
+        let e = &mut self.entries[cluster as usize];
+        *e = (*e & !FAT32_ENTRY_MASK) | (value & FAT32_ENTRY_MASK);
+    }
+
+    /// The low 28 bits of cluster `cluster`'s entry.
+    pub fn get(&self, cluster: u32) -> u32 {
+        self.entries[cluster as usize] & FAT32_ENTRY_MASK
+    }
+
+    /// Serialize one FAT to `geo.fat_size_sectors * 512` bytes: little-endian
+    /// 32-bit entries, zero-padded past the last entry. The volume holds
+    /// `geo.num_fats` identical copies.
+    pub fn to_bytes(&self, geo: &Fat32Geometry) -> Vec<u8> {
+        let mut bytes = vec![0u8; geo.fat_size_sectors as usize * 512];
+        for (i, &e) in self.entries.iter().enumerate() {
+            // The FAT region is sized to hold every entry; guard regardless.
+            if let Some(slot) = bytes.get_mut(i * 4..i * 4 + 4) {
+                slot.copy_from_slice(&e.to_le_bytes());
+            }
+        }
+        bytes
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,5 +379,67 @@ mod tests {
         let fatsz = le32(&s, 36);
         let data = total - (u32::from(le16(&s, 14)) + u32::from(s[16]) * fatsz);
         assert_eq!(data / u32::from(s[13]), geo.count_of_clusters);
+    }
+
+    #[test]
+    fn new_table_has_reserved_entries_and_free_clusters() {
+        let geo = fat32_geometry(64 * 1024 * 1024).unwrap();
+        let fat = Fat32Table::new(&geo);
+        assert_eq!(fat.get(0), 0x0fff_fff8, "FAT[0] = media 0xF8 + EOC bits");
+        assert_eq!(fat.get(1), FAT32_EOC, "FAT[1] = EOC");
+        assert_eq!(fat.get(2), 0, "the first data cluster starts free");
+        assert_eq!(
+            fat.get(geo.count_of_clusters + 1),
+            0,
+            "the last data cluster starts free"
+        );
+    }
+
+    #[test]
+    fn set_links_a_chain_and_keeps_only_the_low_28_bits() {
+        let geo = fat32_geometry(64 * 1024 * 1024).unwrap();
+        let mut fat = Fat32Table::new(&geo);
+        // A 3-cluster chain 2 -> 3 -> 4 -> EOC.
+        fat.set(2, 3);
+        fat.set(3, 4);
+        fat.set(4, FAT32_EOC);
+        assert_eq!(fat.get(2), 3);
+        assert_eq!(fat.get(3), 4);
+        assert!(fat32_is_eoc(fat.get(4)), "cluster 4 ends the chain");
+        // The reserved high 4 bits are dropped from the written value.
+        fat.set(5, 0xf000_0007);
+        assert_eq!(fat.get(5), 7, "only the low 28 bits are stored");
+    }
+
+    #[test]
+    fn to_bytes_is_the_fat_size_and_little_endian() {
+        let geo = fat32_geometry(64 * 1024 * 1024).unwrap();
+        let mut fat = Fat32Table::new(&geo);
+        fat.set(2, FAT32_EOC); // a one-cluster root chain
+        let bytes = fat.to_bytes(&geo);
+        assert_eq!(bytes.len(), geo.fat_size_sectors as usize * 512);
+        let entry =
+            |i: usize| u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+        assert_eq!(entry(0), 0x0fff_fff8, "FAT[0]");
+        assert_eq!(entry(4), FAT32_EOC, "FAT[1]");
+        assert_eq!(entry(8), FAT32_EOC, "cluster 2 = EOC");
+        // Past the last entry, the FAT region is zero-padded.
+        let last = (geo.count_of_clusters as usize + 2) * 4;
+        assert!(bytes[last..].iter().all(|&b| b == 0), "padding is zero");
+    }
+
+    #[test]
+    fn is_eoc_recognizes_the_end_markers() {
+        assert!(fat32_is_eoc(0x0fff_ffff));
+        assert!(
+            fat32_is_eoc(0x0fff_fff8),
+            "0x0FFFFFF8 is the low end of EOC"
+        );
+        assert!(!fat32_is_eoc(0x0fff_fff7), "one below EOC is a link");
+        assert!(!fat32_is_eoc(2), "a normal next-cluster link is not EOC");
+        assert!(
+            fat32_is_eoc(0xffff_ffff),
+            "the reserved high bits are ignored"
+        );
     }
 }

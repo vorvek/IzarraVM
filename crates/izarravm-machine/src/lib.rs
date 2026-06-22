@@ -1,5 +1,8 @@
 pub use fat12::build_fat12;
-pub use fat32::{Fat32Geometry, fat32_boot_sector, fat32_fsinfo_sector, fat32_geometry};
+pub use fat32::{
+    FAT32_EOC, Fat32Geometry, Fat32Table, fat32_boot_sector, fat32_fsinfo_sector, fat32_geometry,
+    fat32_is_eoc,
+};
 use izarravm_audio::{OplChip, Resampler, SbDsp, SbMixer};
 use izarravm_bus::{BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CpuBus, Memory};
 use izarravm_core::{GswMode, HardwareProfile, SoundBlasterConfig, VideoCard};
