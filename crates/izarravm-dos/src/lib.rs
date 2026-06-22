@@ -497,6 +497,24 @@ impl Arena {
                 mem.write_u8(base + 8 + off, b)?;
             }
         }
+        // The chain just written must read back identically through the in-RAM
+        // walker: same segments, signatures, owners, and sizes. This pins the
+        // writer/reader agreement the authoritative allocator will depend on when
+        // it walks and mutates these headers directly.
+        debug_assert!(
+            {
+                let read = read_mcb_chain(mem, first);
+                read.len() == entries.len()
+                    && read.iter().enumerate().all(|(i, m)| {
+                        let want_sig = if i == last { b'Z' } else { b'M' };
+                        m.mcb_seg == entries[i].mcb_seg
+                            && m.sig == want_sig
+                            && m.owner == entries[i].owner
+                            && m.size == entries[i].size
+                    })
+            },
+            "the materialized MCB chain must read back identically"
+        );
         Ok(first)
     }
 }
@@ -508,6 +526,57 @@ struct McbEntry {
     mcb_seg: u16,
     owner: u16,
     size: u16,
+}
+
+/// Safety cap on an MCB walk: a valid chain cannot have more headers than there
+/// are paragraphs in the arena (each header occupies at least its own paragraph),
+/// so this bounds a corrupt or cyclic chain. The realistic chain is a handful of
+/// blocks and stops at its 'Z' header long before this.
+const MCB_WALK_CAP: usize = ARENA_TOP as usize;
+
+/// One MCB read back from guest RAM: the header paragraph, the link/last
+/// signature, the owner PSP (0 = free), and the data size in paragraphs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RamMcb {
+    mcb_seg: u16,
+    sig: u8,
+    owner: u16,
+    size: u16,
+}
+
+/// Walk the in-RAM MCB chain from `first_mcb`, the inverse of
+/// [`Arena::materialize_mcb_chain`]: read each header's signature, owner, and
+/// size, and follow the data-plus-size step to the next, stopping at a 'Z'
+/// last-block header or an unreadable / invalid signature. This reads the chain
+/// as the guest sees it in memory, so an edit a guest (or a future authoritative
+/// allocator) makes to a header is observed here rather than in a shadow copy.
+fn read_mcb_chain(mem: &Memory, first_mcb: u16) -> Vec<RamMcb> {
+    let mut out = Vec::new();
+    let mut seg = first_mcb;
+    for _ in 0..MCB_WALK_CAP {
+        let base = usize::from(seg) * 16;
+        let (Ok(sig), Ok(owner), Ok(size)) = (
+            mem.read_u8(base),
+            mem.read_u16(base + 1),
+            mem.read_u16(base + 3),
+        ) else {
+            break; // ran off mapped memory
+        };
+        if sig != b'M' && sig != b'Z' {
+            break; // not a valid MCB header
+        }
+        out.push(RamMcb {
+            mcb_seg: seg,
+            sig,
+            owner,
+            size,
+        });
+        if sig == b'Z' {
+            break; // last block in the chain
+        }
+        seg = seg.wrapping_add(1).wrapping_add(size);
+    }
+    out
 }
 
 /// Toka-DOS wall clock. Deterministic by default (a fixed 1997 instant) so unit
@@ -5407,6 +5476,42 @@ mod tests {
             mem.read_u8(sentinel_addr).unwrap(),
             0xa5,
             "materialize_mcb_chain must not clobber the allocated block's data"
+        );
+    }
+
+    #[test]
+    fn read_mcb_chain_reconstructs_the_chain_and_reflects_a_guest_edit() {
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let mut kernel = arena_kernel();
+        // AH=52h materializes the MCB chain in guest RAM and returns the first MCB.
+        let mut regs = DosRegs {
+            ax: 0x5200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        let ptr = usize::from(regs.es) * 16 + usize::from(regs.bx);
+        let first = mem.read_u16(ptr - 2).unwrap();
+
+        // Reading the chain back reconstructs the program block then the free
+        // remainder, ending in a 'Z' header with 'M' links before it.
+        let chain = read_mcb_chain(&mem, first);
+        assert!(chain.len() >= 2, "program block + free remainder");
+        assert_eq!(chain[0].mcb_seg, first, "the walk starts at the first MCB");
+        assert_eq!(chain[0].owner, 0x0100, "program block owner = PSP");
+        assert_eq!(chain.last().unwrap().sig, b'Z', "the chain ends in Z");
+        assert!(
+            chain[..chain.len() - 1].iter().all(|m| m.sig == b'M'),
+            "every block before the last is an M link"
+        );
+
+        // Hand-edit the owner word of the first header directly in guest RAM. The
+        // reader reflects it: the chain in memory is the source of truth, not a
+        // shadow copy. This is the property the authoritative allocator relies on.
+        mem.write_u16(usize::from(first) * 16 + 1, 0x1234).unwrap();
+        let edited = read_mcb_chain(&mem, first);
+        assert_eq!(
+            edited[0].owner, 0x1234,
+            "the reader observes the edited owner word"
         );
     }
 
