@@ -4887,7 +4887,12 @@ struct MachineBus<'a> {
 /// The A20 gate clears address line 20 when it is closed. With the gate off, any
 /// physical address with bit 20 set folds down by 0x100000, so a real-mode
 /// program reaching 0x100000-0x10FFEF (the most a seg:off pair can address) wraps
-/// back to 0x0-0xFFEF, the classic 1 MiB wraparound the HMA depends on.
+/// back to 0x0-0xFFEF, the classic 1 MiB wraparound the HMA depends on. The
+/// effect is intentionally global, matching A20M# on real hardware: bit 20 is
+/// cleared on every physical address, so high ROM (0xFFFF0000) and the upper half
+/// of the Margo LFB alias down too when the gate is closed. That is unreachable
+/// in normal use, since A20 powers on enabled and stays so unless a guest
+/// deliberately closes it.
 const A20_MASK: u32 = !(1 << 20);
 
 impl CpuBus for MachineBus<'_> {
@@ -6403,6 +6408,42 @@ mod tests {
                 .unwrap(),
             0xBEEF,
             "the folded word reads back through the HMA alias"
+        );
+    }
+
+    #[test]
+    fn a20_off_folds_a_split_dword_and_reads_back() {
+        let mut m = int15_machine(16);
+        m.keyboard.set_a20(false);
+        let mut bus = m.make_bus();
+        // 0x100001 is not 4-aligned, so the dword splits into four bytes, each
+        // folding down by 0x100000 to 0x1..0x4.
+        bus.write_memory(
+            0x10_0001,
+            BusWidth::Dword,
+            0xDEAD_BEEF,
+            BusAccessKind::DataWrite,
+        )
+        .unwrap();
+        // The read side folds too: the dword reads back through the alias.
+        assert_eq!(
+            bus.read_memory(0x10_0001, BusWidth::Dword, BusAccessKind::DataRead)
+                .unwrap(),
+            0xDEAD_BEEF,
+            "the dword reads back through the HMA alias"
+        );
+        // The low-memory bytes hold the little-endian image.
+        assert_eq!(
+            bus.read_memory(0x1, BusWidth::Byte, BusAccessKind::DataRead)
+                .unwrap(),
+            0xEF,
+            "byte 0 folded to 0x1"
+        );
+        assert_eq!(
+            bus.read_memory(0x4, BusWidth::Byte, BusAccessKind::DataRead)
+                .unwrap(),
+            0xDE,
+            "byte 3 folded to 0x4"
         );
     }
 
