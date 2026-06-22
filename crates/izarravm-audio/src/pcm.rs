@@ -239,6 +239,15 @@ mod tests {
         //     ((15<<1)|0x21)<<7 - 0x21 = (63<<7) - 33 = 8031.
         let mag_00 = i32::from(sample_ulaw(0x00)).abs() >> 2;
         assert_eq!(mag_00, 8031, "mu-law 0x00 ITU 14-bit magnitude = 8031");
+        // Anchor a full mid-range decoded sample to the ITU reference, not just
+        // the magnitude: the wire byte's sign bit is complemented before use, so
+        // stored 0x55 (high bit clear) decodes negative; the 14-bit magnitude 179
+        // scaled <<2 = -716.
+        assert_eq!(
+            sample_ulaw(0x55),
+            -716,
+            "mu-law 0x55 ITU reference decode = -716 (-(179 << 2))"
+        );
     }
 
     #[test]
@@ -255,6 +264,14 @@ mod tests {
         //     ((0<<1)|0x21)<<0 = 33.
         let mag_c5 = i32::from(sample_alaw(0xC5)).abs() >> 3;
         assert_eq!(mag_c5, 33, "A-law 0xC5 ITU 13-bit magnitude = 33");
+        // Anchor a full mid-range decoded sample to the ITU reference, not just
+        // the magnitude: untoggled 0xFE has its sign bit set, so 0xAB decodes
+        // positive; the 13-bit magnitude 3904 scaled <<3 = +31232.
+        assert_eq!(
+            sample_alaw(0xAB),
+            31_232,
+            "A-law 0xAB ITU reference decode = +31232 (3904 << 3)"
+        );
     }
 
     #[test]

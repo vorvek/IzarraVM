@@ -4817,10 +4817,12 @@ impl Machine {
 
     /// CPU clocks to advance while halted so the next wake-capable IRQ lands, or
     /// None if nothing can wake the CPU (so HLT is a genuine halt). A halted guest
-    /// is woken by either IRQ0 (PIT channel 0 OUT edge) or IRQ5 (the SB16 DSP
-    /// half/end-buffer edge, now clock-driven). Each is considered only when
-    /// unmasked; the result is the sooner of the two, clamped to the deadline and
-    /// to at least one clock so the run loop always makes progress.
+    /// is woken by any of three sources: IRQ0 (PIT channel 0 OUT edge), IRQ5 (the
+    /// SB16 DSP half/end-buffer edge, clock-driven), or the AD1848/WSS codec's
+    /// terminal-count edge on its own (config) IRQ line. Each is considered only
+    /// when unmasked/deliverable; the result is the soonest of the applicable
+    /// wakes, clamped to the deadline and to at least one clock so the run loop
+    /// always makes progress.
     fn next_timer_wake(&self, deadline: u64) -> Option<u64> {
         if !self.cpu.interrupts_enabled() {
             return None;

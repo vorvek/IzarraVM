@@ -19,6 +19,7 @@
 //! - I14/I15 Upper/Lower Base Count -- IXA3:0 = 14 & 15.
 
 use std::collections::VecDeque;
+use std::sync::LazyLock;
 
 use crate::pcm::{sample_alaw, sample_i16, sample_u8, sample_ulaw};
 
@@ -30,6 +31,10 @@ const DSP_RING_CAP: usize = 8192;
 
 /// R0 (Index Address) bit masks. `INIT` is read-only and `MCE`/`TRD` latch with
 /// the 4-bit index on a write.
+#[allow(
+    dead_code,
+    reason = "INIT (busy) state is never modeled; kept to document bit7 and assert it reads clear in tests"
+)]
 const R0_INIT: u8 = 0x80;
 const R0_MCE: u8 = 0x40;
 const R0_TRD: u8 = 0x20;
@@ -96,6 +101,12 @@ const DAC_MUTE: u8 = 0x80;
 
 /// AD1848K K-grade revision ID (I12 ID3:0 = "1010").
 const REVISION_K_GRADE: u8 = 0b1010;
+
+/// Config/ID region board/version ID byte (offset 0). A board-integration value,
+/// not codec-defined: the WSS standard has no single canonical board ID, so this
+/// is a plausible static stand-in. Codec-aware detection keys off the I12
+/// revision, so this region just needs to be present.
+const WSS_BOARD_ID: u8 = 0x04;
 
 /// Length of the post-MCE autocalibrate window, in output sample periods. The
 /// datasheet specifies "approximately 128 sample cycles" during which ACI is
@@ -177,8 +188,8 @@ impl Ad1848 {
         regs[IDX_RIGHT_DAC] = DAC_MUTE;
         // I9 Interface Config reset = "00xx 1000": ACAL set, PEN/CEN clear.
         regs[IDX_IFACE_CONFIG] = I9_ACAL;
-        // I12 Misc Info: K-grade revision in ID3:0.
-        regs[IDX_MISC_INFO] = REVISION_K_GRADE;
+        // I12 is not stored: `read_indexed_data` returns REVISION_K_GRADE directly
+        // for that index, so a stored byte here would be dead state.
         Self {
             regs,
             index: R0_INDEX_IDLE,
@@ -208,7 +219,8 @@ impl Ad1848 {
     /// - 4: R0 Index Address (INIT/MCE/TRD/index).
     /// - 5: R1 Indexed Data (the selected indirect register, with read-only
     ///   bits resolved -- e.g. I11 ACI, I12 revision).
-    /// - 6: R2 Status.
+    /// - 6: R2 Status. Only the INT bit (bit0) is dynamic; PRDY/SOUR/PL-R/PU-L
+    ///   are static reset-value stubs in this DMA-only playback scope.
     /// - 7: R3 PIO Data (stub).
     pub fn read_port(&mut self, offset: u16) -> u8 {
         match offset {
@@ -217,8 +229,10 @@ impl Ad1848 {
             5 => self.read_indexed_data(),
             6 => self.status,
             7 => {
-                // ponytail: PIO playback not modeled; DOS WSS drivers use DMA
-                0x00
+                // ponytail: PIO playback not modeled; DOS WSS drivers use DMA.
+                // The datasheet's PIO/Capture Data Register reads "1000 0000"
+                // when idle, so return 0x80 (the DMA path is the modeled one).
+                0x80
             }
             _ => 0xFF,
         }
@@ -258,7 +272,7 @@ impl Ad1848 {
     /// keys off the I12 revision, this region just needs to be present).
     fn read_config(&self, offset: u16) -> u8 {
         match offset {
-            0 => 0x04, // board/version ID
+            0 => WSS_BOARD_ID, // board/version ID
             1 => ((self.config.irq & 0x0F) << 4) | (self.config.dma & 0x0F),
             _ => 0x00,
         }
@@ -275,8 +289,9 @@ impl Ad1848 {
         if self.trd {
             v |= R0_TRD;
         }
-        // INIT (bit7) stays clear: the codec is always ready in this model.
-        v & !R0_INIT
+        // INIT (bit7) stays clear: the codec is always ready in this model, and
+        // it is never set, so no explicit masking is needed here.
+        v
     }
 
     /// R0 Index Address write: latch INIT(ignored, read-only)/MCE/TRD + index.
@@ -599,8 +614,8 @@ impl Ad1848 {
 
     /// Apply the I6/I7 DAC output attenuation (and mute) at drain time. The 6-bit
     /// field is -1.5 dB/step from 0 dB (0) to -94.5 dB (63); a set mute bit
-    /// silences the channel. Modeled as a coarse per-step linear-ish scale; the
-    /// exact dB curve is not audibly critical for the integration smoke path.
+    /// silences the channel. The per-step gain follows the AD1848's documented
+    /// logarithmic law (`DAC_ATTEN_STEPS`), not a linear approximation.
     fn attenuate(&self, frame: (i16, i16)) -> (i16, i16) {
         let (l, r) = frame;
         (
@@ -627,6 +642,12 @@ impl Ad1848 {
     /// whether or not playback is armed, so the machine calls this once per
     /// output frame (alongside `tick_sample`) to retire the ACI window. When the
     /// countdown elapses, ACI clears.
+    ///
+    /// ACI-window retiring is coupled to a valid programmed sample rate (the
+    /// integration loop ticks at `rate_hz`): a guest that clears MCE while an
+    /// unsupported (rate-0) format is selected is non-physical -- real drivers
+    /// select a valid rate before clearing MCE -- so that corner is intentionally
+    /// not special-cased here.
     pub fn advance_autocal(&mut self) {
         if let Some(n) = self.aci_remaining {
             if n <= 1 {
@@ -638,15 +659,26 @@ impl Ad1848 {
     }
 }
 
+/// Linear gain per step of the 6-bit I6/I7 DAC attenuate field. The AD1848
+/// attenuates -1.5 dB per step from 0 dB (step 0) to -94.5 dB (step 63);
+/// `gain = 10**(-1.5 * n / 20)`. Step 0 is exactly 1.0 (unity), and larger
+/// steps are quieter. Built like `VOL5_STEPS` in `mixer.rs`.
+static DAC_ATTEN_STEPS: LazyLock<[f32; 64]> = LazyLock::new(|| {
+    let mut steps = [0f32; 64];
+    for (n, step) in steps.iter_mut().enumerate() {
+        *step = 10f32.powf(-1.5 * n as f32 / 20.0);
+    }
+    steps
+});
+
 /// Apply one channel's I6/I7 DAC attenuate/mute control to a sample. Mute (bit7)
-/// zeroes the channel; otherwise the 6-bit attenuate field scales the sample by
-/// `(64 - n) / 64` as a monotonic stand-in for the -1.5 dB-per-step curve.
+/// zeroes the channel; otherwise the 6-bit attenuate field selects a -1.5 dB-per-
+/// step logarithmic gain from `DAC_ATTEN_STEPS` (the AD1848's documented law).
 fn apply_atten(sample: i16, ctrl: u8) -> i16 {
     if ctrl & DAC_MUTE != 0 {
         return 0;
     }
-    let n = i32::from(ctrl & DAC_ATTEN_MASK);
-    ((i32::from(sample) * (64 - n)) / 64) as i16
+    (f32::from(sample) * DAC_ATTEN_STEPS[(ctrl & DAC_ATTEN_MASK) as usize]).round() as i16
 }
 
 #[cfg(test)]
@@ -1048,23 +1080,32 @@ mod tests {
     }
 
     #[test]
-    fn attenuation_scales_mid_and_full_step_and_sign() {
-        // apply_atten scales by (64 - n) / 64. Exercise an intermediate value,
-        // the maximum non-mute step, and a negative input sample.
-        // n = 32 -> half scale.
-        assert_eq!(apply_atten(1000, 32), (1000 * 32) / 64);
-        assert_eq!(apply_atten(1000, 32), 500);
-        // n = 63 -> 1/64 of the sample (6400 * 1 / 64 = 100).
-        assert_eq!(apply_atten(6400, 63), 100);
-        // Negative input keeps sign under scaling.
-        assert_eq!(apply_atten(-1000, 32), -500);
-        // Mask: only the low 6 bits select attenuation (bit6 set, bit7 mute clear
-        // is not a valid ctrl, but the field mask must ignore bit6).
+    fn attenuation_follows_log_curve_with_sign_mask_and_mute() {
+        // apply_atten selects a -1.5 dB-per-step logarithmic gain (10^(-1.5n/20)).
+        // Step 0 is unity, so the input passes through unchanged.
+        assert_eq!(apply_atten(1000, 0), 1000, "step 0 is unity gain");
+        // Step 10 -> 10^(-15/20) = 0.17783: 1000 * 0.17783 ~= 178 (round).
+        let n10 = apply_atten(1000, 10);
+        let expected_10 = (1000.0 * 10f32.powf(-15.0 / 20.0)).round() as i16;
+        assert_eq!(n10, expected_10, "step 10 matches the log law");
+        assert!((n10 - 178).abs() <= 1, "step 10 ~= input * 0.1778 ({n10})");
+        // The curve decreases monotonically across the 64 steps.
+        let mut prev = apply_atten(30_000, 0);
+        for n in 1u8..64 {
+            let cur = apply_atten(30_000, n);
+            assert!(cur <= prev, "step {n} must not be louder than {}", n - 1);
+            prev = cur;
+        }
+        // Negative input keeps its sign under attenuation.
+        assert_eq!(apply_atten(-1000, 10), -n10, "negative input keeps sign");
+        // Mask: only the low 6 bits select attenuation; bit6 (0x40) is ignored.
         assert_eq!(
-            apply_atten(1000, 0x40 | 32),
-            apply_atten(1000, 32),
+            apply_atten(1000, 0x40 | 10),
+            apply_atten(1000, 10),
             "atten field is masked to 6 bits"
         );
+        // Mute (bit7) silences the channel regardless of the attenuate field.
+        assert_eq!(apply_atten(1000, DAC_MUTE | 10), 0, "mute -> 0");
     }
 
     #[test]
