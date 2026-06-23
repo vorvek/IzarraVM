@@ -264,6 +264,17 @@ fn parse_lastdrive_token(value: &str) -> Option<u8> {
     }
 }
 
+fn split_device_path_and_args(rest: &str) -> (&str, &str) {
+    let rest = rest.trim_start();
+    if let Some(quoted) = rest.strip_prefix('"') {
+        if let Some(end) = quoted.find('"') {
+            return (&quoted[..end], quoted[end + 1..].trim_start());
+        }
+    }
+    let path_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    (&rest[..path_end], rest[path_end..].trim_start())
+}
+
 /// Read the memory-manager intent out of a CONFIG.SYS. The IEMM memory manager
 /// (filed as IEMM.EXE in Toka-DOS, or the real-DOS EMM386.EXE) provides upper
 /// memory only when HIMEM.SYS loads first, matching real DOS, so an IEMM/EMM386
@@ -291,8 +302,7 @@ pub fn parse_config_sys(text: &str) -> ConfigSysMemory {
             .strip_prefix("DEVICEHIGH=")
             .or_else(|| upper.strip_prefix("DEVICE="));
         if let Some(rest) = device {
-            let rest = rest.trim_start();
-            let path = rest.split_whitespace().next().unwrap_or("");
+            let (path, args) = split_device_path_and_args(rest);
             let name = path.rsplit(['\\', '/']).next().unwrap_or(path);
             if name == "HIMEM.SYS" {
                 himem = true;
@@ -306,11 +316,8 @@ pub fn parse_config_sys(text: &str) -> ConfigSysMemory {
                 // only with a prior HIMEM. NOEMS omits the EMS frame.
                 let mut line_frame_seg = None;
                 let mut line_pool_kb = None;
-                let noems = rest
-                    .split_whitespace()
-                    .skip(1)
-                    .any(|token| token == "NOEMS");
-                for token in rest.split_whitespace().skip(1) {
+                let noems = args.split_whitespace().any(|token| token == "NOEMS");
+                for token in args.split_whitespace() {
                     if let Some(frame_seg) = parse_iemm_frame_token(token) {
                         line_frame_seg = Some(frame_seg);
                     }
@@ -1094,6 +1101,17 @@ mod tests {
         assert_eq!(config.ems_frame_seg, Some(0xd000));
         assert_eq!(config.ems_pool_kb, Some(4096));
         assert!(config.dos_umb);
+    }
+
+    #[test]
+    fn config_sys_accepts_quoted_device_paths() {
+        let config = parse_config_sys(
+            "DEVICE=\"C:\\DOS\\HIMEM.SYS\" /TESTMEM:OFF\r\nDEVICEHIGH=\"C:\\DOS\\IEMM.EXE\" RAM FRAME=D000 4096\r\n",
+        );
+
+        assert_eq!(config.emm386, Emm386Mode::Ram);
+        assert_eq!(config.ems_frame_seg, Some(0xd000));
+        assert_eq!(config.ems_pool_kb, Some(4096));
     }
 
     #[test]
