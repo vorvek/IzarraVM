@@ -28,7 +28,6 @@ pub(super) const NO_NAME: &[u8; 8] = b"\0\0\0\0\0\0\0\0";
 const SYSVARS_SEG: u16 = 0x0050;
 
 /// DOS default LASTDRIVE, reported in the list of lists: drives A: through E:.
-/// The CONFIG.SYS `LASTDRIVE=` line will override this once that wiring exists.
 const DEFAULT_LASTDRIVE: u8 = 5;
 
 /// Conventional memory modeled as an authoritative in-RAM MCB chain ending at
@@ -486,6 +485,7 @@ pub(super) fn write_sysvars(
     mem: &mut Memory,
     first_mcb: u16,
     ems_present: bool,
+    lastdrive: Option<u8>,
 ) -> Result<(u16, u16), DosError> {
     let base = usize::from(SYSVARS_SEG) * 16;
     // [BX-2] = first MCB segment (BX returns 0x0002, so this is offset 0).
@@ -498,7 +498,7 @@ pub(super) fn write_sysvars(
     // sector here.
     mem.write_u16(base + 2 + 0x10, 512)?;
     // [BX+0x21] BYTE: LASTDRIVE.
-    mem.write_u8(base + 2 + 0x21, DEFAULT_LASTDRIVE)?;
+    mem.write_u8(base + 2 + 0x21, lastdrive.unwrap_or(DEFAULT_LASTDRIVE))?;
     // [BX+0x22]: the NUL device header, the head of the device-driver chain.
     let nul_off = 0x22usize; // BX-relative offset of the NUL header
     let ems_off = nul_off + 0x12; // the EMMXXXX0 header right after NUL

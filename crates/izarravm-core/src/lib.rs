@@ -220,12 +220,18 @@ impl FromStr for Emm386Mode {
     }
 }
 
-/// The memory-manager configuration a CONFIG.SYS declares: the EMM386 mode its
-/// DEVICE= lines select, and whether DOS=UMB asks for the UMB area to be linked.
+/// DOS default LASTDRIVE, reported in the list of lists: drives A: through E:.
+pub const DEFAULT_LASTDRIVE: u8 = 5;
+
+/// The subset of CONFIG.SYS directives the HLE SYSINIT maps into machine state:
+/// the EMM386/IEMM mode its DEVICE= lines select, whether DOS=UMB asks for the
+/// UMB area to be linked, EMS sizing knobs, and boot-scalar DOS settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConfigSysMemory {
     pub emm386: Emm386Mode,
     pub dos_umb: bool,
+    /// Highest DOS drive index, A: = 1. Defaults to E: like the shipped config.
+    pub lastdrive: u8,
     /// Optional EMS page-frame segment from an IEMM/EMM386 `FRAME=` token.
     /// The token is written in hexadecimal like real EMM386 CONFIG.SYS lines.
     pub ems_frame_seg: Option<u16>,
@@ -248,6 +254,16 @@ fn parse_iemm_pool_token(token: &str) -> Option<u32> {
     }
 }
 
+fn parse_lastdrive_token(value: &str) -> Option<u8> {
+    let value = value.trim();
+    let bytes = value.as_bytes();
+    if bytes.len() == 1 && bytes[0].is_ascii_uppercase() {
+        Some(bytes[0] - b'A' + 1)
+    } else {
+        None
+    }
+}
+
 /// Read the memory-manager intent out of a CONFIG.SYS. The IEMM memory manager
 /// (filed as IEMM.EXE in Toka-DOS, or the real-DOS EMM386.EXE) provides upper
 /// memory only when HIMEM.SYS loads first, matching real DOS, so an IEMM/EMM386
@@ -260,11 +276,13 @@ fn parse_iemm_pool_token(token: &str) -> Option<u32> {
 ///
 /// `FRAME=hhhh` selects the EMS page-frame segment and a bare decimal number on
 /// the manager line selects the EMS backing-pool size in KiB. DOS=UMB (or
-/// DOS=HIGH,UMB) sets `dos_umb`.
+/// DOS=HIGH,UMB) sets `dos_umb`. LASTDRIVE=letter sets the drive count published
+/// through the DOS SysVars table.
 pub fn parse_config_sys(text: &str) -> ConfigSysMemory {
     let mut himem = false;
     let mut emm386 = None;
     let mut dos_umb = false;
+    let mut lastdrive = DEFAULT_LASTDRIVE;
     let mut ems_frame_seg = None;
     let mut ems_pool_kb = None;
     for line in text.lines() {
@@ -312,11 +330,16 @@ pub fn parse_config_sys(text: &str) -> ConfigSysMemory {
             if rest.split([',', ' ']).any(|token| token.trim() == "UMB") {
                 dos_umb = true;
             }
+        } else if let Some(rest) = upper.strip_prefix("LASTDRIVE=") {
+            if let Some(parsed) = parse_lastdrive_token(rest) {
+                lastdrive = parsed;
+            }
         }
     }
     ConfigSysMemory {
         emm386: emm386.unwrap_or(Emm386Mode::Unloaded),
         dos_umb,
+        lastdrive,
         ems_frame_seg,
         ems_pool_kb,
     }
@@ -1071,6 +1094,13 @@ mod tests {
         assert_eq!(config.ems_frame_seg, Some(0xd000));
         assert_eq!(config.ems_pool_kb, Some(4096));
         assert!(config.dos_umb);
+    }
+
+    #[test]
+    fn config_sys_parses_lastdrive() {
+        let config = parse_config_sys("LASTDRIVE=Z\r\n");
+
+        assert_eq!(config.lastdrive, 26);
     }
 
     #[test]

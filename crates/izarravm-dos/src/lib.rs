@@ -526,6 +526,9 @@ pub struct DosKernel {
     // upper memory is reachable only through the XMS Request UMB primitive. The
     // machine sets this from the parsed CONFIG.SYS.
     dos_umb: bool,
+    // Highest configured DOS drive index from CONFIG.SYS LASTDRIVE=, A: = 1.
+    // None means the shipped default E: value is published.
+    lastdrive: Option<u8>,
     // Handles a guest has opened on the EMMXXXX0 device (AH=3Dh), so AH=44h IOCTL
     // and AH=3Eh close treat them as the device rather than a host file.
     ems_handles: HashSet<u16>,
@@ -692,6 +695,12 @@ impl DosKernel {
     /// link the upper area at all. The machine sets this at SYSINIT.
     pub fn set_dos_umb(&mut self, configured: bool) {
         self.dos_umb = configured;
+    }
+
+    /// Record CONFIG.SYS LASTDRIVE=. AH=52h publishes this in the SysVars table
+    /// as a count, with A: = 1 and Z: = 26.
+    pub fn set_lastdrive(&mut self, lastdrive: u8) {
+        self.lastdrive = Some(lastdrive);
     }
 
     /// XMS function 10h Request UMB: carve `paras` paragraphs from the SAME
@@ -2722,7 +2731,12 @@ impl DosKernel {
                 Ok(DosAction::Continue)
             }
             0x52 => {
-                let (es, bx) = write_sysvars(mem, self.arena.first_mcb(), self.ems_present)?;
+                let (es, bx) = write_sysvars(
+                    mem,
+                    self.arena.first_mcb(),
+                    self.ems_present,
+                    self.lastdrive,
+                )?;
                 regs.es = es;
                 regs.bx = bx;
                 Ok(DosAction::Continue)
