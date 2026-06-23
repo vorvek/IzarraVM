@@ -111,7 +111,7 @@ const WSS_BOARD_ID: u8 = 0x04;
 /// Length of the post-MCE autocalibrate window, in output sample periods. The
 /// datasheet specifies "approximately 128 sample cycles" during which ACI is
 /// held high; system software polls ACI rather than counting cycles.
-// ponytail: fixed ~128-sample autocal window
+// Limit: fixed ~128-sample autocal window
 const AUTOCAL_SAMPLES: u32 = 128;
 
 /// AD1848 board config/ID region (4 ports at the card base, codec sits at base+4).
@@ -229,7 +229,7 @@ impl Ad1848 {
             5 => self.read_indexed_data(),
             6 => self.status,
             7 => {
-                // ponytail: PIO playback not modeled; DOS WSS drivers use DMA.
+                // Limit: PIO playback not modeled; DOS WSS drivers use DMA.
                 // The datasheet's PIO/Capture Data Register reads "1000 0000"
                 // when idle, so return 0x80 (the DMA path is the modeled one).
                 0x80
@@ -259,7 +259,7 @@ impl Ad1848 {
                 self.status &= !R2_INT;
             }
             7 => {
-                // ponytail: PIO playback not modeled; DOS WSS drivers use DMA
+                // Limit: PIO playback not modeled; DOS WSS drivers use DMA
             }
             _ => {}
         }

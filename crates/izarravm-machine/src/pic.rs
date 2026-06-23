@@ -53,7 +53,7 @@ impl Pic {
                 self.auto_rotate = false;
                 self.expect_icw4 = value & 0x01 != 0;
                 self.single = value & 0x02 != 0;
-                // ponytail: LTIM is decoded and stored, but the request path stays
+                // Limit: LTIM is decoded and stored, but the request path stays
                 // edge-pulsed; level-triggered re-assertion is not modeled.
                 self.level_triggered = value & 0x08 != 0;
                 self.init = InitStage::ExpectIcw2;
@@ -359,7 +359,7 @@ impl Pic8259Pair {
     /// The master's highest-priority deliverable level, resolved under the same
     /// special-fully-nested-mode rule the poll path uses.
     //
-    // ponytail: SFNM here is just the master-side block relaxation. The datasheet
+    // Limit: SFNM here is just the master-side block relaxation. The datasheet
     // also asks software to poll the slave's ISR after a slave EOI and skip the
     // master EOI while the slave still has work in service. That slave-EOI dance
     // is left to the guest; this models the request-resolution half only.

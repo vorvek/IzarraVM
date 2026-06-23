@@ -1,7 +1,7 @@
 //! x87 FPU state for the 387-class core: the register stack, the control and
 //! status words, and the tag word.
 //!
-//! ponytail: registers hold f64, not the hardware's 80-bit extended format. The
+//! Limit: registers hold f64, not the hardware's 80-bit extended format. The
 //! Izarra's games-first target (Wolfenstein 3D-era DOS) never needs 80-bit
 //! exactness, so the ceiling is that transcendental and denormal edge cases are
 //! not bit-accurate. Upgrade path if a title ever needs it: a soft float80.

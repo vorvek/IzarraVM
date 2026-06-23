@@ -257,7 +257,7 @@ impl Rtc {
     /// when its Register B enable is set, matching real hardware where a disabled
     /// source still sets nothing the guest can see through Register C.
     ///
-    /// ponytail: the periodic granularity is one tick (a whole second), not the
+    /// Limit: the periodic granularity is one tick (a whole second), not the
     /// programmed Register A rate. Every standard rate is at least once per second,
     /// so a guest that polls Register C for PF still sees it set each second, but a
     /// guest counting periodic interrupts to measure sub-second time gets one per
@@ -275,7 +275,7 @@ impl Rtc {
         if enables & REG_B_UIE != 0 {
             new_flags |= REG_C_UF;
         }
-        // PF: latched at second granularity (see the ponytail above).
+        // PF: latched at second granularity (see the limit above).
         if enables & REG_B_PIE != 0 {
             new_flags |= REG_C_PF;
         }

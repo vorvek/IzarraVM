@@ -197,7 +197,7 @@ impl SbDsp {
             0x14 => self.arm_dma(false), // 8-bit single output, normal speed
             0x1C => self.arm_dma(true),  // 8-bit auto-init output, normal speed
             // 0x90/0x91 are the SB Pro high-speed variants of auto-init/single.
-            // ponytail: high-speed command-lockout (DSP ignores commands until
+            // Limit: high-speed command-lockout (DSP ignores commands until
             // reset) not modeled; games exit via the DSP reset handled below.
             0x90 => self.arm_dma(true),  // 8-bit auto-init, high-speed
             0x91 => self.arm_dma(false), // 8-bit single, high-speed

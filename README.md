@@ -7,8 +7,9 @@ System, over an MS-DOS compatible core. The emulator reproduces that one machine
 rather than offering a configurable PC.
 
 The aim is to run early to mid 1990s DOS games the way the Izarra would have run
-them. It does not run DOS games yet. Today it boots clean-room test ROMs and
-validates configuration and the local game corpus.
+them. It does not run retail DOS games yet, but it now boots the Izarra BIOS,
+enters Toka-DOS, runs the ICOMMAND shell and bundled tools, and exercises most of
+the machine through headless boot tests.
 
 There was never a real Izarra 3000. In the project's fiction the company went
 bankrupt in early 1997, before the machine shipped, which is also why it is a good
@@ -59,10 +60,28 @@ Windows-only APIs unless they are isolated behind a backend trait.
 
 ## Current State
 
-This is an early emulator scaffold. It validates TOML and CLI configuration,
-includes local compatibility-corpus scanning tools, and boots a clean-room 80386
-test ROM far enough to show deterministic VGA text-mode checks. It does not run DOS
-games yet.
+IzarraVM is in bring-up. It is past the blank-machine stage, but it is not a
+general DOS game runner yet.
+
+What works today:
+
+- The clean-room Izarra BIOS boots, reports device status, and can enter the
+  Toka-DOS boot path.
+- Toka-DOS installs a host-folder C: drive, boots to the ICOMMAND prompt, and runs
+  bundled tools such as VER, MEM, and IEMM.
+- The CPU core covers a large 386 real/protected-mode subset plus selected 486 and
+  GSW-586 features used by the fantasy machine.
+- VGA text, mode 13h, planar paths, and the Margo 2D chip are modeled far enough
+  for deterministic headless tests and the Toka-DOS shell.
+- PC speaker, OPL3, Sound Blaster 16, and WSS/AD1848 paths exist, with DMA-backed
+  playback coverage for the common SB paths.
+- IDE hard disk, floppy, ATAPI CD-ROM, XMS, EMS, UMBs, keyboard, mouse, PIT, PIC,
+  RTC, serial, and parallel devices are wired into the machine model.
+
+The current headless gates pass. The boot suite still has known red rows for
+CGA/EGA graphics coverage and Sound Blaster ADPCM, and the Distira 3D/Glide side
+of VEGA is still future work. Game compatibility work should start from specific
+titles and turn their first failure into a repeatable test.
 
 ## Quick Start
 

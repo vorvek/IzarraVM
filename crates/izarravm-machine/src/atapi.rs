@@ -48,7 +48,7 @@ pub mod asc {
 /// and cleared when the result phase is ready. The IDE register file (`ide.rs`)
 /// runs each command synchronously, so the busy window is momentary; this device
 /// models the bit so the register file can publish it on the status port.
-// ponytail: the synchronous model never opens a real busy window, so ide.rs has
+// Limit: the synchronous model never opens a real busy window, so ide.rs has
 // no place to publish this bit; it stays defined for fidelity but uncalled.
 #[allow(dead_code)]
 pub const BSY: u8 = 0x80;
@@ -137,7 +137,7 @@ impl AtapiDevice {
 
     /// Current CD-audio output volume (mode page 0x0E ports 0 and 1), 0xFF full.
     /// The mixer can scale the CD-audio stream by these once it consults them.
-    // ponytail: stored and reported but not yet applied to the mixer; the audio
+    // Limit: stored and reported but not yet applied to the mixer; the audio
     // path can read these to attenuate the streamed frames.
     #[allow(dead_code)]
     pub fn audio_volume(&self) -> [u8; 2] {
@@ -176,7 +176,7 @@ impl AtapiDevice {
         self.play
     }
 
-    // ponytail: these two tray/spin queries feed ide.rs (status port), which does
+    // Limit: these two tray/spin queries feed ide.rs (status port), which does
     // not surface them on any ATA register, so they have no in-crate caller yet.
     /// Whether PREVENT/ALLOW MEDIUM REMOVAL currently locks the tray.
     #[allow(dead_code)]
@@ -415,7 +415,7 @@ impl AtapiDevice {
     /// START STOP UNIT (0x1B). Byte 4: LoEj (bit 1) requests a tray eject, Start
     /// (bit 0) spins the unit up or down. LoEj with Start clear ejects, but only
     /// when removal is not prevented; otherwise CHECK CONDITION with medium-removal
-    /// prevented. ponytail: the GUI owns the host file, so an eject-on-command only
+    /// prevented. Limit: the GUI owns the host file, so an eject-on-command only
     /// marks the tray state, it does not close the backing image.
     fn start_stop_unit(&mut self, cdb: &[u8; 12]) -> CmdResult {
         let loej = cdb[4] & 0x02 != 0;
@@ -470,7 +470,7 @@ impl AtapiDevice {
     /// for user data. The expected sector type is validated against the track at
     /// the LBA: type 1 (CD-DA) over a data track, or a data type over an audio
     /// track, is an illegal field.
-    // ponytail: only the 2048-byte user-data main-channel field is returned. The
+    // Limit: only the 2048-byte user-data main-channel field is returned. The
     // sync header, sub-header, and C2/EDC/ECC selections (byte 9 other bits) are
     // not synthesized; a guest that asks for raw 2352-byte frames gets user data.
     fn read_cd(&mut self, cdb: &[u8; 12]) -> CmdResult {
@@ -520,7 +520,7 @@ impl AtapiDevice {
     /// READ HEADER (0x44). Bytes 2-5 hold the LBA; byte 1 bit 1 selects an MSF
     /// address over LBA. Returns a 4-byte header followed by the 4-byte address:
     /// the data-mode byte (0x01 for a MODE1 data sector, 0x00 for an audio or hole)
-    /// then three reserved bytes, then the requested address. ponytail: the model
+    /// then three reserved bytes, then the requested address. Limit: the model
     /// does not synthesize the full CD sub-header, just the mode and address a
     /// driver probes.
     fn read_header(&mut self, cdb: &[u8; 12]) -> CmdResult {
@@ -656,7 +656,7 @@ impl AtapiDevice {
     /// the parameter list itself (header plus mode pages) arrives in a data-out
     /// phase. This call acknowledges the command; the page list is applied through
     /// [`Self::mode_select_data`].
-    // ponytail: the IDE register file (ide.rs) has no data-out phase yet, so the
+    // Limit: the IDE register file (ide.rs) has no data-out phase yet, so the
     // parameter list is never delivered and the command only acks. Wire a write
     // buffer through run_packet that calls mode_select_data to apply the pages.
     fn mode_select10(&mut self, _cdb: &[u8; 12]) -> CmdResult {
@@ -668,8 +668,8 @@ impl AtapiDevice {
     /// tracks (page 0x0E CD audio control: the two output-port volumes). Unknown
     /// pages are skipped, the way a forgiving drive treats vendor pages. Returns
     /// Error with latched sense on a malformed list.
-    // ponytail: ready for the IDE data-out phase but not yet reachable from it
-    // (only the tests call it). Lifting the ponytail on mode_select10 wires this in.
+    // Limit: ready for the IDE data-out phase but not yet reachable from it
+    // (only the tests call it). A mode_select10 data-out path will use this.
     #[allow(dead_code)]
     pub fn mode_select_data(&mut self, params: &[u8]) -> CmdResult {
         // 8-byte MODE SELECT(10) parameter header, then a block-descriptor area

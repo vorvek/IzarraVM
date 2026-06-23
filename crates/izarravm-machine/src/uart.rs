@@ -206,7 +206,7 @@ impl Uart16450 {
             self.rx_ready = true;
             self.lsr |= LSR_DR;
         } else {
-            // ponytail: instant-drain tx, no host backpressure
+            // Limit: instant-drain tx, no host backpressure
             self.output.push(value);
         }
         // The holding register empties at once, so a THR-empty source latches.
@@ -273,7 +273,7 @@ impl Uart16450 {
     /// read (RBR for RX data, LSR for line status, MSR for modem status).
     fn read_iir(&mut self) -> u8 {
         let code = self.pending_code();
-        // ponytail: FIFO control bits decoded, depth/timeout not modeled (instant-drain tx)
+        // Limit: FIFO control bits decoded, depth/timeout not modeled (instant-drain tx)
         let fifo_bits = if self.fcr & FCR_FIFO_ENABLE != 0 {
             0xc0
         } else {
@@ -306,7 +306,7 @@ impl Uart16450 {
     /// Recompute whether the interrupt line is asserted and arm the edge.
     /// The line drives the port's IRQ (IRQ4 for COM1, IRQ3 for COM2) only when
     /// MCR OUT2 gates it.
-    // ponytail: edge-armed on register access, not a continuously level-held
+    // Limit: edge-armed on register access, not a continuously level-held
     // line; sufficient because the 8259 takes IRQ4 as an edge and every guest
     // interaction touches a UART port.
     fn refresh_irq(&mut self) {

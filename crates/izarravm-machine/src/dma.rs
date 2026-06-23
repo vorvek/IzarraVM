@@ -131,7 +131,7 @@ impl DmaChannel {
     /// Write one little-endian word to memory on the slave's word-addressed path
     /// (device->memory, 16-bit DMA) and step the channel. Returns None when
     /// masked, not programmed for a write transfer, or at terminal count.
-    #[allow(dead_code)] // ponytail: no Machine-level write wiring yet (see write_byte).
+    #[allow(dead_code)] // Limit: no Machine-level write wiring yet (see write_byte).
     pub(crate) fn write_word(&mut self, memory: &mut Memory, word: u16) -> Option<()> {
         if self.mask || self.transfer_kind != 1 {
             return None;
@@ -147,7 +147,7 @@ impl DmaChannel {
     /// Verify transfer (transfer_kind 0): step address and count with no memory
     /// access, exactly as the 8237A does for a verify cycle. Returns None when
     /// masked, not programmed for a verify transfer, or already at terminal count.
-    #[allow(dead_code)] // ponytail: no Machine-level verify wiring yet (see write_byte).
+    #[allow(dead_code)] // Limit: no Machine-level verify wiring yet (see write_byte).
     pub(crate) fn verify(&mut self) -> Option<()> {
         if self.mask || self.transfer_kind != 0 {
             return None;
@@ -372,7 +372,7 @@ impl DmaChip {
     /// reload all match a normal channel. Returns the number of bytes copied, or
     /// None when the controller is disabled, mem-to-mem is not enabled, or
     /// channel 0 is masked.
-    // ponytail: ceiling is a single-shot block copy in one call, not a per-cycle
+    // Limit: ceiling is a single-shot block copy in one call, not a per-cycle
     // DREQ/HRQ/HLDA handshake. The 8237A runs mem-to-mem as a burst that holds
     // the bus until channel-1 TC, so doing it in one pass is faithful to the
     // observable result; cycle-accurate bus arbitration is out of scope.
@@ -432,7 +432,7 @@ impl DmaChip {
 
     /// Write one 16-bit word from the device (device->memory) on local channel
     /// `ci`, latching terminal-count into the status register.
-    #[allow(dead_code)] // ponytail: no Machine-level write wiring yet (see DmaChannel::write_byte).
+    #[allow(dead_code)] // Limit: no Machine-level write wiring yet (see DmaChannel::write_byte).
     fn write_word(&mut self, ci: usize, memory: &mut Memory, word: u16) -> Option<()> {
         if self.controller_disabled() {
             return None;
@@ -446,7 +446,7 @@ impl DmaChip {
 
     /// Run one verify transfer on local channel `ci`, latching terminal-count
     /// into the status register. No memory is touched.
-    #[allow(dead_code)] // ponytail: no Machine-level verify wiring yet (see DmaChannel::write_byte).
+    #[allow(dead_code)] // Limit: no Machine-level verify wiring yet (see DmaChannel::write_byte).
     fn verify(&mut self, ci: usize) -> Option<()> {
         if self.controller_disabled() {
             return None;
@@ -512,7 +512,7 @@ impl DmaController {
 
     /// The page ports the AT decodes but leaves unconnected to any DMA channel.
     /// They behave as plain read/write scratch latches.
-    // ponytail: 0x80 is the AT's POST/manufacturing-test port and the rest of the
+    // Limit: 0x80 is the AT's POST/manufacturing-test port and the rest of the
     // machine already latches it as a passive diagnostic register, so the DMA
     // scratch set deliberately excludes it (0x84-0x8E only). Claiming 0x80 here
     // would shadow that POST latch, which is wired ahead of the passive map.
@@ -638,7 +638,7 @@ impl DmaController {
     /// the master's command register: bit0 enables the path, bit1 holds the
     /// source for a fill, bit2 disables the whole controller. Returns the byte
     /// count copied, or None when not enabled or the controller is disabled.
-    // ponytail: only the master pair carries the mem-to-mem hardware; the slave
+    // Limit: only the master pair carries the mem-to-mem hardware; the slave
     // 8237A never does on the PC/AT, so no slave variant exists.
     pub(crate) fn mem_to_mem(&mut self, memory: &mut Memory) -> Option<usize> {
         self.master.mem_to_mem(memory)

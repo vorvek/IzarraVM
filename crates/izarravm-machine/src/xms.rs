@@ -113,7 +113,7 @@ const MAX_HANDLES: usize = 32;
 
 /// A first-fit allocator over a fixed linear window above the HMA.
 ///
-/// ponytail: this reserves linear ranges over already-flat RAM and never touches
+/// Limit: this reserves linear ranges over already-flat RAM and never touches
 /// a page table, so an EMB at base B is just the bytes at physical B. It uses a
 /// fixed handle table and a coalescing first-fit free list. Good enough to run a
 /// game that allocates a few large blocks. The upgrade path is the memory mapper

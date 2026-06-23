@@ -17,10 +17,10 @@
 //! DRDY|DRQ when a data buffer is ready and DRDY alone when idle. Completion
 //! raises IRQ14 unless nIEN masks it.
 //!
-//! ponytail: one master, no slave. The channel models a single drive 0; a slave
+//! Limit: one master, no slave. The channel models a single drive 0; a slave
 //! select reads not-present. Lift by holding two `AtaDisk`s per channel and
 //! routing on the drive bit.
-//! ponytail: LBA28 only, no LBA48. The capacity caps at 2^28-1 sectors (128 GB),
+//! Limit: LBA28 only, no LBA48. The capacity caps at 2^28-1 sectors (128 GB),
 //! plenty for the era. Lift by decoding the READ/WRITE SECTORS EXT (0x24/0x34)
 //! commands and the high-order LBA bytes.
 
@@ -86,7 +86,7 @@ pub struct AtaDisk {
     error: u8,
     /// INITIALIZE DEVICE PARAMETERS programs the logical sectors-per-track and
     /// heads the host wants to use for CHS translation. Defaults to the derived
-    /// geometry. ponytail: stored but CHS reads use the derived geometry, so a
+    /// geometry. Limit: stored but CHS reads use the derived geometry, so a
     /// host that reprograms a nonstandard translation is not honored; lift by
     /// routing chs_to_lba through these.
     logical_sectors: u8,
@@ -335,7 +335,7 @@ impl AtaDisk {
             0x30 | 0x31 => self.write_sectors(),
             // READ/WRITE MULTIPLE behave like the single-sector PIO forms here:
             // the model has no per-block interrupt, so each sector still drains
-            // through the data port. ponytail: no multi-count block size, lift by
+            // through the data port. Limit: no multi-count block size, lift by
             // honoring the SET MULTIPLE MODE block and interrupting per block.
             0xC4 => self.read_sectors(),
             0xC5 => self.write_sectors(),
@@ -506,7 +506,7 @@ impl AtaDisk {
 /// Build the 256-word (512-byte) IDENTIFY DEVICE block for the derived geometry.
 /// The fields a BIOS and DOS driver read: word 0 general config, words 1/3/6 the
 /// default CHS, words 60-61 the LBA28 capacity, the model string byte-swapped per
-/// ATA. ponytail: only the words a real probe reads are filled; SMART, UDMA, and
+/// ATA. Limit: only the words a real probe reads are filled; SMART, UDMA, and
 /// the 48-bit capacity words stay zero.
 fn identify_block(cylinders: u32, heads: u32, sectors: u32, total_lba: u32) -> Vec<u8> {
     let mut words = [0u16; 256];

@@ -300,7 +300,7 @@ impl Counter {
                 false
             }
             2 => {
-                // ponytail: the datasheet forbids a mode-2 count of 1 (count 2 is
+                // Limit: the datasheet forbids a mode-2 count of 1 (count 2 is
                 // the minimum). A count of 1 never holds OUT low for a clock; we
                 // leave that out-of-spec input to reload here rather than special-
                 // case it, matching how real parts treat the illegal value loosely.
@@ -318,7 +318,7 @@ impl Counter {
                 }
             }
             3 => {
-                // ponytail: a mode-3 count of 1 is illegal per the datasheet (count 2
+                // Limit: a mode-3 count of 1 is illegal per the datasheet (count 2
                 // is the minimum). effective_reload of 1 reaches here and reloads every
                 // clock with no half-period, which is a loose handling of the bad input.
                 //
@@ -368,7 +368,7 @@ impl Counter {
 /// The AT DRAM-refresh divisor: channel 1 runs mode 2 with this count so its OUT
 /// pulses at the refresh rate. A real AT BIOS POST programs 18 (0x12); the exact
 /// period is approximate, the value only needs to make port 0x61 bit 4 toggle.
-// ponytail: 18 is the canonical AT refresh divisor but the precise refresh
+// Limit: 18 is the canonical AT refresh divisor but the precise refresh
 // timing is not modeled to the nanosecond; this only seeds a live heartbeat.
 const REFRESH_DIVISOR: u16 = 18;
 

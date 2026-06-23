@@ -125,7 +125,7 @@ impl Fdc {
     /// and 0x3F7 is shared (the FDC owns its read for the DIR and its write for
     /// the CCR data rate). 0x3F0/0x3F1 are the PS/2 status registers A/B, accepted
     /// but not modeled.
-    // ponytail: 0x3F0/0x3F1 read back 0; a guest probing the PS/2 status-register
+    // Limit: 0x3F0/0x3F1 read back 0; a guest probing the PS/2 status-register
     // A/B bits sees nothing. The upgrade path is to model those two bytes if a
     // guest is found that reads the drive-select / write-protect mirror from them.
     pub(crate) fn owns_port(port: u16) -> bool {
@@ -364,7 +364,7 @@ impl Fdc {
     /// SPECIFY (0x03): load the step-rate / head-load timing. No result phase and
     /// no interrupt, exactly as the chip behaves.
     fn cmd_specify(&mut self) {
-        // ponytail: timing parameters (SRT/HUT/HLT) are accepted and dropped; we
+        // Limit: timing parameters (SRT/HUT/HLT) are accepted and dropped; we
         // do not model head-load or step-rate delays. The upgrade path is to feed
         // these into Floppy::access_duration_secs so a guest-programmed step rate
         // changes the modeled seek time.
@@ -434,7 +434,7 @@ impl Fdc {
 
     /// CONFIGURE (0x13): set FIFO/polling options. Accepted, no result phase.
     fn cmd_configure(&mut self) {
-        // ponytail: the FIFO threshold, EIS (implied seek) and polling-disable
+        // Limit: the FIFO threshold, EIS (implied seek) and polling-disable
         // bits are accepted and ignored. The upgrade path is to honor EIS so a
         // READ/WRITE seeks to the target cylinder first, and to expose the FIFO
         // threshold if a non-DMA transfer path is ever added.
@@ -448,7 +448,7 @@ impl Fdc {
         let cyl = self.present_cyl[drive as usize];
         let st0v = self.make_st0(st0::IC_NORMAL, false, drive, head);
         // Result is ST0, ST1, ST2, then the C/H/R/N address mark of the sector.
-        // ponytail: with no MFM/rotation model READ ID always names sector 1, N=2
+        // Limit: with no MFM/rotation model READ ID always names sector 1, N=2
         // (512-byte sectors). The upgrade path is a real index/rotation counter so
         // the reported sector advances with disk angle.
         self.finish_with_result(vec![st0v, 0, 0, cyl, head, 1, 2]);
@@ -510,7 +510,7 @@ impl Fdc {
         let st0v = self.make_st0(ic, false, req.drive, req.head);
         // ST1 is clean on a normal completion; on failure bit2 ND (no data /
         // sector not found) marks the missing or off-media sector.
-        // ponytail: ST1 bit7 EN (end of cylinder) is never set, so a guest that
+        // Limit: ST1 bit7 EN (end of cylinder) is never set, so a guest that
         // reads to the very last sector without a TC will not see EN. The upgrade
         // path is to flag EN when the walk reaches geom.sectors before TC.
         let st1 = if success { 0x00 } else { 0x04 };

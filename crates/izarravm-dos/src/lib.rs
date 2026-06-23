@@ -2314,7 +2314,7 @@ impl DosKernel {
         let src = usize::from(regs.ds) * 16 + usize::from(regs.si);
         let fcb = usize::from(regs.es) * 16 + usize::from(regs.di);
         // Read a bounded run of the source so the parse cannot wander off; a real
-        // filename plus separators is far under this. ponytail: a fixed 64-byte
+        // filename plus separators is far under this. Limit: a fixed 64-byte
         // window, not a true scan-to-CR; command tails parsed here are short.
         let mut text = Vec::with_capacity(64);
         for i in 0..64 {
@@ -2832,7 +2832,7 @@ impl DosKernel {
             // AH=31h KEEP PROCESS (TSR): terminate with the AL return code but leave
             // the program resident. DX is the resident size in paragraphs; the arena
             // trims the program block to it and flags the block resident so its
-            // paragraphs are not reclaimed. ponytail: the resident image is recorded
+            // paragraphs are not reclaimed. Limit: the resident image is recorded
             // in the arena only (no MCB chain, no INT 21h vector hand-off); the exit
             // path is otherwise identical to AH=4Ch, so the machine frees nothing.
             0x31 => {
@@ -3474,7 +3474,7 @@ impl DosKernel {
                 }
                 Ok(DosAction::Continue)
             }
-            // AH=43h CHMOD: AL=00 get attributes (CX), AL=01 set. ponytail: only the
+            // AH=43h CHMOD: AL=00 get attributes (CX), AL=01 set. Limit: only the
             // read-only bit (0x01) maps to a host permission; hidden/system/archive are
             // not represented, so get reports archive (0x20) for files and 0x10 for dirs.
             0x43 => {
@@ -3550,7 +3550,7 @@ impl DosKernel {
             // AH=44h IOCTL. The subfunction is in AL. The load-bearing one is AL=00h get
             // device info, which programs use to tell a console (bit 7 ISDEV set) from a
             // redirected file (clear) so they can decide whether to buffer output.
-            // ponytail: the character-device info word populates only the console bits
+            // Limit: the character-device info word populates only the console bits
             // that matter (ISDEV + stdin/stdout); NUL/clock/binary/special are not set.
             0x44 => {
                 let handle = regs.bx;
@@ -3659,7 +3659,7 @@ impl DosKernel {
             // AH=59h GET EXTENDED ERROR: report the last DOS error. AX = the saved
             // code, BH = error class, BL = suggested action, CH = locus. We use one
             // fixed mapping for every code: class 0x0D (unknown/other), action 0x05
-            // (immediate abort), locus 0x01 (unknown). ponytail: real DOS derives
+            // (immediate abort), locus 0x01 (unknown). Limit: real DOS derives
             // class/action/locus per code from a table; in-scope callers only read
             // AX, so the coarse mapping suffices.
             0x59 => {
@@ -3681,7 +3681,7 @@ impl DosKernel {
                 };
                 // Try a sequence of names until one does not yet exist. The host
                 // create-exclusive open is the real guard; this loop just picks a
-                // free candidate. ponytail: a fixed 0..4096 sweep, not DOS's clock
+                // free candidate. Limit: a fixed 0..4096 sweep, not DOS's clock
                 // seed; ample for the temp files a single program run creates.
                 let mut created = None;
                 for n in 0u16..4096 {
@@ -3961,7 +3961,7 @@ impl CriticalErrorResponse {
 /// The far pointer (segment, offset) a PSP holds for one of the saved INT 22h/23h/
 /// 24h vectors. `psp_off` is 0x0A terminate, 0x0E Ctrl-C, 0x12 critical-error. The
 /// vector is stored offset-then-segment, the IVT layout DOS copies it from.
-// ponytail: the INT 24h vector is stored in the PSP and the IVT, and
+// Limit: the INT 24h vector is stored in the PSP and the IVT, and
 // CriticalErrorResponse decodes a handler's reply, but nothing calls the handler:
 // the HLE file path goes straight to the host filesystem, so no failing block
 // device exists to raise a critical error. The far-call into the guest handler is
@@ -4005,7 +4005,7 @@ fn build_env_block_with_argv0(entries: &[(&str, &str)], argv0: &str) -> Vec<u8> 
     block
 }
 
-/// The argv0 path placed in the environment trailer. ponytail: the loader does
+/// The argv0 path placed in the environment trailer. Limit: the loader does
 /// not know the guest program's path, so a single plausible default stands in;
 /// in-scope callers read the env strings, not this trailer.
 pub const DEFAULT_ARGV0: &str = "C:\\PROGRAM.EXE";

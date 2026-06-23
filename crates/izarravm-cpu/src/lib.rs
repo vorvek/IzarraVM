@@ -2196,7 +2196,7 @@ impl Cpu386 {
             });
         }
         match opcode {
-            // ponytail: MMX is not gated to 586+; a throttled 386/486 GSW mode would
+            // Limit: MMX is not gated to 586+; a throttled 386/486 GSW mode would
             // wrongly accept it. Gate it with the others if that fidelity gap matters.
             op if is_mmx_two_byte(op) => self.execute_mmx(bus, op, prefixes, address_size),
             0x00 => self.execute_descriptor_segment_group(bus, prefixes, address_size, opcode),
@@ -2288,7 +2288,7 @@ impl Cpu386 {
             0xaa => {
                 // RSM: return from System Management Mode. No SMI source is modeled, so the
                 // processor is never in SMM and RSM outside SMM is #UD, as on real hardware.
-                // ponytail: SMM entry is not implemented; RSM is therefore always invalid.
+                // Limit: SMM entry is not implemented; RSM is therefore always invalid.
                 Err(InternalFault::Exception {
                     vector: 6,
                     error_code: None,
@@ -4132,7 +4132,7 @@ impl Cpu386 {
 
     /// 386 hardware task switch. Saves the outgoing task's state into the current TSS,
     /// loads the incoming one, juggles the busy bits, and (for a CALL) links back to
-    /// the caller and sets NT. ponytail: TSS memory is accessed unpaged, and the 286
+    /// the caller and sets NT. Limit: TSS memory is accessed unpaged, and the 286
     /// (short) TSS form is not modeled.
     fn task_switch<B: CpuBus>(
         &mut self,
@@ -4996,7 +4996,7 @@ fn fpu_arith(op: u8, a: f64, b: f64) -> f64 {
     }
 }
 
-/// FIST/FISTP rounding. ponytail: round-to-nearest-even only; the control-word RC
+/// FIST/FISTP rounding. Limit: round-to-nearest-even only; the control-word RC
 /// field is not yet honored (it almost always is round-to-nearest anyway).
 fn fpu_round_to_i64(value: f64) -> i64 {
     value.round_ties_even() as i64
@@ -5359,7 +5359,7 @@ impl Cpu386 {
 
     /// FCOMI/FUCOMI: set the integer EFLAGS ZF/PF/CF from comparing ST(0) with ST(i), the
     /// way SAHF would after FNSTSW. Unordered (a NaN operand) sets all three. OF/SF/AF are
-    /// cleared. ponytail: FCOMI's SNaN-vs-QNaN #IA distinction is not modeled, so FCOMI and
+    /// cleared. Limit: FCOMI's SNaN-vs-QNaN #IA distinction is not modeled, so FCOMI and
     /// FUCOMI behave identically here.
     fn fpu_compare_set_eflags(&mut self, a: f64, b: f64) {
         let (zf, pf, cf) = if a.is_nan() || b.is_nan() {
@@ -5380,7 +5380,7 @@ impl Cpu386 {
     }
 
     /// Set the IE (invalid) and ZE (divide-by-zero) status flags after an arithmetic
-    /// op. ponytail: only these two classes are detected from the f64 result; overflow,
+    /// op. Limit: only these two classes are detected from the f64 result; overflow,
     /// underflow, denormal, and precision are not (f64's wider range rarely trips them).
     fn fpu_record_exceptions(&mut self, op: u8, a: f64, b: f64, result: f64) {
         if matches!(op, 6 | 7) {
@@ -5598,7 +5598,7 @@ impl Cpu386 {
     }
 
     fn fpu_partial_remainder(&mut self, round_nearest: bool) {
-        // ponytail: computes the full remainder in one step and reports reduction
+        // Limit: computes the full remainder in one step and reports reduction
         // complete (C2=0). Real hardware reduces partially and may take several FPREM
         // iterations for large quotients; FPU exceptions are not modeled yet.
         let dividend = self.fpu.get(0);
@@ -5678,7 +5678,7 @@ impl Cpu386 {
                 Ok(clocks(3))
             }
             4 | 5 => {
-                // FUCOM / FUCOMP. ponytail: treated like FCOM/FCOMP; the unordered-vs-
+                // FUCOM / FUCOMP. Limit: treated like FCOM/FCOMP; the unordered-vs-
                 // signaling NaN distinction is not yet modeled (no exceptions).
                 let a = self.fpu.get(0);
                 let b = self.fpu.get(i);
@@ -5933,7 +5933,7 @@ impl Cpu386 {
             let biased = ((bits >> 52) & 0x7ff) as i32;
             let fraction = bits & 0x000f_ffff_ffff_ffff;
             if biased == 0 {
-                // Subnormal f64. ponytail: rare path normalized by scaling, not exact bits.
+                // Subnormal f64. Limit: rare path normalized by scaling, not exact bits.
                 let e = value.abs().log2().floor() as i32;
                 let m = (value.abs() / 2.0f64.powi(e) * 2.0f64.powi(63)) as u64;
                 (m, (e + 16383) as u16)
@@ -5964,7 +5964,7 @@ impl Cpu386 {
         offset: u32,
         operand_size: OperandSize,
     ) -> ExecResult<u32> {
-        // ponytail: the instruction and data pointers (the last four env slots) are
+        // Limit: the instruction and data pointers (the last four env slots) are
         // written as zero; the core does not track the last FPU instruction or
         // operand address yet. Control/status/tag are exact. Returns the env size.
         let control = u32::from(self.fpu.control);
@@ -6020,7 +6020,7 @@ impl Cpu386 {
         offset: u32,
         operand_size: OperandSize,
     ) -> ExecResult<()> {
-        // ponytail: registers are saved in stack order ST(0)..ST(7); hardware uses
+        // Limit: registers are saved in stack order ST(0)..ST(7); hardware uses
         // physical order R0..R7. This round-trips with fpu_restore_state, which is the
         // common use; software that hand-parses the image would see a different order.
         let env = self.fpu_store_environment(bus, segment, offset, operand_size)?;
@@ -6592,7 +6592,7 @@ impl Cpu386 {
         memory: MemoryOperand,
         table: DescriptorTable,
     ) -> ExecResult<()> {
-        // ponytail: the 16-bit-operand quirk (base masked to 24 bits) is not modeled;
+        // Limit: the 16-bit-operand quirk (base masked to 24 bits) is not modeled;
         // the full 32-bit base is always stored.
         self.write_memory_sized(
             bus,

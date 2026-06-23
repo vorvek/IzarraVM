@@ -1159,7 +1159,7 @@ impl Vga {
     fn render_scanline(&mut self, counter_line: u32) {
         let width = self.raster_width() as usize;
         let pixels = if counter_line < self.crtc.vdisp_end {
-            // ponytail: the Attribute Palette Address Source (3C0 index bit 5) is decoded
+            // Limit: the Attribute Palette Address Source (3C0 index bit 5) is decoded
             // and read back (attr.pas), but the documented "display blanks to black while
             // bit 5 is clear during palette programming" effect is not enforced at render
             // time. It conflicts with the raster suite's use of ATC palette writes for
@@ -1362,7 +1362,7 @@ impl Vga {
     pub fn read_status0(&mut self) -> u8 {
         self.catch_up(); // a 3C2 read catches the raster up, like 3DA
         let mut status = 0u8;
-        // ponytail: fixed colour-monitor sense. The DAC comparator path is not
+        // Limit: fixed colour-monitor sense. The DAC comparator path is not
         // modeled, so bit 4 always reports the wired colour display.
         status |= 0x10;
         if beam_vretrace(&self.crtc, self.beam) {
@@ -1511,7 +1511,7 @@ impl Vga {
 
     fn write_seq(&mut self, index: u8, value: u8) {
         match index {
-            // ponytail: store the Reset register (bit 0 async, bit 1 sync) for
+            // Limit: store the Reset register (bit 0 async, bit 1 sync) for
             // read-back only. No datapath gate: a real reset halts the sequencer
             // dot clock, which the cycle-coupled beam model does not act on.
             0x00 => self.seq.reset = value,
@@ -1550,7 +1550,7 @@ impl Vga {
                 self.gc.write_mode = value & 3;
                 self.gc.read_mode = (value >> 3) & 1;
             }
-            // ponytail: Miscellaneous Graphics (06h) decode + read-back only. The
+            // Limit: Miscellaneous Graphics (06h) decode + read-back only. The
             // bus still routes A0000/B8000 by its own fixed map, so the selected
             // aperture (gc.aperture()) is exposed but not yet consulted by the
             // machine-crate memory routing; that is a separate lib.rs follow-up.
@@ -4460,7 +4460,7 @@ mod tests {
     fn palette_address_source_tracks_the_3c0_index_bit5() {
         // The 3C0 index bit 5 (Palette Address Source) is decoded and read back. It powers
         // up set (the mode-set default), clears on an index write with bit 5 clear, and
-        // sets again on an index write with bit 5 set. ponytail: the render-time blank the
+        // sets again on an index write with bit 5 set. Limit: the render-time blank the
         // bit drives on real hardware is not enforced (see render_scanline).
         let mut vga = Vga::default();
         assert!(vga.attr.pas, "PAS powers up set");

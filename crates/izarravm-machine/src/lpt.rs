@@ -100,7 +100,7 @@ impl Lpt {
                     self.output.push(self.data);
                     // The -ACK pulse after the latched byte raises the port's IRQ
                     // when the control register has IRQ-enable set.
-                    // ponytail: instant printer, no real busy/ack timing window.
+                    // Limit: instant printer, no real busy/ack timing window.
                     if value & CONTROL_IRQ_ENABLE != 0 {
                         self.irq_armed = true;
                     }

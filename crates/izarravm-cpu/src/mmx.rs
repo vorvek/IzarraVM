@@ -2,7 +2,7 @@
 //! reads the operands and the x87-aliased register file; everything numeric
 //! lives here so it is testable on its own.
 //!
-//! ponytail: MMX registers are modeled as a separate [u64; 8] in the x87 state.
+//! Limit: MMX registers are modeled as a separate [u64; 8] in the x87 state.
 //! Real silicon aliases MM0-7 onto the x87 register mantissas. The visible tag
 //! effect is modeled (writing MMX marks the tags valid, EMMS marks them empty),
 //! but reading an x87 register as a float after MMX use without EMMS is not

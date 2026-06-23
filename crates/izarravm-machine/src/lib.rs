@@ -1409,7 +1409,7 @@ impl Machine {
 
     /// INT 10h AH=1Bh. Writes the 64-byte video state-information block at ES:DI with the
     /// live mode, geometry, and display-combination fields, plus a static functionality
-    /// table pointer. ponytail: only the commonly-read fields are populated and the static
+    /// table pointer. Limit: only the commonly-read fields are populated and the static
     /// table is pointed at the video BIOS segment rather than a fully built table; the
     /// VGA-present check that programs run only tests AL == 0x1B.
     fn int10_state_info(&mut self) {
@@ -1448,7 +1448,7 @@ impl Machine {
     /// existing pixel), CX = column, DX = row. In mode 13h the pixel is the byte at
     /// `row*320 + col` in the A0000 framebuffer; the chain-4 datapath routes that
     /// linear offset to the right plane the same way the CPU bus write does.
-    /// ponytail: only the linear 320x200 mode 13h is handled; the 16-colour planar
+    /// Limit: only the linear 320x200 mode 13h is handled; the 16-colour planar
     /// modes (0Dh/0Eh/10h/12h) need a read-modify-write through the bit-mask and
     /// map-mask, which is not wired here, so a pixel write in those modes is ignored.
     /// In text mode the call does nothing, matching a real BIOS.
@@ -1554,7 +1554,7 @@ impl Machine {
     /// 64-byte blocks (BX), AL=01 saves the modeled state into ES:BX, AL=02 restores
     /// it. CX is the requested-state bitmap (bit 0 hardware, bit 1 BDA, bit 2 DAC).
     /// Saves and restores the full BDA video state (0040:0049-0040:00A8, 96 bytes,
-    /// two 64-byte blocks) per RBIL. ponytail: the hardware-register and DAC-palette
+    /// two 64-byte blocks) per RBIL. Limit: the hardware-register and DAC-palette
     /// state (CX bits 0 and 2) are not captured, so a save/restore round-trips the
     /// BDA block, not the full VGA hardware. AL is set to 0x1C so callers detect the
     /// service.
@@ -2021,7 +2021,7 @@ impl Machine {
             }
             // C207 set device handler: store the ES:BX far pointer the guest is
             // installing into the EBDA (offset word then segment word) and report
-            // success. ES=0:BX=0 deregisters. ponytail: the handler far-pointer is
+            // success. ES=0:BX=0 deregisters. Limit: the handler far-pointer is
             // stored but never called: invocation needs the outbound host->guest
             // far-call trampoline plus a mouse-packet source, and no producer is
             // wired, so this is deferred until a producer exists. C208/C209 (the
@@ -2233,7 +2233,7 @@ impl Machine {
             // AH=06h/07h set/cancel alarm: no alarm hardware modeled, accept and ignore.
             // AH=08h/0Ch set power-on alarm/date, AH=0Dh reset, AH=0Fh initialize RTC: all
             // documented as succeeding, and the host-driven clock makes them no-ops.
-            // ponytail: power-management and alarm hardware are not modeled; these return
+            // Limit: power-management and alarm hardware are not modeled; these return
             // success without persisting state. Read-back alarm calls (AH=09h/0Eh) keep the
             // default carry since there is no alarm to report.
             0x06 | 0x07 | 0x08 | 0x0C | 0x0D | 0x0F => self.set_int_frame_carry(false),
@@ -2262,7 +2262,7 @@ impl Machine {
     /// as bootable and sector 0 is loaded with no 0xAA55 signature check, so a guest
     /// re-invoking INT 19h gets the same outcome the ROM gives at power-on.
     ///
-    /// ponytail: the floppy boot copies sector 0 and jumps; it does not retry on a
+    /// Limit: the floppy boot copies sector 0 and jumps; it does not retry on a
     /// read error. C: boots the bundled Toka-DOS through the existing HLE record, not
     /// an arbitrary MBR. To lift this, read the C: partition table and load a
     /// guest-supplied MBR the same way the floppy path loads its boot sector.
@@ -2950,7 +2950,7 @@ impl Machine {
         // endpoint must fit (an EMS region within the handle's pages, a
         // conventional region below the 1 MiB line). This also caps the buffer
         // allocation below, so a guest-supplied length cannot exhaust host memory.
-        // ponytail: the 92h source-overwritten and 97h same-handle-exchange-overlap
+        // Limit: the 92h source-overwritten and 97h same-handle-exchange-overlap
         // warnings are not emitted; the buffered copy is overlap-safe, so a move
         // still completes correctly, only without the advisory code.
         if length > 0x10_0000 {
@@ -3393,7 +3393,7 @@ impl Machine {
     /// INT 25h ABSOLUTE DISK READ (DOS). AL=drive (0=A:), CX=sector count, DX=first
     /// logical (LBA) sector, DS:BX=buffer. Classic form only; the >32 MB packet form
     /// (CX=0xFFFF, DS:BX -> a parameter block) is out of scope. On success AX=0 and
-    /// CF clear; on error CF set and AX=0x40xx. ponytail: the real INT 25h/26h leave
+    /// CF clear; on error CF set and AX=0x40xx. Limit: the real INT 25h/26h leave
     /// the original FLAGS on the stack for the caller to discard with its own POPF,
     /// but this HLE returns through the standard IRET stub, so the result CF is
     /// written into the IRET FLAGS image (set_int_frame_carry) like every other
@@ -3565,7 +3565,7 @@ impl Machine {
     /// head, ES:BX = a list of 4-byte address-field records (C,H,R,N). Only floppy
     /// A: is backed; the records describe the standard sequential layout this drive
     /// already uses, so the cylinder/head address is taken from CH/DH and every
-    /// sector of that track is filled with the DOS format filler 0xF6. ponytail:
+    /// sector of that track is filled with the DOS format filler 0xF6. Limit:
     /// the address-field records are not parsed for nonstandard interleave or sector
     /// sizes; the in-memory image is a fixed-geometry linear array, so a track is
     /// formatted by zero-fill of its sectors at the mounted geometry.
@@ -3990,7 +3990,7 @@ impl Machine {
     /// EDD AH=42h/43h extended read/write. The Disk Address Packet at DS:SI holds
     /// the block count and the 64-bit starting LBA; the transfer buffer is a
     /// seg:off far pointer inside the packet. Only the low 32 bits of the LBA are
-    /// honored. ponytail: the 64-bit-flat-buffer form (DAP bytes 16-23 when the
+    /// honored. Limit: the 64-bit-flat-buffer form (DAP bytes 16-23 when the
     /// seg:off is 0xFFFF:0xFFFF) is not decoded; lift by reading the wide pointer.
     fn int13_edd_transfer(&mut self, ah: u8) {
         let ds = self.cpu.registers.segment(SegmentIndex::Ds).base;
@@ -4140,7 +4140,7 @@ impl Machine {
     /// INT 10h AH=10h: set/get the ATC palette registers and the DAC. Covers the
     /// set/get forms for the attribute palette (00/01/02/07/08/09) and the DAC
     /// (10/12/13/15/17/1A/1B). Register conventions per RBIL (INT 10/AH=10h).
-    /// ponytail: the attribute-controller mode bits behind a few sub-functions
+    /// Limit: the attribute-controller mode bits behind a few sub-functions
     /// (AL=03 blink/intensity toggle, AL=13h color-page select) have no public
     /// setter on the video core, so they are accepted as no-ops with CF clear; the
     /// DAC paging state (AL=1Ah) reports the power-up default (mode 0, page 0).
@@ -4168,7 +4168,7 @@ impl Machine {
                 }
                 self.video.set_overscan(block[16]);
             }
-            // AL=03: toggle intensify/blink (BL bit0). ponytail: the attribute mode
+            // AL=03: toggle intensify/blink (BL bit0). Limit: the attribute mode
             // control bit 3 has no public setter on the video core, so this is a
             // no-op; CF stays clear so the caller sees the call succeed.
             0x03 => {}
@@ -4203,7 +4203,7 @@ impl Machine {
                 self.video.set_dac_block(bx as u8, &entries);
             }
             // AL=13: select color page / paging mode (BL=0 select mode in BH, BL=1
-            // select page in BH). ponytail: the attribute color-select datapath has
+            // select page in BH). Limit: the attribute color-select datapath has
             // no public setter, so this is a no-op; CF stays clear.
             0x13 => {}
             // AL=15: get individual DAC register. BX=index -> DH=R, CH=G, CL=B.
@@ -4221,7 +4221,7 @@ impl Machine {
                 self.write_guest_block(es_dx, &bytes);
             }
             // AL=1A: read DAC page state -> BL=paging mode, BH=current page.
-            // ponytail: color paging is not modeled, so the power-up default is
+            // Limit: color paging is not modeled, so the power-up default is
             // reported (mode 0 = four pages of 64, page 0).
             0x1A => {
                 let ebx = self.cpu.registers.ebx() & !0xFFFF; // BL=0, BH=0
@@ -4809,7 +4809,7 @@ impl Machine {
 
     /// Set where the unit tester's Snapshot command writes PPM frames. `None`
     /// (the default) makes Snapshot a no-op. Each Snapshot overwrites this path.
-    // ponytail: single path, overwrite. Add an index suffix if a test ever needs
+    // Limit: single path, overwrite. Add an index suffix if a test ever needs
     // to capture multiple frames in one run.
     pub fn set_test_snapshot_path(&mut self, path: Option<std::path::PathBuf>) {
         self.test_snapshot_path = path;
@@ -6466,7 +6466,7 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
 /// INT 70h does before chaining to any user routine. A guest that masks IRQ8 or
 /// installs its own handler simply overwrites this vector.
 ///
-/// ponytail: the real BIOS INT 70h also tests the RTC wait flag (0040:00A0) and
+/// Limit: the real BIOS INT 70h also tests the RTC wait flag (0040:00A0) and
 /// signals the INT 15h AH=83h/86h event-wait completion at 0040:0098. No wait
 /// flag is modeled here, so the stub only acks and EOIs; wire those BDA bytes and
 /// an INT 15h AH=83h path to lift it.
@@ -6891,7 +6891,7 @@ fn vga_planar_offset(address: u32, width: usize) -> Option<usize> {
 /// The aperture's `base`/`length` come from `Vga::gfx_aperture`. The plane window
 /// is 64 KB, so the offset is `address - base` capped to that window; a 128 KB
 /// aperture is clamped to the low 64 KB the datapath addresses.
-// ponytail: the power-on / map-select-00 aperture (A0000, 128 KB) is left to the
+// Limit: the power-on / map-select-00 aperture (A0000, 128 KB) is left to the
 // fixed A0000 64 KB routing, so the default behavior of every mode is byte-for-
 // byte unchanged. Only a guest that programs a smaller, moved window (64 KB at
 // A0000, or 32 KB at B0000 / B8000) is routed here. Power-on and an explicit
