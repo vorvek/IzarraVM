@@ -3453,8 +3453,9 @@ impl DosKernel {
                 _ => Ok(DosAction::Continue),
             },
             // AH=5Ah CREATE TEMPORARY FILE: DS:DX points at an ASCIIZ directory path
-            // ending in '\'. Generate a unique 8.3 name, append it (with its NUL) so
-            // the caller can read back the full path, then create it create-exclusive.
+            // plus 13 zero bytes. Generate a DOS 6-style 8-letter name, append it
+            // (with its NUL) so the caller can read back the full path, then create
+            // it create-exclusive.
             // CF=0 + AX=handle on success; on a name collision after a bounded number
             // of tries, or a host error, CF=1 with the DOS code.
             0x5a => {
@@ -3466,13 +3467,15 @@ impl DosKernel {
                     set_dos_error(regs, 0x04); // too many open files
                     return Ok(DosAction::Continue);
                 };
+                let prefix = temp_file_prefix(&dir);
+                let seed = temp_file_seed();
                 // Try a sequence of names until one does not yet exist. The host
                 // create-exclusive open is the real guard; this loop just picks a
-                // free candidate. Limit: a fixed 0..4096 sweep, not DOS's clock
-                // seed; ample for the temp files a single program run creates.
+                // free candidate near the time-derived seed.
                 let mut created = None;
-                for n in 0u16..4096 {
-                    let candidate = format!("{dir}{n:04X}.$$$");
+                for offset in 0u32..=0xffff {
+                    let generated = temp_file_name(seed.wrapping_add(offset));
+                    let candidate = format!("{prefix}{generated}");
                     let path = match self.resolve_name(&candidate) {
                         Ok(path) => path,
                         Err(code) => {
@@ -4072,6 +4075,32 @@ fn is_too_many_open_files_error(err: &std::io::Error) -> bool {
         Some(23 | 24) => true,
         _ => false,
     }
+}
+
+fn temp_file_prefix(dir: &str) -> String {
+    if dir.is_empty() {
+        r"C:\".to_string()
+    } else if dir.ends_with('\\') || dir.ends_with('/') {
+        dir.to_string()
+    } else {
+        format!(r"{dir}\")
+    }
+}
+
+fn temp_file_seed() -> u32 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    (now.as_secs() as u32).rotate_left(16) ^ now.subsec_nanos()
+}
+
+fn temp_file_name(seed: u32) -> String {
+    let mut name = String::with_capacity(8);
+    for index in (0..8).rev() {
+        let nibble = ((seed >> (index * 4)) & 0x0f) as u8;
+        name.push(char::from(b'A' + nibble));
+    }
+    name
 }
 
 /// Whether a byte is legal in a DOS 8.3 filename component: letters, digits, and a
@@ -10993,11 +11022,7 @@ mod tests {
         assert!(!err.cf, "the query itself clears carry");
     }
 
-    #[test]
-    fn ah5a_creates_a_unique_temp_file_and_appends_the_name() {
-        // DS:DX points at the directory path "C:\" (ending in '\'). The handler
-        // appends a generated name and creates it create-exclusive.
-        let (mut kernel, mut mem, _dir) = kernel_with_drive(&[], "C:\\");
+    fn create_temp(kernel: &mut DosKernel, mem: &mut Memory) -> DosRegs {
         let mut regs = DosRegs {
             ax: 0x5a00,
             cx: 0,
@@ -11005,25 +11030,66 @@ mod tests {
             dx: 0x0200,
             ..DosRegs::default()
         };
-        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
-        assert!(!regs.cf, "create temp failed: ax={:#06x}", regs.ax);
-        assert!(regs.ax >= 5);
-        // Read the full ASCIIZ path back from DS:DX: it starts with "C:\" and the
-        // appended name names a file that now exists on the host.
-        let base = 0x0100usize * 16 + 0x0200;
-        let mut path = String::new();
+        kernel.dispatch(0x21, &mut regs, mem).unwrap();
+        regs
+    }
+
+    fn read_guest_asciiz(mem: &Memory, seg: u16, off: u16) -> String {
+        let base = usize::from(seg) * 16 + usize::from(off);
+        let mut out = String::new();
         let mut i = 0;
         loop {
             let byte = mem.read_u8(base + i).unwrap();
             if byte == 0 {
                 break;
             }
-            path.push(byte as char);
+            out.push(byte as char);
             i += 1;
         }
+        out
+    }
+
+    fn assert_temp_leaf_shape(name: &str) {
+        assert_eq!(name.len(), 8, "temp leaf was {name}");
+        assert!(
+            name.bytes().all(|byte| (b'A'..=b'P').contains(&byte)),
+            "temp leaf was {name}"
+        );
+    }
+
+    #[test]
+    fn ah5a_creates_a_unique_temp_file_and_appends_the_name() {
+        // DS:DX points at the directory path "C:\" (ending in '\'). The handler
+        // appends a generated name and creates it create-exclusive.
+        let (mut kernel, mut mem, dir) = kernel_with_drive(&[], "C:\\");
+        let regs = create_temp(&mut kernel, &mut mem);
+        assert!(!regs.cf, "create temp failed: ax={:#06x}", regs.ax);
+        assert!(regs.ax >= 5);
+        // Read the full ASCIIZ path back from DS:DX: it starts with "C:\" and the
+        // appended name names a file that now exists on the host.
+        let path = read_guest_asciiz(&mem, 0x0100, 0x0200);
         assert!(path.starts_with("C:\\"), "path was {path}");
         let host_name = &path[3..]; // strip "C:\"
-        assert!(_dir.path().join(host_name).exists(), "missing {host_name}");
+        assert_temp_leaf_shape(host_name);
+        assert!(dir.path().join(host_name).exists(), "missing {host_name}");
+    }
+
+    #[test]
+    fn ah5a_inserts_a_missing_trailing_backslash() {
+        let (mut kernel, mut mem, dir) = kernel_with_drive(&[], r"C:\TMP");
+        std::fs::create_dir(dir.path().join("TMP")).unwrap();
+
+        let regs = create_temp(&mut kernel, &mut mem);
+
+        assert!(!regs.cf, "create temp failed: ax={:#06x}", regs.ax);
+        let path = read_guest_asciiz(&mem, 0x0100, 0x0200);
+        assert!(path.starts_with(r"C:\TMP\"), "path was {path}");
+        let host_name = &path[r"C:\TMP\".len()..];
+        assert_temp_leaf_shape(host_name);
+        assert!(
+            dir.path().join("TMP").join(host_name).exists(),
+            "missing {host_name}"
+        );
     }
 
     #[test]
