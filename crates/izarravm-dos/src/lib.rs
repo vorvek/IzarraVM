@@ -9,9 +9,10 @@ mod memory;
 
 use memory::{
     ARENA_TOP, Arena, ResizeError, SDA_ALWAYS_SWAPPED_LEN, SDA_IN_DOS_SWAPPED_LEN, SdaSnapshot,
-    SftHostFileEntry, UmbArena, allocate_strategy, free_routed, is_valid_alloc_strategy,
-    release_umb, request_umb, resize_routed, resize_umb, set_umb_region, write_child_program_mcb,
-    write_env_mcb, write_free_mcb_to_cap, write_sda, write_sysvars,
+    SftHostFileEntry, UmbArena, allocate_strategy, free_routed, free_umb_blocks_owned_by,
+    is_valid_alloc_strategy, release_umb, request_umb, resize_routed, resize_umb, set_umb_owner,
+    set_umb_region, write_child_program_mcb, write_env_mcb, write_free_mcb_to_cap, write_sda,
+    write_sysvars,
 };
 #[cfg(test)]
 use memory::{NO_NAME, RamMcb, read_mcb_chain, write_mcb_header};
@@ -712,14 +713,18 @@ impl DosKernel {
         paras: u16,
         mem: &mut Memory,
     ) -> Result<Result<u16, u16>, DosError> {
-        allocate_strategy(
+        let result = allocate_strategy(
             &mut self.arena,
             self.umb,
             self.umb_link,
             self.alloc_strategy,
             paras,
             mem,
-        )
+        )?;
+        if let Ok(seg) = result {
+            set_umb_owner(self.umb, seg, self.arena.psp_seg, mem)?;
+        }
+        Ok(result)
     }
 
     /// AH=49h free routed to the arena that owns `seg`: the upper-memory arena when
@@ -1186,23 +1191,20 @@ impl DosKernel {
     /// and record the exit code/type for AH=4Dh. Called by the machine when it
     /// pops a parent frame.
     pub fn finish_exec(&mut self, code: u8, mem: &mut Memory) -> Result<(), DosError> {
-        // The exiting child's blocks (env + program, above the parent free base) are
-        // freed back to the parent, UNLESS the child itself kept resident (a TSR), in
-        // which case keep_resident already left a correct free tail above its block.
-        //
-        // Upper-memory (UMB) blocks a child allocated with a high strategy are NOT
-        // reclaimed here, so they leak past the child (marked): the conventional
-        // reclaim is positional (it resets the parent free tail), and AH=48h blocks
-        // carry their own segment as the owner rather than the PSP, so there is no
-        // owner key to sweep the upper arena by. Real DOS frees a process's upper
-        // memory on exit; an owner-keyed sweep waits on the owner=PSP convention.
-        // In practice high allocators are TSRs that stay resident and keep theirs.
+        // The exiting child's conventional blocks (env + program, above the parent
+        // free base) are freed back to the parent, UNLESS the child itself kept
+        // resident (a TSR), in which case keep_resident already left a correct free
+        // tail above its block. AH=48h blocks allocated from the UMB arena are
+        // owner-tagged with the child's PSP and are swept on normal exit too; TSRs
+        // keep their UMBs because the resident program may still use them.
         let child_resident = self.arena.resident;
+        let child_psp = self.arena.psp_seg;
         if let Some(parent) = self.program_stack.pop() {
             self.arena = parent.arena;
             self.dta = parent.dta;
             self.find_searches = parent.find_searches;
             if !child_resident {
+                free_umb_blocks_owned_by(self.umb, child_psp, mem)?;
                 // A resident TSR carved by this child or a descendant sits above the
                 // freed region; cap the restored free block below the lowest such
                 // resident base so the TSR is preserved (the EXEC chain unwinds past
@@ -4896,8 +4898,9 @@ mod tests {
             "the block lands in the UMB window, got {:#06x}",
             regs.ax
         );
-        // The upper arena now owns the block; the conventional free tail is intact.
-        assert!(kernel.umb_chain(&mem).iter().any(|m| m.owner == regs.ax));
+        // AH=48h UMBs are owner-tagged with the current PSP so EXEC exit can sweep
+        // a child's upper-memory blocks. The conventional free tail is intact.
+        assert!(kernel.umb_chain(&mem).iter().any(|m| m.owner == 0x0100));
         assert_eq!(kernel.arena.free_base(&mem), 0x1100);
     }
 
@@ -4955,7 +4958,7 @@ mod tests {
             kernel
                 .umb_chain(&mem)
                 .iter()
-                .any(|m| m.owner == seg && m.size == 0x0400)
+                .any(|m| m.owner == 0x0100 && m.size == 0x0400)
         );
         // Free it: LIFO reclaim folds it back into the upper free tail.
         let mut regs = DosRegs {
@@ -9602,6 +9605,37 @@ mod tests {
             kernel.arena.free_base(&mem) > child_psp,
             "the resident child block was not reclaimed"
         );
+    }
+
+    #[test]
+    fn finish_exec_reclaims_child_upper_memory_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CHILD.COM"), [0xcdu8, 0x20]).unwrap();
+        let (mut kernel, mut mem) = exec_kernel(dir.path());
+        kernel.set_umb_region(0xc800, 0x0040, &mut mem).unwrap();
+        kernel.set_dos_umb(true);
+        kernel.set_umb_link(true);
+        set_alloc_strategy(&mut kernel, &mut mem, 0x0040);
+
+        place_exec_inputs(&mut mem, "C:\\CHILD.COM", 0);
+        let regs = exec_al0(&mut kernel, &mut mem);
+        assert!(!regs.cf);
+        assert_eq!(kernel.arena.psp_seg, 0x0203);
+
+        let child_umb = dos_alloc(&mut kernel, &mut mem, 0x0010);
+        assert!(!child_umb.cf);
+        assert!(
+            (0xc801..0xc840).contains(&child_umb.ax),
+            "child allocation came from the UMB arena"
+        );
+
+        kernel.finish_exec(0, &mut mem).unwrap();
+
+        let full_pool = match kernel.request_umb(0x003f, &mut mem).unwrap() {
+            Ok(seg) => seg,
+            Err(largest) => panic!("child UMB leaked; largest free UMB was {largest:#06x}"),
+        };
+        assert_eq!(full_pool, 0xc801);
     }
 
     #[test]
