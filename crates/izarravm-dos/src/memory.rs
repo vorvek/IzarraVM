@@ -32,14 +32,15 @@ const DEFAULT_LASTDRIVE: u8 = 5;
 
 /// AH=52h publishes the SFT and Current Directory Structure (CDS) array from the
 /// same reserved paragraph as SysVars. Keep as many SFT slots as fit before the
-/// CDS array and below the first program PSP at 0x0100:0000. The default FILES=40
-/// table plus the default CDS array is slightly too large for this low-memory
-/// scratch paragraph, so entries that do not fit are left blank until the DOS data
-/// segment is given a larger owned block.
+/// CDS array and below the first MCB header. The default FILES=40 table plus the
+/// default CDS array is slightly too large for this low-memory scratch paragraph,
+/// so entries that do not fit are left blank until the DOS data segment is given a
+/// larger owned block.
 const SFT_TABLE_OFF: usize = 0x50;
 const SFT_HEADER_LEN: usize = 0x06;
 const SFT_ENTRY_LEN: usize = 0x3b;
 const STANDARD_SFT_SLOTS: usize = 5;
+const DPB_LEN: usize = 0x21;
 const CDS_ENTRY_LEN: usize = 0x58;
 
 /// A live host-file handle projected into the DOS System File Table.
@@ -512,16 +513,20 @@ pub(super) fn write_sysvars(
     host_files: &[SftHostFileEntry],
 ) -> Result<(u16, u16), DosError> {
     let base = usize::from(SYSVARS_SEG) * 16;
+    let sysvars_limit = usize::from(first_mcb) * 16;
     let drive_count = lastdrive.unwrap_or(DEFAULT_LASTDRIVE).min(26);
     let sft_linear = base + 2 + SFT_TABLE_OFF;
     let cds_bytes = usize::from(drive_count) * CDS_ENTRY_LEN;
-    let max_sft_slots = (0x1000usize.saturating_sub(sft_linear + SFT_HEADER_LEN + cds_bytes)
+    let max_sft_slots = (sysvars_limit
+        .saturating_sub(sft_linear + SFT_HEADER_LEN + DPB_LEN + cds_bytes)
         / SFT_ENTRY_LEN)
-        .max(STANDARD_SFT_SLOTS);
+        .max(2);
     let sft_slots = usize::from(file_count)
         .max(STANDARD_SFT_SLOTS)
         .min(max_sft_slots);
-    let cds_array_off = SFT_TABLE_OFF + SFT_HEADER_LEN + sft_slots * SFT_ENTRY_LEN;
+    let dpb_off = SFT_TABLE_OFF + SFT_HEADER_LEN + sft_slots * SFT_ENTRY_LEN;
+    let cds_array_off = dpb_off + DPB_LEN;
+    let dpb_linear = base + 2 + dpb_off;
     let cds_linear = base + 2 + cds_array_off;
     let clear_end = 2 + cds_array_off + cds_bytes;
     // [BX-2] = first MCB segment (BX returns 0x0002, so this is offset 0).
@@ -531,6 +536,11 @@ pub(super) fn write_sysvars(
     for off in 2..clear_end {
         mem.write_u8(base + off, 0)?;
     }
+    // [BX+0x00] DWORD: pointer to the first Drive Parameter Block. This model has
+    // one backed block device, C:, so the DPB chain contains a single fixed-disk
+    // entry and terminates at FFFF:FFFF.
+    mem.write_u16(base + 2, (2 + dpb_off) as u16)?;
+    mem.write_u16(base + 2 + 2, SYSVARS_SEG)?;
     // [BX+0x10] WORD: the largest bytes-per-block of any block device, a 512-byte
     // sector here.
     mem.write_u16(base + 2 + 0x10, 512)?;
@@ -544,13 +554,15 @@ pub(super) fn write_sysvars(
     // The PSP's default JFT maps stdin/stdout/stderr to SFT slot 1. Seed that slot
     // as a shared read/write CON character device; live host-file slots are filled
     // below from the kernel's open-handle table.
-    let con = sft + SFT_HEADER_LEN + SFT_ENTRY_LEN;
-    mem.write_u16(con, 3)?; // stdin, stdout, stderr references
-    mem.write_u16(con + 0x02, 0x0002)?; // read/write open mode
-    mem.write_u8(con + 0x04, 0)?; // file attributes do not apply to character devices
-    mem.write_u16(con + 0x05, 0x0083)?; // character device, readable and writable
-    for (i, &byte) in b"CON        ".iter().enumerate() {
-        mem.write_u8(con + 0x20 + i, byte)?;
+    if sft_slots > 1 {
+        let con = sft + SFT_HEADER_LEN + SFT_ENTRY_LEN;
+        mem.write_u16(con, 3)?; // stdin, stdout, stderr references
+        mem.write_u16(con + 0x02, 0x0002)?; // read/write open mode
+        mem.write_u8(con + 0x04, 0)?; // file attributes do not apply to character devices
+        mem.write_u16(con + 0x05, 0x0083)?; // character device, readable and writable
+        for (i, &byte) in b"CON        ".iter().enumerate() {
+            mem.write_u8(con + 0x20 + i, byte)?;
+        }
     }
     for host in host_files {
         let slot = usize::from(host.slot);
@@ -568,10 +580,35 @@ pub(super) fn write_sysvars(
             mem.write_u8(entry + 0x20 + i, byte)?;
         }
     }
+    // DOS 4.x DPB for C:. Keep the values coherent with AH=36h's fixed-disk
+    // facade: 512-byte sectors, 64 sectors per cluster, and an unknown-but-large
+    // FAT16-style volume.
+    mem.write_u8(dpb_linear, 2)?; // drive number: C:
+    mem.write_u8(dpb_linear + 0x01, 0)?; // first unit within the block driver
+    mem.write_u16(dpb_linear + 0x02, 512)?;
+    mem.write_u8(dpb_linear + 0x04, 63)?; // sectors per cluster - 1
+    mem.write_u8(dpb_linear + 0x05, 6)?; // 2^6 sectors per cluster
+    mem.write_u16(dpb_linear + 0x06, 1)?; // reserved sectors
+    mem.write_u8(dpb_linear + 0x08, 2)?; // FAT copies
+    mem.write_u16(dpb_linear + 0x09, 512)?; // root directory entries
+    mem.write_u16(dpb_linear + 0x0b, 545)?; // first data sector
+    mem.write_u16(dpb_linear + 0x0d, 0xffff)?; // highest cluster number
+    mem.write_u16(dpb_linear + 0x0f, 256)?; // sectors per FAT, DOS 4.x WORD
+    mem.write_u16(dpb_linear + 0x11, 513)?; // first root directory sector
+    mem.write_u16(dpb_linear + 0x13, 0xffff)?; // block device header not modeled yet
+    mem.write_u16(dpb_linear + 0x15, 0xffff)?;
+    mem.write_u8(dpb_linear + 0x17, 0xf8)?; // fixed disk media descriptor
+    mem.write_u8(dpb_linear + 0x18, 0)?; // disk has been accessed
+    mem.write_u16(dpb_linear + 0x19, 0xffff)?; // next DPB pointer, end of chain
+    mem.write_u16(dpb_linear + 0x1b, 0xffff)?;
+    mem.write_u16(dpb_linear + 0x1d, 2)?; // start free-space search at cluster 2
+    mem.write_u16(dpb_linear + 0x1f, 0xf000)?; // free clusters, matching AH=36h
     // [BX+0x16] DWORD: pointer to the Current Directory Structure array. Each
     // entry is 0x58 bytes and the count is published at [BX+0x21].
     mem.write_u16(base + 2 + 0x16, (2 + cds_array_off) as u16)?;
     mem.write_u16(base + 2 + 0x18, SYSVARS_SEG)?;
+    // [BX+0x20] BYTE: number of installed block devices. Only C: is backed.
+    mem.write_u8(base + 2 + 0x20, 1)?;
     // [BX+0x21] BYTE: LASTDRIVE.
     mem.write_u8(base + 2 + 0x21, drive_count)?;
     for index in 0..drive_count {
@@ -583,7 +620,13 @@ pub(super) fn write_sysvars(
         mem.write_u8(entry + 3, 0)?;
         // Mark C: as the mounted local physical drive. Other letters are reserved
         // by LASTDRIVE but not backed by a modeled block device yet.
-        mem.write_u16(entry + 0x43, if letter == b'C' { 0x4000 } else { 0 })?;
+        let is_c = letter == b'C';
+        mem.write_u16(entry + 0x43, if is_c { 0x4000 } else { 0 })?;
+        mem.write_u16(
+            entry + 0x45,
+            if is_c { (2 + dpb_off) as u16 } else { 0xffff },
+        )?;
+        mem.write_u16(entry + 0x47, if is_c { SYSVARS_SEG } else { 0xffff })?;
         mem.write_u16(entry + 0x49, 0)?; // current directory starts at root
         mem.write_u16(entry + 0x4b, 0xffff)?;
         mem.write_u16(entry + 0x4d, 0xffff)?;
