@@ -701,6 +701,7 @@ impl Machine {
         self.set_emm386_config(ConfigSysMemory {
             emm386: mode,
             dos_umb: false,
+            lastdrive: izarravm_core::DEFAULT_LASTDRIVE,
             ems_frame_seg: None,
             ems_pool_kb: None,
         })
@@ -4544,7 +4545,8 @@ impl Machine {
             let Machine { dos, memory, .. } = self;
             dos.init_shell_base(memory, DOS_LOAD_SEGMENT, &env)?;
         }
-        // CONFIG.SYS DEVICE=EMM386 / DOS=UMB drive the memory manager at SYSINIT.
+        // CONFIG.SYS DEVICE=EMM386 / DOS=UMB drive the memory manager at SYSINIT;
+        // scalar directives such as LASTDRIVE feed the DOS SysVars table.
         // A present, readable file applies its mode (re-laying the layout only when
         // it differs from the current mode); with no readable file the last-applied
         // mode stands (the construction mode on a cold boot) and the shipped
@@ -4557,14 +4559,19 @@ impl Machine {
         }
         let dos_umb = config.map(|c| c.dos_umb).unwrap_or(true);
         self.dos.set_dos_umb(dos_umb);
+        self.dos.set_lastdrive(
+            config
+                .map(|c| c.lastdrive)
+                .unwrap_or(izarravm_core::DEFAULT_LASTDRIVE),
+        );
         if dos_umb && self.dos.has_umb_arena() {
             self.dos.set_umb_link(true);
         }
         Ok(())
     }
 
-    /// Read and parse C:\CONFIG.SYS for the memory-manager intent, or None when the
-    /// C: root is unset or the file is missing or unreadable.
+    /// Read and parse C:\CONFIG.SYS for the HLE SYSINIT directives, or None when
+    /// the C: root is unset or the file is missing or unreadable.
     fn read_config_sys(&self) -> Option<izarravm_core::ConfigSysMemory> {
         let root = self.toka_c_root.as_ref()?;
         let text = std::fs::read_to_string(root.join("CONFIG.SYS")).ok()?;
@@ -8276,6 +8283,7 @@ mod tests {
             .set_emm386_config(izarravm_core::ConfigSysMemory {
                 emm386: Emm386Mode::Ram,
                 dos_umb: true,
+                lastdrive: izarravm_core::DEFAULT_LASTDRIVE,
                 ems_frame_seg: Some(0xd000),
                 ems_pool_kb: Some(4096),
             })
@@ -8409,6 +8417,38 @@ mod tests {
                 .iter()
                 .any(|r| r.kind == UmaUse::Umb),
             "UMBs stay under NOEMS"
+        );
+    }
+
+    #[test]
+    fn config_sys_lastdrive_is_published_in_sysvars() {
+        const PROG: [u8; 2] = [0xCD, 0x20];
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("CONFIG.SYS"),
+            "DEVICE=C:\\DOS\\HIMEM.SYS\r\nDEVICE=C:\\DOS\\IEMM.EXE RAM\r\nDOS=HIGH,UMB\r\nLASTDRIVE=Z\r\n",
+        )
+        .unwrap();
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
+                .unwrap();
+        machine.set_toka_c_root(dir.path().to_path_buf());
+        machine.setup_toka_dos_base().unwrap();
+
+        let mut regs = izarravm_dos::DosRegs {
+            ax: 0x5200,
+            ..izarravm_dos::DosRegs::default()
+        };
+        {
+            let Machine { dos, memory, .. } = &mut machine;
+            dos.dispatch(0x21, &mut regs, memory).unwrap();
+        }
+        let base = usize::from(regs.es) * 16 + usize::from(regs.bx);
+
+        assert_eq!(
+            machine.memory.read_u8(base + 0x21).unwrap(),
+            26,
+            "LASTDRIVE=Z is exposed as drives A: through Z:"
         );
     }
 
