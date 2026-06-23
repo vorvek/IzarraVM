@@ -1,8 +1,10 @@
 use izarravm_bus::{BusError, Memory};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use thiserror::Error;
 
 mod memory;
@@ -425,16 +427,16 @@ impl AccessMode {
 
 /// An open file handle: the host file plus the DOS access mode it was opened
 /// with, which the kernel enforces on reads and writes.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct OpenFile {
-    file: File,
+    file: Rc<RefCell<File>>,
     mode: AccessMode,
     sft_name: [u8; 11],
 }
 
 fn open_file_record(file: File, mode: AccessMode, path: &Path) -> OpenFile {
     OpenFile {
-        file,
+        file: Rc::new(RefCell::new(file)),
         mode,
         sft_name: sft_name_from_path(path),
     }
@@ -503,15 +505,16 @@ struct PendingLine {
 }
 
 /// Saved per-program DOS state, pushed when a child is EXECed (AL=0) and
-/// restored when the child exits. open_files is NOT saved; parent and child
-/// share one handle table. The child PSP exposes the five inherited standard
-/// handles in its JFT, but real DOS ref-counting and close-on-exit are still
-/// parked.
+/// restored when the child exits. Host-file handles are saved with shared file
+/// objects, so inherited handles keep their seek position while child-only
+/// handles are dropped on exit.
 #[derive(Debug)]
 struct ProgramContext {
     arena: Arena,
     dta: (u16, u16),
     find_searches: HashMap<(u16, u16), FindSearch>,
+    open_files: HashMap<u16, OpenFile>,
+    ems_handles: HashSet<u16>,
     // The parent's free-tail segment at the moment of EXEC. The child's env and
     // program blocks are carved from here upward, so on the child's exit finish_exec
     // frees the parent's memory back from this segment, capped below any resident
@@ -701,13 +704,12 @@ impl DosKernel {
     fn sft_host_file_entries(&mut self) -> Vec<SftHostFileEntry> {
         let mut entries = Vec::with_capacity(self.open_files.len());
         for (&slot, open) in &mut self.open_files {
-            let size = open
-                .file
+            let mut file = open.file.borrow_mut();
+            let size = file
                 .metadata()
                 .map(|meta| meta.len().min(u64::from(u32::MAX)) as u32)
                 .unwrap_or(0);
-            let position = open
-                .file
+            let position = file
                 .stream_position()
                 .map(|pos| pos.min(u64::from(u32::MAX)) as u32)
                 .unwrap_or(0);
@@ -1202,6 +1204,8 @@ impl DosKernel {
             arena: std::mem::take(&mut self.arena),
             dta: self.dta,
             find_searches: std::mem::take(&mut self.find_searches),
+            open_files: self.open_files.clone(),
+            ems_handles: self.ems_handles.clone(),
             free_base: env_mcb,
         };
         self.program_stack.push(parent);
@@ -1238,6 +1242,8 @@ impl DosKernel {
             self.arena = parent.arena;
             self.dta = parent.dta;
             self.find_searches = parent.find_searches;
+            self.open_files = parent.open_files;
+            self.ems_handles = parent.ems_handles;
             if !child_resident {
                 free_umb_blocks_owned_by(self.umb, child_psp, mem)?;
                 // A resident TSR carved by this child or a descendant sits above the
@@ -2454,10 +2460,11 @@ impl DosKernel {
                     set_dos_error(regs, 0x05);
                     return Ok(DosAction::Continue);
                 }
+                let mut file = of.file.borrow_mut();
                 let mut buffer = vec![0u8; count];
                 let mut filled = 0usize;
                 while filled < count {
-                    match of.file.read(&mut buffer[filled..]) {
+                    match file.read(&mut buffer[filled..]) {
                         Ok(0) => break,
                         Ok(n) => filled += n,
                         Err(err) => {
@@ -2863,16 +2870,17 @@ impl DosKernel {
                     set_dos_error(regs, 0x05);
                     return Ok(DosAction::Continue);
                 }
+                let mut file = of.file.borrow_mut();
                 if count == 0 {
                     // CX=0 truncates (or extends) the file to the current position.
-                    let pos = match of.file.stream_position() {
+                    let pos = match file.stream_position() {
                         Ok(pos) => pos,
                         Err(err) => {
                             set_dos_error(regs, dos_io_error_code(&err));
                             return Ok(DosAction::Continue);
                         }
                     };
-                    if let Err(err) = of.file.set_len(pos) {
+                    if let Err(err) = file.set_len(pos) {
                         set_dos_error(regs, dos_io_error_code(&err));
                         return Ok(DosAction::Continue);
                     }
@@ -2884,7 +2892,7 @@ impl DosKernel {
                 for (index, slot) in buffer.iter_mut().enumerate() {
                     *slot = mem.read_u8(base + index)?;
                 }
-                match of.file.write_all(&buffer) {
+                match file.write_all(&buffer) {
                     Ok(()) => {
                         regs.ax = regs.cx;
                         regs.cf = false;
@@ -2904,20 +2912,21 @@ impl DosKernel {
                     set_dos_error(regs, 0x06);
                     return Ok(DosAction::Continue);
                 };
+                let mut file = of.file.borrow_mut();
                 // Resolve the base the offset applies to. whence 0 takes the offset
-                // unsigned; 1 (current) and 2 (end) take it signed. DOS lets the
-                // resulting pointer fall before the start of the file with no error:
-                // the 32-bit pointer wraps, and a later read/write at that spot fails.
+                // from BOF; whence 1 from current; whence 2 from EOF. DOS keeps a
+                // 32-bit unsigned file pointer, so negative results wrap into the
+                // high 4 GiB range rather than failing.
                 let base = match whence {
                     0 => 0i64,
-                    1 => match of.file.stream_position() {
+                    1 => match file.stream_position() {
                         Ok(p) => p as i64,
                         Err(err) => {
                             set_dos_error(regs, dos_io_error_code(&err));
                             return Ok(DosAction::Continue);
                         }
                     },
-                    2 => match of.file.seek(SeekFrom::End(0)) {
+                    2 => match file.seek(SeekFrom::End(0)) {
                         Ok(p) => p as i64,
                         Err(err) => {
                             set_dos_error(regs, dos_io_error_code(&err));
@@ -2935,10 +2944,10 @@ impl DosKernel {
                     i64::from(offset as i32)
                 };
                 // A before-start pointer wraps to its 32-bit two's complement, the
-                // value DOS reports. Seeking the host past EOF is harmless; a read
-                // there returns 0 bytes, the HLE's stand-in for DOS's failed I/O.
+                // Seeking beyond EOF is allowed. A later read returns EOF; a write
+                // there extends the host file as DOS would.
                 let pos = (base + signed) as u32;
-                if let Err(err) = of.file.seek(SeekFrom::Start(u64::from(pos))) {
+                if let Err(err) = file.seek(SeekFrom::Start(u64::from(pos))) {
                     set_dos_error(regs, dos_io_error_code(&err));
                     return Ok(DosAction::Continue);
                 }
@@ -3171,9 +3180,10 @@ impl DosKernel {
                     Ok(DosAction::Continue)
                 }
             },
-            // AH=67h SET HANDLE COUNT: the handle table is an unbounded map, so the
-            // requested count always fits. Succeed.
+            // AH=67h SET HANDLE COUNT: resize the modeled per-process JFT limit.
+            // The host backing table is a HashMap, so any requested size fits.
             0x67 => {
+                self.file_count = Some(regs.bx);
                 regs.cf = false;
                 Ok(DosAction::Continue)
             }
@@ -3188,54 +3198,43 @@ impl DosKernel {
                 Ok(DosAction::Continue)
             }
             // AH=45h DUP: duplicate the handle in BX onto a new handle. The clone shares
-            // the underlying open file (and its position) via File::try_clone.
+            // the underlying open file and seek position.
             0x45 => {
                 let cloned = match self.open_files.get(&regs.bx) {
-                    Some(of) => of.file.try_clone().map(|file| OpenFile {
-                        file,
-                        mode: of.mode,
-                        sft_name: of.sft_name,
-                    }),
+                    Some(of) => of.clone(),
                     None => {
                         set_dos_error(regs, 0x06); // invalid handle
                         return Ok(DosAction::Continue);
                     }
                 };
-                match cloned {
-                    Ok(open) => {
-                        let Some(handle) = self.alloc_handle() else {
-                            set_dos_error(regs, 0x04); // too many open files
-                            return Ok(DosAction::Continue);
-                        };
-                        self.open_files.insert(handle, open);
-                        regs.ax = handle;
-                        regs.cf = false;
-                    }
-                    Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
-                }
+                let Some(handle) = self.alloc_handle() else {
+                    set_dos_error(regs, 0x04); // too many open files
+                    return Ok(DosAction::Continue);
+                };
+                self.open_files.insert(handle, cloned);
+                regs.ax = handle;
+                regs.cf = false;
                 Ok(DosAction::Continue)
             }
             // AH=46h DUP2/FORCEDUP: force handle CX to refer to the same open file as BX,
-            // closing whatever CX referred to first (insert drops the old File via RAII).
+            // closing whatever CX referred to first.
             0x46 => {
+                if regs.cx >= self.file_count() {
+                    set_dos_error(regs, 0x04); // too many open files
+                    return Ok(DosAction::Continue);
+                }
                 let cloned = match self.open_files.get(&regs.bx) {
-                    Some(of) => of.file.try_clone().map(|file| OpenFile {
-                        file,
-                        mode: of.mode,
-                        sft_name: of.sft_name,
-                    }),
+                    Some(of) => of.clone(),
                     None => {
                         set_dos_error(regs, 0x06);
                         return Ok(DosAction::Continue);
                     }
                 };
-                match cloned {
-                    Ok(open) => {
-                        self.open_files.insert(regs.cx, open);
-                        regs.cf = false;
-                    }
-                    Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
+                if regs.cx != regs.bx {
+                    self.ems_handles.remove(&regs.cx);
+                    self.open_files.insert(regs.cx, cloned);
                 }
+                regs.cf = false;
                 Ok(DosAction::Continue)
             }
             // AH=43h CHMOD: AL=00 get attributes (CX), AL=01 set. Limit: only the
@@ -3402,7 +3401,7 @@ impl DosKernel {
                     return Ok(DosAction::Continue);
                 };
                 match regs.ax as u8 {
-                    0x00 => match of.file.metadata().and_then(|m| m.modified()) {
+                    0x00 => match of.file.borrow().metadata().and_then(|m| m.modified()) {
                         Ok(modified) => {
                             let (time, date) = dos_time_date(modified);
                             regs.cx = time;
@@ -3411,7 +3410,11 @@ impl DosKernel {
                         }
                         Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
                     },
-                    0x01 => match of.file.set_modified(systemtime_from_dos(regs.cx, regs.dx)) {
+                    0x01 => match of
+                        .file
+                        .borrow()
+                        .set_modified(systemtime_from_dos(regs.cx, regs.dx))
+                    {
                         Ok(()) => regs.cf = false,
                         Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
                     },
@@ -6209,6 +6212,28 @@ mod tests {
     }
 
     #[test]
+    fn ah67_extends_the_dynamic_handle_count() {
+        let (mut kernel, mut mem, _dir) = kernel_with_drive(&[("DATA.TXT", b"hi")], r"C:\DATA.TXT");
+        kernel.set_config_sys_counts(6, 20);
+        assert_eq!(open(&mut kernel, &mut mem).ax, 5);
+        let mut grow = DosRegs {
+            ax: 0x6700,
+            bx: 8,
+            ..DosRegs::default()
+        };
+
+        kernel.dispatch(0x21, &mut grow, &mut mem).unwrap();
+
+        assert!(!grow.cf);
+        assert_eq!(kernel.file_count(), 8);
+        assert_eq!(open(&mut kernel, &mut mem).ax, 6);
+        assert_eq!(open(&mut kernel, &mut mem).ax, 7);
+        let too_many = open(&mut kernel, &mut mem);
+        assert!(too_many.cf);
+        assert_eq!(too_many.ax, 0x04);
+    }
+
+    #[test]
     fn open_missing_file_sets_cf_and_ax02() {
         let (mut kernel, mut mem, _dir) = kernel_with_drive(&[], r"C:\NOPE.TXT");
         let regs = open(&mut kernel, &mut mem);
@@ -6297,6 +6322,27 @@ mod tests {
         };
         kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
         assert!(!regs.cf);
+    }
+
+    #[test]
+    fn ah46_dup2_rejects_a_target_past_the_handle_count() {
+        let (mut kernel, mut mem, _dir) = kernel_with_drive(&[("DATA.TXT", b"hi")], r"C:\DATA.TXT");
+        kernel.set_config_sys_counts(6, 20);
+        assert_eq!(open(&mut kernel, &mut mem).ax, 5);
+        let mut regs = DosRegs {
+            ax: 0x4600,
+            bx: 5,
+            cx: 6,
+            ..DosRegs::default()
+        };
+
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x04);
+        let close_out_of_range = close(&mut kernel, &mut mem, 6);
+        assert!(close_out_of_range.cf);
+        assert_eq!(close_out_of_range.ax, 0x06);
     }
 
     #[test]
@@ -10230,6 +10276,43 @@ mod tests {
     }
 
     #[test]
+    fn finish_exec_closes_child_only_handles_but_keeps_parent_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CHILD.COM"), [0xcdu8, 0x20]).unwrap();
+        std::fs::write(dir.path().join("DATA.TXT"), b"abcdef").unwrap();
+        let (mut kernel, mut mem) = exec_kernel(dir.path());
+        let path_base = 0x0100usize * 16 + 0x0200;
+        for (index, byte) in r"C:\DATA.TXT".bytes().enumerate() {
+            mem.write_u8(path_base + index, byte).unwrap();
+        }
+        mem.write_u8(path_base + r"C:\DATA.TXT".len(), 0).unwrap();
+        let parent_handle = open_data(&mut kernel, &mut mem);
+        assert_eq!(parent_handle, 5);
+        let parent_first = read(&mut kernel, &mut mem, parent_handle, 1, 0x0400);
+        assert!(!parent_first.cf);
+        assert_eq!(mem.read_u8(0x0100usize * 16 + 0x0400).unwrap(), b'a');
+
+        place_exec_inputs(&mut mem, "C:\\CHILD.COM", 0);
+        let exec = exec_al0(&mut kernel, &mut mem);
+        assert!(!exec.cf);
+        assert_eq!(kernel.arena.psp_seg, 0x0203);
+        let child_inherited = read(&mut kernel, &mut mem, parent_handle, 1, 0x0410);
+        assert!(!child_inherited.cf);
+        assert_eq!(mem.read_u8(0x0100usize * 16 + 0x0410).unwrap(), b'b');
+        let child_only_handle = open_data(&mut kernel, &mut mem);
+        assert_eq!(child_only_handle, 6);
+
+        kernel.finish_exec(7, &mut mem).unwrap();
+
+        let parent_after = read(&mut kernel, &mut mem, parent_handle, 1, 0x0420);
+        assert!(!parent_after.cf);
+        assert_eq!(mem.read_u8(0x0100usize * 16 + 0x0420).unwrap(), b'c');
+        let child_only_after = read(&mut kernel, &mut mem, child_only_handle, 1, 0x0430);
+        assert!(child_only_after.cf);
+        assert_eq!(child_only_after.ax, 0x06);
+    }
+
+    #[test]
     fn exec_child_chain_shows_the_env_block_then_the_program() {
         // Commit 2 fidelity: a child's MCB chain (via AH=52h) starts at its
         // environment block (owned by the child PSP), then the program block, so a
@@ -10423,6 +10506,8 @@ mod tests {
             arena: std::mem::take(&mut kernel.arena),
             dta,
             find_searches: HashMap::new(),
+            open_files: kernel.open_files.clone(),
+            ems_handles: kernel.ems_handles.clone(),
             free_base: 0x1100,
         });
         kernel.arena = Arena {
