@@ -2502,6 +2502,13 @@ impl Machine {
     fn handle_int2f(&mut self) -> bool {
         let ax = self.cpu.registers.eax() as u16;
         match ax {
+            // DOS-owned install checks for resident utilities we do not load.
+            // Report "not installed, OK to install" rather than falling through
+            // with stale register contents.
+            0x0100 | 0x0600 | 0x1000 => {
+                self.set_eax_al(0x00);
+                true
+            }
             // Network-redirector / ICDEX installation check (RBIL INTERRUP.K,
             // INT 2F/AX=1100h). The caller pushes a DADAh marker, runs INT 2Fh,
             // and a present ICDEX returns AL=FFh and replaces the pushed word
@@ -2584,6 +2591,14 @@ impl Machine {
             0x150C => {
                 let ebx = (self.cpu.registers.ebx() & !0xFFFF) | 0x0217; // 2.23
                 self.cpu.registers.set_ebx(ebx);
+                true
+            }
+            // Release current VM time-slice (AX=1680h). There is no host-side
+            // scheduler to yield to in the HLE, but DOS 5+ reports support by
+            // clearing AL; doing so keeps idle loops from treating the function
+            // as absent.
+            0x1680 => {
+                self.set_eax_al(0x00);
                 true
             }
             // Send device driver request: ES:BX -> a CD-ROM device driver request
@@ -7570,6 +7585,34 @@ mod tests {
         );
         assert_eq!(m.read_physical_u8(linear + 1), XMS_INT_VECTOR, "INT 66h");
         assert_eq!(m.read_physical_u8(linear + 2), 0xCB, "RETF");
+    }
+
+    #[test]
+    fn int2f_idle_yield_reports_supported() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0xCAFE_1680);
+
+        assert!(m.handle_int2f(), "AX=1680h handled");
+
+        assert_eq!(m.cpu.registers.eax(), 0xCAFE_1600);
+    }
+
+    #[test]
+    fn int2f_dos_install_probes_report_not_installed() {
+        for (ax, name) in [(0x0100u16, "PRINT"), (0x0600, "ASSIGN"), (0x1000, "SHARE")] {
+            let mut m = int15_machine(16);
+            m.cpu.registers.set_eax(0xCAFE_0000 | u32::from(ax));
+            m.cpu.registers.set_ebx(0x1111_2222);
+            m.cpu.registers.set_ecx(0x3333_4444);
+            m.cpu.registers.set_edx(0x5555_6666);
+
+            assert!(m.handle_int2f(), "{name} install check handled");
+
+            assert_eq!(m.cpu.registers.eax() as u8, 0x00, "{name} not installed");
+            assert_eq!(m.cpu.registers.ebx(), 0x1111_2222);
+            assert_eq!(m.cpu.registers.ecx(), 0x3333_4444);
+            assert_eq!(m.cpu.registers.edx(), 0x5555_6666);
+        }
     }
 
     #[test]
