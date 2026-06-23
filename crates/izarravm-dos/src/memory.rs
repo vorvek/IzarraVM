@@ -140,6 +140,26 @@ fn write_character_device_header(
     Ok(())
 }
 
+fn write_sft_character_device(
+    mem: &mut Memory,
+    sft: usize,
+    slot: usize,
+    ref_count: u16,
+    open_mode: u16,
+    device_info: u16,
+    name: &[u8; 11],
+) -> Result<(), DosError> {
+    let entry = sft + SFT_HEADER_LEN + slot * SFT_ENTRY_LEN;
+    mem.write_u16(entry, ref_count)?;
+    mem.write_u16(entry + 0x02, open_mode)?;
+    mem.write_u8(entry + 0x04, 0)?;
+    mem.write_u16(entry + 0x05, device_info)?;
+    for (i, &byte) in name.iter().enumerate() {
+        mem.write_u8(entry + 0x20 + i, byte)?;
+    }
+    Ok(())
+}
+
 /// Conventional memory modeled as an authoritative in-RAM MCB chain ending at
 /// paragraph 0xA000. The chain is the source of truth: allocate/free/resize walk
 /// and mutate the real headers a guest reads through AH=52h, so a memory manager
@@ -680,18 +700,17 @@ pub(super) fn write_sysvars(
     mem.write_u16(sft, 0xffff)?; // next offset, FFFF:FFFF = last SFT table
     mem.write_u16(sft + 2, 0xffff)?; // next segment
     mem.write_u16(sft + 4, file_count)?; // number of SFT slots in this table
-    // The PSP's default JFT maps stdin/stdout/stderr to SFT slot 1. Seed that slot
-    // as a shared read/write CON character device; live host-file slots are filled
-    // below from the kernel's open-handle table.
+    // The PSP's default JFT maps stdin/stdout/stderr to SFT slot 1 (CON), AUX to
+    // slot 3, and PRN to slot 4. Seed those character-device entries; live host-file
+    // slots are filled below from the kernel's open-handle table.
     if sft_slots > 1 {
-        let con = sft + SFT_HEADER_LEN + SFT_ENTRY_LEN;
-        mem.write_u16(con, 3)?; // stdin, stdout, stderr references
-        mem.write_u16(con + 0x02, 0x0002)?; // read/write open mode
-        mem.write_u8(con + 0x04, 0)?; // file attributes do not apply to character devices
-        mem.write_u16(con + 0x05, 0x0083)?; // character device, readable and writable
-        for (i, &byte) in b"CON        ".iter().enumerate() {
-            mem.write_u8(con + 0x20 + i, byte)?;
-        }
+        write_sft_character_device(mem, sft, 1, 3, 0x0002, 0x0083, b"CON        ")?;
+    }
+    if sft_slots > 3 {
+        write_sft_character_device(mem, sft, 3, 1, 0x0002, 0x0080, b"AUX        ")?;
+    }
+    if sft_slots > 4 {
+        write_sft_character_device(mem, sft, 4, 1, 0x0001, 0x0080, b"PRN        ")?;
     }
     for host in host_files {
         let slot = usize::from(host.slot);
