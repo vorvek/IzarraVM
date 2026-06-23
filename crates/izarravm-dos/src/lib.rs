@@ -1271,17 +1271,51 @@ impl DosKernel {
         Ok((dir, pattern))
     }
 
-    /// Resolve the file named by the FCB at DS:DX to a host path. The FCB 8.3
-    /// fields name the file relative to the C: root (no path, like the FCB API).
-    /// Ok(Ok(path)) on success; Ok(Err(())) when the FCB names no resolvable file
-    /// (every FCB error is the single 0xFF return, so a code is not needed).
-    fn fcb_path(&self, mem: &Memory, regs: &DosRegs) -> Result<Result<PathBuf, ()>, DosError> {
+    /// Return the normal 37-byte FCB subrecord. An extended FCB starts with a 0xFF
+    /// marker, five reserved bytes, an attribute byte, then the normal FCB at +7.
+    fn fcb_body_base(&self, mem: &Memory, base: usize) -> Result<usize, DosError> {
+        if mem.read_u8(base)? == 0xff {
+            Ok(base + 7)
+        } else {
+            Ok(base)
+        }
+    }
+
+    fn fcb_body_base_for_regs(&self, mem: &Memory, regs: &DosRegs) -> Result<usize, DosError> {
         let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
-        let name = fcb_name(mem, base, FCB_NAME)?;
+        self.fcb_body_base(mem, base)
+    }
+
+    /// The HLE mounts only C:. FCB drive byte 0 means the default drive, also C:.
+    fn fcb_drive_targets_mounted_c(drive: u8) -> bool {
+        drive == 0 || drive == 3
+    }
+
+    /// Resolve the file named by an FCB subrecord to a host path. The FCB 8.3
+    /// fields name the file relative to the selected drive's root (no path, like
+    /// the FCB API). Ok(Ok(path)) on success; Ok(Err(())) when the FCB names no
+    /// resolvable file or an unmounted drive.
+    fn fcb_path_at(
+        &self,
+        mem: &Memory,
+        base: usize,
+        name_off: usize,
+    ) -> Result<Result<PathBuf, ()>, DosError> {
+        if !Self::fcb_drive_targets_mounted_c(mem.read_u8(base)?) {
+            return Ok(Err(()));
+        }
+        let name = fcb_name(mem, base, name_off)?;
         if name.is_empty() {
             return Ok(Err(()));
         }
         Ok(self.resolve_name(&name).map_err(|_| ()))
+    }
+
+    /// Resolve the file named by the FCB at DS:DX to a host path, accepting either
+    /// a normal FCB or an extended FCB wrapper.
+    fn fcb_path(&self, mem: &Memory, regs: &DosRegs) -> Result<Result<PathBuf, ()>, DosError> {
+        let base = self.fcb_body_base_for_regs(mem, regs)?;
+        self.fcb_path_at(mem, base, FCB_NAME)
     }
 
     /// AH=0Fh OPEN FCB / AH=16h CREATE FCB shared body. `create` truncates or
@@ -1294,7 +1328,13 @@ impl DosKernel {
         regs: &mut DosRegs,
         create: bool,
     ) -> Result<DosAction, DosError> {
-        let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+        let raw_base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+        let base = self.fcb_body_base(mem, raw_base)?;
+        let create_attrs = if create && base != raw_base {
+            u16::from(mem.read_u8(raw_base + 6)?)
+        } else {
+            0
+        };
         let path = match self.fcb_path(mem, regs)? {
             Ok(path) => path,
             Err(()) => {
@@ -1316,6 +1356,10 @@ impl DosKernel {
             regs.ax = (regs.ax & 0xff00) | 0xff;
             return Ok(DosAction::Continue);
         };
+        if create && base != raw_base && apply_create_attributes(&path, create_attrs).is_err() {
+            regs.ax = (regs.ax & 0xff00) | 0xff;
+            return Ok(DosAction::Continue);
+        }
         // Echo the opened 8.3 name back and seed the documented fields.
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
             fcb_set_name(mem, base, name)?;
@@ -1352,12 +1396,16 @@ impl DosKernel {
     /// AH=13h DELETE FCB by name, wildcards allowed. Deletes every matching file
     /// in the C: root. AL=00 if at least one file was deleted, 0xFF otherwise.
     fn fcb_delete(&self, mem: &Memory, regs: &mut DosRegs) -> Result<DosAction, DosError> {
-        let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+        let base = self.fcb_body_base_for_regs(mem, regs)?;
         let name = fcb_name(mem, base, FCB_NAME)?;
         let Some(drive) = self.drive.as_ref() else {
             regs.ax = (regs.ax & 0xff00) | 0xff;
             return Ok(DosAction::Continue);
         };
+        if !Self::fcb_drive_targets_mounted_c(mem.read_u8(base)?) {
+            regs.ax = (regs.ax & 0xff00) | 0xff;
+            return Ok(DosAction::Continue);
+        }
         let pattern = pattern_to_8_3(&name.to_ascii_uppercase());
         let mut deleted = false;
         if let Ok(read_dir) = std::fs::read_dir(drive.root()) {
@@ -1477,10 +1525,11 @@ impl DosKernel {
     /// error. Wildcards in the names are not expanded (marked); the common case is
     /// a literal rename.
     fn fcb_rename(&self, mem: &Memory, regs: &mut DosRegs) -> Result<DosAction, DosError> {
-        let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
-        let old_name = fcb_name(mem, base, FCB_NAME)?;
-        let new_name = fcb_name(mem, base, FCB_RENAME_NEW)?;
-        let al = match (self.resolve_name(&old_name), self.resolve_name(&new_name)) {
+        let base = self.fcb_body_base_for_regs(mem, regs)?;
+        let al = match (
+            self.fcb_path_at(mem, base, FCB_NAME)?,
+            self.fcb_path_at(mem, base, FCB_RENAME_NEW)?,
+        ) {
             (Ok(old), Ok(new)) if std::fs::rename(&old, &new).is_ok() => 0x00,
             _ => 0xff,
         };
@@ -1497,7 +1546,7 @@ impl DosKernel {
         mem: &mut Memory,
         regs: &mut DosRegs,
     ) -> Result<DosAction, DosError> {
-        let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+        let base = self.fcb_body_base_for_regs(mem, regs)?;
         let path = match self.fcb_path(mem, regs)? {
             Ok(path) => path,
             Err(()) => {
@@ -1550,7 +1599,7 @@ impl DosKernel {
         mem: &mut Memory,
         regs: &mut DosRegs,
     ) -> Result<DosAction, DosError> {
-        let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+        let base = self.fcb_body_base_for_regs(mem, regs)?;
         let path = match self.fcb_path(mem, regs)? {
             Ok(path) => path,
             Err(()) => {
@@ -1596,7 +1645,7 @@ impl DosKernel {
     /// records (rounded up by the FCB record size, defaulting to 128). AL=00 on
     /// success, 0xFF when the file does not resolve or exist.
     fn fcb_file_size(&self, mem: &mut Memory, regs: &mut DosRegs) -> Result<DosAction, DosError> {
-        let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+        let base = self.fcb_body_base_for_regs(mem, regs)?;
         let path = match self.fcb_path(mem, regs)? {
             Ok(path) => path,
             Err(()) => {
@@ -1628,7 +1677,7 @@ impl DosKernel {
         mem: &mut Memory,
         regs: &mut DosRegs,
     ) -> Result<DosAction, DosError> {
-        let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+        let base = self.fcb_body_base_for_regs(mem, regs)?;
         let path = match self.fcb_path(mem, regs)? {
             Ok(path) => path,
             Err(()) => {
@@ -1679,7 +1728,7 @@ impl DosKernel {
         mem: &mut Memory,
         regs: &mut DosRegs,
     ) -> Result<DosAction, DosError> {
-        let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+        let base = self.fcb_body_base_for_regs(mem, regs)?;
         let path = match self.fcb_path(mem, regs)? {
             Ok(path) => path,
             Err(()) => {
@@ -1723,7 +1772,7 @@ impl DosKernel {
     /// current block and record: random = block * 128 + current-record. No file
     /// access; this is pure FCB field math. AL is undocumented and left as is.
     fn fcb_set_random(&self, mem: &mut Memory, regs: &mut DosRegs) -> Result<DosAction, DosError> {
-        let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+        let base = self.fcb_body_base_for_regs(mem, regs)?;
         let block = mem.read_u16(base + FCB_BLOCK)?;
         let current = mem.read_u8(base + FCB_CURREC)?;
         let random = u32::from(block) * 128 + u32::from(current);
@@ -1741,7 +1790,7 @@ impl DosKernel {
         mem: &mut Memory,
         regs: &mut DosRegs,
     ) -> Result<DosAction, DosError> {
-        let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+        let base = self.fcb_body_base_for_regs(mem, regs)?;
         let path = match self.fcb_path(mem, regs)? {
             Ok(path) => path,
             Err(()) => {
@@ -1811,7 +1860,7 @@ impl DosKernel {
         mem: &mut Memory,
         regs: &mut DosRegs,
     ) -> Result<DosAction, DosError> {
-        let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+        let base = self.fcb_body_base_for_regs(mem, regs)?;
         let path = match self.fcb_path(mem, regs)? {
             Ok(path) => path,
             Err(()) => {
@@ -9027,7 +9076,10 @@ mod tests {
     /// `name` is "STEM.EXT" or "STEM"; the fields beyond the name are left as the
     /// caller seeded them.
     fn place_fcb(mem: &mut Memory, drive: u8, name: &str) {
-        let base = 0x0100usize * 16 + 0x0200;
+        place_fcb_at(mem, 0x0100usize * 16 + 0x0200, drive, name);
+    }
+
+    fn place_fcb_at(mem: &mut Memory, base: usize, drive: u8, name: &str) {
         mem.write_u8(base, drive).unwrap();
         let (stem, ext) = match name.split_once('.') {
             Some((s, e)) => (s, e),
@@ -9068,11 +9120,44 @@ mod tests {
     }
 
     #[test]
+    fn fcb_open_supports_extended_fcb_header() {
+        let (mut kernel, mut mem, _dir) = fcb_kernel(&[("DATA.BIN", &[0u8; 300])]);
+        place_extended_fcb(&mut mem, 0x01, 3, "DATA.BIN");
+
+        let regs = fcb_call(&mut kernel, &mut mem, 0x0f);
+
+        assert_eq!(regs.ax & 0xff, 0x00, "extended FCB open succeeds");
+        let base = 0x0100usize * 16 + 0x0200;
+        let fcb = base + 7;
+        assert_eq!(mem.read_u8(base).unwrap(), 0xff, "extended prefix kept");
+        assert_eq!(mem.read_u8(base + 6).unwrap(), 0x01, "attribute byte kept");
+        assert_eq!(
+            mem.read_u8(fcb).unwrap(),
+            3,
+            "drive byte lives in the normal FCB subrecord"
+        );
+        assert_eq!(mem.read_u16(fcb + 0x0e).unwrap(), 128, "record size 128");
+        assert_eq!(mem.read_u32(fcb + 0x10).unwrap(), 300, "file size");
+        assert_eq!(mem.read_u16(fcb + 0x0c).unwrap(), 0, "current block 0");
+        assert_eq!(mem.read_u8(fcb + 0x20).unwrap(), 0, "current record 0");
+    }
+
+    #[test]
     fn fcb_open_missing_file_returns_ff() {
         let (mut kernel, mut mem, _dir) = fcb_kernel(&[]);
         place_fcb(&mut mem, 3, "NOPE.DAT");
         let regs = fcb_call(&mut kernel, &mut mem, 0x0f);
         assert_eq!(regs.ax & 0xff, 0xff);
+    }
+
+    #[test]
+    fn fcb_open_rejects_unmounted_drive_byte() {
+        let (mut kernel, mut mem, _dir) = fcb_kernel(&[("DATA.BIN", b"x")]);
+        place_fcb(&mut mem, 1, "DATA.BIN"); // A:, not mounted by the HLE
+
+        let regs = fcb_call(&mut kernel, &mut mem, 0x0f);
+
+        assert_eq!(regs.ax & 0xff, 0xff, "A: FCBs do not alias to mounted C:");
     }
 
     #[test]
@@ -9111,6 +9196,27 @@ mod tests {
         // Third read: EOF (AL=01).
         let read3 = fcb_call(&mut kernel, &mut mem, 0x14);
         assert_eq!(read3.ax & 0xff, 0x01, "EOF");
+    }
+
+    #[test]
+    fn fcb_sequential_read_uses_extended_fcb_body_fields() {
+        let (mut kernel, mut mem, _dir) = fcb_kernel(&[("FILE.BIN", &[0x5au8; 128])]);
+        place_extended_fcb(&mut mem, 0, 3, "FILE.BIN");
+        set_dta_0500(&mut kernel, &mut mem);
+        assert_eq!(fcb_call(&mut kernel, &mut mem, 0x0f).ax & 0xff, 0x00);
+
+        let read = fcb_call(&mut kernel, &mut mem, 0x14);
+
+        assert_eq!(read.ax & 0xff, 0x00, "extended FCB read succeeds");
+        let base = 0x0100usize * 16 + 0x0200;
+        let fcb = base + 7;
+        assert_eq!(mem.read_u8(base).unwrap(), 0xff, "extended prefix kept");
+        assert_eq!(mem.read_u8(0x0500usize * 16).unwrap(), 0x5a, "DTA filled");
+        assert_eq!(
+            mem.read_u8(fcb + 0x20).unwrap(),
+            1,
+            "current record advanced inside the FCB body"
+        );
     }
 
     #[test]
@@ -9163,6 +9269,23 @@ mod tests {
         // The current record advanced to 1.
         let base = 0x0100usize * 16 + 0x0200;
         assert_eq!(mem.read_u8(base + 0x20).unwrap(), 1);
+    }
+
+    #[test]
+    fn fcb_create_uses_extended_fcb_readonly_attribute() {
+        let (mut kernel, mut mem, dir) = fcb_kernel(&[]);
+        place_extended_fcb(&mut mem, 0x01, 3, "ROFCB.BIN");
+
+        let regs = fcb_call(&mut kernel, &mut mem, 0x16);
+
+        assert_eq!(regs.ax & 0xff, 0x00, "extended FCB create succeeds");
+        assert!(
+            std::fs::metadata(dir.path().join("ROFCB.BIN"))
+                .unwrap()
+                .permissions()
+                .readonly(),
+            "extended FCB attribute bit 0 creates a read-only host file"
+        );
     }
 
     #[test]
