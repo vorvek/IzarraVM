@@ -3320,6 +3320,8 @@ impl DosKernel {
                 let valid = handle <= 4
                     || self.open_files.contains_key(&handle)
                     || self.ems_handles.contains(&handle);
+                let is_character = handle <= 4 || self.ems_handles.contains(&handle);
+                let valid_drive = matches!((regs.bx & 0x00ff) as u8, 0 | 3);
                 match regs.ax as u8 {
                     0x00 => {
                         if handle <= 4 {
@@ -3348,18 +3350,59 @@ impl DosKernel {
                         }
                     }
                     0x01 => {
-                        // Set device info: the attribute bits have no host effect; accept.
-                        if valid {
+                        // Set device info applies only to character devices. The HLE keeps
+                        // the device attributes fixed, but validates the target like DOS.
+                        if !valid {
+                            set_dos_error(regs, 0x06);
+                        } else if !is_character {
+                            set_dos_error(regs, 0x05);
+                        } else {
+                            regs.cf = false;
+                        }
+                    }
+                    0x02 | 0x03 => {
+                        // Character-device control channels. The built-in console and EMS
+                        // facades have no private control bytes, so a valid character device
+                        // transfers zero bytes.
+                        if !valid {
+                            set_dos_error(regs, 0x06);
+                        } else if !is_character {
+                            set_dos_error(regs, 0x05);
+                        } else {
+                            regs.ax = 0;
+                            regs.cf = false;
+                        }
+                    }
+                    0x04 | 0x05 => {
+                        // Block-device control channel for the single mounted fixed C: drive.
+                        if valid_drive {
+                            regs.ax = 0;
                             regs.cf = false;
                         } else {
-                            set_dos_error(regs, 0x06);
+                            set_dos_error(regs, 0x0f);
                         }
                     }
                     0x06 => {
                         // Get input status: AL=0xFF ready, 0x00 not. Console input (handle 0)
-                        // is ready only when a key waits; files and outputs are always ready.
+                        // is ready only when a key waits; disk files are ready until EOF;
+                        // output devices are always ready.
                         if valid {
-                            let ready = handle != 0 || !kbd_ring_is_empty(mem)?;
+                            let ready = if handle == 0 {
+                                !kbd_ring_is_empty(mem)?
+                            } else if let Some(of) = self.open_files.get(&handle) {
+                                let mut file = of.file.borrow_mut();
+                                match file.stream_position().and_then(|pos| {
+                                    file.metadata().map(|metadata| pos < metadata.len())
+                                }) {
+                                    Ok(ready) => ready,
+                                    Err(err) => {
+                                        set_dos_error(regs, dos_io_error_code(&err));
+                                        return Ok(DosAction::Continue);
+                                    }
+                                }
+                            } else {
+                                true
+                            };
                             regs.ax = (regs.ax & 0xff00) | if ready { 0xff } else { 0x00 };
                             regs.cf = false;
                         } else {
@@ -3377,18 +3420,72 @@ impl DosKernel {
                     }
                     0x08 => {
                         // Block device removable? AX=1 fixed (C: is a fixed disk).
-                        regs.ax = 1;
-                        regs.cf = false;
+                        if valid_drive {
+                            regs.ax = 1;
+                            regs.cf = false;
+                        } else {
+                            set_dos_error(regs, 0x0f);
+                        }
                     }
                     0x09 => {
                         // Is drive remote? DX bit 12 clear: C: is local.
-                        regs.dx = 0;
-                        regs.cf = false;
+                        if valid_drive {
+                            regs.dx = 0;
+                            regs.cf = false;
+                        } else {
+                            set_dos_error(regs, 0x0f);
+                        }
                     }
                     0x0a => {
                         // Is handle remote? DX bit 15 clear: local.
-                        regs.dx = 0;
+                        if valid {
+                            regs.dx = 0;
+                            regs.cf = false;
+                        } else {
+                            set_dos_error(regs, 0x06);
+                        }
+                    }
+                    0x0b => {
+                        // Set sharing retry count. No sharing subsystem exists yet, so this
+                        // accepted DOS 3.1+ knob is a no-op success.
                         regs.cf = false;
+                    }
+                    0x0e => {
+                        // Logical drive map: the C: block device has one logical drive.
+                        if valid_drive {
+                            regs.ax &= 0xff00;
+                            regs.cf = false;
+                        } else {
+                            set_dos_error(regs, 0x0f);
+                        }
+                    }
+                    0x0f => {
+                        // Set logical drive map. With one fixed C: drive there is nothing to
+                        // remap, but a request for C: is harmless and succeeds.
+                        if valid_drive {
+                            regs.cf = false;
+                        } else {
+                            set_dos_error(regs, 0x0f);
+                        }
+                    }
+                    0x10 => {
+                        // Generic IOCTL capability by handle: the built-in character devices
+                        // accept the capability probe but do not need a private side channel.
+                        if valid {
+                            regs.ax = 0;
+                            regs.cf = false;
+                        } else {
+                            set_dos_error(regs, 0x06);
+                        }
+                    }
+                    0x11 => {
+                        // Generic IOCTL capability by drive: accept the mounted C: drive.
+                        if valid_drive {
+                            regs.ax = 0;
+                            regs.cf = false;
+                        } else {
+                            set_dos_error(regs, 0x0f);
+                        }
                     }
                     _ => set_dos_error(regs, 0x01), // unsupported IOCTL subfunction
                 }
@@ -5791,6 +5888,121 @@ mod tests {
         kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
         assert!(!regs.cf);
         assert_eq!(regs.ax & 0xff, 0x00);
+    }
+
+    #[test]
+    fn ah44_input_status_reports_file_eof() {
+        let (mut kernel, mut mem, _dir) = kernel_with_drive(&[("DATA.TXT", b"hi")], r"C:\DATA.TXT");
+        let handle = open_data(&mut kernel, &mut mem);
+
+        let mut before = DosRegs {
+            ax: 0x4406,
+            bx: handle,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut before, &mut mem).unwrap();
+        assert!(!before.cf);
+        assert_eq!(before.ax & 0xff, 0xff, "unread file data is ready");
+
+        let read = read(&mut kernel, &mut mem, handle, 8, 0x0400);
+        assert_eq!(read.ax, 2);
+
+        let mut after = DosRegs {
+            ax: 0x4406,
+            bx: handle,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut after, &mut mem).unwrap();
+        assert!(!after.cf);
+        assert_eq!(after.ax & 0xff, 0x00, "EOF file input is not ready");
+    }
+
+    #[test]
+    fn ah44_set_device_info_rejects_disk_file_handles() {
+        let (mut kernel, mut mem, _dir) = kernel_with_drive(&[("DATA.TXT", b"hi")], r"C:\DATA.TXT");
+        let handle = open_data(&mut kernel, &mut mem);
+        let mut regs = DosRegs {
+            ax: 0x4401,
+            bx: handle,
+            dx: 0x0080,
+            ..DosRegs::default()
+        };
+
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x05);
+    }
+
+    #[test]
+    fn ah44_handle_remote_rejects_invalid_handles() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let mut regs = DosRegs {
+            ax: 0x440a,
+            bx: 0x99,
+            ..DosRegs::default()
+        };
+
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x06);
+    }
+
+    #[test]
+    fn ah44_drive_queries_reject_unmounted_drives() {
+        for ax in [0x4408, 0x4409, 0x440e, 0x440f, 0x4411] {
+            let mut kernel = DosKernel::new();
+            let mut mem = Memory::new(64 * 1024).unwrap();
+            let mut regs = DosRegs {
+                ax,
+                bx: 0x0001, // A:, not mounted in the HLE
+                ..DosRegs::default()
+            };
+
+            kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+
+            assert!(regs.cf, "AX={ax:#06x} should reject A:");
+            assert_eq!(regs.ax, 0x0f, "AX={ax:#06x} should report invalid drive");
+        }
+    }
+
+    #[test]
+    fn ah44_single_drive_stub_subfunctions_succeed() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+
+        let mut retry = DosRegs {
+            ax: 0x440b,
+            cx: 1,
+            dx: 3,
+            cf: true,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut retry, &mut mem).unwrap();
+        assert!(!retry.cf, "sharing retry stub succeeds");
+
+        for ax in [0x440e, 0x440f, 0x4411] {
+            let mut regs = DosRegs {
+                ax,
+                bx: 0x0003, // C:
+                cf: true,
+                ..DosRegs::default()
+            };
+            kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+            assert!(!regs.cf, "AX={ax:#06x} should accept C:");
+        }
+
+        let mut cap = DosRegs {
+            ax: 0x4410,
+            bx: 1,
+            cf: true,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut cap, &mut mem).unwrap();
+        assert!(!cap.cf, "handle capability stub succeeds");
+        assert_eq!(cap.ax, 0);
     }
 
     #[test]
