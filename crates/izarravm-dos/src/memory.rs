@@ -31,14 +31,26 @@ const SYSVARS_SEG: u16 = 0x0050;
 const DEFAULT_LASTDRIVE: u8 = 5;
 
 /// AH=52h publishes the SFT and Current Directory Structure (CDS) array from the
-/// same reserved paragraph as SysVars. Keep the modeled standard SFT slots before
-/// the CDS array and below the first program PSP at 0x0100:0000.
+/// same reserved paragraph as SysVars. Keep as many SFT slots as fit before the
+/// CDS array and below the first program PSP at 0x0100:0000. The default FILES=40
+/// table plus the default CDS array is slightly too large for this low-memory
+/// scratch paragraph, so entries that do not fit are left blank until the DOS data
+/// segment is given a larger owned block.
 const SFT_TABLE_OFF: usize = 0x50;
 const SFT_HEADER_LEN: usize = 0x06;
 const SFT_ENTRY_LEN: usize = 0x3b;
 const STANDARD_SFT_SLOTS: usize = 5;
-const CDS_ARRAY_OFF: usize = SFT_TABLE_OFF + SFT_HEADER_LEN + STANDARD_SFT_SLOTS * SFT_ENTRY_LEN;
 const CDS_ENTRY_LEN: usize = 0x58;
+
+/// A live host-file handle projected into the DOS System File Table.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SftHostFileEntry {
+    pub(super) slot: u16,
+    pub(super) open_mode: u16,
+    pub(super) size: u32,
+    pub(super) position: u32,
+    pub(super) name: [u8; 11],
+}
 
 /// Conventional memory modeled as an authoritative in-RAM MCB chain ending at
 /// paragraph 0xA000. The chain is the source of truth: allocate/free/resize walk
@@ -497,11 +509,21 @@ pub(super) fn write_sysvars(
     ems_present: bool,
     lastdrive: Option<u8>,
     file_count: u16,
+    host_files: &[SftHostFileEntry],
 ) -> Result<(u16, u16), DosError> {
     let base = usize::from(SYSVARS_SEG) * 16;
     let drive_count = lastdrive.unwrap_or(DEFAULT_LASTDRIVE).min(26);
-    let cds_linear = base + 2 + CDS_ARRAY_OFF;
-    let clear_end = 2 + CDS_ARRAY_OFF + usize::from(drive_count) * CDS_ENTRY_LEN;
+    let sft_linear = base + 2 + SFT_TABLE_OFF;
+    let cds_bytes = usize::from(drive_count) * CDS_ENTRY_LEN;
+    let max_sft_slots = (0x1000usize.saturating_sub(sft_linear + SFT_HEADER_LEN + cds_bytes)
+        / SFT_ENTRY_LEN)
+        .max(STANDARD_SFT_SLOTS);
+    let sft_slots = usize::from(file_count)
+        .max(STANDARD_SFT_SLOTS)
+        .min(max_sft_slots);
+    let cds_array_off = SFT_TABLE_OFF + SFT_HEADER_LEN + sft_slots * SFT_ENTRY_LEN;
+    let cds_linear = base + 2 + cds_array_off;
+    let clear_end = 2 + cds_array_off + cds_bytes;
     // [BX-2] = first MCB segment (BX returns 0x0002, so this is offset 0).
     mem.write_u16(base, first_mcb)?;
     // Clear the documented field span plus the sized CDS array, then fill the
@@ -512,8 +534,7 @@ pub(super) fn write_sysvars(
     // [BX+0x10] WORD: the largest bytes-per-block of any block device, a 512-byte
     // sector here.
     mem.write_u16(base + 2 + 0x10, 512)?;
-    // [BX+0x04] DWORD: pointer to the first System File Table. This slice seeds
-    // the table header and FILES= count; per-handle entries are filled later.
+    // [BX+0x04] DWORD: pointer to the first System File Table.
     mem.write_u16(base + 2 + 0x04, (2 + SFT_TABLE_OFF) as u16)?;
     mem.write_u16(base + 2 + 0x06, SYSVARS_SEG)?;
     let sft = base + 2 + SFT_TABLE_OFF;
@@ -521,8 +542,8 @@ pub(super) fn write_sysvars(
     mem.write_u16(sft + 2, 0xffff)?; // next segment
     mem.write_u16(sft + 4, file_count)?; // number of SFT slots in this table
     // The PSP's default JFT maps stdin/stdout/stderr to SFT slot 1. Seed that slot
-    // as a shared read/write CON character device; open host-file slots remain for
-    // a later slice.
+    // as a shared read/write CON character device; live host-file slots are filled
+    // below from the kernel's open-handle table.
     let con = sft + SFT_HEADER_LEN + SFT_ENTRY_LEN;
     mem.write_u16(con, 3)?; // stdin, stdout, stderr references
     mem.write_u16(con + 0x02, 0x0002)?; // read/write open mode
@@ -531,9 +552,25 @@ pub(super) fn write_sysvars(
     for (i, &byte) in b"CON        ".iter().enumerate() {
         mem.write_u8(con + 0x20 + i, byte)?;
     }
+    for host in host_files {
+        let slot = usize::from(host.slot);
+        if slot >= sft_slots {
+            continue;
+        }
+        let entry = sft + SFT_HEADER_LEN + slot * SFT_ENTRY_LEN;
+        mem.write_u16(entry, 1)?; // one JFT handle references this SFT slot
+        mem.write_u16(entry + 0x02, host.open_mode)?;
+        mem.write_u8(entry + 0x04, 0)?; // normal host file attributes
+        mem.write_u16(entry + 0x05, 0x0002)?; // drive C:, bit 7 clear means file
+        mem.write_u32(entry + 0x11, host.size)?;
+        mem.write_u32(entry + 0x15, host.position)?;
+        for (i, &byte) in host.name.iter().enumerate() {
+            mem.write_u8(entry + 0x20 + i, byte)?;
+        }
+    }
     // [BX+0x16] DWORD: pointer to the Current Directory Structure array. Each
     // entry is 0x58 bytes and the count is published at [BX+0x21].
-    mem.write_u16(base + 2 + 0x16, (2 + CDS_ARRAY_OFF) as u16)?;
+    mem.write_u16(base + 2 + 0x16, (2 + cds_array_off) as u16)?;
     mem.write_u16(base + 2 + 0x18, SYSVARS_SEG)?;
     // [BX+0x21] BYTE: LASTDRIVE.
     mem.write_u8(base + 2 + 0x21, drive_count)?;
