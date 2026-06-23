@@ -1267,6 +1267,16 @@ impl DosKernel {
         Ok(())
     }
 
+    fn restore_psp_saved_vectors(&self, mem: &mut Memory) -> Result<(), DosError> {
+        let psp = usize::from(self.arena.psp_seg) * 16;
+        for (psp_off, int_no) in [(0x0au16, 0x22u8), (0x0e, 0x23), (0x12, 0x24)] {
+            let ivt = usize::from(int_no) * 4;
+            mem.write_u16(ivt, mem.read_u16(psp + usize::from(psp_off))?)?;
+            mem.write_u16(ivt + 2, mem.read_u16(psp + usize::from(psp_off) + 2)?)?;
+        }
+        Ok(())
+    }
+
     fn keep_process_resident(&mut self, paras: u16, mem: &mut Memory) -> Result<(), DosError> {
         self.arena.keep_resident(paras, mem)?;
         // Record the resident region's base so an ancestor's exit will not reclaim
@@ -2662,13 +2672,13 @@ impl DosKernel {
             // AH=4Ch: terminate with the return code in AL.
             0x4c => Ok(DosAction::Exit((regs.ax & 0x00ff) as u8)),
             // AH=31h KEEP PROCESS (TSR): terminate with the AL return code but leave
-            // the program resident. DX is the resident size in paragraphs; the arena
-            // trims the program block to it and flags the block resident so its
-            // paragraphs are not reclaimed. Limit: the resident image is recorded
-            // in the arena only (no MCB chain, no INT 21h vector hand-off); the exit
-            // path is otherwise identical to AH=4Ch, so the machine frees nothing.
+            // the program resident. DX is the requested resident size in paragraphs;
+            // DOS 3+ keeps at least six paragraphs. Restore the saved termination,
+            // Ctrl-C, and critical-error vectors from the PSP before leaving.
             0x31 => {
-                self.keep_process_resident(regs.dx, mem)?;
+                let paras = regs.dx.max(0x0006);
+                self.restore_psp_saved_vectors(mem)?;
+                self.keep_process_resident(paras, mem)?;
                 Ok(DosAction::Exit((regs.ax & 0x00ff) as u8))
             }
             // AH=33h: Ctrl-Break flag. AL=00 gets DL, AL=01 sets it from DL.
@@ -11340,6 +11350,64 @@ mod tests {
         kernel.dispatch(0x21, &mut alloc, &mut mem).unwrap();
         assert!(!alloc.cf);
         assert_eq!(alloc.ax, 0x0100 + 0x0020 + 1);
+    }
+
+    #[test]
+    fn ah31_enforces_dos3_minimum_and_keeps_psp_owner() {
+        let (mut kernel, mut mem, _prog_top) = env_kernel();
+        let mut regs = DosRegs {
+            ax: 0x3100,
+            dx: 0x0001,
+            ..DosRegs::default()
+        };
+
+        assert_eq!(
+            kernel.dispatch(0x21, &mut regs, &mut mem).unwrap(),
+            DosAction::Exit(0)
+        );
+
+        assert!(kernel.arena.resident);
+        assert_eq!(kernel.arena.prog_top(&mem), 0x0100 + 0x0006);
+        let chain = read_mcb_chain(&mem, kernel.arena.first_mcb());
+        assert_eq!(chain[0].owner, 0x0100);
+        assert_eq!(chain[0].size, 0x0006);
+    }
+
+    #[test]
+    fn ah31_restores_psp_saved_vectors() {
+        let (mut kernel, mut mem, _prog_top) = env_kernel();
+        let psp = 0x0100usize * 16;
+        for (psp_off, int_no, saved_off, saved_seg, live_off, live_seg) in [
+            (0x0a, 0x22, 0x1111, 0x2222, 0xaaaa, 0xbbbb),
+            (0x0e, 0x23, 0x3333, 0x4444, 0xcccc, 0xdddd),
+            (0x12, 0x24, 0x5555, 0x6666, 0xeeee, 0xffff),
+        ] {
+            mem.write_u16(psp + psp_off, saved_off).unwrap();
+            mem.write_u16(psp + psp_off + 2, saved_seg).unwrap();
+            let ivt = int_no * 4;
+            mem.write_u16(ivt, live_off).unwrap();
+            mem.write_u16(ivt + 2, live_seg).unwrap();
+        }
+
+        let mut regs = DosRegs {
+            ax: 0x3100,
+            dx: 0x0020,
+            ..DosRegs::default()
+        };
+        assert_eq!(
+            kernel.dispatch(0x21, &mut regs, &mut mem).unwrap(),
+            DosAction::Exit(0)
+        );
+
+        for (int_no, expected_off, expected_seg) in [
+            (0x22, 0x1111, 0x2222),
+            (0x23, 0x3333, 0x4444),
+            (0x24, 0x5555, 0x6666),
+        ] {
+            let ivt = int_no * 4;
+            assert_eq!(mem.read_u16(ivt).unwrap(), expected_off);
+            assert_eq!(mem.read_u16(ivt + 2).unwrap(), expected_seg);
+        }
     }
 
     #[test]
