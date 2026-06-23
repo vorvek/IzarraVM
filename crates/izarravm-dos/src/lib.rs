@@ -988,7 +988,7 @@ impl DosKernel {
         };
         let mut file = match std::fs::File::open(&path) {
             Ok(f) => f,
-            Err(err) => return Ok(Err(dos_io_error_code(&err))),
+            Err(err) => return Ok(Err(dos_io_error_code_for_path(&err, &path))),
         };
         let mut image = Vec::new();
         if let Err(err) = file.read_to_end(&mut image) {
@@ -2403,7 +2403,7 @@ impl DosKernel {
                         regs.ax = handle;
                         regs.cf = false;
                     }
-                    Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
+                    Err(err) => set_dos_error(regs, dos_io_error_code_for_path(&err, &path)),
                 }
                 Ok(DosAction::Continue)
             }
@@ -2696,7 +2696,7 @@ impl DosKernel {
                 {
                     Ok(file) => {
                         if let Err(err) = apply_create_attributes(&path, regs.cx) {
-                            set_dos_error(regs, dos_io_error_code(&err));
+                            set_dos_error(regs, dos_io_error_code_for_path(&err, &path));
                             return Ok(DosAction::Continue);
                         }
                         self.open_files
@@ -2704,7 +2704,7 @@ impl DosKernel {
                         regs.ax = handle;
                         regs.cf = false;
                     }
-                    Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
+                    Err(err) => set_dos_error(regs, dos_io_error_code_for_path(&err, &path)),
                 }
                 Ok(DosAction::Continue)
             }
@@ -2720,7 +2720,7 @@ impl DosKernel {
                 };
                 match std::fs::create_dir(&path) {
                     Ok(()) => regs.cf = false,
-                    Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
+                    Err(err) => set_dos_error(regs, dos_io_error_code_for_path(&err, &path)),
                 }
                 Ok(DosAction::Continue)
             }
@@ -2735,7 +2735,7 @@ impl DosKernel {
                 };
                 match std::fs::remove_dir(&path) {
                     Ok(()) => regs.cf = false,
-                    Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
+                    Err(err) => set_dos_error(regs, dos_io_error_code_for_path(&err, &path)),
                 }
                 Ok(DosAction::Continue)
             }
@@ -2767,7 +2767,7 @@ impl DosKernel {
                 };
                 match std::fs::remove_file(&path) {
                     Ok(()) => regs.cf = false,
-                    Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
+                    Err(err) => set_dos_error(regs, dos_io_error_code_for_path(&err, &path)),
                 }
                 Ok(DosAction::Continue)
             }
@@ -2807,7 +2807,7 @@ impl DosKernel {
                 };
                 match std::fs::rename(&old, &new) {
                     Ok(()) => regs.cf = false,
-                    Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
+                    Err(err) => set_dos_error(regs, dos_rename_error_code(&err, &old, &new)),
                 }
                 Ok(DosAction::Continue)
             }
@@ -3258,7 +3258,7 @@ impl DosKernel {
                             regs.cx = attr;
                             regs.cf = false;
                         }
-                        Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
+                        Err(err) => set_dos_error(regs, dos_io_error_code_for_path(&err, &path)),
                     },
                     0x01 => match std::fs::metadata(&path) {
                         Ok(meta) => {
@@ -3266,10 +3266,12 @@ impl DosKernel {
                             perms.set_readonly(regs.cx & 0x01 != 0);
                             match std::fs::set_permissions(&path, perms) {
                                 Ok(()) => regs.cf = false,
-                                Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
+                                Err(err) => {
+                                    set_dos_error(regs, dos_io_error_code_for_path(&err, &path));
+                                }
                             }
                         }
-                        Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
+                        Err(err) => set_dos_error(regs, dos_io_error_code_for_path(&err, &path)),
                     },
                     _ => set_dos_error(regs, 0x01),
                 }
@@ -3304,7 +3306,7 @@ impl DosKernel {
                     Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                         set_dos_error(regs, 0x50) // file already exists
                     }
-                    Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
+                    Err(err) => set_dos_error(regs, dos_io_error_code_for_path(&err, &path)),
                 }
                 Ok(DosAction::Continue)
             }
@@ -3490,7 +3492,7 @@ impl DosKernel {
                         }
                         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
                         Err(err) => {
-                            self.fail(regs, dos_io_error_code(&err));
+                            self.fail(regs, dos_io_error_code_for_path(&err, &path));
                             return Ok(DosAction::Continue);
                         }
                     }
@@ -3577,7 +3579,7 @@ impl DosKernel {
                     Ok(file) => {
                         if action_taken != 1 {
                             if let Err(err) = apply_create_attributes(&path, regs.cx) {
-                                self.fail(regs, dos_io_error_code(&err));
+                                self.fail(regs, dos_io_error_code_for_path(&err, &path));
                                 return Ok(DosAction::Continue);
                             }
                         }
@@ -3587,7 +3589,7 @@ impl DosKernel {
                         regs.cx = action_taken;
                         regs.cf = false;
                     }
-                    Err(err) => self.fail(regs, dos_io_error_code(&err)),
+                    Err(err) => self.fail(regs, dos_io_error_code_for_path(&err, &path)),
                 }
                 Ok(DosAction::Continue)
             }
@@ -4028,14 +4030,47 @@ fn set_dos_error(regs: &mut DosRegs, code: u16) {
     regs.ax = code;
 }
 
-/// Map a host file io error to a DOS error code. NotFound is 0x02 (file not
-/// found); everything else, including permission failures, maps to 0x05 (access
-/// denied), the closest in-scope code. The host filesystem does not separate
-/// file-not-found from path-not-found, so 0x03 is reserved for path resolution.
+/// Map a host file I/O error to a DOS error code. Callers with the target path
+/// should prefer `dos_io_error_code_for_path`, which can split file-not-found
+/// from path-not-found.
 fn dos_io_error_code(err: &std::io::Error) -> u16 {
+    if is_too_many_open_files_error(err) {
+        return 0x04;
+    }
     match err.kind() {
         std::io::ErrorKind::NotFound => 0x02,
+        std::io::ErrorKind::InvalidInput => 0x0c,
         _ => 0x05,
+    }
+}
+
+fn dos_io_error_code_for_path(err: &std::io::Error, path: &Path) -> u16 {
+    if err.kind() == std::io::ErrorKind::NotFound && path_parent_is_missing(path) {
+        0x03
+    } else {
+        dos_io_error_code(err)
+    }
+}
+
+fn dos_rename_error_code(err: &std::io::Error, old: &Path, new: &Path) -> u16 {
+    if path_parent_is_missing(new) {
+        0x03
+    } else {
+        dos_io_error_code_for_path(err, old)
+    }
+}
+
+fn path_parent_is_missing(path: &Path) -> bool {
+    path.parent().is_some_and(|parent| !parent.exists())
+}
+
+fn is_too_many_open_files_error(err: &std::io::Error) -> bool {
+    match err.raw_os_error() {
+        #[cfg(windows)]
+        Some(4) => true,
+        #[cfg(unix)]
+        Some(23 | 24) => true,
+        _ => false,
     }
 }
 
@@ -4569,6 +4604,21 @@ fn read_asciiz(mem: &Memory, seg: u16, off: u16) -> Result<Option<String>, DosEr
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[cfg(windows)]
+    fn raw_too_many_open_files_error() -> i32 {
+        4
+    }
+
+    #[cfg(unix)]
+    fn raw_too_many_open_files_error() -> i32 {
+        24
+    }
+
+    #[cfg(not(any(windows, unix)))]
+    fn raw_too_many_open_files_error() -> i32 {
+        4
+    }
 
     #[test]
     fn toka_install_ensure_repair_format() {
@@ -6239,6 +6289,28 @@ mod tests {
         let regs = open(&mut kernel, &mut mem);
         assert!(regs.cf);
         assert_eq!(regs.ax, 0x02);
+    }
+
+    #[test]
+    fn open_missing_parent_sets_cf_and_ax03() {
+        let (mut kernel, mut mem, _dir) = kernel_with_drive(&[], r"C:\NOPE\DATA.TXT");
+        let regs = open(&mut kernel, &mut mem);
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x03);
+    }
+
+    #[test]
+    fn dos_io_error_code_splits_common_host_errors() {
+        assert_eq!(
+            dos_io_error_code(&std::io::Error::from(std::io::ErrorKind::InvalidInput)),
+            0x0c
+        );
+        assert_eq!(
+            dos_io_error_code(&std::io::Error::from_raw_os_error(
+                raw_too_many_open_files_error()
+            )),
+            0x04
+        );
     }
 
     #[test]
