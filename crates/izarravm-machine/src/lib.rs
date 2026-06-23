@@ -1078,6 +1078,35 @@ impl Machine {
         r.eflags = 0x0000_0202; // IF set: DOS programs start with interrupts on
     }
 
+    fn invoke_real_mode_interrupt(&mut self, vector: u8) -> Result<(), izarravm_dos::DosError> {
+        let ss_base = self.cpu.registers.segment(SegmentIndex::Ss).base;
+        let old_sp = self.cpu.registers.esp() as u16;
+        let old_flags = self.cpu.registers.eflags as u16;
+        let old_cs = self.cpu.registers.segment(SegmentIndex::Cs).selector;
+        let old_ip = self.cpu.registers.eip as u16;
+
+        let mut sp = old_sp.wrapping_sub(2);
+        self.memory
+            .write_u16((ss_base + u32::from(sp)) as usize, old_flags)?;
+        sp = sp.wrapping_sub(2);
+        self.memory
+            .write_u16((ss_base + u32::from(sp)) as usize, old_cs)?;
+        sp = sp.wrapping_sub(2);
+        self.memory
+            .write_u16((ss_base + u32::from(sp)) as usize, old_ip)?;
+
+        let vector_base = usize::from(vector) * 4;
+        let ip = self.memory.read_u16(vector_base)?;
+        let cs = self.memory.read_u16(vector_base + 2)?;
+
+        let r = &mut self.cpu.registers;
+        r.set_esp((r.esp() & 0xffff_0000) | u32::from(sp));
+        r.eflags &= !0x0000_0300; // clear IF and TF for interrupt entry
+        r.set_segment(SegmentIndex::Cs, SegmentRegister::real(cs));
+        r.eip = u32::from(ip);
+        Ok(())
+    }
+
     /// Install the resident keyboard BIOS for the DOS machine: point IVT[09h] and
     /// IVT[16h] at the handlers in the BIOS ROM (mapped at F000:0000), clear the
     /// BDA ring, program the PIC, and unmask IRQ1. IF is set at program entry so
@@ -4428,6 +4457,10 @@ impl Machine {
         Ok(match action {
             izarravm_dos::DosAction::Continue => None,
             izarravm_dos::DosAction::Exit(code) => Some(code),
+            izarravm_dos::DosAction::InvokeInterrupt(vector) => {
+                self.invoke_real_mode_interrupt(vector)?;
+                None
+            }
             izarravm_dos::DosAction::Exec { entry, child_ax } => {
                 // Snapshot the parent and switch to the child. The kernel has
                 // already saved its per-program state; we save the CPU side.
@@ -14132,6 +14165,29 @@ mod tests {
             env_seg + env_paras + 1,
             "AH=48h allocated segment follows the env block and its MCB header"
         );
+    }
+
+    #[test]
+    fn dos_ctrl_c_enters_guest_int23_handler() {
+        // org 0x100:
+        //   mov dx,handler / mov ax,2523h / int 21h ; install INT 23h
+        //   mov ah,01h / int 21h                   ; Ctrl-C should enter handler
+        //   mov ax,4c01h / int 21h                 ; failure path
+        // handler:
+        //   mov byte [0200h],23h / mov ax,4c00h / int 21h
+        let com: &[u8] = &[
+            0xba, 0x11, 0x01, 0xb8, 0x23, 0x25, 0xcd, 0x21, 0xb4, 0x01, 0xcd, 0x21, 0xb8, 0x01,
+            0x4c, 0xcd, 0x21, 0xc6, 0x06, 0x00, 0x02, 0x23, 0xb8, 0x00, 0x4c, 0xcd, 0x21,
+        ];
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
+                .unwrap();
+        machine.set_dos_stdin(&[0x03]);
+
+        let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
+
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
+        assert_eq!(machine.memory().read_u8(0x1200).unwrap(), 0x23);
     }
 
     #[test]

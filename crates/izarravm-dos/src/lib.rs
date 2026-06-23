@@ -32,6 +32,16 @@ fn kbd_ring_is_empty(mem: &Memory) -> Result<bool, DosError> {
     Ok(head == tail)
 }
 
+fn kbd_ring_peek(mem: &Memory) -> Result<Option<(u8, u8)>, DosError> {
+    let head = mem.read_u16(KBD_BDA_BASE + KBD_HEAD)?;
+    let tail = mem.read_u16(KBD_BDA_BASE + KBD_TAIL)?;
+    if head == tail {
+        return Ok(None);
+    }
+    let word = mem.read_u16(KBD_BDA_BASE + head as usize)?;
+    Ok(Some(((word >> 8) as u8, (word & 0xff) as u8)))
+}
+
 /// Dequeue the next (scancode, ascii) pair, advancing the head with wrap. None
 /// when the ring is empty.
 fn kbd_ring_dequeue(mem: &mut Memory) -> Result<Option<(u8, u8)>, DosError> {
@@ -324,8 +334,9 @@ pub struct DosRegs {
 /// What the caller should do after a handled software interrupt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DosAction {
-    Continue, // results are in DosRegs; the IRET stub returns to the caller
-    Exit(u8), // terminate the program with this code
+    Continue,            // results are in DosRegs; the IRET stub returns to the caller
+    Exit(u8),            // terminate the program with this code
+    InvokeInterrupt(u8), // route to a guest interrupt vector before returning
     /// AH=4Bh AL=0: switch the CPU to the child. The kernel has saved the parent
     /// context and built the child PSP/environment; the machine snapshots the
     /// parent CPU, applies `entry`, and sets the child AX to `child_ax` (FCB
@@ -524,6 +535,9 @@ pub struct DosKernel {
     last_exit_type: u8, // AH=4Dh AH; always 0x00 (normal termination), marked
     // AH=0Ch flush-and-invoke: the flush runs once, not again on a WaitForKey re-entry.
     cooked_flush_done: bool,
+    // AH=33h BREAK flag. The current HLE checks Ctrl-C on the DOS console calls
+    // either way, but the flag itself is guest-visible and must round-trip.
+    ctrl_break_enabled: bool,
     // Extended/function keys (arrows, F-keys) arrive on the ring as a (scancode, 0)
     // pair. DOS cooked input returns them as two reads: 0x00 first, then the scancode
     // on the next AH=01/06/07/08/0Ch call. This holds the scancode between the two.
@@ -2042,6 +2056,21 @@ impl DosKernel {
         }
     }
 
+    fn ctrl_c_action(&mut self) -> DosAction {
+        DosAction::InvokeInterrupt(0x23)
+    }
+
+    fn consume_pending_ctrl_c(&mut self, mem: &mut Memory) -> Result<bool, DosError> {
+        if self.pending_scancode.is_some() {
+            return Ok(false);
+        }
+        if matches!(kbd_ring_peek(mem)?, Some((_, 0x03))) {
+            let _ = kbd_ring_dequeue(mem)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// Read one character from the keyboard ring. Some -> set AL (and echo when
     /// asked) and Continue; None -> WaitForKey so the caller re-runs the INT.
     fn read_char(
@@ -2049,9 +2078,13 @@ impl DosKernel {
         regs: &mut DosRegs,
         mem: &mut Memory,
         echo: bool,
+        check_ctrl_c: bool,
     ) -> Result<DosAction, DosError> {
         match self.next_cooked_char(mem)? {
             Some((ch, extended)) => {
+                if check_ctrl_c && ch == 0x03 && !extended {
+                    return Ok(self.ctrl_c_action());
+                }
                 // Divergence (marked): real DOS echoes the 0x00 lead byte of an
                 // extended key and suppresses only the scancode. We suppress both,
                 // so neither a NUL nor a raw scancode is ever pushed to stdout.
@@ -2093,6 +2126,10 @@ impl DosKernel {
                 self.pending_line = Some((addr, count));
                 return Ok(DosAction::WaitForKey);
             };
+            if ascii == 0x03 {
+                self.pending_line = None;
+                return Ok(self.ctrl_c_action());
+            }
             match ascii {
                 0x0d => {
                     mem.write_u8(buf + 2 + usize::from(count), 0x0d)?;
@@ -2153,9 +2190,12 @@ impl DosKernel {
         match ah {
             // AH=01h: read one character with echo from the keyboard ring. An empty
             // ring blocks: the kernel returns WaitForKey and the machine re-runs the INT.
-            0x01 => self.read_char(regs, mem, true),
+            0x01 => self.read_char(regs, mem, true, true),
             // AH=02h: write the byte in DL to standard output. AL returns it (DOS 2+).
             0x02 => {
+                if self.consume_pending_ctrl_c(mem)? {
+                    return Ok(self.ctrl_c_action());
+                }
                 let ch = regs.dx as u8;
                 self.stdout.push(ch);
                 regs.ax = (regs.ax & 0xff00) | u16::from(ch);
@@ -2181,14 +2221,17 @@ impl DosKernel {
             }
             // AH=08h: read one character without echo from the keyboard ring. An empty
             // ring blocks via WaitForKey, the same as AH=01h.
-            0x08 => self.read_char(regs, mem, false),
+            0x08 => self.read_char(regs, mem, false, true),
             // AH=07h: read one character, no echo, no Ctrl-C check. Blocks.
-            0x07 => self.read_char(regs, mem, false),
+            0x07 => self.read_char(regs, mem, false, false),
             // AH=0Ah: buffered line input into DS:DX. Blocks until CR.
             0x0a => self.buffered_input(regs, mem),
             // AH=0Bh: get input status. ZF set and AL=0 when empty, ZF clear and
             // AL=0xFF when a character is waiting. Does not consume the character.
             0x0b => {
+                if self.consume_pending_ctrl_c(mem)? {
+                    return Ok(self.ctrl_c_action());
+                }
                 if self.pending_scancode.is_none() && kbd_ring_is_empty(mem)? {
                     regs.ax &= 0xff00;
                     regs.zf = true;
@@ -2209,7 +2252,7 @@ impl DosKernel {
                 }
                 let al = regs.ax as u8;
                 let result = match al {
-                    0x01 => self.read_char(regs, mem, true)?,
+                    0x01 => self.read_char(regs, mem, true, true)?,
                     0x06 => {
                         if regs.dx as u8 == 0xff {
                             match self.next_cooked_char(mem)? {
@@ -2222,7 +2265,8 @@ impl DosKernel {
                         }
                         DosAction::Continue
                     }
-                    0x07 | 0x08 => self.read_char(regs, mem, false)?,
+                    0x07 => self.read_char(regs, mem, false, false)?,
+                    0x08 => self.read_char(regs, mem, false, true)?,
                     0x0a => self.buffered_input(regs, mem)?,
                     _ => DosAction::Continue,
                 };
@@ -2231,8 +2275,11 @@ impl DosKernel {
                 }
                 Ok(result)
             }
-            // AH=09h: print the '$'-terminated string at DS:DX to standard output.
+            // AH=09h: write '$'-terminated string at DS:DX to stdout.
             0x09 => {
+                if self.consume_pending_ctrl_c(mem)? {
+                    return Ok(self.ctrl_c_action());
+                }
                 let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
                 let mut offset = 0usize;
                 loop {
@@ -2530,11 +2577,16 @@ impl DosKernel {
                 self.resident_regions.push(self.arena.chain_first);
                 Ok(DosAction::Exit((regs.ax & 0x00ff) as u8))
             }
-            // AH=33h: Ctrl-Break flag. Stub: AL=00 (get) returns DL=0 (off);
-            // AL=01 (set) is accepted as a no-op. No INT 23h state is tracked yet.
+            // AH=33h: Ctrl-Break flag. AL=00 gets DL, AL=01 sets it from DL.
             0x33 => {
-                if regs.ax as u8 == 0x00 {
-                    regs.dx &= 0xff00; // DL = 0 (off)
+                match regs.ax as u8 {
+                    0x00 => {
+                        regs.dx = (regs.dx & 0xff00) | u16::from(self.ctrl_break_enabled);
+                    }
+                    0x01 => {
+                        self.ctrl_break_enabled = regs.dx as u8 != 0;
+                    }
+                    _ => {}
                 }
                 Ok(DosAction::Continue)
             }
@@ -4733,6 +4785,47 @@ mod tests {
         };
         kernel.dispatch(0x21, &mut r2, &mut mem).unwrap();
         assert!(r2.zf, "the flush cleared the pending scancode");
+    }
+
+    #[test]
+    fn ah33_ctrl_break_flag_round_trips() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+
+        let mut set = DosRegs {
+            ax: 0x3301,
+            dx: 0x0001,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut set, &mut mem).unwrap();
+
+        let mut get = DosRegs {
+            ax: 0x3300,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut get, &mut mem).unwrap();
+
+        assert_eq!(get.dx & 0x00ff, 1, "AH=33h reports the stored BREAK flag");
+    }
+
+    #[test]
+    fn ah01_ctrl_c_invokes_int23_instead_of_returning_byte() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        seed_keyboard_ring(&mut mem, &[0x03]).unwrap();
+
+        let mut regs = DosRegs {
+            ax: 0x0100,
+            ..Default::default()
+        };
+        let action = kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+
+        assert_eq!(
+            action,
+            DosAction::InvokeInterrupt(0x23),
+            "Ctrl-C must dispatch INT 23h"
+        );
+        assert!(kernel.stdout().is_empty(), "Ctrl-C is consumed, not echoed");
     }
 
     #[test]
