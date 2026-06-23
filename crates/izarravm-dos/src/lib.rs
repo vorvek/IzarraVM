@@ -5063,8 +5063,8 @@ mod tests {
         assert_eq!(&read_chain_name(true), b"EMMXXXX0", "EMS chains after NUL");
         assert_eq!(
             &read_chain_name(false),
-            b"\0\0\0\0\0\0\0\0",
-            "no EMS leaves NUL ending the chain"
+            b"CON     ",
+            "no EMS links NUL to the standard CON device"
         );
     }
 
@@ -6935,14 +6935,17 @@ mod tests {
 
         // [BX+0x22] the NUL device header heads the driver chain.
         let nul = base + 0x22;
-        assert_eq!(
-            mem.read_u16(nul).unwrap(),
-            0xffff,
-            "NUL next link offset is FFFF (end of chain)"
-        );
+        let clock_off = mem.read_u16(base + 0x08).unwrap();
+        let clock_seg = mem.read_u16(base + 0x0a).unwrap();
+        let con_off = mem.read_u16(base + 0x0c).unwrap();
+        let con_seg = mem.read_u16(base + 0x0e).unwrap();
+        assert_ne!((clock_seg, clock_off), (0, 0), "CLOCK$ pointer");
+        assert_ne!((con_seg, con_off), (0, 0), "CON pointer");
+
+        assert_eq!(mem.read_u16(nul).unwrap(), con_off, "NUL links to CON");
         assert_eq!(
             mem.read_u16(nul + 2).unwrap(),
-            0xffff,
+            con_seg,
             "NUL next link segment"
         );
         assert_eq!(
@@ -6965,6 +6968,44 @@ mod tests {
             .collect();
         assert_eq!(&name, b"NUL     ", "NUL device name");
 
+        let con = usize::from(con_seg) * 16 + usize::from(con_off);
+        assert_eq!(mem.read_u16(con).unwrap(), clock_off, "CON links to CLOCK$");
+        assert_eq!(
+            mem.read_u16(con + 2).unwrap(),
+            clock_seg,
+            "CON next link segment"
+        );
+        assert_eq!(
+            mem.read_u16(con + 4).unwrap(),
+            0x8013,
+            "CON attribute: char + special + stdin + stdout"
+        );
+        let con_name: Vec<u8> = (0..8)
+            .map(|i| mem.read_u8(con + 0x0a + i).unwrap())
+            .collect();
+        assert_eq!(&con_name, b"CON     ", "CON device name");
+
+        let clock = usize::from(clock_seg) * 16 + usize::from(clock_off);
+        assert_eq!(
+            mem.read_u16(clock).unwrap(),
+            0xffff,
+            "CLOCK$ terminates chain"
+        );
+        assert_eq!(
+            mem.read_u16(clock + 2).unwrap(),
+            0xffff,
+            "CLOCK$ next link segment"
+        );
+        assert_eq!(
+            mem.read_u16(clock + 4).unwrap(),
+            0x8008,
+            "CLOCK$ attribute: char + clock"
+        );
+        let clock_name: Vec<u8> = (0..8)
+            .map(|i| mem.read_u8(clock + 0x0a + i).unwrap())
+            .collect();
+        assert_eq!(&clock_name, b"CLOCK$  ", "CLOCK$ device name");
+
         assert_eq!(
             mem.read_u8(base + 0x20).unwrap(),
             1,
@@ -6974,6 +7015,46 @@ mod tests {
             (mem.read_u16(base + 2).unwrap(), mem.read_u16(base).unwrap()),
             (0, 0),
             "[BX+0x00] points at the first DPB"
+        );
+    }
+
+    #[test]
+    fn ah52_keeps_emmxxxx0_between_nul_and_standard_devices() {
+        let (mut kernel, mut mem) = arena_kernel();
+        kernel.set_ems_present(true);
+        let mut regs = DosRegs {
+            ax: 0x5200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        let base = usize::from(regs.es) * 16 + usize::from(regs.bx);
+
+        let nul = base + 0x22;
+        let ems_off = mem.read_u16(nul).unwrap();
+        let ems_seg = mem.read_u16(nul + 2).unwrap();
+        let con_off = mem.read_u16(base + 0x0c).unwrap();
+        let con_seg = mem.read_u16(base + 0x0e).unwrap();
+        assert_ne!(
+            (ems_seg, ems_off),
+            (0xffff, 0xffff),
+            "NUL links to EMMXXXX0"
+        );
+
+        let ems = usize::from(ems_seg) * 16 + usize::from(ems_off);
+        let ems_name: Vec<u8> = (0..8)
+            .map(|i| mem.read_u8(ems + 0x0a + i).unwrap())
+            .collect();
+        assert_eq!(&ems_name, b"EMMXXXX0", "EMMXXXX0 stays after NUL");
+        assert_eq!(
+            mem.read_u16(ems + 4).unwrap(),
+            0xc000,
+            "EMMXXXX0 attributes"
+        );
+        assert_eq!(mem.read_u16(ems).unwrap(), con_off, "EMMXXXX0 links to CON");
+        assert_eq!(
+            mem.read_u16(ems + 2).unwrap(),
+            con_seg,
+            "EMMXXXX0 next link segment"
         );
     }
 

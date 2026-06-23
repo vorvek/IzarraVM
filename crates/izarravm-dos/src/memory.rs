@@ -36,7 +36,12 @@ const DEFAULT_LASTDRIVE: u8 = 5;
 /// default CDS array is slightly too large for this low-memory scratch paragraph,
 /// so entries that do not fit are left blank until the DOS data segment is given a
 /// larger owned block.
-const SFT_TABLE_OFF: usize = 0x50;
+const DEVICE_HEADER_LEN: usize = 0x12;
+const NUL_DEVICE_OFF: usize = 0x22;
+const EMM_DEVICE_OFF: usize = NUL_DEVICE_OFF + DEVICE_HEADER_LEN;
+const CON_DEVICE_OFF: usize = EMM_DEVICE_OFF + DEVICE_HEADER_LEN;
+const CLOCK_DEVICE_OFF: usize = CON_DEVICE_OFF + DEVICE_HEADER_LEN;
+const SFT_TABLE_OFF: usize = 0x70;
 const SFT_HEADER_LEN: usize = 0x06;
 const SFT_ENTRY_LEN: usize = 0x3b;
 const STANDARD_SFT_SLOTS: usize = 5;
@@ -51,6 +56,25 @@ pub(super) struct SftHostFileEntry {
     pub(super) size: u32,
     pub(super) position: u32,
     pub(super) name: [u8; 11],
+}
+
+fn write_character_device_header(
+    mem: &mut Memory,
+    linear: usize,
+    next_off: u16,
+    next_seg: u16,
+    attributes: u16,
+    name: &[u8; 8],
+) -> Result<(), DosError> {
+    mem.write_u16(linear, next_off)?;
+    mem.write_u16(linear + 2, next_seg)?;
+    mem.write_u16(linear + 4, attributes)?;
+    mem.write_u16(linear + 6, 0xffff)?;
+    mem.write_u16(linear + 8, 0xffff)?;
+    for (i, &byte) in name.iter().enumerate() {
+        mem.write_u8(linear + 0x0a + i, byte)?;
+    }
+    Ok(())
 }
 
 /// Conventional memory modeled as an authoritative in-RAM MCB chain ending at
@@ -632,36 +656,35 @@ pub(super) fn write_sysvars(
         mem.write_u16(entry + 0x4d, 0xffff)?;
         mem.write_u16(entry + 0x4f, 2)?; // hide "X:" from GETDIR-style views
     }
-    // [BX+0x22]: the NUL device header, the head of the device-driver chain.
-    let nul_off = 0x22usize; // BX-relative offset of the NUL header
-    let ems_off = nul_off + 0x12; // the EMMXXXX0 header right after NUL
-    let nul = base + 2 + nul_off;
+    // [BX+0x08] and [BX+0x0c] point at the active CLOCK$ and CON headers. NUL
+    // remains the first linked device; EMMXXXX0, when present, stays directly
+    // after NUL before the standard devices.
+    let clock_ptr = (2 + CLOCK_DEVICE_OFF) as u16;
+    let con_ptr = (2 + CON_DEVICE_OFF) as u16;
+    mem.write_u16(base + 2 + 0x08, clock_ptr)?;
+    mem.write_u16(base + 2 + 0x0a, SYSVARS_SEG)?;
+    mem.write_u16(base + 2 + 0x0c, con_ptr)?;
+    mem.write_u16(base + 2 + 0x0e, SYSVARS_SEG)?;
+
+    let nul = base + 2 + NUL_DEVICE_OFF;
+    let ems = base + 2 + EMM_DEVICE_OFF;
+    let con = base + 2 + CON_DEVICE_OFF;
+    let clock = base + 2 + CLOCK_DEVICE_OFF;
     if ems_present {
-        mem.write_u16(nul, (2 + ems_off) as u16)?; // next offset
-        mem.write_u16(nul + 2, SYSVARS_SEG)?; // next segment
+        write_character_device_header(
+            mem,
+            nul,
+            (2 + EMM_DEVICE_OFF) as u16,
+            SYSVARS_SEG,
+            0x8004,
+            b"NUL     ",
+        )?;
+        write_character_device_header(mem, ems, con_ptr, SYSVARS_SEG, 0xc000, b"EMMXXXX0")?;
     } else {
-        mem.write_u16(nul, 0xffff)?;
-        mem.write_u16(nul + 2, 0xffff)?; // FFFF:FFFF = end
+        write_character_device_header(mem, nul, con_ptr, SYSVARS_SEG, 0x8004, b"NUL     ")?;
     }
-    mem.write_u16(nul + 4, 0x8004)?; // attribute: char device, NUL bit
-    mem.write_u16(nul + 6, 0xffff)?; // strategy entry (none)
-    mem.write_u16(nul + 8, 0xffff)?; // interrupt entry (none)
-    for (i, &byte) in b"NUL     ".iter().enumerate() {
-        mem.write_u8(nul + 0x0a + i, byte)?;
-    }
-    // The EMMXXXX0 device header terminates the chain when EMS is present, so a
-    // guest walking the device list finds the manager by name.
-    if ems_present {
-        let ems = base + 2 + ems_off;
-        mem.write_u16(ems, 0xffff)?; // next offset
-        mem.write_u16(ems + 2, 0xffff)?; // next segment (end)
-        mem.write_u16(ems + 4, 0xc000)?; // attribute: character device
-        mem.write_u16(ems + 6, 0xffff)?; // strategy entry (none)
-        mem.write_u16(ems + 8, 0xffff)?; // interrupt entry (none)
-        for (i, &byte) in b"EMMXXXX0".iter().enumerate() {
-            mem.write_u8(ems + 0x0a + i, byte)?;
-        }
-    }
+    write_character_device_header(mem, con, clock_ptr, SYSVARS_SEG, 0x8013, b"CON     ")?;
+    write_character_device_header(mem, clock, 0xffff, 0xffff, 0x8008, b"CLOCK$  ")?;
     Ok((SYSVARS_SEG, 0x0002))
 }
 
