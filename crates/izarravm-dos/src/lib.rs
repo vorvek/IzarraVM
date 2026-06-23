@@ -2198,7 +2198,10 @@ impl DosKernel {
         mem: &mut Memory,
     ) -> Result<DosAction, DosError> {
         match vector {
-            0x20 => Ok(DosAction::Exit(0)),
+            0x20 => {
+                self.restore_psp_saved_vectors(mem)?;
+                Ok(DosAction::Exit(0))
+            }
             0x27 => {
                 let bytes = regs.dx.clamp(DOS_INT27_MIN_RESIDENT_BYTES, 0xfff0);
                 let paras = bytes.div_ceil(16);
@@ -2843,7 +2846,10 @@ impl DosKernel {
                 Ok(DosAction::Continue)
             }
             // AH=4Ch: terminate with the return code in AL.
-            0x4c => Ok(DosAction::Exit((regs.ax & 0x00ff) as u8)),
+            0x4c => {
+                self.restore_psp_saved_vectors(mem)?;
+                Ok(DosAction::Exit((regs.ax & 0x00ff) as u8))
+            }
             // AH=31h KEEP PROCESS (TSR): terminate with the AL return code but leave
             // the program resident. DX is the requested resident size in paragraphs;
             // DOS 3+ keeps at least six paragraphs. Restore the saved termination,
@@ -3286,7 +3292,10 @@ impl DosKernel {
             }
             // AH=00h: terminate the program, the old .COM exit path. Equivalent to
             // INT 20h: return with exit code 0.
-            0x00 => Ok(DosAction::Exit(0)),
+            0x00 => {
+                self.restore_psp_saved_vectors(mem)?;
+                Ok(DosAction::Exit(0))
+            }
             // AH=50h: set the current PSP segment (SET PID). AH=51h/62h get it. The
             // kernel tracks the active PSP as the arena's program segment.
             0x50 => {
@@ -5481,6 +5490,23 @@ mod tests {
     }
 
     #[test]
+    fn ah00_restores_psp_saved_vectors() {
+        let (mut kernel, mut mem, _prog_top) = env_kernel();
+        seed_psp_saved_and_live_vectors(&mut mem);
+        let mut regs = DosRegs {
+            ax: 0x0000,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            kernel.dispatch(0x21, &mut regs, &mut mem).unwrap(),
+            DosAction::Exit(0)
+        );
+
+        assert_psp_saved_vectors_restored(&mem);
+    }
+
+    #[test]
     fn ah50_51_62_get_and_set_current_psp() {
         let mut kernel = DosKernel::new();
         let mut mem = Memory::new(64 * 1024).unwrap();
@@ -6540,6 +6566,23 @@ mod tests {
     }
 
     #[test]
+    fn ah4c_restores_psp_saved_vectors() {
+        let (mut kernel, mut mem, _prog_top) = env_kernel();
+        seed_psp_saved_and_live_vectors(&mut mem);
+        let mut regs = DosRegs {
+            ax: 0x4c07,
+            ..DosRegs::default()
+        };
+
+        assert_eq!(
+            kernel.dispatch(0x21, &mut regs, &mut mem).unwrap(),
+            DosAction::Exit(7)
+        );
+
+        assert_psp_saved_vectors_restored(&mem);
+    }
+
+    #[test]
     fn int20_exits_with_zero() {
         let mut mem = Memory::new(4096).unwrap();
         let mut regs = DosRegs::default();
@@ -6548,6 +6591,20 @@ mod tests {
             kernel.dispatch(0x20, &mut regs, &mut mem).unwrap(),
             DosAction::Exit(0)
         );
+    }
+
+    #[test]
+    fn int20_restores_psp_saved_vectors() {
+        let (mut kernel, mut mem, _prog_top) = env_kernel();
+        seed_psp_saved_and_live_vectors(&mut mem);
+        let mut regs = DosRegs::default();
+
+        assert_eq!(
+            kernel.dispatch(0x20, &mut regs, &mut mem).unwrap(),
+            DosAction::Exit(0)
+        );
+
+        assert_psp_saved_vectors_restored(&mem);
     }
 
     #[test]
@@ -11625,9 +11682,7 @@ mod tests {
         assert_eq!(chain[0].size, 0x0006);
     }
 
-    #[test]
-    fn ah31_restores_psp_saved_vectors() {
-        let (mut kernel, mut mem, _prog_top) = env_kernel();
+    fn seed_psp_saved_and_live_vectors(mem: &mut Memory) {
         let psp = 0x0100usize * 16;
         for (psp_off, int_no, saved_off, saved_seg, live_off, live_seg) in [
             (0x0a, 0x22, 0x1111, 0x2222, 0xaaaa, 0xbbbb),
@@ -11640,6 +11695,24 @@ mod tests {
             mem.write_u16(ivt, live_off).unwrap();
             mem.write_u16(ivt + 2, live_seg).unwrap();
         }
+    }
+
+    fn assert_psp_saved_vectors_restored(mem: &Memory) {
+        for (int_no, expected_off, expected_seg) in [
+            (0x22, 0x1111, 0x2222),
+            (0x23, 0x3333, 0x4444),
+            (0x24, 0x5555, 0x6666),
+        ] {
+            let ivt = int_no * 4;
+            assert_eq!(mem.read_u16(ivt).unwrap(), expected_off);
+            assert_eq!(mem.read_u16(ivt + 2).unwrap(), expected_seg);
+        }
+    }
+
+    #[test]
+    fn ah31_restores_psp_saved_vectors() {
+        let (mut kernel, mut mem, _prog_top) = env_kernel();
+        seed_psp_saved_and_live_vectors(&mut mem);
 
         let mut regs = DosRegs {
             ax: 0x3100,
@@ -11651,15 +11724,7 @@ mod tests {
             DosAction::Exit(0)
         );
 
-        for (int_no, expected_off, expected_seg) in [
-            (0x22, 0x1111, 0x2222),
-            (0x23, 0x3333, 0x4444),
-            (0x24, 0x5555, 0x6666),
-        ] {
-            let ivt = int_no * 4;
-            assert_eq!(mem.read_u16(ivt).unwrap(), expected_off);
-            assert_eq!(mem.read_u16(ivt + 2).unwrap(), expected_seg);
-        }
+        assert_psp_saved_vectors_restored(&mem);
     }
 
     #[test]
