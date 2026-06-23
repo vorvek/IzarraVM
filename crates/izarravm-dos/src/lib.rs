@@ -6965,11 +6965,69 @@ mod tests {
             .collect();
         assert_eq!(&name, b"NUL     ", "NUL device name");
 
-        // A parked chain pointer (the first DPB at [BX+0]) stays zero for now.
         assert_eq!(
-            mem.read_u16(base).unwrap(),
+            mem.read_u8(base + 0x20).unwrap(),
+            1,
+            "one block device is installed"
+        );
+        assert_ne!(
+            (mem.read_u16(base + 2).unwrap(), mem.read_u16(base).unwrap()),
+            (0, 0),
+            "[BX+0x00] points at the first DPB"
+        );
+    }
+
+    #[test]
+    fn ah52_publishes_a_c_drive_dpb_chain() {
+        let (mut kernel, mut mem) = arena_kernel();
+        let mut regs = DosRegs {
+            ax: 0x5200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        let base = usize::from(regs.es) * 16 + usize::from(regs.bx);
+
+        let dpb_off = mem.read_u16(base).unwrap();
+        let dpb_seg = mem.read_u16(base + 2).unwrap();
+        assert_ne!(
+            (dpb_seg, dpb_off),
+            (0, 0),
+            "[BX+0x00] points at the first DPB"
+        );
+        let dpb = usize::from(dpb_seg) * 16 + usize::from(dpb_off);
+        assert_eq!(mem.read_u8(dpb).unwrap(), 2, "DPB drive number is C:");
+        assert_eq!(
+            mem.read_u8(dpb + 0x01).unwrap(),
             0,
-            "the unmodeled DPB pointer is left zero"
+            "first block-device unit"
+        );
+        assert_eq!(mem.read_u16(dpb + 0x02).unwrap(), 512, "bytes per sector");
+        assert_eq!(
+            mem.read_u8(dpb + 0x04).unwrap(),
+            63,
+            "64 sectors per cluster minus one"
+        );
+        assert_eq!(mem.read_u8(dpb + 0x05).unwrap(), 6, "cluster shift");
+        assert_eq!(mem.read_u16(dpb + 0x0f).unwrap(), 256, "sectors per FAT");
+        assert_eq!(
+            mem.read_u16(dpb + 0x11).unwrap(),
+            513,
+            "first root directory sector"
+        );
+        assert_eq!(mem.read_u8(dpb + 0x17).unwrap(), 0xf8, "fixed disk media");
+        assert_eq!(mem.read_u8(dpb + 0x18).unwrap(), 0, "disk accessed flag");
+        assert_eq!(
+            (
+                mem.read_u16(dpb + 0x1b).unwrap(),
+                mem.read_u16(dpb + 0x19).unwrap()
+            ),
+            (0xffff, 0xffff),
+            "the single DPB terminates the chain"
+        );
+        assert_eq!(
+            mem.read_u16(dpb + 0x1f).unwrap(),
+            0xf000,
+            "free clusters match AH=36h"
         );
     }
 
@@ -6984,6 +7042,8 @@ mod tests {
         };
         kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
         let base = usize::from(regs.es) * 16 + usize::from(regs.bx);
+        let dpb_off = mem.read_u16(base).unwrap();
+        let dpb_seg = mem.read_u16(base + 2).unwrap();
 
         let cds_off = mem.read_u16(base + 0x16).unwrap();
         let cds_seg = mem.read_u16(base + 0x18).unwrap();
@@ -7018,6 +7078,16 @@ mod tests {
             mem.read_u16(c_drive + 0x43).unwrap(),
             0x4000,
             "C: is marked as a physical local drive"
+        );
+        assert_eq!(
+            mem.read_u16(c_drive + 0x45).unwrap(),
+            dpb_off,
+            "C: CDS points at the C: DPB offset"
+        );
+        assert_eq!(
+            mem.read_u16(c_drive + 0x47).unwrap(),
+            dpb_seg,
+            "C: CDS points at the C: DPB segment"
         );
     }
 
@@ -7170,6 +7240,7 @@ mod tests {
     fn ah52_refreshes_host_file_sft_offset_after_read_write_and_seek() {
         let (mut kernel, mut mem, _dir) =
             kernel_with_drive(&[("LEVEL1.DAT", b"abcdef")], r"C:\LEVEL1.DAT");
+        kernel.init_program(0x0100, 0x1100, &mut mem).unwrap();
         let mut open = DosRegs {
             ax: 0x3d02,
             ds: 0x0100,
@@ -7179,6 +7250,7 @@ mod tests {
         kernel.dispatch(0x21, &mut open, &mut mem).unwrap();
         assert!(!open.cf, "the read/write host file opens");
         let handle = open.ax;
+        assert_eq!(handle, 5, "the first dynamic handle is 5");
 
         let read = read(&mut kernel, &mut mem, handle, 2, 0x0400);
         assert!(!read.cf);
