@@ -438,6 +438,15 @@ fn open_host_file(path: &Path, mode: AccessMode) -> std::io::Result<File> {
     }
 }
 
+/// Map the DOS create attribute bits that have a host equivalent. Hidden, system,
+/// and archive are not represented in the host filesystem facade, but read-only
+/// maps cleanly to permissions and is visible through AH=43h.
+fn apply_create_attributes(path: &Path, attrs: u16) -> std::io::Result<()> {
+    let mut perms = std::fs::metadata(path)?.permissions();
+    perms.set_readonly(attrs & 0x0001 != 0);
+    std::fs::set_permissions(path, perms)
+}
+
 /// Whether a DOS filename names the EMMXXXX0 character device. DOS matches a
 /// device by its base name regardless of drive, path, or extension, so EMMXXXX0,
 /// C:\EMMXXXX0, and EMMXXXX0.SYS all refer to the device.
@@ -2458,9 +2467,10 @@ impl DosKernel {
                 regs.ax = (regs.ax & 0xff00) | 0x01;
                 Ok(DosAction::Continue)
             }
-            // AH=3Ch: create or truncate a file at DS:DX (ASCIIZ). CX = attributes
-            // (ignored; the host has no DOS attribute bits, marked). Opens read/write,
-            // truncating an existing file to zero. CF=0 + AX=handle, or CF=1 + AX=code.
+            // AH=3Ch: create or truncate a file at DS:DX (ASCIIZ). CX = attributes;
+            // the read-only bit maps to host permissions, other bits are not modeled.
+            // Opens read/write, truncating an existing file to zero. CF=0 + AX=handle,
+            // or CF=1 + AX=code.
             0x3c => {
                 let path = match self.resolve_open_path(mem, regs.ds, regs.dx)? {
                     Ok(path) => path,
@@ -2481,6 +2491,10 @@ impl DosKernel {
                     .open(&path)
                 {
                     Ok(file) => {
+                        if let Err(err) = apply_create_attributes(&path, regs.cx) {
+                            set_dos_error(regs, dos_io_error_code(&err));
+                            return Ok(DosAction::Continue);
+                        }
                         self.open_files
                             .insert(handle, open_file_record(file, AccessMode::ReadWrite, &path));
                         regs.ax = handle;
@@ -3301,7 +3315,7 @@ impl DosKernel {
             }
             // AH=6Ch EXTENDED OPEN/CREATE: a superset of AH=3Dh open and AH=3Ch
             // create. BX = access/share mode (low 3 bits are the access mode), CX =
-            // attributes for a created file (ignored, as in 3Ch), DX = action flags
+            // attributes for a created or replaced file, DX = action flags
             // (bit 0 open-if-exists, bit 1 replace/truncate-if-exists, bit 4
             // create-if-not-exists), DS:SI = ASCIIZ filename. On success CF=0,
             // AX=handle, CX=action taken (1 opened, 2 created, 3 truncated). On
@@ -3361,6 +3375,12 @@ impl DosKernel {
                 };
                 match result {
                     Ok(file) => {
+                        if action_taken != 1 {
+                            if let Err(err) = apply_create_attributes(&path, regs.cx) {
+                                self.fail(regs, dos_io_error_code(&err));
+                                return Ok(DosAction::Continue);
+                            }
+                        }
                         self.open_files
                             .insert(handle, open_file_record(file, mode, &path));
                         regs.ax = handle;
@@ -7942,6 +7962,26 @@ mod tests {
     }
 
     #[test]
+    fn ah3c_honors_the_readonly_create_attribute() {
+        let (mut kernel, mut mem, dir) = kernel_with_drive(&[], r"C:\RO.TXT");
+        let mut regs = DosRegs {
+            ax: 0x3c00,
+            cx: 0x0001,
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf, "create failed: ax={:#06x}", regs.ax);
+
+        let path = dir.path().join("RO.TXT");
+        assert!(
+            std::fs::metadata(path).unwrap().permissions().readonly(),
+            "CX bit 0 creates a read-only host file"
+        );
+    }
+
+    #[test]
     fn ah3c_truncates_an_existing_file() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("OLD.TXT"), b"previous contents").unwrap();
@@ -10314,6 +10354,29 @@ mod tests {
         assert!(!create.cf, "create failed: ax={:#06x}", create.ax);
         assert_eq!(create.cx, 2); // created
         assert!(dir.path().join("MADE.TXT").exists());
+    }
+
+    #[test]
+    fn ah6c_honors_the_readonly_create_attribute() {
+        let (mut kernel, mut mem, dir) = kernel_with_drive(&[], r"C:\RO6C.TXT");
+        let mut regs = DosRegs {
+            ax: 0x6c00,
+            bx: 0x0002,
+            cx: 0x0001,
+            dx: 0x0010,
+            ds: 0x0100,
+            si: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf, "extended create failed: ax={:#06x}", regs.ax);
+        assert_eq!(regs.cx, 2);
+
+        let path = dir.path().join("RO6C.TXT");
+        assert!(
+            std::fs::metadata(path).unwrap().permissions().readonly(),
+            "CX bit 0 creates a read-only host file"
+        );
     }
 
     #[test]
