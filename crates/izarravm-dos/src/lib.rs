@@ -1490,8 +1490,8 @@ impl DosKernel {
 
     /// AH=14h SEQUENTIAL READ. Read one record (FCB record size) from the file
     /// position the current block/record select into the DTA, then advance the
-    /// record number. AL=00 read in full, 01 EOF (no data), 03 a partial record
-    /// (the last record, zero-padded into the DTA).
+    /// record number. AL=00 read in full, 01 EOF/no data, 02 DTA segment wrap,
+    /// 03 a partial record (the last record, zero-padded into the DTA).
     fn fcb_seq_read(
         &mut self,
         mem: &mut Memory,
@@ -1501,7 +1501,7 @@ impl DosKernel {
         let path = match self.fcb_path(mem, regs)? {
             Ok(path) => path,
             Err(()) => {
-                regs.ax = (regs.ax & 0xff00) | 0xff;
+                regs.ax = (regs.ax & 0xff00) | 0x01;
                 return Ok(DosAction::Continue);
             }
         };
@@ -1510,10 +1510,14 @@ impl DosKernel {
         let current = mem.read_u8(base + FCB_CURREC)?;
         let pos = fcb_seq_position(block, current, record_size);
         let size = if record_size == 0 { 128 } else { record_size };
+        if !fcb_dta_transfer_fits(self.dta, usize::from(size)) {
+            regs.ax = (regs.ax & 0xff00) | 0x02;
+            return Ok(DosAction::Continue);
+        }
         let mut file = match File::open(&path) {
             Ok(f) => f,
             Err(_) => {
-                regs.ax = (regs.ax & 0xff00) | 0xff;
+                regs.ax = (regs.ax & 0xff00) | 0x01;
                 return Ok(DosAction::Continue);
             }
         };
@@ -1540,7 +1544,7 @@ impl DosKernel {
 
     /// AH=15h SEQUENTIAL WRITE. Write one record (FCB record size) from the DTA to
     /// the file position the current block/record select, then advance the record
-    /// number. AL=00 on success, 0xFF on a host error.
+    /// number. AL=00 on success, 01 on a host write error, 02 on DTA segment wrap.
     fn fcb_seq_write(
         &mut self,
         mem: &mut Memory,
@@ -1550,7 +1554,7 @@ impl DosKernel {
         let path = match self.fcb_path(mem, regs)? {
             Ok(path) => path,
             Err(()) => {
-                regs.ax = (regs.ax & 0xff00) | 0xff;
+                regs.ax = (regs.ax & 0xff00) | 0x01;
                 return Ok(DosAction::Continue);
             }
         };
@@ -1559,6 +1563,10 @@ impl DosKernel {
         let current = mem.read_u8(base + FCB_CURREC)?;
         let pos = fcb_seq_position(block, current, record_size);
         let size = if record_size == 0 { 128 } else { record_size };
+        if !fcb_dta_transfer_fits(self.dta, usize::from(size)) {
+            regs.ax = (regs.ax & 0xff00) | 0x02;
+            return Ok(DosAction::Continue);
+        }
         let dta = usize::from(self.dta.0) * 16 + usize::from(self.dta.1);
         let mut record = vec![0u8; usize::from(size)];
         for (i, slot) in record.iter_mut().enumerate() {
@@ -1567,12 +1575,12 @@ impl DosKernel {
         let mut file = match OpenOptions::new().read(true).write(true).open(&path) {
             Ok(f) => f,
             Err(_) => {
-                regs.ax = (regs.ax & 0xff00) | 0xff;
+                regs.ax = (regs.ax & 0xff00) | 0x01;
                 return Ok(DosAction::Continue);
             }
         };
         if file.seek(SeekFrom::Start(pos)).is_err() || file.write_all(&record).is_err() {
-            regs.ax = (regs.ax & 0xff00) | 0xff;
+            regs.ax = (regs.ax & 0xff00) | 0x01;
             return Ok(DosAction::Continue);
         }
         // Keep the FCB file-size field current so a following AH=23h is accurate.
@@ -1614,8 +1622,7 @@ impl DosKernel {
     /// 0x21 selects into the DTA, leaving the random-record field unchanged but
     /// syncing the current block/record to it (RBIL: AH=21h sets the block/record
     /// from the random record). AL=00 read in full, 01 EOF (no data, DTA left
-    /// untouched), 03 partial final record (zero-padded). 0xFF if the FCB names no
-    /// resolvable file.
+    /// untouched), 02 DTA segment wrap, 03 partial final record (zero-padded).
     fn fcb_random_read(
         &mut self,
         mem: &mut Memory,
@@ -1625,7 +1632,7 @@ impl DosKernel {
         let path = match self.fcb_path(mem, regs)? {
             Ok(path) => path,
             Err(()) => {
-                regs.ax = (regs.ax & 0xff00) | 0xff;
+                regs.ax = (regs.ax & 0xff00) | 0x01;
                 return Ok(DosAction::Continue);
             }
         };
@@ -1634,10 +1641,14 @@ impl DosKernel {
         fcb_sync_block_record_from_random(mem, base, random)?;
         let size = if record_size == 0 { 128 } else { record_size };
         let pos = u64::from(random) * u64::from(size);
+        if !fcb_dta_transfer_fits(self.dta, usize::from(size)) {
+            regs.ax = (regs.ax & 0xff00) | 0x02;
+            return Ok(DosAction::Continue);
+        }
         let mut file = match File::open(&path) {
             Ok(f) => f,
             Err(_) => {
-                regs.ax = (regs.ax & 0xff00) | 0xff;
+                regs.ax = (regs.ax & 0xff00) | 0x01;
                 return Ok(DosAction::Continue);
             }
         };
@@ -1662,7 +1673,7 @@ impl DosKernel {
 
     /// AH=22h RANDOM WRITE. Write the single record at the DTA to the position the
     /// FCB random-record field selects. The current block/record sync to the random
-    /// record. AL=00 success, 0xFF on a host error or an unresolvable FCB.
+    /// record. AL=00 success, 01 on a host write error, 02 on DTA segment wrap.
     fn fcb_random_write(
         &mut self,
         mem: &mut Memory,
@@ -1672,7 +1683,7 @@ impl DosKernel {
         let path = match self.fcb_path(mem, regs)? {
             Ok(path) => path,
             Err(()) => {
-                regs.ax = (regs.ax & 0xff00) | 0xff;
+                regs.ax = (regs.ax & 0xff00) | 0x01;
                 return Ok(DosAction::Continue);
             }
         };
@@ -1681,6 +1692,10 @@ impl DosKernel {
         fcb_sync_block_record_from_random(mem, base, random)?;
         let size = if record_size == 0 { 128 } else { record_size };
         let pos = u64::from(random) * u64::from(size);
+        if !fcb_dta_transfer_fits(self.dta, usize::from(size)) {
+            regs.ax = (regs.ax & 0xff00) | 0x02;
+            return Ok(DosAction::Continue);
+        }
         let dta = usize::from(self.dta.0) * 16 + usize::from(self.dta.1);
         let mut record = vec![0u8; usize::from(size)];
         for (i, slot) in record.iter_mut().enumerate() {
@@ -1689,12 +1704,12 @@ impl DosKernel {
         let mut file = match OpenOptions::new().read(true).write(true).open(&path) {
             Ok(f) => f,
             Err(_) => {
-                regs.ax = (regs.ax & 0xff00) | 0xff;
+                regs.ax = (regs.ax & 0xff00) | 0x01;
                 return Ok(DosAction::Continue);
             }
         };
         if file.seek(SeekFrom::Start(pos)).is_err() || file.write_all(&record).is_err() {
-            regs.ax = (regs.ax & 0xff00) | 0xff;
+            regs.ax = (regs.ax & 0xff00) | 0x01;
             return Ok(DosAction::Continue);
         }
         if let Ok(meta) = file.metadata() {
@@ -1719,8 +1734,8 @@ impl DosKernel {
     /// AH=27h RANDOM BLOCK READ. Read CX records starting at the random record into
     /// the DTA, packed back to back. CX returns the count actually read; the random
     /// record and the block/record cursor advance past the last record. AL=00 all
-    /// records read, 01 EOF reached mid-block (a clean stop on a record boundary),
-    /// 03 a partial final record (zero-padded). 0xFF if the FCB does not resolve.
+    /// records read, 01 EOF/no data, 02 DTA segment wrap, 03 a partial final
+    /// record (zero-padded).
     fn fcb_random_block_read(
         &mut self,
         mem: &mut Memory,
@@ -1730,7 +1745,8 @@ impl DosKernel {
         let path = match self.fcb_path(mem, regs)? {
             Ok(path) => path,
             Err(()) => {
-                regs.ax = (regs.ax & 0xff00) | 0xff;
+                regs.cx = 0;
+                regs.ax = (regs.ax & 0xff00) | 0x01;
                 return Ok(DosAction::Continue);
             }
         };
@@ -1738,10 +1754,19 @@ impl DosKernel {
         let size = if record_size == 0 { 128 } else { record_size };
         let start = mem.read_u32(base + FCB_RANDREC)?;
         let wanted = regs.cx;
+        if !fcb_dta_transfer_fits(
+            self.dta,
+            usize::from(wanted).saturating_mul(usize::from(size)),
+        ) {
+            regs.cx = 0;
+            regs.ax = (regs.ax & 0xff00) | 0x02;
+            return Ok(DosAction::Continue);
+        }
         let mut file = match File::open(&path) {
             Ok(f) => f,
             Err(_) => {
-                regs.ax = (regs.ax & 0xff00) | 0xff;
+                regs.cx = 0;
+                regs.ax = (regs.ax & 0xff00) | 0x01;
                 return Ok(DosAction::Continue);
             }
         };
@@ -1780,7 +1805,7 @@ impl DosKernel {
     /// random record. The documented quirk: CX=0 sets the file size (truncates or
     /// extends) to the random record without writing data. CX returns the count
     /// written; the random record and block/record cursor advance. AL=00 success,
-    /// 0xFF on a host error or unresolvable FCB.
+    /// 01 on a host write error, 02 on DTA segment wrap.
     fn fcb_random_block_write(
         &mut self,
         mem: &mut Memory,
@@ -1790,7 +1815,8 @@ impl DosKernel {
         let path = match self.fcb_path(mem, regs)? {
             Ok(path) => path,
             Err(()) => {
-                regs.ax = (regs.ax & 0xff00) | 0xff;
+                regs.cx = 0;
+                regs.ax = (regs.ax & 0xff00) | 0x01;
                 return Ok(DosAction::Continue);
             }
         };
@@ -1798,10 +1824,21 @@ impl DosKernel {
         let size = if record_size == 0 { 128 } else { record_size };
         let start = mem.read_u32(base + FCB_RANDREC)?;
         let wanted = regs.cx;
+        if wanted != 0
+            && !fcb_dta_transfer_fits(
+                self.dta,
+                usize::from(wanted).saturating_mul(usize::from(size)),
+            )
+        {
+            regs.cx = 0;
+            regs.ax = (regs.ax & 0xff00) | 0x02;
+            return Ok(DosAction::Continue);
+        }
         let mut file = match OpenOptions::new().read(true).write(true).open(&path) {
             Ok(f) => f,
             Err(_) => {
-                regs.ax = (regs.ax & 0xff00) | 0xff;
+                regs.cx = 0;
+                regs.ax = (regs.ax & 0xff00) | 0x01;
                 return Ok(DosAction::Continue);
             }
         };
@@ -1809,7 +1846,7 @@ impl DosKernel {
             // CX=0: set the file size to start*record-size, no record transfer.
             let len = u64::from(start) * u64::from(size);
             if file.set_len(len).is_err() {
-                regs.ax = (regs.ax & 0xff00) | 0xff;
+                regs.ax = (regs.ax & 0xff00) | 0x01;
                 return Ok(DosAction::Continue);
             }
             mem.write_u32(base + FCB_FILESIZE, len as u32)?;
@@ -1827,7 +1864,7 @@ impl DosKernel {
             }
             if file.seek(SeekFrom::Start(pos)).is_err() || file.write_all(&buffer).is_err() {
                 regs.cx = index;
-                regs.ax = (regs.ax & 0xff00) | 0xff;
+                regs.ax = (regs.ax & 0xff00) | 0x01;
                 return Ok(DosAction::Continue);
             }
         }
@@ -4192,6 +4229,12 @@ fn read_at(file: &mut File, pos: u64, buffer: &mut [u8]) -> Result<usize, DosErr
         }
     }
     Ok(filled)
+}
+
+/// FCB record operations cannot let the Disk Transfer Area wrap past offset
+/// FFFFh. Real DOS reports AL=02h for this before copying bytes.
+fn fcb_dta_transfer_fits(dta: (u16, u16), bytes: usize) -> bool {
+    usize::from(dta.1).saturating_add(bytes) <= 0x1_0000
 }
 
 /// The byte file position the FCB's current block and record select, given the
@@ -9071,6 +9114,27 @@ mod tests {
     }
 
     #[test]
+    fn fcb_sequential_read_returns_02_when_record_crosses_dta_segment() {
+        let (mut kernel, mut mem, _dir) = fcb_kernel(&[("DATA.BIN", &[0xacu8; 128])]);
+        place_fcb(&mut mem, 3, "DATA.BIN");
+        assert_eq!(fcb_call(&mut kernel, &mut mem, 0x0f).ax & 0xff, 0x00);
+        let mut set_dta = DosRegs {
+            ax: 0x1a00,
+            ds: 0x0500,
+            dx: 0xffc0,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut set_dta, &mut mem).unwrap();
+
+        let read = fcb_call(&mut kernel, &mut mem, 0x14);
+        assert_eq!(
+            read.ax & 0xff,
+            0x02,
+            "record transfer crossing a DTA segment boundary returns AL=02"
+        );
+    }
+
+    #[test]
     fn fcb_create_then_sequential_write_persists_a_record() {
         let (mut kernel, mut mem, dir) = fcb_kernel(&[]);
         place_fcb(&mut mem, 3, "OUT.BIN");
@@ -9099,6 +9163,34 @@ mod tests {
         // The current record advanced to 1.
         let base = 0x0100usize * 16 + 0x0200;
         assert_eq!(mem.read_u8(base + 0x20).unwrap(), 1);
+    }
+
+    #[test]
+    fn fcb_sequential_write_returns_02_when_record_crosses_dta_segment() {
+        let (mut kernel, mut mem, dir) = fcb_kernel(&[]);
+        place_fcb(&mut mem, 3, "WRAP.BIN");
+        assert_eq!(fcb_call(&mut kernel, &mut mem, 0x16).ax & 0xff, 0x00);
+        let mut set_dta = DosRegs {
+            ax: 0x1a00,
+            ds: 0x0500,
+            dx: 0xffc0,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut set_dta, &mut mem).unwrap();
+
+        let write = fcb_call(&mut kernel, &mut mem, 0x15);
+        assert_eq!(
+            write.ax & 0xff,
+            0x02,
+            "record write crossing a DTA segment boundary returns AL=02"
+        );
+        assert_eq!(
+            std::fs::metadata(dir.path().join("WRAP.BIN"))
+                .unwrap()
+                .len(),
+            0,
+            "no bytes are written after a segment-wrap failure"
+        );
     }
 
     #[test]
@@ -9385,6 +9477,68 @@ mod tests {
         kernel.dispatch(0x21, &mut regs, mem).unwrap();
     }
 
+    fn fcb_record_call_with_cx(
+        kernel: &mut DosKernel,
+        mem: &mut Memory,
+        ah: u16,
+        cx: u16,
+    ) -> DosRegs {
+        let mut regs = DosRegs {
+            ax: ah << 8,
+            ds: 0x0100,
+            dx: 0x0200,
+            cx,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, mem).unwrap();
+        regs
+    }
+
+    #[test]
+    fn fcb_read_record_ops_map_missing_file_to_eof_status() {
+        for (ah, cx) in [(0x14u16, 0), (0x21, 0), (0x27, 1)] {
+            let (mut kernel, mut mem, _dir) = fcb_kernel(&[]);
+            place_fcb(&mut mem, 3, "NOFILE.BIN");
+            set_dta_0500(&mut kernel, &mut mem);
+            let dta = 0x0500usize * 16;
+            mem.write_u8(dta, 0x77).unwrap();
+
+            let regs = fcb_record_call_with_cx(&mut kernel, &mut mem, ah, cx);
+            assert_eq!(
+                regs.ax & 0xff,
+                0x01,
+                "AH={ah:02x} maps a missing record source to AL=01, not AL=FF"
+            );
+            if ah == 0x27 {
+                assert_eq!(regs.cx, 0, "block read transfers no records");
+            }
+            assert_eq!(mem.read_u8(dta).unwrap(), 0x77, "DTA left untouched");
+        }
+    }
+
+    #[test]
+    fn fcb_write_record_ops_map_missing_file_to_disk_full_status() {
+        for (ah, cx) in [(0x15u16, 0), (0x22, 0), (0x28, 1)] {
+            let (mut kernel, mut mem, _dir) = fcb_kernel(&[]);
+            place_fcb(&mut mem, 3, "NOFILE.BIN");
+            set_dta_0500(&mut kernel, &mut mem);
+            let dta = 0x0500usize * 16;
+            for i in 0..128usize {
+                mem.write_u8(dta + i, i as u8).unwrap();
+            }
+
+            let regs = fcb_record_call_with_cx(&mut kernel, &mut mem, ah, cx);
+            assert_eq!(
+                regs.ax & 0xff,
+                0x01,
+                "AH={ah:02x} maps an unwritable record target to AL=01, not AL=FF"
+            );
+            if ah == 0x28 {
+                assert_eq!(regs.cx, 0, "block write transfers no records");
+            }
+        }
+    }
+
     #[test]
     fn fcb_random_write_then_read_round_trips_a_record() {
         // Create a fresh file, set the random record to 2, write a record there,
@@ -9432,6 +9586,41 @@ mod tests {
         let read = fcb_call(&mut kernel, &mut mem, 0x21);
         assert_eq!(read.ax & 0xff, 0x01, "EOF");
         assert_eq!(mem.read_u8(dta).unwrap(), 0x77, "DTA left untouched");
+    }
+
+    #[test]
+    fn fcb_random_record_ops_return_02_when_dta_wraps() {
+        for (ah, cx) in [(0x21u16, 0), (0x22, 0), (0x27, 1), (0x28, 1)] {
+            let (mut kernel, mut mem, _dir) = fcb_kernel(&[("DATA.BIN", &[0x11u8; 128])]);
+            place_fcb(&mut mem, 3, "DATA.BIN");
+            assert_eq!(fcb_call(&mut kernel, &mut mem, 0x0f).ax & 0xff, 0x00);
+            let base = 0x0100usize * 16 + 0x0200;
+            mem.write_u32(base + 0x21, 0).unwrap();
+            let mut set_dta = DosRegs {
+                ax: 0x1a00,
+                ds: 0x0500,
+                dx: 0xffc0,
+                ..DosRegs::default()
+            };
+            kernel.dispatch(0x21, &mut set_dta, &mut mem).unwrap();
+
+            let mut regs = DosRegs {
+                ax: ah << 8,
+                ds: 0x0100,
+                dx: 0x0200,
+                cx,
+                ..DosRegs::default()
+            };
+            kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+            assert_eq!(
+                regs.ax & 0xff,
+                0x02,
+                "AH={ah:02x} returns AL=02 when the DTA would wrap"
+            );
+            if ah == 0x27 || ah == 0x28 {
+                assert_eq!(regs.cx, 0, "no block records transfer on DTA wrap");
+            }
+        }
     }
 
     #[test]
