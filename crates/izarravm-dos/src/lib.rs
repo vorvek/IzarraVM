@@ -2521,6 +2521,25 @@ impl DosKernel {
                 regs.es = mem.read_u16(addr + 2)?;
                 Ok(DosAction::Continue)
             }
+            // AH=38h: get country-specific information. Toka-DOS exposes the
+            // built-in US/CP437 tables and reports unsupported countries as absent.
+            0x38 => {
+                let requested = match regs.ax as u8 {
+                    0x00 => DOS_COUNTRY_US,
+                    0xff => regs.bx,
+                    country => u16::from(country),
+                };
+                if requested == DOS_COUNTRY_US {
+                    let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+                    write_us_country_info(mem, base)?;
+                    regs.ax = DOS_COUNTRY_US;
+                    regs.bx = DOS_COUNTRY_US;
+                    regs.cf = false;
+                } else {
+                    set_dos_error(regs, 0x02);
+                }
+                Ok(DosAction::Continue)
+            }
             // AH=2Ah: get date. CX=year, DH=month, DL=day, AL=day-of-week (0=Sun).
             0x2a => {
                 regs.cx = self.clock.year;
@@ -3720,6 +3739,70 @@ impl DosKernel {
                 regs.cf = false;
                 Ok(DosAction::Continue)
             }
+            // AH=65h: country/NLS services. The HLE provides a US/CP437 default
+            // table and ASCII capitalization, enough for DOS tools that probe NLS.
+            0x65 => {
+                match regs.ax as u8 {
+                    0x01 => {
+                        let code_page_ok = regs.bx == 0xffff || regs.bx == DOS_CODE_PAGE_US;
+                        let country_ok = regs.dx == 0xffff || regs.dx == DOS_COUNTRY_US;
+                        if !code_page_ok || !country_ok || regs.cx < DOS_EXT_COUNTRY_INFO_LEN as u16
+                        {
+                            set_dos_error(regs, 0x02);
+                        } else {
+                            let base = usize::from(regs.es) * 16 + usize::from(regs.di);
+                            mem.write_u8(base, 0x01)?;
+                            mem.write_u16(base + 1, 38)?;
+                            mem.write_u16(base + 3, DOS_COUNTRY_US)?;
+                            mem.write_u16(base + 5, DOS_CODE_PAGE_US)?;
+                            write_us_country_info(mem, base + 7)?;
+                            regs.cx = DOS_EXT_COUNTRY_INFO_LEN as u16;
+                            regs.cf = false;
+                        }
+                    }
+                    0x20 => {
+                        regs.dx = (regs.dx & 0xff00) | u16::from(nls_upper(regs.dx as u8));
+                        regs.cf = false;
+                    }
+                    0x21 => {
+                        let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+                        for i in 0..usize::from(regs.cx) {
+                            let byte = mem.read_u8(base + i)?;
+                            mem.write_u8(base + i, nls_upper(byte))?;
+                        }
+                        regs.cf = false;
+                    }
+                    0x22 => {
+                        let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+                        for i in 0..=0xffffusize {
+                            let byte = mem.read_u8(base + i)?;
+                            if byte == 0 {
+                                break;
+                            }
+                            mem.write_u8(base + i, nls_upper(byte))?;
+                        }
+                        regs.cf = false;
+                    }
+                    _ => set_dos_error(regs, 0x01),
+                }
+                Ok(DosAction::Continue)
+            }
+            // AX=6601h/6602h: code-page table. Only CP437 is present.
+            0x66 => {
+                match regs.ax as u8 {
+                    0x01 => {
+                        regs.bx = DOS_CODE_PAGE_US;
+                        regs.dx = DOS_CODE_PAGE_US;
+                        regs.cf = false;
+                    }
+                    0x02 if regs.bx == DOS_CODE_PAGE_US && regs.dx == DOS_CODE_PAGE_US => {
+                        regs.cf = false;
+                    }
+                    0x02 => set_dos_error(regs, 0x02),
+                    _ => set_dos_error(regs, 0x01),
+                }
+                Ok(DosAction::Continue)
+            }
             // The FCB (File Control Block) file API: handle-free file ops keyed by
             // the FCB at DS:DX. AL=00 success, AL=0xFF failure (no CF). The
             // sequential ops transfer one record through the DTA; the random-access
@@ -3754,6 +3837,29 @@ impl DosKernel {
 const TOKA_DOS_VERSION_MAJOR: u8 = 6;
 const TOKA_DOS_VERSION_MINOR: u8 = 10; // 6.10, the .NN-hundredths convention (6.20 -> 20)
 const TOKA_DOS_OEM: u8 = 0xff;
+const DOS_COUNTRY_US: u16 = 1;
+const DOS_CODE_PAGE_US: u16 = 437;
+const DOS_COUNTRY_INFO_LEN: usize = 34;
+const DOS_EXT_COUNTRY_INFO_LEN: usize = 41;
+
+fn write_us_country_info(mem: &mut Memory, base: usize) -> Result<(), DosError> {
+    for offset in 0..DOS_COUNTRY_INFO_LEN {
+        mem.write_u8(base + offset, 0)?;
+    }
+    mem.write_u16(base, 0)?; // USA date format, mm/dd/yy.
+    mem.write_u8(base + 0x02, b'$')?; // currency symbol, ASCIZ.
+    mem.write_u8(base + 0x07, b',')?; // thousands separator, ASCIZ.
+    mem.write_u8(base + 0x09, b'.')?; // decimal separator, ASCIZ.
+    mem.write_u8(base + 0x0b, b'/')?; // date separator, ASCIZ.
+    mem.write_u8(base + 0x0d, b':')?; // time separator, ASCIZ.
+    mem.write_u8(base + 0x10, 2)?; // currency decimal places.
+    mem.write_u8(base + 0x16, b',')?; // data-list separator, ASCIZ.
+    Ok(())
+}
+
+fn nls_upper(byte: u8) -> u8 {
+    byte.to_ascii_uppercase()
+}
 
 /// The largest .COM image: a 64 KiB segment minus the 256-byte PSP.
 const COM_MAX_LEN: usize = 0x10000 - 0x100;
@@ -7160,6 +7266,128 @@ mod tests {
         assert_eq!(get2.dx >> 8, 2);
         assert_eq!(get2.dx & 0xff, 29);
         assert_eq!(get2.ax & 0xff, 2); // Tuesday
+    }
+
+    #[test]
+    fn ah38_returns_us_country_info() {
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let mut kernel = DosKernel::new();
+        let mut regs = DosRegs {
+            ax: 0x3800,
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+
+        assert!(!regs.cf);
+        assert_eq!(regs.bx, 1);
+        assert_eq!(regs.ax, 1);
+        let base = 0x0100usize * 16 + 0x0200;
+        assert_eq!(mem.read_u16(base).unwrap(), 0); // USA mm/dd/yy
+        assert_eq!(mem.read_u8(base + 2).unwrap(), b'$');
+        assert_eq!(mem.read_u8(base + 7).unwrap(), b',');
+        assert_eq!(mem.read_u8(base + 9).unwrap(), b'.');
+        assert_eq!(mem.read_u8(base + 0x0b).unwrap(), b'/');
+        assert_eq!(mem.read_u8(base + 0x0d).unwrap(), b':');
+        assert_eq!(mem.read_u8(base + 0x10).unwrap(), 2);
+        assert_eq!(mem.read_u8(base + 0x16).unwrap(), b',');
+    }
+
+    #[test]
+    fn ah65_returns_country_info_and_capitalizes_ascii() {
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let mut kernel = DosKernel::new();
+        let mut info = DosRegs {
+            ax: 0x6501,
+            bx: 0xffff,
+            cx: 64,
+            dx: 0xffff,
+            es: 0x0100,
+            di: 0x0300,
+            ..DosRegs::default()
+        };
+
+        kernel.dispatch(0x21, &mut info, &mut mem).unwrap();
+
+        assert!(!info.cf);
+        assert_eq!(info.cx, 41);
+        let info_base = 0x0100usize * 16 + 0x0300;
+        assert_eq!(mem.read_u8(info_base).unwrap(), 0x01);
+        assert_eq!(mem.read_u16(info_base + 1).unwrap(), 38);
+        assert_eq!(mem.read_u16(info_base + 3).unwrap(), 1);
+        assert_eq!(mem.read_u16(info_base + 5).unwrap(), 437);
+        assert_eq!(mem.read_u16(info_base + 7).unwrap(), 0);
+        assert_eq!(mem.read_u8(info_base + 9).unwrap(), b'$');
+
+        let mut ch = DosRegs {
+            ax: 0x6520,
+            dx: 0x1200 | u16::from(b'a'),
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut ch, &mut mem).unwrap();
+        assert!(!ch.cf);
+        assert_eq!(ch.dx, 0x1200 | u16::from(b'A'));
+
+        let counted = 0x0400usize;
+        for (i, byte) in b"aZ9".iter().enumerate() {
+            mem.write_u8(0x0100usize * 16 + counted + i, *byte).unwrap();
+        }
+        let mut string = DosRegs {
+            ax: 0x6521,
+            cx: 3,
+            ds: 0x0100,
+            dx: counted as u16,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut string, &mut mem).unwrap();
+        assert!(!string.cf);
+        assert_eq!(mem.read_u8(0x0100usize * 16 + counted).unwrap(), b'A');
+        assert_eq!(mem.read_u8(0x0100usize * 16 + counted + 1).unwrap(), b'Z');
+        assert_eq!(mem.read_u8(0x0100usize * 16 + counted + 2).unwrap(), b'9');
+
+        let asciiz = 0x0410usize;
+        for (i, byte) in b"dos\0".iter().enumerate() {
+            mem.write_u8(0x0100usize * 16 + asciiz + i, *byte).unwrap();
+        }
+        let mut zstr = DosRegs {
+            ax: 0x6522,
+            ds: 0x0100,
+            dx: asciiz as u16,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut zstr, &mut mem).unwrap();
+        assert!(!zstr.cf);
+        assert_eq!(mem.read_u8(0x0100usize * 16 + asciiz).unwrap(), b'D');
+        assert_eq!(mem.read_u8(0x0100usize * 16 + asciiz + 1).unwrap(), b'O');
+        assert_eq!(mem.read_u8(0x0100usize * 16 + asciiz + 2).unwrap(), b'S');
+        assert_eq!(mem.read_u8(0x0100usize * 16 + asciiz + 3).unwrap(), 0);
+    }
+
+    #[test]
+    fn ah66_gets_and_accepts_cp437() {
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let mut kernel = DosKernel::new();
+        let mut get = DosRegs {
+            ax: 0x6601,
+            ..DosRegs::default()
+        };
+
+        kernel.dispatch(0x21, &mut get, &mut mem).unwrap();
+
+        assert!(!get.cf);
+        assert_eq!(get.bx, 437);
+        assert_eq!(get.dx, 437);
+
+        let mut set = DosRegs {
+            ax: 0x6602,
+            bx: 437,
+            dx: 437,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut set, &mut mem).unwrap();
+        assert!(!set.cf);
     }
 
     #[test]
