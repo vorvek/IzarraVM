@@ -543,7 +543,7 @@ pub struct DosKernel {
     // capped below the lowest resident base above it. Never pruned (TSRs persist).
     resident_regions: Vec<u16>,
     last_exit_code: u8, // AH=4Dh AL; cleared after it is read
-    last_exit_type: u8, // AH=4Dh AH; always 0x00 (normal termination), marked
+    last_exit_type: u8, // AH=4Dh AH; 0x00 normal, 0x03 TSR resident.
     // AH=0Ch flush-and-invoke: the flush runs once, not again on a WaitForKey re-entry.
     cooked_flush_done: bool,
     // AH=33h BREAK flag. The current HLE checks Ctrl-C on the DOS console calls
@@ -1263,7 +1263,7 @@ impl DosKernel {
             }
         }
         self.last_exit_code = code;
-        self.last_exit_type = 0x00; // only normal termination is modeled (marked).
+        self.last_exit_type = if child_resident { 0x03 } else { 0x00 };
         Ok(())
     }
 
@@ -11327,6 +11327,31 @@ mod tests {
         kernel.dispatch(0x21, &mut alloc, &mut mem).unwrap();
         assert!(!alloc.cf);
         assert_eq!(alloc.ax, 0x0100 + 0x0020 + 1);
+    }
+
+    #[test]
+    fn ah31_records_tsr_exit_type_for_ah4d() {
+        let (mut kernel, mut mem, _prog_top) = env_kernel();
+        let mut keep = DosRegs {
+            ax: 0x3109,
+            dx: 0x0020,
+            ..DosRegs::default()
+        };
+
+        assert_eq!(
+            kernel.dispatch(0x21, &mut keep, &mut mem).unwrap(),
+            DosAction::Exit(9)
+        );
+        kernel.finish_exec(9, &mut mem).unwrap();
+
+        let mut get = DosRegs {
+            ax: 0x4d00,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut get, &mut mem).unwrap();
+
+        assert!(!get.cf);
+        assert_eq!(get.ax, 0x0309);
     }
 
     #[test]
