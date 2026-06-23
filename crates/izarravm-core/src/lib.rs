@@ -226,6 +226,26 @@ impl FromStr for Emm386Mode {
 pub struct ConfigSysMemory {
     pub emm386: Emm386Mode,
     pub dos_umb: bool,
+    /// Optional EMS page-frame segment from an IEMM/EMM386 `FRAME=` token.
+    /// The token is written in hexadecimal like real EMM386 CONFIG.SYS lines.
+    pub ems_frame_seg: Option<u16>,
+    /// Optional expanded-memory backing-pool size in KiB. Real EMM386 accepts a
+    /// bare decimal number on its DEVICE line; IEMM follows that convention.
+    pub ems_pool_kb: Option<u32>,
+}
+
+fn parse_iemm_frame_token(token: &str) -> Option<u16> {
+    let value = token.strip_prefix("FRAME=")?;
+    let value = value.strip_prefix("0X").unwrap_or(value);
+    u16::from_str_radix(value, 16).ok()
+}
+
+fn parse_iemm_pool_token(token: &str) -> Option<u32> {
+    if token.chars().all(|character| character.is_ascii_digit()) {
+        token.parse().ok()
+    } else {
+        None
+    }
 }
 
 /// Read the memory-manager intent out of a CONFIG.SYS. The IEMM memory manager
@@ -238,11 +258,15 @@ pub struct ConfigSysMemory {
 ///
 /// EMM386.EXE is accepted as an alias so a pasted real-DOS CONFIG.SYS still works.
 ///
-/// DOS=UMB (or DOS=HIGH,UMB) sets `dos_umb`.
+/// `FRAME=hhhh` selects the EMS page-frame segment and a bare decimal number on
+/// the manager line selects the EMS backing-pool size in KiB. DOS=UMB (or
+/// DOS=HIGH,UMB) sets `dos_umb`.
 pub fn parse_config_sys(text: &str) -> ConfigSysMemory {
     let mut himem = false;
     let mut emm386 = None;
     let mut dos_umb = false;
+    let mut ems_frame_seg = None;
+    let mut ems_pool_kb = None;
     for line in text.lines() {
         let upper = line.trim().to_ascii_uppercase();
         let device = upper
@@ -262,10 +286,22 @@ pub fn parse_config_sys(text: &str) -> ConfigSysMemory {
             {
                 // IEMM (the Toka-DOS manager) or its real-DOS alias EMM386 loads
                 // only with a prior HIMEM. NOEMS omits the EMS frame.
+                let mut line_frame_seg = None;
+                let mut line_pool_kb = None;
                 let noems = rest
                     .split_whitespace()
                     .skip(1)
                     .any(|token| token == "NOEMS");
+                for token in rest.split_whitespace().skip(1) {
+                    if let Some(frame_seg) = parse_iemm_frame_token(token) {
+                        line_frame_seg = Some(frame_seg);
+                    }
+                    if let Some(pool_kb) = parse_iemm_pool_token(token) {
+                        line_pool_kb = Some(pool_kb);
+                    }
+                }
+                ems_frame_seg = line_frame_seg;
+                ems_pool_kb = line_pool_kb;
                 emm386 = Some(if noems {
                     Emm386Mode::NoEms
                 } else {
@@ -281,6 +317,8 @@ pub fn parse_config_sys(text: &str) -> ConfigSysMemory {
     ConfigSysMemory {
         emm386: emm386.unwrap_or(Emm386Mode::Unloaded),
         dos_umb,
+        ems_frame_seg,
+        ems_pool_kb,
     }
 }
 
@@ -1021,6 +1059,18 @@ mod tests {
             parse_config_sys("DEVICE=IEMM.EXE RAM\r\n").emm386,
             Emm386Mode::Unloaded
         );
+    }
+
+    #[test]
+    fn config_sys_parses_iemm_frame_and_pool_size_knobs() {
+        let config = parse_config_sys(
+            "DEVICE=C:\\DOS\\HIMEM.SYS /TESTMEM:OFF\r\nDEVICE=C:\\DOS\\IEMM.EXE RAM FRAME=D000 4096\r\nDOS=HIGH,UMB\r\n",
+        );
+
+        assert_eq!(config.emm386, Emm386Mode::Ram);
+        assert_eq!(config.ems_frame_seg, Some(0xd000));
+        assert_eq!(config.ems_pool_kb, Some(4096));
+        assert!(config.dos_umb);
     }
 
     #[test]

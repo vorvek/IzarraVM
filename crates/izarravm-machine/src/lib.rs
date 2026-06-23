@@ -7,7 +7,7 @@ pub use fat32_volume::{Fat32Volume, build_fat32};
 use izarravm_audio::{Ad1848, Ad1848Config, OplChip, Resampler, SbDsp, SbMixer};
 use izarravm_bus::{BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CpuBus, Memory};
 use izarravm_core::{
-    Emm386Mode, GswMode, HardwareProfile, SoundBlasterConfig, VideoCard, WssConfig,
+    ConfigSysMemory, Emm386Mode, GswMode, HardwareProfile, SoundBlasterConfig, VideoCard, WssConfig,
 };
 use izarravm_cpu::{
     Cpu386, CpuError, CpuLevel, CycleOutcome, Registers, SegmentIndex, SegmentRegister,
@@ -82,19 +82,26 @@ struct XferEnd {
 }
 
 /// Partition extended RAM into the XMS pool and (in RAM mode) the EMS backing
-/// region, returning the XMS state and the EMS manager. The EMS share is capped at
-/// half of extended RAM so a small machine still keeps an XMS pool. This is the one
-/// source of truth for the partition: `Machine::base` builds it at construction and
-/// `set_emm386_mode` rebuilds it at SYSINIT, so a config-time and a CONFIG.SYS mode
-/// always agree.
+/// region, returning the XMS state and the EMS manager. The default EMS share is
+/// capped at half of extended RAM so a small machine still keeps an XMS pool; an
+/// explicit CONFIG.SYS pool-size knob is still clamped by the XMS allocator to the
+/// usable extended-memory pool. This is the one source of truth for the partition:
+/// `Machine::base` builds it at construction and `set_emm386_config` rebuilds it
+/// at SYSINIT, so a config-time and a CONFIG.SYS mode always agree.
 ///
 /// NOEMS keeps a frameless manager present (EMMXXXX0 + a 0-page INT 67h, the way a
 /// real EMM386 NOEMS install answers) but carves no backing region, so XMS owns all
 /// of extended memory.
-fn build_xms_ems(memory_mib: u16, emm386: Emm386Mode) -> (xms::XmsState, Option<ems::EmsState>) {
+fn build_xms_ems(
+    memory_mib: u16,
+    emm386: Emm386Mode,
+    ems_pool_kb: Option<u32>,
+    ems_frame_seg: u16,
+) -> (xms::XmsState, Option<ems::EmsState>) {
+    let usable_extended_kb = (u32::from(memory_mib) * 1024).saturating_sub(1024 + 64);
     let ems_want_kb = if emm386.provides_ems() {
-        let extended_kb = (u32::from(memory_mib) * 1024).saturating_sub(1024 + 64);
-        EMS_DEFAULT_KIB.min(extended_kb / 2)
+        let default_kb = EMS_DEFAULT_KIB.min(usable_extended_kb / 2);
+        ems_pool_kb.unwrap_or(default_kb)
     } else {
         0
     };
@@ -102,9 +109,7 @@ fn build_xms_ems(memory_mib: u16, emm386: Emm386Mode) -> (xms::XmsState, Option<
     let ems = if emm386 == Emm386Mode::NoEms {
         Some(ems::EmsState::frameless())
     } else {
-        ems_region.map(|region| {
-            ems::EmsState::new(EMS_FRAME_DEFAULT_SEG, region.base, region.total_pages)
-        })
+        ems_region.map(|region| ems::EmsState::new(ems_frame_seg, region.base, region.total_pages))
     };
     (xms, ems)
 }
@@ -440,6 +445,10 @@ pub struct Machine {
     // RAM above 1 MB, the HMA-allocation flag, and the local-A20 nesting count. A
     // guest reaches it via INT 2Fh AX=4310h (an INT 66h entry stub in ROM).
     xms: xms::XmsState,
+    // Applied IEMM knobs from CONFIG.SYS. The mode lives in profile.emm386; these
+    // two fields hold the optional RAM-mode EMS pool size and page-frame segment.
+    ems_pool_kb: Option<u32>,
+    ems_frame_seg: u16,
     // LIM EMS 4.0 expanded-memory state, present under RAM (a real page frame backed
     // by a region of extended RAM partitioned away from the XMS pool, which the bus
     // aliases frame accesses onto) and NOEMS (a frameless manager: the EMMXXXX0 device
@@ -569,7 +578,7 @@ impl Machine {
         let memory_mib = profile.memory_mib;
         let timing = TimingFactors::for_clock(active_mode.clock_hz());
         // Partition extended RAM between XMS and EMS from the EMM386 mode.
-        let (xms, ems) = build_xms_ems(memory_mib, profile.emm386);
+        let (xms, ems) = build_xms_ems(memory_mib, profile.emm386, None, EMS_FRAME_DEFAULT_SEG);
         // Lay the XMS driver entry stub into ROM. INT 2Fh AX=4310h hands the guest
         // a far pointer to it; a guest FAR-CALLs there, the INT 66h traps into the
         // host XMS handler, and the RETF returns. Placed at a fixed ROM offset that
@@ -650,6 +659,8 @@ impl Machine {
             unittester: unittester::UnitTester::default(),
             test_snapshot_path: None,
             xms,
+            ems_pool_kb: None,
+            ems_frame_seg: EMS_FRAME_DEFAULT_SEG,
             ems,
             uma: UmaReservationMap::new(),
         };
@@ -687,17 +698,47 @@ impl Machine {
     /// from the new mode. Must run before any guest XMS or EMS allocation; at
     /// SYSINIT none has happened yet, so re-partitioning strands no live handle.
     pub fn set_emm386_mode(&mut self, mode: Emm386Mode) -> Result<(), MachineError> {
+        self.set_emm386_config(ConfigSysMemory {
+            emm386: mode,
+            dos_umb: false,
+            ems_frame_seg: None,
+            ems_pool_kb: None,
+        })
+    }
+
+    /// Re-apply the full CONFIG.SYS IEMM memory-manager configuration, including
+    /// RAM-mode EMS pool and FRAME knobs. Rebuilds XMS/EMS only when the effective
+    /// manager state changes, so a warm reboot with the same CONFIG.SYS preserves
+    /// live XMS/EMS allocations while still re-laying the DOS UMB arena.
+    pub fn set_emm386_config(&mut self, config: ConfigSysMemory) -> Result<(), MachineError> {
+        let mode = config.emm386;
+        let ems_pool_kb = if mode.provides_ems() {
+            config.ems_pool_kb
+        } else {
+            None
+        };
+        let ems_frame_seg = if mode.provides_ems() {
+            config.ems_frame_seg.unwrap_or(EMS_FRAME_DEFAULT_SEG)
+        } else {
+            EMS_FRAME_DEFAULT_SEG
+        };
         // Rebuild the XMS/EMS partition only when the mode actually changes. A warm
         // reboot (INT 19h) re-enters SYSINIT with the same CONFIG.SYS, so the mode is
         // unchanged and the live XMS EMBs, HMA claim, A20 nesting, and EMS pages are
         // left intact; wholesale-replacing them would strand a guest's allocations
-        // while the CPU, RAM, and A20 gate keep running. A genuine mode change runs
-        // only at the first SYSINIT (before any guest allocation), so it is safe.
-        if self.profile.emm386 != mode {
+        // while the CPU, RAM, and A20 gate keep running. A genuine config change runs
+        // at SYSINIT, before allocations in the new DOS session.
+        if self.profile.emm386 != mode
+            || self.ems_pool_kb != ems_pool_kb
+            || self.ems_frame_seg != ems_frame_seg
+        {
             self.profile.emm386 = mode;
-            let (xms, ems) = build_xms_ems(self.profile.memory_mib, mode);
+            let (xms, ems) =
+                build_xms_ems(self.profile.memory_mib, mode, ems_pool_kb, ems_frame_seg);
             self.xms = xms;
             self.ems = ems;
+            self.ems_pool_kb = ems_pool_kb;
+            self.ems_frame_seg = ems_frame_seg;
         }
         self.furnish_dos_upper_memory()
     }
@@ -989,13 +1030,13 @@ impl Machine {
         // is installed whenever the manager answers (RAM or NOEMS); only HIMEM-only
         // (Unloaded) has no manager, so this mirrors the built `ems` Option.
         self.dos.set_ems_present(self.ems.is_some());
-        // RAM mode reserves the EMS page frame first (at the default top-of-window
-        // address) so the UMB pool carves around it; if a future ROM ever sat on the
-        // default address, fall back to a first-fit hole.
+        // RAM mode reserves the EMS page frame first, at the configured FRAME
+        // segment when present, so the UMB pool carves around it. If the configured
+        // address is not available, fall back to a first-fit hole.
         if mode.provides_ems()
             && self
                 .uma
-                .reserve_ems_frame_at(EMS_FRAME_DEFAULT_BASE)
+                .reserve_ems_frame_at(u32::from(self.ems_frame_seg) << 4)
                 .is_none()
         {
             self.uma.alloc_ems_frame();
@@ -4511,7 +4552,7 @@ impl Machine {
         // box comes up with UMBs linked, like a real DOS=HIGH,UMB machine.
         let config = self.read_config_sys();
         match config {
-            Some(cfg) => self.set_emm386_mode(cfg.emm386)?,
+            Some(cfg) => self.set_emm386_config(cfg)?,
             None => self.furnish_dos_upper_memory()?,
         }
         let dos_umb = config.map(|c| c.dos_umb).unwrap_or(true);
@@ -8216,6 +8257,44 @@ mod tests {
     }
 
     #[test]
+    fn build_xms_ems_honors_configured_pool_size_and_frame() {
+        let (_xms, ems) = build_xms_ems(16, Emm386Mode::Ram, Some(4096), 0xd000);
+        let ems = ems.expect("RAM mode provisions EMS");
+
+        assert_eq!(ems.frame_segment(), 0xd000);
+        assert_eq!(ems.page_counts(), (256, 256));
+    }
+
+    #[test]
+    fn config_sys_knobs_repartition_ems_and_place_the_frame() {
+        const PROG: [u8; 2] = [0xCD, 0x20];
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
+                .unwrap();
+
+        machine
+            .set_emm386_config(izarravm_core::ConfigSysMemory {
+                emm386: Emm386Mode::Ram,
+                dos_umb: true,
+                ems_frame_seg: Some(0xd000),
+                ems_pool_kb: Some(4096),
+            })
+            .unwrap();
+
+        let ems = machine.ems.as_ref().expect("RAM mode provisions EMS");
+        assert_eq!(ems.frame_segment(), 0xd000);
+        assert_eq!(ems.page_counts(), (256, 256));
+        assert!(
+            machine
+                .uma
+                .reservations()
+                .iter()
+                .any(|r| r.kind == UmaUse::EmsFrame && r.base == 0x0d_0000),
+            "configured FRAME=D000 is reserved in UMA"
+        );
+    }
+
+    #[test]
     fn set_emm386_mode_re_applies_the_layout_at_boot() {
         const PROG: [u8; 2] = [0xCD, 0x20];
         // Construct in RAM mode (EMS provisioned, frame reserved).
@@ -8309,7 +8388,7 @@ mod tests {
         let cfg = machine.read_config_sys().expect("CONFIG.SYS is readable");
         assert_eq!(cfg.emm386, Emm386Mode::NoEms);
         assert!(cfg.dos_umb);
-        machine.set_emm386_mode(cfg.emm386).unwrap();
+        machine.set_emm386_config(cfg).unwrap();
         let noems_ems = machine
             .ems
             .as_ref()
