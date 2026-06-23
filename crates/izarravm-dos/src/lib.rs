@@ -6539,8 +6539,8 @@ mod tests {
 
     #[test]
     fn ah4a_shrink_a_non_top_block_keeps_the_block_above_intact() {
-        // Shrinking a non-top AH=48h block leaks a hole in the gap (no reclaim) and
-        // must leave the owned block above it a valid, freeable block.
+        // Shrinking a non-top AH=48h block creates a free MCB in the gap and must
+        // leave the owned block above it a valid, freeable block.
         let (mut kernel, mut mem) = arena_kernel();
         let mut a = DosRegs {
             ax: 0x4800,
@@ -6565,6 +6565,11 @@ mod tests {
         };
         kernel.dispatch(0x21, &mut shrink, &mut mem).unwrap();
         assert!(!shrink.cf);
+
+        let c = dos_alloc(&mut kernel, &mut mem, 0x0008);
+        assert!(!c.cf);
+        assert_eq!(c.ax, 0x110a, "the shrink-created gap is allocatable");
+
         // B is still a valid owned block (freeing it succeeds).
         let mut free_b = DosRegs {
             ax: 0x4900,
@@ -6575,6 +6580,46 @@ mod tests {
         assert!(
             !free_b.cf,
             "the block above the shrunk non-top block survives"
+        );
+    }
+
+    #[test]
+    fn ah4a_grows_into_a_freed_successor() {
+        let (mut kernel, mut mem) = arena_kernel();
+        let a = dos_alloc(&mut kernel, &mut mem, 0x0010);
+        let b = dos_alloc(&mut kernel, &mut mem, 0x0010);
+        let c = dos_alloc(&mut kernel, &mut mem, 0x0010);
+        assert_eq!((a.ax, b.ax, c.ax), (0x1101, 0x1112, 0x1123));
+
+        let mut free_b = DosRegs {
+            ax: 0x4900,
+            es: b.ax,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut free_b, &mut mem).unwrap();
+        assert!(!free_b.cf);
+
+        let mut grow_a = DosRegs {
+            ax: 0x4a00,
+            es: a.ax,
+            bx: 0x0021,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut grow_a, &mut mem).unwrap();
+        assert!(!grow_a.cf, "A grows through B's freed MCB up to C");
+
+        let mut q = DosRegs {
+            ax: 0x5200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut q, &mut mem).unwrap();
+        let first = mem
+            .read_u16(usize::from(q.es) * 16 + usize::from(q.bx) - 2)
+            .unwrap();
+        let chain = read_mcb_chain(&mem, first);
+        assert!(
+            chain.iter().any(|m| m.owner == c.ax),
+            "the owned block above the grown span survives"
         );
     }
 
@@ -6640,6 +6685,69 @@ mod tests {
     }
 
     #[test]
+    fn ah49_non_top_free_is_reused_by_first_fit() {
+        let (mut kernel, mut mem) = arena_kernel();
+        let a = dos_alloc(&mut kernel, &mut mem, 0x0010);
+        assert_eq!(a.ax, 0x1101);
+        let b = dos_alloc(&mut kernel, &mut mem, 0x0010);
+        assert_eq!(b.ax, 0x1112);
+
+        let mut free_a = DosRegs {
+            ax: 0x4900,
+            es: a.ax,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut free_a, &mut mem).unwrap();
+        assert!(!free_a.cf);
+
+        let c = dos_alloc(&mut kernel, &mut mem, 0x0008);
+        assert!(!c.cf);
+        assert_eq!(
+            c.ax, a.ax,
+            "first-fit should reuse the lower free MCB before the tail"
+        );
+    }
+
+    #[test]
+    fn ah49_adjacent_free_blocks_coalesce_before_allocation() {
+        let (mut kernel, mut mem) = arena_kernel();
+        let a = dos_alloc(&mut kernel, &mut mem, 0x0010);
+        let b = dos_alloc(&mut kernel, &mut mem, 0x0010);
+        let c = dos_alloc(&mut kernel, &mut mem, 0x0010);
+        assert_eq!((a.ax, b.ax, c.ax), (0x1101, 0x1112, 0x1123));
+
+        for seg in [a.ax, b.ax] {
+            let mut free = DosRegs {
+                ax: 0x4900,
+                es: seg,
+                ..DosRegs::default()
+            };
+            kernel.dispatch(0x21, &mut free, &mut mem).unwrap();
+            assert!(!free.cf);
+        }
+
+        let d = dos_alloc(&mut kernel, &mut mem, 0x0020);
+        assert!(!d.cf);
+        assert_eq!(
+            d.ax, a.ax,
+            "adjacent free blocks should coalesce into a reusable span"
+        );
+    }
+
+    #[test]
+    fn ah58_last_fit_allocates_from_the_high_end_of_a_free_block() {
+        let (mut kernel, mut mem) = arena_kernel();
+        set_alloc_strategy(&mut kernel, &mut mem, 0x0002);
+
+        let regs = dos_alloc(&mut kernel, &mut mem, 0x0010);
+        assert!(!regs.cf);
+        assert_eq!(
+            regs.ax, 0x9ff0,
+            "last-fit splits the highest suitable free block from its high end"
+        );
+    }
+
+    #[test]
     fn ah49_unknown_block_returns_ax09() {
         let (mut kernel, mut mem) = arena_kernel();
         let mut regs = DosRegs {
@@ -6653,9 +6761,10 @@ mod tests {
     }
 
     #[test]
-    fn ah49_non_top_free_leaves_a_hole_without_underflow() {
-        // Free a lower (non-top) block, then the top block: free_base must not
-        // underflow, and the lower hole stays leaked (the documented LIFO ceiling).
+    fn ah49_non_top_free_then_top_free_coalesces_and_reuses_from_low_end() {
+        // Free a lower block, then the block above it. The free-list contract should
+        // coalesce those adjacent MCBs and let the next first-fit allocation reuse
+        // the low block instead of leaking it.
         let (mut kernel, mut mem) = arena_kernel(); // psp 0x100, prog_top 0x1100
         let mut a = DosRegs {
             ax: 0x4800,
@@ -6689,15 +6798,14 @@ mod tests {
         };
         kernel.dispatch(0x21, &mut free_b, &mut mem).unwrap();
         assert!(!free_b.cf);
-        // A fresh allocation reuses B's reclaimed span: header at 0x1111, data at
-        // 0x1112; A's hole at 0x1101 is leaked, as documented.
+        // A fresh allocation reuses the coalesced A+B span from its low end.
         let mut c = DosRegs {
             ax: 0x4800,
             bx: 0x0008,
             ..DosRegs::default()
         };
         kernel.dispatch(0x21, &mut c, &mut mem).unwrap();
-        assert_eq!(c.ax, 0x1112);
+        assert_eq!(c.ax, 0x1101);
     }
 
     #[test]

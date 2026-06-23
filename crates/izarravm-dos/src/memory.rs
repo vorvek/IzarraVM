@@ -17,6 +17,23 @@ pub(super) enum ResizeError {
     InvalidBlock,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AllocFit {
+    First,
+    Best,
+    Last,
+}
+
+impl AllocFit {
+    fn from_strategy(strategy: u16) -> Self {
+        match strategy & 0x0003 {
+            0x0001 => Self::Best,
+            0x0002 => Self::Last,
+            _ => Self::First,
+        }
+    }
+}
+
 /// The 8-byte MCB owner name. The program block carries a fixed placeholder (the
 /// loader does not thread the real loaded name down here); other blocks are blank.
 pub(super) const PROG_NAME: &[u8; 8] = b"TOKAPROG";
@@ -128,8 +145,8 @@ fn write_character_device_header(
 /// and mutate the real headers a guest reads through AH=52h, so a memory manager
 /// that rewrites a header in place drives the allocator. The arena itself holds
 /// only the current program's PSP and the resident flag; the program top and free
-/// base are read back from the chain. LIFO reclaim, no free-list coalescing (a
-/// freed non-top block leaks until the blocks above it are freed); no UMB/HIMEM.
+/// base are read back from the chain. Allocation coalesces adjacent free MCBs and
+/// honors the AH=58h first/best/last-fit method bits.
 #[derive(Debug, Default)]
 pub(super) struct Arena {
     pub(super) psp_seg: u16,
@@ -223,26 +240,28 @@ impl Arena {
             .unwrap_or(ARENA_TOP)
     }
 
-    /// AH=48h: allocate `paras` paragraphs from the free tail. Ok(Ok(data segment))
-    /// on success, Ok(Err(largest-available data paragraphs)) when it does not fit,
-    /// Err(DosError) on a guest memory fault. The block reserves a one-paragraph
-    /// header at the free tail; the data segment handed out is one paragraph higher,
-    /// and the tail shrinks past header and data. Allocation comes only from the
-    /// tail (no first-fit scan of freed holes), preserving LIFO reclaim. The
-    /// largest-available figure already subtracts the header paragraph.
+    /// AH=48h-style allocation using DOS's default first-fit method.
     pub(super) fn allocate(
         &mut self,
         paras: u16,
         mem: &mut Memory,
     ) -> Result<Result<u16, u16>, DosError> {
-        carve_from_tail(self.first_mcb(), ARENA_TOP, paras, mem)
+        self.allocate_fit(AllocFit::First, paras, mem)
+    }
+
+    fn allocate_fit(
+        &mut self,
+        fit: AllocFit,
+        paras: u16,
+        mem: &mut Memory,
+    ) -> Result<Result<u16, u16>, DosError> {
+        allocate_block(self.first_mcb(), fit, paras, mem)
     }
 
     /// AH=49h: free the block whose data segment is `seg`. Ok(Ok(())) on success,
-    /// Ok(Err(())) for an unknown block, Err(DosError) on a guest memory fault. A
-    /// block immediately below the free tail is merged back into it (LIFO reclaim);
-    /// any other freed block becomes an owner-0 hole that leaks until the blocks
-    /// above it are freed (the documented no-coalesce ceiling).
+    /// Ok(Err(())) for an unknown block, Err(DosError) on a guest memory fault. The
+    /// block is marked owner-0 in the live MCB chain and adjacent free blocks are
+    /// coalesced so the next allocation can reuse it regardless of free order.
     pub(super) fn free(&mut self, seg: u16, mem: &mut Memory) -> Result<Result<(), ()>, DosError> {
         if seg == self.psp_seg {
             return Ok(Ok(())); // freeing the program block (e.g. at termination)
@@ -379,7 +398,16 @@ impl UmbArena {
     }
 
     fn allocate(self, paras: u16, mem: &mut Memory) -> Result<Result<u16, u16>, DosError> {
-        carve_from_tail(self.first_mcb, self.top, paras, mem)
+        self.allocate_fit(AllocFit::First, paras, mem)
+    }
+
+    fn allocate_fit(
+        self,
+        fit: AllocFit,
+        paras: u16,
+        mem: &mut Memory,
+    ) -> Result<Result<u16, u16>, DosError> {
+        allocate_block(self.first_mcb, fit, paras, mem)
     }
 
     fn free(self, seg: u16, mem: &mut Memory) -> Result<Result<(), ()>, DosError> {
@@ -446,19 +474,20 @@ pub(super) fn allocate_strategy(
     mem: &mut Memory,
 ) -> Result<Result<u16, u16>, DosError> {
     let area = alloc_strategy & 0x00c0; // bits 6-7
+    let fit = AllocFit::from_strategy(alloc_strategy);
     match (area, linked_umb(umb, umb_link)) {
-        (0x40, Some(u)) => u.allocate(paras, mem),
-        (0x80, Some(u)) => match u.allocate(paras, mem)? {
+        (0x40, Some(u)) => u.allocate_fit(fit, paras, mem),
+        (0x80, Some(u)) => match u.allocate_fit(fit, paras, mem)? {
             Ok(seg) => Ok(Ok(seg)),
             // Upper memory could not satisfy it: fall back to conventional. On a
-            // double failure report the larger of the two arenas' free tails, the
+            // double failure report the larger of the two arenas' free blocks, the
             // way DOS's single-chain walk reports the global largest block.
-            Err(hi) => match arena.allocate(paras, mem)? {
+            Err(hi) => match arena.allocate_fit(fit, paras, mem)? {
                 Ok(seg) => Ok(Ok(seg)),
                 Err(lo) => Ok(Err(hi.max(lo))),
             },
         },
-        _ => arena.allocate(paras, mem),
+        _ => arena.allocate_fit(fit, paras, mem),
     }
 }
 
@@ -853,82 +882,124 @@ pub(super) fn free_tail(first_mcb: u16, mem: &Memory) -> Option<(u16, u16)> {
     }
 }
 
-/// Carve `paras` paragraphs from the free tail of the region `[first_mcb, top)`.
-/// Reserves a one-paragraph header at the tail; the data segment handed out is one
-/// paragraph higher. Ok(Ok(data seg)), or Ok(Err(largest data paras)) when it does
-/// not fit (already net of the header).
-pub(super) fn carve_from_tail(
-    first_mcb: u16,
-    top: u16,
-    paras: u16,
-    mem: &mut Memory,
-) -> Result<Result<u16, u16>, DosError> {
-    let Some((free_seg, _)) = free_tail(first_mcb, mem) else {
-        return Ok(Err(0)); // region full: no free tail to carve
-    };
-    let data_seg = u32::from(free_seg) + 1; // header sits at free_seg
-    let end = data_seg + u32::from(paras); // first free paragraph after the data
-    if end <= u32::from(top) {
-        let seg = data_seg as u16;
-        if end < u32::from(top) {
-            // A free tail remains above the new block.
-            write_mcb_header(mem, free_seg, b'M', seg, paras, NO_NAME)?;
-            let new_free = end as u16;
-            write_mcb_header(mem, new_free, b'Z', 0, top - new_free - 1, NO_NAME)?;
-        } else {
-            // The carve consumes the tail exactly: the new block is the last.
-            write_mcb_header(mem, free_seg, b'Z', seg, paras, NO_NAME)?;
-        }
-        Ok(Ok(seg))
-    } else {
-        Ok(Err((u32::from(top).saturating_sub(data_seg)) as u16))
+fn coalesce_free_blocks(first_mcb: u16, mem: &mut Memory) -> Result<(), DosError> {
+    loop {
+        let chain = read_mcb_chain(mem, first_mcb);
+        let Some((left, right)) = chain
+            .windows(2)
+            .find(|pair| pair[0].owner == 0 && pair[1].owner == 0)
+            .map(|pair| (pair[0], pair[1]))
+        else {
+            return Ok(());
+        };
+        write_mcb_header(
+            mem,
+            left.mcb_seg,
+            right.sig,
+            0,
+            left.size.wrapping_add(1).wrapping_add(right.size),
+            NO_NAME,
+        )?;
     }
 }
 
-/// Free the owned block whose data segment is `seg` in the region `[first_mcb,
-/// top)`. A block directly below the free tail merges into it (LIFO reclaim); any
-/// other freed block becomes an owner-0 hole that leaks until the blocks above it
-/// are freed. Ok(Ok(())) on success, Ok(Err(())) for an unknown block.
+fn largest_free_block(chain: &[RamMcb]) -> u16 {
+    chain
+        .iter()
+        .filter(|m| m.owner == 0)
+        .map(|m| m.size)
+        .max()
+        .unwrap_or(0)
+}
+
+fn select_free_block(chain: &[RamMcb], fit: AllocFit, paras: u16) -> Option<RamMcb> {
+    let mut blocks = chain
+        .iter()
+        .copied()
+        .filter(|m| m.owner == 0 && m.size >= paras);
+    match fit {
+        AllocFit::First => blocks.next(),
+        AllocFit::Best => blocks.min_by_key(|m| m.size),
+        AllocFit::Last => blocks.next_back(),
+    }
+}
+
+fn split_free_block(
+    block: RamMcb,
+    fit: AllocFit,
+    paras: u16,
+    mem: &mut Memory,
+) -> Result<u16, DosError> {
+    if block.size == paras {
+        let data_seg = block.mcb_seg.wrapping_add(1);
+        write_mcb_header(mem, block.mcb_seg, block.sig, data_seg, paras, NO_NAME)?;
+        return Ok(data_seg);
+    }
+
+    match fit {
+        AllocFit::Last => {
+            let data_seg = block
+                .mcb_seg
+                .wrapping_add(1)
+                .wrapping_add(block.size)
+                .wrapping_sub(paras);
+            let alloc_mcb = data_seg.wrapping_sub(1);
+            write_mcb_header(mem, block.mcb_seg, b'M', 0, block.size - paras - 1, NO_NAME)?;
+            write_mcb_header(mem, alloc_mcb, block.sig, data_seg, paras, NO_NAME)?;
+            Ok(data_seg)
+        }
+        AllocFit::First | AllocFit::Best => {
+            let data_seg = block.mcb_seg.wrapping_add(1);
+            let new_free = data_seg.wrapping_add(paras);
+            write_mcb_header(mem, block.mcb_seg, b'M', data_seg, paras, NO_NAME)?;
+            write_mcb_header(mem, new_free, block.sig, 0, block.size - paras - 1, NO_NAME)?;
+            Ok(data_seg)
+        }
+    }
+}
+
+/// Allocate `paras` paragraphs from the live MCB free-list. Adjacent free MCBs are
+/// coalesced first, then the AH=58h fit method chooses the block. First/best-fit
+/// split from the low end; last-fit splits from the high end like DOS.
+fn allocate_block(
+    first_mcb: u16,
+    fit: AllocFit,
+    paras: u16,
+    mem: &mut Memory,
+) -> Result<Result<u16, u16>, DosError> {
+    coalesce_free_blocks(first_mcb, mem)?;
+    let chain = read_mcb_chain(mem, first_mcb);
+    match select_free_block(&chain, fit, paras) {
+        Some(block) => Ok(Ok(split_free_block(block, fit, paras, mem)?)),
+        None => Ok(Err(largest_free_block(&chain))),
+    }
+}
+
+/// Free the owned block whose data segment is `seg` in the region rooted at
+/// `first_mcb`. The live MCB chain is authoritative: a valid owned MCB at ES-1 is
+/// marked owner-0 and adjacent free blocks are folded together.
 pub(super) fn free_block(
     first_mcb: u16,
-    top: u16,
+    _top: u16,
     seg: u16,
     mem: &mut Memory,
 ) -> Result<Result<(), ()>, DosError> {
     let chain = read_mcb_chain(mem, first_mcb);
-    let Some(pos) = chain
+    let Some(block) = chain
         .iter()
-        .position(|m| m.owner != 0 && m.mcb_seg == seg.wrapping_sub(1))
+        .copied()
+        .find(|m| m.owner != 0 && m.mcb_seg == seg.wrapping_sub(1))
     else {
         return Ok(Err(()));
     };
-    let block = chain[pos];
-    let block_end = block.mcb_seg.wrapping_add(1).wrapping_add(block.size);
-    match chain.last() {
-        Some(tail) if tail.owner == 0 && block_end == tail.mcb_seg => {
-            // LIFO reclaim: extend the free tail down over this block.
-            write_mcb_header(
-                mem,
-                block.mcb_seg,
-                b'Z',
-                0,
-                top - block.mcb_seg - 1,
-                NO_NAME,
-            )?;
-        }
-        _ => {
-            // Non-top free: mark the block free in place; the hole leaks.
-            mem.write_u16(usize::from(block.mcb_seg) * 16 + 1, 0)?;
-        }
-    }
+    write_mcb_header(mem, block.mcb_seg, block.sig, 0, block.size, NO_NAME)?;
+    coalesce_free_blocks(first_mcb, mem)?;
     Ok(Ok(()))
 }
 
 /// Resize the owned AH=48h-style block whose data segment is `seg` in the region
-/// `[first_mcb, top)` to `paras` paragraphs. Same `ResizeError` codes as the
-/// conventional path: a block at (or whose free tail sits directly above) the top
-/// moves the tail; a non-top block shrinks in place and leaks the gap, and a
-/// non-top grow has nowhere to go.
+/// `[first_mcb, top)` to `paras` paragraphs. A free successor is coalesced into the
+/// grow ceiling, and shrink-created gaps become reusable free MCBs.
 pub(super) fn resize_block(
     first_mcb: u16,
     top: u16,
@@ -936,6 +1007,7 @@ pub(super) fn resize_block(
     paras: u16,
     mem: &mut Memory,
 ) -> Result<Result<(), ResizeError>, DosError> {
+    coalesce_free_blocks(first_mcb, mem)?;
     let chain = read_mcb_chain(mem, first_mcb);
     let Some(pos) = chain
         .iter()
@@ -944,32 +1016,32 @@ pub(super) fn resize_block(
         return Ok(Err(ResizeError::InvalidBlock));
     };
     let block = chain[pos];
-    let block_end = block.mcb_seg.wrapping_add(1).wrapping_add(block.size);
-    let tail_above = matches!(chain.last(), Some(t) if t.owner == 0 && block_end == t.mcb_seg);
-    let is_last = pos + 1 == chain.len();
-    if tail_above || is_last {
-        let new_end = u32::from(seg) + u32::from(paras);
-        if new_end > u32::from(top) {
-            return Ok(Err(ResizeError::TooBig(top - seg)));
-        }
-        let new_end = new_end as u16;
-        if new_end < top {
-            write_mcb_header(mem, block.mcb_seg, b'M', seg, paras, NO_NAME)?;
-            write_mcb_header(mem, new_end, b'Z', 0, top - new_end - 1, NO_NAME)?;
-        } else {
-            write_mcb_header(mem, block.mcb_seg, b'Z', seg, paras, NO_NAME)?;
-        }
-        Ok(Ok(()))
-    } else if paras <= block.size {
-        // Non-top block with a successor: shrink in place; the gap leaks.
-        write_mcb_header(mem, block.mcb_seg, b'M', seg, paras, NO_NAME)?;
-        let gap_seg = seg.wrapping_add(paras);
-        let next = chain[pos + 1].mcb_seg;
-        if gap_seg < next {
-            write_mcb_header(mem, gap_seg, b'M', 0, next - gap_seg - 1, NO_NAME)?;
-        }
-        Ok(Ok(()))
-    } else {
-        Ok(Err(ResizeError::TooBig(block.size)))
+    let next = chain.get(pos + 1).copied();
+    let limit = match next {
+        Some(n) if n.owner == 0 => n.mcb_seg.wrapping_add(1).wrapping_add(n.size),
+        Some(n) => n.mcb_seg,
+        None => top,
+    };
+    let new_end = u32::from(seg) + u32::from(paras);
+    if new_end > u32::from(limit) {
+        return Ok(Err(ResizeError::TooBig(limit - seg)));
     }
+    let new_end = new_end as u16;
+    if new_end == limit {
+        let sig = match next {
+            Some(n) if n.owner == 0 => n.sig,
+            Some(_) => b'M',
+            None => b'Z',
+        };
+        write_mcb_header(mem, block.mcb_seg, sig, seg, paras, NO_NAME)?;
+    } else {
+        let free_sig = match next {
+            Some(n) if n.owner == 0 => n.sig,
+            Some(_) => b'M',
+            None => b'Z',
+        };
+        write_mcb_header(mem, block.mcb_seg, b'M', seg, paras, NO_NAME)?;
+        write_mcb_header(mem, new_end, free_sig, 0, limit - new_end - 1, NO_NAME)?;
+    }
+    Ok(Ok(()))
 }
