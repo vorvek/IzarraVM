@@ -8,9 +8,10 @@ use thiserror::Error;
 mod memory;
 
 use memory::{
-    ARENA_TOP, Arena, ResizeError, SftHostFileEntry, UmbArena, allocate_strategy, free_routed,
-    is_valid_alloc_strategy, release_umb, request_umb, resize_routed, resize_umb, set_umb_region,
-    write_child_program_mcb, write_env_mcb, write_free_mcb_to_cap, write_sysvars,
+    ARENA_TOP, Arena, ResizeError, SDA_ALWAYS_SWAPPED_LEN, SDA_IN_DOS_SWAPPED_LEN, SdaSnapshot,
+    SftHostFileEntry, UmbArena, allocate_strategy, free_routed, is_valid_alloc_strategy,
+    release_umb, request_umb, resize_routed, resize_umb, set_umb_region, write_child_program_mcb,
+    write_env_mcb, write_free_mcb_to_cap, write_sda, write_sysvars,
 };
 #[cfg(test)]
 use memory::{NO_NAME, RamMcb, read_mcb_chain, write_mcb_header};
@@ -2026,6 +2027,22 @@ impl DosKernel {
         set_dos_error(regs, code);
     }
 
+    fn refresh_sda(&self, mem: &mut Memory) -> Result<(u16, u16), DosError> {
+        write_sda(
+            mem,
+            self.arena.first_mcb(),
+            self.lastdrive,
+            self.file_count(),
+            SdaSnapshot {
+                last_error: self.last_error,
+                current_dta: self.dta,
+                current_psp: self.arena.psp_seg,
+                last_exit_code: self.last_exit_code,
+                last_exit_type: self.last_exit_type,
+            },
+        )
+    }
+
     fn dispatch_int21(
         &mut self,
         regs: &mut DosRegs,
@@ -2384,6 +2401,15 @@ impl DosKernel {
                 if regs.ax as u8 == 0x00 {
                     regs.dx &= 0xff00; // DL = 0 (off)
                 }
+                Ok(DosAction::Continue)
+            }
+            // AH=34h GET ADDRESS OF INDOS FLAG. The byte lives at SDA+1; the
+            // critical-error flag is the preceding byte, matching DOS 3+.
+            0x34 => {
+                let (seg, sda_off) = self.refresh_sda(mem)?;
+                regs.es = seg;
+                regs.bx = sda_off.wrapping_add(1);
+                regs.cf = false;
                 Ok(DosAction::Continue)
             }
             // AH=0Eh: select default drive. Stub: only C: exists, so report
@@ -3155,6 +3181,21 @@ impl DosKernel {
                 regs.cf = false; // the query itself succeeds; do not overwrite last_error
                 Ok(DosAction::Continue)
             }
+            // AH=5Dh internal server functions. Only AX=5D06h is live here: it
+            // returns the DOS Swappable Data Area and the critical-error flag at
+            // byte 0. Network/server calls and AX=5D0Ah/5D0Bh remain parked.
+            0x5d => match regs.ax as u8 {
+                0x06 => {
+                    let (seg, sda_off) = self.refresh_sda(mem)?;
+                    regs.ds = seg;
+                    regs.si = sda_off;
+                    regs.cx = SDA_IN_DOS_SWAPPED_LEN;
+                    regs.dx = SDA_ALWAYS_SWAPPED_LEN;
+                    regs.cf = false;
+                    Ok(DosAction::Continue)
+                }
+                _ => Ok(DosAction::Continue),
+            },
             // AH=5Ah CREATE TEMPORARY FILE: DS:DX points at an ASCIIZ directory path
             // ending in '\'. Generate a unique 8.3 name, append it (with its NUL) so
             // the caller can read back the full path, then create it create-exclusive.
@@ -7169,6 +7210,137 @@ mod tests {
             mem.read_u16(c_drive + 0x47).unwrap(),
             dpb_seg,
             "C: CDS points at the C: DPB segment"
+        );
+    }
+
+    #[test]
+    fn ah34_returns_the_live_indos_flag_inside_the_sda() {
+        let (mut kernel, mut mem) = arena_kernel();
+        let mut set_dta = DosRegs {
+            ax: 0x1a00,
+            ds: 0x1234,
+            dx: 0x0056,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut set_dta, &mut mem).unwrap();
+
+        let mut regs = DosRegs {
+            ax: 0x3400,
+            es: 0xabcd,
+            bx: 0xdead,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+
+        assert_ne!((regs.es, regs.bx), (0xabcd, 0xdead), "AH=34h returns ES:BX");
+        let indos = usize::from(regs.es) * 16 + usize::from(regs.bx);
+        let sda = indos - 1;
+        assert_eq!(mem.read_u8(sda).unwrap(), 0, "critical-error flag is clear");
+        assert_eq!(
+            mem.read_u8(indos).unwrap(),
+            0,
+            "InDOS is clear between calls"
+        );
+        assert_eq!(
+            mem.read_u16(sda + 0x0c).unwrap(),
+            0x0056,
+            "current DTA offset"
+        );
+        assert_eq!(
+            mem.read_u16(sda + 0x0e).unwrap(),
+            0x1234,
+            "current DTA segment"
+        );
+        assert_eq!(mem.read_u16(sda + 0x10).unwrap(), 0x0100, "current PSP");
+    }
+
+    #[test]
+    fn ax5d06_returns_minimal_live_sda_and_parks_the_dos_stacks() {
+        let (mut kernel, mut mem) = arena_kernel();
+        let mut bad_read = DosRegs {
+            ax: 0x3f00,
+            bx: 0x2222,
+            cx: 1,
+            ds: 0x2000,
+            dx: 0x0000,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut bad_read, &mut mem).unwrap();
+        assert!(bad_read.cf);
+        assert_eq!(bad_read.ax, 0x0006, "bad handle seeds AH=59h state");
+
+        let mut set_dta = DosRegs {
+            ax: 0x1a00,
+            ds: 0x3456,
+            dx: 0x0789,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut set_dta, &mut mem).unwrap();
+
+        let mut regs = DosRegs {
+            ax: 0x5d06,
+            ds: 0xbeef,
+            si: 0xface,
+            cf: true,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+
+        assert!(!regs.cf, "AX=5D06h succeeds");
+        assert_ne!(
+            (regs.ds, regs.si),
+            (0xbeef, 0xface),
+            "DS:SI points at the SDA"
+        );
+        assert_eq!(regs.cx, 0, "large in-DOS stack swap area is parked");
+        assert_eq!(
+            regs.dx, 0x001a,
+            "only the stable SDA prefix is always swapped"
+        );
+
+        let sda = usize::from(regs.ds) * 16 + usize::from(regs.si);
+        assert_eq!(mem.read_u8(sda).unwrap(), 0, "critical-error flag");
+        assert_eq!(mem.read_u8(sda + 1).unwrap(), 0, "InDOS flag");
+        assert_eq!(
+            mem.read_u8(sda + 2).unwrap(),
+            0xff,
+            "no current critical-error drive"
+        );
+        assert_eq!(mem.read_u8(sda + 3).unwrap(), 0x01, "last-error locus");
+        assert_eq!(mem.read_u16(sda + 4).unwrap(), 0x0006, "last-error code");
+        assert_eq!(mem.read_u8(sda + 6).unwrap(), 0x05, "last-error action");
+        assert_eq!(mem.read_u8(sda + 7).unwrap(), 0x0d, "last-error class");
+        assert_eq!(
+            mem.read_u16(sda + 0x0c).unwrap(),
+            0x0789,
+            "current DTA offset"
+        );
+        assert_eq!(
+            mem.read_u16(sda + 0x0e).unwrap(),
+            0x3456,
+            "current DTA segment"
+        );
+        assert_eq!(mem.read_u16(sda + 0x10).unwrap(), 0x0100, "current PSP");
+        assert_eq!(
+            mem.read_u16(sda + 0x14).unwrap(),
+            0,
+            "last process return code"
+        );
+        assert_eq!(mem.read_u8(sda + 0x16).unwrap(), 2, "current drive C:");
+        assert_eq!(
+            mem.read_u8(sda + 0x17).unwrap(),
+            0,
+            "extended break flag off"
+        );
+        assert_eq!(
+            mem.read_u8(sda + 0x18).unwrap(),
+            0,
+            "code-page switch flag parked"
+        );
+        assert_eq!(
+            mem.read_u8(sda + 0x19).unwrap(),
+            0,
+            "INT 24 abort code-page flag parked"
         );
     }
 

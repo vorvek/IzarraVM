@@ -47,6 +47,52 @@ const SFT_ENTRY_LEN: usize = 0x3b;
 const STANDARD_SFT_SLOTS: usize = 5;
 const DPB_LEN: usize = 0x21;
 const CDS_ENTRY_LEN: usize = 0x58;
+const SDA_LIVE_PREFIX_LEN: usize = 0x1a;
+pub(super) const SDA_ALWAYS_SWAPPED_LEN: u16 = 0x001a;
+pub(super) const SDA_IN_DOS_SWAPPED_LEN: u16 = 0x0000;
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SdaSnapshot {
+    pub(super) last_error: u16,
+    pub(super) current_dta: (u16, u16),
+    pub(super) current_psp: u16,
+    pub(super) last_exit_code: u8,
+    pub(super) last_exit_type: u8,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SysvarsLayout {
+    drive_count: u8,
+    sft_slots: usize,
+    dpb_off: usize,
+    cds_array_off: usize,
+    sda_off: usize,
+}
+
+fn sysvars_layout(first_mcb: u16, lastdrive: Option<u8>, file_count: u16) -> SysvarsLayout {
+    let base = usize::from(SYSVARS_SEG) * 16;
+    let sysvars_limit = usize::from(first_mcb) * 16;
+    let drive_count = lastdrive.unwrap_or(DEFAULT_LASTDRIVE).min(26);
+    let sft_linear = base + 2 + SFT_TABLE_OFF;
+    let cds_bytes = usize::from(drive_count) * CDS_ENTRY_LEN;
+    let max_sft_slots = (sysvars_limit
+        .saturating_sub(sft_linear + SFT_HEADER_LEN + DPB_LEN + cds_bytes + SDA_LIVE_PREFIX_LEN)
+        / SFT_ENTRY_LEN)
+        .max(2);
+    let sft_slots = usize::from(file_count)
+        .max(STANDARD_SFT_SLOTS)
+        .min(max_sft_slots);
+    let dpb_off = SFT_TABLE_OFF + SFT_HEADER_LEN + sft_slots * SFT_ENTRY_LEN;
+    let cds_array_off = dpb_off + DPB_LEN;
+    let sda_off = cds_array_off + cds_bytes;
+    SysvarsLayout {
+        drive_count,
+        sft_slots,
+        dpb_off,
+        cds_array_off,
+        sda_off,
+    }
+}
 
 /// A live host-file handle projected into the DOS System File Table.
 #[derive(Debug, Clone, Copy)]
@@ -537,19 +583,12 @@ pub(super) fn write_sysvars(
     host_files: &[SftHostFileEntry],
 ) -> Result<(u16, u16), DosError> {
     let base = usize::from(SYSVARS_SEG) * 16;
-    let sysvars_limit = usize::from(first_mcb) * 16;
-    let drive_count = lastdrive.unwrap_or(DEFAULT_LASTDRIVE).min(26);
-    let sft_linear = base + 2 + SFT_TABLE_OFF;
+    let layout = sysvars_layout(first_mcb, lastdrive, file_count);
+    let drive_count = layout.drive_count;
+    let sft_slots = layout.sft_slots;
+    let dpb_off = layout.dpb_off;
+    let cds_array_off = layout.cds_array_off;
     let cds_bytes = usize::from(drive_count) * CDS_ENTRY_LEN;
-    let max_sft_slots = (sysvars_limit
-        .saturating_sub(sft_linear + SFT_HEADER_LEN + DPB_LEN + cds_bytes)
-        / SFT_ENTRY_LEN)
-        .max(2);
-    let sft_slots = usize::from(file_count)
-        .max(STANDARD_SFT_SLOTS)
-        .min(max_sft_slots);
-    let dpb_off = SFT_TABLE_OFF + SFT_HEADER_LEN + sft_slots * SFT_ENTRY_LEN;
-    let cds_array_off = dpb_off + DPB_LEN;
     let dpb_linear = base + 2 + dpb_off;
     let cds_linear = base + 2 + cds_array_off;
     let clear_end = 2 + cds_array_off + cds_bytes;
@@ -686,6 +725,48 @@ pub(super) fn write_sysvars(
     write_character_device_header(mem, con, clock_ptr, SYSVARS_SEG, 0x8013, b"CON     ")?;
     write_character_device_header(mem, clock, 0xffff, 0xffff, 0x8008, b"CLOCK$  ")?;
     Ok((SYSVARS_SEG, 0x0002))
+}
+
+/// Refresh the DOS 4.x-style live prefix of the Swappable Data Area and return
+/// its far pointer. The large DOS internal stacks and file-operation scratch that
+/// follow the prefix are deliberately parked for now, so AX=5D06h reports no
+/// in-DOS-only swap area and only this 0x1A-byte always-swapped prefix.
+pub(super) fn write_sda(
+    mem: &mut Memory,
+    first_mcb: u16,
+    lastdrive: Option<u8>,
+    file_count: u16,
+    snapshot: SdaSnapshot,
+) -> Result<(u16, u16), DosError> {
+    let layout = sysvars_layout(first_mcb, lastdrive, file_count);
+    let sda_off = (2 + layout.sda_off) as u16;
+    let sda = usize::from(SYSVARS_SEG) * 16 + usize::from(sda_off);
+    for off in 0..SDA_LIVE_PREFIX_LEN {
+        mem.write_u8(sda + off, 0)?;
+    }
+
+    mem.write_u8(sda, 0)?; // critical-error flag, no INT 24h path is active
+    mem.write_u8(sda + 0x01, 0)?; // InDOS count is clear between HLE calls
+    mem.write_u8(sda + 0x02, 0xff)?; // no current critical-error drive
+    mem.write_u8(sda + 0x03, 0x01)?; // AH=59h locus: unknown/not appropriate
+    mem.write_u16(sda + 0x04, snapshot.last_error)?;
+    mem.write_u8(sda + 0x06, 0x05)?; // AH=59h action: immediate abort
+    mem.write_u8(sda + 0x07, 0x0d)?; // AH=59h class: unknown/other
+    // 0x08 ES:DI media-ID pointer is only meaningful for disk-change errors, which
+    // the HLE does not generate, so the zero filled pointer remains parked.
+    mem.write_u16(sda + 0x0c, snapshot.current_dta.1)?;
+    mem.write_u16(sda + 0x0e, snapshot.current_dta.0)?;
+    mem.write_u16(sda + 0x10, snapshot.current_psp)?;
+    // 0x12 SP across INT 23h is parked until Ctrl-C far calls exist.
+    mem.write_u16(
+        sda + 0x14,
+        u16::from(snapshot.last_exit_code) | (u16::from(snapshot.last_exit_type) << 8),
+    )?;
+    mem.write_u8(sda + 0x16, 2)?; // current drive C: (0 = A:)
+    mem.write_u8(sda + 0x17, 0)?; // extended break flag off
+    mem.write_u8(sda + 0x18, 0)?; // code page switching flag parked
+    mem.write_u8(sda + 0x19, 0)?; // INT 24 abort code-page flag parked
+    Ok((SYSVARS_SEG, sda_off))
 }
 
 /// Write one MCB header into guest RAM: the signature ('M' link or 'Z' last), the
