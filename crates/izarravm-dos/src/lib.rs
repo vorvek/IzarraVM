@@ -8,11 +8,12 @@ use thiserror::Error;
 mod memory;
 
 use memory::{
-    ARENA_TOP, Arena, NO_NAME, PROG_NAME, ResizeError, UmbArena, carve_from_tail, free_block,
-    resize_block, write_mcb_header,
+    ARENA_TOP, Arena, ResizeError, UmbArena, allocate_strategy, free_routed,
+    is_valid_alloc_strategy, release_umb, request_umb, resize_routed, resize_umb, set_umb_region,
+    write_child_program_mcb, write_env_mcb, write_free_mcb_to_cap, write_sysvars,
 };
 #[cfg(test)]
-use memory::{RamMcb, read_mcb_chain};
+use memory::{NO_NAME, RamMcb, read_mcb_chain, write_mcb_header};
 
 // BDA keyboard ring (the buffer the resident keyboard BIOS fills). Segment 0x40,
 // head at 0x1a, tail at 0x1c, a 16-entry ring at 0x1e..0x3e. Each entry is a word
@@ -334,15 +335,6 @@ pub enum DosAction {
     WaitForKey,
 }
 
-/// Kernel-reserved paragraph holding the AH=52h list-of-lists (SysVars) table.
-/// 0x0050 = linear 0x500, just above the BIOS data area (0x400-0x4FF) and below
-/// where programs load (psp_seg >= 0x0100), so it collides with neither.
-const SYSVARS_SEG: u16 = 0x0050;
-
-/// DOS default LASTDRIVE, reported in the list of lists: drives A: through E:.
-/// The CONFIG.SYS `LASTDRIVE=` line will override this once that wiring exists.
-const DEFAULT_LASTDRIVE: u8 = 5;
-
 /// Toka-DOS wall clock. Deterministic by default (a fixed 1997 instant) so unit
 /// tests are stable; the machine/CLI may overwrite it via set_clock. Fields are
 /// stored explicitly, including day_of_week, to avoid any calendar computation.
@@ -515,7 +507,8 @@ pub struct DosKernel {
     // AH=2Eh/54h write-verify flag. The HLE writes host files directly, so this has
     // no datapath effect; it only round-trips for guests that read it back.
     verify_flag: bool,
-    // AH=58h memory-allocation strategy. The bump arena ignores it; stored for read-back.
+    // AH=58h memory-allocation strategy. Bits 6-7 route allocations between low
+    // conventional memory and the linked upper-memory arena.
     alloc_strategy: u16,
     // AH=58h AL=03 UMB link state. Gates whether a high or high-then-low allocation
     // strategy is routed into the upper-memory arena; the arena itself exists in RAM
@@ -614,22 +607,7 @@ impl DosKernel {
         paras: u16,
         mem: &mut Memory,
     ) -> Result<(), DosError> {
-        if paras < 2 {
-            // No upper memory: drop the arena and the link, keeping the invariant
-            // that a linked state always has an arena behind it.
-            self.umb = None;
-            self.umb_link = false;
-            return Ok(());
-        }
-        // One free 'Z' block: the header takes the first paragraph, the rest is the
-        // free upper memory. Owner 0 marks it free, the same as the conventional
-        // free tail.
-        write_mcb_header(mem, seg, b'Z', 0, paras - 1, NO_NAME)?;
-        self.umb = Some(UmbArena {
-            first_mcb: seg,
-            top: seg.wrapping_add(paras),
-        });
-        Ok(())
+        set_umb_region(&mut self.umb, &mut self.umb_link, seg, paras, mem)
     }
 
     /// Set whether the EMS manager (the EMMXXXX0 device) is present. The machine
@@ -658,18 +636,8 @@ impl DosKernel {
     #[cfg(test)]
     fn umb_chain(&self, mem: &Memory) -> Vec<RamMcb> {
         match self.umb {
-            Some(arena) => read_mcb_chain(mem, arena.first_mcb),
+            Some(arena) => arena.chain(mem),
             None => Vec::new(),
-        }
-    }
-
-    /// The linked upper-memory arena, if UMBs are both furnished and linked into
-    /// the allocation system (AH=5803h). None routes everything to conventional
-    /// memory, the way DOS behaves before `DOS=UMB` links the upper arena.
-    fn linked_umb(&self) -> Option<UmbArena> {
-        match (self.umb_link, self.umb) {
-            (true, Some(arena)) => Some(arena),
-            _ => None,
         }
     }
 
@@ -682,32 +650,20 @@ impl DosKernel {
         paras: u16,
         mem: &mut Memory,
     ) -> Result<Result<u16, u16>, DosError> {
-        let area = self.alloc_strategy & 0x00c0; // bits 6-7
-        match (area, self.linked_umb()) {
-            (0x40, Some(u)) => carve_from_tail(u.first_mcb, u.top, paras, mem),
-            (0x80, Some(u)) => match carve_from_tail(u.first_mcb, u.top, paras, mem)? {
-                Ok(seg) => Ok(Ok(seg)),
-                // Upper memory could not satisfy it: fall back to conventional. On a
-                // double failure report the larger of the two arenas' free tails,
-                // the way DOS's single-chain walk reports the global largest block.
-                Err(hi) => match self.arena.allocate(paras, mem)? {
-                    Ok(seg) => Ok(Ok(seg)),
-                    Err(lo) => Ok(Err(hi.max(lo))),
-                },
-            },
-            _ => self.arena.allocate(paras, mem),
-        }
+        allocate_strategy(
+            &mut self.arena,
+            self.umb,
+            self.umb_link,
+            self.alloc_strategy,
+            paras,
+            mem,
+        )
     }
 
     /// AH=49h free routed to the arena that owns `seg`: the upper-memory arena when
     /// the segment falls in its window, the conventional arena otherwise.
     fn free_routed(&mut self, seg: u16, mem: &mut Memory) -> Result<Result<(), ()>, DosError> {
-        if let Some(u) = self.umb {
-            if (u.first_mcb..u.top).contains(&seg) {
-                return free_block(u.first_mcb, u.top, seg, mem);
-            }
-        }
-        self.arena.free(seg, mem)
+        free_routed(&mut self.arena, self.umb, seg, mem)
     }
 
     /// AH=4Ah resize routed to the arena that owns `seg` (see `free_routed`).
@@ -717,12 +673,7 @@ impl DosKernel {
         paras: u16,
         mem: &mut Memory,
     ) -> Result<Result<(), ResizeError>, DosError> {
-        if let Some(u) = self.umb {
-            if (u.first_mcb..u.top).contains(&seg) {
-                return resize_block(u.first_mcb, u.top, seg, paras, mem);
-            }
-        }
-        self.arena.resize(seg, paras, mem)
+        resize_routed(&mut self.arena, self.umb, seg, paras, mem)
     }
 
     /// Whether an upper-memory-block arena is furnished (the EMM386 manager is
@@ -754,21 +705,13 @@ impl DosKernel {
         paras: u16,
         mem: &mut Memory,
     ) -> Result<Result<u16, u16>, DosError> {
-        match self.umb {
-            Some(u) => carve_from_tail(u.first_mcb, u.top, paras, mem),
-            None => Ok(Err(0)),
-        }
+        request_umb(self.umb, paras, mem)
     }
 
     /// XMS function 11h Release UMB: free the upper-memory block whose segment is
     /// `seg`. Ok(Ok(())), or Ok(Err(())) when `seg` is not a UMB block.
     pub fn release_umb(&mut self, seg: u16, mem: &mut Memory) -> Result<Result<(), ()>, DosError> {
-        match self.umb {
-            Some(u) if (u.first_mcb..u.top).contains(&seg) => {
-                free_block(u.first_mcb, u.top, seg, mem)
-            }
-            _ => Ok(Err(())),
-        }
+        release_umb(self.umb, seg, mem)
     }
 
     /// XMS function 12h Reallocate UMB: resize the upper-memory block at `seg` to
@@ -781,17 +724,7 @@ impl DosKernel {
         paras: u16,
         mem: &mut Memory,
     ) -> Result<Result<(), Option<u16>>, DosError> {
-        let Some(u) = self.umb else {
-            return Ok(Err(None));
-        };
-        if !(u.first_mcb..u.top).contains(&seg) {
-            return Ok(Err(None));
-        }
-        match resize_block(u.first_mcb, u.top, seg, paras, mem)? {
-            Ok(()) => Ok(Ok(())),
-            Err(ResizeError::TooBig(largest)) => Ok(Err(Some(largest))),
-            Err(ResizeError::InvalidBlock) => Ok(Err(None)),
-        }
+        resize_umb(self.umb, seg, paras, mem)
     }
 
     /// Stand up a system PSP, arena, and base environment with no running
@@ -1124,7 +1057,7 @@ impl DosKernel {
 
         // The load succeeded: now write the environment MCB block (owner = the child
         // PSP) over the parent's old free tail, and the env bytes into its data area.
-        write_mcb_header(mem, env_mcb, b'M', child_psp, env_paras, NO_NAME)?;
+        write_env_mcb(mem, env_mcb, child_psp, env_paras)?;
         let env_linear = usize::from(env_seg) * 16;
         for (i, &byte) in env_bytes.iter().enumerate() {
             mem.write_u8(env_linear + i, byte)?;
@@ -1165,14 +1098,7 @@ impl DosKernel {
         // Write the child program block: owned by the child PSP, the last block,
         // filling conventional memory to the top. Its header sits just above the env
         // data, so the child chain reads env -> program -> (free tail once shrunk).
-        write_mcb_header(
-            mem,
-            child_psp.wrapping_sub(1),
-            b'Z',
-            child_psp,
-            ARENA_TOP - child_psp,
-            PROG_NAME,
-        )?;
+        write_child_program_mcb(mem, child_psp)?;
         self.dta = (child_psp, 0x80);
         // A fresh child has terminated no child of its own.
         self.last_exit_code = 0;
@@ -1214,16 +1140,7 @@ impl DosKernel {
                     .min()
                     .unwrap_or(ARENA_TOP);
                 if parent.free_base < cap {
-                    // 'M' when a resident block follows (a link to it), else the tail.
-                    let sig = if cap < ARENA_TOP { b'M' } else { b'Z' };
-                    write_mcb_header(
-                        mem,
-                        parent.free_base,
-                        sig,
-                        0,
-                        cap - parent.free_base - 1,
-                        NO_NAME,
-                    )?;
+                    write_free_mcb_to_cap(mem, parent.free_base, cap)?;
                 }
             }
         }
@@ -2804,71 +2721,10 @@ impl DosKernel {
                 regs.bx = self.arena.psp_seg;
                 Ok(DosAction::Continue)
             }
-            // AH=52h GET LIST OF LISTS (SysVars). Returns ES:BX -> the DOS internal
-            // variable table. The first-MCB segment at [BX-2] points at the live
-            // in-RAM MCB chain (psp_seg-1 for a directly-loaded program; for an EXEC
-            // child the environment block that heads its chain), which the allocator
-            // owns and a guest can walk and edit. The fields a guest reads (max bytes
-            // per block, LASTDRIVE) and the NUL device header that heads the driver
-            // chain are filled inline. The DWORD chain pointers (DPB, SFT, CLOCK$,
-            // CON, CDS, FCB tables, disk buffers) stay zero: their backing
-            // structures are not modeled yet and no guest in scope walks them. The
-            // table lives at a kernel-reserved low paragraph so it does not collide
-            // with a program loaded at 0x0100+. Offsets are written as base + 2 + off
-            // so the comments can use the documented BX-relative off.
             0x52 => {
-                let first_mcb = self.arena.first_mcb();
-                let base = usize::from(SYSVARS_SEG) * 16;
-                // [BX-2] = first MCB segment (BX returns 0x0002, so this is offset 0).
-                mem.write_u16(base, first_mcb)?;
-                // Clear the documented field span, then fill the known fields over it.
-                for off in 2..0x40usize {
-                    mem.write_u8(base + off, 0)?;
-                }
-                // [BX+0x10] WORD: the largest bytes-per-block of any block device,
-                // a 512-byte sector here.
-                mem.write_u16(base + 2 + 0x10, 512)?;
-                // [BX+0x21] BYTE: LASTDRIVE.
-                mem.write_u8(base + 2 + 0x21, DEFAULT_LASTDRIVE)?;
-                // [BX+0x22]: the NUL device header, the head of the device-driver
-                // chain. It is an inline 18-byte structure, not a pointer: a
-                // FFFF:FFFF next link (NUL is the only modeled device, so the chain
-                // ends here), the character-device + NUL attribute 0x8004, no
-                // strategy or interrupt routine, and the 8-byte name "NUL     ".
-                // The CON and CLOCK$ headers are parked (not modeled yet).
-                let nul_off = 0x22usize; // BX-relative offset of the NUL header
-                let ems_off = nul_off + 0x12; // the EMMXXXX0 header right after NUL
-                let nul = base + 2 + nul_off;
-                // NUL's next link ends the chain, unless EMS is present, in which case
-                // the EMMXXXX0 device follows it.
-                if self.ems_present {
-                    mem.write_u16(nul, (2 + ems_off) as u16)?; // next offset
-                    mem.write_u16(nul + 2, SYSVARS_SEG)?; // next segment
-                } else {
-                    mem.write_u16(nul, 0xffff)?;
-                    mem.write_u16(nul + 2, 0xffff)?; // FFFF:FFFF = end
-                }
-                mem.write_u16(nul + 4, 0x8004)?; // attribute: char device, NUL bit
-                mem.write_u16(nul + 6, 0xffff)?; // strategy entry (none)
-                mem.write_u16(nul + 8, 0xffff)?; // interrupt entry (none)
-                for (i, &byte) in b"NUL     ".iter().enumerate() {
-                    mem.write_u8(nul + 0x0a + i, byte)?;
-                }
-                // The EMMXXXX0 device header terminates the chain when EMS is present,
-                // so a guest walking the device list finds the manager by name.
-                if self.ems_present {
-                    let ems = base + 2 + ems_off;
-                    mem.write_u16(ems, 0xffff)?; // next offset
-                    mem.write_u16(ems + 2, 0xffff)?; // next segment (end)
-                    mem.write_u16(ems + 4, 0xc000)?; // attribute: character device
-                    mem.write_u16(ems + 6, 0xffff)?; // strategy entry (none)
-                    mem.write_u16(ems + 8, 0xffff)?; // interrupt entry (none)
-                    for (i, &byte) in b"EMMXXXX0".iter().enumerate() {
-                        mem.write_u8(ems + 0x0a + i, byte)?;
-                    }
-                }
-                regs.es = SYSVARS_SEG;
-                regs.bx = 0x0002;
+                let (es, bx) = write_sysvars(mem, self.arena.first_mcb(), self.ems_present)?;
+                regs.es = es;
+                regs.bx = bx;
                 Ok(DosAction::Continue)
             }
             // AH=0Dh DISK RESET: the HLE writes host files directly, so there are no
@@ -2893,11 +2749,9 @@ impl DosKernel {
                 regs.ax = (regs.ax & 0xff00) | u16::from(self.verify_flag);
                 Ok(DosAction::Continue)
             }
-            // AH=58h memory-allocation strategy and UMB link state, the seam the
-            // IEMM UMB layer (P5) consumes. AL=00/01 get/set the strategy, AL=02/03
-            // get/set the UMB link state. The bump arena does not honor the strategy
-            // or link UMBs yet; both round-trip through here so a guest (and P5) can
-            // observe them.
+            // AH=58h memory-allocation strategy and UMB link state. AL=00/01 get/set
+            // the strategy, AL=02/03 get/set the UMB link state. The strategy bits
+            // route AH=48h through conventional memory, upper memory, or high-then-low.
             0x58 => match regs.ax as u8 {
                 0x00 => {
                     regs.ax = self.alloc_strategy;
@@ -3773,16 +3627,6 @@ pub fn load_overlay(
 fn set_dos_error(regs: &mut DosRegs, code: u16) {
     regs.cf = true;
     regs.ax = code;
-}
-
-/// The nine valid AH=58h allocation strategies: the low two bits pick the fit
-/// (first / best / last) and bits 6-7 pick the memory area (low, high, or high
-/// then low). Any other value is rejected on a set-strategy call.
-fn is_valid_alloc_strategy(strategy: u16) -> bool {
-    matches!(
-        strategy,
-        0x00 | 0x01 | 0x02 | 0x40 | 0x41 | 0x42 | 0x80 | 0x81 | 0x82
-    )
 }
 
 /// Map a host file io error to a DOS error code. NotFound is 0x02 (file not

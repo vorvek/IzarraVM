@@ -22,6 +22,15 @@ pub(super) enum ResizeError {
 pub(super) const PROG_NAME: &[u8; 8] = b"TOKAPROG";
 pub(super) const NO_NAME: &[u8; 8] = b"\0\0\0\0\0\0\0\0";
 
+/// Kernel-reserved paragraph holding the AH=52h list-of-lists (SysVars) table.
+/// 0x0050 = linear 0x500, just above the BIOS data area (0x400-0x4FF) and below
+/// where programs load (psp_seg >= 0x0100), so it collides with neither.
+const SYSVARS_SEG: u16 = 0x0050;
+
+/// DOS default LASTDRIVE, reported in the list of lists: drives A: through E:.
+/// The CONFIG.SYS `LASTDRIVE=` line will override this once that wiring exists.
+const DEFAULT_LASTDRIVE: u8 = 5;
+
 /// Conventional memory modeled as an authoritative in-RAM MCB chain ending at
 /// paragraph 0xA000. The chain is the source of truth: allocate/free/resize walk
 /// and mutate the real headers a guest reads through AH=52h, so a memory manager
@@ -265,6 +274,262 @@ pub(super) struct UmbArena {
     /// One paragraph past the pool: the ceiling the free tail reaches, the UMB
     /// analogue of `ARENA_TOP` for the conventional arena.
     pub(super) top: u16,
+}
+
+impl UmbArena {
+    pub(super) fn contains_data(self, seg: u16) -> bool {
+        (self.first_mcb..self.top).contains(&seg)
+    }
+
+    #[cfg(test)]
+    pub(super) fn chain(self, mem: &Memory) -> Vec<RamMcb> {
+        read_mcb_chain(mem, self.first_mcb)
+    }
+
+    fn allocate(self, paras: u16, mem: &mut Memory) -> Result<Result<u16, u16>, DosError> {
+        carve_from_tail(self.first_mcb, self.top, paras, mem)
+    }
+
+    fn free(self, seg: u16, mem: &mut Memory) -> Result<Result<(), ()>, DosError> {
+        free_block(self.first_mcb, self.top, seg, mem)
+    }
+
+    fn resize(
+        self,
+        seg: u16,
+        paras: u16,
+        mem: &mut Memory,
+    ) -> Result<Result<(), ResizeError>, DosError> {
+        resize_block(self.first_mcb, self.top, seg, paras, mem)
+    }
+}
+
+/// The nine valid AH=58h allocation strategies: the low two bits pick the fit
+/// (first / best / last) and bits 6-7 pick the memory area (low, high, or high
+/// then low). Any other value is rejected on a set-strategy call.
+pub(super) fn is_valid_alloc_strategy(strategy: u16) -> bool {
+    matches!(
+        strategy,
+        0x00 | 0x01 | 0x02 | 0x40 | 0x41 | 0x42 | 0x80 | 0x81 | 0x82
+    )
+}
+
+/// Furnish or clear the upper-memory arena that DOS exposes to AH=48h high
+/// allocations and XMS UMB calls. Clearing the arena also unlinks it, preserving
+/// the invariant that a linked state always has a real pool behind it.
+pub(super) fn set_umb_region(
+    umb: &mut Option<UmbArena>,
+    umb_link: &mut bool,
+    seg: u16,
+    paras: u16,
+    mem: &mut Memory,
+) -> Result<(), DosError> {
+    if paras < 2 {
+        *umb = None;
+        *umb_link = false;
+        return Ok(());
+    }
+    write_mcb_header(mem, seg, b'Z', 0, paras - 1, NO_NAME)?;
+    *umb = Some(UmbArena {
+        first_mcb: seg,
+        top: seg.wrapping_add(paras),
+    });
+    Ok(())
+}
+
+fn linked_umb(umb: Option<UmbArena>, umb_link: bool) -> Option<UmbArena> {
+    match (umb_link, umb) {
+        (true, Some(arena)) => Some(arena),
+        _ => None,
+    }
+}
+
+/// AH=48h allocation honouring the AH=58h strategy and the UMB link state.
+pub(super) fn allocate_strategy(
+    arena: &mut Arena,
+    umb: Option<UmbArena>,
+    umb_link: bool,
+    alloc_strategy: u16,
+    paras: u16,
+    mem: &mut Memory,
+) -> Result<Result<u16, u16>, DosError> {
+    let area = alloc_strategy & 0x00c0; // bits 6-7
+    match (area, linked_umb(umb, umb_link)) {
+        (0x40, Some(u)) => u.allocate(paras, mem),
+        (0x80, Some(u)) => match u.allocate(paras, mem)? {
+            Ok(seg) => Ok(Ok(seg)),
+            // Upper memory could not satisfy it: fall back to conventional. On a
+            // double failure report the larger of the two arenas' free tails, the
+            // way DOS's single-chain walk reports the global largest block.
+            Err(hi) => match arena.allocate(paras, mem)? {
+                Ok(seg) => Ok(Ok(seg)),
+                Err(lo) => Ok(Err(hi.max(lo))),
+            },
+        },
+        _ => arena.allocate(paras, mem),
+    }
+}
+
+/// AH=49h free routed to the arena that owns `seg`: the upper-memory arena when
+/// the segment falls in its window, the conventional arena otherwise.
+pub(super) fn free_routed(
+    arena: &mut Arena,
+    umb: Option<UmbArena>,
+    seg: u16,
+    mem: &mut Memory,
+) -> Result<Result<(), ()>, DosError> {
+    if let Some(u) = umb {
+        if u.contains_data(seg) {
+            return u.free(seg, mem);
+        }
+    }
+    arena.free(seg, mem)
+}
+
+/// AH=4Ah resize routed to the arena that owns `seg` (see [`free_routed`]).
+pub(super) fn resize_routed(
+    arena: &mut Arena,
+    umb: Option<UmbArena>,
+    seg: u16,
+    paras: u16,
+    mem: &mut Memory,
+) -> Result<Result<(), ResizeError>, DosError> {
+    if let Some(u) = umb {
+        if u.contains_data(seg) {
+            return u.resize(seg, paras, mem);
+        }
+    }
+    arena.resize(seg, paras, mem)
+}
+
+/// XMS function 10h Request UMB: carve `paras` paragraphs from the same upper
+/// MCB chain used by AH=48h-high allocations.
+pub(super) fn request_umb(
+    umb: Option<UmbArena>,
+    paras: u16,
+    mem: &mut Memory,
+) -> Result<Result<u16, u16>, DosError> {
+    match umb {
+        Some(u) => u.allocate(paras, mem),
+        None => Ok(Err(0)),
+    }
+}
+
+/// XMS function 11h Release UMB.
+pub(super) fn release_umb(
+    umb: Option<UmbArena>,
+    seg: u16,
+    mem: &mut Memory,
+) -> Result<Result<(), ()>, DosError> {
+    match umb {
+        Some(u) if u.contains_data(seg) => u.free(seg, mem),
+        _ => Ok(Err(())),
+    }
+}
+
+/// XMS function 12h Reallocate UMB. `Err(Some(largest))` is the too-big case;
+/// `Err(None)` means `seg` is not a live UMB block.
+pub(super) fn resize_umb(
+    umb: Option<UmbArena>,
+    seg: u16,
+    paras: u16,
+    mem: &mut Memory,
+) -> Result<Result<(), Option<u16>>, DosError> {
+    let Some(u) = umb else {
+        return Ok(Err(None));
+    };
+    if !u.contains_data(seg) {
+        return Ok(Err(None));
+    }
+    match u.resize(seg, paras, mem)? {
+        Ok(()) => Ok(Ok(())),
+        Err(ResizeError::TooBig(largest)) => Ok(Err(Some(largest))),
+        Err(ResizeError::InvalidBlock) => Ok(Err(None)),
+    }
+}
+
+pub(super) fn write_env_mcb(
+    mem: &mut Memory,
+    env_mcb: u16,
+    child_psp: u16,
+    env_paras: u16,
+) -> Result<(), DosError> {
+    write_mcb_header(mem, env_mcb, b'M', child_psp, env_paras, NO_NAME)
+}
+
+pub(super) fn write_child_program_mcb(mem: &mut Memory, child_psp: u16) -> Result<(), DosError> {
+    write_mcb_header(
+        mem,
+        child_psp.wrapping_sub(1),
+        b'Z',
+        child_psp,
+        ARENA_TOP - child_psp,
+        PROG_NAME,
+    )
+}
+
+pub(super) fn write_free_mcb_to_cap(
+    mem: &mut Memory,
+    free_base: u16,
+    cap: u16,
+) -> Result<(), DosError> {
+    // 'M' when a resident block follows (a link to it), else the tail.
+    let sig = if cap < ARENA_TOP { b'M' } else { b'Z' };
+    write_mcb_header(mem, free_base, sig, 0, cap - free_base - 1, NO_NAME)
+}
+
+/// AH=52h GET LIST OF LISTS (SysVars). Returns ES:BX -> the DOS internal
+/// variable table. The first-MCB segment at [BX-2] points at the live in-RAM MCB
+/// chain. The modeled scalar fields and device-driver headers are filled in;
+/// unmodeled chain pointers stay zero.
+pub(super) fn write_sysvars(
+    mem: &mut Memory,
+    first_mcb: u16,
+    ems_present: bool,
+) -> Result<(u16, u16), DosError> {
+    let base = usize::from(SYSVARS_SEG) * 16;
+    // [BX-2] = first MCB segment (BX returns 0x0002, so this is offset 0).
+    mem.write_u16(base, first_mcb)?;
+    // Clear the documented field span, then fill the known fields over it.
+    for off in 2..0x40usize {
+        mem.write_u8(base + off, 0)?;
+    }
+    // [BX+0x10] WORD: the largest bytes-per-block of any block device, a 512-byte
+    // sector here.
+    mem.write_u16(base + 2 + 0x10, 512)?;
+    // [BX+0x21] BYTE: LASTDRIVE.
+    mem.write_u8(base + 2 + 0x21, DEFAULT_LASTDRIVE)?;
+    // [BX+0x22]: the NUL device header, the head of the device-driver chain.
+    let nul_off = 0x22usize; // BX-relative offset of the NUL header
+    let ems_off = nul_off + 0x12; // the EMMXXXX0 header right after NUL
+    let nul = base + 2 + nul_off;
+    if ems_present {
+        mem.write_u16(nul, (2 + ems_off) as u16)?; // next offset
+        mem.write_u16(nul + 2, SYSVARS_SEG)?; // next segment
+    } else {
+        mem.write_u16(nul, 0xffff)?;
+        mem.write_u16(nul + 2, 0xffff)?; // FFFF:FFFF = end
+    }
+    mem.write_u16(nul + 4, 0x8004)?; // attribute: char device, NUL bit
+    mem.write_u16(nul + 6, 0xffff)?; // strategy entry (none)
+    mem.write_u16(nul + 8, 0xffff)?; // interrupt entry (none)
+    for (i, &byte) in b"NUL     ".iter().enumerate() {
+        mem.write_u8(nul + 0x0a + i, byte)?;
+    }
+    // The EMMXXXX0 device header terminates the chain when EMS is present, so a
+    // guest walking the device list finds the manager by name.
+    if ems_present {
+        let ems = base + 2 + ems_off;
+        mem.write_u16(ems, 0xffff)?; // next offset
+        mem.write_u16(ems + 2, 0xffff)?; // next segment (end)
+        mem.write_u16(ems + 4, 0xc000)?; // attribute: character device
+        mem.write_u16(ems + 6, 0xffff)?; // strategy entry (none)
+        mem.write_u16(ems + 8, 0xffff)?; // interrupt entry (none)
+        for (i, &byte) in b"EMMXXXX0".iter().enumerate() {
+            mem.write_u8(ems + 0x0a + i, byte)?;
+        }
+    }
+    Ok((SYSVARS_SEG, 0x0002))
 }
 
 /// Write one MCB header into guest RAM: the signature ('M' link or 'Z' last), the
