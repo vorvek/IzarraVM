@@ -222,6 +222,10 @@ impl FromStr for Emm386Mode {
 
 /// DOS default LASTDRIVE, reported in the list of lists: drives A: through E:.
 pub const DEFAULT_LASTDRIVE: u8 = 5;
+/// DOS default FILES count from the shipped CONFIG.SYS.
+pub const DEFAULT_FILES: u16 = 40;
+/// DOS default BUFFERS count from the shipped CONFIG.SYS.
+pub const DEFAULT_BUFFERS: u16 = 20;
 
 /// The subset of CONFIG.SYS directives the HLE SYSINIT maps into machine state:
 /// the EMM386/IEMM mode its DEVICE= lines select, whether DOS=UMB asks for the
@@ -232,6 +236,10 @@ pub struct ConfigSysMemory {
     pub dos_umb: bool,
     /// Highest DOS drive index, A: = 1. Defaults to E: like the shipped config.
     pub lastdrive: u8,
+    /// CONFIG.SYS FILES= count. This caps modeled system file entries.
+    pub files: u16,
+    /// CONFIG.SYS BUFFERS= count. Stored for the DOS buffer model.
+    pub buffers: u16,
     /// Optional EMS page-frame segment from an IEMM/EMM386 `FRAME=` token.
     /// The token is written in hexadecimal like real EMM386 CONFIG.SYS lines.
     pub ems_frame_seg: Option<u16>,
@@ -294,6 +302,8 @@ pub fn parse_config_sys(text: &str) -> ConfigSysMemory {
     let mut emm386 = None;
     let mut dos_umb = false;
     let mut lastdrive = DEFAULT_LASTDRIVE;
+    let mut files = DEFAULT_FILES;
+    let mut buffers = DEFAULT_BUFFERS;
     let mut ems_frame_seg = None;
     let mut ems_pool_kb = None;
     for line in text.lines() {
@@ -341,12 +351,22 @@ pub fn parse_config_sys(text: &str) -> ConfigSysMemory {
             if let Some(parsed) = parse_lastdrive_token(rest) {
                 lastdrive = parsed;
             }
+        } else if let Some(rest) = upper.strip_prefix("FILES=") {
+            if let Ok(parsed) = rest.trim().parse() {
+                files = parsed;
+            }
+        } else if let Some(rest) = upper.strip_prefix("BUFFERS=") {
+            if let Ok(parsed) = rest.trim().parse() {
+                buffers = parsed;
+            }
         }
     }
     ConfigSysMemory {
         emm386: emm386.unwrap_or(Emm386Mode::Unloaded),
         dos_umb,
         lastdrive,
+        files,
+        buffers,
         ems_frame_seg,
         ems_pool_kb,
     }
@@ -1119,6 +1139,14 @@ mod tests {
         let config = parse_config_sys("LASTDRIVE=Z\r\n");
 
         assert_eq!(config.lastdrive, 26);
+    }
+
+    #[test]
+    fn config_sys_parses_files_and_buffers() {
+        let config = parse_config_sys("FILES=37\r\nBUFFERS=12\r\n");
+
+        assert_eq!(config.files, 37);
+        assert_eq!(config.buffers, 12);
     }
 
     #[test]
