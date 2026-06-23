@@ -476,8 +476,9 @@ struct FindSearch {
 
 /// Saved per-program DOS state, pushed when a child is EXECed (AL=0) and
 /// restored when the child exits. open_files is NOT saved; parent and child
-/// share one handle table (real DOS refcounts handles 0-4 into the child's JFT
-/// and closes inherited handles on exit, neither of which we model, marked).
+/// share one handle table. The child PSP exposes the five inherited standard
+/// handles in its JFT, but real DOS ref-counting and close-on-exit are still
+/// parked.
 #[derive(Debug)]
 struct ProgramContext {
     arena: Arena,
@@ -1149,13 +1150,16 @@ impl DosKernel {
         mem.write_u16(psp + 0x16, parent_psp)?; // parent PSP link
         mem.write_u16(psp + 0x2c, env_seg)?; // environment segment
         self.write_command_tail(mem, psp, cmdtail_seg, cmdtail_off)?;
-        // Default JFT at 0x18: stdin/stdout/stderr open, the rest closed.
+        // Default JFT at 0x18: stdin/stdout/stderr share CON slot 1, AUX is slot
+        // 3, PRN is slot 4, and the rest are closed (0xFF).
         for off in 0x18u16..0x2cu16 {
-            mem.write_u8(psp + usize::from(off), 0)?;
+            mem.write_u8(psp + usize::from(off), 0xff)?;
         }
         mem.write_u8(psp + 0x18, 0x01)?;
         mem.write_u8(psp + 0x19, 0x01)?;
         mem.write_u8(psp + 0x1a, 0x01)?;
+        mem.write_u8(psp + 0x1b, 0x03)?;
+        mem.write_u8(psp + 0x1c, 0x04)?;
         let fcb1_drive = copy_fcb(mem, psp + 0x5c, fcb1_seg, fcb1_off)?;
         let fcb2_drive = copy_fcb(mem, psp + 0x6c, fcb2_seg, fcb2_off)?;
         let child_ax = (u16::from(fcb_drive_validity(fcb2_drive)) << 8)
@@ -2199,6 +2203,40 @@ impl DosKernel {
             0x3f => {
                 let handle = regs.bx;
                 let count = usize::from(regs.cx);
+                // Predefined stdin (CON): read cooked keyboard bytes through the
+                // caller's buffer. A console read blocks until at least one byte is
+                // available, stops once CX bytes or CR is consumed, and echoes normal
+                // characters like the BIOS/DOS console path. Extended-key bytes are
+                // delivered by next_cooked_char's existing 00h+scancode state machine
+                // but are not echoed.
+                if handle == 0 {
+                    if count == 0 {
+                        regs.ax = 0;
+                        regs.cf = false;
+                        return Ok(DosAction::Continue);
+                    }
+                    let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+                    let mut filled = 0usize;
+                    while filled < count {
+                        let Some((ch, extended)) = self.next_cooked_char(mem)? else {
+                            if filled == 0 {
+                                return Ok(DosAction::WaitForKey);
+                            }
+                            break;
+                        };
+                        mem.write_u8(base + filled, ch)?;
+                        filled += 1;
+                        if !extended {
+                            self.stdout.push(ch);
+                        }
+                        if ch == 0x0d {
+                            break;
+                        }
+                    }
+                    regs.ax = filled as u16;
+                    regs.cf = false;
+                    return Ok(DosAction::Continue);
+                }
                 // A read from the EMMXXXX0 character device returns end-of-file (0
                 // bytes), the way a real EMM driver answers a DOS read; its control
                 // traffic goes through INT 67h, not the file handle.
@@ -2571,15 +2609,17 @@ impl DosKernel {
                 regs.bx = 0xf000; // free clusters
                 Ok(DosAction::Continue)
             }
-            // AH=40h: write CX bytes from DS:DX to the handle in BX. BX=1/2 route to
-            // stdout/stderr (the output buffer). For a file handle, CX=0 truncates the
-            // file at the current position. CF=0 + AX=bytes-written, or CF=1 + AX=code.
+            // AH=40h: write CX bytes from DS:DX to the handle in BX. CON handles
+            // 0/1/2 route to the output buffer. For a file handle, CX=0 truncates
+            // the file at the current position. CF=0 + AX=bytes-written, or CF=1
+            // + AX=code.
             0x40 => {
                 let handle = regs.bx;
                 let count = usize::from(regs.cx);
                 let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
-                // Predefined console handles: 1=stdout, 2=stderr -> the output buffer.
-                if handle == 1 || handle == 2 {
+                // Predefined CON handles: 0=stdin, 1=stdout, 2=stderr all point at
+                // the console device and write to the output buffer.
+                if handle <= 2 {
                     for index in 0..count {
                         let byte = mem.read_u8(base + index)?;
                         self.stdout.push(byte);
@@ -2598,10 +2638,7 @@ impl DosKernel {
                 }
                 // AUX (3, COM1) and PRN (4, LPT1): accept the write and report every
                 // byte written, but discard the data. The HLE has no serial or
-                // printer capture at the INT 21h layer (marked). Handle 0 (stdin) is
-                // left returning 0x06: whether a stdin write should route to CON is
-                // ambiguous, and changing it would alter the pinned invalid-handle
-                // test, so it is deferred to a human-reviewed slice.
+                // printer capture at the INT 21h layer (marked).
                 if handle == 3 || handle == 4 {
                     regs.ax = regs.cx;
                     regs.cf = false;
@@ -3074,14 +3111,15 @@ impl DosKernel {
                 match regs.ax as u8 {
                     0x00 => {
                         if handle <= 4 {
-                            // The five standard handles are all character devices: stdin(0)
-                            // input, stdout(1)/stderr(2)/stdprn(4) output, stdaux(3) both.
+                            // The five standard handles are all character devices. Bits 0/1
+                            // identify the actual STDIN/STDOUT aliases, not AUX/PRN device
+                            // capabilities, so handles 3 and 4 keep only ISDEV set.
                             let io = match handle {
                                 0 => 0x01,
-                                3 => 0x03,
-                                _ => 0x02,
+                                1 | 2 => 0x02,
+                                _ => 0x00,
                             };
-                            regs.dx = 0x80 | io; // bit 7 ISDEV + the console direction bits
+                            regs.dx = 0x80 | io; // bit 7 ISDEV + standard alias bits
                             regs.cf = false;
                         } else if self.ems_handles.contains(&handle) {
                             // The EMMXXXX0 device: bit 7 ISDEV (so a guest knows it is a
@@ -3417,9 +3455,9 @@ pub struct ProgramEntry {
 /// command tail at 0x80. The documented vectors at 0x0A/0x0E/0x12 snapshot the
 /// current INT 22h/23h/24h IVT entries; 0x16 (parent PSP) defaults to 0 and the
 /// EXEC path overwrites it for a child; 0x32/0x34 hold the JFT count and far
-/// pointer, with the 20-byte JFT at 0x18 wired stdin/stdout/stderr open and the
-/// rest closed. The environment segment (0x2C) is filled in by
-/// `DosKernel::install_environment`.
+/// pointer, with the 20-byte JFT at 0x18 wiring stdin/stdout/stderr to CON,
+/// handle 3 to AUX, handle 4 to PRN, and the rest closed. The environment
+/// segment (0x2C) is filled in by `DosKernel::install_environment`.
 fn build_psp(mem: &mut Memory, psp_seg: u16, top_of_mem_paragraph: u16) -> Result<(), DosError> {
     let base = usize::from(psp_seg) * 16;
     mem.write_u8(base, 0xcd)?;
@@ -3444,9 +3482,11 @@ fn build_psp(mem: &mut Memory, psp_seg: u16, top_of_mem_paragraph: u16) -> Resul
     for off in 0..JFT_LEN {
         mem.write_u8(base + 0x18 + off, 0xff)?;
     }
-    mem.write_u8(base + 0x18, 0x01)?; // stdin
-    mem.write_u8(base + 0x19, 0x01)?; // stdout
-    mem.write_u8(base + 0x1a, 0x01)?; // stderr
+    mem.write_u8(base + 0x18, 0x01)?; // stdin -> CON
+    mem.write_u8(base + 0x19, 0x01)?; // stdout -> CON
+    mem.write_u8(base + 0x1a, 0x01)?; // stderr -> CON
+    mem.write_u8(base + 0x1b, 0x03)?; // stdaux -> AUX
+    mem.write_u8(base + 0x1c, 0x04)?; // stdprn -> PRN
     // PSP:0x32 JFT entry count, PSP:0x34 far pointer to the JFT (PSP:0x18).
     mem.write_u16(base + 0x32, JFT_LEN as u16)?;
     mem.write_u16(base + 0x34, 0x0018)?;
@@ -4584,6 +4624,34 @@ mod tests {
     }
 
     #[test]
+    fn ah3f_handle_zero_reads_a_cooked_console_line() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let buf = 0x2000usize;
+        seed_keyboard_ring(&mut mem, b"go\r").unwrap();
+
+        let mut regs = DosRegs {
+            ax: 0x3f00,
+            bx: 0,
+            cx: 8,
+            dx: buf as u16,
+            ds: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            kernel.dispatch(0x21, &mut regs, &mut mem).unwrap(),
+            DosAction::Continue
+        );
+
+        assert!(!regs.cf);
+        assert_eq!(regs.ax, 3, "stdin read returns bytes through the CR");
+        assert_eq!(mem.read_u8(buf).unwrap(), b'g');
+        assert_eq!(mem.read_u8(buf + 1).unwrap(), b'o');
+        assert_eq!(mem.read_u8(buf + 2).unwrap(), b'\r');
+        assert_eq!(kernel.stdout(), b"go\r", "console stdin read echoes");
+    }
+
+    #[test]
     fn ah00_terminates_the_program() {
         let mut kernel = DosKernel::new();
         let mut mem = Memory::new(64 * 1024).unwrap();
@@ -5251,6 +5319,20 @@ mod tests {
             kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
             assert!(!regs.cf, "standard handle {handle} is valid");
             assert_ne!(regs.dx & 0x80, 0, "handle {handle} is a character device");
+        }
+
+        for handle in [3u16, 4] {
+            let mut regs = DosRegs {
+                ax: 0x4400,
+                bx: handle,
+                ..DosRegs::default()
+            };
+            kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+            assert_eq!(
+                regs.dx & 0x03,
+                0,
+                "AUX/PRN are character devices, but not STDIN/STDOUT aliases"
+            );
         }
     }
 
@@ -7501,6 +7583,8 @@ mod tests {
         assert_eq!(mem.read_u8(0x0100 * 16 + 0x18).unwrap(), 1, "stdin JFT");
         assert_eq!(mem.read_u8(0x0100 * 16 + 0x19).unwrap(), 1, "stdout JFT");
         assert_eq!(mem.read_u8(0x0100 * 16 + 0x1a).unwrap(), 1, "stderr JFT");
+        assert_eq!(mem.read_u8(0x0100 * 16 + 0x1b).unwrap(), 3, "AUX JFT");
+        assert_eq!(mem.read_u8(0x0100 * 16 + 0x1c).unwrap(), 4, "PRN JFT");
 
         let mut regs = DosRegs {
             ax: 0x5200,
@@ -7533,6 +7617,25 @@ mod tests {
             .map(|i| mem.read_u8(con + 0x20 + i).unwrap())
             .collect();
         assert_eq!(&name, b"CON        ", "CON SFT name");
+
+        let aux = sft + 0x06 + 3 * SFT_ENTRY_LEN;
+        let prn = sft + 0x06 + 4 * SFT_ENTRY_LEN;
+        for (entry, expected_name) in [(aux, b"AUX        "), (prn, b"PRN        ")] {
+            assert_eq!(
+                mem.read_u16(entry).unwrap(),
+                1,
+                "one JFT entry references the device"
+            );
+            assert_ne!(
+                mem.read_u16(entry + 0x05).unwrap() & 0x0080,
+                0,
+                "AUX/PRN SFT slots are character devices"
+            );
+            let name: Vec<u8> = (0..11)
+                .map(|i| mem.read_u8(entry + 0x20 + i).unwrap())
+                .collect();
+            assert_eq!(&name, expected_name);
+        }
     }
 
     fn ah52_sft_entry(kernel: &mut DosKernel, mem: &mut Memory, handle: u16) -> usize {
@@ -7912,11 +8015,11 @@ mod tests {
     }
 
     #[test]
-    fn ah40_to_an_invalid_handle_returns_ax06() {
-        // BX=0 is not a routed console handle (1/2) and not an open file, so it
-        // falls through to the table lookup and returns invalid handle.
+    fn ah40_to_stdin_handle_writes_to_the_console_device() {
         let mut kernel = DosKernel::new();
         let mut mem = Memory::new(1024 * 1024).unwrap();
+        let src = 0x0100usize * 16 + 0x0300;
+        mem.write_u8(src, b'!').unwrap();
         let mut regs = DosRegs {
             ax: 0x4000,
             bx: 0,
@@ -7926,8 +8029,9 @@ mod tests {
             ..DosRegs::default()
         };
         kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
-        assert!(regs.cf);
-        assert_eq!(regs.ax, 0x06);
+        assert!(!regs.cf);
+        assert_eq!(regs.ax, 1);
+        assert_eq!(kernel.stdout(), b"!");
     }
 
     #[test]
@@ -9894,15 +9998,17 @@ mod tests {
         assert_eq!(mem.read_u16(psp + 0x14).unwrap(), 0x6666);
         // Parent PSP defaults to 0 (no parent for a directly loaded program).
         assert_eq!(mem.read_u16(psp + 0x16).unwrap(), 0);
-        // The JFT: count 20 at 0x32, far pointer PSP:0x18 at 0x34, the 20 handles
-        // at 0x18 with stdin/stdout/stderr open and the rest closed (0xFF).
+        // The JFT: count 20 at 0x32, far pointer PSP:0x18 at 0x34, handles 0-2
+        // map to CON, handle 3 maps to AUX, handle 4 maps to PRN, and the rest
+        // stay closed (0xFF).
         assert_eq!(mem.read_u16(psp + 0x32).unwrap(), 20);
         assert_eq!(mem.read_u16(psp + 0x34).unwrap(), 0x0018);
         assert_eq!(mem.read_u16(psp + 0x36).unwrap(), 0x0100);
         assert_eq!(mem.read_u8(psp + 0x18).unwrap(), 0x01);
         assert_eq!(mem.read_u8(psp + 0x19).unwrap(), 0x01);
         assert_eq!(mem.read_u8(psp + 0x1a).unwrap(), 0x01);
-        assert_eq!(mem.read_u8(psp + 0x1b).unwrap(), 0xff); // handle 3 closed
+        assert_eq!(mem.read_u8(psp + 0x1b).unwrap(), 0x03);
+        assert_eq!(mem.read_u8(psp + 0x1c).unwrap(), 0x04);
         assert_eq!(mem.read_u8(psp + 0x18 + 19).unwrap(), 0xff); // last entry closed
     }
 
