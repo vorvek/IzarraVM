@@ -30,11 +30,14 @@ const SYSVARS_SEG: u16 = 0x0050;
 /// DOS default LASTDRIVE, reported in the list of lists: drives A: through E:.
 const DEFAULT_LASTDRIVE: u8 = 5;
 
-/// AH=52h publishes the Current Directory Structure (CDS) array from the same
-/// reserved paragraph as SysVars. Keep it after the scalar fields and optional
-/// EMMXXXX0 device header, and below the first program PSP at 0x0100:0000.
+/// AH=52h publishes the SFT and Current Directory Structure (CDS) array from the
+/// same reserved paragraph as SysVars. Keep the modeled standard SFT slots before
+/// the CDS array and below the first program PSP at 0x0100:0000.
 const SFT_TABLE_OFF: usize = 0x50;
-const CDS_ARRAY_OFF: usize = 0x60;
+const SFT_HEADER_LEN: usize = 0x06;
+const SFT_ENTRY_LEN: usize = 0x3b;
+const STANDARD_SFT_SLOTS: usize = 5;
+const CDS_ARRAY_OFF: usize = SFT_TABLE_OFF + SFT_HEADER_LEN + STANDARD_SFT_SLOTS * SFT_ENTRY_LEN;
 const CDS_ENTRY_LEN: usize = 0x58;
 
 /// Conventional memory modeled as an authoritative in-RAM MCB chain ending at
@@ -517,6 +520,17 @@ pub(super) fn write_sysvars(
     mem.write_u16(sft, 0xffff)?; // next offset, FFFF:FFFF = last SFT table
     mem.write_u16(sft + 2, 0xffff)?; // next segment
     mem.write_u16(sft + 4, file_count)?; // number of SFT slots in this table
+    // The PSP's default JFT maps stdin/stdout/stderr to SFT slot 1. Seed that slot
+    // as a shared read/write CON character device; open host-file slots remain for
+    // a later slice.
+    let con = sft + SFT_HEADER_LEN + SFT_ENTRY_LEN;
+    mem.write_u16(con, 3)?; // stdin, stdout, stderr references
+    mem.write_u16(con + 0x02, 0x0002)?; // read/write open mode
+    mem.write_u8(con + 0x04, 0)?; // file attributes do not apply to character devices
+    mem.write_u16(con + 0x05, 0x0083)?; // character device, readable and writable
+    for (i, &byte) in b"CON        ".iter().enumerate() {
+        mem.write_u8(con + 0x20 + i, byte)?;
+    }
     // [BX+0x16] DWORD: pointer to the Current Directory Structure array. Each
     // entry is 0x58 bytes and the count is published at [BX+0x21].
     mem.write_u16(base + 2 + 0x16, (2 + CDS_ARRAY_OFF) as u16)?;
