@@ -5745,7 +5745,7 @@ impl Machine {
                             }
                             0x66 => self.handle_xms(),
                             0x67 => self.handle_int67(),
-                            0x20 | 0x21 => match self.handle_dos_int(vector) {
+                            0x20 | 0x21 | 0x27 => match self.handle_dos_int(vector) {
                                 Ok(Some(code)) => {
                                     if let Some(frame) = self.program_frames.pop() {
                                         // A child exited; resume the parent.

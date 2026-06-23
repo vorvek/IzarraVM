@@ -1267,6 +1267,14 @@ impl DosKernel {
         Ok(())
     }
 
+    fn keep_process_resident(&mut self, paras: u16, mem: &mut Memory) -> Result<(), DosError> {
+        self.arena.keep_resident(paras, mem)?;
+        // Record the resident region's base so an ancestor's exit will not reclaim
+        // it as the EXEC chain unwinds past this resident block.
+        self.resident_regions.push(self.arena.chain_first);
+        Ok(())
+    }
+
     /// Split a FindFirst filespec into (host directory, final-component pattern).
     /// Ok((dir, pattern)) on success; Err(code) is a DOS error code (0x02 no drive,
     /// 0x03 bad/non-C/traversal path). The pattern is the last path component (may
@@ -2030,6 +2038,12 @@ impl DosKernel {
     ) -> Result<DosAction, DosError> {
         match vector {
             0x20 => Ok(DosAction::Exit(0)),
+            0x27 => {
+                let bytes = regs.dx.clamp(DOS_INT27_MIN_RESIDENT_BYTES, 0xfff0);
+                let paras = bytes.div_ceil(16);
+                self.keep_process_resident(paras, mem)?;
+                Ok(DosAction::Exit(0))
+            }
             0x21 => {
                 let action = self.dispatch_int21(regs, mem)?;
                 // Any INT 21h call returning with carry set has placed its DOS
@@ -2654,10 +2668,7 @@ impl DosKernel {
             // in the arena only (no MCB chain, no INT 21h vector hand-off); the exit
             // path is otherwise identical to AH=4Ch, so the machine frees nothing.
             0x31 => {
-                self.arena.keep_resident(regs.dx, mem)?;
-                // Record the resident region's base so an ancestor's exit will not
-                // reclaim it (the EXEC chain can unwind past this resident block).
-                self.resident_regions.push(self.arena.chain_first);
+                self.keep_process_resident(regs.dx, mem)?;
                 Ok(DosAction::Exit((regs.ax & 0x00ff) as u8))
             }
             // AH=33h: Ctrl-Break flag. AL=00 gets DL, AL=01 sets it from DL.
@@ -3079,7 +3090,8 @@ impl DosKernel {
                 }
             },
             // AH=4Dh: get the return code of the last child. AL=code, AH=type
-            // (always 0x00 normal; Ctrl-C/critical/TSR are not modeled, marked).
+            // (0x00 normal, 0x03 terminate-and-stay-resident; Ctrl-C/critical
+            // aborts are not modeled, marked).
             // CF is always clear; the stored code is cleared after the read
             // (one-shot, per RBIL).
             0x4d => {
@@ -3841,6 +3853,7 @@ const DOS_COUNTRY_US: u16 = 1;
 const DOS_CODE_PAGE_US: u16 = 437;
 const DOS_COUNTRY_INFO_LEN: usize = 34;
 const DOS_EXT_COUNTRY_INFO_LEN: usize = 41;
+const DOS_INT27_MIN_RESIDENT_BYTES: u16 = 0x0060;
 
 fn write_us_country_info(mem: &mut Memory, base: usize) -> Result<(), DosError> {
     for offset in 0..DOS_COUNTRY_INFO_LEN {
@@ -11352,6 +11365,32 @@ mod tests {
 
         assert!(!get.cf);
         assert_eq!(get.ax, 0x0309);
+    }
+
+    #[test]
+    fn int27_keeps_resident_with_dos3_minimum_and_tsr_exit_type() {
+        let (mut kernel, mut mem, _prog_top) = env_kernel();
+        let mut keep = DosRegs {
+            dx: 0x0020, // bytes, below the DOS 3+ 0x60-byte minimum
+            ..DosRegs::default()
+        };
+
+        assert_eq!(
+            kernel.dispatch(0x27, &mut keep, &mut mem).unwrap(),
+            DosAction::Exit(0)
+        );
+        assert!(kernel.arena.resident);
+        assert_eq!(kernel.arena.prog_top(&mem), 0x0100 + 0x0006);
+        kernel.finish_exec(0, &mut mem).unwrap();
+
+        let mut get = DosRegs {
+            ax: 0x4d00,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut get, &mut mem).unwrap();
+
+        assert!(!get.cf);
+        assert_eq!(get.ax, 0x0300);
     }
 
     #[test]
