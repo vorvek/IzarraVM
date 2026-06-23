@@ -2768,6 +2768,7 @@ impl DosKernel {
                     self.arena.first_mcb(),
                     self.ems_present,
                     self.lastdrive,
+                    self.file_count(),
                 )?;
                 regs.es = es;
                 regs.bx = bx;
@@ -6973,6 +6974,44 @@ mod tests {
             mem.read_u16(c_drive + 0x43).unwrap(),
             0x4000,
             "C: is marked as a physical local drive"
+        );
+    }
+
+    #[test]
+    fn ah52_publishes_an_sft_header_sized_by_files() {
+        let (mut kernel, mut mem) = arena_kernel();
+        kernel.set_config_sys_counts(7, 20);
+
+        let mut regs = DosRegs {
+            ax: 0x5200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        let base = usize::from(regs.es) * 16 + usize::from(regs.bx);
+
+        let sft_off = mem.read_u16(base + 0x04).unwrap();
+        let sft_seg = mem.read_u16(base + 0x06).unwrap();
+        assert_ne!(
+            (sft_seg, sft_off),
+            (0, 0),
+            "[BX+0x04] points at the first SFT header"
+        );
+
+        let sft = usize::from(sft_seg) * 16 + usize::from(sft_off);
+        assert_eq!(
+            mem.read_u16(sft).unwrap(),
+            0xffff,
+            "the first SFT header is the end of the SFT chain"
+        );
+        assert_eq!(
+            mem.read_u16(sft + 2).unwrap(),
+            0xffff,
+            "the SFT next segment is FFFF for the end of the chain"
+        );
+        assert_eq!(
+            mem.read_u16(sft + 4).unwrap(),
+            7,
+            "FILES= sizes the SFT table"
         );
     }
 

@@ -33,6 +33,7 @@ const DEFAULT_LASTDRIVE: u8 = 5;
 /// AH=52h publishes the Current Directory Structure (CDS) array from the same
 /// reserved paragraph as SysVars. Keep it after the scalar fields and optional
 /// EMMXXXX0 device header, and below the first program PSP at 0x0100:0000.
+const SFT_TABLE_OFF: usize = 0x50;
 const CDS_ARRAY_OFF: usize = 0x60;
 const CDS_ENTRY_LEN: usize = 0x58;
 
@@ -485,13 +486,14 @@ pub(super) fn write_free_mcb_to_cap(
 
 /// AH=52h GET LIST OF LISTS (SysVars). Returns ES:BX -> the DOS internal
 /// variable table. The first-MCB segment at [BX-2] points at the live in-RAM MCB
-/// chain. The modeled scalar fields, CDS array, and device-driver headers are
-/// filled in; unmodeled chain pointers stay zero.
+/// chain. The modeled scalar fields, SFT header, CDS array, and device-driver
+/// headers are filled in; unmodeled chain pointers stay zero.
 pub(super) fn write_sysvars(
     mem: &mut Memory,
     first_mcb: u16,
     ems_present: bool,
     lastdrive: Option<u8>,
+    file_count: u16,
 ) -> Result<(u16, u16), DosError> {
     let base = usize::from(SYSVARS_SEG) * 16;
     let drive_count = lastdrive.unwrap_or(DEFAULT_LASTDRIVE).min(26);
@@ -507,6 +509,14 @@ pub(super) fn write_sysvars(
     // [BX+0x10] WORD: the largest bytes-per-block of any block device, a 512-byte
     // sector here.
     mem.write_u16(base + 2 + 0x10, 512)?;
+    // [BX+0x04] DWORD: pointer to the first System File Table. This slice seeds
+    // the table header and FILES= count; per-handle entries are filled later.
+    mem.write_u16(base + 2 + 0x04, (2 + SFT_TABLE_OFF) as u16)?;
+    mem.write_u16(base + 2 + 0x06, SYSVARS_SEG)?;
+    let sft = base + 2 + SFT_TABLE_OFF;
+    mem.write_u16(sft, 0xffff)?; // next offset, FFFF:FFFF = last SFT table
+    mem.write_u16(sft + 2, 0xffff)?; // next segment
+    mem.write_u16(sft + 4, file_count)?; // number of SFT slots in this table
     // [BX+0x16] DWORD: pointer to the Current Directory Structure array. Each
     // entry is 0x58 bytes and the count is published at [BX+0x21].
     mem.write_u16(base + 2 + 0x16, (2 + CDS_ARRAY_OFF) as u16)?;
