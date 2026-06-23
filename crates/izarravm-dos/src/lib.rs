@@ -2525,24 +2525,22 @@ impl DosKernel {
             0x2a => {
                 regs.cx = self.clock.year;
                 regs.dx = (u16::from(self.clock.month) << 8) | u16::from(self.clock.day);
+                self.clock.day_of_week =
+                    dos_day_of_week(self.clock.year, self.clock.month, self.clock.day);
                 regs.ax = (regs.ax & 0xff00) | u16::from(self.clock.day_of_week);
                 Ok(DosAction::Continue)
             }
             // AH=2Bh: set date. CX=year(1980-2099), DH=month, DL=day. AL=0 ok, 0xFF
-            // invalid. No calendar routine, so the day range is the coarse
-            // 1..=31 (real DOS rejects e.g. Feb 31) and day_of_week is not recomputed;
-            // no in-scope reader needs per-month validation or the post-set weekday.
+            // invalid. DOS validates month/day combinations and recomputes weekday.
             0x2b => {
                 let year = regs.cx;
                 let month = (regs.dx >> 8) as u8;
                 let day = regs.dx as u8;
-                if (1980..=2099).contains(&year)
-                    && (1..=12).contains(&month)
-                    && (1..=31).contains(&day)
-                {
+                if is_valid_dos_date(year, month, day) {
                     self.clock.year = year;
                     self.clock.month = month;
                     self.clock.day = day;
+                    self.clock.day_of_week = dos_day_of_week(year, month, day);
                     regs.ax &= 0xff00;
                 } else {
                     regs.ax = (regs.ax & 0xff00) | 0xff;
@@ -4260,6 +4258,29 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     let doy = (153 * i64::from(mp) + 2) / 5 + i64::from(day) - 1; // [0, 365]
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
     era * 146_097 + doe - 719_468
+}
+
+fn is_leap_year(year: u16) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+}
+
+fn days_in_month(year: u16, month: u8) -> u8 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn is_valid_dos_date(year: u16, month: u8, day: u8) -> bool {
+    (1980..=2099).contains(&year) && day != 0 && day <= days_in_month(year, month)
+}
+
+fn dos_day_of_week(year: u16, month: u8, day: u8) -> u8 {
+    let days = days_from_civil(i64::from(year), u32::from(month), u32::from(day));
+    (days + 4).rem_euclid(7) as u8
 }
 
 /// Convert a packed DOS (time, date) pair to a host SystemTime, treating the fields as
@@ -7100,6 +7121,16 @@ mod tests {
         assert_eq!(get.cx, 2001);
         assert_eq!(get.dx >> 8, 2);
         assert_eq!(get.dx & 0xff, 3);
+        assert_eq!(get.ax & 0xff, 6); // Saturday
+        // Leap day is valid in 2000.
+        let mut leap = DosRegs {
+            ax: 0x2b00,
+            cx: 2000,
+            dx: (2u16 << 8) | 29,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut leap, &mut mem).unwrap();
+        assert_eq!(leap.ax & 0xff, 0x00);
         // Reject month 13.
         let mut bad = DosRegs {
             ax: 0x2b00,
@@ -7109,12 +7140,26 @@ mod tests {
         };
         kernel.dispatch(0x21, &mut bad, &mut mem).unwrap();
         assert_eq!(bad.ax & 0xff, 0xff); // failure, clock unchanged
+        // Reject impossible month/day combinations and non-leap Feb 29.
+        for &(month, day, year) in &[(2, 31, 2001), (4, 31, 2001), (2, 29, 2001)] {
+            let mut invalid = DosRegs {
+                ax: 0x2b00,
+                cx: year,
+                dx: (month << 8) | day,
+                ..DosRegs::default()
+            };
+            kernel.dispatch(0x21, &mut invalid, &mut mem).unwrap();
+            assert_eq!(invalid.ax & 0xff, 0xff, "{year:04}-{month:02}-{day:02}");
+        }
         let mut get2 = DosRegs {
             ax: 0x2a00,
             ..DosRegs::default()
         };
         kernel.dispatch(0x21, &mut get2, &mut mem).unwrap();
-        assert_eq!(get2.dx >> 8, 2); // still February
+        assert_eq!(get2.cx, 2000);
+        assert_eq!(get2.dx >> 8, 2);
+        assert_eq!(get2.dx & 0xff, 29);
+        assert_eq!(get2.ax & 0xff, 2); // Tuesday
     }
 
     #[test]
