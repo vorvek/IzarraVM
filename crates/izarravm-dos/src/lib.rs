@@ -2444,6 +2444,18 @@ impl DosKernel {
                 regs.ax = (regs.ax & 0xff00) | u16::from(ch);
                 Ok(DosAction::Continue)
             }
+            // AH=03h: read one byte from STDAUX. The current DOS facade has no
+            // serial receive source, matching BIOS INT 14h's receive-timeout
+            // limit, so return a deterministic NUL byte instead of an unwakeable
+            // wait.
+            0x03 => {
+                if self.consume_pending_ctrl_c(mem)? {
+                    return Ok(self.ctrl_c_action());
+                }
+                regs.ax &= 0xff00;
+                regs.cf = false;
+                Ok(DosAction::Continue)
+            }
             // AH=06h: direct console I/O. DL=0xFF reads without waiting (ZF reports
             // whether a character was ready); any other DL writes DL.
             0x06 => {
@@ -2619,6 +2631,13 @@ impl DosKernel {
                         }
                     }
                     regs.ax = filled as u16;
+                    regs.cf = false;
+                    return Ok(DosAction::Continue);
+                }
+                // Predefined STDAUX exists as a character device, but the HLE has
+                // no serial RX buffer yet. Report EOF rather than invalid handle.
+                if handle == 3 {
+                    regs.ax = 0;
                     regs.cf = false;
                     return Ok(DosAction::Continue);
                 }
@@ -9288,6 +9307,45 @@ mod tests {
             kernel.stdout().is_empty(),
             "AUX/PRN output is not echoed to the console"
         );
+    }
+
+    #[test]
+    fn stdaux_reads_are_deterministic_without_serial_rx() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let dst = 0x2000usize;
+
+        // AH=03h has no status return. With no serial receive source wired, the
+        // DOS facade returns a deterministic NUL byte instead of blocking forever.
+        let mut single = DosRegs {
+            ax: 0x0300,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut single, &mut mem).unwrap();
+        assert!(!single.cf);
+        assert_eq!(single.ax & 0x00ff, 0x00);
+
+        // Handle 3 is the inherited STDAUX JFT entry. Reads see EOF, not an
+        // invalid-handle error, because the character device exists even though
+        // the current HLE has no RX buffer for it.
+        let mut handle_read = DosRegs {
+            ax: 0x3f00,
+            bx: 3,
+            cx: 8,
+            ds: 0,
+            dx: dst as u16,
+            ..DosRegs::default()
+        };
+        mem.write_u8(dst, 0xa5).unwrap();
+        kernel.dispatch(0x21, &mut handle_read, &mut mem).unwrap();
+        assert!(!handle_read.cf);
+        assert_eq!(handle_read.ax, 0, "AUX read reports EOF when RX is empty");
+        assert_eq!(
+            mem.read_u8(dst).unwrap(),
+            0xa5,
+            "EOF leaves buffer untouched"
+        );
+        assert!(kernel.stdout().is_empty(), "AUX input is not echoed");
     }
 
     #[test]
