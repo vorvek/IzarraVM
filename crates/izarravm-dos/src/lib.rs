@@ -494,6 +494,14 @@ struct FindSearch {
     next: usize,
 }
 
+#[derive(Debug)]
+struct PendingLine {
+    addr: u32,
+    count: u8,
+    template: Vec<u8>,
+    template_index: usize,
+}
+
 /// Saved per-program DOS state, pushed when a child is EXECed (AL=0) and
 /// restored when the child exits. open_files is NOT saved; parent and child
 /// share one handle table. The child PSP exposes the five inherited standard
@@ -542,9 +550,9 @@ pub struct DosKernel {
     // pair. DOS cooked input returns them as two reads: 0x00 first, then the scancode
     // on the next AH=01/06/07/08/0Ch call. This holds the scancode between the two.
     pending_scancode: Option<u8>,
-    // AH=0Ah buffered input: the running character count keyed by buffer address,
+    // AH=0Ah buffered input: the running line-edit state keyed by buffer address,
     // so it survives the per-character WaitForKey re-entries.
-    pending_line: Option<(u32, u8)>,
+    pending_line: Option<PendingLine>,
     // Current directory on C:, as a path from the root with no leading or trailing
     // backslash ("" is the root, "DOS" is \DOS, "DOS\\NET" is \DOS\NET). This is
     // the format AH=47h returns. The current directory is global in DOS, so it is
@@ -2117,41 +2125,92 @@ impl DosKernel {
             mem.write_u8(buf + 1, 0)?;
             return Ok(DosAction::Continue);
         }
-        let mut count = match self.pending_line {
-            Some((a, c)) if a == addr => c,
-            _ => 0,
+        let template_len = usize::from(mem.read_u8(buf + 1)?.min(max.saturating_sub(1)));
+        let mut line = match self.pending_line.take() {
+            Some(line) if line.addr == addr => line,
+            _ => {
+                let mut template = Vec::with_capacity(template_len);
+                for i in 0..template_len {
+                    template.push(mem.read_u8(buf + 2 + i)?);
+                }
+                PendingLine {
+                    addr,
+                    count: 0,
+                    template,
+                    template_index: 0,
+                }
+            }
         };
         loop {
-            let Some((_, ascii)) = kbd_ring_dequeue(mem)? else {
-                self.pending_line = Some((addr, count));
+            let Some((scancode, ascii)) = kbd_ring_dequeue(mem)? else {
+                self.pending_line = Some(line);
                 return Ok(DosAction::WaitForKey);
             };
             if ascii == 0x03 {
                 self.pending_line = None;
                 return Ok(self.ctrl_c_action());
             }
+            let mut push_char = |ch: u8, line: &mut PendingLine| -> Result<bool, DosError> {
+                if usize::from(line.count) + 1 < usize::from(max) {
+                    mem.write_u8(buf + 2 + usize::from(line.count), ch)?;
+                    line.count += 1;
+                    self.stdout.push(ch);
+                    Ok(true)
+                } else {
+                    self.stdout.push(0x07); // buffer full, bell
+                    Ok(false)
+                }
+            };
             match ascii {
                 0x0d => {
-                    mem.write_u8(buf + 2 + usize::from(count), 0x0d)?;
+                    mem.write_u8(buf + 2 + usize::from(line.count), 0x0d)?;
                     self.stdout.push(0x0d);
-                    mem.write_u8(buf + 1, count)?;
+                    mem.write_u8(buf + 1, line.count)?;
                     self.pending_line = None;
                     return Ok(DosAction::Continue);
                 }
                 0x08 => {
-                    if count > 0 {
-                        count -= 1;
+                    if line.count > 0 {
+                        line.count -= 1;
                         self.stdout.extend_from_slice(&[0x08, 0x20, 0x08]);
                     }
                 }
-                _ => {
-                    if usize::from(count) + 1 < usize::from(max) {
-                        mem.write_u8(buf + 2 + usize::from(count), ascii)?;
-                        count += 1;
-                        self.stdout.push(ascii);
-                    } else {
-                        self.stdout.push(0x07); // buffer full, bell
+                0x00 => match scancode {
+                    // F1 copies one character from the recall template.
+                    0x3b => {
+                        if let Some(&ch) = line.template.get(line.template_index) {
+                            if push_char(ch, &mut line)? {
+                                line.template_index += 1;
+                            }
+                        }
                     }
+                    // F3 copies the rest of the recall template.
+                    0x3d => {
+                        while let Some(&ch) = line.template.get(line.template_index) {
+                            if !push_char(ch, &mut line)? {
+                                break;
+                            }
+                            line.template_index += 1;
+                        }
+                    }
+                    // F5 makes the current input the new recall template.
+                    0x3f => {
+                        let mut next_template = Vec::with_capacity(usize::from(line.count));
+                        for i in 0..usize::from(line.count) {
+                            next_template.push(mem.read_u8(buf + 2 + i)?);
+                        }
+                        line.template = next_template;
+                        line.template_index = 0;
+                        line.count = 0;
+                    }
+                    // Del skips one character in the recall template.
+                    0x53 if line.template_index < line.template.len() => {
+                        line.template_index += 1;
+                    }
+                    _ => {}
+                },
+                _ => {
+                    let _ = push_char(ascii, &mut line)?;
                 }
             }
         }
@@ -4642,6 +4701,89 @@ mod tests {
             off += 2;
         }
         mem.write_u16(KBD_BDA_BASE + KBD_TAIL, off).unwrap();
+    }
+
+    #[test]
+    fn ah0a_f1_and_f3_recall_the_input_template() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let buf = 0x2000usize;
+        mem.write_u8(buf, 8).unwrap();
+        mem.write_u8(buf + 1, 3).unwrap();
+        mem.write_u8(buf + 2, b'D').unwrap();
+        mem.write_u8(buf + 3, b'O').unwrap();
+        mem.write_u8(buf + 4, b'S').unwrap();
+        seed_ring_words(&mut mem, &[0x3b00, 0x3d00, 0x000d]); // F1, F3, CR
+        let mut regs = DosRegs {
+            ax: 0x0a00,
+            dx: buf as u16,
+            ds: 0,
+            ..Default::default()
+        };
+
+        let action = kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+
+        assert_eq!(action, DosAction::Continue);
+        assert_eq!(mem.read_u8(buf + 1).unwrap(), 3);
+        assert_eq!(mem.read_u8(buf + 2).unwrap(), b'D');
+        assert_eq!(mem.read_u8(buf + 3).unwrap(), b'O');
+        assert_eq!(mem.read_u8(buf + 4).unwrap(), b'S');
+        assert_eq!(mem.read_u8(buf + 5).unwrap(), 0x0d);
+    }
+
+    #[test]
+    fn ah0a_delete_skips_one_template_character() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let buf = 0x2000usize;
+        mem.write_u8(buf, 8).unwrap();
+        mem.write_u8(buf + 1, 3).unwrap();
+        mem.write_u8(buf + 2, b'A').unwrap();
+        mem.write_u8(buf + 3, b'B').unwrap();
+        mem.write_u8(buf + 4, b'C').unwrap();
+        seed_ring_words(&mut mem, &[0x5300, 0x3d00, 0x000d]); // Del, F3, CR
+        let mut regs = DosRegs {
+            ax: 0x0a00,
+            dx: buf as u16,
+            ds: 0,
+            ..Default::default()
+        };
+
+        let action = kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+
+        assert_eq!(action, DosAction::Continue);
+        assert_eq!(mem.read_u8(buf + 1).unwrap(), 2);
+        assert_eq!(mem.read_u8(buf + 2).unwrap(), b'B');
+        assert_eq!(mem.read_u8(buf + 3).unwrap(), b'C');
+        assert_eq!(mem.read_u8(buf + 4).unwrap(), 0x0d);
+    }
+
+    #[test]
+    fn ah0a_f5_stores_current_line_as_the_new_template() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let buf = 0x2000usize;
+        mem.write_u8(buf, 10).unwrap();
+        mem.write_u8(buf + 1, 3).unwrap();
+        mem.write_u8(buf + 2, b'O').unwrap();
+        mem.write_u8(buf + 3, b'L').unwrap();
+        mem.write_u8(buf + 4, b'D').unwrap();
+        seed_ring_words(&mut mem, &[0x004e, 0x0045, 0x0057, 0x3f00, 0x3d00, 0x000d]); // "NEW", F5, F3, CR
+        let mut regs = DosRegs {
+            ax: 0x0a00,
+            dx: buf as u16,
+            ds: 0,
+            ..Default::default()
+        };
+
+        let action = kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+
+        assert_eq!(action, DosAction::Continue);
+        assert_eq!(mem.read_u8(buf + 1).unwrap(), 3);
+        assert_eq!(mem.read_u8(buf + 2).unwrap(), b'N');
+        assert_eq!(mem.read_u8(buf + 3).unwrap(), b'E');
+        assert_eq!(mem.read_u8(buf + 4).unwrap(), b'W');
+        assert_eq!(mem.read_u8(buf + 5).unwrap(), 0x0d);
     }
 
     #[test]
