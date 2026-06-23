@@ -702,6 +702,8 @@ impl Machine {
             emm386: mode,
             dos_umb: false,
             lastdrive: izarravm_core::DEFAULT_LASTDRIVE,
+            files: izarravm_core::DEFAULT_FILES,
+            buffers: izarravm_core::DEFAULT_BUFFERS,
             ems_frame_seg: None,
             ems_pool_kb: None,
         })
@@ -4564,6 +4566,14 @@ impl Machine {
                 .map(|c| c.lastdrive)
                 .unwrap_or(izarravm_core::DEFAULT_LASTDRIVE),
         );
+        self.dos.set_config_sys_counts(
+            config
+                .map(|c| c.files)
+                .unwrap_or(izarravm_core::DEFAULT_FILES),
+            config
+                .map(|c| c.buffers)
+                .unwrap_or(izarravm_core::DEFAULT_BUFFERS),
+        );
         if dos_umb && self.dos.has_umb_arena() {
             self.dos.set_umb_link(true);
         }
@@ -8284,6 +8294,8 @@ mod tests {
                 emm386: Emm386Mode::Ram,
                 dos_umb: true,
                 lastdrive: izarravm_core::DEFAULT_LASTDRIVE,
+                files: izarravm_core::DEFAULT_FILES,
+                buffers: izarravm_core::DEFAULT_BUFFERS,
                 ems_frame_seg: Some(0xd000),
                 ems_pool_kb: Some(4096),
             })
@@ -8450,6 +8462,25 @@ mod tests {
             26,
             "LASTDRIVE=Z is exposed as drives A: through Z:"
         );
+    }
+
+    #[test]
+    fn config_sys_files_and_buffers_are_recorded_by_sysinit() {
+        const PROG: [u8; 2] = [0xCD, 0x20];
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("CONFIG.SYS"),
+            "DEVICE=C:\\DOS\\HIMEM.SYS\r\nDEVICE=C:\\DOS\\IEMM.EXE RAM\r\nFILES=37\r\nBUFFERS=12\r\n",
+        )
+        .unwrap();
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
+                .unwrap();
+        machine.set_toka_c_root(dir.path().to_path_buf());
+        machine.setup_toka_dos_base().unwrap();
+
+        assert_eq!(machine.dos.file_count(), 37);
+        assert_eq!(machine.dos.buffer_count(), 12);
     }
 
     #[test]

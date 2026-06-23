@@ -124,6 +124,9 @@ fn is_root_system_file(name: &str) -> bool {
 /// path-showing prompt. DOS line endings (CRLF).
 const DEFAULT_AUTOEXEC_BAT: &str = "@ECHO OFF\r\nPATH=C:\\DOS\r\nPROMPT=$P$G\r\n";
 
+const DEFAULT_FILE_COUNT: u16 = 40;
+const DEFAULT_BUFFER_COUNT: u16 = 20;
+
 /// The default CONFIG.SYS: the directives a period DOS carries. The HIMEM.SYS
 /// and IEMM.EXE RAM lines select the IEMM RAM mode (UMBs plus the EMS page
 /// frame) at SYSINIT, the way a real DOS=HIGH,UMB box is configured; the machine
@@ -529,6 +532,11 @@ pub struct DosKernel {
     // Highest configured DOS drive index from CONFIG.SYS LASTDRIVE=, A: = 1.
     // None means the shipped default E: value is published.
     lastdrive: Option<u8>,
+    // CONFIG.SYS FILES= count. DOS counts the five inherited standard handles in
+    // this total, so dynamic handle allocation starts at 5 and stops before it.
+    file_count: Option<u16>,
+    // CONFIG.SYS BUFFERS= count. Stored for the later disk-buffer-chain model.
+    buffer_count: Option<u16>,
     // Handles a guest has opened on the EMMXXXX0 device (AH=3Dh), so AH=44h IOCTL
     // and AH=3Eh close treat them as the device rather than a host file.
     ems_handles: HashSet<u16>,
@@ -628,11 +636,19 @@ impl DosKernel {
     }
 
     /// The lowest free file handle (>= 5), skipping both host files and the open
-    /// EMS-device handles so the two never collide.
-    fn alloc_handle(&self) -> u16 {
-        (5u16..)
+    /// EMS-device handles so the two never collide. FILES= includes inherited
+    /// handles 0-4, so dynamic handles stop before the configured count.
+    fn alloc_handle(&self) -> Option<u16> {
+        (5u16..self.file_count())
             .find(|h| !self.open_files.contains_key(h) && !self.ems_handles.contains(h))
-            .expect("a free DOS handle exists at or below u16::MAX")
+    }
+
+    pub fn file_count(&self) -> u16 {
+        self.file_count.unwrap_or(DEFAULT_FILE_COUNT)
+    }
+
+    pub fn buffer_count(&self) -> u16 {
+        self.buffer_count.unwrap_or(DEFAULT_BUFFER_COUNT)
     }
 
     /// Walk the upper-memory arena's MCB chain, empty when no UMB pool is furnished.
@@ -701,6 +717,13 @@ impl DosKernel {
     /// as a count, with A: = 1 and Z: = 26.
     pub fn set_lastdrive(&mut self, lastdrive: u8) {
         self.lastdrive = Some(lastdrive);
+    }
+
+    /// Record CONFIG.SYS FILES= and BUFFERS=. FILES= gates dynamic handle
+    /// allocation immediately; BUFFERS= is stored for the future disk-buffer chain.
+    pub fn set_config_sys_counts(&mut self, files: u16, buffers: u16) {
+        self.file_count = Some(files);
+        self.buffer_count = Some(buffers);
     }
 
     /// XMS function 10h Request UMB: carve `paras` paragraphs from the SAME
@@ -2074,7 +2097,10 @@ impl DosKernel {
                 // to a host-file open that fails, so the guest reads "no EMS".
                 if let Some(name) = read_asciiz(mem, regs.ds, regs.dx)? {
                     if is_ems_device_name(&name) && self.ems_present {
-                        let handle = self.alloc_handle();
+                        let Some(handle) = self.alloc_handle() else {
+                            set_dos_error(regs, 0x04); // too many open files
+                            return Ok(DosAction::Continue);
+                        };
                         self.ems_handles.insert(handle);
                         regs.ax = handle;
                         regs.cf = false;
@@ -2094,9 +2120,12 @@ impl DosKernel {
                     set_dos_error(regs, 0x0c);
                     return Ok(DosAction::Continue);
                 };
+                let Some(handle) = self.alloc_handle() else {
+                    set_dos_error(regs, 0x04); // too many open files
+                    return Ok(DosAction::Continue);
+                };
                 match open_host_file(&path, mode) {
                     Ok(file) => {
-                        let handle = self.alloc_handle();
                         self.open_files.insert(handle, OpenFile { file, mode });
                         regs.ax = handle;
                         regs.cf = false;
@@ -2331,6 +2360,10 @@ impl DosKernel {
                         return Ok(DosAction::Continue);
                     }
                 };
+                let Some(handle) = self.alloc_handle() else {
+                    set_dos_error(regs, 0x04); // too many open files
+                    return Ok(DosAction::Continue);
+                };
                 match OpenOptions::new()
                     .read(true)
                     .write(true)
@@ -2339,7 +2372,6 @@ impl DosKernel {
                     .open(&path)
                 {
                     Ok(file) => {
-                        let handle = self.alloc_handle();
                         self.open_files.insert(
                             handle,
                             OpenFile {
@@ -2849,7 +2881,10 @@ impl DosKernel {
                 };
                 match cloned {
                     Ok(open) => {
-                        let handle = self.alloc_handle();
+                        let Some(handle) = self.alloc_handle() else {
+                            set_dos_error(regs, 0x04); // too many open files
+                            return Ok(DosAction::Continue);
+                        };
                         self.open_files.insert(handle, open);
                         regs.ax = handle;
                         regs.cf = false;
@@ -2928,6 +2963,10 @@ impl DosKernel {
                         return Ok(DosAction::Continue);
                     }
                 };
+                let Some(handle) = self.alloc_handle() else {
+                    set_dos_error(regs, 0x04); // too many open files
+                    return Ok(DosAction::Continue);
+                };
                 match OpenOptions::new()
                     .read(true)
                     .write(true)
@@ -2935,7 +2974,6 @@ impl DosKernel {
                     .open(&path)
                 {
                     Ok(file) => {
-                        let handle = self.alloc_handle();
                         self.open_files.insert(
                             handle,
                             OpenFile {
@@ -3085,6 +3123,10 @@ impl DosKernel {
                     self.fail(regs, 0x03);
                     return Ok(DosAction::Continue);
                 };
+                let Some(handle) = self.alloc_handle() else {
+                    set_dos_error(regs, 0x04); // too many open files
+                    return Ok(DosAction::Continue);
+                };
                 // Try a sequence of names until one does not yet exist. The host
                 // create-exclusive open is the real guard; this loop just picks a
                 // free candidate. Limit: a fixed 0..4096 sweep, not DOS's clock
@@ -3128,7 +3170,6 @@ impl DosKernel {
                     mem.write_u8(tail + i, byte)?;
                 }
                 mem.write_u8(tail + suffix.len(), 0)?;
-                let handle = self.alloc_handle();
                 self.open_files.insert(
                     handle,
                     OpenFile {
@@ -3166,39 +3207,42 @@ impl DosKernel {
                 let create_if = regs.dx & 0x0010 != 0;
                 // Pick the host action from the flags and whether the file exists.
                 // action_taken: 1 opened, 2 created, 3 truncated (replaced).
-                let (result, action_taken) = if exists {
+                let action_taken = if exists {
                     if truncate_if {
-                        (
-                            OpenOptions::new()
-                                .read(true)
-                                .write(true)
-                                .truncate(true)
-                                .open(&path),
-                            3u16,
-                        )
+                        3u16
                     } else if open_if {
-                        (open_host_file(&path, mode), 1u16)
+                        1u16
                     } else {
                         // The file is there but neither open nor replace is allowed.
                         self.fail(regs, 0x50); // file already exists
                         return Ok(DosAction::Continue);
                     }
                 } else if create_if {
-                    (
-                        OpenOptions::new()
-                            .read(true)
-                            .write(true)
-                            .create_new(true)
-                            .open(&path),
-                        2u16,
-                    )
+                    2u16
                 } else {
                     self.fail(regs, 0x02); // file not found and create not allowed
                     return Ok(DosAction::Continue);
                 };
+                let Some(handle) = self.alloc_handle() else {
+                    set_dos_error(regs, 0x04); // too many open files
+                    return Ok(DosAction::Continue);
+                };
+                let result = match action_taken {
+                    1 => open_host_file(&path, mode),
+                    2 => OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create_new(true)
+                        .open(&path),
+                    3 => OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .truncate(true)
+                        .open(&path),
+                    _ => unreachable!("known extended-open action"),
+                };
                 match result {
                     Ok(file) => {
-                        let handle = self.alloc_handle();
                         self.open_files.insert(handle, OpenFile { file, mode });
                         regs.ax = handle;
                         regs.cx = action_taken;
@@ -5617,6 +5661,33 @@ mod tests {
         let regs = open(&mut kernel, &mut mem);
         assert!(!regs.cf);
         assert_eq!(regs.ax, 5);
+    }
+
+    #[test]
+    fn config_sys_file_and_buffer_counts_are_recorded() {
+        let mut kernel = DosKernel::new();
+
+        kernel.set_config_sys_counts(37, 12);
+
+        assert_eq!(kernel.file_count(), 37);
+        assert_eq!(kernel.buffer_count(), 12);
+    }
+
+    #[test]
+    fn files_count_caps_dynamic_file_handles() {
+        let (mut kernel, mut mem, _dir) = kernel_with_drive(&[("DATA.TXT", b"hi")], r"C:\DATA.TXT");
+        kernel.set_config_sys_counts(6, 20);
+
+        let first = open(&mut kernel, &mut mem);
+        assert!(!first.cf);
+        assert_eq!(first.ax, 5);
+
+        let second = open(&mut kernel, &mut mem);
+        assert!(second.cf);
+        assert_eq!(
+            second.ax, 0x04,
+            "FILES=6 leaves room for one dynamic handle"
+        );
     }
 
     #[test]
