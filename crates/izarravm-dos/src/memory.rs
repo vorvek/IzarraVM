@@ -523,6 +523,43 @@ pub(super) fn resize_routed(
     arena.resize(seg, paras, mem)
 }
 
+/// Retag an AH=48h allocation that landed in the UMB arena to the owning PSP.
+/// XMS Request UMB calls do not use this path, so their manager-owned blocks keep
+/// the allocator's default owner value.
+pub(super) fn set_umb_owner(
+    umb: Option<UmbArena>,
+    seg: u16,
+    owner: u16,
+    mem: &mut Memory,
+) -> Result<(), DosError> {
+    if let Some(u) = umb {
+        if u.contains_data(seg) {
+            mem.write_u16(usize::from(seg.wrapping_sub(1)) * 16 + 1, owner)?;
+        }
+    }
+    Ok(())
+}
+
+/// Free all UMB blocks owned by `owner`, used when an EXEC child exits normally.
+pub(super) fn free_umb_blocks_owned_by(
+    umb: Option<UmbArena>,
+    owner: u16,
+    mem: &mut Memory,
+) -> Result<(), DosError> {
+    let Some(u) = umb else {
+        return Ok(());
+    };
+    let owned: Vec<u16> = read_mcb_chain(mem, u.first_mcb)
+        .into_iter()
+        .filter(|m| m.owner == owner)
+        .map(|m| m.mcb_seg.wrapping_add(1))
+        .collect();
+    for seg in owned {
+        let _ = u.free(seg, mem)?;
+    }
+    Ok(())
+}
+
 /// XMS function 10h Request UMB: carve `paras` paragraphs from the same upper
 /// MCB chain used by AH=48h-high allocations.
 pub(super) fn request_umb(
@@ -1033,14 +1070,14 @@ pub(super) fn resize_block(
             Some(_) => b'M',
             None => b'Z',
         };
-        write_mcb_header(mem, block.mcb_seg, sig, seg, paras, NO_NAME)?;
+        write_mcb_header(mem, block.mcb_seg, sig, block.owner, paras, NO_NAME)?;
     } else {
         let free_sig = match next {
             Some(n) if n.owner == 0 => n.sig,
             Some(_) => b'M',
             None => b'Z',
         };
-        write_mcb_header(mem, block.mcb_seg, b'M', seg, paras, NO_NAME)?;
+        write_mcb_header(mem, block.mcb_seg, b'M', block.owner, paras, NO_NAME)?;
         write_mcb_header(mem, new_end, free_sig, 0, limit - new_end - 1, NO_NAME)?;
     }
     Ok(Ok(()))
