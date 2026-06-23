@@ -69,12 +69,18 @@ pub(super) const SDA_ALWAYS_SWAPPED_LEN: u16 = 0x001a;
 pub(super) const SDA_IN_DOS_SWAPPED_LEN: u16 = 0x0000;
 
 #[derive(Debug, Clone, Copy)]
+pub(super) struct SdaCriticalError {
+    pub(super) drive: u8,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub(super) struct SdaSnapshot {
     pub(super) last_error: u16,
     pub(super) current_dta: (u16, u16),
     pub(super) current_psp: u16,
     pub(super) last_exit_code: u8,
     pub(super) last_exit_type: u8,
+    pub(super) critical_error: Option<SdaCriticalError>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -830,9 +836,15 @@ pub(super) fn write_sda(
         mem.write_u8(sda + off, 0)?;
     }
 
-    mem.write_u8(sda, 0)?; // critical-error flag, no INT 24h path is active
-    mem.write_u8(sda + 0x01, 0)?; // InDOS count is clear between HLE calls
-    mem.write_u8(sda + 0x02, 0xff)?; // no current critical-error drive
+    if let Some(critical_error) = snapshot.critical_error {
+        mem.write_u8(sda, 1)?; // critical-error flag, an INT 24h path is active
+        mem.write_u8(sda + 0x01, 1)?; // DOS is busy while the handler is pending
+        mem.write_u8(sda + 0x02, critical_error.drive)?;
+    } else {
+        mem.write_u8(sda, 0)?; // critical-error flag, no INT 24h path is active
+        mem.write_u8(sda + 0x01, 0)?; // InDOS count is clear between HLE calls
+        mem.write_u8(sda + 0x02, 0xff)?; // no current critical-error drive
+    }
     mem.write_u8(sda + 0x03, 0x01)?; // AH=59h locus: unknown/not appropriate
     mem.write_u16(sda + 0x04, snapshot.last_error)?;
     mem.write_u8(sda + 0x06, 0x05)?; // AH=59h action: immediate abort

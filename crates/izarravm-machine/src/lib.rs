@@ -4400,6 +4400,7 @@ impl Machine {
             dx: self.cpu.registers.edx() as u16,
             si: self.cpu.registers.esi() as u16,
             di: self.cpu.registers.edi() as u16,
+            bp: self.cpu.registers.ebp() as u16,
             ds: self.cpu.registers.segment(SegmentIndex::Ds).selector,
             es: self.cpu.registers.segment(SegmentIndex::Es).selector,
             cf: self.cpu.registers.eflags & 0x1 != 0,
@@ -4449,6 +4450,7 @@ impl Machine {
         r.set_edx((r.edx() & 0xffff_0000) | u32::from(regs.dx));
         r.set_esi((r.esi() & 0xffff_0000) | u32::from(regs.si));
         r.set_edi((r.edi() & 0xffff_0000) | u32::from(regs.di));
+        r.set_ebp((r.ebp() & 0xffff_0000) | u32::from(regs.bp));
         // CF is bit 0, ZF is bit 6; FLAG_CF/FLAG_ZF are private to the cpu crate.
         let mut flags = self.memory.read_u16(flags_addr as usize)?;
         flags = if regs.cf {
