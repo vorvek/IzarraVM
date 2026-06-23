@@ -7016,6 +7016,48 @@ mod tests {
     }
 
     #[test]
+    fn ah52_seeds_the_con_sft_entry_used_by_the_default_jft() {
+        let (mut kernel, mut mem) = arena_kernel();
+        build_psp(&mut mem, 0x0100, 0x1100).unwrap();
+
+        assert_eq!(mem.read_u8(0x0100 * 16 + 0x18).unwrap(), 1, "stdin JFT");
+        assert_eq!(mem.read_u8(0x0100 * 16 + 0x19).unwrap(), 1, "stdout JFT");
+        assert_eq!(mem.read_u8(0x0100 * 16 + 0x1a).unwrap(), 1, "stderr JFT");
+
+        let mut regs = DosRegs {
+            ax: 0x5200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        let base = usize::from(regs.es) * 16 + usize::from(regs.bx);
+        let sft_off = mem.read_u16(base + 0x04).unwrap();
+        let sft_seg = mem.read_u16(base + 0x06).unwrap();
+        let sft = usize::from(sft_seg) * 16 + usize::from(sft_off);
+
+        const SFT_ENTRY_LEN: usize = 0x3b;
+        let con = sft + 0x06 + SFT_ENTRY_LEN;
+        assert_eq!(
+            mem.read_u16(con).unwrap(),
+            3,
+            "stdin/stdout/stderr all reference the CON SFT slot"
+        );
+        assert_eq!(
+            mem.read_u16(con + 0x02).unwrap(),
+            0x0002,
+            "the shared CON SFT entry is read/write"
+        );
+        assert_ne!(
+            mem.read_u16(con + 0x05).unwrap() & 0x0080,
+            0,
+            "CON is marked as a character device"
+        );
+        let name: Vec<u8> = (0..11)
+            .map(|i| mem.read_u8(con + 0x20 + i).unwrap())
+            .collect();
+        assert_eq!(&name, b"CON        ", "CON SFT name");
+    }
+
+    #[test]
     fn critical_error_response_decodes_low_two_bits() {
         assert_eq!(
             CriticalErrorResponse::from_al(0),
