@@ -8,7 +8,7 @@ use thiserror::Error;
 mod memory;
 
 use memory::{
-    ARENA_TOP, Arena, ResizeError, UmbArena, allocate_strategy, free_routed,
+    ARENA_TOP, Arena, ResizeError, SftHostFileEntry, UmbArena, allocate_strategy, free_routed,
     is_valid_alloc_strategy, release_umb, request_umb, resize_routed, resize_umb, set_umb_region,
     write_child_program_mcb, write_env_mcb, write_free_mcb_to_cap, write_sysvars,
 };
@@ -400,6 +400,14 @@ impl AccessMode {
     fn can_write(self) -> bool {
         matches!(self, AccessMode::Write | AccessMode::ReadWrite)
     }
+
+    fn sft_open_mode(self) -> u16 {
+        match self {
+            AccessMode::Read => 0,
+            AccessMode::Write => 1,
+            AccessMode::ReadWrite => 2,
+        }
+    }
 }
 
 /// An open file handle: the host file plus the DOS access mode it was opened
@@ -408,6 +416,15 @@ impl AccessMode {
 struct OpenFile {
     file: File,
     mode: AccessMode,
+    sft_name: [u8; 11],
+}
+
+fn open_file_record(file: File, mode: AccessMode, path: &Path) -> OpenFile {
+    OpenFile {
+        file,
+        mode,
+        sft_name: sft_name_from_path(path),
+    }
 }
 
 /// Open an existing host file for a DOS access mode (no create).
@@ -645,6 +662,31 @@ impl DosKernel {
 
     pub fn file_count(&self) -> u16 {
         self.file_count.unwrap_or(DEFAULT_FILE_COUNT)
+    }
+
+    fn sft_host_file_entries(&mut self) -> Vec<SftHostFileEntry> {
+        let mut entries = Vec::with_capacity(self.open_files.len());
+        for (&slot, open) in &mut self.open_files {
+            let size = open
+                .file
+                .metadata()
+                .map(|meta| meta.len().min(u64::from(u32::MAX)) as u32)
+                .unwrap_or(0);
+            let position = open
+                .file
+                .stream_position()
+                .map(|pos| pos.min(u64::from(u32::MAX)) as u32)
+                .unwrap_or(0);
+            entries.push(SftHostFileEntry {
+                slot,
+                open_mode: open.mode.sft_open_mode(),
+                size,
+                position,
+                name: open.sft_name,
+            });
+        }
+        entries.sort_by_key(|entry| entry.slot);
+        entries
     }
 
     pub fn buffer_count(&self) -> u16 {
@@ -2126,7 +2168,8 @@ impl DosKernel {
                 };
                 match open_host_file(&path, mode) {
                     Ok(file) => {
-                        self.open_files.insert(handle, OpenFile { file, mode });
+                        self.open_files
+                            .insert(handle, open_file_record(file, mode, &path));
                         regs.ax = handle;
                         regs.cf = false;
                     }
@@ -2372,13 +2415,8 @@ impl DosKernel {
                     .open(&path)
                 {
                     Ok(file) => {
-                        self.open_files.insert(
-                            handle,
-                            OpenFile {
-                                file,
-                                mode: AccessMode::ReadWrite,
-                            },
-                        );
+                        self.open_files
+                            .insert(handle, open_file_record(file, AccessMode::ReadWrite, &path));
                         regs.ax = handle;
                         regs.cf = false;
                     }
@@ -2763,12 +2801,18 @@ impl DosKernel {
                 Ok(DosAction::Continue)
             }
             0x52 => {
+                let first_mcb = self.arena.first_mcb();
+                let ems_present = self.ems_present;
+                let lastdrive = self.lastdrive;
+                let file_count = self.file_count();
+                let host_files = self.sft_host_file_entries();
                 let (es, bx) = write_sysvars(
                     mem,
-                    self.arena.first_mcb(),
-                    self.ems_present,
-                    self.lastdrive,
-                    self.file_count(),
+                    first_mcb,
+                    ems_present,
+                    lastdrive,
+                    file_count,
+                    &host_files,
                 )?;
                 regs.es = es;
                 regs.bx = bx;
@@ -2874,6 +2918,7 @@ impl DosKernel {
                     Some(of) => of.file.try_clone().map(|file| OpenFile {
                         file,
                         mode: of.mode,
+                        sft_name: of.sft_name,
                     }),
                     None => {
                         set_dos_error(regs, 0x06); // invalid handle
@@ -2901,6 +2946,7 @@ impl DosKernel {
                     Some(of) => of.file.try_clone().map(|file| OpenFile {
                         file,
                         mode: of.mode,
+                        sft_name: of.sft_name,
                     }),
                     None => {
                         set_dos_error(regs, 0x06);
@@ -2975,13 +3021,8 @@ impl DosKernel {
                     .open(&path)
                 {
                     Ok(file) => {
-                        self.open_files.insert(
-                            handle,
-                            OpenFile {
-                                file,
-                                mode: AccessMode::ReadWrite,
-                            },
-                        );
+                        self.open_files
+                            .insert(handle, open_file_record(file, AccessMode::ReadWrite, &path));
                         regs.ax = handle;
                         regs.cf = false;
                     }
@@ -3149,7 +3190,7 @@ impl DosKernel {
                         .open(&path)
                     {
                         Ok(file) => {
-                            created = Some((file, candidate));
+                            created = Some((file, candidate, path));
                             break;
                         }
                         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -3159,7 +3200,7 @@ impl DosKernel {
                         }
                     }
                 }
-                let Some((file, name)) = created else {
+                let Some((file, name, path)) = created else {
                     self.fail(regs, 0x05); // every candidate was taken
                     return Ok(DosAction::Continue);
                 };
@@ -3171,13 +3212,8 @@ impl DosKernel {
                     mem.write_u8(tail + i, byte)?;
                 }
                 mem.write_u8(tail + suffix.len(), 0)?;
-                self.open_files.insert(
-                    handle,
-                    OpenFile {
-                        file,
-                        mode: AccessMode::ReadWrite,
-                    },
-                );
+                self.open_files
+                    .insert(handle, open_file_record(file, AccessMode::ReadWrite, &path));
                 regs.ax = handle;
                 regs.cf = false;
                 Ok(DosAction::Continue)
@@ -3244,7 +3280,8 @@ impl DosKernel {
                 };
                 match result {
                     Ok(file) => {
-                        self.open_files.insert(handle, OpenFile { file, mode });
+                        self.open_files
+                            .insert(handle, open_file_record(file, mode, &path));
                         regs.ax = handle;
                         regs.cx = action_taken;
                         regs.cf = false;
@@ -3803,6 +3840,13 @@ fn host_name_to_8_3(name: &str) -> Option<[u8; 11]> {
         template[8 + i] = byte.to_ascii_uppercase();
     }
     Some(template)
+}
+
+fn sft_name_from_path(path: &Path) -> [u8; 11] {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(host_name_to_8_3)
+        .unwrap_or([b' '; 11])
 }
 
 /// Build the 11-byte search template from a DOS wildcard pattern. '*' fills the
@@ -7055,6 +7099,155 @@ mod tests {
             .map(|i| mem.read_u8(con + 0x20 + i).unwrap())
             .collect();
         assert_eq!(&name, b"CON        ", "CON SFT name");
+    }
+
+    fn ah52_sft_entry(kernel: &mut DosKernel, mem: &mut Memory, handle: u16) -> usize {
+        let mut regs = DosRegs {
+            ax: 0x5200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, mem).unwrap();
+        let base = usize::from(regs.es) * 16 + usize::from(regs.bx);
+        let sft_off = mem.read_u16(base + 0x04).unwrap();
+        let sft_seg = mem.read_u16(base + 0x06).unwrap();
+        let sft = usize::from(sft_seg) * 16 + usize::from(sft_off);
+        const SFT_ENTRY_LEN: usize = 0x3b;
+        sft + 0x06 + usize::from(handle) * SFT_ENTRY_LEN
+    }
+
+    fn ah52_sft_position(kernel: &mut DosKernel, mem: &mut Memory, handle: u16) -> u32 {
+        let entry = ah52_sft_entry(kernel, mem, handle);
+        mem.read_u32(entry + 0x15).unwrap()
+    }
+
+    #[test]
+    fn ah52_publishes_an_open_host_file_sft_entry() {
+        let (mut kernel, mut mem, _dir) =
+            kernel_with_drive(&[("LEVEL1.DAT", b"abcdef")], r"C:\LEVEL1.DAT");
+        kernel.init_program(0x0100, 0x1100, &mut mem).unwrap();
+
+        let open = open(&mut kernel, &mut mem);
+        assert!(!open.cf, "the host file opens");
+        assert_eq!(open.ax, 5, "the first dynamic handle is 5");
+
+        let mut regs = DosRegs {
+            ax: 0x5200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        let base = usize::from(regs.es) * 16 + usize::from(regs.bx);
+        let sft_off = mem.read_u16(base + 0x04).unwrap();
+        let sft_seg = mem.read_u16(base + 0x06).unwrap();
+        let sft = usize::from(sft_seg) * 16 + usize::from(sft_off);
+
+        const SFT_ENTRY_LEN: usize = 0x3b;
+        let entry = sft + 0x06 + usize::from(open.ax) * SFT_ENTRY_LEN;
+        assert_eq!(mem.read_u16(entry).unwrap(), 1, "one handle references it");
+        assert_eq!(
+            mem.read_u16(entry + 0x02).unwrap(),
+            0,
+            "read-only open mode"
+        );
+        assert_eq!(
+            mem.read_u8(entry + 0x04).unwrap(),
+            0,
+            "normal file attributes"
+        );
+        assert_eq!(
+            mem.read_u16(entry + 0x05).unwrap() & 0x0080,
+            0,
+            "the SFT entry is a file, not a character device"
+        );
+        assert_eq!(mem.read_u32(entry + 0x11).unwrap(), 6, "file size");
+        assert_eq!(mem.read_u32(entry + 0x15).unwrap(), 0, "current offset");
+        let name: Vec<u8> = (0..11)
+            .map(|i| mem.read_u8(entry + 0x20 + i).unwrap())
+            .collect();
+        assert_eq!(&name, b"LEVEL1  DAT", "FCB-style SFT name");
+    }
+
+    #[test]
+    fn ah52_refreshes_host_file_sft_offset_after_read_write_and_seek() {
+        let (mut kernel, mut mem, _dir) =
+            kernel_with_drive(&[("LEVEL1.DAT", b"abcdef")], r"C:\LEVEL1.DAT");
+        let mut open = DosRegs {
+            ax: 0x3d02,
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut open, &mut mem).unwrap();
+        assert!(!open.cf, "the read/write host file opens");
+        let handle = open.ax;
+
+        let read = read(&mut kernel, &mut mem, handle, 2, 0x0400);
+        assert!(!read.cf);
+        assert_eq!(read.ax, 2);
+        assert_eq!(ah52_sft_position(&mut kernel, &mut mem, handle), 2);
+
+        let mut seek_end = DosRegs {
+            ax: 0x4202,
+            bx: handle,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut seek_end, &mut mem).unwrap();
+        assert!(!seek_end.cf);
+        assert_eq!(ah52_sft_position(&mut kernel, &mut mem, handle), 6);
+
+        let src = 0x0100usize * 16 + 0x0500;
+        mem.write_u8(src, b'X').unwrap();
+        mem.write_u8(src + 1, b'Y').unwrap();
+        let mut write = DosRegs {
+            ax: 0x4000,
+            bx: handle,
+            cx: 2,
+            ds: 0x0100,
+            dx: 0x0500,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut write, &mut mem).unwrap();
+        assert!(!write.cf);
+        assert_eq!(write.ax, 2);
+        let entry = ah52_sft_entry(&mut kernel, &mut mem, handle);
+        assert_eq!(
+            mem.read_u32(entry + 0x11).unwrap(),
+            8,
+            "file size after write"
+        );
+        assert_eq!(mem.read_u32(entry + 0x15).unwrap(), 8, "offset after write");
+
+        let mut seek_abs = DosRegs {
+            ax: 0x4200,
+            bx: handle,
+            dx: 3,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut seek_abs, &mut mem).unwrap();
+        assert!(!seek_abs.cf);
+        assert_eq!(ah52_sft_position(&mut kernel, &mut mem, handle), 3);
+    }
+
+    #[test]
+    fn ah52_clears_host_file_sft_entry_after_close() {
+        let (mut kernel, mut mem, _dir) =
+            kernel_with_drive(&[("LEVEL1.DAT", b"abcdef")], r"C:\LEVEL1.DAT");
+        kernel.init_program(0x0100, 0x1100, &mut mem).unwrap();
+        let open = open(&mut kernel, &mut mem);
+        assert!(!open.cf, "the host file opens");
+        let handle = open.ax;
+        let entry = ah52_sft_entry(&mut kernel, &mut mem, handle);
+        assert_eq!(
+            mem.read_u16(entry).unwrap(),
+            1,
+            "entry is live before close"
+        );
+
+        let close = close(&mut kernel, &mut mem, handle);
+        assert!(!close.cf);
+        let entry = ah52_sft_entry(&mut kernel, &mut mem, handle);
+        assert_eq!(mem.read_u16(entry).unwrap(), 0, "refcount is cleared");
+        assert_eq!(mem.read_u32(entry + 0x11).unwrap(), 0, "size is cleared");
+        assert_eq!(mem.read_u32(entry + 0x15).unwrap(), 0, "offset is cleared");
     }
 
     #[test]
