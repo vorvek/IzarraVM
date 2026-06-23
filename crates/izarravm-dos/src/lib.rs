@@ -10,11 +10,11 @@ use thiserror::Error;
 mod memory;
 
 use memory::{
-    ARENA_TOP, Arena, ResizeError, SDA_ALWAYS_SWAPPED_LEN, SDA_IN_DOS_SWAPPED_LEN, SdaSnapshot,
-    SftHostFileEntry, UmbArena, allocate_strategy, free_routed, free_umb_blocks_owned_by,
-    is_valid_alloc_strategy, release_umb, request_umb, resize_routed, resize_umb, set_umb_owner,
-    set_umb_region, write_child_program_mcb, write_env_mcb, write_free_mcb_to_cap, write_sda,
-    write_sysvars,
+    ARENA_TOP, Arena, ResizeError, SDA_ALWAYS_SWAPPED_LEN, SDA_IN_DOS_SWAPPED_LEN,
+    SdaCriticalError, SdaSnapshot, SftHostFileEntry, UmbArena, allocate_strategy, free_routed,
+    free_umb_blocks_owned_by, is_valid_alloc_strategy, release_umb, request_umb, resize_routed,
+    resize_umb, set_umb_owner, set_umb_region, write_child_program_mcb, write_env_mcb,
+    write_free_mcb_to_cap, write_sda, write_sysvars,
 };
 #[cfg(test)]
 use memory::{NO_NAME, RamMcb, read_mcb_chain, write_mcb_header};
@@ -327,6 +327,7 @@ pub struct DosRegs {
     pub dx: u16,
     pub si: u16,
     pub di: u16,
+    pub bp: u16,
     pub ds: u16, // segment selector
     pub es: u16, // segment selector
     pub cf: bool,
@@ -351,6 +352,129 @@ pub enum DosAction {
     /// keyboard ring empty. The machine rewinds the INT 21h so it re-executes
     /// after the ISR refills the ring. The kernel leaves the registers unchanged.
     WaitForKey,
+}
+
+/// A real-mode far pointer, stored and passed as segment:offset.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FarPtr {
+    pub segment: u16,
+    pub offset: u16,
+}
+
+/// Disk area reported in the INT 24h AH flags for a block-device critical error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CriticalErrorArea {
+    Dos,
+    Fat,
+    RootDirectory,
+    Data,
+}
+
+impl CriticalErrorArea {
+    fn bits(self) -> u8 {
+        match self {
+            CriticalErrorArea::Dos => 0,
+            CriticalErrorArea::Fat => 1,
+            CriticalErrorArea::RootDirectory => 2,
+            CriticalErrorArea::Data => 3,
+        }
+    }
+}
+
+/// A DOS critical-error request waiting for the future host-to-guest trampoline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CriticalErrorRequest {
+    pub drive: u8,
+    pub error_code: u8,
+    pub write: bool,
+    pub area: CriticalErrorArea,
+    pub device_header: FarPtr,
+    pub ignore_allowed: bool,
+    pub retry_allowed: bool,
+    pub fail_allowed: bool,
+}
+
+impl CriticalErrorRequest {
+    /// Build a DOS 3+ disk critical-error request with Ignore, Retry, and Fail all
+    /// allowed. Abort is always available and is not represented by an AH flag.
+    pub fn disk(
+        drive: u8,
+        error_code: u8,
+        write: bool,
+        area: CriticalErrorArea,
+        device_header: FarPtr,
+    ) -> Self {
+        Self {
+            drive,
+            error_code,
+            write,
+            area,
+            device_header,
+            ignore_allowed: true,
+            retry_allowed: true,
+            fail_allowed: true,
+        }
+    }
+
+    fn ah_flags(self) -> u8 {
+        let mut flags = self.area.bits() << 1;
+        if self.write {
+            flags |= 0x01;
+        }
+        if self.fail_allowed {
+            flags |= 0x08;
+        }
+        if self.retry_allowed {
+            flags |= 0x10;
+        }
+        if self.ignore_allowed {
+            flags |= 0x20;
+        }
+        flags
+    }
+
+    fn regs(self) -> DosRegs {
+        DosRegs {
+            ax: (u16::from(self.ah_flags()) << 8) | u16::from(self.drive),
+            si: self.device_header.offset,
+            di: u16::from(self.error_code),
+            bp: self.device_header.segment,
+            ..DosRegs::default()
+        }
+    }
+}
+
+/// The INT 24h callback frame the machine will trampoline into guest code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CriticalErrorCall {
+    pub handler: FarPtr,
+    pub regs: DosRegs,
+}
+
+/// A critical-error handler's return code, the value an INT 24h handler leaves in
+/// AL for DOS to act on. DOS reads only the low two bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CriticalErrorResponse {
+    Ignore,
+    Retry,
+    Abort,
+    Fail,
+}
+
+impl CriticalErrorResponse {
+    fn from_al(al: u8) -> Self {
+        match al & 0x03 {
+            0 => CriticalErrorResponse::Ignore,
+            1 => CriticalErrorResponse::Retry,
+            2 => CriticalErrorResponse::Abort,
+            _ => CriticalErrorResponse::Fail,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActiveCriticalError {
+    drive: u8,
 }
 
 /// Toka-DOS wall clock. Deterministic by default (a fixed 1997 instant) so unit
@@ -597,6 +721,8 @@ pub struct DosKernel {
     // AH=59h extended error: the last DOS error code reported to a guest. Held until
     // the next error overwrites it (DOS does not clear it on a successful call).
     last_error: u16,
+    // Active INT 24h critical-error callback state. None outside the callback.
+    critical_error: Option<ActiveCriticalError>,
 }
 
 impl DosKernel {
@@ -658,6 +784,7 @@ impl DosKernel {
         self.program_stack.clear();
         self.last_exit_code = 0;
         self.last_exit_type = 0;
+        self.critical_error = None;
         Ok(())
     }
 
@@ -687,6 +814,30 @@ impl DosKernel {
     /// and NOEMS (the frameless manager) and false only for HIMEM-only.
     pub fn ems_present(&self) -> bool {
         self.ems_present
+    }
+
+    /// Prepare a DOS INT 24h critical-error callback without running guest code.
+    /// The future outbound trampoline will take the returned frame, call the live
+    /// INT 24h vector, then feed the handler's AL back to finish_critical_error.
+    pub fn begin_critical_error(
+        &mut self,
+        mem: &mut Memory,
+        request: CriticalErrorRequest,
+    ) -> Result<CriticalErrorCall, DosError> {
+        self.last_error = critical_error_to_extended_error(request.error_code);
+        self.critical_error = Some(ActiveCriticalError {
+            drive: request.drive,
+        });
+        Ok(CriticalErrorCall {
+            handler: interrupt_vector(mem, 0x24)?,
+            regs: request.regs(),
+        })
+    }
+
+    /// Finish a pending DOS INT 24h callback and decode the handler's AL action.
+    pub fn finish_critical_error(&mut self, handler_al: u8) -> CriticalErrorResponse {
+        self.critical_error = None;
+        CriticalErrorResponse::from_al(handler_al)
     }
 
     /// The lowest free file handle (>= 5), skipping both host files and the open
@@ -2266,6 +2417,9 @@ impl DosKernel {
                 current_psp: self.arena.psp_seg,
                 last_exit_code: self.last_exit_code,
                 last_exit_type: self.last_exit_type,
+                critical_error: self.critical_error.map(|active| SdaCriticalError {
+                    drive: active.drive,
+                }),
             },
         )
     }
@@ -3948,52 +4102,20 @@ fn build_psp(mem: &mut Memory, psp_seg: u16, top_of_mem_paragraph: u16) -> Resul
 /// The default Job File Table length DOS reports in PSP:0x32 (20 handles).
 const JFT_LEN: usize = 20;
 
-/// A critical-error handler's return code, the value an INT 24h handler leaves in
-/// AL for DOS to act on (RBIL INT 24h "Return:"). DOS reads only the low two bits,
-/// so 4..255 alias back into this set; we mask the same way.
-// Scaffolding for the deferred INT 24h far-call (see psp_saved_vector); exercised
-// by tests but not yet on a live code path, so allow dead_code until the machine
-// crate's host->guest call seam invokes a handler.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CriticalErrorResponse {
-    Ignore, // 0: ignore the error and return success to the caller
-    Retry,  // 1: retry the failing operation
-    Abort,  // 2: abort the program through INT 23h
-    Fail,   // 3: fail the system call (DOS 3.1+)
+fn interrupt_vector(mem: &Memory, int_no: u8) -> Result<FarPtr, DosError> {
+    let ivt = usize::from(int_no) * 4;
+    Ok(FarPtr {
+        offset: mem.read_u16(ivt)?,
+        segment: mem.read_u16(ivt + 2)?,
+    })
 }
 
-impl CriticalErrorResponse {
-    /// Decode the AL a critical-error handler returns. Only AL bits 0-1 are
-    /// significant, so a handler that returns 0x07 (a common "leave AL untouched"
-    /// accident) decodes the same as 0x03 Fail, matching DOS.
-    #[allow(dead_code)] // scaffolding for the deferred INT 24h far-call; exercised by tests
-    fn from_al(al: u8) -> Self {
-        match al & 0x03 {
-            0 => CriticalErrorResponse::Ignore,
-            1 => CriticalErrorResponse::Retry,
-            2 => CriticalErrorResponse::Abort,
-            _ => CriticalErrorResponse::Fail,
-        }
+fn critical_error_to_extended_error(code: u8) -> u16 {
+    match code {
+        0x00..=0x0c => 0x13 + u16::from(code),
+        0x0d..=0x11 => 0x20 + u16::from(code - 0x0d),
+        _ => u16::from(code),
     }
-}
-
-/// The far pointer (segment, offset) a PSP holds for one of the saved INT 22h/23h/
-/// 24h vectors. `psp_off` is 0x0A terminate, 0x0E Ctrl-C, 0x12 critical-error. The
-/// vector is stored offset-then-segment, the IVT layout DOS copies it from.
-// Limit: the INT 24h vector is stored in the PSP and the IVT, and
-// CriticalErrorResponse decodes a handler's reply, but nothing calls the handler:
-// the HLE file path goes straight to the host filesystem, so no failing block
-// device exists to raise a critical error. The far-call into the guest handler is
-// deferred until a block device can fault; that needs the outbound host->guest
-// call seam from the machine crate (which would push a fake IRET frame and run the
-// vector here at PSP:0x12), at which point this reader supplies the address.
-#[allow(dead_code)]
-fn psp_saved_vector(mem: &Memory, psp_seg: u16, psp_off: u16) -> Result<(u16, u16), DosError> {
-    let base = usize::from(psp_seg) * 16 + usize::from(psp_off);
-    let offset = mem.read_u16(base)?;
-    let segment = mem.read_u16(base + 2)?;
-    Ok((segment, offset))
 }
 
 /// Format a DOS environment block: a sequence of ASCIIZ `KEY=VALUE` strings
@@ -8540,6 +8662,80 @@ mod tests {
     }
 
     #[test]
+    fn critical_error_scaffold_builds_int24_frame_and_marks_sda() {
+        let (mut kernel, mut mem) = arena_kernel();
+        let psp = 0x0100usize * 16;
+        // PSP:12h is the saved previous handler. A live critical error must call
+        // the current INT 24h vector instead, so seed different values.
+        mem.write_u16(psp + 0x12, 0x2222).unwrap();
+        mem.write_u16(psp + 0x14, 0x3333).unwrap();
+        mem.write_u16(0x24 * 4, 0x4567).unwrap();
+        mem.write_u16(0x24 * 4 + 2, 0x89ab).unwrap();
+
+        let call = kernel
+            .begin_critical_error(
+                &mut mem,
+                CriticalErrorRequest::disk(
+                    2,
+                    0x0b,
+                    true,
+                    CriticalErrorArea::Data,
+                    FarPtr {
+                        segment: 0x0050,
+                        offset: 0x0012,
+                    },
+                ),
+            )
+            .unwrap();
+
+        assert_eq!(
+            call.handler,
+            FarPtr {
+                segment: 0x89ab,
+                offset: 0x4567,
+            },
+            "critical error uses the live INT 24h vector"
+        );
+        assert_eq!(call.regs.ax, 0x3f02, "AH flags plus AL drive");
+        assert_eq!(call.regs.di, 0x000b, "DI low byte carries the error code");
+        assert_eq!(call.regs.bp, 0x0050, "BP:SI points at the driver header");
+        assert_eq!(call.regs.si, 0x0012, "BP:SI points at the driver header");
+
+        let mut sda_regs = DosRegs {
+            ax: 0x5d06,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut sda_regs, &mut mem).unwrap();
+        let sda = usize::from(sda_regs.ds) * 16 + usize::from(sda_regs.si);
+        assert_eq!(mem.read_u8(sda).unwrap(), 1, "critical-error flag is set");
+        assert_eq!(
+            mem.read_u8(sda + 1).unwrap(),
+            1,
+            "DOS is busy during INT 24h"
+        );
+        assert_eq!(
+            mem.read_u8(sda + 2).unwrap(),
+            2,
+            "current critical-error drive"
+        );
+        assert_eq!(mem.read_u16(sda + 4).unwrap(), 0x001e, "AH=59h error code");
+
+        assert_eq!(
+            kernel.finish_critical_error(0x07),
+            CriticalErrorResponse::Fail
+        );
+
+        kernel.dispatch(0x21, &mut sda_regs, &mut mem).unwrap();
+        let sda = usize::from(sda_regs.ds) * 16 + usize::from(sda_regs.si);
+        assert_eq!(mem.read_u8(sda).unwrap(), 0, "critical-error flag clears");
+        assert_eq!(
+            mem.read_u8(sda + 2).unwrap(),
+            0xff,
+            "no current critical-error drive"
+        );
+    }
+
+    #[test]
     fn ah52_publishes_an_sft_header_sized_by_files() {
         let (mut kernel, mut mem) = arena_kernel();
         kernel.set_config_sys_counts(7, 20);
@@ -8823,7 +9019,7 @@ mod tests {
     #[test]
     fn psp_saves_int24_vector_consistent_with_ivt() {
         // Install an INT 24h vector in the IVT, build a PSP, and confirm PSP:0x12
-        // mirrors it (segment,offset) and psp_saved_vector reads it back.
+        // mirrors it as offset then segment.
         let mut mem = Memory::new(64 * 1024).unwrap();
         // IVT entry 0x24 = offset 0xBEEF, segment 0xF000.
         mem.write_u16(0x24 * 4, 0xbeef).unwrap();
@@ -8832,8 +9028,6 @@ mod tests {
         let psp = 0x0100usize * 16;
         assert_eq!(mem.read_u16(psp + 0x12).unwrap(), 0xbeef, "PSP offset");
         assert_eq!(mem.read_u16(psp + 0x14).unwrap(), 0xf000, "PSP segment");
-        let (seg, off) = psp_saved_vector(&mem, 0x0100, 0x12).unwrap();
-        assert_eq!((seg, off), (0xf000, 0xbeef));
     }
 
     #[test]
