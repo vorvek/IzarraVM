@@ -30,6 +30,12 @@ const SYSVARS_SEG: u16 = 0x0050;
 /// DOS default LASTDRIVE, reported in the list of lists: drives A: through E:.
 const DEFAULT_LASTDRIVE: u8 = 5;
 
+/// AH=52h publishes the Current Directory Structure (CDS) array from the same
+/// reserved paragraph as SysVars. Keep it after the scalar fields and optional
+/// EMMXXXX0 device header, and below the first program PSP at 0x0100:0000.
+const CDS_ARRAY_OFF: usize = 0x60;
+const CDS_ENTRY_LEN: usize = 0x58;
+
 /// Conventional memory modeled as an authoritative in-RAM MCB chain ending at
 /// paragraph 0xA000. The chain is the source of truth: allocate/free/resize walk
 /// and mutate the real headers a guest reads through AH=52h, so a memory manager
@@ -479,8 +485,8 @@ pub(super) fn write_free_mcb_to_cap(
 
 /// AH=52h GET LIST OF LISTS (SysVars). Returns ES:BX -> the DOS internal
 /// variable table. The first-MCB segment at [BX-2] points at the live in-RAM MCB
-/// chain. The modeled scalar fields and device-driver headers are filled in;
-/// unmodeled chain pointers stay zero.
+/// chain. The modeled scalar fields, CDS array, and device-driver headers are
+/// filled in; unmodeled chain pointers stay zero.
 pub(super) fn write_sysvars(
     mem: &mut Memory,
     first_mcb: u16,
@@ -488,17 +494,40 @@ pub(super) fn write_sysvars(
     lastdrive: Option<u8>,
 ) -> Result<(u16, u16), DosError> {
     let base = usize::from(SYSVARS_SEG) * 16;
+    let drive_count = lastdrive.unwrap_or(DEFAULT_LASTDRIVE).min(26);
+    let cds_linear = base + 2 + CDS_ARRAY_OFF;
+    let clear_end = 2 + CDS_ARRAY_OFF + usize::from(drive_count) * CDS_ENTRY_LEN;
     // [BX-2] = first MCB segment (BX returns 0x0002, so this is offset 0).
     mem.write_u16(base, first_mcb)?;
-    // Clear the documented field span, then fill the known fields over it.
-    for off in 2..0x40usize {
+    // Clear the documented field span plus the sized CDS array, then fill the
+    // known fields over it.
+    for off in 2..clear_end {
         mem.write_u8(base + off, 0)?;
     }
     // [BX+0x10] WORD: the largest bytes-per-block of any block device, a 512-byte
     // sector here.
     mem.write_u16(base + 2 + 0x10, 512)?;
+    // [BX+0x16] DWORD: pointer to the Current Directory Structure array. Each
+    // entry is 0x58 bytes and the count is published at [BX+0x21].
+    mem.write_u16(base + 2 + 0x16, (2 + CDS_ARRAY_OFF) as u16)?;
+    mem.write_u16(base + 2 + 0x18, SYSVARS_SEG)?;
     // [BX+0x21] BYTE: LASTDRIVE.
-    mem.write_u8(base + 2 + 0x21, lastdrive.unwrap_or(DEFAULT_LASTDRIVE))?;
+    mem.write_u8(base + 2 + 0x21, drive_count)?;
+    for index in 0..drive_count {
+        let entry = cds_linear + usize::from(index) * CDS_ENTRY_LEN;
+        let letter = b'A' + index;
+        mem.write_u8(entry, letter)?;
+        mem.write_u8(entry + 1, b':')?;
+        mem.write_u8(entry + 2, b'\\')?;
+        mem.write_u8(entry + 3, 0)?;
+        // Mark C: as the mounted local physical drive. Other letters are reserved
+        // by LASTDRIVE but not backed by a modeled block device yet.
+        mem.write_u16(entry + 0x43, if letter == b'C' { 0x4000 } else { 0 })?;
+        mem.write_u16(entry + 0x49, 0)?; // current directory starts at root
+        mem.write_u16(entry + 0x4b, 0xffff)?;
+        mem.write_u16(entry + 0x4d, 0xffff)?;
+        mem.write_u16(entry + 0x4f, 2)?; // hide "X:" from GETDIR-style views
+    }
     // [BX+0x22]: the NUL device header, the head of the device-driver chain.
     let nul_off = 0x22usize; // BX-relative offset of the NUL header
     let ems_off = nul_off + 0x12; // the EMMXXXX0 header right after NUL

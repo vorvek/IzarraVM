@@ -6929,6 +6929,54 @@ mod tests {
     }
 
     #[test]
+    fn ah52_publishes_a_cds_array_sized_by_lastdrive() {
+        let (mut kernel, mut mem) = arena_kernel();
+        kernel.set_lastdrive(8); // A: through H:
+
+        let mut regs = DosRegs {
+            ax: 0x5200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        let base = usize::from(regs.es) * 16 + usize::from(regs.bx);
+
+        let cds_off = mem.read_u16(base + 0x16).unwrap();
+        let cds_seg = mem.read_u16(base + 0x18).unwrap();
+        assert_ne!(
+            (cds_seg, cds_off),
+            (0, 0),
+            "[BX+0x16] points at the CDS array"
+        );
+        assert_eq!(
+            mem.read_u8(base + 0x21).unwrap(),
+            8,
+            "LASTDRIVE also sizes the CDS array"
+        );
+
+        const CDS_LEN: usize = 0x58;
+        let cds = usize::from(cds_seg) * 16 + usize::from(cds_off);
+        for (index, letter) in (b'A'..=b'H').enumerate() {
+            let entry = cds + index * CDS_LEN;
+            assert_eq!(mem.read_u8(entry).unwrap(), letter, "drive letter");
+            assert_eq!(mem.read_u8(entry + 1).unwrap(), b':', "drive colon");
+            assert_eq!(mem.read_u8(entry + 2).unwrap(), b'\\', "root slash");
+            assert_eq!(mem.read_u8(entry + 3).unwrap(), 0, "path terminator");
+            assert_eq!(
+                mem.read_u16(entry + 0x4f).unwrap(),
+                2,
+                "root backslash offset hides the drive letter and colon"
+            );
+        }
+
+        let c_drive = cds + 2 * CDS_LEN;
+        assert_eq!(
+            mem.read_u16(c_drive + 0x43).unwrap(),
+            0x4000,
+            "C: is marked as a physical local drive"
+        );
+    }
+
+    #[test]
     fn critical_error_response_decodes_low_two_bits() {
         assert_eq!(
             CriticalErrorResponse::from_al(0),
