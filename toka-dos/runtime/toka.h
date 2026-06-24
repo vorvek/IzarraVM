@@ -57,6 +57,10 @@ int t_create(const char *path);
 int t_read(int handle, void *buf, int count);  /* bytes read, -1 on error */
 int t_write(int handle, const void *buf, int count);
 void t_close(int handle);
+int t_dup(int handle);
+int t_dup2(int src, int dst);
+long t_lseek(int handle, long offset, int whence);
+int t_open_append(const char *path);
 
 int t_mkdir(const char *path);
 int t_rmdir(const char *path);

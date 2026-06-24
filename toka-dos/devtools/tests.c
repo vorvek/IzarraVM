@@ -165,6 +165,28 @@ static void cmd_env(char *rest)
     }
 }
 
+/* WRITE <text>: write the argument text to handle 1 (stdout) via AH=40h. When
+ * the shell redirected stdout to a file, the inherited handle 1 lands the bytes
+ * in that file, proving external-child redirect inheritance. */
+static void cmd_write(char *rest)
+{
+    int len = (int)strlen(rest);
+    if (len > 0) {
+        t_write(1, rest, len);
+    }
+}
+
+/* CAT: copy stdin (handle 0) to stdout (handle 1) until EOF, proving the `<`
+ * redirect feeds an external child its input. */
+static void cmd_cat(void)
+{
+    char buf[512];
+    int n;
+    while ((n = t_read(0, buf, sizeof buf)) > 0) {
+        t_write(1, buf, n);
+    }
+}
+
 int main(void)
 {
     char *p = t_cmdtail();
@@ -172,8 +194,12 @@ int main(void)
     char *rest = next_word(p, word, sizeof word);
     if (eqi(word, "ENV")) {
         cmd_env(rest);
+    } else if (eqi(word, "WRITE")) {
+        cmd_write(rest);
+    } else if (eqi(word, "CAT")) {
+        cmd_cat();
     } else {
-        t_putln("Usage: TESTS ENV <name> [<expected>]");
+        t_putln("Usage: TESTS ENV|WRITE|CAT ...");
     }
     t_exit(0);
     return 0;

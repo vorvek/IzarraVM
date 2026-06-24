@@ -16415,6 +16415,102 @@ mod tests {
         );
     }
 
+    /// Boot Toka-DOS on a temp C: whose AUTOEXEC.BAT runs `lines`, then return the
+    /// temp dir so the caller reads the host output. No keystrokes: AUTOEXEC runs
+    /// at boot, so the `>` / `<` are batch-file content, not keyboard input. The
+    /// redirect commands use the external TESTS tool, which the batch path routes
+    /// through dispatch_redirected.
+    #[cfg(test)]
+    fn run_redirect_autoexec(lines: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let files = izarravm_firmware::toka_dos_system_files();
+        izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format)
+            .unwrap();
+        let tests_com = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("c_drive")
+            .join("TESTS.COM");
+        std::fs::copy(&tests_com, dir.path().join("TESTS.COM")).unwrap();
+        std::fs::write(dir.path().join("AUTOEXEC.BAT"), lines).unwrap();
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .unwrap();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        machine.set_toka_c_root(dir.path().to_path_buf());
+        // POST + boot + AUTOEXEC running several external EXECs, then idle at the
+        // prompt (which halts on WaitForKey). Returns early on halt; the budget is
+        // an upper bound. Raise it if a file is missing because AUTOEXEC was cut off.
+        machine.run_until_halt_or_cycles(60_000_000).unwrap();
+        dir
+    }
+
+    /// Read a file from the temp C: by case-insensitive name (the host may store
+    /// the DOS name in either case).
+    #[cfg(test)]
+    fn read_c_file(dir: &std::path::Path, name: &str) -> String {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(name)
+            {
+                return std::fs::read_to_string(entry.path()).unwrap();
+            }
+        }
+        let have: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        panic!("file {name} not found on C: (have: {have:?})");
+    }
+
+    #[test]
+    fn toka_external_redirect_writes_and_appends() {
+        // AUTOEXEC runs external TESTS WRITE commands: a truncating `>` redirect
+        // and a `>>` append. The batch path routes the external command through
+        // dispatch_redirected, the child inherits the redirected handle 1, and the
+        // bytes land in the host file. (TESTS WRITE writes its argument plus the
+        // trailing spaces left where the redirect token was blanked, so assert on
+        // substrings/ordering rather than exact content.)
+        let dir = run_redirect_autoexec(
+            "@ECHO OFF\r\n\
+             tests write hello > out.txt\r\n\
+             tests write a > app.txt\r\n\
+             tests write b >> app.txt\r\n",
+        );
+        assert!(
+            read_c_file(dir.path(), "OUT.TXT").contains("hello"),
+            "redirected external stdout wrote the file"
+        );
+        let app = read_c_file(dir.path(), "APP.TXT");
+        let a = app.find('a').expect("first write present");
+        let b = app.find('b').expect("appended write present");
+        assert!(a < b, ">> appended after the truncating >; got {app:?}");
+    }
+
+    #[test]
+    fn toka_input_redirect_feeds_a_child() {
+        // First create IN.TXT via a redirected write, then TESTS CAT reads it from
+        // redirected stdin and writes it to redirected stdout, proving `<` feeds a
+        // child from a file (the Host-backed handle 0 returns bytes then EOF, never
+        // WaitForKey). CAT echoes its input verbatim, so CAT.TXT equals IN.TXT.
+        let dir = run_redirect_autoexec(
+            "@ECHO OFF\r\n\
+             tests write payload > in.txt\r\n\
+             tests cat < in.txt > cat.txt\r\n",
+        );
+        let inp = read_c_file(dir.path(), "IN.TXT");
+        let out = read_c_file(dir.path(), "CAT.TXT");
+        assert_eq!(
+            out, inp,
+            "CAT copied IN.TXT to CAT.TXT through redirected stdin/stdout"
+        );
+    }
+
     #[test]
     fn toka_editor_opens_edits_and_saves_a_file() {
         let dir = tempfile::tempdir().unwrap();
