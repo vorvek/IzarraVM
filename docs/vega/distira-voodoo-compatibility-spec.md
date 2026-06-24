@@ -484,7 +484,9 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
       split/odd RGB565 multibase LOD address test plus the workspace gates.
 - [x] Iteration 40: texture aspect ratio LOD dimensions. Validated by the video
       RGB565 S-wider aspect ratio test plus the workspace gates.
-- [ ] Next: texture detail register read/write behavior.
+- [x] Iteration 41: texture detail register read/write behavior. Validated by
+      the video texture detail register round-trip test plus the workspace gates.
+- [ ] Next: texture detail blending behavior.
 
 ## First 90 percent push for this branch
 

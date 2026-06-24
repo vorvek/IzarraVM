@@ -59,6 +59,17 @@ fn voodoo_registers_store_init_and_render_state() {
 }
 
 #[test]
+fn voodoo_texture_detail_register_round_trips() {
+    const SST_TDETAIL: usize = 0x308;
+
+    let mut distira = Distira::new();
+
+    write_reg(&mut distira, SST_TDETAIL, 0x0001_c23f);
+
+    assert_eq!(read_reg(&distira, SST_TDETAIL), 0x0001_c23f);
+}
+
+#[test]
 fn clear_back_buffer_and_swap_presents_rgb565_words() {
     let mut distira = Distira::new();
     distira.set_frame_size(4, 2);
