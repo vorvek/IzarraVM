@@ -941,6 +941,28 @@ pub(super) fn read_mcb_chain(mem: &Memory, first_mcb: u16) -> Vec<RamMcb> {
     out
 }
 
+pub(super) fn mcb_chain_is_complete(mem: &Memory, first_mcb: u16) -> bool {
+    let mut seg = first_mcb;
+    for _ in 0..MCB_WALK_CAP {
+        let base = usize::from(seg) * 16;
+        let (Ok(sig), Ok(size)) = (mem.read_u8(base), mem.read_u16(base + 3)) else {
+            return false;
+        };
+        if sig != b'M' && sig != b'Z' {
+            return false;
+        }
+        if sig == b'Z' {
+            return true;
+        }
+        let next = seg.wrapping_add(1).wrapping_add(size);
+        if next <= seg {
+            return false;
+        }
+        seg = next;
+    }
+    false
+}
+
 /// The free tail of the chain rooted at `first_mcb`: (header seg, data size) of
 /// the last block when it is free (owner 0), else None when the region is full.
 pub(super) fn free_tail(first_mcb: u16, mem: &Memory) -> Option<(u16, u16)> {

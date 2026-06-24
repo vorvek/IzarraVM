@@ -12,9 +12,9 @@ mod memory;
 use memory::{
     ARENA_TOP, Arena, ResizeError, SDA_ALWAYS_SWAPPED_LEN, SDA_IN_DOS_SWAPPED_LEN,
     SdaCriticalError, SdaSnapshot, SftHostFileEntry, UmbArena, allocate_strategy, free_routed,
-    free_umb_blocks_owned_by, is_valid_alloc_strategy, release_umb, request_umb, resize_routed,
-    resize_umb, set_umb_owner, set_umb_region, write_child_program_mcb, write_env_mcb,
-    write_free_mcb_to_cap, write_sda, write_sysvars,
+    free_umb_blocks_owned_by, is_valid_alloc_strategy, mcb_chain_is_complete, release_umb,
+    request_umb, resize_routed, resize_umb, set_umb_owner, set_umb_region, write_child_program_mcb,
+    write_env_mcb, write_free_mcb_to_cap, write_sda, write_sysvars,
 };
 #[cfg(test)]
 use memory::{NO_NAME, RamMcb, read_mcb_chain, write_mcb_header};
@@ -2798,8 +2798,12 @@ impl DosKernel {
                 Ok(DosAction::Continue)
             }
             // AH=48h: allocate BX paragraphs. CF=0 AX=segment, or CF=1 AX=0x08
-            // BX=largest-available.
+            // BX=largest-available. A damaged MCB chain reports AX=0x07.
             0x48 => {
+                if !mcb_chain_is_complete(mem, self.arena.first_mcb()) {
+                    self.fail(regs, 0x07);
+                    return Ok(DosAction::Continue);
+                }
                 match self.allocate_strategy(regs.bx, mem)? {
                     Ok(seg) => {
                         regs.ax = seg;
@@ -2814,7 +2818,12 @@ impl DosKernel {
                 Ok(DosAction::Continue)
             }
             // AH=49h: free the block in ES. CF=0, or CF=1 AX=0x09 (invalid block).
+            // A damaged MCB chain reports AX=0x07.
             0x49 => {
+                if !mcb_chain_is_complete(mem, self.arena.first_mcb()) {
+                    self.fail(regs, 0x07);
+                    return Ok(DosAction::Continue);
+                }
                 match self.free_routed(regs.es, mem)? {
                     Ok(()) => regs.cf = false,
                     Err(()) => {
@@ -2826,7 +2835,12 @@ impl DosKernel {
             }
             // AH=4Ah: resize the block in ES to BX paragraphs. CF=0, or CF=1 with
             // AX=0x08 BX=largest-available (too big) / AX=0x09 (invalid block).
+            // A damaged MCB chain reports AX=0x07.
             0x4a => {
+                if !mcb_chain_is_complete(mem, self.arena.first_mcb()) {
+                    self.fail(regs, 0x07);
+                    return Ok(DosAction::Continue);
+                }
                 match self.resize_routed(regs.es, regs.bx, mem)? {
                     Ok(()) => regs.cf = false,
                     Err(ResizeError::TooBig(largest)) => {
@@ -7775,6 +7789,30 @@ mod tests {
     }
 
     #[test]
+    fn ah48_corrupt_mcb_chain_returns_arena_destroyed() {
+        let (mut kernel, mut mem) = arena_kernel();
+        // DOS distinguishes a damaged MCB chain from an ordinary allocation miss:
+        // error 07h means memory control blocks destroyed, while 08h is merely not
+        // enough memory. Corrupt the live first header signature the allocator walks.
+        mem.write_u8(0x00ff * 16, b'X').unwrap();
+        let mut regs = DosRegs {
+            ax: 0x4800,
+            bx: 0x0010,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x07);
+
+        let mut err = DosRegs {
+            ax: 0x5900,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut err, &mut mem).unwrap();
+        assert_eq!(err.ax, 0x07);
+    }
+
+    #[test]
     fn ah4a_grow_program_block_too_big_fails_with_largest() {
         let (mut kernel, mut mem) = arena_kernel();
         // No allocations yet, so limit is ARENA_TOP. Ask for more than fits.
@@ -7788,6 +7826,21 @@ mod tests {
         assert!(regs.cf);
         assert_eq!(regs.ax, 0x08);
         assert_eq!(regs.bx, 0x9f00); // 0xA000 - 0x0100
+    }
+
+    #[test]
+    fn ah4a_corrupt_mcb_chain_returns_arena_destroyed() {
+        let (mut kernel, mut mem) = arena_kernel();
+        mem.write_u8(0x00ff * 16, b'X').unwrap();
+        let mut regs = DosRegs {
+            ax: 0x4a00,
+            es: 0x0100,
+            bx: 0x0800,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x07);
     }
 
     #[test]
@@ -8103,6 +8156,20 @@ mod tests {
         kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
         assert!(regs.cf);
         assert_eq!(regs.ax, 0x09);
+    }
+
+    #[test]
+    fn ah49_corrupt_mcb_chain_returns_arena_destroyed() {
+        let (mut kernel, mut mem) = arena_kernel();
+        mem.write_u8(0x00ff * 16, b'X').unwrap();
+        let mut regs = DosRegs {
+            ax: 0x4900,
+            es: 0x1101,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x07);
     }
 
     #[test]
