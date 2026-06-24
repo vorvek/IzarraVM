@@ -13,6 +13,7 @@ void t_putc(char c);              /* one character (AH=02h)                  */
 void t_puts(const char *s);       /* a string, no trailing newline           */
 void t_putln(const char *s);      /* a string followed by CR LF              */
 void t_putu(unsigned value);      /* an unsigned decimal number              */
+void t_putul(unsigned long value);/* a 32-bit unsigned decimal number        */
 
 /* Line input via INT 21h AH=0Ah. Returns the length, NUL-terminates `out`,
  * and echoes a CR LF so the caller lands on a fresh line. `max` is capped to
