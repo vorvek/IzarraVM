@@ -16443,6 +16443,97 @@ mod tests {
         assert!(device_chain_contains(&mut machine, b"TESTDEV "));
     }
 
+    /// Walk the published device chain (AH=52h) and return the (segment, offset)
+    /// header of the device whose 8-byte name matches, or None.
+    fn device_header_for(machine: &mut Machine, name: &[u8; 8]) -> Option<(u16, u16)> {
+        let mut regs = izarravm_dos::DosRegs {
+            ax: 0x5200,
+            ..izarravm_dos::DosRegs::default()
+        };
+        machine
+            .dos
+            .dispatch(0x21, &mut regs, &mut machine.memory)
+            .unwrap();
+        let mut seg = regs.es;
+        let mut off = regs.bx.wrapping_add(0x22); // NUL header
+        for _ in 0..32 {
+            if seg == 0xffff && off == 0xffff {
+                break;
+            }
+            let header = (u32::from(seg) << 4) + u32::from(off);
+            let mut found = [0u8; 8];
+            for (i, slot) in found.iter_mut().enumerate() {
+                *slot = machine.read_physical_u8(header + 0x0a + i as u32);
+            }
+            if &found == name {
+                return Some((seg, off));
+            }
+            off = machine.read_guest_word(header);
+            seg = machine.read_guest_word(header + 2);
+        }
+        None
+    }
+
+    #[test]
+    fn testdev_sys_round_trips_bytes_through_read_and_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = izarravm_firmware::toka_dos_system_files();
+        izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format)
+            .unwrap();
+        let src =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../c_drive/TESTDEV.SYS");
+        std::fs::copy(&src, dir.path().join("TESTDEV.SYS")).unwrap();
+        std::fs::write(
+            dir.path().join("CONFIG.SYS"),
+            "DEVICE=C:\\TESTDEV.SYS\r\nDOS=HIGH,UMB\r\n",
+        )
+        .unwrap();
+
+        let mut machine = test_machine();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        machine.set_toka_c_root(dir.path().to_path_buf());
+        machine.perform_toka_service(0x10);
+        assert_eq!(machine.toka_service_status, 0);
+
+        let (seg, off) = device_header_for(&mut machine, b"TESTDEV ").expect("TESTDEV linked");
+        let header = izarravm_dos::FarPtr {
+            segment: seg,
+            offset: off,
+        };
+
+        // WRITE five bytes from a guest buffer high in conventional memory.
+        let xfer = izarravm_dos::FarPtr {
+            segment: 0x4000,
+            offset: 0,
+        };
+        for (i, b) in b"HELLO".iter().enumerate() {
+            machine.memory.write_u8(0x40000 + i, *b).unwrap();
+        }
+        let (written, werr) = machine.service_device_call(header, 8, xfer, 5).unwrap();
+        assert!(!werr);
+        assert_eq!(written, 5);
+        // WRITE ran on the CPU: unit-tester register 2 holds 'W'.
+        assert_eq!(read_unittester_reg(&mut machine, 2), 0x57);
+
+        // READ the bytes back into a different buffer and compare.
+        let back = izarravm_dos::FarPtr {
+            segment: 0x4100,
+            offset: 0,
+        };
+        for i in 0..5 {
+            machine.memory.write_u8(0x41000 + i, 0).unwrap();
+        }
+        let (read, rerr) = machine.service_device_call(header, 4, back, 5).unwrap();
+        assert!(!rerr);
+        assert_eq!(read, 5);
+        let got: Vec<u8> = (0..5)
+            .map(|i| machine.memory.read_u8(0x41000 + i).unwrap())
+            .collect();
+        assert_eq!(&got, b"HELLO");
+        // READ ran on the CPU: unit-tester register 1 holds 'R'.
+        assert_eq!(read_unittester_reg(&mut machine, 1), 0x52);
+    }
+
     #[test]
     fn toka_dos_boots_through_the_bios_to_the_prompt() {
         let dir = tempfile::tempdir().unwrap();
