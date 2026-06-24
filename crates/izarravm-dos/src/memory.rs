@@ -829,9 +829,10 @@ pub(super) fn write_sysvars(
 }
 
 /// Insert the loaded-driver headers into the chain after NUL: NUL -> driver[0] ->
-/// ... -> driver[n] -> the first built-in device. Called on every SysVars rebuild
-/// so the loaded list survives the rebuild. Each far pointer is (segment, offset)
-/// of a loaded device header.
+/// ... -> driver[n] -> the first built-in device. The list is most-recently-loaded
+/// first, so driver[0] is the last `.SYS` CONFIG.SYS loaded and sits nearest NUL.
+/// Called on every SysVars rebuild so the loaded list survives the rebuild. Each
+/// far pointer is (segment, offset) of a loaded device header.
 fn splice_loaded_devices(
     mem: &mut Memory,
     nul: usize,

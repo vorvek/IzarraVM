@@ -4927,6 +4927,13 @@ impl Machine {
                 .trim_start_matches("C:\\")
                 .trim_start_matches("c:\\")
                 .replace('\\', "/");
+            // Anything that still names a drive or starts at the filesystem root
+            // would escape the C: root once joined (PathBuf::join replaces the base
+            // on a rooted component). Refuse it the same way a missing file reports.
+            if rel.contains(':') || rel.starts_with('/') || rel.starts_with('\\') {
+                self.dos.write_boot_message(&format!("{label} not found"));
+                continue;
+            }
             let Ok(image) = std::fs::read(root.join(&rel)) else {
                 self.dos.write_boot_message(&format!("{label} not found"));
                 continue;
@@ -4974,12 +4981,14 @@ impl Machine {
 
     /// Far-call a device-driver entry on the real CPU with ES:BX = the request
     /// header, running until its RETF lands on the HLT sentinel (or the budget runs
-    /// out). Returns whether the request reported DONE with no error bit. The full
-    /// CPU register state and the clock are snapshotted and restored, so the nested
-    /// run is invisible to the outer boot timeline and to the guest that issued the
-    /// service. Success is decided by the request-header DONE bit, not by where IP
-    /// stops: a bare HLT can resume on a timer wake, and the budget bounds a driver
-    /// that never returns.
+    /// out). Returns whether the request reported DONE with no error bit. The CPU
+    /// register context is snapshotted and restored, so the call is transparent to
+    /// the guest that issued the service. INIT runs with interrupts disabled, the
+    /// way real DOS SYSINIT loads drivers. Time genuinely passes: the nested run
+    /// advances the PIT, PIC, RTC, and video like any other run, and the boot clock
+    /// absorbs the INIT cost, so the clock and the devices stay consistent. Success
+    /// is decided by the request-header DONE bit, not by where IP stops: a bare HLT
+    /// can resume on a timer wake, and the budget bounds a driver that never returns.
     fn call_driver_init(
         &mut self,
         entry: (u16, u16),
@@ -4987,41 +4996,47 @@ impl Machine {
     ) -> Result<bool, MachineError> {
         use izarravm_cpu::{SegmentIndex, SegmentRegister};
         let saved_regs = self.cpu.registers.clone();
-        let saved_clocks = self.elapsed_clocks;
         let saved_halted = self.cpu.halted;
 
-        // Far-return frame: SS:SP -> [sentinel IP][sentinel CS]. RETF pops IP then
-        // CS, so the driver returns to the HLT sentinel in segment 0.
-        let sp = SYSINIT_SCRATCH_STACK_SP;
-        let stack = usize::from(SYSINIT_SCRATCH_STACK_SEG) * 16 + usize::from(sp);
-        self.memory.write_u16(stack, SYSINIT_HALT_STUB as u16)?; // return IP
-        self.memory.write_u16(stack + 2, 0x0000)?; // return CS (HLT stub is in seg 0)
+        // Borrow the CPU register context for the nested call, then restore it on
+        // every path. Time passes for real, so the clock is deliberately not saved.
+        let outcome: Result<bool, MachineError> = (|| {
+            // Far-return frame: SS:SP -> [sentinel IP][sentinel CS]. RETF pops IP then
+            // CS, so the driver returns to the HLT sentinel in segment 0.
+            let sp = SYSINIT_SCRATCH_STACK_SP;
+            let stack = usize::from(SYSINIT_SCRATCH_STACK_SEG) * 16 + usize::from(sp);
+            self.memory.write_u16(stack, SYSINIT_HALT_STUB as u16)?; // return IP
+            self.memory.write_u16(stack + 2, 0x0000)?; // return CS (HLT stub is in seg 0)
 
-        self.cpu.registers.set_segment(
-            SegmentIndex::Ss,
-            SegmentRegister::real(SYSINIT_SCRATCH_STACK_SEG),
-        );
-        self.cpu.registers.set_esp(u32::from(sp));
-        self.cpu
-            .registers
-            .set_segment(SegmentIndex::Es, SegmentRegister::real(request.0));
-        self.cpu.registers.set_ebx(u32::from(request.1));
-        self.cpu
-            .registers
-            .set_segment(SegmentIndex::Cs, SegmentRegister::real(entry.0));
-        self.cpu.registers.eip = u32::from(entry.1);
-        self.cpu.halted = false;
+            self.cpu.registers.set_segment(
+                SegmentIndex::Ss,
+                SegmentRegister::real(SYSINIT_SCRATCH_STACK_SEG),
+            );
+            self.cpu.registers.set_esp(u32::from(sp));
+            self.cpu
+                .registers
+                .set_segment(SegmentIndex::Es, SegmentRegister::real(request.0));
+            self.cpu.registers.set_ebx(u32::from(request.1));
+            self.cpu
+                .registers
+                .set_segment(SegmentIndex::Cs, SegmentRegister::real(entry.0));
+            self.cpu.registers.eip = u32::from(entry.1);
+            // Clear IF (bit 9) so the nested run does not vector a hardware IRQ into
+            // the borrowed driver context, matching DOS SYSINIT loading with
+            // interrupts off.
+            self.cpu.registers.eflags &= !0x0000_0200;
+            self.cpu.halted = false;
 
-        let _ = self.run_until_halt_or_cycles(SYSINIT_INIT_BUDGET)?;
+            let _ = self.run_until_halt_or_cycles(SYSINIT_INIT_BUDGET)?;
 
-        let req_lin = usize::from(request.0) * 16 + usize::from(request.1);
-        let status = self.memory.read_u16(req_lin + 3)?;
-        let ok = status & 0x0100 != 0 && status & 0x8000 == 0;
+            let req_lin = usize::from(request.0) * 16 + usize::from(request.1);
+            let status = self.memory.read_u16(req_lin + 3)?;
+            Ok(status & 0x0100 != 0 && status & 0x8000 == 0)
+        })();
 
         self.cpu.registers = saved_regs;
         self.cpu.halted = saved_halted;
-        self.elapsed_clocks = saved_clocks;
-        Ok(ok)
+        outcome
     }
 
     /// Mirror any DOS console output produced since the last call onto the VGA
@@ -7530,6 +7545,7 @@ mod tests {
         let req = 0x40000usize;
         m.memory.write_u16(req + 3, 0).unwrap();
 
+        use izarravm_cpu::SegmentIndex;
         let saved = m.cpu.registers.clone();
         let saved_clocks = m.elapsed_clocks;
 
@@ -7539,8 +7555,31 @@ mod tests {
 
         assert!(ok); // DONE seen, no error bit
         assert_eq!(m.memory.read_u16(req + 3).unwrap(), 0x0100);
-        assert_eq!(m.cpu.registers, saved); // outer CPU state restored
-        assert_eq!(m.elapsed_clocks, saved_clocks); // timeline restored
+        // The borrowed CPU register context is restored on every path.
+        assert_eq!(
+            m.cpu.registers.segment(SegmentIndex::Ss).selector,
+            saved.segment(SegmentIndex::Ss).selector,
+            "SS restored"
+        );
+        assert_eq!(m.cpu.registers.esp(), saved.esp(), "ESP/SP restored");
+        assert_eq!(
+            m.cpu.registers.segment(SegmentIndex::Es).selector,
+            saved.segment(SegmentIndex::Es).selector,
+            "ES restored"
+        );
+        assert_eq!(m.cpu.registers.ebx(), saved.ebx(), "EBX restored");
+        assert_eq!(
+            m.cpu.registers.cs().selector,
+            saved.cs().selector,
+            "CS restored"
+        );
+        assert_eq!(m.cpu.registers.eip, saved.eip, "EIP restored");
+        assert_eq!(m.cpu.registers, saved); // whole register file restored
+        // INIT runs on the real CPU, so the boot clock advances; it is not rewound.
+        assert!(
+            m.elapsed_clocks >= saved_clocks,
+            "clock advanced, not rewound"
+        );
     }
 
     #[test]
