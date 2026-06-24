@@ -677,6 +677,7 @@ pub(super) fn write_sysvars(
     lastdrive: Option<u8>,
     file_count: u16,
     host_files: &[SftHostFileEntry],
+    loaded_devices: &[(u16, u16)],
 ) -> Result<(u16, u16), DosError> {
     let base = usize::from(SYSVARS_SEG) * 16;
     let layout = sysvars_layout(first_mcb, lastdrive, file_count);
@@ -819,7 +820,48 @@ pub(super) fn write_sysvars(
     }
     write_character_device_header(mem, con, clock_ptr, SYSVARS_SEG, 0x8013, b"CON     ")?;
     write_character_device_header(mem, clock, 0xffff, 0xffff, 0x8008, b"CLOCK$  ")?;
+    // Re-link any CONFIG.SYS-loaded drivers between NUL and the first built-in
+    // device. write_sysvars rebuilds the skeleton on every AH=52h query, so the
+    // loaded list is the source of truth and is spliced back in each time. The head
+    // NUL points at when no drivers are loaded is the first built-in (EMM or CON).
+    splice_loaded_devices(mem, nul, ems_present, con_ptr, loaded_devices)?;
     Ok((SYSVARS_SEG, 0x0002))
+}
+
+/// Insert the loaded-driver headers into the chain after NUL: NUL -> driver[0] ->
+/// ... -> driver[n] -> the first built-in device. Called on every SysVars rebuild
+/// so the loaded list survives the rebuild. Each far pointer is (segment, offset)
+/// of a loaded device header.
+fn splice_loaded_devices(
+    mem: &mut Memory,
+    nul: usize,
+    ems_present: bool,
+    con_ptr: u16,
+    loaded_devices: &[(u16, u16)],
+) -> Result<(), DosError> {
+    if loaded_devices.is_empty() {
+        return Ok(());
+    }
+    let builtin_head = if ems_present {
+        ((2 + EMM_DEVICE_OFF) as u16, SYSVARS_SEG)
+    } else {
+        (con_ptr, SYSVARS_SEG)
+    };
+    // NUL points at the first loaded driver.
+    let (first_seg, first_off) = loaded_devices[0];
+    mem.write_u16(nul, first_off)?;
+    mem.write_u16(nul + 2, first_seg)?;
+    // Each loaded driver points at the next; the last points at the first built-in.
+    for (i, &(seg, off)) in loaded_devices.iter().enumerate() {
+        let header = usize::from(seg) * 16 + usize::from(off);
+        let (next_off, next_seg) = match loaded_devices.get(i + 1) {
+            Some(&(ns, no)) => (no, ns),
+            None => builtin_head,
+        };
+        mem.write_u16(header, next_off)?;
+        mem.write_u16(header + 2, next_seg)?;
+    }
+    Ok(())
 }
 
 /// Refresh the DOS 4.x-style live prefix of the Swappable Data Area and return
@@ -874,6 +916,15 @@ pub(super) fn write_sda(
 /// owner PSP word (0 = free), the data size in paragraphs, three reserved bytes,
 /// and the 8-byte owner name. The header occupies the paragraph at `seg`; the
 /// block's data starts at `seg + 1`.
+/// Stamp the owner field of the MCB whose data segment is `seg`, so a resident
+/// driver block is owned by the system PSP and never reclaimed at program exit.
+/// The MCB header is the paragraph below the data segment; owner is at +1.
+pub(super) fn stamp_mcb_owner(mem: &mut Memory, seg: u16, owner: u16) -> Result<(), DosError> {
+    let mcb = usize::from(seg.wrapping_sub(1)) * 16;
+    mem.write_u16(mcb + 1, owner)?;
+    Ok(())
+}
+
 pub(super) fn write_mcb_header(
     mem: &mut Memory,
     seg: u16,
@@ -1155,7 +1206,7 @@ mod tests {
         }
         // A low first_mcb forces a large SysVars structure (the worst case for
         // overrunning low memory toward the stub cluster).
-        write_sysvars(&mut mem, 0x0100, false, Some(b'E'), 40, &[]).unwrap();
+        write_sysvars(&mut mem, 0x0100, false, Some(b'E'), 40, &[], &[]).unwrap();
         for addr in 0x600..0x640 {
             assert_eq!(
                 mem.read_u8(addr).unwrap(),

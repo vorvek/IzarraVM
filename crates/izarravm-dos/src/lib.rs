@@ -11,16 +11,16 @@ mod driver;
 mod memory;
 
 pub use driver::{
-    DeviceHeaderInfo, DriverLoadError, InitResult, build_init_request, parse_device_header,
-    read_init_result,
+    DEVICE_HEADER_LEN, DeviceHeaderInfo, DriverLoadError, InitResult, build_init_request,
+    parse_device_header, read_init_result,
 };
 
 use memory::{
     ARENA_TOP, Arena, ResizeError, SDA_ALWAYS_SWAPPED_LEN, SDA_IN_DOS_SWAPPED_LEN,
     SdaCriticalError, SdaSnapshot, SftHostFileEntry, UmbArena, allocate_strategy, free_routed,
     free_umb_blocks_owned_by, is_valid_alloc_strategy, mcb_chain_is_complete, release_umb,
-    request_umb, resize_routed, resize_umb, set_umb_owner, set_umb_region, write_child_program_mcb,
-    write_env_mcb, write_free_mcb_to_cap, write_sda, write_sysvars,
+    request_umb, resize_routed, resize_umb, set_umb_owner, set_umb_region, stamp_mcb_owner,
+    write_child_program_mcb, write_env_mcb, write_free_mcb_to_cap, write_sda, write_sysvars,
 };
 #[cfg(test)]
 use memory::{NO_NAME, RamMcb, read_mcb_chain, write_mcb_header};
@@ -727,6 +727,46 @@ struct ProgramContext {
     free_base: u16,
 }
 
+/// A raw `.SYS` image placed resident and ready to have INIT run on the CPU. The
+/// machine far-calls strategy then interrupt with `request_ptr`, then finalizes or
+/// aborts based on the request-header status.
+#[derive(Debug, Clone, Copy)]
+pub struct StagedDriver {
+    /// Image base; the device header is at driver_seg:0.
+    pub driver_seg: u16,
+    /// (segment, offset) entry for the strategy routine.
+    pub strategy: (u16, u16),
+    /// (segment, offset) entry for the interrupt routine.
+    pub interrupt: (u16, u16),
+    /// Linear address of the INIT request header.
+    pub request_linear: usize,
+    /// (segment, offset) far pointer to the INIT request header.
+    pub request_ptr: (u16, u16),
+}
+
+/// Why staging a `.SYS` driver failed. The SYSINIT loop reports and continues.
+#[derive(Debug)]
+pub enum DriverStageError {
+    /// The header could not be parsed (MZ format, or malformed).
+    Load(DriverLoadError),
+    /// No resident block large enough for the image plus its scratch paragraph.
+    OutOfMemory,
+    /// A guest memory fault while copying the image or building the request.
+    Memory(DosError),
+}
+
+impl From<DosError> for DriverStageError {
+    fn from(error: DosError) -> Self {
+        DriverStageError::Memory(error)
+    }
+}
+
+impl From<BusError> for DriverStageError {
+    fn from(error: BusError) -> Self {
+        DriverStageError::Memory(DosError::Memory(error))
+    }
+}
+
 /// The stateful DOS kernel. Owns the host-side state that must survive between
 /// INT 21h calls: the open-file handle table and the mounted C: drive, plus the
 /// standard input and output buffers (high-level emulated, HLE). The machine
@@ -804,6 +844,10 @@ pub struct DosKernel {
     last_error: u16,
     // Active INT 24h critical-error callback state. None outside the callback.
     critical_error: Option<ActiveCriticalError>,
+    // Far pointers (segment, offset) to CONFIG.SYS-loaded device-driver headers, in
+    // load order. write_sysvars rebuilds the device-chain skeleton on every AH=52h
+    // query, so these are re-spliced after NUL each time to survive the rebuild.
+    loaded_devices: Vec<(u16, u16)>,
 }
 
 impl DosKernel {
@@ -819,6 +863,14 @@ impl DosKernel {
     /// The bytes written to standard output so far.
     pub fn stdout(&self) -> &[u8] {
         &self.stdout
+    }
+
+    /// Append a SYSINIT boot message to the DOS console buffer, CR/LF-terminated.
+    /// The machine mirrors the console onto the VGA screen, so this is the same
+    /// path DOS uses to print device-load feedback at boot.
+    pub fn write_boot_message(&mut self, text: &str) {
+        self.stdout.extend_from_slice(text.as_bytes());
+        self.stdout.extend_from_slice(b"\r\n");
     }
 
     /// Replace the wall clock (host-time wiring is a later option; default is fixed).
@@ -867,6 +919,86 @@ impl DosKernel {
         self.last_exit_type = 0;
         self.critical_error = None;
         self.seed_standard_handles();
+        Ok(())
+    }
+
+    /// Allocate a resident block, copy the raw `.SYS` image flat, stamp the owner
+    /// to the system PSP, and build the INIT request header with the argument tail.
+    /// The block carries one spare paragraph above the image for the request header
+    /// and the CR-terminated tail. The caller runs INIT on the CPU, then calls
+    /// finalize_sys_driver on success or abort_sys_driver on failure.
+    pub fn stage_sys_driver(
+        &mut self,
+        image: &[u8],
+        args: &str,
+        mem: &mut Memory,
+    ) -> Result<StagedDriver, DriverStageError> {
+        let info = parse_device_header(image).map_err(DriverStageError::Load)?;
+        let image_paras = u16::try_from((image.len() as u32).div_ceil(16))
+            .map_err(|_| DriverStageError::OutOfMemory)?;
+        // Spare paragraphs above the image for the request header (the arg tail
+        // starts at offset 0x20) plus the CR-terminated tail itself.
+        let arg_off = 0x20u16; // past the 0x17-byte request header, room to spare
+        let scratch_bytes = u32::from(arg_off) + args.len() as u32 + 1;
+        let scratch_paras =
+            u16::try_from(scratch_bytes.div_ceil(16)).map_err(|_| DriverStageError::OutOfMemory)?;
+        let seg = match self.arena.allocate(image_paras + scratch_paras, mem)? {
+            Ok(seg) => seg,
+            Err(_) => return Err(DriverStageError::OutOfMemory),
+        };
+        stamp_mcb_owner(mem, seg, self.arena.psp_seg)?;
+        let base = usize::from(seg) * 16;
+        for (i, &b) in image.iter().enumerate() {
+            mem.write_u8(base + i, b)?;
+        }
+        // Request header and arg tail in the spare trailing paragraphs.
+        let request_seg = seg + image_paras;
+        let request_linear = usize::from(request_seg) * 16;
+        let arg_linear = request_linear + usize::from(arg_off);
+        for (i, &b) in args.as_bytes().iter().enumerate() {
+            mem.write_u8(arg_linear + i, b)?;
+        }
+        mem.write_u8(arg_linear + args.len(), 0x0d)?; // CR-terminate the tail
+        let break_default = (seg, image_paras.wrapping_mul(16)); // end of image
+        build_init_request(mem, request_linear, break_default, (request_seg, arg_off))?;
+        Ok(StagedDriver {
+            driver_seg: seg,
+            strategy: (seg, info.strategy),
+            interrupt: (seg, info.interrupt),
+            request_linear,
+            request_ptr: (request_seg, 0x00),
+        })
+    }
+
+    /// INIT succeeded: trim the resident block to the returned break address (DOS
+    /// reclaims the INIT-only tail) and record the header so AH=52h lists it.
+    pub fn finalize_sys_driver(
+        &mut self,
+        staged: &StagedDriver,
+        mem: &mut Memory,
+    ) -> Result<(), DosError> {
+        let result = read_init_result(mem, staged.request_linear)?;
+        // Break address in paragraphs above the block base. The break offset rounds
+        // up to a paragraph. The resident block must keep at least the device header
+        // (0x12 bytes), so the free-tail MCB the trim writes never lands inside it.
+        let header_paras = (DEVICE_HEADER_LEN as u16).div_ceil(16);
+        let break_paras = result
+            .break_seg
+            .wrapping_sub(staged.driver_seg)
+            .wrapping_add((result.break_off + 15) >> 4)
+            .max(header_paras);
+        let _ = self.arena.resize(staged.driver_seg, break_paras, mem)?; // best-effort trim
+        self.loaded_devices.push((staged.driver_seg, 0x0000));
+        Ok(())
+    }
+
+    /// INIT failed or never returned: return the resident block to free memory.
+    pub fn abort_sys_driver(
+        &mut self,
+        staged: &StagedDriver,
+        mem: &mut Memory,
+    ) -> Result<(), DosError> {
+        let _ = self.arena.free(staged.driver_seg, mem)?;
         Ok(())
     }
 
@@ -1104,6 +1236,9 @@ impl DosKernel {
         // by the machine's furnish step (set_umb_region) on the same boot.
         self.umb_link = false;
         self.alloc_strategy = 0;
+        // A warm reboot reloads CONFIG.SYS drivers from scratch; drop the prior
+        // session's loaded-device list so the chain starts at the bare skeleton.
+        self.loaded_devices.clear();
         build_psp(mem, psp_seg, ARENA_TOP)?;
         let prog_top = psp_seg.saturating_add(0x10); // the system PSP is its 256 bytes
         self.init_program(psp_seg, prog_top, mem)?;
@@ -3520,6 +3655,7 @@ impl DosKernel {
                     lastdrive,
                     file_count,
                     &host_files,
+                    &self.loaded_devices,
                 )?;
                 regs.es = es;
                 regs.bx = bx;
@@ -6418,6 +6554,97 @@ mod tests {
         };
         kernel.dispatch(0x21, &mut regs, mem).unwrap();
         regs
+    }
+
+    /// Total free conventional paragraphs: the sum of every owner-0 block's data
+    /// size in the program's MCB chain.
+    fn conventional_free_paragraphs(kernel: &DosKernel, mem: &Memory) -> u32 {
+        read_mcb_chain(mem, kernel.arena.first_mcb())
+            .iter()
+            .filter(|m| m.owner == 0)
+            .map(|m| u32::from(m.size))
+            .sum()
+    }
+
+    /// Walk the device chain from the SysVars first-device pointer (the NUL header)
+    /// and return each 8-byte device name. The kernel publishes the chain through
+    /// AH=52h; this reads the same structure NUL heads.
+    fn device_chain_names(mem: &Memory) -> Vec<[u8; 8]> {
+        // NUL sits at SYSVARS_SEG:0x24 (the 2-byte first-MCB field precedes the
+        // device area). Follow next pointers until the FFFF:FFFF terminator.
+        let mut names = Vec::new();
+        let mut off = 0x0024u16;
+        let mut seg = 0x0064u16;
+        for _ in 0..32 {
+            if seg == 0xffff && off == 0xffff {
+                break;
+            }
+            let header = usize::from(seg) * 16 + usize::from(off);
+            let mut name = [0u8; 8];
+            for (i, slot) in name.iter_mut().enumerate() {
+                *slot = mem.read_u8(header + 0x0a + i).unwrap_or(0);
+            }
+            names.push(name);
+            let next_off = mem.read_u16(header).unwrap_or(0xffff);
+            let next_seg = mem.read_u16(header + 2).unwrap_or(0xffff);
+            off = next_off;
+            seg = next_seg;
+        }
+        names
+    }
+
+    /// Lay the SysVars device-chain skeleton by issuing an AH=52h query, then walk
+    /// it. Used to check a loaded driver survives the SysVars rebuild.
+    fn published_device_chain(kernel: &mut DosKernel, mem: &mut Memory) -> Vec<[u8; 8]> {
+        let mut regs = DosRegs {
+            ax: 0x5200,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, mem).unwrap();
+        device_chain_names(mem)
+    }
+
+    #[test]
+    fn staging_allocates_copies_and_finalize_splices_after_nul() {
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let mut dos = DosKernel::new();
+        dos.init_program(0x0100, 0x1100, &mut mem).unwrap();
+        let image = driver::tests_char_image();
+
+        let staged = dos.stage_sys_driver(&image, "RAM", &mut mem).unwrap();
+        // Image copied flat to the block; header readable at block:0.
+        let base = usize::from(staged.driver_seg) * 16;
+        assert_eq!(mem.read_u16(base + 4).unwrap(), 0x8000); // attribute survived copy
+        // Request header built but INIT not run yet.
+        let r = driver::read_init_result(&mem, staged.request_linear).unwrap();
+        assert!(!r.done);
+
+        // Simulate a successful INIT: DONE, break = one paragraph of resident code.
+        mem.write_u16(staged.request_linear + 0x03, 0x0100).unwrap();
+        mem.write_u16(staged.request_linear + 0x0e, 0x0010).unwrap();
+        mem.write_u16(staged.request_linear + 0x10, staged.driver_seg)
+            .unwrap();
+
+        dos.finalize_sys_driver(&staged, &mut mem).unwrap();
+
+        // The published chain lists the driver between NUL and the first built-in.
+        let names = published_device_chain(&mut dos, &mut mem);
+        assert_eq!(names.first(), Some(b"NUL     "));
+        assert_eq!(names.get(1), Some(b"TESTDEV "));
+        assert!(names.iter().any(|n| n == b"CON     "));
+    }
+
+    #[test]
+    fn abort_frees_a_failed_driver_block() {
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let mut dos = DosKernel::new();
+        dos.init_program(0x0100, 0x1100, &mut mem).unwrap();
+        let image = driver::tests_char_image();
+        let before = conventional_free_paragraphs(&dos, &mem);
+        let staged = dos.stage_sys_driver(&image, "", &mut mem).unwrap();
+        assert!(conventional_free_paragraphs(&dos, &mem) < before); // block taken
+        dos.abort_sys_driver(&staged, &mut mem).unwrap();
+        assert_eq!(conventional_free_paragraphs(&dos, &mem), before); // block returned
     }
 
     fn umb_test_kernel() -> (DosKernel, Memory) {
