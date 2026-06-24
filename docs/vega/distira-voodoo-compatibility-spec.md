@@ -421,7 +421,10 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
       gates.
 - [x] Iteration 11: alpha test for untextured integer Voodoo triangles.
       Validated by the video alpha rejection test plus the workspace gates.
-- [ ] Next: float alpha and alpha derivative registers for `SST_ftriangleCMD`.
+- [x] Iteration 12: float alpha and alpha derivative registers for
+      `SST_ftriangleCMD`. Validated by the video float-alpha rejection test plus
+      the workspace gates.
+- [ ] Next: alpha blending for untextured Voodoo triangles.
 
 ## First 90 percent push for this branch
 

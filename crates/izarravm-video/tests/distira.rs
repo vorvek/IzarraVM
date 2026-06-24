@@ -423,6 +423,46 @@ fn triangle_cmd_alpha_test_rejects_pixels_below_reference() {
 }
 
 #[test]
+fn ftriangle_cmd_alpha_test_uses_float_alpha_derivatives() {
+    const SST_FSTART_A: usize = 0x0b0;
+    const SST_FDA_DX: usize = 0x0d0;
+    const SST_FBI_AFUNC_FAIL: usize = 0x158;
+    const AFUNC_GREATER_THAN: u32 = 4;
+    const ALPHA_TEST_ENABLE: u32 = 1;
+
+    let mut distira = Distira::new();
+    distira.set_frame_size(4, 4);
+    distira.clear_back_rgb(0, 0, 0);
+
+    write_reg(&mut distira, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
+    write_reg(
+        &mut distira,
+        SST_ALPHA_MODE,
+        (96 << 24) | (AFUNC_GREATER_THAN << 1) | ALPHA_TEST_ENABLE,
+    );
+    write_reg(&mut distira, SST_FVERTEX_AX, 0.0f32.to_bits());
+    write_reg(&mut distira, SST_FVERTEX_AY, 0.0f32.to_bits());
+    write_reg(&mut distira, SST_FVERTEX_BX, 3.0f32.to_bits());
+    write_reg(&mut distira, SST_FVERTEX_BY, 0.0f32.to_bits());
+    write_reg(&mut distira, SST_FVERTEX_CX, 0.0f32.to_bits());
+    write_reg(&mut distira, SST_FVERTEX_CY, 3.0f32.to_bits());
+    write_reg(&mut distira, SST_FSTART_R, 255.0f32.to_bits());
+    write_reg(&mut distira, SST_FSTART_G, 0.0f32.to_bits());
+    write_reg(&mut distira, SST_FSTART_B, 0.0f32.to_bits());
+    write_reg(&mut distira, SST_FSTART_A, 0.0f32.to_bits());
+    write_reg(&mut distira, SST_FDA_DX, 100.0f32.to_bits());
+
+    write_reg(&mut distira, SST_FTRIANGLE_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+
+    let frame = distira.scanout_argb();
+    assert_eq!(frame[0], 0x0000_0000);
+    assert_eq!(frame[1], 0x00ff_0000);
+    assert_eq!(frame[2], 0x00ff_0000);
+    assert_ne!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 0);
+}
+
+#[test]
 fn motherboard_chip_names_are_big_distira_and_small_distira() {
     let distira = Distira::new();
 
