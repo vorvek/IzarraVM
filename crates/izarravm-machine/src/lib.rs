@@ -253,7 +253,10 @@ struct ProgramFrame {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingCriticalError {
-    Int26WriteProtect { return_to: izarravm_dos::FarPtr },
+    AbsoluteDisk {
+        return_to: izarravm_dos::FarPtr,
+        ax: u16,
+    },
 }
 
 /// The OPL3 renders at this native rate; the Resonique 2 DAC outputs at 44100.
@@ -1178,13 +1181,13 @@ impl Machine {
         response: izarravm_dos::CriticalErrorResponse,
     ) {
         match pending {
-            PendingCriticalError::Int26WriteProtect { return_to } => {
+            PendingCriticalError::AbsoluteDisk { return_to, ax } => {
                 match response {
                     izarravm_dos::CriticalErrorResponse::Ignore
                     | izarravm_dos::CriticalErrorResponse::Retry
                     | izarravm_dos::CriticalErrorResponse::Abort
                     | izarravm_dos::CriticalErrorResponse::Fail => {
-                        self.set_ax(0x0300);
+                        self.set_ax(ax);
                         self.set_int_frame_carry(true);
                     }
                 }
@@ -1195,17 +1198,24 @@ impl Machine {
         }
     }
 
-    fn start_int26_write_protect_critical_error(&mut self, drive: u8) {
+    fn start_int25_26_critical_error(
+        &mut self,
+        drive: u8,
+        error_code: u8,
+        write: bool,
+        area: izarravm_dos::CriticalErrorArea,
+        ax: u16,
+    ) {
         let return_to = izarravm_dos::FarPtr {
             segment: self.cpu.registers.cs().selector,
             offset: self.cpu.registers.eip as u16,
         };
-        let pending = PendingCriticalError::Int26WriteProtect { return_to };
+        let pending = PendingCriticalError::AbsoluteDisk { return_to, ax };
         let request = izarravm_dos::CriticalErrorRequest::disk(
             drive,
-            0x00,
-            true,
-            izarravm_dos::CriticalErrorArea::Data,
+            error_code,
+            write,
+            area,
             izarravm_dos::FarPtr::default(),
         );
         let Ok(call) = self.dos.begin_critical_error(&mut self.memory, request) else {
@@ -3745,7 +3755,13 @@ impl Machine {
         // packet form (CX=FFFFh / AH=7305h) for sectors past 32 MB is a follow-up.
         if al == 0x02 && self.fat32_c.is_some() {
             if write {
-                self.start_int26_write_protect_critical_error(al);
+                self.start_int25_26_critical_error(
+                    al,
+                    0x00,
+                    true,
+                    izarravm_dos::CriticalErrorArea::Data,
+                    0x0300,
+                );
                 return;
             }
             // Stream one sector at a time: each read borrows the volume only until
@@ -3769,13 +3785,23 @@ impl Machine {
         // drive-not-ready error (AX low byte 0x02 = drive not ready, high byte 0x40
         // = seek failed, per the DOS error-byte convention).
         let Some(geom) = self.floppy.as_ref().map(|f| f.geometry()) else {
-            self.set_ax(0x4002);
-            self.set_int_frame_carry(true);
+            self.start_int25_26_critical_error(
+                al,
+                0x02,
+                write,
+                izarravm_dos::CriticalErrorArea::Data,
+                0x4002,
+            );
             return;
         };
         if al != 0x00 {
-            self.set_ax(0x4002);
-            self.set_int_frame_carry(true);
+            self.start_int25_26_critical_error(
+                al,
+                0x02,
+                write,
+                izarravm_dos::CriticalErrorArea::Data,
+                0x4002,
+            );
             return;
         }
 
@@ -3801,8 +3827,13 @@ impl Machine {
                 if !ok {
                     // Sector off the mounted media: sector-not-found (0x40 = seek
                     // failed, 0x08 = sector not found).
-                    self.set_ax(0x4008);
-                    self.set_int_frame_carry(true);
+                    self.start_int25_26_critical_error(
+                        al,
+                        0x08,
+                        true,
+                        izarravm_dos::CriticalErrorArea::Data,
+                        0x4008,
+                    );
                     return;
                 }
             } else {
@@ -3814,8 +3845,13 @@ impl Machine {
                 match data {
                     Some(bytes) => self.write_guest_block(addr, &bytes),
                     None => {
-                        self.set_ax(0x4008);
-                        self.set_int_frame_carry(true);
+                        self.start_int25_26_critical_error(
+                            al,
+                            0x08,
+                            false,
+                            izarravm_dos::CriticalErrorArea::Data,
+                            0x4008,
+                        );
                         return;
                     }
                 }
@@ -9912,6 +9948,72 @@ mod tests {
         m.cpu.registers.set_edx(0);
         m.handle_int25();
         assert_eq!(m.cpu.registers.eax() as u16, 0x4002, "drive not ready");
+    }
+
+    #[test]
+    fn int25_no_media_calls_live_int24_handler() {
+        // .COM program:
+        //   install an INT 24h handler at CS:0170
+        //   INT 25h read one sector from empty A:
+        //   exit 0 only if the handler ran, saw DOS drive-not-ready registers, and
+        //   DOS returned CF set with AX=4002 after AL=Fail from the handler.
+        let mut prog = Vec::new();
+        prog.extend_from_slice(&[
+            0xba, 0x70, 0x01, // mov dx,0170h
+            0xb8, 0x24, 0x25, // mov ax,2524h
+            0xcd, 0x21, // int 21h
+            0xc6, 0x06, 0xf0, 0x01, 0x00, // mov byte [01f0h],00h
+            0x31, 0xc0, // xor ax,ax ; drive A:
+            0xb9, 0x01, 0x00, // mov cx,0001h
+            0x31, 0xd2, // xor dx,dx
+            0xbb, 0x00, 0x02, // mov bx,0200h
+            0xcd, 0x25, // int 25h
+            0x90, // nop ; Izarra's INT 25h HLE returns CF in live flags
+            0x72, 0x05, // jc +5
+            0xb8, 0x10, 0x4c, // mov ax,4c10h
+            0xcd, 0x21, // int 21h
+            0x3d, 0x02, 0x40, // cmp ax,4002h
+            0x74, 0x05, // je +5
+            0xb8, 0x11, 0x4c, // mov ax,4c11h
+            0xcd, 0x21, // int 21h
+            0x80, 0x3e, 0xf0, 0x01, 0x01, // cmp byte [01f0h],01h
+            0x74, 0x05, // je +5
+            0xb8, 0x12, 0x4c, // mov ax,4c12h
+            0xcd, 0x21, // int 21h
+            0xa0, 0xf1, 0x01, // mov al,[01f1h]
+            0x3c, 0x00, // cmp al,00h ; drive A:
+            0x74, 0x05, // je +5
+            0xb8, 0x13, 0x4c, // mov ax,4c13h
+            0xcd, 0x21, // int 21h
+            0xa0, 0xf2, 0x01, // mov al,[01f2h]
+            0x3c, 0x3e, // cmp al,3eh ; read + data + I/R/F allowed
+            0x74, 0x05, // je +5
+            0xb8, 0x14, 0x4c, // mov ax,4c14h
+            0xcd, 0x21, // int 21h
+            0xa1, 0xf3, 0x01, // mov ax,[01f3h]
+            0x3d, 0x02, 0x00, // cmp ax,0002h ; drive not ready
+            0x74, 0x05, // je +5
+            0xb8, 0x15, 0x4c, // mov ax,4c15h
+            0xcd, 0x21, // int 21h
+            0xb8, 0x00, 0x4c, // mov ax,4c00h
+            0xcd, 0x21, // int 21h
+        ]);
+        prog.resize(0x70, 0x90);
+        prog.extend_from_slice(&[
+            0xc6, 0x06, 0xf0, 0x01, 0x01, // mov byte [01f0h],01h
+            0xa2, 0xf1, 0x01, // mov [01f1h],al
+            0x88, 0x26, 0xf2, 0x01, // mov [01f2h],ah
+            0x89, 0x3e, 0xf3, 0x01, // mov [01f3h],di
+            0xb0, 0x03, // mov al,03h ; Fail
+            0xcf, // iret
+        ]);
+        let mut m =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &prog)
+                .unwrap();
+
+        let stop = m.run_until_halt_or_cycles(1_000_000).unwrap();
+
+        assert_eq!(stop, StopReason::DosExit { code: 0 });
     }
 
     #[test]
