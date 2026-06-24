@@ -844,8 +844,9 @@ pub struct DosKernel {
     last_error: u16,
     // Active INT 24h critical-error callback state. None outside the callback.
     critical_error: Option<ActiveCriticalError>,
-    // Far pointers (segment, offset) to CONFIG.SYS-loaded device-driver headers, in
-    // load order. write_sysvars rebuilds the device-chain skeleton on every AH=52h
+    // Far pointers (segment, offset) to CONFIG.SYS-loaded device-driver headers,
+    // most-recently-loaded first (each new driver front-inserts so it links in right
+    // after NUL). write_sysvars rebuilds the device-chain skeleton on every AH=52h
     // query, so these are re-spliced after NUL each time to survive the rebuild.
     loaded_devices: Vec<(u16, u16)>,
 }
@@ -985,10 +986,12 @@ impl DosKernel {
         let break_paras = result
             .break_seg
             .wrapping_sub(staged.driver_seg)
-            .wrapping_add((result.break_off + 15) >> 4)
+            .wrapping_add(result.break_off.div_ceil(16))
             .max(header_paras);
         let _ = self.arena.resize(staged.driver_seg, break_paras, mem)?; // best-effort trim
-        self.loaded_devices.push((staged.driver_seg, 0x0000));
+        // Front-insert so the most-recently-loaded driver sits nearest NUL, the way
+        // real DOS links each new driver in right after the NUL header.
+        self.loaded_devices.insert(0, (staged.driver_seg, 0x0000));
         Ok(())
     }
 
