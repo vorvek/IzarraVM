@@ -16072,11 +16072,168 @@ mod tests {
             device_chain_contains(&mut machine, b"INLINE  "),
             "the loaded driver is linked into the device chain"
         );
-        // The boot message reached the DOS console.
+        // The boot message reached the DOS console and reports a successful install.
         let console = String::from_utf8_lossy(machine.dos_output()).into_owned();
         assert!(
             console.contains("INLINE.SYS"),
             "boot message; got:\n{console}"
+        );
+        assert!(
+            console.contains("installed"),
+            "success message; got:\n{console}"
+        );
+    }
+
+    /// Walk the published device chain (AH=52h) from the NUL header and return the
+    /// ordered list of 8-byte device names, NUL first. Lets a test check relative
+    /// load order, not just membership.
+    fn device_chain_order(machine: &mut Machine) -> Vec<[u8; 8]> {
+        let mut regs = izarravm_dos::DosRegs {
+            ax: 0x5200,
+            ..izarravm_dos::DosRegs::default()
+        };
+        machine
+            .dos
+            .dispatch(0x21, &mut regs, &mut machine.memory)
+            .unwrap();
+        let mut seg = regs.es;
+        let mut off = regs.bx.wrapping_add(0x22); // NUL header
+        let mut names = Vec::new();
+        for _ in 0..32 {
+            if seg == 0xffff && off == 0xffff {
+                break;
+            }
+            let header = (u32::from(seg) << 4) + u32::from(off);
+            let mut found = [0u8; 8];
+            for (i, slot) in found.iter_mut().enumerate() {
+                *slot = machine.read_physical_u8(header + 0x0a + i as u32);
+            }
+            names.push(found);
+            off = machine.read_guest_word(header);
+            seg = machine.read_guest_word(header + 2);
+        }
+        names
+    }
+
+    /// Build a minimal raw `.SYS` image with the given 8-byte name. The interrupt
+    /// routine writes `status` into the request header (ES:BX+3) then RETFs, so the
+    /// caller picks DONE (0x0100) or DONE+error (0x8100). Strategy is a bare RETF.
+    fn inline_sys_image(name: &[u8; 8], status: u16) -> Vec<u8> {
+        let mut img = vec![0u8; 0x20];
+        img[0..4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        img[4..6].copy_from_slice(&0x8000u16.to_le_bytes()); // character device
+        img[6..8].copy_from_slice(&0x0012u16.to_le_bytes()); // strategy off
+        img[8..10].copy_from_slice(&0x0013u16.to_le_bytes()); // interrupt off
+        img[10..18].copy_from_slice(name);
+        img[0x12] = 0xCB; // strategy: retf
+        // interrupt: mov ax,status; mov es:[bx+3],ax; retf
+        let [lo, hi] = status.to_le_bytes();
+        img[0x13..0x1B].copy_from_slice(&[0xB8, lo, hi, 0x26, 0x89, 0x47, 0x03, 0xCB]);
+        img
+    }
+
+    #[test]
+    fn config_sys_device_init_error_does_not_install_the_driver() {
+        let dir = tempfile::tempdir().unwrap();
+        // INIT sets status 0x8100 (DONE + error): the driver reports it failed.
+        let img = inline_sys_image(b"BADINIT ", 0x8100);
+
+        let files = izarravm_firmware::toka_dos_system_files();
+        izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format)
+            .unwrap();
+        std::fs::write(dir.path().join("BADINIT.SYS"), &img).unwrap();
+        std::fs::write(
+            dir.path().join("CONFIG.SYS"),
+            "DEVICE=C:\\BADINIT.SYS\r\nDOS=HIGH,UMB\r\n",
+        )
+        .unwrap();
+
+        let mut machine = test_machine();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        machine.set_toka_c_root(dir.path().to_path_buf());
+        machine.perform_toka_service(0x10);
+        assert_eq!(machine.toka_service_status, 0);
+
+        assert!(
+            !device_chain_contains(&mut machine, b"BADINIT "),
+            "a driver whose INIT errors is not linked into the chain"
+        );
+        let console = String::from_utf8_lossy(machine.dos_output()).into_owned();
+        assert!(
+            console.contains("failed to install (INIT error)"),
+            "INIT-error message; got:\n{console}"
+        );
+    }
+
+    #[test]
+    fn config_sys_skips_an_mz_format_driver() {
+        let dir = tempfile::tempdir().unwrap();
+        // An MZ-signature image: a linked .EXE-format driver, not raw .SYS.
+        let mut img = vec![0u8; 0x20];
+        img[0] = b'M';
+        img[1] = b'Z';
+
+        let files = izarravm_firmware::toka_dos_system_files();
+        izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format)
+            .unwrap();
+        std::fs::write(dir.path().join("MZDRV.SYS"), &img).unwrap();
+        std::fs::write(
+            dir.path().join("CONFIG.SYS"),
+            "DEVICE=C:\\MZDRV.SYS\r\nDOS=HIGH,UMB\r\n",
+        )
+        .unwrap();
+
+        let mut machine = test_machine();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        machine.set_toka_c_root(dir.path().to_path_buf());
+        machine.perform_toka_service(0x10);
+        assert_eq!(machine.toka_service_status, 0);
+
+        let console = String::from_utf8_lossy(machine.dos_output()).into_owned();
+        assert!(
+            console.contains("skipped (unsupported format)"),
+            "MZ driver is skipped; got:\n{console}"
+        );
+        assert!(
+            !device_chain_contains(&mut machine, b"MZDRV   "),
+            "an unsupported-format driver is not linked into the chain"
+        );
+    }
+
+    #[test]
+    fn config_sys_two_device_lines_load_front_inserted() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = inline_sys_image(b"DRVONE  ", 0x0100);
+        let second = inline_sys_image(b"DRVTWO  ", 0x0100);
+
+        let files = izarravm_firmware::toka_dos_system_files();
+        izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format)
+            .unwrap();
+        std::fs::write(dir.path().join("DRVONE.SYS"), &first).unwrap();
+        std::fs::write(dir.path().join("DRVTWO.SYS"), &second).unwrap();
+        std::fs::write(
+            dir.path().join("CONFIG.SYS"),
+            "DEVICE=C:\\DRVONE.SYS\r\nDEVICE=C:\\DRVTWO.SYS\r\nDOS=HIGH,UMB\r\n",
+        )
+        .unwrap();
+
+        let mut machine = test_machine();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        machine.set_toka_c_root(dir.path().to_path_buf());
+        machine.perform_toka_service(0x10);
+        assert_eq!(machine.toka_service_status, 0);
+
+        let order = device_chain_order(&mut machine);
+        let pos_one = order.iter().position(|n| n == b"DRVONE  ");
+        let pos_two = order.iter().position(|n| n == b"DRVTWO  ");
+        assert!(
+            pos_one.is_some() && pos_two.is_some(),
+            "both drivers linked"
+        );
+        // Front-insert: the second-loaded driver sits nearer NUL than the first.
+        assert!(
+            pos_two < pos_one,
+            "DRVTWO (loaded second) precedes DRVONE; order = {order:?}"
         );
     }
 

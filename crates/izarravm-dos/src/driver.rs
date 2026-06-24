@@ -151,6 +151,34 @@ mod tests {
     }
 
     #[test]
+    fn rejects_an_interrupt_offset_past_the_image() {
+        let mut img = tests_char_image();
+        img[8..10].copy_from_slice(&0x9000u16.to_le_bytes()); // interrupt past end
+        assert!(matches!(
+            parse_device_header(&img),
+            Err(DriverLoadError::MalformedHeader)
+        ));
+    }
+
+    #[test]
+    fn rejects_a_too_short_image() {
+        let img = vec![0u8; DEVICE_HEADER_LEN - 1]; // one byte short of a header
+        assert!(matches!(
+            parse_device_header(&img),
+            Err(DriverLoadError::MalformedHeader)
+        ));
+    }
+
+    #[test]
+    fn parses_a_block_device_header() {
+        let mut img = tests_char_image();
+        img[4..6].copy_from_slice(&0x0000u16.to_le_bytes()); // attribute: block device
+        let info = parse_device_header(&img).unwrap();
+        assert_eq!(info.attributes, 0x0000);
+        assert!(!info.is_character_device());
+    }
+
+    #[test]
     fn builds_and_reads_back_the_init_request() {
         let mut mem = Memory::new(0x20000).unwrap();
         let req = 0x1000usize;
