@@ -400,6 +400,16 @@ pub enum DosAction {
     /// keyboard ring empty. The machine rewinds the INT 21h so it re-executes
     /// after the ISR refills the ring. The kernel leaves the registers unchanged.
     WaitForKey,
+    /// Read from or write to a loaded character device. The kernel cannot far-call
+    /// the driver itself, so the machine builds the DOS request packet, far-calls
+    /// the driver's strategy then interrupt on the CPU, and writes the transferred
+    /// count (or an error) back to the program's AX and CF.
+    CallDevice {
+        header: FarPtr,   // the driver header, for the strategy/interrupt entries
+        command: u8,      // 4 = READ, 8 = WRITE
+        transfer: FarPtr, // the caller's DS:DX buffer
+        count: u16,       // the requested byte count
+    },
 }
 
 /// A real-mode far pointer, stored and passed as segment:offset.
@@ -631,10 +641,8 @@ impl OpenFile {
 
 /// An open handle on a loaded character device. The header far pointer locates
 /// the driver's strategy and interrupt entries so a read or write can far-call
-/// them; the access mode is enforced the same way a file handle's is. The fields
-/// are read by the read/write/IOCTL routing added next.
+/// them; the access mode is enforced the same way a file handle's is.
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 struct OpenDeviceHandle {
     header: FarPtr,
     mode: AccessMode,
@@ -3034,6 +3042,29 @@ impl DosKernel {
                     regs.cf = false;
                     return Ok(DosAction::Continue);
                 }
+                // A loaded character device: route the read to its driver. A
+                // read-only check matches the file path; a zero count is a 0-byte
+                // success with no driver call, like the handle-0 short-circuit.
+                if let Some(dev) = self.device_handles.get(&handle).copied() {
+                    if !dev.mode.can_read() {
+                        set_dos_error(regs, 0x05); // access denied
+                        return Ok(DosAction::Continue);
+                    }
+                    if regs.cx == 0 {
+                        regs.ax = 0;
+                        regs.cf = false;
+                        return Ok(DosAction::Continue);
+                    }
+                    return Ok(DosAction::CallDevice {
+                        header: dev.header,
+                        command: 4,
+                        transfer: FarPtr {
+                            segment: regs.ds,
+                            offset: regs.dx,
+                        },
+                        count: regs.cx,
+                    });
+                }
                 let Some(of) = self.open_files.get(&handle) else {
                     set_dos_error(regs, 0x06);
                     return Ok(DosAction::Continue);
@@ -3471,6 +3502,29 @@ impl DosKernel {
                     regs.ax = regs.cx;
                     regs.cf = false;
                     return Ok(DosAction::Continue);
+                }
+                // A loaded character device: route the write to its driver. A
+                // write-access check matches the file path; a zero count is a
+                // 0-byte success with no driver call.
+                if let Some(dev) = self.device_handles.get(&handle).copied() {
+                    if !dev.mode.can_write() {
+                        set_dos_error(regs, 0x05); // access denied
+                        return Ok(DosAction::Continue);
+                    }
+                    if regs.cx == 0 {
+                        regs.ax = 0;
+                        regs.cf = false;
+                        return Ok(DosAction::Continue);
+                    }
+                    return Ok(DosAction::CallDevice {
+                        header: dev.header,
+                        command: 8,
+                        transfer: FarPtr {
+                            segment: regs.ds,
+                            offset: regs.dx,
+                        },
+                        count: regs.cx,
+                    });
                 }
                 // AUX (3, COM1) and PRN (4, LPT1): accept the write and report every
                 // byte written, but discard the data. The HLE has no serial or
@@ -3985,16 +4039,33 @@ impl DosKernel {
                     .get(&handle)
                     .map(|of| !of.is_console())
                     .unwrap_or(false);
-                let is_device_handle =
-                    (handle <= 4 && !host_redirected) || self.ems_handles.contains(&handle);
+                let device_handle = self.device_handles.get(&handle).copied();
+                let is_device_handle = (handle <= 4 && !host_redirected)
+                    || self.ems_handles.contains(&handle)
+                    || device_handle.is_some();
                 let valid = handle <= 4
                     || self.open_files.contains_key(&handle)
-                    || self.ems_handles.contains(&handle);
+                    || self.ems_handles.contains(&handle)
+                    || device_handle.is_some();
                 let is_character = is_device_handle;
                 let valid_drive = matches!((regs.bx & 0x00ff) as u8, 0 | 3);
                 match regs.ax as u8 {
                     0x00 => {
-                        if is_device_handle {
+                        if let Some(dev) = device_handle {
+                            // A loaded character device. Report ISDEV (bit 7) plus
+                            // the driver's IOCTL-supported capability (driver
+                            // attribute bit 14 -> info-word bit 14), the way DOS
+                            // reflects the driver's own attribute word.
+                            let base = usize::from(dev.header.segment) * 16
+                                + usize::from(dev.header.offset);
+                            let attr = mem.read_u16(base + 4)?;
+                            let mut info = 0x0080u16; // ISDEV
+                            if attr & 0x4000 != 0 {
+                                info |= 0x4000; // supports IOCTL
+                            }
+                            regs.dx = info;
+                            regs.cf = false;
+                        } else if is_device_handle {
                             // A character device. Bits 0/1 identify the STDIN/STDOUT
                             // aliases (not AUX/PRN capabilities), so handles 3 and 4
                             // keep only ISDEV set.
@@ -13422,5 +13493,153 @@ mod tests {
         );
         let next = dos.alloc_handle().unwrap();
         assert_ne!(next, 5, "alloc_handle must not reuse a live device handle");
+    }
+
+    /// Set up a kernel with MYDEV loaded and open it with the given access mode,
+    /// returning the dos kernel, memory, the handle, and the device header.
+    fn dos_with_open_device(al: u8) -> (DosKernel, Memory, u16, FarPtr) {
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let mut dos = DosKernel::new();
+        dos.init_program(0x0100, 0x1100, &mut mem).unwrap();
+        let header = stage_and_finalize_inline_device(&mut dos, &mut mem, b"MYDEV   ");
+        write_asciiz(&mut mem, 0x0100, 0x0080, "MYDEV");
+        let mut regs = open_regs(0x0100, 0x0080, al);
+        dos.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf);
+        (dos, mem, regs.ax, header)
+    }
+
+    #[test]
+    fn read_on_a_device_handle_returns_a_call_device_action() {
+        let (mut dos, mut mem, handle, header) = dos_with_open_device(2);
+        let mut regs = DosRegs {
+            ax: 0x3f00,
+            bx: handle,
+            cx: 4,
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+        let action = dos.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        match action {
+            DosAction::CallDevice {
+                header: h,
+                command,
+                transfer,
+                count,
+            } => {
+                assert_eq!(command, 4);
+                assert_eq!(count, 4);
+                assert_eq!(
+                    transfer,
+                    FarPtr {
+                        segment: 0x0100,
+                        offset: 0x0200
+                    }
+                );
+                assert_eq!(h, header);
+            }
+            other => panic!("expected CallDevice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_on_a_device_handle_returns_a_call_device_action() {
+        let (mut dos, mut mem, handle, header) = dos_with_open_device(2);
+        let mut regs = DosRegs {
+            ax: 0x4000,
+            bx: handle,
+            cx: 3,
+            ds: 0x0100,
+            dx: 0x0300,
+            ..DosRegs::default()
+        };
+        let action = dos.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        match action {
+            DosAction::CallDevice {
+                header: h,
+                command,
+                transfer,
+                count,
+            } => {
+                assert_eq!(command, 8);
+                assert_eq!(count, 3);
+                assert_eq!(
+                    transfer,
+                    FarPtr {
+                        segment: 0x0100,
+                        offset: 0x0300
+                    }
+                );
+                assert_eq!(h, header);
+            }
+            other => panic!("expected CallDevice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_on_a_read_only_device_handle_is_access_denied() {
+        let (mut dos, mut mem, handle, _) = dos_with_open_device(0); // read-only
+        let mut regs = DosRegs {
+            ax: 0x4000,
+            bx: handle,
+            cx: 3,
+            ds: 0x0100,
+            dx: 0x0300,
+            ..DosRegs::default()
+        };
+        let action = dos.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(action, DosAction::Continue);
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x05); // access denied
+    }
+
+    #[test]
+    fn read_on_a_write_only_device_handle_is_access_denied() {
+        let (mut dos, mut mem, handle, _) = dos_with_open_device(1); // write-only
+        let mut regs = DosRegs {
+            ax: 0x3f00,
+            bx: handle,
+            cx: 4,
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+        let action = dos.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(action, DosAction::Continue);
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x05);
+    }
+
+    #[test]
+    fn zero_count_read_on_a_device_short_circuits() {
+        let (mut dos, mut mem, handle, _) = dos_with_open_device(2);
+        let mut regs = DosRegs {
+            ax: 0x3f00,
+            bx: handle,
+            cx: 0,
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+        let action = dos.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(action, DosAction::Continue);
+        assert!(!regs.cf);
+        assert_eq!(regs.ax, 0);
+    }
+
+    #[test]
+    fn ioctl_get_device_data_on_a_device_reports_a_character_device() {
+        let (mut dos, mut mem, handle, _) = dos_with_open_device(2);
+        let mut regs = DosRegs {
+            ax: 0x4400, // AH=44h AL=00h get device data
+            bx: handle,
+            ..DosRegs::default()
+        };
+        let action = dos.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(action, DosAction::Continue);
+        assert!(!regs.cf);
+        // ISDEV (bit 7) set: the guest sees a character device, not a file.
+        assert_ne!(regs.dx & 0x0080, 0, "ISDEV bit set; got {:#06x}", regs.dx);
     }
 }
