@@ -3143,7 +3143,8 @@ impl DosKernel {
                 Ok(DosAction::Continue)
             }
             // AH=3Eh: close the handle in BX. Dropping the File closes it (RAII).
-            // CF=0 if the handle was open, CF=1 + AX=0x06 if it was not.
+            // CF=0 if it closes cleanly. CF=1 + AX=0x06 for an invalid handle, or a
+            // device error if a loaded driver rejects CLOSE.
             0x3e => {
                 if self.open_files.remove(&regs.bx).is_some() || self.ems_handles.remove(&regs.bx) {
                     regs.cf = false;

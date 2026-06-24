@@ -572,7 +572,7 @@ fn sound_blaster_env_entries(config: &SoundBlasterConfig) -> Vec<(String, String
 
 fn device_call_error_code(command: u8, status: u16) -> u16 {
     let status_code = status & 0x00ff;
-    if status & 0x8000 != 0 && status_code != 0 {
+    if status_code != 0 {
         return status_code;
     }
     match command {
@@ -5132,10 +5132,10 @@ impl Machine {
 
     /// Service a CallDevice action: build a DOS request packet for OPEN (0Dh),
     /// CLOSE (0Eh), READ (4), or WRITE (8), far-call the driver's strategy then
-    /// interrupt on the CPU, and read back the transferred count and error bit. The
-    /// driver reads or writes the caller's transfer buffer directly through the
-    /// packet's transfer far pointer, the way a real device driver does. The
-    /// register context the program was running with is restored by
+    /// interrupt on the CPU, and read back its status. READ/WRITE packets carry the
+    /// caller's transfer pointer and count, and return the transferred count on
+    /// success. OPEN/CLOSE packets are header-only; the action handler supplies the
+    /// success AX. The register context the program was running with is restored by
     /// call_driver_request, so the only effect on the program is the AX and CF the
     /// action handler writes back. On success returns the transferred count with
     /// `None`; on a driver fault it returns `(0, Some(code))` with a DOS error code.
@@ -8176,6 +8176,24 @@ mod tests {
         // 4 = READ, so the command-keyed code is 0x1E (read fault). The guest would
         // see CF=1.
         assert_eq!(err, Some(0x1e));
+    }
+
+    #[test]
+    fn service_device_call_honors_status_code_when_done_is_clear() {
+        // A driver that leaves DONE clear is a failed request, but a nonzero low
+        // status byte still carries the DOS error code to report.
+        // mov word [es:bx+3], 0x0005  =  0x26 0xC7 0x47 0x03 0x05 0x00
+        let int_body = [0x26, 0xc7, 0x47, 0x03, 0x05, 0x00];
+        let mut m = test_machine();
+        place_driver_with_interrupt(&mut m, 0x3000, b"NOCODE  ", &int_body);
+        let header = izarravm_dos::FarPtr {
+            segment: 0x3000,
+            offset: 0,
+        };
+        let xfer = izarravm_dos::FarPtr::default();
+        let (count, err) = m.service_device_call(header, 0x0d, xfer, 0).unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(err, Some(0x05), "status low byte wins on no-DONE failure");
     }
 
     #[test]
