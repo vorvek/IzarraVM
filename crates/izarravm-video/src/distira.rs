@@ -64,6 +64,13 @@ pub const SST_FBI_CHROMA_FAIL: usize = 0x150;
 pub const SST_FBI_ZFUNC_FAIL: usize = 0x154;
 pub const SST_FBI_AFUNC_FAIL: usize = 0x158;
 pub const SST_FBI_PIXELS_OUT: usize = 0x15c;
+pub const SST_CMD_FIFO_BASE_ADDR: usize = 0x1e0;
+pub const SST_CMD_FIFO_BUMP: usize = 0x1e4;
+pub const SST_CMD_FIFO_RD_PTR: usize = 0x1e8;
+pub const SST_CMD_FIFO_AMIN: usize = 0x1ec;
+pub const SST_CMD_FIFO_AMAX: usize = 0x1f0;
+pub const SST_CMD_FIFO_DEPTH: usize = 0x1f4;
+pub const SST_CMD_FIFO_HOLES: usize = 0x1f8;
 pub const SST_FBI_INIT4: usize = 0x200;
 pub const SST_V_RETRACE: usize = 0x204;
 pub const SST_BACK_PORCH: usize = 0x208;
@@ -197,6 +204,7 @@ pub struct Distira {
     fb: Vec<u8>,
     texture: Vec<u8>,
     fifo: VecDeque<DistiraFifoEntry>,
+    command_fifo: VecDeque<u32>,
     display: DistiraDisplay,
     display_enabled: bool,
     dither_enabled: bool,
@@ -224,6 +232,12 @@ pub struct Distira {
     fbi_zfunc_fail: u32,
     fbi_afunc_fail: u32,
     fbi_pixels_out: u32,
+    cmd_fifo_base: u32,
+    cmd_fifo_end: u32,
+    cmd_fifo_read_ptr: u32,
+    cmd_fifo_amin: u32,
+    cmd_fifo_amax: u32,
+    cmd_fifo_holes: u32,
     fbi_init: [u32; 8],
     back_porch: u32,
     video_dimensions: u32,
@@ -244,6 +258,7 @@ impl Distira {
             fb: vec![0; DISTIRA_FB_SIZE],
             texture: vec![0; DISTIRA_TEX_SIZE],
             fifo: VecDeque::new(),
+            command_fifo: VecDeque::new(),
             display,
             display_enabled: false,
             dither_enabled: false,
@@ -271,6 +286,12 @@ impl Distira {
             fbi_zfunc_fail: 0,
             fbi_afunc_fail: 0,
             fbi_pixels_out: 0,
+            cmd_fifo_base: 0,
+            cmd_fifo_end: 0,
+            cmd_fifo_read_ptr: 0,
+            cmd_fifo_amin: 0,
+            cmd_fifo_amax: 0,
+            cmd_fifo_holes: 0,
             fbi_init: [0; 8],
             back_porch: 0,
             video_dimensions: 0,
@@ -455,19 +476,31 @@ impl Distira {
         self.push_fifo(DistiraFifoEntry::TextureU32 { offset, value })
     }
 
+    pub fn write_command_fifo_u32(&mut self, aperture_offset: usize, value: u32) -> bool {
+        if self.fbi_init[7] & FBIINIT7_CMDFIFO_ENABLE == 0 || self.fifo_is_full() {
+            return false;
+        }
+        let _write_offset = self
+            .cmd_fifo_base
+            .wrapping_add((aperture_offset as u32) & 0x3fffc);
+        self.command_fifo.push_back(value);
+        true
+    }
+
     pub fn fifo_depth(&self) -> usize {
-        self.fifo.len()
+        self.command_fifo.len() + self.fifo.len()
     }
 
     pub fn fifo_is_empty(&self) -> bool {
-        self.fifo.is_empty()
+        self.command_fifo.is_empty() && self.fifo.is_empty()
     }
 
     pub fn fifo_is_full(&self) -> bool {
-        self.fifo.len() >= DISTIRA_FIFO_CAPACITY
+        self.fifo_depth() >= DISTIRA_FIFO_CAPACITY
     }
 
     pub fn drain_fifo(&mut self) {
+        self.drain_command_fifo();
         while let Some(entry) = self.fifo.pop_front() {
             match entry {
                 DistiraFifoEntry::Register { offset, value } => self.write_mmio_u32(offset, value),
@@ -537,6 +570,22 @@ impl Distira {
             SST_STIPPLE => merge_byte(&mut self.stipple, byte, value),
             SST_COLOR0 => merge_byte(&mut self.color0, byte, value),
             SST_COLOR1 => merge_byte(&mut self.color1, byte, value),
+            SST_CMD_FIFO_BASE_ADDR => {
+                let mut base = self.cmd_fifo_base_addr_value();
+                merge_byte(&mut base, byte, value);
+                self.cmd_fifo_base = (base & 0x3ff) << 12;
+                self.cmd_fifo_end = ((base >> 16) & 0x3ff) << 12;
+            }
+            SST_CMD_FIFO_BUMP => {}
+            SST_CMD_FIFO_RD_PTR => merge_byte(&mut self.cmd_fifo_read_ptr, byte, value),
+            SST_CMD_FIFO_AMIN => merge_byte(&mut self.cmd_fifo_amin, byte, value),
+            SST_CMD_FIFO_AMAX => merge_byte(&mut self.cmd_fifo_amax, byte, value),
+            SST_CMD_FIFO_DEPTH => {
+                if byte == 0 && value == 0 {
+                    self.command_fifo.clear();
+                }
+            }
+            SST_CMD_FIFO_HOLES => merge_byte(&mut self.cmd_fifo_holes, byte, value),
             SST_FBI_INIT4 => merge_byte(&mut self.fbi_init[4], byte, value),
             SST_BACK_PORCH => merge_byte(&mut self.back_porch, byte, value),
             SST_VIDEO_DIMENSIONS => merge_byte(&mut self.video_dimensions, byte, value),
@@ -601,6 +650,32 @@ impl Distira {
         bytes.copy_from_slice(&value.to_le_bytes());
     }
 
+    fn drain_command_fifo(&mut self) {
+        while let Some(header) = self.command_fifo.pop_front() {
+            self.cmd_fifo_read_ptr = self.cmd_fifo_read_ptr.wrapping_add(4);
+            if header & 7 != 1 {
+                continue;
+            }
+
+            let mut offset = ((header & 0x7ff8) >> 1) as usize;
+            let increment = header & (1 << 15) != 0;
+            for _ in 0..(header >> 16) {
+                let Some(value) = self.command_fifo.pop_front() else {
+                    return;
+                };
+                self.cmd_fifo_read_ptr = self.cmd_fifo_read_ptr.wrapping_add(4);
+                self.push_fifo(DistiraFifoEntry::Register { offset, value });
+                if increment {
+                    offset += 4;
+                }
+            }
+        }
+    }
+
+    fn cmd_fifo_base_addr_value(&self) -> u32 {
+        (self.cmd_fifo_base >> 12) | ((self.cmd_fifo_end >> 12) << 16)
+    }
+
     fn control_value(&self) -> u32 {
         u32::from(self.dither_enabled) << 1
     }
@@ -627,6 +702,13 @@ impl Distira {
             SST_FBI_ZFUNC_FAIL => self.fbi_zfunc_fail & 0x00ff_ffff,
             SST_FBI_AFUNC_FAIL => self.fbi_afunc_fail & 0x00ff_ffff,
             SST_FBI_PIXELS_OUT => self.fbi_pixels_out & 0x00ff_ffff,
+            SST_CMD_FIFO_BASE_ADDR => self.cmd_fifo_base_addr_value(),
+            SST_CMD_FIFO_BUMP => 0,
+            SST_CMD_FIFO_RD_PTR => self.cmd_fifo_read_ptr,
+            SST_CMD_FIFO_AMIN => self.cmd_fifo_amin,
+            SST_CMD_FIFO_AMAX => self.cmd_fifo_amax,
+            SST_CMD_FIFO_DEPTH => self.command_fifo.len() as u32,
+            SST_CMD_FIFO_HOLES => self.cmd_fifo_holes,
             SST_FBI_INIT4 => self.fbi_init[4],
             SST_V_RETRACE => 0,
             SST_BACK_PORCH => self.back_porch,

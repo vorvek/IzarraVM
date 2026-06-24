@@ -125,6 +125,7 @@ const PCI_CONFIG_DATA_PORT: u16 = 0x0cfc;
 const PCI_CONFIG_DATA_END: u16 = 0x0cff;
 const DISTIRA_PCI_SLOT: u8 = 0x10;
 const DISTIRA_PCI_BAR_SIZE: u32 = 0x0100_0000;
+const DISTIRA_PCI_CMDFIFO_OFFSET: u32 = 0x0020_0000;
 const DISTIRA_PCI_LFB_OFFSET: u32 = 0x0040_0000;
 const DISTIRA_PCI_TEX_OFFSET: u32 = 0x0080_0000;
 const DISTIRA_PCI_VENDOR_ID: u16 = 0x121a;
@@ -330,6 +331,17 @@ impl PciConfig {
             && offset + width as u32 <= DISTIRA_PCI_TEX_OFFSET
         {
             Some((offset - DISTIRA_PCI_LFB_OFFSET) as usize)
+        } else {
+            None
+        }
+    }
+
+    fn distira_cmdfifo_offset(&self, address: u32, width: usize) -> Option<usize> {
+        let offset = self.distira_bar_offset(address, width)?;
+        if (DISTIRA_PCI_CMDFIFO_OFFSET..DISTIRA_PCI_LFB_OFFSET).contains(&offset)
+            && offset + width as u32 <= DISTIRA_PCI_LFB_OFFSET
+        {
+            Some((offset - DISTIRA_PCI_CMDFIFO_OFFSET) as usize)
         } else {
             None
         }
@@ -909,6 +921,10 @@ impl Machine {
 
     pub fn set_distira_render_threads(&mut self, threads: u8) {
         self.distira.set_render_threads(threads);
+    }
+
+    pub fn drain_distira_fifo(&mut self) {
+        self.distira.drain_fifo();
     }
 
     /// Re-apply the EMM386 memory-manager mode, the way a CONFIG.SYS DEVICE=EMM386
@@ -6575,6 +6591,13 @@ impl CpuBus for MachineBus<'_> {
             self.memory_wait_states(address),
         ));
 
+        if let Some(offset) = self.distira_cmdfifo_offset(address, width.bytes() as usize) {
+            if width == BusWidth::Dword {
+                self.distira.write_command_fifo_u32(offset, value);
+            }
+            return Ok(());
+        }
+
         if let Some(offset) = self.distira_lfb_offset(address, width.bytes() as usize) {
             match width {
                 BusWidth::Byte => self.distira.write_lfb_u8(offset, value as u8),
@@ -7344,6 +7367,10 @@ impl MachineBus<'_> {
             .or_else(|| distira_lfb_offset(address, width))
     }
 
+    fn distira_cmdfifo_offset(&self, address: u32, width: usize) -> Option<usize> {
+        self.pci.distira_cmdfifo_offset(address, width)
+    }
+
     /// Apply the A20 gate to a physical address before it reaches memory. The gate
     /// is the single 8042 output-port bit (shared with fast-A20 port 0x92); when
     /// it is closed, address line 20 is forced low. This is the motherboard-level
@@ -7672,6 +7699,7 @@ impl MachineBus<'_> {
             || margo_lfb_offset(address, 1).is_some()
             || margo_mmio_offset(address, 1).is_some()
             || self.distira_lfb_offset(address, 1).is_some()
+            || self.distira_cmdfifo_offset(address, 1).is_some()
             || self.distira_mmio_offset(address, 1).is_some()
         {
             self.wait_states.video

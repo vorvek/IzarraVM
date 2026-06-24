@@ -6,7 +6,7 @@ use izarravm_machine::{
 use izarravm_video::{
     DISTIRA_REG_FB_HEIGHT, DISTIRA_REG_FB_WIDTH, FBZ_DRAW_BACK, FBZ_RGB_WMASK, LFB_FORMAT_ARGB8888,
     LFB_WRITE_BACK, SST_CLIP_LEFT_RIGHT, SST_CLIP_LOW_Y_HIGH_Y, SST_COLOR1, SST_FASTFILL_CMD,
-    SST_FBZ_MODE, SST_LFB_MODE, SST_STATUS, SST_SWAPBUFFER_CMD,
+    SST_FBI_INIT7, SST_FBZ_MODE, SST_LFB_MODE, SST_STATUS, SST_SWAPBUFFER_CMD,
 };
 
 fn write_reg_at(machine: &mut Machine, base: u32, reg: usize, value: u32) {
@@ -29,6 +29,10 @@ fn read_guest_u32(machine: &mut Machine, address: u32) -> u32 {
     (0..4)
         .map(|i| u32::from(machine.read_physical_u8(address + i)) << (i * 8))
         .fold(0, |a, b| a | b)
+}
+
+fn cmdfifo_type1_header(reg: usize, count: u32) -> u32 {
+    1 | (((reg as u32) << 1) & 0x7ff8) | (count << 16)
 }
 
 #[test]
@@ -143,4 +147,54 @@ fn distira_pci_bar_maps_voodoo_mmio_and_lfb_windows() {
     let (frame, width, height) = machine.frame_argb();
     assert_eq!((width, height), (2, 1));
     assert_eq!(frame, vec![0x0031_557b, 0x0000_0000]);
+}
+
+#[test]
+fn distira_cmdfifo_aperture_drains_type1_register_packets() {
+    const CMD_FIFO_BASE: u32 = DISTIRA_MMIO_BASE + 0x0020_0000;
+    const SST_CMD_FIFO_DEPTH: usize = 0x1f4;
+    const FBIINIT7_CMDFIFO_ENABLE: u32 = 1 << 8;
+
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Distira),
+        I386DX25_TEST_ROM,
+    )
+    .unwrap();
+
+    write_reg(&mut machine, DISTIRA_REG_FB_WIDTH, 2);
+    write_reg(&mut machine, DISTIRA_REG_FB_HEIGHT, 1);
+    write_reg(&mut machine, SST_FBI_INIT7, FBIINIT7_CMDFIFO_ENABLE);
+
+    machine.write_physical_u32(CMD_FIFO_BASE, cmdfifo_type1_header(SST_CLIP_LEFT_RIGHT, 1));
+    machine.write_physical_u32(CMD_FIFO_BASE + 4, 2);
+    machine.write_physical_u32(
+        CMD_FIFO_BASE + 8,
+        cmdfifo_type1_header(SST_CLIP_LOW_Y_HIGH_Y, 1),
+    );
+    machine.write_physical_u32(CMD_FIFO_BASE + 12, 1);
+    machine.write_physical_u32(CMD_FIFO_BASE + 16, cmdfifo_type1_header(SST_FBZ_MODE, 1));
+    machine.write_physical_u32(CMD_FIFO_BASE + 20, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
+    machine.write_physical_u32(CMD_FIFO_BASE + 24, cmdfifo_type1_header(SST_COLOR1, 1));
+    machine.write_physical_u32(CMD_FIFO_BASE + 28, 0x0034_5678);
+    machine.write_physical_u32(
+        CMD_FIFO_BASE + 32,
+        cmdfifo_type1_header(SST_FASTFILL_CMD, 1),
+    );
+    machine.write_physical_u32(CMD_FIFO_BASE + 36, 1);
+    machine.write_physical_u32(
+        CMD_FIFO_BASE + 40,
+        cmdfifo_type1_header(SST_SWAPBUFFER_CMD, 1),
+    );
+    machine.write_physical_u32(CMD_FIFO_BASE + 44, 1);
+
+    assert_eq!(read_reg(&mut machine, SST_CMD_FIFO_DEPTH), 12);
+    assert_ne!(read_reg(&mut machine, SST_STATUS) & 0x380, 0);
+
+    machine.drain_distira_fifo();
+
+    assert_eq!(read_reg(&mut machine, SST_CMD_FIFO_DEPTH), 0);
+    assert_eq!(read_reg(&mut machine, SST_STATUS) & 0x380, 0);
+    let (frame, width, height) = machine.frame_argb();
+    assert_eq!((width, height), (2, 1));
+    assert_eq!(frame, vec![0x0031_557b; 2]);
 }
