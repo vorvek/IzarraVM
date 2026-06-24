@@ -4756,6 +4756,35 @@ impl Machine {
             }
             // Handled above with an early return; kept so the match stays exhaustive.
             izarravm_dos::DosAction::WaitForKey => None,
+            izarravm_dos::DosAction::CallDevice {
+                header,
+                command,
+                transfer,
+                count,
+            } => {
+                // Far-call the driver on the CPU. It runs through the same nested
+                // seam SYSINIT used, which restores the program's register context,
+                // so SS:SP returns to the INT frame the input registers were
+                // marshalled onto. Write the result over AX and the stacked CF the
+                // way the EXEC-return path edits the frame. A host-side failure of
+                // the nested call (a memory or CPU fault) is reported to the guest
+                // as a general device failure (0x1D), not propagated as an abort.
+                let (ax, cf) = match self.service_device_call(header, command, transfer, count) {
+                    Ok((_, true)) => (0x0005u16, true), // driver error bit
+                    Ok((done_count, false)) => (done_count, false),
+                    Err(_) => (0x001d, true), // general device failure
+                };
+                self.cpu
+                    .registers
+                    .set_eax((self.cpu.registers.eax() & 0xffff_0000) | u32::from(ax));
+                let ss = self.cpu.registers.segment(SegmentIndex::Ss).base;
+                let sp = self.cpu.registers.esp() as u16;
+                let flags_addr = (ss + u32::from(sp.wrapping_add(4))) as usize;
+                let mut flags = self.memory.read_u16(flags_addr)?;
+                flags = if cf { flags | 0x0001 } else { flags & !0x0001 };
+                self.memory.write_u16(flags_addr, flags)?;
+                None
+            }
         })
     }
 
@@ -4847,7 +4876,7 @@ impl Machine {
     /// is the SYSINIT-equivalent for the HLE kernel.
     fn setup_toka_dos_base(&mut self) -> Result<(), MachineError> {
         self.memory.write_u8(BIOS_IRET_STUB_ADDRESS, 0xcf)?;
-        // The HLT sentinel a driver INIT's far return lands on (see call_driver_init).
+        // The HLT sentinel a driver call's far return lands on (see call_driver_request).
         self.memory.write_u8(SYSINIT_HALT_STUB, 0xf4)?;
         for vector in [0x20usize, 0x21] {
             self.memory
@@ -4956,9 +4985,9 @@ impl Machine {
             };
             // DOS calls strategy (stores the request pointer) then interrupt (runs
             // INIT). The interrupt call's status decides success.
-            let _ = self.call_driver_init(staged.strategy, staged.request_ptr);
+            let _ = self.call_driver_request(staged.strategy, staged.request_ptr);
             let ok = self
-                .call_driver_init(staged.interrupt, staged.request_ptr)
+                .call_driver_request(staged.interrupt, staged.request_ptr)
                 .unwrap_or(false);
             let Machine { dos, memory, .. } = self;
             if ok {
@@ -4983,13 +5012,15 @@ impl Machine {
     /// header, running until its RETF lands on the HLT sentinel (or the budget runs
     /// out). Returns whether the request reported DONE with no error bit. The CPU
     /// register context is snapshotted and restored, so the call is transparent to
-    /// the guest that issued the service. INIT runs with interrupts disabled, the
-    /// way real DOS SYSINIT loads drivers. Time genuinely passes: the nested run
-    /// advances the PIT, PIC, RTC, and video like any other run, and the boot clock
-    /// absorbs the INIT cost, so the clock and the devices stay consistent. Success
-    /// is decided by the request-header DONE bit, not by where IP stops: a bare HLT
-    /// can resume on a timer wake, and the budget bounds a driver that never returns.
-    fn call_driver_init(
+    /// the guest that issued the service. The call runs with interrupts disabled,
+    /// the way real DOS SYSINIT loads drivers and routes a device request. Time
+    /// genuinely passes: the nested run advances the PIT, PIC, RTC, and video like
+    /// any other run, and the boot or program clock absorbs the call cost, so the
+    /// clock and the devices stay consistent. Success is decided by the
+    /// request-header DONE bit, not by where IP stops: a bare HLT can resume on a
+    /// timer wake, and the budget bounds a driver that never returns. INIT staging
+    /// and device I/O both reach the driver through this one seam.
+    fn call_driver_request(
         &mut self,
         entry: (u16, u16),
         request: (u16, u16),
@@ -5037,6 +5068,49 @@ impl Machine {
         self.cpu.registers = saved_regs;
         self.cpu.halted = saved_halted;
         outcome
+    }
+
+    /// Service a CallDevice action: build a DOS request packet for a READ (command
+    /// 4) or WRITE (command 8), far-call the driver's strategy then interrupt on the
+    /// CPU, and read back the transferred count and error bit. The driver reads or
+    /// writes the caller's transfer buffer directly through the packet's transfer
+    /// far pointer, the way a real device driver does. The register context the
+    /// program was running with is restored by call_driver_request, so the only
+    /// effect on the program is the count and CF the action handler writes back.
+    fn service_device_call(
+        &mut self,
+        header: izarravm_dos::FarPtr,
+        command: u8,
+        transfer: izarravm_dos::FarPtr,
+        count: u16,
+    ) -> Result<(u16, bool), MachineError> {
+        let req = DEVICE_REQUEST_SCRATCH;
+        for i in 0..0x1a {
+            self.memory.write_u8(req + i, 0)?;
+        }
+        self.memory.write_u8(req, 0x1a)?; // +0x00 request-header length
+        self.memory.write_u8(req + 0x01, 0)?; // +0x01 unit (single-unit char device)
+        self.memory.write_u8(req + 0x02, command)?; // +0x02 command: 4 read, 8 write
+        self.memory.write_u16(req + 0x03, 0)?; // +0x03 status (the driver fills it)
+        self.memory.write_u16(req + 0x0e, transfer.offset)?; // +0x0E transfer offset
+        self.memory.write_u16(req + 0x10, transfer.segment)?; // +0x10 transfer segment
+        self.memory.write_u16(req + 0x12, count)?; // +0x12 requested byte count
+
+        let header_lin = usize::from(header.segment) * 16 + usize::from(header.offset);
+        let strat_off = self.memory.read_u16(header_lin + 6)?;
+        let int_off = self.memory.read_u16(header_lin + 8)?;
+        // The packet is paragraph-aligned at DEVICE_REQUEST_SCRATCH, so the far
+        // pointer is (req >> 4):0.
+        let req_ptr = ((req >> 4) as u16, 0u16);
+        // Strategy stores the request pointer; interrupt does the transfer. The seam
+        // restores the program's CPU context after each call; we ignore its DONE
+        // bool and read the count and status from the packet instead.
+        let _ = self.call_driver_request((header.segment, strat_off), req_ptr)?;
+        let _ = self.call_driver_request((header.segment, int_off), req_ptr)?;
+
+        let status = self.memory.read_u16(req + 0x03)?;
+        let done_count = self.memory.read_u16(req + 0x12)?;
+        Ok((done_count, status & 0x8000 != 0))
     }
 
     /// Mirror any DOS console output produced since the last call onto the VGA
@@ -6817,9 +6891,10 @@ const BDA_DAY_COUNT: usize = 0x4f0;
 /// booter wipes low memory, the way real BIOS handlers (which live in ROM) do.
 const BIOS_ROM_IRET_SEG: u16 = 0xff00;
 
-/// RAM address of the one-byte HLT sentinel a driver INIT's far return lands on.
+/// RAM address of the one-byte HLT sentinel a driver call's far return lands on.
 /// It sits in the free gap between the IRET stub at 0x600 and the RTC ISR stub at
-/// 0x610. `setup_toka_dos_base` writes it; `call_driver_init` returns the CPU here.
+/// 0x610. `setup_toka_dos_base` writes it; `call_driver_request` returns the CPU
+/// here for both INIT staging and device-I/O routing.
 const SYSINIT_HALT_STUB: usize = BIOS_IRET_STUB_ADDRESS + 1;
 
 /// Scratch stack segment for the nested driver-INIT call. Linear 0x500 is the
@@ -6834,6 +6909,17 @@ const SYSINIT_SCRATCH_STACK_SP: u16 = 0x00f0;
 /// Cycle budget for one driver-INIT routine. An INIT is short; the budget bounds a
 /// malformed driver that never returns so it cannot hang the boot.
 const SYSINIT_INIT_BUDGET: u64 = 50_000;
+
+/// Linear address of the device-driver request packet a CallDevice service builds.
+/// It sits at the bottom of the SYSINIT scratch page (seg 0x0050, linear 0x500),
+/// paragraph-aligned so the far pointer is 0050:0000. This is host-reserved low
+/// memory: the BIOS data area ends at 0x4FF, the BIOS stub cluster starts at 0x600,
+/// and SysVars starts at 0x640, so 0x500 belongs to no guest structure. The driver
+/// call's stack uses the same page from a high SP (0xF0 -> linear 0x5F0) growing
+/// down, so the 0x1A-byte packet at 0x500-0x519 and the live stack never overlap.
+/// Device I/O and SYSINIT INIT never run at the same time, so sharing the page is
+/// safe; the packet's survival across the call is asserted by a test.
+const DEVICE_REQUEST_SCRATCH: usize = 0x0500;
 
 /// RAM address of the default INT 70h (IRQ8) handler, a few bytes past the IRET
 /// stub at 0x600 in the free BIOS scratch below the .COM load segment (0x1000).
@@ -7531,7 +7617,7 @@ mod tests {
     }
 
     #[test]
-    fn call_driver_init_runs_a_routine_and_restores_state() {
+    fn call_driver_request_runs_a_routine_and_restores_state() {
         let mut m = test_machine();
         // The HLT sentinel the far-return lands on, the way setup_toka_dos_base
         // writes it during a real boot.
@@ -7550,7 +7636,7 @@ mod tests {
         let saved_clocks = m.elapsed_clocks;
 
         let ok = m
-            .call_driver_init((0x3000, 0x0000), (0x4000, 0x0000))
+            .call_driver_request((0x3000, 0x0000), (0x4000, 0x0000))
             .unwrap();
 
         assert!(ok); // DONE seen, no error bit
@@ -7580,6 +7666,65 @@ mod tests {
             m.elapsed_clocks >= saved_clocks,
             "clock advanced, not rewound"
         );
+    }
+
+    /// A minimal inline character driver placed at `seg`:0. The strategy saves
+    /// ES:BX; the interrupt handles WRITE by copying `count` bytes from the request
+    /// transfer address into its resident buffer, then sets the packet count and
+    /// the DONE status. Assembled from testdev-style source (see the test).
+    fn place_inline_io_driver(m: &mut Machine, seg: u16) {
+        // Header + strategy + WRITE-serving interrupt, hand-assembled with NASM.
+        // strategy at +0x18, interrupt at +0x23, resident buffer at +0x63.
+        const IMAGE: &[u8] = &[
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x80, 0x18, 0x00, 0x23, 0x00, 0x49, 0x4e, 0x4c, 0x49,
+            0x4e, 0x45, 0x20, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2e, 0x89, 0x1e, 0x12,
+            0x00, 0x2e, 0x8c, 0x06, 0x14, 0x00, 0xcb, 0x1e, 0x06, 0x56, 0x57, 0x51, 0x2e, 0xc4,
+            0x1e, 0x12, 0x00, 0x26, 0x8b, 0x4f, 0x12, 0x2e, 0x89, 0x0e, 0x16, 0x00, 0x26, 0x8b,
+            0x47, 0x0e, 0x89, 0xc6, 0x26, 0x8b, 0x47, 0x10, 0x8e, 0xd8, 0x0e, 0x07, 0xbf, 0x63,
+            0x00, 0xf3, 0xa4, 0x2e, 0xc4, 0x1e, 0x12, 0x00, 0x2e, 0x8b, 0x0e, 0x16, 0x00, 0x26,
+            0x89, 0x4f, 0x12, 0x26, 0xc7, 0x47, 0x03, 0x00, 0x01, 0x59, 0x5f, 0x5e, 0x07, 0x1f,
+            0xcb,
+        ];
+        let base = usize::from(seg) * 16;
+        for (i, &b) in IMAGE.iter().enumerate() {
+            m.memory.write_u8(base + i, b).unwrap();
+        }
+        // The HLT sentinel the driver's far return lands on.
+        m.memory.write_u8(SYSINIT_HALT_STUB, 0xf4).unwrap();
+    }
+
+    #[test]
+    fn service_device_call_runs_the_driver_and_returns_the_count() {
+        let mut m = test_machine();
+        place_inline_io_driver(&mut m, 0x3000);
+        // A transfer buffer in guest memory with four known bytes.
+        for (i, b) in b"PING".iter().enumerate() {
+            m.memory.write_u8(0x40000 + i, *b).unwrap();
+        }
+        let saved = m.cpu.registers.clone();
+        let (count, err) = m
+            .service_device_call(
+                izarravm_dos::FarPtr {
+                    segment: 0x3000,
+                    offset: 0,
+                }, // driver header
+                8, // WRITE
+                izarravm_dos::FarPtr {
+                    segment: 0x4000,
+                    offset: 0,
+                }, // transfer buffer
+                4,
+            )
+            .unwrap();
+        assert!(!err);
+        assert_eq!(count, 4);
+        // The driver really ran on the CPU: its resident buffer at 0x3000:0x63 has
+        // the copied bytes.
+        let buf = 0x30000 + 0x63;
+        let got: Vec<u8> = (0..4).map(|i| m.memory.read_u8(buf + i).unwrap()).collect();
+        assert_eq!(&got, b"PING");
+        // The caller's CPU register context is restored after the device call.
+        assert_eq!(m.cpu.registers, saved);
     }
 
     #[test]
