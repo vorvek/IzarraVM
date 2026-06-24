@@ -207,6 +207,7 @@ pub const TEX_AI8: u32 = 0x04;
 pub const TEX_PAL8: u32 = 0x05;
 pub const TEX_APAL8: u32 = 0x06;
 pub const TEX_ARGB8332: u32 = 0x08;
+pub const TEX_A8Y4I2Q2: u32 = 0x09;
 pub const TEX_R5G6B5: u32 = 0x0a;
 pub const TEX_ARGB1555: u32 = 0x0b;
 pub const TEX_ARGB4444: u32 = 0x0c;
@@ -1606,6 +1607,7 @@ impl Distira {
                     | TEX_PAL8
                     | TEX_APAL8
                     | TEX_ARGB8332
+                    | TEX_A8Y4I2Q2
                     | TEX_R5G6B5
                     | TEX_ARGB1555
                     | TEX_ARGB4444
@@ -1638,6 +1640,7 @@ impl Distira {
             TEX_PAL8 => self.sample_tmu_pal8(tmu, s, t),
             TEX_APAL8 => self.sample_tmu_apal8(tmu, s, t),
             TEX_ARGB8332 => self.sample_tmu_argb8332(tmu, s, t),
+            TEX_A8Y4I2Q2 => self.sample_tmu_a8_yiq_ncc(tmu, s, t),
             TEX_R5G6B5 => self.sample_tmu_rgb565(tmu, s, t),
             TEX_ARGB1555 => self.sample_tmu_argb1555(tmu, s, t),
             TEX_ARGB4444 => self.sample_tmu_argb4444(tmu, s, t),
@@ -1666,6 +1669,15 @@ impl Distira {
 
     fn sample_tmu_yiq_ncc(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
         let raw = self.sample_tmu_u8(tmu, s, t);
+        self.ncc_color(tmu, raw)
+    }
+
+    fn sample_tmu_a8_yiq_ncc(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
+        let raw = self.sample_tmu_u16(tmu, s, t) as u8;
+        self.ncc_color(tmu, raw)
+    }
+
+    fn ncc_color(&self, tmu: usize, raw: u8) -> (u8, u8, u8) {
         let y_index = usize::from(raw >> 4);
         let i_index = usize::from((raw >> 2) & 0x03);
         let q_index = usize::from(raw & 0x03);
