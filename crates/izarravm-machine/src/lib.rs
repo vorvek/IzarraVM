@@ -251,6 +251,11 @@ struct ProgramFrame {
     registers: Registers,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingCriticalError {
+    Int26WriteProtect { return_to: izarravm_dos::FarPtr },
+}
+
 /// The OPL3 renders at this native rate; the Resonique 2 DAC outputs at 44100.
 const OPL_NATIVE_HZ: u32 = 49_716;
 const DAC_HZ: u32 = 44_100;
@@ -388,6 +393,9 @@ pub struct Machine {
     io_stall_clocks: u64,
     // Parent CPU snapshots for EXEC (AH=4Bh AL=0); popped on child exit.
     program_frames: Vec<ProgramFrame>,
+    // Host-to-guest DOS INT 24h trampoline waiting for the guest handler to return
+    // through the low-memory completion stub.
+    pending_critical_error: Option<PendingCriticalError>,
     // Mounted A: floppy image, geometry inferred from the image length. INT 13h
     // disk services read and write it; None means the drive is empty.
     floppy: Option<floppy::Floppy>,
@@ -643,6 +651,7 @@ impl Machine {
             elapsed_clocks: 0,
             io_stall_clocks: 0,
             program_frames: Vec::new(),
+            pending_critical_error: None,
             floppy: None,
             floppy_accesses: 0,
             c_accesses: 0,
@@ -1105,6 +1114,114 @@ impl Machine {
         r.set_segment(SegmentIndex::Cs, SegmentRegister::real(cs));
         r.eip = u32::from(ip);
         Ok(())
+    }
+
+    fn invoke_critical_error_call(
+        &mut self,
+        call: izarravm_dos::CriticalErrorCall,
+        pending: PendingCriticalError,
+    ) -> Result<(), izarravm_dos::DosError> {
+        let ss_base = self.cpu.registers.segment(SegmentIndex::Ss).base;
+        let old_sp = self.cpu.registers.esp() as u16;
+        let old_flags = self.cpu.registers.eflags as u16;
+
+        let mut sp = old_sp.wrapping_sub(2);
+        self.memory
+            .write_u16((ss_base + u32::from(sp)) as usize, old_flags)?;
+        sp = sp.wrapping_sub(2);
+        self.memory
+            .write_u16((ss_base + u32::from(sp)) as usize, 0)?;
+        sp = sp.wrapping_sub(2);
+        self.memory.write_u16(
+            (ss_base + u32::from(sp)) as usize,
+            BIOS_CRITICAL_ERROR_RETURN_STUB_ADDRESS as u16,
+        )?;
+
+        let regs = call.regs;
+        let r = &mut self.cpu.registers;
+        r.set_eax((r.eax() & 0xffff_0000) | u32::from(regs.ax));
+        r.set_esi((r.esi() & 0xffff_0000) | u32::from(regs.si));
+        r.set_edi((r.edi() & 0xffff_0000) | u32::from(regs.di));
+        r.set_ebp((r.ebp() & 0xffff_0000) | u32::from(regs.bp));
+        r.set_esp((r.esp() & 0xffff_0000) | u32::from(sp));
+        r.eflags &= !0x0000_0300;
+        r.set_segment(
+            SegmentIndex::Cs,
+            SegmentRegister::real(call.handler.segment),
+        );
+        r.eip = u32::from(call.handler.offset);
+        self.pending_critical_error = Some(pending);
+        Ok(())
+    }
+
+    fn finish_pending_critical_error_trampoline(&mut self) -> bool {
+        let Some(pending) = self.pending_critical_error else {
+            return false;
+        };
+        let cs = self.cpu.registers.cs().selector;
+        let ip = self.cpu.registers.eip as u16;
+        if !self.cpu.halted || cs != 0 || ip != BIOS_CRITICAL_ERROR_RETURN_STUB_ADDRESS as u16 + 1 {
+            return false;
+        }
+
+        self.cpu.halted = false;
+        self.pending_critical_error = None;
+        let handler_al = self.cpu.registers.eax() as u8;
+        let response = self.dos.finish_critical_error(handler_al);
+        self.apply_critical_error_response(pending, response);
+        true
+    }
+
+    fn apply_critical_error_response(
+        &mut self,
+        pending: PendingCriticalError,
+        response: izarravm_dos::CriticalErrorResponse,
+    ) {
+        match pending {
+            PendingCriticalError::Int26WriteProtect { return_to } => {
+                match response {
+                    izarravm_dos::CriticalErrorResponse::Ignore
+                    | izarravm_dos::CriticalErrorResponse::Retry
+                    | izarravm_dos::CriticalErrorResponse::Abort
+                    | izarravm_dos::CriticalErrorResponse::Fail => {
+                        self.set_ax(0x0300);
+                        self.set_int_frame_carry(true);
+                    }
+                }
+                let r = &mut self.cpu.registers;
+                r.set_segment(SegmentIndex::Cs, SegmentRegister::real(return_to.segment));
+                r.eip = u32::from(return_to.offset);
+            }
+        }
+    }
+
+    fn start_int26_write_protect_critical_error(&mut self, drive: u8) {
+        let return_to = izarravm_dos::FarPtr {
+            segment: self.cpu.registers.cs().selector,
+            offset: self.cpu.registers.eip as u16,
+        };
+        let pending = PendingCriticalError::Int26WriteProtect { return_to };
+        let request = izarravm_dos::CriticalErrorRequest::disk(
+            drive,
+            0x00,
+            true,
+            izarravm_dos::CriticalErrorArea::Data,
+            izarravm_dos::FarPtr::default(),
+        );
+        let Ok(call) = self.dos.begin_critical_error(&mut self.memory, request) else {
+            self.apply_critical_error_response(pending, izarravm_dos::CriticalErrorResponse::Fail);
+            return;
+        };
+        if call.handler == izarravm_dos::FarPtr::default() {
+            let response = self.dos.finish_critical_error(0x03);
+            self.apply_critical_error_response(pending, response);
+            return;
+        }
+        if self.invoke_critical_error_call(call, pending).is_err() {
+            self.pending_critical_error = None;
+            let response = self.dos.finish_critical_error(0x03);
+            self.apply_critical_error_response(pending, response);
+        }
     }
 
     /// Install the resident keyboard BIOS for the DOS machine: point IVT[09h] and
@@ -3513,11 +3630,7 @@ impl Machine {
         // packet form (CX=FFFFh / AH=7305h) for sectors past 32 MB is a follow-up.
         if al == 0x02 && self.fat32_c.is_some() {
             if write {
-                // The volume is read-only: an absolute write is write-protected.
-                // AL=00h is the write-protect error (INT 24h code); AH=03h is the
-                // write-protected disk status.
-                self.set_ax(0x0300);
-                self.set_int_frame_carry(true);
+                self.start_int26_write_protect_critical_error(al);
                 return;
             }
             // Stream one sector at a time: each read borrows the volume only until
@@ -5796,6 +5909,9 @@ impl Machine {
                     }
                     // Mirror any DOS console output onto the VGA text screen.
                     self.flush_dos_console_to_screen();
+                    if outcome.halted && self.finish_pending_critical_error_trampoline() {
+                        continue;
+                    }
                     if outcome.halted {
                         match self.next_timer_wake(deadline) {
                             Some(wake_step) => {
@@ -6425,6 +6541,11 @@ const BIOS_RTC_ISR_ADDRESS: usize = 0x0610;
 /// interrupts are masked), matching a real BIOS that gives up and halts.
 const BIOS_HALT_STUB_ADDRESS: usize = 0x0620;
 
+/// RAM address of the INT 24h host-trampoline completion stub. A live guest INT
+/// 24h handler IRETs here, executes HLT to stop the instruction batch, then the
+/// machine decodes handler AL and resumes the original host-serviced INT return.
+const BIOS_CRITICAL_ERROR_RETURN_STUB_ADDRESS: usize = 0x0630;
+
 /// EBDA offset of the far pointer to the user pointing-device (mouse) handler the
 /// guest installs with INT 15h AX=C207h. The IBM PS/2 BIOS keeps it here as
 /// offset word then segment word; INT 15h AX=C208h reads it back.
@@ -6491,6 +6612,7 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     // points CS:IP here when no device is bootable.
     memory.write_u8(BIOS_HALT_STUB_ADDRESS, 0xfa)?; // CLI
     memory.write_u8(BIOS_HALT_STUB_ADDRESS + 1, 0xf4)?; // HLT
+    memory.write_u8(BIOS_CRITICAL_ERROR_RETURN_STUB_ADDRESS, 0xf4)?; // HLT
     // The DOS kernel vectors keep the RAM stub: the INT 21h blocking path rewinds
     // EIP onto the CD 21 the RAM stub returns to, and the DOS path owns its memory.
     for vector in [0x20, 0x21] {
@@ -9739,6 +9861,85 @@ mod tests {
             0x0300,
             "INT 26h write to a read-only volume is write-protected"
         );
+    }
+
+    #[test]
+    fn int26_write_protect_calls_live_int24_handler() {
+        let dir = std::env::temp_dir().join(format!(
+            "izarra_int26_int24_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("HELLO.TXT"), b"hi").unwrap();
+        let vol = build_fat32(&dir, 64 * 1024 * 1024, 0x1234_5678).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        // .COM program:
+        //   install an INT 24h handler at CS:0170
+        //   INT 26h write one sector to read-only C:
+        //   exit 0 only if the handler ran, saw DOS write-protect registers, and
+        //   DOS returned CF set with AX=0300 after AL=Fail from the handler.
+        const PROG: [u8; 131] = [
+            0xba, 0x70, 0x01, // mov dx,0170h
+            0xb8, 0x24, 0x25, // mov ax,2524h
+            0xcd, 0x21, // int 21h
+            0xc6, 0x06, 0xf0, 0x01, 0x00, // mov byte [01f0h],00h
+            0xb0, 0x02, // mov al,02h ; C:
+            0xb9, 0x01, 0x00, // mov cx,0001h
+            0xba, 0x00, 0x00, // mov dx,0000h
+            0xbb, 0x00, 0x02, // mov bx,0200h
+            0xcd, 0x26, // int 26h
+            0x90, // nop ; Izarra's INT 26h HLE returns CF in live flags
+            0x72, 0x04, // jc +4
+            0xb0, 0x10, // mov al,10h
+            0xeb, 0x38, // jmp exit
+            0x3d, 0x00, 0x03, // cmp ax,0300h
+            0x74, 0x04, // je +4
+            0xb0, 0x11, // mov al,11h
+            0xeb, 0x2f, // jmp exit
+            0x80, 0x3e, 0xf0, 0x01, 0x01, // cmp byte [01f0h],01h
+            0x74, 0x04, // je +4
+            0xb0, 0x12, // mov al,12h
+            0xeb, 0x24, // jmp exit
+            0xa0, 0xf1, 0x01, // mov al,[01f1h]
+            0x3c, 0x02, // cmp al,02h ; drive C:
+            0x74, 0x04, // je +4
+            0xb0, 0x13, // mov al,13h
+            0xeb, 0x19, // jmp exit
+            0xa0, 0xf2, 0x01, // mov al,[01f2h]
+            0x3c, 0x3f, // cmp al,3fh ; write + data + I/R/F allowed
+            0x74, 0x04, // je +4
+            0xb0, 0x14, // mov al,14h
+            0xeb, 0x0e, // jmp exit
+            0xa1, 0xf3, 0x01, // mov ax,[01f3h]
+            0x3d, 0x00, 0x00, // cmp ax,0000h ; write-protect code
+            0x74, 0x04, // je +4
+            0xb0, 0x15, // mov al,15h
+            0xeb, 0x02, // jmp exit
+            0xb0, 0x00, // mov al,00h
+            0xb4, 0x4c, // mov ah,4ch
+            0xcd, 0x21, // int 21h
+            0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+            0x90, 0x90, 0x90, 0x90, 0x90, // INT 24h handler at 0170h.
+            0xc6, 0x06, 0xf0, 0x01, 0x01, // mov byte [01f0h],01h
+            0xa2, 0xf1, 0x01, // mov [01f1h],al
+            0x88, 0x26, 0xf2, 0x01, // mov [01f2h],ah
+            0x89, 0x3e, 0xf3, 0x01, // mov [01f3h],di
+            0xb0, 0x03, // mov al,03h ; Fail
+            0xcf, // iret
+        ];
+        let mut m =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
+                .unwrap();
+        m.mount_fat32(vol);
+
+        let stop = m.run_until_halt_or_cycles(1_000_000).unwrap();
+
+        assert_eq!(stop, StopReason::DosExit { code: 0 });
     }
 
     #[test]
