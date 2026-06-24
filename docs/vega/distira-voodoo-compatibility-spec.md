@@ -486,7 +486,9 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
       RGB565 S-wider aspect ratio test plus the workspace gates.
 - [x] Iteration 41: texture detail register read/write behavior. Validated by
       the video texture detail register round-trip test plus the workspace gates.
-- [ ] Next: texture detail blending behavior.
+- [x] Iteration 42: texture detail blending behavior. Validated by the video
+      texture detail blend factor test plus the workspace gates.
+- [ ] Next: texture chroma key behavior.
 
 ## First 90 percent push for this branch
 
