@@ -4058,6 +4058,20 @@ impl Machine {
             self.stall_for(secs);
         }
 
+        // The ROM BIOS boot path reads A: CHS 0/0/1 to 0000:7C00 with INT 13h,
+        // then far-jumps there. Once that sector is in place, a self-booting disk
+        // owns DOS-family interrupts through its IVT handlers. Host-side Toka-DOS
+        // and IEMM must stand down before the sector's first INT 21h/2Fh/66h.
+        if ah == 0x02
+            && done > 0
+            && cyl == 0
+            && head == 0
+            && sector == 1
+            && buffer == BOOT_SECTOR_ADDRESS as u32
+        {
+            self.booter_inert = true;
+        }
+
         // AL returns the number of sectors actually transferred.
         self.set_eax_al(done);
         if done == count {
@@ -4837,6 +4851,10 @@ impl Machine {
         if self.setup_toka_dos_base().is_err() {
             return 0xfe;
         }
+        // The bundled Toka-DOS boot record is the OS for C:, so the HLE DOS/IEMM
+        // services are live again. This mirrors handle_int19's C: path for BIOS
+        // ROM boots that request LoadBootRecord through the service port.
+        self.booter_inert = false;
         0
     }
 
@@ -10277,6 +10295,23 @@ mod tests {
             m.cpu.registers.edx() as u8,
             0x80,
             "DL=80h: the C: branch ran"
+        );
+    }
+
+    #[test]
+    fn toka_load_boot_record_clears_booter_inert() {
+        // The BIOS ROM uses the Toka service port to load TOKABOOT for C:. That
+        // path bypasses handle_int19, so it must also clear a prior booter flag.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ICOMMAND.COM"), b"stub").unwrap();
+        let mut m = int15_machine(16);
+        m.set_toka_c_root(dir.path().to_path_buf());
+        m.set_booter_inert(true);
+
+        assert_eq!(m.toka_load_boot_record(), 0, "TOKABOOT loaded");
+        assert!(
+            !m.booter_inert(),
+            "a service-port Toka-DOS C: boot makes the HLE the OS again"
         );
     }
 
@@ -16433,6 +16468,52 @@ mod tests {
             machine.read_physical_u8(0x0500),
             0x99,
             "the boot sector ran from 0000:7C00, so INT 19h loaded and jumped"
+        );
+    }
+
+    #[test]
+    fn floppy_booter_owns_int21_through_its_ivt_handler() {
+        // QuickDOS-style self-booting disks provide their own DOS personality.
+        // After INT 19h boots A:, INT 21h must run through the disk's IVT handler
+        // rather than the Toka-DOS HLE. The boot sector installs INT 21h at
+        // 0000:7C1D, calls AH=4Ch, then writes a post-return marker and halts. If
+        // HLE owns the call, AH=4Ch reports StopReason::DosExit before either
+        // marker lands.
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
+
+        let mut img = vec![0u8; 737_280];
+        let boot = [
+            0x31, 0xC0, // xor ax, ax
+            0x8E, 0xD8, // mov ds, ax
+            0xC7, 0x06, 0x84, 0x00, 0x1D, 0x7C, // mov word [0084h], 7C1Dh
+            0xC7, 0x06, 0x86, 0x00, 0x00, 0x00, // mov word [0086h], 0000h
+            0xB8, 0x2A, 0x4C, // mov ax, 4C2Ah
+            0xCD, 0x21, // int 21h
+            0xBB, 0x01, 0x05, // mov bx, 0501h
+            0xB0, 0x7E, // mov al, 7Eh
+            0x88, 0x07, // mov [bx], al
+            0xF4, // hlt
+            // INT 21h handler at 0000:7C1D.
+            0xBB, 0x00, 0x05, // mov bx, 0500h
+            0xB0, 0x21, // mov al, 21h
+            0x88, 0x07, // mov [bx], al
+            0xCF, // iret
+        ];
+        img[..boot.len()].copy_from_slice(&boot);
+        machine.mount_floppy(img).unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(50_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(
+            machine.read_physical_u8(0x0500),
+            0x21,
+            "the boot sector's INT 21h handler ran instead of Toka-DOS HLE"
+        );
+        assert_eq!(
+            machine.read_physical_u8(0x0501),
+            0x7E,
+            "the boot sector returned from its INT 21h handler and kept running"
         );
     }
 
