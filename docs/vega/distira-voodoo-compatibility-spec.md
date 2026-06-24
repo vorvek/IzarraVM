@@ -476,7 +476,9 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
       texture sample test plus the workspace gates.
 - [x] Iteration 36: S/T texture clamp behavior. Validated by the video S clamp
       texture sample test plus the workspace gates.
-- [ ] Next: S/T texture mirror behavior.
+- [x] Iteration 37: S/T texture mirror behavior. Validated by the video S mirror
+      texture sample test plus the workspace gates.
+- [ ] Next: texture multibase LOD address behavior.
 
 ## First 90 percent push for this branch
 

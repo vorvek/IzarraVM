@@ -200,6 +200,8 @@ pub const FBZ_PARAM_ADJUST: u32 = 1 << 26;
 pub const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
 pub const TEXTUREMODE_TCLAMPS: u32 = 1 << 6;
 pub const TEXTUREMODE_TCLAMPT: u32 = 1 << 7;
+pub const LOD_TMIRROR_S: u32 = 1 << 28;
+pub const LOD_TMIRROR_T: u32 = 1 << 29;
 
 pub const TEX_RGB332: u32 = 0x00;
 pub const TEX_Y4I2Q2: u32 = 0x01;
@@ -1655,11 +1657,22 @@ impl Distira {
     fn sample_tmu_rgb332(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
         let lod = self.texture_lod_level(tmu);
         let mode = self.texture_mode_for_tmu(tmu);
+        let lod_reg = self.texture_lod_for_tmu(tmu);
         let scale = (1_u32 << lod).max(1) as f32;
         let width = (256_usize >> lod).max(1);
         let height = (256_usize >> lod).max(1);
-        let s = texture_coord_index(s / scale, width, mode & TEXTUREMODE_TCLAMPS != 0);
-        let t = texture_coord_index(t / scale, height, mode & TEXTUREMODE_TCLAMPT != 0);
+        let s = texture_coord_index(
+            s / scale,
+            width,
+            mode & TEXTUREMODE_TCLAMPS != 0,
+            lod_reg & LOD_TMIRROR_S != 0,
+        );
+        let t = texture_coord_index(
+            t / scale,
+            height,
+            mode & TEXTUREMODE_TCLAMPT != 0,
+            lod_reg & LOD_TMIRROR_T != 0,
+        );
         let texel = t * width + s;
         let offset = (self.tex_base_addr_for_tmu(tmu) as usize)
             .saturating_add(texture_mip_offset(lod, 1))
@@ -1744,11 +1757,22 @@ impl Distira {
     fn sample_tmu_u8(&self, tmu: usize, s: f32, t: f32) -> u8 {
         let lod = self.texture_lod_level(tmu);
         let mode = self.texture_mode_for_tmu(tmu);
+        let lod_reg = self.texture_lod_for_tmu(tmu);
         let scale = (1_u32 << lod).max(1) as f32;
         let width = (256_usize >> lod).max(1);
         let height = (256_usize >> lod).max(1);
-        let s = texture_coord_index(s / scale, width, mode & TEXTUREMODE_TCLAMPS != 0);
-        let t = texture_coord_index(t / scale, height, mode & TEXTUREMODE_TCLAMPT != 0);
+        let s = texture_coord_index(
+            s / scale,
+            width,
+            mode & TEXTUREMODE_TCLAMPS != 0,
+            lod_reg & LOD_TMIRROR_S != 0,
+        );
+        let t = texture_coord_index(
+            t / scale,
+            height,
+            mode & TEXTUREMODE_TCLAMPT != 0,
+            lod_reg & LOD_TMIRROR_T != 0,
+        );
         let texel = t * width + s;
         let offset = (self.tex_base_addr_for_tmu(tmu) as usize)
             .saturating_add(texture_mip_offset(lod, 1))
@@ -1759,11 +1783,22 @@ impl Distira {
     fn sample_tmu_u16(&self, tmu: usize, s: f32, t: f32) -> u16 {
         let lod = self.texture_lod_level(tmu);
         let mode = self.texture_mode_for_tmu(tmu);
+        let lod_reg = self.texture_lod_for_tmu(tmu);
         let scale = (1_u32 << lod).max(1) as f32;
         let width = (256_usize >> lod).max(1);
         let height = (256_usize >> lod).max(1);
-        let s = texture_coord_index(s / scale, width, mode & TEXTUREMODE_TCLAMPS != 0);
-        let t = texture_coord_index(t / scale, height, mode & TEXTUREMODE_TCLAMPT != 0);
+        let s = texture_coord_index(
+            s / scale,
+            width,
+            mode & TEXTUREMODE_TCLAMPS != 0,
+            lod_reg & LOD_TMIRROR_S != 0,
+        );
+        let t = texture_coord_index(
+            t / scale,
+            height,
+            mode & TEXTUREMODE_TCLAMPT != 0,
+            lod_reg & LOD_TMIRROR_T != 0,
+        );
         let texel = (t * width + s).saturating_mul(2);
         let offset = (self.tex_base_addr_for_tmu(tmu) as usize)
             .saturating_add(texture_mip_offset(lod, 2))
@@ -1777,20 +1812,39 @@ impl Distira {
     fn sample_tmu_rgb565(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
         let lod = self.texture_lod_level(tmu);
         let mode = self.texture_mode_for_tmu(tmu);
+        let lod_reg = self.texture_lod_for_tmu(tmu);
         let scale = (1_u32 << lod).max(1) as f32;
         let s = s / scale;
         let t = t / scale;
         if mode & 0x6 != 0 {
-            return self.bilinear_rgb565(s, t, lod, self.tex_base_addr_for_tmu(tmu), mode);
+            return self.bilinear_rgb565(s, t, lod, self.tex_base_addr_for_tmu(tmu), mode, lod_reg);
         }
         let width = (256_usize >> lod).max(1);
         let height = (256_usize >> lod).max(1);
-        let s = texture_coord_index(s, width, mode & TEXTUREMODE_TCLAMPS != 0) as i32;
-        let t = texture_coord_index(t, height, mode & TEXTUREMODE_TCLAMPT != 0) as i32;
-        self.sample_rgb565_texel(s, t, lod, self.tex_base_addr_for_tmu(tmu), mode)
+        let s = texture_coord_index(
+            s,
+            width,
+            mode & TEXTUREMODE_TCLAMPS != 0,
+            lod_reg & LOD_TMIRROR_S != 0,
+        ) as i32;
+        let t = texture_coord_index(
+            t,
+            height,
+            mode & TEXTUREMODE_TCLAMPT != 0,
+            lod_reg & LOD_TMIRROR_T != 0,
+        ) as i32;
+        self.sample_rgb565_texel(s, t, lod, self.tex_base_addr_for_tmu(tmu), mode, lod_reg)
     }
 
-    fn bilinear_rgb565(&self, s: f32, t: f32, lod: u32, base_addr: u32, mode: u32) -> (u8, u8, u8) {
+    fn bilinear_rgb565(
+        &self,
+        s: f32,
+        t: f32,
+        lod: u32,
+        base_addr: u32,
+        mode: u32,
+        lod_reg: u32,
+    ) -> (u8, u8, u8) {
         let base_s = s.floor();
         let base_t = t.floor();
         let frac_s = ((s - base_s) * 16.0).floor().clamp(0.0, 15.0) as u32;
@@ -1798,10 +1852,10 @@ impl Distira {
         let s0 = base_s as i32;
         let t0 = base_t as i32;
         let samples = [
-            self.sample_rgb565_texel(s0, t0, lod, base_addr, mode),
-            self.sample_rgb565_texel(s0 + 1, t0, lod, base_addr, mode),
-            self.sample_rgb565_texel(s0, t0 + 1, lod, base_addr, mode),
-            self.sample_rgb565_texel(s0 + 1, t0 + 1, lod, base_addr, mode),
+            self.sample_rgb565_texel(s0, t0, lod, base_addr, mode, lod_reg),
+            self.sample_rgb565_texel(s0 + 1, t0, lod, base_addr, mode, lod_reg),
+            self.sample_rgb565_texel(s0, t0 + 1, lod, base_addr, mode, lod_reg),
+            self.sample_rgb565_texel(s0 + 1, t0 + 1, lod, base_addr, mode, lod_reg),
         ];
         let weights = [
             (16 - frac_s) * (16 - frac_t),
@@ -1834,12 +1888,16 @@ impl Distira {
         }
     }
 
-    fn texture_lod_level(&self, tmu: usize) -> u32 {
-        let lod = if tmu == 0 {
+    fn texture_lod_for_tmu(&self, tmu: usize) -> u32 {
+        if tmu == 0 {
             self.texture_lod
         } else {
             self.texture_lod_tmu1
-        };
+        }
+    }
+
+    fn texture_lod_level(&self, tmu: usize) -> u32 {
+        let lod = self.texture_lod_for_tmu(tmu);
         let min_lod = ((lod >> 2) & 0xf).min(8);
         let max_lod = ((lod >> 8) & 0xf).min(8);
         if max_lod == 0 {
@@ -1864,11 +1922,22 @@ impl Distira {
         lod: u32,
         base_addr: u32,
         mode: u32,
+        lod_reg: u32,
     ) -> (u8, u8, u8) {
         let width = (256_usize >> lod).max(1);
         let height = (256_usize >> lod).max(1);
-        let s = texture_coord_index_i32(s, width, mode & TEXTUREMODE_TCLAMPS != 0);
-        let t = texture_coord_index_i32(t, height, mode & TEXTUREMODE_TCLAMPT != 0);
+        let s = texture_coord_index_i32(
+            s,
+            width,
+            mode & TEXTUREMODE_TCLAMPS != 0,
+            lod_reg & LOD_TMIRROR_S != 0,
+        );
+        let t = texture_coord_index_i32(
+            t,
+            height,
+            mode & TEXTUREMODE_TCLAMPT != 0,
+            lod_reg & LOD_TMIRROR_T != 0,
+        );
         let texel = (t * width + s).saturating_mul(2);
         let offset = (base_addr as usize)
             .saturating_add(texture_mip_offset(lod, 2))
@@ -2079,13 +2148,21 @@ fn clamp_ncc(value: i32) -> u8 {
     value.clamp(0, 255) as u8
 }
 
-fn texture_coord_index(coord: f32, size: usize, clamp: bool) -> usize {
-    texture_coord_index_i32(coord.floor() as i32, size, clamp)
+fn texture_coord_index(coord: f32, size: usize, clamp: bool, mirror: bool) -> usize {
+    texture_coord_index_i32(coord.floor() as i32, size, clamp, mirror)
 }
 
-fn texture_coord_index_i32(coord: i32, size: usize, clamp: bool) -> usize {
+fn texture_coord_index_i32(coord: i32, size: usize, clamp: bool, mirror: bool) -> usize {
     if clamp {
         coord.clamp(0, size.saturating_sub(1) as i32) as usize
+    } else if mirror {
+        let period = (size * 2) as i32;
+        let coord = coord.rem_euclid(period);
+        if coord >= size as i32 {
+            (period - 1 - coord) as usize
+        } else {
+            coord as usize
+        }
     } else {
         coord as usize & (size - 1)
     }
