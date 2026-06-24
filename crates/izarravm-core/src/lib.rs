@@ -313,7 +313,7 @@ pub fn parse_config_sys(text: &str) -> ConfigSysMemory {
             .or_else(|| upper.strip_prefix("DEVICE="));
         if let Some(rest) = device {
             let (path, args) = split_device_path_and_args(rest);
-            let name = path.rsplit(['\\', '/']).next().unwrap_or(path);
+            let name = dos_basename(path);
             if name == "HIMEM.SYS" {
                 himem = true;
             } else if (name == "IEMM.EXE"
@@ -370,6 +370,48 @@ pub fn parse_config_sys(text: &str) -> ConfigSysMemory {
         ems_frame_seg,
         ems_pool_kb,
     }
+}
+
+/// One DEVICE=/DEVICEHIGH= line from CONFIG.SYS, in file order, with the path and
+/// argument tail kept in their original case. `parse_config_sys` uppercases for
+/// matching, but a driver path and its switches must keep case to load and run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigDeviceLine {
+    pub path: String,
+    pub args: String,
+    pub high: bool,
+}
+
+/// The filename of a DOS path, after the last `\` or `/`. Shared with the
+/// memory-manager line matching in `parse_config_sys`.
+pub fn dos_basename(path: &str) -> &str {
+    path.rsplit(['\\', '/']).next().unwrap_or(path)
+}
+
+/// Every DEVICE=/DEVICEHIGH= line in order. Memory-manager lines (HIMEM/IEMM/
+/// EMM386) are included; the caller decides which basenames it handles itself.
+pub fn parse_device_lines(text: &str) -> Vec<ConfigDeviceLine> {
+    let mut lines = Vec::new();
+    for raw in text.lines() {
+        let trimmed = raw.trim();
+        let upper = trimmed.to_ascii_uppercase();
+        let (cased_rest, high) = if let Some(rest) = upper.strip_prefix("DEVICEHIGH=") {
+            (&trimmed[trimmed.len() - rest.len()..], true)
+        } else if let Some(rest) = upper.strip_prefix("DEVICE=") {
+            (&trimmed[trimmed.len() - rest.len()..], false)
+        } else {
+            continue;
+        };
+        // `to_ascii_uppercase` preserves byte length, so the uppercased remainder's
+        // length re-slices the original cased line at the same point.
+        let (path, args) = split_device_path_and_args(cased_rest);
+        lines.push(ConfigDeviceLine {
+            path: path.to_string(),
+            args: args.to_string(),
+            high,
+        });
+    }
+    lines
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1016,6 +1058,25 @@ fn normalize(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_lines_are_returned_in_order_with_high_flag() {
+        let lines = parse_device_lines(
+            "DEVICE=C:\\DOS\\HIMEM.SYS /TESTMEM:OFF\r\n\
+             DEVICEHIGH=C:\\MOUSE.SYS 2\r\n\
+             DEVICE=\"C:\\my dir\\ANSI.SYS\"\r\n\
+             FILES=40\r\n",
+        );
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].path, "C:\\DOS\\HIMEM.SYS");
+        assert_eq!(lines[0].args, "/TESTMEM:OFF");
+        assert!(!lines[0].high);
+        assert_eq!(lines[1].path, "C:\\MOUSE.SYS");
+        assert_eq!(lines[1].args, "2");
+        assert!(lines[1].high);
+        assert_eq!(lines[2].path, "C:\\my dir\\ANSI.SYS"); // quoted path preserved
+        assert_eq!(dos_basename(&lines[1].path), "MOUSE.SYS");
+    }
 
     #[test]
     fn gsw_mode_clocks_and_names() {
