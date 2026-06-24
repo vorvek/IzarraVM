@@ -452,7 +452,9 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
       sample test plus the workspace gates.
 - [x] Iteration 24: A8 texture sampling. Validated by the video A8 texture
       sample test plus the workspace gates.
-- [ ] Next: AI44 texture sampling.
+- [x] Iteration 25: AI44 texture sampling. Validated by the video AI44 texture
+      sample test plus the workspace gates.
+- [ ] Next: AI88 texture sampling.
 
 ## First 90 percent push for this branch
 
