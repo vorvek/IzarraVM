@@ -40,9 +40,10 @@ pub(super) const PROG_NAME: &[u8; 8] = b"TOKAPROG";
 pub(super) const NO_NAME: &[u8; 8] = b"\0\0\0\0\0\0\0\0";
 
 /// Kernel-reserved paragraph holding the AH=52h list-of-lists (SysVars) table.
-/// 0x0050 = linear 0x500, just above the BIOS data area (0x400-0x4FF) and below
-/// where programs load (psp_seg >= 0x0100), so it collides with neither.
-const SYSVARS_SEG: u16 = 0x0050;
+/// 0x0064 = linear 0x640, just above the BIOS RAM stub cluster at 0x600-0x63F
+/// (the IRET, RTC, INT 18h halt, and INT 24h critical-error stubs). The SysVars
+/// structure grows up from here to the first MCB, so it must clear those stubs.
+const SYSVARS_SEG: u16 = 0x0064;
 
 /// DOS default LASTDRIVE, reported in the list of lists: drives A: through E:.
 const DEFAULT_LASTDRIVE: u8 = 5;
@@ -1134,4 +1135,30 @@ pub(super) fn resize_block(
         write_mcb_header(mem, new_end, free_sig, 0, limit - new_end - 1, NO_NAME)?;
     }
     Ok(Ok(()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_sysvars_keeps_the_bios_ram_stub_cluster() {
+        // The BIOS keeps its RAM IRET/RTC/halt/critical-error stubs at linear
+        // 0x600..0x63F. SysVars must sit above them, or a guest AH=52h would zero
+        // the IRET stub it returns through. Seed marker bytes across the cluster.
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        for addr in 0x600..0x640 {
+            mem.write_u8(addr, 0xcf).unwrap();
+        }
+        // A low first_mcb forces a large SysVars structure (the worst case for
+        // overrunning low memory toward the stub cluster).
+        write_sysvars(&mut mem, 0x0100, false, Some(b'E'), 40, &[]).unwrap();
+        for addr in 0x600..0x640 {
+            assert_eq!(
+                mem.read_u8(addr).unwrap(),
+                0xcf,
+                "SysVars must not write into the BIOS RAM stub cluster at {addr:#x}"
+            );
+        }
+    }
 }
