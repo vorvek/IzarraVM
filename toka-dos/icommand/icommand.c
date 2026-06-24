@@ -57,6 +57,74 @@ static char *split_word(char *src, char *word, int max)
     return skip_ws(src);
 }
 
+struct redirect {
+    char out[64];
+    char in[64];
+    int append;
+};
+
+/* Copy a filename token at *pp into `name` (case preserved), blanking the source
+ * bytes so the line that reaches split_word no longer carries the filename. */
+static void grab_filename(char **pp, char *name)
+{
+    char *p = *pp;
+    int i = 0;
+    while (*p == ' ' || *p == '\t') {
+        *p++ = ' ';
+    }
+    while (*p && *p != ' ' && *p != '\t' && *p != '>' && *p != '<' && i < 63) {
+        name[i++] = *p;
+        *p++ = ' ';
+    }
+    name[i] = 0;
+    *pp = p;
+}
+
+/* Scan `line` in place for > >> < and their filenames, fill `rd`, and blank the
+ * redirect tokens out of `line`. Returns 1 if any redirect was parsed. A bare
+ * operator with no filename is left literal. */
+static int parse_redirects(char *line, struct redirect *rd)
+{
+    char *p = line;
+    int found = 0;
+    rd->out[0] = 0;
+    rd->in[0] = 0;
+    rd->append = 0;
+    while (*p) {
+        if (*p == '>') {
+            char *op = p;
+            int append = 0;
+            char name[64];
+            char *q;
+            *p++ = ' ';
+            if (*p == '>') { append = 1; *p++ = ' '; }
+            q = p;
+            grab_filename(&q, name);
+            if (name[0]) {
+                strcpy(rd->out, name);
+                rd->append = append;
+                found = 1;
+                p = q;
+            } else {
+                *op = '>';
+                if (append) { op[1] = '>'; }
+            }
+        } else if (*p == '<') {
+            char *op = p;
+            char name[64];
+            char *q;
+            *p++ = ' ';
+            q = p;
+            grab_filename(&q, name);
+            if (name[0]) { strcpy(rd->in, name); found = 1; p = q; }
+            else { *op = '<'; }
+        } else {
+            p++;
+        }
+    }
+    return found;
+}
+
 static int has_wildcard(const char *s)
 {
     while (*s) {
@@ -620,6 +688,10 @@ static void cmd_time(void)
 }
 
 static void dispatch(char *word, char *rest);
+static void dispatch_redirected(char *word, char *rest, struct redirect *rd);
+
+static struct redirect bat_redir;
+static int bat_redir_found;
 
 /* ERRORLEVEL: the exit code of the last external program. */
 static int errorlevel = 0;
@@ -855,6 +927,7 @@ static void bat_exec_line(char *raw)
         return;
     }
     bat_expand(p, expanded);
+    bat_redir_found = parse_redirects(expanded, &bat_redir);
     if (bat_echo && !at) {
         render_prompt();
         t_putln(expanded);
@@ -881,9 +954,11 @@ static void bat_exec_line(char *raw)
         t_getkey();
     } else if (eqi(word, "CALL")) {
         char *r2 = split_word(rest, word, sizeof word);
-        dispatch(word, r2);
+        if (bat_redir_found) { dispatch_redirected(word, r2, &bat_redir); }
+        else { dispatch(word, r2); }
     } else if (!run_assignment(expanded)) {
-        dispatch(word, rest);
+        if (bat_redir_found) { dispatch_redirected(word, rest, &bat_redir); }
+        else { dispatch(word, rest); }
     }
 }
 
@@ -1084,6 +1159,47 @@ static void dispatch(char *word, char *rest)
     }
 }
 
+/* Run dispatch under the redirects in `rd`: save the standard handle with t_dup,
+ * point it at the file with t_dup2, run the command, then restore and close. On
+ * an open/create failure print an error and skip the command. */
+static void dispatch_redirected(char *word, char *rest, struct redirect *rd)
+{
+    int save_out = -1, save_in = -1;
+    int fout = -1, fin = -1;
+
+    if (rd->out[0]) {
+        fout = rd->append ? t_open_append(rd->out) : t_create(rd->out);
+        if (fout < 0) {
+            t_puts("Cannot create file ");
+            t_putln(rd->out);
+            return;
+        }
+    }
+    if (rd->in[0]) {
+        fin = t_open(rd->in, 0);
+        if (fin < 0) {
+            if (fout >= 0) { t_close(fout); }
+            t_puts("File not found ");
+            t_putln(rd->in);
+            return;
+        }
+    }
+
+    if (fout >= 0) { save_out = t_dup(1); t_dup2(fout, 1); }
+    if (fin >= 0) { save_in = t_dup(0); t_dup2(fin, 0); }
+
+    dispatch(word, rest);
+
+    if (fin >= 0) {
+        if (save_in >= 0) { t_dup2(save_in, 0); t_close(save_in); }
+        t_close(fin);
+    }
+    if (fout >= 0) {
+        if (save_out >= 0) { t_dup2(save_out, 1); t_close(save_out); }
+        t_close(fout);
+    }
+}
+
 int main(void)
 {
     char line[LINE_MAX];
@@ -1100,8 +1216,11 @@ int main(void)
     }
 
     for (;;) {
+        struct redirect rd;
+        int redir;
         render_prompt();
         t_getline(line, LINE_MAX);
+        redir = parse_redirects(line, &rd);
         rest = split_word(line, word, sizeof word);
         if (word[0] == 0) {
             continue;
@@ -1109,7 +1228,11 @@ int main(void)
         if (run_assignment(line)) {
             continue;
         }
-        dispatch(word, rest);
+        if (redir) {
+            dispatch_redirected(word, rest, &rd);
+        } else {
+            dispatch(word, rest);
+        }
     }
     /* not reached */
 }

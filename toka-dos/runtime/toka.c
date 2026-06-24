@@ -238,6 +238,61 @@ void t_close(int handle)
     int86(0x21, &r, &r);
 }
 
+/* Duplicate `handle` (AH=45h): a new handle aliasing the same open file, sharing
+ * its seek position. -1 on error. */
+int t_dup(int handle)
+{
+    union REGS r;
+    r.h.ah = 0x45;
+    r.x.bx = (unsigned)handle;
+    int86(0x21, &r, &r);
+    return r.x.cflag ? -1 : (int)r.x.ax;
+}
+
+/* Force `dst` to refer to the same open file as `src` (AH=46h), closing `dst`
+ * first. 0 on success, -1 on error. The shell points handle 1 or 0 at a file. */
+int t_dup2(int src, int dst)
+{
+    union REGS r;
+    r.h.ah = 0x46;
+    r.x.bx = (unsigned)src;
+    r.x.cx = (unsigned)dst;
+    int86(0x21, &r, &r);
+    return r.x.cflag ? -1 : 0;
+}
+
+/* Seek (AH=42h). `whence`: 0 start, 1 current, 2 end. Returns the new offset, or
+ * -1 on error. */
+long t_lseek(int handle, long offset, int whence)
+{
+    union REGS r;
+    r.h.ah = 0x42;
+    r.h.al = (unsigned char)whence;
+    r.x.bx = (unsigned)handle;
+    r.x.cx = (unsigned)(offset >> 16);
+    r.x.dx = (unsigned)(offset & 0xffff);
+    int86(0x21, &r, &r);
+    if (r.x.cflag) {
+        return -1L;
+    }
+    return ((long)r.x.dx << 16) | (long)r.x.ax;
+}
+
+/* Open `path` for appending: open read/write if it exists, else create it, then
+ * seek to end. Returns a handle or -1. Used for the `>>` redirect. */
+int t_open_append(const char *path)
+{
+    int handle = t_open(path, 2);
+    if (handle < 0) {
+        return t_create(path); /* fresh file is already at offset 0 == end */
+    }
+    if (t_lseek(handle, 0L, 2) < 0L) {
+        t_close(handle);
+        return -1;
+    }
+    return handle;
+}
+
 /* Shared body for the path-only directory calls that return CF/AX. */
 static int dir_call(unsigned char ah, const char *path)
 {
