@@ -570,6 +570,25 @@ fn sound_blaster_env_entries(config: &SoundBlasterConfig) -> Vec<(String, String
     ]
 }
 
+fn device_call_error_code(command: u8, status: u16) -> u16 {
+    let status_code = status & 0x00ff;
+    if status & 0x8000 != 0 && status_code != 0 {
+        return status_code;
+    }
+    match command {
+        8 => 0x001d, // write fault
+        4 => 0x001e, // read fault
+        _ => 0x001f, // general failure
+    }
+}
+
+fn device_request_packet_len(command: u8) -> u8 {
+    match command {
+        0x0d | 0x0e => 0x0d, // OPEN/CLOSE carry only the common request header.
+        _ => 0x1a,
+    }
+}
+
 impl Machine {
     /// Shared field initialization for the public constructors. They differ only
     /// in the CPU entry state and the ROM image, so each hands those in and
@@ -4768,15 +4787,24 @@ impl Machine {
                 command,
                 transfer,
                 count,
+                success_ax,
+                rollback_handle_on_error,
             } => {
                 // Far-call the driver on the CPU. It runs through the same nested
                 // seam SYSINIT used, which restores the program's register context,
                 // so SS:SP returns to the INT frame the input registers were
-                // marshalled onto. Write the result over AX and the stacked CF the
-                // way the EXEC-return path edits the frame.
+                // marshalled onto. Write the result over AX (transferred count for
+                // read/write, preserved or supplied AX for control calls) and the
+                // stacked CF the way the EXEC-return path edits the frame.
                 let (ax, cf) = match self.device_call_outcome(header, command, transfer, count) {
-                    Ok(count) => (count, false),
-                    Err(code) => (code, true),
+                    Ok(count) => (success_ax.unwrap_or(count), false),
+                    Err(code) => {
+                        self.dos.record_last_error(code);
+                        if let Some(handle) = rollback_handle_on_error {
+                            self.dos.rollback_failed_device_open(handle);
+                        }
+                        (code, true)
+                    }
                 };
                 self.cpu
                     .registers
@@ -5076,8 +5104,8 @@ impl Machine {
 
     /// Run a CallDevice action with the re-entrancy guard, returning Ok(count) on
     /// success or Err(dos_error_code) on a fault. A host-side failure of the nested
-    /// call (a memory or CPU fault) is reported as a general device failure (0x1D),
-    /// not propagated as an abort. The fixed request packet is not reentrant, so a
+    /// call (a memory or CPU fault) is reported as a DOS device error, not
+    /// propagated as an abort. The fixed request packet is not reentrant, so a
     /// driver that issues its own device I/O while it runs is refused rather than
     /// allowed to clobber the packet and grow the host stack. in_device_call is
     /// reset before this returns, so an error can never leave the guard stuck.
@@ -5088,8 +5116,9 @@ impl Machine {
         transfer: izarravm_dos::FarPtr,
         count: u16,
     ) -> Result<u16, u16> {
+        let fallback_error = device_call_error_code(command, 0);
         if self.in_device_call {
-            return Err(0x001d); // nested device call: the fixed packet is not reentrant
+            return Err(fallback_error); // nested device call: the fixed packet is not reentrant
         }
         self.in_device_call = true;
         let r = self.service_device_call(header, command, transfer, count);
@@ -5097,19 +5126,19 @@ impl Machine {
         match r {
             Ok((count, None)) => Ok(count),
             Ok((_, Some(code))) => Err(code),
-            Err(_) => Err(0x001d), // host-side failure: general device failure
+            Err(_) => Err(fallback_error), // host-side failure: command-keyed device failure
         }
     }
 
-    /// Service a CallDevice action: build a DOS request packet for a READ (command
-    /// 4) or WRITE (command 8), far-call the driver's strategy then interrupt on the
-    /// CPU, and read back the transferred count and error bit. The driver reads or
-    /// writes the caller's transfer buffer directly through the packet's transfer
-    /// far pointer, the way a real device driver does. The register context the
-    /// program was running with is restored by call_driver_request, so the only
-    /// effect on the program is the count and CF the action handler writes back.
-    /// On success returns the transferred count with `None`; on a driver fault it
-    /// returns `(0, Some(code))` with a command-keyed DOS error code.
+    /// Service a CallDevice action: build a DOS request packet for OPEN (0Dh),
+    /// CLOSE (0Eh), READ (4), or WRITE (8), far-call the driver's strategy then
+    /// interrupt on the CPU, and read back the transferred count and error bit. The
+    /// driver reads or writes the caller's transfer buffer directly through the
+    /// packet's transfer far pointer, the way a real device driver does. The
+    /// register context the program was running with is restored by
+    /// call_driver_request, so the only effect on the program is the AX and CF the
+    /// action handler writes back. On success returns the transferred count with
+    /// `None`; on a driver fault it returns `(0, Some(code))` with a DOS error code.
     fn service_device_call(
         &mut self,
         header: izarravm_dos::FarPtr,
@@ -5121,13 +5150,16 @@ impl Machine {
         for i in 0..0x1a {
             self.memory.write_u8(req + i, 0)?;
         }
-        self.memory.write_u8(req, 0x1a)?; // +0x00 request-header length
+        self.memory
+            .write_u8(req, device_request_packet_len(command))?; // +0x00 request length
         self.memory.write_u8(req + 0x01, 0)?; // +0x01 unit (single-unit char device)
-        self.memory.write_u8(req + 0x02, command)?; // +0x02 command: 4 read, 8 write
+        self.memory.write_u8(req + 0x02, command)?; // +0x02 command
         self.memory.write_u16(req + 0x03, 0)?; // +0x03 status (the driver fills it)
-        self.memory.write_u16(req + 0x0e, transfer.offset)?; // +0x0E transfer offset
-        self.memory.write_u16(req + 0x10, transfer.segment)?; // +0x10 transfer segment
-        self.memory.write_u16(req + 0x12, count)?; // +0x12 requested byte count
+        if matches!(command, 4 | 8) {
+            self.memory.write_u16(req + 0x0e, transfer.offset)?; // +0x0E transfer offset
+            self.memory.write_u16(req + 0x10, transfer.segment)?; // +0x10 transfer segment
+            self.memory.write_u16(req + 0x12, count)?; // +0x12 requested byte count
+        }
 
         let header_lin = usize::from(header.segment) * 16 + usize::from(header.offset);
         let strat_off = self.memory.read_u16(header_lin + 6)?;
@@ -5145,10 +5177,7 @@ impl Machine {
         let status = self.memory.read_u16(req + 0x03)?;
         let done_count = self.memory.read_u16(req + 0x12)?;
         if !done || status & 0x8000 != 0 {
-            // Command-keyed DOS device fault: 8 = write -> 0x1D write fault, 4 =
-            // read -> 0x1E read fault. 0x05 stays reserved for the access-mode
-            // denial the kernel already handles before reaching the driver.
-            let code = if command == 8 { 0x1d } else { 0x1e };
+            let code = device_call_error_code(command, status);
             return Ok((0, Some(code)));
         }
         Ok((done_count, None))
@@ -7772,6 +7801,72 @@ mod tests {
         assert_eq!(m.cpu.registers, saved);
     }
 
+    #[test]
+    fn service_device_call_uses_header_only_packets_for_open_and_close() {
+        // OPEN and CLOSE are header-only device requests. They must not expose a
+        // read/write transfer pointer or count to a driver that happens to inspect
+        // the packet tail.
+        let mut m = test_machine();
+        let done_body = [0x26, 0xc7, 0x47, 0x03, 0x00, 0x01];
+        place_driver_with_interrupt(&mut m, 0x3000, b"PKTFMT  ", &done_body);
+        let header = izarravm_dos::FarPtr {
+            segment: 0x3000,
+            offset: 0,
+        };
+        let bogus_transfer = izarravm_dos::FarPtr {
+            segment: 0x4444,
+            offset: 0x2222,
+        };
+
+        for &(command, label) in &[(0x0d, "OPEN"), (0x0e, "CLOSE")] {
+            let (count, err) = m
+                .service_device_call(header, command, bogus_transfer, 0x7777)
+                .unwrap();
+            assert_eq!(err, None, "{label} succeeds");
+            assert_eq!(count, 0, "{label} has no transferred count");
+
+            let req = DEVICE_REQUEST_SCRATCH;
+            assert_eq!(
+                m.memory.read_u8(req).unwrap(),
+                0x0d,
+                "{label} packet length"
+            );
+            assert_eq!(m.memory.read_u8(req + 0x01).unwrap(), 0, "{label} unit");
+            assert_eq!(
+                m.memory.read_u8(req + 0x02).unwrap(),
+                command,
+                "{label} command"
+            );
+            assert_eq!(
+                m.memory.read_u16(req + 0x03).unwrap(),
+                0x0100,
+                "{label} DONE status"
+            );
+            for off in 0x05..0x0d {
+                assert_eq!(
+                    m.memory.read_u8(req + off).unwrap(),
+                    0,
+                    "{label} reserved byte {off:#04x} is zero"
+                );
+            }
+            assert_eq!(
+                m.memory.read_u16(req + 0x0e).unwrap(),
+                0,
+                "{label} has no transfer offset"
+            );
+            assert_eq!(
+                m.memory.read_u16(req + 0x10).unwrap(),
+                0,
+                "{label} has no transfer segment"
+            );
+            assert_eq!(
+                m.memory.read_u16(req + 0x12).unwrap(),
+                0,
+                "{label} has no byte count"
+            );
+        }
+    }
+
     /// Place a minimal character driver at `seg`:0 whose strategy is a bare RETF
     /// (it leaves ES:BX = the request packet, which call_driver_request already set)
     /// and whose interrupt routine is `int_body` followed by a RETF. The 18-byte
@@ -7793,6 +7888,273 @@ mod tests {
         }
         // The HLT sentinel the driver's far return lands on.
         m.memory.write_u8(SYSINIT_HALT_STUB, 0xf4).unwrap();
+    }
+
+    fn marker_device_image_with_status(name: &[u8; 8], attributes: u16, status: u16) -> Vec<u8> {
+        let mut image = vec![0xff, 0xff, 0xff, 0xff]; // next-driver far pointer
+        image.extend_from_slice(&attributes.to_le_bytes());
+        image.extend_from_slice(&0x12u16.to_le_bytes()); // strategy offset
+        image.extend_from_slice(&0x13u16.to_le_bytes()); // interrupt offset
+        image.extend_from_slice(name);
+        image.push(0xcb); // strategy: RETF
+        let [status_lo, status_hi] = status.to_le_bytes();
+        image.extend_from_slice(&[
+            0x26, 0x8a, 0x47, 0x02, // mov al, es:[bx+2] ; request command
+            0x2e, 0xa2, 0x40, 0x00, // mov cs:[0040], al ; marker
+            0x26, 0xc7, 0x47, 0x03, status_lo, status_hi, // mov word es:[bx+3], status
+            0xcb,      // interrupt: RETF
+        ]);
+        image.resize(0x41, 0);
+        image
+    }
+
+    fn marker_device_image_with_failing_close(name: &[u8; 8], attributes: u16) -> Vec<u8> {
+        let mut image = vec![0xff, 0xff, 0xff, 0xff]; // next-driver far pointer
+        image.extend_from_slice(&attributes.to_le_bytes());
+        image.extend_from_slice(&0x12u16.to_le_bytes()); // strategy offset
+        image.extend_from_slice(&0x13u16.to_le_bytes()); // interrupt offset
+        image.extend_from_slice(name);
+        image.push(0xcb); // strategy: RETF
+        image.extend_from_slice(&[
+            0x26, 0x8a, 0x47, 0x02, // mov al, es:[bx+2] ; request command
+            0x2e, 0xa2, 0x40, 0x00, // mov cs:[0040], al ; marker
+            0x3c, 0x0e, // cmp al,0Eh ; CLOSE?
+            0xb8, 0x00, 0x01, // mov ax,0x0100 ; DONE success by default
+            0x75, 0x03, // jne store
+            0xb8, 0x06, 0x81, // mov ax,0x8106 ; DONE + error 6
+            0x26, 0x89, 0x47, 0x03, // store: mov es:[bx+3],ax
+            0xcb, // interrupt: RETF
+        ]);
+        image.resize(0x41, 0);
+        image
+    }
+
+    fn marker_device_image(name: &[u8; 8], attributes: u16) -> Vec<u8> {
+        marker_device_image_with_status(name, attributes, 0x0100)
+    }
+
+    fn stage_marker_device(
+        m: &mut Machine,
+        name: &[u8; 8],
+        attributes: u16,
+    ) -> izarravm_dos::FarPtr {
+        let image = marker_device_image(name, attributes);
+        let staged = m.dos.stage_sys_driver(&image, "", &mut m.memory).unwrap();
+        m.memory
+            .write_u16(staged.request_linear + 0x03, 0x0100)
+            .unwrap();
+        m.memory
+            .write_u16(staged.request_linear + 0x0e, 0x0050)
+            .unwrap();
+        m.memory
+            .write_u16(staged.request_linear + 0x10, staged.driver_seg)
+            .unwrap();
+        m.dos.finalize_sys_driver(&staged, &mut m.memory).unwrap();
+        izarravm_dos::FarPtr {
+            segment: staged.driver_seg,
+            offset: 0,
+        }
+    }
+
+    fn write_guest_asciiz(m: &mut Machine, seg: u16, off: u16, text: &str) {
+        let base = usize::from(seg) * 16 + usize::from(off);
+        for (i, &b) in text.as_bytes().iter().enumerate() {
+            m.memory.write_u8(base + i, b).unwrap();
+        }
+        m.memory.write_u8(base + text.len(), 0).unwrap();
+    }
+
+    fn prime_dos_int_frame(m: &mut Machine) {
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Ss, SegmentRegister::real(0x9000));
+        m.cpu.registers.set_esp(0x0100);
+        m.memory.write_u16(0x9000 * 16 + 0x0104, 0x0001).unwrap();
+    }
+
+    fn dos_int_flags(m: &Machine) -> u16 {
+        m.memory.read_u16(0x9000 * 16 + 0x0104).unwrap()
+    }
+
+    #[test]
+    fn device_open_close_notifications_preserve_guest_ax() {
+        let mut m = test_machine();
+        m.dos.init_program(0x0100, 0x1100, &mut m.memory).unwrap();
+        let header = stage_marker_device(&mut m, b"OPENCLOS", 0x8800);
+        let marker = usize::from(header.segment) * 16 + 0x40;
+        write_guest_asciiz(&mut m, 0x0100, 0x0080, "OPENCLOS");
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x0100));
+        m.cpu.registers.set_edx(0x0080);
+
+        prime_dos_int_frame(&mut m);
+        m.cpu.registers.set_eax(0x3d02);
+        m.handle_dos_int(0x21).unwrap();
+
+        let handle = m.cpu.registers.eax() as u16;
+        assert_eq!(handle, 5, "open must leave AX as the allocated handle");
+        assert_eq!(dos_int_flags(&m) & 1, 0, "open returns CF clear");
+        assert_eq!(m.memory.read_u8(marker).unwrap(), 0x0d, "driver saw OPEN");
+
+        m.memory.write_u8(marker, 0).unwrap();
+        prime_dos_int_frame(&mut m);
+        m.cpu.registers.set_eax(0x3e7b);
+        m.cpu.registers.set_ebx(u32::from(handle));
+        m.handle_dos_int(0x21).unwrap();
+
+        assert_eq!(
+            m.cpu.registers.eax() as u16,
+            0x3e7b,
+            "close success keeps AX unchanged"
+        );
+        assert_eq!(dos_int_flags(&m) & 1, 0, "close returns CF clear");
+        assert_eq!(m.memory.read_u8(marker).unwrap(), 0x0e, "driver saw CLOSE");
+
+        prime_dos_int_frame(&mut m);
+        m.cpu.registers.set_eax(0x3f00);
+        m.cpu.registers.set_ebx(u32::from(handle));
+        m.cpu.registers.set_ecx(1);
+        m.cpu.registers.set_edx(0x0200);
+        m.handle_dos_int(0x21).unwrap();
+
+        assert_eq!(
+            m.cpu.registers.eax() as u16,
+            0x0006,
+            "closed handle is invalid"
+        );
+        assert_eq!(dos_int_flags(&m) & 1, 1, "closed handle read sets CF");
+    }
+
+    #[test]
+    fn failed_device_open_rolls_back_allocated_handle() {
+        let mut m = test_machine();
+        m.dos.init_program(0x0100, 0x1100, &mut m.memory).unwrap();
+        let image = marker_device_image_with_status(b"FAILOPEN", 0x8800, 0x8105);
+        let staged = m.dos.stage_sys_driver(&image, "", &mut m.memory).unwrap();
+        m.memory
+            .write_u16(staged.request_linear + 0x03, 0x0100)
+            .unwrap();
+        m.memory
+            .write_u16(staged.request_linear + 0x0e, 0x0050)
+            .unwrap();
+        m.memory
+            .write_u16(staged.request_linear + 0x10, staged.driver_seg)
+            .unwrap();
+        m.dos.finalize_sys_driver(&staged, &mut m.memory).unwrap();
+        let marker = usize::from(staged.driver_seg) * 16 + 0x40;
+        write_guest_asciiz(&mut m, 0x0100, 0x0080, "FAILOPEN");
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x0100));
+        m.cpu.registers.set_edx(0x0080);
+
+        prime_dos_int_frame(&mut m);
+        m.cpu.registers.set_eax(0x3d02);
+        m.handle_dos_int(0x21).unwrap();
+
+        assert_eq!(dos_int_flags(&m) & 1, 1, "failed open returns CF set");
+        assert_eq!(m.cpu.registers.eax() as u16, 0x0005, "OPEN error code");
+        assert_eq!(m.memory.read_u8(marker).unwrap(), 0x0d, "driver saw OPEN");
+
+        prime_dos_int_frame(&mut m);
+        m.cpu.registers.set_eax(0x5900);
+        m.handle_dos_int(0x21).unwrap();
+
+        assert_eq!(
+            m.cpu.registers.eax() as u16,
+            0x0005,
+            "AH=59h sees OPEN error"
+        );
+        assert_eq!(dos_int_flags(&m) & 1, 0, "AH=59h succeeds");
+
+        prime_dos_int_frame(&mut m);
+        m.cpu.registers.set_eax(0x3f00);
+        m.cpu.registers.set_ebx(5);
+        m.cpu.registers.set_ecx(1);
+        m.cpu.registers.set_edx(0x0200);
+        m.handle_dos_int(0x21).unwrap();
+
+        assert_eq!(
+            m.cpu.registers.eax() as u16,
+            0x0006,
+            "handle 5 was rolled back"
+        );
+        assert_eq!(dos_int_flags(&m) & 1, 1, "rolled-back handle read sets CF");
+    }
+
+    #[test]
+    fn failed_device_close_reports_error_but_drops_handle() {
+        let mut m = test_machine();
+        m.dos.init_program(0x0100, 0x1100, &mut m.memory).unwrap();
+        let image = marker_device_image_with_failing_close(b"FAILCLOS", 0x8800);
+        let staged = m.dos.stage_sys_driver(&image, "", &mut m.memory).unwrap();
+        m.memory
+            .write_u16(staged.request_linear + 0x03, 0x0100)
+            .unwrap();
+        m.memory
+            .write_u16(staged.request_linear + 0x0e, 0x0050)
+            .unwrap();
+        m.memory
+            .write_u16(staged.request_linear + 0x10, staged.driver_seg)
+            .unwrap();
+        m.dos.finalize_sys_driver(&staged, &mut m.memory).unwrap();
+        let marker = usize::from(staged.driver_seg) * 16 + 0x40;
+        write_guest_asciiz(&mut m, 0x0100, 0x0080, "FAILCLOS");
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x0100));
+        m.cpu.registers.set_edx(0x0080);
+
+        prime_dos_int_frame(&mut m);
+        m.cpu.registers.set_eax(0x3d02);
+        m.handle_dos_int(0x21).unwrap();
+        let handle = m.cpu.registers.eax() as u16;
+
+        assert_eq!(handle, 5, "open returns the allocated handle");
+        assert_eq!(dos_int_flags(&m) & 1, 0, "open returns CF clear");
+        assert_eq!(m.memory.read_u8(marker).unwrap(), 0x0d, "driver saw OPEN");
+
+        m.memory.write_u8(marker, 0).unwrap();
+        prime_dos_int_frame(&mut m);
+        m.cpu.registers.set_eax(0x3e00);
+        m.cpu.registers.set_ebx(u32::from(handle));
+        m.handle_dos_int(0x21).unwrap();
+
+        assert_eq!(dos_int_flags(&m) & 1, 1, "failed close returns CF set");
+        assert_eq!(m.cpu.registers.eax() as u16, 0x0006, "CLOSE error code");
+        assert_eq!(m.memory.read_u8(marker).unwrap(), 0x0e, "driver saw CLOSE");
+
+        prime_dos_int_frame(&mut m);
+        m.cpu.registers.set_eax(0x5900);
+        m.handle_dos_int(0x21).unwrap();
+
+        assert_eq!(
+            m.cpu.registers.eax() as u16,
+            0x0006,
+            "AH=59h sees CLOSE error"
+        );
+        assert_eq!(dos_int_flags(&m) & 1, 0, "AH=59h succeeds");
+
+        m.memory.write_u8(marker, 0).unwrap();
+        prime_dos_int_frame(&mut m);
+        m.cpu.registers.set_eax(0x3f00);
+        m.cpu.registers.set_ebx(u32::from(handle));
+        m.cpu.registers.set_ecx(1);
+        m.cpu.registers.set_edx(0x0200);
+        m.handle_dos_int(0x21).unwrap();
+
+        assert_eq!(
+            m.cpu.registers.eax() as u16,
+            0x0006,
+            "failed close still drops the handle"
+        );
+        assert_eq!(dos_int_flags(&m) & 1, 1, "dropped handle read sets CF");
+        assert_eq!(
+            m.memory.read_u8(marker).unwrap(),
+            0,
+            "read did not call driver"
+        );
     }
 
     #[test]
@@ -7820,6 +8182,7 @@ mod tests {
     fn service_device_call_honors_the_driver_error_bit() {
         // The interrupt routine sets status 0x8100 (DONE + error). A WRITE keys to
         // 0x1D (write fault), a READ to 0x1E (read fault); both report CF=1.
+        // If the driver sets a low-byte code, that code wins.
         // mov word [es:bx+3], 0x8100  =  0x26 0xC7 0x47 0x03 0x00 0x81
         let int_body = [0x26, 0xc7, 0x47, 0x03, 0x00, 0x81];
         let mut m = test_machine();
@@ -7838,13 +8201,23 @@ mod tests {
         let (rcount, rerr) = m.service_device_call(header, 4, xfer, 5).unwrap();
         assert_eq!(rcount, 0);
         assert_eq!(rerr, Some(0x1e), "read fault");
+
+        let coded_body = [0x26, 0xc7, 0x47, 0x03, 0x05, 0x81];
+        place_driver_with_interrupt(&mut m, 0x3100, b"ERRCODE ", &coded_body);
+        let coded = izarravm_dos::FarPtr {
+            segment: 0x3100,
+            offset: 0,
+        };
+        let (ocount, oerr) = m.service_device_call(coded, 0x0d, xfer, 0).unwrap();
+        assert_eq!(ocount, 0);
+        assert_eq!(oerr, Some(0x05), "driver status code");
     }
 
     #[test]
     fn a_nested_device_call_is_refused_without_recursing() {
         // With in_device_call already set (as it is while a driver runs on the
-        // borrowed context), a CallDevice must be refused as a device failure
-        // (0x1D / CF=1) instead of re-entering the fixed packet and recursing.
+        // borrowed context), a CallDevice must be refused as a command-keyed
+        // device failure instead of re-entering the fixed packet and recursing.
         let mut m = test_machine();
         place_inline_io_driver(&mut m, 0x3000);
         let header = izarravm_dos::FarPtr {
@@ -7856,8 +8229,14 @@ mod tests {
             offset: 0,
         };
         m.in_device_call = true;
-        let outcome = m.device_call_outcome(header, 4, xfer, 4);
-        assert_eq!(outcome, Err(0x001d), "nested call refused, no recursion");
+        let read = m.device_call_outcome(header, 4, xfer, 4);
+        assert_eq!(read, Err(0x001e), "nested read is a read fault");
+        let write = m.device_call_outcome(header, 8, xfer, 4);
+        assert_eq!(write, Err(0x001d), "nested write is a write fault");
+        let open = m.device_call_outcome(header, 0x0d, izarravm_dos::FarPtr::default(), 0);
+        assert_eq!(open, Err(0x001f), "nested open is a general failure");
+        let close = m.device_call_outcome(header, 0x0e, izarravm_dos::FarPtr::default(), 0);
+        assert_eq!(close, Err(0x001f), "nested close is a general failure");
         // The guard the test forced is left untouched on the refused path: the
         // outer call that set it owns clearing it.
         assert!(m.in_device_call);

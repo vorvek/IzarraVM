@@ -33,6 +33,7 @@ const KBD_HEAD: usize = 0x1a;
 const KBD_TAIL: usize = 0x1c;
 const KBD_RING_START: u16 = 0x1e;
 const KBD_RING_END: u16 = 0x3e; // exclusive
+const DEVICE_ATTR_OPEN_CLOSE: u16 = 0x0800;
 
 fn kbd_ring_is_empty(mem: &Memory) -> Result<bool, DosError> {
     let head = mem.read_u16(KBD_BDA_BASE + KBD_HEAD)?;
@@ -400,15 +401,17 @@ pub enum DosAction {
     /// keyboard ring empty. The machine rewinds the INT 21h so it re-executes
     /// after the ISR refills the ring. The kernel leaves the registers unchanged.
     WaitForKey,
-    /// Read from or write to a loaded character device. The kernel cannot far-call
-    /// the driver itself, so the machine builds the DOS request packet, far-calls
-    /// the driver's strategy then interrupt on the CPU, and writes the transferred
-    /// count (or an error) back to the program's AX and CF.
+    /// Call a loaded character device. The kernel cannot far-call the driver
+    /// itself, so the machine builds the DOS request packet, far-calls the driver's
+    /// strategy then interrupt on the CPU, and writes either the transferred count
+    /// or an explicit success AX back to the program along with CF.
     CallDevice {
-        header: FarPtr,   // the driver header, for the strategy/interrupt entries
-        command: u8,      // 4 = READ, 8 = WRITE
-        transfer: FarPtr, // the caller's DS:DX buffer
-        count: u16,       // the requested byte count
+        header: FarPtr,          // the driver header, for the strategy/interrupt entries
+        command: u8,             // 4 = READ, 8 = WRITE, 0Dh = OPEN, 0Eh = CLOSE
+        transfer: FarPtr,        // the caller's DS:DX buffer, if the command uses one
+        count: u16,              // the requested byte count, if the command uses one
+        success_ax: Option<u16>, // None => return transferred count in AX
+        rollback_handle_on_error: Option<u16>, // rollback a just-opened handle if the driver fails
     },
 }
 
@@ -1152,6 +1155,18 @@ impl DosKernel {
             }
         }
         None
+    }
+
+    /// Device attribute bit 11 asks DOS to send command 0Dh/0Eh on open/close.
+    fn device_supports_open_close(&self, mem: &Memory, header: FarPtr) -> bool {
+        let base = usize::from(header.segment) * 16 + usize::from(header.offset);
+        mem.read_u16(base + 4)
+            .is_ok_and(|attr| attr & DEVICE_ATTR_OPEN_CLOSE != 0)
+    }
+
+    /// Drop a loaded-device handle whose driver rejected its OPEN request.
+    pub fn rollback_failed_device_open(&mut self, handle: u16) {
+        self.device_handles.remove(&handle);
     }
 
     /// Test accessor: the header far pointer recorded for an open device handle.
@@ -2752,6 +2767,12 @@ impl DosKernel {
         set_dos_error(regs, code);
     }
 
+    /// Record a DOS error code that was discovered after the kernel yielded a
+    /// follow-up action to the machine, such as a loaded-driver request failure.
+    pub fn record_last_error(&mut self, code: u16) {
+        self.last_error = code;
+    }
+
     fn refresh_sda(&self, mem: &mut Memory) -> Result<(u16, u16), DosError> {
         write_sda(
             mem,
@@ -2939,6 +2960,16 @@ impl DosKernel {
                             .insert(handle, OpenDeviceHandle { header, mode });
                         regs.ax = handle;
                         regs.cf = false;
+                        if self.device_supports_open_close(mem, header) {
+                            return Ok(DosAction::CallDevice {
+                                header,
+                                command: 0x0d,
+                                transfer: FarPtr::default(),
+                                count: 0,
+                                success_ax: Some(handle),
+                                rollback_handle_on_error: Some(handle),
+                            });
+                        }
                         return Ok(DosAction::Continue);
                     }
                 }
@@ -3072,6 +3103,8 @@ impl DosKernel {
                             offset: regs.dx,
                         },
                         count: regs.cx,
+                        success_ax: None,
+                        rollback_handle_on_error: None,
                     });
                 }
                 let Some(of) = self.open_files.get(&handle) else {
@@ -3112,11 +3145,20 @@ impl DosKernel {
             // AH=3Eh: close the handle in BX. Dropping the File closes it (RAII).
             // CF=0 if the handle was open, CF=1 + AX=0x06 if it was not.
             0x3e => {
-                if self.open_files.remove(&regs.bx).is_some()
-                    || self.ems_handles.remove(&regs.bx)
-                    || self.device_handles.remove(&regs.bx).is_some()
-                {
+                if self.open_files.remove(&regs.bx).is_some() || self.ems_handles.remove(&regs.bx) {
                     regs.cf = false;
+                } else if let Some(dev) = self.device_handles.remove(&regs.bx) {
+                    regs.cf = false;
+                    if self.device_supports_open_close(mem, dev.header) {
+                        return Ok(DosAction::CallDevice {
+                            header: dev.header,
+                            command: 0x0e,
+                            transfer: FarPtr::default(),
+                            count: 0,
+                            success_ax: Some(regs.ax),
+                            rollback_handle_on_error: None,
+                        });
+                    }
                 } else {
                     set_dos_error(regs, 0x06);
                 }
@@ -3533,6 +3575,8 @@ impl DosKernel {
                             offset: regs.dx,
                         },
                         count: regs.cx,
+                        success_ax: None,
+                        rollback_handle_on_error: None,
                     });
                 }
                 // AUX (3, COM1) and PRN (4, LPT1): accept the write and report every
@@ -13392,15 +13436,18 @@ mod tests {
 
     // --- Slice 4b: character-device I/O routing -----------------------------
 
-    /// Stage a TESTDEV-style raw `.SYS` image with the given 8-byte name, simulate
-    /// a successful INIT, and finalize it so loaded_devices lists its header. The
-    /// header lands at driver_seg:0. Returns that header far pointer.
-    fn stage_and_finalize_inline_device(
+    /// Stage a TESTDEV-style raw `.SYS` image with the given 8-byte name and
+    /// attributes, simulate a successful INIT, and finalize it so loaded_devices
+    /// lists its header. The header lands at driver_seg:0. Returns that header far
+    /// pointer.
+    fn stage_and_finalize_inline_device_with_attr(
         dos: &mut DosKernel,
         mem: &mut Memory,
         name: &[u8; 8],
+        attributes: u16,
     ) -> FarPtr {
         let mut image = driver::tests_char_image();
+        image[4..6].copy_from_slice(&attributes.to_le_bytes());
         image[10..18].copy_from_slice(name);
         let staged = dos.stage_sys_driver(&image, "", mem).unwrap();
         // Simulate a successful INIT: status DONE, break one paragraph of resident.
@@ -13413,6 +13460,14 @@ mod tests {
             segment: staged.driver_seg,
             offset: 0x0000,
         }
+    }
+
+    fn stage_and_finalize_inline_device(
+        dos: &mut DosKernel,
+        mem: &mut Memory,
+        name: &[u8; 8],
+    ) -> FarPtr {
+        stage_and_finalize_inline_device_with_attr(dos, mem, name, 0x8000)
     }
 
     /// Write an ASCIIZ string into guest memory at seg:off.
@@ -13450,6 +13505,41 @@ mod tests {
     }
 
     #[test]
+    fn open_a_device_with_open_close_bit_requests_driver_open() {
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let mut dos = DosKernel::new();
+        dos.init_program(0x0100, 0x1100, &mut mem).unwrap();
+        let header =
+            stage_and_finalize_inline_device_with_attr(&mut dos, &mut mem, b"OPENCLOS", 0x8800);
+        write_asciiz(&mut mem, 0x0100, 0x0080, "OPENCLOS");
+
+        let mut regs = open_regs(0x0100, 0x0080, 2);
+        let action = dos.dispatch(0x21, &mut regs, &mut mem).unwrap();
+
+        assert!(!regs.cf);
+        let handle = regs.ax;
+        assert_eq!(dos.device_handle_header_for_test(handle), Some(header));
+        match action {
+            DosAction::CallDevice {
+                header: h,
+                command,
+                transfer,
+                count,
+                success_ax,
+                rollback_handle_on_error,
+            } => {
+                assert_eq!(h, header);
+                assert_eq!(command, 0x0d, "command 0Dh is DEVICE OPEN");
+                assert_eq!(transfer, FarPtr::default());
+                assert_eq!(count, 0);
+                assert_eq!(success_ax, Some(handle));
+                assert_eq!(rollback_handle_on_error, Some(handle));
+            }
+            other => panic!("expected CallDevice for DEVICE OPEN, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn open_a_device_name_with_path_and_extension_still_opens_it() {
         let mut mem = Memory::new(1024 * 1024).unwrap();
         let mut dos = DosKernel::new();
@@ -13480,9 +13570,51 @@ mod tests {
             bx: handle,
             ..DosRegs::default()
         };
-        dos.dispatch(0x21, &mut close, &mut mem).unwrap();
+        let action = dos.dispatch(0x21, &mut close, &mut mem).unwrap();
         assert!(!close.cf);
         assert!(dos.device_handle_header_for_test(handle).is_none());
+        assert_eq!(action, DosAction::Continue);
+    }
+
+    #[test]
+    fn close_a_device_with_open_close_bit_requests_driver_close() {
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let mut dos = DosKernel::new();
+        dos.init_program(0x0100, 0x1100, &mut mem).unwrap();
+        let header =
+            stage_and_finalize_inline_device_with_attr(&mut dos, &mut mem, b"OPENCLOS", 0x8800);
+        write_asciiz(&mut mem, 0x0100, 0x0080, "OPENCLOS");
+        let mut open = open_regs(0x0100, 0x0080, 2);
+        dos.dispatch(0x21, &mut open, &mut mem).unwrap();
+        let handle = open.ax;
+
+        let mut close = DosRegs {
+            ax: 0x3e7b,
+            bx: handle,
+            ..DosRegs::default()
+        };
+        let action = dos.dispatch(0x21, &mut close, &mut mem).unwrap();
+
+        assert!(!close.cf);
+        assert!(dos.device_handle_header_for_test(handle).is_none());
+        match action {
+            DosAction::CallDevice {
+                header: h,
+                command,
+                transfer,
+                count,
+                success_ax,
+                rollback_handle_on_error,
+            } => {
+                assert_eq!(h, header);
+                assert_eq!(command, 0x0e, "command 0Eh is DEVICE CLOSE");
+                assert_eq!(transfer, FarPtr::default());
+                assert_eq!(count, 0);
+                assert_eq!(success_ax, Some(0x3e7b));
+                assert_eq!(rollback_handle_on_error, None);
+            }
+            other => panic!("expected CallDevice for DEVICE CLOSE, got {other:?}"),
+        }
     }
 
     #[test]
@@ -13537,9 +13669,13 @@ mod tests {
                 command,
                 transfer,
                 count,
+                success_ax,
+                rollback_handle_on_error,
             } => {
                 assert_eq!(command, 4);
                 assert_eq!(count, 4);
+                assert_eq!(success_ax, None);
+                assert_eq!(rollback_handle_on_error, None);
                 assert_eq!(
                     transfer,
                     FarPtr {
@@ -13571,9 +13707,13 @@ mod tests {
                 command,
                 transfer,
                 count,
+                success_ax,
+                rollback_handle_on_error,
             } => {
                 assert_eq!(command, 8);
                 assert_eq!(count, 3);
+                assert_eq!(success_ax, None);
+                assert_eq!(rollback_handle_on_error, None);
                 assert_eq!(
                     transfer,
                     FarPtr {
