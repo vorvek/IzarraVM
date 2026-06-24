@@ -684,32 +684,34 @@ fn apply_create_attributes(path: &Path, attrs: u16) -> std::io::Result<()> {
     std::fs::set_permissions(path, perms)
 }
 
+/// Strip a DOS filename down to its device base name: take the last path
+/// component (after any drive or directory), drop a leading `X:` drive specifier,
+/// then keep everything before the first `.` extension. DOS matches a device by
+/// this base name regardless of drive, path, or extension, so TESTDEV,
+/// C:\DEV\TESTDEV, C:TESTDEV, and TESTDEV.XYZ all reduce to "TESTDEV".
+fn device_base_name(name: &str) -> &str {
+    let mut last = name.rsplit(['\\', '/']).next().unwrap_or(name);
+    // A bare drive specifier like "C:NAME" has no path separator, so strip the
+    // leading two-char "X:" here (after the path split, before the extension).
+    let bytes = last.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        last = &last[2..];
+    }
+    last.split('.').next().unwrap_or("")
+}
+
 /// Whether a DOS filename names the EMMXXXX0 character device. DOS matches a
 /// device by its base name regardless of drive, path, or extension, so EMMXXXX0,
 /// C:\EMMXXXX0, and EMMXXXX0.SYS all refer to the device.
 fn is_ems_device_name(name: &str) -> bool {
-    name.rsplit(['\\', '/'])
-        .next()
-        .unwrap_or(name)
-        .split('.')
-        .next()
-        .unwrap_or("")
-        .eq_ignore_ascii_case("EMMXXXX0")
+    device_base_name(name).eq_ignore_ascii_case("EMMXXXX0")
 }
 
-/// The match key for a DOS device-open name: strip any leading path (drive or
-/// directories) and a trailing extension, then upper-case and trim. DOS opens a
-/// device by its 1-8 char base name, so TESTDEV, C:\DEV\TESTDEV, and TESTDEV.XYZ
-/// all key to "TESTDEV".
+/// The match key for a DOS device-open name: the device base name, upper-cased
+/// and trimmed. DOS opens a device by its 1-8 char base name, so TESTDEV,
+/// C:\DEV\TESTDEV, C:TESTDEV, and TESTDEV.XYZ all key to "TESTDEV".
 fn device_name_key(name: &str) -> String {
-    name.rsplit(['\\', '/'])
-        .next()
-        .unwrap_or(name)
-        .split('.')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_uppercase()
+    device_base_name(name).trim().to_ascii_uppercase()
 }
 
 /// One entry of a FindFirst/FindNext result: the documented DTA fields plus the
@@ -1124,15 +1126,22 @@ impl DosKernel {
     /// device, which is not openable by name in 4b).
     fn find_loaded_character_device(&self, mem: &Memory, name: &str) -> Option<FarPtr> {
         let wanted = device_name_key(name);
-        for &(seg, off) in &self.loaded_devices {
+        'devices: for &(seg, off) in &self.loaded_devices {
             let base = usize::from(seg) * 16 + usize::from(off);
-            let attr = mem.read_u16(base + 4).ok()?;
+            // A failed read is a bad header, not a function-level error: skip this
+            // entry so a valid match on a later device is not hidden.
+            let Ok(attr) = mem.read_u16(base + 4) else {
+                continue;
+            };
             if attr & 0x8000 == 0 {
                 continue; // block device, not openable by name in 4b
             }
             let mut raw = [0u8; 8];
             for (i, b) in raw.iter_mut().enumerate() {
-                *b = mem.read_u8(base + 0x0a + i).ok()?;
+                let Ok(byte) = mem.read_u8(base + 0x0a + i) else {
+                    continue 'devices;
+                };
+                *b = byte;
             }
             let have = String::from_utf8_lossy(&raw).trim().to_ascii_uppercase();
             if have == wanted {
@@ -3948,6 +3957,7 @@ impl DosKernel {
                 };
                 if regs.cx != regs.bx {
                     self.ems_handles.remove(&regs.cx);
+                    self.device_handles.remove(&regs.cx);
                     self.open_files.insert(regs.cx, cloned);
                 }
                 regs.cf = false;
@@ -13639,7 +13649,196 @@ mod tests {
         let action = dos.dispatch(0x21, &mut regs, &mut mem).unwrap();
         assert_eq!(action, DosAction::Continue);
         assert!(!regs.cf);
-        // ISDEV (bit 7) set: the guest sees a character device, not a file.
-        assert_ne!(regs.dx & 0x0080, 0, "ISDEV bit set; got {:#06x}", regs.dx);
+        // ISDEV (bit 7) set, no other capability bit: the stage_and_finalize fixture
+        // header has attribute 0x8000 (character, no IOCTL), so the info word is
+        // exactly ISDEV.
+        assert_eq!(
+            regs.dx, 0x0080,
+            "info word is exactly ISDEV; got {:#06x}",
+            regs.dx
+        );
+    }
+
+    #[test]
+    fn ioctl_get_device_data_reflects_the_driver_ioctl_attribute_bit() {
+        // A device whose header attribute sets bit 14 (0x4000, supports IOCTL) must
+        // be reflected in the info word's bit 14, proving the attribute is read from
+        // the header and not fabricated.
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let mut dos = DosKernel::new();
+        dos.init_program(0x0100, 0x1100, &mut mem).unwrap();
+        let header = stage_and_finalize_inline_device(&mut dos, &mut mem, b"IOCTLDEV");
+        // Set the supports-IOCTL bit in the live driver header attribute word.
+        let base = usize::from(header.segment) * 16 + usize::from(header.offset);
+        let attr = mem.read_u16(base + 4).unwrap();
+        mem.write_u16(base + 4, attr | 0x4000).unwrap();
+
+        write_asciiz(&mut mem, 0x0100, 0x0080, "IOCTLDEV");
+        let mut open = open_regs(0x0100, 0x0080, 2);
+        dos.dispatch(0x21, &mut open, &mut mem).unwrap();
+        assert!(!open.cf);
+        let handle = open.ax;
+
+        let mut regs = DosRegs {
+            ax: 0x4400,
+            bx: handle,
+            ..DosRegs::default()
+        };
+        dos.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf);
+        // ISDEV (bit 7 = 0x80) plus supports-IOCTL (bit 14 = 0x4000).
+        assert_eq!(
+            regs.dx, 0x4080,
+            "ISDEV + supports-IOCTL; got {:#06x}",
+            regs.dx
+        );
+    }
+
+    #[test]
+    fn device_name_key_strips_path_drive_and_extension() {
+        // A bare name, a full path, a bare drive specifier, and a name with an
+        // extension all key to the same device base name.
+        assert_eq!(device_name_key("TESTDEV"), "TESTDEV");
+        assert_eq!(device_name_key("\\DEV\\TESTDEV"), "TESTDEV");
+        assert_eq!(device_name_key("C:\\DEV\\TESTDEV"), "TESTDEV");
+        assert_eq!(device_name_key("TESTDEV.XYZ"), "TESTDEV");
+        // The fix: a bare "X:NAME" drive specifier with no path separator.
+        assert_eq!(device_name_key("C:TESTDEV"), "TESTDEV");
+        assert_eq!(device_name_key("c:testdev.sys"), "TESTDEV");
+    }
+
+    #[test]
+    fn open_a_device_with_a_bare_drive_prefix_still_opens_it() {
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let mut dos = DosKernel::new();
+        dos.init_program(0x0100, 0x1100, &mut mem).unwrap();
+        let header = stage_and_finalize_inline_device(&mut dos, &mut mem, b"MYDEV   ");
+        // "C:MYDEV" has a drive specifier but no path separator.
+        write_asciiz(&mut mem, 0x0100, 0x0080, "C:MYDEV");
+        let mut regs = open_regs(0x0100, 0x0080, 2);
+        dos.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf, "open failed: ax={:#06x}", regs.ax);
+        assert_eq!(dos.device_handle_header_for_test(regs.ax), Some(header));
+    }
+
+    #[test]
+    fn forcedup_onto_a_device_handle_drops_the_device_entry() {
+        // AH=46h FORCEDUP of a file handle onto an open device handle must remove
+        // the device entry, so later I/O on that number routes to the file, not the
+        // dead driver. Without the fix the device entry shadows the file (read/write
+        // check device_handles first) and the entry leaks on close.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("DATA.TXT"), b"abc").unwrap();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let mut dos = DosKernel::new();
+        dos.mount_c(HostDrive::mount_c(dir.path()).unwrap());
+        dos.init_program(0x0100, 0x1100, &mut mem).unwrap();
+        stage_and_finalize_inline_device(&mut dos, &mut mem, b"MYDEV   ");
+
+        // Open the device on some handle, then open a host file on another.
+        write_asciiz(&mut mem, 0x0100, 0x0080, "MYDEV");
+        let mut dev_open = open_regs(0x0100, 0x0080, 2);
+        dos.dispatch(0x21, &mut dev_open, &mut mem).unwrap();
+        let dev_handle = dev_open.ax;
+        assert!(dos.device_handle_header_for_test(dev_handle).is_some());
+
+        write_asciiz(&mut mem, 0x0100, 0x0090, "C:\\DATA.TXT");
+        let mut file_open = open_regs(0x0100, 0x0090, 0);
+        dos.dispatch(0x21, &mut file_open, &mut mem).unwrap();
+        let file_handle = file_open.ax;
+
+        // FORCEDUP the file handle onto the device handle number.
+        let mut dup = DosRegs {
+            ax: 0x4600,
+            bx: file_handle,
+            cx: dev_handle,
+            ..DosRegs::default()
+        };
+        dos.dispatch(0x21, &mut dup, &mut mem).unwrap();
+        assert!(!dup.cf);
+
+        // The device entry is gone: I/O on that number now takes the file path.
+        assert!(dos.device_handle_header_for_test(dev_handle).is_none());
+        let mut read = DosRegs {
+            ax: 0x3f00,
+            bx: dev_handle,
+            cx: 3,
+            ds: 0x0100,
+            dx: 0x0300,
+            ..DosRegs::default()
+        };
+        let action = dos.dispatch(0x21, &mut read, &mut mem).unwrap();
+        assert_eq!(
+            action,
+            DosAction::Continue,
+            "read takes the file path, not CallDevice"
+        );
+        assert!(!read.cf);
+        assert_eq!(read.ax, 3, "three bytes read from the file");
+    }
+
+    #[test]
+    fn exec_inherits_a_parent_device_handle_and_drops_a_child_only_one() {
+        // Mirror the open-file inheritance test for device handles: a device handle
+        // opened in the parent survives the EXEC clone and restore, while a device
+        // handle opened only in the child is gone after finish_exec.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CHILD.COM"), [0xcdu8, 0x20]).unwrap();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let mut kernel = DosKernel::new();
+        kernel.init_program(0x0100, 0x1100, &mut mem).unwrap();
+        kernel.mount_c(HostDrive::mount_c(dir.path()).unwrap());
+        let parent_header = stage_and_finalize_inline_device(&mut kernel, &mut mem, b"PARENT  ");
+        write_asciiz(&mut mem, 0x0100, 0x0200, "PARENT");
+        let mut popen = open_regs(0x0100, 0x0200, 2);
+        kernel.dispatch(0x21, &mut popen, &mut mem).unwrap();
+        let parent_handle = popen.ax;
+        assert_eq!(
+            kernel.device_handle_header_for_test(parent_handle),
+            Some(parent_header)
+        );
+
+        place_exec_inputs(&mut mem, "C:\\CHILD.COM", 0);
+        let exec = exec_al0(&mut kernel, &mut mem);
+        assert!(!exec.cf);
+        // The child inherits the parent's device handle through the clone.
+        assert_eq!(
+            kernel.device_handle_header_for_test(parent_handle),
+            Some(parent_header),
+            "child inherits the parent device handle"
+        );
+        // Register a second device handle only in the child. A child PSP fills
+        // conventional memory, so staging a real second driver has no room; insert
+        // the handle directly, which is what the open path would record.
+        let child_header = FarPtr {
+            segment: 0x2000,
+            offset: 0,
+        };
+        let child_handle = kernel.alloc_handle().unwrap();
+        assert_ne!(child_handle, parent_handle);
+        kernel.device_handles.insert(
+            child_handle,
+            OpenDeviceHandle {
+                header: child_header,
+                mode: AccessMode::ReadWrite,
+            },
+        );
+        assert_eq!(
+            kernel.device_handle_header_for_test(child_handle),
+            Some(child_header)
+        );
+
+        kernel.finish_exec(0, &mut mem).unwrap();
+
+        // The parent's device handle survives; the child-only one is dropped.
+        assert_eq!(
+            kernel.device_handle_header_for_test(parent_handle),
+            Some(parent_header),
+            "parent device handle survives the child exit"
+        );
+        assert!(
+            kernel.device_handle_header_for_test(child_handle).is_none(),
+            "child-only device handle is gone after finish_exec"
+        );
     }
 }
