@@ -1427,8 +1427,10 @@ impl DosKernel {
         // free base) are freed back to the parent, UNLESS the child itself kept
         // resident (a TSR), in which case keep_resident already left a correct free
         // tail above its block. AH=48h blocks allocated from the UMB arena are
-        // owner-tagged with the child's PSP and are swept on normal exit too; TSRs
-        // keep their UMBs because the resident program may still use them.
+        // owner-tagged with the child's PSP and are swept here on every terminating
+        // exit (normal AH=4Ch/INT 20h and abnormal Ctrl-C/critical-error aborts all
+        // funnel through finish_exec); TSRs keep their UMBs because the resident
+        // program may still use them.
         let child_resident = self.arena.resident;
         let child_psp = self.arena.psp_seg;
         if let Some(parent) = self.program_stack.pop() {
@@ -11625,6 +11627,50 @@ mod tests {
         let full_pool = match kernel.request_umb(0x003f, &mut mem).unwrap() {
             Ok(seg) => seg,
             Err(largest) => panic!("child UMB leaked; largest free UMB was {largest:#06x}"),
+        };
+        assert_eq!(full_pool, 0xc801);
+    }
+
+    #[test]
+    fn abnormal_int20_exit_reclaims_child_upper_memory_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        // CHILD.COM is INT 20h (the legacy/abnormal terminate), not AH=4Ch.
+        std::fs::write(dir.path().join("CHILD.COM"), [0xcdu8, 0x20]).unwrap();
+        let (mut kernel, mut mem) = exec_kernel(dir.path());
+        kernel.set_umb_region(0xc800, 0x0040, &mut mem).unwrap();
+        kernel.set_dos_umb(true);
+        kernel.set_umb_link(true);
+        set_alloc_strategy(&mut kernel, &mut mem, 0x0040);
+
+        place_exec_inputs(&mut mem, "C:\\CHILD.COM", 0);
+        let regs = exec_al0(&mut kernel, &mut mem);
+        assert!(!regs.cf);
+        assert_eq!(kernel.arena.psp_seg, 0x0203);
+
+        let child_umb = dos_alloc(&mut kernel, &mut mem, 0x0010);
+        assert!(!child_umb.cf);
+        assert!(
+            (0xc801..0xc840).contains(&child_umb.ax),
+            "child allocation came from the UMB arena"
+        );
+
+        // The child terminates abnormally via INT 20h. The kernel returns Exit(0);
+        // the machine then pops the parent frame and completes teardown through
+        // finish_exec. Mirror that sequence here.
+        let mut term = DosRegs::default();
+        let action = kernel.dispatch(0x20, &mut term, &mut mem).unwrap();
+        assert_eq!(
+            action,
+            DosAction::Exit(0),
+            "INT 20h must terminate the child"
+        );
+        kernel.finish_exec(0, &mut mem).unwrap();
+
+        let full_pool = match kernel.request_umb(0x003f, &mut mem).unwrap() {
+            Ok(seg) => seg,
+            Err(largest) => {
+                panic!("child UMB leaked after abnormal exit; largest free UMB was {largest:#06x}")
+            }
         };
         assert_eq!(full_pool, 0xc801);
     }
