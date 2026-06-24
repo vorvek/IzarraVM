@@ -146,7 +146,7 @@ struct toka_epb {
     unsigned fcb2_seg;
 };
 
-int t_exec(const char *path, const char *tail)
+int t_exec_env(const char *path, const char *tail, unsigned env_seg)
 {
     static unsigned char tailbuf[130];
     static unsigned char fcb[16];
@@ -163,7 +163,7 @@ int t_exec(const char *path, const char *tail)
     tailbuf[1 + tlen] = 0x0d;
 
     segread(&s);
-    epb.env_seg = 0;
+    epb.env_seg = env_seg;
     epb.tail_off = (unsigned)tailbuf;
     epb.tail_seg = s.ds;
     epb.fcb1_off = (unsigned)fcb;
@@ -181,6 +181,11 @@ int t_exec(const char *path, const char *tail)
         return (int)r.x.ax;   /* DOS error code (2 = not found) */
     }
     return 0;
+}
+
+int t_exec(const char *path, const char *tail)
+{
+    return t_exec_env(path, tail, 0);
 }
 
 int t_open(const char *path, int mode)

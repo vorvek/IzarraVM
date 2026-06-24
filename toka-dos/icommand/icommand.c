@@ -9,6 +9,7 @@
  * (SET/PATH/PROMPT) and batch processing arrive next.
  */
 #include <string.h>
+#include <dos.h>
 #include "toka.h"
 
 #define LINE_MAX 128
@@ -167,6 +168,69 @@ static void env_list(void)
         t_putln(p);
         p += strlen(p) + 1;
     }
+}
+
+/* Length of the master environment block in bytes, including the terminating
+ * empty string (the lone NUL after the last entry). */
+static unsigned env_block_len(void)
+{
+    char *p = master_env;
+    while (*p) {
+        p += strlen(p) + 1;
+    }
+    return (unsigned)(p - master_env) + 1; /* include the final terminating NUL */
+}
+
+/* Copy master_env into a freshly allocated DOS segment and return its paragraph,
+ * or 0 on failure. The child is given this as its environment. */
+static unsigned build_env_segment(void)
+{
+    unsigned len = env_block_len();
+    unsigned paras = (unsigned)((len + 15) / 16);
+    union REGS r;
+    unsigned seg;
+    char far *dst;
+    unsigned i;
+
+    r.h.ah = 0x48;       /* allocate memory */
+    r.x.bx = paras;
+    int86(0x21, &r, &r);
+    if (r.x.cflag) {
+        return 0;        /* out of memory: caller inherits instead */
+    }
+    seg = r.x.ax;
+
+    dst = (char far *)MK_FP(seg, 0);
+    for (i = 0; i < len; i++) {
+        dst[i] = master_env[i];
+    }
+    return seg;
+}
+
+/* Release a segment from build_env_segment (INT 21h AH=49h). */
+static void free_env_segment(unsigned seg)
+{
+    union REGS r;
+    struct SREGS s;
+    segread(&s);
+    r.h.ah = 0x49;       /* free memory */
+    s.es = seg;          /* ES = segment to free */
+    int86x(0x21, &r, &r, &s);
+}
+
+/* Launch a child with the current master_env, so a SET/PATH made after boot
+ * reaches it. On a low-memory machine where the env segment cannot be built,
+ * fall back to inheriting (the old behavior) so the launch still happens. */
+static int exec_with_env(const char *path, const char *tail)
+{
+    unsigned seg = build_env_segment();
+    int rc;
+    if (seg == 0) {
+        return t_exec_env(path, tail, 0);
+    }
+    rc = t_exec_env(path, tail, seg);
+    free_env_segment(seg);
+    return rc;
 }
 
 /* Draw the prompt from the PROMPT variable, expanding the $ codes. Falls back to
@@ -902,12 +966,12 @@ static int try_dir(const char *dir, const char *name, const char *tail)
 {
     char path[100];
     join_path(path, dir, name, ".COM");
-    if (t_exec(path, tail) != 2) {
+    if (exec_with_env(path, tail) != 2) {
         errorlevel = t_lastexit();
         return 1;
     }
     join_path(path, dir, name, ".EXE");
-    if (t_exec(path, tail) != 2) {
+    if (exec_with_env(path, tail) != 2) {
         errorlevel = t_lastexit();
         return 1;
     }

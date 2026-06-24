@@ -40,6 +40,11 @@ void t_exit(int code);
  * AX if the program could not be loaded (2 = not found). */
 int t_exec(const char *path, const char *tail);
 
+/* As t_exec, but with an explicit environment. `env_seg` is the paragraph of a
+ * DOS-format environment block to give the child, or 0 to inherit the parent
+ * environment (the t_exec behavior). */
+int t_exec_env(const char *path, const char *tail, unsigned env_seg);
+
 /* --- DOS file and directory services (INT 21h) ------------------------------
  * Path-based calls take a DOS path (drive-qualified, absolute, or relative to
  * the current directory). Directory calls return 0 on success or the DOS error

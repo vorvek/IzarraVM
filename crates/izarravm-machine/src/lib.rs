@@ -16038,6 +16038,110 @@ mod tests {
         );
     }
 
+    /// IBM Set-1 make codes for every character the SET and TESTS commands type.
+    /// ICOMMAND uppercases verbs, so lowercase input needs no Shift. Returns
+    /// make + break (make | 0x80), or an empty vec for an unmapped char.
+    #[cfg(test)]
+    fn tests_env_key_codes(ch: char) -> Vec<u8> {
+        let make: u8 = match ch {
+            's' => 0x1f,
+            'e' => 0x12,
+            't' => 0x14,
+            'f' => 0x21,
+            'o' => 0x18,
+            'h' => 0x23,
+            'l' => 0x26,
+            'n' => 0x31,
+            'v' => 0x2f,
+            'w' => 0x11,
+            'r' => 0x13,
+            'g' => 0x22,
+            'a' => 0x1e,
+            'u' => 0x16,
+            ' ' => 0x39,
+            '=' => 0x0d,
+            '\r' => 0x1c,
+            _ => return Vec::new(),
+        };
+        vec![make, make | 0x80]
+    }
+
+    /// Boot Toka-DOS on a fresh temp C: with the committed TESTS.COM copied into
+    /// the root, type each command, and run until the machine stops. Returns the
+    /// StopReason so a caller asserts on the unit-tester exit code. Stops early as
+    /// soon as TESTS issues its unit-tester exit.
+    #[cfg(test)]
+    fn run_tests_env_scenario(commands: &[&str]) -> StopReason {
+        let dir = tempfile::tempdir().unwrap();
+        let files = izarravm_firmware::toka_dos_system_files();
+        izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format)
+            .unwrap();
+
+        // The committed dev fixture lives at the repo root, two levels above this
+        // crate's manifest dir. Copy it into the temp C: root so ICOMMAND can EXEC
+        // it from C:\.
+        let tests_com = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("c_drive")
+            .join("TESTS.COM");
+        std::fs::copy(&tests_com, dir.path().join("TESTS.COM")).unwrap();
+
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .unwrap();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        machine.set_toka_c_root(dir.path().to_path_buf());
+        machine.run_until_halt_or_cycles(22_000_000).unwrap();
+
+        let mut reason = StopReason::Halted;
+        for cmd in commands {
+            for ch in cmd.chars() {
+                for code in tests_env_key_codes(ch) {
+                    machine.inject_key_scancodes(&[code]);
+                }
+                // Each typed char is an INT 21h HLE round-trip; the Enter that
+                // launches TESTS.COM needs room to EXEC and reach CMD_EXIT.
+                reason = machine.run_until_halt_or_cycles(8_000_000).unwrap();
+                if matches!(reason, StopReason::TestExit { .. }) {
+                    return reason;
+                }
+            }
+        }
+        reason
+    }
+
+    #[test]
+    fn toka_set_env_reaches_a_launched_child() {
+        // SET FOO=HELLO in ICOMMAND, then TESTS ENV FOO HELLO: the child must read
+        // its inherited environment and find FOO=HELLO, reporting exit 0 through
+        // the unit-tester. Proves the env segment ICOMMAND builds reaches EXEC.
+        let reason = run_tests_env_scenario(&["set foo=hello\r", "tests env foo hello\r"]);
+        assert_eq!(
+            reason,
+            StopReason::TestExit { code: 0 },
+            "the launched child sees FOO=HELLO from its inherited environment"
+        );
+    }
+
+    #[test]
+    fn toka_set_env_mismatch_reports_nonzero() {
+        // Negative guard: same SET, but TESTS compares against the wrong value, so
+        // the child's real env value does not match and TESTS exits non-zero. This
+        // is what makes the positive test meaningful: it fails loudly if TESTS ever
+        // returned 0 unconditionally.
+        let reason = run_tests_env_scenario(&["set foo=hello\r", "tests env foo wrongvalue\r"]);
+        match reason {
+            StopReason::TestExit { code } => assert_ne!(
+                code, 0,
+                "a value mismatch must report a non-zero unit-tester exit code"
+            ),
+            other => panic!("expected a TestExit from TESTS ENV, got {other:?}"),
+        }
+    }
+
     #[test]
     fn toka_path_assignment_with_empty_value_clears_the_path() {
         // Real COMMAND.COM: "PATH=" with no value clears the search path, and a
