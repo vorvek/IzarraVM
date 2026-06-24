@@ -7,7 +7,13 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use thiserror::Error;
 
+mod driver;
 mod memory;
+
+pub use driver::{
+    DeviceHeaderInfo, DriverLoadError, InitResult, build_init_request, parse_device_header,
+    read_init_result,
+};
 
 use memory::{
     ARENA_TOP, Arena, ResizeError, SDA_ALWAYS_SWAPPED_LEN, SDA_IN_DOS_SWAPPED_LEN,
