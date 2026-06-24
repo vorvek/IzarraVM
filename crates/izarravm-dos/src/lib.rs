@@ -2714,6 +2714,13 @@ impl DosKernel {
                 mem.write_u16(addr + 2, regs.ds)?;
                 Ok(DosAction::Continue)
             }
+            // AH=26h CREATE NEW PSP. DOS copies the current PSP to DX, then
+            // refreshes the memory-size word and saved INT 22h/23h/24h vectors.
+            0x26 => {
+                let top = psp_top_from_mcb_or_current(mem, self.arena.psp_seg, regs.dx)?;
+                copy_psp_from_current(mem, self.arena.psp_seg, regs.dx, top, 0)?;
+                Ok(DosAction::Continue)
+            }
             // AH=35h: get interrupt vector AL into ES:BX.
             0x35 => {
                 let addr = usize::from(regs.ax as u8) * 4;
@@ -3344,6 +3351,15 @@ impl DosKernel {
             }
             0x54 => {
                 regs.ax = (regs.ax & 0xff00) | u16::from(self.verify_flag);
+                Ok(DosAction::Continue)
+            }
+            // AH=55h CREATE CHILD PSP. This shares AH=26h's PSP-copy path, but
+            // uses SI as the memory-size word, links the child to the current PSP,
+            // and makes the child the current PSP.
+            0x55 => {
+                let parent = self.arena.psp_seg;
+                copy_psp_from_current(mem, parent, regs.dx, regs.si, parent)?;
+                self.arena.psp_seg = regs.dx;
                 Ok(DosAction::Continue)
             }
             // AH=58h memory-allocation strategy and UMB link state. AL=00/01 get/set
@@ -4124,6 +4140,50 @@ fn build_psp(mem: &mut Memory, psp_seg: u16, top_of_mem_paragraph: u16) -> Resul
     mem.write_u16(base + 0x36, psp_seg)?;
     mem.write_u8(base + 0x80, 0x00)?;
     mem.write_u8(base + 0x81, 0x0d)?;
+    Ok(())
+}
+
+fn psp_top_from_mcb_or_current(
+    mem: &Memory,
+    current_psp: u16,
+    target_psp: u16,
+) -> Result<u16, DosError> {
+    if target_psp != 0 {
+        let mcb = usize::from(target_psp.wrapping_sub(1)) * 16;
+        let sig = mem.read_u8(mcb)?;
+        if matches!(sig, b'M' | b'Z') {
+            return Ok(target_psp.wrapping_add(mem.read_u16(mcb + 3)?));
+        }
+    }
+    Ok(mem.read_u16(usize::from(current_psp) * 16 + 0x02)?)
+}
+
+fn copy_psp_from_current(
+    mem: &mut Memory,
+    current_psp: u16,
+    target_psp: u16,
+    top_of_mem_paragraph: u16,
+    parent_psp: u16,
+) -> Result<(), DosError> {
+    let source = usize::from(current_psp) * 16;
+    let target = usize::from(target_psp) * 16;
+    let mut bytes = [0u8; 0x100];
+    for (offset, byte) in bytes.iter_mut().enumerate() {
+        *byte = mem.read_u8(source + offset)?;
+    }
+    for (offset, &byte) in bytes.iter().enumerate() {
+        mem.write_u8(target + offset, byte)?;
+    }
+    mem.write_u16(target + 0x02, top_of_mem_paragraph)?;
+    for (psp_off, int_no) in [(0x0au16, 0x22u8), (0x0e, 0x23), (0x12, 0x24)] {
+        let ivt = usize::from(int_no) * 4;
+        mem.write_u16(target + usize::from(psp_off), mem.read_u16(ivt)?)?;
+        mem.write_u16(target + usize::from(psp_off) + 2, mem.read_u16(ivt + 2)?)?;
+    }
+    mem.write_u16(target + 0x16, parent_psp)?;
+    if mem.read_u16(target + 0x36)? == current_psp {
+        mem.write_u16(target + 0x36, target_psp)?;
+    }
     Ok(())
 }
 
@@ -11600,6 +11660,112 @@ mod tests {
         assert_eq!(mem.read_u8(psp + 0x1b).unwrap(), 0x03);
         assert_eq!(mem.read_u8(psp + 0x1c).unwrap(), 0x04);
         assert_eq!(mem.read_u8(psp + 0x18 + 19).unwrap(), 0xff); // last entry closed
+    }
+
+    #[test]
+    fn ah26_create_psp_copies_current_psp_and_refreshes_vectors() {
+        // RBIL: AH=26h creates a PSP at DX, copying the caller's PSP, while
+        // refreshing the top-of-memory word, saved INT 22h/23h/24h vectors from
+        // the IVT, and clearing the parent PSP field.
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        load_com(&[0xb8, 0x00, 0x4c, 0xcd, 0x21], &mut mem, 0x0100).unwrap();
+        let prog_top = mem.read_u16(0x0100 * 16 + 0x02).unwrap();
+        let mut kernel = DosKernel::new();
+        kernel.init_program(0x0100, prog_top, &mut mem).unwrap();
+        let parent = 0x0100usize * 16;
+        mem.write_u8(parent + 0x80, 4).unwrap();
+        for (i, &byte) in b"TAIL\r".iter().enumerate() {
+            mem.write_u8(parent + 0x81 + i, byte).unwrap();
+        }
+
+        let mut alloc = DosRegs {
+            ax: 0x4800,
+            bx: 0x0020,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut alloc, &mut mem).unwrap();
+        assert!(!alloc.cf, "allocation failed: ax={:#06x}", alloc.ax);
+        let target_psp = alloc.ax;
+
+        mem.write_u16(0x22 * 4, 0x1111).unwrap();
+        mem.write_u16(0x22 * 4 + 2, 0x2222).unwrap();
+        mem.write_u16(0x23 * 4, 0x3333).unwrap();
+        mem.write_u16(0x23 * 4 + 2, 0x4444).unwrap();
+        mem.write_u16(0x24 * 4, 0x5555).unwrap();
+        mem.write_u16(0x24 * 4 + 2, 0x6666).unwrap();
+
+        let mut create = DosRegs {
+            ax: 0x2600,
+            dx: target_psp,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut create, &mut mem).unwrap();
+
+        let target = usize::from(target_psp) * 16;
+        assert_eq!(mem.read_u16(target).unwrap(), 0x20cd);
+        assert_eq!(mem.read_u16(target + 0x02).unwrap(), target_psp + 0x0020);
+        assert_eq!(mem.read_u16(target + 0x0a).unwrap(), 0x1111);
+        assert_eq!(mem.read_u16(target + 0x0c).unwrap(), 0x2222);
+        assert_eq!(mem.read_u16(target + 0x0e).unwrap(), 0x3333);
+        assert_eq!(mem.read_u16(target + 0x10).unwrap(), 0x4444);
+        assert_eq!(mem.read_u16(target + 0x12).unwrap(), 0x5555);
+        assert_eq!(mem.read_u16(target + 0x14).unwrap(), 0x6666);
+        assert_eq!(mem.read_u16(target + 0x16).unwrap(), 0x0000);
+        assert_eq!(mem.read_u8(target + 0x80).unwrap(), 4);
+        for (i, &byte) in b"TAIL\r".iter().enumerate() {
+            assert_eq!(mem.read_u8(target + 0x81 + i).unwrap(), byte);
+        }
+    }
+
+    #[test]
+    fn ah55_create_child_psp_sets_parent_and_current_psp() {
+        // RBIL: AH=55h uses the AH=26h PSP creation path, but writes the parent
+        // PSP link to the current PSP, stores SI in PSP:02h, and makes DX the
+        // current PSP.
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        load_com(&[0xb8, 0x00, 0x4c, 0xcd, 0x21], &mut mem, 0x0100).unwrap();
+        let prog_top = mem.read_u16(0x0100 * 16 + 0x02).unwrap();
+        let mut kernel = DosKernel::new();
+        kernel.init_program(0x0100, prog_top, &mut mem).unwrap();
+        let parent = 0x0100usize * 16;
+        mem.write_u8(parent + 0x80, 3).unwrap();
+        for (i, &byte) in b"RUN\r".iter().enumerate() {
+            mem.write_u8(parent + 0x81 + i, byte).unwrap();
+        }
+
+        let mut alloc = DosRegs {
+            ax: 0x4800,
+            bx: 0x0030,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut alloc, &mut mem).unwrap();
+        assert!(!alloc.cf, "allocation failed: ax={:#06x}", alloc.ax);
+        let child_psp = alloc.ax;
+
+        let mut create = DosRegs {
+            ax: 0x5500,
+            dx: child_psp,
+            si: 0x7777,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut create, &mut mem).unwrap();
+
+        let child = usize::from(child_psp) * 16;
+        assert_eq!(mem.read_u16(child).unwrap(), 0x20cd);
+        assert_eq!(mem.read_u16(child + 0x02).unwrap(), 0x7777);
+        assert_eq!(mem.read_u16(child + 0x16).unwrap(), 0x0100);
+        assert_eq!(mem.read_u16(child + 0x36).unwrap(), child_psp);
+        assert_eq!(mem.read_u8(child + 0x80).unwrap(), 3);
+        for (i, &byte) in b"RUN\r".iter().enumerate() {
+            assert_eq!(mem.read_u8(child + 0x81 + i).unwrap(), byte);
+        }
+
+        let mut get_current = DosRegs {
+            ax: 0x5100,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut get_current, &mut mem).unwrap();
+        assert_eq!(get_current.bx, child_psp);
     }
 
     #[test]
