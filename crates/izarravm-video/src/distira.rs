@@ -203,6 +203,8 @@ pub const FBZ_PARAM_ADJUST: u32 = 1 << 26;
 pub const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
 pub const TEXTUREMODE_TCLAMPS: u32 = 1 << 6;
 pub const TEXTUREMODE_TCLAMPT: u32 = 1 << 7;
+pub const LOD_ODD: u32 = 1 << 18;
+pub const LOD_SPLIT: u32 = 1 << 19;
 pub const LOD_TMULTIBASEADDR: u32 = 1 << 24;
 pub const LOD_TMIRROR_S: u32 = 1 << 28;
 pub const LOD_TMIRROR_T: u32 = 1 << 29;
@@ -1962,10 +1964,16 @@ impl Distira {
     }
 
     fn tex_base_addr_for_tmu_lod(&self, tmu: usize, lod: u32) -> u32 {
-        if self.texture_lod_for_tmu(tmu) & LOD_TMULTIBASEADDR == 0 {
+        let lod_reg = self.texture_lod_for_tmu(tmu);
+        if lod_reg & LOD_TMULTIBASEADDR == 0 {
             return self.tex_base_addr_for_tmu(tmu);
         }
-        match lod {
+        let base_lod = if lod_reg & (LOD_SPLIT | LOD_ODD) == (LOD_SPLIT | LOD_ODD) && lod == 0 {
+            1
+        } else {
+            lod
+        };
+        match base_lod {
             0 => self.tex_base_addr_for_tmu(tmu),
             1 => self.tex_base_addr1[tmu],
             2 => self.tex_base_addr2[tmu],
