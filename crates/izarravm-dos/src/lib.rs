@@ -629,6 +629,17 @@ impl OpenFile {
     }
 }
 
+/// An open handle on a loaded character device. The header far pointer locates
+/// the driver's strategy and interrupt entries so a read or write can far-call
+/// them; the access mode is enforced the same way a file handle's is. The fields
+/// are read by the read/write/IOCTL routing added next.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+struct OpenDeviceHandle {
+    header: FarPtr,
+    mode: AccessMode,
+}
+
 /// A console handle. CON is bidirectional, so seed it ReadWrite; console writes
 /// never consult the mode and console reads go through the keyboard path.
 fn console_record() -> OpenFile {
@@ -678,6 +689,21 @@ fn is_ems_device_name(name: &str) -> bool {
         .eq_ignore_ascii_case("EMMXXXX0")
 }
 
+/// The match key for a DOS device-open name: strip any leading path (drive or
+/// directories) and a trailing extension, then upper-case and trim. DOS opens a
+/// device by its 1-8 char base name, so TESTDEV, C:\DEV\TESTDEV, and TESTDEV.XYZ
+/// all key to "TESTDEV".
+fn device_name_key(name: &str) -> String {
+    name.rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(name)
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_uppercase()
+}
+
 /// One entry of a FindFirst/FindNext result: the documented DTA fields plus the
 /// uppercase 8.3 name to write into the 13-byte ASCIIZ slot.
 #[derive(Debug, Clone)]
@@ -720,6 +746,7 @@ struct ProgramContext {
     find_searches: HashMap<(u16, u16), FindSearch>,
     open_files: HashMap<u16, OpenFile>,
     ems_handles: HashSet<u16>,
+    device_handles: HashMap<u16, OpenDeviceHandle>,
     // The parent's free-tail segment at the moment of EXEC. The child's env and
     // program blocks are carved from here upward, so on the child's exit finish_exec
     // frees the parent's memory back from this segment, capped below any resident
@@ -849,6 +876,11 @@ pub struct DosKernel {
     // after NUL). write_sysvars rebuilds the device-chain skeleton on every AH=52h
     // query, so these are re-spliced after NUL each time to survive the rebuild.
     loaded_devices: Vec<(u16, u16)>,
+    // Handles a guest has opened on a loaded CHARACTER device by name (AH=3Dh), so
+    // AH=3Fh read, AH=40h write, AH=44h IOCTL, and AH=3Eh close route to the driver
+    // rather than a host file. Parallel to ems_handles: inherited by an EXEC child,
+    // restored on the child's exit, skipped by alloc_handle, cleared on reboot.
+    device_handles: HashMap<u16, OpenDeviceHandle>,
 }
 
 impl DosKernel {
@@ -1071,8 +1103,44 @@ impl DosKernel {
     /// EMS-device handles so the two never collide. FILES= includes inherited
     /// handles 0-4, so dynamic handles stop before the configured count.
     fn alloc_handle(&self) -> Option<u16> {
-        (5u16..self.file_count())
-            .find(|h| !self.open_files.contains_key(h) && !self.ems_handles.contains(h))
+        (5u16..self.file_count()).find(|h| {
+            !self.open_files.contains_key(h)
+                && !self.ems_handles.contains(h)
+                && !self.device_handles.contains_key(h)
+        })
+    }
+
+    /// Find a loaded CHARACTER device whose name matches `name`, the way DOS opens
+    /// a device by name: case-insensitive, with any path and extension ignored.
+    /// Returns the driver header far pointer, or None for no match (or a block
+    /// device, which is not openable by name in 4b).
+    fn find_loaded_character_device(&self, mem: &Memory, name: &str) -> Option<FarPtr> {
+        let wanted = device_name_key(name);
+        for &(seg, off) in &self.loaded_devices {
+            let base = usize::from(seg) * 16 + usize::from(off);
+            let attr = mem.read_u16(base + 4).ok()?;
+            if attr & 0x8000 == 0 {
+                continue; // block device, not openable by name in 4b
+            }
+            let mut raw = [0u8; 8];
+            for (i, b) in raw.iter_mut().enumerate() {
+                *b = mem.read_u8(base + 0x0a + i).ok()?;
+            }
+            let have = String::from_utf8_lossy(&raw).trim().to_ascii_uppercase();
+            if have == wanted {
+                return Some(FarPtr {
+                    segment: seg,
+                    offset: off,
+                });
+            }
+        }
+        None
+    }
+
+    /// Test accessor: the header far pointer recorded for an open device handle.
+    #[cfg(test)]
+    fn device_handle_header_for_test(&self, handle: u16) -> Option<FarPtr> {
+        self.device_handles.get(&handle).map(|d| d.header)
     }
 
     pub fn file_count(&self) -> u16 {
@@ -1240,8 +1308,10 @@ impl DosKernel {
         self.umb_link = false;
         self.alloc_strategy = 0;
         // A warm reboot reloads CONFIG.SYS drivers from scratch; drop the prior
-        // session's loaded-device list so the chain starts at the bare skeleton.
+        // session's loaded-device list so the chain starts at the bare skeleton,
+        // and the handles opened on them.
         self.loaded_devices.clear();
+        self.device_handles.clear();
         build_psp(mem, psp_seg, ARENA_TOP)?;
         let prog_top = psp_seg.saturating_add(0x10); // the system PSP is its 256 bytes
         self.init_program(psp_seg, prog_top, mem)?;
@@ -1590,6 +1660,7 @@ impl DosKernel {
             find_searches: std::mem::take(&mut self.find_searches),
             open_files: self.open_files.clone(),
             ems_handles: self.ems_handles.clone(),
+            device_handles: self.device_handles.clone(),
             free_base: env_mcb,
         };
         self.program_stack.push(parent);
@@ -1633,6 +1704,7 @@ impl DosKernel {
             self.find_searches = parent.find_searches;
             self.open_files = parent.open_files;
             self.ems_handles = parent.ems_handles;
+            self.device_handles = parent.device_handles;
             if !child_resident {
                 free_umb_blocks_owned_by(self.umb, child_psp, mem)?;
                 // A resident TSR carved by this child or a descendant sits above the
@@ -2835,6 +2907,23 @@ impl DosKernel {
                         regs.cf = false;
                         return Ok(DosAction::Continue);
                     }
+                    // A loaded CHARACTER device opened by name. Record the handle
+                    // against the driver header so read/write/IOCTL route to it.
+                    if let Some(header) = self.find_loaded_character_device(mem, &name) {
+                        let Some(mode) = AccessMode::try_from_open_al(regs.ax as u8) else {
+                            set_dos_error(regs, 0x0c); // invalid access mode
+                            return Ok(DosAction::Continue);
+                        };
+                        let Some(handle) = self.alloc_handle() else {
+                            set_dos_error(regs, 0x04); // too many open files
+                            return Ok(DosAction::Continue);
+                        };
+                        self.device_handles
+                            .insert(handle, OpenDeviceHandle { header, mode });
+                        regs.ax = handle;
+                        regs.cf = false;
+                        return Ok(DosAction::Continue);
+                    }
                 }
                 let path = match self.resolve_open_path(mem, regs.ds, regs.dx)? {
                     Ok(path) => path,
@@ -2983,7 +3072,10 @@ impl DosKernel {
             // AH=3Eh: close the handle in BX. Dropping the File closes it (RAII).
             // CF=0 if the handle was open, CF=1 + AX=0x06 if it was not.
             0x3e => {
-                if self.open_files.remove(&regs.bx).is_some() || self.ems_handles.remove(&regs.bx) {
+                if self.open_files.remove(&regs.bx).is_some()
+                    || self.ems_handles.remove(&regs.bx)
+                    || self.device_handles.remove(&regs.bx).is_some()
+                {
                     regs.cf = false;
                 } else {
                     set_dos_error(regs, 0x06);
@@ -12424,6 +12516,7 @@ mod tests {
             find_searches: HashMap::new(),
             open_files: kernel.open_files.clone(),
             ems_handles: kernel.ems_handles.clone(),
+            device_handles: kernel.device_handles.clone(),
             free_base: 0x1100,
         });
         kernel.arena = Arena {
@@ -13214,5 +13307,120 @@ mod tests {
         }
         // "sub\..\game.exe" folds the "sub\.." away and uppercases to C:\GAME.EXE.
         assert_eq!(out, r"C:\GAME.EXE");
+    }
+
+    // --- Slice 4b: character-device I/O routing -----------------------------
+
+    /// Stage a TESTDEV-style raw `.SYS` image with the given 8-byte name, simulate
+    /// a successful INIT, and finalize it so loaded_devices lists its header. The
+    /// header lands at driver_seg:0. Returns that header far pointer.
+    fn stage_and_finalize_inline_device(
+        dos: &mut DosKernel,
+        mem: &mut Memory,
+        name: &[u8; 8],
+    ) -> FarPtr {
+        let mut image = driver::tests_char_image();
+        image[10..18].copy_from_slice(name);
+        let staged = dos.stage_sys_driver(&image, "", mem).unwrap();
+        // Simulate a successful INIT: status DONE, break one paragraph of resident.
+        mem.write_u16(staged.request_linear + 0x03, 0x0100).unwrap();
+        mem.write_u16(staged.request_linear + 0x0e, 0x0010).unwrap();
+        mem.write_u16(staged.request_linear + 0x10, staged.driver_seg)
+            .unwrap();
+        dos.finalize_sys_driver(&staged, mem).unwrap();
+        FarPtr {
+            segment: staged.driver_seg,
+            offset: 0x0000,
+        }
+    }
+
+    /// Write an ASCIIZ string into guest memory at seg:off.
+    fn write_asciiz(mem: &mut Memory, seg: u16, off: u16, text: &str) {
+        let base = usize::from(seg) * 16 + usize::from(off);
+        for (i, b) in text.bytes().enumerate() {
+            mem.write_u8(base + i, b).unwrap();
+        }
+        mem.write_u8(base + text.len(), 0).unwrap();
+    }
+
+    /// AH=3Dh open registers: DS:DX = ASCIIZ name, AL = access mode.
+    fn open_regs(ds: u16, dx: u16, al: u8) -> DosRegs {
+        DosRegs {
+            ax: 0x3d00 | u16::from(al),
+            ds,
+            dx,
+            ..DosRegs::default()
+        }
+    }
+
+    #[test]
+    fn open_a_loaded_character_device_returns_a_tracked_handle() {
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let mut dos = DosKernel::new();
+        dos.init_program(0x0100, 0x1100, &mut mem).unwrap();
+        let header = stage_and_finalize_inline_device(&mut dos, &mut mem, b"MYDEV   ");
+        write_asciiz(&mut mem, 0x0100, 0x0080, "MYDEV");
+        let mut regs = open_regs(0x0100, 0x0080, 2);
+        let action = dos.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(action, DosAction::Continue);
+        assert!(!regs.cf);
+        let handle = regs.ax;
+        assert_eq!(dos.device_handle_header_for_test(handle), Some(header));
+    }
+
+    #[test]
+    fn open_a_device_name_with_path_and_extension_still_opens_it() {
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let mut dos = DosKernel::new();
+        dos.init_program(0x0100, 0x1100, &mut mem).unwrap();
+        let header = stage_and_finalize_inline_device(&mut dos, &mut mem, b"MYDEV   ");
+        // DOS opens a device by base name regardless of path or extension.
+        write_asciiz(&mut mem, 0x0100, 0x0080, "C:\\DEV\\mydev.xyz");
+        let mut regs = open_regs(0x0100, 0x0080, 0);
+        dos.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(!regs.cf);
+        assert_eq!(dos.device_handle_header_for_test(regs.ax), Some(header));
+    }
+
+    #[test]
+    fn close_removes_a_device_handle() {
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let mut dos = DosKernel::new();
+        dos.init_program(0x0100, 0x1100, &mut mem).unwrap();
+        stage_and_finalize_inline_device(&mut dos, &mut mem, b"MYDEV   ");
+        write_asciiz(&mut mem, 0x0100, 0x0080, "MYDEV");
+        let mut regs = open_regs(0x0100, 0x0080, 2);
+        dos.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        let handle = regs.ax;
+        assert!(dos.device_handle_header_for_test(handle).is_some());
+
+        let mut close = DosRegs {
+            ax: 0x3e00,
+            bx: handle,
+            ..DosRegs::default()
+        };
+        dos.dispatch(0x21, &mut close, &mut mem).unwrap();
+        assert!(!close.cf);
+        assert!(dos.device_handle_header_for_test(handle).is_none());
+    }
+
+    #[test]
+    fn alloc_handle_skips_device_handles() {
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let mut dos = DosKernel::new();
+        dos.init_program(0x0100, 0x1100, &mut mem).unwrap();
+        // Reserve handle 5 as a device handle, then assert alloc_handle never returns it.
+        dos.device_handles.insert(
+            5,
+            OpenDeviceHandle {
+                header: FarPtr {
+                    segment: 0x2000,
+                    offset: 0,
+                },
+                mode: AccessMode::ReadWrite,
+            },
+        );
+        let next = dos.alloc_handle().unwrap();
+        assert_ne!(next, 5, "alloc_handle must not reuse a live device handle");
     }
 }
