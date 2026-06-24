@@ -52,6 +52,12 @@ pub const SST_VERTEX_CY: usize = 0x01c;
 pub const SST_START_R: usize = 0x020;
 pub const SST_START_G: usize = 0x024;
 pub const SST_START_B: usize = 0x028;
+pub const SST_DR_DX: usize = 0x040;
+pub const SST_DG_DX: usize = 0x044;
+pub const SST_DB_DX: usize = 0x048;
+pub const SST_DR_DY: usize = 0x060;
+pub const SST_DG_DY: usize = 0x064;
+pub const SST_DB_DY: usize = 0x068;
 pub const SST_TRIANGLE_CMD: usize = 0x080;
 pub const SST_FVERTEX_AX: usize = 0x088;
 pub const SST_FVERTEX_AY: usize = 0x08c;
@@ -249,6 +255,8 @@ pub struct Distira {
     color1: u32,
     triangle_vertices: [(u32, u32); 3],
     triangle_color: [u32; 3],
+    triangle_color_dx: [u32; 3],
+    triangle_color_dy: [u32; 3],
     ftriangle_vertices: [(u32, u32); 3],
     ftriangle_color: [u32; 3],
     fbi_pixels_in: u32,
@@ -307,6 +315,8 @@ impl Distira {
             color1: 0,
             triangle_vertices: [(0, 0); 3],
             triangle_color: [0; 3],
+            triangle_color_dx: [0; 3],
+            triangle_color_dy: [0; 3],
             ftriangle_vertices: [(0, 0); 3],
             ftriangle_color: [0; 3],
             fbi_pixels_in: 0,
@@ -570,6 +580,12 @@ impl Distira {
             SST_START_R => merge_color_component(&mut self.triangle_color[0], byte, value),
             SST_START_G => merge_color_component(&mut self.triangle_color[1], byte, value),
             SST_START_B => merge_color_component(&mut self.triangle_color[2], byte, value),
+            SST_DR_DX => merge_color_component(&mut self.triangle_color_dx[0], byte, value),
+            SST_DG_DX => merge_color_component(&mut self.triangle_color_dx[1], byte, value),
+            SST_DB_DX => merge_color_component(&mut self.triangle_color_dx[2], byte, value),
+            SST_DR_DY => merge_color_component(&mut self.triangle_color_dy[0], byte, value),
+            SST_DG_DY => merge_color_component(&mut self.triangle_color_dy[1], byte, value),
+            SST_DB_DY => merge_color_component(&mut self.triangle_color_dy[2], byte, value),
             SST_TRIANGLE_CMD => {
                 if byte == 0 && value != 0 {
                     self.run_triangle_command();
@@ -798,6 +814,12 @@ impl Distira {
             SST_START_R => self.triangle_color[0],
             SST_START_G => self.triangle_color[1],
             SST_START_B => self.triangle_color[2],
+            SST_DR_DX => self.triangle_color_dx[0],
+            SST_DG_DX => self.triangle_color_dx[1],
+            SST_DB_DX => self.triangle_color_dx[2],
+            SST_DR_DY => self.triangle_color_dy[0],
+            SST_DG_DY => self.triangle_color_dy[1],
+            SST_DB_DY => self.triangle_color_dy[2],
             SST_TRIANGLE_CMD => 0,
             SST_FVERTEX_AX => self.ftriangle_vertices[0].0,
             SST_FVERTEX_AY => self.ftriangle_vertices[0].1,
@@ -948,11 +970,42 @@ impl Distira {
             return;
         }
 
-        let r = fixed_color_to_u8(self.triangle_color[0]);
-        let g = fixed_color_to_u8(self.triangle_color[1]);
-        let b = fixed_color_to_u8(self.triangle_color[2]);
-        let vertices = self.triangle_vertices.map(|(x, y)| {
-            DistiraVertex::rgb(fixed_vertex_to_f32(x), fixed_vertex_to_f32(y), r, g, b)
+        let coords = self
+            .triangle_vertices
+            .map(|(x, y)| (fixed_vertex_to_f32(x), fixed_vertex_to_f32(y)));
+        let (origin_x, origin_y) = coords[0];
+        let vertices = coords.map(|(x, y)| {
+            DistiraVertex::rgb(
+                x,
+                y,
+                fixed_color_at(
+                    self.triangle_color[0],
+                    self.triangle_color_dx[0],
+                    self.triangle_color_dy[0],
+                    x,
+                    y,
+                    origin_x,
+                    origin_y,
+                ),
+                fixed_color_at(
+                    self.triangle_color[1],
+                    self.triangle_color_dx[1],
+                    self.triangle_color_dy[1],
+                    x,
+                    y,
+                    origin_x,
+                    origin_y,
+                ),
+                fixed_color_at(
+                    self.triangle_color[2],
+                    self.triangle_color_dx[2],
+                    self.triangle_color_dy[2],
+                    x,
+                    y,
+                    origin_x,
+                    origin_y,
+                ),
+            )
         });
         let written = self.draw_triangle(vertices) as u32;
         self.fbi_pixels_in = self.fbi_pixels_in.wrapping_add(written);
@@ -1006,8 +1059,33 @@ fn fixed_vertex_to_f32(raw: u32) -> f32 {
     (raw as i16) as f32 / 16.0
 }
 
-fn fixed_color_to_u8(raw: u32) -> u8 {
-    ((raw >> 12) & 0xff) as u8
+fn fixed_color_at(
+    start: u32,
+    dx: u32,
+    dy: u32,
+    x: f32,
+    y: f32,
+    origin_x: f32,
+    origin_y: f32,
+) -> u8 {
+    (fixed_color_value(start)
+        + fixed_color_value(dx) * (x - origin_x)
+        + fixed_color_value(dy) * (y - origin_y))
+        .round()
+        .clamp(0.0, 255.0) as u8
+}
+
+fn fixed_color_value(raw: u32) -> f32 {
+    sign_extend_24(raw) as f32 / 4096.0
+}
+
+fn sign_extend_24(raw: u32) -> i32 {
+    let raw = raw & 0x00ff_ffff;
+    if raw & 0x0080_0000 != 0 {
+        (raw | 0xff00_0000) as i32
+    } else {
+        raw as i32
+    }
 }
 
 fn float_vertex_to_fixed(raw: u32) -> u32 {
