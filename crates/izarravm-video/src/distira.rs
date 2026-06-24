@@ -190,6 +190,7 @@ pub const FBZ_PARAM_ADJUST: u32 = 1 << 26;
 pub const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
 
 pub const TEX_RGB332: u32 = 0x00;
+pub const TEX_A8: u32 = 0x02;
 pub const TEX_I8: u32 = 0x03;
 pub const TEX_R5G6B5: u32 = 0x0a;
 const CHIP_TREX0: usize = 0x2;
@@ -1483,7 +1484,7 @@ impl Distira {
     fn texture_color_or_source(&self, r: u8, g: u8, b: u8, s: f32, t: f32) -> (u8, u8, u8) {
         let format = (self.texture_mode >> 8) & 0xf;
         if self.fbz_color_path & FBZCP_TEXTURE_ENABLED == 0
-            || !matches!(format, TEX_RGB332 | TEX_I8 | TEX_R5G6B5)
+            || !matches!(format, TEX_RGB332 | TEX_A8 | TEX_I8 | TEX_R5G6B5)
         {
             return (r, g, b);
         }
@@ -1503,6 +1504,7 @@ impl Distira {
     fn sample_tmu_texture(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
         match (self.texture_mode_for_tmu(tmu) >> 8) & 0xf {
             TEX_RGB332 => self.sample_tmu_rgb332(tmu, s, t),
+            TEX_A8 => self.sample_tmu_a8(tmu, s, t),
             TEX_I8 => self.sample_tmu_i8(tmu, s, t),
             TEX_R5G6B5 => self.sample_tmu_rgb565(tmu, s, t),
             _ => (0, 0, 0),
@@ -1524,6 +1526,11 @@ impl Distira {
             return (0, 0, 0);
         };
         expand_rgb332(raw)
+    }
+
+    fn sample_tmu_a8(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
+        let raw = self.sample_tmu_u8(tmu, s, t);
+        (raw, raw, raw)
     }
 
     fn sample_tmu_i8(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
