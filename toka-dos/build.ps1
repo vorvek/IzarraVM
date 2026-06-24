@@ -52,6 +52,20 @@ Get-ChildItem "$root\tools\*.c" -ErrorAction SilentlyContinue | ForEach-Object {
     LinkCom $name @("$name.obj", 'toka.obj')
 }
 
+# Dev tools: built with the same recipe but emitted to the C: drive fixture dir,
+# not packed into tokados.rom. TESTS.COM is a tracked debug tool, not a system
+# file. Compile and link inside build/ (where wlink writes <name>.com), then move
+# the result to c_drive/ so the pack step does not include it.
+$cdrive = Join-Path $root '..\c_drive'
+New-Item -ItemType Directory -Force $cdrive | Out-Null
+Get-ChildItem "$root\devtools\*.c" -ErrorAction SilentlyContinue | ForEach-Object {
+    $name = $_.BaseName
+    Compile $_.FullName "$name.obj"
+    LinkCom $name @("$name.obj", 'toka.obj')
+    $built = Join-Path $build "$name.com"
+    Move-Item -Force $built (Join-Path $cdrive "$($name.ToUpper()).COM")
+}
+
 # The boot record.
 & nasm -f bin "$root\boot\tokaboot.asm" -o "$build\tokaboot.bin"
 if ($LASTEXITCODE -ne 0) { throw "nasm failed on tokaboot" }
