@@ -566,7 +566,10 @@ pub(super) fn set_umb_owner(
     Ok(())
 }
 
-/// Free all UMB blocks owned by `owner`, used when an EXEC child exits normally.
+/// Free all UMB blocks owned by `owner`. Called from the shared `finish_exec`
+/// teardown for every terminating child that did not keep resident, so it covers
+/// the normal AH=4Ch / INT 20h exits and the abnormal Ctrl-C and critical-error
+/// aborts alike; TSRs (AH=31h, INT 27h) are excluded and keep their UMBs.
 pub(super) fn free_umb_blocks_owned_by(
     umb: Option<UmbArena>,
     owner: u16,
