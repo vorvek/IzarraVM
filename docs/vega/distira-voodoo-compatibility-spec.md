@@ -440,7 +440,9 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
 - [x] Iteration 18: float S/T texture coordinate registers for nearest RGB565
       sampling. Validated by the video float S-gradient texture sample test plus
       the workspace gates.
-- [ ] Next: one-TMU bilinear RGB565 texture sampling.
+- [x] Iteration 19: one-TMU bilinear RGB565 texture sampling. Validated by the
+      video bilinear texture sample test plus the workspace gates.
+- [ ] Next: mip and LOD selection for RGB565 texture sampling.
 
 ## First 90 percent push for this branch
 
