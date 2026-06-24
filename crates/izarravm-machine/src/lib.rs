@@ -2609,16 +2609,64 @@ impl Machine {
         }
     }
 
-    /// Service the ICDEX functions of `INT 2Fh` (the multiplex interrupt) as an
-    /// HLE bridge, so the guest sees a CD drive without a real driver loaded. The
-    /// CD-ROM is exposed at the drive letter `CD_DRIVE_NUMBER` (0 = A:), which is
-    /// D: by default. Only the query and device-driver-request functions are
-    /// modeled; unrecognized AX values fall through unchanged so other INT 2Fh
-    /// consumers are unaffected. Returns true if the call was an ICDEX function
-    /// this bridge handled.
+    /// Service the DOS-owned and ICDEX functions of `INT 2Fh` (the multiplex
+    /// interrupt) as HLE bridges. Unrecognized AX values fall through unchanged
+    /// so other INT 2Fh consumers are unaffected. Returns true if the bridge
+    /// handled the call.
     fn handle_int2f(&mut self) -> bool {
         let ax = self.cpu.registers.eax() as u16;
         match ax {
+            // DOS 3.0+ internal-services installation check. AL=FFh follows the
+            // common multiplex convention and lets internal helper probes detect
+            // that the DOS 12xx group is present.
+            0x1200 => {
+                self.set_eax_al(0xff);
+                true
+            }
+            // DOS 3.0+ internal: get DOS data segment. Our DOS data image is the
+            // live SysVars paragraph refreshed by AH=52h.
+            0x1203 => {
+                let Some((seg, _)) = self.refresh_dos_sysvars() else {
+                    return false;
+                };
+                self.cpu
+                    .registers
+                    .set_segment(SegmentIndex::Ds, SegmentRegister::real(seg));
+                true
+            }
+            // DOS 3.0+ internal: get SFT entry for the file handle in BX. Resolve
+            // through the current PSP's JFT before indexing the AH=52h SFT table.
+            0x1216 => {
+                if let Some((seg, off)) = self.sft_entry_for_handle(self.cpu.registers.ebx() as u16)
+                {
+                    self.cpu
+                        .registers
+                        .set_segment(SegmentIndex::Es, SegmentRegister::real(seg));
+                    let edi = (self.cpu.registers.edi() & !0xFFFF) | u32::from(off);
+                    self.cpu.registers.set_edi(edi);
+                    self.set_int_frame_carry(false);
+                } else {
+                    self.set_ax(0x0006);
+                    self.set_int_frame_carry(true);
+                }
+                true
+            }
+            // DOS 3.0+ internal: get length of ASCIIZ string at ES:DI.
+            0x1212 => {
+                let es = self.cpu.registers.segment(SegmentIndex::Es).base;
+                let di = self.cpu.registers.edi() as u16;
+                let len = self.asciz_len(es + u32::from(di));
+                self.set_cx(len);
+                true
+            }
+            // DOS 3.0+ internal: get length of ASCIIZ string at DS:SI.
+            0x1225 => {
+                let ds = self.cpu.registers.segment(SegmentIndex::Ds).base;
+                let si = self.cpu.registers.esi() as u16;
+                let len = self.asciz_len(ds + u32::from(si));
+                self.set_cx(len);
+                true
+            }
             // DOS-owned install checks for resident utilities we do not load.
             // Report "not installed, OK to install" rather than falling through
             // with stale register contents.
@@ -2737,6 +2785,73 @@ impl Machine {
                 true
             }
             _ => false,
+        }
+    }
+
+    fn refresh_dos_sysvars(&mut self) -> Option<(u16, u16)> {
+        let mut regs = izarravm_dos::DosRegs {
+            ax: 0x5200,
+            ..izarravm_dos::DosRegs::default()
+        };
+        match self.dos.dispatch(0x21, &mut regs, &mut self.memory) {
+            Ok(izarravm_dos::DosAction::Continue) => Some((regs.es, regs.bx)),
+            _ => None,
+        }
+    }
+
+    fn current_dos_psp(&mut self) -> Option<u16> {
+        let mut regs = izarravm_dos::DosRegs {
+            ax: 0x5100,
+            ..izarravm_dos::DosRegs::default()
+        };
+        match self.dos.dispatch(0x21, &mut regs, &mut self.memory) {
+            Ok(izarravm_dos::DosAction::Continue) => Some(regs.bx),
+            _ => None,
+        }
+    }
+
+    fn sft_entry_for_handle(&mut self, handle: u16) -> Option<(u16, u16)> {
+        const SFT_HEADER_LEN: u16 = 0x06;
+        const SFT_ENTRY_LEN: u16 = 0x3b;
+
+        let psp = self.current_dos_psp()?;
+        let psp_base = u32::from(psp) << 4;
+        let jft_count = self.read_guest_word(psp_base + 0x32);
+        if handle >= jft_count {
+            return None;
+        }
+
+        let jft_off = self.read_guest_word(psp_base + 0x34);
+        let jft_seg = self.read_guest_word(psp_base + 0x36);
+        let jft = (u32::from(jft_seg) << 4) + u32::from(jft_off);
+        let slot = self.read_physical_u8(jft + u32::from(handle));
+        if slot == 0xff {
+            return None;
+        }
+
+        let (list_seg, list_off) = self.refresh_dos_sysvars()?;
+        let list = (u32::from(list_seg) << 4) + u32::from(list_off);
+        let sft_off = self.read_guest_word(list + 0x04);
+        let sft_seg = self.read_guest_word(list + 0x06);
+        let sft = (u32::from(sft_seg) << 4) + u32::from(sft_off);
+        let sft_count = self.read_guest_word(sft + 0x04);
+        if u16::from(slot) >= sft_count {
+            return None;
+        }
+
+        let entry_off = sft_off
+            .checked_add(SFT_HEADER_LEN)?
+            .checked_add(u16::from(slot).checked_mul(SFT_ENTRY_LEN)?)?;
+        Some((sft_seg, entry_off))
+    }
+
+    fn asciz_len(&mut self, addr: u32) -> u16 {
+        let mut len = 0u16;
+        loop {
+            if self.read_physical_u8(addr + u32::from(len)) == 0 || len == u16::MAX {
+                return len;
+            }
+            len = len.wrapping_add(1);
         }
     }
 
@@ -14410,6 +14525,127 @@ mod tests {
             mem.read_u16(0x1204).unwrap(),
             env_seg + env_paras + 1,
             "AH=48h allocated segment follows the env block and its MCB header"
+        );
+    }
+
+    #[test]
+    fn int2f_12xx_reports_dos_data_and_string_lengths() {
+        const PROG: [u8; 2] = [0xcd, 0x20];
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
+                .unwrap();
+
+        let mut regs = izarravm_dos::DosRegs {
+            ax: 0x5200,
+            ..izarravm_dos::DosRegs::default()
+        };
+        assert!(matches!(
+            machine.dos.dispatch(0x21, &mut regs, &mut machine.memory),
+            Ok(izarravm_dos::DosAction::Continue)
+        ));
+
+        machine.cpu.registers.set_eax(0x1200);
+        assert!(machine.handle_int2f(), "AX=1200h handled");
+        assert_eq!(machine.cpu.registers.eax() as u8, 0xff);
+
+        machine.cpu.registers.set_eax(0x1203);
+        assert!(machine.handle_int2f(), "AX=1203h handled");
+        assert_eq!(
+            machine.cpu.registers.segment(SegmentIndex::Ds).selector,
+            regs.es
+        );
+
+        machine.write_guest_block((0x4000u32 << 4) + 0x0200, b"HELLO\0ignored");
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x4000));
+        machine.cpu.registers.set_edi(0x0200);
+        machine.cpu.registers.set_ecx(0xcccc);
+        machine.cpu.registers.set_eax(0x1212);
+        assert!(machine.handle_int2f(), "AX=1212h handled");
+        assert_eq!(machine.cpu.registers.ecx() as u16, 5);
+
+        machine.write_guest_block((0x4100u32 << 4) + 0x0030, b"DOS\0ignored");
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x4100));
+        machine.cpu.registers.set_esi(0x0030);
+        machine.cpu.registers.set_ecx(0xdddd);
+        machine.cpu.registers.set_eax(0x1225);
+        assert!(machine.handle_int2f(), "AX=1225h handled");
+        assert_eq!(machine.cpu.registers.ecx() as u16, 3);
+    }
+
+    #[test]
+    fn int2f_1216_returns_sft_entry_pointer() {
+        const PROG: [u8; 2] = [0xcd, 0x20];
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
+                .unwrap();
+
+        let mut regs = izarravm_dos::DosRegs {
+            ax: 0x5200,
+            ..izarravm_dos::DosRegs::default()
+        };
+        assert!(matches!(
+            machine.dos.dispatch(0x21, &mut regs, &mut machine.memory),
+            Ok(izarravm_dos::DosAction::Continue)
+        ));
+        let list = (u32::from(regs.es) << 4) + u32::from(regs.bx);
+        let sft_off = machine.read_guest_word(list + 0x04);
+        let sft_seg = machine.read_guest_word(list + 0x06);
+        let sft = (u32::from(sft_seg) << 4) + u32::from(sft_off);
+        let count = machine.read_guest_word(sft + 0x04);
+        assert!(count > 2, "modeled SFT has standard handles");
+
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Ss, SegmentRegister::real(0x3000));
+        machine.cpu.registers.set_esp(0x0100);
+        machine
+            .memory
+            .write_u16((0x3000usize << 4) + 0x0104, 0x0001)
+            .unwrap();
+        machine.cpu.registers.set_eax(0x1216);
+        machine.cpu.registers.set_ebx(2); // STDERR handle -> PSP JFT slot 1 (CON)
+
+        assert!(machine.handle_int2f(), "AX=1216h handled");
+        assert_eq!(
+            machine.cpu.registers.segment(SegmentIndex::Es).selector,
+            sft_seg
+        );
+        assert_eq!(machine.cpu.registers.edi() as u16, sft_off + 0x06 + 0x3b);
+        assert_eq!(machine.cpu.registers.ebx() as u16, 2);
+        assert_eq!(
+            machine
+                .memory
+                .read_u16((0x3000usize << 4) + 0x0104)
+                .unwrap()
+                & 1,
+            0,
+            "successful SFT lookup clears carry in the INT frame"
+        );
+
+        machine
+            .memory
+            .write_u16((0x3000usize << 4) + 0x0104, 0x0000)
+            .unwrap();
+        machine.cpu.registers.set_eax(0x1216);
+        machine.cpu.registers.set_ebx(19); // default JFT entry is closed
+
+        assert!(machine.handle_int2f(), "AX=1216h invalid handle handled");
+        assert_eq!(machine.cpu.registers.eax() as u16, 0x0006);
+        assert_eq!(
+            machine
+                .memory
+                .read_u16((0x3000usize << 4) + 0x0104)
+                .unwrap()
+                & 1,
+            1,
+            "invalid SFT lookup sets carry in the INT frame"
         );
     }
 
