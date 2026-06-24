@@ -432,7 +432,9 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
 - [x] Iteration 15: constant fog color application for untextured Voodoo
       triangles. Validated by the video constant-fog test plus the workspace
       gates.
-- [ ] Next: texture-enabled color path for nearest RGB565 texels.
+- [x] Iteration 16: texture-enabled color path for nearest RGB565 texels.
+      Validated by the video RGB565 texture sample test plus the workspace gates.
+- [ ] Next: S/T texture coordinate gradients for nearest sampling.
 
 ## First 90 percent push for this branch
 
