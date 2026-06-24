@@ -683,6 +683,7 @@ impl Distira {
                         self.cmd_fifo_read_ptr = self.cmd_fifo_read_ptr.wrapping_add(4);
                         match space {
                             2 => self.push_fifo(DistiraFifoEntry::LfbU32 { offset, value }),
+                            3 => self.push_fifo(DistiraFifoEntry::TextureU32 { offset, value }),
                             _ => false,
                         };
                         offset = offset.wrapping_add(4);

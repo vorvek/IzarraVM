@@ -2,8 +2,8 @@ use izarravm_video::{
     BIG_DISTIRA_CHIP_NAME, Distira, DistiraVertex, FBZ_DRAW_BACK, FBZ_RGB_WMASK,
     LFB_FORMAT_ARGB8888, LFB_WRITE_BACK, SMALL_DISTIRA_CHIP_NAME, SST_ALPHA_MODE,
     SST_CLIP_LEFT_RIGHT, SST_CLIP_LOW_Y_HIGH_Y, SST_COLOR1, SST_FASTFILL_CMD, SST_FBI_INIT0,
-    SST_FBI_INIT1, SST_FBI_INIT2, SST_FBI_INIT3, SST_FBZ_MODE, SST_LFB_MODE, SST_STATUS,
-    SST_SWAPBUFFER_CMD,
+    SST_FBI_INIT1, SST_FBI_INIT2, SST_FBI_INIT3, SST_FBI_INIT7, SST_FBZ_MODE, SST_LFB_MODE,
+    SST_STATUS, SST_SWAPBUFFER_CMD,
 };
 
 fn read_reg(distira: &Distira, reg: usize) -> u32 {
@@ -16,6 +16,10 @@ fn write_reg(distira: &mut Distira, reg: usize, value: u32) {
     for (i, byte) in value.to_le_bytes().into_iter().enumerate() {
         distira.write_mmio_u8(reg + i, byte);
     }
+}
+
+fn cmdfifo_type5_header(space: u32, count: u32) -> u32 {
+    (space << 30) | (count << 3) | 5
 }
 
 #[test]
@@ -133,6 +137,29 @@ fn voodoo_fifo_drains_queued_register_lfb_and_texture_writes_in_order() {
     assert_eq!(read_reg(&queued, SST_STATUS) & 0x380, 0);
     assert_eq!(queued.read_texture_u32(0x10), 0xdead_beef);
     assert_eq!(queued.scanout_argb(), direct.scanout_argb());
+}
+
+#[test]
+fn command_fifo_type5_texture_packet_writes_texture_memory() {
+    const FBIINIT7_CMDFIFO_ENABLE: u32 = 1 << 8;
+
+    let mut distira = Distira::new();
+    write_reg(&mut distira, SST_FBI_INIT7, FBIINIT7_CMDFIFO_ENABLE);
+
+    assert!(distira.write_command_fifo_u32(0, cmdfifo_type5_header(3, 2)));
+    assert!(distira.write_command_fifo_u32(4, 0x20));
+    assert!(distira.write_command_fifo_u32(8, 0x1122_3344));
+    assert!(distira.write_command_fifo_u32(12, 0xaabb_ccdd));
+
+    assert_eq!(distira.fifo_depth(), 4);
+    assert_eq!(distira.read_texture_u32(0x20), 0);
+    assert_eq!(distira.read_texture_u32(0x24), 0);
+
+    distira.drain_fifo();
+
+    assert_eq!(distira.fifo_depth(), 0);
+    assert_eq!(distira.read_texture_u32(0x20), 0x1122_3344);
+    assert_eq!(distira.read_texture_u32(0x24), 0xaabb_ccdd);
 }
 
 #[test]
