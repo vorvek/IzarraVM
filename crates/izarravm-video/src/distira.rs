@@ -54,16 +54,25 @@ pub const SST_START_G: usize = 0x024;
 pub const SST_START_B: usize = 0x028;
 pub const SST_START_Z: usize = 0x02c;
 pub const SST_START_A: usize = 0x030;
+pub const SST_START_S: usize = 0x034;
+pub const SST_START_T: usize = 0x038;
+pub const SST_START_W: usize = 0x03c;
 pub const SST_DR_DX: usize = 0x040;
 pub const SST_DG_DX: usize = 0x044;
 pub const SST_DB_DX: usize = 0x048;
 pub const SST_DZ_DX: usize = 0x04c;
 pub const SST_DA_DX: usize = 0x050;
+pub const SST_DS_DX: usize = 0x054;
+pub const SST_DT_DX: usize = 0x058;
+pub const SST_DW_DX: usize = 0x05c;
 pub const SST_DR_DY: usize = 0x060;
 pub const SST_DG_DY: usize = 0x064;
 pub const SST_DB_DY: usize = 0x068;
 pub const SST_DZ_DY: usize = 0x06c;
 pub const SST_DA_DY: usize = 0x070;
+pub const SST_DS_DY: usize = 0x074;
+pub const SST_DT_DY: usize = 0x078;
+pub const SST_DW_DY: usize = 0x07c;
 pub const SST_TRIANGLE_CMD: usize = 0x080;
 pub const SST_FVERTEX_AX: usize = 0x088;
 pub const SST_FVERTEX_AY: usize = 0x08c;
@@ -264,6 +273,8 @@ pub struct DistiraVertex {
     pub g: u8,
     pub b: u8,
     pub a: u8,
+    pub s: f32,
+    pub t: f32,
 }
 
 impl DistiraVertex {
@@ -275,6 +286,8 @@ impl DistiraVertex {
             g,
             b,
             a: 255,
+            s: 0.0,
+            t: 0.0,
         }
     }
 }
@@ -325,6 +338,9 @@ pub struct Distira {
     triangle_alpha: u32,
     triangle_alpha_dx: u32,
     triangle_alpha_dy: u32,
+    triangle_tex_coord: [u32; 3],
+    triangle_tex_coord_dx: [u32; 3],
+    triangle_tex_coord_dy: [u32; 3],
     ftriangle_vertices: [(u32, u32); 3],
     ftriangle_color: [u32; 3],
     ftriangle_color_dx: [u32; 3],
@@ -402,6 +418,9 @@ impl Distira {
             triangle_alpha: 0x00ff_0000,
             triangle_alpha_dx: 0,
             triangle_alpha_dy: 0,
+            triangle_tex_coord: [0; 3],
+            triangle_tex_coord_dx: [0; 3],
+            triangle_tex_coord_dy: [0; 3],
             ftriangle_vertices: [(0, 0); 3],
             ftriangle_color: [0; 3],
             ftriangle_color_dx: [0; 3],
@@ -554,7 +573,9 @@ impl Distira {
                 let r = lerp_u8(a.r, b.r, c.r, l0, l1, l2);
                 let g = lerp_u8(a.g, b.g, c.g, l0, l1, l2);
                 let blue = lerp_u8(a.b, b.b, c.b, l0, l1, l2);
-                let (r, g, blue) = self.texture_color_or_source(r, g, blue);
+                let s = lerp_f32(a.s, b.s, c.s, l0, l1, l2);
+                let t = lerp_f32(a.t, b.t, c.t, l0, l1, l2);
+                let (r, g, blue) = self.texture_color_or_source(r, g, blue, s, t);
                 let alpha = lerp_u8(a.a, b.a, c.a, l0, l1, l2);
                 if !self.alpha_test_passes(alpha) {
                     self.fbi_afunc_fail = self.fbi_afunc_fail.wrapping_add(1);
@@ -714,16 +735,25 @@ impl Distira {
             SST_START_B => merge_color_component(&mut self.triangle_color[2], byte, value),
             SST_START_Z => merge_byte(&mut self.triangle_depth, byte, value),
             SST_START_A => merge_color_component(&mut self.triangle_alpha, byte, value),
+            SST_START_S => merge_byte(&mut self.triangle_tex_coord[0], byte, value),
+            SST_START_T => merge_byte(&mut self.triangle_tex_coord[1], byte, value),
+            SST_START_W => merge_byte(&mut self.triangle_tex_coord[2], byte, value),
             SST_DR_DX => merge_color_component(&mut self.triangle_color_dx[0], byte, value),
             SST_DG_DX => merge_color_component(&mut self.triangle_color_dx[1], byte, value),
             SST_DB_DX => merge_color_component(&mut self.triangle_color_dx[2], byte, value),
             SST_DZ_DX => merge_byte(&mut self.triangle_depth_dx, byte, value),
             SST_DA_DX => merge_color_component(&mut self.triangle_alpha_dx, byte, value),
+            SST_DS_DX => merge_byte(&mut self.triangle_tex_coord_dx[0], byte, value),
+            SST_DT_DX => merge_byte(&mut self.triangle_tex_coord_dx[1], byte, value),
+            SST_DW_DX => merge_byte(&mut self.triangle_tex_coord_dx[2], byte, value),
             SST_DR_DY => merge_color_component(&mut self.triangle_color_dy[0], byte, value),
             SST_DG_DY => merge_color_component(&mut self.triangle_color_dy[1], byte, value),
             SST_DB_DY => merge_color_component(&mut self.triangle_color_dy[2], byte, value),
             SST_DZ_DY => merge_byte(&mut self.triangle_depth_dy, byte, value),
             SST_DA_DY => merge_color_component(&mut self.triangle_alpha_dy, byte, value),
+            SST_DS_DY => merge_byte(&mut self.triangle_tex_coord_dy[0], byte, value),
+            SST_DT_DY => merge_byte(&mut self.triangle_tex_coord_dy[1], byte, value),
+            SST_DW_DY => merge_byte(&mut self.triangle_tex_coord_dy[2], byte, value),
             SST_TRIANGLE_CMD => {
                 if byte == 0 && value != 0 {
                     self.run_triangle_command();
@@ -1232,6 +1262,24 @@ impl Distira {
                 origin_x,
                 origin_y,
             ),
+            s: fixed_texture_coord_at(
+                self.triangle_tex_coord[0],
+                self.triangle_tex_coord_dx[0],
+                self.triangle_tex_coord_dy[0],
+                x,
+                y,
+                origin_x,
+                origin_y,
+            ),
+            t: fixed_texture_coord_at(
+                self.triangle_tex_coord[1],
+                self.triangle_tex_coord_dx[1],
+                self.triangle_tex_coord_dy[1],
+                x,
+                y,
+                origin_x,
+                origin_y,
+            ),
         });
         let written = self.draw_triangle_with_depth(vertices, depths) as u32;
         self.fbi_pixels_in = self.fbi_pixels_in.wrapping_add(written);
@@ -1310,13 +1358,16 @@ impl Distira {
             || b != self.chroma_key as u8
     }
 
-    fn texture_color_or_source(&self, r: u8, g: u8, b: u8) -> (u8, u8, u8) {
+    fn texture_color_or_source(&self, r: u8, g: u8, b: u8, s: f32, t: f32) -> (u8, u8, u8) {
         if self.fbz_color_path & FBZCP_TEXTURE_ENABLED == 0
             || ((self.texture_mode >> 8) & 0xf) != TEX_R5G6B5
         {
             return (r, g, b);
         }
-        let offset = self.tex_base_addr as usize;
+        let s = s.floor() as i32 & 0xff;
+        let t = t.floor() as i32 & 0xff;
+        let texel = (t as usize * 256 + s as usize).saturating_mul(2);
+        let offset = (self.tex_base_addr as usize).saturating_add(texel);
         let Some(bytes) = self.texture.get(offset..offset.saturating_add(2)) else {
             return (r, g, b);
         };
@@ -1436,6 +1487,20 @@ fn fixed_color_at(
 
 fn fixed_color_value(raw: u32) -> f32 {
     sign_extend_24(raw) as f32 / 4096.0
+}
+
+fn fixed_texture_coord_at(
+    start: u32,
+    dx: u32,
+    dy: u32,
+    x: f32,
+    y: f32,
+    origin_x: f32,
+    origin_y: f32,
+) -> f32 {
+    start as i32 as f32 / 16384.0
+        + dx as i32 as f32 / 16384.0 * (x - origin_x)
+        + dy as i32 as f32 / 16384.0 * (y - origin_y)
 }
 
 fn fixed_depth_at(
