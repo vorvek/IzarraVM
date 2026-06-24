@@ -72,8 +72,10 @@ static void grab_filename(char **pp, char *name)
     while (*p == ' ' || *p == '\t') {
         *p++ = ' ';
     }
-    while (*p && *p != ' ' && *p != '\t' && *p != '>' && *p != '<' && i < 63) {
-        name[i++] = *p;
+    while (*p && *p != ' ' && *p != '\t' && *p != '>' && *p != '<') {
+        if (i < 63) {
+            name[i++] = *p;
+        }
         *p++ = ' ';
     }
     name[i] = 0;
@@ -927,7 +929,17 @@ static void bat_exec_line(char *raw)
         return;
     }
     bat_expand(p, expanded);
-    bat_redir_found = parse_redirects(expanded, &bat_redir);
+    /* IF and FOR bodies dispatch their inner command directly, so a redirect
+     * inside them is not honored in v1. Peek the verb and skip parsing for those
+     * (leaving the operator literal) rather than consuming the tokens; every
+     * other line, including the external default and CALL, honors redirects. */
+    {
+        char peek[16];
+        split_word(expanded, peek, sizeof peek);
+        bat_redir_found = (eqi(peek, "IF") || eqi(peek, "FOR"))
+            ? 0
+            : parse_redirects(expanded, &bat_redir);
+    }
     if (bat_echo && !at) {
         render_prompt();
         t_putln(expanded);
@@ -1185,8 +1197,27 @@ static void dispatch_redirected(char *word, char *rest, struct redirect *rd)
         }
     }
 
-    if (fout >= 0) { save_out = t_dup(1); t_dup2(fout, 1); }
-    if (fin >= 0) { save_in = t_dup(0); t_dup2(fin, 0); }
+    if (fout >= 0) {
+        save_out = t_dup(1);
+        if (save_out < 0) {
+            t_putln("Cannot redirect output");
+            if (fin >= 0) { t_close(fin); }
+            t_close(fout);
+            return;
+        }
+        t_dup2(fout, 1);
+    }
+    if (fin >= 0) {
+        save_in = t_dup(0);
+        if (save_in < 0) {
+            t_putln("Cannot redirect input");
+            if (save_out >= 0) { t_dup2(save_out, 1); t_close(save_out); }
+            if (fout >= 0) { t_close(fout); }
+            t_close(fin);
+            return;
+        }
+        t_dup2(fin, 0);
+    }
 
     dispatch(word, rest);
 
