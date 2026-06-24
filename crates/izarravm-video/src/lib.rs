@@ -1,9 +1,12 @@
 use thiserror::Error;
 
+pub mod distira;
 pub mod font;
 pub mod margo;
 pub mod vga;
 pub use vga::{VGA_PLANAR_SIZE, Vga, VgaRaster};
+
+pub use distira::*;
 
 pub use margo::{
     Channel, MARGO_ID_VALUE, MARGO_MMIO_SIZE, MARGO_VBE_MODES, MARGO_VRAM_SIZE, Margo,

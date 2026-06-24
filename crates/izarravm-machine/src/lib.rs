@@ -14,9 +14,10 @@ use izarravm_cpu::{
 };
 pub use izarravm_video::MARGO_ID_VALUE;
 use izarravm_video::{
-    DAC_ENTRIES, MARGO_MMIO_SIZE, MARGO_VBE_MODES, MARGO_VRAM_SIZE, Margo, TextFrame,
-    VGA_MODE13H_BASE, VGA_PLANAR_WINDOW_SIZE, VGA_TEXT_BASE, VGA_TEXT_MEMORY_SIZE,
-    VGA_TEXT_PAGE_STRIDE, Vga, VgaRaster, VideoMode, bytes_per_pixel, pixel_format, vbe_mode,
+    DAC_ENTRIES, DISTIRA_FB_SIZE, DISTIRA_MMIO_SIZE, Distira, MARGO_MMIO_SIZE, MARGO_VBE_MODES,
+    MARGO_VRAM_SIZE, Margo, TextFrame, VGA_MODE13H_BASE, VGA_PLANAR_WINDOW_SIZE, VGA_TEXT_BASE,
+    VGA_TEXT_MEMORY_SIZE, VGA_TEXT_PAGE_STRIDE, Vga, VgaRaster, VideoMode, bytes_per_pixel,
+    pixel_format, vbe_mode,
 };
 use thiserror::Error;
 
@@ -117,6 +118,18 @@ fn build_xms_ems(
 pub const HIGH_ROM_BASE: u32 = 0xffff_0000;
 pub const MARGO_LFB_BASE: u32 = 0xE000_0000;
 pub const MARGO_MMIO_BASE: u32 = 0xE040_0000;
+pub const DISTIRA_MMIO_BASE: u32 = 0xE100_0000;
+pub const DISTIRA_LFB_BASE: u32 = 0xE140_0000;
+const PCI_CONFIG_ADDRESS_PORT: u16 = 0x0cf8;
+const PCI_CONFIG_DATA_PORT: u16 = 0x0cfc;
+const PCI_CONFIG_DATA_END: u16 = 0x0cff;
+const DISTIRA_PCI_SLOT: u8 = 0x10;
+const DISTIRA_PCI_BAR_SIZE: u32 = 0x0100_0000;
+const DISTIRA_PCI_LFB_OFFSET: u32 = 0x0040_0000;
+const DISTIRA_PCI_TEX_OFFSET: u32 = 0x0080_0000;
+const DISTIRA_PCI_VENDOR_ID: u16 = 0x121a;
+const DISTIRA_PCI_DEVICE_ID: u16 = 0x0001;
+const DISTIRA_PCI_REVISION: u8 = 0x02;
 pub const LOW_BIOS_BASE: u32 = 0x000f_0000;
 pub const BIOS_ROM_SIZE: usize = 64 * 1024;
 pub const BOOT_IMAGE_SIZE: usize = 1440 * 1024;
@@ -243,6 +256,185 @@ pub enum StopReason {
     },
 }
 
+#[derive(Debug, Clone)]
+struct PciConfig {
+    address: u32,
+    distira_present: bool,
+    distira_command: u16,
+    distira_mem_base: u32,
+    distira_init_enable: u32,
+}
+
+impl PciConfig {
+    fn new(distira_present: bool) -> Self {
+        Self {
+            address: 0,
+            distira_present,
+            // Izarra has no PCI BIOS yet, so Distira powers on with its fixed BAR
+            // decoded. Guest drivers can still rewrite command/BAR0 through CF8/CFC.
+            distira_command: if distira_present { 0x0002 } else { 0 },
+            distira_mem_base: DISTIRA_MMIO_BASE & !(DISTIRA_PCI_BAR_SIZE - 1),
+            distira_init_enable: 0,
+        }
+    }
+
+    fn read_io(&self, port: u16, width: BusWidth) -> Option<u32> {
+        if port_span_in(
+            port,
+            width,
+            PCI_CONFIG_ADDRESS_PORT,
+            PCI_CONFIG_ADDRESS_PORT + 3,
+        ) {
+            return Some(read_register_bytes(
+                self.address,
+                port - PCI_CONFIG_ADDRESS_PORT,
+                width,
+            ));
+        }
+        if port_span_in(port, width, PCI_CONFIG_DATA_PORT, PCI_CONFIG_DATA_END) {
+            return Some(self.read_data(port - PCI_CONFIG_DATA_PORT, width));
+        }
+        None
+    }
+
+    fn write_io(&mut self, port: u16, width: BusWidth, value: u32) -> bool {
+        if port_span_in(
+            port,
+            width,
+            PCI_CONFIG_ADDRESS_PORT,
+            PCI_CONFIG_ADDRESS_PORT + 3,
+        ) {
+            self.address =
+                write_register_bytes(self.address, port - PCI_CONFIG_ADDRESS_PORT, width, value);
+            return true;
+        }
+        if port_span_in(port, width, PCI_CONFIG_DATA_PORT, PCI_CONFIG_DATA_END) {
+            self.write_data(port - PCI_CONFIG_DATA_PORT, width, value);
+            return true;
+        }
+        false
+    }
+
+    fn distira_mmio_offset(&self, address: u32, width: usize) -> Option<usize> {
+        let offset = self.distira_bar_offset(address, width)?;
+        if offset < DISTIRA_PCI_LFB_OFFSET && offset + width as u32 <= DISTIRA_PCI_LFB_OFFSET {
+            Some(offset as usize)
+        } else {
+            None
+        }
+    }
+
+    fn distira_lfb_offset(&self, address: u32, width: usize) -> Option<usize> {
+        let offset = self.distira_bar_offset(address, width)?;
+        if (DISTIRA_PCI_LFB_OFFSET..DISTIRA_PCI_TEX_OFFSET).contains(&offset)
+            && offset + width as u32 <= DISTIRA_PCI_TEX_OFFSET
+        {
+            Some((offset - DISTIRA_PCI_LFB_OFFSET) as usize)
+        } else {
+            None
+        }
+    }
+
+    fn distira_bar_offset(&self, address: u32, width: usize) -> Option<u32> {
+        if !self.distira_memory_enabled() {
+            return None;
+        }
+        let offset = address.checked_sub(self.distira_mem_base)?;
+        let end = offset.checked_add(width as u32)?;
+        if end <= DISTIRA_PCI_BAR_SIZE {
+            Some(offset)
+        } else {
+            None
+        }
+    }
+
+    fn distira_memory_enabled(&self) -> bool {
+        self.distira_present && self.distira_command & 0x0002 != 0
+    }
+
+    fn read_data(&self, port_offset: u16, width: BusWidth) -> u32 {
+        let base = (self.address & 0xfc) + u32::from(port_offset);
+        (0..width.bytes())
+            .map(|index| u32::from(self.read_config_byte(base + index)) << (index * 8))
+            .fold(0, |a, b| a | b)
+    }
+
+    fn write_data(&mut self, port_offset: u16, width: BusWidth, value: u32) {
+        let base = (self.address & 0xfc) + u32::from(port_offset);
+        for index in 0..width.bytes() {
+            self.write_config_byte(base + index, ((value >> (index * 8)) & 0xff) as u8);
+        }
+    }
+
+    fn read_config_byte(&self, offset: u32) -> u8 {
+        if !self.distira_selected() {
+            return 0xff;
+        }
+        match offset {
+            0x00 => (DISTIRA_PCI_VENDOR_ID & 0xff) as u8,
+            0x01 => (DISTIRA_PCI_VENDOR_ID >> 8) as u8,
+            0x02 => (DISTIRA_PCI_DEVICE_ID & 0xff) as u8,
+            0x03 => (DISTIRA_PCI_DEVICE_ID >> 8) as u8,
+            0x04 => (self.distira_command & 0xff) as u8,
+            0x05 => (self.distira_command >> 8) as u8,
+            0x08 => DISTIRA_PCI_REVISION,
+            0x09 => 0x00,
+            0x0a => 0x00,
+            0x0b => 0x04,
+            0x0e => 0x00,
+            0x10..=0x13 => ((self.distira_mem_base >> ((offset - 0x10) * 8)) & 0xff) as u8,
+            0x40..=0x43 => ((self.distira_init_enable >> ((offset - 0x40) * 8)) & 0xff) as u8,
+            _ => 0x00,
+        }
+    }
+
+    fn write_config_byte(&mut self, offset: u32, value: u8) {
+        if !self.distira_selected() {
+            return;
+        }
+        match offset {
+            0x04 => {
+                self.distira_command = (self.distira_command & !0x0002) | u16::from(value & 0x02);
+            }
+            0x10..=0x12 => {}
+            0x13 => self.distira_mem_base = u32::from(value) << 24,
+            0x40..=0x43 => {
+                let shift = (offset - 0x40) * 8;
+                self.distira_init_enable =
+                    (self.distira_init_enable & !(0xff << shift)) | (u32::from(value) << shift);
+            }
+            _ => {}
+        }
+    }
+
+    fn distira_selected(&self) -> bool {
+        self.distira_present
+            && self.address & 0x8000_0000 != 0
+            && ((self.address >> 16) & 0xff) == 0
+            && ((self.address >> 11) & 0x1f) as u8 == DISTIRA_PCI_SLOT
+            && ((self.address >> 8) & 0x07) == 0
+    }
+}
+
+fn port_span_in(port: u16, width: BusWidth, start: u16, end: u16) -> bool {
+    let last = port.saturating_add(width.bytes() as u16 - 1);
+    port >= start && last <= end
+}
+
+fn read_register_bytes(register: u32, byte_offset: u16, width: BusWidth) -> u32 {
+    (0..width.bytes())
+        .map(|index| ((register >> ((u32::from(byte_offset) + index) * 8)) & 0xff) << (index * 8))
+        .fold(0, |a, b| a | b)
+}
+
+fn write_register_bytes(register: u32, byte_offset: u16, width: BusWidth, value: u32) -> u32 {
+    let mut bytes = register.to_le_bytes();
+    for index in 0..width.bytes() as usize {
+        bytes[usize::from(byte_offset) + index] = ((value >> (index * 8)) & 0xff) as u8;
+    }
+    u32::from_le_bytes(bytes)
+}
+
 /// A frozen parent CPU state for EXEC (AH=4Bh AL=0) resume: the register file as
 /// handle_dos_int left it at the parent's AH=4Bh INT, so restoring it lands the
 /// CPU back on the IRET stub with the parent's INT-return frame on the stack.
@@ -278,6 +470,7 @@ const WSS_AUTOCAL_FALLBACK_HZ: u32 = 8000;
 pub enum ActiveDisplay {
     VgaRaster,
     MargoLfb,
+    Distira,
 }
 
 /// Per-clock conversion factors, recomputed once whenever the active mode (clock)
@@ -325,6 +518,8 @@ pub struct Machine {
     // it costs one pointer and the copies stay cheap.
     video: Box<Vga>,
     margo: Margo,
+    distira: Distira,
+    pci: PciConfig,
     margo_active: bool,
     pending_soft_int: Option<u8>, // software-INT vector awaiting deferred dispatch
     // Set by MachineBus on any port I/O; the run loop's instruction batch reads
@@ -587,6 +782,8 @@ impl Machine {
         });
         let active_mode = profile.cpu;
         let memory_mib = profile.memory_mib;
+        let distira = Distira::new();
+        let pci = PciConfig::new(profile.video == VideoCard::Distira);
         let timing = TimingFactors::for_clock(active_mode.clock_hz());
         // Partition extended RAM between XMS and EMS from the EMM386 mode.
         let (xms, ems) = build_xms_ems(memory_mib, profile.emm386, None, EMS_FRAME_DEFAULT_SEG);
@@ -606,6 +803,8 @@ impl Machine {
             cpu,
             video: Box::new(Vga::default()),
             margo: Margo::default(),
+            distira,
+            pci,
             margo_active: false,
             pending_soft_int: None,
             io_touched: false,
@@ -702,6 +901,14 @@ impl Machine {
     /// the GUI to keep the full power-on screen and timing.
     pub fn set_fast_post(&mut self, fast: bool) {
         self.fast_post = fast;
+    }
+
+    pub fn distira_render_threads(&self) -> u8 {
+        self.distira.render_threads()
+    }
+
+    pub fn set_distira_render_threads(&mut self, threads: u8) {
+        self.distira.set_render_threads(threads);
     }
 
     /// Re-apply the EMM386 memory-manager mode, the way a CONFIG.SYS DEVICE=EMM386
@@ -1380,6 +1587,8 @@ impl Machine {
             memory: &mut self.memory,
             video: &mut self.video,
             margo: &mut self.margo,
+            distira: &mut self.distira,
+            pci: &mut self.pci,
             ems: self.ems.as_ref(),
             rom: &self.rom,
             serial: &mut self.serial,
@@ -1434,6 +1643,11 @@ impl Machine {
         let _ = bus.write_memory_byte(address, value);
     }
 
+    pub fn write_physical_u32(&mut self, address: u32, value: u32) {
+        let mut bus = self.make_bus();
+        let _ = bus.write_memory(address, BusWidth::Dword, value, BusAccessKind::DataWrite);
+    }
+
     pub fn is_graphics_mode(&self) -> bool {
         matches!(
             self.video.active_mode(),
@@ -1468,6 +1682,7 @@ impl Machine {
         let ok = self.video.set_mode(mode);
         if ok {
             self.margo_active = false;
+            self.distira.disable_display();
         }
         ok
     }
@@ -1495,6 +1710,7 @@ impl Machine {
                 0x13 => {
                     self.video.set_mode13h();
                     self.margo_active = false;
+                    self.distira.disable_display();
                     self.set_bda_video_mode(0x13, 40, 25);
                     return;
                 }
@@ -1503,6 +1719,7 @@ impl Machine {
                 0x04..=0x06 => {
                     self.video.set_cga_mode(al);
                     self.margo_active = false;
+                    self.distira.disable_display();
                     let cols = if al == 0x06 { 80 } else { 40 };
                     self.set_bda_video_mode(al, cols, 25);
                     return;
@@ -1512,6 +1729,7 @@ impl Machine {
                 0x00..=0x03 | 0x07 => {
                     self.video.set_text_mode();
                     self.margo_active = false;
+                    self.distira.disable_display();
                     let cols = if al <= 0x01 { 40 } else { 80 };
                     self.set_bda_video_mode(al, cols, 25);
                     // A mode set clears the screen and homes the BDA cursor, so
@@ -5234,12 +5452,16 @@ impl Machine {
     pub fn set_margo_mode_640x480x8(&mut self) {
         self.margo.set_mode_640x480x8();
         self.margo_active = true;
+        self.distira.disable_display();
     }
 
     pub fn active_display(&self) -> ActiveDisplay {
         // Every VGA mode (text, planar, mode X, mode 13h) now presents a raster
-        // through the core; Margo's linear framebuffer is the only other path.
-        if self.margo_active {
+        // through the core. VEGA also exposes Margo's linear framebuffer and
+        // Distira's Voodoo-style front buffer as alternate scanout paths.
+        if self.distira.display_enabled() {
+            ActiveDisplay::Distira
+        } else if self.margo_active {
             ActiveDisplay::MargoLfb
         } else {
             ActiveDisplay::VgaRaster
@@ -5258,7 +5480,7 @@ impl Machine {
                 0 => 60.0,
                 dots => VGA_DOT_HZ as f64 / dots as f64,
             },
-            ActiveDisplay::MargoLfb => 60.0,
+            ActiveDisplay::MargoLfb | ActiveDisplay::Distira => 60.0,
         };
         hz.clamp(50.0, 120.0)
     }
@@ -5292,6 +5514,11 @@ impl Machine {
                 let display = self.margo.display();
                 let (width, height) = (display.width as usize, display.height as usize);
                 (self.margo.scanout_argb(&palette), width, height)
+            }
+            ActiveDisplay::Distira => {
+                let display = self.distira.display();
+                let (width, height) = (display.width as usize, display.height as usize);
+                (self.distira.scanout_argb(), width, height)
             }
         }
     }
@@ -5999,6 +6226,7 @@ impl Machine {
                     memory,
                     video,
                     margo,
+                    distira,
                     ems,
                     rom,
                     serial,
@@ -6029,6 +6257,7 @@ impl Machine {
                     pending_toka_service,
                     toka_service_status,
                     unittester,
+                    pci,
                     io_touched,
                     ..
                 } = self;
@@ -6036,6 +6265,8 @@ impl Machine {
                     memory,
                     video,
                     margo,
+                    distira,
+                    pci,
                     ems: ems.as_ref(),
                     rom,
                     serial,
@@ -6222,6 +6453,8 @@ struct MachineBus<'a> {
     memory: &'a mut Memory,
     video: &'a mut Vga,
     margo: &'a mut Margo,
+    distira: &'a mut Distira,
+    pci: &'a mut PciConfig,
     // The EMS manager, when expanded memory is provisioned. The bus reads its frame
     // map to alias page-frame accesses onto the mapped backing pages in RAM.
     ems: Option<&'a ems::EmsState>,
@@ -6342,6 +6575,19 @@ impl CpuBus for MachineBus<'_> {
             self.memory_wait_states(address),
         ));
 
+        if let Some(offset) = self.distira_lfb_offset(address, width.bytes() as usize) {
+            match width {
+                BusWidth::Byte => self.distira.write_lfb_u8(offset, value as u8),
+                BusWidth::Word => {
+                    for (index, byte) in (value as u16).to_le_bytes().into_iter().enumerate() {
+                        self.distira.write_lfb_u8(offset + index, byte);
+                    }
+                }
+                BusWidth::Dword => self.distira.write_lfb_u32(offset, value),
+            }
+            return Ok(());
+        }
+
         match width {
             BusWidth::Byte => self.write_memory_byte(address, value as u8),
             BusWidth::Word => {
@@ -6367,6 +6613,10 @@ impl CpuBus for MachineBus<'_> {
             width,
             self.wait_states.io,
         ));
+
+        if let Some(value) = self.pci.read_io(port, width) {
+            return Ok(value);
+        }
 
         if width != BusWidth::Byte {
             return Err(BusError::WidthMismatch { width });
@@ -6486,6 +6736,10 @@ impl CpuBus for MachineBus<'_> {
             width,
             self.wait_states.io,
         ));
+
+        if self.pci.write_io(port, width, value) {
+            return Ok(());
+        }
 
         if width != BusWidth::Byte {
             return Err(BusError::WidthMismatch { width });
@@ -7078,6 +7332,18 @@ impl MachineBus<'_> {
         port.checked_sub(self.wss_base).filter(|&off| off < 8)
     }
 
+    fn distira_mmio_offset(&self, address: u32, width: usize) -> Option<usize> {
+        self.pci
+            .distira_mmio_offset(address, width)
+            .or_else(|| distira_mmio_offset(address, width))
+    }
+
+    fn distira_lfb_offset(&self, address: u32, width: usize) -> Option<usize> {
+        self.pci
+            .distira_lfb_offset(address, width)
+            .or_else(|| distira_lfb_offset(address, width))
+    }
+
     /// Apply the A20 gate to a physical address before it reaches memory. The gate
     /// is the single 8042 output-port bit (shared with fast-A20 port 0x92); when
     /// it is closed, address line 20 is forced low. This is the motherboard-level
@@ -7177,6 +7443,18 @@ impl MachineBus<'_> {
                 .collect());
         }
 
+        if let Some(offset) = self.distira_lfb_offset(address, width) {
+            return Ok((0..width)
+                .map(|index| self.distira.read_lfb_u8(offset + index))
+                .collect());
+        }
+
+        if let Some(offset) = self.distira_mmio_offset(address, width) {
+            return Ok((0..width)
+                .map(|index| self.distira.read_mmio_u8(offset + index))
+                .collect());
+        }
+
         // EMS page-frame aliasing: when expanded memory is provisioned and the
         // access touches the 64 KiB frame, route each byte to its mapped backing
         // page, or to flat RAM where the slot is unmapped.
@@ -7258,6 +7536,16 @@ impl MachineBus<'_> {
 
         if let Some(offset) = margo_mmio_offset(address, 1) {
             self.margo.write_mmio_u8(offset, value);
+            return Ok(());
+        }
+
+        if let Some(offset) = self.distira_lfb_offset(address, 1) {
+            self.distira.write_lfb_u8(offset, value);
+            return Ok(());
+        }
+
+        if let Some(offset) = self.distira_mmio_offset(address, 1) {
+            self.distira.write_mmio_u8(offset, value);
             return Ok(());
         }
 
@@ -7383,6 +7671,8 @@ impl MachineBus<'_> {
             || vga_planar_offset(address, 1).is_some()
             || margo_lfb_offset(address, 1).is_some()
             || margo_mmio_offset(address, 1).is_some()
+            || self.distira_lfb_offset(address, 1).is_some()
+            || self.distira_mmio_offset(address, 1).is_some()
         {
             self.wait_states.video
         } else {
@@ -7474,6 +7764,24 @@ fn margo_mmio_offset(address: u32, width: usize) -> Option<usize> {
     let end = MARGO_MMIO_BASE + MARGO_MMIO_SIZE as u32;
     if (MARGO_MMIO_BASE..end).contains(&address) && address + width as u32 <= end {
         Some((address - MARGO_MMIO_BASE) as usize)
+    } else {
+        None
+    }
+}
+
+fn distira_lfb_offset(address: u32, width: usize) -> Option<usize> {
+    let end = DISTIRA_LFB_BASE + DISTIRA_FB_SIZE as u32;
+    if (DISTIRA_LFB_BASE..end).contains(&address) && address + width as u32 <= end {
+        Some((address - DISTIRA_LFB_BASE) as usize)
+    } else {
+        None
+    }
+}
+
+fn distira_mmio_offset(address: u32, width: usize) -> Option<usize> {
+    let end = DISTIRA_MMIO_BASE + DISTIRA_MMIO_SIZE as u32;
+    if (DISTIRA_MMIO_BASE..end).contains(&address) && address + width as u32 <= end {
+        Some((address - DISTIRA_MMIO_BASE) as usize)
     } else {
         None
     }
@@ -12096,6 +12404,8 @@ mod tests {
             memory: &mut machine.memory,
             video: &mut machine.video,
             margo: &mut machine.margo,
+            distira: &mut machine.distira,
+            pci: &mut machine.pci,
             ems: machine.ems.as_ref(),
             rom: &machine.rom,
             serial: &mut machine.serial,

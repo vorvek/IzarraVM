@@ -4,6 +4,7 @@ use izarravm_audio::{AudioPlayer, AudioSink};
 use izarravm_core::GswMode;
 use izarravm_dos::HostDrive;
 use izarravm_machine::{ActiveDisplay, Machine, MachineProfile, StopReason};
+use izarravm_video::{DISTIRA_RENDER_THREAD_CHOICES, normalize_distira_render_threads};
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -116,6 +117,7 @@ fn render_words(machine: &mut Machine) -> (Vec<u32>, usize, usize) {
                 display.height as usize,
             )
         }
+        ActiveDisplay::Distira => machine.frame_argb(),
     }
 }
 
@@ -205,6 +207,8 @@ enum Command {
     MountCd(izarravm_machine::CdImage),
     /// Eject the CD.
     EjectCd,
+    /// Set the host-side Distira/Glide render worker count.
+    SetGlideRenderThreads(u8),
     Shutdown,
 }
 
@@ -321,6 +325,7 @@ impl Emulator {
         sink: Option<AudioSink>,
         rtc_setup: crate::cmos::RtcSetup,
         gain: SharedGain,
+        glide_render_threads: u8,
     ) -> Self {
         let frame = Arc::new(Mutex::new(Frame::default()));
         let (commands, rx) = mpsc::channel();
@@ -336,6 +341,7 @@ impl Emulator {
                     sink,
                     rtc_setup,
                     gain,
+                    glide_render_threads,
                     rx,
                     frame_thread,
                 )
@@ -372,6 +378,10 @@ impl Emulator {
 
     fn eject_cd(&self) {
         let _ = self.commands.send(Command::EjectCd);
+    }
+
+    fn set_glide_render_threads(&self, threads: u8) {
+        let _ = self.commands.send(Command::SetGlideRenderThreads(threads));
     }
 
     fn shutdown(&mut self) {
@@ -413,6 +423,7 @@ fn emulate(
     sink: Option<AudioSink>,
     rtc_setup: crate::cmos::RtcSetup,
     gain: SharedGain,
+    glide_render_threads: u8,
     commands: Receiver<Command>,
     frame: Arc<Mutex<Frame>>,
 ) {
@@ -427,6 +438,7 @@ fn emulate(
     // the ~8 s RAM count-up and the startup chime. Headless runs and tests leave
     // the default (fast) so they finish inside their cycle budgets.
     machine.set_fast_post(false);
+    machine.set_distira_render_threads(glide_render_threads);
     match HostDrive::mount_c(&c_drive) {
         Ok(drive) => machine.mount_c_drive(drive),
         Err(err) => error!(%err, "failed to mount C: drive"),
@@ -474,6 +486,9 @@ fn emulate(
                 }
                 Ok(Command::MountCd(image)) => machine.mount_cd(image),
                 Ok(Command::EjectCd) => machine.eject_cd(),
+                Ok(Command::SetGlideRenderThreads(threads)) => {
+                    machine.set_distira_render_threads(threads)
+                }
                 Ok(Command::Shutdown) => {
                     // Flush the floppy and the final CMOS state before exiting.
                     flush_floppy(&mut machine, &mut floppy_flush_path);
@@ -674,6 +689,9 @@ pub struct GuiApp {
     // The shared gain handed to the emulation thread; the UI writes it whenever
     // the slider moves so the audio path stays lock-free.
     gain: SharedGain,
+    // Distira/Glide render worker count. Persisted in the GUI prefs and applied
+    // live to the emulation thread.
+    glide_render_threads: u8,
     // Persisted GUI prefs (volume, last mounts) and where they live on disk. The
     // file sits next to the C: root and is rewritten on a change.
     prefs: GuiPrefs,
@@ -710,6 +728,7 @@ impl GuiApp {
         let prefs_path = prefs::prefs_path(&c_drive);
         let prefs = GuiPrefs::load(&prefs_path);
         let volume = prefs.master_volume.clamp(0.0, 1.0);
+        let glide_render_threads = prefs.glide_render_threads;
         let gain = SharedGain::new(volume_gain(volume));
         // Restore the last mount if the source still exists on disk. An image
         // takes priority over a folder when both are recorded.
@@ -747,6 +766,7 @@ impl GuiApp {
             show_com1: false,
             volume,
             gain,
+            glide_render_threads,
             prefs,
             prefs_path,
         };
@@ -780,6 +800,7 @@ impl GuiApp {
             sink,
             self.rtc_setup.clone(),
             self.gain.clone(),
+            self.glide_render_threads,
         ));
         self.texture = None;
         self.frame_seq = 0;
@@ -1081,6 +1102,19 @@ impl GuiApp {
         ));
 
         ui.separator();
+        ui.heading("Glide");
+        ui.horizontal(|ui| {
+            ui.label("Render threads");
+            let before = self.glide_render_threads;
+            for threads in DISTIRA_RENDER_THREAD_CHOICES {
+                ui.selectable_value(&mut self.glide_render_threads, threads, threads.to_string());
+            }
+            if self.glide_render_threads != before {
+                self.set_glide_render_threads(self.glide_render_threads);
+            }
+        });
+
+        ui.separator();
         ui.heading("Audio");
         ui.horizontal(|ui| {
             ui.label("Volume");
@@ -1161,6 +1195,16 @@ impl GuiApp {
     /// swallows any IO error, so this never interrupts the UI.
     fn save_prefs(&self) {
         self.prefs.save(&self.prefs_path);
+    }
+
+    fn set_glide_render_threads(&mut self, threads: u8) {
+        let threads = normalize_distira_render_threads(threads);
+        self.glide_render_threads = threads;
+        self.prefs.glide_render_threads = threads;
+        self.save_prefs();
+        if let Some(emu) = &self.emu {
+            emu.set_glide_render_threads(threads);
+        }
     }
 
     /// The three drive rows: A: floppy (load IMG/folder, eject), CD-ROM (the same

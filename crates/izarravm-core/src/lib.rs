@@ -121,6 +121,8 @@ pub enum VideoCard {
     Et4000Ax,
     #[serde(rename = "s3_virge_dx")]
     S3VirgeDx,
+    #[serde(rename = "distira", alias = "voodoo1", alias = "voodoo_graphics")]
+    Distira,
     #[serde(rename = "voodoo2")]
     Voodoo2,
 }
@@ -130,6 +132,7 @@ impl VideoCard {
         match self {
             Self::Et4000Ax => "et4000_ax",
             Self::S3VirgeDx => "s3_virge_dx",
+            Self::Distira => "distira",
             Self::Voodoo2 => "voodoo2",
         }
     }
@@ -148,6 +151,7 @@ impl FromStr for VideoCard {
         match normalize(value).as_str() {
             "et4000ax" | "et4000_ax" | "tsenget4000ax" => Ok(Self::Et4000Ax),
             "s3virgedx" | "s3_virge_dx" | "virgedx" => Ok(Self::S3VirgeDx),
+            "distira" | "voodoo1" | "voodoographics" | "3dfxvoodoo" => Ok(Self::Distira),
             "voodoo2" | "3dfxvoodoo2" => Ok(Self::Voodoo2),
             _ => Err(ConfigError::UnknownPreset {
                 kind: "video",
