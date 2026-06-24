@@ -1113,6 +1113,42 @@ fn triangle_cmd_samples_pal8_texture_when_selected() {
 }
 
 #[test]
+fn triangle_cmd_samples_apal8_texture_when_selected() {
+    const SST_TEXTURE_MODE: usize = 0x300;
+    const SST_TEX_BASE_ADDR: usize = 0x30c;
+    const SST_NCC_TABLE0_Q2: usize = 0x34c;
+    const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
+    const TEX_APAL8: u32 = 0x06;
+
+    let mut distira = Distira::new();
+    distira.set_frame_size(4, 4);
+    distira.clear_back_rgb(0, 0, 0);
+    assert!(distira.queue_texture_write_u32(0, 0));
+    distira.drain_fifo();
+
+    write_reg(&mut distira, SST_NCC_TABLE0_Q2, 0x8003_f000);
+    write_reg(&mut distira, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
+    write_reg(&mut distira, SST_FBZ_COLOR_PATH, FBZCP_TEXTURE_ENABLED);
+    write_reg(&mut distira, SST_TEXTURE_MODE, TEX_APAL8 << 8);
+    write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
+    write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
+    write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_BY, 0 << 4);
+    write_reg(&mut distira, SST_VERTEX_CX, 0 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut distira, SST_START_R, 0xff << 12);
+    write_reg(&mut distira, SST_START_G, 0xff << 12);
+    write_reg(&mut distira, SST_START_B, 0xff << 12);
+
+    write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+
+    let frame = distira.scanout_argb();
+    assert_eq!(frame[0], 0x00ff_0000);
+}
+
+#[test]
 fn motherboard_chip_names_are_big_distira_and_small_distira() {
     let distira = Distira::new();
 

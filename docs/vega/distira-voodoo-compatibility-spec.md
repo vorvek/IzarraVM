@@ -464,7 +464,9 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
       texture sample test plus the workspace gates.
 - [x] Iteration 30: PAL8 texture sampling. Validated by the video PAL8 texture
       sample test plus the workspace gates.
-- [ ] Next: APAL8 texture sampling.
+- [x] Iteration 31: APAL8 texture sampling. Validated by the video APAL8
+      texture sample test plus the workspace gates.
+- [ ] Next: APAL88 texture sampling.
 
 ## First 90 percent push for this branch
 
