@@ -4847,6 +4847,8 @@ impl Machine {
     /// is the SYSINIT-equivalent for the HLE kernel.
     fn setup_toka_dos_base(&mut self) -> Result<(), MachineError> {
         self.memory.write_u8(BIOS_IRET_STUB_ADDRESS, 0xcf)?;
+        // The HLT sentinel a driver INIT's far return lands on (see call_driver_init).
+        self.memory.write_u8(SYSINIT_HALT_STUB, 0xf4)?;
         for vector in [0x20usize, 0x21] {
             self.memory
                 .write_u16(vector * 4, BIOS_IRET_STUB_ADDRESS as u16)?;
@@ -4900,6 +4902,60 @@ impl Machine {
         let root = self.toka_c_root.as_ref()?;
         let text = std::fs::read_to_string(root.join("CONFIG.SYS")).ok()?;
         Some(izarravm_core::parse_config_sys(&text))
+    }
+
+    /// Far-call a device-driver entry on the real CPU with ES:BX = the request
+    /// header, running until its RETF lands on the HLT sentinel (or the budget runs
+    /// out). Returns whether the request reported DONE with no error bit. The full
+    /// CPU register state and the clock are snapshotted and restored, so the nested
+    /// run is invisible to the outer boot timeline and to the guest that issued the
+    /// service. Success is decided by the request-header DONE bit, not by where IP
+    /// stops: a bare HLT can resume on a timer wake, and the budget bounds a driver
+    /// that never returns.
+    // The SYSINIT device-loading loop wires this in.
+    #[allow(dead_code)]
+    fn call_driver_init(
+        &mut self,
+        entry: (u16, u16),
+        request: (u16, u16),
+    ) -> Result<bool, MachineError> {
+        use izarravm_cpu::{SegmentIndex, SegmentRegister};
+        let saved_regs = self.cpu.registers.clone();
+        let saved_clocks = self.elapsed_clocks;
+        let saved_halted = self.cpu.halted;
+
+        // Far-return frame: SS:SP -> [sentinel IP][sentinel CS]. RETF pops IP then
+        // CS, so the driver returns to the HLT sentinel in segment 0.
+        let sp = SYSINIT_SCRATCH_STACK_SP;
+        let stack = usize::from(SYSINIT_SCRATCH_STACK_SEG) * 16 + usize::from(sp);
+        self.memory.write_u16(stack, SYSINIT_HALT_STUB as u16)?; // return IP
+        self.memory.write_u16(stack + 2, 0x0000)?; // return CS (HLT stub is in seg 0)
+
+        self.cpu.registers.set_segment(
+            SegmentIndex::Ss,
+            SegmentRegister::real(SYSINIT_SCRATCH_STACK_SEG),
+        );
+        self.cpu.registers.set_esp(u32::from(sp));
+        self.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(request.0));
+        self.cpu.registers.set_ebx(u32::from(request.1));
+        self.cpu
+            .registers
+            .set_segment(SegmentIndex::Cs, SegmentRegister::real(entry.0));
+        self.cpu.registers.eip = u32::from(entry.1);
+        self.cpu.halted = false;
+
+        let _ = self.run_until_halt_or_cycles(SYSINIT_INIT_BUDGET)?;
+
+        let req_lin = usize::from(request.0) * 16 + usize::from(request.1);
+        let status = self.memory.read_u16(req_lin + 3)?;
+        let ok = status & 0x0100 != 0 && status & 0x8000 == 0;
+
+        self.cpu.registers = saved_regs;
+        self.cpu.halted = saved_halted;
+        self.elapsed_clocks = saved_clocks;
+        Ok(ok)
     }
 
     /// Mirror any DOS console output produced since the last call onto the VGA
@@ -6680,6 +6736,28 @@ const BDA_DAY_COUNT: usize = 0x4f0;
 /// booter wipes low memory, the way real BIOS handlers (which live in ROM) do.
 const BIOS_ROM_IRET_SEG: u16 = 0xff00;
 
+/// RAM address of the one-byte HLT sentinel a driver INIT's far return lands on.
+/// It sits in the free gap between the IRET stub at 0x600 and the RTC ISR stub at
+/// 0x610. `setup_toka_dos_base` writes it; `call_driver_init` returns the CPU here.
+const SYSINIT_HALT_STUB: usize = BIOS_IRET_STUB_ADDRESS + 1;
+
+/// Scratch stack segment for the nested driver-INIT call. Linear 0x500 is the
+/// classic free DOS low-memory scratch page, below the BIOS stub cluster at 0x600
+/// and above the BIOS data area. The stack grows down from a low SP and uses only
+/// the far-return frame plus the driver's own pushes.
+// The SYSINIT device-loading loop wires these in.
+#[allow(dead_code)]
+const SYSINIT_SCRATCH_STACK_SEG: u16 = 0x0050;
+/// Initial SP for the scratch stack: high enough for the driver's pushes, low
+/// enough to keep the stack inside the 0x500 page (below the stub cluster).
+#[allow(dead_code)]
+const SYSINIT_SCRATCH_STACK_SP: u16 = 0x00f0;
+
+/// Cycle budget for one driver-INIT routine. An INIT is short; the budget bounds a
+/// malformed driver that never returns so it cannot hang the boot.
+#[allow(dead_code)]
+const SYSINIT_INIT_BUDGET: u64 = 50_000;
+
 /// RAM address of the default INT 70h (IRQ8) handler, a few bytes past the IRET
 /// stub at 0x600 in the free BIOS scratch below the .COM load segment (0x1000).
 /// Unlike the host-serviced service INTs, the RTC interrupt arrives as a real
@@ -7361,6 +7439,34 @@ mod tests {
             vec![0u8; BIOS_ROM_SIZE],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn call_driver_init_runs_a_routine_and_restores_state() {
+        let mut m = test_machine();
+        // The HLT sentinel the far-return lands on, the way setup_toka_dos_base
+        // writes it during a real boot.
+        m.memory.write_u8(SYSINIT_HALT_STUB, 0xf4).unwrap();
+        // A routine at 0x3000:0000 that, given ES:BX = request, sets [ES:BX+3] to
+        // 0x0100 (DONE) and RETFs: mov ax,0x0100 / mov es:[bx+3],ax / retf.
+        let code = [0xB8, 0x00, 0x01, 0x26, 0x89, 0x47, 0x03, 0xCB];
+        for (i, &b) in code.iter().enumerate() {
+            m.memory.write_u8(0x30000 + i, b).unwrap();
+        }
+        let req = 0x40000usize;
+        m.memory.write_u16(req + 3, 0).unwrap();
+
+        let saved = m.cpu.registers.clone();
+        let saved_clocks = m.elapsed_clocks;
+
+        let ok = m
+            .call_driver_init((0x3000, 0x0000), (0x4000, 0x0000))
+            .unwrap();
+
+        assert!(ok); // DONE seen, no error bit
+        assert_eq!(m.memory.read_u16(req + 3).unwrap(), 0x0100);
+        assert_eq!(m.cpu.registers, saved); // outer CPU state restored
+        assert_eq!(m.elapsed_clocks, saved_clocks); // timeline restored
     }
 
     #[test]
