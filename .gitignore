@@ -6,3 +6,5 @@
 /dev_docs/
 *.log
 *.tmp
+/c_drive/*
+!/c_drive/TESTS.COM
