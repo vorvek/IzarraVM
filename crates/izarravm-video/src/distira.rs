@@ -150,6 +150,9 @@ pub const SST_FBI_INIT7: usize = 0x24c;
 pub const SST_TEXTURE_MODE: usize = 0x300;
 pub const SST_TLOD: usize = 0x304;
 pub const SST_TEX_BASE_ADDR: usize = 0x30c;
+pub const SST_TEX_BASE_ADDR1: usize = 0x310;
+pub const SST_TEX_BASE_ADDR2: usize = 0x314;
+pub const SST_TEX_BASE_ADDR38: usize = 0x318;
 pub const SST_NCC_TABLE0_Y0: usize = 0x324;
 pub const SST_NCC_TABLE0_Y1: usize = 0x328;
 pub const SST_NCC_TABLE0_Y2: usize = 0x32c;
@@ -200,6 +203,7 @@ pub const FBZ_PARAM_ADJUST: u32 = 1 << 26;
 pub const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
 pub const TEXTUREMODE_TCLAMPS: u32 = 1 << 6;
 pub const TEXTUREMODE_TCLAMPT: u32 = 1 << 7;
+pub const LOD_TMULTIBASEADDR: u32 = 1 << 24;
 pub const LOD_TMIRROR_S: u32 = 1 << 28;
 pub const LOD_TMIRROR_T: u32 = 1 << 29;
 
@@ -331,6 +335,15 @@ impl DistiraVertex {
     }
 }
 
+#[derive(Clone, Copy)]
+struct TmuTextureSample {
+    lod: u32,
+    base_addr: u32,
+    mip_offset: usize,
+    mode: u32,
+    lod_reg: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DistiraFifoEntry {
     Register { offset: usize, value: u32 },
@@ -415,6 +428,9 @@ pub struct Distira {
     texture_lod_tmu1: u32,
     tex_base_addr: u32,
     tex_base_addr_tmu1: u32,
+    tex_base_addr1: [u32; 2],
+    tex_base_addr2: [u32; 2],
+    tex_base_addr38: [u32; 2],
     ncc_table0_q2: [u32; 2],
     ncc_table0_q3: [u32; 2],
     ncc_table0_y: [[u32; 4]; 2],
@@ -508,6 +524,9 @@ impl Distira {
             texture_lod_tmu1: 0,
             tex_base_addr: 0,
             tex_base_addr_tmu1: 0,
+            tex_base_addr1: [0; 2],
+            tex_base_addr2: [0; 2],
+            tex_base_addr38: [0; 2],
             ncc_table0_q2: [0; 2],
             ncc_table0_q3: [0; 2],
             ncc_table0_y: [[0; 4]; 2],
@@ -1049,6 +1068,9 @@ impl Distira {
                     merge_byte(&mut self.tex_base_addr_tmu1, byte, value);
                 }
             }
+            SST_TEX_BASE_ADDR1 => self.write_tex_base_addr_registers(chip, 1, byte, value),
+            SST_TEX_BASE_ADDR2 => self.write_tex_base_addr_registers(chip, 2, byte, value),
+            SST_TEX_BASE_ADDR38 => self.write_tex_base_addr_registers(chip, 38, byte, value),
             SST_NCC_TABLE0_Y0 => self.write_ncc_y_registers(chip, 0, byte, value),
             SST_NCC_TABLE0_Y1 => self.write_ncc_y_registers(chip, 1, byte, value),
             SST_NCC_TABLE0_Y2 => self.write_ncc_y_registers(chip, 2, byte, value),
@@ -1082,6 +1104,15 @@ impl Distira {
                 if chip & CHIP_TREX1 != 0 {
                     merge_byte(&mut self.tex_base_addr_tmu1, byte, value);
                 }
+            }
+            _ if voodoo_reg == SST_TEX_BASE_ADDR1 => {
+                self.write_tex_base_addr_registers(chip, 1, byte, value);
+            }
+            _ if voodoo_reg == SST_TEX_BASE_ADDR2 => {
+                self.write_tex_base_addr_registers(chip, 2, byte, value);
+            }
+            _ if voodoo_reg == SST_TEX_BASE_ADDR38 => {
+                self.write_tex_base_addr_registers(chip, 38, byte, value);
             }
             _ if voodoo_reg == SST_NCC_TABLE0_Y0 => {
                 self.write_ncc_y_registers(chip, 0, byte, value);
@@ -1233,6 +1264,20 @@ impl Distira {
         if raw & (1 << 31) != 0 {
             let index = ((raw >> 23) & 0xfe) as usize | usize::from(odd);
             self.texture_palette[tmu][index] = raw | 0xff00_0000;
+        }
+    }
+
+    fn write_tex_base_addr_registers(&mut self, chip: usize, lod: u32, byte: usize, value: u8) {
+        let slots = match lod {
+            1 => &mut self.tex_base_addr1,
+            2 => &mut self.tex_base_addr2,
+            _ => &mut self.tex_base_addr38,
+        };
+        if chip & CHIP_TREX0 != 0 {
+            merge_byte(&mut slots[0], byte, value);
+        }
+        if chip & CHIP_TREX1 != 0 {
+            merge_byte(&mut slots[1], byte, value);
         }
     }
 
@@ -1674,8 +1719,8 @@ impl Distira {
             lod_reg & LOD_TMIRROR_T != 0,
         );
         let texel = t * width + s;
-        let offset = (self.tex_base_addr_for_tmu(tmu) as usize)
-            .saturating_add(texture_mip_offset(lod, 1))
+        let offset = (self.tex_base_addr_for_tmu_lod(tmu, lod) as usize)
+            .saturating_add(self.texture_mip_offset_for_lod(tmu, lod, 1))
             .saturating_add(texel);
         let Some(&raw) = self.texture.get(offset) else {
             return (0, 0, 0);
@@ -1774,8 +1819,8 @@ impl Distira {
             lod_reg & LOD_TMIRROR_T != 0,
         );
         let texel = t * width + s;
-        let offset = (self.tex_base_addr_for_tmu(tmu) as usize)
-            .saturating_add(texture_mip_offset(lod, 1))
+        let offset = (self.tex_base_addr_for_tmu_lod(tmu, lod) as usize)
+            .saturating_add(self.texture_mip_offset_for_lod(tmu, lod, 1))
             .saturating_add(texel);
         self.texture.get(offset).copied().unwrap_or(0)
     }
@@ -1800,8 +1845,8 @@ impl Distira {
             lod_reg & LOD_TMIRROR_T != 0,
         );
         let texel = (t * width + s).saturating_mul(2);
-        let offset = (self.tex_base_addr_for_tmu(tmu) as usize)
-            .saturating_add(texture_mip_offset(lod, 2))
+        let offset = (self.tex_base_addr_for_tmu_lod(tmu, lod) as usize)
+            .saturating_add(self.texture_mip_offset_for_lod(tmu, lod, 2))
             .saturating_add(texel);
         let Some(bytes) = self.texture.get(offset..offset.saturating_add(2)) else {
             return 0;
@@ -1816,8 +1861,17 @@ impl Distira {
         let scale = (1_u32 << lod).max(1) as f32;
         let s = s / scale;
         let t = t / scale;
+        let base_addr = self.tex_base_addr_for_tmu_lod(tmu, lod);
+        let mip_offset = self.texture_mip_offset_for_lod(tmu, lod, 2);
+        let sample = TmuTextureSample {
+            lod,
+            base_addr,
+            mip_offset,
+            mode,
+            lod_reg,
+        };
         if mode & 0x6 != 0 {
-            return self.bilinear_rgb565(s, t, lod, self.tex_base_addr_for_tmu(tmu), mode, lod_reg);
+            return self.bilinear_rgb565(s, t, sample);
         }
         let width = (256_usize >> lod).max(1);
         let height = (256_usize >> lod).max(1);
@@ -1833,18 +1887,10 @@ impl Distira {
             mode & TEXTUREMODE_TCLAMPT != 0,
             lod_reg & LOD_TMIRROR_T != 0,
         ) as i32;
-        self.sample_rgb565_texel(s, t, lod, self.tex_base_addr_for_tmu(tmu), mode, lod_reg)
+        self.sample_rgb565_texel(s, t, sample)
     }
 
-    fn bilinear_rgb565(
-        &self,
-        s: f32,
-        t: f32,
-        lod: u32,
-        base_addr: u32,
-        mode: u32,
-        lod_reg: u32,
-    ) -> (u8, u8, u8) {
+    fn bilinear_rgb565(&self, s: f32, t: f32, sample: TmuTextureSample) -> (u8, u8, u8) {
         let base_s = s.floor();
         let base_t = t.floor();
         let frac_s = ((s - base_s) * 16.0).floor().clamp(0.0, 15.0) as u32;
@@ -1852,10 +1898,10 @@ impl Distira {
         let s0 = base_s as i32;
         let t0 = base_t as i32;
         let samples = [
-            self.sample_rgb565_texel(s0, t0, lod, base_addr, mode, lod_reg),
-            self.sample_rgb565_texel(s0 + 1, t0, lod, base_addr, mode, lod_reg),
-            self.sample_rgb565_texel(s0, t0 + 1, lod, base_addr, mode, lod_reg),
-            self.sample_rgb565_texel(s0 + 1, t0 + 1, lod, base_addr, mode, lod_reg),
+            self.sample_rgb565_texel(s0, t0, sample),
+            self.sample_rgb565_texel(s0 + 1, t0, sample),
+            self.sample_rgb565_texel(s0, t0 + 1, sample),
+            self.sample_rgb565_texel(s0 + 1, t0 + 1, sample),
         ];
         let weights = [
             (16 - frac_s) * (16 - frac_t),
@@ -1915,32 +1961,44 @@ impl Distira {
         }
     }
 
-    fn sample_rgb565_texel(
-        &self,
-        s: i32,
-        t: i32,
-        lod: u32,
-        base_addr: u32,
-        mode: u32,
-        lod_reg: u32,
-    ) -> (u8, u8, u8) {
-        let width = (256_usize >> lod).max(1);
-        let height = (256_usize >> lod).max(1);
+    fn tex_base_addr_for_tmu_lod(&self, tmu: usize, lod: u32) -> u32 {
+        if self.texture_lod_for_tmu(tmu) & LOD_TMULTIBASEADDR == 0 {
+            return self.tex_base_addr_for_tmu(tmu);
+        }
+        match lod {
+            0 => self.tex_base_addr_for_tmu(tmu),
+            1 => self.tex_base_addr1[tmu],
+            2 => self.tex_base_addr2[tmu],
+            _ => self.tex_base_addr38[tmu],
+        }
+    }
+
+    fn texture_mip_offset_for_lod(&self, tmu: usize, lod: u32, bytes_per_texel: usize) -> usize {
+        if self.texture_lod_for_tmu(tmu) & LOD_TMULTIBASEADDR != 0 {
+            0
+        } else {
+            texture_mip_offset(lod, bytes_per_texel)
+        }
+    }
+
+    fn sample_rgb565_texel(&self, s: i32, t: i32, sample: TmuTextureSample) -> (u8, u8, u8) {
+        let width = (256_usize >> sample.lod).max(1);
+        let height = (256_usize >> sample.lod).max(1);
         let s = texture_coord_index_i32(
             s,
             width,
-            mode & TEXTUREMODE_TCLAMPS != 0,
-            lod_reg & LOD_TMIRROR_S != 0,
+            sample.mode & TEXTUREMODE_TCLAMPS != 0,
+            sample.lod_reg & LOD_TMIRROR_S != 0,
         );
         let t = texture_coord_index_i32(
             t,
             height,
-            mode & TEXTUREMODE_TCLAMPT != 0,
-            lod_reg & LOD_TMIRROR_T != 0,
+            sample.mode & TEXTUREMODE_TCLAMPT != 0,
+            sample.lod_reg & LOD_TMIRROR_T != 0,
         );
         let texel = (t * width + s).saturating_mul(2);
-        let offset = (base_addr as usize)
-            .saturating_add(texture_mip_offset(lod, 2))
+        let offset = (sample.base_addr as usize)
+            .saturating_add(sample.mip_offset)
             .saturating_add(texel);
         let Some(bytes) = self.texture.get(offset..offset.saturating_add(2)) else {
             return (0, 0, 0);
