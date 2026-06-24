@@ -15803,6 +15803,133 @@ mod tests {
     }
 
     #[test]
+    fn mem_reports_live_ems_differing_between_ram_and_noems() {
+        // ASCII -> Set 1 make codes for the lowercase letters this test types.
+        fn key_codes(ch: char) -> Vec<u8> {
+            let make: u8 = match ch {
+                'm' => 0x32,
+                'e' => 0x12,
+                '\r' => 0x1c,
+                _ => return Vec::new(),
+            };
+            vec![make, make | 0x80]
+        }
+
+        fn run_mem_with_config(config_sys: &str) -> String {
+            let dir = tempfile::tempdir().unwrap();
+            let files = izarravm_firmware::toka_dos_system_files();
+            izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format)
+                .unwrap();
+            std::fs::write(dir.path().join("CONFIG.SYS"), config_sys).unwrap();
+
+            let mut machine = Machine::new(
+                MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+                izarravm_firmware::izarra_bios(),
+            )
+            .unwrap();
+            machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+            machine.set_toka_c_root(dir.path().to_path_buf());
+            machine.run_until_halt_or_cycles(22_000_000).unwrap();
+
+            for ch in "mem\r".chars() {
+                for code in key_codes(ch) {
+                    machine.inject_key_scancodes(&[code]);
+                }
+                // MEM prints a long live report; each character is an INT 21h HLE
+                // round-trip, so give the run after Enter enough cycles to finish
+                // through the expanded-memory section.
+                machine.run_until_halt_or_cycles(2_000_000).unwrap();
+            }
+            machine.screen_text().as_text()
+        }
+
+        let ram = run_mem_with_config(
+            "DEVICE=C:\\DOS\\HIMEM.SYS /TESTMEM:OFF\r\n\
+             DEVICE=C:\\DOS\\IEMM.EXE RAM\r\nDOS=HIGH,UMB\r\n",
+        );
+        let noems = run_mem_with_config(
+            "DEVICE=C:\\DOS\\HIMEM.SYS /TESTMEM:OFF\r\n\
+             DEVICE=C:\\DOS\\IEMM.EXE NOEMS\r\nDOS=HIGH,UMB\r\n",
+        );
+
+        // RAM provisions an EMS page frame: MEM prints an 'Expanded free' KB line.
+        assert!(
+            ram.contains("Expanded free"),
+            "RAM mode shows live expanded memory; got:\n{ram}"
+        );
+        // NOEMS is a frameless manager: MEM prints the NOEMS no-frame line.
+        assert!(
+            noems.contains("NOEMS"),
+            "NOEMS mode shows the frameless line; got:\n{noems}"
+        );
+        // The proof: the two runs read different live EMS state, not fixed text.
+        assert!(
+            !noems.contains("Expanded free"),
+            "NOEMS must not print the RAM-mode expanded-free line; got:\n{noems}"
+        );
+    }
+
+    #[test]
+    fn toka_icdex_reports_live_cd_letter_and_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = izarravm_firmware::toka_dos_system_files();
+        izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format)
+            .unwrap();
+
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .unwrap();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        machine.set_toka_c_root(dir.path().to_path_buf());
+
+        // A minimal valid data disc (one 2048-byte sector); ICDEX only probes the
+        // redirector, it does not read the medium.
+        let iso = vec![0u8; crate::cdimage::DATA_SECTOR];
+        let image = CdImage::from_iso(iso).unwrap();
+        machine.mount_cd(image);
+
+        machine.run_until_halt_or_cycles(22_000_000).unwrap();
+
+        fn key_codes(ch: char) -> Vec<u8> {
+            let make: u8 = match ch {
+                'i' => 0x17,
+                'c' => 0x2e,
+                'd' => 0x20,
+                'e' => 0x12,
+                'x' => 0x2d,
+                '\r' => 0x1c,
+                _ => return Vec::new(),
+            };
+            vec![make, make | 0x80]
+        }
+        for ch in "icdex\r".chars() {
+            for code in key_codes(ch) {
+                machine.inject_key_scancodes(&[code]);
+            }
+            machine.run_until_halt_or_cycles(400_000).unwrap();
+        }
+
+        let text = machine.screen_text().as_text();
+        // New-only wording proves the rewritten tool shipped and ran.
+        assert!(
+            text.contains("extensions status"),
+            "ICDEX prints the new status header; got:\n{text}"
+        );
+        // Live values from the HLE handler.
+        assert!(
+            text.contains("D:") && text.contains("2.23"),
+            "ICDEX prints the live CD drive letter D: and version 2.23; got:\n{text}"
+        );
+        // The old fake banner's lines must be gone.
+        assert!(
+            !text.contains("extensions installed") && !text.contains("Driver ICD0001"),
+            "the old fake ICDEX banner is gone; got:\n{text}"
+        );
+    }
+
+    #[test]
     fn toka_md_and_cd_update_the_prompt() {
         let dir = tempfile::tempdir().unwrap();
         let files = izarravm_firmware::toka_dos_system_files();
@@ -15999,12 +16126,14 @@ mod tests {
             for code in key_codes(ch) {
                 machine.inject_key_scancodes(&[code]);
             }
-            machine.run_until_halt_or_cycles(400_000).unwrap();
+            // MEM now prints a long live report; give the run after Enter enough
+            // cycles for its banner to appear.
+            machine.run_until_halt_or_cycles(2_000_000).unwrap();
         }
 
         let text = machine.screen_text().as_text();
         assert!(
-            text.contains("conventional memory"),
+            text.contains("Toka-DOS Memory"),
             "MEM (in C:\\DOS) ran via the PATH search; got:\n{text}"
         );
     }

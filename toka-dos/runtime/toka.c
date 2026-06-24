@@ -42,6 +42,23 @@ void t_putu(unsigned value)
     }
 }
 
+void t_putul(unsigned long value)
+{
+    char buf[10];
+    int i = 0;
+    if (value == 0) {
+        t_putc('0');
+        return;
+    }
+    while (value > 0 && i < 10) {
+        buf[i++] = (char)('0' + (int)(value % 10));
+        value /= 10;
+    }
+    while (i > 0) {
+        t_putc(buf[--i]);
+    }
+}
+
 int t_getline(char *out, int max)
 {
     /* DOS AH=0Ah wants a buffer of [max][len][bytes...]. SS = DS in the .COM
