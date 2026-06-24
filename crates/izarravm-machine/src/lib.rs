@@ -4893,7 +4893,75 @@ impl Machine {
         if dos_umb && self.dos.has_umb_arena() {
             self.dos.set_umb_link(true);
         }
+        // Load CONFIG.SYS DEVICE= drivers after the memory manager and scalar
+        // directives, the way DOS SYSINIT processes the file top to bottom.
+        self.load_config_drivers();
         Ok(())
+    }
+
+    /// Walk CONFIG.SYS DEVICE= lines in order and load each non-memory-manager raw
+    /// `.SYS` driver: stage it resident, run its strategy then interrupt INIT on the
+    /// CPU, finalize on success or abort on failure, and emit a boot message.
+    /// Driver loading is non-critical: a failed line never aborts the boot.
+    fn load_config_drivers(&mut self) {
+        let Some(root) = self.toka_c_root.clone() else {
+            return;
+        };
+        let Ok(text) = std::fs::read_to_string(root.join("CONFIG.SYS")) else {
+            return;
+        };
+        for line in izarravm_core::parse_device_lines(&text) {
+            let base = izarravm_core::dos_basename(&line.path).to_ascii_uppercase();
+            let label = device_label(&line);
+            if matches!(
+                base.as_str(),
+                "HIMEM.SYS" | "IEMM.EXE" | "IEMM" | "EMM386.EXE" | "EMM386"
+            ) {
+                self.dos
+                    .write_boot_message(&format!("{label} (memory manager)"));
+                continue;
+            }
+            // CONFIG.SYS paths are C:-rooted; resolve against the host C: root.
+            let rel = line
+                .path
+                .trim_start_matches("C:\\")
+                .trim_start_matches("c:\\")
+                .replace('\\', "/");
+            let Ok(image) = std::fs::read(root.join(&rel)) else {
+                self.dos.write_boot_message(&format!("{label} not found"));
+                continue;
+            };
+            let staged = {
+                let Machine { dos, memory, .. } = self;
+                match dos.stage_sys_driver(&image, &line.args, memory) {
+                    Ok(staged) => staged,
+                    Err(izarravm_dos::DriverStageError::Load(
+                        izarravm_dos::DriverLoadError::UnsupportedFormat,
+                    )) => {
+                        dos.write_boot_message(&format!("{label} skipped (unsupported format)"));
+                        continue;
+                    }
+                    Err(_) => {
+                        dos.write_boot_message(&format!("{label} failed to install"));
+                        continue;
+                    }
+                }
+            };
+            // DOS calls strategy (stores the request pointer) then interrupt (runs
+            // INIT). The interrupt call's status decides success.
+            let _ = self.call_driver_init(staged.strategy, staged.request_ptr);
+            let ok = self
+                .call_driver_init(staged.interrupt, staged.request_ptr)
+                .unwrap_or(false);
+            let Machine { dos, memory, .. } = self;
+            if ok {
+                let _ = dos.finalize_sys_driver(&staged, memory);
+                dos.write_boot_message(&format!("{label} installed"));
+            } else {
+                let _ = dos.abort_sys_driver(&staged, memory);
+                dos.write_boot_message(&format!("{label} failed to install (INIT error)"));
+            }
+        }
     }
 
     /// Read and parse C:\CONFIG.SYS for the HLE SYSINIT directives, or None when
@@ -4912,8 +4980,6 @@ impl Machine {
     /// service. Success is decided by the request-header DONE bit, not by where IP
     /// stops: a bare HLT can resume on a timer wake, and the budget bounds a driver
     /// that never returns.
-    // The SYSINIT device-loading loop wires this in.
-    #[allow(dead_code)]
     fn call_driver_init(
         &mut self,
         entry: (u16, u16),
@@ -6745,17 +6811,13 @@ const SYSINIT_HALT_STUB: usize = BIOS_IRET_STUB_ADDRESS + 1;
 /// classic free DOS low-memory scratch page, below the BIOS stub cluster at 0x600
 /// and above the BIOS data area. The stack grows down from a low SP and uses only
 /// the far-return frame plus the driver's own pushes.
-// The SYSINIT device-loading loop wires these in.
-#[allow(dead_code)]
 const SYSINIT_SCRATCH_STACK_SEG: u16 = 0x0050;
 /// Initial SP for the scratch stack: high enough for the driver's pushes, low
 /// enough to keep the stack inside the 0x500 page (below the stub cluster).
-#[allow(dead_code)]
 const SYSINIT_SCRATCH_STACK_SP: u16 = 0x00f0;
 
 /// Cycle budget for one driver-INIT routine. An INIT is short; the budget bounds a
 /// malformed driver that never returns so it cannot hang the boot.
-#[allow(dead_code)]
 const SYSINIT_INIT_BUDGET: u64 = 50_000;
 
 /// RAM address of the default INT 70h (IRQ8) handler, a few bytes past the IRET
@@ -6812,6 +6874,18 @@ const EBDA_SEGMENT: u16 = 0x9FC0;
 /// the reserved EBDA (after the size byte at offset 0), so it is consistent with
 /// the lowered conventional-memory size and out of the BDA's way.
 const BIOS_CONFIG_TABLE_ADDR: u32 = 0x9FC10;
+
+/// Format a CONFIG.SYS device line for a boot message: the DEVICE= path and its
+/// argument tail, left-padded to a column so the status that follows lines up.
+fn device_label(line: &izarravm_core::ConfigDeviceLine) -> String {
+    let keyword = if line.high { "DEVICEHIGH=" } else { "DEVICE=" };
+    let body = if line.args.is_empty() {
+        format!("{keyword}{}", line.path)
+    } else {
+        format!("{keyword}{} {}", line.path, line.args)
+    };
+    format!("{body:<28}")
+}
 
 fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     // BIOS service interrupts the host intercepts by vector. Their IVT targets
@@ -15874,6 +15948,121 @@ mod tests {
             machine.read_physical_u8(BIOS_IRET_STUB_ADDRESS as u32),
             0xcf
         );
+    }
+
+    /// Publish the DOS device chain through an AH=52h query and report whether a
+    /// device with the given 8-byte name is linked. Walks from the NUL header
+    /// embedded at ES:BX+0x22 down the next pointers.
+    fn device_chain_contains(machine: &mut Machine, name: &[u8; 8]) -> bool {
+        let mut regs = izarravm_dos::DosRegs {
+            ax: 0x5200,
+            ..izarravm_dos::DosRegs::default()
+        };
+        machine
+            .dos
+            .dispatch(0x21, &mut regs, &mut machine.memory)
+            .unwrap();
+        let mut seg = regs.es;
+        let mut off = regs.bx.wrapping_add(0x22); // NUL header
+        for _ in 0..32 {
+            if seg == 0xffff && off == 0xffff {
+                break;
+            }
+            let header = (u32::from(seg) << 4) + u32::from(off);
+            let mut found = [0u8; 8];
+            for (i, slot) in found.iter_mut().enumerate() {
+                *slot = machine.read_physical_u8(header + 0x0a + i as u32);
+            }
+            if &found == name {
+                return true;
+            }
+            off = machine.read_guest_word(header);
+            seg = machine.read_guest_word(header + 2);
+        }
+        false
+    }
+
+    /// Stand up a booted Toka-DOS base with the given CONFIG.SYS text, by laying
+    /// Toka-DOS down on the host C: then running the LoadBootRecord service. Faster
+    /// and more deterministic than driving the whole BIOS, and it runs the same
+    /// setup_toka_dos_base SYSINIT path. The CONFIG.SYS is written after the install
+    /// (Format clears the directory first).
+    fn boot_toka_with_config(dir: &std::path::Path, config_sys: &str) -> Machine {
+        let files = izarravm_firmware::toka_dos_system_files();
+        izarravm_dos::toka_dos_install(dir, &files, izarravm_dos::InstallMode::Format).unwrap();
+        std::fs::write(dir.join("CONFIG.SYS"), config_sys).unwrap();
+        let mut machine = test_machine();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir).unwrap());
+        machine.set_toka_c_root(dir.to_path_buf());
+        machine.perform_toka_service(0x10);
+        assert_eq!(machine.toka_service_status, 0);
+        machine
+    }
+
+    #[test]
+    fn config_sys_device_line_loads_a_raw_sys_driver() {
+        let dir = tempfile::tempdir().unwrap();
+        // Header (18) + strategy (retf) + interrupt (set DONE, retf).
+        let mut img = vec![0u8; 0x20];
+        img[0..4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        img[4..6].copy_from_slice(&0x8000u16.to_le_bytes());
+        img[6..8].copy_from_slice(&0x0012u16.to_le_bytes()); // strategy
+        img[8..10].copy_from_slice(&0x0013u16.to_le_bytes()); // interrupt
+        img[10..18].copy_from_slice(b"INLINE  ");
+        img[0x12] = 0xCB; // strategy: retf
+        // interrupt: mov ax,0x0100; mov es:[bx+3],ax; retf
+        img[0x13..0x1B].copy_from_slice(&[0xB8, 0x00, 0x01, 0x26, 0x89, 0x47, 0x03, 0xCB]);
+
+        let files = izarravm_firmware::toka_dos_system_files();
+        izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format)
+            .unwrap();
+        std::fs::write(dir.path().join("INLINE.SYS"), &img).unwrap();
+        std::fs::write(
+            dir.path().join("CONFIG.SYS"),
+            "DEVICE=C:\\INLINE.SYS\r\nDOS=HIGH,UMB\r\n",
+        )
+        .unwrap();
+
+        let mut machine = test_machine();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        machine.set_toka_c_root(dir.path().to_path_buf());
+        machine.perform_toka_service(0x10);
+        assert_eq!(machine.toka_service_status, 0);
+
+        assert!(
+            device_chain_contains(&mut machine, b"INLINE  "),
+            "the loaded driver is linked into the device chain"
+        );
+        // The boot message reached the DOS console.
+        let console = String::from_utf8_lossy(machine.dos_output()).into_owned();
+        assert!(
+            console.contains("INLINE.SYS"),
+            "boot message; got:\n{console}"
+        );
+    }
+
+    #[test]
+    fn config_sys_missing_device_file_boots_with_a_failure_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut machine =
+            boot_toka_with_config(dir.path(), "DEVICE=C:\\NOPE.SYS\r\nDOS=HIGH,UMB\r\n");
+        let console = String::from_utf8_lossy(machine.dos_output()).into_owned();
+        assert!(
+            console.contains("NOPE.SYS") && console.contains("not found"),
+            "missing driver is reported; got:\n{console}"
+        );
+        // The bare skeleton still walks.
+        assert!(device_chain_contains(&mut machine, b"NUL     "));
+        assert!(device_chain_contains(&mut machine, b"CON     "));
+    }
+
+    #[test]
+    fn config_sys_with_no_device_line_keeps_the_bare_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut machine = boot_toka_with_config(dir.path(), "DOS=HIGH,UMB\r\nFILES=30\r\n");
+        assert!(device_chain_contains(&mut machine, b"NUL     "));
+        assert!(device_chain_contains(&mut machine, b"CON     "));
+        assert!(device_chain_contains(&mut machine, b"CLOCK$  "));
     }
 
     #[test]
