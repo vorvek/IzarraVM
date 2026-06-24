@@ -1,7 +1,7 @@
 use izarravm_video::{
-    BIG_DISTIRA_CHIP_NAME, DEPTHOP_ALWAYS, DEPTHOP_LESSTHAN, Distira, DistiraVertex,
+    BIG_DISTIRA_CHIP_NAME, DEPTHOP_ALWAYS, DEPTHOP_LESSTHAN, Distira, DistiraVertex, FBZ_CHROMAKEY,
     FBZ_DEPTH_ENABLE, FBZ_DEPTH_OP_SHIFT, FBZ_DEPTH_WMASK, FBZ_DRAW_BACK, FBZ_RGB_WMASK,
-    LFB_FORMAT_ARGB8888, LFB_WRITE_BACK, SMALL_DISTIRA_CHIP_NAME, SST_ALPHA_MODE,
+    LFB_FORMAT_ARGB8888, LFB_WRITE_BACK, SMALL_DISTIRA_CHIP_NAME, SST_ALPHA_MODE, SST_CHROMA_KEY,
     SST_CLIP_LEFT_RIGHT, SST_CLIP_LOW_Y_HIGH_Y, SST_COLOR1, SST_DR_DX, SST_DR_DY, SST_FASTFILL_CMD,
     SST_FBI_INIT0, SST_FBI_INIT1, SST_FBI_INIT2, SST_FBI_INIT3, SST_FBI_INIT7, SST_FBI_ZFUNC_FAIL,
     SST_FBZ_MODE, SST_FDR_DX, SST_FDR_DY, SST_FDZ_DX, SST_FSTART_B, SST_FSTART_G, SST_FSTART_R,
@@ -496,6 +496,38 @@ fn triangle_cmd_alpha_blends_source_over_destination() {
     let frame = distira.scanout_argb();
     assert_eq!(frame[0], 0x0084_007b);
     assert_eq!(frame[3], 0x0000_00ff);
+}
+
+#[test]
+fn triangle_cmd_chroma_key_rejects_matching_source_color() {
+    const SST_FBI_CHROMA_FAIL: usize = 0x150;
+
+    let mut distira = Distira::new();
+    distira.set_frame_size(4, 4);
+    distira.clear_back_rgb(0, 0, 255);
+
+    write_reg(
+        &mut distira,
+        SST_FBZ_MODE,
+        FBZ_RGB_WMASK | FBZ_DRAW_BACK | FBZ_CHROMAKEY,
+    );
+    write_reg(&mut distira, SST_CHROMA_KEY, 0x00ff_0000);
+    write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
+    write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_BY, 0 << 4);
+    write_reg(&mut distira, SST_VERTEX_CX, 0 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut distira, SST_START_R, 0xff << 12);
+    write_reg(&mut distira, SST_START_G, 0);
+    write_reg(&mut distira, SST_START_B, 0);
+
+    write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+
+    let frame = distira.scanout_argb();
+    assert_eq!(frame[0], 0x0000_00ff);
+    assert_eq!(read_reg(&distira, SST_FBI_CHROMA_FAIL), 6);
 }
 
 #[test]
