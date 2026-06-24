@@ -4,11 +4,11 @@ use izarravm_video::{
     LFB_FORMAT_ARGB8888, LFB_WRITE_BACK, SMALL_DISTIRA_CHIP_NAME, SST_ALPHA_MODE,
     SST_CLIP_LEFT_RIGHT, SST_CLIP_LOW_Y_HIGH_Y, SST_COLOR1, SST_DR_DX, SST_DR_DY, SST_FASTFILL_CMD,
     SST_FBI_INIT0, SST_FBI_INIT1, SST_FBI_INIT2, SST_FBI_INIT3, SST_FBI_INIT7, SST_FBI_ZFUNC_FAIL,
-    SST_FBZ_MODE, SST_FDR_DX, SST_FDR_DY, SST_FSTART_B, SST_FSTART_G, SST_FSTART_R,
-    SST_FTRIANGLE_CMD, SST_FVERTEX_AX, SST_FVERTEX_AY, SST_FVERTEX_BX, SST_FVERTEX_BY,
-    SST_FVERTEX_CX, SST_FVERTEX_CY, SST_LFB_MODE, SST_START_B, SST_START_G, SST_START_R,
-    SST_START_Z, SST_STATUS, SST_SWAPBUFFER_CMD, SST_TRIANGLE_CMD, SST_VERTEX_AX, SST_VERTEX_AY,
-    SST_VERTEX_BX, SST_VERTEX_BY, SST_VERTEX_CX, SST_VERTEX_CY,
+    SST_FBZ_MODE, SST_FDR_DX, SST_FDR_DY, SST_FDZ_DX, SST_FSTART_B, SST_FSTART_G, SST_FSTART_R,
+    SST_FSTART_Z, SST_FTRIANGLE_CMD, SST_FVERTEX_AX, SST_FVERTEX_AY, SST_FVERTEX_BX,
+    SST_FVERTEX_BY, SST_FVERTEX_CX, SST_FVERTEX_CY, SST_LFB_MODE, SST_START_B, SST_START_G,
+    SST_START_R, SST_START_Z, SST_STATUS, SST_SWAPBUFFER_CMD, SST_TRIANGLE_CMD, SST_VERTEX_AX,
+    SST_VERTEX_AY, SST_VERTEX_BX, SST_VERTEX_BY, SST_VERTEX_CX, SST_VERTEX_CY,
 };
 
 fn read_reg(distira: &Distira, reg: usize) -> u32 {
@@ -337,6 +337,49 @@ fn ftriangle_cmd_applies_float_gouraud_color_gradients() {
     assert!(red_channel(frame[1]) < red_channel(frame[2]));
     assert!(red_channel(frame[8]) < red_channel(frame[2]));
     assert_eq!(frame[3], 0x0000_0000);
+}
+
+#[test]
+fn ftriangle_cmd_depth_test_accepts_closer_float_z() {
+    const DEPTH_LESS_THAN: u32 = DEPTHOP_LESSTHAN << FBZ_DEPTH_OP_SHIFT;
+    const DEPTH_ALWAYS: u32 = DEPTHOP_ALWAYS << FBZ_DEPTH_OP_SHIFT;
+
+    let mut distira = Distira::new();
+    distira.set_frame_size(4, 4);
+    distira.clear_back_rgb(0, 0, 0);
+
+    write_reg(
+        &mut distira,
+        SST_FBZ_MODE,
+        FBZ_RGB_WMASK | FBZ_DRAW_BACK | FBZ_DEPTH_ENABLE | FBZ_DEPTH_WMASK | DEPTH_ALWAYS,
+    );
+    write_reg(&mut distira, SST_FVERTEX_AX, 0.0f32.to_bits());
+    write_reg(&mut distira, SST_FVERTEX_AY, 0.0f32.to_bits());
+    write_reg(&mut distira, SST_FVERTEX_BX, 3.0f32.to_bits());
+    write_reg(&mut distira, SST_FVERTEX_BY, 0.0f32.to_bits());
+    write_reg(&mut distira, SST_FVERTEX_CX, 0.0f32.to_bits());
+    write_reg(&mut distira, SST_FVERTEX_CY, 3.0f32.to_bits());
+    write_reg(&mut distira, SST_FSTART_R, 255.0f32.to_bits());
+    write_reg(&mut distira, SST_FSTART_G, 0.0f32.to_bits());
+    write_reg(&mut distira, SST_FSTART_B, 0.0f32.to_bits());
+    write_reg(&mut distira, SST_FSTART_Z, 256.0f32.to_bits());
+    write_reg(&mut distira, SST_FTRIANGLE_CMD, 1);
+
+    write_reg(
+        &mut distira,
+        SST_FBZ_MODE,
+        FBZ_RGB_WMASK | FBZ_DRAW_BACK | FBZ_DEPTH_ENABLE | FBZ_DEPTH_WMASK | DEPTH_LESS_THAN,
+    );
+    write_reg(&mut distira, SST_FSTART_R, 0.0f32.to_bits());
+    write_reg(&mut distira, SST_FSTART_B, 255.0f32.to_bits());
+    write_reg(&mut distira, SST_FSTART_Z, 512.0f32.to_bits());
+    write_reg(&mut distira, SST_FDZ_DX, (-170.0f32).to_bits());
+    write_reg(&mut distira, SST_FTRIANGLE_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+
+    let frame = distira.scanout_argb();
+    assert_eq!(frame[0], 0x00ff_0000);
+    assert_eq!(frame[2], 0x0000_00ff);
 }
 
 #[test]

@@ -416,7 +416,10 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
 - [x] Iteration 9: depth test and depth write for untextured integer
       triangles. Validated by the video depth rejection test plus the workspace
       gates.
-- [ ] Next: float Z and Z derivative registers for `SST_ftriangleCMD`.
+- [x] Iteration 10: float Z and Z derivative registers for `SST_ftriangleCMD`.
+      Validated by the video float-depth acceptance test plus the workspace
+      gates.
+- [ ] Next: alpha test for untextured Voodoo triangles.
 
 ## First 90 percent push for this branch
 
