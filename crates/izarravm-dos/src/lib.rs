@@ -591,18 +591,51 @@ impl AccessMode {
     }
 }
 
-/// An open file handle: the host file plus the DOS access mode it was opened
-/// with, which the kernel enforces on reads and writes.
+/// Where a handle's bytes flow: the emulated console (screen + keyboard) or a
+/// host file. Standard handles 0/1/2 default to Console; AH=3Dh/3Ch opens and
+/// DUP2 onto them install Host.
+#[derive(Debug, Clone)]
+enum OutputTarget {
+    Console,
+    Host(Rc<RefCell<File>>),
+}
+
+/// An open file handle: its byte target plus the DOS access mode the kernel
+/// enforces on host reads and writes. A Console handle carries no host file.
 #[derive(Debug, Clone)]
 struct OpenFile {
-    file: Rc<RefCell<File>>,
+    target: OutputTarget,
     mode: AccessMode,
     sft_name: [u8; 11],
 }
 
+impl OpenFile {
+    fn is_console(&self) -> bool {
+        matches!(self.target, OutputTarget::Console)
+    }
+
+    /// The shared host file, or None for a Console handle.
+    fn host_file(&self) -> Option<&Rc<RefCell<File>>> {
+        match &self.target {
+            OutputTarget::Host(f) => Some(f),
+            OutputTarget::Console => None,
+        }
+    }
+}
+
+/// A console handle. CON is bidirectional, so seed it ReadWrite; console writes
+/// never consult the mode and console reads go through the keyboard path.
+fn console_record() -> OpenFile {
+    OpenFile {
+        target: OutputTarget::Console,
+        mode: AccessMode::ReadWrite,
+        sft_name: *b"CON        ",
+    }
+}
+
 fn open_file_record(file: File, mode: AccessMode, path: &Path) -> OpenFile {
     OpenFile {
-        file: Rc::new(RefCell::new(file)),
+        target: OutputTarget::Host(Rc::new(RefCell::new(file))),
         mode,
         sft_name: sft_name_from_path(path),
     }
@@ -827,7 +860,18 @@ impl DosKernel {
         self.last_exit_code = 0;
         self.last_exit_type = 0;
         self.critical_error = None;
+        self.seed_standard_handles();
         Ok(())
+    }
+
+    /// Install default Console entries for handles 0/1/2 if absent. `or_insert`
+    /// means an inherited redirect (carried into a child by the deep-cloned
+    /// open_files) is preserved. These never count toward alloc_handle (it scans
+    /// 5..) nor appear in sft_host_file_entries (it skips Console).
+    fn seed_standard_handles(&mut self) {
+        self.open_files.entry(0).or_insert_with(console_record);
+        self.open_files.entry(1).or_insert_with(console_record);
+        self.open_files.entry(2).or_insert_with(console_record);
     }
 
     /// Furnish the upper-memory-block arena: the machine's UMA reservation map
@@ -897,7 +941,10 @@ impl DosKernel {
     fn sft_host_file_entries(&mut self) -> Vec<SftHostFileEntry> {
         let mut entries = Vec::with_capacity(self.open_files.len());
         for (&slot, open) in &mut self.open_files {
-            let mut file = open.file.borrow_mut();
+            let Some(host) = open.host_file() else {
+                continue; // Console handles carry no host metadata
+            };
+            let mut file = host.borrow_mut();
             let size = file
                 .metadata()
                 .map(|meta| meta.len().min(u64::from(u32::MAX)) as u32)
@@ -1415,6 +1462,9 @@ impl DosKernel {
         // A fresh child has terminated no child of its own.
         self.last_exit_code = 0;
         self.last_exit_type = 0;
+        // Seed any standard handle the child did not inherit; an inherited
+        // redirect (a Host target carried in the live open_files) is preserved.
+        self.seed_standard_handles();
 
         Ok(DosAction::Exec { entry, child_ax })
     }
@@ -2307,6 +2357,23 @@ impl DosKernel {
         Ok(false)
     }
 
+    /// Write one byte to a standard output handle (1 = stdout, 2 = stderr). A
+    /// Console target, or an unseeded standard handle, reaches the screen buffer;
+    /// a redirected Host target writes the byte to its file. Returns a DOS error
+    /// code on a host write fault.
+    fn write_console_handle(&mut self, handle: u16, byte: u8) -> Result<(), u16> {
+        match self.open_files.get(&handle).map(|of| &of.target) {
+            Some(OutputTarget::Host(file)) => file
+                .borrow_mut()
+                .write_all(&[byte])
+                .map_err(|e| dos_io_error_code(&e)),
+            _ => {
+                self.stdout.push(byte);
+                Ok(())
+            }
+        }
+    }
+
     /// Read one character from the keyboard ring. Some -> set AL (and echo when
     /// asked) and Continue; None -> WaitForKey so the caller re-runs the INT.
     fn read_char(
@@ -2487,7 +2554,10 @@ impl DosKernel {
                     return Ok(self.ctrl_c_action());
                 }
                 let ch = regs.dx as u8;
-                self.stdout.push(ch);
+                if let Err(code) = self.write_console_handle(1, ch) {
+                    set_dos_error(regs, code);
+                    return Ok(DosAction::Continue);
+                }
                 regs.ax = (regs.ax & 0xff00) | u16::from(ch);
                 Ok(DosAction::Continue)
             }
@@ -2516,7 +2586,10 @@ impl DosKernel {
                     }
                 } else {
                     let ch = regs.dx as u8;
-                    self.stdout.push(ch);
+                    if let Err(code) = self.write_console_handle(1, ch) {
+                        set_dos_error(regs, code);
+                        return Ok(DosAction::Continue);
+                    }
                     regs.ax = (regs.ax & 0xff00) | u16::from(ch);
                 }
                 Ok(DosAction::Continue)
@@ -2589,7 +2662,10 @@ impl DosKernel {
                     if byte == b'$' {
                         break;
                     }
-                    self.stdout.push(byte);
+                    if let Err(code) = self.write_console_handle(1, byte) {
+                        set_dos_error(regs, code);
+                        return Ok(DosAction::Continue);
+                    }
                     offset += 1;
                 }
                 // DOS returns AL = '$' (0x24) from AH=09h.
@@ -2659,6 +2735,35 @@ impl DosKernel {
                         regs.cf = false;
                         return Ok(DosAction::Continue);
                     }
+                    // A redirected stdin (Host) reads file bytes synchronously and
+                    // returns 0 at EOF with no WaitForKey. Console keeps the cooked
+                    // keyboard path below.
+                    if let Some(OutputTarget::Host(file)) =
+                        self.open_files.get(&0).map(|of| of.target.clone())
+                    {
+                        let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+                        let mut buffer = vec![0u8; count];
+                        let mut filled = 0usize;
+                        {
+                            let mut f = file.borrow_mut();
+                            while filled < count {
+                                match f.read(&mut buffer[filled..]) {
+                                    Ok(0) => break,
+                                    Ok(n) => filled += n,
+                                    Err(err) => {
+                                        set_dos_error(regs, dos_io_error_code(&err));
+                                        return Ok(DosAction::Continue);
+                                    }
+                                }
+                            }
+                        }
+                        for (index, &byte) in buffer[..filled].iter().enumerate() {
+                            mem.write_u8(base + index, byte)?;
+                        }
+                        regs.ax = filled as u16;
+                        regs.cf = false;
+                        return Ok(DosAction::Continue);
+                    }
                     let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
                     let mut filled = 0usize;
                     while filled < count {
@@ -2696,7 +2801,7 @@ impl DosKernel {
                     regs.cf = false;
                     return Ok(DosAction::Continue);
                 }
-                let Some(of) = self.open_files.get_mut(&handle) else {
+                let Some(of) = self.open_files.get(&handle) else {
                     set_dos_error(regs, 0x06);
                     return Ok(DosAction::Continue);
                 };
@@ -2704,7 +2809,12 @@ impl DosKernel {
                     set_dos_error(regs, 0x05);
                     return Ok(DosAction::Continue);
                 }
-                let mut file = of.file.borrow_mut();
+                let Some(host) = of.host_file().cloned() else {
+                    regs.ax = 0;
+                    regs.cf = false; // a Console (non-stdin) handle has no input
+                    return Ok(DosAction::Continue);
+                };
+                let mut file = host.borrow_mut();
                 let mut buffer = vec![0u8; count];
                 let mut filled = 0usize;
                 while filled < count {
@@ -2717,6 +2827,7 @@ impl DosKernel {
                         }
                     }
                 }
+                drop(file);
                 let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
                 for (index, &byte) in buffer[..filled].iter().enumerate() {
                     mem.write_u8(base + index, byte)?;
@@ -3117,17 +3228,6 @@ impl DosKernel {
                 let handle = regs.bx;
                 let count = usize::from(regs.cx);
                 let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
-                // Predefined CON handles: 0=stdin, 1=stdout, 2=stderr all point at
-                // the console device and write to the output buffer.
-                if handle <= 2 {
-                    for index in 0..count {
-                        let byte = mem.read_u8(base + index)?;
-                        self.stdout.push(byte);
-                    }
-                    regs.ax = regs.cx;
-                    regs.cf = false;
-                    return Ok(DosAction::Continue);
-                }
                 // A write to the EMMXXXX0 character device is accepted and discarded,
                 // reporting every byte written, the way a real EMM driver answers a
                 // DOS write (its real traffic is INT 67h, not the file handle).
@@ -3144,44 +3244,68 @@ impl DosKernel {
                     regs.cf = false;
                     return Ok(DosAction::Continue);
                 }
-                let Some(of) = self.open_files.get_mut(&handle) else {
-                    set_dos_error(regs, 0x06);
-                    return Ok(DosAction::Continue);
-                };
-                if !of.mode.can_write() {
-                    set_dos_error(regs, 0x05);
-                    return Ok(DosAction::Continue);
-                }
-                let mut file = of.file.borrow_mut();
-                if count == 0 {
-                    // CX=0 truncates (or extends) the file to the current position.
-                    let pos = match file.stream_position() {
-                        Ok(pos) => pos,
-                        Err(err) => {
-                            set_dos_error(regs, dos_io_error_code(&err));
+                // A Host file gets the bytes; a Console handle (or an unseeded
+                // standard handle 0/1/2 in a bare-kernel test) reaches the screen.
+                let host = match self.open_files.get(&handle) {
+                    Some(of) if of.host_file().is_some() => {
+                        if !of.mode.can_write() {
+                            set_dos_error(regs, 0x05);
                             return Ok(DosAction::Continue);
                         }
-                    };
-                    if let Err(err) = file.set_len(pos) {
-                        set_dos_error(regs, dos_io_error_code(&err));
+                        of.host_file().cloned()
+                    }
+                    Some(_) => None,             // a Console handle
+                    None if handle <= 2 => None, // unseeded standard handle -> console
+                    None => {
+                        set_dos_error(regs, 0x06);
                         return Ok(DosAction::Continue);
                     }
-                    regs.ax = 0;
-                    regs.cf = false;
-                    return Ok(DosAction::Continue);
-                }
-                let mut buffer = vec![0u8; count];
-                for (index, slot) in buffer.iter_mut().enumerate() {
-                    *slot = mem.read_u8(base + index)?;
-                }
-                match file.write_all(&buffer) {
-                    Ok(()) => {
+                };
+                match host {
+                    None => {
+                        for index in 0..count {
+                            let byte = mem.read_u8(base + index)?;
+                            if let Err(code) = self.write_console_handle(handle, byte) {
+                                set_dos_error(regs, code);
+                                return Ok(DosAction::Continue);
+                            }
+                        }
                         regs.ax = regs.cx;
                         regs.cf = false;
+                        Ok(DosAction::Continue)
                     }
-                    Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
+                    Some(file) => {
+                        let mut file = file.borrow_mut();
+                        if count == 0 {
+                            let pos = match file.stream_position() {
+                                Ok(pos) => pos,
+                                Err(err) => {
+                                    set_dos_error(regs, dos_io_error_code(&err));
+                                    return Ok(DosAction::Continue);
+                                }
+                            };
+                            if let Err(err) = file.set_len(pos) {
+                                set_dos_error(regs, dos_io_error_code(&err));
+                                return Ok(DosAction::Continue);
+                            }
+                            regs.ax = 0;
+                            regs.cf = false;
+                            return Ok(DosAction::Continue);
+                        }
+                        let mut buffer = vec![0u8; count];
+                        for (index, slot) in buffer.iter_mut().enumerate() {
+                            *slot = mem.read_u8(base + index)?;
+                        }
+                        match file.write_all(&buffer) {
+                            Ok(()) => {
+                                regs.ax = regs.cx;
+                                regs.cf = false;
+                            }
+                            Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
+                        }
+                        Ok(DosAction::Continue)
+                    }
                 }
-                Ok(DosAction::Continue)
             }
             // AH=42h: seek the handle in BX. AL=whence (0=start, 1=current signed,
             // 2=end signed), CX:DX = 32-bit offset (CX high). CF=0 + DX:AX = new
@@ -3190,11 +3314,17 @@ impl DosKernel {
                 let handle = regs.bx;
                 let offset = (u32::from(regs.cx) << 16) | u32::from(regs.dx);
                 let whence = regs.ax as u8;
-                let Some(of) = self.open_files.get_mut(&handle) else {
+                let Some(of) = self.open_files.get(&handle) else {
                     set_dos_error(regs, 0x06);
                     return Ok(DosAction::Continue);
                 };
-                let mut file = of.file.borrow_mut();
+                let Some(host) = of.host_file().cloned() else {
+                    regs.ax = 0;
+                    regs.dx = 0;
+                    regs.cf = false; // seeking CON is a no-op
+                    return Ok(DosAction::Continue);
+                };
+                let mut file = host.borrow_mut();
                 // Resolve the base the offset applies to. whence 0 takes the offset
                 // from BOF; whence 1 from current; whence 2 from EOF. DOS keeps a
                 // 32-bit unsigned file pointer, so negative results wrap into the
@@ -3612,32 +3742,42 @@ impl DosKernel {
             // that matter (ISDEV + stdin/stdout); NUL/clock/binary/special are not set.
             0x44 => {
                 let handle = regs.bx;
+                // A standard handle redirected to a host file is no longer a device.
+                let host_redirected = self
+                    .open_files
+                    .get(&handle)
+                    .map(|of| !of.is_console())
+                    .unwrap_or(false);
+                let is_device_handle =
+                    (handle <= 4 && !host_redirected) || self.ems_handles.contains(&handle);
                 let valid = handle <= 4
                     || self.open_files.contains_key(&handle)
                     || self.ems_handles.contains(&handle);
-                let is_character = handle <= 4 || self.ems_handles.contains(&handle);
+                let is_character = is_device_handle;
                 let valid_drive = matches!((regs.bx & 0x00ff) as u8, 0 | 3);
                 match regs.ax as u8 {
                     0x00 => {
-                        if handle <= 4 {
-                            // The five standard handles are all character devices. Bits 0/1
-                            // identify the actual STDIN/STDOUT aliases, not AUX/PRN device
-                            // capabilities, so handles 3 and 4 keep only ISDEV set.
+                        if is_device_handle {
+                            // A character device. Bits 0/1 identify the STDIN/STDOUT
+                            // aliases (not AUX/PRN capabilities), so handles 3 and 4
+                            // keep only ISDEV set.
                             let io = match handle {
                                 0 => 0x01,
                                 1 | 2 => 0x02,
                                 _ => 0x00,
                             };
-                            regs.dx = 0x80 | io; // bit 7 ISDEV + standard alias bits
-                            regs.cf = false;
-                        } else if self.ems_handles.contains(&handle) {
-                            // The EMMXXXX0 device: bit 7 ISDEV (so a guest knows it is a
-                            // device, not a file) plus the IOCTL-supported bit, the way an
-                            // EMM driver answers the open-then-IOCTL detection.
-                            regs.dx = 0xc080;
+                            if self.ems_handles.contains(&handle) {
+                                // The EMMXXXX0 device: bit 7 ISDEV plus the
+                                // IOCTL-supported bit, the way an EMM driver answers
+                                // the open-then-IOCTL detection.
+                                regs.dx = 0xc080;
+                            } else {
+                                regs.dx = 0x80 | io; // bit 7 ISDEV + standard alias bits
+                            }
                             regs.cf = false;
                         } else if self.open_files.contains_key(&handle) {
-                            // A regular file on C: (drive index 2); bit 7 clear means a file.
+                            // A regular file (or a redirected standard handle); bit 7
+                            // clear means a file.
                             regs.dx = 0x0002;
                             regs.cf = false;
                         } else {
@@ -3682,10 +3822,21 @@ impl DosKernel {
                         // is ready only when a key waits; disk files are ready until EOF;
                         // output devices are always ready.
                         if valid {
-                            let ready = if handle == 0 {
+                            let ready = if handle == 0
+                                && self
+                                    .open_files
+                                    .get(&0)
+                                    .map(|of| of.is_console())
+                                    .unwrap_or(true)
+                            {
                                 !kbd_ring_is_empty(mem)?
-                            } else if let Some(of) = self.open_files.get(&handle) {
-                                let mut file = of.file.borrow_mut();
+                            } else if let Some(host) = self
+                                .open_files
+                                .get(&handle)
+                                .and_then(|of| of.host_file())
+                                .cloned()
+                            {
+                                let mut file = host.borrow_mut();
                                 match file.stream_position().and_then(|pos| {
                                     file.metadata().map(|metadata| pos < metadata.len())
                                 }) {
@@ -3794,8 +3945,12 @@ impl DosKernel {
                     set_dos_error(regs, 0x06); // invalid handle
                     return Ok(DosAction::Continue);
                 };
+                let Some(host) = of.host_file().cloned() else {
+                    set_dos_error(regs, 0x06); // a character device has no file date
+                    return Ok(DosAction::Continue);
+                };
                 match regs.ax as u8 {
-                    0x00 => match of.file.borrow().metadata().and_then(|m| m.modified()) {
+                    0x00 => match host.borrow().metadata().and_then(|m| m.modified()) {
                         Ok(modified) => {
                             let (time, date) = dos_time_date(modified);
                             regs.cx = time;
@@ -3804,8 +3959,7 @@ impl DosKernel {
                         }
                         Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
                     },
-                    0x01 => match of
-                        .file
+                    0x01 => match host
                         .borrow()
                         .set_modified(systemtime_from_dos(regs.cx, regs.dx))
                     {
@@ -5148,6 +5302,232 @@ fn read_asciiz(mem: &Memory, seg: u16, off: u16) -> Result<Option<String>, DosEr
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn redirected_stdout_ah02_and_ah40_write_to_the_host_file() {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let shared = Rc::new(RefCell::new(tempfile::tempfile().unwrap()));
+        kernel.open_files.insert(
+            1,
+            OpenFile {
+                target: OutputTarget::Host(shared.clone()),
+                mode: AccessMode::Write,
+                sft_name: *b"OUT        ",
+            },
+        );
+        let mut c = DosRegs {
+            ax: 0x0200,
+            dx: u16::from(b'A'),
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut c, &mut mem).unwrap();
+        assert!(!c.cf);
+        let src = 0x0100usize * 16 + 0x0300;
+        mem.write_u8(src, b'B').unwrap();
+        mem.write_u8(src + 1, b'C').unwrap();
+        let mut w = DosRegs {
+            ax: 0x4000,
+            bx: 1,
+            cx: 2,
+            ds: 0x0100,
+            dx: 0x0300,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut w, &mut mem).unwrap();
+        assert!(!w.cf);
+        assert_eq!(w.ax, 2);
+        assert!(kernel.stdout().is_empty());
+        let mut got = Vec::new();
+        shared.borrow_mut().seek(SeekFrom::Start(0)).unwrap();
+        shared.borrow_mut().read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"ABC");
+    }
+
+    #[test]
+    fn default_stdout_still_reaches_the_screen_buffer() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        kernel.seed_standard_handles();
+        let mut c = DosRegs {
+            ax: 0x0200,
+            dx: u16::from(b'X'),
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut c, &mut mem).unwrap();
+        let src = 0x0100usize * 16 + 0x0300;
+        mem.write_u8(src, b'Y').unwrap();
+        let mut w = DosRegs {
+            ax: 0x4000,
+            bx: 1,
+            cx: 1,
+            ds: 0x0100,
+            dx: 0x0300,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut w, &mut mem).unwrap();
+        assert_eq!(kernel.stdout(), b"XY");
+    }
+
+    #[test]
+    fn dup_of_handle_one_succeeds_and_dup2_redirects_then_restores() {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        kernel.seed_standard_handles();
+        let mut dup = DosRegs {
+            ax: 0x4500,
+            bx: 1,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut dup, &mut mem).unwrap();
+        assert!(!dup.cf, "DUP of handle 1 now succeeds");
+        let saved = dup.ax;
+        assert!(saved >= 5);
+        let shared = Rc::new(RefCell::new(tempfile::tempfile().unwrap()));
+        kernel.open_files.insert(
+            6,
+            OpenFile {
+                target: OutputTarget::Host(shared.clone()),
+                mode: AccessMode::Write,
+                sft_name: *b"OUT        ",
+            },
+        );
+        let mut d2 = DosRegs {
+            ax: 0x4600,
+            bx: 6,
+            cx: 1,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut d2, &mut mem).unwrap();
+        assert!(!d2.cf);
+        let mut c = DosRegs {
+            ax: 0x0200,
+            dx: u16::from(b'Z'),
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut c, &mut mem).unwrap();
+        assert!(kernel.stdout().is_empty());
+        let mut restore = DosRegs {
+            ax: 0x4600,
+            bx: saved,
+            cx: 1,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut restore, &mut mem).unwrap();
+        let mut c2 = DosRegs {
+            ax: 0x0200,
+            dx: u16::from(b'!'),
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut c2, &mut mem).unwrap();
+        assert_eq!(kernel.stdout(), b"!");
+        let mut got = Vec::new();
+        shared.borrow_mut().seek(SeekFrom::Start(0)).unwrap();
+        shared.borrow_mut().read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"Z");
+    }
+
+    #[test]
+    fn ah3f_handle0_from_a_host_file_reads_then_eofs_with_no_waitforkey() {
+        use std::io::{Seek, SeekFrom, Write as _};
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let mut f = tempfile::tempfile().unwrap();
+        f.write_all(b"hi").unwrap();
+        f.seek(SeekFrom::Start(0)).unwrap();
+        kernel.open_files.insert(
+            0,
+            OpenFile {
+                target: OutputTarget::Host(Rc::new(RefCell::new(f))),
+                mode: AccessMode::Read,
+                sft_name: *b"IN         ",
+            },
+        );
+        let dst = 0x0100usize * 16 + 0x0400;
+        let mut r = DosRegs {
+            ax: 0x3f00,
+            bx: 0,
+            cx: 8,
+            ds: 0x0100,
+            dx: 0x0400,
+            ..DosRegs::default()
+        };
+        let action = kernel.dispatch(0x21, &mut r, &mut mem).unwrap();
+        assert!(
+            matches!(action, DosAction::Continue),
+            "a Host stdin never returns WaitForKey"
+        );
+        assert_eq!(r.ax, 2);
+        assert_eq!(mem.read_u8(dst).unwrap(), b'h');
+        assert_eq!(mem.read_u8(dst + 1).unwrap(), b'i');
+        let mut r2 = DosRegs {
+            ax: 0x3f00,
+            bx: 0,
+            cx: 8,
+            ds: 0x0100,
+            dx: 0x0400,
+            ..DosRegs::default()
+        };
+        let a2 = kernel.dispatch(0x21, &mut r2, &mut mem).unwrap();
+        assert!(matches!(a2, DosAction::Continue));
+        assert_eq!(r2.ax, 0);
+    }
+
+    #[test]
+    fn ah44_isdev_reports_device_for_console_and_file_for_host() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        kernel.seed_standard_handles();
+        let mut q = DosRegs {
+            ax: 0x4400,
+            bx: 1,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut q, &mut mem).unwrap();
+        assert!(!q.cf);
+        assert_ne!(q.dx & 0x0080, 0, "console stdout is a device");
+        kernel.open_files.insert(
+            1,
+            OpenFile {
+                target: OutputTarget::Host(Rc::new(RefCell::new(tempfile::tempfile().unwrap()))),
+                mode: AccessMode::Write,
+                sft_name: *b"OUT        ",
+            },
+        );
+        let mut q2 = DosRegs {
+            ax: 0x4400,
+            bx: 1,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut q2, &mut mem).unwrap();
+        assert!(!q2.cf);
+        assert_eq!(q2.dx & 0x0080, 0, "a redirected stdout is a file");
+    }
+
+    #[test]
+    fn a_child_inherits_a_redirected_handle_one_across_the_exec_clone() {
+        let mut kernel = DosKernel::new();
+        kernel.seed_standard_handles();
+        let shared = Rc::new(RefCell::new(tempfile::tempfile().unwrap()));
+        kernel.open_files.insert(
+            1,
+            OpenFile {
+                target: OutputTarget::Host(shared.clone()),
+                mode: AccessMode::Write,
+                sft_name: *b"OUT        ",
+            },
+        );
+        let _parent_clone = kernel.open_files.clone();
+        kernel.seed_standard_handles(); // child seed must NOT clobber the redirect
+        match kernel.open_files.get(&1).map(|of| of.is_console()) {
+            Some(false) => {}
+            other => {
+                panic!("child must inherit the Host redirect at handle 1, got is_console={other:?}")
+            }
+        }
+    }
 
     #[cfg(windows)]
     fn raw_too_many_open_files_error() -> i32 {
