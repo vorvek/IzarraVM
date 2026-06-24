@@ -196,6 +196,7 @@ pub const TEX_AI8: u32 = 0x04;
 pub const TEX_ARGB8332: u32 = 0x08;
 pub const TEX_R5G6B5: u32 = 0x0a;
 pub const TEX_ARGB1555: u32 = 0x0b;
+pub const TEX_ARGB4444: u32 = 0x0c;
 pub const TEX_A8I8: u32 = 0x0d;
 const CHIP_TREX0: usize = 0x2;
 const CHIP_TREX1: usize = 0x4;
@@ -1497,6 +1498,7 @@ impl Distira {
                     | TEX_ARGB8332
                     | TEX_R5G6B5
                     | TEX_ARGB1555
+                    | TEX_ARGB4444
                     | TEX_A8I8
             )
         {
@@ -1524,6 +1526,7 @@ impl Distira {
             TEX_ARGB8332 => self.sample_tmu_argb8332(tmu, s, t),
             TEX_R5G6B5 => self.sample_tmu_rgb565(tmu, s, t),
             TEX_ARGB1555 => self.sample_tmu_argb1555(tmu, s, t),
+            TEX_ARGB4444 => self.sample_tmu_argb4444(tmu, s, t),
             TEX_A8I8 => self.sample_tmu_ai88(tmu, s, t),
             _ => (0, 0, 0),
         }
@@ -1567,6 +1570,10 @@ impl Distira {
 
     fn sample_tmu_argb1555(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
         expand_rgb555(self.sample_tmu_u16(tmu, s, t))
+    }
+
+    fn sample_tmu_argb4444(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
+        expand_rgb444(self.sample_tmu_u16(tmu, s, t))
     }
 
     fn sample_tmu_i8(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
@@ -1905,6 +1912,14 @@ fn expand_rgb555(raw: u16) -> (u8, u8, u8) {
         expand5(raw >> 10) as u8,
         expand5(raw >> 5) as u8,
         expand5(raw) as u8,
+    )
+}
+
+fn expand_rgb444(raw: u16) -> (u8, u8, u8) {
+    (
+        expand4((raw >> 8) as u8),
+        expand4((raw >> 4) as u8),
+        expand4(raw as u8),
     )
 }
 

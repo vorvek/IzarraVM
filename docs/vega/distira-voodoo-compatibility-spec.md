@@ -460,7 +460,9 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
       texture sample test plus the workspace gates.
 - [x] Iteration 28: ARGB1555 texture sampling. Validated by the video ARGB1555
       texture sample test plus the workspace gates.
-- [ ] Next: ARGB4444 texture sampling.
+- [x] Iteration 29: ARGB4444 texture sampling. Validated by the video ARGB4444
+      texture sample test plus the workspace gates.
+- [ ] Next: PAL8 texture sampling.
 
 ## First 90 percent push for this branch
 
