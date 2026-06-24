@@ -6638,6 +6638,43 @@ mod tests {
     }
 
     #[test]
+    fn staging_stamps_the_resident_block_with_the_system_psp() {
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let mut dos = DosKernel::new();
+        dos.init_program(0x0100, 0x1100, &mut mem).unwrap();
+        let image = driver::tests_char_image();
+
+        let staged = dos.stage_sys_driver(&image, "RAM", &mut mem).unwrap();
+
+        // The block's MCB owner word (header paragraph + 1) is the system PSP, so the
+        // resident driver survives an EXEC child's exit sweep.
+        let owner = mem
+            .read_u16((usize::from(staged.driver_seg) - 1) * 16 + 1)
+            .unwrap();
+        assert_eq!(
+            owner, dos.arena.psp_seg,
+            "resident block owned by the system PSP"
+        );
+    }
+
+    #[test]
+    fn staging_a_driver_too_large_for_the_arena_reports_out_of_memory() {
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let mut dos = DosKernel::new();
+        // The program owns nearly the whole arena up to ARENA_TOP (0xA000), leaving
+        // only a few free paragraphs above it for a resident driver block.
+        dos.init_program(0x0100, 0x9ff0, &mut mem).unwrap();
+        // An image larger than the free tail but well inside the paragraph range: the
+        // allocator finds no block that fits and reports OutOfMemory.
+        let mut image = driver::tests_char_image();
+        image.resize(64 * 1024, 0); // 0x1000 paragraphs, more than the free tail
+        assert!(matches!(
+            dos.stage_sys_driver(&image, "", &mut mem),
+            Err(DriverStageError::OutOfMemory)
+        ));
+    }
+
+    #[test]
     fn abort_frees_a_failed_driver_block() {
         let mut mem = Memory::new(1024 * 1024).unwrap();
         let mut dos = DosKernel::new();
