@@ -16907,6 +16907,66 @@ mod tests {
     }
 
     #[test]
+    fn guest_opens_testdev_and_round_trips_bytes() {
+        // The full path: CONFIG.SYS loads TESTDEV.SYS, AUTOEXEC.BAT runs TESTS DEV,
+        // which opens TESTDEV by name, writes "HELLO", reads it back, and reports 0
+        // through the unit-tester when the bytes match. The boot, the driver INIT,
+        // and the read/write all run on the real CPU.
+        let dir = tempfile::tempdir().unwrap();
+        let files = izarravm_firmware::toka_dos_system_files();
+        izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format)
+            .unwrap();
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        std::fs::copy(
+            manifest.join("../../c_drive/TESTDEV.SYS"),
+            dir.path().join("TESTDEV.SYS"),
+        )
+        .unwrap();
+        std::fs::copy(
+            manifest.join("../../c_drive/TESTS.COM"),
+            dir.path().join("TESTS.COM"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("CONFIG.SYS"),
+            "DEVICE=C:\\TESTDEV.SYS\r\nDOS=HIGH,UMB\r\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("AUTOEXEC.BAT"),
+            "@ECHO OFF\r\nTESTS DEV\r\n",
+        )
+        .unwrap();
+
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .unwrap();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        machine.set_toka_c_root(dir.path().to_path_buf());
+        // POST, disk boot, TOKABOOT, ICOMMAND, then AUTOEXEC runs TESTS DEV, which
+        // exits through the unit-tester as soon as the round-trip matches.
+        let reason = machine.run_until_halt_or_cycles(30_000_000).unwrap();
+        assert_eq!(
+            reason,
+            StopReason::TestExit { code: 0 },
+            "TESTS DEV round-trips the bytes and reports a match"
+        );
+        // The driver's WRITE and READ entries ran on the CPU: their markers are set.
+        assert_eq!(
+            read_unittester_reg(&mut machine, 2),
+            0x57,
+            "WRITE marker 'W'"
+        );
+        assert_eq!(
+            read_unittester_reg(&mut machine, 1),
+            0x52,
+            "READ marker 'R'"
+        );
+    }
+
+    #[test]
     fn toka_path_assignment_with_empty_value_clears_the_path() {
         // Real COMMAND.COM: "PATH=" with no value clears the search path, and a
         // bare PATH then prints "No Path". AUTOEXEC sets PATH=C:\DOS at boot, so
