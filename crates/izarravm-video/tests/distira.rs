@@ -637,6 +637,47 @@ fn triangle_cmd_uses_s_texture_gradient_for_nearest_rgb565_sampling() {
 }
 
 #[test]
+fn ftriangle_cmd_uses_float_s_texture_gradient_for_nearest_rgb565_sampling() {
+    const SST_FSTART_S: usize = 0x0b4;
+    const SST_FSTART_T: usize = 0x0b8;
+    const SST_FDS_DX: usize = 0x0d4;
+    const SST_TEXTURE_MODE: usize = 0x300;
+    const SST_TEX_BASE_ADDR: usize = 0x30c;
+    const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
+    const TEX_R5G6B5: u32 = 0x0a;
+
+    let mut distira = Distira::new();
+    distira.set_frame_size(4, 4);
+    distira.clear_back_rgb(0, 0, 0);
+    assert!(distira.queue_texture_write_u32(0, 0x07e0_f800));
+    distira.drain_fifo();
+
+    write_reg(&mut distira, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
+    write_reg(&mut distira, SST_FBZ_COLOR_PATH, FBZCP_TEXTURE_ENABLED);
+    write_reg(&mut distira, SST_TEXTURE_MODE, TEX_R5G6B5 << 8);
+    write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
+    write_reg(&mut distira, SST_FVERTEX_AX, 0.0f32.to_bits());
+    write_reg(&mut distira, SST_FVERTEX_AY, 0.0f32.to_bits());
+    write_reg(&mut distira, SST_FVERTEX_BX, 3.0f32.to_bits());
+    write_reg(&mut distira, SST_FVERTEX_BY, 0.0f32.to_bits());
+    write_reg(&mut distira, SST_FVERTEX_CX, 0.0f32.to_bits());
+    write_reg(&mut distira, SST_FVERTEX_CY, 3.0f32.to_bits());
+    write_reg(&mut distira, SST_FSTART_R, 255.0f32.to_bits());
+    write_reg(&mut distira, SST_FSTART_G, 255.0f32.to_bits());
+    write_reg(&mut distira, SST_FSTART_B, 255.0f32.to_bits());
+    write_reg(&mut distira, SST_FSTART_S, 0.0f32.to_bits());
+    write_reg(&mut distira, SST_FSTART_T, 0.0f32.to_bits());
+    write_reg(&mut distira, SST_FDS_DX, 1.0f32.to_bits());
+
+    write_reg(&mut distira, SST_FTRIANGLE_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+
+    let frame = distira.scanout_argb();
+    assert_eq!(frame[0], 0x00ff_0000);
+    assert_eq!(frame[1], 0x0000_ff00);
+}
+
+#[test]
 fn motherboard_chip_names_are_big_distira_and_small_distira() {
     let distira = Distira::new();
 

@@ -85,16 +85,25 @@ pub const SST_FSTART_G: usize = 0x0a4;
 pub const SST_FSTART_B: usize = 0x0a8;
 pub const SST_FSTART_Z: usize = 0x0ac;
 pub const SST_FSTART_A: usize = 0x0b0;
+pub const SST_FSTART_S: usize = 0x0b4;
+pub const SST_FSTART_T: usize = 0x0b8;
+pub const SST_FSTART_W: usize = 0x0bc;
 pub const SST_FDR_DX: usize = 0x0c0;
 pub const SST_FDG_DX: usize = 0x0c4;
 pub const SST_FDB_DX: usize = 0x0c8;
 pub const SST_FDZ_DX: usize = 0x0cc;
 pub const SST_FDA_DX: usize = 0x0d0;
+pub const SST_FDS_DX: usize = 0x0d4;
+pub const SST_FDT_DX: usize = 0x0d8;
+pub const SST_FDW_DX: usize = 0x0dc;
 pub const SST_FDR_DY: usize = 0x0e0;
 pub const SST_FDG_DY: usize = 0x0e4;
 pub const SST_FDB_DY: usize = 0x0e8;
 pub const SST_FDZ_DY: usize = 0x0ec;
 pub const SST_FDA_DY: usize = 0x0f0;
+pub const SST_FDS_DY: usize = 0x0f4;
+pub const SST_FDT_DY: usize = 0x0f8;
+pub const SST_FDW_DY: usize = 0x0fc;
 pub const SST_FTRIANGLE_CMD: usize = 0x100;
 pub const SST_FBZ_COLOR_PATH: usize = 0x104;
 pub const SST_FOG_MODE: usize = 0x108;
@@ -351,6 +360,9 @@ pub struct Distira {
     ftriangle_alpha: u32,
     ftriangle_alpha_dx: u32,
     ftriangle_alpha_dy: u32,
+    ftriangle_tex_coord: [u32; 3],
+    ftriangle_tex_coord_dx: [u32; 3],
+    ftriangle_tex_coord_dy: [u32; 3],
     fbi_pixels_in: u32,
     fbi_chroma_fail: u32,
     fbi_zfunc_fail: u32,
@@ -431,6 +443,9 @@ impl Distira {
             ftriangle_alpha: f32::to_bits(255.0),
             ftriangle_alpha_dx: 0,
             ftriangle_alpha_dy: 0,
+            ftriangle_tex_coord: [0; 3],
+            ftriangle_tex_coord_dx: [0; 3],
+            ftriangle_tex_coord_dy: [0; 3],
             fbi_pixels_in: 0,
             fbi_chroma_fail: 0,
             fbi_zfunc_fail: 0,
@@ -803,6 +818,21 @@ impl Distira {
                 merge_byte(&mut self.ftriangle_alpha, byte, value);
                 self.triangle_alpha = float_color_to_fixed(self.ftriangle_alpha);
             }
+            SST_FSTART_S => {
+                merge_byte(&mut self.ftriangle_tex_coord[0], byte, value);
+                self.triangle_tex_coord[0] =
+                    float_texture_coord_to_fixed(self.ftriangle_tex_coord[0]);
+            }
+            SST_FSTART_T => {
+                merge_byte(&mut self.ftriangle_tex_coord[1], byte, value);
+                self.triangle_tex_coord[1] =
+                    float_texture_coord_to_fixed(self.ftriangle_tex_coord[1]);
+            }
+            SST_FSTART_W => {
+                merge_byte(&mut self.ftriangle_tex_coord[2], byte, value);
+                self.triangle_tex_coord[2] =
+                    float_texture_coord_to_fixed(self.ftriangle_tex_coord[2]);
+            }
             SST_FDR_DX => {
                 merge_byte(&mut self.ftriangle_color_dx[0], byte, value);
                 self.triangle_color_dx[0] = float_color_to_fixed(self.ftriangle_color_dx[0]);
@@ -823,6 +853,21 @@ impl Distira {
                 merge_byte(&mut self.ftriangle_alpha_dx, byte, value);
                 self.triangle_alpha_dx = float_color_to_fixed(self.ftriangle_alpha_dx);
             }
+            SST_FDS_DX => {
+                merge_byte(&mut self.ftriangle_tex_coord_dx[0], byte, value);
+                self.triangle_tex_coord_dx[0] =
+                    float_texture_coord_to_fixed(self.ftriangle_tex_coord_dx[0]);
+            }
+            SST_FDT_DX => {
+                merge_byte(&mut self.ftriangle_tex_coord_dx[1], byte, value);
+                self.triangle_tex_coord_dx[1] =
+                    float_texture_coord_to_fixed(self.ftriangle_tex_coord_dx[1]);
+            }
+            SST_FDW_DX => {
+                merge_byte(&mut self.ftriangle_tex_coord_dx[2], byte, value);
+                self.triangle_tex_coord_dx[2] =
+                    float_texture_coord_to_fixed(self.ftriangle_tex_coord_dx[2]);
+            }
             SST_FDR_DY => {
                 merge_byte(&mut self.ftriangle_color_dy[0], byte, value);
                 self.triangle_color_dy[0] = float_color_to_fixed(self.ftriangle_color_dy[0]);
@@ -842,6 +887,21 @@ impl Distira {
             SST_FDA_DY => {
                 merge_byte(&mut self.ftriangle_alpha_dy, byte, value);
                 self.triangle_alpha_dy = float_color_to_fixed(self.ftriangle_alpha_dy);
+            }
+            SST_FDS_DY => {
+                merge_byte(&mut self.ftriangle_tex_coord_dy[0], byte, value);
+                self.triangle_tex_coord_dy[0] =
+                    float_texture_coord_to_fixed(self.ftriangle_tex_coord_dy[0]);
+            }
+            SST_FDT_DY => {
+                merge_byte(&mut self.ftriangle_tex_coord_dy[1], byte, value);
+                self.triangle_tex_coord_dy[1] =
+                    float_texture_coord_to_fixed(self.ftriangle_tex_coord_dy[1]);
+            }
+            SST_FDW_DY => {
+                merge_byte(&mut self.ftriangle_tex_coord_dy[2], byte, value);
+                self.triangle_tex_coord_dy[2] =
+                    float_texture_coord_to_fixed(self.ftriangle_tex_coord_dy[2]);
             }
             SST_FTRIANGLE_CMD => {
                 if byte == 0 && value != 0 {
@@ -1538,6 +1598,10 @@ fn float_color_to_fixed(raw: u32) -> u32 {
 
 fn float_depth_to_fixed(raw: u32) -> u32 {
     (f32::from_bits(raw) * 4096.0) as i32 as u32
+}
+
+fn float_texture_coord_to_fixed(raw: u32) -> u32 {
+    (f32::from_bits(raw) * 16384.0) as i32 as u32
 }
 
 fn edge(ax: f32, ay: f32, bx: f32, by: f32, px: f32, py: f32) -> f32 {
