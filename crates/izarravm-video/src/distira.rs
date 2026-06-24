@@ -53,14 +53,17 @@ pub const SST_START_R: usize = 0x020;
 pub const SST_START_G: usize = 0x024;
 pub const SST_START_B: usize = 0x028;
 pub const SST_START_Z: usize = 0x02c;
+pub const SST_START_A: usize = 0x030;
 pub const SST_DR_DX: usize = 0x040;
 pub const SST_DG_DX: usize = 0x044;
 pub const SST_DB_DX: usize = 0x048;
 pub const SST_DZ_DX: usize = 0x04c;
+pub const SST_DA_DX: usize = 0x050;
 pub const SST_DR_DY: usize = 0x060;
 pub const SST_DG_DY: usize = 0x064;
 pub const SST_DB_DY: usize = 0x068;
 pub const SST_DZ_DY: usize = 0x06c;
+pub const SST_DA_DY: usize = 0x070;
 pub const SST_TRIANGLE_CMD: usize = 0x080;
 pub const SST_FVERTEX_AX: usize = 0x088;
 pub const SST_FVERTEX_AY: usize = 0x08c;
@@ -169,6 +172,18 @@ pub const DEPTHOP_GREATERTHAN: u32 = 4;
 pub const DEPTHOP_NOTEQUAL: u32 = 5;
 pub const DEPTHOP_GREATERTHANEQUAL: u32 = 6;
 pub const DEPTHOP_ALWAYS: u32 = 7;
+
+pub const AFUNC_NEVER: u32 = 0;
+pub const AFUNC_LESSTHAN: u32 = 1;
+pub const AFUNC_EQUAL: u32 = 2;
+pub const AFUNC_LESSTHANEQUAL: u32 = 3;
+pub const AFUNC_GREATERTHAN: u32 = 4;
+pub const AFUNC_NOTEQUAL: u32 = 5;
+pub const AFUNC_GREATERTHANEQUAL: u32 = 6;
+pub const AFUNC_ALWAYS: u32 = 7;
+pub const ALPHA_TEST_ENABLE: u32 = 1;
+pub const ALPHA_FUNC_SHIFT: u32 = 1;
+pub const ALPHA_REF_SHIFT: u32 = 24;
 
 pub const FBIINIT0_VGA_PASS: u32 = 1;
 pub const FBIINIT0_GRAPHICS_RESET: u32 = 1 << 1;
@@ -283,6 +298,9 @@ pub struct Distira {
     triangle_depth: u32,
     triangle_depth_dx: u32,
     triangle_depth_dy: u32,
+    triangle_alpha: u32,
+    triangle_alpha_dx: u32,
+    triangle_alpha_dy: u32,
     ftriangle_vertices: [(u32, u32); 3],
     ftriangle_color: [u32; 3],
     ftriangle_color_dx: [u32; 3],
@@ -352,6 +370,9 @@ impl Distira {
             triangle_depth: 0,
             triangle_depth_dx: 0,
             triangle_depth_dy: 0,
+            triangle_alpha: 0x00ff_0000,
+            triangle_alpha_dx: 0,
+            triangle_alpha_dy: 0,
             ftriangle_vertices: [(0, 0); 3],
             ftriangle_color: [0; 3],
             ftriangle_color_dx: [0; 3],
@@ -499,6 +520,11 @@ impl Distira {
                 let r = lerp_u8(a.r, b.r, c.r, l0, l1, l2);
                 let g = lerp_u8(a.g, b.g, c.g, l0, l1, l2);
                 let blue = lerp_u8(a.b, b.b, c.b, l0, l1, l2);
+                let alpha = lerp_u8(a.a, b.a, c.a, l0, l1, l2);
+                if !self.alpha_test_passes(alpha) {
+                    self.fbi_afunc_fail = self.fbi_afunc_fail.wrapping_add(1);
+                    continue;
+                }
                 let pixel = pack_rgb565_for_pixel(r, g, blue, x, y, self.dither_enabled);
                 if self.write_back_pixel(x, y, pixel) {
                     if let Some(depth) = depth {
@@ -646,14 +672,17 @@ impl Distira {
             SST_START_G => merge_color_component(&mut self.triangle_color[1], byte, value),
             SST_START_B => merge_color_component(&mut self.triangle_color[2], byte, value),
             SST_START_Z => merge_byte(&mut self.triangle_depth, byte, value),
+            SST_START_A => merge_color_component(&mut self.triangle_alpha, byte, value),
             SST_DR_DX => merge_color_component(&mut self.triangle_color_dx[0], byte, value),
             SST_DG_DX => merge_color_component(&mut self.triangle_color_dx[1], byte, value),
             SST_DB_DX => merge_color_component(&mut self.triangle_color_dx[2], byte, value),
             SST_DZ_DX => merge_byte(&mut self.triangle_depth_dx, byte, value),
+            SST_DA_DX => merge_color_component(&mut self.triangle_alpha_dx, byte, value),
             SST_DR_DY => merge_color_component(&mut self.triangle_color_dy[0], byte, value),
             SST_DG_DY => merge_color_component(&mut self.triangle_color_dy[1], byte, value),
             SST_DB_DY => merge_color_component(&mut self.triangle_color_dy[2], byte, value),
             SST_DZ_DY => merge_byte(&mut self.triangle_depth_dy, byte, value),
+            SST_DA_DY => merge_color_component(&mut self.triangle_alpha_dy, byte, value),
             SST_TRIANGLE_CMD => {
                 if byte == 0 && value != 0 {
                     self.run_triangle_command();
@@ -919,14 +948,17 @@ impl Distira {
             SST_START_G => self.triangle_color[1],
             SST_START_B => self.triangle_color[2],
             SST_START_Z => self.triangle_depth,
+            SST_START_A => self.triangle_alpha,
             SST_DR_DX => self.triangle_color_dx[0],
             SST_DG_DX => self.triangle_color_dx[1],
             SST_DB_DX => self.triangle_color_dx[2],
             SST_DZ_DX => self.triangle_depth_dx,
+            SST_DA_DX => self.triangle_alpha_dx,
             SST_DR_DY => self.triangle_color_dy[0],
             SST_DG_DY => self.triangle_color_dy[1],
             SST_DB_DY => self.triangle_color_dy[2],
             SST_DZ_DY => self.triangle_depth_dy,
+            SST_DA_DY => self.triangle_alpha_dy,
             SST_TRIANGLE_CMD => 0,
             SST_FVERTEX_AX => self.ftriangle_vertices[0].0,
             SST_FVERTEX_AY => self.ftriangle_vertices[0].1,
@@ -1101,38 +1133,45 @@ impl Distira {
                 origin_y,
             )
         });
-        let vertices = coords.map(|(x, y)| {
-            DistiraVertex::rgb(
+        let vertices = coords.map(|(x, y)| DistiraVertex {
+            x,
+            y,
+            r: fixed_color_at(
+                self.triangle_color[0],
+                self.triangle_color_dx[0],
+                self.triangle_color_dy[0],
                 x,
                 y,
-                fixed_color_at(
-                    self.triangle_color[0],
-                    self.triangle_color_dx[0],
-                    self.triangle_color_dy[0],
-                    x,
-                    y,
-                    origin_x,
-                    origin_y,
-                ),
-                fixed_color_at(
-                    self.triangle_color[1],
-                    self.triangle_color_dx[1],
-                    self.triangle_color_dy[1],
-                    x,
-                    y,
-                    origin_x,
-                    origin_y,
-                ),
-                fixed_color_at(
-                    self.triangle_color[2],
-                    self.triangle_color_dx[2],
-                    self.triangle_color_dy[2],
-                    x,
-                    y,
-                    origin_x,
-                    origin_y,
-                ),
-            )
+                origin_x,
+                origin_y,
+            ),
+            g: fixed_color_at(
+                self.triangle_color[1],
+                self.triangle_color_dx[1],
+                self.triangle_color_dy[1],
+                x,
+                y,
+                origin_x,
+                origin_y,
+            ),
+            b: fixed_color_at(
+                self.triangle_color[2],
+                self.triangle_color_dx[2],
+                self.triangle_color_dy[2],
+                x,
+                y,
+                origin_x,
+                origin_y,
+            ),
+            a: fixed_color_at(
+                self.triangle_alpha,
+                self.triangle_alpha_dx,
+                self.triangle_alpha_dy,
+                x,
+                y,
+                origin_x,
+                origin_y,
+            ),
         });
         let written = self.draw_triangle_with_depth(vertices, depths) as u32;
         self.fbi_pixels_in = self.fbi_pixels_in.wrapping_add(written);
@@ -1182,6 +1221,24 @@ impl Distira {
             DEPTHOP_NOTEQUAL => depth != old_depth,
             DEPTHOP_GREATERTHANEQUAL => depth >= old_depth,
             DEPTHOP_ALWAYS => true,
+            _ => true,
+        }
+    }
+
+    fn alpha_test_passes(&self, alpha: u8) -> bool {
+        if self.alpha_mode & ALPHA_TEST_ENABLE == 0 {
+            return true;
+        }
+        let reference = (self.alpha_mode >> ALPHA_REF_SHIFT) as u8;
+        match (self.alpha_mode >> ALPHA_FUNC_SHIFT) & 7 {
+            AFUNC_NEVER => false,
+            AFUNC_LESSTHAN => alpha < reference,
+            AFUNC_EQUAL => alpha == reference,
+            AFUNC_LESSTHANEQUAL => alpha <= reference,
+            AFUNC_GREATERTHAN => alpha > reference,
+            AFUNC_NOTEQUAL => alpha != reference,
+            AFUNC_GREATERTHANEQUAL => alpha >= reference,
+            AFUNC_ALWAYS => true,
             _ => true,
         }
     }
