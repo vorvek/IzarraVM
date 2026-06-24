@@ -35,6 +35,10 @@ fn cmdfifo_type1_header(reg: usize, count: u32) -> u32 {
     1 | (((reg as u32) << 1) & 0x7ff8) | (count << 16)
 }
 
+fn cmdfifo_type5_framebuffer_header(count: u32) -> u32 {
+    (2 << 30) | (count << 3) | 5
+}
+
 #[test]
 fn distira_mmio_and_lfb_are_wired_into_machine_scanout() {
     let mut machine = Machine::new(
@@ -197,4 +201,40 @@ fn distira_cmdfifo_aperture_drains_type1_register_packets() {
     let (frame, width, height) = machine.frame_argb();
     assert_eq!((width, height), (2, 1));
     assert_eq!(frame, vec![0x0031_557b; 2]);
+}
+
+#[test]
+fn distira_cmdfifo_type5_framebuffer_packet_writes_lfb() {
+    const CMD_FIFO_BASE: u32 = DISTIRA_MMIO_BASE + 0x0020_0000;
+    const SST_CMD_FIFO_DEPTH: usize = 0x1f4;
+    const FBIINIT7_CMDFIFO_ENABLE: u32 = 1 << 8;
+
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Distira),
+        I386DX25_TEST_ROM,
+    )
+    .unwrap();
+
+    write_reg(&mut machine, DISTIRA_REG_FB_WIDTH, 2);
+    write_reg(&mut machine, DISTIRA_REG_FB_HEIGHT, 1);
+    write_reg(
+        &mut machine,
+        SST_LFB_MODE,
+        LFB_FORMAT_ARGB8888 | LFB_WRITE_BACK,
+    );
+    write_reg(&mut machine, SST_FBI_INIT7, FBIINIT7_CMDFIFO_ENABLE);
+
+    machine.write_physical_u32(CMD_FIFO_BASE, cmdfifo_type5_framebuffer_header(1));
+    machine.write_physical_u32(CMD_FIFO_BASE + 4, 0);
+    machine.write_physical_u32(CMD_FIFO_BASE + 8, 0x0034_5678);
+
+    assert_eq!(read_reg(&mut machine, SST_CMD_FIFO_DEPTH), 3);
+
+    machine.drain_distira_fifo();
+    write_reg(&mut machine, SST_SWAPBUFFER_CMD, 1);
+
+    assert_eq!(read_reg(&mut machine, SST_CMD_FIFO_DEPTH), 0);
+    let (frame, width, height) = machine.frame_argb();
+    assert_eq!((width, height), (2, 1));
+    assert_eq!(frame, vec![0x0031_557b, 0x0000_0000]);
 }

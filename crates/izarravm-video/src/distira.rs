@@ -653,21 +653,42 @@ impl Distira {
     fn drain_command_fifo(&mut self) {
         while let Some(header) = self.command_fifo.pop_front() {
             self.cmd_fifo_read_ptr = self.cmd_fifo_read_ptr.wrapping_add(4);
-            if header & 7 != 1 {
-                continue;
-            }
-
-            let mut offset = ((header & 0x7ff8) >> 1) as usize;
-            let increment = header & (1 << 15) != 0;
-            for _ in 0..(header >> 16) {
-                let Some(value) = self.command_fifo.pop_front() else {
-                    return;
-                };
-                self.cmd_fifo_read_ptr = self.cmd_fifo_read_ptr.wrapping_add(4);
-                self.push_fifo(DistiraFifoEntry::Register { offset, value });
-                if increment {
-                    offset += 4;
+            match header & 7 {
+                1 => {
+                    let mut offset = ((header & 0x7ff8) >> 1) as usize;
+                    let increment = header & (1 << 15) != 0;
+                    for _ in 0..(header >> 16) {
+                        let Some(value) = self.command_fifo.pop_front() else {
+                            return;
+                        };
+                        self.cmd_fifo_read_ptr = self.cmd_fifo_read_ptr.wrapping_add(4);
+                        self.push_fifo(DistiraFifoEntry::Register { offset, value });
+                        if increment {
+                            offset += 4;
+                        }
+                    }
                 }
+                5 => {
+                    let Some(address) = self.command_fifo.pop_front() else {
+                        return;
+                    };
+                    self.cmd_fifo_read_ptr = self.cmd_fifo_read_ptr.wrapping_add(4);
+                    let mut offset = (address & 0x00ff_ffff) as usize;
+                    let count = ((header >> 3) & 0x7ffff).max(1);
+                    let space = header >> 30;
+                    for _ in 0..count {
+                        let Some(value) = self.command_fifo.pop_front() else {
+                            return;
+                        };
+                        self.cmd_fifo_read_ptr = self.cmd_fifo_read_ptr.wrapping_add(4);
+                        match space {
+                            2 => self.push_fifo(DistiraFifoEntry::LfbU32 { offset, value }),
+                            _ => false,
+                        };
+                        offset = offset.wrapping_add(4);
+                    }
+                }
+                _ => {}
             }
         }
     }
