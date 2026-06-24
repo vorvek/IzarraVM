@@ -337,6 +337,12 @@ pub struct Machine {
     pending_toka_service: Option<u8>,
     toka_service_status: u8,
     toka_c_root: Option<std::path::PathBuf>, // host C: root for Repair/Format
+    // True while a CallDevice service is on the CPU. A driver running on the
+    // borrowed context can issue INT 21h AH=3Fh/40h on a device handle, which
+    // would re-enter the same fixed request packet at DEVICE_REQUEST_SCRATCH and
+    // grow the host stack without bound. The CallDevice arm refuses a nested call
+    // while this is set. It is not part of any snapshot.
+    in_device_call: bool,
     // How many bytes of the DOS console output have already been teletyped onto
     // the VGA text screen. DOS CON output goes to the kernel's stdout buffer; the
     // machine mirrors the new bytes onto the framebuffer so the screen shows them.
@@ -612,6 +618,7 @@ impl Machine {
             pending_toka_service: None,
             toka_service_status: 0,
             toka_c_root: None,
+            in_device_call: false,
             dos_screen_shown: 0,
             dos: izarravm_dos::DosKernel::default(),
             rom,
@@ -4766,13 +4773,10 @@ impl Machine {
                 // seam SYSINIT used, which restores the program's register context,
                 // so SS:SP returns to the INT frame the input registers were
                 // marshalled onto. Write the result over AX and the stacked CF the
-                // way the EXEC-return path edits the frame. A host-side failure of
-                // the nested call (a memory or CPU fault) is reported to the guest
-                // as a general device failure (0x1D), not propagated as an abort.
-                let (ax, cf) = match self.service_device_call(header, command, transfer, count) {
-                    Ok((_, true)) => (0x0005u16, true), // driver error bit
-                    Ok((done_count, false)) => (done_count, false),
-                    Err(_) => (0x001d, true), // general device failure
+                // way the EXEC-return path edits the frame.
+                let (ax, cf) = match self.device_call_outcome(header, command, transfer, count) {
+                    Ok(count) => (count, false),
+                    Err(code) => (code, true),
                 };
                 self.cpu
                     .registers
@@ -5070,6 +5074,33 @@ impl Machine {
         outcome
     }
 
+    /// Run a CallDevice action with the re-entrancy guard, returning Ok(count) on
+    /// success or Err(dos_error_code) on a fault. A host-side failure of the nested
+    /// call (a memory or CPU fault) is reported as a general device failure (0x1D),
+    /// not propagated as an abort. The fixed request packet is not reentrant, so a
+    /// driver that issues its own device I/O while it runs is refused rather than
+    /// allowed to clobber the packet and grow the host stack. in_device_call is
+    /// reset before this returns, so an error can never leave the guard stuck.
+    fn device_call_outcome(
+        &mut self,
+        header: izarravm_dos::FarPtr,
+        command: u8,
+        transfer: izarravm_dos::FarPtr,
+        count: u16,
+    ) -> Result<u16, u16> {
+        if self.in_device_call {
+            return Err(0x001d); // nested device call: the fixed packet is not reentrant
+        }
+        self.in_device_call = true;
+        let r = self.service_device_call(header, command, transfer, count);
+        self.in_device_call = false;
+        match r {
+            Ok((count, None)) => Ok(count),
+            Ok((_, Some(code))) => Err(code),
+            Err(_) => Err(0x001d), // host-side failure: general device failure
+        }
+    }
+
     /// Service a CallDevice action: build a DOS request packet for a READ (command
     /// 4) or WRITE (command 8), far-call the driver's strategy then interrupt on the
     /// CPU, and read back the transferred count and error bit. The driver reads or
@@ -5077,13 +5108,15 @@ impl Machine {
     /// far pointer, the way a real device driver does. The register context the
     /// program was running with is restored by call_driver_request, so the only
     /// effect on the program is the count and CF the action handler writes back.
+    /// On success returns the transferred count with `None`; on a driver fault it
+    /// returns `(0, Some(code))` with a command-keyed DOS error code.
     fn service_device_call(
         &mut self,
         header: izarravm_dos::FarPtr,
         command: u8,
         transfer: izarravm_dos::FarPtr,
         count: u16,
-    ) -> Result<(u16, bool), MachineError> {
+    ) -> Result<(u16, Option<u16>), MachineError> {
         let req = DEVICE_REQUEST_SCRATCH;
         for i in 0..0x1a {
             self.memory.write_u8(req + i, 0)?;
@@ -5103,14 +5136,22 @@ impl Machine {
         // pointer is (req >> 4):0.
         let req_ptr = ((req >> 4) as u16, 0u16);
         // Strategy stores the request pointer; interrupt does the transfer. The seam
-        // restores the program's CPU context after each call; we ignore its DONE
-        // bool and read the count and status from the packet instead.
+        // restores the program's CPU context after each call. STRATEGY legitimately
+        // never sets DONE (it only stores the request pointer), so success is gated
+        // on the INTERRUPT call's bool: DONE set with the error bit clear.
         let _ = self.call_driver_request((header.segment, strat_off), req_ptr)?;
-        let _ = self.call_driver_request((header.segment, int_off), req_ptr)?;
+        let done = self.call_driver_request((header.segment, int_off), req_ptr)?;
 
         let status = self.memory.read_u16(req + 0x03)?;
         let done_count = self.memory.read_u16(req + 0x12)?;
-        Ok((done_count, status & 0x8000 != 0))
+        if !done || status & 0x8000 != 0 {
+            // Command-keyed DOS device fault: 8 = write -> 0x1D write fault, 4 =
+            // read -> 0x1E read fault. 0x05 stays reserved for the access-mode
+            // denial the kernel already handles before reaching the driver.
+            let code = if command == 8 { 0x1d } else { 0x1e };
+            return Ok((0, Some(code)));
+        }
+        Ok((done_count, None))
     }
 
     /// Mirror any DOS console output produced since the last call onto the VGA
@@ -6917,8 +6958,12 @@ const SYSINIT_INIT_BUDGET: u64 = 50_000;
 /// and SysVars starts at 0x640, so 0x500 belongs to no guest structure. The driver
 /// call's stack uses the same page from a high SP (0xF0 -> linear 0x5F0) growing
 /// down, so the 0x1A-byte packet at 0x500-0x519 and the live stack never overlap.
-/// Device I/O and SYSINIT INIT never run at the same time, so sharing the page is
-/// safe; the packet's survival across the call is asserted by a test.
+/// No test asserts that the full packet survives the call. The packet occupies
+/// 0x500-0x519 and the driver-call scratch stack grows down from linear 0x5F0, so
+/// the ~214-byte gap between them is a hard ceiling on driver stack depth: a driver
+/// that pushes past it walks down into the packet. The single fixed packet also
+/// assumes device calls are non-reentrant, which the in_device_call guard now
+/// enforces (a nested device call is refused, not run on the same packet).
 const DEVICE_REQUEST_SCRATCH: usize = 0x0500;
 
 /// RAM address of the default INT 70h (IRQ8) handler, a few bytes past the IRET
@@ -7716,7 +7761,7 @@ mod tests {
                 4,
             )
             .unwrap();
-        assert!(!err);
+        assert_eq!(err, None);
         assert_eq!(count, 4);
         // The driver really ran on the CPU: its resident buffer at 0x3000:0x63 has
         // the copied bytes.
@@ -7725,6 +7770,102 @@ mod tests {
         assert_eq!(&got, b"PING");
         // The caller's CPU register context is restored after the device call.
         assert_eq!(m.cpu.registers, saved);
+    }
+
+    /// Place a minimal character driver at `seg`:0 whose strategy is a bare RETF
+    /// (it leaves ES:BX = the request packet, which call_driver_request already set)
+    /// and whose interrupt routine is `int_body` followed by a RETF. The 18-byte
+    /// header points strategy at +0x12 and interrupt at +0x13.
+    fn place_driver_with_interrupt(m: &mut Machine, seg: u16, name: &[u8; 8], int_body: &[u8]) {
+        let mut image = vec![
+            0xff, 0xff, 0xff, 0xff, // next-driver far pointer
+            0x00, 0x80, // attribute: character device
+            0x12, 0x00, // strategy entry offset 0x12
+            0x13, 0x00, // interrupt entry offset 0x13
+        ];
+        image.extend_from_slice(name); // name at +0x0a (8 bytes), ends at +0x12
+        image.push(0xcb); // strategy at +0x12: RETF
+        image.extend_from_slice(int_body); // interrupt at +0x13
+        image.push(0xcb); // interrupt RETF
+        let base = usize::from(seg) * 16;
+        for (i, &b) in image.iter().enumerate() {
+            m.memory.write_u8(base + i, b).unwrap();
+        }
+        // The HLT sentinel the driver's far return lands on.
+        m.memory.write_u8(SYSINIT_HALT_STUB, 0xf4).unwrap();
+    }
+
+    #[test]
+    fn service_device_call_on_a_never_done_driver_returns_a_device_error() {
+        // The interrupt routine never sets the DONE bit (a bare RETF). The service
+        // must report a device error, not a phantom full-count success.
+        let mut m = test_machine();
+        place_driver_with_interrupt(&mut m, 0x3000, b"NODONE  ", &[]);
+        let header = izarravm_dos::FarPtr {
+            segment: 0x3000,
+            offset: 0,
+        };
+        let xfer = izarravm_dos::FarPtr {
+            segment: 0x4000,
+            offset: 0,
+        };
+        let (count, err) = m.service_device_call(header, 4, xfer, 4).unwrap();
+        assert_eq!(count, 0);
+        // 4 = READ, so the command-keyed code is 0x1E (read fault). The guest would
+        // see CF=1.
+        assert_eq!(err, Some(0x1e));
+    }
+
+    #[test]
+    fn service_device_call_honors_the_driver_error_bit() {
+        // The interrupt routine sets status 0x8100 (DONE + error). A WRITE keys to
+        // 0x1D (write fault), a READ to 0x1E (read fault); both report CF=1.
+        // mov word [es:bx+3], 0x8100  =  0x26 0xC7 0x47 0x03 0x00 0x81
+        let int_body = [0x26, 0xc7, 0x47, 0x03, 0x00, 0x81];
+        let mut m = test_machine();
+        place_driver_with_interrupt(&mut m, 0x3000, b"ERRBIT  ", &int_body);
+        let header = izarravm_dos::FarPtr {
+            segment: 0x3000,
+            offset: 0,
+        };
+        let xfer = izarravm_dos::FarPtr {
+            segment: 0x4000,
+            offset: 0,
+        };
+        let (wcount, werr) = m.service_device_call(header, 8, xfer, 5).unwrap();
+        assert_eq!(wcount, 0);
+        assert_eq!(werr, Some(0x1d), "write fault");
+        let (rcount, rerr) = m.service_device_call(header, 4, xfer, 5).unwrap();
+        assert_eq!(rcount, 0);
+        assert_eq!(rerr, Some(0x1e), "read fault");
+    }
+
+    #[test]
+    fn a_nested_device_call_is_refused_without_recursing() {
+        // With in_device_call already set (as it is while a driver runs on the
+        // borrowed context), a CallDevice must be refused as a device failure
+        // (0x1D / CF=1) instead of re-entering the fixed packet and recursing.
+        let mut m = test_machine();
+        place_inline_io_driver(&mut m, 0x3000);
+        let header = izarravm_dos::FarPtr {
+            segment: 0x3000,
+            offset: 0,
+        };
+        let xfer = izarravm_dos::FarPtr {
+            segment: 0x4000,
+            offset: 0,
+        };
+        m.in_device_call = true;
+        let outcome = m.device_call_outcome(header, 4, xfer, 4);
+        assert_eq!(outcome, Err(0x001d), "nested call refused, no recursion");
+        // The guard the test forced is left untouched on the refused path: the
+        // outer call that set it owns clearing it.
+        assert!(m.in_device_call);
+        // A first (non-nested) call clears the guard on the way out.
+        m.in_device_call = false;
+        let ok = m.device_call_outcome(header, 8, xfer, 4);
+        assert_eq!(ok, Ok(4), "the non-nested write succeeds");
+        assert!(!m.in_device_call, "guard cleared after the outer call");
     }
 
     #[test]
@@ -16510,7 +16651,7 @@ mod tests {
             machine.memory.write_u8(0x40000 + i, *b).unwrap();
         }
         let (written, werr) = machine.service_device_call(header, 8, xfer, 5).unwrap();
-        assert!(!werr);
+        assert_eq!(werr, None);
         assert_eq!(written, 5);
         // WRITE ran on the CPU: unit-tester register 2 holds 'W'.
         assert_eq!(read_unittester_reg(&mut machine, 2), 0x57);
@@ -16524,7 +16665,7 @@ mod tests {
             machine.memory.write_u8(0x41000 + i, 0).unwrap();
         }
         let (read, rerr) = machine.service_device_call(header, 4, back, 5).unwrap();
-        assert!(!rerr);
+        assert_eq!(rerr, None);
         assert_eq!(read, 5);
         let got: Vec<u8> = (0..5)
             .map(|i| machine.memory.read_u8(0x41000 + i).unwrap())
