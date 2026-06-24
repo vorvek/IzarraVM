@@ -150,7 +150,25 @@ const DEFAULT_BUFFER_COUNT: u16 = 20;
 /// left out until that driver exists.
 const DEFAULT_CONFIG_SYS: &str = "DEVICE=C:\\DOS\\HIMEM.SYS /TESTMEM:OFF\r\nDEVICE=C:\\DOS\\IEMM.EXE RAM\r\nDOS=HIGH,UMB\r\nFILES=40\r\nBUFFERS=20\r\nLASTDRIVE=E\r\n";
 
-fn write_system_files(c_root: &Path, files: &[(String, Vec<u8>)]) -> std::io::Result<()> {
+/// How the boot-config writer treats an existing CONFIG.SYS / AUTOEXEC.BAT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootConfigPolicy {
+    /// Write each default only when the file is absent (first boot). A user's
+    /// edits are never touched.
+    FillIfMissing,
+    /// Repair: back an existing file up to its `.OLD` sibling (overwriting any
+    /// stale `.OLD`), then write the default unconditionally. An absent file is
+    /// just written, with no `.OLD` created.
+    BackupAndReplace,
+    /// Format: write each default unconditionally and never create a `.OLD`.
+    Overwrite,
+}
+
+fn write_system_files(
+    c_root: &Path,
+    files: &[(String, Vec<u8>)],
+    policy: BootConfigPolicy,
+) -> std::io::Result<()> {
     std::fs::create_dir_all(c_root)?;
     let dos_dir = c_root.join("DOS");
     std::fs::create_dir_all(&dos_dir)?;
@@ -162,19 +180,41 @@ fn write_system_files(c_root: &Path, files: &[(String, Vec<u8>)]) -> std::io::Re
         };
         std::fs::write(dir.join(name), bytes)?;
     }
-    write_default_boot_config(c_root)
+    write_default_boot_config(c_root, policy)
 }
 
-/// Write the default AUTOEXEC.BAT and CONFIG.SYS at the C: root, but only when
-/// each is absent, so a reinstall or repair never clobbers a user's edits.
-fn write_default_boot_config(c_root: &Path) -> std::io::Result<()> {
-    let autoexec = c_root.join("AUTOEXEC.BAT");
-    if !autoexec.exists() {
-        std::fs::write(autoexec, DEFAULT_AUTOEXEC_BAT)?;
-    }
-    let config = c_root.join("CONFIG.SYS");
-    if !config.exists() {
-        std::fs::write(config, DEFAULT_CONFIG_SYS)?;
+/// Write the default AUTOEXEC.BAT and CONFIG.SYS at the C: root according to
+/// `policy`: leave a user's edits in place on first boot, hand back a known-good
+/// pair on Repair (saving the prior file to `.OLD`), or overwrite on Format.
+fn write_default_boot_config(c_root: &Path, policy: BootConfigPolicy) -> std::io::Result<()> {
+    write_one_boot_file(&c_root.join("AUTOEXEC.BAT"), DEFAULT_AUTOEXEC_BAT, policy)?;
+    write_one_boot_file(&c_root.join("CONFIG.SYS"), DEFAULT_CONFIG_SYS, policy)?;
+    Ok(())
+}
+
+/// Write one boot file (CONFIG.SYS or AUTOEXEC.BAT) per the policy.
+fn write_one_boot_file(
+    path: &Path,
+    default: &str,
+    policy: BootConfigPolicy,
+) -> std::io::Result<()> {
+    match policy {
+        BootConfigPolicy::FillIfMissing => {
+            if !path.exists() {
+                std::fs::write(path, default)?;
+            }
+        }
+        BootConfigPolicy::BackupAndReplace => {
+            if path.exists() {
+                // Save the user's current file to its .OLD sibling, replacing any
+                // stale backup, then hand back the known-good default.
+                std::fs::copy(path, path.with_extension("OLD"))?;
+            }
+            std::fs::write(path, default)?;
+        }
+        BootConfigPolicy::Overwrite => {
+            std::fs::write(path, default)?;
+        }
     }
     Ok(())
 }
@@ -206,14 +246,16 @@ pub fn toka_dos_install(
             if c_root.join(TOKA_DOS_MARKER).exists() {
                 return Ok(());
             }
-            write_system_files(c_root, files)
+            write_system_files(c_root, files, BootConfigPolicy::FillIfMissing)
         }
-        InstallMode::Repair => write_system_files(c_root, files),
+        InstallMode::Repair => {
+            write_system_files(c_root, files, BootConfigPolicy::BackupAndReplace)
+        }
         InstallMode::Format => {
             if c_root.exists() {
                 clear_directory(c_root)?;
             }
-            write_system_files(c_root, files)
+            write_system_files(c_root, files, BootConfigPolicy::Overwrite)
         }
     }
 }
@@ -5191,19 +5233,149 @@ mod tests {
             "the default CONFIG.SYS loads the IEMM manager"
         );
 
-        // A user-edited config survives a reinstall (generated only when absent).
+        // Repair hands back the known-good default and saves the prior file to
+        // its .OLD sibling, so a novice who broke CONFIG.SYS can recover and
+        // still get their old text back.
         std::fs::write(root.join("AUTOEXEC.BAT"), b"REM mine").unwrap();
         std::fs::write(root.join("CONFIG.SYS"), b"REM cfg").unwrap();
         toka_dos_install(root, &files, InstallMode::Repair).unwrap();
         assert_eq!(
             std::fs::read_to_string(root.join("AUTOEXEC.BAT")).unwrap(),
-            "REM mine",
-            "Repair keeps the user's AUTOEXEC.BAT"
+            DEFAULT_AUTOEXEC_BAT,
+            "Repair writes the default AUTOEXEC.BAT"
         );
         assert_eq!(
             std::fs::read_to_string(root.join("CONFIG.SYS")).unwrap(),
+            DEFAULT_CONFIG_SYS,
+            "Repair writes the default CONFIG.SYS"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("AUTOEXEC.OLD")).unwrap(),
+            "REM mine",
+            "Repair backs the prior AUTOEXEC.BAT up to AUTOEXEC.OLD"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("CONFIG.OLD")).unwrap(),
             "REM cfg",
-            "Repair keeps the user's CONFIG.SYS"
+            "Repair backs the prior CONFIG.SYS up to CONFIG.OLD"
+        );
+    }
+
+    #[test]
+    fn repair_backs_up_custom_config_sys() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let files = vec![("ICOMMAND.COM".to_string(), vec![1u8])];
+        toka_dos_install(root, &files, InstallMode::Format).unwrap();
+
+        std::fs::write(root.join("CONFIG.SYS"), b"REM broken").unwrap();
+        toka_dos_install(root, &files, InstallMode::Repair).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("CONFIG.OLD")).unwrap(),
+            "REM broken",
+            "Repair saves the custom CONFIG.SYS to CONFIG.OLD"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("CONFIG.SYS")).unwrap(),
+            DEFAULT_CONFIG_SYS,
+            "Repair writes the default CONFIG.SYS"
+        );
+    }
+
+    #[test]
+    fn repair_backs_up_custom_autoexec_bat() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let files = vec![("ICOMMAND.COM".to_string(), vec![1u8])];
+        toka_dos_install(root, &files, InstallMode::Format).unwrap();
+
+        std::fs::write(root.join("AUTOEXEC.BAT"), b"REM mine").unwrap();
+        toka_dos_install(root, &files, InstallMode::Repair).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("AUTOEXEC.OLD")).unwrap(),
+            "REM mine",
+            "Repair saves the custom AUTOEXEC.BAT to AUTOEXEC.OLD"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("AUTOEXEC.BAT")).unwrap(),
+            DEFAULT_AUTOEXEC_BAT,
+            "Repair writes the default AUTOEXEC.BAT"
+        );
+    }
+
+    #[test]
+    fn repair_writes_defaults_and_no_old_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let files = vec![("ICOMMAND.COM".to_string(), vec![1u8])];
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(root.join("ICOMMAND.COM"), vec![1u8]).unwrap();
+        assert!(!root.join("CONFIG.SYS").exists());
+        assert!(!root.join("AUTOEXEC.BAT").exists());
+
+        toka_dos_install(root, &files, InstallMode::Repair).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("CONFIG.SYS")).unwrap(),
+            DEFAULT_CONFIG_SYS
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("AUTOEXEC.BAT")).unwrap(),
+            DEFAULT_AUTOEXEC_BAT
+        );
+        assert!(
+            !root.join("CONFIG.OLD").exists(),
+            "no backup is created when CONFIG.SYS was absent"
+        );
+        assert!(
+            !root.join("AUTOEXEC.OLD").exists(),
+            "no backup is created when AUTOEXEC.BAT was absent"
+        );
+    }
+
+    #[test]
+    fn repair_leaves_unrelated_user_files_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let files = vec![("ICOMMAND.COM".to_string(), vec![1u8])];
+        toka_dos_install(root, &files, InstallMode::Format).unwrap();
+
+        let wolf_dir = root.join("GAMES").join("WOLF3D");
+        std::fs::create_dir_all(&wolf_dir).unwrap();
+        let wolf_exe = wolf_dir.join("WOLF3D.EXE");
+        std::fs::write(&wolf_exe, b"GAME").unwrap();
+
+        toka_dos_install(root, &files, InstallMode::Repair).unwrap();
+
+        assert_eq!(
+            std::fs::read(&wolf_exe).unwrap(),
+            b"GAME",
+            "Repair leaves an unrelated user file untouched"
+        );
+    }
+
+    #[test]
+    fn repair_overwrites_stale_config_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let files = vec![("ICOMMAND.COM".to_string(), vec![1u8])];
+        toka_dos_install(root, &files, InstallMode::Format).unwrap();
+
+        std::fs::write(root.join("CONFIG.OLD"), b"REM stale").unwrap();
+        std::fs::write(root.join("CONFIG.SYS"), b"REM current").unwrap();
+
+        toka_dos_install(root, &files, InstallMode::Repair).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("CONFIG.OLD")).unwrap(),
+            "REM current",
+            "Repair overwrites a stale CONFIG.OLD with the just-backed-up CONFIG.SYS"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("CONFIG.SYS")).unwrap(),
+            DEFAULT_CONFIG_SYS
         );
     }
 
