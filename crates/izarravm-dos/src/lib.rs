@@ -784,6 +784,15 @@ pub struct StagedDriver {
     pub request_ptr: (u16, u16),
 }
 
+/// Where SYSINIT should try to place a raw CONFIG.SYS driver image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverLoadPlacement {
+    /// Plain DEVICE= loads in conventional memory.
+    Low,
+    /// DEVICEHIGH= tries linked upper memory first, then conventional memory.
+    HighThenLow,
+}
+
 /// Why staging a `.SYS` driver failed. The SYSINIT loop reports and continues.
 #[derive(Debug)]
 pub enum DriverStageError {
@@ -977,6 +986,7 @@ impl DosKernel {
         &mut self,
         image: &[u8],
         args: &str,
+        placement: DriverLoadPlacement,
         mem: &mut Memory,
     ) -> Result<StagedDriver, DriverStageError> {
         let info = parse_device_header(image).map_err(DriverStageError::Load)?;
@@ -988,7 +998,21 @@ impl DosKernel {
         let scratch_bytes = u32::from(arg_off) + args.len() as u32 + 1;
         let scratch_paras =
             u16::try_from(scratch_bytes.div_ceil(16)).map_err(|_| DriverStageError::OutOfMemory)?;
-        let seg = match self.arena.allocate(image_paras + scratch_paras, mem)? {
+        let total_paras = image_paras
+            .checked_add(scratch_paras)
+            .ok_or(DriverStageError::OutOfMemory)?;
+        let allocation = match placement {
+            DriverLoadPlacement::Low => self.arena.allocate(total_paras, mem)?,
+            DriverLoadPlacement::HighThenLow => allocate_strategy(
+                &mut self.arena,
+                self.umb,
+                self.umb_link,
+                0x0080,
+                total_paras,
+                mem,
+            )?,
+        };
+        let seg = match allocation {
             Ok(seg) => seg,
             Err(_) => return Err(DriverStageError::OutOfMemory),
         };
@@ -1033,7 +1057,7 @@ impl DosKernel {
             .wrapping_sub(staged.driver_seg)
             .wrapping_add(result.break_off.div_ceil(16))
             .max(header_paras);
-        let _ = self.arena.resize(staged.driver_seg, break_paras, mem)?; // best-effort trim
+        let _ = self.resize_routed(staged.driver_seg, break_paras, mem)?; // best-effort trim
         // Front-insert so the most-recently-loaded driver sits nearest NUL, the way
         // real DOS links each new driver in right after the NUL header.
         self.loaded_devices.insert(0, (staged.driver_seg, 0x0000));
@@ -1046,7 +1070,7 @@ impl DosKernel {
         staged: &StagedDriver,
         mem: &mut Memory,
     ) -> Result<(), DosError> {
-        let _ = self.arena.free(staged.driver_seg, mem)?;
+        let _ = self.free_routed(staged.driver_seg, mem)?;
         Ok(())
     }
 
@@ -6832,7 +6856,9 @@ mod tests {
         dos.init_program(0x0100, 0x1100, &mut mem).unwrap();
         let image = driver::tests_char_image();
 
-        let staged = dos.stage_sys_driver(&image, "RAM", &mut mem).unwrap();
+        let staged = dos
+            .stage_sys_driver(&image, "RAM", DriverLoadPlacement::Low, &mut mem)
+            .unwrap();
         // Image copied flat to the block; header readable at block:0.
         let base = usize::from(staged.driver_seg) * 16;
         assert_eq!(mem.read_u16(base + 4).unwrap(), 0x8000); // attribute survived copy
@@ -6862,7 +6888,9 @@ mod tests {
         dos.init_program(0x0100, 0x1100, &mut mem).unwrap();
         let image = driver::tests_char_image();
 
-        let staged = dos.stage_sys_driver(&image, "RAM", &mut mem).unwrap();
+        let staged = dos
+            .stage_sys_driver(&image, "RAM", DriverLoadPlacement::Low, &mut mem)
+            .unwrap();
 
         // The block's MCB owner word (header paragraph + 1) is the system PSP, so the
         // resident driver survives an EXEC child's exit sweep.
@@ -6887,7 +6915,7 @@ mod tests {
         let mut image = driver::tests_char_image();
         image.resize(64 * 1024, 0); // 0x1000 paragraphs, more than the free tail
         assert!(matches!(
-            dos.stage_sys_driver(&image, "", &mut mem),
+            dos.stage_sys_driver(&image, "", DriverLoadPlacement::Low, &mut mem),
             Err(DriverStageError::OutOfMemory)
         ));
     }
@@ -6899,10 +6927,124 @@ mod tests {
         dos.init_program(0x0100, 0x1100, &mut mem).unwrap();
         let image = driver::tests_char_image();
         let before = conventional_free_paragraphs(&dos, &mem);
-        let staged = dos.stage_sys_driver(&image, "", &mut mem).unwrap();
+        let staged = dos
+            .stage_sys_driver(&image, "", DriverLoadPlacement::Low, &mut mem)
+            .unwrap();
         assert!(conventional_free_paragraphs(&dos, &mem) < before); // block taken
         dos.abort_sys_driver(&staged, &mut mem).unwrap();
         assert_eq!(conventional_free_paragraphs(&dos, &mem), before); // block returned
+    }
+
+    #[test]
+    fn stage_sys_driver_high_then_low_uses_the_linked_upper_arena() {
+        let (mut kernel, mut mem) = umb_test_kernel();
+        link_umbs(&mut kernel, &mut mem);
+        let image = driver::tests_char_image();
+        let conventional_before = conventional_free_paragraphs(&kernel, &mem);
+
+        let staged = kernel
+            .stage_sys_driver(&image, "", DriverLoadPlacement::HighThenLow, &mut mem)
+            .unwrap();
+
+        assert!(
+            (0xc800..0xf000).contains(&staged.driver_seg),
+            "staged driver should land in the UMB window, got {:#06x}",
+            staged.driver_seg
+        );
+        assert_eq!(
+            conventional_free_paragraphs(&kernel, &mem),
+            conventional_before,
+            "high staging must not consume conventional memory"
+        );
+        let chain = kernel.umb_chain(&mem);
+        let block = chain
+            .iter()
+            .find(|m| m.mcb_seg.wrapping_add(1) == staged.driver_seg)
+            .expect("UMB MCB for staged driver");
+        assert_eq!(block.owner, 0x0100);
+    }
+
+    #[test]
+    fn stage_sys_driver_high_then_low_falls_back_when_upper_memory_is_full() {
+        let (mut kernel, mut mem) = umb_test_kernel();
+        link_umbs(&mut kernel, &mut mem);
+        let drained = kernel.request_umb(0x27fb, &mut mem).unwrap().unwrap();
+        assert!(
+            (0xc800..0xf000).contains(&drained),
+            "drain allocation lands in UMBs"
+        );
+        let image = driver::tests_char_image();
+
+        let staged = kernel
+            .stage_sys_driver(&image, "", DriverLoadPlacement::HighThenLow, &mut mem)
+            .unwrap();
+
+        assert!(
+            (0x0100..0xa000).contains(&staged.driver_seg),
+            "too-small UMB tail should fall back low, got {:#06x}",
+            staged.driver_seg
+        );
+    }
+
+    #[test]
+    fn finalize_sys_driver_trims_a_high_loaded_driver_in_the_upper_arena() {
+        let (mut kernel, mut mem) = umb_test_kernel();
+        link_umbs(&mut kernel, &mut mem);
+        let image = driver::tests_char_image();
+        let conventional_before = conventional_free_paragraphs(&kernel, &mem);
+        let staged = kernel
+            .stage_sys_driver(&image, "", DriverLoadPlacement::HighThenLow, &mut mem)
+            .unwrap();
+
+        mem.write_u16(staged.request_linear + 0x03, 0x0100).unwrap();
+        mem.write_u16(staged.request_linear + 0x0e, 0x0012).unwrap();
+        mem.write_u16(staged.request_linear + 0x10, staged.driver_seg)
+            .unwrap();
+
+        kernel.finalize_sys_driver(&staged, &mut mem).unwrap();
+
+        let chain = kernel.umb_chain(&mem);
+        let resident = chain
+            .iter()
+            .find(|m| m.mcb_seg.wrapping_add(1) == staged.driver_seg)
+            .expect("resident high driver block");
+        assert_eq!(resident.owner, 0x0100);
+        assert_eq!(resident.size, 2, "header-sized resident block kept");
+        assert!(
+            chain
+                .iter()
+                .any(|m| m.owner == 0 && m.mcb_seg > resident.mcb_seg),
+            "trim leaves a reusable upper free tail"
+        );
+        assert_eq!(
+            conventional_free_paragraphs(&kernel, &mem),
+            conventional_before,
+            "high finalize must not touch conventional memory"
+        );
+    }
+
+    #[test]
+    fn abort_sys_driver_frees_a_high_loaded_driver_from_the_upper_arena() {
+        let (mut kernel, mut mem) = umb_test_kernel();
+        link_umbs(&mut kernel, &mut mem);
+        let image = driver::tests_char_image();
+        let conventional_before = conventional_free_paragraphs(&kernel, &mem);
+        let staged = kernel
+            .stage_sys_driver(&image, "", DriverLoadPlacement::HighThenLow, &mut mem)
+            .unwrap();
+
+        kernel.abort_sys_driver(&staged, &mut mem).unwrap();
+
+        let chain = kernel.umb_chain(&mem);
+        assert_eq!(chain.len(), 1, "upper arena coalesced back to one block");
+        assert_eq!(chain[0].mcb_seg, 0xc800);
+        assert_eq!(chain[0].owner, 0);
+        assert_eq!(chain[0].size, 0x27ff);
+        assert_eq!(
+            conventional_free_paragraphs(&kernel, &mem),
+            conventional_before,
+            "high abort must not touch conventional memory"
+        );
     }
 
     fn umb_test_kernel() -> (DosKernel, Memory) {
@@ -13450,7 +13592,9 @@ mod tests {
         let mut image = driver::tests_char_image();
         image[4..6].copy_from_slice(&attributes.to_le_bytes());
         image[10..18].copy_from_slice(name);
-        let staged = dos.stage_sys_driver(&image, "", mem).unwrap();
+        let staged = dos
+            .stage_sys_driver(&image, "", DriverLoadPlacement::Low, mem)
+            .unwrap();
         // Simulate a successful INIT: status DONE, break one paragraph of resident.
         mem.write_u16(staged.request_linear + 0x03, 0x0100).unwrap();
         mem.write_u16(staged.request_linear + 0x0e, 0x0010).unwrap();
