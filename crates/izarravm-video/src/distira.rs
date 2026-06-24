@@ -202,6 +202,7 @@ pub const TEX_R5G6B5: u32 = 0x0a;
 pub const TEX_ARGB1555: u32 = 0x0b;
 pub const TEX_ARGB4444: u32 = 0x0c;
 pub const TEX_A8I8: u32 = 0x0d;
+pub const TEX_APAL88: u32 = 0x0e;
 const CHIP_TREX0: usize = 0x2;
 const CHIP_TREX1: usize = 0x4;
 
@@ -1543,6 +1544,7 @@ impl Distira {
                     | TEX_ARGB1555
                     | TEX_ARGB4444
                     | TEX_A8I8
+                    | TEX_APAL88
             )
         {
             return (r, g, b);
@@ -1573,6 +1575,7 @@ impl Distira {
             TEX_ARGB1555 => self.sample_tmu_argb1555(tmu, s, t),
             TEX_ARGB4444 => self.sample_tmu_argb4444(tmu, s, t),
             TEX_A8I8 => self.sample_tmu_ai88(tmu, s, t),
+            TEX_APAL88 => self.sample_tmu_apal88(tmu, s, t),
             _ => (0, 0, 0),
         }
     }
@@ -1616,6 +1619,12 @@ impl Distira {
 
     fn sample_tmu_apal8(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
         expand_apal8(self.texture_palette[tmu][usize::from(self.sample_tmu_u8(tmu, s, t))])
+    }
+
+    fn sample_tmu_apal88(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
+        let index = (self.sample_tmu_u16(tmu, s, t) & 0xff) as usize;
+        let raw = self.texture_palette[tmu][index];
+        ((raw >> 16) as u8, (raw >> 8) as u8, raw as u8)
     }
 
     fn sample_tmu_argb8332(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
