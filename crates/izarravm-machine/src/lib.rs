@@ -16065,6 +16065,43 @@ mod tests {
         assert!(device_chain_contains(&mut machine, b"CLOCK$  "));
     }
 
+    /// Read one Lotura unit-tester register back through the I/O ports: set the
+    /// index at 0xE4, then read the data at 0xE5 (which post-increments).
+    fn read_unittester_reg(machine: &mut Machine, index: u8) -> u8 {
+        with_bus(machine, |bus| {
+            bus.write_io(0x00e4, BusWidth::Byte, u32::from(index))
+                .unwrap();
+            bus.read_io(0x00e5, BusWidth::Byte).unwrap() as u8
+        })
+    }
+
+    #[test]
+    fn testdev_sys_inits_on_the_cpu_and_links_into_the_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = izarravm_firmware::toka_dos_system_files();
+        izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format)
+            .unwrap();
+        let src =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../c_drive/TESTDEV.SYS");
+        std::fs::copy(&src, dir.path().join("TESTDEV.SYS")).unwrap();
+        std::fs::write(
+            dir.path().join("CONFIG.SYS"),
+            "DEVICE=C:\\TESTDEV.SYS\r\nDOS=HIGH,UMB\r\n",
+        )
+        .unwrap();
+
+        let mut machine = test_machine();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        machine.set_toka_c_root(dir.path().to_path_buf());
+        machine.perform_toka_service(0x10);
+        assert_eq!(machine.toka_service_status, 0);
+
+        // INIT ran on the CPU: the driver poked unit-tester register 0 with 0xD5.
+        assert_eq!(read_unittester_reg(&mut machine, 0), 0xD5);
+        // The chain lists TESTDEV between NUL and the built-in devices.
+        assert!(device_chain_contains(&mut machine, b"TESTDEV "));
+    }
+
     #[test]
     fn toka_dos_boots_through_the_bios_to_the_prompt() {
         let dir = tempfile::tempdir().unwrap();
