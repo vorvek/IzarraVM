@@ -5001,7 +5001,12 @@ impl Machine {
             };
             let staged = {
                 let Machine { dos, memory, .. } = self;
-                match dos.stage_sys_driver(&image, &line.args, memory) {
+                let placement = if line.high {
+                    izarravm_dos::DriverLoadPlacement::HighThenLow
+                } else {
+                    izarravm_dos::DriverLoadPlacement::Low
+                };
+                match dos.stage_sys_driver(&image, &line.args, placement, memory) {
                     Ok(staged) => staged,
                     Err(izarravm_dos::DriverStageError::Load(
                         izarravm_dos::DriverLoadError::UnsupportedFormat,
@@ -7939,7 +7944,15 @@ mod tests {
         attributes: u16,
     ) -> izarravm_dos::FarPtr {
         let image = marker_device_image(name, attributes);
-        let staged = m.dos.stage_sys_driver(&image, "", &mut m.memory).unwrap();
+        let staged = m
+            .dos
+            .stage_sys_driver(
+                &image,
+                "",
+                izarravm_dos::DriverLoadPlacement::Low,
+                &mut m.memory,
+            )
+            .unwrap();
         m.memory
             .write_u16(staged.request_linear + 0x03, 0x0100)
             .unwrap();
@@ -8031,7 +8044,15 @@ mod tests {
         let mut m = test_machine();
         m.dos.init_program(0x0100, 0x1100, &mut m.memory).unwrap();
         let image = marker_device_image_with_status(b"FAILOPEN", 0x8800, 0x8105);
-        let staged = m.dos.stage_sys_driver(&image, "", &mut m.memory).unwrap();
+        let staged = m
+            .dos
+            .stage_sys_driver(
+                &image,
+                "",
+                izarravm_dos::DriverLoadPlacement::Low,
+                &mut m.memory,
+            )
+            .unwrap();
         m.memory
             .write_u16(staged.request_linear + 0x03, 0x0100)
             .unwrap();
@@ -8088,7 +8109,15 @@ mod tests {
         let mut m = test_machine();
         m.dos.init_program(0x0100, 0x1100, &mut m.memory).unwrap();
         let image = marker_device_image_with_failing_close(b"FAILCLOS", 0x8800);
-        let staged = m.dos.stage_sys_driver(&image, "", &mut m.memory).unwrap();
+        let staged = m
+            .dos
+            .stage_sys_driver(
+                &image,
+                "",
+                izarravm_dos::DriverLoadPlacement::Low,
+                &mut m.memory,
+            )
+            .unwrap();
         m.memory
             .write_u16(staged.request_linear + 0x03, 0x0100)
             .unwrap();
@@ -16813,6 +16842,134 @@ mod tests {
         let [lo, hi] = status.to_le_bytes();
         img[0x13..0x1B].copy_from_slice(&[0xB8, lo, hi, 0x26, 0x89, 0x47, 0x03, 0xCB]);
         img
+    }
+
+    #[test]
+    fn config_sys_devicehigh_loads_raw_sys_driver_in_upper_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = inline_sys_image(b"HIGHDEV ", 0x0100);
+
+        let files = izarravm_firmware::toka_dos_system_files();
+        izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format)
+            .unwrap();
+        std::fs::write(dir.path().join("HIGHDEV.SYS"), &img).unwrap();
+        std::fs::write(
+            dir.path().join("CONFIG.SYS"),
+            "DEVICE=C:\\DOS\\HIMEM.SYS /TESTMEM:OFF\r\n\
+             DEVICE=C:\\DOS\\IEMM.EXE RAM\r\n\
+             DOS=HIGH,UMB\r\n\
+             DEVICEHIGH=C:\\HIGHDEV.SYS\r\n",
+        )
+        .unwrap();
+
+        let mut machine = test_machine();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        machine.set_toka_c_root(dir.path().to_path_buf());
+        machine.perform_toka_service(0x10);
+        assert_eq!(machine.toka_service_status, 0);
+
+        let (seg, off) = device_header_for(&mut machine, b"HIGHDEV ").expect("HIGHDEV linked");
+        assert!(
+            (0xc800..0xf000).contains(&seg),
+            "DEVICEHIGH driver loaded outside the UMB pool: {seg:04x}:{off:04x}"
+        );
+        let console = String::from_utf8_lossy(machine.dos_output()).into_owned();
+        assert!(
+            console.contains("DEVICEHIGH=C:\\HIGHDEV.SYS") && console.contains("installed"),
+            "DEVICEHIGH install message; got:\n{console}"
+        );
+    }
+
+    #[test]
+    fn config_sys_device_line_stays_conventional_even_when_umbs_are_linked() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = inline_sys_image(b"LOWDEV  ", 0x0100);
+
+        let files = izarravm_firmware::toka_dos_system_files();
+        izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format)
+            .unwrap();
+        std::fs::write(dir.path().join("LOWDEV.SYS"), &img).unwrap();
+        std::fs::write(
+            dir.path().join("CONFIG.SYS"),
+            "DEVICE=C:\\DOS\\HIMEM.SYS /TESTMEM:OFF\r\n\
+             DEVICE=C:\\DOS\\IEMM.EXE RAM\r\n\
+             DOS=HIGH,UMB\r\n\
+             DEVICE=C:\\LOWDEV.SYS\r\n",
+        )
+        .unwrap();
+
+        let mut machine = test_machine();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        machine.set_toka_c_root(dir.path().to_path_buf());
+        machine.perform_toka_service(0x10);
+        assert_eq!(machine.toka_service_status, 0);
+
+        let (seg, off) = device_header_for(&mut machine, b"LOWDEV  ").expect("LOWDEV linked");
+        assert!(
+            seg < 0xa000,
+            "plain DEVICE= must stay conventional even with UMBs linked: {seg:04x}:{off:04x}"
+        );
+    }
+
+    #[test]
+    fn config_sys_devicehigh_falls_back_low_without_umb_arena() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = inline_sys_image(b"FALLBK  ", 0x0100);
+
+        let files = izarravm_firmware::toka_dos_system_files();
+        izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format)
+            .unwrap();
+        std::fs::write(dir.path().join("FALLBK.SYS"), &img).unwrap();
+        std::fs::write(
+            dir.path().join("CONFIG.SYS"),
+            "DEVICE=C:\\DOS\\HIMEM.SYS /TESTMEM:OFF\r\n\
+             DOS=HIGH,UMB\r\n\
+             DEVICEHIGH=C:\\FALLBK.SYS\r\n",
+        )
+        .unwrap();
+
+        let mut machine = test_machine();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        machine.set_toka_c_root(dir.path().to_path_buf());
+        machine.perform_toka_service(0x10);
+        assert_eq!(machine.toka_service_status, 0);
+
+        let (seg, off) = device_header_for(&mut machine, b"FALLBK  ").expect("FALLBK linked");
+        assert!(
+            seg < 0xa000,
+            "DEVICEHIGH without a UMB arena must fall back low: {seg:04x}:{off:04x}"
+        );
+    }
+
+    #[test]
+    fn config_sys_devicehigh_falls_back_low_when_umb_arena_is_unlinked() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = inline_sys_image(b"UNLINKD ", 0x0100);
+
+        let files = izarravm_firmware::toka_dos_system_files();
+        izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format)
+            .unwrap();
+        std::fs::write(dir.path().join("UNLINKD.SYS"), &img).unwrap();
+        std::fs::write(
+            dir.path().join("CONFIG.SYS"),
+            "DEVICE=C:\\DOS\\HIMEM.SYS /TESTMEM:OFF\r\n\
+             DEVICE=C:\\DOS\\IEMM.EXE RAM\r\n\
+             DOS=HIGH\r\n\
+             DEVICEHIGH=C:\\UNLINKD.SYS\r\n",
+        )
+        .unwrap();
+
+        let mut machine = test_machine();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        machine.set_toka_c_root(dir.path().to_path_buf());
+        machine.perform_toka_service(0x10);
+        assert_eq!(machine.toka_service_status, 0);
+
+        let (seg, off) = device_header_for(&mut machine, b"UNLINKD ").expect("UNLINKD linked");
+        assert!(
+            seg < 0xa000,
+            "DEVICEHIGH with an unlinked UMB arena must fall back low: {seg:04x}:{off:04x}"
+        );
     }
 
     #[test]
