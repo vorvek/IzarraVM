@@ -187,6 +187,45 @@ static void cmd_cat(void)
     }
 }
 
+/* DEV: open the loaded TESTDEV character device by name, write a known string to
+ * it, read it back, and report 0 through the unit-tester when the bytes match (1
+ * on any failure). This proves a loaded .SYS driver's read and write entries
+ * route to it on the real CPU. */
+static void cmd_dev(void)
+{
+    static const char msg[] = "HELLO";
+    char back[8];
+    int handle;
+    int i;
+
+    handle = t_open("TESTDEV", 2); /* read/write */
+    if (handle < 0) {
+        ut_exit(1);
+        return;
+    }
+    if (t_write(handle, msg, 5) != 5) {
+        t_close(handle);
+        ut_exit(1);
+        return;
+    }
+    for (i = 0; i < (int)sizeof back; i++) {
+        back[i] = 0;
+    }
+    if (t_read(handle, back, 5) != 5) {
+        t_close(handle);
+        ut_exit(1);
+        return;
+    }
+    t_close(handle);
+    for (i = 0; i < 5; i++) {
+        if (back[i] != msg[i]) {
+            ut_exit(1);
+            return;
+        }
+    }
+    ut_exit(0);
+}
+
 int main(void)
 {
     char *p = t_cmdtail();
@@ -198,8 +237,10 @@ int main(void)
         cmd_write(rest);
     } else if (eqi(word, "CAT")) {
         cmd_cat();
+    } else if (eqi(word, "DEV")) {
+        cmd_dev();
     } else {
-        t_putln("Usage: TESTS ENV|WRITE|CAT ...");
+        t_putln("Usage: TESTS ENV|WRITE|CAT|DEV ...");
     }
     t_exit(0);
     return 0;
