@@ -8,3 +8,4 @@
 *.tmp
 /c_drive/*
 !/c_drive/TESTS.COM
+!/c_drive/TESTDEV.SYS
