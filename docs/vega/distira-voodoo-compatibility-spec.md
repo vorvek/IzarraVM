@@ -386,6 +386,24 @@ Acceptance: dual-TMU tests pass and Voodoo 2 has its own profile tests.
 
 Acceptance: curated Glide smoke set runs with documented results.
 
+## Development progress
+
+Mark each implementation iteration here when the tested slice is committed and
+pushed. Keep entries tied to guest-visible behavior, not internal refactors.
+
+- [x] Iteration 1: Voodoo register, MMIO, LFB, PCI BAR, and FIFO groundwork.
+      Commit `8693fad`. Validated by Distira video and machine tests plus the
+      workspace gates.
+- [x] Iteration 2: command FIFO aperture for type-1 register packets. Commit
+      `b6cc3d3`. Validated by the machine command FIFO aperture test plus the
+      workspace gates.
+- [x] Iteration 3: command FIFO type-5 framebuffer packets. Commit `7fc4652`.
+      Validated by the machine framebuffer packet test plus the workspace gates.
+- [x] Iteration 4: command FIFO type-5 texture packets. Commit `b6ef44c`.
+      Validated by the video texture packet test plus the workspace gates.
+- [ ] Next: direct Voodoo triangle command registers for a flat untextured
+      triangle through `SST_triangleCMD`.
+
 ## First 90 percent push for this branch
 
 Today should not try to port all of 86Box in one commit. The largest safe slice
