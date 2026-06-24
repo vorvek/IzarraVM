@@ -442,7 +442,9 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
       the workspace gates.
 - [x] Iteration 19: one-TMU bilinear RGB565 texture sampling. Validated by the
       video bilinear texture sample test plus the workspace gates.
-- [ ] Next: mip and LOD selection for RGB565 texture sampling.
+- [x] Iteration 20: mip and LOD selection for RGB565 texture sampling. Validated
+      by the video tLOD-min mip selection test plus the workspace gates.
+- [ ] Next: two-TMU texture combine for RGB565 sampling.
 
 ## First 90 percent push for this branch
 

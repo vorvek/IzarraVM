@@ -148,6 +148,7 @@ pub const SST_FBI_INIT5: usize = 0x244;
 pub const SST_FBI_INIT6: usize = 0x248;
 pub const SST_FBI_INIT7: usize = 0x24c;
 pub const SST_TEXTURE_MODE: usize = 0x300;
+pub const SST_TLOD: usize = 0x304;
 pub const SST_TEX_BASE_ADDR: usize = 0x30c;
 
 pub const LFB_WRITE_FRONT: u32 = 0x0000;
@@ -380,6 +381,7 @@ pub struct Distira {
     h_sync: u32,
     v_sync: u32,
     texture_mode: u32,
+    texture_lod: u32,
     tex_base_addr: u32,
 }
 
@@ -463,6 +465,7 @@ impl Distira {
             h_sync: 0,
             v_sync: 0,
             texture_mode: 0,
+            texture_lod: 0,
             tex_base_addr: 0,
         }
     }
@@ -974,6 +977,7 @@ impl Distira {
             SST_FBI_INIT6 => merge_byte(&mut self.fbi_init[6], byte, value),
             SST_FBI_INIT7 => merge_byte(&mut self.fbi_init[7], byte, value),
             SST_TEXTURE_MODE => merge_byte(&mut self.texture_mode, byte, value),
+            SST_TLOD => merge_byte(&mut self.texture_lod, byte, value),
             SST_TEX_BASE_ADDR => merge_byte(&mut self.tex_base_addr, byte, value),
             DISTIRA_REG_CONTROL => {
                 let mut control = self.control_value();
@@ -1167,6 +1171,7 @@ impl Distira {
             SST_FBI_INIT6 => self.fbi_init[6],
             SST_FBI_INIT7 => self.fbi_init[7] & !0xff,
             SST_TEXTURE_MODE => self.texture_mode,
+            SST_TLOD => self.texture_lod,
             SST_TEX_BASE_ADDR => self.tex_base_addr,
             DISTIRA_REG_STATUS => {
                 if self.display_enabled {
@@ -1424,15 +1429,19 @@ impl Distira {
         {
             return (r, g, b);
         }
+        let lod = self.texture_lod_level();
+        let scale = (1_u32 << lod).max(1) as f32;
+        let s = s / scale;
+        let t = t / scale;
         if self.texture_mode & 0x6 != 0 {
-            return self.bilinear_rgb565(s, t);
+            return self.bilinear_rgb565(s, t, lod);
         }
         let s = s.floor() as i32 & 0xff;
         let t = t.floor() as i32 & 0xff;
-        self.sample_rgb565_texel(s, t)
+        self.sample_rgb565_texel(s, t, lod)
     }
 
-    fn bilinear_rgb565(&self, s: f32, t: f32) -> (u8, u8, u8) {
+    fn bilinear_rgb565(&self, s: f32, t: f32, lod: u32) -> (u8, u8, u8) {
         let base_s = s.floor();
         let base_t = t.floor();
         let frac_s = ((s - base_s) * 16.0).floor().clamp(0.0, 15.0) as u32;
@@ -1440,10 +1449,10 @@ impl Distira {
         let s0 = base_s as i32;
         let t0 = base_t as i32;
         let samples = [
-            self.sample_rgb565_texel(s0, t0),
-            self.sample_rgb565_texel(s0 + 1, t0),
-            self.sample_rgb565_texel(s0, t0 + 1),
-            self.sample_rgb565_texel(s0 + 1, t0 + 1),
+            self.sample_rgb565_texel(s0, t0, lod),
+            self.sample_rgb565_texel(s0 + 1, t0, lod),
+            self.sample_rgb565_texel(s0, t0 + 1, lod),
+            self.sample_rgb565_texel(s0 + 1, t0 + 1, lod),
         ];
         let weights = [
             (16 - frac_s) * (16 - frac_t),
@@ -1468,11 +1477,19 @@ impl Distira {
         )
     }
 
-    fn sample_rgb565_texel(&self, s: i32, t: i32) -> (u8, u8, u8) {
-        let s = s & 0xff;
-        let t = t & 0xff;
-        let texel = (t as usize * 256 + s as usize).saturating_mul(2);
-        let offset = (self.tex_base_addr as usize).saturating_add(texel);
+    fn texture_lod_level(&self) -> u32 {
+        ((self.texture_lod >> 2) & 0xf).min(8)
+    }
+
+    fn sample_rgb565_texel(&self, s: i32, t: i32, lod: u32) -> (u8, u8, u8) {
+        let width = (256_usize >> lod).max(1);
+        let height = (256_usize >> lod).max(1);
+        let s = s as usize & (width - 1);
+        let t = t as usize & (height - 1);
+        let texel = (t * width + s).saturating_mul(2);
+        let offset = (self.tex_base_addr as usize)
+            .saturating_add(rgb565_mip_offset(lod))
+            .saturating_add(texel);
         let Some(bytes) = self.texture.get(offset..offset.saturating_add(2)) else {
             return (0, 0, 0);
         };
@@ -1647,6 +1664,16 @@ fn float_depth_to_fixed(raw: u32) -> u32 {
 
 fn float_texture_coord_to_fixed(raw: u32) -> u32 {
     (f32::from_bits(raw) * 16384.0) as i32 as u32
+}
+
+fn rgb565_mip_offset(lod: u32) -> usize {
+    (0..lod)
+        .map(|level| {
+            let width = (256_usize >> level).max(1);
+            let height = (256_usize >> level).max(1);
+            width * height * 2
+        })
+        .sum()
 }
 
 fn edge(ax: f32, ay: f32, bx: f32, by: f32, px: f32, py: f32) -> f32 {
