@@ -502,7 +502,9 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
       the video LFB-over-texture selection test plus the workspace gates.
 - [x] Iteration 49: texture local color combine behavior. Validated by the
       video color0-local texture combine test plus the workspace gates.
-- [ ] Next: texture color path subtract behavior.
+- [x] Iteration 50: texture color path subtract behavior. Validated by the
+      video color0-local subtract test plus the workspace gates.
+- [ ] Next: texture color path reverse blend behavior.
 
 ## First 90 percent push for this branch
 
