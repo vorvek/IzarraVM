@@ -233,6 +233,7 @@ pub const FBZCP_CCA_MSELECT_SHIFT: u32 = 19;
 pub const FBZCP_CCA_MSELECT_MASK: u32 = 0x7;
 pub const CCA_MSELECT_ALOCAL: u32 = 1;
 pub const CCA_MSELECT_AOTHER: u32 = 2;
+pub const CCA_MSELECT_ALOCAL2: u32 = 3;
 pub const CCA_MSELECT_TEX_ALPHA: u32 = 4;
 pub const FBZCP_CCA_REVERSE_BLEND: u32 = 1 << 22;
 pub const FBZCP_CCA_ADD_SHIFT: u32 = 23;
@@ -1961,6 +1962,7 @@ impl Distira {
         let mselect = (self.fbz_color_path >> FBZCP_CCA_MSELECT_SHIFT) & FBZCP_CCA_MSELECT_MASK;
         if mselect == CCA_MSELECT_ALOCAL
             || mselect == CCA_MSELECT_AOTHER
+            || mselect == CCA_MSELECT_ALOCAL2
             || mselect == CCA_MSELECT_TEX_ALPHA
         {
             let factor = if mselect == CCA_MSELECT_AOTHER {
