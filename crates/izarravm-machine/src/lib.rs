@@ -18251,11 +18251,11 @@ mod tests {
             wordmark > 100,
             "expected the baked-in wordmark in the background, found {wordmark} non-field pixels"
         );
-        // The header text ("Izarra-BIOS v3.01 - 1997" / "Starting your computer...")
-        // renders in the clear left column (x 8..200, y 12..36) via lfb_text; any
-        // non-field pixels there are glyphs, guarding the LFB glyph path on the art.
+        // The version line "Izarra-BIOS v3.01 - 1997" renders top-left (y 12..20)
+        // via lfb_text; any non-field pixels there are glyphs, guarding the LFB
+        // glyph path on the art.
         let mut header = 0;
-        for y in 12..36u32 {
+        for y in 12..20u32 {
             for x in 8..200u32 {
                 if machine.read_physical_u8(MARGO_LFB_BASE + y * 320 + x) != field {
                     header += 1;
@@ -18264,7 +18264,21 @@ mod tests {
         }
         assert!(
             header > 60,
-            "expected the top-left header text, found {header} non-field pixels"
+            "expected the top-left version line, found {header} non-field pixels"
+        );
+        // The DEL/TAB key hints render in the gap above the icon row (y 134..154,
+        // x 8..200), telling the user how to reach setup and the boot menu.
+        let mut hints = 0;
+        for y in 134..154u32 {
+            for x in 8..200u32 {
+                if machine.read_physical_u8(MARGO_LFB_BASE + y * 320 + x) != field {
+                    hints += 1;
+                }
+            }
+        }
+        assert!(
+            hints > 60,
+            "expected the DEL/TAB key hints, found {hints} non-field pixels"
         );
     }
 
