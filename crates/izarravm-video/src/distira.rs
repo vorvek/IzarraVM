@@ -208,6 +208,8 @@ pub const RGB_SELECT_LFB: u32 = 3;
 pub const FBZCP_A_SELECT_SHIFT: u32 = 2;
 pub const FBZCP_A_SELECT_MASK: u32 = 0x3;
 pub const A_SELECT_TEX: u32 = 1;
+pub const FBZCP_CC_LOCALSELECT_COLOR0: u32 = 1 << 4;
+pub const FBZCP_CC_ADD_CLOCAL: u32 = 1 << 14;
 pub const TC_ZERO_OTHER: u32 = 1 << 12;
 pub const TC_SUB_CLOCAL: u32 = 1 << 13;
 pub const TC_MSELECT_SHIFT: u32 = 14;
@@ -1690,53 +1692,78 @@ impl Distira {
     ) -> (u8, u8, u8) {
         let (r, g, b) = source;
         let (s, t) = texture_coords;
-        if self.fbz_color_path & FBZCP_TEXTURE_ENABLED != 0 {
-            match self.fbz_color_path & FBZCP_RGB_SELECT_MASK {
-                RGB_SELECT_COLOR1 => {
-                    return (
-                        (self.color1 >> 16) as u8,
-                        (self.color1 >> 8) as u8,
-                        self.color1 as u8,
-                    );
-                }
-                RGB_SELECT_LFB => return self.read_back_pixel_rgb(position.0, position.1),
-                _ => {}
-            }
+        if self.fbz_color_path & FBZCP_TEXTURE_ENABLED == 0 {
+            return source;
         }
 
-        let format = (self.texture_mode >> 8) & 0xf;
-        if self.fbz_color_path & FBZCP_TEXTURE_ENABLED == 0
-            || !matches!(
-                format,
-                TEX_RGB332
-                    | TEX_Y4I2Q2
-                    | TEX_A8
-                    | TEX_I8
-                    | TEX_AI8
-                    | TEX_PAL8
-                    | TEX_APAL8
-                    | TEX_ARGB8332
-                    | TEX_A8Y4I2Q2
-                    | TEX_R5G6B5
-                    | TEX_ARGB1555
-                    | TEX_ARGB4444
-                    | TEX_A8I8
-                    | TEX_APAL88
+        let selected = match self.fbz_color_path & FBZCP_RGB_SELECT_MASK {
+            RGB_SELECT_COLOR1 => (
+                (self.color1 >> 16) as u8,
+                (self.color1 >> 8) as u8,
+                self.color1 as u8,
+            ),
+            RGB_SELECT_LFB => self.read_back_pixel_rgb(position.0, position.1),
+            _ => {
+                let format = (self.texture_mode >> 8) & 0xf;
+                if !matches!(
+                    format,
+                    TEX_RGB332
+                        | TEX_Y4I2Q2
+                        | TEX_A8
+                        | TEX_I8
+                        | TEX_AI8
+                        | TEX_PAL8
+                        | TEX_APAL8
+                        | TEX_ARGB8332
+                        | TEX_A8Y4I2Q2
+                        | TEX_R5G6B5
+                        | TEX_ARGB1555
+                        | TEX_ARGB4444
+                        | TEX_A8I8
+                        | TEX_APAL88
+                ) {
+                    return (r, g, b);
+                }
+                let tmu0 = self.apply_texture_detail_blend(0, self.sample_tmu_texture(0, s, t));
+                if self.texture_mode & (1 << 18) != 0
+                    && ((self.texture_mode_tmu1 >> 8) & 0xf) == TEX_R5G6B5
+                {
+                    let tmu1 = self.apply_texture_detail_blend(1, self.sample_tmu_texture(1, s, t));
+                    (
+                        tmu0.0.saturating_add(tmu1.0),
+                        tmu0.1.saturating_add(tmu1.1),
+                        tmu0.2.saturating_add(tmu1.2),
+                    )
+                } else {
+                    tmu0
+                }
+            }
+        };
+        self.apply_color_path_local_combine(selected, source)
+    }
+
+    fn apply_color_path_local_combine(
+        &self,
+        color: (u8, u8, u8),
+        source: (u8, u8, u8),
+    ) -> (u8, u8, u8) {
+        if self.fbz_color_path & FBZCP_CC_ADD_CLOCAL == 0 {
+            return color;
+        }
+        let local = if self.fbz_color_path & FBZCP_CC_LOCALSELECT_COLOR0 != 0 {
+            (
+                (self.color0 >> 16) as u8,
+                (self.color0 >> 8) as u8,
+                self.color0 as u8,
             )
-        {
-            return (r, g, b);
-        }
-        let tmu0 = self.apply_texture_detail_blend(0, self.sample_tmu_texture(0, s, t));
-        if self.texture_mode & (1 << 18) != 0 && ((self.texture_mode_tmu1 >> 8) & 0xf) == TEX_R5G6B5
-        {
-            let tmu1 = self.apply_texture_detail_blend(1, self.sample_tmu_texture(1, s, t));
-            return (
-                tmu0.0.saturating_add(tmu1.0),
-                tmu0.1.saturating_add(tmu1.1),
-                tmu0.2.saturating_add(tmu1.2),
-            );
-        }
-        tmu0
+        } else {
+            source
+        };
+        (
+            color.0.saturating_add(local.0),
+            color.1.saturating_add(local.1),
+            color.2.saturating_add(local.2),
+        )
     }
 
     fn apply_texture_detail_blend(&self, tmu: usize, color: (u8, u8, u8)) -> (u8, u8, u8) {
