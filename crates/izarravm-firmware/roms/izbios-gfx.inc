@@ -580,8 +580,10 @@ gfx_post_note:
 
 str_post_name:     db 'Izarra-BIOS v3.01 - 1997', 0
 str_post_starting: db 'Running diagnostics...', 0
-str_post_hint1:    db 'DEL  Configuration menu', 0
-str_post_hint2:    db 'TAB  Select boot device', 0
+; The 0x10 byte is CP437 'BLACK RIGHT-POINTING POINTER' (a filled ► triangle) in
+; the 8x8 font, used as a separator between the key and its action.
+str_post_hint1:    db 'DEL ', 0x10, ' Configuration menu', 0
+str_post_hint2:    db 'TAB ', 0x10, ' Select boot device', 0
 str_post_mem:  db 'Testing memory:  ', 0
 str_post_kb:   db ' KB', 0
 str_post_skip: db 'Memory test skipped', 0
