@@ -73,6 +73,11 @@
 ; free tail of the foundation BIOS_SCRATCH region (BLIT_* ends at 0x052D), so it
 ; does not collide with the Stream D/C scratch areas. Defaults to floppy.
 %define BOOT_CHOICE    (BIOS_SCRATCH + 0x0e)   ; 0x052E
+; First POST hotkey latched from anywhere in diagnostics: 0 none, 1 Del/setup,
+; 2 Tab/boot menu. First one wins.
+%define POST_HOTKEY    (BIOS_SCRATCH + 0x0f)   ; 0x052F
+%define POST_HOTKEY_SETUP 1
+%define POST_HOTKEY_BOOT  2
 
 ; Boot-console layout (mode 13h pixels, 8x8 glyphs). The POST draws a text boot
 ; log: a title row, then one line per step with its name and OK/FAIL/value.

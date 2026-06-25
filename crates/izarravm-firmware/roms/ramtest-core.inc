@@ -38,14 +38,8 @@
 %define RT_EXT_STRIDE       0x100         ; slow: one check per 256 bytes
 %define RT_EXT_STRIDE_FAST  0x00100000    ; fast: one check per 1 MiB
 ; Redraw the count every this many bytes of address progress; redrawing on every
-; dword would swamp the walk. The visible count-up is a separate PIT-paced
-; animation (ramtest_animate_count) so it ticks smoothly regardless of where the
-; walk happens to be; this only bounds the (rare) draws during the walk itself.
+; dword would swamp the walk, but this keeps the screen tied to the actual test.
 %define RT_DRAW_STEP  0x00010000        ; 64 KiB
-; The visible count-up animates over this many PIT-paced frames (~55 ms each, so
-; ~30 frames ~= 1.65 s) under slow POST. Fast POST draws the final number once.
-%define RT_ANIM_FRAMES 30
-
 POST_STEP "memory.ramtest", ramtest_run
 POST_STEP "memory.detected_kib", ramtest_size
 
@@ -148,20 +142,14 @@ ramtest_run:
     add ebx, edx
     jmp .ext
 .ext_done:
-    ; The walk passed. Now show the size as a smooth count-up (slow POST) or a
-    ; single final number (fast POST). EBP still holds the total KiB.
-    call ramtest_animate_count
+    mov ax, bp
+    call gfx_post_mem
+    call gfx_post_mem_ok
     mov al, HRES_PASS
     jmp .done
 
 .skipped:
-    ; Esc fast-forwards: show the full detected size, a full bar, and the note.
-    mov ebx, esi
-    call ramtest_draw
-    push cs
-    pop ds
-    mov si, str_post_skip
-    call gfx_post_note
+    call gfx_post_mem_skipped
     mov al, HRES_PASS
     jmp .done
 
@@ -176,12 +164,15 @@ ramtest_run:
     pop ebx
     ret
 
-; ramtest_draw_maybe: kept for the walk's call site, but the on-screen count is no
-; longer driven off the walk index -- the per-check cost makes the count crawl
-; through low addresses and then jump, which reads as "stuck then done". Instead
-; the walk runs silently and ramtest_animate_count paints a smooth, PIT-paced
-; count-up once the size is known. So this is a no-op (EDI/RT_DRAW_STEP unused).
+; ramtest_draw_maybe: redraw from the real walk index at a bounded cadence so the
+; count shows actual RAM-test progress without repainting on every dword.
 ramtest_draw_maybe:
+    cmp ebx, edi
+    jb .done
+    call ramtest_draw
+    mov edi, ebx
+    add edi, RT_DRAW_STEP
+.done:
     ret
 
 ; ramtest_draw: paint "Testing memory: NNNNN KB" and the bar from the current
@@ -208,36 +199,6 @@ ramtest_draw:
     pop edx
     pop ecx
     pop eax
-    ret
-
-; ramtest_animate_count: paint the detected-size line. EBP = total KiB on entry.
-; Slow POST: tick the count up from ~0 to the total across RT_ANIM_FRAMES frames,
-; pausing ~55 ms (one PIT reload, wall-time paced) per frame so it visibly climbs
-; at any CPU clock. Fast POST: just paint the final number once. The walk's 32-bit
-; index registers are restored from the stack at ramtest_run's exit, so this is
-; free to clobber them; SI (frame) and DI (total KiB <= 16384) survive the
-; gfx_post_mem / chime_pit_wait calls (both preserve 16-bit registers).
-ramtest_animate_count:
-    mov di, bp                     ; DI = total KiB (the low 16 of EBP)
-    in al, PORT_FAST_POST
-    test al, 1
-    jnz .final                     ; fast POST: final number only
-    mov si, 1                      ; SI = frame index 1..RT_ANIM_FRAMES
-.frame:
-    movzx eax, di                  ; EAX = total
-    movzx ecx, si
-    mul ecx                        ; EDX:EAX = total * frame (fits 32 bits)
-    mov ecx, RT_ANIM_FRAMES
-    xor edx, edx
-    div ecx                        ; EAX = KiB to show this frame
-    call gfx_post_mem              ; AX = KiB
-    call chime_pit_wait            ; ~55 ms real-time pause
-    inc si
-    cmp si, RT_ANIM_FRAMES
-    jbe .frame
-.final:
-    mov ax, di                     ; the exact detected total
-    call gfx_post_mem
     ret
 
 ; ramtest_check_dword: write an address-keyed value to [fs:EBX], read it back,
@@ -295,27 +256,53 @@ ramtest_size:
     ret
 
 ; ramtest_esc_pressed: CF=1 if Esc (scancode 0x01) is waiting in the BDA ring,
-; else CF=0. Peeks the ring head without consuming; the keyboard ISR (INT 09h)
-; fills it. Preserves all registers except flags.
+; else CF=0. Drains queued keys so an older non-Esc key cannot hide Esc, but
+; latches POST Tab/Del before discarding them.
+; Preserves all registers except flags.
 ramtest_esc_pressed:
     push ax
     push bx
+    push cx
     push ds
     mov ax, BDA_SEG
     mov ds, ax
+.next:
     mov bx, [KB_BUF_HEAD]
     cmp bx, [KB_BUF_TAIL]
     je .none
     mov ax, [bx]                    ; AH = scancode, AL = ASCII
+    mov cx, bx
+    add cx, 2
+    cmp cx, KB_BUF_START + 32
+    jb .no_wrap
+    mov cx, KB_BUF_START
+.no_wrap:
+    mov [KB_BUF_HEAD], cx
     cmp ah, 0x01                    ; Esc make code
-    jne .none
+    je .skip
+    cmp ah, SETUP_HOTKEY
+    je .setup
+    cmp ah, BOOTMENU_HOTKEY
+    je .boot
+    jmp .none
+.setup:
+    call su_latch_setup_hotkey
+    jmp .none
+.boot:
+    call su_latch_boot_hotkey
+    jmp .none
+.skip:
     pop ds
+    pop cx
     pop bx
     pop ax
     stc
     ret
 .none:
+    cmp bx, [KB_BUF_TAIL]
+    jne .next
     pop ds
+    pop cx
     pop bx
     pop ax
     clc

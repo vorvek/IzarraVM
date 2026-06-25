@@ -119,42 +119,120 @@ setup_maybe_enter:
 ; su_wait_hotkey: peek the keyboard ring for the setup or boot-menu hotkey for a
 ; bounded spin. Returns CF=1 with AL=0 if Del (SETUP_HOTKEY) was seen, or CF=1 with
 ; AL=1 if Tab (BOOTMENU_HOTKEY) was seen; CF=0 if the window elapsed with neither.
-; The hotkey make is consumed from the ring. Any other key seen during the window is
-; consumed and ignored so it does not leak into the boot path. Clobbers AX, CX.
+; The first hotkey make is latched by su_poll_post_hotkeys; any later Del/Tab is
+; consumed but ignored. Other keys are consumed so they do not leak into the boot
+; path. Clobbers AX, CX.
 su_wait_hotkey:
     mov cx, SU_HOTKEY_SPINS
 .spin:
+    call su_take_latched_hotkey
+    jc .done
+    call su_poll_post_hotkeys
+    call su_take_latched_hotkey
+    jc .done
     mov ah, 0x01
     call kb_getkey                  ; peek: CF=1 if empty
     jc .next
-    cmp ah, SETUP_HOTKEY
-    je .hit_setup
-    cmp ah, BOOTMENU_HOTKEY
-    je .hit_boot
-    ; some other key: drain it and keep watching for a hotkey.
-    push cx
     xor ah, ah
-    call kb_getkey
-    pop cx
-    jmp .next
+    call kb_getkey                  ; drain one unrelated key
 .next:
     loop .spin
     clc                             ; window elapsed, no hotkey
     ret
-.hit_setup:
-    xor ah, ah
-    call kb_getkey                  ; drain the Del make from the ring
+.done:
+    ret
+
+; su_poll_post_hotkeys: scan the keyboard ring and latch the first Del/Tab POST
+; action. It does not consume keys; Esc must stay queued for the RAM-test skip.
+; Safe to call from long POST steps: preserves registers and DS.
+su_poll_post_hotkeys:
+    pusha
+    push ds
+    xor ax, ax
+    mov ds, ax
+    cmp byte [POST_HOTKEY], 0
+    jne .done
+    mov ax, BDA_SEG
+    mov ds, ax
+    mov bx, [KB_BUF_HEAD]
+.scan:
+    cmp bx, [KB_BUF_TAIL]
+    je .done
+    mov ax, [bx]                    ; AH = scancode, AL = ASCII
+    cmp ah, SETUP_HOTKEY
+    je .setup
+    cmp ah, BOOTMENU_HOTKEY
+    je .boot
+    add bx, 2
+    cmp bx, KB_BUF_START + 32
+    jb .no_wrap
+    mov bx, KB_BUF_START
+.no_wrap:
+    jmp .scan
+.setup:
+    call su_latch_setup_hotkey
+    jmp .done
+.boot:
+    call su_latch_boot_hotkey
+    jmp .done
+.done:
+    pop ds
+    popa
+    ret
+
+su_latch_setup_hotkey:
+    pusha
+    push ds
+    xor ax, ax
+    mov ds, ax
+    cmp byte [POST_HOTKEY], 0
+    jne .done
+    mov byte [POST_HOTKEY], POST_HOTKEY_SETUP
     mov si, su_str_enter_setup
-    call su_post_note               ; brief feedback on the POST screen
-    xor al, al                      ; AL=0 -> setup page
+    call su_post_note
+.done:
+    pop ds
+    popa
+    ret
+
+su_latch_boot_hotkey:
+    pusha
+    push ds
+    xor ax, ax
+    mov ds, ax
+    cmp byte [POST_HOTKEY], 0
+    jne .done
+    mov byte [POST_HOTKEY], POST_HOTKEY_BOOT
+    mov si, su_str_enter_boot
+    call su_post_note
+.done:
+    pop ds
+    popa
+    ret
+
+; su_take_latched_hotkey: CF=1 with AL=0 for setup, AL=1 for boot; CF=0 if none.
+su_take_latched_hotkey:
+    push bx
+    push ds
+    xor bx, bx
+    mov ds, bx
+    mov bl, [POST_HOTKEY]
+    pop ds
+    cmp bl, POST_HOTKEY_SETUP
+    je .setup
+    cmp bl, POST_HOTKEY_BOOT
+    je .boot
+    pop bx
+    clc
+    ret
+.setup:
+    pop bx
+    xor al, al
     stc
     ret
-.hit_boot:
-    xor ah, ah
-    call kb_getkey                  ; drain the Tab make from the ring
-    mov si, su_str_enter_boot
-    call su_post_note               ; brief feedback on the POST screen
-    mov al, 1                       ; AL=1 -> boot menu
+.boot:
+    pop bx
+    mov al, 1
     stc
     ret
 
@@ -171,7 +249,7 @@ su_post_note:
     ; Wipe the two hint rows on the LFB to the field colour.
     mov di, ART_HDR_X
     mov si, ART_HINT1_Y
-    mov cx, 200
+    mov cx, 230
     mov dx, 20
     mov bl, ART_FIELD_INDEX
     call lfb_fill_rect
@@ -1446,8 +1524,8 @@ su_str_discard:      db 'DISCARD AND EXIT', 0
 su_str_hint:         db 'Up/Dn move  L/R edit  Enter  Esc back', 0
 su_str_deadnote:     db 'Note: dead keys emit base character', 0
 ; POST hotkey feedback (Bug 4). Drawn on the white POST field, so kept short.
-su_str_enter_setup:  db 'Entering setup...', 0
-su_str_enter_boot:   db 'Opening boot menu...', 0
+su_str_enter_setup:  db 'Entering configuration...', 0
+su_str_enter_boot:   db 'Entering boot menu...', 0
 su_str_colon:        db ':', 0
 su_str_slash:        db '/', 0
 

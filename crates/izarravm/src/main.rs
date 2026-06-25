@@ -301,9 +301,8 @@ fn run_izarra_bios(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
         MachineProfile::from_hardware_profile(hardware),
         izarravm_firmware::izarra_bios(),
     )?;
-    // POST is wall-time bound (the RAM sweep, device settle, keyboard window), so
-    // scale the budget with the clock as the boot suite does (clock_hz / 5 ~ 200 ms).
-    let budget = hardware.clock_hz / 5;
+    // The graphical POST blit and RAM sweep need more than the old 200 ms budget.
+    let budget = hardware.clock_hz;
     let stop_reason = machine.run_until_halt_or_cycles(budget)?;
     let results = parse_result_block(machine.memory().as_slice())?;
     for record in &results.records {

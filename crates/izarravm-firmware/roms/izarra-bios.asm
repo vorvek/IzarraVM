@@ -23,6 +23,8 @@ reset:                          ; ROM offset 0; the reset vector far-jumps here
 %include "izbios-kbd.inc"       ; foundation: INT 09h/16h + kb_getkey/kb_flush
 %include "kbd-layouts.inc"      ; foundation: six scancode -> ASCII layout tables
 %include "izbios-result.inc"    ; foundation: POST_STEP macro + result_append
+%include "probes/probe-cpu.inc"      ; STREAM C: GSW-586 CPU (CPUID identity)
+%include "probes/probe-margo.inc"    ; STREAM C: VEGA/Margo video (screen path)
 %include "ramtest-core.inc"          ; STREAM B
 %include "probe-table.inc"           ; STREAM C (shared, reserved)
 %include "probes/probe-lotura.inc"   ; STREAM C
@@ -31,8 +33,6 @@ reset:                          ; ROM offset 0; the reset vector far-jumps here
 %include "probes/probe-serial.inc"   ; STREAM C
 %include "probes/probe-sbdsp.inc"    ; STREAM C
 %include "probes/probe-opl.inc"      ; STREAM C
-%include "probes/probe-margo.inc"    ; STREAM C
-%include "probes/probe-cpu.inc"      ; STREAM C: GSW-586 CPU (CPUID identity)
 %include "probes/probe-floppy.inc"   ; STREAM C: floppy disk controller (FDC MSR)
 %include "probes/probe-hdd.inc"      ; STREAM C: ATA hard disk (primary status)
 %include "probes/probe-optical.inc"  ; STREAM C: ATAPI optical (secondary signature)

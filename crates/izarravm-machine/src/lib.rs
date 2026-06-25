@@ -20722,6 +20722,127 @@ mod tests {
             record.status == izarravm_firmware::SuiteRecordStatus::Pass
                 && record.name == "self.extaccess"
         }));
+        assert!(results.records.iter().any(|record| {
+            record.status == izarravm_firmware::SuiteRecordStatus::Pass
+                && record.name == "component.optical_atapi"
+        }));
+        let cpu = results
+            .records
+            .iter()
+            .position(|record| record.name == "component.cpu_gsw")
+            .unwrap();
+        let memory = results
+            .records
+            .iter()
+            .position(|record| record.name == "memory.ramtest")
+            .unwrap();
+        let video = results
+            .records
+            .iter()
+            .position(|record| record.name == "component.video_margo")
+            .unwrap();
+        assert!(cpu < memory, "CPU POST should run before RAM");
+        assert!(video < memory, "VGA POST should run before RAM");
+    }
+
+    #[test]
+    fn izarra_bios_slow_post_continues_after_ramtest() {
+        let profile = MachineProfile::gsw_386(2, VideoCard::Et4000Ax);
+        let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
+        machine.set_fast_post(false);
+        let mut results = None;
+        for _ in 0..30 {
+            machine.run_until_halt_or_cycles(10_000_000).unwrap();
+            let parsed =
+                izarravm_firmware::parse_result_block(machine.memory().as_slice()).unwrap();
+            let complete = parsed
+                .records
+                .iter()
+                .any(|record| record.name == "component.optical_atapi");
+            results = Some(parsed);
+            if complete {
+                break;
+            }
+        }
+        let results = results.unwrap();
+        assert!(
+            results
+                .records
+                .iter()
+                .any(|record| record.name == "component.optical_atapi"),
+            "{:?}",
+            results.records
+        );
+    }
+
+    #[test]
+    fn izarra_bios_ramtest_esc_skips_and_continues_post() {
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
+        machine.set_fast_post(false);
+        for _ in 0..40 {
+            machine.run_until_halt_or_cycles(1_000_000).unwrap();
+            let results =
+                izarravm_firmware::parse_result_block(machine.memory().as_slice()).unwrap();
+            if results
+                .records
+                .iter()
+                .any(|record| record.name == "component.cpu_gsw")
+            {
+                break;
+            }
+        }
+        machine.inject_key_scancodes(&[0x01]);
+        let reason = machine.run_until_halt_or_cycles(100_000_000).unwrap();
+        assert!(matches!(reason, StopReason::CycleLimit { .. }));
+        let results = izarravm_firmware::parse_result_block(machine.memory().as_slice()).unwrap();
+        assert!(
+            results
+                .records
+                .iter()
+                .any(|record| record.name == "component.cpu_lotura"),
+            "{:?}",
+            results.records
+        );
+    }
+
+    #[test]
+    fn izarra_bios_tab_before_ramtest_wins_over_later_del() {
+        let profile = MachineProfile::gsw_386(2, VideoCard::Et4000Ax);
+        let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
+        machine.set_fast_post(false);
+        for _ in 0..40 {
+            machine.run_until_halt_or_cycles(1_000_000).unwrap();
+            if let Ok(results) = izarravm_firmware::parse_result_block(machine.memory().as_slice())
+            {
+                if results
+                    .records
+                    .iter()
+                    .any(|record| record.name == "video.margo_caps")
+                {
+                    break;
+                }
+            }
+        }
+
+        machine.inject_key_scancodes(&[0x0f, 0x8f, 0x53, 0xd3]); // Tab, then Del.
+
+        let mut red = 0;
+        for _ in 0..40 {
+            machine.run_until_halt_or_cycles(5_000_000).unwrap();
+            red = (64..72u32)
+                .flat_map(|y| (28..130u32).map(move |x| (x, y)))
+                .filter(|&(x, y)| machine.read_physical_u8(MARGO_LFB_BASE + y * 320 + x) == 24)
+                .count();
+            if red > 20 {
+                break;
+            }
+        }
+        assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
+        assert!(
+            red > 20,
+            "Tab should open the boot menu; found {red} red title pixels"
+        );
     }
 
     #[test]
@@ -20897,7 +21018,7 @@ mod tests {
         // QuickDOS-style self-booting disks provide their own DOS personality.
         // After INT 19h boots A:, INT 21h must run through the disk's IVT handler
         // rather than the Toka-DOS HLE. The boot sector installs INT 21h at
-        // 0000:7C1D, calls AH=4Ch, then writes a post-return marker and halts. If
+        // 0000:7C1E, calls AH=4Ch, then writes a post-return marker and halts. If
         // HLE owns the call, AH=4Ch reports StopReason::DosExit before either
         // marker lands.
         let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
@@ -20907,15 +21028,16 @@ mod tests {
         let boot = [
             0x31, 0xC0, // xor ax, ax
             0x8E, 0xD8, // mov ds, ax
-            0xC7, 0x06, 0x84, 0x00, 0x1D, 0x7C, // mov word [0084h], 7C1Dh
+            0xC7, 0x06, 0x84, 0x00, 0x1E, 0x7C, // mov word [0084h], 7C1Eh
             0xC7, 0x06, 0x86, 0x00, 0x00, 0x00, // mov word [0086h], 0000h
             0xB8, 0x2A, 0x4C, // mov ax, 4C2Ah
             0xCD, 0x21, // int 21h
             0xBB, 0x01, 0x05, // mov bx, 0501h
             0xB0, 0x7E, // mov al, 7Eh
             0x88, 0x07, // mov [bx], al
+            0xFA, // cli
             0xF4, // hlt
-            // INT 21h handler at 0000:7C1D.
+            // INT 21h handler at 0000:7C1E.
             0xBB, 0x00, 0x05, // mov bx, 0500h
             0xB0, 0x21, // mov al, 21h
             0x88, 0x07, // mov [bx], al

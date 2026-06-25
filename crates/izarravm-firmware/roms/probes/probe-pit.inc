@@ -35,8 +35,21 @@ probe_pit:
     and al, 0x30                  ; isolate the access field (bits 5:4)
     cmp al, 0x30                  ; LSB-then-MSB -> 11b
     jne .fail
+    call probe_pit_restore_timer
     mov al, HRES_PASS
     ret
 .fail:
+    call probe_pit_restore_timer
     mov al, HRES_FAIL
+    ret
+
+; The POST sequencer paces the visible icon reveal through channel 0 after every
+; probe. Restore the standard 18.2 Hz mode before returning so this probe cannot
+; strand the sequencer with a half-programmed counter.
+probe_pit_restore_timer:
+    mov al, 0x34                  ; counter 0, lobyte/hibyte, mode 2
+    out PORT_PIT_CTRL, al
+    xor al, al                    ; reload 0 -> 65536
+    out PORT_PIT_CH0, al
+    out PORT_PIT_CH0, al
     ret

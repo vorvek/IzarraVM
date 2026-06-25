@@ -142,7 +142,7 @@ fn setup_save_then_setup_draws_mode13h() {
         F10_MAKE,
         F10_BREAK, // Save
     ]);
-    machine.run_until_halt_or_cycles(20_000_000).unwrap();
+    machine.run_until_halt_or_cycles(30_000_000).unwrap();
     // Save switched the live mode to 486 (66 MHz), so a full mode-13h frame takes
     // more CPU clocks to scan than at the 386 boot clock. Advance generously so the
     // raster engine completes at least one frame before the snapshot.

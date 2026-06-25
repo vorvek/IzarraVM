@@ -42,6 +42,7 @@ bios_start:
     xor al, al
 .order_ok:
     mov [BOOT_CHOICE], al
+    mov byte [POST_HOTKEY], 0
 
     ; Install the interrupt vectors (CS = ROM_SEG for every entry):
     ;   INT 08h -> int08   timer tick (IRQ0), maintains the BDA tick count
@@ -175,7 +176,6 @@ run_post:
     out PORT_PIT_CH0, al
     call console_init           ; paint the graphical POST screen
     call com1_init              ; bring up COM1 and write the POST log header
-    call com1_init              ; bring up COM1 and write the POST log header
     mov al, RESULT_BEGIN
     mov si, str_suite_name
     call result_append          ; BEGIN suite.izarra
@@ -211,11 +211,13 @@ run_post:
 ; Preserves all registers (the sequencer reuses AL/SI after this call).
 post_step_pace:
     push ax
+    call su_poll_post_hotkeys
     in al, PORT_FAST_POST
     test al, 1
     jnz .done                   ; fast POST: no cosmetic delay
     call chime_pit_wait
     call chime_pit_wait
+    call su_poll_post_hotkeys
 .done:
     pop ax
     ret

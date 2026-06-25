@@ -516,18 +516,11 @@ gfx_bar_fill:
     ret
 
 ; gfx_post_mem: draw the "Testing memory: NNNNN KB" line with KiB value in AX.
-; The count-up calls this each step with a rising value; it overwrites the prior
-; number by repainting the whole line on the white field.
+; lfb_text paints glyph backgrounds, and the number is fixed-width, so this
+; redraws in place without clearing the whole strip first.
 gfx_post_mem:
     pusha
     push ax                         ; save the KiB value
-    ; Repaint the line's background with the field colour to erase the prior number.
-    mov di, ART_HDR_X
-    mov si, ART_MEM_Y
-    mov cx, 256
-    mov dx, 8
-    mov bl, ART_FIELD_INDEX
-    call lfb_fill_rect
     ; Label.
     push cs
     pop ds
@@ -548,12 +541,50 @@ gfx_post_mem:
     push cs
     pop ds
     mov si, str_post_kb
-    mov di, ART_HDR_X + 23 * 8
+    mov di, ART_HDR_X + 22 * 8
     mov ax, ART_MEM_Y
     mov bl, ART_INK_INDEX
     mov bh, ART_FIELD_INDEX
     call lfb_text
     popa
+    ret
+
+; gfx_post_mem_ok: replace the count field with green OK.
+gfx_post_mem_ok:
+    pusha
+    mov si, str_post_ok
+    mov bl, COLOR_PASS
+    call gfx_post_mem_status
+    popa
+    ret
+
+; gfx_post_mem_skipped: replace the count field with SKIPPED.
+gfx_post_mem_skipped:
+    pusha
+    mov si, str_post_skip
+    mov bl, ART_INK_INDEX
+    call gfx_post_mem_status
+    popa
+    ret
+
+; gfx_post_mem_status: clear the value area and draw CS:SI there. BL = fg.
+gfx_post_mem_status:
+    push si
+    push bx
+    mov di, ART_HDR_X + 17 * 8
+    mov si, ART_MEM_Y
+    mov cx, 80
+    mov dx, 8
+    mov bl, ART_FIELD_INDEX
+    call lfb_fill_rect
+    pop bx
+    pop si
+    push cs
+    pop ds
+    mov di, ART_HDR_X + 17 * 8
+    mov ax, ART_MEM_Y
+    mov bh, ART_FIELD_INDEX
+    call lfb_text
     ret
 
 ; gfx_post_note: draw a one-line black status note at the memory-line row,
@@ -585,8 +616,9 @@ str_post_starting: db 'Running diagnostics...', 0
 str_post_hint1:    db 'DEL ', 0x10, ' Configuration menu', 0
 str_post_hint2:    db 'TAB ', 0x10, ' Select boot device', 0
 str_post_mem:  db 'Testing memory:  ', 0
-str_post_kb:   db ' KB', 0
-str_post_skip: db 'Memory test skipped', 0
+str_post_kb:   db 'KB', 0
+str_post_ok:   db 'OK', 0
+str_post_skip: db 'SKIPPED', 0
 
 ; --- 8x8 CP437 font (256 glyphs, 8 bytes each) copied from VGAFONT_8X8. ------
 bios_font:
