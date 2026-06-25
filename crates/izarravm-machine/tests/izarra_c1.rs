@@ -22,7 +22,7 @@ fn run_post() -> izarravm_firmware::SuiteResults {
     // streams leave the boot tail doing; either way the result block is complete,
     // so we only require that the call returns without surfacing a machine error.
     machine
-        .run_until_halt_or_cycles(5_000_000)
+        .run_until_halt_or_cycles(20_000_000)
         .expect("the BIOS runs without a machine error");
 
     parse_result_block(machine.memory().as_slice()).expect("POST writes a valid VDTS result block")

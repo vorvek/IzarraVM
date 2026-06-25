@@ -15,7 +15,9 @@ fn full_post_block_is_consistent_and_every_component_passes() {
         izarra_bios(),
     )
     .unwrap();
-    let stop = machine.run_until_halt_or_cycles(5_000_000).unwrap();
+    // The full-screen RLE POST background delays the step loop to ~10M cycles, so
+    // give POST room to append every record before sampling the block.
+    let stop = machine.run_until_halt_or_cycles(20_000_000).unwrap();
     assert!(
         matches!(stop, StopReason::CycleLimit { .. }),
         "POST completes and the BIOS idles (it does not halt)"

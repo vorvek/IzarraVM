@@ -59,7 +59,7 @@ fn tab_opens_the_boot_menu_in_mode13h() {
     // but never slot 0x07, so the grey frame proves the menu painted on top of POST.
     let mut machine = boot_machine();
     machine.inject_key_scancodes(&[TAB_MAKE, TAB_BREAK]);
-    machine.run_until_halt_or_cycles(12_000_000).unwrap();
+    machine.run_until_halt_or_cycles(20_000_000).unwrap();
 
     assert_eq!(
         machine.video().active_mode(),
@@ -85,7 +85,7 @@ fn mouse_hover_moves_focus_to_the_speed_pane() {
     let mut machine = boot_machine();
     machine.inject_key_scancodes(&[TAB_MAKE, TAB_BREAK]);
     // Let the menu open and enable the mouse.
-    machine.run_until_halt_or_cycles(12_000_000).unwrap();
+    machine.run_until_halt_or_cycles(20_000_000).unwrap();
     assert_eq!(machine.video().active_mode(), VideoMode::Mode13h);
     // The menu seeds focus on the device pane (BMX_FOCUS_PANE at seg0 0x0900 = 0).
     assert_eq!(
@@ -122,7 +122,7 @@ fn mouse_click_marks_a_speed_row() {
     // a different row is an observable change.
     let mut machine = boot_machine();
     machine.inject_key_scancodes(&[TAB_MAKE, TAB_BREAK]);
-    machine.run_until_halt_or_cycles(12_000_000).unwrap();
+    machine.run_until_halt_or_cycles(20_000_000).unwrap();
     let seeded_spd = machine.read_physical_u8(0x0903);
     // Move onto the right pane around y=66 (the Slow row, hit y 60..75), button up.
     for _ in 0..6 {
@@ -376,7 +376,7 @@ fn tab_navigates_to_hard_disk_and_reports_unavailable() {
         ESC_MAKE,
         ESC_BREAK, // cancel the menu
     ]);
-    machine.run_until_halt_or_cycles(12_000_000).unwrap();
+    machine.run_until_halt_or_cycles(20_000_000).unwrap();
     // Esc on the menu falls through to boot_entry with the floppy default and no
     // media mounted, so the read fails and the BIOS idles. The card stays in the
     // mode-13h POST/menu field; the key point is no fault occurred.

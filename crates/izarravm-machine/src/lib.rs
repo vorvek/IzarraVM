@@ -7706,8 +7706,11 @@ mod tests {
             izarravm_firmware::izarra_bios(),
         )
         .unwrap();
-        for _ in 0..80 {
-            let _ = machine.run_until_halt_or_cycles(50_000).unwrap();
+        // The full-screen RLE background blit writes 76800 LFB bytes through the
+        // unreal FS, so the screen comes up at ~10M cycles (still ~40 ms at the
+        // machine clock); give the boot loop headroom past that.
+        for _ in 0..40 {
+            let _ = machine.run_until_halt_or_cycles(500_000).unwrap();
             if machine.active_display() == ActiveDisplay::MargoLfb {
                 break;
             }
@@ -7722,6 +7725,36 @@ mod tests {
         assert!(
             words.iter().any(|&p| p != words[0]),
             "screen is a single flat color - nothing was drawn"
+        );
+    }
+
+    #[test]
+    fn izarra_bios_lfb_carries_rle_background() {
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .unwrap();
+        for _ in 0..40 {
+            let _ = machine.run_until_halt_or_cycles(500_000).unwrap();
+            if machine.active_display() == ActiveDisplay::MargoLfb {
+                break;
+            }
+        }
+        assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
+        // A top-left pixel is the cream field; the icon-strip row (y 175) carries
+        // the baked-in grey icons, so it is not a single flat colour.
+        let field = machine.read_physical_u8(MARGO_LFB_BASE + 4 * 320 + 4);
+        let mut varied = false;
+        for x in (0..320u32).step_by(7) {
+            if machine.read_physical_u8(MARGO_LFB_BASE + 175 * 320 + x) != field {
+                varied = true;
+                break;
+            }
+        }
+        assert!(
+            varied,
+            "icon-strip row is flat — RLE background did not blit"
         );
     }
 
@@ -17687,8 +17720,10 @@ mod tests {
         machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
         machine.set_toka_c_root(dir.path().to_path_buf());
         // POST, disk boot, TOKABOOT, ICOMMAND, then AUTOEXEC runs TESTS DEV, which
-        // exits through the unit-tester as soon as the round-trip matches.
-        let reason = machine.run_until_halt_or_cycles(12_000_000).unwrap();
+        // exits through the unit-tester as soon as the round-trip matches. The
+        // full-screen RLE POST background adds ~10M cycles before the disk boot, so
+        // the budget covers the heavier POST plus the boot/DOS/driver round-trip.
+        let reason = machine.run_until_halt_or_cycles(30_000_000).unwrap();
         assert_eq!(
             reason,
             StopReason::TestExit { code: 0 },
@@ -18160,7 +18195,9 @@ mod tests {
     fn izarra_bios_post_publishes_result_block() {
         let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
-        let reason = machine.run_until_halt_or_cycles(5_000_000).unwrap();
+        // The full-screen RLE background blit delays the POST step loop to ~10M
+        // cycles, so the result block fills out later than the old mode-13h screen.
+        let reason = machine.run_until_halt_or_cycles(20_000_000).unwrap();
         // POST completes and the BIOS idles (it keeps running, not halting).
         assert!(matches!(reason, StopReason::CycleLimit { .. }));
         let results = izarravm_firmware::parse_result_block(machine.memory().as_slice()).unwrap();
@@ -18188,62 +18225,70 @@ mod tests {
     }
 
     #[test]
-    fn izarra_bios_draws_graceful_post_screen() {
-        // The graceful screen is a white field (index GFX_WHITE = 0) with the red
-        // "Izarra 3000" wordmark (index GFX_RED = 4) across the top and a red
-        // progress-bar frame lower down. It is now drawn in the proprietary Margo
-        // LFB mode 0x150 (320x240x8, no double scan), so pixels are read as raw
-        // palette indices straight from the LFB VRAM at MARGO_LFB_BASE + y*320 + x.
-        // The LFB drawing primitives are heavier than the old rep-stosw mode 13h
-        // path, so POST needs a larger cycle budget than the original 5M.
+    fn izarra_bios_draws_art_post_screen() {
+        // The POST screen is the RLE art (izbios-art.inc): a cream field with the
+        // wordmark, mascot and grey component icons baked into the background, plus
+        // the top-left header text drawn over it by lfb_text. Pixels are read as raw
+        // palette indices from the LFB VRAM at MARGO_LFB_BASE + y*320 + x. The
+        // full-screen RLE blit is heavy, so POST needs a large cycle budget.
         let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
-        machine.run_until_halt_or_cycles(12_000_000).unwrap();
+        machine.run_until_halt_or_cycles(20_000_000).unwrap();
         assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
-        // A clear spot (no logo, no text, no bar) is the white field, index 0.
-        assert_eq!(
-            machine.read_physical_u8(MARGO_LFB_BASE + 64 * 320 + 12),
-            0,
-            "the background field is white (index 0)"
-        );
-        // The red wordmark sits at logical y 8..29, x 62..257 (no double scan now).
-        let mut logo_pixels = 0;
-        for y in 8..29u32 {
-            for x in 62..257u32 {
-                if machine.read_physical_u8(MARGO_LFB_BASE + y * 320 + x) == 0x04 {
-                    logo_pixels += 1;
+        // A clear top-left spot is the cream field; the screen is not monochrome.
+        let field = machine.read_physical_u8(MARGO_LFB_BASE + 4 * 320 + 4);
+        // The wordmark sits top-right in the art (x 213..303, y 11..60): non-field
+        // pixels there prove the background RLE blitted, not just a flat clear.
+        let mut wordmark = 0;
+        for y in 11..60u32 {
+            for x in 213..303u32 {
+                if machine.read_physical_u8(MARGO_LFB_BASE + y * 320 + x) != field {
+                    wordmark += 1;
                 }
             }
         }
         assert!(
-            logo_pixels > 100,
-            "expected the red Izarra 3000 wordmark, found {logo_pixels} red pixels"
+            wordmark > 100,
+            "expected the baked-in wordmark in the background, found {wordmark} non-field pixels"
         );
-        // The black title text (index GFX_BLACK = 1) renders at logical y 40..48,
-        // x 32.. via lfb_text/lfb_glyph. Counting black pixels there guards the
-        // glyph path (a glyph register bug would leave the title blank/garbled).
-        let mut title_pixels = 0;
-        for y in 40..48u32 {
-            for x in 32..224u32 {
-                if machine.read_physical_u8(MARGO_LFB_BASE + y * 320 + x) == 0x01 {
-                    title_pixels += 1;
+        // The header text ("Izarra-BIOS v3.01 - 1997" / "Starting your computer...")
+        // renders in the clear left column (x 8..200, y 12..36) via lfb_text; any
+        // non-field pixels there are glyphs, guarding the LFB glyph path on the art.
+        let mut header = 0;
+        for y in 12..36u32 {
+            for x in 8..200u32 {
+                if machine.read_physical_u8(MARGO_LFB_BASE + y * 320 + x) != field {
+                    header += 1;
                 }
             }
         }
         assert!(
-            title_pixels > 40,
-            "expected the black title text, found {title_pixels} black pixels"
+            header > 60,
+            "expected the top-left header text, found {header} non-field pixels"
         );
-        // The progress-bar frame top edge is red at logical y 128, x 32..288.
-        let mut bar_pixels = 0;
-        for x in 32..288u32 {
-            if machine.read_physical_u8(MARGO_LFB_BASE + 128 * 320 + x) == 0x04 {
-                bar_pixels += 1;
-            }
-        }
+    }
+
+    #[test]
+    fn izarra_bios_post_lights_component_icons() {
+        // As each wired probe passes, console_step_line blits the colour icon sprite
+        // over its grey background icon. The VEGA monitor sprite (cell x 42..66,
+        // y 166..192) carries saturated colour bars once lit, whereas the grey icon
+        // is near-monochrome. A saturated pixel in the cell after a full POST sweep
+        // proves component.video_margo passed and the grey->colour reveal fired.
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
+        machine.run_until_halt_or_cycles(20_000_000).unwrap();
+        assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
+        let (words, _w, _h) = machine.frame_argb();
+        let saturated = |x: u32, y: u32| {
+            let p = words[(y * 320 + x) as usize];
+            let (r, g, b) = ((p >> 16) & 0xff, (p >> 8) & 0xff, p & 0xff);
+            r.max(g).max(b).saturating_sub(r.min(g).min(b)) > 60
+        };
+        let lit = (42..66u32).any(|x| (166..192u32).any(|y| saturated(x, y)));
         assert!(
-            bar_pixels > 50,
-            "expected the red progress-bar frame, found {bar_pixels} red pixels"
+            lit,
+            "VEGA icon cell never lit to colour — the reveal did not fire"
         );
     }
 
@@ -18288,7 +18333,8 @@ mod tests {
         // foundation reference step, proving the mirror is live.
         let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
-        machine.run_until_halt_or_cycles(5_000_000).unwrap();
+        // The RLE background blit delays com1_init/the step loop to ~10M cycles.
+        machine.run_until_halt_or_cycles(20_000_000).unwrap();
         let serial = machine.serial_text();
         assert!(
             serial.contains("Izarra 3000 POST"),
@@ -18459,7 +18505,9 @@ mod tests {
         machine.inject_key_scancodes(&[0x53, 0xd3]);
         // Run past POST. The window consumes Del and enters the menu, which then
         // blocks on a keyboard read, so the rest of the budget just spins there.
-        machine.run_until_halt_or_cycles(5_000_000).unwrap();
+        // The full-screen RLE POST background pushes the hotkey window to ~15M
+        // cycles, so this budget must clear it.
+        machine.run_until_halt_or_cycles(20_000_000).unwrap();
 
         // Down moves the highlight from Time (row 0) to Keyboard (row 1).
         machine.inject_key_scancodes(&[0x50, 0xd0]); // Down
@@ -18503,12 +18551,12 @@ mod tests {
         let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
 
         machine.inject_key_scancodes(&[0x0f, 0x8f]); // Tab opens the boot menu.
-        // POST now paints the graceful screen via the per-pixel LFB primitives,
-        // heavier than the old rep-stosw mode 13h path, so reaching the boot menu
-        // takes more cycles than the original 5M budget. The boot menu itself still
-        // renders in mode 13h (it calls set_mode13h on entry), so the marker reads
-        // below via render_256color_row remain valid.
-        machine.run_until_halt_or_cycles(12_000_000).unwrap();
+        // POST paints the full-screen RLE art via the per-pixel LFB primitives,
+        // heavier than the old rep-stosw mode 13h path, so reaching the boot-menu
+        // hotkey window (~15M cycles) needs more than the original budget. The boot
+        // menu itself still renders in mode 13h (it calls set_mode13h on entry), so
+        // the marker reads below via render_256color_row remain valid.
+        machine.run_until_halt_or_cycles(20_000_000).unwrap();
         assert!(
             marker_pixels(&machine, 80).contains(&1),
             "the initial 386 row has a black diamond"
