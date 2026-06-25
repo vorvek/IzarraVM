@@ -15,7 +15,13 @@ fn full_post_block_is_consistent_and_every_component_passes() {
         izarra_bios(),
     )
     .unwrap();
-    let stop = machine.run_until_halt_or_cycles(5_000_000).unwrap();
+    // Mount a real ATA disk so the HDD probe (component.disk_hdd) finds a device:
+    // this is the fully-equipped machine where every component is present and must
+    // PASS. (On a bare machine C: is HLE-backed, so the HDD probe FAILs by design.)
+    machine.mount_hdd(vec![0u8; 64 * 512]);
+    // The full-screen RLE POST background delays the step loop to ~10M cycles, so
+    // give POST room to append every record before sampling the block.
+    let stop = machine.run_until_halt_or_cycles(20_000_000).unwrap();
     assert!(
         matches!(stop, StopReason::CycleLimit { .. }),
         "POST completes and the BIOS idles (it does not halt)"
@@ -58,6 +64,10 @@ fn full_post_block_is_consistent_and_every_component_passes() {
         "component.audio_opl",
         "component.video_margo",
         "video.margo_caps",
+        "component.cpu_gsw",
+        "component.floppy_fdc",
+        "component.disk_hdd",
+        "component.optical_atapi",
     ] {
         assert!(names.contains(&expected), "missing record {expected}");
     }

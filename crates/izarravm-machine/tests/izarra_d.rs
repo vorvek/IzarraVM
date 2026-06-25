@@ -46,7 +46,7 @@ fn setup_skipped_without_hotkey_boots_and_idles() {
     // The setup window peeks, sees no Del, and the BIOS boots straight to its idle
     // loop, which keeps running, so the run reaches the cycle budget.
     machine.inject_key_scancodes(&[A_MAKE, A_BREAK]);
-    let reason = machine.run_until_halt_or_cycles(12_000_000).unwrap();
+    let reason = machine.run_until_halt_or_cycles(20_000_000).unwrap();
     assert!(
         matches!(reason, StopReason::CycleLimit { .. }),
         "BIOS boots and idles"
@@ -80,7 +80,10 @@ fn setup_save_applies_chosen_gsw_mode() {
         F10_MAKE,
         F10_BREAK, // Save
     ]);
-    let reason = machine.run_until_halt_or_cycles(12_000_000).unwrap();
+    // This test queues all six keys up front and processes them in one run, so the
+    // budget must cover the full POST (~15M with the RLE art) plus the setup menu
+    // walking and saving each queued key after it.
+    let reason = machine.run_until_halt_or_cycles(30_000_000).unwrap();
     assert!(
         matches!(reason, StopReason::CycleLimit { .. }),
         "setup saves then boots and idles"
@@ -109,7 +112,7 @@ fn setup_discard_keeps_boot_mode() {
         ESC_MAKE,
         ESC_BREAK, // Discard
     ]);
-    let reason = machine.run_until_halt_or_cycles(12_000_000).unwrap();
+    let reason = machine.run_until_halt_or_cycles(20_000_000).unwrap();
     assert!(
         matches!(reason, StopReason::CycleLimit { .. }),
         "discard still boots and idles"
@@ -139,7 +142,7 @@ fn setup_save_then_setup_draws_mode13h() {
         F10_MAKE,
         F10_BREAK, // Save
     ]);
-    machine.run_until_halt_or_cycles(12_000_000).unwrap();
+    machine.run_until_halt_or_cycles(20_000_000).unwrap();
     // Save switched the live mode to 486 (66 MHz), so a full mode-13h frame takes
     // more CPU clocks to scan than at the 386 boot clock. Advance generously so the
     // raster engine completes at least one frame before the snapshot.
@@ -185,7 +188,7 @@ fn setup_sub_pages_open_and_return() {
         ESC_MAKE,
         ESC_BREAK, // Esc on the menu discards and exits
     ]);
-    let reason = machine.run_until_halt_or_cycles(12_000_000).unwrap();
+    let reason = machine.run_until_halt_or_cycles(20_000_000).unwrap();
     assert!(
         matches!(reason, StopReason::CycleLimit { .. }),
         "the sub-pages open and return without fault"

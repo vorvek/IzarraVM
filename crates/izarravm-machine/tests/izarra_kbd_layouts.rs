@@ -50,7 +50,7 @@ fn translate_sequence(layout: u8, scancodes: &[u8]) -> u8 {
     // The bring-up caches CMOS 0x10 into the BDA, so set the layout before any run.
     machine.set_cmos_byte(CMOS_LAYOUT, layout);
     // Run past POST and the setup-hotkey window to the idle loop.
-    machine.run_until_halt_or_cycles(12_000_000).unwrap();
+    machine.run_until_halt_or_cycles(20_000_000).unwrap();
     // Inject the key and let IRQ1 -> INT 09h translate and enqueue it.
     machine.inject_key_scancodes(scancodes);
     machine.run_until_halt_or_cycles(2_000_000).unwrap();

@@ -14,7 +14,7 @@ fn ramtest_result(memory_mib: u16) -> (SuiteRecordStatus, u32) {
         izarra_bios(),
     )
     .unwrap();
-    let stop = machine.run_until_halt_or_cycles(5_000_000).unwrap();
+    let stop = machine.run_until_halt_or_cycles(20_000_000).unwrap();
     assert!(
         matches!(stop, StopReason::CycleLimit { .. }),
         "POST completes and the BIOS idles (it does not halt)"
@@ -66,7 +66,7 @@ fn ramtest_caps_the_int12h_word_at_640_kib() {
         izarra_bios(),
     )
     .unwrap();
-    machine.run_until_halt_or_cycles(5_000_000).unwrap();
+    machine.run_until_halt_or_cycles(20_000_000).unwrap();
     let memory = machine.memory().as_slice();
     let word = u16::from_le_bytes([memory[0x413], memory[0x414]]);
     assert_eq!(word, 640);

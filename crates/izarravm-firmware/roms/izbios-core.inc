@@ -164,8 +164,17 @@ irq_stub_slave:
 ; dw name_ptr, dw handler_ptr. Append a BEGIN suite record, then for each step
 ; call the handler (DS = BDA on entry) and append its result by name.
 run_post:
-    call play_chime             ; power-on rising arpeggio (delay skipped under fast POST)
-    call console_init           ; mode 13h boot console + title (the main window)
+    ; No power-on chime: Toka-DOS will own the startup sound (future work). The
+    ; chime used to program PIT channel 0 for the POST's real-time pacing, so do it
+    ; here instead: mode 2, reload 0 = 65536 = ~18.2 Hz, the standard timer tick that
+    ; post_step_pace and the RAM count-up poll (and that IRQ0/INT 08h runs on).
+    mov al, 0x34
+    out PORT_PIT_CTRL, al
+    xor al, al
+    out PORT_PIT_CH0, al
+    out PORT_PIT_CH0, al
+    call console_init           ; paint the graphical POST screen
+    call com1_init              ; bring up COM1 and write the POST log header
     call com1_init              ; bring up COM1 and write the POST log header
     mov al, RESULT_BEGIN
     mov si, str_suite_name
@@ -184,7 +193,8 @@ run_post:
     xor cx, cx
     mov ds, cx                  ; DS = 0 for result_append
     pop si                      ; name pointer
-    call console_step_line      ; draw the boot-log line (status AL, value DX)
+    call console_step_line      ; light this component's icon grey->colour on PASS
+    call post_step_pace         ; brief real-time pause so the reveal is visible
     call com1_log_step          ; mirror the line to COM1 (status AL, name SI)
     inc al                      ; map HRES_* (0/1/2) -> RESULT_* (1/2/3)
     call result_append
@@ -194,20 +204,33 @@ run_post:
 .done:
     ret
 
-; --- Boot / halt tail. The boot console is already on screen from run_post, so
-; append a final ready line at the next row rather than clearing it. --
+; post_step_pace: under slow POST, pause ~110 ms (two PIT reloads) after a step so
+; each component's icon lights visibly in sequence rather than all at once in a
+; single frame. Skipped under fast POST (headless/tests). chime_pit_wait is
+; wall-time paced (PIT channel 0), so the cadence is the same at any CPU clock.
+; Preserves all registers (the sequencer reuses AL/SI after this call).
+post_step_pace:
+    push ax
+    in al, PORT_FAST_POST
+    test al, 1
+    jnz .done                   ; fast POST: no cosmetic delay
+    call chime_pit_wait
+    call chime_pit_wait
+.done:
+    pop ax
+    ret
+
+; --- Boot / halt tail. The graphical POST screen is already on the LFB from
+; run_post, so draw the handoff line on it (lfb_text), then hand to INT 19h. --
 enter_setup_or_boot:
-    xor ax, ax
-    mov ds, ax
-    mov ax, [CONSOLE_ROW_Y]     ; next free console row
-    add ax, STATUS_LINE_DY      ; leave one blank line above the message
-    mov di, STATUS_X
     push cs
     pop ds                      ; DS = CS so DS:SI reaches the ROM string
-    mov si, str_ready
-    mov bl, GFX_BLACK
-    mov bh, GFX_WHITE
-    call gfx_text
+    mov si, str_post_toka
+    mov di, ART_HDR_X
+    mov ax, ART_TOKA_Y
+    mov bl, ART_INK_INDEX
+    mov bh, ART_FIELD_INDEX
+    call lfb_text
     ; POST is complete: hand off to the INT 19h bootstrap. If a bootable floppy is
     ; mounted, boot_entry far jumps into its boot sector and never returns. With no
     ; media (or a read error) it returns here and the machine idles rather than
@@ -217,7 +240,7 @@ enter_setup_or_boot:
     call boot_entry
 .idle:
     jmp .idle
-str_ready: db 'SYSTEM READY', 0
+str_post_toka: db 'Starting Toka-DOS...', 0
 
 ; --- COM1 POST log mirror ---------------------------------------------------
 ; The graphical screen and the serial console carry the same POST progress. The

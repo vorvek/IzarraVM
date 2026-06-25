@@ -16,7 +16,7 @@ fn run_post() -> Vec<SuiteRecord> {
     let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
     let mut machine = Machine::new(profile, izarra_bios()).expect("build machine with izarra BIOS");
     let stop = machine
-        .run_until_halt_or_cycles(5_000_000)
+        .run_until_halt_or_cycles(20_000_000)
         .expect("run POST");
     // POST runs the whole step table and then the BIOS idles (it keeps running
     // rather than halting), so the budget is reached with the result block final.

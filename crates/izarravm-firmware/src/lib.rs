@@ -23,6 +23,19 @@ pub const KBD_RESIDENT_BIOS_SEG: u16 = 0xf000;
 pub const IZARRA_BIOS: &[u8] = include_bytes!("../roms/izarra-bios.bin");
 pub const IZARRA_BIOS_SOURCE: &str = include_str!("../roms/izarra-bios.asm");
 
+/// The izarra flash chip is 256 KiB. The board shadows only the top 64 KiB to
+/// 0xF0000, exactly like a period board where the BIOS shadow is a slice of a
+/// larger flash. The lower 192 KiB is reserved (room for uncompressed art, a
+/// VGA option ROM, etc.) and is not CPU-addressable.
+pub const IZARRA_FLASH_SIZE: usize = 256 * 1024;
+
+static IZARRA_FLASH: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::new(|| {
+    let mut flash = vec![0u8; IZARRA_FLASH_SIZE];
+    let top = IZARRA_FLASH_SIZE - IZARRA_BIOS.len();
+    flash[top..].copy_from_slice(IZARRA_BIOS);
+    flash
+});
+
 /// The Toka-DOS ROM image: a packed blob of the OS system files (ICOMMAND, the
 /// boot record, and the tools) that the machine lays down onto the C: drive.
 /// It lives in the motherboard BOOT.rom alongside the BIOS and Belunza.
@@ -51,7 +64,7 @@ pub fn kbd_resident_bios() -> &'static [u8] {
 }
 
 pub fn izarra_bios() -> &'static [u8] {
-    IZARRA_BIOS
+    &IZARRA_FLASH
 }
 
 pub fn boot_test_image() -> &'static [u8] {
@@ -336,8 +349,24 @@ mod tests {
     }
 
     #[test]
-    fn izarra_bios_is_64k() {
-        assert_eq!(IZARRA_BIOS.len(), I386DX25_TEST_ROM_SIZE);
+    fn izarra_flash_is_256k_with_shadowed_reset() {
+        let flash = izarra_bios();
+        assert_eq!(flash.len(), IZARRA_FLASH_SIZE);
+        // The CPU-shadowed view is the top 64 KiB; its reset vector still far-jumps
+        // to ROM_SEG:0000. Offset 0xFFF0 within the top 64 KiB:
+        let shadow = &flash[flash.len() - 64 * 1024..];
+        assert_eq!(&shadow[0xfff0..0xfff5], &[0xea, 0x00, 0x00, 0x00, 0xf0]);
+        // The lower bytes are pad.
+        assert!(flash[..flash.len() - 64 * 1024].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn izarra_bios_carries_v301_version_string() {
+        let needle = b"Izarra-BIOS v3.01 - 1997";
+        assert!(
+            IZARRA_BIOS.windows(needle.len()).any(|w| w == needle),
+            "v3.01 version string not found in the ROM"
+        );
     }
 
     #[test]

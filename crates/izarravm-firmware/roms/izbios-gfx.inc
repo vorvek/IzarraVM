@@ -227,12 +227,79 @@ console_init:
     mov word [CONSOLE_ROW_Y], POST_HINT_Y
     ret
 
-; console_step_line: per-step hook kept for the POST sequencer's call site. The
-; graceful screen shows the wordmark and RAM count-up rather than a scrolling
-; text log, so this no longer draws; the per-step PASS/FAIL log is mirrored to
-; COM1 instead (a later stream). It preserves all caller registers so the
-; sequencer's name pointer in SI and status in AL survive across the call.
+; console_step_line: per-step screen hook. Lights the matching component icon
+; grey->colour when its probe PASSes, by blitting the colour sprite over the grey
+; icon already in the background. The sequencer calls this once per step with
+; AL = status (HRES_PASS/FAIL/MEASURE), SI = CS-relative step-name pointer, and
+; DS = 0. The per-step PASS/FAIL log is mirrored to COM1 separately. It preserves
+; ALL caller registers so the sequencer's name pointer in SI and status in AL
+; survive across the call (the COM1 mirror and result_append run after it).
 console_step_line:
+    cmp al, HRES_PASS
+    jne .ret                        ; only a PASS lights its icon
+    pusha
+    mov bx, icon_map
+.scan:
+    cmp bx, icon_map_end
+    jae .scan_done
+    mov di, [cs:bx]                 ; candidate step-name pointer (ROM)
+    call cs_streq                   ; compare CS:SI vs CS:DI -> ZF=1 if equal
+    je .hit
+    add bx, 12                      ; next row (6 words)
+    jmp .scan
+.hit:
+    mov si, [cs:bx + 2]             ; colour-sprite RLE pointer
+    mov di, [cs:bx + 4]             ; cell x
+    mov ax, [cs:bx + 6]             ; cell y
+    mov cx, [cs:bx + 8]             ; cell w
+    mov dx, [cs:bx + 10]            ; cell h
+    call lfb_blit_rle               ; reads CS:SI (SI is in ROM); resets DS itself
+.scan_done:
+    popa
+.ret:
+    ret
+
+; icon_map: each wired component, mapped step-name -> colour sprite + cell. A row
+; is  dw step_name_ptr, dw sprite_rle_ptr, dw cell_x, cell_y, cell_w, cell_h
+; (6 words = 12 bytes). All 7 icons are wired: VEGA/RAM/sound (Phase 2) and
+; CPU/floppy/HDD/optical (Phase 3). An absent device's probe FAILs, so its icon
+; stays grey (e.g. HDD when C: is HLE-backed rather than a real ATA disk).
+icon_map:
+    dw icon_name_video,   art_icon_0_rle, ICON_0_X, ICON_0_Y, ICON_0_W, ICON_0_H
+    dw icon_name_cpu,     art_icon_1_rle, ICON_1_X, ICON_1_Y, ICON_1_W, ICON_1_H
+    dw icon_name_ram,     art_icon_2_rle, ICON_2_X, ICON_2_Y, ICON_2_W, ICON_2_H
+    dw icon_name_sbdsp,   art_icon_3_rle, ICON_3_X, ICON_3_Y, ICON_3_W, ICON_3_H
+    dw icon_name_floppy,  art_icon_4_rle, ICON_4_X, ICON_4_Y, ICON_4_W, ICON_4_H
+    dw icon_name_hdd,     art_icon_5_rle, ICON_5_X, ICON_5_Y, ICON_5_W, ICON_5_H
+    dw icon_name_optical, art_icon_6_rle, ICON_6_X, ICON_6_Y, ICON_6_W, ICON_6_H
+icon_map_end:
+icon_name_video:   db 'component.video_margo', 0
+icon_name_cpu:     db 'component.cpu_gsw', 0
+icon_name_ram:     db 'memory.ramtest', 0
+icon_name_sbdsp:   db 'component.audio_sbdsp', 0
+icon_name_floppy:  db 'component.floppy_fdc', 0
+icon_name_hdd:     db 'component.disk_hdd', 0
+icon_name_optical: db 'component.optical_atapi', 0
+
+; cs_streq: compare the ASCIIZ strings at CS:SI and CS:DI. Returns ZF=1 if equal,
+; ZF=0 otherwise. Preserves SI, DI and AX (it walks copies on the stack).
+cs_streq:
+    push si
+    push di
+    push ax
+.next:
+    mov al, [cs:si]
+    cmp al, [cs:di]
+    jne .done                       ; mismatch -> ZF=0
+    test al, al
+    jz .done                        ; both reached NUL together -> ZF=1
+    inc si
+    inc di
+    jmp .next
+.done:
+    pop ax
+    pop di
+    pop si
     ret
 
 ; --- Graceful POST screen primitives ---------------------------------------
@@ -342,46 +409,63 @@ gfx_blit_1bpp:
     popa
     ret
 
-; gfx_post_screen: paint the graceful POST screen. White field, the red Izarra
-; 3000 wordmark centered across the top, black title/version and hint lines, and
-; the empty red-framed progress bar. Called once before the RAM test paces.
+; gfx_post_screen: paint the graphical POST screen from the RLE art. Loads the
+; shared palette into the DAC, blits the grey background (the wordmark, mascot and
+; grey component icons are all baked into it), then draws the two top-left header
+; lines (version + "Starting your computer..."). The component icons light from
+; grey to colour later, one per probe, in console_step_line. Called once before
+; the RAM test paces. Drawing is done into VRAM before lfb_set_mode (activate
+; last): Margo's set_mode does not clear VRAM, so flipping the order would make
+; the mode switch visible while VRAM still holds stale pixels (a flash of
+; garbage). Do NOT move lfb_set_mode earlier -- the screen would no longer reveal
+; atomically.
 gfx_post_screen:
-    call set_mode13h
-    call gfx_post_palette
-    mov al, GFX_WHITE
-    call gfx_clear
-    ; Logo: blit the red wordmark centered at the top.
+    call lfb_load_palette           ; shared art palette -> VGA DAC (Margo reads it)
+    ; Grey background: the full-screen RLE blob (320x240 indexed art).
     push cs
     pop ds
-    mov si, bios_logo_bitmap
-    mov di, LOGO_X
-    mov ax, LOGO_Y
-    mov cx, LOGO_W
-    mov dx, LOGO_H
-    mov bl, GFX_RED
-    mov bh, LOGO_STRIDE
-    call gfx_blit_1bpp
-    ; Title + version line (black on white).
+    mov si, art_bg_rle
+    xor di, di
+    xor ax, ax
+    mov cx, LFB_W
+    mov dx, LFB_H
+    call lfb_blit_rle
+    ; Header line 1: the version string, ink on the cream field, top-left.
     push cs
     pop ds
     mov si, str_post_name
-    mov di, POST_TEXT_X
-    mov ax, POST_TITLE_Y
-    mov bl, GFX_BLACK
-    mov bh, GFX_WHITE
-    call gfx_text
-    ; Hint line (black on white). Drawn from x=8 so the full string fits inside
-    ; the 320 px width without spilling into the next row.
+    mov di, ART_HDR_X
+    mov ax, ART_VER_Y
+    mov bl, ART_INK_INDEX
+    mov bh, ART_FIELD_INDEX
+    call lfb_text
+    ; Header line 2: the running-diagnostics status.
     push cs
     pop ds
-    mov si, str_post_hint
-    mov di, 8
-    mov ax, POST_HINT_Y
-    mov bl, GFX_BLACK
-    mov bh, GFX_WHITE
-    call gfx_text
-    ; Progress-bar frame: a thin red outline around the fill area.
-    call gfx_bar_frame
+    mov si, str_post_starting
+    mov di, ART_HDR_X
+    mov ax, ART_START_Y
+    mov bl, ART_INK_INDEX
+    mov bh, ART_FIELD_INDEX
+    call lfb_text
+    ; Key hints (DEL/TAB) in the gap above the icon row, ink on the field.
+    push cs
+    pop ds
+    mov si, str_post_hint1
+    mov di, ART_HDR_X
+    mov ax, ART_HINT1_Y
+    mov bl, ART_INK_INDEX
+    mov bh, ART_FIELD_INDEX
+    call lfb_text
+    push cs
+    pop ds
+    mov si, str_post_hint2
+    mov di, ART_HDR_X
+    mov ax, ART_HINT2_Y
+    mov bl, ART_INK_INDEX
+    mov bh, ART_FIELD_INDEX
+    call lfb_text
+    call lfb_set_mode               ; proprietary 320x240x8 Margo mode (activate last)
     ret
 
 ; gfx_bar_frame: draw the red outline of the RAM progress bar (top, bottom, and
@@ -398,25 +482,25 @@ gfx_bar_frame:
     mov si, POST_BAR_Y
     mov cx, POST_BAR_W
     mov dx, 1
-    call gfx_fill_rect
+    call lfb_fill_rect
     ; bottom edge
     mov di, POST_BAR_X
     mov si, POST_BAR_Y + POST_BAR_H - 1
     mov cx, POST_BAR_W
     mov dx, 1
-    call gfx_fill_rect
+    call lfb_fill_rect
     ; left edge
     mov di, POST_BAR_X
     mov si, POST_BAR_Y
     mov cx, 1
     mov dx, POST_BAR_H
-    call gfx_fill_rect
+    call lfb_fill_rect
     ; right edge
     mov di, POST_BAR_X + POST_BAR_W - 1
     mov si, POST_BAR_Y
     mov cx, 1
     mov dx, POST_BAR_H
-    call gfx_fill_rect
+    call lfb_fill_rect
     pop bx
     pop dx
     pop cx
@@ -424,30 +508,11 @@ gfx_bar_frame:
     pop di
     ret
 
-; gfx_bar_fill: fill the progress bar to AX percent (0..100) in red. The interior
-; is POST_BAR_W-2 wide; the filled width is interior * pct / 100. Idempotent: it
-; redraws from the left edge each call, so it can be driven by a rising counter.
+; gfx_bar_fill: AX = percent (0..100). The graphical POST art has no progress bar
+; -- the grey->colour icon reveal is the progress indicator -- so this is a no-op.
+; The RAM test (ramtest_draw) still calls it by name; keep the label and just
+; return. ponytail: stub, not dead code -- ramtest-core owns its call site.
 gfx_bar_fill:
-    pusha
-    cmp ax, 100
-    jbe .clamp_ok
-    mov ax, 100
-.clamp_ok:
-    mov bx, POST_BAR_W - 2          ; interior width
-    mul bx                          ; AX = pct * interior (fits 16 bits)
-    mov bx, 100
-    xor dx, dx
-    div bx                          ; AX = filled width in pixels
-    test ax, ax
-    jz .done                        ; nothing to draw yet
-    mov cx, ax                      ; width
-    mov di, POST_BAR_X + 1
-    mov si, POST_BAR_Y + 1
-    mov dx, POST_BAR_H - 2          ; interior height
-    mov bl, GFX_RED
-    call gfx_fill_rect
-.done:
-    popa
     ret
 
 ; gfx_post_mem: draw the "Testing memory: NNNNN KB" line with KiB value in AX.
@@ -456,38 +521,38 @@ gfx_bar_fill:
 gfx_post_mem:
     pusha
     push ax                         ; save the KiB value
-    ; Repaint the line's background white so the previous number is erased.
-    mov di, POST_TEXT_X
-    mov si, POST_MEM_Y
+    ; Repaint the line's background with the field colour to erase the prior number.
+    mov di, ART_HDR_X
+    mov si, ART_MEM_Y
     mov cx, 256
     mov dx, 8
-    mov bl, GFX_WHITE
-    call gfx_fill_rect
+    mov bl, ART_FIELD_INDEX
+    call lfb_fill_rect
     ; Label.
     push cs
     pop ds
     mov si, str_post_mem
-    mov di, POST_TEXT_X
-    mov ax, POST_MEM_Y
-    mov bl, GFX_BLACK
-    mov bh, GFX_WHITE
-    call gfx_text
-    ; Number (5-digit, black on white), placed after the label.
+    mov di, ART_HDR_X
+    mov ax, ART_MEM_Y
+    mov bl, ART_INK_INDEX
+    mov bh, ART_FIELD_INDEX
+    call lfb_text
+    ; Number (5-digit, ink on field), placed after the label.
     pop ax                          ; KiB value
-    mov di, POST_TEXT_X + 17 * 8    ; "Testing memory:  " is 17 chars wide
-    mov si, POST_MEM_Y
-    mov bl, GFX_BLACK
-    mov bh, GFX_WHITE
-    call gfx_putdec
+    mov di, ART_HDR_X + 17 * 8      ; "Testing memory:  " is 17 chars wide
+    mov si, ART_MEM_Y
+    mov bl, ART_INK_INDEX
+    mov bh, ART_FIELD_INDEX
+    call lfb_putdec
     ; " KB" suffix after the 5 digits.
     push cs
     pop ds
     mov si, str_post_kb
-    mov di, POST_TEXT_X + 23 * 8
-    mov ax, POST_MEM_Y
-    mov bl, GFX_BLACK
-    mov bh, GFX_WHITE
-    call gfx_text
+    mov di, ART_HDR_X + 23 * 8
+    mov ax, ART_MEM_Y
+    mov bl, ART_INK_INDEX
+    mov bh, ART_FIELD_INDEX
+    call lfb_text
     popa
     ret
 
@@ -496,26 +561,29 @@ gfx_post_mem:
 gfx_post_note:
     pusha
     push si
-    mov di, POST_TEXT_X
-    mov si, POST_MEM_Y
+    mov di, ART_HDR_X
+    mov si, ART_MEM_Y
     mov cx, 256
     mov dx, 8
-    mov bl, GFX_WHITE
-    call gfx_fill_rect
+    mov bl, ART_FIELD_INDEX
+    call lfb_fill_rect
     pop si                          ; the note pointer (CS-relative)
     push cs
     pop ds
-    mov di, POST_TEXT_X
-    mov ax, POST_MEM_Y
-    mov bl, GFX_BLACK
-    mov bh, GFX_WHITE
-    call gfx_text
+    mov di, ART_HDR_X
+    mov ax, ART_MEM_Y
+    mov bl, ART_INK_INDEX
+    mov bh, ART_FIELD_INDEX
+    call lfb_text
     popa
     ret
 
-str_post_name: db 'Izarra 3000 BIOS  v1.0', 0
-; The hint draws from x=8, so it must fit (320-8)/8 = 39 glyphs. This is 38.
-str_post_hint: db 'Del:Setup  Tab:Boot menu  Esc:skip mem', 0
+str_post_name:     db 'Izarra-BIOS v3.01 - 1997', 0
+str_post_starting: db 'Running diagnostics...', 0
+; The 0x10 byte is CP437 'BLACK RIGHT-POINTING POINTER' (a filled ► triangle) in
+; the 8x8 font, used as a separator between the key and its action.
+str_post_hint1:    db 'DEL ', 0x10, ' Configuration menu', 0
+str_post_hint2:    db 'TAB ', 0x10, ' Select boot device', 0
 str_post_mem:  db 'Testing memory:  ', 0
 str_post_kb:   db ' KB', 0
 str_post_skip: db 'Memory test skipped', 0

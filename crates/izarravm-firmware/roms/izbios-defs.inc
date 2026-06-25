@@ -98,6 +98,8 @@
 %define BLIT_H         (BIOS_SCRATCH + 0x08)   ; rows remaining
 %define BLIT_STRIDE    (BIOS_SCRATCH + 0x0a)   ; bytes per source row
 %define BLIT_COLOR     (BIOS_SCRATCH + 0x0c)   ; fill color (byte)
+%define BLIT_RUN_LEFT  BLIT_STRIDE     ; lfb_blit_rle: pixels remaining in the current RLE run (word)
+%define BLIT_RUN_VAL   BLIT_COLOR      ; lfb_blit_rle: the current run's palette index (byte)
 
 ; --- Graceful POST screen (Amiga/Mac-style: white field, black text, red logo).
 ; These DAC indices are reprogrammed by gfx_post_palette before the screen draws,
@@ -254,3 +256,31 @@
 ; Cursor clamp bounds keep the 16x16 sprite fully on the 320x200 field.
 %define BMX_CUR_X_MAX    303       ; 320 - 16 - 1
 %define BMX_CUR_Y_MAX    183       ; 200 - 16 - 1
+
+; --- Proprietary Margo LFB screen (320x240x8) ------------------------------
+; The graphical POST runs in Margo mode 0x150 (320x240, 8bpp, linear). The
+; framebuffer is the Margo LFB aperture; pixel (x,y) is at LFB_BASE + y*320 + x,
+; reached with the unreal-mode flat FS (see unreal_init / ramtest_poke32).
+%define LFB_MODE       0x0150     ; INT 10h AX=4F02h, BX=LFB_MODE
+%define LFB_BASE       0xe0000000 ; MARGO_LFB_BASE in the machine
+%define LFB_W          320
+%define LFB_H          240
+%define LFB_PITCH      320        ; bytes per row (8bpp)
+%define LFB_PIXELS     76800      ; LFB_W * LFB_H
+
+; Graphical POST text layout (LFB pixels). The art keeps the left column x=8..199
+; clear down to ~y130 (the wordmark is top-right, the mascot is right, the icon
+; strip is y161+), so the header and the RAM count-up sit top-left. Colours are
+; palette indices from izbios-art.inc (ART_INK_INDEX on ART_FIELD_INDEX).
+; The version line stays at the top; the three live status lines are grouped
+; together near the vertical centre (y84/100/116, the band that clears the
+; mascot on the right), reading top-to-bottom in the order they appear.
+%define ART_HDR_X       8
+%define ART_VER_Y       12         ; "Izarra-BIOS v3.01 - 1997" (top)
+%define ART_START_Y     84         ; "Running diagnostics..."
+%define ART_MEM_Y       100        ; RAM count-up line
+%define ART_TOKA_Y      116        ; "Starting Toka-DOS..." (boot handoff)
+; Key hints sit in the gap above the icon row (clear of the mascot on the right).
+; su_post_note overwrites this area with the Del/Tab confirmation when one is hit.
+%define ART_HINT1_Y     134        ; "DEL  Configuration menu"
+%define ART_HINT2_Y     146        ; "TAB  Select boot device"

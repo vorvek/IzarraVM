@@ -2,10 +2,12 @@
 ; component/peripheral probes, mode-13h status + setup page).
 ; Assemble with: nasm -f bin izarra-bios.asm -o izarra-bios.bin
 ;
-; This skeleton is the ONLY file that lists %includes. The order below is frozen
-; and append-only; each work-stream owns exactly one .inc file so parallel agents
-; never edit a shared file. izbios-tables.inc MUST stay last: it emits the POST
-; step table that POST_STEP accumulated across every prior include.
+; This skeleton is the ONLY file that lists %includes. The order below is frozen;
+; each work-stream owns exactly one .inc file so parallel agents never edit a
+; shared file. izbios-tables.inc MUST stay last: it emits the POST step table that
+; POST_STEP accumulated across every prior include. izbios-art.inc (generated)
+; sits right after the reset jump and before core/gfx/lfb because its geometry
+; %defines are textual and must precede every routine that references them.
 bits 16
 org 0
 
@@ -14,8 +16,10 @@ org 0
 reset:                          ; ROM offset 0; the reset vector far-jumps here
     jmp bios_start
 
+%include "izbios-art.inc"       ; generated art: palette + RLE bg/icons/boot box (geometry %defines used by core/gfx/lfb below)
 %include "izbios-core.inc"      ; foundation: bring-up, PIC, POST sequencer, helpers
 %include "izbios-gfx.inc"       ; foundation: mode-13h primitives + 8x8 font
+%include "izbios-lfb.inc"       ; foundation: 320x240x8 LFB draw primitives
 %include "izbios-kbd.inc"       ; foundation: INT 09h/16h + kb_getkey/kb_flush
 %include "kbd-layouts.inc"      ; foundation: six scancode -> ASCII layout tables
 %include "izbios-result.inc"    ; foundation: POST_STEP macro + result_append
@@ -28,6 +32,10 @@ reset:                          ; ROM offset 0; the reset vector far-jumps here
 %include "probes/probe-sbdsp.inc"    ; STREAM C
 %include "probes/probe-opl.inc"      ; STREAM C
 %include "probes/probe-margo.inc"    ; STREAM C
+%include "probes/probe-cpu.inc"      ; STREAM C: GSW-586 CPU (CPUID identity)
+%include "probes/probe-floppy.inc"   ; STREAM C: floppy disk controller (FDC MSR)
+%include "probes/probe-hdd.inc"      ; STREAM C: ATA hard disk (primary status)
+%include "probes/probe-optical.inc"  ; STREAM C: ATAPI optical (secondary signature)
 %include "setup-ui.inc"              ; STREAM D
 %include "izbios-boot.inc"           ; STREAM E: INT 19h bootstrap (boot_entry)
 %include "izbios-bootbox.inc"        ; STREAM E: boxed two-pane boot+speed menu

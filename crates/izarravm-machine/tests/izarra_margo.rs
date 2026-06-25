@@ -22,7 +22,7 @@ fn post_records() -> Vec<SuiteRecord> {
     .expect("the izarra-bios image builds a gsw_386 machine");
 
     machine
-        .run_until_halt_or_cycles(5_000_000)
+        .run_until_halt_or_cycles(20_000_000)
         .expect("POST runs without a CPU fault");
 
     parse_result_block(machine.memory().as_slice())
