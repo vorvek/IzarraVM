@@ -7,9 +7,12 @@ use izarravm_machine::{
 use izarravm_video::{
     ALPHA_BLEND_ENABLE, ALPHA_DST_FUNC_SHIFT, ALPHA_SRC_FUNC_SHIFT, BLEND_AONE, BLEND_AZERO,
     DISTIRA_REG_FB_HEIGHT, DISTIRA_REG_FB_WIDTH, FBZ_DRAW_BACK, FBZ_RGB_WMASK,
-    LFB_ENABLE_PIXEL_PIPELINE, LFB_FORMAT_ARGB8888, LFB_FORMAT_RGB565, LFB_READ_BACK,
-    LFB_WRITE_BACK, SST_ALPHA_MODE, SST_CLIP_LEFT_RIGHT, SST_CLIP_LOW_Y_HIGH_Y, SST_COLOR1,
-    SST_FASTFILL_CMD, SST_FBI_INIT7, SST_FBZ_MODE, SST_LFB_MODE, SST_STATUS, SST_SWAPBUFFER_CMD,
+    FBZCP_TEXTURE_ENABLED, LFB_ENABLE_PIXEL_PIPELINE, LFB_FORMAT_ARGB8888, LFB_FORMAT_RGB565,
+    LFB_READ_BACK, LFB_WRITE_BACK, SST_ALPHA_MODE, SST_CLIP_LEFT_RIGHT, SST_CLIP_LOW_Y_HIGH_Y,
+    SST_COLOR1, SST_FASTFILL_CMD, SST_FBI_INIT7, SST_FBZ_COLOR_PATH, SST_FBZ_MODE, SST_LFB_MODE,
+    SST_START_A, SST_START_B, SST_START_G, SST_START_R, SST_STATUS, SST_SWAPBUFFER_CMD,
+    SST_TEX_BASE_ADDR, SST_TEXTURE_MODE, SST_TRIANGLE_CMD, SST_VERTEX_AX, SST_VERTEX_AY,
+    SST_VERTEX_BX, SST_VERTEX_BY, SST_VERTEX_CX, SST_VERTEX_CY, TEX_R5G6B5,
 };
 
 fn write_reg_at(machine: &mut Machine, base: u32, reg: usize, value: u32) {
@@ -40,6 +43,10 @@ fn cmdfifo_type1_header(reg: usize, count: u32) -> u32 {
 
 fn cmdfifo_type5_framebuffer_header(count: u32) -> u32 {
     (2 << 30) | (count << 3) | 5
+}
+
+fn cmdfifo_type5_texture_header(count: u32) -> u32 {
+    (3 << 30) | (count << 3) | 5
 }
 
 fn push_u16(out: &mut Vec<u8>, value: u16) {
@@ -452,6 +459,65 @@ fn distira_guest_cmdfifo_type5_framebuffer_packets_use_assigned_bar_aperture() {
     let (frame, width, height) = machine.frame_argb();
     assert_eq!((width, height), (2, 1));
     assert_eq!(frame, vec![0x0031_557b, 0x0000_0000]);
+}
+
+#[test]
+fn distira_guest_cmdfifo_type5_texture_packets_use_assigned_bar_aperture() {
+    const ASSIGNED_BAR: u32 = 0xe500_0000;
+    const CMD_FIFO_BASE: u32 = ASSIGNED_BAR + 0x0020_0000;
+    const SST_CMD_FIFO_DEPTH: usize = 0x1f4;
+    const FBIINIT7_CMDFIFO_ENABLE: u32 = 1 << 8;
+
+    let mut code = Vec::new();
+    push_out_dx_eax(&mut code, 0x0cf8, 0x8000_8010);
+    push_out_dx_eax(&mut code, 0x0cfc, ASSIGNED_BAR);
+    push_out_dx_eax(&mut code, 0x0cf8, 0x8000_8004);
+    push_out_dx_eax(&mut code, 0x0cfc, 0x0000_0002);
+    push_mov_moffs_u32_imm32(
+        &mut code,
+        ASSIGNED_BAR + SST_FBI_INIT7 as u32,
+        FBIINIT7_CMDFIFO_ENABLE,
+    );
+    push_mov_moffs_u32_imm32(&mut code, CMD_FIFO_BASE, cmdfifo_type5_texture_header(1));
+    push_mov_moffs_u32_imm32(&mut code, CMD_FIFO_BASE + 4, 0);
+    push_mov_moffs_u32_imm32(&mut code, CMD_FIFO_BASE + 8, 0x07e0_07e0);
+
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Distira),
+        protected_flat_rom(&code),
+    )
+    .unwrap();
+
+    let reason = machine.run_until_halt_or_cycles(500_000).unwrap();
+
+    assert_eq!(reason, StopReason::Halted);
+    assert_eq!(read_reg(&mut machine, SST_CMD_FIFO_DEPTH), 3);
+
+    machine.drain_distira_fifo();
+
+    assert_eq!(read_reg(&mut machine, SST_CMD_FIFO_DEPTH), 0);
+    write_reg(&mut machine, DISTIRA_REG_FB_WIDTH, 4);
+    write_reg(&mut machine, DISTIRA_REG_FB_HEIGHT, 4);
+    write_reg(&mut machine, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
+    write_reg(&mut machine, SST_FBZ_COLOR_PATH, FBZCP_TEXTURE_ENABLED);
+    write_reg(&mut machine, SST_TEXTURE_MODE, TEX_R5G6B5 << 8);
+    write_reg(&mut machine, SST_TEX_BASE_ADDR, 0);
+    write_reg(&mut machine, SST_VERTEX_AX, 0 << 4);
+    write_reg(&mut machine, SST_VERTEX_AY, 0 << 4);
+    write_reg(&mut machine, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut machine, SST_VERTEX_BY, 0 << 4);
+    write_reg(&mut machine, SST_VERTEX_CX, 0 << 4);
+    write_reg(&mut machine, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut machine, SST_START_R, 0xff << 12);
+    write_reg(&mut machine, SST_START_G, 0xff << 12);
+    write_reg(&mut machine, SST_START_B, 0xff << 12);
+    write_reg(&mut machine, SST_START_A, 0xff << 12);
+    write_reg(&mut machine, SST_TRIANGLE_CMD, 1);
+    write_reg(&mut machine, SST_SWAPBUFFER_CMD, 1);
+
+    let (frame, width, height) = machine.frame_argb();
+    assert_eq!((width, height), (4, 4));
+    assert_eq!(frame[0], 0x0000_ff00);
 }
 
 #[test]

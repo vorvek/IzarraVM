@@ -712,5 +712,10 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
       x86 protected-mode code and drain into the LFB write path. Validated by the
       machine guest command-FIFO type-5 framebuffer BAR regression and the
       Distira machine gates.
-- [ ] Next: Guest instruction-level command FIFO type-5 texture packets through
-      an assigned PCI BAR from real x86 code.
+- [x] Iteration 120: Guest instruction-level command FIFO type-5 texture packets
+      now flow through the assigned BAR0 command-FIFO aperture from real x86
+      protected-mode code and drain into texture memory that a subsequent
+      register-driven textured triangle samples. Validated by the machine guest
+      command-FIFO type-5 texture BAR regression and the Distira machine gates.
+- [ ] Next: Guest instruction-level direct texture-memory aperture writes through
+      the assigned BAR0 texture window from real x86 code.
