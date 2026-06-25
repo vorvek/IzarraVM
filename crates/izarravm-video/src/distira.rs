@@ -75,14 +75,17 @@ pub const SST_FSTART_R: usize = 0x0a0;
 pub const SST_FSTART_G: usize = 0x0a4;
 pub const SST_FSTART_B: usize = 0x0a8;
 pub const SST_FSTART_Z: usize = 0x0ac;
+pub const SST_FSTART_A: usize = 0x0b0;
 pub const SST_FDR_DX: usize = 0x0c0;
 pub const SST_FDG_DX: usize = 0x0c4;
 pub const SST_FDB_DX: usize = 0x0c8;
 pub const SST_FDZ_DX: usize = 0x0cc;
+pub const SST_FDA_DX: usize = 0x0d0;
 pub const SST_FDR_DY: usize = 0x0e0;
 pub const SST_FDG_DY: usize = 0x0e4;
 pub const SST_FDB_DY: usize = 0x0e8;
 pub const SST_FDZ_DY: usize = 0x0ec;
+pub const SST_FDA_DY: usize = 0x0f0;
 pub const SST_FTRIANGLE_CMD: usize = 0x100;
 pub const SST_FBZ_COLOR_PATH: usize = 0x104;
 pub const SST_FOG_MODE: usize = 0x108;
@@ -308,6 +311,9 @@ pub struct Distira {
     ftriangle_depth: u32,
     ftriangle_depth_dx: u32,
     ftriangle_depth_dy: u32,
+    ftriangle_alpha: u32,
+    ftriangle_alpha_dx: u32,
+    ftriangle_alpha_dy: u32,
     fbi_pixels_in: u32,
     fbi_chroma_fail: u32,
     fbi_zfunc_fail: u32,
@@ -380,6 +386,9 @@ impl Distira {
             ftriangle_depth: 0,
             ftriangle_depth_dx: 0,
             ftriangle_depth_dy: 0,
+            ftriangle_alpha: f32::to_bits(255.0),
+            ftriangle_alpha_dx: 0,
+            ftriangle_alpha_dy: 0,
             fbi_pixels_in: 0,
             fbi_chroma_fail: 0,
             fbi_zfunc_fail: 0,
@@ -728,6 +737,10 @@ impl Distira {
                 merge_byte(&mut self.ftriangle_depth, byte, value);
                 self.triangle_depth = float_depth_to_fixed(self.ftriangle_depth);
             }
+            SST_FSTART_A => {
+                merge_byte(&mut self.ftriangle_alpha, byte, value);
+                self.triangle_alpha = float_color_to_fixed(self.ftriangle_alpha);
+            }
             SST_FDR_DX => {
                 merge_byte(&mut self.ftriangle_color_dx[0], byte, value);
                 self.triangle_color_dx[0] = float_color_to_fixed(self.ftriangle_color_dx[0]);
@@ -744,6 +757,10 @@ impl Distira {
                 merge_byte(&mut self.ftriangle_depth_dx, byte, value);
                 self.triangle_depth_dx = float_depth_to_fixed(self.ftriangle_depth_dx);
             }
+            SST_FDA_DX => {
+                merge_byte(&mut self.ftriangle_alpha_dx, byte, value);
+                self.triangle_alpha_dx = float_color_to_fixed(self.ftriangle_alpha_dx);
+            }
             SST_FDR_DY => {
                 merge_byte(&mut self.ftriangle_color_dy[0], byte, value);
                 self.triangle_color_dy[0] = float_color_to_fixed(self.ftriangle_color_dy[0]);
@@ -759,6 +776,10 @@ impl Distira {
             SST_FDZ_DY => {
                 merge_byte(&mut self.ftriangle_depth_dy, byte, value);
                 self.triangle_depth_dy = float_depth_to_fixed(self.ftriangle_depth_dy);
+            }
+            SST_FDA_DY => {
+                merge_byte(&mut self.ftriangle_alpha_dy, byte, value);
+                self.triangle_alpha_dy = float_color_to_fixed(self.ftriangle_alpha_dy);
             }
             SST_FTRIANGLE_CMD => {
                 if byte == 0 && value != 0 {
@@ -970,14 +991,17 @@ impl Distira {
             SST_FSTART_G => self.ftriangle_color[1],
             SST_FSTART_B => self.ftriangle_color[2],
             SST_FSTART_Z => self.ftriangle_depth,
+            SST_FSTART_A => self.ftriangle_alpha,
             SST_FDR_DX => self.ftriangle_color_dx[0],
             SST_FDG_DX => self.ftriangle_color_dx[1],
             SST_FDB_DX => self.ftriangle_color_dx[2],
             SST_FDZ_DX => self.ftriangle_depth_dx,
+            SST_FDA_DX => self.ftriangle_alpha_dx,
             SST_FDR_DY => self.ftriangle_color_dy[0],
             SST_FDG_DY => self.ftriangle_color_dy[1],
             SST_FDB_DY => self.ftriangle_color_dy[2],
             SST_FDZ_DY => self.ftriangle_depth_dy,
+            SST_FDA_DY => self.ftriangle_alpha_dy,
             SST_FTRIANGLE_CMD => 0,
             SST_FBZ_COLOR_PATH => self.fbz_color_path,
             SST_FOG_MODE => self.fog_mode,
