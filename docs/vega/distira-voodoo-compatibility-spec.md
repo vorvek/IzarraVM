@@ -691,5 +691,11 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
       open bus (`0xff`) and byte writes are ignored while word/dword LFB writes
       still route through the hardware-format paths. Validated by the machine
       LFB aperture/scanout regression and the Distira video/machine gates.
-- [ ] Next: Odd-aligned word/dword LFB dispatch and readback parity against
-      86Box's LFB aperture behavior.
+- [x] Iteration 116: Odd-aligned machine LFB word/dword accesses dispatch through
+      Voodoo-shaped word/dword callbacks instead of decomposing into byte cycles:
+      readw/readl align the byte address like 86Box (`addr & 0x7fe`), byte reads
+      remain open bus, and unaligned writes still update the expected RGB565
+      pixels. Validated by the machine odd-aligned LFB callback regression and the
+      Distira video/machine gates.
+- [ ] Next: Guest instruction-level LFB aperture parity through an assigned PCI
+      BAR, including odd word/dword reads and writes from real x86 code.

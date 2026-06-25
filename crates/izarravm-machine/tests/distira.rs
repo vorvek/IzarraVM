@@ -6,9 +6,9 @@ use izarravm_machine::{
 use izarravm_video::{
     ALPHA_BLEND_ENABLE, ALPHA_DST_FUNC_SHIFT, ALPHA_SRC_FUNC_SHIFT, BLEND_AONE, BLEND_AZERO,
     DISTIRA_REG_FB_HEIGHT, DISTIRA_REG_FB_WIDTH, FBZ_DRAW_BACK, FBZ_RGB_WMASK,
-    LFB_ENABLE_PIXEL_PIPELINE, LFB_FORMAT_ARGB8888, LFB_FORMAT_RGB565, LFB_WRITE_BACK,
-    SST_ALPHA_MODE, SST_CLIP_LEFT_RIGHT, SST_CLIP_LOW_Y_HIGH_Y, SST_COLOR1, SST_FASTFILL_CMD,
-    SST_FBI_INIT7, SST_FBZ_MODE, SST_LFB_MODE, SST_STATUS, SST_SWAPBUFFER_CMD,
+    LFB_ENABLE_PIXEL_PIPELINE, LFB_FORMAT_ARGB8888, LFB_FORMAT_RGB565, LFB_READ_BACK,
+    LFB_WRITE_BACK, SST_ALPHA_MODE, SST_CLIP_LEFT_RIGHT, SST_CLIP_LOW_Y_HIGH_Y, SST_COLOR1,
+    SST_FASTFILL_CMD, SST_FBI_INIT7, SST_FBZ_MODE, SST_LFB_MODE, SST_STATUS, SST_SWAPBUFFER_CMD,
 };
 
 fn write_reg_at(machine: &mut Machine, base: u32, reg: usize, value: u32) {
@@ -139,6 +139,35 @@ fn distira_lfb_word_writes_use_voodoo_pixel_pipeline() {
     let (frame, width, height) = machine.frame_argb();
     assert_eq!((width, height), (1, 1));
     assert_eq!(frame, vec![0x0000_00ff]);
+}
+
+#[test]
+fn distira_odd_aligned_lfb_word_dword_accesses_use_voodoo_callbacks() {
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Distira),
+        I386DX25_TEST_ROM,
+    )
+    .unwrap();
+
+    write_reg(&mut machine, DISTIRA_REG_FB_WIDTH, 4);
+    write_reg(&mut machine, DISTIRA_REG_FB_HEIGHT, 1);
+    write_reg(
+        &mut machine,
+        SST_LFB_MODE,
+        LFB_FORMAT_RGB565 | LFB_WRITE_BACK | LFB_READ_BACK,
+    );
+
+    machine.write_physical_u16(DISTIRA_LFB_BASE + 1, 0xf800);
+    assert_eq!(machine.read_physical_u16(DISTIRA_LFB_BASE + 1), 0xf800);
+    assert_eq!(machine.read_physical_u8(DISTIRA_LFB_BASE + 1), 0xff);
+
+    machine.write_physical_u32(DISTIRA_LFB_BASE + 2, 0x07e0_001f);
+    assert_eq!(machine.read_physical_u32(DISTIRA_LFB_BASE + 3), 0x07e0_001f);
+    write_reg(&mut machine, SST_SWAPBUFFER_CMD, 1);
+
+    let (frame, width, height) = machine.frame_argb();
+    assert_eq!((width, height), (4, 1));
+    assert_eq!(frame, vec![0x00ff_0000, 0x0000_00ff, 0x0000_ff00, 0]);
 }
 
 #[test]
