@@ -805,24 +805,77 @@ impl Distira {
                     let pixel = offset / 2;
                     let raw0 = value as u16;
                     let raw1 = (value >> 16) as u16;
-                    if self.lfb_pipeline_rgb565_passes(raw0) {
-                        self.write_color_pixel(base, pixel, raw0);
+                    if let Some(raw) = self.lfb_pipeline_color_pixel(
+                        base,
+                        pixel,
+                        raw0,
+                        rgb565_components(raw0),
+                        0xff,
+                    ) {
+                        self.write_color_pixel(base, pixel, raw);
                     }
-                    if self.lfb_pipeline_rgb565_passes(raw1) {
-                        self.write_color_pixel(base, pixel + 1, raw1);
+                    if let Some(raw) = self.lfb_pipeline_color_pixel(
+                        base,
+                        pixel + 1,
+                        raw1,
+                        rgb565_components(raw1),
+                        0xff,
+                    ) {
+                        self.write_color_pixel(base, pixel + 1, raw);
                     }
                 }
             }
-            LFB_FORMAT_RGB555 | LFB_FORMAT_ARGB1555 => {
+            LFB_FORMAT_RGB555 => {
                 if write_color {
                     let pixel = offset / 2;
-                    let raw0 = rgb555_to_rgb565(value as u16);
-                    let raw1 = rgb555_to_rgb565((value >> 16) as u16);
-                    if self.lfb_pipeline_rgb565_passes(raw0) {
-                        self.write_color_pixel(base, pixel, raw0);
+                    let raw0 = value as u16;
+                    let raw1 = (value >> 16) as u16;
+                    let raw0_rgb565 = rgb555_to_rgb565(raw0);
+                    let raw1_rgb565 = rgb555_to_rgb565(raw1);
+                    if let Some(raw) = self.lfb_pipeline_color_pixel(
+                        base,
+                        pixel,
+                        raw0_rgb565,
+                        rgb565_components(raw0_rgb565),
+                        0xff,
+                    ) {
+                        self.write_color_pixel(base, pixel, raw);
                     }
-                    if self.lfb_pipeline_rgb565_passes(raw1) {
-                        self.write_color_pixel(base, pixel + 1, raw1);
+                    if let Some(raw) = self.lfb_pipeline_color_pixel(
+                        base,
+                        pixel + 1,
+                        raw1_rgb565,
+                        rgb565_components(raw1_rgb565),
+                        0xff,
+                    ) {
+                        self.write_color_pixel(base, pixel + 1, raw);
+                    }
+                }
+            }
+            LFB_FORMAT_ARGB1555 => {
+                if write_color {
+                    let pixel = offset / 2;
+                    let raw0 = value as u16;
+                    let raw1 = (value >> 16) as u16;
+                    let raw0_rgb565 = rgb555_to_rgb565(raw0);
+                    let raw1_rgb565 = rgb555_to_rgb565(raw1);
+                    if let Some(raw) = self.lfb_pipeline_color_pixel(
+                        base,
+                        pixel,
+                        raw0_rgb565,
+                        rgb565_components(raw0_rgb565),
+                        argb1555_alpha(raw0),
+                    ) {
+                        self.write_color_pixel(base, pixel, raw);
+                    }
+                    if let Some(raw) = self.lfb_pipeline_color_pixel(
+                        base,
+                        pixel + 1,
+                        raw1_rgb565,
+                        rgb565_components(raw1_rgb565),
+                        argb1555_alpha(raw1),
+                    ) {
+                        self.write_color_pixel(base, pixel + 1, raw);
                     }
                 }
             }
@@ -836,11 +889,11 @@ impl Distira {
                     } else {
                         0xff
                     };
-                    if self.lfb_pipeline_color_passes((r, g, b))
-                        && self.lfb_pipeline_alpha_passes(alpha)
+                    let raw = pack_rgb565(r, g, b);
+                    if let Some(raw) =
+                        self.lfb_pipeline_color_pixel(base, offset / 4, raw, (r, g, b), alpha)
                     {
-                        let (r, g, b) = self.lfb_pipeline_fog_color(r, g, b);
-                        self.write_color_pixel(base, offset / 4, pack_rgb565(r, g, b));
+                        self.write_color_pixel(base, offset / 4, raw);
                     }
                 }
             }
@@ -848,29 +901,67 @@ impl Distira {
                 let pixel = offset / 4;
                 let raw = value as u16;
                 let depth = (value >> 16) as u16;
-                if self.lfb_pipeline_depth_test_passes(pixel, depth)
-                    && self.lfb_pipeline_rgb565_passes(raw)
-                {
-                    if write_color {
-                        self.write_color_pixel(base, pixel, raw);
-                    }
-                    if write_depth {
-                        self.write_depth_pixel_by_index(pixel, depth);
+                if self.lfb_pipeline_depth_test_passes(pixel, depth) {
+                    let color = self.lfb_pipeline_color_pixel(
+                        base,
+                        pixel,
+                        raw,
+                        rgb565_components(raw),
+                        0xff,
+                    );
+                    if let Some(color) = color {
+                        if write_color {
+                            self.write_color_pixel(base, pixel, color);
+                        }
+                        if write_depth {
+                            self.write_depth_pixel_by_index(pixel, depth);
+                        }
                     }
                 }
             }
-            LFB_FORMAT_DEPTH_RGB555 | LFB_FORMAT_DEPTH_ARGB1555 => {
+            LFB_FORMAT_DEPTH_RGB555 => {
                 let pixel = offset / 4;
-                let raw = rgb555_to_rgb565(value as u16);
+                let raw = value as u16;
+                let raw_rgb565 = rgb555_to_rgb565(raw);
                 let depth = (value >> 16) as u16;
-                if self.lfb_pipeline_depth_test_passes(pixel, depth)
-                    && self.lfb_pipeline_rgb565_passes(raw)
-                {
-                    if write_color {
-                        self.write_color_pixel(base, pixel, raw);
+                if self.lfb_pipeline_depth_test_passes(pixel, depth) {
+                    let color = self.lfb_pipeline_color_pixel(
+                        base,
+                        pixel,
+                        raw_rgb565,
+                        rgb565_components(raw_rgb565),
+                        0xff,
+                    );
+                    if let Some(color) = color {
+                        if write_color {
+                            self.write_color_pixel(base, pixel, color);
+                        }
+                        if write_depth {
+                            self.write_depth_pixel_by_index(pixel, depth);
+                        }
                     }
-                    if write_depth {
-                        self.write_depth_pixel_by_index(pixel, depth);
+                }
+            }
+            LFB_FORMAT_DEPTH_ARGB1555 => {
+                let pixel = offset / 4;
+                let raw = value as u16;
+                let raw_rgb565 = rgb555_to_rgb565(raw);
+                let depth = (value >> 16) as u16;
+                if self.lfb_pipeline_depth_test_passes(pixel, depth) {
+                    let color = self.lfb_pipeline_color_pixel(
+                        base,
+                        pixel,
+                        raw_rgb565,
+                        rgb565_components(raw_rgb565),
+                        argb1555_alpha(raw),
+                    );
+                    if let Some(color) = color {
+                        if write_color {
+                            self.write_color_pixel(base, pixel, color);
+                        }
+                        if write_depth {
+                            self.write_depth_pixel_by_index(pixel, depth);
+                        }
                     }
                 }
             }
@@ -1635,15 +1726,24 @@ impl Distira {
         false
     }
 
-    fn lfb_pipeline_fog_color(&self, r: u8, g: u8, b: u8) -> (u8, u8, u8) {
+    fn lfb_pipeline_color_pixel(
+        &mut self,
+        base: u32,
+        pixel: usize,
+        raw: u16,
+        color: (u8, u8, u8),
+        alpha: u8,
+    ) -> Option<u16> {
         if self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0 {
-            return (r, g, b);
+            return Some(raw);
         }
-        self.apply_fog_color(r, g, b)
-    }
-
-    fn lfb_pipeline_rgb565_passes(&mut self, raw: u16) -> bool {
-        self.lfb_pipeline_color_passes(rgb565_components(raw))
+        let (x, y) = self.pixel_index_coords(pixel)?;
+        if !self.lfb_pipeline_color_passes(color) || !self.lfb_pipeline_alpha_passes(alpha) {
+            return None;
+        }
+        let (r, g, b) = self.apply_fog_color(color.0, color.1, color.2);
+        let (r, g, b) = self.alpha_blend_color_at_base(base, (x, y), (r, g, b), alpha);
+        Some(pack_rgb565_for_pixel(r, g, b, x, y, self.dither_enabled))
     }
 
     fn read_color_lfb_byte(&self, base: u32, offset: usize) -> u8 {
@@ -1675,16 +1775,23 @@ impl Distira {
         }
     }
 
-    fn write_color_pixel(&mut self, base: u32, pixel: usize, value: u16) {
+    fn pixel_index_coords(&self, pixel: usize) -> Option<(u32, u32)> {
         let width = self.display.width as usize;
         if width == 0 {
-            return;
+            return None;
         }
         let x = pixel % width;
         let y = pixel / width;
         if y >= self.display.height as usize {
-            return;
+            return None;
         }
+        Some((x as u32, y as u32))
+    }
+
+    fn write_color_pixel(&mut self, base: u32, pixel: usize, value: u16) {
+        let Some((x, y)) = self.pixel_index_coords(pixel) else {
+            return;
+        };
         let off = u64::from(base)
             .saturating_add((y as u64).saturating_mul(u64::from(self.display.pitch)))
             .saturating_add((x as u64).saturating_mul(2));
@@ -2555,24 +2662,37 @@ impl Distira {
     }
 
     fn alpha_blend_color(&self, x: u32, y: u32, r: u8, g: u8, b: u8, alpha: u8) -> (u8, u8, u8) {
+        self.alpha_blend_color_at_base(self.display.back_base, (x, y), (r, g, b), alpha)
+    }
+
+    fn alpha_blend_color_at_base(
+        &self,
+        base: u32,
+        position: (u32, u32),
+        color: (u8, u8, u8),
+        alpha: u8,
+    ) -> (u8, u8, u8) {
+        let (r, g, b) = color;
         if self.alpha_mode & ALPHA_BLEND_ENABLE == 0 {
             return (r, g, b);
         }
-        let (dest_r, dest_g, dest_b) = self.read_back_pixel_rgb(x, y);
+        let (x, y) = position;
+        let (dest_r, dest_g, dest_b) = self.read_pixel_rgb_at_base(base, x, y);
         let source_func = (self.alpha_mode >> ALPHA_SRC_FUNC_SHIFT) & 0xf;
         let dest_func = (self.alpha_mode >> ALPHA_DST_FUNC_SHIFT) & 0xf;
         (
-            blend_channel(source_func, r, r, alpha)
-                .saturating_add(blend_channel(dest_func, dest_r, r, alpha)),
-            blend_channel(source_func, g, g, alpha)
-                .saturating_add(blend_channel(dest_func, dest_g, g, alpha)),
-            blend_channel(source_func, b, b, alpha)
-                .saturating_add(blend_channel(dest_func, dest_b, b, alpha)),
+            alpha_blend_component(source_func, dest_func, r, dest_r, alpha),
+            alpha_blend_component(source_func, dest_func, g, dest_g, alpha),
+            alpha_blend_component(source_func, dest_func, b, dest_b, alpha),
         )
     }
 
     fn read_back_pixel_rgb(&self, x: u32, y: u32) -> (u8, u8, u8) {
-        let off = u64::from(self.display.back_base)
+        self.read_pixel_rgb_at_base(self.display.back_base, x, y)
+    }
+
+    fn read_pixel_rgb_at_base(&self, base: u32, x: u32, y: u32) -> (u8, u8, u8) {
+        let off = u64::from(base)
             .saturating_add(u64::from(y).saturating_mul(u64::from(self.display.pitch)))
             .saturating_add(u64::from(x).saturating_mul(2));
         let raw = if off + 1 < self.fb.len() as u64 {
@@ -2853,24 +2973,48 @@ fn lerp_f32(a: f32, b: f32, c: f32, w0: f32, w1: f32, w2: f32) -> f32 {
     a * w0 + b * w1 + c * w2
 }
 
-fn blend_channel(func: u32, component: u8, source: u8, source_alpha: u8) -> u8 {
-    let component = u32::from(component);
+fn alpha_blend_component(
+    source_func: u32,
+    dest_func: u32,
+    source: u8,
+    dest: u8,
+    source_alpha: u8,
+) -> u8 {
+    (alpha_blend_source_channel(source_func, source, dest, source_alpha)
+        + alpha_blend_dest_channel(dest_func, dest, source, source_alpha))
+    .min(255) as u8
+}
+
+fn alpha_blend_source_channel(func: u32, source: u8, dest: u8, source_alpha: u8) -> u32 {
+    let source = u32::from(source);
+    let dest = u32::from(dest);
+    let source_alpha = u32::from(source_alpha);
+    match func {
+        BLEND_AZERO => 0,
+        BLEND_ASRC_ALPHA => source * source_alpha / 255,
+        BLEND_A_COLOR => source * dest / 255,
+        BLEND_ADST_ALPHA | BLEND_AONE => source,
+        BLEND_AOMSRC_ALPHA => source * (255 - source_alpha) / 255,
+        BLEND_AOM_COLOR => source * (255 - dest) / 255,
+        BLEND_AOMDST_ALPHA | BLEND_ASATURATE => 0,
+        _ => source,
+    }
+}
+
+fn alpha_blend_dest_channel(func: u32, dest: u8, source: u8, source_alpha: u8) -> u32 {
+    let dest = u32::from(dest);
     let source = u32::from(source);
     let source_alpha = u32::from(source_alpha);
-    let destination_alpha = 255;
-    let value = match func {
+    match func {
         BLEND_AZERO => 0,
-        BLEND_ASRC_ALPHA => component * source_alpha / 255,
-        BLEND_A_COLOR => component * source / 255,
-        BLEND_ADST_ALPHA => component * destination_alpha / 255,
-        BLEND_AONE => component,
-        BLEND_AOMSRC_ALPHA => component * (255 - source_alpha) / 255,
-        BLEND_AOM_COLOR => component * (255 - source) / 255,
-        BLEND_AOMDST_ALPHA => component * (255 - destination_alpha) / 255,
-        BLEND_ASATURATE => component * source_alpha.min(255 - destination_alpha) / 255,
-        _ => component,
-    };
-    value.min(255) as u8
+        BLEND_ASRC_ALPHA => dest * source_alpha / 255,
+        BLEND_A_COLOR => dest * source / 255,
+        BLEND_ADST_ALPHA | BLEND_AONE => dest,
+        BLEND_AOMSRC_ALPHA => dest * (255 - source_alpha) / 255,
+        BLEND_AOM_COLOR => dest * (255 - source) / 255,
+        BLEND_AOMDST_ALPHA | BLEND_ASATURATE => 0,
+        _ => dest,
+    }
 }
 
 fn quantize_channel(v: u8, bits: u32, cell: u32, dither: bool) -> u16 {
@@ -2897,6 +3041,10 @@ fn rgb555_to_rgb565(raw: u16) -> u16 {
     let g = ((g5 << 1) | (g5 >> 4)) << 5;
     let b = raw & 0x1f;
     r | g | b
+}
+
+fn argb1555_alpha(raw: u16) -> u8 {
+    if raw & 0x8000 != 0 { 0xff } else { 0 }
 }
 
 fn rgb565_components(raw: u16) -> (u8, u8, u8) {

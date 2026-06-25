@@ -670,5 +670,10 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
 - [x] Iteration 111: LFB pixel-pipeline mode applies constant fog before the
       color write. Validated by the video LFB pipeline constant-fog test plus the
       Distira video test gates.
-- [ ] Next: LFB pixel-pipeline alpha blend hooks and broader 16-bit-format
-      pipeline parity.
+- [x] Iteration 112: LFB pixel-pipeline mode applies alpha blending over the
+      selected destination buffer and extends alpha-test/fog/blend parity across
+      RGB565, RGB555, ARGB1555, and depth+color writes. Validated by the video
+      LFB pipeline ARGB8888 blend, RGB565 blend, and ARGB1555 alpha-test tests
+      plus the Distira video test gates.
+- [ ] Next: LFB pixel-pipeline stipple-pattern gating and depth-only pipeline
+      parity with `zaColor` alpha/chroma behavior.
