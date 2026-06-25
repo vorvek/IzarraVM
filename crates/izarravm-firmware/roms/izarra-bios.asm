@@ -2,10 +2,12 @@
 ; component/peripheral probes, mode-13h status + setup page).
 ; Assemble with: nasm -f bin izarra-bios.asm -o izarra-bios.bin
 ;
-; This skeleton is the ONLY file that lists %includes. The order below is frozen
-; and append-only; each work-stream owns exactly one .inc file so parallel agents
-; never edit a shared file. izbios-tables.inc MUST stay last: it emits the POST
-; step table that POST_STEP accumulated across every prior include.
+; This skeleton is the ONLY file that lists %includes. The order below is frozen;
+; each work-stream owns exactly one .inc file so parallel agents never edit a
+; shared file. izbios-tables.inc MUST stay last: it emits the POST step table that
+; POST_STEP accumulated across every prior include. izbios-art.inc (generated)
+; sits right after core and before gfx/lfb because its geometry %defines are
+; textual and must precede the gfx/lfb routines that reference them.
 bits 16
 org 0
 
@@ -15,6 +17,7 @@ reset:                          ; ROM offset 0; the reset vector far-jumps here
     jmp bios_start
 
 %include "izbios-core.inc"      ; foundation: bring-up, PIC, POST sequencer, helpers
+%include "izbios-art.inc"       ; generated art: palette + RLE bg/icons/boot box (geometry %defines used by gfx/lfb below)
 %include "izbios-gfx.inc"       ; foundation: mode-13h primitives + 8x8 font
 %include "izbios-lfb.inc"       ; foundation: 320x240x8 LFB draw primitives
 %include "izbios-kbd.inc"       ; foundation: INT 09h/16h + kb_getkey/kb_flush
