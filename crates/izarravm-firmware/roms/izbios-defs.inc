@@ -254,3 +254,14 @@
 ; Cursor clamp bounds keep the 16x16 sprite fully on the 320x200 field.
 %define BMX_CUR_X_MAX    303       ; 320 - 16 - 1
 %define BMX_CUR_Y_MAX    183       ; 200 - 16 - 1
+
+; --- Proprietary Margo LFB screen (320x240x8) ------------------------------
+; The graphical POST runs in Margo mode 0x150 (320x240, 8bpp, linear). The
+; framebuffer is the Margo LFB aperture; pixel (x,y) is at LFB_BASE + y*320 + x,
+; reached with the unreal-mode flat FS (see unreal_init / ramtest_poke32).
+%define LFB_MODE       0x0150     ; INT 10h AX=4F02h, BX=LFB_MODE
+%define LFB_BASE       0xe0000000 ; MARGO_LFB_BASE in the machine
+%define LFB_W          320
+%define LFB_H          240
+%define LFB_PITCH      320        ; bytes per row (8bpp)
+%define LFB_PIXELS     76800      ; LFB_W * LFB_H
