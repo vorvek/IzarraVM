@@ -427,7 +427,9 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
 - [x] Iteration 13: alpha blending for untextured Voodoo triangles. Validated by
       the video source-over-destination alpha blend test plus the workspace
       gates.
-- [ ] Next: chroma key rejection for untextured Voodoo triangles.
+- [x] Iteration 14: chroma key rejection for untextured Voodoo triangles.
+      Validated by the video chroma-key rejection test plus the workspace gates.
+- [ ] Next: fog color application for untextured Voodoo triangles.
 
 ## First 90 percent push for this branch
 

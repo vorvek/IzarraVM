@@ -547,6 +547,10 @@ impl Distira {
                     self.fbi_afunc_fail = self.fbi_afunc_fail.wrapping_add(1);
                     continue;
                 }
+                if !self.chroma_key_passes(r, g, blue) {
+                    self.fbi_chroma_fail = self.fbi_chroma_fail.wrapping_add(1);
+                    continue;
+                }
                 let (r, g, blue) = self.alpha_blend_color(x, y, r, g, blue, alpha);
                 let pixel = pack_rgb565_for_pixel(r, g, blue, x, y, self.dither_enabled);
                 if self.write_back_pixel(x, y, pixel) {
@@ -1279,6 +1283,13 @@ impl Distira {
             AFUNC_ALWAYS => true,
             _ => true,
         }
+    }
+
+    fn chroma_key_passes(&self, r: u8, g: u8, b: u8) -> bool {
+        self.fbz_mode & FBZ_CHROMAKEY == 0
+            || r != (self.chroma_key >> 16) as u8
+            || g != (self.chroma_key >> 8) as u8
+            || b != self.chroma_key as u8
     }
 
     fn alpha_blend_color(&self, x: u32, y: u32, r: u8, g: u8, b: u8, alpha: u8) -> (u8, u8, u8) {
