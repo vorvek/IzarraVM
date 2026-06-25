@@ -210,6 +210,10 @@ pub const FBZCP_A_SELECT_MASK: u32 = 0x3;
 pub const A_SELECT_TEX: u32 = 1;
 pub const FBZCP_CC_LOCALSELECT_COLOR0: u32 = 1 << 4;
 pub const FBZCP_CC_SUB_CLOCAL: u32 = 1 << 9;
+pub const FBZCP_CC_MSELECT_SHIFT: u32 = 10;
+pub const FBZCP_CC_MSELECT_MASK: u32 = 0x7;
+pub const CC_MSELECT_CLOCAL: u32 = 1;
+pub const FBZCP_CC_REVERSE_BLEND: u32 = 1 << 13;
 pub const FBZCP_CC_ADD_CLOCAL: u32 = 1 << 14;
 pub const TC_ZERO_OTHER: u32 = 1 << 12;
 pub const TC_SUB_CLOCAL: u32 = 1 << 13;
@@ -1748,7 +1752,10 @@ impl Distira {
         color: (u8, u8, u8),
         source: (u8, u8, u8),
     ) -> (u8, u8, u8) {
-        if self.fbz_color_path & (FBZCP_CC_SUB_CLOCAL | FBZCP_CC_ADD_CLOCAL) == 0 {
+        let mselect = (self.fbz_color_path >> FBZCP_CC_MSELECT_SHIFT) & FBZCP_CC_MSELECT_MASK;
+        if self.fbz_color_path & (FBZCP_CC_SUB_CLOCAL | FBZCP_CC_ADD_CLOCAL) == 0
+            && mselect != CC_MSELECT_CLOCAL
+        {
             return color;
         }
         let local = if self.fbz_color_path & FBZCP_CC_LOCALSELECT_COLOR0 != 0 {
@@ -1759,6 +1766,16 @@ impl Distira {
             )
         } else {
             source
+        };
+        let color = if mselect == CC_MSELECT_CLOCAL {
+            let reverse = self.fbz_color_path & FBZCP_CC_REVERSE_BLEND != 0;
+            (
+                color_path_blend_channel(color.0, local.0, reverse),
+                color_path_blend_channel(color.1, local.1, reverse),
+                color_path_blend_channel(color.2, local.2, reverse),
+            )
+        } else {
+            color
         };
         let color = if self.fbz_color_path & FBZCP_CC_SUB_CLOCAL != 0 {
             (
@@ -2381,6 +2398,15 @@ fn detail_blend_channel(channel: u8, factor: u8) -> u8 {
     let inverse_factor = u32::from((factor ^ 0xff).wrapping_add(1));
     let subtract = (u32::from(channel) * inverse_factor) >> 8;
     channel.saturating_sub(subtract.min(u32::from(channel)) as u8)
+}
+
+fn color_path_blend_channel(channel: u8, factor: u8, reverse: bool) -> u8 {
+    let factor = if reverse {
+        u32::from((factor ^ 0xff).wrapping_add(1))
+    } else {
+        u32::from(factor) + 1
+    };
+    ((u32::from(channel) * factor) >> 8).min(255) as u8
 }
 
 fn texture_coord_index(coord: f32, size: usize, clamp: bool, mirror: bool) -> usize {
