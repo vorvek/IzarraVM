@@ -707,5 +707,10 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
       protected-mode code, preserving FIFO busy/depth status until the host drain
       seam applies the register packet stream. Validated by the machine guest
       command-FIFO type-1 BAR regression and the Distira machine gates.
-- [ ] Next: Guest instruction-level command FIFO type-5 framebuffer packets
-      through an assigned PCI BAR from real x86 code.
+- [x] Iteration 119: Guest instruction-level command FIFO type-5 framebuffer
+      packets now flow through the assigned BAR0 command-FIFO aperture from real
+      x86 protected-mode code and drain into the LFB write path. Validated by the
+      machine guest command-FIFO type-5 framebuffer BAR regression and the
+      Distira machine gates.
+- [ ] Next: Guest instruction-level command FIFO type-5 texture packets through
+      an assigned PCI BAR from real x86 code.
