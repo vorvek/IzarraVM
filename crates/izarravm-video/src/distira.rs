@@ -202,6 +202,9 @@ pub const FBZ_DITHER_SUB: u32 = 1 << 19;
 pub const FBZ_DEPTH_SOURCE: u32 = 1 << 20;
 pub const FBZ_PARAM_ADJUST: u32 = 1 << 26;
 pub const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
+pub const FBZCP_A_SELECT_SHIFT: u32 = 2;
+pub const FBZCP_A_SELECT_MASK: u32 = 0x3;
+pub const A_SELECT_TEX: u32 = 1;
 pub const TC_ZERO_OTHER: u32 = 1 << 12;
 pub const TC_SUB_CLOCAL: u32 = 1 << 13;
 pub const TC_MSELECT_SHIFT: u32 = 14;
@@ -674,8 +677,9 @@ impl Distira {
                 let blue = lerp_u8(a.b, b.b, c.b, l0, l1, l2);
                 let s = lerp_f32(a.s, b.s, c.s, l0, l1, l2);
                 let t = lerp_f32(a.t, b.t, c.t, l0, l1, l2);
-                let (r, g, blue) = self.texture_color_or_source(r, g, blue, s, t);
                 let alpha = lerp_u8(a.a, b.a, c.a, l0, l1, l2);
+                let (r, g, blue) = self.texture_color_or_source(r, g, blue, s, t);
+                let alpha = self.texture_alpha_or_source(alpha, s, t);
                 if !self.alpha_test_passes(alpha) {
                     self.fbi_afunc_fail = self.fbi_afunc_fail.wrapping_add(1);
                     continue;
@@ -1733,6 +1737,35 @@ impl Distira {
         let bias = ((detail >> 8) & 0x3f) as i32;
         let scale = (detail >> 14) & 0x7;
         ((bias - lod as i32) << scale).clamp(0, max).min(255) as u8
+    }
+
+    fn texture_alpha_or_source(&self, alpha: u8, s: f32, t: f32) -> u8 {
+        if self.fbz_color_path & FBZCP_TEXTURE_ENABLED == 0
+            || ((self.fbz_color_path >> FBZCP_A_SELECT_SHIFT) & FBZCP_A_SELECT_MASK) != A_SELECT_TEX
+        {
+            return alpha;
+        }
+
+        self.sample_tmu_alpha(0, s, t)
+    }
+
+    fn sample_tmu_alpha(&self, tmu: usize, s: f32, t: f32) -> u8 {
+        match (self.texture_mode_for_tmu(tmu) >> 8) & 0xf {
+            TEX_A8 => self.sample_tmu_u8(tmu, s, t),
+            TEX_AI8 => expand4(self.sample_tmu_u8(tmu, s, t) >> 4),
+            TEX_ARGB8332 | TEX_A8Y4I2Q2 | TEX_A8I8 | TEX_APAL88 => {
+                (self.sample_tmu_u16(tmu, s, t) >> 8) as u8
+            }
+            TEX_ARGB1555 => {
+                if self.sample_tmu_u16(tmu, s, t) & 0x8000 != 0 {
+                    0xff
+                } else {
+                    0
+                }
+            }
+            TEX_ARGB4444 => expand4((self.sample_tmu_u16(tmu, s, t) >> 12) as u8),
+            _ => 0xff,
+        }
     }
 
     fn sample_tmu_texture(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
