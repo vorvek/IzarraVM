@@ -71,12 +71,15 @@ pub const SST_FVERTEX_CY: usize = 0x09c;
 pub const SST_FSTART_R: usize = 0x0a0;
 pub const SST_FSTART_G: usize = 0x0a4;
 pub const SST_FSTART_B: usize = 0x0a8;
+pub const SST_FSTART_Z: usize = 0x0ac;
 pub const SST_FDR_DX: usize = 0x0c0;
 pub const SST_FDG_DX: usize = 0x0c4;
 pub const SST_FDB_DX: usize = 0x0c8;
+pub const SST_FDZ_DX: usize = 0x0cc;
 pub const SST_FDR_DY: usize = 0x0e0;
 pub const SST_FDG_DY: usize = 0x0e4;
 pub const SST_FDB_DY: usize = 0x0e8;
+pub const SST_FDZ_DY: usize = 0x0ec;
 pub const SST_FTRIANGLE_CMD: usize = 0x100;
 pub const SST_FBZ_COLOR_PATH: usize = 0x104;
 pub const SST_FOG_MODE: usize = 0x108;
@@ -284,6 +287,9 @@ pub struct Distira {
     ftriangle_color: [u32; 3],
     ftriangle_color_dx: [u32; 3],
     ftriangle_color_dy: [u32; 3],
+    ftriangle_depth: u32,
+    ftriangle_depth_dx: u32,
+    ftriangle_depth_dy: u32,
     fbi_pixels_in: u32,
     fbi_chroma_fail: u32,
     fbi_zfunc_fail: u32,
@@ -350,6 +356,9 @@ impl Distira {
             ftriangle_color: [0; 3],
             ftriangle_color_dx: [0; 3],
             ftriangle_color_dy: [0; 3],
+            ftriangle_depth: 0,
+            ftriangle_depth_dx: 0,
+            ftriangle_depth_dy: 0,
             fbi_pixels_in: 0,
             fbi_chroma_fail: 0,
             fbi_zfunc_fail: 0,
@@ -686,6 +695,10 @@ impl Distira {
                 merge_byte(&mut self.ftriangle_color[2], byte, value);
                 self.triangle_color[2] = float_color_to_fixed(self.ftriangle_color[2]);
             }
+            SST_FSTART_Z => {
+                merge_byte(&mut self.ftriangle_depth, byte, value);
+                self.triangle_depth = float_depth_to_fixed(self.ftriangle_depth);
+            }
             SST_FDR_DX => {
                 merge_byte(&mut self.ftriangle_color_dx[0], byte, value);
                 self.triangle_color_dx[0] = float_color_to_fixed(self.ftriangle_color_dx[0]);
@@ -698,6 +711,10 @@ impl Distira {
                 merge_byte(&mut self.ftriangle_color_dx[2], byte, value);
                 self.triangle_color_dx[2] = float_color_to_fixed(self.ftriangle_color_dx[2]);
             }
+            SST_FDZ_DX => {
+                merge_byte(&mut self.ftriangle_depth_dx, byte, value);
+                self.triangle_depth_dx = float_depth_to_fixed(self.ftriangle_depth_dx);
+            }
             SST_FDR_DY => {
                 merge_byte(&mut self.ftriangle_color_dy[0], byte, value);
                 self.triangle_color_dy[0] = float_color_to_fixed(self.ftriangle_color_dy[0]);
@@ -709,6 +726,10 @@ impl Distira {
             SST_FDB_DY => {
                 merge_byte(&mut self.ftriangle_color_dy[2], byte, value);
                 self.triangle_color_dy[2] = float_color_to_fixed(self.ftriangle_color_dy[2]);
+            }
+            SST_FDZ_DY => {
+                merge_byte(&mut self.ftriangle_depth_dy, byte, value);
+                self.triangle_depth_dy = float_depth_to_fixed(self.ftriangle_depth_dy);
             }
             SST_FTRIANGLE_CMD => {
                 if byte == 0 && value != 0 {
@@ -916,12 +937,15 @@ impl Distira {
             SST_FSTART_R => self.ftriangle_color[0],
             SST_FSTART_G => self.ftriangle_color[1],
             SST_FSTART_B => self.ftriangle_color[2],
+            SST_FSTART_Z => self.ftriangle_depth,
             SST_FDR_DX => self.ftriangle_color_dx[0],
             SST_FDG_DX => self.ftriangle_color_dx[1],
             SST_FDB_DX => self.ftriangle_color_dx[2],
+            SST_FDZ_DX => self.ftriangle_depth_dx,
             SST_FDR_DY => self.ftriangle_color_dy[0],
             SST_FDG_DY => self.ftriangle_color_dy[1],
             SST_FDB_DY => self.ftriangle_color_dy[2],
+            SST_FDZ_DY => self.ftriangle_depth_dy,
             SST_FTRIANGLE_CMD => 0,
             SST_FBZ_COLOR_PATH => self.fbz_color_path,
             SST_FOG_MODE => self.fog_mode,
@@ -1259,6 +1283,10 @@ fn float_vertex_to_fixed(raw: u32) -> u32 {
 
 fn float_color_to_fixed(raw: u32) -> u32 {
     ((f32::from_bits(raw) * 4096.0) as i32 as u32) & 0x00ff_ffff
+}
+
+fn float_depth_to_fixed(raw: u32) -> u32 {
+    (f32::from_bits(raw) * 4096.0) as i32 as u32
 }
 
 fn edge(ax: f32, ay: f32, bx: f32, by: f32, px: f32, py: f32) -> f32 {
