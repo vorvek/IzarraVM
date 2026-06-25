@@ -80,7 +80,10 @@ fn setup_save_applies_chosen_gsw_mode() {
         F10_MAKE,
         F10_BREAK, // Save
     ]);
-    let reason = machine.run_until_halt_or_cycles(20_000_000).unwrap();
+    // This test queues all six keys up front and processes them in one run, so the
+    // budget must cover the full POST (~15M with the RLE art) plus the setup menu
+    // walking and saving each queued key after it.
+    let reason = machine.run_until_halt_or_cycles(30_000_000).unwrap();
     assert!(
         matches!(reason, StopReason::CycleLimit { .. }),
         "setup saves then boots and idles"
