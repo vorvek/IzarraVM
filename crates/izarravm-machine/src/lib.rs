@@ -713,11 +713,14 @@ impl Machine {
 
     pub fn new(profile: MachineProfile, rom: impl AsRef<[u8]>) -> Result<Self, MachineError> {
         let rom = rom.as_ref();
-        if rom.len() != BIOS_ROM_SIZE {
+        // Accept either a bare 64 KiB BIOS or a larger flash image; in both cases
+        // the CPU sees the top BIOS_ROM_SIZE bytes shadowed at 0xF0000.
+        if rom.len() < BIOS_ROM_SIZE {
             return Err(MachineError::InvalidRomSize(rom.len()));
         }
+        let shadow = &rom[rom.len() - BIOS_ROM_SIZE..];
 
-        let mut machine = Self::base(profile, Cpu386::default(), rom.to_vec())?;
+        let mut machine = Self::base(profile, Cpu386::default(), shadow.to_vec())?;
         install_boot_bios_stubs(&mut machine.memory)?;
         Ok(machine)
     }
@@ -7677,6 +7680,20 @@ mod tests {
             max_ticks > 3,
             "INT 08h did not advance the BDA tick (got {max_ticks})"
         );
+    }
+
+    #[test]
+    fn machine_accepts_256k_flash_and_shadows_top_64k() {
+        // A 256 KiB flash whose top 64 KiB carries a recognizable reset far-jump
+        // boots: the machine maps the top 64 KiB at 0xF0000, so the reset vector at
+        // 0xFFFF0 reads the far jump.
+        let mut flash = vec![0u8; 256 * 1024];
+        let top = flash.len() - BIOS_ROM_SIZE;
+        flash[top + 0xfff0..top + 0xfff5].copy_from_slice(&[0xea, 0x00, 0x00, 0x00, 0xf0]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), flash).unwrap();
+        assert_eq!(machine.read_physical_u8(0xffff0), 0xea);
+        assert_eq!(machine.read_physical_u8(0xffff4), 0xf0);
     }
 
     fn test_machine() -> Machine {
