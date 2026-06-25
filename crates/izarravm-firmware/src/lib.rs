@@ -361,6 +361,15 @@ mod tests {
     }
 
     #[test]
+    fn izarra_bios_carries_v301_version_string() {
+        let needle = b"Izarra-BIOS v3.01 - 1997";
+        assert!(
+            IZARRA_BIOS.windows(needle.len()).any(|w| w == needle),
+            "v3.01 version string not found in the ROM"
+        );
+    }
+
+    #[test]
     fn toka_rom_parses_and_fits() {
         let rom = toka_dos_rom();
         assert_eq!(&rom[0..4], toka_rom::MAGIC);

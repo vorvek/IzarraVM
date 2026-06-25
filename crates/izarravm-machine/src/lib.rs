@@ -7696,6 +7696,35 @@ mod tests {
         assert_eq!(machine.read_physical_u8(0xffff4), 0xf0);
     }
 
+    #[test]
+    fn izarra_bios_boots_into_margo_lfb_screen() {
+        // POST sets the proprietary 320x240x8 Margo mode and draws its screen
+        // there. Fast POST (default) skips delays so the screen is up within the
+        // cycle budget.
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .unwrap();
+        for _ in 0..80 {
+            let _ = machine.run_until_halt_or_cycles(50_000).unwrap();
+            if machine.active_display() == ActiveDisplay::MargoLfb {
+                break;
+            }
+        }
+        assert_eq!(
+            machine.active_display(),
+            ActiveDisplay::MargoLfb,
+            "POST never set the Margo LFB mode"
+        );
+        let (words, w, h) = machine.frame_argb();
+        assert_eq!((w, h), (320, 240), "proprietary mode is 320x240");
+        assert!(
+            words.iter().any(|&p| p != words[0]),
+            "screen is a single flat color - nothing was drawn"
+        );
+    }
+
     fn test_machine() -> Machine {
         Machine::new(
             MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
@@ -17659,7 +17688,7 @@ mod tests {
         machine.set_toka_c_root(dir.path().to_path_buf());
         // POST, disk boot, TOKABOOT, ICOMMAND, then AUTOEXEC runs TESTS DEV, which
         // exits through the unit-tester as soon as the round-trip matches.
-        let reason = machine.run_until_halt_or_cycles(30_000_000).unwrap();
+        let reason = machine.run_until_halt_or_cycles(12_000_000).unwrap();
         assert_eq!(
             reason,
             StopReason::TestExit { code: 0 },
@@ -18160,41 +18189,58 @@ mod tests {
 
     #[test]
     fn izarra_bios_draws_graceful_post_screen() {
-        // The graceful screen is a white field (DAC index GFX_WHITE = 0) with the
-        // red "Izarra 3000" wordmark (index GFX_RED = 4) across the top and a red
-        // progress-bar frame lower down. The raster carries DAC indices, not RGB,
-        // so the palette remap to white/red does not change the index values here.
+        // The graceful screen is a white field (index GFX_WHITE = 0) with the red
+        // "Izarra 3000" wordmark (index GFX_RED = 4) across the top and a red
+        // progress-bar frame lower down. It is now drawn in the proprietary Margo
+        // LFB mode 0x150 (320x240x8, no double scan), so pixels are read as raw
+        // palette indices straight from the LFB VRAM at MARGO_LFB_BASE + y*320 + x.
+        // The LFB drawing primitives are heavier than the old rep-stosw mode 13h
+        // path, so POST needs a larger cycle budget than the original 5M.
         let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
-        machine.run_until_halt_or_cycles(5_000_000).unwrap();
-        // The BIOS is idling with the screen drawn; advance the beam to scan a frame.
-        machine.advance_devices(600_000);
-        let raster = machine.vga_raster().expect("mode 13h presents a VgaRaster");
-        assert_eq!(raster.width, 320);
-        let w = raster.width as usize;
+        machine.run_until_halt_or_cycles(12_000_000).unwrap();
+        assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
         // A clear spot (no logo, no text, no bar) is the white field, index 0.
-        // Logical y 64 -> physical 128 under the mode-13h double scan.
         assert_eq!(
-            raster.pixels[128 * w + 12],
+            machine.read_physical_u8(MARGO_LFB_BASE + 64 * 320 + 12),
             0,
-            "the background field cleared to white (index 0)"
+            "the background field is white (index 0)"
         );
-        // The red wordmark sits at logical y 8..29, x 62..257. Mode 13h double-
-        // scans, so that band lands at physical rows 16..58. Count index-4 pixels.
-        let logo_pixels = (16..58)
-            .flat_map(|y| (62..257).map(move |x| (x, y)))
-            .filter(|&(x, y)| raster.pixels[y * w + x] == 0x04)
-            .count();
+        // The red wordmark sits at logical y 8..29, x 62..257 (no double scan now).
+        let mut logo_pixels = 0;
+        for y in 8..29u32 {
+            for x in 62..257u32 {
+                if machine.read_physical_u8(MARGO_LFB_BASE + y * 320 + x) == 0x04 {
+                    logo_pixels += 1;
+                }
+            }
+        }
         assert!(
-            logo_pixels > 200,
+            logo_pixels > 100,
             "expected the red Izarra 3000 wordmark, found {logo_pixels} red pixels"
         );
-        // The progress-bar frame is red too. Its top edge is logical y 128 ->
-        // physical 256, spanning x 32..288. Find red pixels along that row band.
-        let bar_pixels = (256..260)
-            .flat_map(|y| (32..288).map(move |x| (x, y)))
-            .filter(|&(x, y)| raster.pixels[y * w + x] == 0x04)
-            .count();
+        // The black title text (index GFX_BLACK = 1) renders at logical y 40..48,
+        // x 32.. via lfb_text/lfb_glyph. Counting black pixels there guards the
+        // glyph path (a glyph register bug would leave the title blank/garbled).
+        let mut title_pixels = 0;
+        for y in 40..48u32 {
+            for x in 32..224u32 {
+                if machine.read_physical_u8(MARGO_LFB_BASE + y * 320 + x) == 0x01 {
+                    title_pixels += 1;
+                }
+            }
+        }
+        assert!(
+            title_pixels > 40,
+            "expected the black title text, found {title_pixels} black pixels"
+        );
+        // The progress-bar frame top edge is red at logical y 128, x 32..288.
+        let mut bar_pixels = 0;
+        for x in 32..288u32 {
+            if machine.read_physical_u8(MARGO_LFB_BASE + 128 * 320 + x) == 0x04 {
+                bar_pixels += 1;
+            }
+        }
         assert!(
             bar_pixels > 50,
             "expected the red progress-bar frame, found {bar_pixels} red pixels"
@@ -18457,7 +18503,12 @@ mod tests {
         let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
 
         machine.inject_key_scancodes(&[0x0f, 0x8f]); // Tab opens the boot menu.
-        machine.run_until_halt_or_cycles(5_000_000).unwrap();
+        // POST now paints the graceful screen via the per-pixel LFB primitives,
+        // heavier than the old rep-stosw mode 13h path, so reaching the boot menu
+        // takes more cycles than the original 5M budget. The boot menu itself still
+        // renders in mode 13h (it calls set_mode13h on entry), so the marker reads
+        // below via render_256color_row remain valid.
+        machine.run_until_halt_or_cycles(12_000_000).unwrap();
         assert!(
             marker_pixels(&machine, 80).contains(&1),
             "the initial 386 row has a black diamond"
