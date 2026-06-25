@@ -345,12 +345,13 @@ gfx_blit_1bpp:
 ; gfx_post_screen: paint the graceful POST screen. White field, the red Izarra
 ; 3000 wordmark centered across the top, black title/version and hint lines, and
 ; the empty red-framed progress bar. Called once before the RAM test paces.
+; Drawing is done into VRAM before lfb_set_mode so the display is fully painted
+; when the mode switch makes it visible.
 gfx_post_screen:
-    call set_mode13h
-    call gfx_post_palette
+    call gfx_post_palette           ; DAC slots 0 white, 1 black, 4 red (INT 10h)
     mov al, GFX_WHITE
-    call gfx_clear
-    ; Logo: blit the red wordmark centered at the top.
+    call lfb_clear                  ; cream/white field (index 0)
+    ; Wordmark: red 1bpp logo, centered near the top.
     push cs
     pop ds
     mov si, bios_logo_bitmap
@@ -360,7 +361,7 @@ gfx_post_screen:
     mov dx, LOGO_H
     mov bl, GFX_RED
     mov bh, LOGO_STRIDE
-    call gfx_blit_1bpp
+    call lfb_blit_1bpp
     ; Title + version line (black on white).
     push cs
     pop ds
@@ -369,9 +370,8 @@ gfx_post_screen:
     mov ax, POST_TITLE_Y
     mov bl, GFX_BLACK
     mov bh, GFX_WHITE
-    call gfx_text
-    ; Hint line (black on white). Drawn from x=8 so the full string fits inside
-    ; the 320 px width without spilling into the next row.
+    call lfb_text
+    ; Hint line (black on white), drawn from x=8.
     push cs
     pop ds
     mov si, str_post_hint
@@ -379,9 +379,9 @@ gfx_post_screen:
     mov ax, POST_HINT_Y
     mov bl, GFX_BLACK
     mov bh, GFX_WHITE
-    call gfx_text
-    ; Progress-bar frame: a thin red outline around the fill area.
+    call lfb_text
     call gfx_bar_frame
+    call lfb_set_mode               ; proprietary 320x240x8 Margo mode (activate last)
     ret
 
 ; gfx_bar_frame: draw the red outline of the RAM progress bar (top, bottom, and
@@ -398,25 +398,25 @@ gfx_bar_frame:
     mov si, POST_BAR_Y
     mov cx, POST_BAR_W
     mov dx, 1
-    call gfx_fill_rect
+    call lfb_fill_rect
     ; bottom edge
     mov di, POST_BAR_X
     mov si, POST_BAR_Y + POST_BAR_H - 1
     mov cx, POST_BAR_W
     mov dx, 1
-    call gfx_fill_rect
+    call lfb_fill_rect
     ; left edge
     mov di, POST_BAR_X
     mov si, POST_BAR_Y
     mov cx, 1
     mov dx, POST_BAR_H
-    call gfx_fill_rect
+    call lfb_fill_rect
     ; right edge
     mov di, POST_BAR_X + POST_BAR_W - 1
     mov si, POST_BAR_Y
     mov cx, 1
     mov dx, POST_BAR_H
-    call gfx_fill_rect
+    call lfb_fill_rect
     pop bx
     pop dx
     pop cx
@@ -445,7 +445,7 @@ gfx_bar_fill:
     mov si, POST_BAR_Y + 1
     mov dx, POST_BAR_H - 2          ; interior height
     mov bl, GFX_RED
-    call gfx_fill_rect
+    call lfb_fill_rect
 .done:
     popa
     ret
@@ -462,7 +462,7 @@ gfx_post_mem:
     mov cx, 256
     mov dx, 8
     mov bl, GFX_WHITE
-    call gfx_fill_rect
+    call lfb_fill_rect
     ; Label.
     push cs
     pop ds
@@ -471,14 +471,14 @@ gfx_post_mem:
     mov ax, POST_MEM_Y
     mov bl, GFX_BLACK
     mov bh, GFX_WHITE
-    call gfx_text
+    call lfb_text
     ; Number (5-digit, black on white), placed after the label.
     pop ax                          ; KiB value
     mov di, POST_TEXT_X + 17 * 8    ; "Testing memory:  " is 17 chars wide
     mov si, POST_MEM_Y
     mov bl, GFX_BLACK
     mov bh, GFX_WHITE
-    call gfx_putdec
+    call lfb_putdec
     ; " KB" suffix after the 5 digits.
     push cs
     pop ds
@@ -487,7 +487,7 @@ gfx_post_mem:
     mov ax, POST_MEM_Y
     mov bl, GFX_BLACK
     mov bh, GFX_WHITE
-    call gfx_text
+    call lfb_text
     popa
     ret
 
@@ -501,7 +501,7 @@ gfx_post_note:
     mov cx, 256
     mov dx, 8
     mov bl, GFX_WHITE
-    call gfx_fill_rect
+    call lfb_fill_rect
     pop si                          ; the note pointer (CS-relative)
     push cs
     pop ds
@@ -509,11 +509,11 @@ gfx_post_note:
     mov ax, POST_MEM_Y
     mov bl, GFX_BLACK
     mov bh, GFX_WHITE
-    call gfx_text
+    call lfb_text
     popa
     ret
 
-str_post_name: db 'Izarra 3000 BIOS  v1.0', 0
+str_post_name: db 'Izarra-BIOS v3.01 - 1997', 0
 ; The hint draws from x=8, so it must fit (320-8)/8 = 39 glyphs. This is 38.
 str_post_hint: db 'Del:Setup  Tab:Boot menu  Esc:skip mem', 0
 str_post_mem:  db 'Testing memory:  ', 0
