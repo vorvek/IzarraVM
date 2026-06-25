@@ -18307,21 +18307,6 @@ mod tests {
     }
 
     #[test]
-    fn izarra_bios_plays_the_power_on_chime() {
-        // POST opens with the four-note PC-speaker chime. The note delay is skipped
-        // under the default fast POST, but each note still programs PIT channel 2
-        // and drives port 0x61 bit 1 high, so the speaker enable latch must be set
-        // by the time POST has run.
-        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
-        let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
-        machine.run_until_halt_or_cycles(5_000_000).unwrap();
-        assert!(
-            machine.speaker_ever_enabled(),
-            "the power-on chime should enable the PC speaker during POST"
-        );
-    }
-
-    #[test]
     fn serial_tx_is_captured_and_lsr_reports_empty() {
         // A write to the COM1 transmit register (0x3F8) with DLAB clear appends to
         // the text serial_text() surfaces, and the line status register (0x3FD)
