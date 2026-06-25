@@ -446,7 +446,9 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
       by the video tLOD-min mip selection test plus the workspace gates.
 - [x] Iteration 21: two-TMU texture combine for RGB565 sampling. Validated by
       the video two-TMU RGB565 add-combine test plus the workspace gates.
-- [ ] Next: additional Voodoo texture formats, starting with RGB332.
+- [x] Iteration 22: RGB332 texture sampling. Validated by the video RGB332
+      texture sample test plus the workspace gates.
+- [ ] Next: I8 texture sampling.
 
 ## First 90 percent push for this branch
 

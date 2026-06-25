@@ -189,6 +189,7 @@ pub const FBZ_DEPTH_SOURCE: u32 = 1 << 20;
 pub const FBZ_PARAM_ADJUST: u32 = 1 << 26;
 pub const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
 
+pub const TEX_RGB332: u32 = 0x00;
 pub const TEX_R5G6B5: u32 = 0x0a;
 const CHIP_TREX0: usize = 0x2;
 const CHIP_TREX1: usize = 0x4;
@@ -1479,15 +1480,16 @@ impl Distira {
     }
 
     fn texture_color_or_source(&self, r: u8, g: u8, b: u8, s: f32, t: f32) -> (u8, u8, u8) {
+        let format = (self.texture_mode >> 8) & 0xf;
         if self.fbz_color_path & FBZCP_TEXTURE_ENABLED == 0
-            || ((self.texture_mode >> 8) & 0xf) != TEX_R5G6B5
+            || !matches!(format, TEX_RGB332 | TEX_R5G6B5)
         {
             return (r, g, b);
         }
-        let tmu0 = self.sample_tmu_rgb565(0, s, t);
+        let tmu0 = self.sample_tmu_texture(0, s, t);
         if self.texture_mode & (1 << 18) != 0 && ((self.texture_mode_tmu1 >> 8) & 0xf) == TEX_R5G6B5
         {
-            let tmu1 = self.sample_tmu_rgb565(1, s, t);
+            let tmu1 = self.sample_tmu_texture(1, s, t);
             return (
                 tmu0.0.saturating_add(tmu1.0),
                 tmu0.1.saturating_add(tmu1.1),
@@ -1495,6 +1497,31 @@ impl Distira {
             );
         }
         tmu0
+    }
+
+    fn sample_tmu_texture(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
+        match (self.texture_mode_for_tmu(tmu) >> 8) & 0xf {
+            TEX_RGB332 => self.sample_tmu_rgb332(tmu, s, t),
+            TEX_R5G6B5 => self.sample_tmu_rgb565(tmu, s, t),
+            _ => (0, 0, 0),
+        }
+    }
+
+    fn sample_tmu_rgb332(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
+        let lod = self.texture_lod_level(tmu);
+        let scale = (1_u32 << lod).max(1) as f32;
+        let width = (256_usize >> lod).max(1);
+        let height = (256_usize >> lod).max(1);
+        let s = (s / scale).floor() as usize & (width - 1);
+        let t = (t / scale).floor() as usize & (height - 1);
+        let texel = t * width + s;
+        let offset = (self.tex_base_addr_for_tmu(tmu) as usize)
+            .saturating_add(texture_mip_offset(lod, 1))
+            .saturating_add(texel);
+        let Some(&raw) = self.texture.get(offset) else {
+            return (0, 0, 0);
+        };
+        expand_rgb332(raw)
     }
 
     fn sample_tmu_rgb565(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
@@ -1578,7 +1605,7 @@ impl Distira {
         let t = t as usize & (height - 1);
         let texel = (t * width + s).saturating_mul(2);
         let offset = (base_addr as usize)
-            .saturating_add(rgb565_mip_offset(lod))
+            .saturating_add(texture_mip_offset(lod, 2))
             .saturating_add(texel);
         let Some(bytes) = self.texture.get(offset..offset.saturating_add(2)) else {
             return (0, 0, 0);
@@ -1763,14 +1790,28 @@ fn float_texture_coord_to_fixed(raw: u32) -> u32 {
     (f32::from_bits(raw) * 16384.0) as i32 as u32
 }
 
-fn rgb565_mip_offset(lod: u32) -> usize {
+fn texture_mip_offset(lod: u32, bytes_per_texel: usize) -> usize {
     (0..lod)
         .map(|level| {
             let width = (256_usize >> level).max(1);
             let height = (256_usize >> level).max(1);
-            width * height * 2
+            width * height * bytes_per_texel
         })
         .sum()
+}
+
+fn expand3(v: u8) -> u8 {
+    let v = u32::from(v & 0x07);
+    ((v << 5) | (v << 2) | (v >> 1)) as u8
+}
+
+fn expand2(v: u8) -> u8 {
+    let v = u32::from(v & 0x03);
+    ((v << 6) | (v << 4) | (v << 2) | v) as u8
+}
+
+fn expand_rgb332(raw: u8) -> (u8, u8, u8) {
+    (expand3(raw >> 5), expand3(raw >> 2), expand2(raw))
 }
 
 fn edge(ax: f32, ay: f32, bx: f32, by: f32, px: f32, py: f32) -> f32 {
