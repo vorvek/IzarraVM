@@ -124,16 +124,16 @@ pub const BOOT_SECTOR_ADDRESS: usize = 0x7c00;
 pub const BOOT_STAGE2_ADDRESS: usize = 0x8000;
 pub const BIOS_IRET_STUB_ADDRESS: usize = 0x0600;
 pub const RESULT_BLOCK_ADDRESS: usize = 0x9000;
-/// Fixed load segment for a .COM: PSP at linear 0x1000, clear of the IVT, the
-/// BIOS data area, the BIOS stub at 0x0600, and the boot result block at 0x9000.
-const DOS_LOAD_SEGMENT: u16 = 0x0100;
+/// Fixed load segment for a .COM: PSP at linear 0x2000, clear of the IVT, BIOS
+/// data area, BIOS RAM stubs, and the worst-case Toka-DOS SysVars/SDA layout.
+const DOS_LOAD_SEGMENT: u16 = 0x0200;
 
 /// Lotura system-controller identifier, mirroring the Margo card's MARGO_ID_VALUE
 /// convention (a fixed nonzero byte the guest can probe).
 pub const LOTURA_ID_VALUE: u8 = 0x5a;
 
-/// Drive number the ICDEX HLE exposes the CD-ROM at (0 = A:). The CD is D:,
-/// after A: floppy and C: host drive.
+/// Default drive number the ICDEX HLE exposes the CD-ROM at (0 = A:). With no
+/// CONFIG.SYS block drivers, the CD is D:, after A: floppy and C: host drive.
 ///
 /// ICDEX = Izarra CD-ROM Extensions, the Toka-DOS CD redirector. Its INT 2Fh
 /// interface is intentionally ABI-compatible with the CD extension interface
@@ -2733,12 +2733,13 @@ impl Machine {
             // CD-ROM installation check: BX = number of CD drives, CX = first
             // drive letter (0 = A:).
             0x1500 => {
-                // One CD drive is always present (D:), even with no disc loaded:
-                // a game maps the drive letter before inserting media.
-                let bx = 1u16;
+                // One CD drive is present if any D:..Z: letter remains after
+                // CONFIG.SYS block drivers. No disc is still a present drive.
+                let cd_drive = self.icdex_cd_drive_number();
+                let bx = u16::from(cd_drive.is_some());
                 let ebx = (self.cpu.registers.ebx() & !0xFFFF) | u32::from(bx);
                 self.cpu.registers.set_ebx(ebx);
-                let ecx = (self.cpu.registers.ecx() & !0xFFFF) | u32::from(CD_DRIVE_NUMBER);
+                let ecx = (self.cpu.registers.ecx() & !0xFFFF) | u32::from(cd_drive.unwrap_or(0));
                 self.cpu.registers.set_ecx(ecx);
                 true
             }
@@ -2747,26 +2748,33 @@ impl Machine {
             // pointer (the guest only needs the drive count/letter to map the
             // drive; the header is informational for our HLE path).
             0x1501 => {
-                let es = self.cpu.registers.segment(SegmentIndex::Es).base;
-                let bx = self.cpu.registers.ebx() as u16;
-                let addr = es.wrapping_add(u32::from(bx));
-                self.write_guest_block(addr, &[0u8; 5]); // subunit 0, header 0:0
+                if self.icdex_cd_drive_number().is_some() {
+                    let es = self.cpu.registers.segment(SegmentIndex::Es).base;
+                    let bx = self.cpu.registers.ebx() as u16;
+                    let addr = es.wrapping_add(u32::from(bx));
+                    self.write_guest_block(addr, &[0u8; 5]); // subunit 0, header 0:0
+                }
                 true
             }
             // Get CD-ROM drive letters: ES:BX -> one byte per drive letter, the
             // drive number (0 = A:). One CD drive.
             0x150D => {
-                let es = self.cpu.registers.segment(SegmentIndex::Es).base;
-                let bx = self.cpu.registers.ebx() as u16;
-                let addr = es.wrapping_add(u32::from(bx));
-                self.write_guest_block(addr, &[CD_DRIVE_NUMBER]);
+                if let Some(cd_drive) = self.icdex_cd_drive_number() {
+                    let es = self.cpu.registers.segment(SegmentIndex::Es).base;
+                    let bx = self.cpu.registers.ebx() as u16;
+                    let addr = es.wrapping_add(u32::from(bx));
+                    self.write_guest_block(addr, &[cd_drive]);
+                }
                 true
             }
             // Drive check: BX = ADADh signals ICDEX present; AX nonzero if the
             // drive in CX is a supported CD-ROM.
             0x150B => {
                 let cx = self.cpu.registers.ecx() as u16;
-                let supported = u16::from(cx == u16::from(CD_DRIVE_NUMBER));
+                let supported = u16::from(
+                    self.icdex_cd_drive_number()
+                        .is_some_and(|drive| cx == u16::from(drive)),
+                );
                 let eax = (self.cpu.registers.eax() & !0xFFFF) | u32::from(supported);
                 self.cpu.registers.set_eax(eax);
                 let ebx = (self.cpu.registers.ebx() & !0xFFFF) | 0xADAD;
@@ -2806,7 +2814,10 @@ impl Machine {
             // header. CX = drive number. Dispatch it to the ATAPI device.
             0x1510 => {
                 let cx = self.cpu.registers.ecx() as u16;
-                if cx != u16::from(CD_DRIVE_NUMBER) {
+                if self
+                    .icdex_cd_drive_number()
+                    .is_none_or(|drive| cx != u16::from(drive))
+                {
                     // Invalid drive: CF set, AX = 000Fh.
                     let eax = (self.cpu.registers.eax() & !0xFFFF) | 0x000F;
                     self.cpu.registers.set_eax(eax);
@@ -3515,6 +3526,10 @@ impl Machine {
     fn handle_int29(&mut self) {
         let al = self.cpu.registers.eax() as u8;
         self.teletype_char(al);
+    }
+
+    fn icdex_cd_drive_number(&self) -> Option<u8> {
+        self.dos.next_block_device_drive()
     }
 
     /// Execute one CD-ROM device driver request whose header begins at linear
@@ -7961,6 +7976,50 @@ mod tests {
             .unwrap();
         m.memory
             .write_u16(staged.request_linear + 0x10, staged.driver_seg)
+            .unwrap();
+        m.dos.finalize_sys_driver(&staged, &mut m.memory).unwrap();
+        izarravm_dos::FarPtr {
+            segment: staged.driver_seg,
+            offset: 0,
+        }
+    }
+
+    fn stage_marker_block_units(m: &mut Machine, units: u8) -> izarravm_dos::FarPtr {
+        let mut image = marker_device_image(b"BLKUNIT ", 0x0000);
+        image.resize(0x80, 0);
+        let staged = m
+            .dos
+            .stage_sys_driver(
+                &image,
+                "",
+                izarravm_dos::DriverLoadPlacement::Low,
+                &mut m.memory,
+            )
+            .unwrap();
+        let array_offset = 0x50u16;
+        let array_linear = usize::from(staged.driver_seg) * 16 + usize::from(array_offset);
+        for unit in 0..units {
+            m.memory
+                .write_u16(array_linear + usize::from(unit) * 2, 0)
+                .unwrap();
+        }
+        m.memory
+            .write_u16(staged.request_linear + 0x03, 0x0100)
+            .unwrap();
+        m.memory
+            .write_u8(staged.request_linear + 0x0d, units)
+            .unwrap();
+        m.memory
+            .write_u16(staged.request_linear + 0x0e, 0x0080)
+            .unwrap();
+        m.memory
+            .write_u16(staged.request_linear + 0x10, staged.driver_seg)
+            .unwrap();
+        m.memory
+            .write_u16(staged.request_linear + 0x12, array_offset)
+            .unwrap();
+        m.memory
+            .write_u16(staged.request_linear + 0x14, staged.driver_seg)
             .unwrap();
         m.dos.finalize_sys_driver(&staged, &mut m.memory).unwrap();
         izarravm_dos::FarPtr {
@@ -13552,6 +13611,142 @@ mod tests {
     }
 
     #[test]
+    fn icdex_moves_after_loaded_block_device_units() {
+        let mut machine = test_machine();
+        machine
+            .dos
+            .init_program(0x0100, 0x1100, &mut machine.memory)
+            .unwrap();
+        stage_marker_block_units(&mut machine, 2);
+
+        machine.cpu.registers.set_eax(0x1500);
+        assert!(machine.handle_int2f());
+        assert_eq!(machine.cpu.registers.ebx() as u16, 1);
+        assert_eq!(machine.cpu.registers.ecx() as u16, 5, "CD moves to F:");
+
+        let buffer = 0x3000u32;
+        machine.write_guest_block(buffer, &[0xaa; 5]);
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0));
+        machine.cpu.registers.set_ebx(buffer);
+        machine.cpu.registers.set_eax(0x1501);
+        assert!(machine.handle_int2f());
+        assert_eq!(
+            (0..5)
+                .map(|i| machine.read_physical_u8(buffer + i))
+                .collect::<Vec<_>>(),
+            vec![0; 5],
+            "AX=1501h writes the one moved device-list entry"
+        );
+
+        machine.write_physical_u8(buffer, 0xaa);
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0));
+        machine.cpu.registers.set_ebx(buffer);
+        machine.cpu.registers.set_eax(0x150D);
+        assert!(machine.handle_int2f());
+        assert_eq!(machine.read_physical_u8(buffer), 5, "AX=150Dh reports F:");
+
+        machine.cpu.registers.set_eax(0x150B);
+        machine.cpu.registers.set_ecx(5);
+        assert!(machine.handle_int2f());
+        assert_eq!(machine.cpu.registers.ebx() as u16, 0xADAD);
+        assert_ne!(machine.cpu.registers.eax() as u16, 0, "F: is supported");
+
+        machine.cpu.registers.set_eax(0x150B);
+        machine.cpu.registers.set_ecx(u32::from(CD_DRIVE_NUMBER));
+        assert!(machine.handle_int2f());
+        assert_eq!(machine.cpu.registers.ebx() as u16, 0xADAD);
+        assert_eq!(
+            machine.cpu.registers.eax() as u16,
+            0,
+            "D: is no longer supported"
+        );
+
+        let header = 0x3100u32;
+        machine.write_physical_u8(header + 2, 0x83); // SEEK: benign request
+        prime_dos_int_frame(&mut machine);
+        machine.cpu.registers.set_eax(0x1510);
+        machine.cpu.registers.set_ebx(header);
+        machine.cpu.registers.set_ecx(5);
+        assert!(machine.handle_int2f());
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "F: request clears CF");
+        assert_eq!(
+            machine.read_guest_word(header + 3),
+            0x0100,
+            "request completed"
+        );
+
+        prime_dos_int_frame(&mut machine);
+        machine.cpu.registers.set_eax(0x1510);
+        machine.cpu.registers.set_ebx(header);
+        machine.cpu.registers.set_ecx(u32::from(CD_DRIVE_NUMBER));
+        assert!(machine.handle_int2f());
+        assert_eq!(machine.cpu.registers.eax() as u16, 0x000f);
+        assert_eq!(dos_int_flags(&machine) & 1, 1, "D: request sets CF");
+    }
+
+    #[test]
+    fn icdex_reports_no_cd_when_block_devices_exhaust_d_through_z() {
+        let mut machine = test_machine();
+        machine
+            .dos
+            .init_program(0x0100, 0x1100, &mut machine.memory)
+            .unwrap();
+        stage_marker_block_units(&mut machine, 23);
+
+        machine.cpu.registers.set_eax(0x1500);
+        machine.cpu.registers.set_ebx(0xbeef);
+        machine.cpu.registers.set_ecx(0xface);
+        assert!(machine.handle_int2f());
+        assert_eq!(machine.cpu.registers.ebx() as u16, 0);
+        assert_eq!(machine.cpu.registers.ecx() as u16, 0);
+
+        let buffer = 0x3000u32;
+        machine.write_guest_block(buffer, &[0xaa; 8]);
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0));
+        machine.cpu.registers.set_ebx(buffer);
+        machine.cpu.registers.set_eax(0x1501);
+        assert!(machine.handle_int2f());
+        assert_eq!(
+            (0..5)
+                .map(|i| machine.read_physical_u8(buffer + i))
+                .collect::<Vec<_>>(),
+            vec![0xaa; 5],
+            "AX=1501h leaves the caller buffer untouched when no CD drive exists"
+        );
+
+        machine.cpu.registers.set_eax(0x150D);
+        assert!(machine.handle_int2f());
+        assert_eq!(
+            machine.read_physical_u8(buffer),
+            0xaa,
+            "AX=150Dh writes no drive letter when no CD drive exists"
+        );
+
+        machine.cpu.registers.set_eax(0x150B);
+        machine.cpu.registers.set_ecx(u32::from(CD_DRIVE_NUMBER));
+        assert!(machine.handle_int2f());
+        assert_eq!(machine.cpu.registers.ebx() as u16, 0xADAD);
+        assert_eq!(machine.cpu.registers.eax() as u16, 0, "D: is unsupported");
+
+        prime_dos_int_frame(&mut machine);
+        machine.cpu.registers.set_eax(0x1510);
+        machine.cpu.registers.set_ecx(u32::from(CD_DRIVE_NUMBER));
+        machine.cpu.registers.set_ebx(buffer);
+        assert!(machine.handle_int2f());
+        assert_eq!(machine.cpu.registers.eax() as u16, 0x000f);
+        assert_eq!(dos_int_flags(&machine) & 1, 1, "invalid drive sets CF");
+    }
+
+    #[test]
     fn icdex_send_request_read_long_loads_a_sector() {
         let mut machine = test_machine();
         // A small data ISO with a marker per sector.
@@ -13849,8 +14044,8 @@ mod tests {
         let ptr = read_u32(&mut machine, base + 0x0e);
         let list = (((ptr >> 16) & 0xffff) << 4) + (ptr & 0xffff);
         let expected = [
-            0x0100, 0x0101, 0x0103, 0x0105, 0x0110, 0x0111, 0x0113, 0x0114, 0x0116, 0x0117, 0x014a,
-            0x014c, 0x014e, 0xffff,
+            0x0100, 0x0101, 0x0150, 0x0103, 0x0105, 0x0110, 0x0111, 0x0113, 0x0114, 0x0116, 0x0117,
+            0x014a, 0x014c, 0x014e, 0xffff,
         ];
         for (i, &mode) in expected.iter().enumerate() {
             assert_eq!(read_u16(&mut machine, list + (i * 2) as u32), mode);
@@ -15535,16 +15730,17 @@ mod tests {
         let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
         assert_eq!(reason, StopReason::DosExit { code: 0 });
         let mem = machine.memory();
-        // PSP at 0x0100 -> linear 0x1000; the program stored words at offsets 0x200..0x205.
-        assert_eq!(mem.read_u16(0x1200).unwrap(), 0x0000); // ES from IVT[0x21] (stub segment)
-        assert_eq!(mem.read_u16(0x1202).unwrap(), 0x0600); // BX from IVT[0x21] (stub offset)
+        let psp_base = usize::from(DOS_LOAD_SEGMENT) * 16;
+        // The program stored words at PSP offsets 0x200..0x205.
+        assert_eq!(mem.read_u16(psp_base + 0x200).unwrap(), 0x0000); // ES from IVT[0x21]
+        assert_eq!(mem.read_u16(psp_base + 0x202).unwrap(), 0x0600); // BX from IVT[0x21]
         // AH=48h returns a data segment that follows the seeded BLASTER=/SETSOUND=
         // env block plus the new block's own reserved MCB header. Derive the
         // expected segment from the env block so the assertion tracks the env size,
         // not a hardcoded value. The block ends with the DOS 3.0+ argv0 trailer: a
         // terminator NUL, a WORD count of 1, and the ASCIIZ program path, so account
         // for it here.
-        let env_seg = mem.read_u16(0x1000 + 0x2c).unwrap();
+        let env_seg = mem.read_u16(psp_base + 0x2c).unwrap();
         let strings = sound_blaster_env_entries(&SoundBlasterConfig::default())
             .iter()
             .map(|(key, value)| key.len() + 1 + value.len() + 1)
@@ -15555,7 +15751,7 @@ mod tests {
         // env_seg + env_paras is the env block's first free paragraph (its MCB header
         // slot); the AH=48h data segment is one paragraph above that header.
         assert_eq!(
-            mem.read_u16(0x1204).unwrap(),
+            mem.read_u16(psp_base + 0x204).unwrap(),
             env_seg + env_paras + 1,
             "AH=48h allocated segment follows the env block and its MCB header"
         );
@@ -15702,7 +15898,13 @@ mod tests {
         let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
 
         assert_eq!(reason, StopReason::DosExit { code: 0 });
-        assert_eq!(machine.memory().read_u8(0x1200).unwrap(), 0x23);
+        assert_eq!(
+            machine
+                .memory()
+                .read_u8(usize::from(DOS_LOAD_SEGMENT) * 16 + 0x200)
+                .unwrap(),
+            0x23
+        );
     }
 
     #[test]
@@ -16842,6 +17044,173 @@ mod tests {
         let [lo, hi] = status.to_le_bytes();
         img[0x13..0x1B].copy_from_slice(&[0xB8, lo, hi, 0x26, 0x89, 0x47, 0x03, 0xCB]);
         img
+    }
+
+    fn inline_block_sys_image(name: &[u8; 8], status: u16, units: u8) -> Vec<u8> {
+        let mut img = vec![0u8; 0x70];
+        img[0..4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        img[4..6].copy_from_slice(&0x0000u16.to_le_bytes()); // block device
+        img[6..8].copy_from_slice(&0x0012u16.to_le_bytes()); // strategy off
+        img[8..10].copy_from_slice(&0x0013u16.to_le_bytes()); // interrupt off
+        img[10..18].copy_from_slice(name);
+        img[0x12] = 0xCB; // strategy: retf
+        let [lo, hi] = status.to_le_bytes();
+        img[0x13..0x2D].copy_from_slice(&[
+            0xB8, lo, hi, 0x26, 0x89, 0x47, 0x03, // mov ax,status; mov es:[bx+3],ax
+            0x26, 0xC6, 0x47, 0x0D, units, // mov byte es:[bx+0Dh],units
+            0xB8, 0x40, 0x00, 0x26, 0x89, 0x47, 0x12, // BPB-offset array offset
+            0x0E, 0x58, 0x26, 0x89, 0x47, 0x14, // push cs; pop ax; write array segment
+            0xCB,
+        ]);
+        img[0x40..0x42].copy_from_slice(&0x0050u16.to_le_bytes());
+        let mut bpb = [0u8; 0x19];
+        bpb[0..2].copy_from_slice(&1024u16.to_le_bytes()); // bytes per sector
+        bpb[2] = 1; // sectors per cluster
+        bpb[3..5].copy_from_slice(&1u16.to_le_bytes()); // reserved sectors
+        bpb[5] = 2; // FATs
+        bpb[6..8].copy_from_slice(&224u16.to_le_bytes()); // root entries
+        bpb[8..10].copy_from_slice(&1440u16.to_le_bytes()); // total sectors
+        bpb[10] = 0xF9; // media descriptor
+        bpb[11..13].copy_from_slice(&9u16.to_le_bytes()); // sectors per FAT
+        bpb[13..15].copy_from_slice(&18u16.to_le_bytes()); // sectors per track
+        bpb[15..17].copy_from_slice(&2u16.to_le_bytes()); // heads
+        img[0x50..0x69].copy_from_slice(&bpb);
+        img
+    }
+
+    #[test]
+    fn config_sys_block_device_assigns_d_drive_and_dpb() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = izarravm_firmware::toka_dos_system_files();
+        izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format)
+            .unwrap();
+        std::fs::write(
+            dir.path().join("BLKDRV.SYS"),
+            inline_block_sys_image(b"BLKDRV  ", 0x0100, 1),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("CONFIG.SYS"), "DEVICE=C:\\BLKDRV.SYS\r\n").unwrap();
+
+        let mut machine = test_machine();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        machine.set_toka_c_root(dir.path().to_path_buf());
+        machine.perform_toka_service(0x10);
+        assert_eq!(machine.toka_service_status, 0);
+        assert!(device_chain_contains(&mut machine, b"BLKDRV  "));
+
+        let mut regs = izarravm_dos::DosRegs {
+            ax: 0x5200,
+            ..izarravm_dos::DosRegs::default()
+        };
+        machine
+            .dos
+            .dispatch(0x21, &mut regs, &mut machine.memory)
+            .unwrap();
+        let base = usize::from(regs.es) * 16 + usize::from(regs.bx);
+        assert_eq!(machine.memory.read_u8(base + 0x20).unwrap(), 2);
+        assert_eq!(machine.memory.read_u16(base + 0x10).unwrap(), 1024);
+        let c_dpb_off = machine.memory.read_u16(base).unwrap();
+        let c_dpb_seg = machine.memory.read_u16(base + 2).unwrap();
+        let c_dpb = usize::from(c_dpb_seg) * 16 + usize::from(c_dpb_off);
+        let d_dpb_off = machine.memory.read_u16(c_dpb + 0x19).unwrap();
+        let d_dpb_seg = machine.memory.read_u16(c_dpb + 0x1b).unwrap();
+        let d_dpb = usize::from(d_dpb_seg) * 16 + usize::from(d_dpb_off);
+        assert_eq!(machine.memory.read_u8(d_dpb).unwrap(), 3, "D: DPB drive");
+        assert_eq!(machine.memory.read_u16(d_dpb + 0x02).unwrap(), 1024);
+        assert_eq!(machine.memory.read_u16(d_dpb + 0x0b).unwrap(), 26);
+        assert_eq!(machine.memory.read_u16(d_dpb + 0x0d).unwrap(), 1415);
+        assert_eq!(machine.memory.read_u16(d_dpb + 0x0f).unwrap(), 9);
+        assert_eq!(machine.memory.read_u16(d_dpb + 0x11).unwrap(), 19);
+        let header = device_header_for(&mut machine, b"BLKDRV  ").unwrap();
+        assert_eq!(machine.memory.read_u16(d_dpb + 0x13).unwrap(), header.1);
+        assert_eq!(machine.memory.read_u16(d_dpb + 0x15).unwrap(), header.0);
+
+        write_guest_asciiz(&mut machine, 0x2000, 0x0000, "BLKDRV");
+        let mut open = izarravm_dos::DosRegs {
+            ax: 0x3d00,
+            ds: 0x2000,
+            dx: 0x0000,
+            ..izarravm_dos::DosRegs::default()
+        };
+        machine
+            .dos
+            .dispatch(0x21, &mut open, &mut machine.memory)
+            .unwrap();
+        assert!(
+            open.cf,
+            "block driver is not a character-device open target"
+        );
+
+        machine.cpu.registers.set_eax(0x0003);
+        machine.cpu.registers.set_ecx(0x0001);
+        machine.cpu.registers.set_edx(0);
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x2000));
+        machine.cpu.registers.set_ebx(0x0100);
+        machine.handle_int25();
+        assert_ne!(
+            machine.cpu.registers.eax() as u16,
+            0,
+            "D: absolute read is deferred"
+        );
+        machine.cpu.registers.set_eax(0x0003);
+        machine.handle_int26();
+        assert_ne!(
+            machine.cpu.registers.eax() as u16,
+            0,
+            "D: absolute write is deferred"
+        );
+
+        machine.cpu.registers.set_eax(0x1500);
+        assert!(machine.handle_int2f());
+        assert_eq!(machine.cpu.registers.ecx() as u16, 4, "ICDEX moves to E:");
+    }
+
+    #[test]
+    fn config_sys_block_driver_exhaustion_skips_following_driver_before_init() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = izarravm_firmware::toka_dos_system_files();
+        izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format)
+            .unwrap();
+        std::fs::write(
+            dir.path().join("FULL.SYS"),
+            inline_block_sys_image(b"FULLDRV ", 0x0100, 30),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("MARKER.SYS"),
+            inline_block_sys_image(b"MARKER  ", 0x0100, 1),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("CONFIG.SYS"),
+            "DEVICE=C:\\FULL.SYS\r\nDEVICE=C:\\MARKER.SYS\r\n",
+        )
+        .unwrap();
+
+        let mut machine = test_machine();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        machine.set_toka_c_root(dir.path().to_path_buf());
+        machine.perform_toka_service(0x10);
+        assert_eq!(machine.toka_service_status, 0);
+
+        assert!(device_chain_contains(&mut machine, b"FULLDRV "));
+        assert!(
+            !device_chain_contains(&mut machine, b"MARKER  "),
+            "the exhausted block driver must not be called or linked"
+        );
+        machine.cpu.registers.set_eax(0x1500);
+        assert!(machine.handle_int2f());
+        assert_eq!(
+            machine.cpu.registers.ebx() as u16,
+            0,
+            "D: through Z: are consumed"
+        );
+        let console = String::from_utf8_lossy(machine.dos_output()).into_owned();
+        assert!(console.contains("FULL.SYS") && console.contains("installed"));
+        assert!(console.contains("MARKER.SYS") && console.contains("failed to install"));
     }
 
     #[test]
