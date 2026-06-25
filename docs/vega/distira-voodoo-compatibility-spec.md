@@ -410,7 +410,10 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
 - [x] Iteration 7: Gouraud color gradients for untextured Voodoo triangles
       through integer color derivative registers. Validated by the video
       triangle gradient test plus the workspace gates.
-- [ ] Next: float color derivative registers for `SST_ftriangleCMD`.
+- [x] Iteration 8: float color derivative registers for `SST_ftriangleCMD`.
+      Validated by the video float triangle gradient test plus the workspace
+      gates.
+- [ ] Next: depth test and depth write for untextured Voodoo triangles.
 
 ## First 90 percent push for this branch
 
