@@ -209,6 +209,7 @@ pub const FBZCP_A_SELECT_SHIFT: u32 = 2;
 pub const FBZCP_A_SELECT_MASK: u32 = 0x3;
 pub const A_SELECT_TEX: u32 = 1;
 pub const FBZCP_CC_LOCALSELECT_COLOR0: u32 = 1 << 4;
+pub const FBZCP_CC_ZERO_OTHER: u32 = 1 << 8;
 pub const FBZCP_CC_SUB_CLOCAL: u32 = 1 << 9;
 pub const FBZCP_CC_MSELECT_SHIFT: u32 = 10;
 pub const FBZCP_CC_MSELECT_MASK: u32 = 0x7;
@@ -1784,7 +1785,11 @@ impl Distira {
         texture_rgb: (u8, u8, u8),
     ) -> (u8, u8, u8) {
         let mselect = (self.fbz_color_path >> FBZCP_CC_MSELECT_SHIFT) & FBZCP_CC_MSELECT_MASK;
-        if self.fbz_color_path & (FBZCP_CC_SUB_CLOCAL | FBZCP_CC_ADD_CLOCAL | FBZCP_CC_ADD_ALOCAL)
+        if self.fbz_color_path
+            & (FBZCP_CC_ZERO_OTHER
+                | FBZCP_CC_SUB_CLOCAL
+                | FBZCP_CC_ADD_CLOCAL
+                | FBZCP_CC_ADD_ALOCAL)
             == 0
             && mselect != CC_MSELECT_CLOCAL
             && mselect != CC_MSELECT_AOTHER
@@ -1794,6 +1799,11 @@ impl Distira {
         {
             return color;
         }
+        let color = if self.fbz_color_path & FBZCP_CC_ZERO_OTHER != 0 {
+            (0, 0, 0)
+        } else {
+            color
+        };
         let local = if self.fbz_color_path & FBZCP_CC_LOCALSELECT_COLOR0 != 0 {
             (
                 (self.color0 >> 16) as u8,
