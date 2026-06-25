@@ -514,7 +514,9 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
       video texture color alocal-add test plus the workspace gates.
 - [x] Iteration 55: texture color path aother modulation behavior. Validated by
       the video texture color aother-modulation test plus the workspace gates.
-- [ ] Next: texture color path alocal modulation behavior.
+- [x] Iteration 56: texture color path alocal modulation behavior. Validated by
+      the video texture color alocal-modulation test plus the workspace gates.
+- [ ] Next: texture color path texture-alpha modulation behavior.
 
 ## First 90 percent push for this branch
 
