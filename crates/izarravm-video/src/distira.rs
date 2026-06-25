@@ -210,6 +210,9 @@ pub const FBZCP_A_SELECT_MASK: u32 = 0x3;
 pub const A_SELECT_TEX: u32 = 1;
 pub const A_SELECT_COLOR1: u32 = 2;
 pub const FBZCP_CC_LOCALSELECT_COLOR0: u32 = 1 << 4;
+pub const FBZCP_CCA_LOCALSELECT_SHIFT: u32 = 5;
+pub const FBZCP_CCA_LOCALSELECT_MASK: u32 = 0x3;
+pub const CCA_LOCALSELECT_COLOR0: u32 = 1;
 pub const FBZCP_CC_ZERO_OTHER: u32 = 1 << 8;
 pub const FBZCP_CC_SUB_CLOCAL: u32 = 1 << 9;
 pub const FBZCP_CC_MSELECT_SHIFT: u32 = 10;
@@ -707,11 +710,12 @@ impl Distira {
                 let s = lerp_f32(a.s, b.s, c.s, l0, l1, l2);
                 let t = lerp_f32(a.t, b.t, c.t, l0, l1, l2);
                 let alpha = lerp_u8(a.a, b.a, c.a, l0, l1, l2);
+                let alocal = self.alpha_local_source(alpha);
                 let texture_alpha = self.texture_alpha_factor(s, t);
                 let aother = self.texture_alpha_or_source(alpha, s, t);
                 let (r, g, blue) =
-                    self.texture_color_or_source((x, y), (r, g, blue), alpha, aother, (s, t));
-                let alpha = self.apply_alpha_path(alpha, aother, texture_alpha);
+                    self.texture_color_or_source((x, y), (r, g, blue), alocal, aother, (s, t));
+                let alpha = self.apply_alpha_path(alocal, aother, texture_alpha);
                 if !self.alpha_test_passes(alpha) {
                     self.fbi_afunc_fail = self.fbi_afunc_fail.wrapping_add(1);
                     continue;
@@ -1921,6 +1925,16 @@ impl Distira {
         match (self.fbz_color_path >> FBZCP_A_SELECT_SHIFT) & FBZCP_A_SELECT_MASK {
             A_SELECT_TEX => self.sample_tmu_alpha(0, s, t),
             A_SELECT_COLOR1 => (self.color1 >> 24) as u8,
+            _ => alpha,
+        }
+    }
+
+    fn alpha_local_source(&self, alpha: u8) -> u8 {
+        if self.fbz_color_path & FBZCP_TEXTURE_ENABLED == 0 {
+            return alpha;
+        }
+        match (self.fbz_color_path >> FBZCP_CCA_LOCALSELECT_SHIFT) & FBZCP_CCA_LOCALSELECT_MASK {
+            CCA_LOCALSELECT_COLOR0 => (self.color0 >> 24) as u8,
             _ => alpha,
         }
     }

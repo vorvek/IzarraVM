@@ -545,7 +545,10 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
 - [x] Iteration 68: texture alpha path color1 alpha select behavior.
       Validated by the video texture alpha color1-select test plus the
       workspace gates.
-- [ ] Next: texture alpha path color0 local-alpha select behavior.
+- [x] Iteration 69: texture alpha path color0 local-alpha select behavior.
+      Validated by the video texture alpha color0 local-select test plus the
+      workspace gates.
+- [ ] Next: texture alpha path iter-Z local-alpha select behavior.
 
 ## First 90 percent push for this branch
 
