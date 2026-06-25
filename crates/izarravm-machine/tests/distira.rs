@@ -118,7 +118,9 @@ fn distira_pci_config_ports_report_voodoo_graphics_identity() {
     let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
 
     assert_eq!(reason, StopReason::DosExit { code: 0 });
-    assert_eq!(read_guest_u32(&mut machine, 0x1200), 0x0001_121a);
+    // The direct DOS loader enters .COM programs at segment 0x0200; the guest
+    // stores at DS:0200, so the physical result lives at 0x2200.
+    assert_eq!(read_guest_u32(&mut machine, 0x2200), 0x0001_121a);
 }
 
 #[test]
