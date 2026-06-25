@@ -150,6 +150,14 @@ pub const SST_FBI_INIT7: usize = 0x24c;
 pub const SST_TEXTURE_MODE: usize = 0x300;
 pub const SST_TLOD: usize = 0x304;
 pub const SST_TEX_BASE_ADDR: usize = 0x30c;
+pub const SST_NCC_TABLE0_Y0: usize = 0x324;
+pub const SST_NCC_TABLE0_Y1: usize = 0x328;
+pub const SST_NCC_TABLE0_Y2: usize = 0x32c;
+pub const SST_NCC_TABLE0_Y3: usize = 0x330;
+pub const SST_NCC_TABLE0_I0: usize = 0x334;
+pub const SST_NCC_TABLE0_I1: usize = 0x338;
+pub const SST_NCC_TABLE0_I2: usize = 0x33c;
+pub const SST_NCC_TABLE0_I3: usize = 0x340;
 pub const SST_NCC_TABLE0_Q2: usize = 0x34c;
 pub const SST_NCC_TABLE0_Q3: usize = 0x350;
 
@@ -192,6 +200,7 @@ pub const FBZ_PARAM_ADJUST: u32 = 1 << 26;
 pub const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
 
 pub const TEX_RGB332: u32 = 0x00;
+pub const TEX_Y4I2Q2: u32 = 0x01;
 pub const TEX_A8: u32 = 0x02;
 pub const TEX_I8: u32 = 0x03;
 pub const TEX_AI8: u32 = 0x04;
@@ -403,6 +412,9 @@ pub struct Distira {
     tex_base_addr_tmu1: u32,
     ncc_table0_q2: [u32; 2],
     ncc_table0_q3: [u32; 2],
+    ncc_table0_y: [[u32; 4]; 2],
+    ncc_table0_i: [[u32; 4]; 2],
+    ncc_table0_q: [[u32; 4]; 2],
     texture_palette: [[u32; 256]; 2],
 }
 
@@ -493,6 +505,9 @@ impl Distira {
             tex_base_addr_tmu1: 0,
             ncc_table0_q2: [0; 2],
             ncc_table0_q3: [0; 2],
+            ncc_table0_y: [[0; 4]; 2],
+            ncc_table0_i: [[0; 4]; 2],
+            ncc_table0_q: [[0; 4]; 2],
             texture_palette: [[0; 256]; 2],
         }
     }
@@ -1029,6 +1044,14 @@ impl Distira {
                     merge_byte(&mut self.tex_base_addr_tmu1, byte, value);
                 }
             }
+            SST_NCC_TABLE0_Y0 => self.write_ncc_y_registers(chip, 0, byte, value),
+            SST_NCC_TABLE0_Y1 => self.write_ncc_y_registers(chip, 1, byte, value),
+            SST_NCC_TABLE0_Y2 => self.write_ncc_y_registers(chip, 2, byte, value),
+            SST_NCC_TABLE0_Y3 => self.write_ncc_y_registers(chip, 3, byte, value),
+            SST_NCC_TABLE0_I0 => self.write_ncc_i_registers(chip, 0, byte, value),
+            SST_NCC_TABLE0_I1 => self.write_ncc_i_registers(chip, 1, byte, value),
+            SST_NCC_TABLE0_I2 => self.write_ncc_i_registers(chip, 2, byte, value),
+            SST_NCC_TABLE0_I3 => self.write_ncc_i_registers(chip, 3, byte, value),
             SST_NCC_TABLE0_Q2 => self.write_palette_registers(chip, false, byte, value),
             SST_NCC_TABLE0_Q3 => self.write_palette_registers(chip, true, byte, value),
             _ if voodoo_reg == SST_TEXTURE_MODE => {
@@ -1054,6 +1077,30 @@ impl Distira {
                 if chip & CHIP_TREX1 != 0 {
                     merge_byte(&mut self.tex_base_addr_tmu1, byte, value);
                 }
+            }
+            _ if voodoo_reg == SST_NCC_TABLE0_Y0 => {
+                self.write_ncc_y_registers(chip, 0, byte, value);
+            }
+            _ if voodoo_reg == SST_NCC_TABLE0_Y1 => {
+                self.write_ncc_y_registers(chip, 1, byte, value);
+            }
+            _ if voodoo_reg == SST_NCC_TABLE0_Y2 => {
+                self.write_ncc_y_registers(chip, 2, byte, value);
+            }
+            _ if voodoo_reg == SST_NCC_TABLE0_Y3 => {
+                self.write_ncc_y_registers(chip, 3, byte, value);
+            }
+            _ if voodoo_reg == SST_NCC_TABLE0_I0 => {
+                self.write_ncc_i_registers(chip, 0, byte, value);
+            }
+            _ if voodoo_reg == SST_NCC_TABLE0_I1 => {
+                self.write_ncc_i_registers(chip, 1, byte, value);
+            }
+            _ if voodoo_reg == SST_NCC_TABLE0_I2 => {
+                self.write_ncc_i_registers(chip, 2, byte, value);
+            }
+            _ if voodoo_reg == SST_NCC_TABLE0_I3 => {
+                self.write_ncc_i_registers(chip, 3, byte, value);
             }
             _ if voodoo_reg == SST_NCC_TABLE0_Q2 => {
                 self.write_palette_registers(chip, false, byte, value);
@@ -1181,6 +1228,24 @@ impl Distira {
         if raw & (1 << 31) != 0 {
             let index = ((raw >> 23) & 0xfe) as usize | usize::from(odd);
             self.texture_palette[tmu][index] = raw | 0xff00_0000;
+        }
+    }
+
+    fn write_ncc_y_registers(&mut self, chip: usize, index: usize, byte: usize, value: u8) {
+        if chip & CHIP_TREX0 != 0 {
+            merge_byte(&mut self.ncc_table0_y[0][index], byte, value);
+        }
+        if chip & CHIP_TREX1 != 0 {
+            merge_byte(&mut self.ncc_table0_y[1][index], byte, value);
+        }
+    }
+
+    fn write_ncc_i_registers(&mut self, chip: usize, index: usize, byte: usize, value: u8) {
+        if chip & CHIP_TREX0 != 0 {
+            merge_byte(&mut self.ncc_table0_i[0][index], byte, value);
+        }
+        if chip & CHIP_TREX1 != 0 {
+            merge_byte(&mut self.ncc_table0_i[1][index], byte, value);
         }
     }
 
@@ -1534,6 +1599,7 @@ impl Distira {
             || !matches!(
                 format,
                 TEX_RGB332
+                    | TEX_Y4I2Q2
                     | TEX_A8
                     | TEX_I8
                     | TEX_AI8
@@ -1565,6 +1631,7 @@ impl Distira {
     fn sample_tmu_texture(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
         match (self.texture_mode_for_tmu(tmu) >> 8) & 0xf {
             TEX_RGB332 => self.sample_tmu_rgb332(tmu, s, t),
+            TEX_Y4I2Q2 => self.sample_tmu_yiq_ncc(tmu, s, t),
             TEX_A8 => self.sample_tmu_a8(tmu, s, t),
             TEX_I8 => self.sample_tmu_i8(tmu, s, t),
             TEX_AI8 => self.sample_tmu_ai44(tmu, s, t),
@@ -1595,6 +1662,21 @@ impl Distira {
             return (0, 0, 0);
         };
         expand_rgb332(raw)
+    }
+
+    fn sample_tmu_yiq_ncc(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
+        let raw = self.sample_tmu_u8(tmu, s, t);
+        let y_index = usize::from(raw >> 4);
+        let i_index = usize::from((raw >> 2) & 0x03);
+        let q_index = usize::from(raw & 0x03);
+        let y = ((self.ncc_table0_y[tmu][y_index >> 2] >> ((y_index & 3) * 8)) & 0xff) as i32;
+        let i = self.ncc_table0_i[tmu][i_index];
+        let q = self.ncc_table0_q[tmu][q_index];
+        (
+            clamp_ncc(y + signed_ncc_component(i, 18) + signed_ncc_component(q, 18)),
+            clamp_ncc(y + signed_ncc_component(i, 9) + signed_ncc_component(q, 9)),
+            clamp_ncc(y + signed_ncc_component(i, 0) + signed_ncc_component(q, 0)),
+        )
     }
 
     fn sample_tmu_a8(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
@@ -1949,6 +2031,19 @@ fn texture_mip_offset(lod: u32, bytes_per_texel: usize) -> usize {
             width * height * bytes_per_texel
         })
         .sum()
+}
+
+fn signed_ncc_component(raw: u32, shift: u32) -> i32 {
+    let value = ((raw >> shift) & 0x1ff) as i32;
+    if value & 0x100 != 0 {
+        value | !0x1ff
+    } else {
+        value
+    }
+}
+
+fn clamp_ncc(value: i32) -> u8 {
+    value.clamp(0, 255) as u8
 }
 
 fn expand3(v: u8) -> u8 {
