@@ -202,6 +202,12 @@ pub const FBZ_DITHER_SUB: u32 = 1 << 19;
 pub const FBZ_DEPTH_SOURCE: u32 = 1 << 20;
 pub const FBZ_PARAM_ADJUST: u32 = 1 << 26;
 pub const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
+pub const TC_ZERO_OTHER: u32 = 1 << 12;
+pub const TC_SUB_CLOCAL: u32 = 1 << 13;
+pub const TC_MSELECT_SHIFT: u32 = 14;
+pub const TC_MSELECT_MASK: u32 = 0x7;
+pub const TC_MSELECT_DETAIL: u32 = 4;
+pub const TC_ADD_CLOCAL: u32 = 1 << 18;
 pub const TEXTUREMODE_TCLAMPS: u32 = 1 << 6;
 pub const TEXTUREMODE_TCLAMPT: u32 = 1 << 7;
 pub const LOD_ODD: u32 = 1 << 18;
@@ -1692,10 +1698,10 @@ impl Distira {
         {
             return (r, g, b);
         }
-        let tmu0 = self.sample_tmu_texture(0, s, t);
+        let tmu0 = self.apply_texture_detail_blend(0, self.sample_tmu_texture(0, s, t));
         if self.texture_mode & (1 << 18) != 0 && ((self.texture_mode_tmu1 >> 8) & 0xf) == TEX_R5G6B5
         {
-            let tmu1 = self.sample_tmu_texture(1, s, t);
+            let tmu1 = self.apply_texture_detail_blend(1, self.sample_tmu_texture(1, s, t));
             return (
                 tmu0.0.saturating_add(tmu1.0),
                 tmu0.1.saturating_add(tmu1.1),
@@ -1703,6 +1709,30 @@ impl Distira {
             );
         }
         tmu0
+    }
+
+    fn apply_texture_detail_blend(&self, tmu: usize, color: (u8, u8, u8)) -> (u8, u8, u8) {
+        let mode = self.texture_mode_for_tmu(tmu);
+        let mselect = (mode >> TC_MSELECT_SHIFT) & TC_MSELECT_MASK;
+        if mode & TC_ADD_CLOCAL == 0 || mselect != TC_MSELECT_DETAIL {
+            return color;
+        }
+
+        let lod = self.texture_lod_level(tmu);
+        let factor = self.texture_detail_factor(tmu, lod);
+        (
+            detail_blend_channel(color.0, factor),
+            detail_blend_channel(color.1, factor),
+            detail_blend_channel(color.2, factor),
+        )
+    }
+
+    fn texture_detail_factor(&self, tmu: usize, lod: u32) -> u8 {
+        let detail = self.texture_detail_for_tmu(tmu);
+        let max = (detail & 0xff).min(0xff) as i32;
+        let bias = ((detail >> 8) & 0x3f) as i32;
+        let scale = (detail >> 14) & 0x7;
+        ((bias - lod as i32) << scale).clamp(0, max).min(255) as u8
     }
 
     fn sample_tmu_texture(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
@@ -1962,6 +1992,14 @@ impl Distira {
             self.texture_lod
         } else {
             self.texture_lod_tmu1
+        }
+    }
+
+    fn texture_detail_for_tmu(&self, tmu: usize) -> u32 {
+        if tmu == 0 {
+            self.texture_detail
+        } else {
+            self.texture_detail_tmu1
         }
     }
 
@@ -2239,6 +2277,12 @@ fn signed_ncc_component(raw: u32, shift: u32) -> i32 {
 
 fn clamp_ncc(value: i32) -> u8 {
     value.clamp(0, 255) as u8
+}
+
+fn detail_blend_channel(channel: u8, factor: u8) -> u8 {
+    let inverse_factor = u32::from((factor ^ 0xff).wrapping_add(1));
+    let subtract = (u32::from(channel) * inverse_factor) >> 8;
+    channel.saturating_sub(subtract.min(u32::from(channel)) as u8)
 }
 
 fn texture_coord_index(coord: f32, size: usize, clamp: bool, mirror: bool) -> usize {

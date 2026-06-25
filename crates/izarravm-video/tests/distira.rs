@@ -946,6 +946,66 @@ fn triangle_cmd_applies_rgb565_s_wider_aspect_ratio() {
 }
 
 #[test]
+fn triangle_cmd_applies_texture_detail_blend_factor() {
+    const SST_TEXTURE_MODE: usize = 0x300;
+    const SST_TDETAIL: usize = 0x308;
+    const SST_TEX_BASE_ADDR: usize = 0x30c;
+    const TREX0: usize = 0x2 << 10;
+    const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
+    const TC_ZERO_OTHER: u32 = 1 << 12;
+    const TC_SUB_CLOCAL: u32 = 1 << 13;
+    const TC_MSELECT_DETAIL: u32 = 4 << 14;
+    const TC_ADD_CLOCAL: u32 = 1 << 18;
+    const TEX_R5G6B5: u32 = 0x0a;
+    const DETAIL_MAX_128: u32 = 0x80;
+    const DETAIL_BIAS_32: u32 = 32 << 8;
+    const DETAIL_SCALE_2: u32 = 2 << 14;
+
+    let mut distira = Distira::new();
+    distira.set_frame_size(4, 4);
+    distira.clear_back_rgb(0, 0, 0);
+    assert!(distira.queue_texture_write_u32(0, 0x07e0_07e0));
+    distira.drain_fifo();
+
+    write_reg(&mut distira, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
+    write_reg(&mut distira, SST_FBZ_COLOR_PATH, FBZCP_TEXTURE_ENABLED);
+    write_reg(
+        &mut distira,
+        TREX0 | SST_TEXTURE_MODE,
+        (TEX_R5G6B5 << 8) | TC_ZERO_OTHER | TC_SUB_CLOCAL | TC_MSELECT_DETAIL | TC_ADD_CLOCAL,
+    );
+    write_reg(
+        &mut distira,
+        TREX0 | SST_TDETAIL,
+        DETAIL_MAX_128 | DETAIL_BIAS_32 | DETAIL_SCALE_2,
+    );
+    assert_eq!(
+        read_reg(&distira, SST_TEXTURE_MODE),
+        (TEX_R5G6B5 << 8) | TC_ZERO_OTHER | TC_SUB_CLOCAL | TC_MSELECT_DETAIL | TC_ADD_CLOCAL,
+    );
+    assert_eq!(
+        read_reg(&distira, SST_TDETAIL),
+        DETAIL_MAX_128 | DETAIL_BIAS_32 | DETAIL_SCALE_2,
+    );
+    write_reg(&mut distira, TREX0 | SST_TEX_BASE_ADDR, 0);
+    write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
+    write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_BY, 0 << 4);
+    write_reg(&mut distira, SST_VERTEX_CX, 0 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut distira, SST_START_R, 0xff << 12);
+    write_reg(&mut distira, SST_START_G, 0xff << 12);
+    write_reg(&mut distira, SST_START_B, 0xff << 12);
+
+    write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+
+    let frame = distira.scanout_argb();
+    assert_eq!(frame[0], 0x0000_8200);
+}
+
+#[test]
 fn triangle_cmd_clamps_rgb565_s_texture_coordinate() {
     const SST_START_S: usize = 0x034;
     const SST_START_T: usize = 0x038;
