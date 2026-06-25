@@ -232,6 +232,7 @@ pub const CCA_MSELECT_TEX_ALPHA: u32 = 4;
 pub const FBZCP_CCA_REVERSE_BLEND: u32 = 1 << 22;
 pub const FBZCP_CCA_ADD_SHIFT: u32 = 23;
 pub const FBZCP_CCA_ADD_MASK: u32 = 0x3;
+pub const FBZCP_CCA_INVERT_OUTPUT: u32 = 1 << 25;
 pub const TC_ZERO_OTHER: u32 = 1 << 12;
 pub const TC_SUB_CLOCAL: u32 = 1 << 13;
 pub const TC_MSELECT_SHIFT: u32 = 14;
@@ -1956,6 +1957,9 @@ impl Distira {
         }
         if ((self.fbz_color_path >> FBZCP_CCA_ADD_SHIFT) & FBZCP_CCA_ADD_MASK) != 0 {
             alpha = alpha.saturating_add(alocal);
+        }
+        if self.fbz_color_path & FBZCP_CCA_INVERT_OUTPUT != 0 {
+            alpha ^= 0xff;
         }
         alpha
     }
