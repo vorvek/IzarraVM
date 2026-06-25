@@ -213,6 +213,7 @@ pub const FBZCP_CC_LOCALSELECT_COLOR0: u32 = 1 << 4;
 pub const FBZCP_CCA_LOCALSELECT_SHIFT: u32 = 5;
 pub const FBZCP_CCA_LOCALSELECT_MASK: u32 = 0x3;
 pub const CCA_LOCALSELECT_COLOR0: u32 = 1;
+pub const CCA_LOCALSELECT_ITER_Z: u32 = 2;
 pub const FBZCP_CC_ZERO_OTHER: u32 = 1 << 8;
 pub const FBZCP_CC_SUB_CLOCAL: u32 = 1 << 9;
 pub const FBZCP_CC_MSELECT_SHIFT: u32 = 10;
@@ -695,8 +696,8 @@ impl Distira {
                 let l0 = w0 * inv_area;
                 let l1 = w1 * inv_area;
                 let l2 = w2 * inv_area;
-                let depth =
-                    depths.map(|[za, zb, zc]| depth_to_u16(lerp_f32(za, zb, zc, l0, l1, l2)));
+                let depth_raw = depths.map(|[za, zb, zc]| lerp_f32(za, zb, zc, l0, l1, l2));
+                let depth = depth_raw.map(depth_to_u16);
                 if let Some(depth) = depth {
                     if !self.depth_test_passes(x, y, depth) {
                         self.fbi_zfunc_fail = self.fbi_zfunc_fail.wrapping_add(1);
@@ -710,7 +711,7 @@ impl Distira {
                 let s = lerp_f32(a.s, b.s, c.s, l0, l1, l2);
                 let t = lerp_f32(a.t, b.t, c.t, l0, l1, l2);
                 let alpha = lerp_u8(a.a, b.a, c.a, l0, l1, l2);
-                let alocal = self.alpha_local_source(alpha);
+                let alocal = self.alpha_local_source(alpha, depth_raw);
                 let texture_alpha = self.texture_alpha_factor(s, t);
                 let aother = self.texture_alpha_or_source(alpha, s, t);
                 let (r, g, blue) =
@@ -1929,12 +1930,13 @@ impl Distira {
         }
     }
 
-    fn alpha_local_source(&self, alpha: u8) -> u8 {
+    fn alpha_local_source(&self, alpha: u8, depth_raw: Option<f32>) -> u8 {
         if self.fbz_color_path & FBZCP_TEXTURE_ENABLED == 0 {
             return alpha;
         }
         match (self.fbz_color_path >> FBZCP_CCA_LOCALSELECT_SHIFT) & FBZCP_CCA_LOCALSELECT_MASK {
             CCA_LOCALSELECT_COLOR0 => (self.color0 >> 24) as u8,
+            CCA_LOCALSELECT_ITER_Z => depth_raw.map_or(0, fixed_depth_to_local_alpha),
             _ => alpha,
         }
     }
@@ -2503,6 +2505,10 @@ fn fixed_depth_at(
 
 fn depth_to_u16(raw: f32) -> u16 {
     (raw / 4096.0).round().clamp(0.0, 65535.0) as u16
+}
+
+fn fixed_depth_to_local_alpha(raw: f32) -> u8 {
+    ((raw as i64) >> 20).clamp(0, 255) as u8
 }
 
 fn sign_extend_24(raw: u32) -> i32 {
