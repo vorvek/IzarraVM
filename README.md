@@ -29,7 +29,7 @@ is one tight design.
   Glide-capable 3D chip (Distira). 4 MB shared, VESA VBE 2.0, up to 1024x768 at
   32-bit color.
 - Sound: Resonique 2, compatible with the Sound Blaster 16, with an OPL3 FM chip,
-  an MPU-401 MIDI port, and a wavetable daughterboard.
+  an MPU-401 MIDI port, a wavetable daughterboard, and a Yamaha ADPCM-B DAC.
 - Storage: 3.6 GB IDE hard disk, 12x CD-ROM with CD audio, 1.44 MB floppy.
 - Display: 15-inch CRT, up to 1024x768.
 - Firmware: a 2 MB ROM holding a simplified custom BIOS and Toka Disk System.
@@ -74,7 +74,9 @@ What works today:
 - VGA text, mode 13h, planar paths, and the Margo 2D chip are modeled far enough
   for deterministic headless tests and the Toka-DOS shell.
 - PC speaker, OPL3, Sound Blaster 16, and WSS/AD1848 paths exist, with DMA-backed
-  playback coverage for the common SB paths.
+  playback coverage for the common SB paths. A Yamaha ADPCM-B streaming DAC
+  (4-bit Yamaha/Creative/Y8950-family ADPCM, ported from the `superctr/adpcm`
+  codec library) is wired as a fourth sound device at I/O 0x240 on its own IRQ/DMA.
 - IDE hard disk, floppy, ATAPI CD-ROM, XMS, EMS, UMBs, keyboard, mouse, PIT, PIC,
   RTC, serial, and parallel devices are wired into the machine model.
 

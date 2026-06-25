@@ -942,6 +942,11 @@ pub struct AudioConfig {
     pub sound_blaster: SoundBlasterConfig,
     pub wss: WssConfig,
     pub opl3: bool,
+    /// Yamaha ADPCM-B streaming DAC (the chip ported from the `superctr/adpcm`
+    /// Yamaha ADPCM-B codec). An always-on second sound device on the ReSonique
+    /// 2, decoding 4-bit ADPCM streams concurrently with the SB16/OPL3/WSS.
+    #[serde(default)]
+    pub yamaha_adpcm: YamahaAdpcmConfig,
     pub midi: MidiConfig,
 }
 
@@ -952,9 +957,49 @@ impl Default for AudioConfig {
             sound_blaster: SoundBlasterConfig::default(),
             wss: WssConfig::default(),
             opl3: true,
+            yamaha_adpcm: YamahaAdpcmConfig::default(),
             midi: MidiConfig::default(),
         }
     }
+}
+
+/// Board wiring for the Yamaha ADPCM-B streaming DAC: a fixed I/O base, IRQ
+/// line, and DMA channel the guest reads back to drive the chip like real
+/// hardware. Defaults (0x240 / IRQ10 / DMA3) avoid every other sound path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct YamahaAdpcmConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_yamaha_adpcm_base")]
+    pub base: u16,
+    #[serde(default = "default_yamaha_adpcm_irq")]
+    pub irq: u8,
+    #[serde(default = "default_yamaha_adpcm_dma")]
+    pub dma: u8,
+}
+
+impl Default for YamahaAdpcmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            base: 0x0240,
+            irq: 10,
+            dma: 3,
+        }
+    }
+}
+
+fn default_yamaha_adpcm_base() -> u16 {
+    0x0240
+}
+
+fn default_yamaha_adpcm_irq() -> u8 {
+    10
+}
+
+fn default_yamaha_adpcm_dma() -> u8 {
+    3
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1020,6 +1065,7 @@ pub struct HardwareProfile {
     pub video: VideoCard,
     pub sound_blaster: SoundBlasterConfig,
     pub wss: WssConfig,
+    pub yamaha_adpcm: YamahaAdpcmConfig,
     pub emm386: Emm386Mode,
 }
 
@@ -1034,6 +1080,7 @@ impl HardwareProfile {
             video: config.machine.video,
             sound_blaster: config.audio.sound_blaster,
             wss: config.audio.wss,
+            yamaha_adpcm: config.audio.yamaha_adpcm,
             emm386: config.machine.emm386,
         })
     }
