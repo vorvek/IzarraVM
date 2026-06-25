@@ -854,7 +854,29 @@ fn block_fs_path_8_3(path: &str) -> Option<(u8, [u8; 11])> {
     Some((drive, out))
 }
 
+fn block_fs_find_spec(path: &str) -> Option<(u8, String)> {
+    let drive = block_fs_drive(path)?;
+    let mut pattern = &path[2..];
+    while pattern.starts_with(['\\', '/']) {
+        pattern = &pattern[1..];
+    }
+    if pattern.is_empty() || pattern.contains(['\\', '/']) {
+        return None;
+    }
+    Some((drive, pattern.to_string()))
+}
+
 const BLOCK_FS_MAX_FILE_SIZE: u32 = 8 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlockFsRootEntry {
+    name_8_3: [u8; 11],
+    attr: u8,
+    time: u16,
+    date: u16,
+    size: u32,
+    first_cluster: u16,
+}
 
 fn block_fs_fat_entry(fat: &[u8], cluster: u16, fat12: bool) -> Option<u16> {
     if fat12 {
@@ -5108,7 +5130,10 @@ impl Machine {
                 self.c_accesses += 1;
             }
         }
-        let action = if vector == 0x21 && self.try_open_block_device_file(&mut regs)? {
+        let action = if vector == 0x21
+            && (self.try_find_first_block_device_file(&mut regs)?
+                || self.try_open_block_device_file(&mut regs)?)
+        {
             izarravm_dos::DosAction::Continue
         } else {
             self.dos.dispatch(vector, &mut regs, &mut self.memory)?
@@ -5640,36 +5665,50 @@ impl Machine {
         self.read_block_fs_sector(io, scratch_seg, lba)
     }
 
-    fn read_block_fs_file(
+    fn block_fs_target_supported(target: izarravm_dos::BlockDeviceFsTarget) -> bool {
+        target.bytes_per_sector == 512
+            && target.sectors_per_cluster != 0
+            && target.sectors_per_cluster.is_power_of_two()
+            && target.root_entries != 0
+            && target.fat_count != 0
+            && target.sectors_per_fat != 0
+    }
+
+    fn read_block_fs_root_entries(
         &mut self,
         target: izarravm_dos::BlockDeviceFsTarget,
-        name_8_3: [u8; 11],
-    ) -> Result<Vec<u8>, u16> {
-        if target.bytes_per_sector != 512
-            || target.sectors_per_cluster == 0
-            || !target.sectors_per_cluster.is_power_of_two()
-            || target.root_entries == 0
-            || target.fat_count == 0
-            || target.sectors_per_fat == 0
-        {
+    ) -> Result<Vec<BlockFsRootEntry>, u16> {
+        if !Self::block_fs_target_supported(target) {
             return Err(0x000d);
         }
         let Some(scratch_seg) = self.alloc_block_fs_scratch().map_err(|_| 0x0008_u16)? else {
             return Err(0x0008);
         };
-        let result = self.read_block_fs_file_with_scratch(target, name_8_3, scratch_seg);
+        let result = self.read_block_fs_root_entries_with_scratch(target, scratch_seg);
         let _ = self.free_block_fs_scratch(scratch_seg);
         result
     }
 
-    fn read_block_fs_file_with_scratch(
+    fn read_block_fs_root_entries_with_scratch(
         &mut self,
         target: izarravm_dos::BlockDeviceFsTarget,
-        name_8_3: [u8; 11],
         scratch_seg: u16,
-    ) -> Result<Vec<u8>, u16> {
+    ) -> Result<Vec<BlockFsRootEntry>, u16> {
+        let mut entries = Vec::new();
+        self.scan_block_fs_root_entries_with_scratch(target, scratch_seg, |entry| {
+            entries.push(entry);
+            true
+        })?;
+        Ok(entries)
+    }
+
+    fn scan_block_fs_root_entries_with_scratch(
+        &mut self,
+        target: izarravm_dos::BlockDeviceFsTarget,
+        scratch_seg: u16,
+        mut visit: impl FnMut(BlockFsRootEntry) -> bool,
+    ) -> Result<(), u16> {
         let root_sectors = (u32::from(target.root_entries) * 32).div_ceil(512);
-        let mut found = None;
         let mut root_finished = false;
         let mut entries_seen = 0u32;
         let root_entries = u32::from(target.root_entries);
@@ -5697,21 +5736,63 @@ impl Machine {
                 if attr & 0x0f == 0x0f || attr & 0x18 != 0 {
                     continue;
                 }
-                if entry[..11] == name_8_3 {
-                    let cluster = u16::from_le_bytes([entry[0x1a], entry[0x1b]]);
-                    let size =
-                        u32::from_le_bytes([entry[0x1c], entry[0x1d], entry[0x1e], entry[0x1f]]);
-                    found = Some((cluster, size));
-                    break;
+                let mut name_8_3 = [0u8; 11];
+                name_8_3.copy_from_slice(&entry[..11]);
+                let root_entry = BlockFsRootEntry {
+                    name_8_3,
+                    attr,
+                    time: u16::from_le_bytes([entry[0x16], entry[0x17]]),
+                    date: u16::from_le_bytes([entry[0x18], entry[0x19]]),
+                    first_cluster: u16::from_le_bytes([entry[0x1a], entry[0x1b]]),
+                    size: u32::from_le_bytes([entry[0x1c], entry[0x1d], entry[0x1e], entry[0x1f]]),
+                };
+                if !visit(root_entry) {
+                    return Ok(());
                 }
             }
-            if found.is_some() || root_finished {
+            if root_finished {
                 break;
             }
         }
-        let Some((mut cluster, size)) = found else {
+        Ok(())
+    }
+
+    fn read_block_fs_file(
+        &mut self,
+        target: izarravm_dos::BlockDeviceFsTarget,
+        name_8_3: [u8; 11],
+    ) -> Result<Vec<u8>, u16> {
+        if !Self::block_fs_target_supported(target) {
+            return Err(0x000d);
+        }
+        let Some(scratch_seg) = self.alloc_block_fs_scratch().map_err(|_| 0x0008_u16)? else {
+            return Err(0x0008);
+        };
+        let result = self.read_block_fs_file_with_scratch(target, name_8_3, scratch_seg);
+        let _ = self.free_block_fs_scratch(scratch_seg);
+        result
+    }
+
+    fn read_block_fs_file_with_scratch(
+        &mut self,
+        target: izarravm_dos::BlockDeviceFsTarget,
+        name_8_3: [u8; 11],
+        scratch_seg: u16,
+    ) -> Result<Vec<u8>, u16> {
+        let mut found = None;
+        self.scan_block_fs_root_entries_with_scratch(target, scratch_seg, |entry| {
+            if entry.name_8_3 == name_8_3 {
+                found = Some(entry);
+                false
+            } else {
+                true
+            }
+        })?;
+        let Some(entry) = found else {
             return Err(0x0002);
         };
+        let mut cluster = entry.first_cluster;
+        let size = entry.size;
         if size > BLOCK_FS_MAX_FILE_SIZE {
             return Err(0x0008);
         }
@@ -5770,6 +5851,52 @@ impl Machine {
             return Err(0x000d);
         }
         Ok(bytes)
+    }
+
+    fn try_find_first_block_device_file(
+        &mut self,
+        regs: &mut izarravm_dos::DosRegs,
+    ) -> Result<bool, izarravm_dos::DosError> {
+        if (regs.ax >> 8) as u8 != 0x4e {
+            return Ok(false);
+        }
+        let Some(path) = izarravm_dos::read_dos_asciiz(&self.memory, regs.ds, regs.dx)? else {
+            self.dos.fail_find_first(regs, 0x0003);
+            return Ok(true);
+        };
+        let Some(drive) = block_fs_drive(&path) else {
+            return Ok(false);
+        };
+        let Some(target) = self.dos.block_device_fs_target(drive) else {
+            return Ok(false);
+        };
+        let Some((_, pattern)) = block_fs_find_spec(&path) else {
+            self.dos.fail_find_first(regs, 0x0003);
+            return Ok(true);
+        };
+        if self.in_device_call {
+            self.dos.fail_find_first(regs, 0x0005);
+            return Ok(true);
+        }
+        match self.read_block_fs_root_entries(target) {
+            Ok(entries) => {
+                let entries = entries
+                    .into_iter()
+                    .map(|entry| izarravm_dos::DosFindEntry {
+                        name_8_3: entry.name_8_3,
+                        attr: entry.attr,
+                        time: entry.time,
+                        date: entry.date,
+                        size: entry.size,
+                    })
+                    .collect::<Vec<_>>();
+                let _ =
+                    self.dos
+                        .find_first_from_entries(&mut self.memory, regs, &pattern, &entries)?;
+            }
+            Err(code) => self.dos.fail_find_first(regs, code),
+        }
+        Ok(true)
     }
 
     fn try_open_block_device_file(
@@ -18400,11 +18527,60 @@ mod tests {
         m.cpu.registers.eax() as u16
     }
 
+    fn block_fs_find_first(m: &mut Machine, path: &str, mask: u16) -> u16 {
+        write_guest_asciiz(m, 0x0100, 0x0200, path);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x0100));
+        m.cpu.registers.set_edx(0x0200);
+        m.cpu.registers.set_ecx(u32::from(mask));
+        prime_dos_int_frame(m);
+        m.cpu.registers.set_eax(0x4e00);
+        m.handle_dos_int(0x21).unwrap();
+        m.cpu.registers.eax() as u16
+    }
+
+    fn block_fs_find_next(m: &mut Machine) -> u16 {
+        prime_dos_int_frame(m);
+        m.cpu.registers.set_eax(0x4f00);
+        m.handle_dos_int(0x21).unwrap();
+        m.cpu.registers.eax() as u16
+    }
+
     fn guest_bytes(m: &Machine, offset: u16, len: usize) -> Vec<u8> {
         let base = 0x0100usize * 16 + usize::from(offset);
         (0..len)
             .map(|i| m.memory.read_u8(base + i).unwrap())
             .collect()
+    }
+
+    fn block_find_dta_name(m: &Machine) -> String {
+        let base = 0x0100usize * 16 + 0x80 + 0x1e;
+        let mut bytes = Vec::new();
+        for index in 0..13 {
+            let byte = m.memory.read_u8(base + index).unwrap();
+            if byte == 0 {
+                break;
+            }
+            bytes.push(byte);
+        }
+        String::from_utf8(bytes).unwrap()
+    }
+
+    fn block_find_dta_attr(m: &Machine) -> u8 {
+        m.memory.read_u8(0x0100usize * 16 + 0x80 + 0x15).unwrap()
+    }
+
+    fn block_find_dta_time(m: &Machine) -> u16 {
+        m.memory.read_u16(0x0100usize * 16 + 0x80 + 0x16).unwrap()
+    }
+
+    fn block_find_dta_date(m: &Machine) -> u16 {
+        m.memory.read_u16(0x0100usize * 16 + 0x80 + 0x18).unwrap()
+    }
+
+    fn block_find_dta_size(m: &Machine) -> u32 {
+        m.memory.read_u32(0x0100usize * 16 + 0x80 + 0x1a).unwrap()
     }
 
     #[test]
@@ -18421,6 +18597,143 @@ mod tests {
             assert_eq!(ax, code, "open mode {access} returns exact AX");
             assert_eq!(block_driver_extended_error(&mut machine), code);
         }
+    }
+
+    #[test]
+    fn block_driver_filesystem_findfirst_lists_root_file() {
+        let payload = b"BLOCK-FS-OK\r\n";
+        let (mut sectors, bpb) = tiny_fat12_image(&[(b"HELLO   TXT", payload.as_slice())]);
+        let root = sectors.get_mut(&2).unwrap();
+        root[0x16..0x18].copy_from_slice(&0x4a21u16.to_le_bytes());
+        root[0x18..0x1a].copy_from_slice(&0x5b42u16.to_le_bytes());
+        let mut machine = test_machine();
+        let header =
+            stage_block_io_driver(&mut machine, fat_block_file_sys_image(&sectors, &bpb, None));
+
+        let ax = block_fs_find_first(&mut machine, "D:\\*.*", 0);
+
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "FindFirst returns CF clear");
+        assert_eq!(ax, 0x4e00);
+        assert_eq!(block_find_dta_name(&machine), "HELLO.TXT");
+        assert_eq!(block_find_dta_attr(&machine), 0x20);
+        assert_eq!(block_find_dta_time(&machine), 0x4a21);
+        assert_eq!(block_find_dta_date(&machine), 0x5b42);
+        assert_eq!(block_find_dta_size(&machine), payload.len() as u32);
+        assert!(
+            block_fs_request_log(&mut machine, header)
+                .iter()
+                .any(|entry| entry.command == 0x04 && entry.sector == 2),
+            "root directory was read"
+        );
+    }
+
+    #[test]
+    fn block_driver_filesystem_findnext_walks_root_entries() {
+        let (sectors, bpb) = tiny_fat12_image(&[
+            (b"ALPHA   TXT", b"a".as_slice()),
+            (b"BETA    TXT", b"bb".as_slice()),
+        ]);
+        let mut machine = test_machine();
+        stage_block_io_driver(&mut machine, fat_block_file_sys_image(&sectors, &bpb, None));
+
+        let first = block_fs_find_first(&mut machine, "D:\\*.TXT", 0);
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "FindFirst returns CF clear");
+        assert_eq!(first, 0x4e00);
+        assert_eq!(block_find_dta_name(&machine), "ALPHA.TXT");
+
+        let next = block_fs_find_next(&mut machine);
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "FindNext returns CF clear");
+        assert_eq!(next, 0x4f00);
+        assert_eq!(block_find_dta_name(&machine), "BETA.TXT");
+
+        let done = block_fs_find_next(&mut machine);
+        assert_ne!(dos_int_flags(&machine) & 1, 0, "final FindNext sets CF");
+        assert_eq!(done, 0x0012);
+    }
+
+    #[test]
+    fn block_driver_filesystem_findfirst_no_match_clears_previous_search() {
+        let (sectors, bpb) = tiny_fat12_image(&[
+            (b"ALPHA   TXT", b"a".as_slice()),
+            (b"BETA    TXT", b"bb".as_slice()),
+        ]);
+        let mut machine = test_machine();
+        stage_block_io_driver(&mut machine, fat_block_file_sys_image(&sectors, &bpb, None));
+
+        let first = block_fs_find_first(&mut machine, "D:\\*.TXT", 0);
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "FindFirst returns CF clear");
+        assert_eq!(first, 0x4e00);
+        assert_eq!(block_find_dta_name(&machine), "ALPHA.TXT");
+
+        let miss = block_fs_find_first(&mut machine, "D:\\*.EXE", 0);
+        assert_ne!(dos_int_flags(&machine) & 1, 0, "missing pattern sets CF");
+        assert_eq!(miss, 0x0012);
+
+        let next = block_fs_find_next(&mut machine);
+        assert_ne!(dos_int_flags(&machine) & 1, 0, "old search is cleared");
+        assert_eq!(next, 0x0012);
+    }
+
+    #[test]
+    fn block_driver_filesystem_findfirst_accepts_drive_relative_root_pattern() {
+        let (sectors, bpb) = tiny_fat12_image(&[(b"HELLO   TXT", b"hello".as_slice())]);
+        let mut machine = test_machine();
+        stage_block_io_driver(&mut machine, fat_block_file_sys_image(&sectors, &bpb, None));
+
+        let ax = block_fs_find_first(&mut machine, "D:*.TXT", 0);
+
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "FindFirst returns CF clear");
+        assert_eq!(ax, 0x4e00);
+        assert_eq!(block_find_dta_name(&machine), "HELLO.TXT");
+    }
+
+    #[test]
+    fn block_driver_filesystem_find_skips_lfn_deleted_and_padding() {
+        let (mut sectors, mut bpb) = tiny_fat12_image(&[]);
+        bpb[6..8].copy_from_slice(&3u16.to_le_bytes());
+        let root = sectors.get_mut(&2).unwrap();
+        root[0..11].copy_from_slice(b"DELETED TXT");
+        root[0] = 0xe5;
+        root[32..43].copy_from_slice(b"LFN     TXT");
+        root[32 + 0x0b] = 0x0f;
+        root[64..75].copy_from_slice(b"GOOD    TXT");
+        root[64 + 0x0b] = 0x20;
+        root[64 + 0x1c..64 + 0x20].copy_from_slice(&7u32.to_le_bytes());
+        root[96..107].copy_from_slice(b"PAD     TXT");
+        root[96 + 0x0b] = 0x20;
+        let mut machine = test_machine();
+        stage_block_io_driver(&mut machine, fat_block_file_sys_image(&sectors, &bpb, None));
+
+        let first = block_fs_find_first(&mut machine, "D:\\*.*", 0);
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "FindFirst returns CF clear");
+        assert_eq!(first, 0x4e00);
+        assert_eq!(block_find_dta_name(&machine), "GOOD.TXT");
+        assert_eq!(block_find_dta_size(&machine), 7);
+
+        let next = block_fs_find_next(&mut machine);
+        assert_ne!(
+            dos_int_flags(&machine) & 1,
+            0,
+            "FindNext stops at BPB root_entries"
+        );
+        assert_eq!(next, 0x0012);
+    }
+
+    #[test]
+    fn block_driver_filesystem_find_rejects_subdirectories_for_this_slice() {
+        let (sectors, bpb) = tiny_fat12_image(&[(b"HELLO   TXT", b"hello".as_slice())]);
+        let mut machine = test_machine();
+        let header =
+            stage_block_io_driver(&mut machine, fat_block_file_sys_image(&sectors, &bpb, None));
+
+        let ax = block_fs_find_first(&mut machine, "D:\\DIR\\*.*", 0);
+
+        assert_ne!(dos_int_flags(&machine) & 1, 0, "subdirectory find sets CF");
+        assert_eq!(ax, 0x0003);
+        assert!(
+            block_fs_request_log(&mut machine, header).is_empty(),
+            "subdirectory find fails before block READ"
+        );
     }
 
     #[test]
@@ -18500,6 +18813,38 @@ mod tests {
         let handle = block_fs_open(&mut later, "D:\\HELLO.TXT", 0);
         assert_eq!(dos_int_flags(&later) & 1, 0, "later block open still works");
         assert!(handle >= 5);
+    }
+
+    #[test]
+    fn block_driver_filesystem_open_stops_after_matching_root_entry() {
+        let (mut sectors, mut bpb) = tiny_fat12_image(&[(b"HELLO   TXT", &[])]);
+        bpb[6..8].copy_from_slice(&32u16.to_le_bytes());
+        let root = sectors.get_mut(&2).unwrap();
+        for entry in 1..16 {
+            root[entry * 32] = 0xe5;
+        }
+        sectors.insert(3, [0u8; 512]);
+        let mut machine = test_machine();
+        let header = stage_block_io_driver(
+            &mut machine,
+            fat_block_file_sys_image(&sectors, &bpb, Some(3)),
+        );
+
+        let handle = block_fs_open(&mut machine, "D:\\HELLO.TXT", 0);
+
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "open returns CF clear");
+        assert!(handle >= 5);
+        let log = block_fs_request_log(&mut machine, header);
+        assert!(
+            log.iter()
+                .any(|entry| entry.command == 0x04 && entry.sector == 2),
+            "first root sector is read; log={log:?}"
+        );
+        assert!(
+            !log.iter()
+                .any(|entry| entry.command == 0x04 && entry.sector == 3),
+            "open stops before the failing second root sector; log={log:?}"
+        );
     }
 
     #[test]
