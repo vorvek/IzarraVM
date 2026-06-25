@@ -194,6 +194,7 @@ pub const FBZ_DITHER: u32 = 1 << 8;
 pub const FBZ_RGB_WMASK: u32 = 1 << 9;
 pub const FBZ_DEPTH_WMASK: u32 = 1 << 10;
 pub const FBZ_DITHER_2X2: u32 = 1 << 11;
+pub const FBZ_STIPPLE_PATT: u32 = 1 << 12;
 pub const FBZ_ALPHA_MASK: u32 = 1 << 13;
 pub const FBZ_DRAW_FRONT: u32 = 0x0000;
 pub const FBZ_DRAW_BACK: u32 = 0x4000;
@@ -901,21 +902,20 @@ impl Distira {
                 let pixel = offset / 4;
                 let raw = value as u16;
                 let depth = (value >> 16) as u16;
-                if self.lfb_pipeline_depth_test_passes(pixel, depth) {
-                    let color = self.lfb_pipeline_color_pixel(
-                        base,
-                        pixel,
-                        raw,
-                        rgb565_components(raw),
-                        0xff,
-                    );
-                    if let Some(color) = color {
-                        if write_color {
-                            self.write_color_pixel(base, pixel, color);
-                        }
-                        if write_depth {
-                            self.write_depth_pixel_by_index(pixel, depth);
-                        }
+                let color = self.lfb_pipeline_depth_color_pixel(
+                    base,
+                    pixel,
+                    raw,
+                    rgb565_components(raw),
+                    0xff,
+                    depth,
+                );
+                if let Some(color) = color {
+                    if write_color {
+                        self.write_color_pixel(base, pixel, color);
+                    }
+                    if write_depth {
+                        self.write_depth_pixel_by_index(pixel, depth);
                     }
                 }
             }
@@ -924,21 +924,20 @@ impl Distira {
                 let raw = value as u16;
                 let raw_rgb565 = rgb555_to_rgb565(raw);
                 let depth = (value >> 16) as u16;
-                if self.lfb_pipeline_depth_test_passes(pixel, depth) {
-                    let color = self.lfb_pipeline_color_pixel(
-                        base,
-                        pixel,
-                        raw_rgb565,
-                        rgb565_components(raw_rgb565),
-                        0xff,
-                    );
-                    if let Some(color) = color {
-                        if write_color {
-                            self.write_color_pixel(base, pixel, color);
-                        }
-                        if write_depth {
-                            self.write_depth_pixel_by_index(pixel, depth);
-                        }
+                let color = self.lfb_pipeline_depth_color_pixel(
+                    base,
+                    pixel,
+                    raw_rgb565,
+                    rgb565_components(raw_rgb565),
+                    0xff,
+                    depth,
+                );
+                if let Some(color) = color {
+                    if write_color {
+                        self.write_color_pixel(base, pixel, color);
+                    }
+                    if write_depth {
+                        self.write_depth_pixel_by_index(pixel, depth);
                     }
                 }
             }
@@ -947,33 +946,42 @@ impl Distira {
                 let raw = value as u16;
                 let raw_rgb565 = rgb555_to_rgb565(raw);
                 let depth = (value >> 16) as u16;
-                if self.lfb_pipeline_depth_test_passes(pixel, depth) {
-                    let color = self.lfb_pipeline_color_pixel(
-                        base,
-                        pixel,
-                        raw_rgb565,
-                        rgb565_components(raw_rgb565),
-                        argb1555_alpha(raw),
-                    );
-                    if let Some(color) = color {
-                        if write_color {
-                            self.write_color_pixel(base, pixel, color);
-                        }
-                        if write_depth {
-                            self.write_depth_pixel_by_index(pixel, depth);
-                        }
+                let color = self.lfb_pipeline_depth_color_pixel(
+                    base,
+                    pixel,
+                    raw_rgb565,
+                    rgb565_components(raw_rgb565),
+                    argb1555_alpha(raw),
+                    depth,
+                );
+                if let Some(color) = color {
+                    if write_color {
+                        self.write_color_pixel(base, pixel, color);
+                    }
+                    if write_depth {
+                        self.write_depth_pixel_by_index(pixel, depth);
                     }
                 }
             }
-            LFB_FORMAT_DEPTH if write_depth => {
+            LFB_FORMAT_DEPTH if write_depth || write_color => {
                 let pixel = offset / 2;
                 let depth0 = value as u16;
                 let depth1 = (value >> 16) as u16;
-                if self.lfb_pipeline_depth_test_passes(pixel, depth0) {
-                    self.write_depth_pixel_by_index(pixel, depth0);
+                if let Some(color) = self.lfb_pipeline_depth_only_color(base, pixel, depth0) {
+                    if let Some(color) = color {
+                        self.write_color_pixel(base, pixel, color);
+                    }
+                    if write_depth {
+                        self.write_depth_pixel_by_index(pixel, depth0);
+                    }
                 }
-                if self.lfb_pipeline_depth_test_passes(pixel + 1, depth1) {
-                    self.write_depth_pixel_by_index(pixel + 1, depth1);
+                if let Some(color) = self.lfb_pipeline_depth_only_color(base, pixel + 1, depth1) {
+                    if let Some(color) = color {
+                        self.write_color_pixel(base, pixel + 1, color);
+                    }
+                    if write_depth {
+                        self.write_depth_pixel_by_index(pixel + 1, depth1);
+                    }
                 }
             }
             _ => {}
@@ -1737,10 +1745,74 @@ impl Distira {
         if self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0 {
             return Some(raw);
         }
+        let position = self.lfb_pipeline_stipple_position(pixel)?;
+        self.lfb_pipeline_shade_color_at(base, position, raw, color, alpha)
+    }
+
+    fn lfb_pipeline_depth_color_pixel(
+        &mut self,
+        base: u32,
+        pixel: usize,
+        raw: u16,
+        color: (u8, u8, u8),
+        alpha: u8,
+        depth: u16,
+    ) -> Option<u16> {
+        if self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0 {
+            return Some(raw);
+        }
+        let position = self.lfb_pipeline_stipple_position(pixel)?;
+        if !self.lfb_pipeline_depth_test_passes(pixel, depth) {
+            return None;
+        }
+        self.lfb_pipeline_shade_color_at(base, position, raw, color, alpha)
+    }
+
+    fn lfb_pipeline_depth_only_color(
+        &mut self,
+        base: u32,
+        pixel: usize,
+        depth: u16,
+    ) -> Option<Option<u16>> {
+        if self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0 {
+            return Some(None);
+        }
+        let position = self.lfb_pipeline_stipple_position(pixel)?;
+        if !self.lfb_pipeline_depth_test_passes(pixel, depth) {
+            return None;
+        }
+        let alpha = (self.za_color >> 24) as u8;
+        self.lfb_pipeline_shade_color_at(base, position, pack_rgb565(0, 0, 0), (0, 0, 0), alpha)
+            .map(Some)
+    }
+
+    fn lfb_pipeline_stipple_position(&mut self, pixel: usize) -> Option<(u32, u32)> {
         let (x, y) = self.pixel_index_coords(pixel)?;
+        if self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0 || self.fbz_mode & FBZ_STIPPLE == 0 {
+            return Some((x, y));
+        }
+        let passes = if self.fbz_mode & FBZ_STIPPLE_PATT != 0 {
+            let index = ((y & 3) << 3) | ((!x) & 7);
+            self.stipple & (1 << index) != 0
+        } else {
+            self.stipple = self.stipple.rotate_left(1);
+            self.stipple & 0x8000_0000 != 0
+        };
+        passes.then_some((x, y))
+    }
+
+    fn lfb_pipeline_shade_color_at(
+        &mut self,
+        base: u32,
+        position: (u32, u32),
+        _raw: u16,
+        color: (u8, u8, u8),
+        alpha: u8,
+    ) -> Option<u16> {
         if !self.lfb_pipeline_color_passes(color) || !self.lfb_pipeline_alpha_passes(alpha) {
             return None;
         }
+        let (x, y) = position;
         let (r, g, b) = self.apply_fog_color(color.0, color.1, color.2);
         let (r, g, b) = self.alpha_blend_color_at_base(base, (x, y), (r, g, b), alpha);
         Some(pack_rgb565_for_pixel(r, g, b, x, y, self.dither_enabled))

@@ -675,5 +675,10 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
       RGB565, RGB555, ARGB1555, and depth+color writes. Validated by the video
       LFB pipeline ARGB8888 blend, RGB565 blend, and ARGB1555 alpha-test tests
       plus the Distira video test gates.
-- [ ] Next: LFB pixel-pipeline stipple-pattern gating and depth-only pipeline
-      parity with `zaColor` alpha/chroma behavior.
+- [x] Iteration 113: LFB pixel-pipeline mode applies Voodoo stipple-pattern
+      gating before writes and routes depth-only writes through `zaColor` alpha
+      test/chroma/fog/blend behavior before updating color/depth masks.
+      Validated by the video LFB stipple-pattern and depth-only `zaColor` alpha
+      tests plus the Distira video test gates.
+- [ ] Next: LFB byte/word write-width parity, including pixel-pipeline word
+      writes for RGB, ARGB, depth, and depth+color formats.
