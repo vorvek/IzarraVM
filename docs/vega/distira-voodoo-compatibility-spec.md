@@ -524,7 +524,9 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
       workspace gates.
 - [x] Iteration 59: texture color path zero-other behavior. Validated by the
       video texture color zero-other test plus the workspace gates.
-- [ ] Next: texture alpha path zero-other behavior.
+- [x] Iteration 60: texture alpha path zero-other behavior. Validated by the
+      video texture alpha zero-other test plus the workspace gates.
+- [ ] Next: texture alpha path subtract-local behavior.
 
 ## First 90 percent push for this branch
 

@@ -222,6 +222,7 @@ pub const FBZCP_CC_REVERSE_BLEND: u32 = 1 << 13;
 pub const FBZCP_CC_ADD_CLOCAL: u32 = 1 << 14;
 pub const FBZCP_CC_ADD_ALOCAL: u32 = 2 << 14;
 pub const FBZCP_CC_INVERT_OUTPUT: u32 = 1 << 16;
+pub const FBZCP_CCA_ZERO_OTHER: u32 = 1 << 17;
 pub const TC_ZERO_OTHER: u32 = 1 << 12;
 pub const TC_SUB_CLOCAL: u32 = 1 << 13;
 pub const TC_MSELECT_SHIFT: u32 = 14;
@@ -698,7 +699,7 @@ impl Distira {
                 let aother = self.texture_alpha_or_source(alpha, s, t);
                 let (r, g, blue) =
                     self.texture_color_or_source((x, y), (r, g, blue), alpha, aother, (s, t));
-                let alpha = aother;
+                let alpha = self.apply_alpha_path(aother);
                 if !self.alpha_test_passes(alpha) {
                     self.fbi_afunc_fail = self.fbi_afunc_fail.wrapping_add(1);
                     continue;
@@ -1909,6 +1910,14 @@ impl Distira {
         }
 
         self.sample_tmu_alpha(0, s, t)
+    }
+
+    fn apply_alpha_path(&self, alpha: u8) -> u8 {
+        if self.fbz_color_path & FBZCP_CCA_ZERO_OTHER != 0 {
+            0
+        } else {
+            alpha
+        }
     }
 
     fn sample_tmu_alpha(&self, tmu: usize, s: f32, t: f32) -> u8 {
