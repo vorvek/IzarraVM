@@ -532,7 +532,10 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
       the video texture alpha local-modulation test plus the workspace gates.
 - [x] Iteration 63: texture alpha path other modulation behavior. Validated by
       the video texture alpha other-modulation test plus the workspace gates.
-- [ ] Next: texture alpha path texture-alpha modulation behavior.
+- [x] Iteration 64: texture alpha path texture-alpha modulation behavior.
+      Validated by the video texture alpha texture-modulation test plus the
+      workspace gates.
+- [ ] Next: texture alpha path add-local behavior.
 
 ## First 90 percent push for this branch
 
