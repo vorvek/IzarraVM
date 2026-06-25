@@ -448,7 +448,9 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
       the video two-TMU RGB565 add-combine test plus the workspace gates.
 - [x] Iteration 22: RGB332 texture sampling. Validated by the video RGB332
       texture sample test plus the workspace gates.
-- [ ] Next: I8 texture sampling.
+- [x] Iteration 23: I8 texture sampling. Validated by the video I8 texture
+      sample test plus the workspace gates.
+- [ ] Next: A8 texture sampling.
 
 ## First 90 percent push for this branch
 
