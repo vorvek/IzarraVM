@@ -71,11 +71,13 @@ lfb_glyph:
     push di                     ; x constant per row
     mov al, [cs:bp]             ; this row's bitmap
     inc bp
+    push bx                     ; preserve BL=fg/BH=bg: lfb_pixel_addr returns EBX
     push ax
     mov si, dx                  ; y for lfb_pixel_addr (word)
     mov ax, dx
-    call lfb_pixel_addr         ; EBX = LFB addr of (di, dx)
+    call lfb_pixel_addr         ; EBX = LFB addr of (di, dx); clobbers BX
     pop ax
+    pop bx                      ; restore fg/bg before the column loop reads them
     mov cx, 8                   ; 8 columns
 .col:
     shl al, 1                   ; MSB -> CF
@@ -158,8 +160,10 @@ lfb_fill_rect:
     push cx
     push di
     push si
+    push bx                     ; preserve BL=color: lfb_pixel_addr returns EBX
     mov ax, si
-    call lfb_pixel_addr         ; EBX = addr of (di, si)
+    call lfb_pixel_addr         ; EBX = addr of (di, si); clobbers BX
+    pop bx                      ; restore color before the column loop writes it
     pop si
     pop di
     pop cx
