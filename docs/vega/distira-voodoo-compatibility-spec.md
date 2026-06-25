@@ -508,7 +508,9 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
       video color0-local reverse blend test plus the workspace gates.
 - [x] Iteration 52: texture color path non-reverse blend behavior. Validated by
       the video color0-local non-reverse blend test plus the workspace gates.
-- [ ] Next: texture color path invert output behavior.
+- [x] Iteration 53: texture color path invert output behavior. Validated by the
+      video texture color invert-output test plus the workspace gates.
+- [ ] Next: texture color path alocal add behavior.
 
 ## First 90 percent push for this branch
 

@@ -215,6 +215,7 @@ pub const FBZCP_CC_MSELECT_MASK: u32 = 0x7;
 pub const CC_MSELECT_CLOCAL: u32 = 1;
 pub const FBZCP_CC_REVERSE_BLEND: u32 = 1 << 13;
 pub const FBZCP_CC_ADD_CLOCAL: u32 = 1 << 14;
+pub const FBZCP_CC_INVERT_OUTPUT: u32 = 1 << 16;
 pub const TC_ZERO_OTHER: u32 = 1 << 12;
 pub const TC_SUB_CLOCAL: u32 = 1 << 13;
 pub const TC_MSELECT_SHIFT: u32 = 14;
@@ -1744,7 +1745,15 @@ impl Distira {
                 }
             }
         };
-        self.apply_color_path_local_combine(selected, source)
+        let color = self.apply_color_path_local_combine(selected, source);
+        self.apply_color_path_output_invert(color)
+    }
+
+    fn apply_color_path_output_invert(&self, color: (u8, u8, u8)) -> (u8, u8, u8) {
+        if self.fbz_color_path & FBZCP_CC_INVERT_OUTPUT == 0 {
+            return color;
+        }
+        (color.0 ^ 0xff, color.1 ^ 0xff, color.2 ^ 0xff)
     }
 
     fn apply_color_path_local_combine(
