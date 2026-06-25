@@ -15,7 +15,8 @@ we replace the earlier Distira-native scaffold.
 
 ### Gold standard
 
-The behavioral reference is the 86Box Voodoo implementation, used with permission
+The behavioral reference is the 86Box Voodoo implementation (*voodoo* in 
+https://github.com/86Box/86Box/tree/master/src/video), used with permission 
 for adaptation into this codebase. The important source areas are:
 
 | 86Box area | Role | IzarraVM destination |
@@ -566,23 +567,108 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
 - [x] Iteration 75: texture alpha path subtract-before-add ordering behavior.
       Validated by the video texture alpha subtract/add ordering coverage test
       plus the workspace gates.
-- [ ] Next: texture alpha path subtract-modulate-add ordering behavior.
-
-## First 90 percent push for this branch
-
-Today should not try to port all of 86Box in one commit. The largest safe slice
-is phases 1 and 2 plus the start of phase 3:
-
-1. Introduce Voodoo register constants and state shell.
-2. Add Voodoo-shaped MMIO reads and writes for status, init regs, render state,
-   `lfbMode`, `fbzMode`, `fastfillCMD`, and `swapbufferCMD`.
-3. Keep the existing Distira framebuffer/scanout path working through those
-   Voodoo registers.
-4. Add unit and machine tests that use `SST_*` names instead of the custom
-   `DISTIRA_REG_*` command path.
-5. Leave PCI, FIFO, and texture work as the next slices once the register model
-   is stable.
-
-That does not reach 90 percent of final Glide compatibility. It reaches a much
-better 90 percent of the first architectural pivot: from custom Distira commands
-to a Voodoo-shaped device core.
+- [x] Iteration 76: texture alpha path subtract-modulate-add ordering behavior.
+      Validated by the video texture alpha subtract/modulate/add ordering
+      coverage test plus the workspace gates.
+- [x] Iteration 77: texture alpha path invert-after-add ordering behavior.
+      Validated by the video alpha invert-after-add test plus the Distira video
+      test gates.
+- [x] Iteration 78: texture alpha zero-other before add-local ordering behavior.
+      Validated by the video alpha zero-other/add-local test plus the Distira
+      video test gates.
+- [x] Iteration 79: texture alpha zero-other before invert-output ordering
+      behavior. Validated by the video alpha zero-other/invert test plus the
+      Distira video test gates.
+- [x] Iteration 80: CCA CLOCAL add-mode invert-after-add behavior. Validated by
+      the video alpha CLOCAL-add invert test plus the Distira video test gates.
+- [x] Iteration 81: color path subtract-before-CLOCAL-modulation ordering.
+      Validated by the video color subtract/CLOCAL modulation test plus the
+      Distira video test gates.
+- [x] Iteration 82: color path subtract-before-ALOCAL-modulation ordering.
+      Validated by the video color subtract/ALOCAL modulation test plus the
+      Distira video test gates.
+- [x] Iteration 83: color path subtract, modulate, then add-CLOCAL ordering.
+      Validated by the video color subtract/modulate/add test plus the Distira
+      video test gates.
+- [x] Iteration 84: color path subtract before add-CLOCAL behavior. Validated by
+      the video color subtract/add test plus the Distira video test gates.
+- [x] Iteration 85: color path add-ALOCAL saturation behavior. Validated by the
+      video color add-ALOCAL saturation test plus the Distira video test gates.
+- [x] Iteration 86: color path zero-other before add-CLOCAL behavior. Validated
+      by the video color zero-other/add test plus the Distira video test gates.
+- [x] Iteration 87: color path zero-other before invert-output behavior.
+      Validated by the video color zero-other/invert test plus the Distira video
+      test gates.
+- [x] Iteration 88: color path Color0 local selection for add-CLOCAL behavior.
+      Validated by the video Color0 CLOCAL add test plus the Distira video test
+      gates.
+- [x] Iteration 89: color path local-select override chooses Color0 when texture
+      alpha bit 7 is set. Validated by the video local-override high-alpha test
+      plus the Distira video test gates.
+- [x] Iteration 90: color path local-select override chooses iterated RGB when
+      texture alpha bit 7 is clear. Validated by the video local-override
+      low-alpha test plus the Distira video test gates.
+- [x] Iteration 91: `FBZ_ALPHA_MASK` rejects even selected alpha before the alpha
+      combine path. Validated by the video alpha-mask rejection test plus the
+      Distira video test gates.
+- [x] Iteration 92: `FBZ_ALPHA_MASK` allows odd selected alpha. Validated by the
+      video alpha-mask allow test plus the Distira video test gates.
+- [x] Iteration 93: triangles without `FBZ_DEPTH_WMASK` do not update depth.
+      Validated by the video depth write-mask disabled test plus the Distira
+      video test gates.
+- [x] Iteration 94: triangles with `FBZ_DEPTH_WMASK` update depth. Validated by
+      the video depth write-mask enabled test plus the Distira video test gates.
+- [x] Iteration 95: depth-only triangles update depth without RGB writes.
+      Validated by the video depth-only write test plus the Distira video test
+      gates.
+- [x] Iteration 96: triangle draws respect `FBZ_DRAW_FRONT` and update scanout
+      without a swap. Validated by the video draw-front triangle test plus the
+      Distira video test gates.
+- [x] Iteration 97: triangle draws to the back buffer wait for `swapbufferCMD`
+      before scanout. Validated by the video draw-back/swap test plus the
+      Distira video test gates.
+- [x] Iteration 98: LFB ARGB8888 writes target the front buffer when selected.
+      Validated by the video LFB front-buffer ARGB8888 test plus the Distira
+      video test gates.
+- [x] Iteration 99: LFB RGB555 dword writes convert two back-buffer pixels.
+      Validated by the video LFB RGB555 dword test plus the Distira video test
+      gates.
+- [x] Iteration 100: LFB ARGB1555 dword writes convert two back-buffer pixels.
+      Validated by the video LFB ARGB1555 dword test plus the Distira video test
+      gates.
+- [x] Iteration 101: LFB RGB565 dword writes split into two selected-buffer
+      pixels. Validated by the video LFB RGB565 dword test plus the Distira
+      video test gates.
+- [x] Iteration 102: LFB depth-only dword writes update two aux/depth pixels
+      without touching scanout color. Validated by the video LFB depth dword test
+      plus the Distira video test gates.
+- [x] Iteration 103: LFB depth+RGB565 dword writes update one selected color
+      pixel and the matching aux/depth pixel with Voodoo address shifting.
+      Validated by the video LFB depth+RGB565 dword test plus the Distira video
+      test gates.
+- [x] Iteration 104: LFB depth+RGB555 dword writes convert color and update the
+      matching aux/depth pixel. Validated by the video LFB depth+RGB555 dword
+      test plus the Distira video test gates.
+- [x] Iteration 105: LFB depth+ARGB1555 dword writes convert color and update the
+      matching aux/depth pixel. Validated by the video LFB depth+ARGB1555 dword
+      test plus the Distira video test gates.
+- [x] Iteration 106: LFB pixel-pipeline mode respects `FBZ_RGB_WMASK` for color
+      writes. Validated by the video LFB pipeline RGB write-mask test plus the
+      Distira video test gates.
+- [x] Iteration 107: LFB pixel-pipeline mode respects `FBZ_DEPTH_WMASK` for aux
+      writes. Validated by the video LFB pipeline depth write-mask test plus the
+      Distira video test gates.
+- [x] Iteration 108: LFB depth+color pixel-pipeline writes honor Voodoo depth
+      compare before changing color or aux. Validated by the video LFB pipeline
+      depth-test rejection/acceptance test plus the Distira video test gates.
+- [x] Iteration 109: LFB pixel-pipeline mode applies chroma-key rejection and
+      increments the FBI chroma-fail counter. Validated by the video LFB pipeline
+      chroma-key test plus the Distira video test gates.
+- [x] Iteration 110: LFB pixel-pipeline mode applies ARGB8888 alpha-test
+      rejection and increments the FBI alpha-fail counter. Validated by the video
+      LFB pipeline alpha-test test plus the Distira video test gates.
+- [x] Iteration 111: LFB pixel-pipeline mode applies constant fog before the
+      color write. Validated by the video LFB pipeline constant-fog test plus the
+      Distira video test gates.
+- [ ] Next: LFB pixel-pipeline alpha blend hooks and broader 16-bit-format
+      pipeline parity.
