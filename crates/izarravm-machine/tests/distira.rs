@@ -326,6 +326,83 @@ fn distira_guest_lfb_bar_odd_reads_and_writes_use_voodoo_callbacks() {
 }
 
 #[test]
+fn distira_guest_cmdfifo_type1_packets_use_assigned_bar_aperture() {
+    const ASSIGNED_BAR: u32 = 0xe300_0000;
+    const CMD_FIFO_BASE: u32 = ASSIGNED_BAR + 0x0020_0000;
+    const SST_CMD_FIFO_DEPTH: usize = 0x1f4;
+    const FBIINIT7_CMDFIFO_ENABLE: u32 = 1 << 8;
+
+    let mut code = Vec::new();
+    push_out_dx_eax(&mut code, 0x0cf8, 0x8000_8010);
+    push_out_dx_eax(&mut code, 0x0cfc, ASSIGNED_BAR);
+    push_out_dx_eax(&mut code, 0x0cf8, 0x8000_8004);
+    push_out_dx_eax(&mut code, 0x0cfc, 0x0000_0002);
+    push_mov_moffs_u32_imm32(&mut code, ASSIGNED_BAR + DISTIRA_REG_FB_WIDTH as u32, 2);
+    push_mov_moffs_u32_imm32(&mut code, ASSIGNED_BAR + DISTIRA_REG_FB_HEIGHT as u32, 1);
+    push_mov_moffs_u32_imm32(
+        &mut code,
+        ASSIGNED_BAR + SST_FBI_INIT7 as u32,
+        FBIINIT7_CMDFIFO_ENABLE,
+    );
+    push_mov_moffs_u32_imm32(
+        &mut code,
+        CMD_FIFO_BASE,
+        cmdfifo_type1_header(SST_CLIP_LEFT_RIGHT, 1),
+    );
+    push_mov_moffs_u32_imm32(&mut code, CMD_FIFO_BASE + 4, 2);
+    push_mov_moffs_u32_imm32(
+        &mut code,
+        CMD_FIFO_BASE + 8,
+        cmdfifo_type1_header(SST_CLIP_LOW_Y_HIGH_Y, 1),
+    );
+    push_mov_moffs_u32_imm32(&mut code, CMD_FIFO_BASE + 12, 1);
+    push_mov_moffs_u32_imm32(
+        &mut code,
+        CMD_FIFO_BASE + 16,
+        cmdfifo_type1_header(SST_FBZ_MODE, 1),
+    );
+    push_mov_moffs_u32_imm32(&mut code, CMD_FIFO_BASE + 20, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
+    push_mov_moffs_u32_imm32(
+        &mut code,
+        CMD_FIFO_BASE + 24,
+        cmdfifo_type1_header(SST_COLOR1, 1),
+    );
+    push_mov_moffs_u32_imm32(&mut code, CMD_FIFO_BASE + 28, 0x0034_5678);
+    push_mov_moffs_u32_imm32(
+        &mut code,
+        CMD_FIFO_BASE + 32,
+        cmdfifo_type1_header(SST_FASTFILL_CMD, 1),
+    );
+    push_mov_moffs_u32_imm32(&mut code, CMD_FIFO_BASE + 36, 1);
+    push_mov_moffs_u32_imm32(
+        &mut code,
+        CMD_FIFO_BASE + 40,
+        cmdfifo_type1_header(SST_SWAPBUFFER_CMD, 1),
+    );
+    push_mov_moffs_u32_imm32(&mut code, CMD_FIFO_BASE + 44, 1);
+
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Distira),
+        protected_flat_rom(&code),
+    )
+    .unwrap();
+
+    let reason = machine.run_until_halt_or_cycles(500_000).unwrap();
+
+    assert_eq!(reason, StopReason::Halted);
+    assert_eq!(read_reg(&mut machine, SST_CMD_FIFO_DEPTH), 12);
+    assert_ne!(read_reg(&mut machine, SST_STATUS) & 0x380, 0);
+
+    machine.drain_distira_fifo();
+
+    assert_eq!(read_reg(&mut machine, SST_CMD_FIFO_DEPTH), 0);
+    assert_eq!(read_reg(&mut machine, SST_STATUS) & 0x380, 0);
+    let (frame, width, height) = machine.frame_argb();
+    assert_eq!((width, height), (2, 1));
+    assert_eq!(frame, vec![0x0031_557b; 2]);
+}
+
+#[test]
 fn distira_pci_config_ports_report_voodoo_graphics_identity() {
     // mov dx,0x0cf8; mov eax,0x80008000; out dx,eax
     // mov dx,0x0cfc; in eax,dx; mov [0x0200],eax; int 20h
