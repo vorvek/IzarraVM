@@ -444,7 +444,9 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
       video bilinear texture sample test plus the workspace gates.
 - [x] Iteration 20: mip and LOD selection for RGB565 texture sampling. Validated
       by the video tLOD-min mip selection test plus the workspace gates.
-- [ ] Next: two-TMU texture combine for RGB565 sampling.
+- [x] Iteration 21: two-TMU texture combine for RGB565 sampling. Validated by
+      the video two-TMU RGB565 add-combine test plus the workspace gates.
+- [ ] Next: additional Voodoo texture formats, starting with RGB332.
 
 ## First 90 percent push for this branch
 

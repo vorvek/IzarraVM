@@ -190,6 +190,8 @@ pub const FBZ_PARAM_ADJUST: u32 = 1 << 26;
 pub const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
 
 pub const TEX_R5G6B5: u32 = 0x0a;
+const CHIP_TREX0: usize = 0x2;
+const CHIP_TREX1: usize = 0x4;
 
 pub const DEPTHOP_NEVER: u32 = 0;
 pub const DEPTHOP_LESSTHAN: u32 = 1;
@@ -381,8 +383,11 @@ pub struct Distira {
     h_sync: u32,
     v_sync: u32,
     texture_mode: u32,
+    texture_mode_tmu1: u32,
     texture_lod: u32,
+    texture_lod_tmu1: u32,
     tex_base_addr: u32,
+    tex_base_addr_tmu1: u32,
 }
 
 impl Default for Distira {
@@ -465,8 +470,11 @@ impl Distira {
             h_sync: 0,
             v_sync: 0,
             texture_mode: 0,
+            texture_mode_tmu1: 0,
             texture_lod: 0,
+            texture_lod_tmu1: 0,
             tex_base_addr: 0,
+            tex_base_addr_tmu1: 0,
         }
     }
 
@@ -739,7 +747,9 @@ impl Distira {
 
     pub fn write_mmio_u8(&mut self, offset: usize, value: u8) {
         let reg = offset & !0x3;
+        let voodoo_reg = offset & 0x3fc;
         let byte = offset & 0x3;
+        let chip = tmu_chip_mask(offset);
         match reg {
             SST_INTR_CTRL => merge_byte(&mut self.intr_ctrl, byte, value),
             SST_VERTEX_AX => merge_vertex_component(&mut self.triangle_vertices[0].0, byte, value),
@@ -976,9 +986,54 @@ impl Distira {
             SST_FBI_INIT5 => merge_byte(&mut self.fbi_init[5], byte, value),
             SST_FBI_INIT6 => merge_byte(&mut self.fbi_init[6], byte, value),
             SST_FBI_INIT7 => merge_byte(&mut self.fbi_init[7], byte, value),
-            SST_TEXTURE_MODE => merge_byte(&mut self.texture_mode, byte, value),
-            SST_TLOD => merge_byte(&mut self.texture_lod, byte, value),
-            SST_TEX_BASE_ADDR => merge_byte(&mut self.tex_base_addr, byte, value),
+            SST_TEXTURE_MODE => {
+                if chip & CHIP_TREX0 != 0 {
+                    merge_byte(&mut self.texture_mode, byte, value);
+                }
+                if chip & CHIP_TREX1 != 0 {
+                    merge_byte(&mut self.texture_mode_tmu1, byte, value);
+                }
+            }
+            SST_TLOD => {
+                if chip & CHIP_TREX0 != 0 {
+                    merge_byte(&mut self.texture_lod, byte, value);
+                }
+                if chip & CHIP_TREX1 != 0 {
+                    merge_byte(&mut self.texture_lod_tmu1, byte, value);
+                }
+            }
+            SST_TEX_BASE_ADDR => {
+                if chip & CHIP_TREX0 != 0 {
+                    merge_byte(&mut self.tex_base_addr, byte, value);
+                }
+                if chip & CHIP_TREX1 != 0 {
+                    merge_byte(&mut self.tex_base_addr_tmu1, byte, value);
+                }
+            }
+            _ if voodoo_reg == SST_TEXTURE_MODE => {
+                if chip & CHIP_TREX0 != 0 {
+                    merge_byte(&mut self.texture_mode, byte, value);
+                }
+                if chip & CHIP_TREX1 != 0 {
+                    merge_byte(&mut self.texture_mode_tmu1, byte, value);
+                }
+            }
+            _ if voodoo_reg == SST_TLOD => {
+                if chip & CHIP_TREX0 != 0 {
+                    merge_byte(&mut self.texture_lod, byte, value);
+                }
+                if chip & CHIP_TREX1 != 0 {
+                    merge_byte(&mut self.texture_lod_tmu1, byte, value);
+                }
+            }
+            _ if voodoo_reg == SST_TEX_BASE_ADDR => {
+                if chip & CHIP_TREX0 != 0 {
+                    merge_byte(&mut self.tex_base_addr, byte, value);
+                }
+                if chip & CHIP_TREX1 != 0 {
+                    merge_byte(&mut self.tex_base_addr_tmu1, byte, value);
+                }
+            }
             DISTIRA_REG_CONTROL => {
                 let mut control = self.control_value();
                 merge_byte(&mut control, byte, value);
@@ -1429,19 +1484,33 @@ impl Distira {
         {
             return (r, g, b);
         }
-        let lod = self.texture_lod_level();
+        let tmu0 = self.sample_tmu_rgb565(0, s, t);
+        if self.texture_mode & (1 << 18) != 0 && ((self.texture_mode_tmu1 >> 8) & 0xf) == TEX_R5G6B5
+        {
+            let tmu1 = self.sample_tmu_rgb565(1, s, t);
+            return (
+                tmu0.0.saturating_add(tmu1.0),
+                tmu0.1.saturating_add(tmu1.1),
+                tmu0.2.saturating_add(tmu1.2),
+            );
+        }
+        tmu0
+    }
+
+    fn sample_tmu_rgb565(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
+        let lod = self.texture_lod_level(tmu);
         let scale = (1_u32 << lod).max(1) as f32;
         let s = s / scale;
         let t = t / scale;
-        if self.texture_mode & 0x6 != 0 {
-            return self.bilinear_rgb565(s, t, lod);
+        if self.texture_mode_for_tmu(tmu) & 0x6 != 0 {
+            return self.bilinear_rgb565(s, t, lod, self.tex_base_addr_for_tmu(tmu));
         }
         let s = s.floor() as i32 & 0xff;
         let t = t.floor() as i32 & 0xff;
-        self.sample_rgb565_texel(s, t, lod)
+        self.sample_rgb565_texel(s, t, lod, self.tex_base_addr_for_tmu(tmu))
     }
 
-    fn bilinear_rgb565(&self, s: f32, t: f32, lod: u32) -> (u8, u8, u8) {
+    fn bilinear_rgb565(&self, s: f32, t: f32, lod: u32, base_addr: u32) -> (u8, u8, u8) {
         let base_s = s.floor();
         let base_t = t.floor();
         let frac_s = ((s - base_s) * 16.0).floor().clamp(0.0, 15.0) as u32;
@@ -1449,10 +1518,10 @@ impl Distira {
         let s0 = base_s as i32;
         let t0 = base_t as i32;
         let samples = [
-            self.sample_rgb565_texel(s0, t0, lod),
-            self.sample_rgb565_texel(s0 + 1, t0, lod),
-            self.sample_rgb565_texel(s0, t0 + 1, lod),
-            self.sample_rgb565_texel(s0 + 1, t0 + 1, lod),
+            self.sample_rgb565_texel(s0, t0, lod, base_addr),
+            self.sample_rgb565_texel(s0 + 1, t0, lod, base_addr),
+            self.sample_rgb565_texel(s0, t0 + 1, lod, base_addr),
+            self.sample_rgb565_texel(s0 + 1, t0 + 1, lod, base_addr),
         ];
         let weights = [
             (16 - frac_s) * (16 - frac_t),
@@ -1477,17 +1546,38 @@ impl Distira {
         )
     }
 
-    fn texture_lod_level(&self) -> u32 {
-        ((self.texture_lod >> 2) & 0xf).min(8)
+    fn texture_mode_for_tmu(&self, tmu: usize) -> u32 {
+        if tmu == 0 {
+            self.texture_mode
+        } else {
+            self.texture_mode_tmu1
+        }
     }
 
-    fn sample_rgb565_texel(&self, s: i32, t: i32, lod: u32) -> (u8, u8, u8) {
+    fn texture_lod_level(&self, tmu: usize) -> u32 {
+        let lod = if tmu == 0 {
+            self.texture_lod
+        } else {
+            self.texture_lod_tmu1
+        };
+        ((lod >> 2) & 0xf).min(8)
+    }
+
+    fn tex_base_addr_for_tmu(&self, tmu: usize) -> u32 {
+        if tmu == 0 {
+            self.tex_base_addr
+        } else {
+            self.tex_base_addr_tmu1
+        }
+    }
+
+    fn sample_rgb565_texel(&self, s: i32, t: i32, lod: u32, base_addr: u32) -> (u8, u8, u8) {
         let width = (256_usize >> lod).max(1);
         let height = (256_usize >> lod).max(1);
         let s = s as usize & (width - 1);
         let t = t as usize & (height - 1);
         let texel = (t * width + s).saturating_mul(2);
-        let offset = (self.tex_base_addr as usize)
+        let offset = (base_addr as usize)
             .saturating_add(rgb565_mip_offset(lod))
             .saturating_add(texel);
         let Some(bytes) = self.texture.get(offset..offset.saturating_add(2)) else {
@@ -1575,6 +1665,13 @@ impl Distira {
 fn merge_byte(slot: &mut u32, byte: usize, value: u8) {
     let shift = byte * 8;
     *slot = (*slot & !(0xff_u32 << shift)) | (u32::from(value) << shift);
+}
+
+fn tmu_chip_mask(offset: usize) -> usize {
+    match (offset >> 10) & 0xf {
+        0 => 0xf,
+        chip => chip,
+    }
 }
 
 fn merge_vertex_component(slot: &mut u32, byte: usize, value: u8) {
