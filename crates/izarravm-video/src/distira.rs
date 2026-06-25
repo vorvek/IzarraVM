@@ -210,6 +210,7 @@ pub const FBZCP_A_SELECT_MASK: u32 = 0x3;
 pub const A_SELECT_TEX: u32 = 1;
 pub const A_SELECT_COLOR1: u32 = 2;
 pub const FBZCP_CC_LOCALSELECT_COLOR0: u32 = 1 << 4;
+pub const FBZCP_CC_LOCALSELECT_OVERRIDE: u32 = 1 << 7;
 pub const FBZCP_CCA_LOCALSELECT_SHIFT: u32 = 5;
 pub const FBZCP_CCA_LOCALSELECT_MASK: u32 = 0x3;
 pub const CCA_LOCALSELECT_COLOR0: u32 = 1;
@@ -224,6 +225,8 @@ pub const CC_MSELECT_ALOCAL: u32 = 3;
 pub const CC_MSELECT_TEX_ALPHA: u32 = 4;
 pub const CC_MSELECT_TEX_RGB: u32 = 5;
 pub const FBZCP_CC_REVERSE_BLEND: u32 = 1 << 13;
+pub const FBZCP_CC_ADD_SHIFT: u32 = 14;
+pub const FBZCP_CC_ADD_MASK: u32 = 0x3;
 pub const FBZCP_CC_ADD_CLOCAL: u32 = 1 << 14;
 pub const FBZCP_CC_ADD_ALOCAL: u32 = 2 << 14;
 pub const FBZCP_CC_INVERT_OUTPUT: u32 = 1 << 16;
@@ -715,6 +718,10 @@ impl Distira {
                 let alocal = self.alpha_local_source(alpha, depth_raw);
                 let texture_alpha = self.texture_alpha_factor(s, t);
                 let aother = self.texture_alpha_or_source(alpha, s, t);
+                if self.fbz_mode & FBZ_ALPHA_MASK != 0 && aother & 1 == 0 {
+                    continue;
+                }
+
                 let (r, g, blue) =
                     self.texture_color_or_source((x, y), (r, g, blue), alocal, aother, (s, t));
                 let alpha = self.apply_alpha_path(alocal, aother, texture_alpha);
@@ -729,10 +736,13 @@ impl Distira {
                 let (r, g, blue) = self.apply_fog_color(r, g, blue);
                 let (r, g, blue) = self.alpha_blend_color(x, y, r, g, blue, alpha);
                 let pixel = pack_rgb565_for_pixel(r, g, blue, x, y, self.dither_enabled);
-                if self.write_back_pixel(x, y, pixel) {
-                    if let Some(depth) = depth {
-                        self.write_depth_pixel(x, y, depth);
-                    }
+                let wrote_color = if depths.is_none() {
+                    self.write_pixel_at_base(self.display.back_base, x, y, pixel)
+                } else {
+                    self.fbz_mode & FBZ_RGB_WMASK != 0 && self.write_draw_pixel(x, y, pixel)
+                };
+                let wrote_depth = depth.is_some_and(|depth| self.write_depth_pixel(x, y, depth));
+                if wrote_color || wrote_depth {
                     written += 1;
                 }
             }
@@ -1563,7 +1573,7 @@ impl Distira {
     }
 
     fn run_triangle_command(&mut self) {
-        if self.fbz_mode & FBZ_RGB_WMASK == 0 {
+        if self.fbz_mode & (FBZ_RGB_WMASK | FBZ_DEPTH_WMASK) == 0 {
             return;
         }
 
@@ -1659,8 +1669,8 @@ impl Distira {
         self.command = 0;
     }
 
-    fn write_back_pixel(&mut self, x: u32, y: u32, pixel: u16) -> bool {
-        let off = u64::from(self.display.back_base)
+    fn write_pixel_at_base(&mut self, base: u32, x: u32, y: u32, pixel: u16) -> bool {
+        let off = u64::from(base)
             .saturating_add(u64::from(y).saturating_mul(u64::from(self.display.pitch)))
             .saturating_add(u64::from(x).saturating_mul(2));
         if off + 1 >= self.fb.len() as u64 {
@@ -1670,6 +1680,14 @@ impl Distira {
         self.fb[off as usize] = bytes[0];
         self.fb[off as usize + 1] = bytes[1];
         true
+    }
+
+    fn write_draw_pixel(&mut self, x: u32, y: u32, pixel: u16) -> bool {
+        let base = match self.fbz_mode & FBZ_DRAW_MASK {
+            FBZ_DRAW_FRONT => self.display.front_base,
+            _ => self.display.back_base,
+        };
+        self.write_pixel_at_base(base, x, y, pixel)
     }
 
     fn depth_test_passes(&self, x: u32, y: u32, depth: u16) -> bool {
@@ -1807,9 +1825,11 @@ impl Distira {
         if self.fbz_color_path
             & (FBZCP_CC_ZERO_OTHER
                 | FBZCP_CC_SUB_CLOCAL
-                | FBZCP_CC_ADD_CLOCAL
-                | FBZCP_CC_ADD_ALOCAL)
+                | FBZCP_CC_LOCALSELECT_COLOR0
+                | FBZCP_CC_LOCALSELECT_OVERRIDE
+                | FBZCP_CC_INVERT_OUTPUT)
             == 0
+            && ((self.fbz_color_path >> FBZCP_CC_ADD_SHIFT) & 0x3) == 0
             && mselect != CC_MSELECT_CLOCAL
             && mselect != CC_MSELECT_AOTHER
             && mselect != CC_MSELECT_ALOCAL
@@ -1818,82 +1838,94 @@ impl Distira {
         {
             return color;
         }
-        let color = if self.fbz_color_path & FBZCP_CC_ZERO_OTHER != 0 {
-            (0, 0, 0)
+        let mut color = if self.fbz_color_path & FBZCP_CC_ZERO_OTHER != 0 {
+            (0_i32, 0_i32, 0_i32)
         } else {
-            color
+            (i32::from(color.0), i32::from(color.1), i32::from(color.2))
         };
-        let local = if self.fbz_color_path & FBZCP_CC_LOCALSELECT_COLOR0 != 0 {
+        let local_select_color0 = if self.fbz_color_path & FBZCP_CC_LOCALSELECT_OVERRIDE != 0 {
+            texture_alpha & 0x80 != 0
+        } else {
+            self.fbz_color_path & FBZCP_CC_LOCALSELECT_COLOR0 != 0
+        };
+        let local = if local_select_color0 {
             (
-                (self.color0 >> 16) as u8,
-                (self.color0 >> 8) as u8,
-                self.color0 as u8,
+                i32::from((self.color0 >> 16) as u8),
+                i32::from((self.color0 >> 8) as u8),
+                i32::from(self.color0 as u8),
             )
         } else {
-            source
+            (
+                i32::from(source.0),
+                i32::from(source.1),
+                i32::from(source.2),
+            )
         };
-        let color = if mselect == CC_MSELECT_CLOCAL {
+        if self.fbz_color_path & FBZCP_CC_SUB_CLOCAL != 0 {
+            color.0 -= local.0;
+            color.1 -= local.1;
+            color.2 -= local.2;
+        }
+
+        color = if mselect == CC_MSELECT_CLOCAL {
             let reverse = self.fbz_color_path & FBZCP_CC_REVERSE_BLEND != 0;
             (
-                color_path_blend_channel(color.0, local.0, reverse),
-                color_path_blend_channel(color.1, local.1, reverse),
-                color_path_blend_channel(color.2, local.2, reverse),
+                color_path_blend_component(color.0, local.0 as u8, reverse),
+                color_path_blend_component(color.1, local.1 as u8, reverse),
+                color_path_blend_component(color.2, local.2 as u8, reverse),
             )
         } else if mselect == CC_MSELECT_AOTHER {
             let reverse = self.fbz_color_path & FBZCP_CC_REVERSE_BLEND != 0;
             (
-                color_path_blend_channel(color.0, aother, reverse),
-                color_path_blend_channel(color.1, aother, reverse),
-                color_path_blend_channel(color.2, aother, reverse),
+                color_path_blend_component(color.0, aother, reverse),
+                color_path_blend_component(color.1, aother, reverse),
+                color_path_blend_component(color.2, aother, reverse),
             )
         } else if mselect == CC_MSELECT_ALOCAL {
             let reverse = self.fbz_color_path & FBZCP_CC_REVERSE_BLEND != 0;
             (
-                color_path_blend_channel(color.0, alocal, reverse),
-                color_path_blend_channel(color.1, alocal, reverse),
-                color_path_blend_channel(color.2, alocal, reverse),
+                color_path_blend_component(color.0, alocal, reverse),
+                color_path_blend_component(color.1, alocal, reverse),
+                color_path_blend_component(color.2, alocal, reverse),
             )
         } else if mselect == CC_MSELECT_TEX_ALPHA {
             let reverse = self.fbz_color_path & FBZCP_CC_REVERSE_BLEND != 0;
             (
-                color_path_blend_channel(color.0, texture_alpha, reverse),
-                color_path_blend_channel(color.1, texture_alpha, reverse),
-                color_path_blend_channel(color.2, texture_alpha, reverse),
+                color_path_blend_component(color.0, texture_alpha, reverse),
+                color_path_blend_component(color.1, texture_alpha, reverse),
+                color_path_blend_component(color.2, texture_alpha, reverse),
             )
         } else if mselect == CC_MSELECT_TEX_RGB {
             let reverse = self.fbz_color_path & FBZCP_CC_REVERSE_BLEND != 0;
             (
-                color_path_blend_channel(color.0, texture_rgb.0, reverse),
-                color_path_blend_channel(color.1, texture_rgb.1, reverse),
-                color_path_blend_channel(color.2, texture_rgb.2, reverse),
+                color_path_blend_component(color.0, texture_rgb.0, reverse),
+                color_path_blend_component(color.1, texture_rgb.1, reverse),
+                color_path_blend_component(color.2, texture_rgb.2, reverse),
             )
         } else {
             color
         };
-        let color = if self.fbz_color_path & FBZCP_CC_SUB_CLOCAL != 0 {
-            (
-                color.0.saturating_sub(local.0),
-                color.1.saturating_sub(local.1),
-                color.2.saturating_sub(local.2),
-            )
-        } else {
-            color
-        };
-        if self.fbz_color_path & FBZCP_CC_ADD_CLOCAL != 0 {
-            (
-                color.0.saturating_add(local.0),
-                color.1.saturating_add(local.1),
-                color.2.saturating_add(local.2),
-            )
-        } else if self.fbz_color_path & FBZCP_CC_ADD_ALOCAL != 0 {
-            (
-                color.0.saturating_add(alocal),
-                color.1.saturating_add(alocal),
-                color.2.saturating_add(alocal),
-            )
-        } else {
-            color
+
+        match (self.fbz_color_path >> FBZCP_CC_ADD_SHIFT) & 0x3 {
+            1 => {
+                color.0 += local.0;
+                color.1 += local.1;
+                color.2 += local.2;
+            }
+            2 => {
+                let alocal = i32::from(alocal);
+                color.0 += alocal;
+                color.1 += alocal;
+                color.2 += alocal;
+            }
+            _ => {}
         }
+
+        (
+            color.0.clamp(0, 255) as u8,
+            color.1.clamp(0, 255) as u8,
+            color.2.clamp(0, 255) as u8,
+        )
     }
 
     fn apply_texture_detail_blend(&self, tmu: usize, color: (u8, u8, u8)) -> (u8, u8, u8) {
@@ -2411,17 +2443,20 @@ impl Distira {
             .and_then(|index| self.depth.get(index).copied())
     }
 
-    fn write_depth_pixel(&mut self, x: u32, y: u32, depth: u16) {
+    fn write_depth_pixel(&mut self, x: u32, y: u32, depth: u16) -> bool {
         if self.fbz_mode & (FBZ_DEPTH_ENABLE | FBZ_DEPTH_WMASK)
             != (FBZ_DEPTH_ENABLE | FBZ_DEPTH_WMASK)
         {
-            return;
+            return false;
         }
         let Some(index) = self.depth_pixel_index(x, y) else {
-            return;
+            return false;
         };
         if let Some(slot) = self.depth.get_mut(index) {
             *slot = depth;
+            true
+        } else {
+            false
         }
     }
 
@@ -2564,6 +2599,15 @@ fn color_path_blend_channel(channel: u8, factor: u8, reverse: bool) -> u8 {
         u32::from((factor ^ 0xff).wrapping_add(1))
     };
     ((u32::from(channel) * factor) >> 8).min(255) as u8
+}
+
+fn color_path_blend_component(channel: i32, factor: u8, reverse: bool) -> i32 {
+    let factor = if reverse {
+        i32::from(factor) + 1
+    } else {
+        i32::from((factor ^ 0xff).wrapping_add(1))
+    };
+    (channel * factor) >> 8
 }
 
 fn texture_coord_index(coord: f32, size: usize, clamp: bool, mirror: bool) -> usize {

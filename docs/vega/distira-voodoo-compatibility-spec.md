@@ -15,7 +15,8 @@ we replace the earlier Distira-native scaffold.
 
 ### Gold standard
 
-The behavioral reference is the 86Box Voodoo implementation, used with permission
+The behavioral reference is the 86Box Voodoo implementation (*voodoo* in 
+https://github.com/86Box/86Box/tree/master/src/video), used with permission 
 for adaptation into this codebase. The important source areas are:
 
 | 86Box area | Role | IzarraVM destination |
@@ -569,23 +570,73 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
 - [x] Iteration 76: texture alpha path subtract-modulate-add ordering behavior.
       Validated by the video texture alpha subtract/modulate/add ordering
       coverage test plus the workspace gates.
-- [ ] Next: texture alpha path invert-after-add ordering behavior.
-
-## First 90 percent push for this branch
-
-Today should not try to port all of 86Box in one commit. The largest safe slice
-is phases 1 and 2 plus the start of phase 3:
-
-1. Introduce Voodoo register constants and state shell.
-2. Add Voodoo-shaped MMIO reads and writes for status, init regs, render state,
-   `lfbMode`, `fbzMode`, `fastfillCMD`, and `swapbufferCMD`.
-3. Keep the existing Distira framebuffer/scanout path working through those
-   Voodoo registers.
-4. Add unit and machine tests that use `SST_*` names instead of the custom
-   `DISTIRA_REG_*` command path.
-5. Leave PCI, FIFO, and texture work as the next slices once the register model
-   is stable.
-
-That does not reach 90 percent of final Glide compatibility. It reaches a much
-better 90 percent of the first architectural pivot: from custom Distira commands
-to a Voodoo-shaped device core.
+- [x] Iteration 77: texture alpha path invert-after-add ordering behavior.
+      Validated by the video alpha invert-after-add test plus the Distira video
+      test gates.
+- [x] Iteration 78: texture alpha zero-other before add-local ordering behavior.
+      Validated by the video alpha zero-other/add-local test plus the Distira
+      video test gates.
+- [x] Iteration 79: texture alpha zero-other before invert-output ordering
+      behavior. Validated by the video alpha zero-other/invert test plus the
+      Distira video test gates.
+- [x] Iteration 80: CCA CLOCAL add-mode invert-after-add behavior. Validated by
+      the video alpha CLOCAL-add invert test plus the Distira video test gates.
+- [x] Iteration 81: color path subtract-before-CLOCAL-modulation ordering.
+      Validated by the video color subtract/CLOCAL modulation test plus the
+      Distira video test gates.
+- [x] Iteration 82: color path subtract-before-ALOCAL-modulation ordering.
+      Validated by the video color subtract/ALOCAL modulation test plus the
+      Distira video test gates.
+- [x] Iteration 83: color path subtract, modulate, then add-CLOCAL ordering.
+      Validated by the video color subtract/modulate/add test plus the Distira
+      video test gates.
+- [x] Iteration 84: color path subtract before add-CLOCAL behavior. Validated by
+      the video color subtract/add test plus the Distira video test gates.
+- [x] Iteration 85: color path add-ALOCAL saturation behavior. Validated by the
+      video color add-ALOCAL saturation test plus the Distira video test gates.
+- [x] Iteration 86: color path zero-other before add-CLOCAL behavior. Validated
+      by the video color zero-other/add test plus the Distira video test gates.
+- [x] Iteration 87: color path zero-other before invert-output behavior.
+      Validated by the video color zero-other/invert test plus the Distira video
+      test gates.
+- [x] Iteration 88: color path Color0 local selection for add-CLOCAL behavior.
+      Validated by the video Color0 CLOCAL add test plus the Distira video test
+      gates.
+- [x] Iteration 89: color path local-select override chooses Color0 when texture
+      alpha bit 7 is set. Validated by the video local-override high-alpha test
+      plus the Distira video test gates.
+- [x] Iteration 90: color path local-select override chooses iterated RGB when
+      texture alpha bit 7 is clear. Validated by the video local-override
+      low-alpha test plus the Distira video test gates.
+- [x] Iteration 91: `FBZ_ALPHA_MASK` rejects even selected alpha before the alpha
+      combine path. Validated by the video alpha-mask rejection test plus the
+      Distira video test gates.
+- [x] Iteration 92: `FBZ_ALPHA_MASK` allows odd selected alpha. Validated by the
+      video alpha-mask allow test plus the Distira video test gates.
+- [x] Iteration 93: triangles without `FBZ_DEPTH_WMASK` do not update depth.
+      Validated by the video depth write-mask disabled test plus the Distira
+      video test gates.
+- [x] Iteration 94: triangles with `FBZ_DEPTH_WMASK` update depth. Validated by
+      the video depth write-mask enabled test plus the Distira video test gates.
+- [x] Iteration 95: depth-only triangles update depth without RGB writes.
+      Validated by the video depth-only write test plus the Distira video test
+      gates.
+- [x] Iteration 96: triangle draws respect `FBZ_DRAW_FRONT` and update scanout
+      without a swap. Validated by the video draw-front triangle test plus the
+      Distira video test gates.
+- [x] Iteration 97: triangle draws to the back buffer wait for `swapbufferCMD`
+      before scanout. Validated by the video draw-back/swap test plus the
+      Distira video test gates.
+- [x] Iteration 98: LFB ARGB8888 writes target the front buffer when selected.
+      Validated by the video LFB front-buffer ARGB8888 test plus the Distira
+      video test gates.
+- [x] Iteration 99: LFB RGB555 dword writes convert two back-buffer pixels.
+      Validated by the video LFB RGB555 dword test plus the Distira video test
+      gates.
+- [x] Iteration 100: LFB ARGB1555 dword writes convert two back-buffer pixels.
+      Validated by the video LFB ARGB1555 dword test plus the Distira video test
+      gates.
+- [x] Iteration 101: LFB RGB565 dword writes split into two selected-buffer
+      pixels. Validated by the video LFB RGB565 dword test plus the Distira
+      video test gates.
+- [ ] Next: LFB depth/depth-plus-color formats and aux/depth buffer selection.
