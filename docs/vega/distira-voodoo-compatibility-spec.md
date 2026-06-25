@@ -554,7 +554,10 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
 - [x] Iteration 71: texture alpha path float iter-Z local-alpha select behavior.
       Validated by the video texture alpha float iter-Z local-select regression
       test plus the workspace gates.
-- [ ] Next: texture alpha path alocal2 modulation behavior.
+- [x] Iteration 72: texture alpha path alocal2 modulation behavior.
+      Validated by the video texture alpha alocal2 modulation test plus the
+      workspace gates.
+- [ ] Next: texture alpha path add-local mode distinctions.
 
 ## First 90 percent push for this branch
 
