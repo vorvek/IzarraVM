@@ -50,8 +50,9 @@ fn distira_mmio_and_lfb_are_wired_into_machine_scanout() {
     .unwrap();
 
     assert_eq!(read_reg(&mut machine, SST_STATUS) & 0x380, 0);
+    assert_eq!(machine.read_physical_u8(DISTIRA_LFB_BASE), 0xff);
     machine.write_physical_u8(DISTIRA_LFB_BASE, 0x34);
-    assert_eq!(machine.read_physical_u8(DISTIRA_LFB_BASE), 0x34);
+    assert_eq!(machine.read_physical_u8(DISTIRA_LFB_BASE), 0xff);
 
     write_reg(&mut machine, DISTIRA_REG_FB_WIDTH, 2);
     write_reg(&mut machine, DISTIRA_REG_FB_HEIGHT, 2);

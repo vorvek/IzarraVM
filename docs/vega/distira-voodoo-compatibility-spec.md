@@ -686,6 +686,10 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
       RGB color formats, and machine-bus word routing through the same path.
       Validated by the video LFB word RGB565 blend/depth/depth-only alpha tests,
       the machine LFB word pipeline test, and the Distira video/machine gates.
-- [ ] Next: LFB byte-width and odd-aligned word semantics against 86Box's LFB
-      aperture behavior, including readback parity for guest byte/word/dword
-      accesses.
+- [x] Iteration 115: Machine LFB byte accesses follow the 86Box aperture shape:
+      the Voodoo mapping has no byte callback, so guest-visible byte reads return
+      open bus (`0xff`) and byte writes are ignored while word/dword LFB writes
+      still route through the hardware-format paths. Validated by the machine
+      LFB aperture/scanout regression and the Distira video/machine gates.
+- [ ] Next: Odd-aligned word/dword LFB dispatch and readback parity against
+      86Box's LFB aperture behavior.

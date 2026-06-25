@@ -7208,7 +7208,7 @@ impl CpuBus for MachineBus<'_> {
 
         if let Some(offset) = self.distira_lfb_offset(address, width.bytes() as usize) {
             match width {
-                BusWidth::Byte => self.distira.write_lfb_u8(offset, value as u8),
+                BusWidth::Byte => {}
                 BusWidth::Word => self.distira.write_lfb_u16(offset, value as u16),
                 BusWidth::Dword => self.distira.write_lfb_u32(offset, value),
             }
@@ -8091,6 +8091,9 @@ impl MachineBus<'_> {
         }
 
         if let Some(offset) = self.distira_lfb_offset(address, width) {
+            if width == 1 {
+                return Ok(vec![0xff]);
+            }
             return Ok((0..width)
                 .map(|index| self.distira.read_lfb_u8(offset + index))
                 .collect());
@@ -8186,8 +8189,7 @@ impl MachineBus<'_> {
             return Ok(());
         }
 
-        if let Some(offset) = self.distira_lfb_offset(address, 1) {
-            self.distira.write_lfb_u8(offset, value);
+        if self.distira_lfb_offset(address, 1).is_some() {
             return Ok(());
         }
 
