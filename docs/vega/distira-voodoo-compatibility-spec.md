@@ -542,7 +542,10 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
 - [x] Iteration 67: texture alpha path non-reverse modulation behavior.
       Validated by the video texture alpha non-reverse modulation regression
       test plus the workspace gates.
-- [ ] Next: texture alpha path color1 alpha select behavior.
+- [x] Iteration 68: texture alpha path color1 alpha select behavior.
+      Validated by the video texture alpha color1-select test plus the
+      workspace gates.
+- [ ] Next: texture alpha path color0 local-alpha select behavior.
 
 ## First 90 percent push for this branch
 
