@@ -623,6 +623,55 @@ impl AccessMode {
 enum OutputTarget {
     Console,
     Host(Rc<RefCell<File>>),
+    Memory(Rc<RefCell<MemoryFile>>),
+}
+
+#[derive(Debug, Clone)]
+struct MemoryFile {
+    bytes: Vec<u8>,
+    position: u32,
+}
+
+impl MemoryFile {
+    fn size_u32(&self) -> u32 {
+        self.bytes.len().min(u32::MAX as usize) as u32
+    }
+
+    fn read_to_guest(
+        &mut self,
+        mem: &mut Memory,
+        base: usize,
+        count: usize,
+    ) -> Result<usize, DosError> {
+        let start = usize::try_from(self.position).unwrap_or(usize::MAX);
+        if start >= self.bytes.len() {
+            return Ok(0);
+        }
+        let available = self.bytes.len().saturating_sub(start);
+        let filled = available.min(count);
+        for (index, &byte) in self.bytes[start..start + filled].iter().enumerate() {
+            mem.write_u8(base + index, byte)?;
+        }
+        self.position = self.position.saturating_add(filled as u32);
+        Ok(filled)
+    }
+
+    fn seek(&mut self, whence: u8, offset: u32) -> Option<u32> {
+        let base = match whence {
+            0 => 0i64,
+            1 => i64::from(self.position),
+            2 => i64::from(self.size_u32()),
+            _ => return None,
+        };
+        let signed = if whence == 0 {
+            i64::from(offset)
+        } else {
+            i64::from(offset as i32)
+        };
+        let pos = (base + signed) as u32;
+        self.position = pos;
+        Some(pos)
+    }
 }
 
 /// An open file handle: its byte target plus the DOS access mode the kernel
@@ -643,7 +692,14 @@ impl OpenFile {
     fn host_file(&self) -> Option<&Rc<RefCell<File>>> {
         match &self.target {
             OutputTarget::Host(f) => Some(f),
-            OutputTarget::Console => None,
+            OutputTarget::Console | OutputTarget::Memory(_) => None,
+        }
+    }
+
+    fn memory_file(&self) -> Option<&Rc<RefCell<MemoryFile>>> {
+        match &self.target {
+            OutputTarget::Memory(f) => Some(f),
+            OutputTarget::Console | OutputTarget::Host(_) => None,
         }
     }
 }
@@ -672,6 +728,14 @@ fn open_file_record(file: File, mode: AccessMode, path: &Path) -> OpenFile {
         target: OutputTarget::Host(Rc::new(RefCell::new(file))),
         mode,
         sft_name: sft_name_from_path(path),
+    }
+}
+
+fn open_memory_file_record(name: [u8; 11], bytes: Vec<u8>) -> OpenFile {
+    OpenFile {
+        target: OutputTarget::Memory(Rc::new(RefCell::new(MemoryFile { bytes, position: 0 }))),
+        mode: AccessMode::Read,
+        sft_name: name,
     }
 }
 
@@ -811,6 +875,20 @@ pub struct BlockDeviceIoTarget {
     pub header: FarPtr,
     pub unit: u8,
     pub media: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockDeviceFsTarget {
+    pub io: BlockDeviceIoTarget,
+    pub bytes_per_sector: u16,
+    pub sectors_per_cluster: u8,
+    pub first_fat_sector: u16,
+    pub fat_count: u8,
+    pub root_entries: u16,
+    pub first_data_sector: u16,
+    pub highest_cluster: u16,
+    pub sectors_per_fat: u16,
+    pub first_root_sector: u16,
 }
 
 /// Where SYSINIT should try to place a raw CONFIG.SYS driver image.
@@ -1241,6 +1319,14 @@ impl DosKernel {
         None
     }
 
+    /// True when AH=3Dh on `name` should open a character device before any
+    /// filesystem route. DOS applies this name precedence even with a drive or
+    /// extension, so `D:\\TESTDEV.XYZ` still resolves to a loaded `TESTDEV` driver.
+    pub fn open_name_would_resolve_to_character_device(&self, mem: &Memory, name: &str) -> bool {
+        (is_ems_device_name(name) && self.ems_present)
+            || self.find_loaded_character_device(mem, name).is_some()
+    }
+
     /// Device attribute bit 11 asks DOS to send command 0Dh/0Eh on open/close.
     fn device_supports_open_close(&self, mem: &Memory, header: FarPtr) -> bool {
         let base = usize::from(header.segment) * 16 + usize::from(header.offset);
@@ -1292,6 +1378,40 @@ impl DosKernel {
                 },
                 unit,
                 media: bpb.media,
+            });
+        }
+        None
+    }
+
+    pub fn block_device_fs_target(&self, drive: u8) -> Option<BlockDeviceFsTarget> {
+        for device in &self.loaded_block_devices {
+            if drive < device.first_drive {
+                continue;
+            }
+            let unit = drive - device.first_drive;
+            if unit >= device.installed_units {
+                continue;
+            }
+            let bpb = device.bpbs_by_unit.get(usize::from(unit))?.as_ref()?;
+            let io = BlockDeviceIoTarget {
+                header: FarPtr {
+                    segment: device.header.0,
+                    offset: device.header.1,
+                },
+                unit,
+                media: bpb.media,
+            };
+            return Some(BlockDeviceFsTarget {
+                io,
+                bytes_per_sector: bpb.bytes_per_sector,
+                sectors_per_cluster: bpb.cluster_mask + 1,
+                first_fat_sector: bpb.first_fat_sector,
+                fat_count: bpb.fat_count,
+                root_entries: bpb.root_entries,
+                first_data_sector: bpb.first_data_sector,
+                highest_cluster: bpb.highest_cluster,
+                sectors_per_fat: bpb.sectors_per_fat,
+                first_root_sector: bpb.first_root_sector,
             });
         }
         None
@@ -1367,18 +1487,25 @@ impl DosKernel {
     fn sft_host_file_entries(&mut self) -> Vec<SftHostFileEntry> {
         let mut entries = Vec::with_capacity(self.open_files.len());
         for (&slot, open) in &mut self.open_files {
-            let Some(host) = open.host_file() else {
-                continue; // Console handles carry no host metadata
+            let (size, position) = match &open.target {
+                OutputTarget::Console => continue,
+                OutputTarget::Host(host) => {
+                    let mut file = host.borrow_mut();
+                    let size = file
+                        .metadata()
+                        .map(|meta| meta.len().min(u64::from(u32::MAX)) as u32)
+                        .unwrap_or(0);
+                    let position = file
+                        .stream_position()
+                        .map(|pos| pos.min(u64::from(u32::MAX)) as u32)
+                        .unwrap_or(0);
+                    (size, position)
+                }
+                OutputTarget::Memory(file) => {
+                    let file = file.borrow();
+                    (file.size_u32(), file.position)
+                }
             };
-            let mut file = host.borrow_mut();
-            let size = file
-                .metadata()
-                .map(|meta| meta.len().min(u64::from(u32::MAX)) as u32)
-                .unwrap_or(0);
-            let position = file
-                .stream_position()
-                .map(|pos| pos.min(u64::from(u32::MAX)) as u32)
-                .unwrap_or(0);
             entries.push(SftHostFileEntry {
                 slot,
                 open_mode: open.mode.sft_open_mode(),
@@ -2793,14 +2920,16 @@ impl DosKernel {
 
     /// Write one byte to a standard output handle (1 = stdout, 2 = stderr). A
     /// Console target, or an unseeded standard handle, reaches the screen buffer;
-    /// a redirected Host target writes the byte to its file. Returns a DOS error
-    /// code on a host write fault.
+    /// a redirected Host target writes the byte to its file. A read-only memory
+    /// file redirected onto stdout/stderr rejects character writes just like AH=40h.
+    /// Returns a DOS error code on write fault.
     fn write_console_handle(&mut self, handle: u16, byte: u8) -> Result<(), u16> {
         match self.open_files.get(&handle).map(|of| &of.target) {
             Some(OutputTarget::Host(file)) => file
                 .borrow_mut()
                 .write_all(&[byte])
                 .map_err(|e| dos_io_error_code(&e)),
+            Some(OutputTarget::Memory(_)) => Err(0x05),
             _ => {
                 self.stdout.push(byte);
                 Ok(())
@@ -2953,10 +3082,54 @@ impl DosKernel {
         set_dos_error(regs, code);
     }
 
+    pub fn fail_regs(&mut self, regs: &mut DosRegs, code: u16) {
+        self.fail(regs, code);
+    }
+
     /// Record a DOS error code that was discovered after the kernel yielded a
     /// follow-up action to the machine, such as a loaded-driver request failure.
     pub fn record_last_error(&mut self, code: u16) {
         self.last_error = code;
+    }
+
+    pub fn open_readonly_memory_file(
+        &mut self,
+        regs: &mut DosRegs,
+        name: [u8; 11],
+        bytes: Vec<u8>,
+    ) {
+        let Some(mode) = AccessMode::try_from_open_al(regs.ax as u8) else {
+            self.fail(regs, 0x0c);
+            return;
+        };
+        if mode != AccessMode::Read {
+            self.fail(regs, 0x05);
+            return;
+        }
+        let Some(handle) = self.alloc_handle() else {
+            self.fail(regs, 0x04);
+            return;
+        };
+        self.open_files
+            .insert(handle, open_memory_file_record(name, bytes));
+        regs.ax = handle;
+        regs.cf = false;
+    }
+
+    pub fn alloc_internal_scratch(
+        &mut self,
+        paras: u16,
+        mem: &mut Memory,
+    ) -> Result<Result<u16, u16>, DosError> {
+        self.arena.allocate(paras, mem)
+    }
+
+    pub fn free_internal_scratch(
+        &mut self,
+        seg: u16,
+        mem: &mut Memory,
+    ) -> Result<Result<(), ()>, DosError> {
+        self.free_routed(seg, mem)
     }
 
     fn refresh_sda(&self, mem: &mut Memory) -> Result<(u16, u16), DosError> {
@@ -3204,34 +3377,42 @@ impl DosKernel {
                         regs.cf = false;
                         return Ok(DosAction::Continue);
                     }
-                    // A redirected stdin (Host) reads file bytes synchronously and
-                    // returns 0 at EOF with no WaitForKey. Console keeps the cooked
-                    // keyboard path below.
-                    if let Some(OutputTarget::Host(file)) =
-                        self.open_files.get(&0).map(|of| of.target.clone())
-                    {
-                        let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
-                        let mut buffer = vec![0u8; count];
-                        let mut filled = 0usize;
-                        {
-                            let mut f = file.borrow_mut();
-                            while filled < count {
-                                match f.read(&mut buffer[filled..]) {
-                                    Ok(0) => break,
-                                    Ok(n) => filled += n,
-                                    Err(err) => {
-                                        set_dos_error(regs, dos_io_error_code(&err));
-                                        return Ok(DosAction::Continue);
+                    // A redirected stdin reads file bytes synchronously and returns
+                    // 0 at EOF with no WaitForKey. Console keeps the cooked keyboard
+                    // path below.
+                    match self.open_files.get(&0).map(|of| of.target.clone()) {
+                        Some(OutputTarget::Host(file)) => {
+                            let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+                            let mut buffer = vec![0u8; count];
+                            let mut filled = 0usize;
+                            {
+                                let mut f = file.borrow_mut();
+                                while filled < count {
+                                    match f.read(&mut buffer[filled..]) {
+                                        Ok(0) => break,
+                                        Ok(n) => filled += n,
+                                        Err(err) => {
+                                            set_dos_error(regs, dos_io_error_code(&err));
+                                            return Ok(DosAction::Continue);
+                                        }
                                     }
                                 }
                             }
+                            for (index, &byte) in buffer[..filled].iter().enumerate() {
+                                mem.write_u8(base + index, byte)?;
+                            }
+                            regs.ax = filled as u16;
+                            regs.cf = false;
+                            return Ok(DosAction::Continue);
                         }
-                        for (index, &byte) in buffer[..filled].iter().enumerate() {
-                            mem.write_u8(base + index, byte)?;
+                        Some(OutputTarget::Memory(file)) => {
+                            let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+                            let filled = file.borrow_mut().read_to_guest(mem, base, count)?;
+                            regs.ax = filled as u16;
+                            regs.cf = false;
+                            return Ok(DosAction::Continue);
                         }
-                        regs.ax = filled as u16;
-                        regs.cf = false;
-                        return Ok(DosAction::Continue);
+                        _ => {}
                     }
                     let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
                     let mut filled = 0usize;
@@ -3252,13 +3433,6 @@ impl DosKernel {
                         }
                     }
                     regs.ax = filled as u16;
-                    regs.cf = false;
-                    return Ok(DosAction::Continue);
-                }
-                // Predefined STDAUX exists as a character device, but the HLE has
-                // no serial RX buffer yet. Report EOF rather than invalid handle.
-                if handle == 3 {
-                    regs.ax = 0;
                     regs.cf = false;
                     return Ok(DosAction::Continue);
                 }
@@ -3296,6 +3470,13 @@ impl DosKernel {
                     });
                 }
                 let Some(of) = self.open_files.get(&handle) else {
+                    // Predefined STDAUX exists as a character device, but the HLE has
+                    // no serial RX buffer yet. Report EOF rather than invalid handle.
+                    if handle == 3 {
+                        regs.ax = 0;
+                        regs.cf = false;
+                        return Ok(DosAction::Continue);
+                    }
                     set_dos_error(regs, 0x06);
                     return Ok(DosAction::Continue);
                 };
@@ -3303,32 +3484,43 @@ impl DosKernel {
                     set_dos_error(regs, 0x05);
                     return Ok(DosAction::Continue);
                 }
-                let Some(host) = of.host_file().cloned() else {
-                    regs.ax = 0;
-                    regs.cf = false; // a Console (non-stdin) handle has no input
-                    return Ok(DosAction::Continue);
-                };
-                let mut file = host.borrow_mut();
-                let mut buffer = vec![0u8; count];
-                let mut filled = 0usize;
-                while filled < count {
-                    match file.read(&mut buffer[filled..]) {
-                        Ok(0) => break,
-                        Ok(n) => filled += n,
-                        Err(err) => {
-                            set_dos_error(regs, dos_io_error_code(&err));
-                            return Ok(DosAction::Continue);
+                match of.target.clone() {
+                    OutputTarget::Console => {
+                        regs.ax = 0;
+                        regs.cf = false; // a Console (non-stdin) handle has no input
+                        Ok(DosAction::Continue)
+                    }
+                    OutputTarget::Memory(file) => {
+                        let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+                        let filled = file.borrow_mut().read_to_guest(mem, base, count)?;
+                        regs.ax = filled as u16;
+                        regs.cf = false;
+                        Ok(DosAction::Continue)
+                    }
+                    OutputTarget::Host(host) => {
+                        let mut file = host.borrow_mut();
+                        let mut buffer = vec![0u8; count];
+                        let mut filled = 0usize;
+                        while filled < count {
+                            match file.read(&mut buffer[filled..]) {
+                                Ok(0) => break,
+                                Ok(n) => filled += n,
+                                Err(err) => {
+                                    set_dos_error(regs, dos_io_error_code(&err));
+                                    return Ok(DosAction::Continue);
+                                }
+                            }
                         }
+                        drop(file);
+                        let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+                        for (index, &byte) in buffer[..filled].iter().enumerate() {
+                            mem.write_u8(base + index, byte)?;
+                        }
+                        regs.ax = filled as u16;
+                        regs.cf = false;
+                        Ok(DosAction::Continue)
                     }
                 }
-                drop(file);
-                let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
-                for (index, &byte) in buffer[..filled].iter().enumerate() {
-                    mem.write_u8(base + index, byte)?;
-                }
-                regs.ax = filled as u16;
-                regs.cf = false;
-                Ok(DosAction::Continue)
             }
             // AH=3Eh: close the handle in BX. Dropping the File closes it (RAII).
             // CF=0 if it closes cleanly. CF=1 + AX=0x06 for an invalid handle, or a
@@ -3768,12 +3960,12 @@ impl DosKernel {
                         rollback_handle_on_error: None,
                     });
                 }
-                // AUX (3, COM1) and PRN (4, LPT1): accept the write and report every
-                // byte written, but discard the data. The HLE has no serial or
-                // printer capture at the INT 21h layer (marked).
-                if handle == 3 || handle == 4 {
-                    regs.ax = regs.cx;
-                    regs.cf = false;
+                if self
+                    .open_files
+                    .get(&handle)
+                    .is_some_and(|of| matches!(of.target, OutputTarget::Memory(_)))
+                {
+                    set_dos_error(regs, 0x05);
                     return Ok(DosAction::Continue);
                 }
                 // A Host file gets the bytes; a Console handle (or an unseeded
@@ -3788,6 +3980,14 @@ impl DosKernel {
                     }
                     Some(_) => None,             // a Console handle
                     None if handle <= 2 => None, // unseeded standard handle -> console
+                    // AUX (3, COM1) and PRN (4, LPT1): accept the write and report every
+                    // byte written, but discard the data. The HLE has no serial or
+                    // printer capture at the INT 21h layer (marked).
+                    None if handle == 3 || handle == 4 => {
+                        regs.ax = regs.cx;
+                        regs.cf = false;
+                        return Ok(DosAction::Continue);
+                    }
                     None => {
                         set_dos_error(regs, 0x06);
                         return Ok(DosAction::Continue);
@@ -3850,51 +4050,63 @@ impl DosKernel {
                     set_dos_error(regs, 0x06);
                     return Ok(DosAction::Continue);
                 };
-                let Some(host) = of.host_file().cloned() else {
-                    regs.ax = 0;
-                    regs.dx = 0;
-                    regs.cf = false; // seeking CON is a no-op
-                    return Ok(DosAction::Continue);
-                };
-                let mut file = host.borrow_mut();
-                // Resolve the base the offset applies to. whence 0 takes the offset
-                // from BOF; whence 1 from current; whence 2 from EOF. DOS keeps a
-                // 32-bit unsigned file pointer, so negative results wrap into the
-                // high 4 GiB range rather than failing.
-                let base = match whence {
-                    0 => 0i64,
-                    1 => match file.stream_position() {
-                        Ok(p) => p as i64,
-                        Err(err) => {
-                            set_dos_error(regs, dos_io_error_code(&err));
-                            return Ok(DosAction::Continue);
-                        }
-                    },
-                    2 => match file.seek(SeekFrom::End(0)) {
-                        Ok(p) => p as i64,
-                        Err(err) => {
-                            set_dos_error(regs, dos_io_error_code(&err));
-                            return Ok(DosAction::Continue);
-                        }
-                    },
-                    _ => {
-                        set_dos_error(regs, 0x01);
+                let pos = match of.target.clone() {
+                    OutputTarget::Console => {
+                        regs.ax = 0;
+                        regs.dx = 0;
+                        regs.cf = false; // seeking CON is a no-op
                         return Ok(DosAction::Continue);
                     }
+                    OutputTarget::Memory(file) => {
+                        let Some(pos) = file.borrow_mut().seek(whence, offset) else {
+                            set_dos_error(regs, 0x01);
+                            return Ok(DosAction::Continue);
+                        };
+                        pos
+                    }
+                    OutputTarget::Host(host) => {
+                        let mut file = host.borrow_mut();
+                        // Resolve the base the offset applies to. whence 0 takes the offset
+                        // from BOF; whence 1 from current; whence 2 from EOF. DOS keeps a
+                        // 32-bit unsigned file pointer, so negative results wrap into the
+                        // high 4 GiB range rather than failing.
+                        let base = match whence {
+                            0 => 0i64,
+                            1 => match file.stream_position() {
+                                Ok(p) => p as i64,
+                                Err(err) => {
+                                    set_dos_error(regs, dos_io_error_code(&err));
+                                    return Ok(DosAction::Continue);
+                                }
+                            },
+                            2 => match file.seek(SeekFrom::End(0)) {
+                                Ok(p) => p as i64,
+                                Err(err) => {
+                                    set_dos_error(regs, dos_io_error_code(&err));
+                                    return Ok(DosAction::Continue);
+                                }
+                            },
+                            _ => {
+                                set_dos_error(regs, 0x01);
+                                return Ok(DosAction::Continue);
+                            }
+                        };
+                        let signed = if whence == 0 {
+                            i64::from(offset)
+                        } else {
+                            i64::from(offset as i32)
+                        };
+                        // A before-start pointer wraps to its 32-bit two's complement.
+                        // Seeking beyond EOF is allowed. A later read returns EOF; a
+                        // write there extends the host file as DOS would.
+                        let pos = (base + signed) as u32;
+                        if let Err(err) = file.seek(SeekFrom::Start(u64::from(pos))) {
+                            set_dos_error(regs, dos_io_error_code(&err));
+                            return Ok(DosAction::Continue);
+                        }
+                        pos
+                    }
                 };
-                let signed = if whence == 0 {
-                    i64::from(offset)
-                } else {
-                    i64::from(offset as i32)
-                };
-                // A before-start pointer wraps to its 32-bit two's complement, the
-                // Seeking beyond EOF is allowed. A later read returns EOF; a write
-                // there extends the host file as DOS would.
-                let pos = (base + signed) as u32;
-                if let Err(err) = file.seek(SeekFrom::Start(u64::from(pos))) {
-                    set_dos_error(regs, dos_io_error_code(&err));
-                    return Ok(DosAction::Continue);
-                }
                 regs.ax = pos as u16;
                 regs.dx = (pos >> 16) as u16;
                 regs.cf = false;
@@ -4401,6 +4613,14 @@ impl DosKernel {
                                         return Ok(DosAction::Continue);
                                     }
                                 }
+                            } else if let Some(memory) = self
+                                .open_files
+                                .get(&handle)
+                                .and_then(|of| of.memory_file())
+                                .cloned()
+                            {
+                                let file = memory.borrow();
+                                file.position < file.size_u32()
                             } else {
                                 true
                             };
@@ -8703,6 +8923,319 @@ mod tests {
         };
         kernel.dispatch(0x21, &mut regs, mem).unwrap();
         regs
+    }
+
+    fn open_memory_handle(kernel: &mut DosKernel, data: &[u8]) -> u16 {
+        let mut regs = DosRegs {
+            ax: 0x3d00,
+            ..DosRegs::default()
+        };
+        kernel.open_readonly_memory_file(&mut regs, *b"MEM     TXT", data.to_vec());
+        assert!(!regs.cf, "memory file open failed: ax={:#06x}", regs.ax);
+        regs.ax
+    }
+
+    #[test]
+    fn memory_file_handle_reads_then_eofs() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let handle = open_memory_handle(&mut kernel, b"abcdef");
+
+        let first = read(&mut kernel, &mut mem, handle, 4, 0x0400);
+        assert!(!first.cf);
+        assert_eq!(first.ax, 4);
+        let second = read(&mut kernel, &mut mem, handle, 4, 0x0410);
+        assert!(!second.cf);
+        assert_eq!(second.ax, 2);
+        let third = read(&mut kernel, &mut mem, handle, 4, 0x0420);
+        assert!(!third.cf);
+        assert_eq!(third.ax, 0);
+
+        let base0 = 0x0100usize * 16 + 0x0400;
+        let chunk0: Vec<u8> = (0..4).map(|i| mem.read_u8(base0 + i).unwrap()).collect();
+        assert_eq!(chunk0, b"abcd");
+        let base1 = 0x0100usize * 16 + 0x0410;
+        let chunk1: Vec<u8> = (0..2).map(|i| mem.read_u8(base1 + i).unwrap()).collect();
+        assert_eq!(chunk1, b"ef");
+    }
+
+    #[test]
+    fn memory_file_handle_seek_reads_from_new_position() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let handle = open_memory_handle(&mut kernel, b"abcdef");
+        let mut seek = DosRegs {
+            ax: 0x4200,
+            bx: handle,
+            dx: 2,
+            ..DosRegs::default()
+        };
+
+        kernel.dispatch(0x21, &mut seek, &mut mem).unwrap();
+
+        assert!(!seek.cf);
+        assert_eq!(seek.ax, 2);
+        assert_eq!(seek.dx, 0);
+        let regs = read(&mut kernel, &mut mem, handle, 3, 0x0400);
+        assert!(!regs.cf);
+        assert_eq!(regs.ax, 3);
+        let base = 0x0100usize * 16 + 0x0400;
+        let got: Vec<u8> = (0..3).map(|i| mem.read_u8(base + i).unwrap()).collect();
+        assert_eq!(got, b"cde");
+    }
+
+    #[test]
+    fn memory_file_handle_write_and_zero_count_truncate_are_access_denied() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let handle = open_memory_handle(&mut kernel, b"abcdef");
+        let src = 0x0100usize * 16 + 0x0500;
+        mem.write_u8(src, b'X').unwrap();
+        let mut write = DosRegs {
+            ax: 0x4000,
+            bx: handle,
+            cx: 1,
+            ds: 0x0100,
+            dx: 0x0500,
+            ..DosRegs::default()
+        };
+
+        kernel.dispatch(0x21, &mut write, &mut mem).unwrap();
+
+        assert!(write.cf);
+        assert_eq!(write.ax, 0x05);
+        let mut truncate = DosRegs {
+            ax: 0x4000,
+            bx: handle,
+            cx: 0,
+            ds: 0x0100,
+            dx: 0x0500,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut truncate, &mut mem).unwrap();
+        assert!(truncate.cf);
+        assert_eq!(truncate.ax, 0x05);
+    }
+
+    #[test]
+    fn memory_file_handle_commit_and_close_are_valid() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let handle = open_memory_handle(&mut kernel, b"abcdef");
+
+        for ax in [0x6800, 0x6a00] {
+            let mut commit = DosRegs {
+                ax,
+                bx: handle,
+                ..DosRegs::default()
+            };
+            kernel.dispatch(0x21, &mut commit, &mut mem).unwrap();
+            assert!(!commit.cf, "commit {ax:#06x} succeeds");
+        }
+
+        let closed = close(&mut kernel, &mut mem, handle);
+        assert!(!closed.cf);
+    }
+
+    #[test]
+    fn memory_file_handle_sft_reports_size_and_position() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        kernel.init_program(0x0100, 0x1100, &mut mem).unwrap();
+        let handle = open_memory_handle(&mut kernel, b"abcdef");
+        let read = read(&mut kernel, &mut mem, handle, 2, 0x0400);
+        assert!(!read.cf);
+
+        let entry = ah52_sft_entry(&mut kernel, &mut mem, handle);
+
+        assert_eq!(mem.read_u16(entry).unwrap(), 1);
+        assert_eq!(mem.read_u16(entry + 0x02).unwrap(), 0);
+        assert_eq!(mem.read_u16(entry + 0x05).unwrap() & 0x0080, 0);
+        assert_eq!(mem.read_u32(entry + 0x11).unwrap(), 6);
+        assert_eq!(mem.read_u32(entry + 0x15).unwrap(), 2);
+        let name: Vec<u8> = (0..11)
+            .map(|i| mem.read_u8(entry + 0x20 + i).unwrap())
+            .collect();
+        assert_eq!(&name, b"MEM     TXT");
+    }
+
+    #[test]
+    fn memory_file_handle_dup_and_dup2_share_cursor() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let handle = open_memory_handle(&mut kernel, b"abcdef");
+        let mut dup = DosRegs {
+            ax: 0x4500,
+            bx: handle,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut dup, &mut mem).unwrap();
+        assert!(!dup.cf);
+        let dup_handle = dup.ax;
+
+        assert_eq!(read(&mut kernel, &mut mem, handle, 2, 0x0400).ax, 2);
+        let through_dup = read(&mut kernel, &mut mem, dup_handle, 2, 0x0410);
+        assert!(!through_dup.cf);
+        assert_eq!(through_dup.ax, 2);
+        let base = 0x0100usize * 16 + 0x0410;
+        let got: Vec<u8> = (0..2).map(|i| mem.read_u8(base + i).unwrap()).collect();
+        assert_eq!(got, b"cd");
+
+        let mut dup2 = DosRegs {
+            ax: 0x4600,
+            bx: handle,
+            cx: 9,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut dup2, &mut mem).unwrap();
+        assert!(!dup2.cf);
+        let through_dup2 = read(&mut kernel, &mut mem, 9, 1, 0x0420);
+        assert!(!through_dup2.cf);
+        assert_eq!(through_dup2.ax, 1);
+        let got = mem.read_u8(0x0100usize * 16 + 0x0420).unwrap();
+        assert_eq!(got, b'e');
+    }
+
+    #[test]
+    fn memory_file_handle_dup2_to_stdout_rejects_char_output() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let handle = open_memory_handle(&mut kernel, b"abcdef");
+        let mut dup2 = DosRegs {
+            ax: 0x4600,
+            bx: handle,
+            cx: 1,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut dup2, &mut mem).unwrap();
+        assert!(!dup2.cf);
+
+        let mut char_out = DosRegs {
+            ax: 0x0200,
+            dx: u16::from(b'X'),
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut char_out, &mut mem).unwrap();
+
+        let base = 0x0100usize * 16 + 0x0500;
+        for (index, &byte) in b"YZ$".iter().enumerate() {
+            mem.write_u8(base + index, byte).unwrap();
+        }
+        let mut string_out = DosRegs {
+            ax: 0x0900,
+            ds: 0x0100,
+            dx: 0x0500,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut string_out, &mut mem).unwrap();
+
+        assert!(char_out.cf);
+        assert_eq!(char_out.ax, 0x05);
+        assert!(string_out.cf);
+        assert_eq!(string_out.ax, 0x05);
+        assert!(kernel.stdout().is_empty());
+    }
+
+    #[test]
+    fn memory_file_handle_dup2_to_aux_reads_file_bytes() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let handle = open_memory_handle(&mut kernel, b"abcdef");
+        let mut dup2 = DosRegs {
+            ax: 0x4600,
+            bx: handle,
+            cx: 3,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut dup2, &mut mem).unwrap();
+        assert!(!dup2.cf);
+
+        let through_aux = read(&mut kernel, &mut mem, 3, 2, 0x0520);
+
+        assert!(!through_aux.cf);
+        assert_eq!(through_aux.ax, 2);
+        let base = 0x0100usize * 16 + 0x0520;
+        let got: Vec<u8> = (0..2).map(|i| mem.read_u8(base + i).unwrap()).collect();
+        assert_eq!(got, b"ab");
+    }
+
+    #[test]
+    fn memory_file_handle_dup2_to_aux_prn_rejects_writes() {
+        for target in [3, 4] {
+            let mut kernel = DosKernel::new();
+            let mut mem = Memory::new(1024 * 1024).unwrap();
+            let handle = open_memory_handle(&mut kernel, b"abcdef");
+            let mut dup2 = DosRegs {
+                ax: 0x4600,
+                bx: handle,
+                cx: target,
+                ..DosRegs::default()
+            };
+            kernel.dispatch(0x21, &mut dup2, &mut mem).unwrap();
+            assert!(!dup2.cf);
+
+            let src = 0x0100usize * 16 + 0x0540;
+            mem.write_u8(src, b'X').unwrap();
+            let mut write = DosRegs {
+                ax: 0x4000,
+                bx: target,
+                cx: 1,
+                ds: 0x0100,
+                dx: 0x0540,
+                ..DosRegs::default()
+            };
+            kernel.dispatch(0x21, &mut write, &mut mem).unwrap();
+
+            assert!(write.cf, "handle {target} rejects write");
+            assert_eq!(write.ax, 0x05, "handle {target} returns access denied");
+        }
+    }
+
+    #[test]
+    fn memory_file_handle_ioctl_reports_regular_file() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let handle = open_memory_handle(&mut kernel, b"abcdef");
+        let mut regs = DosRegs {
+            ax: 0x4400,
+            bx: handle,
+            ..DosRegs::default()
+        };
+
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+
+        assert!(!regs.cf);
+        assert_eq!(regs.dx & 0x0080, 0, "memory file is not a device");
+        assert_eq!(regs.dx, 0x0002);
+    }
+
+    #[test]
+    fn memory_file_handle_ioctl_input_status_tracks_eof() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let handle = open_memory_handle(&mut kernel, b"abc");
+
+        let mut before = DosRegs {
+            ax: 0x4406,
+            bx: handle,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut before, &mut mem).unwrap();
+        assert!(!before.cf);
+        assert_eq!(before.ax & 0x00ff, 0x00ff, "memory file starts ready");
+
+        let drained = read(&mut kernel, &mut mem, handle, 3, 0x0440);
+        assert!(!drained.cf);
+        assert_eq!(drained.ax, 3);
+
+        let mut after = DosRegs {
+            ax: 0x4406,
+            bx: handle,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut after, &mut mem).unwrap();
+        assert!(!after.cf);
+        assert_eq!(after.ax & 0x00ff, 0x0000, "memory file is not ready at EOF");
     }
 
     #[test]

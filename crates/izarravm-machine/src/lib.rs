@@ -797,6 +797,76 @@ fn block_device_error_code(write: bool, status: u16) -> u8 {
     if write { 0x0a } else { 0x0b }
 }
 
+fn block_fs_drive(path: &str) -> Option<u8> {
+    let bytes = path.as_bytes();
+    if bytes.len() < 2 || bytes[1] != b':' || !bytes[0].is_ascii_alphabetic() {
+        return None;
+    }
+    let drive = bytes[0].to_ascii_uppercase().checked_sub(b'A')?;
+    if drive > 25 {
+        return None;
+    }
+    Some(drive)
+}
+
+fn block_fs_path_8_3(path: &str) -> Option<(u8, [u8; 11])> {
+    let drive = block_fs_drive(path)?;
+    let bytes = path.as_bytes();
+    if bytes.len() < 4 || !matches!(bytes[2], b'\\' | b'/') {
+        return None;
+    }
+    let mut name = &path[2..];
+    while name.starts_with(['\\', '/']) {
+        name = &name[1..];
+    }
+    if name.is_empty() || name.contains(['\\', '/']) || name.contains(['*', '?']) {
+        return None;
+    }
+    let mut out = [b' '; 11];
+    let mut parts = name.split('.');
+    let stem = parts.next().unwrap_or_default();
+    let ext = parts.next().unwrap_or_default();
+    if parts.next().is_some() || stem.is_empty() || stem.len() > 8 || ext.len() > 3 {
+        return None;
+    }
+    if !stem
+        .bytes()
+        .chain(ext.bytes())
+        .all(|b| b.is_ascii_alphanumeric() || b"$%'-_@~`!(){}^#&".contains(&b))
+    {
+        return None;
+    }
+    for (i, b) in stem.bytes().enumerate() {
+        out[i] = b.to_ascii_uppercase();
+    }
+    for (i, b) in ext.bytes().enumerate() {
+        out[8 + i] = b.to_ascii_uppercase();
+    }
+    Some((drive, out))
+}
+
+const BLOCK_FS_MAX_FILE_SIZE: u32 = 8 * 1024 * 1024;
+
+fn block_fs_fat_entry(fat: &[u8], cluster: u16, fat12: bool) -> Option<u16> {
+    if fat12 {
+        let offset = usize::from(cluster) * 3 / 2;
+        let lo = *fat.get(offset)?;
+        let hi = *fat.get(offset + 1)?;
+        let word = u16::from_le_bytes([lo, hi]);
+        Some(if cluster & 1 == 0 {
+            word & 0x0fff
+        } else {
+            word >> 4
+        })
+    } else {
+        let offset = usize::from(cluster) * 2;
+        Some(u16::from_le_bytes([
+            *fat.get(offset)?,
+            *fat.get(offset + 1)?,
+        ]))
+    }
+}
+
 fn device_request_packet_len(command: u8) -> u8 {
     match command {
         0x0d | 0x0e => 0x0d, // OPEN/CLOSE carry only the common request header.
@@ -5006,7 +5076,11 @@ impl Machine {
                 self.c_accesses += 1;
             }
         }
-        let action = self.dos.dispatch(vector, &mut regs, &mut self.memory)?;
+        let action = if vector == 0x21 && self.try_open_block_device_file(&mut regs)? {
+            izarravm_dos::DosAction::Continue
+        } else {
+            self.dos.dispatch(vector, &mut regs, &mut self.memory)?
+        };
         if matches!(action, izarravm_dos::DosAction::WaitForKey) {
             // Blocking read with an empty ring. Rewind the stacked return IP by 2
             // so the IRET stub re-enters the INT 21h (CD 21), and set IF in the
@@ -5473,6 +5547,247 @@ impl Machine {
         } else {
             Ok(Some(block_device_error_code(write, status)))
         }
+    }
+
+    fn read_guest_asciiz_lossy(&mut self, segment: u16, offset: u16, max: usize) -> String {
+        let base = u32::from(segment) * 16 + u32::from(offset);
+        let mut bytes = Vec::new();
+        for i in 0..max {
+            let byte = self.read_physical_u8(base + i as u32);
+            if byte == 0 {
+                break;
+            }
+            bytes.push(byte);
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn alloc_block_fs_scratch(&mut self) -> Result<Option<u16>, izarravm_dos::DosError> {
+        self.dos
+            .alloc_internal_scratch(0x0020, &mut self.memory)
+            .map(Result::ok)
+    }
+
+    fn free_block_fs_scratch(&mut self, segment: u16) -> Result<(), izarravm_dos::DosError> {
+        let _ = self.dos.free_internal_scratch(segment, &mut self.memory)?;
+        Ok(())
+    }
+
+    fn read_block_fs_sector(
+        &mut self,
+        io: izarravm_dos::BlockDeviceIoTarget,
+        scratch_seg: u16,
+        lba: u16,
+    ) -> Result<[u8; 512], u16> {
+        self.block_device_transfer_outcome(
+            io,
+            false,
+            izarravm_dos::FarPtr {
+                segment: scratch_seg,
+                offset: 0,
+            },
+            1,
+            lba,
+        )
+        .map_err(|_| 0x001e_u16)?;
+        let base = usize::from(scratch_seg) * 16;
+        let mut sector = [0u8; 512];
+        for (index, byte) in sector.iter_mut().enumerate() {
+            *byte = self.memory.read_u8(base + index).map_err(|_| 0x000d_u16)?;
+        }
+        Ok(sector)
+    }
+
+    fn read_block_fs_lba(
+        &mut self,
+        io: izarravm_dos::BlockDeviceIoTarget,
+        scratch_seg: u16,
+        lba: u32,
+    ) -> Result<[u8; 512], u16> {
+        let lba = u16::try_from(lba).map_err(|_| 0x000d_u16)?;
+        self.read_block_fs_sector(io, scratch_seg, lba)
+    }
+
+    fn read_block_fs_file(
+        &mut self,
+        target: izarravm_dos::BlockDeviceFsTarget,
+        name_8_3: [u8; 11],
+    ) -> Result<Vec<u8>, u16> {
+        if target.bytes_per_sector != 512
+            || target.sectors_per_cluster == 0
+            || !target.sectors_per_cluster.is_power_of_two()
+            || target.root_entries == 0
+            || target.fat_count == 0
+            || target.sectors_per_fat == 0
+        {
+            return Err(0x000d);
+        }
+        let Some(scratch_seg) = self.alloc_block_fs_scratch().map_err(|_| 0x0008_u16)? else {
+            return Err(0x0008);
+        };
+        let result = self.read_block_fs_file_with_scratch(target, name_8_3, scratch_seg);
+        let _ = self.free_block_fs_scratch(scratch_seg);
+        result
+    }
+
+    fn read_block_fs_file_with_scratch(
+        &mut self,
+        target: izarravm_dos::BlockDeviceFsTarget,
+        name_8_3: [u8; 11],
+        scratch_seg: u16,
+    ) -> Result<Vec<u8>, u16> {
+        let root_sectors = (u32::from(target.root_entries) * 32).div_ceil(512);
+        let mut found = None;
+        let mut root_finished = false;
+        let mut entries_seen = 0u32;
+        let root_entries = u32::from(target.root_entries);
+        for sector_index in 0..root_sectors {
+            let sector = self.read_block_fs_lba(
+                target.io,
+                scratch_seg,
+                u32::from(target.first_root_sector) + sector_index,
+            )?;
+            for entry in sector.chunks_exact(32) {
+                if entries_seen >= root_entries {
+                    root_finished = true;
+                    break;
+                }
+                entries_seen += 1;
+                match entry[0] {
+                    0x00 => {
+                        root_finished = true;
+                        break;
+                    }
+                    0xe5 => continue,
+                    _ => {}
+                }
+                let attr = entry[0x0b];
+                if attr & 0x0f == 0x0f || attr & 0x18 != 0 {
+                    continue;
+                }
+                if entry[..11] == name_8_3 {
+                    let cluster = u16::from_le_bytes([entry[0x1a], entry[0x1b]]);
+                    let size =
+                        u32::from_le_bytes([entry[0x1c], entry[0x1d], entry[0x1e], entry[0x1f]]);
+                    found = Some((cluster, size));
+                    break;
+                }
+            }
+            if found.is_some() || root_finished {
+                break;
+            }
+        }
+        let Some((mut cluster, size)) = found else {
+            return Err(0x0002);
+        };
+        if size > BLOCK_FS_MAX_FILE_SIZE {
+            return Err(0x0008);
+        }
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        if cluster < 2 || cluster > target.highest_cluster {
+            return Err(0x000d);
+        }
+
+        let mut fat = Vec::with_capacity(usize::from(target.sectors_per_fat) * 512);
+        for sector in 0..u32::from(target.sectors_per_fat) {
+            fat.extend_from_slice(&self.read_block_fs_lba(
+                target.io,
+                scratch_seg,
+                u32::from(target.first_fat_sector) + sector,
+            )?);
+        }
+        let data_clusters = target.highest_cluster.saturating_sub(1);
+        let fat12 = data_clusters < 4085;
+        let eoc = if fat12 { 0x0ff8 } else { 0xfff8 };
+        let bad = if fat12 { 0x0ff7 } else { 0xfff7 };
+        let mut bytes = Vec::with_capacity(size as usize);
+        let mut guard = 0u16;
+        while bytes.len() < size as usize {
+            if cluster < 2 || cluster > target.highest_cluster || guard > target.highest_cluster {
+                return Err(0x000d);
+            }
+            for sector_in_cluster in 0..u32::from(target.sectors_per_cluster) {
+                if bytes.len() == size as usize {
+                    break;
+                }
+                let lba = u32::from(target.first_data_sector)
+                    + u32::from(cluster - 2) * u32::from(target.sectors_per_cluster)
+                    + sector_in_cluster;
+                let sector = self.read_block_fs_lba(target.io, scratch_seg, lba)?;
+                let want = (size as usize - bytes.len()).min(512);
+                bytes.extend_from_slice(&sector[..want]);
+            }
+            if bytes.len() == size as usize {
+                break;
+            }
+            let Some(next) = block_fs_fat_entry(&fat, cluster, fat12) else {
+                return Err(0x000d);
+            };
+            if next >= eoc {
+                break;
+            }
+            if next == bad || next < 2 {
+                return Err(0x000d);
+            }
+            cluster = next;
+            guard = guard.saturating_add(1);
+        }
+        if bytes.len() < size as usize {
+            return Err(0x000d);
+        }
+        Ok(bytes)
+    }
+
+    fn try_open_block_device_file(
+        &mut self,
+        regs: &mut izarravm_dos::DosRegs,
+    ) -> Result<bool, izarravm_dos::DosError> {
+        if (regs.ax >> 8) as u8 != 0x3d {
+            return Ok(false);
+        }
+        let path = self.read_guest_asciiz_lossy(regs.ds, regs.dx, 260);
+        if self
+            .dos
+            .open_name_would_resolve_to_character_device(&self.memory, &path)
+        {
+            return Ok(false);
+        }
+        let Some((drive, name_8_3)) = block_fs_path_8_3(&path) else {
+            if let Some(drive) = block_fs_drive(&path) {
+                if self.dos.block_device_fs_target(drive).is_some() {
+                    self.dos.fail_regs(regs, 0x0003);
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        };
+        let Some(target) = self.dos.block_device_fs_target(drive) else {
+            return Ok(false);
+        };
+        match (regs.ax as u8) & 0x0f {
+            0 => {}
+            1 | 2 => {
+                self.dos.fail_regs(regs, 0x0005);
+                return Ok(true);
+            }
+            _ => {
+                self.dos.fail_regs(regs, 0x000c);
+                return Ok(true);
+            }
+        }
+        if self.in_device_call {
+            self.dos.fail_regs(regs, 0x0005);
+            return Ok(true);
+        }
+        match self.read_block_fs_file(target, name_8_3) {
+            Ok(bytes) => self.dos.open_readonly_memory_file(regs, name_8_3, bytes),
+            Err(code) => {
+                self.dos.fail_regs(regs, code);
+            }
+        }
+        Ok(true)
     }
 
     /// Run a CallDevice action with the re-entrancy guard, returning Ok(count) on
@@ -17712,6 +18027,224 @@ mod tests {
         img
     }
 
+    const BLOCK_FS_LOG_COUNT_OFF: usize = 0x0184;
+    const BLOCK_FS_LOG_ENTRIES_OFF: usize = 0x0185;
+    const BLOCK_FS_READ_FAIL_LBA_OFF: usize = 0x0288;
+    const BLOCK_FS_BPB_ARRAY_OFF: usize = 0x028a;
+    const BLOCK_FS_BPB_OFF: usize = 0x028c;
+    const BLOCK_FS_SECTOR_DATA_OFF: usize = 0x0300;
+    const BLOCK_FS_LOG_ENTRY_LEN: usize = 8;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct BlockFsRequestLogEntry {
+        command: u8,
+        unit: u8,
+        count: u16,
+        sector: u16,
+        status: u16,
+    }
+
+    fn tiny_fat12_image(
+        files: &[(&[u8; 11], &[u8])],
+    ) -> (std::collections::BTreeMap<u16, [u8; 512]>, [u8; 0x19]) {
+        let mut sectors = std::collections::BTreeMap::<u16, [u8; 512]>::new();
+        let mut bpb = [0u8; 0x19];
+        bpb[0..2].copy_from_slice(&512u16.to_le_bytes());
+        bpb[2] = 1; // sectors per cluster
+        bpb[3..5].copy_from_slice(&1u16.to_le_bytes()); // reserved sectors
+        bpb[5] = 1; // FAT copies
+        bpb[6..8].copy_from_slice(&16u16.to_le_bytes()); // root entries
+        bpb[8..10].copy_from_slice(&64u16.to_le_bytes()); // total sectors
+        bpb[10] = 0xf9; // media
+        bpb[11..13].copy_from_slice(&1u16.to_le_bytes()); // sectors per FAT
+        bpb[13..15].copy_from_slice(&18u16.to_le_bytes()); // sectors per track
+        bpb[15..17].copy_from_slice(&2u16.to_le_bytes()); // heads
+
+        let mut boot = [0u8; 512];
+        boot[..0x19].copy_from_slice(&bpb);
+        sectors.insert(0, boot);
+
+        let mut fat = [0u8; 512];
+        fat[0] = 0xf9;
+        fat[1] = 0xff;
+        fat[2] = 0xff;
+
+        let mut root = [0u8; 512];
+        let mut next_cluster = 2u16;
+        for (entry_index, (name, payload)) in files.iter().enumerate() {
+            let first_cluster = if payload.is_empty() { 0 } else { next_cluster };
+            let cluster_count = payload.len().div_ceil(512);
+            for cluster_index in 0..cluster_count {
+                let cluster = next_cluster;
+                let next = if cluster_index + 1 == cluster_count {
+                    0x0fff
+                } else {
+                    cluster + 1
+                };
+                set_fat12_entry(&mut fat, cluster, next);
+                let start = cluster_index * 512;
+                let end = (start + 512).min(payload.len());
+                let mut sector = [0u8; 512];
+                sector[..end - start].copy_from_slice(&payload[start..end]);
+                sectors.insert(3 + (cluster - 2), sector);
+                next_cluster += 1;
+            }
+
+            let off = entry_index * 32;
+            root[off..off + 11].copy_from_slice(*name);
+            root[off + 11] = 0x20;
+            root[off + 26..off + 28].copy_from_slice(&first_cluster.to_le_bytes());
+            root[off + 28..off + 32].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        }
+        sectors.insert(1, fat);
+        sectors.insert(2, root);
+        (sectors, bpb)
+    }
+
+    fn tiny_fat16_image(
+        files: &[(&[u8; 11], &[u8])],
+    ) -> (std::collections::BTreeMap<u16, [u8; 512]>, [u8; 0x19]) {
+        const SECTORS_PER_FAT: u16 = 32;
+        const FIRST_ROOT_SECTOR: u16 = 1 + SECTORS_PER_FAT;
+        const FIRST_DATA_SECTOR: u16 = FIRST_ROOT_SECTOR + 1;
+        let mut sectors = std::collections::BTreeMap::<u16, [u8; 512]>::new();
+        let mut bpb = [0u8; 0x19];
+        bpb[0..2].copy_from_slice(&512u16.to_le_bytes());
+        bpb[2] = 1; // sectors per cluster
+        bpb[3..5].copy_from_slice(&1u16.to_le_bytes()); // reserved sectors
+        bpb[5] = 1; // FAT copies
+        bpb[6..8].copy_from_slice(&16u16.to_le_bytes()); // root entries
+        bpb[8..10].copy_from_slice(&5000u16.to_le_bytes()); // total sectors, FAT16-sized
+        bpb[10] = 0xf8; // fixed-disk media
+        bpb[11..13].copy_from_slice(&SECTORS_PER_FAT.to_le_bytes());
+        bpb[13..15].copy_from_slice(&63u16.to_le_bytes()); // sectors per track
+        bpb[15..17].copy_from_slice(&16u16.to_le_bytes()); // heads
+
+        let mut boot = [0u8; 512];
+        boot[..0x19].copy_from_slice(&bpb);
+        sectors.insert(0, boot);
+
+        let mut fat = vec![0u8; usize::from(SECTORS_PER_FAT) * 512];
+        set_fat16_entry(&mut fat, 0, 0xfff8);
+        set_fat16_entry(&mut fat, 1, 0xffff);
+
+        let mut root = [0u8; 512];
+        let mut next_cluster = 2u16;
+        for (entry_index, (name, payload)) in files.iter().enumerate() {
+            let first_cluster = if payload.is_empty() { 0 } else { next_cluster };
+            let cluster_count = payload.len().div_ceil(512);
+            for cluster_index in 0..cluster_count {
+                let cluster = next_cluster;
+                let next = if cluster_index + 1 == cluster_count {
+                    0xffff
+                } else {
+                    cluster + 1
+                };
+                set_fat16_entry(&mut fat, cluster, next);
+                let start = cluster_index * 512;
+                let end = (start + 512).min(payload.len());
+                let mut sector = [0u8; 512];
+                sector[..end - start].copy_from_slice(&payload[start..end]);
+                sectors.insert(FIRST_DATA_SECTOR + (cluster - 2), sector);
+                next_cluster += 1;
+            }
+
+            let off = entry_index * 32;
+            root[off..off + 11].copy_from_slice(*name);
+            root[off + 11] = 0x20;
+            root[off + 26..off + 28].copy_from_slice(&first_cluster.to_le_bytes());
+            root[off + 28..off + 32].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        }
+        for (index, chunk) in fat.chunks_exact(512).enumerate() {
+            let mut sector = [0u8; 512];
+            sector.copy_from_slice(chunk);
+            sectors.insert(1 + index as u16, sector);
+        }
+        sectors.insert(FIRST_ROOT_SECTOR, root);
+        (sectors, bpb)
+    }
+
+    fn set_fat16_entry(fat: &mut [u8], cluster: u16, value: u16) {
+        let offset = usize::from(cluster) * 2;
+        fat[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn set_fat12_entry(fat: &mut [u8; 512], cluster: u16, value: u16) {
+        let offset = usize::from(cluster) * 3 / 2;
+        if cluster & 1 == 0 {
+            fat[offset] = value as u8;
+            fat[offset + 1] = (fat[offset + 1] & 0xf0) | ((value >> 8) as u8 & 0x0f);
+        } else {
+            fat[offset] = (fat[offset] & 0x0f) | ((value << 4) as u8 & 0xf0);
+            fat[offset + 1] = (value >> 4) as u8;
+        }
+    }
+
+    fn fat_block_file_sys_image(
+        sectors: &std::collections::BTreeMap<u16, [u8; 512]>,
+        bpb: &[u8; 0x19],
+        read_fail_lba: Option<u16>,
+    ) -> Vec<u8> {
+        let mut img = vec![
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x12, 0x00, 0x1d, 0x00, 0x42, 0x4c, 0x4b, 0x46,
+            0x53, 0x20, 0x20, 0x20, 0x2e, 0x89, 0x1e, 0x80, 0x01, 0x2e, 0x8c, 0x06, 0x82, 0x01,
+            0xcb, 0x50, 0x53, 0x51, 0x52, 0x56, 0x57, 0x1e, 0x06, 0x2e, 0xc4, 0x1e, 0x80, 0x01,
+            0x26, 0x8a, 0x47, 0x02, 0x3c, 0x00, 0x74, 0x0e, 0x3c, 0x04, 0x74, 0x21, 0x3c, 0x08,
+            0x74, 0x63, 0xb8, 0x01, 0x81, 0xe9, 0xad, 0x00, 0x26, 0xc6, 0x47, 0x0d, 0x01, 0x26,
+            0xc7, 0x47, 0x12, 0x8a, 0x02, 0x0e, 0x58, 0x26, 0x89, 0x47, 0x14, 0xb8, 0x00, 0x01,
+            0xe9, 0x96, 0x00, 0xe8, 0x4b, 0x00, 0x2e, 0xa1, 0x88, 0x02, 0x83, 0xf8, 0xff, 0x74,
+            0x0b, 0x26, 0x3b, 0x47, 0x14, 0x75, 0x05, 0xb8, 0x0e, 0x81, 0xeb, 0x7f, 0x26, 0x8b,
+            0x57, 0x12, 0x26, 0x8b, 0x77, 0x14, 0xb1, 0x09, 0xd3, 0xe6, 0x81, 0xc6, 0x00, 0x03,
+            0x26, 0x8b, 0x7f, 0x0e, 0x26, 0x8b, 0x47, 0x10, 0x06, 0x53, 0x0e, 0x1f, 0x8e, 0xc0,
+            0x89, 0xd0, 0xb1, 0x09, 0xd3, 0xe0, 0x89, 0xc1, 0xf3, 0xa4, 0x5b, 0x07, 0xb8, 0x00,
+            0x01, 0xeb, 0x50, 0xe8, 0x05, 0x00, 0xb8, 0x05, 0x81, 0xeb, 0x48, 0x50, 0x53, 0x51,
+            0x52, 0x57, 0x06, 0x0e, 0x1f, 0xa0, 0x84, 0x01, 0x3c, 0x20, 0x73, 0x32, 0x30, 0xe4,
+            0x89, 0xc7, 0xd1, 0xe7, 0xd1, 0xe7, 0xd1, 0xe7, 0x81, 0xc7, 0x85, 0x01, 0x26, 0x8a,
+            0x47, 0x02, 0x88, 0x05, 0x26, 0x8a, 0x47, 0x01, 0x88, 0x45, 0x01, 0x26, 0x8b, 0x47,
+            0x12, 0x89, 0x45, 0x02, 0x26, 0x8b, 0x47, 0x14, 0x89, 0x45, 0x04, 0xc7, 0x45, 0x06,
+            0x00, 0x01, 0xfe, 0x06, 0x84, 0x01, 0x07, 0x5f, 0x5a, 0x59, 0x5b, 0x58, 0xc3, 0x26,
+            0x89, 0x47, 0x03, 0x07, 0x1f, 0x5f, 0x5e, 0x5a, 0x59, 0x5b, 0x58, 0xcb,
+        ];
+        img.resize(BLOCK_FS_SECTOR_DATA_OFF, 0);
+        img[BLOCK_FS_READ_FAIL_LBA_OFF..BLOCK_FS_READ_FAIL_LBA_OFF + 2]
+            .copy_from_slice(&read_fail_lba.unwrap_or(0xffff).to_le_bytes());
+        img[BLOCK_FS_BPB_ARRAY_OFF..BLOCK_FS_BPB_ARRAY_OFF + 2]
+            .copy_from_slice(&(BLOCK_FS_BPB_OFF as u16).to_le_bytes());
+        img[BLOCK_FS_BPB_OFF..BLOCK_FS_BPB_OFF + 0x19].copy_from_slice(bpb);
+        for (&lba, sector) in sectors {
+            let offset = BLOCK_FS_SECTOR_DATA_OFF + usize::from(lba) * 512;
+            if img.len() < offset + 512 {
+                img.resize(offset + 512, 0);
+            }
+            img[offset..offset + 512].copy_from_slice(sector);
+        }
+        img
+    }
+
+    fn block_fs_request_log(
+        m: &mut Machine,
+        header: izarravm_dos::FarPtr,
+    ) -> Vec<BlockFsRequestLogEntry> {
+        let base = usize::from(header.segment) * 16 + usize::from(header.offset);
+        let count = m
+            .memory
+            .read_u8(base + BLOCK_FS_LOG_COUNT_OFF)
+            .unwrap()
+            .min(32);
+        (0..usize::from(count))
+            .map(|index| {
+                let entry = base + BLOCK_FS_LOG_ENTRIES_OFF + index * BLOCK_FS_LOG_ENTRY_LEN;
+                BlockFsRequestLogEntry {
+                    command: m.memory.read_u8(entry).unwrap(),
+                    unit: m.memory.read_u8(entry + 1).unwrap(),
+                    count: m.memory.read_u16(entry + 2).unwrap(),
+                    sector: m.memory.read_u16(entry + 4).unwrap(),
+                    status: m.memory.read_u16(entry + 6).unwrap(),
+                }
+            })
+            .collect()
+    }
+
     fn stage_block_io_driver(m: &mut Machine, image: Vec<u8>) -> izarravm_dos::FarPtr {
         m.dos.init_program(0x0100, 0x1100, &mut m.memory).unwrap();
         m.memory.write_u8(SYSINIT_HALT_STUB, 0xf4).unwrap();
@@ -17760,6 +18293,508 @@ mod tests {
         };
         m.dos.dispatch(0x21, &mut regs, &mut m.memory).unwrap();
         regs.ax
+    }
+
+    fn block_fs_open(m: &mut Machine, path: &str, access: u8) -> u16 {
+        write_guest_asciiz(m, 0x0100, 0x0080, path);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x0100));
+        m.cpu.registers.set_edx(0x0080);
+        prime_dos_int_frame(m);
+        m.cpu.registers.set_eax(0x3d00 | u32::from(access));
+        m.handle_dos_int(0x21).unwrap();
+        m.cpu.registers.eax() as u16
+    }
+
+    fn block_fs_read(m: &mut Machine, handle: u16, count: u16, buffer: u16) -> u16 {
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x0100));
+        m.cpu.registers.set_edx(u32::from(buffer));
+        m.cpu.registers.set_ecx(u32::from(count));
+        m.cpu.registers.set_ebx(u32::from(handle));
+        prime_dos_int_frame(m);
+        m.cpu.registers.set_eax(0x3f00);
+        m.handle_dos_int(0x21).unwrap();
+        m.cpu.registers.eax() as u16
+    }
+
+    fn guest_bytes(m: &Machine, offset: u16, len: usize) -> Vec<u8> {
+        let base = 0x0100usize * 16 + usize::from(offset);
+        (0..len)
+            .map(|i| m.memory.read_u8(base + i).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn block_driver_filesystem_open_modes_return_exact_errors() {
+        let payload = b"BLOCK-FS-OK\r\n";
+        let (sectors, bpb) = tiny_fat12_image(&[(b"HELLO   TXT", payload.as_slice())]);
+        for (access, code) in [(1, 0x0005), (2, 0x0005), (3, 0x000c)] {
+            let mut machine = test_machine();
+            stage_block_io_driver(&mut machine, fat_block_file_sys_image(&sectors, &bpb, None));
+
+            let ax = block_fs_open(&mut machine, "D:\\HELLO.TXT", access);
+
+            assert_ne!(dos_int_flags(&machine) & 1, 0, "open mode {access} sets CF");
+            assert_eq!(ax, code, "open mode {access} returns exact AX");
+            assert_eq!(block_driver_extended_error(&mut machine), code);
+        }
+    }
+
+    #[test]
+    fn block_driver_filesystem_rejects_bad_paths_without_block_reads() {
+        let payload = b"BLOCK-FS-OK\r\n";
+        let (sectors, bpb) = tiny_fat12_image(&[(b"HELLO   TXT", payload.as_slice())]);
+        for path in [
+            "D:HELLO.TXT",
+            "D:\\DIR\\HELLO.TXT",
+            "D:\\*.TXT",
+            "D:\\LONGFILENAME.TXT",
+        ] {
+            let mut machine = test_machine();
+            let header =
+                stage_block_io_driver(&mut machine, fat_block_file_sys_image(&sectors, &bpb, None));
+
+            let ax = block_fs_open(&mut machine, path, 0);
+
+            assert_ne!(dos_int_flags(&machine) & 1, 0, "{path} sets CF");
+            assert_eq!(ax, 0x0003, "{path} returns path-not-found");
+            assert_eq!(block_driver_extended_error(&mut machine), 0x0003);
+            assert!(
+                block_fs_request_log(&mut machine, header).is_empty(),
+                "{path} fails before any block READ"
+            );
+        }
+    }
+
+    #[test]
+    fn block_driver_filesystem_zero_length_file_opens_and_eofs() {
+        let (sectors, bpb) = tiny_fat12_image(&[(b"EMPTY   BIN", &[])]);
+        let mut machine = test_machine();
+        let header =
+            stage_block_io_driver(&mut machine, fat_block_file_sys_image(&sectors, &bpb, None));
+
+        let handle = block_fs_open(&mut machine, "D:\\EMPTY.BIN", 0);
+
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "open returns CF clear");
+        assert!(handle >= 5);
+        let read = block_fs_read(&mut machine, handle, 16, 0x0200);
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "EOF read returns CF clear");
+        assert_eq!(read, 0);
+        let log = block_fs_request_log(&mut machine, header);
+        assert!(
+            log.iter()
+                .any(|entry| entry.command == 0x04 && entry.sector == 2),
+            "root directory is read; log={log:?}"
+        );
+        assert!(
+            !log.iter()
+                .any(|entry| entry.command == 0x04 && entry.sector >= 3),
+            "zero-length file reads no data cluster; log={log:?}"
+        );
+    }
+
+    #[test]
+    fn block_driver_filesystem_read_failure_sets_error_and_leaks_no_handle() {
+        let payload = b"BLOCK-FS-OK\r\n";
+        let (sectors, bpb) = tiny_fat12_image(&[(b"HELLO   TXT", payload.as_slice())]);
+        let mut machine = test_machine();
+        stage_block_io_driver(
+            &mut machine,
+            fat_block_file_sys_image(&sectors, &bpb, Some(2)),
+        );
+
+        let ax = block_fs_open(&mut machine, "D:\\HELLO.TXT", 0);
+
+        assert_ne!(dos_int_flags(&machine) & 1, 0, "failed open sets CF");
+        assert_eq!(ax, 0x001e);
+        assert_eq!(block_driver_extended_error(&mut machine), 0x001e);
+        let invalid = block_fs_read(&mut machine, 5, 4, 0x0200);
+        assert_ne!(dos_int_flags(&machine) & 1, 0, "handle 5 was not leaked");
+        assert_eq!(invalid, 0x0006);
+
+        let mut later = test_machine();
+        stage_block_io_driver(&mut later, fat_block_file_sys_image(&sectors, &bpb, None));
+        let handle = block_fs_open(&mut later, "D:\\HELLO.TXT", 0);
+        assert_eq!(dos_int_flags(&later) & 1, 0, "later block open still works");
+        assert!(handle >= 5);
+    }
+
+    #[test]
+    fn block_driver_filesystem_missing_root_file_is_not_host_fallback() {
+        let (sectors, bpb) = tiny_fat12_image(&[(b"OTHER   TXT", b"other".as_slice())]);
+        let mut machine = test_machine();
+        let header =
+            stage_block_io_driver(&mut machine, fat_block_file_sys_image(&sectors, &bpb, None));
+
+        let ax = block_fs_open(&mut machine, "D:\\HELLO.TXT", 0);
+
+        assert_ne!(dos_int_flags(&machine) & 1, 0, "missing file sets CF");
+        assert_eq!(ax, 0x0002);
+        assert_eq!(block_driver_extended_error(&mut machine), 0x0002);
+        assert!(
+            block_fs_request_log(&mut machine, header)
+                .iter()
+                .any(|entry| entry.command == 0x04 && entry.sector == 2),
+            "root directory was consulted"
+        );
+    }
+
+    #[test]
+    fn block_driver_filesystem_ignores_root_padding_past_declared_entries() {
+        let (sectors, mut bpb) = tiny_fat12_image(&[
+            (b"FIRST   TXT", b"first".as_slice()),
+            (b"HIDDEN  TXT", b"hidden".as_slice()),
+        ]);
+        bpb[6..8].copy_from_slice(&1u16.to_le_bytes()); // only the first root slot exists
+        let mut machine = test_machine();
+        let header =
+            stage_block_io_driver(&mut machine, fat_block_file_sys_image(&sectors, &bpb, None));
+
+        let ax = block_fs_open(&mut machine, "D:\\HIDDEN.TXT", 0);
+
+        assert_ne!(dos_int_flags(&machine) & 1, 0, "padding entry sets CF");
+        assert_eq!(ax, 0x0002);
+        assert_eq!(block_driver_extended_error(&mut machine), 0x0002);
+        let log = block_fs_request_log(&mut machine, header);
+        assert!(
+            log.iter()
+                .any(|entry| entry.command == 0x04 && entry.sector == 2),
+            "root directory was consulted; log={log:?}"
+        );
+        assert!(
+            !log.iter()
+                .any(|entry| entry.command == 0x04 && entry.sector >= 3),
+            "padding entry must not open or read file data; log={log:?}"
+        );
+    }
+
+    #[test]
+    fn block_driver_filesystem_keeps_fat12_at_cluster_count_boundary() {
+        let payload = (0..900).map(|i| (i & 0xff) as u8).collect::<Vec<_>>();
+        let (mut sectors, mut bpb) = tiny_fat12_image(&[(b"EDGE    BIN", payload.as_slice())]);
+        bpb[8..10].copy_from_slice(&4098u16.to_le_bytes()); // 4084 data clusters
+        bpb[11..13].copy_from_slice(&12u16.to_le_bytes()); // enough sectors for FAT12
+        let root = sectors.remove(&2).unwrap();
+        sectors.insert(13, root);
+        let cluster2 = sectors.remove(&3).unwrap();
+        sectors.insert(14, cluster2);
+        let cluster3 = sectors.remove(&4).unwrap();
+        sectors.insert(15, cluster3);
+        let mut machine = test_machine();
+        let header =
+            stage_block_io_driver(&mut machine, fat_block_file_sys_image(&sectors, &bpb, None));
+
+        let handle = block_fs_open(&mut machine, "D:\\EDGE.BIN", 0);
+
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "open returns CF clear");
+        assert!(handle >= 5);
+        let read = block_fs_read(&mut machine, handle, payload.len() as u16, 0x0200);
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "read returns CF clear");
+        assert_eq!(read, payload.len() as u16);
+        assert_eq!(guest_bytes(&machine, 0x0200, payload.len()), payload);
+        let log = block_fs_request_log(&mut machine, header);
+        for sector in [1, 12, 13, 14, 15] {
+            assert!(
+                log.iter().any(|entry| entry.command == 0x04
+                    && entry.count == 1
+                    && entry.sector == sector),
+                "missing boundary FAT12 READ of sector {sector}; log={log:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn block_driver_filesystem_reads_fat16_cluster_chain() {
+        let payload = (0..700)
+            .map(|i| (255 - (i & 0xff)) as u8)
+            .collect::<Vec<_>>();
+        let (sectors, bpb) = tiny_fat16_image(&[(b"F16     BIN", payload.as_slice())]);
+        let mut machine = test_machine();
+        let header =
+            stage_block_io_driver(&mut machine, fat_block_file_sys_image(&sectors, &bpb, None));
+
+        let handle = block_fs_open(&mut machine, "D:\\F16.BIN", 0);
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "open returns CF clear");
+        assert!(handle >= 5);
+        let read = block_fs_read(&mut machine, handle, payload.len() as u16, 0x0200);
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "read returns CF clear");
+        assert_eq!(read, payload.len() as u16);
+        assert_eq!(guest_bytes(&machine, 0x0200, payload.len()), payload);
+
+        let log = block_fs_request_log(&mut machine, header);
+        for sector in [1, 31, 33] {
+            assert!(
+                log.iter().any(|entry| entry.command == 0x04
+                    && entry.count == 1
+                    && entry.sector == sector),
+                "missing FAT16 READ of sector {sector}; log={log:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn block_driver_filesystem_rejects_unsupported_sector_size_before_read() {
+        let payload = b"BLOCK-FS-OK\r\n";
+        let (sectors, mut bpb) = tiny_fat12_image(&[(b"HELLO   TXT", payload.as_slice())]);
+        bpb[0..2].copy_from_slice(&1024u16.to_le_bytes());
+        let mut machine = test_machine();
+        let header =
+            stage_block_io_driver(&mut machine, fat_block_file_sys_image(&sectors, &bpb, None));
+
+        let ax = block_fs_open(&mut machine, "D:\\HELLO.TXT", 0);
+
+        assert_ne!(dos_int_flags(&machine) & 1, 0, "open sets CF");
+        assert_eq!(ax, 0x000d);
+        assert_eq!(block_driver_extended_error(&mut machine), 0x000d);
+        assert!(
+            block_fs_request_log(&mut machine, header).is_empty(),
+            "invalid geometry fails before block READ"
+        );
+    }
+
+    #[test]
+    fn block_driver_filesystem_corrupt_fat_returns_invalid_data_and_leaks_no_handle() {
+        let payload = (0..900).map(|i| (i & 0xff) as u8).collect::<Vec<_>>();
+        let (mut sectors, bpb) = tiny_fat12_image(&[(b"BROKEN  BIN", payload.as_slice())]);
+        set_fat12_entry(sectors.get_mut(&1).unwrap(), 2, 0x0ff7);
+        let mut machine = test_machine();
+        stage_block_io_driver(&mut machine, fat_block_file_sys_image(&sectors, &bpb, None));
+
+        let ax = block_fs_open(&mut machine, "D:\\BROKEN.BIN", 0);
+
+        assert_ne!(dos_int_flags(&machine) & 1, 0, "open sets CF");
+        assert_eq!(ax, 0x000d);
+        assert_eq!(block_driver_extended_error(&mut machine), 0x000d);
+        let invalid = block_fs_read(&mut machine, 5, 4, 0x0200);
+        assert_ne!(
+            dos_int_flags(&machine) & 1,
+            0,
+            "failed open leaks no handle"
+        );
+        assert_eq!(invalid, 0x0006);
+    }
+
+    #[test]
+    fn block_driver_filesystem_scratch_failure_returns_no_memory_before_read() {
+        let payload = b"BLOCK-FS-OK\r\n";
+        let (sectors, bpb) = tiny_fat12_image(&[(b"HELLO   TXT", payload.as_slice())]);
+        let mut machine = test_machine();
+        let header =
+            stage_block_io_driver(&mut machine, fat_block_file_sys_image(&sectors, &bpb, None));
+        let mut held = Vec::new();
+        while let Ok(Ok(seg)) = machine
+            .dos
+            .alloc_internal_scratch(0x1000, &mut machine.memory)
+        {
+            held.push(seg);
+        }
+        while let Ok(Ok(seg)) = machine
+            .dos
+            .alloc_internal_scratch(0x0020, &mut machine.memory)
+        {
+            held.push(seg);
+        }
+        assert!(!held.is_empty(), "test exhausted the DOS arena");
+
+        let ax = block_fs_open(&mut machine, "D:\\HELLO.TXT", 0);
+
+        assert_ne!(dos_int_flags(&machine) & 1, 0, "open sets CF");
+        assert_eq!(ax, 0x0008);
+        assert_eq!(block_driver_extended_error(&mut machine), 0x0008);
+        assert!(
+            block_fs_request_log(&mut machine, header).is_empty(),
+            "scratch allocation fails before block READ"
+        );
+    }
+
+    #[test]
+    fn block_driver_filesystem_uses_scratch_without_clobbering_guest_buffer() {
+        let payload = b"BLOCK-FS-OK\r\n";
+        let (sectors, bpb) = tiny_fat12_image(&[(b"HELLO   TXT", payload.as_slice())]);
+        let mut machine = test_machine();
+        stage_block_io_driver(&mut machine, fat_block_file_sys_image(&sectors, &bpb, None));
+        let sentinel = b"do-not-clobber";
+        let base = 0x0100usize * 16 + 0x0200;
+        for (index, &byte) in sentinel.iter().enumerate() {
+            machine.memory.write_u8(base + index, byte).unwrap();
+        }
+
+        let handle = block_fs_open(&mut machine, "D:\\HELLO.TXT", 0);
+
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "open returns CF clear");
+        assert!(handle >= 5);
+        assert_eq!(guest_bytes(&machine, 0x0200, sentinel.len()), sentinel);
+    }
+
+    #[test]
+    fn block_driver_filesystem_character_device_name_takes_precedence() {
+        let payload = b"BLOCK-FS-OK\r\n";
+        let (sectors, bpb) = tiny_fat12_image(&[(b"HELLO   TXT", payload.as_slice())]);
+        let mut machine = test_machine();
+        let block_header =
+            stage_block_io_driver(&mut machine, fat_block_file_sys_image(&sectors, &bpb, None));
+        stage_block_io_driver(&mut machine, inline_sys_image(b"HELLO   ", 0x0100));
+
+        let handle = block_fs_open(&mut machine, "D:\\HELLO.TXT", 0);
+
+        assert_eq!(
+            dos_int_flags(&machine) & 1,
+            0,
+            "character device open returns CF clear"
+        );
+        assert!(handle >= 5);
+        assert!(
+            block_fs_request_log(&mut machine, block_header).is_empty(),
+            "character device open should not run through block request log"
+        );
+    }
+
+    #[test]
+    fn block_driver_filesystem_opens_and_reads_root_file() {
+        let payload = b"BLOCK-FS-OK\r\n";
+        let (sectors, bpb) = tiny_fat12_image(&[(b"HELLO   TXT", payload.as_slice())]);
+        let mut machine = test_machine();
+        let header =
+            stage_block_io_driver(&mut machine, fat_block_file_sys_image(&sectors, &bpb, None));
+
+        write_guest_asciiz(&mut machine, 0x0100, 0x0080, "D:\\HELLO.TXT");
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x0100));
+        machine.cpu.registers.set_edx(0x0080);
+        prime_dos_int_frame(&mut machine);
+        machine.cpu.registers.set_eax(0x3d00);
+        machine.handle_dos_int(0x21).unwrap();
+
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "open returns CF clear");
+        let handle = machine.cpu.registers.eax() as u16;
+        assert!(handle >= 5, "open returns a dynamic handle, got {handle}");
+
+        let buffer = 0x0200u16;
+        machine.cpu.registers.set_edx(buffer.into());
+        machine.cpu.registers.set_ecx(payload.len() as u32);
+        machine.cpu.registers.set_ebx(u32::from(handle));
+        prime_dos_int_frame(&mut machine);
+        machine.cpu.registers.set_eax(0x3f00);
+        machine.handle_dos_int(0x21).unwrap();
+
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "read returns CF clear");
+        assert_eq!(machine.cpu.registers.eax() as u16, payload.len() as u16);
+        let base = 0x0100usize * 16 + usize::from(buffer);
+        let got = (0..payload.len())
+            .map(|i| machine.memory.read_u8(base + i).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(got, payload);
+
+        let log = block_fs_request_log(&mut machine, header);
+        for sector in [1, 2, 3] {
+            assert!(
+                log.iter().any(|entry| entry.command == 0x04
+                    && entry.count == 1
+                    && entry.sector == sector),
+                "missing READ of sector {sector}; log={log:?}"
+            );
+        }
+
+        machine.cpu.registers.set_ebx(u32::from(handle));
+        prime_dos_int_frame(&mut machine);
+        machine.cpu.registers.set_eax(0x3e00);
+        machine.handle_dos_int(0x21).unwrap();
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "close returns CF clear");
+    }
+
+    #[test]
+    fn block_driver_filesystem_reads_fat12_cluster_chain() {
+        let payload = (0..900).map(|i| (i & 0xff) as u8).collect::<Vec<_>>();
+        let (sectors, bpb) = tiny_fat12_image(&[(b"CHAIN   BIN", payload.as_slice())]);
+        let mut machine = test_machine();
+        let header =
+            stage_block_io_driver(&mut machine, fat_block_file_sys_image(&sectors, &bpb, None));
+
+        write_guest_asciiz(&mut machine, 0x0100, 0x0080, "D:\\CHAIN.BIN");
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x0100));
+        machine.cpu.registers.set_edx(0x0080);
+        prime_dos_int_frame(&mut machine);
+        machine.cpu.registers.set_eax(0x3d00);
+        machine.handle_dos_int(0x21).unwrap();
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "open returns CF clear");
+        let handle = machine.cpu.registers.eax() as u16;
+
+        let buffer = 0x0200u16;
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x0100));
+        machine.cpu.registers.set_edx(buffer.into());
+        machine.cpu.registers.set_ecx(payload.len() as u32);
+        machine.cpu.registers.set_ebx(u32::from(handle));
+        prime_dos_int_frame(&mut machine);
+        machine.cpu.registers.set_eax(0x3f00);
+        machine.handle_dos_int(0x21).unwrap();
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "read returns CF clear");
+        assert_eq!(machine.cpu.registers.eax() as u16, payload.len() as u16);
+
+        let base = 0x0100usize * 16 + usize::from(buffer);
+        let got = (0..payload.len())
+            .map(|i| machine.memory.read_u8(base + i).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(got, payload, "read follows the FAT12 cluster chain");
+
+        machine.cpu.registers.set_ecx(0);
+        machine.cpu.registers.set_edx(512);
+        machine.cpu.registers.set_ebx(u32::from(handle));
+        prime_dos_int_frame(&mut machine);
+        machine.cpu.registers.set_eax(0x4200);
+        machine.handle_dos_int(0x21).unwrap();
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "seek returns CF clear");
+        assert_eq!(machine.cpu.registers.eax() as u16, 512);
+        assert_eq!(machine.cpu.registers.edx() as u16, 0);
+
+        let second_cluster_buf = 0x0700u16;
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x0100));
+        machine.cpu.registers.set_edx(second_cluster_buf.into());
+        machine.cpu.registers.set_ecx(37);
+        machine.cpu.registers.set_ebx(u32::from(handle));
+        prime_dos_int_frame(&mut machine);
+        machine.cpu.registers.set_eax(0x3f00);
+        machine.handle_dos_int(0x21).unwrap();
+        assert_eq!(
+            dos_int_flags(&machine) & 1,
+            0,
+            "post-seek read returns CF clear"
+        );
+        assert_eq!(machine.cpu.registers.eax() as u16, 37);
+        let second_base = 0x0100usize * 16 + usize::from(second_cluster_buf);
+        let got = (0..37)
+            .map(|i| machine.memory.read_u8(second_base + i).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(got, payload[512..549]);
+
+        let log = block_fs_request_log(&mut machine, header);
+        for sector in [1, 2, 3, 4] {
+            assert!(
+                log.iter().any(|entry| entry.command == 0x04
+                    && entry.count == 1
+                    && entry.sector == sector),
+                "missing READ of sector {sector}; log={log:?}"
+            );
+        }
+
+        machine.cpu.registers.set_ebx(u32::from(handle));
+        prime_dos_int_frame(&mut machine);
+        machine.cpu.registers.set_eax(0x3e00);
+        machine.handle_dos_int(0x21).unwrap();
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "close returns CF clear");
     }
 
     fn install_recording_int24_handler(m: &mut Machine, segment: u16) -> usize {
