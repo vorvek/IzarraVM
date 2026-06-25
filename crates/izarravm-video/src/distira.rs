@@ -1474,7 +1474,7 @@ impl Distira {
         }
     }
 
-    fn write_texture_u32(&mut self, offset: usize, value: u32) {
+    pub fn write_texture_u32(&mut self, offset: usize, value: u32) {
         let Some(end) = offset.checked_add(4) else {
             return;
         };
