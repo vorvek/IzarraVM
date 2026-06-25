@@ -195,6 +195,7 @@ pub const TEX_I8: u32 = 0x03;
 pub const TEX_AI8: u32 = 0x04;
 pub const TEX_ARGB8332: u32 = 0x08;
 pub const TEX_R5G6B5: u32 = 0x0a;
+pub const TEX_ARGB1555: u32 = 0x0b;
 pub const TEX_A8I8: u32 = 0x0d;
 const CHIP_TREX0: usize = 0x2;
 const CHIP_TREX1: usize = 0x4;
@@ -1489,7 +1490,14 @@ impl Distira {
         if self.fbz_color_path & FBZCP_TEXTURE_ENABLED == 0
             || !matches!(
                 format,
-                TEX_RGB332 | TEX_A8 | TEX_I8 | TEX_AI8 | TEX_ARGB8332 | TEX_R5G6B5 | TEX_A8I8
+                TEX_RGB332
+                    | TEX_A8
+                    | TEX_I8
+                    | TEX_AI8
+                    | TEX_ARGB8332
+                    | TEX_R5G6B5
+                    | TEX_ARGB1555
+                    | TEX_A8I8
             )
         {
             return (r, g, b);
@@ -1515,6 +1523,7 @@ impl Distira {
             TEX_AI8 => self.sample_tmu_ai44(tmu, s, t),
             TEX_ARGB8332 => self.sample_tmu_argb8332(tmu, s, t),
             TEX_R5G6B5 => self.sample_tmu_rgb565(tmu, s, t),
+            TEX_ARGB1555 => self.sample_tmu_argb1555(tmu, s, t),
             TEX_A8I8 => self.sample_tmu_ai88(tmu, s, t),
             _ => (0, 0, 0),
         }
@@ -1554,6 +1563,10 @@ impl Distira {
 
     fn sample_tmu_argb8332(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
         expand_rgb332(self.sample_tmu_u16(tmu, s, t) as u8)
+    }
+
+    fn sample_tmu_argb1555(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
+        expand_rgb555(self.sample_tmu_u16(tmu, s, t))
     }
 
     fn sample_tmu_i8(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
@@ -1885,6 +1898,14 @@ fn expand4(v: u8) -> u8 {
 
 fn expand_rgb332(raw: u8) -> (u8, u8, u8) {
     (expand3(raw >> 5), expand3(raw >> 2), expand2(raw))
+}
+
+fn expand_rgb555(raw: u16) -> (u8, u8, u8) {
+    (
+        expand5(raw >> 10) as u8,
+        expand5(raw >> 5) as u8,
+        expand5(raw) as u8,
+    )
 }
 
 fn edge(ax: f32, ay: f32, bx: f32, by: f32, px: f32, py: f32) -> f32 {
