@@ -253,3 +253,83 @@ lfb_blit_1bpp:
     pop ds
     popa
     ret
+
+; lfb_load_palette: load the whole art palette into the VGA DAC via INT 10h
+; AX=1012h (BX=start index, CX=count, ES:DX -> 6-bit RGB triples). The palette
+; bytes live in the ROM (CS), so ES=CS. The Margo 8bpp scanout reads this DAC.
+lfb_load_palette:
+    push ax
+    push bx
+    push cx
+    push dx
+    push es
+    push cs
+    pop es                      ; ES:DX -> art_palette (ROM)
+    mov dx, art_palette
+    mov ax, 0x1012
+    xor bx, bx                  ; start at DAC index 0
+    mov cx, ART_PAL_COUNT
+    int 0x10
+    pop es
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; lfb_blit_rle: decode a flat [count,value] RLE stream into a w*h rectangle of
+; the LFB. CS:SI = RLE source, DI = x, AX = y, CX = w, DX = h. Opaque (every
+; pixel written, value 0 included); decodes exactly w*h pixels; runs may cross
+; row boundaries. Geometry + run state live in segment-0 scratch (BLIT_*) so the
+; inner loop keeps registers free, mirroring lfb_blit_1bpp.
+;
+; Register discipline (Phase-1 gotcha): EBX holds the running LFB address that
+; lfb_pixel_addr returns, so the pixel value is written from AL and BL/BH are
+; never touched. lfb_pixel_addr preserves SI (the RLE pointer) and CX.
+lfb_blit_rle:
+    pusha
+    push ds
+    push ax                     ; save y
+    xor ax, ax
+    mov ds, ax                  ; DS = 0 for the scratch words
+    mov [BLIT_X], di
+    mov [BLIT_W], cx
+    mov [BLIT_H], dx
+    mov word [BLIT_RUN_LEFT], 0 ; no active run yet
+    pop ax
+    mov [BLIT_Y], ax
+.row:
+    xor ax, ax
+    mov ds, ax
+    mov dx, [BLIT_H]
+    test dx, dx
+    jz .done
+    mov di, [BLIT_X]
+    mov ax, [BLIT_Y]
+    call lfb_pixel_addr         ; EBX = LFB addr of (x, y); SI, CX preserved
+    mov cx, [BLIT_W]            ; CX = columns remaining this row
+.col:
+    cmp word [BLIT_RUN_LEFT], 0
+    jne .have_run
+    mov al, [cs:si]             ; next run: count
+    mov ah, [cs:si + 1]         ; value
+    add si, 2
+    movzx dx, al
+    mov [BLIT_RUN_LEFT], dx
+    mov [BLIT_RUN_VAL], ah
+.have_run:
+    mov al, [BLIT_RUN_VAL]
+    mov [fs:ebx], al            ; write the pixel (AL, never BL/BH)
+    inc ebx
+    dec word [BLIT_RUN_LEFT]
+    dec cx
+    jnz .col
+    mov ax, [BLIT_Y]
+    inc ax
+    mov [BLIT_Y], ax
+    dec word [BLIT_H]
+    jmp .row
+.done:
+    pop ds
+    popa
+    ret

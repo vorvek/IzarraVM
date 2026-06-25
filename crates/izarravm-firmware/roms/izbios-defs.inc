@@ -98,6 +98,8 @@
 %define BLIT_H         (BIOS_SCRATCH + 0x08)   ; rows remaining
 %define BLIT_STRIDE    (BIOS_SCRATCH + 0x0a)   ; bytes per source row
 %define BLIT_COLOR     (BIOS_SCRATCH + 0x0c)   ; fill color (byte)
+%define BLIT_RUN_LEFT  BLIT_STRIDE     ; lfb_blit_rle: pixels remaining in the current RLE run (word)
+%define BLIT_RUN_VAL   BLIT_COLOR      ; lfb_blit_rle: the current run's palette index (byte)
 
 ; --- Graceful POST screen (Amiga/Mac-style: white field, black text, red logo).
 ; These DAC indices are reprogrammed by gfx_post_palette before the screen draws,
