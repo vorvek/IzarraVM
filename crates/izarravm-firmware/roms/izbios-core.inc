@@ -194,20 +194,17 @@ run_post:
 .done:
     ret
 
-; --- Boot / halt tail. The boot console is already on screen from run_post, so
-; append a final ready line at the next row rather than clearing it. --
+; --- Boot / halt tail. The graphical POST screen is already on the LFB from
+; run_post, so draw the handoff line on it (lfb_text), then hand to INT 19h. --
 enter_setup_or_boot:
-    xor ax, ax
-    mov ds, ax
-    mov ax, [CONSOLE_ROW_Y]     ; next free console row
-    add ax, STATUS_LINE_DY      ; leave one blank line above the message
-    mov di, STATUS_X
     push cs
     pop ds                      ; DS = CS so DS:SI reaches the ROM string
-    mov si, str_ready
-    mov bl, GFX_BLACK
-    mov bh, GFX_WHITE
-    call gfx_text
+    mov si, str_post_toka
+    mov di, ART_HDR_X
+    mov ax, ART_TOKA_Y
+    mov bl, ART_INK_INDEX
+    mov bh, ART_FIELD_INDEX
+    call lfb_text
     ; POST is complete: hand off to the INT 19h bootstrap. If a bootable floppy is
     ; mounted, boot_entry far jumps into its boot sector and never returns. With no
     ; media (or a read error) it returns here and the machine idles rather than
@@ -217,7 +214,7 @@ enter_setup_or_boot:
     call boot_entry
 .idle:
     jmp .idle
-str_ready: db 'SYSTEM READY', 0
+str_post_toka: db 'Starting Toka-DOS...', 0
 
 ; --- COM1 POST log mirror ---------------------------------------------------
 ; The graphical screen and the serial console carry the same POST progress. The

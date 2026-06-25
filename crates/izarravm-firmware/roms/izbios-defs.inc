@@ -267,3 +267,13 @@
 %define LFB_H          240
 %define LFB_PITCH      320        ; bytes per row (8bpp)
 %define LFB_PIXELS     76800      ; LFB_W * LFB_H
+
+; Graphical POST text layout (LFB pixels). The art keeps the left column x=8..199
+; clear down to ~y130 (the wordmark is top-right, the mascot is right, the icon
+; strip is y161+), so the header and the RAM count-up sit top-left. Colours are
+; palette indices from izbios-art.inc (ART_INK_INDEX on ART_FIELD_INDEX).
+%define ART_HDR_X       8
+%define ART_VER_Y       12         ; "Izarra-BIOS v3.01 - 1997"
+%define ART_START_Y     28         ; "Starting your computer..."
+%define ART_MEM_Y       100        ; RAM count-up line
+%define ART_TOKA_Y      132        ; "Starting Toka-DOS..." (boot handoff)
