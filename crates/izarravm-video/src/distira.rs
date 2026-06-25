@@ -52,12 +52,15 @@ pub const SST_VERTEX_CY: usize = 0x01c;
 pub const SST_START_R: usize = 0x020;
 pub const SST_START_G: usize = 0x024;
 pub const SST_START_B: usize = 0x028;
+pub const SST_START_Z: usize = 0x02c;
 pub const SST_DR_DX: usize = 0x040;
 pub const SST_DG_DX: usize = 0x044;
 pub const SST_DB_DX: usize = 0x048;
+pub const SST_DZ_DX: usize = 0x04c;
 pub const SST_DR_DY: usize = 0x060;
 pub const SST_DG_DY: usize = 0x064;
 pub const SST_DB_DY: usize = 0x068;
+pub const SST_DZ_DY: usize = 0x06c;
 pub const SST_TRIANGLE_CMD: usize = 0x080;
 pub const SST_FVERTEX_AX: usize = 0x088;
 pub const SST_FVERTEX_AY: usize = 0x08c;
@@ -141,6 +144,7 @@ pub const FBZ_CHROMAKEY: u32 = 1 << 1;
 pub const FBZ_STIPPLE: u32 = 1 << 2;
 pub const FBZ_W_BUFFER: u32 = 1 << 3;
 pub const FBZ_DEPTH_ENABLE: u32 = 1 << 4;
+pub const FBZ_DEPTH_OP_SHIFT: u32 = 5;
 pub const FBZ_DITHER: u32 = 1 << 8;
 pub const FBZ_RGB_WMASK: u32 = 1 << 9;
 pub const FBZ_DEPTH_WMASK: u32 = 1 << 10;
@@ -153,6 +157,15 @@ pub const FBZ_ALPHA_ENABLE: u32 = 1 << 18;
 pub const FBZ_DITHER_SUB: u32 = 1 << 19;
 pub const FBZ_DEPTH_SOURCE: u32 = 1 << 20;
 pub const FBZ_PARAM_ADJUST: u32 = 1 << 26;
+
+pub const DEPTHOP_NEVER: u32 = 0;
+pub const DEPTHOP_LESSTHAN: u32 = 1;
+pub const DEPTHOP_EQUAL: u32 = 2;
+pub const DEPTHOP_LESSTHANEQUAL: u32 = 3;
+pub const DEPTHOP_GREATERTHAN: u32 = 4;
+pub const DEPTHOP_NOTEQUAL: u32 = 5;
+pub const DEPTHOP_GREATERTHANEQUAL: u32 = 6;
+pub const DEPTHOP_ALWAYS: u32 = 7;
 
 pub const FBIINIT0_VGA_PASS: u32 = 1;
 pub const FBIINIT0_GRAPHICS_RESET: u32 = 1 << 1;
@@ -234,6 +247,7 @@ enum DistiraFifoEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Distira {
     fb: Vec<u8>,
+    depth: Vec<u16>,
     texture: Vec<u8>,
     fifo: VecDeque<DistiraFifoEntry>,
     command_fifo: VecDeque<u32>,
@@ -263,6 +277,9 @@ pub struct Distira {
     triangle_color: [u32; 3],
     triangle_color_dx: [u32; 3],
     triangle_color_dy: [u32; 3],
+    triangle_depth: u32,
+    triangle_depth_dx: u32,
+    triangle_depth_dy: u32,
     ftriangle_vertices: [(u32, u32); 3],
     ftriangle_color: [u32; 3],
     ftriangle_color_dx: [u32; 3],
@@ -296,6 +313,7 @@ impl Distira {
         let display = DistiraDisplay::default();
         Self {
             fb: vec![0; DISTIRA_FB_SIZE],
+            depth: vec![0xffff; (DISTIRA_MAX_WIDTH * DISTIRA_MAX_HEIGHT) as usize],
             texture: vec![0; DISTIRA_TEX_SIZE],
             fifo: VecDeque::new(),
             command_fifo: VecDeque::new(),
@@ -325,6 +343,9 @@ impl Distira {
             triangle_color: [0; 3],
             triangle_color_dx: [0; 3],
             triangle_color_dy: [0; 3],
+            triangle_depth: 0,
+            triangle_depth_dx: 0,
+            triangle_depth_dy: 0,
             ftriangle_vertices: [(0, 0); 3],
             ftriangle_color: [0; 3],
             ftriangle_color_dx: [0; 3],
@@ -394,6 +415,7 @@ impl Distira {
         };
         self.clip_right = self.clip_right.min(width);
         self.clip_high_y = self.clip_high_y.min(height);
+        self.depth.fill(0xffff);
     }
 
     pub fn clear_back_rgb(&mut self, r: u8, g: u8, b: u8) {
@@ -412,6 +434,18 @@ impl Distira {
     }
 
     pub fn draw_triangle(&mut self, vertices: [DistiraVertex; 3]) -> u64 {
+        self.draw_triangle_inner(vertices, None)
+    }
+
+    fn draw_triangle_with_depth(&mut self, vertices: [DistiraVertex; 3], depths: [f32; 3]) -> u64 {
+        self.draw_triangle_inner(vertices, Some(depths))
+    }
+
+    fn draw_triangle_inner(
+        &mut self,
+        vertices: [DistiraVertex; 3],
+        depths: Option<[f32; 3]>,
+    ) -> u64 {
         let [a, b, c] = vertices;
         let area = edge(a.x, a.y, b.x, b.y, c.x, c.y);
         if area == 0.0 {
@@ -444,11 +478,23 @@ impl Distira {
                 let l0 = w0 * inv_area;
                 let l1 = w1 * inv_area;
                 let l2 = w2 * inv_area;
+                let depth =
+                    depths.map(|[za, zb, zc]| depth_to_u16(lerp_f32(za, zb, zc, l0, l1, l2)));
+                if let Some(depth) = depth {
+                    if !self.depth_test_passes(x, y, depth) {
+                        self.fbi_zfunc_fail = self.fbi_zfunc_fail.wrapping_add(1);
+                        continue;
+                    }
+                }
+
                 let r = lerp_u8(a.r, b.r, c.r, l0, l1, l2);
                 let g = lerp_u8(a.g, b.g, c.g, l0, l1, l2);
                 let blue = lerp_u8(a.b, b.b, c.b, l0, l1, l2);
                 let pixel = pack_rgb565_for_pixel(r, g, blue, x, y, self.dither_enabled);
                 if self.write_back_pixel(x, y, pixel) {
+                    if let Some(depth) = depth {
+                        self.write_depth_pixel(x, y, depth);
+                    }
                     written += 1;
                 }
             }
@@ -590,12 +636,15 @@ impl Distira {
             SST_START_R => merge_color_component(&mut self.triangle_color[0], byte, value),
             SST_START_G => merge_color_component(&mut self.triangle_color[1], byte, value),
             SST_START_B => merge_color_component(&mut self.triangle_color[2], byte, value),
+            SST_START_Z => merge_byte(&mut self.triangle_depth, byte, value),
             SST_DR_DX => merge_color_component(&mut self.triangle_color_dx[0], byte, value),
             SST_DG_DX => merge_color_component(&mut self.triangle_color_dx[1], byte, value),
             SST_DB_DX => merge_color_component(&mut self.triangle_color_dx[2], byte, value),
+            SST_DZ_DX => merge_byte(&mut self.triangle_depth_dx, byte, value),
             SST_DR_DY => merge_color_component(&mut self.triangle_color_dy[0], byte, value),
             SST_DG_DY => merge_color_component(&mut self.triangle_color_dy[1], byte, value),
             SST_DB_DY => merge_color_component(&mut self.triangle_color_dy[2], byte, value),
+            SST_DZ_DY => merge_byte(&mut self.triangle_depth_dy, byte, value),
             SST_TRIANGLE_CMD => {
                 if byte == 0 && value != 0 {
                     self.run_triangle_command();
@@ -848,12 +897,15 @@ impl Distira {
             SST_START_R => self.triangle_color[0],
             SST_START_G => self.triangle_color[1],
             SST_START_B => self.triangle_color[2],
+            SST_START_Z => self.triangle_depth,
             SST_DR_DX => self.triangle_color_dx[0],
             SST_DG_DX => self.triangle_color_dx[1],
             SST_DB_DX => self.triangle_color_dx[2],
+            SST_DZ_DX => self.triangle_depth_dx,
             SST_DR_DY => self.triangle_color_dy[0],
             SST_DG_DY => self.triangle_color_dy[1],
             SST_DB_DY => self.triangle_color_dy[2],
+            SST_DZ_DY => self.triangle_depth_dy,
             SST_TRIANGLE_CMD => 0,
             SST_FVERTEX_AX => self.ftriangle_vertices[0].0,
             SST_FVERTEX_AY => self.ftriangle_vertices[0].1,
@@ -1014,6 +1066,17 @@ impl Distira {
             .triangle_vertices
             .map(|(x, y)| (fixed_vertex_to_f32(x), fixed_vertex_to_f32(y)));
         let (origin_x, origin_y) = coords[0];
+        let depths = coords.map(|(x, y)| {
+            fixed_depth_at(
+                self.triangle_depth,
+                self.triangle_depth_dx,
+                self.triangle_depth_dy,
+                x,
+                y,
+                origin_x,
+                origin_y,
+            )
+        });
         let vertices = coords.map(|(x, y)| {
             DistiraVertex::rgb(
                 x,
@@ -1047,7 +1110,7 @@ impl Distira {
                 ),
             )
         });
-        let written = self.draw_triangle(vertices) as u32;
+        let written = self.draw_triangle_with_depth(vertices, depths) as u32;
         self.fbi_pixels_in = self.fbi_pixels_in.wrapping_add(written);
         self.fbi_pixels_out = self.fbi_pixels_out.wrapping_add(written);
     }
@@ -1077,6 +1140,52 @@ impl Distira {
         self.fb[off as usize] = bytes[0];
         self.fb[off as usize + 1] = bytes[1];
         true
+    }
+
+    fn depth_test_passes(&self, x: u32, y: u32, depth: u16) -> bool {
+        if self.fbz_mode & FBZ_DEPTH_ENABLE == 0 {
+            return true;
+        }
+        let Some(old_depth) = self.read_depth_pixel(x, y) else {
+            return false;
+        };
+        match (self.fbz_mode >> FBZ_DEPTH_OP_SHIFT) & 7 {
+            DEPTHOP_NEVER => false,
+            DEPTHOP_LESSTHAN => depth < old_depth,
+            DEPTHOP_EQUAL => depth == old_depth,
+            DEPTHOP_LESSTHANEQUAL => depth <= old_depth,
+            DEPTHOP_GREATERTHAN => depth > old_depth,
+            DEPTHOP_NOTEQUAL => depth != old_depth,
+            DEPTHOP_GREATERTHANEQUAL => depth >= old_depth,
+            DEPTHOP_ALWAYS => true,
+            _ => true,
+        }
+    }
+
+    fn read_depth_pixel(&self, x: u32, y: u32) -> Option<u16> {
+        self.depth_pixel_index(x, y)
+            .and_then(|index| self.depth.get(index).copied())
+    }
+
+    fn write_depth_pixel(&mut self, x: u32, y: u32, depth: u16) {
+        if self.fbz_mode & (FBZ_DEPTH_ENABLE | FBZ_DEPTH_WMASK)
+            != (FBZ_DEPTH_ENABLE | FBZ_DEPTH_WMASK)
+        {
+            return;
+        }
+        let Some(index) = self.depth_pixel_index(x, y) else {
+            return;
+        };
+        if let Some(slot) = self.depth.get_mut(index) {
+            *slot = depth;
+        }
+    }
+
+    fn depth_pixel_index(&self, x: u32, y: u32) -> Option<usize> {
+        if x >= self.display.width || y >= self.display.height {
+            return None;
+        }
+        Some((y as usize * self.display.width as usize) + x as usize)
     }
 }
 
@@ -1119,6 +1228,22 @@ fn fixed_color_value(raw: u32) -> f32 {
     sign_extend_24(raw) as f32 / 4096.0
 }
 
+fn fixed_depth_at(
+    start: u32,
+    dx: u32,
+    dy: u32,
+    x: f32,
+    y: f32,
+    origin_x: f32,
+    origin_y: f32,
+) -> f32 {
+    start as f32 + dx as i32 as f32 * (x - origin_x) + dy as i32 as f32 * (y - origin_y)
+}
+
+fn depth_to_u16(raw: f32) -> u16 {
+    (raw / 4096.0).round().clamp(0.0, 65535.0) as u16
+}
+
 fn sign_extend_24(raw: u32) -> i32 {
     let raw = raw & 0x00ff_ffff;
     if raw & 0x0080_0000 != 0 {
@@ -1144,6 +1269,10 @@ fn lerp_u8(a: u8, b: u8, c: u8, w0: f32, w1: f32, w2: f32) -> u8 {
     (a as f32 * w0 + b as f32 * w1 + c as f32 * w2)
         .round()
         .clamp(0.0, 255.0) as u8
+}
+
+fn lerp_f32(a: f32, b: f32, c: f32, w0: f32, w1: f32, w2: f32) -> f32 {
+    a * w0 + b * w1 + c * w2
 }
 
 fn quantize_channel(v: u8, bits: u32, cell: u32, dither: bool) -> u16 {

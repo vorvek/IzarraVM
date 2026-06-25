@@ -413,7 +413,10 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
 - [x] Iteration 8: float color derivative registers for `SST_ftriangleCMD`.
       Validated by the video float triangle gradient test plus the workspace
       gates.
-- [ ] Next: depth test and depth write for untextured Voodoo triangles.
+- [x] Iteration 9: depth test and depth write for untextured integer
+      triangles. Validated by the video depth rejection test plus the workspace
+      gates.
+- [ ] Next: float Z and Z derivative registers for `SST_ftriangleCMD`.
 
 ## First 90 percent push for this branch
 
