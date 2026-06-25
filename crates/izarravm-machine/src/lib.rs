@@ -1762,6 +1762,16 @@ impl Machine {
         let _ = bus.write_memory_byte(address, value);
     }
 
+    pub fn write_physical_u16(&mut self, address: u32, value: u16) {
+        let mut bus = self.make_bus();
+        let _ = bus.write_memory(
+            address,
+            BusWidth::Word,
+            u32::from(value),
+            BusAccessKind::DataWrite,
+        );
+    }
+
     pub fn write_physical_u32(&mut self, address: u32, value: u32) {
         let mut bus = self.make_bus();
         let _ = bus.write_memory(address, BusWidth::Dword, value, BusAccessKind::DataWrite);
@@ -7199,11 +7209,7 @@ impl CpuBus for MachineBus<'_> {
         if let Some(offset) = self.distira_lfb_offset(address, width.bytes() as usize) {
             match width {
                 BusWidth::Byte => self.distira.write_lfb_u8(offset, value as u8),
-                BusWidth::Word => {
-                    for (index, byte) in (value as u16).to_le_bytes().into_iter().enumerate() {
-                        self.distira.write_lfb_u8(offset + index, byte);
-                    }
-                }
+                BusWidth::Word => self.distira.write_lfb_u16(offset, value as u16),
                 BusWidth::Dword => self.distira.write_lfb_u32(offset, value),
             }
             return Ok(());

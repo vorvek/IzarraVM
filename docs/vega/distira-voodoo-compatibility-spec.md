@@ -680,5 +680,12 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
       test/chroma/fog/blend behavior before updating color/depth masks.
       Validated by the video LFB stipple-pattern and depth-only `zaColor` alpha
       tests plus the Distira video test gates.
-- [ ] Next: LFB byte/word write-width parity, including pixel-pipeline word
-      writes for RGB, ARGB, depth, and depth+color formats.
+- [x] Iteration 114: 16-bit LFB writes use a Voodoo-shaped `writew` path for
+      RGB565, RGB555, ARGB1555, and depth-only formats, including pixel-pipeline
+      alpha blend/test behavior, `zaColor` depth test/write-mask semantics for
+      RGB color formats, and machine-bus word routing through the same path.
+      Validated by the video LFB word RGB565 blend/depth/depth-only alpha tests,
+      the machine LFB word pipeline test, and the Distira video/machine gates.
+- [ ] Next: LFB byte-width and odd-aligned word semantics against 86Box's LFB
+      aperture behavior, including readback parity for guest byte/word/dword
+      accesses.
