@@ -429,7 +429,10 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
       gates.
 - [x] Iteration 14: chroma key rejection for untextured Voodoo triangles.
       Validated by the video chroma-key rejection test plus the workspace gates.
-- [ ] Next: fog color application for untextured Voodoo triangles.
+- [x] Iteration 15: constant fog color application for untextured Voodoo
+      triangles. Validated by the video constant-fog test plus the workspace
+      gates.
+- [ ] Next: texture-enabled color path for nearest RGB565 texels.
 
 ## First 90 percent push for this branch
 

@@ -201,6 +201,9 @@ pub const BLEND_AOM_COLOR: u32 = 6;
 pub const BLEND_AOMDST_ALPHA: u32 = 7;
 pub const BLEND_ASATURATE: u32 = 0xf;
 
+pub const FOG_ENABLE: u32 = 0x01;
+pub const FOG_CONSTANT: u32 = 0x20;
+
 pub const FBIINIT0_VGA_PASS: u32 = 1;
 pub const FBIINIT0_GRAPHICS_RESET: u32 = 1 << 1;
 pub const FBIINIT1_MULTI_SST: u32 = 1 << 2;
@@ -551,6 +554,7 @@ impl Distira {
                     self.fbi_chroma_fail = self.fbi_chroma_fail.wrapping_add(1);
                     continue;
                 }
+                let (r, g, blue) = self.apply_fog_color(r, g, blue);
                 let (r, g, blue) = self.alpha_blend_color(x, y, r, g, blue, alpha);
                 let pixel = pack_rgb565_for_pixel(r, g, blue, x, y, self.dither_enabled);
                 if self.write_back_pixel(x, y, pixel) {
@@ -1290,6 +1294,17 @@ impl Distira {
             || r != (self.chroma_key >> 16) as u8
             || g != (self.chroma_key >> 8) as u8
             || b != self.chroma_key as u8
+    }
+
+    fn apply_fog_color(&self, r: u8, g: u8, b: u8) -> (u8, u8, u8) {
+        if self.fog_mode & (FOG_ENABLE | FOG_CONSTANT) != (FOG_ENABLE | FOG_CONSTANT) {
+            return (r, g, b);
+        }
+        (
+            r.saturating_add((self.fog_color >> 16) as u8),
+            g.saturating_add((self.fog_color >> 8) as u8),
+            b.saturating_add(self.fog_color as u8),
+        )
     }
 
     fn alpha_blend_color(&self, x: u32, y: u32, r: u8, g: u8, b: u8, alpha: u8) -> (u8, u8, u8) {
