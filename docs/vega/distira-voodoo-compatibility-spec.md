@@ -478,7 +478,9 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
       texture sample test plus the workspace gates.
 - [x] Iteration 37: S/T texture mirror behavior. Validated by the video S mirror
       texture sample test plus the workspace gates.
-- [ ] Next: texture multibase LOD address behavior.
+- [x] Iteration 38: texture multibase LOD address behavior. Validated by the
+      video RGB565 multibase LOD address test plus the workspace gates.
+- [ ] Next: split/odd LOD selection behavior.
 
 ## First 90 percent push for this branch
 
