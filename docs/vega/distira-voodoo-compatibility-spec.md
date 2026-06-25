@@ -539,7 +539,10 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
       video texture alpha add-local test plus the workspace gates.
 - [x] Iteration 66: texture alpha path invert-output behavior. Validated by
       the video texture alpha invert-output test plus the workspace gates.
-- [ ] Next: texture alpha path non-reverse modulation behavior.
+- [x] Iteration 67: texture alpha path non-reverse modulation behavior.
+      Validated by the video texture alpha non-reverse modulation regression
+      test plus the workspace gates.
+- [ ] Next: texture alpha path color1 alpha select behavior.
 
 ## First 90 percent push for this branch
 
