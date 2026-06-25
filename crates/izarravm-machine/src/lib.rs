@@ -2814,9 +2814,9 @@ impl Machine {
             // header. CX = drive number. Dispatch it to the ATAPI device.
             0x1510 => {
                 let cx = self.cpu.registers.ecx() as u16;
-                if !self
+                if self
                     .icdex_cd_drive_number()
-                    .is_some_and(|drive| cx == u16::from(drive))
+                    .is_none_or(|drive| cx != u16::from(drive))
                 {
                     // Invalid drive: CF set, AX = 000Fh.
                     let eax = (self.cpu.registers.eax() & !0xFFFF) | 0x000F;
@@ -15751,7 +15751,7 @@ mod tests {
         // env_seg + env_paras is the env block's first free paragraph (its MCB header
         // slot); the AH=48h data segment is one paragraph above that header.
         assert_eq!(
-            mem.read_u16(0x1204).unwrap(),
+            mem.read_u16(psp_base + 0x204).unwrap(),
             env_seg + env_paras + 1,
             "AH=48h allocated segment follows the env block and its MCB header"
         );
@@ -15898,7 +15898,13 @@ mod tests {
         let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
 
         assert_eq!(reason, StopReason::DosExit { code: 0 });
-        assert_eq!(machine.memory().read_u8(0x1200).unwrap(), 0x23);
+        assert_eq!(
+            machine
+                .memory()
+                .read_u8(usize::from(DOS_LOAD_SEGMENT) * 16 + 0x200)
+                .unwrap(),
+            0x23
+        );
     }
 
     #[test]
@@ -17038,6 +17044,173 @@ mod tests {
         let [lo, hi] = status.to_le_bytes();
         img[0x13..0x1B].copy_from_slice(&[0xB8, lo, hi, 0x26, 0x89, 0x47, 0x03, 0xCB]);
         img
+    }
+
+    fn inline_block_sys_image(name: &[u8; 8], status: u16, units: u8) -> Vec<u8> {
+        let mut img = vec![0u8; 0x70];
+        img[0..4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        img[4..6].copy_from_slice(&0x0000u16.to_le_bytes()); // block device
+        img[6..8].copy_from_slice(&0x0012u16.to_le_bytes()); // strategy off
+        img[8..10].copy_from_slice(&0x0013u16.to_le_bytes()); // interrupt off
+        img[10..18].copy_from_slice(name);
+        img[0x12] = 0xCB; // strategy: retf
+        let [lo, hi] = status.to_le_bytes();
+        img[0x13..0x2D].copy_from_slice(&[
+            0xB8, lo, hi, 0x26, 0x89, 0x47, 0x03, // mov ax,status; mov es:[bx+3],ax
+            0x26, 0xC6, 0x47, 0x0D, units, // mov byte es:[bx+0Dh],units
+            0xB8, 0x40, 0x00, 0x26, 0x89, 0x47, 0x12, // BPB-offset array offset
+            0x0E, 0x58, 0x26, 0x89, 0x47, 0x14, // push cs; pop ax; write array segment
+            0xCB,
+        ]);
+        img[0x40..0x42].copy_from_slice(&0x0050u16.to_le_bytes());
+        let mut bpb = [0u8; 0x19];
+        bpb[0..2].copy_from_slice(&1024u16.to_le_bytes()); // bytes per sector
+        bpb[2] = 1; // sectors per cluster
+        bpb[3..5].copy_from_slice(&1u16.to_le_bytes()); // reserved sectors
+        bpb[5] = 2; // FATs
+        bpb[6..8].copy_from_slice(&224u16.to_le_bytes()); // root entries
+        bpb[8..10].copy_from_slice(&1440u16.to_le_bytes()); // total sectors
+        bpb[10] = 0xF9; // media descriptor
+        bpb[11..13].copy_from_slice(&9u16.to_le_bytes()); // sectors per FAT
+        bpb[13..15].copy_from_slice(&18u16.to_le_bytes()); // sectors per track
+        bpb[15..17].copy_from_slice(&2u16.to_le_bytes()); // heads
+        img[0x50..0x69].copy_from_slice(&bpb);
+        img
+    }
+
+    #[test]
+    fn config_sys_block_device_assigns_d_drive_and_dpb() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = izarravm_firmware::toka_dos_system_files();
+        izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format)
+            .unwrap();
+        std::fs::write(
+            dir.path().join("BLKDRV.SYS"),
+            inline_block_sys_image(b"BLKDRV  ", 0x0100, 1),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("CONFIG.SYS"), "DEVICE=C:\\BLKDRV.SYS\r\n").unwrap();
+
+        let mut machine = test_machine();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        machine.set_toka_c_root(dir.path().to_path_buf());
+        machine.perform_toka_service(0x10);
+        assert_eq!(machine.toka_service_status, 0);
+        assert!(device_chain_contains(&mut machine, b"BLKDRV  "));
+
+        let mut regs = izarravm_dos::DosRegs {
+            ax: 0x5200,
+            ..izarravm_dos::DosRegs::default()
+        };
+        machine
+            .dos
+            .dispatch(0x21, &mut regs, &mut machine.memory)
+            .unwrap();
+        let base = usize::from(regs.es) * 16 + usize::from(regs.bx);
+        assert_eq!(machine.memory.read_u8(base + 0x20).unwrap(), 2);
+        assert_eq!(machine.memory.read_u16(base + 0x10).unwrap(), 1024);
+        let c_dpb_off = machine.memory.read_u16(base).unwrap();
+        let c_dpb_seg = machine.memory.read_u16(base + 2).unwrap();
+        let c_dpb = usize::from(c_dpb_seg) * 16 + usize::from(c_dpb_off);
+        let d_dpb_off = machine.memory.read_u16(c_dpb + 0x19).unwrap();
+        let d_dpb_seg = machine.memory.read_u16(c_dpb + 0x1b).unwrap();
+        let d_dpb = usize::from(d_dpb_seg) * 16 + usize::from(d_dpb_off);
+        assert_eq!(machine.memory.read_u8(d_dpb).unwrap(), 3, "D: DPB drive");
+        assert_eq!(machine.memory.read_u16(d_dpb + 0x02).unwrap(), 1024);
+        assert_eq!(machine.memory.read_u16(d_dpb + 0x0b).unwrap(), 26);
+        assert_eq!(machine.memory.read_u16(d_dpb + 0x0d).unwrap(), 1415);
+        assert_eq!(machine.memory.read_u16(d_dpb + 0x0f).unwrap(), 9);
+        assert_eq!(machine.memory.read_u16(d_dpb + 0x11).unwrap(), 19);
+        let header = device_header_for(&mut machine, b"BLKDRV  ").unwrap();
+        assert_eq!(machine.memory.read_u16(d_dpb + 0x13).unwrap(), header.1);
+        assert_eq!(machine.memory.read_u16(d_dpb + 0x15).unwrap(), header.0);
+
+        write_guest_asciiz(&mut machine, 0x2000, 0x0000, "BLKDRV");
+        let mut open = izarravm_dos::DosRegs {
+            ax: 0x3d00,
+            ds: 0x2000,
+            dx: 0x0000,
+            ..izarravm_dos::DosRegs::default()
+        };
+        machine
+            .dos
+            .dispatch(0x21, &mut open, &mut machine.memory)
+            .unwrap();
+        assert!(
+            open.cf,
+            "block driver is not a character-device open target"
+        );
+
+        machine.cpu.registers.set_eax(0x0003);
+        machine.cpu.registers.set_ecx(0x0001);
+        machine.cpu.registers.set_edx(0);
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x2000));
+        machine.cpu.registers.set_ebx(0x0100);
+        machine.handle_int25();
+        assert_ne!(
+            machine.cpu.registers.eax() as u16,
+            0,
+            "D: absolute read is deferred"
+        );
+        machine.cpu.registers.set_eax(0x0003);
+        machine.handle_int26();
+        assert_ne!(
+            machine.cpu.registers.eax() as u16,
+            0,
+            "D: absolute write is deferred"
+        );
+
+        machine.cpu.registers.set_eax(0x1500);
+        assert!(machine.handle_int2f());
+        assert_eq!(machine.cpu.registers.ecx() as u16, 4, "ICDEX moves to E:");
+    }
+
+    #[test]
+    fn config_sys_block_driver_exhaustion_skips_following_driver_before_init() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = izarravm_firmware::toka_dos_system_files();
+        izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format)
+            .unwrap();
+        std::fs::write(
+            dir.path().join("FULL.SYS"),
+            inline_block_sys_image(b"FULLDRV ", 0x0100, 30),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("MARKER.SYS"),
+            inline_block_sys_image(b"MARKER  ", 0x0100, 1),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("CONFIG.SYS"),
+            "DEVICE=C:\\FULL.SYS\r\nDEVICE=C:\\MARKER.SYS\r\n",
+        )
+        .unwrap();
+
+        let mut machine = test_machine();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        machine.set_toka_c_root(dir.path().to_path_buf());
+        machine.perform_toka_service(0x10);
+        assert_eq!(machine.toka_service_status, 0);
+
+        assert!(device_chain_contains(&mut machine, b"FULLDRV "));
+        assert!(
+            !device_chain_contains(&mut machine, b"MARKER  "),
+            "the exhausted block driver must not be called or linked"
+        );
+        machine.cpu.registers.set_eax(0x1500);
+        assert!(machine.handle_int2f());
+        assert_eq!(
+            machine.cpu.registers.ebx() as u16,
+            0,
+            "D: through Z: are consumed"
+        );
+        let console = String::from_utf8_lossy(machine.dos_output()).into_owned();
+        assert!(console.contains("FULL.SYS") && console.contains("installed"));
+        assert!(console.contains("MARKER.SYS") && console.contains("failed to install"));
     }
 
     #[test]

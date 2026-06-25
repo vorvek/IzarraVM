@@ -64,6 +64,7 @@ const SFT_HEADER_LEN: usize = 0x06;
 const SFT_ENTRY_LEN: usize = 0x3b;
 const STANDARD_SFT_SLOTS: usize = 5;
 const DPB_LEN: usize = 0x21;
+pub(super) const BLOCK_BPB_LEN: usize = 0x19;
 const CDS_ENTRY_LEN: usize = 0x58;
 const SDA_LIVE_PREFIX_LEN: usize = 0x1a;
 pub(super) const SDA_ALWAYS_SWAPPED_LEN: u16 = 0x001a;
@@ -93,29 +94,40 @@ struct SysvarsLayout {
     sda_off: usize,
 }
 
-fn sysvars_layout(first_mcb: u16, lastdrive: Option<u8>, file_count: u16) -> SysvarsLayout {
+fn sysvars_layout(
+    first_mcb: u16,
+    lastdrive: Option<u8>,
+    file_count: u16,
+    published_block_units: usize,
+) -> Result<SysvarsLayout, DosError> {
     let base = usize::from(SYSVARS_SEG) * 16;
     let sysvars_limit = usize::from(first_mcb) * 16;
     let drive_count = lastdrive.unwrap_or(DEFAULT_LASTDRIVE).min(26);
     let sft_linear = base + 2 + SFT_TABLE_OFF;
     let cds_bytes = usize::from(drive_count) * CDS_ENTRY_LEN;
+    let dpb_bytes = DPB_LEN * (1 + published_block_units);
     let max_sft_slots = (sysvars_limit
-        .saturating_sub(sft_linear + SFT_HEADER_LEN + DPB_LEN + cds_bytes + SDA_LIVE_PREFIX_LEN)
+        .saturating_sub(sft_linear + SFT_HEADER_LEN + dpb_bytes + cds_bytes + SDA_LIVE_PREFIX_LEN)
         / SFT_ENTRY_LEN)
         .max(2);
     let sft_slots = usize::from(file_count)
         .max(STANDARD_SFT_SLOTS)
         .min(max_sft_slots);
     let dpb_off = SFT_TABLE_OFF + SFT_HEADER_LEN + sft_slots * SFT_ENTRY_LEN;
-    let cds_array_off = dpb_off + DPB_LEN;
+    let cds_array_off = dpb_off + dpb_bytes;
     let sda_off = cds_array_off + cds_bytes;
-    SysvarsLayout {
+    let layout = SysvarsLayout {
         drive_count,
         sft_slots,
         dpb_off,
         cds_array_off,
         sda_off,
+    };
+    let layout_end = base + 2 + layout.sda_off + SDA_LIVE_PREFIX_LEN;
+    if layout_end > sysvars_limit {
+        return Err(DosError::SystemLayoutTooSmall);
     }
+    Ok(layout)
 }
 
 /// A live host-file handle projected into the DOS System File Table.
@@ -126,6 +138,85 @@ pub(super) struct SftHostFileEntry {
     pub(super) size: u32,
     pub(super) position: u32,
     pub(super) name: [u8; 11],
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct BlockDeviceBpb {
+    pub(super) bytes_per_sector: u16,
+    pub(super) cluster_mask: u8,
+    pub(super) cluster_shift: u8,
+    pub(super) first_fat_sector: u16,
+    pub(super) fat_count: u8,
+    pub(super) root_entries: u16,
+    pub(super) first_data_sector: u16,
+    pub(super) highest_cluster: u16,
+    pub(super) sectors_per_fat: u16,
+    pub(super) first_root_sector: u16,
+    pub(super) media: u8,
+}
+
+impl BlockDeviceBpb {
+    pub(super) fn from_bytes(bytes: &[u8; BLOCK_BPB_LEN]) -> Option<Self> {
+        let bytes_per_sector = u16::from_le_bytes([bytes[0], bytes[1]]);
+        let sectors_per_cluster = bytes[2];
+        let reserved_sectors = u16::from_le_bytes([bytes[3], bytes[4]]);
+        let fat_count = bytes[5];
+        let root_entries = u16::from_le_bytes([bytes[6], bytes[7]]);
+        let total_sectors_small = u16::from_le_bytes([bytes[8], bytes[9]]);
+        let media = bytes[10];
+        let sectors_per_fat = u16::from_le_bytes([bytes[11], bytes[12]]);
+        let huge_sectors = u32::from_le_bytes([bytes[21], bytes[22], bytes[23], bytes[24]]);
+        if bytes_per_sector == 0
+            || sectors_per_cluster == 0
+            || !sectors_per_cluster.is_power_of_two()
+        {
+            return None;
+        }
+        let first_root_sector = u32::from(reserved_sectors)
+            .checked_add(u32::from(fat_count).checked_mul(u32::from(sectors_per_fat))?)?;
+        let root_dir_bytes = u32::from(root_entries).checked_mul(32)?;
+        let root_dir_sectors = root_dir_bytes.div_ceil(u32::from(bytes_per_sector));
+        let first_data_sector = first_root_sector.checked_add(root_dir_sectors)?;
+        let total_sectors = if total_sectors_small != 0 {
+            u32::from(total_sectors_small)
+        } else {
+            huge_sectors
+        };
+        if total_sectors <= first_data_sector {
+            return None;
+        }
+        let highest_cluster = total_sectors
+            .checked_sub(first_data_sector)?
+            .checked_div(u32::from(sectors_per_cluster))?
+            .checked_add(1)?;
+        Some(Self {
+            bytes_per_sector,
+            cluster_mask: sectors_per_cluster - 1,
+            cluster_shift: sectors_per_cluster.trailing_zeros() as u8,
+            first_fat_sector: reserved_sectors,
+            fat_count,
+            root_entries,
+            first_data_sector: u16::try_from(first_data_sector).ok()?,
+            highest_cluster: u16::try_from(highest_cluster).ok()?,
+            sectors_per_fat,
+            first_root_sector: u16::try_from(first_root_sector).ok()?,
+            media,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct BlockDeviceDpbEntry {
+    pub(super) drive: u8,
+    pub(super) unit: u8,
+    pub(super) header: (u16, u16),
+    pub(super) bpb: BlockDeviceBpb,
+}
+
+pub(super) struct SysvarsDevices<'a> {
+    pub(super) host_files: &'a [SftHostFileEntry],
+    pub(super) block_dpbs: &'a [BlockDeviceDpbEntry],
+    pub(super) loaded_devices: &'a [(u16, u16)],
 }
 
 fn write_character_device_header(
@@ -676,11 +767,13 @@ pub(super) fn write_sysvars(
     ems_present: bool,
     lastdrive: Option<u8>,
     file_count: u16,
-    host_files: &[SftHostFileEntry],
-    loaded_devices: &[(u16, u16)],
+    devices: SysvarsDevices<'_>,
 ) -> Result<(u16, u16), DosError> {
     let base = usize::from(SYSVARS_SEG) * 16;
-    let layout = sysvars_layout(first_mcb, lastdrive, file_count);
+    let host_files = devices.host_files;
+    let block_dpbs = devices.block_dpbs;
+    let loaded_devices = devices.loaded_devices;
+    let layout = sysvars_layout(first_mcb, lastdrive, file_count, block_dpbs.len())?;
     let drive_count = layout.drive_count;
     let sft_slots = layout.sft_slots;
     let dpb_off = layout.dpb_off;
@@ -701,9 +794,13 @@ pub(super) fn write_sysvars(
     // entry and terminates at FFFF:FFFF.
     mem.write_u16(base + 2, (2 + dpb_off) as u16)?;
     mem.write_u16(base + 2 + 2, SYSVARS_SEG)?;
-    // [BX+0x10] WORD: the largest bytes-per-block of any block device, a 512-byte
-    // sector here.
-    mem.write_u16(base + 2 + 0x10, 512)?;
+    let largest_bytes_per_block = block_dpbs
+        .iter()
+        .map(|entry| entry.bpb.bytes_per_sector)
+        .max()
+        .unwrap_or(512)
+        .max(512);
+    mem.write_u16(base + 2 + 0x10, largest_bytes_per_block)?;
     // [BX+0x04] DWORD: pointer to the first System File Table.
     mem.write_u16(base + 2 + 0x04, (2 + SFT_TABLE_OFF) as u16)?;
     mem.write_u16(base + 2 + 0x06, SYSVARS_SEG)?;
@@ -758,16 +855,51 @@ pub(super) fn write_sysvars(
     mem.write_u16(dpb_linear + 0x15, 0xffff)?;
     mem.write_u8(dpb_linear + 0x17, 0xf8)?; // fixed disk media descriptor
     mem.write_u8(dpb_linear + 0x18, 0)?; // disk has been accessed
-    mem.write_u16(dpb_linear + 0x19, 0xffff)?; // next DPB pointer, end of chain
-    mem.write_u16(dpb_linear + 0x1b, 0xffff)?;
+    if block_dpbs.is_empty() {
+        mem.write_u16(dpb_linear + 0x19, 0xffff)?; // next DPB pointer, end of chain
+        mem.write_u16(dpb_linear + 0x1b, 0xffff)?;
+    } else {
+        mem.write_u16(dpb_linear + 0x19, (2 + dpb_off + DPB_LEN) as u16)?;
+        mem.write_u16(dpb_linear + 0x1b, SYSVARS_SEG)?;
+    }
     mem.write_u16(dpb_linear + 0x1d, 2)?; // start free-space search at cluster 2
     mem.write_u16(dpb_linear + 0x1f, 0xf000)?; // free clusters, matching AH=36h
+    for (index, entry) in block_dpbs.iter().enumerate() {
+        let dpb = dpb_linear + (index + 1) * DPB_LEN;
+        mem.write_u8(dpb, entry.drive)?;
+        mem.write_u8(dpb + 0x01, entry.unit)?;
+        mem.write_u16(dpb + 0x02, entry.bpb.bytes_per_sector)?;
+        mem.write_u8(dpb + 0x04, entry.bpb.cluster_mask)?;
+        mem.write_u8(dpb + 0x05, entry.bpb.cluster_shift)?;
+        mem.write_u16(dpb + 0x06, entry.bpb.first_fat_sector)?;
+        mem.write_u8(dpb + 0x08, entry.bpb.fat_count)?;
+        mem.write_u16(dpb + 0x09, entry.bpb.root_entries)?;
+        mem.write_u16(dpb + 0x0b, entry.bpb.first_data_sector)?;
+        mem.write_u16(dpb + 0x0d, entry.bpb.highest_cluster)?;
+        mem.write_u16(dpb + 0x0f, entry.bpb.sectors_per_fat)?;
+        mem.write_u16(dpb + 0x11, entry.bpb.first_root_sector)?;
+        mem.write_u16(dpb + 0x13, entry.header.1)?;
+        mem.write_u16(dpb + 0x15, entry.header.0)?;
+        mem.write_u8(dpb + 0x17, entry.bpb.media)?;
+        mem.write_u8(dpb + 0x18, 0)?;
+        if index + 1 == block_dpbs.len() {
+            mem.write_u16(dpb + 0x19, 0xffff)?;
+            mem.write_u16(dpb + 0x1b, 0xffff)?;
+        } else {
+            mem.write_u16(dpb + 0x19, (2 + dpb_off + (index + 2) * DPB_LEN) as u16)?;
+            mem.write_u16(dpb + 0x1b, SYSVARS_SEG)?;
+        }
+        mem.write_u16(dpb + 0x1d, 2)?;
+        mem.write_u16(dpb + 0x1f, 0xffff)?;
+    }
     // [BX+0x16] DWORD: pointer to the Current Directory Structure array. Each
     // entry is 0x58 bytes and the count is published at [BX+0x21].
     mem.write_u16(base + 2 + 0x16, (2 + cds_array_off) as u16)?;
     mem.write_u16(base + 2 + 0x18, SYSVARS_SEG)?;
-    // [BX+0x20] BYTE: number of installed block devices. Only C: is backed.
-    mem.write_u8(base + 2 + 0x20, 1)?;
+    mem.write_u8(
+        base + 2 + 0x20,
+        1 + u8::try_from(block_dpbs.len()).unwrap_or(u8::MAX),
+    )?;
     // [BX+0x21] BYTE: LASTDRIVE.
     mem.write_u8(base + 2 + 0x21, drive_count)?;
     for index in 0..drive_count {
@@ -777,15 +909,28 @@ pub(super) fn write_sysvars(
         mem.write_u8(entry + 1, b':')?;
         mem.write_u8(entry + 2, b'\\')?;
         mem.write_u8(entry + 3, 0)?;
-        // Mark C: as the mounted local physical drive. Other letters are reserved
-        // by LASTDRIVE but not backed by a modeled block device yet.
+        // Mark C: and CONFIG.SYS-published block drivers as mounted local physical
+        // drives. Other letters are reserved by LASTDRIVE but not backed here.
         let is_c = letter == b'C';
-        mem.write_u16(entry + 0x43, if is_c { 0x4000 } else { 0 })?;
+        let loaded = block_dpbs
+            .iter()
+            .position(|block| block.drive == index)
+            .map(|pos| (2 + dpb_off + (pos + 1) * DPB_LEN) as u16);
+        let dpb_ptr = if is_c {
+            Some((2 + dpb_off) as u16)
+        } else {
+            loaded
+        };
+        mem.write_u16(entry + 0x43, if dpb_ptr.is_some() { 0x4000 } else { 0 })?;
+        mem.write_u16(entry + 0x45, dpb_ptr.unwrap_or(0xffff))?;
         mem.write_u16(
-            entry + 0x45,
-            if is_c { (2 + dpb_off) as u16 } else { 0xffff },
+            entry + 0x47,
+            if dpb_ptr.is_some() {
+                SYSVARS_SEG
+            } else {
+                0xffff
+            },
         )?;
-        mem.write_u16(entry + 0x47, if is_c { SYSVARS_SEG } else { 0xffff })?;
         mem.write_u16(entry + 0x49, 0)?; // current directory starts at root
         mem.write_u16(entry + 0x4b, 0xffff)?;
         mem.write_u16(entry + 0x4d, 0xffff)?;
@@ -874,9 +1019,10 @@ pub(super) fn write_sda(
     first_mcb: u16,
     lastdrive: Option<u8>,
     file_count: u16,
+    published_block_units: usize,
     snapshot: SdaSnapshot,
 ) -> Result<(u16, u16), DosError> {
-    let layout = sysvars_layout(first_mcb, lastdrive, file_count);
+    let layout = sysvars_layout(first_mcb, lastdrive, file_count, published_block_units)?;
     let sda_off = (2 + layout.sda_off) as u16;
     let sda = usize::from(SYSVARS_SEG) * 16 + usize::from(sda_off);
     for off in 0..SDA_LIVE_PREFIX_LEN {
@@ -1207,7 +1353,19 @@ mod tests {
         }
         // A low first_mcb forces a large SysVars structure (the worst case for
         // overrunning low memory toward the stub cluster).
-        write_sysvars(&mut mem, 0x0100, false, Some(b'E'), 40, &[], &[]).unwrap();
+        write_sysvars(
+            &mut mem,
+            0x0100,
+            false,
+            Some(5),
+            40,
+            SysvarsDevices {
+                host_files: &[],
+                block_dpbs: &[],
+                loaded_devices: &[],
+            },
+        )
+        .unwrap();
         for addr in 0x600..0x640 {
             assert_eq!(
                 mem.read_u8(addr).unwrap(),
@@ -1215,5 +1373,58 @@ mod tests {
                 "SysVars must not write into the BIOS RAM stub cluster at {addr:#x}"
             );
         }
+    }
+
+    #[test]
+    fn write_sysvars_rejects_worst_case_layout_below_old_0100_psp() {
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let mut raw = [0u8; BLOCK_BPB_LEN];
+        raw[0..2].copy_from_slice(&512u16.to_le_bytes());
+        raw[2] = 1;
+        raw[3..5].copy_from_slice(&1u16.to_le_bytes());
+        raw[5] = 2;
+        raw[6..8].copy_from_slice(&224u16.to_le_bytes());
+        raw[8..10].copy_from_slice(&2880u16.to_le_bytes());
+        raw[10] = 0xf0;
+        raw[11..13].copy_from_slice(&9u16.to_le_bytes());
+        raw[13..15].copy_from_slice(&18u16.to_le_bytes());
+        raw[15..17].copy_from_slice(&2u16.to_le_bytes());
+        let bpb = BlockDeviceBpb::from_bytes(&raw).unwrap();
+        let block_dpbs: Vec<_> = (0..23)
+            .map(|unit| BlockDeviceDpbEntry {
+                drive: 3 + unit,
+                unit,
+                header: (0x2000 + u16::from(unit), 0),
+                bpb,
+            })
+            .collect();
+
+        let err = write_sysvars(
+            &mut mem,
+            0x00ff,
+            false,
+            Some(b'Z' - b'A' + 1),
+            40,
+            SysvarsDevices {
+                host_files: &[],
+                block_dpbs: &block_dpbs,
+                loaded_devices: &[],
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, DosError::SystemLayoutTooSmall));
+        write_sysvars(
+            &mut mem,
+            0x01ff,
+            false,
+            Some(b'Z' - b'A' + 1),
+            40,
+            SysvarsDevices {
+                host_files: &[],
+                block_dpbs: &block_dpbs,
+                loaded_devices: &[],
+            },
+        )
+        .unwrap();
     }
 }

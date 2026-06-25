@@ -35,6 +35,14 @@ pub const MARGO_VBE_MODES: &[VbeMode] = &[
         height: 480,
         bpp: 8,
     },
+    // Proprietary VEGA/Margo OEM mode: 320x240x256, line-doubled to the display
+    // by the monitor/scaler. Used by the Izarra-BIOS graphical POST screen.
+    VbeMode {
+        number: 0x150,
+        width: 320,
+        height: 240,
+        bpp: 8,
+    },
     VbeMode {
         number: 0x103,
         width: 800,
@@ -4118,5 +4126,17 @@ mod tests {
         write_reg(&mut margo, REG_CURSOR_CTRL, 1);
         let argb = margo.scanout_argb(&palette);
         assert_eq!(argb[0], 0x00); // xor plane off-store -> every pixel skipped -> surface 0
+    }
+
+    #[test]
+    fn proprietary_mode_0x150_is_320x240x8() {
+        let mode = vbe_mode(0x150).expect("0x150 present in the mode table");
+        assert_eq!((mode.width, mode.height, mode.bpp), (320, 240, 8));
+
+        let mut margo = Margo::default();
+        assert!(margo.set_mode(0x150), "set_mode(0x150) succeeds");
+        let display = margo.display();
+        assert_eq!((display.width, display.height, display.bpp), (320, 240, 8));
+        assert_eq!(display.pitch, 320); // 320 * 1 byte per pixel
     }
 }

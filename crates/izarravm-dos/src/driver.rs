@@ -31,6 +31,10 @@ impl DeviceHeaderInfo {
     pub fn is_character_device(&self) -> bool {
         self.attributes & 0x8000 != 0
     }
+
+    pub fn is_block_device(&self) -> bool {
+        !self.is_character_device()
+    }
 }
 
 /// Validate the device header at offset 0 of a raw `.SYS` image.
@@ -66,6 +70,7 @@ pub fn build_init_request(
     req_linear: usize,
     break_default: (u16, u16),
     arg_ptr: (u16, u16),
+    first_drive: u8,
 ) -> Result<(), DosError> {
     for i in 0..usize::from(INIT_REQUEST_LEN) {
         mem.write_u8(req_linear + i, 0)?;
@@ -78,6 +83,7 @@ pub fn build_init_request(
     mem.write_u16(req_linear + 0x10, break_default.0)?; // break seg
     mem.write_u16(req_linear + 0x12, arg_ptr.1)?; // arg off
     mem.write_u16(req_linear + 0x14, arg_ptr.0)?; // arg seg
+    mem.write_u8(req_linear + 0x16, first_drive)?; // first drive for block drivers
     Ok(())
 }
 
@@ -182,12 +188,13 @@ mod tests {
     fn builds_and_reads_back_the_init_request() {
         let mut mem = Memory::new(0x20000).unwrap();
         let req = 0x1000usize;
-        build_init_request(&mut mem, req, (0x0700, 0x0010), (0x0050, 0x0005)).unwrap();
+        build_init_request(&mut mem, req, (0x0700, 0x0010), (0x0050, 0x0005), 0x03).unwrap();
         assert_eq!(mem.read_u8(req).unwrap(), 0x17); // +0x00 length
         assert_eq!(mem.read_u8(req + 0x02).unwrap(), 0x00); // INIT command
         assert_eq!(mem.read_u16(req + 0x03).unwrap(), 0x0000); // seeded status
         assert_eq!(mem.read_u16(req + 0x12).unwrap(), 0x0005); // arg off
         assert_eq!(mem.read_u16(req + 0x14).unwrap(), 0x0050); // arg seg
+        assert_eq!(mem.read_u8(req + 0x16).unwrap(), 0x03); // first drive
         // Driver writes DONE + break address; read_init_result decodes it.
         mem.write_u16(req + 0x03, 0x0100).unwrap(); // DONE, no error
         mem.write_u16(req + 0x0e, 0x0040).unwrap(); // break off
