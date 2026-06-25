@@ -55,45 +55,51 @@ lfb_pixel_addr:
 
 ; lfb_glyph: draw one 8x8 glyph. AL=char, DI=x, SI(word)=y, BL=fg, BH=bg.
 ; Internal helper used by lfb_text. Preserves caller registers.
+;
+; The top-left LFB address is computed ONCE into ESI (lfb_pixel_addr returns it in
+; EBX, which we move out so BX can keep fg/bg -- BL/BH are the low word of EBX and
+; would otherwise be destroyed). Each row advances ESI by the pitch and walks a
+; working copy in EDI. The pixel's fg/bg byte goes through DH, so DL stays free as
+; the row counter; CL is the column counter.
 lfb_glyph:
     pusha
     push eax
     push ebx
     push ecx
     push edx
+    push esi
+    push edi
     movzx bp, al
     shl bp, 3
-    add bp, bios_font           ; CS:bp -> 8 glyph rows
-    mov dx, si                  ; dx = current y
-    mov cx, 8                   ; 8 rows
+    add bp, bios_font           ; CS:BP -> 8 glyph rows
+    push bx                     ; save BL=fg / BH=bg across the address calc
+    mov ax, si                  ; AX = y (lfb_pixel_addr reads DI=x, AX=y)
+    call lfb_pixel_addr         ; EBX = LFB addr of (x, y)
+    mov esi, ebx                ; ESI = running row address
+    pop bx                      ; BL=fg, BH=bg restored; EBX now free
+    mov dl, 8                   ; DL = rows remaining
 .row:
-    push cx
-    push di                     ; x constant per row
-    mov al, [cs:bp]             ; this row's bitmap
+    mov al, [cs:bp]             ; this row's 8 bits
     inc bp
-    push bx                     ; preserve BL=fg/BH=bg: lfb_pixel_addr returns EBX
-    push ax
-    mov si, dx                  ; y for lfb_pixel_addr (word)
-    mov ax, dx
-    call lfb_pixel_addr         ; EBX = LFB addr of (di, dx); clobbers BX
-    pop ax
-    pop bx                      ; restore fg/bg before the column loop reads them
-    mov cx, 8                   ; 8 columns
+    mov edi, esi                ; EDI = pixel address for this row
+    mov cl, 8                   ; CL = columns remaining
 .col:
     shl al, 1                   ; MSB -> CF
     jc .fg
-    mov dl, bh                  ; background index
+    mov dh, bh                  ; background index
     jmp .put
 .fg:
-    mov dl, bl                  ; foreground index
+    mov dh, bl                  ; foreground index
 .put:
-    mov [fs:ebx], dl
-    inc ebx
-    loop .col
-    pop di
-    pop cx
-    inc dx                      ; next scanline
-    loop .row
+    mov [fs:edi], dh
+    inc edi
+    dec cl
+    jnz .col
+    add esi, LFB_PITCH          ; next scanline
+    dec dl
+    jnz .row
+    pop edi
+    pop esi
     pop edx
     pop ecx
     pop ebx
@@ -152,25 +158,28 @@ lfb_putdec:
     ret
 
 ; lfb_fill_rect: DI=x, SI(word)=y, CX=w, DX=h, BL=color. Solid rectangle.
+; The color is stashed in BP (which survives lfb_pixel_addr; BL is the low byte of
+; the EBX address it returns and would be destroyed). The per-pixel write goes
+; through DL while DX's real value (rows remaining) is parked on the stack.
 lfb_fill_rect:
     pusha
+    movzx bp, bl                ; BP = fill color (survives lfb_pixel_addr)
 .row:
     test dx, dx
     jz .done
     push cx
     push di
     push si
-    push bx                     ; preserve BL=color: lfb_pixel_addr returns EBX
     mov ax, si
-    call lfb_pixel_addr         ; EBX = addr of (di, si); clobbers BX
-    pop bx                      ; restore color before the column loop writes it
+    call lfb_pixel_addr         ; EBX = addr of (di, si)
     pop si
     pop di
     pop cx
     push cx
     push dx
+    mov dx, bp                  ; DL = color (DX restored from the stack below)
 .col:
-    mov [fs:ebx], bl
+    mov [fs:ebx], dl
     inc ebx
     loop .col
     pop dx
