@@ -25,24 +25,34 @@ pub const DISTIRA_CAPS_TMU1: u32 = 1 << 2;
 pub const DISTIRA_CAPS_TMU2: u32 = 1 << 3;
 pub const DISTIRA_CAPS_LFB: u32 = 1 << 4;
 
-pub const DISTIRA_REG_ID: usize = 0x0000;
-pub const DISTIRA_REG_CAPS: usize = 0x0004;
-pub const DISTIRA_REG_STATUS: usize = 0x0008;
-pub const DISTIRA_REG_CONTROL: usize = 0x000c;
-pub const DISTIRA_REG_MODEL: usize = 0x0010;
-pub const DISTIRA_REG_FB_WIDTH: usize = 0x0020;
-pub const DISTIRA_REG_FB_HEIGHT: usize = 0x0024;
-pub const DISTIRA_REG_FB_PITCH: usize = 0x0028;
-pub const DISTIRA_REG_FRONT_BASE: usize = 0x002c;
-pub const DISTIRA_REG_BACK_BASE: usize = 0x0030;
-pub const DISTIRA_REG_CLEAR_COLOR: usize = 0x0040;
-pub const DISTIRA_REG_COMMAND: usize = 0x00fc;
+pub const DISTIRA_REG_ID: usize = 0xf000;
+pub const DISTIRA_REG_CAPS: usize = 0xf004;
+pub const DISTIRA_REG_STATUS: usize = 0xf008;
+pub const DISTIRA_REG_CONTROL: usize = 0xf00c;
+pub const DISTIRA_REG_MODEL: usize = 0xf010;
+pub const DISTIRA_REG_FB_WIDTH: usize = 0xf020;
+pub const DISTIRA_REG_FB_HEIGHT: usize = 0xf024;
+pub const DISTIRA_REG_FB_PITCH: usize = 0xf028;
+pub const DISTIRA_REG_FRONT_BASE: usize = 0xf02c;
+pub const DISTIRA_REG_BACK_BASE: usize = 0xf030;
+pub const DISTIRA_REG_CLEAR_COLOR: usize = 0xf040;
+pub const DISTIRA_REG_COMMAND: usize = 0xf0fc;
 
 pub const DISTIRA_CMD_CLEAR: u32 = 1;
 pub const DISTIRA_CMD_SWAP: u32 = 2;
 
 pub const SST_STATUS: usize = 0x000;
 pub const SST_INTR_CTRL: usize = 0x004;
+pub const SST_VERTEX_AX: usize = 0x008;
+pub const SST_VERTEX_AY: usize = 0x00c;
+pub const SST_VERTEX_BX: usize = 0x010;
+pub const SST_VERTEX_BY: usize = 0x014;
+pub const SST_VERTEX_CX: usize = 0x018;
+pub const SST_VERTEX_CY: usize = 0x01c;
+pub const SST_START_R: usize = 0x020;
+pub const SST_START_G: usize = 0x024;
+pub const SST_START_B: usize = 0x028;
+pub const SST_TRIANGLE_CMD: usize = 0x080;
 pub const SST_FBZ_COLOR_PATH: usize = 0x104;
 pub const SST_FOG_MODE: usize = 0x108;
 pub const SST_ALPHA_MODE: usize = 0x10c;
@@ -227,6 +237,8 @@ pub struct Distira {
     stipple: u32,
     color0: u32,
     color1: u32,
+    triangle_vertices: [(u32, u32); 3],
+    triangle_color: [u32; 3],
     fbi_pixels_in: u32,
     fbi_chroma_fail: u32,
     fbi_zfunc_fail: u32,
@@ -281,6 +293,8 @@ impl Distira {
             stipple: 0,
             color0: 0,
             color1: 0,
+            triangle_vertices: [(0, 0); 3],
+            triangle_color: [0; 3],
             fbi_pixels_in: 0,
             fbi_chroma_fail: 0,
             fbi_zfunc_fail: 0,
@@ -533,6 +547,20 @@ impl Distira {
         let byte = offset & 0x3;
         match reg {
             SST_INTR_CTRL => merge_byte(&mut self.intr_ctrl, byte, value),
+            SST_VERTEX_AX => merge_vertex_component(&mut self.triangle_vertices[0].0, byte, value),
+            SST_VERTEX_AY => merge_vertex_component(&mut self.triangle_vertices[0].1, byte, value),
+            SST_VERTEX_BX => merge_vertex_component(&mut self.triangle_vertices[1].0, byte, value),
+            SST_VERTEX_BY => merge_vertex_component(&mut self.triangle_vertices[1].1, byte, value),
+            SST_VERTEX_CX => merge_vertex_component(&mut self.triangle_vertices[2].0, byte, value),
+            SST_VERTEX_CY => merge_vertex_component(&mut self.triangle_vertices[2].1, byte, value),
+            SST_START_R => merge_color_component(&mut self.triangle_color[0], byte, value),
+            SST_START_G => merge_color_component(&mut self.triangle_color[1], byte, value),
+            SST_START_B => merge_color_component(&mut self.triangle_color[2], byte, value),
+            SST_TRIANGLE_CMD => {
+                if byte == 0 && value != 0 {
+                    self.run_triangle_command();
+                }
+            }
             SST_FBZ_COLOR_PATH => merge_byte(&mut self.fbz_color_path, byte, value),
             SST_FOG_MODE => merge_byte(&mut self.fog_mode, byte, value),
             SST_ALPHA_MODE => merge_byte(&mut self.alpha_mode, byte, value),
@@ -706,6 +734,16 @@ impl Distira {
         match reg {
             SST_STATUS => self.status_value(),
             SST_INTR_CTRL => self.intr_ctrl,
+            SST_VERTEX_AX => self.triangle_vertices[0].0,
+            SST_VERTEX_AY => self.triangle_vertices[0].1,
+            SST_VERTEX_BX => self.triangle_vertices[1].0,
+            SST_VERTEX_BY => self.triangle_vertices[1].1,
+            SST_VERTEX_CX => self.triangle_vertices[2].0,
+            SST_VERTEX_CY => self.triangle_vertices[2].1,
+            SST_START_R => self.triangle_color[0],
+            SST_START_G => self.triangle_color[1],
+            SST_START_B => self.triangle_color[2],
+            SST_TRIANGLE_CMD => 0,
             SST_FBZ_COLOR_PATH => self.fbz_color_path,
             SST_FOG_MODE => self.fog_mode,
             SST_ALPHA_MODE => self.alpha_mode,
@@ -840,6 +878,22 @@ impl Distira {
         }
     }
 
+    fn run_triangle_command(&mut self) {
+        if self.fbz_mode & FBZ_RGB_WMASK == 0 {
+            return;
+        }
+
+        let r = fixed_color_to_u8(self.triangle_color[0]);
+        let g = fixed_color_to_u8(self.triangle_color[1]);
+        let b = fixed_color_to_u8(self.triangle_color[2]);
+        let vertices = self.triangle_vertices.map(|(x, y)| {
+            DistiraVertex::rgb(fixed_vertex_to_f32(x), fixed_vertex_to_f32(y), r, g, b)
+        });
+        let written = self.draw_triangle(vertices) as u32;
+        self.fbi_pixels_in = self.fbi_pixels_in.wrapping_add(written);
+        self.fbi_pixels_out = self.fbi_pixels_out.wrapping_add(written);
+    }
+
     fn run_command(&mut self) {
         match self.command & 0xff {
             DISTIRA_CMD_CLEAR => {
@@ -871,6 +925,24 @@ impl Distira {
 fn merge_byte(slot: &mut u32, byte: usize, value: u8) {
     let shift = byte * 8;
     *slot = (*slot & !(0xff_u32 << shift)) | (u32::from(value) << shift);
+}
+
+fn merge_vertex_component(slot: &mut u32, byte: usize, value: u8) {
+    merge_byte(slot, byte, value);
+    *slot &= 0xffff;
+}
+
+fn merge_color_component(slot: &mut u32, byte: usize, value: u8) {
+    merge_byte(slot, byte, value);
+    *slot &= 0x00ff_ffff;
+}
+
+fn fixed_vertex_to_f32(raw: u32) -> f32 {
+    (raw as i16) as f32 / 16.0
+}
+
+fn fixed_color_to_u8(raw: u32) -> u8 {
+    ((raw >> 12) & 0xff) as u8
 }
 
 fn edge(ax: f32, ay: f32, bx: f32, by: f32, px: f32, py: f32) -> f32 {

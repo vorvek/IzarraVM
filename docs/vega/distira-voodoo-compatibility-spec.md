@@ -401,8 +401,10 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
       Validated by the machine framebuffer packet test plus the workspace gates.
 - [x] Iteration 4: command FIFO type-5 texture packets. Commit `b6ef44c`.
       Validated by the video texture packet test plus the workspace gates.
-- [ ] Next: direct Voodoo triangle command registers for a flat untextured
-      triangle through `SST_triangleCMD`.
+- [x] Iteration 5: direct Voodoo triangle command registers for a flat
+      untextured triangle through `SST_triangleCMD`. Validated by the video
+      triangle command test plus the workspace gates.
+- [ ] Next: float Voodoo triangle command registers through `SST_ftriangleCMD`.
 
 ## First 90 percent push for this branch
 
