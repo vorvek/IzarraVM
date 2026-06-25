@@ -216,6 +216,7 @@ pub const CC_MSELECT_CLOCAL: u32 = 1;
 pub const CC_MSELECT_AOTHER: u32 = 2;
 pub const CC_MSELECT_ALOCAL: u32 = 3;
 pub const CC_MSELECT_TEX_ALPHA: u32 = 4;
+pub const CC_MSELECT_TEX_RGB: u32 = 5;
 pub const FBZCP_CC_REVERSE_BLEND: u32 = 1 << 13;
 pub const FBZCP_CC_ADD_CLOCAL: u32 = 1 << 14;
 pub const FBZCP_CC_ADD_ALOCAL: u32 = 2 << 14;
@@ -1754,8 +1755,15 @@ impl Distira {
             }
         };
         let texture_alpha = self.sample_tmu_alpha(0, s, t);
-        let color =
-            self.apply_color_path_local_combine(selected, source, alocal, aother, texture_alpha);
+        let texture_rgb = self.sample_tmu_texture(0, s, t);
+        let color = self.apply_color_path_local_combine(
+            selected,
+            source,
+            alocal,
+            aother,
+            texture_alpha,
+            texture_rgb,
+        );
         self.apply_color_path_output_invert(color)
     }
 
@@ -1773,6 +1781,7 @@ impl Distira {
         alocal: u8,
         aother: u8,
         texture_alpha: u8,
+        texture_rgb: (u8, u8, u8),
     ) -> (u8, u8, u8) {
         let mselect = (self.fbz_color_path >> FBZCP_CC_MSELECT_SHIFT) & FBZCP_CC_MSELECT_MASK;
         if self.fbz_color_path & (FBZCP_CC_SUB_CLOCAL | FBZCP_CC_ADD_CLOCAL | FBZCP_CC_ADD_ALOCAL)
@@ -1781,6 +1790,7 @@ impl Distira {
             && mselect != CC_MSELECT_AOTHER
             && mselect != CC_MSELECT_ALOCAL
             && mselect != CC_MSELECT_TEX_ALPHA
+            && mselect != CC_MSELECT_TEX_RGB
         {
             return color;
         }
@@ -1820,6 +1830,13 @@ impl Distira {
                 color_path_blend_channel(color.0, texture_alpha, reverse),
                 color_path_blend_channel(color.1, texture_alpha, reverse),
                 color_path_blend_channel(color.2, texture_alpha, reverse),
+            )
+        } else if mselect == CC_MSELECT_TEX_RGB {
+            let reverse = self.fbz_color_path & FBZCP_CC_REVERSE_BLEND != 0;
+            (
+                color_path_blend_channel(color.0, texture_rgb.0, reverse),
+                color_path_blend_channel(color.1, texture_rgb.1, reverse),
+                color_path_blend_channel(color.2, texture_rgb.2, reverse),
             )
         } else {
             color
