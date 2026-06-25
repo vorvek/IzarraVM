@@ -783,3 +783,81 @@ fn voodoo_lfb_pipeline_applies_constant_fog_before_write() {
 
     assert_eq!(distira.scanout_argb(), vec![0x0000_4100]);
 }
+
+#[test]
+fn voodoo_lfb_pipeline_alpha_blends_argb8888_over_destination() {
+    let mut distira = Distira::new();
+    distira.set_frame_size(1, 1);
+    distira.clear_back_rgb(0, 0, 255);
+
+    write_reg(
+        &mut distira,
+        SST_LFB_MODE,
+        LFB_FORMAT_ARGB8888 | LFB_WRITE_BACK | LFB_ENABLE_PIXEL_PIPELINE,
+    );
+    write_reg(&mut distira, SST_FBZ_MODE, FBZ_RGB_WMASK);
+    write_reg(
+        &mut distira,
+        SST_ALPHA_MODE,
+        ALPHA_BLEND_ENABLE
+            | (BLEND_ASRC_ALPHA << ALPHA_SRC_FUNC_SHIFT)
+            | (BLEND_AOMSRC_ALPHA << ALPHA_DST_FUNC_SHIFT),
+    );
+
+    distira.write_lfb_u32(0, 0x80ff_0000);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+
+    assert_eq!(distira.scanout_argb(), vec![0x0084_007b]);
+}
+
+#[test]
+fn voodoo_lfb_pipeline_alpha_blends_rgb565_with_opaque_source_alpha() {
+    let mut distira = Distira::new();
+    distira.set_frame_size(1, 1);
+    distira.clear_back_rgb(0, 0, 255);
+
+    write_reg(
+        &mut distira,
+        SST_LFB_MODE,
+        LFB_FORMAT_RGB565 | LFB_WRITE_BACK | LFB_ENABLE_PIXEL_PIPELINE,
+    );
+    write_reg(&mut distira, SST_FBZ_MODE, FBZ_RGB_WMASK);
+    write_reg(
+        &mut distira,
+        SST_ALPHA_MODE,
+        ALPHA_BLEND_ENABLE
+            | (BLEND_AZERO << ALPHA_SRC_FUNC_SHIFT)
+            | (BLEND_AONE << ALPHA_DST_FUNC_SHIFT),
+    );
+
+    distira.write_lfb_u32(0, 0x0000_f800);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+
+    assert_eq!(distira.scanout_argb(), vec![0x0000_00ff]);
+}
+
+#[test]
+fn voodoo_lfb_pipeline_alpha_tests_argb1555_source_alpha() {
+    let mut distira = Distira::new();
+    distira.set_frame_size(1, 1);
+
+    write_reg(
+        &mut distira,
+        SST_LFB_MODE,
+        LFB_FORMAT_ARGB1555 | LFB_WRITE_FRONT | LFB_ENABLE_PIXEL_PIPELINE,
+    );
+    write_reg(&mut distira, SST_FBZ_MODE, FBZ_RGB_WMASK);
+    write_reg(
+        &mut distira,
+        SST_ALPHA_MODE,
+        ALPHA_TEST_ENABLE | (AFUNC_GREATERTHAN << ALPHA_FUNC_SHIFT),
+    );
+
+    distira.write_lfb_u32(0, 0x0000_03e0);
+    assert_eq!(distira.scanout_argb(), vec![0x0000_0000]);
+    assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 1);
+
+    distira.write_lfb_u32(0, 0x0000_fc00);
+    assert_eq!(distira.scanout_argb(), vec![0x00ff_0000]);
+    assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 1);
+}
