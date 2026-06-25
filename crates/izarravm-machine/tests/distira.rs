@@ -521,6 +521,51 @@ fn distira_guest_cmdfifo_type5_texture_packets_use_assigned_bar_aperture() {
 }
 
 #[test]
+fn distira_guest_direct_texture_bar_writes_feed_texture_sampling() {
+    const ASSIGNED_BAR: u32 = 0xe600_0000;
+    const ASSIGNED_TEX: u32 = ASSIGNED_BAR + 0x0080_0000;
+
+    let mut code = Vec::new();
+    push_out_dx_eax(&mut code, 0x0cf8, 0x8000_8010);
+    push_out_dx_eax(&mut code, 0x0cfc, ASSIGNED_BAR);
+    push_out_dx_eax(&mut code, 0x0cf8, 0x8000_8004);
+    push_out_dx_eax(&mut code, 0x0cfc, 0x0000_0002);
+    push_mov_moffs_u32_imm32(&mut code, ASSIGNED_TEX, 0x07e0_07e0);
+
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Distira),
+        protected_flat_rom(&code),
+    )
+    .unwrap();
+
+    let reason = machine.run_until_halt_or_cycles(500_000).unwrap();
+
+    assert_eq!(reason, StopReason::Halted);
+    write_reg(&mut machine, DISTIRA_REG_FB_WIDTH, 4);
+    write_reg(&mut machine, DISTIRA_REG_FB_HEIGHT, 4);
+    write_reg(&mut machine, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
+    write_reg(&mut machine, SST_FBZ_COLOR_PATH, FBZCP_TEXTURE_ENABLED);
+    write_reg(&mut machine, SST_TEXTURE_MODE, TEX_R5G6B5 << 8);
+    write_reg(&mut machine, SST_TEX_BASE_ADDR, 0);
+    write_reg(&mut machine, SST_VERTEX_AX, 0 << 4);
+    write_reg(&mut machine, SST_VERTEX_AY, 0 << 4);
+    write_reg(&mut machine, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut machine, SST_VERTEX_BY, 0 << 4);
+    write_reg(&mut machine, SST_VERTEX_CX, 0 << 4);
+    write_reg(&mut machine, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut machine, SST_START_R, 0xff << 12);
+    write_reg(&mut machine, SST_START_G, 0xff << 12);
+    write_reg(&mut machine, SST_START_B, 0xff << 12);
+    write_reg(&mut machine, SST_START_A, 0xff << 12);
+    write_reg(&mut machine, SST_TRIANGLE_CMD, 1);
+    write_reg(&mut machine, SST_SWAPBUFFER_CMD, 1);
+
+    let (frame, width, height) = machine.frame_argb();
+    assert_eq!((width, height), (4, 4));
+    assert_eq!(frame[0], 0x0000_ff00);
+}
+
+#[test]
 fn distira_pci_config_ports_report_voodoo_graphics_identity() {
     // mov dx,0x0cf8; mov eax,0x80008000; out dx,eax
     // mov dx,0x0cfc; in eax,dx; mov [0x0200],eax; int 20h

@@ -336,6 +336,15 @@ impl PciConfig {
         }
     }
 
+    fn distira_texture_offset(&self, address: u32, width: usize) -> Option<usize> {
+        let offset = self.distira_bar_offset(address, width)?;
+        if offset >= DISTIRA_PCI_TEX_OFFSET && offset + width as u32 <= DISTIRA_PCI_BAR_SIZE {
+            Some((offset - DISTIRA_PCI_TEX_OFFSET) as usize)
+        } else {
+            None
+        }
+    }
+
     fn distira_cmdfifo_offset(&self, address: u32, width: usize) -> Option<usize> {
         let offset = self.distira_bar_offset(address, width)?;
         if (DISTIRA_PCI_CMDFIFO_OFFSET..DISTIRA_PCI_LFB_OFFSET).contains(&offset)
@@ -7267,6 +7276,13 @@ impl CpuBus for MachineBus<'_> {
             return Ok(());
         }
 
+        if let Some(offset) = self.distira_texture_offset(address, width.bytes() as usize) {
+            if width == BusWidth::Dword {
+                self.distira.write_texture_u32(offset, value);
+            }
+            return Ok(());
+        }
+
         match width {
             BusWidth::Byte => self.write_memory_byte(address, value as u8),
             BusWidth::Word => {
@@ -8037,6 +8053,10 @@ impl MachineBus<'_> {
         self.pci
             .distira_lfb_offset(address, width)
             .or_else(|| distira_lfb_offset(address, width))
+    }
+
+    fn distira_texture_offset(&self, address: u32, width: usize) -> Option<usize> {
+        self.pci.distira_texture_offset(address, width)
     }
 
     fn distira_cmdfifo_offset(&self, address: u32, width: usize) -> Option<usize> {

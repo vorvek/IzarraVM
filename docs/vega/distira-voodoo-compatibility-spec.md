@@ -717,5 +717,10 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
       protected-mode code and drain into texture memory that a subsequent
       register-driven textured triangle samples. Validated by the machine guest
       command-FIFO type-5 texture BAR regression and the Distira machine gates.
-- [ ] Next: Guest instruction-level direct texture-memory aperture writes through
+- [x] Iteration 121: Guest instruction-level direct texture-memory aperture dword
+      writes now route through the assigned BAR0 texture window into Distira
+      texture storage, where a subsequent textured triangle samples the uploaded
+      RGB565 texel. Validated by the machine guest direct texture BAR regression
+      and the Distira video/machine gates.
+- [ ] Next: Guest instruction-level direct texture-memory aperture reads through
       the assigned BAR0 texture window from real x86 code.
