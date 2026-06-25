@@ -861,3 +861,57 @@ fn voodoo_lfb_pipeline_alpha_tests_argb1555_source_alpha() {
     assert_eq!(distira.scanout_argb(), vec![0x00ff_0000]);
     assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 1);
 }
+
+#[test]
+fn voodoo_lfb_pipeline_stipple_pattern_rejects_masked_rgb565_pixels() {
+    const FBZ_STIPPLE_PATT: u32 = 1 << 12;
+
+    let mut distira = Distira::new();
+    distira.set_frame_size(2, 1);
+
+    write_reg(
+        &mut distira,
+        SST_LFB_MODE,
+        LFB_FORMAT_RGB565 | LFB_WRITE_FRONT | LFB_ENABLE_PIXEL_PIPELINE,
+    );
+    write_reg(
+        &mut distira,
+        SST_FBZ_MODE,
+        FBZ_RGB_WMASK | FBZ_STIPPLE | FBZ_STIPPLE_PATT,
+    );
+    write_reg(&mut distira, SST_STIPPLE, 1 << 6);
+
+    distira.write_lfb_u32(0, 0x07e0_f800);
+
+    assert_eq!(distira.scanout_argb(), vec![0x0000_0000, 0x0000_ff00]);
+}
+
+#[test]
+fn voodoo_lfb_pipeline_depth_only_alpha_test_uses_zacolor_alpha() {
+    let mut distira = Distira::new();
+    distira.set_frame_size(1, 1);
+
+    write_reg(
+        &mut distira,
+        SST_LFB_MODE,
+        LFB_FORMAT_DEPTH | LFB_WRITE_BACK | LFB_READ_AUX | LFB_ENABLE_PIXEL_PIPELINE,
+    );
+    write_reg(&mut distira, SST_FBZ_MODE, FBZ_DEPTH_WMASK);
+    write_reg(&mut distira, SST_ZA_COLOR, 0x4000_0000);
+    write_reg(
+        &mut distira,
+        SST_ALPHA_MODE,
+        ALPHA_TEST_ENABLE | (AFUNC_GREATERTHAN << ALPHA_FUNC_SHIFT) | (0x80 << ALPHA_REF_SHIFT),
+    );
+
+    distira.write_lfb_u32(0, 0x1111_1111);
+    assert_eq!(distira.read_lfb_u8(0), 0xff);
+    assert_eq!(distira.read_lfb_u8(1), 0xff);
+    assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 1);
+
+    write_reg(&mut distira, SST_ZA_COLOR, 0xff00_0000);
+    distira.write_lfb_u32(0, 0x2222_2222);
+    assert_eq!(distira.read_lfb_u8(0), 0x22);
+    assert_eq!(distira.read_lfb_u8(1), 0x22);
+    assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 1);
+}
