@@ -150,6 +150,8 @@ pub const SST_FBI_INIT7: usize = 0x24c;
 pub const SST_TEXTURE_MODE: usize = 0x300;
 pub const SST_TLOD: usize = 0x304;
 pub const SST_TEX_BASE_ADDR: usize = 0x30c;
+pub const SST_NCC_TABLE0_Q2: usize = 0x34c;
+pub const SST_NCC_TABLE0_Q3: usize = 0x350;
 
 pub const LFB_WRITE_FRONT: u32 = 0x0000;
 pub const LFB_WRITE_BACK: u32 = 0x0010;
@@ -193,6 +195,7 @@ pub const TEX_RGB332: u32 = 0x00;
 pub const TEX_A8: u32 = 0x02;
 pub const TEX_I8: u32 = 0x03;
 pub const TEX_AI8: u32 = 0x04;
+pub const TEX_PAL8: u32 = 0x05;
 pub const TEX_ARGB8332: u32 = 0x08;
 pub const TEX_R5G6B5: u32 = 0x0a;
 pub const TEX_ARGB1555: u32 = 0x0b;
@@ -396,6 +399,9 @@ pub struct Distira {
     texture_lod_tmu1: u32,
     tex_base_addr: u32,
     tex_base_addr_tmu1: u32,
+    ncc_table0_q2: [u32; 2],
+    ncc_table0_q3: [u32; 2],
+    texture_palette: [[u32; 256]; 2],
 }
 
 impl Default for Distira {
@@ -483,6 +489,9 @@ impl Distira {
             texture_lod_tmu1: 0,
             tex_base_addr: 0,
             tex_base_addr_tmu1: 0,
+            ncc_table0_q2: [0; 2],
+            ncc_table0_q3: [0; 2],
+            texture_palette: [[0; 256]; 2],
         }
     }
 
@@ -1018,6 +1027,8 @@ impl Distira {
                     merge_byte(&mut self.tex_base_addr_tmu1, byte, value);
                 }
             }
+            SST_NCC_TABLE0_Q2 => self.write_palette_registers(chip, false, byte, value),
+            SST_NCC_TABLE0_Q3 => self.write_palette_registers(chip, true, byte, value),
             _ if voodoo_reg == SST_TEXTURE_MODE => {
                 if chip & CHIP_TREX0 != 0 {
                     merge_byte(&mut self.texture_mode, byte, value);
@@ -1041,6 +1052,12 @@ impl Distira {
                 if chip & CHIP_TREX1 != 0 {
                     merge_byte(&mut self.tex_base_addr_tmu1, byte, value);
                 }
+            }
+            _ if voodoo_reg == SST_NCC_TABLE0_Q2 => {
+                self.write_palette_registers(chip, false, byte, value);
+            }
+            _ if voodoo_reg == SST_NCC_TABLE0_Q3 => {
+                self.write_palette_registers(chip, true, byte, value);
             }
             DISTIRA_REG_CONTROL => {
                 let mut control = self.control_value();
@@ -1140,6 +1157,29 @@ impl Distira {
 
     fn cmd_fifo_base_addr_value(&self) -> u32 {
         (self.cmd_fifo_base >> 12) | ((self.cmd_fifo_end >> 12) << 16)
+    }
+
+    fn write_palette_registers(&mut self, chip: usize, odd: bool, byte: usize, value: u8) {
+        if chip & CHIP_TREX0 != 0 {
+            self.write_palette_register(0, odd, byte, value);
+        }
+        if chip & CHIP_TREX1 != 0 {
+            self.write_palette_register(1, odd, byte, value);
+        }
+    }
+
+    fn write_palette_register(&mut self, tmu: usize, odd: bool, byte: usize, value: u8) {
+        let slot = if odd {
+            &mut self.ncc_table0_q3[tmu]
+        } else {
+            &mut self.ncc_table0_q2[tmu]
+        };
+        merge_byte(slot, byte, value);
+        let raw = *slot;
+        if raw & (1 << 31) != 0 {
+            let index = ((raw >> 23) & 0xfe) as usize | usize::from(odd);
+            self.texture_palette[tmu][index] = raw | 0xff00_0000;
+        }
     }
 
     fn control_value(&self) -> u32 {
@@ -1495,6 +1535,7 @@ impl Distira {
                     | TEX_A8
                     | TEX_I8
                     | TEX_AI8
+                    | TEX_PAL8
                     | TEX_ARGB8332
                     | TEX_R5G6B5
                     | TEX_ARGB1555
@@ -1523,6 +1564,7 @@ impl Distira {
             TEX_A8 => self.sample_tmu_a8(tmu, s, t),
             TEX_I8 => self.sample_tmu_i8(tmu, s, t),
             TEX_AI8 => self.sample_tmu_ai44(tmu, s, t),
+            TEX_PAL8 => self.sample_tmu_pal8(tmu, s, t),
             TEX_ARGB8332 => self.sample_tmu_argb8332(tmu, s, t),
             TEX_R5G6B5 => self.sample_tmu_rgb565(tmu, s, t),
             TEX_ARGB1555 => self.sample_tmu_argb1555(tmu, s, t),
@@ -1562,6 +1604,11 @@ impl Distira {
     fn sample_tmu_ai88(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
         let intensity = self.sample_tmu_u16(tmu, s, t) as u8;
         (intensity, intensity, intensity)
+    }
+
+    fn sample_tmu_pal8(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
+        let raw = self.texture_palette[tmu][usize::from(self.sample_tmu_u8(tmu, s, t))];
+        ((raw >> 16) as u8, (raw >> 8) as u8, raw as u8)
     }
 
     fn sample_tmu_argb8332(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
