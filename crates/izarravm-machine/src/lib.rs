@@ -582,6 +582,14 @@ fn device_call_error_code(command: u8, status: u16) -> u16 {
     }
 }
 
+fn block_device_error_code(write: bool, status: u16) -> u8 {
+    let status_code = status as u8;
+    if status_code != 0 {
+        return status_code;
+    }
+    if write { 0x0a } else { 0x0b }
+}
+
 fn device_request_packet_len(command: u8) -> u8 {
     match command {
         0x0d | 0x0e => 0x0d, // OPEN/CLOSE carry only the common request header.
@@ -1230,6 +1238,7 @@ impl Machine {
         error_code: u8,
         write: bool,
         area: izarravm_dos::CriticalErrorArea,
+        device_header: izarravm_dos::FarPtr,
         ax: u16,
     ) {
         let return_to = izarravm_dos::FarPtr {
@@ -1237,13 +1246,8 @@ impl Machine {
             offset: self.cpu.registers.eip as u16,
         };
         let pending = PendingCriticalError::AbsoluteDisk { return_to, ax };
-        let request = izarravm_dos::CriticalErrorRequest::disk(
-            drive,
-            error_code,
-            write,
-            area,
-            izarravm_dos::FarPtr::default(),
-        );
+        let request =
+            izarravm_dos::CriticalErrorRequest::disk(drive, error_code, write, area, device_header);
         let Ok(call) = self.dos.begin_critical_error(&mut self.memory, request) else {
             self.apply_critical_error_response(pending, izarravm_dos::CriticalErrorResponse::Fail);
             return;
@@ -3801,6 +3805,7 @@ impl Machine {
                     0x00,
                     true,
                     izarravm_dos::CriticalErrorArea::Data,
+                    izarravm_dos::FarPtr::default(),
                     0x0300,
                 );
                 return;
@@ -3822,6 +3827,33 @@ impl Machine {
             return;
         }
 
+        if count != 0xffff {
+            if let Some(target) = self.dos.block_device_io_target(al) {
+                let transfer = izarravm_dos::FarPtr {
+                    segment: self.cpu.registers.segment(SegmentIndex::Ds).selector,
+                    offset: bx,
+                };
+                match self.block_device_transfer_outcome(target, write, transfer, count, start_lba)
+                {
+                    Ok(()) => {
+                        self.set_ax(0);
+                        self.set_int_frame_carry(false);
+                    }
+                    Err(error_code) => {
+                        self.start_int25_26_critical_error(
+                            al,
+                            error_code,
+                            write,
+                            izarravm_dos::CriticalErrorArea::Data,
+                            target.header,
+                            u16::from(error_code),
+                        );
+                    }
+                }
+                return;
+            }
+        }
+
         // Only floppy A: is backed. Any other drive, or no media, reports a
         // drive-not-ready error (AX low byte 0x02 = drive not ready, high byte 0x40
         // = seek failed, per the DOS error-byte convention).
@@ -3831,6 +3863,7 @@ impl Machine {
                 0x02,
                 write,
                 izarravm_dos::CriticalErrorArea::Data,
+                izarravm_dos::FarPtr::default(),
                 0x4002,
             );
             return;
@@ -3841,6 +3874,7 @@ impl Machine {
                 0x02,
                 write,
                 izarravm_dos::CriticalErrorArea::Data,
+                izarravm_dos::FarPtr::default(),
                 0x4002,
             );
             return;
@@ -3873,6 +3907,7 @@ impl Machine {
                         0x08,
                         true,
                         izarravm_dos::CriticalErrorArea::Data,
+                        izarravm_dos::FarPtr::default(),
                         0x4008,
                     );
                     return;
@@ -3891,6 +3926,7 @@ impl Machine {
                             0x08,
                             false,
                             izarravm_dos::CriticalErrorArea::Data,
+                            izarravm_dos::FarPtr::default(),
                             0x4008,
                         );
                         return;
@@ -5120,6 +5156,68 @@ impl Machine {
         self.cpu.registers = saved_regs;
         self.cpu.halted = saved_halted;
         outcome
+    }
+
+    fn block_device_transfer_outcome(
+        &mut self,
+        target: izarravm_dos::BlockDeviceIoTarget,
+        write: bool,
+        transfer: izarravm_dos::FarPtr,
+        count: u16,
+        start_lba: u16,
+    ) -> Result<(), u8> {
+        let fallback_error = block_device_error_code(write, 0);
+        if self.in_device_call {
+            return Err(fallback_error);
+        }
+        self.in_device_call = true;
+        let r = self.service_block_device_transfer(target, write, transfer, count, start_lba);
+        self.in_device_call = false;
+        match r {
+            Ok(None) => Ok(()),
+            Ok(Some(code)) => Err(code),
+            Err(_) => Err(fallback_error),
+        }
+    }
+
+    fn service_block_device_transfer(
+        &mut self,
+        target: izarravm_dos::BlockDeviceIoTarget,
+        write: bool,
+        transfer: izarravm_dos::FarPtr,
+        count: u16,
+        start_lba: u16,
+    ) -> Result<Option<u8>, MachineError> {
+        let req = DEVICE_REQUEST_SCRATCH;
+        let command = if write { 0x08 } else { 0x04 };
+        for i in 0..0x1a {
+            self.memory.write_u8(req + i, 0)?;
+        }
+        self.memory.write_u8(req, 0x1a)?;
+        self.memory.write_u8(req + 0x01, target.unit)?;
+        self.memory.write_u8(req + 0x02, command)?;
+        self.memory.write_u16(req + 0x03, 0)?;
+        self.memory.write_u8(req + 0x0d, target.media)?;
+        self.memory.write_u16(req + 0x0e, transfer.offset)?;
+        self.memory.write_u16(req + 0x10, transfer.segment)?;
+        self.memory.write_u16(req + 0x12, count)?;
+        self.memory.write_u16(req + 0x14, start_lba)?;
+        self.memory.write_u16(req + 0x16, 0)?;
+
+        let header_lin =
+            usize::from(target.header.segment) * 16 + usize::from(target.header.offset);
+        let strat_off = self.memory.read_u16(header_lin + 6)?;
+        let int_off = self.memory.read_u16(header_lin + 8)?;
+        let req_ptr = ((req >> 4) as u16, 0u16);
+        let _ = self.call_driver_request((target.header.segment, strat_off), req_ptr)?;
+        let _ = self.call_driver_request((target.header.segment, int_off), req_ptr)?;
+
+        let status = self.memory.read_u16(req + 0x03)?;
+        if status & 0x0100 != 0 && status & 0x8000 == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(block_device_error_code(write, status)))
+        }
     }
 
     /// Run a CallDevice action with the re-entrancy guard, returning Ok(count) on
@@ -17078,6 +17176,626 @@ mod tests {
         img
     }
 
+    const BLOCK_IO_LAST_COMMAND_OFF: usize = 0x00d7;
+    const BLOCK_IO_LAST_UNIT_OFF: usize = 0x00d8;
+    const BLOCK_IO_LAST_MEDIA_OFF: usize = 0x00d9;
+    const BLOCK_IO_LAST_COUNT_OFF: usize = 0x00da;
+    const BLOCK_IO_LAST_SECTOR_OFF: usize = 0x00dc;
+    const BLOCK_IO_WRITE_MARKER_OFF: usize = 0x00de;
+    const BLOCK_IO_READ_STATUS_OFF: usize = 0x009d;
+    const BLOCK_IO_WRITE_STATUS_OFF: usize = 0x00b9;
+    const BLOCK_IO_INIT_UNITS_IMM_OFF: usize = 0x0048;
+    const BLOCK_IO_INIT_BPB_ARRAY_IMM_OFF: usize = 0x0059;
+    const BLOCK_IO_DEFAULT_BPB_OFF: usize = 0x00f0;
+
+    fn block_io_bpb(media: u8) -> [u8; 0x19] {
+        let mut bpb = [0u8; 0x19];
+        bpb[0..2].copy_from_slice(&512u16.to_le_bytes());
+        bpb[2] = 1;
+        bpb[3..5].copy_from_slice(&1u16.to_le_bytes());
+        bpb[5] = 2;
+        bpb[6..8].copy_from_slice(&224u16.to_le_bytes());
+        bpb[8..10].copy_from_slice(&1440u16.to_le_bytes());
+        bpb[10] = media;
+        bpb[11..13].copy_from_slice(&9u16.to_le_bytes());
+        bpb[13..15].copy_from_slice(&18u16.to_le_bytes());
+        bpb[15..17].copy_from_slice(&2u16.to_le_bytes());
+        bpb
+    }
+
+    fn block_io_sys_image(read_status: u16, write_status: u16) -> Vec<u8> {
+        let mut img = vec![0u8; 0x0309];
+        img[0..4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        img[4..6].copy_from_slice(&0x0000u16.to_le_bytes());
+        img[6..8].copy_from_slice(&0x0012u16.to_le_bytes());
+        img[8..10].copy_from_slice(&0x001du16.to_le_bytes());
+        img[10..18].copy_from_slice(b"BLKDRV  ");
+        img[0x12..0x1d].copy_from_slice(&[
+            0x2e, 0x89, 0x1e, 0xd3, 0x00, 0x2e, 0x8c, 0x06, 0xd5, 0x00, 0xcb,
+        ]);
+        img[0x1d..0xd3].copy_from_slice(&[
+            0x50, 0x53, 0x51, 0x52, 0x56, 0x57, 0x1e, 0x06, 0x2e, 0xc4, 0x1e, 0xd3, 0x00, 0x26,
+            0x8a, 0x47, 0x02, 0x2e, 0xa2, 0xd7, 0x00, 0x3c, 0x00, 0x74, 0x0e, 0x3c, 0x04, 0x74,
+            0x4b, 0x3c, 0x08, 0x74, 0x63, 0xb8, 0x01, 0x81, 0xe9, 0x82, 0x00, 0x26, 0xc6, 0x47,
+            0x0d, 0x01, 0x26, 0xc7, 0x47, 0x0e, 0x09, 0x03, 0x0e, 0x58, 0x26, 0x89, 0x47, 0x10,
+            0x26, 0xc7, 0x47, 0x12, 0xee, 0x00, 0x26, 0x89, 0x47, 0x14, 0xb8, 0x00, 0x01, 0xeb,
+            0x62, 0x26, 0x8a, 0x47, 0x01, 0x2e, 0xa2, 0xd8, 0x00, 0x26, 0x8a, 0x47, 0x0d, 0x2e,
+            0xa2, 0xd9, 0x00, 0x26, 0x8b, 0x47, 0x12, 0x2e, 0xa3, 0xda, 0x00, 0x26, 0x8b, 0x47,
+            0x14, 0x2e, 0xa3, 0xdc, 0x00, 0xc3, 0xe8, 0xdc, 0xff, 0x26, 0x8b, 0x7f, 0x0e, 0x26,
+            0x8b, 0x47, 0x10, 0x0e, 0x1f, 0x8e, 0xc0, 0xbe, 0x09, 0x01, 0xb9, 0x00, 0x02, 0xf3,
+            0xa4, 0xb8, 0x00, 0x01, 0xeb, 0x1a, 0xe8, 0xc0, 0xff, 0x26, 0x8b, 0x77, 0x0e, 0x26,
+            0x8b, 0x47, 0x10, 0x8e, 0xd8, 0x0e, 0x07, 0xbf, 0xde, 0x00, 0xb9, 0x10, 0x00, 0xf3,
+            0xa4, 0xb8, 0x00, 0x01, 0x2e, 0xc4, 0x1e, 0xd3, 0x00, 0x26, 0xc7, 0x47, 0x12, 0x01,
+            0x00, 0x26, 0x89, 0x47, 0x03, 0x07, 0x1f, 0x5f, 0x5e, 0x5a, 0x59, 0x5b, 0x58, 0xcb,
+        ]);
+        img[BLOCK_IO_READ_STATUS_OFF..BLOCK_IO_READ_STATUS_OFF + 2]
+            .copy_from_slice(&read_status.to_le_bytes());
+        img[BLOCK_IO_WRITE_STATUS_OFF..BLOCK_IO_WRITE_STATUS_OFF + 2]
+            .copy_from_slice(&write_status.to_le_bytes());
+        img[0x00ee..0x00f0].copy_from_slice(&(BLOCK_IO_DEFAULT_BPB_OFF as u16).to_le_bytes());
+        img[BLOCK_IO_DEFAULT_BPB_OFF..0x0109].copy_from_slice(&block_io_bpb(0xf9));
+        img[0x0109..0x0309].fill(0x5a);
+        img
+    }
+
+    fn block_io_sys_image_two_units() -> Vec<u8> {
+        let mut img = block_io_sys_image(0x0100, 0x0100);
+        let array_off = 0x0309usize;
+        let second_bpb_off = 0x0320usize;
+        img[BLOCK_IO_INIT_UNITS_IMM_OFF] = 2;
+        img[BLOCK_IO_INIT_BPB_ARRAY_IMM_OFF..BLOCK_IO_INIT_BPB_ARRAY_IMM_OFF + 2]
+            .copy_from_slice(&(array_off as u16).to_le_bytes());
+        img.resize(second_bpb_off + 0x19, 0);
+        img[array_off..array_off + 2]
+            .copy_from_slice(&(BLOCK_IO_DEFAULT_BPB_OFF as u16).to_le_bytes());
+        img[array_off + 2..array_off + 4].copy_from_slice(&(second_bpb_off as u16).to_le_bytes());
+        img[second_bpb_off..second_bpb_off + 0x19].copy_from_slice(&block_io_bpb(0xfa));
+        img
+    }
+
+    fn block_io_sys_image_invalid_bpb() -> Vec<u8> {
+        let mut img = block_io_sys_image(0x0100, 0x0100);
+        img[BLOCK_IO_DEFAULT_BPB_OFF..BLOCK_IO_DEFAULT_BPB_OFF + 2]
+            .copy_from_slice(&0u16.to_le_bytes());
+        img
+    }
+
+    fn stage_block_io_driver(m: &mut Machine, image: Vec<u8>) -> izarravm_dos::FarPtr {
+        m.dos.init_program(0x0100, 0x1100, &mut m.memory).unwrap();
+        m.memory.write_u8(SYSINIT_HALT_STUB, 0xf4).unwrap();
+        let staged = m
+            .dos
+            .stage_sys_driver(
+                &image,
+                "",
+                izarravm_dos::DriverLoadPlacement::Low,
+                &mut m.memory,
+            )
+            .unwrap();
+        let _ = m.call_driver_request(staged.strategy, staged.request_ptr);
+        assert!(
+            m.call_driver_request(staged.interrupt, staged.request_ptr)
+                .unwrap()
+        );
+        m.dos.finalize_sys_driver(&staged, &mut m.memory).unwrap();
+        izarravm_dos::FarPtr {
+            segment: staged.driver_seg,
+            offset: 0,
+        }
+    }
+
+    fn set_block_int_regs(
+        m: &mut Machine,
+        drive: u8,
+        count: u16,
+        sector: u16,
+        transfer: izarravm_dos::FarPtr,
+    ) {
+        prime_dos_int_frame(m);
+        m.cpu.registers.set_eax(u32::from(drive));
+        m.cpu.registers.set_ecx(u32::from(count));
+        m.cpu.registers.set_edx(u32::from(sector));
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(transfer.segment));
+        m.cpu.registers.set_ebx(u32::from(transfer.offset));
+    }
+
+    fn block_driver_extended_error(m: &mut Machine) -> u16 {
+        let mut regs = izarravm_dos::DosRegs {
+            ax: 0x5900,
+            ..izarravm_dos::DosRegs::default()
+        };
+        m.dos.dispatch(0x21, &mut regs, &mut m.memory).unwrap();
+        regs.ax
+    }
+
+    fn install_recording_int24_handler(m: &mut Machine, segment: u16) -> usize {
+        let base = usize::from(segment) * 16;
+        let code = [
+            0x2e, 0xa3, 0x20, 0x00, // mov cs:[0020],ax
+            0x89, 0xe8, 0x2e, 0xa3, 0x22, 0x00, // mov ax,bp; mov cs:[0022],ax
+            0x89, 0xf0, 0x2e, 0xa3, 0x24, 0x00, // mov ax,si; mov cs:[0024],ax
+            0x89, 0xf8, 0x2e, 0xa3, 0x26, 0x00, // mov ax,di; mov cs:[0026],ax
+            0xb0, 0x03, 0xcf, // mov al,3; iret
+        ];
+        for (i, &byte) in code.iter().enumerate() {
+            m.memory.write_u8(base + i, byte).unwrap();
+        }
+        m.memory.write_u16(0x24 * 4, 0).unwrap();
+        m.memory.write_u16(0x24 * 4 + 2, segment).unwrap();
+        base
+    }
+
+    #[test]
+    fn block_driver_int25_routes_loaded_unit_zero_read() {
+        let mut machine = test_machine();
+        let header = stage_block_io_driver(&mut machine, block_io_sys_image(0x0100, 0x0100));
+        let header_linear = usize::from(header.segment) * 16;
+        let buffer = 0x3000 * 16 + 0x0200;
+        for i in 0..512 {
+            machine.memory.write_u8(buffer + i, 0).unwrap();
+        }
+
+        set_block_int_regs(
+            &mut machine,
+            3,
+            1,
+            0,
+            izarravm_dos::FarPtr {
+                segment: 0x3000,
+                offset: 0x0200,
+            },
+        );
+
+        machine.handle_int25();
+
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "INT 25h returns CF clear");
+        assert_eq!(machine.cpu.registers.eax() as u16, 0);
+        assert_eq!(
+            (0..16)
+                .map(|i| machine.memory.read_u8(buffer + i).unwrap())
+                .collect::<Vec<_>>(),
+            vec![0x5a; 16]
+        );
+        assert_eq!(
+            machine
+                .memory
+                .read_u8(header_linear + BLOCK_IO_LAST_COMMAND_OFF)
+                .unwrap(),
+            0x04
+        );
+        assert_eq!(
+            machine
+                .memory
+                .read_u8(header_linear + BLOCK_IO_LAST_UNIT_OFF)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            machine
+                .memory
+                .read_u8(header_linear + BLOCK_IO_LAST_MEDIA_OFF)
+                .unwrap(),
+            0xf9
+        );
+        assert_eq!(
+            machine
+                .memory
+                .read_u16(header_linear + BLOCK_IO_LAST_COUNT_OFF)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            machine
+                .memory
+                .read_u16(header_linear + BLOCK_IO_LAST_SECTOR_OFF)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn block_driver_int26_routes_loaded_unit_one_write() {
+        let mut machine = test_machine();
+        let header = stage_block_io_driver(&mut machine, block_io_sys_image_two_units());
+        let header_linear = usize::from(header.segment) * 16;
+        let buffer = 0x3100 * 16 + 0x0010;
+        let written = (0..16).map(|i| 0xa0 + i).collect::<Vec<_>>();
+        for (i, &byte) in written.iter().enumerate() {
+            machine.memory.write_u8(buffer + i, byte).unwrap();
+        }
+
+        set_block_int_regs(
+            &mut machine,
+            4,
+            2,
+            7,
+            izarravm_dos::FarPtr {
+                segment: 0x3100,
+                offset: 0x0010,
+            },
+        );
+        machine.handle_int26();
+
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "INT 26h returns CF clear");
+        assert_eq!(machine.cpu.registers.eax() as u16, 0);
+        assert_eq!(
+            machine
+                .memory
+                .read_u8(header_linear + BLOCK_IO_LAST_COMMAND_OFF)
+                .unwrap(),
+            0x08
+        );
+        assert_eq!(
+            machine
+                .memory
+                .read_u8(header_linear + BLOCK_IO_LAST_UNIT_OFF)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            machine
+                .memory
+                .read_u8(header_linear + BLOCK_IO_LAST_MEDIA_OFF)
+                .unwrap(),
+            0xfa
+        );
+        assert_eq!(
+            machine
+                .memory
+                .read_u16(header_linear + BLOCK_IO_LAST_COUNT_OFF)
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            machine
+                .memory
+                .read_u16(header_linear + BLOCK_IO_LAST_SECTOR_OFF)
+                .unwrap(),
+            7
+        );
+        assert_eq!(
+            (0..16)
+                .map(|i| {
+                    machine
+                        .memory
+                        .read_u8(header_linear + BLOCK_IO_WRITE_MARKER_OFF + i)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>(),
+            written
+        );
+    }
+
+    #[test]
+    fn block_driver_int25_zero_count_still_routes() {
+        let mut machine = test_machine();
+        let header = stage_block_io_driver(&mut machine, block_io_sys_image(0x0100, 0x0100));
+        let header_linear = usize::from(header.segment) * 16;
+
+        set_block_int_regs(
+            &mut machine,
+            3,
+            0,
+            9,
+            izarravm_dos::FarPtr {
+                segment: 0x3200,
+                offset: 0x0000,
+            },
+        );
+        machine.handle_int25();
+
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "zero-count read succeeds");
+        assert_eq!(
+            machine
+                .memory
+                .read_u8(header_linear + BLOCK_IO_LAST_COMMAND_OFF)
+                .unwrap(),
+            0x04
+        );
+        assert_eq!(
+            machine
+                .memory
+                .read_u16(header_linear + BLOCK_IO_LAST_COUNT_OFF)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            machine
+                .memory
+                .read_u16(header_linear + BLOCK_IO_LAST_SECTOR_OFF)
+                .unwrap(),
+            9
+        );
+    }
+
+    fn arm_critical_error_return_halt(m: &mut Machine) {
+        m.memory.write_u8(0x0700, 0xf4).unwrap();
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Cs, SegmentRegister::real(0));
+        m.cpu.registers.eip = 0x0700;
+    }
+
+    fn run_pending_critical_error_to_fail(m: &mut Machine) -> StopReason {
+        m.run_until_halt_or_cycles(20_000).unwrap()
+    }
+
+    #[test]
+    fn block_driver_int25_error_calls_int24_with_block_header_and_raw_code() {
+        let mut machine = test_machine();
+        let header = stage_block_io_driver(&mut machine, block_io_sys_image(0x8105, 0x0100));
+        let handler_base = install_recording_int24_handler(&mut machine, 0x0800);
+        set_block_int_regs(
+            &mut machine,
+            3,
+            1,
+            0,
+            izarravm_dos::FarPtr {
+                segment: 0x3300,
+                offset: 0,
+            },
+        );
+
+        arm_critical_error_return_halt(&mut machine);
+        machine.handle_int25();
+        assert_eq!(
+            run_pending_critical_error_to_fail(&mut machine),
+            StopReason::Halted
+        );
+
+        assert_eq!(dos_int_flags(&machine) & 1, 1, "INT 25h failure sets CF");
+        assert_eq!(machine.cpu.registers.eax() as u16, 0x0005);
+        assert_eq!(
+            machine.memory.read_u16(handler_base + 0x20).unwrap(),
+            0x3e03
+        );
+        assert_eq!(
+            machine.memory.read_u16(handler_base + 0x22).unwrap(),
+            header.segment
+        );
+        assert_eq!(
+            machine.memory.read_u16(handler_base + 0x24).unwrap(),
+            header.offset
+        );
+        assert_eq!(
+            machine.memory.read_u16(handler_base + 0x26).unwrap(),
+            0x0005
+        );
+        assert_eq!(block_driver_extended_error(&mut machine), 0x0018);
+    }
+
+    #[test]
+    fn block_driver_missing_done_falls_back_to_raw_read_write_codes() {
+        let mut read_machine = test_machine();
+        stage_block_io_driver(&mut read_machine, block_io_sys_image(0x0000, 0x0000));
+        let read_handler = install_recording_int24_handler(&mut read_machine, 0x0800);
+        set_block_int_regs(
+            &mut read_machine,
+            3,
+            1,
+            0,
+            izarravm_dos::FarPtr {
+                segment: 0x3400,
+                offset: 0,
+            },
+        );
+        arm_critical_error_return_halt(&mut read_machine);
+        read_machine.handle_int25();
+        assert_eq!(
+            run_pending_critical_error_to_fail(&mut read_machine),
+            StopReason::Halted
+        );
+        assert_eq!(read_machine.cpu.registers.eax() as u16, 0x000b);
+        assert_eq!(
+            read_machine.memory.read_u16(read_handler + 0x26).unwrap(),
+            0x000b
+        );
+
+        let mut write_machine = test_machine();
+        stage_block_io_driver(&mut write_machine, block_io_sys_image(0x0000, 0x0000));
+        let write_handler = install_recording_int24_handler(&mut write_machine, 0x0800);
+        set_block_int_regs(
+            &mut write_machine,
+            3,
+            1,
+            0,
+            izarravm_dos::FarPtr {
+                segment: 0x3500,
+                offset: 0,
+            },
+        );
+        arm_critical_error_return_halt(&mut write_machine);
+        write_machine.handle_int26();
+        assert_eq!(
+            run_pending_critical_error_to_fail(&mut write_machine),
+            StopReason::Halted
+        );
+        assert_eq!(write_machine.cpu.registers.eax() as u16, 0x000a);
+        assert_eq!(
+            write_machine.memory.read_u16(write_handler + 0x26).unwrap(),
+            0x000a
+        );
+    }
+
+    #[test]
+    fn block_driver_malformed_error_without_done_keeps_raw_status_code() {
+        let mut machine = test_machine();
+        stage_block_io_driver(&mut machine, block_io_sys_image(0x8005, 0x0100));
+        let handler_base = install_recording_int24_handler(&mut machine, 0x0800);
+        set_block_int_regs(
+            &mut machine,
+            3,
+            1,
+            0,
+            izarravm_dos::FarPtr {
+                segment: 0x3600,
+                offset: 0,
+            },
+        );
+
+        arm_critical_error_return_halt(&mut machine);
+        machine.handle_int25();
+        assert_eq!(
+            run_pending_critical_error_to_fail(&mut machine),
+            StopReason::Halted
+        );
+
+        assert_eq!(machine.cpu.registers.eax() as u16, 0x0005);
+        assert_eq!(
+            machine.memory.read_u16(handler_base + 0x26).unwrap(),
+            0x0005
+        );
+    }
+
+    #[test]
+    fn block_driver_packet_form_and_invalid_bpb_do_not_route_to_driver() {
+        let mut packet_machine = test_machine();
+        let packet_header =
+            stage_block_io_driver(&mut packet_machine, block_io_sys_image(0x0100, 0x0100));
+        let packet_header_linear = usize::from(packet_header.segment) * 16;
+        packet_machine
+            .memory
+            .write_u8(packet_header_linear + BLOCK_IO_LAST_COMMAND_OFF, 0xee)
+            .unwrap();
+        set_block_int_regs(
+            &mut packet_machine,
+            3,
+            0xffff,
+            0,
+            izarravm_dos::FarPtr {
+                segment: 0x3700,
+                offset: 0,
+            },
+        );
+
+        packet_machine.handle_int25();
+
+        assert_eq!(
+            packet_machine
+                .memory
+                .read_u8(packet_header_linear + BLOCK_IO_LAST_COMMAND_OFF)
+                .unwrap(),
+            0xee
+        );
+
+        let mut invalid_machine = test_machine();
+        let invalid_header =
+            stage_block_io_driver(&mut invalid_machine, block_io_sys_image_invalid_bpb());
+        let invalid_header_linear = usize::from(invalid_header.segment) * 16;
+        invalid_machine
+            .memory
+            .write_u8(invalid_header_linear + BLOCK_IO_LAST_COMMAND_OFF, 0xdd)
+            .unwrap();
+        assert!(invalid_machine.dos.block_device_io_target(3).is_none());
+        set_block_int_regs(
+            &mut invalid_machine,
+            3,
+            1,
+            0,
+            izarravm_dos::FarPtr {
+                segment: 0x3800,
+                offset: 0,
+            },
+        );
+
+        invalid_machine.handle_int25();
+
+        assert_eq!(
+            invalid_machine
+                .memory
+                .read_u8(invalid_header_linear + BLOCK_IO_LAST_COMMAND_OFF)
+                .unwrap(),
+            0xdd
+        );
+    }
+
+    #[test]
+    fn block_driver_lastdrive_clipped_assignment_still_routes() {
+        let mut machine = test_machine();
+        machine.dos.set_lastdrive(3);
+        let header = stage_block_io_driver(&mut machine, block_io_sys_image(0x0100, 0x0100));
+        let header_linear = usize::from(header.segment) * 16;
+        assert!(machine.dos.block_device_io_target(3).is_some());
+
+        set_block_int_regs(
+            &mut machine,
+            3,
+            1,
+            4,
+            izarravm_dos::FarPtr {
+                segment: 0x3900,
+                offset: 0,
+            },
+        );
+        machine.handle_int25();
+
+        assert_eq!(
+            dos_int_flags(&machine) & 1,
+            0,
+            "LASTDRIVE-clipped D: routes"
+        );
+        assert_eq!(
+            machine
+                .memory
+                .read_u8(header_linear + BLOCK_IO_LAST_COMMAND_OFF)
+                .unwrap(),
+            0x04
+        );
+        assert_eq!(
+            machine
+                .memory
+                .read_u16(header_linear + BLOCK_IO_LAST_SECTOR_OFF)
+                .unwrap(),
+            4
+        );
+    }
+
+    #[test]
+    fn block_driver_reentrant_transfer_guard_fails_without_calling_driver() {
+        let mut machine = test_machine();
+        let header = stage_block_io_driver(&mut machine, block_io_sys_image(0x0100, 0x0100));
+        let header_linear = usize::from(header.segment) * 16;
+        machine
+            .memory
+            .write_u8(header_linear + BLOCK_IO_LAST_COMMAND_OFF, 0xcc)
+            .unwrap();
+        let handler_base = install_recording_int24_handler(&mut machine, 0x0800);
+        set_block_int_regs(
+            &mut machine,
+            3,
+            1,
+            0,
+            izarravm_dos::FarPtr {
+                segment: 0x3a00,
+                offset: 0,
+            },
+        );
+
+        arm_critical_error_return_halt(&mut machine);
+        machine.in_device_call = true;
+        machine.handle_int25();
+        machine.in_device_call = false;
+        assert_eq!(
+            run_pending_critical_error_to_fail(&mut machine),
+            StopReason::Halted
+        );
+
+        assert_eq!(machine.cpu.registers.eax() as u16, 0x000b);
+        assert_eq!(
+            machine.memory.read_u16(handler_base + 0x26).unwrap(),
+            0x000b
+        );
+        assert_eq!(
+            machine
+                .memory
+                .read_u8(header_linear + BLOCK_IO_LAST_COMMAND_OFF)
+                .unwrap(),
+            0xcc
+        );
+    }
+
     #[test]
     fn config_sys_block_device_assigns_d_drive_and_dpb() {
         let dir = tempfile::tempdir().unwrap();
@@ -17141,6 +17859,7 @@ mod tests {
             "block driver is not a character-device open target"
         );
 
+        prime_dos_int_frame(&mut machine);
         machine.cpu.registers.set_eax(0x0003);
         machine.cpu.registers.set_ecx(0x0001);
         machine.cpu.registers.set_edx(0);
@@ -17150,18 +17869,22 @@ mod tests {
             .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x2000));
         machine.cpu.registers.set_ebx(0x0100);
         machine.handle_int25();
-        assert_ne!(
+        assert_eq!(
             machine.cpu.registers.eax() as u16,
             0,
-            "D: absolute read is deferred"
+            "D: absolute read routes through the loaded block driver"
         );
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "D: read clears CF");
+
+        prime_dos_int_frame(&mut machine);
         machine.cpu.registers.set_eax(0x0003);
         machine.handle_int26();
-        assert_ne!(
+        assert_eq!(
             machine.cpu.registers.eax() as u16,
             0,
-            "D: absolute write is deferred"
+            "D: absolute write routes through the loaded block driver"
         );
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "D: write clears CF");
 
         machine.cpu.registers.set_eax(0x1500);
         assert!(machine.handle_int2f());
