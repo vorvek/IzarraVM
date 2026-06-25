@@ -16,8 +16,9 @@ pub use driver::{
 };
 
 use memory::{
-    ARENA_TOP, Arena, ResizeError, SDA_ALWAYS_SWAPPED_LEN, SDA_IN_DOS_SWAPPED_LEN,
-    SdaCriticalError, SdaSnapshot, SftHostFileEntry, UmbArena, allocate_strategy, free_routed,
+    ARENA_TOP, Arena, BLOCK_BPB_LEN, BlockDeviceBpb, BlockDeviceDpbEntry, ResizeError,
+    SDA_ALWAYS_SWAPPED_LEN, SDA_IN_DOS_SWAPPED_LEN, SdaCriticalError, SdaSnapshot,
+    SftHostFileEntry, SysvarsDevices, UmbArena, allocate_strategy, free_routed,
     free_umb_blocks_owned_by, is_valid_alloc_strategy, mcb_chain_is_complete, release_umb,
     request_umb, resize_routed, resize_umb, set_umb_owner, set_umb_region, stamp_mcb_owner,
     write_child_program_mcb, write_env_mcb, write_free_mcb_to_cap, write_sda, write_sysvars,
@@ -147,6 +148,9 @@ const DEFAULT_AUTOEXEC_BAT: &str = "@ECHO OFF\r\nPATH=C:\\DOS\r\nPROMPT=$P$G\r\n
 
 const DEFAULT_FILE_COUNT: u16 = 40;
 const DEFAULT_BUFFER_COUNT: u16 = 20;
+const DEFAULT_LASTDRIVE_COUNT: u8 = 5;
+const FIRST_LOADED_BLOCK_DRIVE: u8 = 3;
+const MAX_DOS_DRIVE: u8 = 25;
 
 /// The default CONFIG.SYS: the directives a period DOS carries. The HIMEM.SYS
 /// and IEMM.EXE RAM lines select the IEMM RAM mode (UMBs plus the EMS page
@@ -291,6 +295,8 @@ pub enum DosError {
     ExeNotEnoughMemory { needed: u32, available: u32 },
     #[error("not enough conventional memory for the environment segment")]
     EnvSegmentFull,
+    #[error("DOS system data layout does not fit below the first MCB")]
+    SystemLayoutTooSmall,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -774,6 +780,14 @@ struct ProgramContext {
 pub struct StagedDriver {
     /// Image base; the device header is at driver_seg:0.
     pub driver_seg: u16,
+    /// Start segment of the staged allocation that owns the image and INIT scratch.
+    pub allocation_seg: u16,
+    /// Paragraphs allocated for the image plus INIT scratch before final trim.
+    pub allocation_paras: u16,
+    /// Whether the raw device header is a block driver rather than a character device.
+    pub is_block_device: bool,
+    /// DOS-assigned first drive byte written into the INIT request.
+    pub first_drive: u8,
     /// (segment, offset) entry for the strategy routine.
     pub strategy: (u16, u16),
     /// (segment, offset) entry for the interrupt routine.
@@ -782,6 +796,21 @@ pub struct StagedDriver {
     pub request_linear: usize,
     /// (segment, offset) far pointer to the INIT request header.
     pub request_ptr: (u16, u16),
+}
+
+#[derive(Debug, Clone)]
+struct LoadedBlockDevice {
+    header: (u16, u16),
+    first_drive: u8,
+    installed_units: u8,
+    bpbs_by_unit: Vec<Option<BlockDeviceBpb>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockDeviceIoTarget {
+    pub header: FarPtr,
+    pub unit: u8,
+    pub media: u8,
 }
 
 /// Where SYSINIT should try to place a raw CONFIG.SYS driver image.
@@ -800,6 +829,8 @@ pub enum DriverStageError {
     Load(DriverLoadError),
     /// No resident block large enough for the image plus its scratch paragraph.
     OutOfMemory,
+    /// A block driver requested a first drive after Z:.
+    NoBlockDriveLetters,
     /// A guest memory fault while copying the image or building the request.
     Memory(DosError),
 }
@@ -898,6 +929,9 @@ pub struct DosKernel {
     // after NUL). write_sysvars rebuilds the device-chain skeleton on every AH=52h
     // query, so these are re-spliced after NUL each time to survive the rebuild.
     loaded_devices: Vec<(u16, u16)>,
+    // Loaded block devices in CONFIG.SYS load order. Drive-letter assignment uses
+    // their installed unit spans even when a unit's BPB is invalid and unpublished.
+    loaded_block_devices: Vec<LoadedBlockDevice>,
     // Handles a guest has opened on a loaded CHARACTER device by name (AH=3Dh), so
     // AH=3Fh read, AH=40h write, AH=44h IOCTL, and AH=3Eh close route to the driver
     // rather than a host file. Parallel to ems_handles: inherited by an EXEC child,
@@ -990,6 +1024,12 @@ impl DosKernel {
         mem: &mut Memory,
     ) -> Result<StagedDriver, DriverStageError> {
         let info = parse_device_header(image).map_err(DriverStageError::Load)?;
+        let first_drive = if info.is_block_device() {
+            self.next_block_device_drive()
+                .ok_or(DriverStageError::NoBlockDriveLetters)?
+        } else {
+            0
+        };
         let image_paras = u16::try_from((image.len() as u32).div_ceil(16))
             .map_err(|_| DriverStageError::OutOfMemory)?;
         // Spare paragraphs above the image for the request header (the arg tail
@@ -1030,9 +1070,19 @@ impl DosKernel {
         }
         mem.write_u8(arg_linear + args.len(), 0x0d)?; // CR-terminate the tail
         let break_default = (seg, image_paras.wrapping_mul(16)); // end of image
-        build_init_request(mem, request_linear, break_default, (request_seg, arg_off))?;
+        build_init_request(
+            mem,
+            request_linear,
+            break_default,
+            (request_seg, arg_off),
+            first_drive,
+        )?;
         Ok(StagedDriver {
             driver_seg: seg,
+            allocation_seg: seg,
+            allocation_paras: total_paras,
+            is_block_device: info.is_block_device(),
+            first_drive,
             strategy: (seg, info.strategy),
             interrupt: (seg, info.interrupt),
             request_linear,
@@ -1048,6 +1098,11 @@ impl DosKernel {
         mem: &mut Memory,
     ) -> Result<(), DosError> {
         let result = read_init_result(mem, staged.request_linear)?;
+        let loaded_block = if staged.is_block_device {
+            Some(self.capture_loaded_block_device(staged, mem)?)
+        } else {
+            None
+        };
         // Break address in paragraphs above the block base. The break offset rounds
         // up to a paragraph. The resident block must keep at least the device header
         // (0x12 bytes), so the free-tail MCB the trim writes never lands inside it.
@@ -1061,6 +1116,11 @@ impl DosKernel {
         // Front-insert so the most-recently-loaded driver sits nearest NUL, the way
         // real DOS links each new driver in right after the NUL header.
         self.loaded_devices.insert(0, (staged.driver_seg, 0x0000));
+        if let Some(loaded_block) = loaded_block {
+            if loaded_block.installed_units != 0 {
+                self.loaded_block_devices.push(loaded_block);
+            }
+        }
         Ok(())
     }
 
@@ -1201,6 +1261,107 @@ impl DosKernel {
 
     pub fn file_count(&self) -> u16 {
         self.file_count.unwrap_or(DEFAULT_FILE_COUNT)
+    }
+
+    pub fn next_block_device_drive(&self) -> Option<u8> {
+        let used: u16 = self
+            .loaded_block_devices
+            .iter()
+            .map(|device| u16::from(device.installed_units))
+            .sum();
+        let next = u16::from(FIRST_LOADED_BLOCK_DRIVE).checked_add(used)?;
+        u8::try_from(next)
+            .ok()
+            .filter(|drive| *drive <= MAX_DOS_DRIVE)
+    }
+
+    pub fn block_device_io_target(&self, drive: u8) -> Option<BlockDeviceIoTarget> {
+        for device in &self.loaded_block_devices {
+            if drive < device.first_drive {
+                continue;
+            }
+            let unit = drive - device.first_drive;
+            if unit >= device.installed_units {
+                continue;
+            }
+            let bpb = device.bpbs_by_unit.get(usize::from(unit))?.as_ref()?;
+            return Some(BlockDeviceIoTarget {
+                header: FarPtr {
+                    segment: device.header.0,
+                    offset: device.header.1,
+                },
+                unit,
+                media: bpb.media,
+            });
+        }
+        None
+    }
+
+    fn published_block_dpbs(&self) -> Vec<BlockDeviceDpbEntry> {
+        let mut entries = Vec::new();
+        let published_drive_count = self.lastdrive.unwrap_or(DEFAULT_LASTDRIVE_COUNT).min(26);
+        for device in &self.loaded_block_devices {
+            for (unit, bpb) in device.bpbs_by_unit.iter().enumerate() {
+                let Some(bpb) = bpb else { continue };
+                let Some(drive) = device.first_drive.checked_add(unit as u8) else {
+                    continue;
+                };
+                if drive >= published_drive_count {
+                    continue;
+                }
+                entries.push(BlockDeviceDpbEntry {
+                    drive,
+                    unit: unit as u8,
+                    header: device.header,
+                    bpb: *bpb,
+                });
+            }
+        }
+        entries
+    }
+
+    fn staged_allocation_contains(staged: &StagedDriver, linear: usize, len: usize) -> bool {
+        let start = usize::from(staged.allocation_seg) * 16;
+        let end = start + usize::from(staged.allocation_paras) * 16;
+        linear >= start && linear.checked_add(len).is_some_and(|after| after <= end)
+    }
+
+    fn capture_loaded_block_device(
+        &self,
+        staged: &StagedDriver,
+        mem: &Memory,
+    ) -> Result<LoadedBlockDevice, DosError> {
+        let max_units = 26u8.saturating_sub(staged.first_drive);
+        let installed_units = mem.read_u8(staged.request_linear + 0x0d)?.min(max_units);
+        let array_off = mem.read_u16(staged.request_linear + 0x12)?;
+        let array_seg = mem.read_u16(staged.request_linear + 0x14)?;
+        let array_linear = usize::from(array_seg) * 16 + usize::from(array_off);
+        let array_len = usize::from(installed_units) * 2;
+        let array_inside = Self::staged_allocation_contains(staged, array_linear, array_len);
+        let mut bpbs_by_unit = Vec::with_capacity(usize::from(installed_units));
+        for unit in 0..installed_units {
+            if !array_inside {
+                bpbs_by_unit.push(None);
+                continue;
+            }
+            let offset_word = mem.read_u16(array_linear + usize::from(unit) * 2)?;
+            let bpb_linear = usize::from(staged.driver_seg) * 16 + usize::from(offset_word);
+            if !Self::staged_allocation_contains(staged, bpb_linear, BLOCK_BPB_LEN) {
+                bpbs_by_unit.push(None);
+                continue;
+            }
+            let mut raw = [0u8; BLOCK_BPB_LEN];
+            for (i, byte) in raw.iter_mut().enumerate() {
+                *byte = mem.read_u8(bpb_linear + i)?;
+            }
+            bpbs_by_unit.push(BlockDeviceBpb::from_bytes(&raw));
+        }
+        Ok(LoadedBlockDevice {
+            header: (staged.driver_seg, 0),
+            first_drive: staged.first_drive,
+            installed_units,
+            bpbs_by_unit,
+        })
     }
 
     fn sft_host_file_entries(&mut self) -> Vec<SftHostFileEntry> {
@@ -1367,6 +1528,7 @@ impl DosKernel {
         // session's loaded-device list so the chain starts at the bare skeleton,
         // and the handles opened on them.
         self.loaded_devices.clear();
+        self.loaded_block_devices.clear();
         self.device_handles.clear();
         build_psp(mem, psp_seg, ARENA_TOP)?;
         let prog_top = psp_seg.saturating_add(0x10); // the system PSP is its 256 bytes
@@ -2798,11 +2960,13 @@ impl DosKernel {
     }
 
     fn refresh_sda(&self, mem: &mut Memory) -> Result<(u16, u16), DosError> {
+        let published_block_count = self.published_block_dpbs().len();
         write_sda(
             mem,
             self.arena.first_mcb(),
             self.lastdrive,
             self.file_count(),
+            published_block_count,
             SdaSnapshot {
                 last_error: self.last_error,
                 current_dta: self.dta,
@@ -3875,14 +4039,18 @@ impl DosKernel {
                 let lastdrive = self.lastdrive;
                 let file_count = self.file_count();
                 let host_files = self.sft_host_file_entries();
+                let block_dpbs = self.published_block_dpbs();
                 let (es, bx) = write_sysvars(
                     mem,
                     first_mcb,
                     ems_present,
                     lastdrive,
                     file_count,
-                    &host_files,
-                    &self.loaded_devices,
+                    SysvarsDevices {
+                        host_files: &host_files,
+                        block_dpbs: &block_dpbs,
+                        loaded_devices: &self.loaded_devices,
+                    },
                 )?;
                 regs.es = es;
                 regs.bx = bx;
@@ -6849,6 +7017,149 @@ mod tests {
         device_chain_names(mem)
     }
 
+    fn tests_block_image() -> Vec<u8> {
+        let mut image = driver::tests_char_image();
+        image[4..6].copy_from_slice(&0x0000u16.to_le_bytes());
+        image
+    }
+
+    fn tests_bpb_1440k() -> [u8; 0x19] {
+        tests_bpb_custom(512, 1, 2880, 0xf0)
+    }
+
+    fn tests_bpb_custom(
+        bytes_per_sector: u16,
+        sectors_per_cluster: u8,
+        total_sectors: u16,
+        media: u8,
+    ) -> [u8; 0x19] {
+        let mut bpb = [0u8; 0x19];
+        bpb[0..2].copy_from_slice(&bytes_per_sector.to_le_bytes());
+        bpb[2] = sectors_per_cluster;
+        bpb[3..5].copy_from_slice(&1u16.to_le_bytes());
+        bpb[5] = 2;
+        bpb[6..8].copy_from_slice(&224u16.to_le_bytes());
+        bpb[8..10].copy_from_slice(&total_sectors.to_le_bytes());
+        bpb[10] = media;
+        bpb[11..13].copy_from_slice(&9u16.to_le_bytes());
+        bpb[13..15].copy_from_slice(&18u16.to_le_bytes());
+        bpb[15..17].copy_from_slice(&2u16.to_le_bytes());
+        bpb
+    }
+
+    fn tests_block_image_with_bpbs(bpbs: &[(u16, [u8; 0x19])]) -> Vec<u8> {
+        let mut image = tests_block_image();
+        for &(offset, bpb) in bpbs {
+            let end = usize::from(offset) + bpb.len();
+            if image.len() < end {
+                image.resize(end, 0);
+            }
+            image[usize::from(offset)..end].copy_from_slice(&bpb);
+        }
+        image
+    }
+
+    fn tests_block_image_with_bpb(bpb_offset: u16) -> Vec<u8> {
+        tests_block_image_with_bpbs(&[(bpb_offset, tests_bpb_1440k())])
+    }
+
+    fn complete_block_init_with_offsets(
+        mem: &mut Memory,
+        staged: &StagedDriver,
+        units: u8,
+        array_offset: u16,
+        bpb_offsets: &[u16],
+    ) {
+        let base = usize::from(staged.driver_seg) * 16;
+        for (unit, offset) in bpb_offsets.iter().copied().enumerate() {
+            mem.write_u16(base + usize::from(array_offset) + unit * 2, offset)
+                .unwrap();
+        }
+        mem.write_u16(staged.request_linear + 0x03, 0x0100).unwrap();
+        mem.write_u8(staged.request_linear + 0x0d, units).unwrap();
+        mem.write_u16(staged.request_linear + 0x0e, 0x0100).unwrap();
+        mem.write_u16(staged.request_linear + 0x10, staged.driver_seg)
+            .unwrap();
+        mem.write_u16(staged.request_linear + 0x12, array_offset)
+            .unwrap();
+        mem.write_u16(staged.request_linear + 0x14, staged.driver_seg)
+            .unwrap();
+    }
+
+    fn complete_block_init_with_bpb(mem: &mut Memory, staged: &StagedDriver, bpb_offset: u16) {
+        let array_offset = 0x20;
+        complete_block_init_with_offsets(mem, staged, 1, array_offset, &[bpb_offset]);
+    }
+
+    fn ah52_sysvars_base(kernel: &mut DosKernel, mem: &mut Memory) -> usize {
+        let mut regs = DosRegs {
+            ax: 0x5200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, mem).unwrap();
+        usize::from(regs.es) * 16 + usize::from(regs.bx)
+    }
+
+    fn ah52_dpb_drives(kernel: &mut DosKernel, mem: &mut Memory) -> Vec<u8> {
+        let base = ah52_sysvars_base(kernel, mem);
+        let mut off = mem.read_u16(base).unwrap();
+        let mut seg = mem.read_u16(base + 2).unwrap();
+        let mut drives = Vec::new();
+        for _ in 0..32 {
+            if (off, seg) == (0xffff, 0xffff) {
+                break;
+            }
+            let dpb = usize::from(seg) * 16 + usize::from(off);
+            drives.push(mem.read_u8(dpb).unwrap());
+            off = mem.read_u16(dpb + 0x19).unwrap();
+            seg = mem.read_u16(dpb + 0x1b).unwrap();
+        }
+        drives
+    }
+
+    #[test]
+    fn stage_sys_driver_sets_first_loaded_block_driver_to_drive_d() {
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let mut dos = DosKernel::new();
+        dos.init_program(0x0100, 0x1100, &mut mem).unwrap();
+        let image = tests_block_image();
+
+        let staged = dos
+            .stage_sys_driver(&image, "", DriverLoadPlacement::Low, &mut mem)
+            .unwrap();
+
+        assert_eq!(
+            mem.read_u8(staged.request_linear + 0x16).unwrap(),
+            3,
+            "first loaded block device should receive D: as first-drive byte"
+        );
+    }
+
+    #[test]
+    fn stage_sys_driver_keeps_finalize_metadata_for_block_and_character_drivers() {
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        let mut dos = DosKernel::new();
+        dos.init_program(0x0100, 0x1100, &mut mem).unwrap();
+        let block_image = tests_block_image();
+        let char_image = driver::tests_char_image();
+
+        let block = dos
+            .stage_sys_driver(&block_image, "", DriverLoadPlacement::Low, &mut mem)
+            .unwrap();
+        let character = dos
+            .stage_sys_driver(&char_image, "", DriverLoadPlacement::Low, &mut mem)
+            .unwrap();
+
+        assert!(block.is_block_device);
+        assert_eq!(block.first_drive, 3);
+        assert_eq!(block.allocation_seg, block.driver_seg);
+        assert_eq!(block.allocation_paras, 5);
+        assert!(!character.is_block_device);
+        assert_eq!(character.first_drive, 0);
+        assert_eq!(character.allocation_seg, character.driver_seg);
+        assert_eq!(character.allocation_paras, 5);
+    }
+
     #[test]
     fn staging_allocates_copies_and_finalize_splices_after_nul() {
         let mut mem = Memory::new(1024 * 1024).unwrap();
@@ -7256,6 +7567,7 @@ mod tests {
         let read_chain_name = |present: bool| -> [u8; 8] {
             let mut kernel = DosKernel::new();
             let mut mem = Memory::new(1024 * 1024).unwrap();
+            kernel.init_program(0x0100, 0x1100, &mut mem).unwrap();
             kernel.set_ems_present(present);
             let mut regs = DosRegs {
                 ax: 0x5200,
@@ -9858,6 +10170,410 @@ mod tests {
             0xf000,
             "free clusters match AH=36h"
         );
+    }
+
+    #[test]
+    fn ah52_publishes_loaded_block_driver_dpb_and_cds_from_bpb() {
+        let (mut kernel, mut mem) = arena_kernel();
+        let image = tests_block_image_with_bpb(0x30);
+        let staged = kernel
+            .stage_sys_driver(&image, "", DriverLoadPlacement::Low, &mut mem)
+            .unwrap();
+        complete_block_init_with_bpb(&mut mem, &staged, 0x30);
+        kernel.finalize_sys_driver(&staged, &mut mem).unwrap();
+
+        let mut regs = DosRegs {
+            ax: 0x5200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        let base = usize::from(regs.es) * 16 + usize::from(regs.bx);
+
+        assert_eq!(
+            mem.read_u8(base + 0x20).unwrap(),
+            2,
+            "C: plus loaded D: block unit should be counted"
+        );
+        let c_dpb_off = mem.read_u16(base).unwrap();
+        let c_dpb_seg = mem.read_u16(base + 2).unwrap();
+        let c_dpb = usize::from(c_dpb_seg) * 16 + usize::from(c_dpb_off);
+        let d_dpb_off = mem.read_u16(c_dpb + 0x19).unwrap();
+        let d_dpb_seg = mem.read_u16(c_dpb + 0x1b).unwrap();
+        let d_dpb = usize::from(d_dpb_seg) * 16 + usize::from(d_dpb_off);
+
+        assert_eq!(mem.read_u8(d_dpb).unwrap(), 3, "D: DPB drive number");
+        assert_eq!(mem.read_u8(d_dpb + 0x01).unwrap(), 0, "driver unit 0");
+        assert_eq!(mem.read_u16(d_dpb + 0x02).unwrap(), 512, "bytes per sector");
+        assert_eq!(mem.read_u8(d_dpb + 0x04).unwrap(), 0, "cluster mask");
+        assert_eq!(mem.read_u8(d_dpb + 0x05).unwrap(), 0, "cluster shift");
+        assert_eq!(mem.read_u16(d_dpb + 0x06).unwrap(), 1, "first FAT sector");
+        assert_eq!(mem.read_u8(d_dpb + 0x08).unwrap(), 2, "FAT count");
+        assert_eq!(mem.read_u16(d_dpb + 0x09).unwrap(), 224, "root entries");
+        assert_eq!(mem.read_u16(d_dpb + 0x0b).unwrap(), 33, "first data sector");
+        assert_eq!(mem.read_u16(d_dpb + 0x0d).unwrap(), 2848, "highest cluster");
+        assert_eq!(mem.read_u16(d_dpb + 0x0f).unwrap(), 9, "sectors per FAT");
+        assert_eq!(mem.read_u16(d_dpb + 0x11).unwrap(), 19, "first root sector");
+        assert_eq!(
+            mem.read_u16(d_dpb + 0x13).unwrap(),
+            0,
+            "driver header offset"
+        );
+        assert_eq!(
+            mem.read_u16(d_dpb + 0x15).unwrap(),
+            staged.driver_seg,
+            "driver header segment"
+        );
+        assert_eq!(mem.read_u8(d_dpb + 0x17).unwrap(), 0xf0, "media byte");
+        assert_eq!(
+            (
+                mem.read_u16(d_dpb + 0x1b).unwrap(),
+                mem.read_u16(d_dpb + 0x19).unwrap()
+            ),
+            (0xffff, 0xffff),
+            "D: terminates the DPB chain"
+        );
+        assert_eq!(
+            mem.read_u16(d_dpb + 0x1f).unwrap(),
+            0xffff,
+            "free clusters unknown"
+        );
+
+        let cds_off = mem.read_u16(base + 0x16).unwrap();
+        let cds_seg = mem.read_u16(base + 0x18).unwrap();
+        let d_cds = usize::from(cds_seg) * 16 + usize::from(cds_off) + 3 * 0x58;
+        assert_eq!(
+            mem.read_u16(d_cds + 0x43).unwrap(),
+            0x4000,
+            "D: local physical CDS"
+        );
+        assert_eq!(
+            mem.read_u16(d_cds + 0x45).unwrap(),
+            d_dpb_off,
+            "D: CDS DPB offset"
+        );
+        assert_eq!(
+            mem.read_u16(d_cds + 0x47).unwrap(),
+            d_dpb_seg,
+            "D: CDS DPB segment"
+        );
+    }
+
+    #[test]
+    fn ah52_publishes_multi_unit_and_second_block_driver_letters() {
+        let (mut kernel, mut mem) = arena_kernel();
+        kernel.set_lastdrive(6); // A: through F:
+        let first_image = tests_block_image_with_bpbs(&[
+            (0x40, tests_bpb_custom(512, 1, 2880, 0xf0)),
+            (0x70, tests_bpb_custom(512, 2, 2880, 0xf9)),
+        ]);
+        let first = kernel
+            .stage_sys_driver(&first_image, "", DriverLoadPlacement::Low, &mut mem)
+            .unwrap();
+        assert_eq!(first.first_drive, 3, "two-unit driver starts at D:");
+        complete_block_init_with_offsets(&mut mem, &first, 2, 0x20, &[0x40, 0x70]);
+        kernel.finalize_sys_driver(&first, &mut mem).unwrap();
+
+        let second_image = tests_block_image_with_bpb(0x40);
+        let second = kernel
+            .stage_sys_driver(&second_image, "", DriverLoadPlacement::Low, &mut mem)
+            .unwrap();
+        assert_eq!(second.first_drive, 5, "next driver skips D: and E:");
+        complete_block_init_with_bpb(&mut mem, &second, 0x40);
+        kernel.finalize_sys_driver(&second, &mut mem).unwrap();
+
+        assert_eq!(
+            ah52_dpb_drives(&mut kernel, &mut mem),
+            vec![2, 3, 4, 5],
+            "DPB chain follows C:, D:, E:, F:"
+        );
+    }
+
+    #[test]
+    fn bad_bpb_consumes_assigned_span_without_publishing_fake_dpb() {
+        let (mut kernel, mut mem) = arena_kernel();
+        let mut bad_image = tests_block_image();
+        bad_image.resize(0x40, 0);
+        let bad = kernel
+            .stage_sys_driver(&bad_image, "", DriverLoadPlacement::Low, &mut mem)
+            .unwrap();
+        let unrelated = usize::from(bad.driver_seg) * 16 + 0x9000;
+        for (i, byte) in tests_bpb_1440k().iter().copied().enumerate() {
+            mem.write_u8(unrelated + i, byte).unwrap();
+        }
+        complete_block_init_with_offsets(&mut mem, &bad, 1, 0x20, &[0x9000]);
+        kernel.finalize_sys_driver(&bad, &mut mem).unwrap();
+        assert_eq!(
+            ah52_dpb_drives(&mut kernel, &mut mem),
+            vec![2],
+            "readable BPB bytes outside the staged allocation do not publish D:"
+        );
+
+        let good_image = tests_block_image_with_bpb(0x40);
+        let good = kernel
+            .stage_sys_driver(&good_image, "", DriverLoadPlacement::Low, &mut mem)
+            .unwrap();
+        assert_eq!(good.first_drive, 4, "the bad D: unit still consumed D:");
+        complete_block_init_with_bpb(&mut mem, &good, 0x40);
+        kernel.finalize_sys_driver(&good, &mut mem).unwrap();
+        assert_eq!(ah52_dpb_drives(&mut kernel, &mut mem), vec![2, 4]);
+    }
+
+    #[test]
+    fn malformed_bpb_geometry_fails_closed() {
+        for case in 0..5 {
+            let (mut kernel, mut mem) = arena_kernel();
+            let mut bpb = tests_bpb_1440k();
+            match case {
+                0 => bpb[0..2].copy_from_slice(&0u16.to_le_bytes()),
+                1 => bpb[2] = 0,
+                2 => bpb[2] = 3,
+                3 => bpb[8..10].copy_from_slice(&0u16.to_le_bytes()),
+                4 => bpb[8..10].copy_from_slice(&20u16.to_le_bytes()),
+                _ => unreachable!(),
+            }
+            let image = tests_block_image_with_bpbs(&[(0x40, bpb)]);
+            let bad = kernel
+                .stage_sys_driver(&image, "", DriverLoadPlacement::Low, &mut mem)
+                .unwrap();
+            complete_block_init_with_bpb(&mut mem, &bad, 0x40);
+            kernel.finalize_sys_driver(&bad, &mut mem).unwrap();
+            assert_eq!(
+                ah52_dpb_drives(&mut kernel, &mut mem),
+                vec![2],
+                "case {case} must not publish a fake D: DPB"
+            );
+            let good = kernel
+                .stage_sys_driver(
+                    &tests_block_image_with_bpb(0x40),
+                    "",
+                    DriverLoadPlacement::Low,
+                    &mut mem,
+                )
+                .unwrap();
+            assert_eq!(good.first_drive, 4, "case {case} still consumes D:");
+        }
+    }
+
+    #[test]
+    fn ah52_largest_bytes_per_block_tracks_published_bpbs() {
+        let (mut kernel, mut mem) = arena_kernel();
+        let base = ah52_sysvars_base(&mut kernel, &mut mem);
+        assert_eq!(mem.read_u16(base + 0x10).unwrap(), 512);
+
+        let big_image =
+            tests_block_image_with_bpbs(&[(0x40, tests_bpb_custom(1024, 1, 1440, 0xf8))]);
+        let big = kernel
+            .stage_sys_driver(&big_image, "", DriverLoadPlacement::Low, &mut mem)
+            .unwrap();
+        complete_block_init_with_bpb(&mut mem, &big, 0x40);
+        kernel.finalize_sys_driver(&big, &mut mem).unwrap();
+        let base = ah52_sysvars_base(&mut kernel, &mut mem);
+        assert_eq!(mem.read_u16(base + 0x10).unwrap(), 1024);
+
+        let mut invalid = tests_bpb_custom(2048, 1, 1440, 0xf8);
+        invalid[8..10].copy_from_slice(&0u16.to_le_bytes());
+        let invalid_image = tests_block_image_with_bpbs(&[(0x40, invalid)]);
+        let staged = kernel
+            .stage_sys_driver(&invalid_image, "", DriverLoadPlacement::Low, &mut mem)
+            .unwrap();
+        complete_block_init_with_bpb(&mut mem, &staged, 0x40);
+        kernel.finalize_sys_driver(&staged, &mut mem).unwrap();
+        let base = ah52_sysvars_base(&mut kernel, &mut mem);
+        assert_eq!(
+            mem.read_u16(base + 0x10).unwrap(),
+            1024,
+            "invalid unpublished BPB does not raise the block size"
+        );
+    }
+
+    #[test]
+    fn ah52_clamps_loaded_block_driver_dpbs_to_lastdrive() {
+        let (mut kernel, mut mem) = arena_kernel();
+        let image = tests_block_image_with_bpbs(&[
+            (0x40, tests_bpb_custom(512, 1, 2880, 0xf0)),
+            (0x70, tests_bpb_custom(512, 1, 2880, 0xf9)),
+        ]);
+        let staged = kernel
+            .stage_sys_driver(&image, "", DriverLoadPlacement::Low, &mut mem)
+            .unwrap();
+        complete_block_init_with_offsets(&mut mem, &staged, 2, 0x20, &[0x40, 0x70]);
+        kernel.finalize_sys_driver(&staged, &mut mem).unwrap();
+
+        kernel.set_lastdrive(3); // C:
+        assert_eq!(ah52_dpb_drives(&mut kernel, &mut mem), vec![2]);
+        let base = ah52_sysvars_base(&mut kernel, &mut mem);
+        assert_eq!(mem.read_u8(base + 0x20).unwrap(), 1);
+
+        kernel.set_lastdrive(4); // D:
+        assert_eq!(ah52_dpb_drives(&mut kernel, &mut mem), vec![2, 3]);
+        kernel.set_lastdrive(5); // E:
+        assert_eq!(ah52_dpb_drives(&mut kernel, &mut mem), vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn block_driver_unit_count_is_clipped_at_z_without_wrapping() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        kernel.init_program(0x0200, 0x1200, &mut mem).unwrap();
+        kernel.set_lastdrive(26);
+        let image = tests_block_image_with_bpbs(&[(0x60, tests_bpb_1440k())]);
+        let staged = kernel
+            .stage_sys_driver(&image, "", DriverLoadPlacement::Low, &mut mem)
+            .unwrap();
+        let offsets = vec![0x60; 23];
+        complete_block_init_with_offsets(&mut mem, &staged, 30, 0x20, &offsets);
+        kernel.finalize_sys_driver(&staged, &mut mem).unwrap();
+        let drives = ah52_dpb_drives(&mut kernel, &mut mem);
+        assert_eq!(drives.first(), Some(&2));
+        assert_eq!(drives.last(), Some(&25));
+        assert_eq!(drives.len(), 24, "C: plus D: through Z:");
+
+        let free_before = conventional_free_paragraphs(&kernel, &mem);
+        let err = kernel
+            .stage_sys_driver(&image, "", DriverLoadPlacement::Low, &mut mem)
+            .unwrap_err();
+        assert!(matches!(err, DriverStageError::NoBlockDriveLetters));
+        assert_eq!(
+            conventional_free_paragraphs(&kernel, &mem),
+            free_before,
+            "exhausted block-driver staging fails before allocation"
+        );
+    }
+
+    #[test]
+    fn zero_unit_block_driver_links_but_consumes_no_drive_letters() {
+        let (mut kernel, mut mem) = arena_kernel();
+        let image = tests_block_image_with_bpb(0x40);
+        let staged = kernel
+            .stage_sys_driver(&image, "", DriverLoadPlacement::Low, &mut mem)
+            .unwrap();
+        complete_block_init_with_offsets(&mut mem, &staged, 0, 0x20, &[]);
+        kernel.finalize_sys_driver(&staged, &mut mem).unwrap();
+
+        assert!(
+            published_device_chain(&mut kernel, &mut mem)
+                .iter()
+                .any(|name| name == b"TESTDEV "),
+            "a zero-unit block driver is still linked into the device chain"
+        );
+        assert_eq!(ah52_dpb_drives(&mut kernel, &mut mem), vec![2]);
+        let next = kernel
+            .stage_sys_driver(&image, "", DriverLoadPlacement::Low, &mut mem)
+            .unwrap();
+        assert_eq!(next.first_drive, 3, "zero units do not consume D:");
+    }
+
+    #[test]
+    fn failed_block_driver_init_publishes_no_dpb_and_consumes_no_drive() {
+        let (mut kernel, mut mem) = arena_kernel();
+        let image = tests_block_image_with_bpb(0x40);
+        let failed = kernel
+            .stage_sys_driver(&image, "", DriverLoadPlacement::Low, &mut mem)
+            .unwrap();
+        mem.write_u16(failed.request_linear + 0x03, 0x8100).unwrap();
+        kernel.abort_sys_driver(&failed, &mut mem).unwrap();
+
+        assert!(
+            !published_device_chain(&mut kernel, &mut mem)
+                .iter()
+                .any(|name| name == b"TESTDEV "),
+            "failed INIT must not link the block driver"
+        );
+        assert_eq!(ah52_dpb_drives(&mut kernel, &mut mem), vec![2]);
+        let next = kernel
+            .stage_sys_driver(&image, "", DriverLoadPlacement::Low, &mut mem)
+            .unwrap();
+        assert_eq!(next.first_drive, 3, "failed INIT does not consume D:");
+    }
+
+    #[test]
+    fn expanded_dpb_layout_keeps_sda_pointers_below_the_first_mcb() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(1024 * 1024).unwrap();
+        kernel.init_program(0x0200, 0x1200, &mut mem).unwrap();
+        kernel.set_lastdrive(26);
+        let image = tests_block_image_with_bpbs(&[(0x60, tests_bpb_1440k())]);
+        let staged = kernel
+            .stage_sys_driver(&image, "", DriverLoadPlacement::Low, &mut mem)
+            .unwrap();
+        let offsets = vec![0x60; 23];
+        complete_block_init_with_offsets(&mut mem, &staged, 23, 0x20, &offsets);
+        kernel.finalize_sys_driver(&staged, &mut mem).unwrap();
+
+        let base = ah52_sysvars_base(&mut kernel, &mut mem);
+        let cds_off = mem.read_u16(base + 0x16).unwrap();
+        let cds_seg = mem.read_u16(base + 0x18).unwrap();
+        let cds = usize::from(cds_seg) * 16 + usize::from(cds_off);
+        let last_cds_end = cds + 26 * 0x58;
+        let mut ah34 = DosRegs {
+            ax: 0x3400,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut ah34, &mut mem).unwrap();
+        let sda = usize::from(ah34.es) * 16 + usize::from(ah34.bx) - 1;
+        assert!(
+            sda >= last_cds_end,
+            "SDA starts after the expanded CDS array"
+        );
+        assert!(
+            sda + usize::from(SDA_ALWAYS_SWAPPED_LEN) <= usize::from(kernel.arena.first_mcb()) * 16,
+            "SDA live prefix fits below the first MCB"
+        );
+
+        let mut ax5d06 = DosRegs {
+            ax: 0x5d06,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut ax5d06, &mut mem).unwrap();
+        assert_eq!((ax5d06.ds, ax5d06.si), (ah34.es, ah34.bx - 1));
+    }
+
+    #[test]
+    fn block_driver_name_is_not_opened_as_a_character_device() {
+        let (mut kernel, mut mem) = arena_kernel();
+        let image = tests_block_image_with_bpb(0x40);
+        let staged = kernel
+            .stage_sys_driver(&image, "", DriverLoadPlacement::Low, &mut mem)
+            .unwrap();
+        complete_block_init_with_bpb(&mut mem, &staged, 0x40);
+        kernel.finalize_sys_driver(&staged, &mut mem).unwrap();
+        let (ds, dx) = put_asciiz(&mut mem, 0x2000, b"TESTDEV");
+        let mut regs = DosRegs {
+            ax: 0x3d00,
+            ds,
+            dx,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(
+            regs.cf,
+            "block devices are not opened through AH=3Dh name lookup"
+        );
+    }
+
+    #[test]
+    fn file_open_on_block_drive_letter_does_not_route_to_host_c() {
+        let (mut kernel, mut mem) = arena_kernel();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("SAME.TXT"), b"host c").unwrap();
+        kernel.mount_c(HostDrive::mount_c(root.path()).unwrap());
+        let image = tests_block_image_with_bpb(0x40);
+        let staged = kernel
+            .stage_sys_driver(&image, "", DriverLoadPlacement::Low, &mut mem)
+            .unwrap();
+        complete_block_init_with_bpb(&mut mem, &staged, 0x40);
+        kernel.finalize_sys_driver(&staged, &mut mem).unwrap();
+
+        let (ds, dx) = put_asciiz(&mut mem, 0x2000, b"D:\\SAME.TXT");
+        let mut regs = DosRegs {
+            ax: 0x3d00,
+            ds,
+            dx,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert!(regs.cf, "D: is not a host-backed file route in this slice");
+        assert_eq!(regs.ax, 0x0003, "unbacked block-drive path is rejected");
     }
 
     #[test]
