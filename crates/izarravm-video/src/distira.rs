@@ -796,107 +796,130 @@ impl Distira {
         }
     }
 
+    pub fn write_lfb_u16(&mut self, offset: usize, value: u16) {
+        let base = self.lfb_write_base();
+        let write_color = self.lfb_pipeline_writes_color();
+        let write_depth = self.lfb_pipeline_writes_depth();
+        let pipeline = self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE != 0;
+        match self.lfb_mode & LFB_FORMAT_MASK {
+            LFB_FORMAT_RGB565 => {
+                let pixel = offset / 2;
+                self.write_lfb_color_pipeline_pixel(
+                    base,
+                    pixel,
+                    value,
+                    rgb565_components(value),
+                    0xff,
+                );
+            }
+            LFB_FORMAT_RGB555 => {
+                let pixel = offset / 2;
+                let raw = rgb555_to_rgb565(value);
+                self.write_lfb_color_pipeline_pixel(base, pixel, raw, rgb565_components(raw), 0xff);
+            }
+            LFB_FORMAT_ARGB1555 => {
+                let pixel = offset / 2;
+                let raw = rgb555_to_rgb565(value);
+                self.write_lfb_color_pipeline_pixel(
+                    base,
+                    pixel,
+                    raw,
+                    rgb565_components(raw),
+                    argb1555_alpha(value),
+                );
+            }
+            LFB_FORMAT_DEPTH if write_depth || write_color || pipeline => {
+                let pixel = offset / 2;
+                if let Some(color) = self.lfb_pipeline_depth_only_color(base, pixel, value) {
+                    if let Some(color) = color {
+                        self.write_color_pixel(base, pixel, color);
+                    }
+                    if write_depth {
+                        self.write_depth_pixel_by_index(pixel, value);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn write_lfb_u32(&mut self, offset: usize, value: u32) {
         let base = self.lfb_write_base();
         let write_color = self.lfb_pipeline_writes_color();
         let write_depth = self.lfb_pipeline_writes_depth();
         match self.lfb_mode & LFB_FORMAT_MASK {
             LFB_FORMAT_RGB565 => {
-                if write_color {
-                    let pixel = offset / 2;
-                    let raw0 = value as u16;
-                    let raw1 = (value >> 16) as u16;
-                    if let Some(raw) = self.lfb_pipeline_color_pixel(
-                        base,
-                        pixel,
-                        raw0,
-                        rgb565_components(raw0),
-                        0xff,
-                    ) {
-                        self.write_color_pixel(base, pixel, raw);
-                    }
-                    if let Some(raw) = self.lfb_pipeline_color_pixel(
-                        base,
-                        pixel + 1,
-                        raw1,
-                        rgb565_components(raw1),
-                        0xff,
-                    ) {
-                        self.write_color_pixel(base, pixel + 1, raw);
-                    }
-                }
+                let pixel = offset / 2;
+                let raw0 = value as u16;
+                let raw1 = (value >> 16) as u16;
+                self.write_lfb_color_pipeline_pixel(
+                    base,
+                    pixel,
+                    raw0,
+                    rgb565_components(raw0),
+                    0xff,
+                );
+                self.write_lfb_color_pipeline_pixel(
+                    base,
+                    pixel + 1,
+                    raw1,
+                    rgb565_components(raw1),
+                    0xff,
+                );
             }
             LFB_FORMAT_RGB555 => {
-                if write_color {
-                    let pixel = offset / 2;
-                    let raw0 = value as u16;
-                    let raw1 = (value >> 16) as u16;
-                    let raw0_rgb565 = rgb555_to_rgb565(raw0);
-                    let raw1_rgb565 = rgb555_to_rgb565(raw1);
-                    if let Some(raw) = self.lfb_pipeline_color_pixel(
-                        base,
-                        pixel,
-                        raw0_rgb565,
-                        rgb565_components(raw0_rgb565),
-                        0xff,
-                    ) {
-                        self.write_color_pixel(base, pixel, raw);
-                    }
-                    if let Some(raw) = self.lfb_pipeline_color_pixel(
-                        base,
-                        pixel + 1,
-                        raw1_rgb565,
-                        rgb565_components(raw1_rgb565),
-                        0xff,
-                    ) {
-                        self.write_color_pixel(base, pixel + 1, raw);
-                    }
-                }
+                let pixel = offset / 2;
+                let raw0 = value as u16;
+                let raw1 = (value >> 16) as u16;
+                let raw0_rgb565 = rgb555_to_rgb565(raw0);
+                let raw1_rgb565 = rgb555_to_rgb565(raw1);
+                self.write_lfb_color_pipeline_pixel(
+                    base,
+                    pixel,
+                    raw0_rgb565,
+                    rgb565_components(raw0_rgb565),
+                    0xff,
+                );
+                self.write_lfb_color_pipeline_pixel(
+                    base,
+                    pixel + 1,
+                    raw1_rgb565,
+                    rgb565_components(raw1_rgb565),
+                    0xff,
+                );
             }
             LFB_FORMAT_ARGB1555 => {
-                if write_color {
-                    let pixel = offset / 2;
-                    let raw0 = value as u16;
-                    let raw1 = (value >> 16) as u16;
-                    let raw0_rgb565 = rgb555_to_rgb565(raw0);
-                    let raw1_rgb565 = rgb555_to_rgb565(raw1);
-                    if let Some(raw) = self.lfb_pipeline_color_pixel(
-                        base,
-                        pixel,
-                        raw0_rgb565,
-                        rgb565_components(raw0_rgb565),
-                        argb1555_alpha(raw0),
-                    ) {
-                        self.write_color_pixel(base, pixel, raw);
-                    }
-                    if let Some(raw) = self.lfb_pipeline_color_pixel(
-                        base,
-                        pixel + 1,
-                        raw1_rgb565,
-                        rgb565_components(raw1_rgb565),
-                        argb1555_alpha(raw1),
-                    ) {
-                        self.write_color_pixel(base, pixel + 1, raw);
-                    }
-                }
+                let pixel = offset / 2;
+                let raw0 = value as u16;
+                let raw1 = (value >> 16) as u16;
+                let raw0_rgb565 = rgb555_to_rgb565(raw0);
+                let raw1_rgb565 = rgb555_to_rgb565(raw1);
+                self.write_lfb_color_pipeline_pixel(
+                    base,
+                    pixel,
+                    raw0_rgb565,
+                    rgb565_components(raw0_rgb565),
+                    argb1555_alpha(raw0),
+                );
+                self.write_lfb_color_pipeline_pixel(
+                    base,
+                    pixel + 1,
+                    raw1_rgb565,
+                    rgb565_components(raw1_rgb565),
+                    argb1555_alpha(raw1),
+                );
             }
             LFB_FORMAT_XRGB8888 | LFB_FORMAT_ARGB8888 => {
-                if write_color {
-                    let r = (value >> 16) as u8;
-                    let g = (value >> 8) as u8;
-                    let b = value as u8;
-                    let alpha = if (self.lfb_mode & LFB_FORMAT_MASK) == LFB_FORMAT_ARGB8888 {
-                        (value >> 24) as u8
-                    } else {
-                        0xff
-                    };
-                    let raw = pack_rgb565(r, g, b);
-                    if let Some(raw) =
-                        self.lfb_pipeline_color_pixel(base, offset / 4, raw, (r, g, b), alpha)
-                    {
-                        self.write_color_pixel(base, offset / 4, raw);
-                    }
-                }
+                let r = (value >> 16) as u8;
+                let g = (value >> 8) as u8;
+                let b = value as u8;
+                let alpha = if (self.lfb_mode & LFB_FORMAT_MASK) == LFB_FORMAT_ARGB8888 {
+                    (value >> 24) as u8
+                } else {
+                    0xff
+                };
+                let raw = pack_rgb565(r, g, b);
+                self.write_lfb_color_pipeline_pixel(base, offset / 4, raw, (r, g, b), alpha);
             }
             LFB_FORMAT_DEPTH_RGB565 => {
                 let pixel = offset / 4;
@@ -1704,6 +1727,33 @@ impl Distira {
 
     fn lfb_pipeline_writes_depth(&self) -> bool {
         self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0 || self.fbz_mode & FBZ_DEPTH_WMASK != 0
+    }
+
+    fn write_lfb_color_pipeline_pixel(
+        &mut self,
+        base: u32,
+        pixel: usize,
+        raw: u16,
+        color: (u8, u8, u8),
+        alpha: u8,
+    ) {
+        let pipeline = self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE != 0;
+        let write_color = self.lfb_pipeline_writes_color();
+        let write_depth = pipeline && self.fbz_mode & FBZ_DEPTH_WMASK != 0;
+        let depth = self.za_color as u16;
+        let color = if pipeline {
+            self.lfb_pipeline_depth_color_pixel(base, pixel, raw, color, alpha, depth)
+        } else {
+            self.lfb_pipeline_color_pixel(base, pixel, raw, color, alpha)
+        };
+        if let Some(color) = color {
+            if write_color {
+                self.write_color_pixel(base, pixel, color);
+            }
+            if write_depth {
+                self.write_depth_pixel_by_index(pixel, depth);
+            }
+        }
     }
 
     fn lfb_pipeline_depth_test_passes(&self, pixel: usize, depth: u16) -> bool {

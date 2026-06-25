@@ -4,8 +4,10 @@ use izarravm_machine::{
     ActiveDisplay, DISTIRA_LFB_BASE, DISTIRA_MMIO_BASE, Machine, MachineProfile, StopReason,
 };
 use izarravm_video::{
-    DISTIRA_REG_FB_HEIGHT, DISTIRA_REG_FB_WIDTH, FBZ_DRAW_BACK, FBZ_RGB_WMASK, LFB_FORMAT_ARGB8888,
-    LFB_WRITE_BACK, SST_CLIP_LEFT_RIGHT, SST_CLIP_LOW_Y_HIGH_Y, SST_COLOR1, SST_FASTFILL_CMD,
+    ALPHA_BLEND_ENABLE, ALPHA_DST_FUNC_SHIFT, ALPHA_SRC_FUNC_SHIFT, BLEND_AONE, BLEND_AZERO,
+    DISTIRA_REG_FB_HEIGHT, DISTIRA_REG_FB_WIDTH, FBZ_DRAW_BACK, FBZ_RGB_WMASK,
+    LFB_ENABLE_PIXEL_PIPELINE, LFB_FORMAT_ARGB8888, LFB_FORMAT_RGB565, LFB_WRITE_BACK,
+    SST_ALPHA_MODE, SST_CLIP_LEFT_RIGHT, SST_CLIP_LOW_Y_HIGH_Y, SST_COLOR1, SST_FASTFILL_CMD,
     SST_FBI_INIT7, SST_FBZ_MODE, SST_LFB_MODE, SST_STATUS, SST_SWAPBUFFER_CMD,
 };
 
@@ -102,6 +104,40 @@ fn distira_lfb_dword_writes_follow_voodoo_lfb_format() {
     let (frame, width, height) = machine.frame_argb();
     assert_eq!((width, height), (2, 1));
     assert_eq!(frame, vec![0x0031_557b, 0x0000_0000]);
+}
+
+#[test]
+fn distira_lfb_word_writes_use_voodoo_pixel_pipeline() {
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Distira),
+        I386DX25_TEST_ROM,
+    )
+    .unwrap();
+
+    write_reg(&mut machine, DISTIRA_REG_FB_WIDTH, 1);
+    write_reg(&mut machine, DISTIRA_REG_FB_HEIGHT, 1);
+    write_reg(&mut machine, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
+    write_reg(&mut machine, SST_COLOR1, 0x0000_00ff);
+    write_reg(&mut machine, SST_FASTFILL_CMD, 1);
+    write_reg(
+        &mut machine,
+        SST_LFB_MODE,
+        LFB_FORMAT_RGB565 | LFB_WRITE_BACK | LFB_ENABLE_PIXEL_PIPELINE,
+    );
+    write_reg(
+        &mut machine,
+        SST_ALPHA_MODE,
+        ALPHA_BLEND_ENABLE
+            | (BLEND_AZERO << ALPHA_SRC_FUNC_SHIFT)
+            | (BLEND_AONE << ALPHA_DST_FUNC_SHIFT),
+    );
+
+    machine.write_physical_u16(DISTIRA_LFB_BASE, 0xf800);
+    write_reg(&mut machine, SST_SWAPBUFFER_CMD, 1);
+
+    let (frame, width, height) = machine.frame_argb();
+    assert_eq!((width, height), (1, 1));
+    assert_eq!(frame, vec![0x0000_00ff]);
 }
 
 #[test]
