@@ -345,8 +345,10 @@ gfx_blit_1bpp:
 ; gfx_post_screen: paint the graceful POST screen. White field, the red Izarra
 ; 3000 wordmark centered across the top, black title/version and hint lines, and
 ; the empty red-framed progress bar. Called once before the RAM test paces.
-; Drawing is done into VRAM before lfb_set_mode so the display is fully painted
-; when the mode switch makes it visible.
+; Drawing is done into VRAM before lfb_set_mode (activate last): Margo's set_mode
+; does not clear VRAM, so flipping the order would make the mode switch visible
+; while VRAM still holds stale pixels (a flash of garbage). Do NOT move
+; lfb_set_mode earlier -- the screen would no longer reveal atomically.
 gfx_post_screen:
     call gfx_post_palette           ; DAC slots 0 white, 1 black, 4 red (INT 10h)
     mov al, GFX_WHITE
