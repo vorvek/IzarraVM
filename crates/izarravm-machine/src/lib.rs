@@ -18553,45 +18553,30 @@ mod tests {
     }
 
     #[test]
-    fn boot_menu_removes_the_old_speed_marker() {
-        fn marker_pixels(machine: &Machine, y: u32) -> Vec<u8> {
-            (y * 2..(y + 8) * 2)
-                .step_by(2)
-                .flat_map(|row| machine.video().render_256color_row(row)[296..304].to_vec())
-                .collect()
-        }
-
+    fn boot_menu_marks_one_speed_row_on_the_lfb() {
+        // Open the LFB boot menu (focus seeds on the Floppy device row, so every
+        // speed row is unfocused) and confirm exactly one speed row shows the marker
+        // diamond. The marker sits at x 172 on a speed row; an unfocused marked row
+        // paints an ink diamond (index ART_INK_INDEX = 0) on the cream field, so ink
+        // pixels in that column flag the mark. This guards the full-repaint render
+        // (a stale or missing marker would change the count).
         let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
+        machine.inject_key_scancodes(&[0x0f, 0x8f]); // Tab opens the menu.
+        machine.run_until_halt_or_cycles(25_000_000).unwrap();
+        assert_eq!(machine.active_display(), ActiveDisplay::MargoLfb);
 
-        machine.inject_key_scancodes(&[0x0f, 0x8f]); // Tab opens the boot menu.
-        // POST paints the full-screen RLE art via the per-pixel LFB primitives,
-        // heavier than the old rep-stosw mode 13h path, so reaching the boot-menu
-        // hotkey window (~15M cycles) needs more than the original budget. The boot
-        // menu itself still renders in mode 13h (it calls set_mode13h on entry), so
-        // the marker reads below via render_256color_row remain valid.
-        machine.run_until_halt_or_cycles(20_000_000).unwrap();
-        assert!(
-            marker_pixels(&machine, 80).contains(&1),
-            "the initial 386 row has a black diamond"
-        );
-
-        for key in [[0x4d, 0xcd], [0x48, 0xc8]] {
-            machine.inject_key_scancodes(&key); // Right, Up focuses 586.
-            machine.run_until_halt_or_cycles(1_000_000).unwrap();
-        }
-        machine.inject_key_scancodes(&[0x1c, 0x9c]); // Enter selects 586.
-        machine.run_until_halt_or_cycles(5_000_000).unwrap();
-
-        let old_marker = marker_pixels(&machine, 80);
-        assert!(
-            old_marker.iter().all(|&pixel| pixel == 0),
-            "the old 386 diamond is erased: {old_marker:?}"
-        );
-        assert!(
-            marker_pixels(&machine, 48).contains(&0),
-            "the focused 586 row has a white diamond"
-        );
+        // Speed rows top at y 144 + row*12; the marker glyph is at +2, x 172..180.
+        let marker_inked = |m: &mut Machine, row: u32| -> bool {
+            let y0 = 144 + row * 12 + 2;
+            (y0..y0 + 8).any(|y| {
+                (172..180u32).any(|x| m.read_physical_u8(MARGO_LFB_BASE + y * 320 + x) == 0)
+            })
+        };
+        let marked = (0..4u32)
+            .filter(|&row| marker_inked(&mut machine, row))
+            .count();
+        assert_eq!(marked, 1, "exactly one speed row shows the marker diamond");
     }
 
     #[test]

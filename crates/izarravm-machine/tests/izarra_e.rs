@@ -1,26 +1,27 @@
 // STREAM E integration test: the Tab boot menu and the INT 19h floppy bootstrap.
 //
 // Drives the public Machine API only. During the POST hotkey window the BIOS
-// watches for Del (setup) and Tab (boot menu). Tab opens a mode-13h two-pane menu:
-// the left pane picks the boot device (Hard Disk, Floppy, CD-ROM), the right pane
-// picks the CPU speed, and an Accept/Cancel button bar sits below. Arrows move
-// within and between panes, Enter marks a row, F10 (or Accept) commits, Esc (or
-// Cancel) discards. The default device comes from CMOS 0x11. Committing Floppy
-// drives the floppy path, which reads the boot sector and far jumps to 0000:7C00.
+// watches for Del (setup) and Tab (boot menu). Tab opens the boot menu on the
+// Margo LFB (mode 0x150) inside the boot-box sprite: a single stacked column with
+// three device rows (Hard Disk, Floppy, CD-ROM), four CPU-speed rows, and an
+// Accept row, walked by a flat focus index (Up/Down). Enter marks a device/speed
+// or commits on Accept; F10 also commits; Esc bails to the default boot order. The
+// default device comes from CMOS 0x11. Committing Floppy drives the floppy path,
+// which reads the boot sector and far jumps to 0000:7C00. (The menu is keyboard-
+// only; the old mode-13h two-pane menu and its PS/2 mouse layer were retired.)
 //
 // Cases:
-//   1. Tab during POST opens the menu: mode 13h with the menu's red title and grey
-//      pane frames that the plain POST screen does not paint.
-//   2. A host mouse move hot-tracks focus to the speed pane; a click marks a row.
-//   3. Tab then F10 (Accept) on the default Floppy boots the mounted image: the
+//   1. Tab during POST opens the menu on the LFB: the red menu title renders inside
+//      the box, which the plain POST screen does not paint there.
+//   2. Tab then F10 (Accept) on the default Floppy boots the mounted image: the
 //      Wizardry III booter takes over and switches the card to CGA.
+//   3. Walking down to the 286 row and accepting switches the CPU tier live.
 //
-// Keys are fed as Set 1 scancodes via inject_key_scancodes; mouse motion via
-// inject_mouse. The menu polls the aux channel and the keyboard ring each loop.
+// Keys are fed as Set 1 scancodes via inject_key_scancodes.
 
 use izarravm_core::{GswMode, VideoCard};
 use izarravm_firmware::izarra_bios;
-use izarravm_machine::{Machine, MachineProfile, build_fat12};
+use izarravm_machine::{ActiveDisplay, MARGO_LFB_BASE, Machine, MachineProfile, build_fat12};
 use izarravm_video::VideoMode;
 
 // Set 1 make/break codes used by the boot menu.
@@ -32,12 +33,9 @@ const UP_MAKE: u8 = 0x48;
 const UP_BREAK: u8 = 0xc8;
 const DOWN_MAKE: u8 = 0x50;
 const DOWN_BREAK: u8 = 0xd0;
-const RIGHT_MAKE: u8 = 0x4d;
-const RIGHT_BREAK: u8 = 0xcd;
 const ESC_MAKE: u8 = 0x01;
 const ESC_BREAK: u8 = 0x81;
-// F10 accepts the marked device and speed (the two-pane menu commits on Accept,
-// not on Enter, which only marks a row).
+// F10 (or Enter on the Accept row) commits the marked device and speed.
 const F10_MAKE: u8 = 0x44;
 const F10_BREAK: u8 = 0xc4;
 
@@ -52,97 +50,32 @@ fn boot_machine() -> Machine {
 }
 
 #[test]
-fn tab_opens_the_boot_menu_in_mode13h() {
-    // Tab during POST opens the menu and stops there blocking on a key. The menu
-    // wears the BIOS white/black/red skin: a red title (DAC slot 0x04) and light
-    // grey pane/button frames (slot 0x07). The graceful POST screen paints red too,
-    // but never slot 0x07, so the grey frame proves the menu painted on top of POST.
+fn tab_opens_the_boot_menu_on_the_lfb() {
+    // Tab during POST opens the boot menu on the Margo LFB (not a mode switch) and
+    // blocks there on a key. The menu's red title "Boot & Speed" (art palette index
+    // ART_RED_INDEX = 24) renders inside the box; the POST screen never paints red
+    // in that band, so red pixels there prove the menu drew over POST on the LFB.
     let mut machine = boot_machine();
     machine.inject_key_scancodes(&[TAB_MAKE, TAB_BREAK]);
-    machine.run_until_halt_or_cycles(20_000_000).unwrap();
+    machine.run_until_halt_or_cycles(25_000_000).unwrap();
 
     assert_eq!(
-        machine.video().active_mode(),
-        VideoMode::Mode13h,
-        "the boot menu draws in mode 13h"
+        machine.active_display(),
+        ActiveDisplay::MargoLfb,
+        "the boot menu draws on the Margo LFB"
     );
-    let raster = machine.video_mut().render_full_frame();
-    let has_title = raster.pixels.contains(&0x04);
-    let has_frame = raster.pixels.contains(&0x07);
-    assert!(
-        has_title && has_frame,
-        "the red menu title and grey pane frames are on screen"
-    );
-}
-
-#[test]
-fn mouse_hover_moves_focus_to_the_speed_pane() {
-    // Open the two-pane menu (focus starts on the device pane), then feed a host
-    // mouse move that lands the cursor over the right (speed) pane. The BIOS polls
-    // the PS/2 aux channel each loop, hot-tracks the hovered region, and repaints,
-    // so the focus pane flips from device (0) to speed (1). This exercises the full
-    // item-8 path: BIOS aux enable, packet decode, cursor move, hit-test, refocus.
-    let mut machine = boot_machine();
-    machine.inject_key_scancodes(&[TAB_MAKE, TAB_BREAK]);
-    // Let the menu open and enable the mouse.
-    machine.run_until_halt_or_cycles(20_000_000).unwrap();
-    assert_eq!(machine.video().active_mode(), VideoMode::Mode13h);
-    // The menu seeds focus on the device pane (BMX_FOCUS_PANE at seg0 0x0900 = 0).
-    assert_eq!(
-        machine.read_physical_u8(0x0900),
-        0,
-        "focus starts on the device pane"
-    );
-    // The cursor parks mid-field at (152, 92). Move it up-right onto a speed row
-    // (the right pane spans x 172..303, y 44..107). dx=+48, screen dy=-34 lands it
-    // near (200, 58), inside the Fast/Slow speed rows. Feed the move in a few small
-    // packets so the BIOS poll, which drains one aux byte per loop, keeps up.
-    for _ in 0..6 {
-        machine.inject_mouse(8, -6, 0);
-        machine.run_until_halt_or_cycles(2_000_000).unwrap();
+    // Title band y 64..72, x 28..130: red glyphs (index 24).
+    let mut red = 0;
+    for y in 64..72u32 {
+        for x in 28..130u32 {
+            if machine.read_physical_u8(MARGO_LFB_BASE + y * 320 + x) == 24 {
+                red += 1;
+            }
+        }
     }
-    machine.run_until_halt_or_cycles(4_000_000).unwrap();
-    assert_eq!(
-        machine.read_physical_u8(0x0900),
-        1,
-        "hovering the right pane moved focus to the speed pane"
-    );
-    // The cursor word (seg0 0x0908) advanced from its parked X (152) toward the
-    // right pane, proving the packets moved the pointer.
-    let cur_x =
-        machine.read_physical_u8(0x0908) as u16 | ((machine.read_physical_u8(0x0909) as u16) << 8);
-    assert!(cur_x > 152, "the cursor moved right (x={cur_x})");
-}
-
-#[test]
-fn mouse_click_marks_a_speed_row() {
-    // Open the menu, move the cursor onto a Slow (486) speed row, and click. A click
-    // is "hover then mark", so the marked speed (seg0 0x0903) becomes the clicked
-    // row. The menu seeds the marked speed to Fast (row 0) from CMOS, so a click on
-    // a different row is an observable change.
-    let mut machine = boot_machine();
-    machine.inject_key_scancodes(&[TAB_MAKE, TAB_BREAK]);
-    machine.run_until_halt_or_cycles(20_000_000).unwrap();
-    let seeded_spd = machine.read_physical_u8(0x0903);
-    // Move onto the right pane around y=66 (the Slow row, hit y 60..75), button up.
-    for _ in 0..6 {
-        machine.inject_mouse(8, -4, 0);
-        machine.run_until_halt_or_cycles(2_000_000).unwrap();
-    }
-    machine.run_until_halt_or_cycles(2_000_000).unwrap();
-    // Press the left button (a 0->1 edge) on the hovered row, then release.
-    machine.inject_mouse(0, 0, 0x01);
-    machine.run_until_halt_or_cycles(4_000_000).unwrap();
-    machine.inject_mouse(0, 0, 0x00);
-    machine.run_until_halt_or_cycles(2_000_000).unwrap();
-    let marked_spd = machine.read_physical_u8(0x0903);
-    // The click landed on a speed row and marked it; whatever row it hit, the menu
-    // is still alive in mode 13h (the click did not commit, since speed rows mark
-    // rather than boot).
-    assert_eq!(machine.video().active_mode(), VideoMode::Mode13h);
     assert!(
-        marked_spd <= 3,
-        "a click marked an available speed row (was {seeded_spd}, now {marked_spd})"
+        red > 20,
+        "the red menu title is on the LFB, found {red} red pixels"
     );
 }
 
@@ -189,27 +122,32 @@ fn accept_super_slow_commits_the_286_tier() {
     let mut machine = boot_machine();
     assert_eq!(machine.active_mode(), GswMode::Gsw386, "boot mode is 386");
 
-    // Tab opens the menu (focus on the device pane, row 1 = the only bootable
-    // device, Floppy). Right crosses to the speed pane carrying that row index, so
-    // focus lands on speed row 1 (Slow). Two Downs walk to row 3 (Super Slow / 286).
+    // Tab opens the menu with focus on the marked device (flat index 1 = Floppy).
+    // The flat list is dev0..dev2 (0..2), spd0..spd3 (3..6), Accept (7), so five
+    // Downs walk from Floppy (1) to the Super Slow / 286 row (focus 6 = speed row 3).
     // Enter marks it, F10 accepts.
     machine.inject_key_scancodes(&[
         TAB_MAKE,
-        TAB_BREAK, // open the boot menu
-        RIGHT_MAKE,
-        RIGHT_BREAK, // device pane -> speed pane (row 1)
+        TAB_BREAK, // open the boot menu (focus = Floppy)
         DOWN_MAKE,
-        DOWN_BREAK, // Slow (row 1) -> VSlow (row 2)
+        DOWN_BREAK, // -> CD-ROM
         DOWN_MAKE,
-        DOWN_BREAK, // VSlow (row 2) -> SSlow (row 3)
+        DOWN_BREAK, // -> Fast 586
+        DOWN_MAKE,
+        DOWN_BREAK, // -> Slow 486
+        DOWN_MAKE,
+        DOWN_BREAK, // -> VSlow 386
+        DOWN_MAKE,
+        DOWN_BREAK, // -> SSlow 286
         ENTER_MAKE,
         ENTER_BREAK, // mark the Super Slow row
         F10_MAKE,
         F10_BREAK, // Accept
     ]);
-    // Accept applies the speed live and falls through into the boot path. Give the
-    // firmware room to settle on the new tier.
-    machine.run_until_halt_or_cycles(24_000_000).unwrap();
+    // Accept applies the speed live and falls through into the boot path. The seven
+    // queued keys each trigger a row redraw on top of the ~15M-cycle POST, so give
+    // the run room to process them all and settle on the new tier.
+    machine.run_until_halt_or_cycles(40_000_000).unwrap();
 
     assert_eq!(
         machine.active_mode(),
@@ -359,12 +297,11 @@ fn fat12_folder_boots_and_reads_a_known_file_through_int13() {
 
 #[test]
 fn tab_navigates_to_hard_disk_and_reports_unavailable() {
-    // Tab opens the two-pane menu with Floppy focused (device row 1). Up moves to
-    // the Hard Disk row (row 0), which is unavailable in this build. Enter on it
-    // reports that Toka-DOS is not installed and refuses the mark, staying on the
-    // menu. Esc then cancels. The run reaching the cycle limit in mode 13h without
-    // a fault proves the unavailable row returned to the menu rather than booting
-    // or crashing.
+    // Tab opens the menu with Floppy focused (flat index 1). Up moves to the Hard
+    // Disk row (index 0), which is unavailable in this build (greyed). Enter on it
+    // refuses the mark and stays on the menu. Esc then bails. The run reaching the
+    // cycle limit on the LFB without a fault proves the unavailable row returned to
+    // the menu rather than booting or crashing.
     let mut machine = boot_machine();
     machine.inject_key_scancodes(&[
         TAB_MAKE,
@@ -372,17 +309,16 @@ fn tab_navigates_to_hard_disk_and_reports_unavailable() {
         UP_MAKE,
         UP_BREAK, // Floppy -> Hard Disk
         ENTER_MAKE,
-        ENTER_BREAK, // Hard Disk: report unavailable, stay on the menu
+        ENTER_BREAK, // Hard Disk: unavailable, stay on the menu
         ESC_MAKE,
-        ESC_BREAK, // cancel the menu
+        ESC_BREAK, // bail out of the menu
     ]);
-    machine.run_until_halt_or_cycles(20_000_000).unwrap();
-    // Esc on the menu falls through to boot_entry with the floppy default and no
-    // media mounted, so the read fails and the BIOS idles. The card stays in the
-    // mode-13h POST/menu field; the key point is no fault occurred.
+    machine.run_until_halt_or_cycles(25_000_000).unwrap();
+    // Esc bails to boot_entry with the floppy default and no media mounted, so the
+    // read fails and the BIOS idles on the LFB. The key point is no fault occurred.
     assert_eq!(
-        machine.video().active_mode(),
-        VideoMode::Mode13h,
+        machine.active_display(),
+        ActiveDisplay::MargoLfb,
         "the unavailable Hard Disk row returned to the menu without booting"
     );
 }
