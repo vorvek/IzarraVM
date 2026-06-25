@@ -560,7 +560,10 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
 - [x] Iteration 73: texture alpha path add-local mode distinctions.
       Validated by the video texture alpha CCA add-mode coverage test plus the
       workspace gates.
-- [ ] Next: texture alpha path add-local saturation behavior.
+- [x] Iteration 74: texture alpha path add-local saturation behavior.
+      Validated by the video texture alpha CCA add saturation coverage test plus
+      the workspace gates.
+- [ ] Next: texture alpha path subtract-before-add ordering behavior.
 
 ## First 90 percent push for this branch
 
