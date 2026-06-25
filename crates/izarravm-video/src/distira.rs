@@ -215,6 +215,7 @@ pub const FBZCP_CC_MSELECT_MASK: u32 = 0x7;
 pub const CC_MSELECT_CLOCAL: u32 = 1;
 pub const FBZCP_CC_REVERSE_BLEND: u32 = 1 << 13;
 pub const FBZCP_CC_ADD_CLOCAL: u32 = 1 << 14;
+pub const FBZCP_CC_ADD_ALOCAL: u32 = 2 << 14;
 pub const FBZCP_CC_INVERT_OUTPUT: u32 = 1 << 16;
 pub const TC_ZERO_OTHER: u32 = 1 << 12;
 pub const TC_SUB_CLOCAL: u32 = 1 << 13;
@@ -689,7 +690,8 @@ impl Distira {
                 let s = lerp_f32(a.s, b.s, c.s, l0, l1, l2);
                 let t = lerp_f32(a.t, b.t, c.t, l0, l1, l2);
                 let alpha = lerp_u8(a.a, b.a, c.a, l0, l1, l2);
-                let (r, g, blue) = self.texture_color_or_source((x, y), (r, g, blue), (s, t));
+                let (r, g, blue) =
+                    self.texture_color_or_source((x, y), (r, g, blue), alpha, (s, t));
                 let alpha = self.texture_alpha_or_source(alpha, s, t);
                 if !self.alpha_test_passes(alpha) {
                     self.fbi_afunc_fail = self.fbi_afunc_fail.wrapping_add(1);
@@ -1694,6 +1696,7 @@ impl Distira {
         &self,
         position: (u32, u32),
         source: (u8, u8, u8),
+        alocal: u8,
         texture_coords: (f32, f32),
     ) -> (u8, u8, u8) {
         let (r, g, b) = source;
@@ -1745,7 +1748,7 @@ impl Distira {
                 }
             }
         };
-        let color = self.apply_color_path_local_combine(selected, source);
+        let color = self.apply_color_path_local_combine(selected, source, alocal);
         self.apply_color_path_output_invert(color)
     }
 
@@ -1760,9 +1763,11 @@ impl Distira {
         &self,
         color: (u8, u8, u8),
         source: (u8, u8, u8),
+        alocal: u8,
     ) -> (u8, u8, u8) {
         let mselect = (self.fbz_color_path >> FBZCP_CC_MSELECT_SHIFT) & FBZCP_CC_MSELECT_MASK;
-        if self.fbz_color_path & (FBZCP_CC_SUB_CLOCAL | FBZCP_CC_ADD_CLOCAL) == 0
+        if self.fbz_color_path & (FBZCP_CC_SUB_CLOCAL | FBZCP_CC_ADD_CLOCAL | FBZCP_CC_ADD_ALOCAL)
+            == 0
             && mselect != CC_MSELECT_CLOCAL
         {
             return color;
@@ -1800,6 +1805,12 @@ impl Distira {
                 color.0.saturating_add(local.0),
                 color.1.saturating_add(local.1),
                 color.2.saturating_add(local.2),
+            )
+        } else if self.fbz_color_path & FBZCP_CC_ADD_ALOCAL != 0 {
+            (
+                color.0.saturating_add(alocal),
+                color.1.saturating_add(alocal),
+                color.2.saturating_add(alocal),
             )
         } else {
             color
