@@ -113,21 +113,18 @@ def detect_icons(grey):
 
 
 def detect_bootbox(boot):
-    """Bbox of the boot-box frame: non-field pixels in the left region."""
+    """The boot-box frame rectangle. The box is a fixed asset: a grey border with
+    a drop shadow, left edge at x=19, right border at x=228 with a purple shadow at
+    x=229-230, top at y=57, bottom at y=233. Auto-detecting the bbox catches the
+    wordmark (which overlaps x213-230 at the top), so the bounds are fixed here.
+    The full width (212, through the shadow) covers the CD-ROM icon slot and the
+    right border, which a narrower crop would clip off."""
+    box = (19, 57, 212, 177)
     px = boot.load()
-    W, H = boot.size
-    nf = [
-        (x, y)
-        for x in range(5, 200)
-        for y in range(40, 235)
-        if px[x, y] != FIELD
-    ]
-    if not nf:
-        sys.exit("no boot-box frame detected")
-    xs = [p[0] for p in nf]
-    ys = [p[1] for p in nf]
-    x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
-    return (x0, y0, x1 - x0 + 1, y1 - y0 + 1)
+    x, y, _, _ = box
+    if px[x, y + 90] == FIELD:
+        sys.exit("boot-box left border not where expected -- check izarra3000_boot.png")
+    return box
 
 
 def emit_db(name, blob):

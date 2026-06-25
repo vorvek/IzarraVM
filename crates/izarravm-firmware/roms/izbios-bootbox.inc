@@ -262,18 +262,13 @@ bx_draw_full:
     mov cx, BOOTBOX_W
     mov dx, BOOTBOX_H
     call lfb_blit_rle
-    ; Clear the POST-screen slivers that stick out past the box -- the left margin
-    ; (x 0..18) and the gap before the mascot (x 200..223) -- so the menu reads as
-    ; a clean boot screen. Stays below the wordmark (y>=64) and left of the mascot.
+    ; Clear the POST-screen sliver that sticks out left of the box (x 0..18) so the
+    ; menu reads as a clean boot screen. The box itself (now x 19..230, through the
+    ; shadow) covers the rest of the POST text and the icon row; the gap before the
+    ; mascot stays cream. Stays below the wordmark (y>=64).
     mov di, 0
     mov si, 64
     mov cx, BOOTBOX_X
-    mov dx, 170
-    mov bl, BX_C_FIELD
-    call lfb_fill_rect
-    mov di, BOOTBOX_X + BOOTBOX_W
-    mov si, 64
-    mov cx, 24
     mov dx, 170
     mov bl, BX_C_FIELD
     call lfb_fill_rect
