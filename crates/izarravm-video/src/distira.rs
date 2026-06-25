@@ -196,6 +196,7 @@ pub const TEX_A8: u32 = 0x02;
 pub const TEX_I8: u32 = 0x03;
 pub const TEX_AI8: u32 = 0x04;
 pub const TEX_PAL8: u32 = 0x05;
+pub const TEX_APAL8: u32 = 0x06;
 pub const TEX_ARGB8332: u32 = 0x08;
 pub const TEX_R5G6B5: u32 = 0x0a;
 pub const TEX_ARGB1555: u32 = 0x0b;
@@ -1536,6 +1537,7 @@ impl Distira {
                     | TEX_I8
                     | TEX_AI8
                     | TEX_PAL8
+                    | TEX_APAL8
                     | TEX_ARGB8332
                     | TEX_R5G6B5
                     | TEX_ARGB1555
@@ -1565,6 +1567,7 @@ impl Distira {
             TEX_I8 => self.sample_tmu_i8(tmu, s, t),
             TEX_AI8 => self.sample_tmu_ai44(tmu, s, t),
             TEX_PAL8 => self.sample_tmu_pal8(tmu, s, t),
+            TEX_APAL8 => self.sample_tmu_apal8(tmu, s, t),
             TEX_ARGB8332 => self.sample_tmu_argb8332(tmu, s, t),
             TEX_R5G6B5 => self.sample_tmu_rgb565(tmu, s, t),
             TEX_ARGB1555 => self.sample_tmu_argb1555(tmu, s, t),
@@ -1609,6 +1612,10 @@ impl Distira {
     fn sample_tmu_pal8(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
         let raw = self.texture_palette[tmu][usize::from(self.sample_tmu_u8(tmu, s, t))];
         ((raw >> 16) as u8, (raw >> 8) as u8, raw as u8)
+    }
+
+    fn sample_tmu_apal8(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
+        expand_apal8(self.texture_palette[tmu][usize::from(self.sample_tmu_u8(tmu, s, t))])
     }
 
     fn sample_tmu_argb8332(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
@@ -1952,6 +1959,17 @@ fn expand4(v: u8) -> u8 {
 
 fn expand_rgb332(raw: u8) -> (u8, u8, u8) {
     (expand3(raw >> 5), expand3(raw >> 2), expand2(raw))
+}
+
+fn expand_apal8(raw: u32) -> (u8, u8, u8) {
+    let r = (raw >> 16) as u8;
+    let g = (raw >> 8) as u8;
+    let b = raw as u8;
+    (
+        ((r & 3) << 6) | ((g & 0xf0) >> 2) | (r & 3),
+        ((g & 0x0f) << 4) | ((b & 0xc0) >> 4) | ((g & 0x0f) >> 2),
+        ((b & 0x3f) << 2) | ((b & 0x30) >> 4),
+    )
 }
 
 fn expand_rgb555(raw: u16) -> (u8, u8, u8) {
