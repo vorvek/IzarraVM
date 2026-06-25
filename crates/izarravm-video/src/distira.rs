@@ -53,6 +53,16 @@ pub const SST_START_R: usize = 0x020;
 pub const SST_START_G: usize = 0x024;
 pub const SST_START_B: usize = 0x028;
 pub const SST_TRIANGLE_CMD: usize = 0x080;
+pub const SST_FVERTEX_AX: usize = 0x088;
+pub const SST_FVERTEX_AY: usize = 0x08c;
+pub const SST_FVERTEX_BX: usize = 0x090;
+pub const SST_FVERTEX_BY: usize = 0x094;
+pub const SST_FVERTEX_CX: usize = 0x098;
+pub const SST_FVERTEX_CY: usize = 0x09c;
+pub const SST_FSTART_R: usize = 0x0a0;
+pub const SST_FSTART_G: usize = 0x0a4;
+pub const SST_FSTART_B: usize = 0x0a8;
+pub const SST_FTRIANGLE_CMD: usize = 0x100;
 pub const SST_FBZ_COLOR_PATH: usize = 0x104;
 pub const SST_FOG_MODE: usize = 0x108;
 pub const SST_ALPHA_MODE: usize = 0x10c;
@@ -239,6 +249,8 @@ pub struct Distira {
     color1: u32,
     triangle_vertices: [(u32, u32); 3],
     triangle_color: [u32; 3],
+    ftriangle_vertices: [(u32, u32); 3],
+    ftriangle_color: [u32; 3],
     fbi_pixels_in: u32,
     fbi_chroma_fail: u32,
     fbi_zfunc_fail: u32,
@@ -295,6 +307,8 @@ impl Distira {
             color1: 0,
             triangle_vertices: [(0, 0); 3],
             triangle_color: [0; 3],
+            ftriangle_vertices: [(0, 0); 3],
+            ftriangle_color: [0; 3],
             fbi_pixels_in: 0,
             fbi_chroma_fail: 0,
             fbi_zfunc_fail: 0,
@@ -561,6 +575,47 @@ impl Distira {
                     self.run_triangle_command();
                 }
             }
+            SST_FVERTEX_AX => {
+                merge_byte(&mut self.ftriangle_vertices[0].0, byte, value);
+                self.triangle_vertices[0].0 = float_vertex_to_fixed(self.ftriangle_vertices[0].0);
+            }
+            SST_FVERTEX_AY => {
+                merge_byte(&mut self.ftriangle_vertices[0].1, byte, value);
+                self.triangle_vertices[0].1 = float_vertex_to_fixed(self.ftriangle_vertices[0].1);
+            }
+            SST_FVERTEX_BX => {
+                merge_byte(&mut self.ftriangle_vertices[1].0, byte, value);
+                self.triangle_vertices[1].0 = float_vertex_to_fixed(self.ftriangle_vertices[1].0);
+            }
+            SST_FVERTEX_BY => {
+                merge_byte(&mut self.ftriangle_vertices[1].1, byte, value);
+                self.triangle_vertices[1].1 = float_vertex_to_fixed(self.ftriangle_vertices[1].1);
+            }
+            SST_FVERTEX_CX => {
+                merge_byte(&mut self.ftriangle_vertices[2].0, byte, value);
+                self.triangle_vertices[2].0 = float_vertex_to_fixed(self.ftriangle_vertices[2].0);
+            }
+            SST_FVERTEX_CY => {
+                merge_byte(&mut self.ftriangle_vertices[2].1, byte, value);
+                self.triangle_vertices[2].1 = float_vertex_to_fixed(self.ftriangle_vertices[2].1);
+            }
+            SST_FSTART_R => {
+                merge_byte(&mut self.ftriangle_color[0], byte, value);
+                self.triangle_color[0] = float_color_to_fixed(self.ftriangle_color[0]);
+            }
+            SST_FSTART_G => {
+                merge_byte(&mut self.ftriangle_color[1], byte, value);
+                self.triangle_color[1] = float_color_to_fixed(self.ftriangle_color[1]);
+            }
+            SST_FSTART_B => {
+                merge_byte(&mut self.ftriangle_color[2], byte, value);
+                self.triangle_color[2] = float_color_to_fixed(self.ftriangle_color[2]);
+            }
+            SST_FTRIANGLE_CMD => {
+                if byte == 0 && value != 0 {
+                    self.run_triangle_command();
+                }
+            }
             SST_FBZ_COLOR_PATH => merge_byte(&mut self.fbz_color_path, byte, value),
             SST_FOG_MODE => merge_byte(&mut self.fog_mode, byte, value),
             SST_ALPHA_MODE => merge_byte(&mut self.alpha_mode, byte, value),
@@ -744,6 +799,16 @@ impl Distira {
             SST_START_G => self.triangle_color[1],
             SST_START_B => self.triangle_color[2],
             SST_TRIANGLE_CMD => 0,
+            SST_FVERTEX_AX => self.ftriangle_vertices[0].0,
+            SST_FVERTEX_AY => self.ftriangle_vertices[0].1,
+            SST_FVERTEX_BX => self.ftriangle_vertices[1].0,
+            SST_FVERTEX_BY => self.ftriangle_vertices[1].1,
+            SST_FVERTEX_CX => self.ftriangle_vertices[2].0,
+            SST_FVERTEX_CY => self.ftriangle_vertices[2].1,
+            SST_FSTART_R => self.ftriangle_color[0],
+            SST_FSTART_G => self.ftriangle_color[1],
+            SST_FSTART_B => self.ftriangle_color[2],
+            SST_FTRIANGLE_CMD => 0,
             SST_FBZ_COLOR_PATH => self.fbz_color_path,
             SST_FOG_MODE => self.fog_mode,
             SST_ALPHA_MODE => self.alpha_mode,
@@ -943,6 +1008,14 @@ fn fixed_vertex_to_f32(raw: u32) -> f32 {
 
 fn fixed_color_to_u8(raw: u32) -> u8 {
     ((raw >> 12) & 0xff) as u8
+}
+
+fn float_vertex_to_fixed(raw: u32) -> u32 {
+    ((f32::from_bits(raw) * 16.0) as i16 as u16).into()
+}
+
+fn float_color_to_fixed(raw: u32) -> u32 {
+    ((f32::from_bits(raw) * 4096.0) as i32 as u32) & 0x00ff_ffff
 }
 
 fn edge(ax: f32, ay: f32, bx: f32, by: f32, px: f32, py: f32) -> f32 {

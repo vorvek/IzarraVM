@@ -2,9 +2,11 @@ use izarravm_video::{
     BIG_DISTIRA_CHIP_NAME, Distira, DistiraVertex, FBZ_DRAW_BACK, FBZ_RGB_WMASK,
     LFB_FORMAT_ARGB8888, LFB_WRITE_BACK, SMALL_DISTIRA_CHIP_NAME, SST_ALPHA_MODE,
     SST_CLIP_LEFT_RIGHT, SST_CLIP_LOW_Y_HIGH_Y, SST_COLOR1, SST_FASTFILL_CMD, SST_FBI_INIT0,
-    SST_FBI_INIT1, SST_FBI_INIT2, SST_FBI_INIT3, SST_FBI_INIT7, SST_FBZ_MODE, SST_LFB_MODE,
-    SST_START_B, SST_START_G, SST_START_R, SST_STATUS, SST_SWAPBUFFER_CMD, SST_TRIANGLE_CMD,
-    SST_VERTEX_AX, SST_VERTEX_AY, SST_VERTEX_BX, SST_VERTEX_BY, SST_VERTEX_CX, SST_VERTEX_CY,
+    SST_FBI_INIT1, SST_FBI_INIT2, SST_FBI_INIT3, SST_FBI_INIT7, SST_FBZ_MODE, SST_FSTART_B,
+    SST_FSTART_G, SST_FSTART_R, SST_FTRIANGLE_CMD, SST_FVERTEX_AX, SST_FVERTEX_AY, SST_FVERTEX_BX,
+    SST_FVERTEX_BY, SST_FVERTEX_CX, SST_FVERTEX_CY, SST_LFB_MODE, SST_START_B, SST_START_G,
+    SST_START_R, SST_STATUS, SST_SWAPBUFFER_CMD, SST_TRIANGLE_CMD, SST_VERTEX_AX, SST_VERTEX_AY,
+    SST_VERTEX_BX, SST_VERTEX_BY, SST_VERTEX_CX, SST_VERTEX_CY,
 };
 
 fn read_reg(distira: &Distira, reg: usize) -> u32 {
@@ -181,6 +183,37 @@ fn triangle_cmd_rasterizes_flat_untextured_triangle_from_integer_registers() {
     write_reg(&mut distira, SST_START_B, 0);
 
     write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+
+    let frame = distira.scanout_argb();
+    assert_eq!(frame[0], 0x00ff_0000);
+    assert_eq!(frame[1], 0x00ff_0000);
+    assert_eq!(frame[2], 0x00ff_0000);
+    assert_eq!(frame[3], 0x0000_0000);
+    assert_eq!(frame[4], 0x00ff_0000);
+    assert_eq!(frame[5], 0x00ff_0000);
+    assert_eq!(frame[6], 0x0000_0000);
+    assert_eq!(frame[8], 0x00ff_0000);
+}
+
+#[test]
+fn ftriangle_cmd_rasterizes_flat_untextured_triangle_from_float_registers() {
+    let mut distira = Distira::new();
+    distira.set_frame_size(4, 4);
+    distira.clear_back_rgb(0, 0, 0);
+
+    write_reg(&mut distira, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
+    write_reg(&mut distira, SST_FVERTEX_AX, 0.0f32.to_bits());
+    write_reg(&mut distira, SST_FVERTEX_AY, 0.0f32.to_bits());
+    write_reg(&mut distira, SST_FVERTEX_BX, 3.0f32.to_bits());
+    write_reg(&mut distira, SST_FVERTEX_BY, 0.0f32.to_bits());
+    write_reg(&mut distira, SST_FVERTEX_CX, 0.0f32.to_bits());
+    write_reg(&mut distira, SST_FVERTEX_CY, 3.0f32.to_bits());
+    write_reg(&mut distira, SST_FSTART_R, 255.0f32.to_bits());
+    write_reg(&mut distira, SST_FSTART_G, 0.0f32.to_bits());
+    write_reg(&mut distira, SST_FSTART_B, 0.0f32.to_bits());
+
+    write_reg(&mut distira, SST_FTRIANGLE_CMD, 1);
     write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
 
     let frame = distira.scanout_argb();

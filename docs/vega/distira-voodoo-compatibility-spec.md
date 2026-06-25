@@ -404,7 +404,10 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
 - [x] Iteration 5: direct Voodoo triangle command registers for a flat
       untextured triangle through `SST_triangleCMD`. Validated by the video
       triangle command test plus the workspace gates.
-- [ ] Next: float Voodoo triangle command registers through `SST_ftriangleCMD`.
+- [x] Iteration 6: float Voodoo triangle command registers for a flat
+      untextured triangle through `SST_ftriangleCMD`. Validated by the video
+      float triangle command test plus the workspace gates.
+- [ ] Next: Gouraud color gradients for untextured Voodoo triangles.
 
 ## First 90 percent push for this branch
 
