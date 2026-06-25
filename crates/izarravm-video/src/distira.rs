@@ -209,6 +209,7 @@ pub const FBZCP_A_SELECT_SHIFT: u32 = 2;
 pub const FBZCP_A_SELECT_MASK: u32 = 0x3;
 pub const A_SELECT_TEX: u32 = 1;
 pub const FBZCP_CC_LOCALSELECT_COLOR0: u32 = 1 << 4;
+pub const FBZCP_CC_SUB_CLOCAL: u32 = 1 << 9;
 pub const FBZCP_CC_ADD_CLOCAL: u32 = 1 << 14;
 pub const TC_ZERO_OTHER: u32 = 1 << 12;
 pub const TC_SUB_CLOCAL: u32 = 1 << 13;
@@ -1747,7 +1748,7 @@ impl Distira {
         color: (u8, u8, u8),
         source: (u8, u8, u8),
     ) -> (u8, u8, u8) {
-        if self.fbz_color_path & FBZCP_CC_ADD_CLOCAL == 0 {
+        if self.fbz_color_path & (FBZCP_CC_SUB_CLOCAL | FBZCP_CC_ADD_CLOCAL) == 0 {
             return color;
         }
         let local = if self.fbz_color_path & FBZCP_CC_LOCALSELECT_COLOR0 != 0 {
@@ -1759,11 +1760,24 @@ impl Distira {
         } else {
             source
         };
-        (
-            color.0.saturating_add(local.0),
-            color.1.saturating_add(local.1),
-            color.2.saturating_add(local.2),
-        )
+        let color = if self.fbz_color_path & FBZCP_CC_SUB_CLOCAL != 0 {
+            (
+                color.0.saturating_sub(local.0),
+                color.1.saturating_sub(local.1),
+                color.2.saturating_sub(local.2),
+            )
+        } else {
+            color
+        };
+        if self.fbz_color_path & FBZCP_CC_ADD_CLOCAL != 0 {
+            (
+                color.0.saturating_add(local.0),
+                color.1.saturating_add(local.1),
+                color.2.saturating_add(local.2),
+            )
+        } else {
+            color
+        }
     }
 
     fn apply_texture_detail_blend(&self, tmu: usize, color: (u8, u8, u8)) -> (u8, u8, u8) {
