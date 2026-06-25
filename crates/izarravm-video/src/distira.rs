@@ -194,6 +194,7 @@ pub const TEX_A8: u32 = 0x02;
 pub const TEX_I8: u32 = 0x03;
 pub const TEX_AI8: u32 = 0x04;
 pub const TEX_R5G6B5: u32 = 0x0a;
+pub const TEX_A8I8: u32 = 0x0d;
 const CHIP_TREX0: usize = 0x2;
 const CHIP_TREX1: usize = 0x4;
 
@@ -1485,7 +1486,10 @@ impl Distira {
     fn texture_color_or_source(&self, r: u8, g: u8, b: u8, s: f32, t: f32) -> (u8, u8, u8) {
         let format = (self.texture_mode >> 8) & 0xf;
         if self.fbz_color_path & FBZCP_TEXTURE_ENABLED == 0
-            || !matches!(format, TEX_RGB332 | TEX_A8 | TEX_I8 | TEX_AI8 | TEX_R5G6B5)
+            || !matches!(
+                format,
+                TEX_RGB332 | TEX_A8 | TEX_I8 | TEX_AI8 | TEX_R5G6B5 | TEX_A8I8
+            )
         {
             return (r, g, b);
         }
@@ -1509,6 +1513,7 @@ impl Distira {
             TEX_I8 => self.sample_tmu_i8(tmu, s, t),
             TEX_AI8 => self.sample_tmu_ai44(tmu, s, t),
             TEX_R5G6B5 => self.sample_tmu_rgb565(tmu, s, t),
+            TEX_A8I8 => self.sample_tmu_ai88(tmu, s, t),
             _ => (0, 0, 0),
         }
     }
@@ -1540,6 +1545,11 @@ impl Distira {
         (intensity, intensity, intensity)
     }
 
+    fn sample_tmu_ai88(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
+        let intensity = self.sample_tmu_u16(tmu, s, t) as u8;
+        (intensity, intensity, intensity)
+    }
+
     fn sample_tmu_i8(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
         let raw = self.sample_tmu_u8(tmu, s, t);
         (raw, raw, raw)
@@ -1557,6 +1567,23 @@ impl Distira {
             .saturating_add(texture_mip_offset(lod, 1))
             .saturating_add(texel);
         self.texture.get(offset).copied().unwrap_or(0)
+    }
+
+    fn sample_tmu_u16(&self, tmu: usize, s: f32, t: f32) -> u16 {
+        let lod = self.texture_lod_level(tmu);
+        let scale = (1_u32 << lod).max(1) as f32;
+        let width = (256_usize >> lod).max(1);
+        let height = (256_usize >> lod).max(1);
+        let s = (s / scale).floor() as usize & (width - 1);
+        let t = (t / scale).floor() as usize & (height - 1);
+        let texel = (t * width + s).saturating_mul(2);
+        let offset = (self.tex_base_addr_for_tmu(tmu) as usize)
+            .saturating_add(texture_mip_offset(lod, 2))
+            .saturating_add(texel);
+        let Some(bytes) = self.texture.get(offset..offset.saturating_add(2)) else {
+            return 0;
+        };
+        u16::from_le_bytes(bytes.try_into().unwrap())
     }
 
     fn sample_tmu_rgb565(&self, tmu: usize, s: f32, t: f32) -> (u8, u8, u8) {
