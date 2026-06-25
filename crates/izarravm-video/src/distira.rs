@@ -224,6 +224,10 @@ pub const FBZCP_CC_ADD_ALOCAL: u32 = 2 << 14;
 pub const FBZCP_CC_INVERT_OUTPUT: u32 = 1 << 16;
 pub const FBZCP_CCA_ZERO_OTHER: u32 = 1 << 17;
 pub const FBZCP_CCA_SUB_CLOCAL: u32 = 1 << 18;
+pub const FBZCP_CCA_MSELECT_SHIFT: u32 = 19;
+pub const FBZCP_CCA_MSELECT_MASK: u32 = 0x7;
+pub const CCA_MSELECT_ALOCAL: u32 = 1;
+pub const FBZCP_CCA_REVERSE_BLEND: u32 = 1 << 22;
 pub const TC_ZERO_OTHER: u32 = 1 << 12;
 pub const TC_SUB_CLOCAL: u32 = 1 << 13;
 pub const TC_MSELECT_SHIFT: u32 = 14;
@@ -1914,16 +1918,20 @@ impl Distira {
     }
 
     fn apply_alpha_path(&self, alocal: u8, aother: u8) -> u8 {
-        let alpha = if self.fbz_color_path & FBZCP_CCA_ZERO_OTHER != 0 {
+        let mut alpha = if self.fbz_color_path & FBZCP_CCA_ZERO_OTHER != 0 {
             0
         } else {
             aother
         };
         if self.fbz_color_path & FBZCP_CCA_SUB_CLOCAL != 0 {
-            alpha.saturating_sub(alocal)
-        } else {
-            alpha
+            alpha = alpha.saturating_sub(alocal);
         }
+        let mselect = (self.fbz_color_path >> FBZCP_CCA_MSELECT_SHIFT) & FBZCP_CCA_MSELECT_MASK;
+        if mselect == CCA_MSELECT_ALOCAL {
+            let reverse = self.fbz_color_path & FBZCP_CCA_REVERSE_BLEND != 0;
+            alpha = color_path_blend_channel(alpha, alocal, reverse);
+        }
+        alpha
     }
 
     fn sample_tmu_alpha(&self, tmu: usize, s: f32, t: f32) -> u8 {
