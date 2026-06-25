@@ -1750,6 +1750,19 @@ impl Machine {
         bus.read_memory_bytes(address, 1).map(|b| b[0]).unwrap_or(0)
     }
 
+    pub fn read_physical_u16(&mut self, address: u32) -> u16 {
+        let mut bus = self.make_bus();
+        bus.read_memory(address, BusWidth::Word, BusAccessKind::DataRead)
+            .map(|value| value as u16)
+            .unwrap_or(0)
+    }
+
+    pub fn read_physical_u32(&mut self, address: u32) -> u32 {
+        let mut bus = self.make_bus();
+        bus.read_memory(address, BusWidth::Dword, BusAccessKind::DataRead)
+            .unwrap_or(0)
+    }
+
     /// Last byte written to a passive I/O port (such as 0x80, the POST diagnostic
     /// port), or None if the port address is not in the passive port map. A
     /// decoded but never written port reads its default, not None.
@@ -7147,6 +7160,35 @@ impl CpuBus for MachineBus<'_> {
         kind: BusAccessKind,
     ) -> Result<u32, BusError> {
         let address = self.apply_a20(address);
+        let bytes = width.bytes() as usize;
+
+        if let Some(offset) = self.distira_lfb_offset(address, bytes) {
+            self.trace.push(BusCycle::new(
+                kind,
+                address,
+                width,
+                self.memory_wait_states(address),
+            ));
+            let offset = if width == BusWidth::Byte {
+                offset
+            } else {
+                offset & !1
+            };
+            return Ok(match width {
+                BusWidth::Byte => 0xff,
+                BusWidth::Word => u32::from(u16::from_le_bytes([
+                    self.distira.read_lfb_u8(offset),
+                    self.distira.read_lfb_u8(offset + 1),
+                ])),
+                BusWidth::Dword => u32::from_le_bytes([
+                    self.distira.read_lfb_u8(offset),
+                    self.distira.read_lfb_u8(offset + 1),
+                    self.distira.read_lfb_u8(offset + 2),
+                    self.distira.read_lfb_u8(offset + 3),
+                ]),
+            });
+        }
+
         if should_split(address, width) {
             let mut value = 0u32;
             for offset in 0..width.bytes() {
@@ -7163,7 +7205,6 @@ impl CpuBus for MachineBus<'_> {
             self.memory_wait_states(address),
         ));
 
-        let bytes = width.bytes() as usize;
         let data = self.read_memory_bytes(address, bytes)?;
         Ok(match width {
             BusWidth::Byte => u32::from(data[0]),
@@ -7180,6 +7221,26 @@ impl CpuBus for MachineBus<'_> {
         kind: BusAccessKind,
     ) -> Result<(), BusError> {
         let address = self.apply_a20(address);
+        if let Some(offset) = self.distira_lfb_offset(address, width.bytes() as usize) {
+            self.trace.push(BusCycle::new(
+                kind,
+                address,
+                width,
+                self.memory_wait_states(address),
+            ));
+            let offset = if width == BusWidth::Byte {
+                offset
+            } else {
+                offset & !1
+            };
+            match width {
+                BusWidth::Byte => {}
+                BusWidth::Word => self.distira.write_lfb_u16(offset, value as u16),
+                BusWidth::Dword => self.distira.write_lfb_u32(offset, value),
+            }
+            return Ok(());
+        }
+
         if should_split(address, width) {
             for offset in 0..width.bytes() {
                 self.write_memory(
@@ -7202,15 +7263,6 @@ impl CpuBus for MachineBus<'_> {
         if let Some(offset) = self.distira_cmdfifo_offset(address, width.bytes() as usize) {
             if width == BusWidth::Dword {
                 self.distira.write_command_fifo_u32(offset, value);
-            }
-            return Ok(());
-        }
-
-        if let Some(offset) = self.distira_lfb_offset(address, width.bytes() as usize) {
-            match width {
-                BusWidth::Byte => {}
-                BusWidth::Word => self.distira.write_lfb_u16(offset, value as u16),
-                BusWidth::Dword => self.distira.write_lfb_u32(offset, value),
             }
             return Ok(());
         }
