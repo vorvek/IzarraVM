@@ -543,6 +543,47 @@ fn triangle_cmd_chroma_key_rejects_matching_source_color() {
 }
 
 #[test]
+fn triangle_cmd_chroma_key_rejects_matching_texture_color() {
+    const SST_FBI_CHROMA_FAIL: usize = 0x150;
+    const SST_TEXTURE_MODE: usize = 0x300;
+    const SST_TEX_BASE_ADDR: usize = 0x30c;
+    const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
+    const TEX_R5G6B5: u32 = 0x0a;
+
+    let mut distira = Distira::new();
+    distira.set_frame_size(4, 4);
+    distira.clear_back_rgb(0, 0, 255);
+    assert!(distira.queue_texture_write_u32(0, 0xf800_f800));
+    distira.drain_fifo();
+
+    write_reg(
+        &mut distira,
+        SST_FBZ_MODE,
+        FBZ_RGB_WMASK | FBZ_DRAW_BACK | FBZ_CHROMAKEY,
+    );
+    write_reg(&mut distira, SST_FBZ_COLOR_PATH, FBZCP_TEXTURE_ENABLED);
+    write_reg(&mut distira, SST_CHROMA_KEY, 0x00ff_0000);
+    write_reg(&mut distira, SST_TEXTURE_MODE, TEX_R5G6B5 << 8);
+    write_reg(&mut distira, SST_TEX_BASE_ADDR, 0);
+    write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
+    write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_BY, 0 << 4);
+    write_reg(&mut distira, SST_VERTEX_CX, 0 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut distira, SST_START_R, 0);
+    write_reg(&mut distira, SST_START_G, 0xff << 12);
+    write_reg(&mut distira, SST_START_B, 0);
+
+    write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+
+    let frame = distira.scanout_argb();
+    assert_eq!(frame[0], 0x0000_00ff);
+    assert_eq!(read_reg(&distira, SST_FBI_CHROMA_FAIL), 6);
+}
+
+#[test]
 fn triangle_cmd_applies_constant_fog_color() {
     const FOG_ENABLE: u32 = 0x01;
     const FOG_CONSTANT: u32 = 0x20;
