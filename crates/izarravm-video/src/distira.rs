@@ -129,6 +129,8 @@ pub const SST_HV_RETRACE: usize = 0x240;
 pub const SST_FBI_INIT5: usize = 0x244;
 pub const SST_FBI_INIT6: usize = 0x248;
 pub const SST_FBI_INIT7: usize = 0x24c;
+pub const SST_TEXTURE_MODE: usize = 0x300;
+pub const SST_TEX_BASE_ADDR: usize = 0x30c;
 
 pub const LFB_WRITE_FRONT: u32 = 0x0000;
 pub const LFB_WRITE_BACK: u32 = 0x0010;
@@ -166,6 +168,9 @@ pub const FBZ_ALPHA_ENABLE: u32 = 1 << 18;
 pub const FBZ_DITHER_SUB: u32 = 1 << 19;
 pub const FBZ_DEPTH_SOURCE: u32 = 1 << 20;
 pub const FBZ_PARAM_ADJUST: u32 = 1 << 26;
+pub const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
+
+pub const TEX_R5G6B5: u32 = 0x0a;
 
 pub const DEPTHOP_NEVER: u32 = 0;
 pub const DEPTHOP_LESSTHAN: u32 = 1;
@@ -346,6 +351,8 @@ pub struct Distira {
     video_dimensions: u32,
     h_sync: u32,
     v_sync: u32,
+    texture_mode: u32,
+    tex_base_addr: u32,
 }
 
 impl Default for Distira {
@@ -421,6 +428,8 @@ impl Distira {
             video_dimensions: 0,
             h_sync: 0,
             v_sync: 0,
+            texture_mode: 0,
+            tex_base_addr: 0,
         }
     }
 
@@ -545,6 +554,7 @@ impl Distira {
                 let r = lerp_u8(a.r, b.r, c.r, l0, l1, l2);
                 let g = lerp_u8(a.g, b.g, c.g, l0, l1, l2);
                 let blue = lerp_u8(a.b, b.b, c.b, l0, l1, l2);
+                let (r, g, blue) = self.texture_color_or_source(r, g, blue);
                 let alpha = lerp_u8(a.a, b.a, c.a, l0, l1, l2);
                 if !self.alpha_test_passes(alpha) {
                     self.fbi_afunc_fail = self.fbi_afunc_fail.wrapping_add(1);
@@ -873,6 +883,8 @@ impl Distira {
             SST_FBI_INIT5 => merge_byte(&mut self.fbi_init[5], byte, value),
             SST_FBI_INIT6 => merge_byte(&mut self.fbi_init[6], byte, value),
             SST_FBI_INIT7 => merge_byte(&mut self.fbi_init[7], byte, value),
+            SST_TEXTURE_MODE => merge_byte(&mut self.texture_mode, byte, value),
+            SST_TEX_BASE_ADDR => merge_byte(&mut self.tex_base_addr, byte, value),
             DISTIRA_REG_CONTROL => {
                 let mut control = self.control_value();
                 merge_byte(&mut control, byte, value);
@@ -1064,6 +1076,8 @@ impl Distira {
             SST_FBI_INIT5 => self.fbi_init[5] & !0x1ff,
             SST_FBI_INIT6 => self.fbi_init[6],
             SST_FBI_INIT7 => self.fbi_init[7] & !0xff,
+            SST_TEXTURE_MODE => self.texture_mode,
+            SST_TEX_BASE_ADDR => self.tex_base_addr,
             DISTIRA_REG_STATUS => {
                 if self.display_enabled {
                     STATUS_DISPLAY_ENABLED
@@ -1294,6 +1308,24 @@ impl Distira {
             || r != (self.chroma_key >> 16) as u8
             || g != (self.chroma_key >> 8) as u8
             || b != self.chroma_key as u8
+    }
+
+    fn texture_color_or_source(&self, r: u8, g: u8, b: u8) -> (u8, u8, u8) {
+        if self.fbz_color_path & FBZCP_TEXTURE_ENABLED == 0
+            || ((self.texture_mode >> 8) & 0xf) != TEX_R5G6B5
+        {
+            return (r, g, b);
+        }
+        let offset = self.tex_base_addr as usize;
+        let Some(bytes) = self.texture.get(offset..offset.saturating_add(2)) else {
+            return (r, g, b);
+        };
+        let raw = u16::from_le_bytes([bytes[0], bytes[1]]);
+        (
+            expand5(raw >> 11) as u8,
+            expand6(raw >> 5) as u8,
+            expand5(raw) as u8,
+        )
     }
 
     fn apply_fog_color(&self, r: u8, g: u8, b: u8) -> (u8, u8, u8) {
