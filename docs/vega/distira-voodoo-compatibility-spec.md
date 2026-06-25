@@ -434,7 +434,10 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
       gates.
 - [x] Iteration 16: texture-enabled color path for nearest RGB565 texels.
       Validated by the video RGB565 texture sample test plus the workspace gates.
-- [ ] Next: S/T texture coordinate gradients for nearest sampling.
+- [x] Iteration 17: S/T texture coordinate gradients for nearest RGB565
+      sampling. Validated by the video S-gradient texture sample test plus the
+      workspace gates.
+- [ ] Next: float S/T texture coordinate registers for nearest sampling.
 
 ## First 90 percent push for this branch
 
