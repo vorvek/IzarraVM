@@ -214,6 +214,7 @@ pub const FBZCP_CC_MSELECT_SHIFT: u32 = 10;
 pub const FBZCP_CC_MSELECT_MASK: u32 = 0x7;
 pub const CC_MSELECT_CLOCAL: u32 = 1;
 pub const CC_MSELECT_AOTHER: u32 = 2;
+pub const CC_MSELECT_ALOCAL: u32 = 3;
 pub const FBZCP_CC_REVERSE_BLEND: u32 = 1 << 13;
 pub const FBZCP_CC_ADD_CLOCAL: u32 = 1 << 14;
 pub const FBZCP_CC_ADD_ALOCAL: u32 = 2 << 14;
@@ -1774,6 +1775,7 @@ impl Distira {
             == 0
             && mselect != CC_MSELECT_CLOCAL
             && mselect != CC_MSELECT_AOTHER
+            && mselect != CC_MSELECT_ALOCAL
         {
             return color;
         }
@@ -1799,6 +1801,13 @@ impl Distira {
                 color_path_blend_channel(color.0, aother, reverse),
                 color_path_blend_channel(color.1, aother, reverse),
                 color_path_blend_channel(color.2, aother, reverse),
+            )
+        } else if mselect == CC_MSELECT_ALOCAL {
+            let reverse = self.fbz_color_path & FBZCP_CC_REVERSE_BLEND != 0;
+            (
+                color_path_blend_channel(color.0, alocal, reverse),
+                color_path_blend_channel(color.1, alocal, reverse),
+                color_path_blend_channel(color.2, alocal, reverse),
             )
         } else {
             color
