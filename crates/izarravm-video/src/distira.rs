@@ -202,6 +202,8 @@ pub const FBZ_DITHER_SUB: u32 = 1 << 19;
 pub const FBZ_DEPTH_SOURCE: u32 = 1 << 20;
 pub const FBZ_PARAM_ADJUST: u32 = 1 << 26;
 pub const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
+pub const FBZCP_RGB_SELECT_MASK: u32 = 0x3;
+pub const RGB_SELECT_COLOR1: u32 = 2;
 pub const FBZCP_A_SELECT_SHIFT: u32 = 2;
 pub const FBZCP_A_SELECT_MASK: u32 = 0x3;
 pub const A_SELECT_TEX: u32 = 1;
@@ -1680,6 +1682,16 @@ impl Distira {
     }
 
     fn texture_color_or_source(&self, r: u8, g: u8, b: u8, s: f32, t: f32) -> (u8, u8, u8) {
+        if self.fbz_color_path & FBZCP_TEXTURE_ENABLED != 0
+            && self.fbz_color_path & FBZCP_RGB_SELECT_MASK == RGB_SELECT_COLOR1
+        {
+            return (
+                (self.color1 >> 16) as u8,
+                (self.color1 >> 8) as u8,
+                self.color1 as u8,
+            );
+        }
+
         let format = (self.texture_mode >> 8) & 0xf;
         if self.fbz_color_path & FBZCP_TEXTURE_ENABLED == 0
             || !matches!(
