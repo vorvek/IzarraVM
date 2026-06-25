@@ -1424,12 +1424,57 @@ impl Distira {
         {
             return (r, g, b);
         }
+        if self.texture_mode & 0x6 != 0 {
+            return self.bilinear_rgb565(s, t);
+        }
         let s = s.floor() as i32 & 0xff;
         let t = t.floor() as i32 & 0xff;
+        self.sample_rgb565_texel(s, t)
+    }
+
+    fn bilinear_rgb565(&self, s: f32, t: f32) -> (u8, u8, u8) {
+        let base_s = s.floor();
+        let base_t = t.floor();
+        let frac_s = ((s - base_s) * 16.0).floor().clamp(0.0, 15.0) as u32;
+        let frac_t = ((t - base_t) * 16.0).floor().clamp(0.0, 15.0) as u32;
+        let s0 = base_s as i32;
+        let t0 = base_t as i32;
+        let samples = [
+            self.sample_rgb565_texel(s0, t0),
+            self.sample_rgb565_texel(s0 + 1, t0),
+            self.sample_rgb565_texel(s0, t0 + 1),
+            self.sample_rgb565_texel(s0 + 1, t0 + 1),
+        ];
+        let weights = [
+            (16 - frac_s) * (16 - frac_t),
+            frac_s * (16 - frac_t),
+            (16 - frac_s) * frac_t,
+            frac_s * frac_t,
+        ];
+        let blend = |component: fn((u8, u8, u8)) -> u8| -> u8 {
+            samples
+                .iter()
+                .zip(weights)
+                .map(|(&sample, weight)| u32::from(component(sample)) * weight)
+                .sum::<u32>()
+                .checked_shr(8)
+                .unwrap_or(0)
+                .min(255) as u8
+        };
+        (
+            blend(|(r, _, _)| r),
+            blend(|(_, g, _)| g),
+            blend(|(_, _, b)| b),
+        )
+    }
+
+    fn sample_rgb565_texel(&self, s: i32, t: i32) -> (u8, u8, u8) {
+        let s = s & 0xff;
+        let t = t & 0xff;
         let texel = (t as usize * 256 + s as usize).saturating_mul(2);
         let offset = (self.tex_base_addr as usize).saturating_add(texel);
         let Some(bytes) = self.texture.get(offset..offset.saturating_add(2)) else {
-            return (r, g, b);
+            return (0, 0, 0);
         };
         let raw = u16::from_le_bytes([bytes[0], bytes[1]]);
         (
