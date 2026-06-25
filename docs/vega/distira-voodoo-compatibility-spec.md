@@ -498,7 +498,9 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
       the video texture alpha blend test plus the workspace gates.
 - [x] Iteration 47: texture color path selection behavior. Validated by the
       video color1-over-texture selection test plus the workspace gates.
-- [ ] Next: texture LFB color path selection behavior.
+- [x] Iteration 48: texture LFB color path selection behavior. Validated by
+      the video LFB-over-texture selection test plus the workspace gates.
+- [ ] Next: texture local color combine behavior.
 
 ## First 90 percent push for this branch
 

@@ -204,6 +204,7 @@ pub const FBZ_PARAM_ADJUST: u32 = 1 << 26;
 pub const FBZCP_TEXTURE_ENABLED: u32 = 1 << 27;
 pub const FBZCP_RGB_SELECT_MASK: u32 = 0x3;
 pub const RGB_SELECT_COLOR1: u32 = 2;
+pub const RGB_SELECT_LFB: u32 = 3;
 pub const FBZCP_A_SELECT_SHIFT: u32 = 2;
 pub const FBZCP_A_SELECT_MASK: u32 = 0x3;
 pub const A_SELECT_TEX: u32 = 1;
@@ -680,7 +681,7 @@ impl Distira {
                 let s = lerp_f32(a.s, b.s, c.s, l0, l1, l2);
                 let t = lerp_f32(a.t, b.t, c.t, l0, l1, l2);
                 let alpha = lerp_u8(a.a, b.a, c.a, l0, l1, l2);
-                let (r, g, blue) = self.texture_color_or_source(r, g, blue, s, t);
+                let (r, g, blue) = self.texture_color_or_source((x, y), (r, g, blue), (s, t));
                 let alpha = self.texture_alpha_or_source(alpha, s, t);
                 if !self.alpha_test_passes(alpha) {
                     self.fbi_afunc_fail = self.fbi_afunc_fail.wrapping_add(1);
@@ -1681,15 +1682,26 @@ impl Distira {
             || b != self.chroma_key as u8
     }
 
-    fn texture_color_or_source(&self, r: u8, g: u8, b: u8, s: f32, t: f32) -> (u8, u8, u8) {
-        if self.fbz_color_path & FBZCP_TEXTURE_ENABLED != 0
-            && self.fbz_color_path & FBZCP_RGB_SELECT_MASK == RGB_SELECT_COLOR1
-        {
-            return (
-                (self.color1 >> 16) as u8,
-                (self.color1 >> 8) as u8,
-                self.color1 as u8,
-            );
+    fn texture_color_or_source(
+        &self,
+        position: (u32, u32),
+        source: (u8, u8, u8),
+        texture_coords: (f32, f32),
+    ) -> (u8, u8, u8) {
+        let (r, g, b) = source;
+        let (s, t) = texture_coords;
+        if self.fbz_color_path & FBZCP_TEXTURE_ENABLED != 0 {
+            match self.fbz_color_path & FBZCP_RGB_SELECT_MASK {
+                RGB_SELECT_COLOR1 => {
+                    return (
+                        (self.color1 >> 16) as u8,
+                        (self.color1 >> 8) as u8,
+                        self.color1 as u8,
+                    );
+                }
+                RGB_SELECT_LFB => return self.read_back_pixel_rgb(position.0, position.1),
+                _ => {}
+            }
         }
 
         let format = (self.texture_mode >> 8) & 0xf;
