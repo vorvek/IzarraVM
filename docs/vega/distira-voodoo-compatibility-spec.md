@@ -702,5 +702,10 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
       writes against the BAR0 LFB window, including odd-aligned Voodoo callback
       masking and open-bus byte reads. Validated by the machine guest LFB BAR
       regression and the Distira machine gates.
-- [ ] Next: Guest instruction-level command FIFO type-1 register packets through
-      an assigned PCI BAR from real x86 code.
+- [x] Iteration 118: Guest instruction-level command FIFO type-1 register packets
+      now flow through the assigned BAR0 command-FIFO aperture from real x86
+      protected-mode code, preserving FIFO busy/depth status until the host drain
+      seam applies the register packet stream. Validated by the machine guest
+      command-FIFO type-1 BAR regression and the Distira machine gates.
+- [ ] Next: Guest instruction-level command FIFO type-5 framebuffer packets
+      through an assigned PCI BAR from real x86 code.
