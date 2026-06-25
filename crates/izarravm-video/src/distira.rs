@@ -185,8 +185,21 @@ pub const AFUNC_NOTEQUAL: u32 = 5;
 pub const AFUNC_GREATERTHANEQUAL: u32 = 6;
 pub const AFUNC_ALWAYS: u32 = 7;
 pub const ALPHA_TEST_ENABLE: u32 = 1;
+pub const ALPHA_BLEND_ENABLE: u32 = 1 << 4;
 pub const ALPHA_FUNC_SHIFT: u32 = 1;
+pub const ALPHA_SRC_FUNC_SHIFT: u32 = 8;
+pub const ALPHA_DST_FUNC_SHIFT: u32 = 12;
 pub const ALPHA_REF_SHIFT: u32 = 24;
+
+pub const BLEND_AZERO: u32 = 0;
+pub const BLEND_ASRC_ALPHA: u32 = 1;
+pub const BLEND_A_COLOR: u32 = 2;
+pub const BLEND_ADST_ALPHA: u32 = 3;
+pub const BLEND_AONE: u32 = 4;
+pub const BLEND_AOMSRC_ALPHA: u32 = 5;
+pub const BLEND_AOM_COLOR: u32 = 6;
+pub const BLEND_AOMDST_ALPHA: u32 = 7;
+pub const BLEND_ASATURATE: u32 = 0xf;
 
 pub const FBIINIT0_VGA_PASS: u32 = 1;
 pub const FBIINIT0_GRAPHICS_RESET: u32 = 1 << 1;
@@ -534,6 +547,7 @@ impl Distira {
                     self.fbi_afunc_fail = self.fbi_afunc_fail.wrapping_add(1);
                     continue;
                 }
+                let (r, g, blue) = self.alpha_blend_color(x, y, r, g, blue, alpha);
                 let pixel = pack_rgb565_for_pixel(r, g, blue, x, y, self.dither_enabled);
                 if self.write_back_pixel(x, y, pixel) {
                     if let Some(depth) = depth {
@@ -1267,6 +1281,39 @@ impl Distira {
         }
     }
 
+    fn alpha_blend_color(&self, x: u32, y: u32, r: u8, g: u8, b: u8, alpha: u8) -> (u8, u8, u8) {
+        if self.alpha_mode & ALPHA_BLEND_ENABLE == 0 {
+            return (r, g, b);
+        }
+        let (dest_r, dest_g, dest_b) = self.read_back_pixel_rgb(x, y);
+        let source_func = (self.alpha_mode >> ALPHA_SRC_FUNC_SHIFT) & 0xf;
+        let dest_func = (self.alpha_mode >> ALPHA_DST_FUNC_SHIFT) & 0xf;
+        (
+            blend_channel(source_func, r, r, alpha)
+                .saturating_add(blend_channel(dest_func, dest_r, r, alpha)),
+            blend_channel(source_func, g, g, alpha)
+                .saturating_add(blend_channel(dest_func, dest_g, g, alpha)),
+            blend_channel(source_func, b, b, alpha)
+                .saturating_add(blend_channel(dest_func, dest_b, b, alpha)),
+        )
+    }
+
+    fn read_back_pixel_rgb(&self, x: u32, y: u32) -> (u8, u8, u8) {
+        let off = u64::from(self.display.back_base)
+            .saturating_add(u64::from(y).saturating_mul(u64::from(self.display.pitch)))
+            .saturating_add(u64::from(x).saturating_mul(2));
+        let raw = if off + 1 < self.fb.len() as u64 {
+            u16::from_le_bytes([self.fb[off as usize], self.fb[off as usize + 1]])
+        } else {
+            0
+        };
+        (
+            expand5(raw >> 11) as u8,
+            expand6(raw >> 5) as u8,
+            expand5(raw) as u8,
+        )
+    }
+
     fn read_depth_pixel(&self, x: u32, y: u32) -> Option<u16> {
         self.depth_pixel_index(x, y)
             .and_then(|index| self.depth.get(index).copied())
@@ -1382,6 +1429,26 @@ fn lerp_u8(a: u8, b: u8, c: u8, w0: f32, w1: f32, w2: f32) -> u8 {
 
 fn lerp_f32(a: f32, b: f32, c: f32, w0: f32, w1: f32, w2: f32) -> f32 {
     a * w0 + b * w1 + c * w2
+}
+
+fn blend_channel(func: u32, component: u8, source: u8, source_alpha: u8) -> u8 {
+    let component = u32::from(component);
+    let source = u32::from(source);
+    let source_alpha = u32::from(source_alpha);
+    let destination_alpha = 255;
+    let value = match func {
+        BLEND_AZERO => 0,
+        BLEND_ASRC_ALPHA => component * source_alpha / 255,
+        BLEND_A_COLOR => component * source / 255,
+        BLEND_ADST_ALPHA => component * destination_alpha / 255,
+        BLEND_AONE => component,
+        BLEND_AOMSRC_ALPHA => component * (255 - source_alpha) / 255,
+        BLEND_AOM_COLOR => component * (255 - source) / 255,
+        BLEND_AOMDST_ALPHA => component * (255 - destination_alpha) / 255,
+        BLEND_ASATURATE => component * source_alpha.min(255 - destination_alpha) / 255,
+        _ => component,
+    };
+    value.min(255) as u8
 }
 
 fn quantize_channel(v: u8, bits: u32, cell: u32, dither: bool) -> u16 {

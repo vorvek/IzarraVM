@@ -463,6 +463,42 @@ fn ftriangle_cmd_alpha_test_uses_float_alpha_derivatives() {
 }
 
 #[test]
+fn triangle_cmd_alpha_blends_source_over_destination() {
+    const SST_START_A: usize = 0x030;
+    const AFUNC_ASRC_ALPHA: u32 = 1;
+    const AFUNC_AOMSRC_ALPHA: u32 = 5;
+    const ALPHA_BLEND_ENABLE: u32 = 1 << 4;
+
+    let mut distira = Distira::new();
+    distira.set_frame_size(4, 4);
+    distira.clear_back_rgb(0, 0, 255);
+
+    write_reg(&mut distira, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_DRAW_BACK);
+    write_reg(
+        &mut distira,
+        SST_ALPHA_MODE,
+        ALPHA_BLEND_ENABLE | (AFUNC_ASRC_ALPHA << 8) | (AFUNC_AOMSRC_ALPHA << 12),
+    );
+    write_reg(&mut distira, SST_VERTEX_AX, 0 << 4);
+    write_reg(&mut distira, SST_VERTEX_AY, 0 << 4);
+    write_reg(&mut distira, SST_VERTEX_BX, 3 << 4);
+    write_reg(&mut distira, SST_VERTEX_BY, 0 << 4);
+    write_reg(&mut distira, SST_VERTEX_CX, 0 << 4);
+    write_reg(&mut distira, SST_VERTEX_CY, 3 << 4);
+    write_reg(&mut distira, SST_START_R, 0xff << 12);
+    write_reg(&mut distira, SST_START_G, 0);
+    write_reg(&mut distira, SST_START_B, 0);
+    write_reg(&mut distira, SST_START_A, 128 << 12);
+
+    write_reg(&mut distira, SST_TRIANGLE_CMD, 1);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+
+    let frame = distira.scanout_argb();
+    assert_eq!(frame[0], 0x0084_007b);
+    assert_eq!(frame[3], 0x0000_00ff);
+}
+
+#[test]
 fn motherboard_chip_names_are_big_distira_and_small_distira() {
     let distira = Distira::new();
 
