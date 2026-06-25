@@ -1,7 +1,8 @@
 use izarravm_core::VideoCard;
 use izarravm_firmware::I386DX25_TEST_ROM;
 use izarravm_machine::{
-    ActiveDisplay, DISTIRA_LFB_BASE, DISTIRA_MMIO_BASE, Machine, MachineProfile, StopReason,
+    ActiveDisplay, BIOS_ROM_SIZE, DISTIRA_LFB_BASE, DISTIRA_MMIO_BASE, Machine, MachineProfile,
+    StopReason,
 };
 use izarravm_video::{
     ALPHA_BLEND_ENABLE, ALPHA_DST_FUNC_SHIFT, ALPHA_SRC_FUNC_SHIFT, BLEND_AONE, BLEND_AZERO,
@@ -39,6 +40,115 @@ fn cmdfifo_type1_header(reg: usize, count: u32) -> u32 {
 
 fn cmdfifo_type5_framebuffer_header(count: u32) -> u32 {
     (2 << 30) | (count << 3) | 5
+}
+
+fn push_u16(out: &mut Vec<u8>, value: u16) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_mov_eax_imm32(out: &mut Vec<u8>, value: u32) {
+    out.push(0xb8);
+    push_u32(out, value);
+}
+
+fn push_mov_dx_imm16(out: &mut Vec<u8>, value: u16) {
+    out.extend_from_slice(&[0x66, 0xba]);
+    push_u16(out, value);
+}
+
+fn push_out_dx_eax(out: &mut Vec<u8>, port: u16, value: u32) {
+    push_mov_dx_imm16(out, port);
+    push_mov_eax_imm32(out, value);
+    out.push(0xef);
+}
+
+fn push_mov_moffs_u32_imm32(out: &mut Vec<u8>, address: u32, value: u32) {
+    out.extend_from_slice(&[0xc7, 0x05]);
+    push_u32(out, address);
+    push_u32(out, value);
+}
+
+fn push_mov_moffs_u16_imm16(out: &mut Vec<u8>, address: u32, value: u16) {
+    out.extend_from_slice(&[0x66, 0xc7, 0x05]);
+    push_u32(out, address);
+    push_u16(out, value);
+}
+
+fn push_load_ax_moffs(out: &mut Vec<u8>, address: u32) {
+    out.extend_from_slice(&[0x66, 0xa1]);
+    push_u32(out, address);
+}
+
+fn push_load_al_moffs(out: &mut Vec<u8>, address: u32) {
+    out.push(0xa0);
+    push_u32(out, address);
+}
+
+fn push_load_eax_moffs(out: &mut Vec<u8>, address: u32) {
+    out.push(0xa1);
+    push_u32(out, address);
+}
+
+fn push_store_ax_moffs(out: &mut Vec<u8>, address: u32) {
+    out.extend_from_slice(&[0x66, 0xa3]);
+    push_u32(out, address);
+}
+
+fn push_store_al_moffs(out: &mut Vec<u8>, address: u32) {
+    out.push(0xa2);
+    push_u32(out, address);
+}
+
+fn push_store_eax_moffs(out: &mut Vec<u8>, address: u32) {
+    out.push(0xa3);
+    push_u32(out, address);
+}
+
+fn protected_flat_rom(body: &[u8]) -> Vec<u8> {
+    const ROM_BASE: u32 = 0x000f_0000;
+    let mut protected = vec![
+        0x66, 0xb8, 0x10, 0x00, // mov ax,10h
+        0x8e, 0xd8, // mov ds,ax
+        0x8e, 0xc0, // mov es,ax
+        0x8e, 0xd0, // mov ss,ax
+        0xbc, 0x00, 0x80, 0x00, 0x00, // mov esp,8000h
+    ];
+    protected.extend_from_slice(body);
+    protected.push(0xf4); // hlt
+
+    let real_prefix_len = 27u16;
+    let protected_offset = u32::from(real_prefix_len);
+    let gdtr_offset = real_prefix_len as usize + protected.len();
+    let gdt_offset = gdtr_offset + 6;
+
+    let mut code = Vec::new();
+    code.extend_from_slice(&[0x0e, 0x1f]); // push cs; pop ds
+    code.push(0xfa); // cli
+    code.extend_from_slice(&[0x66, 0x0f, 0x01, 0x16]); // lgdt [gdtr]
+    push_u16(&mut code, gdtr_offset as u16);
+    code.extend_from_slice(&[0x0f, 0x20, 0xc0]); // mov eax,cr0
+    code.extend_from_slice(&[0x66, 0x83, 0xc8, 0x01]); // or eax,1
+    code.extend_from_slice(&[0x0f, 0x22, 0xc0]); // mov cr0,eax
+    code.extend_from_slice(&[0x66, 0xea]); // jmp 08h:protected_entry
+    push_u32(&mut code, ROM_BASE + protected_offset);
+    push_u16(&mut code, 0x0008);
+    assert_eq!(code.len(), usize::from(real_prefix_len));
+    code.extend_from_slice(&protected);
+
+    push_u16(&mut code, 24 - 1);
+    push_u32(&mut code, ROM_BASE + gdt_offset as u32);
+    code.extend_from_slice(&[0; 8]);
+    code.extend_from_slice(&[0xff, 0xff, 0, 0, 0, 0x9a, 0xcf, 0]);
+    code.extend_from_slice(&[0xff, 0xff, 0, 0, 0, 0x92, 0xcf, 0]);
+
+    let mut rom = vec![0; BIOS_ROM_SIZE];
+    rom[..code.len()].copy_from_slice(&code);
+    rom[0xfff0..0xfff5].copy_from_slice(&[0xea, 0x00, 0x00, 0x00, 0xf0]);
+    rom
 }
 
 #[test]
@@ -165,6 +275,51 @@ fn distira_odd_aligned_lfb_word_dword_accesses_use_voodoo_callbacks() {
     assert_eq!(machine.read_physical_u32(DISTIRA_LFB_BASE + 3), 0x07e0_001f);
     write_reg(&mut machine, SST_SWAPBUFFER_CMD, 1);
 
+    let (frame, width, height) = machine.frame_argb();
+    assert_eq!((width, height), (4, 1));
+    assert_eq!(frame, vec![0x00ff_0000, 0x0000_00ff, 0x0000_ff00, 0]);
+}
+
+#[test]
+fn distira_guest_lfb_bar_odd_reads_and_writes_use_voodoo_callbacks() {
+    const ASSIGNED_BAR: u32 = 0xe200_0000;
+    const ASSIGNED_LFB: u32 = ASSIGNED_BAR + 0x0040_0000;
+    const SCRATCH: u32 = 0x2200;
+
+    let mut code = Vec::new();
+    push_out_dx_eax(&mut code, 0x0cf8, 0x8000_8010);
+    push_out_dx_eax(&mut code, 0x0cfc, ASSIGNED_BAR);
+    push_out_dx_eax(&mut code, 0x0cf8, 0x8000_8004);
+    push_out_dx_eax(&mut code, 0x0cfc, 0x0000_0002);
+    push_mov_moffs_u32_imm32(&mut code, ASSIGNED_BAR + DISTIRA_REG_FB_WIDTH as u32, 4);
+    push_mov_moffs_u32_imm32(&mut code, ASSIGNED_BAR + DISTIRA_REG_FB_HEIGHT as u32, 1);
+    push_mov_moffs_u32_imm32(
+        &mut code,
+        ASSIGNED_BAR + SST_LFB_MODE as u32,
+        LFB_FORMAT_RGB565 | LFB_WRITE_BACK | LFB_READ_BACK,
+    );
+    push_mov_moffs_u16_imm16(&mut code, ASSIGNED_LFB + 1, 0xf800);
+    push_load_ax_moffs(&mut code, ASSIGNED_LFB + 1);
+    push_store_ax_moffs(&mut code, SCRATCH);
+    push_load_al_moffs(&mut code, ASSIGNED_LFB + 1);
+    push_store_al_moffs(&mut code, SCRATCH + 2);
+    push_mov_moffs_u32_imm32(&mut code, ASSIGNED_LFB + 2, 0x07e0_001f);
+    push_load_eax_moffs(&mut code, ASSIGNED_LFB + 3);
+    push_store_eax_moffs(&mut code, SCRATCH + 4);
+    push_mov_moffs_u32_imm32(&mut code, ASSIGNED_BAR + SST_SWAPBUFFER_CMD as u32, 1);
+
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Distira),
+        protected_flat_rom(&code),
+    )
+    .unwrap();
+
+    let reason = machine.run_until_halt_or_cycles(500_000).unwrap();
+
+    assert_eq!(reason, StopReason::Halted);
+    assert_eq!(machine.read_physical_u16(SCRATCH), 0xf800);
+    assert_eq!(machine.read_physical_u8(SCRATCH + 2), 0xff);
+    assert_eq!(machine.read_physical_u32(SCRATCH + 4), 0x07e0_001f);
     let (frame, width, height) = machine.frame_argb();
     assert_eq!((width, height), (4, 1));
     assert_eq!(frame, vec![0x00ff_0000, 0x0000_00ff, 0x0000_ff00, 0]);

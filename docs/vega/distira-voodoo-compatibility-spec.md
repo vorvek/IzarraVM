@@ -697,5 +697,10 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
       remain open bus, and unaligned writes still update the expected RGB565
       pixels. Validated by the machine odd-aligned LFB callback regression and the
       Distira video/machine gates.
-- [ ] Next: Guest instruction-level LFB aperture parity through an assigned PCI
-      BAR, including odd word/dword reads and writes from real x86 code.
+- [x] Iteration 117: Guest instruction-level LFB aperture parity through an
+      assigned PCI BAR now exercises real x86 protected-mode word/dword reads and
+      writes against the BAR0 LFB window, including odd-aligned Voodoo callback
+      masking and open-bus byte reads. Validated by the machine guest LFB BAR
+      regression and the Distira machine gates.
+- [ ] Next: Guest instruction-level command FIFO type-1 register packets through
+      an assigned PCI BAR from real x86 code.
