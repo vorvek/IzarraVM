@@ -806,6 +806,13 @@ struct LoadedBlockDevice {
     bpbs_by_unit: Vec<Option<BlockDeviceBpb>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockDeviceIoTarget {
+    pub header: FarPtr,
+    pub unit: u8,
+    pub media: u8,
+}
+
 /// Where SYSINIT should try to place a raw CONFIG.SYS driver image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverLoadPlacement {
@@ -1266,6 +1273,28 @@ impl DosKernel {
         u8::try_from(next)
             .ok()
             .filter(|drive| *drive <= MAX_DOS_DRIVE)
+    }
+
+    pub fn block_device_io_target(&self, drive: u8) -> Option<BlockDeviceIoTarget> {
+        for device in &self.loaded_block_devices {
+            if drive < device.first_drive {
+                continue;
+            }
+            let unit = drive - device.first_drive;
+            if unit >= device.installed_units {
+                continue;
+            }
+            let bpb = device.bpbs_by_unit.get(usize::from(unit))?.as_ref()?;
+            return Some(BlockDeviceIoTarget {
+                header: FarPtr {
+                    segment: device.header.0,
+                    offset: device.header.1,
+                },
+                unit,
+                media: bpb.media,
+            });
+        }
+        None
     }
 
     fn published_block_dpbs(&self) -> Vec<BlockDeviceDpbEntry> {
