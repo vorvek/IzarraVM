@@ -205,6 +205,7 @@ pub const TEXTUREMODE_TCLAMPS: u32 = 1 << 6;
 pub const TEXTUREMODE_TCLAMPT: u32 = 1 << 7;
 pub const LOD_ODD: u32 = 1 << 18;
 pub const LOD_SPLIT: u32 = 1 << 19;
+pub const LOD_S_IS_WIDER: u32 = 1 << 20;
 pub const LOD_TMULTIBASEADDR: u32 = 1 << 24;
 pub const LOD_TMIRROR_S: u32 = 1 << 28;
 pub const LOD_TMIRROR_T: u32 = 1 << 29;
@@ -339,7 +340,8 @@ impl DistiraVertex {
 
 #[derive(Clone, Copy)]
 struct TmuTextureSample {
-    lod: u32,
+    width: usize,
+    height: usize,
     base_addr: u32,
     mip_offset: usize,
     mode: u32,
@@ -1706,8 +1708,7 @@ impl Distira {
         let mode = self.texture_mode_for_tmu(tmu);
         let lod_reg = self.texture_lod_for_tmu(tmu);
         let scale = (1_u32 << lod).max(1) as f32;
-        let width = (256_usize >> lod).max(1);
-        let height = (256_usize >> lod).max(1);
+        let (width, height) = self.texture_dimensions_for_lod(tmu, lod);
         let s = texture_coord_index(
             s / scale,
             width,
@@ -1806,8 +1807,7 @@ impl Distira {
         let mode = self.texture_mode_for_tmu(tmu);
         let lod_reg = self.texture_lod_for_tmu(tmu);
         let scale = (1_u32 << lod).max(1) as f32;
-        let width = (256_usize >> lod).max(1);
-        let height = (256_usize >> lod).max(1);
+        let (width, height) = self.texture_dimensions_for_lod(tmu, lod);
         let s = texture_coord_index(
             s / scale,
             width,
@@ -1832,8 +1832,7 @@ impl Distira {
         let mode = self.texture_mode_for_tmu(tmu);
         let lod_reg = self.texture_lod_for_tmu(tmu);
         let scale = (1_u32 << lod).max(1) as f32;
-        let width = (256_usize >> lod).max(1);
-        let height = (256_usize >> lod).max(1);
+        let (width, height) = self.texture_dimensions_for_lod(tmu, lod);
         let s = texture_coord_index(
             s / scale,
             width,
@@ -1865,8 +1864,10 @@ impl Distira {
         let t = t / scale;
         let base_addr = self.tex_base_addr_for_tmu_lod(tmu, lod);
         let mip_offset = self.texture_mip_offset_for_lod(tmu, lod, 2);
+        let (width, height) = self.texture_dimensions_for_lod(tmu, lod);
         let sample = TmuTextureSample {
-            lod,
+            width,
+            height,
             base_addr,
             mip_offset,
             mode,
@@ -1875,8 +1876,6 @@ impl Distira {
         if mode & 0x6 != 0 {
             return self.bilinear_rgb565(s, t, sample);
         }
-        let width = (256_usize >> lod).max(1);
-        let height = (256_usize >> lod).max(1);
         let s = texture_coord_index(
             s,
             width,
@@ -1955,6 +1954,19 @@ impl Distira {
         }
     }
 
+    fn texture_dimensions_for_lod(&self, tmu: usize, lod: u32) -> (usize, usize) {
+        let lod_reg = self.texture_lod_for_tmu(tmu);
+        let aspect = ((lod_reg >> 21) & 0x3) as usize;
+        let mut width = (256_usize >> lod).max(1);
+        let mut height = (256_usize >> lod).max(1);
+        if lod_reg & LOD_S_IS_WIDER != 0 {
+            height = (height >> aspect).max(1);
+        } else {
+            width = (width >> aspect).max(1);
+        }
+        (width, height)
+    }
+
     fn tex_base_addr_for_tmu(&self, tmu: usize) -> u32 {
         if tmu == 0 {
             self.tex_base_addr
@@ -1985,26 +1997,29 @@ impl Distira {
         if self.texture_lod_for_tmu(tmu) & LOD_TMULTIBASEADDR != 0 {
             0
         } else {
-            texture_mip_offset(lod, bytes_per_texel)
+            (0..lod)
+                .map(|level| {
+                    let (width, height) = self.texture_dimensions_for_lod(tmu, level);
+                    width * height * bytes_per_texel
+                })
+                .sum()
         }
     }
 
     fn sample_rgb565_texel(&self, s: i32, t: i32, sample: TmuTextureSample) -> (u8, u8, u8) {
-        let width = (256_usize >> sample.lod).max(1);
-        let height = (256_usize >> sample.lod).max(1);
         let s = texture_coord_index_i32(
             s,
-            width,
+            sample.width,
             sample.mode & TEXTUREMODE_TCLAMPS != 0,
             sample.lod_reg & LOD_TMIRROR_S != 0,
         );
         let t = texture_coord_index_i32(
             t,
-            height,
+            sample.height,
             sample.mode & TEXTUREMODE_TCLAMPT != 0,
             sample.lod_reg & LOD_TMIRROR_T != 0,
         );
-        let texel = (t * width + s).saturating_mul(2);
+        let texel = (t * sample.width + s).saturating_mul(2);
         let offset = (sample.base_addr as usize)
             .saturating_add(sample.mip_offset)
             .saturating_add(texel);
@@ -2189,16 +2204,6 @@ fn float_depth_to_fixed(raw: u32) -> u32 {
 
 fn float_texture_coord_to_fixed(raw: u32) -> u32 {
     (f32::from_bits(raw) * 16384.0) as i32 as u32
-}
-
-fn texture_mip_offset(lod: u32, bytes_per_texel: usize) -> usize {
-    (0..lod)
-        .map(|level| {
-            let width = (256_usize >> level).max(1);
-            let height = (256_usize >> level).max(1);
-            width * height * bytes_per_texel
-        })
-        .sum()
 }
 
 fn signed_ncc_component(raw: u32, shift: u32) -> i32 {
