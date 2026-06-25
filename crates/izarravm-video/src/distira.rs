@@ -227,6 +227,7 @@ pub const FBZCP_CCA_SUB_CLOCAL: u32 = 1 << 18;
 pub const FBZCP_CCA_MSELECT_SHIFT: u32 = 19;
 pub const FBZCP_CCA_MSELECT_MASK: u32 = 0x7;
 pub const CCA_MSELECT_ALOCAL: u32 = 1;
+pub const CCA_MSELECT_AOTHER: u32 = 2;
 pub const FBZCP_CCA_REVERSE_BLEND: u32 = 1 << 22;
 pub const TC_ZERO_OTHER: u32 = 1 << 12;
 pub const TC_SUB_CLOCAL: u32 = 1 << 13;
@@ -1927,9 +1928,14 @@ impl Distira {
             alpha = alpha.saturating_sub(alocal);
         }
         let mselect = (self.fbz_color_path >> FBZCP_CCA_MSELECT_SHIFT) & FBZCP_CCA_MSELECT_MASK;
-        if mselect == CCA_MSELECT_ALOCAL {
+        if mselect == CCA_MSELECT_ALOCAL || mselect == CCA_MSELECT_AOTHER {
+            let factor = if mselect == CCA_MSELECT_AOTHER {
+                aother
+            } else {
+                alocal
+            };
             let reverse = self.fbz_color_path & FBZCP_CCA_REVERSE_BLEND != 0;
-            alpha = color_path_blend_channel(alpha, alocal, reverse);
+            alpha = color_path_blend_channel(alpha, factor, reverse);
         }
         alpha
     }
