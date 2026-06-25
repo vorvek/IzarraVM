@@ -798,6 +798,15 @@ struct FindEntry {
     name: String, // uppercase 8.3, e.g. "LEVEL1.DAT"
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DosFindEntry {
+    pub name_8_3: [u8; 11],
+    pub attr: u8,
+    pub time: u16,
+    pub date: u16,
+    pub size: u32,
+}
+
 /// A live directory search: the snapshot of matching entries and the cursor into
 /// it, keyed in the kernel by the DTA address. The whole match list is
 /// taken once at FindFirst; host directory changes between calls are not seen
@@ -2123,6 +2132,40 @@ impl DosKernel {
         Ok((dir, pattern))
     }
 
+    pub fn find_first_from_entries(
+        &mut self,
+        mem: &mut Memory,
+        regs: &mut DosRegs,
+        pattern: &str,
+        entries: &[DosFindEntry],
+    ) -> Result<DosAction, DosError> {
+        let mask = regs.cx as u8;
+        let pattern_template = pattern_to_8_3(pattern);
+        let entries = entries
+            .iter()
+            .filter(|entry| {
+                attr_matches(entry.attr, mask)
+                    && template_matches(&entry.name_8_3, &pattern_template)
+            })
+            .map(|entry| FindEntry {
+                attr: entry.attr,
+                time: entry.time,
+                date: entry.date,
+                size: entry.size,
+                name: find_name_from_8_3(&entry.name_8_3),
+            })
+            .collect::<Vec<_>>();
+        let Some(first) = entries.first().cloned() else {
+            self.fail_find_first(regs, 0x12);
+            return Ok(DosAction::Continue);
+        };
+        write_find_record(mem, self.dta, &first)?;
+        self.find_searches
+            .insert(self.dta, FindSearch { entries, next: 1 });
+        regs.cf = false;
+        Ok(DosAction::Continue)
+    }
+
     /// Return the normal 37-byte FCB subrecord. An extended FCB starts with a 0xFF
     /// marker, five reserved bytes, an attribute byte, then the normal FCB at +7.
     fn fcb_body_base(&self, mem: &Memory, base: usize) -> Result<usize, DosError> {
@@ -3083,6 +3126,11 @@ impl DosKernel {
     }
 
     pub fn fail_regs(&mut self, regs: &mut DosRegs, code: u16) {
+        self.fail(regs, code);
+    }
+
+    pub fn fail_find_first(&mut self, regs: &mut DosRegs, code: u16) {
+        self.find_searches.remove(&self.dta);
         self.fail(regs, code);
     }
 
@@ -4119,13 +4167,13 @@ impl DosKernel {
             // matching file).
             0x4e => {
                 let Some(filespec) = read_asciiz(mem, regs.ds, regs.dx)? else {
-                    set_dos_error(regs, 0x03);
+                    self.fail_find_first(regs, 0x03);
                     return Ok(DosAction::Continue);
                 };
                 let (dir, pattern) = match self.split_find_spec(&filespec) {
                     Ok(split) => split,
                     Err(code) => {
-                        set_dos_error(regs, code);
+                        self.fail_find_first(regs, code);
                         return Ok(DosAction::Continue);
                     }
                 };
@@ -4134,11 +4182,11 @@ impl DosKernel {
                 let read_dir = match std::fs::read_dir(&dir) {
                     Ok(read_dir) => read_dir,
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                        set_dos_error(regs, 0x03);
+                        self.fail_find_first(regs, 0x03);
                         return Ok(DosAction::Continue);
                     }
                     Err(_) => {
-                        set_dos_error(regs, 0x05);
+                        self.fail_find_first(regs, 0x05);
                         return Ok(DosAction::Continue);
                     }
                 };
@@ -4174,7 +4222,7 @@ impl DosKernel {
                     });
                 }
                 let Some(first) = entries.first().cloned() else {
-                    set_dos_error(regs, 0x12);
+                    self.fail_find_first(regs, 0x12);
                     return Ok(DosAction::Continue);
                 };
                 write_find_record(mem, self.dta, &first)?;
@@ -5703,6 +5751,16 @@ fn template_matches(file: &[u8; 11], pattern: &[u8; 11]) -> bool {
         .all(|(&f, &p)| p == b'?' || p == f)
 }
 
+fn find_name_from_8_3(name: &[u8; 11]) -> String {
+    let stem = String::from_utf8_lossy(&name[..8]).trim_end().to_string();
+    let ext = String::from_utf8_lossy(&name[8..]).trim_end().to_string();
+    if ext.is_empty() {
+        stem
+    } else {
+        format!("{stem}.{ext}")
+    }
+}
+
 /// RBIL: for masks other than the volume-label bit, a file matches if it has at
 /// most the masked special attributes. Host files carry only "normal" (0x00) or
 /// "directory" (0x10): a normal file always matches; a directory matches only when
@@ -6071,6 +6129,10 @@ fn read_asciiz(mem: &Memory, seg: u16, off: u16) -> Result<Option<String>, DosEr
         bytes.push(byte);
     }
     Ok(None)
+}
+
+pub fn read_dos_asciiz(mem: &Memory, seg: u16, off: u16) -> Result<Option<String>, DosError> {
+    read_asciiz(mem, seg, off)
 }
 
 #[cfg(test)]
