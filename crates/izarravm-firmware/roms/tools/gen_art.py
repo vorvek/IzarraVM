@@ -158,6 +158,13 @@ def main():
     pal, index = build_palette([grey, color, boot])
     field_idx = index[FIELD]
     ink_idx = min(range(len(pal)), key=lambda i: sum(pal[i]))
+    # A strong red (for menu titles) and a mid grey (for disabled menu rows), used
+    # by the LFB boot menu. Picked from the shared palette so they survive a regen.
+    red_idx = max(range(len(pal)), key=lambda i: pal[i][0] - max(pal[i][1], pal[i][2]))
+    grey_idx = min(
+        range(len(pal)),
+        key=lambda i: (max(pal[i]) - min(pal[i])) + abs(sum(pal[i]) / 3 - 150),
+    )
 
     bg_rle = rle(index_region(grey, index, 0, 0, 320, 240))
     icons = detect_icons(grey)
@@ -178,6 +185,8 @@ def main():
     out.append(f"%define ART_PAL_COUNT   {len(pal)}")
     out.append(f"%define ART_FIELD_INDEX {field_idx}")
     out.append(f"%define ART_INK_INDEX   {ink_idx}")
+    out.append(f"%define ART_RED_INDEX   {red_idx}")
+    out.append(f"%define ART_GREY_INDEX  {grey_idx}")
     for i, (x, y, w, h) in enumerate(icons):
         out.append(
             f"%define ICON_{i}_X {x}\n%define ICON_{i}_Y {y}\n"

@@ -6,6 +6,8 @@
 %define ART_PAL_COUNT   31
 %define ART_FIELD_INDEX 29
 %define ART_INK_INDEX   0
+%define ART_RED_INDEX   24
+%define ART_GREY_INDEX  20
 %define ICON_0_X 42
 %define ICON_0_Y 166
 %define ICON_0_W 24
