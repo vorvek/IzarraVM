@@ -472,7 +472,9 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
       NCC texture sample test plus the workspace gates.
 - [x] Iteration 34: A8Y4I2Q2 texture sampling. Validated by the video A8Y4I2Q2
       NCC texture sample test plus the workspace gates.
-- [ ] Next: LOD clamp behavior.
+- [x] Iteration 35: LOD clamp behavior. Validated by the video tLOD max clamp
+      texture sample test plus the workspace gates.
+- [ ] Next: S/T texture clamp behavior.
 
 ## First 90 percent push for this branch
 

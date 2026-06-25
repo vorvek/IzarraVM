@@ -1832,7 +1832,13 @@ impl Distira {
         } else {
             self.texture_lod_tmu1
         };
-        ((lod >> 2) & 0xf).min(8)
+        let min_lod = ((lod >> 2) & 0xf).min(8);
+        let max_lod = ((lod >> 8) & 0xf).min(8);
+        if max_lod == 0 {
+            min_lod
+        } else {
+            min_lod.min(max_lod)
+        }
     }
 
     fn tex_base_addr_for_tmu(&self, tmu: usize) -> u32 {
