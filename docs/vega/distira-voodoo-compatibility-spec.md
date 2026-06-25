@@ -480,7 +480,9 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
       texture sample test plus the workspace gates.
 - [x] Iteration 38: texture multibase LOD address behavior. Validated by the
       video RGB565 multibase LOD address test plus the workspace gates.
-- [ ] Next: split/odd LOD selection behavior.
+- [x] Iteration 39: split/odd LOD selection behavior. Validated by the video
+      split/odd RGB565 multibase LOD address test plus the workspace gates.
+- [ ] Next: texture aspect ratio LOD dimensions.
 
 ## First 90 percent push for this branch
 
