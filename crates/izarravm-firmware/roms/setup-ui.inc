@@ -158,20 +158,32 @@ su_wait_hotkey:
     stc
     ret
 
-; su_post_note: draw a short status line on the still-visible graceful POST screen
-; when a hotkey is caught, so the press gets immediate feedback before the setup
-; page or boot menu repaints over it. SI = CS-relative ASCIIZ on entry. Black on the
-; white POST field, just under the hint row. Preserves the caller's registers and
-; the CF/AL the hotkey path is about to return.
+; su_post_note: draw a short status line on the still-visible graphical POST
+; screen (the Margo LFB) when a hotkey is caught, so the press gets immediate
+; feedback before the setup page or boot menu mode-switches over it. SI =
+; CS-relative ASCIIZ on entry. It overwrites the two key-hint rows with the note,
+; ink on the field. Preserves the caller's registers (the hotkey path re-sets the
+; CF/AL it returns after this call). NOTE: the BIOS is in the LFB mode here, so
+; this must use lfb_* primitives -- mode-13h gfx_* writes would be invisible.
 su_post_note:
     pusha
+    mov bp, si                      ; BP = note string pointer (survives the wipe)
+    ; Wipe the two hint rows on the LFB to the field colour.
+    mov di, ART_HDR_X
+    mov si, ART_HINT1_Y
+    mov cx, 200
+    mov dx, 20
+    mov bl, ART_FIELD_INDEX
+    call lfb_fill_rect
+    ; Draw the note where the first hint row was.
     push cs
     pop ds                          ; DS = CS so DS:SI reaches the ROM string
-    mov di, POST_TEXT_X
-    mov ax, POST_HINT_Y + 12        ; one row below the "Del: Setup ..." hint
-    mov bl, GFX_BLACK
-    mov bh, GFX_WHITE
-    call gfx_text
+    mov si, bp
+    mov di, ART_HDR_X
+    mov ax, ART_HINT1_Y
+    mov bl, ART_INK_INDEX
+    mov bh, ART_FIELD_INDEX
+    call lfb_text
     popa
     ret
 

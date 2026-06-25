@@ -439,12 +439,29 @@ gfx_post_screen:
     mov bl, ART_INK_INDEX
     mov bh, ART_FIELD_INDEX
     call lfb_text
-    ; Header line 2: "Starting your computer..."
+    ; Header line 2: the running-diagnostics status.
     push cs
     pop ds
     mov si, str_post_starting
     mov di, ART_HDR_X
     mov ax, ART_START_Y
+    mov bl, ART_INK_INDEX
+    mov bh, ART_FIELD_INDEX
+    call lfb_text
+    ; Key hints (DEL/TAB) in the gap above the icon row, ink on the field.
+    push cs
+    pop ds
+    mov si, str_post_hint1
+    mov di, ART_HDR_X
+    mov ax, ART_HINT1_Y
+    mov bl, ART_INK_INDEX
+    mov bh, ART_FIELD_INDEX
+    call lfb_text
+    push cs
+    pop ds
+    mov si, str_post_hint2
+    mov di, ART_HDR_X
+    mov ax, ART_HINT2_Y
     mov bl, ART_INK_INDEX
     mov bh, ART_FIELD_INDEX
     call lfb_text
@@ -562,7 +579,9 @@ gfx_post_note:
     ret
 
 str_post_name:     db 'Izarra-BIOS v3.01 - 1997', 0
-str_post_starting: db 'Starting your computer...', 0
+str_post_starting: db 'Running diagnostics...', 0
+str_post_hint1:    db 'DEL  Configuration menu', 0
+str_post_hint2:    db 'TAB  Select boot device', 0
 str_post_mem:  db 'Testing memory:  ', 0
 str_post_kb:   db ' KB', 0
 str_post_skip: db 'Memory test skipped', 0

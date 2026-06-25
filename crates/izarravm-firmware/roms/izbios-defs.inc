@@ -272,8 +272,15 @@
 ; clear down to ~y130 (the wordmark is top-right, the mascot is right, the icon
 ; strip is y161+), so the header and the RAM count-up sit top-left. Colours are
 ; palette indices from izbios-art.inc (ART_INK_INDEX on ART_FIELD_INDEX).
+; The version line stays at the top; the three live status lines are grouped
+; together near the vertical centre (y84/100/116, the band that clears the
+; mascot on the right), reading top-to-bottom in the order they appear.
 %define ART_HDR_X       8
-%define ART_VER_Y       12         ; "Izarra-BIOS v3.01 - 1997"
-%define ART_START_Y     28         ; "Starting your computer..."
+%define ART_VER_Y       12         ; "Izarra-BIOS v3.01 - 1997" (top)
+%define ART_START_Y     84         ; "Running diagnostics..."
 %define ART_MEM_Y       100        ; RAM count-up line
-%define ART_TOKA_Y      132        ; "Starting Toka-DOS..." (boot handoff)
+%define ART_TOKA_Y      116        ; "Starting Toka-DOS..." (boot handoff)
+; Key hints sit in the gap above the icon row (clear of the mascot on the right).
+; su_post_note overwrites this area with the Del/Tab confirmation when one is hit.
+%define ART_HINT1_Y     134        ; "DEL  Configuration menu"
+%define ART_HINT2_Y     146        ; "TAB  Select boot device"
