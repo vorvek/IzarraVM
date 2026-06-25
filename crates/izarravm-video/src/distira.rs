@@ -149,6 +149,7 @@ pub const SST_FBI_INIT6: usize = 0x248;
 pub const SST_FBI_INIT7: usize = 0x24c;
 pub const SST_TEXTURE_MODE: usize = 0x300;
 pub const SST_TLOD: usize = 0x304;
+pub const SST_TDETAIL: usize = 0x308;
 pub const SST_TEX_BASE_ADDR: usize = 0x30c;
 pub const SST_TEX_BASE_ADDR1: usize = 0x310;
 pub const SST_TEX_BASE_ADDR2: usize = 0x314;
@@ -430,6 +431,8 @@ pub struct Distira {
     texture_mode_tmu1: u32,
     texture_lod: u32,
     texture_lod_tmu1: u32,
+    texture_detail: u32,
+    texture_detail_tmu1: u32,
     tex_base_addr: u32,
     tex_base_addr_tmu1: u32,
     tex_base_addr1: [u32; 2],
@@ -526,6 +529,8 @@ impl Distira {
             texture_mode_tmu1: 0,
             texture_lod: 0,
             texture_lod_tmu1: 0,
+            texture_detail: 0,
+            texture_detail_tmu1: 0,
             tex_base_addr: 0,
             tex_base_addr_tmu1: 0,
             tex_base_addr1: [0; 2],
@@ -1064,6 +1069,14 @@ impl Distira {
                     merge_byte(&mut self.texture_lod_tmu1, byte, value);
                 }
             }
+            SST_TDETAIL => {
+                if chip & CHIP_TREX0 != 0 {
+                    merge_byte(&mut self.texture_detail, byte, value);
+                }
+                if chip & CHIP_TREX1 != 0 {
+                    merge_byte(&mut self.texture_detail_tmu1, byte, value);
+                }
+            }
             SST_TEX_BASE_ADDR => {
                 if chip & CHIP_TREX0 != 0 {
                     merge_byte(&mut self.tex_base_addr, byte, value);
@@ -1099,6 +1112,14 @@ impl Distira {
                 }
                 if chip & CHIP_TREX1 != 0 {
                     merge_byte(&mut self.texture_lod_tmu1, byte, value);
+                }
+            }
+            _ if voodoo_reg == SST_TDETAIL => {
+                if chip & CHIP_TREX0 != 0 {
+                    merge_byte(&mut self.texture_detail, byte, value);
+                }
+                if chip & CHIP_TREX1 != 0 {
+                    merge_byte(&mut self.texture_detail_tmu1, byte, value);
                 }
             }
             _ if voodoo_reg == SST_TEX_BASE_ADDR => {
@@ -1396,6 +1417,7 @@ impl Distira {
             SST_FBI_INIT7 => self.fbi_init[7] & !0xff,
             SST_TEXTURE_MODE => self.texture_mode,
             SST_TLOD => self.texture_lod,
+            SST_TDETAIL => self.texture_detail,
             SST_TEX_BASE_ADDR => self.tex_base_addr,
             DISTIRA_REG_STATUS => {
                 if self.display_enabled {
