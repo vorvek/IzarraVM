@@ -490,7 +490,9 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
       texture detail blend factor test plus the workspace gates.
 - [x] Iteration 43: texture chroma key behavior. Validated by the video texture
       chroma key rejection test plus the workspace gates.
-- [ ] Next: texture fog interaction behavior.
+- [x] Iteration 44: texture fog interaction behavior. Validated by the video
+      texture fog color test plus the workspace gates.
+- [ ] Next: texture alpha test interaction behavior.
 
 ## First 90 percent push for this branch
 
