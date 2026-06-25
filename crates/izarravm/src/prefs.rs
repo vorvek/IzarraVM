@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
+use izarravm_video::{DISTIRA_DEFAULT_RENDER_THREADS, normalize_distira_render_threads};
+
 /// File name for the GUI prefs, written next to the C: root.
 const PREFS_FILE: &str = "izarravm.conf";
 
@@ -24,6 +26,8 @@ const DEFAULT_VOLUME: f32 = 0.8;
 pub struct GuiPrefs {
     /// Master output volume, 0.0..1.0. Applied host-side as a perceptual gain.
     pub master_volume: f32,
+    /// Distira Glide renderer worker count. Matches 86Box's choices: 1, 2, or 4.
+    pub glide_render_threads: u8,
     /// Last floppy IMG mounted, re-mounted on startup if it still exists.
     pub last_floppy_image: Option<PathBuf>,
     /// Last folder mounted as drive A:, restored on startup if it still exists.
@@ -36,6 +40,7 @@ impl Default for GuiPrefs {
     fn default() -> Self {
         Self {
             master_volume: DEFAULT_VOLUME,
+            glide_render_threads: DISTIRA_DEFAULT_RENDER_THREADS,
             last_floppy_image: None,
             last_floppy_folder: None,
             last_cd_image: None,
@@ -67,6 +72,8 @@ impl GuiPrefs {
         match toml::from_str::<Self>(&text) {
             Ok(mut prefs) => {
                 prefs.master_volume = prefs.master_volume.clamp(0.0, 1.0);
+                prefs.glide_render_threads =
+                    normalize_distira_render_threads(prefs.glide_render_threads);
                 prefs
             }
             Err(err) => {
@@ -100,6 +107,7 @@ mod tests {
     fn round_trips_through_toml() {
         let prefs = GuiPrefs {
             master_volume: 0.65,
+            glide_render_threads: 4,
             last_floppy_image: Some(PathBuf::from("/tmp/disk.img")),
             last_floppy_folder: Some(PathBuf::from("/tmp/games")),
             last_cd_image: None,
@@ -116,6 +124,27 @@ mod tests {
         let parsed: GuiPrefs = toml::from_str("").expect("deserialize empty");
         assert_eq!(parsed, GuiPrefs::default());
         assert_eq!(parsed.master_volume, DEFAULT_VOLUME);
+        assert_eq!(parsed.glide_render_threads, 2);
+    }
+
+    #[test]
+    fn glide_render_threads_are_limited_to_86box_choices() {
+        let mut path = std::env::temp_dir();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        path.push(format!(
+            "izarravm-prefs-{}-{}.conf",
+            std::process::id(),
+            nonce
+        ));
+        std::fs::write(&path, "glide_render_threads = 3\n").expect("write prefs");
+
+        let prefs = GuiPrefs::load(&path);
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(prefs.glide_render_threads, 2);
     }
 
     #[test]
