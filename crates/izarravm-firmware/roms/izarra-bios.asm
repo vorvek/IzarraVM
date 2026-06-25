@@ -32,6 +32,10 @@ reset:                          ; ROM offset 0; the reset vector far-jumps here
 %include "probes/probe-sbdsp.inc"    ; STREAM C
 %include "probes/probe-opl.inc"      ; STREAM C
 %include "probes/probe-margo.inc"    ; STREAM C
+%include "probes/probe-cpu.inc"      ; STREAM C: GSW-586 CPU (CPUID identity)
+%include "probes/probe-floppy.inc"   ; STREAM C: floppy disk controller (FDC MSR)
+%include "probes/probe-hdd.inc"      ; STREAM C: ATA hard disk (primary status)
+%include "probes/probe-optical.inc"  ; STREAM C: ATAPI optical (secondary signature)
 %include "setup-ui.inc"              ; STREAM D
 %include "izbios-boot.inc"           ; STREAM E: INT 19h bootstrap (boot_entry)
 %include "izbios-bootbox.inc"        ; STREAM E: boxed two-pane boot+speed menu

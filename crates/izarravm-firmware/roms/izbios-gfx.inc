@@ -259,17 +259,27 @@ console_step_line:
 .ret:
     ret
 
-; icon_map: wired components (Phase 2: VEGA / RAM / sound). Each row is
-;   dw step_name_ptr, dw sprite_rle_ptr, dw cell_x, cell_y, cell_w, cell_h
-; (6 words = 12 bytes). Phase 3 adds the CPU/floppy/HDD/optical rows here.
+; icon_map: each wired component, mapped step-name -> colour sprite + cell. A row
+; is  dw step_name_ptr, dw sprite_rle_ptr, dw cell_x, cell_y, cell_w, cell_h
+; (6 words = 12 bytes). All 7 icons are wired: VEGA/RAM/sound (Phase 2) and
+; CPU/floppy/HDD/optical (Phase 3). An absent device's probe FAILs, so its icon
+; stays grey (e.g. HDD when C: is HLE-backed rather than a real ATA disk).
 icon_map:
-    dw icon_name_video, art_icon_0_rle, ICON_0_X, ICON_0_Y, ICON_0_W, ICON_0_H
-    dw icon_name_ram,   art_icon_2_rle, ICON_2_X, ICON_2_Y, ICON_2_W, ICON_2_H
-    dw icon_name_sbdsp, art_icon_3_rle, ICON_3_X, ICON_3_Y, ICON_3_W, ICON_3_H
+    dw icon_name_video,   art_icon_0_rle, ICON_0_X, ICON_0_Y, ICON_0_W, ICON_0_H
+    dw icon_name_cpu,     art_icon_1_rle, ICON_1_X, ICON_1_Y, ICON_1_W, ICON_1_H
+    dw icon_name_ram,     art_icon_2_rle, ICON_2_X, ICON_2_Y, ICON_2_W, ICON_2_H
+    dw icon_name_sbdsp,   art_icon_3_rle, ICON_3_X, ICON_3_Y, ICON_3_W, ICON_3_H
+    dw icon_name_floppy,  art_icon_4_rle, ICON_4_X, ICON_4_Y, ICON_4_W, ICON_4_H
+    dw icon_name_hdd,     art_icon_5_rle, ICON_5_X, ICON_5_Y, ICON_5_W, ICON_5_H
+    dw icon_name_optical, art_icon_6_rle, ICON_6_X, ICON_6_Y, ICON_6_W, ICON_6_H
 icon_map_end:
-icon_name_video: db 'component.video_margo', 0
-icon_name_ram:   db 'memory.ramtest', 0
-icon_name_sbdsp: db 'component.audio_sbdsp', 0
+icon_name_video:   db 'component.video_margo', 0
+icon_name_cpu:     db 'component.cpu_gsw', 0
+icon_name_ram:     db 'memory.ramtest', 0
+icon_name_sbdsp:   db 'component.audio_sbdsp', 0
+icon_name_floppy:  db 'component.floppy_fdc', 0
+icon_name_hdd:     db 'component.disk_hdd', 0
+icon_name_optical: db 'component.optical_atapi', 0
 
 ; cs_streq: compare the ASCIIZ strings at CS:SI and CS:DI. Returns ZF=1 if equal,
 ; ZF=0 otherwise. Preserves SI, DI and AX (it walks copies on the stack).
