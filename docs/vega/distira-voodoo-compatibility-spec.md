@@ -639,4 +639,36 @@ pushed. Keep entries tied to guest-visible behavior, not internal refactors.
 - [x] Iteration 101: LFB RGB565 dword writes split into two selected-buffer
       pixels. Validated by the video LFB RGB565 dword test plus the Distira
       video test gates.
-- [ ] Next: LFB depth/depth-plus-color formats and aux/depth buffer selection.
+- [x] Iteration 102: LFB depth-only dword writes update two aux/depth pixels
+      without touching scanout color. Validated by the video LFB depth dword test
+      plus the Distira video test gates.
+- [x] Iteration 103: LFB depth+RGB565 dword writes update one selected color
+      pixel and the matching aux/depth pixel with Voodoo address shifting.
+      Validated by the video LFB depth+RGB565 dword test plus the Distira video
+      test gates.
+- [x] Iteration 104: LFB depth+RGB555 dword writes convert color and update the
+      matching aux/depth pixel. Validated by the video LFB depth+RGB555 dword
+      test plus the Distira video test gates.
+- [x] Iteration 105: LFB depth+ARGB1555 dword writes convert color and update the
+      matching aux/depth pixel. Validated by the video LFB depth+ARGB1555 dword
+      test plus the Distira video test gates.
+- [x] Iteration 106: LFB pixel-pipeline mode respects `FBZ_RGB_WMASK` for color
+      writes. Validated by the video LFB pipeline RGB write-mask test plus the
+      Distira video test gates.
+- [x] Iteration 107: LFB pixel-pipeline mode respects `FBZ_DEPTH_WMASK` for aux
+      writes. Validated by the video LFB pipeline depth write-mask test plus the
+      Distira video test gates.
+- [x] Iteration 108: LFB depth+color pixel-pipeline writes honor Voodoo depth
+      compare before changing color or aux. Validated by the video LFB pipeline
+      depth-test rejection/acceptance test plus the Distira video test gates.
+- [x] Iteration 109: LFB pixel-pipeline mode applies chroma-key rejection and
+      increments the FBI chroma-fail counter. Validated by the video LFB pipeline
+      chroma-key test plus the Distira video test gates.
+- [x] Iteration 110: LFB pixel-pipeline mode applies ARGB8888 alpha-test
+      rejection and increments the FBI alpha-fail counter. Validated by the video
+      LFB pipeline alpha-test test plus the Distira video test gates.
+- [x] Iteration 111: LFB pixel-pipeline mode applies constant fog before the
+      color write. Validated by the video LFB pipeline constant-fog test plus the
+      Distira video test gates.
+- [ ] Next: LFB pixel-pipeline alpha blend hooks and broader 16-bit-format
+      pipeline parity.

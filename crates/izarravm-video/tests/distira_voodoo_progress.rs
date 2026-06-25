@@ -565,3 +565,221 @@ fn voodoo_lfb_writes_rgb565_dword_as_two_pixels() {
 
     assert_eq!(distira.scanout_argb(), vec![0x00ff_0000, 0x0000_ff00]);
 }
+
+#[test]
+fn voodoo_lfb_depth_dword_writes_two_aux_pixels() {
+    let mut distira = Distira::new();
+    distira.set_frame_size(2, 1);
+
+    write_reg(
+        &mut distira,
+        SST_LFB_MODE,
+        LFB_FORMAT_DEPTH | LFB_WRITE_BACK | LFB_READ_AUX,
+    );
+    distira.write_lfb_u32(0, 0x2222_1111);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+
+    assert_eq!(distira.scanout_argb(), vec![0x0000_0000, 0x0000_0000]);
+    assert_eq!(
+        (0..4)
+            .map(|offset| distira.read_lfb_u8(offset))
+            .collect::<Vec<_>>(),
+        vec![0x11, 0x11, 0x22, 0x22]
+    );
+}
+
+#[test]
+fn voodoo_lfb_depth_rgb565_dword_writes_one_color_and_depth_pixel() {
+    let mut distira = Distira::new();
+    distira.set_frame_size(2, 1);
+
+    write_reg(
+        &mut distira,
+        SST_LFB_MODE,
+        LFB_FORMAT_DEPTH_RGB565 | LFB_WRITE_BACK | LFB_READ_AUX,
+    );
+    distira.write_lfb_u32(4, 0x3333_f800);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+
+    assert_eq!(distira.scanout_argb(), vec![0x0000_0000, 0x00ff_0000]);
+    assert_eq!(distira.read_lfb_u8(2), 0x33);
+    assert_eq!(distira.read_lfb_u8(3), 0x33);
+}
+
+#[test]
+fn voodoo_lfb_depth_rgb555_dword_converts_color_and_depth() {
+    let mut distira = Distira::new();
+    distira.set_frame_size(1, 1);
+
+    write_reg(
+        &mut distira,
+        SST_LFB_MODE,
+        LFB_FORMAT_DEPTH_RGB555 | LFB_WRITE_BACK | LFB_READ_AUX,
+    );
+    distira.write_lfb_u32(0, 0x4444_03e0);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+
+    assert_eq!(distira.scanout_argb(), vec![0x0000_ff00]);
+    assert_eq!(distira.read_lfb_u8(0), 0x44);
+    assert_eq!(distira.read_lfb_u8(1), 0x44);
+}
+
+#[test]
+fn voodoo_lfb_depth_argb1555_dword_converts_color_and_depth() {
+    let mut distira = Distira::new();
+    distira.set_frame_size(1, 1);
+
+    write_reg(
+        &mut distira,
+        SST_LFB_MODE,
+        LFB_FORMAT_DEPTH_ARGB1555 | LFB_WRITE_BACK | LFB_READ_AUX,
+    );
+    distira.write_lfb_u32(0, 0x5555_fc00);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+
+    assert_eq!(distira.scanout_argb(), vec![0x00ff_0000]);
+    assert_eq!(distira.read_lfb_u8(0), 0x55);
+    assert_eq!(distira.read_lfb_u8(1), 0x55);
+}
+
+#[test]
+fn voodoo_lfb_pipeline_respects_rgb_write_mask() {
+    let mut distira = Distira::new();
+    distira.set_frame_size(2, 1);
+
+    write_reg(
+        &mut distira,
+        SST_LFB_MODE,
+        LFB_FORMAT_RGB565 | LFB_WRITE_BACK | LFB_ENABLE_PIXEL_PIPELINE,
+    );
+    write_reg(&mut distira, SST_FBZ_MODE, FBZ_DRAW_BACK);
+    distira.write_lfb_u32(0, 0x07e0_f800);
+    write_reg(&mut distira, SST_SWAPBUFFER_CMD, 1);
+
+    assert_eq!(distira.scanout_argb(), vec![0x0000_0000, 0x0000_0000]);
+}
+
+#[test]
+fn voodoo_lfb_pipeline_respects_depth_write_mask() {
+    let mut distira = Distira::new();
+    distira.set_frame_size(2, 1);
+
+    write_reg(
+        &mut distira,
+        SST_LFB_MODE,
+        LFB_FORMAT_DEPTH | LFB_WRITE_BACK | LFB_READ_AUX | LFB_ENABLE_PIXEL_PIPELINE,
+    );
+    write_reg(&mut distira, SST_FBZ_MODE, FBZ_DRAW_BACK);
+    distira.write_lfb_u32(0, 0x2222_1111);
+    assert_eq!(
+        (0..4)
+            .map(|offset| distira.read_lfb_u8(offset))
+            .collect::<Vec<_>>(),
+        vec![0xff, 0xff, 0xff, 0xff]
+    );
+
+    write_reg(&mut distira, SST_FBZ_MODE, FBZ_DRAW_BACK | FBZ_DEPTH_WMASK);
+    distira.write_lfb_u32(0, 0x4444_3333);
+    assert_eq!(
+        (0..4)
+            .map(|offset| distira.read_lfb_u8(offset))
+            .collect::<Vec<_>>(),
+        vec![0x33, 0x33, 0x44, 0x44]
+    );
+}
+
+#[test]
+fn voodoo_lfb_pipeline_depth_test_rejects_farther_depth_color_writes() {
+    let mut distira = Distira::new();
+    distira.set_frame_size(1, 1);
+
+    write_reg(&mut distira, SST_LFB_MODE, LFB_FORMAT_DEPTH | LFB_READ_AUX);
+    distira.write_lfb_u32(0, 0x0000_4000);
+
+    write_reg(
+        &mut distira,
+        SST_LFB_MODE,
+        LFB_FORMAT_DEPTH_RGB565 | LFB_WRITE_FRONT | LFB_READ_AUX | LFB_ENABLE_PIXEL_PIPELINE,
+    );
+    write_reg(
+        &mut distira,
+        SST_FBZ_MODE,
+        FBZ_RGB_WMASK
+            | FBZ_DEPTH_WMASK
+            | FBZ_DEPTH_ENABLE
+            | (DEPTHOP_LESSTHAN << FBZ_DEPTH_OP_SHIFT),
+    );
+    distira.write_lfb_u32(0, 0x8000_f800);
+
+    assert_eq!(distira.scanout_argb(), vec![0x0000_0000]);
+    assert_eq!(distira.read_lfb_u8(0), 0x00);
+    assert_eq!(distira.read_lfb_u8(1), 0x40);
+
+    distira.write_lfb_u32(0, 0x1000_07e0);
+
+    assert_eq!(distira.scanout_argb(), vec![0x0000_ff00]);
+    assert_eq!(distira.read_lfb_u8(0), 0x00);
+    assert_eq!(distira.read_lfb_u8(1), 0x10);
+}
+
+#[test]
+fn voodoo_lfb_pipeline_chroma_key_rejects_matching_color() {
+    let mut distira = Distira::new();
+    distira.set_frame_size(2, 1);
+
+    write_reg(
+        &mut distira,
+        SST_LFB_MODE,
+        LFB_FORMAT_RGB565 | LFB_WRITE_FRONT | LFB_ENABLE_PIXEL_PIPELINE,
+    );
+    write_reg(&mut distira, SST_FBZ_MODE, FBZ_RGB_WMASK | FBZ_CHROMAKEY);
+    write_reg(&mut distira, SST_CHROMA_KEY, 0x00ff_0000);
+    distira.write_lfb_u32(0, 0x07e0_f800);
+
+    assert_eq!(distira.scanout_argb(), vec![0x0000_0000, 0x0000_ff00]);
+    assert_eq!(read_reg(&distira, SST_FBI_CHROMA_FAIL), 1);
+}
+
+#[test]
+fn voodoo_lfb_pipeline_alpha_test_rejects_low_argb8888_alpha() {
+    let mut distira = Distira::new();
+    distira.set_frame_size(1, 1);
+
+    write_reg(
+        &mut distira,
+        SST_LFB_MODE,
+        LFB_FORMAT_ARGB8888 | LFB_WRITE_FRONT | LFB_ENABLE_PIXEL_PIPELINE,
+    );
+    write_reg(&mut distira, SST_FBZ_MODE, FBZ_RGB_WMASK);
+    write_reg(
+        &mut distira,
+        SST_ALPHA_MODE,
+        ALPHA_TEST_ENABLE | (AFUNC_GREATERTHAN << ALPHA_FUNC_SHIFT) | (0x80 << ALPHA_REF_SHIFT),
+    );
+
+    distira.write_lfb_u32(0, 0x40ff_0000);
+    assert_eq!(distira.scanout_argb(), vec![0x0000_0000]);
+    assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 1);
+
+    distira.write_lfb_u32(0, 0xff00_ff00);
+    assert_eq!(distira.scanout_argb(), vec![0x0000_ff00]);
+    assert_eq!(read_reg(&distira, SST_FBI_AFUNC_FAIL), 1);
+}
+
+#[test]
+fn voodoo_lfb_pipeline_applies_constant_fog_before_write() {
+    let mut distira = Distira::new();
+    distira.set_frame_size(1, 1);
+
+    write_reg(
+        &mut distira,
+        SST_LFB_MODE,
+        LFB_FORMAT_ARGB8888 | LFB_WRITE_FRONT | LFB_ENABLE_PIXEL_PIPELINE,
+    );
+    write_reg(&mut distira, SST_FBZ_MODE, FBZ_RGB_WMASK);
+    write_reg(&mut distira, SST_FOG_MODE, FOG_ENABLE | FOG_CONSTANT);
+    write_reg(&mut distira, SST_FOG_COLOR, 0x0000_4000);
+    distira.write_lfb_u32(0, 0xff00_0000);
+
+    assert_eq!(distira.scanout_argb(), vec![0x0000_4100]);
+}

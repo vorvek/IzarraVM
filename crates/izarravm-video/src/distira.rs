@@ -183,6 +183,7 @@ pub const LFB_FORMAT_DEPTH_RGB555: u32 = 13;
 pub const LFB_FORMAT_DEPTH_ARGB1555: u32 = 14;
 pub const LFB_FORMAT_DEPTH: u32 = 15;
 pub const LFB_FORMAT_MASK: u32 = 15;
+pub const LFB_ENABLE_PIXEL_PIPELINE: u32 = 0x100;
 
 pub const FBZ_CHROMAKEY: u32 = 1 << 1;
 pub const FBZ_STIPPLE: u32 = 1 << 2;
@@ -774,33 +775,115 @@ impl Distira {
     }
 
     pub fn read_lfb_u8(&self, offset: usize) -> u8 {
-        self.fb.get(offset).copied().unwrap_or(0)
+        match self.lfb_mode & LFB_READ_MASK {
+            LFB_READ_BACK => self.read_color_lfb_byte(self.display.back_base, offset),
+            LFB_READ_AUX => self.read_depth_lfb_byte(offset),
+            _ => self.read_color_lfb_byte(self.display.front_base, offset),
+        }
     }
 
     pub fn write_lfb_u8(&mut self, offset: usize, value: u8) {
-        if let Some(slot) = self.fb.get_mut(offset) {
+        if (self.lfb_mode & LFB_FORMAT_MASK) == LFB_FORMAT_DEPTH {
+            self.write_depth_lfb_byte(offset, value);
+            return;
+        }
+        let Some(off) = (self.lfb_write_base() as usize).checked_add(offset) else {
+            return;
+        };
+        if let Some(slot) = self.fb.get_mut(off) {
             *slot = value;
         }
     }
 
     pub fn write_lfb_u32(&mut self, offset: usize, value: u32) {
         let base = self.lfb_write_base();
+        let write_color = self.lfb_pipeline_writes_color();
+        let write_depth = self.lfb_pipeline_writes_depth();
         match self.lfb_mode & LFB_FORMAT_MASK {
             LFB_FORMAT_RGB565 => {
-                let pixel = offset / 2;
-                self.write_color_pixel(base, pixel, value as u16);
-                self.write_color_pixel(base, pixel + 1, (value >> 16) as u16);
+                if write_color {
+                    let pixel = offset / 2;
+                    let raw0 = value as u16;
+                    let raw1 = (value >> 16) as u16;
+                    if self.lfb_pipeline_rgb565_passes(raw0) {
+                        self.write_color_pixel(base, pixel, raw0);
+                    }
+                    if self.lfb_pipeline_rgb565_passes(raw1) {
+                        self.write_color_pixel(base, pixel + 1, raw1);
+                    }
+                }
             }
             LFB_FORMAT_RGB555 | LFB_FORMAT_ARGB1555 => {
-                let pixel = offset / 2;
-                self.write_color_pixel(base, pixel, rgb555_to_rgb565(value as u16));
-                self.write_color_pixel(base, pixel + 1, rgb555_to_rgb565((value >> 16) as u16));
+                if write_color {
+                    let pixel = offset / 2;
+                    let raw0 = rgb555_to_rgb565(value as u16);
+                    let raw1 = rgb555_to_rgb565((value >> 16) as u16);
+                    if self.lfb_pipeline_rgb565_passes(raw0) {
+                        self.write_color_pixel(base, pixel, raw0);
+                    }
+                    if self.lfb_pipeline_rgb565_passes(raw1) {
+                        self.write_color_pixel(base, pixel + 1, raw1);
+                    }
+                }
             }
             LFB_FORMAT_XRGB8888 | LFB_FORMAT_ARGB8888 => {
-                let r = (value >> 16) as u8;
-                let g = (value >> 8) as u8;
-                let b = value as u8;
-                self.write_color_pixel(base, offset / 4, pack_rgb565(r, g, b));
+                if write_color {
+                    let r = (value >> 16) as u8;
+                    let g = (value >> 8) as u8;
+                    let b = value as u8;
+                    let alpha = if (self.lfb_mode & LFB_FORMAT_MASK) == LFB_FORMAT_ARGB8888 {
+                        (value >> 24) as u8
+                    } else {
+                        0xff
+                    };
+                    if self.lfb_pipeline_color_passes((r, g, b))
+                        && self.lfb_pipeline_alpha_passes(alpha)
+                    {
+                        let (r, g, b) = self.lfb_pipeline_fog_color(r, g, b);
+                        self.write_color_pixel(base, offset / 4, pack_rgb565(r, g, b));
+                    }
+                }
+            }
+            LFB_FORMAT_DEPTH_RGB565 => {
+                let pixel = offset / 4;
+                let raw = value as u16;
+                let depth = (value >> 16) as u16;
+                if self.lfb_pipeline_depth_test_passes(pixel, depth)
+                    && self.lfb_pipeline_rgb565_passes(raw)
+                {
+                    if write_color {
+                        self.write_color_pixel(base, pixel, raw);
+                    }
+                    if write_depth {
+                        self.write_depth_pixel_by_index(pixel, depth);
+                    }
+                }
+            }
+            LFB_FORMAT_DEPTH_RGB555 | LFB_FORMAT_DEPTH_ARGB1555 => {
+                let pixel = offset / 4;
+                let raw = rgb555_to_rgb565(value as u16);
+                let depth = (value >> 16) as u16;
+                if self.lfb_pipeline_depth_test_passes(pixel, depth)
+                    && self.lfb_pipeline_rgb565_passes(raw)
+                {
+                    if write_color {
+                        self.write_color_pixel(base, pixel, raw);
+                    }
+                    if write_depth {
+                        self.write_depth_pixel_by_index(pixel, depth);
+                    }
+                }
+            }
+            LFB_FORMAT_DEPTH if write_depth => {
+                let pixel = offset / 2;
+                let depth0 = value as u16;
+                let depth1 = (value >> 16) as u16;
+                if self.lfb_pipeline_depth_test_passes(pixel, depth0) {
+                    self.write_depth_pixel_by_index(pixel, depth0);
+                }
+                if self.lfb_pipeline_depth_test_passes(pixel + 1, depth1) {
+                    self.write_depth_pixel_by_index(pixel + 1, depth1);
+                }
             }
             _ => {}
         }
@@ -1516,6 +1599,82 @@ impl Distira {
         }
     }
 
+    fn lfb_pipeline_writes_color(&self) -> bool {
+        self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0 || self.fbz_mode & FBZ_RGB_WMASK != 0
+    }
+
+    fn lfb_pipeline_writes_depth(&self) -> bool {
+        self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0 || self.fbz_mode & FBZ_DEPTH_WMASK != 0
+    }
+
+    fn lfb_pipeline_depth_test_passes(&self, pixel: usize, depth: u16) -> bool {
+        if self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0 || self.fbz_mode & FBZ_DEPTH_ENABLE == 0 {
+            return true;
+        }
+        let Some(&old_depth) = self.depth.get(pixel) else {
+            return false;
+        };
+        depth_compare_passes(self.fbz_mode, old_depth, depth)
+    }
+
+    fn lfb_pipeline_color_passes(&mut self, color: (u8, u8, u8)) -> bool {
+        if self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0
+            || self.chroma_key_passes(color.0, color.1, color.2)
+        {
+            return true;
+        }
+        self.fbi_chroma_fail = self.fbi_chroma_fail.wrapping_add(1);
+        false
+    }
+
+    fn lfb_pipeline_alpha_passes(&mut self, alpha: u8) -> bool {
+        if self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0 || self.alpha_test_passes(alpha) {
+            return true;
+        }
+        self.fbi_afunc_fail = self.fbi_afunc_fail.wrapping_add(1);
+        false
+    }
+
+    fn lfb_pipeline_fog_color(&self, r: u8, g: u8, b: u8) -> (u8, u8, u8) {
+        if self.lfb_mode & LFB_ENABLE_PIXEL_PIPELINE == 0 {
+            return (r, g, b);
+        }
+        self.apply_fog_color(r, g, b)
+    }
+
+    fn lfb_pipeline_rgb565_passes(&mut self, raw: u16) -> bool {
+        self.lfb_pipeline_color_passes(rgb565_components(raw))
+    }
+
+    fn read_color_lfb_byte(&self, base: u32, offset: usize) -> u8 {
+        let Some(off) = (base as usize).checked_add(offset) else {
+            return 0;
+        };
+        self.fb.get(off).copied().unwrap_or(0)
+    }
+
+    fn read_depth_lfb_byte(&self, offset: usize) -> u8 {
+        let Some(value) = self.depth.get(offset / 2).copied() else {
+            return 0;
+        };
+        value.to_le_bytes()[offset & 1]
+    }
+
+    fn write_depth_lfb_byte(&mut self, offset: usize, value: u8) {
+        let Some(slot) = self.depth.get_mut(offset / 2) else {
+            return;
+        };
+        let mut bytes = slot.to_le_bytes();
+        bytes[offset & 1] = value;
+        *slot = u16::from_le_bytes(bytes);
+    }
+
+    fn write_depth_pixel_by_index(&mut self, pixel: usize, value: u16) {
+        if let Some(slot) = self.depth.get_mut(pixel) {
+            *slot = value;
+        }
+    }
+
     fn write_color_pixel(&mut self, base: u32, pixel: usize, value: u16) {
         let width = self.display.width as usize;
         if width == 0 {
@@ -1697,17 +1856,7 @@ impl Distira {
         let Some(old_depth) = self.read_depth_pixel(x, y) else {
             return false;
         };
-        match (self.fbz_mode >> FBZ_DEPTH_OP_SHIFT) & 7 {
-            DEPTHOP_NEVER => false,
-            DEPTHOP_LESSTHAN => depth < old_depth,
-            DEPTHOP_EQUAL => depth == old_depth,
-            DEPTHOP_LESSTHANEQUAL => depth <= old_depth,
-            DEPTHOP_GREATERTHAN => depth > old_depth,
-            DEPTHOP_NOTEQUAL => depth != old_depth,
-            DEPTHOP_GREATERTHANEQUAL => depth >= old_depth,
-            DEPTHOP_ALWAYS => true,
-            _ => true,
-        }
+        depth_compare_passes(self.fbz_mode, old_depth, depth)
     }
 
     fn alpha_test_passes(&self, alpha: u8) -> bool {
@@ -2473,6 +2622,20 @@ fn merge_byte(slot: &mut u32, byte: usize, value: u8) {
     *slot = (*slot & !(0xff_u32 << shift)) | (u32::from(value) << shift);
 }
 
+fn depth_compare_passes(fbz_mode: u32, old_depth: u16, depth: u16) -> bool {
+    match (fbz_mode >> FBZ_DEPTH_OP_SHIFT) & 7 {
+        DEPTHOP_NEVER => false,
+        DEPTHOP_LESSTHAN => depth < old_depth,
+        DEPTHOP_EQUAL => depth == old_depth,
+        DEPTHOP_LESSTHANEQUAL => depth <= old_depth,
+        DEPTHOP_GREATERTHAN => depth > old_depth,
+        DEPTHOP_NOTEQUAL => depth != old_depth,
+        DEPTHOP_GREATERTHANEQUAL => depth >= old_depth,
+        DEPTHOP_ALWAYS => true,
+        _ => true,
+    }
+}
+
 fn tmu_chip_mask(offset: usize) -> usize {
     match (offset >> 10) & 0xf {
         0 => 0xf,
@@ -2731,9 +2894,17 @@ fn pack_rgb565(r: u8, g: u8, b: u8) -> u16 {
 fn rgb555_to_rgb565(raw: u16) -> u16 {
     let r = ((raw >> 10) & 0x1f) << 11;
     let g5 = (raw >> 5) & 0x1f;
-    let g = (g5 << 1) | (g5 >> 4);
+    let g = ((g5 << 1) | (g5 >> 4)) << 5;
     let b = raw & 0x1f;
-    r | (g << 5) | b
+    r | g | b
+}
+
+fn rgb565_components(raw: u16) -> (u8, u8, u8) {
+    (
+        expand5(raw >> 11) as u8,
+        expand6(raw >> 5) as u8,
+        expand5(raw) as u8,
+    )
 }
 
 fn expand5(v: u16) -> u32 {
