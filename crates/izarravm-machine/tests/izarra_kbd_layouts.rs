@@ -108,11 +108,12 @@ fn de_qwertz_minus_key_is_eszett() {
 }
 
 #[test]
-fn it_qwertz_minus_key_is_apostrophe() {
-    // Layout 5: Italian QWERTZ shares the Y/Z swap with German but puts an
-    // apostrophe (not the eszett) on the US minus scancode, separating the two.
+fn it_qwerty_minus_key_is_apostrophe() {
+    // Layout 5: Italian is QWERTY (the MS-DOS source keeps Y/Z in the US
+    // positions, unlike our earlier approximation that treated it as QWERTZ). It
+    // puts an apostrophe on the US minus scancode, separating it from German.
     assert_eq!(translate(5, SC_MINUS), b'\'');
-    assert_eq!(translate(5, 0x15), b'z');
+    assert_eq!(translate(5, 0x15), b'y');
     assert_eq!(
         translate_sequence(5, &[0xe0, 0x38, SC_SEMI, break_of(SC_SEMI), 0xe0, 0xb8]),
         b'@'

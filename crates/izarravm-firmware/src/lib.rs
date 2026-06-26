@@ -549,7 +549,15 @@ mod tests {
         let int16 = u16::from_le_bytes([image[2], image[3]]) as usize;
         assert!(int09 >= 4 && int09 < image.len(), "int09 offset in image");
         assert!(int16 >= 4 && int16 < image.len(), "int16 offset in image");
-        assert!(image.len() < 4096, "resident BIOS stays small");
+        // The resident is mapped as the synthetic BIOS ROM at F000:0000 and only
+        // has to stay below the service-return IRET at offset 0xF000. The 17
+        // imported layout tables push it past the old conservative 4 KB mark,
+        // which was never a real load limit (it is not a TSR; nothing loads it
+        // into conventional memory).
+        assert!(
+            image.len() < 0xF000,
+            "resident BIOS fits below the F000 IRET"
+        );
     }
 
     #[test]

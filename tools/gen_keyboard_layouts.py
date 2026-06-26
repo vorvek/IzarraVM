@@ -408,6 +408,10 @@ def parse_section(lines, label, src_cp):
         pos[0] += 1
         return t
 
+    def back():
+        if pos[0] > 0:
+            pos[0] -= 1
+
     # Section header: DW len ; DW cp_id
     t = next_tok()  # DW len
     t = next_tok()  # DW cp_id  (numeric or -1)
@@ -477,8 +481,23 @@ def parse_section(lines, label, src_cp):
                 te = next_tok()
                 if te is None:
                     break
+                if te[0] == "DW":
+                    # A DW here is the null-table terminator that ends the
+                    # state. Some KDF tables declare a `num` larger than the
+                    # entries actually listed (an off-by-one in the MS-DOS
+                    # source). Stop at the real table boundary and let the outer
+                    # loop consume the DW, rather than reading entries out of the
+                    # following state and desynchronizing the whole walk.
+                    back()
+                    break
                 if te[0] != "DB":
                     continue
+                # A lone DB carrying a non-numeric symbol (a state id like
+                # NON_ALPHA_UPPER) means we have run past this state's entries
+                # into the next state header. Stop and rewind.
+                if len(te[1]) == 1 and operand_byte(te[1][0]) is None:
+                    back()
+                    break
                 ops_e = te[1]
                 # Entries may be packed several per DB line or one per line. With
                 # ASCII_ONLY each entry is scan,char (2 ops); without it (a plain
@@ -729,7 +748,11 @@ def build_deadkey_comp(lines, prefix, src_cps, cp_name, log, ctx):
         sections.append((prefix + "_" + str(cp) + "_XLAT", cp))
     merged = {}  # state_id -> {scan: uni}
     for label, cp in sections:
-        scp = src_cp_for_section(cp) if cp != -1 else None
+        # The COMMON section (cp == -1) carries the lowercase accent states
+        # (GRAVE_LOWER etc.) as raw high bytes that are valid across pages.
+        # Decode them through cp437 like build_block does; passing None here
+        # silently dropped every high byte, so grave-lower composition was lost.
+        scp = src_cp_for_section(cp) if cp != -1 else "cp437"
         try:
             st = parse_section(lines, label, scp)
         except KeyError:
@@ -1040,6 +1063,53 @@ EXPECT = [
     (16, 0x27, False, "ñ"),   # LA (Latin American): n-tilde (scan 39)
 ]
 
+# Detailed Spanish checks mirroring the hand-verified machine tests
+# (es_layout_fills_ordinal_and_iso_and_cedilla, es_dead_keys_compose_accents,
+# int16_resident_keyboard_uses_bios_layout_byte). The sparse EXPECT gate above
+# missed real converter bugs in the ES block and dead-key composition, so these
+# rows pin the standard Spanish keys directly against the same oracle the Rust
+# tests use. Layout 2 = ES, code page CP850.
+
+# (scan, shifted, expected_unicode) against the lo/hi blocks of layout 2.
+EXPECT_ES_BLOCK = [
+    (0x29, False, "º"),   # ordinal key (left of 1): masculine ordinal
+    (0x29, True, "ª"),    # shift -> feminine ordinal
+    (0x56, False, "<"),   # ISO 102nd key: less-than
+    (0x56, True, ">"),    # shift -> greater-than
+    (0x2b, False, "ç"),   # cedilla key
+    (0x2b, True, "Ç"),    # shift -> capital cedilla
+    (0x0d, False, "¡"),   # inverted exclamation
+    (0x0d, True, "¿"),    # shift -> inverted question
+    (0x33, False, ","),   # comma
+    (0x33, True, ";"),    # shift -> semicolon
+    (0x27, False, "ñ"),   # n-tilde
+    (0x27, True, "Ñ"),    # shift -> capital n-tilde
+]
+
+# (scan, expected_unicode) against the AltGr block of layout 2.
+EXPECT_ES_ALTGR = [
+    (0x29, "\\"),         # AltGr+ordinal key -> backslash
+    (0x2b, "}"),          # AltGr+cedilla key -> right brace
+]
+
+# (accent_id, base_char, expected_composed_unicode) against the ES composition
+# table. Accent ids: 1 grave, 2 acute, 4 diaeresis.
+EXPECT_ES_COMPOSE = [
+    (2, "a", "á"),        # acute + a
+    (1, "e", "è"),        # grave + e
+    (4, "u", "ü"),        # diaeresis + u
+    (1, "a", "à"),        # grave + a (lowercase, the one the old bug dropped)
+    (2, "E", "É"),        # acute + E (uppercase path)
+]
+
+# ES dead-key descriptor rows the machine relies on: (scan, shift, accent_id).
+EXPECT_ES_DEADKEYS = [
+    (0x1a, 0, 1),         # grave armed unshifted
+    (0x28, 0, 2),         # acute armed unshifted
+    (0x1a, 1, 3),         # circumflex armed shifted
+    (0x28, 1, 4),         # diaeresis armed shifted
+]
+
 
 def decode_block_char(block, scan, shifted, cp_name):
     lo, hi, altgr = block
@@ -1108,6 +1178,38 @@ def main():
                             "got %r" % (idx, LAYOUTS[idx][1], scan, shifted,
                                         expected, got))
 
+    # Detailed ES checks. Layout 2 is Spanish, code page CP850.
+    es_cp = CP_NAME[LAYOUT_CP[2]]
+    es_lo, es_hi, es_altgr = blocks[2]
+    extra = 0
+    for scan, shifted, expected in EXPECT_ES_BLOCK:
+        got = decode_block_char(blocks[2], scan, shifted, es_cp)
+        extra += 1
+        if got != expected:
+            failures.append("ES scan 0x%02x shift=%s: expected %r got %r"
+                            % (scan, shifted, expected, got))
+    for scan, expected in EXPECT_ES_ALTGR:
+        b = es_altgr[scan]
+        got = bytes([b]).decode(es_cp) if b else None
+        extra += 1
+        if got != expected:
+            failures.append("ES AltGr scan 0x%02x: expected %r got %r"
+                            % (scan, expected, got))
+    es_comp = comps.get(2, {})
+    for acc, base, expected in EXPECT_ES_COMPOSE:
+        b = es_comp.get(acc, {}).get(base, 0)
+        got = bytes([b]).decode(es_cp) if b else None
+        extra += 1
+        if got != expected:
+            failures.append("ES compose accent %d + %r: expected %r got %r"
+                            % (acc, base, expected, got))
+    es_dk = set(deadkeys.get(2, []))
+    for row in EXPECT_ES_DEADKEYS:
+        extra += 1
+        if row not in es_dk:
+            failures.append("ES dead-key descriptor missing: scan 0x%02x "
+                            "shift=%d accent=%d" % row)
+
     if log:
         print("Encoding notes (char absent from code page -> emitted 0):")
         for entry in sorted(set(log)):
@@ -1119,7 +1221,8 @@ def main():
             print("  " + f)
         sys.exit(1)
 
-    print("\nAll %d EXPECT checks passed." % len(EXPECT))
+    print("\nAll %d EXPECT checks passed (+%d detailed ES checks)."
+          % (len(EXPECT), extra))
     print("Wrote %s" % os.path.join(ROMS, "kbd-layouts.inc"))
     print("Wrote %s" % os.path.join(ROMS, "kbd-layout-meta.inc"))
 
