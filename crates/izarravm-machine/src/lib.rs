@@ -1710,7 +1710,12 @@ impl Machine {
             self.apply_critical_error_response(pending, izarravm_dos::CriticalErrorResponse::Fail);
             return;
         };
-        if call.handler == izarravm_dos::FarPtr::default() {
+        let default_int24_handler = izarravm_dos::FarPtr {
+            segment: 0,
+            offset: DOS_INT24_DEFAULT_STUB_ADDRESS as u16,
+        };
+        if call.handler == izarravm_dos::FarPtr::default() || call.handler == default_int24_handler
+        {
             let response = self.dos.finish_critical_error(0x03);
             self.apply_critical_error_response(pending, response);
             return;
@@ -7306,14 +7311,7 @@ impl Machine {
     /// environment so the boot record's EXEC has a parent to inherit from. This
     /// is the SYSINIT-equivalent for the HLE kernel.
     fn setup_toka_dos_base(&mut self) -> Result<(), MachineError> {
-        self.memory.write_u8(BIOS_IRET_STUB_ADDRESS, 0xcf)?;
-        // The HLT sentinel a driver call's far return lands on (see call_driver_request).
-        self.memory.write_u8(SYSINIT_HALT_STUB, 0xf4)?;
-        for vector in [0x20usize, 0x21] {
-            self.memory
-                .write_u16(vector * 4, BIOS_IRET_STUB_ADDRESS as u16)?;
-            self.memory.write_u16(vector * 4 + 2, 0)?;
-        }
+        install_dos_low_memory_stubs(&mut self.memory)?;
         let env: [(&str, &str); 3] = [
             ("COMSPEC", "C:\\ICOMMAND.COM"),
             ("PATH", "C:\\;C:\\DOS"),
@@ -10075,6 +10073,10 @@ const BIOS_HALT_STUB_ADDRESS: usize = 0x0620;
 /// 24h handler IRETs here, executes HLT to stop the instruction batch, then the
 /// machine decodes handler AL and resumes the original host-serviced INT return.
 const BIOS_CRITICAL_ERROR_RETURN_STUB_ADDRESS: usize = 0x0630;
+/// Default DOS Ctrl-C handler: terminate via INT 21h AH=4Ch with code 0.
+const DOS_INT23_DEFAULT_STUB_ADDRESS: usize = 0x0632;
+/// Default DOS critical-error handler: return Fail (AL=03h) to the caller.
+const DOS_INT24_DEFAULT_STUB_ADDRESS: usize = 0x0637;
 
 /// EBDA offset of the far pointer to the user pointing-device (mouse) handler the
 /// guest installs with INT 15h AX=C207h. The IBM PS/2 BIOS keeps it here as
@@ -10153,18 +10155,7 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     memory.write_u16(0x70 * 4, BIOS_RTC_ISR_ADDRESS as u16)?;
     memory.write_u16(0x70 * 4 + 2, 0)?;
     install_rtc_isr_stub(memory)?;
-    // INT 18h's halt target: CLI;HLT in low RAM. The run loop's INT 18h handler
-    // points CS:IP here when no device is bootable.
-    memory.write_u8(BIOS_HALT_STUB_ADDRESS, 0xfa)?; // CLI
-    memory.write_u8(BIOS_HALT_STUB_ADDRESS + 1, 0xf4)?; // HLT
-    memory.write_u8(BIOS_CRITICAL_ERROR_RETURN_STUB_ADDRESS, 0xf4)?; // HLT
-    // The DOS kernel vectors keep the RAM stub: the INT 21h blocking path rewinds
-    // EIP onto the CD 21 the RAM stub returns to, and the DOS path owns its memory.
-    for vector in [0x20, 0x21] {
-        let address = vector * 4;
-        memory.write_u16(address, BIOS_IRET_STUB_ADDRESS as u16)?;
-        memory.write_u16(address + 2, 0)?;
-    }
+    install_dos_low_memory_stubs(memory)?;
     // Seed the BDA words INT 11h and INT 12h hand back, like a real BIOS. The 1 KB
     // EBDA reserved below 640 KB lowers the conventional-memory word by 1 (to 639),
     // so INT 12h and the EBDA stay consistent.
@@ -10232,7 +10223,39 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     memory.write_u8(0x43e, 0)?; // floppy recalibrate/seek status
     memory.write_u8(0x441, 0)?; // last floppy disk status
     memory.write_u8(0x474, 0)?; // last fixed-disk status
-    memory.write_u8(BIOS_IRET_STUB_ADDRESS, 0xcf)
+    Ok(())
+}
+
+fn install_dos_low_memory_stubs(memory: &mut Memory) -> Result<(), BusError> {
+    memory.write_u8(BIOS_IRET_STUB_ADDRESS, 0xcf)?;
+    // The HLT sentinel a driver call's far return lands on (see call_driver_request).
+    memory.write_u8(SYSINIT_HALT_STUB, 0xf4)?;
+    // INT 18h's halt target: CLI;HLT in low RAM. INT 22h uses the same safe
+    // default terminate-address target until a shell or guest replaces it.
+    memory.write_u8(BIOS_HALT_STUB_ADDRESS, 0xfa)?;
+    memory.write_u8(BIOS_HALT_STUB_ADDRESS + 1, 0xf4)?;
+    memory.write_u8(BIOS_CRITICAL_ERROR_RETURN_STUB_ADDRESS, 0xf4)?;
+    memory.write_u8(DOS_INT23_DEFAULT_STUB_ADDRESS, 0xb8)?; // mov ax,4C00h
+    memory.write_u8(DOS_INT23_DEFAULT_STUB_ADDRESS + 1, 0x00)?;
+    memory.write_u8(DOS_INT23_DEFAULT_STUB_ADDRESS + 2, 0x4c)?;
+    memory.write_u8(DOS_INT23_DEFAULT_STUB_ADDRESS + 3, 0xcd)?; // int 21h
+    memory.write_u8(DOS_INT23_DEFAULT_STUB_ADDRESS + 4, 0x21)?;
+    memory.write_u8(DOS_INT24_DEFAULT_STUB_ADDRESS, 0xb0)?; // mov al,03h
+    memory.write_u8(DOS_INT24_DEFAULT_STUB_ADDRESS + 1, 0x03)?;
+    memory.write_u8(DOS_INT24_DEFAULT_STUB_ADDRESS + 2, 0xcf)?; // iret
+
+    for (vector, target) in [
+        (0x20usize, BIOS_IRET_STUB_ADDRESS),
+        (0x21, BIOS_IRET_STUB_ADDRESS),
+        (0x22, BIOS_HALT_STUB_ADDRESS),
+        (0x23, DOS_INT23_DEFAULT_STUB_ADDRESS),
+        (0x24, DOS_INT24_DEFAULT_STUB_ADDRESS),
+    ] {
+        let address = vector * 4;
+        memory.write_u16(address, target as u16)?;
+        memory.write_u16(address + 2, 0)?;
+    }
+    Ok(())
 }
 
 /// Write the default INT 70h (IRQ8) handler into low RAM: acknowledge the RTC by
@@ -18627,6 +18650,39 @@ mod tests {
     }
 
     #[test]
+    fn dos_default_int23_terminates_through_dos() {
+        // org 0x100: int 23h; mov ax,4c7f; int 21h
+        let com: &[u8] = &[0xcd, 0x23, 0xb8, 0x7f, 0x4c, 0xcd, 0x21];
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
+                .unwrap();
+        let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
+    }
+
+    #[test]
+    fn dos_default_int24_returns_fail() {
+        // org 0x100:
+        //   int 24h
+        //   cmp al,03h
+        //   jne fail
+        //   mov ax,4c00h
+        //   int 21h
+        // fail:
+        //   mov ax,4c01h
+        //   int 21h
+        let com: &[u8] = &[
+            0xcd, 0x24, 0x3c, 0x03, 0x75, 0x05, 0xb8, 0x00, 0x4c, 0xcd, 0x21, 0xb8, 0x01, 0x4c,
+            0xcd, 0x21,
+        ];
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
+                .unwrap();
+        let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
+    }
+
+    #[test]
     fn dos_com_unknown_int21_reports_invalid_function_and_returns() {
         // org 0x100:
         //   mov ax,7200h / int 21h
@@ -21087,6 +21143,20 @@ mod tests {
                 .unwrap(),
             0x23
         );
+    }
+
+    #[test]
+    fn dos_ctrl_c_default_handler_terminates() {
+        // org 0x100: mov ah,01h; int 21h; mov ax,4c7fh; int 21h
+        let com: &[u8] = &[0xb4, 0x01, 0xcd, 0x21, 0xb8, 0x7f, 0x4c, 0xcd, 0x21];
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
+                .unwrap();
+        machine.set_dos_stdin(&[0x03]);
+
+        let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
+
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
     }
 
     #[test]
