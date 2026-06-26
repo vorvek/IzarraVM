@@ -638,6 +638,13 @@ pub struct Machine {
     io_stall_clocks: u64,
     // Parent CPU snapshots for EXEC (AH=4Bh AL=0); popped on child exit.
     program_frames: Vec<ProgramFrame>,
+    // INT 2Fh AH=13h DOS disk-driver hook state: DS:DX live handler and ES:BX
+    // restore target. Initial value is the seeded BIOS INT 13h IRET vector.
+    dos_disk_handler: (u16, u16),
+    dos_disk_restore: (u16, u16),
+    // INT 2Fh AX=B803h/B804h network post address. Null when no network TSR has
+    // published one.
+    network_post_address: (u16, u16),
     // Host-to-guest DOS INT 24h trampoline waiting for the guest handler to return
     // through the low-memory completion stub.
     pending_critical_error: Option<PendingCriticalError>,
@@ -653,6 +660,13 @@ pub struct Machine {
     // owns the mounted disc image, the ATA register file, and the CD-audio
     // playback state the mixer streams.
     ide: ide::IdeChannel,
+    // MSCDEX/ICDEX volume-descriptor preference. The default selects the primary
+    // volume descriptor.
+    icdex_vd_preference: u16,
+    // Guest BDS entries installed through INT 2Fh AX=0801h. The DOS-owned BDS
+    // list is regenerated on demand, so keep external entries as far pointers and
+    // relink them after each regeneration.
+    external_driver_bds: Vec<(u16, u16)>,
     // ATA hard disk on the primary IDE channel (0x1F0-0x1F7/0x3F6, IRQ14). The
     // boot drive C:; None when no image is mounted. INT 13h DL>=0x80 and the
     // primary-channel ports drive it.
@@ -730,6 +744,23 @@ struct MouseState {
     max_x: i32,
     min_y: i32,
     max_y: i32,
+    press_count: [u16; 3],
+    release_count: [u16; 3],
+    last_press_x: [i32; 3],
+    last_press_y: [i32; 3],
+    last_release_x: [i32; 3],
+    last_release_y: [i32; 3],
+    event_mask: u16,
+    event_handler_segment: u16,
+    event_handler_offset: u16,
+    display_page: u16,
+    mickey_ratio_x: u16,
+    mickey_ratio_y: u16,
+    double_speed_threshold: u16,
+    update_left: i32,
+    update_top: i32,
+    update_right: i32,
+    update_bottom: i32,
 }
 
 impl Default for MouseState {
@@ -745,6 +776,23 @@ impl Default for MouseState {
             max_x: MOUSE_MAX_X,
             min_y: 0,
             max_y: MOUSE_MAX_Y,
+            press_count: [0; 3],
+            release_count: [0; 3],
+            last_press_x: [MOUSE_MAX_X / 2; 3],
+            last_press_y: [MOUSE_MAX_Y / 2; 3],
+            last_release_x: [MOUSE_MAX_X / 2; 3],
+            last_release_y: [MOUSE_MAX_Y / 2; 3],
+            event_mask: 0,
+            event_handler_segment: 0,
+            event_handler_offset: 0,
+            display_page: 0,
+            mickey_ratio_x: 8,
+            mickey_ratio_y: 16,
+            double_speed_threshold: 64,
+            update_left: 0,
+            update_top: 0,
+            update_right: MOUSE_MAX_X,
+            update_bottom: MOUSE_MAX_Y,
         }
     }
 }
@@ -754,6 +802,8 @@ impl Default for MouseState {
 /// doubled space, matching the Microsoft convention.
 const MOUSE_MAX_X: i32 = 639;
 const MOUSE_MAX_Y: i32 = 199;
+const MOUSE_STATE_BYTES: u16 = 44;
+const MOUSE_STATE_MAGIC: u16 = 0x334d;
 
 /// Return `(min, max)` so a range function accepts its limits in either order.
 fn order(a: i32, b: i32) -> (i32, i32) {
@@ -761,6 +811,27 @@ fn order(a: i32, b: i32) -> (i32, i32) {
 }
 
 impl MouseState {
+    fn set_buttons_at_current_position(&mut self, buttons: u8) {
+        let next = buttons & 0x07;
+        let changed = self.buttons ^ next;
+        for index in 0..3 {
+            let bit = 1u8 << index;
+            if changed & bit == 0 {
+                continue;
+            }
+            if next & bit != 0 {
+                self.press_count[index] = increment_mouse_event_count(self.press_count[index]);
+                self.last_press_x[index] = self.x;
+                self.last_press_y[index] = self.y;
+            } else {
+                self.release_count[index] = increment_mouse_event_count(self.release_count[index]);
+                self.last_release_x[index] = self.x;
+                self.last_release_y[index] = self.y;
+            }
+        }
+        self.buttons = next;
+    }
+
     /// Fold a host pixel delta into the cursor position and the mickey counters,
     /// and latch the new button mask. The mapping is one mickey per host pixel
     /// (a sane 1:1 default), so the cursor tracks the host pointer directly. The
@@ -771,8 +842,20 @@ impl MouseState {
         self.mickey_y += dy;
         self.x = (self.x + dx).clamp(self.min_x, self.max_x);
         self.y = (self.y + dy).clamp(self.min_y, self.max_y);
-        self.buttons = buttons & 0x07;
+        self.set_buttons_at_current_position(buttons);
     }
+}
+
+fn increment_mouse_event_count(value: u16) -> u16 {
+    value.saturating_add(1).min(0x7fff)
+}
+
+fn mouse_i32_to_i16_word(value: i32) -> u16 {
+    value.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16 as u16
+}
+
+fn mouse_i16_word_to_i32(value: u16) -> i32 {
+    i32::from(value as i16)
 }
 
 /// Build the CT1745 mixer from the profile's Sound Blaster power-on routing.
@@ -836,6 +919,14 @@ fn block_fs_drive(path: &str) -> Option<u8> {
         return None;
     }
     Some(drive)
+}
+
+fn normalize_dos_name_byte(byte: u8) -> u8 {
+    if byte == b'/' {
+        b'\\'
+    } else {
+        byte.to_ascii_uppercase()
+    }
 }
 
 fn block_fs_path_8_3(path: &str) -> Option<(u8, [u8; 11])> {
@@ -1035,11 +1126,16 @@ impl Machine {
             elapsed_clocks: 0,
             io_stall_clocks: 0,
             program_frames: Vec::new(),
+            dos_disk_handler: (BIOS_ROM_IRET_SEG, 0),
+            dos_disk_restore: (BIOS_ROM_IRET_SEG, 0),
+            network_post_address: (0, 0),
             pending_critical_error: None,
             floppy: None,
             floppy_accesses: 0,
             c_accesses: 0,
             ide: ide::IdeChannel::new(),
+            icdex_vd_preference: 0x0100,
+            external_driver_bds: Vec::new(),
             ata: None,
             fat32_c: None,
             cd_accesses: 0,
@@ -1155,8 +1251,8 @@ impl Machine {
     }
 
     /// Enter or leave booter-inert mode. When set, the Toka-DOS HLE and IEMM stop
-    /// intercepting the DOS/memory-manager interrupts (0x20/0x21/0x25/0x26/0x28/
-    /// 0x29/0x2F/0x66), so a self-booting disk's own handlers run through the IVT;
+    /// intercepting the DOS/memory-manager interrupts (0x20/0x21/0x25/0x26/0x29/
+    /// 0x2F/0x66), so a self-booting disk's own handlers run through the IVT;
     /// the BIOS services stay intercepted. The booter track sets this; nothing
     /// auto-detects a booter yet.
     pub fn set_booter_inert(&mut self, inert: bool) {
@@ -1728,7 +1824,7 @@ impl Machine {
     pub fn set_mouse_absolute(&mut self, x: i32, y: i32, buttons: u8) {
         self.mouse.x = x.clamp(self.mouse.min_x, self.mouse.max_x);
         self.mouse.y = y.clamp(self.mouse.min_y, self.mouse.max_y);
-        self.mouse.buttons = buttons;
+        self.mouse.set_buttons_at_current_position(buttons);
     }
 
     #[cfg(test)]
@@ -2369,9 +2465,10 @@ impl Machine {
 
     /// Service INT 14h (SERIAL) over the COM1 UART. DX selects the port; only COM1
     /// (DX=0) is wired. AH=00h initializes from the AL parameter byte, AH=01h sends
-    /// AL, AH=02h receives into AL, AH=03h reads status. AH returns the line-status
-    /// byte and AL the modem-status byte, the way the BIOS reports the 16450
-    /// registers.
+    /// AL, AH=02h receives into AL, AH=03h reads status, AH=04h is the PS/2
+    /// extended initialize call, and AH=05h reads/writes the modem-control register.
+    /// AH returns the line-status byte and AL the modem-status byte, the way the BIOS
+    /// reports the 16450 registers.
     fn handle_int14(&mut self) {
         const COM1: u16 = 0x03f8;
         let ax = self.cpu.registers.eax() as u16;
@@ -2413,6 +2510,29 @@ impl Machine {
                 self.set_eax_ah(lsr);
                 self.set_eax_al(msr);
             }
+            0x04 if self.int14_extended_params_valid() => {
+                self.uart_extended_init();
+                let lsr = self.serial.read_port(COM1 + 5).unwrap_or(0);
+                let msr = self.serial.read_port(COM1 + 6).unwrap_or(0);
+                self.set_eax_ah(lsr);
+                self.set_eax_al(msr);
+            }
+            0x05 => match al {
+                0x00 => {
+                    let mcr = self.serial.read_port(COM1 + 4).unwrap_or(0);
+                    self.set_bx((self.cpu.registers.ebx() as u16 & 0xff00) | u16::from(mcr));
+                    self.set_eax_ah(0x00);
+                }
+                0x01 => {
+                    self.serial
+                        .write_port(COM1 + 4, self.cpu.registers.ebx() as u8);
+                    let lsr = self.serial.read_port(COM1 + 5).unwrap_or(0);
+                    let msr = self.serial.read_port(COM1 + 6).unwrap_or(0);
+                    self.set_eax_ah(lsr);
+                    self.set_eax_al(msr);
+                }
+                _ => self.set_eax_ah(0x80),
+            },
             _ => self.set_eax_ah(0x80),
         }
     }
@@ -2444,6 +2564,59 @@ impl Machine {
         self.serial.write_port(COM1, (divisor & 0xff) as u8); // DLL
         self.serial.write_port(COM1 + 1, (divisor >> 8) as u8); // DLM
         self.serial.write_port(COM1 + 3, lcr); // LCR, clears DLAB
+    }
+
+    fn int14_extended_params_valid(&self) -> bool {
+        let ax = self.cpu.registers.eax() as u16;
+        let bx = self.cpu.registers.ebx() as u16;
+        let cx = self.cpu.registers.ecx() as u16;
+        let al = ax as u8;
+        let bh = (bx >> 8) as u8;
+        let bl = bx as u8;
+        let ch = (cx >> 8) as u8;
+        let cl = cx as u8;
+        al <= 1 && bh <= 4 && bl <= 1 && ch <= 3 && cl <= 0x0b
+    }
+
+    /// Program the COM1 UART from the PS/2 INT 14h AH=04h extended-configuration
+    /// fields: BH parity, BL stop bits, CH word length, CL baud-rate index.
+    fn uart_extended_init(&mut self) {
+        const COM1: u16 = 0x03f8;
+        let bx = self.cpu.registers.ebx() as u16;
+        let cx = self.cpu.registers.ecx() as u16;
+        let parity = (bx >> 8) as u8;
+        let stop = bx as u8;
+        let word = (cx >> 8) as u8;
+        let baud = cx as u8;
+        let divisor: u16 = match baud {
+            0 => 1047, // 110
+            1 => 768,  // 150
+            2 => 384,  // 300
+            3 => 192,  // 600
+            4 => 96,   // 1200
+            5 => 48,   // 2400
+            6 => 24,   // 4800
+            7 => 12,   // 9600
+            8 => 6,    // 19200
+            9 => 3,    // 38400
+            10 => 2,   // 57600-ish, nearest whole divisor
+            _ => 1,    // 115200
+        };
+        let mut lcr = word & 0x03;
+        if stop != 0 {
+            lcr |= 0x04;
+        }
+        match parity {
+            1 => lcr |= 0x08,               // odd
+            2 => lcr |= 0x08 | 0x10,        // even
+            3 => lcr |= 0x08 | 0x20,        // stick odd
+            4 => lcr |= 0x08 | 0x10 | 0x20, // stick even
+            _ => {}
+        }
+        self.serial.write_port(COM1 + 3, 0x80);
+        self.serial.write_port(COM1, (divisor & 0xff) as u8);
+        self.serial.write_port(COM1 + 1, (divisor >> 8) as u8);
+        self.serial.write_port(COM1 + 3, lcr);
     }
 
     /// Service INT 17h (PRINTER) over LPT1. DX selects the port; only LPT1 (DX=0)
@@ -2975,17 +3148,90 @@ impl Machine {
         self.cpu.registers.set_eax(eax);
     }
 
-    /// Service the INT 33h mouse driver (Microsoft API). The subset DOS games
-    /// rely on: reset/detect, show/hide cursor, get position+buttons, set
-    /// position, define horizontal/vertical ranges, and read the mickey motion
-    /// counters. The PS/2 aux device is the hardware behind it; this HLE tracks
-    /// the same position the host feeds through `inject_mouse`, so a game that
-    /// polls INT 33h sees the pointer without writing its own IRQ12 ISR.
-    /// Functions outside this subset return with the registers unchanged.
+    fn mouse_state_addr(&self) -> u32 {
+        self.cpu.registers.segment(SegmentIndex::Es).base
+            + u32::from(self.cpu.registers.edx() as u16)
+    }
+
+    fn write_mouse_state(&mut self, addr: u32) {
+        let fields = [
+            MOUSE_STATE_MAGIC,
+            self.mouse.x as u16,
+            self.mouse.y as u16,
+            self.mouse.min_x as u16,
+            self.mouse.max_x as u16,
+            self.mouse.min_y as u16,
+            self.mouse.max_y as u16,
+            u16::from(self.mouse.buttons),
+            mouse_i32_to_i16_word(self.mouse.show_count),
+            mouse_i32_to_i16_word(self.mouse.mickey_x),
+            mouse_i32_to_i16_word(self.mouse.mickey_y),
+            self.mouse.display_page,
+            self.mouse.mickey_ratio_x,
+            self.mouse.mickey_ratio_y,
+            self.mouse.double_speed_threshold,
+            self.mouse.event_mask,
+            self.mouse.event_handler_offset,
+            self.mouse.event_handler_segment,
+            self.mouse.update_left as u16,
+            self.mouse.update_top as u16,
+            self.mouse.update_right as u16,
+            self.mouse.update_bottom as u16,
+        ];
+        for (index, value) in fields.into_iter().enumerate() {
+            self.write_physical_u16(addr + (index as u32) * 2, value);
+        }
+    }
+
+    fn read_mouse_state(&mut self, addr: u32) {
+        if self.read_physical_u16(addr) != MOUSE_STATE_MAGIC {
+            return;
+        }
+        self.mouse.x = i32::from(self.read_physical_u16(addr + 2)).clamp(0, MOUSE_MAX_X);
+        self.mouse.y = i32::from(self.read_physical_u16(addr + 4)).clamp(0, MOUSE_MAX_Y);
+        self.mouse.min_x = i32::from(self.read_physical_u16(addr + 6)).clamp(0, MOUSE_MAX_X);
+        self.mouse.max_x = i32::from(self.read_physical_u16(addr + 8)).clamp(0, MOUSE_MAX_X);
+        self.mouse.min_y = i32::from(self.read_physical_u16(addr + 10)).clamp(0, MOUSE_MAX_Y);
+        self.mouse.max_y = i32::from(self.read_physical_u16(addr + 12)).clamp(0, MOUSE_MAX_Y);
+        if self.mouse.min_x > self.mouse.max_x {
+            std::mem::swap(&mut self.mouse.min_x, &mut self.mouse.max_x);
+        }
+        if self.mouse.min_y > self.mouse.max_y {
+            std::mem::swap(&mut self.mouse.min_y, &mut self.mouse.max_y);
+        }
+        self.mouse.buttons = self.read_physical_u16(addr + 14) as u8 & 0x07;
+        self.mouse.show_count = mouse_i16_word_to_i32(self.read_physical_u16(addr + 16));
+        self.mouse.mickey_x = mouse_i16_word_to_i32(self.read_physical_u16(addr + 18));
+        self.mouse.mickey_y = mouse_i16_word_to_i32(self.read_physical_u16(addr + 20));
+        self.mouse.display_page = self.read_physical_u16(addr + 22);
+        self.mouse.mickey_ratio_x = self.read_physical_u16(addr + 24);
+        self.mouse.mickey_ratio_y = self.read_physical_u16(addr + 26);
+        self.mouse.double_speed_threshold = self.read_physical_u16(addr + 28);
+        self.mouse.event_mask = self.read_physical_u16(addr + 30);
+        self.mouse.event_handler_offset = self.read_physical_u16(addr + 32);
+        self.mouse.event_handler_segment = self.read_physical_u16(addr + 34);
+        self.mouse.update_left = i32::from(self.read_physical_u16(addr + 36)).clamp(0, MOUSE_MAX_X);
+        self.mouse.update_top = i32::from(self.read_physical_u16(addr + 38)).clamp(0, MOUSE_MAX_Y);
+        self.mouse.update_right =
+            i32::from(self.read_physical_u16(addr + 40)).clamp(0, MOUSE_MAX_X);
+        self.mouse.update_bottom =
+            i32::from(self.read_physical_u16(addr + 42)).clamp(0, MOUSE_MAX_Y);
+        self.mouse.x = self.mouse.x.clamp(self.mouse.min_x, self.mouse.max_x);
+        self.mouse.y = self.mouse.y.clamp(self.mouse.min_y, self.mouse.max_y);
+    }
+
+    /// Service the INT 33h mouse driver (Microsoft API). The PS/2 aux device is
+    /// the hardware behind it; this HLE tracks the same position and button
+    /// edges the host feeds through `inject_mouse`, so a game that polls INT 33h
+    /// sees the pointer without writing its own IRQ12 ISR. Guest callback
+    /// vectors are stored for API compatibility, but not invoked yet.
     fn handle_int33(&mut self) {
         let ax = self.cpu.registers.eax() as u16;
+        let bx = self.cpu.registers.ebx() as u16;
         let cx = self.cpu.registers.ecx() as u16;
         let dx = self.cpu.registers.edx() as u16;
+        let si = self.cpu.registers.esi() as u16;
+        let di = self.cpu.registers.edi() as u16;
         match ax {
             // AX=0000: reset driver and read status. Re-centre the cursor, hide
             // it, clear motion, and report "installed, 2 buttons".
@@ -3019,6 +3265,37 @@ impl Machine {
                 self.mouse.x = i32::from(cx).clamp(self.mouse.min_x, self.mouse.max_x);
                 self.mouse.y = i32::from(dx).clamp(self.mouse.min_y, self.mouse.max_y);
             }
+            // AX=0005/0006: return button press/release counts since the last
+            // query for the requested button, plus the last position where it
+            // changed state.
+            0x0005 | 0x0006 => {
+                let index = usize::from(bx);
+                let (count, x, y) = if index < 3 {
+                    if ax == 0x0005 {
+                        let out = (
+                            self.mouse.press_count[index],
+                            self.mouse.last_press_x[index],
+                            self.mouse.last_press_y[index],
+                        );
+                        self.mouse.press_count[index] = 0;
+                        out
+                    } else {
+                        let out = (
+                            self.mouse.release_count[index],
+                            self.mouse.last_release_x[index],
+                            self.mouse.last_release_y[index],
+                        );
+                        self.mouse.release_count[index] = 0;
+                        out
+                    }
+                } else {
+                    (0, self.mouse.x, self.mouse.y)
+                };
+                self.set_ax(u16::from(self.mouse.buttons));
+                self.set_bx(count);
+                self.set_cx(x as u16);
+                self.set_dx(y as u16);
+            }
             // AX=0007: define horizontal range (CX..DX). A reversed pair is
             // swapped, the way the driver normalizes the limits.
             0x0007 => {
@@ -3034,6 +3311,10 @@ impl Machine {
                 self.mouse.max_y = hi.clamp(0, MOUSE_MAX_Y);
                 self.mouse.y = self.mouse.y.clamp(self.mouse.min_y, self.mouse.max_y);
             }
+            // AX=0009/000A: cursor shape definitions. Rendering the software cursor
+            // is not modeled, but accepting the definitions keeps setup code from
+            // treating the driver as absent.
+            0x0009 | 0x000A => {}
             // AX=000B: read and clear the mickey motion counters. Returned as
             // 16-bit signed deltas; positive is right/down.
             0x000B => {
@@ -3042,9 +3323,194 @@ impl Machine {
                 self.mouse.mickey_x = 0;
                 self.mouse.mickey_y = 0;
             }
+            // AX=000C: define the user event callback. The HLE stores it so later
+            // exchange/query calls see a coherent driver state.
+            0x000C => {
+                self.mouse.event_mask = cx;
+                self.mouse.event_handler_segment =
+                    self.cpu.registers.segment(SegmentIndex::Es).selector;
+                self.mouse.event_handler_offset = dx;
+            }
+            // AX=000D/000E: light-pen emulation toggle. INT 10h light pen state is
+            // not modeled, so the toggle is accepted as inert.
+            0x000D | 0x000E => {}
+            // AX=000F: define mickey-to-pixel ratio.
+            0x000F => {
+                self.mouse.mickey_ratio_x = cx;
+                self.mouse.mickey_ratio_y = dx;
+            }
+            // AX=0010: define the screen region where the cursor is hidden while
+            // the application updates it.
+            0x0010 => {
+                let (left, right) = order(i32::from(cx), i32::from(si));
+                let (top, bottom) = order(i32::from(dx), i32::from(di));
+                self.mouse.update_left = left.clamp(0, MOUSE_MAX_X);
+                self.mouse.update_right = right.clamp(0, MOUSE_MAX_X);
+                self.mouse.update_top = top.clamp(0, MOUSE_MAX_Y);
+                self.mouse.update_bottom = bottom.clamp(0, MOUSE_MAX_Y);
+            }
+            // AX=0012: large graphics cursor block accepted.
+            0x0012 => {
+                self.set_ax(0xFFFF);
+            }
+            // AX=0013: define double-speed threshold; zero restores the default.
+            0x0013 => {
+                self.mouse.double_speed_threshold = if dx == 0 { 64 } else { dx };
+            }
+            // AX=0014: exchange user event callbacks.
+            0x0014 => {
+                let old_mask = self.mouse.event_mask;
+                let old_seg = self.mouse.event_handler_segment;
+                let old_off = self.mouse.event_handler_offset;
+                self.mouse.event_mask = cx;
+                self.mouse.event_handler_segment =
+                    self.cpu.registers.segment(SegmentIndex::Es).selector;
+                self.mouse.event_handler_offset = dx;
+                self.set_cx(old_mask);
+                self.cpu
+                    .registers
+                    .set_segment(SegmentIndex::Es, SegmentRegister::real(old_seg));
+                self.set_dx(old_off);
+            }
+            // AX=0015/0042: report the size of the opaque save-state buffer.
+            0x0015 => {
+                self.set_bx(MOUSE_STATE_BYTES);
+            }
+            0x0042 => {
+                self.set_ax(0xFFFF);
+                self.set_bx(MOUSE_STATE_BYTES);
+            }
+            // AX=0016/0050: save driver state to ES:DX.
+            0x0016 | 0x0050 => {
+                let addr = self.mouse_state_addr();
+                self.write_mouse_state(addr);
+                if ax == 0x0050 {
+                    self.set_ax(0xFFFF);
+                }
+            }
+            // AX=0017/0052: restore driver state from ES:DX.
+            0x0017 | 0x0052 => {
+                let addr = self.mouse_state_addr();
+                self.read_mouse_state(addr);
+                if ax == 0x0052 {
+                    self.set_ax(0xFFFF);
+                }
+            }
+            // AX=001A/001B: set/query sensitivity values.
+            0x001A => {
+                self.mouse.mickey_ratio_x = bx;
+                self.mouse.mickey_ratio_y = cx;
+                self.mouse.double_speed_threshold = if dx == 0 { 64 } else { dx };
+            }
+            0x001B => {
+                self.set_bx(self.mouse.mickey_ratio_x);
+                self.set_cx(self.mouse.mickey_ratio_y);
+                self.set_dx(self.mouse.double_speed_threshold);
+            }
+            // AX=001D/001E: define/query display page number.
+            0x001D => {
+                self.mouse.display_page = bx;
+            }
+            0x001E => {
+                self.set_bx(self.mouse.display_page);
+            }
+            // AX=0021: software reset/detect, identical to AX=0000 except that it
+            // does not clear the driver state.
+            0x0021 => {
+                self.set_ax(0xFFFF);
+                self.set_bx(0x0002);
+            }
+            // AX=0022/0023: US mouse driver language.
+            0x0022 => {}
+            0x0023 => {
+                self.set_bx(0x0000);
+            }
+            // AX=0024: version/type/IRQ. Report a PS/2 mouse with the standard
+            // driver-version shape used by Microsoft-compatible drivers.
+            0x0024 if bx == 0 => {
+                self.set_bx(0x0820);
+                self.set_cx(0x0400);
+            }
             // Other functions are accepted as no-ops, leaving registers as-is.
             _ => {}
         }
+    }
+
+    /// Service INT 2Ah. The network installation check reports absent, direct
+    /// disk I/O is allowed, and DOS critical-section/keyboard-busy notifications
+    /// are no-ops in this single-tasking box.
+    fn handle_int2a(&mut self) {
+        let ah = ((self.cpu.registers.eax() as u16) >> 8) as u8;
+        let ax = self.cpu.registers.eax() as u16;
+        match ax {
+            _ if ah == 0x00 => {
+                self.set_eax_ah(0x00);
+                self.set_int_frame_carry(false);
+            }
+            0x0300 => {
+                self.set_int_frame_carry(false);
+            }
+            0x0500 => {
+                self.set_ax(0x0000);
+                self.set_bx(0x0000);
+                self.set_cx(0x0000);
+                self.set_dx(0x0000);
+                self.set_int_frame_carry(false);
+            }
+            _ if ah == 0x04 => {
+                self.set_ax(0x0101);
+                self.set_int_frame_carry(false);
+            }
+            _ if ah == 0x06 => {
+                self.set_ax(0x0001);
+                self.set_int_frame_carry(true);
+            }
+            _ if matches!(ah, 0x80 | 0x81 | 0x82 | 0x84) => {
+                self.set_int_frame_carry(false);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_int2e(&mut self) -> Result<Option<u8>, izarravm_dos::DosError> {
+        let ds = self.cpu.registers.segment(SegmentIndex::Ds).base;
+        let si = self.cpu.registers.esi() as u16;
+        let len = self.read_physical_u8(ds + u32::from(si)).min(123);
+        let command = self.read_guest_block(ds + u32::from(si.wrapping_add(1)), usize::from(len));
+
+        let scratch_seg = SYSINIT_SCRATCH_STACK_SEG;
+        let scratch = DEVICE_REQUEST_SCRATCH as u32;
+        let path_off = 0x0000u16;
+        let tail_off = 0x0020u16;
+        let epb_off = 0x00b0u16;
+        let mut tail = Vec::with_capacity(usize::from(len) + 5);
+        tail.extend_from_slice(b" /C ");
+        tail.extend_from_slice(&command);
+
+        self.write_guest_block(scratch + u32::from(path_off), b"C:\\ICOMMAND.COM\0");
+        self.write_physical_u8(scratch + u32::from(tail_off), tail.len() as u8);
+        self.write_guest_block(scratch + u32::from(tail_off) + 1, &tail);
+        self.write_physical_u8(scratch + u32::from(tail_off) + 1 + tail.len() as u32, 0x0d);
+        self.write_physical_u16(scratch + u32::from(epb_off), 0);
+        self.write_physical_u16(scratch + u32::from(epb_off) + 2, tail_off);
+        self.write_physical_u16(scratch + u32::from(epb_off) + 4, scratch_seg);
+        self.write_physical_u16(scratch + u32::from(epb_off) + 6, 0);
+        self.write_physical_u16(scratch + u32::from(epb_off) + 8, 0);
+        self.write_physical_u16(scratch + u32::from(epb_off) + 0x0a, 0);
+        self.write_physical_u16(scratch + u32::from(epb_off) + 0x0c, 0);
+
+        // Run a transient ICOMMAND /C child until ICOMMAND grows a true resident
+        // INT 2Eh entry point.
+        self.cpu.registers.set_eax(0x4b00);
+        self.cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(scratch_seg));
+        self.cpu.registers.set_edx(u32::from(path_off));
+        self.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(scratch_seg));
+        self.cpu.registers.set_ebx(u32::from(epb_off));
+        self.handle_dos_int(0x21)
     }
 
     /// Service the DOS-owned and ICDEX functions of `INT 2Fh` (the multiplex
@@ -3072,6 +3538,115 @@ impl Machine {
                     .set_segment(SegmentIndex::Ds, SegmentRegister::real(seg));
                 true
             }
+            // DOS 3.0+ internal: get interrupt vector whose number is on the
+            // caller's stack.
+            0x1202 => {
+                let vector = self.int2f_stack_word() as u8;
+                let ivt = u32::from(vector) * 4;
+                let off = self.read_guest_word(ivt);
+                let seg = self.read_guest_word(ivt + 2);
+                self.cpu
+                    .registers
+                    .set_segment(SegmentIndex::Es, SegmentRegister::real(seg));
+                self.set_bx(off);
+                true
+            }
+            // DOS 3.0+ internal: normalize a path separator passed on the stack.
+            0x1204 => {
+                let ch = self.int2f_stack_word() as u8;
+                let separator = ch == b'/' || ch == b'\\';
+                self.set_eax_al(if ch == b'/' { b'\\' } else { ch });
+                self.set_int_frame_zero(separator);
+                true
+            }
+            // DOS 3.0+ internal: output character passed on the stack to STDOUT.
+            0x1205 => {
+                let ch = self.int2f_stack_word() as u8;
+                self.dispatch_int21_from_int2f(izarravm_dos::DosRegs {
+                    ax: 0x0200,
+                    dx: u16::from(ch),
+                    ..self.cpu_dos_regs()
+                })
+            }
+            // DOS 3.0+ internal: close current file via the SDA's current SFT
+            // pointer. The HLE does not keep that transient SDA field, so there is
+            // no current file to close.
+            0x1201 => {
+                self.set_ax(0x0006);
+                self.set_int_frame_carry(true);
+                true
+            }
+            // DOS 3.0+ internal critical-error helpers. No nested INT 24h dialog
+            // is active here, so answer Fail/do-not-retry deterministically.
+            0x1206 => {
+                self.set_eax_al(0x03);
+                true
+            }
+            0x120A => {
+                self.set_eax_al(0x03);
+                self.set_int_frame_carry(true);
+                true
+            }
+            0x120B => {
+                self.set_ax(0x0020);
+                self.set_int_frame_carry(true);
+                true
+            }
+            // DOS 3.0+ internal disk-buffer helpers. Toka-DOS writes through to the
+            // mounted host files and block devices, so there is no DOS buffer chain.
+            0x1207 | 0x1209 | 0x120C | 0x1215 => true,
+            0x120E | 0x120F => {
+                self.cpu
+                    .registers
+                    .set_segment(SegmentIndex::Ds, SegmentRegister::real(0));
+                let edi = self.cpu.registers.edi() & !0xFFFF;
+                self.cpu.registers.set_edi(edi);
+                true
+            }
+            0x1210 => {
+                self.set_int_frame_zero(true);
+                true
+            }
+            // DOS 3.0+ internal: decrement the reference count at ES:DI SFT.
+            0x1208 => {
+                let sft = self.cpu.registers.segment(SegmentIndex::Es).base
+                    + u32::from(self.cpu.registers.edi() as u16);
+                let original = self.read_guest_word(sft);
+                let next = match original {
+                    0 => 0,
+                    1 => 0xffff,
+                    n => n - 1,
+                };
+                self.write_physical_u16(sft, next);
+                self.set_ax(original);
+                true
+            }
+            // DOS 3.0+ internal: return current date and time in packed DOS file
+            // timestamp format.
+            0x120D => {
+                let mut date = izarravm_dos::DosRegs {
+                    ax: 0x2a00,
+                    ..izarravm_dos::DosRegs::default()
+                };
+                let mut time = izarravm_dos::DosRegs {
+                    ax: 0x2c00,
+                    ..izarravm_dos::DosRegs::default()
+                };
+                if !self.dispatch_int21_no_marshal(&mut date)
+                    || !self.dispatch_int21_no_marshal(&mut time)
+                {
+                    return false;
+                }
+                let year = date.cx.saturating_sub(1980).min(127);
+                let month = (date.dx >> 8) & 0x0f;
+                let day = date.dx & 0x1f;
+                let hour = (time.cx >> 8) & 0x1f;
+                let minute = time.cx & 0x3f;
+                let second = ((time.dx >> 8) / 2) & 0x1f;
+                self.set_ax((year << 9) | (month << 5) | day);
+                self.set_dx((hour << 11) | (minute << 5) | second);
+                true
+            }
             // DOS 3.0+ internal: get SFT entry for the file handle in BX. Resolve
             // through the current PSP's JFT before indexing the AH=52h SFT table.
             0x1216 => {
@@ -3089,12 +3664,375 @@ impl Machine {
                 }
                 true
             }
+            // DOS 3.0+ internal: normalize ASCIZ filename, uppercasing and turning
+            // forward slashes into backslashes without making the path absolute.
+            0x1211 => {
+                let mut src = self.cpu.registers.segment(SegmentIndex::Ds).base
+                    + (self.cpu.registers.esi() as u16) as u32;
+                let mut dst = self.cpu.registers.segment(SegmentIndex::Es).base
+                    + (self.cpu.registers.edi() as u16) as u32;
+                for _ in 0..=u16::MAX {
+                    let byte = self.read_physical_u8(src);
+                    let out = if byte == b'/' {
+                        b'\\'
+                    } else {
+                        byte.to_ascii_uppercase()
+                    };
+                    self.write_physical_u8(dst, out);
+                    src = src.wrapping_add(1);
+                    dst = dst.wrapping_add(1);
+                    if byte == 0 {
+                        break;
+                    }
+                }
+                true
+            }
             // DOS 3.0+ internal: get length of ASCIIZ string at ES:DI.
             0x1212 => {
                 let es = self.cpu.registers.segment(SegmentIndex::Es).base;
                 let di = self.cpu.registers.edi() as u16;
                 let len = self.asciz_len(es + u32::from(di));
                 self.set_cx(len);
+                true
+            }
+            // DOS 3.0+ internal: uppercase a character passed on the stack.
+            0x1213 => {
+                let ch = self.int2f_stack_word() as u8;
+                self.set_eax_al(ch.to_ascii_uppercase());
+                true
+            }
+            // DOS 3.0+ internal: compare DS:SI and ES:DI as far pointers.
+            0x1214 => {
+                let equal = self.cpu.registers.segment(SegmentIndex::Ds).selector
+                    == self.cpu.registers.segment(SegmentIndex::Es).selector
+                    && (self.cpu.registers.esi() as u16) == (self.cpu.registers.edi() as u16);
+                self.set_int_frame_zero(equal);
+                self.set_int_frame_carry(!equal);
+                true
+            }
+            // DOS 3.0+ internal: get CDS for the drive number on the stack.
+            0x1217 => {
+                let drive = self.int2f_stack_word();
+                if let Some((seg, off)) = self.cds_entry_for_drive(drive) {
+                    self.cpu
+                        .registers
+                        .set_segment(SegmentIndex::Ds, SegmentRegister::real(seg));
+                    let esi = (self.cpu.registers.esi() & !0xFFFF) | u32::from(off);
+                    self.cpu.registers.set_esi(esi);
+                    self.set_int_frame_carry(false);
+                } else {
+                    self.set_ax(0x000f);
+                    self.set_int_frame_carry(true);
+                }
+                true
+            }
+            // DOS 3.0+ internal: return a saved caller-register image.
+            0x1218 => {
+                let frame = [
+                    self.cpu.registers.eax() as u16,
+                    self.cpu.registers.ebx() as u16,
+                    self.cpu.registers.ecx() as u16,
+                    self.cpu.registers.edx() as u16,
+                    self.cpu.registers.esi() as u16,
+                    self.cpu.registers.edi() as u16,
+                    self.cpu.registers.ebp() as u16,
+                    self.cpu.registers.segment(SegmentIndex::Ds).selector,
+                    self.cpu.registers.segment(SegmentIndex::Es).selector,
+                ];
+                let base = (u32::from(DOS_INT2F_REGS_SEG) << 4) + u32::from(DOS_INT2F_REGS_OFF);
+                for (index, value) in frame.into_iter().enumerate() {
+                    self.write_physical_u16(base + (index as u32) * 2, value);
+                }
+                self.cpu
+                    .registers
+                    .set_segment(SegmentIndex::Ds, SegmentRegister::real(DOS_INT2F_REGS_SEG));
+                let esi = (self.cpu.registers.esi() & !0xFFFF) | u32::from(DOS_INT2F_REGS_OFF);
+                self.cpu.registers.set_esi(esi);
+                true
+            }
+            // DOS 3.0+ internal: select/resolve a drive. Drive 0 means default.
+            0x1219 => {
+                let raw = self.int2f_stack_word();
+                let drive = if raw == 0 { 2 } else { raw.saturating_sub(1) };
+                if let Some((seg, off)) = self.cds_entry_for_drive(drive) {
+                    self.cpu
+                        .registers
+                        .set_segment(SegmentIndex::Ds, SegmentRegister::real(seg));
+                    let esi = (self.cpu.registers.esi() & !0xFFFF) | u32::from(off);
+                    self.cpu.registers.set_esi(esi);
+                    self.set_int_frame_carry(false);
+                } else {
+                    self.set_ax(0x000f);
+                    self.set_int_frame_carry(true);
+                }
+                true
+            }
+            // DOS 3.0+ internal: get current process JFT byte for handle in BX.
+            0x1220 => {
+                if let Some((seg, off)) = self.jft_entry_for_handle(self.cpu.registers.ebx() as u16)
+                {
+                    self.cpu
+                        .registers
+                        .set_segment(SegmentIndex::Es, SegmentRegister::real(seg));
+                    let edi = (self.cpu.registers.edi() & !0xFFFF) | u32::from(off);
+                    self.cpu.registers.set_edi(edi);
+                    self.set_int_frame_carry(false);
+                } else {
+                    self.set_eax_al(0x06);
+                    self.set_int_frame_carry(true);
+                }
+                true
+            }
+            // DOS 3.0+ internal: parse an optional leading drive from DS:SI.
+            0x121A => {
+                let ds = self.cpu.registers.segment(SegmentIndex::Ds).base;
+                let si = self.cpu.registers.esi() as u16;
+                let addr = ds + u32::from(si);
+                let first = self.read_physical_u8(addr);
+                let second = self.read_physical_u8(addr + 1);
+                let al = if second == b':' {
+                    if first.is_ascii_alphabetic() {
+                        let drive = first.to_ascii_uppercase() - b'A' + 1;
+                        let esi =
+                            (self.cpu.registers.esi() & !0xFFFF) | u32::from(si.wrapping_add(2));
+                        self.cpu.registers.set_esi(esi);
+                        drive
+                    } else {
+                        0xff
+                    }
+                } else {
+                    0
+                };
+                self.set_eax_al(al);
+                true
+            }
+            // DOS 3.0+ internal: compute February length for year 1980+CL.
+            0x121B => {
+                let year = 1980 + u16::from(self.cpu.registers.ecx() as u8);
+                let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+                self.set_eax_al(if leap { 29 } else { 28 });
+                true
+            }
+            // DOS 3.0+ internal: 16-bit additive checksum over CX bytes.
+            0x121C => {
+                let count = self.cpu.registers.ecx() as u16;
+                let mut addr = self.cpu.registers.segment(SegmentIndex::Ds).base
+                    + (self.cpu.registers.esi() as u16) as u32;
+                let mut sum = self.cpu.registers.edx() as u16;
+                for _ in 0..count {
+                    sum = sum.wrapping_add(u16::from(self.read_physical_u8(addr)));
+                    addr = addr.wrapping_add(1);
+                }
+                self.set_dx(sum);
+                self.set_cx(0);
+                let si = (self.cpu.registers.esi() as u16).wrapping_add(count);
+                let esi = (self.cpu.registers.esi() & !0xFFFF) | u32::from(si);
+                self.cpu.registers.set_esi(esi);
+                true
+            }
+            // DOS 3.0+ internal: sum bytes until the next byte would exceed DX.
+            0x121D => {
+                let mut addr = self.cpu.registers.segment(SegmentIndex::Ds).base
+                    + (self.cpu.registers.esi() as u16) as u32;
+                let start_si = self.cpu.registers.esi() as u16;
+                let mut remaining = self.cpu.registers.edx() as u16;
+                let mut count = 0u16;
+                for _ in 0..=u16::MAX {
+                    let byte = self.read_physical_u8(addr);
+                    if u16::from(byte) > remaining {
+                        self.set_eax_al(byte);
+                        self.set_cx(count);
+                        self.set_dx(remaining);
+                        let si = start_si.wrapping_add(count).wrapping_add(1);
+                        let esi = (self.cpu.registers.esi() & !0xFFFF) | u32::from(si);
+                        self.cpu.registers.set_esi(esi);
+                        return true;
+                    }
+                    remaining = remaining.wrapping_sub(u16::from(byte));
+                    count = count.wrapping_add(1);
+                    addr = addr.wrapping_add(1);
+                }
+                let si = start_si.wrapping_add(count);
+                let esi = (self.cpu.registers.esi() & !0xFFFF) | u32::from(si);
+                self.cpu.registers.set_esi(esi);
+                self.set_cx(count);
+                self.set_dx(remaining);
+                self.set_eax_al(0);
+                true
+            }
+            // DOS 3.0+ internal: compare two ASCIZ filenames after DOS-style case
+            // and slash normalization.
+            0x121E => {
+                let ds = self.cpu.registers.segment(SegmentIndex::Ds).base;
+                let es = self.cpu.registers.segment(SegmentIndex::Es).base;
+                let mut left = ds + u32::from(self.cpu.registers.esi() as u16);
+                let mut right = es + u32::from(self.cpu.registers.edi() as u16);
+                let mut equal = true;
+                for _ in 0..=u16::MAX {
+                    let a = normalize_dos_name_byte(self.read_physical_u8(left));
+                    let b = normalize_dos_name_byte(self.read_physical_u8(right));
+                    if a != b {
+                        equal = false;
+                        break;
+                    }
+                    if a == 0 {
+                        break;
+                    }
+                    left = left.wrapping_add(1);
+                    right = right.wrapping_add(1);
+                }
+                self.set_int_frame_zero(equal);
+                true
+            }
+            // DOS 3.0+ internal: build CDS for the drive named on the stack.
+            0x121F => {
+                let raw = self.int2f_stack_word();
+                let drive = match raw as u8 {
+                    b'a'..=b'z' => u16::from(raw as u8 - b'a'),
+                    b'A'..=b'Z' => u16::from(raw as u8 - b'A'),
+                    _ => raw,
+                };
+                if let Some((seg, off)) = self.cds_entry_for_drive(drive) {
+                    self.cpu
+                        .registers
+                        .set_segment(SegmentIndex::Es, SegmentRegister::real(seg));
+                    let edi = (self.cpu.registers.edi() & !0xFFFF) | u32::from(off);
+                    self.cpu.registers.set_edi(edi);
+                    self.set_int_frame_carry(false);
+                } else {
+                    self.set_ax(0x000f);
+                    self.set_int_frame_carry(true);
+                }
+                true
+            }
+            // DOS 3.0+ internal: canonicalize filename, same result as INT 21h
+            // AH=60h.
+            0x1221 => {
+                let mut regs = izarravm_dos::DosRegs {
+                    ax: 0x6000,
+                    ds: self.cpu.registers.segment(SegmentIndex::Ds).selector,
+                    si: self.cpu.registers.esi() as u16,
+                    es: self.cpu.registers.segment(SegmentIndex::Es).selector,
+                    di: self.cpu.registers.edi() as u16,
+                    ..izarravm_dos::DosRegs::default()
+                };
+                if self.dos.dispatch(0x21, &mut regs, &mut self.memory).is_ok() {
+                    self.set_ax(regs.ax);
+                    self.set_int_frame_carry(regs.cf);
+                    true
+                } else {
+                    false
+                }
+            }
+            // DOS 3.0+ internal: check whether the current SDA filename is a
+            // character device. The extended SDA filename buffer is not modeled, so
+            // report "not a device" instead of consulting stale memory.
+            0x1223 => {
+                self.set_int_frame_carry(true);
+                true
+            }
+            // DOS 3.3+ internal: open file, equivalent to INT 21h AH=3Dh with
+            // access in CL.
+            0x1226 => self.dispatch_int21_from_int2f(izarravm_dos::DosRegs {
+                ax: 0x3d00 | u16::from(self.cpu.registers.ecx() as u8),
+                dx: self.cpu.registers.edx() as u16,
+                ds: self.cpu.registers.segment(SegmentIndex::Ds).selector,
+                ..self.cpu_dos_regs()
+            }),
+            // DOS 3.3+ internal: close file, equivalent to INT 21h AH=3Eh.
+            0x1227 => self.dispatch_int21_from_int2f(izarravm_dos::DosRegs {
+                ax: 0x3e00,
+                bx: self.cpu.registers.ebx() as u16,
+                ..self.cpu_dos_regs()
+            }),
+            // DOS 3.3+ internal: move file pointer, equivalent to INT 21h AH=42h
+            // with the full AX supplied in BP.
+            0x1228 if (0x4200..=0x4202).contains(&(self.cpu.registers.ebp() as u16)) => self
+                .dispatch_int21_from_int2f(izarravm_dos::DosRegs {
+                    ax: self.cpu.registers.ebp() as u16,
+                    bx: self.cpu.registers.ebx() as u16,
+                    cx: self.cpu.registers.ecx() as u16,
+                    dx: self.cpu.registers.edx() as u16,
+                    ..self.cpu_dos_regs()
+                }),
+            0x1228 => {
+                self.set_ax(0x0001);
+                self.set_int_frame_carry(true);
+                true
+            }
+            // DOS 3.3+ internal: read file, equivalent to INT 21h AH=3Fh.
+            0x1229 => self.dispatch_int21_from_int2f(izarravm_dos::DosRegs {
+                ax: 0x3f00,
+                bx: self.cpu.registers.ebx() as u16,
+                cx: self.cpu.registers.ecx() as u16,
+                dx: self.cpu.registers.edx() as u16,
+                ds: self.cpu.registers.segment(SegmentIndex::Ds).selector,
+                ..self.cpu_dos_regs()
+            }),
+            // DOS 3.3+ internal: install FASTOPEN entry point. FASTOPEN is absent,
+            // but accepting the registration lets the TSR load without changing
+            // normal file semantics.
+            0x122A => {
+                self.set_int_frame_carry(false);
+                true
+            }
+            // DOS 3.3+ internal: get device chain, returning the header after NUL.
+            0x122C => {
+                let Some((seg, off)) = self.refresh_dos_sysvars() else {
+                    return false;
+                };
+                let nul = (u32::from(seg) << 4) + u32::from(off.wrapping_add(0x22));
+                let next_off = self.read_guest_word(nul);
+                let next_seg = self.read_guest_word(nul + 2);
+                self.set_ax(next_off);
+                self.set_bx(next_seg);
+                true
+            }
+            // DOS 3.0+ internal: sharing retry delay. In this single-tasking DOS
+            // model no SHARE retry loop is pending, so the delay completes
+            // immediately.
+            0x1224 => true,
+            // DOS 3.0+ internal: update extended-error class/action/locus from the
+            // caller's record table at SS:SI.
+            0x1222 => {
+                let ss = self.cpu.registers.segment(SegmentIndex::Ss).selector;
+                let si = self.cpu.registers.esi() as u16;
+                match self.dos.set_extended_error_from_table(&self.memory, ss, si) {
+                    Ok(next_si) => {
+                        let esi = (self.cpu.registers.esi() & !0xFFFF) | u32::from(next_si);
+                        self.cpu.registers.set_esi(esi);
+                        true
+                    }
+                    Err(_) => false,
+                }
+            }
+            // DOS 3.3+ internal: get current extended error code.
+            0x122D => {
+                let mut regs = izarravm_dos::DosRegs {
+                    ax: 0x5900,
+                    ..izarravm_dos::DosRegs::default()
+                };
+                if self.dispatch_int21_no_marshal(&mut regs) {
+                    self.set_ax(regs.ax);
+                    true
+                } else {
+                    false
+                }
+            }
+            // DOS 3.3+ internal: IOCTL, equivalent to INT 21h AX=44xxh with AX
+            // supplied in BP.
+            0x122B if (self.cpu.registers.ebp() as u16) & 0xff00 == 0x4400 => self
+                .dispatch_int21_from_int2f(izarravm_dos::DosRegs {
+                    ax: self.cpu.registers.ebp() as u16,
+                    bx: self.cpu.registers.ebx() as u16,
+                    cx: self.cpu.registers.ecx() as u16,
+                    dx: self.cpu.registers.edx() as u16,
+                    ds: self.cpu.registers.segment(SegmentIndex::Ds).selector,
+                    ..self.cpu_dos_regs()
+                }),
+            0x122B => {
+                self.set_ax(0x0001);
+                self.set_int_frame_carry(true);
                 true
             }
             // DOS 3.0+ internal: get length of ASCIIZ string at DS:SI.
@@ -3105,11 +4043,177 @@ impl Machine {
                 self.set_cx(len);
                 true
             }
+            // DOS 4.0+ internal: get/set error-table addresses. Toka-DOS keeps
+            // AH=59h state internally and has no resident message tables.
+            0x122E => {
+                if self.cpu.registers.edx() as u8 & 1 == 0 {
+                    self.cpu
+                        .registers
+                        .set_segment(SegmentIndex::Es, SegmentRegister::real(0));
+                    let edi = self.cpu.registers.edi() & !0xFFFF;
+                    self.cpu.registers.set_edi(edi);
+                }
+                self.set_int_frame_carry(false);
+                true
+            }
+            // DOS 4.x internal: set the apparent version returned by INT 21h
+            // AH=30h. DX=0000h restores the true version.
+            0x122F => {
+                self.dos
+                    .set_reported_version_word(self.cpu.registers.edx() as u16);
+                true
+            }
+            // DOS 3.2+ DRIVER.SYS support install check. The backing table is the
+            // DOS 4.x BDS list returned by AX=0803h.
+            0x0800 => {
+                self.set_eax_al(0xff);
+                true
+            }
+            // DOS 3.2+ DRIVER.SYS support: append a guest-supplied BDS entry to
+            // the internal drive data table list.
+            0x0801 => self.int2f_driver_install_bds(),
+            // DOS 3.2+ DRIVER.SYS support: execute a block-device request packet
+            // at ES:BX through the internal disk-driver facade. DOS 4 routes
+            // AL=02h and AL=04h..F7h here; AL=03h is the BDS-list query below.
+            0x0802 | 0x0804..=0x08f7 => {
+                let header = self.cpu.registers.segment(SegmentIndex::Es).base
+                    + u32::from(self.cpu.registers.ebx() as u16);
+                self.int2f_driver_disk_request(header);
+                true
+            }
+            // DOS 4.0+ DRIVER.SYS support: DS:DI -> first drive data table.
+            0x0803 => {
+                let Some((seg, off)) = self.publish_driver_bds_chain() else {
+                    return false;
+                };
+                self.cpu
+                    .registers
+                    .set_segment(SegmentIndex::Ds, SegmentRegister::real(seg));
+                let edi = (self.cpu.registers.edi() & !0xFFFF) | u32::from(off);
+                self.cpu.registers.set_edi(edi);
+                true
+            }
+            // Reserved DRIVER.SYS functions are consumed by the DOS 4 handler.
+            0x08f8..=0x08ff => true,
             // DOS-owned install checks for resident utilities we do not load.
             // Report "not installed, OK to install" rather than falling through
             // with stale register contents.
-            0x0100 | 0x0600 | 0x1000 => {
+            0x0100 | 0x0500 | 0x1000 | 0x1400 | 0x6400 | 0x7A00 | 0xAA00 | 0xAD00 | 0xB000
+            | 0xF700 => {
                 self.set_eax_al(0x00);
+                true
+            }
+            0x2300 | 0x2E00 => {
+                self.set_eax_ah(0x00);
+                true
+            }
+            0xB700 => {
+                self.set_ax(0x0000);
+                true
+            }
+            0xB800 => {
+                self.set_eax_ah(0x00);
+                self.set_bx(0x0000);
+                true
+            }
+            0xB803 => {
+                let (seg, off) = self.network_post_address;
+                self.cpu
+                    .registers
+                    .set_segment(SegmentIndex::Es, SegmentRegister::real(seg));
+                self.set_bx(off);
+                true
+            }
+            0xB804 => {
+                self.network_post_address = (
+                    self.cpu.registers.segment(SegmentIndex::Es).selector,
+                    self.cpu.registers.ebx() as u16,
+                );
+                true
+            }
+            // ASSIGN is absent. DOSINTS documents AH=0 for not installed, while
+            // RBIL documents AL=0; clear AX to satisfy both probes. AX=0601h would
+            // return ASSIGN's work area if installed, so return a null segment.
+            0x0600 => {
+                self.set_ax(0x0000);
+                true
+            }
+            0x0601 => {
+                self.cpu
+                    .registers
+                    .set_segment(SegmentIndex::Es, SegmentRegister::real(0));
+                true
+            }
+            // PRINT is not resident. Its service calls report a normal DOS invalid
+            // function error instead of falling through with whatever CF/AX the
+            // caller happened to have.
+            0x0101..=0x0105 => {
+                self.set_ax(0x0001);
+                self.set_int_frame_carry(true);
+                true
+            }
+            0x1401..=0x1404 | 0x14FE | 0x14FF => {
+                self.set_eax_al(0x01);
+                true
+            }
+            0xB001 => {
+                self.set_eax_al(0x00);
+                true
+            }
+            0xB701 | 0xB702 | 0xB809 | 0xF701 => {
+                self.set_ax(0x0001);
+                self.set_int_frame_carry(true);
+                true
+            }
+            ax if ax & 0xFF00 == 0x2300 || ax & 0xFF00 == 0x2E00 => {
+                self.set_eax_ah(0x00);
+                true
+            }
+            // Redirector/IFSFUNC calls. Toka-DOS does not load a network
+            // redirector or installable filesystem helper here. Hooks that only
+            // notify the redirector are no-ops; unsupported remote operations fail
+            // with the documented invalid-function result instead of leaking stale
+            // caller state.
+            0x111D | 0x1122 => true,
+            0x1120 => {
+                self.set_int_frame_carry(false);
+                true
+            }
+            0x1101..=0x111C | 0x111E | 0x111F | 0x1121 | 0x1123..=0x112F => {
+                self.set_ax(0x0001);
+                self.set_int_frame_carry(true);
+                true
+            }
+            // Critical-error helper: no resident message override is installed, so
+            // expansion requests fail instead of falling through with stale flags.
+            ax if ax & 0xFF00 == 0x0500 => {
+                self.set_ax(0x0001);
+                self.set_int_frame_carry(true);
+                true
+            }
+            // DOS 3.2+ disk-interrupt handler hook. Return the previous handler
+            // pair, then remember the caller's new DS:DX and ES:BX values.
+            ax if ax & 0xFF00 == 0x1300 => {
+                let new_handler = (
+                    self.cpu.registers.segment(SegmentIndex::Ds).selector,
+                    self.cpu.registers.edx() as u16,
+                );
+                let new_restore = (
+                    self.cpu.registers.segment(SegmentIndex::Es).selector,
+                    self.cpu.registers.ebx() as u16,
+                );
+                let old_handler = self.dos_disk_handler;
+                let old_restore = self.dos_disk_restore;
+                self.dos_disk_handler = new_handler;
+                self.dos_disk_restore = new_restore;
+                self.cpu
+                    .registers
+                    .set_segment(SegmentIndex::Ds, SegmentRegister::real(old_handler.0));
+                self.set_dx(old_handler.1);
+                self.cpu
+                    .registers
+                    .set_segment(SegmentIndex::Es, SegmentRegister::real(old_restore.0));
+                self.set_bx(old_restore.1);
                 true
             }
             // Network-redirector / ICDEX installation check (RBIL INTERRUP.K,
@@ -3117,9 +4221,8 @@ impl Machine {
             // and a present ICDEX returns AL=FFh and replaces the pushed word
             // with ADADh. A strict probe checks that the word changed, so we
             // rewrite it. The INT pushed IP, CS, FLAGS over the marker, so the
-            // marker sits at SS:SP+6. Only the DADAh marker is the install check;
-            // any other pushed value is some other 1100h subfunction and is left
-            // unhandled rather than falsely reporting installed.
+            // marker sits at SS:SP+6. Without that marker this is the plain
+            // network-redirector install check, and no redirector is loaded.
             0x1100 => {
                 let ss = self.cpu.registers.segment(SegmentIndex::Ss).base;
                 let sp = self.cpu.registers.esp() as u16;
@@ -3127,10 +4230,10 @@ impl Machine {
                 if self.read_guest_word(marker_addr) == 0xDADA {
                     let _ = self.memory.write_u16(marker_addr as usize, 0xADAD);
                     self.set_eax_al(0xFF);
-                    true
                 } else {
-                    false
+                    self.set_eax_al(0x00);
                 }
+                true
             }
             // CD-ROM installation check: BX = number of CD drives, CX = first
             // drive letter (0 = A:).
@@ -3155,6 +4258,88 @@ impl Machine {
                     let bx = self.cpu.registers.ebx() as u16;
                     let addr = es.wrapping_add(u32::from(bx));
                     self.write_guest_block(addr, &[0u8; 5]); // subunit 0, header 0:0
+                }
+                true
+            }
+            // Metadata filenames from the ISO primary volume descriptor. Until the
+            // descriptor parser grows those fields, report empty names for a valid
+            // CD drive rather than leaking stale guest buffer bytes.
+            0x1502..=0x1504 => {
+                if !self.icdex_drive_matches(self.cpu.registers.ecx() as u16) {
+                    self.icdex_fail(0x000F);
+                    return true;
+                }
+                self.write_guest_block(self.icdex_es_bx(), &[0u8; 38]);
+                self.set_int_frame_carry(false);
+                true
+            }
+            // Read ISO volume descriptor N. VTOC index 0 maps to LBA 16.
+            0x1505 => {
+                if !self.icdex_drive_matches(self.cpu.registers.ecx() as u16) {
+                    self.icdex_fail(0x000F);
+                    return true;
+                }
+                let lba = 16u32.wrapping_add(u32::from(self.cpu.registers.edx() as u16));
+                match self
+                    .ide
+                    .device()
+                    .image()
+                    .and_then(|img| img.read_data_sector(lba))
+                {
+                    Some(sector) => {
+                        let descriptor_type = sector[0];
+                        self.write_guest_block(self.icdex_es_bx(), &sector);
+                        self.set_ax(u16::from(descriptor_type));
+                        self.set_int_frame_carry(false);
+                    }
+                    None => self.icdex_fail(0x0015),
+                }
+                true
+            }
+            // Absolute CD data read. SI:DI is the starting LBA, DX is the sector
+            // count, and ES:BX receives contiguous 2048-byte sectors.
+            0x1508 => {
+                if !self.icdex_drive_matches(self.cpu.registers.ecx() as u16) {
+                    self.icdex_fail(0x000F);
+                    return true;
+                }
+                let lba = ((self.cpu.registers.esi() as u16 as u32) << 16)
+                    | u32::from(self.cpu.registers.edi() as u16);
+                let count = self.cpu.registers.edx() as u16;
+                let mut addr = self.icdex_es_bx();
+                let mut ok = true;
+                for sector_index in 0..u32::from(count) {
+                    match self
+                        .ide
+                        .device()
+                        .image()
+                        .and_then(|img| img.read_data_sector(lba + sector_index))
+                    {
+                        Some(sector) => {
+                            self.write_guest_block(addr, &sector);
+                            addr = addr.wrapping_add(cdimage::DATA_SECTOR as u32);
+                        }
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    self.cd_accesses += u64::from(count != 0);
+                    self.set_int_frame_carry(false);
+                } else {
+                    self.icdex_fail(0x0015);
+                }
+                true
+            }
+            // Absolute write is reserved for writable optical media. No such device
+            // is modeled, so report invalid function for a valid CD drive.
+            0x1509 => {
+                if !self.icdex_drive_matches(self.cpu.registers.ecx() as u16) {
+                    self.icdex_fail(0x000F);
+                } else {
+                    self.icdex_fail(0x0001);
                 }
                 true
             }
@@ -3183,6 +4368,15 @@ impl Machine {
                 self.cpu.registers.set_ebx(ebx);
                 true
             }
+            // Reserved CD-ROM debug toggles. No debugger is modeled, but accepting
+            // the calls matches their no-result contract.
+            0x1506 | 0x1507 => true,
+            // Reserved by MSCDEX. Consume it so probes do not fall through with
+            // stale interrupt state.
+            0x150A => {
+                self.set_int_frame_carry(false);
+                true
+            }
             // XMS install check (INT 2F/AX=4300h). The host XMS driver is present, so
             // report AL=80h. The guest then asks for the entry point with AX=4310h.
             0x4300 => {
@@ -3202,6 +4396,79 @@ impl Machine {
             0x150C => {
                 let ebx = (self.cpu.registers.ebx() & !0xFFFF) | 0x0217; // 2.23
                 self.cpu.registers.set_ebx(ebx);
+                true
+            }
+            // Get/set volume descriptor preference. Default is primary volume
+            // descriptor; a caller may request supplementary descriptors.
+            0x150E => {
+                if !self.icdex_drive_matches(self.cpu.registers.ecx() as u16) {
+                    self.icdex_fail(0x000F);
+                    return true;
+                }
+                match self.cpu.registers.ebx() as u16 {
+                    0x0000 => {
+                        self.set_dx(self.icdex_vd_preference);
+                        self.set_int_frame_carry(false);
+                    }
+                    0x0001 => {
+                        let dx = self.cpu.registers.edx() as u16;
+                        let primary = (dx >> 8) as u8;
+                        let supplementary = dx as u8;
+                        if (primary == 0x01 || primary == 0x02)
+                            && (supplementary == 0x00 || supplementary == 0x01)
+                        {
+                            self.icdex_vd_preference = dx;
+                            self.set_int_frame_carry(false);
+                        } else {
+                            self.icdex_fail(0x0001);
+                        }
+                    }
+                    _ => self.icdex_fail(0x0001),
+                }
+                true
+            }
+            // Get an ISO9660 directory entry for the ASCIZ path at ES:BX. CH bit 0
+            // selects MSCDEX's canonical structure; clear means a direct raw
+            // directory-record copy.
+            0x150F => {
+                let drive = self.cpu.registers.ecx() as u8;
+                if !self.icdex_drive_matches(u16::from(drive)) {
+                    self.icdex_fail(0x000F);
+                    return true;
+                }
+                let es = self.cpu.registers.segment(SegmentIndex::Es).selector;
+                let bx = self.cpu.registers.ebx() as u16;
+                let path = self.read_guest_asciiz_lossy(es, bx, 255);
+                let copy_canonical = (self.cpu.registers.ecx() as u16 >> 8) & 1 != 0;
+                let dst = (u32::from(self.cpu.registers.esi() as u16) << 4)
+                    + u32::from(self.cpu.registers.edi() as u16);
+                match self.icdex_iso_dir_record(&path) {
+                    Ok(record) => {
+                        if copy_canonical {
+                            self.write_icdex_canonical_dir_record(dst, &record);
+                        } else {
+                            let mut out = [0u8; 255];
+                            let len = usize::from(record[0]).min(record.len()).min(out.len());
+                            out[..len].copy_from_slice(&record[..len]);
+                            self.write_guest_block(dst, &out);
+                        }
+                        self.set_ax(0x0001);
+                        self.set_int_frame_carry(false);
+                    }
+                    Err(code) => self.icdex_fail(code),
+                }
+                true
+            }
+            // Windows enhanced-mode installation check. This is a plain DOS box,
+            // so neither Windows/386 nor Windows 3.x enhanced mode is active.
+            0x1600 => {
+                self.set_eax_al(0x00);
+                true
+            }
+            // DPMI mode/install checks. Toka-DOS has XMS/EMS HLE, but no DPMI host
+            // yet, so report real-mode/no-host with AX nonzero.
+            0x1686 | 0x1687 => {
+                self.set_ax(0x0001);
                 true
             }
             // Release current VM time-slice (AX=1680h). There is no host-side
@@ -3259,21 +4526,25 @@ impl Machine {
         }
     }
 
-    fn sft_entry_for_handle(&mut self, handle: u16) -> Option<(u16, u16)> {
-        const SFT_HEADER_LEN: u16 = 0x06;
-        const SFT_ENTRY_LEN: u16 = 0x3b;
-
+    fn jft_entry_for_handle(&mut self, handle: u16) -> Option<(u16, u16)> {
         let psp = self.current_dos_psp()?;
         let psp_base = u32::from(psp) << 4;
         let jft_count = self.read_guest_word(psp_base + 0x32);
         if handle >= jft_count {
             return None;
         }
-
         let jft_off = self.read_guest_word(psp_base + 0x34);
         let jft_seg = self.read_guest_word(psp_base + 0x36);
+        Some((jft_seg, jft_off.wrapping_add(handle)))
+    }
+
+    fn sft_entry_for_handle(&mut self, handle: u16) -> Option<(u16, u16)> {
+        const SFT_HEADER_LEN: u16 = 0x06;
+        const SFT_ENTRY_LEN: u16 = 0x3b;
+
+        let (jft_seg, jft_off) = self.jft_entry_for_handle(handle)?;
         let jft = (u32::from(jft_seg) << 4) + u32::from(jft_off);
-        let slot = self.read_physical_u8(jft + u32::from(handle));
+        let slot = self.read_physical_u8(jft);
         if slot == 0xff {
             return None;
         }
@@ -3294,6 +4565,74 @@ impl Machine {
         Some((sft_seg, entry_off))
     }
 
+    fn cds_entry_for_drive(&mut self, drive: u16) -> Option<(u16, u16)> {
+        const CDS_ENTRY_LEN: u16 = 0x58;
+
+        let (list_seg, list_off) = self.refresh_dos_sysvars()?;
+        let list = (u32::from(list_seg) << 4) + u32::from(list_off);
+        let lastdrive = self.read_physical_u8(list + 0x21);
+        if drive >= u16::from(lastdrive) {
+            return None;
+        }
+
+        let cds_off = self.read_guest_word(list + 0x16);
+        let cds_seg = self.read_guest_word(list + 0x18);
+        let entry_off = cds_off.checked_add(drive.checked_mul(CDS_ENTRY_LEN)?)?;
+        Some((cds_seg, entry_off))
+    }
+
+    fn dispatch_int21_no_marshal(&mut self, regs: &mut izarravm_dos::DosRegs) -> bool {
+        matches!(
+            self.dos.dispatch(0x21, regs, &mut self.memory),
+            Ok(izarravm_dos::DosAction::Continue)
+        )
+    }
+
+    fn dispatch_int21_from_int2f(&mut self, mut regs: izarravm_dos::DosRegs) -> bool {
+        if !self.dispatch_int21_no_marshal(&mut regs) {
+            return false;
+        }
+        self.apply_dos_regs_to_cpu(&regs);
+        true
+    }
+
+    fn cpu_dos_regs(&self) -> izarravm_dos::DosRegs {
+        izarravm_dos::DosRegs {
+            ax: self.cpu.registers.eax() as u16,
+            bx: self.cpu.registers.ebx() as u16,
+            cx: self.cpu.registers.ecx() as u16,
+            dx: self.cpu.registers.edx() as u16,
+            si: self.cpu.registers.esi() as u16,
+            di: self.cpu.registers.edi() as u16,
+            bp: self.cpu.registers.ebp() as u16,
+            ds: self.cpu.registers.segment(SegmentIndex::Ds).selector,
+            es: self.cpu.registers.segment(SegmentIndex::Es).selector,
+            cf: self.cpu.registers.eflags & 0x1 != 0,
+            zf: self.cpu.registers.eflags & 0x40 != 0,
+        }
+    }
+
+    fn apply_dos_regs_to_cpu(&mut self, regs: &izarravm_dos::DosRegs) {
+        self.set_ax(regs.ax);
+        self.set_bx(regs.bx);
+        self.set_cx(regs.cx);
+        self.set_dx(regs.dx);
+        let esi = (self.cpu.registers.esi() & !0xFFFF) | u32::from(regs.si);
+        self.cpu.registers.set_esi(esi);
+        let edi = (self.cpu.registers.edi() & !0xFFFF) | u32::from(regs.di);
+        self.cpu.registers.set_edi(edi);
+        let ebp = (self.cpu.registers.ebp() & !0xFFFF) | u32::from(regs.bp);
+        self.cpu.registers.set_ebp(ebp);
+        self.cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(regs.ds));
+        self.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(regs.es));
+        self.set_int_frame_carry(regs.cf);
+        self.set_int_frame_zero(regs.zf);
+    }
+
     fn asciz_len(&mut self, addr: u32) -> u16 {
         let mut len = 0u16;
         loop {
@@ -3302,6 +4641,12 @@ impl Machine {
             }
             len = len.wrapping_add(1);
         }
+    }
+
+    fn int2f_stack_word(&mut self) -> u16 {
+        let ss = self.cpu.registers.segment(SegmentIndex::Ss).base;
+        let sp = self.cpu.registers.esp() as u16;
+        self.read_guest_word(ss + u32::from(sp.wrapping_add(6)))
     }
 
     /// Service the XMS driver, reached when a guest FAR-CALLs the entry point
@@ -3917,21 +5262,95 @@ impl Machine {
         self.xms_success();
     }
 
-    /// Service INT 28h (DOS idle). DOS calls this from its keyboard-wait loop so a
-    /// TSR can do background work. With no TSR installed it is a no-op return; the
-    /// guest's FLAGS image is untouched, the way the default IRET stub left it.
-    fn handle_int28(&mut self) {}
-
     /// Service INT 29h (DOS fast console output). The character is in AL; write it to
     /// the active page through the same teletype path INT 10h AH=0Eh uses, the way
     /// the DOS CON device's fast-output hook does.
     fn handle_int29(&mut self) {
+        if self.read_guest_word(0x29 * 4) != 0
+            || self.read_guest_word(0x29 * 4 + 2) != BIOS_ROM_IRET_SEG
+        {
+            return;
+        }
         let al = self.cpu.registers.eax() as u8;
         self.teletype_char(al);
     }
 
     fn icdex_cd_drive_number(&self) -> Option<u8> {
         self.dos.next_block_device_drive()
+    }
+
+    fn icdex_drive_matches(&self, drive: u16) -> bool {
+        self.icdex_cd_drive_number()
+            .is_some_and(|cd_drive| drive == u16::from(cd_drive))
+    }
+
+    fn icdex_es_bx(&self) -> u32 {
+        self.cpu.registers.segment(SegmentIndex::Es).base + (self.cpu.registers.ebx() as u16) as u32
+    }
+
+    fn icdex_fail(&mut self, code: u16) {
+        self.set_ax(code);
+        self.set_int_frame_carry(true);
+    }
+
+    fn icdex_iso_dir_record(&self, path: &str) -> Result<Vec<u8>, u16> {
+        let image = self.ide.device().image().ok_or(0x0015u16)?;
+        let pvd = image.read_data_sector(16).ok_or(0x0015u16)?;
+        if pvd[0] != 0x01 || &pvd[1..6] != b"CD001" {
+            return Err(0x0015);
+        }
+        let root_len = usize::from(pvd[156]);
+        if root_len == 0 || 156 + root_len > pvd.len() {
+            return Err(0x0015);
+        }
+        let mut record = pvd[156..156 + root_len].to_vec();
+        let mut normalized = path.replace('/', "\\");
+        if normalized.as_bytes().get(1) == Some(&b':') {
+            normalized.drain(..2);
+        }
+        for component in normalized.split('\\').filter(|part| !part.is_empty()) {
+            if record.get(25).copied().unwrap_or(0) & 0x02 == 0 {
+                return Err(0x0002);
+            }
+            record = icdex_iso_child_record(image, &record, component).ok_or(0x0002u16)?;
+        }
+        Ok(record)
+    }
+
+    fn write_icdex_canonical_dir_record(&mut self, dst: u32, record: &[u8]) {
+        let mut out = [0u8; 285];
+        if record.len() < 34 {
+            self.write_guest_block(dst, &out);
+            return;
+        }
+        let lba = u32::from_le_bytes(record[2..6].try_into().unwrap());
+        let len = u32::from_le_bytes(record[10..14].try_into().unwrap());
+        let blocks = len
+            .div_ceil(cdimage::DATA_SECTOR as u32)
+            .min(u32::from(u16::MAX)) as u16;
+        out[0] = record[1];
+        out[1..5].copy_from_slice(&lba.to_le_bytes());
+        out[5..7].copy_from_slice(&blocks.to_le_bytes());
+        out[7..11].copy_from_slice(&len.to_le_bytes());
+        out[0x0b..0x12].copy_from_slice(&record[18..25]);
+        out[0x12] = record[25];
+        out[0x13] = record[26];
+        out[0x14] = record[27];
+        out[0x15..0x17].copy_from_slice(&record[28..30]);
+        let (name, version) = icdex_iso_name_and_version(record);
+        let name_len = name.len().min(37);
+        out[0x17] = name_len as u8;
+        out[0x18..0x18 + name_len].copy_from_slice(&name[..name_len]);
+        out[0x3e..0x40].copy_from_slice(&version.to_le_bytes());
+        let name_record_len = usize::from(record[32]);
+        let sys_start = 33 + name_record_len + usize::from(name_record_len % 2 == 0);
+        if sys_start < record.len() {
+            let sys = &record[sys_start..];
+            let sys_len = sys.len().min(220);
+            out[0x40] = sys_len as u8;
+            out[0x41..0x41 + sys_len].copy_from_slice(&sys[..sys_len]);
+        }
+        self.write_guest_block(dst, &out);
     }
 
     /// Execute one CD-ROM device driver request whose header begins at linear
@@ -4045,6 +5464,250 @@ impl Machine {
             self.read_physical_u8(addr + 3),
         ];
         u32::from_le_bytes(bytes)
+    }
+
+    fn driver_request_far_ptr(&mut self, header: u32, offset: u32) -> izarravm_dos::FarPtr {
+        izarravm_dos::FarPtr {
+            offset: self.read_guest_word(header + offset),
+            segment: self.read_guest_word(header + offset + 2),
+        }
+    }
+
+    fn driver_request_linear(&mut self, header: u32, offset: u32) -> u32 {
+        let ptr = self.driver_request_far_ptr(header, offset);
+        (u32::from(ptr.segment) << 4).wrapping_add(u32::from(ptr.offset))
+    }
+
+    fn driver_request_start_lba(&mut self, header: u32) -> u32 {
+        let len = self.read_physical_u8(header);
+        let word = self.read_guest_word(header + 0x14);
+        if len == 0x1e && word == 0xffff {
+            self.read_guest_dword(header + 0x1a)
+        } else if len == 0x18 {
+            self.read_guest_dword(header + 0x14)
+        } else {
+            u32::from(word)
+        }
+    }
+
+    fn publish_driver_bds_chain(&mut self) -> Option<(u16, u16)> {
+        let first = self.dos.publish_driver_bds(&mut self.memory).ok()?;
+        self.link_external_driver_bds(first);
+        for entry in self.external_driver_bds.clone() {
+            self.mark_shared_driver_bds(first, entry);
+        }
+        Some(first)
+    }
+
+    fn link_external_driver_bds(&mut self, first: (u16, u16)) {
+        let entries = self.external_driver_bds.clone();
+        let Some(&head) = entries.first() else {
+            return;
+        };
+        let Some(tail) = self.driver_bds_tail(first) else {
+            return;
+        };
+        self.write_driver_bds_link(tail, head);
+        for (index, &entry) in entries.iter().enumerate() {
+            let next = entries.get(index + 1).copied().unwrap_or((0xffff, 0xffff));
+            self.write_driver_bds_link(entry, next);
+        }
+    }
+
+    fn driver_bds_tail(&mut self, first: (u16, u16)) -> Option<(u16, u16)> {
+        let (mut seg, mut off) = first;
+        for _ in 0..32 {
+            if (seg, off) == (0xffff, 0xffff) {
+                return None;
+            }
+            let linear = (u32::from(seg) << 4) + u32::from(off);
+            let next_off = self.read_guest_word(linear);
+            let next_seg = self.read_guest_word(linear + 2);
+            if (next_seg, next_off) == (0xffff, 0xffff) {
+                return Some((seg, off));
+            }
+            seg = next_seg;
+            off = next_off;
+        }
+        None
+    }
+
+    fn write_driver_bds_link(&mut self, entry: (u16, u16), next: (u16, u16)) {
+        let linear = (u32::from(entry.0) << 4) + u32::from(entry.1);
+        self.write_physical_u16(linear, next.1);
+        self.write_physical_u16(linear + 2, next.0);
+    }
+
+    fn int2f_driver_install_bds(&mut self) -> bool {
+        let seg = self.cpu.registers.segment(SegmentIndex::Ds).selector;
+        let off = self.cpu.registers.edi() as u16;
+        let entry = (seg, off);
+        if entry == (0xffff, 0xffff) {
+            return true;
+        }
+        if !self.external_driver_bds.contains(&entry) {
+            self.external_driver_bds.push(entry);
+        }
+        self.publish_driver_bds_chain().is_some()
+    }
+
+    fn mark_shared_driver_bds(&mut self, first: (u16, u16), new_entry: (u16, u16)) {
+        const FCHANGELINE: u16 = 0x0002;
+        const FI_AM_MULT: u16 = 0x0010;
+        const FI_OWN_PHYSICAL: u16 = 0x0020;
+
+        let new_linear = (u32::from(new_entry.0) << 4) + u32::from(new_entry.1);
+        let unit = self.read_physical_u8(new_linear + 0x04);
+        let mut new_flags = self.read_guest_word(new_linear + 0x23);
+        let (mut seg, mut off) = first;
+        for _ in 0..32 {
+            if (seg, off) == (0xffff, 0xffff) || (seg, off) == new_entry {
+                break;
+            }
+            let linear = (u32::from(seg) << 4) + u32::from(off);
+            if self.read_physical_u8(linear + 0x04) == unit {
+                let flags = self.read_guest_word(linear + 0x23) | FI_AM_MULT;
+                self.write_physical_u16(linear + 0x23, flags);
+                new_flags |= FI_AM_MULT | (flags & FCHANGELINE);
+                new_flags &= !FI_OWN_PHYSICAL;
+            }
+            let next_off = self.read_guest_word(linear);
+            let next_seg = self.read_guest_word(linear + 2);
+            seg = next_seg;
+            off = next_off;
+        }
+        self.write_physical_u16(new_linear + 0x23, new_flags);
+    }
+
+    fn driver_bds_for_unit(&mut self, unit: u8) -> Option<(u16, u16, u8)> {
+        let (mut seg, mut off) = self.publish_driver_bds_chain()?;
+        for _ in 0..32 {
+            if (seg, off) == (0xffff, 0xffff) {
+                return None;
+            }
+            let linear = (u32::from(seg) << 4) + u32::from(off);
+            if self.read_physical_u8(linear + 0x04) == unit {
+                return Some((seg, off, self.read_physical_u8(linear + 0x05)));
+            }
+            let next_off = self.read_guest_word(linear);
+            let next_seg = self.read_guest_word(linear + 2);
+            seg = next_seg;
+            off = next_off;
+        }
+        None
+    }
+
+    fn int2f_driver_disk_request(&mut self, header: u32) {
+        let command = self.read_physical_u8(header + 0x02);
+        let result = match command {
+            // MEDIA CHECK: this HLE does not model change-line state, so media is
+            // stable when the unit exists.
+            0x01 => {
+                let unit = self.read_physical_u8(header + 0x01);
+                if self.driver_bds_for_unit(unit).is_some() {
+                    self.write_physical_u8(header + 0x0e, 0x01);
+                    Ok(())
+                } else {
+                    Err(0x01)
+                }
+            }
+            // BUILD BPB: return a pointer into the matching published BDS entry.
+            0x02 => {
+                let unit = self.read_physical_u8(header + 0x01);
+                if let Some((seg, off, _)) = self.driver_bds_for_unit(unit) {
+                    self.write_physical_u16(header + 0x12, off.wrapping_add(0x06));
+                    self.write_physical_u16(header + 0x14, seg);
+                    Ok(())
+                } else {
+                    Err(0x01)
+                }
+            }
+            0x04 => self.driver_disk_transfer_request(header, false),
+            0x08 | 0x09 => self.driver_disk_transfer_request(header, true),
+            0x0d..=0x0f => Ok(()),
+            _ => Err(0x03),
+        };
+        let status = match result {
+            Ok(()) => 0x0100,
+            Err(code) => 0x8100 | u16::from(code),
+        };
+        self.write_physical_u16(header + 0x03, status);
+    }
+
+    fn driver_disk_transfer_request(&mut self, header: u32, write: bool) -> Result<(), u8> {
+        let unit = self.read_physical_u8(header + 0x01);
+        let Some((_, _, drive)) = self.driver_bds_for_unit(unit) else {
+            return Err(0x01);
+        };
+        let transfer = self.driver_request_far_ptr(header, 0x0e);
+        let count = self.read_guest_word(header + 0x12);
+        let lba = self.driver_request_start_lba(header);
+        if count == 0 {
+            return Ok(());
+        }
+        if drive == 2 {
+            let transfer = self.driver_request_linear(header, 0x0e);
+            return self.driver_c_transfer(write, transfer, count, lba);
+        }
+        let Some(target) = self.dos.block_device_io_target(drive) else {
+            return Err(0x01);
+        };
+        let start = u16::try_from(lba).map_err(|_| 0x08)?;
+        self.block_device_transfer_outcome(target, write, transfer, count, start)
+    }
+
+    fn driver_c_transfer(
+        &mut self,
+        write: bool,
+        transfer: u32,
+        count: u16,
+        lba: u32,
+    ) -> Result<(), u8> {
+        if write && self.fat32_c.is_some() && self.ata.is_none() {
+            return Err(0x00);
+        }
+        if !write && self.fat32_c.is_some() && self.ata.is_none() {
+            for index in 0..count {
+                let sector = self
+                    .fat32_c
+                    .as_ref()
+                    .unwrap()
+                    .read_sector(lba.wrapping_add(u32::from(index)));
+                self.write_guest_block(transfer.wrapping_add(u32::from(index) * 512), &sector);
+            }
+            self.c_accesses += 1;
+            return Ok(());
+        }
+        let total = self.ata.as_ref().map_or(0, |disk| disk.total_sectors());
+        if lba.saturating_add(u32::from(count)) > total {
+            return Err(0x08);
+        }
+        for index in 0..count {
+            let sector_lba = lba + u32::from(index);
+            let addr = transfer.wrapping_add(u32::from(index) * 512);
+            if write {
+                let bytes = self.read_guest_block(addr, 512);
+                if !self
+                    .ata
+                    .as_mut()
+                    .is_some_and(|disk| disk.write_lba(sector_lba, &bytes))
+                {
+                    return Err(0x0a);
+                }
+            } else {
+                let Some(bytes) = self
+                    .ata
+                    .as_ref()
+                    .and_then(|disk| disk.read_lba(sector_lba))
+                    .map(<[u8]>::to_vec)
+                else {
+                    return Err(0x0b);
+                };
+                self.write_guest_block(addr, &bytes);
+            }
+        }
+        self.c_accesses += 1;
+        Ok(())
     }
 
     /// Consume `secs` of emulated time for a device operation that blocks the
@@ -4978,6 +6641,21 @@ impl Machine {
         }
     }
 
+    /// Set or clear ZF in the FLAGS image the pending IRET stub will pop.
+    fn set_int_frame_zero(&mut self, zero: bool) {
+        let ss = self.cpu.registers.segment(SegmentIndex::Ss).base;
+        let sp = self.cpu.registers.esp() as u16;
+        let flags_addr = (ss + u32::from(sp.wrapping_add(4))) as usize;
+        if let Ok(mut flags) = self.memory.read_u16(flags_addr) {
+            if zero {
+                flags |= 0x0040;
+            } else {
+                flags &= !0x0040;
+            }
+            let _ = self.memory.write_u16(flags_addr, flags);
+        }
+    }
+
     /// INT 10h AH=10h: set/get the ATC palette registers and the DAC. Covers the
     /// set/get forms for the attribute palette (00/01/02/07/08/09) and the DAC
     /// (10/12/13/15/17/1A/1B). Register conventions per RBIL (INT 10/AH=10h).
@@ -5194,8 +6872,8 @@ impl Machine {
         // unconditionally so a later slice that returns a value in any of them (for
         // example AH=3Fh returns the byte count in CX) needs no change here. Only the
         // low 16 bits are touched, preserving each e-register's high half. DS and ES
-        // are inputs to INT 21h; the rare functions that return a segment (AH=2Fh in
-        // ES) add their own write-back when implemented.
+        // are segment inputs for most INT 21h calls, but some DOS internals return
+        // pointers in DS:BX or DS:SI.
         //
         // The INT pushed FLAGS/CS/IP; after it the real-mode frame is [SS:SP]=IP,
         // [SS:SP+2]=CS, [SS:SP+4]=FLAGS. handle_dos_int does not move the guest
@@ -5224,10 +6902,12 @@ impl Machine {
             flags & !0x0040
         };
         self.memory.write_u16(flags_addr as usize, flags)?;
-        // AH=35h (get vector) and AH=2Fh (get DTA) return a segment in ES. The
-        // marshalling reads ES as an input at the top; write it back here so those
-        // results reach the guest. For calls that do not touch ES, regs.es still
-        // equals the input selector, so this re-sets the same real-mode base.
+        // The marshalling reads segment registers as inputs at the top; write them
+        // back so pointer-return calls reach the guest. For calls that do not touch
+        // segments, these re-set the same real-mode bases.
+        self.cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(regs.ds));
         self.cpu
             .registers
             .set_segment(SegmentIndex::Es, SegmentRegister::real(regs.es));
@@ -7279,8 +8959,11 @@ impl Machine {
                             0x1A => self.handle_int1a(),
                             0x25 => self.handle_int25(),
                             0x26 => self.handle_int26(),
-                            0x28 => self.handle_int28(),
                             0x29 => self.handle_int29(),
+                            0x2A => self.handle_int2a(),
+                            0x2E => {
+                                self.handle_int2e()?;
+                            }
                             0x33 => self.handle_int33(),
                             0x2F => {
                                 self.handle_int2f();
@@ -7825,7 +9508,7 @@ impl CpuBus for MachineBus<'_> {
         // BIOS hardware services (0x10-0x1A) and the mouse stay intercepted.
         let dos_or_iemm = matches!(
             vector,
-            0x20 | 0x21 | 0x25 | 0x26 | 0x28 | 0x29 | 0x2F | 0x66 | 0x67
+            0x20 | 0x21 | 0x25 | 0x26 | 0x27 | 0x29 | 0x2A | 0x2E | 0x2F | 0x66 | 0x67
         );
         // INT 67h is intercepted whenever a manager is built: RAM answers the full
         // EMS API, NOEMS answers a frameless manager (present, 0 pages, no frame).
@@ -7846,8 +9529,10 @@ impl CpuBus for MachineBus<'_> {
                 | 0x21
                 | 0x25
                 | 0x26
-                | 0x28
+                | 0x27
                 | 0x29
+                | 0x2A
+                | 0x2E
                 | 0x2F
                 | 0x33
                 | 0x66
@@ -7899,6 +9584,63 @@ fn known_passive_ports() -> impl Iterator<Item = u16> {
         0x03b0..=0x03df, // MDA/CGA/EGA/VGA registers
     ];
     ranges.into_iter().flatten()
+}
+
+fn icdex_iso_child_record(image: &CdImage, dir_record: &[u8], component: &str) -> Option<Vec<u8>> {
+    let lba = u32::from_le_bytes(dir_record.get(2..6)?.try_into().ok()?);
+    let len = u32::from_le_bytes(dir_record.get(10..14)?.try_into().ok()?);
+    let sectors = len.div_ceil(cdimage::DATA_SECTOR as u32);
+    let wanted = component.to_ascii_uppercase();
+    for sector_index in 0..sectors {
+        let sector = image.read_data_sector(lba + sector_index)?;
+        let mut offset = 0usize;
+        while offset < sector.len() {
+            let record_len = usize::from(sector[offset]);
+            if record_len == 0 {
+                break;
+            }
+            let end = offset.checked_add(record_len)?;
+            if end > sector.len() {
+                break;
+            }
+            let record = &sector[offset..end];
+            if icdex_iso_name_matches(record, &wanted) {
+                return Some(record.to_vec());
+            }
+            offset = end;
+        }
+    }
+    None
+}
+
+fn icdex_iso_name_matches(record: &[u8], wanted: &str) -> bool {
+    let name_len = usize::from(*record.get(32).unwrap_or(&0));
+    let Some(name) = record.get(33..33 + name_len) else {
+        return false;
+    };
+    if name == [0] || name == [1] {
+        return false;
+    }
+    let raw = String::from_utf8_lossy(name).to_ascii_uppercase();
+    raw == wanted || raw.split_once(';').is_some_and(|(base, _)| base == wanted)
+}
+
+fn icdex_iso_name_and_version(record: &[u8]) -> (Vec<u8>, u16) {
+    let name_len = usize::from(*record.get(32).unwrap_or(&0));
+    let name = record.get(33..33 + name_len).unwrap_or(&[]);
+    if name == [0] {
+        return (b".".to_vec(), 1);
+    }
+    if name == [1] {
+        return (b"..".to_vec(), 1);
+    }
+    let raw = String::from_utf8_lossy(name).to_ascii_uppercase();
+    if let Some((base, version)) = raw.split_once(';') {
+        let version = version.parse::<u16>().unwrap_or(1);
+        (base.as_bytes().to_vec(), version)
+    } else {
+        (raw.into_bytes(), 1)
+    }
 }
 
 fn gsw_mode_from_code(code: u8) -> Option<GswMode> {
@@ -8066,6 +9808,12 @@ const SYSINIT_INIT_BUDGET: u64 = 50_000;
 /// enforces (a nested device call is refused, not run on the same packet).
 const DEVICE_REQUEST_SCRATCH: usize = 0x0500;
 
+/// Low-memory scratch record returned by INT 2Fh AX=1218h. 0052:0000 is the
+/// DOS SDA-list pointer block; this starts after that small structure and stays
+/// below the driver scratch stack.
+const DOS_INT2F_REGS_SEG: u16 = 0x0052;
+const DOS_INT2F_REGS_OFF: u16 = 0x0010;
+
 /// RAM address of the default INT 70h (IRQ8) handler, a few bytes past the IRET
 /// stub at 0x600 in the free BIOS scratch below the .COM load segment (0x1000).
 /// Unlike the host-serviced service INTs, the RTC interrupt arrives as a real
@@ -8136,17 +9884,20 @@ fn device_label(line: &izarravm_core::ConfigDeviceLine) -> String {
 fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     // BIOS service interrupts the host intercepts by vector. Their IVT targets
     // point at the ROM IRET so they survive a guest low-memory wipe. INT 33h is
-    // the mouse driver and INT 2Fh is the ICDEX CD bridge; INT 28h/29h are the DOS
-    // idle and fast-console hooks; INT 25h/26h are the DOS absolute disk read/write:
-    // the same stub shape the HLE handler returns through. INT 18h/19h are the
+    // the mouse driver and INT 2Fh is the ICDEX CD bridge; INT 29h is the DOS
+    // fast-console hook; INT 25h/26h are the DOS absolute disk read/write; INT
+    // 27h is the obsolete TSR exit; INT 28h is the DOS idle hook's default IRET;
+    // INT 2Ah is the DOS network/critical-section hook; INT 2Bh-2Dh are DOS
+    // reserved IRET vectors; INT 2Eh is the DOS command-interpreter back door.
+    // INT 18h/19h are the
     // host-serviced boot and diskless vectors (the run loop services them and
     // redirects CS:IP itself, so the IRET target is only a fallback). INT 1Bh is
     // the Ctrl-Break hook: no host handler, just a default IRET so a guest that
     // hooks it or calls it through the vector has a valid target. INT 66h is the
     // XMS driver entry trap, host-intercepted the same way.
     for vector in [
-        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x25, 0x26, 0x28, 0x29,
-        0x2F, 0x33, 0x66, 0x67,
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x25, 0x26, 0x27, 0x28,
+        0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F, 0x33, 0x66, 0x67,
     ] {
         let address = vector * 4;
         memory.write_u16(address, 0)?;
@@ -9707,6 +11458,43 @@ mod tests {
     }
 
     #[test]
+    fn int14_extended_initialize_programs_uart_format_and_divisor() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x0401); // AH=04h, no break
+        m.cpu.registers.set_ebx(0x0201); // even parity, two stop bits
+        m.cpu.registers.set_ecx(0x0308); // 8 data bits, 19200 baud
+        m.cpu.registers.set_edx(0); // COM1
+        m.handle_int14();
+
+        let lcr = m.serial.read_port(0x03fb).unwrap();
+        assert_eq!(lcr, 0x1f, "8E2 line format");
+        assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x60, "LSR in AH");
+        m.serial.write_port(0x03fb, lcr | 0x80); // DLAB on
+        assert_eq!(m.serial.read_port(0x03f8).unwrap(), 6, "DLL for 19200");
+        assert_eq!(m.serial.read_port(0x03f9).unwrap(), 0, "DLM for 19200");
+        m.serial.write_port(0x03fb, lcr);
+    }
+
+    #[test]
+    fn int14_modem_control_read_write_round_trips() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x0501); // AH=05h, AL=01h write MCR
+        m.cpu.registers.set_ebx(0x0013); // DTR|RTS|LOOP
+        m.cpu.registers.set_edx(0);
+        m.handle_int14();
+
+        assert_eq!(m.serial.read_port(0x03fc).unwrap(), 0x13);
+
+        m.cpu.registers.set_eax(0x0500); // AH=05h, AL=00h read MCR
+        m.cpu.registers.set_ebx(0xAA00);
+        m.cpu.registers.set_edx(0);
+        m.handle_int14();
+
+        assert_eq!(m.cpu.registers.ebx() as u16, 0xAA13);
+        assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x00);
+    }
+
+    #[test]
     fn int14_unwired_port_times_out() {
         let mut m = int15_machine(16);
         m.cpu.registers.set_eax(0x0300);
@@ -10055,8 +11843,49 @@ mod tests {
     }
 
     #[test]
+    fn int2f_windows_install_probe_reports_plain_dos() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0xCAFE_1600);
+        m.cpu.registers.set_ebx(0x1111_2222);
+
+        assert!(m.handle_int2f(), "AX=1600h handled");
+
+        assert_eq!(m.cpu.registers.eax(), 0xCAFE_1600);
+        assert_eq!(m.cpu.registers.ebx(), 0x1111_2222);
+    }
+
+    #[test]
+    fn int2f_dpmi_probes_report_absent() {
+        for ax in [0x1686u16, 0x1687] {
+            let mut m = int15_machine(16);
+            m.cpu.registers.set_eax(0xCAFE_0000 | u32::from(ax));
+            m.cpu.registers.set_ebx(0x1111_2222);
+
+            assert!(m.handle_int2f(), "AX={ax:04X}h handled");
+
+            assert_eq!(m.cpu.registers.eax(), 0xCAFE_0001);
+            assert_eq!(m.cpu.registers.ebx(), 0x1111_2222);
+        }
+    }
+
+    #[test]
     fn int2f_dos_install_probes_report_not_installed() {
-        for (ax, name) in [(0x0100u16, "PRINT"), (0x0600, "ASSIGN"), (0x1000, "SHARE")] {
+        for (ax, name) in [
+            (0x0100u16, "PRINT"),
+            (0x0500, "critical-error helper"),
+            (0x0600, "ASSIGN"),
+            (0x1000, "SHARE"),
+            (0x1400, "NLSFUNC"),
+            (0x2300, "DR DOS GRAFTABL"),
+            (0x2E00, "Novell GRAFTABL"),
+            (0x6400, "SCRNSAV2"),
+            (0x7A00, "NetWare"),
+            (0xAA00, "VIDCLOCK"),
+            (0xAD00, "DISPLAY.SYS"),
+            (0xB000, "GRAFTABL"),
+            (0xB700, "APPEND"),
+            (0xF700, "AUTOPARK"),
+        ] {
             let mut m = int15_machine(16);
             m.cpu.registers.set_eax(0xCAFE_0000 | u32::from(ax));
             m.cpu.registers.set_ebx(0x1111_2222);
@@ -10066,6 +11895,307 @@ mod tests {
             assert!(m.handle_int2f(), "{name} install check handled");
 
             assert_eq!(m.cpu.registers.eax() as u8, 0x00, "{name} not installed");
+            if matches!(ax, 0x0600 | 0x2300 | 0x2E00 | 0xB700) {
+                assert_eq!(
+                    (m.cpu.registers.eax() as u16) >> 8,
+                    0x00,
+                    "{name} also clears AH"
+                );
+            }
+            assert_eq!(m.cpu.registers.ebx(), 0x1111_2222);
+            assert_eq!(m.cpu.registers.ecx(), 0x3333_4444);
+            assert_eq!(m.cpu.registers.edx(), 0x5555_6666);
+        }
+
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0xCAFE_B800);
+        m.cpu.registers.set_ebx(0x1111_2222);
+
+        assert!(m.handle_int2f(), "network install check handled");
+
+        assert_eq!(m.cpu.registers.eax(), 0xCAFE_0000);
+        assert_eq!(m.cpu.registers.ebx(), 0x1111_0000);
+
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0xCAFE_0601);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x3333));
+
+        assert!(m.handle_int2f(), "ASSIGN work-area query handled");
+
+        assert_eq!(m.cpu.registers.segment(SegmentIndex::Es).selector, 0);
+
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0xCAFE_B803);
+        m.cpu.registers.set_ebx(0xAAAA_5555);
+
+        assert!(m.handle_int2f(), "network post-address read handled");
+
+        assert_eq!(m.cpu.registers.segment(SegmentIndex::Es).selector, 0);
+        assert_eq!(m.cpu.registers.ebx(), 0xAAAA_0000);
+
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x4567));
+        m.cpu.registers.set_ebx(0xBBBB_1234);
+        m.cpu.registers.set_eax(0xCAFE_B804);
+
+        assert!(m.handle_int2f(), "network post-address set handled");
+
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0));
+        m.cpu.registers.set_ebx(0xCCCC_0000);
+        m.cpu.registers.set_eax(0xCAFE_B803);
+
+        assert!(
+            m.handle_int2f(),
+            "network post-address read after set handled"
+        );
+
+        assert_eq!(m.cpu.registers.segment(SegmentIndex::Es).selector, 0x4567);
+        assert_eq!(m.cpu.registers.ebx(), 0xCCCC_1234);
+
+        for ax in 0x0101u16..=0x0105 {
+            let mut m = int15_machine(16);
+            prime_dos_int_frame(&mut m);
+            m.cpu.registers.set_eax(0xCAFE_0000 | u32::from(ax));
+
+            assert!(m.handle_int2f(), "PRINT AX={ax:04X}h handled");
+
+            assert_eq!(m.cpu.registers.eax(), 0xCAFE_0001);
+            assert_ne!(dos_int_flags(&m) & 1, 0, "PRINT service sets CF");
+        }
+
+        for ax in [0x1401u16, 0x1402, 0x1403, 0x1404, 0x14FE, 0x14FF] {
+            let mut m = int15_machine(16);
+            m.cpu.registers.set_eax(0xCAFE_0000 | u32::from(ax));
+
+            assert!(m.handle_int2f(), "NLSFUNC AX={ax:04X}h handled");
+
+            assert_eq!(
+                m.cpu.registers.eax(),
+                0xCAFE_1401,
+                "absent NLSFUNC service reports DOS error 1 in AL"
+            );
+        }
+
+        for ax in [0xB001u16, 0x2301, 0x2E01] {
+            let mut m = int15_machine(16);
+            m.cpu.registers.set_eax(0xCAFE_0000 | u32::from(ax));
+
+            assert!(m.handle_int2f(), "GRAFTABL AX={ax:04X}h handled");
+
+            if ax == 0xB001 {
+                assert_eq!(
+                    m.cpu.registers.eax() as u8,
+                    0x00,
+                    "MS-DOS GRAFTABL data call does not claim a font table"
+                );
+            } else {
+                assert_eq!(
+                    (m.cpu.registers.eax() as u16) >> 8,
+                    0x00,
+                    "DR/Novell GRAFTABL data call reports not installed"
+                );
+            }
+        }
+
+        for ax in [0xB701u16, 0xB702, 0xB809, 0xF701] {
+            let mut m = int15_machine(16);
+            prime_dos_int_frame(&mut m);
+            m.cpu.registers.set_eax(0xCAFE_0000 | u32::from(ax));
+
+            assert!(m.handle_int2f(), "AX={ax:04X}h absent service handled");
+
+            assert_eq!(m.cpu.registers.eax(), 0xCAFE_0001);
+            assert_ne!(dos_int_flags(&m) & 1, 0, "absent service sets CF");
+        }
+    }
+
+    #[test]
+    fn int2f_driver_sys_request_reads_and_writes_c_drive() {
+        const HEADER: u32 = 0x30000;
+        const BUFFER: u32 = 0x40100;
+        let original: Vec<u8> = (0..512).map(|i| i as u8).collect();
+        let updated: Vec<u8> = (0..512).map(|i| 255u8.wrapping_sub(i as u8)).collect();
+        let mut disk = vec![0u8; 4 * 512];
+        disk[2 * 512..3 * 512].copy_from_slice(&original);
+
+        let mut m = Machine::new_dos_program(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            &[0xcd, 0x20],
+        )
+        .unwrap();
+        m.mount_hdd(disk);
+        let run = |m: &mut Machine, ax: u16, command: u8, lba: u16| -> u16 {
+            m.write_physical_u8(HEADER, 0x1a);
+            m.write_physical_u8(HEADER + 0x01, 0x80);
+            m.write_physical_u8(HEADER + 0x02, command);
+            m.write_physical_u16(HEADER + 0x03, 0);
+            m.write_physical_u8(HEADER + 0x0d, 0xf8);
+            m.write_physical_u16(HEADER + 0x0e, 0x0100);
+            m.write_physical_u16(HEADER + 0x10, 0x4000);
+            m.write_physical_u16(HEADER + 0x12, 1);
+            m.write_physical_u16(HEADER + 0x14, lba);
+            m.cpu
+                .registers
+                .set_segment(SegmentIndex::Es, SegmentRegister::real(0x3000));
+            m.cpu.registers.set_ebx(0);
+            m.cpu.registers.set_eax(u32::from(ax));
+
+            assert!(m.handle_int2f(), "AX={ax:04X}h handled");
+            m.read_physical_u16(HEADER + 0x03)
+        };
+
+        assert_eq!(run(&mut m, 0x0802, 0x04, 2), 0x0100);
+        assert_eq!(m.read_guest_block(BUFFER, 512), original);
+
+        m.write_guest_block(BUFFER, &updated);
+        assert_eq!(run(&mut m, 0x0802, 0x08, 3), 0x0100);
+        m.write_guest_block(BUFFER, &[0u8; 512]);
+        assert_eq!(run(&mut m, 0x0804, 0x04, 3), 0x0100);
+        assert_eq!(m.read_guest_block(BUFFER, 512), updated);
+    }
+
+    #[test]
+    fn int2f_driver_sys_install_bds_appends_drive_data_table() {
+        const EXT_BDS: u32 = (0x5000u32 << 4) + 0x0020;
+        let mut m = Machine::new_dos_program(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            &[0xcd, 0x20],
+        )
+        .unwrap();
+        m.write_physical_u8(EXT_BDS + 0x04, 0x80);
+        m.write_physical_u8(EXT_BDS + 0x05, 3);
+        m.write_physical_u16(EXT_BDS + 0x23, 0x0020);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x5000));
+        m.cpu.registers.set_edi(0x0020);
+        m.cpu.registers.set_eax(0x0801);
+
+        assert!(m.handle_int2f(), "AX=0801h handled");
+
+        m.cpu.registers.set_eax(0x0803);
+        m.cpu.registers.set_edi(0);
+        assert!(m.handle_int2f(), "AX=0803h handled");
+        let c_bds = (u32::from(m.cpu.registers.segment(SegmentIndex::Ds).selector) << 4)
+            + u32::from(m.cpu.registers.edi() as u16);
+
+        assert_eq!(m.read_guest_word(c_bds), 0x0020);
+        assert_eq!(m.read_guest_word(c_bds + 2), 0x5000);
+        assert_eq!(m.read_guest_word(EXT_BDS), 0xffff);
+        assert_eq!(m.read_guest_word(EXT_BDS + 2), 0xffff);
+        assert_ne!(m.read_guest_word(c_bds + 0x23) & 0x0010, 0);
+        let ext_flags = m.read_guest_word(EXT_BDS + 0x23);
+        assert_ne!(ext_flags & 0x0010, 0);
+        assert_eq!(ext_flags & 0x0020, 0);
+    }
+
+    #[test]
+    fn int2f_absent_redirector_calls_fail_or_noop() {
+        for ax in [
+            0x1101u16, 0x1102, 0x1103, 0x1104, 0x1105, 0x1106, 0x1107, 0x1108, 0x1109, 0x110A,
+            0x110B, 0x110C, 0x110D, 0x110E, 0x110F, 0x1110, 0x1111, 0x1112, 0x1113, 0x1114, 0x1115,
+            0x1116, 0x1117, 0x1118, 0x1119, 0x111A, 0x111B, 0x111C, 0x111E, 0x111F, 0x1121, 0x1123,
+            0x1124, 0x1125, 0x1126, 0x1127, 0x1128, 0x1129, 0x112A, 0x112B, 0x112C, 0x112D, 0x112E,
+            0x112F,
+        ] {
+            let mut m = int15_machine(16);
+            prime_dos_int_frame(&mut m);
+            m.cpu.registers.set_eax(0xCAFE_0000 | u32::from(ax));
+            m.cpu.registers.set_ebx(0x1111_2222);
+
+            assert!(m.handle_int2f(), "AX={ax:04X}h handled");
+
+            assert_eq!(m.cpu.registers.eax(), 0xCAFE_0001);
+            assert_eq!(m.cpu.registers.ebx(), 0x1111_2222);
+            let ss = m.cpu.registers.segment(SegmentIndex::Ss).base;
+            let sp = m.cpu.registers.esp() as u16;
+            let flags = m
+                .memory
+                .read_u16((ss + u32::from(sp.wrapping_add(4))) as usize)
+                .unwrap();
+            assert_ne!(flags & 0x0001, 0, "CF set");
+        }
+
+        for ax in [0x111Du16, 0x1122] {
+            let mut m = int15_machine(16);
+            prime_dos_int_frame(&mut m);
+            m.cpu.registers.set_eax(0xCAFE_0000 | u32::from(ax));
+
+            assert!(m.handle_int2f(), "AX={ax:04X}h handled");
+
+            assert_eq!(m.cpu.registers.eax(), 0xCAFE_0000 | u32::from(ax));
+            assert_ne!(dos_int_flags(&m) & 1, 0, "notify hook leaves flags alone");
+        }
+
+        let mut m = int15_machine(16);
+        prime_dos_int_frame(&mut m);
+        m.cpu.registers.set_eax(0xCAFE_1120);
+
+        assert!(m.handle_int2f(), "AX=1120h handled");
+
+        assert_eq!(m.cpu.registers.eax(), 0xCAFE_1120);
+        assert_eq!(dos_int_flags(&m) & 1, 0, "flush hook clears CF");
+    }
+
+    #[test]
+    fn int2f_disk_handler_hook_returns_previous_vectors() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0xCAFE_1300);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x1111));
+        m.cpu.registers.set_edx(0xAAAA_2222);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x3333));
+        m.cpu.registers.set_ebx(0xBBBB_4444);
+
+        assert!(m.handle_int2f(), "AH=13h first call handled");
+        assert_eq!(
+            m.cpu.registers.segment(SegmentIndex::Ds).selector,
+            BIOS_ROM_IRET_SEG
+        );
+        assert_eq!(m.cpu.registers.edx(), 0xAAAA_0000);
+        assert_eq!(
+            m.cpu.registers.segment(SegmentIndex::Es).selector,
+            BIOS_ROM_IRET_SEG
+        );
+        assert_eq!(m.cpu.registers.ebx(), 0xBBBB_0000);
+
+        m.cpu.registers.set_eax(0xCAFE_1301);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x5555));
+        m.cpu.registers.set_edx(0xCCCC_6666);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x7777));
+        m.cpu.registers.set_ebx(0xDDDD_8888);
+
+        assert!(m.handle_int2f(), "AH=13h second call handled");
+        assert_eq!(m.cpu.registers.segment(SegmentIndex::Ds).selector, 0x1111);
+        assert_eq!(m.cpu.registers.edx(), 0xCCCC_2222);
+        assert_eq!(m.cpu.registers.segment(SegmentIndex::Es).selector, 0x3333);
+        assert_eq!(m.cpu.registers.ebx(), 0xDDDD_4444);
+    }
+
+    #[test]
+    fn int2f_cdrom_reserved_debug_toggles_are_noops() {
+        for ax in [0x1506u16, 0x1507] {
+            let mut m = int15_machine(16);
+            m.cpu.registers.set_eax(0xCAFE_0000 | u32::from(ax));
+            m.cpu.registers.set_ebx(0x1111_2222);
+            m.cpu.registers.set_ecx(0x3333_4444);
+            m.cpu.registers.set_edx(0x5555_6666);
+
+            assert!(m.handle_int2f(), "AX={ax:04X}h handled");
+
+            assert_eq!(m.cpu.registers.eax(), 0xCAFE_0000 | u32::from(ax));
             assert_eq!(m.cpu.registers.ebx(), 0x1111_2222);
             assert_eq!(m.cpu.registers.ecx(), 0x3333_4444);
             assert_eq!(m.cpu.registers.edx(), 0x5555_6666);
@@ -10479,6 +12609,36 @@ mod tests {
     }
 
     #[test]
+    fn hooked_int29_does_not_also_use_the_host_fast_console() {
+        // org 0x100:
+        //   mov dx,handler / mov ax,2529h / int 21h ; install INT 29h
+        //   mov al,'X' / int 29h / exit
+        // handler:
+        //   mov byte [0200h],29h / iret
+        let com: &[u8] = &[
+            0xba, 0x11, 0x01, 0xb8, 0x29, 0x25, 0xcd, 0x21, 0xb0, b'X', 0xcd, 0x29, 0xb8, 0x00,
+            0x4c, 0xcd, 0x21, 0xc6, 0x06, 0x00, 0x02, 0x29, 0xcf,
+        ];
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
+                .unwrap();
+        machine.memory.write_u16(0x450, 0).unwrap();
+        machine.video.write_u8(0, b'.').unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
+
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
+        assert_eq!(
+            machine
+                .memory()
+                .read_u8(usize::from(DOS_LOAD_SEGMENT) * 16 + 0x200)
+                .unwrap(),
+            0x29
+        );
+        assert_eq!(machine.video.read_u8(0).unwrap(), b'.');
+    }
+
+    #[test]
     fn int33_show_hide_cursor_counter_follows_microsoft_contract() {
         let mut m = int15_machine(16);
         // AX=0000 reset: the visibility counter starts hidden at -1.
@@ -10509,6 +12669,121 @@ mod tests {
         m.cpu.registers.set_eax(0x0001);
         m.handle_int33();
         assert_eq!(m.mouse.show_count, 0);
+    }
+
+    #[test]
+    fn int33_button_press_and_release_counts_reset_after_query() {
+        let mut m = int15_machine(16);
+        let start_x = m.mouse.x as u16;
+        let start_y = m.mouse.y as u16;
+
+        m.inject_mouse(0, 0, 0x01);
+        m.cpu.registers.set_eax(0x0005);
+        m.cpu.registers.set_ebx(0x0000);
+        m.handle_int33();
+
+        assert_eq!(m.cpu.registers.eax() as u16, 0x0001);
+        assert_eq!(m.cpu.registers.ebx() as u16, 1);
+        assert_eq!(m.cpu.registers.ecx() as u16, start_x);
+        assert_eq!(m.cpu.registers.edx() as u16, start_y);
+
+        m.cpu.registers.set_eax(0x0005);
+        m.cpu.registers.set_ebx(0x0000);
+        m.handle_int33();
+        assert_eq!(m.cpu.registers.ebx() as u16, 0, "press count is consumed");
+
+        m.inject_mouse(2, 3, 0x00);
+        m.cpu.registers.set_eax(0x0006);
+        m.cpu.registers.set_ebx(0x0000);
+        m.handle_int33();
+
+        assert_eq!(m.cpu.registers.eax() as u16, 0x0000);
+        assert_eq!(m.cpu.registers.ebx() as u16, 1);
+        assert_eq!(m.cpu.registers.ecx() as u16, start_x + 2);
+        assert_eq!(m.cpu.registers.edx() as u16, start_y + 3);
+    }
+
+    #[test]
+    fn int33_state_display_page_sensitivity_and_callback_round_trip() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x0004);
+        m.cpu.registers.set_ecx(111);
+        m.cpu.registers.set_edx(44);
+        m.handle_int33();
+        m.cpu.registers.set_eax(0x001A);
+        m.cpu.registers.set_ebx(9);
+        m.cpu.registers.set_ecx(10);
+        m.cpu.registers.set_edx(11);
+        m.handle_int33();
+        m.cpu.registers.set_eax(0x001D);
+        m.cpu.registers.set_ebx(3);
+        m.handle_int33();
+        m.cpu.registers.set_eax(0x000C);
+        m.cpu.registers.set_ecx(0x001F);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x4567));
+        m.cpu.registers.set_edx(0x89AB);
+        m.handle_int33();
+
+        m.cpu.registers.set_eax(0x0015);
+        m.handle_int33();
+        assert_eq!(m.cpu.registers.ebx() as u16, MOUSE_STATE_BYTES);
+        m.cpu.registers.set_eax(0x0042);
+        m.handle_int33();
+        assert_eq!(m.cpu.registers.eax() as u16, 0xFFFF);
+        assert_eq!(m.cpu.registers.ebx() as u16, MOUSE_STATE_BYTES);
+
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x3000));
+        m.cpu.registers.set_edx(0x0100);
+        m.cpu.registers.set_eax(0x0016);
+        m.handle_int33();
+
+        m.cpu.registers.set_eax(0x0004);
+        m.cpu.registers.set_ecx(1);
+        m.cpu.registers.set_edx(2);
+        m.handle_int33();
+        m.cpu.registers.set_eax(0x001A);
+        m.cpu.registers.set_ebx(30);
+        m.cpu.registers.set_ecx(31);
+        m.cpu.registers.set_edx(32);
+        m.handle_int33();
+        m.cpu.registers.set_eax(0x001D);
+        m.cpu.registers.set_ebx(7);
+        m.handle_int33();
+
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x3000));
+        m.cpu.registers.set_edx(0x0100);
+        m.cpu.registers.set_eax(0x0017);
+        m.handle_int33();
+
+        m.cpu.registers.set_eax(0x0003);
+        m.handle_int33();
+        assert_eq!(m.cpu.registers.ecx() as u16, 111);
+        assert_eq!(m.cpu.registers.edx() as u16, 44);
+        m.cpu.registers.set_eax(0x001B);
+        m.handle_int33();
+        assert_eq!(m.cpu.registers.ebx() as u16, 9);
+        assert_eq!(m.cpu.registers.ecx() as u16, 10);
+        assert_eq!(m.cpu.registers.edx() as u16, 11);
+        m.cpu.registers.set_eax(0x001E);
+        m.handle_int33();
+        assert_eq!(m.cpu.registers.ebx() as u16, 3);
+
+        m.cpu.registers.set_eax(0x0014);
+        m.cpu.registers.set_ecx(0x00AA);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x1111));
+        m.cpu.registers.set_edx(0x2222);
+        m.handle_int33();
+        assert_eq!(m.cpu.registers.ecx() as u16, 0x001F);
+        assert_eq!(m.cpu.registers.edx() as u16, 0x89AB);
+        assert_eq!(m.cpu.registers.segment(SegmentIndex::Es).selector, 0x4567);
     }
 
     #[test]
@@ -14810,6 +17085,23 @@ mod tests {
         CdImage::from_cue(cue, bin).unwrap()
     }
 
+    fn iso_dir_record(lba: u32, len: u32, flags: u8, name: &[u8]) -> Vec<u8> {
+        let pad = usize::from(name.len() % 2 == 0);
+        let mut record = vec![0u8; 33 + name.len() + pad];
+        record[0] = record.len() as u8;
+        record[2..6].copy_from_slice(&lba.to_le_bytes());
+        record[6..10].copy_from_slice(&lba.to_be_bytes());
+        record[10..14].copy_from_slice(&len.to_le_bytes());
+        record[14..18].copy_from_slice(&len.to_be_bytes());
+        record[18..25].copy_from_slice(&[126, 1, 1, 0, 0, 0, 0]);
+        record[25] = flags;
+        record[28..30].copy_from_slice(&1u16.to_le_bytes());
+        record[30..32].copy_from_slice(&1u16.to_be_bytes());
+        record[32] = name.len() as u8;
+        record[33..33 + name.len()].copy_from_slice(name);
+        record
+    }
+
     #[test]
     fn play_audio_mixes_cd_audio_into_render_audio() {
         let mut machine = test_machine();
@@ -14886,7 +17178,7 @@ mod tests {
     }
 
     #[test]
-    fn icdex_install_check_ignores_non_dada_marker() {
+    fn int2f_redirector_install_check_reports_not_installed_without_dada_marker() {
         let mut machine = test_machine();
         machine
             .cpu
@@ -14894,11 +17186,12 @@ mod tests {
             .set_segment(SegmentIndex::Ss, SegmentRegister::real(0x9000));
         machine.cpu.registers.set_esp(0x0100);
         let marker_addr = 0x9000 * 16 + (0x0100 + 6);
-        // A pushed word other than DADAh is some other 1100h subfunction. We must
-        // not claim installed or touch the stack word.
+        // A pushed word other than DADAh is the plain redirector install check.
+        // It must not claim ICDEX installed or touch the stack word.
         machine.memory.write_u16(marker_addr, 0x1234).unwrap();
-        machine.cpu.registers.set_eax(0x1100);
-        assert!(!machine.handle_int2f());
+        machine.cpu.registers.set_eax(0xCAFE_1100);
+        assert!(machine.handle_int2f());
+        assert_eq!(machine.cpu.registers.eax(), 0xCAFE_1100);
         assert_eq!(machine.memory.read_u16(marker_addr).unwrap(), 0x1234);
     }
 
@@ -15056,6 +17349,161 @@ mod tests {
         assert!(machine.handle_int2f());
         assert_eq!(machine.cpu.registers.eax() as u16, 0x000f);
         assert_eq!(dos_int_flags(&machine) & 1, 1, "invalid drive sets CF");
+    }
+
+    #[test]
+    fn icdex_direct_calls_cover_metadata_vtoc_absolute_read_and_preferences() {
+        let mut machine = test_machine();
+        let mut bytes = vec![0u8; 20 * cdimage::DATA_SECTOR];
+        bytes[0] = 0x42; // LBA 0 marker for AX=1508h.
+        let pvd = 16 * cdimage::DATA_SECTOR;
+        bytes[pvd] = 0x01; // primary volume descriptor
+        bytes[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
+        let root = iso_dir_record(18, cdimage::DATA_SECTOR as u32, 0x02, &[0]);
+        bytes[pvd + 156..pvd + 156 + root.len()].copy_from_slice(&root);
+        let file = iso_dir_record(19, 1234, 0x00, b"README.TXT;1");
+        let root_sector = 18 * cdimage::DATA_SECTOR;
+        bytes[root_sector..root_sector + root.len()].copy_from_slice(&root);
+        bytes[root_sector + root.len()..root_sector + root.len() + file.len()]
+            .copy_from_slice(&file);
+        let term = 17 * cdimage::DATA_SECTOR;
+        bytes[term] = 0xff; // volume descriptor set terminator
+        machine.mount_cd(CdImage::from_iso(bytes).unwrap());
+
+        machine.write_guest_block(0x5000, &[0xaa; 38]);
+        prime_dos_int_frame(&mut machine);
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0));
+        machine.cpu.registers.set_ebx(0x5000);
+        machine.cpu.registers.set_ecx(u32::from(CD_DRIVE_NUMBER));
+        machine.cpu.registers.set_eax(0x1502);
+        assert!(machine.handle_int2f(), "AX=1502h handled");
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "metadata clears CF");
+        assert_eq!(machine.read_guest_block(0x5000, 38), vec![0; 38]);
+
+        prime_dos_int_frame(&mut machine);
+        machine.cpu.registers.set_ebx(0x6000);
+        machine.cpu.registers.set_ecx(u32::from(CD_DRIVE_NUMBER));
+        machine.cpu.registers.set_edx(0);
+        machine.cpu.registers.set_eax(0x1505);
+        assert!(machine.handle_int2f(), "AX=1505h handled");
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "VTOC clears CF");
+        assert_eq!(machine.cpu.registers.eax() as u16, 0x0001);
+        assert_eq!(machine.read_physical_u8(0x6000), 0x01);
+        assert_eq!(&machine.read_guest_block(0x6001, 5), b"CD001");
+
+        prime_dos_int_frame(&mut machine);
+        machine.cpu.registers.set_ebx(0x7000);
+        machine.cpu.registers.set_ecx(u32::from(CD_DRIVE_NUMBER));
+        machine.cpu.registers.set_esi(0);
+        machine.cpu.registers.set_edi(0);
+        machine.cpu.registers.set_edx(1);
+        machine.cpu.registers.set_eax(0x1508);
+        assert!(machine.handle_int2f(), "AX=1508h handled");
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "absolute read clears CF");
+        assert_eq!(machine.read_physical_u8(0x7000), 0x42);
+
+        prime_dos_int_frame(&mut machine);
+        machine.cpu.registers.set_ebx(0);
+        machine.cpu.registers.set_ecx(u32::from(CD_DRIVE_NUMBER));
+        machine.cpu.registers.set_edx(0);
+        machine.cpu.registers.set_eax(0x150E);
+        assert!(machine.handle_int2f(), "AX=150Eh get handled");
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "preference get clears CF");
+        assert_eq!(machine.cpu.registers.edx() as u16, 0x0100);
+
+        prime_dos_int_frame(&mut machine);
+        machine.cpu.registers.set_ebx(1);
+        machine.cpu.registers.set_ecx(u32::from(CD_DRIVE_NUMBER));
+        machine.cpu.registers.set_edx(0x0201);
+        machine.cpu.registers.set_eax(0x150E);
+        assert!(machine.handle_int2f(), "AX=150Eh set handled");
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "preference set clears CF");
+
+        prime_dos_int_frame(&mut machine);
+        machine.cpu.registers.set_ebx(0);
+        machine.cpu.registers.set_ecx(u32::from(CD_DRIVE_NUMBER));
+        machine.cpu.registers.set_edx(0);
+        machine.cpu.registers.set_eax(0x150E);
+        assert!(machine.handle_int2f(), "AX=150Eh get-after-set handled");
+        assert_eq!(machine.cpu.registers.edx() as u16, 0x0201);
+
+        prime_dos_int_frame(&mut machine);
+        machine.cpu.registers.set_eax(0x150A);
+        assert!(machine.handle_int2f(), "AX=150Ah handled");
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "reserved call clears CF");
+
+        machine.write_guest_block(0x5100, b"\\README.TXT\0");
+        prime_dos_int_frame(&mut machine);
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0));
+        machine.cpu.registers.set_ebx(0x5100);
+        machine.cpu.registers.set_ecx(u32::from(CD_DRIVE_NUMBER));
+        machine.cpu.registers.set_esi(0x3000);
+        machine.cpu.registers.set_edi(0x0100);
+        machine.cpu.registers.set_eax(0x150F);
+        assert!(machine.handle_int2f(), "AX=150Fh direct handled");
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "directory entry clears CF");
+        assert_eq!(machine.cpu.registers.eax() as u16, 0x0001);
+        let direct = machine.read_guest_block((0x3000u32 << 4) + 0x0100, file.len());
+        assert_eq!(direct[0], file.len() as u8);
+        assert_eq!(&direct[2..6], &19u32.to_le_bytes());
+        assert_eq!(&direct[10..14], &1234u32.to_le_bytes());
+        assert_eq!(&direct[33..45], b"README.TXT;1");
+
+        prime_dos_int_frame(&mut machine);
+        machine.cpu.registers.set_ebx(0x5100);
+        machine
+            .cpu
+            .registers
+            .set_ecx((1u32 << 8) | u32::from(CD_DRIVE_NUMBER));
+        machine.cpu.registers.set_esi(0x3100);
+        machine.cpu.registers.set_edi(0);
+        machine.cpu.registers.set_eax(0x150F);
+        assert!(machine.handle_int2f(), "AX=150Fh canonical handled");
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "canonical entry clears CF");
+        let canonical = machine.read_guest_block(0x3100u32 << 4, 0x41);
+        assert_eq!(&canonical[1..5], &19u32.to_le_bytes());
+        assert_eq!(&canonical[5..7], &1u16.to_le_bytes());
+        assert_eq!(&canonical[7..11], &1234u32.to_le_bytes());
+        assert_eq!(canonical[0x17], 10);
+        assert_eq!(&canonical[0x18..0x22], b"README.TXT");
+        assert_eq!(&canonical[0x3e..0x40], &1u16.to_le_bytes());
+
+        prime_dos_int_frame(&mut machine);
+        machine.cpu.registers.set_ecx(u32::from(CD_DRIVE_NUMBER));
+        machine.cpu.registers.set_eax(0x1509);
+        assert!(machine.handle_int2f(), "AX=1509h handled");
+        assert_ne!(dos_int_flags(&machine) & 1, 0, "write sets CF");
+        assert_eq!(machine.cpu.registers.eax() as u16, 0x0001);
+
+        prime_dos_int_frame(&mut machine);
+        machine
+            .cpu
+            .registers
+            .set_ecx(u32::from(CD_DRIVE_NUMBER) + 1);
+        machine.cpu.registers.set_eax(0x1508);
+        assert!(machine.handle_int2f(), "AX=1508h invalid drive handled");
+        assert_ne!(dos_int_flags(&machine) & 1, 0, "invalid drive sets CF");
+        assert_eq!(machine.cpu.registers.eax() as u16, 0x000f);
+
+        let mut empty = test_machine();
+        prime_dos_int_frame(&mut empty);
+        empty
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0));
+        empty.cpu.registers.set_ebx(0x8000);
+        empty.cpu.registers.set_ecx(u32::from(CD_DRIVE_NUMBER));
+        empty.cpu.registers.set_edx(0);
+        empty.cpu.registers.set_eax(0x1505);
+        assert!(empty.handle_int2f(), "AX=1505h no-media handled");
+        assert_ne!(dos_int_flags(&empty) & 1, 0, "no media sets CF");
+        assert_eq!(empty.cpu.registers.eax() as u16, 0x0015);
     }
 
     #[test]
@@ -15468,15 +17916,174 @@ mod tests {
     }
 
     #[test]
-    fn dos_com_unhandled_int21_returns_through_stub_and_exits() {
-        // org 0x100: mov ah,0x30 (unhandled); int 21; mov ax,4c00; int 21
-        let com: &[u8] = &[0xb4, 0x30, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21];
+    fn dos_com_unknown_int21_reports_invalid_function_and_returns() {
+        // org 0x100:
+        //   mov ax,7200h / int 21h
+        //   jc got_carry
+        //   exit 2
+        // got_carry:
+        //   cmp ax,1
+        //   je ok
+        //   exit 3
+        // ok:
+        //   exit 0
+        let com: &[u8] = &[
+            0xb8, 0x00, 0x72, 0xcd, 0x21, 0x72, 0x05, 0xb8, 0x02, 0x4c, 0xcd, 0x21, 0x3d, 0x01,
+            0x00, 0x74, 0x05, 0xb8, 0x03, 0x4c, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21,
+        ];
         let mut machine =
             Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
                 .unwrap();
         let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
         assert_eq!(reason, StopReason::DosExit { code: 0 });
         assert!(machine.dos_output().is_empty());
+    }
+
+    #[test]
+    fn dos_com_int27_reaches_the_tsr_exit_path() {
+        // org 0x100: mov dx,0020h; int 27h; mov ax,4c7fh; int 21h
+        let com: &[u8] = &[0xba, 0x20, 0x00, 0xcd, 0x27, 0xb8, 0x7f, 0x4c, 0xcd, 0x21];
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
+                .unwrap();
+        let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
+    }
+
+    #[test]
+    fn dos_com_int2a_network_probe_reports_absent() {
+        let com: &[u8] = &[
+            0xf9, // stc
+            0x31, 0xc0, // xor ax,ax
+            0xcd, 0x2a, // int 2Ah
+            0x9c, // pushf
+            0x5b, // pop bx
+            0xf7, 0xc3, 0x01, 0x00, // test bx,0001h
+            0x75, 0x0a, // jnz fail_cf
+            0x80, 0xfc, 0x00, // cmp ah,00h
+            0x75, 0x0a, // jnz fail_ah
+            0xb8, 0x00, 0x4c, // mov ax,4c00h
+            0xcd, 0x21, // int 21h
+            0xb8, 0x11, 0x4c, // fail_cf: mov ax,4c11h
+            0xcd, 0x21, // int 21h
+            0xb8, 0x12, 0x4c, // fail_ah: mov ax,4c12h
+            0xcd, 0x21, // int 21h
+        ];
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
+                .unwrap();
+        let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
+    }
+
+    #[test]
+    fn int2a_direct_io_check_allows_local_disk_access() {
+        let mut machine = test_machine();
+
+        prime_dos_int_frame(&mut machine);
+        machine.cpu.registers.set_eax(0x0300);
+        machine.handle_int2a();
+
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "AX=0300h clears CF");
+    }
+
+    #[test]
+    fn int2a_network_resource_and_netbios_calls_report_absent() {
+        let mut machine = test_machine();
+
+        prime_dos_int_frame(&mut machine);
+        machine.cpu.registers.set_eax(0x0500);
+        machine.cpu.registers.set_ebx(0x1111_2222);
+        machine.cpu.registers.set_ecx(0x3333_4444);
+        machine.cpu.registers.set_edx(0x5555_6666);
+        machine.handle_int2a();
+
+        assert_eq!(machine.cpu.registers.eax() as u16, 0x0000);
+        assert_eq!(machine.cpu.registers.ebx() as u16, 0x0000);
+        assert_eq!(machine.cpu.registers.ecx() as u16, 0x0000);
+        assert_eq!(machine.cpu.registers.edx() as u16, 0x0000);
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "AX=0500h clears CF");
+
+        prime_dos_int_frame(&mut machine);
+        machine.cpu.registers.set_eax(0x0401);
+        machine.handle_int2a();
+
+        assert_eq!(machine.cpu.registers.eax() as u16, 0x0101);
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "AH=04h returns AX status");
+
+        prime_dos_int_frame(&mut machine);
+        machine.cpu.registers.set_eax(0x0600);
+        machine.handle_int2a();
+
+        assert_eq!(machine.cpu.registers.eax() as u16, 0x0001);
+        assert_ne!(dos_int_flags(&machine) & 1, 0, "AH=06h sets CF");
+    }
+
+    #[test]
+    fn int2a_dos_critical_section_notifications_are_noops() {
+        let mut machine = test_machine();
+
+        for ax in [0x8001, 0x8101, 0x8201, 0x8401] {
+            prime_dos_int_frame(&mut machine);
+            machine.cpu.registers.set_eax(ax);
+            machine.handle_int2a();
+            assert_eq!(dos_int_flags(&machine) & 1, 0, "AX={ax:04X}h clears CF");
+        }
+    }
+
+    #[test]
+    fn dos_com_int2e_execs_icommand_with_c_tail() {
+        // Parent: DS:SI -> counted "ECHO OK\r"; INT 2Eh; exit with EXEC error on
+        // CF, else with AH=4Dh child code.
+        let parent: &[u8] = &[
+            0xbe, 0x19, 0x01, 0xcd, 0x2e, 0x9c, 0x5b, 0xf7, 0xc3, 0x01, 0x00, 0x74, 0x04, 0xb4,
+            0x4c, 0xcd, 0x21, 0xb4, 0x4d, 0xcd, 0x21, 0xb4, 0x4c, 0xcd, 0x21, 0x07, b'E', b'C',
+            b'H', b'O', b' ', b'O', b'K', 0x0d,
+        ];
+        // Child ICOMMAND.COM test double: print Y only if PSP:80h is " /C ECHO OK".
+        let icommand: &[u8] = &[
+            0xbe, 0x80, 0x00, 0xac, 0x3c, 0x0b, 0x75, 0x15, 0xbf, 0x28, 0x01, 0xb9, 0x0b, 0x00,
+            0xf3, 0xa6, 0x75, 0x0b, 0xb2, b'Y', 0xb4, 0x02, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd,
+            0x21, 0xb2, b'N', 0xb4, 0x02, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21, b' ', b'/',
+            b'C', b' ', b'E', b'C', b'H', b'O', b' ', b'O', b'K',
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ICOMMAND.COM"), icommand).unwrap();
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), parent)
+                .unwrap();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+
+        let reason = machine.run_until_halt_or_cycles(500_000).unwrap();
+
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
+        assert_eq!(machine.dos_output(), b"Y");
+    }
+
+    #[test]
+    fn dos_com_int2f_critical_error_expansion_fails_cleanly() {
+        let com: &[u8] = &[
+            0xf8, // clc
+            0xb8, 0x01, 0x05, // mov ax,0501h
+            0xcd, 0x2f, // int 2Fh
+            0x9c, // pushf
+            0x5b, // pop bx
+            0xf6, 0xc3, 0x01, // test bl,01h
+            0x75, 0x05, // jnz cf_ok
+            0xb8, 0x11, 0x4c, // mov ax,4c11h
+            0xcd, 0x21, // int 21h
+            0x3d, 0x01, 0x00, // cf_ok: cmp ax,0001h
+            0x74, 0x05, // je ok
+            0xb8, 0x12, 0x4c, // mov ax,4c12h
+            0xcd, 0x21, // int 21h
+            0xb8, 0x00, 0x4c, // ok: mov ax,4c00h
+            0xcd, 0x21, // int 21h
+        ];
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
+                .unwrap();
+        let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
     }
 
     #[test]
@@ -17025,7 +19632,7 @@ mod tests {
     #[test]
     fn dos_program_startup_services() {
         // org 0x100:
-        //   mov ah,0x30 / int 0x21            ; get version (AL=6, AH=10), no fault
+        //   mov ah,0x30 / int 0x21            ; get version (AL=6, AH=22), no fault
         //   mov bx,0x10 / mov ah,0x48 / int 21 ; allocate 16 paras
         //   mov [0x0204],ax                    ; store the allocated segment
         //   mov ax,0x3521 / int 0x21           ; get INT 21h vector -> ES=0, BX=0x0600
@@ -17067,6 +19674,27 @@ mod tests {
             env_seg + env_paras + 1,
             "AH=48h allocated segment follows the env block and its MCB header"
         );
+    }
+
+    #[test]
+    fn dos_hle_returns_ds_for_pointer_results() {
+        // org 0x100:
+        //   mov ax,5d0b / int 21h       ; DS:SI -> DOS 4 SDA list
+        //   jc fail
+        //   cmp word ptr [si],1         ; requires returned DS, not the PSP DS
+        //   jne fail
+        //   mov ax,4c00 / int 21h
+        // fail:
+        //   mov ax,4c12 / int 21h
+        let com: &[u8] = &[
+            0xb8, 0x0b, 0x5d, 0xcd, 0x21, 0x72, 0x0a, 0x83, 0x3c, 0x01, 0x75, 0x05, 0xb8, 0x00,
+            0x4c, 0xcd, 0x21, 0xb8, 0x12, 0x4c, 0xcd, 0x21,
+        ];
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
+                .unwrap();
+        let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
     }
 
     #[test]
@@ -17117,6 +19745,537 @@ mod tests {
         machine.cpu.registers.set_eax(0x1225);
         assert!(machine.handle_int2f(), "AX=1225h handled");
         assert_eq!(machine.cpu.registers.ecx() as u16, 3);
+    }
+
+    #[test]
+    fn int2f_12xx_handles_path_case_pointer_and_memory_helpers() {
+        const PROG: [u8; 2] = [0xcd, 0x20];
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
+                .unwrap();
+
+        machine.memory.write_u16(0x60 * 4, 0x1234).unwrap();
+        machine.memory.write_u16(0x60 * 4 + 2, 0x5678).unwrap();
+        prime_dos_int_frame(&mut machine);
+        machine
+            .memory
+            .write_u16(0x9000 * 16 + 0x0106, 0x0060)
+            .unwrap();
+        machine.cpu.registers.set_eax(0x1202);
+        assert!(machine.handle_int2f(), "AX=1202h handled");
+        assert_eq!(
+            machine.cpu.registers.segment(SegmentIndex::Es).selector,
+            0x5678
+        );
+        assert_eq!(machine.cpu.registers.ebx() as u16, 0x1234);
+
+        prime_dos_int_frame(&mut machine);
+        machine
+            .memory
+            .write_u16(0x9000 * 16 + 0x0106, u16::from(b'/'))
+            .unwrap();
+        machine.cpu.registers.set_eax(0x1204);
+        assert!(machine.handle_int2f(), "AX=1204h slash handled");
+        assert_eq!(machine.cpu.registers.eax() as u8, b'\\');
+        assert_ne!(dos_int_flags(&machine) & 0x40, 0, "separator sets ZF");
+
+        prime_dos_int_frame(&mut machine);
+        machine
+            .memory
+            .write_u16(0x9000 * 16 + 0x0106, u16::from(b'a'))
+            .unwrap();
+        machine.cpu.registers.set_eax(0x1213);
+        assert!(machine.handle_int2f(), "AX=1213h handled");
+        assert_eq!(machine.cpu.registers.eax() as u8, b'A');
+
+        machine.write_guest_block((0x2000u32 << 4) + 0x0100, b"c:/dos/foo.txt\0");
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x2000));
+        machine.cpu.registers.set_esi(0x0100);
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x2100));
+        machine.cpu.registers.set_edi(0x0020);
+        machine.cpu.registers.set_eax(0x1211);
+        assert!(machine.handle_int2f(), "AX=1211h handled");
+        let normalized = machine.read_guest_block((0x2100u32 << 4) + 0x0020, 15);
+        assert_eq!(&normalized, b"C:\\DOS\\FOO.TXT\0");
+
+        prime_dos_int_frame(&mut machine);
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x3000));
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x3000));
+        machine.cpu.registers.set_esi(0x0040);
+        machine.cpu.registers.set_edi(0x0040);
+        machine.cpu.registers.set_eax(0x1214);
+        assert!(machine.handle_int2f(), "AX=1214h equal handled");
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "equal pointers clear CF");
+        assert_ne!(dos_int_flags(&machine) & 0x40, 0, "equal pointers set ZF");
+
+        machine.write_guest_block((0x3000u32 << 4) + 0x0100, b"d:\\game.exe\0");
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x3000));
+        machine.cpu.registers.set_esi(0x0100);
+        machine.cpu.registers.set_eax(0x121A);
+        assert!(machine.handle_int2f(), "AX=121Ah handled");
+        assert_eq!(machine.cpu.registers.eax() as u8, 4);
+        assert_eq!(machine.cpu.registers.esi() as u16, 0x0102);
+
+        machine.cpu.registers.set_ecx(24);
+        machine.cpu.registers.set_eax(0x121B);
+        assert!(machine.handle_int2f(), "AX=121Bh leap handled");
+        assert_eq!(machine.cpu.registers.eax() as u8, 29);
+        machine.cpu.registers.set_ecx(21);
+        machine.cpu.registers.set_eax(0x121B);
+        assert!(machine.handle_int2f(), "AX=121Bh common handled");
+        assert_eq!(machine.cpu.registers.eax() as u8, 28);
+
+        machine.write_guest_block((0x3000u32 << 4) + 0x0200, &[1, 2, 3]);
+        machine.cpu.registers.set_esi(0x0200);
+        machine.cpu.registers.set_ecx(3);
+        machine.cpu.registers.set_edx(0x0010);
+        machine.cpu.registers.set_eax(0x121C);
+        assert!(machine.handle_int2f(), "AX=121Ch handled");
+        assert_eq!(machine.cpu.registers.edx() as u16, 0x0016);
+        assert_eq!(machine.cpu.registers.ecx() as u16, 0);
+        assert_eq!(machine.cpu.registers.esi() as u16, 0x0203);
+
+        machine.write_guest_block((0x3000u32 << 4) + 0x0300, &[2, 4, 9]);
+        machine.cpu.registers.set_esi(0x0300);
+        machine.cpu.registers.set_edx(5);
+        machine.cpu.registers.set_eax(0x121D);
+        assert!(machine.handle_int2f(), "AX=121Dh handled");
+        assert_eq!(machine.cpu.registers.eax() as u8, 4);
+        assert_eq!(machine.cpu.registers.ecx() as u16, 1);
+        assert_eq!(machine.cpu.registers.edx() as u16, 3);
+        assert_eq!(machine.cpu.registers.esi() as u16, 0x0302);
+
+        machine.write_guest_block((0x3000u32 << 4) + 0x0400, b"c:/dir/file.txt\0");
+        machine.write_guest_block(0x3100u32 << 4, b"C:\\DIR\\FILE.TXT\0");
+        prime_dos_int_frame(&mut machine);
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x3000));
+        machine.cpu.registers.set_esi(0x0400);
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x3100));
+        machine.cpu.registers.set_edi(0x0000);
+        machine.cpu.registers.set_eax(0x121E);
+        assert!(machine.handle_int2f(), "AX=121Eh handled");
+        assert_ne!(dos_int_flags(&machine) & 0x40, 0, "equivalent names set ZF");
+
+        machine.write_guest_block((0x3000u32 << 4) + 0x0500, b"sub\\..\\game.exe\0");
+        prime_dos_int_frame(&mut machine);
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x3000));
+        machine.cpu.registers.set_esi(0x0500);
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x3200));
+        machine.cpu.registers.set_edi(0x0000);
+        machine.cpu.registers.set_eax(0x1221);
+        assert!(machine.handle_int2f(), "AX=1221h handled");
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "canonicalize clears CF");
+        let canonical = machine.read_guest_block(0x3200u32 << 4, 12);
+        assert_eq!(&canonical, b"C:\\GAME.EXE\0");
+    }
+
+    #[test]
+    fn int2f_12xx_handles_internal_noops_cds_and_error_helpers() {
+        const PROG: [u8; 2] = [0xcd, 0x20];
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
+                .unwrap();
+
+        prime_dos_int_frame(&mut machine);
+        machine.cpu.registers.set_eax(0x1201);
+        assert!(machine.handle_int2f(), "AX=1201h handled");
+        assert_ne!(dos_int_flags(&machine) & 1, 0);
+        assert_eq!(machine.cpu.registers.eax() as u16, 0x0006);
+
+        machine.cpu.registers.set_eax(0x1206);
+        assert!(machine.handle_int2f(), "AX=1206h handled");
+        assert_eq!(machine.cpu.registers.eax() as u8, 0x03);
+
+        prime_dos_int_frame(&mut machine);
+        machine.cpu.registers.set_eax(0x120A);
+        assert!(machine.handle_int2f(), "AX=120Ah handled");
+        assert_eq!(machine.cpu.registers.eax() as u8, 0x03);
+        assert_ne!(dos_int_flags(&machine) & 1, 0);
+
+        prime_dos_int_frame(&mut machine);
+        machine.cpu.registers.set_eax(0x120B);
+        assert!(machine.handle_int2f(), "AX=120Bh handled");
+        assert_eq!(machine.cpu.registers.eax() as u16, 0x0020);
+        assert_ne!(dos_int_flags(&machine) & 1, 0);
+
+        for ax in [0x1207, 0x1209, 0x120C, 0x1215] {
+            machine.cpu.registers.set_eax(ax);
+            assert!(machine.handle_int2f(), "AX={ax:04X}h handled");
+        }
+
+        let sft = (0x4000u32 << 4) + 0x0020;
+        machine.write_physical_u16(sft, 1);
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x4000));
+        machine.cpu.registers.set_edi(0x0020);
+        machine.cpu.registers.set_eax(0x1208);
+        assert!(machine.handle_int2f(), "AX=1208h one-ref handled");
+        assert_eq!(machine.cpu.registers.eax() as u16, 1);
+        assert_eq!(machine.read_guest_word(sft), 0xffff);
+
+        machine.write_physical_u16(sft, 3);
+        machine.cpu.registers.set_eax(0x1208);
+        assert!(machine.handle_int2f(), "AX=1208h multi-ref handled");
+        assert_eq!(machine.cpu.registers.eax() as u16, 3);
+        assert_eq!(machine.read_guest_word(sft), 2);
+
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x4000));
+        machine.cpu.registers.set_edi(0xbeef);
+        machine.cpu.registers.set_eax(0x120E);
+        assert!(machine.handle_int2f(), "AX=120Eh handled");
+        assert_eq!(machine.cpu.registers.segment(SegmentIndex::Ds).selector, 0);
+        assert_eq!(machine.cpu.registers.edi() as u16, 0);
+
+        prime_dos_int_frame(&mut machine);
+        machine.cpu.registers.set_eax(0x1210);
+        assert!(machine.handle_int2f(), "AX=1210h handled");
+        assert_ne!(dos_int_flags(&machine) & 0x40, 0, "no buffer sets ZF");
+
+        prime_dos_int_frame(&mut machine);
+        machine.memory.write_u16(0x9000 * 16 + 0x0106, 2).unwrap();
+        machine.cpu.registers.set_eax(0x1217);
+        assert!(machine.handle_int2f(), "AX=1217h handled");
+        assert_eq!(dos_int_flags(&machine) & 1, 0);
+        let cds = (u32::from(machine.cpu.registers.segment(SegmentIndex::Ds).selector) << 4)
+            + u32::from(machine.cpu.registers.esi() as u16);
+        assert_eq!(machine.read_guest_block(cds, 3), b"C:\\");
+
+        prime_dos_int_frame(&mut machine);
+        machine.memory.write_u16(0x9000 * 16 + 0x0106, 0).unwrap();
+        machine.cpu.registers.set_eax(0x1219);
+        assert!(machine.handle_int2f(), "AX=1219h default drive handled");
+        assert_eq!(dos_int_flags(&machine) & 1, 0);
+        let cds = (u32::from(machine.cpu.registers.segment(SegmentIndex::Ds).selector) << 4)
+            + u32::from(machine.cpu.registers.esi() as u16);
+        assert_eq!(machine.read_guest_block(cds, 3), b"C:\\");
+
+        prime_dos_int_frame(&mut machine);
+        machine
+            .memory
+            .write_u16(0x9000 * 16 + 0x0106, u16::from(b'C'))
+            .unwrap();
+        machine.cpu.registers.set_eax(0x121F);
+        assert!(machine.handle_int2f(), "AX=121Fh handled");
+        assert_eq!(dos_int_flags(&machine) & 1, 0);
+        let cds = (u32::from(machine.cpu.registers.segment(SegmentIndex::Es).selector) << 4)
+            + u32::from(machine.cpu.registers.edi() as u16);
+        assert_eq!(machine.read_guest_block(cds, 3), b"C:\\");
+
+        prime_dos_int_frame(&mut machine);
+        machine.memory.write_u16(0x9000 * 16 + 0x0106, 26).unwrap();
+        machine.cpu.registers.set_eax(0x1217);
+        assert!(machine.handle_int2f(), "AX=1217h bad drive handled");
+        assert_ne!(dos_int_flags(&machine) & 1, 0);
+        assert_eq!(machine.cpu.registers.eax() as u16, 0x000f);
+
+        machine.cpu.registers.set_eax(0x1218);
+        machine.cpu.registers.set_ebx(0xabcd);
+        machine.cpu.registers.set_ecx(0x1357);
+        machine.cpu.registers.set_edx(0x2468);
+        machine.cpu.registers.set_esi(0x3333);
+        machine.cpu.registers.set_edi(0x4444);
+        machine.cpu.registers.set_ebp(0x5555);
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x1111));
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x2222));
+        assert!(machine.handle_int2f(), "AX=1218h handled");
+        assert_eq!(
+            (
+                machine.cpu.registers.segment(SegmentIndex::Ds).selector,
+                machine.cpu.registers.esi() as u16
+            ),
+            (DOS_INT2F_REGS_SEG, DOS_INT2F_REGS_OFF)
+        );
+        let frame = (u32::from(DOS_INT2F_REGS_SEG) << 4) + u32::from(DOS_INT2F_REGS_OFF);
+        assert_eq!(machine.read_guest_word(frame), 0x1218);
+        assert_eq!(machine.read_guest_word(frame + 2), 0xabcd);
+        assert_eq!(machine.read_guest_word(frame + 14), 0x1111);
+        assert_eq!(machine.read_guest_word(frame + 16), 0x2222);
+
+        prime_dos_int_frame(&mut machine);
+        machine.cpu.registers.set_eax(0x1223);
+        assert!(machine.handle_int2f(), "AX=1223h handled");
+        assert_ne!(dos_int_flags(&machine) & 1, 0);
+
+        for (ax, bp) in [(0x1228, 0x4100), (0x122B, 0x4300)] {
+            prime_dos_int_frame(&mut machine);
+            machine.cpu.registers.set_ebp(bp);
+            machine.cpu.registers.set_eax(ax);
+            assert!(
+                machine.handle_int2f(),
+                "AX={ax:04X}h invalid helper handled"
+            );
+            assert_ne!(dos_int_flags(&machine) & 1, 0);
+            assert_eq!(machine.cpu.registers.eax() as u16, 0x0001);
+        }
+
+        prime_dos_int_frame(&mut machine);
+        machine.cpu.registers.set_eax(0x122A);
+        assert!(machine.handle_int2f(), "AX=122Ah handled");
+        assert_eq!(dos_int_flags(&machine) & 1, 0);
+
+        prime_dos_int_frame(&mut machine);
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x3333));
+        machine.cpu.registers.set_edi(0x4444);
+        machine.cpu.registers.set_edx(0);
+        machine.cpu.registers.set_eax(0x122E);
+        assert!(machine.handle_int2f(), "AX=122Eh handled");
+        assert_eq!(dos_int_flags(&machine) & 1, 0);
+        assert_eq!(machine.cpu.registers.segment(SegmentIndex::Es).selector, 0);
+        assert_eq!(machine.cpu.registers.edi() as u16, 0);
+    }
+
+    #[test]
+    fn int2f_12xx_delegates_dos_file_and_state_helpers() {
+        const PROG: [u8; 2] = [0xcd, 0x20];
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("COUNTRY.SYS"), b"abcdef").unwrap();
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
+                .unwrap();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+
+        prime_dos_int_frame(&mut machine);
+        machine
+            .memory
+            .write_u16(0x9000 * 16 + 0x0106, u16::from(b'Z'))
+            .unwrap();
+        machine.cpu.registers.set_eax(0x1205);
+        assert!(machine.handle_int2f(), "AX=1205h handled");
+        assert_eq!(machine.dos_output(), b"Z");
+
+        machine.cpu.registers.set_eax(0x120D);
+        assert!(machine.handle_int2f(), "AX=120Dh handled");
+        assert_eq!(machine.cpu.registers.eax() as u16, 0x22d1); // 1997-06-17
+        assert_eq!(machine.cpu.registers.edx() as u16, 0x6000); // 12:00:00
+
+        prime_dos_int_frame(&mut machine);
+        machine.cpu.registers.set_eax(0x1220);
+        machine.cpu.registers.set_ebx(1); // STDOUT
+        assert!(machine.handle_int2f(), "AX=1220h handled");
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "open JFT entry clears CF");
+        let jft = (u32::from(machine.cpu.registers.segment(SegmentIndex::Es).selector) << 4)
+            + u32::from(machine.cpu.registers.edi() as u16);
+        assert_ne!(machine.read_physical_u8(jft), 0xff);
+
+        machine.cpu.registers.set_eax(0x122C);
+        assert!(machine.handle_int2f(), "AX=122Ch handled");
+        assert_ne!(
+            (
+                machine.cpu.registers.ebx() as u16,
+                machine.cpu.registers.eax() as u16
+            ),
+            (0xffff, 0xffff),
+            "device chain has a driver after NUL"
+        );
+
+        write_guest_asciiz(&mut machine, 0x3000, 0x0100, "C:\\COUNTRY.SYS");
+        prime_dos_int_frame(&mut machine);
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x3000));
+        machine.cpu.registers.set_edx(0x0100);
+        machine.cpu.registers.set_ecx(0x0000); // CL = read-only
+        machine.cpu.registers.set_eax(0x1226);
+        assert!(machine.handle_int2f(), "AX=1226h handled");
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "open clears CF");
+        let handle = machine.cpu.registers.eax() as u16;
+
+        prime_dos_int_frame(&mut machine);
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x3000));
+        machine.cpu.registers.set_edx(0x0200);
+        machine.cpu.registers.set_ecx(3);
+        machine.cpu.registers.set_ebx(u32::from(handle));
+        machine.cpu.registers.set_eax(0x1229);
+        assert!(machine.handle_int2f(), "AX=1229h handled");
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "read clears CF");
+        assert_eq!(machine.cpu.registers.eax() as u16, 3);
+        assert_eq!(
+            machine.read_guest_block((0x3000u32 << 4) + 0x0200, 3),
+            b"abc"
+        );
+
+        prime_dos_int_frame(&mut machine);
+        machine.cpu.registers.set_ebp(0x4200);
+        machine.cpu.registers.set_ebx(u32::from(handle));
+        machine.cpu.registers.set_ecx(0);
+        machine.cpu.registers.set_edx(1);
+        machine.cpu.registers.set_eax(0x1228);
+        assert!(machine.handle_int2f(), "AX=1228h handled");
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "seek clears CF");
+        assert_eq!(machine.cpu.registers.eax() as u16, 1);
+        assert_eq!(machine.cpu.registers.edx() as u16, 0);
+
+        prime_dos_int_frame(&mut machine);
+        machine.cpu.registers.set_ebp(0x4400);
+        machine.cpu.registers.set_ebx(u32::from(handle));
+        machine.cpu.registers.set_eax(0x122B);
+        assert!(machine.handle_int2f(), "AX=122Bh handled");
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "IOCTL get info clears CF");
+
+        prime_dos_int_frame(&mut machine);
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x3000));
+        machine.cpu.registers.set_edx(0x0204);
+        machine.cpu.registers.set_ecx(2);
+        machine.cpu.registers.set_ebx(u32::from(handle));
+        machine.cpu.registers.set_eax(0x1229);
+        assert!(machine.handle_int2f(), "AX=1229h second read handled");
+        assert_eq!(machine.cpu.registers.eax() as u16, 2);
+        assert_eq!(
+            machine.read_guest_block((0x3000u32 << 4) + 0x0204, 2),
+            b"bc"
+        );
+
+        prime_dos_int_frame(&mut machine);
+        machine.cpu.registers.set_ebx(u32::from(handle));
+        machine.cpu.registers.set_eax(0x1227);
+        assert!(machine.handle_int2f(), "AX=1227h handled");
+        assert_eq!(dos_int_flags(&machine) & 1, 0, "close clears CF");
+
+        prime_dos_int_frame(&mut machine);
+        machine.cpu.registers.set_ebx(u32::from(handle));
+        machine.cpu.registers.set_ecx(1);
+        machine.cpu.registers.set_edx(0x0208);
+        machine.cpu.registers.set_eax(0x1229);
+        assert!(
+            machine.handle_int2f(),
+            "AX=1229h closed-handle read handled"
+        );
+        assert_ne!(dos_int_flags(&machine) & 1, 0, "closed handle sets CF");
+        assert_eq!(machine.cpu.registers.eax() as u16, 0x0006);
+
+        machine.cpu.registers.set_eax(0x122D);
+        assert!(machine.handle_int2f(), "AX=122Dh handled");
+        assert_eq!(machine.cpu.registers.eax() as u16, 0x0006);
+    }
+
+    #[test]
+    fn int2f_12xx_updates_extended_error_and_reported_version() {
+        const PROG: [u8; 2] = [0xcd, 0x20];
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
+                .unwrap();
+
+        let mut bad_read = izarravm_dos::DosRegs {
+            ax: 0x3f00,
+            bx: 0xffff,
+            ..izarravm_dos::DosRegs::default()
+        };
+        machine
+            .dos
+            .dispatch(0x21, &mut bad_read, &mut machine.memory)
+            .unwrap();
+        assert!(bad_read.cf);
+        assert_eq!(bad_read.ax, 0x0006);
+
+        machine.write_guest_block((0x3600u32 << 4) + 0x0100, &[0x06, 0x07, 0x08, 0x09, 0xff]);
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Ss, SegmentRegister::real(0x3600));
+        machine.cpu.registers.set_esi(0x0100);
+        machine.cpu.registers.set_eax(0x1222);
+        assert!(machine.handle_int2f(), "AX=1222h handled");
+        assert_eq!(machine.cpu.registers.esi() as u16, 0x0104);
+
+        let mut err = izarravm_dos::DosRegs {
+            ax: 0x5900,
+            ..izarravm_dos::DosRegs::default()
+        };
+        machine
+            .dos
+            .dispatch(0x21, &mut err, &mut machine.memory)
+            .unwrap();
+        assert_eq!(err.ax, 0x0006);
+        assert_eq!(err.bx, 0x0708);
+        assert_eq!(err.cx >> 8, 0x09);
+
+        machine.cpu.registers.set_eax(0x1224);
+        assert!(machine.handle_int2f(), "AX=1224h handled");
+
+        machine.cpu.registers.set_edx(0x0005); // apparent DOS 5.00
+        machine.cpu.registers.set_eax(0x122F);
+        assert!(machine.handle_int2f(), "AX=122Fh set handled");
+
+        let mut apparent = izarravm_dos::DosRegs {
+            ax: 0x3000,
+            ..izarravm_dos::DosRegs::default()
+        };
+        machine
+            .dos
+            .dispatch(0x21, &mut apparent, &mut machine.memory)
+            .unwrap();
+        assert_eq!(apparent.ax, 0x0005);
+
+        let mut true_version = izarravm_dos::DosRegs {
+            ax: 0x3306,
+            ..izarravm_dos::DosRegs::default()
+        };
+        machine
+            .dos
+            .dispatch(0x21, &mut true_version, &mut machine.memory)
+            .unwrap();
+        assert_eq!(true_version.bx, 0x1606);
+
+        machine.cpu.registers.set_edx(0);
+        machine.cpu.registers.set_eax(0x122F);
+        assert!(machine.handle_int2f(), "AX=122Fh clear handled");
+        let mut restored = izarravm_dos::DosRegs {
+            ax: 0x3000,
+            ..izarravm_dos::DosRegs::default()
+        };
+        machine
+            .dos
+            .dispatch(0x21, &mut restored, &mut machine.memory)
+            .unwrap();
+        assert_eq!(restored.ax, 0x1606);
     }
 
     #[test]
@@ -17216,6 +20375,33 @@ mod tests {
                 .read_u8(usize::from(DOS_LOAD_SEGMENT) * 16 + 0x200)
                 .unwrap(),
             0x23
+        );
+    }
+
+    #[test]
+    fn dos_idle_int28_runs_guest_handler() {
+        // org 0x100:
+        //   mov dx,handler / mov ax,2528h / int 21h ; install INT 28h
+        //   int 28h
+        //   exit 0 only if handler wrote marker 28h at DS:0200h
+        let com: &[u8] = &[
+            0xba, 0x1b, 0x01, 0xb8, 0x28, 0x25, 0xcd, 0x21, 0xcd, 0x28, 0xa0, 0x00, 0x02, 0x3c,
+            0x28, 0x75, 0x05, 0xb8, 0x00, 0x4c, 0xcd, 0x21, 0xb8, 0x01, 0x4c, 0xcd, 0x21, 0xc6,
+            0x06, 0x00, 0x02, 0x28, 0xcf,
+        ];
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
+                .unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
+
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
+        assert_eq!(
+            machine
+                .memory()
+                .read_u8(usize::from(DOS_LOAD_SEGMENT) * 16 + 0x200)
+                .unwrap(),
+            0x28
         );
     }
 
@@ -19995,6 +23181,39 @@ mod tests {
         assert_eq!(machine.memory.read_u16(d_dpb + 0x13).unwrap(), header.1);
         assert_eq!(machine.memory.read_u16(d_dpb + 0x15).unwrap(), header.0);
 
+        machine.cpu.registers.set_eax(0x0800);
+        assert!(machine.handle_int2f(), "DRIVER.SYS install check handled");
+        assert_eq!(machine.cpu.registers.eax() as u8, 0xff, "handler installed");
+
+        machine.cpu.registers.set_eax(0x0803);
+        machine.cpu.registers.set_edi(0xCAFE_0000);
+        assert!(machine.handle_int2f(), "DRIVER.SYS BDS list handled");
+        let bds_seg = machine.cpu.registers.segment(SegmentIndex::Ds).selector;
+        let c_bds = usize::from(bds_seg) * 16 + usize::from(machine.cpu.registers.edi() as u16);
+        assert_eq!(machine.memory.read_u8(c_bds + 0x04).unwrap(), 0x80);
+        assert_eq!(machine.memory.read_u8(c_bds + 0x05).unwrap(), 2, "C: BDS");
+        assert_eq!(machine.memory.read_u16(c_bds + 0x06).unwrap(), 512);
+        assert_eq!(machine.memory.read_u8(c_bds + 0x08).unwrap(), 64);
+        assert_eq!(machine.memory.read_u8(c_bds + 0x10).unwrap(), 0xf8);
+        assert_eq!(machine.memory.read_u16(c_bds + 0x23).unwrap(), 0x0001);
+        let d_bds_off = machine.memory.read_u16(c_bds).unwrap();
+        let d_bds_seg = machine.memory.read_u16(c_bds + 2).unwrap();
+        let d_bds = usize::from(d_bds_seg) * 16 + usize::from(d_bds_off);
+        assert_eq!(machine.memory.read_u8(d_bds + 0x05).unwrap(), 3, "D: BDS");
+        assert_eq!(machine.memory.read_u16(d_bds + 0x06).unwrap(), 1024);
+        assert_eq!(machine.memory.read_u16(d_bds + 0x0e).unwrap(), 1440);
+        assert_eq!(machine.memory.read_u8(d_bds + 0x10).unwrap(), 0xf9);
+        assert_eq!(machine.memory.read_u16(d_bds + 0x13).unwrap(), 18);
+        assert_eq!(machine.memory.read_u16(d_bds + 0x15).unwrap(), 2);
+        assert_eq!(
+            (
+                machine.memory.read_u16(d_bds + 2).unwrap(),
+                machine.memory.read_u16(d_bds).unwrap()
+            ),
+            (0xffff, 0xffff),
+            "D: BDS terminates the chain"
+        );
+
         write_guest_asciiz(&mut machine, 0x2000, 0x0000, "BLKDRV");
         let mut open = izarravm_dos::DosRegs {
             ax: 0x3d00,
@@ -21919,6 +25138,27 @@ mod tests {
             0xcf,
             "INT 1Bh target is an IRET"
         );
+    }
+
+    #[test]
+    fn dos_reserved_vectors_point_at_a_valid_iret_handler() {
+        let mut m = Machine::new(
+            MachineProfile::gsw_386(4, VideoCard::Et4000Ax),
+            rom_with_code(&[]),
+        )
+        .unwrap();
+
+        for vector in [0x2bu32, 0x2c, 0x2d, 0x2e] {
+            let off = read_u16(&mut m, vector * 4);
+            let seg = read_u16(&mut m, vector * 4 + 2);
+            assert_eq!(seg, BIOS_ROM_IRET_SEG, "INT {vector:02X}h IRET segment");
+            let target = (u32::from(seg) << 4) + u32::from(off);
+            assert_eq!(
+                m.read_physical_u8(target),
+                0xcf,
+                "INT {vector:02X}h target is an IRET"
+            );
+        }
     }
 
     #[test]

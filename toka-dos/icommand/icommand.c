@@ -1231,15 +1231,45 @@ static void dispatch_redirected(char *word, char *rest, struct redirect *rd)
     }
 }
 
+static void execute_line(char *line)
+{
+    char word[16];
+    char *rest;
+    struct redirect rd;
+    int redir;
+
+    redir = parse_redirects(line, &rd);
+    rest = split_word(line, word, sizeof word);
+    if (word[0] == 0) {
+        return;
+    }
+    if (run_assignment(line)) {
+        return;
+    }
+    if (redir) {
+        dispatch_redirected(word, rest, &rd);
+    } else {
+        dispatch(word, rest);
+    }
+}
+
 int main(void)
 {
     char line[LINE_MAX];
-    char word[16];
-    char *rest;
+    char *tail;
 
     /* TOKABOOT already set 80x25 text mode and printed the startup line; print
      * below it rather than clearing. */
     t_putln("");
+
+    tail = skip_ws(t_cmdtail());
+    if ((tail[0] == '/' || tail[0] == '-') && up(tail[1]) == 'C'
+        && (tail[2] == 0 || tail[2] == ' ' || tail[2] == '\t')) {
+        strncpy(line, skip_ws(tail + 2), LINE_MAX - 1);
+        line[LINE_MAX - 1] = 0;
+        execute_line(line);
+        t_exit(errorlevel);
+    }
 
     /* Run the startup batch if present, the way DOS does. */
     if (t_exists("C:\\AUTOEXEC.BAT")) {
@@ -1247,23 +1277,9 @@ int main(void)
     }
 
     for (;;) {
-        struct redirect rd;
-        int redir;
         render_prompt();
         t_getline(line, LINE_MAX);
-        redir = parse_redirects(line, &rd);
-        rest = split_word(line, word, sizeof word);
-        if (word[0] == 0) {
-            continue;
-        }
-        if (run_assignment(line)) {
-            continue;
-        }
-        if (redir) {
-            dispatch_redirected(word, rest, &rd);
-        } else {
-            dispatch(word, rest);
-        }
+        execute_line(line);
     }
     /* not reached */
 }

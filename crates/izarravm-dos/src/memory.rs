@@ -60,13 +60,28 @@ const EMM_DEVICE_OFF: usize = NUL_DEVICE_OFF + DEVICE_HEADER_LEN;
 const CON_DEVICE_OFF: usize = EMM_DEVICE_OFF + DEVICE_HEADER_LEN;
 const CLOCK_DEVICE_OFF: usize = CON_DEVICE_OFF + DEVICE_HEADER_LEN;
 const SFT_TABLE_OFF: usize = 0x70;
+pub(super) const DBCS_LEAD_BYTE_TABLE_PTR: (u16, u16) = (SYSVARS_SEG, SFT_TABLE_OFF as u16);
 const SFT_HEADER_LEN: usize = 0x06;
 const SFT_ENTRY_LEN: usize = 0x3b;
 const STANDARD_SFT_SLOTS: usize = 5;
 const DPB_LEN: usize = 0x21;
+const BDS_ENTRY_LEN: usize = 0x64;
 pub(super) const BLOCK_BPB_LEN: usize = 0x19;
 const CDS_ENTRY_LEN: usize = 0x58;
 const SDA_LIVE_PREFIX_LEN: usize = 0x1a;
+const NLS_UPPER_TABLE_LEN: usize = 2 + 0x80;
+const NLS_LOWER_TABLE_LEN: usize = 2 + 0x100;
+const NLS_FILENAME_UPPER_TABLE_LEN: usize = 2 + 0x80;
+const NLS_FILENAME_TERMINATORS: &[u8] = b".\"/\\[]:|<>+=;,";
+const NLS_FILENAME_TERMINATOR_TABLE_LEN: usize = 2 + 8 + NLS_FILENAME_TERMINATORS.len();
+const NLS_COLLATING_TABLE_LEN: usize = 2 + 0x100;
+const NLS_TABLES_LEN: usize = NLS_UPPER_TABLE_LEN
+    + NLS_LOWER_TABLE_LEN
+    + NLS_FILENAME_UPPER_TABLE_LEN
+    + NLS_FILENAME_TERMINATOR_TABLE_LEN
+    + NLS_COLLATING_TABLE_LEN;
+const SDA_LIST_SEG: u16 = 0x0052;
+const SDA_LIST_OFF: u16 = 0x0000;
 pub(super) const SDA_ALWAYS_SWAPPED_LEN: u16 = 0x001a;
 pub(super) const SDA_IN_DOS_SWAPPED_LEN: u16 = 0x0000;
 
@@ -91,7 +106,9 @@ struct SysvarsLayout {
     sft_slots: usize,
     dpb_off: usize,
     cds_array_off: usize,
+    bds_off: usize,
     sda_off: usize,
+    nls_off: usize,
 }
 
 fn sysvars_layout(
@@ -106,28 +123,48 @@ fn sysvars_layout(
     let sft_linear = base + 2 + SFT_TABLE_OFF;
     let cds_bytes = usize::from(drive_count) * CDS_ENTRY_LEN;
     let dpb_bytes = DPB_LEN * (1 + published_block_units);
-    let max_sft_slots = (sysvars_limit
-        .saturating_sub(sft_linear + SFT_HEADER_LEN + dpb_bytes + cds_bytes + SDA_LIVE_PREFIX_LEN)
-        / SFT_ENTRY_LEN)
+    let bds_bytes = BDS_ENTRY_LEN * (1 + published_block_units);
+    let max_sft_slots = (sysvars_limit.saturating_sub(
+        sft_linear
+            + SFT_HEADER_LEN
+            + dpb_bytes
+            + cds_bytes
+            + bds_bytes
+            + SDA_LIVE_PREFIX_LEN
+            + NLS_TABLES_LEN,
+    ) / SFT_ENTRY_LEN)
         .max(2);
     let sft_slots = usize::from(file_count)
         .max(STANDARD_SFT_SLOTS)
         .min(max_sft_slots);
     let dpb_off = SFT_TABLE_OFF + SFT_HEADER_LEN + sft_slots * SFT_ENTRY_LEN;
     let cds_array_off = dpb_off + dpb_bytes;
-    let sda_off = cds_array_off + cds_bytes;
+    let bds_off = cds_array_off + cds_bytes;
+    let sda_off = bds_off + bds_bytes;
+    let nls_off = sda_off + SDA_LIVE_PREFIX_LEN;
     let layout = SysvarsLayout {
         drive_count,
         sft_slots,
         dpb_off,
         cds_array_off,
+        bds_off,
         sda_off,
+        nls_off,
     };
-    let layout_end = base + 2 + layout.sda_off + SDA_LIVE_PREFIX_LEN;
+    let layout_end = base + 2 + layout.nls_off + NLS_TABLES_LEN;
     if layout_end > sysvars_limit {
         return Err(DosError::SystemLayoutTooSmall);
     }
     Ok(layout)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct NlsTablePointers {
+    pub(super) uppercase: (u16, u16),
+    pub(super) lowercase: (u16, u16),
+    pub(super) filename_uppercase: (u16, u16),
+    pub(super) filename_terminators: (u16, u16),
+    pub(super) collating: (u16, u16),
 }
 
 /// A live host-file handle projected into the DOS System File Table.
@@ -148,9 +185,13 @@ pub(super) struct BlockDeviceBpb {
     pub(super) first_fat_sector: u16,
     pub(super) fat_count: u8,
     pub(super) root_entries: u16,
+    pub(super) total_sectors: u32,
     pub(super) first_data_sector: u16,
     pub(super) highest_cluster: u16,
     pub(super) sectors_per_fat: u16,
+    pub(super) sectors_per_track: u16,
+    pub(super) heads: u16,
+    pub(super) hidden_sectors: u32,
     pub(super) first_root_sector: u16,
     pub(super) media: u8,
 }
@@ -165,6 +206,9 @@ impl BlockDeviceBpb {
         let total_sectors_small = u16::from_le_bytes([bytes[8], bytes[9]]);
         let media = bytes[10];
         let sectors_per_fat = u16::from_le_bytes([bytes[11], bytes[12]]);
+        let sectors_per_track = u16::from_le_bytes([bytes[13], bytes[14]]);
+        let heads = u16::from_le_bytes([bytes[15], bytes[16]]);
+        let hidden_sectors = u32::from_le_bytes([bytes[17], bytes[18], bytes[19], bytes[20]]);
         let huge_sectors = u32::from_le_bytes([bytes[21], bytes[22], bytes[23], bytes[24]]);
         if bytes_per_sector == 0
             || sectors_per_cluster == 0
@@ -196,12 +240,40 @@ impl BlockDeviceBpb {
             first_fat_sector: reserved_sectors,
             fat_count,
             root_entries,
+            total_sectors,
             first_data_sector: u16::try_from(first_data_sector).ok()?,
             highest_cluster: u16::try_from(highest_cluster).ok()?,
             sectors_per_fat,
+            sectors_per_track,
+            heads,
+            hidden_sectors,
             first_root_sector: u16::try_from(first_root_sector).ok()?,
             media,
         })
+    }
+
+    fn to_bytes(self) -> [u8; BLOCK_BPB_LEN] {
+        let mut bytes = [0u8; BLOCK_BPB_LEN];
+        bytes[0..2].copy_from_slice(&self.bytes_per_sector.to_le_bytes());
+        bytes[2] = self.cluster_mask + 1;
+        bytes[3..5].copy_from_slice(&self.first_fat_sector.to_le_bytes());
+        bytes[5] = self.fat_count;
+        bytes[6..8].copy_from_slice(&self.root_entries.to_le_bytes());
+        bytes[8..10].copy_from_slice(
+            &(if self.total_sectors <= u32::from(u16::MAX) {
+                self.total_sectors as u16
+            } else {
+                0
+            })
+            .to_le_bytes(),
+        );
+        bytes[10] = self.media;
+        bytes[11..13].copy_from_slice(&self.sectors_per_fat.to_le_bytes());
+        bytes[13..15].copy_from_slice(&self.sectors_per_track.to_le_bytes());
+        bytes[15..17].copy_from_slice(&self.heads.to_le_bytes());
+        bytes[17..21].copy_from_slice(&self.hidden_sectors.to_le_bytes());
+        bytes[21..25].copy_from_slice(&self.total_sectors.to_le_bytes());
+        bytes
     }
 }
 
@@ -973,6 +1045,250 @@ pub(super) fn write_sysvars(
     Ok((SYSVARS_SEG, 0x0002))
 }
 
+fn write_bds_bpb(
+    mem: &mut Memory,
+    linear: usize,
+    bytes: &[u8; BLOCK_BPB_LEN],
+) -> Result<(), DosError> {
+    for (index, &byte) in bytes.iter().enumerate() {
+        mem.write_u8(linear + index, byte)?;
+    }
+    Ok(())
+}
+
+fn default_c_bds_bpb() -> [u8; BLOCK_BPB_LEN] {
+    let mut bytes = [0u8; BLOCK_BPB_LEN];
+    let total_sectors = 1024u32 * 16 * 63;
+    bytes[0..2].copy_from_slice(&512u16.to_le_bytes());
+    bytes[2] = 64;
+    bytes[3..5].copy_from_slice(&1u16.to_le_bytes());
+    bytes[5] = 2;
+    bytes[6..8].copy_from_slice(&512u16.to_le_bytes());
+    bytes[8..10].copy_from_slice(&0u16.to_le_bytes());
+    bytes[10] = 0xf8;
+    bytes[11..13].copy_from_slice(&256u16.to_le_bytes());
+    bytes[13..15].copy_from_slice(&63u16.to_le_bytes());
+    bytes[15..17].copy_from_slice(&16u16.to_le_bytes());
+    bytes[17..21].copy_from_slice(&63u32.to_le_bytes());
+    bytes[21..25].copy_from_slice(&total_sectors.to_le_bytes());
+    bytes
+}
+
+fn write_bds_link(
+    mem: &mut Memory,
+    linear: usize,
+    next: Option<(u16, u16)>,
+) -> Result<(), DosError> {
+    let (off, seg) = next.unwrap_or((0xffff, 0xffff));
+    mem.write_u16(linear, off)?;
+    mem.write_u16(linear + 0x02, seg)?;
+    Ok(())
+}
+
+fn write_bds_label(mem: &mut Memory, linear: usize, fs_type: &[u8; 8]) -> Result<(), DosError> {
+    for (index, &byte) in b"NO NAME    ".iter().enumerate() {
+        mem.write_u8(linear + 0x4b + index, byte)?;
+    }
+    mem.write_u8(linear + 0x56, 0)?;
+    mem.write_u32(linear + 0x57, 0)?;
+    for (index, &byte) in fs_type.iter().enumerate() {
+        mem.write_u8(linear + 0x5b + index, byte)?;
+    }
+    mem.write_u8(linear + 0x63, 0)?;
+    Ok(())
+}
+
+fn write_default_c_bds_entry(
+    mem: &mut Memory,
+    linear: usize,
+    next: Option<(u16, u16)>,
+) -> Result<(), DosError> {
+    let bpb = default_c_bds_bpb();
+    write_bds_link(mem, linear, next)?;
+    mem.write_u8(linear + 0x04, 0x80)?; // INT 13h fixed disk 0
+    mem.write_u8(linear + 0x05, 2)?; // C:
+    write_bds_bpb(mem, linear + 0x06, &bpb)?;
+    mem.write_u8(linear + 0x1f, 0x40)?; // FAT16
+    mem.write_u16(linear + 0x20, 0)?;
+    mem.write_u8(linear + 0x22, 0)?;
+    mem.write_u16(linear + 0x23, 0x0001)?; // fixed media
+    mem.write_u16(linear + 0x25, 1024)?;
+    write_bds_bpb(mem, linear + 0x27, &bpb)?;
+    for off in 0x40..0x46 {
+        mem.write_u8(linear + off, 0)?;
+    }
+    mem.write_u8(linear + 0x46, 0xff)?;
+    mem.write_u16(linear + 0x47, 0xffff)?;
+    mem.write_u16(linear + 0x49, 0xffff)?;
+    write_bds_label(mem, linear, b"FAT16   ")
+}
+
+fn write_loaded_bds_entry(
+    mem: &mut Memory,
+    linear: usize,
+    next: Option<(u16, u16)>,
+    entry: &BlockDeviceDpbEntry,
+) -> Result<(), DosError> {
+    let bpb = entry.bpb;
+    let bpb_bytes = bpb.to_bytes();
+    let fat16 = bpb.highest_cluster >= 0x0ff6;
+    let cylinders = if bpb.sectors_per_track != 0 && bpb.heads != 0 {
+        (bpb.total_sectors / u32::from(bpb.sectors_per_track) / u32::from(bpb.heads))
+            .min(u32::from(u16::MAX)) as u16
+    } else {
+        0
+    };
+    write_bds_link(mem, linear, next)?;
+    mem.write_u8(linear + 0x04, entry.unit)?;
+    mem.write_u8(linear + 0x05, entry.drive)?;
+    write_bds_bpb(mem, linear + 0x06, &bpb_bytes)?;
+    mem.write_u8(linear + 0x1f, if fat16 { 0x40 } else { 0x00 })?;
+    mem.write_u16(linear + 0x20, 0)?;
+    mem.write_u8(linear + 0x22, 0)?;
+    mem.write_u16(
+        linear + 0x23,
+        if bpb.media == 0xf8 { 0x0001 } else { 0x0000 },
+    )?;
+    mem.write_u16(linear + 0x25, cylinders)?;
+    write_bds_bpb(mem, linear + 0x27, &bpb_bytes)?;
+    for off in 0x40..0x46 {
+        mem.write_u8(linear + off, 0)?;
+    }
+    mem.write_u8(linear + 0x46, 0xff)?;
+    mem.write_u32(linear + 0x47, 0xffff_ffff)?;
+    write_bds_label(mem, linear, if fat16 { b"FAT16   " } else { b"FAT12   " })
+}
+
+/// INT 2Fh AX=0803h exposes DOS 4.x drive data tables for DRIVER.SYS support.
+/// The table lives inside the same reserved SysVars paragraph as the DPB/CDS/SDA
+/// data, so the returned far pointer stays stable until the next DOS data rebuild.
+pub(super) fn write_driver_bds(
+    mem: &mut Memory,
+    first_mcb: u16,
+    lastdrive: Option<u8>,
+    file_count: u16,
+    block_dpbs: &[BlockDeviceDpbEntry],
+) -> Result<(u16, u16), DosError> {
+    let layout = sysvars_layout(first_mcb, lastdrive, file_count, block_dpbs.len())?;
+    let first_off = (2 + layout.bds_off) as u16;
+    let base = usize::from(SYSVARS_SEG) * 16 + usize::from(first_off);
+    let total = 1 + block_dpbs.len();
+    for index in 0..total * BDS_ENTRY_LEN {
+        mem.write_u8(base + index, 0)?;
+    }
+
+    let next_for = |index: usize| {
+        if index + 1 == total {
+            None
+        } else {
+            Some((
+                (2 + layout.bds_off + (index + 1) * BDS_ENTRY_LEN) as u16,
+                SYSVARS_SEG,
+            ))
+        }
+    };
+    write_default_c_bds_entry(mem, base, next_for(0))?;
+    for (index, entry) in block_dpbs.iter().enumerate() {
+        write_loaded_bds_entry(
+            mem,
+            base + (index + 1) * BDS_ENTRY_LEN,
+            next_for(index + 1),
+            entry,
+        )?;
+    }
+    Ok((SYSVARS_SEG, first_off))
+}
+
+fn write_case_table(
+    mem: &mut Memory,
+    linear: usize,
+    start: u8,
+    len: usize,
+    lowercase: bool,
+) -> Result<(), DosError> {
+    mem.write_u16(linear, len as u16)?;
+    for index in 0..len {
+        let byte = start.wrapping_add(index as u8);
+        let mapped = if lowercase {
+            byte.to_ascii_lowercase()
+        } else {
+            byte.to_ascii_uppercase()
+        };
+        mem.write_u8(linear + 2 + index, mapped)?;
+    }
+    Ok(())
+}
+
+fn write_collating_table(mem: &mut Memory, linear: usize) -> Result<(), DosError> {
+    mem.write_u16(linear, 0x0100)?;
+    for byte in 0u16..=0xff {
+        mem.write_u8(linear + 2 + usize::from(byte), byte as u8)?;
+    }
+    Ok(())
+}
+
+fn write_filename_terminator_table(mem: &mut Memory, linear: usize) -> Result<(), DosError> {
+    mem.write_u16(linear, (NLS_FILENAME_TERMINATOR_TABLE_LEN - 2) as u16)?;
+    mem.write_u8(linear + 0x02, 0x01)?;
+    mem.write_u8(linear + 0x03, 0x00)?;
+    mem.write_u8(linear + 0x04, 0xff)?;
+    mem.write_u8(linear + 0x05, 0x00)?;
+    mem.write_u8(linear + 0x06, b'\\')?;
+    mem.write_u8(linear + 0x07, b'/')?;
+    mem.write_u8(linear + 0x08, 0x02)?;
+    mem.write_u8(linear + 0x09, NLS_FILENAME_TERMINATORS.len() as u8)?;
+    for (index, &byte) in NLS_FILENAME_TERMINATORS.iter().enumerate() {
+        mem.write_u8(linear + 0x0a + index, byte)?;
+    }
+    Ok(())
+}
+
+/// INT 21h AH=65h subfunctions 02h-06h return pointers to NLS tables. Toka-DOS
+/// currently ships only the US/CP437 defaults, so extended-byte maps are identity
+/// maps and ASCII is folded for the full lowercase table.
+pub(super) fn write_nls_tables(
+    mem: &mut Memory,
+    first_mcb: u16,
+    lastdrive: Option<u8>,
+    file_count: u16,
+    published_block_units: usize,
+) -> Result<NlsTablePointers, DosError> {
+    let layout = sysvars_layout(first_mcb, lastdrive, file_count, published_block_units)?;
+    let mut off = (2 + layout.nls_off) as u16;
+    let mut linear = usize::from(SYSVARS_SEG) * 16 + usize::from(off);
+
+    let uppercase = (SYSVARS_SEG, off);
+    write_case_table(mem, linear, 0x80, 0x80, false)?;
+    off = off.wrapping_add(NLS_UPPER_TABLE_LEN as u16);
+    linear += NLS_UPPER_TABLE_LEN;
+
+    let lowercase = (SYSVARS_SEG, off);
+    write_case_table(mem, linear, 0x00, 0x100, true)?;
+    off = off.wrapping_add(NLS_LOWER_TABLE_LEN as u16);
+    linear += NLS_LOWER_TABLE_LEN;
+
+    let filename_uppercase = (SYSVARS_SEG, off);
+    write_case_table(mem, linear, 0x80, 0x80, false)?;
+    off = off.wrapping_add(NLS_FILENAME_UPPER_TABLE_LEN as u16);
+    linear += NLS_FILENAME_UPPER_TABLE_LEN;
+
+    let filename_terminators = (SYSVARS_SEG, off);
+    write_filename_terminator_table(mem, linear)?;
+    off = off.wrapping_add(NLS_FILENAME_TERMINATOR_TABLE_LEN as u16);
+    linear += NLS_FILENAME_TERMINATOR_TABLE_LEN;
+
+    let collating = (SYSVARS_SEG, off);
+    write_collating_table(mem, linear)?;
+
+    Ok(NlsTablePointers {
+        uppercase,
+        lowercase,
+        filename_uppercase,
+        filename_terminators,
+        collating,
+    })
+}
+
 /// Insert the loaded-driver headers into the chain after NUL: NUL -> driver[0] ->
 /// ... -> driver[n] -> the first built-in device. The list is most-recently-loaded
 /// first, so driver[0] is the last `.SYS` CONFIG.SYS loaded and sits nearest NUL.
@@ -1057,6 +1373,30 @@ pub(super) fn write_sda(
     mem.write_u8(sda + 0x18, 0)?; // code page switching flag parked
     mem.write_u8(sda + 0x19, 0)?; // INT 24 abort code-page flag parked
     Ok((SYSVARS_SEG, sda_off))
+}
+
+pub(super) fn write_sda_list(
+    mem: &mut Memory,
+    first_mcb: u16,
+    lastdrive: Option<u8>,
+    file_count: u16,
+    published_block_units: usize,
+    snapshot: SdaSnapshot,
+) -> Result<(u16, u16), DosError> {
+    let (seg, sda_off) = write_sda(
+        mem,
+        first_mcb,
+        lastdrive,
+        file_count,
+        published_block_units,
+        snapshot,
+    )?;
+    let list = usize::from(SDA_LIST_SEG) * 16 + usize::from(SDA_LIST_OFF);
+    mem.write_u16(list, 1)?;
+    mem.write_u16(list + 2, sda_off)?;
+    mem.write_u16(list + 4, seg)?;
+    mem.write_u16(list + 6, 0x8000 | SDA_ALWAYS_SWAPPED_LEN)?;
+    Ok((SDA_LIST_SEG, SDA_LIST_OFF))
 }
 
 /// Write one MCB header into guest RAM: the signature ('M' link or 'Z' last), the

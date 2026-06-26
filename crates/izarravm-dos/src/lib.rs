@@ -16,12 +16,13 @@ pub use driver::{
 };
 
 use memory::{
-    ARENA_TOP, Arena, BLOCK_BPB_LEN, BlockDeviceBpb, BlockDeviceDpbEntry, ResizeError,
-    SDA_ALWAYS_SWAPPED_LEN, SDA_IN_DOS_SWAPPED_LEN, SdaCriticalError, SdaSnapshot,
+    ARENA_TOP, Arena, BLOCK_BPB_LEN, BlockDeviceBpb, BlockDeviceDpbEntry, DBCS_LEAD_BYTE_TABLE_PTR,
+    ResizeError, SDA_ALWAYS_SWAPPED_LEN, SDA_IN_DOS_SWAPPED_LEN, SdaCriticalError, SdaSnapshot,
     SftHostFileEntry, SysvarsDevices, UmbArena, allocate_strategy, free_routed,
     free_umb_blocks_owned_by, is_valid_alloc_strategy, mcb_chain_is_complete, release_umb,
     request_umb, resize_routed, resize_umb, set_umb_owner, set_umb_region, stamp_mcb_owner,
-    write_child_program_mcb, write_env_mcb, write_free_mcb_to_cap, write_sda, write_sysvars,
+    write_child_program_mcb, write_driver_bds, write_env_mcb, write_free_mcb_to_cap,
+    write_nls_tables, write_sda, write_sda_list, write_sysvars,
 };
 #[cfg(test)]
 use memory::{NO_NAME, RamMcb, read_mcb_chain, write_mcb_header};
@@ -151,6 +152,12 @@ const DEFAULT_BUFFER_COUNT: u16 = 20;
 const DEFAULT_LASTDRIVE_COUNT: u8 = 5;
 const FIRST_LOADED_BLOCK_DRIVE: u8 = 3;
 const MAX_DOS_DRIVE: u8 = 25;
+const C_DRIVE_SECTORS_PER_CLUSTER: u16 = 64;
+const C_DRIVE_BYTES_PER_SECTOR: u16 = 512;
+const C_DRIVE_TOTAL_CLUSTERS: u16 = 0xffff;
+const C_DRIVE_FREE_CLUSTERS: u16 = 0xf000;
+const C_DRIVE_VOLUME_LABEL: [u8; 11] = *b"NO NAME    ";
+const C_DRIVE_FS_TYPE: [u8; 8] = *b"FAT16   ";
 
 /// The default CONFIG.SYS: the directives a period DOS carries. The HIMEM.SYS
 /// and IEMM.EXE RAM lines select the IEMM RAM mode (UMBs plus the EMS page
@@ -426,6 +433,34 @@ pub enum DosAction {
 pub struct FarPtr {
     pub segment: u16,
     pub offset: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExtendedError {
+    code: u16,
+    bx: u16,
+    ch: u8,
+    pointer: FarPtr,
+}
+
+impl ExtendedError {
+    fn from_code(code: u16) -> Self {
+        Self {
+            code,
+            ..Self::default()
+        }
+    }
+}
+
+impl Default for ExtendedError {
+    fn default() -> Self {
+        Self {
+            code: 0,
+            bx: (0x0d << 8) | 0x05,
+            ch: 0x01,
+            pointer: FarPtr::default(),
+        }
+    }
 }
 
 /// Disk area reported in the INT 24h AH flags for a block-device critical error.
@@ -787,14 +822,16 @@ fn device_name_key(name: &str) -> String {
     device_base_name(name).trim().to_ascii_uppercase()
 }
 
-/// One entry of a FindFirst/FindNext result: the documented DTA fields plus the
-/// uppercase 8.3 name to write into the 13-byte ASCIIZ slot.
+/// One entry of a FindFirst/FindNext result: the documented DTA fields, the raw
+/// 11-byte directory-entry name, and the uppercase name to write into the
+/// 13-byte ASCIIZ slot.
 #[derive(Debug, Clone)]
 struct FindEntry {
     attr: u8,
     time: u16, // packed DOS time (RBIL #01665)
     date: u16, // packed DOS date (RBIL #01666)
     size: u32,
+    raw_name: [u8; 11],
     name: String, // uppercase 8.3, e.g. "LEVEL1.DAT"
 }
 
@@ -961,6 +998,13 @@ pub struct DosKernel {
     // AH=33h BREAK flag. The current HLE checks Ctrl-C on the DOS console calls
     // either way, but the flag itself is guest-visible and must round-trip.
     ctrl_break_enabled: bool,
+    // INT 2Fh AX=122Fh can change the DOS version reported by AH=30h. None means
+    // report the true Toka-DOS API version.
+    reported_version_override: Option<u16>,
+    // AH=37h Xenix compatibility switch character. None means the DOS default '/'.
+    switch_char: Option<u8>,
+    // AH=63h interim console flag for DBCS-aware callers. CP437 starts clear.
+    interim_console_flag: bool,
     // Extended/function keys (arrows, F-keys) arrive on the ring as a (scancode, 0)
     // pair. DOS cooked input returns them as two reads: 0x00 first, then the scancode
     // on the next AH=01/06/07/08/0Ch call. This holds the scancode between the two.
@@ -973,6 +1017,8 @@ pub struct DosKernel {
     // the format AH=47h returns. The current directory is global in DOS, so it is
     // not saved or restored across EXEC.
     cwd: String,
+    // AH=0Eh/19h selected default drive, 0=A:. None means the boot default C:.
+    current_drive: Option<u8>,
     // AH=2Eh/54h write-verify flag. The HLE writes host files directly, so this has
     // no datapath effect; it only round-trips for guests that read it back.
     verify_flag: bool,
@@ -1006,9 +1052,17 @@ pub struct DosKernel {
     // Handles a guest has opened on the EMMXXXX0 device (AH=3Dh), so AH=44h IOCTL
     // and AH=3Eh close treat them as the device rather than a host file.
     ems_handles: HashSet<u16>,
-    // AH=59h extended error: the last DOS error code reported to a guest. Held until
-    // the next error overwrites it (DOS does not clear it on a successful call).
-    last_error: u16,
+    // AH=59h extended error state. Held until the next error, or AX=5D0Ah, overwrites
+    // it (DOS does not clear it on a successful call).
+    extended_error: ExtendedError,
+    // AH=69h volume serial/label stored in the C: extended BPB facade.
+    volume_serial: u32,
+    volume_label: Option<[u8; 11]>,
+    // AX=440Dh/CX=0847h and 0867h disk access flag. This round-trips only;
+    // enforce it when raw sector I/O exists.
+    media_access_disabled: bool,
+    // AX=5E00h/5E01h Microsoft Networks machine name.
+    machine_name: Option<([u8; DOS_MACHINE_NAME_LEN], u8)>,
     // Active INT 24h critical-error callback state. None outside the callback.
     critical_error: Option<ActiveCriticalError>,
     // Far pointers (segment, offset) to CONFIG.SYS-loaded device-driver headers,
@@ -1047,6 +1101,81 @@ impl DosKernel {
     pub fn write_boot_message(&mut self, text: &str) {
         self.stdout.extend_from_slice(text.as_bytes());
         self.stdout.extend_from_slice(b"\r\n");
+    }
+
+    /// Set the apparent DOS version returned by INT 21h AH=30h. The word uses the
+    /// AH=30h register layout: low byte major, high byte minor. Passing zero
+    /// restores the true DOS version.
+    pub fn set_reported_version_word(&mut self, version: u16) {
+        self.reported_version_override = (version != 0).then_some(version);
+    }
+
+    fn reported_version_word(&self) -> u16 {
+        self.reported_version_override
+            .unwrap_or(TOKA_DOS_VERSION_WORD)
+    }
+
+    fn current_drive(&self) -> u8 {
+        self.current_drive.unwrap_or(2)
+    }
+
+    fn logical_drive_count(&self) -> u8 {
+        self.lastdrive
+            .unwrap_or(DEFAULT_LASTDRIVE_COUNT)
+            .clamp(5, 26)
+    }
+
+    fn dos_drive_index(&self, drive: u8) -> Option<u8> {
+        if drive == 0 {
+            Some(self.current_drive())
+        } else if (1..=26).contains(&drive) {
+            Some(drive - 1)
+        } else {
+            None
+        }
+    }
+
+    fn drive_is_mounted_c(&self, drive: u8) -> bool {
+        self.dos_drive_index(drive) == Some(2)
+    }
+
+    /// Update AH=59h class/action/locus fields from a DOS internal error table.
+    /// Each four-byte record is code, class, action, locus; 0xFF in a field means
+    /// "leave unchanged", and a code byte of 0xFF terminates the table.
+    pub fn set_extended_error_from_table(
+        &mut self,
+        mem: &Memory,
+        seg: u16,
+        off: u16,
+    ) -> Result<u16, DosError> {
+        let wanted = self.extended_error.code as u8;
+        let mut cursor = off;
+        for _ in 0..=u16::MAX / 4 {
+            let base = usize::from(seg) * 16 + usize::from(cursor);
+            let code = mem.read_u8(base)?;
+            if code == 0xff {
+                cursor = cursor.wrapping_add(1);
+                break;
+            }
+            let class = mem.read_u8(base + 1)?;
+            let action = mem.read_u8(base + 2)?;
+            let locus = mem.read_u8(base + 3)?;
+            cursor = cursor.wrapping_add(4);
+            if code == wanted {
+                if class != 0xff {
+                    self.extended_error.bx =
+                        (u16::from(class) << 8) | (self.extended_error.bx & 0x00ff);
+                }
+                if action != 0xff {
+                    self.extended_error.bx = (self.extended_error.bx & 0xff00) | u16::from(action);
+                }
+                if locus != 0xff {
+                    self.extended_error.ch = locus;
+                }
+                break;
+            }
+        }
+        Ok(cursor)
     }
 
     /// Replace the wall clock (host-time wiring is a later option; default is fixed).
@@ -1267,7 +1396,8 @@ impl DosKernel {
         mem: &mut Memory,
         request: CriticalErrorRequest,
     ) -> Result<CriticalErrorCall, DosError> {
-        self.last_error = critical_error_to_extended_error(request.error_code);
+        self.extended_error =
+            ExtendedError::from_code(critical_error_to_extended_error(request.error_code));
         self.critical_error = Some(ActiveCriticalError {
             drive: request.drive,
         });
@@ -1292,6 +1422,12 @@ impl DosKernel {
                 && !self.ems_handles.contains(h)
                 && !self.device_handles.contains_key(h)
         })
+    }
+
+    fn has_live_handle_at_or_above(&self, limit: u16) -> bool {
+        self.open_files.keys().any(|&handle| handle >= limit)
+            || self.ems_handles.iter().any(|&handle| handle >= limit)
+            || self.device_handles.keys().any(|&handle| handle >= limit)
     }
 
     /// Find a loaded CHARACTER device whose name matches `name`, the way DOS opens
@@ -1447,6 +1583,122 @@ impl DosKernel {
             }
         }
         entries
+    }
+
+    fn publish_sysvars(&mut self, mem: &mut Memory) -> Result<(u16, u16), DosError> {
+        let first_mcb = self.arena.first_mcb();
+        let ems_present = self.ems_present;
+        let lastdrive = self.lastdrive;
+        let file_count = self.file_count();
+        let host_files = self.sft_host_file_entries();
+        let block_dpbs = self.published_block_dpbs();
+        write_sysvars(
+            mem,
+            first_mcb,
+            ems_present,
+            lastdrive,
+            file_count,
+            SysvarsDevices {
+                host_files: &host_files,
+                block_dpbs: &block_dpbs,
+                loaded_devices: &self.loaded_devices,
+            },
+        )
+    }
+
+    pub fn publish_driver_bds(&mut self, mem: &mut Memory) -> Result<(u16, u16), DosError> {
+        let _ = self.publish_sysvars(mem)?;
+        let block_dpbs = self.published_block_dpbs();
+        write_driver_bds(
+            mem,
+            self.arena.first_mcb(),
+            self.lastdrive,
+            self.file_count(),
+            &block_dpbs,
+        )
+    }
+
+    fn publish_nls_tables(&self, mem: &mut Memory) -> Result<memory::NlsTablePointers, DosError> {
+        let block_dpbs = self.published_block_dpbs();
+        write_nls_tables(
+            mem,
+            self.arena.first_mcb(),
+            self.lastdrive,
+            self.file_count(),
+            block_dpbs.len(),
+        )
+    }
+
+    fn valid_media_id_drive(&self, drive: u8) -> bool {
+        self.drive_is_mounted_c(drive)
+    }
+
+    fn write_media_id_packet(&self, mem: &mut Memory, base: usize) -> Result<(), DosError> {
+        mem.write_u16(base, 0)?;
+        mem.write_u32(base + 2, self.volume_serial)?;
+        let label = self.volume_label.unwrap_or(C_DRIVE_VOLUME_LABEL);
+        for (index, byte) in label.into_iter().enumerate() {
+            mem.write_u8(base + 6 + index, byte)?;
+        }
+        for (index, byte) in C_DRIVE_FS_TYPE.into_iter().enumerate() {
+            mem.write_u8(base + 17 + index, byte)?;
+        }
+        Ok(())
+    }
+
+    fn read_media_id_packet(&mut self, mem: &Memory, base: usize) -> Result<bool, DosError> {
+        if mem.read_u16(base)? != 0 {
+            return Ok(false);
+        }
+        self.volume_serial = mem.read_u32(base + 2)?;
+        let mut label = [0; 11];
+        for (index, slot) in label.iter_mut().enumerate() {
+            *slot = mem.read_u8(base + 6 + index)?;
+        }
+        self.volume_label = Some(label);
+        Ok(true)
+    }
+
+    fn write_access_flag_packet(&self, mem: &mut Memory, base: usize) -> Result<(), DosError> {
+        mem.write_u8(base, 0)?;
+        mem.write_u8(base + 1, u8::from(!self.media_access_disabled))?;
+        Ok(())
+    }
+
+    fn read_access_flag_packet(&mut self, mem: &Memory, base: usize) -> Result<bool, DosError> {
+        if mem.read_u8(base)? != 0 {
+            return Ok(false);
+        }
+        self.media_access_disabled = mem.read_u8(base + 1)? == 0;
+        Ok(true)
+    }
+
+    fn published_dpb_for_drive(
+        &mut self,
+        mem: &mut Memory,
+        requested_drive: u8,
+    ) -> Result<Option<(u16, u16)>, DosError> {
+        let Some(drive) = self.dos_drive_index(requested_drive) else {
+            return Ok(None);
+        };
+        let (sysvars_seg, sysvars_off) = self.publish_sysvars(mem)?;
+        let sysvars = usize::from(sysvars_seg) * 16 + usize::from(sysvars_off);
+        let mut dpb_off = mem.read_u16(sysvars)?;
+        let mut dpb_seg = mem.read_u16(sysvars + 2)?;
+        for _ in 0..26 {
+            if dpb_seg == 0xffff && dpb_off == 0xffff {
+                return Ok(None);
+            }
+            let dpb = usize::from(dpb_seg) * 16 + usize::from(dpb_off);
+            if mem.read_u8(dpb)? == drive {
+                return Ok(Some((dpb_seg, dpb_off)));
+            }
+            let next_off = mem.read_u16(dpb + 0x19)?;
+            let next_seg = mem.read_u16(dpb + 0x1b)?;
+            dpb_off = next_off;
+            dpb_seg = next_seg;
+        }
+        Ok(None)
     }
 
     fn staged_allocation_contains(staged: &StagedDriver, linear: usize, len: usize) -> bool {
@@ -1736,6 +1988,15 @@ impl DosKernel {
         Ok(self.resolve_name(&name))
     }
 
+    fn name_targets_mounted_c(&self, name: &str) -> bool {
+        let bytes = name.as_bytes();
+        if bytes.len() >= 2 && bytes[1] == b':' {
+            bytes[0].eq_ignore_ascii_case(&b'C')
+        } else {
+            self.current_drive() == 2
+        }
+    }
+
     /// Resolve a DOS filename (drive-qualified, absolute, or relative to the
     /// current directory) to a host path under the mounted C: drive, or a DOS
     /// error code (0x02 no drive).
@@ -1743,9 +2004,7 @@ impl DosKernel {
         let Some(drive) = self.drive.as_ref() else {
             return Err(0x02);
         };
-        // A drive letter other than C: names a drive that is not mounted.
-        let bytes = name.as_bytes();
-        if bytes.len() >= 2 && bytes[1] == b':' && !bytes[0].eq_ignore_ascii_case(&b'C') {
+        if !self.name_targets_mounted_c(name) {
             return Err(0x03);
         }
         let absolute = self.absolute_dos_path(name);
@@ -2038,6 +2297,42 @@ impl DosKernel {
         Ok(DosAction::Exec { entry, child_ax })
     }
 
+    /// AH=4Bh AL=1: load a program and return its initial SS:SP and CS:IP in the
+    /// EXEC parameter block without transferring control.
+    fn exec_load_no_execute(
+        &mut self,
+        mem: &mut Memory,
+        regs: &mut DosRegs,
+    ) -> Result<DosAction, DosError> {
+        let last_exit_code = self.last_exit_code;
+        let last_exit_type = self.last_exit_type;
+        let action = self.exec_load_and_execute(mem, regs)?;
+        let DosAction::Exec { entry, child_ax } = action else {
+            return Ok(action);
+        };
+        let Some(parent) = self.program_stack.pop() else {
+            return Ok(DosAction::Continue);
+        };
+        self.arena = parent.arena;
+        self.dta = parent.dta;
+        self.find_searches = parent.find_searches;
+        self.open_files = parent.open_files;
+        self.ems_handles = parent.ems_handles;
+        self.device_handles = parent.device_handles;
+        self.last_exit_code = last_exit_code;
+        self.last_exit_type = last_exit_type;
+
+        let sp = entry.sp.wrapping_sub(2);
+        mem.write_u16((usize::from(entry.ss) * 16) + usize::from(sp), child_ax)?;
+        let epb = usize::from(regs.es) * 16 + usize::from(regs.bx);
+        mem.write_u16(epb + 0x0e, sp)?;
+        mem.write_u16(epb + 0x10, entry.ss)?;
+        mem.write_u16(epb + 0x12, entry.ip)?;
+        mem.write_u16(epb + 0x14, entry.cs)?;
+        regs.cf = false;
+        Ok(DosAction::Continue)
+    }
+
     /// Restore the parent program's DOS state after a child exits with `code`,
     /// and record the exit code/type for AH=4Dh. Called by the machine when it
     /// pops a parent frame.
@@ -2114,6 +2409,8 @@ impl DosKernel {
                 rest
             } else if spec.as_bytes().get(1) == Some(&b':') {
                 return Err(0x03); // a drive letter other than C: (we mount only C:)
+            } else if self.current_drive() != 2 {
+                return Err(0x03);
             } else {
                 spec
             };
@@ -2152,6 +2449,7 @@ impl DosKernel {
                 time: entry.time,
                 date: entry.date,
                 size: entry.size,
+                raw_name: entry.name_8_3,
                 name: find_name_from_8_3(&entry.name_8_3),
             })
             .collect::<Vec<_>>();
@@ -2181,9 +2479,13 @@ impl DosKernel {
         self.fcb_body_base(mem, base)
     }
 
-    /// The HLE mounts only C:. FCB drive byte 0 means the default drive, also C:.
-    fn fcb_drive_targets_mounted_c(drive: u8) -> bool {
-        drive == 0 || drive == 3
+    /// The HLE mounts only C:. FCB drive byte 0 means the selected default drive.
+    fn fcb_drive_targets_mounted_c(&self, drive: u8) -> bool {
+        if drive == 0 {
+            self.current_drive() == 2
+        } else {
+            drive == 3
+        }
     }
 
     /// Resolve the file named by an FCB subrecord to a host path. The FCB 8.3
@@ -2196,7 +2498,7 @@ impl DosKernel {
         base: usize,
         name_off: usize,
     ) -> Result<Result<PathBuf, ()>, DosError> {
-        if !Self::fcb_drive_targets_mounted_c(mem.read_u8(base)?) {
+        if !self.fcb_drive_targets_mounted_c(mem.read_u8(base)?) {
             return Ok(Err(()));
         }
         let name = fcb_name(mem, base, name_off)?;
@@ -2297,7 +2599,7 @@ impl DosKernel {
             regs.ax = (regs.ax & 0xff00) | 0xff;
             return Ok(DosAction::Continue);
         };
-        if !Self::fcb_drive_targets_mounted_c(mem.read_u8(base)?) {
+        if !self.fcb_drive_targets_mounted_c(mem.read_u8(base)?) {
             regs.ax = (regs.ax & 0xff00) | 0xff;
             return Ok(DosAction::Continue);
         }
@@ -2326,8 +2628,9 @@ impl DosKernel {
     /// as a directory entry into the DTA, and keep the cursor for AH=12h. AL=00h
     /// found, 0xFFh on no match or no drive. An extended FCB (0xFF prefix) carries
     /// a search attribute so directories, hidden, and system entries can be
-    /// returned; a normal FCB returns normal files only. Volume-label search
-    /// (attribute 0x08) is not modeled, the HLE having no volume label.
+    /// returned; a normal FCB returns normal files only. Extended FCB searches
+    /// with attribute 0x08 see the stored volume label and, for a pure 0x08 mask,
+    /// do not fall through to normal files.
     fn fcb_find_first(
         &mut self,
         mem: &mut Memory,
@@ -2342,34 +2645,44 @@ impl DosKernel {
         };
         let pattern = pattern_to_8_3(&name.to_ascii_uppercase());
         let mut entries = Vec::new();
-        if let Ok(read_dir) = std::fs::read_dir(drive.root()) {
-            for dirent in read_dir.flatten() {
-                let raw = dirent.file_name();
-                let Some(host) = raw.to_str() else { continue };
-                let Some(template) = host_name_to_8_3(host) else {
-                    continue;
-                };
-                if !template_matches(&template, &pattern) {
-                    continue;
+        if search_attr & 0x08 != 0 {
+            if let Some(label) = self.volume_label {
+                if template_matches(&label, &pattern) {
+                    entries.push(volume_label_find_entry(label));
                 }
-                let Ok(metadata) = dirent.metadata() else {
-                    continue;
-                };
-                let attr = if metadata.is_dir() { 0x10 } else { 0x00 };
-                // A normal FCB (search attribute 0) returns only normal files; an
-                // extended FCB's attribute also admits directories, hidden, etc.
-                if !attr_matches(attr, search_attr) {
-                    continue;
+            }
+        }
+        if search_attr != 0x08 {
+            if let Ok(read_dir) = std::fs::read_dir(drive.root()) {
+                for dirent in read_dir.flatten() {
+                    let raw = dirent.file_name();
+                    let Some(host) = raw.to_str() else { continue };
+                    let Some(template) = host_name_to_8_3(host) else {
+                        continue;
+                    };
+                    if !template_matches(&template, &pattern) {
+                        continue;
+                    }
+                    let Ok(metadata) = dirent.metadata() else {
+                        continue;
+                    };
+                    let attr = if metadata.is_dir() { 0x10 } else { 0x00 };
+                    // A normal FCB (search attribute 0) returns only normal files; an
+                    // extended FCB's attribute also admits directories, hidden, etc.
+                    if !attr_matches(attr, search_attr) {
+                        continue;
+                    }
+                    let (time, date) =
+                        dos_time_date(metadata.modified().unwrap_or(std::time::UNIX_EPOCH));
+                    entries.push(FindEntry {
+                        attr,
+                        time,
+                        date,
+                        size: metadata.len() as u32,
+                        raw_name: template,
+                        name: host.to_ascii_uppercase(),
+                    });
                 }
-                let (time, date) =
-                    dos_time_date(metadata.modified().unwrap_or(std::time::UNIX_EPOCH));
-                entries.push(FindEntry {
-                    attr,
-                    time,
-                    date,
-                    size: metadata.len() as u32,
-                    name: host.to_ascii_uppercase(),
-                });
             }
         }
         let Some(first) = entries.first().cloned() else {
@@ -2913,7 +3226,7 @@ impl DosKernel {
                 // most recent failure, covering every set_dos_error site, not just
                 // the handlers that route through fail().
                 if regs.cf {
-                    self.last_error = regs.ax;
+                    self.extended_error = ExtendedError::from_code(regs.ax);
                 }
                 Ok(action)
             }
@@ -3121,7 +3434,7 @@ impl DosKernel {
     /// return. The new (AH=59h-aware) handlers route their failures through this
     /// so the extended-error query has a value to report.
     fn fail(&mut self, regs: &mut DosRegs, code: u16) {
-        self.last_error = code;
+        self.extended_error = ExtendedError::from_code(code);
         set_dos_error(regs, code);
     }
 
@@ -3137,7 +3450,7 @@ impl DosKernel {
     /// Record a DOS error code that was discovered after the kernel yielded a
     /// follow-up action to the machine, such as a loaded-driver request failure.
     pub fn record_last_error(&mut self, code: u16) {
-        self.last_error = code;
+        self.extended_error = ExtendedError::from_code(code);
     }
 
     pub fn open_readonly_memory_file(
@@ -3189,7 +3502,28 @@ impl DosKernel {
             self.file_count(),
             published_block_count,
             SdaSnapshot {
-                last_error: self.last_error,
+                last_error: self.extended_error.code,
+                current_dta: self.dta,
+                current_psp: self.arena.psp_seg,
+                last_exit_code: self.last_exit_code,
+                last_exit_type: self.last_exit_type,
+                critical_error: self.critical_error.map(|active| SdaCriticalError {
+                    drive: active.drive,
+                }),
+            },
+        )
+    }
+
+    fn refresh_sda_list(&self, mem: &mut Memory) -> Result<(u16, u16), DosError> {
+        let published_block_count = self.published_block_dpbs().len();
+        write_sda_list(
+            mem,
+            self.arena.first_mcb(),
+            self.lastdrive,
+            self.file_count(),
+            published_block_count,
+            SdaSnapshot {
+                last_error: self.extended_error.code,
                 current_dta: self.dta,
                 current_psp: self.arena.psp_seg,
                 last_exit_code: self.last_exit_code,
@@ -3233,6 +3567,17 @@ impl DosKernel {
                     return Ok(self.ctrl_c_action());
                 }
                 regs.ax &= 0xff00;
+                regs.cf = false;
+                Ok(DosAction::Continue)
+            }
+            // AH=04h/05h: write DL to STDAUX/STDPRN. The current HLE has no
+            // serial or printer TX sink, so accept the byte and discard it.
+            0x04 | 0x05 => {
+                if self.consume_pending_ctrl_c(mem)? {
+                    return Ok(self.ctrl_c_action());
+                }
+                let ch = regs.dx as u8;
+                regs.ax = (regs.ax & 0xff00) | u16::from(ch);
                 regs.cf = false;
                 Ok(DosAction::Continue)
             }
@@ -3593,17 +3938,17 @@ impl DosKernel {
                 }
                 Ok(DosAction::Continue)
             }
-            // AH=30h: get Toka-DOS version. AL=major, AH=minor, BH=OEM, BL:CX=serial (0).
+            // AH=30h: get the apparent DOS version. AL=major, AH=minor, BH=OEM,
+            // BL:CX=serial (0). INT 2Fh AX=122Fh can change the apparent version.
             0x30 => {
-                regs.ax =
-                    u16::from(TOKA_DOS_VERSION_MAJOR) | (u16::from(TOKA_DOS_VERSION_MINOR) << 8);
+                regs.ax = self.reported_version_word();
                 regs.bx = u16::from(TOKA_DOS_OEM) << 8;
                 regs.cx = 0;
                 Ok(DosAction::Continue)
             }
-            // AH=19h: get current default drive. Only C: is mounted, so AL=2 (0=A).
+            // AH=19h: get current default drive. AL is 0=A:.
             0x19 => {
-                regs.ax = (regs.ax & 0xff00) | 0x02;
+                regs.ax = (regs.ax & 0xff00) | u16::from(self.current_drive());
                 Ok(DosAction::Continue)
             }
             // AH=25h: set interrupt vector AL to DS:DX. Writes the real guest IVT
@@ -3638,6 +3983,16 @@ impl DosKernel {
                     0xff => regs.bx,
                     country => u16::from(country),
                 };
+                if regs.dx == 0xffff {
+                    if requested == DOS_COUNTRY_US {
+                        regs.ax = DOS_COUNTRY_US;
+                        regs.bx = DOS_COUNTRY_US;
+                        regs.cf = false;
+                    } else {
+                        set_dos_error(regs, 0x02);
+                    }
+                    return Ok(DosAction::Continue);
+                }
                 if requested == DOS_COUNTRY_US {
                     let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
                     write_us_country_info(mem, base)?;
@@ -3762,6 +4117,40 @@ impl DosKernel {
                 self.dta = (regs.ds, regs.dx);
                 Ok(DosAction::Continue)
             }
+            // AH=1Bh/1Ch: old allocation-table information calls. They return
+            // the same disk geometry as AH=36h, plus DS:BX pointing at the media
+            // byte in the published DPB.
+            0x1b | 0x1c => {
+                let requested_drive = if ah == 0x1b { 0 } else { regs.dx as u8 };
+                let Some((dpb_seg, dpb_off)) =
+                    self.published_dpb_for_drive(mem, requested_drive)?
+                else {
+                    regs.ax = (regs.ax & 0xff00) | 0xff;
+                    return Ok(DosAction::Continue);
+                };
+                let dpb = usize::from(dpb_seg) * 16 + usize::from(dpb_off);
+                regs.ds = dpb_seg;
+                regs.bx = dpb_off.wrapping_add(0x17);
+                regs.dx = mem.read_u16(dpb + 0x0d)?;
+                regs.cx = mem.read_u16(dpb + 0x02)?;
+                regs.ax = (regs.ax & 0xff00) | u16::from(mem.read_u8(dpb + 0x04)?.wrapping_add(1));
+                Ok(DosAction::Continue)
+            }
+            // AH=1Fh/32h: return a pointer to the Drive Parameter Block. AH=1Fh
+            // uses the default drive; AH=32h takes DL (0=default, 1=A, ...).
+            0x1f | 0x32 => {
+                let requested_drive = if ah == 0x1f { 0 } else { regs.dx as u8 };
+                let Some((dpb_seg, dpb_off)) =
+                    self.published_dpb_for_drive(mem, requested_drive)?
+                else {
+                    regs.ax = (regs.ax & 0xff00) | 0xff;
+                    return Ok(DosAction::Continue);
+                };
+                regs.ds = dpb_seg;
+                regs.bx = dpb_off;
+                regs.ax &= 0xff00;
+                Ok(DosAction::Continue)
+            }
             // AH=2Fh: get the Disk Transfer Area into ES:BX. Default is PSP:0x80.
             0x2f => {
                 regs.es = self.dta.0;
@@ -3783,7 +4172,8 @@ impl DosKernel {
                 self.keep_process_resident(paras, mem)?;
                 Ok(DosAction::Exit((regs.ax & 0x00ff) as u8))
             }
-            // AH=33h: Ctrl-Break flag. AL=00 gets DL, AL=01 sets it from DL.
+            // AH=33h: Ctrl-Break flag and DOS 5+ true-version query. AL=00 gets
+            // DL, AL=01 sets it from DL, AL=06 returns BL=major, BH=minor.
             0x33 => {
                 match regs.ax as u8 {
                     0x00 => {
@@ -3792,7 +4182,24 @@ impl DosKernel {
                     0x01 => {
                         self.ctrl_break_enabled = regs.dx as u8 != 0;
                     }
-                    _ => {}
+                    0x02 => {
+                        let old = self.ctrl_break_enabled;
+                        self.ctrl_break_enabled = regs.dx as u8 != 0;
+                        regs.dx = (regs.dx & 0xff00) | u16::from(old);
+                    }
+                    0x03 => {
+                        regs.dx &= 0xff00;
+                    }
+                    0x04 => {}
+                    0x05 => {
+                        regs.dx = (regs.dx & 0xff00) | 3;
+                    }
+                    0x06 => {
+                        regs.bx = TOKA_DOS_VERSION_WORD;
+                        regs.dx = 0;
+                        regs.ax &= 0xff00;
+                    }
+                    _ => regs.ax = (regs.ax & 0xff00) | 0xff,
                 }
                 Ok(DosAction::Continue)
             }
@@ -3805,10 +4212,15 @@ impl DosKernel {
                 regs.cf = false;
                 Ok(DosAction::Continue)
             }
-            // AH=0Eh: select default drive. Stub: only C: exists, so report
-            // AL=1 logical drive and do not change the current drive.
+            // AH=0Eh: select default drive. AL reports the DOS 3+ potential drive
+            // count, at least LASTDRIVE= and at least five drives.
             0x0e => {
-                regs.ax = (regs.ax & 0xff00) | 0x01;
+                let drive_count = self.logical_drive_count();
+                let selected = regs.dx as u8;
+                if selected < drive_count {
+                    self.current_drive = Some(selected);
+                }
+                regs.ax = (regs.ax & 0xff00) | u16::from(drive_count);
                 Ok(DosAction::Continue)
             }
             // AH=3Ch: create or truncate a file at DS:DX (ASCIIZ). CX = attributes;
@@ -3914,6 +4326,10 @@ impl DosKernel {
             // AH=47h: get the current directory for the drive in DL (0=default,
             // 3=C:) into the 64-byte buffer at DS:SI, with no leading backslash.
             0x47 => {
+                if !self.drive_is_mounted_c(regs.dx as u8) {
+                    self.fail(regs, 0x0f);
+                    return Ok(DosAction::Continue);
+                }
                 let base = usize::from(regs.ds) * 16 + usize::from(regs.si);
                 let bytes = self.cwd.as_bytes();
                 let written = bytes.len().min(63);
@@ -3957,14 +4373,33 @@ impl DosKernel {
             // CX=bytes/sector, DX=total clusters; AX=0xFFFF means an invalid drive.
             0x36 => {
                 let drive = (regs.dx & 0xff) as u8;
-                if drive != 0 && drive != 3 {
+                if !self.drive_is_mounted_c(drive) {
                     regs.ax = 0xffff;
                     return Ok(DosAction::Continue);
                 }
-                regs.ax = 64; // sectors per cluster (64 * 512 = 32 KiB)
-                regs.cx = 512; // bytes per sector
-                regs.dx = 0xffff; // total clusters (~2 GiB)
-                regs.bx = 0xf000; // free clusters
+                regs.ax = C_DRIVE_SECTORS_PER_CLUSTER; // 64 * 512 = 32 KiB
+                regs.cx = C_DRIVE_BYTES_PER_SECTOR;
+                regs.dx = C_DRIVE_TOTAL_CLUSTERS;
+                regs.bx = C_DRIVE_FREE_CLUSTERS;
+                Ok(DosAction::Continue)
+            }
+            // AH=37h SWITCHAR/AVAILDEV. DOS 4 keeps the switch character mutable,
+            // reports devices always available for AL=02h, and makes AL=03h a no-op.
+            0x37 => {
+                match regs.ax as u8 {
+                    0x00 => {
+                        let ch = self.switch_char.unwrap_or(b'/');
+                        regs.dx = (regs.dx & 0xff00) | u16::from(ch);
+                    }
+                    0x01 => {
+                        self.switch_char = Some(regs.dx as u8);
+                    }
+                    0x02 => {
+                        regs.dx |= 0x00ff;
+                    }
+                    0x03 => {}
+                    _ => regs.ax = (regs.ax & 0xff00) | 0xff,
+                }
                 Ok(DosAction::Continue)
             }
             // AH=40h: write CX bytes from DS:DX to the handle in BX. CON handles
@@ -4191,35 +4626,46 @@ impl DosKernel {
                     }
                 };
                 let mut entries = Vec::new();
-                for dirent in read_dir.flatten() {
-                    let raw = dirent.file_name();
-                    let Some(name) = raw.to_str() else {
-                        continue; // a non-UTF-8 host name cannot be an 8.3 DOS name
-                    };
-                    let Some(file_template) = host_name_to_8_3(name) else {
-                        continue;
-                    };
-                    if !template_matches(&file_template, &pattern_template) {
-                        continue;
+                let root_search = self.drive.as_ref().is_some_and(|drive| dir == drive.root());
+                if mask & 0x08 != 0 && root_search {
+                    if let Some(label) = self.volume_label {
+                        if template_matches(&label, &pattern_template) {
+                            entries.push(volume_label_find_entry(label));
+                        }
                     }
-                    let Ok(metadata) = dirent.metadata() else {
-                        continue;
-                    };
-                    let attr = if metadata.is_dir() { 0x10 } else { 0x00 };
-                    if !attr_matches(attr, mask) {
-                        continue;
+                }
+                if mask != 0x08 {
+                    for dirent in read_dir.flatten() {
+                        let raw = dirent.file_name();
+                        let Some(name) = raw.to_str() else {
+                            continue; // a non-UTF-8 host name cannot be an 8.3 DOS name
+                        };
+                        let Some(file_template) = host_name_to_8_3(name) else {
+                            continue;
+                        };
+                        if !template_matches(&file_template, &pattern_template) {
+                            continue;
+                        }
+                        let Ok(metadata) = dirent.metadata() else {
+                            continue;
+                        };
+                        let attr = if metadata.is_dir() { 0x10 } else { 0x00 };
+                        if !attr_matches(attr, mask) {
+                            continue;
+                        }
+                        let (time, date) =
+                            dos_time_date(metadata.modified().unwrap_or(std::time::UNIX_EPOCH));
+                        entries.push(FindEntry {
+                            attr,
+                            time,
+                            date,
+                            // The DTA size field is a 32-bit dword, so a host
+                            // file over 4 GiB truncates; DOS cannot represent more.
+                            size: metadata.len() as u32,
+                            raw_name: file_template,
+                            name: name.to_ascii_uppercase(),
+                        });
                     }
-                    let (time, date) =
-                        dos_time_date(metadata.modified().unwrap_or(std::time::UNIX_EPOCH));
-                    entries.push(FindEntry {
-                        attr,
-                        time,
-                        date,
-                        // The DTA size field is a 32-bit dword, so a host
-                        // file over 4 GiB truncates; DOS cannot represent more.
-                        size: metadata.len() as u32,
-                        name: name.to_ascii_uppercase(),
-                    });
                 }
                 let Some(first) = entries.first().cloned() else {
                     self.fail_find_first(regs, 0x12);
@@ -4254,12 +4700,18 @@ impl DosKernel {
                 regs.cf = false;
                 Ok(DosAction::Continue)
             }
-            // AH=4Bh: EXEC. AL=0 (load and execute) and AL=3 (load overlay) are
-            // handled; AL=1 (load without execute) and AL=4 (background) are not
-            // implemented and return 0x01 (invalid function), marked.
+            // AH=4Bh: EXEC. AL=0 loads and executes, AL=1 loads without executing,
+            // AL=3 loads an overlay, and AL=5 marks a prepared DOS 5+ execution
+            // state. Other subfunctions fail invalid-function.
             0x4b => match regs.ax as u8 {
                 0x00 => self.exec_load_and_execute(mem, regs),
+                0x01 => self.exec_load_no_execute(mem, regs),
                 0x03 => self.exec_load_overlay(mem, regs),
+                0x05 => {
+                    regs.ax = 0;
+                    regs.cf = false;
+                    Ok(DosAction::Continue)
+                }
                 _ => {
                     set_dos_error(regs, 0x01);
                     Ok(DosAction::Continue)
@@ -4294,26 +4746,39 @@ impl DosKernel {
                 Ok(DosAction::Continue)
             }
             0x52 => {
-                let first_mcb = self.arena.first_mcb();
-                let ems_present = self.ems_present;
-                let lastdrive = self.lastdrive;
-                let file_count = self.file_count();
-                let host_files = self.sft_host_file_entries();
-                let block_dpbs = self.published_block_dpbs();
-                let (es, bx) = write_sysvars(
-                    mem,
-                    first_mcb,
-                    ems_present,
-                    lastdrive,
-                    file_count,
-                    SysvarsDevices {
-                        host_files: &host_files,
-                        block_dpbs: &block_dpbs,
-                        loaded_devices: &self.loaded_devices,
-                    },
-                )?;
+                let (es, bx) = self.publish_sysvars(mem)?;
                 regs.es = es;
                 regs.bx = bx;
+                Ok(DosAction::Continue)
+            }
+            // AH=53h: translate a BIOS Parameter Block at DS:SI into the Drive
+            // Parameter Block buffer at ES:BP. DOS preserves caller-owned DPB
+            // fields outside the BPB-derived geometry.
+            0x53 => {
+                let bpb_base = usize::from(regs.ds) * 16 + usize::from(regs.si);
+                let mut raw = [0u8; BLOCK_BPB_LEN];
+                for (index, byte) in raw.iter_mut().enumerate() {
+                    *byte = mem.read_u8(bpb_base + index)?;
+                }
+                let Some(bpb) = BlockDeviceBpb::from_bytes(&raw) else {
+                    set_dos_error(regs, 0x01);
+                    return Ok(DosAction::Continue);
+                };
+                let dpb = usize::from(regs.es) * 16 + usize::from(regs.bp);
+                mem.write_u16(dpb + 0x02, bpb.bytes_per_sector)?;
+                mem.write_u8(dpb + 0x04, bpb.cluster_mask)?;
+                mem.write_u8(dpb + 0x05, bpb.cluster_shift)?;
+                mem.write_u16(dpb + 0x06, bpb.first_fat_sector)?;
+                mem.write_u8(dpb + 0x08, bpb.fat_count)?;
+                mem.write_u16(dpb + 0x09, bpb.root_entries)?;
+                mem.write_u16(dpb + 0x0b, bpb.first_data_sector)?;
+                mem.write_u16(dpb + 0x0d, bpb.highest_cluster)?;
+                mem.write_u16(dpb + 0x0f, bpb.sectors_per_fat)?;
+                mem.write_u16(dpb + 0x11, bpb.first_root_sector)?;
+                mem.write_u8(dpb + 0x17, bpb.media)?;
+                mem.write_u16(dpb + 0x1d, 0)?;
+                mem.write_u16(dpb + 0x1f, 0xffff)?;
+                regs.cf = false;
                 Ok(DosAction::Continue)
             }
             // AH=0Dh DISK RESET: the HLE writes host files directly, so there are no
@@ -4403,8 +4868,11 @@ impl DosKernel {
                 }
             },
             // AH=67h SET HANDLE COUNT: resize the modeled per-process JFT limit.
-            // The host backing table is a HashMap, so any requested size fits.
             0x67 => {
+                if self.has_live_handle_at_or_above(regs.bx) {
+                    self.fail(regs, 0x04);
+                    return Ok(DosAction::Continue);
+                }
                 self.file_count = Some(regs.bx);
                 regs.cf = false;
                 Ok(DosAction::Continue)
@@ -4413,6 +4881,9 @@ impl DosKernel {
             // layer, so there is nothing to flush. Succeed for a valid open handle.
             0x68 | 0x6a => {
                 if self.open_files.contains_key(&regs.bx) {
+                    if ah == 0x6a {
+                        regs.ax = (regs.ax & 0x00ff) | 0x6800;
+                    }
                     regs.cf = false;
                 } else {
                     set_dos_error(regs, 0x06); // invalid handle
@@ -4533,6 +5004,26 @@ impl DosKernel {
                 }
                 Ok(DosAction::Continue)
             }
+            // AH=5Ch LOCK/UNLOCK FILE ACCESS. The HLE is single-process and has no
+            // SHARE table yet, so valid range locks are accepted as no-ops.
+            0x5c => {
+                match regs.ax as u8 {
+                    0x00 | 0x01 => {
+                        let handle = regs.bx;
+                        let valid = handle <= 4
+                            || self.open_files.contains_key(&handle)
+                            || self.ems_handles.contains(&handle)
+                            || self.device_handles.contains_key(&handle);
+                        if valid {
+                            regs.cf = false;
+                        } else {
+                            set_dos_error(regs, 0x06);
+                        }
+                    }
+                    _ => set_dos_error(regs, 0x01),
+                }
+                Ok(DosAction::Continue)
+            }
             // AH=44h IOCTL. The subfunction is in AL. The load-bearing one is AL=00h get
             // device info, which programs use to tell a console (bit 7 ISDEV set) from a
             // redirected file (clear) so they can decide whether to buffer output.
@@ -4555,7 +5046,7 @@ impl DosKernel {
                     || self.ems_handles.contains(&handle)
                     || device_handle.is_some();
                 let is_character = is_device_handle;
-                let valid_drive = matches!((regs.bx & 0x00ff) as u8, 0 | 3);
+                let valid_drive = self.drive_is_mounted_c((regs.bx & 0x00ff) as u8);
                 match regs.ax as u8 {
                     0x00 => {
                         if let Some(dev) = device_handle {
@@ -4588,6 +5079,9 @@ impl DosKernel {
                                 regs.dx = 0xc080;
                             } else {
                                 regs.dx = 0x80 | io; // bit 7 ISDEV + standard alias bits
+                                if builtin_char_ioctl_category(handle).is_some() {
+                                    regs.dx |= DOS_DEV_ATTR_DEV320;
+                                }
                             }
                             regs.cf = false;
                         } else if self.open_files.contains_key(&handle) {
@@ -4719,6 +5213,89 @@ impl DosKernel {
                         // accepted DOS 3.1+ knob is a no-op success.
                         regs.cf = false;
                     }
+                    0x0c => {
+                        // Generic character-device IOCTL. Built-in CON and PRN expose
+                        // the CP437 code-page calls; other functions still require a
+                        // real character-device driver path.
+                        let category = (regs.cx >> 8) as u8;
+                        let function = regs.cx as u8;
+                        if !valid {
+                            set_dos_error(regs, 0x06);
+                        } else if !is_character {
+                            set_dos_error(regs, 0x05);
+                        } else if !builtin_char_ioctl_supported(handle, category, function) {
+                            set_dos_error(regs, 0x01);
+                        } else {
+                            let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+                            match function {
+                                0x4a | 0x4d => {
+                                    if mem.read_u16(base + 2)? == DOS_CODE_PAGE_US {
+                                        regs.ax = 0;
+                                        regs.cf = false;
+                                    } else {
+                                        set_dos_error(regs, 0x02);
+                                    }
+                                }
+                                0x4c => {
+                                    if code_page_prepare_list_contains_active(mem, base)? {
+                                        regs.ax = 0;
+                                        regs.cf = false;
+                                    } else {
+                                        set_dos_error(regs, 0x02);
+                                    }
+                                }
+                                0x6a => {
+                                    write_selected_code_page_packet(mem, base)?;
+                                    regs.ax = 0;
+                                    regs.cf = false;
+                                }
+                                0x6b => {
+                                    write_code_page_prepare_list_packet(mem, base)?;
+                                    regs.ax = 0;
+                                    regs.cf = false;
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                    }
+                    0x0d => {
+                        // Generic block-device IOCTL. DOS 4 uses category 08h minor
+                        // 46h/66h as the lower-level path for AH=69h media ID.
+                        if !valid_drive {
+                            set_dos_error(regs, 0x0f);
+                        } else {
+                            let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+                            match regs.cx {
+                                0x0847 => {
+                                    if self.read_access_flag_packet(mem, base)? {
+                                        regs.ax = 0;
+                                        regs.cf = false;
+                                    } else {
+                                        set_dos_error(regs, 0x01);
+                                    }
+                                }
+                                0x0866 => {
+                                    self.write_media_id_packet(mem, base)?;
+                                    regs.ax = 0;
+                                    regs.cf = false;
+                                }
+                                0x0867 => {
+                                    self.write_access_flag_packet(mem, base)?;
+                                    regs.ax = 0;
+                                    regs.cf = false;
+                                }
+                                0x0846 => {
+                                    if self.read_media_id_packet(mem, base)? {
+                                        regs.ax = 0;
+                                        regs.cf = false;
+                                    } else {
+                                        set_dos_error(regs, 0x01);
+                                    }
+                                }
+                                _ => set_dos_error(regs, 0x01),
+                            }
+                        }
+                    }
                     0x0e => {
                         // Logical drive map: the C: block device has one logical drive.
                         if valid_drive {
@@ -4738,22 +5315,27 @@ impl DosKernel {
                         }
                     }
                     0x10 => {
-                        // Generic IOCTL capability by handle: the built-in character devices
-                        // accept the capability probe but do not need a private side channel.
-                        if valid {
+                        // Generic IOCTL capability by handle.
+                        let category = (regs.cx >> 8) as u8;
+                        let function = regs.cx as u8;
+                        if !valid {
+                            set_dos_error(regs, 0x06);
+                        } else if builtin_char_ioctl_supported(handle, category, function) {
                             regs.ax = 0;
                             regs.cf = false;
                         } else {
-                            set_dos_error(regs, 0x06);
+                            set_dos_error(regs, 0x01);
                         }
                     }
                     0x11 => {
-                        // Generic IOCTL capability by drive: accept the mounted C: drive.
-                        if valid_drive {
+                        // Generic IOCTL capability by drive.
+                        if !valid_drive {
+                            set_dos_error(regs, 0x0f);
+                        } else if matches!(regs.cx, 0x0846 | 0x0847 | 0x0866 | 0x0867) {
                             regs.ax = 0;
                             regs.cf = false;
                         } else {
-                            set_dos_error(regs, 0x0f);
+                            set_dos_error(regs, 0x01);
                         }
                     }
                     _ => set_dos_error(regs, 0x01), // unsupported IOCTL subfunction
@@ -4789,6 +5371,18 @@ impl DosKernel {
                         Ok(()) => regs.cf = false,
                         Err(err) => set_dos_error(regs, dos_io_error_code(&err)),
                     },
+                    0x02 | 0x03 => {
+                        let buffer_len = regs.cx;
+                        regs.cx = 2;
+                        if buffer_len >= 2 {
+                            let base = usize::from(regs.es) * 16 + usize::from(regs.di);
+                            mem.write_u16(base, 0)?;
+                        }
+                        regs.cf = false;
+                    }
+                    0x04 => {
+                        regs.cf = false;
+                    }
                     _ => set_dos_error(regs, 0x01),
                 }
                 Ok(DosAction::Continue)
@@ -4800,16 +5394,53 @@ impl DosKernel {
             // class/action/locus per code from a table; in-scope callers only read
             // AX, so the coarse mapping suffices.
             0x59 => {
-                regs.ax = self.last_error;
-                regs.bx = (0x0d << 8) | 0x05; // BH = class, BL = action
-                regs.cx = (regs.cx & 0x00ff) | (0x01 << 8); // CH = locus, CL preserved
-                regs.cf = false; // the query itself succeeds; do not overwrite last_error
+                regs.ax = self.extended_error.code;
+                regs.bx = self.extended_error.bx;
+                regs.cx = (regs.cx & 0x00ff) | (u16::from(self.extended_error.ch) << 8);
+                regs.es = self.extended_error.pointer.segment;
+                regs.di = self.extended_error.pointer.offset;
+                regs.cf = false; // the query itself succeeds; do not overwrite the saved state
                 Ok(DosAction::Continue)
             }
-            // AH=5Dh internal server functions. Only AX=5D06h is live here: it
-            // returns the DOS Swappable Data Area and the critical-error flag at
-            // byte 0. Network/server calls and AX=5D0Ah/5D0Bh remain parked.
+            // AH=5Dh internal server functions. AX=5D00h runs an INT 21h call from
+            // a DOS parameter list. AX=5D06h returns the SDA, and AX=5D0Ah stores
+            // the extended-error record that AH=59h returns.
             0x5d => match regs.ax as u8 {
+                0x00 => {
+                    let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+                    let mut nested = DosRegs {
+                        ax: mem.read_u16(base)?,
+                        bx: mem.read_u16(base + 2)?,
+                        cx: mem.read_u16(base + 4)?,
+                        dx: mem.read_u16(base + 6)?,
+                        si: mem.read_u16(base + 8)?,
+                        di: mem.read_u16(base + 10)?,
+                        bp: regs.bp,
+                        ds: mem.read_u16(base + 12)?,
+                        es: mem.read_u16(base + 14)?,
+                        ..DosRegs::default()
+                    };
+                    if nested.ax == 0x5d00 {
+                        set_dos_error(&mut nested, 0x01);
+                        *regs = nested;
+                        return Ok(DosAction::Continue);
+                    }
+                    let action = self.dispatch_int21(&mut nested, mem)?;
+                    *regs = nested;
+                    Ok(action)
+                }
+                0x01 => {
+                    regs.cf = false;
+                    Ok(DosAction::Continue)
+                }
+                0x02..=0x04 => {
+                    self.fail(regs, 0x01);
+                    Ok(DosAction::Continue)
+                }
+                0x05 => {
+                    self.fail(regs, 0x12);
+                    Ok(DosAction::Continue)
+                }
                 0x06 => {
                     let (seg, sda_off) = self.refresh_sda(mem)?;
                     regs.ds = seg;
@@ -4819,8 +5450,77 @@ impl DosKernel {
                     regs.cf = false;
                     Ok(DosAction::Continue)
                 }
-                _ => Ok(DosAction::Continue),
+                0x0b => {
+                    let (seg, list_off) = self.refresh_sda_list(mem)?;
+                    regs.ds = seg;
+                    regs.si = list_off;
+                    regs.cf = false;
+                    Ok(DosAction::Continue)
+                }
+                0x07..=0x09 => {
+                    self.fail(regs, 0x01);
+                    Ok(DosAction::Continue)
+                }
+                0x0a => {
+                    let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+                    self.extended_error = ExtendedError {
+                        code: mem.read_u16(base)?,
+                        bx: mem.read_u16(base + 2)?,
+                        ch: (mem.read_u16(base + 4)? >> 8) as u8,
+                        pointer: FarPtr {
+                            offset: mem.read_u16(base + 10)?,
+                            segment: mem.read_u16(base + 14)?,
+                        },
+                    };
+                    regs.cf = false;
+                    Ok(DosAction::Continue)
+                }
+                _ => {
+                    self.fail(regs, 0x01);
+                    Ok(DosAction::Continue)
+                }
             },
+            // AH=5Eh/5Fh Microsoft Networks services. Toka carries the local
+            // machine-name calls; redirector and printer setup calls still fail
+            // without a network redirector.
+            0x5e => {
+                match regs.ax as u8 {
+                    0x00 => {
+                        if let Some((name, number)) = &self.machine_name {
+                            write_machine_name(mem, regs.ds, regs.dx, name)?;
+                            regs.cx = (0x01 << 8) | u16::from(*number);
+                        } else {
+                            regs.cx &= 0x00ff; // CH=0: machine name is not valid.
+                        }
+                        regs.cf = false;
+                    }
+                    0x01 => {
+                        if regs.cx & 0xff00 == 0 {
+                            self.machine_name = None;
+                        } else {
+                            self.machine_name =
+                                Some((read_machine_name(mem, regs.ds, regs.dx)?, regs.cx as u8));
+                        }
+                        regs.cf = false;
+                    }
+                    _ => self.fail(regs, 0x01),
+                }
+                Ok(DosAction::Continue)
+            }
+            0x5f => {
+                match regs.ax as u8 {
+                    0x07 | 0x08 => {
+                        let drive = regs.dx as u8;
+                        if drive < self.lastdrive.unwrap_or(DEFAULT_LASTDRIVE_COUNT) {
+                            regs.cf = false;
+                        } else {
+                            self.fail(regs, 0x0f);
+                        }
+                    }
+                    _ => self.fail(regs, 0x01),
+                }
+                Ok(DosAction::Continue)
+            }
             // AH=5Ah CREATE TEMPORARY FILE: DS:DX points at an ASCIIZ directory path
             // plus 13 zero bytes. Generate a DOS 6-style 8-letter name, append it
             // (with its NUL) so the caller can read back the full path, then create
@@ -4895,6 +5595,10 @@ impl DosKernel {
             // AX=handle, CX=action taken (1 opened, 2 created, 3 truncated). On
             // failure CF=1 with the DOS code.
             0x6c => {
+                if regs.ax as u8 != 0 {
+                    self.fail(regs, 0x01);
+                    return Ok(DosAction::Continue);
+                }
                 let path = match self.resolve_open_path(mem, regs.ds, regs.si)? {
                     Ok(path) => path,
                     Err(code) => {
@@ -4975,9 +5679,7 @@ impl DosKernel {
                     self.fail(regs, 0x03);
                     return Ok(DosAction::Continue);
                 };
-                // A drive letter other than C: names an unmounted drive.
-                let bytes = name.as_bytes();
-                if bytes.len() >= 2 && bytes[1] == b':' && !bytes[0].eq_ignore_ascii_case(&b'C') {
+                if !self.name_targets_mounted_c(&name) {
                     self.fail(regs, 0x03);
                     return Ok(DosAction::Continue);
                 }
@@ -4991,6 +5693,41 @@ impl DosKernel {
                     mem.write_u8(base + i, byte)?;
                 }
                 mem.write_u8(base + written, 0)?;
+                regs.cf = false;
+                Ok(DosAction::Continue)
+            }
+            // AH=61h UNUSED: documented to return AL=0.
+            0x61 => {
+                regs.ax &= 0xff00;
+                Ok(DosAction::Continue)
+            }
+            // AH=63h DBCS lead-byte/interim-console services. CP437 has no DBCS
+            // lead ranges, so the table is just the 00h,00h terminator.
+            0x63 => {
+                match regs.ax as u8 {
+                    0x00 => {
+                        let (seg, off) = DBCS_LEAD_BYTE_TABLE_PTR;
+                        mem.write_u16(usize::from(seg) * 16 + usize::from(off), 0)?;
+                        regs.ds = seg;
+                        regs.si = off;
+                        regs.cf = false;
+                    }
+                    0x01 => {
+                        self.interim_console_flag = regs.dx as u8 & 1 != 0;
+                        regs.cf = false;
+                    }
+                    0x02 => {
+                        regs.dx = (regs.dx & 0xff00) | u16::from(self.interim_console_flag);
+                        regs.cf = false;
+                    }
+                    _ => set_dos_error(regs, 0x01),
+                }
+                Ok(DosAction::Continue)
+            }
+            // AH=64h SET DEVICE DRIVER LOOKAHEAD FLAG. The HLE console does not call
+            // character driver function 5, so the flag has no effect; MS-DOS returns
+            // no value and treats the call as successful.
+            0x64 => {
                 regs.cf = false;
                 Ok(DosAction::Continue)
             }
@@ -5015,11 +5752,50 @@ impl DosKernel {
                             regs.cf = false;
                         }
                     }
-                    0x20 => {
+                    0x02..=0x06 => {
+                        let code_page_ok = regs.bx == 0xffff || regs.bx == DOS_CODE_PAGE_US;
+                        let country_ok = regs.dx == 0xffff || regs.dx == DOS_COUNTRY_US;
+                        if !code_page_ok || !country_ok || regs.cx < 5 {
+                            set_dos_error(regs, 0x02);
+                        } else {
+                            let tables = self.publish_nls_tables(mem)?;
+                            let ptr = match regs.ax as u8 {
+                                0x02 => tables.uppercase,
+                                0x03 => tables.lowercase,
+                                0x04 => tables.filename_uppercase,
+                                0x05 => tables.filename_terminators,
+                                0x06 => tables.collating,
+                                _ => unreachable!(),
+                            };
+                            let base = usize::from(regs.es) * 16 + usize::from(regs.di);
+                            mem.write_u8(base, regs.ax as u8)?;
+                            mem.write_u16(base + 1, ptr.1)?;
+                            mem.write_u16(base + 3, ptr.0)?;
+                            regs.cx = 5;
+                            regs.cf = false;
+                        }
+                    }
+                    0x07 => {
+                        let code_page_ok = regs.bx == 0xffff || regs.bx == DOS_CODE_PAGE_US;
+                        let country_ok = regs.dx == 0xffff || regs.dx == DOS_COUNTRY_US;
+                        if !code_page_ok || !country_ok || regs.cx < 5 {
+                            set_dos_error(regs, 0x02);
+                        } else {
+                            let base = usize::from(regs.es) * 16 + usize::from(regs.di);
+                            let (seg, off) = DBCS_LEAD_BYTE_TABLE_PTR;
+                            mem.write_u16(usize::from(seg) * 16 + usize::from(off), 0)?;
+                            mem.write_u8(base, 0x07)?;
+                            mem.write_u16(base + 1, off)?;
+                            mem.write_u16(base + 3, seg)?;
+                            regs.cx = 5;
+                            regs.cf = false;
+                        }
+                    }
+                    0x20 | 0xa0 => {
                         regs.dx = (regs.dx & 0xff00) | u16::from(nls_upper(regs.dx as u8));
                         regs.cf = false;
                     }
-                    0x21 => {
+                    0x21 | 0xa1 => {
                         let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
                         for i in 0..usize::from(regs.cx) {
                             let byte = mem.read_u8(base + i)?;
@@ -5027,7 +5803,7 @@ impl DosKernel {
                         }
                         regs.cf = false;
                     }
-                    0x22 => {
+                    0x22 | 0xa2 => {
                         let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
                         for i in 0..=0xffffusize {
                             let byte = mem.read_u8(base + i)?;
@@ -5036,6 +5812,14 @@ impl DosKernel {
                             }
                             mem.write_u8(base + i, nls_upper(byte))?;
                         }
+                        regs.cf = false;
+                    }
+                    0x23 => {
+                        regs.ax = match regs.dx as u8 {
+                            b'N' | b'n' => 0,
+                            b'Y' | b'y' => 1,
+                            _ => 2,
+                        };
                         regs.cf = false;
                     }
                     _ => set_dos_error(regs, 0x01),
@@ -5056,6 +5840,55 @@ impl DosKernel {
                     0x02 => set_dos_error(regs, 0x02),
                     _ => set_dos_error(regs, 0x01),
                 }
+                Ok(DosAction::Continue)
+            }
+            // AH=69h DOS 4+ GET/SET DISK SERIAL NUMBER. The host C: facade exposes
+            // a FAT16-style extended BPB with serial, label, and filesystem type.
+            0x69 => {
+                let subfunction = regs.ax as u8;
+                let drive = regs.bx as u8;
+                let info_level = (regs.bx >> 8) as u8;
+                if info_level != 0 {
+                    self.fail(regs, 0x01);
+                    return Ok(DosAction::Continue);
+                }
+                if !self.valid_media_id_drive(drive) {
+                    self.fail(regs, 0x0f);
+                    return Ok(DosAction::Continue);
+                }
+                let base = usize::from(regs.ds) * 16 + usize::from(regs.dx);
+                match subfunction {
+                    0x00 => {
+                        self.write_media_id_packet(mem, base)?;
+                        regs.ax = 0;
+                        regs.cf = false;
+                    }
+                    0x01 => {
+                        if !self.read_media_id_packet(mem, base)? {
+                            self.fail(regs, 0x01);
+                            return Ok(DosAction::Continue);
+                        }
+                        regs.ax = 0;
+                        regs.cf = false;
+                    }
+                    _ => self.fail(regs, 0x01),
+                }
+                Ok(DosAction::Continue)
+            }
+            // AH=6Bh is a DOS 5+ null call. AH=6Dh/6Eh/6Fh are ROM-search calls;
+            // on normal non-ROM MS-DOS they report unsupported by returning AL=0.
+            0x6b | 0x6d | 0x6e | 0x6f => {
+                regs.ax &= 0xff00;
+                Ok(DosAction::Continue)
+            }
+            // AH=70h/71h are MS-DOS 7 internationalization/LFN families. Toka-DOS
+            // presents as DOS 6.22, so callers get the documented fallback errors.
+            0x70 => {
+                self.fail(regs, 0x7000);
+                Ok(DosAction::Continue)
+            }
+            0x71 => {
+                self.fail(regs, 0x7100);
                 Ok(DosAction::Continue)
             }
             // The FCB (File Control Block) file API: handle-free file ops keyed by
@@ -5079,23 +5912,29 @@ impl DosKernel {
             0x29 => self.fcb_parse_filename(mem, regs),
             0x11 => self.fcb_find_first(mem, regs),
             0x12 => self.fcb_find_next(mem, regs),
-            // Everything else is not yet implemented; later slices fill it in. An
-            // unimplemented function returns Continue so the IRET stub returns to
-            // the caller.
-            _ => Ok(DosAction::Continue),
+            // Unknown INT 21h functions fail with DOS error 1. The old CP/M null
+            // calls and DOS 5+ null call are handled explicitly above.
+            _ => {
+                self.fail(regs, 0x01);
+                Ok(DosAction::Continue)
+            }
         }
     }
 }
 
-/// Toka-DOS (Toka Disk Operating System), the Izarra 3000's MS-DOS 6.1 clone,
+/// Toka-DOS (Toka Disk Operating System), the Izarra 3000's MS-DOS 6.22 clone,
 /// is what this HLE kernel emulates. INT 21h AH=30h reports its version.
 const TOKA_DOS_VERSION_MAJOR: u8 = 6;
-const TOKA_DOS_VERSION_MINOR: u8 = 10; // 6.10, the .NN-hundredths convention (6.20 -> 20)
+const TOKA_DOS_VERSION_MINOR: u8 = 22; // 6.22, the .NN-hundredths convention (6.20 -> 20)
+const TOKA_DOS_VERSION_WORD: u16 =
+    (TOKA_DOS_VERSION_MAJOR as u16) | ((TOKA_DOS_VERSION_MINOR as u16) << 8);
 const TOKA_DOS_OEM: u8 = 0xff;
 const DOS_COUNTRY_US: u16 = 1;
 const DOS_CODE_PAGE_US: u16 = 437;
 const DOS_COUNTRY_INFO_LEN: usize = 34;
 const DOS_EXT_COUNTRY_INFO_LEN: usize = 41;
+const DOS_MACHINE_NAME_LEN: usize = 15;
+const DOS_DEV_ATTR_DEV320: u16 = 0x0040;
 const DOS_INT27_MIN_RESIDENT_BYTES: u16 = 0x0060;
 
 fn write_us_country_info(mem: &mut Memory, base: usize) -> Result<(), DosError> {
@@ -5115,6 +5954,45 @@ fn write_us_country_info(mem: &mut Memory, base: usize) -> Result<(), DosError> 
 
 fn nls_upper(byte: u8) -> u8 {
     byte.to_ascii_uppercase()
+}
+
+fn builtin_char_ioctl_category(handle: u16) -> Option<u8> {
+    match handle {
+        0..=2 => Some(0x03), // CON
+        4 => Some(0x05),     // PRN/LPT
+        _ => None,
+    }
+}
+
+fn builtin_char_ioctl_supported(handle: u16, category: u8, function: u8) -> bool {
+    builtin_char_ioctl_category(handle) == Some(category)
+        && matches!(function, 0x4a | 0x4c | 0x4d | 0x6a | 0x6b)
+}
+
+fn write_selected_code_page_packet(mem: &mut Memory, base: usize) -> Result<(), DosError> {
+    mem.write_u16(base, 4)?;
+    mem.write_u16(base + 2, DOS_CODE_PAGE_US)?;
+    mem.write_u16(base + 4, 0)?;
+    Ok(())
+}
+
+fn write_code_page_prepare_list_packet(mem: &mut Memory, base: usize) -> Result<(), DosError> {
+    mem.write_u16(base, 8)?;
+    mem.write_u16(base + 2, 1)?;
+    mem.write_u16(base + 4, DOS_CODE_PAGE_US)?;
+    mem.write_u16(base + 6, 1)?;
+    mem.write_u16(base + 8, DOS_CODE_PAGE_US)?;
+    Ok(())
+}
+
+fn code_page_prepare_list_contains_active(mem: &Memory, base: usize) -> Result<bool, DosError> {
+    let count = usize::from(mem.read_u16(base + 4)?);
+    for index in 0..count.min(64) {
+        if mem.read_u16(base + 6 + index * 2)? == DOS_CODE_PAGE_US {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The largest .COM image: a 64 KiB segment minus the 256-byte PSP.
@@ -5761,6 +6639,17 @@ fn find_name_from_8_3(name: &[u8; 11]) -> String {
     }
 }
 
+fn volume_label_find_entry(label: [u8; 11]) -> FindEntry {
+    FindEntry {
+        attr: 0x08,
+        time: 0,
+        date: (1 << 5) | 1, // 1980-01-01
+        size: 0,
+        raw_name: label,
+        name: String::from_utf8_lossy(&label).into_owned(),
+    }
+}
+
 /// RBIL: for masks other than the volume-label bit, a file matches if it has at
 /// most the masked special attributes. Host files carry only "normal" (0x00) or
 /// "directory" (0x10): a normal file always matches; a directory matches only when
@@ -5832,7 +6721,9 @@ fn write_fcb_find_record(
     } else {
         mem.write_u8(base, FCB_FIND_DRIVE)?;
     }
-    fcb_set_name(mem, dirent - 1, &entry.name)?; // name at the entry start, ext +8
+    for (index, byte) in entry.raw_name.into_iter().enumerate() {
+        mem.write_u8(dirent + index, byte)?;
+    }
     mem.write_u8(dirent + 0x0b, entry.attr)?; // entry+0x0B attribute
     // entry+0x0C reserved (10 bytes) stays zero
     mem.write_u16(dirent + 0x16, entry.time)?; // entry+0x16 time
@@ -6133,6 +7024,37 @@ fn read_asciiz(mem: &Memory, seg: u16, off: u16) -> Result<Option<String>, DosEr
 
 pub fn read_dos_asciiz(mem: &Memory, seg: u16, off: u16) -> Result<Option<String>, DosError> {
     read_asciiz(mem, seg, off)
+}
+
+fn read_machine_name(
+    mem: &Memory,
+    seg: u16,
+    off: u16,
+) -> Result<[u8; DOS_MACHINE_NAME_LEN], DosError> {
+    let base = usize::from(seg) * 16 + usize::from(off);
+    let mut name = [b' '; DOS_MACHINE_NAME_LEN];
+    for (index, slot) in name.iter_mut().enumerate() {
+        let byte = mem.read_u8(base + index)?;
+        if byte == 0 {
+            break;
+        }
+        *slot = byte;
+    }
+    Ok(name)
+}
+
+fn write_machine_name(
+    mem: &mut Memory,
+    seg: u16,
+    off: u16,
+    name: &[u8; DOS_MACHINE_NAME_LEN],
+) -> Result<(), DosError> {
+    let base = usize::from(seg) * 16 + usize::from(off);
+    for (index, byte) in name.iter().enumerate() {
+        mem.write_u8(base + index, *byte)?;
+    }
+    mem.write_u8(base + DOS_MACHINE_NAME_LEN, 0)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -6892,6 +7814,101 @@ mod tests {
         kernel.dispatch(0x21, &mut get, &mut mem).unwrap();
 
         assert_eq!(get.dx & 0x00ff, 1, "AH=33h reports the stored BREAK flag");
+
+        let mut set_and_get = DosRegs {
+            ax: 0x3302,
+            dx: 0x0000,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut set_and_get, &mut mem).unwrap();
+        assert_eq!(
+            set_and_get.dx & 0x00ff,
+            1,
+            "AX=3302h returns the old BREAK flag"
+        );
+
+        let mut get_after = DosRegs {
+            ax: 0x3300,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut get_after, &mut mem).unwrap();
+        assert_eq!(get_after.dx & 0x00ff, 0, "AX=3302h updates the BREAK flag");
+
+        let mut cpsw = DosRegs {
+            ax: 0x3303,
+            dx: 0x1201,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut cpsw, &mut mem).unwrap();
+        assert_eq!(cpsw.dx, 0x1200, "CPSW is parked off");
+
+        let mut boot = DosRegs {
+            ax: 0x3305,
+            dx: 0x1200,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut boot, &mut mem).unwrap();
+        assert_eq!(boot.dx, 0x1203, "Toka-DOS boots from C:");
+
+        let mut bad = DosRegs {
+            ax: 0x3307,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut bad, &mut mem).unwrap();
+        assert_eq!(bad.ax & 0x00ff, 0xff);
+    }
+
+    #[test]
+    fn ah37_switch_char_round_trips_and_availdev_matches_dos4() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+
+        let mut get_default = DosRegs {
+            ax: 0x3700,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut get_default, &mut mem).unwrap();
+        assert_eq!(get_default.dx & 0x00ff, u16::from(b'/'));
+
+        let mut set = DosRegs {
+            ax: 0x3701,
+            dx: u16::from(b'-'),
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut set, &mut mem).unwrap();
+        let mut get_changed = DosRegs {
+            ax: 0x3700,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut get_changed, &mut mem).unwrap();
+        assert_eq!(get_changed.dx & 0x00ff, u16::from(b'-'));
+
+        let mut avail = DosRegs {
+            ax: 0x3702,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut avail, &mut mem).unwrap();
+        assert_eq!(avail.dx & 0x00ff, 0xff, "DOS 4 reports AVAILDEV on");
+
+        let mut set_avail = DosRegs {
+            ax: 0x3703,
+            dx: 0,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut set_avail, &mut mem).unwrap();
+        let mut still_avail = DosRegs {
+            ax: 0x3702,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut still_avail, &mut mem).unwrap();
+        assert_eq!(still_avail.dx & 0x00ff, 0xff, "AL=03h is a no-op in DOS 4");
+
+        let mut invalid = DosRegs {
+            ax: 0x3704,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut invalid, &mut mem).unwrap();
+        assert_eq!(invalid.ax & 0x00ff, 0xff);
     }
 
     #[test]
@@ -7926,6 +8943,102 @@ mod tests {
     }
 
     #[test]
+    fn ah44_generic_character_ioctl_reports_and_selects_cp437() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let base = 0x0100usize * 16 + 0x0200;
+
+        let mut info = DosRegs {
+            ax: 0x4400,
+            bx: 1,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut info, &mut mem).unwrap();
+        assert!(!info.cf);
+        assert_ne!(info.dx & DOS_DEV_ATTR_DEV320, 0);
+
+        let mut cap = DosRegs {
+            ax: 0x4410,
+            bx: 1,
+            cx: 0x036a,
+            cf: true,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut cap, &mut mem).unwrap();
+        assert!(!cap.cf);
+        assert_eq!(cap.ax, 0);
+
+        let mut query = DosRegs {
+            ax: 0x440c,
+            bx: 1,
+            cx: 0x036a,
+            ds: 0x0100,
+            dx: 0x0200,
+            cf: true,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut query, &mut mem).unwrap();
+        assert!(!query.cf);
+        assert_eq!(mem.read_u16(base).unwrap(), 4);
+        assert_eq!(mem.read_u16(base + 2).unwrap(), DOS_CODE_PAGE_US);
+        assert_eq!(mem.read_u16(base + 4).unwrap(), 0);
+
+        let mut select = DosRegs {
+            ax: 0x440c,
+            bx: 1,
+            cx: 0x034a,
+            ds: 0x0100,
+            dx: 0x0200,
+            cf: true,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut select, &mut mem).unwrap();
+        assert!(!select.cf);
+
+        mem.write_u16(base + 2, 850).unwrap();
+        let mut bad_select = DosRegs {
+            ax: 0x440c,
+            bx: 1,
+            cx: 0x034a,
+            ds: 0x0100,
+            dx: 0x0200,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut bad_select, &mut mem).unwrap();
+        assert!(bad_select.cf);
+        assert_eq!(bad_select.ax, 0x02);
+
+        let mut list = DosRegs {
+            ax: 0x440c,
+            bx: 1,
+            cx: 0x036b,
+            ds: 0x0100,
+            dx: 0x0200,
+            cf: true,
+            ..Default::default()
+        };
+        kernel.dispatch(0x21, &mut list, &mut mem).unwrap();
+        assert!(!list.cf);
+        assert_eq!(mem.read_u16(base).unwrap(), 8);
+        assert_eq!(mem.read_u16(base + 2).unwrap(), 1);
+        assert_eq!(mem.read_u16(base + 4).unwrap(), DOS_CODE_PAGE_US);
+        assert_eq!(mem.read_u16(base + 6).unwrap(), 1);
+        assert_eq!(mem.read_u16(base + 8).unwrap(), DOS_CODE_PAGE_US);
+
+        let mut wrong_category = DosRegs {
+            ax: 0x4410,
+            bx: 1,
+            cx: 0x016a,
+            ..Default::default()
+        };
+        kernel
+            .dispatch(0x21, &mut wrong_category, &mut mem)
+            .unwrap();
+        assert!(wrong_category.cf);
+        assert_eq!(wrong_category.ax, 0x01);
+    }
+
+    #[test]
     fn ah18_null_function_returns_al_zero() {
         let mut kernel = DosKernel::new();
         let mut mem = Memory::new(64 * 1024).unwrap();
@@ -8155,7 +9268,7 @@ mod tests {
         kernel.dispatch(0x21, &mut retry, &mut mem).unwrap();
         assert!(!retry.cf, "sharing retry stub succeeds");
 
-        for ax in [0x440e, 0x440f, 0x4411] {
+        for ax in [0x440e, 0x440f] {
             let mut regs = DosRegs {
                 ax,
                 bx: 0x0003, // C:
@@ -8173,8 +9286,18 @@ mod tests {
             ..DosRegs::default()
         };
         kernel.dispatch(0x21, &mut cap, &mut mem).unwrap();
-        assert!(!cap.cf, "handle capability stub succeeds");
-        assert_eq!(cap.ax, 0);
+        assert!(cap.cf, "handle capability reports unavailable");
+        assert_eq!(cap.ax, 0x01);
+
+        let mut drive_cap = DosRegs {
+            ax: 0x4411,
+            bx: 0x0003, // C:
+            cf: false,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut drive_cap, &mut mem).unwrap();
+        assert!(drive_cap.cf, "drive capability reports unavailable");
+        assert_eq!(drive_cap.ax, 0x01);
     }
 
     #[test]
@@ -8210,6 +9333,42 @@ mod tests {
         assert!(!regs.cf);
         assert_eq!(regs.dx, date);
         assert_eq!(regs.cx, time);
+
+        let ea_base = 0x0100usize * 16 + 0x0300;
+        mem.write_u16(ea_base, 0xffff).unwrap();
+        let mut get_eas = DosRegs {
+            ax: 0x5702,
+            bx: handle,
+            cx: 2,
+            es: 0x0100,
+            di: 0x0300,
+            cf: true,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut get_eas, &mut mem).unwrap();
+        assert!(!get_eas.cf);
+        assert_eq!(get_eas.cx, 2);
+        assert_eq!(mem.read_u16(ea_base).unwrap(), 0, "no extended attributes");
+
+        let mut get_ea_props = DosRegs {
+            ax: 0x5703,
+            bx: handle,
+            cx: 0,
+            cf: true,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut get_ea_props, &mut mem).unwrap();
+        assert!(!get_ea_props.cf);
+        assert_eq!(get_ea_props.cx, 2);
+
+        let mut set_eas = DosRegs {
+            ax: 0x5704,
+            bx: handle,
+            cf: true,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut set_eas, &mut mem).unwrap();
+        assert!(!set_eas.cf);
     }
 
     #[test]
@@ -8463,16 +9622,25 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_int21_function_is_noop() {
+    fn unknown_int21_function_fails_invalid_function() {
         let mut mem = Memory::new(4096).unwrap();
         let mut regs = DosRegs {
-            ax: 0x4400, // AH=44h IOCTL, not implemented
+            ax: 0x7200,
             ..DosRegs::default()
         };
         let mut kernel = DosKernel::new();
         let action = kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
         assert_eq!(action, DosAction::Continue);
+        assert!(regs.cf);
+        assert_eq!(regs.ax, 0x0001);
         assert!(kernel.stdout().is_empty());
+
+        let mut err = DosRegs {
+            ax: 0x5900,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut err, &mut mem).unwrap();
+        assert_eq!(err.ax, 0x0001);
     }
 
     #[test]
@@ -8485,8 +9653,52 @@ mod tests {
         let mut kernel = DosKernel::new();
         kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
         assert_eq!(regs.ax & 0x00ff, 6); // AL = major
-        assert_eq!(regs.ax >> 8, 10); // AH = minor (6.10)
+        assert_eq!(regs.ax >> 8, 22); // AH = minor (6.22)
         assert_eq!(regs.bx >> 8, 0xff); // BH = OEM
+    }
+
+    #[test]
+    fn ah33_06_reports_true_toka_dos_version() {
+        let mut mem = Memory::new(4096).unwrap();
+        let mut regs = DosRegs {
+            ax: 0x3306,
+            ..DosRegs::default()
+        };
+        let mut kernel = DosKernel::new();
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+        assert_eq!(regs.bx & 0x00ff, 6); // BL = major
+        assert_eq!(regs.bx >> 8, 22); // BH = minor
+        assert_eq!(regs.dx, 0); // revision and flags
+        assert_ne!(regs.ax as u8, 0xff);
+    }
+
+    #[test]
+    fn reported_version_override_affects_ah30_only() {
+        let mut mem = Memory::new(4096).unwrap();
+        let mut kernel = DosKernel::new();
+        kernel.set_reported_version_word(0x0005); // 5.00
+
+        let mut apparent = DosRegs {
+            ax: 0x3000,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut apparent, &mut mem).unwrap();
+        assert_eq!(apparent.ax, 0x0005);
+
+        let mut true_version = DosRegs {
+            ax: 0x3306,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut true_version, &mut mem).unwrap();
+        assert_eq!(true_version.bx, 0x1606);
+
+        kernel.set_reported_version_word(0);
+        let mut restored = DosRegs {
+            ax: 0x3000,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut restored, &mut mem).unwrap();
+        assert_eq!(restored.ax, 0x1606);
     }
 
     #[test]
@@ -8725,6 +9937,20 @@ mod tests {
         let too_many = open(&mut kernel, &mut mem);
         assert!(too_many.cf);
         assert_eq!(too_many.ax, 0x04);
+
+        let mut shrink = DosRegs {
+            ax: 0x6700,
+            bx: 7,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut shrink, &mut mem).unwrap();
+        assert!(shrink.cf, "cannot shrink away live handle 7");
+        assert_eq!(shrink.ax, 0x04);
+        assert_eq!(
+            kernel.file_count(),
+            8,
+            "failed shrink leaves count unchanged"
+        );
     }
 
     #[test]
@@ -8888,6 +10114,46 @@ mod tests {
         kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
         assert!(!regs.cf);
         assert_eq!(regs.ax, 5);
+    }
+
+    #[test]
+    fn ah5c_lock_unlock_validates_handle_and_subfunction() {
+        let (mut kernel, mut mem, _dir) =
+            kernel_with_drive(&[("LOCK.TXT", b"data")], r"C:\LOCK.TXT");
+        let opened = open(&mut kernel, &mut mem);
+        assert!(!opened.cf);
+        let handle = opened.ax;
+
+        for al in [0x00u16, 0x01] {
+            let mut regs = DosRegs {
+                ax: 0x5c00 | al,
+                bx: handle,
+                dx: 4,
+                di: 8,
+                cf: true,
+                ..DosRegs::default()
+            };
+            kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+            assert!(!regs.cf, "lock/unlock succeeds for a valid handle");
+        }
+
+        let mut bad_function = DosRegs {
+            ax: 0x5c02,
+            bx: handle,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut bad_function, &mut mem).unwrap();
+        assert!(bad_function.cf);
+        assert_eq!(bad_function.ax, 0x01);
+
+        let mut bad_handle = DosRegs {
+            ax: 0x5c00,
+            bx: 0x7777,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut bad_handle, &mut mem).unwrap();
+        assert!(bad_handle.cf);
+        assert_eq!(bad_handle.ax, 0x06);
     }
 
     #[test]
@@ -9093,6 +10359,9 @@ mod tests {
             };
             kernel.dispatch(0x21, &mut commit, &mut mem).unwrap();
             assert!(!commit.cf, "commit {ax:#06x} succeeds");
+            if ax == 0x6a00 {
+                assert_eq!(commit.ax >> 8, 0x68, "AH=6Ah returns AH=68h");
+            }
         }
 
         let closed = close(&mut kernel, &mut mem, handle);
@@ -9682,12 +10951,99 @@ mod tests {
         assert_eq!(mem.read_u8(base + 0x0d).unwrap(), b':');
         assert_eq!(mem.read_u8(base + 0x10).unwrap(), 2);
         assert_eq!(mem.read_u8(base + 0x16).unwrap(), b',');
+
+        let sentinel = 0x0100usize * 16 + 0x00ff;
+        mem.write_u8(sentinel, 0x5a).unwrap();
+        let mut set_us = DosRegs {
+            ax: 0x3801,
+            bx: 0xffff,
+            ds: 0x0100,
+            dx: 0xffff,
+            cf: true,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut set_us, &mut mem).unwrap();
+        assert!(!set_us.cf);
+        assert_eq!(set_us.ax, DOS_COUNTRY_US);
+        assert_eq!(set_us.bx, DOS_COUNTRY_US);
+        assert_eq!(
+            mem.read_u8(sentinel).unwrap(),
+            0x5a,
+            "set-country does not write a country-info buffer"
+        );
+
+        let mut set_unknown = DosRegs {
+            ax: 0x382c,
+            dx: 0xffff,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut set_unknown, &mut mem).unwrap();
+        assert!(set_unknown.cf);
+        assert_eq!(set_unknown.ax, 0x0002);
+    }
+
+    #[test]
+    fn ah61_ah63_and_ah64_return_unused_dbcs_and_lookahead_state() {
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let mut kernel = DosKernel::new();
+
+        let mut unused = DosRegs {
+            ax: 0x61ff,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut unused, &mut mem).unwrap();
+        assert_eq!(unused.ax & 0x00ff, 0);
+
+        let mut table = DosRegs {
+            ax: 0x6300,
+            cf: true,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut table, &mut mem).unwrap();
+        assert!(!table.cf);
+        let table_base = usize::from(table.ds) * 16 + usize::from(table.si);
+        assert_eq!(
+            mem.read_u16(table_base).unwrap(),
+            0,
+            "CP437 has no DBCS lead ranges"
+        );
+
+        let mut set = DosRegs {
+            ax: 0x6301,
+            dx: 1,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut set, &mut mem).unwrap();
+        let mut get = DosRegs {
+            ax: 0x6302,
+            dx: 0x1200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut get, &mut mem).unwrap();
+        assert_eq!(get.dx, 0x1201);
+
+        let mut invalid = DosRegs {
+            ax: 0x6303,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut invalid, &mut mem).unwrap();
+        assert!(invalid.cf);
+        assert_eq!(invalid.ax, 0x01);
+
+        let mut lookahead = DosRegs {
+            ax: 0x6401,
+            cf: true,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut lookahead, &mut mem).unwrap();
+        assert!(!lookahead.cf);
     }
 
     #[test]
     fn ah65_returns_country_info_and_capitalizes_ascii() {
         let mut mem = Memory::new(64 * 1024).unwrap();
         let mut kernel = DosKernel::new();
+        kernel.init_program(0x0100, 0x0200, &mut mem).unwrap();
         let mut info = DosRegs {
             ax: 0x6501,
             bx: 0xffff,
@@ -9709,6 +11065,74 @@ mod tests {
         assert_eq!(mem.read_u16(info_base + 5).unwrap(), 437);
         assert_eq!(mem.read_u16(info_base + 7).unwrap(), 0);
         assert_eq!(mem.read_u8(info_base + 9).unwrap(), b'$');
+
+        let mut dbcs = DosRegs {
+            ax: 0x6507,
+            bx: 0xffff,
+            cx: 5,
+            dx: 0xffff,
+            es: 0x0100,
+            di: 0x0340,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut dbcs, &mut mem).unwrap();
+        assert!(!dbcs.cf);
+        assert_eq!(dbcs.cx, 5);
+        let dbcs_info = 0x0100usize * 16 + 0x0340;
+        let (dbcs_seg, dbcs_off) = DBCS_LEAD_BYTE_TABLE_PTR;
+        assert_eq!(mem.read_u8(dbcs_info).unwrap(), 0x07);
+        assert_eq!(mem.read_u16(dbcs_info + 1).unwrap(), dbcs_off);
+        assert_eq!(mem.read_u16(dbcs_info + 3).unwrap(), dbcs_seg);
+        let dbcs_table = usize::from(dbcs_seg) * 16 + usize::from(dbcs_off);
+        assert_eq!(mem.read_u16(dbcs_table).unwrap(), 0);
+
+        let pointer_info = [
+            (0x6502u16, 0x80u16, 0x02usize, 0x80u8),
+            (0x6503, 0x100, 0x02 + usize::from(b'A'), b'a'),
+            (0x6504, 0x80, 0x02, 0x80),
+            (0x6506, 0x100, 0x02 + usize::from(b'A'), b'A'),
+        ];
+        for (index, (ax, table_len, sample_off, sample)) in pointer_info.iter().enumerate() {
+            let mut regs = DosRegs {
+                ax: *ax,
+                bx: 0xffff,
+                cx: 5,
+                dx: 0xffff,
+                es: 0x0100,
+                di: 0x0360 + index as u16 * 8,
+                ..DosRegs::default()
+            };
+            kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+            assert!(!regs.cf, "AX={ax:04X}h succeeds");
+            assert_eq!(regs.cx, 5);
+            let record = 0x0100usize * 16 + usize::from(regs.di);
+            assert_eq!(mem.read_u8(record).unwrap(), *ax as u8);
+            let table_off = mem.read_u16(record + 1).unwrap();
+            let table_seg = mem.read_u16(record + 3).unwrap();
+            let table = usize::from(table_seg) * 16 + usize::from(table_off);
+            assert_eq!(mem.read_u16(table).unwrap(), *table_len);
+            assert_eq!(mem.read_u8(table + sample_off).unwrap(), *sample);
+        }
+
+        let mut terminators = DosRegs {
+            ax: 0x6505,
+            bx: 0xffff,
+            cx: 5,
+            dx: 0xffff,
+            es: 0x0100,
+            di: 0x0388,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut terminators, &mut mem).unwrap();
+        assert!(!terminators.cf);
+        let term_record = 0x0100usize * 16 + 0x0388;
+        let term_off = mem.read_u16(term_record + 1).unwrap();
+        let term_seg = mem.read_u16(term_record + 3).unwrap();
+        let term_table = usize::from(term_seg) * 16 + usize::from(term_off);
+        assert_eq!(mem.read_u16(term_table).unwrap(), 22);
+        assert_eq!(mem.read_u8(term_table + 0x09).unwrap(), 14);
+        assert_eq!(mem.read_u8(term_table + 0x0a).unwrap(), b'.');
+        assert_eq!(mem.read_u8(term_table + 0x0d).unwrap(), b'\\');
 
         let mut ch = DosRegs {
             ax: 0x6520,
@@ -9752,6 +11176,40 @@ mod tests {
         assert_eq!(mem.read_u8(0x0100usize * 16 + asciiz + 1).unwrap(), b'O');
         assert_eq!(mem.read_u8(0x0100usize * 16 + asciiz + 2).unwrap(), b'S');
         assert_eq!(mem.read_u8(0x0100usize * 16 + asciiz + 3).unwrap(), 0);
+
+        for (byte, class) in [(b'N', 0), (b'y', 1), (b'?', 2)] {
+            let mut yes_no = DosRegs {
+                ax: 0x6523,
+                dx: u16::from(byte),
+                ..DosRegs::default()
+            };
+            kernel.dispatch(0x21, &mut yes_no, &mut mem).unwrap();
+            assert!(!yes_no.cf);
+            assert_eq!(yes_no.ax, class);
+        }
+
+        let mut filename_ch = DosRegs {
+            ax: 0x65a0,
+            dx: u16::from(b'z'),
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut filename_ch, &mut mem).unwrap();
+        assert!(!filename_ch.cf);
+        assert_eq!(filename_ch.dx, u16::from(b'Z'));
+
+        for (i, byte) in b"file\0".iter().enumerate() {
+            mem.write_u8(0x0100usize * 16 + 0x0420 + i, *byte).unwrap();
+        }
+        let mut filename_zstr = DosRegs {
+            ax: 0x65a2,
+            ds: 0x0100,
+            dx: 0x0420,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut filename_zstr, &mut mem).unwrap();
+        assert!(!filename_zstr.cf);
+        assert_eq!(mem.read_u8(0x0100usize * 16 + 0x0420).unwrap(), b'F');
+        assert_eq!(mem.read_u8(0x0100usize * 16 + 0x0423).unwrap(), b'E');
     }
 
     #[test]
@@ -10768,6 +12226,306 @@ mod tests {
     }
 
     #[test]
+    fn ah1b_and_ah1c_return_allocation_table_info() {
+        let (mut kernel, mut mem) = arena_kernel();
+
+        for (ax, dx) in [(0x1b00, 0), (0x1c00, 3)] {
+            let mut regs = DosRegs {
+                ax,
+                dx,
+                ..DosRegs::default()
+            };
+            kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+            assert_eq!(regs.ax & 0x00ff, C_DRIVE_SECTORS_PER_CLUSTER);
+            assert_eq!(regs.cx, C_DRIVE_BYTES_PER_SECTOR);
+            assert_eq!(regs.dx, C_DRIVE_TOTAL_CLUSTERS);
+
+            let media = usize::from(regs.ds) * 16 + usize::from(regs.bx);
+            assert_eq!(
+                mem.read_u8(media).unwrap(),
+                0xf8,
+                "DS:BX points at the FAT ID byte"
+            );
+        }
+
+        let mut bad = DosRegs {
+            ax: 0x1c00,
+            dx: 1,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut bad, &mut mem).unwrap();
+        assert_eq!(bad.ax & 0x00ff, 0xff, "A: has no DPB");
+    }
+
+    #[test]
+    fn ah1f_and_ah32_return_drive_parameter_blocks() {
+        let (mut kernel, mut mem) = arena_kernel();
+        let mut default_dpb = DosRegs {
+            ax: 0x1f00,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut default_dpb, &mut mem).unwrap();
+        assert_eq!(default_dpb.ax & 0x00ff, 0);
+        let dpb = usize::from(default_dpb.ds) * 16 + usize::from(default_dpb.bx);
+        assert_eq!(mem.read_u8(dpb).unwrap(), 2, "default DPB is C:");
+        assert_eq!(mem.read_u16(dpb + 0x02).unwrap(), C_DRIVE_BYTES_PER_SECTOR);
+
+        let mut explicit_c = DosRegs {
+            ax: 0x3200,
+            dx: 3,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut explicit_c, &mut mem).unwrap();
+        assert_eq!(explicit_c.ax & 0x00ff, 0);
+        assert_eq!(
+            (explicit_c.ds, explicit_c.bx),
+            (default_dpb.ds, default_dpb.bx),
+            "DL=3 returns the same C: DPB"
+        );
+
+        let mut bad = DosRegs {
+            ax: 0x3200,
+            dx: 1,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut bad, &mut mem).unwrap();
+        assert_eq!(bad.ax & 0x00ff, 0xff, "A: has no DPB");
+    }
+
+    #[test]
+    fn ah53_translates_bpb_to_dpb() {
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let mut kernel = DosKernel::new();
+        let bpb = 0x0100usize * 16 + 0x0200;
+        let dpb = 0x0200usize * 16 + 0x0100;
+        for (index, byte) in tests_bpb_custom(512, 1, 2880, 0xf0).iter().enumerate() {
+            mem.write_u8(bpb + index, *byte).unwrap();
+        }
+        mem.write_u8(dpb, 3).unwrap();
+        mem.write_u8(dpb + 0x01, 7).unwrap();
+        mem.write_u16(dpb + 0x13, 0xaaaa).unwrap();
+        mem.write_u16(dpb + 0x15, 0xbbbb).unwrap();
+        mem.write_u8(dpb + 0x18, 0xcc).unwrap();
+        mem.write_u16(dpb + 0x19, 0xdddd).unwrap();
+        mem.write_u16(dpb + 0x1b, 0xeeee).unwrap();
+
+        let mut regs = DosRegs {
+            ax: 0x5300,
+            ds: 0x0100,
+            si: 0x0200,
+            es: 0x0200,
+            bp: 0x0100,
+            cf: true,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+
+        assert!(!regs.cf);
+        assert_eq!(mem.read_u8(dpb).unwrap(), 3, "drive byte preserved");
+        assert_eq!(mem.read_u8(dpb + 0x01).unwrap(), 7, "unit preserved");
+        assert_eq!(mem.read_u16(dpb + 0x02).unwrap(), 512);
+        assert_eq!(mem.read_u8(dpb + 0x04).unwrap(), 0);
+        assert_eq!(mem.read_u8(dpb + 0x05).unwrap(), 0);
+        assert_eq!(mem.read_u16(dpb + 0x06).unwrap(), 1);
+        assert_eq!(mem.read_u8(dpb + 0x08).unwrap(), 2);
+        assert_eq!(mem.read_u16(dpb + 0x09).unwrap(), 224);
+        assert_eq!(mem.read_u16(dpb + 0x0b).unwrap(), 33);
+        assert_eq!(mem.read_u16(dpb + 0x0d).unwrap(), 2848);
+        assert_eq!(mem.read_u16(dpb + 0x0f).unwrap(), 9);
+        assert_eq!(mem.read_u16(dpb + 0x11).unwrap(), 19);
+        assert_eq!(mem.read_u16(dpb + 0x13).unwrap(), 0xaaaa);
+        assert_eq!(mem.read_u16(dpb + 0x15).unwrap(), 0xbbbb);
+        assert_eq!(mem.read_u8(dpb + 0x17).unwrap(), 0xf0);
+        assert_eq!(mem.read_u8(dpb + 0x18).unwrap(), 0xcc);
+        assert_eq!(mem.read_u16(dpb + 0x19).unwrap(), 0xdddd);
+        assert_eq!(mem.read_u16(dpb + 0x1b).unwrap(), 0xeeee);
+        assert_eq!(mem.read_u16(dpb + 0x1d).unwrap(), 0);
+        assert_eq!(mem.read_u16(dpb + 0x1f).unwrap(), 0xffff);
+    }
+
+    #[test]
+    fn ah69_gets_and_sets_c_drive_serial_info() {
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let mut kernel = DosKernel::new();
+        let base = 0x0100usize * 16 + 0x0200;
+
+        let mut get_default = DosRegs {
+            ax: 0x6900,
+            bx: 0x0000,
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut get_default, &mut mem).unwrap();
+        assert!(!get_default.cf);
+        assert_eq!(mem.read_u16(base).unwrap(), 0);
+        assert_eq!(mem.read_u32(base + 2).unwrap(), 0);
+        for (index, byte) in C_DRIVE_VOLUME_LABEL.into_iter().enumerate() {
+            assert_eq!(mem.read_u8(base + 6 + index).unwrap(), byte);
+        }
+        for (index, byte) in C_DRIVE_FS_TYPE.into_iter().enumerate() {
+            assert_eq!(mem.read_u8(base + 17 + index).unwrap(), byte);
+        }
+
+        mem.write_u16(base, 0).unwrap();
+        mem.write_u32(base + 2, 0x1234_5678).unwrap();
+        for (index, byte) in (*b"TOKADOS    ").into_iter().enumerate() {
+            mem.write_u8(base + 6 + index, byte).unwrap();
+        }
+        let mut set = DosRegs {
+            ax: 0x6901,
+            bx: 0x0003,
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut set, &mut mem).unwrap();
+        assert!(!set.cf);
+
+        let mut get = DosRegs {
+            ax: 0x6900,
+            bx: 0x0003,
+            ds: 0x0100,
+            dx: 0x0300,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut get, &mut mem).unwrap();
+        let out = 0x0100usize * 16 + 0x0300;
+        assert_eq!(mem.read_u32(out + 2).unwrap(), 0x1234_5678);
+        for (index, byte) in (*b"TOKADOS    ").into_iter().enumerate() {
+            assert_eq!(mem.read_u8(out + 6 + index).unwrap(), byte);
+        }
+
+        let mut bad_drive = DosRegs {
+            ax: 0x6900,
+            bx: 0x0001,
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut bad_drive, &mut mem).unwrap();
+        assert!(bad_drive.cf);
+        assert_eq!(bad_drive.ax, 0x0f);
+    }
+
+    #[test]
+    fn ioctl_440d_gets_and_sets_c_drive_media_id() {
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let mut kernel = DosKernel::new();
+        let base = 0x0100usize * 16 + 0x0200;
+
+        mem.write_u16(base, 0).unwrap();
+        mem.write_u32(base + 2, 0x8765_4321).unwrap();
+        for (index, byte) in (*b"GENIOCTL  ").into_iter().enumerate() {
+            mem.write_u8(base + 6 + index, byte).unwrap();
+        }
+
+        let mut set = DosRegs {
+            ax: 0x440d,
+            bx: 0x0003,
+            cx: 0x0846,
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut set, &mut mem).unwrap();
+        assert!(!set.cf);
+
+        let mut get = DosRegs {
+            ax: 0x440d,
+            bx: 0x0000,
+            cx: 0x0866,
+            ds: 0x0100,
+            dx: 0x0300,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut get, &mut mem).unwrap();
+        let out = 0x0100usize * 16 + 0x0300;
+        assert!(!get.cf);
+        assert_eq!(mem.read_u16(out).unwrap(), 0);
+        assert_eq!(mem.read_u32(out + 2).unwrap(), 0x8765_4321);
+        for (index, byte) in (*b"GENIOCTL  ").into_iter().enumerate() {
+            assert_eq!(mem.read_u8(out + 6 + index).unwrap(), byte);
+        }
+        for (index, byte) in C_DRIVE_FS_TYPE.into_iter().enumerate() {
+            assert_eq!(mem.read_u8(out + 17 + index).unwrap(), byte);
+        }
+
+        mem.write_u8(base, 0).unwrap();
+        mem.write_u8(base + 1, 0).unwrap();
+        let mut set_access = DosRegs {
+            ax: 0x440d,
+            bx: 0x0003,
+            cx: 0x0847,
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut set_access, &mut mem).unwrap();
+        assert!(!set_access.cf);
+
+        let mut get_access = DosRegs {
+            ax: 0x440d,
+            bx: 0x0003,
+            cx: 0x0867,
+            ds: 0x0100,
+            dx: 0x0300,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut get_access, &mut mem).unwrap();
+        assert!(!get_access.cf);
+        assert_eq!(mem.read_u8(out).unwrap(), 0);
+        assert_eq!(mem.read_u8(out + 1).unwrap(), 0);
+
+        let mut supported = DosRegs {
+            ax: 0x4411,
+            bx: 0x0003,
+            cx: 0x0867,
+            cf: true,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut supported, &mut mem).unwrap();
+        assert!(!supported.cf);
+        assert_eq!(supported.ax, 0);
+
+        let mut unsupported = DosRegs {
+            ax: 0x4411,
+            bx: 0x0003,
+            cx: 0x0868,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut unsupported, &mut mem).unwrap();
+        assert!(unsupported.cf);
+        assert_eq!(unsupported.ax, 0x01);
+    }
+
+    #[test]
+    fn late_dos_probe_calls_report_null_or_not_supported() {
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let mut kernel = DosKernel::new();
+
+        for ax in [0x6bff, 0x6dff, 0x6eff, 0x6fff] {
+            let mut regs = DosRegs {
+                ax,
+                cf: true,
+                ..DosRegs::default()
+            };
+            kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+            assert_eq!(regs.ax & 0x00ff, 0, "AX={ax:04x} returns AL=0");
+        }
+
+        for (ax, error) in [(0x7000, 0x7000), (0x7160, 0x7100)] {
+            let mut regs = DosRegs {
+                ax,
+                ..DosRegs::default()
+            };
+            kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+            assert!(regs.cf, "AX={ax:04x} must fail on DOS 6.22");
+            assert_eq!(regs.ax, error);
+        }
+    }
+
+    #[test]
     fn ah52_publishes_loaded_block_driver_dpb_and_cds_from_bpb() {
         let (mut kernel, mut mem) = arena_kernel();
         let image = tests_block_image_with_bpb(0x30);
@@ -11363,6 +13121,77 @@ mod tests {
     }
 
     #[test]
+    fn ax5d0b_returns_dos4_sda_list() {
+        let (mut kernel, mut mem) = arena_kernel();
+        let mut set_dta = DosRegs {
+            ax: 0x1a00,
+            ds: 0x3456,
+            dx: 0x0789,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut set_dta, &mut mem).unwrap();
+
+        let mut regs = DosRegs {
+            ax: 0x5d0b,
+            ds: 0xbeef,
+            si: 0xface,
+            cf: true,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+
+        assert!(!regs.cf, "AX=5D0Bh succeeds");
+        assert_ne!((regs.ds, regs.si), (0xbeef, 0xface));
+        let list = usize::from(regs.ds) * 16 + usize::from(regs.si);
+        assert_eq!(mem.read_u16(list).unwrap(), 1, "one SDA area");
+        let sda_off = mem.read_u16(list + 2).unwrap();
+        let sda_seg = mem.read_u16(list + 4).unwrap();
+        assert_ne!((sda_seg, sda_off), (regs.ds, regs.si));
+        assert_eq!(
+            mem.read_u16(list + 6).unwrap(),
+            0x8000 | SDA_ALWAYS_SWAPPED_LEN,
+            "stable prefix is swap-always"
+        );
+        let sda = usize::from(sda_seg) * 16 + usize::from(sda_off);
+        assert_eq!(mem.read_u16(sda + 0x0c).unwrap(), 0x0789);
+        assert_eq!(mem.read_u16(sda + 0x0e).unwrap(), 0x3456);
+    }
+
+    #[test]
+    fn ax5d00_dispatches_int21_from_dpl() {
+        let (mut kernel, mut mem) = arena_kernel();
+        let dpl = 0x0100 * 16 + 0x0200;
+        mem.write_u16(dpl, 0x1a00).unwrap();
+        mem.write_u16(dpl + 6, 0x0789).unwrap();
+        mem.write_u16(dpl + 12, 0x3456).unwrap();
+
+        let mut regs = DosRegs {
+            ax: 0x5d00,
+            bp: 0xbabe,
+            ds: 0x0100,
+            dx: 0x0200,
+            cf: true,
+            ..DosRegs::default()
+        };
+        assert_eq!(
+            kernel.dispatch(0x21, &mut regs, &mut mem).unwrap(),
+            DosAction::Continue
+        );
+        assert!(!regs.cf);
+        assert_eq!(regs.ax, 0x1a00);
+        assert_eq!(regs.bp, 0xbabe);
+        assert_eq!(regs.ds, 0x3456);
+        assert_eq!(regs.dx, 0x0789);
+
+        let mut get_dta = DosRegs {
+            ax: 0x2f00,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut get_dta, &mut mem).unwrap();
+        assert_eq!((get_dta.es, get_dta.bx), (0x3456, 0x0789));
+    }
+
+    #[test]
     fn critical_error_scaffold_builds_int24_frame_and_marks_sda() {
         let (mut kernel, mut mem) = arena_kernel();
         let psp = 0x0100usize * 16;
@@ -11775,16 +13604,54 @@ mod tests {
     }
 
     #[test]
-    fn ah0e_reports_one_drive() {
-        let mut mem = Memory::new(4096).unwrap();
-        let mut kernel = DosKernel::new();
-        let mut regs = DosRegs {
+    fn ah0e_selects_default_drive_and_reports_lastdrive_count() {
+        let (mut kernel, mut mem, _dir) = kernel_with_drive(&[("DATA.TXT", b"hi")], "DATA.TXT");
+        kernel.set_lastdrive(6); // A: through F:
+
+        let mut select_d = DosRegs {
+            ax: 0x0e00,
+            dx: 0x0003,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut select_d, &mut mem).unwrap();
+        assert_eq!(select_d.ax & 0xff, 0x06);
+
+        let mut current = DosRegs {
+            ax: 0x1900,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut current, &mut mem).unwrap();
+        assert_eq!(current.ax & 0xff, 0x03);
+
+        let mut open_default_d = DosRegs {
+            ax: 0x3d00,
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel
+            .dispatch(0x21, &mut open_default_d, &mut mem)
+            .unwrap();
+        assert!(open_default_d.cf);
+        assert_eq!(open_default_d.ax, 0x03);
+
+        let mut select_c = DosRegs {
             ax: 0x0e00,
             dx: 0x0002,
             ..DosRegs::default()
         };
-        kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
-        assert_eq!(regs.ax & 0xff, 0x01); // AL = number of logical drives
+        kernel.dispatch(0x21, &mut select_c, &mut mem).unwrap();
+
+        let mut open_default_c = DosRegs {
+            ax: 0x3d00,
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel
+            .dispatch(0x21, &mut open_default_c, &mut mem)
+            .unwrap();
+        assert!(!open_default_c.cf);
     }
 
     #[test]
@@ -11988,6 +13855,29 @@ mod tests {
         assert!(
             kernel.stdout().is_empty(),
             "AUX/PRN output is not echoed to the console"
+        );
+    }
+
+    #[test]
+    fn ah04_and_ah05_accept_and_discard_aux_prn_output() {
+        let mut kernel = DosKernel::new();
+        let mut mem = Memory::new(64 * 1024).unwrap();
+
+        for (ah, ch) in [(0x04u16, b'A'), (0x05u16, b'P')] {
+            let mut regs = DosRegs {
+                ax: ah << 8,
+                dx: u16::from(ch),
+                cf: true,
+                ..DosRegs::default()
+            };
+            kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+            assert!(!regs.cf);
+            assert_eq!(regs.ax & 0x00ff, u16::from(ch));
+        }
+
+        assert!(
+            kernel.stdout().is_empty(),
+            "AUX/PRN character output is not echoed to the console"
         );
     }
 
@@ -12425,6 +14315,14 @@ mod tests {
         String::from_utf8(bytes).unwrap()
     }
 
+    fn dta_raw_name(mem: &Memory) -> [u8; 11] {
+        let mut name = [0; 11];
+        for (index, slot) in name.iter_mut().enumerate() {
+            *slot = mem.read_u8(0x1e + index).unwrap();
+        }
+        name
+    }
+
     /// A kernel with `dir` mounted as C: and a 1 MiB memory for DTA writes.
     fn find_kernel(dir: &Path) -> (DosKernel, Memory) {
         let mut kernel = DosKernel::new();
@@ -12563,6 +14461,24 @@ mod tests {
         let regs = find_first(&mut kernel, &mut mem, "C:\\SUB", 0x10);
         assert!(!regs.cf);
         assert_eq!(mem.read_u8(0x15).unwrap(), 0x10);
+    }
+
+    #[test]
+    fn ah4e_volume_label_mask_returns_label_only() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("F.TXT"), b"a").unwrap();
+        let (mut kernel, mut mem) = find_kernel(dir.path());
+        kernel.volume_label = Some(*b"TOKA-DOS   ");
+
+        let regs = find_first(&mut kernel, &mut mem, "C:\\*.*", 0x08);
+        assert!(!regs.cf);
+        assert_eq!(mem.read_u8(0x15).unwrap(), 0x08);
+        assert_eq!(mem.read_u32(0x1a).unwrap(), 0);
+        assert_eq!(&dta_raw_name(&mem), b"TOKA-DOS   ");
+
+        let next = find_next(&mut kernel, &mut mem);
+        assert!(next.cf);
+        assert_eq!(next.ax, 0x12);
     }
 
     #[test]
@@ -12796,7 +14712,18 @@ mod tests {
     fn ah4b_bad_subfunction_returns_0x01() {
         let dir = tempfile::tempdir().unwrap();
         let (mut kernel, mut mem) = overlay_kernel(dir.path());
-        for al in [0x01u16, 0x04] {
+        let mut exec_state = DosRegs {
+            ax: 0x4b05,
+            ds: 0x1000,
+            dx: 0x0100,
+            cf: true,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut exec_state, &mut mem).unwrap();
+        assert!(!exec_state.cf);
+        assert_eq!(exec_state.ax, 0);
+
+        for al in [0x02u16, 0x04] {
             let mut regs = DosRegs {
                 ax: 0x4b00 | al,
                 ..DosRegs::default()
@@ -13345,6 +15272,26 @@ mod tests {
     }
 
     #[test]
+    fn fcb_extended_find_volume_label_uses_label_entry() {
+        let (mut kernel, mut mem, _dir) = fcb_kernel(&[("F.TXT", b"x")]);
+        kernel.volume_label = Some(*b"TOKA-DOS   ");
+        place_extended_fcb(&mut mem, 0x08, 0, "????????.???");
+
+        let r = fcb_call(&mut kernel, &mut mem, 0x11);
+        assert_eq!(r.ax & 0xff, 0x00);
+        assert_eq!(mem.read_u8(FCB_DTA).unwrap(), 0xff);
+        assert_eq!(mem.read_u8(FCB_DTA + 6).unwrap(), 0x08);
+        let raw: Vec<u8> = (0..11)
+            .map(|i| mem.read_u8(FCB_DTA + 8 + i).unwrap())
+            .collect();
+        assert_eq!(&raw, b"TOKA-DOS   ");
+        assert_eq!(mem.read_u32(FCB_DTA + 8 + 0x1c).unwrap(), 0);
+
+        let next = fcb_call(&mut kernel, &mut mem, 0x12);
+        assert_eq!(next.ax & 0xff, 0xff);
+    }
+
+    #[test]
     fn fcb_extended_find_next_keeps_the_extended_format() {
         let (mut kernel, mut mem, _dir) = fcb_kernel(&[("A.TXT", b"a"), ("B.TXT", b"b")]);
         place_extended_fcb(&mut mem, 0x00, 0, "????????.TXT");
@@ -13726,6 +15673,40 @@ mod tests {
             }
             other => panic!("expected Exec, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn ah4b_al1_loads_child_and_returns_entry_without_exec() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CHILD.COM"), [0xcdu8, 0x20]).unwrap();
+        let (mut kernel, mut mem) = exec_kernel(dir.path());
+        kernel.last_exit_code = 7;
+        kernel.last_exit_type = 3;
+        place_exec_inputs(&mut mem, "C:\\CHILD.COM", 0);
+        let mut regs = DosRegs {
+            ax: 0x4b01,
+            ds: 0x1000,
+            dx: 0,
+            es: 0x1000,
+            bx: 0x40,
+            ..DosRegs::default()
+        };
+
+        let action = kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+
+        assert_eq!(action, DosAction::Continue);
+        assert!(!regs.cf);
+        assert_eq!(kernel.arena.psp_seg, 0x0100);
+        assert!(kernel.program_stack.is_empty());
+        assert_eq!(kernel.last_exit_code, 7);
+        assert_eq!(kernel.last_exit_type, 3);
+        assert_eq!(mem.read_u16(0x1004e).unwrap(), 0xfffc); // initial SP
+        assert_eq!(mem.read_u16(0x10050).unwrap(), 0x0203); // initial SS
+        assert_eq!(mem.read_u16(0x10052).unwrap(), 0x0100); // entry IP
+        assert_eq!(mem.read_u16(0x10054).unwrap(), 0x0203); // entry CS
+        assert_eq!(mem.read_u16(0x0203 * 16 + 0xfffc).unwrap(), 0x0000);
+        assert_eq!(mem.read_u16(0x0203 * 16 + 0x16).unwrap(), 0x0100);
+        assert_eq!(kernel.arena.free_base(&mem), ARENA_TOP);
     }
 
     #[test]
@@ -14732,6 +16713,201 @@ mod tests {
         assert!(!err.cf, "the query itself clears carry");
     }
 
+    #[test]
+    fn ax5d0a_sets_extended_error_record_for_ah59() {
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let mut kernel = DosKernel::new();
+        let base = 0x0100usize * 16 + 0x0200;
+        mem.write_u16(base, 0x0053).unwrap(); // AX: fail on INT 24h
+        mem.write_u16(base + 2, 0x0907).unwrap(); // BH class, BL action
+        mem.write_u16(base + 4, 0x0400).unwrap(); // CH locus
+        mem.write_u16(base + 10, 0x3456).unwrap(); // DI
+        mem.write_u16(base + 14, 0xabcd).unwrap(); // ES
+
+        let mut set = DosRegs {
+            ax: 0x5d0a,
+            ds: 0x0100,
+            dx: 0x0200,
+            cf: true,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut set, &mut mem).unwrap();
+        assert!(!set.cf);
+
+        let mut err = DosRegs {
+            ax: 0x5900,
+            cx: 0x00aa,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut err, &mut mem).unwrap();
+        assert_eq!(err.ax, 0x0053);
+        assert_eq!(err.bx, 0x0907);
+        assert_eq!(err.cx, 0x04aa);
+        assert_eq!(err.es, 0xabcd);
+        assert_eq!(err.di, 0x3456);
+        assert!(!err.cf);
+    }
+
+    #[test]
+    fn ax5d_share_and_redirected_printer_helpers_report_absent_services() {
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let mut kernel = DosKernel::new();
+
+        let mut commit = DosRegs {
+            ax: 0x5d01,
+            cf: true,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut commit, &mut mem).unwrap();
+        assert!(!commit.cf);
+
+        for ax in [0x5d02, 0x5d03, 0x5d04, 0x5d07, 0x5d08, 0x5d09] {
+            let mut regs = DosRegs {
+                ax,
+                ..DosRegs::default()
+            };
+            kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+            assert!(regs.cf, "AX={ax:04X}h fails without SHARE/redirector");
+            assert_eq!(regs.ax, 0x0001);
+        }
+
+        let mut list = DosRegs {
+            ax: 0x5d05,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut list, &mut mem).unwrap();
+        assert!(list.cf);
+        assert_eq!(list.ax, 0x0012, "no SHARE open-file list entries");
+
+        let mut unknown = DosRegs {
+            ax: 0x5dff,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut unknown, &mut mem).unwrap();
+        assert!(unknown.cf);
+        assert_eq!(unknown.ax, 0x0001);
+    }
+
+    #[test]
+    fn network_services_report_no_redirector() {
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let mut kernel = DosKernel::new();
+
+        let mut machine_name = DosRegs {
+            ax: 0x5e00,
+            cx: 0xff42,
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut machine_name, &mut mem).unwrap();
+        assert!(!machine_name.cf);
+        assert_eq!(machine_name.cx, 0x0042, "CH=0 marks the name invalid");
+
+        for ax in [0x5e02, 0x5e03, 0x5f02, 0x5f03, 0x5f04] {
+            let mut regs = DosRegs {
+                ax,
+                ..DosRegs::default()
+            };
+            kernel.dispatch(0x21, &mut regs, &mut mem).unwrap();
+            assert!(regs.cf, "AX={ax:04x} must fail without MS Networks");
+            assert_eq!(regs.ax, 0x01);
+        }
+
+        let mut network_err = DosRegs {
+            ax: 0x5900,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut network_err, &mut mem).unwrap();
+        assert_eq!(network_err.ax, 0x01);
+
+        for ax in [0x5f07, 0x5f08] {
+            let mut c_drive = DosRegs {
+                ax,
+                dx: 2,
+                cf: true,
+                ..DosRegs::default()
+            };
+            kernel.dispatch(0x21, &mut c_drive, &mut mem).unwrap();
+            assert!(!c_drive.cf, "AX={ax:04x} accepts a LASTDRIVE-backed C:");
+
+            let mut out_of_range = DosRegs {
+                ax,
+                dx: 25,
+                ..DosRegs::default()
+            };
+            kernel.dispatch(0x21, &mut out_of_range, &mut mem).unwrap();
+            assert!(out_of_range.cf, "AX={ax:04x} rejects drives past LASTDRIVE");
+            assert_eq!(out_of_range.ax, 0x0f);
+        }
+
+        let mut err = DosRegs {
+            ax: 0x5900,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut err, &mut mem).unwrap();
+        assert_eq!(err.ax, 0x0f);
+    }
+
+    #[test]
+    fn ax5e_gets_sets_and_undefines_machine_name() {
+        let mut mem = Memory::new(64 * 1024).unwrap();
+        let mut kernel = DosKernel::new();
+        let base = 0x0100usize * 16 + 0x0200;
+        for (index, byte) in b"TOKADOS".iter().enumerate() {
+            mem.write_u8(base + index, *byte).unwrap();
+        }
+        mem.write_u8(base + 7, 0).unwrap();
+
+        let mut set = DosRegs {
+            ax: 0x5e01,
+            cx: 0x0107,
+            ds: 0x0100,
+            dx: 0x0200,
+            cf: true,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut set, &mut mem).unwrap();
+        assert!(!set.cf);
+
+        let mut get = DosRegs {
+            ax: 0x5e00,
+            cx: 0xff00,
+            ds: 0x0100,
+            dx: 0x0300,
+            cf: true,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut get, &mut mem).unwrap();
+        let out = 0x0100usize * 16 + 0x0300;
+        assert!(!get.cf);
+        assert_eq!(get.cx, 0x0107);
+        let raw: Vec<u8> = (0..DOS_MACHINE_NAME_LEN)
+            .map(|i| mem.read_u8(out + i).unwrap())
+            .collect();
+        assert_eq!(&raw, b"TOKADOS        ");
+        assert_eq!(mem.read_u8(out + DOS_MACHINE_NAME_LEN).unwrap(), 0);
+
+        let mut undefine = DosRegs {
+            ax: 0x5e01,
+            cx: 0x0007,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut undefine, &mut mem).unwrap();
+        assert!(!undefine.cf);
+
+        let mut get_invalid = DosRegs {
+            ax: 0x5e00,
+            cx: 0xff55,
+            ds: 0x0100,
+            dx: 0x0300,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut get_invalid, &mut mem).unwrap();
+        assert!(!get_invalid.cf);
+        assert_eq!(get_invalid.cx, 0x0055);
+    }
+
     fn create_temp(kernel: &mut DosKernel, mem: &mut Memory) -> DosRegs {
         let mut regs = DosRegs {
             ax: 0x5a00,
@@ -14804,6 +16980,17 @@ mod tests {
 
     #[test]
     fn ah6c_opens_an_existing_file_and_creates_a_new_one() {
+        let (mut kernel, mut mem, _dir) = kernel_with_drive(&[], r"C:\EA.TXT");
+        let mut ea_open = DosRegs {
+            ax: 0x6c01,
+            ds: 0x0100,
+            si: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut ea_open, &mut mem).unwrap();
+        assert!(ea_open.cf);
+        assert_eq!(ea_open.ax, 0x0001);
+
         // Open-existing: bit 0 set (open-if-exists). CX reports 1 (opened).
         let (mut kernel, mut mem, _dir) = kernel_with_drive(&[("HAVE.TXT", b"hi")], r"C:\HAVE.TXT");
         let mut open = DosRegs {
