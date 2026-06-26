@@ -2917,6 +2917,18 @@ impl Machine {
         let ah = (self.cpu.registers.eax() as u16 >> 8) as u8;
         let al = self.cpu.registers.eax() as u8;
         match ah {
+            // AH=00h-03h cassette services (PC/PCjr). This profile has no cassette.
+            0x00..=0x03 => {
+                self.set_eax_ah(0x86);
+                self.set_int_frame_carry(true);
+            }
+            // AH=4Fh keyboard intercept. With no resident hook, keep the scan code.
+            0x4F => self.set_int_frame_carry(true),
+            // AH=80h-82h OS device hooks. The default BIOS handler succeeds.
+            0x80..=0x82 => {
+                self.set_eax_ah(0x00);
+                self.set_int_frame_carry(false);
+            }
             // AH=88h extended memory size in KiB (existing behavior).
             0x88 => {
                 let extended_kib = u32::from(self.profile.memory_mib.saturating_sub(1)) * 1024;
@@ -3026,6 +3038,11 @@ impl Machine {
             // AH=C2h PS/2 pointing-device (mouse) BIOS interface. AL selects the
             // subfunction.
             0xC2 => self.int15_c2_pointing_device(al),
+            // AH=C3h/C4h PS/2 watchdog and POS are absent on the base profile.
+            0xC3 | 0xC4 => {
+                self.set_eax_ah(0x86);
+                self.set_int_frame_carry(true);
+            }
             _ => self.set_int_frame_carry(true),
         }
     }
@@ -12557,6 +12574,56 @@ mod tests {
         assert_eq!(m.cpu.registers.ecx() as u16, 0x0000, "joy B X");
         assert_eq!(m.cpu.registers.edx() as u16, 0x0000, "joy B Y");
         assert_eq!(dos_int_flags(&m) & 1, 0, "position read CF clear");
+    }
+
+    #[test]
+    fn int15_reports_absent_cassette() {
+        for ah in [0x00u8, 0x01, 0x02, 0x03] {
+            let mut m = int15_machine(16);
+            prime_dos_int_frame(&mut m);
+            m.cpu.registers.set_eax(u32::from(ah) << 8);
+            m.handle_int15();
+
+            assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x86, "AH={ah:02X}");
+            assert_eq!(dos_int_flags(&m) & 1, 1, "AH={ah:02X} CF set");
+        }
+    }
+
+    #[test]
+    fn int15_keyboard_intercept_continues_scan_code() {
+        let mut m = int15_machine(16);
+        prime_dos_int_frame(&mut m);
+        m.cpu.registers.set_eax(0x4F1E);
+        m.handle_int15();
+
+        assert_eq!(m.cpu.registers.eax() as u8, 0x1E, "scan code preserved");
+        assert_eq!(dos_int_flags(&m) & 1, 1, "CF set continues processing");
+    }
+
+    #[test]
+    fn int15_os_device_hooks_succeed_as_noops() {
+        for ah in [0x80u8, 0x81, 0x82] {
+            let mut m = int15_machine(16);
+            prime_dos_int_frame(&mut m);
+            m.cpu.registers.set_eax((u32::from(ah) << 8) | 0x55);
+            m.handle_int15();
+
+            assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x00, "AH={ah:02X}");
+            assert_eq!(dos_int_flags(&m) & 1, 0, "AH={ah:02X} CF clear");
+        }
+    }
+
+    #[test]
+    fn int15_reports_absent_watchdog_and_pos() {
+        for ax in [0xC300u32, 0xC400] {
+            let mut m = int15_machine(16);
+            prime_dos_int_frame(&mut m);
+            m.cpu.registers.set_eax(ax);
+            m.handle_int15();
+
+            assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x86, "AX={ax:04X}");
+            assert_eq!(dos_int_flags(&m) & 1, 1, "AX={ax:04X} CF set");
+        }
     }
 
     #[test]
