@@ -378,6 +378,12 @@ pub(crate) struct Pit {
     counters: [Counter; 3],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OutTransition {
+    pub(crate) tick: u64,
+    pub(crate) level: bool,
+}
+
 impl Default for Pit {
     /// Power-on state with channel 1 pre-seeded as the AT DRAM-refresh timer
     /// (mode 2, count 18). A guest that never programs channel 1 still sees port
@@ -439,19 +445,53 @@ impl Pit {
         }
     }
 
-    /// Advance every counter by `clocks` input CLK pulses. Returns the number of
-    /// channel-0 OUT rising edges, which the machine turns into IRQ0 requests.
-    pub(crate) fn tick(&mut self, clocks: u64) -> u32 {
+    fn tick_with_observer<F>(
+        &mut self,
+        clocks: u64,
+        watch_channel: Option<usize>,
+        mut out_changed: F,
+    ) -> u32
+    where
+        F: FnMut(u64, bool),
+    {
         let mut edges = 0u32;
-        for _ in 0..clocks {
+        let mut watched = watch_channel.map(|channel| self.channel_out(channel));
+        for tick in 1..=clocks {
             for (i, counter) in self.counters.iter_mut().enumerate() {
                 let rose = counter.step();
                 if i == 0 && rose {
                     edges += 1;
                 }
             }
+            if let Some(channel) = watch_channel {
+                let level = self.channel_out(channel);
+                if Some(level) != watched {
+                    watched = Some(level);
+                    out_changed(tick, level);
+                }
+            }
         }
         edges
+    }
+
+    /// Advance every counter by `clocks` input CLK pulses. Returns the number of
+    /// channel-0 OUT rising edges, which the machine turns into IRQ0 requests.
+    #[cfg(test)]
+    pub(crate) fn tick(&mut self, clocks: u64) -> u32 {
+        self.tick_with_observer(clocks, None, |_, _| {})
+    }
+
+    /// Advance every counter and append channel OUT transitions with the PIT input
+    /// tick on which they occurred. Tick numbers are 1-based within this advance.
+    pub(crate) fn tick_recording_out_transitions(
+        &mut self,
+        clocks: u64,
+        channel: usize,
+        transitions: &mut Vec<OutTransition>,
+    ) -> u32 {
+        self.tick_with_observer(clocks, Some(channel), |tick, level| {
+            transitions.push(OutTransition { tick, level });
+        })
     }
 
     /// Input CLK pulses until channel 0 produces its next OUT rising edge, or None

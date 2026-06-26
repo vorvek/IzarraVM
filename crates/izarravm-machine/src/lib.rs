@@ -765,6 +765,7 @@ pub struct Machine {
     keyboard: keyboard::Keyboard8042,
     speaker: speaker::Speaker,
     pit_clocks: f64, // fractional PIT input clocks owed to the counters
+    speaker_transitions: Vec<pit::OutTransition>,
     dma: dma::DmaController,
     // 8272A floppy disk controller (ports 0x3F0-0x3F7). A guest that programs the
     // FDC directly drives it here; the INT 13h path stays HLE and does not use it.
@@ -1280,6 +1281,7 @@ impl Machine {
             keyboard: keyboard::Keyboard8042::default(),
             speaker: speaker::Speaker::default(),
             pit_clocks: 0.0,
+            speaker_transitions: Vec::new(),
             dma: dma::DmaController::default(),
             fdc: fdc::Fdc::default(),
             opl: OplChip::default(),
@@ -10594,19 +10596,29 @@ impl Machine {
             }
         }
 
+        let ch2_before = self.pit.channel_out(2);
+        let pit_fraction_before = self.pit_clocks;
         self.pit_clocks += clocks as f64 * self.timing.pit_per_clock;
         let whole = self.pit_clocks.floor();
         self.pit_clocks -= whole;
-        let edges = self.pit.tick(whole as u64);
+        self.speaker_transitions.clear();
+        let edges =
+            self.pit
+                .tick_recording_out_transitions(whole as u64, 2, &mut self.speaker_transitions);
         for _ in 0..edges {
             self.pic.request(0); // channel 0 OUT rising edge is IRQ0
         }
 
-        // PC speaker: sample (ch2 OUT AND data enable) into the speaker ring at
-        // the DAC rate. `clocks` is small (per instruction), so a tone is sampled
-        // finely enough to form a square wave.
-        self.speaker
-            .accumulate(clocks, self.timing.inv_clock, self.pit.channel_out(2));
+        // PC speaker: integrate channel-2 OUT transitions at PIT-clock precision,
+        // then let the speaker model produce DAC-rate samples.
+        let seconds = clocks as f64 * self.timing.inv_clock;
+        let transitions = self.speaker_transitions.iter().map(|event| {
+            (
+                (event.tick as f64 - pit_fraction_before) / PIT_INPUT_HZ as f64,
+                event.level,
+            )
+        });
+        self.speaker.accumulate(seconds, ch2_before, transitions);
 
         if self.keyboard.take_irq() {
             self.pic.request(1); // IRQ1: keyboard output buffer has a scancode
@@ -21757,6 +21769,32 @@ mod tests {
         assert!(
             pcm.iter().any(|&(l, _)| l > 0) && pcm.iter().any(|&(l, _)| l < 0),
             "a toggling speaker tone should produce both polarities"
+        );
+    }
+
+    #[test]
+    fn pc_speaker_ultrasonic_square_wave_averages_quietly() {
+        let mut machine = test_machine();
+        with_bus(&mut machine, |bus| {
+            bus.write_io(0x43, BusWidth::Byte, 0xb6).unwrap(); // ch2, lo/hi, mode 3
+            bus.write_io(0x42, BusWidth::Byte, 0x02).unwrap(); // divisor low
+            bus.write_io(0x42, BusWidth::Byte, 0x00).unwrap(); // divisor high
+            bus.write_io(0x61, BusWidth::Byte, 0x03).unwrap(); // GATE2 + data enable
+        });
+        let clock_hz = machine.profile.clock_hz;
+        let chunk = clock_hz / 100_000; // ~10 us, mimicking per-instruction advance
+        for _ in 0..2_000 {
+            machine.advance_devices_clocks(chunk); // ~20 ms total
+        }
+        let pcm = machine.render_audio(OPL_NATIVE_HZ as usize / 50);
+        let peak = pcm
+            .iter()
+            .map(|&(l, r)| i32::from(l).abs().max(i32::from(r).abs()))
+            .max()
+            .unwrap_or(0);
+        assert!(
+            peak < 1_200,
+            "an ultrasonic PIT2 square wave should average down instead of aliasing at full scale, peak {peak}"
         );
     }
 
