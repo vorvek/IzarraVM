@@ -1,5 +1,5 @@
 //! Host side of the RTC/CMOS: seed the clock from host local time at startup
-//! and persist the 64-byte NVRAM image to a `cmos.bin` next to the C: root.
+//! and persist the 64-byte NVRAM image to `cmos.bin` next to `izarravm.conf`.
 //!
 //! The local-time read uses the `time` crate's `now_local()`, which is sound
 //! only when called before any extra threads are spawned. Startup runs this on
@@ -51,9 +51,9 @@ fn from_offset(now: OffsetDateTime) -> SeedTime {
     }
 }
 
-/// Path to the persisted CMOS image, next to the resolved C: root.
+/// Path to the persisted CMOS image, beside `izarravm.conf`.
 pub fn cmos_path(c_root: &Path) -> PathBuf {
-    c_root.join("cmos.bin")
+    c_root.parent().unwrap_or(c_root).join("cmos.bin")
 }
 
 /// Everything the emulation thread needs to bring the RTC online: the host
@@ -66,7 +66,7 @@ pub struct RtcSetup {
 }
 
 impl RtcSetup {
-    /// Read host local time and resolve the cmos.bin path from the C: root.
+    /// Read host local time and resolve the cmos.bin path beside the C: root.
     pub fn from_c_root(c_root: &Path) -> Self {
         Self {
             seed: read_host_time(),
@@ -150,8 +150,9 @@ mod tests {
     #[test]
     fn load_round_trips_a_saved_image() {
         let dir = std::env::temp_dir().join(format!("izarra_cmos_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = cmos_path(&dir);
+        let c_root = dir.join("c_drive");
+        std::fs::create_dir_all(&c_root).unwrap();
+        let path = cmos_path(&c_root);
         let mut image = [0u8; 64];
         image[0x10] = 3;
         image[0x2f] = 0xab;
@@ -164,10 +165,20 @@ mod tests {
     #[test]
     fn wrong_size_file_is_treated_as_absent() {
         let dir = std::env::temp_dir().join(format!("izarra_cmos_bad_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = cmos_path(&dir);
+        let c_root = dir.join("c_drive");
+        std::fs::create_dir_all(&c_root).unwrap();
+        let path = cmos_path(&c_root);
         std::fs::write(&path, [0u8; 32]).unwrap();
         assert!(load_cmos_file(&path).is_none());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cmos_path_sits_beside_c_root() {
+        let c_root = PathBuf::from("/home/user/.izarravm/c_drive");
+        assert_eq!(
+            cmos_path(&c_root),
+            PathBuf::from("/home/user/.izarravm/cmos.bin")
+        );
     }
 }
