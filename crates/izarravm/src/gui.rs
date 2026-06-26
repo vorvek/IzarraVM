@@ -635,6 +635,7 @@ pub struct GuiApp {
     // motion and buttons are forwarded to the VM. Ctrl+F2 releases it. Entered
     // by clicking the framebuffer image.
     input_captured: bool,
+    guest_modifiers: GuestModifiers,
     // Last button mask forwarded to the VM, so a button press or release is sent
     // even on a frame with no pointer motion.
     last_buttons: u8,
@@ -741,6 +742,7 @@ impl GuiApp {
             rtc_setup,
             title,
             input_captured: false,
+            guest_modifiers: GuestModifiers::default(),
             last_buttons: 0,
             screen_rect: None,
             abs_x: 0.0,
@@ -913,11 +915,20 @@ impl GuiApp {
         self.last_buttons = 0;
         if capture {
             // Start the guest cursor centred; raw motion accumulates from there.
+            self.guest_modifiers = GuestModifiers::default();
             self.abs_x = MOUSE_GUEST_MAX_X as f32 / 2.0;
             self.abs_y = MOUSE_GUEST_MAX_Y as f32 / 2.0;
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::Locked));
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
         } else {
+            let mut codes = Vec::new();
+            push_modifier_delta(self.guest_modifiers, GuestModifiers::default(), &mut codes);
+            self.guest_modifiers = GuestModifiers::default();
+            if !codes.is_empty() {
+                if let Some(emu) = &self.emu {
+                    emu.send_keys(codes);
+                }
+            }
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::None));
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
         }
@@ -962,20 +973,33 @@ impl GuiApp {
         let mut codes: Vec<u8> = Vec::new();
         let mut buttons = self.last_buttons;
         let mut moved = false;
+        let mut key_press_emitted = false;
         let ppp = ctx.pixels_per_point().max(0.01);
         for event in &raw_input.events {
             match event {
                 egui::Event::Key {
                     key,
-                    physical_key,
+                    physical_key: _,
                     pressed,
+                    repeat,
                     modifiers,
-                    ..
-                } => codes.extend(key_event_to_set1(
-                    physical_key.unwrap_or(*key),
-                    *pressed,
-                    *modifiers,
-                )),
+                } => {
+                    let next = GuestModifiers::from_egui(*modifiers);
+                    push_modifier_delta(self.guest_modifiers, next, &mut codes);
+                    self.guest_modifiers = next;
+                    if !*repeat {
+                        let key_codes = key_event_to_set1(*key, *pressed);
+                        key_press_emitted |= *pressed && !key_codes.is_empty();
+                        codes.extend(key_codes);
+                    }
+                }
+                egui::Event::Text(text) => {
+                    if key_press_emitted {
+                        key_press_emitted = false;
+                    } else {
+                        codes.extend(text_to_set1(text));
+                    }
+                }
                 // Raw relative motion from the locked, hidden cursor (winit
                 // DeviceEvent::MouseMotion, surfaced as MouseMoved). The cursor is
                 // pinned and cannot leave, so we accumulate the deltas into the guest
@@ -1010,6 +1034,9 @@ impl GuiApp {
                 _ => {}
             }
         }
+        let next = GuestModifiers::from_egui(raw_input.modifiers);
+        push_modifier_delta(self.guest_modifiers, next, &mut codes);
+        self.guest_modifiers = next;
         raw_input.events.retain(|e| !is_captured_input_event(e));
 
         if !codes.is_empty() {
@@ -1482,21 +1509,29 @@ impl eframe::App for GuiApp {
         // the non-captured path runs here: forward keys to the guest when no egui
         // widget wants the keyboard, otherwise yield so the user can type in the UI.
         if !self.input_captured && !ctx.wants_keyboard_input() {
-            let codes: Vec<u8> = ctx.input(|i| {
-                i.events
-                    .iter()
-                    .flat_map(|e| match e {
-                        egui::Event::Key {
-                            key,
-                            physical_key,
-                            pressed,
-                            modifiers,
-                            ..
-                        } => key_event_to_set1(physical_key.unwrap_or(*key), *pressed, *modifiers),
-                        _ => Vec::new(),
-                    })
-                    .collect()
+            let mut guest_modifiers = self.guest_modifiers;
+            let codes = ctx.input(|i| {
+                let mut codes = Vec::new();
+                for event in &i.events {
+                    if let egui::Event::Key {
+                        key,
+                        pressed,
+                        repeat,
+                        modifiers,
+                        ..
+                    } = event
+                    {
+                        let next = GuestModifiers::from_egui(*modifiers);
+                        push_modifier_delta(guest_modifiers, next, &mut codes);
+                        guest_modifiers = next;
+                        if !*repeat {
+                            codes.extend(key_event_to_set1(*key, *pressed));
+                        }
+                    }
+                }
+                codes
             });
+            self.guest_modifiers = guest_modifiers;
             if !codes.is_empty() {
                 if let Some(emu) = &self.emu {
                     emu.send_keys(codes);
@@ -1562,6 +1597,53 @@ fn is_captured_input_event(event: &egui::Event) -> bool {
             | egui::Event::Zoom(_)
             | egui::Event::Touch { .. }
     )
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct GuestModifiers {
+    shift: bool,
+    ctrl: bool,
+    alt: bool,
+    altgr: bool,
+}
+
+impl GuestModifiers {
+    fn from_egui(modifiers: egui::Modifiers) -> Self {
+        let altgr = modifiers.alt && modifiers.ctrl;
+        Self {
+            shift: modifiers.shift,
+            ctrl: modifiers.ctrl && !altgr,
+            alt: modifiers.alt && !altgr,
+            altgr,
+        }
+    }
+}
+
+fn push_modifier_delta(from: GuestModifiers, to: GuestModifiers, codes: &mut Vec<u8>) {
+    if from.shift && !to.shift {
+        codes.push(0xaa);
+    }
+    if from.altgr && !to.altgr {
+        codes.extend_from_slice(&[0xe0, 0xb8]);
+    }
+    if from.alt && !to.alt {
+        codes.push(0xb8);
+    }
+    if from.ctrl && !to.ctrl {
+        codes.push(0x9d);
+    }
+    if !from.ctrl && to.ctrl {
+        codes.push(0x1d);
+    }
+    if !from.alt && to.alt {
+        codes.push(0x38);
+    }
+    if !from.altgr && to.altgr {
+        codes.extend_from_slice(&[0xe0, 0x38]);
+    }
+    if !from.shift && to.shift {
+        codes.push(0x2a);
+    }
 }
 
 /// egui Key to Set 1 scancode (make code). Covers the keys a user types at a
@@ -1648,38 +1730,23 @@ fn egui_key_to_set1(key: egui::Key) -> Option<u8> {
     })
 }
 
-/// Turn one host key event into Set 1 bytes. egui does not emit modifier keys as
-/// key events, so bracket the physical key with their make/break codes. Windows
-/// reports AltGr as Ctrl+Alt; send that pair as the right-Alt extended key.
-fn key_event_to_set1(key: egui::Key, pressed: bool, modifiers: egui::Modifiers) -> Vec<u8> {
+/// Turn one host key event into Set 1 bytes.
+fn key_event_to_set1(key: egui::Key, pressed: bool) -> Vec<u8> {
     let Some(make) = egui_key_to_set1(key) else {
         return Vec::new();
     };
-    let mut codes = Vec::with_capacity(7);
-    let altgr = modifiers.alt && modifiers.ctrl;
     if pressed {
-        if altgr {
-            codes.extend_from_slice(&[0xe0, 0x38]);
-        } else if modifiers.alt {
-            codes.push(0x38);
-        } else if modifiers.ctrl {
-            codes.push(0x1d);
-        }
-        if modifiers.shift {
-            codes.push(0x2a);
-        }
-        codes.push(make);
+        vec![make]
     } else {
-        codes.push(make | 0x80);
-        if modifiers.shift {
-            codes.push(0xaa);
-        }
-        if altgr {
-            codes.extend_from_slice(&[0xe0, 0xb8]);
-        } else if modifiers.alt {
-            codes.push(0xb8);
-        } else if modifiers.ctrl {
-            codes.push(0x9d);
+        vec![make | 0x80]
+    }
+}
+
+fn text_to_set1(text: &str) -> Vec<u8> {
+    let mut codes = Vec::new();
+    for ch in text.chars() {
+        if ch == '.' {
+            codes.extend_from_slice(&[0x34, 0xb4]);
         }
     }
     codes
@@ -1826,28 +1893,33 @@ mod tests {
 
     #[test]
     fn host_keys_emit_dos_modifiers_and_symbol_scancodes() {
-        let shift = egui::Modifiers {
+        let mut codes = Vec::new();
+        let shift = GuestModifiers::from_egui(egui::Modifiers {
             shift: true,
             ..Default::default()
-        };
-        assert_eq!(
-            key_event_to_set1(egui::Key::Num7, true, shift),
-            [0x2a, 0x08]
-        );
-        assert_eq!(
-            key_event_to_set1(egui::Key::Num7, false, shift),
-            [0x88, 0xaa]
-        );
+        });
+        push_modifier_delta(GuestModifiers::default(), shift, &mut codes);
+        codes.extend(key_event_to_set1(egui::Key::Num7, true));
+        codes.extend(key_event_to_set1(egui::Key::Num7, false));
+        push_modifier_delta(shift, GuestModifiers::default(), &mut codes);
+        assert_eq!(codes, [0x2a, 0x08, 0x88, 0xaa]);
 
-        let altgr = egui::Modifiers {
+        let altgr = GuestModifiers::from_egui(egui::Modifiers {
             alt: true,
             ctrl: true,
             ..Default::default()
-        };
-        assert_eq!(
-            key_event_to_set1(egui::Key::Num2, true, altgr),
-            [0xe0, 0x38, 0x03]
-        );
+        });
+        let mut altgr_codes = Vec::new();
+        push_modifier_delta(GuestModifiers::default(), altgr, &mut altgr_codes);
+        altgr_codes.extend(key_event_to_set1(egui::Key::Num2, true));
+        assert_eq!(altgr_codes, [0xe0, 0x38, 0x03]);
         assert_eq!(egui_key_to_set1(egui::Key::Backslash), Some(0x2b));
+    }
+
+    #[test]
+    fn repeated_key_press_does_not_need_modifier_wrapping() {
+        assert_eq!(key_event_to_set1(egui::Key::ArrowUp, true), [0x48]);
+        assert_eq!(key_event_to_set1(egui::Key::ArrowUp, false), [0xc8]);
+        assert_eq!(text_to_set1("."), [0x34, 0xb4]);
     }
 }

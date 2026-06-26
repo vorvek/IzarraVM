@@ -619,6 +619,46 @@ static int dir_arg_is_directory(const char *arg)
     return t_findfirst(arg, 0x10, probe) == 0 && (probe[DTA_ATTR] & 0x10) != 0;
 }
 
+static void parse_dir_args(const char *arg, char *filespec, int *pause)
+{
+    const char *p = arg;
+    *pause = 0;
+    filespec[0] = 0;
+    while (*p) {
+        char tok[80];
+        int i = 0;
+        while (*p == ' ' || *p == '\t') {
+            p++;
+        }
+        while (*p && *p != ' ' && *p != '\t' && i < (int)sizeof(tok) - 1) {
+            tok[i++] = *p++;
+        }
+        while (*p && *p != ' ' && *p != '\t') {
+            p++;
+        }
+        tok[i] = 0;
+        if (tok[0] == '/' && up(tok[1]) == 'P' && tok[2] == 0) {
+            *pause = 1;
+        } else if (tok[0] && filespec[0] == 0) {
+            strcpy(filespec, tok);
+        }
+    }
+}
+
+static void dir_count_line(int pause, int *lines)
+{
+    if (!pause) {
+        return;
+    }
+    (*lines)++;
+    if (*lines >= 23) {
+        t_puts("Press any key to continue . . .");
+        t_getkey();
+        t_putln("");
+        *lines = 0;
+    }
+}
+
 static void build_dir_spec(const char *arg, char *spec, char *display)
 {
     char shown[80];
@@ -642,21 +682,30 @@ static void build_dir_spec(const char *arg, char *spec, char *display)
 static void cmd_dir(const char *arg)
 {
     static unsigned char dta[43];
+    char filespec[80];
     char spec[80];
     char display[80];
     unsigned files = 0;
     unsigned dirs = 0;
     unsigned long bytes = 0;
+    int pause;
+    int lines = 0;
 
-    build_dir_spec(arg, spec, display);
+    parse_dir_args(arg, filespec, &pause);
+    build_dir_spec(filespec, spec, display);
     t_putln("");
+    dir_count_line(pause, &lines);
     t_putln(" Volume in drive C is TOKA-DOS");
+    dir_count_line(pause, &lines);
     t_puts(" Directory of  ");
     t_putln(display);
+    dir_count_line(pause, &lines);
     t_putln("");
+    dir_count_line(pause, &lines);
 
     if (t_findfirst(spec, 0x10, dta) != 0) {
         t_putln("File not found");
+        dir_count_line(pause, &lines);
         return;
     }
     do {
@@ -679,6 +728,7 @@ static void cmd_dir(const char *arg)
         t_puts("  ");
         put_dos_time(word_at(dta + DTA_TIME));
         t_putln("");
+        dir_count_line(pause, &lines);
     } while (t_findnext(dta) == 0);
 
     put_ulong_width(files, 10);

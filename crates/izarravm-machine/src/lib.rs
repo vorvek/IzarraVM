@@ -688,12 +688,12 @@ struct TimingFactors {
     micros_per_clock: f64,   // 1e6 / clock_hz (OPL and DSP settle)
     pit_per_clock: f64,      // PIT_INPUT_HZ / clock_hz
     margo_ns_per_clock: f64, // 1e9 / clock_hz
-    inv_clock: f64,          // 1 / clock_hz (DSP sample phase and the speaker)
+    inv_clock: f64,          // 1 / clock_hz (DSP sample phase)
     // CPU clocks in one 44.1 kHz DAC sample. The run loop batches instructions
     // up to this many clocks before servicing devices once, so the per-clock
-    // fine-samplers (the PC speaker reads ch2 OUT once per advance_devices, the
-    // DSP/CD producers step at the DAC rate) still see at most one sample of
-    // time per call and never alias. >=1 in every mode (clock_hz >> 44100).
+    // fine-samplers (the DSP/CD producers step at the DAC rate) still see at
+    // most one sample of time per call and never alias. >=1 in every mode
+    // (clock_hz >> 44100).
     clocks_per_audio_sample: u64,
 }
 
@@ -22214,10 +22214,10 @@ mod tests {
     #[test]
     fn audio_sample_cap_is_one_dac_sample_and_never_zero() {
         // The run-loop batch services devices once per cap clocks; the cap must be
-        // exactly one 44.1 kHz DAC sample so the PC speaker (samples ch2 OUT once
-        // per advance_devices) and the DSP/CD producers never alias, and never 0
-        // (which would stall the batch). Checked at the live 266 MHz default and a
-        // pathologically slow clock where the floor division would otherwise be 0.
+        // exactly one 44.1 kHz DAC sample so the DSP/CD producers never alias, and
+        // never 0 (which would stall the batch). Checked at the live 266 MHz
+        // default and a pathologically slow clock where the floor division would
+        // otherwise be 0.
         assert_eq!(
             TimingFactors::for_clock(266_000_000).clocks_per_audio_sample,
             266_000_000 / u64::from(DAC_HZ)
@@ -30765,6 +30765,40 @@ mod tests {
             .map(|e| e.file_name())
             .collect();
         panic!("file {name} not found on C: (have: {have:?})");
+    }
+
+    #[test]
+    fn toka_dir_accepts_pause_switch_before_filespec() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = izarravm_firmware::toka_dos_system_files();
+        izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format)
+            .unwrap();
+        std::fs::write(dir.path().join("ALPHA.EXE"), b"not a real exe").unwrap();
+        std::fs::write(dir.path().join("BETA.TXT"), b"text").unwrap();
+        std::fs::write(
+            dir.path().join("AUTOEXEC.BAT"),
+            "@ECHO OFF\r\nDIR /P *.EXE > DIRP.TXT\r\n",
+        )
+        .unwrap();
+
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .unwrap();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        machine.set_toka_c_root(dir.path().to_path_buf());
+        machine.run_until_halt_or_cycles(60_000_000).unwrap();
+
+        let out = read_c_file(dir.path(), "DIRP.TXT");
+        assert!(
+            out.contains("ALPHA    EXE"),
+            "DIR /P *.EXE lists matching EXE files; got:\n{out}"
+        );
+        assert!(
+            !out.contains("BETA     TXT"),
+            "DIR /P *.EXE does not treat /P as the filespec; got:\n{out}"
+        );
     }
 
     #[test]
