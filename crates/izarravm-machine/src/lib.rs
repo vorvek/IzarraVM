@@ -16672,6 +16672,36 @@ mod tests {
         ); // ¿ 0xA8
     }
 
+    #[test]
+    fn es_dead_keys_compose_accents() {
+        // Layout 2 = ES. 0x28 = acute dead key, 0x1a = grave dead key.
+        // acute + a -> a-acute (CP437 0xA0), reported with a's scancode 0x1e.
+        assert_eq!(
+            int16_read_after_with_layout(2, &[0x28, 0xa8, 0x1e, 0x9e]),
+            0x1ea0
+        );
+        // grave + e -> e-grave (0x8A), e scancode 0x12.
+        assert_eq!(
+            int16_read_after_with_layout(2, &[0x1a, 0x9a, 0x12, 0x92]),
+            0x128a
+        );
+        // diaeresis (shift+0x28) + u -> u-diaeresis (0x81), u scancode 0x16.
+        assert_eq!(
+            int16_read_after_with_layout(2, &[0x2a, 0x28, 0xa8, 0xaa, 0x16, 0x96]),
+            0x1681
+        );
+        // acute + space -> the spacing acute ' (0x27), space scancode 0x39.
+        assert_eq!(
+            int16_read_after_with_layout(2, &[0x28, 0xa8, 0x39, 0xb9]),
+            0x3927
+        );
+        // acute + t (no composed form) -> first key read back is the flush ' (0x27).
+        assert_eq!(
+            int16_read_after_with_layout(2, &[0x28, 0xa8, 0x14, 0x94]),
+            0x1427
+        );
+    }
+
     /// Same path as `int16_read_after`, but the program reads with AH=10h (the
     /// enhanced read). Before the DOS keyboard ROM aliased AH=10h to the AH=00h
     /// reader, this fell through the int16 dispatch and returned stale AX.

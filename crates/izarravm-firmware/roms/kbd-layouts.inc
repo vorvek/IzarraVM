@@ -200,3 +200,115 @@ kbd_deadkey_comp:
     db 0xa0,0x82,0xa1,0xa2,0xa3,0,   0xb5,0x90,0xd6,0xe0,0xe9,0     ; acute
     db 0x83,0x88,0x8c,0x93,0x96,0,   0xb6,0xd2,0xd7,0xe2,0xea,0     ; circumflex
     db 0x84,0x89,0x8b,0x94,0x81,0x98,0x8e,0xd3,0xd8,0x99,0x9a,0     ; diaeresis (y -> 0x98)
+
+; kb_deadkey: dead-key state machine, shared by both INT 09h ISRs.
+; In:  AL = layout ASCII for this key, BL = make scancode, DS = BDA segment.
+; Out: CF=0 -> caller enqueues AL as usual (AL may be a composed char).
+;      CF=1 -> caller enqueues nothing (key swallowed or fully handled here).
+kb_deadkey:
+    push cx
+    push si
+    push di
+    cmp byte [KB_DEAD], 0
+    jne .have_pending
+    call .lookup_dead          ; -> AH = accent id (0 if not dead)
+    test ah, ah
+    jz .pass
+    mov [KB_DEAD], ah
+    jmp .swallow
+.have_pending:
+    call .lookup_dead          ; -> AH = accent id (0 if not dead)
+    test ah, ah
+    jz .compose
+    push ax
+    call .flush
+    pop ax
+    mov [KB_DEAD], ah
+    jmp .swallow
+.compose:
+    movzx di, byte [KB_DEAD]
+    dec di
+    mov si, kbd_deadkey_bases
+    xor cx, cx
+.col_scan:
+    cmp cx, 12
+    jae .no_match
+    mov ah, [cs:si]
+    cmp ah, al
+    je .col_found
+    inc cx
+    inc si
+    jmp .col_scan
+.col_found:
+    ; CX = column (0..11), DI = row (0..3), BL = make scancode
+    ; want: kbd_deadkey_comp[di*12 + cx]
+    push bx                         ; save make scancode
+    mov bx, cx                      ; BX = column
+    mov si, di
+    imul si, si, 12                 ; SI = row * 12
+    add si, bx                      ; SI = row*12 + col
+    add si, kbd_deadkey_comp
+    mov ah, [cs:si]
+    pop bx                          ; restore make scancode
+    test ah, ah
+    jz .no_match
+    mov al, ah
+    mov byte [KB_DEAD], 0
+    jmp .pass
+.no_match:
+    push ax
+    call .flush
+    pop ax
+    mov byte [KB_DEAD], 0
+    cmp al, ' '
+    je .swallow
+    jmp .pass
+.pass:
+    pop di
+    pop si
+    pop cx
+    clc
+    ret
+.swallow:
+    pop di
+    pop si
+    pop cx
+    stc
+    ret
+.lookup_dead:
+    cmp byte [KB_ALTGR], 0
+    jne .ld_none
+    mov ah, 0
+    test byte [KB_FLAGS], 0x03
+    jz .ld_noshift
+    mov ah, 1
+.ld_noshift:
+    mov cl, [KB_LAYOUT]
+    mov si, kbd_deadkey_desc
+.ld_loop:
+    mov ch, [cs:si]
+    cmp ch, 0xff
+    je .ld_none
+    cmp ch, cl
+    jne .ld_next
+    mov ch, [cs:si + 1]
+    cmp ch, bl
+    jne .ld_next
+    mov ch, [cs:si + 2]
+    cmp ch, ah
+    jne .ld_next
+    mov ah, [cs:si + 3]
+    ret
+.ld_next:
+    add si, 4
+    jmp .ld_loop
+.ld_none:
+    xor ah, ah
+    ret
+.flush:
+    movzx si, byte [KB_DEAD]
+    dec si
+    mov al, [cs:kbd_deadkey_flush + si]
+    mov ah, bl
+    call kb_enqueue
+    ret

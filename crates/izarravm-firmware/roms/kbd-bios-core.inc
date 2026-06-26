@@ -9,6 +9,7 @@
 %define KB_LAYOUT      0x0096      ; BDA: active keyboard layout index
 %define KB_PREFIX      0x0097      ; pending E0 extended-key prefix
 %define KB_ALTGR       0x0098      ; right Alt held
+%define KB_DEAD        0x0099      ; BDA: pending dead-key accent id (0 = none)
 
 ; INT 09h: keyboard hardware ISR
 int09:
@@ -104,6 +105,8 @@ int09:
     jne .not_left_alt
     xor al, al
 .not_left_alt:
+    call kb_deadkey
+    jc .deadkey_swallow
     ; Ctrl + letter -> control code (Ctrl-A = 1 .. Ctrl-Z = 26), as a real BIOS
     ; does, so a full-screen program reads Ctrl-S as ASCII 0x13 from INT 16h.
     test byte [KB_FLAGS], 0x04
@@ -130,6 +133,10 @@ int09:
 .enqueue_store:
     mov ah, bl                     ; scancode in AH, ASCII in AL
     call kb_enqueue
+    pop si
+    pop cx
+    jmp .eoi
+.deadkey_swallow:
     pop si
     pop cx
     jmp .eoi

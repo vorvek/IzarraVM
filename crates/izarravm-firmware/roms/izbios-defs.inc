@@ -26,6 +26,7 @@
 ; following AT keyboard status bytes in the BDA.
 %define KB_PREFIX      0x0097
 %define KB_ALTGR       0x0098
+%define KB_DEAD        0x0099      ; BDA: pending dead-key accent id (0 = none)
 ; CMOS index of the persisted layout (MC146818 ports 0x70/0x71). en-US is 0.
 %define KB_CMOS_LAYOUT 0x10
 ; Bytes per layout block: 128 each for unshifted, shifted, and AltGr.
