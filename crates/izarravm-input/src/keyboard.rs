@@ -114,6 +114,8 @@ fn keycode_to_set1(code: KeyCode) -> Option<(u8, bool)> {
 }
 
 /// Stable per-key id for the held set: the make code plus the extended flag.
+/// Keying on the Set 1 bytes (not KeyCode directly) avoids needing Ord/Hash on
+/// KeyCode and keeps the held set tied to the wire format.
 fn code_id(make: u8, extended: bool) -> u16 {
     u16::from(make) | (u16::from(extended) << 8)
 }
