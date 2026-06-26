@@ -17,9 +17,9 @@ use izarravm_cpu::{
 };
 pub use izarravm_video::MARGO_ID_VALUE;
 use izarravm_video::{
-    DAC_ENTRIES, DISTIRA_FB_SIZE, DISTIRA_MMIO_SIZE, Distira, MARGO_MMIO_SIZE, MARGO_VBE_MODES,
-    MARGO_VRAM_SIZE, Margo, TextFrame, VGA_MODE13H_BASE, VGA_PLANAR_WINDOW_SIZE, VGA_TEXT_BASE,
-    VGA_TEXT_MEMORY_SIZE, VGA_TEXT_PAGE_STRIDE, Vga, VgaRaster, VideoMode, bytes_per_pixel,
+    CGA_FB_SIZE, DAC_ENTRIES, DISTIRA_FB_SIZE, DISTIRA_MMIO_SIZE, Distira, MARGO_MMIO_SIZE,
+    MARGO_VBE_MODES, MARGO_VRAM_SIZE, Margo, TextFrame, VGA_MODE13H_BASE, VGA_PLANAR_WINDOW_SIZE,
+    VGA_TEXT_MEMORY_SIZE, VGA_TEXT_PAGE_STRIDE, Vga, VgaRaster, VideoMode, bytes_per_pixel, font,
     pixel_format, vbe_mode,
 };
 use thiserror::Error;
@@ -61,6 +61,7 @@ pub use uma::{EMS_FRAME_SIZE, UmaReservation, UmaReservationMap, UmaUse};
 /// even though this machine does not yet map a BIOS image into that span.
 const VGA_BIOS_BASE: u32 = UPPER_MEMORY_BASE; // 0xC0000
 const VGA_BIOS_SIZE: u32 = 0x8000; // 32 KiB
+const VGA_BIOS_SEGMENT: u16 = (VGA_BIOS_BASE >> 4) as u16; // 0xC000
 const VGA_BIOS_INT1D_VIDEO_TABLE_OFF: u16 = 0x1000;
 const VGA_BIOS_INT1D_VIDEO_TABLE_ADDR: u32 = VGA_BIOS_BASE + VGA_BIOS_INT1D_VIDEO_TABLE_OFF as u32;
 const VGA_BIOS_FONT_TABLE_OFF: u16 = 0x2000;
@@ -144,6 +145,177 @@ const DISTIRA_PCI_DEVICE_ID: u16 = 0x0001;
 const DISTIRA_PCI_REVISION: u8 = 0x02;
 pub const LOW_BIOS_BASE: u32 = 0x000f_0000;
 pub const BIOS_ROM_SIZE: usize = 64 * 1024;
+const BIOS_ROM_SEGMENT: u16 = (LOW_BIOS_BASE >> 4) as u16;
+const BIOS_FONT_8X8_ROM_OFFSET: u16 = 0xC000;
+const BIOS_FONT_8X14_ROM_OFFSET: u16 = 0xC800;
+const BIOS_FONT_8X16_ROM_OFFSET: u16 = 0xD600;
+const BIOS_FONT_8X8_HIGH_ROM_OFFSET: u16 = 0xE600;
+const INT10_STATE_HARDWARE_LEN: usize = 0x46;
+const INT10_STATE_CGA_LATCH_OFFSET: usize = 0x42;
+const INT10_STATE_CGA_LATCH_MARKER: [u8; 2] = *b"CG";
+const INT10_STATE_BDA_LEN: usize = 0x4ab - 0x449 + 1;
+const INT10_STATE_DAC_LEN: usize = 3 + DAC_ENTRIES * 3 + 1;
+const INT10_STATIC_FUNCTIONALITY: [u8; 16] = [
+    0xff, 0xe0, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x07, 0x02, 0x08, 0xe7, 0x0c, 0x00, 0x00, 0x00, 0x00,
+];
+const INT10_VIDEO_SAVE_POINTER_TABLE_OFFSET: u16 = 0x0010;
+const INT10_VIDEO_SAVE_POINTER_TABLE_PTRS: usize = 7;
+const INT10_VIDEO_PARAM_TABLE_OFFSET: u16 = 0x0030;
+const INT10_VIDEO_PARAM_ENTRY_LEN: usize = 64;
+const INT10_VIDEO_PARAM_TABLE_ENTRIES: usize = 30;
+const BDA_VIDEO_SAVE_POINTER: usize = 0x4a8;
+const INT10_VIDEO_PARAM_ENTRIES: &[(usize, [u8; INT10_VIDEO_PARAM_ENTRY_LEN])] = &[
+    (
+        0x04,
+        [
+            0x28, 0x18, 0x08, 0x00, 0x08, 0x09, 0x03, 0x00, 0x02, 0x63, 0x2d, 0x27, 0x28, 0x90,
+            0x2b, 0x80, 0xbf, 0x1f, 0x00, 0xc1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x9c, 0x8e,
+            0x8f, 0x14, 0x00, 0x96, 0xb9, 0xa2, 0xff, 0x00, 0x13, 0x15, 0x17, 0x02, 0x04, 0x06,
+            0x07, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x01, 0x00, 0x03, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x30, 0x0f, 0x0f, 0xff,
+        ],
+    ),
+    (
+        0x05,
+        [
+            0x28, 0x18, 0x08, 0x00, 0x08, 0x09, 0x03, 0x00, 0x02, 0x63, 0x2d, 0x27, 0x28, 0x90,
+            0x2b, 0x80, 0xbf, 0x1f, 0x00, 0xc1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x9c, 0x8e,
+            0x8f, 0x14, 0x00, 0x96, 0xb9, 0xa2, 0xff, 0x00, 0x13, 0x15, 0x17, 0x02, 0x04, 0x06,
+            0x07, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x01, 0x00, 0x03, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x30, 0x0f, 0x0f, 0xff,
+        ],
+    ),
+    (
+        0x06,
+        [
+            0x50, 0x18, 0x08, 0x00, 0x10, 0x01, 0x01, 0x00, 0x06, 0x63, 0x5f, 0x4f, 0x50, 0x82,
+            0x54, 0x80, 0xbf, 0x1f, 0x00, 0xc1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x9c, 0x8e,
+            0x8f, 0x28, 0x00, 0x96, 0xb9, 0xc2, 0xff, 0x00, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17,
+            0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x01, 0x00, 0x01, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x0d, 0x0f, 0xff,
+        ],
+    ),
+    (
+        0x07,
+        [
+            0x50, 0x18, 0x10, 0x00, 0x10, 0x00, 0x03, 0x00, 0x02, 0x66, 0x5f, 0x4f, 0x50, 0x82,
+            0x55, 0x81, 0xbf, 0x1f, 0x00, 0x4f, 0x0d, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x9c, 0x8e,
+            0x8f, 0x28, 0x0f, 0x96, 0xb9, 0xa3, 0xff, 0x00, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08,
+            0x08, 0x10, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x0e, 0x00, 0x0f, 0x08, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x10, 0x0a, 0x0f, 0xff,
+        ],
+    ),
+    (
+        0x0d,
+        [
+            0x28, 0x18, 0x08, 0x00, 0x20, 0x09, 0x0f, 0x00, 0x06, 0x63, 0x2d, 0x27, 0x28, 0x90,
+            0x2b, 0x80, 0xbf, 0x1f, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x9c, 0x8e,
+            0x8f, 0x14, 0x00, 0x96, 0xb9, 0xe3, 0xff, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+            0x07, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x01, 0x00, 0x0f, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x0f, 0xff,
+        ],
+    ),
+    (
+        0x0e,
+        [
+            0x50, 0x18, 0x08, 0x00, 0x40, 0x01, 0x0f, 0x00, 0x06, 0x63, 0x5f, 0x4f, 0x50, 0x82,
+            0x54, 0x80, 0xbf, 0x1f, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x9c, 0x8e,
+            0x8f, 0x28, 0x00, 0x96, 0xb9, 0xe3, 0xff, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+            0x07, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x01, 0x00, 0x0f, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x0f, 0xff,
+        ],
+    ),
+    (
+        0x11,
+        [
+            0x50, 0x18, 0x0e, 0x00, 0x80, 0x01, 0x0f, 0x00, 0x06, 0xa3, 0x5f, 0x4f, 0x50, 0x82,
+            0x54, 0x80, 0xbf, 0x1f, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x83, 0x85,
+            0x5d, 0x28, 0x0f, 0x63, 0xba, 0xe3, 0xff, 0x00, 0x08, 0x00, 0x00, 0x18, 0x18, 0x00,
+            0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x0f, 0xff,
+        ],
+    ),
+    (
+        0x12,
+        [
+            0x50, 0x18, 0x0e, 0x00, 0x80, 0x01, 0x0f, 0x00, 0x06, 0xa3, 0x5f, 0x4f, 0x50, 0x82,
+            0x54, 0x80, 0xbf, 0x1f, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x83, 0x85,
+            0x5d, 0x28, 0x0f, 0x63, 0xba, 0xe3, 0xff, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x14,
+            0x07, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x01, 0x00, 0x0f, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x0f, 0xff,
+        ],
+    ),
+    (
+        0x17,
+        [
+            0x28, 0x18, 0x10, 0x00, 0x08, 0x08, 0x03, 0x00, 0x02, 0x67, 0x2d, 0x27, 0x28, 0x90,
+            0x2b, 0xa0, 0xbf, 0x1f, 0x00, 0x4f, 0x0d, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x9c, 0x8e,
+            0x8f, 0x14, 0x1f, 0x96, 0xb9, 0xa3, 0xff, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x14,
+            0x07, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x0c, 0x00, 0x0f, 0x08, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x10, 0x0e, 0x0f, 0xff,
+        ],
+    ),
+    (
+        0x18,
+        [
+            0x50, 0x18, 0x10, 0x00, 0x10, 0x00, 0x03, 0x00, 0x02, 0x67, 0x5f, 0x4f, 0x50, 0x82,
+            0x55, 0x81, 0xbf, 0x1f, 0x00, 0x4f, 0x0d, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x9c, 0x8e,
+            0x8f, 0x28, 0x1f, 0x96, 0xb9, 0xa3, 0xff, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x14,
+            0x07, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x0c, 0x00, 0x0f, 0x08, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x10, 0x0e, 0x0f, 0xff,
+        ],
+    ),
+    (
+        0x19,
+        [
+            0x50, 0x18, 0x10, 0x00, 0x10, 0x00, 0x03, 0x00, 0x02, 0x66, 0x5f, 0x4f, 0x50, 0x82,
+            0x55, 0x81, 0xbf, 0x1f, 0x00, 0x4f, 0x0d, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x9c, 0x8e,
+            0x8f, 0x28, 0x0f, 0x96, 0xb9, 0xa3, 0xff, 0x00, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08,
+            0x08, 0x10, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x0e, 0x00, 0x0f, 0x08, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x10, 0x0a, 0x0f, 0xff,
+        ],
+    ),
+    (
+        0x1a,
+        [
+            0x50, 0x1d, 0x10, 0x00, 0x00, 0x01, 0x0f, 0x00, 0x06, 0xe3, 0x5f, 0x4f, 0x50, 0x82,
+            0x54, 0x80, 0x0b, 0x3e, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xea, 0x8c,
+            0xdf, 0x28, 0x00, 0xe7, 0x04, 0xe3, 0xff, 0x00, 0x3f, 0x00, 0x3f, 0x00, 0x3f, 0x00,
+            0x3f, 0x00, 0x3f, 0x00, 0x3f, 0x00, 0x3f, 0x00, 0x3f, 0x01, 0x00, 0x0f, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x0f, 0xff,
+        ],
+    ),
+    (
+        0x1b,
+        [
+            0x50, 0x1d, 0x10, 0x00, 0x00, 0x01, 0x0f, 0x00, 0x06, 0xe3, 0x5f, 0x4f, 0x50, 0x82,
+            0x54, 0x80, 0x0b, 0x3e, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xea, 0x8c,
+            0xdf, 0x28, 0x00, 0xe7, 0x04, 0xe3, 0xff, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x14,
+            0x07, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x01, 0x00, 0x0f, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x0f, 0xff,
+        ],
+    ),
+    (
+        0x1c,
+        [
+            0x28, 0x18, 0x08, 0x00, 0x00, 0x01, 0x0f, 0x00, 0x0e, 0x63, 0x5f, 0x4f, 0x50, 0x82,
+            0x54, 0x80, 0xbf, 0x1f, 0x00, 0x41, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x9c, 0x8e,
+            0x8f, 0x28, 0x40, 0x96, 0xb9, 0xa3, 0xff, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+            0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x41, 0x00, 0x0f, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x40, 0x05, 0x0f, 0xff,
+        ],
+    ),
+    (
+        0x1d,
+        [
+            0x64, 0x24, 0x10, 0x00, 0x00, 0x01, 0x0f, 0x00, 0x06, 0xe3, 0x7f, 0x63, 0x63, 0x83,
+            0x6b, 0x1b, 0x72, 0xf0, 0x00, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x59, 0x8d,
+            0x57, 0x32, 0x00, 0x57, 0x73, 0xe3, 0xff, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x14,
+            0x07, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x01, 0x00, 0x0f, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x0f, 0xff,
+        ],
+    ),
+];
 pub const BOOT_IMAGE_SIZE: usize = 1440 * 1024;
 pub const BOOT_SECTOR_ADDRESS: usize = 0x7c00;
 pub const BOOT_STAGE2_ADDRESS: usize = 0x8000;
@@ -494,8 +666,6 @@ const OPL_NATIVE_HZ: u32 = 49_716;
 const DAC_HZ: u32 = 44_100;
 /// Standard PC PIT input clock frequency.
 const PIT_INPUT_HZ: u32 = 1_193_182;
-/// VGA 25.175 MHz dot clock (standard 640x480 and related modes).
-const VGA_DOT_HZ: u64 = 25_175_000;
 /// Fallback cadence (Hz) for retiring the AD1848 autocal (ACI) window when the
 /// programmed sample rate is one of the two unsupported XTAL1 selects
 /// (`rate_hz()==0`). On real hardware the autocal converter clock retires the
@@ -518,7 +688,6 @@ struct TimingFactors {
     micros_per_clock: f64,   // 1e6 / clock_hz (OPL and DSP settle)
     pit_per_clock: f64,      // PIT_INPUT_HZ / clock_hz
     margo_ns_per_clock: f64, // 1e9 / clock_hz
-    vga_dots_per_clock: f64, // VGA_DOT_HZ / clock_hz
     inv_clock: f64,          // 1 / clock_hz (DSP sample phase and the speaker)
     // CPU clocks in one 44.1 kHz DAC sample. The run loop batches instructions
     // up to this many clocks before servicing devices once, so the per-clock
@@ -535,7 +704,6 @@ impl TimingFactors {
             micros_per_clock: 1_000_000.0 / c,
             pit_per_clock: PIT_INPUT_HZ as f64 / c,
             margo_ns_per_clock: 1_000_000_000.0 / c,
-            vga_dots_per_clock: VGA_DOT_HZ as f64 / c,
             inv_clock: 1.0 / c,
             clocks_per_audio_sample: (clock_hz / u64::from(DAC_HZ)).max(1),
         }
@@ -561,6 +729,7 @@ pub struct Machine {
     distira: Distira,
     pci: PciConfig,
     margo_active: bool,
+    text_scanline_override: Option<u16>,
     pending_soft_int: Option<u8>, // software-INT vector awaiting deferred dispatch
     // Set by MachineBus on any port I/O; the run loop's instruction batch reads
     // it to know when to stop and service devices (see run_until_clock). A field
@@ -1067,6 +1236,7 @@ impl Machine {
         // Lay the HLE entry stubs into ROM. INT 2Fh AX=4310h hands the guest the
         // XMS entry pointer; PSP:0005 reaches the CALL 5 adapter through the
         // low-memory DOS entry at 0000:00C0.
+        install_bios_font_mirror(&mut rom);
         rom[XMS_ENTRY_ROM_OFFSET..XMS_ENTRY_ROM_OFFSET + XMS_ENTRY_STUB.len()]
             .copy_from_slice(&XMS_ENTRY_STUB);
         rom[DOS_CALL5_ROM_OFFSET..DOS_CALL5_ROM_OFFSET + DOS_CALL5_ENTRY_STUB.len()]
@@ -1090,6 +1260,7 @@ impl Machine {
             distira,
             pci,
             margo_active: false,
+            text_scanline_override: None,
             pending_soft_int: None,
             io_touched: false,
             pending_toka_service: None,
@@ -2058,38 +2229,50 @@ impl Machine {
         ok
     }
 
-    fn int10_set_mode_number(&mut self, mode: u8) -> bool {
+    fn int10_set_mode_number(&mut self, requested_mode: u8) -> bool {
+        let mode = requested_mode & 0x7F;
+        let clear = requested_mode & 0x80 == 0;
         match mode {
             0x0D..=0x12 => {
                 if !self.set_vga_mode(mode) {
                     return false;
                 }
                 let cols = if mode == 0x0D { 40 } else { 80 };
-                self.set_bda_video_mode(mode, cols, 25);
+                self.set_bda_video_mode(requested_mode, cols, Self::video_text_rows(mode));
             }
             0x13 => {
                 self.video.set_mode13h();
                 self.margo_active = false;
                 self.distira.disable_display();
-                self.set_bda_video_mode(0x13, 40, 25);
+                self.set_bda_video_mode(requested_mode, 40, Self::video_text_rows(mode));
             }
             0x04..=0x06 => {
-                self.video.set_cga_mode(mode);
+                self.video.set_cga_mode_with_clear(mode, clear);
                 self.margo_active = false;
                 self.distira.disable_display();
                 let cols = if mode == 0x06 { 80 } else { 40 };
-                self.set_bda_video_mode(mode, cols, 25);
+                self.set_bda_video_mode(requested_mode, cols, Self::video_text_rows(mode));
             }
             0x00..=0x03 | 0x07 => {
-                self.video.set_text_mode();
                 self.margo_active = false;
                 self.distira.disable_display();
-                let cols = if mode <= 0x01 { 40 } else { 80 };
-                self.set_bda_video_mode(mode, cols, 25);
-                let _ = self.memory.write_u16(0x450, 0);
+                let cols: u16 = if mode <= 0x01 { 40 } else { 80 };
+                if mode == 0x07 {
+                    self.video.set_mono_text_mode();
+                } else if let Some(scanlines) = self.text_scanline_override {
+                    let _ = self
+                        .video
+                        .set_color_text_mode_scanlines(mode, scanlines, clear);
+                } else if mode <= 0x02 {
+                    let _ = self.video.set_cga_text_mode_with_clear(mode, clear);
+                } else {
+                    self.video.set_text_mode_columns(usize::from(cols));
+                }
+                self.set_bda_video_mode(requested_mode, cols, Self::video_text_rows(mode));
             }
             _ => return false,
         }
+        self.set_eax_al(Self::video_mode_set_return_al(mode));
         true
     }
 
@@ -2125,28 +2308,55 @@ impl Machine {
         }
         if ah == 0x05 {
             // INT 10h AH=05h SELECT ACTIVE DISPLAY PAGE (RBIL INTERRUP.A:2162).
-            // AL is the page number. The 80x25 color text page stride is 4096
-            // bytes (0x1000); the CRTC start address is a word/cell address in
-            // mode 03h's word mode, so page N sits at cell N*2048 and eight pages
-            // fill the 32 KB aperture. Routed through set_start_address so the
-            // change latches at the next vretrace (no mid-frame tear), matching
-            // what the BIOS writes to CRTC 0C/0Dh. Page 0 is the default.
-            let page = u32::from(al);
-            self.video
-                .set_start_address(page * (VGA_TEXT_PAGE_STRIDE / 2) as u32);
-            return;
-        }
-        if ah == 0x04 {
-            // No light pen is attached to the VGA profile, so the trigger flag is
-            // clear and the coordinate registers are left untouched.
-            self.set_eax_ah(0x00);
+            // AL is the page number. CGA graphics modes have only page 0; text
+            // modes page by moving the CRTC start address in character cells.
+            // EGA planar graphics modes page in byte-address units.
+            let mode = self.read_physical_u8(0x449) & 0x7F;
+            if matches!(mode, 0x04..=0x06) {
+                let _ = self.memory.write_u8(0x462, 0);
+                let _ = self.memory.write_u16(0x44e, 0);
+                return;
+            }
+            if let Some((page, page_start)) = self.ega_graphics_page_start(mode, al) {
+                self.video.set_start_address(page_start);
+                let _ = self.memory.write_u8(0x462, page);
+                let _ = self.memory.write_u16(0x44e, page_start as u16);
+                return;
+            }
+            let page = self.normalize_text_page(al);
+            let stride = self.text_page_stride();
+            let page_start = usize::from(page) * stride;
+            self.video.set_start_address((page_start / 2) as u32);
+            let _ = self.memory.write_u8(0x462, page);
+            let _ = self.memory.write_u16(0x44e, page_start as u16);
+            let pos = self.cursor_pos(page);
+            self.set_hardware_cursor_for_page(page, pos);
             return;
         }
         if ah == 0x0b {
-            // BH=0: BL is the border/overscan color (Attribute register 11h). BH=1
-            // is the CGA palette select, a rarely-used CGA-compat path; deferred.
-            if bh == 0x00 {
-                self.video.set_overscan(bl);
+            match bh {
+                // BH=0: BL is the border/overscan color. In CGA graphics it also
+                // sets the 3D9h background/foreground nibble plus intensity.
+                0x00 => {
+                    self.video.set_overscan(bl);
+                    if self.video.active_mode() == VideoMode::Cga {
+                        let current = self.video.cga_color_select();
+                        let _ = self
+                            .video
+                            .write_port(0x3D9, (current & !0x1F) | (bl & 0x1F));
+                    }
+                }
+                // BH=1: BL bit0 selects CGA palette 0 vs 1 for 320x200x4.
+                0x01 => {
+                    let current = self.video.cga_color_select();
+                    let _ = self
+                        .video
+                        .write_port(0x3D9, (current & !0x20) | ((bl & 1) << 5));
+                }
+                _ => {}
+            }
+            if self.video.is_cga_personality() {
+                self.sync_bda_cga_latches();
             }
             return;
         }
@@ -2156,6 +2366,10 @@ impl Machine {
         }
         if ah == 0x0d {
             self.int10_read_pixel();
+            return;
+        }
+        if ah == 0x04 {
+            self.int10_read_light_pen();
             return;
         }
         if ah == 0x10 {
@@ -2226,18 +2440,24 @@ impl Machine {
                 | (u32::from(cols & 0xff) << 8)
                 | u32::from(mode);
             self.cpu.registers.set_eax(eax);
-            // BH = active page 0; leave the rest of EBX intact.
-            let ebx = self.cpu.registers.ebx() & !0xFF00;
+            let page = self.read_physical_u8(0x462);
+            let ebx = (self.cpu.registers.ebx() & !0xFF00) | (u32::from(page) << 8);
             self.cpu.registers.set_ebx(ebx);
             return;
         }
         if ah == 0x1a {
-            // AH=1Ah display combination code. AL=00h reads, AL=01h writes (the write
-            // is cosmetic here). Report a VGA with an analog colour monitor: AL=1Ah
-            // marks the function supported, BL=08h is the active display code.
+            // AH=1Ah display combination code. AL=00h reads and AL=01h writes
+            // the BDA DCC byte, the same storage AH=1Bh reports.
             self.set_eax_al(0x1A);
-            if al == 0x00 {
-                self.set_bx(0x0008);
+            match al {
+                0x00 => {
+                    let dcc = self.read_physical_u8(0x48A);
+                    self.set_bx(u16::from(dcc));
+                }
+                0x01 => {
+                    let _ = self.memory.write_u8(0x48A, bl);
+                }
+                _ => {}
             }
             return;
         }
@@ -2273,11 +2493,22 @@ impl Machine {
         }
     }
 
+    fn uses_mono_crtc_base(&self) -> bool {
+        self.memory.read_u16(0x463).unwrap_or(0x03D4) == 0x03B4
+    }
+
+    fn active_display_combination_code(&self) -> u8 {
+        if self.uses_mono_crtc_base() {
+            0x07
+        } else {
+            0x08
+        }
+    }
+
     /// INT 10h AH=1Bh. Writes the 64-byte video state-information block at ES:DI with the
-    /// live mode, geometry, and display-combination fields, plus a static functionality
-    /// table pointer. Limit: only the commonly-read fields are populated and the static
-    /// table is pointed at the video BIOS segment rather than a fully built table; the
-    /// VGA-present check that programs run only tests AL == 0x1B.
+    /// live mode, geometry, CGA latch shadows, and display-combination fields, plus
+    /// a static functionality table pointer. Limit: only the commonly-read fields
+    /// are populated; the VGA-present check that programs run only tests AL == 0x1B.
     fn int10_state_info(&mut self) {
         let es = self.cpu.registers.segment(SegmentIndex::Es).base;
         let di = self.cpu.registers.edi() as u16;
@@ -2286,18 +2517,88 @@ impl Machine {
         let cols = self.read_guest_word(0x44a);
         let page = self.read_physical_u8(0x462);
         let rows_minus_1 = self.read_physical_u8(0x484);
+        let page_size = self.read_guest_word(0x44c);
+        let page_start = self.read_guest_word(0x44e);
+        let cursor_type = self.read_guest_word(0x460);
+        let char_height = self.read_guest_word(0x485);
         let mut block = [0u8; 64];
-        block[0..4].copy_from_slice(&0xC000_0000u32.to_le_bytes()); // C000:0000 func table
+        block[0..2].copy_from_slice(&0u16.to_le_bytes());
+        block[2..4].copy_from_slice(&VGA_BIOS_SEGMENT.to_le_bytes());
         block[4] = mode;
         block[5..7].copy_from_slice(&cols.to_le_bytes());
+        block[0x07..0x09].copy_from_slice(&page_size.to_le_bytes());
+        block[0x09..0x0B].copy_from_slice(&page_start.to_le_bytes());
+        for offset in 0..16 {
+            block[0x0B + offset] = self.read_physical_u8(0x450 + offset as u32);
+        }
+        block[0x1B..0x1D].copy_from_slice(&cursor_type.to_le_bytes());
         block[0x1D] = page;
-        block[0x1E..0x20].copy_from_slice(&0x03D4u16.to_le_bytes()); // CRTC base port
+        block[0x1E..0x20].copy_from_slice(&self.read_guest_word(0x463).to_le_bytes());
+        block[0x20] = self.read_physical_u8(0x465); // CGA mode-control shadow
+        block[0x21] = self.read_physical_u8(0x466); // CGA color-select shadow
         block[0x22] = rows_minus_1.wrapping_add(1); // rows on screen
-        block[0x25] = 0x08; // active display combination code (VGA colour)
-        block[0x29] = 8; // pages
-        block[0x2A] = 0x03; // 480 scan lines (VGA)
+        block[0x23..0x25].copy_from_slice(&char_height.to_le_bytes());
+        block[0x25] = self.read_physical_u8(0x48A);
+        block[0x27..0x29].copy_from_slice(&Self::video_color_count(mode).to_le_bytes());
+        block[0x29] = self.video_page_count(mode); // pages
+        block[0x2A] = self.video_scanline_code(mode);
         self.write_guest_block(addr, &block);
         self.set_eax_al(0x1B);
+    }
+
+    fn set_selected_text_scanlines(&mut self, al: u8) -> bool {
+        let mut flags = self.read_physical_u8(0x489);
+        let mut switches = self.read_physical_u8(0x488) & 0xF0;
+        flags &= !0x90;
+        match al {
+            0x00 => {
+                flags |= 0x80; // 200 scan lines
+                switches |= 0x08;
+                self.text_scanline_override = Some(200);
+            }
+            0x01 => {
+                switches |= 0x09;
+                self.text_scanline_override = Some(350);
+            }
+            0x02 => {
+                flags |= 0x10; // 400 scan lines
+                switches |= 0x09;
+                self.text_scanline_override = Some(400);
+            }
+            _ => return false,
+        }
+        let _ = self.memory.write_u8(0x488, switches);
+        let _ = self.memory.write_u8(0x489, flags);
+        true
+    }
+
+    fn text_scanlines_for_mode(&self, mode: u8) -> u16 {
+        self.text_scanline_override
+            .unwrap_or(if (mode & 0x7F) <= 0x02 { 200 } else { 400 })
+    }
+
+    fn video_color_count(mode: u8) -> u16 {
+        match mode & 0x7F {
+            0x04 | 0x05 => 4,
+            0x06 | 0x07 | 0x0F | 0x11 => 2,
+            0x13 => 256,
+            _ => 16,
+        }
+    }
+
+    fn video_scanline_code(&self, mode: u8) -> u8 {
+        match mode & 0x7F {
+            0x00..=0x03 => match self.text_scanlines_for_mode(mode) {
+                200 => 0,
+                350 => 1,
+                400 => 2,
+                _ => 2,
+            },
+            0x07 | 0x0F | 0x10 => 1, // 350 active scan lines
+            0x11 | 0x12 => 3,        // 480 active scan lines
+            0x04..=0x06 | 0x13 => 0, // 200 active scan lines
+            _ => 2,                  // VGA text modes default to 400
+        }
     }
 
     /// Record the current video mode in the BDA so apps that read it directly
@@ -2306,8 +2607,33 @@ impl Machine {
     fn set_bda_video_mode(&mut self, mode: u8, columns: u16, rows: u8) {
         let _ = self.memory.write_u8(0x449, mode);
         let _ = self.memory.write_u16(0x44a, columns);
+        let _ = self.memory.write_u16(0x44c, self.video_page_size(mode));
         let _ = self.memory.write_u8(0x484, rows.saturating_sub(1));
-        let _ = self.memory.write_u16(0x463, 0x03d4); // VGA CRTC base port
+        let _ = self
+            .memory
+            .write_u16(0x485, u16::from(self.video_char_height(mode)));
+        let _ = self.memory.write_u16(0x44e, 0);
+        let _ = self.memory.write_u8(0x462, 0);
+        for page in 0..8usize {
+            let _ = self.memory.write_u16(0x450 + page * 2, 0);
+        }
+        let _ = self
+            .memory
+            .write_u16(0x463, Self::video_crtc_base_port(mode));
+        let _ = self.memory.write_u8(0x487, 0x60 | (mode & 0x80));
+        let _ = self
+            .memory
+            .write_u8(0x48A, self.active_display_combination_code());
+        let _ = seed_bda_video_save_pointer(&mut self.memory);
+        if let Some(mode_control) = Self::cga_bda_mode_control(mode) {
+            let _ = self.memory.write_u8(0x465, mode_control);
+            let _ = self
+                .memory
+                .write_u8(0x466, Self::cga_bda_color_select(mode));
+        } else {
+            let _ = self.memory.write_u8(0x465, 0);
+            let _ = self.memory.write_u8(0x466, 0);
+        }
     }
 
     fn int10_paradise_set_special_mode(&mut self) {
@@ -2419,10 +2745,9 @@ impl Machine {
         match bl {
             // BL=10h: return EGA/VGA configuration information.
             0x10 => {
-                let control = self.read_physical_u8(0x487);
                 let switch_data = self.read_physical_u8(0x488);
-                let mode = (control >> 1) & 0x01; // 0 = color 3Dx, 1 = mono 3Bx
-                let memory = (control >> 5) & 0x03; // 0..3 = 64K..256K
+                let mode = u8::from(self.uses_mono_crtc_base());
+                let memory = 0x03u8; // 256 KiB installed
                 let feature = (switch_data >> 4) & 0x0f;
                 let switches = switch_data & 0x0f;
                 self.set_bx((u16::from(mode) << 8) | u16::from(memory));
@@ -2433,17 +2758,13 @@ impl Machine {
             0x20 => {}
             // BL=30h: select text-mode scanline count for the next mode set.
             0x30 if al <= 0x02 => {
-                let mut flags = self.read_physical_u8(0x489) & !(0x80 | 0x10);
-                if al == 0x00 {
-                    flags |= 0x80; // 200 lines
-                } else if al == 0x02 {
-                    flags |= 0x10; // 400 lines
+                if self.set_selected_text_scanlines(al) {
+                    self.set_eax_al(0x12);
                 }
-                self.write_physical_u8(0x489, flags);
-                self.set_eax_al(0x12);
             }
             // BL=31h: default palette loading on mode set.
             0x31 if al <= 0x01 => {
+                self.video.set_default_palette_loading_enabled(al == 0x00);
                 let mut flags = self.read_physical_u8(0x489);
                 if al == 0x01 {
                     flags |= 0x08; // no palette load
@@ -2453,11 +2774,20 @@ impl Machine {
                 self.write_physical_u8(0x489, flags);
                 self.set_eax_al(0x12);
             }
-            // BL=32h: video memory/register addressing. Access gating is not modeled,
-            // but the standard BIOS call is supported.
-            0x32 if al <= 0x01 => self.set_eax_al(0x12),
+            // BL=32h: video memory/register addressing.
+            0x32 if al <= 0x01 => {
+                let misc = self.video.read_port(0x3CC).unwrap_or(0x67);
+                let misc = if al == 0x00 {
+                    misc | 0x02
+                } else {
+                    misc & !0x02
+                };
+                let _ = self.video.write_port(0x3C2, misc);
+                self.set_eax_al(0x12);
+            }
             // BL=33h: gray-scale summing policy.
             0x33 if al <= 0x01 => {
+                self.video.set_grayscale_summing_enabled(al == 0x00);
                 let mut flags = self.read_physical_u8(0x489);
                 if al == 0x00 {
                     flags |= 0x02; // gray scaling enabled
@@ -2467,78 +2797,340 @@ impl Machine {
                 self.write_physical_u8(0x489, flags);
                 self.set_eax_al(0x12);
             }
-            // BL=34h: cursor emulation/scaling policy. BDA 0040:0087 bit 0 is the
-            // inhibit bit, so enabling cursor emulation clears it.
+            // BL=34h: cursor emulation/scaling policy. This BIOS tracks both the
+            // EGA/VGA video-control inhibit bit at 0040:0087 and the mode-set
+            // control latch at 0040:0089 used by cursor-shape scaling.
             0x34 if al <= 0x01 => {
                 let mut control = self.read_physical_u8(0x487);
+                let mut flags = self.read_physical_u8(0x489);
                 if al == 0x01 {
                     control |= 0x01;
+                    flags &= !0x01;
                 } else {
                     control &= !0x01;
+                    flags |= 0x01;
                 }
                 self.write_physical_u8(0x487, control);
+                self.write_physical_u8(0x489, flags);
                 self.set_eax_al(0x12);
             }
-            // BL=35h display switch and BL=36h refresh control: no second adapter or
-            // refresh blanking path is modeled, but the VGA BIOS acknowledges them.
+            // BL=35h display switch: no second adapter is modeled, but the VGA BIOS
+            // acknowledges the call.
             0x35 if al <= 0x03 => self.set_eax_al(0x12),
-            0x36 if al <= 0x01 => self.set_eax_al(0x12),
+            // BL=36h refresh control.
+            0x36 if al <= 0x01 => {
+                self.video.set_display_refresh_enabled(al == 0x00);
+                self.set_eax_al(0x12);
+            }
             _ => {}
         }
     }
 
-    /// INT 10h AH=0Ch WRITE GRAPHICS PIXEL. AL = colour (bit 7 set XORs into the
-    /// existing pixel), CX = column, DX = row. In mode 13h the pixel is the byte at
-    /// `row*320 + col` in the A0000 framebuffer; the chain-4 datapath routes that
-    /// linear offset to the right plane the same way the CPU bus write does.
-    /// Limit: only the linear 320x200 mode 13h is handled; the 16-colour planar
-    /// modes (0Dh/0Eh/10h/12h) need a read-modify-write through the bit-mask and
-    /// map-mask, which is not wired here, so a pixel write in those modes is ignored.
-    /// In text mode the call does nothing, matching a real BIOS.
-    fn int10_write_pixel(&mut self, al: u8) {
-        if self.video.active_mode() != VideoMode::Mode13h {
-            return;
+    fn cga_bda_mode_control(mode: u8) -> Option<u8> {
+        match mode & 0x7F {
+            0x00 => Some(0x2C),
+            0x01 => Some(0x28),
+            0x02 => Some(0x2D),
+            0x03 => Some(0x29),
+            0x04 => Some(0x0A),
+            0x05 => Some(0x0E),
+            0x06 => Some(0x1A),
+            _ => None,
         }
+    }
+
+    fn video_crtc_base_port(mode: u8) -> u16 {
+        match mode & 0x7F {
+            0x07 | 0x0F => 0x03B4,
+            _ => 0x03D4,
+        }
+    }
+
+    fn cga_bda_color_select(mode: u8) -> u8 {
+        if mode & 0x7F == 0x06 { 0x0F } else { 0x00 }
+    }
+
+    fn video_mode_set_return_al(mode: u8) -> u8 {
+        match mode & 0x7F {
+            0x06 => 0x3F,
+            0x00..=0x05 | 0x07 => 0x30,
+            _ => 0x20,
+        }
+    }
+
+    fn sync_bda_cga_latches(&mut self) {
+        let _ = self.memory.write_u8(0x465, self.video.cga_mode_control());
+        let _ = self.memory.write_u8(0x466, self.video.cga_color_select());
+    }
+
+    fn video_page_size(&self, mode: u8) -> u16 {
+        let mode = mode & 0x7F;
+        match mode {
+            0x00 | 0x01 => 0x0800,
+            0x02 | 0x03 | 0x07 => 0x1000,
+            0x0D => 0x2000,
+            0x0E => 0x4000,
+            0x0F | 0x10 => 0x8000,
+            0x11 | 0x12 => 0x0000,
+            0x04..=0x06 => 0x4000,
+            0x13 => 320 * 200,
+            _ => 0x1000,
+        }
+    }
+
+    fn video_text_rows(mode: u8) -> u8 {
+        match mode & 0x7F {
+            0x11 | 0x12 => 30,
+            _ => 25,
+        }
+    }
+
+    fn video_char_height(&self, mode: u8) -> u8 {
+        match mode & 0x7F {
+            0x00..=0x03 => match self.text_scanlines_for_mode(mode) {
+                200 => 8,
+                350 => 14,
+                400 => 16,
+                _ => 16,
+            },
+            0x04..=0x06 | 0x0D | 0x0E | 0x13 => 8,
+            0x07 | 0x0F | 0x10 => 14,
+            _ => 16,
+        }
+    }
+
+    fn text_columns(&mut self) -> usize {
+        self.read_guest_word(0x44a).clamp(1, 80) as usize
+    }
+
+    fn text_rows(&mut self) -> usize {
+        (usize::from(self.read_physical_u8(0x484)) + 1).clamp(1, 60)
+    }
+
+    fn text_page_stride(&mut self) -> usize {
+        let size = self.read_guest_word(0x44c) as usize;
+        if size != 0 {
+            size
+        } else if self.text_columns() <= 40 {
+            0x0800
+        } else {
+            VGA_TEXT_PAGE_STRIDE
+        }
+    }
+
+    fn text_aperture_size(&self) -> usize {
+        if self.video.is_cga_personality() {
+            CGA_FB_SIZE
+        } else {
+            VGA_TEXT_MEMORY_SIZE
+        }
+    }
+
+    fn text_page_count(&mut self) -> u8 {
+        (self.text_aperture_size() / self.text_page_stride()).clamp(1, 8) as u8
+    }
+
+    fn ega_graphics_page_count(&self, mode: u8) -> Option<u8> {
+        let mode = mode & 0x7F;
+        match mode {
+            0x0D..=0x10 => Some(
+                ((VGA_PLANAR_WINDOW_SIZE as usize) / usize::from(self.video_page_size(mode)))
+                    .clamp(1, 8) as u8,
+            ),
+            0x11 | 0x12 => Some(1),
+            _ => None,
+        }
+    }
+
+    fn ega_graphics_page_start(&self, mode: u8, page: u8) -> Option<(u8, u32)> {
+        let page = page % self.ega_graphics_page_count(mode)?;
+        Some((
+            page,
+            u32::from(page) * u32::from(self.video_page_size(mode)),
+        ))
+    }
+
+    fn video_page_count(&mut self, mode: u8) -> u8 {
+        self.ega_graphics_page_count(mode)
+            .unwrap_or_else(|| self.text_page_count())
+    }
+
+    fn normalize_text_page(&mut self, page: u8) -> u8 {
+        page % self.text_page_count()
+    }
+
+    fn normalize_bios_page(&mut self, page: u8) -> u8 {
+        match self.video.active_mode() {
+            VideoMode::Cga => 0,
+            VideoMode::Planar => {
+                let mode = self.read_physical_u8(0x449);
+                self.ega_graphics_page_start(mode, page)
+                    .map(|(page, _)| page)
+                    .unwrap_or(0)
+            }
+            _ => self.normalize_text_page(page),
+        }
+    }
+
+    fn active_bios_page(&mut self) -> u8 {
+        let page = self.read_physical_u8(0x462);
+        self.normalize_bios_page(page)
+    }
+
+    fn text_page_base(&mut self, page: u8) -> usize {
+        let page = self.normalize_text_page(page);
+        usize::from(page) * self.text_page_stride()
+    }
+
+    fn text_offset(&mut self, page: u8, row: usize, col: usize) -> usize {
+        let page = self.normalize_text_page(page);
+        let columns = self.text_columns();
+        let stride = self.text_page_stride();
+        usize::from(page) * stride + (row * columns + col) * 2
+    }
+
+    fn cursor_pos(&mut self, page: u8) -> u16 {
+        let page = self.normalize_bios_page(page);
+        self.memory
+            .read_u16(0x450 + usize::from(page) * 2)
+            .unwrap_or(0)
+    }
+
+    fn set_cursor_pos(&mut self, page: u8, pos: u16) {
+        let page = self.normalize_bios_page(page);
+        let _ = self.memory.write_u16(0x450 + usize::from(page) * 2, pos);
+        if !self.is_bios_graphics_text_mode() && page == self.active_bios_page() {
+            self.set_hardware_cursor_for_page(page, pos);
+        }
+    }
+
+    fn set_hardware_cursor_for_page(&mut self, page: u8, pos: u16) {
+        let columns = self.text_columns();
+        let row = usize::from(pos >> 8);
+        let col = usize::from(pos & 0x00ff);
+        let base_cells = self.text_page_base(page) / 2;
+        self.video
+            .set_cursor_offset((base_cells + row * columns + col) as u16);
+    }
+
+    fn bios_cursor_shape(&mut self, cx: u16) -> (u16, u8, u8) {
+        let request_start = ((cx >> 8) as u8) & 0x3F;
+        let request_end = (cx as u8) & 0x1F;
+        let bda_shape = (u16::from(request_start) << 8) | u16::from(request_end);
+        let mut hardware_start = request_start;
+        let mut hardware_end = request_end;
+        let mode_set_control = self.read_physical_u8(0x489);
+        let char_height = self.read_guest_word(0x485);
+
+        if mode_set_control & 0x01 != 0
+            && char_height > 8
+            && request_end < 8
+            && request_start < 0x20
+        {
+            let scaled_end = ((u16::from(request_end) + 1) * char_height / 8).saturating_sub(1);
+            let scaled_start = if u16::from(request_end) != u16::from(request_start) + 1 {
+                ((u16::from(request_start) + 1) * char_height / 8).saturating_sub(1)
+            } else {
+                ((u16::from(request_end) + 1) * char_height / 8).saturating_sub(2)
+            };
+            hardware_start = scaled_start as u8;
+            hardware_end = scaled_end as u8;
+        }
+
+        (bda_shape, hardware_start, hardware_end)
+    }
+
+    /// INT 10h AH=0Ch WRITE GRAPHICS PIXEL. AL = colour (bit 7 XORs in CGA/EGA
+    /// packed-pixel modes), CX = column, DX = row. Mode 13h stores the full byte;
+    /// CGA modes write packed raw pixel values into B800's interleaved framebuffer.
+    /// EGA/VGA planar modes write the 4-bit colour into the four planes.
+    fn int10_write_pixel(&mut self, al: u8) {
         let col = self.cpu.registers.ecx() as u16;
         let row = self.cpu.registers.edx() as u16;
-        let offset = usize::from(row) * 320 + usize::from(col);
-        if offset >= 320 * 200 {
-            return;
+        let page = ((self.cpu.registers.ebx() as u16) >> 8) as u8;
+        match self.video.active_mode() {
+            VideoMode::Mode13h => {
+                let offset = usize::from(row) * 320 + usize::from(col);
+                if offset < 320 * 200 {
+                    // Mode 13h is a 256-color mode: AL is the full 8-bit pixel
+                    // value, bit 7 included, with no XOR.
+                    self.video.cpu_write_chain4(offset, al);
+                }
+            }
+            VideoMode::Cga => {
+                let _ = self
+                    .video
+                    .cga_write_pixel(col, row, al & 0x7F, al & 0x80 != 0);
+            }
+            VideoMode::Planar => {
+                let mode = self.read_physical_u8(0x449);
+                let start = self
+                    .ega_graphics_page_start(mode, page)
+                    .map(|(_, start)| start)
+                    .unwrap_or(0);
+                let _ =
+                    self.video
+                        .planar_write_pixel_at(start, col, row, al & 0x0F, al & 0x80 != 0);
+            }
+            _ => {}
         }
-        // Mode 13h is a 256-color mode: AL is the full 8-bit pixel value, bit 7
-        // included. The bit-7 XOR-onto-screen convention applies only to the
-        // 16-color planar modes, which this handler does not service.
-        self.video.cpu_write_chain4(offset, al);
     }
 
     /// INT 10h AH=0Dh READ GRAPHICS PIXEL. CX = column, DX = row; returns AL = the
-    /// pixel colour at `row*320 + col`. Only mode 13h is read back (see
-    /// int10_write_pixel); other modes return AL = 0.
+    /// pixel colour at `row*320 + col`. CGA modes return the raw packed pixel
+    /// value (0..3 or 0..1), not the resolved DAC index. Planar modes return the
+    /// four plane bits as a 0..15 colour.
     fn int10_read_pixel(&mut self) {
-        let color = if self.video.active_mode() == VideoMode::Mode13h {
-            let col = self.cpu.registers.ecx() as u16;
-            let row = self.cpu.registers.edx() as u16;
-            let offset = usize::from(row) * 320 + usize::from(col);
-            if offset < 320 * 200 {
-                self.video.cpu_read_chain4(offset)
-            } else {
-                0
+        let col = self.cpu.registers.ecx() as u16;
+        let row = self.cpu.registers.edx() as u16;
+        let page = ((self.cpu.registers.ebx() as u16) >> 8) as u8;
+        let color = match self.video.active_mode() {
+            VideoMode::Mode13h => {
+                let offset = usize::from(row) * 320 + usize::from(col);
+                if offset < 320 * 200 {
+                    self.video.cpu_read_chain4(offset)
+                } else {
+                    0
+                }
             }
-        } else {
-            0
+            VideoMode::Cga => self.video.cga_read_pixel(col, row),
+            VideoMode::Planar => {
+                let mode = self.read_physical_u8(0x449);
+                let start = self
+                    .ega_graphics_page_start(mode, page)
+                    .map(|(_, start)| start)
+                    .unwrap_or(0);
+                self.video.planar_read_pixel_at(start, col, row)
+            }
+            _ => 0,
         };
         self.set_eax_al(color);
     }
 
+    /// INT 10h AH=04h READ LIGHT PEN POSITION. CGA-compatible only; VGA BIOSes
+    /// report this as unsupported by leaving the trigger flag clear.
+    fn int10_read_light_pen(&mut self) {
+        let Some((pixel_col, pixel_row, char_row, char_col)) = self.video.cga_light_pen_report()
+        else {
+            self.set_eax_ah(0);
+            return;
+        };
+        self.set_eax_ah(1);
+        self.set_bx(pixel_col);
+        self.set_cx(u16::from(pixel_row) << 8);
+        self.set_dx((u16::from(char_row) << 8) | u16::from(char_col));
+    }
+
     /// INT 10h AH=13h WRITE STRING. AL = write mode (bit 0 advance cursor, bit 1
-    /// the source carries interleaved attribute bytes), BH = page (ignored, page 0
-    /// only), BL = attribute when bit 1 is clear, CX = character count, DH/DL =
-    /// start row/col, ES:BP = the string. Characters land in the page-0 text buffer
-    /// with their attribute, advancing the column and wrapping rows; the cursor is
-    /// left at the end only when AL bit 0 is set.
+    /// the source carries interleaved attribute bytes), BH = page, BL =
+    /// attribute/color when bit 1 is clear, CX = character count, DH/DL = start
+    /// row/col, ES:BP = the string. Text and EGA graphics modes write the
+    /// requested page; CGA graphics remains single-page.
+    /// The cursor is left at the end only when AL bit 0 is set.
     fn int10_write_string(&mut self) {
         let al = self.cpu.registers.eax() as u8;
         let bx = self.cpu.registers.ebx() as u16;
+        let page = self.normalize_bios_page((bx >> 8) as u8);
         let bl = bx as u8;
         let count = self.cpu.registers.ecx() as u16;
         let dx = self.cpu.registers.edx() as u16;
@@ -2548,6 +3140,8 @@ impl Machine {
         let bp = self.cpu.registers.ebp() as u16;
         let mut src = es.wrapping_add(u32::from(bp));
         let with_attr = al & 0x02 != 0;
+        let columns = self.text_columns();
+        let rows = self.text_rows();
         for _ in 0..count {
             let ch = self.read_physical_u8(src);
             src += 1;
@@ -2566,65 +3160,247 @@ impl Machine {
                 0x08 => col = col.saturating_sub(1),
                 0x07 => {}
                 _ => {
-                    if row < 25 && col < 80 {
-                        let off = (row * 80 + col) * 2;
-                        let _ = self.video.write_u8(off, ch);
-                        let _ = self.video.write_u8(off + 1, attr);
+                    if row < rows && col < columns {
+                        self.write_bios_char_cell(page, row, col, ch, attr);
                     }
                     col += 1;
-                    if col >= 80 {
+                    if col >= columns {
                         col = 0;
                         row += 1;
                     }
                 }
             }
-            while row >= 25 {
-                self.scroll_text_up();
+            while row >= rows {
+                self.scroll_text_up(page);
                 row -= 1;
             }
         }
         // AL bit 0: leave the cursor at the end of the string; otherwise the caller
         // keeps its prior cursor (the BDA cursor is untouched).
         if al & 0x01 != 0 {
-            let row = row.min(24) as u16;
-            let col = col.min(79) as u16;
-            let _ = self.memory.write_u16(0x450, (row << 8) | col);
-            self.video.set_cursor_offset(row * 80 + col);
+            let row = row.min(rows - 1) as u16;
+            let col = col.min(columns - 1) as u16;
+            self.set_cursor_pos(page, (row << 8) | col);
         }
     }
 
+    fn int10_state_size_bytes(cx: u16) -> usize {
+        let mut size = 0;
+        if cx & 0x0001 != 0 {
+            size += INT10_STATE_HARDWARE_LEN;
+        }
+        if cx & 0x0002 != 0 {
+            size += INT10_STATE_BDA_LEN;
+        }
+        if cx & 0x0004 != 0 {
+            size += INT10_STATE_DAC_LEN;
+        }
+        size
+    }
+
+    fn int10_state_size_blocks(cx: u16) -> u16 {
+        let size = Self::int10_state_size_bytes(cx);
+        size.div_ceil(64) as u16
+    }
+
+    fn save_video_hardware_state(&mut self, dst: u32) {
+        let crtc_addr = self.read_guest_word(0x463);
+        let crtc_addr: u16 = if crtc_addr == 0x03B4 { 0x03B4 } else { 0x03D4 };
+        let mut block = Vec::with_capacity(INT10_STATE_HARDWARE_LEN);
+
+        block.push(self.video.read_port(0x3C4).unwrap_or(0));
+        block.push(self.video.crtc_index_latch());
+        block.push(self.video.read_port(0x3CE).unwrap_or(0));
+        self.video.read_status1();
+        block.push(self.video.read_port(0x3C0).unwrap_or(0x20));
+        block.push(self.video.read_port(0x3CA).unwrap_or(0));
+
+        for index in 1..=4 {
+            let _ = self.video.write_port(0x3C4, index);
+            block.push(self.video.read_port(0x3C5).unwrap_or(0));
+        }
+        let _ = self.video.write_port(0x3C4, 0);
+        block.push(self.video.read_port(0x3C5).unwrap_or(0));
+
+        for index in 0..=0x18 {
+            block.push(self.video.crtc_register_latch(index));
+        }
+
+        let ar_index = block[3];
+        for index in 0..=0x13 {
+            self.video.read_status1();
+            let _ = self.video.write_port(0x3C0, index | (ar_index & 0x20));
+            block.push(self.video.read_port(0x3C1).unwrap_or(0));
+        }
+        self.video.read_status1();
+
+        for index in 0..=0x08 {
+            let _ = self.video.write_port(0x3CE, index);
+            block.push(self.video.read_port(0x3CF).unwrap_or(0));
+        }
+
+        block.extend_from_slice(&crtc_addr.to_le_bytes());
+        if self.video.is_cga_personality() {
+            block.extend_from_slice(&INT10_STATE_CGA_LATCH_MARKER);
+            block.push(self.video.cga_mode_control());
+            block.push(self.video.cga_color_select());
+        } else {
+            block.extend_from_slice(&[0; 4]); // VGA latches are not CPU-readable.
+        }
+        debug_assert_eq!(block.len(), INT10_STATE_HARDWARE_LEN);
+        self.write_guest_block(dst, &block);
+    }
+
+    fn restore_video_hardware_state(&mut self, src: u32) {
+        let block = self.read_guest_block(src, INT10_STATE_HARDWARE_LEN);
+        if block.len() != INT10_STATE_HARDWARE_LEN {
+            return;
+        }
+        let crtc_addr = u16::from_le_bytes([block[0x40], block[0x41]]);
+        let crtc_addr = if crtc_addr == 0x03B4 { 0x03B4 } else { 0x03D4 };
+        let misc = self.video.read_port(0x3CC).unwrap_or(0x67);
+        let misc = (misc & !0x01) | u8::from(crtc_addr == 0x03D4);
+        let _ = self.video.write_port(0x3C2, misc);
+        if block[INT10_STATE_CGA_LATCH_OFFSET..INT10_STATE_CGA_LATCH_OFFSET + 2]
+            == INT10_STATE_CGA_LATCH_MARKER
+        {
+            let _ = self
+                .video
+                .write_port(0x3D8, block[INT10_STATE_CGA_LATCH_OFFSET + 2]);
+            let _ = self
+                .video
+                .write_port(0x3D9, block[INT10_STATE_CGA_LATCH_OFFSET + 3]);
+        }
+
+        let mut offset = 5;
+        for index in 1..=4 {
+            let _ = self.video.write_port(0x3C4, index);
+            let _ = self.video.write_port(0x3C5, block[offset]);
+            offset += 1;
+        }
+        let _ = self.video.write_port(0x3C4, 0);
+        let _ = self.video.write_port(0x3C5, block[offset]);
+        offset += 1;
+
+        let _ = self.video.write_port(crtc_addr, 0x11);
+        let _ = self.video.write_port(crtc_addr + 1, 0x00);
+        for index in 0..=0x18 {
+            let value = block[offset + index as usize];
+            if index != 0x11 {
+                let _ = self.video.write_port(crtc_addr, index);
+                let _ = self.video.write_port(crtc_addr + 1, value);
+            }
+        }
+        let crtc_offset = offset;
+        offset += 0x19;
+        let _ = self.video.write_port(crtc_addr, 0x11);
+        let _ = self
+            .video
+            .write_port(crtc_addr + 1, block[crtc_offset + 0x11]);
+
+        let ar_index = block[3];
+        for index in 0..=0x13 {
+            self.video.read_status1();
+            let _ = self.video.write_port(0x3C0, index | (ar_index & 0x20));
+            let _ = self.video.write_port(0x3C0, block[offset]);
+            offset += 1;
+        }
+        self.video.read_status1();
+        let _ = self.video.write_port(0x3C0, ar_index);
+        self.video.read_status1();
+
+        for index in 0..=0x08 {
+            let _ = self.video.write_port(0x3CE, index);
+            let _ = self.video.write_port(0x3CF, block[offset]);
+            offset += 1;
+        }
+
+        let _ = self.video.write_port(0x3C4, block[0]);
+        let _ = self.video.write_port(crtc_addr, block[1]);
+        let _ = self.video.write_port(0x3CE, block[2]);
+        let _ = self.video.write_port(crtc_addr - 4 + 0x0A, block[4]);
+    }
+
+    fn save_video_dac_state(&mut self, dst: u32) {
+        let mut block = Vec::with_capacity(INT10_STATE_DAC_LEN);
+        block.push(self.video.read_port(0x3C7).unwrap_or(0));
+        block.push(self.video.read_port(0x3C8).unwrap_or(0));
+        block.push(self.video.read_port(0x3C6).unwrap_or(0xFF));
+        block.extend(self.video.dac_block_bytes(0, 256));
+        block.push(self.video.attr_register(0x14));
+        debug_assert_eq!(block.len(), INT10_STATE_DAC_LEN);
+        self.write_guest_block(dst, &block);
+    }
+
+    fn restore_video_dac_state(&mut self, src: u32) {
+        let block = self.read_guest_block(src, INT10_STATE_DAC_LEN);
+        if block.len() != INT10_STATE_DAC_LEN {
+            return;
+        }
+        let _ = self.video.write_port(0x3C6, block[2]);
+        let grayscale = self.video.grayscale_summing_enabled();
+        self.video.set_grayscale_summing_enabled(false);
+        for index in 0..=255usize {
+            let base = 3 + index * 3;
+            self.video
+                .set_dac_entry(index as u8, block[base], block[base + 1], block[base + 2]);
+        }
+        self.video.set_grayscale_summing_enabled(grayscale);
+        self.video
+            .set_attr_register(0x14, block[INT10_STATE_DAC_LEN - 1]);
+        let _ = self.video.write_port(0x3C8, block[1]);
+    }
+
     /// INT 10h AH=1Ch SAVE/RESTORE VIDEO STATE. AL=00 returns the buffer size in
-    /// 64-byte blocks (BX), AL=01 saves the modeled state into ES:BX, AL=02 restores
-    /// it. CX is the requested-state bitmap (bit 0 hardware, bit 1 BDA, bit 2 DAC).
-    /// Saves and restores the full BDA video state (0040:0049-0040:00A8, 96 bytes,
-    /// two 64-byte blocks) per RBIL. Limit: the hardware-register and DAC-palette
-    /// state (CX bits 0 and 2) are not captured, so a save/restore round-trips the
-    /// BDA block, not the full VGA hardware. AL is set to 0x1C so callers detect the
-    /// service.
+    /// 64-byte blocks (BX), AL=01 saves the requested state into ES:BX, AL=02 restores
+    /// it. CX is the requested-state bitmap: bit 0 hardware registers, bit 1 BDA,
+    /// bit 2 DAC/palette.
     fn int10_save_restore_state(&mut self, al: u8) {
         const BDA_VIDEO_START: u32 = 0x449;
-        const BDA_VIDEO_LEN: usize = 0x4a8 - 0x449 + 1; // 96 bytes, two 64-byte blocks
         match al {
             0x00 => {
-                self.set_bx(2); // two 64-byte blocks hold the 96-byte BDA video state
+                let cx = self.cpu.registers.ecx() as u16;
+                self.set_bx(Self::int10_state_size_blocks(cx));
                 self.set_eax_al(0x1c);
                 self.set_int_frame_carry(false);
             }
             0x01 => {
+                let cx = self.cpu.registers.ecx() as u16;
                 let es = self.cpu.registers.segment(SegmentIndex::Es).base;
                 let bx = self.cpu.registers.ebx() as u16;
-                let dst = es.wrapping_add(u32::from(bx));
-                let block = self.read_guest_block(BDA_VIDEO_START, BDA_VIDEO_LEN);
-                self.write_guest_block(dst, &block);
+                let mut dst = es.wrapping_add(u32::from(bx));
+                if cx & 0x0001 != 0 {
+                    self.save_video_hardware_state(dst);
+                    dst = dst.wrapping_add(INT10_STATE_HARDWARE_LEN as u32);
+                }
+                if cx & 0x0002 != 0 {
+                    let block = self.read_guest_block(BDA_VIDEO_START, INT10_STATE_BDA_LEN);
+                    self.write_guest_block(dst, &block);
+                    dst = dst.wrapping_add(INT10_STATE_BDA_LEN as u32);
+                }
+                if cx & 0x0004 != 0 {
+                    self.save_video_dac_state(dst);
+                }
                 self.set_eax_al(0x1c);
                 self.set_int_frame_carry(false);
             }
             0x02 => {
+                let cx = self.cpu.registers.ecx() as u16;
                 let es = self.cpu.registers.segment(SegmentIndex::Es).base;
                 let bx = self.cpu.registers.ebx() as u16;
-                let from = es.wrapping_add(u32::from(bx));
-                let block = self.read_guest_block(from, BDA_VIDEO_LEN);
-                self.write_guest_block(BDA_VIDEO_START, &block);
+                let mut from = es.wrapping_add(u32::from(bx));
+                if cx & 0x0001 != 0 {
+                    self.restore_video_hardware_state(from);
+                    from = from.wrapping_add(INT10_STATE_HARDWARE_LEN as u32);
+                }
+                if cx & 0x0002 != 0 {
+                    let block = self.read_guest_block(from, INT10_STATE_BDA_LEN);
+                    self.write_guest_block(BDA_VIDEO_START, &block);
+                    from = from.wrapping_add(INT10_STATE_BDA_LEN as u32);
+                }
+                if cx & 0x0004 != 0 {
+                    self.restore_video_dac_state(from);
+                }
                 self.set_eax_al(0x1c);
                 self.set_int_frame_carry(false);
             }
@@ -2632,34 +3408,36 @@ impl Machine {
         }
     }
 
-    /// INT 10h text-mode output and cursor services. Operates on the same VGA text
-    /// framebuffer and BDA cursor (0040:0050) the teletype helper uses. Page
-    /// arguments are ignored: this BIOS renders page 0 only.
+    /// INT 10h text-mode output and cursor services. Text and EGA graphics modes
+    /// use BH/page-aware BDA cursor slots; CGA graphics remains single-page.
     fn handle_int10_text(&mut self, ah: u8) {
         let ax = self.cpu.registers.eax() as u16;
         let al = ax as u8;
         let bx = self.cpu.registers.ebx() as u16;
+        let page = self.normalize_bios_page((bx >> 8) as u8);
         let bl = bx as u8;
         let cx = self.cpu.registers.ecx() as u16;
         let dx = self.cpu.registers.edx() as u16;
         let dl = dx as u8;
         let dh = (dx >> 8) as u8;
+        let columns = self.text_columns();
+        let rows = self.text_rows();
         match ah {
-            // AH=01h set cursor shape: store CX in the BDA cursor-type word.
+            // AH=01h set cursor shape: store the BIOS request in the BDA and
+            // program the modeled CRTC cursor shape, including VGA cursor
+            // emulation scaling for legacy 8-scanline requests.
             0x01 => {
-                let _ = self.memory.write_u16(0x460, cx);
+                let (bda_shape, start, end) = self.bios_cursor_shape(cx);
+                let _ = self.memory.write_u16(0x460, bda_shape);
+                self.video.set_cursor_shape(start, end);
             }
             // AH=02h set cursor position: DH=row, DL=col.
             0x02 => {
-                let _ = self
-                    .memory
-                    .write_u16(0x450, (u16::from(dh) << 8) | u16::from(dl));
-                self.video
-                    .set_cursor_offset(u16::from(dh) * 80 + u16::from(dl));
+                self.set_cursor_pos(page, (u16::from(dh) << 8) | u16::from(dl));
             }
             // AH=03h get cursor position and shape.
             0x03 => {
-                let pos = self.read_guest_word(0x450);
+                let pos = self.cursor_pos(page);
                 let edx = (self.cpu.registers.edx() & !0xFFFF) | u32::from(pos);
                 self.cpu.registers.set_edx(edx);
                 let shape = self.read_guest_word(0x460);
@@ -2671,66 +3449,239 @@ impl Machine {
             0x06 | 0x07 => self.scroll_window(ah == 0x06, al, bx >> 8, cx, dx),
             // AH=08h read char+attr at the cursor.
             0x08 => {
-                let pos = self.read_guest_word(0x450);
-                let off = (usize::from(pos >> 8) * 80 + usize::from(pos & 0xff)) * 2;
-                let ch = self.video.read_u8(off).unwrap_or(b' ');
-                let at = self.video.read_u8(off + 1).unwrap_or(0x07);
+                let pos = self.cursor_pos(page);
+                let row = usize::from(pos >> 8);
+                let col = usize::from(pos & 0xff);
+                let (ch, at) = if self.is_bios_graphics_text_mode() {
+                    self.read_graphics_char(page, row, col)
+                } else {
+                    let off = self.text_offset(page, row, col);
+                    (
+                        self.video.read_u8(off).unwrap_or(b' '),
+                        self.video.read_u8(off + 1).unwrap_or(0x07),
+                    )
+                };
                 let eax =
                     (self.cpu.registers.eax() & !0xFFFF) | (u32::from(at) << 8) | u32::from(ch);
                 self.cpu.registers.set_eax(eax);
             }
             // AH=09h write char+attr, AH=0Ah write char only, CX times, no advance.
             0x09 | 0x0A => {
-                let pos = self.read_guest_word(0x450);
-                let base = (usize::from(pos >> 8) * 80 + usize::from(pos & 0xff)) * 2;
+                let pos = self.cursor_pos(page);
+                let row = usize::from(pos >> 8);
+                let col = usize::from(pos & 0xff);
                 for i in 0..usize::from(cx) {
-                    let off = base + i * 2;
-                    let _ = self.video.write_u8(off, al);
-                    if ah == 0x09 {
-                        let _ = self.video.write_u8(off + 1, bl);
+                    let target_col = col + i;
+                    if row >= rows || target_col >= columns {
+                        break;
+                    }
+                    if self.is_bios_graphics_text_mode() {
+                        self.draw_graphics_char(page, row, target_col, al, bl);
+                    } else {
+                        let off = self.text_offset(page, row, target_col);
+                        let _ = self.video.write_u8(off, al);
+                        if ah == 0x09 {
+                            let _ = self.video.write_u8(off + 1, bl);
+                        }
                     }
                 }
             }
             // AH=0Eh teletype.
-            0x0E => self.teletype_char(al),
+            0x0E => self.teletype_char_attr(al, bl, page),
             _ => {}
         }
     }
 
+    fn write_bios_char_cell(&mut self, page: u8, row: usize, col: usize, ch: u8, attr: u8) {
+        if self.is_bios_graphics_text_mode() {
+            self.draw_graphics_char(page, row, col, ch, attr);
+        } else {
+            let off = self.text_offset(page, row, col);
+            let _ = self.video.write_u8(off, ch);
+            let _ = self.video.write_u8(off + 1, attr);
+        }
+    }
+
+    fn is_bios_graphics_text_mode(&self) -> bool {
+        matches!(self.video.active_mode(), VideoMode::Cga | VideoMode::Planar)
+    }
+
+    fn graphics_text_cell_height(&mut self) -> usize {
+        match self.video.active_mode() {
+            VideoMode::Cga => 8,
+            VideoMode::Planar => usize::from(self.read_physical_u8(0x485)).clamp(1, 32),
+            _ => 16,
+        }
+    }
+
+    fn graphics_page_start(&mut self, page: u8) -> u32 {
+        if self.video.active_mode() != VideoMode::Planar {
+            return 0;
+        }
+        let mode = self.read_physical_u8(0x449);
+        self.ega_graphics_page_start(mode, page)
+            .map(|(_, start)| start)
+            .unwrap_or(0)
+    }
+
+    fn graphics_write_pixel(&mut self, page: u8, x: u16, y: u16, color: u8, xor: bool) -> bool {
+        match self.video.active_mode() {
+            VideoMode::Cga => self.video.cga_write_pixel(x, y, color, xor),
+            VideoMode::Planar => {
+                let start = self.graphics_page_start(page);
+                self.video.planar_write_pixel_at(start, x, y, color, xor)
+            }
+            _ => false,
+        }
+    }
+
+    fn graphics_read_pixel(&mut self, page: u8, x: u16, y: u16) -> u8 {
+        match self.video.active_mode() {
+            VideoMode::Cga => self.video.cga_read_pixel(x, y),
+            VideoMode::Planar => {
+                let start = self.graphics_page_start(page);
+                self.video.planar_read_pixel_at(start, x, y)
+            }
+            _ => 0,
+        }
+    }
+
+    fn draw_graphics_char(&mut self, page: u8, row: usize, col: usize, ch: u8, color: u8) {
+        let x0 = col * 8;
+        let cell_height = self.graphics_text_cell_height();
+        let y0 = row * cell_height;
+        let xor = color & 0x80 != 0;
+        let fg = match self.video.active_mode() {
+            VideoMode::Cga => color & 0x7F,
+            VideoMode::Planar => color & 0x0F,
+            _ => color,
+        };
+        for gy in 0..cell_height {
+            let bits = self.graphics_glyph_row(ch, gy);
+            for gx in 0..8usize {
+                let lit = bits & (0x80 >> gx) != 0;
+                if xor {
+                    if lit {
+                        let _ = self.graphics_write_pixel(
+                            page,
+                            (x0 + gx) as u16,
+                            (y0 + gy) as u16,
+                            fg,
+                            true,
+                        );
+                    }
+                } else {
+                    let _ = self.graphics_write_pixel(
+                        page,
+                        (x0 + gx) as u16,
+                        (y0 + gy) as u16,
+                        if lit { fg } else { 0 },
+                        false,
+                    );
+                }
+            }
+        }
+    }
+
+    fn graphics_glyph_row(&mut self, ch: u8, row: usize) -> u8 {
+        if self.video.active_mode() != VideoMode::Cga || ch < 0x80 {
+            return self.video.active_font_glyph_row(ch, row);
+        }
+        let offset = self.read_guest_word(0x1F * 4);
+        let segment = self.read_guest_word(0x1F * 4 + 2);
+        if offset == 0 && segment == 0 {
+            return self.video.active_font_glyph_row(ch, row);
+        }
+        let base = u32::from(segment) * 16 + u32::from(offset);
+        self.read_physical_u8(base + u32::from(ch - 0x80) * 8 + row.min(7) as u32)
+    }
+
+    fn read_graphics_char(&mut self, page: u8, row: usize, col: usize) -> (u8, u8) {
+        let x0 = col * 8;
+        let cell_height = self.graphics_text_cell_height();
+        let y0 = row * cell_height;
+        if row >= self.text_rows() || x0 + 8 > self.video.raster_width() as usize {
+            return (0, 0);
+        }
+        let max_fg = match self.video.active_mode() {
+            VideoMode::Cga if self.video.raster_width() >= 640 => 1,
+            VideoMode::Cga => 3,
+            VideoMode::Planar => 15,
+            _ => 0,
+        };
+        for fg in 1..=max_fg {
+            let present = (0..cell_height).any(|gy| {
+                (0..8usize).any(|gx| {
+                    self.graphics_read_pixel(page, (x0 + gx) as u16, (y0 + gy) as u16) == fg
+                })
+            });
+            if !present {
+                continue;
+            }
+            for ch in 0..=u8::MAX {
+                let mut matches = true;
+                for gy in 0..cell_height {
+                    let mut row_bits = 0u8;
+                    for gx in 0..8usize {
+                        if self.graphics_read_pixel(page, (x0 + gx) as u16, (y0 + gy) as u16) == fg
+                        {
+                            row_bits |= 0x80 >> gx;
+                        }
+                    }
+                    if row_bits != self.graphics_glyph_row(ch, gy) {
+                        matches = false;
+                        break;
+                    }
+                }
+                if matches {
+                    return (ch, fg);
+                }
+            }
+        }
+        (b' ', 0)
+    }
+
     /// Scroll a text window. `up` selects direction; `lines`==0 blanks the whole
     /// window. `attr` fills the vacated rows; `cx`=top-left (CH row, CL col),
-    /// `dx`=bottom-right (DH row, DL col). Clamped to the 80x25 screen.
+    /// `dx`=bottom-right (DH row, DL col). Clamped to the active text screen.
     fn scroll_window(&mut self, up: bool, lines: u8, attr: u16, cx: u16, dx: u16) {
         let attr = attr as u8;
-        let top = usize::from((cx >> 8) as u8).min(24);
-        let left = usize::from(cx as u8).min(79);
-        let bottom = usize::from((dx >> 8) as u8).min(24).max(top);
-        let right = usize::from(dx as u8).min(79).max(left);
+        let page = self.active_bios_page();
+        let columns = self.text_columns();
+        let rows = self.text_rows();
+        let top = usize::from((cx >> 8) as u8).min(rows - 1);
+        let left = usize::from(cx as u8).min(columns - 1);
+        let bottom = usize::from((dx >> 8) as u8).min(rows - 1).max(top);
+        let right = usize::from(dx as u8).min(columns - 1).max(left);
         let height = bottom - top + 1;
         let n = if lines == 0 {
             height
         } else {
             usize::from(lines)
         };
+        if self.is_bios_graphics_text_mode() {
+            self.scroll_graphics_window(page, up, n, attr, top, left, bottom, right);
+            return;
+        }
         if n >= height {
             for row in top..=bottom {
-                self.blank_text_row(row, left, right, attr);
+                self.blank_text_row(page, row, left, right, attr);
             }
             return;
         }
         if up {
             for row in top..=(bottom - n) {
-                self.copy_text_row(row + n, row, left, right, attr);
+                self.copy_text_row(page, row + n, row, left, right, attr);
             }
             for row in (bottom - n + 1)..=bottom {
-                self.blank_text_row(row, left, right, attr);
+                self.blank_text_row(page, row, left, right, attr);
             }
         } else {
             for row in ((top + n)..=bottom).rev() {
-                self.copy_text_row(row - n, row, left, right, attr);
+                self.copy_text_row(page, row - n, row, left, right, attr);
             }
             for row in top..(top + n) {
-                self.blank_text_row(row, left, right, attr);
+                self.blank_text_row(page, row, left, right, attr);
             }
         }
     }
@@ -2738,6 +3689,7 @@ impl Machine {
     /// Copy a span of text cells from `src_row` to `dst_row` (inclusive columns).
     fn copy_text_row(
         &mut self,
+        page: u8,
         src_row: usize,
         dst_row: usize,
         left: usize,
@@ -2745,8 +3697,8 @@ impl Machine {
         attr: u8,
     ) {
         for col in left..=right {
-            let src = (src_row * 80 + col) * 2;
-            let dst = (dst_row * 80 + col) * 2;
+            let src = self.text_offset(page, src_row, col);
+            let dst = self.text_offset(page, dst_row, col);
             let b0 = self.video.read_u8(src).unwrap_or(b' ');
             let b1 = self.video.read_u8(src + 1).unwrap_or(attr);
             let _ = self.video.write_u8(dst, b0);
@@ -2755,9 +3707,9 @@ impl Machine {
     }
 
     /// Blank a span of text cells to spaces with `attr` (inclusive columns).
-    fn blank_text_row(&mut self, row: usize, left: usize, right: usize, attr: u8) {
+    fn blank_text_row(&mut self, page: u8, row: usize, left: usize, right: usize, attr: u8) {
         for col in left..=right {
-            let off = (row * 80 + col) * 2;
+            let off = self.text_offset(page, row, col);
             let _ = self.video.write_u8(off, b' ');
             let _ = self.video.write_u8(off + 1, attr);
         }
@@ -7799,12 +8751,8 @@ impl Machine {
     }
 
     /// INT 10h AH=10h: set/get the ATC palette registers and the DAC. Covers the
-    /// set/get forms for the attribute palette (00/01/02/07/08/09) and the DAC
-    /// (10/12/13/15/17/1A/1B). Register conventions per RBIL (INT 10/AH=10h).
-    /// Limit: the attribute-controller mode bits behind a few sub-functions
-    /// (AL=03 blink/intensity toggle, AL=13h color-page select) have no public
-    /// setter on the video core, so they are accepted as no-ops with CF clear; the
-    /// DAC paging state (AL=1Ah) reports the power-up default (mode 0, page 0).
+    /// set/get forms for the attribute palette (00/01/02/03/07/08/09) and the DAC
+    /// (10/12/13/15/17/18/19/1A/1B). Register conventions per RBIL (INT 10/AH=10h).
     fn handle_int10_palette(&mut self, al: u8) {
         let bx = self.cpu.registers.ebx() as u16;
         let bl = bx as u8;
@@ -7817,10 +8765,20 @@ impl Machine {
         let es_base = self.cpu.registers.segment(SegmentIndex::Es).base;
         let es_dx = es_base + u32::from(dx);
         match al {
-            // AL=00: set individual palette register. BL=index (0-15), BH=value.
-            0x00 => self.video.set_attr_palette_reg(bl, bh),
+            // AL=00: set individual Attribute register. BL=index, BH=value.
+            0x00 => {
+                self.video.set_attr_register(bl, bh);
+                if self.video.is_cga_personality() {
+                    self.sync_bda_cga_latches();
+                }
+            }
             // AL=01: set overscan/border color. BH=value (overlap with AH=0Bh).
-            0x01 => self.video.set_overscan(bh),
+            0x01 => {
+                self.video.set_overscan(bh);
+                if self.video.is_cga_personality() {
+                    self.sync_bda_cga_latches();
+                }
+            }
             // AL=02: set all 16 palette registers and overscan from ES:DX (17 bytes).
             0x02 => {
                 let block = self.read_guest_block(es_dx, 17);
@@ -7828,14 +8786,20 @@ impl Machine {
                     self.video.set_attr_palette_reg(i, block[i as usize]);
                 }
                 self.video.set_overscan(block[16]);
+                if self.video.is_cga_personality() {
+                    self.sync_bda_cga_latches();
+                }
             }
-            // AL=03: toggle intensify/blink (BL bit0). Limit: the attribute mode
-            // control bit 3 has no public setter on the video core, so this is a
-            // no-op; CF stays clear so the caller sees the call succeed.
-            0x03 => {}
-            // AL=07: get individual palette register. BL=index -> BH.
+            // AL=03: BL=0 enables bright backgrounds, BL=1 enables blink.
+            0x03 => {
+                self.video.set_text_blink_enabled(bl & 0x01 != 0);
+                if self.video.is_cga_personality() {
+                    self.sync_bda_cga_latches();
+                }
+            }
+            // AL=07: get individual Attribute register. BL=index -> BH.
             0x07 => {
-                let value = self.video.attr_palette_reg(bl);
+                let value = self.video.attr_register(bl);
                 let ebx = (self.cpu.registers.ebx() & !0xFF00) | (u32::from(value) << 8);
                 self.cpu.registers.set_ebx(ebx);
             }
@@ -7863,10 +8827,29 @@ impl Machine {
                     bytes.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
                 self.video.set_dac_block(bx as u8, &entries);
             }
-            // AL=13: select color page / paging mode (BL=0 select mode in BH, BL=1
-            // select page in BH). Limit: the attribute color-select datapath has
-            // no public setter, so this is a no-op; CF stays clear.
-            0x13 => {}
+            // AL=13: select DAC colour-page mode/page. BL=0 picks four 64-colour
+            // pages (BH=0) vs sixteen 16-colour pages (BH=1); BL=1 selects page.
+            0x13 => match bl {
+                0x00 => {
+                    let mut mode_control = self.video.attr_register(0x10);
+                    if bh & 0x01 != 0 {
+                        mode_control |= 0x80;
+                    } else {
+                        mode_control &= !0x80;
+                    }
+                    self.video.set_attr_register(0x10, mode_control);
+                }
+                0x01 => {
+                    let color_select = self.video.attr_register(0x14);
+                    let page = if self.video.attr_register(0x10) & 0x80 != 0 {
+                        bh & 0x0F
+                    } else {
+                        (color_select & 0x03) | ((bh & 0x03) << 2)
+                    };
+                    self.video.set_attr_register(0x14, page);
+                }
+                _ => {}
+            },
             // AL=15: get individual DAC register. BX=index -> DH=R, CH=G, CL=B.
             0x15 => {
                 let [r, g, b] = self.video.dac_entry(bx as u8);
@@ -7881,11 +8864,27 @@ impl Machine {
                 let bytes = self.video.dac_block_bytes(bx as u8, cx);
                 self.write_guest_block(es_dx, &bytes);
             }
+            // AL=18: set PEL mask. BL=value.
+            0x18 => {
+                let _ = self.video.write_port(0x3C6, bl);
+            }
+            // AL=19: read PEL mask -> BL.
+            0x19 => {
+                let value = self.video.read_port(0x3C6).unwrap_or(0xFF);
+                let ebx = (self.cpu.registers.ebx() & !0xFF) | u32::from(value);
+                self.cpu.registers.set_ebx(ebx);
+            }
             // AL=1A: read DAC page state -> BL=paging mode, BH=current page.
-            // Limit: color paging is not modeled, so the power-up default is
-            // reported (mode 0 = four pages of 64, page 0).
             0x1A => {
-                let ebx = self.cpu.registers.ebx() & !0xFFFF; // BL=0, BH=0
+                let mode = u8::from(self.video.attr_register(0x10) & 0x80 != 0);
+                let color_select = self.video.attr_register(0x14);
+                let page = if mode == 0 {
+                    (color_select >> 2) & 0x03
+                } else {
+                    color_select & 0x0F
+                };
+                let ebx =
+                    (self.cpu.registers.ebx() & !0xFFFF) | (u32::from(page) << 8) | u32::from(mode);
                 self.cpu.registers.set_ebx(ebx);
             }
             // AL=1B: sum a block of DAC registers to gray scale. BX=start, CX=count.
@@ -7909,9 +8908,12 @@ impl Machine {
     /// loads a user font at ES:BP (CX glyphs, DX first char, BH bytes/char, BL
     /// block); AL=01/11, 02/12, 04/14 load the ROM 8x14, 8x8, 8x16 fonts (BL
     /// block); AL=03 sets the block specifier (BL -> Sequencer index 3). The 1x
-    /// variants also reprogram the CRTC character height. AL=30 (get font info)
-    /// and the graphics-mode text services are deferred. Register conventions
-    /// verified against the LGPL VGABios `biosfn_load_text_*`.
+    /// variants also reprogram the CRTC character height. AL=20 installs the
+    /// 8x8 CGA graphics-character pointer at INT 1Fh; AL=21-24 select the
+    /// planar graphics-mode BIOS text font and row grid; AL=30 returns the
+    /// requested font pointer (BH=00..07) plus the live BDA font height/rows.
+    /// Text-font register conventions verified against the LGPL VGABios
+    /// `biosfn_load_text_*`; graphics-font register conventions follow RBIL.
     fn handle_int10_font(&mut self, al: u8) {
         let bx = self.cpu.registers.ebx() as u16;
         let bl = bx as u8;
@@ -7931,6 +8933,7 @@ impl Machine {
                 let count = (cx as usize).min(256);
                 let bytes = self.read_guest_block(es_base + u32::from(bp), count * bh as usize);
                 self.video.load_font_table(table, dx, bh, &bytes);
+                self.set_int43_pointer(self.cpu.registers.segment(SegmentIndex::Es).selector, bp);
                 if al >= 0x10 {
                     self.video.set_char_height(bh);
                 }
@@ -7938,6 +8941,7 @@ impl Machine {
             }
             0x01 | 0x11 => {
                 self.video.load_rom_font(table, 14);
+                self.set_int43_pointer(BIOS_ROM_SEGMENT, BIOS_FONT_8X14_ROM_OFFSET);
                 if al >= 0x10 {
                     self.video.set_char_height(14);
                 }
@@ -7945,6 +8949,7 @@ impl Machine {
             }
             0x02 | 0x12 => {
                 self.video.load_rom_font(table, 8);
+                self.set_int43_pointer(BIOS_ROM_SEGMENT, BIOS_FONT_8X8_ROM_OFFSET);
                 if al >= 0x10 {
                     self.video.set_char_height(8);
                 }
@@ -7952,6 +8957,7 @@ impl Machine {
             }
             0x04 | 0x14 => {
                 self.video.load_rom_font(table, 16);
+                self.set_int43_pointer(BIOS_ROM_SEGMENT, BIOS_FONT_8X16_ROM_OFFSET);
                 if al >= 0x10 {
                     self.video.set_char_height(16);
                 }
@@ -7961,9 +8967,38 @@ impl Machine {
                 self.video.set_char_map_select(bl);
                 self.publish_int43_font_table();
             }
-            0x30 => self.int10_get_font_info(bh),
+            0x20 => {
+                let es = self.cpu.registers.segment(SegmentIndex::Es).selector;
+                let bp = self.cpu.registers.ebp() as u16;
+                let _ = self.memory.write_u16(0x1F * 4, bp);
+                let _ = self.memory.write_u16(0x1F * 4 + 2, es);
+            }
+            0x21 => {
+                let bp = self.cpu.registers.ebp() as u16;
+                let es_base = self.cpu.registers.segment(SegmentIndex::Es).base;
+                let bytes_per_char = cx.clamp(1, 32) as u8;
+                let bytes = self
+                    .read_guest_block(es_base + u32::from(bp), 256 * usize::from(bytes_per_char));
+                self.video.set_char_map_select(0);
+                self.video.load_font_table(0, 0, bytes_per_char, &bytes);
+                self.set_graphics_font_grid(bytes_per_char, bl, dx as u8);
+            }
+            0x22 => self.load_rom_graphics_font(14, bl, dx as u8),
+            0x23 => self.load_rom_graphics_font(8, bl, dx as u8),
+            0x24 => self.load_rom_graphics_font(16, bl, dx as u8),
+            0x30 => {
+                if bh == 0x01 {
+                    self.publish_int43_font_table();
+                }
+                self.int10_font_info(bh);
+            }
             _ => {}
         }
+    }
+
+    fn set_int43_pointer(&mut self, segment: u16, offset: u16) {
+        let _ = self.memory.write_u16(0x43 * 4, offset);
+        let _ = self.memory.write_u16(0x43 * 4 + 2, segment);
     }
 
     fn publish_int43_font_table(&mut self) {
@@ -7971,28 +9006,65 @@ impl Machine {
         let table = self.video.active_font_table();
         let bytes = self.video.font_table_image(table, height);
         self.write_guest_block(VGA_BIOS_INT43_FONT_ADDR, &bytes);
-        let _ = self.memory.write_u16(0x43 * 4, VGA_BIOS_FONT_TABLE_OFF);
-        let _ = self
-            .memory
-            .write_u16(0x43 * 4 + 2, (VGA_BIOS_BASE >> 4) as u16);
+        self.set_int43_pointer(VGA_BIOS_SEGMENT, VGA_BIOS_FONT_TABLE_OFF);
         let _ = self.memory.write_u8(0x485, height);
     }
 
-    fn int10_get_font_info(&mut self, bh: u8) {
-        if bh != 0x01 {
+    fn int10_font_info(&mut self, specifier: u8) {
+        let Some((segment, offset)) = self.font_info_pointer(specifier) else {
+            return;
+        };
+        self.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(segment));
+        self.cpu
+            .registers
+            .set_ebp((self.cpu.registers.ebp() & !0xFFFF) | u32::from(offset));
+        let char_height = self.read_physical_u8(0x485).max(1);
+        self.set_cx(u16::from(char_height));
+        let rows_minus_1 = self.read_physical_u8(0x484);
+        let edx = (self.cpu.registers.edx() & !0xFF) | u32::from(rows_minus_1);
+        self.cpu.registers.set_edx(edx);
+    }
+
+    fn font_info_pointer(&mut self, specifier: u8) -> Option<(u16, u16)> {
+        Some(match specifier {
+            0x00 => (
+                self.read_guest_word(0x1F * 4 + 2),
+                self.read_guest_word(0x1F * 4),
+            ),
+            0x01 => (
+                self.read_guest_word(0x43 * 4 + 2),
+                self.read_guest_word(0x43 * 4),
+            ),
+            0x02 | 0x05 => (BIOS_ROM_SEGMENT, BIOS_FONT_8X14_ROM_OFFSET),
+            0x03 => (BIOS_ROM_SEGMENT, BIOS_FONT_8X8_ROM_OFFSET),
+            0x04 => (BIOS_ROM_SEGMENT, BIOS_FONT_8X8_HIGH_ROM_OFFSET),
+            0x06 | 0x07 => (BIOS_ROM_SEGMENT, BIOS_FONT_8X16_ROM_OFFSET),
+            _ => return None,
+        })
+    }
+
+    fn load_rom_graphics_font(&mut self, height: u8, row_specifier: u8, user_rows: u8) {
+        self.video.set_char_map_select(0);
+        self.video.load_rom_font(0, height);
+        self.set_graphics_font_grid(height, row_specifier, user_rows);
+    }
+
+    fn set_graphics_font_grid(&mut self, bytes_per_char: u8, row_specifier: u8, user_rows: u8) {
+        if self.video.active_mode() != VideoMode::Planar {
             return;
         }
-        self.publish_int43_font_table();
-        self.cpu.registers.set_segment(
-            SegmentIndex::Es,
-            SegmentRegister::real((VGA_BIOS_BASE >> 4) as u16),
-        );
-        let ebp = (self.cpu.registers.ebp() & !0xFFFF) | u32::from(VGA_BIOS_FONT_TABLE_OFF);
-        self.cpu.registers.set_ebp(ebp);
-        self.set_cx(u16::from(self.video.char_height()));
-        let rows_minus_one = self.memory.read_u8(0x484).unwrap_or(24);
-        let dx = (self.cpu.registers.edx() as u16 & 0xFF00) | u16::from(rows_minus_one);
-        self.set_dx(dx);
+        let rows = match row_specifier {
+            0 => user_rows,
+            1 => 14,
+            2 => 25,
+            3 => 43,
+            _ => self.text_rows() as u8,
+        }
+        .clamp(1, 60);
+        let _ = self.memory.write_u8(0x484, rows - 1);
+        let _ = self.memory.write_u16(0x485, u16::from(bytes_per_char));
     }
 
     /// Service a DOS software interrupt (INT 20h or INT 21h) host-side after the
@@ -8944,7 +10016,14 @@ impl Machine {
     /// with CR, LF, backspace, tab, and bottom-of-screen scroll, the way the BIOS
     /// teletype (INT 10h AH=0Eh) does. Attribute 0x07 is light grey on black.
     fn teletype_char(&mut self, byte: u8) {
-        let cursor = self.memory.read_u16(0x450).unwrap_or(0);
+        let page = self.active_bios_page();
+        self.teletype_char_attr(byte, 0x07, page);
+    }
+
+    fn teletype_char_attr(&mut self, byte: u8, attr: u8, page: u8) {
+        let page = self.normalize_bios_page(page);
+        let cursor = self.cursor_pos(page);
+        let columns = self.text_columns();
         let mut col = usize::from(cursor & 0x00ff);
         let mut row = usize::from(cursor >> 8);
         match byte {
@@ -8954,46 +10033,115 @@ impl Machine {
             0x07 => {}                           // bell: no visible effect
             b'\t' => {
                 col = (col + 8) & !7;
-                if col >= 80 {
+                if col >= columns {
                     col = 0;
                     row += 1;
                 }
             }
             _ => {
-                let offset = (row * 80 + col) * 2;
-                let _ = self.video.write_u8(offset, byte);
-                let _ = self.video.write_u8(offset + 1, 0x07);
+                self.write_bios_char_cell(page, row, col, byte, attr);
                 col += 1;
-                if col >= 80 {
+                if col >= columns {
                     col = 0;
                     row += 1;
                 }
             }
         }
-        while row >= 25 {
-            self.scroll_text_up();
+        while row >= self.text_rows() {
+            self.scroll_text_up(page);
             row -= 1;
         }
-        let _ = self
-            .memory
-            .write_u16(0x450, ((row as u16) << 8) | col as u16);
-        // Track the visible hardware cursor (CRTC 0E/0Fh) with the BDA cursor, the
-        // way the BIOS teletype does, so it sits where the next char lands.
-        self.video.set_cursor_offset((row * 80 + col) as u16);
+        self.set_cursor_pos(page, ((row as u16) << 8) | col as u16);
     }
 
-    /// Scroll the 80x25 text screen up one line, clearing the bottom row to
+    /// Scroll the active text screen up one line, clearing the bottom row to
     /// spaces with the normal attribute.
-    fn scroll_text_up(&mut self) {
-        const ROW_BYTES: usize = 80 * 2;
-        for offset in 0..(24 * ROW_BYTES) {
-            let byte = self.video.read_u8(offset + ROW_BYTES).unwrap_or(b' ');
-            let _ = self.video.write_u8(offset, byte);
+    fn scroll_text_up(&mut self, page: u8) {
+        if self.is_bios_graphics_text_mode() {
+            self.scroll_graphics_text_up(page);
+            return;
         }
-        let last = 24 * ROW_BYTES;
-        for col in 0..80 {
+        let base = self.text_page_base(page);
+        let columns = self.text_columns();
+        let rows = self.text_rows();
+        let row_bytes = columns * 2;
+        for offset in 0..((rows - 1) * row_bytes) {
+            let byte = self
+                .video
+                .read_u8(base + offset + row_bytes)
+                .unwrap_or(b' ');
+            let _ = self.video.write_u8(base + offset, byte);
+        }
+        let last = base + (rows - 1) * row_bytes;
+        for col in 0..columns {
             let _ = self.video.write_u8(last + col * 2, b' ');
             let _ = self.video.write_u8(last + col * 2 + 1, 0x07);
+        }
+    }
+
+    fn scroll_graphics_text_up(&mut self, page: u8) {
+        let columns = self.text_columns();
+        let rows = self.text_rows();
+        self.scroll_graphics_window(page, true, 1, 0, 0, 0, rows - 1, columns - 1);
+    }
+
+    fn scroll_graphics_window(
+        &mut self,
+        page: u8,
+        up: bool,
+        lines: usize,
+        color: u8,
+        top: usize,
+        left: usize,
+        bottom: usize,
+        right: usize,
+    ) {
+        let cell_height = self.graphics_text_cell_height();
+        let x0 = (left * 8) as u16;
+        let x1 = ((right + 1) * 8).min(self.video.raster_width() as usize) as u16;
+        let y0 = (top * cell_height) as u16;
+        let y1 = ((bottom + 1) * cell_height) as u16;
+        let height = bottom - top + 1;
+        let fill = match self.video.active_mode() {
+            VideoMode::Cga => color & 0x7F,
+            VideoMode::Planar => color & 0x0F,
+            _ => color,
+        };
+
+        if lines >= height {
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let _ = self.graphics_write_pixel(page, x, y, fill, false);
+                }
+            }
+            return;
+        }
+
+        let shift = (lines * cell_height) as u16;
+        if up {
+            for y in y0..(y1 - shift) {
+                for x in x0..x1 {
+                    let color = self.graphics_read_pixel(page, x, y + shift);
+                    let _ = self.graphics_write_pixel(page, x, y, color, false);
+                }
+            }
+            for y in (y1 - shift)..y1 {
+                for x in x0..x1 {
+                    let _ = self.graphics_write_pixel(page, x, y, fill, false);
+                }
+            }
+        } else {
+            for y in (y0 + shift..y1).rev() {
+                for x in x0..x1 {
+                    let color = self.graphics_read_pixel(page, x, y - shift);
+                    let _ = self.graphics_write_pixel(page, x, y, color, false);
+                }
+            }
+            for y in y0..(y0 + shift) {
+                for x in x0..x1 {
+                    let _ = self.graphics_write_pixel(page, x, y, fill, false);
+                }
+            }
         }
     }
 
@@ -9144,7 +10292,7 @@ impl Machine {
         let hz = match self.active_display() {
             ActiveDisplay::VgaRaster => match self.video.frame_dots() {
                 0 => 60.0,
-                dots => VGA_DOT_HZ as f64 / dots as f64,
+                dots => self.video.dot_clock_hz() as f64 / dots as f64,
             },
             ActiveDisplay::MargoLfb | ActiveDisplay::Distira => 60.0,
         };
@@ -9530,7 +10678,7 @@ impl Machine {
         self.margo.advance_busy(whole_ns as u64);
         self.margo_ns -= whole_ns;
 
-        self.vga_dots += clocks as f64 * self.timing.vga_dots_per_clock;
+        self.vga_dots += clocks as f64 * self.video.dot_clock_hz() as f64 * self.timing.inv_clock;
         let whole = self.vga_dots.floor();
         self.video.advance(whole as u64);
         self.vga_dots -= whole;
@@ -10435,6 +11583,10 @@ impl CpuBus for MachineBus<'_> {
             return Err(BusError::WidthMismatch { width });
         }
 
+        if self.video_io_disabled_for_port(port) {
+            return Ok(0xff);
+        }
+
         if let Some(value) = self.serial.read_port(port) {
             return Ok(u32::from(value));
         }
@@ -10447,8 +11599,10 @@ impl CpuBus for MachineBus<'_> {
         if let Some(value) = self.lpt2.read_port(port) {
             return Ok(u32::from(value));
         }
-        if let Some(value) = self.video.read_port(port) {
-            return Ok(u32::from(value));
+        if self.video_io_enabled_for_port(port) {
+            if let Some(value) = self.video.read_port(port) {
+                return Ok(u32::from(value));
+            }
         }
         if let Some(opl_port) = opl_port(port) {
             // The chip drives only the status byte on reads; data ports read open-bus.
@@ -10565,6 +11719,10 @@ impl CpuBus for MachineBus<'_> {
             return Err(BusError::WidthMismatch { width });
         }
 
+        if self.video_io_disabled_for_port(port) {
+            return Ok(());
+        }
+
         if let Some(opl_port) = opl_port(port) {
             self.opl.write_port(opl_port, value as u8);
             return Ok(());
@@ -10653,7 +11811,7 @@ impl CpuBus for MachineBus<'_> {
             || self.serial2.write_port(port, value as u8)
             || self.lpt.write_port(port, value as u8)
             || self.lpt2.write_port(port, value as u8)
-            || self.video.write_port(port, value as u8)
+            || (self.video_io_enabled_for_port(port) && self.video.write_port(port, value as u8))
             || self.pit.write_port(port, value as u8)
             || self.pic.write_port(port, value as u8)
             || self.keyboard.write_port(port, value as u8)
@@ -11175,6 +12333,53 @@ const BIOS_POST_ERROR_LOG_COUNT_ADDR: u32 = 0x9FC3F;
 const BIOS_POST_ERROR_LOG_ADDR: u32 = 0x9FC40;
 const BIOS_POST_ERROR_LOG_MAX: u8 = 16;
 
+fn install_bios_font_mirror(rom: &mut [u8]) {
+    let off = usize::from(BIOS_FONT_8X8_ROM_OFFSET);
+    rom[off..off + font::VGAFONT_8X8.len()].copy_from_slice(&font::VGAFONT_8X8);
+    let off = usize::from(BIOS_FONT_8X14_ROM_OFFSET);
+    rom[off..off + font::VGAFONT_8X14.len()].copy_from_slice(&font::VGAFONT_8X14);
+    let off = usize::from(BIOS_FONT_8X16_ROM_OFFSET);
+    rom[off..off + font::VGAFONT_8X16.len()].copy_from_slice(&font::VGAFONT_8X16);
+    let high = &font::VGAFONT_8X8[128 * 8..];
+    let off = usize::from(BIOS_FONT_8X8_HIGH_ROM_OFFSET);
+    rom[off..off + high.len()].copy_from_slice(high);
+}
+
+fn seed_bda_video_save_pointer(memory: &mut Memory) -> Result<(), BusError> {
+    memory.write_u16(
+        BDA_VIDEO_SAVE_POINTER,
+        INT10_VIDEO_SAVE_POINTER_TABLE_OFFSET,
+    )?;
+    memory.write_u16(BDA_VIDEO_SAVE_POINTER + 2, VGA_BIOS_SEGMENT)
+}
+
+fn seed_video_bios_tables(memory: &mut Memory) -> Result<(), BusError> {
+    let vga_base = VGA_BIOS_BASE as usize;
+    for (index, byte) in INT10_STATIC_FUNCTIONALITY.iter().copied().enumerate() {
+        memory.write_u8(vga_base + index, byte)?;
+    }
+
+    let save_ptr = vga_base + usize::from(INT10_VIDEO_SAVE_POINTER_TABLE_OFFSET);
+    memory.write_u16(save_ptr, INT10_VIDEO_PARAM_TABLE_OFFSET)?;
+    memory.write_u16(save_ptr + 2, VGA_BIOS_SEGMENT)?;
+    for slot in 1..INT10_VIDEO_SAVE_POINTER_TABLE_PTRS {
+        memory.write_u16(save_ptr + slot * 4, 0)?;
+        memory.write_u16(save_ptr + slot * 4 + 2, 0)?;
+    }
+
+    let param_table = vga_base + usize::from(INT10_VIDEO_PARAM_TABLE_OFFSET);
+    for offset in 0..INT10_VIDEO_PARAM_TABLE_ENTRIES * INT10_VIDEO_PARAM_ENTRY_LEN {
+        memory.write_u8(param_table + offset, 0)?;
+    }
+    for &(entry, bytes) in INT10_VIDEO_PARAM_ENTRIES {
+        let base = param_table + entry * INT10_VIDEO_PARAM_ENTRY_LEN;
+        for (offset, byte) in bytes.iter().copied().enumerate() {
+            memory.write_u8(base + offset, byte)?;
+        }
+    }
+    Ok(())
+}
+
 /// Format a CONFIG.SYS device line for a boot message: the DEVICE= path and its
 /// argument tail, left-padded to a column so the status that follows lines up.
 fn device_label(line: &izarravm_core::ConfigDeviceLine) -> String {
@@ -11263,6 +12468,7 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     seed_int43_font_table(memory)?;
     seed_int44_font_table(memory)?;
     seed_int46_absent_fixed_disk_table(memory)?;
+    seed_video_bios_tables(memory)?;
     // Seed the BDA words INT 11h and INT 12h hand back, like a real BIOS. The 1 KB
     // EBDA reserved below 640 KB lowers the conventional-memory word by 1 (to 639),
     // so INT 12h and the EBDA stay consistent.
@@ -11300,11 +12506,15 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     memory.write_u16(0x44e, 0)?; // active page start in regen buffer
     memory.write_u8(0x462, 0)?; // active display page
     memory.write_u16(0x463, 0x03d4)?; // CRTC base port
+    memory.write_u8(0x465, 0x29)?; // CGA mode-control shadow (80x25 color text)
+    memory.write_u8(0x466, 0x00)?; // CGA color-select shadow
     memory.write_u8(0x484, 24)?; // rows on screen minus one
-    memory.write_u8(0x485, 16)?; // character cell height in scan lines
-    memory.write_u8(0x487, 0x60)?; // EGA/VGA control: 350-line, no cursor emulation
+    memory.write_u16(0x485, 16)?; // character cell height in scan lines
+    memory.write_u8(0x487, 0x60)?; // EGA/VGA video-control byte
     memory.write_u8(0x488, 0xf9)?; // EGA/VGA switches / feature bits
-    memory.write_u8(0x489, 0x00)?; // VGA flags (mode-set control)
+    memory.write_u8(0x489, 0x51)?; // cursor emulation enabled, 400-line alphanumeric mode
+    memory.write_u8(0x48A, 0x08)?; // display-combination code: VGA colour
+    seed_bda_video_save_pointer(memory)?;
     // Fixed-disk count: zero at construction, before any image is mounted.
     // Machine::mount_hdd bumps it to 1 when a hard disk attaches, so the count
     // tracks the real device rather than a fixed value. Ctrl-Break flag clear.
@@ -11533,6 +12743,14 @@ fn seed_int46_absent_fixed_disk_table(memory: &mut Memory) -> Result<(), BusErro
 }
 
 impl MachineBus<'_> {
+    fn video_io_disabled_for_port(&self, port: u16) -> bool {
+        !self.video.video_subsystem_enabled() && port != 0x3C3 && (0x3B0..=0x3DF).contains(&port)
+    }
+
+    fn video_io_enabled_for_port(&self, port: u16) -> bool {
+        self.video.video_subsystem_enabled() || port == 0x3C3
+    }
+
     /// In-region offset (0..=7) of `port` within the AD1848 / WSS port window
     /// `[wss_base, wss_base + 8)`, or `None` when the codec is disabled or the
     /// port lies outside the window. The codec's read_port/write_port take this
@@ -11564,6 +12782,13 @@ impl MachineBus<'_> {
         self.pci.distira_cmdfifo_offset(address, width)
     }
 
+    fn video_text_offset(&self, address: u32, width: usize) -> Option<usize> {
+        self.video
+            .video_memory_enabled()
+            .then(|| video_text_offset(self.video.text_memory_base(), address, width))
+            .flatten()
+    }
+
     /// Apply the A20 gate to a physical address before it reaches memory. The gate
     /// is the single 8042 output-port bit (shared with fast-A20 port 0x92); when
     /// it is closed, address line 20 is forced low. This is the motherboard-level
@@ -11579,11 +12804,12 @@ impl MachineBus<'_> {
     }
 
     /// The plane-window offset for an access that the guest-selected GC06 graphics
-    /// aperture redirects, or None when the access is not in a moved graphics
-    /// window. Only graphics modes consult the aperture; text and CGA keep the
-    /// fixed B8000 decode. A power-on / default (128 KB) aperture is left to the
-    /// fixed A0000 routing so every mode's default behavior is unchanged.
+    /// aperture redirects. Only graphics modes consult the aperture; text and CGA
+    /// keep the fixed B8000 decode.
     fn vga_gfx_offset(&self, address: u32, width: usize) -> Option<usize> {
+        if !self.video.video_memory_enabled() {
+            return None;
+        }
         match self.video.active_mode() {
             VideoMode::Planar | VideoMode::ModeX | VideoMode::Mode13h => {
                 let ap = self.video.gfx_aperture();
@@ -11613,19 +12839,25 @@ impl MachineBus<'_> {
             });
         }
 
-        if let Some(offset) = video_text_offset(address, width) {
+        if let Some(offset) = self.video_text_offset(address, width) {
             // In a CGA graphics mode the B800 aperture is the 16 KiB CGA
             // framebuffer; in text mode it is the character/attribute buffer.
-            if self.video.active_mode() == VideoMode::Cga {
-                return Ok((0..width)
-                    .map(|i| self.video.cga_read(offset + i))
-                    .collect());
-            }
+            let cga_window = self.video.is_cga_personality();
+            let cga_graphics = self.video.active_mode() == VideoMode::Cga;
             return (0..width)
                 .map(|index| {
-                    self.video
-                        .read_u8(offset + index)
-                        .map_err(|_| BusError::UnmappedMemory { address })
+                    let byte_offset = if cga_window {
+                        (offset + index) & (CGA_FB_SIZE - 1)
+                    } else {
+                        offset + index
+                    };
+                    if cga_graphics {
+                        Ok(self.video.cga_read(byte_offset))
+                    } else {
+                        self.video
+                            .read_u8(byte_offset)
+                            .map_err(|_| BusError::UnmappedMemory { address })
+                    }
                 })
                 .collect();
         }
@@ -11634,20 +12866,22 @@ impl MachineBus<'_> {
         // X) and 16-color planar route through the planar datapath (cpu_read loads
         // the VGA latches as a side effect, so it needs &mut self); chained mode
         // 13h routes through the chain-4 decode.
-        if let Some(offset) = vga_planar_offset(address, width) {
-            match self.video.active_mode() {
-                VideoMode::Planar | VideoMode::ModeX => {
-                    return Ok((0..width)
-                        .map(|i| self.video.cpu_read(offset + i))
-                        .collect());
+        if self.video.video_memory_enabled() {
+            if let Some(offset) = vga_planar_offset(address, width) {
+                match self.video.active_mode() {
+                    VideoMode::Planar | VideoMode::ModeX => {
+                        return Ok((0..width)
+                            .map(|i| self.video.cpu_read(offset + i))
+                            .collect());
+                    }
+                    VideoMode::Mode13h => {
+                        return Ok((0..width)
+                            .map(|i| self.video.cpu_read_chain4(offset + i))
+                            .collect());
+                    }
+                    // Text and CGA do not decode the A0000 window; fall through.
+                    VideoMode::Text | VideoMode::Cga => {}
                 }
-                VideoMode::Mode13h => {
-                    return Ok((0..width)
-                        .map(|i| self.video.cpu_read_chain4(offset + i))
-                        .collect());
-                }
-                // Text and CGA do not decode the A0000 window; fall through.
-                VideoMode::Text | VideoMode::Cga => {}
             }
         }
 
@@ -11720,9 +12954,14 @@ impl MachineBus<'_> {
             return Ok(());
         }
 
-        if let Some(offset) = video_text_offset(address, 1) {
+        if let Some(offset) = self.video_text_offset(address, 1) {
             // In a CGA graphics mode the B800 aperture is the 16 KiB CGA
             // framebuffer; in text mode it is the character/attribute buffer.
+            let offset = if self.video.is_cga_personality() {
+                offset & (CGA_FB_SIZE - 1)
+            } else {
+                offset
+            };
             if self.video.active_mode() == VideoMode::Cga {
                 self.video.cga_write(offset, value);
                 return Ok(());
@@ -11737,18 +12976,20 @@ impl MachineBus<'_> {
         // X) and 16-color planar route A0000 through the planar datapath (map mask,
         // write mode, bit mask, latches); chained mode 13h routes through the
         // chain-4 decode.
-        if let Some(offset) = vga_planar_offset(address, 1) {
-            match self.video.active_mode() {
-                VideoMode::Planar | VideoMode::ModeX => {
-                    self.video.cpu_write(offset, value);
-                    return Ok(());
+        if self.video.video_memory_enabled() {
+            if let Some(offset) = vga_planar_offset(address, 1) {
+                match self.video.active_mode() {
+                    VideoMode::Planar | VideoMode::ModeX => {
+                        self.video.cpu_write(offset, value);
+                        return Ok(());
+                    }
+                    VideoMode::Mode13h => {
+                        self.video.cpu_write_chain4(offset, value);
+                        return Ok(());
+                    }
+                    // Text and CGA do not decode the A0000 window; fall through.
+                    VideoMode::Text | VideoMode::Cga => {}
                 }
-                VideoMode::Mode13h => {
-                    self.video.cpu_write_chain4(offset, value);
-                    return Ok(());
-                }
-                // Text and CGA do not decode the A0000 window; fall through.
-                VideoMode::Text | VideoMode::Cga => {}
             }
         }
 
@@ -11889,8 +13130,8 @@ impl MachineBus<'_> {
         if rom_offset(address, 1).is_some() {
             self.wait_states.rom
         } else if self.vga_gfx_offset(address, 1).is_some()
-            || video_text_offset(address, 1).is_some()
-            || vga_planar_offset(address, 1).is_some()
+            || self.video_text_offset(address, 1).is_some()
+            || (self.video.video_memory_enabled() && vga_planar_offset(address, 1).is_some())
             || margo_lfb_offset(address, 1).is_some()
             || margo_mmio_offset(address, 1).is_some()
             || self.distira_lfb_offset(address, 1).is_some()
@@ -11924,10 +13165,10 @@ fn rom_offset(address: u32, width: usize) -> Option<usize> {
     (offset + width <= BIOS_ROM_SIZE).then_some(offset)
 }
 
-fn video_text_offset(address: u32, width: usize) -> Option<usize> {
-    let end = VGA_TEXT_BASE + VGA_TEXT_MEMORY_SIZE as u32;
-    if (VGA_TEXT_BASE..end).contains(&address) && address + width as u32 <= end {
-        Some((address - VGA_TEXT_BASE) as usize)
+fn video_text_offset(base: u32, address: u32, width: usize) -> Option<usize> {
+    let end = base + VGA_TEXT_MEMORY_SIZE as u32;
+    if (base..end).contains(&address) && address + width as u32 <= end {
+        Some((address - base) as usize)
     } else {
         None
     }
@@ -11946,28 +13187,12 @@ fn vga_planar_offset(address: u32, width: usize) -> Option<usize> {
 
 /// The graphics-mode CPU window the guest selected through Graphics Controller
 /// register 06h (memory map select), as a plane-window offset for the VGA
-/// datapath. Returns Some(offset) when the access falls in a guest-moved aperture
-/// that the fixed A0000 window does not already cover.
-///
-/// The aperture's `base`/`length` come from `Vga::gfx_aperture`. The plane window
-/// is 64 KB, so the offset is `address - base` capped to that window; a 128 KB
-/// aperture is clamped to the low 64 KB the datapath addresses.
-// Limit: the power-on / map-select-00 aperture (A0000, 128 KB) is left to the
-// fixed A0000 64 KB routing, so the default behavior of every mode is byte-for-
-// byte unchanged. Only a guest that programs a smaller, moved window (64 KB at
-// A0000, or 32 KB at B0000 / B8000) is routed here. Power-on and an explicit
-// 128 KB selection are indistinguishable (both read misc bits 3-2 as 00), so the
-// rarely used full-128 KB decode stays on the legacy path rather than extending
-// graphics routing across B0000-BFFFF.
+/// datapath. The VGA datapath addresses a 64 KB plane window; map-select 00's
+/// 128 KB host window mirrors that 64 KB plane window twice.
 fn vga_gfx_aperture_offset(base: u32, length: u32, address: u32, width: usize) -> Option<usize> {
-    // A 128 KB window is the default/legacy decode; do not reroute it here.
-    if length >= VGA_PLANAR_WINDOW_SIZE * 2 {
-        return None;
-    }
     let end = base + length;
     if (base..end).contains(&address) && address + width as u32 <= end {
-        let offset = (address - base) as usize;
-        // The planar/chain-4 datapath indexes a 64 KB plane window.
+        let offset = ((address - base) % VGA_PLANAR_WINDOW_SIZE) as usize;
         (offset + width <= VGA_PLANAR_WINDOW_SIZE as usize).then_some(offset)
     } else {
         None
@@ -12015,6 +13240,9 @@ mod tests {
     use super::*;
     use izarravm_core::{SbDma8, SbDma16, SbIrq};
     use izarravm_firmware::I386DX25_TEST_ROM;
+    use izarravm_video::{VGA_MODE13H_BASE, VGA_MONO_TEXT_BASE, VGA_TEXT_BASE};
+
+    const BIOS_TEXT_WHITE: u8 = 0x3F;
 
     #[test]
     fn slow_post_paces_without_null_vector_runaway() {
@@ -12187,6 +13415,13 @@ mod tests {
             vec![0u8; BIOS_ROM_SIZE],
         )
         .unwrap()
+    }
+
+    fn color_crtc_reg(machine: &mut Machine, index: u8) -> u8 {
+        let mut bus = machine.make_bus();
+        bus.write_io(0x3D4, BusWidth::Byte, u32::from(index))
+            .unwrap();
+        bus.read_io(0x3D5, BusWidth::Byte).unwrap() as u8
     }
 
     #[test]
@@ -14414,6 +15649,9 @@ mod tests {
         // Static video-state block and the system flags.
         assert_eq!(m.memory.read_u16(0x44c).unwrap(), 0x1000); // regen page size
         assert_eq!(m.memory.read_u8(0x485).unwrap(), 16); // char cell height
+        assert_eq!(m.memory.read_u8(0x487).unwrap(), 0x60); // EGA/VGA video-control byte
+        assert_eq!(m.memory.read_u8(0x489).unwrap(), 0x51); // EGA/VGA mode-set control
+        assert_eq!(m.memory.read_u8(0x48A).unwrap(), 0x08); // VGA colour DCC
         assert_eq!(m.memory.read_u8(0x475).unwrap(), 0); // no fixed disks
         assert_eq!(m.memory.read_u16(0x472).unwrap(), 0x1234); // warm-boot magic
     }
@@ -14644,12 +15882,288 @@ mod tests {
     }
 
     #[test]
-    fn int10_1a_reports_vga_color_dcc() {
+    fn int10_display_detection_tracks_color_and_mono_crtc() {
         let mut m = int15_machine(16);
         m.cpu.registers.set_eax(0x1A00);
         m.handle_int10();
         assert_eq!(m.cpu.registers.eax() as u8, 0x1A); // AL = function supported
         assert_eq!(m.cpu.registers.ebx() as u8, 0x08); // BL = VGA colour DCC
+        assert_eq!(m.memory.read_u8(0x48A).unwrap(), 0x08);
+
+        m.cpu.registers.set_eax(0x1A01);
+        m.cpu.registers.set_ebx(0x000A);
+        m.handle_int10();
+        assert_eq!(m.memory.read_u8(0x48A).unwrap(), 0x0A);
+        m.cpu.registers.set_eax(0x1A00);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.ebx() as u8, 0x0A);
+
+        m.cpu.registers.set_eax(0x1200);
+        m.cpu.registers.set_ebx(0x0010);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.ebx() as u16, 0x0003); // colour, 256 KiB
+        assert_eq!(m.cpu.registers.ecx() as u16, 0x0f09); // feature bits, switch setting
+
+        m.cpu.registers.set_eax(0x0007);
+        m.handle_int10();
+        m.cpu.registers.set_eax(0x1A00);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.ebx() as u8, 0x07); // BL = VGA mono DCC
+        assert_eq!(m.memory.read_u8(0x48A).unwrap(), 0x07);
+        m.cpu.registers.set_eax(0x1200);
+        m.cpu.registers.set_ebx(0x0010);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.ebx() as u16, 0x0103); // mono, 256 KiB
+    }
+
+    #[test]
+    fn int10_1232_toggles_video_addressing() {
+        let mut m = int15_machine(16);
+        m.write_physical_u8(VGA_TEXT_BASE, b'T');
+        assert_eq!(m.read_physical_u8(VGA_TEXT_BASE), b'T');
+
+        m.cpu.registers.set_eax(0x1201);
+        m.cpu.registers.set_ebx(0x0032);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.eax() as u8, 0x12);
+        assert!(m.video().video_subsystem_enabled());
+        assert!(!m.video().video_memory_enabled());
+
+        m.write_physical_u8(VGA_TEXT_BASE, b'R');
+        assert_eq!(m.read_physical_u8(VGA_TEXT_BASE), b'R');
+        {
+            let mut bus = m.make_bus();
+            assert_eq!(bus.read_io(0x3C3, BusWidth::Byte).unwrap(), 1);
+            assert_eq!(bus.read_io(0x3CC, BusWidth::Byte).unwrap() & 0x02, 0);
+        }
+
+        m.cpu.registers.set_eax(0x1200);
+        m.cpu.registers.set_ebx(0x0032);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.eax() as u8, 0x12);
+        assert!(m.video().video_subsystem_enabled());
+        assert!(m.video().video_memory_enabled());
+        assert_eq!(m.read_physical_u8(VGA_TEXT_BASE), b'T');
+
+        m.cpu.registers.set_eax(0x1201);
+        m.cpu.registers.set_ebx(0x0032);
+        m.handle_int10();
+        assert!(!m.video().video_memory_enabled());
+        m.cpu.registers.set_eax(0x000D);
+        m.handle_int10();
+        assert!(m.video().video_memory_enabled());
+    }
+
+    #[test]
+    fn int10_1230_selects_text_scanlines_on_next_mode_set() {
+        let mut m = int15_machine(16);
+        assert_eq!(m.read_physical_u8(0x489) & 0x90, 0x10); // POST default: 400 lines
+        assert_eq!(m.read_physical_u8(0x488) & 0x0F, 0x09);
+
+        m.cpu.registers.set_eax(0x1200);
+        m.cpu.registers.set_ebx(0x0030);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.eax() as u8, 0x12);
+        assert_eq!(m.read_physical_u8(0x489) & 0x90, 0x80);
+        assert_eq!(m.read_physical_u8(0x488) & 0x0F, 0x08);
+        m.cpu.registers.set_eax(0x1200);
+        m.cpu.registers.set_ebx(0x0010);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.ecx() as u16, 0x0f08);
+        m.cpu.registers.set_eax(0x0003);
+        m.handle_int10();
+        assert_eq!(m.read_physical_u8(0x485), 8);
+        assert_eq!(m.video().raster_height(), 262);
+
+        m.cpu.registers.set_eax(0x1201);
+        m.cpu.registers.set_ebx(0x0030);
+        m.handle_int10();
+        assert_eq!(m.read_physical_u8(0x489) & 0x90, 0x00);
+        assert_eq!(m.read_physical_u8(0x488) & 0x0F, 0x09);
+        m.cpu.registers.set_eax(0x0003);
+        m.handle_int10();
+        assert_eq!(m.read_physical_u8(0x485), 14);
+        assert_eq!(m.video().raster_width(), 720);
+
+        m.cpu.registers.set_eax(0x1202);
+        m.cpu.registers.set_ebx(0x0030);
+        m.handle_int10();
+        assert_eq!(m.read_physical_u8(0x489) & 0x90, 0x10);
+        assert_eq!(m.read_physical_u8(0x488) & 0x0F, 0x09);
+        m.cpu.registers.set_eax(0x0003);
+        m.handle_int10();
+        assert_eq!(m.read_physical_u8(0x485), 16);
+        assert_eq!(m.video().raster_width(), 720);
+    }
+
+    #[test]
+    fn int10_1231_toggles_default_palette_loading_on_mode_set() {
+        let mut m = int15_machine(16);
+        m.video_mut().set_dac_entry(5, 1, 2, 3);
+        m.video_mut().set_attr_palette_reg(1, 0x2A);
+        m.video_mut().write_port(0x3C6, 0x0F);
+
+        m.cpu.registers.set_eax(0x1201);
+        m.cpu.registers.set_ebx(0x0031);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.eax() as u8, 0x12);
+        assert!(!m.video().default_palette_loading_enabled());
+        assert_eq!(m.read_physical_u8(0x489) & 0x08, 0x08);
+
+        m.cpu.registers.set_eax(0x000D);
+        m.handle_int10();
+        assert_eq!(m.video().dac_entry(5), [1, 2, 3]);
+        assert_eq!(m.video().attr_palette_reg(1), 0x2A);
+        assert_eq!(m.video_mut().read_port(0x3C6), Some(0x0F));
+
+        m.video_mut().set_dac_entry(5, 1, 2, 3);
+        m.video_mut().set_attr_palette_reg(1, 0x2A);
+        m.video_mut().write_port(0x3C6, 0x0F);
+        m.cpu.registers.set_eax(0x1200);
+        m.cpu.registers.set_ebx(0x0031);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.eax() as u8, 0x12);
+        assert!(m.video().default_palette_loading_enabled());
+        assert_eq!(m.read_physical_u8(0x489) & 0x08, 0x00);
+
+        m.cpu.registers.set_eax(0x000D);
+        m.handle_int10();
+        assert_eq!(m.video().dac_entry(5), [0x2A, 0x00, 0x2A]);
+        assert_eq!(m.video().attr_palette_reg(1), 1);
+        assert_eq!(m.video_mut().read_port(0x3C6), Some(0xFF));
+    }
+
+    #[test]
+    fn int10_1233_toggles_grayscale_summing_for_dac_loads() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x1200);
+        m.cpu.registers.set_ebx(0x0033);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.eax() as u8, 0x12);
+        assert!(m.video().grayscale_summing_enabled());
+        assert_eq!(m.read_physical_u8(0x489) & 0x02, 0x02);
+
+        m.cpu.registers.set_eax(0x1010);
+        m.cpu.registers.set_ebx(5);
+        m.cpu.registers.set_edx(63 << 8); // DH = red
+        m.cpu.registers.set_ecx(0); // CH/CL = green/blue
+        m.handle_int10();
+        assert_eq!(m.video().dac_entry(5), [18, 18, 18]);
+
+        m.video_mut().write_port(0x3C8, 6);
+        m.video_mut().write_port(0x3C9, 0);
+        m.video_mut().write_port(0x3C9, 63);
+        m.video_mut().write_port(0x3C9, 0);
+        assert_eq!(m.video().dac_entry(6), [37, 37, 37]);
+
+        m.cpu.registers.set_eax(0x1201);
+        m.cpu.registers.set_ebx(0x0033);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.eax() as u8, 0x12);
+        assert!(!m.video().grayscale_summing_enabled());
+        assert_eq!(m.read_physical_u8(0x489) & 0x02, 0x00);
+
+        m.cpu.registers.set_eax(0x1010);
+        m.cpu.registers.set_ebx(7);
+        m.cpu.registers.set_edx(0);
+        m.cpu.registers.set_ecx((63 << 8) | 0);
+        m.handle_int10();
+        assert_eq!(m.video().dac_entry(7), [0, 63, 0]);
+    }
+
+    #[test]
+    fn int10_1234_toggles_cursor_emulation_without_disturbing_mode_set_bits() {
+        let mut m = int15_machine(16);
+        assert_eq!(m.read_physical_u8(0x489) & 0x01, 0x01);
+
+        m.cpu.registers.set_eax(0x1201);
+        m.cpu.registers.set_ebx(0x0034);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.eax() as u8, 0x12);
+        assert_eq!(m.read_physical_u8(0x489) & 0x01, 0x00);
+
+        m.cpu.registers.set_eax(0x1202);
+        m.cpu.registers.set_ebx(0x0030);
+        m.handle_int10();
+        assert_eq!(m.read_physical_u8(0x489) & 0x11, 0x10);
+
+        m.cpu.registers.set_eax(0x1200);
+        m.cpu.registers.set_ebx(0x0034);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.eax() as u8, 0x12);
+        assert_eq!(m.read_physical_u8(0x489) & 0x11, 0x11);
+    }
+
+    #[test]
+    fn int10_1235_acknowledges_display_switch_interface() {
+        let mut m = int15_machine(16);
+
+        m.cpu.registers.set_eax(0x1200);
+        m.cpu.registers.set_ebx(0x0035);
+        m.handle_int10();
+
+        assert_eq!(m.cpu.registers.eax() as u8, 0x12);
+        assert!(m.video().display_refresh_enabled());
+        assert!(m.video().video_subsystem_enabled());
+    }
+
+    #[test]
+    fn int10_01_scales_legacy_cursor_shape_when_emulation_is_enabled() {
+        let mut m = int15_machine(16);
+        m.write_physical_u8(0x486, 0xA5);
+        m.cpu.registers.set_eax(0x0003);
+        m.handle_int10();
+        assert_eq!(m.read_physical_u8(0x485), 16);
+        assert_eq!(m.read_physical_u16(0x485), 16);
+        assert_eq!(m.read_physical_u8(0x489) & 0x01, 0x01);
+
+        m.cpu.registers.set_eax(0x0100);
+        m.cpu.registers.set_ecx(0x0007);
+        m.handle_int10();
+        assert_eq!(m.memory.read_u16(0x460).unwrap(), 0x0007);
+        assert_eq!(color_crtc_reg(&mut m, 0x0A), 0x01);
+        assert_eq!(color_crtc_reg(&mut m, 0x0B), 0x0F);
+
+        m.cpu.registers.set_eax(0x0300);
+        m.cpu.registers.set_ebx(0);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.ecx() as u16, 0x0007);
+
+        m.cpu.registers.set_eax(0x1201);
+        m.cpu.registers.set_ebx(0x0034);
+        m.handle_int10();
+        m.cpu.registers.set_eax(0x0100);
+        m.cpu.registers.set_ecx(0x0007);
+        m.handle_int10();
+        assert_eq!(m.memory.read_u16(0x460).unwrap(), 0x0007);
+        assert_eq!(color_crtc_reg(&mut m, 0x0A), 0x00);
+        assert_eq!(color_crtc_reg(&mut m, 0x0B), 0x07);
+    }
+
+    #[test]
+    fn int10_1236_toggles_video_refresh() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x000D);
+        m.handle_int10();
+        assert!(m.video_mut().planar_write_pixel(0, 0, 0x0F, false));
+        let lit = m.video_mut().render_full_frame().pixels[0];
+        assert_ne!(lit, 0);
+
+        m.cpu.registers.set_eax(0x1201);
+        m.cpu.registers.set_ebx(0x0036);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.eax() as u8, 0x12);
+        assert!(!m.video().display_refresh_enabled());
+        assert!(m.video().video_subsystem_enabled());
+        assert_eq!(m.video_mut().render_full_frame().pixels[0], 0);
+        assert_eq!(m.video_mut().read_status1() & 0x01, 0x01);
+
+        m.cpu.registers.set_eax(0x1200);
+        m.cpu.registers.set_ebx(0x0036);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.eax() as u8, 0x12);
+        assert!(m.video().display_refresh_enabled());
+        assert_eq!(m.video_mut().render_full_frame().pixels[0], lit);
     }
 
     #[test]
@@ -14802,14 +16316,100 @@ mod tests {
     #[test]
     fn int10_1b_fills_state_block_and_signals_vga() {
         let mut m = int15_machine(16);
-        m.cpu.registers.set_eax(0x0003); // mode 03h so the BDA has a known mode
+        m.cpu.registers.set_eax(0x0004); // CGA mode so the BDA shadows are non-VGA
+        m.handle_int10();
+        m.cpu.registers.set_eax(0x0B00);
+        m.cpu.registers.set_ebx(0x0011);
+        m.handle_int10();
+        m.cpu.registers.set_eax(0x0B00);
+        m.cpu.registers.set_ebx(0x0101);
+        m.handle_int10();
+        m.cpu.registers.set_eax(0x1A01);
+        m.cpu.registers.set_ebx(0x000A);
         m.handle_int10();
         m.cpu.registers.set_eax(0x1B00); // ES:DI = 0:0 -> block at physical 0
         m.handle_int10();
         assert_eq!(m.cpu.registers.eax() as u8, 0x1B);
-        assert_eq!(m.read_physical_u8(4), 0x03); // video mode at +4
-        assert_eq!(m.read_physical_u8(0x25), 0x08); // active DCC
-        assert_eq!(m.read_physical_u8(0x2A), 0x03); // 480 scan lines (VGA)
+        assert_eq!(m.read_physical_u16(0), 0x0000); // functionality table offset
+        assert_eq!(m.read_physical_u16(2), VGA_BIOS_SEGMENT); // functionality table segment
+        let table: Vec<u8> = (0..16)
+            .map(|offset| m.read_physical_u8(VGA_BIOS_BASE + offset))
+            .collect();
+        assert_eq!(table.as_slice(), &INT10_STATIC_FUNCTIONALITY);
+        assert_eq!(m.read_physical_u8(4), 0x04); // video mode at +4
+        assert_eq!(m.read_physical_u16(0x07), 0x4000); // regen buffer/page size
+        assert_eq!(m.read_physical_u16(0x09), 0x0000); // active page start
+        assert_eq!(m.read_physical_u8(0x20), 0x0A); // CGA 3D8h shadow
+        assert_eq!(m.read_physical_u8(0x21), 0x31); // CGA 3D9h shadow
+        assert_eq!(m.read_physical_u16(0x23), 8); // bytes per character
+        assert_eq!(m.read_physical_u8(0x25), 0x0A); // BDA display-combination code
+        assert_eq!(m.read_physical_u16(0x27), 4); // CGA mode 04h colors
+        assert_eq!(m.read_physical_u8(0x29), 1); // CGA graphics has one page
+        assert_eq!(m.read_physical_u8(0x2A), 0x00); // 200 scan lines
+    }
+
+    #[test]
+    fn int10_exposes_video_save_pointer_and_parameter_table() {
+        let mut m = int15_machine(16);
+        assert_eq!(
+            m.read_physical_u16(BDA_VIDEO_SAVE_POINTER as u32),
+            INT10_VIDEO_SAVE_POINTER_TABLE_OFFSET
+        );
+        assert_eq!(
+            m.read_physical_u16((BDA_VIDEO_SAVE_POINTER + 2) as u32),
+            VGA_BIOS_SEGMENT
+        );
+
+        let save_table = VGA_BIOS_BASE + u32::from(INT10_VIDEO_SAVE_POINTER_TABLE_OFFSET);
+        assert_eq!(
+            m.read_physical_u16(save_table),
+            INT10_VIDEO_PARAM_TABLE_OFFSET
+        );
+        assert_eq!(m.read_physical_u16(save_table + 2), VGA_BIOS_SEGMENT);
+        let param_table = VGA_BIOS_BASE + u32::from(INT10_VIDEO_PARAM_TABLE_OFFSET);
+        let mode03 = param_table + 0x18 * INT10_VIDEO_PARAM_ENTRY_LEN as u32;
+        assert_eq!(m.read_physical_u8(mode03), 80);
+        assert_eq!(m.read_physical_u8(mode03 + 1), 24);
+        assert_eq!(m.read_physical_u8(mode03 + 2), 16);
+        let mode12 = param_table + 0x1b * INT10_VIDEO_PARAM_ENTRY_LEN as u32;
+        assert_eq!(m.read_physical_u8(mode12), 80);
+        assert_eq!(m.read_physical_u8(mode12 + 1), 29);
+        assert_eq!(m.read_physical_u8(mode12 + 2), 16);
+
+        m.memory.write_u16(BDA_VIDEO_SAVE_POINTER, 0).unwrap();
+        m.memory.write_u16(BDA_VIDEO_SAVE_POINTER + 2, 0).unwrap();
+        m.cpu.registers.set_eax(0x000D);
+        m.handle_int10();
+        assert_eq!(
+            m.read_physical_u16(BDA_VIDEO_SAVE_POINTER as u32),
+            INT10_VIDEO_SAVE_POINTER_TABLE_OFFSET
+        );
+        assert_eq!(
+            m.read_physical_u16((BDA_VIDEO_SAVE_POINTER + 2) as u32),
+            VGA_BIOS_SEGMENT
+        );
+    }
+
+    #[test]
+    fn int10_1b_reports_ega_graphics_page_count() {
+        let mut m = int15_machine(16);
+
+        for (mode, pages) in [
+            (0x0D, 8),
+            (0x0E, 4),
+            (0x0F, 2),
+            (0x10, 2),
+            (0x11, 1),
+            (0x12, 1),
+        ] {
+            m.cpu.registers.set_eax(mode);
+            m.handle_int10();
+            m.cpu.registers.set_eax(0x1B00);
+            m.handle_int10();
+
+            assert_eq!(m.cpu.registers.eax() as u8, 0x1B);
+            assert_eq!(m.read_physical_u8(0x29), pages, "mode {mode:02X}");
+        }
     }
 
     #[test]
@@ -15924,6 +17524,46 @@ mod tests {
     }
 
     #[test]
+    fn int10_00_returns_vgabios_mode_class_code() {
+        let mut m = int15_machine(16);
+
+        for (mode, returned_al) in [
+            (0x00u8, 0x30u8),
+            (0x04, 0x30),
+            (0x06, 0x3F),
+            (0x0D, 0x20),
+            (0x13, 0x20),
+            (0x84, 0x30),
+        ] {
+            m.cpu.registers.set_eax(u32::from(mode));
+            m.handle_int10();
+
+            assert_eq!(m.cpu.registers.eax() as u8, returned_al, "mode {mode:02X}");
+        }
+        assert_eq!(m.read_physical_u8(0x449), 0x84);
+    }
+
+    #[test]
+    fn int10_00_tracks_no_clear_in_bda_video_control() {
+        let mut m = int15_machine(16);
+
+        m.cpu.registers.set_eax(0x008D);
+        m.handle_int10();
+        assert_eq!(m.read_physical_u8(0x449), 0x8D);
+        assert_eq!(m.read_physical_u8(0x487), 0xE0);
+
+        m.cpu.registers.set_eax(0x0093);
+        m.handle_int10();
+        assert_eq!(m.read_physical_u8(0x449), 0x93);
+        assert_eq!(m.read_physical_u8(0x487), 0xE0);
+
+        m.cpu.registers.set_eax(0x000D);
+        m.handle_int10();
+        assert_eq!(m.read_physical_u8(0x449), 0x0D);
+        assert_eq!(m.read_physical_u8(0x487), 0x60);
+    }
+
+    #[test]
     fn boot_image_starts_at_bios_loaded_boot_sector() {
         let mut machine = Machine::new_boot_image(
             MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
@@ -15956,8 +17596,10 @@ mod tests {
 
         assert_eq!(reason, StopReason::Halted);
         assert!(serial.contains("PASS boot.stage2"));
+        assert!(serial.contains("PASS video.cga_graphics"));
+        assert!(serial.contains("PASS video.ega_planar"));
         assert!(serial.contains("PASS video.vga_mode13h"));
-        assert!(serial.contains("FAIL sound.opl3"));
+        assert!(serial.contains("FAIL sound.sb_adpcm"));
         assert_eq!(
             usize::from(results.declared_record_count),
             results.records.len()
@@ -15970,6 +17612,11 @@ mod tests {
             record.status == izarravm_firmware::SuiteRecordStatus::Pass
                 && record.name == "video.vga_mode13h"
         }));
+        for name in ["video.cga_graphics", "video.ega_planar"] {
+            assert!(results.records.iter().any(|record| {
+                record.status == izarravm_firmware::SuiteRecordStatus::Pass && record.name == name
+            }));
+        }
         // Chain-4 routes the linear byte at offset N to plane N & 3 at plane
         // offset N >> 2, so the boot image's three drawn pixels land as:
         // 0 -> plane 0 @ 0, 319 -> plane 3 @ 79, 63680 -> plane 0 @ 15920.
@@ -16187,6 +17834,534 @@ mod tests {
     }
 
     #[test]
+    fn int10_pixel_write_read_round_trips_in_cga_graphics() {
+        let mut m = int15_machine(16);
+        m.video_mut().set_cga_mode(0x04);
+
+        // Mode 04h packs four 2-bit pixels per byte. Pixel (2,1) lives in the odd
+        // bank at B800:2000 bits 3:2.
+        m.cpu.registers.set_eax(0x0C03);
+        m.cpu.registers.set_ecx(2);
+        m.cpu.registers.set_edx(1);
+        m.handle_int10();
+        assert_eq!(m.video().cga_read(0x2000), 0x0C);
+
+        m.cpu.registers.set_eax(0x0D00);
+        m.cpu.registers.set_ecx(2);
+        m.cpu.registers.set_edx(1);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.eax() as u8, 3);
+
+        // In CGA modes AL bit 7 means XOR the low colour bits with the existing
+        // pixel, so 3 xor 1 becomes 2.
+        m.cpu.registers.set_eax(0x0C81);
+        m.cpu.registers.set_ecx(2);
+        m.cpu.registers.set_edx(1);
+        m.handle_int10();
+        m.cpu.registers.set_eax(0x0D00);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.eax() as u8, 2);
+
+        m.video_mut().set_cga_mode(0x06);
+        m.cpu.registers.set_eax(0x0C01);
+        m.cpu.registers.set_ecx(9);
+        m.cpu.registers.set_edx(0);
+        m.handle_int10();
+        m.cpu.registers.set_eax(0x0D00);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.eax() as u8, 1);
+    }
+
+    #[test]
+    fn int10_pixel_write_read_round_trips_in_ega_planar() {
+        let mut m = int15_machine(16);
+        assert!(m.video_mut().set_mode(0x0D));
+
+        m.cpu.registers.set_eax(0x0C0B);
+        m.cpu.registers.set_ecx(9);
+        m.cpu.registers.set_edx(3);
+        m.handle_int10();
+        assert_eq!(m.video().planar_read_pixel(9, 3), 0x0B);
+
+        m.cpu.registers.set_eax(0x0D00);
+        m.cpu.registers.set_ecx(9);
+        m.cpu.registers.set_edx(3);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.eax() as u8, 0x0B);
+        assert_eq!(m.video().render_active_row(6)[9], 0x13);
+
+        m.cpu.registers.set_eax(0x0C82);
+        m.handle_int10();
+        m.cpu.registers.set_eax(0x0D00);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.eax() as u8, 0x09);
+    }
+
+    #[test]
+    fn int10_pixel_read_write_uses_ega_graphics_page() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x000D);
+        m.handle_int10();
+
+        m.cpu.registers.set_eax(0x0C0B);
+        m.cpu.registers.set_ebx(0x0100);
+        m.cpu.registers.set_ecx(9);
+        m.cpu.registers.set_edx(3);
+        m.handle_int10();
+
+        assert_eq!(m.video().planar_read_pixel(9, 3), 0x00);
+        assert_eq!(m.video().planar_read_pixel_at(0x2000, 9, 3), 0x0B);
+
+        m.cpu.registers.set_eax(0x0D00);
+        m.cpu.registers.set_ebx(0x0000);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.eax() as u8, 0x00);
+
+        m.cpu.registers.set_eax(0x0D00);
+        m.cpu.registers.set_ebx(0x0100);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.eax() as u8, 0x0B);
+    }
+
+    #[test]
+    fn int10_mode_set_bit7_preserves_cga_framebuffer() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x0004);
+        m.handle_int10();
+        m.video_mut().cga_write(0, 0b01_10_11_00);
+        assert!(m.video_mut().write_port(0x3D9, 0x31));
+
+        m.cpu.registers.set_eax(0x0084);
+        m.handle_int10();
+
+        assert_eq!(m.video().active_mode(), VideoMode::Cga);
+        assert_eq!(m.video().cga_read(0), 0b01_10_11_00);
+        assert_eq!(m.video().cga_color_select(), 0x00);
+        assert_eq!(m.memory.read_u8(0x449).unwrap(), 0x84);
+        assert_eq!(m.memory.read_u16(0x44c).unwrap(), 0x4000);
+
+        m.cpu.registers.set_eax(0x0F00);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.eax() as u8, 0x84);
+
+        m.cpu.registers.set_eax(0x0004);
+        m.handle_int10();
+        assert_eq!(m.video().cga_read(0), 0);
+    }
+
+    #[test]
+    fn int10_09_draws_and_xors_font_glyphs_in_cga_graphics() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x0004);
+        m.handle_int10();
+
+        m.cpu.registers.set_eax(0x09DB);
+        m.cpu.registers.set_ebx(0x0003);
+        m.cpu.registers.set_ecx(1);
+        m.handle_int10();
+        assert_eq!(m.video().cga_read_pixel(0, 0), 3);
+        assert_eq!(m.video().cga_read_pixel(7, 7), 3);
+
+        m.cpu.registers.set_eax(0x09DB);
+        m.cpu.registers.set_ebx(0x0081);
+        m.cpu.registers.set_ecx(1);
+        m.handle_int10();
+        assert_eq!(m.video().cga_read_pixel(0, 0), 2);
+        assert_eq!(m.memory.read_u16(0x450).unwrap(), 0);
+    }
+
+    #[test]
+    fn int10_09_space_erases_cga_graphics_cell() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x0004);
+        m.handle_int10();
+
+        for y in 0..8u16 {
+            for x in 0..8u16 {
+                assert!(m.video_mut().cga_write_pixel(x, y, 3, false));
+            }
+        }
+
+        m.cpu.registers.set_eax(0x0920);
+        m.cpu.registers.set_ebx(0x0002);
+        m.cpu.registers.set_ecx(1);
+        m.handle_int10();
+
+        assert_eq!(m.video().cga_read_pixel(0, 0), 0);
+        assert_eq!(m.video().cga_read_pixel(7, 7), 0);
+
+        m.cpu.registers.set_eax(0x0800);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.eax() as u16, 0x0020);
+    }
+
+    #[test]
+    fn int10_08_recognizes_white_cga_graphics_font_patterns() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x0004);
+        m.handle_int10();
+
+        m.cpu.registers.set_eax(0x09DB);
+        m.cpu.registers.set_ebx(0x0003);
+        m.cpu.registers.set_ecx(1);
+        m.handle_int10();
+        m.cpu.registers.set_eax(0x0800);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.eax() as u16, 0x03DB);
+
+        m.video_mut().set_cga_mode(0x04);
+        m.cpu.registers.set_eax(0x09DB);
+        m.cpu.registers.set_ebx(0x0002);
+        m.cpu.registers.set_ecx(1);
+        m.handle_int10();
+        m.cpu.registers.set_eax(0x0800);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.eax() as u16, 0x02DB);
+
+        m.video_mut().set_cga_mode(0x06);
+        m.cpu.registers.set_eax(0x09DB);
+        m.cpu.registers.set_ebx(0x0001);
+        m.cpu.registers.set_ecx(1);
+        m.handle_int10();
+        m.cpu.registers.set_eax(0x0800);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.eax() as u16, 0x01DB);
+    }
+
+    #[test]
+    fn int10_cga_graphics_uses_int1f_font_for_high_chars() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x0004);
+        m.handle_int10();
+
+        m.write_guest_block(0x40000, &[0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01]);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x4000));
+        m.cpu.registers.set_ebp(0);
+        m.cpu.registers.set_eax(0x1120);
+        m.handle_int10();
+        assert_eq!(m.read_physical_u16(0x1F * 4), 0);
+        assert_eq!(m.read_physical_u16(0x1F * 4 + 2), 0x4000);
+
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x1234));
+        m.cpu.registers.set_ebp(0xFFFF);
+        m.cpu.registers.set_ecx(0);
+        m.cpu.registers.set_edx(0);
+        m.cpu.registers.set_eax(0x1130);
+        m.cpu.registers.set_ebx(0x0000);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.segment(SegmentIndex::Es).selector, 0x4000);
+        assert_eq!(m.cpu.registers.ebp() as u16, 0);
+        assert_eq!(m.cpu.registers.ecx() as u16, 8);
+        assert_eq!(m.cpu.registers.edx() as u8, 24);
+
+        m.cpu.registers.set_eax(0x0980);
+        m.cpu.registers.set_ebx(0x0002);
+        m.cpu.registers.set_ecx(1);
+        m.handle_int10();
+
+        assert_eq!(m.video().cga_read_pixel(0, 0), 2);
+        assert_eq!(m.video().cga_read_pixel(1, 0), 0);
+        assert_eq!(m.video().cga_read_pixel(1, 1), 2);
+
+        m.cpu.registers.set_eax(0x0800);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.eax() as u16, 0x0280);
+    }
+
+    #[test]
+    fn int10_1130_returns_readable_font_info_pointers() {
+        let mut m = int15_machine(16);
+
+        m.cpu.registers.set_eax(0x1130);
+        m.cpu.registers.set_ebx(0x0100);
+        m.handle_int10();
+        assert_eq!(
+            m.cpu.registers.segment(SegmentIndex::Es).selector,
+            VGA_BIOS_SEGMENT
+        );
+        assert_eq!(m.cpu.registers.ebp() as u16, VGA_BIOS_FONT_TABLE_OFF);
+
+        m.cpu.registers.set_eax(0x0010);
+        m.handle_int10();
+        m.cpu.registers.set_eax(0x1130);
+        m.cpu.registers.set_ebx(0x0600);
+        m.cpu.registers.set_ecx(0xBEEF);
+        m.cpu.registers.set_edx(0xAB00);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.ecx() as u16, 14);
+        assert_eq!(m.cpu.registers.edx() as u8, 24);
+        let ptr = (u32::from(BIOS_ROM_SEGMENT) << 4) + u32::from(BIOS_FONT_8X16_ROM_OFFSET);
+        assert_eq!(
+            m.read_physical_u8(ptr + u32::from(b'A') * 16 + 7),
+            font::VGAFONT_8X16[usize::from(b'A') * 16 + 7]
+        );
+
+        m.cpu.registers.set_eax(0x1130);
+        m.cpu.registers.set_ebx(0x0200);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.ebp() as u16, BIOS_FONT_8X14_ROM_OFFSET);
+        let ptr = (u32::from(BIOS_ROM_SEGMENT) << 4) + u32::from(BIOS_FONT_8X14_ROM_OFFSET);
+        assert_eq!(
+            m.read_physical_u8(ptr + u32::from(b'A') * 14 + 6),
+            font::VGAFONT_8X14[usize::from(b'A') * 14 + 6]
+        );
+
+        m.cpu.registers.set_eax(0x1130);
+        m.cpu.registers.set_ebx(0x0400);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.ebp() as u16, BIOS_FONT_8X8_HIGH_ROM_OFFSET);
+        let ptr = (u32::from(BIOS_ROM_SEGMENT) << 4) + u32::from(BIOS_FONT_8X8_HIGH_ROM_OFFSET);
+        assert_eq!(m.read_physical_u8(ptr), font::VGAFONT_8X8[128 * 8]);
+    }
+
+    #[test]
+    fn int10_04_reports_cga_light_pen_latch() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x0004);
+        m.handle_int10();
+
+        let line_dots = m.video().frame_dots() / u64::from(m.video().raster_height());
+        m.video_mut().advance(line_dots * 16 + 80);
+        assert_eq!(m.video_mut().read_port(0x3DC), Some(0xFF));
+
+        m.cpu.registers.set_eax(0x0400);
+        m.handle_int10();
+        assert_eq!((m.cpu.registers.eax() >> 8) as u8, 1);
+        assert_eq!(m.cpu.registers.ebx() as u16, 80);
+        assert_eq!(m.cpu.registers.ecx() as u16, 0x1000);
+        assert_eq!(m.cpu.registers.edx() as u16, 0x020A);
+
+        assert_eq!(m.video_mut().read_port(0x3DB), Some(0xFF));
+        m.cpu.registers.set_eax(0x0400);
+        m.handle_int10();
+        assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0);
+    }
+
+    #[test]
+    fn int10_teletype_draws_and_scrolls_cga_graphics_text() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x0004);
+        m.handle_int10();
+
+        m.cpu.registers.set_eax(0x0EDB);
+        m.cpu.registers.set_ebx(0x0002);
+        m.handle_int10();
+        assert_eq!(m.video().cga_read_pixel(0, 0), 2);
+        assert_eq!(m.memory.read_u16(0x450).unwrap(), 1);
+
+        m.video_mut().cga_write_pixel(0, 8, 3, false);
+        m.cpu.registers.set_eax(0x0200);
+        m.cpu.registers.set_edx(24 << 8);
+        m.handle_int10();
+        m.cpu.registers.set_eax(0x0E0A);
+        m.handle_int10();
+        assert_eq!(m.video().cga_read_pixel(0, 0), 3);
+        assert_eq!(m.video().cga_read_pixel(0, 192), 0);
+        assert_eq!(m.memory.read_u16(0x450).unwrap(), 24 << 8);
+    }
+
+    #[test]
+    fn int10_scroll_window_moves_cga_graphics_pixels_by_character_rows() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x0004);
+        m.handle_int10();
+
+        assert!(m.video_mut().cga_write_pixel(8, 16, 2, false)); // window row 2, col 1
+        assert!(m.video_mut().cga_write_pixel(0, 16, 1, false)); // outside window
+        m.cpu.registers.set_eax(0x0601);
+        m.cpu.registers.set_ebx(0x0300);
+        m.cpu.registers.set_ecx((1 << 8) | 1);
+        m.cpu.registers.set_edx((3 << 8) | 2);
+        m.handle_int10();
+
+        assert_eq!(m.video().cga_read_pixel(8, 8), 2);
+        assert_eq!(m.video().cga_read_pixel(8, 24), 3);
+        assert_eq!(m.video().cga_read_pixel(0, 16), 1);
+
+        m.video_mut().set_cga_mode(0x04);
+        assert!(m.video_mut().cga_write_pixel(8, 16, 2, false));
+        m.cpu.registers.set_eax(0x0701);
+        m.cpu.registers.set_ebx(0x0100);
+        m.cpu.registers.set_ecx((1 << 8) | 1);
+        m.cpu.registers.set_edx((3 << 8) | 2);
+        m.handle_int10();
+
+        assert_eq!(m.video().cga_read_pixel(8, 24), 2);
+        assert_eq!(m.video().cga_read_pixel(8, 8), 1);
+    }
+
+    #[test]
+    fn int10_scroll_window_clear_fills_cga_graphics_window_only() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x0004);
+        m.handle_int10();
+
+        assert!(m.video_mut().cga_write_pixel(8, 8, 1, false));
+        assert!(m.video_mut().cga_write_pixel(0, 8, 3, false));
+        m.cpu.registers.set_eax(0x0600);
+        m.cpu.registers.set_ebx(0x0200);
+        m.cpu.registers.set_ecx((1 << 8) | 1);
+        m.cpu.registers.set_edx((2 << 8) | 2);
+        m.handle_int10();
+
+        assert_eq!(m.video().cga_read_pixel(8, 8), 2);
+        assert_eq!(m.video().cga_read_pixel(16, 16), 2);
+        assert_eq!(m.video().cga_read_pixel(0, 8), 3);
+    }
+
+    #[test]
+    fn int10_13_draws_attributed_string_in_cga_graphics() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x0004);
+        m.handle_int10();
+        m.write_guest_block(0x4000, &[0xDB, 0x01, 0xDB, 0x02]);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x0000));
+        m.cpu.registers.set_ebp(0x4000);
+        m.cpu.registers.set_eax(0x1303);
+        m.cpu.registers.set_ecx(2);
+        m.cpu.registers.set_edx(0);
+        m.handle_int10();
+
+        assert_eq!(m.video().cga_read_pixel(0, 0), 1);
+        assert_eq!(m.video().cga_read_pixel(8, 0), 2);
+        assert_eq!(m.memory.read_u16(0x450).unwrap(), 2);
+    }
+
+    #[test]
+    fn int10_ega_graphics_text_services_draw_visible_planar_glyphs() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x0012);
+        m.handle_int10();
+        assert_eq!(m.read_physical_u8(0x484), 29);
+        assert_eq!(m.read_physical_u8(0x485), 16);
+
+        m.cpu.registers.set_eax(0x09DB);
+        m.cpu.registers.set_ebx(0x000C);
+        m.cpu.registers.set_ecx(1);
+        m.handle_int10();
+        assert_eq!(m.video().planar_read_pixel(0, 0), 0x0C);
+
+        m.cpu.registers.set_eax(0x0800);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.eax() as u16, 0x0CDB);
+
+        m.write_guest_block(0x6000, &[0xDB, 0x05]);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x0000));
+        m.cpu.registers.set_ebp(0x6000);
+        m.cpu.registers.set_eax(0x1303);
+        m.cpu.registers.set_ecx(1);
+        m.cpu.registers.set_edx((1 << 8) | 1);
+        m.handle_int10();
+        assert_eq!(m.video().planar_read_pixel(8, 16), 0x05);
+        assert_eq!(m.memory.read_u16(0x450).unwrap(), (1 << 8) | 2);
+
+        assert!(m.video_mut().planar_write_pixel(0, 16, 3, false));
+        m.cpu.registers.set_eax(0x0200);
+        m.cpu.registers.set_edx(29 << 8);
+        m.handle_int10();
+        m.cpu.registers.set_eax(0x0E0A);
+        m.handle_int10();
+        assert_eq!(m.video().planar_read_pixel(0, 0), 3);
+        assert_eq!(m.video().planar_read_pixel(0, 29 * 16), 0);
+        assert_eq!(m.memory.read_u16(0x450).unwrap(), 29 << 8);
+    }
+
+    #[test]
+    fn int10_ega_graphics_text_services_use_bh_page() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x000D);
+        m.handle_int10();
+
+        m.cpu.registers.set_eax(0x0200);
+        m.cpu.registers.set_ebx(0x0100);
+        m.cpu.registers.set_edx(0);
+        m.handle_int10();
+
+        m.cpu.registers.set_eax(0x09DB);
+        m.cpu.registers.set_ebx(0x0105);
+        m.cpu.registers.set_ecx(1);
+        m.handle_int10();
+
+        assert_eq!(m.video().planar_read_pixel(0, 0), 0);
+        assert_eq!(m.video().planar_read_pixel_at(0x2000, 0, 0), 5);
+
+        m.cpu.registers.set_eax(0x0800);
+        m.cpu.registers.set_ebx(0x0000);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.eax() as u16, 0x0020);
+
+        m.cpu.registers.set_eax(0x0800);
+        m.cpu.registers.set_ebx(0x0100);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.eax() as u16, 0x05DB);
+    }
+
+    #[test]
+    fn int10_ega_graphics_font_services_feed_planar_text_output() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x0012);
+        m.handle_int10();
+
+        let mut font = vec![0u8; 256 * 16];
+        font[usize::from(b'A') * 16] = 0x80;
+        m.write_guest_block(0x7000, &font);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x0000));
+        m.cpu.registers.set_ebp(0x7000);
+        m.cpu.registers.set_eax(0x1121);
+        m.cpu.registers.set_ebx(0x0000);
+        m.cpu.registers.set_ecx(16);
+        m.cpu.registers.set_edx(30);
+        m.handle_int10();
+
+        assert_eq!(m.read_physical_u8(0x484), 29);
+        assert_eq!(m.read_physical_u8(0x485), 16);
+        m.cpu.registers.set_eax(0x0941);
+        m.cpu.registers.set_ebx(0x0007);
+        m.cpu.registers.set_ecx(1);
+        m.handle_int10();
+        assert_eq!(m.video().planar_read_pixel(0, 0), 7);
+        assert_eq!(m.video().planar_read_pixel(1, 0), 0);
+
+        m.cpu.registers.set_eax(0x1123);
+        m.cpu.registers.set_ebx(0x0003);
+        m.cpu.registers.set_edx(0);
+        m.handle_int10();
+        assert_eq!(m.read_physical_u8(0x484), 42);
+        assert_eq!(m.read_physical_u8(0x485), 8);
+
+        m.cpu.registers.set_eax(0x0200);
+        m.cpu.registers.set_edx(42 << 8);
+        m.handle_int10();
+        m.cpu.registers.set_eax(0x0EDB);
+        m.cpu.registers.set_ebx(0x0002);
+        m.handle_int10();
+        assert_eq!(m.video().planar_read_pixel(0, 42 * 8), 2);
+
+        m.cpu.registers.set_eax(0x1122);
+        m.cpu.registers.set_ebx(0x0002);
+        m.handle_int10();
+        assert_eq!(m.read_physical_u8(0x484), 24);
+        assert_eq!(m.read_physical_u8(0x485), 14);
+
+        m.cpu.registers.set_eax(0x1124);
+        m.cpu.registers.set_ebx(0x0000);
+        m.cpu.registers.set_edx(30);
+        m.handle_int10();
+        assert_eq!(m.read_physical_u8(0x484), 29);
+        assert_eq!(m.read_physical_u8(0x485), 16);
+    }
+
+    #[test]
     fn int10_write_string_places_chars_and_attr_in_text_buffer() {
         let mut m = int15_machine(16);
         m.video_mut().set_text_mode();
@@ -16242,26 +18417,202 @@ mod tests {
     #[test]
     fn int10_save_restore_state_round_trips_the_bda_block() {
         let mut m = int15_machine(16);
-        // AL=00 reports the buffer size in 64-byte blocks (96 bytes -> 2 blocks).
+        // AL=00 reports the buffer size in 64-byte blocks (99 bytes -> 2 blocks).
         m.cpu.registers.set_eax(0x1C00);
+        m.cpu.registers.set_ecx(0x0002);
         m.handle_int10();
         assert_eq!(m.cpu.registers.ebx() as u16, 2, "two 64-byte blocks");
         assert_eq!(m.cpu.registers.eax() as u8, 0x1C);
-        // Mark the BDA mode byte, save into ES:BX, change it, then restore.
+        m.cpu.registers.set_eax(0x1C00);
+        m.cpu.registers.set_ecx(0x0007);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.ebx() as u16, 15, "full state block count");
+        // Mark the BDA edge bytes, save into ES:BX, change them, then restore.
         let _ = m.memory.write_u8(0x449, 0x12);
+        let _ = m.memory.write_u16(BDA_VIDEO_SAVE_POINTER, 0x1234);
+        let _ = m.memory.write_u16(BDA_VIDEO_SAVE_POINTER + 2, 0xabcd);
         m.cpu
             .registers
             .set_segment(SegmentIndex::Es, SegmentRegister::real(0x0000));
         m.cpu.registers.set_ebx(0x6000);
         m.cpu.registers.set_eax(0x1C01); // save
-        m.cpu.registers.set_ecx(0x0007);
+        m.cpu.registers.set_ecx(0x0002);
         m.handle_int10();
         // Corrupt the live BDA, then restore it from the saved buffer.
         let _ = m.memory.write_u8(0x449, 0x99);
+        let _ = m.memory.write_u16(BDA_VIDEO_SAVE_POINTER, 0);
+        let _ = m.memory.write_u16(BDA_VIDEO_SAVE_POINTER + 2, 0);
         m.cpu.registers.set_ebx(0x6000);
         m.cpu.registers.set_eax(0x1C02); // restore
         m.handle_int10();
         assert_eq!(m.memory.read_u8(0x449).unwrap(), 0x12, "BDA mode restored");
+        assert_eq!(
+            m.memory.read_u16(BDA_VIDEO_SAVE_POINTER).unwrap(),
+            0x1234,
+            "video-save pointer offset restored"
+        );
+        assert_eq!(
+            m.memory.read_u16(BDA_VIDEO_SAVE_POINTER + 2).unwrap(),
+            0xabcd,
+            "video-save pointer segment restored"
+        );
+    }
+
+    #[test]
+    fn int10_save_restore_state_round_trips_hardware_registers() {
+        let mut m = int15_machine(16);
+        m.video_mut().write_port(0x3C4, 0x02);
+        m.video_mut().write_port(0x3C5, 0x05);
+        m.video_mut().write_port(0x3D4, 0x0A);
+        m.video_mut().write_port(0x3D5, 0x12);
+        m.video_mut().write_port(0x3CE, 0x08);
+        m.video_mut().write_port(0x3CF, 0xA5);
+        m.video_mut().set_attr_register(0x12, 0x06);
+        m.video_mut().write_port(0x3DA, 0x77);
+
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x0000));
+        m.cpu.registers.set_ebx(0x6000);
+        m.cpu.registers.set_ecx(0x0001);
+        m.cpu.registers.set_eax(0x1C01);
+        m.handle_int10();
+
+        m.video_mut().write_port(0x3C4, 0x02);
+        m.video_mut().write_port(0x3C5, 0x0F);
+        m.video_mut().write_port(0x3D4, 0x0A);
+        m.video_mut().write_port(0x3D5, 0x01);
+        m.video_mut().write_port(0x3CE, 0x08);
+        m.video_mut().write_port(0x3CF, 0x5A);
+        m.video_mut().set_attr_register(0x12, 0x00);
+        m.video_mut().write_port(0x3DA, 0x11);
+
+        m.cpu.registers.set_ebx(0x6000);
+        m.cpu.registers.set_ecx(0x0001);
+        m.cpu.registers.set_eax(0x1C02);
+        m.handle_int10();
+
+        m.video_mut().write_port(0x3C4, 0x02);
+        assert_eq!(m.video_mut().read_port(0x3C5), Some(0x05));
+        assert_eq!(color_crtc_reg(&mut m, 0x0A), 0x12);
+        m.video_mut().write_port(0x3CE, 0x08);
+        assert_eq!(m.video_mut().read_port(0x3CF), Some(0xA5));
+        assert_eq!(m.video().attr_register(0x12), 0x06);
+        assert_eq!(m.video_mut().read_port(0x3CA), Some(0x77));
+    }
+
+    #[test]
+    fn int10_save_restore_state_round_trips_cga_output_only_registers() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x0004);
+        m.handle_int10();
+
+        m.video_mut().write_port(0x3D8, 0x0A);
+        m.video_mut().write_port(0x3D9, 0x35);
+        for (index, value) in [(0x01, 0x20), (0x09, 0x01), (0x0A, 0x06), (0x0B, 0x07)] {
+            m.video_mut().write_port(0x3D4, index);
+            m.video_mut().write_port(0x3D5, value);
+        }
+
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x0000));
+        m.cpu.registers.set_ebx(0x6000);
+        m.cpu.registers.set_ecx(0x0001);
+        m.cpu.registers.set_eax(0x1C01);
+        m.handle_int10();
+
+        m.video_mut().write_port(0x3D8, 0x1A);
+        m.video_mut().write_port(0x3D9, 0x00);
+        for (index, value) in [(0x01, 0x28), (0x09, 0x07), (0x0A, 0x01), (0x0B, 0x02)] {
+            m.video_mut().write_port(0x3D4, index);
+            m.video_mut().write_port(0x3D5, value);
+        }
+
+        m.cpu.registers.set_ebx(0x6000);
+        m.cpu.registers.set_ecx(0x0001);
+        m.cpu.registers.set_eax(0x1C02);
+        m.handle_int10();
+
+        assert_eq!(m.video().active_mode(), VideoMode::Cga);
+        assert_eq!(m.video().cga_mode_control(), 0x0A);
+        assert_eq!(m.video().cga_color_select(), 0x35);
+        assert_eq!(m.video().crtc_register_latch(0x01), 0x20);
+        assert_eq!(m.video().crtc_register_latch(0x09), 0x01);
+        assert_eq!(m.video().crtc_register_latch(0x0A), 0x06);
+        assert_eq!(m.video().crtc_register_latch(0x0B), 0x07);
+        assert_eq!(m.video().crtc_index_latch(), 0x0B);
+        assert_eq!(m.video().raster_width(), 256);
+        m.video_mut().write_port(0x3D4, 0x01);
+        assert_eq!(m.video_mut().read_port(0x3D5), None);
+    }
+
+    #[test]
+    fn int10_save_restore_state_reenters_cga_text_from_planar_mode() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x0002);
+        m.handle_int10();
+        m.video_mut().write_port(0x3D9, 0x15);
+
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x0000));
+        m.cpu.registers.set_ebx(0x6400);
+        m.cpu.registers.set_ecx(0x0001);
+        m.cpu.registers.set_eax(0x1C01);
+        m.handle_int10();
+
+        m.cpu.registers.set_eax(0x000D);
+        m.handle_int10();
+        assert_eq!(m.video().active_mode(), VideoMode::Planar);
+
+        m.cpu.registers.set_ebx(0x6400);
+        m.cpu.registers.set_ecx(0x0001);
+        m.cpu.registers.set_eax(0x1C02);
+        m.handle_int10();
+
+        assert_eq!(m.video().active_mode(), VideoMode::Text);
+        assert!(m.video().is_cga_personality());
+        assert_eq!(m.video().cga_mode_control(), 0x2D);
+        assert_eq!(m.video().cga_color_select(), 0x15);
+        assert_eq!(m.video().raster_width(), 640);
+        m.video_mut().write_port(0x3D4, 0x01);
+        assert_eq!(m.video_mut().read_port(0x3D5), None);
+    }
+
+    #[test]
+    fn int10_save_restore_state_round_trips_dac_without_grayscale_summing() {
+        let mut m = int15_machine(16);
+        m.video_mut().set_grayscale_summing_enabled(false);
+        m.video_mut().set_dac_entry(5, 1, 2, 3);
+        m.video_mut().write_port(0x3C6, 0x0F);
+        m.video_mut().set_attr_register(0x14, 0x0C);
+        m.video_mut().write_port(0x3C8, 0x22);
+        m.video_mut().set_grayscale_summing_enabled(true);
+
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x0000));
+        m.cpu.registers.set_ebx(0x7000);
+        m.cpu.registers.set_ecx(0x0004);
+        m.cpu.registers.set_eax(0x1C01);
+        m.handle_int10();
+
+        m.video_mut().set_dac_entry(5, 63, 0, 0);
+        m.video_mut().write_port(0x3C6, 0xFF);
+        m.video_mut().set_attr_register(0x14, 0x00);
+        m.video_mut().write_port(0x3C8, 0x00);
+
+        m.cpu.registers.set_ebx(0x7000);
+        m.cpu.registers.set_ecx(0x0004);
+        m.cpu.registers.set_eax(0x1C02);
+        m.handle_int10();
+
+        assert_eq!(m.video().dac_entry(5), [1, 2, 3]);
+        assert_eq!(m.video_mut().read_port(0x3C6), Some(0x0F));
+        assert_eq!(m.video().attr_register(0x14), 0x0C);
+        assert_eq!(m.video_mut().read_port(0x3C8), Some(0x22));
+        assert!(m.video().grayscale_summing_enabled());
     }
 
     #[test]
@@ -21392,6 +23743,21 @@ mod tests {
     }
 
     #[test]
+    fn display_refresh_uses_misc_output_clock_select() {
+        let mut machine = test_machine();
+        machine.set_vga_mode_0dh();
+        let clock25 = machine.display_refresh_hz();
+        assert!(machine.video_mut().write_port(0x3C2, 0x04));
+        let clock28 = machine.display_refresh_hz();
+
+        assert!(clock28 > clock25);
+        assert!(
+            (clock28 / clock25 - 28_322_000.0 / 25_175_000.0).abs() < 0.01,
+            "expected refresh ratio to follow Misc Output clock select"
+        );
+    }
+
+    #[test]
     fn planar_mode_presents_a_vga_raster() {
         let mut machine = test_machine();
         machine.set_vga_mode_0dh();
@@ -21417,9 +23783,93 @@ mod tests {
         let raster = machine.vga_raster().expect("text presents a VgaRaster");
         assert_eq!(raster.width, 720);
         // The top-left glyph pixel scans out as DAC index 15 (the foreground).
-        assert_eq!(raster.pixels[0], 15);
+        assert_eq!(raster.pixels[0], 0x17);
         // Resolved through the live DAC, entry 15 is red.
         assert_eq!(machine.palette_argb()[15], 0x00FF_0000);
+    }
+
+    #[test]
+    fn video_subsystem_enable_gates_legacy_apertures_through_the_machine() {
+        let mut machine = test_machine();
+
+        machine.write_physical_u8(VGA_TEXT_BASE, b'T');
+        assert_eq!(machine.read_physical_u8(VGA_TEXT_BASE), b'T');
+        assert!(machine.video_mut().write_port(0x3C3, 0x00));
+        machine.write_physical_u8(VGA_TEXT_BASE, b'R');
+        assert_eq!(machine.read_physical_u8(VGA_TEXT_BASE), b'R');
+        assert!(machine.video_mut().write_port(0x3C3, 0x01));
+        assert_eq!(machine.read_physical_u8(VGA_TEXT_BASE), b'T');
+
+        machine.video_mut().set_mode13h();
+        machine.write_physical_u8(VGA_MODE13H_BASE, 0x12);
+        assert_eq!(machine.read_physical_u8(VGA_MODE13H_BASE), 0x12);
+        assert!(machine.video_mut().write_port(0x3C3, 0x00));
+        machine.write_physical_u8(VGA_MODE13H_BASE, 0x34);
+        assert_eq!(machine.read_physical_u8(VGA_MODE13H_BASE), 0x34);
+        assert!(machine.video_mut().write_port(0x3C3, 0x01));
+        assert_eq!(machine.read_physical_u8(VGA_MODE13H_BASE), 0x12);
+    }
+
+    #[test]
+    fn misc_output_ram_enable_gates_legacy_apertures_through_the_machine() {
+        let mut machine = test_machine();
+
+        machine.write_physical_u8(VGA_TEXT_BASE, b'T');
+        assert_eq!(machine.read_physical_u8(VGA_TEXT_BASE), b'T');
+        let misc = machine.video_mut().read_port(0x3CC).unwrap();
+        assert!(machine.video_mut().write_port(0x3C2, misc & !0x02));
+        assert!(machine.video().video_subsystem_enabled());
+        assert!(!machine.video().video_memory_enabled());
+        machine.write_physical_u8(VGA_TEXT_BASE, b'R');
+        assert_eq!(machine.read_physical_u8(VGA_TEXT_BASE), b'R');
+        {
+            let mut bus = machine.make_bus();
+            assert_eq!(bus.read_io(0x3C3, BusWidth::Byte).unwrap(), 1);
+            assert_eq!(bus.read_io(0x3CC, BusWidth::Byte).unwrap() & 0x02, 0);
+        }
+        let misc = machine.video_mut().read_port(0x3CC).unwrap();
+        assert!(machine.video_mut().write_port(0x3C2, misc | 0x02));
+        assert!(machine.video().video_memory_enabled());
+        assert_eq!(machine.read_physical_u8(VGA_TEXT_BASE), b'T');
+
+        machine.video_mut().set_mode13h();
+        machine.write_physical_u8(VGA_MODE13H_BASE, 0x12);
+        assert_eq!(machine.read_physical_u8(VGA_MODE13H_BASE), 0x12);
+        let misc = machine.video_mut().read_port(0x3CC).unwrap();
+        assert!(machine.video_mut().write_port(0x3C2, misc & !0x02));
+        machine.write_physical_u8(VGA_MODE13H_BASE, 0x34);
+        assert_eq!(machine.read_physical_u8(VGA_MODE13H_BASE), 0x34);
+        let misc = machine.video_mut().read_port(0x3CC).unwrap();
+        assert!(machine.video_mut().write_port(0x3C2, misc | 0x02));
+        assert_eq!(machine.read_physical_u8(VGA_MODE13H_BASE), 0x12);
+    }
+
+    #[test]
+    fn mode7_routes_b000_text_window_through_the_machine() {
+        // mov ax,0007h; int 10h; hlt
+        let rom = rom_with_code(&[0xb8, 0x07, 0x00, 0xcd, 0x10, 0xf4]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+
+        assert_eq!(
+            machine.run_until_halt_or_cycles(1_000_000).unwrap(),
+            StopReason::Halted
+        );
+        assert_eq!(machine.video().active_mode(), VideoMode::Text);
+        assert_eq!(machine.video().raster_width(), 720);
+        assert_eq!(machine.video().raster_height(), 449);
+        assert_eq!(machine.read_physical_u8(0x449), 0x07);
+        assert_eq!(machine.read_physical_u16(0x463), 0x03B4);
+        assert_eq!(machine.read_physical_u8(0x485), 14);
+
+        machine.write_physical_u8(VGA_MONO_TEXT_BASE, 0xDB);
+        machine.write_physical_u8(VGA_MONO_TEXT_BASE + 1, 0x0F);
+        assert_eq!(machine.read_physical_u8(VGA_MONO_TEXT_BASE), 0xDB);
+        assert_eq!(machine.read_physical_u8(VGA_MONO_TEXT_BASE + 1), 0x0F);
+
+        machine.advance_devices(600_000);
+        let raster = machine.vga_raster().expect("mode 7 presents a VgaRaster");
+        assert_eq!(raster.pixels[0], 0x0F);
     }
 
     #[test]
@@ -21454,6 +23904,92 @@ mod tests {
     }
 
     #[test]
+    fn cga_mode_control_switches_b800_routing_through_the_machine() {
+        let mut machine = test_machine();
+        assert!(machine.video_mut().set_cga_text_mode(0x01));
+        machine.write_physical_u8(VGA_TEXT_BASE, b'T');
+        machine.write_physical_u8(VGA_TEXT_BASE + 1, 0x0F);
+
+        {
+            let mut bus = machine.make_bus();
+            bus.write_io(0x3D8, BusWidth::Byte, 0x0A).unwrap();
+        }
+        assert_eq!(machine.video().active_mode(), VideoMode::Cga);
+        assert_eq!(machine.video().render_cga_row(0)[0], 2);
+        machine.write_physical_u8(VGA_TEXT_BASE, 0b01_01_01_01);
+        assert_eq!(machine.read_physical_u8(VGA_TEXT_BASE), 0b01_01_01_01);
+
+        {
+            let mut bus = machine.make_bus();
+            bus.write_io(0x3D8, BusWidth::Byte, 0x28).unwrap();
+        }
+        assert_eq!(machine.video().active_mode(), VideoMode::Text);
+        assert_eq!(machine.read_physical_u8(VGA_TEXT_BASE), 0b01_01_01_01);
+    }
+
+    #[test]
+    fn cga_mode_and_color_select_ports_are_output_only_through_the_bus() {
+        let mut machine = test_machine();
+        {
+            let mut bus = machine.make_bus();
+            bus.write_io(0x3D8, BusWidth::Byte, 0x0A).unwrap();
+            bus.write_io(0x3D9, BusWidth::Byte, 0x35).unwrap();
+            assert_eq!(bus.read_io(0x3D8, BusWidth::Byte).unwrap(), 0xFF);
+            assert_eq!(bus.read_io(0x3D9, BusWidth::Byte).unwrap(), 0xFF);
+        }
+
+        assert_eq!(machine.video().active_mode(), VideoMode::Cga);
+        assert_eq!(machine.video().cga_color_select(), 0x35);
+    }
+
+    #[test]
+    fn cga_crtc_alias_ports_route_through_video_bus() {
+        let mut machine = test_machine();
+        {
+            let mut bus = machine.make_bus();
+            bus.write_io(0x3D8, BusWidth::Byte, 0x0A).unwrap();
+            bus.write_io(0x3D0, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x3D1, BusWidth::Byte, 0x20).unwrap();
+            assert_eq!(bus.read_io(0x3D2, BusWidth::Byte).unwrap(), 0xFF);
+            assert_eq!(bus.read_io(0x3D3, BusWidth::Byte).unwrap(), 0xFF);
+
+            bus.write_io(0x3D6, BusWidth::Byte, 0x0A).unwrap();
+            bus.write_io(0x3D7, BusWidth::Byte, 0x06).unwrap();
+            assert_eq!(bus.read_io(0x3D4, BusWidth::Byte).unwrap(), 0xFF);
+            assert_eq!(bus.read_io(0x3D5, BusWidth::Byte).unwrap(), 0xFF);
+
+            bus.write_io(0x3D4, BusWidth::Byte, 0x0E).unwrap();
+            bus.write_io(0x3D5, BusWidth::Byte, 0x12).unwrap();
+            assert_eq!(bus.read_io(0x3D5, BusWidth::Byte).unwrap(), 0x12);
+        }
+
+        assert_eq!(machine.video().active_mode(), VideoMode::Cga);
+        assert_eq!(machine.video().raster_width(), 256);
+    }
+
+    #[test]
+    fn cga_text_b800_window_mirrors_16kb_through_the_machine() {
+        let mut machine = test_machine();
+        assert!(machine.video_mut().set_cga_text_mode(0x01));
+        machine.write_physical_u8(VGA_TEXT_BASE, b'A');
+        machine.write_physical_u8(VGA_TEXT_BASE + CGA_FB_SIZE as u32, b'B');
+        assert_eq!(machine.read_physical_u8(VGA_TEXT_BASE), b'B');
+        assert_eq!(
+            machine.read_physical_u8(VGA_TEXT_BASE + CGA_FB_SIZE as u32),
+            b'B'
+        );
+
+        machine.video_mut().set_text_mode();
+        machine.write_physical_u8(VGA_TEXT_BASE, b'A');
+        machine.write_physical_u8(VGA_TEXT_BASE + CGA_FB_SIZE as u32, b'V');
+        assert_eq!(machine.read_physical_u8(VGA_TEXT_BASE), b'A');
+        assert_eq!(
+            machine.read_physical_u8(VGA_TEXT_BASE + CGA_FB_SIZE as u32),
+            b'V'
+        );
+    }
+
+    #[test]
     fn int10_11h_loads_user_font() {
         // A 2-glyph user font (two solid 8x16 blocks) at ES:BP = 4000h:0,
         // overwriting 'A' and 'B'. AL=00 loads it; BH=16 bytes/char, BL=0
@@ -21480,9 +24016,9 @@ mod tests {
             StopReason::Halted
         );
         // The custom 'A' is solid, so its top row scans out as the foreground.
-        // The stock 'A' would be blank on the top row (background), so 15
+        // The stock 'A' would be blank on the top row (background), so this
         // confirms the user font loaded and renders.
-        assert_eq!(machine.video().render_text_row(0)[0], 15);
+        assert_eq!(machine.video().render_text_row(0)[0], BIOS_TEXT_WHITE);
     }
 
     #[test]
@@ -21608,7 +24144,7 @@ mod tests {
         );
         // The ROM reload restored the solid full block; without it the custom
         // blank load would leave the top row as the background (0).
-        assert_eq!(machine.video().render_text_row(0)[0], 15);
+        assert_eq!(machine.video().render_text_row(0)[0], BIOS_TEXT_WHITE);
     }
 
     #[test]
@@ -21639,7 +24175,7 @@ mod tests {
         let reason = machine.run_until_halt_or_cycles(2_000_000).unwrap();
         assert_eq!(reason, StopReason::Halted);
         // The first glyph (solid) loaded and renders as the foreground.
-        assert_eq!(machine.video().render_text_row(0)[0], 15);
+        assert_eq!(machine.video().render_text_row(0)[0], BIOS_TEXT_WHITE);
     }
 
     #[test]
@@ -21660,6 +24196,87 @@ mod tests {
         assert_eq!(machine.read_physical_u8(VGA_TEXT_BASE + 2), b'i');
         let dx = machine.cpu().registers.edx() as u16;
         assert_eq!(dx, 0x0002, "DH=row 0, DL=col 2");
+    }
+
+    #[test]
+    fn int10_01_updates_cga_hardware_cursor_shape() {
+        let mut machine = int15_machine(16);
+        machine.cpu.registers.set_eax(0x0002);
+        machine.handle_int10();
+        machine.write_physical_u8(VGA_TEXT_BASE + 1, 0x0F);
+        assert_eq!(machine.video().render_text_row(0)[0], 0);
+
+        machine.cpu.registers.set_eax(0x0100);
+        machine.cpu.registers.set_ecx(0x0007);
+        machine.handle_int10();
+        assert_eq!(machine.video().render_text_row(0)[0], 15);
+
+        machine.cpu.registers.set_eax(0x0300);
+        machine.cpu.registers.set_ebx(0);
+        machine.handle_int10();
+        assert_eq!(machine.cpu.registers.ecx() as u16, 0x0007);
+    }
+
+    #[test]
+    fn int10_text_services_use_40_column_mode_stride() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x0001);
+        m.handle_int10();
+        assert_eq!(m.video().frame().columns, 40);
+        assert_eq!(m.video_mut().render_full_frame().width, 320);
+        assert_eq!(m.memory.read_u16(0x44c).unwrap(), 0x0800);
+
+        m.write_guest_block(0x4000, b"ABCD");
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x0000));
+        m.cpu.registers.set_ebp(0x4000);
+        m.cpu.registers.set_eax(0x1301);
+        m.cpu.registers.set_ebx(0x001E);
+        m.cpu.registers.set_ecx(4);
+        m.cpu.registers.set_edx(38);
+        m.handle_int10();
+        assert_eq!(m.read_physical_u8(VGA_TEXT_BASE + 38 * 2), b'A');
+        assert_eq!(m.read_physical_u8(VGA_TEXT_BASE + 39 * 2), b'B');
+        assert_eq!(m.read_physical_u8(VGA_TEXT_BASE + 40 * 2), b'C');
+        assert_eq!(m.read_physical_u8(VGA_TEXT_BASE + 41 * 2), b'D');
+        assert_eq!(m.memory.read_u16(0x450).unwrap(), 0x0102);
+
+        m.cpu.registers.set_eax(0x0200);
+        m.cpu.registers.set_edx(39);
+        m.handle_int10();
+        m.cpu.registers.set_eax(0x0E5A);
+        m.handle_int10();
+        assert_eq!(m.read_physical_u8(VGA_TEXT_BASE + 39 * 2), b'Z');
+        assert_eq!(m.memory.read_u16(0x450).unwrap(), 0x0100);
+        assert_eq!(m.video().frame().cursor_offset, 40);
+
+        m.cpu.registers.set_eax(0x0F00);
+        m.handle_int10();
+        assert_eq!((m.cpu.registers.eax() as u16) >> 8, 40);
+    }
+
+    #[test]
+    fn int10_mode02_uses_cga_80_text_geometry_and_mode03_stays_vga() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x0002);
+        m.handle_int10();
+        assert_eq!(m.video().frame().columns, 80);
+        assert_eq!(m.video_mut().render_full_frame().width, 640);
+        assert_eq!(m.memory.read_u16(0x44c).unwrap(), 0x1000);
+        assert_eq!(m.read_physical_u8(0x485), 8);
+
+        m.cpu.registers.set_eax(0x0003);
+        m.handle_int10();
+        assert_eq!(m.video().frame().columns, 80);
+        assert_eq!(m.video_mut().render_full_frame().width, 720);
+        assert_eq!(m.memory.read_u16(0x44c).unwrap(), 0x1000);
+        assert_eq!(m.read_physical_u8(0x485), 16);
+
+        m.cpu.registers.set_eax(0x0004);
+        m.handle_int10();
+        assert_eq!(m.memory.read_u16(0x44c).unwrap(), 0x4000);
+        assert_eq!(m.read_physical_u8(0x485), 8);
     }
 
     #[test]
@@ -21803,7 +24420,7 @@ mod tests {
         // write, so after 16 entries the flip-flop is back in "index" mode.
         machine.video_mut().read_status1(); // reset attr flip-flop
         for i in 0..16u8 {
-            machine.video_mut().write_port(0x3C0, i); // index
+            machine.video_mut().write_port(0x3C0, 0x20 | i); // index, PAS on
             machine.video_mut().write_port(0x3C0, i); // value: palette[i] = i
         }
         // Advance to roughly counter line 50, change palette[1] -> 9, then finish
@@ -21811,7 +24428,7 @@ mod tests {
         // 39_700 clocks ≈ 39_980 dots ≈ counter line 49 (htotal 800).
         machine.advance_devices(39_700);
         // The flip-flop is in "index" mode here (even number of writes above).
-        machine.video_mut().write_port(0x3C0, 0x01); // attr index 1
+        machine.video_mut().write_port(0x3C0, 0x21); // attr index 1, PAS on
         machine.video_mut().write_port(0x3C0, 9); // palette[1] = 9
         machine.advance_devices(400_000); // complete the frame
         let raster = machine.vga_raster().expect("a frame presented");
@@ -21865,14 +24482,14 @@ mod tests {
         // flip-flop to "index"; 16 entries * 2 writes leaves it in "index" mode.
         machine.video_mut().read_status1();
         for i in 0..16u8 {
-            machine.video_mut().write_port(0x3C0, i); // index
+            machine.video_mut().write_port(0x3C0, 0x20 | i); // index, PAS on
             machine.video_mut().write_port(0x3C0, i); // value: palette[i] = i
         }
         // Lock pel-pan below the split (Attribute Mode Control 10h bit 5) and pan the
         // top by 4. The flip-flop is in "index" mode here.
-        machine.video_mut().write_port(0x3C0, 0x10); // attr index 0x10 (mode control)
+        machine.video_mut().write_port(0x3C0, 0x30); // attr index 0x10, PAS on
         machine.video_mut().write_port(0x3C0, 0x20); // bit 5: pel-pan up to line compare
-        machine.video_mut().write_port(0x3C0, 0x13); // attr index 0x13 (pixel pan)
+        machine.video_mut().write_port(0x3C0, 0x33); // attr index 0x13, PAS on
         machine.video_mut().write_port(0x3C0, 0x04); // pan 4
         // Program a split at scan-counter line 100. The mode default line compare is
         // 0x3FF, so the overflow (07h) bit 8 and max-scan (09h) bit 9 must be cleared.
@@ -21900,10 +24517,15 @@ mod tests {
             0,
             "top region is scrolled to cleared VRAM"
         );
-        // The first split scanline (101 = line_compare + 1) reads offset 0 (the marked
-        // byte), with pel-pan forced to 0 below the split: pixel 0 is the marked index 1.
         assert_eq!(
             raster.pixels[101 * w],
+            0,
+            "EGA keeps two extra scanlines in the top region"
+        );
+        // The first EGA split scanline (103 = line_compare + 3) reads offset 0
+        // (the marked byte), with pel-pan forced to 0 below the split.
+        assert_eq!(
+            raster.pixels[103 * w],
             1,
             "split region reads offset 0 with pel-pan forced to 0"
         );
@@ -21923,7 +24545,7 @@ mod tests {
         // Identity palette so index 1 -> DAC 1.
         machine.video_mut().read_status1(); // reset attr flip-flop to index
         for i in 0..16u8 {
-            machine.video_mut().write_port(0x3C0, i);
+            machine.video_mut().write_port(0x3C0, 0x20 | i);
             machine.video_mut().write_port(0x3C0, i);
         }
         // Set start_address = 0xFFF8 through the CRTC ports (buffered until vretrace).
@@ -22032,6 +24654,29 @@ mod tests {
     }
 
     #[test]
+    fn int10_ega_modes_publish_bda_geometry() {
+        let mut machine = int15_machine(16);
+
+        for (mode, height, page_size) in [
+            (0x0D, 8, 0x2000),
+            (0x0E, 8, 0x4000),
+            (0x0F, 14, 0x8000),
+            (0x10, 14, 0x8000),
+            (0x11, 16, 0x0000),
+            (0x12, 16, 0x0000),
+        ] {
+            machine.cpu.registers.set_eax(mode);
+            machine.handle_int10();
+            assert_eq!(machine.read_physical_u8(0x485), height, "mode {mode:02X}");
+            assert_eq!(
+                machine.read_physical_u16(0x44C),
+                page_size,
+                "mode {mode:02X}"
+            );
+        }
+    }
+
+    #[test]
     fn int10_sets_mode_12h_then_draws_and_presents_640x480() {
         // mov ax, 0012h; int 10h; hlt
         let rom = rom_with_code(&[0xb8, 0x12, 0x00, 0xcd, 0x10, 0xf4]);
@@ -22053,7 +24698,7 @@ mod tests {
         machine.write_physical_u8(0x000A_0000, 0xFF);
         machine.video_mut().read_status1(); // reset attr flip-flop to index
         for i in 0..16u8 {
-            machine.video_mut().write_port(0x3C0, i); // index
+            machine.video_mut().write_port(0x3C0, 0x20 | i); // index, PAS on
             machine.video_mut().write_port(0x3C0, i); // palette[i] = i
         }
 
@@ -22064,6 +24709,33 @@ mod tests {
         assert_eq!(raster.width, 640);
         assert_eq!(raster.height, 525);
         assert_eq!(raster.pixels[0], 1, "top-left pixel is attribute index 1");
+    }
+
+    #[test]
+    fn int10_sets_ega_mode_0fh_through_planar_dispatch() {
+        // mov ax,000Fh; int 10h; hlt
+        let rom = rom_with_code(&[0xb8, 0x0f, 0x00, 0xcd, 0x10, 0xf4]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(machine.active_display(), ActiveDisplay::VgaRaster);
+        assert_eq!(machine.video().active_mode(), VideoMode::Planar);
+        assert_eq!(machine.video().raster_width(), 640);
+        assert_eq!(machine.video().raster_height(), 449);
+        assert_eq!(machine.read_physical_u8(0x449), 0x0f);
+        assert_eq!(machine.read_physical_u16(0x463), 0x03B4);
+
+        {
+            let mut bus = machine.make_bus();
+            bus.write_io(0x3B4, BusWidth::Byte, 0x0C).unwrap();
+            bus.write_io(0x3B5, BusWidth::Byte, 0x12).unwrap();
+            bus.write_io(0x3B4, BusWidth::Byte, 0x0D).unwrap();
+            bus.write_io(0x3B5, BusWidth::Byte, 0x34).unwrap();
+            assert!(bus.read_io(0x3BA, BusWidth::Byte).is_ok());
+        }
+        assert_eq!(machine.video().pending_start_address(), Some(0x1234));
     }
 
     #[test]
@@ -22111,6 +24783,90 @@ mod tests {
     }
 
     #[test]
+    fn int10_0bh_sets_cga_background_and_palette() {
+        // mode 04h; AH=0Bh/BH=0 background blue + high intensity; AH=0Bh/BH=1 palette 1.
+        let rom = rom_with_code(&[
+            0xb8, 0x04, 0x00, 0xcd, 0x10, 0xb8, 0x00, 0x0b, 0xbb, 0x11, 0x00, 0xcd, 0x10, 0xb8,
+            0x00, 0x0b, 0xbb, 0x01, 0x01, 0xcd, 0x10, 0xf4,
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(machine.video().active_mode(), VideoMode::Cga);
+        assert_eq!(machine.memory.read_u16(0x44c).unwrap(), 0x4000);
+        machine.write_physical_u8(VGA_TEXT_BASE, 0b00_01_10_11);
+        let raster = machine.video_mut().render_full_frame();
+        assert_eq!(&raster.pixels[0..4], &[1, 11, 13, 15]);
+    }
+
+    #[test]
+    fn int10_1003_toggles_cga_text_blink_bit() {
+        let mut machine = int15_machine(16);
+        machine.cpu.registers.set_eax(0x0001);
+        machine.handle_int10();
+        assert_ne!(machine.video().cga_mode_control() & 0x20, 0);
+
+        machine.cpu.registers.set_eax(0x1003);
+        machine.cpu.registers.set_ebx(0x0000);
+        machine.handle_int10();
+        assert_eq!(machine.video().cga_mode_control() & 0x20, 0);
+
+        machine.cpu.registers.set_eax(0x1003);
+        machine.cpu.registers.set_ebx(0x0001);
+        machine.handle_int10();
+        assert_ne!(machine.video().cga_mode_control() & 0x20, 0);
+    }
+
+    #[test]
+    fn int10_cga_bda_latches_track_bios_control_writes() {
+        let mut machine = int15_machine(16);
+        machine.cpu.registers.set_eax(0x0006);
+        machine.handle_int10();
+        assert_eq!(machine.read_physical_u8(0x465), 0x1A);
+        assert_eq!(machine.read_physical_u8(0x466), 0x0F);
+
+        machine.cpu.registers.set_eax(0x0B00);
+        machine.cpu.registers.set_ebx(0x0011);
+        machine.handle_int10();
+        assert_eq!(machine.read_physical_u8(0x466), 0x11);
+
+        machine.cpu.registers.set_eax(0x0B00);
+        machine.cpu.registers.set_ebx(0x0101);
+        machine.handle_int10();
+        assert_eq!(machine.read_physical_u8(0x466), 0x31);
+
+        machine.cpu.registers.set_eax(0x0002);
+        machine.handle_int10();
+        assert_eq!(machine.read_physical_u8(0x465), 0x2D);
+
+        machine.cpu.registers.set_eax(0x1003);
+        machine.cpu.registers.set_ebx(0x0000);
+        machine.handle_int10();
+        assert_eq!(machine.read_physical_u8(0x465), 0x0D);
+    }
+
+    #[test]
+    fn int10_non_cga_mode_set_clears_cga_bda_latches() {
+        let mut machine = int15_machine(16);
+        machine.cpu.registers.set_eax(0x0006);
+        machine.handle_int10();
+        assert_eq!(machine.read_physical_u8(0x465), 0x1A);
+        assert_eq!(machine.read_physical_u8(0x466), 0x0F);
+
+        machine.cpu.registers.set_eax(0x000D);
+        machine.handle_int10();
+
+        assert_eq!(machine.read_physical_u8(0x465), 0);
+        assert_eq!(machine.read_physical_u8(0x466), 0);
+        machine.cpu.registers.set_eax(0x1B00);
+        machine.handle_int10();
+        assert_eq!(machine.read_physical_u8(0x20), 0);
+        assert_eq!(machine.read_physical_u8(0x21), 0);
+    }
+
+    #[test]
     fn int10_ah05_sets_the_text_page_via_start_address() {
         // mov ax,0501h; int 10h; hlt  (AH=05h, AL=1 -> display page 1)
         let rom = rom_with_code(&[0xb8, 0x01, 0x05, 0xcd, 0x10, 0xf4]);
@@ -22132,6 +24888,119 @@ mod tests {
             0,
             "start address applies at the next vretrace, not mid-frame"
         );
+    }
+
+    #[test]
+    fn int10_ah05_uses_40_column_page_stride() {
+        let mut machine = int15_machine(16);
+        machine.cpu.registers.set_eax(0x0001);
+        machine.handle_int10();
+        machine.cpu.registers.set_eax(0x0501);
+        machine.handle_int10();
+
+        assert_eq!(machine.video().pending_start_address(), Some(1024));
+        assert_eq!(machine.read_physical_u8(0x462), 1);
+        assert_eq!(machine.memory.read_u16(0x44e).unwrap(), 2048);
+
+        machine.cpu.registers.set_eax(0x0F00);
+        machine.cpu.registers.set_ebx(0);
+        machine.handle_int10();
+        assert_eq!((machine.cpu.registers.ebx() >> 8) as u8, 1);
+    }
+
+    #[test]
+    fn int10_text_services_use_the_selected_cga_text_page() {
+        let mut machine = int15_machine(16);
+        machine.cpu.registers.set_eax(0x0001);
+        machine.handle_int10();
+        machine.cpu.registers.set_eax(0x0501);
+        machine.handle_int10();
+
+        machine.cpu.registers.set_eax(0x0200); // cursor page 1, row 0 col 0
+        machine.cpu.registers.set_ebx(0x0100);
+        machine.cpu.registers.set_edx(0);
+        machine.handle_int10();
+        machine.cpu.registers.set_eax(0x0950); // write 'P'/attr 1E on page 1
+        machine.cpu.registers.set_ebx(0x011E);
+        machine.cpu.registers.set_ecx(1);
+        machine.handle_int10();
+
+        assert_eq!(machine.read_physical_u8(VGA_TEXT_BASE), b' ');
+        assert_eq!(machine.read_physical_u8(VGA_TEXT_BASE + 2048), b'P');
+        assert_eq!(machine.read_physical_u8(VGA_TEXT_BASE + 2049), 0x1E);
+
+        machine.cpu.registers.set_eax(0x0800);
+        machine.cpu.registers.set_ebx(0x0100);
+        machine.handle_int10();
+        assert_eq!(machine.cpu.registers.eax() as u16, 0x1E50);
+
+        machine.cpu.registers.set_eax(0x0300);
+        machine.cpu.registers.set_ebx(0x0100);
+        machine.handle_int10();
+        assert_eq!(machine.cpu.registers.edx() as u16, 0);
+    }
+
+    #[test]
+    fn int10_mode02_wraps_display_pages_at_the_cga_16kb_window() {
+        let mut machine = int15_machine(16);
+        machine.cpu.registers.set_eax(0x0002);
+        machine.handle_int10();
+
+        machine.cpu.registers.set_eax(0x0503);
+        machine.handle_int10();
+        assert_eq!(machine.video().pending_start_address(), Some(0x1800));
+        assert_eq!(machine.read_physical_u8(0x462), 3);
+        assert_eq!(machine.memory.read_u16(0x44e).unwrap(), 0x3000);
+
+        machine.cpu.registers.set_eax(0x0504);
+        machine.handle_int10();
+        assert_eq!(machine.video().pending_start_address(), Some(0));
+        assert_eq!(machine.read_physical_u8(0x462), 0);
+        assert_eq!(machine.memory.read_u16(0x44e).unwrap(), 0);
+    }
+
+    #[test]
+    fn int10_ah05_ignores_cga_graphics_single_page() {
+        let mut machine = int15_machine(16);
+        machine.cpu.registers.set_eax(0x0004);
+        machine.handle_int10();
+        machine.video_mut().cga_write(0, 0b01_01_01_01);
+
+        machine.cpu.registers.set_eax(0x0501);
+        machine.handle_int10();
+
+        assert_eq!(machine.video().pending_start_address(), None);
+        assert_eq!(machine.video().crtc_start_address(), 0);
+        assert_eq!(machine.read_physical_u8(0x462), 0);
+        assert_eq!(&machine.video().render_cga_row(0)[0..4], &[2, 2, 2, 2]);
+    }
+
+    #[test]
+    fn int10_ah05_selects_ega_graphics_display_page() {
+        let mut machine = int15_machine(16);
+        machine.cpu.registers.set_eax(0x000D);
+        machine.handle_int10();
+        machine.write_physical_u8(0x000A_0000 + 0x2000, 0x80);
+
+        machine.cpu.registers.set_eax(0x0501);
+        machine.handle_int10();
+
+        assert_eq!(machine.video().pending_start_address(), Some(0x2000));
+        assert_eq!(machine.read_physical_u8(0x462), 1);
+        assert_eq!(machine.memory.read_u16(0x44e).unwrap(), 0x2000);
+
+        machine.advance_devices(600_000);
+        let raster = machine.video_mut().render_full_frame();
+        assert_eq!(raster.pixels[0], 0x17);
+
+        machine.cpu.registers.set_eax(0x0012);
+        machine.handle_int10();
+        machine.cpu.registers.set_eax(0x0501);
+        machine.handle_int10();
+
+        assert_eq!(machine.video().pending_start_address(), Some(0));
+        assert_eq!(machine.read_physical_u8(0x462), 0);
+        assert_eq!(machine.memory.read_u16(0x44e).unwrap(), 0);
     }
 
     #[test]
@@ -22264,9 +25133,66 @@ mod tests {
     }
 
     #[test]
+    fn int10_1001_sets_cga_graphics_intensity() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x0004);
+        m.handle_int10();
+
+        m.cpu.registers.set_eax(0x1001);
+        m.cpu.registers.set_ebx(0x1100);
+        m.handle_int10();
+
+        m.write_physical_u8(VGA_TEXT_BASE, 0b00_01_10_11);
+        let raster = m.video_mut().render_full_frame();
+        assert_eq!(&raster.pixels[0..4], &[1, 10, 12, 14]);
+    }
+
+    #[test]
+    fn int10_1000_11_sets_cga_overscan_register() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x0004);
+        m.handle_int10();
+
+        m.cpu.registers.set_eax(0x1000);
+        m.cpu.registers.set_ebx(0x1111);
+        m.handle_int10();
+
+        m.cpu.registers.set_eax(0x1007);
+        m.cpu.registers.set_ebx(0x0011);
+        m.handle_int10();
+        assert_eq!((m.cpu.registers.ebx() >> 8) as u8, 0x11);
+
+        m.write_physical_u8(VGA_TEXT_BASE, 0b00_01_10_11);
+        let raster = m.video_mut().render_full_frame();
+        assert_eq!(&raster.pixels[0..4], &[1, 10, 12, 14]);
+    }
+
+    #[test]
+    fn int10_10h_reads_cga_color_select_low_bits() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x0004);
+        m.handle_int10();
+        assert!(m.video_mut().write_port(0x3D9, 0x3F));
+
+        m.cpu.registers.set_eax(0x1008);
+        m.cpu.registers.set_ebx(0);
+        m.handle_int10();
+        assert_eq!((m.cpu.registers.ebx() >> 8) as u8, 0x1F);
+
+        m.cpu.registers.set_eax(0x1009);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x1000));
+        m.cpu.registers.set_edx(0);
+        m.handle_int10();
+        assert_eq!(m.read_physical_u8(0x1_0010), 0x1F);
+    }
+
+    #[test]
     fn int10_10h_reads_all_palette_registers() {
-        // AL=09 writes the 16 palette registers + overscan to ES:DX. With the
-        // power-up palette (reg N = N) and overscan 0, expect 0,1,...,15,0.
+        // AL=09 writes the 16 palette registers + overscan to ES:DX. Mode 03h
+        // starts from the VGABios text Attribute Controller table, followed by
+        // overscan 0.
         let mut m = int15_machine(16);
         m.cpu.registers.set_eax(0x1009);
         m.cpu
@@ -22274,8 +25200,12 @@ mod tests {
             .set_segment(SegmentIndex::Es, SegmentRegister::real(0x1000));
         m.cpu.registers.set_edx(0x0000);
         m.handle_int10();
-        for i in 0..16u8 {
-            assert_eq!(m.read_physical_u8(0x1_0000 + u32::from(i)), i);
+        let expected = [
+            0x00u8, 0x01, 0x02, 0x03, 0x04, 0x05, 0x14, 0x07, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D,
+            0x3E, 0x3F,
+        ];
+        for (i, value) in expected.into_iter().enumerate() {
+            assert_eq!(m.read_physical_u8(0x1_0000 + i as u32), value);
         }
         assert_eq!(
             m.read_physical_u8(0x1_0010),
@@ -22310,6 +25240,64 @@ mod tests {
         m.cpu.registers.set_ebx(0xFFFF);
         m.handle_int10();
         assert_eq!(m.cpu.registers.ebx() as u16, 0x0000);
+    }
+
+    #[test]
+    fn int10_10h_sets_and_reads_pel_mask() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x1018);
+        m.cpu.registers.set_ebx(0x120F);
+        m.handle_int10();
+        assert_eq!(m.video_mut().read_port(0x3C6), Some(0x0F));
+
+        m.cpu.registers.set_eax(0x1019);
+        m.cpu.registers.set_ebx(0xAB00);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.ebx() as u16, 0xAB0F);
+    }
+
+    #[test]
+    fn int10_10h_selects_and_reports_dac_color_pages() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x000D);
+        m.handle_int10();
+
+        // Attribute palette register 1 selects DAC low bits 5, then a pixel with
+        // colour 1 scans out through the colour-page state below.
+        m.cpu.registers.set_eax(0x1000);
+        m.cpu.registers.set_ebx(0x0501);
+        m.handle_int10();
+        m.cpu.registers.set_eax(0x0C01);
+        m.cpu.registers.set_ebx(0);
+        m.cpu.registers.set_ecx(0);
+        m.cpu.registers.set_edx(0);
+        m.handle_int10();
+
+        // Mode 0: four 64-colour pages. Page 3 supplies DAC bits 7-6.
+        m.cpu.registers.set_eax(0x1013);
+        m.cpu.registers.set_ebx(0x0000);
+        m.handle_int10();
+        m.cpu.registers.set_eax(0x1013);
+        m.cpu.registers.set_ebx(0x0301);
+        m.handle_int10();
+        m.cpu.registers.set_eax(0x101A);
+        m.cpu.registers.set_ebx(0xFFFF);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.ebx() as u16, 0x0300);
+        assert_eq!(m.video_mut().render_full_frame().pixels[0], 0xC5);
+
+        // Mode 1: sixteen 16-colour pages. Page 6 supplies DAC bits 7-4.
+        m.cpu.registers.set_eax(0x1013);
+        m.cpu.registers.set_ebx(0x0100);
+        m.handle_int10();
+        m.cpu.registers.set_eax(0x1013);
+        m.cpu.registers.set_ebx(0x0601);
+        m.handle_int10();
+        m.cpu.registers.set_eax(0x101A);
+        m.cpu.registers.set_ebx(0);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.ebx() as u16, 0x0601);
+        assert_eq!(m.video_mut().render_full_frame().pixels[0], 0x65);
     }
 
     #[test]
@@ -23494,9 +26482,9 @@ mod tests {
 
     #[test]
     fn gc06_moved_aperture_routes_graphics_access_to_the_vga() {
-        // Mode 13h: the default GC06 leaves the framebuffer at A0000, so an A0000
-        // write still lands in the chain-4 plane (offset 6 -> plane 2, plane-offset
-        // 1). Then move the aperture to the 32 KB B8000 window through GC06 and
+        // Mode 13h programs GC06 to the standard 64 KB A0000 graphics window, so
+        // an A0000 write lands in the chain-4 plane (offset 6 -> plane 2,
+        // plane-offset 1). Then move the aperture to the 32 KB B8000 window and
         // confirm a B8000 access now routes to the VGA, while the default A0000
         // path stays exactly as it was.
         let mut machine = test_machine();
@@ -23528,6 +26516,31 @@ mod tests {
         );
         // Read-back through the moved window returns the byte from the plane.
         assert_eq!(machine.read_physical_u8(0x000B_8000 + 10), 0x7E);
+    }
+
+    #[test]
+    fn gc06_map_select_00_routes_the_128kb_graphics_aperture() {
+        let mut machine = test_machine();
+        machine.video_mut().set_mode13h();
+        machine.video_mut().write_port(0x3CE, 0x06);
+        machine.video_mut().write_port(0x3CF, 0x01); // graphics, A0000-BFFFF
+
+        machine.write_physical_u8(VGA_TEXT_BASE + 10, 0x6D);
+
+        let mirrored_offset = 0x8000 + 10;
+        assert_eq!(
+            machine
+                .video()
+                .plane_byte(mirrored_offset & 3, mirrored_offset >> 2),
+            0x6D,
+            "B8000 in map-select 00 routes through the mirrored VGA graphics window"
+        );
+        assert_eq!(machine.read_physical_u8(VGA_TEXT_BASE + 10), 0x6D);
+        assert_eq!(
+            machine.read_physical_u8(VGA_MODE13H_BASE + mirrored_offset as u32),
+            0x6D,
+            "the second 64 KB host half mirrors the same plane window"
+        );
     }
 
     #[test]
@@ -23691,7 +26704,7 @@ mod tests {
         // scans out plane `pan` at plane offset 0: the fine-shifted pixel, not plane 0.
         for pan in 1u8..=3 {
             machine.video_mut().read_status1(); // reset attr flip-flop to index mode
-            machine.video_mut().write_port(0x3C0, 0x13); // attr index 0x13 (pixel pan)
+            machine.video_mut().write_port(0x3C0, 0x33); // attr index 0x13, PAS on
             machine.video_mut().write_port(0x3C0, pan); // pel-pan value
             // Pel-pan is live (not latched): it takes effect at the scanline of the
             // write, so the in-progress frame's early rows still hold the prior pan.
@@ -23750,7 +26763,7 @@ mod tests {
         // scans out plane `pan` at plane offset 0: the fine-shifted pixel.
         for pan in 1u8..=3 {
             machine.video_mut().read_status1(); // reset attr flip-flop to index mode
-            machine.video_mut().write_port(0x3C0, 0x13); // attr index 0x13 (pixel pan)
+            machine.video_mut().write_port(0x3C0, 0x33); // attr index 0x13, PAS on
             machine.video_mut().write_port(0x3C0, pan); // pel-pan value
             // Pel-pan is live (not latched): it takes effect at the scanline of the
             // write, so the in-progress frame's early rows still hold the prior pan.
@@ -23772,15 +26785,14 @@ mod tests {
         machine.video_mut().set_mode13h();
         assert_eq!(machine.active_display(), ActiveDisplay::VgaRaster);
         // A split at scan-counter line 200, well inside the 400 active scanlines.
-        // The line-compare bits are mode-agnostic (CRTC 18h + 07h.4 + 09h.6), and
-        // mode 13h does not honor guest vertical-CRTC bangs, so writing 07h/09h
-        // here clears only their line-compare bits, leaving the fixed 320x200
-        // timing intact. The default line_compare 0x3FF holds bits 8 and 9 set, so
-        // they must be cleared or the low byte alone yields 0x3C8 (no split).
+        // Preserve the other vertical-timing bits in 07h/09h while clearing the
+        // line-compare high bits; those registers are live timing on VGA hardware.
         machine.video_mut().write_port(0x3D4, 0x07);
-        machine.video_mut().write_port(0x3D5, 0x00); // clear line-compare bit 8
+        let r07 = machine.video_mut().read_port(0x3D5).unwrap_or(0);
+        machine.video_mut().write_port(0x3D5, r07 & !0x10); // clear line-compare bit 8
         machine.video_mut().write_port(0x3D4, 0x09);
-        machine.video_mut().write_port(0x3D5, 0x00); // clear line-compare bit 9
+        let r09 = machine.video_mut().read_port(0x3D5).unwrap_or(0);
+        machine.video_mut().write_port(0x3D5, r09 & !0x40); // clear line-compare bit 9
         machine.video_mut().write_port(0x3D4, 0x18);
         machine.video_mut().write_port(0x3D5, 200); // line compare low byte = 200
         // Mark plane 0, offset 0 (pixel 0 of any scanline reading offset 0). 0xC2

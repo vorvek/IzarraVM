@@ -60,10 +60,10 @@ What works today:
 - IDE hard disk, floppy, ATAPI CD-ROM, XMS, EMS, UMBs, keyboard, mouse, PIT, PIC,
   RTC, serial, and parallel devices are wired into the machine model.
 
-The current headless gates pass. The boot suite still has known red rows for
-CGA/EGA graphics coverage and Sound Blaster ADPCM, and the Distira 3D/Glide side
-of VEGA is still future work. Game compatibility work should start from specific
-titles and turn their first failure into a repeatable test.
+The current headless gates pass. The boot suite still has a known red row for
+Sound Blaster ADPCM, and the Distira 3D/Glide side of VEGA is still future work.
+Game compatibility work should start from specific titles and turn their first
+failure into a repeatable test.
 
 ## Quick Start
 
