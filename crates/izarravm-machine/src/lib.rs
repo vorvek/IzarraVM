@@ -2103,6 +2103,13 @@ impl Machine {
         let bx = self.cpu.registers.ebx() as u16;
         let bh = (bx >> 8) as u8;
         let bl = bx as u8;
+        if matches!(ax, 0x0070 | 0x6F05) {
+            return;
+        }
+        if matches!(ax, 0x6A00..=0x6A02) {
+            self.int10_dgis(ax);
+            return;
+        }
         if ah == 0x00 {
             if al == 0x7e {
                 self.int10_paradise_set_special_mode();
@@ -2242,6 +2249,27 @@ impl Machine {
         }
         if ah == 0x4f {
             self.handle_vbe(al);
+        }
+    }
+
+    fn int10_dgis(&mut self, ax: u16) {
+        match ax {
+            // DGIS inquire: no DGIS devices installed.
+            0x6A00 => {
+                self.set_bx(0x0000);
+                self.set_cx(0x0000);
+            }
+            // DGIS redirect output: cannot redirect to a non-DGIS device.
+            0x6A01 => self.set_cx(0x0000),
+            // DGIS current output device: the current display is the BIOS VGA.
+            0x6A02 => {
+                self.cpu
+                    .registers
+                    .set_segment(SegmentIndex::Es, SegmentRegister::real(0x0000));
+                let edi = self.cpu.registers.edi() & !0xFFFF;
+                self.cpu.registers.set_edi(edi);
+            }
+            _ => {}
         }
     }
 
@@ -14529,6 +14557,42 @@ mod tests {
             assert_eq!(m.cpu.registers.ebx() as u16, 0x1111);
             assert_eq!(m.cpu.registers.ecx() as u16, 0x2222);
             assert_eq!(m.cpu.registers.edx() as u16, 0x3333);
+        }
+    }
+
+    #[test]
+    fn int10_dgis_and_extended_adapter_modes_report_absent() {
+        let mut m = int15_machine(16);
+
+        m.cpu.registers.set_eax(0x6A00);
+        m.cpu.registers.set_ebx(0x1111);
+        m.cpu.registers.set_ecx(0x2222);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.ebx() as u16, 0x0000);
+        assert_eq!(m.cpu.registers.ecx() as u16, 0x0000);
+
+        m.cpu.registers.set_eax(0x6A01);
+        m.cpu.registers.set_ecx(0x3333);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.ecx() as u16, 0x0000);
+
+        m.cpu.registers.set_eax(0x6A02);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x1234));
+        m.cpu.registers.set_edi(0xABCD_5678);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.segment(SegmentIndex::Es).selector, 0);
+        assert_eq!(m.cpu.registers.edi() as u16, 0);
+
+        m.cpu.registers.set_eax(0x0003);
+        m.handle_int10();
+        assert_eq!(m.read_physical_u8(0x449), 0x03);
+        for ax in [0x0070, 0x6F05] {
+            m.cpu.registers.set_eax(ax);
+            m.cpu.registers.set_ebx(0x0066);
+            m.handle_int10();
+            assert_eq!(m.read_physical_u8(0x449), 0x03);
         }
     }
 
