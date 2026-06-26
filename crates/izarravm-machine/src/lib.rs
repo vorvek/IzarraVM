@@ -2115,6 +2115,12 @@ impl Machine {
                 .set_start_address(page * (VGA_TEXT_PAGE_STRIDE / 2) as u32);
             return;
         }
+        if ah == 0x04 {
+            // No light pen is attached to the VGA profile, so the trigger flag is
+            // clear and the coordinate registers are left untouched.
+            self.set_eax_ah(0x00);
+            return;
+        }
         if ah == 0x0b {
             // BH=0: BL is the border/overscan color (Attribute register 11h). BH=1
             // is the CGA palette select, a rarely-used CGA-compat path; deferred.
@@ -2137,6 +2143,10 @@ impl Machine {
         }
         if ah == 0x11 {
             self.handle_int10_font(al);
+            return;
+        }
+        if ah == 0x12 {
+            self.handle_int10_alternate(al, bl);
             return;
         }
         if ah == 0x13 {
@@ -2222,6 +2232,81 @@ impl Machine {
         let _ = self.memory.write_u16(0x44a, columns);
         let _ = self.memory.write_u8(0x484, rows.saturating_sub(1));
         let _ = self.memory.write_u16(0x463, 0x03d4); // VGA CRTC base port
+    }
+
+    /// INT 10h AH=12h alternate function select. The common VGA calls are mostly
+    /// BIOS policy latches: report the configured adapter for BL=10h and mirror
+    /// supported toggles into the VGA BDA bytes at 0040:0087-0089.
+    fn handle_int10_alternate(&mut self, al: u8, bl: u8) {
+        match bl {
+            // BL=10h: return EGA/VGA configuration information.
+            0x10 => {
+                let control = self.read_physical_u8(0x487);
+                let switch_data = self.read_physical_u8(0x488);
+                let mode = (control >> 1) & 0x01; // 0 = color 3Dx, 1 = mono 3Bx
+                let memory = (control >> 5) & 0x03; // 0..3 = 64K..256K
+                let feature = (switch_data >> 4) & 0x0f;
+                let switches = switch_data & 0x0f;
+                self.set_bx((u16::from(mode) << 8) | u16::from(memory));
+                self.set_cx((u16::from(feature) << 8) | u16::from(switches));
+            }
+            // BL=20h installs the video BIOS print-screen hook. The ROM print-screen
+            // body is not modeled; accepting the call matches VGA BIOS probes.
+            0x20 => {}
+            // BL=30h: select text-mode scanline count for the next mode set.
+            0x30 if al <= 0x02 => {
+                let mut flags = self.read_physical_u8(0x489) & !(0x80 | 0x10);
+                if al == 0x00 {
+                    flags |= 0x80; // 200 lines
+                } else if al == 0x02 {
+                    flags |= 0x10; // 400 lines
+                }
+                self.write_physical_u8(0x489, flags);
+                self.set_eax_al(0x12);
+            }
+            // BL=31h: default palette loading on mode set.
+            0x31 if al <= 0x01 => {
+                let mut flags = self.read_physical_u8(0x489);
+                if al == 0x01 {
+                    flags |= 0x08; // no palette load
+                } else {
+                    flags &= !0x08;
+                }
+                self.write_physical_u8(0x489, flags);
+                self.set_eax_al(0x12);
+            }
+            // BL=32h: video memory/register addressing. Access gating is not modeled,
+            // but the standard BIOS call is supported.
+            0x32 if al <= 0x01 => self.set_eax_al(0x12),
+            // BL=33h: gray-scale summing policy.
+            0x33 if al <= 0x01 => {
+                let mut flags = self.read_physical_u8(0x489);
+                if al == 0x00 {
+                    flags |= 0x02; // gray scaling enabled
+                } else {
+                    flags &= !0x02;
+                }
+                self.write_physical_u8(0x489, flags);
+                self.set_eax_al(0x12);
+            }
+            // BL=34h: cursor emulation/scaling policy. BDA 0040:0087 bit 0 is the
+            // inhibit bit, so enabling cursor emulation clears it.
+            0x34 if al <= 0x01 => {
+                let mut control = self.read_physical_u8(0x487);
+                if al == 0x01 {
+                    control |= 0x01;
+                } else {
+                    control &= !0x01;
+                }
+                self.write_physical_u8(0x487, control);
+                self.set_eax_al(0x12);
+            }
+            // BL=35h display switch and BL=36h refresh control: no second adapter or
+            // refresh blanking path is modeled, but the VGA BIOS acknowledges them.
+            0x35 if al <= 0x03 => self.set_eax_al(0x12),
+            0x36 if al <= 0x01 => self.set_eax_al(0x12),
+            _ => {}
+        }
     }
 
     /// INT 10h AH=0Ch WRITE GRAPHICS PIXEL. AL = colour (bit 7 set XORs into the
@@ -13351,6 +13436,69 @@ mod tests {
         m.handle_int10();
         assert_eq!(m.cpu.registers.eax() as u8, 0x1A); // AL = function supported
         assert_eq!(m.cpu.registers.ebx() as u8, 0x08); // BL = VGA colour DCC
+    }
+
+    #[test]
+    fn int10_04h_reports_no_light_pen() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x04ff);
+        m.cpu.registers.set_ecx(0x1234);
+        m.cpu.registers.set_edx(0x5678);
+        m.handle_int10();
+        assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x00);
+        assert_eq!(m.cpu.registers.ecx() as u16, 0x1234);
+        assert_eq!(m.cpu.registers.edx() as u16, 0x5678);
+    }
+
+    #[test]
+    fn int10_12h_reports_vga_configuration() {
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0x1200);
+        m.cpu.registers.set_ebx(0x0010);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.ebx() as u16, 0x0003); // color, 256 KB VRAM
+        assert_eq!(m.cpu.registers.ecx() as u16, 0x0f09); // feature bits, color switches
+    }
+
+    #[test]
+    fn int10_12h_updates_vga_policy_latches() {
+        let mut m = int15_machine(16);
+
+        m.cpu.registers.set_eax(0x1200);
+        m.cpu.registers.set_ebx(0x0030);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.eax() as u8, 0x12);
+        assert_eq!(m.read_physical_u8(0x489) & 0x90, 0x80); // 200 scan lines
+
+        m.cpu.registers.set_eax(0x1202);
+        m.cpu.registers.set_ebx(0x0030);
+        m.handle_int10();
+        assert_eq!(m.read_physical_u8(0x489) & 0x90, 0x10); // 400 scan lines
+
+        m.cpu.registers.set_eax(0x1201);
+        m.cpu.registers.set_ebx(0x0031);
+        m.handle_int10();
+        assert_ne!(m.read_physical_u8(0x489) & 0x08, 0); // palette load disabled
+
+        m.cpu.registers.set_eax(0x1200);
+        m.cpu.registers.set_ebx(0x0031);
+        m.handle_int10();
+        assert_eq!(m.read_physical_u8(0x489) & 0x08, 0); // palette load enabled
+
+        m.cpu.registers.set_eax(0x1200);
+        m.cpu.registers.set_ebx(0x0033);
+        m.handle_int10();
+        assert_ne!(m.read_physical_u8(0x489) & 0x02, 0); // gray summing enabled
+
+        m.cpu.registers.set_eax(0x1201);
+        m.cpu.registers.set_ebx(0x0034);
+        m.handle_int10();
+        assert_ne!(m.read_physical_u8(0x487) & 0x01, 0); // cursor emulation disabled
+
+        m.cpu.registers.set_eax(0x1200);
+        m.cpu.registers.set_ebx(0x0034);
+        m.handle_int10();
+        assert_eq!(m.read_physical_u8(0x487) & 0x01, 0); // cursor emulation enabled
     }
 
     #[test]
