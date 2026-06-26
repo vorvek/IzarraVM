@@ -18683,6 +18683,19 @@ mod tests {
     }
 
     #[test]
+    fn dos_internal_iret_vectors_return_to_caller() {
+        // org 0x100: int 2bh; int 2ch; int 2dh; mov ax,4c00h; int 21h
+        let com: &[u8] = &[
+            0xcd, 0x2b, 0xcd, 0x2c, 0xcd, 0x2d, 0xb8, 0x00, 0x4c, 0xcd, 0x21,
+        ];
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
+                .unwrap();
+        let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
+    }
+
+    #[test]
     fn dos_com_unknown_int21_reports_invalid_function_and_returns() {
         // org 0x100:
         //   mov ax,7200h / int 21h
