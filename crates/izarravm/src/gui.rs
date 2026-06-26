@@ -1541,8 +1541,10 @@ impl eframe::App for GuiApp {
         // While captured, all keyboard and pointer input was already drained and
         // routed to the guest in raw_input_hook, ahead of egui's processing. Only
         // the non-captured path runs here: forward keys to the guest when no egui
-        // widget wants the keyboard, otherwise yield so the user can type in the UI.
-        if !self.input_captured && !ctx.wants_keyboard_input() {
+        // widget wants the keyboard. Esc still reaches the guest so POST can skip
+        // the RAM test even if a sidebar control has focus.
+        if !self.input_captured {
+            let ui_wants_keyboard = ctx.wants_keyboard_input();
             self.sync_guest_num_lock();
             let events = ctx.input(|i| i.events.clone());
             let mut codes = Vec::new();
@@ -1555,6 +1557,9 @@ impl eframe::App for GuiApp {
                     modifiers,
                 } = event
                 {
+                    if !should_forward_uncaptured_key(ui_wants_keyboard, *key) {
+                        continue;
+                    }
                     let next = GuestModifiers::from_egui(*modifiers);
                     push_modifier_delta(self.guest_modifiers, next, &mut codes);
                     self.guest_modifiers = next;
@@ -1633,6 +1638,10 @@ fn is_captured_input_event(event: &egui::Event) -> bool {
             | egui::Event::Zoom(_)
             | egui::Event::Touch { .. }
     )
+}
+
+fn should_forward_uncaptured_key(ui_wants_keyboard: bool, key: egui::Key) -> bool {
+    !ui_wants_keyboard || key == egui::Key::Escape
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2128,6 +2137,13 @@ mod tests {
             [0xc8]
         );
         assert_eq!(text_to_set1("."), [0x34, 0xb4]);
+    }
+
+    #[test]
+    fn escape_forwards_to_guest_even_when_ui_has_focus() {
+        assert!(should_forward_uncaptured_key(true, egui::Key::Escape));
+        assert!(!should_forward_uncaptured_key(true, egui::Key::A));
+        assert!(should_forward_uncaptured_key(false, egui::Key::A));
     }
 
     #[test]
