@@ -8,3 +8,6 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+
+[dev-dependencies]
+izarravm-video = { path = "../izarravm-video" }

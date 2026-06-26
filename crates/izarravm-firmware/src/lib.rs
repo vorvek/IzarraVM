@@ -23,6 +23,12 @@ pub const KBD_RESIDENT_BIOS_SEG: u16 = 0xf000;
 pub const IZARRA_BIOS: &[u8] = include_bytes!("../roms/izarra-bios.bin");
 pub const IZARRA_BIOS_SOURCE: &str = include_str!("../roms/izarra-bios.asm");
 
+/// The five code-page fonts (437, 850, 860, 863, 865), each at 8x16, 8x14, then
+/// 8x8. Code-page-major: block `cp` at `cp * 9728`, sizes at 0 / 4096 / 7680.
+/// The machine maps this read-only at 0xC8000 and the BIOS loads a page into the
+/// VGA character generator.
+pub const CODEPAGE_FONTS: &[u8] = include_bytes!("../roms/codepage-fonts.bin");
+
 /// The izarra flash chip is 256 KiB. The board shadows only the top 64 KiB to
 /// 0xF0000, exactly like a period board where the BIOS shadow is a slice of a
 /// larger flash. The lower 192 KiB is reserved (room for uncompressed art, a
@@ -333,6 +339,20 @@ fn additive_checksum(bytes: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codepage_fonts_blob_has_five_pages_three_sizes() {
+        assert_eq!(CODEPAGE_FONTS.len(), 48_640); // 5 * (4096 + 3584 + 2048)
+    }
+
+    #[test]
+    fn codepage_fonts_cp437_matches_shipped_font() {
+        use izarravm_video::font::{VGAFONT_8X14, VGAFONT_8X16, VGAFONT_8X8};
+        // Block 0 = CP437. 8x16 at [0..4096], 8x14 at [4096..7680], 8x8 at [7680..9728].
+        assert_eq!(&CODEPAGE_FONTS[0..4096], &VGAFONT_8X16[..]);
+        assert_eq!(&CODEPAGE_FONTS[4096..7680], &VGAFONT_8X14[..]);
+        assert_eq!(&CODEPAGE_FONTS[7680..9728], &VGAFONT_8X8[..]);
+    }
 
     #[test]
     fn test_rom_is_64k_and_has_reset_far_jump() {
