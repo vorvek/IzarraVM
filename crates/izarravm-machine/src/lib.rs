@@ -10291,17 +10291,17 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     // INT 2Eh is the DOS command-interpreter back door. INT 6Ch is the DOS
     // realtime-clock/resume hook's default IRET. INT 18h/19h are the host-serviced
     // boot and diskless vectors (the run loop services them and redirects CS:IP
-    // itself, so the IRET target is only a fallback). INT 1Bh is the Ctrl-Break
-    // hook: no host handler, just a default IRET so a guest that hooks it or calls
-    // it through the vector has a valid target. INT 40h is the relocated floppy
-    // handler, routed through the same disk service as INT 13h. INT 42h is the
-    // relocated video handler, routed through INT 10h. INT 66h is the XMS driver
-    // entry trap, host-intercepted the same way.
+    // itself, so the IRET target is only a fallback). INT 1Bh and 1Ch are the
+    // Ctrl-Break and timer-tick hooks: no host handlers, just default IRETs so a
+    // guest that hooks or calls them through the vectors has valid targets. INT 40h
+    // is the relocated floppy handler, routed through the same disk service as
+    // INT 13h. INT 42h is the relocated video handler, routed through INT 10h.
+    // INT 66h is the XMS driver entry trap, host-intercepted the same way.
     for vector in [
-        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x25, 0x26, 0x27, 0x28,
-        0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39,
-        0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 0x40, 0x42, 0x47, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F, 0x58,
-        0x5D, 0x5E, 0x5F, 0x66, 0x67, 0x6C,
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x25, 0x26, 0x27,
+        0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38,
+        0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 0x40, 0x42, 0x47, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F,
+        0x58, 0x5D, 0x5E, 0x5F, 0x66, 0x67, 0x6C,
     ] {
         let address = vector * 4;
         memory.write_u16(address, 0)?;
@@ -18988,8 +18988,8 @@ mod tests {
             0xcd, 0x2b, 0xcd, 0x2c, 0xcd, 0x2d, 0xcd, 0x32, 0xcd, 0x34, 0xcd, 0x35, 0xcd, 0x36,
             0xcd, 0x37, 0xcd, 0x38, 0xcd, 0x39, 0xcd, 0x3a, 0xcd, 0x3b, 0xcd, 0x3c, 0xcd, 0x3d,
             0xcd, 0x3e, 0xcd, 0x3f, 0xcd, 0x47, 0xcd, 0x4b, 0xcd, 0x4c, 0xcd, 0x4d, 0xcd, 0x4e,
-            0xcd, 0x4f, 0xcd, 0x58, 0xcd, 0x5d, 0xcd, 0x5e, 0xcd, 0x5f, 0xcd, 0x6c, 0xb8, 0x00,
-            0x4c, 0xcd, 0x21,
+            0xcd, 0x1c, 0xcd, 0x4f, 0xcd, 0x58, 0xcd, 0x5d, 0xcd, 0x5e, 0xcd, 0x5f, 0xcd, 0x6c,
+            0xb8, 0x00, 0x4c, 0xcd, 0x21,
         ];
         let mut machine =
             Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
@@ -26315,7 +26315,7 @@ mod tests {
     }
 
     #[test]
-    fn int1b_vector_points_at_a_valid_iret_handler() {
+    fn int1b_and_int1c_vectors_point_at_valid_iret_handlers() {
         // Use a ROM that carries the IRET byte at FF00:0000, the way the real BIOS
         // does, so the seeded vector lands on a genuine IRET.
         let mut m = Machine::new(
@@ -26323,19 +26323,20 @@ mod tests {
             rom_with_code(&[]),
         )
         .unwrap();
-        // IVT[0x1B] is the Ctrl-Break vector: offset word then segment word.
-        let off = read_u16(&mut m, 0x1b * 4);
-        let seg = read_u16(&mut m, 0x1b * 4 + 2);
-        assert_eq!(
-            seg, BIOS_ROM_IRET_SEG,
-            "INT 1Bh targets the ROM IRET segment"
-        );
-        let target = (u32::from(seg) << 4) + u32::from(off);
-        assert_eq!(
-            m.read_physical_u8(target),
-            0xcf,
-            "INT 1Bh target is an IRET"
-        );
+        for vector in [0x1bu32, 0x1c] {
+            let off = read_u16(&mut m, vector * 4);
+            let seg = read_u16(&mut m, vector * 4 + 2);
+            assert_eq!(
+                seg, BIOS_ROM_IRET_SEG,
+                "INT {vector:02X}h targets the ROM IRET segment"
+            );
+            let target = (u32::from(seg) << 4) + u32::from(off);
+            assert_eq!(
+                m.read_physical_u8(target),
+                0xcf,
+                "INT {vector:02X}h target is an IRET"
+            );
+        }
     }
 
     #[test]
