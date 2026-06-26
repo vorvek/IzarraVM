@@ -34,7 +34,7 @@ is one tight design.
 - Display: 15-inch CRT, up to 1024x768.
 - Firmware: a 2 MB ROM holding a simplified custom BIOS and Toka Disk System.
 
-Games see a DOS environment. Toka runs an MS-DOS 6.1 compatible core with the
+Games see a DOS environment. Toka runs an MS-DOS 6.22 compatible core with the
 usual memory managers, and maps itself out of conventional memory so games that
 need most of the first 640 KB (Wing Commander, for one) still get it.
 

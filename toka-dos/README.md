@@ -1,12 +1,12 @@
 # Toka-DOS
 
-The Izarra 3000's bundled operating system, an MS-DOS 6.1 clone. This tree holds
+The Izarra 3000's bundled operating system, an MS-DOS 6.22 clone. This tree holds
 the source for the ICOMMAND shell, the boot record, the DOS tools, and the
 packer that bundles them into the motherboard ROM image.
 
 The product version shown on screen is "Toka-DOS v3.0". The DOS API version
-reported to programs through INT 21h AH=30h stays 6.10, so software sees a
-compatible DOS.
+reported to programs through INT 21h AH=30h stays 6.22, so software sees a
+DOS 6.22-compatible system.
 
 ## Layout
 

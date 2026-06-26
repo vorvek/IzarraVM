@@ -511,7 +511,7 @@ gfx_bar_frame:
 ; gfx_bar_fill: AX = percent (0..100). The graphical POST art has no progress bar
 ; -- the grey->colour icon reveal is the progress indicator -- so this is a no-op.
 ; The RAM test (ramtest_draw) still calls it by name; keep the label and just
-; return. ponytail: stub, not dead code -- ramtest-core owns its call site.
+; return. This is a stub, not dead code; ramtest-core owns its call site.
 gfx_bar_fill:
     ret
 
