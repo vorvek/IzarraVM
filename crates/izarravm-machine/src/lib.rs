@@ -2754,17 +2754,52 @@ impl Machine {
         self.cpu.registers.set_eax(eax);
     }
 
-    /// Service INT 14h (SERIAL) over the COM1 UART. DX selects the port; only COM1
-    /// (DX=0) is wired. AH=00h initializes from the AL parameter byte, AH=01h sends
-    /// AL, AH=02h receives into AL, AH=03h reads status, AH=04h is the PS/2
-    /// extended initialize call, and AH=05h reads/writes the modem-control register.
-    /// AH returns the line-status byte and AL the modem-status byte, the way the BIOS
-    /// reports the 16450 registers.
+    /// Service INT 14h over the COM1 UART. DX selects the serial port; only COM1
+    /// (DX=0) is wired. The BIOS functions cover AH=00h-05h, and the FOSSIL calls
+    /// use the same instant-drain UART plus the BIOS text cursor and keyboard ring.
     fn handle_int14(&mut self) {
         const COM1: u16 = 0x03f8;
         let ax = self.cpu.registers.eax() as u16;
         let ah = (ax >> 8) as u8;
         let al = ax as u8;
+        let bx = self.cpu.registers.ebx() as u16;
+
+        match ah {
+            0x07 => {
+                self.set_ax(0x1208); // INT 08h, about 18 ticks per second.
+                self.set_dx(55);
+                return;
+            }
+            0x0D | 0x0E => {
+                self.int14_fossil_keyboard_read();
+                return;
+            }
+            0x11 => {
+                self.handle_int10_text(0x02);
+                return;
+            }
+            0x12 => {
+                self.handle_int10_text(0x03);
+                return;
+            }
+            0x13 | 0x15 => {
+                self.teletype_char(al);
+                return;
+            }
+            0x16 => {
+                self.set_ax(0x0001);
+                return;
+            }
+            0x17 => return,
+            0x7E | 0x7F => {
+                self.set_ax(0x1954);
+                self.set_bx((bx & 0xff00) | u16::from(al));
+                self.set_dx(self.cpu.registers.edx() as u16 & 0x00ff);
+                return;
+            }
+            _ => {}
+        }
+
         if self.cpu.registers.edx() as u16 != 0 {
             self.set_eax_ah(0x80); // bit7 timeout: no such serial port
             return;
@@ -2801,6 +2836,12 @@ impl Machine {
                 self.set_eax_ah(lsr);
                 self.set_eax_al(msr);
             }
+            0x04 if bx == 0x4F50 => {
+                let mcr = self.serial.read_port(COM1 + 4).unwrap_or(0) | 0x01;
+                self.serial.write_port(COM1 + 4, mcr);
+                self.set_ax(0x1954);
+                self.set_bx(0x001B);
+            }
             0x04 if self.int14_extended_params_valid() => {
                 self.uart_extended_init();
                 let lsr = self.serial.read_port(COM1 + 5).unwrap_or(0);
@@ -2824,8 +2865,94 @@ impl Machine {
                 }
                 _ => self.set_eax_ah(0x80),
             },
+            0x06 => {
+                let mcr = self.serial.read_port(COM1 + 4).unwrap_or(0);
+                let mcr = if al == 0 { mcr & !0x01 } else { mcr | 0x01 };
+                self.serial.write_port(COM1 + 4, mcr);
+            }
+            0x08 | 0x09 | 0x0F | 0x10 | 0x14 | 0x1A => {}
+            0x0A => {
+                while self.serial.read_port(COM1 + 5).unwrap_or(0) & 0x01 != 0 {
+                    let _ = self.serial.read_port(COM1);
+                }
+            }
+            0x0B => {
+                self.serial.write_port(COM1, al);
+                self.set_ax(0x0001);
+            }
+            0x18 => self.int14_fossil_read_block(),
+            0x19 => self.int14_fossil_write_block(),
+            0x1B => self.int14_fossil_driver_info(),
             _ => self.set_eax_ah(0x80),
         }
+    }
+
+    fn int14_fossil_keyboard_read(&mut self) {
+        const KBD_BDA_BASE: usize = 0x400;
+        const KBD_HEAD: usize = 0x1a;
+        const KBD_TAIL: usize = 0x1c;
+        const KBD_RING_START: u16 = 0x1e;
+        const KBD_RING_END: u16 = 0x3e;
+
+        let head = self.memory.read_u16(KBD_BDA_BASE + KBD_HEAD).unwrap_or(0);
+        let tail = self.memory.read_u16(KBD_BDA_BASE + KBD_TAIL).unwrap_or(0);
+        if head == tail {
+            self.set_ax(0xFFFF);
+            return;
+        }
+        let word = self
+            .memory
+            .read_u16(KBD_BDA_BASE + usize::from(head))
+            .unwrap_or(0);
+        let mut next = head + 2;
+        if next >= KBD_RING_END {
+            next = KBD_RING_START;
+        }
+        let _ = self.memory.write_u16(KBD_BDA_BASE + KBD_HEAD, next);
+        self.set_ax(word);
+    }
+
+    fn int14_fossil_read_block(&mut self) {
+        const COM1: u16 = 0x03f8;
+        let max = self.cpu.registers.ecx() as u16;
+        let es = self.cpu.registers.segment(SegmentIndex::Es).base;
+        let di = self.cpu.registers.edi() as u16;
+        let mut dst = es + u32::from(di);
+        let mut count = 0u16;
+        while count < max && self.serial.read_port(COM1 + 5).unwrap_or(0) & 0x01 != 0 {
+            let byte = self.serial.read_port(COM1).unwrap_or(0);
+            self.write_physical_u8(dst, byte);
+            dst = dst.wrapping_add(1);
+            count += 1;
+        }
+        self.set_ax(count);
+    }
+
+    fn int14_fossil_write_block(&mut self) {
+        const COM1: u16 = 0x03f8;
+        let count = self.cpu.registers.ecx() as u16;
+        let es = self.cpu.registers.segment(SegmentIndex::Es).base;
+        let di = self.cpu.registers.edi() as u16;
+        for index in 0..count {
+            let byte = self.read_physical_u8(es + u32::from(di.wrapping_add(index)));
+            self.serial.write_port(COM1, byte);
+        }
+        self.set_ax(count);
+    }
+
+    fn int14_fossil_driver_info(&mut self) {
+        let max = self.cpu.registers.ecx() as usize;
+        let es = self.cpu.registers.segment(SegmentIndex::Es).base;
+        let di = self.cpu.registers.edi() as u16;
+        let mut info = [0u8; 21];
+        let info_len = info.len();
+        info[0..2].copy_from_slice(&(info_len as u16).to_le_bytes());
+        info[2] = 5; // FOSSIL spec level.
+        info[16] = 80;
+        info[17] = 25;
+        let count = max.min(info_len);
+        self.write_guest_block(es + u32::from(di), &info[..count]);
+        self.set_ax(count as u16);
     }
 
     /// Program the COM1 UART from an INT 14h AH=00h parameter byte: bits 7-5 baud
@@ -12927,6 +13054,107 @@ mod tests {
             0x80,
             "timeout bit set"
         );
+    }
+
+    #[test]
+    fn int14_fossil_services_use_uart_and_bios_state() {
+        let mut m = int15_machine(16);
+
+        m.cpu.registers.set_eax(0x0601);
+        m.cpu.registers.set_edx(0);
+        m.handle_int14();
+        assert_ne!(m.serial.read_port(0x03fc).unwrap() & 0x01, 0, "DTR raised");
+
+        m.cpu.registers.set_eax(0x0600);
+        m.cpu.registers.set_edx(0);
+        m.handle_int14();
+        assert_eq!(m.serial.read_port(0x03fc).unwrap() & 0x01, 0, "DTR lowered");
+
+        m.cpu.registers.set_eax(0x0400);
+        m.cpu.registers.set_ebx(0x4F50);
+        m.cpu.registers.set_edx(0);
+        m.handle_int14();
+        assert_eq!(m.cpu.registers.eax() as u16, 0x1954);
+        assert_eq!(m.cpu.registers.ebx() as u16, 0x001B);
+        assert_ne!(m.serial.read_port(0x03fc).unwrap() & 0x01, 0, "DTR raised");
+
+        m.cpu.registers.set_eax(0x0B58);
+        m.cpu.registers.set_edx(0);
+        m.handle_int14();
+        assert_eq!(m.cpu.registers.eax() as u16, 0x0001);
+        assert_eq!(m.serial.output(), b"X");
+
+        m.write_guest_block(0x4000, b"yz");
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x400));
+        m.cpu.registers.set_edi(0);
+        m.cpu.registers.set_ecx(2);
+        m.cpu.registers.set_eax(0x1900);
+        m.cpu.registers.set_edx(0);
+        m.handle_int14();
+        assert_eq!(m.cpu.registers.eax() as u16, 2);
+        assert_eq!(m.serial.output(), b"Xyz");
+
+        m.serial.write_port(0x03fc, 0x10);
+        m.serial.write_port(0x03f8, b'R');
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x500));
+        m.cpu.registers.set_edi(0);
+        m.cpu.registers.set_ecx(4);
+        m.cpu.registers.set_eax(0x1800);
+        m.cpu.registers.set_edx(0);
+        m.handle_int14();
+        assert_eq!(m.cpu.registers.eax() as u16, 1);
+        assert_eq!(m.read_physical_u8(0x5000), b'R');
+
+        m.set_dos_stdin(b"k");
+        m.cpu.registers.set_eax(0x0D00);
+        m.handle_int14();
+        assert_eq!(m.cpu.registers.eax() as u16, b'k' as u16);
+    }
+
+    #[test]
+    fn int14_fossil_screen_and_info_calls_are_minimal_but_stable() {
+        let mut m = int15_machine(16);
+
+        m.cpu.registers.set_edx(0x0407);
+        m.cpu.registers.set_eax(0x1100);
+        m.handle_int14();
+        assert_eq!(m.read_guest_word(0x450), 0x0407);
+
+        m.cpu.registers.set_edx(0);
+        m.cpu.registers.set_eax(0x1200);
+        m.handle_int14();
+        assert_eq!(m.cpu.registers.edx() as u16, 0x0407);
+
+        m.cpu.registers.set_eax(0x1541);
+        m.handle_int14();
+        let cell = (4 * 80 + 7) * 2;
+        assert_eq!(m.video.read_u8(cell).unwrap(), b'A');
+
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x600));
+        m.cpu.registers.set_edi(0);
+        m.cpu.registers.set_ecx(21);
+        m.cpu.registers.set_eax(0x1B00);
+        m.cpu.registers.set_edx(0);
+        m.handle_int14();
+        assert_eq!(m.cpu.registers.eax() as u16, 21);
+        assert_eq!(m.memory.read_u16(0x6000).unwrap(), 21);
+        assert_eq!(m.read_physical_u8(0x6002), 5);
+        assert_eq!(m.read_physical_u8(0x6010), 80);
+        assert_eq!(m.read_physical_u8(0x6011), 25);
+
+        m.cpu.registers.set_eax(0x7E42);
+        m.cpu.registers.set_ebx(0);
+        m.cpu.registers.set_edx(0x1234);
+        m.handle_int14();
+        assert_eq!(m.cpu.registers.eax() as u16, 0x1954);
+        assert_eq!(m.cpu.registers.ebx() as u16, 0x0042);
+        assert_eq!(m.cpu.registers.edx() as u16, 0x0034);
     }
 
     #[test]
