@@ -16639,6 +16639,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn es_layout_fills_ordinal_and_iso_and_cedilla() {
+        // AX = (scancode << 8) | ascii from INT 16h. Layout 2 = ES.
+        // 0x29 (left of 1): º / ª / backslash
+        assert_eq!(int16_read_after_with_layout(2, &[0x29, 0xa9]), 0x29a7); // º CP437 0xA7
+        assert_eq!(
+            int16_read_after_with_layout(2, &[0x2a, 0x29, 0xa9, 0xaa]),
+            0x29a6
+        ); // ª 0xA6
+        assert_eq!(
+            int16_read_after_with_layout(2, &[0xe0, 0x38, 0x29, 0xa9, 0xe0, 0xb8]),
+            0x295c
+        ); // AltGr+0x29 -> '\'
+        // 0x56 ISO 102nd key: < / >
+        assert_eq!(int16_read_after_with_layout(2, &[0x56, 0xd6]), 0x563c); // '<'
+        assert_eq!(
+            int16_read_after_with_layout(2, &[0x2a, 0x56, 0xd6, 0xaa]),
+            0x563e
+        ); // '>'
+        // 0x2b cedilla key: c-cedilla / C-cedilla (was wrongly Greek glyphs)
+        assert_eq!(int16_read_after_with_layout(2, &[0x2b, 0xab]), 0x2b87); // ç 0x87
+        assert_eq!(
+            int16_read_after_with_layout(2, &[0x2a, 0x2b, 0xab, 0xaa]),
+            0x2b80
+        ); // Ç 0x80
+        // 0x0d inverted punctuation: ¡ / ¿
+        assert_eq!(int16_read_after_with_layout(2, &[0x0d, 0x8d]), 0x0dad); // ¡ 0xAD
+        assert_eq!(
+            int16_read_after_with_layout(2, &[0x2a, 0x0d, 0x8d, 0xaa]),
+            0x0da8
+        ); // ¿ 0xA8
+    }
+
     /// Same path as `int16_read_after`, but the program reads with AH=10h (the
     /// enhanced read). Before the DOS keyboard ROM aliased AH=10h to the AH=00h
     /// reader, this fell through the int16 dispatch and returned stale AX.
