@@ -1,9 +1,10 @@
+use std::collections::BTreeSet;
+
 use winit::keyboard::KeyCode;
 
 /// Physical key -> (Set 1 make code, is-extended). Extended keys are prefixed
 /// with 0xE0 on both make and break. Returns None for keys outside the DOS set.
-#[allow(dead_code)]
-pub(crate) fn keycode_to_set1(code: KeyCode) -> Option<(u8, bool)> {
+fn keycode_to_set1(code: KeyCode) -> Option<(u8, bool)> {
     use KeyCode::*;
     let plain = |c| Some((c, false));
     let ext = |c| Some((c, true));
@@ -112,9 +113,61 @@ pub(crate) fn keycode_to_set1(code: KeyCode) -> Option<(u8, bool)> {
     }
 }
 
-/// Stub for the stateful translator that Task 2 will flesh out.
+/// Stable per-key id for the held set: the make code plus the extended flag.
+fn code_id(make: u8, extended: bool) -> u16 {
+    u16::from(make) | (u16::from(extended) << 8)
+}
+
+/// Translates winit physical key events into Set 1 scancode bytes and remembers
+/// which keys are held, so everything can be released at once on focus loss or
+/// capture release. Pure: no windowing, no OS calls.
 #[derive(Debug, Default)]
-pub struct HostKeyboard;
+pub struct HostKeyboard {
+    held: BTreeSet<u16>, // KeyCode encoded as u16 via code_id
+}
+
+impl HostKeyboard {
+    /// Make on press, make|0x80 on release, each 0xE0-prefixed for extended
+    /// keys. Auto-repeat (repeat=true) re-emits the make. Empty for keys outside
+    /// the DOS set.
+    pub fn key(&mut self, code: KeyCode, pressed: bool, repeat: bool) -> Vec<u8> {
+        let Some((make, extended)) = keycode_to_set1(code) else {
+            return Vec::new();
+        };
+        let id = code_id(make, extended);
+        let mut out = Vec::with_capacity(2);
+        if pressed {
+            if !repeat {
+                self.held.insert(id);
+            }
+            if extended {
+                out.push(0xe0);
+            }
+            out.push(make);
+        } else {
+            self.held.remove(&id);
+            if extended {
+                out.push(0xe0);
+            }
+            out.push(make | 0x80);
+        }
+        out
+    }
+
+    /// Break codes for every held key, then forget them all.
+    pub fn release_all(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for id in std::mem::take(&mut self.held) {
+            let make = (id & 0xff) as u8;
+            let extended = id & 0x100 != 0;
+            if extended {
+                out.push(0xe0);
+            }
+            out.push(make | 0x80);
+        }
+        out
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -136,5 +189,47 @@ mod tests {
         assert_eq!(keycode_to_set1(KeyCode::NumpadEnter), Some((0x1c, true)));
         assert_eq!(keycode_to_set1(KeyCode::Delete), Some((0x53, true)));
         assert_eq!(keycode_to_set1(KeyCode::F24), None);
+    }
+
+    #[test]
+    fn press_and_release_emit_make_then_break() {
+        let mut kb = HostKeyboard::default();
+        assert_eq!(kb.key(KeyCode::ShiftLeft, true, false), vec![0x2a]);
+        assert_eq!(kb.key(KeyCode::KeyA, true, false), vec![0x1e]);
+        assert_eq!(kb.key(KeyCode::KeyA, false, false), vec![0x9e]);
+        assert_eq!(kb.key(KeyCode::ShiftLeft, false, false), vec![0xaa]);
+    }
+
+    #[test]
+    fn extended_key_carries_the_e0_prefix_both_ways() {
+        let mut kb = HostKeyboard::default();
+        assert_eq!(kb.key(KeyCode::ArrowRight, true, false), vec![0xe0, 0x4d]);
+        assert_eq!(kb.key(KeyCode::ArrowRight, false, false), vec![0xe0, 0xcd]);
+    }
+
+    #[test]
+    fn auto_repeat_re_emits_the_make() {
+        let mut kb = HostKeyboard::default();
+        assert_eq!(kb.key(KeyCode::KeyA, true, false), vec![0x1e]);
+        assert_eq!(kb.key(KeyCode::KeyA, true, true), vec![0x1e]); // repeat
+    }
+
+    #[test]
+    fn release_all_breaks_every_held_key_then_forgets_them() {
+        let mut kb = HostKeyboard::default();
+        kb.key(KeyCode::ShiftLeft, true, false);
+        kb.key(KeyCode::ArrowUp, true, false);
+        let mut codes = kb.release_all();
+        codes.sort_unstable();
+        // 0xaa (shift break) and 0xe0,0xc8 (arrow-up break), order-independent.
+        assert_eq!(codes, vec![0xaa, 0xc8, 0xe0]);
+        assert!(kb.release_all().is_empty());
+    }
+
+    #[test]
+    fn unmapped_key_emits_nothing_and_is_not_tracked() {
+        let mut kb = HostKeyboard::default();
+        assert!(kb.key(KeyCode::F24, true, false).is_empty());
+        assert!(kb.release_all().is_empty());
     }
 }
