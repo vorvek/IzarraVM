@@ -20,7 +20,9 @@ result_payload:
     db 'PASS memory.conventional_pattern', 10
     db 'MEASURE memory.conventional_kib 640', 10
     db 'PASS video.vga_text', 10
+cga_graphics_record:
     db 'FAIL video.cga_graphics', 10
+ega_planar_record:
     db 'FAIL video.ega_planar', 10
     db 'PASS video.vga_mode13h', 10
 pc_speaker_record:

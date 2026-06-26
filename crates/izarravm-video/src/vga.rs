@@ -8,8 +8,8 @@
 //! write/read decode.
 
 use crate::{
-    DAC_ENTRIES, Dac, TextCell, TextFrame, VGA_TEXT_COLUMNS, VGA_TEXT_MEMORY_SIZE, VGA_TEXT_ROWS,
-    VideoError, VideoMode,
+    DAC_ENTRIES, Dac, TextCell, TextFrame, VGA_MONO_TEXT_BASE, VGA_TEXT_BASE, VGA_TEXT_COLUMNS,
+    VGA_TEXT_MEMORY_SIZE, VGA_TEXT_ROWS, VideoError, VideoMode,
 };
 
 pub const VGA_PLANE_SIZE: usize = 64 * 1024;
@@ -60,6 +60,62 @@ impl CrtcTiming {
             underline_loc: 0x00,
             line_compare: 0x3FF,
             preset_row_scan: 0,
+        }
+    }
+
+    /// Monochrome text (BIOS mode 07h): 80x25, 9x14 cells, 720x350 active.
+    pub fn text_07h() -> Self {
+        Self {
+            htotal_chars: 100,
+            char_width: 9,
+            hdisp_end: 720,
+            vtotal: 449,
+            vdisp_end: 350,
+            vblank_start: 355,
+            vblank_end: 442,
+            vretrace_start: 387,
+            vretrace_end: 389,
+            max_scan: 13,
+            double_scan: false,
+            start_address: 0,
+            offset: 80,
+            mode_control: 0xA3,
+            underline_loc: 0x00,
+            line_compare: 0x3FF,
+            preset_row_scan: 0,
+        }
+    }
+
+    /// CGA-style 40x25 text (BIOS modes 00h/01h): 8x8 cells, 320x200 active.
+    pub fn text_40x25() -> Self {
+        Self {
+            htotal_chars: 57,
+            char_width: 8,
+            hdisp_end: 320,
+            vtotal: 262,
+            vdisp_end: 200,
+            vblank_start: 200,
+            vblank_end: 255,
+            vretrace_start: 224,
+            vretrace_end: 226,
+            max_scan: 7,
+            double_scan: false,
+            start_address: 0,
+            offset: 40,
+            mode_control: 0xA3,
+            underline_loc: 0x00,
+            line_compare: 0x3FF,
+            preset_row_scan: 0,
+        }
+    }
+
+    /// CGA-style 80x25 text (BIOS modes 02h/03h): 8x8 cells, 640x200 active.
+    pub fn text_80x25_cga() -> Self {
+        Self {
+            htotal_chars: 114,
+            hdisp_end: 640,
+            offset: 80,
+            ..Self::text_40x25()
         }
     }
 
@@ -228,7 +284,7 @@ impl CrtcTiming {
     /// double-scanned in the raster model: 200 source rows map to 200 raster lines.
     pub fn cga_320x200() -> Self {
         Self {
-            htotal_chars: 100,
+            htotal_chars: 57,
             char_width: 8,
             hdisp_end: 320,
             vtotal: 262,
@@ -248,10 +304,12 @@ impl CrtcTiming {
         }
     }
 
-    /// CGA 640x200 graphics (mode 06h): same vertical timing as 320x200, wider
-    /// active area.
+    /// CGA 640x200 graphics (mode 06h): the 6845 uses the same 40-column
+    /// horizontal timing registers as 320x200 graphics, but the high-res dot
+    /// clock makes each displayed character time cover 16 active pixels.
     pub fn cga_640x200() -> Self {
         Self {
+            char_width: 16,
             hdisp_end: 640,
             ..Self::cga_320x200()
         }
@@ -263,10 +321,16 @@ impl CrtcTiming {
     }
 }
 
-/// Raw CRTC vertical-timing register bytes, honored only while unchained (mode X)
-/// so the geometry follows whatever the guest programs. Seeded at mode-X entry and
-/// derived into `CrtcTiming` by `recompute_vertical_timing`. The horizontal group
-/// (r00-r05) is stored for read-back only; nothing derives geometry from it yet.
+const CGA_MODE_80_COLUMNS: u8 = 0x01;
+const CGA_MODE_GRAPHICS: u8 = 0x02;
+const CGA_MODE_BW: u8 = 0x04;
+const CGA_MODE_VIDEO_ENABLE: u8 = 0x08;
+const CGA_MODE_HIGH_RES: u8 = 0x10;
+const CGA_MODE_BLINK: u8 = 0x20;
+
+/// Raw CRTC register bytes. VGA graphics modes derive vertical timing from these
+/// bytes; CGA personalities also derive Motorola 6845 horizontal R0/R1 and
+/// vertical R4/R5/R6/R7/R9 into `CrtcTiming`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CrtcRegs {
     pub r00: u8, // horizontal total
@@ -277,15 +341,83 @@ pub struct CrtcRegs {
     pub r05: u8, // end horizontal retrace (bits 4-0 end, 6-5 delay, 7 EHB bit 5)
     pub r06: u8, // vertical total (low 8)
     pub r07: u8, // overflow (high bits of several fields)
+    pub r08: u8, // preset row scan / interlace mode (CGA: interlace/skew)
     pub r09: u8, // maximum scan line (double-scan, max_scan, line-compare bit 9)
     pub r10: u8, // vertical retrace start (low 8)
     pub r11: u8, // vertical retrace end (low-nibble compare)
     pub r12: u8, // vertical display end (low 8)
+    pub r13: u8, // offset
+    pub r14: u8, // underline location / dword addressing bit
     pub r15: u8, // vertical blank start (low 8)
     pub r16: u8, // vertical blank end (8-bit compare)
+    pub r17: u8, // CRTC mode control
+    pub r18: u8, // line compare low 8
 }
 
 impl CrtcRegs {
+    pub fn from_timing(t: CrtcTiming) -> Self {
+        let vtotal = t.vtotal.saturating_sub(2);
+        let vdisp = t.vdisp_end.saturating_sub(1);
+        let vretrace = t.vretrace_start;
+        let vblank = t.vblank_start;
+        let hdisplay = (t.hdisp_end / t.char_width).saturating_sub(1);
+
+        Self {
+            r00: (t.htotal_chars.saturating_sub(5) & 0xFF) as u8,
+            r01: (hdisplay & 0xFF) as u8,
+            r02: ((hdisplay + 1) & 0xFF) as u8,
+            r03: 0x82,
+            r04: ((hdisplay + 5) & 0xFF) as u8,
+            r05: 0x80,
+            r06: (vtotal & 0xFF) as u8,
+            r07: (((vtotal >> 8) & 1)
+                | (((vdisp >> 8) & 1) << 1)
+                | (((vretrace >> 8) & 1) << 2)
+                | (((vblank >> 8) & 1) << 3)
+                | (((t.line_compare >> 8) & 1) << 4)
+                | (((vtotal >> 9) & 1) << 5)
+                | (((vdisp >> 9) & 1) << 6)
+                | (((vretrace >> 9) & 1) << 7)) as u8,
+            r08: t.preset_row_scan,
+            r09: (t.max_scan as u8 & 0x1F)
+                | (((vblank >> 9) as u8 & 1) << 5)
+                | (((t.line_compare >> 9) as u8 & 1) << 6),
+            r10: (vretrace & 0xFF) as u8,
+            r11: (t.vretrace_end & 0x0F) as u8,
+            r12: (vdisp & 0xFF) as u8,
+            r13: t.offset as u8,
+            r14: t.underline_loc,
+            r15: (vblank & 0xFF) as u8,
+            r16: (t.vblank_end & 0xFF) as u8,
+            r17: t.mode_control,
+            r18: t.line_compare as u8,
+        }
+    }
+
+    fn from_vgabios_crtc(regs: [u8; 25]) -> Self {
+        Self {
+            r00: regs[0x00],
+            r01: regs[0x01],
+            r02: regs[0x02],
+            r03: regs[0x03],
+            r04: regs[0x04],
+            r05: regs[0x05],
+            r06: regs[0x06],
+            r07: regs[0x07],
+            r08: regs[0x08],
+            r09: regs[0x09],
+            r10: regs[0x10],
+            r11: regs[0x11],
+            r12: regs[0x12],
+            r13: regs[0x13],
+            r14: regs[0x14],
+            r15: regs[0x15],
+            r16: regs[0x16],
+            r17: regs[0x17],
+            r18: regs[0x18],
+        }
+    }
+
     /// The 320x200 unchained register set, matching `CrtcTiming::mode_x()`. The
     /// horizontal group (r00-r05) carries the stock 320-pixel CRTC values so a
     /// guest that reads them back before reprogramming sees the mode default.
@@ -299,23 +431,181 @@ impl CrtcRegs {
             r05: 0x80,
             r06: 0xBF,
             r07: 0x1F,
+            r08: 0x00,
             r09: 0x41,
             r10: 0x9C,
             r11: 0x0E,
             r12: 0x8F,
+            r13: 0x28,
+            r14: 0x40,
             r15: 0x97,
             r16: 0xBA,
+            r17: 0xA3,
+            r18: 0xFF,
         }
+    }
+
+    pub fn cga_text_40x25() -> Self {
+        Self {
+            r00: 0x38,
+            r01: 0x28,
+            r02: 0x2D,
+            r03: 0x0A,
+            r04: 0x1F,
+            r05: 0x06,
+            r06: 0x19,
+            r07: 0x1C,
+            r08: 0x02,
+            r09: 0x07,
+            r10: 0x06,
+            r11: 0x07,
+            r12: 0x00,
+            r13: 0x00,
+            r14: 0x00,
+            r15: 0x00,
+            r16: 0x00,
+            r17: 0x00,
+            r18: 0x00,
+        }
+    }
+
+    pub fn cga_text_80x25() -> Self {
+        Self {
+            r00: 0x71,
+            r01: 0x50,
+            r02: 0x5A,
+            r03: 0x0A,
+            ..Self::cga_text_40x25()
+        }
+    }
+
+    pub fn cga_graphics_320x200() -> Self {
+        Self {
+            r00: 0x38,
+            r01: 0x28,
+            r02: 0x2D,
+            r03: 0x0A,
+            r04: 0x7F,
+            r05: 0x06,
+            r06: 0x64,
+            r07: 0x70,
+            r08: 0x02,
+            r09: 0x01,
+            r10: 0x06,
+            r11: 0x07,
+            r12: 0x00,
+            r13: 0x00,
+            r14: 0x00,
+            r15: 0x00,
+            r16: 0x00,
+            r17: 0x00,
+            r18: 0x00,
+        }
+    }
+
+    pub fn cga_graphics_640x200() -> Self {
+        Self::cga_graphics_320x200()
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+fn vgabios_crtc_regs(mode: u8) -> Option<[u8; 25]> {
+    match mode {
+        0x03 => Some([
+            0x5f, 0x4f, 0x50, 0x82, 0x55, 0x81, 0xbf, 0x1f, 0x00, 0x4f, 0x0d, 0x0e, 0x00, 0x00,
+            0x00, 0x00, 0x9c, 0x8e, 0x8f, 0x28, 0x1f, 0x96, 0xb9, 0xa3, 0xff,
+        ]),
+        0x0d => Some([
+            0x2d, 0x27, 0x28, 0x90, 0x2b, 0x80, 0xbf, 0x1f, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x9c, 0x8e, 0x8f, 0x14, 0x00, 0x96, 0xb9, 0xe3, 0xff,
+        ]),
+        0x0e => Some([
+            0x5f, 0x4f, 0x50, 0x82, 0x54, 0x80, 0xbf, 0x1f, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x9c, 0x8e, 0x8f, 0x28, 0x00, 0x96, 0xb9, 0xe3, 0xff,
+        ]),
+        0x0f | 0x10 => Some([
+            0x5f, 0x4f, 0x50, 0x82, 0x54, 0x80, 0xbf, 0x1f, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x83, 0x85, 0x5d, 0x28, 0x0f, 0x63, 0xba, 0xe3, 0xff,
+        ]),
+        0x11 | 0x12 => Some([
+            0x5f, 0x4f, 0x50, 0x82, 0x54, 0x80, 0x0b, 0x3e, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0xea, 0x8c, 0xdf, 0x28, 0x00, 0xe7, 0x04, 0xe3, 0xff,
+        ]),
+        0x13 => Some([
+            0x5f, 0x4f, 0x50, 0x82, 0x54, 0x80, 0xbf, 0x1f, 0x00, 0x41, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x9c, 0x8e, 0x8f, 0x28, 0x40, 0x96, 0xb9, 0xa3, 0xff,
+        ]),
+        _ => None,
+    }
+}
+
+fn vgabios_seq_regs(mode: u8) -> Option<[u8; 4]> {
+    match mode {
+        0x03 => Some([0x00, 0x03, 0x00, 0x02]),
+        0x0d => Some([0x09, 0x0f, 0x00, 0x06]),
+        0x0e..=0x12 => Some([0x01, 0x0f, 0x00, 0x06]),
+        0x13 => Some([0x01, 0x0f, 0x00, 0x0e]),
+        _ => None,
+    }
+}
+
+fn vgabios_gc_regs(mode: u8) -> Option<[u8; 9]> {
+    match mode {
+        0x03 => Some([0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x0e, 0x0f, 0xff]),
+        0x0d..=0x12 => Some([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x0f, 0xff]),
+        0x13 => Some([0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x05, 0x0f, 0xff]),
+        _ => None,
+    }
+}
+
+fn vgabios_attr_regs(mode: u8) -> Option<[u8; 20]> {
+    match mode {
+        0x03 => Some([
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x14, 0x07, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d,
+            0x3e, 0x3f, 0x0c, 0x00, 0x0f, 0x08,
+        ]),
+        0x0d | 0x0e => Some([
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
+            0x16, 0x17, 0x01, 0x00, 0x0f, 0x00,
+        ]),
+        0x0f => Some([
+            0x00, 0x08, 0x00, 0x00, 0x18, 0x18, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x18,
+            0x00, 0x00, 0x01, 0x00, 0x01, 0x00,
+        ]),
+        0x10 | 0x12 => Some([
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x14, 0x07, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d,
+            0x3e, 0x3f, 0x01, 0x00, 0x0f, 0x00,
+        ]),
+        0x11 => Some([
+            0x00, 0x3f, 0x00, 0x3f, 0x00, 0x3f, 0x00, 0x3f, 0x00, 0x3f, 0x00, 0x3f, 0x00, 0x3f,
+            0x00, 0x3f, 0x01, 0x00, 0x0f, 0x00,
+        ]),
+        0x13 => Some([
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x41, 0x00, 0x0f, 0x00,
+        ]),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct Sequencer {
-    pub reset: u8,           // idx 0 (bit 0 async reset, bit 1 sync reset); read-back only
+    pub reset: u8,           // idx 0 (bits 0 and 1 must both be 1 for output)
     pub clocking_mode: u8,   // idx 1 (bit 0 set = 8-dot chars; clear = 9-dot)
     pub map_mask: u8,        // idx 2, low 4 bits
     pub char_map_select: u8, // idx 3 (map A bits 0,1,4 select the active font table)
     pub memory_mode: u8,     // idx 4
+}
+
+impl Default for Sequencer {
+    fn default() -> Self {
+        Self {
+            reset: 0x03,
+            clocking_mode: 0,
+            map_mask: 0,
+            char_map_select: 0,
+            memory_mode: 0,
+        }
+    }
 }
 
 /// Attribute Controller register block (3C0/3C1).
@@ -336,14 +626,14 @@ pub struct Attribute {
 
 impl Default for Attribute {
     fn default() -> Self {
-        // Real VGA powers up with ATC palette register N = N, so a 4-bit plane
-        // index maps straight to DAC N (vgabios video_param_table actl_regs). The
-        // remaining registers reset to zero, as the BIOS mode-set programs them.
+        // Real VGA powers up with ATC palette register N = N and all four colour
+        // planes enabled, so a 4-bit plane index maps straight to DAC N (vgabios
+        // video_param_table actl_regs). The BIOS mode-set programs the rest.
         Self {
             palette: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
             mode_control: 0,
             overscan: 0,
-            plane_enable: 0,
+            plane_enable: 0x0F,
             pixel_pan: 0,
             color_select: 0,
             flip_flop_data: false,
@@ -362,8 +652,8 @@ pub const CGA_FB_SIZE: usize = 16 * 1024;
 /// scanlines (0, 2, 4, ...) live at 0x0000; odd scanlines (1, 3, 5, ...) at
 /// 0x2000. Each bank is 8000 bytes (100 lines x 80 bytes per line).
 pub const CGA_ODD_BANK: usize = 0x2000;
-/// Bytes per scanline in every CGA graphics mode: 80. In 320x200x4 that is 4
-/// pixels per byte; in 640x200x2 it is 8 pixels per byte.
+/// Standard CGA graphics bytes per scanline. Register-banged horizontal modes
+/// derive the live pitch from `hdisp_end` instead.
 pub const CGA_BYTES_PER_LINE: usize = 80;
 
 /// The CGA graphics submode the B800 framebuffer is decoded as.
@@ -377,8 +667,8 @@ pub enum CgaMode {
 
 /// CGA graphics state: the framebuffer plus the two control registers the CGA
 /// exposes (mode control 0x3D8 and color select 0x3D9). The mode-control
-/// register is stored for read-back; the displayed geometry comes from the
-/// `submode` the BIOS mode-set installed. Color decode reads `color_select`.
+/// register drives the CGA text/graphics personality and blanking; color decode
+/// reads `color_select`.
 #[derive(Debug, Clone)]
 pub struct Cga {
     pub fb: Vec<u8>,
@@ -386,8 +676,12 @@ pub struct Cga {
     /// INT 10h mode number (04h, 05h, or 06h). Mode 05h forces the alternate
     /// red/cyan/white palette regardless of the color-select palette bit.
     pub bios_mode: u8,
-    pub mode_control: u8, // port 0x3D8 (stored for read-back)
+    pub mode_control: u8, // port 0x3D8 output latch
     pub color_select: u8, // port 0x3D9
+    pub light_pen_triggered: bool,
+    pub light_pen_latch: u16,
+    pub light_pen_pixel_col: u16,
+    pub light_pen_pixel_row: u16,
 }
 
 impl Default for Cga {
@@ -398,6 +692,10 @@ impl Default for Cga {
             bios_mode: 0x04,
             mode_control: 0x00,
             color_select: 0x00,
+            light_pen_triggered: false,
+            light_pen_latch: 0,
+            light_pen_pixel_col: 0,
+            light_pen_pixel_row: 0,
         }
     }
 }
@@ -455,8 +753,7 @@ impl Cga {
     /// The foreground color for the 1 bits in 640x200x2: color-select bits 0-3,
     /// the same field as the background nibble. The background is always black.
     fn foreground_640x200(&self) -> u8 {
-        let fg = self.color_select & 0x0F;
-        if fg == 0 { CGA_WHITE } else { fg }
+        self.color_select & 0x0F
     }
 
     /// Decode the four DAC indices a 320x200x4 framebuffer byte holds, MSB-first:
@@ -486,6 +783,11 @@ pub struct VgaRaster {
     pub height: u32,
     pub pixels: Vec<u8>, // DAC indices; renderer resolves through the Dac
 }
+
+const VGA_DOT_CLOCK_25_HZ: u64 = 25_175_000;
+const VGA_DOT_CLOCK_28_HZ: u64 = 28_322_000;
+// Wired VGA colour-display switch sense, selected by Misc Output bits 3-2.
+const VGA_COLOR_SWITCH_SENSE: u8 = 0b0110;
 
 /// Total horizontal dots per scan line.
 pub fn htotal_dots(t: &CrtcTiming) -> u64 {
@@ -533,6 +835,7 @@ pub struct Vga {
     pub(crate) crtc_index: u8,
     // Legacy text/RAMDAC/cursor personality, folded in from VgaTextMode.
     pub(crate) text_memory: [u8; VGA_TEXT_MEMORY_SIZE],
+    pub(crate) text_columns: usize,
     // The writable font store: eight tables of 256 glyphs x 32 bytes (the max
     // 8x32). Table 0 seeds from the ROM 8x16 font; the rest seed as copies, so a
     // title that selects an unloaded table still renders. The Sequencer
@@ -543,18 +846,24 @@ pub struct Vga {
     pub(crate) cursor_start: u8,
     pub(crate) cursor_end: u8,
     pub(crate) mode: VideoMode,
+    pub(crate) planar_bios_mode: u8,
     pub(crate) misc_output: u8,
     pub(crate) pel_mask: u8,
     // Feature Control (read 3CA, write 3DA color / 3BA mono). Stored read-back
     // only; the FEAT0/FEAT1 lines drive nothing in this core.
     pub(crate) feature_control: u8,
-    // Video Subsystem Enable (3C3, bit 0). Stored read-back only; gating the
-    // legacy A0000/B8000 aperture lives in the machine bus, not this register.
+    // Video Subsystem Enable (3C3, bit 0). The register stores the latch; it
+    // gates VGA I/O and combines with Misc Output bit 1 for memory decode.
     pub(crate) video_subsystem_enable: u8,
-    // DAC State (read 3C7, bits 1-0): 0b11 after a write-index (3C8) write,
-    // 0b00 after a read-index (3C7) write. Tracks which DAC access mode was
+    // BIOS video-refresh control (INT 10h AX=1200h/1201h, BL=36h). This blanks
+    // display output/status but leaves guest-visible sequencer registers alone.
+    pub(crate) display_refresh_enabled: bool,
+    // DAC State (read 3C7, bits 1-0): 0b11 after a read-index (3C7) write,
+    // 0b00 after a write-index (3C8) write. Tracks which DAC access mode was
     // armed last so a program polling 3C7 sees the documented state.
     pub(crate) dac_state: u8,
+    pub(crate) default_palette_loading_enabled: bool,
+    pub(crate) grayscale_summing_enabled: bool,
     pub(crate) cga: Cga,
 }
 
@@ -584,6 +893,7 @@ impl Default for Vga {
             gc_index: 0,
             crtc_index: 0,
             text_memory,
+            text_columns: VGA_TEXT_COLUMNS,
             font: Self::seed_fonts(),
             dac: Dac::default(),
             cursor_offset: 0,
@@ -592,20 +902,27 @@ impl Default for Vga {
             cursor_start: 0x0E,
             cursor_end: 0x0F,
             mode: VideoMode::Text,
+            planar_bios_mode: 0,
             // Misc Output powers up as mode 03h (text/CGA clock, CRTC at 3Dx); the
-            // DAC pel mask defaults to all-pass. Both are stored and read back,
-            // not applied to the dot clock.
+            // DAC pel mask defaults to all-pass.
             misc_output: 0x67,
             pel_mask: 0xFF,
             feature_control: 0x00,
             // Video subsystem powers up enabled so the framebuffer aperture is live.
             video_subsystem_enable: 0x01,
-            // DAC powers up armed for writes (3C8 path), so the state reads 0b11.
-            dac_state: 0x03,
+            display_refresh_enabled: true,
+            // DAC powers up armed for writes (3C8 path), so the state reads 0b00.
+            dac_state: 0x00,
+            default_palette_loading_enabled: true,
+            grayscale_summing_enabled: false,
             cga: Cga::default(),
         };
         // Size the work buffer for the boot text mode so the raster is published
         // from the first frame (finalize_frame only publishes a non-empty work).
+        vga.seed_vgabios_crtc_readback(0x03);
+        vga.seed_vgabios_seq_readback(0x03);
+        vga.seed_vgabios_gc_readback(0x03);
+        vga.seed_vgabios_attr_readback(0x03);
         vga.resize_work();
         vga
     }
@@ -614,6 +931,94 @@ impl Default for Vga {
 impl Vga {
     pub fn frame_dots(&self) -> u64 {
         self.crtc.frame_dots()
+    }
+
+    pub fn dot_clock_hz(&self) -> u64 {
+        match (self.misc_output >> 2) & 0x03 {
+            0x01 => VGA_DOT_CLOCK_28_HZ,
+            // ponytail: external/reserved VGA clocks fall back to the stock 25 MHz
+            // clock until VEGA exposes a programmable clock generator.
+            _ => VGA_DOT_CLOCK_25_HZ,
+        }
+    }
+
+    fn set_misc_mode_bits(&mut self, clock_select: u8, color_emulation: bool, vertical_size: u8) {
+        self.misc_output = (self.misc_output & !0xCF)
+            | 0x02
+            | ((vertical_size & 0x03) << 6)
+            | ((clock_select & 0x03) << 2)
+            | u8::from(color_emulation);
+    }
+
+    fn seed_vgabios_crtc_readback(&mut self, mode: u8) {
+        if let Some(regs) = vgabios_crtc_regs(mode) {
+            self.crtc_regs = CrtcRegs::from_vgabios_crtc(regs);
+            self.crtc.preset_row_scan = regs[0x08];
+        }
+    }
+
+    fn seed_vgabios_seq_readback(&mut self, mode: u8) {
+        if let Some([clocking_mode, map_mask, char_map_select, memory_mode]) =
+            vgabios_seq_regs(mode)
+        {
+            self.seq.reset = 0x03;
+            self.seq.clocking_mode = clocking_mode;
+            self.seq.map_mask = map_mask;
+            self.seq.char_map_select = char_map_select;
+            self.seq.memory_mode = memory_mode;
+        }
+    }
+
+    fn seed_vgabios_gc_readback(&mut self, mode: u8) {
+        if let Some(regs) = vgabios_gc_regs(mode) {
+            for (index, value) in regs.into_iter().enumerate() {
+                self.write_gc(index as u8, value);
+            }
+        }
+    }
+
+    fn seed_vgabios_attr_readback(&mut self, mode: u8) {
+        if let Some(regs) = vgabios_attr_regs(mode) {
+            if self.default_palette_loading_enabled {
+                self.attr.palette.copy_from_slice(&regs[..16]);
+                self.attr.overscan = regs[17];
+            }
+            self.attr.mode_control = regs[16];
+            self.attr.plane_enable = regs[18];
+            self.attr.pixel_pan = regs[19] & 0x0F;
+            self.attr.color_select = 0;
+            self.attr.pas = true;
+        }
+    }
+
+    fn color_emulation(&self) -> bool {
+        self.misc_output & 0x01 != 0
+    }
+
+    fn crtc_index_port_selected(&self, port: u16) -> bool {
+        matches!(
+            (self.color_emulation(), port),
+            (true, 0x3D4) | (false, 0x3B4)
+        )
+    }
+
+    fn crtc_data_port_selected(&self, port: u16) -> bool {
+        matches!(
+            (self.color_emulation(), port),
+            (true, 0x3D5) | (false, 0x3B5)
+        )
+    }
+
+    fn status1_port_selected(&self, port: u16) -> bool {
+        matches!(
+            (self.color_emulation(), port),
+            (true, 0x3DA) | (false, 0x3BA)
+        )
+    }
+
+    fn switch_sense_bit(&self) -> bool {
+        let selected = (self.misc_output >> 2) & 0x03;
+        VGA_COLOR_SWITCH_SENSE & (1u8 << selected) != 0
     }
 
     pub fn beam_dots(&self) -> u64 {
@@ -631,10 +1036,38 @@ impl Vga {
         self.crtc.start_address
     }
 
+    pub fn text_memory_base(&self) -> u32 {
+        if self.mode == VideoMode::Text && !self.color_emulation() {
+            VGA_MONO_TEXT_BASE
+        } else {
+            VGA_TEXT_BASE
+        }
+    }
+
+    pub fn video_subsystem_enabled(&self) -> bool {
+        self.video_subsystem_enable & 0x01 != 0
+    }
+
+    pub fn video_memory_enabled(&self) -> bool {
+        self.video_subsystem_enabled() && self.misc_output & 0x02 != 0
+    }
+
+    pub fn display_refresh_enabled(&self) -> bool {
+        self.display_refresh_enabled
+    }
+
+    pub fn set_display_refresh_enabled(&mut self, enabled: bool) {
+        self.display_refresh_enabled = enabled;
+    }
+
     /// The start-address change buffered by the last `set_start_address`, applied
     /// at the next vretrace (finalize_frame). `None` when no change is pending.
     pub fn pending_start_address(&self) -> Option<u32> {
         self.pending_start
+    }
+
+    fn crtc_start_register(&self) -> u32 {
+        self.pending_start.unwrap_or(self.crtc.start_address)
     }
 
     /// Seed the eight font tables from the ROM 8x16 font: table 0 holds the
@@ -658,6 +1091,16 @@ impl Vga {
     /// 256-glyph text. (Abrash, Graphics Programming Black Book ch.24.)
     pub fn active_font_table(&self) -> usize {
         char_map_a_decode(self.seq.char_map_select)
+    }
+
+    /// One glyph row for BIOS graphics-mode text. CGA has a fixed 8x8 character
+    /// ROM; VGA-family modes use the active writable font table.
+    pub fn active_font_glyph_row(&self, ch: u8, row: usize) -> u8 {
+        if self.is_cga_personality() {
+            crate::font::VGAFONT_8X8[ch as usize * 8 + row.min(7)]
+        } else {
+            self.font[self.active_font_table()][ch as usize * 32 + row.min(31)]
+        }
     }
 
     /// The second font table index, decoded from the map-B field of the Sequencer
@@ -748,26 +1191,53 @@ impl Vga {
     /// so a prior program's custom palette (the BIOS, say) does not leak into the
     /// program that sets the next mode.
     fn reset_palette_defaults(&mut self) {
-        self.dac = Dac::default();
+        let dac = self.dac.clone();
+        let attr_palette = self.attr.palette;
+        let overscan = self.attr.overscan;
+        let color_select = self.attr.color_select;
+        let pel_mask = self.pel_mask;
         self.attr = Attribute::default();
-        self.pel_mask = 0xFF;
+        if self.default_palette_loading_enabled {
+            self.dac = Dac::default();
+            self.pel_mask = 0xFF;
+        } else {
+            self.dac = dac;
+            self.attr.palette = attr_palette;
+            self.attr.overscan = overscan;
+            self.attr.color_select = color_select;
+            self.pel_mask = pel_mask;
+        }
     }
 
     /// Install a planar mode's timing and reset the beam to the top of frame.
-    fn set_planar_mode(&mut self, timing: CrtcTiming) {
+    fn set_planar_mode(&mut self, mode: u8, timing: CrtcTiming) {
         self.crtc = timing;
+        self.crtc_regs = CrtcRegs::from_timing(timing);
+        self.seed_vgabios_crtc_readback(mode);
+        self.seed_vgabios_seq_readback(mode);
+        let vertical_size = match mode {
+            0x0F | 0x10 => 0x02, // 350-line family
+            0x11 | 0x12 => 0x03, // 480-line family
+            _ => 0x01,           // 400-line / double-scanned 200-line family
+        };
+        self.set_misc_mode_bits(0, mode != 0x0F, vertical_size);
+        self.gc = GfxController::default();
+        self.seed_vgabios_gc_readback(mode);
+        self.latches = [0; VGA_PLANES];
         self.beam = 0;
         self.last_line = 0;
         self.mode = VideoMode::Planar;
+        self.planar_bios_mode = mode;
         self.presented = None; // drop any stale frame from a prior mode
         self.reset_palette_defaults();
+        self.seed_vgabios_attr_readback(mode);
         self.resize_work();
     }
 
     /// Switch to mode 0Dh. Kept as an alias so existing callers do not churn;
     /// new call sites can use `set_mode(0x0D)`.
     pub fn set_mode_0dh(&mut self) {
-        self.set_planar_mode(CrtcTiming::mode_0dh());
+        self.set_planar_mode(0x0D, CrtcTiming::mode_0dh());
     }
 
     /// Select a planar mode by its INT 10h number. Returns false for a number this
@@ -782,7 +1252,7 @@ impl Vga {
             0x12 => CrtcTiming::mode_12h(),
             _ => return false,
         };
-        self.set_planar_mode(timing);
+        self.set_planar_mode(mode, timing);
         true
     }
 
@@ -822,28 +1292,62 @@ impl Vga {
         drawn
     }
 
+    fn text_aperture_size(&self) -> usize {
+        if self.is_cga_text_mode() {
+            CGA_FB_SIZE
+        } else {
+            VGA_TEXT_MEMORY_SIZE
+        }
+    }
+
+    fn text_byte(&self, offset: usize) -> u8 {
+        if self.is_cga_text_mode() {
+            return self.cga_read(offset);
+        }
+        self.text_memory[offset % self.text_aperture_size()]
+    }
+
     /// Byte offset of the char/attr pair for a displayed cell at `(char_row, col)`
-    /// relative to the start-address origin `start_cells` (word/cell units), wrapped
-    /// at the 32 KB text aperture. Mode 03h is word mode, so the cell index is
-    /// `start_cells + char_row*offset + col` and the byte pair sits at that index
-    /// times two. Shared by the pixel scanout (`render_text_row`) and the headless
-    /// cell view (`frame`) so the two always agree on the origin.
+    /// relative to the start-address origin `start_cells` (word/cell units),
+    /// wrapped at the live text aperture. Mode 03h is word mode, so the cell
+    /// index is `start_cells + char_row*offset + col` and the byte pair sits at
+    /// that index times two. Shared by pixel scanout and the headless cell view.
     fn text_cell_base(&self, start_cells: usize, char_row: usize, col: usize) -> usize {
-        ((start_cells + char_row * self.crtc.offset as usize + col) * 2) % VGA_TEXT_MEMORY_SIZE
+        ((start_cells + char_row * self.crtc.offset as usize + col) * 2) % self.text_aperture_size()
     }
 
     /// Display-address origin for one scanline, honoring the CRTC Line Compare
     /// split (Abrash, Graphics Programming Black Book ch.30). Returns
     /// `(start_base, first_line)`: above the split the start address scrolls the
-    /// region; at and below `line_compare + 1` the address counter reloads to 0
-    /// and row counting restarts there. The comparison is in scan-counter units
-    /// and is not divided by the double-scan factor, so `first_line` is already
-    /// in counter units and is divided by `scan_factor` by the caller.
+    /// region; at and below the split threshold the address counter reloads to 0
+    /// and row counting restarts there. VGA starts the split at `line_compare + 1`;
+    /// EGA-era planar BIOS modes start it two scanlines lower. The comparison is
+    /// in scan-counter units and is not divided by the double-scan factor.
     fn split_origin(&self, counter_line: u32) -> (u32, u32) {
-        if counter_line > self.crtc.line_compare {
-            (0, self.crtc.line_compare + 1)
+        let first_line = self.split_first_line();
+        if counter_line >= first_line {
+            (0, first_line)
         } else {
             (self.crtc.start_address, 0)
+        }
+    }
+
+    fn split_first_line(&self) -> u32 {
+        self.crtc
+            .line_compare
+            .saturating_add(1)
+            .saturating_add(self.ega_split_delay())
+    }
+
+    fn below_split(&self, counter_line: u32) -> bool {
+        counter_line >= self.split_first_line()
+    }
+
+    fn ega_split_delay(&self) -> u32 {
+        if self.mode == VideoMode::Planar && matches!(self.planar_bios_mode, 0x0D..=0x10) {
+            2
+        } else {
+            0
         }
     }
 
@@ -860,6 +1364,15 @@ impl Vga {
         }
     }
 
+    fn text_pel_pan(&self, below_split: bool, char_width: usize) -> usize {
+        let pan = self.pel_pan(below_split);
+        if char_width == 9 && pan == 8 {
+            0
+        } else {
+            pan.min(char_width - 1)
+        }
+    }
+
     /// Whether the horizontal pan (AC 13h pel-pan and CRTC 08h byte pan) is forced
     /// to 0 below the CRTC Line Compare split: only when AC Mode Control 10h bit 5
     /// is set (FreeVGA crtcreg.htm 18h). Shared by `pel_pan` and the byte-pan
@@ -867,6 +1380,26 @@ impl Vga {
     /// preset-row-scan reset below the split is unconditional and stays separate.
     fn pan_resets_below_split(&self, below_split: bool) -> bool {
         below_split && (self.attr.mode_control & 0x20 != 0)
+    }
+
+    fn preset_row_scan(&self, below_split: bool) -> u32 {
+        if below_split {
+            0
+        } else {
+            u32::from(self.crtc.preset_row_scan & 0x1F)
+        }
+    }
+
+    fn byte_pan(&self, below_split: bool) -> u32 {
+        if self.pan_resets_below_split(below_split) {
+            0
+        } else {
+            u32::from((self.crtc.preset_row_scan >> 5) & 0x03)
+        }
+    }
+
+    fn sequencer_outputs_enabled(&self) -> bool {
+        self.seq.reset & 0x03 == 0x03 && self.seq.clocking_mode & 0x20 == 0
     }
 
     /// Fold the Attribute Color Select register (14h) into a 6-bit attribute
@@ -892,38 +1425,113 @@ impl Vga {
         index & self.pel_mask
     }
 
+    fn attr_lookup(&self, index: u8) -> u8 {
+        self.attr.palette[(index & self.attr.plane_enable & 0x0F) as usize] & 0x3F
+    }
+
+    fn planar_logical_attr_index(&self, plane_bits: u8) -> u8 {
+        match self.planar_bios_mode {
+            // EGA/VGA mode 0Fh uses C0 as the video plane and C2 as the
+            // intensity/blink plane: 00,01,10,11 -> attributes 0,3,C,F.
+            0x0F => match plane_bits & 0x05 {
+                0x00 => 0x00,
+                0x01 => 0x03,
+                0x04 => 0x0C,
+                _ => 0x0F,
+            },
+            // VGA mode 11h is mode-6 style one-bit graphics in map 0.
+            0x11 => {
+                if plane_bits & 0x01 != 0 {
+                    0x0F
+                } else {
+                    0x00
+                }
+            }
+            _ => plane_bits & 0x0F,
+        }
+    }
+
+    fn planar_scanout_attr_index(&self, plane_bits: u8) -> u8 {
+        let index = self.planar_logical_attr_index(plane_bits);
+        if self.planar_bios_mode == 0x0F
+            && index == 0x0C
+            && self.attr.mode_control & 0x08 != 0
+            && self.blink_hide_phase()
+        {
+            0
+        } else {
+            index
+        }
+    }
+
+    fn planar_storage_bits(&self, color: u8) -> u8 {
+        match self.planar_bios_mode {
+            0x0F => u8::from(color & 0x01 != 0) | (u8::from(color & 0x04 != 0) << 2),
+            0x11 => u8::from(color & 0x01 != 0),
+            _ => color & 0x0F,
+        }
+    }
+
+    fn video_status_mux_bits(&self) -> u8 {
+        if self.is_cga_personality() || !beam_display_enable(&self.crtc, self.beam) {
+            return 0;
+        }
+        let line = beam_line(&self.crtc, self.beam);
+        let dot = beam_dot(&self.crtc, self.beam) as usize;
+        let color = match self.mode {
+            VideoMode::Mode13h | VideoMode::ModeX => self.render_256color_row(line)[dot],
+            VideoMode::Text => self.render_text_row(line)[dot],
+            VideoMode::Planar => self.render_active_row(line)[dot],
+            VideoMode::Cga => 0,
+        };
+        let pair = match (self.attr.plane_enable >> 4) & 0x03 {
+            0x00 => (((color >> 2) & 1) << 1) | (color & 1),
+            0x01 => (color >> 4) & 0x03,
+            0x02 => (((color >> 3) & 1) << 1) | ((color >> 1) & 1),
+            _ => (color >> 6) & 0x03,
+        };
+        pair << 4
+    }
+
     /// Assemble one active scanline into `hdisp_end` DAC indices, applying pel-pan
     /// and the attribute palette. `counter_line` is the scanline in scan-counter
     /// units; double-scan maps it to source row `counter_line / scan_factor`, so a
     /// doubled mode holds each VRAM row for two scanlines.
     pub fn render_active_row(&self, counter_line: u32) -> Vec<u8> {
         let width = self.crtc.hdisp_end as usize;
-        // Line Compare split (CRTC 18h + 07h.4 + 09h.6). Abrash, Graphics Programming
-        // Black Book ch.30: the scanline matching line compare is the last line above
-        // the split; the split starts on the following line and reloads the display
-        // address counter to 0. The comparison is in scan-counter units, the same units
-        // the beam and the other vertical timing registers use, so it is not divided by
-        // the double-scan factor.
-        let below_split = counter_line > self.crtc.line_compare;
+        // Line Compare split (CRTC 18h + 07h.4 + 09h.6). The comparison is in
+        // scan-counter units, so it is not divided by the double-scan factor.
+        let below_split = self.below_split(counter_line);
         let (start, first_line) = self.split_origin(counter_line);
         let pan = self.pel_pan(below_split);
-        let source_row = (counter_line - first_line) / self.scan_factor();
+        let row_scan = counter_line - first_line + self.preset_row_scan(below_split);
+        let source_row = row_scan / self.scan_factor();
         // The per-scanline counter increment is offset*2 in every addressing mode; the
         // byte/word/doubleword transform lives in display_offset, not the stride.
-        let row_base = start + source_row * self.crtc.offset * 2;
+        let row_base = start + source_row * self.crtc.offset * 2 + self.byte_pan(below_split);
         let mut row = vec![0u8; width];
         for (x, slot) in row.iter_mut().enumerate() {
             let px = x + pan;
             let byte = px / 8;
             let bit = 7 - (px % 8);
-            let ma = row_base + byte as u32;
-            let off = display_offset(self.crtc.mode_control, self.crtc.underline_loc, ma);
+            let ma = display_counter(
+                self.crtc.mode_control,
+                self.crtc.underline_loc,
+                row_base,
+                byte as u32,
+            );
+            let off = display_offset_row(
+                self.crtc.mode_control,
+                self.crtc.underline_loc,
+                ma,
+                row_scan,
+            );
             let mut index = 0u8;
             for plane in 0..VGA_PLANES {
                 let b = self.vram[plane * VGA_PLANE_SIZE + off];
                 index |= ((b >> bit) & 1) << plane;
             }
-            *slot = self.dac_index(self.attr.palette[index as usize] & 0x3F);
+            *slot = self.dac_index(self.attr_lookup(self.planar_scanout_attr_index(index)));
         }
         row
     }
@@ -947,13 +1555,14 @@ impl Vga {
     /// is set.
     pub fn render_256color_row(&self, counter_line: u32) -> Vec<u8> {
         let width = self.crtc.hdisp_end as usize;
-        let below_split = counter_line > self.crtc.line_compare;
+        let below_split = self.below_split(counter_line);
         let (start, first_line) = self.split_origin(counter_line);
         // The split branch returns first_line = line_compare + 1 and is taken only when
         // counter_line > line_compare, so counter_line >= first_line holds: the
         // subtraction never underflows.
-        let source_row = (counter_line - first_line) / self.scan_factor();
-        let row_base = start + source_row * self.crtc.offset * 2;
+        let row_scan = counter_line - first_line + self.preset_row_scan(below_split);
+        let source_row = row_scan / self.scan_factor();
+        let row_base = start + source_row * self.crtc.offset * 2 + self.byte_pan(below_split);
         // Mode-X pel-pan: one plane per pel, so the fine range is 0-3 (a pan of 4
         // equals a start-address bump). The below-split forcing is shared with the
         // 16-color path through pel_pan.
@@ -962,27 +1571,41 @@ impl Vga {
         for (x, slot) in row.iter_mut().enumerate() {
             let x_eff = x as u32 + pan;
             let plane = (x_eff & 3) as usize;
-            let ma = row_base + (x_eff >> 2);
-            let off = display_offset(self.crtc.mode_control, self.crtc.underline_loc, ma);
+            let ma = display_counter(
+                self.crtc.mode_control,
+                self.crtc.underline_loc,
+                row_base,
+                x_eff >> 2,
+            );
+            let off = display_offset_row(
+                self.crtc.mode_control,
+                self.crtc.underline_loc,
+                ma,
+                row_scan,
+            );
             *slot = self.vram[plane * VGA_PLANE_SIZE + off] & self.pel_mask;
         }
         row
     }
 
     /// Assemble one text-mode scanline (counter line) into `hdisp_end` DAC
-    /// indices, sharing the raster engine with the graphics paths. Mode 03h lays
-    /// out 80 character columns of `max_scan + 1` scanlines each (16 for 720x400);
-    /// the CRTC Line Compare split reuses `split_origin`, with the character-row
-    /// count restarting below the split. Each cell's foreground and background
-    /// nibbles map through the 16-entry Attribute palette to a DAC index, then the
-    /// pel mask (the same transform the 16-color path applies). Blink (Attribute
-    /// Mode Control 10h bit 3) collapses the foreground to the background on its
-    /// hide phase; with bit 3 clear, attribute bit 7 is background intensity
-    /// instead (16 backgrounds, no blink). In 9-dot mode the 9th pixel column
+    /// indices, sharing the raster engine with the graphics paths. Text mode lays
+    /// out the active column count in `max_scan + 1` scanlines per cell; the
+    /// CRTC Line Compare split reuses `split_origin`, with the character-row
+    /// count restarting below the split. VGA text maps each cell's foreground and
+    /// background nibbles through the Attribute palette and pel mask; CGA text
+    /// decodes those nibbles directly as RGBI color indexes. Blink (Attribute
+    /// Mode Control 10h bit 3, or CGA mode-control 3D8h bit 5) collapses the
+    /// foreground to the background on its hide phase; with blink clear, attribute
+    /// bit 7 is background intensity instead. In 9-dot mode the 9th pixel column
     /// replicates the 8th for the box-drawing glyphs 0xC0-0xDF (a solid line join)
     /// and is the background otherwise (Abrash, Graphics Programming Black Book).
     pub fn render_text_row(&self, counter_line: u32) -> Vec<u8> {
         let width = self.crtc.hdisp_end as usize;
+        let cga_text = self.is_cga_text_mode();
+        if cga_text && self.cga.mode_control & CGA_MODE_VIDEO_ENABLE == 0 {
+            return vec![CGA_BLACK; width];
+        }
         let rows_per_char = self.crtc.max_scan + 1;
         // The display origin scrolls with the CRTC Start Address (0C/0Dh). Above
         // the line-compare split the origin is `start_address`; at and below the
@@ -993,7 +1616,7 @@ impl Vga {
         // col` and reads the char/attr byte pair at that cell index * 2. The byte
         // read wraps at the 32 KB text aperture (FreeVGA 0Dh wrap behavior). See
         // A1 in dev_docs/reference/vga/text-mode-gaps-confirm-notes.md.
-        let below_split = counter_line > self.crtc.line_compare;
+        let below_split = self.below_split(counter_line);
         let (start, first_line) = self.split_origin(counter_line);
         // split_origin returns first_line <= counter_line in both branches, so the
         // subtraction never underflows.
@@ -1004,23 +1627,16 @@ impl Vga {
         // the preset always resets to 0; the byte pan resets to 0 below the split
         // only when AC 10h bit 5 is set (FreeVGA 18h). See A3 in
         // dev_docs/reference/vga/text-mode-gaps-confirm-notes.md.
-        let reg = self.crtc.preset_row_scan;
-        let preset_row = if below_split {
-            0
-        } else {
-            u32::from(reg & 0x1F)
-        };
-        let byte_pan = if self.pan_resets_below_split(below_split) {
-            0
-        } else {
-            ((reg >> 5) & 0x03) as usize
-        };
+        let preset_row = self.preset_row_scan(below_split);
+        let byte_pan = self.byte_pan(below_split) as usize;
         // Effective scanline = rel + preset_row scrolls the display up; char_row
         // advances when the addition wraps past rows_per_char.
         let eff = rel + preset_row;
         let char_row = (eff / rows_per_char) as usize;
         let font_line = (eff % rows_per_char) as usize;
-        let char_width = if self.seq.clocking_mode & 0x01 != 0 {
+        let char_width = if cga_text {
+            8
+        } else if self.seq.clocking_mode & 0x01 != 0 {
             8
         } else {
             9
@@ -1033,42 +1649,62 @@ impl Vga {
         // the shared pel_pan so AC 10h bit 5 forces it to 0 below the line-compare
         // split (FreeVGA crtcreg.htm 18h). See A2 in
         // dev_docs/reference/vga/text-mode-gaps-confirm-notes.md.
-        let pan = self.pel_pan(below_split).min(char_width - 1);
-        let blink_enabled = self.attr.mode_control & 0x08 != 0;
+        let pan = if cga_text {
+            0
+        } else {
+            self.text_pel_pan(below_split, char_width)
+        };
+        let blink_enabled = if cga_text {
+            self.cga.mode_control & CGA_MODE_BLINK != 0
+        } else {
+            self.attr.mode_control & 0x08 != 0
+        };
         // The shared blink hide phase: 16 frames on, 16 off, driven by the frame
         // (vertical-retrace) counter. Attribute blink and the cursor blink both
         // read this single source. See A6 in
         // dev_docs/reference/vga/text-mode-gaps-confirm-notes.md.
         let blink_hide_phase = self.blink_hide_phase();
         let start_cells = start as usize;
-        // The active font tables and the 512-glyph flag depend only on the
-        // Sequencer Character Map Select, which is constant for the whole
-        // scanline, so decode them once outside the per-cell loop.
+        // VGA text uses Sequencer font maps; CGA text uses the fixed 8x8
+        // character ROM, so attribute bit 3 stays foreground intensity there.
         let table_a = self.active_font_table();
         let table_b = self.active_font_table_b();
-        let dual_font = table_a != table_b;
-        // Cursor Skew (CRTC 0Bh bits 6-5) delays the onset by that many character
-        // clocks; the effective cursor cell is cursor_offset + skew. The cursor
-        // match target is loop-invariant, so compute it once per scanline.
-        let skew = (self.cursor_end >> 5) & 0x03;
-        let cursor_byte =
-            ((self.cursor_offset as usize + skew as usize) * 2) % VGA_TEXT_MEMORY_SIZE;
-        let cursor_disabled = self.cursor_start & 0x20 != 0;
+        let dual_font = !cga_text && table_a != table_b;
+        // VGA uses 0Ah bit 5 as cursor disable and 0Bh bits 5-6 as cursor skew.
+        // CGA's 6845 instead uses 0Ah bits 5-6 as cursor mode; R11 is 5-bit.
+        let (skew, cursor_disabled, cursor_hidden) = if cga_text {
+            let mode = (self.cursor_start >> 5) & 0x03;
+            let hidden = match mode {
+                0x00 => false,
+                0x01 => false,
+                0x02 => blink_hide_phase,
+                _ => (self.frames / 32) % 2 == 1,
+            };
+            (0, mode == 0x01, hidden)
+        } else {
+            (
+                (self.cursor_end >> 5) & 0x03,
+                self.cursor_start & 0x20 != 0,
+                blink_hide_phase,
+            )
+        };
+        let text_aperture_size = self.text_aperture_size();
+        let cursor_byte = ((self.cursor_offset as usize + skew as usize) * 2) % text_aperture_size;
         let start_line = (self.cursor_start & 0x1F) as usize;
         let end_line = (self.cursor_end & 0x1F) as usize;
         let mut row = vec![0u8; width];
         // Render one extra cell column so a non-zero pan's right edge pulls in the
         // next cell's leading pixels; the left edge clips cell 0's scrolled-off
         // leading pixels.
-        for dc in 0..=VGA_TEXT_COLUMNS {
+        for dc in 0..=self.text_columns {
             // Absolute cell index (char/attr pair) scrolled by the start address;
             // the CRTC byte pan (08h bits 6-5) adds a byte offset to the origin,
             // so a pan of 2 shifts one whole cell and a pan of 1 lands on the
             // attribute byte (the real-hardware half-cell scramble).
             let base =
-                (self.text_cell_base(start_cells, char_row, dc) + byte_pan) % VGA_TEXT_MEMORY_SIZE;
-            let char_byte = self.text_memory.get(base).copied().unwrap_or(b' ');
-            let attr = self.text_memory.get(base + 1).copied().unwrap_or(0x07);
+                (self.text_cell_base(start_cells, char_row, dc) + byte_pan) % text_aperture_size;
+            let char_byte = self.text_byte(base);
+            let attr = self.text_byte(base + 1);
             let blink_attr = attr & 0x80 != 0;
             // 512-glyph mode: when the Sequencer selects two distinct font tables
             // (map A != map B), attribute bit 3 becomes the per-cell font selector
@@ -1090,8 +1726,16 @@ impl Vga {
             } else {
                 ((attr >> 4) & 0x0F) as usize
             };
-            let mut fg = self.dac_index(self.attr.palette[fg_index] & 0x3F);
-            let mut bg = self.dac_index(self.attr.palette[bg_index] & 0x3F);
+            let mut fg = if cga_text {
+                fg_index as u8
+            } else {
+                self.dac_index(self.attr_lookup(fg_index as u8))
+            };
+            let mut bg = if cga_text {
+                bg_index as u8
+            } else {
+                self.dac_index(self.attr_lookup(bg_index as u8))
+            };
             let hide_fg = blink_enabled && blink_attr && blink_hide_phase;
             // Hardware text cursor (CRTC 0A/0B): on the cursor cell, swap fg/bg
             // on the active scanlines for reverse video. 0A bit 5 disables the
@@ -1113,14 +1757,16 @@ impl Vga {
             } else {
                 font_line >= start_line || font_line <= end_line
             };
-            if cursor_here && !cursor_disabled && in_range && !blink_hide_phase {
+            if cursor_here && !cursor_disabled && in_range && !cursor_hidden {
                 std::mem::swap(&mut fg, &mut bg);
             }
-            // The active font table (Sequencer index 3); each glyph occupies a
-            // 32-byte slot, bit 7 of a row being the leftmost pixel. font_line
-            // beyond the slot is clamped (a taller char cell on a reprogrammed
-            // max_scan reads the last row of the slot).
-            let glyph_row = self.font[font_table][char_byte as usize * 32 + font_line.min(31)];
+            // VGA reads the active writable font table. CGA has a fixed 8x8 ROM
+            // character generator, not VGA plane-2 font RAM.
+            let glyph_row = if cga_text {
+                crate::font::VGAFONT_8X8[char_byte as usize * 8 + font_line.min(7)]
+            } else {
+                self.font[font_table][char_byte as usize * 32 + font_line.min(31)]
+            };
             let extend_ninth = (0xC0..=0xDF).contains(&char_byte);
             // Place the cell shifted left by `pan` pels. Use signed math so cell 0's
             // leading `pan` pels (which scroll off the left edge) clip to negative
@@ -1145,7 +1791,19 @@ impl Vga {
 
     fn region_color(&self, scan_line: u32) -> u8 {
         // scan_line in counter units; caller guarantees scan_line >= vdisp_end.
+        if self.is_cga_personality() && self.cga.mode_control & CGA_MODE_VIDEO_ENABLE == 0 {
+            return CGA_BLACK;
+        }
         if scan_line < self.crtc.vblank_start || scan_line >= self.crtc.vblank_end {
+            if self.is_cga_text_mode() {
+                return self.cga.background_index();
+            }
+            if self.mode == VideoMode::Cga {
+                return match self.cga.submode {
+                    CgaMode::Graphics320x200 => self.cga.background_index(),
+                    CgaMode::Graphics640x200 => CGA_BLACK,
+                };
+            }
             self.attr.overscan & 0x3F // border = overscan color
         } else {
             0 // vertical blank = black
@@ -1158,22 +1816,20 @@ impl Vga {
     /// space the beam counts in.
     fn render_scanline(&mut self, counter_line: u32) {
         let width = self.raster_width() as usize;
-        let pixels = if counter_line < self.crtc.vdisp_end {
-            // Limit: the Attribute Palette Address Source (3C0 index bit 5) is decoded
-            // and read back (attr.pas), but the documented "display blanks to black while
-            // bit 5 is clear during palette programming" effect is not enforced at render
-            // time. It conflicts with the raster suite's use of ATC palette writes for
-            // mid-frame effects (real code re-enables bit 5 or uses the DAC); revisit if a
-            // title needs the blank.
-            match self.mode {
-                VideoMode::Mode13h | VideoMode::ModeX => self.render_256color_row(counter_line),
-                VideoMode::Text => self.render_text_row(counter_line),
-                VideoMode::Cga => self.render_cga_row(counter_line),
-                _ => self.render_active_row(counter_line),
-            }
-        } else {
-            vec![self.region_color(counter_line); width]
-        };
+        let pixels =
+            if !self.display_refresh_enabled || !self.attr.pas || !self.sequencer_outputs_enabled()
+            {
+                vec![0u8; width]
+            } else if counter_line < self.crtc.vdisp_end {
+                match self.mode {
+                    VideoMode::Mode13h | VideoMode::ModeX => self.render_256color_row(counter_line),
+                    VideoMode::Text => self.render_text_row(counter_line),
+                    VideoMode::Cga => self.render_cga_row(counter_line),
+                    _ => self.render_active_row(counter_line),
+                }
+            } else {
+                vec![self.region_color(counter_line); width]
+            };
         let dst = counter_line as usize * width;
         if dst + width <= self.work.len() {
             self.work[dst..dst + width].copy_from_slice(&pixels);
@@ -1271,8 +1927,48 @@ impl Vga {
         }
     }
 
+    fn odd_even_offset(offset: usize) -> (usize, usize) {
+        (offset >> 1, offset & 1)
+    }
+
+    fn cpu_write_odd_even(&mut self, offset: usize, data: u8) {
+        let (plane_offset, odd) = Self::odd_even_offset(offset);
+        if plane_offset >= VGA_PLANE_SIZE {
+            return;
+        }
+        let mut planes = self.plane_slice_mut(plane_offset);
+        let old = planes;
+        let gc = self.gc;
+        let latches = self.latches;
+        write_planes(&mut planes, data, &gc, &latches);
+        for plane in 0..VGA_PLANES {
+            if plane & 1 == odd && (self.seq.map_mask >> plane) & 1 != 0 {
+                self.vram[plane * VGA_PLANE_SIZE + plane_offset] = planes[plane][0];
+            } else {
+                self.vram[plane * VGA_PLANE_SIZE + plane_offset] = old[plane][0];
+            }
+        }
+    }
+
+    fn cpu_read_odd_even(&mut self, offset: usize) -> u8 {
+        let (plane_offset, odd) = Self::odd_even_offset(offset);
+        if plane_offset >= VGA_PLANE_SIZE {
+            return 0xFF;
+        }
+        let planes = self.plane_slice_mut(plane_offset);
+        for plane in 0..VGA_PLANES {
+            self.latches[plane] = planes[plane][0];
+        }
+        let plane = (usize::from(self.gc.read_map & 0x02)) | odd;
+        planes[plane][0]
+    }
+
     pub fn cpu_write(&mut self, offset: usize, data: u8) {
         if offset >= VGA_PLANE_SIZE {
+            return;
+        }
+        if self.seq.memory_mode & 0x04 == 0 {
+            self.cpu_write_odd_even(offset, data);
             return;
         }
         let mut planes = self.plane_slice_mut(offset);
@@ -1286,9 +1982,80 @@ impl Vga {
         if offset >= VGA_PLANE_SIZE {
             return 0xFF;
         }
+        if self.gc.mode_odd_even() && self.gc.aperture().chain_odd_even {
+            return self.cpu_read_odd_even(offset);
+        }
         let planes = self.plane_slice_mut(offset);
         let gc = self.gc;
         read_planes(&planes, &gc, &mut self.latches)
+    }
+
+    fn planar_pixel_offset_at(&self, start: u32, x: u16, y: u16) -> Option<(usize, u8)> {
+        if self.mode != VideoMode::Planar {
+            return None;
+        }
+        let x = u32::from(x);
+        let y = u32::from(y);
+        let source_height = self.crtc.vdisp_end / self.scan_factor();
+        if x >= self.crtc.hdisp_end || y >= source_height {
+            return None;
+        }
+        let row_base = start + y * self.crtc.offset * 2;
+        let ma = display_counter(
+            self.crtc.mode_control,
+            self.crtc.underline_loc,
+            row_base,
+            x / 8,
+        );
+        let offset = display_offset(self.crtc.mode_control, self.crtc.underline_loc, ma);
+        if offset as usize >= VGA_PLANE_SIZE {
+            return None;
+        }
+        Some((offset, (7 - (x & 7)) as u8))
+    }
+
+    pub fn planar_write_pixel(&mut self, x: u16, y: u16, color: u8, xor: bool) -> bool {
+        self.planar_write_pixel_at(0, x, y, color, xor)
+    }
+
+    pub fn planar_write_pixel_at(
+        &mut self,
+        start: u32,
+        x: u16,
+        y: u16,
+        color: u8,
+        xor: bool,
+    ) -> bool {
+        let Some((offset, bit)) = self.planar_pixel_offset_at(start, x, y) else {
+            return false;
+        };
+        let old = self.planar_read_pixel_at(start, x, y);
+        let color = self.planar_storage_bits(if xor { old ^ color } else { color });
+        let mask = 1 << bit;
+        for plane in 0..VGA_PLANES {
+            let byte = &mut self.vram[plane * VGA_PLANE_SIZE + offset];
+            if (color >> plane) & 1 != 0 {
+                *byte |= mask;
+            } else {
+                *byte &= !mask;
+            }
+        }
+        true
+    }
+
+    pub fn planar_read_pixel(&self, x: u16, y: u16) -> u8 {
+        self.planar_read_pixel_at(0, x, y)
+    }
+
+    pub fn planar_read_pixel_at(&self, start: u32, x: u16, y: u16) -> u8 {
+        let Some((offset, bit)) = self.planar_pixel_offset_at(start, x, y) else {
+            return 0;
+        };
+        let mut color = 0u8;
+        for plane in 0..VGA_PLANES {
+            color |= ((self.vram[plane * VGA_PLANE_SIZE + offset] >> bit) & 1) << plane;
+        }
+        self.planar_logical_attr_index(color)
     }
 
     /// Chained mode-13h CPU write: chain-4 (Sequencer Memory Mode 04h bit 3)
@@ -1332,9 +2099,24 @@ impl Vga {
         self.cursor_offset = offset;
     }
 
+    /// Set the hardware text cursor shape (CRTC 0A/0Bh).
+    pub fn set_cursor_shape(&mut self, start: u8, end: u8) {
+        if self.is_cga_personality() {
+            self.cursor_start = start & 0x7F;
+            self.cursor_end = end & 0x1F;
+        } else {
+            self.cursor_start = start;
+            self.cursor_end = end;
+        }
+    }
+
     /// Read Input Status Register 1 (port 3DAh).
     ///
-    /// Bit 0: display disabled (beam is in blank or retrace).
+    /// Bit 0: display inactive. Attribute PAS blanking and CGA 3D8h video-disable
+    /// make VRAM access safe for the whole frame instead of only during beam
+    /// blank/retrace.
+    /// Bit 1: CGA light pen trigger latched.
+    /// Bit 2: CGA light pen switch off (no attached switch pressed).
     /// Bit 3: vertical retrace active.
     ///
     /// Reading this register also resets the Attribute Controller address/data
@@ -1343,28 +2125,37 @@ impl Vga {
         self.catch_up(); // a 3DA read catches the raster up, like a register write
         self.attr.flip_flop_data = false; // reading 3DA resets the flip-flop
         let mut status = 0u8;
-        if !beam_display_enable(&self.crtc, self.beam) {
-            status |= 0x01; // display disabled (blank or retrace)
+        let display_disabled = !self.display_refresh_enabled
+            || !self.attr.pas
+            || !self.sequencer_outputs_enabled()
+            || (self.is_cga_personality() && self.cga.mode_control & CGA_MODE_VIDEO_ENABLE == 0);
+        let display_inactive = display_disabled || !beam_display_enable(&self.crtc, self.beam);
+        if display_inactive {
+            status |= 0x01; // display inactive / safe VRAM window
+        }
+        if self.is_cga_personality() {
+            if self.cga.light_pen_triggered {
+                status |= 0x02;
+            }
+            status |= 0x04; // no light pen switch is pressed/attached
         }
         if beam_vretrace(&self.crtc, self.beam) {
             status |= 0x08; // vertical retrace
         }
+        status |= self.video_status_mux_bits();
         status
     }
 
     /// Read Input Status Register 0 (port 3C2h).
     ///
-    /// Bit 4: switch sense / DAC comparator output. A program drives the DAC
-    /// comparator (3C7/3C8 + 3C6) and reads this bit to identify the attached
-    /// monitor; with no comparison driven it reads back as a fixed color-monitor
-    /// sense (set), matching a wired colour display.
+    /// Bit 4: the display switch sense bit selected by Misc Output bits 3-2.
     /// Bit 7: vertical retrace active (the CRT interrupt status the BIOS polls).
     pub fn read_status0(&mut self) -> u8 {
         self.catch_up(); // a 3C2 read catches the raster up, like 3DA
         let mut status = 0u8;
-        // Limit: fixed colour-monitor sense. The DAC comparator path is not
-        // modeled, so bit 4 always reports the wired colour display.
-        status |= 0x10;
+        if self.switch_sense_bit() {
+            status |= 0x10;
+        }
         if beam_vretrace(&self.crtc, self.beam) {
             status |= 0x80; // vertical retrace -> CRT interrupt status
         }
@@ -1400,16 +2191,19 @@ impl Vga {
             }
             0x3C7 => {
                 self.dac.set_read_index(value);
-                self.dac_state = 0x00; // armed for a DAC read
+                self.dac_state = 0x03; // armed for a DAC read
                 true
             }
             0x3C8 => {
                 self.dac.set_write_index(value);
-                self.dac_state = 0x03; // armed for a DAC write
+                self.dac_state = 0x00; // armed for a DAC write
                 true
             }
             0x3C9 => {
-                self.dac.write_data(value);
+                if let Some(index) = self.dac.write_data(value) {
+                    self.sum_dac_entry_to_gray(index);
+                }
+                self.dac_state = 0x00;
                 true
             }
             0x3CE => {
@@ -1421,11 +2215,20 @@ impl Vga {
                 self.write_gc(idx, value);
                 true
             }
-            0x3D4 => {
+            0x3D0 | 0x3D2 | 0x3D4 | 0x3D6 if self.is_cga_personality() => {
+                self.crtc_index = value & 0x1F;
+                true
+            }
+            port if self.crtc_index_port_selected(port) => {
                 self.crtc_index = value;
                 true
             }
-            0x3D5 => {
+            0x3D1 | 0x3D3 | 0x3D5 | 0x3D7 if self.is_cga_personality() => {
+                let idx = self.crtc_index;
+                self.write_crtc(idx, value);
+                true
+            }
+            port if self.crtc_data_port_selected(port) => {
                 let idx = self.crtc_index;
                 self.write_crtc(idx, value);
                 true
@@ -1434,25 +2237,30 @@ impl Vga {
                 self.write_attr(value);
                 true
             }
-            // CGA Mode Control register: stored for read-back. The displayed
-            // geometry comes from the BIOS mode-set (set_cga_mode), not this
-            // register, so a title that re-bangs it does not change the resolution.
             0x3D8 => {
-                self.cga.mode_control = value;
+                self.write_cga_mode_control(value);
                 true
             }
             // CGA Color Select register: background/border nibble (bits 0-3),
             // intensity (bit 4), and palette select (bit 5). Decoded per scanline
             // in render_cga_row.
             0x3D9 => {
-                self.cga.color_select = value;
+                self.cga.color_select = value & 0x3F;
                 true
             }
             // Feature Control: written at 3DA in colour setups, 3BA in mono.
             // Read back at 3CA. The two write addresses are the colour/mono
             // alias of the same register.
-            0x3DA | 0x3BA => {
+            port if self.status1_port_selected(port) => {
                 self.feature_control = value;
+                true
+            }
+            0x3DB => {
+                self.clear_cga_light_pen();
+                true
+            }
+            0x3DC => {
+                self.latch_cga_light_pen();
                 true
             }
             _ => false,
@@ -1463,35 +2271,111 @@ impl Vga {
     pub fn read_port(&mut self, port: u16) -> Option<u8> {
         match port {
             0x3C2 => Some(self.read_status0()),
+            0x3C0 => Some(self.attr.index | (u8::from(self.attr.pas) << 5)),
             0x3C1 => Some(self.attr_indexed_read()),
             0x3C3 => Some(self.video_subsystem_enable),
+            0x3C4 => Some(self.seq_index),
+            0x3C5 => Some(self.read_seq(self.seq_index)),
             0x3C6 => Some(self.pel_mask),
             0x3C7 => Some(self.dac_state & 0x03),
             0x3CA => Some(self.feature_control),
             0x3C8 => Some(self.dac.write_index()),
-            0x3C9 => Some(self.dac.read_data()),
+            0x3C9 => {
+                self.dac_state = 0x03;
+                Some(self.dac.read_data())
+            }
             0x3CC => Some(self.misc_output),
+            0x3CE => Some(self.gc_index),
             0x3CF => Some(self.read_gc(self.gc_index)),
-            0x3D4 => Some(self.crtc_index),
-            0x3D5 => match self.crtc_index {
-                // Horizontal timing group: read back the byte last written (00h-05h).
-                0x00 => Some(self.crtc_regs.r00),
-                0x01 => Some(self.crtc_regs.r01),
-                0x02 => Some(self.crtc_regs.r02),
-                0x03 => Some(self.crtc_regs.r03),
-                0x04 => Some(self.crtc_regs.r04),
-                0x05 => Some(self.crtc_regs.r05),
-                0x08 => Some(self.crtc.preset_row_scan),
-                0x0A => Some(self.cursor_start),
-                0x0B => Some(self.cursor_end),
-                0x0E => Some((self.cursor_offset >> 8) as u8),
-                0x0F => Some(self.cursor_offset as u8),
-                _ => Some(0),
-            },
-            0x3D8 => Some(self.cga.mode_control),
-            0x3D9 => Some(self.cga.color_select),
-            0x3DA => Some(self.read_status1()),
+            0x3D0 | 0x3D2 | 0x3D4 | 0x3D6 if self.is_cga_personality() => None,
+            port if self.crtc_index_port_selected(port) => Some(self.crtc_index),
+            0x3D1 | 0x3D3 | 0x3D5 | 0x3D7 if self.is_cga_personality() => {
+                self.read_cga_crtc_data_port()
+            }
+            port if self.crtc_data_port_selected(port) => {
+                Some(self.crtc_register_latch(self.crtc_index))
+            }
+            port if self.status1_port_selected(port) => Some(self.read_status1()),
+            0x3DB => {
+                self.catch_up();
+                self.clear_cga_light_pen();
+                Some(0xFF)
+            }
+            0x3DC => {
+                self.catch_up();
+                self.latch_cga_light_pen();
+                Some(0xFF)
+            }
             _ => None,
+        }
+    }
+
+    fn read_cga_crtc_data_port(&self) -> Option<u8> {
+        match self.crtc_index {
+            0x0E => Some((self.cursor_offset >> 8) as u8),
+            0x0F => Some(self.cursor_offset as u8),
+            0x10 => Some((self.cga.light_pen_latch >> 8) as u8),
+            0x11 => Some(self.cga.light_pen_latch as u8),
+            _ => None,
+        }
+    }
+
+    pub fn crtc_index_latch(&self) -> u8 {
+        self.crtc_index
+    }
+
+    pub fn crtc_register_latch(&self, index: u8) -> u8 {
+        if self.is_cga_personality() {
+            return match index {
+                0x00 => self.crtc_regs.r00,
+                0x01 => self.crtc_regs.r01,
+                0x02 => self.crtc_regs.r02,
+                0x03 => self.crtc_regs.r03,
+                0x04 => self.crtc_regs.r04,
+                0x05 => self.crtc_regs.r05,
+                0x06 => self.crtc_regs.r06,
+                0x07 => self.crtc_regs.r07,
+                0x08 => self.crtc_regs.r08,
+                0x09 => self.crtc_regs.r09,
+                0x0A => self.cursor_start,
+                0x0B => self.cursor_end,
+                0x0C => (self.crtc_start_register() >> 8) as u8,
+                0x0D => self.crtc_start_register() as u8,
+                0x0E => (self.cursor_offset >> 8) as u8,
+                0x0F => self.cursor_offset as u8,
+                0x10 => (self.cga.light_pen_latch >> 8) as u8,
+                0x11 => self.cga.light_pen_latch as u8,
+                _ => 0,
+            };
+        }
+        match index {
+            // Horizontal timing group: read back the byte last written (00h-05h).
+            0x00 => self.crtc_regs.r00,
+            0x01 => self.crtc_regs.r01,
+            0x02 => self.crtc_regs.r02,
+            0x03 => self.crtc_regs.r03,
+            0x04 => self.crtc_regs.r04,
+            0x05 => self.crtc_regs.r05,
+            0x06 => self.crtc_regs.r06,
+            0x07 => self.crtc_regs.r07,
+            0x08 => self.crtc.preset_row_scan,
+            0x09 => self.crtc_regs.r09,
+            0x0A => self.cursor_start,
+            0x0B => self.cursor_end,
+            0x0C => (self.crtc_start_register() >> 8) as u8,
+            0x0D => self.crtc_start_register() as u8,
+            0x0E => (self.cursor_offset >> 8) as u8,
+            0x0F => self.cursor_offset as u8,
+            0x10 => self.crtc_regs.r10,
+            0x11 => self.crtc_regs.r11,
+            0x12 => self.crtc_regs.r12,
+            0x13 => self.crtc_regs.r13,
+            0x14 => self.crtc_regs.r14,
+            0x15 => self.crtc_regs.r15,
+            0x16 => self.crtc_regs.r16,
+            0x17 => self.crtc_regs.r17,
+            0x18 => self.crtc_regs.r18,
+            _ => 0,
         }
     }
 
@@ -1511,9 +2395,6 @@ impl Vga {
 
     fn write_seq(&mut self, index: u8, value: u8) {
         match index {
-            // Limit: store the Reset register (bit 0 async, bit 1 sync) for
-            // read-back only. No datapath gate: a real reset halts the sequencer
-            // dot clock, which the cycle-coupled beam model does not act on.
             0x00 => self.seq.reset = value,
             0x01 => self.seq.clocking_mode = value,
             0x02 => self.seq.map_mask = value & 0x0F,
@@ -1536,6 +2417,17 @@ impl Vga {
         }
     }
 
+    fn read_seq(&self, index: u8) -> u8 {
+        match index {
+            0x00 => self.seq.reset,
+            0x01 => self.seq.clocking_mode,
+            0x02 => self.seq.map_mask,
+            0x03 => self.seq.char_map_select,
+            0x04 => self.seq.memory_mode,
+            _ => 0,
+        }
+    }
+
     fn write_gc(&mut self, index: u8, value: u8) {
         match index {
             0x00 => self.gc.set_reset = value & 0x0F,
@@ -1549,11 +2441,8 @@ impl Vga {
             0x05 => {
                 self.gc.write_mode = value & 3;
                 self.gc.read_mode = (value >> 3) & 1;
+                self.gc.mode_flags = value & 0x70;
             }
-            // Limit: Miscellaneous Graphics (06h) decode + read-back only. The
-            // bus still routes A0000/B8000 by its own fixed map, so the selected
-            // aperture (gc.aperture()) is exposed but not yet consulted by the
-            // machine-crate memory routing; that is a separate lib.rs follow-up.
             0x06 => self.gc.misc = value & 0x0F,
             0x07 => self.gc.color_dont_care = value & 0x0F,
             0x08 => self.gc.bit_mask = value,
@@ -1571,7 +2460,7 @@ impl Vga {
             0x02 => self.gc.color_compare,
             0x03 => self.gc.rotate | (self.gc.logic << 3),
             0x04 => self.gc.read_map,
-            0x05 => self.gc.write_mode | (self.gc.read_mode << 3),
+            0x05 => self.gc.write_mode | (self.gc.read_mode << 3) | self.gc.mode_flags,
             0x06 => self.gc.misc,
             0x07 => self.gc.color_dont_care,
             0x08 => self.gc.bit_mask,
@@ -1579,7 +2468,105 @@ impl Vga {
         }
     }
 
+    fn write_cga_crtc(&mut self, index: u8, value: u8) {
+        match index {
+            0x00 => {
+                self.crtc_regs.r00 = value;
+                self.recompute_cga_horizontal_timing();
+            }
+            0x01 => {
+                self.crtc_regs.r01 = value;
+                self.recompute_cga_horizontal_timing();
+            }
+            0x02 => self.crtc_regs.r02 = value,
+            0x03 => self.crtc_regs.r03 = value & 0x0F,
+            0x04 => {
+                self.crtc_regs.r04 = value & 0x7F;
+                self.recompute_cga_vertical_timing();
+            }
+            0x05 => {
+                self.crtc_regs.r05 = value & 0x1F;
+                self.recompute_cga_vertical_timing();
+            }
+            0x06 => {
+                self.crtc_regs.r06 = value & 0x7F;
+                self.recompute_cga_vertical_timing();
+            }
+            0x07 => {
+                self.crtc_regs.r07 = value & 0x7F;
+                self.recompute_cga_vertical_timing();
+            }
+            0x08 => self.crtc_regs.r08 = value & 0x03,
+            0x09 => {
+                self.crtc_regs.r09 = value & 0x1F;
+                self.recompute_cga_vertical_timing();
+            }
+            0x0A => self.cursor_start = value & 0x7F,
+            0x0B => self.cursor_end = value & 0x1F,
+            0x0C => {
+                let cur = self.pending_start.unwrap_or(self.crtc.start_address);
+                self.set_start_address((cur & 0x00FF) | (u32::from(value & 0x3F) << 8));
+            }
+            0x0D => {
+                let cur = self.pending_start.unwrap_or(self.crtc.start_address);
+                self.set_start_address((cur & 0xFF00) | u32::from(value));
+            }
+            0x0E => {
+                self.cursor_offset = (self.cursor_offset & 0x00FF) | (u16::from(value & 0x3F) << 8)
+            }
+            0x0F => self.cursor_offset = (self.cursor_offset & 0xFF00) | u16::from(value),
+            _ => {}
+        }
+    }
+
+    fn recompute_cga_horizontal_timing(&mut self) {
+        let displayed_chars = u32::from(self.crtc_regs.r01).max(1);
+        self.crtc.char_width =
+            if self.mode == VideoMode::Cga && self.cga.submode == CgaMode::Graphics640x200 {
+                16
+            } else {
+                8
+            };
+        self.crtc.htotal_chars = (u32::from(self.crtc_regs.r00) + 1).max(displayed_chars);
+        self.crtc.hdisp_end = displayed_chars * self.crtc.char_width;
+        if self.mode == VideoMode::Text {
+            self.crtc.offset = displayed_chars;
+            self.text_columns = displayed_chars.min(VGA_TEXT_COLUMNS as u32) as usize;
+        }
+        self.resize_work();
+    }
+
+    fn recompute_cga_vertical_timing(&mut self) {
+        let scanlines_per_row = u32::from(self.crtc_regs.r09 & 0x1F) + 1;
+        let vtotal =
+            (u32::from(self.crtc_regs.r04) + 1) * scanlines_per_row + u32::from(self.crtc_regs.r05);
+        let vdisp = u32::from(self.crtc_regs.r06) * scanlines_per_row;
+        let vretrace_start = u32::from(self.crtc_regs.r07) * scanlines_per_row;
+
+        self.crtc.max_scan = scanlines_per_row - 1;
+        self.crtc.double_scan = false;
+        self.crtc.vtotal = vtotal.max(1);
+        self.crtc.vdisp_end = vdisp.min(self.crtc.vtotal);
+        self.crtc.vblank_start = self.crtc.vdisp_end;
+        self.crtc.vblank_end = self.crtc.vtotal.saturating_sub(1);
+        self.crtc.vretrace_start = vretrace_start.min(self.crtc.vtotal.saturating_sub(1));
+        self.crtc.vretrace_end = (self.crtc.vretrace_start + 2).min(self.crtc.vtotal);
+        self.resize_work();
+    }
+
     fn write_crtc(&mut self, index: u8, value: u8) {
+        if self.is_cga_personality() {
+            self.write_cga_crtc(index, value);
+            return;
+        }
+        let crtc_protected = self.crtc_regs.r11 & 0x80 != 0;
+        if crtc_protected && index <= 0x07 {
+            if index == 0x07 {
+                self.crtc.line_compare =
+                    (self.crtc.line_compare & !0x100) | (u32::from((value >> 4) & 1) << 8);
+            }
+            return;
+        }
         match index {
             // Horizontal timing group (FreeVGA crtcreg.htm 00h-05h): horizontal
             // total, display end, start/end blanking, start/end retrace. Stored as
@@ -1596,7 +2583,10 @@ impl Vga {
             0x05 => self.crtc_regs.r05 = value,
             // Preset Row Scan (FreeVGA crtcreg.htm 08h): bits 4-0 first font
             // scanline (vertical sub-row), bits 6-5 byte pan.
-            0x08 => self.crtc.preset_row_scan = value,
+            0x08 => {
+                self.crtc_regs.r08 = value;
+                self.crtc.preset_row_scan = value;
+            }
             // Cursor shape (start scanline + disable bit / end scanline + skew).
             0x0A => self.cursor_start = value,
             0x0B => self.cursor_end = value,
@@ -1613,27 +2603,41 @@ impl Vga {
             // Text cursor location (high/low byte), shared CRTC index with timing.
             0x0E => self.cursor_offset = (self.cursor_offset & 0x00FF) | (u16::from(value) << 8),
             0x0F => self.cursor_offset = (self.cursor_offset & 0xFF00) | u16::from(value),
-            0x13 => self.crtc.offset = u32::from(value),
-            0x14 => self.crtc.underline_loc = value,
-            0x17 => self.crtc.mode_control = value,
-            0x18 => self.crtc.line_compare = (self.crtc.line_compare & !0xFF) | u32::from(value),
+            0x13 => {
+                self.crtc_regs.r13 = value;
+                self.crtc.offset = u32::from(value);
+            }
+            0x14 => {
+                self.crtc_regs.r14 = value;
+                self.crtc.underline_loc = value;
+            }
+            0x17 => {
+                self.crtc_regs.r17 = value;
+                self.crtc.mode_control = value;
+            }
+            0x18 => {
+                self.crtc_regs.r18 = value;
+                self.crtc.line_compare = (self.crtc.line_compare & !0xFF) | u32::from(value);
+            }
             0x07 => {
+                self.crtc_regs.r07 = value;
                 self.crtc.line_compare =
                     (self.crtc.line_compare & !0x100) | (u32::from((value >> 4) & 1) << 8);
             }
             0x09 => {
+                self.crtc_regs.r09 = value;
                 self.crtc.line_compare =
                     (self.crtc.line_compare & !0x200) | (u32::from((value >> 6) & 1) << 9);
             }
+            0x11 => self.crtc_regs.r11 = value,
             _ => {} // full timing programmed via set_mode_0dh in slice 1
         }
-        // While unchained (mode X), honor the guest's vertical CRTC timing so the
-        // geometry follows the registers it programs (Abrash's bang yields 320x240).
-        // Seeded at mode-X entry; the absolute fields are derived in
-        // recompute_vertical_timing. The line-compare bits (07h/09h/18h) are handled
-        // by the match above and left untouched here.
-        if self.mode == VideoMode::ModeX
-            && matches!(index, 0x06 | 0x07 | 0x09 | 0x10 | 0x11 | 0x12 | 0x15 | 0x16)
+        // Graphics modes honor guest vertical CRTC timing. The absolute fields are
+        // derived in recompute_vertical_timing; line-compare bits are handled above.
+        if matches!(
+            self.mode,
+            VideoMode::Planar | VideoMode::Mode13h | VideoMode::ModeX
+        ) && matches!(index, 0x06 | 0x07 | 0x09 | 0x10 | 0x11 | 0x12 | 0x15 | 0x16)
         {
             match index {
                 0x06 => self.crtc_regs.r06 = value,
@@ -1673,6 +2677,9 @@ impl Vga {
     }
 
     pub fn read_u8(&self, offset: usize) -> Result<u8, VideoError> {
+        if self.is_cga_text_mode() {
+            return Ok(self.cga_read(offset));
+        }
         self.text_memory
             .get(offset)
             .copied()
@@ -1680,6 +2687,10 @@ impl Vga {
     }
 
     pub fn write_u8(&mut self, offset: usize, value: u8) -> Result<(), VideoError> {
+        if self.is_cga_text_mode() {
+            self.cga_write(offset, value);
+            return Ok(());
+        }
         let slot = self
             .text_memory
             .get_mut(offset)
@@ -1694,35 +2705,60 @@ impl Vga {
     /// write decode; the CRTC display scanout is shared with mode X.
     pub fn set_mode13h(&mut self) {
         self.crtc = CrtcTiming::mode13h();
+        self.crtc_regs = CrtcRegs::from_timing(self.crtc);
+        self.seed_vgabios_crtc_readback(0x13);
+        self.seed_vgabios_seq_readback(0x13);
+        self.set_misc_mode_bits(0, true, 0x01);
+        self.gc = GfxController::default();
+        self.seed_vgabios_gc_readback(0x13);
+        self.latches = [0; VGA_PLANES];
         self.beam = 0;
         self.last_line = 0;
         self.mode = VideoMode::Mode13h;
         self.presented = None; // drop any stale frame from a prior mode
         self.reset_palette_defaults();
+        self.seed_vgabios_attr_readback(0x13);
         self.resize_work();
     }
 
-    /// Switch to a CGA graphics mode by its INT 10h number (04h, 05h, or 06h).
-    /// Installs the CGA timing, marks the framebuffer aperture active, and clears
-    /// the framebuffer (a fresh mode-set starts on a blank screen, like the BIOS
-    /// clear). Returns false for a number this path does not implement, leaving
-    /// the current mode untouched. Mode 05h carries the alternate red/cyan/white
-    /// palette through `Cga::bios_mode`.
+    /// Switch to a CGA graphics mode by its INT 10h number (04h, 05h, or 06h),
+    /// clearing the framebuffer like a normal BIOS mode set.
     pub fn set_cga_mode(&mut self, mode: u8) -> bool {
+        self.set_cga_mode_with_clear(mode, true)
+    }
+
+    /// Switch to a CGA graphics mode, optionally preserving the B800 framebuffer
+    /// for INT 10h AH=00h mode numbers with bit 7 set.
+    pub fn set_cga_mode_with_clear(&mut self, mode: u8, clear: bool) -> bool {
         let (timing, submode) = match mode {
             0x04 | 0x05 => (CrtcTiming::cga_320x200(), CgaMode::Graphics320x200),
             0x06 => (CrtcTiming::cga_640x200(), CgaMode::Graphics640x200),
             _ => return false,
         };
         self.crtc = timing;
+        self.set_misc_mode_bits(0, true, 0x01);
+        self.seq.reset = 0x03;
+        self.crtc_regs = match mode {
+            0x06 => CrtcRegs::cga_graphics_640x200(),
+            _ => CrtcRegs::cga_graphics_320x200(),
+        };
+        self.recompute_cga_vertical_timing();
         self.cga.submode = submode;
         self.cga.bios_mode = mode;
-        // The BIOS mode-set programs the color-select default: background black,
-        // palette 0, no intensity. A title that wants other colors writes 0x3D9.
-        self.cga.color_select = 0x00;
-        self.cga.mode_control = 0x00;
-        for byte in self.cga.fb.iter_mut() {
-            *byte = 0;
+        // The BIOS mode-set programs the color-select default. Mode 06h is white
+        // on black; 320x200 modes start with background black, palette 0, low intensity.
+        self.cga.color_select = if mode == 0x06 { CGA_WHITE } else { 0x00 };
+        self.cga.mode_control = match mode {
+            0x05 => 0x0E,
+            0x06 => 0x1A,
+            _ => 0x0A,
+        };
+        self.seq.char_map_select = 0;
+        self.load_rom_font(0, 8);
+        if clear {
+            for byte in self.cga.fb.iter_mut() {
+                *byte = 0;
+            }
         }
         self.beam = 0;
         self.last_line = 0;
@@ -1732,6 +2768,322 @@ impl Vga {
         self.reset_palette_defaults();
         self.resize_work();
         true
+    }
+
+    fn write_cga_mode_control(&mut self, value: u8) {
+        let value = value & 0x3F;
+        let old_control = self.cga.mode_control;
+        let was_cga = self.is_cga_personality();
+        self.cga.mode_control = value;
+        let decode_changed = !was_cga
+            || ((old_control ^ value)
+                & (CGA_MODE_80_COLUMNS | CGA_MODE_GRAPHICS | CGA_MODE_HIGH_RES)
+                != 0);
+
+        if value & CGA_MODE_GRAPHICS != 0 {
+            if value & CGA_MODE_HIGH_RES != 0 {
+                if !was_cga {
+                    self.crtc = CrtcTiming::cga_640x200();
+                    self.crtc_regs = CrtcRegs::cga_graphics_640x200();
+                    self.recompute_cga_vertical_timing();
+                }
+                if decode_changed {
+                    self.crtc.char_width = 16;
+                    self.crtc.htotal_chars = 57;
+                    self.crtc.hdisp_end = 640;
+                }
+                self.cga.submode = CgaMode::Graphics640x200;
+                self.cga.bios_mode = 0x06;
+            } else {
+                if !was_cga {
+                    self.crtc = CrtcTiming::cga_320x200();
+                    self.crtc_regs = CrtcRegs::cga_graphics_320x200();
+                    self.recompute_cga_vertical_timing();
+                }
+                if decode_changed {
+                    self.crtc.char_width = 8;
+                    self.crtc.htotal_chars = 57;
+                    self.crtc.hdisp_end = 320;
+                }
+                self.cga.submode = CgaMode::Graphics320x200;
+                self.cga.bios_mode = if value & CGA_MODE_BW != 0 { 0x05 } else { 0x04 };
+            }
+            self.mode = VideoMode::Cga;
+            self.resize_work();
+        } else {
+            if value & CGA_MODE_80_COLUMNS != 0 {
+                if !was_cga {
+                    self.crtc = CrtcTiming::text_80x25_cga();
+                    self.crtc_regs = CrtcRegs::cga_text_80x25();
+                    self.recompute_cga_vertical_timing();
+                }
+                if decode_changed {
+                    self.crtc.char_width = 8;
+                    self.crtc.htotal_chars = 114;
+                    self.crtc.hdisp_end = 640;
+                    self.crtc.offset = 80;
+                    self.text_columns = VGA_TEXT_COLUMNS;
+                }
+            } else {
+                if !was_cga {
+                    self.crtc = CrtcTiming::text_40x25();
+                    self.crtc_regs = CrtcRegs::cga_text_40x25();
+                    self.recompute_cga_vertical_timing();
+                }
+                if decode_changed {
+                    self.crtc.char_width = 8;
+                    self.crtc.htotal_chars = 57;
+                    self.crtc.hdisp_end = 320;
+                    self.crtc.offset = 40;
+                    self.text_columns = 40;
+                }
+            }
+            self.seq.clocking_mode |= 0x01;
+            self.mode = VideoMode::Text;
+            self.resize_work();
+        }
+    }
+
+    fn is_cga_text_mode(&self) -> bool {
+        self.mode == VideoMode::Text && self.crtc.char_width == 8
+    }
+
+    pub fn is_cga_personality(&self) -> bool {
+        self.mode == VideoMode::Cga || self.is_cga_text_mode()
+    }
+
+    fn cga_light_pen_cell_position(&self) -> (u16, u16) {
+        let line = beam_line(&self.crtc, self.beam).min(self.crtc.vdisp_end.saturating_sub(1));
+        let dot = beam_dot(&self.crtc, self.beam).min(self.crtc.hdisp_end.saturating_sub(1));
+        let (columns, row_divisor) = if self.mode == VideoMode::Cga {
+            (40u32, 2u32)
+        } else {
+            (self.text_columns as u32, self.crtc.max_scan + 1)
+        };
+        let col = dot.saturating_mul(columns) / self.crtc.hdisp_end.max(1);
+        let row = line / row_divisor.max(1);
+        (col as u16, row as u16)
+    }
+
+    fn latch_cga_light_pen(&mut self) {
+        if !self.is_cga_personality() || self.cga.light_pen_triggered {
+            return;
+        }
+        let (col, row) = self.cga_light_pen_cell_position();
+        let pitch = if self.mode == VideoMode::Cga {
+            40
+        } else {
+            self.text_columns as u16
+        };
+        let start = self.crtc.start_address as u16;
+        self.cga.light_pen_latch =
+            start.wrapping_add(row.wrapping_mul(pitch).wrapping_add(col)) & 0x3FFF;
+        let row_height = if self.mode == VideoMode::Cga {
+            2
+        } else {
+            self.crtc.max_scan + 1
+        };
+        self.cga.light_pen_pixel_row = row.saturating_mul(row_height as u16).min(199);
+        self.cga.light_pen_pixel_col = match self.mode {
+            VideoMode::Cga if self.cga.submode == CgaMode::Graphics640x200 => {
+                let dot =
+                    beam_dot(&self.crtc, self.beam).min(self.crtc.hdisp_end.saturating_sub(1));
+                (dot as u16 & !3).min(639)
+            }
+            VideoMode::Cga => {
+                let dot =
+                    beam_dot(&self.crtc, self.beam).min(self.crtc.hdisp_end.saturating_sub(1));
+                (dot as u16 & !1).min(319)
+            }
+            _ => (col * 8).min(639),
+        };
+        self.cga.light_pen_triggered = true;
+    }
+
+    fn clear_cga_light_pen(&mut self) {
+        self.cga.light_pen_triggered = false;
+    }
+
+    pub fn cga_light_pen_report(&self) -> Option<(u16, u8, u8, u8)> {
+        if !self.is_cga_personality() || !self.cga.light_pen_triggered {
+            return None;
+        }
+        let pixel_row = self.cga.light_pen_pixel_row.min(199);
+        let pixel_col = self.cga.light_pen_pixel_col.min(639);
+        let (char_row, char_col) = match self.mode {
+            VideoMode::Cga if self.cga.submode == CgaMode::Graphics640x200 => {
+                ((pixel_row / 8).min(24), (pixel_col / 16).min(39))
+            }
+            VideoMode::Cga => ((pixel_row / 8).min(24), (pixel_col / 8).min(39)),
+            _ => (
+                (pixel_row / (self.crtc.max_scan + 1) as u16).min(24),
+                (pixel_col / 8).min(self.text_columns.saturating_sub(1) as u16),
+            ),
+        };
+        Some((pixel_col, pixel_row as u8, char_row as u8, char_col as u8))
+    }
+
+    fn reset_text_mode(&mut self, clear: bool) {
+        self.cursor_offset = 0;
+        if clear {
+            if self.crtc.char_width == 8 {
+                for cell in self.cga.fb.chunks_exact_mut(2) {
+                    cell[0] = b' ';
+                    cell[1] = 0x07;
+                }
+            } else {
+                for cell in self.text_memory.chunks_exact_mut(2) {
+                    cell[0] = b' ';
+                    cell[1] = 0x07;
+                }
+            }
+        }
+        self.beam = 0;
+        self.last_line = 0;
+        self.seq.reset = 0x03;
+        self.mode = VideoMode::Text;
+        self.presented = None;
+        // A buffered start-address change from a prior graphics mode must not
+        // carry across the mode switch: the text origin resets to page 0.
+        self.pending_start = None;
+        self.reset_palette_defaults();
+        self.resize_work();
+    }
+
+    pub fn set_cga_text_mode(&mut self, mode: u8) -> bool {
+        self.set_cga_text_mode_with_clear(mode, true)
+    }
+
+    pub fn set_cga_text_mode_with_clear(&mut self, mode: u8, clear: bool) -> bool {
+        let (timing, regs, columns, mode_control) = match mode {
+            0x00 => (
+                CrtcTiming::text_40x25(),
+                CrtcRegs::cga_text_40x25(),
+                40,
+                CGA_MODE_BW | CGA_MODE_VIDEO_ENABLE | CGA_MODE_BLINK,
+            ),
+            0x01 => (
+                CrtcTiming::text_40x25(),
+                CrtcRegs::cga_text_40x25(),
+                40,
+                CGA_MODE_VIDEO_ENABLE | CGA_MODE_BLINK,
+            ),
+            0x02 => (
+                CrtcTiming::text_80x25_cga(),
+                CrtcRegs::cga_text_80x25(),
+                VGA_TEXT_COLUMNS,
+                CGA_MODE_80_COLUMNS | CGA_MODE_BW | CGA_MODE_VIDEO_ENABLE | CGA_MODE_BLINK,
+            ),
+            0x03 => (
+                CrtcTiming::text_80x25_cga(),
+                CrtcRegs::cga_text_80x25(),
+                VGA_TEXT_COLUMNS,
+                CGA_MODE_80_COLUMNS | CGA_MODE_VIDEO_ENABLE | CGA_MODE_BLINK,
+            ),
+            _ => return false,
+        };
+
+        self.crtc = timing;
+        self.set_misc_mode_bits(0, true, 0x01);
+        self.crtc_regs = regs;
+        self.recompute_cga_vertical_timing();
+        self.text_columns = columns;
+        self.cga.mode_control = mode_control;
+        self.seq.clocking_mode |= 0x01;
+        self.seq.char_map_select = 0;
+        self.load_rom_font(0, 8);
+        self.cursor_start = 0x06;
+        self.cursor_end = 0x07;
+        self.reset_text_mode(clear);
+        true
+    }
+
+    pub fn set_cga_80_text_mode(&mut self) {
+        let _ = self.set_cga_text_mode(0x02);
+    }
+
+    fn set_vga_80_text_mode(&mut self) {
+        self.crtc = CrtcTiming::text_03h();
+        self.crtc_regs = CrtcRegs::from_timing(self.crtc);
+        self.seed_vgabios_crtc_readback(0x03);
+        self.seed_vgabios_seq_readback(0x03);
+        self.seed_vgabios_gc_readback(0x03);
+        self.set_misc_mode_bits(1, true, 0x01);
+        self.text_columns = VGA_TEXT_COLUMNS;
+        self.load_rom_font(0, 16);
+        self.cursor_start = 0x0E;
+        self.cursor_end = 0x0F;
+        self.reset_text_mode(true);
+        self.seed_vgabios_attr_readback(0x03);
+    }
+
+    pub fn set_color_text_mode_scanlines(&mut self, mode: u8, scanlines: u16, clear: bool) -> bool {
+        let columns = match mode & 0x7F {
+            0x00 | 0x01 => 40,
+            0x02 | 0x03 => VGA_TEXT_COLUMNS,
+            _ => return false,
+        };
+        if scanlines == 200 {
+            return self.set_cga_text_mode_with_clear(mode, clear);
+        }
+
+        let mut timing = match scanlines {
+            350 => CrtcTiming::text_07h(),
+            400 => CrtcTiming::text_03h(),
+            _ => return false,
+        };
+        if columns <= 40 {
+            timing.hdisp_end /= 2;
+            timing.offset = 40;
+        }
+        self.crtc = timing;
+        self.crtc_regs = CrtcRegs::from_timing(timing);
+        if mode & 0x7F == 0x03 && scanlines == 400 {
+            self.seed_vgabios_crtc_readback(0x03);
+            self.seed_vgabios_seq_readback(0x03);
+            self.seed_vgabios_gc_readback(0x03);
+        }
+        self.set_misc_mode_bits(1, true, if scanlines == 350 { 0x02 } else { 0x01 });
+        self.text_columns = columns;
+        self.seq.clocking_mode &= !0x01;
+        self.seq.char_map_select = 0;
+        let height = if scanlines == 350 { 14 } else { 16 };
+        self.load_rom_font(0, height);
+        self.cursor_start = height - 2;
+        self.cursor_end = height - 1;
+        self.reset_text_mode(clear);
+        if mode & 0x7F == 0x03 && scanlines == 400 {
+            self.seed_vgabios_attr_readback(0x03);
+        }
+        true
+    }
+
+    /// Switch to the 80x25 VGA text mode (mode 03h).
+    pub fn set_text_mode(&mut self) {
+        self.set_text_mode_columns(VGA_TEXT_COLUMNS);
+    }
+
+    pub fn set_mono_text_mode(&mut self) {
+        self.crtc = CrtcTiming::text_07h();
+        self.crtc_regs = CrtcRegs::from_timing(self.crtc);
+        self.set_misc_mode_bits(1, false, 0x02);
+        self.text_columns = VGA_TEXT_COLUMNS;
+        self.seq.clocking_mode &= !0x01;
+        self.seq.char_map_select = 0;
+        self.load_rom_font(0, 14);
+        self.cursor_start = 0x0C;
+        self.cursor_end = 0x0D;
+        self.reset_text_mode(true);
+    }
+
+    /// Switch to a text mode with 40 or 80 visible columns, resetting the beam,
+    /// clearing the text buffer, and dropping any stale graphics frame.
+    pub fn set_text_mode_columns(&mut self, columns: usize) {
+        if columns <= 40 {
+            let _ = self.set_cga_text_mode(0x01);
+        } else {
+            self.set_vga_80_text_mode();
+        }
     }
 
     /// Write one byte into the CGA framebuffer at a B800 aperture offset. The
@@ -1753,22 +3105,78 @@ impl Vga {
             .unwrap_or(0)
     }
 
+    fn cga_pixel_offset(&self, x: u16, y: u16) -> Option<(usize, u8, u8)> {
+        if y >= 200 || u32::from(x) >= self.crtc.hdisp_end {
+            return None;
+        }
+        let row = usize::from(y);
+        let bank = (row & 1) * CGA_ODD_BANK;
+        let row_base = bank + (row >> 1) * self.cga_bytes_per_scanline();
+        match self.cga.submode {
+            CgaMode::Graphics320x200 => {
+                let pixel = usize::from(x);
+                let shift = 6 - ((pixel & 3) * 2);
+                Some((row_base + pixel / 4, shift as u8, 0x03))
+            }
+            CgaMode::Graphics640x200 => {
+                let pixel = usize::from(x);
+                Some((row_base + pixel / 8, (7 - (pixel & 7)) as u8, 0x01))
+            }
+        }
+    }
+
+    pub fn cga_write_pixel(&mut self, x: u16, y: u16, color: u8, xor: bool) -> bool {
+        let Some((offset, shift, mask_bits)) = self.cga_pixel_offset(x, y) else {
+            return false;
+        };
+        let old = self.cga_read(offset);
+        let mask = mask_bits << shift;
+        let old_bits = (old >> shift) & mask_bits;
+        let color_bits = color & mask_bits;
+        let new_bits = if xor {
+            old_bits ^ color_bits
+        } else {
+            color_bits
+        };
+        self.cga_write(offset, (old & !mask) | (new_bits << shift));
+        true
+    }
+
+    pub fn cga_read_pixel(&self, x: u16, y: u16) -> u8 {
+        let Some((offset, shift, mask_bits)) = self.cga_pixel_offset(x, y) else {
+            return 0;
+        };
+        (self.cga_read(offset) >> shift) & mask_bits
+    }
+
+    fn cga_bytes_per_scanline(&self) -> usize {
+        match self.cga.submode {
+            CgaMode::Graphics320x200 => (self.crtc.hdisp_end as usize / 4).max(1),
+            CgaMode::Graphics640x200 => (self.crtc.hdisp_end as usize / 8).max(1),
+        }
+    }
+
     /// Assemble one CGA graphics scanline into `hdisp_end` DAC indices. The
     /// classic CGA interleave maps display scanline `y` to framebuffer bank
-    /// `(y & 1) * 0x2000` plus `(y >> 1) * 80` bytes; even lines sit in the low
-    /// bank, odd lines in the high bank. 320x200x4 unpacks 4 pixels per byte
+    /// `(y & 1) * 0x2000` plus `(y >> 1) * live_pitch`; even lines sit in the
+    /// low bank, odd lines in the high bank. 320x200x4 unpacks 4 pixels per byte
     /// (2 bits each, MSB first) through the four-color palette; 640x200x2 unpacks
     /// 8 pixels per byte (1 bit each) through the background/foreground pair.
     pub fn render_cga_row(&self, counter_line: u32) -> Vec<u8> {
         let width = self.crtc.hdisp_end as usize;
+        if self.cga.mode_control & 0x08 == 0 {
+            return vec![CGA_BLACK; width];
+        }
         let y = counter_line as usize;
         let bank = (y & 1) * CGA_ODD_BANK;
-        let row_base = bank + (y >> 1) * CGA_BYTES_PER_LINE;
+        let pitch = self.cga_bytes_per_scanline();
+        let row_base =
+            (self.crtc.start_address as usize + bank + (y >> 1) * pitch) & (CGA_FB_SIZE - 1);
         let mut row = vec![0u8; width];
         match self.cga.submode {
             CgaMode::Graphics320x200 => {
-                for byte_col in 0..CGA_BYTES_PER_LINE {
-                    let byte = self.cga.fb.get(row_base + byte_col).copied().unwrap_or(0);
+                for byte_col in 0..pitch {
+                    let byte = self.cga_read(row_base + byte_col);
                     let pixels = self.cga.decode_byte_320x200(byte);
                     for (sub, &index) in pixels.iter().enumerate() {
                         let x = byte_col * 4 + sub;
@@ -1781,8 +3189,8 @@ impl Vga {
             CgaMode::Graphics640x200 => {
                 let bg = CGA_BLACK;
                 let fg = self.cga.foreground_640x200();
-                for byte_col in 0..CGA_BYTES_PER_LINE {
-                    let byte = self.cga.fb.get(row_base + byte_col).copied().unwrap_or(0);
+                for byte_col in 0..pitch {
+                    let byte = self.cga_read(row_base + byte_col);
                     for bit in 0..8 {
                         let x = byte_col * 8 + bit;
                         if x < width {
@@ -1793,31 +3201,6 @@ impl Vga {
             }
         }
         row
-    }
-
-    /// Switch to the 80x25 text mode (mode 03h), resetting the beam, clearing the
-    /// text buffer to blank spaces, and dropping any stale graphics frame. The
-    /// BIOS INT 10h AH=00h text-family mode numbers all route here: the core
-    /// carries a single text personality, so the 40x25 and CGA variants return to
-    /// the same 80x25 geometry. Mirrors `set_mode13h`; the work buffer is sized so
-    /// the text raster is published on the next frame.
-    pub fn set_text_mode(&mut self) {
-        self.crtc = CrtcTiming::text_03h();
-        self.cursor_start = 0x0E;
-        self.cursor_end = 0x0F;
-        for cell in self.text_memory.chunks_exact_mut(2) {
-            cell[0] = b' ';
-            cell[1] = 0x07;
-        }
-        self.beam = 0;
-        self.last_line = 0;
-        self.mode = VideoMode::Text;
-        self.presented = None;
-        // A buffered start-address change from a prior graphics mode must not
-        // carry across the mode switch: the text origin resets to page 0.
-        self.pending_start = None;
-        self.reset_palette_defaults();
-        self.resize_work();
     }
 
     /// Derive the absolute vertical timing in `crtc` from the raw register bytes in
@@ -1886,20 +3269,48 @@ impl Vga {
 
     /// The CPU aperture window the Graphics Controller Miscellaneous register
     /// (06h) selects, plus the graphics and chain-odd-even flags. The machine bus
-    /// can consult this to route the legacy A0000/B0000 mapping once the routing
-    /// follow-up lands; this core only decodes and exposes it.
+    /// consults this to route the legacy A0000/B0000 mapping in graphics modes.
     pub fn gfx_aperture(&self) -> GfxAperture {
         self.gc.aperture()
     }
 
-    /// Set the border/overscan color (Attribute register 11h). Stored raw; the
-    /// raster path masks it to 6 bits when resolving the border color.
+    pub fn cga_mode_control(&self) -> u8 {
+        self.cga.mode_control
+    }
+
+    pub fn cga_color_select(&self) -> u8 {
+        self.cga.color_select
+    }
+
+    /// Set the border/overscan color. VGA stores Attribute register 11h raw;
+    /// CGA mirrors the low five bits into 3D9h's background/intensity field.
     pub fn set_overscan(&mut self, value: u8) {
         self.attr.overscan = value;
+        if self.is_cga_personality() {
+            self.cga.color_select = (self.cga.color_select & !0x1F) | (value & 0x1F);
+        }
+    }
+
+    pub fn set_text_blink_enabled(&mut self, enabled: bool) {
+        if self.is_cga_text_mode() {
+            if enabled {
+                self.cga.mode_control |= CGA_MODE_BLINK;
+            } else {
+                self.cga.mode_control &= !CGA_MODE_BLINK;
+            }
+        } else if enabled {
+            self.attr.mode_control |= 0x08;
+        } else {
+            self.attr.mode_control &= !0x08;
+        }
     }
 
     pub fn overscan(&self) -> u8 {
-        self.attr.overscan
+        if self.is_cga_personality() {
+            self.cga.color_select & 0x1F
+        } else {
+            self.attr.overscan
+        }
     }
 
     /// Set one Attribute palette register (0-15). The index is masked to 4 bits,
@@ -1912,7 +3323,32 @@ impl Vga {
         self.attr.palette[(index & 0x0F) as usize]
     }
 
+    pub fn set_attr_register(&mut self, index: u8, value: u8) {
+        match index & 0x1F {
+            0x00..=0x0F => self.set_attr_palette_reg(index, value),
+            0x10 => self.attr.mode_control = value,
+            0x11 => self.set_overscan(value),
+            0x12 => self.attr.plane_enable = value,
+            0x13 => self.attr.pixel_pan = value & 0x0F,
+            0x14 => self.attr.color_select = value,
+            _ => {}
+        }
+    }
+
+    pub fn attr_register(&self, index: u8) -> u8 {
+        match index & 0x1F {
+            0x00..=0x0F => self.attr_palette_reg(index),
+            0x10 => self.attr.mode_control,
+            0x11 => self.overscan(),
+            0x12 => self.attr.plane_enable,
+            0x13 => self.attr.pixel_pan,
+            0x14 => self.attr.color_select,
+            _ => 0,
+        }
+    }
+
     pub fn set_dac_entry(&mut self, index: u8, r: u8, g: u8, b: u8) {
+        let [r, g, b] = self.dac_entry_for_write(r, g, b);
         self.dac.set_entry(index, r, g, b);
     }
 
@@ -1921,11 +3357,51 @@ impl Vga {
     }
 
     pub fn set_dac_block(&mut self, start: u8, entries: &[[u8; 3]]) {
-        self.dac.set_block(start, entries);
+        for (offset, &[r, g, b]) in entries.iter().enumerate() {
+            self.set_dac_entry(start.wrapping_add(offset as u8), r, g, b);
+        }
     }
 
     pub fn dac_block_bytes(&self, start: u8, count: u16) -> Vec<u8> {
         self.dac.block_bytes(start, count)
+    }
+
+    pub fn default_palette_loading_enabled(&self) -> bool {
+        self.default_palette_loading_enabled
+    }
+
+    pub fn set_default_palette_loading_enabled(&mut self, enabled: bool) {
+        self.default_palette_loading_enabled = enabled;
+    }
+
+    pub fn grayscale_summing_enabled(&self) -> bool {
+        self.grayscale_summing_enabled
+    }
+
+    pub fn set_grayscale_summing_enabled(&mut self, enabled: bool) {
+        self.grayscale_summing_enabled = enabled;
+    }
+
+    pub fn sum_dac_entry_to_gray(&mut self, index: u8) {
+        if self.grayscale_summing_enabled {
+            let [r, g, b] = self.dac.entry(index);
+            let gray = Self::gray6(r, g, b);
+            self.dac.set_entry(index, gray, gray, gray);
+        }
+    }
+
+    fn dac_entry_for_write(&self, r: u8, g: u8, b: u8) -> [u8; 3] {
+        if self.grayscale_summing_enabled {
+            let gray = Self::gray6(r, g, b);
+            [gray, gray, gray]
+        } else {
+            [r & 0x3F, g & 0x3F, b & 0x3F]
+        }
+    }
+
+    fn gray6(r: u8, g: u8, b: u8) -> u8 {
+        ((u16::from(r & 0x3F) * 77 + u16::from(g & 0x3F) * 151 + u16::from(b & 0x3F) * 28) >> 8)
+            as u8
     }
 
     pub fn palette_argb(&self) -> [u32; DAC_ENTRIES] {
@@ -1938,25 +3414,26 @@ impl Vga {
     }
 
     pub fn frame(&self) -> TextFrame {
-        // The visible 80x25 page, read from the start-address origin so the
+        // The visible text page, read from the start-address origin so the
         // headless cell view matches the pixel scanout (render_text_row). Mode
         // 03h is word mode, so start_address is a word/cell address: the cell
         // index for (row, col) is start + row*offset + col, and the char/attr
-        // byte pair sits at that cell index * 2, wrapped at the 32 KB aperture.
+        // byte pair sits at that cell index * 2, wrapped at the live text aperture.
         let start_cells = self.crtc.start_address as usize;
-        let mut cells = Vec::with_capacity(VGA_TEXT_COLUMNS * VGA_TEXT_ROWS);
+        let columns = self.text_columns;
+        let mut cells = Vec::with_capacity(columns * VGA_TEXT_ROWS);
         for row in 0..VGA_TEXT_ROWS {
-            for col in 0..VGA_TEXT_COLUMNS {
+            for col in 0..columns {
                 let base = self.text_cell_base(start_cells, row, col);
                 cells.push(TextCell {
-                    character: self.text_memory.get(base).copied().unwrap_or(b' '),
-                    attribute: self.text_memory.get(base + 1).copied().unwrap_or(0x07),
+                    character: self.text_byte(base),
+                    attribute: self.text_byte(base + 1),
                 });
             }
         }
 
         TextFrame {
-            columns: VGA_TEXT_COLUMNS,
+            columns,
             rows: VGA_TEXT_ROWS,
             cells,
             cursor_offset: self.cursor_offset,
@@ -1998,12 +3475,19 @@ pub struct GfxController {
     pub read_map: u8,         // idx 4
     pub write_mode: u8,       // idx 5 bits 0..1
     pub read_mode: u8,        // idx 5 bit 3
+    pub mode_flags: u8,       // idx 5 bits 4..6: odd/even + shift modes
     pub color_dont_care: u8,  // idx 7
     pub bit_mask: u8,         // idx 8
     // idx 6 Miscellaneous Graphics: bit 0 graphics (vs alphanumeric), bit 1 chain
     // odd/even, bits 3-2 memory map select. Stored as written; the fields are
     // decoded by `aperture` (FreeVGA gfxreg.htm 06h).
     pub misc: u8,
+}
+
+impl GfxController {
+    fn mode_odd_even(&self) -> bool {
+        self.mode_flags & 0x10 != 0
+    }
 }
 
 /// The decoded Graphics Controller Miscellaneous register (index 06h): the CPU
@@ -2139,26 +3623,48 @@ pub fn write_planes(
 /// Map a display-address counter value `ma` to a per-plane byte offset, applying
 /// the CRTC byte/word/doubleword addressing transform and the 16-bit (64 KB)
 /// counter wrap. `mode_control` is CRTC index 17h, `underline_loc` is index 14h.
-/// See `dev_docs/reference/vga/crtc-addressing.md`.
+/// See `docs/vga-core/README.md` slice 3.
 pub fn display_offset(mode_control: u8, underline_loc: u8, ma: u32) -> usize {
-    let addr = if mode_control & 0x40 != 0 {
+    display_offset_row(mode_control, underline_loc, ma, 0)
+}
+
+pub fn display_counter(mode_control: u8, underline_loc: u8, row_base: u32, column: u32) -> u32 {
+    let divisor = if underline_loc & 0x20 != 0 {
+        4
+    } else if mode_control & 0x08 != 0 {
+        2
+    } else {
+        1
+    };
+    row_base + column / divisor
+}
+
+pub fn display_offset_row(mode_control: u8, underline_loc: u8, ma: u32, row_scan: u32) -> usize {
+    let mut addr = if mode_control & 0x40 != 0 {
         ma // byte mode (CR17 bit 6): identity
     } else if underline_loc & 0x40 != 0 {
-        // doubleword mode (CR14 bit 6): rotate left 2, MA13 -> bit 1, MA12 -> bit 0.
-        // These bit positions are pending validation against an unbroken reference
-        // mirror; no in-scope 16-color planar workload exercises doubleword mode.
-        (ma << 2) | ((ma >> 12) & 0x3)
+        // Doubleword mode (CR14 bit 6): MA0/MA1 are forced low, MA2..MA15 receive
+        // A0..A13; CR17 bits 0/1 may still replace MA13/MA14 with row-scan bits.
+        ma << 2
     } else {
         // word mode: rotate left 1, MA15 (CR17 bit 5 = 1) or MA13 (= 0) -> bit 0
         let wrap_bit = if mode_control & 0x20 != 0 { 15 } else { 13 };
         (ma << 1) | ((ma >> wrap_bit) & 1)
     };
+    if mode_control & 0x01 == 0 {
+        addr = (addr & !(1 << 13)) | ((row_scan & 0x01) << 13);
+    }
+    if mode_control & 0x02 == 0 {
+        addr = (addr & !(1 << 14)) | (((row_scan >> 1) & 0x01) << 14);
+    }
     (addr as usize) % VGA_PLANE_SIZE
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const BIOS_TEXT_WHITE: u8 = 0x3F;
 
     #[test]
     fn cga_320x200_decodes_a_byte_msb_first() {
@@ -2199,6 +3705,9 @@ mod tests {
         // The background nibble (bits 0-3) sets pixel value 0.
         vga.write_port(0x3D9, 0x01); // background = blue(1)
         assert_eq!(vga.cga.decode_byte_320x200(0b00_00_00_00)[0], 1);
+        let raster = vga.render_full_frame();
+        let border = (raster.height as usize - 1) * raster.width as usize;
+        assert_eq!(raster.pixels[border], 1);
     }
 
     #[test]
@@ -2249,16 +3758,62 @@ mod tests {
     }
 
     #[test]
+    fn cga_graphics_scanout_honors_start_address_and_wraps() {
+        let mut vga = Vga::default();
+        assert!(vga.set_cga_mode(0x04));
+        vga.cga_write(0x0000, 0b01_01_01_01);
+        vga.cga_write(0x0001, 0b10_10_10_10);
+        assert_eq!(&vga.render_cga_row(0)[0..4], &[CGA_GREEN; 4]);
+
+        vga.crtc.start_address = 1;
+        assert_eq!(&vga.render_cga_row(0)[0..4], &[CGA_RED; 4]);
+
+        vga.crtc.start_address = (CGA_FB_SIZE - 1) as u32;
+        vga.cga_write(CGA_FB_SIZE - 1, 0b11_11_11_11);
+        assert_eq!(&vga.render_cga_row(0)[0..4], &[CGA_BROWN; 4]);
+    }
+
+    #[test]
     fn cga_640x200_unpacks_one_bit_per_pixel() {
         let mut vga = Vga::default();
         assert!(vga.set_cga_mode(0x06));
+        assert_eq!(vga.crtc_regs.r00, 0x38);
+        assert_eq!(vga.crtc_regs.r01, 0x28);
+        assert_eq!(vga.crtc.char_width, 16);
         assert_eq!(vga.crtc.hdisp_end, 640);
+        assert_eq!(htotal_dots(&vga.crtc), 912);
         assert_eq!(vga.active_mode(), VideoMode::Cga);
-        // Foreground defaults to white (bits 0-3 = 0 -> white); 0b10101010 lights
-        // every other pixel.
+        // BIOS mode 06h starts white-on-black; 0b10101010 lights every other pixel.
         vga.cga_write(0x0000, 0b1010_1010);
         let line0 = vga.render_cga_row(0);
         assert_eq!(&line0[0..8], &[15, 0, 15, 0, 15, 0, 15, 0]);
+
+        vga.write_port(0x3D9, 0x00);
+        assert_eq!(&vga.render_cga_row(0)[0..8], &[0; 8]);
+
+        vga.write_port(0x3D9, 0x04);
+        assert_eq!(&vga.render_cga_row(0)[0..8], &[4, 0, 4, 0, 4, 0, 4, 0]);
+    }
+
+    #[test]
+    fn cga_pixel_helpers_pack_and_xor_raw_pixel_values() {
+        let mut vga = Vga::default();
+        assert!(vga.set_cga_mode(0x04));
+
+        assert!(vga.cga_write_pixel(2, 1, 3, false));
+        assert_eq!(vga.cga_read(0x2000), 0x0C);
+        assert_eq!(vga.cga_read_pixel(2, 1), 3);
+        assert_eq!(vga.render_cga_row(1)[2], CGA_BROWN);
+
+        assert!(vga.cga_write_pixel(2, 1, 1, true));
+        assert_eq!(vga.cga_read_pixel(2, 1), 2);
+        assert_eq!(vga.render_cga_row(1)[2], CGA_RED);
+
+        assert!(vga.set_cga_mode(0x06));
+        assert!(vga.cga_write_pixel(9, 0, 1, false));
+        assert_eq!(vga.cga_read(1), 0x40);
+        assert_eq!(vga.cga_read_pixel(9, 0), 1);
+        assert_eq!(vga.render_cga_row(0)[9], CGA_WHITE);
     }
 
     #[test]
@@ -2267,9 +3822,347 @@ mod tests {
         assert!(vga.set_cga_mode(0x04));
         assert_eq!(vga.active_mode(), VideoMode::Cga);
         assert_eq!(vga.raster_width(), 320);
+        assert_eq!(htotal_dots(&vga.crtc), 456);
         assert_eq!(vga.crtc.vdisp_end, 200);
+        assert_eq!(vga.cga_mode_control(), 0x0A);
         // An unimplemented number leaves the mode untouched.
         assert!(!vga.set_cga_mode(0x09));
+    }
+
+    #[test]
+    fn cga_mode_control_switches_graphics_decode_without_clearing_fb() {
+        let mut vga = Vga::default();
+        assert!(vga.set_cga_mode(0x04));
+        vga.cga_write(0, 0b10_00_00_00);
+        assert_eq!(vga.render_cga_row(0)[0], CGA_RED);
+
+        assert!(vga.write_port(0x3D8, 0x1A));
+        assert_eq!(vga.raster_width(), 640);
+        assert_eq!(vga.crtc.char_width, 16);
+        assert_eq!(vga.crtc_regs.r01, 0x28);
+        assert_eq!(htotal_dots(&vga.crtc), 912);
+        assert_eq!(vga.cga_read(0), 0b10_00_00_00);
+        assert_eq!(vga.render_cga_row(0)[0], CGA_BLACK);
+
+        vga.write_port(0x3D9, 0x0F);
+        assert_eq!(vga.render_cga_row(0)[0], CGA_WHITE);
+
+        assert!(vga.write_port(0x3D8, 0x02));
+        assert_eq!(vga.raster_width(), 320);
+        assert_eq!(vga.crtc.char_width, 8);
+        assert_eq!(htotal_dots(&vga.crtc), 456);
+        assert_eq!(vga.render_cga_row(0)[0], CGA_BLACK);
+    }
+
+    #[test]
+    fn cga_mode_control_switches_text_width_and_blanks_without_clearing() {
+        let mut vga = Vga::default();
+        assert!(vga.set_cga_text_mode(0x01));
+        text_put(&mut vga, 0, 0, 0xDB, 0x0F);
+
+        assert_eq!(vga.cga_mode_control(), 0x28);
+        assert_eq!(vga.raster_width(), 320);
+        assert_eq!(vga.render_text_row(0)[0], CGA_WHITE);
+
+        assert!(vga.write_port(0x3D8, 0x20));
+        assert_eq!(vga.render_text_row(0)[0], CGA_BLACK);
+        assert_eq!(vga.read_u8(0).unwrap(), 0xDB);
+
+        assert!(vga.write_port(0x3D8, 0x29));
+        assert_eq!(vga.raster_width(), 640);
+        assert_eq!(vga.frame().columns, 80);
+        assert_eq!(vga.render_text_row(0)[0], CGA_WHITE);
+    }
+
+    #[test]
+    fn cga_mode_control_switches_between_text_and_graphics_without_clearing() {
+        let mut vga = Vga::default();
+        assert!(vga.set_cga_text_mode(0x01));
+        text_put(&mut vga, 0, 0, 0b10_00_00_00, 0x0F);
+
+        assert!(vga.write_port(0x3D8, 0x0A));
+        assert_eq!(vga.active_mode(), VideoMode::Cga);
+        assert_eq!(vga.render_cga_row(0)[0], CGA_RED);
+        vga.cga_write(0, b'T');
+
+        assert!(vga.write_port(0x3D8, 0x28));
+        assert_eq!(vga.active_mode(), VideoMode::Text);
+        assert_eq!(vga.frame().columns, 40);
+        assert_eq!(vga.frame().cells[0].character, b'T');
+    }
+
+    #[test]
+    fn cga_light_pen_ports_set_clear_status_and_latch_position() {
+        let mut vga = Vga::default();
+        assert!(vga.set_cga_mode(0x04));
+        assert_eq!(vga.read_port(0x3DA).unwrap() & 0x06, 0x04);
+
+        vga.advance(htotal_dots(&vga.crtc) * 16 + 80);
+        assert_eq!(vga.read_port(0x3DC), Some(0xFF));
+        assert_eq!(vga.read_port(0x3DA).unwrap() & 0x06, 0x06);
+
+        vga.write_port(0x3D4, 0x10);
+        assert_eq!(vga.read_port(0x3D5), Some(0x01));
+        vga.write_port(0x3D4, 0x11);
+        assert_eq!(vga.read_port(0x3D5), Some(0x4A));
+
+        assert_eq!(vga.read_port(0x3DB), Some(0xFF));
+        assert_eq!(vga.read_port(0x3DA).unwrap() & 0x06, 0x04);
+    }
+
+    #[test]
+    fn cga_light_pen_graphics_column_has_cga_precision() {
+        let mut vga = Vga::default();
+        assert!(vga.set_cga_mode(0x04));
+
+        vga.advance(htotal_dots(&vga.crtc) * 11 + 95);
+        assert_eq!(vga.read_port(0x3DC), Some(0xFF));
+        assert_eq!(vga.cga_light_pen_report(), Some((94, 10, 1, 11)));
+        assert_eq!(vga.read_port(0x3DB), Some(0xFF));
+
+        assert!(vga.set_cga_mode(0x06));
+        vga.advance(htotal_dots(&vga.crtc) * 11 + 95);
+        assert_eq!(vga.read_port(0x3DC), Some(0xFF));
+        assert_eq!(vga.cga_light_pen_report(), Some((92, 10, 1, 5)));
+    }
+
+    #[test]
+    fn cga_crtc_ports_decode_3d0_through_3d7_aliases() {
+        let mut vga = Vga::default();
+        assert!(vga.set_cga_mode(0x04));
+
+        for (index_port, data_port, value) in [
+            (0x3D0, 0x3D1, 0x20),
+            (0x3D2, 0x3D3, 0x21),
+            (0x3D4, 0x3D5, 0x22),
+            (0x3D6, 0x3D7, 0x23),
+        ] {
+            assert!(vga.write_port(index_port, 0x01));
+            assert!(vga.write_port(data_port, value));
+            assert_eq!(vga.crtc_index, 0x01);
+            assert_eq!(vga.read_port(index_port), None);
+            assert_eq!(vga.read_port(data_port), None);
+        }
+
+        assert_eq!(vga.raster_width(), 0x23 * 8);
+    }
+
+    #[test]
+    fn cga_crtc_timing_and_cursor_shape_registers_are_write_only() {
+        let mut vga = Vga::default();
+        assert!(vga.set_cga_mode(0x04));
+
+        for (index, value) in [(0x01, 0x20), (0x09, 0x01), (0x0A, 0x06), (0x0B, 0x07)] {
+            assert!(vga.write_port(0x3D4, index));
+            assert!(vga.write_port(0x3D5, value));
+            assert_eq!(vga.read_port(0x3D5), None, "CGA CRTC register {index:02X}");
+        }
+    }
+
+    #[test]
+    fn cga_crtc_index_is_a_5_bit_pointer() {
+        let mut vga = Vga::default();
+        assert!(vga.set_cga_mode(0x04));
+
+        assert!(vga.write_port(0x3D4, 0x8E));
+        assert!(vga.write_port(0x3D5, 0x12));
+        assert!(vga.write_port(0x3D4, 0x8F));
+        assert!(vga.write_port(0x3D5, 0x34));
+
+        assert_eq!(vga.crtc_index, 0x0F);
+        assert_eq!(vga.read_port(0x3D4), None);
+        assert!(vga.write_port(0x3D4, 0x0E));
+        assert_eq!(vga.read_port(0x3D5), Some(0x12));
+        assert!(vga.write_port(0x3D4, 0x0F));
+        assert_eq!(vga.read_port(0x3D5), Some(0x34));
+    }
+
+    #[test]
+    fn cga_control_registers_are_6_bit_latches() {
+        let mut vga = Vga::default();
+        assert!(vga.set_cga_mode(0x04));
+
+        assert!(vga.write_port(0x3D8, 0xFF));
+        assert_eq!(vga.cga_mode_control(), 0x3F);
+        assert!(vga.write_port(0x3D9, 0xFF));
+        assert_eq!(vga.cga_color_select(), 0x3F);
+    }
+
+    #[test]
+    fn cga_crtc_address_high_registers_are_6_bit_fields() {
+        let mut vga = Vga::default();
+        assert!(vga.set_cga_mode(0x04));
+
+        assert!(vga.write_port(0x3D4, 0x0C));
+        assert!(vga.write_port(0x3D5, 0xFF));
+        assert!(vga.write_port(0x3D4, 0x0D));
+        assert!(vga.write_port(0x3D5, 0xEE));
+        assert!(vga.write_port(0x3D4, 0x0C));
+        assert_eq!(vga.crtc_start_register(), 0x3FEE);
+        assert_eq!(vga.read_port(0x3D5), None);
+        assert!(vga.write_port(0x3D4, 0x0D));
+        assert_eq!(vga.read_port(0x3D5), None);
+
+        assert!(vga.write_port(0x3D4, 0x0E));
+        assert!(vga.write_port(0x3D5, 0xFF));
+        assert!(vga.write_port(0x3D4, 0x0F));
+        assert!(vga.write_port(0x3D5, 0xAA));
+        assert!(vga.write_port(0x3D4, 0x0E));
+        assert_eq!(vga.read_port(0x3D5), Some(0x3F));
+        assert!(vga.write_port(0x3D4, 0x0F));
+        assert_eq!(vga.read_port(0x3D5), Some(0xAA));
+    }
+
+    #[test]
+    fn cga_crtc_timing_registers_mask_to_6845_field_widths() {
+        let mut vga = Vga::default();
+        assert!(vga.set_cga_mode(0x04));
+
+        for index in 0x03..=0x09 {
+            assert!(vga.write_port(0x3D4, index));
+            assert!(vga.write_port(0x3D5, 0xF0));
+        }
+
+        assert_eq!(vga.crtc_regs.r03, 0x00);
+        assert_eq!(vga.crtc_regs.r04, 0x70);
+        assert_eq!(vga.crtc_regs.r05, 0x10);
+        assert_eq!(vga.crtc_regs.r06, 0x70);
+        assert_eq!(vga.crtc_regs.r07, 0x70);
+        assert_eq!(vga.crtc_regs.r08, 0x00);
+        assert_eq!(vga.crtc_regs.r09, 0x10);
+        assert_eq!(vga.crtc.max_scan, 0x10);
+    }
+
+    #[test]
+    fn cga_cursor_mode_zero_does_not_blink() {
+        let mut vga = Vga::default();
+        assert!(vga.set_cga_text_mode(0x02));
+        text_put(&mut vga, 0, 0, b' ', 0x0F);
+        vga.cursor_offset = 0;
+        vga.cursor_start = 0x00;
+        vga.cursor_end = 0x07;
+        vga.frames = 16;
+
+        assert_eq!(vga.render_text_row(0)[0], CGA_WHITE);
+    }
+
+    #[test]
+    fn cga_cursor_end_ignores_vga_skew_bits() {
+        let mut vga = Vga::default();
+        assert!(vga.set_cga_text_mode(0x02));
+        text_put(&mut vga, 0, 0, b' ', 0x0F);
+        vga.cursor_offset = 0;
+        vga.frames = 0;
+
+        assert!(vga.write_port(0x3D4, 0x0A));
+        assert!(vga.write_port(0x3D5, 0x00));
+        assert!(vga.write_port(0x3D4, 0x0B));
+        assert!(vga.write_port(0x3D5, 0x67));
+
+        assert_eq!(vga.cursor_end, 0x07);
+        assert_eq!(vga.render_text_row(0)[0], CGA_WHITE);
+    }
+
+    #[test]
+    fn cga_status_reports_display_inactive_when_video_is_disabled() {
+        let mut vga = Vga::default();
+        assert!(vga.set_cga_mode(0x04));
+        assert_eq!(vga.read_port(0x3DA).unwrap() & 0x01, 0x00);
+
+        assert!(vga.write_port(0x3D8, CGA_MODE_GRAPHICS));
+        assert_eq!(vga.read_port(0x3DA).unwrap() & 0x01, 0x01);
+
+        assert!(vga.write_port(0x3D8, CGA_MODE_GRAPHICS | CGA_MODE_VIDEO_ENABLE));
+        assert_eq!(vga.read_port(0x3DA).unwrap() & 0x01, 0x00);
+    }
+
+    #[test]
+    fn cga_crtc_registers_can_retune_80_column_text_to_160x100() {
+        let mut vga = Vga::default();
+        vga.set_text_mode();
+        assert_eq!(vga.raster_width(), 720);
+
+        assert!(vga.write_port(0x3D8, 0x01)); // 80-column text, video disabled
+        assert_eq!(vga.raster_width(), 640);
+        assert_eq!(vga.render_text_row(0)[0], CGA_BLACK);
+
+        for (index, value) in [(0x04, 0x7F), (0x06, 0x64), (0x07, 0x70), (0x09, 0x01)] {
+            vga.write_port(0x3D4, index);
+            vga.write_port(0x3D5, value);
+        }
+        text_put(&mut vga, 99, 0, 0xDB, 0x0F);
+
+        assert!(vga.write_port(0x3D8, 0x09)); // preserve CRTC retune, enable video
+        assert_eq!(vga.crtc.max_scan, 1);
+        assert_eq!(vga.crtc.vtotal, 262);
+        assert_eq!(vga.crtc.vdisp_end, 200);
+        assert_eq!(vga.crtc.vretrace_start, 224);
+        assert_eq!(vga.frame().columns, 80);
+
+        vga.write_port(0x3D4, 0x09);
+        assert_eq!(vga.read_port(0x3D5), None);
+        assert_eq!(vga.render_text_row(198)[0], CGA_WHITE);
+
+        let raster = vga.render_full_frame();
+        assert_eq!(raster.width, 640);
+        assert_eq!(raster.height, 262);
+        assert_eq!(raster.pixels[200 * raster.width as usize], CGA_BLACK);
+    }
+
+    #[test]
+    fn cga_crtc_horizontal_registers_drive_width_and_survive_video_enable() {
+        let mut vga = Vga::default();
+        vga.set_text_mode();
+
+        assert!(vga.write_port(0x3D8, 0x01)); // 80-column text, video disabled
+        assert_eq!(vga.raster_width(), 640);
+        assert_eq!(htotal_dots(&vga.crtc), 912);
+
+        for (index, value) in [(0x00, 0x63), (0x01, 0x28)] {
+            vga.write_port(0x3D4, index);
+            vga.write_port(0x3D5, value);
+        }
+
+        assert_eq!(vga.raster_width(), 320);
+        assert_eq!(htotal_dots(&vga.crtc), 800);
+        assert_eq!(vga.frame().columns, 40);
+
+        assert!(vga.write_port(0x3D8, 0x09)); // enable only; keep manual R0/R1
+        assert_eq!(vga.raster_width(), 320);
+        assert_eq!(htotal_dots(&vga.crtc), 800);
+        vga.write_port(0x3D4, 0x01);
+        assert_eq!(vga.read_port(0x3D5), None);
+    }
+
+    #[test]
+    fn cga_crtc_horizontal_displayed_drives_graphics_row_stride() {
+        let mut vga = Vga::default();
+        assert!(vga.set_cga_mode(0x04));
+
+        vga.write_port(0x3D4, 0x01);
+        vga.write_port(0x3D5, 0x20); // 32 displayed chars: 256 pixels, 64 bytes/row
+        assert_eq!(vga.raster_width(), 256);
+
+        vga.cga_write(80, 0b10_10_10_10); // old fixed stride would read this
+        vga.cga_write(64, 0b01_01_01_01); // live 64-byte stride reads this
+        assert_eq!(vga.cga_read_pixel(0, 2), 1);
+        assert_eq!(vga.render_cga_row(2)[0], CGA_GREEN);
+    }
+
+    #[test]
+    fn cga_640x200_crtc_displayed_uses_16_dot_characters() {
+        let mut vga = Vga::default();
+        assert!(vga.set_cga_mode(0x06));
+
+        vga.write_port(0x3D4, 0x01);
+        vga.write_port(0x3D5, 0x20); // 32 displayed chars: 512 pixels in high-res CGA.
+        assert_eq!(vga.crtc.char_width, 16);
+        assert_eq!(vga.raster_width(), 512);
+
+        vga.cga_write(80, 0x00); // old fixed 80-byte stride would read this
+        vga.cga_write(64, 0x80); // live 64-byte stride reads this
+        assert_eq!(vga.cga_read_pixel(0, 2), 1);
+        assert_eq!(vga.render_cga_row(2)[0], CGA_WHITE);
     }
 
     #[test]
@@ -2277,17 +4170,41 @@ mod tests {
         // Byte mode (CR17 bit 6 = 1): identity, wrapped at 64 KB.
         assert_eq!(display_offset(0xE3, 0x00, 0x1234), 0x1234);
         assert_eq!(display_offset(0xE3, 0x00, 0x1_0005), 0x0005); // 64 KB counter wrap
+        assert_eq!(
+            display_counter(0xE3, 0x00, 0x1000, 3),
+            0x1003,
+            "normal address clock increments every character"
+        );
+        assert_eq!(
+            display_counter(0xEB, 0x00, 0x1000, 3),
+            0x1001,
+            "CR17 bit 3 divides the address clock by two"
+        );
+        assert_eq!(
+            display_counter(0xE3, 0x20, 0x1000, 7),
+            0x1001,
+            "CR14 bit 5 divides the address clock by four"
+        );
         // Word mode, 16-bit wrap (CR17 = 0xA3: bit 6 = 0, bit 5 = 1): rotate left 1,
         // MA15 into bit 0.
         assert_eq!(display_offset(0xA3, 0x00, 0x4001), 0x8002); // MA15 = 0
         assert_eq!(display_offset(0xA3, 0x00, 0x8000), 0x0001); // MA15 = 1 -> bit 0
         // Word mode, 14-bit wrap (CR17 = 0x83: bit 6 = 0, bit 5 = 0): MA13 into bit 0.
         assert_eq!(display_offset(0x83, 0x00, 0x2000), 0x4001); // MA13 = 1 -> bit 0
-        // Doubleword mode (CR14 bit 6 = 1, word base): rotate left 2, MA13 -> bit 1,
-        // MA12 -> bit 0.
-        assert_eq!(display_offset(0xA3, 0x40, 0x3000), 0xC003);
+        // Doubleword mode (CR14 bit 6 = 1): shift left two, forcing MA0/MA1 low.
+        assert_eq!(display_offset(0xA3, 0x40, 0x3000), 0xC000);
+        assert_eq!(
+            display_offset_row(0xA0, 0x40, 0, 3),
+            0x6000,
+            "CR17 bits 0/1 still substitute row-scan bits in doubleword mode"
+        );
         // Byte mode wins over the doubleword bit.
         assert_eq!(display_offset(0xE3, 0x40, 0x1234), 0x1234);
+        assert_eq!(
+            display_offset_row(0xE0, 0x00, 0, 3),
+            0x6000,
+            "CR17 bits 0/1 clear substitute row-scan bits into address bits 13/14"
+        );
     }
 
     #[test]
@@ -2304,6 +4221,31 @@ mod tests {
         vga.write_port(0x3D4, 0x14); // CRTC index 14h
         vga.write_port(0x3D5, 0x40); // doubleword bit
         assert_eq!(vga.crtc.underline_loc, 0x40);
+    }
+
+    #[test]
+    fn crtc_address_generation_bits_affect_scanout() {
+        let mut vga = Vga::default();
+        vga.set_mode_0dh(); // double-scanned, so row 0 and row 1 share source row 0.
+        vga.crtc.mode_control &= !0x01; // substitute row-scan bit 0 for address bit 13.
+        vga.vram[0] = 0x80;
+        vga.vram[VGA_PLANE_SIZE + 0x2000] = 0x80;
+
+        assert_eq!(vga.render_active_row(0)[0], 0x01);
+        assert_eq!(vga.render_active_row(1)[0], 0x02);
+
+        let mut divided = Vga::default();
+        assert!(divided.set_mode(0x10));
+        divided.crtc.mode_control |= 0x08; // divide address clock by two.
+        divided.vram[0] = 0x80;
+        divided.vram[VGA_PLANE_SIZE + 1] = 0x80;
+        assert_eq!(divided.render_active_row(0)[0], 0x01);
+        assert_eq!(
+            divided.render_active_row(0)[8],
+            0x01,
+            "second byte column still reads offset 0 when the address clock is /2"
+        );
+        assert_eq!(divided.render_active_row(0)[16], 0x02);
     }
 
     #[test]
@@ -2479,9 +4421,7 @@ mod tests {
     #[test]
     fn cpu_write_then_read_round_trips_through_latches() {
         let mut vga = Vga::default();
-        vga.seq.map_mask = 0x0F; // all planes enabled
-        vga.gc.write_mode = 0;
-        vga.gc.bit_mask = 0xFF;
+        vga.set_mode_0dh();
         vga.cpu_write(0x10, 0xA5);
         vga.gc.read_map = 0;
         assert_eq!(vga.cpu_read(0x10), 0xA5);
@@ -2491,11 +4431,60 @@ mod tests {
     #[test]
     fn map_mask_gates_which_planes_are_written() {
         let mut vga = Vga::default();
+        vga.seq.memory_mode = 0x04; // sequential planar addressing
         vga.seq.map_mask = 0b0001; // only plane 0
         vga.gc.bit_mask = 0xFF;
         vga.cpu_write(0, 0xFF);
         assert_eq!(vga.plane_byte(0, 0), 0xFF);
         assert_eq!(vga.plane_byte(1, 0), 0x00);
+    }
+
+    #[test]
+    fn odd_even_write_routes_cpu_addresses_to_plane_pairs() {
+        let mut vga = Vga::default();
+        vga.seq.memory_mode = 0x02; // bit 2 clear: odd/even writes enabled
+        vga.seq.map_mask = 0x0F;
+        vga.gc.bit_mask = 0xFF;
+
+        vga.cpu_write(0, 0xA5);
+        vga.cpu_write(1, 0x5A);
+
+        assert_eq!(vga.plane_byte(0, 0), 0xA5);
+        assert_eq!(vga.plane_byte(2, 0), 0xA5);
+        assert_eq!(vga.plane_byte(1, 0), 0x5A);
+        assert_eq!(vga.plane_byte(3, 0), 0x5A);
+        assert_eq!(
+            vga.plane_byte(0, 1),
+            0x00,
+            "odd/even addressing advances the plane offset every two CPU bytes"
+        );
+    }
+
+    #[test]
+    fn odd_even_read_uses_address_parity_and_read_map_pair() {
+        let mut vga = Vga::default();
+        vga.write_port(0x3CE, 0x05);
+        vga.write_port(0x3CF, 0x10); // GC05 bit 4: odd/even read mode
+        assert_eq!(vga.read_port(0x3CF), Some(0x10));
+        vga.write_port(0x3CE, 0x06);
+        vga.write_port(0x3CF, 0x03); // graphics + chain odd/even
+
+        vga.vram[0] = 0x10;
+        vga.vram[VGA_PLANE_SIZE] = 0x11;
+        vga.vram[2 * VGA_PLANE_SIZE] = 0x20;
+        vga.vram[3 * VGA_PLANE_SIZE] = 0x21;
+        vga.vram[1] = 0x30;
+        vga.vram[VGA_PLANE_SIZE + 1] = 0x31;
+
+        vga.gc.read_map = 0;
+        assert_eq!(vga.cpu_read(0), 0x10);
+        assert_eq!(vga.cpu_read(1), 0x11);
+        assert_eq!(vga.cpu_read(3), 0x31);
+
+        vga.gc.read_map = 2;
+        assert_eq!(vga.cpu_read(0), 0x20);
+        assert_eq!(vga.cpu_read(1), 0x21);
+        assert_eq!(vga.latches, [0x10, 0x11, 0x20, 0x21]);
     }
 
     #[test]
@@ -2583,6 +4572,25 @@ mod tests {
     }
 
     #[test]
+    fn cga_start_address_registers_are_write_only_but_latch_pending_value() {
+        let mut vga = Vga::default();
+        assert!(vga.set_cga_mode(0x04));
+
+        vga.write_port(0x3D4, 0x0C);
+        vga.write_port(0x3D5, 0x12);
+        vga.write_port(0x3D4, 0x0D);
+        vga.write_port(0x3D5, 0x34);
+
+        assert_eq!(vga.crtc_start_address(), 0);
+        assert_eq!(vga.pending_start_address(), Some(0x1234));
+        assert_eq!(vga.crtc_start_register(), 0x1234);
+        vga.write_port(0x3D4, 0x0C);
+        assert_eq!(vga.read_port(0x3D5), None);
+        vga.write_port(0x3D4, 0x0D);
+        assert_eq!(vga.read_port(0x3D5), None);
+    }
+
+    #[test]
     fn gc_and_seq_ports_round_trip_and_catch_up_runs_first() {
         let mut vga = Vga::default();
         vga.set_mode_0dh();
@@ -2643,6 +4651,8 @@ mod tests {
             (0x04, 0x54),
             (0x05, 0x80),
         ];
+        vga.write_port(0x3D4, 0x11);
+        vga.write_port(0x3D5, 0x00);
         for (index, value) in writes {
             vga.write_port(0x3D4, index);
             vga.write_port(0x3D5, value);
@@ -2655,6 +4665,31 @@ mod tests {
                 "horizontal CRTC index {index:#04x} round-trips"
             );
         }
+    }
+
+    #[test]
+    fn crtc_11h_write_protect_locks_registers_00h_through_07h() {
+        let mut vga = Vga::default();
+        vga.crtc_regs.r00 = 0x5F;
+        vga.crtc_regs.r07 = 0x00;
+        vga.crtc.line_compare = 0;
+
+        vga.write_port(0x3D4, 0x11);
+        vga.write_port(0x3D5, 0x80);
+        vga.write_port(0x3D4, 0x00);
+        vga.write_port(0x3D5, 0x77);
+        assert_eq!(vga.crtc_regs.r00, 0x5F);
+
+        vga.write_port(0x3D4, 0x07);
+        vga.write_port(0x3D5, 0x10);
+        assert_eq!(vga.crtc_regs.r07, 0x00);
+        assert_eq!(vga.crtc.line_compare & 0x100, 0x100);
+
+        vga.write_port(0x3D4, 0x11);
+        vga.write_port(0x3D5, 0x00);
+        vga.write_port(0x3D4, 0x00);
+        vga.write_port(0x3D5, 0x77);
+        assert_eq!(vga.crtc_regs.r00, 0x77);
     }
 
     #[test]
@@ -2675,6 +4710,7 @@ mod tests {
             attr.palette,
             [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
         );
+        assert_eq!(attr.plane_enable & 0x0F, 0x0F);
     }
 
     #[test]
@@ -2682,6 +4718,68 @@ mod tests {
         let mut vga = Vga::default();
         assert!(vga.write_port(0x3C2, 0x42));
         assert_eq!(vga.read_port(0x3CC), Some(0x42));
+    }
+
+    #[test]
+    fn misc_output_clock_select_drives_dot_clock() {
+        let mut vga = Vga::default();
+        assert_eq!(vga.dot_clock_hz(), VGA_DOT_CLOCK_28_HZ);
+
+        assert!(vga.write_port(0x3C2, 0x00));
+        assert_eq!(vga.dot_clock_hz(), VGA_DOT_CLOCK_25_HZ);
+        assert!(vga.write_port(0x3C2, 0x04));
+        assert_eq!(vga.dot_clock_hz(), VGA_DOT_CLOCK_28_HZ);
+        assert!(vga.write_port(0x3C2, 0x08));
+        assert_eq!(vga.dot_clock_hz(), VGA_DOT_CLOCK_25_HZ);
+
+        vga.set_mode13h();
+        assert_eq!(vga.dot_clock_hz(), VGA_DOT_CLOCK_25_HZ);
+        vga.set_text_mode();
+        assert_eq!(vga.dot_clock_hz(), VGA_DOT_CLOCK_28_HZ);
+    }
+
+    #[test]
+    fn misc_output_ios_selects_crtc_status_and_feature_ports() {
+        let mut vga = Vga::default();
+
+        assert!(vga.write_port(0x3D4, 0x0C));
+        assert_eq!(vga.read_port(0x3D4), Some(0x0C));
+        assert_eq!(vga.read_port(0x3B4), None);
+        assert!(vga.read_port(0x3DA).is_some());
+        assert_eq!(vga.read_port(0x3BA), None);
+        assert!(vga.write_port(0x3DA, 0x0A));
+        assert_eq!(vga.read_port(0x3CA), Some(0x0A));
+
+        assert!(vga.write_port(0x3C2, vga.misc_output & !0x01));
+        assert!(!vga.write_port(0x3D4, 0x0A));
+        assert!(vga.write_port(0x3B4, 0x0A));
+        assert_eq!(vga.read_port(0x3B4), Some(0x0A));
+        assert_eq!(vga.read_port(0x3D4), None);
+        assert!(vga.write_port(0x3B5, 0x05));
+        assert_eq!(vga.cursor_start, 0x05);
+        assert!(vga.read_port(0x3BA).is_some());
+        assert_eq!(vga.read_port(0x3DA), None);
+        assert!(vga.write_port(0x3BA, 0x05));
+        assert_eq!(vga.read_port(0x3CA), Some(0x05));
+    }
+
+    #[test]
+    fn mono_text_mode_uses_b000_9x14_720x350() {
+        let mut vga = Vga::default();
+        vga.set_mono_text_mode();
+
+        assert_eq!(vga.active_mode(), VideoMode::Text);
+        assert_eq!(vga.text_memory_base(), VGA_MONO_TEXT_BASE);
+        assert_eq!(vga.raster_width(), 720);
+        assert_eq!(vga.raster_height(), 449);
+        assert_eq!(vga.crtc.vdisp_end, 350);
+        assert_eq!(vga.crtc.max_scan, 13);
+        assert_eq!(vga.misc_output & 0xCD, 0x84);
+        assert_eq!(vga.cursor_start, 0x0C);
+        assert_eq!(vga.cursor_end, 0x0D);
+
+        text_put(&mut vga, 0, 0, 0xDB, 0x0F);
+        assert_eq!(vga.render_text_row(0)[0], 0x0F);
     }
 
     #[test]
@@ -2760,6 +4858,34 @@ mod tests {
         assert_eq!(status & 0x01, 0x01); // bit 0 display disabled (in retrace)
         // Reading 3DA resets the attribute address/data flip-flop to "address".
         assert!(!vga.attr.flip_flop_data);
+    }
+
+    #[test]
+    fn status1_reports_attribute_video_status_mux_bits() {
+        let mut vga = Vga::default();
+        vga.set_mode13h();
+
+        for (color, mux, expected) in [
+            (0x04, 0x00, 0x20), // mux 00: status bits 5/4 = colour bits 2/0
+            (0x01, 0x00, 0x10),
+            (0x20, 0x10, 0x20), // mux 01: colour bits 5/4
+            (0x10, 0x10, 0x10),
+            (0x08, 0x20, 0x20), // mux 10: colour bits 3/1
+            (0x02, 0x20, 0x10),
+            (0x80, 0x30, 0x20), // mux 11: colour bits 7/6
+            (0x40, 0x30, 0x10),
+        ] {
+            vga.beam = 0;
+            vga.vram[0] = color;
+            vga.attr.plane_enable = 0x0F | mux;
+            assert_eq!(vga.read_status1() & 0x30, expected);
+        }
+
+        let htotal = htotal_dots(&vga.crtc);
+        vga.beam = htotal * u64::from(vga.crtc.vretrace_start);
+        vga.vram[0] = 0xC0;
+        vga.attr.plane_enable = 0x3F;
+        assert_eq!(vga.read_status1() & 0x30, 0x00);
     }
 
     #[test]
@@ -2868,6 +4994,20 @@ mod tests {
     }
 
     #[test]
+    fn mode13h_mode_set_installs_chain4_and_a000_graphics_defaults() {
+        let mut video = Vga::default();
+        video.set_mode13h();
+
+        assert_eq!(video.seq.map_mask, 0x0F);
+        assert_eq!(video.seq.memory_mode, 0x0E);
+        assert_eq!(video.gc.bit_mask, 0xFF);
+        assert_eq!(video.gc.color_dont_care, 0x0F);
+        let ap = video.gfx_aperture();
+        assert_eq!((ap.base, ap.length), (0x000A_0000, 0x0001_0000));
+        assert!(ap.graphics);
+    }
+
+    #[test]
     fn dac_write_then_read_round_trips() {
         let mut video = Vga::default();
         video.write_port(0x03c8, 5); // write index = 5
@@ -2916,6 +5056,49 @@ mod tests {
     }
 
     #[test]
+    fn preset_row_scan_offsets_graphics_source_rows() {
+        let mut vga = Vga::default();
+        assert!(vga.set_mode(0x10));
+        let pitch = (vga.crtc.offset * 2) as usize;
+        vga.vram[0] = 0x80; // row 0, plane 0 -> index 1
+        vga.vram[VGA_PLANE_SIZE + pitch] = 0x80; // row 1, plane 1 -> index 2
+
+        assert_eq!(vga.render_active_row(0)[0], 0x01);
+        vga.crtc.preset_row_scan = 0x01;
+        assert_eq!(vga.render_active_row(0)[0], 0x02);
+        vga.crtc.line_compare = 0;
+        assert_eq!(
+            vga.render_active_row(3)[0],
+            0x01,
+            "preset row resets below the line-compare split"
+        );
+        vga.crtc.line_compare = u32::MAX;
+        vga.crtc.preset_row_scan = 0x20;
+        vga.vram[0] = 0x80; // row 0, byte 0, plane 0 -> index 1
+        vga.vram[VGA_PLANE_SIZE] = 0x00;
+        vga.vram[VGA_PLANE_SIZE + 1] = 0x80; // row 0, byte 1, plane 1 -> index 2
+        assert_eq!(vga.render_active_row(0)[0], 0x02);
+        vga.crtc.line_compare = 0;
+        vga.attr.mode_control = 0x20;
+        assert_eq!(
+            vga.render_active_row(3)[0],
+            0x01,
+            "byte pan resets below the split when AC 10h bit 5 requests it"
+        );
+
+        let mut mode13h = Vga::default();
+        mode13h.set_mode13h();
+        let pitch = (mode13h.crtc.offset * 2) as usize;
+        mode13h.vram[0] = 0x11;
+        mode13h.vram[pitch] = 0x22;
+        mode13h.crtc.preset_row_scan = 0x02;
+        assert_eq!(mode13h.render_256color_row(0)[0], 0x22);
+        mode13h.crtc.preset_row_scan = 0x20;
+        mode13h.vram[1] = 0x33;
+        assert_eq!(mode13h.render_256color_row(0)[0], 0x33);
+    }
+
+    #[test]
     fn set_mode_selects_geometry_for_each_planar_number() {
         let mut vga = Vga::default();
 
@@ -2937,6 +5120,205 @@ mod tests {
         assert_eq!(vga.raster_height(), 449);
 
         assert!(!vga.set_mode(0x99)); // unknown number leaves a false result
+    }
+
+    #[test]
+    fn bios_mode_sets_seed_vgabios_crtc_readback() {
+        fn assert_regs(vga: &Vga, mode: u8, expected: &[(u8, u8)]) {
+            for &(index, value) in expected {
+                assert_eq!(
+                    vga.crtc_register_latch(index),
+                    value,
+                    "mode {mode:02X} CRTC {index:02X}"
+                );
+            }
+        }
+
+        let mut vga = Vga::default();
+        assert_regs(
+            &vga,
+            0x03,
+            &[
+                (0x04, 0x55),
+                (0x05, 0x81),
+                (0x09, 0x4F),
+                (0x13, 0x28),
+                (0x14, 0x1F),
+                (0x15, 0x96),
+                (0x17, 0xA3),
+            ],
+        );
+
+        for (mode, expected) in [
+            (
+                0x0D,
+                &[
+                    (0x00, 0x2D),
+                    (0x01, 0x27),
+                    (0x04, 0x2B),
+                    (0x09, 0xC0),
+                    (0x13, 0x14),
+                    (0x15, 0x96),
+                    (0x16, 0xB9),
+                ][..],
+            ),
+            (0x0E, &[(0x00, 0x5F), (0x01, 0x4F), (0x13, 0x28)][..]),
+            (0x0F, &[(0x09, 0x40), (0x14, 0x0F), (0x15, 0x63)][..]),
+            (0x10, &[(0x09, 0x40), (0x14, 0x0F), (0x15, 0x63)][..]),
+            (
+                0x11,
+                &[(0x06, 0x0B), (0x07, 0x3E), (0x10, 0xEA), (0x16, 0x04)][..],
+            ),
+            (
+                0x12,
+                &[(0x06, 0x0B), (0x07, 0x3E), (0x10, 0xEA), (0x16, 0x04)][..],
+            ),
+        ] {
+            assert!(vga.set_mode(mode));
+            assert_regs(&vga, mode, expected);
+        }
+
+        vga.set_mode13h();
+        assert_regs(
+            &vga,
+            0x13,
+            &[(0x09, 0x41), (0x13, 0x28), (0x14, 0x40), (0x17, 0xA3)],
+        );
+    }
+
+    #[test]
+    fn bios_mode_sets_seed_vgabios_sequencer_readback() {
+        fn seq_reg(vga: &mut Vga, index: u8) -> u8 {
+            assert!(vga.write_port(0x3C4, index));
+            vga.read_port(0x3C5).unwrap()
+        }
+
+        let mut vga = Vga::default();
+        vga.set_mode13h();
+        vga.set_text_mode();
+        assert_eq!(seq_reg(&mut vga, 1), 0x00);
+        assert_eq!(seq_reg(&mut vga, 2), 0x03);
+        assert_eq!(seq_reg(&mut vga, 4), 0x02);
+
+        for (mode, clocking_mode, memory_mode) in [
+            (0x0D, 0x09, 0x06),
+            (0x0E, 0x01, 0x06),
+            (0x0F, 0x01, 0x06),
+            (0x10, 0x01, 0x06),
+            (0x11, 0x01, 0x06),
+            (0x12, 0x01, 0x06),
+        ] {
+            assert!(vga.set_mode(mode));
+            assert_eq!(seq_reg(&mut vga, 1), clocking_mode, "mode {mode:02X}");
+            assert_eq!(seq_reg(&mut vga, 2), 0x0F, "mode {mode:02X}");
+            assert_eq!(seq_reg(&mut vga, 3), 0x00, "mode {mode:02X}");
+            assert_eq!(seq_reg(&mut vga, 4), memory_mode, "mode {mode:02X}");
+        }
+
+        vga.set_mode13h();
+        assert_eq!(seq_reg(&mut vga, 1), 0x01);
+        assert_eq!(seq_reg(&mut vga, 2), 0x0F);
+        assert_eq!(seq_reg(&mut vga, 4), 0x0E);
+    }
+
+    #[test]
+    fn bios_mode_sets_seed_vgabios_graphics_controller_readback() {
+        fn gc_reg(vga: &mut Vga, index: u8) -> u8 {
+            assert!(vga.write_port(0x3CE, index));
+            vga.read_port(0x3CF).unwrap()
+        }
+
+        let mut vga = Vga::default();
+        assert_eq!(gc_reg(&mut vga, 5), 0x10);
+        assert_eq!(gc_reg(&mut vga, 6), 0x0E);
+        assert_eq!(gc_reg(&mut vga, 7), 0x0F);
+        assert_eq!(gc_reg(&mut vga, 8), 0xFF);
+
+        for mode in 0x0D..=0x12 {
+            assert!(vga.set_mode(mode));
+            assert_eq!(gc_reg(&mut vga, 5), 0x00, "mode {mode:02X}");
+            assert_eq!(gc_reg(&mut vga, 6), 0x05, "mode {mode:02X}");
+            assert_eq!(gc_reg(&mut vga, 7), 0x0F, "mode {mode:02X}");
+            assert_eq!(gc_reg(&mut vga, 8), 0xFF, "mode {mode:02X}");
+        }
+
+        vga.set_mode13h();
+        assert_eq!(gc_reg(&mut vga, 5), 0x40);
+        assert_eq!(gc_reg(&mut vga, 6), 0x05);
+        assert_eq!(gc_reg(&mut vga, 7), 0x0F);
+        assert_eq!(gc_reg(&mut vga, 8), 0xFF);
+
+        vga.set_text_mode();
+        assert_eq!(gc_reg(&mut vga, 5), 0x10);
+        assert_eq!(gc_reg(&mut vga, 6), 0x0E);
+    }
+
+    #[test]
+    fn bios_graphics_modes_seed_vgabios_attribute_controller_readback() {
+        fn attr_reg(vga: &mut Vga, index: u8) -> u8 {
+            vga.read_status1();
+            assert!(vga.write_port(0x3C0, 0x20 | (index & 0x1F)));
+            vga.read_port(0x3C1).unwrap()
+        }
+
+        let mut vga = Vga::default();
+        assert_eq!(attr_reg(&mut vga, 0x06), 0x14, "mode 03H AC06");
+        assert_eq!(attr_reg(&mut vga, 0x08), 0x38, "mode 03H AC08");
+        assert_eq!(attr_reg(&mut vga, 0x0F), 0x3F, "mode 03H AC0F");
+        assert_eq!(attr_reg(&mut vga, 0x10), 0x0C, "mode 03H AC10");
+        assert_eq!(attr_reg(&mut vga, 0x12), 0x0F, "mode 03H AC12");
+        assert_eq!(attr_reg(&mut vga, 0x13), 0x08, "mode 03H AC13");
+        assert_eq!(attr_reg(&mut vga, 0x14), 0x00, "mode 03H AC14");
+
+        for (mode, expected) in [
+            (0x0D, &[(0x08, 0x10), (0x10, 0x01), (0x12, 0x0F)][..]),
+            (0x0E, &[(0x08, 0x10), (0x10, 0x01), (0x12, 0x0F)][..]),
+            (
+                0x0F,
+                &[(0x01, 0x08), (0x04, 0x18), (0x10, 0x01), (0x12, 0x01)][..],
+            ),
+            (
+                0x10,
+                &[(0x06, 0x14), (0x08, 0x38), (0x10, 0x01), (0x12, 0x0F)][..],
+            ),
+            (
+                0x11,
+                &[(0x01, 0x3F), (0x0F, 0x3F), (0x10, 0x01), (0x12, 0x0F)][..],
+            ),
+            (
+                0x12,
+                &[(0x06, 0x14), (0x08, 0x38), (0x10, 0x01), (0x12, 0x0F)][..],
+            ),
+        ] {
+            assert!(vga.set_mode(mode));
+            for &(index, value) in expected {
+                assert_eq!(
+                    attr_reg(&mut vga, index),
+                    value,
+                    "mode {mode:02X} AC{index:02X}"
+                );
+            }
+            assert_eq!(attr_reg(&mut vga, 0x13), 0x00, "mode {mode:02X} AC13");
+            assert_eq!(attr_reg(&mut vga, 0x14), 0x00, "mode {mode:02X} AC14");
+        }
+
+        vga.set_mode13h();
+        assert_eq!(attr_reg(&mut vga, 0x0F), 0x0F);
+        assert_eq!(attr_reg(&mut vga, 0x10), 0x41);
+        assert_eq!(attr_reg(&mut vga, 0x12), 0x0F);
+        assert_eq!(attr_reg(&mut vga, 0x14), 0x00);
+    }
+
+    #[test]
+    fn planar_mode_set_installs_writeable_graphics_defaults() {
+        let mut vga = Vga::default();
+        assert!(vga.set_mode(0x10));
+
+        vga.cpu_write(0, 0xA5);
+        for plane in 0..VGA_PLANES {
+            vga.gc.read_map = plane as u8;
+            assert_eq!(vga.cpu_read(0), 0xA5);
+        }
     }
 
     #[test]
@@ -3067,7 +5449,22 @@ mod tests {
     }
 
     #[test]
-    fn line_compare_compares_against_the_scan_counter_line_in_a_doubled_mode() {
+    fn ega_line_compare_split_starts_two_scanlines_later() {
+        let split = 100u32;
+        let mut vga = Vga::default();
+        assert!(vga.set_mode(0x10));
+        vga.attr.palette = core::array::from_fn(|i| i as u8);
+        vga.vram[0] = 0xFF; // offset 0 marked: index 1 across pixels 0..7
+        vga.crtc.start_address = 0x4000;
+        vga.crtc.line_compare = split;
+
+        assert_eq!(vga.render_active_row(split + 1)[0], 0);
+        assert_eq!(vga.render_active_row(split + 2)[0], 0);
+        assert_eq!(vga.render_active_row(split + 3)[0], 1);
+    }
+
+    #[test]
+    fn ega_line_compare_compares_against_the_scan_counter_line_in_a_doubled_mode() {
         let mut vga = Vga::default();
         vga.set_mode_0dh(); // double-scanned: 400 active scanlines, source rows 0..200
         vga.attr.palette = core::array::from_fn(|i| i as u8);
@@ -3082,15 +5479,25 @@ mod tests {
             0,
             "scanline 320 == line_compare is the last top line"
         );
-        // Scanlines 321 and 322 are the first two split scanlines: the same doubled
-        // source row 0, read from offset 0.
         assert_eq!(
             vga.render_active_row(321)[0],
+            0,
+            "EGA split is delayed two scanlines after the VGA threshold"
+        );
+        assert_eq!(
+            vga.render_active_row(322)[0],
+            0,
+            "EGA split is still delayed on the second scanline after the match"
+        );
+        // Scanlines 323 and 324 are the first two split scanlines: the same doubled
+        // source row 0, read from offset 0.
+        assert_eq!(
+            vga.render_active_row(323)[0],
             1,
             "first split scanline, offset 0"
         );
         assert_eq!(
-            vga.render_active_row(322)[0],
+            vga.render_active_row(324)[0],
             1,
             "second scanline holds the same doubled source row 0"
         );
@@ -3169,6 +5576,69 @@ mod tests {
             vga.crtc.double_scan,
             "double-scanned: 240 source rows over 480 lines"
         );
+        assert_eq!(vga.raster_height(), 527);
+    }
+
+    #[test]
+    fn planar_vertical_crtc_writes_recompute_ega_timing() {
+        let mut vga = Vga::default();
+        assert!(vga.set_mode(0x10));
+        assert_eq!(vga.crtc.vdisp_end, 350);
+        assert_eq!(vga.raster_height(), 449);
+
+        vga.write_port(0x3D4, 0x11);
+        vga.write_port(0x3D5, 0x00);
+        for (idx, val) in [
+            (0x06u8, 0x0Du8),
+            (0x07, 0x3E),
+            (0x09, 0x41),
+            (0x10, 0xEA),
+            (0x11, 0xAC),
+            (0x12, 0xDF),
+            (0x15, 0xE7),
+            (0x16, 0x06),
+        ] {
+            vga.write_port(0x3D4, idx);
+            vga.write_port(0x3D5, val);
+            vga.write_port(0x3D4, idx);
+            assert_eq!(vga.read_port(0x3D5), Some(val));
+        }
+
+        assert_eq!(vga.crtc.vtotal, 527);
+        assert_eq!(vga.crtc.vdisp_end, 480);
+        assert_eq!(vga.crtc.vblank_start, 487);
+        assert_eq!(vga.crtc.vretrace_start, 490);
+        assert_eq!(vga.crtc.max_scan, 1);
+        assert!(vga.crtc.double_scan);
+        assert_eq!(vga.raster_height(), 527);
+    }
+
+    #[test]
+    fn mode13h_vertical_crtc_writes_recompute_timing() {
+        let mut vga = Vga::default();
+        vga.set_mode13h();
+        assert_eq!(vga.raster_height(), 449);
+
+        vga.write_port(0x3D4, 0x11);
+        vga.write_port(0x3D5, 0x00);
+        for (idx, val) in [
+            (0x06u8, 0x0Du8),
+            (0x07, 0x3E),
+            (0x09, 0x41),
+            (0x10, 0xEA),
+            (0x11, 0xAC),
+            (0x12, 0xDF),
+            (0x15, 0xE7),
+            (0x16, 0x06),
+        ] {
+            vga.write_port(0x3D4, idx);
+            vga.write_port(0x3D5, val);
+        }
+
+        assert_eq!(vga.crtc.vtotal, 527);
+        assert_eq!(vga.crtc.vdisp_end, 480);
+        assert_eq!(vga.crtc.max_scan, 1);
+        assert!(vga.crtc.double_scan);
         assert_eq!(vga.raster_height(), 527);
     }
 
@@ -3628,9 +6098,9 @@ mod tests {
 
     /// Write a character/attribute pair into a text cell (row, col).
     fn text_put(vga: &mut Vga, row: usize, col: usize, ch: u8, attr: u8) {
-        let i = row * VGA_TEXT_COLUMNS + col;
-        vga.text_memory[i * 2] = ch;
-        vga.text_memory[i * 2 + 1] = attr;
+        let i = row * vga.text_columns + col;
+        vga.write_u8(i * 2, ch).unwrap();
+        vga.write_u8(i * 2 + 1, attr).unwrap();
     }
 
     #[test]
@@ -3641,12 +6111,12 @@ mod tests {
         };
         // 0xDB is the solid full block (all-ones rows); white on black (0x0F).
         text_put(&mut vga, 0, 0, 0xDB, 0x0F);
-        // The default ATC palette is identity and the pel mask is all-pass, so a
-        // lit pixel scans out as DAC index 15 (foreground) and a clear one as 0.
+        // The mode 03h BIOS ATC palette maps attribute 0x0F to DAC index 0x3F;
+        // the pel mask is all-pass, so a clear pixel scans out as 0.
         let top = vga.render_text_row(0); // char row 0, font line 0
         assert_eq!(
             &top[0..9],
-            &[15u8; 9],
+            &[BIOS_TEXT_WHITE; 9],
             "all 9 columns of 0xDB are foreground"
         );
         assert_eq!(top[8], top[7], "the 9th column replicates the 8th for 0xDB");
@@ -3654,7 +6124,7 @@ mod tests {
         let bottom = vga.render_text_row(15); // font line 15, still char row 0
         assert_eq!(
             &bottom[0..9],
-            &[15u8; 9],
+            &[BIOS_TEXT_WHITE; 9],
             "0xDB stays solid across 16 scanlines"
         );
         // A non-box glyph clears its 9th column to the background. 0xFF is outside
@@ -3694,11 +6164,11 @@ mod tests {
         // bit set and a white foreground.
         vga.attr.mode_control = 0x08;
         text_put(&mut vga, 0, 0, 0xDB, 0x8F);
-        // Show phase: foreground renders as DAC 15.
+        // Show phase: foreground renders as the BIOS text-white DAC entry.
         vga.frames = 0;
         assert_eq!(
             vga.render_text_row(0)[0],
-            15,
+            BIOS_TEXT_WHITE,
             "show phase renders the foreground"
         );
         // Hide phase: the foreground collapses to the background (DAC 0).
@@ -3715,20 +6185,21 @@ mod tests {
         vga.frames = 0;
         assert_eq!(
             vga.render_text_row(0)[0],
-            15,
+            BIOS_TEXT_WHITE,
             "no blink: foreground on show phase"
         );
         vga.frames = 16;
         assert_eq!(
             vga.render_text_row(0)[0],
-            15,
+            BIOS_TEXT_WHITE,
             "no blink: foreground stays on the would-be hide phase"
         );
-        // And the background now reads bit 7 as intensity (background index 8).
+        // And the background now reads bit 7 as intensity (background index 8),
+        // then maps it through the mode 03h BIOS ATC palette.
         text_put(&mut vga, 0, 0, b' ', 0x80); // blank glyph, bit-7 background
         assert_eq!(
             vga.render_text_row(0)[0],
-            8,
+            0x38,
             "with blink off, attribute bit 7 selects background intensity 8"
         );
     }
@@ -3743,7 +6214,7 @@ mod tests {
         // 400 active rows, top-justified: row 0 carries the glyph, row 400 is the
         // border (overscan, default black).
         assert_eq!(
-            raster.pixels[0], 15,
+            raster.pixels[0], BIOS_TEXT_WHITE,
             "top-left active pixel is the foreground"
         );
         let border = 400 * 720;
@@ -3751,6 +6222,208 @@ mod tests {
             raster.pixels[border], 0,
             "scanline 400 is the border, not active"
         );
+    }
+
+    #[test]
+    fn mode03_vgabios_pixel_pan_default_keeps_text_origin_unshifted() {
+        let mut vga = Vga::default();
+        assert_eq!(vga.attr.pixel_pan, 8, "mode 03h BIOS default AC13");
+        text_put(&mut vga, 0, 0, 0xDB, 0x0F);
+        text_put(&mut vga, 0, 1, b' ', 0x0F);
+        let row = vga.render_text_row(0);
+        assert_eq!(row[0], BIOS_TEXT_WHITE);
+        assert_eq!(row[8], BIOS_TEXT_WHITE);
+        assert_eq!(row[9], 0);
+
+        vga.attr.pixel_pan = 1;
+        let row = vga.render_text_row(0);
+        assert_eq!(row[0], BIOS_TEXT_WHITE);
+        assert_eq!(row[8], 0);
+    }
+
+    #[test]
+    fn text_40_column_mode_uses_cga_geometry_and_stride() {
+        let mut vga = Vga::default();
+        vga.set_text_mode_columns(40);
+        text_put(&mut vga, 1, 0, 0xDB, 0x0F);
+
+        let frame = vga.frame();
+        assert_eq!(frame.columns, 40);
+        assert_eq!(frame.rows, 25);
+        assert_eq!(frame.cells.len(), 40 * 25);
+        assert_eq!(frame.cells[40].character, 0xDB);
+        assert_eq!(vga.render_text_row(8)[0], 15);
+
+        let raster = vga.render_full_frame();
+        assert_eq!(raster.width, 320);
+        assert_eq!(raster.height, 262);
+    }
+
+    #[test]
+    fn text_cga_80_column_mode_uses_8x8_640x200_geometry() {
+        let mut vga = Vga::default();
+        vga.set_cga_80_text_mode();
+        text_put(&mut vga, 1, 0, 0xDB, 0x0F);
+
+        assert_eq!(vga.cga_mode_control(), 0x2D);
+        let frame = vga.frame();
+        assert_eq!(frame.columns, 80);
+        assert_eq!(frame.rows, 25);
+        assert_eq!(frame.cells.len(), 80 * 25);
+        assert_eq!(frame.cells[80].character, 0xDB);
+        assert_eq!(vga.render_text_row(8)[0], 15);
+
+        let raster = vga.render_full_frame();
+        assert_eq!(raster.width, 640);
+        assert_eq!(raster.height, 262);
+    }
+
+    #[test]
+    fn cga_text_mode_03_is_80_column_color_text() {
+        let mut vga = Vga::default();
+        assert!(vga.set_cga_text_mode(0x03));
+        text_put(&mut vga, 1, 0, 0xDB, 0x0F);
+
+        assert_eq!(vga.cga_mode_control(), 0x29);
+        assert_eq!(vga.frame().columns, 80);
+        assert_eq!(vga.render_full_frame().width, 640);
+    }
+
+    #[test]
+    fn cga_text_start_address_wraps_at_the_16kb_window() {
+        let mut vga = Vga::default();
+        assert!(vga.set_cga_text_mode(0x02));
+        text_put(&mut vga, 0, 0, b'A', 0x07);
+        vga.crtc.start_address = 0x2000;
+        assert_eq!(vga.frame().cells[0].character, b'A');
+
+        vga.set_text_mode();
+        text_put(&mut vga, 0, 0, b'A', 0x07);
+        vga.text_memory[0x4000] = b'Z';
+        vga.text_memory[0x4001] = 0x07;
+        vga.crtc.start_address = 0x2000;
+        assert_eq!(vga.frame().cells[0].character, b'Z');
+    }
+
+    #[test]
+    fn cga_text_blink_uses_3d8_bit5_not_vga_attribute_control() {
+        let mut vga = Vga::default();
+        assert!(vga.set_cga_text_mode(0x01));
+        text_put(&mut vga, 0, 0, 0xDB, 0x8F);
+
+        assert_eq!(vga.attr.mode_control & 0x08, 0);
+        assert_eq!(vga.render_text_row(0)[0], 15);
+        vga.frames = 16;
+        assert_eq!(vga.render_text_row(0)[0], 0);
+
+        assert!(vga.write_port(0x3D8, CGA_MODE_VIDEO_ENABLE));
+        assert_eq!(vga.render_text_row(0)[0], 15);
+    }
+
+    #[test]
+    fn cga_text_colors_ignore_vga_attribute_palette_and_pel_mask() {
+        let mut vga = Vga::default();
+        assert!(vga.set_cga_text_mode(0x01));
+        vga.attr.palette[0x0E] = CGA_BLACK;
+        vga.attr.palette[0x01] = CGA_BLACK;
+        vga.pel_mask = 0x00;
+        text_put(&mut vga, 0, 0, 0xDB, 0x1E);
+        text_put(&mut vga, 0, 1, b' ', 0x1E);
+
+        let row = vga.render_text_row(0);
+        assert_eq!(row[0], CGA_YELLOW);
+        assert_eq!(row[8], 1);
+    }
+
+    #[test]
+    fn cga_text_ignores_vga_sequencer_character_width() {
+        let mut vga = Vga::default();
+        assert!(vga.set_cga_text_mode(0x02));
+        text_put(&mut vga, 0, 0, b' ', 0x0F);
+        text_put(&mut vga, 0, 1, 0xDB, 0x0F);
+
+        assert!(vga.write_port(0x3C4, 0x01));
+        assert!(vga.write_port(0x3C5, 0x00));
+
+        let row = vga.render_text_row(0);
+        assert_eq!(row[7], CGA_BLACK);
+        assert_eq!(row[8], CGA_WHITE);
+    }
+
+    #[test]
+    fn cga_text_ignores_vga_attribute_pixel_pan() {
+        let mut vga = Vga::default();
+        assert!(vga.set_cga_text_mode(0x02));
+        text_put(&mut vga, 0, 0, b' ', 0x0F);
+        text_put(&mut vga, 0, 1, 0xDB, 0x0F);
+
+        vga.read_status1();
+        assert!(vga.write_port(0x3C0, 0x20 | 0x13));
+        assert!(vga.write_port(0x3C0, 0x07));
+
+        let row = vga.render_text_row(0);
+        assert_eq!(row[1], CGA_BLACK);
+        assert_eq!(row[8], CGA_WHITE);
+    }
+
+    #[test]
+    fn cga_text_uses_fixed_rom_font_not_vga_font_maps() {
+        let mut vga = Vga::default();
+        assert!(vga.set_cga_text_mode(0x01));
+        for row in 0..8usize {
+            vga.font[0][0xDB * 32 + row] = 0x00;
+            vga.font[1][0xDB * 32 + row] = 0x00;
+        }
+        vga.seq.char_map_select = 0x04; // VGA dual-font state: map A 0, map B 1
+        text_put(&mut vga, 0, 0, 0xDB, 0x08);
+
+        assert_eq!(vga.render_text_row(0)[0], 8);
+    }
+
+    #[test]
+    fn cga_graphics_text_uses_fixed_rom_font_not_vga_font_maps() {
+        let mut vga = Vga::default();
+        assert!(vga.set_cga_mode(0x04));
+        vga.load_font_table(0, 0xDB, 8, &[0; 8]);
+
+        assert_eq!(vga.active_font_glyph_row(0xDB, 0), 0xFF);
+    }
+
+    #[test]
+    fn cga_text_border_uses_color_select_register() {
+        let mut vga = Vga::default();
+        assert!(vga.set_cga_text_mode(0x01));
+
+        vga.write_port(0x3D9, 0x05);
+        let raster = vga.render_full_frame();
+        let border = (raster.height as usize - 1) * raster.width as usize;
+        assert_eq!(raster.pixels[border], 5);
+
+        vga.set_overscan(0x0A);
+        assert_eq!(vga.cga_color_select(), 0x0A);
+        let raster = vga.render_full_frame();
+        let border = (raster.height as usize - 1) * raster.width as usize;
+        assert_eq!(raster.pixels[border], 10);
+    }
+
+    #[test]
+    fn cga_video_disable_blanks_the_border() {
+        let mut vga = Vga::default();
+        assert!(vga.set_cga_text_mode(0x01));
+        assert!(vga.write_port(0x3D9, 0x05));
+        assert!(vga.write_port(0x3D8, CGA_MODE_BLINK));
+
+        let raster = vga.render_full_frame();
+        let border = (raster.height as usize - 1) * raster.width as usize;
+        assert_eq!(raster.pixels[border], CGA_BLACK);
+
+        assert!(vga.set_cga_mode(0x04));
+        assert!(vga.write_port(0x3D9, 0x05));
+        assert!(vga.write_port(0x3D8, CGA_MODE_GRAPHICS));
+
+        let raster = vga.render_full_frame();
+        let border = (raster.height as usize - 1) * raster.width as usize;
+        assert_eq!(raster.pixels[border], CGA_BLACK);
     }
 
     #[test]
@@ -3772,7 +6445,7 @@ mod tests {
         assert_eq!(vga.active_font_table(), 1);
         assert_eq!(
             vga.render_text_row(0)[0],
-            15,
+            BIOS_TEXT_WHITE,
             "table 1 'A' is solid -> foreground"
         );
     }
@@ -3797,7 +6470,7 @@ mod tests {
         // stays 256-glyph (map A == map B) and does not consume attr bit 3.
         vga.write_port(0x3C5, 0x10 | 0x20); // -> table 4 (solid)
         assert_eq!(vga.active_font_table(), 4);
-        assert_eq!(vga.render_text_row(0)[0], 15);
+        assert_eq!(vga.render_text_row(0)[0], BIOS_TEXT_WHITE);
     }
 
     #[test]
@@ -3812,9 +6485,9 @@ mod tests {
         vga.frames = 0; // show phase
         let row = vga.render_text_row(0);
         // Reverse video on a blank cell swaps the background (where the blank
-        // glyph reads) to the foreground, so the cursor cell is solid fg (15).
+        // glyph reads) to the foreground, so the cursor cell is solid fg.
         assert_eq!(
-            row[0], 15,
+            row[0], BIOS_TEXT_WHITE,
             "cursor cell scans out as the foreground (reverse video on a blank)"
         );
         // The neighbouring blank cell is not the cursor, so it stays the
@@ -3838,8 +6511,16 @@ mod tests {
             0,
             "scanline 0 is outside [14,15]: no swap"
         );
-        assert_eq!(vga.render_text_row(14)[0], 15, "scanline 14 swaps");
-        assert_eq!(vga.render_text_row(15)[0], 15, "scanline 15 swaps");
+        assert_eq!(
+            vga.render_text_row(14)[0],
+            BIOS_TEXT_WHITE,
+            "scanline 14 swaps"
+        );
+        assert_eq!(
+            vga.render_text_row(15)[0],
+            BIOS_TEXT_WHITE,
+            "scanline 15 swaps"
+        );
     }
 
     #[test]
@@ -3867,7 +6548,11 @@ mod tests {
         vga.cursor_start = 0x00;
         vga.cursor_end = 0x0F;
         vga.frames = 0; // show phase: cursor visible
-        assert_eq!(vga.render_text_row(0)[0], 15, "show phase: cursor swaps");
+        assert_eq!(
+            vga.render_text_row(0)[0],
+            BIOS_TEXT_WHITE,
+            "show phase: cursor swaps"
+        );
         vga.frames = 16; // hide phase: cursor hidden
         assert_eq!(vga.render_text_row(0)[0], 0, "hide phase: no swap");
     }
@@ -3880,11 +6565,27 @@ mod tests {
         vga.cursor_start = 0x0E; // start line 14
         vga.cursor_end = 0x01; // end line 1: start > end wraps to two regions
         vga.frames = 0;
-        assert_eq!(vga.render_text_row(0)[0], 15, "wrap: scanline 0 swaps");
-        assert_eq!(vga.render_text_row(1)[0], 15, "wrap: scanline 1 swaps");
+        assert_eq!(
+            vga.render_text_row(0)[0],
+            BIOS_TEXT_WHITE,
+            "wrap: scanline 0 swaps"
+        );
+        assert_eq!(
+            vga.render_text_row(1)[0],
+            BIOS_TEXT_WHITE,
+            "wrap: scanline 1 swaps"
+        );
         assert_eq!(vga.render_text_row(7)[0], 0, "wrap: scanline 7 does not");
-        assert_eq!(vga.render_text_row(14)[0], 15, "wrap: scanline 14 swaps");
-        assert_eq!(vga.render_text_row(15)[0], 15, "wrap: scanline 15 swaps");
+        assert_eq!(
+            vga.render_text_row(14)[0],
+            BIOS_TEXT_WHITE,
+            "wrap: scanline 14 swaps"
+        );
+        assert_eq!(
+            vga.render_text_row(15)[0],
+            BIOS_TEXT_WHITE,
+            "wrap: scanline 15 swaps"
+        );
     }
 
     #[test]
@@ -3896,14 +6597,14 @@ mod tests {
         text_put(&mut vga, 0, 0, 0xDB, 0x0F); // page 0 cell 0: solid block
         // Page 1 cell 0 = cell index 0x800 = byte 0x1000.
         let page1_cell0 = 0x800usize;
-        vga.text_memory[page1_cell0 * 2] = b' '; // blank glyph, distinct from 0xDB
-        vga.text_memory[page1_cell0 * 2 + 1] = 0x0F;
+        vga.write_u8(page1_cell0 * 2, b' ').unwrap(); // blank glyph, distinct from 0xDB
+        vga.write_u8(page1_cell0 * 2 + 1, 0x0F).unwrap();
         // Start address is a cell/word address (byte offset = start * 2), so the
         // BIOS page-flip value page * 0x800 maps straight onto it.
         vga.crtc.start_address = 0x800;
         // With the origin scrolled to page 1, cell (0,0) reads the blank glyph
         // there, so the top-left pixel is the background (0), not the solid
-        // block foreground (15) that page 0 holds.
+        // block foreground that page 0 holds.
         assert_eq!(
             vga.render_text_row(0)[0],
             0,
@@ -3913,7 +6614,7 @@ mod tests {
         vga.crtc.start_address = 0;
         assert_eq!(
             vga.render_text_row(0)[0],
-            15,
+            BIOS_TEXT_WHITE,
             "origin back at page 0 reads page 0's solid block"
         );
     }
@@ -3937,7 +6638,7 @@ mod tests {
         // is shown again.
         assert_eq!(
             vga.render_text_row(8)[0],
-            15,
+            BIOS_TEXT_WHITE,
             "below-split region starts from offset 0 (solid block)"
         );
     }
@@ -3977,8 +6678,8 @@ mod tests {
         let mut vga = Vga::default();
         text_put(&mut vga, 0, 0, b'A', 0x07); // page 0 cell 0 = 'A'
         let page1_cell0 = 0x800usize;
-        vga.text_memory[page1_cell0 * 2] = b'Z'; // page 1 cell 0 = 'Z'
-        vga.text_memory[page1_cell0 * 2 + 1] = 0x07;
+        vga.write_u8(page1_cell0 * 2, b'Z').unwrap(); // page 1 cell 0 = 'Z'
+        vga.write_u8(page1_cell0 * 2 + 1, 0x07).unwrap();
         assert_eq!(
             vga.frame().cells[0].character,
             b'A',
@@ -4008,13 +6709,13 @@ mod tests {
         vga.attr.pixel_pan = 0;
         assert_eq!(
             vga.render_text_row(0)[8],
-            15,
+            BIOS_TEXT_WHITE,
             "pan=0: cell 0's 9th column is lit at output[8]"
         );
         vga.attr.pixel_pan = 1;
         let row = vga.render_text_row(0);
         assert_eq!(
-            row[0], 15,
+            row[0], BIOS_TEXT_WHITE,
             "pan=1: cell 0 still leads the row (its pel 1 now at output[0])"
         );
         assert_eq!(
@@ -4043,7 +6744,7 @@ mod tests {
         // cell 0's 9th column is lit at output[8].
         assert_eq!(
             vga.render_text_row(8)[8],
-            15,
+            BIOS_TEXT_WHITE,
             "below the split AC 10h bit 5 forces pel-pan to 0"
         );
     }
@@ -4060,7 +6761,7 @@ mod tests {
         vga.attr.pixel_pan = 1;
         assert_eq!(
             vga.render_text_row(0)[7],
-            15,
+            BIOS_TEXT_WHITE,
             "0xDB's replicated 9th column shifts into output[7] and stays lit"
         );
         // Replace cell 0 with a non-box glyph that is solid in pels 0..7 (0xFF) but
@@ -4089,7 +6790,7 @@ mod tests {
         text_put(&mut vga, 0, 0, 0x01, 0x0F);
         assert_eq!(
             vga.render_text_row(0)[0],
-            15,
+            BIOS_TEXT_WHITE,
             "preset 0: font line 0 is the first displayed scanline (solid)"
         );
         vga.crtc.preset_row_scan = 0x01; // scroll up one scanline
@@ -4109,7 +6810,7 @@ mod tests {
         text_put(&mut vga, 0, 1, b' ', 0x0F); // cell 1: blank (pel 0 bg)
         assert_eq!(
             vga.render_text_row(0)[0],
-            15,
+            BIOS_TEXT_WHITE,
             "byte pan 0: pel 0 reads cell 0 (solid)"
         );
         vga.crtc.preset_row_scan = 0x02 << 5; // byte pan 2 (bits 6-5 = 10)
@@ -4143,7 +6844,7 @@ mod tests {
         // to 0, so pel 0 reads font line 0 (solid).
         assert_eq!(
             vga.render_text_row(16)[0],
-            15,
+            BIOS_TEXT_WHITE,
             "below-split region: preset row scan resets to 0 (font line 0 solid)"
         );
     }
@@ -4236,7 +6937,7 @@ mod tests {
         // Cell 0 (pels 0..8): not the skewed cursor (it moved to cell 1).
         assert_eq!(row[0], 0, "skew 1: cell 0 is not the cursor");
         // Cell 1 (pel 9 onward): the cursor, swapped to foreground.
-        assert_eq!(row[9], 15, "skew 1: cursor delayed to cell 1");
+        assert_eq!(row[9], BIOS_TEXT_WHITE, "skew 1: cursor delayed to cell 1");
     }
 
     #[test]
@@ -4256,7 +6957,7 @@ mod tests {
         assert_eq!(row[0], 0, "skew 3: cell 0 not the cursor");
         assert_eq!(
             row[3 * 9],
-            15,
+            BIOS_TEXT_WHITE,
             "skew 3: cursor delayed to cell 3 (max delay, not disabled)"
         );
     }
@@ -4274,7 +6975,7 @@ mod tests {
             vga.frames = f;
             assert_eq!(
                 vga.render_text_row(0)[0],
-                15,
+                BIOS_TEXT_WHITE,
                 "frame {f}: show phase, foreground visible"
             );
         }
@@ -4291,7 +6992,7 @@ mod tests {
         vga.frames = 32;
         assert_eq!(
             vga.render_text_row(0)[0],
-            15,
+            BIOS_TEXT_WHITE,
             "frame 32: period repeats (show)"
         );
     }
@@ -4310,7 +7011,7 @@ mod tests {
             vga.frames = f;
             assert_eq!(
                 vga.render_text_row(0)[0],
-                15,
+                BIOS_TEXT_WHITE,
                 "frame {f}: cursor visible (show phase)"
             );
         }
@@ -4323,35 +7024,78 @@ mod tests {
             );
         }
         vga.frames = 32;
-        assert_eq!(vga.render_text_row(0)[0], 15, "frame 32: period repeats");
+        assert_eq!(
+            vga.render_text_row(0)[0],
+            BIOS_TEXT_WHITE,
+            "frame 32: period repeats"
+        );
     }
 
     #[test]
-    fn sequencer_reset_register_round_trips() {
-        // Sequencer index 0 (Reset) is stored read-back only: a write through
-        // 3C4/3C5 lands in seq.reset without gating the datapath.
-        let mut vga = Vga::default();
-        vga.write_port(0x3C4, 0x00);
-        vga.write_port(0x3C5, 0x02); // synchronous reset asserted
-        assert_eq!(vga.seq.reset, 0x02);
-        vga.write_port(0x3C5, 0x03); // both reset bits (index 0 still selected)
-        assert_eq!(vga.seq.reset, 0x03);
-    }
-
-    #[test]
-    fn input_status0_reports_retrace_and_a_fixed_color_sense() {
+    fn sequencer_reset_and_screen_off_blank_output_and_status() {
         let mut vga = Vga::default();
         vga.set_mode_0dh();
-        // Bit 4 is the colour-monitor sense, always set in this core.
+        vga.attr.palette = core::array::from_fn(|i| i as u8);
+        vga.vram[0] = 0x80; // plane 0, pixel 0 -> index 1 when output is enabled.
+
+        assert_eq!(vga.seq.reset, 0x03);
+        assert_eq!(vga.render_full_frame().pixels[0], 1);
+        assert_eq!(vga.read_status1() & 0x01, 0);
+
+        vga.write_port(0x3C4, 0x00);
+        vga.write_port(0x3C5, 0x02); // asynchronous reset asserted (bit 0 clear)
+        assert_eq!(vga.seq.reset, 0x02);
+        assert_eq!(vga.render_full_frame().pixels[0], 0);
+        assert_eq!(vga.read_status1() & 0x01, 0x01);
+
+        vga.write_port(0x3C5, 0x03); // both reset bits (index 0 still selected)
+        assert_eq!(vga.seq.reset, 0x03);
+        assert_eq!(vga.render_full_frame().pixels[0], 1);
+
+        vga.write_port(0x3C4, 0x01);
+        vga.write_port(0x3C5, 0x20); // Clocking Mode bit 5: screen off.
+        assert_eq!(vga.render_full_frame().pixels[0], 0);
+        assert_eq!(vga.read_status1() & 0x01, 0x01);
+    }
+
+    #[test]
+    fn display_refresh_control_blanks_output_and_status() {
+        let mut vga = Vga::default();
+        vga.set_mode_0dh();
+        vga.attr.palette = core::array::from_fn(|i| i as u8);
+        vga.vram[0] = 0x80; // plane 0, pixel 0 -> index 1 when refresh is enabled.
+
+        assert!(vga.display_refresh_enabled());
+        assert_eq!(vga.render_full_frame().pixels[0], 1);
+        assert_eq!(vga.read_status1() & 0x01, 0);
+
+        vga.set_display_refresh_enabled(false);
+        assert_eq!(vga.render_full_frame().pixels[0], 0);
+        assert_eq!(vga.read_status1() & 0x01, 0x01);
+
+        vga.set_display_refresh_enabled(true);
+        assert_eq!(vga.render_full_frame().pixels[0], 1);
+    }
+
+    #[test]
+    fn input_status0_reports_misc_selected_switch_sense_and_retrace() {
+        let mut vga = Vga::default();
+        vga.set_mode_0dh();
         let htotal = htotal_dots(&vga.crtc);
         vga.beam = htotal * (vga.crtc.vdisp_end as u64); // active off, not in retrace
-        let active = vga.read_port(0x3C2).unwrap();
+        for (select, expected) in [(0, 0x00), (1, 0x10), (2, 0x10), (3, 0x00)] {
+            assert!(vga.write_port(0x3C2, (select << 2) | 0x03));
+            assert_eq!(
+                vga.read_port(0x3C2).unwrap() & 0x10,
+                expected,
+                "bit 4 reports colour-display sense bit {select}"
+            );
+        }
         assert_eq!(
-            active & 0x10,
-            0x10,
-            "bit 4 reports the colour-monitor sense"
+            vga.read_port(0x3C2).unwrap() & 0x80,
+            0x00,
+            "bit 7 clear outside vertical retrace"
         );
-        assert_eq!(active & 0x80, 0x00, "bit 7 clear outside vertical retrace");
         // Park the beam in vertical retrace: bit 7 (CRT interrupt status) sets.
         vga.beam = htotal * (vga.crtc.vretrace_start as u64);
         let retrace = vga.read_port(0x3C2).unwrap();
@@ -4407,11 +7151,32 @@ mod tests {
     }
 
     #[test]
+    fn color_plane_enable_masks_vga_text_and_planar_indexes() {
+        let mut vga = Vga::default();
+        vga.set_mode_0dh();
+        for plane in 0..VGA_PLANES {
+            vga.vram[plane * VGA_PLANE_SIZE] = 0x80;
+        }
+        vga.attr.plane_enable = 0x05;
+        assert_eq!(vga.render_active_row(0)[0], 0x05);
+        vga.attr.plane_enable = 0x00;
+        assert_eq!(vga.render_active_row(0)[0], 0x00);
+
+        let mut text = Vga::default();
+        text_put(&mut text, 0, 0, 0xDB, 0x0F);
+        text.attr.plane_enable = 0x05;
+        assert_eq!(text.render_text_row(0)[0], 0x05);
+        text.attr.plane_enable = 0x00;
+        assert_eq!(text.render_text_row(0)[0], 0x00);
+    }
+
+    #[test]
     fn feature_control_round_trips_3ca_with_color_and_mono_writes() {
         let mut vga = Vga::default();
         assert_eq!(vga.read_port(0x3CA), Some(0x00), "powers up at 0");
         assert!(vga.write_port(0x3DA, 0x0A)); // colour write address
         assert_eq!(vga.read_port(0x3CA), Some(0x0A));
+        assert!(vga.write_port(0x3C2, vga.misc_output & !0x01));
         assert!(vga.write_port(0x3BA, 0x05)); // mono alias of the same register
         assert_eq!(vga.read_port(0x3CA), Some(0x05));
     }
@@ -4430,14 +7195,18 @@ mod tests {
     #[test]
     fn dac_state_reports_the_armed_access_mode() {
         let mut vga = Vga::default();
-        // Powers up armed for a write (3C8 path): state 0b11.
-        assert_eq!(vga.read_port(0x3C7), Some(0x03));
-        // A read-index write (3C7) arms a read: state 0b00.
-        assert!(vga.write_port(0x3C7, 5));
+        // Powers up armed for a write (3C8 path): state 0b00.
         assert_eq!(vga.read_port(0x3C7), Some(0x00));
-        // A write-index write (3C8) arms a write again: state 0b11.
-        assert!(vga.write_port(0x3C8, 7));
+        // A read-index write (3C7) arms a read: state 0b11.
+        assert!(vga.write_port(0x3C7, 5));
         assert_eq!(vga.read_port(0x3C7), Some(0x03));
+        let _ = vga.read_port(0x3C9);
+        assert_eq!(vga.read_port(0x3C7), Some(0x03));
+        // A write-index write (3C8) arms a write again: state 0b00.
+        assert!(vga.write_port(0x3C8, 7));
+        assert_eq!(vga.read_port(0x3C7), Some(0x00));
+        assert!(vga.write_port(0x3C9, 0x2A));
+        assert_eq!(vga.read_port(0x3C7), Some(0x00));
     }
 
     #[test]
@@ -4448,20 +7217,106 @@ mod tests {
         assert_eq!(vga.raster_width(), 640);
         assert_eq!(vga.crtc.vdisp_end, 350);
         assert_eq!(vga.active_mode(), VideoMode::Planar);
+        assert_eq!(vga.seq.map_mask, 0x0F);
+        assert_eq!(vga.misc_output & 0xC1, 0x80);
         assert_eq!(CrtcTiming::mode_0fh(), CrtcTiming::mode_10h());
         // 11h shares 12h's 640x480 timing.
         assert!(vga.set_mode(0x11));
         assert_eq!(vga.raster_width(), 640);
         assert_eq!(vga.crtc.vdisp_end, 480);
+        assert_eq!(vga.seq.map_mask, 0x0F);
+        assert_eq!(vga.misc_output & 0xC1, 0xC1);
         assert_eq!(CrtcTiming::mode_11h(), CrtcTiming::mode_12h());
+    }
+
+    #[test]
+    fn mode_0fh_scanout_uses_vgabios_monochrome_attribute_table() {
+        let mut vga = Vga::default();
+        assert!(vga.set_mode(0x0F));
+        assert_eq!(vga.seq.map_mask, 0x0F);
+
+        vga.cpu_write(0, 0x80);
+        assert_eq!(vga.plane_byte(0, 0), 0x80);
+        assert_eq!(vga.plane_byte(1, 0), 0x80);
+        assert_eq!(vga.plane_byte(2, 0), 0x80);
+        assert_eq!(vga.plane_byte(3, 0), 0x80);
+        assert_eq!(vga.planar_read_pixel(0, 0), 0x0F);
+        assert_eq!(vga.render_active_row(0)[0], 0x08);
+
+        vga.vram[0] = 0;
+        vga.vram[2 * VGA_PLANE_SIZE] = 0;
+        vga.seq.map_mask = 0x01;
+        vga.cpu_write(0, 0x80);
+        assert_eq!(vga.planar_read_pixel(0, 0), 0x03);
+
+        vga.vram[0] = 0;
+        vga.vram[2 * VGA_PLANE_SIZE] = 0;
+        vga.seq.map_mask = 0x04;
+        vga.cpu_write(0, 0x80);
+        assert_eq!(vga.planar_read_pixel(0, 0), 0x0C);
+
+        vga.vram[0] = 0;
+        vga.vram[2 * VGA_PLANE_SIZE] = 0;
+        vga.seq.map_mask = 0x05;
+
+        let plane0 = 0;
+        let plane2 = 2 * VGA_PLANE_SIZE;
+        vga.vram[plane0] = 0x80;
+        assert_eq!(vga.planar_read_pixel(0, 0), 0x03);
+        assert_eq!(vga.render_active_row(0)[0], 0x08);
+
+        vga.vram[plane0] = 0;
+        vga.vram[plane2] = 0x80;
+        assert_eq!(vga.planar_read_pixel(0, 0), 0x0C);
+        vga.frames = 0;
+        assert_eq!(vga.render_active_row(0)[0], 0x00);
+        vga.frames = 16;
+        assert_eq!(vga.render_active_row(0)[0], 0x00);
+
+        vga.vram[plane0] = 0x80;
+        vga.frames = 16;
+        assert_eq!(vga.planar_read_pixel(0, 0), 0x0F);
+        assert_eq!(vga.render_active_row(0)[0], 0x08);
+
+        assert!(vga.planar_write_pixel(1, 0, 0x0C, false));
+        assert_eq!(vga.planar_read_pixel(1, 0), 0x0C);
+    }
+
+    #[test]
+    fn mode_11h_scanout_uses_map0_like_mode6() {
+        let mut vga = Vga::default();
+        assert!(vga.set_mode(0x11));
+        assert_eq!(vga.seq.map_mask, 0x0F);
+
+        vga.cpu_write(0, 0x80);
+        assert_eq!(vga.plane_byte(0, 0), 0x80);
+        assert_eq!(vga.plane_byte(1, 0), 0x80);
+        assert_eq!(vga.plane_byte(2, 0), 0x80);
+        assert_eq!(vga.plane_byte(3, 0), 0x80);
+        assert_eq!(vga.planar_read_pixel(0, 0), 0x0F);
+        assert_eq!(vga.render_active_row(0)[0], 0x3F);
+        vga.vram[0] = 0;
+
+        for plane in 1..VGA_PLANES {
+            vga.vram[plane * VGA_PLANE_SIZE] = 0x80;
+        }
+        assert_eq!(vga.planar_read_pixel(0, 0), 0x00);
+        assert_eq!(vga.render_active_row(0)[0], 0x00);
+
+        vga.vram[0] = 0x80;
+        assert_eq!(vga.planar_read_pixel(0, 0), 0x0F);
+        assert_eq!(vga.render_active_row(0)[0], 0x3F);
+
+        assert!(vga.planar_write_pixel(1, 0, 0x0F, false));
+        assert_eq!(vga.planar_read_pixel(1, 0), 0x0F);
+        assert_eq!(vga.plane_byte(1, 0) & 0x40, 0);
     }
 
     #[test]
     fn palette_address_source_tracks_the_3c0_index_bit5() {
         // The 3C0 index bit 5 (Palette Address Source) is decoded and read back. It powers
         // up set (the mode-set default), clears on an index write with bit 5 clear, and
-        // sets again on an index write with bit 5 set. Limit: the render-time blank the
-        // bit drives on real hardware is not enforced (see render_scanline).
+        // sets again on an index write with bit 5 set.
         let mut vga = Vga::default();
         assert!(vga.attr.pas, "PAS powers up set");
         vga.read_status1(); // reset the flip-flop to the index phase
@@ -4470,6 +7325,39 @@ mod tests {
         vga.read_status1();
         vga.write_port(0x3C0, 0x20); // index 0 with bit 5 set -> PAS on
         assert!(vga.attr.pas);
+    }
+
+    #[test]
+    fn palette_address_source_clear_blanks_render_and_status() {
+        let mut vga = Vga::default();
+        vga.set_mode_0dh();
+        for b in vga.vram[0..VGA_PLANE_SIZE].iter_mut() {
+            *b = 0xFF;
+        }
+        vga.attr.palette[1] = 5;
+        vga.attr.overscan = 7;
+
+        let lit = vga.render_full_frame();
+        let w = lit.width as usize;
+        let border = vga.crtc.vdisp_end as usize * w;
+        assert_eq!(lit.pixels[0], 5);
+        assert_eq!(lit.pixels[border], 7);
+
+        vga.read_status1();
+        vga.write_port(0x3C0, 0x00); // PAS clear
+        assert!(!vga.attr.pas);
+        vga.beam = 0;
+        assert_eq!(vga.read_status1() & 0x01, 0x01);
+
+        let blank = vga.render_full_frame();
+        assert_eq!(blank.pixels[0], 0);
+        assert_eq!(blank.pixels[border], 0);
+
+        vga.read_status1();
+        vga.write_port(0x3C0, 0x20); // PAS set again
+        assert!(vga.attr.pas);
+        let restored = vga.render_full_frame();
+        assert_eq!(restored.pixels[0], 5);
     }
 
     #[test]

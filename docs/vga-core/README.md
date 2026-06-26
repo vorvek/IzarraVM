@@ -25,13 +25,13 @@ it. What is in:
 | Mode | `0Dh` (320×200×16 planar), set via `set_mode_0dh` / `INT 10h AH=00h` analog |
 | Legacy | Text mode (now a `VgaRaster` through the raster engine, slice 9; `frame()` / `TextFrame` stay as the headless cell view), mode `13h` (chained 256-color, routed through the same raster engine as the planar and mode-X paths), the 256-entry DAC, the text cursor — folded in from the former `VgaTextMode` |
 | Planar memory | Four-plane model, write modes 0–3, read modes 0–1, latches, data-rotate/ALU, Map Mask, Bit Mask, Set/Reset |
-| Sequencer (`3C4/3C5`) | Map Mask (2), Memory Mode (4); Clocking Mode (1) char-width feeds the dot count |
+| Sequencer (`3C4/3C5`) | Reset (0) gates display output while either reset bit is clear; Map Mask (2), Memory Mode (4); Clocking Mode (1) char-width feeds the dot count and bit 5 blanks the screen |
 | Graphics Ctrl (`3CE/3CF`) | Set/Reset (0), Enable Set/Reset (1), Color Compare (2), Data Rotate/Function (3), Read Map (4), Mode (5), Color Don't Care (7), Bit Mask (8) |
-| Attribute (`3C0`) | 16 palette entries (power-up identity: register N = N), Mode Control (10h), Overscan (11h), Pixel Pan (13h), readback through `3C1`; the `3DA` flip-flop reset. Plane Enable (12h) and Color Select (14h) are **stored, not yet applied** (unused in mode 0Dh; applying 12h's default 0 would blank the screen) |
-| CRTC (`3D4/3D5`) | Start Address Hi/Lo (0C/0D), Offset (13h), text cursor location (0E/0F) and shape (0A/0B); full vertical timing carried in `CrtcTiming` |
-| DAC (`3C7/3C8/3C9`) | Read/write index + 6-bit RGB data; the pel mask (`3C6`) is stored and applied to the rendered DAC index. The 256-entry palette powers up to the stock VGA mode-13h default (the 16 EGA colors with brown at index 6, then the gray and color ramps) |
-| Misc (`3C2/3CC`) | Misc Output write/readback (clock-select bits stored, not applied to the dot clock) |
-| Status (`3DA`) | Display-disabled (bit 0), vertical retrace (bit 3), beam-derived |
+| Attribute (`3C0`) | 16 palette entries (raw register default identity, BIOS-set text/graphics modes seed VGABios tables), Palette Address Source display blanking (index bit 5), Mode Control (10h), Overscan (11h), Color Plane Enable (12h), Pixel Pan (13h), Color Select (14h) DAC page bits, readback through `3C1`; the `3DA` flip-flop reset |
+| CRTC (`03?4/03?5`) | Start Address Hi/Lo (0C/0D), Offset (13h), text cursor location (0E/0F) and shape (0A/0B); Misc Output bit 0 selects the VGA/EGA CRTC and Input Status 1 base (`3B?` mono, `3D?` color); CGA personalities use a 5-bit Motorola 6845 register select and apply horizontal R0/R1 plus vertical-row R4/R5/R6/R7/R9 writes for register-banged text/graphics retunes, while those timing and cursor-shape registers read as write-only; BIOS-set VGA/EGA modes seed VGABIOS CRTC readback bytes and honor guest vertical timing writes (06h/07h/09h/10h/11h/12h/15h/16h) |
+| DAC (`3C7/3C8/3C9`) | Read/write index + 6-bit RGB data; `3C7` state reports read mode as 3 and write mode as 0; the pel mask (`3C6`) is stored and applied to the rendered DAC index. The 256-entry palette powers up to the stock VGA mode-13h default (the 16 EGA colors with brown at index 6, then the gray and color ramps) |
+| Misc (`3C2/3CC`) | Misc Output write/readback; standard clock-select values 00/01 drive the 25.175/28.322 MHz beam timing, bit 0 selects mono/color I/O base, and sync-polarity bits 7-6 are seeded per 400/350/480-line mode family |
+| Status (`3C2/03?A`) | Input Status 0 switch sense bit 4 follows the colour-display sense bit selected by Misc Output clock-select bits 3-2; Input Status 1 follows the Misc Output mono/color base and reports display-inactive/safe-VRAM window (bit 0, beam-derived, PAS-blank, sequencer reset/screen-off, and CGA video-disable aware), CGA light-pen trigger-latched/switch-off bits (1-2), vertical retrace (bit 3), Attribute `12h` video-status MUX bits (4-5) for active VGA/EGA output, beam-derived |
 | Beam | Cycle-coupled dot clock, catch-up rasterization, per-frame finalize |
 
 Deferred to later slices: pel-pan smooth-scroll polish, the bad-card
@@ -48,17 +48,27 @@ unchanged.
 |------|--------|--------|--------|---------------|----------------|---------|
 | 0Dh  | 320x200 | 320x449 | 400 | 200 | yes | 70 Hz |
 | 0Eh  | 640x200 | 640x449 | 400 | 200 | yes | 70 Hz |
+| 0Fh  | 640x350 mono | 640x449 | 350 | 350 | no  | 70 Hz |
 | 10h  | 640x350 | 640x449 | 350 | 350 | no  | 70 Hz |
+| 11h  | 640x480 mono | 640x525 | 480 | 480 | no  | 60 Hz |
 | 12h  | 640x480 | 640x525 | 480 | 480 | no  | 60 Hz |
 
-All four use the 25.175 MHz dot clock, 8-dot characters, and `htotal_chars` 100
+These modes use the 25.175 MHz dot clock, 8-dot characters, and `htotal_chars` 100
 (800 dots per line). Per-plane byte pitch is `offset * 2` (offset 20 for the
 320-wide mode, 40 for the 640-wide modes). A mode is selected by number through
 `Vga::set_mode(u8)`, `Machine::set_vga_mode(u8)`, or `INT 10h, AH=00h` with AL =
-0Dh/0Eh/10h/12h (the host clears the Margo latch on a VGA mode-set). The exact
+0Dh/0Eh/0Fh/10h/11h/12h (the host clears the Margo latch on a VGA mode-set). The exact
 vertical border and blank offsets per mode are conventional values validated
 against the FreeVGA reference; the load-bearing fields are resolution,
 double-scan, refresh family, and pitch.
+
+Mode 0Fh follows the VGABios VGA monochrome table: the mode-set Map Mask defaults
+to all planes (`0x0F`), while the Attribute Controller enables visible plane C0
+and maps set pixels to DAC index 8. It also selects the mono
+CRTC/status/feature base (`3B4/3B5/3BA`) through Misc Output bit 0 and publishes
+`0040:0063 = 03B4h`. Mode 11h is the VGA mode-6-style one-bit 640x480 path in
+map C0, with all-plane CPU writes/readback and the VGABios black/white ATC
+palette.
 
 **Corrected double-scan model.** The beam and catch-up count in scanlines
 (0..Vertical Total), and one scanline emits exactly one raster row, so the raster
@@ -77,8 +87,8 @@ which it wraps now match hardware.
 | Area | Covered in slice 3 |
 |------|--------------------|
 | Addressing mode | Byte / word / doubleword, from CRTC Mode Control (17h) bit 6 and Underline Location (14h) bit 6, with the Address Wrap Select (17h bit 5) choosing MA13 vs MA15 for word mode |
-| Transform | `display_offset`: byte = identity; word = rotate left 1 with MA13/MA15 into bit 0; doubleword = rotate left 2 with MA13/MA12 into bits 1/0 |
-| Counter | `start_address + source_row*offset*2 + byte_col`; the `offset*2` per-scanline increment is mode-independent |
+| Transform | `display_offset`: byte = identity; word = rotate left 1 with MA13/MA15 into bit 0; doubleword = shift left 2 with MA0/MA1 forced low |
+| Counter | `start_address + source_row*offset*2 + byte_col`, adjusted by CR17 bit 3 / CR14 bit 5 address-clock division and CR17 bits 0-1 row-scan substitution for address bits 13-14 |
 | Wrap | 16-bit counter wraps at 64 KB per plane; one counter value addresses all four parallel 64 KB planes, so this is the 256 KB display wraparound |
 | Registers | CR17 (Mode Control) and CR14 (Underline Location) are live state on `CrtcTiming`, defaulted per mode (16-color planar = 0xE3 byte mode) and writable through 3D4/3D5 |
 
@@ -89,16 +99,12 @@ and `display_address_wrap_seam_through_the_machine`).
 
 Divergences (fidelity directive):
 
-1. **Doubleword bit positions pending reference confirmation.** Implemented as
-   MA13 -> bit 1, MA12 -> bit 0 from the recollected FreeVGA/Matrox transform; to
-   be confirmed against an unbroken mirror. Unexercised by any in-scope workload.
-2. **CR17 bits 0/1 row-scan substitution not modeled.** Address bits 13/14 always
-   come from the counter. The 16-color planar modes set these bits (substitution
-   off), so this matches hardware for every in-scope mode; CGA/Hercules-compat
-   modes that clear them are out of scope.
-3. **Address-clock dividers not modeled.** CR17 bit 3 (count by 2) and CR14 bit 5
-   (count by 4) are stored but not applied to the counter rate. The 16-color
-   planar modes select no division.
+1. **Doubleword addressing is modeled from the Matrox VGA table.** CR14 bit 6
+   shifts the CRTC counter into MA2 and forces MA0/MA1 low; CR17 bits 0-1 still
+   control row-scan substitution into MA13/MA14.
+2. **Row-scan substitution and address-clock division are modeled.** CR17 bits
+   0-1 can substitute row-scan bits into address bits 13-14, CR17 bit 3 divides
+   the address clock by two, and CR14 bit 5 divides it by four.
 
 ## Slice 4 coverage
 
@@ -112,7 +118,7 @@ hardware scroll.
 | Area | Covered in slice 4 |
 |------|--------------------|
 | Line Compare | Full 10-bit value assembled from CRTC 18h (bits 0-7), the Overflow register 07h bit 4 (bit 8), and the Maximum Scan Line register 09h bit 6 (bit 9); live state on `CrtcTiming`, defaulted 0x3FF (disabled) per mode |
-| Split | Below the split (`counter_line > line_compare`) the address counter reloads to 0; rows are counted from the first split scanline (`line_compare + 1`), so the bottom region addresses VRAM from offset 0 |
+| Split | Below the split the address counter reloads to 0; VGA modes start the bottom region at `line_compare + 1`, while EGA-era planar BIOS modes 0Dh-10h start it two scanlines lower; the bottom region addresses VRAM from offset 0 |
 | Comparison point | Against the scan-counter line, in the same scan-counter units the beam and the other vertical timing registers use; not divided by the double-scan factor |
 | Pel-pan below split | Forced to 0 below the split when Attribute Mode Control (10h) bit 5 is set ("enable pixel panning: 0 = all, 1 = up to line compare"); applies everywhere when clear |
 | Registers | CRTC 18h / 07h / 09h writable through 3D4/3D5; each write updates only its line-compare bit |
@@ -138,21 +144,15 @@ genre, an EGA/VGA 16-color hardware scroller with a locked status panel.
 
 Divergences (fidelity directive):
 
-1. **EGA two-lines-lower split not modeled.** Abrash chapter 30 notes the EGA split
-   may display two scan lines lower; this core targets the VGA, where the split
-   starts on the line after the match, so the EGA variance is out of scope.
+1. **EGA two-lines-lower split is modeled.** EGA-era planar BIOS modes 0Dh-10h
+   start the split two scanlines after the VGA `line_compare + 1` threshold;
+   VGA mode 12h, mode X, and mode 13h keep VGA timing.
 2. **Line Compare bit 9 assembled but unexercised in scope.** Bit 9 only matters for
    splits at scanline 512 or higher; the in-scope modes top out at Vertical Display
-   End 480, so no in-scope split reaches it. Assembled for fidelity, flagged like
-   slice 3's doubleword bits.
-3. **Overflow / Maximum Scan Line non-line-compare fields not honored from guest
-   writes.** A 07h or 09h write updates only the line-compare bit; the vertical timing
-   high bits (07h) and the double-scan / max-scan fields (09h) stay mode-defaulted,
-   consistent with the existing full-timing-via-set_mode simplification.
-4. **Byte panning and exact preset-row-scan re-alignment at the split not modeled.**
-   CRTC 08h byte panning is not modeled, so it is not reset at the split; the bottom
-   region restarts row counting at `line_compare + 1` without a sub-double-scan-row
-   phase offset.
+   End 480, so no in-scope split reaches it. Assembled for fidelity.
+3. **CRTC 08h scroll fields are scanline-granular.** Preset-row low bits and
+   byte-pan bits offset graphics source addressing and reset below the split;
+   sub-scanline latch races stay out of scope.
 
 ## Slice 5 coverage
 
@@ -198,18 +198,18 @@ Divergences (fidelity directive):
    mode-X mechanism) remain the coarse-scroll path. Chained mode 13h shares the
    planar scanout and the same 0-3 pel-pan (see "Slice 8 coverage"), so there is no
    distinct 13h pel-pan to defer.
-3. **Only the chain-4 to unchained-planar transition is modeled,** not the full
-   odd/even host-addressing matrix.
+3. **The CPU host-addressing paths cover chain-4, sequential planar, and
+   odd/even decode.** The VGA core applies Sequencer Memory Mode 04h bit 2 for
+   odd/even writes, plus Graphics Controller Mode 05h bit 4 and Misc 06h bit 1
+   for odd/even reads. The machine bus routes the GC06-selected graphics
+   aperture, including map-select 00's 128 KB host window mirrored onto the 64 KB
+   plane window.
 4. **The 256-color byte is the DAC index directly.** Attribute Mode Control bit 6
    (the 8-bit-color gate) is not modeled as a separate switch; unchained 256-color
    implies it.
 5. **Exact 320x240 blank and retrace offsets follow the guest's registers,** with
    the end fields as line-counter compares; the load-bearing fields are 320x240
    resolution, 60 Hz, double-scan, and pitch.
-6. **The CRTC End Vertical Retrace (11h) write-protect bit (bit 7) is not enforced.**
-   When set, real hardware locks CRTC registers 00h-07h against further writes; the
-   core honors all subsequent vertical-timing writes regardless. No in-scope mode-X
-   setup depends on the protection.
 
 ## Slice 6 coverage
 
@@ -295,9 +295,7 @@ Divergences (fidelity directive):
    planar 256-color scanout with mode X, so it inherits the 0-3 pel-pan (one plane
    per pel, four pels per plane-offset address) and has no distinct pel-pan to
    defer; see "Slice 8 coverage."
-2. **CRTC 08h byte panning and preset-row-scan re-alignment at the split stay
-   deferred** (slice-4 divergence 4), unchanged for mode X.
-3. **Pel-pan values 4-7 fold into a start-address bump** in mode X and are
+2. **Pel-pan values 4-7 fold into a start-address bump** in mode X and are
    masked out (`& 0x03`); they are beyond-useful, not a distinct behavior.
 
 ## Slice 8 coverage
@@ -316,7 +314,7 @@ presentation, and the 64000-byte aperture cap are all gone.
 |------|--------------------|
 | Renderer | `render_256color_row` (renamed from `render_modex_row`): the shared planar scanout, `plane = x & 3`, plane offset `row_base + (x >> 2)`, the byte as the 8-bit DAC index; `render_scanline` dispatches both `Mode13h` and `ModeX` to it |
 | Chain-4 writes | `cpu_write_chain4` / `cpu_read_chain4`: byte N routes straight to plane `N & 3` at plane-offset `N >> 2`, bypassing the planar datapath (Abrash, Graphics Programming Black Book ch.47) |
-| Timing | `CrtcTiming::mode13h`: standard 320x200 70 Hz, double-scanned to 400 scanlines (200 source rows), offset 40; `set_mode13h` installs it, resets the beam, and resizes the work buffer |
+| Timing | `CrtcTiming::mode13h`: standard 320x200 70 Hz, double-scanned to 400 scanlines (200 source rows), offset 40; `set_mode13h` installs it, resets the beam, seeds the raw CRTC register file, and resizes the work buffer. Guest vertical CRTC writes use the shared graphics-mode `recompute_vertical_timing` path |
 | Bus | The 64 KB A0000 window serves Planar, ModeX, and Mode13h alike; mode 13h picks the chain-4 decode; `active_display` returns `VgaRaster` for all three |
 | Start-address vretrace latch | The generic CRTC 0C/0D latch applies to mode 13h by construction |
 | CRTC Line Compare split | `split_origin` applies to mode 13h by construction |
@@ -360,13 +358,7 @@ this slice.
 
 Divergences (fidelity directive):
 
-1. **Mode-13h guest vertical-CRTC-bang retuning is deferred.** Mode 13h installs
-   fixed 320x200 70Hz timing at entry; only mode X honors the guest's vertical
-   CRTC bang. The tweaked-13h geometry (320x400, 360-wide) is mode-X-adjacent
-   territory and stays deferred.
-2. **CRTC 08h byte panning and preset-row-scan re-alignment at the split stay
-   deferred** (slice-4 divergence 4), unchanged for mode 13h.
-3. **Pel-pan values 4-7 fold into a start-address bump** and are masked out
+1. **Pel-pan values 4-7 fold into a start-address bump** and are masked out
    (`& 0x03`); they are beyond-useful, not a distinct behavior.
 
 ## Slice 9 coverage — text-mode scanout and the loadable character generator
@@ -380,14 +372,14 @@ for the headless ASCII dump.
 
 | Area | Covered in slice 9 |
 |------|--------------------|
-| Character generator | The three ROM glyph fonts (8x8, 8x14, 8x16) byte-for-byte from the LGPL VGABios `vgafonts.h`; the 8x16 table is the mode-03h default |
+| Character generator | The three ROM glyph fonts (8x8, 8x14, 8x16) byte-for-byte from the LGPL VGABios `vgafonts.h`; the 8x16 table is the mode-03h default. CGA text uses the fixed 8x8 ROM glyphs and ignores VGA font-map state |
 | Sequencer Clocking Mode (1) | Bit 0 selects 8-dot vs 9-dot text; the renderer derives the effective character width |
-| Text scanout | `render_text_row`: 80 columns of `max_scan + 1` scanlines each (16 for 720x400 mode 03h), the CRTC Line Compare split via the shared `split_origin`, foreground/background nibbles mapped through the 16-entry Attribute palette to DAC indices with the pel mask applied |
+| Text scanout | `render_text_row`: active 40- or 80-column text geometry, with CGA-style modes 00h/01h using fixed 8x8 cells in a 320x200 active area, CGA-style modes 02h/03h using fixed 8x8 cells in 640x200, BIOS mode 03h retaining VGA 80-column 16-scanline cells in 720x400, and mono mode 07h using 9x14 cells in 720x350 with the host text window at B0000; CGA text reads the same 16 KB B800 backing store as CGA graphics and ignores VGA Sequencer character width plus ATC pixel pan; the CRTC Line Compare split via the shared `split_origin`; VGA text maps foreground/background nibbles through the mode 03h VGABios Attribute palette to DAC indices and pel mask, while CGA text decodes them directly as RGBI color indexes |
 | 9-dot geometry | The 9th pixel column replicates the 8th for the box-drawing glyphs 0xC0-0xDF (a solid line join) and is the background otherwise |
-| Attribute decode | AC Mode Control 10h bit 3 toggles blink (attribute bit 7 = blink, 8 backgrounds) vs background intensity (bit 7 = intensity, 16 backgrounds); blink collapses the foreground to the background on its hide phase |
-| Writable font store | Eight 256-glyph tables (32 bytes per slot) seeded from the ROM 8x16 font; the renderer reads the active table |
+| Attribute decode | VGA text uses AC Mode Control 10h bit 3 for blink (attribute bit 7 = blink, 8 backgrounds) vs background intensity (bit 7 = intensity, 16 backgrounds); CGA text uses mode-control `3D8` bit 5 for the same blink/background-intensity choice; blink collapses the foreground to the background on its hide phase |
+| Writable font store | Eight 256-glyph tables (32 bytes per slot) seeded from the ROM 8x16 font; VGA text reads the active table |
 | Sequencer Character Map Select (3) | Map A (bits 0, 1, 4) selects the active table for 256-glyph text |
-| `INT 10h AH=11h` | AL=00/10 user font (ES:BP), AL=01/11 ROM 8x14, AL=02/12 ROM 8x8, AL=04/14 ROM 8x16, AL=03 set block specifier; the 1x variants reprogram the CRTC character height |
+| `INT 10h AH=11h` | AL=00/10 user text font (ES:BP), AL=01/11 ROM 8x14, AL=02/12 ROM 8x8, AL=04/14 ROM 8x16, AL=03 set block specifier, AL=20 graphics 8x8 font pointer at INT 1Fh, AL=21 user planar graphics font (ES:BP, CX bytes/char), AL=22/23/24 ROM 8x14/8x8/8x16 graphics fonts with BL row-grid selection, AL=30/BH=00..07 font-info pointers with live BDA height/rows; the 1x text variants reprogram the CRTC character height |
 | Presentation | Text mode presents a `VgaRaster` (`ActiveDisplay::VgaRaster`); `frame()` / `TextFrame` stay for the headless cell view |
 
 The semantics are pinned to the IBM VGA character generator and Abrash's
@@ -413,36 +405,28 @@ glyph data, the 9-dot geometry, the attribute/blink decode, and the font-store
 and AH=11h behavior are verified directly against the code paths above; no
 released-source title was inspected.
 
-Divergences (fidelity directive):
-
-1. **`AH=11h AL=30` (get font info) and `AL=20-24` (graphics-mode text) are
-   deferred.** AL=30 returns a far pointer to the active font; the graphics-mode
-   text services render text in graphics modes. Both are the Slice B follow-up
-   (graphics-mode text); see the Slice A coverage for the text-mode work that did
-   land.
-
 The remaining slice-9 text-mode gaps closed in Slice A:
 
-2. **The hardware text cursor is rendered (slice 11), now including cursor skew
+1. **The hardware text cursor is rendered (slice 11), now including cursor skew
    (Slice A).** The cursor renders reverse video on the cell at
    `cursor_offset`; the `frame()` / `TextFrame` cursor offset stays for the
    headless ASCII view. Cursor skew (CRTC 0Bh bits 5-6) now delays the cursor
    onset by 0-3 character clocks (see the Slice 11 coverage and Slice A).
-3. **The blink cadence is modeled.** Attribute blink and cursor blink share one
+2. **The blink cadence is modeled.** Attribute blink and cursor blink share one
    16-on / 16-off vertical-retrace phase (`blink_hide_phase`); the hardware
    cadence is no longer a refinement (Slice A).
-4. **Text-mode pel-pan (AC 13h) and start-address smooth scroll are applied.**
+3. **Text-mode pel-pan (AC 13h) and start-address smooth scroll are applied.**
    The text scanout reads cells from the CRTC start-address origin and shifts the
    column origin by the AC 13h pel-pan, with the 9-dot replicate shifting with
    the cell (Slice A).
-5. **CRTC 08h preset-row-scan is modeled.** Bits 4-0 offset the first displayed
+4. **CRTC 08h preset-row-scan is modeled.** Bits 4-0 offset the first displayed
    font scanline (vertical sub-row scroll); bits 6-5 add a byte pan to the
    origin; both reset below the line-compare split (Slice A).
-6. **512-character / dual-font mode is modeled.** `char_map_b_decode` selects
+5. **512-character / dual-font mode is modeled.** `char_map_b_decode` selects
    the second font table; attribute bit 3 selects map A vs map B and the
-   foreground drops to 8 colors while active (Slice A). The Tier-2/3 graphics
-   register gaps (16-color Color Select 14h, guest vertical timing, odd/even
-   addressing) stay parked in the backlog spec; none blocks a standard title.
+   foreground drops to 8 colors while active (Slice A). The remaining Tier-2/3
+   graphics register gaps stay parked in the backlog spec; none blocks a
+   standard title.
 
 ## Slice 10 coverage — default palettes, BIOS video services, and ports
 
@@ -454,12 +438,21 @@ gates the rendered DAC index (the default `0xFF` is a no-op).
 
 | Area | Covered in slice 10 |
 |------|---------------------|
-| Default palettes | The 16 ATC palette registers power up to identity (N → N), and the 256-entry DAC powers up to the stock VGA mode-13h palette (byte-for-byte from the LGPL VGABios `palette3`) |
-| `INT 10h AH=00h` | Mode set including the text-family return (`AL` 0-7) via `Vga::set_text_mode`, alongside the existing planar (0D-12) and chained-13h branches |
-| `INT 10h AH=0Bh` | Border/overscan color (`BH=0`); the CGA palette select (`BH=1`) is deferred |
-| `INT 10h AH=10h` | ATC palette register set/get individual (`AL=00/07`) and block (`AL=02`), overscan set (`AL=01`), DAC individual (`AL=10/15`) and block (`AL=12/17`) set/get |
-| Ports | Misc Output (`3C2` write / `3CC` read), DAC pel mask (`3C6`), ATC readback (`3C1`); the pel mask is applied in both render paths |
-| CRTC | Cursor-shape registers `0A/0B` are now stored and read back (cursor *location* 0E/0F was already handled) |
+| Default palettes | The raw Attribute register block defaults to identity (N → N), BIOS mode 03h and graphics modes 0Dh-13h seed their VGABios ATC tables, and the 256-entry DAC powers up to the stock VGA mode-13h palette (byte-for-byte from the LGPL VGABios `palette3`) |
+| `INT 10h AH=00h/05h/0Fh` | Mode set including the text-family return (`AL` 0-7), VGABios-compatible `AH=00h` return class byte (`AL=30h/3Fh/20h`), AL bit 7 no-clear preservation for CGA text/graphics memory plus current-mode readback and BDA video-control `40:87`, per-mode BDA page-size/start/page/CRTC-base state, CGA `40:65/40:66` latch shadows cleared on non-CGA mode sets, BDA `40:A8` video-save pointer refreshed to the C000 table, text and EGA planar display-page select through the CRTC start-address latch; CGA graphics modes and full-frame planar modes stay single-page |
+| `INT 10h AH=04h` | CGA light-pen readback reports the trigger flag plus pixel and character coordinates from the `3DC` latch, with graphics-mode rows rounded to two scanlines and columns rounded to CGA's 2-pixel (320-wide) or 4-pixel (640-wide) granularity; unsupported/non-triggered paths return AH=0 |
+| `INT 10h AH=06h/07h` | Text-window scroll up/down on the active text page, including EGA planar graphics pages and CGA graphics modes 04h-06h where character-cell windows map to 8x8 pixel regions and `BH` supplies the raw fill color |
+| `INT 10h AH=08h` | Read char/attribute from the requested text/EGA graphics page, including CGA graphics pattern matching for glyphs drawn in any raw foreground pixel value |
+| `INT 10h AH=0Bh` | Border/overscan color (`BH=0`), including CGA background/foreground nibble plus graphics intensity in CGA modes; CGA palette select (`BH=1`) |
+| `INT 10h AH=09h/0Ah/0Eh/13h` | Text output uses the requested text/EGA graphics page and per-page BDA cursor slots; CGA graphics modes 04h-06h draw the fixed 8x8 ROM font into the packed B800 framebuffer, use the INT 1Fh table for character codes 128-255 when installed, with `BL` as graphics color and bit 7 XOR for AH=09h/0Ah; EGA/VGA planar graphics modes draw active-font glyphs into the selected planar page, including mode-12h's 30-row/16-scanline text grid |
+| `INT 10h AH=0Ch/0Dh` | Write/read graphics pixel for CGA modes 04h-06h, EGA/VGA 16-colour planar modes using `BH` as the EGA graphics page, and chained mode 13h |
+| `INT 10h AH=10h` | ATC register set/get individual (`AL=00/07`, including overscan register 11h), ATC palette block set (`AL=02`), blink/background-intensity toggle (`AL=03`), overscan set/get (`AL=01/08`, carrying the CGA `3D9h` low five bits in CGA personalities), palette+overscan block get (`AL=09`), DAC individual (`AL=10/15`) and block (`AL=12/17`) set/get, DAC colour-page mode/page select (`AL=13`) and state readback (`AL=1A`), PEL mask set/get (`AL=18/19`), grayscale summing (`AL=1B`) |
+| `INT 10h AH=12h` | EGA alternate-select information query (`BL=10h`): reports color vs mono CRTC base, 256 KiB video memory, and the BDA switch low nibble; text scanline-family select (`BL=30h`) stores the 200/350/400-line request for the next text mode set and updates the EGA switch nibble reported by `BL=10h`; default-palette loading enable/disable (`BL=31h`) controls whether mode sets reload DAC/ATC palette data; video-addressing enable/disable (`BL=32h`) drives the Misc Output RAM-enable bit while leaving VGA I/O live; grayscale-summing enable/disable (`BL=33h`) converts future DAC loads from INT 10h or `3C9` writes; cursor-emulation enable/disable (`BL=34h`) controls whether `AH=01h` scales legacy 8-scanline cursor shapes to the active text cell height; display-switch interface (`BL=35h`) is acknowledged as a single-adapter no-op; video-refresh enable/disable (`BL=36h`) blanks or restores display output/status while leaving memory and ports live |
+| `INT 10h AH=1Ah` | Display-combination read/write uses the BDA `40:8A` byte: `AL=00h` returns it in `BL`, `AL=01h` stores caller `BL`, and mode sets refresh it from the active color/mono CRTC base |
+| `INT 10h AH=1Bh` | VGA state-information block reports a readable C000 functionality table pointer, live mode, text geometry, page size/start/page, per-page cursor slots, CRTC base, CGA latch shadows, character height, display combination code mirrored in BDA `40:8A`, colour count, scanline family, EGA planar page counts, one-page full-frame planar modes, and a C000 video-save pointer table whose first far pointer targets the standard VGABios video-parameter table bytes |
+| `INT 10h AH=1Ch` | Save/restore video state honors the requested `CX` bitmap for hardware registers, including CGA output-only CRTC/mode/color latches, BDA video bytes through the `40:A8` video-save pointer, and DAC/palette state; `AL=00h` reports the 64-byte block count for the requested combination |
+| Ports | Misc Output (`3C2` write / `3CC` read), including the RAM-enable bit for A0000/B0000/B8000 memory decode; Video Subsystem Enable (`3C3`) gating VGA/EGA/CGA I/O and combining with Misc Output for legacy apertures; DAC pel mask (`3C6`), ATC readback (`3C1`), Misc Output-selected VGA/EGA CRTC and Input Status 1 ports (`3B4/3B5/3BA` or `3D4/3D5/3DA`), CRTC start-address scanout for CGA graphics, text apertures at B0000 for mode 07h and B8000 for color/CGA text, CGA-style CRTC aliases (`3D0/3D2/3D4/3D6` index and `3D1/3D3/3D5/3D7` data), CGA mode-control (`3D8`, output-only 6-bit latch) for CGA text 40/80-column decode, text/graphics personality switching over the shared 16 KB CGA B800 backing store, 320/640 graphics decode, full-output video-enable blanking, text blink/background-intensity, VGA-mode03-to-CGA-text switching for register-banged low-res text modes, and the 16 KB CGA B800 window mirrored at BC000; CGA color-select (`3D9`, output-only 6-bit latch) covers text border, 320x200 background/border/palette/intensity, and 640x200 foreground, and light-pen clear/set latch (`3DB/3DC`); the pel mask is applied in both VGA render paths |
+| CRTC/SEQ/GC/ATC | VGA/EGA BIOS mode sets seed VGABIOS CRTC, Sequencer, Graphics Controller, and Attribute Controller readback bytes for mode 03h and graphics modes 0Dh-13h, while keeping the existing tested scanout timing model; mode 03h stores VGABios AC13=08h for readback but treats it as the unshifted 9-dot text baseline. VGA cursor-shape registers `0A/0B` are stored and read back; CGA personalities use the 6845's 5-bit register select, mask timing/interlace writes to their 6845 field widths, mask start/cursor-address high bytes to the 14-bit address bus, and decode 6845 cursor mode bits in `0A` with a 5-bit cursor-end `0B` (no VGA skew), while exposing 6845-style write-only reads for the index plus registers `00h-0Dh`. Cursor location `0E/0F` and light-pen latch high/low `10/11` read back. CGA honors horizontal total/displayed plus vertical total/displayed/retrace/max-scan writes for register-banged text/graphics modes, including graphics row pitch from the live displayed width; 640x200 mode keeps the 40-column graphics 6845 register image and expands each displayed character time to 16 pixels |
 
 The HLE services run *after* the software `INT` retires (registers intact) and
 operate on register state through public `Vga` accessors rather than the port
@@ -469,13 +462,9 @@ strictly additive.
 
 Divergences (fidelity directive):
 
-1. **Misc Output clock-select is stored, not applied.** `3C2` bits 2-3 are read
-   back faithfully through `3CC`, but the dot clock stays mode-fixed; retuned
-   refresh (the 360-wide modes) is not modeled.
-2. **The rare `AH=10h` sub-functions are deferred**: overscan get (`AL=08`), the
-   palette/overscan block get (`AL=09`), intensity/blink toggle (`AL=03`), color
-   paging (`AL=13/14/1A`), and the font services (`AL=20-24`). The font services
-   belong with the loadable-character-generator slice.
+1. **External/reserved Misc Output clocks fall back to 25.175 MHz.** Standard
+   VGA selects 00/01 drive the 25.175/28.322 MHz dot clocks; selects 10/11 need
+   a programmable clock source VEGA does not expose yet.
 
 ## Slice 11 coverage — text-mode hardware cursor
 
@@ -488,7 +477,7 @@ reverse video on the active scanlines.
 | Area | Covered in slice 11 |
 |------|---------------------|
 | Cursor fill | Reverse video: on the cell at `cursor_offset`, the foreground and background swap on the active cursor scanlines (the Bochs `draw_char_common` text-cursor path; QEMU's solid-foreground approximation coincides for the blank-cell case) |
-| Cursor shape | CRTC 0A bit 5 disables the cursor; bits 0-4 of 0A/0B bound the scanline range; a start greater than end wraps to two regions (a faithful superset of Bochs, which treats that case as invisible) |
+| Cursor shape | VGA CRTC 0A bit 5 disables the cursor and 0B bits 5-6 skew it; CGA text uses 6845 R10 bits 5-6 as cursor mode and R11 as a 5-bit cursor end. Bits 0-4 of 0A/0B bound the scanline range; a start greater than end wraps to two regions (a faithful superset of Bochs, which treats that case as invisible) |
 | Cursor blink | The cursor blinks on the same frame hide phase as attribute blink, but is not gated on the AC Mode Control 10h bit 3 attribute-blink enable |
 
 The semantics are pinned to the IBM VGA character generator and RBIL
@@ -537,7 +526,7 @@ start-address latch is honored and cleared on `set_text_mode`.
 | Commit | Area | Covered in Slice A |
 |--------|------|--------------------|
 | C1 | 32 KB aperture + start-address scanout | `VGA_TEXT_MEMORY_SIZE` grows to 32768; `render_text_row` reads from the start-address origin above the line-compare split and from 0 below it; `pending_start` cleared on mode set |
-| C2 | `INT 10h AH=05h` set-display-page | `start_address = page * 2048` (page_size 4096 bytes) routed through the vretrace latch |
+| C2 | `INT 10h AH=05h` set-display-page | Text modes route `start_address = page * stride_cells` through the vretrace latch, EGA planar modes route byte-addressed page starts through the same latch, update BDA page-size/start/page state, and keep BIOS text services on the selected text page; CGA graphics modes remain on their single page |
 | C3 | AC pel-pan (13h) in text | Column origin shifted by the 0..char_width pel-pan; the 9-dot replicate shifts with the cell; below-split forcing via AC 10h bit 5 reuses the shared `pel_pan` |
 | C4 | CRTC 08h preset-row-scan | Bits 4-0 offset the first displayed font scanline (vertical sub-row scroll); bits 6-5 add a byte pan to the origin; both reset below the split |
 | C5 | 512-character / dual-font | `char_map_b_decode` selects the second font table; attribute bit 3 set selects map B (Abrash/vgabios/Bochs polarity; FreeVGA's opposite wording is recorded as a known conflict and overridden); the foreground drops to 8 colors while active |
@@ -573,11 +562,12 @@ proven end-to-end through the machine at
 `int10_ah05_sets_the_text_page_via_start_address` and
 `int10_ah05_page_flip_scrolls_through_the_machine`.
 
-Out of Slice A (Slice B, graphics-mode text): `AH=11h AL=30` get-font-info and
-`AL=20-24` graphics-mode text setup, plus the graphics-mode text-output services
-(`AH=09/0E/13`) and BIOS cursor tracking (`AH=02/03`). Graphics-mode pel-pan /
-preset-row-scan for the planar paths stay parked as before; this slice applies
-08h / 13h to text only.
+Out of Slice A (Slice B, graphics-mode text): CGA modes 04h-06h draw BIOS text
+output into B800 and honor `AL=20`/`AL=30,BH=00` INT 1Fh graphics-font
+setup/query; planar modes now draw BIOS text output into the visible planar
+framebuffer and honor `AL=21-24` graphics-font setup.
+Graphics-mode preset-row scan, CRTC byte pan, and pel-pan are now applied in the
+planar paths.
 
 ## Latch rules
 
@@ -642,9 +632,9 @@ modes land.
 7. **Separate 256 KB VGA buffer.** VGA planar memory is its own buffer, distinct
    from Margo's 4 MB linear VRAM. Unifying matters only if software maps the same
    bytes through both apertures at once — no DOS-era planar game does.
-8. **Misc Output clock-select is stored, not applied.** The `3C2` bits are read
-   back through `3CC`, but the dot clock stays mode-fixed; retuned refresh is not
-   modeled (see Slice 10).
+8. **External/reserved Misc Output clocks fall back to 25.175 MHz.** The standard
+   `3C2` clock selects 00/01 drive live refresh timing; selects 10/11 wait on a
+   programmable VEGA clock source (see Slice 10).
 
 ## Slice-1 implementation approximations
 
@@ -653,10 +643,12 @@ These are simplifications recorded for later tightening, not hardware behavior:
 - **Start address and offset pitch** are now handled by the faithful
   display-address counter and the byte/word/doubleword transform (see "Slice 3
   coverage"); these are no longer approximations.
-- **The A0000 aperture** routes to the planar datapath when the core is in a
-  planar mode, to the chain-4 decode in mode 13h, and to the unchained planar
-  datapath in mode X; the window is the 64 KB `A0000..AFFFF` range. (Mode 13h was
-  once a separate flat buffer; slice 8 routed it through the raster engine.)
+- **The GC06 graphics aperture** routes to the planar datapath when the core is
+  in a planar mode, to the chain-4 decode in mode 13h, and to the unchained
+  planar datapath in mode X. The standard mode-set window is 64 KB
+  `A0000..AFFFF`; explicit map-select 00 routes `A0000..BFFFF` as a 128 KB host
+  window mirrored onto the 64 KB plane window. (Mode 13h was once a separate flat
+  buffer; slice 8 routed it through the raster engine.)
 - **Full CRTC vertical timing** (`text_03h`, `mode_0dh`) uses conventional values;
   per-mode timing tables are added as modes land.
 

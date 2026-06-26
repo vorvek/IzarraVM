@@ -49,9 +49,6 @@ stage2_start:
     call init_serial
     call copy_result_block
 
-    mov si, result_payload
-    call puts_serial
-
     mov ax, VGA_TEXT
     mov es, ax
     mov di, 0
@@ -79,6 +76,8 @@ stage2_start:
     mov ah, 0x0b
     call puts_screen
 
+    call test_cga_graphics
+    call test_ega_planar
     call test_mode13h
     call test_timer
     call test_sb_dsp_reset
@@ -87,6 +86,9 @@ stage2_start:
     call test_sb_8bit_dma
     call test_sb_16bit_dma
     call test_pc_speaker
+
+    mov si, RESULT_BLOCK + (result_payload - result_block_template)
+    call puts_serial
 
     hlt
     jmp $
@@ -173,6 +175,83 @@ test_mode13h:
     mov di, 63680
     mov al, 0x7f
     stosb
+    ret
+
+test_cga_graphics:
+    mov ax, 0x0004
+    int 0x10
+    mov ax, VGA_TEXT
+    mov es, ax
+    xor di, di
+    mov al, 0x1b
+    stosb
+    xor si, si
+    mov al, [es:si]
+    cmp al, 0x1b
+    jne .done
+    mov di, 0x2000
+    mov al, 0x55
+    stosb
+    mov si, 0x2000
+    mov al, [es:si]
+    cmp al, 0x55
+    jne .done
+    mov ax, 0x0b00
+    mov bx, 0x0101              ; BH=1 palette select, BL=1 palette 1
+    int 0x10
+    mov dx, 0x03d9
+    in al, dx
+    and al, 0x20
+    cmp al, 0x20
+    jne .done
+    mov di, RESULT_BLOCK + (cga_graphics_record - result_block_template)
+    mov byte [di], 'P'
+    mov byte [di + 2], 'S'
+    mov byte [di + 3], 'S'
+    add word [RESULT_BLOCK + 10], 27
+.done:
+    ret
+
+test_ega_planar:
+    mov ax, 0x0010
+    int 0x10
+    mov dx, 0x03c4
+    mov al, 0x02                ; Sequencer Map Mask
+    out dx, al
+    inc dx
+    mov al, 0x04                ; plane 2 only
+    out dx, al
+    mov ax, VGA_MODE13H
+    mov es, ax
+    xor di, di
+    mov al, 0xa5
+    stosb
+    mov dx, 0x03ce
+    mov al, 0x04                ; Graphics Controller Read Map Select
+    out dx, al
+    inc dx
+    mov al, 0x02                ; read plane 2
+    out dx, al
+    xor si, si
+    mov al, [es:si]
+    cmp al, 0xa5
+    jne .done
+    mov dx, 0x03ce
+    mov al, 0x04
+    out dx, al
+    inc dx
+    mov al, 0x00                ; read plane 0; it must still be untouched
+    out dx, al
+    xor si, si
+    mov al, [es:si]
+    test al, al
+    jnz .done
+    mov di, RESULT_BLOCK + (ega_planar_record - result_block_template)
+    mov byte [di], 'P'
+    mov byte [di + 2], 'S'
+    mov byte [di + 3], 'S'
+    add word [RESULT_BLOCK + 10], 27
+.done:
     ret
 
 copy_result_block:
@@ -536,7 +615,7 @@ irq0_handler:
 
 title db 'IzarraVM x86 Boot Test Suite', 0
 line_cpu db 'CPU: real/protected/paging smoke PASS', 0
-line_video db 'VIDEO: VGA text PASS, CGA/EGA/VGA graphics pending FAIL', 0
+line_video db 'VIDEO: VGA text, CGA/EGA/VGA graphics PASS', 0
 line_sound db 'SOUND: capability matrix emitted; absent/unsupported features FAIL', 0
 line_memory db 'MEMORY: conventional pattern PASS, extended stress pending FAIL', 0
 

@@ -4,7 +4,7 @@ pub mod distira;
 pub mod font;
 pub mod margo;
 pub mod vga;
-pub use vga::{VGA_PLANAR_SIZE, Vga, VgaRaster};
+pub use vga::{CGA_FB_SIZE, VGA_PLANAR_SIZE, Vga, VgaRaster};
 
 pub use distira::*;
 
@@ -21,6 +21,7 @@ pub const VGA_MODE13H_BASE: u32 = 0x000a_0000;
 /// (mode X) and 16-color planar access. Wider than `MODE13H_MEMORY_SIZE`, the
 /// 64000-byte chained mode-13h buffer.
 pub const VGA_PLANAR_WINDOW_SIZE: u32 = 0x1_0000;
+pub const VGA_MONO_TEXT_BASE: u32 = 0x000b_0000;
 pub const VGA_TEXT_BASE: u32 = 0x000b_8000;
 pub const VGA_TEXT_COLUMNS: usize = 80;
 pub const VGA_TEXT_ROWS: usize = 25;
@@ -382,12 +383,16 @@ impl Dac {
         self.read_component = 0;
     }
 
-    pub fn write_data(&mut self, value: u8) {
+    pub fn write_data(&mut self, value: u8) -> Option<u8> {
+        let index = self.write_index;
         self.palette[self.write_index as usize][self.write_component as usize] = value & 0x3f;
         self.write_component += 1;
         if self.write_component == 3 {
             self.write_component = 0;
             self.write_index = self.write_index.wrapping_add(1);
+            Some(index)
+        } else {
+            None
         }
     }
 
