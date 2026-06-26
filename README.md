@@ -45,8 +45,6 @@ point is to make the Izarra 3000 feel like a real, opinionated computer.
 
 IzarraVM is early. The emulator boots its own BIOS and Toka-DOS path, and some
 simple DOS software may work, but it is not a dependable DOS game runner yet.
-Game compatibility work should start from specific titles and turn their first
-failure into a repeatable test.
 
 ## Quick Start
 
