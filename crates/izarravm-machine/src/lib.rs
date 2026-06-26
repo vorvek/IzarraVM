@@ -70,6 +70,10 @@ const VGA_BIOS_INT44_FONT_OFF: u16 = 0x3000;
 const VGA_BIOS_INT44_FONT_ADDR: u32 = VGA_BIOS_BASE + VGA_BIOS_INT44_FONT_OFF as u32;
 const VGA_BIOS_INT1F_FONT_OFF: u16 = 0x3800;
 const VGA_BIOS_INT1F_FONT_ADDR: u32 = VGA_BIOS_BASE + VGA_BIOS_INT1F_FONT_OFF as u32;
+/// Lotura port 0xE7 banks one code-page font page here. The address sits in
+/// free space inside the VGA BIOS span (0xC0000-0xC7FFF); the VGA BIOS only
+/// uses through ~0xC3C00, so 0xC4000 is available without a new UMA reservation.
+const CODEPAGE_FONT_WINDOW: u32 = 0xC4000;
 
 /// The default LIM EMS 4.0 page-frame base: segment 0xE000, the top 64 KiB of the
 /// upper-memory window. This is the 386MAX and DOSBox default, and on the Izarra
@@ -11839,6 +11843,27 @@ impl CpuBus for MachineBus<'_> {
             return Ok(());
         }
         if self.unittester.write_port(port, value as u8) {
+            return Ok(());
+        }
+        if port == 0x00e7 {
+            // Lotura port 0xE7: bank a code-page font page into the window at
+            // CODEPAGE_FONT_WINDOW. sel = cp*3 + size_index where size_index
+            // 0=8x16 (4096 bytes), 1=8x14 (3584 bytes), 2=8x8 (2048 bytes).
+            // Valid selectors are 0..14 (five code pages, three sizes each).
+            // An out-of-range selector is silently ignored.
+            let sel = value as usize;
+            let cp = sel / 3;
+            let size_index = sel % 3;
+            if cp < 5 {
+                let (size_off, len) = [(0usize, 4096usize), (4096, 3584), (7680, 2048)][size_index];
+                let off = cp * 9728 + size_off;
+                let page = &izarravm_firmware::CODEPAGE_FONTS[off..off + len];
+                for (i, &byte) in page.iter().enumerate() {
+                    let _ = self
+                        .memory
+                        .write_u8(CODEPAGE_FONT_WINDOW as usize + i, byte);
+                }
+            }
             return Ok(());
         }
         if self.rtc.write_port(port, value as u8) {
@@ -31734,5 +31759,24 @@ mod tests {
         // Run from the halt stub: CLI then HLT, with IF cleared, gives a genuine stop.
         let reason = m.run_until_halt_or_cycles(10_000).unwrap();
         assert_eq!(reason, StopReason::Halted);
+    }
+
+    #[test]
+    fn lotura_e7_banks_a_codepage_font_page_into_the_window() {
+        // mov al,3 ; out 0E7h,al ; int 20h -> bank CP850 8x16 (cp=1, size=0) into 0xC4000.
+        // sel=3: cp=3/3=1, size_index=3%3=0 => CP850, 8x16 block.
+        const PROG: [u8; 6] = [0xB0, 0x03, 0xE6, 0xE7, 0xCD, 0x20];
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
+                .unwrap();
+        machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        // CP850 8x16 block is CODEPAGE_FONTS[9728 .. 9728+4096]; it must now be at 0xC4000.
+        for k in [0u32, 1, 0x41 * 16 + 2, 4095] {
+            assert_eq!(
+                machine.read_physical_u8(0xC4000 + k),
+                izarravm_firmware::CODEPAGE_FONTS[(9728 + k) as usize],
+                "byte {k} mismatch"
+            );
+        }
     }
 }

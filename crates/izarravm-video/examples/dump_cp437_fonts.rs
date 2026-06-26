@@ -1,7 +1,7 @@
 // Authoring-only: write the built-in CP437 glyphs (8x8, 8x14, 8x16, in that
 // order, concatenated) to tools/cp437-fonts.bin so the font-blob generator can
 // reuse them verbatim and keep CP437 byte-identical to what ships.
-use izarravm_video::font::{VGAFONT_8X14, VGAFONT_8X16, VGAFONT_8X8};
+use izarravm_video::font::{VGAFONT_8X8, VGAFONT_8X14, VGAFONT_8X16};
 
 fn main() {
     let mut out = Vec::new();
