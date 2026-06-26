@@ -31779,4 +31779,34 @@ mod tests {
             );
         }
     }
+
+    // Boot the BIOS with the given CMOS 0x11 code-page index to its idle loop, then
+    // return `rows` font bytes for `glyph` from the VGA character generator (table 0).
+    // Mirrors the boot-to-idle pattern from izarra_kbd_layouts.rs.
+    fn boot_and_read_font_rows(cmos_codepage: u8, glyph: u8, rows: usize) -> Vec<u8> {
+        let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
+        machine.set_cmos_byte(0x11, cmos_codepage);
+        machine.run_until_halt_or_cycles(20_000_000).unwrap();
+        (0..rows)
+            .map(|r| machine.video().active_font_glyph_row(glyph, r))
+            .collect()
+    }
+
+    #[test]
+    fn boot_codepage_byte_loads_font_into_generator() {
+        // CP850 8x16 block is CODEPAGE_FONTS[9728 .. 9728+4096]. Glyph 0xB5 there is
+        // A-acute; under CP437 it is a box-drawing piece. Booting with CMOS 0x11 = 1
+        // must leave the VGA font generator holding the CP850 glyph.
+        let want: Vec<u8> = (0..16)
+            .map(|r| izarravm_firmware::CODEPAGE_FONTS[9728 + 0xB5 * 16 + r])
+            .collect();
+        let got = boot_and_read_font_rows(1, 0xB5, 16);
+        assert_eq!(got, want);
+        // CP437 (cmos 0) keeps the box-drawing glyph.
+        let want437: Vec<u8> = (0..16)
+            .map(|r| izarravm_firmware::CODEPAGE_FONTS[0xB5 * 16 + r])
+            .collect();
+        assert_eq!(boot_and_read_font_rows(0, 0xB5, 16), want437);
+    }
 }

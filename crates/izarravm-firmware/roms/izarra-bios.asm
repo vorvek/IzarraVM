@@ -19,6 +19,7 @@ reset:                          ; ROM offset 0; the reset vector far-jumps here
 %include "izbios-art.inc"       ; generated art: palette + RLE bg/icons/boot box (geometry %defines used by core/gfx/lfb below)
 %include "izbios-core.inc"      ; foundation: bring-up, PIC, POST sequencer, helpers
 %include "izbios-gfx.inc"       ; foundation: mode-13h primitives + 8x8 font
+%include "izbios-codepage.inc"  ; foundation: code-page font loader (Lotura 0xE7 + INT 10h)
 %include "izbios-lfb.inc"       ; foundation: 320x240x8 LFB draw primitives
 %include "izbios-kbd.inc"       ; foundation: INT 09h/16h + kb_getkey/kb_flush
 %include "kbd-layouts.inc"      ; foundation: six scancode -> ASCII layout tables
