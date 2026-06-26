@@ -6,6 +6,7 @@
 ; "lock key held" guard so a held CapsLock/NumLock/ScrollLock/Insert key toggles
 ; the matching KB_FLAGS bit once per press, not once per auto-repeat.
 %define KB_FLAGS_1     0x0018      ; BDA: second shift-flags byte
+%define KB_LAYOUT      0x0096      ; BDA: active keyboard layout index
 %define KB_PREFIX      0x0097      ; pending E0 extended-key prefix
 %define KB_ALTGR       0x0098      ; right Alt held
 
@@ -49,17 +50,32 @@ int09:
     test byte [KB_FLAGS], 0x20
     jz .make_ins
 .map_ascii:
-    ; Map scancode -> ASCII using the shift state, then enqueue (scancode:ascii).
+    ; Map scancode -> ASCII using the active layout and shift state, then enqueue
+    ; (scancode:ascii).
     push cx
     push si
     mov ax, 0x0040
     mov ds, ax
-    movzx si, bl
-    mov al, [cs:scan2ascii + si]   ; unshifted ASCII (0 if none)
+    ; Compute layout*384 as layout*128 + layout*256, then select its modifier
+    ; table. SI finally indexes that 128-byte table by make scancode.
+    movzx si, byte [KB_LAYOUT]
+    mov ax, si
+    shl si, 7
+    shl ax, 8
+    add si, ax
+    cmp byte [KB_ALTGR], 0
+    jne .altgr
     test byte [KB_FLAGS], 0x03     ; either shift held?
-    jz .have_ascii
-    mov al, [cs:scan2ascii_shift + si]
-.have_ascii:
+    jz .no_shift
+    add si, 128
+    jmp .no_shift
+.altgr:
+    add si, 256
+.no_shift:
+    add si, kbd_layout_tables
+    movzx cx, bl
+    add si, cx
+    mov al, [cs:si]                ; ASCII (0 if none)
     test bh, bh
     jnz .keypad_done
     cmp bl, 0x4a
@@ -83,9 +99,11 @@ int09:
     mov al, [cs:keypad_num_ascii + si]
 .keypad_done:
     test byte [KB_FLAGS], 0x08
-    jz .not_alt
+    jz .not_left_alt
+    cmp byte [KB_ALTGR], 0
+    jne .not_left_alt
     xor al, al
-.not_alt:
+.not_left_alt:
     ; Ctrl + letter -> control code (Ctrl-A = 1 .. Ctrl-Z = 26), as a real BIOS
     ; does, so a full-screen program reads Ctrl-S as ASCII 0x13 from INT 16h.
     test byte [KB_FLAGS], 0x04
@@ -549,19 +567,4 @@ kb_enqueue:
 keypad_num_ascii:
     db '7','8','9',0,'4','5','6',0,'1','2','3','0','.'
 
-; Scancode (Set 1) -> ASCII tables (US). 0 = no ASCII / handled elsewhere.
-; Index by make scancode (0x00..0x3a covers the main block used by the demo).
-; Covers the main typing block; extend toward 0x53 as needed.
-scan2ascii:
-    db 0,    27,  '1','2','3','4','5','6','7','8','9','0','-','=', 8,  9     ; 00-0f
-    db 'q','w','e','r','t','y','u','i','o','p','[',']', 13, 0,  'a','s'      ; 10-1f
-    db 'd','f','g','h','j','k','l',';',39, '`', 0,  92, 'z','x','c','v'      ; 20-2f
-    db 'b','n','m',',','.','/', 0,  '*', 0,  ' '                            ; 30-39
-    times 0x80 - ($ - scan2ascii) db 0
-
-scan2ascii_shift:
-    db 0,    27,  '!','@','#','$','%','^','&','*','(',')','_','+', 8,  9     ; 00-0f
-    db 'Q','W','E','R','T','Y','U','I','O','P','{','}', 13, 0,  'A','S'      ; 10-1f
-    db 'D','F','G','H','J','K','L',':',34, '~', 0,  '|','Z','X','C','V'      ; 20-2f
-    db 'B','N','M','<','>','?', 0,  '*', 0,  ' '                            ; 30-39
-    times 0x80 - ($ - scan2ascii_shift) db 0
+%include "kbd-layouts.inc"

@@ -16547,15 +16547,20 @@ mod tests {
     /// after injecting `scancodes`. Returns the value INT 16h handed the program.
     /// This is the editor's keyboard path end to end: 8042 -> IRQ1 -> INT 09h ISR
     /// -> BDA ring -> INT 16h read.
-    fn int16_read_after(scancodes: &[u8]) -> u16 {
+    fn int16_read_after_with_layout(layout: u8, scancodes: &[u8]) -> u16 {
         // mov ah,0; int 16h; mov [0x200],ax; int 20h
         const PROG: [u8; 9] = [0xB4, 0x00, 0xCD, 0x16, 0xA3, 0x00, 0x02, 0xCD, 0x20];
         let mut machine =
             Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
                 .unwrap();
+        machine.write_physical_u8(0x0496, layout);
         machine.inject_key_scancodes(scancodes);
         machine.run_until_halt_or_cycles(3_000_000).unwrap();
         read_u16(&mut machine, (u32::from(DOS_LOAD_SEGMENT) << 4) + 0x200)
+    }
+
+    fn int16_read_after(scancodes: &[u8]) -> u16 {
+        int16_read_after_with_layout(0, scancodes)
     }
 
     fn int16_peek_guest_exit(scancodes: &[u8], prog: &[u8]) -> StopReason {
@@ -16618,6 +16623,20 @@ mod tests {
         assert_eq!(int16_read_after(&[0x45, 0xc5, 0x48, 0xc8]), 0x4838);
         assert_eq!(int16_read_after(&[0x45, 0xc5, 0x52, 0xd2]), 0x5230);
         assert_eq!(int16_read_after(&[0x4e, 0xce]), 0x4e2b);
+    }
+
+    #[test]
+    fn int16_resident_keyboard_uses_bios_layout_byte() {
+        assert_eq!(int16_read_after_with_layout(0, &[0x27, 0xa7]), 0x273b);
+        assert_eq!(
+            int16_read_after_with_layout(0, &[0x2a, 0x27, 0xa7, 0xaa]),
+            0x273a
+        );
+        assert_eq!(int16_read_after_with_layout(2, &[0x27, 0xa7]), 0x27a4);
+        assert_eq!(
+            int16_read_after_with_layout(2, &[0x2a, 0x33, 0xb3, 0xaa]),
+            0x333b
+        );
     }
 
     /// Same path as `int16_read_after`, but the program reads with AH=10h (the
@@ -30765,6 +30784,33 @@ mod tests {
             .map(|e| e.file_name())
             .collect();
         panic!("file {name} not found on C: (have: {have:?})");
+    }
+
+    #[test]
+    fn toka_keyb_validates_ms_dos_layout_codes() {
+        let dir = run_redirect_autoexec(
+            "@ECHO OFF\r\nC:\\DOS\\KEYB > K0.TXT\r\nC:\\DOS\\KEYB ES > BAD.TXT\r\nC:\\DOS\\KEYB SP > SP.TXT\r\nC:\\DOS\\KEYB > K1.TXT\r\n",
+        );
+        let before = read_c_file(dir.path(), "K0.TXT");
+        assert!(
+            before.contains("Current keyboard layout: US"),
+            "KEYB reports the BIOS default layout; got:\n{before}"
+        );
+        let bad = read_c_file(dir.path(), "BAD.TXT");
+        assert!(
+            bad.contains("Invalid keyboard layout"),
+            "KEYB rejects non-MS-DOS layout codes; got:\n{bad}"
+        );
+        let set = read_c_file(dir.path(), "SP.TXT");
+        assert!(
+            set.contains("Keyboard layout set: SP"),
+            "KEYB SP selects the Spanish BIOS layout; got:\n{set}"
+        );
+        let after = read_c_file(dir.path(), "K1.TXT");
+        assert!(
+            after.contains("Current keyboard layout: SP"),
+            "KEYB reads back the BIOS layout byte; got:\n{after}"
+        );
     }
 
     #[test]

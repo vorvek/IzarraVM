@@ -636,6 +636,10 @@ pub struct GuiApp {
     // by clicking the framebuffer image.
     input_captured: bool,
     guest_modifiers: GuestModifiers,
+    // Make codes chosen for live host keys. Releases use the stored make so
+    // numpad keys do not turn into top-row breaks when host NumLock changes.
+    guest_key_scancodes: Vec<(egui::Key, u8)>,
+    guest_num_lock: bool,
     // Last button mask forwarded to the VM, so a button press or release is sent
     // even on a frame with no pointer motion.
     last_buttons: u8,
@@ -743,6 +747,8 @@ impl GuiApp {
             title,
             input_captured: false,
             guest_modifiers: GuestModifiers::default(),
+            guest_key_scancodes: Vec::new(),
+            guest_num_lock: false,
             last_buttons: 0,
             screen_rect: None,
             abs_x: 0.0,
@@ -806,6 +812,9 @@ impl GuiApp {
         ));
         self.texture = None;
         self.frame_seq = 0;
+        self.guest_modifiers = GuestModifiers::default();
+        self.guest_key_scancodes.clear();
+        self.guest_num_lock = false;
         // A fresh machine boots with an empty drive A:, then we remount whatever
         // was in it so a Reset keeps the disk in the drive (no race to re-mount
         // before the BIOS boots).
@@ -823,6 +832,9 @@ impl GuiApp {
         self.frame_seq = 0;
         self.floppy_label = None;
         self.floppy_source = None;
+        self.guest_modifiers = GuestModifiers::default();
+        self.guest_key_scancodes.clear();
+        self.guest_num_lock = false;
     }
 }
 
@@ -916,14 +928,17 @@ impl GuiApp {
         if capture {
             // Start the guest cursor centred; raw motion accumulates from there.
             self.guest_modifiers = GuestModifiers::default();
+            self.guest_key_scancodes.clear();
             self.abs_x = MOUSE_GUEST_MAX_X as f32 / 2.0;
             self.abs_y = MOUSE_GUEST_MAX_Y as f32 / 2.0;
+            self.sync_guest_num_lock();
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::Locked));
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
         } else {
             let mut codes = Vec::new();
             push_modifier_delta(self.guest_modifiers, GuestModifiers::default(), &mut codes);
             self.guest_modifiers = GuestModifiers::default();
+            self.guest_key_scancodes.clear();
             if !codes.is_empty() {
                 if let Some(emu) = &self.emu {
                     emu.send_keys(codes);
@@ -933,6 +948,19 @@ impl GuiApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
         }
         self.title = capture_title(capture);
+    }
+
+    fn sync_guest_num_lock(&mut self) {
+        let Some(host_on) = host_num_lock_on() else {
+            return;
+        };
+        if host_on == self.guest_num_lock {
+            return;
+        }
+        if let Some(emu) = &self.emu {
+            emu.send_keys(vec![0x45, 0xc5]);
+            self.guest_num_lock = host_on;
+        }
     }
 
     /// Drain the captured input out of `raw_input` before egui sees it, routing it
@@ -946,6 +974,7 @@ impl GuiApp {
     /// relative guest-pixel delta scaled across the framebuffer rect, and the
     /// button mask is rebuilt from the pointer-button events.
     fn process_captured_raw_input(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        self.sync_guest_num_lock();
         // Ctrl+F2 releases the grab. Handle it before anything else and forward
         // nothing this frame so the combo does not reach the guest.
         let release_combo = raw_input.modifiers.ctrl
@@ -979,7 +1008,7 @@ impl GuiApp {
             match event {
                 egui::Event::Key {
                     key,
-                    physical_key: _,
+                    physical_key,
                     pressed,
                     repeat,
                     modifiers,
@@ -988,7 +1017,12 @@ impl GuiApp {
                     push_modifier_delta(self.guest_modifiers, next, &mut codes);
                     self.guest_modifiers = next;
                     if !*repeat {
-                        let key_codes = key_event_to_set1(*key, *pressed);
+                        let key_codes = key_event_to_set1(
+                            *key,
+                            *physical_key,
+                            *pressed,
+                            &mut self.guest_key_scancodes,
+                        );
                         key_press_emitted |= *pressed && !key_codes.is_empty();
                         codes.extend(key_codes);
                     }
@@ -1509,29 +1543,31 @@ impl eframe::App for GuiApp {
         // the non-captured path runs here: forward keys to the guest when no egui
         // widget wants the keyboard, otherwise yield so the user can type in the UI.
         if !self.input_captured && !ctx.wants_keyboard_input() {
-            let mut guest_modifiers = self.guest_modifiers;
-            let codes = ctx.input(|i| {
-                let mut codes = Vec::new();
-                for event in &i.events {
-                    if let egui::Event::Key {
-                        key,
-                        pressed,
-                        repeat,
-                        modifiers,
-                        ..
-                    } = event
-                    {
-                        let next = GuestModifiers::from_egui(*modifiers);
-                        push_modifier_delta(guest_modifiers, next, &mut codes);
-                        guest_modifiers = next;
-                        if !*repeat {
-                            codes.extend(key_event_to_set1(*key, *pressed));
-                        }
+            self.sync_guest_num_lock();
+            let events = ctx.input(|i| i.events.clone());
+            let mut codes = Vec::new();
+            for event in &events {
+                if let egui::Event::Key {
+                    key,
+                    physical_key,
+                    pressed,
+                    repeat,
+                    modifiers,
+                } = event
+                {
+                    let next = GuestModifiers::from_egui(*modifiers);
+                    push_modifier_delta(self.guest_modifiers, next, &mut codes);
+                    self.guest_modifiers = next;
+                    if !*repeat {
+                        codes.extend(key_event_to_set1(
+                            *key,
+                            *physical_key,
+                            *pressed,
+                            &mut self.guest_key_scancodes,
+                        ));
                     }
                 }
-                codes
-            });
-            self.guest_modifiers = guest_modifiers;
+            }
             if !codes.is_empty() {
                 if let Some(emu) = &self.emu {
                     emu.send_keys(codes);
@@ -1646,6 +1682,128 @@ fn push_modifier_delta(from: GuestModifiers, to: GuestModifiers, codes: &mut Vec
     }
 }
 
+#[cfg(target_os = "windows")]
+const VK_NUMLOCK: i32 = 0x90;
+#[cfg(target_os = "windows")]
+const VK_NUMPAD0: i32 = 0x60;
+#[cfg(target_os = "windows")]
+const VK_ADD: i32 = 0x6b;
+#[cfg(target_os = "windows")]
+const VK_SUBTRACT: i32 = 0x6d;
+#[cfg(target_os = "windows")]
+const VK_DECIMAL: i32 = 0x6e;
+
+#[cfg(target_os = "windows")]
+#[link(name = "user32")]
+unsafe extern "system" {
+    #[link_name = "GetAsyncKeyState"]
+    fn get_async_key_state(v_key: i32) -> i16;
+    #[link_name = "GetKeyState"]
+    fn get_key_state(v_key: i32) -> i16;
+}
+
+#[cfg(target_os = "windows")]
+fn host_virtual_key_down(vk: i32) -> bool {
+    (unsafe { get_async_key_state(vk) } as u16 & 0x8000) != 0
+}
+
+#[cfg(target_os = "windows")]
+fn host_num_lock_on() -> Option<bool> {
+    Some((unsafe { get_key_state(VK_NUMLOCK) } & 1) != 0)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn host_num_lock_on() -> Option<bool> {
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn numpad_virtual_key_for_egui_key(key: egui::Key) -> Option<i32> {
+    use egui::Key::*;
+    Some(match key {
+        Num0 => VK_NUMPAD0,
+        Num1 => VK_NUMPAD0 + 1,
+        Num2 => VK_NUMPAD0 + 2,
+        Num3 => VK_NUMPAD0 + 3,
+        Num4 => VK_NUMPAD0 + 4,
+        Num5 => VK_NUMPAD0 + 5,
+        Num6 => VK_NUMPAD0 + 6,
+        Num7 => VK_NUMPAD0 + 7,
+        Num8 => VK_NUMPAD0 + 8,
+        Num9 => VK_NUMPAD0 + 9,
+        Period | Comma => VK_DECIMAL,
+        Plus => VK_ADD,
+        Minus => VK_SUBTRACT,
+        _ => return None,
+    })
+}
+
+fn numpad_make_for_egui_key(key: egui::Key) -> Option<u8> {
+    use egui::Key::*;
+    Some(match key {
+        Num7 => 0x47,
+        Num8 => 0x48,
+        Num9 => 0x49,
+        Num4 => 0x4b,
+        Num5 => 0x4c,
+        Num6 => 0x4d,
+        Num1 => 0x4f,
+        Num2 => 0x50,
+        Num3 => 0x51,
+        Num0 => 0x52,
+        Period | Comma => 0x53,
+        Minus => 0x4a,
+        Plus => 0x4e,
+        _ => return None,
+    })
+}
+
+fn host_numpad_make_for_key(key: egui::Key) -> Option<u8> {
+    #[cfg(target_os = "windows")]
+    {
+        let make = numpad_make_for_egui_key(key)?;
+        let vk = numpad_virtual_key_for_egui_key(key)?;
+        if host_virtual_key_down(vk) {
+            return Some(make);
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = key;
+    }
+    None
+}
+
+fn navigation_key(key: egui::Key) -> bool {
+    use egui::Key::*;
+    matches!(
+        key,
+        Home | ArrowUp
+            | PageUp
+            | ArrowDown
+            | End
+            | PageDown
+            | Insert
+            | ArrowLeft
+            | ArrowRight
+            | Delete
+    )
+}
+
+fn guest_key_identity(key: egui::Key, physical_key: Option<egui::Key>) -> egui::Key {
+    physical_key.unwrap_or(key)
+}
+
+fn guest_make_for_key(key: egui::Key, physical_key: Option<egui::Key>) -> Option<u8> {
+    if let Some(make) = host_numpad_make_for_key(key) {
+        return Some(make);
+    }
+    if navigation_key(key) {
+        return egui_key_to_set1(key);
+    }
+    egui_key_to_set1(physical_key.unwrap_or(key))
+}
+
 /// egui Key to Set 1 scancode (make code). Covers the keys a user types at a
 /// DOS prompt; extend as the setup page needs more.
 fn egui_key_to_set1(key: egui::Key) -> Option<u8> {
@@ -1731,13 +1889,38 @@ fn egui_key_to_set1(key: egui::Key) -> Option<u8> {
 }
 
 /// Turn one host key event into Set 1 bytes.
-fn key_event_to_set1(key: egui::Key, pressed: bool) -> Vec<u8> {
-    let Some(make) = egui_key_to_set1(key) else {
-        return Vec::new();
-    };
+fn key_event_to_set1(
+    key: egui::Key,
+    physical_key: Option<egui::Key>,
+    pressed: bool,
+    pressed_makes: &mut Vec<(egui::Key, u8)>,
+) -> Vec<u8> {
+    let identity = guest_key_identity(key, physical_key);
     if pressed {
+        let Some(make) = guest_make_for_key(key, physical_key) else {
+            return Vec::new();
+        };
+        if let Some((_, stored)) = pressed_makes
+            .iter_mut()
+            .find(|(pressed_key, _)| *pressed_key == identity)
+        {
+            *stored = make;
+        } else {
+            pressed_makes.push((identity, make));
+        }
         vec![make]
     } else {
+        let make = if let Some(index) = pressed_makes
+            .iter()
+            .position(|(pressed_key, _)| *pressed_key == identity)
+        {
+            pressed_makes.remove(index).1
+        } else {
+            let Some(make) = guest_make_for_key(key, physical_key) else {
+                return Vec::new();
+            };
+            make
+        };
         vec![make | 0x80]
     }
 }
@@ -1894,13 +2077,24 @@ mod tests {
     #[test]
     fn host_keys_emit_dos_modifiers_and_symbol_scancodes() {
         let mut codes = Vec::new();
+        let mut pressed = Vec::new();
         let shift = GuestModifiers::from_egui(egui::Modifiers {
             shift: true,
             ..Default::default()
         });
         push_modifier_delta(GuestModifiers::default(), shift, &mut codes);
-        codes.extend(key_event_to_set1(egui::Key::Num7, true));
-        codes.extend(key_event_to_set1(egui::Key::Num7, false));
+        codes.extend(key_event_to_set1(
+            egui::Key::Num7,
+            Some(egui::Key::Num7),
+            true,
+            &mut pressed,
+        ));
+        codes.extend(key_event_to_set1(
+            egui::Key::Num7,
+            Some(egui::Key::Num7),
+            false,
+            &mut pressed,
+        ));
         push_modifier_delta(shift, GuestModifiers::default(), &mut codes);
         assert_eq!(codes, [0x2a, 0x08, 0x88, 0xaa]);
 
@@ -1910,16 +2104,70 @@ mod tests {
             ..Default::default()
         });
         let mut altgr_codes = Vec::new();
+        let mut altgr_pressed = Vec::new();
         push_modifier_delta(GuestModifiers::default(), altgr, &mut altgr_codes);
-        altgr_codes.extend(key_event_to_set1(egui::Key::Num2, true));
+        altgr_codes.extend(key_event_to_set1(
+            egui::Key::Num2,
+            Some(egui::Key::Num2),
+            true,
+            &mut altgr_pressed,
+        ));
         assert_eq!(altgr_codes, [0xe0, 0x38, 0x03]);
         assert_eq!(egui_key_to_set1(egui::Key::Backslash), Some(0x2b));
     }
 
     #[test]
     fn repeated_key_press_does_not_need_modifier_wrapping() {
-        assert_eq!(key_event_to_set1(egui::Key::ArrowUp, true), [0x48]);
-        assert_eq!(key_event_to_set1(egui::Key::ArrowUp, false), [0xc8]);
+        let mut pressed = Vec::new();
+        assert_eq!(
+            key_event_to_set1(egui::Key::ArrowUp, None, true, &mut pressed),
+            [0x48]
+        );
+        assert_eq!(
+            key_event_to_set1(egui::Key::ArrowUp, None, false, &mut pressed),
+            [0xc8]
+        );
         assert_eq!(text_to_set1("."), [0x34, 0xb4]);
+    }
+
+    #[test]
+    fn printable_keys_use_physical_position_not_host_text() {
+        let mut pressed = Vec::new();
+        assert_eq!(
+            key_event_to_set1(
+                egui::Key::Colon,
+                Some(egui::Key::Semicolon),
+                true,
+                &mut pressed
+            ),
+            [0x27]
+        );
+        assert_eq!(
+            key_event_to_set1(
+                egui::Key::Colon,
+                Some(egui::Key::Semicolon),
+                false,
+                &mut pressed
+            ),
+            [0xa7]
+        );
+        assert_eq!(
+            key_event_to_set1(
+                egui::Key::Semicolon,
+                Some(egui::Key::Comma),
+                true,
+                &mut pressed
+            ),
+            [0x33]
+        );
+    }
+
+    #[test]
+    fn numpad_number_keys_have_keypad_make_codes() {
+        assert_eq!(numpad_make_for_egui_key(egui::Key::Num7), Some(0x47));
+        assert_eq!(numpad_make_for_egui_key(egui::Key::Num4), Some(0x4b));
+        assert_eq!(numpad_make_for_egui_key(egui::Key::Num6), Some(0x4d));
+        assert_eq!(numpad_make_for_egui_key(egui::Key::Num2), Some(0x50));
+        assert_eq!(numpad_make_for_egui_key(egui::Key::Period), Some(0x53));
     }
 }
