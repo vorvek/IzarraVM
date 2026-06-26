@@ -1,8 +1,8 @@
 use crate::prefs::{self, GuiPrefs};
-use eframe::egui;
 use izarravm_audio::{AudioPlayer, AudioSink};
 use izarravm_core::GswMode;
 use izarravm_dos::HostDrive;
+use izarravm_input::HostKeyboard;
 use izarravm_machine::{ActiveDisplay, Machine, MachineProfile, StopReason};
 use izarravm_video::{DISTIRA_RENDER_THREAD_CHOICES, normalize_distira_render_threads};
 use std::error::Error;
@@ -13,6 +13,11 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tracing::{error, warn};
+use winit::application::ApplicationHandler;
+use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::keyboard::PhysicalKey;
+use winit::window::{Window, WindowId};
 
 const OPL_NATIVE_HZ: f64 = 49_716.0;
 
@@ -643,18 +648,12 @@ pub struct GuiApp {
     // motion and buttons are forwarded to the VM. Ctrl+F2 releases it. Entered
     // by clicking the framebuffer image.
     input_captured: bool,
-    guest_modifiers: GuestModifiers,
-    // Make codes chosen for live host keys. Releases use the stored make so
-    // numpad keys do not turn into top-row breaks when host NumLock changes.
-    guest_key_scancodes: Vec<(egui::Key, u8)>,
     // Guest NumLock/CapsLock/ScrollLock state, mirrored from the host. Parallel
     // to HOST_LOCK_KEYS; seeded false because the BIOS clears KB_FLAGS on boot.
     guest_locks: [bool; HOST_LOCK_KEYS.len()],
-    // Host window focus last frame. When focus is lost while a key or modifier is
-    // held, the host delivers the key-up to whatever window took focus, not to us
-    // (and egui leaves modifiers set), so the guest never sees the release and the
-    // key sticks down. On a focus-loss edge we flush every held key as a break.
-    was_focused: bool,
+    // Set by monitor_ui when the framebuffer image is clicked, so the event loop
+    // can enter capture (it owns the winit Window that monitor_ui does not).
+    want_capture: bool,
     // Last button mask forwarded to the VM, so a button press or release is sent
     // even on a frame with no pointer motion.
     last_buttons: u8,
@@ -761,10 +760,8 @@ impl GuiApp {
             rtc_setup,
             title,
             input_captured: false,
-            guest_modifiers: GuestModifiers::default(),
-            guest_key_scancodes: Vec::new(),
             guest_locks: [false; HOST_LOCK_KEYS.len()],
-            was_focused: true,
+            want_capture: false,
             last_buttons: 0,
             screen_rect: None,
             abs_x: 0.0,
@@ -828,8 +825,6 @@ impl GuiApp {
         ));
         self.texture = None;
         self.frame_seq = 0;
-        self.guest_modifiers = GuestModifiers::default();
-        self.guest_key_scancodes.clear();
         self.guest_locks = [false; HOST_LOCK_KEYS.len()];
         // A fresh machine boots with an empty drive A:, then we remount whatever
         // was in it so a Reset keeps the disk in the drive (no race to re-mount
@@ -848,9 +843,13 @@ impl GuiApp {
         self.frame_seq = 0;
         self.floppy_label = None;
         self.floppy_source = None;
-        self.guest_modifiers = GuestModifiers::default();
-        self.guest_key_scancodes.clear();
         self.guest_locks = [false; HOST_LOCK_KEYS.len()];
+    }
+
+    /// Save prefs and stop the emulation thread on window close.
+    fn shutdown_for_exit(&mut self) {
+        self.save_prefs();
+        self.stop();
     }
 }
 
@@ -925,25 +924,26 @@ impl GuiApp {
         // hidden, and keyboard/mouse route to the guest until Ctrl+F2 releases.
         let response = ui.interact(rect, ui.id().with("monitor-capture"), egui::Sense::click());
         if response.clicked() && !self.input_captured {
-            self.set_capture(ctx, true);
+            // The winit Window lives in the event loop, not here, so flag the
+            // intent and let about_to_wait enter capture.
+            self.want_capture = true;
         }
     }
 
-    /// Release everything the guest currently holds, as break codes, and forget
-    /// the held state. The guest tracks held keys from host key-up events and
-    /// modifiers from egui's modifier state; when those stop arriving (input
-    /// release, or the window losing focus mid-press) a held key would otherwise
-    /// stay down in the guest forever. Mirrors what a real keyboard does when it
-    /// is unplugged and replugged: everything comes up.
-    fn release_held_input(&mut self) {
-        let codes = release_codes(self.guest_modifiers, &self.guest_key_scancodes);
-        self.guest_modifiers = GuestModifiers::default();
-        self.guest_key_scancodes.clear();
-        if !codes.is_empty() {
-            if let Some(emu) = &self.emu {
-                emu.send_keys(codes);
-            }
+    /// Forward already-translated Set 1 bytes to the emulation thread. Empty
+    /// slices (an unmapped key, nothing held) are dropped.
+    fn send_keys_to_guest(&self, codes: Vec<u8>) {
+        if codes.is_empty() {
+            return;
         }
+        if let Some(emu) = &self.emu {
+            emu.send_keys(codes);
+        }
+    }
+
+    /// Whether monitor_ui flagged a click-to-capture this frame, clearing it.
+    fn take_want_capture(&mut self) -> bool {
+        std::mem::take(&mut self.want_capture)
     }
 
     /// Enter or leave input capture. While captured we lock and hide the OS cursor
@@ -951,28 +951,55 @@ impl GuiApp {
     /// and route keyboard and mouse to the guest, which draws its own cursor.
     /// Ctrl+F2 releases. Locked delivers motion as raw relative deltas, which we
     /// accumulate into the guest cursor position (clamped to the screen), so there
-    /// is nothing for the OS cursor to escape and no warp to fight.
-    fn set_capture(&mut self, ctx: &egui::Context, capture: bool) {
-        if self.input_captured == capture {
-            return;
-        }
-        self.input_captured = capture;
+    /// is nothing for the OS cursor to escape and no warp to fight. On release we
+    /// flush any held keys so nothing sticks down in the guest.
+    fn toggle_capture(&mut self, window: &winit::window::Window, kbd: &mut HostKeyboard) {
+        self.input_captured = !self.input_captured;
         self.last_buttons = 0;
-        if capture {
+        if self.input_captured {
             // Start the guest cursor centred; raw motion accumulates from there.
-            self.guest_modifiers = GuestModifiers::default();
-            self.guest_key_scancodes.clear();
             self.abs_x = MOUSE_GUEST_MAX_X as f32 / 2.0;
             self.abs_y = MOUSE_GUEST_MAX_Y as f32 / 2.0;
             self.sync_guest_locks();
-            ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::Locked));
-            ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
+            let _ = window
+                .set_cursor_grab(winit::window::CursorGrabMode::Locked)
+                .or_else(|_| window.set_cursor_grab(winit::window::CursorGrabMode::Confined));
+            window.set_cursor_visible(false);
         } else {
-            self.release_held_input();
-            ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::None));
-            ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
+            self.send_keys_to_guest(kbd.release_all());
+            let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
+            window.set_cursor_visible(true);
         }
-        self.title = capture_title(capture);
+        self.title = capture_title(self.input_captured);
+    }
+
+    /// Update the guest button mask from a pointer button edge and resend the
+    /// current absolute position with the new mask.
+    fn set_guest_button(&mut self, bit: u8, pressed: bool) {
+        if pressed {
+            self.last_buttons |= bit;
+        } else {
+            self.last_buttons &= !bit;
+        }
+        if let Some(emu) = &self.emu {
+            emu.send_mouse_absolute(self.abs_x as i32, self.abs_y as i32, self.last_buttons);
+        }
+    }
+
+    /// Add raw relative motion (winit DeviceEvent::MouseMotion) into the guest
+    /// cursor position, scaled across the framebuffer rect into guest pixels and
+    /// clamped to the screen, then send the new absolute position.
+    fn accumulate_guest_motion(&mut self, dx: f32, dy: f32, ppp: f32) {
+        let Some(rect) = self.screen_rect else {
+            return;
+        };
+        let sx = MOUSE_GUEST_MAX_X as f32 / (rect.width() * ppp).max(1.0);
+        let sy = MOUSE_GUEST_MAX_Y as f32 / (rect.height() * ppp).max(1.0);
+        self.abs_x = (self.abs_x + dx * sx).clamp(0.0, MOUSE_GUEST_MAX_X as f32);
+        self.abs_y = (self.abs_y + dy * sy).clamp(0.0, MOUSE_GUEST_MAX_Y as f32);
+        if let Some(emu) = &self.emu {
+            emu.send_mouse_absolute(self.abs_x as i32, self.abs_y as i32, self.last_buttons);
+        }
     }
 
     /// Mirror the host's NumLock/CapsLock/ScrollLock onto the guest. Each lock
@@ -990,138 +1017,6 @@ impl GuiApp {
             if host_on != self.guest_locks[i] {
                 emu.send_keys(vec![*make, *make | 0x80]);
                 self.guest_locks[i] = host_on;
-            }
-        }
-    }
-
-    /// Drain the captured input out of `raw_input` before egui sees it, routing it
-    /// to the guest instead. Runs from `raw_input_hook`, ahead of egui's own
-    /// processing, so a captured TAB never reaches the sidebar focus traversal and
-    /// the sidebar stays pointer-inert while the screen holds the grab.
-    ///
-    /// Ctrl+F2 is checked first and releases the grab without forwarding anything,
-    /// so the combo never lands in the guest. Otherwise every keyboard and pointer
-    /// event is consumed: keys become Set 1 scancodes, pointer motion becomes a
-    /// relative guest-pixel delta scaled across the framebuffer rect, and the
-    /// button mask is rebuilt from the pointer-button events.
-    fn process_captured_raw_input(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
-        self.sync_guest_locks();
-        // Ctrl+F2 releases the grab. Handle it before anything else and forward
-        // nothing this frame so the combo does not reach the guest.
-        let release_combo = raw_input.modifiers.ctrl
-            && raw_input.events.iter().any(|e| {
-                matches!(
-                    e,
-                    egui::Event::Key {
-                        key: egui::Key::F2,
-                        pressed: true,
-                        ..
-                    }
-                )
-            });
-        if release_combo {
-            self.set_capture(ctx, false);
-            // Drop the captured keys, the F2 press, and any pointer events so none
-            // of them slip through to egui or the guest on the release frame.
-            raw_input.events.retain(|e| !is_captured_input_event(e));
-            return;
-        }
-
-        // Collect Set 1 scancodes, raw relative mouse motion, and the button mask,
-        // then strip every keyboard and pointer event so egui never acts on them
-        // (TAB never moves sidebar focus; the sidebar stays pointer-inert).
-        let mut codes: Vec<u8> = Vec::new();
-        let mut buttons = self.last_buttons;
-        let mut moved = false;
-        let mut key_press_emitted = false;
-        let ppp = ctx.pixels_per_point().max(0.01);
-        for event in &raw_input.events {
-            match event {
-                egui::Event::Key {
-                    key,
-                    physical_key,
-                    pressed,
-                    repeat,
-                    modifiers,
-                } => {
-                    let next = GuestModifiers::from_egui(*modifiers);
-                    push_modifier_delta(self.guest_modifiers, next, &mut codes);
-                    self.guest_modifiers = next;
-                    if !*repeat {
-                        let key_codes = key_event_to_set1(
-                            *key,
-                            *physical_key,
-                            *pressed,
-                            &mut self.guest_key_scancodes,
-                        );
-                        key_press_emitted |= *pressed && !key_codes.is_empty();
-                        codes.extend(key_codes);
-                    }
-                }
-                egui::Event::Text(text) => {
-                    if key_press_emitted {
-                        key_press_emitted = false;
-                    } else if let Some(codes_iso) = iso_key_make_break(text) {
-                        codes.extend(codes_iso);
-                    } else {
-                        codes.extend(text_to_set1(text));
-                    }
-                }
-                // Raw relative motion from the locked, hidden cursor (winit
-                // DeviceEvent::MouseMotion, surfaced as MouseMoved). The cursor is
-                // pinned and cannot leave, so we accumulate the deltas into the guest
-                // position ourselves, scaled so a full sweep across the video-output
-                // rect covers the full guest range, and clamped to the screen.
-                egui::Event::MouseMoved(delta) => {
-                    if let Some(rect) = self.screen_rect {
-                        let sx = MOUSE_GUEST_MAX_X as f32 / (rect.width() * ppp).max(1.0);
-                        let sy = MOUSE_GUEST_MAX_Y as f32 / (rect.height() * ppp).max(1.0);
-                        self.abs_x =
-                            (self.abs_x + delta.x * sx).clamp(0.0, MOUSE_GUEST_MAX_X as f32);
-                        self.abs_y =
-                            (self.abs_y + delta.y * sy).clamp(0.0, MOUSE_GUEST_MAX_Y as f32);
-                        moved = true;
-                    }
-                }
-                egui::Event::PointerButton {
-                    button, pressed, ..
-                } => {
-                    let bit = match button {
-                        egui::PointerButton::Primary => 0x01,
-                        egui::PointerButton::Secondary => 0x02,
-                        egui::PointerButton::Middle => 0x04,
-                        _ => 0,
-                    };
-                    if *pressed {
-                        buttons |= bit;
-                    } else {
-                        buttons &= !bit;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let next = GuestModifiers::from_egui(raw_input.modifiers);
-        push_modifier_delta(self.guest_modifiers, next, &mut codes);
-        self.guest_modifiers = next;
-        raw_input.events.retain(|e| !is_captured_input_event(e));
-
-        if !codes.is_empty() {
-            if let Some(emu) = &self.emu {
-                emu.send_keys(codes);
-            }
-        }
-
-        // Send the accumulated absolute guest position when it or the buttons
-        // changed. The cursor is locked (pinned and hidden) so there is nothing to
-        // confine or warp: the guest cursor is purely the accumulated motion clamped
-        // to the screen, and the BIOS menus read it via INT 33h.
-        if moved || buttons != self.last_buttons {
-            self.last_buttons = buttons;
-            let gx = self.abs_x.round() as i32;
-            let gy = self.abs_y.round() as i32;
-            if let Some(emu) = &self.emu {
-                emu.send_mouse_absolute(gx, gy, buttons);
             }
         }
     }
@@ -1551,23 +1446,16 @@ fn cue_bin_path(cue_path: &Path, cue: &str) -> PathBuf {
     ))
 }
 
-impl eframe::App for GuiApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Keep the title in sync with the capture state every frame, so a
-        // capture toggle is reflected even if set_capture ran mid-frame.
+impl GuiApp {
+    /// Build one egui frame: the title, the sidebar, the monitor, and the optional
+    /// COM1 window. Keyboard, mouse capture, and focus loss are handled in the
+    /// winit event loop now, not here, so the guest reads raw physical keys.
+    fn ui(&mut self, ctx: &egui::Context) {
+        // Keep the title in sync with the capture state every frame.
         self.title = capture_title(self.input_captured);
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.title.clone()));
-        // On losing window focus, release everything the guest holds. The host
-        // routes the matching key-ups to whatever window took focus, so without
-        // this a key held at the moment of an alt-tab (Shift, in a game) sticks
-        // down in the guest until the next host event flips it.
-        let focused = ctx.input(|i| i.focused);
-        if self.was_focused && !focused {
-            self.release_held_input();
-        }
-        self.was_focused = focused;
-        // Host-loop diagnostics: count this update() and the input events egui
-        // saw, rolling the rates up once a second.
+        // Host-loop diagnostics: count this frame and the input events egui saw,
+        // rolling the rates up once a second.
         let now = Instant::now();
         self.frames_since += 1;
         self.events_since += ctx.input(|i| i.events.len()) as u32;
@@ -1580,62 +1468,8 @@ impl eframe::App for GuiApp {
             self.events_since = 0;
             self.metrics_mark = Some(now);
         }
-        // While captured, all keyboard and pointer input was already drained and
-        // routed to the guest in raw_input_hook, ahead of egui's processing. The
-        // non-captured path runs here and forwards every key to the guest: the GUI
-        // is mouse-driven with no text fields, so gating on egui focus only stole
-        // the keyboard from the guest once a sidebar control was clicked or tabbed
-        // to (and split a key's press from its release, leaving it stuck).
-        // ponytail: forward unconditionally; add a focus guard only if a real
-        // text-entry widget is ever added to the sidebar.
-        if !self.input_captured {
-            self.sync_guest_locks();
-            let (events, modifiers) = ctx.input(|i| (i.events.clone(), i.modifiers));
-            let mut codes = Vec::new();
-            let mut key_emitted = false;
-            for event in &events {
-                match event {
-                    egui::Event::Key {
-                        key,
-                        physical_key,
-                        pressed,
-                        repeat,
-                        modifiers,
-                    } => {
-                        let next = GuestModifiers::from_egui(*modifiers);
-                        push_modifier_delta(self.guest_modifiers, next, &mut codes);
-                        self.guest_modifiers = next;
-                        if !*repeat {
-                            let key_codes = key_event_to_set1(
-                                *key,
-                                *physical_key,
-                                *pressed,
-                                &mut self.guest_key_scancodes,
-                            );
-                            key_emitted |= *pressed && !key_codes.is_empty();
-                            codes.extend(key_codes);
-                        }
-                    }
-                    egui::Event::Text(text) if !key_emitted => {
-                        if let Some(codes_iso) = iso_key_make_break(text) {
-                            codes.extend(codes_iso);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            // A bare modifier key (Shift held alone, the action key in many games)
-            // produces no egui Key event, only a modifiers change, so reconcile
-            // against the frame's final modifier state like the captured path does.
-            let next = GuestModifiers::from_egui(modifiers);
-            push_modifier_delta(self.guest_modifiers, next, &mut codes);
-            self.guest_modifiers = next;
-            if !codes.is_empty() {
-                if let Some(emu) = &self.emu {
-                    emu.send_keys(codes);
-                }
-            }
-        }
+        // Mirror the host lock keys onto the guest each frame.
+        self.sync_guest_locks();
         egui::SidePanel::right("controls")
             .exact_width(320.0)
             .resizable(false)
@@ -1644,28 +1478,6 @@ impl eframe::App for GuiApp {
         // The COM1 console floats over the central panel when toggled open.
         if self.show_com1 {
             self.com1_window(ctx);
-        }
-        // Repaint at the guest's refresh rate rather than busy-looping at the
-        // host vsync. Input still triggers extra repaints, but the emulation
-        // runs on its own thread now, so they cannot slow it down.
-        let refresh_hz = self.emu.as_ref().map_or(60.0, |emu| {
-            let hz = emu
-                .frame
-                .lock()
-                .expect("frame snapshot poisoned")
-                .refresh_hz;
-            if hz > 0.0 { hz } else { 60.0 }
-        });
-        ctx.request_repaint_after(Duration::from_secs_f64(1.0 / refresh_hz));
-    }
-
-    /// Intercept input before egui processes the frame. While captured this strips
-    /// the keyboard and pointer events out of the raw input and routes them to the
-    /// guest, so egui's focus traversal (TAB) and the sidebar never see them and
-    /// input stays trapped in the screen until Ctrl+F2 releases it.
-    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
-        if self.input_captured {
-            self.process_captured_raw_input(ctx, raw_input);
         }
     }
 }
@@ -1680,109 +1492,18 @@ fn capture_title(captured: bool) -> String {
     }
 }
 
-/// Is this an input event the capture path swallows so egui never sees it?
-/// Covers keyboard and every pointer event; everything else (window focus,
-/// screenshots, paste, and so on) is left for egui to handle.
-fn is_captured_input_event(event: &egui::Event) -> bool {
-    matches!(
-        event,
-        egui::Event::Key { .. }
-            | egui::Event::Text(_)
-            | egui::Event::PointerMoved(_)
-            | egui::Event::MouseMoved(_)
-            | egui::Event::PointerButton { .. }
-            | egui::Event::MouseWheel { .. }
-            | egui::Event::Zoom(_)
-            | egui::Event::Touch { .. }
-    )
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct GuestModifiers {
-    shift: bool,
-    ctrl: bool,
-    alt: bool,
-    altgr: bool,
-}
-
-impl GuestModifiers {
-    fn from_egui(modifiers: egui::Modifiers) -> Self {
-        let altgr = modifiers.alt && modifiers.ctrl;
-        Self {
-            shift: modifiers.shift,
-            ctrl: modifiers.ctrl && !altgr,
-            alt: modifiers.alt && !altgr,
-            altgr,
-        }
-    }
-}
-
-/// Break codes that release the current held state: every held modifier and key
-/// turned into its break (make | 0x80). Used when input stops flowing (capture
-/// release, window focus loss) so nothing stays stuck down in the guest.
-fn release_codes(modifiers: GuestModifiers, held: &[(egui::Key, u8)]) -> Vec<u8> {
-    let mut codes = Vec::new();
-    push_modifier_delta(modifiers, GuestModifiers::default(), &mut codes);
-    for (_, make) in held {
-        codes.push(make | 0x80);
-    }
-    codes
-}
-
-fn push_modifier_delta(from: GuestModifiers, to: GuestModifiers, codes: &mut Vec<u8>) {
-    if from.shift && !to.shift {
-        codes.push(0xaa);
-    }
-    if from.altgr && !to.altgr {
-        codes.extend_from_slice(&[0xe0, 0xb8]);
-    }
-    if from.alt && !to.alt {
-        codes.push(0xb8);
-    }
-    if from.ctrl && !to.ctrl {
-        codes.push(0x9d);
-    }
-    if !from.ctrl && to.ctrl {
-        codes.push(0x1d);
-    }
-    if !from.alt && to.alt {
-        codes.push(0x38);
-    }
-    if !from.altgr && to.altgr {
-        codes.extend_from_slice(&[0xe0, 0x38]);
-    }
-    if !from.shift && to.shift {
-        codes.push(0x2a);
-    }
-}
-
 const VK_NUMLOCK: i32 = 0x90;
 const VK_CAPITAL: i32 = 0x14;
 const VK_SCROLL: i32 = 0x91;
 /// Host lock keys mirrored to the guest, as (host virtual-key, Set 1 make).
 /// Break is make | 0x80. Order is parallel to `GuiApp::guest_locks`.
 const HOST_LOCK_KEYS: [(i32, u8); 3] = [(VK_NUMLOCK, 0x45), (VK_CAPITAL, 0x3a), (VK_SCROLL, 0x46)];
-#[cfg(target_os = "windows")]
-const VK_NUMPAD0: i32 = 0x60;
-#[cfg(target_os = "windows")]
-const VK_ADD: i32 = 0x6b;
-#[cfg(target_os = "windows")]
-const VK_SUBTRACT: i32 = 0x6d;
-#[cfg(target_os = "windows")]
-const VK_DECIMAL: i32 = 0x6e;
 
 #[cfg(target_os = "windows")]
 #[link(name = "user32")]
 unsafe extern "system" {
-    #[link_name = "GetAsyncKeyState"]
-    fn get_async_key_state(v_key: i32) -> i16;
     #[link_name = "GetKeyState"]
     fn get_key_state(v_key: i32) -> i16;
-}
-
-#[cfg(target_os = "windows")]
-fn host_virtual_key_down(vk: i32) -> bool {
-    (unsafe { get_async_key_state(vk) } as u16 & 0x8000) != 0
 }
 
 #[cfg(target_os = "windows")]
@@ -1793,235 +1514,6 @@ fn host_lock_on(vk: i32) -> Option<bool> {
 #[cfg(not(target_os = "windows"))]
 fn host_lock_on(_vk: i32) -> Option<bool> {
     None
-}
-
-#[cfg(target_os = "windows")]
-fn numpad_virtual_key_for_egui_key(key: egui::Key) -> Option<i32> {
-    use egui::Key::*;
-    Some(match key {
-        Num0 => VK_NUMPAD0,
-        Num1 => VK_NUMPAD0 + 1,
-        Num2 => VK_NUMPAD0 + 2,
-        Num3 => VK_NUMPAD0 + 3,
-        Num4 => VK_NUMPAD0 + 4,
-        Num5 => VK_NUMPAD0 + 5,
-        Num6 => VK_NUMPAD0 + 6,
-        Num7 => VK_NUMPAD0 + 7,
-        Num8 => VK_NUMPAD0 + 8,
-        Num9 => VK_NUMPAD0 + 9,
-        Period | Comma => VK_DECIMAL,
-        Plus => VK_ADD,
-        Minus => VK_SUBTRACT,
-        _ => return None,
-    })
-}
-
-fn numpad_make_for_egui_key(key: egui::Key) -> Option<u8> {
-    use egui::Key::*;
-    Some(match key {
-        Num7 => 0x47,
-        Num8 => 0x48,
-        Num9 => 0x49,
-        Num4 => 0x4b,
-        Num5 => 0x4c,
-        Num6 => 0x4d,
-        Num1 => 0x4f,
-        Num2 => 0x50,
-        Num3 => 0x51,
-        Num0 => 0x52,
-        Period | Comma => 0x53,
-        Minus => 0x4a,
-        Plus => 0x4e,
-        _ => return None,
-    })
-}
-
-fn host_numpad_make_for_key(key: egui::Key) -> Option<u8> {
-    #[cfg(target_os = "windows")]
-    {
-        let make = numpad_make_for_egui_key(key)?;
-        let vk = numpad_virtual_key_for_egui_key(key)?;
-        if host_virtual_key_down(vk) {
-            return Some(make);
-        }
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = key;
-    }
-    None
-}
-
-fn navigation_key(key: egui::Key) -> bool {
-    use egui::Key::*;
-    matches!(
-        key,
-        Home | ArrowUp
-            | PageUp
-            | ArrowDown
-            | End
-            | PageDown
-            | Insert
-            | ArrowLeft
-            | ArrowRight
-            | Delete
-    )
-}
-
-fn guest_key_identity(key: egui::Key, physical_key: Option<egui::Key>) -> egui::Key {
-    physical_key.unwrap_or(key)
-}
-
-fn guest_make_for_key(key: egui::Key, physical_key: Option<egui::Key>) -> Option<u8> {
-    if let Some(make) = host_numpad_make_for_key(key) {
-        return Some(make);
-    }
-    if navigation_key(key) {
-        return egui_key_to_set1(key);
-    }
-    egui_key_to_set1(physical_key.unwrap_or(key))
-}
-
-/// egui Key to Set 1 scancode (make code). Covers the keys a user types at a
-/// DOS prompt; extend as the setup page needs more.
-fn egui_key_to_set1(key: egui::Key) -> Option<u8> {
-    use egui::Key::*;
-    Some(match key {
-        A => 0x1e,
-        B => 0x30,
-        C => 0x2e,
-        D => 0x20,
-        E => 0x12,
-        F => 0x21,
-        G => 0x22,
-        H => 0x23,
-        I => 0x17,
-        J => 0x24,
-        K => 0x25,
-        L => 0x26,
-        M => 0x32,
-        N => 0x31,
-        O => 0x18,
-        P => 0x19,
-        Q => 0x10,
-        R => 0x13,
-        S => 0x1f,
-        T => 0x14,
-        U => 0x16,
-        V => 0x2f,
-        W => 0x11,
-        X => 0x2d,
-        Y => 0x15,
-        Z => 0x2c,
-        Num0 => 0x0b,
-        Num1 => 0x02,
-        Num2 => 0x03,
-        Num3 => 0x04,
-        Num4 => 0x05,
-        Num5 => 0x06,
-        Num6 => 0x07,
-        Num7 => 0x08,
-        Num8 => 0x09,
-        Num9 => 0x0a,
-        Minus => 0x0c,
-        Equals | Plus => 0x0d,
-        OpenBracket | OpenCurlyBracket => 0x1a,
-        CloseBracket | CloseCurlyBracket => 0x1b,
-        Semicolon | Colon => 0x27,
-        Quote => 0x28,
-        Backtick => 0x29,
-        Backslash | Pipe => 0x2b,
-        Comma => 0x33,
-        Period => 0x34,
-        Slash | Questionmark => 0x35,
-        Exclamationmark => 0x02,
-        Space => 0x39,
-        Enter => 0x1c,
-        Backspace => 0x0e,
-        Escape => 0x01,
-        Tab => 0x0f,
-        Home => 0x47,
-        ArrowUp => 0x48,
-        PageUp => 0x49,
-        ArrowDown => 0x50,
-        End => 0x4f,
-        PageDown => 0x51,
-        Insert => 0x52,
-        ArrowLeft => 0x4b,
-        ArrowRight => 0x4d,
-        Delete => 0x53,
-        F1 => 0x3b,
-        F2 => 0x3c,
-        F3 => 0x3d,
-        F4 => 0x3e,
-        F5 => 0x3f,
-        F6 => 0x40,
-        F7 => 0x41,
-        F8 => 0x42,
-        F9 => 0x43,
-        F10 => 0x44,
-        F11 => 0x57,
-        F12 => 0x58,
-        _ => return None,
-    })
-}
-
-/// Turn one host key event into Set 1 bytes.
-fn key_event_to_set1(
-    key: egui::Key,
-    physical_key: Option<egui::Key>,
-    pressed: bool,
-    pressed_makes: &mut Vec<(egui::Key, u8)>,
-) -> Vec<u8> {
-    let identity = guest_key_identity(key, physical_key);
-    if pressed {
-        let Some(make) = guest_make_for_key(key, physical_key) else {
-            return Vec::new();
-        };
-        if let Some((_, stored)) = pressed_makes
-            .iter_mut()
-            .find(|(pressed_key, _)| *pressed_key == identity)
-        {
-            *stored = make;
-        } else {
-            pressed_makes.push((identity, make));
-        }
-        vec![make]
-    } else {
-        let make = if let Some(index) = pressed_makes
-            .iter()
-            .position(|(pressed_key, _)| *pressed_key == identity)
-        {
-            pressed_makes.remove(index).1
-        } else {
-            let Some(make) = guest_make_for_key(key, physical_key) else {
-                return Vec::new();
-            };
-            make
-        };
-        vec![make | 0x80]
-    }
-}
-
-/// The ISO 102nd key (`<` `>`) is the one printable key egui cannot deliver as
-/// a Key event (it drops KeyCode::IntlBackslash and has no `<`/`>` Key variant),
-/// so recover it from its Text event as scancode 0x56. The guest's live shift
-/// state picks `<` vs `>` from the layout table; AltGr `|` is reachable elsewhere.
-fn iso_key_make_break(text: &str) -> Option<[u8; 2]> {
-    match text {
-        "<" | ">" => Some([0x56, 0x56 | 0x80]),
-        _ => None,
-    }
-}
-
-fn text_to_set1(text: &str) -> Vec<u8> {
-    let mut codes = Vec::new();
-    for ch in text.chars() {
-        if ch == '.' {
-            codes.extend_from_slice(&[0x34, 0xb4]);
-        }
-    }
-    codes
 }
 
 /// Fill the Margo LFB with a diagonal gradient. Debug aid behind
@@ -2040,6 +1532,246 @@ fn load_margo_test_pattern(machine: &mut Machine) {
     }
 }
 
+/// The wgpu surface, device, queue, and surface config for the one window.
+struct WgpuState {
+    surface: wgpu::Surface<'static>,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    config: wgpu::SurfaceConfiguration,
+}
+
+/// Owns the winit window and the egui-on-wgpu plumbing. The GUI logic lives in
+/// `GuiApp`; this struct routes raw winit events to it and drives the render.
+struct WinitApp {
+    gui: GuiApp,
+    host_kbd: HostKeyboard,
+    // Physical Ctrl state, tracked for the Ctrl+F2 capture toggle.
+    ctrl_down: bool,
+    window: Option<Arc<Window>>,
+    wgpu: Option<WgpuState>,
+    egui_ctx: egui::Context,
+    egui_winit: Option<egui_winit::State>,
+    egui_renderer: Option<egui_wgpu::Renderer>,
+}
+
+impl ApplicationHandler for WinitApp {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window.is_some() {
+            return;
+        }
+        let attrs = Window::default_attributes()
+            .with_title("IzarraVM")
+            .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0))
+            .with_min_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
+        let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
+
+        // Standard wgpu init for the surface, adapter, and device.
+        let instance = wgpu::Instance::default();
+        let surface = instance.create_surface(window.clone()).expect("surface");
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: Some(&surface),
+            force_fallback_adapter: false,
+        }))
+        .expect("adapter");
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+                .expect("device");
+        let size = window.inner_size();
+        let caps = surface.get_capabilities(&adapter);
+        let format = caps.formats[0];
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: size.width.max(1),
+            height: size.height.max(1),
+            present_mode: wgpu::PresentMode::Fifo,
+            alpha_mode: caps.alpha_modes[0],
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        surface.configure(&device, &config);
+
+        let egui_winit = egui_winit::State::new(
+            self.egui_ctx.clone(),
+            self.egui_ctx.viewport_id(),
+            &window,
+            Some(window.scale_factor() as f32),
+            None,
+            None,
+        );
+        let egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
+
+        self.egui_renderer = Some(egui_renderer);
+        self.egui_winit = Some(egui_winit);
+        self.wgpu = Some(WgpuState {
+            surface,
+            device,
+            queue,
+            config,
+        });
+        self.window = Some(window);
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        // Keyboard goes straight to the guest, never to egui (the GUI has no text
+        // widgets). Handle it at the top so its borrows of self.gui/host_kbd/
+        // ctrl_down stay disjoint from the window/egui/wgpu destructure below.
+        if let WindowEvent::KeyboardInput {
+            event: key_event, ..
+        } = &event
+        {
+            use winit::keyboard::KeyCode;
+            if let PhysicalKey::Code(code) = key_event.physical_key {
+                let pressed = key_event.state == ElementState::Pressed;
+                if matches!(code, KeyCode::ControlLeft | KeyCode::ControlRight) {
+                    self.ctrl_down = pressed;
+                }
+                // Ctrl+F2 toggles input capture and is withheld from the guest.
+                if pressed && code == KeyCode::F2 && self.ctrl_down {
+                    if let Some(window) = self.window.clone() {
+                        self.gui.toggle_capture(&window, &mut self.host_kbd);
+                    }
+                    return;
+                }
+                let codes = self.host_kbd.key(code, pressed, key_event.repeat);
+                self.gui.send_keys_to_guest(codes);
+            }
+            return;
+        }
+        // On focus loss, release everything held so a key down at the moment of an
+        // alt-tab (Shift, in a game) does not stick in the guest.
+        if let WindowEvent::Focused(false) = &event {
+            self.gui.send_keys_to_guest(self.host_kbd.release_all());
+            self.ctrl_down = false;
+            return;
+        }
+        // While captured, pointer buttons go to the guest and egui is skipped;
+        // motion comes from DeviceEvent::MouseMotion instead. When not captured,
+        // fall through so the sidebar and the click-to-capture still work.
+        if self.gui.input_captured {
+            if let WindowEvent::MouseInput { state, button, .. } = &event {
+                let bit = match button {
+                    MouseButton::Left => 0x01,
+                    MouseButton::Right => 0x02,
+                    MouseButton::Middle => 0x04,
+                    _ => 0,
+                };
+                let pressed = *state == ElementState::Pressed;
+                self.gui.set_guest_button(bit, pressed);
+                return;
+            }
+            if matches!(
+                event,
+                WindowEvent::CursorMoved { .. } | WindowEvent::MouseWheel { .. }
+            ) {
+                return;
+            }
+        }
+
+        let (Some(window), Some(egui_winit), Some(wgpu), Some(renderer)) = (
+            self.window.as_ref(),
+            self.egui_winit.as_mut(),
+            self.wgpu.as_mut(),
+            self.egui_renderer.as_mut(),
+        ) else {
+            return;
+        };
+
+        let _ = egui_winit.on_window_event(window, &event);
+        match event {
+            WindowEvent::CloseRequested => {
+                self.gui.shutdown_for_exit();
+                event_loop.exit();
+            }
+            WindowEvent::Resized(size) => {
+                wgpu.config.width = size.width.max(1);
+                wgpu.config.height = size.height.max(1);
+                wgpu.surface.configure(&wgpu.device, &wgpu.config);
+                window.request_redraw();
+            }
+            WindowEvent::RedrawRequested => {
+                // Clone the Context (Arc-backed, cheap) so the run() closure only
+                // borrows self.gui, not self.egui_ctx as well.
+                let egui_ctx = self.egui_ctx.clone();
+                let raw_input = egui_winit.take_egui_input(window);
+                let full = egui_ctx.run(raw_input, |ctx| self.gui.ui(ctx));
+                egui_winit.handle_platform_output(window, full.platform_output);
+                let tris = egui_ctx.tessellate(full.shapes, full.pixels_per_point);
+                let desc = egui_wgpu::ScreenDescriptor {
+                    size_in_pixels: [wgpu.config.width, wgpu.config.height],
+                    pixels_per_point: full.pixels_per_point,
+                };
+                let mut encoder = wgpu.device.create_command_encoder(&Default::default());
+                for (id, delta) in &full.textures_delta.set {
+                    renderer.update_texture(&wgpu.device, &wgpu.queue, *id, delta);
+                }
+                renderer.update_buffers(&wgpu.device, &wgpu.queue, &mut encoder, &tris, &desc);
+                let frame = match wgpu.surface.get_current_texture() {
+                    Ok(f) => f,
+                    Err(_) => {
+                        wgpu.surface.configure(&wgpu.device, &wgpu.config);
+                        return;
+                    }
+                };
+                let view = frame.texture.create_view(&Default::default());
+                {
+                    let mut pass = encoder
+                        .begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("egui"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &view,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                        })
+                        .forget_lifetime();
+                    renderer.render(&mut pass, &tris, &desc);
+                }
+                for id in &full.textures_delta.free {
+                    renderer.free_texture(id);
+                }
+                wgpu.queue.submit(Some(encoder.finish()));
+                frame.present();
+            }
+            _ => {}
+        }
+    }
+
+    fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
+        if !self.gui.input_captured {
+            return;
+        }
+        if let DeviceEvent::MouseMotion { delta } = event {
+            let ppp = self
+                .window
+                .as_ref()
+                .map_or(1.0, |w| w.scale_factor() as f32);
+            self.gui
+                .accumulate_guest_motion(delta.0 as f32, delta.1 as f32, ppp);
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        // Enter capture if the monitor image was clicked this frame; the event
+        // loop owns the winit Window that monitor_ui does not.
+        if self.gui.take_want_capture() {
+            if let Some(window) = self.window.clone() {
+                self.gui.toggle_capture(&window, &mut self.host_kbd);
+            }
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+}
+
 /// Open the window and run the emulator. Returns when the user closes it.
 pub fn run(
     profile: MachineProfile,
@@ -2050,60 +1782,33 @@ pub fn run(
     test_pattern: bool,
     rtc_setup: crate::cmos::RtcSetup,
 ) -> Result<(), Box<dyn Error>> {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 720.0])
-            .with_min_inner_size([1280.0, 720.0]),
-        renderer: eframe::Renderer::Wgpu,
-        ..Default::default()
+    let event_loop = EventLoop::new()?;
+    let gui = GuiApp::new(
+        profile,
+        rom,
+        c_drive,
+        cd_image,
+        audio_enabled,
+        test_pattern,
+        rtc_setup,
+    );
+    let mut app = WinitApp {
+        gui,
+        host_kbd: HostKeyboard::default(),
+        ctrl_down: false,
+        window: None,
+        wgpu: None,
+        egui_ctx: egui::Context::default(),
+        egui_winit: None,
+        egui_renderer: None,
     };
-    eframe::run_native(
-        "IzarraVM",
-        options,
-        Box::new(move |_cc| {
-            Ok(Box::new(GuiApp::new(
-                profile,
-                rom,
-                c_drive,
-                cd_image,
-                audio_enabled,
-                test_pattern,
-                rtc_setup,
-            )))
-        }),
-    )?;
+    event_loop.run_app(&mut app)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn iso_key_recovers_angle_brackets_only() {
-        assert_eq!(iso_key_make_break("<"), Some([0x56, 0xd6]));
-        assert_eq!(iso_key_make_break(">"), Some([0x56, 0xd6]));
-        assert_eq!(iso_key_make_break("a"), None);
-        assert_eq!(iso_key_make_break("|"), None); // reachable as AltGr+1
-    }
-
-    #[test]
-    fn release_codes_break_every_held_key_and_modifier() {
-        // Shift held plus the 'A' key (make 0x1e) held: focus loss must break both,
-        // modifier first (0xaa shift break) then the key (0x9e = 0x1e | 0x80).
-        let shift = GuestModifiers::from_egui(egui::Modifiers {
-            shift: true,
-            ..Default::default()
-        });
-        let held = vec![(egui::Key::A, 0x1e)];
-        assert_eq!(release_codes(shift, &held), vec![0xaa, 0x9e]);
-
-        // Nothing held: nothing to release.
-        assert_eq!(
-            release_codes(GuestModifiers::default(), &[]),
-            Vec::<u8>::new()
-        );
-    }
 
     #[test]
     fn volume_gain_is_cubic_and_clamped() {
@@ -2187,102 +1892,5 @@ mod tests {
         let src = egui::ColorImage::new([4, 4], vec![egui::Color32::BLACK; 16]);
         let out = sharp_prescale(&src, 3, 3);
         assert_eq!(out.size, [4, 4]);
-    }
-
-    #[test]
-    fn host_keys_emit_dos_modifiers_and_symbol_scancodes() {
-        let mut codes = Vec::new();
-        let mut pressed = Vec::new();
-        let shift = GuestModifiers::from_egui(egui::Modifiers {
-            shift: true,
-            ..Default::default()
-        });
-        push_modifier_delta(GuestModifiers::default(), shift, &mut codes);
-        codes.extend(key_event_to_set1(
-            egui::Key::Num7,
-            Some(egui::Key::Num7),
-            true,
-            &mut pressed,
-        ));
-        codes.extend(key_event_to_set1(
-            egui::Key::Num7,
-            Some(egui::Key::Num7),
-            false,
-            &mut pressed,
-        ));
-        push_modifier_delta(shift, GuestModifiers::default(), &mut codes);
-        assert_eq!(codes, [0x2a, 0x08, 0x88, 0xaa]);
-
-        let altgr = GuestModifiers::from_egui(egui::Modifiers {
-            alt: true,
-            ctrl: true,
-            ..Default::default()
-        });
-        let mut altgr_codes = Vec::new();
-        let mut altgr_pressed = Vec::new();
-        push_modifier_delta(GuestModifiers::default(), altgr, &mut altgr_codes);
-        altgr_codes.extend(key_event_to_set1(
-            egui::Key::Num2,
-            Some(egui::Key::Num2),
-            true,
-            &mut altgr_pressed,
-        ));
-        assert_eq!(altgr_codes, [0xe0, 0x38, 0x03]);
-        assert_eq!(egui_key_to_set1(egui::Key::Backslash), Some(0x2b));
-    }
-
-    #[test]
-    fn repeated_key_press_does_not_need_modifier_wrapping() {
-        let mut pressed = Vec::new();
-        assert_eq!(
-            key_event_to_set1(egui::Key::ArrowUp, None, true, &mut pressed),
-            [0x48]
-        );
-        assert_eq!(
-            key_event_to_set1(egui::Key::ArrowUp, None, false, &mut pressed),
-            [0xc8]
-        );
-        assert_eq!(text_to_set1("."), [0x34, 0xb4]);
-    }
-
-    #[test]
-    fn printable_keys_use_physical_position_not_host_text() {
-        let mut pressed = Vec::new();
-        assert_eq!(
-            key_event_to_set1(
-                egui::Key::Colon,
-                Some(egui::Key::Semicolon),
-                true,
-                &mut pressed
-            ),
-            [0x27]
-        );
-        assert_eq!(
-            key_event_to_set1(
-                egui::Key::Colon,
-                Some(egui::Key::Semicolon),
-                false,
-                &mut pressed
-            ),
-            [0xa7]
-        );
-        assert_eq!(
-            key_event_to_set1(
-                egui::Key::Semicolon,
-                Some(egui::Key::Comma),
-                true,
-                &mut pressed
-            ),
-            [0x33]
-        );
-    }
-
-    #[test]
-    fn numpad_number_keys_have_keypad_make_codes() {
-        assert_eq!(numpad_make_for_egui_key(egui::Key::Num7), Some(0x47));
-        assert_eq!(numpad_make_for_egui_key(egui::Key::Num4), Some(0x4b));
-        assert_eq!(numpad_make_for_egui_key(egui::Key::Num6), Some(0x4d));
-        assert_eq!(numpad_make_for_egui_key(egui::Key::Num2), Some(0x50));
-        assert_eq!(numpad_make_for_egui_key(egui::Key::Period), Some(0x53));
     }
 }
