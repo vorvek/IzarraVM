@@ -639,7 +639,9 @@ pub struct GuiApp {
     // Make codes chosen for live host keys. Releases use the stored make so
     // numpad keys do not turn into top-row breaks when host NumLock changes.
     guest_key_scancodes: Vec<(egui::Key, u8)>,
-    guest_num_lock: bool,
+    // Guest NumLock/CapsLock/ScrollLock state, mirrored from the host. Parallel
+    // to HOST_LOCK_KEYS; seeded false because the BIOS clears KB_FLAGS on boot.
+    guest_locks: [bool; HOST_LOCK_KEYS.len()],
     // Last button mask forwarded to the VM, so a button press or release is sent
     // even on a frame with no pointer motion.
     last_buttons: u8,
@@ -748,7 +750,7 @@ impl GuiApp {
             input_captured: false,
             guest_modifiers: GuestModifiers::default(),
             guest_key_scancodes: Vec::new(),
-            guest_num_lock: false,
+            guest_locks: [false; HOST_LOCK_KEYS.len()],
             last_buttons: 0,
             screen_rect: None,
             abs_x: 0.0,
@@ -814,7 +816,7 @@ impl GuiApp {
         self.frame_seq = 0;
         self.guest_modifiers = GuestModifiers::default();
         self.guest_key_scancodes.clear();
-        self.guest_num_lock = false;
+        self.guest_locks = [false; HOST_LOCK_KEYS.len()];
         // A fresh machine boots with an empty drive A:, then we remount whatever
         // was in it so a Reset keeps the disk in the drive (no race to re-mount
         // before the BIOS boots).
@@ -834,7 +836,7 @@ impl GuiApp {
         self.floppy_source = None;
         self.guest_modifiers = GuestModifiers::default();
         self.guest_key_scancodes.clear();
-        self.guest_num_lock = false;
+        self.guest_locks = [false; HOST_LOCK_KEYS.len()];
     }
 }
 
@@ -931,7 +933,7 @@ impl GuiApp {
             self.guest_key_scancodes.clear();
             self.abs_x = MOUSE_GUEST_MAX_X as f32 / 2.0;
             self.abs_y = MOUSE_GUEST_MAX_Y as f32 / 2.0;
-            self.sync_guest_num_lock();
+            self.sync_guest_locks();
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::Locked));
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
         } else {
@@ -950,16 +952,22 @@ impl GuiApp {
         self.title = capture_title(capture);
     }
 
-    fn sync_guest_num_lock(&mut self) {
-        let Some(host_on) = host_num_lock_on() else {
+    /// Mirror the host's NumLock/CapsLock/ScrollLock onto the guest. Each lock
+    /// that differs gets a make+break injected, which the BIOS INT 09h handler
+    /// toggles once (guarded by its held-flag). Runs every frame, so it also
+    /// catches the host toggling a lock mid-session, not just the load.
+    fn sync_guest_locks(&mut self) {
+        let Some(emu) = &self.emu else {
             return;
         };
-        if host_on == self.guest_num_lock {
-            return;
-        }
-        if let Some(emu) = &self.emu {
-            emu.send_keys(vec![0x45, 0xc5]);
-            self.guest_num_lock = host_on;
+        for (i, (vk, make)) in HOST_LOCK_KEYS.iter().enumerate() {
+            let Some(host_on) = host_lock_on(*vk) else {
+                return;
+            };
+            if host_on != self.guest_locks[i] {
+                emu.send_keys(vec![*make, *make | 0x80]);
+                self.guest_locks[i] = host_on;
+            }
         }
     }
 
@@ -974,7 +982,7 @@ impl GuiApp {
     /// relative guest-pixel delta scaled across the framebuffer rect, and the
     /// button mask is rebuilt from the pointer-button events.
     fn process_captured_raw_input(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
-        self.sync_guest_num_lock();
+        self.sync_guest_locks();
         // Ctrl+F2 releases the grab. Handle it before anything else and forward
         // nothing this frame so the combo does not reach the guest.
         let release_combo = raw_input.modifiers.ctrl
@@ -1539,14 +1547,16 @@ impl eframe::App for GuiApp {
             self.metrics_mark = Some(now);
         }
         // While captured, all keyboard and pointer input was already drained and
-        // routed to the guest in raw_input_hook, ahead of egui's processing. Only
-        // the non-captured path runs here: forward keys to the guest when no egui
-        // widget wants the keyboard. Esc still reaches the guest so POST can skip
-        // the RAM test even if a sidebar control has focus.
+        // routed to the guest in raw_input_hook, ahead of egui's processing. The
+        // non-captured path runs here and forwards every key to the guest: the GUI
+        // is mouse-driven with no text fields, so gating on egui focus only stole
+        // the keyboard from the guest once a sidebar control was clicked or tabbed
+        // to (and split a key's press from its release, leaving it stuck).
+        // ponytail: forward unconditionally; add a focus guard only if a real
+        // text-entry widget is ever added to the sidebar.
         if !self.input_captured {
-            let ui_wants_keyboard = ctx.wants_keyboard_input();
-            self.sync_guest_num_lock();
-            let events = ctx.input(|i| i.events.clone());
+            self.sync_guest_locks();
+            let (events, modifiers) = ctx.input(|i| (i.events.clone(), i.modifiers));
             let mut codes = Vec::new();
             for event in &events {
                 if let egui::Event::Key {
@@ -1557,9 +1567,6 @@ impl eframe::App for GuiApp {
                     modifiers,
                 } = event
                 {
-                    if !should_forward_uncaptured_key(ui_wants_keyboard, *key) {
-                        continue;
-                    }
                     let next = GuestModifiers::from_egui(*modifiers);
                     push_modifier_delta(self.guest_modifiers, next, &mut codes);
                     self.guest_modifiers = next;
@@ -1573,6 +1580,12 @@ impl eframe::App for GuiApp {
                     }
                 }
             }
+            // A bare modifier key (Shift held alone, the action key in many games)
+            // produces no egui Key event, only a modifiers change, so reconcile
+            // against the frame's final modifier state like the captured path does.
+            let next = GuestModifiers::from_egui(modifiers);
+            push_modifier_delta(self.guest_modifiers, next, &mut codes);
+            self.guest_modifiers = next;
             if !codes.is_empty() {
                 if let Some(emu) = &self.emu {
                     emu.send_keys(codes);
@@ -1640,10 +1653,6 @@ fn is_captured_input_event(event: &egui::Event) -> bool {
     )
 }
 
-fn should_forward_uncaptured_key(ui_wants_keyboard: bool, key: egui::Key) -> bool {
-    !ui_wants_keyboard || key == egui::Key::Escape
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct GuestModifiers {
     shift: bool,
@@ -1691,8 +1700,12 @@ fn push_modifier_delta(from: GuestModifiers, to: GuestModifiers, codes: &mut Vec
     }
 }
 
-#[cfg(target_os = "windows")]
 const VK_NUMLOCK: i32 = 0x90;
+const VK_CAPITAL: i32 = 0x14;
+const VK_SCROLL: i32 = 0x91;
+/// Host lock keys mirrored to the guest, as (host virtual-key, Set 1 make).
+/// Break is make | 0x80. Order is parallel to `GuiApp::guest_locks`.
+const HOST_LOCK_KEYS: [(i32, u8); 3] = [(VK_NUMLOCK, 0x45), (VK_CAPITAL, 0x3a), (VK_SCROLL, 0x46)];
 #[cfg(target_os = "windows")]
 const VK_NUMPAD0: i32 = 0x60;
 #[cfg(target_os = "windows")]
@@ -1717,12 +1730,12 @@ fn host_virtual_key_down(vk: i32) -> bool {
 }
 
 #[cfg(target_os = "windows")]
-fn host_num_lock_on() -> Option<bool> {
-    Some((unsafe { get_key_state(VK_NUMLOCK) } & 1) != 0)
+fn host_lock_on(vk: i32) -> Option<bool> {
+    Some((unsafe { get_key_state(vk) } & 1) != 0)
 }
 
 #[cfg(not(target_os = "windows"))]
-fn host_num_lock_on() -> Option<bool> {
+fn host_lock_on(_vk: i32) -> Option<bool> {
     None
 }
 
@@ -2137,13 +2150,6 @@ mod tests {
             [0xc8]
         );
         assert_eq!(text_to_set1("."), [0x34, 0xb4]);
-    }
-
-    #[test]
-    fn escape_forwards_to_guest_even_when_ui_has_focus() {
-        assert!(should_forward_uncaptured_key(true, egui::Key::Escape));
-        assert!(!should_forward_uncaptured_key(true, egui::Key::A));
-        assert!(should_forward_uncaptured_key(false, egui::Key::A));
     }
 
     #[test]
