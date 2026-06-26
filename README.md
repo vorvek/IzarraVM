@@ -38,26 +38,6 @@ Games see a DOS environment. Toka runs an MS-DOS 6.22 compatible core with the
 usual memory managers, and maps itself out of conventional memory so games that
 need most of the first 640 KB (Wing Commander, for one) still get it.
 
-## Implementation order
-
-One machine, built in layers. The rough sequence:
-
-- CPU: a 386 core first, which doubles as the Izarra 1000 compatibility mode, then
-  486DX2 behavior, then the full GSW-586.
-- Graphics: VGA text and Mode 13h, then VESA SVGA on Margo, then the Distira 3D
-  unit and the Glide path.
-- Sound: PC speaker, then OPL3 and Sound Blaster 16, then MPU-401 MIDI and
-  wavetable.
-- Host integration: keyboard and mouse, DOS joystick, and host-folder C: mounts
-  with no virtual disk image required.
-
-## Development Policy
-
-Active development is Windows-first for now, matching the local DOS library and
-current workstation. Keep the architecture portable: use cross-platform crates for
-windowing, graphics, audio, MIDI, input, paths, and process boundaries, and avoid
-Windows-only APIs unless they are isolated behind a backend trait.
-
 ## Current State
 
 IzarraVM is in bring-up. It is past the blank-machine stage, but it is not a
