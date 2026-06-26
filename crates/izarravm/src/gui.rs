@@ -920,12 +920,11 @@ impl GuiApp {
                 ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
             }
         }
-        // Clicking the screen grabs the input: the OS cursor is confined and
-        // hidden, and keyboard/mouse route to the guest until Ctrl+F2 releases.
+        // Clicking the screen requests input capture. The actual cursor grab and
+        // hide happen later in toggle_capture (run from the event loop, which owns
+        // the winit Window); here we only flag the intent.
         let response = ui.interact(rect, ui.id().with("monitor-capture"), egui::Sense::click());
         if response.clicked() && !self.input_captured {
-            // The winit Window lives in the event loop, not here, so flag the
-            // intent and let about_to_wait enter capture.
             self.want_capture = true;
         }
     }
@@ -939,6 +938,20 @@ impl GuiApp {
         if let Some(emu) = &self.emu {
             emu.send_keys(codes);
         }
+    }
+
+    /// The guest's published vertical refresh rate, used to pace the host
+    /// redraw. Falls back to 60 Hz when no machine is running or the guest has
+    /// not reported a rate yet.
+    fn guest_refresh_hz(&self) -> f64 {
+        self.emu.as_ref().map_or(60.0, |emu| {
+            let hz = emu
+                .frame
+                .lock()
+                .expect("frame snapshot poisoned")
+                .refresh_hz;
+            if hz > 0.0 { hz } else { 60.0 }
+        })
     }
 
     /// Whether monitor_ui flagged a click-to-capture this frame, clearing it.
@@ -1552,6 +1565,9 @@ struct WinitApp {
     egui_ctx: egui::Context,
     egui_winit: Option<egui_winit::State>,
     egui_renderer: Option<egui_wgpu::Renderer>,
+    // When the next frame is due. about_to_wait paces redraws to the guest
+    // refresh rate with ControlFlow::WaitUntil rather than spinning at host vsync.
+    next_frame: Instant,
 }
 
 impl ApplicationHandler for WinitApp {
@@ -1640,7 +1656,9 @@ impl ApplicationHandler for WinitApp {
             return;
         }
         // On focus loss, release everything held so a key down at the moment of an
-        // alt-tab (Shift, in a game) does not stick in the guest.
+        // alt-tab (Shift, in a game) does not stick in the guest. This returns
+        // before egui sees the event on purpose: focus loss is only a guest-key
+        // flush, so unlike Focused(true) it is not forwarded to egui.
         if let WindowEvent::Focused(false) = &event {
             self.gui.send_keys_to_guest(self.host_kbd.release_all());
             self.ctrl_down = false;
@@ -1709,8 +1727,18 @@ impl ApplicationHandler for WinitApp {
                 renderer.update_buffers(&wgpu.device, &wgpu.queue, &mut encoder, &tris, &desc);
                 let frame = match wgpu.surface.get_current_texture() {
                     Ok(f) => f,
-                    Err(_) => {
+                    // The surface changed or was lost: rebuild it and skip this
+                    // frame; the next redraw draws to the fresh surface.
+                    Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
                         wgpu.surface.configure(&wgpu.device, &wgpu.config);
+                        return;
+                    }
+                    // A transient timeout: just skip the frame, no reconfigure.
+                    Err(wgpu::SurfaceError::Timeout) => return,
+                    // Fatal: log and exit rather than spin on a dead surface.
+                    Err(err @ (wgpu::SurfaceError::OutOfMemory | wgpu::SurfaceError::Other)) => {
+                        error!(?err, "fatal surface error; exiting");
+                        event_loop.exit();
                         return;
                     }
                 };
@@ -1758,17 +1786,26 @@ impl ApplicationHandler for WinitApp {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         // Enter capture if the monitor image was clicked this frame; the event
         // loop owns the winit Window that monitor_ui does not.
         if self.gui.take_want_capture() {
-            if let Some(window) = self.window.clone() {
-                self.gui.toggle_capture(&window, &mut self.host_kbd);
+            if let Some(window) = &self.window {
+                self.gui.toggle_capture(window, &mut self.host_kbd);
             }
         }
-        if let Some(window) = &self.window {
-            window.request_redraw();
+        // Pace redraws to the guest refresh rate. Only request a redraw once the
+        // deadline has elapsed; requesting unconditionally would defeat the
+        // WaitUntil below and spin the UI thread at host vsync.
+        let now = Instant::now();
+        if now >= self.next_frame {
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+            let hz = self.gui.guest_refresh_hz().max(1.0);
+            self.next_frame = now + Duration::from_secs_f64(1.0 / hz);
         }
+        event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(self.next_frame));
     }
 }
 
@@ -1801,6 +1838,7 @@ pub fn run(
         egui_ctx: egui::Context::default(),
         egui_winit: None,
         egui_renderer: None,
+        next_frame: Instant::now(),
     };
     event_loop.run_app(&mut app)?;
     Ok(())
