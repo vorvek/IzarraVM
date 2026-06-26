@@ -367,11 +367,18 @@ int16:
     jne .peek_done
     xor al, al
 .peek_done:
-    clc
+    ; AH=01h reports availability in the caller's restored FLAGS image.
+    push bp
+    mov bp, sp
+    and word [bp + 6], 0xffbe      ; CF=0, ZF=0: key present
+    pop bp
     iret
 .peek_empty:
     pop ds
-    stc
+    push bp
+    mov bp, sp
+    or word [bp + 6], 0x0041       ; CF=1, ZF=1: no key
+    pop bp
     iret
 .peek16:
     ; Enhanced peek (AH=11h): leaves the key in the ring and keeps the 0xE0 marker.
@@ -383,11 +390,17 @@ int16:
     je .peek16_empty
     mov ax, [bx]
     pop ds
-    clc
+    push bp
+    mov bp, sp
+    and word [bp + 6], 0xffbe      ; CF=0, ZF=0: key present
+    pop bp
     iret
 .peek16_empty:
     pop ds
-    stc
+    push bp
+    mov bp, sp
+    or word [bp + 6], 0x0041       ; CF=1, ZF=1: no key
+    pop bp
     iret
 .flags:
     push ds

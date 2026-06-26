@@ -16505,6 +16505,43 @@ mod tests {
         read_u16(&mut machine, (u32::from(DOS_LOAD_SEGMENT) << 4) + 0x200)
     }
 
+    fn int16_peek_guest_exit(scancodes: &[u8], prog: &[u8]) -> StopReason {
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), prog)
+                .unwrap();
+        machine.inject_key_scancodes(scancodes);
+        machine.run_until_halt_or_cycles(1_000_000).unwrap()
+    }
+
+    #[test]
+    fn int16_peek_empty_sets_guest_zf() {
+        // mov al,1; or al,al; mov ah,1; int 16h; jz pass; mov al,1; jmp exit;
+        // pass: xor al,al; exit: store AL as the Lotura exit code.
+        const PROG: [u8; 30] = [
+            0xb0, 0x01, 0x08, 0xc0, 0xb4, 0x01, 0xcd, 0x16, 0x74, 0x04, 0xb0, 0x01, 0xeb, 0x02,
+            0x30, 0xc0, 0x88, 0xc3, 0xb0, 0x0c, 0xe6, 0xe4, 0x88, 0xd8, 0xe6, 0xe5, 0xb0, 0x03,
+            0xe6, 0xe6,
+        ];
+        assert_eq!(
+            int16_peek_guest_exit(&[], &PROG),
+            StopReason::TestExit { code: 0 }
+        );
+    }
+
+    #[test]
+    fn int16_peek_available_clears_guest_zf() {
+        // xor ax,ax; mov ah,1; int 16h; jnz pass; mov al,1; jmp exit;
+        // pass: xor al,al; exit: store AL as the Lotura exit code.
+        const PROG: [u8; 28] = [
+            0x31, 0xc0, 0xb4, 0x01, 0xcd, 0x16, 0x75, 0x04, 0xb0, 0x01, 0xeb, 0x02, 0x30, 0xc0,
+            0x88, 0xc3, 0xb0, 0x0c, 0xe6, 0xe4, 0x88, 0xd8, 0xe6, 0xe5, 0xb0, 0x03, 0xe6, 0xe6,
+        ];
+        assert_eq!(
+            int16_peek_guest_exit(&[0x1e, 0x9e], &PROG),
+            StopReason::TestExit { code: 0 }
+        );
+    }
+
     #[test]
     fn int16_returns_extended_scancode_for_up_arrow() {
         // Up arrow is the bare scancode 0x48 (make) / 0xC8 (break); no 0xE0 prefix.
