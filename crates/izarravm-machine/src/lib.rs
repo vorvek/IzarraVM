@@ -5145,7 +5145,7 @@ impl Machine {
         tail.extend_from_slice(b" /C ");
         tail.extend_from_slice(&command);
 
-        self.write_guest_block(scratch + u32::from(path_off), b"C:\\ICOMMAND.COM\0");
+        self.write_guest_block(scratch + u32::from(path_off), b"C:\\DOS\\ICOMMAND.COM\0");
         self.write_physical_u8(scratch + u32::from(tail_off), tail.len() as u8);
         self.write_guest_block(scratch + u32::from(tail_off) + 1, &tail);
         self.write_physical_u8(scratch + u32::from(tail_off) + 1 + tail.len() as u32, 0x0d);
@@ -9274,16 +9274,16 @@ impl Machine {
     }
 
     /// Place the Toka-DOS boot record (TOKABOOT) at 0x7C00 and set up the DOS
-    /// base context so the boot record's EXEC of ICOMMAND.COM works. The BIOS
+    /// base context so the boot record's EXEC of C:\DOS\ICOMMAND.COM works. The BIOS
     /// then jumps to 0x7C00 like a real INT 19h boot.
     fn toka_load_boot_record(&mut self) -> u8 {
-        // Toka-DOS is bootable only when it is installed on C: (ICOMMAND.COM
+        // Toka-DOS is bootable only when it is installed on C: (C:\DOS\ICOMMAND.COM
         // present). The boot record always lives in the ROM, so without this
         // check the machine would "boot" a drive that carries no OS.
         let installed = self
             .toka_c_root
             .as_ref()
-            .is_some_and(|root| root.join("ICOMMAND.COM").exists());
+            .is_some_and(|root| root.join("DOS").join("ICOMMAND.COM").exists());
         if !installed {
             return 1; // not installed: the BIOS reports and idles
         }
@@ -9318,8 +9318,8 @@ impl Machine {
     fn setup_toka_dos_base(&mut self) -> Result<(), MachineError> {
         install_dos_low_memory_stubs(&mut self.memory)?;
         let env: [(&str, &str); 3] = [
-            ("COMSPEC", "C:\\ICOMMAND.COM"),
-            ("PATH", "C:\\;C:\\DOS"),
+            ("COMSPEC", "C:\\DOS\\ICOMMAND.COM"),
+            ("PATH", "C:\\DOS"),
             ("PROMPT", "$p$g"),
         ];
         {
@@ -19868,7 +19868,9 @@ mod tests {
         // time, which is how a warm reboot from C: takes the machine back from a
         // booter floppy.
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("ICOMMAND.COM"), b"stub").unwrap();
+        let dos_dir = dir.path().join("DOS");
+        std::fs::create_dir_all(&dos_dir).unwrap();
+        std::fs::write(dos_dir.join("ICOMMAND.COM"), b"stub").unwrap();
         let mut m = int15_machine(16);
         m.set_toka_c_root(dir.path().to_path_buf());
         m.set_booter_inert(true); // simulate a prior booter boot
@@ -19889,7 +19891,9 @@ mod tests {
         // The BIOS ROM uses the Toka service port to load TOKABOOT for C:. That
         // path bypasses handle_int19, so it must also clear a prior booter flag.
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("ICOMMAND.COM"), b"stub").unwrap();
+        let dos_dir = dir.path().join("DOS");
+        std::fs::create_dir_all(&dos_dir).unwrap();
+        std::fs::write(dos_dir.join("ICOMMAND.COM"), b"stub").unwrap();
         let mut m = int15_machine(16);
         m.set_toka_c_root(dir.path().to_path_buf());
         m.set_booter_inert(true);
@@ -23314,7 +23318,9 @@ mod tests {
             b'C', b' ', b'E', b'C', b'H', b'O', b' ', b'O', b'K',
         ];
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("ICOMMAND.COM"), icommand).unwrap();
+        let dos_dir = dir.path().join("DOS");
+        std::fs::create_dir_all(&dos_dir).unwrap();
+        std::fs::write(dos_dir.join("ICOMMAND.COM"), icommand).unwrap();
         let mut machine =
             Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), parent)
                 .unwrap();
@@ -27477,7 +27483,8 @@ mod tests {
         // Format installs the Toka-DOS system files onto C:.
         machine.perform_toka_service(0x02);
         assert_eq!(machine.toka_service_status, 0);
-        assert!(dir.path().join("ICOMMAND.COM").exists());
+        assert!(dir.path().join("DOS").join("ICOMMAND.COM").exists());
+        assert!(!dir.path().join("ICOMMAND.COM").exists());
         let status = with_bus(&mut machine, |bus| {
             bus.read_io(0x00e3, BusWidth::Byte).unwrap() as u8
         });
@@ -30449,9 +30456,13 @@ mod tests {
             machine.run_until_halt_or_cycles(8_000_000).unwrap();
         };
 
-        type_line(&mut machine, "CD GAMES\\UUKRUL");
+        type_line(&mut machine, "cd games\\uukrul");
         type_line(&mut machine, "DIR");
         let dir_text = machine.screen_text().as_text();
+        assert!(
+            dir_text.contains("C:\\GAMES\\UUKRUL>"),
+            "lowercase CD still displays an uppercase DOS cwd; got:\n{dir_text}"
+        );
         assert!(
             dir_text.contains("Directory of  C:\\GAMES\\UUKRUL"),
             "DIR reports the current game directory; got:\n{dir_text}"

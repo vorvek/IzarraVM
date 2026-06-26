@@ -121,7 +121,7 @@ pub fn resolve_c_root() -> PathBuf {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallMode {
     /// Install only if Toka-DOS is absent (first boot). The presence of
-    /// `ICOMMAND.COM` is the marker.
+    /// `C:\DOS\ICOMMAND.COM` is the marker.
     EnsureIfMissing,
     /// Overwrite the system files from ROM, leaving any user files in place.
     Repair,
@@ -129,18 +129,8 @@ pub enum InstallMode {
     Format,
 }
 
-/// The marker file whose presence means Toka-DOS is already installed.
-const TOKA_DOS_MARKER: &str = "ICOMMAND.COM";
-
-/// System files that stay at the C: root: the shell and its COMMAND.COM alias,
-/// the COMSPEC the boot path launches. Every other system file is a tool and
-/// installs under C:\DOS, where the shell's PATH search finds it.
-const ROOT_SYSTEM_FILES: &[&str] = &["ICOMMAND.COM", "COMMAND.COM"];
-
-fn is_root_system_file(name: &str) -> bool {
-    ROOT_SYSTEM_FILES
-        .iter()
-        .any(|root| root.eq_ignore_ascii_case(name))
+fn toka_dos_marker(c_root: &Path) -> PathBuf {
+    c_root.join("DOS").join("ICOMMAND.COM")
 }
 
 /// The default AUTOEXEC.BAT: put the tools directory on the PATH and set a
@@ -191,14 +181,24 @@ fn write_system_files(
     let dos_dir = c_root.join("DOS");
     std::fs::create_dir_all(&dos_dir)?;
     for (name, bytes) in files {
-        let dir = if is_root_system_file(name) {
-            c_root
-        } else {
-            dos_dir.as_path()
-        };
-        std::fs::write(dir.join(name), bytes)?;
+        std::fs::write(dos_dir.join(name), bytes)?;
     }
+    remove_root_system_file_copies(c_root, files)?;
     write_default_boot_config(c_root, policy)
+}
+
+fn remove_root_system_file_copies(
+    c_root: &Path,
+    files: &[(String, Vec<u8>)],
+) -> std::io::Result<()> {
+    for (name, _) in files {
+        match std::fs::remove_file(c_root.join(name)) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
 }
 
 /// Write the default AUTOEXEC.BAT and CONFIG.SYS at the C: root according to
@@ -261,7 +261,9 @@ pub fn toka_dos_install(
 ) -> std::io::Result<()> {
     match mode {
         InstallMode::EnsureIfMissing => {
-            if c_root.join(TOKA_DOS_MARKER).exists() {
+            if toka_dos_marker(c_root).exists() {
+                remove_root_system_file_copies(c_root, files)?;
+                write_default_boot_config(c_root, BootConfigPolicy::FillIfMissing)?;
                 return Ok(());
             }
             write_system_files(c_root, files, BootConfigPolicy::FillIfMissing)
@@ -4315,7 +4317,7 @@ impl DosKernel {
                 };
                 match self.resolve_name(&name) {
                     Ok(path) if path.is_dir() => {
-                        self.cwd = self.absolute_dos_path(&name);
+                        self.cwd = self.absolute_dos_path(&name).to_ascii_uppercase();
                         regs.cf = false;
                     }
                     Ok(_) => set_dos_error(regs, 0x03),
@@ -7339,24 +7341,32 @@ mod tests {
             ("VER.COM".to_string(), vec![4u8]),
         ];
 
-        // Format lays everything down on a fresh drive: the shell stays at the
-        // root, tools install under C:\DOS (the user-requested layout).
+        // Format lays everything down on a fresh drive under C:\DOS.
         toka_dos_install(root, &files, InstallMode::Format).unwrap();
-        assert!(root.join("ICOMMAND.COM").exists());
+        assert!(root.join("DOS").join("ICOMMAND.COM").exists());
         assert!(root.join("DOS").join("VER.COM").exists());
+        assert!(!root.join("ICOMMAND.COM").exists());
         assert!(!root.join("VER.COM").exists());
 
         // EnsureIfMissing is a no-op once the marker is present: a hand-edited
         // system file is left untouched.
-        std::fs::write(root.join("ICOMMAND.COM"), b"edited").unwrap();
+        std::fs::write(root.join("DOS").join("ICOMMAND.COM"), b"edited").unwrap();
+        std::fs::write(root.join("ICOMMAND.COM"), b"stale").unwrap();
         toka_dos_install(root, &files, InstallMode::EnsureIfMissing).unwrap();
-        assert_eq!(std::fs::read(root.join("ICOMMAND.COM")).unwrap(), b"edited");
+        assert_eq!(
+            std::fs::read(root.join("DOS").join("ICOMMAND.COM")).unwrap(),
+            b"edited"
+        );
+        assert!(
+            !root.join("ICOMMAND.COM").exists(),
+            "EnsureIfMissing removes stale root system files"
+        );
 
         // Repair overwrites system files but keeps a stray user file.
         std::fs::write(root.join("USER.TXT"), b"x").unwrap();
         toka_dos_install(root, &files, InstallMode::Repair).unwrap();
         assert_eq!(
-            std::fs::read(root.join("ICOMMAND.COM")).unwrap(),
+            std::fs::read(root.join("DOS").join("ICOMMAND.COM")).unwrap(),
             vec![1, 2, 3]
         );
         assert!(root.join("USER.TXT").exists());
@@ -7364,7 +7374,7 @@ mod tests {
         // Format wipes the stray user file, then reinstalls.
         toka_dos_install(root, &files, InstallMode::Format).unwrap();
         assert!(!root.join("USER.TXT").exists());
-        assert!(root.join("ICOMMAND.COM").exists());
+        assert!(root.join("DOS").join("ICOMMAND.COM").exists());
     }
 
     #[test]
@@ -7378,11 +7388,12 @@ mod tests {
         ];
         toka_dos_install(root, &files, InstallMode::Format).unwrap();
 
-        // The shell and its COMMAND.COM alias stay at the root (the boot COMSPEC).
-        assert!(root.join("ICOMMAND.COM").exists());
-        assert!(root.join("COMMAND.COM").exists());
-        // A tool installs under C:\DOS, not the root.
+        // System files live under C:\DOS, including the shell and COMMAND alias.
+        assert!(root.join("DOS").join("ICOMMAND.COM").exists());
+        assert!(root.join("DOS").join("COMMAND.COM").exists());
         assert!(root.join("DOS").join("MEM.COM").exists());
+        assert!(!root.join("ICOMMAND.COM").exists());
+        assert!(!root.join("COMMAND.COM").exists());
         assert!(!root.join("MEM.COM").exists());
 
         // The default boot config is generated.
@@ -7485,6 +7496,11 @@ mod tests {
 
         toka_dos_install(root, &files, InstallMode::Repair).unwrap();
 
+        assert!(root.join("DOS").join("ICOMMAND.COM").exists());
+        assert!(
+            !root.join("ICOMMAND.COM").exists(),
+            "Repair removes stale root system files"
+        );
         assert_eq!(
             std::fs::read_to_string(root.join("CONFIG.SYS")).unwrap(),
             DEFAULT_CONFIG_SYS

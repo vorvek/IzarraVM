@@ -251,7 +251,7 @@ static void put_dir_name(const char *name)
  * edit this block and the prompt reads it. (Children still inherit the boot
  * environment, so a SET after boot is not yet propagated into a launched
  * program.) */
-static char master_env[2048] = "PROMPT=$p$g\0COMSPEC=C:\\ICOMMAND.COM\0";
+static char master_env[2048] = "PROMPT=$p$g\0COMSPEC=C:\\DOS\\ICOMMAND.COM\0";
 
 static int key_matches(const char *entry, const char *name, int namelen)
 {

@@ -32,7 +32,7 @@ start:
         int 0x21
 
 .launch:
-        ; EXEC C:\ICOMMAND.COM. DS:DX -> program path, ES:BX -> parameter block.
+        ; EXEC C:\DOS\ICOMMAND.COM. DS:DX -> program path, ES:BX -> parameter block.
         ; The environment segment 0 in the block means inherit the shell
         ; environment the machine prepared.
         mov ax, 0x4B00
@@ -46,7 +46,7 @@ start:
         jmp .halt
 
 msg:    db "Starting Toka-DOS v3.0...", 13, 10, "$"
-path:   db "C:\ICOMMAND.COM", 0
+path:   db "C:\DOS\ICOMMAND.COM", 0
 
         align 2
 epb:
