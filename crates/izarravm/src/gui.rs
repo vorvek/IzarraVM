@@ -1045,6 +1045,8 @@ impl GuiApp {
                 egui::Event::Text(text) => {
                     if key_press_emitted {
                         key_press_emitted = false;
+                    } else if let Some(codes_iso) = iso_key_make_break(text) {
+                        codes.extend(codes_iso);
                     } else {
                         codes.extend(text_to_set1(text));
                     }
@@ -1565,26 +1567,36 @@ impl eframe::App for GuiApp {
             self.sync_guest_locks();
             let (events, modifiers) = ctx.input(|i| (i.events.clone(), i.modifiers));
             let mut codes = Vec::new();
+            let mut key_emitted = false;
             for event in &events {
-                if let egui::Event::Key {
-                    key,
-                    physical_key,
-                    pressed,
-                    repeat,
-                    modifiers,
-                } = event
-                {
-                    let next = GuestModifiers::from_egui(*modifiers);
-                    push_modifier_delta(self.guest_modifiers, next, &mut codes);
-                    self.guest_modifiers = next;
-                    if !*repeat {
-                        codes.extend(key_event_to_set1(
-                            *key,
-                            *physical_key,
-                            *pressed,
-                            &mut self.guest_key_scancodes,
-                        ));
+                match event {
+                    egui::Event::Key {
+                        key,
+                        physical_key,
+                        pressed,
+                        repeat,
+                        modifiers,
+                    } => {
+                        let next = GuestModifiers::from_egui(*modifiers);
+                        push_modifier_delta(self.guest_modifiers, next, &mut codes);
+                        self.guest_modifiers = next;
+                        if !*repeat {
+                            let key_codes = key_event_to_set1(
+                                *key,
+                                *physical_key,
+                                *pressed,
+                                &mut self.guest_key_scancodes,
+                            );
+                            key_emitted |= *pressed && !key_codes.is_empty();
+                            codes.extend(key_codes);
+                        }
                     }
+                    egui::Event::Text(text) if !key_emitted => {
+                        if let Some(codes_iso) = iso_key_make_break(text) {
+                            codes.extend(codes_iso);
+                        }
+                    }
+                    _ => {}
                 }
             }
             // A bare modifier key (Shift held alone, the action key in many games)
@@ -1954,6 +1966,17 @@ fn key_event_to_set1(
     }
 }
 
+/// The ISO 102nd key (`<` `>`) is the one printable key egui cannot deliver as
+/// a Key event (it drops KeyCode::IntlBackslash and has no `<`/`>` Key variant),
+/// so recover it from its Text event as scancode 0x56. The guest's live shift
+/// state picks `<` vs `>` from the layout table; AltGr `|` is reachable elsewhere.
+fn iso_key_make_break(text: &str) -> Option<[u8; 2]> {
+    match text {
+        "<" | ">" => Some([0x56, 0x56 | 0x80]),
+        _ => None,
+    }
+}
+
 fn text_to_set1(text: &str) -> Vec<u8> {
     let mut codes = Vec::new();
     for ch in text.chars() {
@@ -2018,6 +2041,14 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn iso_key_recovers_angle_brackets_only() {
+        assert_eq!(iso_key_make_break("<"), Some([0x56, 0xd6]));
+        assert_eq!(iso_key_make_break(">"), Some([0x56, 0xd6]));
+        assert_eq!(iso_key_make_break("a"), None);
+        assert_eq!(iso_key_make_break("|"), None); // reachable as AltGr+1
+    }
 
     #[test]
     fn volume_gain_is_cubic_and_clamped() {
