@@ -1344,6 +1344,7 @@ impl Machine {
     /// disk count to 1 so a guest reading 0040:0075 sees the drive.
     pub fn mount_hdd(&mut self, bytes: Vec<u8>) {
         self.ata = Some(ata::AtaDisk::new(bytes));
+        let _ = self.publish_fixed_disk_parameter_table();
         let _ = self.memory.write_u8(0x475, 1); // BDA fixed-disk count
     }
 
@@ -1359,6 +1360,7 @@ impl Machine {
     /// mounted. Clears the BDA fixed-disk count.
     pub fn eject_hdd(&mut self) -> Option<Vec<u8>> {
         let bytes = self.ata.take().map(|d| d.bytes().to_vec());
+        let _ = self.clear_fixed_disk_parameter_table();
         let _ = self.memory.write_u8(0x475, 0);
         bytes
     }
@@ -1367,6 +1369,47 @@ impl Machine {
     /// flushes the image back only when it changed. False when no disk is mounted.
     pub fn hdd_dirty(&self) -> bool {
         self.ata.as_ref().is_some_and(|d| d.dirty)
+    }
+
+    fn publish_fixed_disk_parameter_table(&mut self) -> Result<(), BusError> {
+        let Some(disk) = self.ata.as_ref() else {
+            return self.clear_fixed_disk_parameter_table();
+        };
+        let cylinders = disk.cylinders().min(u32::from(u16::MAX)) as u16;
+        let heads = disk.heads().min(u32::from(u8::MAX)) as u8;
+        let spt = disk.sectors_per_track().min(u32::from(u8::MAX)) as u8;
+        let base = BIOS_FIXED_DISK_PARAMETER_TABLE_ADDR as usize;
+        self.memory.write_u16(base, cylinders)?;
+        self.memory.write_u8(base + 2, heads)?;
+        self.memory.write_u16(base + 3, 0)?; // reduced write current, XT only
+        self.memory.write_u16(base + 5, 0)?; // write precompensation
+        self.memory.write_u8(base + 7, 0)?; // ECC burst length, XT only
+        self.memory
+            .write_u8(base + 8, if heads > 8 { 0x08 } else { 0x00 })?;
+        self.memory.write_u8(base + 9, 0)?; // standard timeout, XT only
+        self.memory.write_u8(base + 10, 0)?; // formatting timeout, XT only
+        self.memory.write_u8(base + 11, 0)?; // drive-check timeout, XT only
+        self.memory.write_u16(base + 12, cylinders)?;
+        self.memory.write_u8(base + 14, spt)?;
+        self.memory.write_u8(base + 15, 0)?;
+        self.memory.write_u16(
+            0x41 * 4,
+            (BIOS_FIXED_DISK_PARAMETER_TABLE_ADDR & 0x0F) as u16,
+        )?;
+        self.memory.write_u16(
+            0x41 * 4 + 2,
+            (BIOS_FIXED_DISK_PARAMETER_TABLE_ADDR >> 4) as u16,
+        )?;
+        Ok(())
+    }
+
+    fn clear_fixed_disk_parameter_table(&mut self) -> Result<(), BusError> {
+        for i in 0..16 {
+            self.memory
+                .write_u8(BIOS_FIXED_DISK_PARAMETER_TABLE_ADDR as usize + i, 0)?;
+        }
+        self.memory.write_u16(0x41 * 4, 0)?;
+        self.memory.write_u16(0x41 * 4 + 2, 0)
     }
 
     /// Whether a disc is currently mounted in the ATAPI drive.
@@ -10180,6 +10223,8 @@ const EBDA_SEGMENT: u16 = 0x9FC0;
 /// the reserved EBDA (after the size byte at offset 0), so it is consistent with
 /// the lowered conventional-memory size and out of the BDA's way.
 const BIOS_CONFIG_TABLE_ADDR: u32 = 0x9FC10;
+/// AT fixed-disk parameter table for drive 80h, published through IVT[41h].
+const BIOS_FIXED_DISK_PARAMETER_TABLE_ADDR: u32 = 0x9FC20;
 
 /// Format a CONFIG.SYS device line for a boot message: the DEVICE= path and its
 /// argument tail, left-padded to a column so the status that follows lines up.
@@ -14732,6 +14777,28 @@ mod tests {
     fn mount_hdd_seeds_the_bda_fixed_disk_count() {
         let m = machine_with_hdd(64);
         assert_eq!(m.memory.read_u8(0x475).unwrap(), 1, "one fixed disk");
+    }
+
+    #[test]
+    fn mount_hdd_publishes_int41_fixed_disk_parameter_table() {
+        let mut m = machine_with_hdd(4032); // 4 cylinders, 16 heads, 63 spt
+        let off = read_u16(&mut m, 0x41 * 4);
+        let seg = read_u16(&mut m, 0x41 * 4 + 2);
+        let table = (u32::from(seg) << 4) + u32::from(off);
+        assert_eq!(table, BIOS_FIXED_DISK_PARAMETER_TABLE_ADDR);
+        assert_eq!(read_u16(&mut m, table), 4, "cylinder count");
+        assert_eq!(m.read_physical_u8(table + 2), 16, "head count");
+        assert_eq!(read_u16(&mut m, table + 3), 0, "no XT reduced current");
+        assert_eq!(read_u16(&mut m, table + 5), 0, "no write precomp");
+        assert_eq!(m.read_physical_u8(table + 8), 0x08, "more-than-8-heads bit");
+        assert_eq!(read_u16(&mut m, table + 12), 4, "landing zone");
+        assert_eq!(m.read_physical_u8(table + 14), 63, "sectors per track");
+
+        let bytes = m.eject_hdd().unwrap();
+        assert_eq!(bytes.len(), 4032 * 512);
+        assert_eq!(m.memory.read_u8(0x475).unwrap(), 0, "no fixed disks");
+        assert_eq!(read_u16(&mut m, 0x41 * 4), 0, "INT 41h offset cleared");
+        assert_eq!(read_u16(&mut m, 0x41 * 4 + 2), 0, "INT 41h segment cleared");
     }
 
     #[test]
