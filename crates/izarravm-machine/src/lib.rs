@@ -3103,8 +3103,16 @@ impl Machine {
     /// size on a machine with no probing path. Capped at 0xFFFF KiB (64 MiB) to
     /// fit the 16-bit AX return; other subfunctions report CF set (unsupported).
     fn handle_int15(&mut self) {
-        let ah = (self.cpu.registers.eax() as u16 >> 8) as u8;
-        let al = self.cpu.registers.eax() as u8;
+        let ax = self.cpu.registers.eax() as u16;
+        let ah = (ax >> 8) as u8;
+        let al = ax as u8;
+        if matches!(
+            ax,
+            0x1000..=0x1025 | 0x102B..=0x102D | 0xDE00..=0xDE12
+        ) {
+            self.int15_report_absent_window_manager();
+            return;
+        }
         match ah {
             // AH=00h-03h cassette services (PC/PCjr). This profile has no cassette.
             0x00..=0x03 => {
@@ -3148,6 +3156,10 @@ impl Machine {
             0x0F => {
                 self.set_eax_ah(0x00);
                 self.set_int_frame_carry(false);
+            }
+            // TopView/DESQview, PRINT.COM, and Convertible profile/power calls.
+            0x10..=0x12 | 0x20 | 0x40..=0x44 => {
+                self.int15_report_absent_window_manager();
             }
             // AH=21h POST error log.
             0x21 => self.int15_post_error_log(al),
@@ -3234,6 +3246,12 @@ impl Machine {
             }
             _ => self.set_int_frame_carry(true),
         }
+    }
+
+    fn int15_report_absent_window_manager(&mut self) {
+        self.set_bx(0x0000);
+        self.set_eax_ah(0x86);
+        self.set_int_frame_carry(true);
     }
 
     /// INT 15h AH=21h POST error log. AL=00 reads the resident log, AL=01 appends
@@ -12818,6 +12836,23 @@ mod tests {
             m.handle_int15();
 
             assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x86, "AX={ax:04X}");
+            assert_eq!(dos_int_flags(&m) & 1, 1, "AX={ax:04X} CF set");
+        }
+    }
+
+    #[test]
+    fn int15_reports_absent_window_manager_print_and_convertible_calls() {
+        for ax in [
+            0x1000u32, 0x1022, 0x102D, 0xDE00, 0xDE12, 0x1100, 0x1200, 0x2000, 0x4000, 0x4400,
+        ] {
+            let mut m = int15_machine(16);
+            prime_dos_int_frame(&mut m);
+            m.cpu.registers.set_eax(ax);
+            m.cpu.registers.set_ebx(0xFFFF);
+            m.handle_int15();
+
+            assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x86, "AX={ax:04X}");
+            assert_eq!(m.cpu.registers.ebx() as u16, 0x0000, "AX={ax:04X} BX");
             assert_eq!(dos_int_flags(&m) & 1, 1, "AX={ax:04X} CF set");
         }
     }
