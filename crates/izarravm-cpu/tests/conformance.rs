@@ -61,6 +61,17 @@ impl CpuBus for FlatBus {
         Ok(())
     }
 
+    fn prefetch_memory(&mut self, address: u32, out: &mut [u8]) -> Result<usize, BusError> {
+        for (offset, byte) in out.iter_mut().enumerate() {
+            *byte = self.read_u8(address.wrapping_add(offset as u32));
+        }
+        Ok(out.len())
+    }
+
+    fn charge_instruction_fetch(&mut self, _address: u32) -> Result<(), BusError> {
+        Ok(())
+    }
+
     fn read_io(&mut self, _port: u16, _width: BusWidth) -> Result<u32, BusError> {
         Ok(0)
     }

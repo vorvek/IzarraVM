@@ -182,6 +182,28 @@ impl BusCycle {
             states,
         }
     }
+
+    /// The clock cost of a cycle without allocating its per-state detail vector.
+    /// Matches `BusCycle::new(...).clocks` exactly: T1 + T2 plus the wait states.
+    pub const fn clocks_for(_width: BusWidth, wait_states: u8) -> u32 {
+        2 + wait_states as u32
+    }
+}
+
+/// How much of each bus cycle a `BusTrace` retains. Timing accounting is
+/// independent of this: `elapsed_clocks` always advances by every pushed
+/// cycle's clock count, so `Off` preserves the clock pacing the GUI and the
+/// device scheduler depend on while eliding the per-cycle allocation that the
+/// hot fetch/decode path would otherwise pay on every byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TracingMode {
+    /// Retain `BusCycle` detail (kind, address, states) up to the capacity.
+    #[default]
+    Full,
+    /// Record no per-cycle detail, but keep a count of recorded cycles.
+    Counts,
+    /// Record nothing but the running clock total.
+    Off,
 }
 
 /// Default cap on the number of retained bus cycles. A run of many hundred
@@ -202,6 +224,8 @@ pub struct BusTrace {
     cycles: VecDeque<BusCycle>,
     capacity: usize,
     elapsed_clocks: u64,
+    access_count: u64,
+    mode: TracingMode,
 }
 
 impl Default for BusTrace {
@@ -218,11 +242,19 @@ impl BusTrace {
             cycles: VecDeque::new(),
             capacity,
             elapsed_clocks: 0,
+            access_count: 0,
+            mode: TracingMode::Full,
         }
     }
 
     pub fn push(&mut self, cycle: BusCycle) {
         self.elapsed_clocks += u64::from(cycle.clocks);
+        if self.mode != TracingMode::Off {
+            self.access_count += 1;
+        }
+        if self.mode != TracingMode::Full {
+            return;
+        }
         if self.capacity == 0 {
             return;
         }
@@ -230,6 +262,39 @@ impl BusTrace {
             self.cycles.pop_front();
         }
         self.cycles.push_back(cycle);
+    }
+
+    /// Record a cycle by its timing parameters, allocating the per-cycle detail
+    /// only when the trace is in `Full` mode. In `Counts`/`Off` this bumps the
+    /// clock total (and the access count) without touching the heap, which is the
+    /// fast path the interpreter fetch loop takes.
+    pub fn record(&mut self, kind: BusAccessKind, address: u32, width: BusWidth, wait_states: u8) {
+        let clocks = BusCycle::clocks_for(width, wait_states);
+        self.elapsed_clocks += u64::from(clocks);
+        if self.mode != TracingMode::Off {
+            self.access_count += 1;
+        }
+        if self.mode == TracingMode::Full && self.capacity > 0 {
+            if self.cycles.len() == self.capacity {
+                self.cycles.pop_front();
+            }
+            self.cycles
+                .push_back(BusCycle::new(kind, address, width, wait_states));
+        }
+    }
+
+    /// The number of cycles recorded since the trace was last cleared, regardless
+    /// of mode. `elapsed_clocks` is the clock total; this is the access total.
+    pub fn access_count(&self) -> u64 {
+        self.access_count
+    }
+
+    pub fn tracing_mode(&self) -> TracingMode {
+        self.mode
+    }
+
+    pub fn set_tracing_mode(&mut self, mode: TracingMode) {
+        self.mode = mode;
     }
 
     /// The retained cycles, oldest first. Bounded to the configured capacity, so
@@ -252,6 +317,7 @@ impl BusTrace {
     pub fn clear(&mut self) {
         self.cycles.clear();
         self.elapsed_clocks = 0;
+        self.access_count = 0;
     }
 }
 
@@ -270,6 +336,14 @@ pub trait CpuBus {
         value: u32,
         kind: BusAccessKind,
     ) -> Result<(), BusError>;
+
+    /// Copy physical instruction bytes into `out` without charging bus clocks.
+    /// The CPU charges each consumed fetch byte separately so prefetch snapshots
+    /// do not advance guest-visible time for bytes that never execute.
+    fn prefetch_memory(&mut self, address: u32, out: &mut [u8]) -> Result<usize, BusError>;
+
+    /// Charge one byte of instruction-fetch bus time at `address`.
+    fn charge_instruction_fetch(&mut self, address: u32) -> Result<(), BusError>;
 
     fn read_io(&mut self, port: u16, width: BusWidth) -> Result<u32, BusError>;
 
@@ -391,6 +465,54 @@ mod tests {
         assert_eq!(trace.cycles().len(), 0);
         assert_eq!(trace.last(), None);
         assert_eq!(trace.elapsed_clocks(), 2);
+    }
+
+    #[test]
+    fn bus_trace_off_mode_totals_clocks_without_detail() {
+        let mut trace = BusTrace::with_capacity(DEFAULT_BUS_TRACE_CAPACITY);
+        trace.set_tracing_mode(TracingMode::Off);
+        for _ in 0..5 {
+            trace.record(
+                BusAccessKind::InstructionPrefetch,
+                0x1000,
+                BusWidth::Byte,
+                0,
+            );
+        }
+
+        assert_eq!(trace.cycles().len(), 0);
+        assert_eq!(trace.elapsed_clocks(), 10);
+        // Off records neither detail nor the access count.
+        assert_eq!(trace.access_count(), 0);
+    }
+
+    #[test]
+    fn bus_trace_counts_mode_totals_clocks_and_accesses_without_detail() {
+        let mut trace = BusTrace::with_capacity(DEFAULT_BUS_TRACE_CAPACITY);
+        trace.set_tracing_mode(TracingMode::Counts);
+        for _ in 0..3 {
+            trace.record(BusAccessKind::DataRead, 0x2000, BusWidth::Word, 1);
+        }
+
+        assert_eq!(trace.cycles().len(), 0);
+        assert_eq!(trace.elapsed_clocks(), 9); // (2 + 1) * 3
+        assert_eq!(trace.access_count(), 3);
+    }
+
+    #[test]
+    fn bus_trace_full_mode_record_matches_push() {
+        let mut a = BusTrace::with_capacity(4);
+        let mut b = BusTrace::with_capacity(4);
+        a.record(BusAccessKind::DataRead, 0x10, BusWidth::Dword, 2);
+        b.push(BusCycle::new(
+            BusAccessKind::DataRead,
+            0x10,
+            BusWidth::Dword,
+            2,
+        ));
+
+        assert_eq!(a.cycles(), b.cycles());
+        assert_eq!(a.elapsed_clocks(), b.elapsed_clocks());
     }
 
     #[test]

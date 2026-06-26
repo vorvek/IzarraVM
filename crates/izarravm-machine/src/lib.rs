@@ -7,7 +7,7 @@ pub use fat32_volume::{Fat32Volume, build_fat32};
 use izarravm_audio::{
     Ad1848, Ad1848Config, AdpcmConfig, OplChip, Resampler, SbDsp, SbMixer, YamahaAdpcmChip,
 };
-use izarravm_bus::{BusAccessKind, BusCycle, BusError, BusTrace, BusWidth, CpuBus, Memory};
+use izarravm_bus::{BusAccessKind, BusError, BusTrace, BusWidth, CpuBus, Memory, TracingMode};
 use izarravm_core::{
     ConfigSysMemory, Emm386Mode, GswMode, HardwareProfile, SoundBlasterConfig, VideoCard,
     WssConfig, YamahaAdpcmConfig,
@@ -1312,7 +1312,11 @@ impl Machine {
             adpcm_enabled,
             margo_ns: 0.0,
             vga_dots: 0.0,
-            trace: BusTrace::default(),
+            trace: {
+                let mut trace = BusTrace::default();
+                trace.set_tracing_mode(TracingMode::Off);
+                trace
+            },
             elapsed_clocks: 0,
             io_stall_clocks: 0,
             program_frames: Vec::new(),
@@ -2149,7 +2153,7 @@ impl Machine {
 
     pub fn read_physical_u8(&mut self, address: u32) -> u8 {
         let mut bus = self.make_bus();
-        bus.read_memory_bytes(address, 1).map(|b| b[0]).unwrap_or(0)
+        bus.read_phys_u8(address).unwrap_or(0)
     }
 
     pub fn read_physical_u16(&mut self, address: u32) -> u16 {
@@ -10419,6 +10423,14 @@ impl Machine {
         &self.trace
     }
 
+    pub fn set_bus_trace_detailed(&mut self, detailed: bool) {
+        self.trace.set_tracing_mode(if detailed {
+            TracingMode::Full
+        } else {
+            TracingMode::Off
+        });
+    }
+
     pub fn elapsed_clocks(&self) -> u64 {
         self.elapsed_clocks
     }
@@ -11451,12 +11463,8 @@ impl CpuBus for MachineBus<'_> {
         let bytes = width.bytes() as usize;
 
         if let Some(offset) = self.distira_lfb_offset(address, bytes) {
-            self.trace.push(BusCycle::new(
-                kind,
-                address,
-                width,
-                self.memory_wait_states(address),
-            ));
+            self.trace
+                .record(kind, address, width, self.memory_wait_states(address));
             let offset = if width == BusWidth::Byte {
                 offset
             } else {
@@ -11486,14 +11494,11 @@ impl CpuBus for MachineBus<'_> {
             return Ok(value);
         }
 
-        self.trace.push(BusCycle::new(
-            kind,
-            address,
-            width,
-            self.memory_wait_states(address),
-        ));
+        self.trace
+            .record(kind, address, width, self.memory_wait_states(address));
 
-        let data = self.read_memory_bytes(address, bytes)?;
+        let mut data = [0u8; 4];
+        self.read_phys(address, &mut data[..bytes])?;
         Ok(match width {
             BusWidth::Byte => u32::from(data[0]),
             BusWidth::Word => u32::from(u16::from_le_bytes([data[0], data[1]])),
@@ -11510,12 +11515,8 @@ impl CpuBus for MachineBus<'_> {
     ) -> Result<(), BusError> {
         let address = self.apply_a20(address);
         if let Some(offset) = self.distira_lfb_offset(address, width.bytes() as usize) {
-            self.trace.push(BusCycle::new(
-                kind,
-                address,
-                width,
-                self.memory_wait_states(address),
-            ));
+            self.trace
+                .record(kind, address, width, self.memory_wait_states(address));
             let offset = if width == BusWidth::Byte {
                 offset
             } else {
@@ -11541,12 +11542,8 @@ impl CpuBus for MachineBus<'_> {
             return Ok(());
         }
 
-        self.trace.push(BusCycle::new(
-            kind,
-            address,
-            width,
-            self.memory_wait_states(address),
-        ));
+        self.trace
+            .record(kind, address, width, self.memory_wait_states(address));
 
         if let Some(offset) = self.distira_cmdfifo_offset(address, width.bytes() as usize) {
             if width == BusWidth::Dword {
@@ -11579,14 +11576,41 @@ impl CpuBus for MachineBus<'_> {
         }
     }
 
+    fn prefetch_memory(&mut self, address: u32, out: &mut [u8]) -> Result<usize, BusError> {
+        let address = self.apply_a20(address);
+        let mut copied = 0;
+        for (offset, byte) in out.iter_mut().enumerate() {
+            match self.read_phys_u8(address + offset as u32) {
+                Ok(value) => {
+                    *byte = value;
+                    copied += 1;
+                }
+                Err(BusError::UnmappedMemory { .. }) if copied > 0 => break,
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(copied)
+    }
+
+    fn charge_instruction_fetch(&mut self, address: u32) -> Result<(), BusError> {
+        let address = self.apply_a20(address);
+        self.trace.record(
+            BusAccessKind::InstructionPrefetch,
+            address,
+            BusWidth::Byte,
+            self.memory_wait_states(address),
+        );
+        Ok(())
+    }
+
     fn read_io(&mut self, port: u16, width: BusWidth) -> Result<u32, BusError> {
         *self.io_touched = true;
-        self.trace.push(BusCycle::new(
+        self.trace.record(
             BusAccessKind::IoRead,
             u32::from(port),
             width,
             self.wait_states.io,
-        ));
+        );
 
         if let Some(value) = self.pci.read_io(port, width) {
             return Ok(value);
@@ -11717,12 +11741,12 @@ impl CpuBus for MachineBus<'_> {
 
     fn write_io(&mut self, port: u16, width: BusWidth, value: u32) -> Result<(), BusError> {
         *self.io_touched = true;
-        self.trace.push(BusCycle::new(
+        self.trace.record(
             BusAccessKind::IoWrite,
             u32::from(port),
             width,
             self.wait_states.io,
-        ));
+        );
 
         if self.pci.write_io(port, width, value) {
             return Ok(());
@@ -11845,12 +11869,12 @@ impl CpuBus for MachineBus<'_> {
     }
 
     fn interrupt_acknowledge(&mut self, vector: u8, _ax: u16) -> Result<(), BusError> {
-        self.trace.push(BusCycle::new(
+        self.trace.record(
             BusAccessKind::InterruptAcknowledge,
             u32::from(vector),
             BusWidth::Byte,
             self.wait_states.io,
-        ));
+        );
         // Record the software-INT vector for the deferred dispatch in the run loop,
         // which has the CPU registers and memory to service it. 0x10 is the BIOS
         // video service; 0x20/0x21 are the DOS kernel. Vector 0x10 reaches here
@@ -12832,9 +12856,21 @@ impl MachineBus<'_> {
         }
     }
 
-    fn read_memory_bytes(&mut self, address: u32, width: usize) -> Result<Vec<u8>, BusError> {
+    fn read_phys_u8(&mut self, address: u32) -> Result<u8, BusError> {
+        let mut byte = [0];
+        self.read_phys(address, &mut byte)?;
+        Ok(byte[0])
+    }
+
+    fn read_phys(&mut self, address: u32, out: &mut [u8]) -> Result<(), BusError> {
+        let width = out.len();
+        if width == 0 {
+            return Ok(());
+        }
+
         if let Some(offset) = rom_offset(address, width) {
-            return Ok(self.rom[offset..offset + width].to_vec());
+            out.copy_from_slice(&self.rom[offset..offset + width]);
+            return Ok(());
         }
 
         // A guest that moves the graphics aperture through GC06 (memory map select)
@@ -12842,14 +12878,13 @@ impl MachineBus<'_> {
         // and GC06 points at a moved window, route the access through the planar /
         // chain-4 datapath before the fixed text/CGA window decode below.
         if let Some(offset) = self.vga_gfx_offset(address, width) {
-            return Ok(match self.video.active_mode() {
-                VideoMode::Mode13h => (0..width)
-                    .map(|i| self.video.cpu_read_chain4(offset + i))
-                    .collect(),
-                _ => (0..width)
-                    .map(|i| self.video.cpu_read(offset + i))
-                    .collect(),
-            });
+            for (i, byte) in out.iter_mut().enumerate() {
+                *byte = match self.video.active_mode() {
+                    VideoMode::Mode13h => self.video.cpu_read_chain4(offset + i),
+                    _ => self.video.cpu_read(offset + i),
+                };
+            }
+            return Ok(());
         }
 
         if let Some(offset) = self.video_text_offset(address, width) {
@@ -12857,22 +12892,21 @@ impl MachineBus<'_> {
             // framebuffer; in text mode it is the character/attribute buffer.
             let cga_window = self.video.is_cga_personality();
             let cga_graphics = self.video.active_mode() == VideoMode::Cga;
-            return (0..width)
-                .map(|index| {
-                    let byte_offset = if cga_window {
-                        (offset + index) & (CGA_FB_SIZE - 1)
-                    } else {
-                        offset + index
-                    };
-                    if cga_graphics {
-                        Ok(self.video.cga_read(byte_offset))
-                    } else {
-                        self.video
-                            .read_u8(byte_offset)
-                            .map_err(|_| BusError::UnmappedMemory { address })
-                    }
-                })
-                .collect();
+            for (index, byte) in out.iter_mut().enumerate() {
+                let byte_offset = if cga_window {
+                    (offset + index) & (CGA_FB_SIZE - 1)
+                } else {
+                    offset + index
+                };
+                *byte = if cga_graphics {
+                    self.video.cga_read(byte_offset)
+                } else {
+                    self.video
+                        .read_u8(byte_offset)
+                        .map_err(|_| BusError::UnmappedMemory { address })?
+                };
+            }
+            return Ok(());
         }
 
         // The 64 KB A0000 window serves all three graphics modes. Unchained (mode
@@ -12883,14 +12917,16 @@ impl MachineBus<'_> {
             if let Some(offset) = vga_planar_offset(address, width) {
                 match self.video.active_mode() {
                     VideoMode::Planar | VideoMode::ModeX => {
-                        return Ok((0..width)
-                            .map(|i| self.video.cpu_read(offset + i))
-                            .collect());
+                        for (i, byte) in out.iter_mut().enumerate() {
+                            *byte = self.video.cpu_read(offset + i);
+                        }
+                        return Ok(());
                     }
                     VideoMode::Mode13h => {
-                        return Ok((0..width)
-                            .map(|i| self.video.cpu_read_chain4(offset + i))
-                            .collect());
+                        for (i, byte) in out.iter_mut().enumerate() {
+                            *byte = self.video.cpu_read_chain4(offset + i);
+                        }
+                        return Ok(());
                     }
                     // Text and CGA do not decode the A0000 window; fall through.
                     VideoMode::Text | VideoMode::Cga => {}
@@ -12899,30 +12935,35 @@ impl MachineBus<'_> {
         }
 
         if let Some(offset) = margo_lfb_offset(address, width) {
-            return Ok((0..width)
-                .map(|index| self.margo.read_vram_u8(offset + index))
-                .collect());
+            for (index, byte) in out.iter_mut().enumerate() {
+                *byte = self.margo.read_vram_u8(offset + index);
+            }
+            return Ok(());
         }
 
         if let Some(offset) = margo_mmio_offset(address, width) {
-            return Ok((0..width)
-                .map(|index| self.margo.read_mmio_u8(offset + index))
-                .collect());
+            for (index, byte) in out.iter_mut().enumerate() {
+                *byte = self.margo.read_mmio_u8(offset + index);
+            }
+            return Ok(());
         }
 
         if let Some(offset) = self.distira_lfb_offset(address, width) {
             if width == 1 {
-                return Ok(vec![0xff]);
+                out[0] = 0xff;
+                return Ok(());
             }
-            return Ok((0..width)
-                .map(|index| self.distira.read_lfb_u8(offset + index))
-                .collect());
+            for (index, byte) in out.iter_mut().enumerate() {
+                *byte = self.distira.read_lfb_u8(offset + index);
+            }
+            return Ok(());
         }
 
         if let Some(offset) = self.distira_mmio_offset(address, width) {
-            return Ok((0..width)
-                .map(|index| self.distira.read_mmio_u8(offset + index))
-                .collect());
+            for (index, byte) in out.iter_mut().enumerate() {
+                *byte = self.distira.read_mmio_u8(offset + index);
+            }
+            return Ok(());
         }
 
         // EMS page-frame aliasing: when expanded memory is provisioned and the
@@ -12931,21 +12972,19 @@ impl MachineBus<'_> {
         if let Some(ems) = self.ems {
             let last = address + (width as u32).saturating_sub(1);
             if ems.in_frame(address) || ems.in_frame(last) {
-                return (0..width)
-                    .map(|index| {
-                        let addr = address + index as u32;
-                        let backing = ems.resolve(addr).unwrap_or(addr) as usize;
-                        self.memory.read_u8(backing)
-                    })
-                    .collect();
+                for (index, byte) in out.iter_mut().enumerate() {
+                    let addr = address + index as u32;
+                    let backing = ems.resolve(addr).unwrap_or(addr) as usize;
+                    *byte = self.memory.read_u8(backing)?;
+                }
+                return Ok(());
             }
         }
 
         let end = address as usize + width;
         if end <= self.memory.len() {
-            return (0..width)
-                .map(|index| self.memory.read_u8(address as usize + index))
-                .collect();
+            out.copy_from_slice(&self.memory.as_slice()[address as usize..end]);
+            return Ok(());
         }
 
         Err(BusError::UnmappedMemory { address })
@@ -13415,11 +13454,13 @@ mod tests {
     }
 
     fn test_machine() -> Machine {
-        Machine::new(
+        let mut machine = Machine::new(
             MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
             I386DX25_TEST_ROM,
         )
-        .unwrap()
+        .unwrap();
+        machine.set_bus_trace_detailed(true);
+        machine
     }
 
     fn int15_machine(mem_mib: u16) -> Machine {
@@ -17504,6 +17545,7 @@ mod tests {
         ]);
         let mut machine =
             Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        machine.set_bus_trace_detailed(true);
 
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
 
@@ -17629,6 +17671,7 @@ mod tests {
             izarravm_firmware::X86_BOOT_TEST_IMAGE,
         )
         .unwrap();
+        machine.set_bus_trace_detailed(true);
 
         let reason = machine.run_cycles(16).unwrap();
 

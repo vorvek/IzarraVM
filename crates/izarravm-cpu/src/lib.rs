@@ -470,6 +470,8 @@ impl CpuLevel {
 /// collide on a slot; a 386/486 had 32, this keeps a few more so a fetch/execute
 /// loop's interleaved code and data pages do not evict each other every step.
 const TLB_ENTRIES: usize = 64;
+const PREFETCH_WINDOW_BYTES: usize = 32;
+const TRACKED_WRITE_PAGES: usize = 8;
 
 #[derive(Clone, Copy)]
 struct TlbEntry {
@@ -563,6 +565,83 @@ impl std::fmt::Debug for Tlb {
     }
 }
 
+#[derive(Clone, Default)]
+struct CodePageCache {
+    valid: bool,
+    cs: SegmentRegister,
+    linear_page: u32,
+    physical_page: u32,
+}
+
+impl PartialEq for CodePageCache {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for CodePageCache {}
+
+impl std::fmt::Debug for CodePageCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CodePageCache")
+    }
+}
+
+#[derive(Clone)]
+struct PrefetchWindow {
+    bytes: [u8; PREFETCH_WINDOW_BYTES],
+    cs: SegmentRegister,
+    linear_base: u32,
+    physical_base: u32,
+    len: u8,
+}
+
+impl Default for PrefetchWindow {
+    fn default() -> Self {
+        Self {
+            bytes: [0; PREFETCH_WINDOW_BYTES],
+            cs: SegmentRegister::default(),
+            linear_base: 0,
+            physical_base: 0,
+            len: 0,
+        }
+    }
+}
+
+impl PrefetchWindow {
+    fn invalidate(&mut self) {
+        self.len = 0;
+    }
+
+    fn get(&self, cs: SegmentRegister, linear: u32) -> Option<(u8, u32)> {
+        if self.cs != cs {
+            return None;
+        }
+        let offset = linear.checked_sub(self.linear_base)? as usize;
+        if offset < usize::from(self.len) {
+            Some((self.bytes[offset], self.physical_base + offset as u32))
+        } else {
+            None
+        }
+    }
+
+    fn physical_page(&self) -> Option<u32> {
+        (self.len != 0).then_some(self.physical_base >> 12)
+    }
+}
+
+impl PartialEq for PrefetchWindow {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for PrefetchWindow {}
+
+impl std::fmt::Debug for PrefetchWindow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PrefetchWindow {{ {} bytes }}", self.len)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Cpu386 {
     pub registers: Registers,
@@ -589,6 +668,10 @@ pub struct Cpu386 {
     // extenders, Win9x) does not re-walk the two-level page table on every access.
     // Flushed on CR0/CR3 writes, task switch, and INVLPG.
     tlb: Tlb,
+    code_page: CodePageCache,
+    prefetch: PrefetchWindow,
+    written_pages: [Option<u32>; TRACKED_WRITE_PAGES],
+    written_pages_overflow: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -696,6 +779,47 @@ type ExecResult<T> = Result<T, InternalFault>;
 impl Cpu386 {
     pub fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    fn invalidate_code_caches(&mut self) {
+        self.code_page.valid = false;
+        self.prefetch.invalidate();
+    }
+
+    fn flush_tlb_and_code_caches(&mut self) {
+        self.tlb.flush();
+        self.invalidate_code_caches();
+    }
+
+    fn set_eip(&mut self, eip: u32) {
+        self.registers.eip = eip;
+        self.prefetch.invalidate();
+    }
+
+    fn record_write_page(&mut self, physical: u32) {
+        let page = physical >> 12;
+        if self.written_pages.contains(&Some(page)) {
+            return;
+        }
+        if let Some(slot) = self.written_pages.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(page);
+        } else {
+            self.written_pages_overflow = true;
+        }
+    }
+
+    fn begin_instruction(&mut self) {
+        // A 486 prefetch queue is a snapshot: writes to already fetched bytes are
+        // not observed until control flow or the next refill invalidates the queue.
+        if self.written_pages_overflow {
+            self.prefetch.invalidate();
+        } else if let Some(code_page) = self.prefetch.physical_page() {
+            if self.written_pages.contains(&Some(code_page)) {
+                self.prefetch.invalidate();
+            }
+        }
+        self.written_pages = [None; TRACKED_WRITE_PAGES];
+        self.written_pages_overflow = false;
     }
 
     pub fn is_protected_mode(&self) -> bool {
@@ -823,13 +947,14 @@ impl Cpu386 {
             }
         }
 
+        self.begin_instruction();
         let start_eip = self.registers.eip;
         let start_cs = self.registers.cs().selector;
         let result = self.execute_instruction(bus);
         let outcome = match result {
             Ok(outcome) => outcome,
             Err(InternalFault::Exception { vector, error_code }) => {
-                self.registers.eip = start_eip;
+                self.set_eip(start_eip);
                 if self.registers.cs().selector != start_cs {
                     self.load_segment_real(SegmentIndex::Cs, start_cs);
                 }
@@ -1503,13 +1628,13 @@ impl Cpu386 {
                 // address is popped; the operand size only selects the offset pop width.
                 let release = self.fetch_u16(bus)?;
                 let target = self.pop(bus, operand_size)?;
-                self.registers.eip = target & operand_size.mask();
+                self.set_eip(target & operand_size.mask());
                 self.release_stack(release);
                 Ok(clocks(10))
             }
             0xc3 => {
                 let target = self.pop(bus, operand_size)?;
-                self.registers.eip = target & operand_size.mask();
+                self.set_eip(target & operand_size.mask());
                 Ok(clocks(10))
             }
             0xca => {
@@ -1930,12 +2055,12 @@ impl Cpu386 {
                     2 => {
                         let target = self.read_operand_sized(bus, operand, operand_size)?;
                         self.push(bus, self.registers.eip, operand_size)?;
-                        self.registers.eip = target & operand_size.mask();
+                        self.set_eip(target & operand_size.mask());
                         Ok(clocks(7))
                     }
                     4 => {
                         let target = self.read_operand_sized(bus, operand, operand_size)?;
-                        self.registers.eip = target & operand_size.mask();
+                        self.set_eip(target & operand_size.mask());
                         Ok(clocks(7))
                     }
                     6 => {
@@ -2334,12 +2459,12 @@ impl Cpu386 {
                     // change translations, so flush the TLB. CR2/CR4 do not.
                     0 => {
                         self.control.cr0 = value;
-                        self.tlb.flush();
+                        self.flush_tlb_and_code_caches();
                     }
                     2 => self.control.cr2 = value,
                     3 => {
                         self.control.cr3 = value & 0xffff_f000;
-                        self.tlb.flush();
+                        self.flush_tlb_and_code_caches();
                     }
                     4 => self.control.cr4 = value,
                     _ => {}
@@ -2898,14 +3023,81 @@ impl Cpu386 {
         }
     }
 
+    fn code_linear_for_offset(&self, offset: u32, width: u32) -> ExecResult<u32> {
+        let descriptor = self.registers.cs();
+        if descriptor.base == 0 && descriptor.limit == u32::MAX {
+            return Ok(offset);
+        }
+        if offset > descriptor.limit
+            || offset.saturating_add(width.saturating_sub(1)) > descriptor.limit
+        {
+            return Err(CpuError::SegmentLimit {
+                segment: SegmentIndex::Cs,
+                offset,
+                width,
+            }
+            .into());
+        }
+        Ok(descriptor.base.wrapping_add(offset))
+    }
+
+    fn translate_code_linear<B: CpuBus>(&mut self, bus: &mut B, linear: u32) -> ExecResult<u32> {
+        let cs = self.registers.cs();
+        let page = linear >> 12;
+        if self.code_page.valid && self.code_page.cs == cs && self.code_page.linear_page == page {
+            return Ok(self.code_page.physical_page | (linear & 0x0fff));
+        }
+        let physical = self.translate_linear(bus, linear, false)?;
+        self.code_page = CodePageCache {
+            valid: true,
+            cs,
+            linear_page: page,
+            physical_page: physical & 0xffff_f000,
+        };
+        Ok(physical)
+    }
+
+    fn refill_prefetch<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        offset: u32,
+        linear: u32,
+    ) -> ExecResult<()> {
+        let cs = self.registers.cs();
+        let physical = self.translate_code_linear(bus, linear)?;
+        let page_remaining = 0x1000 - (linear as usize & 0x0fff);
+        let linear_remaining = (u32::MAX - linear) as usize + 1;
+        let segment_remaining = if cs.base == 0 && cs.limit == u32::MAX {
+            PREFETCH_WINDOW_BYTES
+        } else {
+            (cs.limit - offset + 1) as usize
+        };
+        let mut len = PREFETCH_WINDOW_BYTES
+            .min(page_remaining)
+            .min(linear_remaining)
+            .min(segment_remaining);
+        let mut bytes = [0u8; PREFETCH_WINDOW_BYTES];
+        len = bus.prefetch_memory(physical, &mut bytes[..len])?;
+        if len == 0 {
+            return Err(BusError::UnmappedMemory { address: physical }.into());
+        }
+        self.prefetch.bytes[..len].copy_from_slice(&bytes[..len]);
+        self.prefetch.cs = cs;
+        self.prefetch.linear_base = linear;
+        self.prefetch.physical_base = physical;
+        self.prefetch.len = len as u8;
+        Ok(())
+    }
+
     fn fetch_u8<B: CpuBus>(&mut self, bus: &mut B) -> ExecResult<u8> {
         let offset = self.registers.eip;
-        let value = self.read_memory_u8(
-            bus,
-            SegmentIndex::Cs,
-            offset,
-            BusAccessKind::InstructionPrefetch,
-        )?;
+        let cs = self.registers.cs();
+        let linear = self.code_linear_for_offset(offset, 1)?;
+        if self.prefetch.get(cs, linear).is_none() {
+            self.refill_prefetch(bus, offset, linear)?;
+        }
+        let (value, physical) = self.prefetch.get(cs, linear).expect("prefetch refilled");
+        bus.charge_instruction_fetch(physical)?;
         self.registers.eip = self.registers.eip.wrapping_add(1);
         Ok(value)
     }
@@ -3316,18 +3508,21 @@ impl Cpu386 {
         write: bool,
     ) -> ExecResult<u32> {
         let descriptor = self.registers.segment(segment);
-        if offset > descriptor.limit
-            || offset.saturating_add(width.saturating_sub(1)) > descriptor.limit
-        {
-            return Err(CpuError::SegmentLimit {
-                segment,
-                offset,
-                width,
+        let linear = if descriptor.base == 0 && descriptor.limit == u32::MAX {
+            offset
+        } else {
+            if offset > descriptor.limit
+                || offset.saturating_add(width.saturating_sub(1)) > descriptor.limit
+            {
+                return Err(CpuError::SegmentLimit {
+                    segment,
+                    offset,
+                    width,
+                }
+                .into());
             }
-            .into());
-        }
-
-        let linear = descriptor.base.wrapping_add(offset);
+            descriptor.base.wrapping_add(offset)
+        };
         self.translate_linear(bus, linear, write)
     }
 
@@ -3338,6 +3533,9 @@ impl Cpu386 {
         write: bool,
     ) -> ExecResult<u32> {
         if !self.is_paging_enabled() {
+            if write {
+                self.record_write_page(linear);
+            }
             return Ok(linear);
         }
 
@@ -3369,7 +3567,11 @@ impl Cpu386 {
             }
             // Serve the hit for a read, or a write to an already-dirty page.
             if !write || e.dirty {
-                return Ok(e.phys | (linear & 0x0000_0fff));
+                let physical = e.phys | (linear & 0x0000_0fff);
+                if write {
+                    self.record_write_page(physical);
+                }
+                return Ok(physical);
             }
         }
 
@@ -3457,7 +3659,11 @@ impl Cpu386 {
             pte & 0x40 != 0,
         );
 
-        Ok((pte & 0xffff_f000) | (linear & 0x0000_0fff))
+        let physical = (pte & 0xffff_f000) | (linear & 0x0000_0fff);
+        if write {
+            self.record_write_page(physical);
+        }
+        Ok(physical)
     }
 
     fn push<B: CpuBus>(
@@ -3762,7 +3968,7 @@ impl Cpu386 {
         let cs =
             bus.read_memory(vector_address + 2, BusWidth::Word, BusAccessKind::DataRead)? as u16;
         self.load_segment_real(SegmentIndex::Cs, cs);
-        self.registers.eip = u32::from(ip);
+        self.set_eip(u32::from(ip));
         Ok(())
     }
 
@@ -3811,7 +4017,7 @@ impl Cpu386 {
         }
         self.set_flag(FLAG_IF | FLAG_TF, false);
         self.load_segment(bus, SegmentIndex::Cs, selector)?;
-        self.registers.eip = offset;
+        self.set_eip(offset);
         Ok(())
     }
 
@@ -3839,7 +4045,7 @@ impl Cpu386 {
                 let cs = self.pop(bus, OperandSize::Word)? as u16;
                 let flags = self.pop(bus, OperandSize::Word)?;
                 self.load_segment(bus, SegmentIndex::Cs, cs)?;
-                self.registers.eip = ip & 0xffff;
+                self.set_eip(ip & 0xffff);
                 self.load_flags(flags, OperandSize::Word);
             }
             OperandSize::Dword => {
@@ -3847,7 +4053,7 @@ impl Cpu386 {
                 let cs = self.pop(bus, OperandSize::Dword)? as u16;
                 let flags = self.pop(bus, OperandSize::Dword)?;
                 self.load_segment(bus, SegmentIndex::Cs, cs)?;
-                self.registers.eip = eip;
+                self.set_eip(eip);
                 self.load_flags(flags, OperandSize::Dword);
             }
         }
@@ -3875,7 +4081,7 @@ impl Cpu386 {
         self.push(bus, u32::from(self.registers.cs().selector), operand_size)?;
         self.push(bus, self.registers.eip, operand_size)?;
         self.load_segment(bus, SegmentIndex::Cs, selector)?;
-        self.registers.eip = offset & operand_size.mask();
+        self.set_eip(offset & operand_size.mask());
         Ok(())
     }
 
@@ -3885,7 +4091,7 @@ impl Cpu386 {
         let offset = self.pop(bus, operand_size)?;
         let selector = self.pop(bus, operand_size)? as u16;
         self.load_segment(bus, SegmentIndex::Cs, selector)?;
-        self.registers.eip = offset & operand_size.mask();
+        self.set_eip(offset & operand_size.mask());
         Ok(())
     }
 
@@ -3917,7 +4123,7 @@ impl Cpu386 {
             }
         }
         self.load_segment(bus, SegmentIndex::Cs, selector)?;
-        self.registers.eip = offset & operand_size.mask();
+        self.set_eip(offset & operand_size.mask());
         Ok(())
     }
 
@@ -4059,7 +4265,8 @@ impl Cpu386 {
             target.selector = (target_selector & !3) | u16::from(cpl);
         }
         self.registers.set_segment(SegmentIndex::Cs, target);
-        self.registers.eip = gate_offset & op.mask();
+        self.invalidate_code_caches();
+        self.set_eip(gate_offset & op.mask());
         Ok(())
     }
 
@@ -4109,7 +4316,8 @@ impl Cpu386 {
         let mut target = self.descriptor_to_segment(target_selector, tl, th);
         target.selector = (target_selector & !3) | u16::from(cpl);
         self.registers.set_segment(SegmentIndex::Cs, target);
-        self.registers.eip = gate_offset & op.mask();
+        self.invalidate_code_caches();
+        self.set_eip(gate_offset & op.mask());
         Ok(())
     }
 
@@ -4219,7 +4427,7 @@ impl Cpu386 {
                 bus.read_memory(base + 28, BusWidth::Dword, BusAccessKind::DataRead)?;
             // The incoming task reloads CR3, so its page mappings replace the old
             // task's: drop the previous task's cached translations.
-            self.tlb.flush();
+            self.flush_tlb_and_code_caches();
         }
         // The LDTR is loaded first so segment loads that reference the LDT resolve.
         let ldtr = bus.read_memory(base + 96, BusWidth::Word, BusAccessKind::DataRead)? as u16;
@@ -4232,7 +4440,7 @@ impl Cpu386 {
             self.write_gpr32(i as u8, value);
         }
         self.registers.eflags = eflags | 0x2;
-        self.registers.eip = eip;
+        self.set_eip(eip);
         for (k, segment) in TASK_SEGMENTS.iter().enumerate() {
             let selector = bus.read_memory(
                 base + 72 + k as u32 * 4,
@@ -4282,7 +4490,7 @@ impl Cpu386 {
     }
 
     fn relative_jump(&mut self, relative: i32, operand_size: OperandSize) {
-        self.registers.eip = self.registers.eip.wrapping_add(relative as u32) & operand_size.mask();
+        self.set_eip(self.registers.eip.wrapping_add(relative as u32) & operand_size.mask());
     }
 
     fn load_segment<B: CpuBus>(
@@ -4297,6 +4505,9 @@ impl Cpu386 {
         } else if self.is_protected_mode() {
             let register = self.load_protected_segment(bus, selector)?;
             self.registers.set_segment(segment, register);
+            if segment == SegmentIndex::Cs {
+                self.invalidate_code_caches();
+            }
         } else {
             self.load_segment_real(segment, selector);
         }
@@ -4306,6 +4517,9 @@ impl Cpu386 {
     fn load_segment_real(&mut self, segment: SegmentIndex, selector: u16) {
         self.registers
             .set_segment(segment, SegmentRegister::real(selector));
+        if segment == SegmentIndex::Cs {
+            self.invalidate_code_caches();
+        }
     }
 
     fn load_protected_segment<B: CpuBus>(
@@ -6379,13 +6593,14 @@ impl Cpu386 {
         // EIP already points past SYSCALL, so it is the return address.
         let return_eip = self.registers.eip;
         self.write_gpr32(1, return_eip); // ECX
-        self.registers.eip = star as u32; // STAR[31:0]
+        self.set_eip(star as u32); // STAR[31:0]
         self.set_flag(FLAG_IF, false);
         self.set_flag(FLAG_VM, false);
         // STAR[47:32] is the CS/SS selector base; force the CS RPL to 0 so CPL reads 0.
         let cs_sel = ((star >> 32) as u16) & 0xfffc;
         self.registers
             .set_segment(SegmentIndex::Cs, SegmentRegister::flat(cs_sel, 0x9b));
+        self.invalidate_code_caches();
         self.registers.set_segment(
             SegmentIndex::Ss,
             SegmentRegister::flat(cs_sel.wrapping_add(8), 0x93),
@@ -6410,13 +6625,14 @@ impl Cpu386 {
             });
         }
         let star = self.msr.star;
-        self.registers.eip = self.read_gpr32(1); // ECX -> EIP
+        self.set_eip(self.read_gpr32(1)); // ECX -> EIP
         self.set_flag(FLAG_IF, true);
         let base = (star >> 32) as u16; // STAR[47:32]
         let cs_sel = (base & 0xfffc) | 3; // CPL 3
         let ss_sel = (base.wrapping_add(16) & 0xfffc) | 3; // SS = base + 16, RPL 3
         self.registers
             .set_segment(SegmentIndex::Cs, SegmentRegister::flat(cs_sel, 0xfb));
+        self.invalidate_code_caches();
         self.registers
             .set_segment(SegmentIndex::Ss, SegmentRegister::flat(ss_sel, 0xf3));
         Ok(clocks(10))
@@ -6514,7 +6730,10 @@ impl Cpu386 {
                 if msw & CR0_PE != 0 {
                     cr0 |= CR0_PE;
                 }
-                self.control.cr0 = cr0;
+                if self.control.cr0 != cr0 {
+                    self.control.cr0 = cr0;
+                    self.flush_tlb_and_code_caches();
+                }
                 Ok(clocks(3))
             }
             reg => {
@@ -6573,7 +6792,7 @@ impl Cpu386 {
                                 error_code: None,
                             });
                         }
-                        self.tlb.flush();
+                        self.flush_tlb_and_code_caches();
                         Ok(clocks(12))
                     }
                     _ => Err(CpuError::UnsupportedGroupOpcode {
@@ -6884,18 +7103,24 @@ mod tests {
             kind: BusAccessKind,
         ) -> Result<u32, BusError> {
             self.trace.push(BusCycle::new(kind, address, width, 0));
-            let address = address as usize;
+            let start = address as usize;
+            let end = start
+                .checked_add(width.bytes() as usize)
+                .ok_or(BusError::UnmappedMemory { address })?;
+            if end > self.memory.len() {
+                return Err(BusError::UnmappedMemory { address });
+            }
             Ok(match width {
-                BusWidth::Byte => u32::from(self.memory[address]),
+                BusWidth::Byte => u32::from(self.memory[start]),
                 BusWidth::Word => u32::from(u16::from_le_bytes([
-                    self.memory[address],
-                    self.memory[address + 1],
+                    self.memory[start],
+                    self.memory[start + 1],
                 ])),
                 BusWidth::Dword => u32::from_le_bytes([
-                    self.memory[address],
-                    self.memory[address + 1],
-                    self.memory[address + 2],
-                    self.memory[address + 3],
+                    self.memory[start],
+                    self.memory[start + 1],
+                    self.memory[start + 2],
+                    self.memory[start + 3],
                 ]),
             })
         }
@@ -6918,6 +7143,26 @@ mod tests {
                     self.memory[address..address + 4].copy_from_slice(&value.to_le_bytes())
                 }
             }
+            Ok(())
+        }
+
+        fn prefetch_memory(&mut self, address: u32, out: &mut [u8]) -> Result<usize, BusError> {
+            let start = address as usize;
+            if start >= self.memory.len() {
+                return Err(BusError::UnmappedMemory { address });
+            }
+            let len = out.len().min(self.memory.len() - start);
+            out[..len].copy_from_slice(&self.memory[start..start + len]);
+            Ok(len)
+        }
+
+        fn charge_instruction_fetch(&mut self, address: u32) -> Result<(), BusError> {
+            self.trace.push(BusCycle::new(
+                BusAccessKind::InstructionPrefetch,
+                address,
+                BusWidth::Byte,
+                0,
+            ));
             Ok(())
         }
 
@@ -12645,6 +12890,27 @@ mod tests {
         cpu.load_segment_real(SegmentIndex::Ss, 0);
         cpu.registers.eip = 0;
         (cpu, memory)
+    }
+
+    #[test]
+    fn self_modified_opcode_beyond_prefetch_window_is_seen() {
+        let mut code = vec![0x90; 0x40]; // nop sled
+        code[0..5].copy_from_slice(&[0xc6, 0x06, 0x21, 0x00, 0xf4]); // mov byte [0021h],hlt
+        code[0x21] = 0x90; // replaced before execution reaches it
+        code[0x22..0x24].copy_from_slice(&[0xeb, 0xfe]); // stale path would loop here
+        let (mut cpu, memory) = real_mode_cpu(&code, 0x40);
+        let mut bus = TestBus::with_memory(memory);
+
+        let mut halted = false;
+        for _ in 0..40 {
+            halted = cpu.cycle(&mut bus).unwrap().halted;
+            if halted {
+                break;
+            }
+        }
+
+        assert!(halted, "modified HLT at 0021h must execute");
+        assert_eq!(cpu.registers.eip, 0x22);
     }
 
     #[test]
