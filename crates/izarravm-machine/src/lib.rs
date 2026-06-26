@@ -2827,6 +2827,13 @@ impl Machine {
                 self.set_dx((ext_kib >> 16) as u16);
                 self.set_int_frame_carry(false);
             }
+            // AH=0Fh format-unit periodic interrupt: continue the ESDI format.
+            0x0F => {
+                self.set_eax_ah(0x00);
+                self.set_int_frame_carry(false);
+            }
+            // AH=21h POST error log.
+            0x21 => self.int15_post_error_log(al),
             // AX=E801h/E820h/E881h memory-size and memory-map queries (AH=E8h group).
             0xE8 => match self.cpu.registers.eax() as u8 {
                 0x01 => self.int15_e801(false),
@@ -2870,6 +2877,18 @@ impl Machine {
             // installed the BIOS returns "no wait performed" with CF clear, rather than
             // the unsupported-function carry the catch-all would set.
             0x90 | 0x91 => self.set_int_frame_carry(false),
+            // AH=83h event wait, AH=84h joystick, AH=85h SysReq hook, AH=89h
+            // protected-mode switch.
+            0x83 => self.int15_event_wait(al),
+            0x84 => self.int15_joystick(),
+            0x85 => {
+                self.set_eax_ah(0x00);
+                self.set_int_frame_carry(false);
+            }
+            0x89 => {
+                self.set_eax_ah(0x86);
+                self.set_int_frame_carry(true);
+            }
             // AH=C0h get system-configuration table: ES:BX -> the table seeded at POST.
             0xC0 => {
                 let seg = (BIOS_CONFIG_TABLE_ADDR >> 4) as u16;
@@ -2892,6 +2911,98 @@ impl Machine {
             // subfunction.
             0xC2 => self.int15_c2_pointing_device(al),
             _ => self.set_int_frame_carry(true),
+        }
+    }
+
+    /// INT 15h AH=21h POST error log. AL=00 reads the resident log, AL=01 appends
+    /// one device/error pair (BH=device, BL=error).
+    fn int15_post_error_log(&mut self, al: u8) {
+        match al {
+            0x00 => {
+                let count = self.read_physical_u8(BIOS_POST_ERROR_LOG_COUNT_ADDR);
+                self.set_bx(u16::from(count.min(BIOS_POST_ERROR_LOG_MAX)));
+                let seg = (BIOS_POST_ERROR_LOG_ADDR >> 4) as u16;
+                let off = (BIOS_POST_ERROR_LOG_ADDR & 0xf) as u16;
+                self.cpu
+                    .registers
+                    .set_segment(SegmentIndex::Es, SegmentRegister::real(seg));
+                let edi = (self.cpu.registers.edi() & !0xFFFF) | u32::from(off);
+                self.cpu.registers.set_edi(edi);
+                self.set_eax_ah(0x00);
+                self.set_int_frame_carry(false);
+            }
+            0x01 => {
+                let count = self.read_physical_u8(BIOS_POST_ERROR_LOG_COUNT_ADDR);
+                if count >= BIOS_POST_ERROR_LOG_MAX {
+                    self.set_eax_ah(0x01);
+                    self.set_int_frame_carry(true);
+                    return;
+                }
+                let bx = self.cpu.registers.ebx() as u16;
+                let device = (bx >> 8) as u8;
+                let error = bx as u8;
+                let addr = BIOS_POST_ERROR_LOG_ADDR + u32::from(count) * 2;
+                let _ = self.memory.write_u8(addr as usize, error);
+                let _ = self.memory.write_u8(addr as usize + 1, device);
+                let _ = self
+                    .memory
+                    .write_u8(BIOS_POST_ERROR_LOG_COUNT_ADDR as usize, count + 1);
+                self.set_eax_ah(0x00);
+                self.set_int_frame_carry(false);
+            }
+            _ => {
+                self.set_eax_ah(0x02);
+                self.set_int_frame_carry(true);
+            }
+        }
+    }
+
+    /// INT 15h AH=83h event wait. The machine has no async RTC wait queue yet, so
+    /// it advances the guest clock, sets the completion byte, and returns.
+    fn int15_event_wait(&mut self, al: u8) {
+        match al {
+            0x00 => {
+                let micros = (u64::from(self.cpu.registers.ecx() as u16) << 16)
+                    | u64::from(self.cpu.registers.edx() as u16);
+                let es = self.cpu.registers.segment(SegmentIndex::Es).base;
+                let bx = self.cpu.registers.ebx() as u16;
+                let addr = es.wrapping_add(u32::from(bx));
+                self.stall_for(micros as f64 / 1_000_000.0);
+                let byte = self.read_physical_u8(addr);
+                let _ = self.memory.write_u8(addr as usize, byte | 0x80);
+                self.set_eax_ah(0x00);
+                self.set_int_frame_carry(false);
+            }
+            0x01 => {
+                self.set_eax_ah(0x00);
+                self.set_int_frame_carry(false);
+            }
+            _ => {
+                self.set_eax_ah(0x86);
+                self.set_int_frame_carry(true);
+            }
+        }
+    }
+
+    /// INT 15h AH=84h joystick BIOS support. No game port is installed, which the
+    /// BIOS reports as open switches and zeroed position counters.
+    fn int15_joystick(&mut self) {
+        match self.cpu.registers.edx() as u16 {
+            0x0000 => {
+                self.set_ax(0x0000);
+                self.set_int_frame_carry(false);
+            }
+            0x0001 => {
+                self.set_ax(0x0000);
+                self.set_bx(0x0000);
+                self.set_cx(0x0000);
+                self.set_dx(0x0000);
+                self.set_int_frame_carry(false);
+            }
+            _ => {
+                self.set_eax_ah(0x80);
+                self.set_int_frame_carry(true);
+            }
         }
     }
 
@@ -3126,6 +3237,13 @@ impl Machine {
                 self.set_dx(dx);
                 self.set_int_frame_carry(false);
             }
+            // AH=09h read RTC alarm time and status. No alarm source is armed, so
+            // return zero time with DL=00h (alarm not enabled).
+            0x09 => {
+                self.set_cx(0x0000);
+                self.set_dx(0x0000);
+                self.set_int_frame_carry(false);
+            }
             // AH=03h set RTC time: CH/CL/DH are BCD hours/minutes/seconds (DL = DST flag,
             // not modeled). Re-seed the clock keeping the current date.
             0x03 => {
@@ -3176,8 +3294,8 @@ impl Machine {
             // AH=08h/0Ch set power-on alarm/date, AH=0Dh reset, AH=0Fh initialize RTC: all
             // documented as succeeding, and the host-driven clock makes them no-ops.
             // Limit: power-management and alarm hardware are not modeled; these return
-            // success without persisting state. Read-back alarm calls (AH=09h/0Eh) keep the
-            // default carry since there is no alarm to report.
+            // success without persisting state. AH=0Eh keeps the default carry since no
+            // power-on alarm date is stored.
             0x06 | 0x07 | 0x08 | 0x0C | 0x0D | 0x0F => self.set_int_frame_carry(false),
             _ => self.set_int_frame_carry(true),
         }
@@ -10438,6 +10556,9 @@ const BIOS_RTC_ISR_ADDRESS: usize = 0x0610;
 /// IF makes the HLT a genuine stop (the run loop will not wake a CPU whose
 /// interrupts are masked), matching a real BIOS that gives up and halts.
 const BIOS_HALT_STUB_ADDRESS: usize = 0x0620;
+/// RAM address of the default IRQ12/IRQ13/IRQ14 slave-PIC handler. It sends EOIs
+/// to both PICs and returns, which is enough for an unclaimed slave interrupt.
+const BIOS_SLAVE_IRQ_ISR_ADDRESS: usize = 0x0622;
 
 /// RAM address of the INT 24h host-trampoline completion stub. A live guest INT
 /// 24h handler IRETs here, executes HLT to stop the instruction batch, then the
@@ -10553,6 +10674,11 @@ const BIOS_CONFIG_TABLE_ADDR: u32 = 0x9FC10;
 const BIOS_FIXED_DISK_PARAMETER_TABLE_ADDR: u32 = 0x9FC20;
 /// Default AT diskette parameter table, published through IVT[1Eh].
 const BIOS_DISKETTE_PARAMETER_TABLE_ADDR: u32 = 0x9FC30;
+/// POST error-log backing storage for INT 15h AH=21h. One count byte lives just
+/// before the returned record array.
+const BIOS_POST_ERROR_LOG_COUNT_ADDR: u32 = 0x9FC3F;
+const BIOS_POST_ERROR_LOG_ADDR: u32 = 0x9FC40;
+const BIOS_POST_ERROR_LOG_MAX: u8 = 16;
 
 /// Format a CONFIG.SYS device line for a boot message: the DEVICE= path and its
 /// argument tail, left-padded to a column so the status that follows lines up.
@@ -10598,7 +10724,14 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     // vector points at the RAM ISR stub that acks Register C and EOIs both PICs.
     memory.write_u16(0x70 * 4, BIOS_RTC_ISR_ADDRESS as u16)?;
     memory.write_u16(0x70 * 4 + 2, 0)?;
+    // INT 74h-76h are the AT slave-PIC IRQ12/IRQ13/IRQ14 defaults. With no BIOS
+    // device handler installed, acknowledge the interrupt and return.
+    for vector in [0x74usize, 0x75, 0x76] {
+        memory.write_u16(vector * 4, BIOS_SLAVE_IRQ_ISR_ADDRESS as u16)?;
+        memory.write_u16(vector * 4 + 2, 0)?;
+    }
     install_rtc_isr_stub(memory)?;
+    install_slave_irq_isr_stub(memory)?;
     install_dos_low_memory_stubs(memory)?;
     seed_int1d_video_parameter_table(memory)?;
     seed_int1e_diskette_parameter_table(memory)?;
@@ -10718,9 +10851,9 @@ fn install_dos_low_memory_stubs(memory: &mut Memory) -> Result<(), BusError> {
 /// installs its own handler simply overwrites this vector.
 ///
 /// Limit: the real BIOS INT 70h also tests the RTC wait flag (0040:00A0) and
-/// signals the INT 15h AH=83h/86h event-wait completion at 0040:0098. No wait
-/// flag is modeled here, so the stub only acks and EOIs; wire those BDA bytes and
-/// an INT 15h AH=83h path to lift it.
+/// signals the INT 15h AH=83h/86h event-wait completion at 0040:0098. The host
+/// INT 15h AH=83h path completes waits synchronously, so this stub only acks
+/// and EOIs.
 fn install_rtc_isr_stub(memory: &mut Memory) -> Result<(), BusError> {
     // push ax; mov al,0Ch; out 70h,al; in al,71h; (ack Register C)
     // mov al,20h; out A0h,al; out 20h,al; (EOI slave then master)
@@ -10739,6 +10872,24 @@ fn install_rtc_isr_stub(memory: &mut Memory) -> Result<(), BusError> {
         memory.write_u8(BIOS_RTC_ISR_ADDRESS + offset, byte)?;
     }
     memory.write_u8(BIOS_RTC_ISR_ADDRESS + STUB.len(), 0xcf) // iret
+}
+
+/// Write the shared IRQ12/IRQ13/IRQ14 default handler into low RAM. These arrive
+/// through the slave PIC, so a default handler must EOI both controllers before
+/// returning.
+fn install_slave_irq_isr_stub(memory: &mut Memory) -> Result<(), BusError> {
+    const STUB: [u8; 9] = [
+        0x50, // push ax
+        0xb0, 0x20, // mov al,20h
+        0xe6, 0xa0, // out A0h,al
+        0xe6, 0x20, // out 20h,al
+        0x58, // pop ax
+        0xcf, // iret
+    ];
+    for (offset, &byte) in STUB.iter().enumerate() {
+        memory.write_u8(BIOS_SLAVE_IRQ_ISR_ADDRESS + offset, byte)?;
+    }
+    Ok(())
 }
 
 /// Seed the INT 15h AH=C0h system-configuration table at BIOS_CONFIG_TABLE_ADDR.
@@ -12113,6 +12264,111 @@ mod tests {
         // 23 MB above the first 1 MB = 23552 KB = 0x5C00 (fits in AX, DX = 0).
         assert_eq!(m.cpu.registers.eax() as u16, 0x5C00);
         assert_eq!(m.cpu.registers.edx() as u16, 0x0000);
+    }
+
+    #[test]
+    fn int15_21_post_error_log_stores_and_reads_entries() {
+        let mut m = int15_machine(16);
+        prime_dos_int_frame(&mut m);
+        m.cpu.registers.set_eax(0x2101);
+        m.cpu.registers.set_ebx(0x1234); // BH=device, BL=error
+        m.handle_int15();
+        assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x00, "write AH=0");
+        assert_eq!(dos_int_flags(&m) & 1, 0, "write CF clear");
+
+        prime_dos_int_frame(&mut m);
+        m.cpu.registers.set_eax(0x2100);
+        m.cpu.registers.set_edi(0xCAFE_0000);
+        m.handle_int15();
+        assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x00, "read AH=0");
+        assert_eq!(m.cpu.registers.ebx() as u16, 1, "one POST record");
+        let es = m.cpu.registers.segment(SegmentIndex::Es).base;
+        let di = m.cpu.registers.edi() as u16;
+        assert_eq!(es + u32::from(di), BIOS_POST_ERROR_LOG_ADDR);
+        assert_eq!(m.read_physical_u8(BIOS_POST_ERROR_LOG_ADDR), 0x34);
+        assert_eq!(m.read_physical_u8(BIOS_POST_ERROR_LOG_ADDR + 1), 0x12);
+    }
+
+    #[test]
+    fn int15_83_event_wait_sets_completion_byte() {
+        let mut m = int15_machine(16);
+        m.write_physical_u8(0x4_0000, 0x01);
+        prime_dos_int_frame(&mut m);
+        m.cpu.registers.set_eax(0x8300);
+        m.cpu.registers.set_ecx(0x0000);
+        m.cpu.registers.set_edx(0x0001);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x4000));
+        m.cpu.registers.set_ebx(0x0000);
+        m.handle_int15();
+
+        assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x00, "AH=0");
+        assert_eq!(m.read_physical_u8(0x4_0000), 0x81, "completion bit set");
+        assert_eq!(dos_int_flags(&m) & 1, 0, "CF clear");
+    }
+
+    #[test]
+    fn int15_84_reports_absent_joystick() {
+        let mut m = int15_machine(16);
+        prime_dos_int_frame(&mut m);
+        m.cpu.registers.set_eax(0x84FF);
+        m.cpu.registers.set_edx(0x0000);
+        m.handle_int15();
+        assert_eq!(m.cpu.registers.eax() as u16, 0x0000, "switches open");
+        assert_eq!(dos_int_flags(&m) & 1, 0, "switch read CF clear");
+
+        prime_dos_int_frame(&mut m);
+        m.cpu.registers.set_eax(0x8400);
+        m.cpu.registers.set_ebx(0xFFFF);
+        m.cpu.registers.set_ecx(0xFFFF);
+        m.cpu.registers.set_edx(0x0001);
+        m.handle_int15();
+        assert_eq!(m.cpu.registers.eax() as u16, 0x0000, "joy A X");
+        assert_eq!(m.cpu.registers.ebx() as u16, 0x0000, "joy A Y");
+        assert_eq!(m.cpu.registers.ecx() as u16, 0x0000, "joy B X");
+        assert_eq!(m.cpu.registers.edx() as u16, 0x0000, "joy B Y");
+        assert_eq!(dos_int_flags(&m) & 1, 0, "position read CF clear");
+    }
+
+    #[test]
+    fn int15_low_bios_hooks_return_defined_status() {
+        let mut m = int15_machine(16);
+
+        prime_dos_int_frame(&mut m);
+        m.cpu.registers.set_eax(0x0F02);
+        m.handle_int15();
+        assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x00, "format continues");
+        assert_eq!(dos_int_flags(&m) & 1, 0, "AH=0F CF clear");
+
+        prime_dos_int_frame(&mut m);
+        m.cpu.registers.set_eax(0x8500);
+        m.handle_int15();
+        assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x00, "SysReq hook OK");
+        assert_eq!(dos_int_flags(&m) & 1, 0, "AH=85 CF clear");
+
+        prime_dos_int_frame(&mut m);
+        m.cpu.registers.set_eax(0x8900);
+        m.handle_int15();
+        assert_eq!(
+            (m.cpu.registers.eax() >> 8) as u8,
+            0x86,
+            "BIOS protected-mode switch unsupported"
+        );
+        assert_eq!(dos_int_flags(&m) & 1, 1, "AH=89 CF set");
+    }
+
+    #[test]
+    fn int1a_09_reports_alarm_disabled() {
+        let mut m = int15_machine(16);
+        prime_dos_int_frame(&mut m);
+        m.cpu.registers.set_eax(0x0900);
+        m.cpu.registers.set_ecx(0xFFFF);
+        m.cpu.registers.set_edx(0xFFFF);
+        m.handle_int1a();
+        assert_eq!(m.cpu.registers.ecx() as u16, 0x0000, "alarm time");
+        assert_eq!(m.cpu.registers.edx() as u16, 0x0000, "alarm disabled");
+        assert_eq!(dos_int_flags(&m) & 1, 0, "CF clear");
     }
 
     #[test]
@@ -26981,6 +27237,25 @@ mod tests {
         // The stub starts with PUSH AX and ends with IRET.
         assert_eq!(m.read_physical_u8(BIOS_RTC_ISR_ADDRESS as u32), 0x50);
         assert_eq!(m.read_physical_u8(BIOS_RTC_ISR_ADDRESS as u32 + 14), 0xcf);
+    }
+
+    #[test]
+    fn slave_irq_vectors_point_at_the_eoi_stub() {
+        let mut m = int15_machine(4);
+        for vector in [0x74u32, 0x75, 0x76] {
+            let off = read_u16(&mut m, vector * 4);
+            let seg = read_u16(&mut m, vector * 4 + 2);
+            assert_eq!(seg, 0, "INT {vector:02X}h segment");
+            assert_eq!(
+                off, BIOS_SLAVE_IRQ_ISR_ADDRESS as u16,
+                "INT {vector:02X}h offset"
+            );
+        }
+        assert_eq!(m.read_physical_u8(BIOS_SLAVE_IRQ_ISR_ADDRESS as u32), 0x50);
+        assert_eq!(
+            m.read_physical_u8(BIOS_SLAVE_IRQ_ISR_ADDRESS as u32 + 8),
+            0xcf
+        );
     }
 
     #[test]
