@@ -9233,7 +9233,7 @@ impl Machine {
                     }
                     if let Some(vector) = self.pending_soft_int {
                         match vector {
-                            0x10 => self.handle_int10(),
+                            0x10 | 0x42 => self.handle_int10(),
                             0x11 => self.handle_int11(),
                             0x12 => self.handle_int12(),
                             0x13 | 0x40 => self.handle_int13(),
@@ -9822,6 +9822,7 @@ impl CpuBus for MachineBus<'_> {
                 | 0x2F
                 | 0x33
                 | 0x40
+                | 0x42
                 | 0x66
         ) || (vector == 0x67 && self.ems.is_some());
         if intercepted && !(self.booter_inert && dos_or_iemm) {
@@ -10252,12 +10253,13 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     // target is only a fallback). INT 1Bh is the Ctrl-Break hook: no host handler,
     // just a default IRET so a guest that hooks it or calls it through the vector
     // has a valid target. INT 40h is the relocated floppy handler, routed through
-    // the same disk service as INT 13h. INT 66h is the XMS driver entry trap,
-    // host-intercepted the same way.
+    // the same disk service as INT 13h. INT 42h is the relocated video handler,
+    // routed through INT 10h. INT 66h is the XMS driver entry trap, host-
+    // intercepted the same way.
     for vector in [
         0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x25, 0x26, 0x27, 0x28,
         0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39,
-        0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 0x40, 0x66, 0x67, 0x6C,
+        0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 0x40, 0x42, 0x66, 0x67, 0x6C,
     ] {
         let address = vector * 4;
         memory.write_u16(address, 0)?;
@@ -14451,6 +14453,22 @@ mod tests {
     }
 
     #[test]
+    fn int42_relocated_video_handler_uses_int10_service() {
+        let rom = rom_with_code(&[
+            0xb8, 0x13, 0x00, // mov ax, 0013h
+            0xcd, 0x42, // int 42h
+            0xf4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(machine.memory.read_u8(0x449).unwrap(), 0x13);
+        assert_eq!(machine.active_display(), ActiveDisplay::VgaRaster);
+    }
+
+    #[test]
     fn host_mode_set_selects_margo_lfb() {
         let mut machine = test_machine();
         assert_eq!(machine.active_display(), ActiveDisplay::VgaRaster);
@@ -15589,6 +15607,13 @@ mod tests {
             m.pending_soft_int,
             Some(0x40),
             "INT 40h (relocated floppy) stays intercepted"
+        );
+        m.pending_soft_int = None;
+        m.make_bus().interrupt_acknowledge(0x42, 0).unwrap();
+        assert_eq!(
+            m.pending_soft_int,
+            Some(0x42),
+            "INT 42h (relocated video) stays intercepted"
         );
 
         // A vector the HLE never intercepts is recorded in neither mode.
