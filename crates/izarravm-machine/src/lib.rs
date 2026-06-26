@@ -63,6 +63,8 @@ const VGA_BIOS_BASE: u32 = UPPER_MEMORY_BASE; // 0xC0000
 const VGA_BIOS_SIZE: u32 = 0x8000; // 32 KiB
 const VGA_BIOS_FONT_TABLE_OFF: u16 = 0x2000;
 const VGA_BIOS_INT43_FONT_ADDR: u32 = VGA_BIOS_BASE + VGA_BIOS_FONT_TABLE_OFF as u32;
+const VGA_BIOS_INT44_FONT_OFF: u16 = 0x3000;
+const VGA_BIOS_INT44_FONT_ADDR: u32 = VGA_BIOS_BASE + VGA_BIOS_INT44_FONT_OFF as u32;
 
 /// The default LIM EMS 4.0 page-frame base: segment 0xE000, the top 64 KiB of the
 /// upper-memory window. This is the 386MAX and DOSBox default, and on the Izarra
@@ -10311,6 +10313,7 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     install_rtc_isr_stub(memory)?;
     install_dos_low_memory_stubs(memory)?;
     seed_int43_font_table(memory)?;
+    seed_int44_font_table(memory)?;
     // Seed the BDA words INT 11h and INT 12h hand back, like a real BIOS. The 1 KB
     // EBDA reserved below 640 KB lowers the conventional-memory word by 1 (to 639),
     // so INT 12h and the EBDA stay consistent.
@@ -10480,6 +10483,14 @@ fn seed_int43_font_table(memory: &mut Memory) -> Result<(), BusError> {
     }
     memory.write_u16(0x43 * 4, VGA_BIOS_FONT_TABLE_OFF)?;
     memory.write_u16(0x43 * 4 + 2, (VGA_BIOS_BASE >> 4) as u16)
+}
+
+fn seed_int44_font_table(memory: &mut Memory) -> Result<(), BusError> {
+    for (offset, &byte) in izarravm_video::font::VGAFONT_8X8.iter().enumerate() {
+        memory.write_u8(VGA_BIOS_INT44_FONT_ADDR as usize + offset, byte)?;
+    }
+    memory.write_u16(0x44 * 4, VGA_BIOS_INT44_FONT_OFF)?;
+    memory.write_u16(0x44 * 4 + 2, (VGA_BIOS_BASE >> 4) as u16)
 }
 
 impl MachineBus<'_> {
@@ -19713,6 +19724,21 @@ mod tests {
         machine.cpu.registers.set_eax(0x1100);
         machine.handle_int10();
         assert_eq!(machine.read_physical_u8(table + 0x41 * 16), 0xFF);
+    }
+
+    #[test]
+    fn int44_points_at_rom_8x8_font_table() {
+        let mut machine = int15_machine(16);
+        let off = read_u16(&mut machine, 0x44 * 4);
+        let seg = read_u16(&mut machine, 0x44 * 4 + 2);
+        let table = (u32::from(seg) << 4) + u32::from(off);
+        assert_eq!(seg, (VGA_BIOS_BASE >> 4) as u16);
+        assert_eq!(off, VGA_BIOS_INT44_FONT_OFF);
+        assert_eq!(table, VGA_BIOS_INT44_FONT_ADDR);
+        assert_eq!(
+            machine.read_physical_u8(table + 0x41 * 8 + 4),
+            izarravm_video::font::VGAFONT_8X8[0x41 * 8 + 4]
+        );
     }
 
     #[test]
