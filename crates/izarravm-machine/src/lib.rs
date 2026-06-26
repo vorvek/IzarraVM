@@ -1071,6 +1071,11 @@ impl Machine {
             .copy_from_slice(&XMS_ENTRY_STUB);
         rom[DOS_CALL5_ROM_OFFSET..DOS_CALL5_ROM_OFFSET + DOS_CALL5_ENTRY_STUB.len()]
             .copy_from_slice(&DOS_CALL5_ENTRY_STUB);
+        rom[BIOS_TIMER_ISR_ROM_OFFSET..BIOS_TIMER_ISR_ROM_OFFSET + BIOS_TIMER_ISR_STUB.len()]
+            .copy_from_slice(&BIOS_TIMER_ISR_STUB);
+        rom[BIOS_MASTER_IRQ_ISR_ROM_OFFSET
+            ..BIOS_MASTER_IRQ_ISR_ROM_OFFSET + BIOS_MASTER_IRQ_ISR_STUB.len()]
+            .copy_from_slice(&BIOS_MASTER_IRQ_ISR_STUB);
         let machine = Self {
             memory: Memory::from_mib(profile.memory_mib)?,
             profile,
@@ -10783,6 +10788,35 @@ const DOS_CALL5_ENTRY_STUB: [u8; 49] = [
     0xcb, // retf
 ];
 
+const BIOS_TIMER_ISR_ROM_OFF: u16 = 0x0060;
+const BIOS_TIMER_ISR_ROM_OFFSET: usize = 0xf060;
+const BIOS_MASTER_IRQ_ISR_ROM_OFF: u16 = 0x0080;
+const BIOS_MASTER_IRQ_ISR_ROM_OFFSET: usize = 0xf080;
+
+// INT 08h: bump the BIOS tick dword, chain INT 1Ch, EOI the master PIC, IRET.
+const BIOS_TIMER_ISR_STUB: [u8; 25] = [
+    0x50, // push ax
+    0x1e, // push ds
+    0x31, 0xc0, // xor ax,ax
+    0x8e, 0xd8, // mov ds,ax
+    0x83, 0x06, 0x6c, 0x04, 0x01, // add word [046Ch],1
+    0x83, 0x16, 0x6e, 0x04, 0x00, // adc word [046Eh],0
+    0xcd, 0x1c, // int 1Ch
+    0xb0, 0x20, // mov al,20h
+    0xe6, 0x20, // out 20h,al
+    0x1f, // pop ds
+    0x58, // pop ax
+    0xcf, // iret
+];
+
+const BIOS_MASTER_IRQ_ISR_STUB: [u8; 7] = [
+    0x50, // push ax
+    0xb0, 0x20, // mov al,20h
+    0xe6, 0x20, // out 20h,al
+    0x58, // pop ax
+    0xcf, // iret
+];
+
 /// Real-mode segment of the 1 KB extended BIOS data area (EBDA), reserved at the
 /// top of conventional memory. Segment 0x9FC0 is physical 0x9FC00, so the EBDA
 /// runs 0x9FC00-0x9FFFF and the conventional-memory word at 0040:0013 drops from
@@ -10816,6 +10850,25 @@ fn device_label(line: &izarravm_core::ConfigDeviceLine) -> String {
 }
 
 fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
+    // Low CPU exception vectors and INT 05h Print Screen start as safe BIOS
+    // defaults. Guests and DOS can replace them through the IVT.
+    for vector in 0x00usize..=0x07 {
+        let address = vector * 4;
+        memory.write_u16(address, 0)?;
+        memory.write_u16(address + 2, BIOS_ROM_IRET_SEG)?;
+    }
+    // IRQ0 is real guest ISR code because the PIT can interrupt outside a BIOS
+    // service call. It maintains the BDA tick count and chains INT 1Ch.
+    memory.write_u16(0x08 * 4, BIOS_TIMER_ISR_ROM_OFF)?;
+    memory.write_u16(0x08 * 4 + 2, BIOS_ROM_IRET_SEG)?;
+    // Unclaimed master-PIC device IRQs only need to acknowledge the controller.
+    // IRQ1 is installed by the resident keyboard BIOS instead.
+    for vector in [0x0Ausize, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F] {
+        let address = vector * 4;
+        memory.write_u16(address, BIOS_MASTER_IRQ_ISR_ROM_OFF)?;
+        memory.write_u16(address + 2, BIOS_ROM_IRET_SEG)?;
+    }
+
     // BIOS service interrupts the host intercepts by vector. Their IVT targets
     // point at the ROM IRET so they survive a guest low-memory wipe. INT 33h is
     // the mouse driver and INT 2Fh is the ICDEX CD bridge; INT 29h is the DOS
@@ -10847,9 +10900,9 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     // vector points at the RAM ISR stub that acks Register C and EOIs both PICs.
     memory.write_u16(0x70 * 4, BIOS_RTC_ISR_ADDRESS as u16)?;
     memory.write_u16(0x70 * 4 + 2, 0)?;
-    // INT 74h-76h are the AT slave-PIC IRQ12/IRQ13/IRQ14 defaults. With no BIOS
+    // INT 71h-77h are the AT slave-PIC IRQ9-IRQ15 defaults. With no BIOS
     // device handler installed, acknowledge the interrupt and return.
-    for vector in [0x74usize, 0x75, 0x76] {
+    for vector in [0x71usize, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77] {
         memory.write_u16(vector * 4, BIOS_SLAVE_IRQ_ISR_ADDRESS as u16)?;
         memory.write_u16(vector * 4 + 2, 0)?;
     }
@@ -11642,6 +11695,58 @@ mod tests {
             max_ticks > 3,
             "INT 08h did not advance the BDA tick (got {max_ticks})"
         );
+    }
+
+    #[test]
+    fn bios_seeds_low_exception_and_irq_vectors() {
+        let mut machine = int15_machine(16);
+
+        for vector in 0x00u32..=0x07 {
+            let base = vector * 4;
+            assert_eq!(read_u16(&mut machine, base), 0);
+            assert_eq!(read_u16(&mut machine, base + 2), BIOS_ROM_IRET_SEG);
+        }
+        assert_eq!(read_u16(&mut machine, 0x08 * 4), BIOS_TIMER_ISR_ROM_OFF);
+        assert_eq!(read_u16(&mut machine, 0x08 * 4 + 2), BIOS_ROM_IRET_SEG);
+        for vector in [0x0Au32, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F] {
+            let base = vector * 4;
+            assert_eq!(read_u16(&mut machine, base), BIOS_MASTER_IRQ_ISR_ROM_OFF);
+            assert_eq!(read_u16(&mut machine, base + 2), BIOS_ROM_IRET_SEG);
+        }
+        for vector in [0x71u32, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77] {
+            let base = vector * 4;
+            assert_eq!(
+                read_u16(&mut machine, base),
+                BIOS_SLAVE_IRQ_ISR_ADDRESS as u16
+            );
+            assert_eq!(read_u16(&mut machine, base + 2), 0);
+        }
+    }
+
+    #[test]
+    fn default_int08_ticks_and_returns_from_irq0() {
+        let code: &[u8] = &[
+            0xb0, 0x11, 0xe6, 0x20, // ICW1 master
+            0xb0, 0x08, 0xe6, 0x21, // ICW2 base 08h
+            0xb0, 0x04, 0xe6, 0x21, // ICW3 slave on IR2
+            0xb0, 0x01, 0xe6, 0x21, // ICW4 8086 mode
+            0xb0, 0xfe, 0xe6, 0x21, // unmask IRQ0 only
+            0xb0, 0x36, 0xe6, 0x43, // PIT channel 0 mode 3
+            0xb0, 0xe8, 0xe6, 0x40, // count low 1000
+            0xb0, 0x03, 0xe6, 0x40, // count high
+            0xfb, 0xf4, // sti; hlt
+            0xfa, 0xf4, // cli; hlt
+        ];
+        let mut machine = Machine::new_boot_image(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            boot_image_with(code),
+        )
+        .unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(read_u16(&mut machine, 0x46c), 1);
     }
 
     #[test]
