@@ -836,20 +836,8 @@ def emit_layouts_inc(blocks, deadkeys, comps, out_path):
     A("; --- Dead-key composition data (consumed by kb_deadkey) ---------------")
     A("; Accent ids: 1 grave, 2 acute, 3 circumflex, 4 diaeresis, 5 tilde.")
     A("")
-    A("; Descriptor rows: layout, scancode, shift (0/1), accent id. 0xFF ends.")
-    A("; kbd_deadkey_desc is what the current kb_deadkey routine reads. It is")
-    A("; scoped to ES (layout 2) only, matching the original hand-authored file,")
-    A("; because the routine still composes against the single ES kbd_deadkey_comp")
-    A("; table below. Arming a dead key on FR/DE/etc here would compose wrong, so")
-    A("; the full per-layout descriptors live in kbd_layout_deadkey_desc, which the")
-    A("; later per-layout ISR task consumes alongside kbd_layout_comp_ptr.")
-    A("kbd_deadkey_desc:")
-    for scan, shift, acc in deadkeys.get(2, []):
-        A("    db 2, 0x%02x, %d, %d   ; ES" % (scan, shift, acc))
-    A("    db 0xff")
-    A("")
-    A("; Full per-layout dead-key descriptors for the future per-layout ISR. Same")
-    A("; row shape: layout, scancode, shift, accent id; 0xFF terminates.")
+    A("; Per-layout dead-key descriptor rows: layout, scancode, shift (0/1),")
+    A("; accent id; 0xFF terminates. kb_deadkey selects rows by KB_LAYOUT.")
     A("kbd_layout_deadkey_desc:")
     for idx, code, base, cpidx in LAYOUTS:
         for scan, shift, acc in deadkeys.get(idx, []):
@@ -887,29 +875,14 @@ def emit_layouts_inc(blocks, deadkeys, comps, out_path):
             A("    db " + ",".join("0x%02x" % v for v in vals) +
               "   ; %s" % ACCENTS[acc][0].lower())
     A("")
-    # Back-compat: the existing kb_deadkey routine reads kbd_deadkey_comp as a
-    # single 4-row table (grave/acute/circumflex/diaeresis) for the wired
-    # layouts. Emit ES's table under that name so the current routine still
-    # assembles and works for ES until the ISR task switches to the per-layout
-    # pointer table above.
-    es_comp = comps.get(2, {})
-    A("; Back-compat single table (ES) for the current kb_deadkey routine.")
-    A("kbd_deadkey_comp:")
-    for acc in (1, 2, 3, 4):
-        row = es_comp.get(acc, {})
-        vals = [row.get(c, 0) for c in DEAD_BASES]
-        A("    db " + ",".join("0x%02x" % v for v in vals) +
-          "   ; %s" % ACCENTS[acc][0].lower())
-    A("")
     A(KB_DEADKEY_ROUTINE.rstrip("\n"))
     open(out_path, "w", newline="\n").write("\n".join(lines) + "\n")
 
 
-# The dead-key state machine, copied verbatim from the original hand-authored
-# kbd-layouts.inc so the two INT 09h ISRs (izbios-kbd.inc, kbd-bios-core.inc)
-# that %include this file still find kb_deadkey. It reads kbd_deadkey_bases and
-# the back-compat kbd_deadkey_comp table emitted above. A later ISR task can
-# switch it to the per-layout kbd_layout_comp_ptr table.
+# The dead-key state machine, shared by the two INT 09h ISRs (izbios-kbd.inc,
+# kbd-bios-core.inc) that %include this file. It reads kbd_deadkey_bases, the
+# per-layout kbd_layout_deadkey_desc descriptor, and the per-layout
+# kbd_layout_comp_ptr composition tables, all emitted above.
 KB_DEADKEY_ROUTINE = r"""
 ; kb_deadkey: dead-key state machine, shared by both INT 09h ISRs.
 ; In:  AL = layout ASCII for this key, BL = make scancode, DS = BDA segment.

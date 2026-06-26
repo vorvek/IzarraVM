@@ -153,22 +153,8 @@ kbd_layout_tables:
 ; --- Dead-key composition data (consumed by kb_deadkey) ---------------
 ; Accent ids: 1 grave, 2 acute, 3 circumflex, 4 diaeresis, 5 tilde.
 
-; Descriptor rows: layout, scancode, shift (0/1), accent id. 0xFF ends.
-; kbd_deadkey_desc is what the current kb_deadkey routine reads. It is
-; scoped to ES (layout 2) only, matching the original hand-authored file,
-; because the routine still composes against the single ES kbd_deadkey_comp
-; table below. Arming a dead key on FR/DE/etc here would compose wrong, so
-; the full per-layout descriptors live in kbd_layout_deadkey_desc, which the
-; later per-layout ISR task consumes alongside kbd_layout_comp_ptr.
-kbd_deadkey_desc:
-    db 2, 0x1a, 0, 1   ; ES
-    db 2, 0x28, 0, 2   ; ES
-    db 2, 0x1a, 1, 3   ; ES
-    db 2, 0x28, 1, 4   ; ES
-    db 0xff
-
-; Full per-layout dead-key descriptors for the future per-layout ISR. Same
-; row shape: layout, scancode, shift, accent id; 0xFF terminates.
+; Per-layout dead-key descriptor rows: layout, scancode, shift (0/1),
+; accent id; 0xFF terminates. kb_deadkey selects rows by KB_LAYOUT.
 kbd_layout_deadkey_desc:
     db 2, 0x1a, 0, 1   ; SP
     db 2, 0x28, 0, 2   ; SP
@@ -343,13 +329,6 @@ kbd_layout_comp_ptr:
     db 0x83,0x88,0x8c,0x93,0x96,0x00,0xb6,0xd2,0xd7,0xe2,0xea,0x00   ; circumflex
     db 0x84,0x89,0x8b,0x94,0x81,0x98,0x8e,0xd3,0xd8,0x99,0x9a,0x00   ; diaresis
     db 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00   ; tilde
-
-; Back-compat single table (ES) for the current kb_deadkey routine.
-kbd_deadkey_comp:
-    db 0x85,0x8a,0x8d,0x95,0x97,0x00,0xb7,0xd4,0xde,0xe3,0xeb,0x00   ; grave
-    db 0xa0,0x82,0xa1,0xa2,0xa3,0x00,0xb5,0x90,0xd6,0xe0,0xe9,0x00   ; acute
-    db 0x83,0x88,0x8c,0x93,0x96,0x00,0xb6,0xd2,0xd7,0xe2,0xea,0x00   ; circumflex
-    db 0x84,0x89,0x8b,0x94,0x81,0x98,0x8e,0xd3,0xd8,0x99,0x9a,0x00   ; diaresis
 
 
 ; kb_deadkey: dead-key state machine, shared by both INT 09h ISRs.
