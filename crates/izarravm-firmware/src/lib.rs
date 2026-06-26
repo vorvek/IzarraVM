@@ -428,11 +428,12 @@ mod tests {
     fn izarra_bios_int16_dispatch_has_enhanced_aliases() {
         // The INT 16h dispatch routes each function to its own handler: AH=00h/10h
         // (legacy/enhanced read), 01h/11h (legacy/enhanced peek), 02h/12h (legacy
-        // flags / extended shift status), 05h buffer write, then 03h/09h/0Ah (set
-        // typematic, get functionality, get keyboard id). Each arm is a `cmp ah,
-        // imm8` (opcode 80 FC). Only AH=00h/10h reach their nearby read handlers
-        // with a short `je rel8` (74); every later handler sits past the grown
-        // read/peek/flags code, so NASM emits the near `je rel16` form (0F 84).
+        // flags / extended shift status), 04h keyclick, 05h buffer write, then
+        // 03h/09h/0Ah (set typematic, get functionality, get keyboard id). Each
+        // arm is a `cmp ah, imm8` (opcode 80 FC). Only AH=00h/10h reach their
+        // nearby read handlers with a short `je rel8` (74); every later handler
+        // sits past the grown read/peek/flags code, so NASM emits the near
+        // `je rel16` form (0F 84).
         // Assert the whole chain appears in order, ending in the bare iret
         // fall-through. Runtime coverage of this handler is infeasible without
         // booting the full ROM into a guest stub (the DOS-program test harness
@@ -441,25 +442,27 @@ mod tests {
         // (read the bytes at the dispatch site) whenever a handler is added.
         let dispatch: &[u8] = &[
             0x80, 0xfc, 0x00, // cmp ah, 0x00 (read)
-            0x74, 0x3e, //       je .read
+            0x74, 0x45, //       je .read
             0x80, 0xfc, 0x10, // cmp ah, 0x10 (enhanced read)
-            0x74, 0x6e, //       je .read16
+            0x74, 0x75, //       je .read16
             0x80, 0xfc, 0x01, // cmp ah, 0x01 (peek)
-            0x0f, 0x84, 0x96, 0x00, // je .peek
+            0x0f, 0x84, 0x9d, 0x00, // je .peek
             0x80, 0xfc, 0x11, // cmp ah, 0x11 (enhanced peek)
-            0x0f, 0x84, 0xad, 0x00, // je .peek16
+            0x0f, 0x84, 0xb4, 0x00, // je .peek16
             0x80, 0xfc, 0x02, // cmp ah, 0x02 (flags)
-            0x0f, 0x84, 0xbe, 0x00, // je .flags
+            0x0f, 0x84, 0xc5, 0x00, // je .flags
             0x80, 0xfc, 0x12, // cmp ah, 0x12 (extended shift status)
-            0x0f, 0x84, 0xc4, 0x00, // je .flags12
+            0x0f, 0x84, 0xcb, 0x00, // je .flags12
+            0x80, 0xfc, 0x04, // cmp ah, 0x04 (PCjr keyclick)
+            0x0f, 0x84, 0xd3, 0x00, // je .keyclick
             0x80, 0xfc, 0x05, // cmp ah, 0x05 (buffer write)
-            0x0f, 0x84, 0xcc, 0x00, // je .bufwrite
+            0x0f, 0x84, 0xcd, 0x00, // je .bufwrite
             0x80, 0xfc, 0x03, // cmp ah, 0x03 (set typematic rate and delay)
-            0x0f, 0x84, 0xf3, 0x00, // je .typematic
+            0x0f, 0x84, 0xf4, 0x00, // je .typematic
             0x80, 0xfc, 0x09, // cmp ah, 0x09 (get keyboard functionality)
-            0x0f, 0x84, 0x32, 0x01, // je .funcs
+            0x0f, 0x84, 0x33, 0x01, // je .funcs
             0x80, 0xfc, 0x0a, // cmp ah, 0x0a (get keyboard id)
-            0x0f, 0x84, 0x30, 0x01, // je .kbid
+            0x0f, 0x84, 0x31, 0x01, // je .kbid
             0xcf, //             iret (unhandled fall-through)
         ];
         assert!(

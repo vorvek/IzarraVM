@@ -258,6 +258,8 @@ int16:
     je .flags
     cmp ah, 0x12        ; extended shift status
     je .flags12
+    cmp ah, 0x04        ; PCjr keyclick state
+    je .keyclick
     cmp ah, 0x05        ; keyboard buffer write
     je .bufwrite
     cmp ah, 0x03        ; set typematic rate and delay
@@ -379,6 +381,9 @@ int16:
     mov al, [KB_FLAGS]
     mov ah, [KB_FLAGS_1]
     pop ds
+    iret
+.keyclick:
+    ; PCjr-only keyclick enable/disable. This AT-style keyboard has no clicker.
     iret
 .bufwrite:
     push ds

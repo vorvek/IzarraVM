@@ -13423,6 +13423,23 @@ mod tests {
     }
 
     #[test]
+    fn int16_keyclick_call_returns_to_caller() {
+        // mov ax,0401h; int 16h; mov word [0200h],1234h; int 20h
+        const PROG: [u8; 13] = [
+            0xb8, 0x01, 0x04, 0xcd, 0x16, 0xc7, 0x06, 0x00, 0x02, 0x34, 0x12, 0xcd, 0x20,
+        ];
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
+                .unwrap();
+        machine.run_until_halt_or_cycles(100_000).unwrap();
+        assert_eq!(
+            read_u16(&mut machine, (u32::from(DOS_LOAD_SEGMENT) << 4) + 0x200),
+            0x1234,
+            "INT 16h AH=04h returned to the caller"
+        );
+    }
+
+    #[test]
     fn io_port_reports_last_post_write() {
         // mov al,0x42; out 0x80,al; hlt
         let mut machine = Machine::new(
