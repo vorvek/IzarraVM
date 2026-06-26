@@ -650,6 +650,11 @@ pub struct GuiApp {
     // Guest NumLock/CapsLock/ScrollLock state, mirrored from the host. Parallel
     // to HOST_LOCK_KEYS; seeded false because the BIOS clears KB_FLAGS on boot.
     guest_locks: [bool; HOST_LOCK_KEYS.len()],
+    // Host window focus last frame. When focus is lost while a key or modifier is
+    // held, the host delivers the key-up to whatever window took focus, not to us
+    // (and egui leaves modifiers set), so the guest never sees the release and the
+    // key sticks down. On a focus-loss edge we flush every held key as a break.
+    was_focused: bool,
     // Last button mask forwarded to the VM, so a button press or release is sent
     // even on a frame with no pointer motion.
     last_buttons: u8,
@@ -759,6 +764,7 @@ impl GuiApp {
             guest_modifiers: GuestModifiers::default(),
             guest_key_scancodes: Vec::new(),
             guest_locks: [false; HOST_LOCK_KEYS.len()],
+            was_focused: true,
             last_buttons: 0,
             screen_rect: None,
             abs_x: 0.0,
@@ -923,6 +929,23 @@ impl GuiApp {
         }
     }
 
+    /// Release everything the guest currently holds, as break codes, and forget
+    /// the held state. The guest tracks held keys from host key-up events and
+    /// modifiers from egui's modifier state; when those stop arriving (input
+    /// release, or the window losing focus mid-press) a held key would otherwise
+    /// stay down in the guest forever. Mirrors what a real keyboard does when it
+    /// is unplugged and replugged: everything comes up.
+    fn release_held_input(&mut self) {
+        let codes = release_codes(self.guest_modifiers, &self.guest_key_scancodes);
+        self.guest_modifiers = GuestModifiers::default();
+        self.guest_key_scancodes.clear();
+        if !codes.is_empty() {
+            if let Some(emu) = &self.emu {
+                emu.send_keys(codes);
+            }
+        }
+    }
+
     /// Enter or leave input capture. While captured we lock and hide the OS cursor
     /// (winit Locked: pinned in place, cannot move on screen or leave the window)
     /// and route keyboard and mouse to the guest, which draws its own cursor.
@@ -945,15 +968,7 @@ impl GuiApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::Locked));
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
         } else {
-            let mut codes = Vec::new();
-            push_modifier_delta(self.guest_modifiers, GuestModifiers::default(), &mut codes);
-            self.guest_modifiers = GuestModifiers::default();
-            self.guest_key_scancodes.clear();
-            if !codes.is_empty() {
-                if let Some(emu) = &self.emu {
-                    emu.send_keys(codes);
-                }
-            }
+            self.release_held_input();
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorGrab(egui::CursorGrab::None));
             ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
         }
@@ -1542,6 +1557,15 @@ impl eframe::App for GuiApp {
         // capture toggle is reflected even if set_capture ran mid-frame.
         self.title = capture_title(self.input_captured);
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.title.clone()));
+        // On losing window focus, release everything the guest holds. The host
+        // routes the matching key-ups to whatever window took focus, so without
+        // this a key held at the moment of an alt-tab (Shift, in a game) sticks
+        // down in the guest until the next host event flips it.
+        let focused = ctx.input(|i| i.focused);
+        if self.was_focused && !focused {
+            self.release_held_input();
+        }
+        self.was_focused = focused;
         // Host-loop diagnostics: count this update() and the input events egui
         // saw, rolling the rates up once a second.
         let now = Instant::now();
@@ -1691,6 +1715,18 @@ impl GuestModifiers {
             altgr,
         }
     }
+}
+
+/// Break codes that release the current held state: every held modifier and key
+/// turned into its break (make | 0x80). Used when input stops flowing (capture
+/// release, window focus loss) so nothing stays stuck down in the guest.
+fn release_codes(modifiers: GuestModifiers, held: &[(egui::Key, u8)]) -> Vec<u8> {
+    let mut codes = Vec::new();
+    push_modifier_delta(modifiers, GuestModifiers::default(), &mut codes);
+    for (_, make) in held {
+        codes.push(make | 0x80);
+    }
+    codes
 }
 
 fn push_modifier_delta(from: GuestModifiers, to: GuestModifiers, codes: &mut Vec<u8>) {
@@ -2049,6 +2085,24 @@ mod tests {
         assert_eq!(iso_key_make_break(">"), Some([0x56, 0xd6]));
         assert_eq!(iso_key_make_break("a"), None);
         assert_eq!(iso_key_make_break("|"), None); // reachable as AltGr+1
+    }
+
+    #[test]
+    fn release_codes_break_every_held_key_and_modifier() {
+        // Shift held plus the 'A' key (make 0x1e) held: focus loss must break both,
+        // modifier first (0xaa shift break) then the key (0x9e = 0x1e | 0x80).
+        let shift = GuestModifiers::from_egui(egui::Modifiers {
+            shift: true,
+            ..Default::default()
+        });
+        let held = vec![(egui::Key::A, 0x1e)];
+        assert_eq!(release_codes(shift, &held), vec![0xaa, 0x9e]);
+
+        // Nothing held: nothing to release.
+        assert_eq!(
+            release_codes(GuestModifiers::default(), &[]),
+            Vec::<u8>::new()
+        );
     }
 
     #[test]
