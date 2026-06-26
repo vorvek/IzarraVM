@@ -16727,6 +16727,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn non_es_dead_keys_use_the_per_layout_tables() {
+        // The kb_deadkey routine now selects the descriptor and composition table
+        // by KB_LAYOUT, so dead keys work beyond Spanish. French (layout 3): the
+        // circumflex dead key (scancode 0x1a, unshifted) then 'e' (0x12) composes
+        // to e-circumflex (CP850 0x88), reported with e's scancode.
+        assert_eq!(
+            int16_read_after_with_layout(3, &[0x1a, 0x9a, 0x12, 0x92]),
+            0x1288
+        );
+        // German (layout 4): the dead acute (scancode 0x0d, unshifted) then 'a'
+        // (0x1e) composes to a-acute (CP850 0xA0).
+        assert_eq!(
+            int16_read_after_with_layout(4, &[0x0d, 0x8d, 0x1e, 0x9e]),
+            0x1ea0
+        );
+    }
+
     /// Same path as `int16_read_after`, but the program reads with AH=10h (the
     /// enhanced read). Before the DOS keyboard ROM aliased AH=10h to the AH=00h
     /// reader, this fell through the int16 dispatch and returned stale AX.

@@ -391,14 +391,20 @@ kb_deadkey:
     inc si
     jmp .col_scan
 .col_found:
-    ; CX = column (0..11), DI = row (0..3), BL = make scancode
-    ; want: kbd_deadkey_comp[di*12 + cx]
+    ; CX = column (0..11), DI = accent row (0..4), BL = make scancode. The
+    ; composition table is per layout: kbd_layout_comp_ptr[KB_LAYOUT] points at a
+    ; 5-row (grave/acute/circumflex/diaeresis/tilde) x 12-column block, or 0 when
+    ; the layout has no dead keys.
     push bx                         ; save make scancode
-    mov bx, cx                      ; BX = column
+    movzx bx, byte [KB_LAYOUT]
+    shl bx, 1
+    mov bx, [cs:kbd_layout_comp_ptr + bx]
+    test bx, bx
+    jz .col_found_none
     mov si, di
-    imul si, si, 12                 ; SI = row * 12
-    add si, bx                      ; SI = row*12 + col
-    add si, kbd_deadkey_comp
+    imul si, si, 12                 ; SI = accent row * 12
+    add si, cx                      ; SI += column
+    add si, bx                      ; SI += per-layout table base
     mov ah, [cs:si]
     pop bx                          ; restore make scancode
     test ah, ah
@@ -406,6 +412,9 @@ kb_deadkey:
     mov al, ah
     mov byte [KB_DEAD], 0
     jmp .pass
+.col_found_none:
+    pop bx                          ; layout has no composition table
+    jmp .no_match
 .no_match:
     push ax
     call .flush
@@ -435,7 +444,7 @@ kb_deadkey:
     mov ah, 1
 .ld_noshift:
     mov cl, [KB_LAYOUT]
-    mov si, kbd_deadkey_desc
+    mov si, kbd_layout_deadkey_desc
 .ld_loop:
     mov ch, [cs:si]
     cmp ch, 0xff
