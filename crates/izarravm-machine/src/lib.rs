@@ -10136,15 +10136,15 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     // 27h is the obsolete TSR exit; INT 28h is the DOS idle hook's default IRET;
     // INT 2Ah is the DOS network/critical-section hook; INT 2Bh-2Dh are DOS
     // reserved IRET vectors; INT 2Eh is the DOS command-interpreter back door.
-    // INT 18h/19h are the
-    // host-serviced boot and diskless vectors (the run loop services them and
-    // redirects CS:IP itself, so the IRET target is only a fallback). INT 1Bh is
-    // the Ctrl-Break hook: no host handler, just a default IRET so a guest that
+    // INT 6Ch is the DOS realtime-clock/resume hook's default IRET. INT 18h/19h
+    // are the host-serviced boot and diskless vectors (the run loop services them
+    // and redirects CS:IP itself, so the IRET target is only a fallback). INT 1Bh
+    // is the Ctrl-Break hook: no host handler, just a default IRET so a guest that
     // hooks it or calls it through the vector has a valid target. INT 66h is the
     // XMS driver entry trap, host-intercepted the same way.
     for vector in [
         0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x25, 0x26, 0x27, 0x28,
-        0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F, 0x33, 0x66, 0x67,
+        0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F, 0x33, 0x66, 0x67, 0x6C,
     ] {
         let address = vector * 4;
         memory.write_u16(address, 0)?;
@@ -18683,10 +18683,10 @@ mod tests {
     }
 
     #[test]
-    fn dos_internal_iret_vectors_return_to_caller() {
-        // org 0x100: int 2bh; int 2ch; int 2dh; mov ax,4c00h; int 21h
+    fn dos_iret_vectors_return_to_caller() {
+        // org 0x100: int 2bh; int 2ch; int 2dh; int 6ch; mov ax,4c00h; int 21h
         let com: &[u8] = &[
-            0xcd, 0x2b, 0xcd, 0x2c, 0xcd, 0x2d, 0xb8, 0x00, 0x4c, 0xcd, 0x21,
+            0xcd, 0x2b, 0xcd, 0x2c, 0xcd, 0x2d, 0xcd, 0x6c, 0xb8, 0x00, 0x4c, 0xcd, 0x21,
         ];
         let mut machine =
             Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
@@ -25942,7 +25942,7 @@ mod tests {
         )
         .unwrap();
 
-        for vector in [0x2bu32, 0x2c, 0x2d, 0x2e] {
+        for vector in [0x2bu32, 0x2c, 0x2d, 0x2e, 0x6c] {
             let off = read_u16(&mut m, vector * 4);
             let seg = read_u16(&mut m, vector * 4 + 2);
             assert_eq!(seg, BIOS_ROM_IRET_SEG, "INT {vector:02X}h IRET segment");
