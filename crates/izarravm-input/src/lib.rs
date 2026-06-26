@@ -1,3 +1,6 @@
+mod keyboard;
+pub use keyboard::HostKeyboard;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostInputKind {
     Keyboard,
