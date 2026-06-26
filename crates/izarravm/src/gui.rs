@@ -454,6 +454,7 @@ fn emulate(
     if let Some(index) = crate::host_keyboard_layout_index() {
         let mut cmos = machine.cmos_bytes();
         cmos[0x10] = index;
+        cmos[0x11] = crate::codepage_index_for_layout(index);
         machine.load_cmos(&cmos);
     }
     if test_pattern {

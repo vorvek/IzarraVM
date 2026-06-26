@@ -614,20 +614,43 @@ fn select_rom(bios: Option<&Path>) -> Result<Vec<u8>, Box<dyn Error>> {
     }
 }
 
-/// Map a Windows LANGID to one of the six guest layout indices
-/// (0 US, 1 UK, 2 ES, 3 FR, 4 DE, 5 IT). Unknown languages fall back to US.
+/// Map a Windows LANGID to one of the 17 guest layout indices (see the canonical
+/// table in dev_docs/2026-06-26-keyboard-layout-import-design.md). Regions that
+/// share a language but use different keyboards are matched on the full LANGID
+/// first; everything else falls back to the primary-language default, then US.
 pub(crate) fn layout_index_from_langid(langid: u16) -> u8 {
-    if langid == 0x0809 {
-        return 1; // en-GB
+    match langid {
+        0x0809 => return 1,          // en-GB -> UK
+        0x080c => return 6,          // fr-BE -> Belgium
+        0x0813 => return 6,          // nl-BE -> Belgium
+        0x0c0c => return 7,          // fr-CA -> Canadian French
+        0x100c => return 12,         // fr-CH -> Swiss French
+        0x0807 => return 13,         // de-CH -> Swiss German
+        0x040a | 0x0c0a => return 2, // es-ES (traditional/modern) -> Spain
+        _ => {}
     }
     match langid & 0x03ff {
-        0x09 => 0, // English (non-GB) -> US
-        0x0a => 2, // Spanish (any region) -> ES
-        0x0c => 3, // French -> FR
-        0x07 => 4, // German -> DE
-        0x10 => 5, // Italian -> IT
+        0x09 => 0,  // English (other) -> US
+        0x0a => 16, // Spanish (non-Spain, i.e. Latin America) -> LA
+        0x0c => 3,  // French (other) -> France
+        0x07 => 4,  // German (other) -> Germany
+        0x10 => 5,  // Italian -> Italy
+        0x06 => 8,  // Danish -> Denmark
+        0x13 => 9,  // Dutch (other) -> Netherlands
+        0x14 => 10, // Norwegian -> Norway
+        0x16 => 11, // Portuguese -> Portugal
+        0x0b => 14, // Finnish -> Finland
+        0x1d => 15, // Swedish -> Sweden
         _ => 0,
     }
+}
+
+/// The default code-page index (sub-project A order: 437=0, 850=1, 860=2,
+/// 863=3, 865=4) for each guest keyboard layout. Frozen to match the firmware
+/// `kbd_layout_codepage` table emitted by the layout converter.
+pub(crate) fn codepage_index_for_layout(layout: u8) -> u8 {
+    const CP: [u8; 17] = [0, 0, 1, 1, 1, 1, 1, 3, 4, 1, 4, 2, 1, 1, 1, 1, 1];
+    *CP.get(usize::from(layout)).unwrap_or(&0)
 }
 
 /// The host keyboard layout as a guest index, or None when it cannot be read
@@ -672,10 +695,32 @@ mod tests {
         assert_eq!(layout_index_from_langid(0x0809), 1); // en-GB
         assert_eq!(layout_index_from_langid(0x1009), 0); // en-CA -> US
         assert_eq!(layout_index_from_langid(0x0c0a), 2); // es-ES
-        assert_eq!(layout_index_from_langid(0x080a), 2); // es-MX -> ES
+        assert_eq!(layout_index_from_langid(0x080a), 16); // es-MX -> Latin America
         assert_eq!(layout_index_from_langid(0x040c), 3); // fr-FR
         assert_eq!(layout_index_from_langid(0x0407), 4); // de-DE
         assert_eq!(layout_index_from_langid(0x0410), 5); // it-IT
         assert_eq!(layout_index_from_langid(0x0411), 0); // ja-JP -> US fallback
+    }
+
+    #[test]
+    fn langid_maps_new_layouts() {
+        assert_eq!(layout_index_from_langid(0x080c), 6); // fr-BE -> BE
+        assert_eq!(layout_index_from_langid(0x0c0c), 7); // fr-CA -> CF
+        assert_eq!(layout_index_from_langid(0x0406), 8); // da-DK -> DK
+        assert_eq!(layout_index_from_langid(0x0413), 9); // nl-NL -> NL
+        assert_eq!(layout_index_from_langid(0x0414), 10); // nb-NO -> NO
+        assert_eq!(layout_index_from_langid(0x0816), 11); // pt-PT -> PO
+        assert_eq!(layout_index_from_langid(0x100c), 12); // fr-CH -> SF
+        assert_eq!(layout_index_from_langid(0x0807), 13); // de-CH -> SG
+        assert_eq!(layout_index_from_langid(0x040b), 14); // fi-FI -> SU
+        assert_eq!(layout_index_from_langid(0x041d), 15); // sv-SE -> SV
+    }
+
+    #[test]
+    fn codepage_index_for_each_layout() {
+        let want = [0u8, 0, 1, 1, 1, 1, 1, 3, 4, 1, 4, 2, 1, 1, 1, 1, 1];
+        for (i, w) in want.iter().enumerate() {
+            assert_eq!(codepage_index_for_layout(i as u8), *w);
+        }
     }
 }
