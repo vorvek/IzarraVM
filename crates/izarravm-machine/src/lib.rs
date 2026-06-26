@@ -3430,6 +3430,9 @@ impl Machine {
             // success without persisting state. AH=0Eh keeps the default carry since no
             // power-on alarm date is stored.
             0x06 | 0x07 | 0x08 | 0x0C | 0x0D | 0x0F => self.set_int_frame_carry(false),
+            // AH=80h PCjr/Tandy sound multiplexor. A Tandy 1000SL/TL BIOS exposes
+            // this as a bare IRET; the base profile keeps the caller state intact.
+            0x80 => {}
             _ => self.set_int_frame_carry(true),
         }
     }
@@ -12664,6 +12667,25 @@ mod tests {
         assert_eq!(m.cpu.registers.ecx() as u16, 0x0000, "alarm time");
         assert_eq!(m.cpu.registers.edx() as u16, 0x0000, "alarm disabled");
         assert_eq!(dos_int_flags(&m) & 1, 0, "CF clear");
+    }
+
+    #[test]
+    fn int1a_80_sound_multiplexor_is_iret_noop() {
+        let mut m = int15_machine(16);
+        prime_dos_int_frame(&mut m);
+        m.memory.write_u16(0x9000 * 16 + 0x0104, 0x0241).unwrap();
+        m.cpu.registers.set_eax(0x8055);
+        m.cpu.registers.set_ebx(0x1234);
+        m.cpu.registers.set_ecx(0x5678);
+        m.cpu.registers.set_edx(0x9ABC);
+
+        m.handle_int1a();
+
+        assert_eq!(m.cpu.registers.eax() as u16, 0x8055, "AX preserved");
+        assert_eq!(m.cpu.registers.ebx() as u16, 0x1234, "BX preserved");
+        assert_eq!(m.cpu.registers.ecx() as u16, 0x5678, "CX preserved");
+        assert_eq!(m.cpu.registers.edx() as u16, 0x9ABC, "DX preserved");
+        assert_eq!(dos_int_flags(&m), 0x0241, "FLAGS image preserved");
     }
 
     #[test]
