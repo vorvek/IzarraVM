@@ -6011,18 +6011,24 @@ pub struct ProgramEntry {
 }
 
 /// Build the 256-byte PSP at psp_seg:0. INT 20h (CD 20) at offset 0 so a near
-/// RET to PSP:0 terminates; the top-of-memory paragraph at 0x02; an empty
-/// command tail at 0x80. The documented vectors at 0x0A/0x0E/0x12 snapshot the
-/// current INT 22h/23h/24h IVT entries; 0x16 (parent PSP) defaults to 0 and the
-/// EXEC path overwrites it for a child; 0x32/0x34 hold the JFT count and far
-/// pointer, with the 20-byte JFT at 0x18 wiring stdin/stdout/stderr to CON,
-/// handle 3 to AUX, handle 4 to PRN, and the rest closed. The environment
-/// segment (0x2C) is filled in by `DosKernel::install_environment`.
+/// RET to PSP:0 terminates; the top-of-memory paragraph at 0x02; the CP/M CALL
+/// 5 far call at 0x05; the INT 21h/RETF helper at 0x50; an empty command tail at
+/// 0x80. The documented vectors at 0x0A/0x0E/0x12 snapshot the current INT
+/// 22h/23h/24h IVT entries; 0x16 (parent PSP) defaults to 0 and the EXEC path
+/// overwrites it for a child; 0x32/0x34 hold the JFT count and far pointer, with
+/// the 20-byte JFT at 0x18 wiring stdin/stdout/stderr to CON, handle 3 to AUX,
+/// handle 4 to PRN, and the rest closed. The environment segment (0x2C) is
+/// filled in by `DosKernel::install_environment`.
 fn build_psp(mem: &mut Memory, psp_seg: u16, top_of_mem_paragraph: u16) -> Result<(), DosError> {
     let base = usize::from(psp_seg) * 16;
     mem.write_u8(base, 0xcd)?;
     mem.write_u8(base + 1, 0x20)?;
     mem.write_u16(base + 2, top_of_mem_paragraph)?;
+    // PSP:0x05 is the ancient CP/M-compatible CALL 5 entry. MS-DOS points it at
+    // the low-memory entry whose bytes overlap the nominal INT 30h/31h vectors.
+    mem.write_u8(base + 0x05, 0x9a)?; // call far 0000:00C0
+    mem.write_u16(base + 0x06, 0x00c0)?;
+    mem.write_u16(base + 0x08, 0x0000)?;
     // PSP:0x0A/0x0E/0x12 are the terminate (INT 22h), Ctrl-C (INT 23h), and
     // critical-error (INT 24h) far vectors DOS saves so a child can restore them
     // on exit. Snapshot the live IVT entries (offset then segment) at AL*4. The
@@ -6051,6 +6057,12 @@ fn build_psp(mem: &mut Memory, psp_seg: u16, top_of_mem_paragraph: u16) -> Resul
     mem.write_u16(base + 0x32, JFT_LEN as u16)?;
     mem.write_u16(base + 0x34, 0x0018)?;
     mem.write_u16(base + 0x36, psp_seg)?;
+    // PSP:0x50 is the documented portable DOS-call helper: INT 21h then RETF.
+    mem.write_u8(base + 0x50, 0xcd)?;
+    mem.write_u8(base + 0x51, 0x21)?;
+    mem.write_u8(base + 0x52, 0xcb)?;
+    mem.write_u8(base + 0x53, 0)?;
+    mem.write_u8(base + 0x54, 0)?;
     mem.write_u8(base + 0x80, 0x00)?;
     mem.write_u8(base + 0x81, 0x0d)?;
     Ok(())
@@ -16230,6 +16242,13 @@ mod tests {
         mem.write_u16(0x24 * 4 + 2, 0x6666).unwrap();
         build_psp(&mut mem, 0x0100, 0x9000).unwrap();
         let psp = 0x0100usize * 16;
+        // CP/M compatibility entry and portable DOS-call helper.
+        assert_eq!(mem.read_u8(psp + 0x05).unwrap(), 0x9a);
+        assert_eq!(mem.read_u16(psp + 0x06).unwrap(), 0x00c0);
+        assert_eq!(mem.read_u16(psp + 0x08).unwrap(), 0x0000);
+        assert_eq!(mem.read_u8(psp + 0x50).unwrap(), 0xcd);
+        assert_eq!(mem.read_u8(psp + 0x51).unwrap(), 0x21);
+        assert_eq!(mem.read_u8(psp + 0x52).unwrap(), 0xcb);
         // The INT 22h/23h/24h far vectors are snapshotted from the IVT.
         assert_eq!(mem.read_u16(psp + 0x0a).unwrap(), 0x1111);
         assert_eq!(mem.read_u16(psp + 0x0c).unwrap(), 0x2222);

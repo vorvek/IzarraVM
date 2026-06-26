@@ -1054,13 +1054,13 @@ impl Machine {
         let timing = TimingFactors::for_clock(active_mode.clock_hz());
         // Partition extended RAM between XMS and EMS from the EMM386 mode.
         let (xms, ems) = build_xms_ems(memory_mib, profile.emm386, None, EMS_FRAME_DEFAULT_SEG);
-        // Lay the XMS driver entry stub into ROM. INT 2Fh AX=4310h hands the guest
-        // a far pointer to it; a guest FAR-CALLs there, the INT 66h traps into the
-        // host XMS handler, and the RETF returns. Placed at a fixed ROM offset that
-        // no other BIOS stub uses (the IRET is at 0xF000, the reset vector at
-        // 0xFFF0). See XMS_ENTRY_ROM_OFFSET for the bytes.
+        // Lay the HLE entry stubs into ROM. INT 2Fh AX=4310h hands the guest the
+        // XMS entry pointer; PSP:0005 reaches the CALL 5 adapter through the
+        // low-memory DOS entry at 0000:00C0.
         rom[XMS_ENTRY_ROM_OFFSET..XMS_ENTRY_ROM_OFFSET + XMS_ENTRY_STUB.len()]
             .copy_from_slice(&XMS_ENTRY_STUB);
+        rom[DOS_CALL5_ROM_OFFSET..DOS_CALL5_ROM_OFFSET + DOS_CALL5_ENTRY_STUB.len()]
+            .copy_from_slice(&DOS_CALL5_ENTRY_STUB);
         let machine = Self {
             memory: Memory::from_mib(profile.memory_mib)?,
             profile,
@@ -10105,6 +10105,70 @@ const XMS_ENTRY_OFF: u16 = 0x0010;
 /// function in AH), and the RETF returns to the caller.
 const XMS_ENTRY_STUB: [u8; 3] = [0xcd, XMS_INT_VECTOR, 0xcb];
 
+/// Physical address of the CP/M CALL 5 entry. DOSINTS names this as INT 30h, but
+/// it is code over the IVT bytes for INT 30h and INT 31h rather than a real
+/// interrupt vector.
+const DOS_CALL5_ENTRY_ADDRESS: usize = 0x00c0;
+const DOS_CALL5_ENTRY_SEG: u16 = 0xff00;
+const DOS_CALL5_ENTRY_OFF: u16 = 0x0020;
+const DOS_CALL5_ROM_OFFSET: usize = 0xf020;
+const DOS_CALL5_MAX_FUNCTION: u8 = 0x24;
+
+/// ROM adapter for the PSP:0005 CP/M entry. CALL 5 pushes a near return address,
+/// the PSP far-call pushes PSP:000A, and this adapter rewrites the stack so RETF
+/// lands back at the original caller. CL selects the old DOS function.
+const DOS_CALL5_ENTRY_STUB: [u8; 49] = [
+    0x80,
+    0xf9,
+    DOS_CALL5_MAX_FUNCTION, // cmp cl,24h
+    0x77,
+    0x17, // ja bad
+    0x55, // push bp
+    0x8b,
+    0xec, // mov bp,sp
+    0x50, // push ax
+    0x8b,
+    0x46,
+    0x04, // mov ax,[bp+4]
+    0x87,
+    0x46,
+    0x06, // xchg ax,[bp+6]
+    0x89,
+    0x46,
+    0x04, // mov [bp+4],ax
+    0x58, // pop ax
+    0x5d, // pop bp
+    0x83,
+    0xc4,
+    0x02, // add sp,2
+    0x88,
+    0xcc, // mov ah,cl
+    0xcd,
+    0x21, // int 21h
+    0xcb, // retf
+    0x55, // bad: push bp
+    0x8b,
+    0xec, // mov bp,sp
+    0x50, // push ax
+    0x8b,
+    0x46,
+    0x04, // mov ax,[bp+4]
+    0x87,
+    0x46,
+    0x06, // xchg ax,[bp+6]
+    0x89,
+    0x46,
+    0x04, // mov [bp+4],ax
+    0x58, // pop ax
+    0x5d, // pop bp
+    0x83,
+    0xc4,
+    0x02, // add sp,2
+    0xb0,
+    0x00, // mov al,0
+    0xcb, // retf
+];
+
 /// Real-mode segment of the 1 KB extended BIOS data area (EBDA), reserved at the
 /// top of conventional memory. Segment 0x9FC0 is physical 0x9FC00, so the EBDA
 /// runs 0x9FC00-0x9FFFF and the conventional-memory word at 0040:0013 drops from
@@ -10228,6 +10292,9 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
 
 fn install_dos_low_memory_stubs(memory: &mut Memory) -> Result<(), BusError> {
     memory.write_u8(BIOS_IRET_STUB_ADDRESS, 0xcf)?;
+    memory.write_u8(DOS_CALL5_ENTRY_ADDRESS, 0xea)?; // jmp far FF00:0020
+    memory.write_u16(DOS_CALL5_ENTRY_ADDRESS + 1, DOS_CALL5_ENTRY_OFF)?;
+    memory.write_u16(DOS_CALL5_ENTRY_ADDRESS + 3, DOS_CALL5_ENTRY_SEG)?;
     // The HLT sentinel a driver call's far return lands on (see call_driver_request).
     memory.write_u8(SYSINIT_HALT_STUB, 0xf4)?;
     // INT 18h's halt target: CLI;HLT in low RAM. INT 22h uses the same safe
@@ -18693,6 +18760,53 @@ mod tests {
                 .unwrap();
         let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
         assert_eq!(reason, StopReason::DosExit { code: 0 });
+    }
+
+    #[test]
+    fn dos_call5_entry_dispatches_cpm_style_function() {
+        // org 0x100:
+        //   mov cl,09h
+        //   mov dx,msg
+        //   call 0005h
+        //   mov ax,4c00h
+        //   int 21h
+        // msg db 'OK$'
+        let com: &[u8] = &[
+            0xb1, 0x09, 0xba, 0x0d, 0x01, 0xe8, 0xfd, 0xfe, 0xb8, 0x00, 0x4c, 0xcd, 0x21, b'O',
+            b'K', b'$',
+        ];
+        let mut machine =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
+                .unwrap();
+        let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
+        assert_eq!(machine.dos_output(), b"OK");
+    }
+
+    #[test]
+    fn dos_call5_low_memory_entry_is_a_far_jump() {
+        let mut machine = Machine::new_dos_program(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            &[0xb8, 0x00, 0x4c, 0xcd, 0x21],
+        )
+        .unwrap();
+
+        assert_eq!(
+            machine.read_physical_u8(DOS_CALL5_ENTRY_ADDRESS as u32),
+            0xea
+        );
+        assert_eq!(
+            machine.memory_read_u16_for_test(DOS_CALL5_ENTRY_ADDRESS + 1),
+            DOS_CALL5_ENTRY_OFF
+        );
+        assert_eq!(
+            machine.memory_read_u16_for_test(DOS_CALL5_ENTRY_ADDRESS + 3),
+            DOS_CALL5_ENTRY_SEG
+        );
+        assert_eq!(
+            machine.read_physical_u8(LOW_BIOS_BASE + DOS_CALL5_ROM_OFFSET as u32),
+            0x80
+        );
     }
 
     #[test]
