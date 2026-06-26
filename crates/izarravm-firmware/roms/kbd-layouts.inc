@@ -171,3 +171,32 @@ kbd_layout_tables:
     db 0, 0, 0,0,0,0,0,0,0,0,'[',']',0,0,0,0                           ; 10-1f
     db 0, 0, 0,0,0,0,0,'@','#',0,0,0,0,0,0,0                           ; 20-2f
     times 0x80 - ($ - .it_altgr) db 0
+
+; --- Dead-key composition data (consumed by kb_deadkey) ---------------------
+; Accent ids: 1 grave, 2 acute, 3 circumflex, 4 diaeresis.
+
+; Descriptor: which (layout, scancode, shift) is a dead key. Each row is
+; layout, scancode, shift (0=unshifted,1=shifted), accent id. 0xFF terminates.
+; AltGr keys are never dead. Only ES is wired this round.
+kbd_deadkey_desc:
+    db 2, 0x1a, 0, 1       ; ES `  grave
+    db 2, 0x1a, 1, 3       ; ES ^  circumflex
+    db 2, 0x28, 0, 2       ; ES acute
+    db 2, 0x28, 1, 4       ; ES diaeresis
+    db 0xff
+
+; Spacing glyph emitted when a dead key is flushed (dead+space or dead+non-vowel).
+; Indexed by accent id - 1.
+kbd_deadkey_flush:
+    db 0x60, 0x27, 0x5e, 0x22   ; ` ' ^ "
+
+; Composition: accent id - 1 selects the row; column is the base letter's index
+; in kbd_deadkey_bases. 0 = no composed form (caller flushes instead).
+kbd_deadkey_bases:
+    db 'a','e','i','o','u','y','A','E','I','O','U','Y'
+kbd_deadkey_comp:
+    ; a     e     i     o     u     y     A     E     I     O     U     Y
+    db 0x85,0x8a,0x8d,0x95,0x97,0,   0xb7,0xd4,0xde,0xe3,0xeb,0     ; grave
+    db 0xa0,0x82,0xa1,0xa2,0xa3,0,   0xb5,0x90,0xd6,0xe0,0xe9,0     ; acute
+    db 0x83,0x88,0x8c,0x93,0x96,0,   0xb6,0xd2,0xd7,0xe2,0xea,0     ; circumflex
+    db 0x84,0x89,0x8b,0x94,0x81,0x98,0x8e,0xd3,0xd8,0x99,0x9a,0     ; diaeresis (y -> 0x98)
