@@ -10198,17 +10198,19 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     // the mouse driver and INT 2Fh is the ICDEX CD bridge; INT 29h is the DOS
     // fast-console hook; INT 25h/26h are the DOS absolute disk read/write; INT
     // 27h is the obsolete TSR exit; INT 28h is the DOS idle hook's default IRET;
-    // INT 2Ah is the DOS network/critical-section hook; INT 2Bh-2Dh are DOS
-    // reserved IRET vectors; INT 2Eh is the DOS command-interpreter back door.
-    // INT 6Ch is the DOS realtime-clock/resume hook's default IRET. INT 18h/19h
-    // are the host-serviced boot and diskless vectors (the run loop services them
-    // and redirects CS:IP itself, so the IRET target is only a fallback). INT 1Bh
-    // is the Ctrl-Break hook: no host handler, just a default IRET so a guest that
-    // hooks it or calls it through the vector has a valid target. INT 66h is the
-    // XMS driver entry trap, host-intercepted the same way.
+    // INT 2Ah is the DOS network/critical-section hook; INT 2Bh-2Dh, 32h, and
+    // 34h-3Fh are DOS reserved IRET vectors; INT 2Eh is the DOS
+    // command-interpreter back door. INT 6Ch is the DOS realtime-clock/resume
+    // hook's default IRET. INT 18h/19h are the host-serviced boot and diskless
+    // vectors (the run loop services them and redirects CS:IP itself, so the IRET
+    // target is only a fallback). INT 1Bh is the Ctrl-Break hook: no host handler,
+    // just a default IRET so a guest that hooks it or calls it through the vector
+    // has a valid target. INT 66h is the XMS driver entry trap, host-intercepted
+    // the same way.
     for vector in [
         0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x25, 0x26, 0x27, 0x28,
-        0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F, 0x33, 0x66, 0x67, 0x6C,
+        0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39,
+        0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 0x66, 0x67, 0x6C,
     ] {
         let address = vector * 4;
         memory.write_u16(address, 0)?;
@@ -18751,9 +18753,11 @@ mod tests {
 
     #[test]
     fn dos_iret_vectors_return_to_caller() {
-        // org 0x100: int 2bh; int 2ch; int 2dh; int 6ch; mov ax,4c00h; int 21h
+        // org 0x100: call DOS reserved IRET vectors, then exit 0.
         let com: &[u8] = &[
-            0xcd, 0x2b, 0xcd, 0x2c, 0xcd, 0x2d, 0xcd, 0x6c, 0xb8, 0x00, 0x4c, 0xcd, 0x21,
+            0xcd, 0x2b, 0xcd, 0x2c, 0xcd, 0x2d, 0xcd, 0x32, 0xcd, 0x34, 0xcd, 0x35, 0xcd, 0x36,
+            0xcd, 0x37, 0xcd, 0x38, 0xcd, 0x39, 0xcd, 0x3a, 0xcd, 0x3b, 0xcd, 0x3c, 0xcd, 0x3d,
+            0xcd, 0x3e, 0xcd, 0x3f, 0xcd, 0x6c, 0xb8, 0x00, 0x4c, 0xcd, 0x21,
         ];
         let mut machine =
             Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
@@ -26056,7 +26060,10 @@ mod tests {
         )
         .unwrap();
 
-        for vector in [0x2bu32, 0x2c, 0x2d, 0x2e, 0x6c] {
+        for vector in [
+            0x2bu32, 0x2c, 0x2d, 0x2e, 0x32, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c,
+            0x3d, 0x3e, 0x3f, 0x6c,
+        ] {
             let off = read_u16(&mut m, vector * 4);
             let seg = read_u16(&mut m, vector * 4 + 2);
             assert_eq!(seg, BIOS_ROM_IRET_SEG, "INT {vector:02X}h IRET segment");
