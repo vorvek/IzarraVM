@@ -130,8 +130,14 @@ pub struct HostKeyboard {
 
 impl HostKeyboard {
     /// Make on press, make|0x80 on release, each 0xE0-prefixed for extended
-    /// keys. Auto-repeat (repeat=true) re-emits the make. Empty for keys outside
-    /// the DOS set.
+    /// keys. Empty for keys outside the DOS set, and for host auto-repeat.
+    ///
+    /// Host auto-repeat (repeat=true) is dropped: a held key sends one make, and
+    /// the guest tracks its own down state until the break. Forwarding the host's
+    /// repeats floods the 8042 with makes, which buries a later break (a released
+    /// Shift never reaching the guest) and lags every other key behind the
+    /// backlog. Real typematic is the keyboard's job and belongs in 8042
+    /// emulation, not here; until then no repeat is better than a flood.
     pub fn key(&mut self, code: KeyCode, pressed: bool, repeat: bool) -> Vec<u8> {
         let Some((make, extended)) = keycode_to_set1(code) else {
             return Vec::new();
@@ -139,9 +145,10 @@ impl HostKeyboard {
         let id = code_id(make, extended);
         let mut out = Vec::with_capacity(2);
         if pressed {
-            if !repeat {
-                self.held.insert(id);
+            if repeat {
+                return Vec::new();
             }
+            self.held.insert(id);
             if extended {
                 out.push(0xe0);
             }
@@ -210,10 +217,12 @@ mod tests {
     }
 
     #[test]
-    fn auto_repeat_re_emits_the_make() {
+    fn auto_repeat_is_dropped() {
         let mut kb = HostKeyboard::default();
         assert_eq!(kb.key(KeyCode::KeyA, true, false), vec![0x1e]);
-        assert_eq!(kb.key(KeyCode::KeyA, true, true), vec![0x1e]); // repeat
+        assert!(kb.key(KeyCode::KeyA, true, true).is_empty()); // host repeat dropped
+        // The single press is tracked once, so release still emits one break.
+        assert_eq!(kb.key(KeyCode::KeyA, false, false), vec![0x9e]);
     }
 
     #[test]
