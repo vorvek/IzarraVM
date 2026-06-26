@@ -449,6 +449,13 @@ fn emulate(
     // Bring the RTC online: load cmos.bin (or write defaults) and seed the clock
     // from the host time read on the main thread at startup.
     rtc_setup.apply(&mut machine);
+    // Auto-match the guest keyboard layout to the host. Auto-detect wins each
+    // boot; the setup page / KEYB still change the live layout for the session.
+    if let Some(index) = crate::host_keyboard_layout_index() {
+        let mut cmos = machine.cmos_bytes();
+        cmos[0x10] = index;
+        machine.load_cmos(&cmos);
+    }
     if test_pattern {
         load_margo_test_pattern(&mut machine);
     }
