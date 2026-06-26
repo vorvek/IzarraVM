@@ -6099,6 +6099,24 @@ impl Machine {
             return;
         }
 
+        match ah {
+            // AH=16h detect disk change, AH=17h set disk type for format, and
+            // AH=18h set media type for format are meaningful even as probe calls.
+            0x16 => {
+                self.int13_floppy_change_status(dl);
+                return;
+            }
+            0x17 => {
+                self.int13_floppy_set_disk_type_for_format(dl);
+                return;
+            }
+            0x18 => {
+                self.int13_floppy_set_media_type_for_format(dl);
+                return;
+            }
+            _ => {}
+        }
+
         // With no floppy image mounted there is no drive to service. Leave the
         // registers and the IRET FLAGS image untouched so the guest sees the same
         // result the bare IRET stub gave before this handler existed.
@@ -6640,6 +6658,99 @@ impl Machine {
         self.set_int_frame_carry(false);
     }
 
+    /// AH=16h detect disk change. Izarra's in-memory drive has no change line, so
+    /// a mounted A: reports unchanged. An absent or non-wired drive reports not
+    /// ready.
+    fn int13_floppy_change_status(&mut self, dl: u8) {
+        if dl == 0x00 && self.floppy.is_some() {
+            self.set_eax_ah(0x00);
+            self.set_disk_status(0x00);
+            self.set_int_frame_carry(false);
+        } else {
+            self.set_eax_ah(0x80);
+            self.set_disk_status(0x80);
+            self.set_int_frame_carry(true);
+        }
+    }
+
+    /// AH=17h set disk type for format. The mounted image fixes the media
+    /// geometry, so this validates that the requested format class matches it.
+    fn int13_floppy_set_disk_type_for_format(&mut self, dl: u8) {
+        let al = self.cpu.registers.eax() as u8;
+        let Some(geom) = self.floppy.as_ref().map(|f| f.geometry()) else {
+            self.set_eax_ah(0x80);
+            self.set_disk_status(0x80);
+            self.set_int_frame_carry(true);
+            return;
+        };
+        if dl != 0x00 {
+            self.set_eax_ah(0x80);
+            self.set_disk_status(0x80);
+            self.set_int_frame_carry(true);
+            return;
+        }
+
+        let supported = match al {
+            0x01 | 0x02 => geom.cylinders == 40 && geom.sectors <= 9,
+            0x03 => geom.cylinders == 80 && geom.sectors == 15,
+            0x04 => geom.cylinders == 80 && geom.sectors == 9,
+            _ => false,
+        };
+        if supported {
+            self.set_eax_ah(0x00);
+            self.set_disk_status(0x00);
+            self.set_int_frame_carry(false);
+        } else {
+            self.set_eax_ah(0x0c);
+            self.set_disk_status(0x0c);
+            self.set_int_frame_carry(true);
+        }
+    }
+
+    /// AH=18h set media type for format. Returns ES:DI pointing at the resident
+    /// diskette parameter table when the requested cylinder and sector geometry
+    /// matches the mounted image.
+    fn int13_floppy_set_media_type_for_format(&mut self, dl: u8) {
+        let Some(geom) = self.floppy.as_ref().map(|f| f.geometry()) else {
+            self.set_eax_ah(0x80);
+            self.set_disk_status(0x80);
+            self.set_int_frame_carry(true);
+            return;
+        };
+        if dl != 0x00 {
+            self.set_eax_ah(0x0c);
+            self.set_disk_status(0x0c);
+            self.set_int_frame_carry(true);
+            return;
+        }
+
+        let cx = self.cpu.registers.ecx() as u16;
+        let cl = cx as u8;
+        let ch = (cx >> 8) as u8;
+        let requested_max_cyl = u16::from(ch) | (u16::from(cl & 0xc0) << 2);
+        let requested_sectors = cl & 0x3f;
+        if requested_max_cyl != geom.cylinders.saturating_sub(1)
+            || requested_sectors != geom.sectors
+        {
+            self.set_eax_ah(0x0c);
+            self.set_disk_status(0x0c);
+            self.set_int_frame_carry(true);
+            return;
+        }
+
+        let table = BIOS_DISKETTE_PARAMETER_TABLE_ADDR;
+        let seg = (table >> 4) as u16;
+        let off = (table & 0x0f) as u16;
+        self.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(seg));
+        let edi = (self.cpu.registers.edi() & !0xFFFF) | u32::from(off);
+        self.cpu.registers.set_edi(edi);
+        self.set_eax_ah(0x00);
+        self.set_disk_status(0x00);
+        self.set_int_frame_carry(false);
+    }
+
     /// INT 13h fixed-disk path (DL>=0x80). Only the first drive (0x80 = C:) is
     /// backed; any other unit reports no-such-drive. Status follows the AT BIOS
     /// convention: AH = result code (0 success), CF set on error. EDD AH=41h-48h
@@ -6650,9 +6761,7 @@ impl Machine {
         // absent fixed disk. The EDD install check (AH=41h) on an absent drive
         // also lands here through the default arm.
         if dl != 0x80 || self.ata.is_none() {
-            self.set_eax_ah(0x01);
-            self.set_disk_status(0x01);
-            self.set_int_frame_carry(true);
+            self.int13_hdd_error(0x01);
             return;
         }
         match ah {
@@ -6669,14 +6778,25 @@ impl Machine {
             0x02 | 0x03 => self.int13_hdd_transfer(ah),
             // AH=04 verify: confirm the run is in range without copying.
             0x04 => self.int13_hdd_verify(),
+            // AH=06/07 and AH=1A are controller-level format calls. The fixed
+            // disk image has no low-level format or defect table state.
+            0x06 | 0x07 | 0x1A => self.int13_hdd_error(0x01),
             // AH=08 get drive parameters: CHS geometry packed into CX/DH, fixed-
             // disk count in DL.
             0x08 => self.int13_hdd_parameters(),
             // AH=09 init drive pair, AH=0C seek, AH=0D alternate reset, AH=11
-            // recalibrate: all succeed with no data movement on this model.
-            0x09 | 0x0C | 0x0D | 0x11 => self.int13_hdd_ok(),
+            // recalibrate, AH=19 park heads: all succeed with no data movement.
+            0x09 | 0x0C | 0x0D | 0x11 | 0x19 => self.int13_hdd_ok(),
+            // AH=0A/0B read/write long: transfer 512 data bytes plus synthetic
+            // ECC bytes per sector.
+            0x0A | 0x0B => self.int13_hdd_long_transfer(ah),
+            // AH=0E/0F access an XT controller sector buffer, which this ATA model
+            // does not expose.
+            0x0E | 0x0F => self.int13_hdd_error(0x01),
             // AH=10 test drive ready, AH=14 controller diagnostic: ready/OK.
             0x10 | 0x14 => self.int13_hdd_ok(),
+            // AH=12 controller RAM diagnostic, AH=13 drive diagnostic.
+            0x12 | 0x13 => self.int13_hdd_diagnostic_ok(),
             // AH=15 get DASD type: AH=03 (fixed disk), and the total sector count
             // in CX:DX.
             0x15 => self.int13_hdd_dasd(),
@@ -6687,11 +6807,7 @@ impl Machine {
             // EDD get extended drive parameters into a result buffer at DS:SI.
             0x48 => self.int13_edd_drive_params(),
             // Genuinely unknown subfunctions report invalid-function.
-            _ => {
-                self.set_eax_ah(0x01);
-                self.set_fixed_disk_status(0x01);
-                self.set_int_frame_carry(true);
-            }
+            _ => self.int13_hdd_error(0x01),
         }
     }
 
@@ -6706,6 +6822,20 @@ impl Machine {
         self.set_eax_ah(0x00);
         self.set_fixed_disk_status(0x00);
         self.set_int_frame_carry(false);
+    }
+
+    /// Common failure for a fixed-disk call.
+    fn int13_hdd_error(&mut self, status: u8) {
+        self.set_eax_ah(status);
+        self.set_fixed_disk_status(status);
+        self.set_int_frame_carry(true);
+    }
+
+    /// AH=12h/13h diagnostics return AL=0 when the controller or drive test
+    /// completes successfully.
+    fn int13_hdd_diagnostic_ok(&mut self) {
+        self.set_eax_al(0x00);
+        self.int13_hdd_ok();
     }
 
     /// Read the CHS address out of the INT 13h register layout: CH = cylinder low
@@ -6779,6 +6909,71 @@ impl Machine {
             self.set_eax_ah(0x04);
             self.set_fixed_disk_status(0x04);
             self.set_int_frame_carry(true);
+        }
+    }
+
+    /// AH=0Ah/0Bh read/write long. A classic BIOS moves sector data followed by
+    /// controller ECC bytes. The ATA image stores only 512-byte sectors, so reads
+    /// append four zero ECC bytes and writes ignore the caller's ECC trailer.
+    fn int13_hdd_long_transfer(&mut self, ah: u8) {
+        const LONG_SECTOR_BYTES: u32 = ata::SECTOR as u32 + 4;
+        const ZERO_ECC: [u8; 4] = [0; 4];
+
+        let count = self.cpu.registers.eax() as u8;
+        let (cyl, head, sector) = self.int13_chs();
+        let es = self.cpu.registers.segment(SegmentIndex::Es).base;
+        let bx = self.cpu.registers.ebx() as u16;
+        let buffer = es.wrapping_add(u32::from(bx));
+
+        let Some(start_lba) = self
+            .ata
+            .as_ref()
+            .and_then(|d| d.chs_to_lba(cyl, head, sector))
+        else {
+            self.set_eax_al(0);
+            self.int13_hdd_error(0x04);
+            return;
+        };
+
+        self.c_accesses += 1;
+        let mut done: u8 = 0;
+        for i in 0..count {
+            let lba = start_lba + u32::from(i);
+            let addr = buffer.wrapping_add(u32::from(i) * LONG_SECTOR_BYTES);
+            if ah == 0x0A {
+                let data = self
+                    .ata
+                    .as_ref()
+                    .and_then(|d| d.read_lba(lba))
+                    .map(<[u8]>::to_vec);
+                match data {
+                    Some(bytes) => {
+                        self.write_guest_block(addr, &bytes);
+                        self.write_guest_block(addr.wrapping_add(ata::SECTOR as u32), &ZERO_ECC);
+                    }
+                    None => break,
+                }
+            } else {
+                let bytes = self.read_guest_block(addr, ata::SECTOR);
+                let wrote = self
+                    .ata
+                    .as_mut()
+                    .map(|d| d.write_lba(lba, &bytes))
+                    .unwrap_or(false);
+                if !wrote {
+                    break;
+                }
+            }
+            done += 1;
+        }
+
+        self.set_eax_al(done);
+        if done == count {
+            self.set_eax_ah(0x00);
+            self.set_fixed_disk_status(0x00);
+            self.set_int_frame_carry(false);
+        } else {
+            self.int13_hdd_error(0x04);
         }
     }
 
@@ -15074,6 +15269,65 @@ mod tests {
         assert_eq!(m.memory.read_u8(0x441).unwrap(), 0x80, "status = no drive");
     }
 
+    #[test]
+    fn int13_ah16_reports_floppy_not_changed() {
+        let mut m = int15_machine(16);
+        m.mount_floppy(vec![0u8; 1_474_560]).unwrap();
+        prime_dos_int_frame(&mut m);
+
+        m.cpu.registers.set_eax(0x1600);
+        m.cpu.registers.set_edx(0x0000);
+        m.handle_int13();
+
+        assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x00, "AH=0");
+        assert_eq!(m.memory.read_u8(0x441).unwrap(), 0x00, "status = success");
+        assert_eq!(dos_int_flags(&m) & 0x0001, 0, "CF clear");
+    }
+
+    #[test]
+    fn int13_ah17_validates_floppy_format_class() {
+        let mut m = int15_machine(16);
+        m.mount_floppy(vec![0u8; 737_280]).unwrap(); // 720 KB
+
+        m.cpu.registers.set_eax(0x1704);
+        m.cpu.registers.set_edx(0x0000);
+        m.handle_int13();
+        assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x00, "720 KB accepted");
+
+        m.cpu.registers.set_eax(0x1703);
+        m.cpu.registers.set_edx(0x0000);
+        m.handle_int13();
+        assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x0c, "1.2 MB rejected");
+        assert_eq!(
+            m.memory.read_u8(0x441).unwrap(),
+            0x0c,
+            "status = unsupported media"
+        );
+    }
+
+    #[test]
+    fn int13_ah18_returns_diskette_parameter_table_for_current_media() {
+        let mut m = int15_machine(16);
+        m.mount_floppy(vec![0u8; 1_474_560]).unwrap(); // 80 cyl, 18 spt
+        prime_dos_int_frame(&mut m);
+
+        m.cpu.registers.set_eax(0x1800);
+        m.cpu.registers.set_ecx(0x4f12); // max cylinder 79, 18 sectors
+        m.cpu.registers.set_edx(0x0000);
+        m.cpu.registers.set_edi(0xCAFE_1234);
+        m.handle_int13();
+
+        assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x00, "AH=0");
+        assert_eq!(dos_int_flags(&m) & 0x0001, 0, "CF clear");
+        let es = m.cpu.registers.segment(SegmentIndex::Es).base;
+        let di = m.cpu.registers.edi() as u16;
+        assert_eq!(
+            es + u32::from(di),
+            BIOS_DISKETTE_PARAMETER_TABLE_ADDR,
+            "ES:DI points at the DPT"
+        );
+    }
+
     /// A small hard-disk image whose first byte per sector marks the LBA, plus an
     /// otherwise-zero machine with the disk mounted as C:.
     fn machine_with_hdd(sectors: usize) -> Machine {
@@ -15201,6 +15455,68 @@ mod tests {
     }
 
     #[test]
+    fn int13_ah0a_read_long_includes_synthetic_ecc_bytes() {
+        let mut m = machine_with_hdd(64);
+        for i in 0..516u32 {
+            m.write_physical_u8(0x4_0000 + i, 0xAA);
+        }
+
+        m.cpu.registers.set_eax(0x0A01);
+        m.cpu.registers.set_ecx(0x0001);
+        m.cpu.registers.set_edx(0x0080);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x4000));
+        m.cpu.registers.set_ebx(0x0000);
+        m.handle_int13();
+
+        assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x00, "AH=0");
+        assert_eq!(m.cpu.registers.eax() as u8, 0x01, "AL=1 sector moved");
+        assert_eq!(m.read_physical_u8(0x4_0000), 0x10, "sector data copied");
+        for i in 0..4u32 {
+            assert_eq!(
+                m.read_physical_u8(0x4_0000 + 512 + i),
+                0x00,
+                "synthetic ECC byte {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn int13_ah0b_write_long_ignores_ecc_bytes() {
+        let mut m = machine_with_hdd(64);
+        for i in 0..512u32 {
+            m.write_physical_u8(0x2_0000 + i, (i as u8).wrapping_mul(3));
+        }
+        for i in 0..4u32 {
+            m.write_physical_u8(0x2_0000 + 512 + i, 0xE0 + i as u8);
+        }
+
+        m.cpu.registers.set_eax(0x0B01);
+        m.cpu.registers.set_ecx(0x0001);
+        m.cpu.registers.set_edx(0x0080);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x2000));
+        m.cpu.registers.set_ebx(0x0000);
+        m.handle_int13();
+        assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x00, "write long AH=0");
+
+        m.cpu.registers.set_eax(0x0201);
+        m.cpu.registers.set_ecx(0x0001);
+        m.cpu.registers.set_edx(0x0080);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x3000));
+        m.cpu.registers.set_ebx(0x0000);
+        m.handle_int13();
+        assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x00, "read AH=0");
+        for i in 0..512u32 {
+            assert_eq!(m.read_physical_u8(0x3_0000 + i), (i as u8).wrapping_mul(3));
+        }
+    }
+
+    #[test]
     fn int13_ah08_reports_hard_disk_geometry() {
         let mut m = machine_with_hdd(4032); // 4 cylinders, 16 heads, 63 spt
         m.cpu.registers.set_eax(0x0800);
@@ -15259,6 +15575,33 @@ mod tests {
         assert_eq!(m.cpu.registers.ebx() as u16, 0xAA55, "BX=0xAA55 present");
         assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x30, "EDD version 3.0");
         assert_eq!(m.cpu.registers.ecx() as u16 & 0x0001, 0x0001, "ext access");
+    }
+
+    #[test]
+    fn int13_legacy_fixed_disk_controls_report_status() {
+        let mut m = machine_with_hdd(64);
+
+        m.cpu.registers.set_eax(0x12ff);
+        m.cpu.registers.set_edx(0x0080);
+        m.handle_int13();
+        assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x00, "AH=12 success");
+        assert_eq!(m.cpu.registers.eax() as u8, 0x00, "AL=0 diagnostic code");
+
+        m.cpu.registers.set_eax(0x1300);
+        m.cpu.registers.set_edx(0x0080);
+        m.handle_int13();
+        assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x00, "AH=13 success");
+
+        m.cpu.registers.set_eax(0x1900);
+        m.cpu.registers.set_edx(0x0080);
+        m.handle_int13();
+        assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x00, "AH=19 success");
+
+        m.cpu.registers.set_eax(0x0600);
+        m.cpu.registers.set_edx(0x0080);
+        m.handle_int13();
+        assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x01, "format rejected");
+        assert_eq!(m.memory.read_u8(0x474).unwrap(), 0x01, "fixed status");
     }
 
     #[test]
