@@ -555,6 +555,8 @@ pub struct Machine {
     // overflow the main-thread stack before the binary did any work. On the heap
     // it costs one pointer and the copies stay cheap.
     video: Box<Vga>,
+    paradise_non_vga: bool,
+    paradise_regs: [u8; 6],
     margo: Margo,
     distira: Distira,
     pci: PciConfig,
@@ -1077,6 +1079,8 @@ impl Machine {
             timing,
             cpu,
             video: Box::new(Vga::default()),
+            paradise_non_vga: false,
+            paradise_regs: [0; 6],
             margo: Margo::default(),
             distira,
             pci,
@@ -2049,6 +2053,41 @@ impl Machine {
         ok
     }
 
+    fn int10_set_mode_number(&mut self, mode: u8) -> bool {
+        match mode {
+            0x0D..=0x12 => {
+                if !self.set_vga_mode(mode) {
+                    return false;
+                }
+                let cols = if mode == 0x0D { 40 } else { 80 };
+                self.set_bda_video_mode(mode, cols, 25);
+            }
+            0x13 => {
+                self.video.set_mode13h();
+                self.margo_active = false;
+                self.distira.disable_display();
+                self.set_bda_video_mode(0x13, 40, 25);
+            }
+            0x04..=0x06 => {
+                self.video.set_cga_mode(mode);
+                self.margo_active = false;
+                self.distira.disable_display();
+                let cols = if mode == 0x06 { 80 } else { 40 };
+                self.set_bda_video_mode(mode, cols, 25);
+            }
+            0x00..=0x03 | 0x07 => {
+                self.video.set_text_mode();
+                self.margo_active = false;
+                self.distira.disable_display();
+                let cols = if mode <= 0x01 { 40 } else { 80 };
+                self.set_bda_video_mode(mode, cols, 25);
+                let _ = self.memory.write_u16(0x450, 0);
+            }
+            _ => return false,
+        }
+        true
+    }
+
     /// Service the host side of an `INT 10h` after the instruction retires.
     /// The CPU registers are intact here: a software interrupt only pushes
     /// flags/CS/IP.
@@ -2060,46 +2099,16 @@ impl Machine {
         let bh = (bx >> 8) as u8;
         let bl = bx as u8;
         if ah == 0x00 {
-            match al {
-                // The 16-color planar modes this slice implements.
-                0x0D | 0x0E | 0x10 | 0x12 => {
-                    self.set_vga_mode(al); // clears the Margo latch internally
-                    let cols = if al == 0x0D { 40 } else { 80 };
-                    self.set_bda_video_mode(al, cols, 25);
-                    return;
-                }
-                // Chained mode 13h.
-                0x13 => {
-                    self.video.set_mode13h();
-                    self.margo_active = false;
-                    self.distira.disable_display();
-                    self.set_bda_video_mode(0x13, 40, 25);
-                    return;
-                }
-                // CGA graphics: 04h/05h are 320x200x4, 06h is 640x200x2. The B800
-                // framebuffer renders through the CGA personality (set_cga_mode).
-                0x04..=0x06 => {
-                    self.video.set_cga_mode(al);
-                    self.margo_active = false;
-                    self.distira.disable_display();
-                    let cols = if al == 0x06 { 80 } else { 40 };
-                    self.set_bda_video_mode(al, cols, 25);
-                    return;
-                }
-                // The 80x25 color text family (2/3), monochrome text (7), and the
-                // 40x25 variants (0/1) map to the single text personality.
-                0x00..=0x03 | 0x07 => {
-                    self.video.set_text_mode();
-                    self.margo_active = false;
-                    self.distira.disable_display();
-                    let cols = if al <= 0x01 { 40 } else { 80 };
-                    self.set_bda_video_mode(al, cols, 25);
-                    // A mode set clears the screen and homes the BDA cursor, so
-                    // teletyped output starts at the top left.
-                    let _ = self.memory.write_u16(0x450, 0);
-                    return;
-                }
-                _ => {}
+            if al == 0x7e {
+                self.int10_paradise_set_special_mode();
+                return;
+            }
+            if al == 0x7f {
+                self.int10_paradise_extended(bh, bl);
+                return;
+            }
+            if self.int10_set_mode_number(al) {
+                return;
             }
         }
         if ah == 0x05 {
@@ -2232,6 +2241,108 @@ impl Machine {
         let _ = self.memory.write_u16(0x44a, columns);
         let _ = self.memory.write_u8(0x484, rows.saturating_sub(1));
         let _ = self.memory.write_u16(0x463, 0x03d4); // VGA CRTC base port
+    }
+
+    fn int10_paradise_set_special_mode(&mut self) {
+        let width = self.cpu.registers.ebx() as u16;
+        let height = self.cpu.registers.ecx() as u16;
+        let colors = self.cpu.registers.edx() as u16;
+        let mode = match (width, height, colors) {
+            (40, 25, 16) => Some(0x00),
+            (80, 25, 16) => Some(0x03),
+            (80, 25, 0) => Some(0x07),
+            (320, 200, 4) => Some(0x04),
+            (640, 200, 0 | 2) => Some(0x06),
+            (320, 200, 16) => Some(0x0D),
+            (640, 200, 16) => Some(0x0E),
+            (640, 350, 0 | 2) => Some(0x0F),
+            (640, 350, 16) => Some(0x10),
+            (640, 480, 0 | 2) => Some(0x11),
+            (640, 480, 16) => Some(0x12),
+            (320, 200, 256) => Some(0x13),
+            _ => None,
+        };
+
+        let ok = match mode {
+            Some(mode) => self.int10_set_mode_number(mode),
+            None => false,
+        };
+        if ok {
+            self.set_eax_al(0x7E);
+            self.set_bh(0x7E);
+        } else {
+            self.set_bh(0x00);
+        }
+    }
+
+    fn int10_paradise_extended(&mut self, bh: u8, bl: u8) {
+        let ok = match bh {
+            0x00 => {
+                self.paradise_non_vga = false;
+                true
+            }
+            0x01 => {
+                self.paradise_non_vga = true;
+                true
+            }
+            0x02 => {
+                self.set_bl(u8::from(self.paradise_non_vga));
+                let used = self.int10_current_vram_units();
+                self.set_cx((4 << 8) | u16::from(used));
+                true
+            }
+            0x03 | 0x29..=0x2F | 0x60 | 0xA5 | 0xA6 => true,
+            0x04 => {
+                self.paradise_non_vga = true;
+                self.int10_set_mode_number(0x07)
+            }
+            0x05 => {
+                self.paradise_non_vga = true;
+                true
+            }
+            0x06 => {
+                self.paradise_non_vga = false;
+                self.int10_set_mode_number(0x07)
+            }
+            0x07 => {
+                self.paradise_non_vga = false;
+                self.int10_set_mode_number(0x03)
+            }
+            0x0A..=0x0F => {
+                self.paradise_regs[usize::from(bh - 0x0A)] = bl;
+                true
+            }
+            0x1A..=0x1F => {
+                self.set_bl(self.paradise_regs[usize::from(bh - 0x1A)]);
+                true
+            }
+            0x61 => {
+                let addr = self
+                    .cpu
+                    .registers
+                    .segment(SegmentIndex::Es)
+                    .base
+                    .wrapping_add(u32::from(self.cpu.registers.edi() as u16));
+                self.write_physical_u8(addr, 0);
+                true
+            }
+            _ => false,
+        };
+
+        if ok {
+            self.set_eax_al(0x7F);
+            self.set_bh(0x7F);
+        } else {
+            self.set_bh(0x00);
+        }
+    }
+
+    fn int10_current_vram_units(&mut self) -> u8 {
+        match self.read_physical_u8(0x449) {
+            0x12 => 3,
+            0x0F..=0x11 => 2,
+            _ => 1,
+        }
     }
 
     /// INT 10h AH=12h alternate function select. The common VGA calls are mostly
@@ -3385,6 +3496,18 @@ impl Machine {
     /// Replace the low 16 bits of EBX.
     fn set_bx(&mut self, bx: u16) {
         let ebx = (self.cpu.registers.ebx() & !0xFFFF) | u32::from(bx);
+        self.cpu.registers.set_ebx(ebx);
+    }
+
+    /// Replace BH, leaving BL and the upper half intact.
+    fn set_bh(&mut self, bh: u8) {
+        let ebx = (self.cpu.registers.ebx() & !0xFF00) | (u32::from(bh) << 8);
+        self.cpu.registers.set_ebx(ebx);
+    }
+
+    /// Replace BL, leaving BH and the upper half intact.
+    fn set_bl(&mut self, bl: u8) {
+        let ebx = (self.cpu.registers.ebx() & !0xFF) | u32::from(bl);
         self.cpu.registers.set_ebx(ebx);
     }
 
@@ -21032,6 +21155,75 @@ mod tests {
         assert_eq!(machine.video().raster_height(), 525);
 
         assert!(!machine.set_vga_mode(0x99));
+    }
+
+    #[test]
+    fn int10_paradise_special_mode_selects_existing_mode() {
+        let mut machine = int15_machine(16);
+
+        machine.cpu.registers.set_eax(0x007E);
+        machine.cpu.registers.set_ebx(320);
+        machine.cpu.registers.set_ecx(200);
+        machine.cpu.registers.set_edx(256);
+        machine.handle_int10();
+        assert_eq!((machine.cpu.registers.eax() as u16) & 0x00FF, 0x007E);
+        assert_eq!(((machine.cpu.registers.ebx() as u16) >> 8) as u8, 0x7E);
+        assert_eq!(machine.video().active_mode(), VideoMode::Mode13h);
+        assert_eq!(machine.read_physical_u8(0x449), 0x13);
+
+        machine.cpu.registers.set_eax(0x007E);
+        machine.cpu.registers.set_ebx(800);
+        machine.cpu.registers.set_ecx(600);
+        machine.cpu.registers.set_edx(16);
+        machine.handle_int10();
+        assert_eq!(((machine.cpu.registers.ebx() as u16) >> 8) as u8, 0x00);
+    }
+
+    #[test]
+    fn int10_paradise_extended_status_and_registers() {
+        let mut machine = int15_machine(16);
+
+        machine.cpu.registers.set_eax(0x007F);
+        machine.cpu.registers.set_ebx(0x0A5A);
+        machine.handle_int10();
+        assert_eq!(((machine.cpu.registers.ebx() as u16) >> 8) as u8, 0x7F);
+
+        machine.cpu.registers.set_eax(0x007F);
+        machine.cpu.registers.set_ebx(0x1A00);
+        machine.handle_int10();
+        assert_eq!(((machine.cpu.registers.ebx() as u16) >> 8) as u8, 0x7F);
+        assert_eq!((machine.cpu.registers.ebx() as u16) & 0x00FF, 0x005A);
+
+        machine.cpu.registers.set_eax(0x007F);
+        machine.cpu.registers.set_ebx(0x0100);
+        machine.handle_int10();
+        machine.cpu.registers.set_eax(0x007F);
+        machine.cpu.registers.set_ebx(0x0200);
+        machine.handle_int10();
+        assert_eq!(((machine.cpu.registers.ebx() as u16) >> 8) as u8, 0x7F);
+        assert_eq!((machine.cpu.registers.ebx() as u16) & 0x00FF, 0x0001);
+        assert_eq!(machine.cpu.registers.ecx() as u16, 0x0401);
+
+        machine.cpu.registers.set_eax(0x007F);
+        machine.cpu.registers.set_ebx(0x0700);
+        machine.handle_int10();
+        assert_eq!(machine.read_physical_u8(0x449), 0x03);
+        machine.cpu.registers.set_eax(0x007F);
+        machine.cpu.registers.set_ebx(0x0200);
+        machine.handle_int10();
+        assert_eq!((machine.cpu.registers.ebx() as u16) & 0x00FF, 0x0000);
+
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x4000));
+        machine.cpu.registers.set_edi(0x0100);
+        machine.write_physical_u8(0x40100, 0xFF);
+        machine.cpu.registers.set_eax(0x007F);
+        machine.cpu.registers.set_ebx(0x6100);
+        machine.handle_int10();
+        assert_eq!(((machine.cpu.registers.ebx() as u16) >> 8) as u8, 0x7F);
+        assert_eq!(machine.read_physical_u8(0x40100), 0x00);
     }
 
     #[test]
