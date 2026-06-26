@@ -23,7 +23,7 @@
 
 ; --- SETUP_SCRATCH layout (segment 0) --------------------------------------
 %define SU_WORKING_MODE   SETUP_SCRATCH + 0    ; edited GSW mode (0/1/2)
-%define SU_WORKING_LAYOUT SETUP_SCRATCH + 1    ; edited keyboard layout (0..5)
+%define SU_WORKING_LAYOUT SETUP_SCRATCH + 1    ; edited keyboard layout (0..16)
 %define SU_CURSOR         SETUP_SCRATCH + 2    ; highlighted main-menu row
 %define SU_TIME_FIELD     SETUP_SCRATCH + 3    ; highlighted time field (0..5)
 %define SU_TIME_EDITED    SETUP_SCRATCH + 4    ; 1 once the time was changed
@@ -71,10 +71,10 @@
 %define SU_NVRAM_LAYOUT   0x10
 %define SU_NVRAM_GSW      0x12
 
-; Number of selectable keyboard layouts (en-US/UK/ES/FR/DE/IT). The active table
-; selection lives in CMOS 0x10; the layout-switching ISR is a separate stream, so
-; this page only persists the index and names the choice.
-%define SU_LAYOUT_COUNT   6
+; Number of selectable keyboard layouts (US/UK/SP/FR/GR/IT/BE/CF/DK/NL/NO/PO/SF/SG/SU/SV/LA).
+; The active table selection lives in CMOS 0x10; the layout-switching ISR is a separate
+; stream, so this page only persists the index and names the choice.
+%define SU_LAYOUT_COUNT   17
 
 ; Set 1 make codes for the navigation and action keys.
 %define SC_ESC            0x01
@@ -505,7 +505,7 @@ su_cursor_inc:
     ret
 
 ; su_edit_left / su_edit_right: Left/Right on the main menu edit the inline rows.
-; LAYOUT cycles the keyboard layout 0..5; GSW cycles the mode 0..2. Other rows are
+; LAYOUT cycles the keyboard layout 0..16; GSW cycles the mode 0..2. Other rows are
 ; not inline-editable, so the keys are ignored there. DS = 0. Clobbers AX, BX.
 su_edit_left:
     xor ax, ax
@@ -590,6 +590,20 @@ su_commit:
     mov ds, bx
     mov [KB_LAYOUT], al
     pop ds
+    ; Look up the code-page index for the new layout and write CMOS 0x11 so the
+    ; font follows the layout. kbd_layout_codepage is a CS-relative ROM table.
+    mov bx, SU_WORKING_LAYOUT
+    mov bl, [bx]                   ; BL = layout index (0..16)
+    xor bh, bh
+    mov al, [cs:kbd_layout_codepage + bx]  ; AL = code-page index (0..4)
+    mov ah, CP_CMOS_INDEX          ; 0x11
+    call su_cmos_write
+    ; Load the matching font live so the change is visible without a reboot.
+    mov bx, SU_WORKING_LAYOUT
+    mov bl, [bx]
+    xor bh, bh
+    mov al, [cs:kbd_layout_codepage + bx]
+    call load_codepage_font
     ; CMOS 0x12 = GSW default.
     mov bx, SU_WORKING_MODE
     mov al, [bx]
@@ -1533,15 +1547,31 @@ su_str_mode386:      db '386', 0
 su_str_mode486:      db '486', 0
 su_str_mode586:      db '586', 0
 
-; Keyboard layout names, indexed by CMOS 0x10 (0 en-US .. 5 IT).
-su_str_lay_us:       db 'en-US', 0
+; Keyboard layout names, indexed by CMOS 0x10 (0 US .. 16 LA).
+; Codes match the MS-DOS KEYB tool identifiers.
+su_str_lay_us:       db 'US', 0
 su_str_lay_uk:       db 'UK', 0
-su_str_lay_es:       db 'ES', 0
+su_str_lay_es:       db 'SP', 0
 su_str_lay_fr:       db 'FR', 0
-su_str_lay_de:       db 'DE', 0
+su_str_lay_de:       db 'GR', 0
 su_str_lay_it:       db 'IT', 0
+su_str_lay_be:       db 'BE', 0
+su_str_lay_cf:       db 'CF', 0
+su_str_lay_dk:       db 'DK', 0
+su_str_lay_nl:       db 'NL', 0
+su_str_lay_no:       db 'NO', 0
+su_str_lay_po:       db 'PO', 0
+su_str_lay_sf:       db 'SF', 0
+su_str_lay_sg:       db 'SG', 0
+su_str_lay_su:       db 'SU', 0
+su_str_lay_sv:       db 'SV', 0
+su_str_lay_la:       db 'LA', 0
 su_layout_names:     dw su_str_lay_us, su_str_lay_uk, su_str_lay_es
                      dw su_str_lay_fr, su_str_lay_de, su_str_lay_it
+                     dw su_str_lay_be, su_str_lay_cf, su_str_lay_dk
+                     dw su_str_lay_nl, su_str_lay_no, su_str_lay_po
+                     dw su_str_lay_sf, su_str_lay_sg, su_str_lay_su
+                     dw su_str_lay_sv, su_str_lay_la
 
 su_str_time_title:   db 'SET TIME AND DATE', 0
 su_str_time_hint:    db 'L/R field  Up/Dn change  Esc back', 0

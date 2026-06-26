@@ -22,7 +22,8 @@ reset:                          ; ROM offset 0; the reset vector far-jumps here
 %include "izbios-codepage.inc"  ; foundation: code-page font loader (Lotura 0xE7 + INT 10h)
 %include "izbios-lfb.inc"       ; foundation: 320x240x8 LFB draw primitives
 %include "izbios-kbd.inc"       ; foundation: INT 09h/16h + kb_getkey/kb_flush
-%include "kbd-layouts.inc"      ; foundation: six scancode -> ASCII layout tables
+%include "kbd-layouts.inc"      ; foundation: scancode -> ASCII layout tables (17 layouts)
+%include "kbd-layout-meta.inc"  ; generated: kbd_layout_codepage table (cp index per layout)
 %include "izbios-result.inc"    ; foundation: POST_STEP macro + result_append
 %include "probes/probe-cpu.inc"      ; STREAM C: GSW-586 CPU (CPUID identity)
 %include "probes/probe-margo.inc"    ; STREAM C: VEGA/Margo video (screen path)
