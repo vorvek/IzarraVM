@@ -614,6 +614,41 @@ fn select_rom(bios: Option<&Path>) -> Result<Vec<u8>, Box<dyn Error>> {
     }
 }
 
+/// Map a Windows LANGID to one of the six guest layout indices
+/// (0 US, 1 UK, 2 ES, 3 FR, 4 DE, 5 IT). Unknown languages fall back to US.
+pub(crate) fn layout_index_from_langid(langid: u16) -> u8 {
+    if langid == 0x0809 {
+        return 1; // en-GB
+    }
+    match langid & 0x03ff {
+        0x09 => 0, // English (non-GB) -> US
+        0x0a => 2, // Spanish (any region) -> ES
+        0x0c => 3, // French -> FR
+        0x07 => 4, // German -> DE
+        0x10 => 5, // Italian -> IT
+        _ => 0,
+    }
+}
+
+/// The host keyboard layout as a guest index, or None when it cannot be read
+/// (non-Windows).
+#[cfg(target_os = "windows")]
+pub(crate) fn host_keyboard_layout_index() -> Option<u8> {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        #[link_name = "GetKeyboardLayout"]
+        fn get_keyboard_layout(thread_id: u32) -> usize;
+    }
+    let hkl = unsafe { get_keyboard_layout(0) };
+    let langid = (hkl & 0xffff) as u16;
+    Some(layout_index_from_langid(langid))
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn host_keyboard_layout_index() -> Option<u8> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -629,5 +664,18 @@ mod tests {
         assert_eq!(ascii_to_set1('!'), vec![0x2a, 0x02, 0x82, 0xaa]);
         // Characters with no US-layout key produce nothing.
         assert!(ascii_to_set1('\u{00f1}').is_empty());
+    }
+
+    #[test]
+    fn langid_maps_to_guest_layout_index() {
+        assert_eq!(layout_index_from_langid(0x0409), 0); // en-US
+        assert_eq!(layout_index_from_langid(0x0809), 1); // en-GB
+        assert_eq!(layout_index_from_langid(0x1009), 0); // en-CA -> US
+        assert_eq!(layout_index_from_langid(0x0c0a), 2); // es-ES
+        assert_eq!(layout_index_from_langid(0x080a), 2); // es-MX -> ES
+        assert_eq!(layout_index_from_langid(0x040c), 3); // fr-FR
+        assert_eq!(layout_index_from_langid(0x0407), 4); // de-DE
+        assert_eq!(layout_index_from_langid(0x0410), 5); // it-IT
+        assert_eq!(layout_index_from_langid(0x0411), 0); // ja-JP -> US fallback
     }
 }
