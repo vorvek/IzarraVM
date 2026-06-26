@@ -4,8 +4,9 @@
  *   With no argument, reports the current BIOS layout.
  *   With a supported MS-DOS layout code, updates the BIOS layout byte and CMOS.
  *
- * CMOS 0x10 holds the keyboard layout index; CMOS 0x11 holds the code-page
- * index that drives the VGA font loader on the next boot.
+ * CMOS 0x10 holds the keyboard layout index; CMOS 0x13 holds the code-page
+ * index that drives the VGA font loader on the next boot (0x11 is the boot
+ * order, 0x12 the GSW default).
  *
  * Code-page indices: 0=CP437 (US/UK), 1=CP850 (Western Europe),
  * 2=CP860 (Portugal), 3=CP863 (Canadian French), 4=CP865 (Nordic).
@@ -17,7 +18,7 @@
 
 #define BDA_KB_LAYOUT (*(unsigned char far *)MK_FP(0x0040, 0x0096))
 #define CMOS_KB_LAYOUT  0x10
-#define CMOS_KB_CODEPAGE 0x11
+#define CMOS_KB_CODEPAGE 0x13
 
 struct layout_entry {
     const char *code;

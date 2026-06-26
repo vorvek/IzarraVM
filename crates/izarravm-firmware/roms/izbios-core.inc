@@ -24,7 +24,7 @@ bios_start:
     mov al, KB_CMOS_LAYOUT
     out 0x70, al
     in al, 0x71
-    cmp al, 6
+    cmp al, 17                  ; 17 imported layouts (0..16)
     jb .layout_ok
     xor al, al
 .layout_ok:
@@ -104,7 +104,7 @@ bios_start:
     sti
     call run_post              ; walk the POST step table, append each record
     call setup_maybe_enter     ; STREAM D setup-page hook (foundation stub: ret)
-    ; Load the boot code-page font (CMOS 0x11) into the VGA character generator.
+    ; Load the boot code-page font (CMOS 0x13) into the VGA character generator.
     ; This runs after POST so the BDA character height (0040:0085) is settled and
     ; the host has seeded the font tables for the default 8x16 text mode.
     call boot_load_codepage

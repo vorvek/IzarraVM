@@ -31839,7 +31839,7 @@ mod tests {
     fn boot_and_read_font_rows(cmos_codepage: u8, glyph: u8, rows: usize) -> Vec<u8> {
         let profile = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios()).unwrap();
-        machine.set_cmos_byte(0x11, cmos_codepage);
+        machine.set_cmos_byte(0x13, cmos_codepage);
         machine.run_until_halt_or_cycles(20_000_000).unwrap();
         (0..rows)
             .map(|r| machine.video().active_font_glyph_row(glyph, r))
@@ -31849,7 +31849,7 @@ mod tests {
     #[test]
     fn boot_codepage_byte_loads_font_into_generator() {
         // CP850 8x16 block is CODEPAGE_FONTS[9728 .. 9728+4096]. Glyph 0xB5 there is
-        // A-acute; under CP437 it is a box-drawing piece. Booting with CMOS 0x11 = 1
+        // A-acute; under CP437 it is a box-drawing piece. Booting with CMOS 0x13 = 1
         // must leave the VGA font generator holding the CP850 glyph.
         let want: Vec<u8> = (0..16)
             .map(|r| izarravm_firmware::CODEPAGE_FONTS[9728 + 0xB5 * 16 + r])

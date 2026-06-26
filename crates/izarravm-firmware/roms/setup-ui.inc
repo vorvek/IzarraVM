@@ -596,7 +596,7 @@ su_commit:
     mov bl, [bx]                   ; BL = layout index (0..16)
     xor bh, bh
     mov al, [cs:kbd_layout_codepage + bx]  ; AL = code-page index (0..4)
-    mov ah, CP_CMOS_INDEX          ; 0x11
+    mov ah, CP_CMOS_INDEX          ; 0x13
     call su_cmos_write
     ; Load the matching font live so the change is visible without a reboot.
     mov bx, SU_WORKING_LAYOUT

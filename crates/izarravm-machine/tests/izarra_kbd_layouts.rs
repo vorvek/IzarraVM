@@ -119,3 +119,13 @@ fn it_qwerty_minus_key_is_apostrophe() {
         b'@'
     );
 }
+
+#[test]
+fn imported_countries_emit_their_native_keys() {
+    // Distinguishing keys for layouts beyond the original six, each a byte in
+    // that layout's code page (the converter re-encodes per layout).
+    assert_eq!(translate(10, 0x1a), 0x86); // NO: a-ring (CP865 0x86)
+    assert_eq!(translate(11, 0x27), 0x87); // PO: c-cedilla (CP860 0x87)
+    assert_eq!(translate(7, 0x35), 0x82); // CF: e-acute (CP863 0x82)
+    assert_eq!(translate(16, 0x27), 0xa4); // LA: n-tilde (CP850 0xA4)
+}
