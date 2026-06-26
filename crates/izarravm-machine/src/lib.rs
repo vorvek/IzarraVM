@@ -2167,8 +2167,42 @@ impl Machine {
             self.int10_write_string();
             return;
         }
+        if ah == 0x15 {
+            // Convertible display parameters: no alternate physical display.
+            self.set_ax(0x0000);
+            return;
+        }
         if ah == 0x1c {
             self.int10_save_restore_state(al);
+            return;
+        }
+        if matches!(ah, 0x70 | 0x71) {
+            // Tandy 1000 RAM address queries. This VGA profile has no Tandy planes.
+            self.set_ax(0x0000);
+            self.set_bx(0x0000);
+            self.set_cx(0x0000);
+            self.set_dx(0x0000);
+            return;
+        }
+        if ah == 0xbf {
+            // Compaq switchable display extensions. AL=03 reports no switchable VDU;
+            // the other subfunctions preserve registers as absent hardware.
+            if al == 0x03 {
+                self.set_bx(0x0000);
+                self.set_cx(0x0000);
+                self.set_dx(0x0000);
+            }
+            return;
+        }
+        if ah == 0xfa {
+            // Microsoft mouse EGA register interface installation check.
+            self.set_bx(0x0000);
+            return;
+        }
+        if matches!(
+            ah,
+            0x14 | 0x40..=0x4e | 0x72 | 0x73 | 0x80..=0x82 | 0xf0..=0xf7 | 0xfe | 0xff
+        ) {
             return;
         }
         if matches!(
@@ -14220,6 +14254,54 @@ mod tests {
         assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x00);
         assert_eq!(m.cpu.registers.ecx() as u16, 0x1234);
         assert_eq!(m.cpu.registers.edx() as u16, 0x5678);
+    }
+
+    #[test]
+    fn int10_optional_adapter_extensions_report_absent() {
+        let mut m = int15_machine(16);
+
+        m.cpu.registers.set_eax(0x1500);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.eax() as u16, 0x0000);
+
+        for ax in [0x7000, 0x7100] {
+            m.cpu.registers.set_eax(ax);
+            m.cpu.registers.set_ebx(0x1111);
+            m.cpu.registers.set_ecx(0x2222);
+            m.cpu.registers.set_edx(0x3333);
+            m.handle_int10();
+            assert_eq!(m.cpu.registers.eax() as u16, 0x0000);
+            assert_eq!(m.cpu.registers.ebx() as u16, 0x0000);
+            assert_eq!(m.cpu.registers.ecx() as u16, 0x0000);
+            assert_eq!(m.cpu.registers.edx() as u16, 0x0000);
+        }
+
+        m.cpu.registers.set_eax(0xBF03);
+        m.cpu.registers.set_ebx(0x1111);
+        m.cpu.registers.set_ecx(0x2222);
+        m.cpu.registers.set_edx(0x3333);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.ebx() as u16, 0x0000);
+        assert_eq!(m.cpu.registers.ecx() as u16, 0x0000);
+        assert_eq!(m.cpu.registers.edx() as u16, 0x0000);
+
+        m.cpu.registers.set_eax(0xFA00);
+        m.cpu.registers.set_ebx(0x1234);
+        m.handle_int10();
+        assert_eq!(m.cpu.registers.ebx() as u16, 0x0000);
+
+        for ax in [0x1402, 0x4000, 0x7200, 0x8000, 0xF000, 0xFE00, 0xFF00] {
+            let before_eax = 0xCAFE_0000 | ax;
+            m.cpu.registers.set_eax(before_eax);
+            m.cpu.registers.set_ebx(0x1111);
+            m.cpu.registers.set_ecx(0x2222);
+            m.cpu.registers.set_edx(0x3333);
+            m.handle_int10();
+            assert_eq!(m.cpu.registers.eax(), before_eax);
+            assert_eq!(m.cpu.registers.ebx() as u16, 0x1111);
+            assert_eq!(m.cpu.registers.ecx() as u16, 0x2222);
+            assert_eq!(m.cpu.registers.edx() as u16, 0x3333);
+        }
     }
 
     #[test]
