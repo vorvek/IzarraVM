@@ -10314,6 +10314,7 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     install_dos_low_memory_stubs(memory)?;
     seed_int43_font_table(memory)?;
     seed_int44_font_table(memory)?;
+    seed_int46_absent_fixed_disk_table(memory)?;
     // Seed the BDA words INT 11h and INT 12h hand back, like a real BIOS. The 1 KB
     // EBDA reserved below 640 KB lowers the conventional-memory word by 1 (to 639),
     // so INT 12h and the EBDA stay consistent.
@@ -10491,6 +10492,11 @@ fn seed_int44_font_table(memory: &mut Memory) -> Result<(), BusError> {
     }
     memory.write_u16(0x44 * 4, VGA_BIOS_INT44_FONT_OFF)?;
     memory.write_u16(0x44 * 4 + 2, (VGA_BIOS_BASE >> 4) as u16)
+}
+
+fn seed_int46_absent_fixed_disk_table(memory: &mut Memory) -> Result<(), BusError> {
+    memory.write_u16(0x46 * 4, 0)?;
+    memory.write_u16(0x46 * 4 + 2, 0)
 }
 
 impl MachineBus<'_> {
@@ -14876,6 +14882,26 @@ mod tests {
         assert_eq!(m.memory.read_u8(0x475).unwrap(), 0, "no fixed disks");
         assert_eq!(read_u16(&mut m, 0x41 * 4), 0, "INT 41h offset cleared");
         assert_eq!(read_u16(&mut m, 0x41 * 4 + 2), 0, "INT 41h segment cleared");
+    }
+
+    #[test]
+    fn int46_secondary_fixed_disk_parameter_table_is_absent() {
+        let mut m = machine_with_hdd(4032);
+        assert_eq!(read_u16(&mut m, 0x46 * 4), 0, "INT 46h offset absent");
+        assert_eq!(read_u16(&mut m, 0x46 * 4 + 2), 0, "INT 46h segment absent");
+
+        let bytes = m.eject_hdd().unwrap();
+        assert_eq!(bytes.len(), 4032 * 512);
+        assert_eq!(
+            read_u16(&mut m, 0x46 * 4),
+            0,
+            "INT 46h offset remains absent"
+        );
+        assert_eq!(
+            read_u16(&mut m, 0x46 * 4 + 2),
+            0,
+            "INT 46h segment remains absent"
+        );
     }
 
     #[test]
