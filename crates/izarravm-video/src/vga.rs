@@ -1649,6 +1649,7 @@ impl Vga {
         let eff = rel + preset_row;
         let char_row = (eff / rows_per_char) as usize;
         let font_line = (eff % rows_per_char) as usize;
+        #[allow(clippy::if_same_then_else)]
         let char_width = if cga_text {
             8
         } else if self.seq.clocking_mode & 0x01 != 0 {
@@ -1971,8 +1972,8 @@ impl Vga {
             return 0xFF;
         }
         let planes = self.plane_slice_mut(plane_offset);
-        for plane in 0..VGA_PLANES {
-            self.latches[plane] = planes[plane][0];
+        for (plane, slot) in planes.iter().enumerate() {
+            self.latches[plane] = slot[0];
         }
         let plane = (usize::from(self.gc.read_map & 0x02)) | odd;
         planes[plane][0]
@@ -2023,7 +2024,7 @@ impl Vga {
             x / 8,
         );
         let offset = display_offset(self.crtc.mode_control, self.crtc.underline_loc, ma);
-        if offset as usize >= VGA_PLANE_SIZE {
+        if offset >= VGA_PLANE_SIZE {
             return None;
         }
         Some((offset, (7 - (x & 7)) as u8))

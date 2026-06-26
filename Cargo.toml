@@ -21,6 +21,12 @@ license = "GPL-3.0-only"
 repository = "https://github.com/vorvek/IzarraVM"
 authors = ["IzarraVM contributors"]
 
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
 [workspace.dependencies]
 bitflags = "2.6"
 clap = { version = "4.5", features = ["derive", "env"] }

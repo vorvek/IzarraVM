@@ -10085,6 +10085,7 @@ impl Machine {
         self.scroll_graphics_window(page, true, 1, 0, 0, 0, rows - 1, columns - 1);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn scroll_graphics_window(
         &mut self,
         page: u8,
@@ -16066,7 +16067,7 @@ mod tests {
         m.cpu.registers.set_eax(0x1010);
         m.cpu.registers.set_ebx(7);
         m.cpu.registers.set_edx(0);
-        m.cpu.registers.set_ecx((63 << 8) | 0);
+        m.cpu.registers.set_ecx(63 << 8);
         m.handle_int10();
         assert_eq!(m.video().dac_entry(7), [0, 63, 0]);
     }
@@ -23775,17 +23776,15 @@ mod tests {
         // attribute, written through the bus so it routes to text_memory.
         machine.write_physical_u8(VGA_TEXT_BASE, 0xDB);
         machine.write_physical_u8(VGA_TEXT_BASE + 1, 0x0F);
-        // A distinct DAC entry for the foreground index (15): red.
-        machine.video_mut().set_dac_entry(15, 63, 0, 0);
+        // Mode 03h maps white text through DAC index 0x3F.
+        machine.video_mut().set_dac_entry(0x3F, 63, 0, 0);
         // Enough CPU time to finalize at least one frame.
         machine.advance_devices(600_000);
         assert!(matches!(machine.active_display(), ActiveDisplay::VgaRaster));
         let raster = machine.vga_raster().expect("text presents a VgaRaster");
         assert_eq!(raster.width, 720);
-        // The top-left glyph pixel scans out as DAC index 15 (the foreground).
-        assert_eq!(raster.pixels[0], 0x17);
-        // Resolved through the live DAC, entry 15 is red.
-        assert_eq!(machine.palette_argb()[15], 0x00FF_0000);
+        assert_eq!(raster.pixels[0], 0x3F);
+        assert_eq!(machine.palette_argb()[0x3F], 0x00FF_0000);
     }
 
     #[test]
