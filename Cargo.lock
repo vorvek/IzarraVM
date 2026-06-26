@@ -1830,6 +1830,9 @@ dependencies = [
 [[package]]
 name = "izarravm-firmware"
 version = "0.1.0"
+dependencies = [
+ "izarravm-video",
+]
 
 [[package]]
 name = "izarravm-input"
