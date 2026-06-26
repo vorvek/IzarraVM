@@ -61,6 +61,8 @@ pub use uma::{EMS_FRAME_SIZE, UmaReservation, UmaReservationMap, UmaUse};
 /// even though this machine does not yet map a BIOS image into that span.
 const VGA_BIOS_BASE: u32 = UPPER_MEMORY_BASE; // 0xC0000
 const VGA_BIOS_SIZE: u32 = 0x8000; // 32 KiB
+const VGA_BIOS_FONT_TABLE_OFF: u16 = 0x2000;
+const VGA_BIOS_INT43_FONT_ADDR: u32 = VGA_BIOS_BASE + VGA_BIOS_FONT_TABLE_OFF as u32;
 
 /// The default LIM EMS 4.0 page-frame base: segment 0xE000, the top 64 KiB of the
 /// upper-memory window. This is the 386MAX and DOSBox default, and on the Izarra
@@ -7081,28 +7083,65 @@ impl Machine {
                 if al >= 0x10 {
                     self.video.set_char_height(bh);
                 }
+                self.publish_int43_font_table();
             }
             0x01 | 0x11 => {
                 self.video.load_rom_font(table, 14);
                 if al >= 0x10 {
                     self.video.set_char_height(14);
                 }
+                self.publish_int43_font_table();
             }
             0x02 | 0x12 => {
                 self.video.load_rom_font(table, 8);
                 if al >= 0x10 {
                     self.video.set_char_height(8);
                 }
+                self.publish_int43_font_table();
             }
             0x04 | 0x14 => {
                 self.video.load_rom_font(table, 16);
                 if al >= 0x10 {
                     self.video.set_char_height(16);
                 }
+                self.publish_int43_font_table();
             }
-            0x03 => self.video.set_char_map_select(bl),
+            0x03 => {
+                self.video.set_char_map_select(bl);
+                self.publish_int43_font_table();
+            }
+            0x30 => self.int10_get_font_info(bh),
             _ => {}
         }
+    }
+
+    fn publish_int43_font_table(&mut self) {
+        let height = self.video.char_height();
+        let table = self.video.active_font_table();
+        let bytes = self.video.font_table_image(table, height);
+        self.write_guest_block(VGA_BIOS_INT43_FONT_ADDR, &bytes);
+        let _ = self.memory.write_u16(0x43 * 4, VGA_BIOS_FONT_TABLE_OFF);
+        let _ = self
+            .memory
+            .write_u16(0x43 * 4 + 2, (VGA_BIOS_BASE >> 4) as u16);
+        let _ = self.memory.write_u8(0x485, height);
+    }
+
+    fn int10_get_font_info(&mut self, bh: u8) {
+        if bh != 0x01 {
+            return;
+        }
+        self.publish_int43_font_table();
+        self.cpu.registers.set_segment(
+            SegmentIndex::Es,
+            SegmentRegister::real((VGA_BIOS_BASE >> 4) as u16),
+        );
+        let ebp = (self.cpu.registers.ebp() & !0xFFFF) | u32::from(VGA_BIOS_FONT_TABLE_OFF);
+        self.cpu.registers.set_ebp(ebp);
+        self.set_cx(u16::from(self.video.char_height()));
+        let rows_minus_one = self.memory.read_u8(0x484).unwrap_or(24);
+        let dx = (self.cpu.registers.edx() as u16 & 0xFF00) | u16::from(rows_minus_one);
+        self.set_dx(dx);
     }
 
     /// Service a DOS software interrupt (INT 20h or INT 21h) host-side after the
@@ -10271,6 +10310,7 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     memory.write_u16(0x70 * 4 + 2, 0)?;
     install_rtc_isr_stub(memory)?;
     install_dos_low_memory_stubs(memory)?;
+    seed_int43_font_table(memory)?;
     // Seed the BDA words INT 11h and INT 12h hand back, like a real BIOS. The 1 KB
     // EBDA reserved below 640 KB lowers the conventional-memory word by 1 (to 639),
     // so INT 12h and the EBDA stay consistent.
@@ -10432,6 +10472,14 @@ fn seed_bios_config_table(memory: &mut Memory) -> Result<(), BusError> {
         memory.write_u8(base + i, byte)?;
     }
     Ok(())
+}
+
+fn seed_int43_font_table(memory: &mut Memory) -> Result<(), BusError> {
+    for (offset, &byte) in izarravm_video::font::VGAFONT_8X16.iter().enumerate() {
+        memory.write_u8(VGA_BIOS_INT43_FONT_ADDR as usize + offset, byte)?;
+    }
+    memory.write_u16(0x43 * 4, VGA_BIOS_FONT_TABLE_OFF)?;
+    memory.write_u16(0x43 * 4 + 2, (VGA_BIOS_BASE >> 4) as u16)
 }
 
 impl MachineBus<'_> {
@@ -19626,6 +19674,45 @@ mod tests {
         // The stock 'A' would be blank on the top row (background), so 15
         // confirms the user font loaded and renders.
         assert_eq!(machine.video().render_text_row(0)[0], 15);
+    }
+
+    #[test]
+    fn int43_points_at_current_font_table() {
+        let mut machine = int15_machine(16);
+        let off = read_u16(&mut machine, 0x43 * 4);
+        let seg = read_u16(&mut machine, 0x43 * 4 + 2);
+        let table = (u32::from(seg) << 4) + u32::from(off);
+        assert_eq!(seg, (VGA_BIOS_BASE >> 4) as u16);
+        assert_eq!(off, VGA_BIOS_FONT_TABLE_OFF);
+        assert_eq!(table, VGA_BIOS_INT43_FONT_ADDR);
+        assert_eq!(
+            machine.read_physical_u8(table + 0x41 * 16 + 7),
+            izarravm_video::font::VGAFONT_8X16[0x41 * 16 + 7]
+        );
+
+        machine.cpu.registers.set_eax(0x1130);
+        machine.cpu.registers.set_ebx(0x0100); // BH=01h: INT 43h pointer
+        machine.handle_int10();
+        assert_eq!(
+            machine.cpu.registers.segment(SegmentIndex::Es).selector,
+            (VGA_BIOS_BASE >> 4) as u16
+        );
+        assert_eq!(machine.cpu.registers.ebp() as u16, VGA_BIOS_FONT_TABLE_OFF);
+        assert_eq!(machine.cpu.registers.ecx() as u16, 16);
+        assert_eq!(machine.cpu.registers.edx() as u8, 24);
+
+        machine.write_guest_block(0x40000, &[0xFF; 16]);
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x4000));
+        machine.cpu.registers.set_ebp(0);
+        machine.cpu.registers.set_ecx(1);
+        machine.cpu.registers.set_edx(0x41);
+        machine.cpu.registers.set_ebx(0x1000); // BH=16, BL=0
+        machine.cpu.registers.set_eax(0x1100);
+        machine.handle_int10();
+        assert_eq!(machine.read_physical_u8(table + 0x41 * 16), 0xFF);
     }
 
     #[test]

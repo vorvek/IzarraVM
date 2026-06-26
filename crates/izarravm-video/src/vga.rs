@@ -743,6 +743,21 @@ impl Vga {
         self.crtc.max_scan = u32::from(height.saturating_sub(1));
     }
 
+    pub fn char_height(&self) -> u8 {
+        self.crtc.max_scan.saturating_add(1).min(u32::from(u8::MAX)) as u8
+    }
+
+    pub fn font_table_image(&self, table: usize, bytes_per_char: u8) -> Vec<u8> {
+        let bpc = usize::from(bytes_per_char.min(32));
+        let table = table & 0x07;
+        let mut bytes = Vec::with_capacity(256 * bpc);
+        for code in 0..256usize {
+            let slot = code * 32;
+            bytes.extend_from_slice(&self.font[table][slot..slot + bpc]);
+        }
+        bytes
+    }
+
     /// Reload the power-on default DAC palette, attribute palette, and pel mask.
     /// Real hardware reprograms the RAMDAC to the mode's defaults on a mode set,
     /// so a prior program's custom palette (the BIOS, say) does not leak into the
