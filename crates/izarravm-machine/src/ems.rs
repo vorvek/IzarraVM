@@ -32,6 +32,7 @@ pub mod status {
     /// mappable-address count (58h) is zero in that state rather than an error.
     pub const SOFTWARE_MALFUNCTION: u8 = 0x80;
     pub const INVALID_HANDLE: u8 = 0x83;
+    pub const UNDEFINED_FUNCTION: u8 = 0x84;
     pub const NO_MORE_HANDLES: u8 = 0x85;
     pub const TOTAL_EXCEEDED: u8 = 0x87;
     pub const FREE_EXCEEDED: u8 = 0x88;
@@ -40,10 +41,16 @@ pub mod status {
     pub const INVALID_PHYSICAL_PAGE: u8 = 0x8b;
     pub const CONTEXT_ALREADY_SAVED: u8 = 0x8d;
     pub const NO_SAVED_CONTEXT: u8 = 0x8e;
+    pub const UNDEFINED_SUBFUNCTION: u8 = 0x8f;
+    pub const UNDEFINED_ATTRIBUTE: u8 = 0x90;
+    pub const FEATURE_NOT_SUPPORTED: u8 = 0x91;
     /// Move/exchange (57h) region is larger than the handle's allocated pages.
     pub const REGION_EXCEEDS_PAGES: u8 = 0x93;
     /// Move/exchange (57h) region length is more than 1 MiB.
     pub const LENGTH_EXCEEDS_1M: u8 = 0x96;
+    pub const HANDLE_NAME_NOT_FOUND: u8 = 0xa0;
+    pub const HANDLE_NAME_ERROR: u8 = 0xa1;
+    pub const ACCESS_DENIED: u8 = 0xa4;
     /// Move/exchange (57h) conventional region crosses the 1 MiB boundary.
     pub const MEMORY_WRAP: u8 = 0xa2;
 }
@@ -279,6 +286,11 @@ impl EmsState {
         self.handles.iter().filter(|h| h.is_some()).count() as u16
     }
 
+    /// Function 54h AL=02: the manager's total handle capacity.
+    pub fn handle_capacity(&self) -> u16 {
+        Self::MAX_HANDLES as u16
+    }
+
     /// Function 4Dh: (handle, page count) for every active handle.
     pub fn all_handles(&self) -> Vec<(u16, u16)> {
         self.handles
@@ -286,6 +298,38 @@ impl EmsState {
             .enumerate()
             .filter_map(|(id, h)| h.as_ref().map(|h| (id as u16, h.pages.len() as u16)))
             .collect()
+    }
+
+    /// Function 54h AL=00: directory entries for active, named handles.
+    pub fn named_handles(&self) -> Result<Vec<(u16, [u8; 8])>, u8> {
+        let mut out = Vec::new();
+        for (id, h) in self.handles.iter().enumerate() {
+            let Some(h) = h else {
+                continue;
+            };
+            if h.name == [0; 8] {
+                return Err(status::HANDLE_NAME_ERROR);
+            }
+            out.push((id as u16, h.name));
+        }
+        Ok(out)
+    }
+
+    /// Function 54h AL=01: search for a named handle.
+    pub fn find_handle_by_name(&self, name: [u8; 8]) -> Result<u16, u8> {
+        let mut found = None;
+        for (id, h) in self.handles.iter().enumerate() {
+            let Some(h) = h else {
+                continue;
+            };
+            if h.name == name && h.name != [0; 8] {
+                if found.is_some() {
+                    return Err(status::HANDLE_NAME_ERROR);
+                }
+                found = Some(id as u16);
+            }
+        }
+        found.ok_or(status::HANDLE_NAME_NOT_FOUND)
     }
 
     /// Function 47h: save the current frame mapping under `handle`.
@@ -343,6 +387,15 @@ impl EmsState {
 
     /// Function 53h AL=01: set the 8-byte handle name.
     pub fn set_name(&mut self, handle: u16, name: [u8; 8]) -> Result<(), u8> {
+        if name != [0; 8] {
+            for (id, existing) in self.handles.iter().enumerate() {
+                if id != usize::from(handle)
+                    && matches!(existing, Some(existing) if existing.name == name)
+                {
+                    return Err(status::HANDLE_NAME_ERROR);
+                }
+            }
+        }
         let idx = usize::from(handle);
         let h = self
             .handles
@@ -563,6 +616,31 @@ mod tests {
         ems.set_name(h, *b"MYHANDLE").unwrap();
         assert_eq!(&ems.name(h).unwrap(), b"MYHANDLE");
         assert_eq!(ems.set_name(99, [0u8; 8]), Err(status::INVALID_HANDLE));
+    }
+
+    #[test]
+    fn handle_names_reject_duplicates_and_support_directory_search() {
+        let mut ems = manager();
+        let first = ems.allocate(1).unwrap();
+        let second = ems.allocate(1).unwrap();
+        assert_eq!(ems.named_handles(), Err(status::HANDLE_NAME_ERROR));
+
+        ems.set_name(first, *b"FIRST   ").unwrap();
+        ems.set_name(second, *b"SECOND  ").unwrap();
+        assert_eq!(
+            ems.set_name(second, *b"FIRST   "),
+            Err(status::HANDLE_NAME_ERROR)
+        );
+
+        assert_eq!(ems.find_handle_by_name(*b"FIRST   "), Ok(first));
+        assert_eq!(
+            ems.find_handle_by_name(*b"MISSING "),
+            Err(status::HANDLE_NAME_NOT_FOUND)
+        );
+        assert_eq!(
+            ems.named_handles().unwrap(),
+            vec![(first, *b"FIRST   "), (second, *b"SECOND  ")]
+        );
     }
 
     #[test]

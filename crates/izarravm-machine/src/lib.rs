@@ -4909,6 +4909,8 @@ impl Machine {
                 let result = self.ems_mut().restore_context(dx);
                 self.set_ah(result.err().unwrap_or(ems::status::OK));
             }
+            // Reserved EMS 3.0 functions: not implemented by this EMS 4.0 manager.
+            0x49 | 0x4a => self.set_ah(ems::status::UNDEFINED_FUNCTION),
             // 4Bh GET NUMBER OF EMM HANDLES: BX = count.
             0x4b => {
                 let count = self.ems().handle_count();
@@ -4949,8 +4951,15 @@ impl Machine {
                 }
                 Err(code) => self.set_ah(code),
             },
+            // 52h GET/SET HANDLE ATTRIBUTES: this manager supports volatile handles.
+            0x52 => self.ems_handle_attributes(al, dx, self.cpu.registers.ebx() as u8),
             // 53h GET/SET HANDLE NAME: DX = handle, AL=0 get (ES:DI), AL=1 set (DS:SI).
             0x53 => self.ems_handle_name(al, dx),
+            // 54h GET HANDLE DIRECTORY.
+            0x54 => self.ems_handle_directory(al),
+            // The page-map jump/call services need instruction-level return control;
+            // callers get the documented "undefined function" instead of a fake jump.
+            0x55 | 0x56 => self.set_ah(ems::status::UNDEFINED_FUNCTION),
             // 57h MOVE/EXCHANGE MEMORY REGION: DS:SI = 18-byte descriptor, AL=0 move,
             // AL=1 exchange.
             0x57 => self.ems_move_exchange(al == 0x01),
@@ -4959,22 +4968,168 @@ impl Machine {
             0x58 => {
                 let count = self.ems().mappable_count();
                 if al == 0x00 {
-                    let es = self.cpu.registers.segment(SegmentIndex::Es).base;
-                    let di = self.cpu.registers.edi() as u16;
-                    let mut addr = es as usize + usize::from(di);
-                    for phys in 0..count {
-                        let seg = self.ems().slot_segment(phys);
-                        let _ = self.memory.write_u16(addr, seg);
-                        let _ = self.memory.write_u16(addr + 2, u16::from(phys));
-                        addr += 4;
-                    }
+                    self.ems_write_mappable_array();
                 }
                 self.set_cx(u16::from(count));
                 self.set_ah(ems::status::OK);
             }
-            // OS-only (alt-map register sets, page-map jump/call, partial page map)
-            // and any other function are not modeled: undefined function.
-            _ => self.set_ah(0x84),
+            // 59h HARDWARE INFORMATION: raw page counts are visible; the hardware
+            // configuration array is OS-only.
+            0x59 => self.ems_hardware_info(al),
+            // 5Ah ALLOCATE STANDARD/RAW PAGES. Raw pages are backed by the same
+            // 16 KiB logical pages in this EMM386-style model.
+            0x5a => match al {
+                0x00 | 0x01 => match self.ems_mut().allocate(bx) {
+                    Ok(handle) => {
+                        self.set_dx(handle);
+                        self.set_ah(ems::status::OK);
+                    }
+                    Err(code) => self.set_ah(code),
+                },
+                _ => self.set_ah(ems::status::UNDEFINED_SUBFUNCTION),
+            },
+            // 5Bh alternate map registers are OS-only; the access gate is closed.
+            0x5b => match al {
+                0x00..=0x08 => self.set_ah(ems::status::ACCESS_DENIED),
+                _ => self.set_ah(ems::status::UNDEFINED_SUBFUNCTION),
+            },
+            // 5Ch warm-boot preparation is a no-op for this RAM-backed manager.
+            0x5c => self.set_ah(ems::status::OK),
+            // 5Dh controls OS-only functions. Do not enable them for applications.
+            0x5d => match al {
+                0x00..=0x02 => self.set_ah(ems::status::ACCESS_DENIED),
+                _ => self.set_ah(ems::status::UNDEFINED_SUBFUNCTION),
+            },
+            // EEMS window/frame aliases.
+            0x60 | 0x68 => {
+                let count = self.ems_write_mappable_array();
+                self.set_ax(u16::from(count));
+            }
+            0x61 => self.set_ah(ems::status::UNDEFINED_FUNCTION),
+            0x69 => {
+                let result = self.ems_mut().map(al, bx, dx);
+                self.set_ah(result.err().unwrap_or(ems::status::OK));
+            }
+            0x6a => self.set_ah(ems::status::UNDEFINED_FUNCTION),
+            // OS-only page-map state is not modeled yet; any other function is not
+            // implemented by this manager.
+            0x4e | 0x4f => self.set_ah(ems::status::UNDEFINED_FUNCTION),
+            _ => self.set_ah(ems::status::UNDEFINED_FUNCTION),
+        }
+    }
+
+    fn ems_write_mappable_array(&mut self) -> u8 {
+        let count = self.ems().mappable_count();
+        let es = self.cpu.registers.segment(SegmentIndex::Es).base;
+        let di = self.cpu.registers.edi() as u16;
+        let mut addr = es as usize + usize::from(di);
+        for phys in 0..count {
+            let seg = self.ems().slot_segment(phys);
+            let _ = self.memory.write_u16(addr, seg);
+            let _ = self.memory.write_u16(addr + 2, u16::from(phys));
+            addr += 4;
+        }
+        count
+    }
+
+    fn ems_handle_attributes(&mut self, sub: u8, handle: u16, attr: u8) {
+        match sub {
+            0x00 => {
+                let status = self
+                    .ems()
+                    .pages_for_handle(handle)
+                    .err()
+                    .unwrap_or(ems::status::OK);
+                if status == ems::status::OK {
+                    self.set_ax(0x0000);
+                } else {
+                    self.set_ah(status);
+                }
+            }
+            0x01 => {
+                let status = self
+                    .ems()
+                    .pages_for_handle(handle)
+                    .err()
+                    .unwrap_or(ems::status::OK);
+                if status != ems::status::OK {
+                    self.set_ah(status);
+                } else if attr == 0x00 {
+                    self.set_ah(ems::status::OK);
+                } else if attr == 0x01 {
+                    self.set_ah(ems::status::FEATURE_NOT_SUPPORTED);
+                } else {
+                    self.set_ah(ems::status::UNDEFINED_ATTRIBUTE);
+                }
+            }
+            0x02 => {
+                let status = self
+                    .ems()
+                    .pages_for_handle(handle)
+                    .err()
+                    .unwrap_or(ems::status::OK);
+                if status == ems::status::OK {
+                    self.set_ax(0x0000);
+                } else {
+                    self.set_ah(status);
+                }
+            }
+            _ => self.set_ah(ems::status::UNDEFINED_SUBFUNCTION),
+        }
+    }
+
+    fn ems_handle_directory(&mut self, sub: u8) {
+        match sub {
+            0x00 => match self.ems().named_handles() {
+                Ok(handles) => {
+                    let es = self.cpu.registers.segment(SegmentIndex::Es).base;
+                    let di = self.cpu.registers.edi() as u16;
+                    let mut addr = es as usize + usize::from(di);
+                    for (handle, name) in &handles {
+                        let _ = self.memory.write_u16(addr, *handle);
+                        for (i, byte) in name.iter().enumerate() {
+                            let _ = self.memory.write_u8(addr + 2 + i, *byte);
+                        }
+                        addr += 10;
+                    }
+                    self.set_ax(handles.len() as u16);
+                }
+                Err(code) => self.set_ah(code),
+            },
+            0x01 => {
+                let ds = self.cpu.registers.segment(SegmentIndex::Ds).base;
+                let si = self.cpu.registers.esi() as u16;
+                let base = ds as usize + usize::from(si);
+                let mut name = [0u8; 8];
+                for (i, slot) in name.iter_mut().enumerate() {
+                    *slot = self.memory.read_u8(base + i).unwrap_or(0);
+                }
+                match self.ems().find_handle_by_name(name) {
+                    Ok(handle) => {
+                        self.set_dx(handle);
+                        self.set_ah(ems::status::OK);
+                    }
+                    Err(code) => self.set_ah(code),
+                }
+            }
+            0x02 => {
+                self.set_bx(self.ems().handle_capacity());
+                self.set_ah(ems::status::OK);
+            }
+            _ => self.set_ah(ems::status::UNDEFINED_SUBFUNCTION),
+        }
+    }
+
+    fn ems_hardware_info(&mut self, sub: u8) {
+        match sub {
+            0x00 => self.set_ah(ems::status::ACCESS_DENIED),
+            0x01 => {
+                let (free, total) = self.ems().page_counts();
+                self.set_bx(free);
+                self.set_dx(total);
+                self.set_ah(ems::status::OK);
+            }
+            _ => self.set_ah(ems::status::UNDEFINED_SUBFUNCTION),
         }
     }
 
@@ -5035,7 +5190,7 @@ impl Machine {
                 let code = self.ems_mut().set_name(handle, name).err().unwrap_or(0);
                 self.set_ah(code);
             }
-            _ => self.set_ah(0x8f), // undefined subfunction
+            _ => self.set_ah(ems::status::UNDEFINED_SUBFUNCTION),
         }
     }
 
@@ -5710,6 +5865,47 @@ impl Machine {
         Ok(())
     }
 
+    fn handle_int21_ax7305(&mut self) {
+        let drive = self.cpu.registers.edx() as u8;
+        let flags = self.cpu.registers.esi() as u16;
+        let ds = self.cpu.registers.segment(SegmentIndex::Ds).base;
+        let bx = self.cpu.registers.ebx() as u16;
+        let packet = ds.wrapping_add(u32::from(bx));
+        let write = flags & 0x0001 != 0;
+
+        if self.cpu.registers.ecx() as u16 != 0xffff
+            || drive == 0
+            || drive != 3
+            || flags & !0x6001 != 0
+            || (!write && flags & 0x6000 != 0)
+        {
+            self.dos.record_last_error(0x0001);
+            self.set_ax(0x0001);
+            self.set_int_frame_carry(true);
+            return;
+        }
+
+        let lba = self.read_guest_dword(packet);
+        let count = self.read_guest_word(packet + 4);
+        let transfer = self.driver_request_linear(packet, 6);
+        match self.driver_c_transfer(write, transfer, count, lba) {
+            Ok(()) => {
+                self.set_ax(0);
+                self.set_int_frame_carry(false);
+            }
+            Err(code) => {
+                let error = if write && code == 0 {
+                    0x0300
+                } else {
+                    u16::from(code)
+                };
+                self.dos.record_last_error(error);
+                self.set_ax(error);
+                self.set_int_frame_carry(true);
+            }
+        }
+    }
+
     /// Consume `secs` of emulated time for a device operation that blocks the
     /// guest (a floppy seek/read). Advancing both the master clock and the devices
     /// by the same amount keeps timekeeping coupled, the way an instruction's own
@@ -5826,14 +6022,14 @@ impl Machine {
         let _ = self.memory.write_u8(0x441, status);
     }
 
-    /// INT 25h ABSOLUTE DISK READ (DOS). AL=drive (0=A:), CX=sector count, DX=first
-    /// logical (LBA) sector, DS:BX=buffer. Classic form only; the >32 MB packet form
-    /// (CX=0xFFFF, DS:BX -> a parameter block) is out of scope. On success AX=0 and
-    /// CF clear; on error CF set and AX=0x40xx. Limit: the real INT 25h/26h leave
-    /// the original FLAGS on the stack for the caller to discard with its own POPF,
-    /// but this HLE returns through the standard IRET stub, so the result CF is
-    /// written into the IRET FLAGS image (set_int_frame_carry) like every other
-    /// host-serviced INT here.
+    /// INT 25h ABSOLUTE DISK READ (DOS). AL=drive (0=A:). The classic form uses
+    /// CX=sector count, DX=first logical sector, DS:BX=buffer. The DOS 3.31+
+    /// packet form uses CX=FFFFh and DS:BX -> DWORD LBA, WORD count, DWORD far
+    /// transfer pointer. On success AX=0 and CF clear; on error CF set and AX holds
+    /// the disk status. Limit: the real INT 25h/26h leave the original FLAGS on the
+    /// stack for the caller to discard with its own POPF, but this HLE returns
+    /// through the standard IRET stub, so the result CF is written into the IRET
+    /// FLAGS image (set_int_frame_carry) like every other host-serviced INT here.
     fn handle_int25(&mut self) {
         self.int25_26_transfer(false);
     }
@@ -5854,11 +6050,15 @@ impl Machine {
         let bx = self.cpu.registers.ebx() as u16;
         let buffer = ds.wrapping_add(u32::from(bx));
 
+        if count == 0xffff {
+            self.int25_26_packet_transfer(write, al, buffer);
+            return;
+        }
+
         // Drive C: (AL=2) is served by the synthesized FAT32 volume when one is
         // mounted. Every 16-bit logical sector falls in the first 32 MB of any
         // FAT32 volume (its sector count exceeds 0xFFFF), so the classic form
-        // addresses a valid sector and never reports out of range here. The
-        // packet form (CX=FFFFh / AH=7305h) for sectors past 32 MB is a follow-up.
+        // addresses a valid sector and never reports out of range here.
         if al == 0x02 && self.fat32_c.is_some() {
             if write {
                 self.start_int25_26_critical_error(
@@ -6008,6 +6208,47 @@ impl Machine {
 
         self.set_ax(0x0000);
         self.set_int_frame_carry(false);
+    }
+
+    fn int25_26_packet_transfer(&mut self, write: bool, drive: u8, packet: u32) {
+        let lba = self.read_guest_dword(packet);
+        let count = self.read_guest_word(packet + 4);
+        let transfer = self.driver_request_linear(packet, 6);
+
+        if drive == 0x02 && self.fat32_c.is_some() {
+            self.set_ax(0x0207);
+            self.set_int_frame_carry(true);
+            return;
+        }
+
+        if drive == 0x02 && self.ata.is_some() {
+            match self.driver_c_transfer(write, transfer, count, lba) {
+                Ok(()) => {
+                    self.set_ax(0);
+                    self.set_int_frame_carry(false);
+                }
+                Err(error_code) => {
+                    self.start_int25_26_critical_error(
+                        drive,
+                        error_code,
+                        write,
+                        izarravm_dos::CriticalErrorArea::Data,
+                        izarravm_dos::FarPtr::default(),
+                        0x4000 | u16::from(error_code),
+                    );
+                }
+            }
+            return;
+        }
+
+        self.start_int25_26_critical_error(
+            drive,
+            0x02,
+            write,
+            izarravm_dos::CriticalErrorArea::Data,
+            izarravm_dos::FarPtr::default(),
+            0x4002,
+        );
     }
 
     /// AH=04h verify: confirm the requested sectors are readable without copying
@@ -6843,6 +7084,10 @@ impl Machine {
             let ah = (regs.ax >> 8) as u8;
             if matches!(ah, 0x3C | 0x3D | 0x3E | 0x3F | 0x40 | 0x42 | 0x4E | 0x4F) {
                 self.c_accesses += 1;
+            }
+            if regs.ax == 0x7305 {
+                self.handle_int21_ax7305();
+                return Ok(None);
             }
         }
         let action = if vector == 0x21
@@ -11968,6 +12213,21 @@ mod tests {
             assert_ne!(dos_int_flags(&m) & 1, 0, "PRINT service sets CF");
         }
 
+        for ax in [0x0501u16, 0x05ff] {
+            let mut m = int15_machine(16);
+            prime_dos_int_frame(&mut m);
+            m.cpu.registers.set_eax(0xCAFE_0000 | u32::from(ax));
+
+            assert!(m.handle_int2f(), "critical-error AX={ax:04X}h handled");
+
+            assert_eq!(m.cpu.registers.eax(), 0xCAFE_0001);
+            assert_ne!(
+                dos_int_flags(&m) & 1,
+                0,
+                "critical-error helper service sets CF"
+            );
+        }
+
         for ax in [0x1401u16, 0x1402, 0x1403, 0x1404, 0x14FE, 0x14FF] {
             let mut m = int15_machine(16);
             m.cpu.registers.set_eax(0xCAFE_0000 | u32::from(ax));
@@ -13398,6 +13658,202 @@ mod tests {
     }
 
     #[test]
+    fn ems_52h_reports_volatile_handle_attributes() {
+        const PROG: [u8; 2] = [0xCD, 0x20];
+        let mut p = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        p.emm386 = Emm386Mode::Ram;
+        let mut machine = Machine::new_dos_program(p, &PROG).unwrap();
+        let handle = machine.ems.as_mut().unwrap().allocate(1).unwrap();
+
+        machine.cpu.registers.set_eax(0x5200);
+        machine.cpu.registers.set_edx(u32::from(handle));
+        machine.handle_int67();
+        assert_eq!(machine.cpu.registers.eax() as u16, 0, "volatile handle");
+
+        machine.cpu.registers.set_eax(0x5201);
+        machine.cpu.registers.set_ebx(0);
+        machine.cpu.registers.set_edx(u32::from(handle));
+        machine.handle_int67();
+        assert_eq!(
+            (machine.cpu.registers.eax() >> 8) as u8,
+            ems::status::OK,
+            "setting volatile succeeds"
+        );
+
+        machine.cpu.registers.set_eax(0x5201);
+        machine.cpu.registers.set_ebx(1);
+        machine.cpu.registers.set_edx(u32::from(handle));
+        machine.handle_int67();
+        assert_eq!(
+            (machine.cpu.registers.eax() >> 8) as u8,
+            ems::status::FEATURE_NOT_SUPPORTED,
+            "nonvolatile handles are not supported"
+        );
+    }
+
+    #[test]
+    fn ems_54h_lists_searches_and_counts_handles() {
+        const PROG: [u8; 2] = [0xCD, 0x20];
+        let mut p = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        p.emm386 = Emm386Mode::Ram;
+        let mut machine = Machine::new_dos_program(p, &PROG).unwrap();
+        let first = machine.ems.as_mut().unwrap().allocate(1).unwrap();
+        let second = machine.ems.as_mut().unwrap().allocate(2).unwrap();
+        machine
+            .ems
+            .as_mut()
+            .unwrap()
+            .set_name(first, *b"FIRST   ")
+            .unwrap();
+        machine
+            .ems
+            .as_mut()
+            .unwrap()
+            .set_name(second, *b"SECOND  ")
+            .unwrap();
+
+        machine.cpu.registers.set_eax(0x5400);
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x2000));
+        machine.cpu.registers.set_edi(0);
+        machine.handle_int67();
+        assert_eq!(machine.cpu.registers.eax() as u16, 2, "two named entries");
+        assert_eq!(machine.read_guest_word(0x2_0000), first);
+        assert_eq!(&machine.read_guest_block(0x2_0002, 8), b"FIRST   ");
+        assert_eq!(machine.read_guest_word(0x2_000a), second);
+        assert_eq!(&machine.read_guest_block(0x2_000c, 8), b"SECOND  ");
+
+        machine.write_guest_block(0x3_0000, b"SECOND  ");
+        machine.cpu.registers.set_eax(0x5401);
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x3000));
+        machine.cpu.registers.set_esi(0);
+        machine.handle_int67();
+        assert_eq!(
+            (machine.cpu.registers.eax() >> 8) as u8,
+            ems::status::OK,
+            "named search succeeds"
+        );
+        assert_eq!(machine.cpu.registers.edx() as u16, second);
+
+        machine.cpu.registers.set_eax(0x5402);
+        machine.handle_int67();
+        assert_eq!(machine.cpu.registers.ebx() as u16, 64, "handle capacity");
+    }
+
+    #[test]
+    fn ems_59h_5ah_and_eems_aliases_report_live_state() {
+        const PROG: [u8; 2] = [0xCD, 0x20];
+        let mut p = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        p.emm386 = Emm386Mode::Ram;
+        let mut machine = Machine::new_dos_program(p, &PROG).unwrap();
+        let (free, total) = machine.ems.as_ref().unwrap().page_counts();
+
+        machine.cpu.registers.set_eax(0x5901);
+        machine.handle_int67();
+        assert_eq!((machine.cpu.registers.eax() >> 8) as u8, ems::status::OK);
+        assert_eq!(machine.cpu.registers.ebx() as u16, free);
+        assert_eq!(machine.cpu.registers.edx() as u16, total);
+
+        machine.cpu.registers.set_eax(0x5900);
+        machine.handle_int67();
+        assert_eq!(
+            (machine.cpu.registers.eax() >> 8) as u8,
+            ems::status::ACCESS_DENIED,
+            "hardware configuration is OS-only"
+        );
+
+        machine.cpu.registers.set_eax(0x5a01);
+        machine.cpu.registers.set_ebx(1);
+        machine.handle_int67();
+        let handle = machine.cpu.registers.edx() as u16;
+        assert_eq!(
+            (machine.cpu.registers.eax() >> 8) as u8,
+            ems::status::OK,
+            "raw-page allocation succeeds"
+        );
+        assert_eq!(
+            machine.ems.as_ref().unwrap().pages_for_handle(handle),
+            Ok(1)
+        );
+
+        machine.cpu.registers.set_eax(0x6000);
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x2000));
+        machine.cpu.registers.set_edi(0);
+        machine.handle_int67();
+        assert_eq!(machine.cpu.registers.eax() as u16, 4, "EEMS window count");
+        assert_eq!(machine.read_guest_word(0x2_0000), 0xE000);
+        assert_eq!(machine.read_guest_word(0x2_0002), 0);
+
+        machine.cpu.registers.set_eax(0x6900);
+        machine.cpu.registers.set_ebx(0);
+        machine.cpu.registers.set_edx(u32::from(handle));
+        machine.handle_int67();
+        assert_eq!(
+            (machine.cpu.registers.eax() >> 8) as u8,
+            ems::status::OK,
+            "EEMS map aliases LIM 44h"
+        );
+        machine.write_physical_u8(0x0E_0000, 0x5a);
+        assert_eq!(machine.read_physical_u8(0x0E_0000), 0x5a);
+
+        machine.cpu.registers.set_eax(0x6800);
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x2100));
+        machine.cpu.registers.set_edi(0);
+        machine.handle_int67();
+        assert_eq!(machine.cpu.registers.eax() as u16, 4, "EEMS frame count");
+        assert_eq!(machine.read_guest_word(0x2_1000), 0xE000);
+    }
+
+    #[test]
+    fn ems_reserved_and_os_only_calls_return_documented_status() {
+        const PROG: [u8; 2] = [0xCD, 0x20];
+        let mut p = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
+        p.emm386 = Emm386Mode::Ram;
+        let mut machine = Machine::new_dos_program(p, &PROG).unwrap();
+
+        for ax in [
+            0x4900, 0x4a00, 0x4e00, 0x4f00, 0x5500, 0x5600, 0x6100, 0x6a00,
+        ] {
+            machine.cpu.registers.set_eax(ax);
+            machine.handle_int67();
+            assert_eq!(
+                (machine.cpu.registers.eax() >> 8) as u8,
+                ems::status::UNDEFINED_FUNCTION,
+                "AX={ax:04x} reports undefined"
+            );
+        }
+
+        for ax in [0x5b00, 0x5d00] {
+            machine.cpu.registers.set_eax(ax);
+            machine.handle_int67();
+            assert_eq!(
+                (machine.cpu.registers.eax() >> 8) as u8,
+                ems::status::ACCESS_DENIED,
+                "AX={ax:04x} reports OS access denied"
+            );
+        }
+
+        machine.cpu.registers.set_eax(0x5c00);
+        machine.handle_int67();
+        assert_eq!(
+            (machine.cpu.registers.eax() >> 8) as u8,
+            ems::status::OK,
+            "warm-boot preparation succeeds"
+        );
+    }
+
+    #[test]
     fn ems_guest_self_check_allocates_maps_and_round_trips_through_the_frame() {
         // A guest program that drives the EMS manager end to end through the real
         // INT 67h path: allocate a page (AH=43h), map it into frame slot 0 (AH=44h),
@@ -14139,6 +14595,19 @@ mod tests {
         m
     }
 
+    fn write_abs_disk_packet(
+        m: &mut Machine,
+        packet: u32,
+        lba: u32,
+        count: u16,
+        transfer: izarravm_dos::FarPtr,
+    ) {
+        m.write_guest_block(packet, &lba.to_le_bytes());
+        m.write_guest_block(packet + 4, &count.to_le_bytes());
+        m.write_guest_block(packet + 6, &transfer.offset.to_le_bytes());
+        m.write_guest_block(packet + 8, &transfer.segment.to_le_bytes());
+    }
+
     #[test]
     fn mount_hdd_seeds_the_bda_fixed_disk_count() {
         let m = machine_with_hdd(64);
@@ -14536,6 +15005,248 @@ mod tests {
             0x0300,
             "INT 26h write to a read-only volume is write-protected"
         );
+    }
+
+    #[test]
+    fn int25_packet_form_reads_ata_c() {
+        let mut m = machine_with_hdd(64);
+        let packet = 0x3000u32 << 4;
+        write_abs_disk_packet(
+            &mut m,
+            packet,
+            7,
+            2,
+            izarravm_dos::FarPtr {
+                segment: 0x4000,
+                offset: 0,
+            },
+        );
+        prime_dos_int_frame(&mut m);
+        m.cpu.registers.set_eax(0x0002); // C:
+        m.cpu.registers.set_ecx(0xffff);
+        m.cpu.registers.set_edx(0);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x3000));
+        m.cpu.registers.set_ebx(0);
+
+        m.handle_int25();
+
+        assert_eq!(m.cpu.registers.eax() as u16, 0, "packet read succeeds");
+        assert_eq!(dos_int_flags(&m) & 1, 0, "packet read clears CF");
+        assert_eq!(m.read_physical_u8(0x4_0000), 0x17, "LBA 7 marker");
+        assert_eq!(m.read_physical_u8(0x4_0000 + 512), 0x18, "LBA 8 marker");
+    }
+
+    #[test]
+    fn int26_packet_form_writes_ata_c() {
+        let mut m = machine_with_hdd(64);
+        for i in 0..512u32 {
+            m.write_physical_u8(0x4_0000 + i, (i & 0xff) as u8);
+        }
+
+        let packet = 0x3000u32 << 4;
+        write_abs_disk_packet(
+            &mut m,
+            packet,
+            9,
+            1,
+            izarravm_dos::FarPtr {
+                segment: 0x4000,
+                offset: 0,
+            },
+        );
+        prime_dos_int_frame(&mut m);
+        m.cpu.registers.set_eax(0x0002); // C:
+        m.cpu.registers.set_ecx(0xffff);
+        m.cpu.registers.set_edx(0);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x3000));
+        m.cpu.registers.set_ebx(0);
+
+        m.handle_int26();
+
+        assert_eq!(m.cpu.registers.eax() as u16, 0, "packet write succeeds");
+        assert_eq!(dos_int_flags(&m) & 1, 0, "packet write clears CF");
+
+        write_abs_disk_packet(
+            &mut m,
+            packet,
+            9,
+            1,
+            izarravm_dos::FarPtr {
+                segment: 0x5000,
+                offset: 0,
+            },
+        );
+        prime_dos_int_frame(&mut m);
+        m.cpu.registers.set_eax(0x0002);
+        m.cpu.registers.set_ecx(0xffff);
+        m.cpu.registers.set_edx(0);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x3000));
+        m.cpu.registers.set_ebx(0);
+
+        m.handle_int25();
+
+        assert_eq!(m.cpu.registers.eax() as u16, 0, "readback succeeds");
+        assert_eq!(m.read_physical_u8(0x5_0000), 0x00);
+        assert_eq!(m.read_physical_u8(0x5_0000 + 255), 0xff);
+    }
+
+    #[test]
+    fn int25_26_packet_form_on_fat32_reports_use_ax7305() {
+        let dir = std::env::temp_dir().join(format!(
+            "izarra_int25_packet_fat32_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("HELLO.TXT"), b"hi").unwrap();
+        let vol = build_fat32(&dir, 64 * 1024 * 1024, 0x1234_5678).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        let mut m = int15_machine(16);
+        m.mount_fat32(vol);
+
+        let packet = 0x3000u32 << 4;
+        write_abs_disk_packet(
+            &mut m,
+            packet,
+            0,
+            1,
+            izarravm_dos::FarPtr {
+                segment: 0x4000,
+                offset: 0,
+            },
+        );
+
+        prime_dos_int_frame(&mut m);
+        m.cpu.registers.set_eax(0x0002); // C:
+        m.cpu.registers.set_ecx(0xffff);
+        m.cpu.registers.set_edx(0);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x3000));
+        m.cpu.registers.set_ebx(0);
+        m.handle_int25();
+        assert_eq!(m.cpu.registers.eax() as u16, 0x0207);
+        assert_ne!(dos_int_flags(&m) & 1, 0, "FAT32 packet read sets CF");
+
+        prime_dos_int_frame(&mut m);
+        m.cpu.registers.set_eax(0x0002);
+        m.cpu.registers.set_ecx(0xffff);
+        m.cpu.registers.set_edx(0);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x3000));
+        m.cpu.registers.set_ebx(0);
+        m.handle_int26();
+        assert_eq!(m.cpu.registers.eax() as u16, 0x0207);
+        assert_ne!(dos_int_flags(&m) & 1, 0, "FAT32 packet write sets CF");
+    }
+
+    #[test]
+    fn int21_ax7305_reads_the_fat32_volume_packet() {
+        let dir = std::env::temp_dir().join(format!(
+            "izarra_7305_fat32_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("HELLO.TXT"), b"hi").unwrap();
+        let vol = build_fat32(&dir, 64 * 1024 * 1024, 0x1234_5678).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        let mut m = int15_machine(16);
+        m.mount_fat32(vol);
+        prime_dos_int_frame(&mut m);
+
+        let packet = 0x3000u32 << 4;
+        let buffer = 0x2200u16;
+        m.write_guest_block(packet, &0u32.to_le_bytes()); // LBA 0
+        m.write_guest_block(packet + 4, &2u16.to_le_bytes());
+        m.write_guest_block(packet + 6, &0u16.to_le_bytes());
+        m.write_guest_block(packet + 8, &buffer.to_le_bytes());
+        m.cpu.registers.set_eax(0x7305);
+        m.cpu.registers.set_ecx(0xffff);
+        m.cpu.registers.set_edx(0x0003); // C:, 1=A:
+        m.cpu.registers.set_esi(0x0000);
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x3000));
+        m.cpu.registers.set_ebx(0x0000);
+
+        assert_eq!(m.handle_dos_int(0x21).unwrap(), None);
+        assert_eq!(m.cpu.registers.eax() as u16, 0, "AX=7305h read AX=0");
+        assert_eq!(dos_int_flags(&m) & 1, 0, "AX=7305h read clears CF");
+
+        let target = u32::from(buffer) << 4;
+        let fstype: Vec<u8> = (0..8u32)
+            .map(|i| m.read_physical_u8(target + 82 + i))
+            .collect();
+        assert_eq!(&fstype, b"FAT32   ", "boot sector filesystem type");
+        let fsi_lead: Vec<u8> = (0..4u32)
+            .map(|i| m.read_physical_u8(target + 512 + i))
+            .collect();
+        assert_eq!(&fsi_lead, &0x4161_5252u32.to_le_bytes());
+    }
+
+    #[test]
+    fn int21_ax7305_write_to_fat32_is_write_protected_and_updates_ah59() {
+        let dir = std::env::temp_dir().join(format!(
+            "izarra_7305_write_fat32_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("HELLO.TXT"), b"hi").unwrap();
+        let vol = build_fat32(&dir, 64 * 1024 * 1024, 0x1234_5678).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        let mut m = int15_machine(16);
+        m.mount_fat32(vol);
+        prime_dos_int_frame(&mut m);
+
+        let packet = 0x3000u32 << 4;
+        m.write_guest_block(packet, &0u32.to_le_bytes()); // LBA 0
+        m.write_guest_block(packet + 4, &1u16.to_le_bytes());
+        m.write_guest_block(packet + 6, &0u16.to_le_bytes());
+        m.write_guest_block(packet + 8, &0x2200u16.to_le_bytes());
+        m.cpu.registers.set_eax(0x7305);
+        m.cpu.registers.set_ecx(0xffff);
+        m.cpu.registers.set_edx(0x0003); // C:, 1=A:
+        m.cpu.registers.set_esi(0x0001); // write
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x3000));
+        m.cpu.registers.set_ebx(0x0000);
+
+        assert_eq!(m.handle_dos_int(0x21).unwrap(), None);
+        assert_eq!(
+            m.cpu.registers.eax() as u16,
+            0x0300,
+            "AX=7305h write reports write-protect"
+        );
+        assert_ne!(dos_int_flags(&m) & 1, 0, "AX=7305h write sets CF");
+
+        prime_dos_int_frame(&mut m);
+        m.cpu.registers.set_eax(0x5900);
+        m.cpu.registers.set_ebx(0);
+        assert_eq!(m.handle_dos_int(0x21).unwrap(), None);
+        assert_eq!(m.cpu.registers.eax() as u16, 0x0300);
+        assert_eq!(dos_int_flags(&m) & 1, 0, "AH=59h clears CF");
     }
 
     #[test]
