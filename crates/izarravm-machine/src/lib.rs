@@ -9193,7 +9193,7 @@ impl Machine {
                             0x10 => self.handle_int10(),
                             0x11 => self.handle_int11(),
                             0x12 => self.handle_int12(),
-                            0x13 => self.handle_int13(),
+                            0x13 | 0x40 => self.handle_int13(),
                             0x14 => self.handle_int14(),
                             0x15 => self.handle_int15(),
                             0x17 => self.handle_int17(),
@@ -9778,6 +9778,7 @@ impl CpuBus for MachineBus<'_> {
                 | 0x2E
                 | 0x2F
                 | 0x33
+                | 0x40
                 | 0x66
         ) || (vector == 0x67 && self.ems.is_some());
         if intercepted && !(self.booter_inert && dos_or_iemm) {
@@ -10205,12 +10206,13 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     // vectors (the run loop services them and redirects CS:IP itself, so the IRET
     // target is only a fallback). INT 1Bh is the Ctrl-Break hook: no host handler,
     // just a default IRET so a guest that hooks it or calls it through the vector
-    // has a valid target. INT 66h is the XMS driver entry trap, host-intercepted
-    // the same way.
+    // has a valid target. INT 40h is the relocated floppy handler, routed through
+    // the same disk service as INT 13h. INT 66h is the XMS driver entry trap,
+    // host-intercepted the same way.
     for vector in [
         0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x25, 0x26, 0x27, 0x28,
         0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39,
-        0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 0x66, 0x67, 0x6C,
+        0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 0x40, 0x66, 0x67, 0x6C,
     ] {
         let address = vector * 4;
         memory.write_u16(address, 0)?;
@@ -14453,6 +14455,32 @@ mod tests {
     }
 
     #[test]
+    fn int40_relocated_floppy_handler_uses_disk_service() {
+        let mut img = vec![0u8; 737_280];
+        img[0] = 0xEB;
+        img[1] = 0x40;
+        let rom = rom_with_code(&[
+            0x31, 0xC0, // xor ax, ax
+            0x8E, 0xC0, // mov es, ax
+            0xBB, 0x00, 0x20, // mov bx, 0x2000
+            0xB8, 0x01, 0x02, // mov ax, 0x0201
+            0xB9, 0x01, 0x00, // mov cx, 0x0001
+            0xBA, 0x00, 0x00, // mov dx, 0x0000
+            0xCD, 0x40, // int 40h
+            0xF4, // hlt
+        ]);
+        let mut machine =
+            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
+        machine.mount_floppy(img).unwrap();
+
+        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(machine.read_physical_u8(0x2000), 0xEB);
+        assert_eq!(machine.read_physical_u8(0x2001), 0x40);
+        assert_eq!(machine.cpu().registers.eflags & 0x0001, 0);
+    }
+
+    #[test]
     fn int10_pixel_write_read_round_trips_in_mode13h() {
         let mut m = int15_machine(16);
         m.video_mut().set_mode13h();
@@ -15487,6 +15515,13 @@ mod tests {
             m.pending_soft_int,
             Some(0x13),
             "INT 13h (BIOS disk) stays intercepted"
+        );
+        m.pending_soft_int = None;
+        m.make_bus().interrupt_acknowledge(0x40, 0).unwrap();
+        assert_eq!(
+            m.pending_soft_int,
+            Some(0x40),
+            "INT 40h (relocated floppy) stays intercepted"
         );
 
         // A vector the HLE never intercepts is recorded in neither mode.
