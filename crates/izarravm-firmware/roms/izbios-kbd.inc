@@ -138,6 +138,8 @@ int09:
     jne .not_left_alt
     xor al, al
 .not_left_alt:
+    call kb_deadkey
+    jc .deadkey_swallow
     ; Ctrl + letter -> control code (Ctrl-A = 1 .. Ctrl-Z = 26), as a real BIOS
     ; does, so a full-screen program reads Ctrl-S as ASCII 0x13 from INT 16h.
     test byte [KB_FLAGS], 0x04
@@ -164,6 +166,10 @@ int09:
 .enqueue_store:
     mov ah, bl                      ; AH = scancode
     call kb_enqueue
+    pop si
+    pop cx
+    jmp .eoi
+.deadkey_swallow:
     pop si
     pop cx
     jmp .eoi
