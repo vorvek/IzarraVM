@@ -43,7 +43,12 @@ int09:
     cmp bl, 0x46
     je .make_scroll
     cmp bl, 0x52
-    je .make_ins
+    jne .map_ascii
+    test bh, bh
+    jnz .make_ins
+    test byte [KB_FLAGS], 0x20
+    jz .make_ins
+.map_ascii:
     ; Map scancode -> ASCII using the shift state, then enqueue (scancode:ascii).
     push cx
     push si
@@ -55,6 +60,28 @@ int09:
     jz .have_ascii
     mov al, [cs:scan2ascii_shift + si]
 .have_ascii:
+    test bh, bh
+    jnz .keypad_done
+    cmp bl, 0x4a
+    jne .keypad_plus
+    mov al, '-'
+    jmp .keypad_done
+.keypad_plus:
+    cmp bl, 0x4e
+    jne .keypad_numlock
+    mov al, '+'
+    jmp .keypad_done
+.keypad_numlock:
+    test byte [KB_FLAGS], 0x20
+    jz .keypad_done
+    cmp bl, 0x47
+    jb .keypad_done
+    cmp bl, 0x53
+    ja .keypad_done
+    movzx si, bl
+    sub si, 0x47
+    mov al, [cs:keypad_num_ascii + si]
+.keypad_done:
     test byte [KB_FLAGS], 0x08
     jz .not_alt
     xor al, al
@@ -505,6 +532,9 @@ kb_enqueue:
     pop cx
     pop bx
     ret
+
+keypad_num_ascii:
+    db '7','8','9',0,'4','5','6',0,'1','2','3','0','.'
 
 ; Scancode (Set 1) -> ASCII tables (US). 0 = no ASCII / handled elsewhere.
 ; Index by make scancode (0x00..0x3a covers the main block used by the demo).

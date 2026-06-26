@@ -21,6 +21,11 @@ org 0x8000
 %define DSP_READ 0x22A
 %define DSP_WRITE 0x22C
 %define DSP_STATUS 0x22E
+%define ADPCM_STATUS 0x240
+%define ADPCM_ADDR 0x240
+%define ADPCM_DATA 0x241
+%define ADPCM_RESOURCE 0x242
+%define ADPCM_FIFO 0x243
 %define OPL_ADDR 0x388
 %define OPL_DATA 0x389
 %define DMA1_MODE 0x0B
@@ -85,6 +90,7 @@ stage2_start:
     call test_opl2
     call test_sb_8bit_dma
     call test_sb_16bit_dma
+    call test_adpcm
     call test_pc_speaker
 
     mov si, RESULT_BLOCK + (result_payload - result_block_template)
@@ -540,6 +546,89 @@ test_sb_16bit_dma:
     call wait_for_irq5
     jz .done                ; timeout (counter still 0) -> leave FAIL
     mov di, RESULT_BLOCK + (sb_16bit_dma_record - result_block_template)
+    mov byte [di], 'P'
+    mov byte [di + 2], 'S'
+    mov byte [di + 3], 'S'
+    add word [RESULT_BLOCK + 10], 27
+.done:
+    ret
+
+test_adpcm:
+    ; Izarra's Yamaha ADPCM-B DAC lives at 0x240, IRQ10, DMA3. This direct-FIFO
+    ; probe checks the guest-visible resource byte, starts a short mono block, and
+    ; waits for the playing bit to clear after the clocked decoder consumes it.
+    mov dx, ADPCM_RESOURCE
+    in al, dx
+    cmp al, 0xA3               ; high nibble IRQ10, low nibble DMA3
+    jne .done
+
+    mov dx, ADPCM_ADDR
+    mov al, 0x00               ; CONTROL
+    out dx, al
+    mov dx, ADPCM_DATA
+    mov al, 0x04               ; RESET playback/FIFO
+    out dx, al
+
+    mov dx, ADPCM_ADDR
+    mov al, 0x01               ; RATE_LOW
+    out dx, al
+    mov dx, ADPCM_DATA
+    mov al, 0x11               ; 11025 Hz = 0x2B11
+    out dx, al
+    mov dx, ADPCM_ADDR
+    mov al, 0x02               ; RATE_HIGH
+    out dx, al
+    mov dx, ADPCM_DATA
+    mov al, 0x2B
+    out dx, al
+    mov dx, ADPCM_ADDR
+    mov al, 0x04               ; COUNT_LOW
+    out dx, al
+    mov dx, ADPCM_DATA
+    mov al, 0x0F               ; 16 nibbles -> count register is nibbles - 1
+    out dx, al
+    mov dx, ADPCM_ADDR
+    mov al, 0x05               ; COUNT_HIGH
+    out dx, al
+    mov dx, ADPCM_DATA
+    xor al, al
+    out dx, al
+    mov dx, ADPCM_ADDR
+    mov al, 0x03               ; FORMAT
+    out dx, al
+    mov dx, ADPCM_DATA
+    xor al, al                 ; ADPCM-B mono
+    out dx, al
+
+    mov dx, ADPCM_FIFO
+    mov cx, 8                  ; 8 bytes = 16 mono ADPCM nibbles
+.feed:
+    xor al, al
+    out dx, al
+    loop .feed
+
+    mov dx, ADPCM_ADDR
+    xor al, al                 ; CONTROL
+    out dx, al
+    mov dx, ADPCM_DATA
+    mov al, 0x01               ; START
+    out dx, al
+    mov dx, ADPCM_STATUS
+    in al, dx
+    test al, 0x01
+    jz .done                   ; did not enter playing state
+
+    mov cx, 32
+.wait:
+    call delay
+    mov dx, ADPCM_STATUS
+    in al, dx
+    test al, 0x01
+    jz .passed
+    loop .wait
+    ret
+.passed:
+    mov di, RESULT_BLOCK + (adpcm_record - result_block_template)
     mov byte [di], 'P'
     mov byte [di + 2], 'S'
     mov byte [di + 3], 'S'

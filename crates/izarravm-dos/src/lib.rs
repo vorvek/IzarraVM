@@ -2397,10 +2397,9 @@ impl DosKernel {
 
     /// Split a FindFirst filespec into (host directory, final-component pattern).
     /// Ok((dir, pattern)) on success; Err(code) is a DOS error code (0x02 no drive,
-    /// 0x03 bad/non-C/traversal path). The pattern is the last path component (may
-    /// hold wildcards); the directory defaults to the C: root when no path is given
-    /// (no per-drive current directory is tracked, marked). The filespec is already
-    /// read from guest memory, so this touches no memory and returns no DosError.
+    /// 0x03 bad/non-C path). The pattern is the last path component and may hold
+    /// wildcards. Relative specs use the current directory, matching the normal
+    /// file calls.
     fn split_find_spec(&self, filespec: &str) -> Result<(PathBuf, String), u16> {
         let drive = self.drive.as_ref().ok_or(0x02u16)?;
         let spec = filespec.trim();
@@ -2415,15 +2414,31 @@ impl DosKernel {
                 spec
             };
         let normalized = after_drive.replace('/', "\\");
-        let (dir_part, pattern) = match normalized.rfind('\\') {
-            Some(i) => (normalized[..i].to_string(), normalized[i + 1..].to_string()),
-            None => (String::new(), normalized.clone()),
-        };
-        let mut dir = drive.root().to_path_buf();
-        for component in dir_part.split('\\').filter(|c| !c.is_empty() && *c != ".") {
-            if component == ".." {
-                return Err(0x03);
+        let mut parts = normalized
+            .split('\\')
+            .filter(|c| !c.is_empty())
+            .collect::<Vec<_>>();
+        let pattern = parts.pop().unwrap_or_default().to_string();
+        let mut components = Vec::new();
+        if !normalized.starts_with('\\') {
+            components.extend(
+                self.cwd
+                    .split('\\')
+                    .filter(|c| !c.is_empty())
+                    .map(str::to_string),
+            );
+        }
+        for component in parts {
+            match component {
+                "." => {}
+                ".." => {
+                    components.pop();
+                }
+                other => components.push(other.to_string()),
             }
+        }
+        let mut dir = drive.root().to_path_buf();
+        for component in components {
             dir.push(component);
         }
         Ok((dir, pattern))
@@ -14407,6 +14422,33 @@ mod tests {
         assert_eq!(dta_name(&mem), "HELLO.TXT");
         assert_eq!(mem.read_u8(0x15).unwrap(), 0x00); // attr: normal file
         assert_eq!(mem.read_u32(0x1a).unwrap(), 8); // size
+    }
+
+    #[test]
+    fn ah4e_bare_pattern_uses_current_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("SUB")).unwrap();
+        std::fs::write(dir.path().join("ROOT.TXT"), b"root").unwrap();
+        std::fs::write(dir.path().join("SUB").join("LOCAL.TXT"), b"local").unwrap();
+        let (mut kernel, mut mem) = find_kernel(dir.path());
+
+        let path_base = 0x0100usize * 16 + 0x0200;
+        for (i, byte) in b"SUB".iter().enumerate() {
+            mem.write_u8(path_base + i, *byte).unwrap();
+        }
+        mem.write_u8(path_base + 3, 0).unwrap();
+        let mut chdir = DosRegs {
+            ax: 0x3b00,
+            ds: 0x0100,
+            dx: 0x0200,
+            ..DosRegs::default()
+        };
+        kernel.dispatch(0x21, &mut chdir, &mut mem).unwrap();
+        assert!(!chdir.cf);
+
+        let regs = find_first(&mut kernel, &mut mem, "*.TXT", 0);
+        assert!(!regs.cf);
+        assert_eq!(dta_name(&mem), "LOCAL.TXT");
     }
 
     #[test]

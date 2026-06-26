@@ -37,6 +37,7 @@ sb_8bit_dma_record:
      db 'FAIL sound.sb_8bit_dma', 10
 sb_16bit_dma_record:
      db 'FAIL sound.sb_16bit_dma', 10
+adpcm_record:
     db 'FAIL sound.sb_adpcm', 10
 timer_record:
     db 'FAIL timer.irq0', 10

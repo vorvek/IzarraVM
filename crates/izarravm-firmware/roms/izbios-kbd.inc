@@ -80,7 +80,12 @@ int09:
     cmp bl, 0x46
     je .make_scroll
     cmp bl, 0x52
-    je .make_ins
+    jne .map_ascii
+    test bh, bh
+    jnz .make_ins
+    test byte [KB_FLAGS], 0x20
+    jz .make_ins
+.map_ascii:
     push cx
     push si
     mov ax, BDA_SEG
@@ -105,6 +110,28 @@ int09:
     movzx cx, bl                    ; CX = scancode
     add si, cx
     mov al, [cs:si]                 ; AL = ASCII (0 if none)
+    test bh, bh
+    jnz .keypad_done
+    cmp bl, 0x4a
+    jne .keypad_plus
+    mov al, '-'
+    jmp .keypad_done
+.keypad_plus:
+    cmp bl, 0x4e
+    jne .keypad_numlock
+    mov al, '+'
+    jmp .keypad_done
+.keypad_numlock:
+    test byte [KB_FLAGS], 0x20
+    jz .keypad_done
+    cmp bl, 0x47
+    jb .keypad_done
+    cmp bl, 0x53
+    ja .keypad_done
+    movzx si, bl
+    sub si, 0x47
+    mov al, [cs:keypad_num_ascii + si]
+.keypad_done:
     test byte [KB_FLAGS], 0x08
     jz .not_left_alt
     cmp byte [KB_ALTGR], 0
@@ -555,6 +582,9 @@ kb_enqueue:
     pop cx
     pop bx
     ret
+
+keypad_num_ascii:
+    db '7','8','9',0,'4','5','6',0,'1','2','3','0','.'
 
 ; The scancode -> ASCII tables for every layout live in kbd-layouts.inc, indexed
 ; above by the cached KB_LAYOUT byte.

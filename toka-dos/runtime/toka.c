@@ -390,6 +390,18 @@ void t_gettime(int *hour, int *min, int *sec)
     *sec = (int)r.h.dh;
 }
 
+unsigned long t_diskfree(void)
+{
+    union REGS r;
+    r.h.ah = 0x36; /* get free disk space */
+    r.h.dl = 0;    /* default drive */
+    int86(0x21, &r, &r);
+    if (r.x.ax == 0xffff) {
+        return 0;
+    }
+    return (unsigned long)r.x.ax * (unsigned long)r.x.bx * (unsigned long)r.x.cx;
+}
+
 int t_lastexit(void)
 {
     union REGS r;

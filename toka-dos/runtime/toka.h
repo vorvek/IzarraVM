@@ -77,6 +77,7 @@ int t_findnext(void *dta);
 
 void t_getdate(int *year, int *month, int *day, int *dow);
 void t_gettime(int *hour, int *min, int *sec);
+unsigned long t_diskfree(void);
 
 /* The exit code of the last EXEC'd child (AH=4Dh), for ERRORLEVEL. */
 int t_lastexit(void);

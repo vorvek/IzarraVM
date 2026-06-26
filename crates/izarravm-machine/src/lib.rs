@@ -16521,6 +16521,15 @@ mod tests {
         assert_eq!(int16_read_after(&[0x1d, 0x1f, 0x9f, 0x9d]), 0x1f13);
     }
 
+    #[test]
+    fn int16_numpad_honors_num_lock_for_digits() {
+        // NumLock make/break toggles the BIOS flag without entering the key ring.
+        // The next keypad make then returns its numeric ASCII byte.
+        assert_eq!(int16_read_after(&[0x45, 0xc5, 0x48, 0xc8]), 0x4838);
+        assert_eq!(int16_read_after(&[0x45, 0xc5, 0x52, 0xd2]), 0x5230);
+        assert_eq!(int16_read_after(&[0x4e, 0xce]), 0x4e2b);
+    }
+
     /// Same path as `int16_read_after`, but the program reads with AH=10h (the
     /// enhanced read). Before the DOS keyboard ROM aliased AH=10h to the AH=00h
     /// reader, this fell through the int16 dispatch and returned stale AX.
@@ -17600,7 +17609,7 @@ mod tests {
         assert!(serial.contains("PASS video.cga_graphics"));
         assert!(serial.contains("PASS video.ega_planar"));
         assert!(serial.contains("PASS video.vga_mode13h"));
-        assert!(serial.contains("FAIL sound.sb_adpcm"));
+        assert!(serial.contains("PASS sound.sb_adpcm"));
         assert_eq!(
             usize::from(results.declared_record_count),
             results.records.len()
@@ -17627,6 +17636,10 @@ mod tests {
         assert!(results.records.iter().any(|record| {
             record.status == izarravm_firmware::SuiteRecordStatus::Pass
                 && record.name == "sound.sb_16bit_dma"
+        }));
+        assert!(results.records.iter().any(|record| {
+            record.status == izarravm_firmware::SuiteRecordStatus::Pass
+                && record.name == "sound.sb_adpcm"
         }));
     }
 
@@ -21936,6 +21949,25 @@ mod tests {
                     && record.name == "sound.sb_16bit_dma"
             }),
             "boot suite should report PASS sound.sb_16bit_dma (clock-driven auto-init DMA + IRQ5)"
+        );
+    }
+
+    #[test]
+    fn boot_suite_reports_adpcm_pass() {
+        let mut machine = Machine::new_boot_image(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::X86_BOOT_TEST_IMAGE,
+        )
+        .unwrap();
+        let reason = machine.run_until_halt_or_cycles(5_000_000).unwrap();
+        assert_eq!(reason, StopReason::Halted);
+        let results = izarravm_firmware::parse_result_block(machine.memory().as_slice()).unwrap();
+        assert!(
+            results.records.iter().any(|record| {
+                record.status == izarravm_firmware::SuiteRecordStatus::Pass
+                    && record.name == "sound.sb_adpcm"
+            }),
+            "boot suite should report PASS sound.sb_adpcm (guest-visible Yamaha ADPCM-B DAC)"
         );
     }
 
@@ -30375,6 +30407,90 @@ mod tests {
             codes.push(0xaa);
         }
         codes
+    }
+
+    #[test]
+    fn toka_dir_uses_cwd_and_runs_exact_external_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = izarravm_firmware::toka_dos_system_files();
+        izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format)
+            .unwrap();
+        let game_dir = dir.path().join("GAMES").join("UUKRUL");
+        std::fs::create_dir_all(&game_dir).unwrap();
+        std::fs::write(game_dir.join("UUKRUL.EXE"), izarravm_firmware::EXEHELLO_EXE).unwrap();
+        std::fs::write(
+            game_dir.join("PLAY.BAT"),
+            "@ECHO OFF\r\nECHO batch exact\r\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("ROOT.TXT"), b"root").unwrap();
+
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .unwrap();
+        machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+        machine.set_toka_c_root(dir.path().to_path_buf());
+        machine.run_until_halt_or_cycles(22_000_000).unwrap();
+
+        let type_line = |machine: &mut Machine, text: &str| {
+            for ch in text.chars() {
+                let codes = toka_key_codes(ch);
+                assert!(!codes.is_empty(), "unmapped test char {ch:?}");
+                for code in codes {
+                    machine.inject_key_scancodes(&[code]);
+                }
+                machine.run_until_halt_or_cycles(400_000).unwrap();
+            }
+            for code in toka_key_codes('\r') {
+                machine.inject_key_scancodes(&[code]);
+            }
+            machine.run_until_halt_or_cycles(8_000_000).unwrap();
+        };
+
+        type_line(&mut machine, "CD GAMES\\UUKRUL");
+        type_line(&mut machine, "DIR");
+        let dir_text = machine.screen_text().as_text();
+        assert!(
+            dir_text.contains("Directory of  C:\\GAMES\\UUKRUL"),
+            "DIR reports the current game directory; got:\n{dir_text}"
+        );
+        assert!(
+            dir_text.contains("UUKRUL   EXE"),
+            "DIR lists the game executable; got:\n{dir_text}"
+        );
+        assert!(
+            !dir_text.contains("ROOT     TXT"),
+            "DIR must not fall back to the C: root; got:\n{dir_text}"
+        );
+
+        type_line(&mut machine, "UUKRUL");
+        let bare_text = machine.screen_text().as_text();
+        assert!(
+            bare_text.contains("Hello from a relocated .EXE!"),
+            "bare UUKRUL finds UUKRUL.EXE; got:\n{bare_text}"
+        );
+        assert!(
+            !bare_text.contains("Bad command or file name"),
+            "bare UUKRUL should not fail command lookup; got:\n{bare_text}"
+        );
+
+        type_line(&mut machine, "UUKRUL.EXE");
+        type_line(&mut machine, "PLAY.BAT");
+        let exact_text = machine.screen_text().as_text();
+        assert!(
+            exact_text.contains("Hello from a relocated .EXE!"),
+            "typed UUKRUL.EXE runs exactly; got:\n{exact_text}"
+        );
+        assert!(
+            exact_text.contains("batch exact"),
+            "typed PLAY.BAT runs as the exact batch file; got:\n{exact_text}"
+        );
+        assert!(
+            !exact_text.contains("Bad command or file name"),
+            "exact typed filenames should not fail command lookup; got:\n{exact_text}"
+        );
     }
 
     #[test]

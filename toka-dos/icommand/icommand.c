@@ -138,24 +138,6 @@ static int has_wildcard(const char *s)
     return 0;
 }
 
-/* Print an unsigned long in decimal (file sizes exceed 16 bits). */
-static void put_ulong(unsigned long value)
-{
-    char buf[12];
-    int i = 0;
-    if (value == 0) {
-        t_putc('0');
-        return;
-    }
-    while (value > 0 && i < 12) {
-        buf[i++] = (char)('0' + (int)(value % 10));
-        value /= 10;
-    }
-    while (i > 0) {
-        t_putc(buf[--i]);
-    }
-}
-
 static unsigned long dword_at(const unsigned char *p)
 {
     return (unsigned long)p[0] | ((unsigned long)p[1] << 8) |
@@ -165,8 +147,101 @@ static unsigned long dword_at(const unsigned char *p)
 /* The DTA fields a find result fills: name at 0x1E, attribute at 0x15, size
  * dword at 0x1A. */
 #define DTA_ATTR 0x15
+#define DTA_TIME 0x16
+#define DTA_DATE 0x18
 #define DTA_SIZE 0x1A
 #define DTA_NAME 0x1E
+
+static unsigned word_at(const unsigned char *p)
+{
+    return (unsigned)p[0] | ((unsigned)p[1] << 8);
+}
+
+static void put_dir2(unsigned value)
+{
+    t_putc((char)('0' + (value / 10) % 10));
+    t_putc((char)('0' + value % 10));
+}
+
+static void put_ulong_width(unsigned long value, int width)
+{
+    char buf[12];
+    int i = 0;
+    int pad;
+    if (value == 0) {
+        buf[i++] = '0';
+    } else {
+        while (value > 0 && i < 12) {
+            buf[i++] = (char)('0' + (int)(value % 10));
+            value /= 10;
+        }
+    }
+    for (pad = width - i; pad > 0; pad--) {
+        t_putc(' ');
+    }
+    while (i > 0) {
+        t_putc(buf[--i]);
+    }
+}
+
+static void put_dos_date(unsigned date)
+{
+    put_dir2((date >> 5) & 0x0f);
+    t_putc('-');
+    put_dir2(date & 0x1f);
+    t_putc('-');
+    put_dir2((date >> 9) + 80);
+}
+
+static void put_dos_time(unsigned time)
+{
+    unsigned hour = (time >> 11) & 0x1f;
+    unsigned minute = (time >> 5) & 0x3f;
+    char suffix = hour >= 12 ? 'p' : 'a';
+    if (hour == 0) {
+        hour = 12;
+    } else if (hour > 12) {
+        hour -= 12;
+    }
+    if (hour < 10) {
+        t_putc(' ');
+        t_putc((char)('0' + hour));
+    } else {
+        put_dir2(hour);
+    }
+    t_putc(':');
+    put_dir2(minute);
+    t_putc(suffix);
+}
+
+static void put_dir_name(const char *name)
+{
+    char base[8];
+    char ext[3];
+    int i;
+    for (i = 0; i < 8; i++) {
+        base[i] = ' ';
+    }
+    for (i = 0; i < 3; i++) {
+        ext[i] = ' ';
+    }
+    for (i = 0; *name && *name != '.' && i < 8; i++) {
+        base[i] = up(*name++);
+    }
+    if (*name == '.') {
+        name++;
+        for (i = 0; *name && i < 3; i++) {
+            ext[i] = up(*name++);
+        }
+    }
+    for (i = 0; i < 8; i++) {
+        t_putc(base[i]);
+    }
+    t_putc(' ');
+    for (i = 0; i < 3; i++) {
+        t_putc(ext[i]);
+    }
+}
 
 /* The master environment: a DOS-format block of KEY=VALUE strings, each NUL
  * terminated, ended by an empty string (a double NUL). ICOMMAND owns it and
@@ -468,19 +543,116 @@ static void cmd_truename(const char *arg)
     t_putln(arg);
 }
 
+static void current_dir_display(char *out)
+{
+    char cwd[64];
+    strcpy(out, "C:\\");
+    t_getcwd(cwd);
+    strcat(out, cwd);
+}
+
+static void absolute_display_path(const char *path, char *out)
+{
+    char cwd[64];
+    if (path[0] == 0) {
+        current_dir_display(out);
+    } else if (path[1] == ':') {
+        strcpy(out, path);
+    } else if (path[0] == '\\' || path[0] == '/') {
+        strcpy(out, "C:");
+        strcat(out, path);
+    } else {
+        strcpy(out, "C:\\");
+        t_getcwd(cwd);
+        if (cwd[0]) {
+            strcat(out, cwd);
+            strcat(out, "\\");
+        }
+        strcat(out, path);
+    }
+    while (*out) {
+        if (*out == '/') {
+            *out = '\\';
+        } else {
+            *out = up(*out);
+        }
+        out++;
+    }
+}
+
+static void dir_part_for_display(const char *spec, char *out)
+{
+    int last = -1, i;
+    for (i = 0; spec[i]; i++) {
+        if (spec[i] == '\\' || spec[i] == '/') {
+            last = i;
+        }
+    }
+    if (last < 0) {
+        out[0] = 0;
+        return;
+    }
+    if (last == 2 && spec[1] == ':') {
+        last++;
+    }
+    for (i = 0; i < last; i++) {
+        out[i] = spec[i];
+    }
+    out[last] = 0;
+}
+
+static void append_all_files(char *spec)
+{
+    int n = (int)strlen(spec);
+    if (n > 0 && spec[n - 1] != '\\' && spec[n - 1] != '/') {
+        strcat(spec, "\\");
+    }
+    strcat(spec, "*.*");
+}
+
+static int dir_arg_is_directory(const char *arg)
+{
+    static unsigned char probe[43];
+    if (arg[0] == 0 || has_wildcard(arg)) {
+        return 0;
+    }
+    return t_findfirst(arg, 0x10, probe) == 0 && (probe[DTA_ATTR] & 0x10) != 0;
+}
+
+static void build_dir_spec(const char *arg, char *spec, char *display)
+{
+    char shown[80];
+    int is_dir;
+    if (arg[0] == 0) {
+        strcpy(spec, "*.*");
+        current_dir_display(display);
+        return;
+    }
+    strcpy(spec, arg);
+    is_dir = dir_arg_is_directory(arg);
+    if (is_dir) {
+        append_all_files(spec);
+        absolute_display_path(arg, display);
+    } else {
+        dir_part_for_display(arg, shown);
+        absolute_display_path(shown, display);
+    }
+}
+
 static void cmd_dir(const char *arg)
 {
     static unsigned char dta[43];
     char spec[80];
-    char cwd[64];
+    char display[80];
     unsigned files = 0;
+    unsigned dirs = 0;
+    unsigned long bytes = 0;
 
-    strcpy(spec, arg[0] == 0 ? "*.*" : arg);
-    t_getcwd(cwd);
+    build_dir_spec(arg, spec, display);
     t_putln("");
     t_putln(" Volume in drive C is TOKA-DOS");
-    t_puts(" Directory of C:\\");
-    t_putln(cwd);
+    t_puts(" Directory of  ");
+    t_putln(display);
     t_putln("");
 
     if (t_findfirst(spec, 0x10, dta) != 0) {
@@ -490,20 +662,33 @@ static void cmd_dir(const char *arg)
     do {
         const char *name = (const char *)(dta + DTA_NAME);
         unsigned char attr = dta[DTA_ATTR];
-        t_puts(name);
+        unsigned long size = dword_at(dta + DTA_SIZE);
+        put_dir_name(name);
+        t_putc(' ');
         if (attr & 0x10) {
-            t_puts("    <DIR>");
+            t_puts("   <DIR>    ");
+            dirs++;
         } else {
-            t_puts("    ");
-            put_ulong(dword_at(dta + DTA_SIZE));
+            put_ulong_width(size, 11);
+            t_putc(' ');
+            files++;
+            bytes += size;
         }
+        t_putc(' ');
+        put_dos_date(word_at(dta + DTA_DATE));
+        t_puts("  ");
+        put_dos_time(word_at(dta + DTA_TIME));
         t_putln("");
-        files++;
     } while (t_findnext(dta) == 0);
 
-    t_puts("    ");
-    t_putu(files);
-    t_putln(" file(s)");
+    put_ulong_width(files, 10);
+    t_puts(" File(s)");
+    put_ulong_width(bytes, 12);
+    t_putln(" bytes");
+    put_ulong_width(dirs, 10);
+    t_puts(" Dir(s) ");
+    put_ulong_width(t_diskfree(), 12);
+    t_putln(" bytes free");
 }
 
 static void cmd_type(const char *arg)
@@ -1046,12 +1231,62 @@ static void join_path(char *out, const char *dir, const char *name, const char *
     strcat(out, ext);
 }
 
-/* Try to run `dir`\`name` as .COM, then .EXE, then .BAT (the DOS extension
- * order). Returns 1 if a match exists in `dir` (and is run, or its launch error
- * is reported through errorlevel); 0 if no such file exists there. */
+static int has_dos_path(const char *name)
+{
+    while (*name) {
+        if (*name == ':' || *name == '\\' || *name == '/') {
+            return 1;
+        }
+        name++;
+    }
+    return 0;
+}
+
+static const char *final_ext(const char *name)
+{
+    const char *dot = 0;
+    while (*name) {
+        if (*name == ':' || *name == '\\' || *name == '/') {
+            dot = 0;
+        } else if (*name == '.') {
+            dot = name;
+        }
+        name++;
+    }
+    return dot;
+}
+
+static int has_extension(const char *name)
+{
+    return final_ext(name) != 0;
+}
+
+static int batch_ext(const char *name)
+{
+    const char *dot = final_ext(name);
+    return dot && eqi(dot, ".BAT");
+}
+
+/* Try the exact name when an extension was typed. Bare names use the DOS search
+ * order: .COM, then .EXE, then .BAT. Returns 1 if a match exists in `dir` (and
+ * is run, or its launch error is reported through errorlevel); 0 if no such file
+ * exists there. */
 static int try_dir(const char *dir, const char *name, const char *tail)
 {
     char path[100];
+    if (has_extension(name)) {
+        join_path(path, dir, name, "");
+        if (batch_ext(name)) {
+            if (t_exists(path)) {
+                run_batch(path, tail);
+                return 1;
+            }
+        } else if (exec_with_env(path, tail) != 2) {
+            errorlevel = t_lastexit();
+            return 1;
+        }
+        return 0;
+    }
     join_path(path, dir, name, ".COM");
     if (exec_with_env(path, tail) != 2) {
         errorlevel = t_lastexit();
@@ -1070,6 +1305,36 @@ static int try_dir(const char *dir, const char *name, const char *tail)
     return 0;
 }
 
+static int try_path_command(const char *name, const char *tail)
+{
+    char dir[80];
+    char base[32];
+    int last = -1, i, j = 0;
+    for (i = 0; name[i]; i++) {
+        if (name[i] == '\\' || name[i] == '/') {
+            last = i;
+        }
+    }
+    if (last < 0) {
+        if (name[1] == ':') {
+            strcpy(dir, "C:");
+            strncpy(base, name + 2, sizeof(base) - 1);
+            base[sizeof(base) - 1] = 0;
+            return base[0] && try_dir(dir, base, tail);
+        }
+        return 0;
+    }
+    for (i = 0; i < last && i < (int)sizeof(dir) - 1; i++) {
+        dir[i] = name[i];
+    }
+    dir[i] = 0;
+    for (i = last + 1; name[i] && j < (int)sizeof(base) - 1; i++) {
+        base[j++] = name[i];
+    }
+    base[j] = 0;
+    return base[0] && try_dir(dir, base, tail);
+}
+
 /* Run `name` as an external .COM/.EXE/.BAT, searching the current directory
  * first (the DOS order, and the fallback that keeps commands resolvable when
  * PATH is empty) and then each semicolon-separated entry of PATH. Returns 1 if
@@ -1078,6 +1343,10 @@ static int run_external(const char *name, const char *tail)
 {
     char dir[80];
     char *path;
+
+    if (has_dos_path(name)) {
+        return try_path_command(name, tail);
+    }
 
     /* The current directory: "C:\" plus the cwd relative to the root. */
     strcpy(dir, "C:\\");
@@ -1159,7 +1428,7 @@ static void dispatch(char *word, char *rest)
         cmd_truename(rest);
     } else if (eqi(word, "LOADHIGH") || eqi(word, "LH") || eqi(word, "LOADFIX")) {
         /* No UMB model: just run the program that follows. */
-        char w2[16];
+        char w2[80];
         char *r2 = split_word(rest, w2, sizeof w2);
         if (w2[0]) {
             dispatch(w2, r2);
@@ -1233,7 +1502,7 @@ static void dispatch_redirected(char *word, char *rest, struct redirect *rd)
 
 static void execute_line(char *line)
 {
-    char word[16];
+    char word[80];
     char *rest;
     struct redirect rd;
     int redir;
