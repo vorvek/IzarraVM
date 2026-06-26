@@ -61,10 +61,14 @@ pub use uma::{EMS_FRAME_SIZE, UmaReservation, UmaReservationMap, UmaUse};
 /// even though this machine does not yet map a BIOS image into that span.
 const VGA_BIOS_BASE: u32 = UPPER_MEMORY_BASE; // 0xC0000
 const VGA_BIOS_SIZE: u32 = 0x8000; // 32 KiB
+const VGA_BIOS_INT1D_VIDEO_TABLE_OFF: u16 = 0x1000;
+const VGA_BIOS_INT1D_VIDEO_TABLE_ADDR: u32 = VGA_BIOS_BASE + VGA_BIOS_INT1D_VIDEO_TABLE_OFF as u32;
 const VGA_BIOS_FONT_TABLE_OFF: u16 = 0x2000;
 const VGA_BIOS_INT43_FONT_ADDR: u32 = VGA_BIOS_BASE + VGA_BIOS_FONT_TABLE_OFF as u32;
 const VGA_BIOS_INT44_FONT_OFF: u16 = 0x3000;
 const VGA_BIOS_INT44_FONT_ADDR: u32 = VGA_BIOS_BASE + VGA_BIOS_INT44_FONT_OFF as u32;
+const VGA_BIOS_INT1F_FONT_OFF: u16 = 0x3800;
+const VGA_BIOS_INT1F_FONT_ADDR: u32 = VGA_BIOS_BASE + VGA_BIOS_INT1F_FONT_OFF as u32;
 
 /// The default LIM EMS 4.0 page-frame base: segment 0xE000, the top 64 KiB of the
 /// upper-memory window. This is the 386MAX and DOSBox default, and on the Izarra
@@ -10267,6 +10271,8 @@ const EBDA_SEGMENT: u16 = 0x9FC0;
 const BIOS_CONFIG_TABLE_ADDR: u32 = 0x9FC10;
 /// AT fixed-disk parameter table for drive 80h, published through IVT[41h].
 const BIOS_FIXED_DISK_PARAMETER_TABLE_ADDR: u32 = 0x9FC20;
+/// Default AT diskette parameter table, published through IVT[1Eh].
+const BIOS_DISKETTE_PARAMETER_TABLE_ADDR: u32 = 0x9FC30;
 
 /// Format a CONFIG.SYS device line for a boot message: the DEVICE= path and its
 /// argument tail, left-padded to a column so the status that follows lines up.
@@ -10313,6 +10319,9 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     memory.write_u16(0x70 * 4 + 2, 0)?;
     install_rtc_isr_stub(memory)?;
     install_dos_low_memory_stubs(memory)?;
+    seed_int1d_video_parameter_table(memory)?;
+    seed_int1e_diskette_parameter_table(memory)?;
+    seed_int1f_graphics_font_table(memory)?;
     seed_int43_font_table(memory)?;
     seed_int44_font_table(memory)?;
     seed_int46_absent_fixed_disk_table(memory)?;
@@ -10477,6 +10486,73 @@ fn seed_bios_config_table(memory: &mut Memory) -> Result<(), BusError> {
         memory.write_u8(base + i, byte)?;
     }
     Ok(())
+}
+
+fn write_ivt_pointer(memory: &mut Memory, vector: u8, linear: u32) -> Result<(), BusError> {
+    let address = usize::from(vector) * 4;
+    memory.write_u16(address, (linear & 0x0f) as u16)?;
+    memory.write_u16(address + 2, (linear >> 4) as u16)
+}
+
+fn seed_int1d_video_parameter_table(memory: &mut Memory) -> Result<(), BusError> {
+    const TEXT_40X25: [u8; 16] = [
+        0x38, 0x28, 0x2d, 0x0a, 0x1f, 0x06, 0x19, 0x1c, 0x02, 0x07, 0x06, 0x07, 0x00, 0x00, 0x00,
+        0x00,
+    ];
+    const TEXT_80X25: [u8; 16] = [
+        0x71, 0x50, 0x5a, 0x0a, 0x1f, 0x06, 0x19, 0x1c, 0x02, 0x07, 0x06, 0x07, 0x00, 0x00, 0x00,
+        0x00,
+    ];
+    const CGA_320X200: [u8; 16] = [
+        0x38, 0x28, 0x2d, 0x0a, 0x7f, 0x06, 0x64, 0x70, 0x02, 0x01, 0x06, 0x07, 0x00, 0x00, 0x00,
+        0x00,
+    ];
+    const CGA_640X200: [u8; 16] = [
+        0x71, 0x50, 0x5a, 0x0a, 0x7f, 0x06, 0x64, 0x70, 0x02, 0x01, 0x06, 0x07, 0x00, 0x00, 0x00,
+        0x00,
+    ];
+    const MDA_TEXT_80X25: [u8; 16] = [
+        0x61, 0x50, 0x52, 0x0f, 0x19, 0x06, 0x19, 0x19, 0x02, 0x0d, 0x0b, 0x0c, 0x00, 0x00, 0x00,
+        0x00,
+    ];
+    const TABLE: [[u8; 16]; 8] = [
+        TEXT_40X25,
+        TEXT_40X25,
+        TEXT_80X25,
+        TEXT_80X25,
+        CGA_320X200,
+        CGA_320X200,
+        CGA_640X200,
+        MDA_TEXT_80X25,
+    ];
+
+    let base = VGA_BIOS_INT1D_VIDEO_TABLE_ADDR as usize;
+    for (mode, regs) in TABLE.iter().enumerate() {
+        for (offset, &byte) in regs.iter().enumerate() {
+            memory.write_u8(base + mode * regs.len() + offset, byte)?;
+        }
+    }
+    write_ivt_pointer(memory, 0x1d, VGA_BIOS_INT1D_VIDEO_TABLE_ADDR)
+}
+
+fn seed_int1e_diskette_parameter_table(memory: &mut Memory) -> Result<(), BusError> {
+    const DPT_1440K: [u8; 11] = [
+        0xdf, 0x02, 0x25, 0x02, 0x12, 0x1b, 0xff, 0x6c, 0xf6, 0x0f, 0x08,
+    ];
+
+    let base = BIOS_DISKETTE_PARAMETER_TABLE_ADDR as usize;
+    for (offset, &byte) in DPT_1440K.iter().enumerate() {
+        memory.write_u8(base + offset, byte)?;
+    }
+    write_ivt_pointer(memory, 0x1e, BIOS_DISKETTE_PARAMETER_TABLE_ADDR)
+}
+
+fn seed_int1f_graphics_font_table(memory: &mut Memory) -> Result<(), BusError> {
+    let upper_half = &izarravm_video::font::VGAFONT_8X8[0x80 * 8..];
+    for (offset, &byte) in upper_half.iter().enumerate() {
+        memory.write_u8(VGA_BIOS_INT1F_FONT_ADDR as usize + offset, byte)?;
+    }
+    write_ivt_pointer(memory, 0x1f, VGA_BIOS_INT1F_FONT_ADDR)
 }
 
 fn seed_int43_font_table(memory: &mut Memory) -> Result<(), BusError> {
@@ -19770,6 +19846,46 @@ mod tests {
         machine.cpu.registers.set_eax(0x1100);
         machine.handle_int10();
         assert_eq!(machine.read_physical_u8(table + 0x41 * 16), 0xFF);
+    }
+
+    #[test]
+    fn bios_table_vectors_1d_1e_1f_point_at_seeded_tables() {
+        let mut machine = int15_machine(16);
+
+        let int1d = {
+            let off = read_u16(&mut machine, 0x1d * 4);
+            let seg = read_u16(&mut machine, 0x1d * 4 + 2);
+            (u32::from(seg) << 4) + u32::from(off)
+        };
+        assert_eq!(int1d, VGA_BIOS_INT1D_VIDEO_TABLE_ADDR);
+        assert_eq!(
+            machine.read_physical_u8(int1d + 2 * 16 + 1),
+            0x50,
+            "INT 1Dh mode 02h table is 80-column text"
+        );
+
+        let int1e = {
+            let off = read_u16(&mut machine, 0x1e * 4);
+            let seg = read_u16(&mut machine, 0x1e * 4 + 2);
+            (u32::from(seg) << 4) + u32::from(off)
+        };
+        assert_eq!(int1e, BIOS_DISKETTE_PARAMETER_TABLE_ADDR);
+        assert_eq!(
+            machine.read_physical_u8(int1e + 4),
+            0x12,
+            "default diskette table describes 18 sectors per track"
+        );
+
+        let int1f = {
+            let off = read_u16(&mut machine, 0x1f * 4);
+            let seg = read_u16(&mut machine, 0x1f * 4 + 2);
+            (u32::from(seg) << 4) + u32::from(off)
+        };
+        assert_eq!(int1f, VGA_BIOS_INT1F_FONT_ADDR);
+        assert_eq!(
+            machine.read_physical_u8(int1f + (0xc4 - 0x80) * 8),
+            izarravm_video::font::VGAFONT_8X8[0xc4 * 8]
+        );
     }
 
     #[test]
