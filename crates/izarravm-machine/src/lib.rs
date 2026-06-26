@@ -10896,6 +10896,8 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     // 27h is the obsolete TSR exit; INT 28h is the DOS idle hook's default IRET;
     // INT 2Ah is the DOS network/critical-section hook; INT 2Bh-2Dh, 32h,
     // 34h-3Fh, 47h, 4Bh-4Fh, 58h, and 5Dh-5Fh are DOS reserved IRET vectors;
+    // 61h-65h, 69h-6Bh, 6Eh, 78h-79h, 7Bh-85h, F0h-F7h, F9h, and FCh-FDh
+    // are unused, BASIC-reserved, or user-reserved IRET vectors.
     // INT 2Eh is the DOS command-interpreter back door. INT 6Ch is the DOS
     // realtime-clock/resume hook's default IRET. INT 18h/19h are the host-serviced
     // boot and diskless vectors (the run loop services them and redirects CS:IP
@@ -10910,7 +10912,9 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
         0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x25, 0x26, 0x27,
         0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38,
         0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 0x40, 0x42, 0x47, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F,
-        0x4A, 0x58, 0x5D, 0x5E, 0x5F, 0x66, 0x67, 0x6C,
+        0x4A, 0x58, 0x5D, 0x5E, 0x5F, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x69, 0x6A, 0x6B,
+        0x6C, 0x6E, 0x78, 0x79, 0x7B, 0x7C, 0x7D, 0x7E, 0x7F, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85,
+        0xF0, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF9, 0xFC, 0xFD,
     ] {
         let address = vector * 4;
         memory.write_u16(address, 0)?;
@@ -18562,16 +18566,18 @@ mod tests {
         // register) and confirm the destination block in guest memory matches the
         // source. The machine fires the burst on that request-register write.
         let mut machine = test_machine();
+        const SRC: u32 = 0x1000;
+        const DST: u32 = 0x1100;
         let src = [0xDE, 0xAD, 0xBE, 0xEFu8];
         for (i, &b) in src.iter().enumerate() {
-            machine.write_physical_u8(0x0100 + i as u32, b);
+            machine.write_physical_u8(SRC + i as u32, b);
         }
         with_bus(&mut machine, |bus| {
-            // Channel 0 source address 0x0100, channel 1 dest address 0x0200.
+            // Channel 0 source address 0x1000, channel 1 dest address 0x1100.
             bus.write_io(0x00, BusWidth::Byte, 0x00).unwrap(); // ch0 addr LSB
-            bus.write_io(0x00, BusWidth::Byte, 0x01).unwrap(); // ch0 addr MSB -> 0x0100
+            bus.write_io(0x00, BusWidth::Byte, 0x10).unwrap(); // ch0 addr MSB -> 0x1000
             bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap(); // ch1 addr LSB
-            bus.write_io(0x02, BusWidth::Byte, 0x02).unwrap(); // ch1 addr MSB -> 0x0200
+            bus.write_io(0x02, BusWidth::Byte, 0x11).unwrap(); // ch1 addr MSB -> 0x1100
             bus.write_io(0x03, BusWidth::Byte, 0x03).unwrap(); // ch1 count LSB
             bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap(); // ch1 count MSB -> 3 (4 bytes)
             bus.write_io(0x87, BusWidth::Byte, 0x00).unwrap(); // ch0 page 0
@@ -18584,7 +18590,7 @@ mod tests {
         });
         for (i, &b) in src.iter().enumerate() {
             assert_eq!(
-                machine.read_physical_u8(0x0200 + i as u32),
+                machine.read_physical_u8(DST + i as u32),
                 b,
                 "dest byte {i} copied from the source block"
             );
@@ -18596,14 +18602,16 @@ mod tests {
         // The same request-register write, but with mem-to-mem disabled (command
         // bit0 clear), must not move any memory: the destination stays zero.
         let mut machine = test_machine();
+        const SRC: u32 = 0x1000;
+        const DST: u32 = 0x1100;
         for i in 0..4 {
-            machine.write_physical_u8(0x0100 + i, 0xAB);
+            machine.write_physical_u8(SRC + i, 0xAB);
         }
         with_bus(&mut machine, |bus| {
             bus.write_io(0x00, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x00, BusWidth::Byte, 0x01).unwrap();
+            bus.write_io(0x00, BusWidth::Byte, 0x10).unwrap();
             bus.write_io(0x02, BusWidth::Byte, 0x00).unwrap();
-            bus.write_io(0x02, BusWidth::Byte, 0x02).unwrap();
+            bus.write_io(0x02, BusWidth::Byte, 0x11).unwrap();
             bus.write_io(0x03, BusWidth::Byte, 0x03).unwrap();
             bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap();
             bus.write_io(0x0A, BusWidth::Byte, 0x00).unwrap(); // unmask ch0
@@ -18611,7 +18619,7 @@ mod tests {
         });
         for i in 0..4 {
             assert_eq!(
-                machine.read_physical_u8(0x0200 + i),
+                machine.read_physical_u8(DST + i),
                 0x00,
                 "no copy when mem-to-mem is disabled"
             );
@@ -27599,7 +27607,9 @@ mod tests {
 
         for vector in [
             0x2bu32, 0x2c, 0x2d, 0x2e, 0x32, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c,
-            0x3d, 0x3e, 0x3f, 0x4a, 0x6c,
+            0x3d, 0x3e, 0x3f, 0x4a, 0x61, 0x62, 0x63, 0x64, 0x65, 0x69, 0x6a, 0x6b, 0x6c, 0x6e,
+            0x78, 0x79, 0x7b, 0x7c, 0x7d, 0x7e, 0x7f, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0xf0,
+            0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf9, 0xfc, 0xfd,
         ] {
             let off = read_u16(&mut m, vector * 4);
             let seg = read_u16(&mut m, vector * 4 + 2);
