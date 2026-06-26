@@ -3755,6 +3755,11 @@ impl Machine {
         self.cpu.registers.set_edx(edx);
     }
 
+    fn set_cl(&mut self, cl: u8) {
+        let ecx = (self.cpu.registers.ecx() & !0xFF) | u32::from(cl);
+        self.cpu.registers.set_ecx(ecx);
+    }
+
     /// Replace AH (bits 8-15 of EAX), leaving AL and the upper half intact. EMS
     /// functions return their status code here.
     fn set_ah(&mut self, ah: u8) {
@@ -4083,6 +4088,93 @@ impl Machine {
                 self.set_int_frame_carry(false);
             }
             _ => {}
+        }
+    }
+
+    fn handle_absent_resident_api(&mut self, vector: u8) {
+        match vector {
+            0x5C => {
+                let ncb = self.cpu.registers.segment(SegmentIndex::Es).base
+                    + (self.cpu.registers.ebx() as u16) as u32;
+                self.write_physical_u8(ncb + 1, 0xFB);
+                self.set_eax_al(0xFB);
+            }
+            0x60 => self.handle_absent_int60(),
+            0x68 => self.handle_absent_int68(),
+            0x6F => self.handle_absent_int6f(),
+            0x7A => self.handle_absent_int7a(),
+            0x86 | 0xE4 => {}
+            _ => {}
+        }
+    }
+
+    fn handle_absent_int60(&mut self) {
+        let ah = ((self.cpu.registers.eax() as u16) >> 8) as u8;
+        match ah {
+            0x01 => {
+                self.set_eax_al(0xFF);
+                self.set_int_frame_carry(false);
+            }
+            0x11..=0x13 => {
+                self.set_eax_al(0x07);
+            }
+            _ => {
+                let edx = (self.cpu.registers.edx() & !0xFF00) | (0x0B << 8);
+                self.cpu.registers.set_edx(edx);
+                self.set_int_frame_carry(true);
+            }
+        }
+    }
+
+    fn handle_absent_int68(&mut self) {
+        let ah = ((self.cpu.registers.eax() as u16) >> 8) as u8;
+        if matches!(ah, 0x01..=0x07 | 0xFB) {
+            let block = self.cpu.registers.segment(SegmentIndex::Ds).base
+                + (self.cpu.registers.edx() as u16) as u32;
+            self.write_guest_block(block + 0x14, &[0xF0, 0x01, 0x00, 0x00]);
+        }
+    }
+
+    fn handle_absent_int6f(&mut self) {
+        let ah = ((self.cpu.registers.eax() as u16) >> 8) as u8;
+        match ah {
+            0x03 => {
+                self.set_bx(0);
+                self.cpu
+                    .registers
+                    .set_segment(SegmentIndex::Es, SegmentRegister::real(0));
+            }
+            0x0B | 0x0C => {
+                self.set_eax_al(0x07);
+            }
+            0x0D => {
+                self.set_cl(0);
+            }
+            _ => {
+                self.set_ax(0x08FF);
+                self.set_int_frame_carry(true);
+            }
+        }
+    }
+
+    fn handle_absent_int7a(&mut self) {
+        let ax = self.cpu.registers.eax() as u16;
+        let bx = self.cpu.registers.ebx() as u16;
+        match (ax, bx) {
+            (0x0001 | 0x07D0, _) => {
+                self.set_ax(0);
+                self.set_bx(0);
+                self.set_cx(0);
+                self.set_dx(0);
+            }
+            (0x0200, 0) => {
+                self.set_bx(0);
+                self.set_cx(0);
+                self.set_dx(0);
+            }
+            (_, 0x0010) => self.set_eax_al(0xF0),
+            (_, 0x000A) => {}
+            _ => self.set_eax_al(0xFF),
         }
     }
 
@@ -10049,6 +10141,13 @@ impl Machine {
                                 self.handle_int2e()?;
                             }
                             0x33 => self.handle_int33(),
+                            0x5C => self.handle_absent_resident_api(0x5C),
+                            0x60 => self.handle_absent_resident_api(0x60),
+                            0x68 => self.handle_absent_resident_api(0x68),
+                            0x6F => self.handle_absent_resident_api(0x6F),
+                            0x7A => self.handle_absent_resident_api(0x7A),
+                            0x86 => self.handle_absent_resident_api(0x86),
+                            0xE4 => self.handle_absent_resident_api(0xE4),
                             0x2F => {
                                 self.handle_int2f();
                             }
@@ -10598,6 +10697,8 @@ impl CpuBus for MachineBus<'_> {
         // EMS API, NOEMS answers a frameless manager (present, 0 pages, no frame).
         // Only HIMEM-only (unloaded) has no manager, so the vector runs the ROM IRET
         // there, the way a box with no EMM386 leaves no working EMS.
+        let absent_resident_api = matches!(vector, 0x5C | 0x60 | 0x68 | 0x6F | 0x7A | 0x86 | 0xE4)
+            && self.vector_points_at_rom_iret(vector)?;
         let intercepted = matches!(
             vector,
             0x10 | 0x11
@@ -10622,11 +10723,21 @@ impl CpuBus for MachineBus<'_> {
                 | 0x40
                 | 0x42
                 | 0x66
-        ) || (vector == 0x67 && self.ems.is_some());
+        ) || (vector == 0x67 && self.ems.is_some())
+            || absent_resident_api;
         if intercepted && !(self.booter_inert && dos_or_iemm) {
             *self.pending_soft_int = Some(vector);
         }
         Ok(())
+    }
+}
+
+impl MachineBus<'_> {
+    fn vector_points_at_rom_iret(&mut self, vector: u8) -> Result<bool, BusError> {
+        let address = usize::from(vector) * 4;
+        let off = self.memory.read_u16(address)?;
+        let seg = self.memory.read_u16(address + 2)?;
+        Ok(off == 0 && seg == BIOS_ROM_IRET_SEG)
     }
 }
 
@@ -11107,6 +11218,8 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
     // are unused, BASIC-reserved, or user-reserved IRET vectors.
     // 45h, 48h-49h, 59h-5Bh, 6Dh, E0h, EFh, F8h, FAh-FBh, and FEh-FFh are
     // optional vendor or machine-specific entry points with no resident provider.
+    // 5Ch, 60h, 68h, 6Fh, 7Ah, 86h, and E4h are optional resident API vectors;
+    // the host returns absent while the IVT still points at the default IRET.
     // INT 2Eh is the DOS command-interpreter back door. INT 6Ch is the DOS
     // realtime-clock/resume hook's default IRET. INT 18h/19h are the host-serviced
     // boot and diskless vectors (the run loop services them and redirects CS:IP
@@ -11121,10 +11234,11 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
         0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x25, 0x26, 0x27,
         0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38,
         0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 0x40, 0x42, 0x47, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F,
-        0x45, 0x48, 0x49, 0x4A, 0x58, 0x59, 0x5A, 0x5B, 0x5D, 0x5E, 0x5F, 0x61, 0x62, 0x63, 0x64,
-        0x65, 0x66, 0x67, 0x69, 0x6A, 0x6B, 0x6C, 0x6D, 0x6E, 0x78, 0x79, 0x7B, 0x7C, 0x7D, 0x7E,
-        0x7F, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0xE0, 0xEF, 0xF0, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5,
-        0xF6, 0xF7, 0xF8, 0xF9, 0xFA, 0xFB, 0xFC, 0xFD, 0xFE, 0xFF,
+        0x45, 0x48, 0x49, 0x4A, 0x58, 0x59, 0x5A, 0x5B, 0x5C, 0x5D, 0x5E, 0x5F, 0x60, 0x61, 0x62,
+        0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6A, 0x6B, 0x6C, 0x6D, 0x6E, 0x6F, 0x78, 0x79,
+        0x7A, 0x7B, 0x7C, 0x7D, 0x7E, 0x7F, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0xE0, 0xE4,
+        0xEF, 0xF0, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8, 0xF9, 0xFA, 0xFB, 0xFC, 0xFD,
+        0xFE, 0xFF,
     ] {
         let address = vector * 4;
         memory.write_u16(address, 0)?;
@@ -17283,6 +17397,83 @@ mod tests {
             m.pending_soft_int, None,
             "an un-intercepted vector is ignored"
         );
+    }
+
+    #[test]
+    fn absent_resident_api_vectors_intercept_only_default_iret() {
+        let mut m = int15_machine(16);
+
+        for vector in [0x5C, 0x60, 0x68, 0x6F, 0x7A, 0x86, 0xE4] {
+            m.make_bus().interrupt_acknowledge(vector, 0).unwrap();
+            assert_eq!(m.pending_soft_int, Some(vector), "INT {vector:02X}h");
+            m.pending_soft_int = None;
+        }
+
+        m.memory.write_u16(0x60 * 4, 0x1234).unwrap();
+        m.memory.write_u16(0x60 * 4 + 2, 0x5678).unwrap();
+        m.make_bus().interrupt_acknowledge(0x60, 0).unwrap();
+
+        assert_eq!(
+            m.pending_soft_int, None,
+            "guest-owned INT 60h is not stolen"
+        );
+    }
+
+    #[test]
+    fn absent_resident_api_vectors_report_not_installed() {
+        let mut m = int15_machine(16);
+
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x3000));
+        m.cpu.registers.set_ebx(0x0020);
+        m.write_physical_u8(0x30020 + 1, 0);
+        m.handle_absent_resident_api(0x5C);
+        assert_eq!(m.cpu.registers.eax() as u8, 0xFB);
+        assert_eq!(m.read_physical_u8(0x30020 + 1), 0xFB);
+
+        prime_dos_int_frame(&mut m);
+        m.cpu.registers.set_eax(0xCAFE_01FF);
+        m.handle_absent_resident_api(0x60);
+        assert_eq!(m.cpu.registers.eax(), 0xCAFE_01FF);
+        assert_eq!(dos_int_flags(&m) & 1, 0, "driver-info clears CF");
+
+        prime_dos_int_frame(&mut m);
+        m.cpu.registers.set_eax(0xCAFE_0400);
+        m.cpu.registers.set_edx(0x1111_2222);
+        m.handle_absent_resident_api(0x60);
+        assert_eq!((m.cpu.registers.edx() >> 8) as u8, 0x0B);
+        assert_ne!(dos_int_flags(&m) & 1, 0, "packet send sets CF");
+
+        m.cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0x4000));
+        m.cpu.registers.set_edx(0x0100);
+        m.cpu.registers.set_eax(0x0500);
+        m.write_guest_block(0x40100, &[0; 0x18]);
+        m.handle_absent_resident_api(0x68);
+        assert_eq!(&m.read_guest_block(0x40114, 4), &[0xF0, 0x01, 0x00, 0x00]);
+
+        prime_dos_int_frame(&mut m);
+        m.cpu.registers.set_eax(0x0200);
+        m.handle_absent_resident_api(0x6F);
+        assert_eq!(m.cpu.registers.eax() as u16, 0x08FF);
+        assert_ne!(dos_int_flags(&m) & 1, 0, "10NET node status sets CF");
+
+        m.cpu.registers.set_eax(0x0001);
+        m.cpu.registers.set_ebx(0x1111_2222);
+        m.cpu.registers.set_ecx(0x3333_4444);
+        m.cpu.registers.set_edx(0x5555_6666);
+        m.handle_absent_resident_api(0x7A);
+        assert_eq!(m.cpu.registers.eax() as u16, 0);
+        assert_eq!(m.cpu.registers.ebx() as u16, 0);
+        assert_eq!(m.cpu.registers.ecx() as u16, 0);
+        assert_eq!(m.cpu.registers.edx() as u16, 0);
+
+        m.cpu.registers.set_eax(0);
+        m.cpu.registers.set_ebx(0x0010);
+        m.handle_absent_resident_api(0x7A);
+        assert_eq!(m.cpu.registers.eax() as u8, 0xF0);
     }
 
     #[test]
@@ -28019,10 +28210,11 @@ mod tests {
 
         for vector in [
             0x2bu32, 0x2c, 0x2d, 0x2e, 0x32, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c,
-            0x3d, 0x3e, 0x3f, 0x45, 0x48, 0x49, 0x4a, 0x59, 0x5a, 0x5b, 0x61, 0x62, 0x63, 0x64,
-            0x65, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x78, 0x79, 0x7b, 0x7c, 0x7d, 0x7e, 0x7f,
-            0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0xe0, 0xef, 0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5,
-            0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff,
+            0x3d, 0x3e, 0x3f, 0x45, 0x48, 0x49, 0x4a, 0x59, 0x5a, 0x5b, 0x5c, 0x60, 0x61, 0x62,
+            0x63, 0x64, 0x65, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f, 0x78, 0x79, 0x7a,
+            0x7b, 0x7c, 0x7d, 0x7e, 0x7f, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0xe0, 0xe4,
+            0xef, 0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc,
+            0xfd, 0xfe, 0xff,
         ] {
             let off = read_u16(&mut m, vector * 4);
             let seg = read_u16(&mut m, vector * 4 + 2);
