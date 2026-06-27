@@ -881,7 +881,7 @@ pub struct Machine {
     // boot turns it off (the HLE is the OS), re-evaluated on every boot so a warm
     // reboot flips it. It starts off and stays off until the first boot.
     booter_inert: bool,
-    // Last absolute pointer the GUI reported, in the INT 33h virtual space
+    // Last absolute pointer the GUI reported, in the guest virtual-screen space
     // (0..639 x 0..199). set_mouse_absolute diffs against this to synthesize the
     // relative deltas the aux device and the guest driver expect. Mutated only on
     // the emulation thread, so it needs no synchronization.
@@ -4223,7 +4223,7 @@ impl Machine {
         match al {
             // C200 enable/disable (BH=0 disable, 1 enable). Enable or disable
             // hardware aux data reporting so IRQ12 packets stream to the guest
-            // INT 74h ISR. The cursor itself is the driver's INT 33h state.
+            // INT 74h ISR.
             0x00 => {
                 self.keyboard.set_mouse_reporting(bh != 0);
                 self.set_eax_ah(0x00);
@@ -11522,7 +11522,7 @@ impl CpuBus for MachineBus<'_> {
         //
         // In booter-inert mode the DOS kernel, absolute-disk, multiplex, and XMS
         // vectors stand down so a self-booting disk owns them through the IVT; the
-        // BIOS hardware services (0x10-0x1A) and the mouse stay intercepted.
+        // BIOS hardware services (0x10-0x1A) stay intercepted.
         let dos_or_iemm = matches!(
             vector,
             0x20 | 0x21 | 0x25 | 0x26 | 0x27 | 0x29 | 0x2A | 0x2E | 0x2F | 0x66 | 0x67
