@@ -79,11 +79,22 @@ fn render_words(machine: &mut Machine) -> (Vec<u32>, usize, usize) {
         ActiveDisplay::VgaRaster => {
             let palette = machine.palette_argb();
             match machine.vga_raster() {
-                Some(raster) => (
-                    palette_words(&raster.pixels, &palette),
-                    raster.width as usize,
-                    raster.height as usize,
-                ),
+                Some(raster) => {
+                    // Present only the active visible region. `height` is the full
+                    // beam frame (vtotal) including the vertical retrace/border the
+                    // monitor never shows; cropping to the top `display_height`
+                    // (vdisp_end) rows is what makes the aspect-fill correct — it
+                    // drops the black bottom bar a 320x200 mode would otherwise bake
+                    // into the stretched image.
+                    let w = raster.width as usize;
+                    let h = if raster.display_height == 0 {
+                        raster.height as usize
+                    } else {
+                        raster.display_height as usize
+                    };
+                    let visible = &raster.pixels[..(w * h).min(raster.pixels.len())];
+                    (palette_words(visible, &palette), w, h)
+                }
                 None => (vec![0x0000_0000], 1, 1),
             }
         }
