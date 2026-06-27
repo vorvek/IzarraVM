@@ -16,11 +16,16 @@ most of the machine through headless boot tests.
 
 ## Origin
 
-Izarra Computer Systems started in 1992 as a small Spanish workstation shop that
+Izarra Computer Systems started in 1987 as a small Spanish workstation shop that
 built graphics terminals for schools and local studios. Its engineers wanted a
-home computer that could run DOS games without feeling like a beige PC, so they
-designed a tight motherboard around VGA, MIDI, CD-ROM audio, and a friendly ROM
-shell.
+home computer that could run DOS games without feeling like a beige PC, and they
+spent the next decade chasing that idea across three machines.
+
+The Izarra 1000 arrived in 1990 around a 286 at 12 MHz, followed in 1993 by the
+386-based Izarra 2000 at 25 MHz. Both sold modestly to the schools and studios
+that already knew the brand. Work on the 3000 began in late 1994 as the most
+ambitious of the three: a tight motherboard around VGA, MIDI, CD-ROM audio, and
+a friendly ROM shell, fast enough to make DOS games feel at home.
 
 The prototype was fast, but the timing was brutal. Windows 95 made compatibility
 the only spec retailers cared about, so Izarra kept adding bridge chips and
