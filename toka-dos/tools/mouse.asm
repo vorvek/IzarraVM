@@ -34,6 +34,8 @@ mickey_x        dw 0
 mickey_y        dw 0
 ratio_x         dw 8
 ratio_y         dw 16
+accum_x         dw 0                 ; sub-pixel remainder carried by the ratio scale
+accum_y         dw 0
 cb_mask         dw 0
 ; The callback far pointer is laid out offset-then-segment so `call far [cb_off]`
 ; reads a valid 32-bit far pointer straight from this pair (Intel memory order:
@@ -127,6 +129,8 @@ m_reset:
     mov word [cs:release_y + 4], 0
     mov word [cs:mickey_x], 0
     mov word [cs:mickey_y], 0
+    mov word [cs:accum_x], 0
+    mov word [cs:accum_y], 0
     mov word [cs:saved_off], 0xFFFF
     mov byte [cs:in_callback], 0
     mov byte [cs:cond_active], 0       ; no conditional-off region after reset
@@ -357,11 +361,24 @@ m_lightpen_on:
 m_lightpen_off:
     iret
 
-; 0x0F set the mickey-to-pixel ratio. Returns nothing; preserve ALL (no register
-; is written).
+; 0x0F set the mickey-to-pixel ratio (mickeys per 8 pixels per axis). A zero would
+; divide-by-zero in the packet handler's scale, so clamp each axis to at least 1.
+; Returns nothing; preserves ALL (ax is saved and restored).
 m_set_ratio:
-    mov [cs:ratio_x], cx
-    mov [cs:ratio_y], dx
+    push ax
+    mov ax, cx
+    or ax, ax
+    jnz .rx
+    inc ax                            ; 0 is invalid; keep it non-zero
+.rx:
+    mov [cs:ratio_x], ax
+    mov ax, dx
+    or ax, ax
+    jnz .ry
+    inc ax
+.ry:
+    mov [cs:ratio_y], ax
+    pop ax
     iret
 
 ; 0x10 conditional-off region. order(CX,SI) -> cond_left,cond_right and
@@ -804,7 +821,30 @@ packet_handler:
     add [mickey_x], si
     add [mickey_y], di
 
-    ; position += delta, clamped to [min,max]
+    ; Scale the raw mickey delta to a pixel delta through the mickey-to-pixel ratio
+    ; (pixels = mickeys * 8 / ratio), carrying the sub-pixel remainder per axis so
+    ; slow motion is not truncated away. The default ratio is 8 horizontal (1:1) and
+    ; 16 vertical (half speed). ratio_x/y are clamped non-zero by 0x0F so the idiv is
+    ; safe, and the dividend stays well inside 16 bits for any sane ratio. dh holds
+    ; the old button mask the edge code needs, so preserve dx across the divides.
+    push dx
+    mov ax, si
+    sal ax, 3                         ; mickeys * 8 (signed, -2048..2040)
+    add ax, [accum_x]                 ; carry the prior remainder
+    cwd
+    idiv word [ratio_x]               ; ax = pixel delta, dx = remainder
+    mov [accum_x], dx
+    mov si, ax                        ; si = scaled dx in pixels
+    mov ax, di
+    sal ax, 3
+    add ax, [accum_y]
+    cwd
+    idiv word [ratio_y]
+    mov [accum_y], dx
+    mov di, ax                        ; di = scaled dy in pixels
+    pop dx
+
+    ; position += scaled delta, clamped to [min,max]
     mov ax, [cur_x]
     add ax, si
     cmp ax, [min_x]

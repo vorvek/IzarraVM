@@ -11,8 +11,9 @@
 ;   B  static INT 33h checks with no host motion: setpos/getpos round-trip,
 ;      range clamp, AX=0x24 version, reset re-centres.
 ;   C  host-injected motion: open the full range, poll getpos until the
-;      position moves, then confirm it moved right+down and the left button is
-;      set. The host injects the motion between two run chunks.
+;      position moves, then confirm it moved right+down, the left button is set,
+;      and the mickey-to-pixel ratio was applied (equal mickeys move less in y
+;      than in x). The host injects the motion between run chunks.
 ;
 ; Assemble: nasm -f bin mtest.asm -o MTEST.COM
     cpu 386
@@ -139,10 +140,13 @@ start:
     jmp fail_c_nomotion                 ; cap hit with no motion seen
 
 .moved:
-    ; The host injected inject_mouse(40, 20, 0x01): right + down with the left
-    ; button held. Confirm the position moved right and down from the baseline
-    ; and the left button is set. Exact deltas depend on clamping, so check the
-    ; direction, not the magnitude.
+    ; The host injects inject_mouse(8, 8, 0x01) per chunk: equal mickeys in x and y
+    ; with the left button held. Confirm the cursor moved right and down, the left
+    ; button is set, and the mickey-to-pixel ratio was applied. With the default
+    ; ratios (8 horizontal, 16 vertical) equal mickeys move the cursor farther in x
+    ; than in y, so the y delta is strictly less than the x delta; without ratio
+    ; scaling the two deltas would be equal. Compare deltas, not absolute magnitude,
+    ; since the injection count is not fixed.
     mov ax, [last_x]
     cmp ax, [base_x]
     jle fail_c_dir                      ; must have moved right (x increased)
@@ -151,6 +155,12 @@ start:
     jle fail_c_dir                      ; must have moved down (y increased)
     test word [last_btn], 0x0001
     jz fail_c_btn                       ; left button must be set
+    mov ax, [last_x]
+    sub ax, [base_x]                    ; ax = x delta (pixels)
+    mov bx, [last_y]
+    sub bx, [base_y]                    ; bx = y delta (pixels)
+    cmp bx, ax
+    jge fail_c_ratio                    ; vertical ratio: y must move less than x
 
     ; Every stage passed.
     xor al, al                          ; code 0
@@ -179,6 +189,9 @@ fail_c_dir:
     jmp ut_exit
 fail_c_btn:
     mov al, 8
+    jmp ut_exit
+fail_c_ratio:
+    mov al, 9
     jmp ut_exit
 
 ; Stop the machine through the Lotura unit-tester with the code in AL.

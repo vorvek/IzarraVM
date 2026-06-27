@@ -81,10 +81,12 @@ fn mouse_driver_passes_the_guest_self_test_end_to_end() {
                 final_reason = Some(StopReason::TestExit { code });
                 break;
             }
-            // Right + down, left button held. The packet handler adds this to
-            // cur_x/cur_y (clamped to the full range MTEST re-opened) and sets the
-            // button bit, which MTEST's poll observes once it is live.
-            StopReason::CycleLimit { .. } => machine.inject_mouse(40, 20, 0x01),
+            // Equal mickeys right + down, left button held. The packet handler
+            // scales this through the mickey-to-pixel ratio (8 horizontal, 16
+            // vertical) and adds the pixel delta to cur_x/cur_y, so MTEST sees the
+            // cursor move twice as far in x as in y. Small per-chunk steps keep the
+            // cursor off the range edges no matter how many chunks land.
+            StopReason::CycleLimit { .. } => machine.inject_mouse(8, 8, 0x01),
             other => {
                 final_reason = Some(other);
                 break;
@@ -97,7 +99,7 @@ fn mouse_driver_passes_the_guest_self_test_end_to_end() {
         Some(StopReason::TestExit { code }) => panic!(
             "MTEST reported failure code {code} (1=reset status, 2=setpos/getpos, \
              3=range clamp, 4=version 0x24, 5=reset re-centre, 6=no motion seen, \
-             7=motion direction, 8=left button)"
+             7=motion direction, 8=left button, 9=ratio not applied)"
         ),
         Some(other) => panic!(
             "expected MTEST to Exit with code 0, got {other:?}; the self-test never \
