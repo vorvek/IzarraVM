@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/izarra3000-logo.png" alt="Izarra 3000 logo" width="200">
+</p>
+
 # IzarraVM
 
 IzarraVM is a Rust emulator for the Izarra 3000, a DOS-era games computer that
