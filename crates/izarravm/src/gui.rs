@@ -1388,54 +1388,75 @@ impl GuiApp {
         ui.add_space(8.0);
         self.power_row(ui);
         ui.separator();
-        let mode = mode.unwrap_or(self.profile.cpu);
-        ui.label(format!(
-            "CPU: GSW-586 ({} mode, {} MHz)",
-            mode.canonical_name(),
-            mode.clock_hz() / 1_000_000
-        ));
-        ui.label(format!("Emulation speed: {:.0}%", speed * 100.0));
-        ui.label(format!("Memory: {} MB", self.profile.memory_mib));
-        ui.label(format!(
-            "Host: {:.0} fps, {:.0} input/s",
-            self.host_fps, self.input_rate
-        ));
+        self.drives_ui(ui, running);
 
         ui.separator();
-        ui.heading("Audio");
+        let mode = mode.unwrap_or(self.profile.cpu);
+        let line = |ui: &mut egui::Ui, text: String| {
+            ui.label(egui::RichText::new(text).color(MUTED).size(12.0));
+        };
+        line(
+            ui,
+            format!(
+                "GSW-586 - {} mode - {} MHz",
+                mode.canonical_name(),
+                mode.clock_hz() / 1_000_000
+            ),
+        );
+        line(
+            ui,
+            format!(
+                "Speed {:.0}% - {} MB",
+                speed * 100.0,
+                self.profile.memory_mib
+            ),
+        );
+        line(
+            ui,
+            format!(
+                "Host {:.0} fps - {:.0} input/s",
+                self.host_fps, self.input_rate
+            ),
+        );
+
+        ui.add_space(6.0);
         ui.horizontal(|ui| {
-            ui.label("Volume");
-            // Show 0..100% but drive a 0..1 value. On a change, recompute the
-            // host-side gain and persist the new volume to izarravm.conf.
-            let slider = ui.add(
-                egui::Slider::new(&mut self.volume, 0.0..=1.0)
-                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
-                    .custom_parser(|s| {
-                        s.trim_end_matches('%')
-                            .trim()
-                            .parse::<f64>()
-                            .ok()
-                            .map(|p| (p / 100.0).clamp(0.0, 1.0))
-                    }),
-            );
+            ui.label(egui::RichText::new("VOL").color(LABEL).size(11.0));
+            let slider = ui.add(egui::Slider::new(&mut self.volume, 0.0..=1.0).show_value(false));
             if slider.changed() {
                 self.gain.set(volume_gain(self.volume));
                 self.prefs.master_volume = self.volume;
                 self.save_prefs();
             }
+            let com1_label = if self.show_com1 { "Hide COM1" } else { "COM1" };
+            if ui.button(com1_label).clicked() {
+                self.show_com1 = !self.show_com1;
+            }
         });
 
-        ui.separator();
-        ui.heading("Drives");
-        self.drives_ui(ui, running);
-
-        // The serial console lives in its own floating window now; a button at the
-        // bottom of the sidebar toggles it.
-        ui.separator();
-        let com1_label = if self.show_com1 { "Hide COM1" } else { "COM1" };
-        if ui.button(com1_label).clicked() {
-            self.show_com1 = !self.show_com1;
+        // Corner screws and a bottom vent grille, painted over the panel face.
+        let area = ui.min_rect();
+        let painter = ui.painter().clone();
+        for corner in [
+            area.left_top() + egui::vec2(2.0, 2.0),
+            area.right_top() + egui::vec2(-2.0, 2.0),
+            area.left_bottom() + egui::vec2(2.0, -2.0),
+            area.right_bottom() + egui::vec2(-2.0, -2.0),
+        ] {
+            screw(&painter, corner);
         }
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            let n = 5;
+            let gap = 4.0;
+            let w = (ui.available_width() - gap * (n as f32 - 1.0)) / n as f32;
+            for _ in 0..n {
+                let (slot, _) =
+                    ui.allocate_exact_size(egui::vec2(w.max(4.0), 3.0), egui::Sense::hover());
+                ui.painter().rect_filled(slot, 2.0, RECESS);
+                ui.add_space(gap - 4.0);
+            }
+        });
     }
 
     /// Open the configuration modal, seeding its staged settings from the live
