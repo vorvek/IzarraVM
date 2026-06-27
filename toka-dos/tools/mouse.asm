@@ -383,8 +383,285 @@ m_cond_off:
     pop ax
     iret
 
+; ---- extended INT 33h dispatcher (AX 0x12..0x24 and aliases) ----
+; Each arm preserves every register outside its documented return set.
+; State is always accessed CS-relative (the TSR runs on the caller's DS).
 x33_high:
-    ; 0x11+ (everything above 0x10) is implemented in Task 3.4.
+    cmp ax, 0x0012
+    je m_large_gfx_cursor
+    cmp ax, 0x0013
+    je m_set_dbl_speed
+    cmp ax, 0x0014
+    je m_exchange_handler
+    cmp ax, 0x0015
+    je m_get_buf_size
+    cmp ax, 0x0016
+    je m_save_state
+    cmp ax, 0x0017
+    je m_restore_state
+    cmp ax, 0x001A
+    je m_set_sensitivity
+    cmp ax, 0x001B
+    je m_get_sensitivity
+    cmp ax, 0x001D
+    je m_set_disp_page
+    cmp ax, 0x001E
+    je m_get_disp_page
+    cmp ax, 0x0021
+    je m_soft_reset
+    cmp ax, 0x0022
+    je m_set_language
+    cmp ax, 0x0023
+    je m_get_language
+    cmp ax, 0x0024
+    je m_get_version
+    cmp ax, 0x0042
+    je m_get_buf_size_42
+    cmp ax, 0x0050
+    je m_save_state
+    cmp ax, 0x0052
+    je m_restore_state
+    ; catch-all: leave all registers unchanged
+    iret
+
+; 0x12 define large graphics cursor: return AX=0xFFFF. Preserves BX,CX,DX,SI,DI.
+m_large_gfx_cursor:
+    mov ax, 0xFFFF
+    iret
+
+; 0x13 set double-speed threshold: dbl_speed=CX; if CX==0 set dbl_speed=64.
+; Returns nothing; preserve ALL (AX,BX,DX,SI,DI - none written).
+m_set_dbl_speed:
+    push ax
+    mov ax, cx
+    cmp ax, 0
+    jne .store
+    mov ax, 64
+.store:
+    mov [cs:dbl_speed], ax
+    pop ax
+    iret
+
+; 0x14 exchange user event handler.
+; Returns CX=old cb_mask, ES=old cb_seg, DX=old cb_off.
+; Installs new handler: cb_mask=(incoming CX), cb_seg=(incoming ES), cb_off=(incoming DX).
+; Preserves AX,BX,SI,DI.
+; Strategy: read ALL old values into scratch registers first, write new values, then
+; set the return registers. Scratch registers used: AX (old mask), SI (old off),
+; DI (old seg). Push/pop AX,BX,SI,DI to satisfy the preserve contract.
+m_exchange_handler:
+    push ax
+    push bx
+    push si
+    push di
+    ; Stage old values before any field write.
+    mov ax, [cs:cb_mask]        ; ax = old mask
+    mov si, [cs:cb_off]         ; si = old off
+    mov di, [cs:cb_seg]         ; di = old seg
+    ; Write the new values (caller's CX, DX, ES are still intact at this point).
+    mov [cs:cb_mask], cx
+    mov [cs:cb_off], dx
+    mov [cs:cb_seg], es
+    ; Build return registers from the staged old values.
+    mov cx, ax                  ; CX = old mask
+    mov dx, si                  ; DX = old off
+    ; ES = old seg: push DI (old seg) and pop into ES.
+    push di
+    pop es
+    pop di
+    pop si
+    pop bx
+    pop ax
+    iret
+
+; 0x15 get state buffer size: BX=44. Preserves AX,CX,DX,SI,DI.
+m_get_buf_size:
+    mov bx, 44
+    iret
+
+; 0x42 alias of 0x15 but also returns AX=0xFFFF. Preserves CX,DX,SI,DI.
+m_get_buf_size_42:
+    mov ax, 0xFFFF
+    mov bx, 44
+    iret
+
+; 0x16 save driver state to ES:DX (alias 0x50 routes here too).
+; Copies the 44-byte state blob. Returns nothing; preserve ALL.
+; Save/restore blob layout (22 words, 44 bytes):
+;   word  0: magic 0x334D
+;   word  1: cur_x        word  2: cur_y       word  3: show_count
+;   word  4: buttons (as word, low byte)        word  5: min_x
+;   word  6: max_x        word  7: min_y        word  8: max_y
+;   word  9: ratio_x      word 10: ratio_y      word 11: cond_left
+;   word 12: cond_top     word 13: cond_right   word 14: cond_bottom
+;   word 15: disp_page    word 16: sens_x       word 17: sens_y
+;   word 18: sens_thr     word 19: cb_mask      word 20: cb_seg
+;   word 21: cb_off
+m_save_state:
+    push ax
+    push bx
+    ; ES:DX is the caller-supplied buffer; use BX as the ES-relative index.
+    mov bx, dx
+    mov ax, 0x334D
+    mov [es:bx +  0], ax        ; magic
+    mov ax, [cs:cur_x]
+    mov [es:bx +  2], ax
+    mov ax, [cs:cur_y]
+    mov [es:bx +  4], ax
+    mov ax, [cs:show_count]
+    mov [es:bx +  6], ax
+    xor ax, ax
+    mov al, [cs:buttons]
+    mov [es:bx +  8], ax        ; buttons as word
+    mov ax, [cs:min_x]
+    mov [es:bx + 10], ax
+    mov ax, [cs:max_x]
+    mov [es:bx + 12], ax
+    mov ax, [cs:min_y]
+    mov [es:bx + 14], ax
+    mov ax, [cs:max_y]
+    mov [es:bx + 16], ax
+    mov ax, [cs:ratio_x]
+    mov [es:bx + 18], ax
+    mov ax, [cs:ratio_y]
+    mov [es:bx + 20], ax
+    mov ax, [cs:cond_left]
+    mov [es:bx + 22], ax
+    mov ax, [cs:cond_top]
+    mov [es:bx + 24], ax
+    mov ax, [cs:cond_right]
+    mov [es:bx + 26], ax
+    mov ax, [cs:cond_bottom]
+    mov [es:bx + 28], ax
+    mov ax, [cs:disp_page]
+    mov [es:bx + 30], ax
+    mov ax, [cs:sens_x]
+    mov [es:bx + 32], ax
+    mov ax, [cs:sens_y]
+    mov [es:bx + 34], ax
+    mov ax, [cs:sens_thr]
+    mov [es:bx + 36], ax
+    mov ax, [cs:cb_mask]
+    mov [es:bx + 38], ax
+    mov ax, [cs:cb_seg]
+    mov [es:bx + 40], ax
+    mov ax, [cs:cb_off]
+    mov [es:bx + 42], ax
+    pop bx
+    pop ax
+    iret
+
+; 0x17 restore driver state from ES:DX (alias 0x52 routes here too).
+; Returns nothing; preserve ALL.
+m_restore_state:
+    push ax
+    push bx
+    mov bx, dx
+    ; word 0 is magic - consume/skip it (read but discard).
+    ; word 1 onward maps to fields in the same order as save.
+    mov ax, [es:bx +  2]
+    mov [cs:cur_x], ax
+    mov ax, [es:bx +  4]
+    mov [cs:cur_y], ax
+    mov ax, [es:bx +  6]
+    mov [cs:show_count], ax
+    mov ax, [es:bx +  8]
+    mov [cs:buttons], al        ; low byte only
+    mov ax, [es:bx + 10]
+    mov [cs:min_x], ax
+    mov ax, [es:bx + 12]
+    mov [cs:max_x], ax
+    mov ax, [es:bx + 14]
+    mov [cs:min_y], ax
+    mov ax, [es:bx + 16]
+    mov [cs:max_y], ax
+    mov ax, [es:bx + 18]
+    mov [cs:ratio_x], ax
+    mov ax, [es:bx + 20]
+    mov [cs:ratio_y], ax
+    mov ax, [es:bx + 22]
+    mov [cs:cond_left], ax
+    mov ax, [es:bx + 24]
+    mov [cs:cond_top], ax
+    mov ax, [es:bx + 26]
+    mov [cs:cond_right], ax
+    mov ax, [es:bx + 28]
+    mov [cs:cond_bottom], ax
+    mov ax, [es:bx + 30]
+    mov [cs:disp_page], ax
+    mov ax, [es:bx + 32]
+    mov [cs:sens_x], ax
+    mov ax, [es:bx + 34]
+    mov [cs:sens_y], ax
+    mov ax, [es:bx + 36]
+    mov [cs:sens_thr], ax
+    mov ax, [es:bx + 38]
+    mov [cs:cb_mask], ax
+    mov ax, [es:bx + 40]
+    mov [cs:cb_seg], ax
+    mov ax, [es:bx + 42]
+    mov [cs:cb_off], ax
+    pop bx
+    pop ax
+    iret
+
+; 0x1A set mouse sensitivity: sens_x=BX, sens_y=CX, sens_thr=DX.
+; If DX==0 set sens_thr=64. Returns nothing; preserve ALL (AX is scratch).
+m_set_sensitivity:
+    push ax
+    mov [cs:sens_x], bx
+    mov [cs:sens_y], cx
+    mov ax, dx
+    cmp ax, 0
+    jne .thr_ok
+    mov ax, 64
+.thr_ok:
+    mov [cs:sens_thr], ax
+    pop ax
+    iret
+
+; 0x1B get mouse sensitivity: BX=sens_x, CX=sens_y, DX=sens_thr.
+; Preserves AX,SI,DI (none written).
+m_get_sensitivity:
+    mov bx, [cs:sens_x]
+    mov cx, [cs:sens_y]
+    mov dx, [cs:sens_thr]
+    iret
+
+; 0x1D set display page: disp_page=BX. Returns nothing; preserve ALL.
+m_set_disp_page:
+    mov [cs:disp_page], bx
+    iret
+
+; 0x1E get display page: BX=disp_page. Preserves AX,CX,DX,SI,DI.
+m_get_disp_page:
+    mov bx, [cs:disp_page]
+    iret
+
+; 0x21 software reset/detect: AX=0xFFFF, BX=2. No state clear. Preserves CX,DX,SI,DI.
+m_soft_reset:
+    mov ax, 0xFFFF
+    mov bx, 2
+    iret
+
+; 0x22 set language: no-op. Returns nothing; preserve ALL.
+m_set_language:
+    iret
+
+; 0x23 get language number: BX=0 (English). Preserves AX,CX,DX,SI,DI.
+m_get_language:
+    mov bx, 0
+    iret
+
+; 0x24 get driver version/type/IRQ.
+; Only when BX==0 on entry: return BX=0x0820, CX=0x0400. Preserves AX,DX,SI,DI.
+; If BX != 0, leave all registers unchanged.
+m_get_version:
+    cmp bx, 0
+    jne .skip
+    mov bx, 0x0820
+    mov cx, 0x0400
+.skip:
     iret
 
 ; ---- PS/2 packet handler (far-called by the BIOS INT 74h ISR) ----
