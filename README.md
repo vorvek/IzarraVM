@@ -58,6 +58,11 @@ cargo run -p izarravm -- --config examples/izarravm.toml
 For non-Windows hosts later, replace the `c_drive` path in
 `examples/izarravm.toml` or pass `--c-drive /path/to/dosroot`.
 
+By default the C: drive, `cmos.bin`, and `izarravm.conf` live under the per-user
+`~/.izarravm` directory, so launching the binary from any folder leaves nothing
+behind in the working directory. Pass `--portable` to keep them in a `c_drive`
+beside the executable instead, for a self-contained install.
+
 ## Validation
 
 ```powershell
