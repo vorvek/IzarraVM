@@ -52,6 +52,11 @@ Get-ChildItem "$root\tools\*.c" -ErrorAction SilentlyContinue | ForEach-Object {
     LinkCom $name @("$name.obj", 'toka.obj')
 }
 
+# The mouse driver is hand-written NASM, not a C tool, so build it explicitly into
+# $build where the packer collects it as a system .COM.
+& nasm -f bin "$root\tools\mouse.asm" -o "$build\MOUSE.COM"
+if ($LASTEXITCODE -ne 0) { throw "nasm failed on mouse" }
+
 # Dev tools: built with the same recipe but emitted to the C: drive fixture dir,
 # not packed into tokados.rom. TESTS.COM is a tracked debug tool, not a system
 # file. Compile and link inside build/ (where wlink writes <name>.com), then move
