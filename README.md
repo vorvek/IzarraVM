@@ -1,8 +1,4 @@
-<p align="center">
-  <img src="docs/izarra3000-logo.png" alt="Izarra 3000 logo" width="200">
-</p>
-
-# IzarraVM
+# <img src="docs/star.svg" alt="" height="30"> IzarraVM
 
 IzarraVM is a Rust emulator for the Izarra 3000, a DOS-era games computer that
 almost shipped in 1997. It models one fixed machine: custom video and audio
