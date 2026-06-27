@@ -1844,7 +1844,9 @@ impl GuiApp {
             .exact_width(320.0)
             .resizable(false)
             .show(ctx, |ui| self.controls_ui(ui));
-        egui::CentralPanel::default().show(ctx, |ui| self.monitor_ui(ui));
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(egui::Color32::BLACK))
+            .show(ctx, |ui| self.monitor_ui(ui));
         // The COM1 console floats over the central panel when toggled open.
         if self.show_com1 {
             self.com1_window(ctx);
@@ -1861,6 +1863,20 @@ fn enlarge_ui_fonts(ctx: &egui::Context) {
         for font_id in style.text_styles.values_mut() {
             font_id.size += 2.0;
         }
+    });
+}
+
+/// Set the dark base theme with a pure-black canvas, so the area around the
+/// monitor and the 4:3 letterbox are black rather than the default grey-blue.
+/// The beige panel and modal override their own fills, so this does not leak
+/// into them. Applied once at startup.
+fn apply_black_theme(ctx: &egui::Context) {
+    ctx.style_mut(|style| {
+        let mut v = egui::Visuals::dark();
+        v.panel_fill = egui::Color32::BLACK;
+        v.extreme_bg_color = egui::Color32::BLACK;
+        v.window_fill = egui::Color32::from_rgb(0x1A, 0x1A, 0x1A);
+        style.visuals = v;
     });
 }
 
@@ -2305,6 +2321,7 @@ pub fn run(
     );
     let egui_ctx = egui::Context::default();
     enlarge_ui_fonts(&egui_ctx);
+    apply_black_theme(&egui_ctx);
     let mut app = WinitApp {
         gui,
         host_kbd: HostKeyboard::default(),
