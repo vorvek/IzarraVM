@@ -54,6 +54,7 @@ text_cursor_mask dw 0x7700
 saved_cell      dw 0
 saved_off       dw 0xFFFF
 in_callback     db 0                 ; re-entrancy guard for the user callback
+cond_active     db 0                 ; 1 = a conditional-off region is in effect
 
 ; ---- INT 33h dispatcher ----
 ; A flat compare ladder over the core function set 0x00..0x10. AX > 0x10 falls
@@ -128,6 +129,7 @@ m_reset:
     mov word [cs:mickey_y], 0
     mov word [cs:saved_off], 0xFFFF
     mov byte [cs:in_callback], 0
+    mov byte [cs:cond_active], 0       ; no conditional-off region after reset
     mov word [cs:cb_mask], 0
     mov word [cs:cb_seg], 0
     mov word [cs:cb_off], 0
@@ -146,6 +148,7 @@ m_show:
     xor ax, ax                        ; clamp at 0 (visible)
 .store:
     mov [cs:show_count], ax
+    mov byte [cs:cond_active], 0       ; Show cancels any active conditional-off region
     call cursor_show                   ; draw if the count reached 0 (visible)
     pop ax
     iret
@@ -382,6 +385,7 @@ m_cond_off:
 .v_ok:
     mov [cs:cond_top], ax
     mov [cs:cond_bottom], bx
+    mov byte [cs:cond_active], 1       ; the region is now in effect (one-shot)
     call cursor_hide                   ; re-evaluate: hide if now inside the box
     call cursor_show                   ; redraw if still visible and outside it
     pop bx
@@ -709,6 +713,8 @@ cursor_show:
     push es
     cmp word [cs:show_count], 0
     jne .done                         ; hidden
+    cmp byte [cs:cond_active], 0
+    je .visible                       ; no active region: draw everywhere
     ; conditional-off test in virtual space: skip drawing if inside the box
     mov ax, [cs:cur_x]
     cmp ax, [cs:cond_left]
