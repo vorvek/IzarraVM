@@ -11869,9 +11869,13 @@ const DOS_INT23_DEFAULT_STUB_ADDRESS: usize = 0x0632;
 const DOS_INT24_DEFAULT_STUB_ADDRESS: usize = 0x0637;
 
 /// EBDA offset of the far pointer to the user pointing-device (mouse) handler the
-/// guest installs with INT 15h AX=C207h. The IBM PS/2 BIOS keeps it here as
-/// offset word then segment word; INT 15h AX=C208h reads it back.
-const EBDA_MOUSE_HANDLER_OFF: u32 = 0x0022;
+/// guest installs with INT 15h AX=C207h (offset word then segment word). Offset
+/// 0x22 overlapped the fixed-disk parameter table (0x20..0x2F): a mounted HDD
+/// clobbered the handler pointer and a registered handler corrupted the disk
+/// geometry. The mouse sub-block lives in the free 0x01..0x0F gap: handler
+/// far-pointer at 0x02/0x04, packet buffer at 0x06..0x08, byte-index at 0x09. The
+/// izbios INT 74h ISR mirrors these offsets.
+const EBDA_MOUSE_HANDLER_OFF: u32 = 0x0002;
 
 /// Soft-INT vector the XMS driver entry stub triggers to trap into the host. INT
 /// 66h sits in the user-reserved range (RBIL: INT 60h-66h are free for
