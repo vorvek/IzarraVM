@@ -198,6 +198,15 @@ impl Keyboard8042 {
         reporting && self.irq12_armed
     }
 
+    /// Enable or disable PS/2 aux data reporting directly, the seam the BIOS
+    /// INT 15h AX=C200/C205 services use. This flips the same flag the guest's
+    /// 0xD4-routed 0xF4/0xF5 commands set, without queuing an ACK into the aux
+    /// stream. It does not clear the queue or re-centre; that is the driver's job.
+    #[allow(dead_code)]
+    pub fn set_mouse_reporting(&mut self, on: bool) {
+        self.mouse.reporting = on;
+    }
+
     /// Handle a byte the guest wrote straight to the keyboard device (the 0x60
     /// non-data path). Mirrors the aux handshake: most commands ACK with 0xFA,
     /// a few queue extra report bytes, and a parameter-taking command records
@@ -543,6 +552,27 @@ mod tests {
             0,
             "nothing latched"
         );
+    }
+
+    #[test]
+    fn set_mouse_reporting_enables_packets_without_a_command() {
+        let mut kbd = Keyboard8042::default();
+        // Command byte bit1 must be set for IRQ12 to arm in latch_next.
+        kbd.write_port(0x64, 0x60); // write command byte
+        kbd.write_port(0x60, 0x03); // IRQ1 + IRQ12 enabled
+        // Enable reporting via the new seam, not the 0xD4/0xF4 command path.
+        kbd.set_mouse_reporting(true);
+        assert!(kbd.mouse.reporting, "seam flips the reporting flag");
+        // A queued packet now latches and arms IRQ12, with no spurious 0xFA ACK.
+        let pulse = kbd.inject_mouse(5, -3, 0x01);
+        assert!(
+            pulse,
+            "reporting on plus an armed mouse byte requests IRQ12"
+        );
+        assert!(kbd.take_irq12(), "IRQ12 edge is pending");
+        let b0 = kbd.read_port(0x60).unwrap();
+        assert_eq!(b0 & 0x08, 0x08, "sync bit set on packet byte 0");
+        assert_eq!(b0 & 0x01, 0x01, "left button reported");
     }
 
     #[test]
