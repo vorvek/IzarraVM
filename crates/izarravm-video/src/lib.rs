@@ -496,14 +496,15 @@ impl Default for Dac {
 
 impl Dac {
     /// The DAC palette the VGA BIOS loads as a given mode's power-on default.
-    /// Mode 13h and the CGA/text personalities keep the 256-color palette3
-    /// (entries 0..15 already hold the standard colors); the EGA graphics modes
-    /// get palette0/1/2 in entries 0..63 (the rest are never indexed there).
+    /// Mode 13h and the CGA personalities keep the 256-color palette3 (entries
+    /// 0..15 already hold the standard colors, and CGA text/graphics index color
+    /// numbers directly); the EGA modes and VGA 16-color text (mode 03h) get
+    /// palette0/1/2 in entries 0..63, which the attribute remap then indexes.
     pub fn for_mode(mode: u8) -> Self {
         let table: &[[u8; 3]; 64] = match mode {
             0x0F => &EGA_DAC_PALETTE_MONO,
             0x0D | 0x0E => &EGA_DAC_PALETTE_CGA,
-            0x10..=0x12 => &EGA_DAC_PALETTE_EGA,
+            0x03 | 0x10..=0x12 => &EGA_DAC_PALETTE_EGA,
             _ => return Self::default(),
         };
         let mut palette = [[0u8; 3]; DAC_ENTRIES];

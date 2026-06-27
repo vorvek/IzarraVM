@@ -901,7 +901,10 @@ impl Default for Vga {
             text_memory,
             text_columns: VGA_TEXT_COLUMNS,
             font: Self::seed_fonts(),
-            dac: Dac::default(),
+            // Power-up is mode 03h, which seeds the EGA attribute remap below, so
+            // the DAC must be palette2 to match (palette3 would mis-resolve the
+            // remapped brown and bright colors).
+            dac: Dac::for_mode(0x03),
             cursor_offset: 0,
             // Mode 03h uses an 8x16 font, so the bottom two scanlines form the
             // normal underscore cursor.
@@ -2949,7 +2952,13 @@ impl Vga {
         Some((pixel_col, pixel_row as u8, char_row as u8, char_col as u8))
     }
 
-    fn reset_text_mode(&mut self, clear: bool) {
+    /// Reset to a text mode. `ega_attr_dac` selects the default DAC: VGA
+    /// 16-color text (mode 03h) drives colors through the EGA attribute remap
+    /// (6 -> 0x14, the bright eight -> 0x38..0x3F), so it needs palette2 in the
+    /// first 64 DAC entries. CGA text (modes 00h-02h, direct RGBI color numbers)
+    /// and MDA-style mono text (identity attribute palette) instead need the
+    /// standard 16 colors at entries 0..15, which the 256-color palette3 holds.
+    fn reset_text_mode(&mut self, clear: bool, ega_attr_dac: bool) {
         self.cursor_offset = 0;
         if clear {
             if self.crtc.char_width == 8 {
@@ -2970,11 +2979,11 @@ impl Vga {
         self.mode = VideoMode::Text;
         self.presented = None;
         // A buffered start-address change from a prior graphics mode must not
-        // carry across the mode switch: the text origin resets to page 0. Text
-        // keeps the 256-color palette3, where the standard 16 colors already sit
-        // at entries 0..15 (the EGA text DAC is a separate, deferred fix).
+        // carry across the mode switch: the text origin resets to page 0.
         self.pending_start = None;
-        self.reset_palette_defaults(0x03);
+        // Mode 03h installs the EGA attribute remap and so wants palette2; CGA
+        // and mono text keep the 256-color palette3 (standard 16 at 0..15).
+        self.reset_palette_defaults(if ega_attr_dac { 0x03 } else { 0x13 });
         self.resize_work();
     }
 
@@ -3022,7 +3031,7 @@ impl Vga {
         self.load_rom_font(0, 8);
         self.cursor_start = 0x06;
         self.cursor_end = 0x07;
-        self.reset_text_mode(clear);
+        self.reset_text_mode(clear, false); // CGA text: direct RGBI, keep palette3
         true
     }
 
@@ -3041,7 +3050,7 @@ impl Vga {
         self.load_rom_font(0, 16);
         self.cursor_start = 0x0E;
         self.cursor_end = 0x0F;
-        self.reset_text_mode(true);
+        self.reset_text_mode(true, true); // VGA mode 03h: EGA attribute remap, palette2
         self.seed_vgabios_attr_readback(0x03);
     }
 
@@ -3066,7 +3075,11 @@ impl Vga {
         }
         self.crtc = timing;
         self.crtc_regs = CrtcRegs::from_timing(timing);
-        if mode & 0x7F == 0x03 && scanlines == 400 {
+        // Only mode 03h at 400 lines installs the EGA attribute remap; the DAC
+        // palette has to match it (palette2), while the other text variants here
+        // keep their identity attribute palette and so keep palette3.
+        let install_ega_attr = mode & 0x7F == 0x03 && scanlines == 400;
+        if install_ega_attr {
             self.seed_vgabios_crtc_readback(0x03);
             self.seed_vgabios_seq_readback(0x03);
             self.seed_vgabios_gc_readback(0x03);
@@ -3079,8 +3092,8 @@ impl Vga {
         self.load_rom_font(0, height);
         self.cursor_start = height - 2;
         self.cursor_end = height - 1;
-        self.reset_text_mode(clear);
-        if mode & 0x7F == 0x03 && scanlines == 400 {
+        self.reset_text_mode(clear, install_ega_attr);
+        if install_ega_attr {
             self.seed_vgabios_attr_readback(0x03);
         }
         true
@@ -3101,7 +3114,7 @@ impl Vga {
         self.load_rom_font(0, 14);
         self.cursor_start = 0x0C;
         self.cursor_end = 0x0D;
-        self.reset_text_mode(true);
+        self.reset_text_mode(true, false); // mono text: identity attribute, keep palette3
     }
 
     /// Switch to a text mode with 40 or 80 visible columns, resetting the beam,
@@ -5070,6 +5083,33 @@ mod tests {
         assert_eq!(vga.dac.entry(0x06), [0x2a, 0x15, 0x00], "0x0D brown");
         assert_eq!(vga.dac.entry(0x10), [0x15, 0x15, 0x15], "0x0D bright black");
         assert_eq!(vga.dac.entry(0x17), [0x3f, 0x3f, 0x3f], "0x0D bright white");
+    }
+
+    #[test]
+    fn vga_text_mode3_resolves_remapped_colors_through_palette2() {
+        // Mode 03h drives text colors through the EGA attribute remap (color 6 ->
+        // 0x14, bright eight -> 0x38..0x3F, white -> 0x3F), so the DAC must be
+        // palette2 or those land on the 256-color ramps: white came out pink,
+        // brown gray, dark gray blue. Resolve the final RGB the remap produces.
+        let mut vga = Vga::default();
+        vga.set_text_mode();
+        assert_eq!(vga.dac.rgb888(0x3f), (0xff, 0xff, 0xff), "bright white");
+        assert_eq!(vga.dac.rgb888(0x14), (0xaa, 0x55, 0x00), "brown");
+        assert_eq!(vga.dac.rgb888(0x38), (0x55, 0x55, 0x55), "dark gray");
+
+        // CGA text (modes 00h-02h) uses direct RGBI color numbers, which must stay
+        // the standard 16 at entries 0..15 (palette3): white is index 15, not 0x3F.
+        assert!(vga.set_cga_text_mode(0x01));
+        assert_eq!(
+            vga.dac.rgb888(0x0f),
+            (0xff, 0xff, 0xff),
+            "CGA white at index 15"
+        );
+        assert_eq!(
+            vga.dac.rgb888(0x06),
+            (0xaa, 0x55, 0x00),
+            "CGA brown at index 6"
+        );
     }
 
     #[test]
