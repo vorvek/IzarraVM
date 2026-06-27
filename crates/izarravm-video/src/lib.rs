@@ -360,6 +360,128 @@ pub const STOCK_VGA_DAC_PALETTE: [[u8; 3]; DAC_ENTRIES] = [
     [0x00, 0x00, 0x00],
 ];
 
+// The DAC palettes the VGA BIOS loads for the non-256-color modes, 6-bit RGB
+// (0..=63), byte-for-byte from the LGPL VGABios (`vgatables.h`, palette0/1/2).
+// Mode 13h (palette3, STOCK_VGA_DAC_PALETTE) is the 256-color one; every
+// 16-color and text mode instead indexes a 6-bit attribute value into the
+// first 64 DAC entries, so those entries must hold the EGA/CGA colors. Loading
+// the 256-color palette3 in an EGA mode is why a brown attribute (0x14) or the
+// bright eight (0x38..0x3F) landed on the gray ramp and rendered wrong.
+
+/// palette0, dacmodel 0: mode 0Fh (640x350 mono). Three intensity bands.
+pub const EGA_DAC_PALETTE_MONO: [[u8; 3]; 64] = ega_mono_palette();
+
+/// palette1, dacmodel 1: modes 0Dh/0Eh (CGA 320x200/640x200 16-color). The 16
+/// CGA colors (brown at 6, the bright eight at 8..15) tiled across 64 entries so
+/// the modes' default attribute map (8..15 -> 0x10..0x17) resolves correctly.
+pub const EGA_DAC_PALETTE_CGA: [[u8; 3]; 64] = [
+    // dark 8, repeated for the 0x00..0x0F and 0x20..0x2F blocks
+    [0x00, 0x00, 0x00],
+    [0x00, 0x00, 0x2a],
+    [0x00, 0x2a, 0x00],
+    [0x00, 0x2a, 0x2a],
+    [0x2a, 0x00, 0x00],
+    [0x2a, 0x00, 0x2a],
+    [0x2a, 0x15, 0x00],
+    [0x2a, 0x2a, 0x2a],
+    [0x00, 0x00, 0x00],
+    [0x00, 0x00, 0x2a],
+    [0x00, 0x2a, 0x00],
+    [0x00, 0x2a, 0x2a],
+    [0x2a, 0x00, 0x00],
+    [0x2a, 0x00, 0x2a],
+    [0x2a, 0x15, 0x00],
+    [0x2a, 0x2a, 0x2a],
+    // bright 8, for the 0x10..0x1F and 0x30..0x3F blocks
+    [0x15, 0x15, 0x15],
+    [0x15, 0x15, 0x3f],
+    [0x15, 0x3f, 0x15],
+    [0x15, 0x3f, 0x3f],
+    [0x3f, 0x15, 0x15],
+    [0x3f, 0x15, 0x3f],
+    [0x3f, 0x3f, 0x15],
+    [0x3f, 0x3f, 0x3f],
+    [0x15, 0x15, 0x15],
+    [0x15, 0x15, 0x3f],
+    [0x15, 0x3f, 0x15],
+    [0x15, 0x3f, 0x3f],
+    [0x3f, 0x15, 0x15],
+    [0x3f, 0x15, 0x3f],
+    [0x3f, 0x3f, 0x15],
+    [0x3f, 0x3f, 0x3f],
+    [0x00, 0x00, 0x00],
+    [0x00, 0x00, 0x2a],
+    [0x00, 0x2a, 0x00],
+    [0x00, 0x2a, 0x2a],
+    [0x2a, 0x00, 0x00],
+    [0x2a, 0x00, 0x2a],
+    [0x2a, 0x15, 0x00],
+    [0x2a, 0x2a, 0x2a],
+    [0x00, 0x00, 0x00],
+    [0x00, 0x00, 0x2a],
+    [0x00, 0x2a, 0x00],
+    [0x00, 0x2a, 0x2a],
+    [0x2a, 0x00, 0x00],
+    [0x2a, 0x00, 0x2a],
+    [0x2a, 0x15, 0x00],
+    [0x2a, 0x2a, 0x2a],
+    [0x15, 0x15, 0x15],
+    [0x15, 0x15, 0x3f],
+    [0x15, 0x3f, 0x15],
+    [0x15, 0x3f, 0x3f],
+    [0x3f, 0x15, 0x15],
+    [0x3f, 0x15, 0x3f],
+    [0x3f, 0x3f, 0x15],
+    [0x3f, 0x3f, 0x3f],
+    [0x15, 0x15, 0x15],
+    [0x15, 0x15, 0x3f],
+    [0x15, 0x3f, 0x15],
+    [0x15, 0x3f, 0x3f],
+    [0x3f, 0x15, 0x15],
+    [0x3f, 0x15, 0x3f],
+    [0x3f, 0x3f, 0x15],
+    [0x3f, 0x3f, 0x3f],
+];
+
+/// palette2, dacmodel 2: modes 03h/10h/11h/12h (EGA/VGA 16-color and text). The
+/// full EGA 64-color decode: each index's bits are `r g b R G B` (secondary
+/// then primary), so the modes' default attribute map (6 -> 0x14, 8..15 ->
+/// 0x38..0x3F) resolves brown and the bright eight from the correct entries.
+pub const EGA_DAC_PALETTE_EGA: [[u8; 3]; 64] = ega_64_color_palette();
+
+/// Build palette2: index `i` decoded as `r g b R G B` (bits 5..0), each channel
+/// = primary (2/3 -> 0x2A) plus secondary (1/3 -> 0x15) intensity.
+const fn ega_64_color_palette() -> [[u8; 3]; 64] {
+    let mut table = [[0u8; 3]; 64];
+    let mut i = 0;
+    while i < 64 {
+        let r = ((i >> 2) & 1) as u8 * 0x2a + ((i >> 5) & 1) as u8 * 0x15;
+        let g = ((i >> 1) & 1) as u8 * 0x2a + ((i >> 4) & 1) as u8 * 0x15;
+        let b = (i & 1) as u8 * 0x2a + ((i >> 3) & 1) as u8 * 0x15;
+        table[i] = [r, g, b];
+        i += 1;
+    }
+    table
+}
+
+/// Build palette0: bands of black / 2-of-3 gray / full white keyed on the
+/// secondary-intensity bits (vgatables.h palette0). Mode 0Fh remaps its two
+/// planes onto attributes 0/3/0xC/0xF, so only those bands are ever sampled.
+const fn ega_mono_palette() -> [[u8; 3]; 64] {
+    let mut table = [[0u8; 3]; 64];
+    let mut i = 0;
+    while i < 64 {
+        let v = match (i >> 3) & 3 {
+            0 => 0x00,
+            3 => 0x3f,
+            _ => 0x2a,
+        };
+        table[i] = [v, v, v];
+        i += 1;
+    }
+    table
+}
+
 impl Default for Dac {
     fn default() -> Self {
         Self {
@@ -373,6 +495,28 @@ impl Default for Dac {
 }
 
 impl Dac {
+    /// The DAC palette the VGA BIOS loads as a given mode's power-on default.
+    /// Mode 13h and the CGA/text personalities keep the 256-color palette3
+    /// (entries 0..15 already hold the standard colors); the EGA graphics modes
+    /// get palette0/1/2 in entries 0..63 (the rest are never indexed there).
+    pub fn for_mode(mode: u8) -> Self {
+        let table: &[[u8; 3]; 64] = match mode {
+            0x0F => &EGA_DAC_PALETTE_MONO,
+            0x0D | 0x0E => &EGA_DAC_PALETTE_CGA,
+            0x10..=0x12 => &EGA_DAC_PALETTE_EGA,
+            _ => return Self::default(),
+        };
+        let mut palette = [[0u8; 3]; DAC_ENTRIES];
+        palette[..64].copy_from_slice(table);
+        Self {
+            palette,
+            write_index: 0,
+            read_index: 0,
+            write_component: 0,
+            read_component: 0,
+        }
+    }
+
     pub fn set_write_index(&mut self, index: u8) {
         self.write_index = index;
         self.write_component = 0;

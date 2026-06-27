@@ -1207,11 +1207,13 @@ impl Vga {
         bytes
     }
 
-    /// Reload the power-on default DAC palette, attribute palette, and pel mask.
-    /// Real hardware reprograms the RAMDAC to the mode's defaults on a mode set,
-    /// so a prior program's custom palette (the BIOS, say) does not leak into the
-    /// program that sets the next mode.
-    fn reset_palette_defaults(&mut self) {
+    /// Reload the power-on default DAC palette, attribute palette, and pel mask
+    /// for `mode`. Real hardware reprograms the RAMDAC to the mode's defaults on
+    /// a mode set, so a prior program's custom palette (the BIOS, say) does not
+    /// leak into the program that sets the next mode. The default DAC differs by
+    /// mode: EGA graphics modes load palette0/1/2 (see [`Dac::for_mode`]), every
+    /// other mode keeps the 256-color palette3.
+    fn reset_palette_defaults(&mut self, mode: u8) {
         let dac = self.dac.clone();
         let attr_palette = self.attr.palette;
         let overscan = self.attr.overscan;
@@ -1219,7 +1221,7 @@ impl Vga {
         let pel_mask = self.pel_mask;
         self.attr = Attribute::default();
         if self.default_palette_loading_enabled {
-            self.dac = Dac::default();
+            self.dac = Dac::for_mode(mode);
             self.pel_mask = 0xFF;
         } else {
             self.dac = dac;
@@ -1250,7 +1252,7 @@ impl Vga {
         self.mode = VideoMode::Planar;
         self.planar_bios_mode = mode;
         self.presented = None; // drop any stale frame from a prior mode
-        self.reset_palette_defaults();
+        self.reset_palette_defaults(mode);
         self.seed_vgabios_attr_readback(mode);
         self.resize_work();
     }
@@ -2740,7 +2742,7 @@ impl Vga {
         self.last_line = 0;
         self.mode = VideoMode::Mode13h;
         self.presented = None; // drop any stale frame from a prior mode
-        self.reset_palette_defaults();
+        self.reset_palette_defaults(0x13);
         self.seed_vgabios_attr_readback(0x13);
         self.resize_work();
     }
@@ -2789,7 +2791,7 @@ impl Vga {
         self.mode = VideoMode::Cga;
         self.presented = None;
         self.pending_start = None;
-        self.reset_palette_defaults();
+        self.reset_palette_defaults(mode);
         self.resize_work();
         true
     }
@@ -2968,9 +2970,11 @@ impl Vga {
         self.mode = VideoMode::Text;
         self.presented = None;
         // A buffered start-address change from a prior graphics mode must not
-        // carry across the mode switch: the text origin resets to page 0.
+        // carry across the mode switch: the text origin resets to page 0. Text
+        // keeps the 256-color palette3, where the standard 16 colors already sit
+        // at entries 0..15 (the EGA text DAC is a separate, deferred fix).
         self.pending_start = None;
-        self.reset_palette_defaults();
+        self.reset_palette_defaults(0x03);
         self.resize_work();
     }
 
@@ -5040,6 +5044,32 @@ mod tests {
         assert_eq!(video.active_mode(), VideoMode::Text);
         video.set_mode13h();
         assert_eq!(video.active_mode(), VideoMode::Mode13h);
+    }
+
+    #[test]
+    fn ega_modes_load_the_matching_bios_dac_palette() {
+        // Mode 13h keeps the 256-color palette3: brown sits at index 6 directly
+        // and the gray ramp at 0x10..0x1F. (This is the value an EGA mode used
+        // to wrongly inherit, turning brown attributes gray.)
+        let mut vga = Vga::default();
+        vga.set_mode13h();
+        assert_eq!(vga.dac.entry(0x06), [0x2a, 0x15, 0x00]);
+        assert_eq!(vga.dac.entry(0x14), [0x0e, 0x0e, 0x0e]); // gray ramp, not brown
+
+        // Mode 10h loads palette2, the EGA 64-color decode. Its default
+        // attribute map sends color 6 -> 0x14 and the bright eight -> 0x38..0x3F,
+        // so those entries must hold real colors, not the gray ramp.
+        vga.set_mode(0x10);
+        assert_eq!(vga.dac.entry(0x14), [0x2a, 0x15, 0x00], "0x10 brown");
+        assert_eq!(vga.dac.entry(0x38), [0x15, 0x15, 0x15], "0x10 dark gray");
+        assert_eq!(vga.dac.entry(0x3f), [0x3f, 0x3f, 0x3f], "0x10 white");
+
+        // Mode 0Dh (CGA 320x200, the Monkey Island mode) loads palette1: brown at
+        // 6 and the bright eight at 0x10..0x17 (this mode's attribute targets).
+        vga.set_mode(0x0D);
+        assert_eq!(vga.dac.entry(0x06), [0x2a, 0x15, 0x00], "0x0D brown");
+        assert_eq!(vga.dac.entry(0x10), [0x15, 0x15, 0x15], "0x0D bright black");
+        assert_eq!(vga.dac.entry(0x17), [0x3f, 0x3f, 0x3f], "0x0D bright white");
     }
 
     #[test]
