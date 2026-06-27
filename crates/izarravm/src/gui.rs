@@ -350,24 +350,60 @@ fn eject_button(ui: &mut egui::Ui, enabled: bool) -> bool {
     enabled && resp.clicked()
 }
 
-/// The classic ascending-bars volume icon from period CD-ROM front panels: a
-/// row of vertical bars stepping up in height, drawn at the left of the volume
-/// row in place of a text label.
+/// A small speaker icon (back box, flared cone, and two sound waves) drawn at
+/// the left of the volume row in place of a text label.
 fn volume_icon(ui: &mut egui::Ui) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(18.0, 14.0), egui::Sense::hover());
-    let bars = 4;
-    let bar_w = 3.0;
-    let gap = 1.5;
-    for i in 0..bars {
-        let frac = (i + 1) as f32 / bars as f32;
-        let bh = rect.height() * frac;
-        let x = rect.left() + i as f32 * (bar_w + gap);
-        let bar = egui::Rect::from_min_max(
-            egui::pos2(x, rect.bottom() - bh),
-            egui::pos2(x + bar_w, rect.bottom()),
-        );
-        ui.painter().rect_filled(bar, 0.0, LABEL);
-    }
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(20.0, 14.0), egui::Sense::hover());
+    let cy = rect.center().y;
+    let left = rect.left();
+    // Speaker back box.
+    ui.painter().rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(left + 1.0, cy - 3.0),
+            egui::pos2(left + 6.0, cy + 3.0),
+        ),
+        0.0,
+        LABEL,
+    );
+    // Speaker cone, a trapezoid flaring to the right.
+    let cone = vec![
+        egui::pos2(left + 6.0, cy - 3.0),
+        egui::pos2(left + 12.0, cy - 6.0),
+        egui::pos2(left + 12.0, cy + 6.0),
+        egui::pos2(left + 6.0, cy + 3.0),
+    ];
+    ui.painter()
+        .add(egui::Shape::convex_polygon(cone, LABEL, egui::Stroke::NONE));
+    // Two sound-wave chevrons to the right.
+    let stroke = egui::Stroke::new(1.2, LABEL);
+    ui.painter().line_segment(
+        [
+            egui::pos2(left + 14.0, cy - 2.5),
+            egui::pos2(left + 15.5, cy),
+        ],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [
+            egui::pos2(left + 15.5, cy),
+            egui::pos2(left + 14.0, cy + 2.5),
+        ],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [
+            egui::pos2(left + 16.5, cy - 4.0),
+            egui::pos2(left + 18.5, cy),
+        ],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [
+            egui::pos2(left + 18.5, cy),
+            egui::pos2(left + 16.5, cy + 4.0),
+        ],
+        stroke,
+    );
 }
 
 /// Recolour the logo's flat off-white background to `beige` with a per-pixel
