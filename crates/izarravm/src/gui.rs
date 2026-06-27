@@ -1,4 +1,4 @@
-use crate::prefs::{self, GuiPrefs};
+use crate::prefs::{self, CrtStyle, GuiPrefs, KeyBinding};
 use izarravm_audio::{AudioPlayer, AudioSink};
 use izarravm_core::GswMode;
 use izarravm_dos::HostDrive;
@@ -704,13 +704,39 @@ pub struct GuiApp {
     // Distira/Glide render worker count. Persisted in the GUI prefs and applied
     // live to the emulation thread.
     glide_render_threads: u8,
-    // Whether the CRT-emulation shader pass is on. Persisted in the GUI prefs;
-    // read by monitor_ui each frame and passed to the shader as a uniform flag.
-    crt_emulation: bool,
+    // CRT presentation style (off / subtle / Ye Olde). Persisted; read by
+    // monitor_ui each frame and mapped to the shader's style uniform.
+    crt_style: CrtStyle,
+    // Live hotkeys for releasing captured input and toggling fullscreen. The
+    // event loop matches physical keys against these; the config dialog edits
+    // staged copies and writes them back on Accept.
+    input_release: KeyBinding,
+    fullscreen_key: KeyBinding,
+    // The configuration modal, when open. Holds a staged copy of the settings it
+    // edits so Cancel discards and Accept applies.
+    config_dialog: Option<ConfigDialog>,
     // Persisted GUI prefs (volume, last mounts) and where they live on disk. The
     // file sits next to the C: root and is rewritten on a change.
     prefs: GuiPrefs,
     prefs_path: PathBuf,
+}
+
+/// Which hotkey the config dialog is currently waiting to capture.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BindTarget {
+    InputRelease,
+    Fullscreen,
+}
+
+/// Staged settings edited by the configuration modal. Seeded from the live
+/// values when opened; applied on Accept, discarded on Cancel.
+struct ConfigDialog {
+    input_release: KeyBinding,
+    fullscreen: KeyBinding,
+    glide_threads: u8,
+    crt_style: CrtStyle,
+    // The binding awaiting a key press, set when the user clicks a rebind button.
+    capturing: Option<BindTarget>,
 }
 
 impl GuiApp {
@@ -744,7 +770,9 @@ impl GuiApp {
         let prefs = GuiPrefs::load(&prefs_path);
         let volume = prefs.master_volume.clamp(0.0, 1.0);
         let glide_render_threads = prefs.glide_render_threads;
-        let crt_emulation = prefs.crt_emulation;
+        let crt_style = prefs.crt_style;
+        let input_release = prefs.input_release.clone();
+        let fullscreen_key = prefs.fullscreen.clone();
         let gain = SharedGain::new(volume_gain(volume));
         // Restore the last mount if the source still exists on disk. An image
         // takes priority over a folder when both are recorded.
@@ -784,7 +812,10 @@ impl GuiApp {
             volume,
             gain,
             glide_render_threads,
-            crt_emulation,
+            crt_style,
+            input_release,
+            fullscreen_key,
+            config_dialog: None,
             prefs,
             prefs_path,
         };
@@ -896,13 +927,16 @@ impl GuiApp {
             }
         };
         // Paint the guest screen through the wgpu shader pass: aspect-fill to the
-        // 4:3 rect, sharp upscale, and the CRT model when enabled.
+        // 4:3 rect, sharp upscale, and the CRT model for the chosen style. The Ye
+        // Olde grain animates, so keep repainting while it is active.
+        let style = self.crt_style.as_u32();
+        let time = ui.input(|i| i.time) as f32;
+        if self.crt_style == CrtStyle::YeOlde {
+            ui.ctx().request_repaint();
+        }
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(
             rect,
-            crate::crt::CrtCallback {
-                frame,
-                crt_on: self.crt_emulation,
-            },
+            crate::crt::CrtCallback { frame, style, time },
         ));
         // Clicking the screen requests input capture (handled later by the event
         // loop, which owns the winit Window).
@@ -970,7 +1004,10 @@ impl GuiApp {
             let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
             window.set_cursor_visible(true);
         }
-        self.title = capture_title(self.input_captured);
+        // Set the OS title bar directly: viewport commands are not applied in this
+        // bespoke winit loop (no eframe), so the lock hint has to go on the window.
+        self.title = capture_title(self.input_captured, &self.input_release.display());
+        window.set_title(&self.title);
     }
 
     /// Update the guest button mask from a pointer button edge and resend the
@@ -1057,7 +1094,20 @@ impl GuiApp {
             self.cd_access_at = Some(now);
         }
 
-        ui.heading("Machine");
+        // The "Machine" heading with the configuration gear right-aligned on the
+        // same row (right_to_left fills the remaining width after the heading).
+        ui.horizontal(|ui| {
+            ui.heading("Machine");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button("\u{2699}")
+                    .on_hover_text("Configuration")
+                    .clicked()
+                {
+                    self.open_config_dialog();
+                }
+            });
+        });
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(!running, egui::Button::new("Start"))
@@ -1089,30 +1139,6 @@ impl GuiApp {
             "Host: {:.0} fps, {:.0} input/s",
             self.host_fps, self.input_rate
         ));
-
-        ui.separator();
-        ui.heading("Glide");
-        ui.horizontal(|ui| {
-            ui.label("Render threads");
-            let before = self.glide_render_threads;
-            for threads in DISTIRA_RENDER_THREAD_CHOICES {
-                ui.selectable_value(&mut self.glide_render_threads, threads, threads.to_string());
-            }
-            if self.glide_render_threads != before {
-                self.set_glide_render_threads(self.glide_render_threads);
-            }
-        });
-
-        ui.separator();
-        ui.heading("Display");
-        if ui
-            .checkbox(&mut self.crt_emulation, "CRT emulation")
-            .on_hover_text("Scanlines, shadow mask, and halation of a mid-90s SVGA monitor")
-            .changed()
-        {
-            self.prefs.crt_emulation = self.crt_emulation;
-            self.save_prefs();
-        }
 
         ui.separator();
         ui.heading("Audio");
@@ -1148,6 +1174,118 @@ impl GuiApp {
         let com1_label = if self.show_com1 { "Hide COM1" } else { "COM1" };
         if ui.button(com1_label).clicked() {
             self.show_com1 = !self.show_com1;
+        }
+    }
+
+    /// Open the configuration modal, seeding its staged settings from the live
+    /// values so Cancel can discard cleanly.
+    fn open_config_dialog(&mut self) {
+        self.config_dialog = Some(ConfigDialog {
+            input_release: self.input_release.clone(),
+            fullscreen: self.fullscreen_key.clone(),
+            glide_threads: self.glide_render_threads,
+            crt_style: self.crt_style,
+            capturing: None,
+        });
+    }
+
+    /// True while the dialog is waiting to capture a hotkey, so the event loop
+    /// swallows the next key instead of toggling capture or forwarding to the guest.
+    fn is_capturing_bind(&self) -> bool {
+        self.config_dialog
+            .as_ref()
+            .is_some_and(|d| d.capturing.is_some())
+    }
+
+    /// Record a captured combo into the staged binding the dialog is waiting on,
+    /// then stop capturing. `key` is the winit `KeyCode` debug name.
+    fn record_bind(&mut self, key: &str, ctrl: bool, shift: bool, alt: bool) {
+        if let Some(dialog) = &mut self.config_dialog {
+            if let Some(target) = dialog.capturing.take() {
+                let binding = KeyBinding::new(ctrl, shift, alt, key);
+                match target {
+                    BindTarget::InputRelease => dialog.input_release = binding,
+                    BindTarget::Fullscreen => dialog.fullscreen = binding,
+                }
+            }
+        }
+    }
+
+    /// Render the configuration modal. Accept applies the staged settings and
+    /// closes; Cancel, the backdrop, or Esc discards and closes.
+    fn config_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.config_dialog.take() else {
+            return;
+        };
+        let mut keep_open = true;
+        let mut accept = false;
+        let modal = egui::Modal::new(egui::Id::new("config-modal")).show(ctx, |ui| {
+            ui.set_width(340.0);
+            ui.heading("Configuration");
+            ui.add_space(6.0);
+
+            egui::Grid::new("config-keys")
+                .num_columns(2)
+                .spacing([12.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("Input release");
+                    bind_button(ui, &mut dialog, BindTarget::InputRelease);
+                    ui.end_row();
+                    ui.label("Full screen");
+                    bind_button(ui, &mut dialog, BindTarget::Fullscreen);
+                    ui.end_row();
+                });
+
+            ui.separator();
+            ui.label("Display");
+            ui.horizontal(|ui| {
+                ui.label("Voodoo rendering threads");
+                for threads in DISTIRA_RENDER_THREAD_CHOICES {
+                    ui.selectable_value(&mut dialog.glide_threads, threads, threads.to_string());
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("CRT emulation");
+                ui.selectable_value(&mut dialog.crt_style, CrtStyle::Off, "No");
+                ui.selectable_value(&mut dialog.crt_style, CrtStyle::Subtle, "Subtle");
+                ui.selectable_value(&mut dialog.crt_style, CrtStyle::YeOlde, "Ye Olde Screene");
+            });
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Accept").clicked() {
+                    accept = true;
+                    keep_open = false;
+                }
+                if ui.button("Cancel").clicked() {
+                    keep_open = false;
+                }
+            });
+        });
+        if modal.should_close() {
+            keep_open = false;
+        }
+        if accept {
+            self.apply_config(&dialog);
+        }
+        if keep_open {
+            self.config_dialog = Some(dialog);
+        }
+    }
+
+    /// Push the staged config to the live fields, the emulation thread, and prefs.
+    fn apply_config(&mut self, dialog: &ConfigDialog) {
+        self.input_release = dialog.input_release.clone();
+        self.fullscreen_key = dialog.fullscreen.clone();
+        self.crt_style = dialog.crt_style;
+        self.prefs.input_release = dialog.input_release.clone();
+        self.prefs.fullscreen = dialog.fullscreen.clone();
+        self.prefs.crt_style = dialog.crt_style;
+        if dialog.glide_threads != self.glide_render_threads {
+            // Updates the field, prefs, and emulation thread, and persists.
+            self.set_glide_render_threads(dialog.glide_threads);
+        } else {
+            self.save_prefs();
         }
     }
 
@@ -1462,9 +1600,8 @@ impl GuiApp {
     /// COM1 window. Keyboard, mouse capture, and focus loss are handled in the
     /// winit event loop now, not here, so the guest reads raw physical keys.
     fn ui(&mut self, ctx: &egui::Context) {
-        // Keep the title in sync with the capture state every frame.
-        self.title = capture_title(self.input_captured);
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.title.clone()));
+        // The window title (capture-lock hint) is set directly on the winit window
+        // from the event loop now; viewport commands are not applied without eframe.
         // Host-loop diagnostics: count this frame and the input events egui saw,
         // rolling the rates up once a second.
         let now = Instant::now();
@@ -1490,16 +1627,45 @@ impl GuiApp {
         if self.show_com1 {
             self.com1_window(ctx);
         }
+        // The configuration modal renders on top of everything when open.
+        self.config_ui(ctx);
     }
 }
 
+/// Bump every UI text style up a couple of points for legibility. Applied once
+/// to the egui context at startup, so it persists across frames.
+fn enlarge_ui_fonts(ctx: &egui::Context) {
+    ctx.style_mut(|style| {
+        for font_id in style.text_styles.values_mut() {
+            font_id.size += 2.0;
+        }
+    });
+}
+
 /// The window title for the current capture state. While captured it tells the
-/// user how to release the grab; otherwise it is just the product name.
-fn capture_title(captured: bool) -> String {
+/// user which key releases the grab; otherwise it is just the product name.
+fn capture_title(captured: bool, release_key: &str) -> String {
     if captured {
-        String::from("IzarraVM - [Press Ctrl+F2 to release the input]")
+        format!("IzarraVM - [Input locked, press {release_key} to release]")
     } else {
         String::from("IzarraVM")
+    }
+}
+
+/// A config-dialog button showing a binding's label, or "press a key…" while it
+/// is the one being captured. Clicking toggles capture for that binding.
+fn bind_button(ui: &mut egui::Ui, dialog: &mut ConfigDialog, target: BindTarget) {
+    let capturing = dialog.capturing == Some(target);
+    let label = if capturing {
+        "press a key\u{2026}".to_string()
+    } else {
+        match target {
+            BindTarget::InputRelease => dialog.input_release.display(),
+            BindTarget::Fullscreen => dialog.fullscreen.display(),
+        }
+    };
+    if ui.selectable_label(capturing, label).clicked() {
+        dialog.capturing = if capturing { None } else { Some(target) };
     }
 }
 
@@ -1556,8 +1722,13 @@ struct WgpuState {
 struct WinitApp {
     gui: GuiApp,
     host_kbd: HostKeyboard,
-    // Physical Ctrl state, tracked for the Ctrl+F2 capture toggle.
+    // Physical modifier state, tracked so the configurable hotkeys (input
+    // release, fullscreen) and the rebind capture can read the live combo.
     ctrl_down: bool,
+    shift_down: bool,
+    alt_down: bool,
+    // Whether the window is currently fullscreen, toggled by the fullscreen hotkey.
+    is_fullscreen: bool,
     // Whether our window has keyboard focus. Raw device key events are global, so
     // we only forward them to the guest while focused.
     focused: bool,
@@ -1577,23 +1748,63 @@ struct WinitApp {
 }
 
 impl WinitApp {
-    /// Translate one physical key transition to the guest. Ctrl+F2 toggles input
-    /// capture and is withheld from the guest; everything else goes through
-    /// HostKeyboard (which dedupes repeats) and on to the emulation thread. Used
-    /// by both the raw DeviceEvent::Key path and the cooked WindowEvent fallback.
+    /// Translate one physical key transition to the guest. The configurable input
+    /// release and fullscreen hotkeys are intercepted (and withheld from the
+    /// guest); a pending rebind capture swallows the next key; everything else
+    /// goes through HostKeyboard and on to the emulation thread. Used by both the
+    /// raw DeviceEvent::Key path and the cooked WindowEvent fallback.
     fn handle_guest_key(&mut self, code: winit::keyboard::KeyCode, pressed: bool) {
         use winit::keyboard::KeyCode;
-        if matches!(code, KeyCode::ControlLeft | KeyCode::ControlRight) {
-            self.ctrl_down = pressed;
+        // Track modifiers (still forwarded to the guest below).
+        match code {
+            KeyCode::ControlLeft | KeyCode::ControlRight => self.ctrl_down = pressed,
+            KeyCode::ShiftLeft | KeyCode::ShiftRight => self.shift_down = pressed,
+            KeyCode::AltLeft | KeyCode::AltRight => self.alt_down = pressed,
+            _ => {}
         }
-        if pressed && code == KeyCode::F2 && self.ctrl_down {
+        let is_modifier = matches!(
+            code,
+            KeyCode::ControlLeft
+                | KeyCode::ControlRight
+                | KeyCode::ShiftLeft
+                | KeyCode::ShiftRight
+                | KeyCode::AltLeft
+                | KeyCode::AltRight
+        );
+        // The winit KeyCode debug name is the binding's key identity (e.g. "F2").
+        let name = format!("{code:?}");
+        let (ctrl, shift, alt) = (self.ctrl_down, self.shift_down, self.alt_down);
+
+        // The config dialog is capturing a rebind: take the next non-modifier key
+        // as the new combo and swallow it.
+        if pressed && !is_modifier && self.gui.is_capturing_bind() {
+            self.gui.record_bind(&name, ctrl, shift, alt);
+            return;
+        }
+        if pressed && self.gui.input_release.matches(&name, ctrl, shift, alt) {
             if let Some(window) = self.window.clone() {
                 self.gui.toggle_capture(&window, &mut self.host_kbd);
             }
             return;
         }
+        if pressed && self.gui.fullscreen_key.matches(&name, ctrl, shift, alt) {
+            self.toggle_fullscreen();
+            return;
+        }
+
         let codes = self.host_kbd.key(code, pressed);
         self.gui.send_keys_to_guest(codes);
+    }
+
+    /// Toggle borderless fullscreen on the window.
+    fn toggle_fullscreen(&mut self) {
+        self.is_fullscreen = !self.is_fullscreen;
+        if let Some(window) = &self.window {
+            let mode = self
+                .is_fullscreen
+                .then_some(winit::window::Fullscreen::Borderless(None));
+            window.set_fullscreen(mode);
+        }
     }
 }
 
@@ -1869,15 +2080,20 @@ pub fn run(
         test_pattern,
         rtc_setup,
     );
+    let egui_ctx = egui::Context::default();
+    enlarge_ui_fonts(&egui_ctx);
     let mut app = WinitApp {
         gui,
         host_kbd: HostKeyboard::default(),
         ctrl_down: false,
+        shift_down: false,
+        alt_down: false,
+        is_fullscreen: false,
         focused: true,
         raw_keys: false,
         window: None,
         wgpu: None,
-        egui_ctx: egui::Context::default(),
+        egui_ctx,
         egui_winit: None,
         egui_renderer: None,
         next_frame: Instant::now(),

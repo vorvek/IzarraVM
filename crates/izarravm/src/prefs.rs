@@ -19,6 +19,80 @@ const PREFS_FILE: &str = "izarravm.conf";
 /// material while still being plainly audible.
 const DEFAULT_VOLUME: f32 = 0.8;
 
+/// A host hotkey: modifier flags plus a key name. `key` is the winit `KeyCode`
+/// debug name (e.g. "F2", "KeyA"), which the GUI compares against the live key
+/// and renders prettily. Kept winit-free so prefs stays plain data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyBinding {
+    pub ctrl: bool,
+    pub shift: bool,
+    pub alt: bool,
+    pub key: String,
+}
+
+impl KeyBinding {
+    pub fn new(ctrl: bool, shift: bool, alt: bool, key: &str) -> Self {
+        Self {
+            ctrl,
+            shift,
+            alt,
+            key: key.to_string(),
+        }
+    }
+
+    /// True when the live key name and modifier state match this binding.
+    pub fn matches(&self, key: &str, ctrl: bool, shift: bool, alt: bool) -> bool {
+        self.ctrl == ctrl && self.shift == shift && self.alt == alt && self.key == key
+    }
+
+    /// Human label like "Ctrl+F2". Strips the winit "Key"/"Digit" prefixes so a
+    /// letter or number reads naturally.
+    pub fn display(&self) -> String {
+        let mut s = String::new();
+        if self.ctrl {
+            s.push_str("Ctrl+");
+        }
+        if self.shift {
+            s.push_str("Shift+");
+        }
+        if self.alt {
+            s.push_str("Alt+");
+        }
+        let key = self
+            .key
+            .strip_prefix("Key")
+            .or_else(|| self.key.strip_prefix("Digit"))
+            .unwrap_or(&self.key);
+        s.push_str(key);
+        s
+    }
+}
+
+/// CRT presentation style.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CrtStyle {
+    /// No CRT pass: plain aspect-corrected output.
+    Off,
+    /// The default subtle high-res SVGA look.
+    #[default]
+    Subtle,
+    /// Heavier "Ye Olde Screene": visible scanlines + shadow mask, curvature,
+    /// softer focus, and faint animated grain.
+    YeOlde,
+}
+
+impl CrtStyle {
+    /// Shader style selector: 0 off, 1 subtle, 2 Ye Olde.
+    pub fn as_u32(self) -> u32 {
+        match self {
+            CrtStyle::Off => 0,
+            CrtStyle::Subtle => 1,
+            CrtStyle::YeOlde => 2,
+        }
+    }
+}
+
 /// Host-side GUI preferences. Fields are optional where a "not set yet" state is
 /// meaningful, so an older or hand-edited file with missing keys still loads.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -28,9 +102,12 @@ pub struct GuiPrefs {
     pub master_volume: f32,
     /// Distira Glide renderer worker count. Matches 86Box's choices: 1, 2, or 4.
     pub glide_render_threads: u8,
-    /// Whether the CRT-emulation shader pass is enabled. Off = plain
-    /// aspect-corrected output; on = scanlines + shadow mask + halation.
-    pub crt_emulation: bool,
+    /// CRT presentation style: off, subtle (default), or Ye Olde Screene.
+    pub crt_style: CrtStyle,
+    /// Hotkey that releases captured input. Default Ctrl+F2.
+    pub input_release: KeyBinding,
+    /// Hotkey that toggles fullscreen. Default Ctrl+F11.
+    pub fullscreen: KeyBinding,
     /// Last floppy IMG mounted, re-mounted on startup if it still exists.
     pub last_floppy_image: Option<PathBuf>,
     /// Last folder mounted as drive A:, restored on startup if it still exists.
@@ -44,7 +121,9 @@ impl Default for GuiPrefs {
         Self {
             master_volume: DEFAULT_VOLUME,
             glide_render_threads: DISTIRA_DEFAULT_RENDER_THREADS,
-            crt_emulation: true,
+            crt_style: CrtStyle::Subtle,
+            input_release: KeyBinding::new(true, false, false, "F2"),
+            fullscreen: KeyBinding::new(true, false, false, "F11"),
             last_floppy_image: None,
             last_floppy_folder: None,
             last_cd_image: None,
@@ -112,7 +191,9 @@ mod tests {
         let prefs = GuiPrefs {
             master_volume: 0.65,
             glide_render_threads: 4,
-            crt_emulation: false,
+            crt_style: CrtStyle::YeOlde,
+            input_release: KeyBinding::new(true, true, false, "F4"),
+            fullscreen: KeyBinding::new(false, false, true, "Enter"),
             last_floppy_image: Some(PathBuf::from("/tmp/disk.img")),
             last_floppy_folder: Some(PathBuf::from("/tmp/games")),
             last_cd_image: None,
@@ -130,10 +211,46 @@ mod tests {
         assert_eq!(parsed, GuiPrefs::default());
         assert_eq!(parsed.master_volume, DEFAULT_VOLUME);
         assert_eq!(parsed.glide_render_threads, 2);
-        assert!(
-            parsed.crt_emulation,
-            "CRT emulation defaults on for older files"
+        assert_eq!(
+            parsed.crt_style,
+            CrtStyle::Subtle,
+            "CRT defaults to the subtle look for older files"
         );
+        assert_eq!(
+            parsed.input_release,
+            KeyBinding::new(true, false, false, "F2")
+        );
+        assert_eq!(
+            parsed.fullscreen,
+            KeyBinding::new(true, false, false, "F11")
+        );
+    }
+
+    #[test]
+    fn key_binding_display_strips_winit_prefixes() {
+        assert_eq!(
+            KeyBinding::new(true, false, false, "F2").display(),
+            "Ctrl+F2"
+        );
+        assert_eq!(
+            KeyBinding::new(true, true, true, "KeyA").display(),
+            "Ctrl+Shift+Alt+A"
+        );
+        assert_eq!(
+            KeyBinding::new(false, false, false, "Digit5").display(),
+            "5"
+        );
+    }
+
+    #[test]
+    fn crt_style_serialises_lowercase() {
+        assert_eq!(
+            toml::Value::try_from(CrtStyle::YeOlde).unwrap().as_str(),
+            Some("yeolde")
+        );
+        assert_eq!(CrtStyle::default(), CrtStyle::Subtle);
+        assert_eq!(CrtStyle::Off.as_u32(), 0);
+        assert_eq!(CrtStyle::YeOlde.as_u32(), 2);
     }
 
     #[test]
