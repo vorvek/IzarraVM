@@ -6,7 +6,9 @@ around an MS-DOS compatible core, with Toka Disk System as its ROM shell and
 launcher.
 
 <p align="center">
-  <img src="docs/izarra-3000-chassis.jpg" alt="The Izarra 3000 desktop tower" width="380">
+  <img src="docs/izarra-3000-chassis.jpg" alt="The Izarra 3000 desktop tower" width="300">
+  &nbsp;&nbsp;
+  <a href="docs/izarravm-screenshot.png"><img src="docs/izarravm-screenshot.png" alt="The Izarra BIOS POST screen running in IzarraVM" width="420"></a>
 </p>
 
 The goal is to run early to mid 1990s DOS games as if the Izarra had reached
