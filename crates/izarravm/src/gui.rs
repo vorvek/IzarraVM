@@ -440,6 +440,67 @@ fn recolor_logo(raw: &[u8], beige: [f32; 3]) -> Vec<u8> {
     out
 }
 
+/// Rasterize a solid five-pointed star into `size` x `size` straight RGBA,
+/// `color` inside and transparent outside. The classic star uses an inner /
+/// outer radius ratio of 0.382, with the top point up.
+fn render_star_icon(size: u32, color: [u8; 3]) -> Vec<u8> {
+    let n = size as f32;
+    let (cx, cy) = (n / 2.0, n / 2.0);
+    let ro = n * 0.46;
+    let ri = ro * 0.382;
+    let mut pts = Vec::with_capacity(10);
+    for k in 0..5 {
+        let ao = (-90.0 + k as f32 * 72.0).to_radians();
+        pts.push((cx + ro * ao.cos(), cy + ro * ao.sin()));
+        let ai = (-90.0 + 36.0 + k as f32 * 72.0).to_radians();
+        pts.push((cx + ri * ai.cos(), cy + ri * ai.sin()));
+    }
+    let inside = |px: f32, py: f32| -> bool {
+        // Ray-casting point-in-polygon, valid for this concave star.
+        let mut hit = false;
+        let mut j = pts.len() - 1;
+        for i in 0..pts.len() {
+            let (xi, yi) = pts[i];
+            let (xj, yj) = pts[j];
+            if (yi > py) != (yj > py) {
+                let x_cross = (xj - xi) * (py - yi) / (yj - yi) + xi;
+                if px < x_cross {
+                    hit = !hit;
+                }
+            }
+            j = i;
+        }
+        hit
+    };
+    let mut rgba = vec![0u8; (size * size * 4) as usize];
+    for y in 0..size {
+        for x in 0..size {
+            if inside(x as f32 + 0.5, y as f32 + 0.5) {
+                let o = ((y * size + x) * 4) as usize;
+                rgba[o] = color[0];
+                rgba[o + 1] = color[1];
+                rgba[o + 2] = color[2];
+                rgba[o + 3] = 0xFF;
+            }
+        }
+    }
+    rgba
+}
+
+/// Build the winit window icon: a brand-red star. Logged and dropped on the
+/// rare `BadIcon`, so a bad buffer never blocks the window.
+fn star_window_icon() -> Option<winit::window::Icon> {
+    let size = 64u32;
+    let rgba = render_star_icon(size, [0xC7, 0x44, 0x46]);
+    match winit::window::Icon::from_rgba(rgba, size, size) {
+        Ok(icon) => Some(icon),
+        Err(err) => {
+            warn!(%err, "could not build the window icon");
+            None
+        }
+    }
+}
+
 /// Host-side master audio gain shared between the UI thread (writes it from the
 /// volume slider) and the emulation thread (reads it each audio pump). The f32
 /// gain is stored as its bit pattern so it can ride in a lock-free atomic on the
@@ -1976,6 +2037,7 @@ impl ApplicationHandler for WinitApp {
         }
         let attrs = Window::default_attributes()
             .with_title("IzarraVM")
+            .with_window_icon(star_window_icon())
             .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0))
             .with_min_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
@@ -2336,5 +2398,16 @@ mod tests {
             (rgba[4], rgba[5], rgba[6], rgba[7]),
             (0xAB, 0xCD, 0xEF, 0xFF)
         );
+    }
+
+    #[test]
+    fn star_icon_is_red_in_the_centre_and_clear_in_the_corner() {
+        let size = 64u32;
+        let rgba = render_star_icon(size, [0xC7, 0x44, 0x46]);
+        assert_eq!(rgba.len(), (size * size * 4) as usize);
+        let center = ((size / 2 * size + size / 2) * 4) as usize;
+        assert_eq!(&rgba[center..center + 4], &[0xC7u8, 0x44, 0x46, 0xFF]);
+        // Top-left corner is outside the star, fully transparent.
+        assert_eq!(&rgba[0..4], &[0u8, 0, 0, 0]);
     }
 }
