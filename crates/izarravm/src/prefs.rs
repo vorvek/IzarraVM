@@ -114,6 +114,9 @@ pub struct GuiPrefs {
     pub last_floppy_folder: Option<PathBuf>,
     /// Reserved for a future CD image mount. Persisted so the slot exists.
     pub last_cd_image: Option<PathBuf>,
+    /// Whether the beige control panel is expanded. Persisted so the collapse
+    /// state survives a restart. Defaults to open.
+    pub panel_open: bool,
 }
 
 impl Default for GuiPrefs {
@@ -127,6 +130,7 @@ impl Default for GuiPrefs {
             last_floppy_image: None,
             last_floppy_folder: None,
             last_cd_image: None,
+            panel_open: true,
         }
     }
 }
@@ -197,6 +201,7 @@ mod tests {
             last_floppy_image: Some(PathBuf::from("/tmp/disk.img")),
             last_floppy_folder: Some(PathBuf::from("/tmp/games")),
             last_cd_image: None,
+            panel_open: false,
         };
         let text = toml::to_string_pretty(&prefs).expect("serialize");
         let parsed: GuiPrefs = toml::from_str(&text).expect("deserialize");
@@ -224,6 +229,7 @@ mod tests {
             parsed.fullscreen,
             KeyBinding::new(true, false, false, "F11")
         );
+        assert!(parsed.panel_open, "panel defaults to open for older files");
     }
 
     #[test]
