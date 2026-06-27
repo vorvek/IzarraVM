@@ -50,7 +50,6 @@ const LABEL: egui::Color32 = egui::Color32::from_rgb(0x6B, 0x62, 0x48);
 const MUTED: egui::Color32 = egui::Color32::from_rgb(0x5C, 0x53, 0x40);
 const LED_ON: egui::Color32 = egui::Color32::from_rgb(0x46, 0xE0, 0x5A);
 const LED_OFF: egui::Color32 = egui::Color32::from_rgb(0x2D, 0x4A, 0x2E);
-const SCREW: egui::Color32 = egui::Color32::from_rgb(0xA8, 0x9E, 0x80);
 
 /// The panel face as f32 RGB, for the logo recolor unmix target.
 const PANEL_FACE_F32: [f32; 3] = [205.0, 195.0, 164.0];
@@ -314,20 +313,6 @@ fn beige_group<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R 
         });
     bevel_edges(ui.painter(), res.response.rect, true);
     res.inner
-}
-
-/// A small Phillips screw dot for the panel and modal corners.
-fn screw(painter: &egui::Painter, center: egui::Pos2) {
-    painter.circle_filled(center, 3.0, SCREW);
-    painter.circle_stroke(center, 3.0, egui::Stroke::new(0.7, BEVEL_LO));
-    let s = egui::Stroke::new(0.7, BEVEL_LO);
-    painter.line_segment(
-        [
-            center + egui::vec2(-2.0, 0.0),
-            center + egui::vec2(2.0, 0.0),
-        ],
-        s,
-    );
 }
 
 /// A small square drive-activity LED.
@@ -1243,37 +1228,55 @@ impl GuiApp {
         self.save_prefs();
     }
 
-    /// The inboard edge tab shown while the panel is open: a full-height beige
-    /// nub with an inward chevron. Clicking collapses the panel.
+    /// The inboard edge tab shown while the panel is open: the whole left column
+    /// is clickable, flat (not a raised button), with a small triangle icon.
+    /// Clicking collapses the panel.
     fn open_handle(&mut self, ui: &mut egui::Ui) {
         let h = ui.available_height().max(40.0);
-        let (rect, resp) = ui.allocate_exact_size(egui::vec2(14.0, h), egui::Sense::click());
-        bevel_rect(ui.painter(), rect, FACEPLATE, true);
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(16.0, h), egui::Sense::click());
+        let fill = if resp.hovered() { BEVEL_HI } else { FACEPLATE };
+        ui.painter().rect_filled(rect, 0.0, fill);
+        // A thin groove separates the handle column from the panel body.
+        ui.painter().line_segment(
+            [rect.right_top(), rect.right_bottom()],
+            egui::Stroke::new(1.0, BEVEL_LO),
+        );
+        // Triangle icon pointing inward (collapse the panel).
         let c = rect.center();
-        let s = egui::Stroke::new(1.5, INK);
-        // Chevron pointing right (push the panel away).
+        let tri = vec![
+            c + egui::vec2(-2.5, -5.0),
+            c + egui::vec2(-2.5, 5.0),
+            c + egui::vec2(3.5, 0.0),
+        ];
         ui.painter()
-            .line_segment([c + egui::vec2(-3.0, -5.0), c + egui::vec2(3.0, 0.0)], s);
-        ui.painter()
-            .line_segment([c + egui::vec2(3.0, 0.0), c + egui::vec2(-3.0, 5.0)], s);
+            .add(egui::Shape::convex_polygon(tri, LABEL, egui::Stroke::NONE));
         if resp.clicked() {
             self.toggle_panel();
         }
     }
 
     /// The collapsed strip pinned to the window's right edge: the whole strip is
-    /// the reopen tab, with an outward chevron. Clicking expands the panel.
+    /// the clickable reopen tab, flat with a small triangle icon. Clicking
+    /// expands the panel.
     fn collapsed_tab(&mut self, ui: &mut egui::Ui) {
         let size = egui::vec2(ui.available_width(), ui.available_height());
         let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
-        bevel_rect(ui.painter(), rect, FACEPLATE, true);
+        let fill = if resp.hovered() { BEVEL_HI } else { PANEL_FACE };
+        ui.painter().rect_filled(rect, 0.0, fill);
+        // A thin groove on the inboard edge, against the black screen.
+        ui.painter().line_segment(
+            [rect.left_top(), rect.left_bottom()],
+            egui::Stroke::new(1.0, BEVEL_LO),
+        );
+        // Triangle icon pointing outward (pull the panel out).
         let c = rect.center();
-        let s = egui::Stroke::new(1.5, INK);
-        // Chevron pointing left (pull the panel out).
+        let tri = vec![
+            c + egui::vec2(2.5, -5.0),
+            c + egui::vec2(2.5, 5.0),
+            c + egui::vec2(-3.5, 0.0),
+        ];
         ui.painter()
-            .line_segment([c + egui::vec2(3.0, -5.0), c + egui::vec2(-3.0, 0.0)], s);
-        ui.painter()
-            .line_segment([c + egui::vec2(-3.0, 0.0), c + egui::vec2(3.0, 5.0)], s);
+            .add(egui::Shape::convex_polygon(tri, LABEL, egui::Stroke::NONE));
         if resp.clicked() {
             self.toggle_panel();
         }
@@ -1393,72 +1396,78 @@ impl GuiApp {
         ui.separator();
         self.drives_ui(ui, running);
 
-        ui.separator();
+        // Push the readout, volume, COM1, and vents to the bottom of the panel.
         let mode = mode.unwrap_or(self.profile.cpu);
-        let line = |ui: &mut egui::Ui, text: String| {
-            ui.label(egui::RichText::new(text).color(MUTED).size(12.0));
-        };
-        line(
-            ui,
-            format!(
-                "GSW-586 - {} mode - {} MHz",
-                mode.canonical_name(),
-                mode.clock_hz() / 1_000_000
-            ),
-        );
-        line(
-            ui,
-            format!(
-                "Speed {:.0}% - {} MB",
-                speed * 100.0,
-                self.profile.memory_mib
-            ),
-        );
-        line(
-            ui,
-            format!(
-                "Host {:.0} fps - {:.0} input/s",
-                self.host_fps, self.input_rate
-            ),
-        );
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.separator();
+                let line = |ui: &mut egui::Ui, text: String| {
+                    ui.label(egui::RichText::new(text).color(MUTED).size(12.0));
+                };
+                line(
+                    ui,
+                    format!(
+                        "GSW-586 - {} mode - {} MHz",
+                        mode.canonical_name(),
+                        mode.clock_hz() / 1_000_000
+                    ),
+                );
+                line(
+                    ui,
+                    format!(
+                        "Speed {:.0}% - {} MB",
+                        speed * 100.0,
+                        self.profile.memory_mib
+                    ),
+                );
+                line(
+                    ui,
+                    format!(
+                        "Host {:.0} fps - {:.0} input/s",
+                        self.host_fps, self.input_rate
+                    ),
+                );
 
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("VOL").color(LABEL).size(11.0));
-            let slider = ui.add(egui::Slider::new(&mut self.volume, 0.0..=1.0).show_value(false));
-            if slider.changed() {
-                self.gain.set(volume_gain(self.volume));
-                self.prefs.master_volume = self.volume;
-                self.save_prefs();
-            }
-            let com1_label = if self.show_com1 { "Hide COM1" } else { "COM1" };
-            if ui.button(com1_label).clicked() {
-                self.show_com1 = !self.show_com1;
-            }
-        });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("VOL").color(LABEL).size(11.0));
+                    let slider =
+                        ui.add(egui::Slider::new(&mut self.volume, 0.0..=1.0).show_value(false));
+                    if slider.changed() {
+                        self.gain.set(volume_gain(self.volume));
+                        self.prefs.master_volume = self.volume;
+                        self.save_prefs();
+                    }
+                    let com1_label = if self.show_com1 { "Hide COM1" } else { "COM1" };
+                    if ui.button(com1_label).clicked() {
+                        self.show_com1 = !self.show_com1;
+                    }
+                });
 
-        // Corner screws and a bottom vent grille, painted over the panel face.
-        let area = ui.min_rect();
-        let painter = ui.painter().clone();
-        for corner in [
-            area.left_top() + egui::vec2(2.0, 2.0),
-            area.right_top() + egui::vec2(-2.0, 2.0),
-            area.left_bottom() + egui::vec2(2.0, -2.0),
-            area.right_bottom() + egui::vec2(-2.0, -2.0),
-        ] {
-            screw(&painter, corner);
-        }
-        ui.add_space(10.0);
-        ui.horizontal(|ui| {
-            let n = 5;
-            let gap = 4.0;
-            let w = (ui.available_width() - gap * (n as f32 - 1.0)) / n as f32;
-            for _ in 0..n {
-                let (slot, _) =
-                    ui.allocate_exact_size(egui::vec2(w.max(4.0), 3.0), egui::Sense::hover());
-                ui.painter().rect_filled(slot, 2.0, RECESS);
-                ui.add_space(gap - 4.0);
-            }
+                ui.add_space(8.0);
+                // Vent grille: four rows, kept clear of the right border.
+                let cols = 5;
+                let rows = 4;
+                let row_h = 3.0;
+                let row_gap = 3.0;
+                let col_gap = 4.0;
+                let right_margin = 8.0;
+                let grille_w = (ui.available_width() - right_margin).max(20.0);
+                let grille_h = rows as f32 * row_h + (rows as f32 - 1.0) * row_gap;
+                let (grille, _) =
+                    ui.allocate_exact_size(egui::vec2(grille_w, grille_h), egui::Sense::hover());
+                let slot_w = (grille_w - col_gap * (cols as f32 - 1.0)) / cols as f32;
+                let p = ui.painter();
+                for r in 0..rows {
+                    for col in 0..cols {
+                        let x = grille.left() + col as f32 * (slot_w + col_gap);
+                        let y = grille.top() + r as f32 * (row_h + row_gap);
+                        let slot =
+                            egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(slot_w, row_h));
+                        p.rect_filled(slot, 1.0, RECESS);
+                    }
+                }
+            });
         });
     }
 
