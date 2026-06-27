@@ -1560,6 +1560,14 @@ struct WinitApp {
     host_kbd: HostKeyboard,
     // Physical Ctrl state, tracked for the Ctrl+F2 capture toggle.
     ctrl_down: bool,
+    // Whether our window has keyboard focus. Raw device key events are global, so
+    // we only forward them to the guest while focused.
+    focused: bool,
+    // Set once any raw DeviceEvent::Key arrives. From then the guest keyboard is
+    // driven by the raw path (immune to the Windows NumLock/fake-shift mangling
+    // that drops numpad releases on the cooked WindowEvent path); the cooked path
+    // is the fallback only until/unless raw events appear (e.g. on Wayland).
+    raw_keys: bool,
     window: Option<Arc<Window>>,
     wgpu: Option<WgpuState>,
     egui_ctx: egui::Context,
@@ -1568,6 +1576,27 @@ struct WinitApp {
     // When the next frame is due. about_to_wait paces redraws to the guest
     // refresh rate with ControlFlow::WaitUntil rather than spinning at host vsync.
     next_frame: Instant,
+}
+
+impl WinitApp {
+    /// Translate one physical key transition to the guest. Ctrl+F2 toggles input
+    /// capture and is withheld from the guest; everything else goes through
+    /// HostKeyboard (which dedupes repeats) and on to the emulation thread. Used
+    /// by both the raw DeviceEvent::Key path and the cooked WindowEvent fallback.
+    fn handle_guest_key(&mut self, code: winit::keyboard::KeyCode, pressed: bool) {
+        use winit::keyboard::KeyCode;
+        if matches!(code, KeyCode::ControlLeft | KeyCode::ControlRight) {
+            self.ctrl_down = pressed;
+        }
+        if pressed && code == KeyCode::F2 && self.ctrl_down {
+            if let Some(window) = self.window.clone() {
+                self.gui.toggle_capture(&window, &mut self.host_kbd);
+            }
+            return;
+        }
+        let codes = self.host_kbd.key(code, pressed);
+        self.gui.send_keys_to_guest(codes);
+    }
 }
 
 impl ApplicationHandler for WinitApp {
@@ -1580,6 +1609,10 @@ impl ApplicationHandler for WinitApp {
             .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0))
             .with_min_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
+        // Ask winit for raw device input while focused, so the guest keyboard can
+        // read DeviceEvent::Key (Win32 Raw Input) instead of the cooked
+        // WindowEvent path, and raw mouse motion for capture.
+        event_loop.listen_device_events(winit::event_loop::DeviceEvents::WhenFocused);
 
         // Standard wgpu init for the surface, adapter, and device.
         let instance = wgpu::Instance::default();
@@ -1630,39 +1663,33 @@ impl ApplicationHandler for WinitApp {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        // Keyboard goes straight to the guest, never to egui (the GUI has no text
-        // widgets). Handle it at the top so its borrows of self.gui/host_kbd/
-        // ctrl_down stay disjoint from the window/egui/wgpu destructure below.
+        // The guest keyboard is driven by raw DeviceEvent::Key (see device_event),
+        // which is immune to the Windows NumLock/fake-shift mangling that drops
+        // numpad releases on this cooked WindowEvent path. The cooked path is the
+        // fallback only until a raw key event arrives (e.g. on Wayland, where
+        // device key events may not fire). Either way keys never reach egui (no
+        // text widgets), so this arm consumes them.
         if let WindowEvent::KeyboardInput {
             event: key_event, ..
         } = &event
         {
-            use winit::keyboard::KeyCode;
-            if let PhysicalKey::Code(code) = key_event.physical_key {
-                let pressed = key_event.state == ElementState::Pressed;
-                if matches!(code, KeyCode::ControlLeft | KeyCode::ControlRight) {
-                    self.ctrl_down = pressed;
+            if !self.raw_keys {
+                if let PhysicalKey::Code(code) = key_event.physical_key {
+                    self.handle_guest_key(code, key_event.state == ElementState::Pressed);
                 }
-                // Ctrl+F2 toggles input capture and is withheld from the guest.
-                if pressed && code == KeyCode::F2 && self.ctrl_down {
-                    if let Some(window) = self.window.clone() {
-                        self.gui.toggle_capture(&window, &mut self.host_kbd);
-                    }
-                    return;
-                }
-                let codes = self.host_kbd.key(code, pressed, key_event.repeat);
-                self.gui.send_keys_to_guest(codes);
             }
             return;
         }
-        // On focus loss, release everything held so a key down at the moment of an
-        // alt-tab (Shift, in a game) does not stick in the guest. This returns
-        // before egui sees the event on purpose: focus loss is only a guest-key
-        // flush, so unlike Focused(true) it is not forwarded to egui.
-        if let WindowEvent::Focused(false) = &event {
-            self.gui.send_keys_to_guest(self.host_kbd.release_all());
-            self.ctrl_down = false;
-            return;
+        if let WindowEvent::Focused(focused) = &event {
+            self.focused = *focused;
+            if !*focused {
+                // Release everything held so a key down at the moment of an
+                // alt-tab (Shift, in a game) does not stick in the guest.
+                self.gui.send_keys_to_guest(self.host_kbd.release_all());
+                self.ctrl_down = false;
+                return;
+            }
+            // Focused(true): fall through so egui also observes regained focus.
         }
         // While captured, pointer buttons go to the guest and egui is skipped;
         // motion comes from DeviceEvent::MouseMotion instead. When not captured,
@@ -1773,16 +1800,28 @@ impl ApplicationHandler for WinitApp {
     }
 
     fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
-        if !self.gui.input_captured {
-            return;
-        }
-        if let DeviceEvent::MouseMotion { delta } = event {
-            let ppp = self
-                .window
-                .as_ref()
-                .map_or(1.0, |w| w.scale_factor() as f32);
-            self.gui
-                .accumulate_guest_motion(delta.0 as f32, delta.1 as f32, ppp);
+        match event {
+            // Raw keyboard (Win32 Raw Input on Windows): true hardware make/break
+            // per physical key, immune to the cooked-path NumLock/fake-shift
+            // mangling that drops numpad releases. This is the guest keyboard.
+            DeviceEvent::Key(raw) => {
+                self.raw_keys = true;
+                if self.focused {
+                    if let PhysicalKey::Code(code) = raw.physical_key {
+                        self.handle_guest_key(code, raw.state == ElementState::Pressed);
+                    }
+                }
+            }
+            // Raw relative pointer motion drives the captured guest cursor.
+            DeviceEvent::MouseMotion { delta } if self.gui.input_captured => {
+                let ppp = self
+                    .window
+                    .as_ref()
+                    .map_or(1.0, |w| w.scale_factor() as f32);
+                self.gui
+                    .accumulate_guest_motion(delta.0 as f32, delta.1 as f32, ppp);
+            }
+            _ => {}
         }
     }
 
@@ -1833,6 +1872,8 @@ pub fn run(
         gui,
         host_kbd: HostKeyboard::default(),
         ctrl_down: false,
+        focused: true,
+        raw_keys: false,
         window: None,
         wgpu: None,
         egui_ctx: egui::Context::default(),

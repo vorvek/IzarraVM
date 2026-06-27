@@ -130,25 +130,26 @@ pub struct HostKeyboard {
 
 impl HostKeyboard {
     /// Make on press, make|0x80 on release, each 0xE0-prefixed for extended
-    /// keys. Empty for keys outside the DOS set, and for host auto-repeat.
+    /// keys. Empty for keys outside the DOS set, and for a press of a key already
+    /// held.
     ///
-    /// Host auto-repeat (repeat=true) is dropped: a held key sends one make, and
-    /// the guest tracks its own down state until the break. Forwarding the host's
-    /// repeats floods the 8042 with makes, which buries a later break (a released
-    /// Shift never reaching the guest) and lags every other key behind the
-    /// backlog. Real typematic is the keyboard's job and belongs in 8042
-    /// emulation, not here; until then no repeat is better than a flood.
-    pub fn key(&mut self, code: KeyCode, pressed: bool, repeat: bool) -> Vec<u8> {
+    /// A press of an already-held key is a hardware/OS auto-repeat make and is
+    /// dropped: the guest tracks its own down state until the break, so repeats
+    /// only flood the 8042, burying a later break (a released key never reaching
+    /// the guest) and lagging everything behind the backlog. Deduping on the
+    /// held set (rather than a repeat flag) works for the raw-input path too,
+    /// which delivers a fresh make per typematic tick with no repeat marker.
+    /// Real typematic is the keyboard's job and belongs in 8042 emulation.
+    pub fn key(&mut self, code: KeyCode, pressed: bool) -> Vec<u8> {
         let Some((make, extended)) = keycode_to_set1(code) else {
             return Vec::new();
         };
         let id = code_id(make, extended);
         let mut out = Vec::with_capacity(2);
         if pressed {
-            if repeat {
+            if !self.held.insert(id) {
                 return Vec::new();
             }
-            self.held.insert(id);
             if extended {
                 out.push(0xe0);
             }
@@ -203,33 +204,35 @@ mod tests {
     #[test]
     fn press_and_release_emit_make_then_break() {
         let mut kb = HostKeyboard::default();
-        assert_eq!(kb.key(KeyCode::ShiftLeft, true, false), vec![0x2a]);
-        assert_eq!(kb.key(KeyCode::KeyA, true, false), vec![0x1e]);
-        assert_eq!(kb.key(KeyCode::KeyA, false, false), vec![0x9e]);
-        assert_eq!(kb.key(KeyCode::ShiftLeft, false, false), vec![0xaa]);
+        assert_eq!(kb.key(KeyCode::ShiftLeft, true), vec![0x2a]);
+        assert_eq!(kb.key(KeyCode::KeyA, true), vec![0x1e]);
+        assert_eq!(kb.key(KeyCode::KeyA, false), vec![0x9e]);
+        assert_eq!(kb.key(KeyCode::ShiftLeft, false), vec![0xaa]);
     }
 
     #[test]
     fn extended_key_carries_the_e0_prefix_both_ways() {
         let mut kb = HostKeyboard::default();
-        assert_eq!(kb.key(KeyCode::ArrowRight, true, false), vec![0xe0, 0x4d]);
-        assert_eq!(kb.key(KeyCode::ArrowRight, false, false), vec![0xe0, 0xcd]);
+        assert_eq!(kb.key(KeyCode::ArrowRight, true), vec![0xe0, 0x4d]);
+        assert_eq!(kb.key(KeyCode::ArrowRight, false), vec![0xe0, 0xcd]);
     }
 
     #[test]
-    fn auto_repeat_is_dropped() {
+    fn duplicate_press_of_held_key_is_dropped() {
         let mut kb = HostKeyboard::default();
-        assert_eq!(kb.key(KeyCode::KeyA, true, false), vec![0x1e]);
-        assert!(kb.key(KeyCode::KeyA, true, true).is_empty()); // host repeat dropped
-        // The single press is tracked once, so release still emits one break.
-        assert_eq!(kb.key(KeyCode::KeyA, false, false), vec![0x9e]);
+        assert_eq!(kb.key(KeyCode::KeyA, true), vec![0x1e]);
+        assert!(kb.key(KeyCode::KeyA, true).is_empty()); // already held: auto-repeat make
+        // The release still emits exactly one break.
+        assert_eq!(kb.key(KeyCode::KeyA, false), vec![0x9e]);
+        // After release a fresh press emits the make again.
+        assert_eq!(kb.key(KeyCode::KeyA, true), vec![0x1e]);
     }
 
     #[test]
     fn release_all_breaks_every_held_key_then_forgets_them() {
         let mut kb = HostKeyboard::default();
-        kb.key(KeyCode::ShiftLeft, true, false);
-        kb.key(KeyCode::ArrowUp, true, false);
+        kb.key(KeyCode::ShiftLeft, true);
+        kb.key(KeyCode::ArrowUp, true);
         let mut codes = kb.release_all();
         codes.sort_unstable();
         // 0xaa (shift break) and 0xe0,0xc8 (arrow-up break), order-independent.
@@ -240,7 +243,7 @@ mod tests {
     #[test]
     fn unmapped_key_emits_nothing_and_is_not_tracked() {
         let mut kb = HostKeyboard::default();
-        assert!(kb.key(KeyCode::F24, true, false).is_empty());
+        assert!(kb.key(KeyCode::F24, true).is_empty());
         assert!(kb.release_all().is_empty());
     }
 }
