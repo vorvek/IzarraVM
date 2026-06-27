@@ -1094,10 +1094,10 @@ impl GuiApp {
             self.cd_access_at = Some(now);
         }
 
-        // A gear at the top-right opens the configuration modal. The horizontal
-        // wrapper keeps it to a single top row (a bare right_to_left layout would
-        // take the whole panel height and centre the button vertically).
+        // The "Machine" heading with the configuration gear right-aligned on the
+        // same row (right_to_left fills the remaining width after the heading).
         ui.horizontal(|ui| {
+            ui.heading("Machine");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .button("\u{2699}")
@@ -1108,8 +1108,6 @@ impl GuiApp {
                 }
             });
         });
-
-        ui.heading("Machine");
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(!running, egui::Button::new("Start"))
@@ -1634,6 +1632,16 @@ impl GuiApp {
     }
 }
 
+/// Bump every UI text style up a couple of points for legibility. Applied once
+/// to the egui context at startup, so it persists across frames.
+fn enlarge_ui_fonts(ctx: &egui::Context) {
+    ctx.style_mut(|style| {
+        for font_id in style.text_styles.values_mut() {
+            font_id.size += 2.0;
+        }
+    });
+}
+
 /// The window title for the current capture state. While captured it tells the
 /// user which key releases the grab; otherwise it is just the product name.
 fn capture_title(captured: bool, release_key: &str) -> String {
@@ -2072,6 +2080,8 @@ pub fn run(
         test_pattern,
         rtc_setup,
     );
+    let egui_ctx = egui::Context::default();
+    enlarge_ui_fonts(&egui_ctx);
     let mut app = WinitApp {
         gui,
         host_kbd: HostKeyboard::default(),
@@ -2083,7 +2093,7 @@ pub fn run(
         raw_keys: false,
         window: None,
         wgpu: None,
-        egui_ctx: egui::Context::default(),
+        egui_ctx,
         egui_winit: None,
         egui_renderer: None,
         next_frame: Instant::now(),
