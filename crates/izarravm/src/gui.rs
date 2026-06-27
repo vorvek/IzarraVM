@@ -61,6 +61,9 @@ const PANEL_FACE_F32: [f32; 3] = [205.0, 195.0, 164.0];
 const LOGO_RGBA: &[u8] = include_bytes!("../assets/izarra3000_logo.rgba");
 const LOGO_W: usize = 94;
 const LOGO_H: usize = 53;
+/// The embedded blob must be exactly LOGO_W x LOGO_H RGBA, or building the
+/// texture would panic. This catches a wrongly regenerated asset at compile time.
+const _: () = assert!(LOGO_RGBA.len() == LOGO_W * LOGO_H * 4);
 /// The source PNG's flat background colour, the unmix origin.
 const LOGO_BG_F32: [f32; 3] = [236.0, 230.0, 223.0];
 
