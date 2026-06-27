@@ -1854,11 +1854,9 @@ impl GuiApp {
             if ui.button("Open C: folder").clicked() {
                 open_in_file_manager(&self.c_drive);
             }
-            ui.label(
-                egui::RichText::new(self.c_drive.display().to_string())
-                    .color(MUTED)
-                    .size(11.0),
-            );
+            // ponytail: blank line holds the box at its prior height now that the
+            // path label is gone.
+            ui.label(egui::RichText::new(" ").size(11.0));
         });
     }
 

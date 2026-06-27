@@ -114,12 +114,18 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
   // below stays in uniform control flow (no per-pixel early return), which WGSL
   // requires for sampling.
   var t = in.uv;
-  var outside = false;
+  var edge = 1.0;
   if (curv > 0.0) {
     let c = in.uv * 2.0 - 1.0;
     let o = c.yx * c.yx * curv;
     let w = (c + c * o) * 0.5 + 0.5;
-    outside = w.x < 0.0 || w.x > 1.0 || w.y < 0.0 || w.y > 1.0;
+    // Antialias the curved border: fade coverage to 0 across the ~1px band
+    // where the warped coord crosses the [0,1] edge, using the screen-space
+    // derivative so only that border ring softens, not the interior image.
+    let d = min(w, vec2<f32>(1.0) - w);
+    let aa = fwidth(w);
+    let cov = clamp(d / max(aa, vec2<f32>(1e-6)), vec2<f32>(0.0), vec2<f32>(1.0));
+    edge = cov.x * cov.y;
     t = clamp(w, vec2<f32>(0.0), vec2<f32>(1.0));
   }
 
@@ -138,7 +144,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
       col = col + vec3<f32>(n * 0.05);
     }
   }
-  if (outside) { col = vec3<f32>(0.0); }
+  col = col * edge;
   col = clamp(col, vec3<f32>(0.0), vec3<f32>(1.0));
   if (u.srgb > 0.5) { col = to_linear(col); }
   return vec4<f32>(col, 1.0);
