@@ -10,9 +10,9 @@ launcher.
 </p>
 
 The goal is to run early to mid 1990s DOS games as if the Izarra had reached
-store shelves. It does not run retail DOS games yet, but it boots the Izarra
-BIOS, enters Toka-DOS, runs the ICOMMAND shell and bundled tools, and exercises
-most of the machine through headless boot tests.
+store shelves. Some games already run, but the VM is far for complete, and performance
+is lacking in a few areas, most importantly on the CPU. The 486 Mode @66 MHz is borderline,
+and the full speed mode is not yet usable.
 
 ## Origin
 
