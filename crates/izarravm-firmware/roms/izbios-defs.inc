@@ -220,6 +220,14 @@
 %define BMX_PKT          0x0910    ; 3-byte PS/2 packet buffer
 %define BMX_SAVE         0x0920    ; 16x16 cursor background save buffer (256 B)
 
+; Extended BIOS data area (EBDA) mouse sub-block. The Rust machine reserves the
+; EBDA at segment 0x9FC0 and the C207 service stores the handler far-pointer here.
+; Offsets match crates/izarravm-machine/src/lib.rs EBDA_MOUSE_HANDLER_OFF (0x02).
+%define EBDA_SEG          0x9FC0
+%define EBDA_MOUSE_HANDLER 0x0002   ; far-pointer: offset word 0x02, segment word 0x04
+%define EBDA_MOUSE_PKT     0x0006   ; 3-byte PS/2 packet assembly buffer
+%define EBDA_MOUSE_IDX     0x0009   ; packet byte-index 0..2
+
 ; Boxed-menu draw scratch (segment 0 RAM, above BMX_SAVE which ends at 0x0A1F).
 ; The renderer is single-threaded, so these are reused freely between helpers.
 ; They MUST be in RAM, not the ROM code segment: a mov into a CS label is dropped

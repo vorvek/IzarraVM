@@ -96,8 +96,13 @@ bios_start:
     ; Unmask IRQ0 (timer) and IRQ1 (keyboard) on the master; the timer ISR is now
     ; installed, so the IRQ0 edges raised while pacing the count-up land on int08.
     in al, PORT_PIC_DATA
-    and al, 0xfc
+    and al, 0xf8                 ; unmask IRQ0 timer, IRQ1 keyboard, IRQ2 cascade
     out PORT_PIC_DATA, al
+    ; Unmask slave IRQ12 (the PS/2 mouse) so INT 74h fires; the slave reaches the
+    ; CPU through the master cascade on IR2, unmasked just above.
+    in al, PORT_PIC2_DATA
+    and al, 0xef                 ; clear bit 4 (IRQ12)
+    out PORT_PIC2_DATA, al
 
     call unreal_init            ; widen FS to 4 GB for peek32/poke32/read_margo_reg
     call result_init           ; lay the empty VDTS header
