@@ -1306,8 +1306,9 @@ impl GuiApp {
         });
     }
 
-    /// The header: the recoloured logo on the left, the config gear on the
-    /// right. The logo texture is built once and cached.
+    /// The top row: the logo aligned left, then the power LED and the square
+    /// Power and Reset buttons (Reset smaller) plus the config gear aligned to
+    /// the right. The logo texture is built once and cached.
     fn panel_header(&mut self, ui: &mut egui::Ui) {
         let tex = self.logo.get_or_insert_with(|| {
             let rgba = recolor_logo(LOGO_RGBA, PANEL_FACE_F32);
@@ -1318,8 +1319,10 @@ impl GuiApp {
         let id = tex.id();
         let scale = 34.0 / LOGO_H as f32;
         let size = egui::vec2(LOGO_W as f32 * scale, LOGO_H as f32 * scale);
+        let running = self.emu.is_some();
         ui.horizontal(|ui| {
             ui.image((id, size));
+            // Right side, added right to left so it reads LED, Power, Reset, gear.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .button("\u{2699}")
@@ -1328,42 +1331,41 @@ impl GuiApp {
                 {
                     self.open_config_dialog();
                 }
-            });
-        });
-    }
-
-    /// The Power (toggle) and Reset row, with the round power LED.
-    fn power_row(&mut self, ui: &mut egui::Ui) {
-        let running = self.emu.is_some();
-        ui.horizontal(|ui| {
-            // Power LED.
-            let (led, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-            let c = led.center();
-            ui.painter()
-                .circle_filled(c, 6.0, if running { LED_ON } else { LED_OFF });
-            if running {
-                ui.painter()
-                    .circle_filled(c, 2.5, egui::Color32::from_rgb(0xC8, 0xFF, 0xCE));
-            }
-            ui.painter()
-                .circle_stroke(c, 6.0, egui::Stroke::new(1.0, BEVEL_LO));
-            // Power is a little wider than Reset and carries the toggle.
-            if ui
-                .add_sized([110.0, 30.0], egui::Button::new("POWER"))
-                .clicked()
-            {
-                if running {
-                    self.stop();
-                } else {
+                let reset = ui
+                    .add_enabled_ui(running, |ui| {
+                        ui.add_sized(
+                            [36.0, 36.0],
+                            egui::Button::new(egui::RichText::new("RESET").size(10.0)),
+                        )
+                    })
+                    .inner;
+                if reset.clicked() {
                     self.start();
                 }
-            }
-            if ui
-                .add_enabled(running, egui::Button::new("RESET"))
-                .clicked()
-            {
-                self.start();
-            }
+                if ui
+                    .add_sized(
+                        [48.0, 48.0],
+                        egui::Button::new(egui::RichText::new("POWER").size(13.0)),
+                    )
+                    .clicked()
+                {
+                    if running {
+                        self.stop();
+                    } else {
+                        self.start();
+                    }
+                }
+                let (led, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                let c = led.center();
+                ui.painter()
+                    .circle_filled(c, 6.0, if running { LED_ON } else { LED_OFF });
+                if running {
+                    ui.painter()
+                        .circle_filled(c, 2.5, egui::Color32::from_rgb(0xC8, 0xFF, 0xCE));
+                }
+                ui.painter()
+                    .circle_stroke(c, 6.0, egui::Stroke::new(1.0, BEVEL_LO));
+            });
         });
     }
 
@@ -1404,8 +1406,6 @@ impl GuiApp {
         }
 
         self.panel_header(ui);
-        ui.add_space(8.0);
-        self.power_row(ui);
         ui.separator();
         self.drives_ui(ui, running);
 
