@@ -711,6 +711,9 @@ pub struct GuiApp {
     // Distira/Glide render worker count. Persisted in the GUI prefs and applied
     // live to the emulation thread.
     glide_render_threads: u8,
+    // Whether the CRT-emulation shader pass is on. Persisted in the GUI prefs;
+    // read by monitor_ui each frame and passed to the shader as a uniform flag.
+    crt_emulation: bool,
     // Persisted GUI prefs (volume, last mounts) and where they live on disk. The
     // file sits next to the C: root and is rewritten on a change.
     prefs: GuiPrefs,
@@ -748,6 +751,7 @@ impl GuiApp {
         let prefs = GuiPrefs::load(&prefs_path);
         let volume = prefs.master_volume.clamp(0.0, 1.0);
         let glide_render_threads = prefs.glide_render_threads;
+        let crt_emulation = prefs.crt_emulation;
         let gain = SharedGain::new(volume_gain(volume));
         // Restore the last mount if the source still exists on disk. An image
         // takes priority over a folder when both are recorded.
@@ -788,6 +792,7 @@ impl GuiApp {
             volume,
             gain,
             glide_render_threads,
+            crt_emulation,
             prefs,
             prefs_path,
         };
@@ -1115,6 +1120,17 @@ impl GuiApp {
                 self.set_glide_render_threads(self.glide_render_threads);
             }
         });
+
+        ui.separator();
+        ui.heading("Display");
+        if ui
+            .checkbox(&mut self.crt_emulation, "CRT emulation")
+            .on_hover_text("Scanlines, shadow mask, and halation of a mid-90s SVGA monitor")
+            .changed()
+        {
+            self.prefs.crt_emulation = self.crt_emulation;
+            self.save_prefs();
+        }
 
         ui.separator();
         ui.heading("Audio");
