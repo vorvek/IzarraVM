@@ -130,7 +130,10 @@ mod tests {
         assert_eq!(parsed, GuiPrefs::default());
         assert_eq!(parsed.master_volume, DEFAULT_VOLUME);
         assert_eq!(parsed.glide_render_threads, 2);
-        assert!(parsed.crt_emulation, "CRT emulation defaults on for older files");
+        assert!(
+            parsed.crt_emulation,
+            "CRT emulation defaults on for older files"
+        );
     }
 
     #[test]
