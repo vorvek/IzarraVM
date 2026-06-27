@@ -187,8 +187,8 @@ struct Frame {
     cd_accesses: u64,      // monotonic CD access count, drives the LED
 }
 
-/// The guest cursor coordinate range the INT 33h mouse uses (matches the machine's
-/// MOUSE_MAX_X / MOUSE_MAX_Y): x spans 0..639, y spans 0..199.
+/// The guest cursor coordinate range: x spans 0..639, y spans 0..199. These are
+/// the GUI's own virtual pointer limits; they match the INT 33h driver's range.
 const MOUSE_GUEST_MAX_X: i32 = 639;
 const MOUSE_GUEST_MAX_Y: i32 = 199;
 
@@ -200,6 +200,9 @@ enum Command {
     /// framebuffer rect maps straight to the guest cursor (no relative drift, no
     /// confinement), which the BIOS menus read through INT 33h. Capture only.
     MouseAbsolute(i32, i32, u8),
+    /// Set the machine's last-known absolute mouse position without injecting
+    /// a motion event. Sent on capture entry so the first real delta is small.
+    SeedMouseOrigin(i32, i32),
     /// Mount a floppy image into drive A: live. `flush_path` is the source IMG to
     /// rewrite a dirty image to on eject; folder mounts pass None (read-only).
     MountFloppy {
@@ -367,6 +370,10 @@ impl Emulator {
         let _ = self.commands.send(Command::MouseAbsolute(x, y, buttons));
     }
 
+    fn send_mouse_origin(&self, x: i32, y: i32) {
+        let _ = self.commands.send(Command::SeedMouseOrigin(x, y));
+    }
+
     fn mount_floppy(&self, bytes: Vec<u8>, flush_path: Option<PathBuf>) {
         let _ = self
             .commands
@@ -488,6 +495,7 @@ fn emulate(
                 Ok(Command::MouseAbsolute(x, y, buttons)) => {
                     machine.set_mouse_absolute(x, y, buttons)
                 }
+                Ok(Command::SeedMouseOrigin(x, y)) => machine.seed_mouse_origin(x, y),
                 Ok(Command::MountFloppy { bytes, flush_path }) => {
                     match machine.mount_floppy(bytes) {
                         Ok(()) => floppy_flush_path = flush_path,
@@ -973,6 +981,10 @@ impl GuiApp {
             // Start the guest cursor centred; raw motion accumulates from there.
             self.abs_x = MOUSE_GUEST_MAX_X as f32 / 2.0;
             self.abs_y = MOUSE_GUEST_MAX_Y as f32 / 2.0;
+            // Seed the machine's last-known position so the first delta is small.
+            if let Some(emu) = &self.emu {
+                emu.send_mouse_origin(self.abs_x as i32, self.abs_y as i32);
+            }
             self.sync_guest_locks();
             let _ = window
                 .set_cursor_grab(winit::window::CursorGrabMode::Locked)
