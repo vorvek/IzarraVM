@@ -19899,24 +19899,11 @@ mod tests {
     }
 
     #[test]
-    fn c200_enable_lets_injected_motion_raise_irq12() {
-        let mut m = int15_machine(16);
-        // The 8042 command byte needs IRQ12 (bit1) enabled so a latched aux byte
-        // arms IRQ12. int15_machine boots a zeroed ROM that never runs the keyboard
-        // BIOS, so set it here the way that BIOS would.
-        m.enable_8042_irq12();
-        m.cpu.registers.set_eax(0xC200);
-        m.cpu.registers.set_ebx(0x0100); // BH=1 enable
-        m.handle_int15();
-        m.inject_mouse(4, -2, 0x01);
-        assert!(m.irq12_pending(), "C200 enable lets a packet raise IRQ12");
-    }
-
-    #[test]
     fn c200_enable_arms_irq12_in_the_command_byte_itself() {
         // Without any manual command-byte setup: a C200 enable must arm IRQ12 on
         // its own, the way a real PS/2 BIOS does, so the MOUSE.COM install path
-        // (which only issues INT 15h C205/C207/C200) gets working interrupts.
+        // (which only issues INT 15h C205/C207/C200) gets working interrupts. The
+        // injected packet then raises IRQ12 with no separate command-byte write.
         let mut m = int15_machine(16);
         m.cpu.registers.set_eax(0xC200);
         m.cpu.registers.set_ebx(0x0100); // BH=1 enable
@@ -19929,9 +19916,27 @@ mod tests {
     }
 
     #[test]
-    fn c200_disable_clears_the_irq12_arming() {
-        // Enabling then disabling the pointing device must clear the command-byte
-        // IRQ12 bit again, so a disabled mouse raises no interrupt.
+    fn c205_initialize_arms_irq12_in_the_command_byte() {
+        // C205 is MOUSE.COM's first BIOS call. Like C200 enable, it must arm IRQ12
+        // on its own with no prior command-byte setup, so an injected packet raises
+        // the interrupt.
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0xC205);
+        m.handle_int15();
+        m.inject_mouse(4, -2, 0x01);
+        assert!(
+            m.irq12_pending(),
+            "C205 initialize alone arms IRQ12 (no separate command-byte write needed)"
+        );
+    }
+
+    #[test]
+    fn c200_disable_leaves_no_irq12_pending() {
+        // The BIOS-level mirror of the keyboard-level edge-clear test: enabling
+        // then disabling the pointing device through C200 leaves a disabled mouse
+        // that raises no IRQ12 (C200 disable both turns reporting off and clears
+        // the command-byte IRQ12 bit). The keyboard unit test
+        // disable_clears_a_pending_irq12_edge covers the already-latched-edge case.
         let mut m = int15_machine(16);
         m.cpu.registers.set_eax(0xC200);
         m.cpu.registers.set_ebx(0x0100); // BH=1 enable

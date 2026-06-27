@@ -27,6 +27,8 @@ use izarravm_firmware::izarra_bios;
 use izarravm_machine::{Machine, MachineProfile, StopReason};
 
 // MTEST.COM, assembled from tests/fixtures/mtest.asm and committed alongside it.
+// Regenerate after editing the asm: `nasm -f bin mtest.asm -o MTEST.COM` from the
+// fixtures dir (same rebuild contract as the committed tokados.rom blob).
 const MTEST_COM: &[u8] = include_bytes!("fixtures/MTEST.COM");
 
 // AUTOEXEC.BAT: load the resident mouse driver, then run the self-test. MOUSE.COM

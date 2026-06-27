@@ -219,6 +219,9 @@ impl Keyboard8042 {
             self.latch_next();
         } else {
             self.command_byte &= !0x02;
+            // A byte latched while the interrupt was enabled may have left the
+            // edge armed; drop it so a disabled mouse raises no IRQ12.
+            self.irq12_armed = false;
         }
     }
 
@@ -588,6 +591,24 @@ mod tests {
         let b0 = kbd.read_port(0x60).unwrap();
         assert_eq!(b0 & 0x08, 0x08, "sync bit set on packet byte 0");
         assert_eq!(b0 & 0x01, 0x01, "left button reported");
+    }
+
+    #[test]
+    fn disable_clears_a_pending_irq12_edge() {
+        // Enable IRQ12 and reporting, then queue a packet so a byte latches and
+        // arms the IRQ12 edge. Disable the mouse interrupt before the run loop
+        // consumes that edge (take_irq12). The disable must drop the pending edge,
+        // so a disabled mouse raises no interrupt.
+        let mut kbd = Keyboard8042::default();
+        kbd.set_mouse_irq(true); // command byte bit1 = IRQ12 enabled
+        kbd.set_mouse_reporting(true);
+        let pulse = kbd.inject_mouse(5, -3, 0x01);
+        assert!(pulse, "an armed mouse byte requests IRQ12 while enabled");
+        kbd.set_mouse_irq(false); // disable before take_irq12 consumes the edge
+        assert!(
+            !kbd.take_irq12(),
+            "disabling the mouse interrupt drops the pending IRQ12 edge"
+        );
     }
 
     #[test]
