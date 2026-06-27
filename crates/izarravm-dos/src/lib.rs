@@ -7456,6 +7456,14 @@ mod tests {
     }
 
     #[test]
+    fn default_autoexec_loads_mouse_driver() {
+        assert!(
+            DEFAULT_AUTOEXEC_BAT.contains("MOUSE\r\n"),
+            "default AUTOEXEC.BAT must load the mouse driver"
+        );
+    }
+
+    #[test]
     fn repair_backs_up_custom_config_sys() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
