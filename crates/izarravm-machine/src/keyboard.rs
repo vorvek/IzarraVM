@@ -248,11 +248,16 @@ impl Keyboard8042 {
     /// any scancode already latched is pushed back to the front of the queue rather
     /// than dropped. This keeps a self-test from eating host keystrokes.
     fn respond_immediately(&mut self, response: u8) {
-        if let Some(latched) = self.output.take() {
-            if self.output_is_aux {
-                self.mouse.queue.push_front(latched);
-            } else {
-                self.queue.push_front(latched);
+        // Only a fresh (OBF-set) byte gets pushed back; a stale byte left in the
+        // output register after a read (OBF clear) was already consumed and must
+        // not be re-queued.
+        if self.status & STATUS_OBF != 0 {
+            if let Some(latched) = self.output.take() {
+                if self.output_is_aux {
+                    self.mouse.queue.push_front(latched);
+                } else {
+                    self.queue.push_front(latched);
+                }
             }
         }
         self.output = Some(response);
@@ -269,7 +274,10 @@ impl Keyboard8042 {
     /// is pending. A mouse byte sets the AUX status bit and arms IRQ12 instead of
     /// IRQ1.
     fn latch_next(&mut self) {
-        if self.output.is_some() {
+        // A fresh byte (OBF set) is still waiting to be read; do not overwrite it.
+        // A stale byte left after a read (OBF clear) may be overwritten by the
+        // next queued byte.
+        if self.status & STATUS_OBF != 0 {
             return;
         }
         // Command-byte bit4 masks the keyboard, bit5 the aux device. A masked
@@ -335,10 +343,16 @@ impl Keyboard8042 {
     pub fn read_port(&mut self, port: u16) -> Option<u8> {
         match port {
             0x60 => {
-                let value = self.output.take().unwrap_or(0x00);
-                self.output_is_aux = false;
+                // Real 8042: a read clears OBF but leaves the byte in the output
+                // register, so a re-read before a new byte arrives returns the same
+                // (stale) value. A guest INT 09h that reads 0x60 and then chains to
+                // the BIOS handler (which reads 0x60 again) depends on this; Prince
+                // of Persia does exactly that and reads its shift state from the
+                // BDA flag the BIOS sets from that second read.
+                let value = self.output.unwrap_or(0x00);
                 self.status &= !(STATUS_OBF | STATUS_AUX);
-                self.latch_next(); // re-arms IRQ if more is queued
+                self.output_is_aux = false;
+                self.latch_next(); // latch the next queued byte now that OBF is clear
                 Some(value)
             }
             0x64 => Some(self.status),
@@ -422,6 +436,30 @@ mod tests {
             0,
             "OBF clears after read"
         );
+    }
+
+    #[test]
+    fn reread_returns_stale_byte_until_next_arrives() {
+        // A real 8042 keeps the last byte in the output register after a read; a
+        // re-read (the BIOS handler reading 0x60 after a game's INT 09h already
+        // did) returns the same value rather than 0. Prince of Persia's shift
+        // state depends on this.
+        let mut kbd = Keyboard8042::default();
+        kbd.push_scancodes(&[0x2a]); // shift make
+        assert_eq!(kbd.read_port(0x60), Some(0x2a));
+        assert_eq!(
+            kbd.read_port(0x64).unwrap() & STATUS_OBF,
+            0,
+            "OBF clears after the read"
+        );
+        assert_eq!(
+            kbd.read_port(0x60),
+            Some(0x2a),
+            "re-read returns the stale byte, not 0"
+        );
+        kbd.push_scancodes(&[0xaa]); // shift break replaces it
+        assert_eq!(kbd.read_port(0x60), Some(0xaa));
+        assert_eq!(kbd.read_port(0x60), Some(0xaa), "now stale on 0xaa");
     }
 
     #[test]
