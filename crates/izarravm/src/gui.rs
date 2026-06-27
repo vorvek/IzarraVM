@@ -37,8 +37,8 @@ const EMU_SLICE: Duration = Duration::from_millis(1);
 /// fast reads reads as a steady glow rather than an imperceptible flicker.
 const LED_GLOW: Duration = Duration::from_millis(150);
 
-/// Pack 0x00RRGGBB words into an opaque egui image.
-fn words_to_color_image(words: &[u32], width: usize, height: usize) -> egui::ColorImage {
+/// Pack 0x00RRGGBB words into a tightly-packed opaque RGBA8 buffer for upload.
+fn words_to_rgba(words: &[u32], width: usize, height: usize) -> Vec<u8> {
     let mut rgba = vec![0u8; width * height * 4];
     for (i, &color) in words.iter().enumerate().take(width * height) {
         let o = i * 4;
@@ -47,37 +47,12 @@ fn words_to_color_image(words: &[u32], width: usize, height: usize) -> egui::Col
         rgba[o + 2] = (color & 0xff) as u8;
         rgba[o + 3] = 0xff;
     }
-    egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba)
+    rgba
 }
 
 /// Map palette-indexed pixels (mode 13h, the VGA raster core) to 0x00RRGGBB words.
 fn palette_words(pixels: &[u8], palette: &[u32; 256]) -> Vec<u32> {
     pixels.iter().map(|&i| palette[i as usize]).collect()
-}
-
-/// Nearest-neighbour integer upscale per axis, as large as fits the target
-/// without exceeding it. The caller then lets egui stretch the small remainder
-/// with bilinear filtering, which gives a sharp-bilinear look without a shader.
-fn sharp_prescale(image: &egui::ColorImage, target_w: usize, target_h: usize) -> egui::ColorImage {
-    let [source_w, source_h] = image.size;
-    if source_w == 0 || source_h == 0 {
-        return image.clone();
-    }
-    let factor_x = (target_w / source_w).max(1);
-    let factor_y = (target_h / source_h).max(1);
-    if factor_x == 1 && factor_y == 1 {
-        return image.clone();
-    }
-    let dest_w = source_w * factor_x;
-    let dest_h = source_h * factor_y;
-    let mut pixels = Vec::with_capacity(dest_w * dest_h);
-    for y in 0..dest_h {
-        let source_row = (y / factor_y) * source_w;
-        for x in 0..dest_w {
-            pixels.push(image.pixels[source_row + x / factor_x]);
-        }
-    }
-    egui::ColorImage::new([dest_w, dest_h], pixels)
 }
 
 /// Refill the pacing credit by the wall time elapsed this slice, capping the
@@ -670,7 +645,6 @@ pub struct GuiApp {
     // emulation thread gets a Send sink cloned from it.
     audio: Option<AudioPlayer>,
     emu: Option<Emulator>,
-    texture: Option<egui::TextureHandle>,
     // Guest frame counter of the texture currently uploaded, so we rebuild it
     // only when a new frame is presented rather than on every update().
     frame_seq: u64,
@@ -772,8 +746,7 @@ impl GuiApp {
             abs_y: 0.0,
             audio,
             emu: None,
-            texture: None,
-            frame_seq: 0,
+            frame_seq: u64::MAX,
             metrics_mark: None,
             frames_since: 0,
             events_since: 0,
@@ -828,8 +801,7 @@ impl GuiApp {
             self.gain.clone(),
             self.glide_render_threads,
         ));
-        self.texture = None;
-        self.frame_seq = 0;
+        self.frame_seq = u64::MAX;
         self.guest_locks = [false; HOST_LOCK_KEYS.len()];
         // A fresh machine boots with an empty drive A:, then we remount whatever
         // was in it so a Reset keeps the disk in the drive (no race to re-mount
@@ -844,8 +816,7 @@ impl GuiApp {
         if let Some(mut emu) = self.emu.take() {
             emu.shutdown();
         }
-        self.texture = None;
-        self.frame_seq = 0;
+        self.frame_seq = u64::MAX;
         self.floppy_label = None;
         self.floppy_source = None;
         self.guest_locks = [false; HOST_LOCK_KEYS.len()];
@@ -880,7 +851,7 @@ fn fit_4_3(area: egui::Rect) -> egui::Rect {
 }
 
 impl GuiApp {
-    fn monitor_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn monitor_ui(&mut self, ui: &mut egui::Ui) {
         let rect = fit_4_3(ui.max_rect());
         // Record the image rect so the capture path can scale host pointer motion
         // across it into guest pixels.
@@ -889,45 +860,33 @@ impl GuiApp {
             ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
             return;
         };
-        // Build a new native image only when the guest frame counter advanced,
-        // and only hold the snapshot lock for that copy. The prescale (which
-        // depends on the live rect) and the GPU upload happen after the unlock.
-        let rebuilt = {
+        // Pull a fresh framebuffer only when the guest frame counter advanced;
+        // otherwise the persistent GPU texture is reused. The lock is held only
+        // for the copy.
+        let frame = {
             let f = emu.frame.lock().expect("frame snapshot poisoned");
-            if (self.texture.is_none() || f.seq != self.frame_seq) && f.width > 0 {
+            if f.width > 0 && f.seq != self.frame_seq {
                 self.frame_seq = f.seq;
-                Some(words_to_color_image(&f.words, f.width, f.height))
+                Some(crate::crt::CrtFrame {
+                    rgba: words_to_rgba(&f.words, f.width, f.height),
+                    width: f.width as u32,
+                    height: f.height as u32,
+                })
             } else {
                 None
             }
         };
-        if let Some(native) = rebuilt {
-            let image = sharp_prescale(
-                &native,
-                rect.width().round() as usize,
-                rect.height().round() as usize,
-            );
-            let options = egui::TextureOptions::LINEAR;
-            match &mut self.texture {
-                Some(t) => t.set(image, options),
-                None => {
-                    self.texture = Some(ctx.load_texture("monitor", image, options));
-                }
-            }
-        }
-        match &self.texture {
-            Some(texture) => {
-                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-                ui.painter()
-                    .image(texture.id(), rect, uv, egui::Color32::WHITE);
-            }
-            None => {
-                ui.painter().rect_filled(rect, 0.0, egui::Color32::BLACK);
-            }
-        }
-        // Clicking the screen requests input capture. The actual cursor grab and
-        // hide happen later in toggle_capture (run from the event loop, which owns
-        // the winit Window); here we only flag the intent.
+        // Paint the guest screen through the wgpu shader pass: aspect-fill to the
+        // 4:3 rect, sharp upscale, and the CRT model when enabled.
+        ui.painter().add(egui_wgpu::Callback::new_paint_callback(
+            rect,
+            crate::crt::CrtCallback {
+                frame,
+                crt_on: self.crt_emulation,
+            },
+        ));
+        // Clicking the screen requests input capture (handled later by the event
+        // loop, which owns the winit Window).
         let response = ui.interact(rect, ui.id().with("monitor-capture"), egui::Sense::click());
         if response.clicked() && !self.input_captured {
             self.want_capture = true;
@@ -1503,7 +1462,7 @@ impl GuiApp {
             .exact_width(320.0)
             .resizable(false)
             .show(ctx, |ui| self.controls_ui(ui));
-        egui::CentralPanel::default().show(ctx, |ui| self.monitor_ui(ui, ctx));
+        egui::CentralPanel::default().show(ctx, |ui| self.monitor_ui(ui));
         // The COM1 console floats over the central panel when toggled open.
         if self.show_com1 {
             self.com1_window(ctx);
@@ -1665,7 +1624,10 @@ impl ApplicationHandler for WinitApp {
             None,
             None,
         );
-        let egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
+        let mut egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
+        egui_renderer
+            .callback_resources
+            .insert(crate::crt::CrtResources::new(&device, &queue, format));
 
         self.egui_renderer = Some(egui_renderer);
         self.egui_winit = Some(egui_winit);
@@ -1956,36 +1918,12 @@ mod tests {
         let words = palette_words(&pixels, &palette);
         assert_eq!(words.len(), 4);
         assert_eq!(words[1], 0x00AB_CDEF);
-        let image = words_to_color_image(&words, 2, 2);
-        assert_eq!(image.size, [2, 2]);
-        let p = image.pixels[1];
-        assert_eq!((p.r(), p.g(), p.b()), (0xAB, 0xCD, 0xEF));
-    }
-
-    #[test]
-    fn prescale_uses_per_axis_integer_factor() {
-        // 2x1 source, target 6x6: x factor 3, y factor 6.
-        let src = egui::ColorImage::new(
-            [2, 1],
-            vec![
-                egui::Color32::from_rgb(10, 0, 0),
-                egui::Color32::from_rgb(0, 20, 0),
-            ],
+        let rgba = words_to_rgba(&words, 2, 2);
+        assert_eq!(rgba.len(), 16);
+        // Pixel 1 is 0x00ABCDEF -> R=AB, G=CD, B=EF, A=FF.
+        assert_eq!(
+            (rgba[4], rgba[5], rgba[6], rgba[7]),
+            (0xAB, 0xCD, 0xEF, 0xFF)
         );
-        let out = sharp_prescale(&src, 6, 6);
-        assert_eq!(out.size, [6, 6]);
-        // First source pixel fills the left 3 columns, second fills the right 3.
-        assert_eq!(out.pixels[0], egui::Color32::from_rgb(10, 0, 0));
-        assert_eq!(out.pixels[2], egui::Color32::from_rgb(10, 0, 0));
-        assert_eq!(out.pixels[3], egui::Color32::from_rgb(0, 20, 0));
-        // Second output row repeats the first (vertical factor applied).
-        assert_eq!(out.pixels[6], egui::Color32::from_rgb(10, 0, 0));
-    }
-
-    #[test]
-    fn prescale_is_identity_when_target_smaller() {
-        let src = egui::ColorImage::new([4, 4], vec![egui::Color32::BLACK; 16]);
-        let out = sharp_prescale(&src, 3, 3);
-        assert_eq!(out.size, [4, 4]);
     }
 }

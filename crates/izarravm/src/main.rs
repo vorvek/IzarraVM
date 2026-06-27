@@ -1,4 +1,5 @@
 mod cmos;
+mod crt;
 mod gui;
 mod prefs;
 
