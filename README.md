@@ -44,7 +44,7 @@ reproduces the Izarra 3000 exactly as it was built.
 | CPU | GSW-586, a K6-class 266 MHz part on a 66 MHz bus. Toka can throttle it to 486DX2 66 MHz or 386DX 25 MHz without rebooting. |
 | Memory | 24 MB SDRAM, with Toka mapping itself out of conventional memory when DOS games need the first 640 KB. |
 | Graphics | VEGA chipset: Margo 2D, Distira 3D, 4 MB video memory, VESA VBE 2.0, VGA mode 13h, and up to 1024x768 at 32-bit color. |
-| Sound | Resonique 2: Sound Blaster 16 compatible digital audio, OPL3 FM, MPU-401 MIDI, wavetable daughterboard, and Yamaha ADPCM-B playback. |
+| Sound | ReSonique 2: Sound Blaster 16 compatible digital audio, OPL3 FM, MPU-401 MIDI, wavetable daughterboard, and Yamaha ADPCM-B playback. |
 | Storage | 3.6 GB IDE hard disk, 12x ATAPI CD-ROM with CD audio, and a 1.44 MB floppy drive. |
 | Display | 15-inch CRT, tuned for 320x200 DOS modes and 1024x768 desktop output. |
 | Firmware | 2 MB ROM with the Izarra BIOS, Toka Disk System, ICOMMAND, and bundled tools. |
