@@ -1,34 +1,38 @@
 # IzarraVM
 
-IzarraVM is a Rust emulator for the Izarra 3000, a fictional DOS-era games
-computer that almost shipped in 1997. It models one fixed machine: custom video
-and audio around an MS-DOS compatible core, with Toka Disk System as its ROM
-shell and launcher.
+IzarraVM is a Rust emulator for the Izarra 3000, a DOS-era games computer that
+almost shipped in 1997. It models one fixed machine: custom video and audio
+around an MS-DOS compatible core, with Toka Disk System as its ROM shell and
+launcher.
+
+<p align="center">
+  <img src="docs/izarra-3000-chassis.jpg" alt="The Izarra 3000 desktop tower" width="380">
+</p>
 
 The goal is to run early to mid 1990s DOS games as if the Izarra had reached
 store shelves. It does not run retail DOS games yet, but it boots the Izarra
 BIOS, enters Toka-DOS, runs the ICOMMAND shell and bundled tools, and exercises
 most of the machine through headless boot tests.
 
-## Fictional Origin
+## Origin
 
-There was never a real Izarra 3000. In the project's fiction, Izarra Computer
-Systems started in 1992 as a small Spanish workstation shop that built graphics
-terminals for schools and local studios. Its engineers wanted a home computer
-that could run DOS games without feeling like a beige PC, so they designed a
-tight motherboard around VGA, MIDI, CD-ROM audio, and a friendly ROM shell.
+Izarra Computer Systems started in 1992 as a small Spanish workstation shop that
+built graphics terminals for schools and local studios. Its engineers wanted a
+home computer that could run DOS games without feeling like a beige PC, so they
+designed a tight motherboard around VGA, MIDI, CD-ROM audio, and a friendly ROM
+shell.
 
 The prototype was fast, but the timing was brutal. Windows 95 made compatibility
 the only spec retailers cared about, so Izarra kept adding bridge chips and
 fallback modes to reassure publishers. The board became expensive and late. In
 April 1997, with the first production run still in testing and suppliers asking
-for cash, the company filed for bankruptcy. In this fiction, IzarraVM is what
-survived in the lab notes.
+for cash, the company filed for bankruptcy. IzarraVM is what survived in the lab
+notes.
 
-## Fictional Tech Specs
+## Tech Specs
 
-The emulator targets one fixed machine. None of this is user-selectable; the
-point is to make the Izarra 3000 feel like a real, opinionated computer.
+The emulator targets one fixed machine. None of this is user-selectable; it
+reproduces the Izarra 3000 exactly as it was built.
 
 | Area | Izarra 3000 hardware |
 | --- | --- |
