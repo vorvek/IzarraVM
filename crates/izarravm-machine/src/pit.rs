@@ -156,6 +156,18 @@ impl Counter {
                     self.state = CounterState::WaitGate;
                 }
             }
+            // Modes 2 and 3 are periodic. A count written while the counter is
+            // already running is latched into `reload` (done by the caller) and
+            // adopted at the next terminal count / half-cycle by step_counting,
+            // which reloads from `reload`. It must NOT reset the live count, or a
+            // guest that rewrites the count faster than one period (Prince of
+            // Persia's speaker driver does) would never complete a cycle and the
+            // tone would die. Only the initial load takes the immediate LoadDelay.
+            2 | 3 => {
+                if self.state != CounterState::Counting {
+                    self.state = CounterState::LoadDelay;
+                }
+            }
             _ => self.state = CounterState::LoadDelay,
         }
     }
@@ -838,6 +850,50 @@ mod tests {
         pit.tick(1); // load
         let (high, low) = measure_high_low(&mut pit);
         assert_eq!((high, low), (3, 3));
+    }
+
+    #[test]
+    fn pop_speaker_count_rewrites_reproduction() {
+        // Reproduce Prince of Persia's PC-speaker driver from the captured writes:
+        // channel 2 set to mode 3, LSB+MSB, binary (control word 0xB6), GATE2 high,
+        // then a fresh 16-bit count (~16344) written every ~408 PIT input clocks.
+        // Count 16344 is ~73 Hz, so OUT should toggle about once per 8172-clock half
+        // period (~2 times over this run), NOT once per count rewrite.
+        let mut pit = Pit::default();
+        pit.write_port(0x43, 0xB6); // counter 2, LSB+MSB, mode 3, binary
+        pit.set_gate(2, true);
+        let count: u16 = 16344; // ~73 Hz: half-period 8172 input clocks
+        let updates = 60usize;
+        let ticks_between = 408usize;
+        let mut transitions = 0usize;
+        let mut prev = pit.channel_out(2);
+        for _ in 0..updates {
+            pit.write_port(0x42, (count & 0xff) as u8); // LSB
+            pit.write_port(0x42, (count >> 8) as u8); // MSB
+            for _ in 0..ticks_between {
+                pit.tick(1);
+                let now = pit.channel_out(2);
+                if now != prev {
+                    transitions += 1;
+                    prev = now;
+                }
+            }
+        }
+        let total_ticks = updates * ticks_between;
+        let expected = total_ticks / (count as usize / 2);
+        println!(
+            "PoP repro: {transitions} OUT transitions over {total_ticks} ticks, {updates} rewrites; \
+             real-hw expects ~{expected}"
+        );
+        // The tone must actually sound at its programmed rate. 0 = silent (each
+        // rewrite reset the live counter); ~{updates} = OUT wrongly coupled to the
+        // rewrite cadence. Correct is ~{expected} toggles for the 73 Hz tone.
+        assert!(
+            (2..=8).contains(&transitions),
+            "mode-3 count 16344 should sound at ~73 Hz (~{expected} OUT toggles over \
+             {total_ticks} ticks), but got {transitions}: a mid-count rewrite must not \
+             reset the running counter"
+        );
     }
 
     #[test]
