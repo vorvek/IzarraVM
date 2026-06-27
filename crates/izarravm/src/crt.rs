@@ -81,10 +81,14 @@ fn shadow_mask(col: vec3<f32>, frag: vec2<f32>, pitch: f32, strength: f32) -> ve
   return col * m;
 }
 
-// Cheap hash for the Ye Olde animated grain.
-fn hash21(p: vec2<f32>) -> f32 {
-  let h = dot(p, vec2<f32>(127.1, 311.7));
-  return fract(sin(h) * 43758.5453);
+// Decorrelated grain hash (Dave Hoskins, "hash without sine"): three inputs to
+// one value, no sin() iso-lines to band along. Time goes in as the third input
+// so each frame reseeds the whole field instead of translating it, which is what
+// produced the diagonal scrolling stripes.
+fn hash13(p: vec3<f32>) -> f32 {
+  var q = fract(p * 0.1031);
+  q = q + dot(q, q.zyx + 31.32);
+  return fract((q.x + q.y) * q.z);
 }
 
 // Exact sRGB -> linear, to cancel an sRGB render target's encode.
@@ -139,8 +143,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     col = shadow_mask(col, in.pos.xy, mask_pitch, mask_strength);
     col = col * brightness;
     if (yeolde) {
-      // Faint grain that shifts every frame.
-      let n = hash21(in.pos.xy + vec2<f32>(u.time * 53.0, u.time * 91.0)) - 0.5;
+      // Faint grain reseeded every frame.
+      let n = hash13(vec3<f32>(in.pos.xy, u.time * 100.0)) - 0.5;
       col = col + vec3<f32>(n * 0.05);
     }
   }
