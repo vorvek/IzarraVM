@@ -37,6 +37,24 @@ const EMU_SLICE: Duration = Duration::from_millis(1);
 /// fast reads reads as a steady glow rather than an imperceptible flicker.
 const LED_GLOW: Duration = Duration::from_millis(150);
 
+/// The beige front-panel palette. One warm-beige family, dark-brown ink, and
+/// the LED greens. Shared by the panel, the drive bays, and the config modal so
+/// the whole interface reads as one moulded plastic face.
+const PANEL_FACE: egui::Color32 = egui::Color32::from_rgb(0xCD, 0xC3, 0xA4);
+const FACEPLATE: egui::Color32 = egui::Color32::from_rgb(0xC4, 0xBA, 0x99);
+const BEVEL_HI: egui::Color32 = egui::Color32::from_rgb(0xDE, 0xD6, 0xBD);
+const BEVEL_LO: egui::Color32 = egui::Color32::from_rgb(0x9B, 0x91, 0x76);
+const RECESS: egui::Color32 = egui::Color32::from_rgb(0x22, 0x1F, 0x18);
+const INK: egui::Color32 = egui::Color32::from_rgb(0x4A, 0x43, 0x32);
+const LABEL: egui::Color32 = egui::Color32::from_rgb(0x6B, 0x62, 0x48);
+const MUTED: egui::Color32 = egui::Color32::from_rgb(0x5C, 0x53, 0x40);
+const LED_ON: egui::Color32 = egui::Color32::from_rgb(0x46, 0xE0, 0x5A);
+const LED_OFF: egui::Color32 = egui::Color32::from_rgb(0x2D, 0x4A, 0x2E);
+const SCREW: egui::Color32 = egui::Color32::from_rgb(0xA8, 0x9E, 0x80);
+
+/// The panel face as f32 RGB, for the logo recolor unmix target.
+const PANEL_FACE_F32: [f32; 3] = [205.0, 195.0, 164.0];
+
 /// Pack 0x00RRGGBB words into a tightly-packed opaque RGBA8 buffer for upload.
 fn words_to_rgba(words: &[u32], width: usize, height: usize) -> Vec<u8> {
     let mut rgba = vec![0u8; width * height * 4];
@@ -277,6 +295,117 @@ fn access_led(ui: &mut egui::Ui, lit: bool) {
         egui::Color32::from_rgb(28, 52, 30)
     };
     ui.painter().rect_filled(rect.shrink(1.0), 2.0, color);
+}
+
+/// Apply the beige theme to a ui subtree: dark ink text and faceplate-coloured
+/// widgets with bevel-toned borders, so standard egui buttons, sliders, and
+/// selectable labels inside it read as plastic without bespoke widgets.
+fn beige_visuals(ui: &mut egui::Ui) {
+    let v = ui.visuals_mut();
+    v.override_text_color = Some(INK);
+    for w in [
+        &mut v.widgets.inactive,
+        &mut v.widgets.hovered,
+        &mut v.widgets.active,
+    ] {
+        w.bg_stroke = egui::Stroke::new(1.0, BEVEL_LO);
+        w.fg_stroke = egui::Stroke::new(1.0, INK);
+    }
+    v.widgets.inactive.bg_fill = FACEPLATE;
+    v.widgets.inactive.weak_bg_fill = FACEPLATE;
+    v.widgets.hovered.bg_fill = BEVEL_HI;
+    v.widgets.hovered.weak_bg_fill = BEVEL_HI;
+    v.widgets.active.bg_fill = BEVEL_LO;
+    v.widgets.active.weak_bg_fill = BEVEL_LO;
+    // A pressed segmented control reads as recessed.
+    v.selection.bg_fill = BEVEL_LO;
+    v.selection.stroke = egui::Stroke::new(1.0, INK);
+}
+
+/// Draw the four bevel edges over `rect`: highlight on the top and left, shadow
+/// on the bottom and right (raised), or swapped (recessed). The fill is drawn
+/// separately by the caller (a Frame or `rect_filled`).
+fn bevel_edges(painter: &egui::Painter, rect: egui::Rect, raised: bool) {
+    let (hi, lo) = if raised {
+        (BEVEL_HI, BEVEL_LO)
+    } else {
+        (BEVEL_LO, BEVEL_HI)
+    };
+    let top = egui::Stroke::new(1.0, hi);
+    let bot = egui::Stroke::new(1.0, lo);
+    painter.line_segment([rect.left_top(), rect.right_top()], top);
+    painter.line_segment([rect.left_top(), rect.left_bottom()], top);
+    painter.line_segment([rect.left_bottom(), rect.right_bottom()], bot);
+    painter.line_segment([rect.right_top(), rect.right_bottom()], bot);
+}
+
+/// Fill `rect` and bevel it in one call, for slots and standalone plates.
+fn bevel_rect(painter: &egui::Painter, rect: egui::Rect, fill: egui::Color32, raised: bool) {
+    painter.rect_filled(rect, 2.0, fill);
+    bevel_edges(painter, rect, raised);
+}
+
+/// A raised beige faceplate wrapping `add`, bevelled on all four edges.
+fn beige_group<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let res = egui::Frame::new()
+        .fill(FACEPLATE)
+        .inner_margin(egui::Margin::same(9))
+        .corner_radius(2.0)
+        .show(ui, |ui| {
+            beige_visuals(ui);
+            add(ui)
+        });
+    bevel_edges(ui.painter(), res.response.rect, true);
+    res.inner
+}
+
+/// A small Phillips screw dot for the panel and modal corners.
+fn screw(painter: &egui::Painter, center: egui::Pos2) {
+    painter.circle_filled(center, 3.0, SCREW);
+    painter.circle_stroke(center, 3.0, egui::Stroke::new(0.7, BEVEL_LO));
+    let s = egui::Stroke::new(0.7, BEVEL_LO);
+    painter.line_segment(
+        [
+            center + egui::vec2(-2.0, 0.0),
+            center + egui::vec2(2.0, 0.0),
+        ],
+        s,
+    );
+}
+
+/// A small square drive-activity LED.
+fn activity_led(ui: &mut egui::Ui, lit: bool) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+    let color = if lit { LED_ON } else { LED_OFF };
+    ui.painter().rect_filled(rect, 1.0, color);
+    ui.painter().rect_stroke(
+        rect,
+        1.0,
+        egui::Stroke::new(0.5, BEVEL_LO),
+        egui::StrokeKind::Inside,
+    );
+}
+
+/// A physical eject button (up-triangle over a bar). Returns true on a click
+/// while `enabled`. Painted, so it keeps the plastic look the egui button theme
+/// cannot give a tiny glyph.
+fn eject_button(ui: &mut egui::Ui, enabled: bool) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(24.0, 18.0), egui::Sense::click());
+    bevel_rect(ui.painter(), rect, FACEPLATE, true);
+    let c = rect.center();
+    let col = if enabled { INK } else { BEVEL_LO };
+    let tri = vec![
+        c + egui::vec2(0.0, -3.5),
+        c + egui::vec2(-4.0, 1.5),
+        c + egui::vec2(4.0, 1.5),
+    ];
+    ui.painter()
+        .add(egui::Shape::convex_polygon(tri, col, egui::Stroke::NONE));
+    ui.painter().line_segment(
+        [c + egui::vec2(-4.0, 4.0), c + egui::vec2(4.0, 4.0)],
+        egui::Stroke::new(1.5, col),
+    );
+    enabled && resp.clicked()
 }
 
 /// Host-side master audio gain shared between the UI thread (writes it from the
