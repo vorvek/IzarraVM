@@ -1342,6 +1342,67 @@ impl GuiApp {
         });
     }
 
+    /// The header: the recoloured logo on the left, the config gear on the
+    /// right. The logo texture is built once and cached.
+    fn panel_header(&mut self, ui: &mut egui::Ui) {
+        let tex = self.logo.get_or_insert_with(|| {
+            let rgba = recolor_logo(LOGO_RGBA, PANEL_FACE_F32);
+            let image = egui::ColorImage::from_rgba_unmultiplied([LOGO_W, LOGO_H], &rgba);
+            ui.ctx()
+                .load_texture("izarra-logo", image, egui::TextureOptions::LINEAR)
+        });
+        let id = tex.id();
+        let scale = 34.0 / LOGO_H as f32;
+        let size = egui::vec2(LOGO_W as f32 * scale, LOGO_H as f32 * scale);
+        ui.horizontal(|ui| {
+            ui.image((id, size));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button("\u{2699}")
+                    .on_hover_text("Configuration")
+                    .clicked()
+                {
+                    self.open_config_dialog();
+                }
+            });
+        });
+    }
+
+    /// The Power (toggle) and Reset row, with the round power LED.
+    fn power_row(&mut self, ui: &mut egui::Ui) {
+        let running = self.emu.is_some();
+        ui.horizontal(|ui| {
+            // Power LED.
+            let (led, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+            let c = led.center();
+            ui.painter()
+                .circle_filled(c, 6.0, if running { LED_ON } else { LED_OFF });
+            if running {
+                ui.painter()
+                    .circle_filled(c, 2.5, egui::Color32::from_rgb(0xC8, 0xFF, 0xCE));
+            }
+            ui.painter()
+                .circle_stroke(c, 6.0, egui::Stroke::new(1.0, BEVEL_LO));
+            // Power is a little wider than Reset and carries the toggle.
+            if ui
+                .add_sized([110.0, 30.0], egui::Button::new("POWER"))
+                .clicked()
+            {
+                if running {
+                    self.stop();
+                } else {
+                    self.start();
+                }
+            }
+            if ui
+                .add_enabled(running, egui::Button::new("RESET"))
+                .clicked()
+            {
+                self.start();
+            }
+        });
+    }
+
     fn panel_body(&mut self, ui: &mut egui::Ui) {
         let running = self.emu.is_some();
         let (mode, speed, floppy_accesses, c_accesses, cd_accesses) = match &self.emu {
@@ -1378,38 +1439,9 @@ impl GuiApp {
             self.cd_access_at = Some(now);
         }
 
-        // The "Machine" heading with the configuration gear right-aligned on the
-        // same row (right_to_left fills the remaining width after the heading).
-        ui.horizontal(|ui| {
-            ui.heading("Machine");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .button("\u{2699}")
-                    .on_hover_text("Configuration")
-                    .clicked()
-                {
-                    self.open_config_dialog();
-                }
-            });
-        });
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(!running, egui::Button::new("Start"))
-                .clicked()
-            {
-                self.start();
-            }
-            if ui
-                .add_enabled(running, egui::Button::new("Reset"))
-                .clicked()
-            {
-                self.start();
-            }
-            if ui.add_enabled(running, egui::Button::new("Stop")).clicked() {
-                self.stop();
-            }
-        });
-
+        self.panel_header(ui);
+        ui.add_space(8.0);
+        self.power_row(ui);
         ui.separator();
         let mode = mode.unwrap_or(self.profile.cpu);
         ui.label(format!(
