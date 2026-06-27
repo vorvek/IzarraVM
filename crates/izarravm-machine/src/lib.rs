@@ -4239,9 +4239,12 @@ impl Machine {
         match al {
             // C200 enable/disable (BH=0 disable, 1 enable). Enable or disable
             // hardware aux data reporting so IRQ12 packets stream to the guest
-            // INT 74h ISR.
+            // INT 74h ISR. Enabling the pointing device also arms IRQ12 in the
+            // 8042 command byte (a real PS/2 BIOS does both); without that, a
+            // latched aux byte never raises the interrupt and the ISR never runs.
             0x00 => {
                 self.keyboard.set_mouse_reporting(bh != 0);
+                self.keyboard.set_mouse_irq(bh != 0);
                 self.set_eax_ah(0x00);
                 self.set_int_frame_carry(false);
             }
@@ -4268,10 +4271,12 @@ impl Machine {
                 self.set_int_frame_carry(false);
             }
             // C205 initialize (BH=packet size, 3 for a standard mouse): enable
-            // hardware aux reporting and acknowledge. The driver does a C200
-            // enable afterwards too; both leave reporting on without re-centring.
+            // hardware aux reporting, arm IRQ12 in the 8042 command byte, and
+            // acknowledge. The driver does a C200 enable afterwards too; both
+            // leave reporting on and IRQ12 armed without re-centring.
             0x05 => {
                 self.keyboard.set_mouse_reporting(true);
+                self.keyboard.set_mouse_irq(true);
                 self.set_eax_ah(0x00);
                 self.set_int_frame_carry(false);
             }
@@ -19905,6 +19910,40 @@ mod tests {
         m.handle_int15();
         m.inject_mouse(4, -2, 0x01);
         assert!(m.irq12_pending(), "C200 enable lets a packet raise IRQ12");
+    }
+
+    #[test]
+    fn c200_enable_arms_irq12_in_the_command_byte_itself() {
+        // Without any manual command-byte setup: a C200 enable must arm IRQ12 on
+        // its own, the way a real PS/2 BIOS does, so the MOUSE.COM install path
+        // (which only issues INT 15h C205/C207/C200) gets working interrupts.
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0xC200);
+        m.cpu.registers.set_ebx(0x0100); // BH=1 enable
+        m.handle_int15();
+        m.inject_mouse(4, -2, 0x01);
+        assert!(
+            m.irq12_pending(),
+            "C200 enable alone arms IRQ12 (no separate command-byte write needed)"
+        );
+    }
+
+    #[test]
+    fn c200_disable_clears_the_irq12_arming() {
+        // Enabling then disabling the pointing device must clear the command-byte
+        // IRQ12 bit again, so a disabled mouse raises no interrupt.
+        let mut m = int15_machine(16);
+        m.cpu.registers.set_eax(0xC200);
+        m.cpu.registers.set_ebx(0x0100); // BH=1 enable
+        m.handle_int15();
+        m.cpu.registers.set_eax(0xC200);
+        m.cpu.registers.set_ebx(0x0000); // BH=0 disable
+        m.handle_int15();
+        m.inject_mouse(4, -2, 0x01);
+        assert!(
+            !m.irq12_pending(),
+            "a disabled pointing device raises no IRQ12"
+        );
     }
 
     #[test]

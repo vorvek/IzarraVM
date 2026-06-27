@@ -206,6 +206,22 @@ impl Keyboard8042 {
         self.mouse.reporting = on;
     }
 
+    /// Enable or disable IRQ12 (the mouse interrupt) in the 8042 command byte,
+    /// the seam the BIOS INT 15h AX=C200/C205 services use when they enable the
+    /// pointing device. A real PS/2 BIOS enabling the mouse sets command-byte
+    /// bit1 so latched aux bytes raise IRQ12; without it the aux byte latches but
+    /// no interrupt fires. Bit1 is set/cleared in place so the keyboard's IRQ1
+    /// enable (bit0) and the device masks (bits 4/5) are preserved. Enabling
+    /// re-latches a held byte so a packet already queued can raise IRQ12 at once.
+    pub fn set_mouse_irq(&mut self, on: bool) {
+        if on {
+            self.command_byte |= 0x02;
+            self.latch_next();
+        } else {
+            self.command_byte &= !0x02;
+        }
+    }
+
     /// Handle a byte the guest wrote straight to the keyboard device (the 0x60
     /// non-data path). Mirrors the aux handshake: most commands ACK with 0xFA,
     /// a few queue extra report bytes, and a parameter-taking command records
