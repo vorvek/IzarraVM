@@ -28,6 +28,9 @@ pub struct GuiPrefs {
     pub master_volume: f32,
     /// Distira Glide renderer worker count. Matches 86Box's choices: 1, 2, or 4.
     pub glide_render_threads: u8,
+    /// Whether the CRT-emulation shader pass is enabled. Off = plain
+    /// aspect-corrected output; on = scanlines + shadow mask + halation.
+    pub crt_emulation: bool,
     /// Last floppy IMG mounted, re-mounted on startup if it still exists.
     pub last_floppy_image: Option<PathBuf>,
     /// Last folder mounted as drive A:, restored on startup if it still exists.
@@ -41,6 +44,7 @@ impl Default for GuiPrefs {
         Self {
             master_volume: DEFAULT_VOLUME,
             glide_render_threads: DISTIRA_DEFAULT_RENDER_THREADS,
+            crt_emulation: true,
             last_floppy_image: None,
             last_floppy_folder: None,
             last_cd_image: None,
@@ -108,6 +112,7 @@ mod tests {
         let prefs = GuiPrefs {
             master_volume: 0.65,
             glide_render_threads: 4,
+            crt_emulation: false,
             last_floppy_image: Some(PathBuf::from("/tmp/disk.img")),
             last_floppy_folder: Some(PathBuf::from("/tmp/games")),
             last_cd_image: None,
@@ -125,6 +130,10 @@ mod tests {
         assert_eq!(parsed, GuiPrefs::default());
         assert_eq!(parsed.master_volume, DEFAULT_VOLUME);
         assert_eq!(parsed.glide_render_threads, 2);
+        assert!(
+            parsed.crt_emulation,
+            "CRT emulation defaults on for older files"
+        );
     }
 
     #[test]

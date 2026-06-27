@@ -781,6 +781,12 @@ impl Cga {
 pub struct VgaRaster {
     pub width: u32,
     pub height: u32,
+    /// Visible active scanlines (`vdisp_end`). The top `display_height` rows of
+    /// `pixels` are the displayed image; the rows below are vertical blanking and
+    /// border, which a real monitor never shows. `height` stays the full beam
+    /// frame (`vtotal`); the host crops to `display_height` before presenting so
+    /// the active image — not the retrace region — is what fills the screen.
+    pub display_height: u32,
     pub pixels: Vec<u8>, // DAC indices; renderer resolves through the Dac
 }
 
@@ -1863,6 +1869,7 @@ impl Vga {
         VgaRaster {
             width: w,
             height: h,
+            display_height: self.crtc.vdisp_end,
             pixels: self.work.clone(),
         }
     }
@@ -1881,6 +1888,7 @@ impl Vga {
             self.presented = Some(VgaRaster {
                 width: self.raster_width(),
                 height: self.raster_height(),
+                display_height: self.crtc.vdisp_end,
                 pixels: self.work.clone(),
             });
         }
@@ -4521,6 +4529,31 @@ mod tests {
         assert!(vga.take_presented().is_none());
         vga.advance(vga.frame_dots() + 10); // cross one frame
         assert!(vga.presented_ready());
+    }
+
+    #[test]
+    fn presented_frame_carries_active_visible_height_below_the_beam_total() {
+        // The host crops to the active region for display: `display_height`
+        // (vdisp_end) is the visible image; `height` stays the full beam frame
+        // (vtotal) including the retrace/border the monitor never shows. Cropping
+        // to display_height is what drops the black bottom bar before aspect-fill.
+        let mut vga = Vga::default();
+        vga.set_mode_0dh();
+        vga.advance(vga.frame_dots() + 10);
+        let raster = vga.take_presented().unwrap();
+        assert_eq!(
+            raster.height, vga.crtc.vtotal,
+            "height is the full beam frame"
+        );
+        assert_eq!(
+            raster.display_height, vga.crtc.vdisp_end,
+            "display_height is the visible active region"
+        );
+        assert!(
+            raster.display_height < raster.height,
+            "the vertical blanking/border is excluded from the visible region"
+        );
+        assert_eq!(raster.pixels.len(), (raster.width * raster.height) as usize);
     }
 
     #[test]
