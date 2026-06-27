@@ -149,6 +149,7 @@ m_show:
 .store:
     mov [cs:show_count], ax
     mov byte [cs:cond_active], 0       ; Show cancels any active conditional-off region
+    call cursor_hide                   ; restore any drawn cell so a redundant Show redraws cleanly
     call cursor_show                   ; draw if the count reached 0 (visible)
     pop ax
     iret
