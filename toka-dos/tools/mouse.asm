@@ -97,8 +97,9 @@ int33:
     je m_cond_off
     jmp x33_high
 
-; 0x00 reset and status. Re-centre, hide, clear edge counters, drop the callback
-; and the re-entrancy guard, and report installed (AX=0xFFFF) with two buttons.
+; 0x00 reset and status. Re-centre, hide, clear edge counters and their saved
+; positions, drop the callback and the re-entrancy guard, and report installed
+; (AX=0xFFFF) with two buttons. Returns AX,BX; preserves CX,DX,SI,DI.
 m_reset:
     mov word [cs:cur_x], CENTER_X
     mov word [cs:cur_y], CENTER_Y
@@ -110,6 +111,18 @@ m_reset:
     mov word [cs:release_cnt], 0
     mov word [cs:release_cnt + 2], 0
     mov word [cs:release_cnt + 4], 0
+    mov word [cs:press_x], 0
+    mov word [cs:press_x + 2], 0
+    mov word [cs:press_x + 4], 0
+    mov word [cs:press_y], 0
+    mov word [cs:press_y + 2], 0
+    mov word [cs:press_y + 4], 0
+    mov word [cs:release_x], 0
+    mov word [cs:release_x + 2], 0
+    mov word [cs:release_x + 4], 0
+    mov word [cs:release_y], 0
+    mov word [cs:release_y + 2], 0
+    mov word [cs:release_y + 4], 0
     mov word [cs:mickey_x], 0
     mov word [cs:mickey_y], 0
     mov word [cs:saved_off], 0xFFFF
@@ -121,25 +134,30 @@ m_reset:
     mov bx, 2
     iret
 
-; 0x01 show: show_count = min(show_count+1, 0) (signed saturate at 0).
+; 0x01 show: show_count = min(show_count+1, 0) (signed saturate at 0). Returns
+; nothing; preserve ALL (AX is scratch here, so save and restore it).
 m_show:
+    push ax
     mov ax, [cs:show_count]
     inc ax
     cmp ax, 0
-    jle .store                        ; signed: still <= 0, keep it
+    jle .store                        ; signed: AX <= 0 (hidden or boundary), store as-is
     xor ax, ax                        ; clamp at 0 (visible)
 .store:
     mov [cs:show_count], ax
     ; cursor draw wired in Task 3.5
+    pop ax
     iret
 
-; 0x02 hide: show_count -= 1 (signed, no floor).
+; 0x02 hide: show_count -= 1 (signed, no floor). Returns nothing; preserve ALL
+; (no general register is touched).
 m_hide:
     ; cursor restore wired in Task 3.5
     dec word [cs:show_count]
     iret
 
-; 0x03 get position and buttons.
+; 0x03 get position and buttons. Returns BX,CX,DX; preserves AX,SI,DI (none of
+; them is written).
 m_getpos:
     mov bx, [cs:buttons]
     and bx, 0x0007
@@ -147,8 +165,10 @@ m_getpos:
     mov dx, [cs:cur_y]
     iret
 
-; 0x04 set position, clamped to the active range.
+; 0x04 set position, clamped to the active range. Returns nothing; preserve ALL
+; (AX is scratch, save and restore it).
 m_setpos:
+    push ax
     mov ax, cx
     cmp ax, [cs:min_x]
     jge .x_lo
@@ -169,14 +189,14 @@ m_setpos:
     mov ax, [cs:max_y]
 .y_hi:
     mov [cs:cur_y], ax
+    pop ax
     iret
 
 ; 0x05 button press info. BX selects the button (0 left, 1 right, 2 middle).
 ; AX=current buttons, BX=press_cnt[i] then zero it, CX=press_x[i], DX=press_y[i].
-; BX >= 3 returns count 0 and the current position.
+; BX >= 3 returns count 0 and the current position. Returns AX,BX,CX,DX;
+; preserves SI,DI (neither is written).
 m_press_info:
-    mov ax, [cs:buttons]
-    and ax, 0x0007
     cmp bx, 3
     jae .out_of_range
     shl bx, 1                         ; i*2 into the word arrays
@@ -185,19 +205,20 @@ m_press_info:
     mov ax, [cs:press_cnt + bx]       ; ax = count to return
     mov word [cs:press_cnt + bx], 0
     mov bx, ax                        ; BX = count
-    mov ax, [cs:buttons]
+    mov ax, [cs:buttons]              ; AX = current buttons (the return value)
     and ax, 0x0007
     iret
 .out_of_range:
+    mov ax, [cs:buttons]
+    and ax, 0x0007
     mov cx, [cs:cur_x]
     mov dx, [cs:cur_y]
     mov bx, 0
     iret
 
-; 0x06 button release info, the release_* mirror of 0x05.
+; 0x06 button release info, the release_* mirror of 0x05. Returns AX,BX,CX,DX;
+; preserves SI,DI.
 m_release_info:
-    mov ax, [cs:buttons]
-    and ax, 0x0007
     cmp bx, 3
     jae .out_of_range
     shl bx, 1
@@ -206,18 +227,23 @@ m_release_info:
     mov ax, [cs:release_cnt + bx]
     mov word [cs:release_cnt + bx], 0
     mov bx, ax
-    mov ax, [cs:buttons]
+    mov ax, [cs:buttons]              ; AX = current buttons (the return value)
     and ax, 0x0007
     iret
 .out_of_range:
+    mov ax, [cs:buttons]
+    and ax, 0x0007
     mov cx, [cs:cur_x]
     mov dx, [cs:cur_y]
     mov bx, 0
     iret
 
 ; 0x07 set horizontal range. order(CX,DX) -> min_x,max_x, clamp to 0..VIRT_MAX_X,
-; then reclamp the cursor into the new range.
+; then reclamp the cursor into the new range. Returns nothing; preserve ALL
+; (AX,BX are scratch).
 m_set_hrange:
+    push ax
+    push bx
     mov ax, cx                        ; ax = low candidate
     mov bx, dx                        ; bx = high candidate
     cmp ax, bx
@@ -247,10 +273,15 @@ m_set_hrange:
     mov ax, [cs:max_x]
 .cx_hi:
     mov [cs:cur_x], ax
+    pop bx
+    pop ax
     iret
 
-; 0x08 set vertical range, the min_y/max_y mirror of 0x07.
+; 0x08 set vertical range, the min_y/max_y mirror of 0x07. Returns nothing;
+; preserve ALL (AX,BX are scratch).
 m_set_vrange:
+    push ax
+    push bx
     mov ax, cx
     mov bx, dx
     cmp ax, bx
@@ -277,14 +308,17 @@ m_set_vrange:
     mov ax, [cs:max_y]
 .cy_hi:
     mov [cs:cur_y], ax
+    pop bx
+    pop ax
     iret
 
-; 0x09 define graphics cursor: accept, inert in v1.
+; 0x09 define graphics cursor: accept, inert in v1. Returns nothing; preserve ALL.
 m_def_gfx_cursor:
     iret
 
 ; 0x0A define text cursor. BX==0 selects the software cursor: store the screen
-; and cursor masks. Rendering is Task 3.5.
+; and cursor masks. Rendering is Task 3.5. Returns nothing; preserve ALL (no
+; register is written).
 m_def_txt_cursor:
     cmp bx, 0
     jne .done
@@ -293,7 +327,8 @@ m_def_txt_cursor:
 .done:
     iret
 
-; 0x0B read and clear the mickey counters.
+; 0x0B read and clear the mickey counters. Returns CX,DX; preserves AX,BX,SI,DI
+; (none of them is written).
 m_read_mickeys:
     mov cx, [cs:mickey_x]
     mov dx, [cs:mickey_y]
@@ -301,20 +336,22 @@ m_read_mickeys:
     mov word [cs:mickey_y], 0
     iret
 
-; 0x0C set the user event handler: mask in CX, far pointer in ES:DX.
+; 0x0C set the user event handler: mask in CX, far pointer in ES:DX. Returns
+; nothing; preserve ALL (no register is written).
 m_set_callback:
     mov [cs:cb_mask], cx
     mov [cs:cb_seg], es
     mov [cs:cb_off], dx
     iret
 
-; 0x0D / 0x0E light-pen emulation on/off: inert.
+; 0x0D / 0x0E light-pen emulation on/off: inert. Returns nothing; preserve ALL.
 m_lightpen_on:
     iret
 m_lightpen_off:
     iret
 
-; 0x0F set the mickey-to-pixel ratio.
+; 0x0F set the mickey-to-pixel ratio. Returns nothing; preserve ALL (no register
+; is written).
 m_set_ratio:
     mov [cs:ratio_x], cx
     mov [cs:ratio_y], dx
@@ -322,7 +359,10 @@ m_set_ratio:
 
 ; 0x10 conditional-off region. order(CX,SI) -> cond_left,cond_right and
 ; order(DX,DI) -> cond_top,cond_bottom. Cursor hide-on-overlap is Task 3.5.
+; Returns nothing; preserve ALL (AX,BX are scratch).
 m_cond_off:
+    push ax
+    push bx
     mov ax, cx
     mov bx, si
     cmp ax, bx
@@ -339,10 +379,12 @@ m_cond_off:
 .v_ok:
     mov [cs:cond_top], ax
     mov [cs:cond_bottom], bx
+    pop bx
+    pop ax
     iret
 
 x33_high:
-    ; Extended functions 0x12..0x24 are implemented in Task 3.4.
+    ; 0x11+ (everything above 0x10) is implemented in Task 3.4.
     iret
 
 ; ---- PS/2 packet handler (far-called by the BIOS INT 74h ISR) ----
@@ -366,25 +408,31 @@ packet_handler:
     and al, 0x07
     mov [buttons], al                 ; new button mask (bit0 L, bit1 R, bit2 M)
 
-    ; signed dx: X byte, sign from status bit4
-    mov al, [bp+10]
-    cbw
-    test dl, 0x10
-    jnz .x_signed
-    mov ah, 0
-.x_signed:
-    mov si, ax                        ; si = signed dx (screen sense)
+    ; signed dx: the status sign bit is authoritative, the packet byte is the low
+    ; 8 bits. queue_movement clamps deltas to the 9-bit range -256..255, so a fast
+    ; -256..-129 move has a magnitude byte whose own bit7 disagrees with the true
+    ; sign. Sign-extend from status bit4, not from the byte, to span -256..255.
+    mov al, [bp+10]                   ; X magnitude byte (low 8 bits)
+    xor ah, ah
+    test dl, 0x10                     ; status bit4: X negative?
+    jz .x_done
+    mov ah, 0xFF                      ; sign-extend per the status bit
+.x_done:
+    mov si, ax                        ; si = signed dx (screen sense), -256..255
 
-    ; signed dy: Y byte, sign from status bit5; PS/2 is +up so negate for screen
-    mov al, [bp+8]
-    cbw
-    test dl, 0x20
-    jnz .y_signed
-    mov ah, 0
-.y_signed:
-    neg ax
-    mov di, ax                        ; di = signed screen dy
+    ; signed dy: same reconstruction from status bit5; PS/2 is +up so negate to
+    ; screen sense (+down) afterwards.
+    mov al, [bp+8]                    ; Y magnitude byte (low 8 bits)
+    xor ah, ah
+    test dl, 0x20                     ; status bit5: Y negative?
+    jz .y_done
+    mov ah, 0xFF
+.y_done:
+    neg ax                            ; flip PS/2 +up to screen +down
+    mov di, ax                        ; di = signed screen dy, -256..255
 
+    ; Mickeys accumulate in screen sense (positive = down), matching the Microsoft
+    ; contract; this is intentional, not a missing negate.
     add [mickey_x], si
     add [mickey_y], di
 
@@ -550,6 +598,10 @@ packet_handler:
     mov dx, [cur_y]                   ; DX = cur_y
     mov si, [mickey_x]                ; SI = mickey_x
     mov di, [mickey_y]                ; DI = mickey_y
+    ; The callback runs with DS = driver segment. Per common mouse-driver practice
+    ; the application's callback establishes its own DS; in this IRQ-driven path
+    ; there is no application caller whose DS to restore, so we deliberately do not
+    ; restore one here. Revisit only if a corpus program needs it.
     call far [cb_off]                 ; far-call cb_seg:cb_off via the stored pair
     mov byte [in_callback], 0
 .no_callback:
