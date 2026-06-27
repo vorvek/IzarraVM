@@ -1320,48 +1320,58 @@ impl GuiApp {
         let scale = 34.0 / LOGO_H as f32;
         let size = egui::vec2(LOGO_W as f32 * scale, LOGO_H as f32 * scale);
         let running = self.emu.is_some();
-        // Bottom-align the row so the logo, LED, and buttons share one baseline.
-        ui.with_layout(egui::Layout::left_to_right(egui::Align::Max), |ui| {
-            ui.image((id, size));
-            // Right side, added right to left so it reads LED, Power, Reset.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Max), |ui| {
-                let reset = ui
-                    .add_enabled_ui(running, |ui| {
-                        ui.add_sized(
-                            [36.0, 36.0],
-                            egui::Button::new(egui::RichText::new("RESET").size(10.0)),
-                        )
-                    })
-                    .inner;
-                if reset.clicked() {
-                    self.start();
-                }
-                if ui
-                    .add_sized(
-                        [48.0, 48.0],
-                        egui::Button::new(egui::RichText::new("POWER").size(13.0)),
-                    )
-                    .clicked()
-                {
-                    if running {
-                        self.stop();
-                    } else {
+        // A fixed-height row, bottom-aligned, so the logo, LED, and buttons
+        // share one baseline (the Power button's). The explicit height stops the
+        // Align::Max layout from expanding to fill the whole panel.
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), 48.0),
+            egui::Layout::left_to_right(egui::Align::Max),
+            |ui| {
+                ui.image((id, size));
+                // Right side, added right to left so it reads LED, Power, Reset.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Max), |ui| {
+                    let reset = ui
+                        .add_enabled_ui(running, |ui| {
+                            ui.add_sized(
+                                [36.0, 36.0],
+                                egui::Button::new(egui::RichText::new("RESET").size(10.0)),
+                            )
+                        })
+                        .inner;
+                    if reset.clicked() {
                         self.start();
                     }
-                }
-                // A tall box so the LED centres vertically against the Power button.
-                let (led, _) = ui.allocate_exact_size(egui::vec2(16.0, 48.0), egui::Sense::hover());
-                let c = led.center();
-                ui.painter()
-                    .circle_filled(c, 6.0, if running { LED_ON } else { LED_OFF });
-                if running {
+                    if ui
+                        .add_sized(
+                            [48.0, 48.0],
+                            egui::Button::new(egui::RichText::new("POWER").size(13.0)),
+                        )
+                        .clicked()
+                    {
+                        if running {
+                            self.stop();
+                        } else {
+                            self.start();
+                        }
+                    }
+                    // A tall box so the LED centres vertically against the Power button.
+                    let (led, _) =
+                        ui.allocate_exact_size(egui::vec2(16.0, 48.0), egui::Sense::hover());
+                    let c = led.center();
                     ui.painter()
-                        .circle_filled(c, 2.5, egui::Color32::from_rgb(0xC8, 0xFF, 0xCE));
-                }
-                ui.painter()
-                    .circle_stroke(c, 6.0, egui::Stroke::new(1.0, BEVEL_LO));
-            });
-        });
+                        .circle_filled(c, 6.0, if running { LED_ON } else { LED_OFF });
+                    if running {
+                        ui.painter().circle_filled(
+                            c,
+                            2.5,
+                            egui::Color32::from_rgb(0xC8, 0xFF, 0xCE),
+                        );
+                    }
+                    ui.painter()
+                        .circle_stroke(c, 6.0, egui::Stroke::new(1.0, BEVEL_LO));
+                });
+            },
+        );
     }
 
     fn panel_body(&mut self, ui: &mut egui::Ui) {
