@@ -1307,8 +1307,8 @@ impl GuiApp {
     }
 
     /// The top row: the logo aligned left, then the power LED and the square
-    /// Power and Reset buttons (Reset smaller) plus the config gear aligned to
-    /// the right. The logo texture is built once and cached.
+    /// Power and Reset buttons (Reset smaller) aligned to the right, all sharing
+    /// one bottom baseline. The logo texture is built once and cached.
     fn panel_header(&mut self, ui: &mut egui::Ui) {
         let tex = self.logo.get_or_insert_with(|| {
             let rgba = recolor_logo(LOGO_RGBA, PANEL_FACE_F32);
@@ -1320,17 +1320,11 @@ impl GuiApp {
         let scale = 34.0 / LOGO_H as f32;
         let size = egui::vec2(LOGO_W as f32 * scale, LOGO_H as f32 * scale);
         let running = self.emu.is_some();
-        ui.horizontal(|ui| {
+        // Bottom-align the row so the logo, LED, and buttons share one baseline.
+        ui.with_layout(egui::Layout::left_to_right(egui::Align::Max), |ui| {
             ui.image((id, size));
-            // Right side, added right to left so it reads LED, Power, Reset, gear.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .button("\u{2699}")
-                    .on_hover_text("Configuration")
-                    .clicked()
-                {
-                    self.open_config_dialog();
-                }
+            // Right side, added right to left so it reads LED, Power, Reset.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Max), |ui| {
                 let reset = ui
                     .add_enabled_ui(running, |ui| {
                         ui.add_sized(
@@ -1355,7 +1349,8 @@ impl GuiApp {
                         self.start();
                     }
                 }
-                let (led, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                // A tall box so the LED centres vertically against the Power button.
+                let (led, _) = ui.allocate_exact_size(egui::vec2(16.0, 48.0), egui::Sense::hover());
                 let c = led.center();
                 ui.painter()
                     .circle_filled(c, 6.0, if running { LED_ON } else { LED_OFF });
@@ -1431,6 +1426,13 @@ impl GuiApp {
                         let com1_label = if self.show_com1 { "Hide COM1" } else { "COM1" };
                         if ui.button(com1_label).clicked() {
                             self.show_com1 = !self.show_com1;
+                        }
+                        if ui
+                            .button("\u{2699}")
+                            .on_hover_text("Configuration")
+                            .clicked()
+                        {
+                            self.open_config_dialog();
                         }
                     });
                 });
