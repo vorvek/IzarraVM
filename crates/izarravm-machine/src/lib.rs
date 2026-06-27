@@ -4231,8 +4231,9 @@ impl Machine {
     /// device is the same standard PS/2 mouse INT 33h models, so the reset reports
     /// the self-test-passed/device-id bytes a real mouse returns. C207 (set the
     /// device handler) stores the ES:BX far pointer in the EBDA and returns success;
-    /// the pointer is never called yet (see the C207 arm). C208/C209 (read/write the
-    /// raw device port) report function-not-supported (AH=86h, CF set).
+    /// the BIOS INT 74h ISR (izbios ROM) far-calls that pointer on each completed
+    /// 3-byte PS/2 packet. C208/C209 (read/write the raw device port) report
+    /// function-not-supported (AH=86h, CF set).
     fn int15_c2_pointing_device(&mut self, al: u8) {
         let bh = (self.cpu.registers.ebx() as u16 >> 8) as u8;
         match al {
@@ -4294,11 +4295,10 @@ impl Machine {
             }
             // C207 set device handler: store the ES:BX far pointer the guest is
             // installing into the EBDA (offset word then segment word) and report
-            // success. ES=0:BX=0 deregisters. Limit: the handler far-pointer is
-            // stored but never called: invocation needs the outbound host->guest
-            // far-call trampoline plus a mouse-packet source, and no producer is
-            // wired, so this is deferred until a producer exists. C208/C209 (the
-            // raw device-port read/write) stay unsupported for the same reason.
+            // success. ES=0:BX=0 deregisters. The producer is the BIOS INT 74h ISR
+            // in the izbios ROM: it assembles each 3-byte PS/2 packet and far-calls
+            // this pointer with the standard 4-word frame. C208/C209 (the raw
+            // device-port read/write) stay unsupported.
             0x07 => {
                 // The far pointer's segment is the literal ES the guest passed (the
                 // selector), not the derived physical base.
@@ -14056,9 +14056,9 @@ mod tests {
 
     #[test]
     fn int15_c207_set_handler_stores_pointer_and_succeeds() {
-        // C207 (set device handler) now registers the ES:BX far pointer in the EBDA
-        // and returns success (AH=0, CF clear). The pointer is stored but not yet
-        // called (no mouse-packet producer is wired).
+        // C207 (set device handler) registers the ES:BX far pointer in the EBDA and
+        // returns success (AH=0, CF clear). The stored pointer is the one the BIOS
+        // INT 74h ISR far-calls on each completed PS/2 packet.
         let mut m = int15_machine(16);
         m.cpu
             .registers

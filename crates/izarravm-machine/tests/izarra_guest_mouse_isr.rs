@@ -1,6 +1,6 @@
 use izarravm_core::VideoCard;
 use izarravm_firmware::izarra_bios;
-use izarravm_machine::{Machine, MachineProfile};
+use izarravm_machine::{Machine, MachineProfile, StopReason};
 
 const RESULT_STATUS: u32 = 0x8000; // packet status byte the handler saw
 const RESULT_X: u32 = 0x8001; // packet X byte the handler saw
@@ -40,7 +40,14 @@ fn guest_int74_isr_calls_the_registered_handler() {
     m.register_mouse_handler_for_test(0x0000, HANDLER_ADDR as u16);
 
     m.inject_mouse(7, -1, 0x01);
-    m.run_until_halt_or_cycles(2_000_000).unwrap();
+    let reason = m.run_until_halt_or_cycles(2_000_000).unwrap();
+    // The BIOS idles in a spin loop with interrupts on, so the run should reach the
+    // cycle limit. An ISR fault would surface here as CpuError, not a wrong-memory
+    // assertion below.
+    assert!(
+        matches!(reason, StopReason::CycleLimit { .. }),
+        "run ended in {reason:?}, expected the BIOS idle spin to hit the cycle limit"
+    );
 
     assert_eq!(
         m.read_physical_u8(RESULT_COUNT),
@@ -64,9 +71,17 @@ fn guest_int74_two_packets_call_handler_twice() {
     m.write_physical_u8(RESULT_COUNT, 0);
     m.register_mouse_handler_for_test(0x0000, HANDLER_ADDR as u16);
     m.inject_mouse(3, 0, 0x00);
-    m.run_until_halt_or_cycles(2_000_000).unwrap();
+    let reason = m.run_until_halt_or_cycles(2_000_000).unwrap();
+    assert!(
+        matches!(reason, StopReason::CycleLimit { .. }),
+        "first run ended in {reason:?}, expected the BIOS idle spin to hit the cycle limit"
+    );
     m.inject_mouse(-2, 0, 0x00);
-    m.run_until_halt_or_cycles(2_000_000).unwrap();
+    let reason = m.run_until_halt_or_cycles(2_000_000).unwrap();
+    assert!(
+        matches!(reason, StopReason::CycleLimit { .. }),
+        "second run ended in {reason:?}, expected the BIOS idle spin to hit the cycle limit"
+    );
     assert_eq!(
         m.read_physical_u8(RESULT_COUNT),
         2,

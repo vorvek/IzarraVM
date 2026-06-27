@@ -218,7 +218,7 @@ int74:
     iret
 
 ; int74_dispatch: build the RBIL 4-word frame from EBDA_MOUSE_PKT and far-call the
-; registered handler if non-null. DS = EBDA_SEG on entry. Clobbers ax,bx,cx,dx.
+; registered handler if non-null. DS = EBDA_SEG on entry. Clobbers ax,cx,dx.
 int74_dispatch:
     mov ax, [EBDA_MOUSE_HANDLER]     ; offset
     mov dx, [EBDA_MOUSE_HANDLER + 2] ; segment
