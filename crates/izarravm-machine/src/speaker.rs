@@ -11,23 +11,213 @@ const SPEAKER_AMPLITUDE: f64 = 8000.0;
 /// The host DAC rate the ring is produced at.
 const DAC_HZ: u32 = 44_100;
 const SAMPLE_SECONDS: f64 = 1.0 / DAC_HZ as f64;
-/// A small cone response keeps PIT/PWM edges from aliasing as hard digital steps.
-const CONE_RESPONSE_SECONDS: f64 = 60e-6;
+
+// Voicing of the physical cone. A real case-mounted PC speaker is not flat: it
+// has a low-mid body resonance that gives it warmth and presence, and a soft top
+// rather than a tiny beeper's tinny buzz. Two biquads model that: a gentle
+// peaking boost for the body, then a 2nd-order low-pass for the top. Tuned by ear.
+const BODY_HZ: f64 = 550.0; // cone body resonance, for warmth and presence
+const BODY_Q: f64 = 0.9; // focused enough to read as body, not a broad mud boost
+const BODY_GAIN_DB: f64 = 3.0;
+const TOP_HZ: f64 = 5000.0; // soft top rolloff, to tame the tinny buzz
+const TOP_Q: f64 = 0.6; // below Butterworth: a gentle early rolloff, no harsh knee
+
+// "Inside the case" ambience. The speaker sits in a small desktop case (Amiga
+// 3000 / horizontal ATX size), so its sound carries short early reflections with
+// a faint metallic ring. A handful of single-digit-millisecond comb delays plus
+// one diffusing allpass model that; modest feedback keeps the decay short like a
+// component-packed case rather than a room, and low wet keeps it a hint, not a
+// hall. Tuned by ear.
+const BOX_FEEDBACK: f64 = 0.4; // short decay: a small case, not a room
+const BOX_WET: f64 = 0.15; // how much of the box ambience to blend in
+
+/// A direct-form-I biquad. Shapes the box-averaged square into something with a
+/// cone's body instead of a sterile beep. Coefficients use the RBJ cookbook.
+#[derive(Debug, Clone, Default)]
+struct Biquad {
+    b0: f64,
+    b1: f64,
+    b2: f64,
+    a1: f64,
+    a2: f64,
+    x1: f64,
+    x2: f64,
+    y1: f64,
+    y2: f64,
+}
+
+impl Biquad {
+    /// Peaking EQ: boost a band around `f0` by `db_gain`, roughly flat elsewhere.
+    fn peaking(fs: f64, f0: f64, q: f64, db_gain: f64) -> Self {
+        let a = 10f64.powf(db_gain / 40.0);
+        let w0 = 2.0 * std::f64::consts::PI * f0 / fs;
+        let (sin, cos) = (w0.sin(), w0.cos());
+        let alpha = sin / (2.0 * q);
+        let a0 = 1.0 + alpha / a;
+        Self {
+            b0: (1.0 + alpha * a) / a0,
+            b1: (-2.0 * cos) / a0,
+            b2: (1.0 - alpha * a) / a0,
+            a1: (-2.0 * cos) / a0,
+            a2: (1.0 - alpha / a) / a0,
+            ..Default::default()
+        }
+    }
+
+    /// 2nd-order low-pass at corner `fc`.
+    fn low_pass(fs: f64, fc: f64, q: f64) -> Self {
+        let w0 = 2.0 * std::f64::consts::PI * fc / fs;
+        let (sin, cos) = (w0.sin(), w0.cos());
+        let alpha = sin / (2.0 * q);
+        let a0 = 1.0 + alpha;
+        Self {
+            b0: ((1.0 - cos) / 2.0) / a0,
+            b1: (1.0 - cos) / a0,
+            b2: ((1.0 - cos) / 2.0) / a0,
+            a1: (-2.0 * cos) / a0,
+            a2: (1.0 - alpha) / a0,
+            ..Default::default()
+        }
+    }
+
+    fn process(&mut self, x: f64) -> f64 {
+        let y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2
+            - self.a1 * self.y1
+            - self.a2 * self.y2;
+        self.x2 = self.x1;
+        self.x1 = x;
+        self.y2 = self.y1;
+        self.y1 = y;
+        y
+    }
+}
+
+/// A feedback comb: a short delay line fed back on itself. Short delays with
+/// modest feedback give the boxy, faintly metallic resonance of a small case.
+#[derive(Debug, Clone)]
+struct Comb {
+    buf: Vec<f64>,
+    pos: usize,
+    feedback: f64,
+}
+
+impl Comb {
+    fn new(delay: usize, feedback: f64) -> Self {
+        Self {
+            buf: vec![0.0; delay.max(1)],
+            pos: 0,
+            feedback,
+        }
+    }
+
+    fn process(&mut self, x: f64) -> f64 {
+        let y = self.buf[self.pos];
+        self.buf[self.pos] = x + y * self.feedback;
+        self.pos = (self.pos + 1) % self.buf.len();
+        y
+    }
+}
+
+/// A Schroeder allpass: diffuses the comb resonances so the box reads as
+/// ambience rather than a single pitched ring.
+#[derive(Debug, Clone)]
+struct Allpass {
+    buf: Vec<f64>,
+    pos: usize,
+    gain: f64,
+}
+
+impl Allpass {
+    fn new(delay: usize, gain: f64) -> Self {
+        Self {
+            buf: vec![0.0; delay.max(1)],
+            pos: 0,
+            gain,
+        }
+    }
+
+    fn process(&mut self, x: f64) -> f64 {
+        let buffered = self.buf[self.pos];
+        let y = buffered - x;
+        self.buf[self.pos] = x + buffered * self.gain;
+        self.pos = (self.pos + 1) % self.buf.len();
+        y
+    }
+}
+
+/// The case as an acoustic box: a few short, mutually detuned combs plus one
+/// allpass, blended in dry+wet. Models the early reflections inside the plastic
+/// and aluminium enclosure without a full reverb tail.
+#[derive(Debug, Clone)]
+struct BoxReverb {
+    combs: Vec<Comb>,
+    allpass: Allpass,
+    wet: f64,
+}
+
+impl BoxReverb {
+    fn new(fs: f64) -> Self {
+        // Convert milliseconds to whole samples. The delays are small and not
+        // simple ratios of each other, so the comb peaks do not pile onto one
+        // pitch (which would sound like a single resonant tone, not a box).
+        let ms = |m: f64| ((fs * m / 1000.0) as usize).max(1);
+        Self {
+            combs: vec![
+                Comb::new(ms(3.0), BOX_FEEDBACK),
+                Comb::new(ms(4.1), BOX_FEEDBACK),
+                Comb::new(ms(5.3), BOX_FEEDBACK),
+                Comb::new(ms(6.2), BOX_FEEDBACK),
+            ],
+            allpass: Allpass::new(ms(1.6), 0.5),
+            wet: BOX_WET,
+        }
+    }
+
+    fn process(&mut self, x: f64) -> f64 {
+        let mut sum = 0.0;
+        for comb in &mut self.combs {
+            sum += comb.process(x);
+        }
+        sum /= self.combs.len() as f64;
+        let diffused = self.allpass.process(sum);
+        x + self.wet * diffused
+    }
+}
 
 /// Cap the ring so a headless run (which never drains) cannot grow it without
 /// bound. The GUI drains every frame, so it never reaches this.
 const RING_CAP: usize = 2 * DAC_HZ as usize;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub(crate) struct Speaker {
     data_enable: bool,   // port 0x61 bit 1
     control_bits: u8,    // low bits last written to 0x61, for readback (bits 0,1)
     ch2_out: bool,       // current PIT channel-2 OUT level
     sample_elapsed: f64, // seconds accumulated into the current DAC sample
     sample_area: f64,    // target-level integral for the current DAC sample
-    cone: f64,           // filtered membrane position
+    body: Biquad,        // cone body resonance (low-mid warmth)
+    top: Biquad,         // top rolloff (tames the tinny buzz)
+    case: BoxReverb,     // "inside the case" early-reflection ambience
     ring: VecDeque<i16>, // produced mono samples awaiting drain
     ever_enabled: bool,  // sticky: set the first time data enable goes high
+}
+
+impl Default for Speaker {
+    fn default() -> Self {
+        let fs = DAC_HZ as f64;
+        Self {
+            data_enable: false,
+            control_bits: 0,
+            ch2_out: false,
+            sample_elapsed: 0.0,
+            sample_area: 0.0,
+            body: Biquad::peaking(fs, BODY_HZ, BODY_Q, BODY_GAIN_DB),
+            top: Biquad::low_pass(fs, TOP_HZ, TOP_Q),
+            case: BoxReverb::new(fs),
+            ring: VecDeque::new(),
+            ever_enabled: false,
+        }
+    }
 }
 
 impl Speaker {
@@ -54,7 +244,7 @@ impl Speaker {
     }
 
     /// Advance emulated time, integrating PIT channel-2 transitions at their
-    /// sub-sample times before applying a simple cone response.
+    /// sub-sample times before shaping the result through the cone voicing.
     pub(crate) fn accumulate<I>(&mut self, seconds: f64, initial_ch2_out: bool, transitions: I)
     where
         I: IntoIterator<Item = (f64, bool)>,
@@ -107,9 +297,11 @@ impl Speaker {
 
     fn emit_sample(&mut self) {
         let avg_target = self.sample_area / SAMPLE_SECONDS;
-        let alpha = 1.0 - (-SAMPLE_SECONDS / CONE_RESPONSE_SECONDS).exp();
-        self.cone += (avg_target - self.cone) * alpha;
-        let sample = self.cone.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+        // Shape the box-averaged square through the cone voicing (low-mid body
+        // resonance, then top rolloff), then place it inside the case.
+        let shaped = self.top.process(self.body.process(avg_target));
+        let boxed = self.case.process(shaped);
+        let sample = boxed.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16;
         self.ring.push_back(sample);
         if self.ring.len() > RING_CAP {
             self.ring.pop_front();
