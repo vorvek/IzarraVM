@@ -881,10 +881,11 @@ pub struct Machine {
     // boot turns it off (the HLE is the OS), re-evaluated on every boot so a warm
     // reboot flips it. It starts off and stays off until the first boot.
     booter_inert: bool,
-    // INT 33h mouse-driver HLE state: virtual cursor position, button mask,
-    // visibility, motion-counter accumulators, and the configured ranges. The
-    // PS/2 aux device is the hardware side; this is the DOS driver a game calls.
-    mouse: MouseState,
+    // Last absolute pointer the GUI reported, in the INT 33h virtual space
+    // (0..639 x 0..199). set_mouse_absolute diffs against this to synthesize the
+    // relative deltas the aux device and the guest driver expect. Mutated only on
+    // the emulation thread, so it needs no synchronization.
+    last_abs: (i32, i32),
     // Guest-visible regression-test device (Lotura ports 0xE4-0xE6). A command
     // write records the request here; the run loop performs it after the cycle
     // (it needs &mut self for the framebuffer, host I/O, and the stop).
@@ -912,135 +913,13 @@ pub struct Machine {
     uma: UmaReservationMap,
 }
 
-/// INT 33h mouse-driver state. Coordinates are in a virtual screen space that
-/// matches mode 13h (320x200) doubled horizontally, so x runs 0..639 and y runs
-/// 0..199, the convention the Microsoft driver presents to graphics-mode games.
-/// Host pixel deltas drive both this position and the mickey counters.
-#[derive(Debug, Clone, PartialEq)]
-struct MouseState {
-    x: i32,          // virtual cursor column (clamped to [min_x, max_x])
-    y: i32,          // virtual cursor row (clamped to [min_y, max_y])
-    buttons: u8,     // bit0 left, bit1 right, bit2 middle
-    show_count: i32, // cursor visibility counter (>=0 visible); hide decrements
-    mickey_x: i32,   // horizontal motion accumulator (mickeys) since last read
-    mickey_y: i32,   // vertical motion accumulator (mickeys) since last read
-    min_x: i32,
-    max_x: i32,
-    min_y: i32,
-    max_y: i32,
-    press_count: [u16; 3],
-    release_count: [u16; 3],
-    last_press_x: [i32; 3],
-    last_press_y: [i32; 3],
-    last_release_x: [i32; 3],
-    last_release_y: [i32; 3],
-    event_mask: u16,
-    event_handler_segment: u16,
-    event_handler_offset: u16,
-    display_page: u16,
-    mickey_ratio_x: u16,
-    mickey_ratio_y: u16,
-    double_speed_threshold: u16,
-    update_left: i32,
-    update_top: i32,
-    update_right: i32,
-    update_bottom: i32,
-}
-
-impl Default for MouseState {
-    fn default() -> Self {
-        Self {
-            x: MOUSE_MAX_X / 2,
-            y: MOUSE_MAX_Y / 2,
-            buttons: 0,
-            show_count: -1, // hidden until the driver calls Show (AX=0001)
-            mickey_x: 0,
-            mickey_y: 0,
-            min_x: 0,
-            max_x: MOUSE_MAX_X,
-            min_y: 0,
-            max_y: MOUSE_MAX_Y,
-            press_count: [0; 3],
-            release_count: [0; 3],
-            last_press_x: [MOUSE_MAX_X / 2; 3],
-            last_press_y: [MOUSE_MAX_Y / 2; 3],
-            last_release_x: [MOUSE_MAX_X / 2; 3],
-            last_release_y: [MOUSE_MAX_Y / 2; 3],
-            event_mask: 0,
-            event_handler_segment: 0,
-            event_handler_offset: 0,
-            display_page: 0,
-            mickey_ratio_x: 8,
-            mickey_ratio_y: 16,
-            double_speed_threshold: 64,
-            update_left: 0,
-            update_top: 0,
-            update_right: MOUSE_MAX_X,
-            update_bottom: MOUSE_MAX_Y,
-        }
-    }
-}
-
-/// Virtual-screen bounds for the INT 33h cursor: a mode-13h game sees 0..639 x
-/// 0..199. 320-wide modes scale x internally; the driver always reports this
-/// doubled space, matching the Microsoft convention.
-const MOUSE_MAX_X: i32 = 639;
-const MOUSE_MAX_Y: i32 = 199;
-const MOUSE_STATE_BYTES: u16 = 44;
-const MOUSE_STATE_MAGIC: u16 = 0x334d;
-
-/// Return `(min, max)` so a range function accepts its limits in either order.
-fn order(a: i32, b: i32) -> (i32, i32) {
-    if a <= b { (a, b) } else { (b, a) }
-}
-
-impl MouseState {
-    fn set_buttons_at_current_position(&mut self, buttons: u8) {
-        let next = buttons & 0x07;
-        let changed = self.buttons ^ next;
-        for index in 0..3 {
-            let bit = 1u8 << index;
-            if changed & bit == 0 {
-                continue;
-            }
-            if next & bit != 0 {
-                self.press_count[index] = increment_mouse_event_count(self.press_count[index]);
-                self.last_press_x[index] = self.x;
-                self.last_press_y[index] = self.y;
-            } else {
-                self.release_count[index] = increment_mouse_event_count(self.release_count[index]);
-                self.last_release_x[index] = self.x;
-                self.last_release_y[index] = self.y;
-            }
-        }
-        self.buttons = next;
-    }
-
-    /// Fold a host pixel delta into the cursor position and the mickey counters,
-    /// and latch the new button mask. The mapping is one mickey per host pixel
-    /// (a sane 1:1 default), so the cursor tracks the host pointer directly. The
-    /// position is clamped to the configured ranges; the mickey counters are
-    /// raw motion and are not clamped (they reset on read, AX=000Bh).
-    fn apply_motion(&mut self, dx: i32, dy: i32, buttons: u8) {
-        self.mickey_x += dx;
-        self.mickey_y += dy;
-        self.x = (self.x + dx).clamp(self.min_x, self.max_x);
-        self.y = (self.y + dy).clamp(self.min_y, self.max_y);
-        self.set_buttons_at_current_position(buttons);
-    }
-}
-
-fn increment_mouse_event_count(value: u16) -> u16 {
-    value.saturating_add(1).min(0x7fff)
-}
-
-fn mouse_i32_to_i16_word(value: i32) -> u16 {
-    value.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16 as u16
-}
-
-fn mouse_i16_word_to_i32(value: u16) -> i32 {
-    i32::from(value as i16)
-}
+/// The GUI virtual pointer space the relative-delta synthesis spans: x 0..639,
+/// y 0..199, matching the GUI's own MOUSE_GUEST_MAX_X/Y. The center is where a
+/// fresh capture seeds last_abs so the first delta is not a large jump.
+const MOUSE_GUEST_MAX_X: i32 = 639;
+const MOUSE_GUEST_MAX_Y: i32 = 199;
+const MOUSE_GUEST_CENTER_X: i32 = MOUSE_GUEST_MAX_X / 2;
+const MOUSE_GUEST_CENTER_Y: i32 = MOUSE_GUEST_MAX_Y / 2;
 
 /// Build the CT1745 mixer from the profile's Sound Blaster power-on routing.
 /// The host config is applied once at construction like `SBCONFIG`; a guest
@@ -1342,7 +1221,7 @@ impl Machine {
             rtc_seconds: 0.0,
             fast_post: true,
             booter_inert: false,
-            mouse: MouseState::default(),
+            last_abs: (MOUSE_GUEST_CENTER_X, MOUSE_GUEST_CENTER_Y),
             unittester: unittester::UnitTester::default(),
             test_snapshot_path: None,
             xms,
@@ -2051,26 +1930,34 @@ impl Machine {
     /// Feed a host mouse delta and button mask to the PS/2 aux device. `dx`/`dy`
     /// are host pixels (y down positive); `buttons` is bit0 left, bit1 right,
     /// bit2 middle. The aux device queues a movement packet and, when data
-    /// reporting is enabled, this requests IRQ12 so a guest ISR runs. The same
-    /// delta drives the INT 33h cursor and mickey counters so the HLE driver
-    /// tracks the pointer even when no guest ISR consumes the hardware packets.
+    /// reporting is enabled, this requests IRQ12 so a guest ISR runs.
     pub fn inject_mouse(&mut self, dx: i32, dy: i32, buttons: u8) {
         if self.keyboard.inject_mouse(dx, dy, buttons) {
             self.pic.request(12);
         }
-        self.mouse.apply_motion(dx, dy, buttons);
     }
 
-    /// Set the absolute INT 33h cursor position directly, for the GUI's
-    /// absolute-pointer mode: the host maps the pointer's position over the screen
-    /// straight to the guest cursor, so there is no relative drift and nothing to
-    /// confine. `x` is 0..639, `y` is 0..199; both clamp to the active range.
-    /// Buttons use the same bit layout as `inject_mouse` (bit0 left, bit1 right,
-    /// bit2 middle). The BIOS setup/boot menus read this through INT 33h AX=0003h.
+    /// Map the GUI's absolute captured pointer onto relative aux-device motion.
+    /// The host pointer is clamped to the virtual space; the delta against the
+    /// previous position drives a PS/2 packet through the 8042, so the guest
+    /// INT 74h ISR and the mouse driver see real hardware motion. A button-only
+    /// change (zero delta) still injects a packet so the button edge reaches the
+    /// guest.
     pub fn set_mouse_absolute(&mut self, x: i32, y: i32, buttons: u8) {
-        self.mouse.x = x.clamp(self.mouse.min_x, self.mouse.max_x);
-        self.mouse.y = y.clamp(self.mouse.min_y, self.mouse.max_y);
-        self.mouse.set_buttons_at_current_position(buttons);
+        let x = x.clamp(0, MOUSE_GUEST_MAX_X);
+        let y = y.clamp(0, MOUSE_GUEST_MAX_Y);
+        let dx = x - self.last_abs.0;
+        let dy = y - self.last_abs.1;
+        self.last_abs = (x, y);
+        self.inject_mouse(dx, dy, buttons);
+    }
+
+    /// Seed the absolute-pointer origin without injecting motion, called when the
+    /// GUI enters capture and re-centres its pointer. Without this the first
+    /// post-capture update would diff against a stale position and synthesize a
+    /// large bogus delta.
+    pub fn seed_mouse_origin(&mut self, x: i32, y: i32) {
+        self.last_abs = (x.clamp(0, MOUSE_GUEST_MAX_X), y.clamp(0, MOUSE_GUEST_MAX_Y));
     }
 
     #[cfg(test)]
@@ -2087,6 +1974,20 @@ impl Machine {
     #[cfg(test)]
     fn irq12_pending(&self) -> bool {
         self.pic.irr_bit(12)
+    }
+
+    /// Set the 8042 command byte's IRQ1+IRQ12 enable bits the way the keyboard
+    /// BIOS does, so a latched aux byte arms IRQ12. `int15_machine` boots a zeroed
+    /// ROM that never runs that BIOS, so a test that wants IRQ12 must do this
+    /// first.
+    #[cfg(test)]
+    fn enable_8042_irq12(&mut self) {
+        let mut bus = self.make_bus();
+        bus.write_io(0x64, BusWidth::Byte, 0x20).unwrap();
+        let ccb = bus.read_io(0x60, BusWidth::Byte).unwrap() as u8;
+        bus.write_io(0x64, BusWidth::Byte, 0x60).unwrap();
+        bus.write_io(0x60, BusWidth::Byte, u32::from(ccb | 0x01 | 0x02))
+            .unwrap();
     }
 
     #[cfg(test)]
@@ -4320,17 +4221,18 @@ impl Machine {
     fn int15_c2_pointing_device(&mut self, al: u8) {
         let bh = (self.cpu.registers.ebx() as u16 >> 8) as u8;
         match al {
-            // C200 enable/disable (BH=0 disable, 1 enable). Accept either; the cursor
-            // visibility is driven through INT 33h, so this only acknowledges.
+            // C200 enable/disable (BH=0 disable, 1 enable). Enable or disable
+            // hardware aux data reporting so IRQ12 packets stream to the guest
+            // INT 74h ISR. The cursor itself is the driver's INT 33h state.
             0x00 => {
+                self.keyboard.set_mouse_reporting(bh != 0);
                 self.set_eax_ah(0x00);
                 self.set_int_frame_carry(false);
             }
             // C201 reset: BH=0x00 (device id, a standard mouse), BL=0xAA (the
             // reset-complete/BAT-passed signature the device returns; drivers probe
-            // for AAh here). Re-centre the modeled mouse like a reset.
+            // for AAh here). Acknowledge with the signature.
             0x01 => {
-                self.mouse = MouseState::default();
                 let ebx = (self.cpu.registers.ebx() & !0xFFFF) | 0x00AA;
                 self.cpu.registers.set_ebx(ebx);
                 self.set_eax_ah(0x00);
@@ -4349,10 +4251,11 @@ impl Machine {
                 self.set_eax_ah(0x00);
                 self.set_int_frame_carry(false);
             }
-            // C205 initialize (BH=packet size, 3 for a standard mouse): reset the
-            // modeled state and acknowledge.
+            // C205 initialize (BH=packet size, 3 for a standard mouse): enable
+            // hardware aux reporting and acknowledge. The driver does a C200
+            // enable afterwards too; both leave reporting on without re-centring.
             0x05 => {
-                self.mouse = MouseState::default();
+                self.keyboard.set_mouse_reporting(true);
                 self.set_eax_ah(0x00);
                 self.set_int_frame_carry(false);
             }
@@ -4727,294 +4630,6 @@ impl Machine {
     fn set_ah(&mut self, ah: u8) {
         let eax = (self.cpu.registers.eax() & !0xFF00) | (u32::from(ah) << 8);
         self.cpu.registers.set_eax(eax);
-    }
-
-    fn mouse_state_addr(&self) -> u32 {
-        self.cpu.registers.segment(SegmentIndex::Es).base
-            + u32::from(self.cpu.registers.edx() as u16)
-    }
-
-    fn write_mouse_state(&mut self, addr: u32) {
-        let fields = [
-            MOUSE_STATE_MAGIC,
-            self.mouse.x as u16,
-            self.mouse.y as u16,
-            self.mouse.min_x as u16,
-            self.mouse.max_x as u16,
-            self.mouse.min_y as u16,
-            self.mouse.max_y as u16,
-            u16::from(self.mouse.buttons),
-            mouse_i32_to_i16_word(self.mouse.show_count),
-            mouse_i32_to_i16_word(self.mouse.mickey_x),
-            mouse_i32_to_i16_word(self.mouse.mickey_y),
-            self.mouse.display_page,
-            self.mouse.mickey_ratio_x,
-            self.mouse.mickey_ratio_y,
-            self.mouse.double_speed_threshold,
-            self.mouse.event_mask,
-            self.mouse.event_handler_offset,
-            self.mouse.event_handler_segment,
-            self.mouse.update_left as u16,
-            self.mouse.update_top as u16,
-            self.mouse.update_right as u16,
-            self.mouse.update_bottom as u16,
-        ];
-        for (index, value) in fields.into_iter().enumerate() {
-            self.write_physical_u16(addr + (index as u32) * 2, value);
-        }
-    }
-
-    fn read_mouse_state(&mut self, addr: u32) {
-        if self.read_physical_u16(addr) != MOUSE_STATE_MAGIC {
-            return;
-        }
-        self.mouse.x = i32::from(self.read_physical_u16(addr + 2)).clamp(0, MOUSE_MAX_X);
-        self.mouse.y = i32::from(self.read_physical_u16(addr + 4)).clamp(0, MOUSE_MAX_Y);
-        self.mouse.min_x = i32::from(self.read_physical_u16(addr + 6)).clamp(0, MOUSE_MAX_X);
-        self.mouse.max_x = i32::from(self.read_physical_u16(addr + 8)).clamp(0, MOUSE_MAX_X);
-        self.mouse.min_y = i32::from(self.read_physical_u16(addr + 10)).clamp(0, MOUSE_MAX_Y);
-        self.mouse.max_y = i32::from(self.read_physical_u16(addr + 12)).clamp(0, MOUSE_MAX_Y);
-        if self.mouse.min_x > self.mouse.max_x {
-            std::mem::swap(&mut self.mouse.min_x, &mut self.mouse.max_x);
-        }
-        if self.mouse.min_y > self.mouse.max_y {
-            std::mem::swap(&mut self.mouse.min_y, &mut self.mouse.max_y);
-        }
-        self.mouse.buttons = self.read_physical_u16(addr + 14) as u8 & 0x07;
-        self.mouse.show_count = mouse_i16_word_to_i32(self.read_physical_u16(addr + 16));
-        self.mouse.mickey_x = mouse_i16_word_to_i32(self.read_physical_u16(addr + 18));
-        self.mouse.mickey_y = mouse_i16_word_to_i32(self.read_physical_u16(addr + 20));
-        self.mouse.display_page = self.read_physical_u16(addr + 22);
-        self.mouse.mickey_ratio_x = self.read_physical_u16(addr + 24);
-        self.mouse.mickey_ratio_y = self.read_physical_u16(addr + 26);
-        self.mouse.double_speed_threshold = self.read_physical_u16(addr + 28);
-        self.mouse.event_mask = self.read_physical_u16(addr + 30);
-        self.mouse.event_handler_offset = self.read_physical_u16(addr + 32);
-        self.mouse.event_handler_segment = self.read_physical_u16(addr + 34);
-        self.mouse.update_left = i32::from(self.read_physical_u16(addr + 36)).clamp(0, MOUSE_MAX_X);
-        self.mouse.update_top = i32::from(self.read_physical_u16(addr + 38)).clamp(0, MOUSE_MAX_Y);
-        self.mouse.update_right =
-            i32::from(self.read_physical_u16(addr + 40)).clamp(0, MOUSE_MAX_X);
-        self.mouse.update_bottom =
-            i32::from(self.read_physical_u16(addr + 42)).clamp(0, MOUSE_MAX_Y);
-        self.mouse.x = self.mouse.x.clamp(self.mouse.min_x, self.mouse.max_x);
-        self.mouse.y = self.mouse.y.clamp(self.mouse.min_y, self.mouse.max_y);
-    }
-
-    /// Service the INT 33h mouse driver (Microsoft API). The PS/2 aux device is
-    /// the hardware behind it; this HLE tracks the same position and button
-    /// edges the host feeds through `inject_mouse`, so a game that polls INT 33h
-    /// sees the pointer without writing its own IRQ12 ISR. Guest callback
-    /// vectors are stored for API compatibility, but not invoked yet.
-    fn handle_int33(&mut self) {
-        let ax = self.cpu.registers.eax() as u16;
-        let bx = self.cpu.registers.ebx() as u16;
-        let cx = self.cpu.registers.ecx() as u16;
-        let dx = self.cpu.registers.edx() as u16;
-        let si = self.cpu.registers.esi() as u16;
-        let di = self.cpu.registers.edi() as u16;
-        match ax {
-            // AX=0000: reset driver and read status. Re-centre the cursor, hide
-            // it, clear motion, and report "installed, 2 buttons".
-            0x0000 => {
-                self.mouse = MouseState::default();
-                self.set_ax(0xFFFF); // driver installed
-                self.set_bx(0x0002); // two-button mouse
-            }
-            // AX=0001: show cursor. The visibility counter counts up toward 0 and
-            // saturates there, never going positive. From the reset value of -1 a single
-            // Show reaches the visible state (0); the saturation keeps extra Shows from
-            // banking credit, so N hides require exactly N shows to undo (RBIL INT 33h
-            // AX=0002 note). `.min(0)` is the high-end cap, not a clamp to a maximum of 0
-            // from below.
-            0x0001 => {
-                self.mouse.show_count = (self.mouse.show_count + 1).min(0);
-            }
-            // AX=0002: hide cursor. Decrement without a lower bound, so successive hides
-            // stack and each needs a matching show to reverse.
-            0x0002 => {
-                self.mouse.show_count -= 1;
-            }
-            // AX=0003: return position and button status.
-            0x0003 => {
-                self.set_bx(u16::from(self.mouse.buttons));
-                self.set_cx(self.mouse.x as u16);
-                self.set_dx(self.mouse.y as u16);
-            }
-            // AX=0004: position the cursor at CX (column), DX (row), clamped.
-            0x0004 => {
-                self.mouse.x = i32::from(cx).clamp(self.mouse.min_x, self.mouse.max_x);
-                self.mouse.y = i32::from(dx).clamp(self.mouse.min_y, self.mouse.max_y);
-            }
-            // AX=0005/0006: return button press/release counts since the last
-            // query for the requested button, plus the last position where it
-            // changed state.
-            0x0005 | 0x0006 => {
-                let index = usize::from(bx);
-                let (count, x, y) = if index < 3 {
-                    if ax == 0x0005 {
-                        let out = (
-                            self.mouse.press_count[index],
-                            self.mouse.last_press_x[index],
-                            self.mouse.last_press_y[index],
-                        );
-                        self.mouse.press_count[index] = 0;
-                        out
-                    } else {
-                        let out = (
-                            self.mouse.release_count[index],
-                            self.mouse.last_release_x[index],
-                            self.mouse.last_release_y[index],
-                        );
-                        self.mouse.release_count[index] = 0;
-                        out
-                    }
-                } else {
-                    (0, self.mouse.x, self.mouse.y)
-                };
-                self.set_ax(u16::from(self.mouse.buttons));
-                self.set_bx(count);
-                self.set_cx(x as u16);
-                self.set_dx(y as u16);
-            }
-            // AX=0007: define horizontal range (CX..DX). A reversed pair is
-            // swapped, the way the driver normalizes the limits.
-            0x0007 => {
-                let (lo, hi) = order(i32::from(cx), i32::from(dx));
-                self.mouse.min_x = lo.clamp(0, MOUSE_MAX_X);
-                self.mouse.max_x = hi.clamp(0, MOUSE_MAX_X);
-                self.mouse.x = self.mouse.x.clamp(self.mouse.min_x, self.mouse.max_x);
-            }
-            // AX=0008: define vertical range (CX..DX).
-            0x0008 => {
-                let (lo, hi) = order(i32::from(cx), i32::from(dx));
-                self.mouse.min_y = lo.clamp(0, MOUSE_MAX_Y);
-                self.mouse.max_y = hi.clamp(0, MOUSE_MAX_Y);
-                self.mouse.y = self.mouse.y.clamp(self.mouse.min_y, self.mouse.max_y);
-            }
-            // AX=0009/000A: cursor shape definitions. Rendering the software cursor
-            // is not modeled, but accepting the definitions keeps setup code from
-            // treating the driver as absent.
-            0x0009 | 0x000A => {}
-            // AX=000B: read and clear the mickey motion counters. Returned as
-            // 16-bit signed deltas; positive is right/down.
-            0x000B => {
-                self.set_cx(self.mouse.mickey_x as i16 as u16);
-                self.set_dx(self.mouse.mickey_y as i16 as u16);
-                self.mouse.mickey_x = 0;
-                self.mouse.mickey_y = 0;
-            }
-            // AX=000C: define the user event callback. The HLE stores it so later
-            // exchange/query calls see a coherent driver state.
-            0x000C => {
-                self.mouse.event_mask = cx;
-                self.mouse.event_handler_segment =
-                    self.cpu.registers.segment(SegmentIndex::Es).selector;
-                self.mouse.event_handler_offset = dx;
-            }
-            // AX=000D/000E: light-pen emulation toggle. INT 10h light pen state is
-            // not modeled, so the toggle is accepted as inert.
-            0x000D | 0x000E => {}
-            // AX=000F: define mickey-to-pixel ratio.
-            0x000F => {
-                self.mouse.mickey_ratio_x = cx;
-                self.mouse.mickey_ratio_y = dx;
-            }
-            // AX=0010: define the screen region where the cursor is hidden while
-            // the application updates it.
-            0x0010 => {
-                let (left, right) = order(i32::from(cx), i32::from(si));
-                let (top, bottom) = order(i32::from(dx), i32::from(di));
-                self.mouse.update_left = left.clamp(0, MOUSE_MAX_X);
-                self.mouse.update_right = right.clamp(0, MOUSE_MAX_X);
-                self.mouse.update_top = top.clamp(0, MOUSE_MAX_Y);
-                self.mouse.update_bottom = bottom.clamp(0, MOUSE_MAX_Y);
-            }
-            // AX=0012: large graphics cursor block accepted.
-            0x0012 => {
-                self.set_ax(0xFFFF);
-            }
-            // AX=0013: define double-speed threshold; zero restores the default.
-            0x0013 => {
-                self.mouse.double_speed_threshold = if dx == 0 { 64 } else { dx };
-            }
-            // AX=0014: exchange user event callbacks.
-            0x0014 => {
-                let old_mask = self.mouse.event_mask;
-                let old_seg = self.mouse.event_handler_segment;
-                let old_off = self.mouse.event_handler_offset;
-                self.mouse.event_mask = cx;
-                self.mouse.event_handler_segment =
-                    self.cpu.registers.segment(SegmentIndex::Es).selector;
-                self.mouse.event_handler_offset = dx;
-                self.set_cx(old_mask);
-                self.cpu
-                    .registers
-                    .set_segment(SegmentIndex::Es, SegmentRegister::real(old_seg));
-                self.set_dx(old_off);
-            }
-            // AX=0015/0042: report the size of the opaque save-state buffer.
-            0x0015 => {
-                self.set_bx(MOUSE_STATE_BYTES);
-            }
-            0x0042 => {
-                self.set_ax(0xFFFF);
-                self.set_bx(MOUSE_STATE_BYTES);
-            }
-            // AX=0016/0050: save driver state to ES:DX.
-            0x0016 | 0x0050 => {
-                let addr = self.mouse_state_addr();
-                self.write_mouse_state(addr);
-                if ax == 0x0050 {
-                    self.set_ax(0xFFFF);
-                }
-            }
-            // AX=0017/0052: restore driver state from ES:DX.
-            0x0017 | 0x0052 => {
-                let addr = self.mouse_state_addr();
-                self.read_mouse_state(addr);
-                if ax == 0x0052 {
-                    self.set_ax(0xFFFF);
-                }
-            }
-            // AX=001A/001B: set/query sensitivity values.
-            0x001A => {
-                self.mouse.mickey_ratio_x = bx;
-                self.mouse.mickey_ratio_y = cx;
-                self.mouse.double_speed_threshold = if dx == 0 { 64 } else { dx };
-            }
-            0x001B => {
-                self.set_bx(self.mouse.mickey_ratio_x);
-                self.set_cx(self.mouse.mickey_ratio_y);
-                self.set_dx(self.mouse.double_speed_threshold);
-            }
-            // AX=001D/001E: define/query display page number.
-            0x001D => {
-                self.mouse.display_page = bx;
-            }
-            0x001E => {
-                self.set_bx(self.mouse.display_page);
-            }
-            // AX=0021: software reset/detect, identical to AX=0000 except that it
-            // does not clear the driver state.
-            0x0021 => {
-                self.set_ax(0xFFFF);
-                self.set_bx(0x0002);
-            }
-            // AX=0022/0023: US mouse driver language.
-            0x0022 => {}
-            0x0023 => {
-                self.set_bx(0x0000);
-            }
-            // AX=0024: version/type/IRQ. Report a PS/2 mouse with the standard
-            // driver-version shape used by Microsoft-compatible drivers.
-            0x0024 if bx == 0 => {
-                self.set_bx(0x0820);
-                self.set_cx(0x0400);
-            }
-            // Other functions are accepted as no-ops, leaving registers as-is.
-            _ => {}
-        }
     }
 
     /// Service INT 2Ah. The network installation check reports absent, direct
@@ -11317,7 +10932,6 @@ impl Machine {
                             0x2E => {
                                 self.handle_int2e()?;
                             }
-                            0x33 => self.handle_int33(),
                             0x5C => self.handle_absent_resident_api(0x5C),
                             0x60 => self.handle_absent_resident_api(0x60),
                             0x68 => self.handle_absent_resident_api(0x68),
@@ -11939,7 +11553,6 @@ impl CpuBus for MachineBus<'_> {
                 | 0x2A
                 | 0x2E
                 | 0x2F
-                | 0x33
                 | 0x40
                 | 0x42
                 | 0x66
@@ -15796,154 +15409,6 @@ mod tests {
             0x29
         );
         assert_eq!(machine.video.read_u8(0).unwrap(), b'.');
-    }
-
-    #[test]
-    fn int33_show_hide_cursor_counter_follows_microsoft_contract() {
-        let mut m = int15_machine(16);
-        // AX=0000 reset: the visibility counter starts hidden at -1.
-        m.cpu.registers.set_eax(0x0000);
-        m.handle_int33();
-        assert_eq!(m.mouse.show_count, -1);
-        // One Show (AX=0001) reaches the visible state (0).
-        m.cpu.registers.set_eax(0x0001);
-        m.handle_int33();
-        assert_eq!(m.mouse.show_count, 0);
-        // A second Show saturates at 0 rather than going positive.
-        m.cpu.registers.set_eax(0x0001);
-        m.handle_int33();
-        assert_eq!(m.mouse.show_count, 0);
-        // RBIL: N hides require N shows to unhide. Three hides take it to -3.
-        for _ in 0..3 {
-            m.cpu.registers.set_eax(0x0002);
-            m.handle_int33();
-        }
-        assert_eq!(m.mouse.show_count, -3);
-        // Two shows are not enough; the cursor stays hidden (< 0).
-        for _ in 0..2 {
-            m.cpu.registers.set_eax(0x0001);
-            m.handle_int33();
-        }
-        assert!(m.mouse.show_count < 0);
-        // The third show finally restores the visible state.
-        m.cpu.registers.set_eax(0x0001);
-        m.handle_int33();
-        assert_eq!(m.mouse.show_count, 0);
-    }
-
-    #[test]
-    fn int33_button_press_and_release_counts_reset_after_query() {
-        let mut m = int15_machine(16);
-        let start_x = m.mouse.x as u16;
-        let start_y = m.mouse.y as u16;
-
-        m.inject_mouse(0, 0, 0x01);
-        m.cpu.registers.set_eax(0x0005);
-        m.cpu.registers.set_ebx(0x0000);
-        m.handle_int33();
-
-        assert_eq!(m.cpu.registers.eax() as u16, 0x0001);
-        assert_eq!(m.cpu.registers.ebx() as u16, 1);
-        assert_eq!(m.cpu.registers.ecx() as u16, start_x);
-        assert_eq!(m.cpu.registers.edx() as u16, start_y);
-
-        m.cpu.registers.set_eax(0x0005);
-        m.cpu.registers.set_ebx(0x0000);
-        m.handle_int33();
-        assert_eq!(m.cpu.registers.ebx() as u16, 0, "press count is consumed");
-
-        m.inject_mouse(2, 3, 0x00);
-        m.cpu.registers.set_eax(0x0006);
-        m.cpu.registers.set_ebx(0x0000);
-        m.handle_int33();
-
-        assert_eq!(m.cpu.registers.eax() as u16, 0x0000);
-        assert_eq!(m.cpu.registers.ebx() as u16, 1);
-        assert_eq!(m.cpu.registers.ecx() as u16, start_x + 2);
-        assert_eq!(m.cpu.registers.edx() as u16, start_y + 3);
-    }
-
-    #[test]
-    fn int33_state_display_page_sensitivity_and_callback_round_trip() {
-        let mut m = int15_machine(16);
-        m.cpu.registers.set_eax(0x0004);
-        m.cpu.registers.set_ecx(111);
-        m.cpu.registers.set_edx(44);
-        m.handle_int33();
-        m.cpu.registers.set_eax(0x001A);
-        m.cpu.registers.set_ebx(9);
-        m.cpu.registers.set_ecx(10);
-        m.cpu.registers.set_edx(11);
-        m.handle_int33();
-        m.cpu.registers.set_eax(0x001D);
-        m.cpu.registers.set_ebx(3);
-        m.handle_int33();
-        m.cpu.registers.set_eax(0x000C);
-        m.cpu.registers.set_ecx(0x001F);
-        m.cpu
-            .registers
-            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x4567));
-        m.cpu.registers.set_edx(0x89AB);
-        m.handle_int33();
-
-        m.cpu.registers.set_eax(0x0015);
-        m.handle_int33();
-        assert_eq!(m.cpu.registers.ebx() as u16, MOUSE_STATE_BYTES);
-        m.cpu.registers.set_eax(0x0042);
-        m.handle_int33();
-        assert_eq!(m.cpu.registers.eax() as u16, 0xFFFF);
-        assert_eq!(m.cpu.registers.ebx() as u16, MOUSE_STATE_BYTES);
-
-        m.cpu
-            .registers
-            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x3000));
-        m.cpu.registers.set_edx(0x0100);
-        m.cpu.registers.set_eax(0x0016);
-        m.handle_int33();
-
-        m.cpu.registers.set_eax(0x0004);
-        m.cpu.registers.set_ecx(1);
-        m.cpu.registers.set_edx(2);
-        m.handle_int33();
-        m.cpu.registers.set_eax(0x001A);
-        m.cpu.registers.set_ebx(30);
-        m.cpu.registers.set_ecx(31);
-        m.cpu.registers.set_edx(32);
-        m.handle_int33();
-        m.cpu.registers.set_eax(0x001D);
-        m.cpu.registers.set_ebx(7);
-        m.handle_int33();
-
-        m.cpu
-            .registers
-            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x3000));
-        m.cpu.registers.set_edx(0x0100);
-        m.cpu.registers.set_eax(0x0017);
-        m.handle_int33();
-
-        m.cpu.registers.set_eax(0x0003);
-        m.handle_int33();
-        assert_eq!(m.cpu.registers.ecx() as u16, 111);
-        assert_eq!(m.cpu.registers.edx() as u16, 44);
-        m.cpu.registers.set_eax(0x001B);
-        m.handle_int33();
-        assert_eq!(m.cpu.registers.ebx() as u16, 9);
-        assert_eq!(m.cpu.registers.ecx() as u16, 10);
-        assert_eq!(m.cpu.registers.edx() as u16, 11);
-        m.cpu.registers.set_eax(0x001E);
-        m.handle_int33();
-        assert_eq!(m.cpu.registers.ebx() as u16, 3);
-
-        m.cpu.registers.set_eax(0x0014);
-        m.cpu.registers.set_ecx(0x00AA);
-        m.cpu
-            .registers
-            .set_segment(SegmentIndex::Es, SegmentRegister::real(0x1111));
-        m.cpu.registers.set_edx(0x2222);
-        m.handle_int33();
-        assert_eq!(m.cpu.registers.ecx() as u16, 0x001F);
-        assert_eq!(m.cpu.registers.edx() as u16, 0x89AB);
-        assert_eq!(m.cpu.registers.segment(SegmentIndex::Es).selector, 0x4567);
     }
 
     #[test]
@@ -20410,50 +19875,31 @@ mod tests {
     }
 
     #[test]
-    fn int33_set_then_get_position_round_trips() {
-        // Stub: set the cursor to (100, 50) via AX=0004, then read it back via
-        // AX=0003. The host injects a left-button-down move first so the get
-        // reports the button mask too. After the get, BX=buttons, CX=col, DX=row.
-        let rom = rom_with_code(&[
-            0xB8, 0x04, 0x00, // mov ax, 0x0004 (set position)
-            0xB9, 0x64, 0x00, // mov cx, 100 (column)
-            0xBA, 0x32, 0x00, // mov dx, 50 (row)
-            0xCD, 0x33, // int 33h
-            0xB8, 0x03, 0x00, // mov ax, 0x0003 (get position + buttons)
-            0xCD, 0x33, // int 33h
-            0xF4, // hlt
-        ]);
-        let mut machine =
-            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
-        // A prior host move sets the left button; position is overwritten by the
-        // AX=0004 set, so only the button mask survives into the get.
-        machine.inject_mouse(0, 0, 0x01);
-        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
-        assert_eq!(reason, StopReason::Halted);
-        let bx = machine.cpu().registers.ebx() as u16;
-        let cx = machine.cpu().registers.ecx() as u16;
-        let dx = machine.cpu().registers.edx() as u16;
-        assert_eq!(cx, 100, "column round-trips through set/get");
-        assert_eq!(dx, 50, "row round-trips through set/get");
-        assert_eq!(bx, 0x0001, "left button reported in BX");
+    fn c200_enable_lets_injected_motion_raise_irq12() {
+        let mut m = int15_machine(16);
+        // The 8042 command byte needs IRQ12 (bit1) enabled so a latched aux byte
+        // arms IRQ12. int15_machine boots a zeroed ROM that never runs the keyboard
+        // BIOS, so set it here the way that BIOS would.
+        m.enable_8042_irq12();
+        m.cpu.registers.set_eax(0xC200);
+        m.cpu.registers.set_ebx(0x0100); // BH=1 enable
+        m.handle_int15();
+        m.inject_mouse(4, -2, 0x01);
+        assert!(m.irq12_pending(), "C200 enable lets a packet raise IRQ12");
     }
 
     #[test]
-    fn int33_reset_reports_present_and_two_buttons() {
-        // Stub: AX=0000 reset/detect, then halt. AX=FFFFh (installed), BX=2.
-        let rom = rom_with_code(&[
-            0x31, 0xC0, // xor ax, ax (AX=0000)
-            0xCD, 0x33, // int 33h
-            0xF4, // hlt
-        ]);
-        let mut machine =
-            Machine::new(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), rom).unwrap();
-        let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
-        assert_eq!(reason, StopReason::Halted);
-        let ax = machine.cpu().registers.eax() as u16;
-        let bx = machine.cpu().registers.ebx() as u16;
-        assert_eq!(ax, 0xFFFF, "driver reports installed");
-        assert_eq!(bx, 0x0002, "two-button mouse");
+    fn set_mouse_absolute_synthesizes_relative_deltas() {
+        let mut m = int15_machine(16);
+        m.enable_8042_irq12();
+        m.cpu.registers.set_eax(0xC205);
+        m.handle_int15(); // initialize enables reporting
+        m.seed_mouse_origin(100, 100);
+        m.set_mouse_absolute(110, 97, 0x00); // +10 / -3 screen delta
+        assert!(
+            m.irq12_pending(),
+            "synthesized motion reaches the aux device"
+        );
     }
 
     #[test]

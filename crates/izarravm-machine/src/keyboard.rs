@@ -202,7 +202,6 @@ impl Keyboard8042 {
     /// INT 15h AX=C200/C205 services use. This flips the same flag the guest's
     /// 0xD4-routed 0xF4/0xF5 commands set, without queuing an ACK into the aux
     /// stream. It does not clear the queue or re-centre; that is the driver's job.
-    #[allow(dead_code)]
     pub fn set_mouse_reporting(&mut self, on: bool) {
         self.mouse.reporting = on;
     }
