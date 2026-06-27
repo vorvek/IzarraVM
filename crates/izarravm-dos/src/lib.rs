@@ -107,11 +107,20 @@ pub fn resolve_c_root_in(base: &Path, home: &Path) -> PathBuf {
     chosen
 }
 
-/// Resolve the C: root against the process working directory and the host home
-/// directory. `home_dir` is un-deprecated on the project MSRV and behaves
-/// correctly on Windows and Unix, so no `dirs` crate is pulled in.
+/// Resolve the C: root for a normal launch. Portable mode keys off the
+/// executable's own directory, not the process working directory: a release
+/// unpacked with a `c_drive` beside it stays self-contained, while launching the
+/// binary from an arbitrary folder (a dev tree, whatever the shell's cwd is)
+/// does not scatter `c_drive`, `cmos.bin`, and `izarravm.conf` there. With no
+/// `c_drive` next to the executable it falls back to the per-user
+/// `<home>/.izarravm`. `home_dir` is un-deprecated on the project MSRV and
+/// behaves correctly on Windows and Unix, so no `dirs` crate is pulled in.
 pub fn resolve_c_root() -> PathBuf {
-    let base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let base = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
     #[allow(deprecated)]
     let home = std::env::home_dir().unwrap_or_else(|| base.clone());
     resolve_c_root_in(&base, &home)
