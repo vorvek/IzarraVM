@@ -1946,10 +1946,23 @@ impl Machine {
     pub fn set_mouse_absolute(&mut self, x: i32, y: i32, buttons: u8) {
         let x = x.clamp(0, MOUSE_GUEST_MAX_X);
         let y = y.clamp(0, MOUSE_GUEST_MAX_Y);
-        let dx = x - self.last_abs.0;
-        let dy = y - self.last_abs.1;
+        let mut dx = x - self.last_abs.0;
+        let mut dy = y - self.last_abs.1;
         self.last_abs = (x, y);
-        self.inject_mouse(dx, dy, buttons);
+        // The host coalesces a frame of motion into one call, so the delta can
+        // exceed a single PS/2 packet's 9-bit range on a fast flick. Split it into
+        // packet-sized chunks instead of clamping, so the full motion reaches the
+        // guest. Always inject once so a button-only edge (zero delta) still fires.
+        loop {
+            let sx = dx.clamp(-255, 255);
+            let sy = dy.clamp(-255, 255);
+            self.inject_mouse(sx, sy, buttons);
+            dx -= sx;
+            dy -= sy;
+            if dx == 0 && dy == 0 {
+                break;
+            }
+        }
     }
 
     /// Seed the absolute-pointer origin without injecting motion, called when the

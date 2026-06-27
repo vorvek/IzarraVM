@@ -871,6 +871,11 @@ pub struct GuiApp {
     // Reset to the centre on capture enter.
     abs_x: f32,
     abs_y: f32,
+    // Raw motion accumulates into abs_x/abs_y on every DeviceEvent but the guest
+    // position is only flushed once per frame (set here, cleared in about_to_wait).
+    // An 8000 Hz mouse fires ~130 events per frame; sending one guest packet each
+    // floods the emulation thread with guest IRQ12s and stalls the UI thread.
+    mouse_dirty: bool,
     // The cpal stream is !Send, so it stays here on the UI thread; the
     // emulation thread gets a Send sink cloned from it.
     audio: Option<AudioPlayer>,
@@ -1008,6 +1013,7 @@ impl GuiApp {
             screen_rect: None,
             abs_x: 0.0,
             abs_y: 0.0,
+            mouse_dirty: false,
             audio,
             emu: None,
             frame_seq: u64::MAX,
@@ -1253,6 +1259,20 @@ impl GuiApp {
         let sy = MOUSE_GUEST_MAX_Y as f32 / (rect.height() * ppp).max(1.0);
         self.abs_x = (self.abs_x + dx * sx).clamp(0.0, MOUSE_GUEST_MAX_X as f32);
         self.abs_y = (self.abs_y + dy * sy).clamp(0.0, MOUSE_GUEST_MAX_Y as f32);
+        // Defer the guest send to the per-frame flush in about_to_wait; the machine
+        // diffs against its last position, so the dropped intermediate sends lose no
+        // motion (and a large coalesced delta is split across packets there).
+        self.mouse_dirty = true;
+    }
+
+    /// Send the latest accumulated guest cursor position, if it moved since the
+    /// last flush. Called once per frame so an 8000 Hz mouse drives the guest at
+    /// the refresh rate, not at the host polling rate.
+    fn flush_guest_motion(&mut self) {
+        if !self.mouse_dirty {
+            return;
+        }
+        self.mouse_dirty = false;
         if let Some(emu) = &self.emu {
             emu.send_mouse_absolute(self.abs_x as i32, self.abs_y as i32, self.last_buttons);
         }
@@ -2532,6 +2552,8 @@ impl ApplicationHandler for WinitApp {
         // WaitUntil below and spin the UI thread at host vsync.
         let now = Instant::now();
         if now >= self.next_frame {
+            // Flush a frame's worth of coalesced mouse motion as one guest packet.
+            self.gui.flush_guest_motion();
             if let Some(window) = &self.window {
                 window.request_redraw();
             }
