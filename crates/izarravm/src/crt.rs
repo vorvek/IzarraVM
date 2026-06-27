@@ -368,9 +368,9 @@ impl CallbackTrait for CrtCallback {
             if self.crt_on { 1.0 } else { 0.0 },
             if res.srgb { 1.0 } else { 0.0 },
         ];
-        let mut bytes = Vec::with_capacity(16);
-        for v in data {
-            bytes.extend_from_slice(&v.to_le_bytes());
+        let mut bytes = [0u8; 16];
+        for (i, v) in data.iter().enumerate() {
+            bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
         }
         queue.write_buffer(&res.uniform, 0, &bytes);
         Vec::new()
