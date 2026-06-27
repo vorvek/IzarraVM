@@ -148,9 +148,9 @@ fn toka_dos_marker(c_root: &Path) -> PathBuf {
     c_root.join("DOS").join("ICOMMAND.COM")
 }
 
-/// The default AUTOEXEC.BAT: put the tools directory on the PATH and set a
-/// path-showing prompt. DOS line endings (CRLF).
-const DEFAULT_AUTOEXEC_BAT: &str = "@ECHO OFF\r\nPATH=C:\\DOS\r\nPROMPT=$P$G\r\n";
+/// The default AUTOEXEC.BAT: put the tools directory on the PATH, set a
+/// path-showing prompt, and load the mouse driver. DOS line endings (CRLF).
+const DEFAULT_AUTOEXEC_BAT: &str = "@ECHO OFF\r\nPATH=C:\\DOS\r\nPROMPT=$P$G\r\nMOUSE\r\n";
 
 const DEFAULT_FILE_COUNT: u16 = 40;
 const DEFAULT_BUFFER_COUNT: u16 = 20;
