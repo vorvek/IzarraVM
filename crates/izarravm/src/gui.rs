@@ -941,6 +941,11 @@ pub struct GuiApp {
     // file sits next to the C: root and is rewritten on a change.
     prefs: GuiPrefs,
     prefs_path: PathBuf,
+    // Whether the beige control panel is expanded. Mirrors prefs.panel_open and
+    // is persisted on toggle.
+    panel_open: bool,
+    // The recoloured logo texture, loaded once on the first frame.
+    logo: Option<egui::TextureHandle>,
 }
 
 /// Which hotkey the config dialog is currently waiting to capture.
@@ -999,6 +1004,7 @@ impl GuiApp {
         // Restore the last mount if the source still exists on disk. An image
         // takes priority over a folder when both are recorded.
         let floppy_source = restore_floppy_source(&prefs);
+        let panel_open = prefs.panel_open;
         let mut app = Self {
             profile,
             rom,
@@ -1040,6 +1046,8 @@ impl GuiApp {
             config_dialog: None,
             prefs,
             prefs_path,
+            panel_open,
+            logo: None,
         };
         app.start();
         // Mount a config-provided CD image once the emulation thread is up.
@@ -1280,7 +1288,61 @@ impl GuiApp {
         }
     }
 
+    /// Toggle the panel and persist the new state.
+    fn toggle_panel(&mut self) {
+        self.panel_open = !self.panel_open;
+        self.prefs.panel_open = self.panel_open;
+        self.save_prefs();
+    }
+
+    /// The inboard edge tab shown while the panel is open: a full-height beige
+    /// nub with an inward chevron. Clicking collapses the panel.
+    fn open_handle(&mut self, ui: &mut egui::Ui) {
+        let h = ui.available_height().max(40.0);
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(14.0, h), egui::Sense::click());
+        bevel_rect(ui.painter(), rect, FACEPLATE, true);
+        let c = rect.center();
+        let s = egui::Stroke::new(1.5, INK);
+        // Chevron pointing right (push the panel away).
+        ui.painter()
+            .line_segment([c + egui::vec2(-3.0, -5.0), c + egui::vec2(3.0, 0.0)], s);
+        ui.painter()
+            .line_segment([c + egui::vec2(3.0, 0.0), c + egui::vec2(-3.0, 5.0)], s);
+        if resp.clicked() {
+            self.toggle_panel();
+        }
+    }
+
+    /// The collapsed strip pinned to the window's right edge: the whole strip is
+    /// the reopen tab, with an outward chevron. Clicking expands the panel.
+    fn collapsed_tab(&mut self, ui: &mut egui::Ui) {
+        let size = egui::vec2(ui.available_width(), ui.available_height());
+        let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+        bevel_rect(ui.painter(), rect, FACEPLATE, true);
+        let c = rect.center();
+        let s = egui::Stroke::new(1.5, INK);
+        // Chevron pointing left (pull the panel out).
+        ui.painter()
+            .line_segment([c + egui::vec2(3.0, -5.0), c + egui::vec2(-3.0, 0.0)], s);
+        ui.painter()
+            .line_segment([c + egui::vec2(-3.0, 0.0), c + egui::vec2(3.0, 5.0)], s);
+        if resp.clicked() {
+            self.toggle_panel();
+        }
+    }
+
     fn controls_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_top(|ui| {
+            self.open_handle(ui);
+            ui.add_space(8.0);
+            ui.vertical(|ui| {
+                beige_visuals(ui);
+                self.panel_body(ui);
+            });
+        });
+    }
+
+    fn panel_body(&mut self, ui: &mut egui::Ui) {
         let running = self.emu.is_some();
         let (mode, speed, floppy_accesses, c_accesses, cd_accesses) = match &self.emu {
             Some(emu) => {
@@ -1840,10 +1902,22 @@ impl GuiApp {
         }
         // Mirror the host lock keys onto the guest each frame.
         self.sync_guest_locks();
-        egui::SidePanel::right("controls")
-            .exact_width(320.0)
-            .resizable(false)
-            .show(ctx, |ui| self.controls_ui(ui));
+        let panel_frame = egui::Frame::new()
+            .fill(PANEL_FACE)
+            .inner_margin(egui::Margin::same(12));
+        if self.panel_open {
+            egui::SidePanel::right("controls")
+                .exact_width(320.0)
+                .resizable(false)
+                .frame(panel_frame)
+                .show(ctx, |ui| self.controls_ui(ui));
+        } else {
+            egui::SidePanel::right("controls-tab")
+                .exact_width(18.0)
+                .resizable(false)
+                .frame(panel_frame)
+                .show(ctx, |ui| self.collapsed_tab(ui));
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(egui::Color32::BLACK))
             .show(ctx, |ui| self.monitor_ui(ui));
