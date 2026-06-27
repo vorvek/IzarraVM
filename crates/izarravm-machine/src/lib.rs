@@ -17644,6 +17644,75 @@ mod tests {
     }
 
     #[test]
+    fn ega_graphics_brown_and_bright_colors_render_through_the_dac() {
+        // End-to-end guard for the EGA/CGA palette: a guest draws brown (color 6)
+        // and the bright eight in an EGA graphics mode, and the composited frame
+        // (the same pixels the unit-tester CRC hashes) must show the real RGB, not
+        // the 256-color palette3 gray/color ramps that brown and 0x38-0x3F land on.
+        // The boot-suite video checks only touch safe colors, so they missed this.
+        //
+        // Per pixel: AH=0Ch AL=color BH=0 (page) CX=col DX=row, then INT 10h.
+        fn draw(code: &mut Vec<u8>, color: u8, col: u16, row: u16) {
+            code.extend_from_slice(&[0xB8, color, 0x0C]); // mov ax, 0x0C00 | color
+            code.extend_from_slice(&[0xBB, 0x00, 0x00]); // mov bx, 0 (page 0)
+            code.push(0xB9);
+            code.extend_from_slice(&col.to_le_bytes()); // mov cx, col
+            code.push(0xBA);
+            code.extend_from_slice(&row.to_le_bytes()); // mov dx, row
+            code.extend_from_slice(&[0xCD, 0x10]); // int 0x10
+        }
+
+        // Color number -> expected 0x00RRGGBB, the same in both modes: brown, dark
+        // gray, bright blue, yellow, bright white, and light gray as a control that
+        // was already correct (it never used a remapped DAC entry).
+        let samples: [(u8, u32); 6] = [
+            (6, 0x00AA_5500),
+            (8, 0x0055_5555),
+            (9, 0x0055_55FF),
+            (14, 0x00FF_FF55),
+            (15, 0x00FF_FFFF),
+            (7, 0x00AA_AAAA),
+        ];
+
+        // Mode 10h (640x350, palette2 via the EGA attribute remap) is 1:1; mode 0Dh
+        // (320x200, palette1, the Monkey Island mode) is double-scanned, so source
+        // row R lands on output raster rows 2R and 2R+1.
+        for (mode, row, scan) in [(0x10u8, 100u16, 1usize), (0x0Du8, 50u16, 2usize)] {
+            let mut code = vec![0xB8, mode, 0x00, 0xCD, 0x10]; // mov ax,00<mode>h; int 10h
+            for (i, (color, _)) in samples.iter().enumerate() {
+                draw(&mut code, *color, 10 + i as u16 * 10, row);
+            }
+            code.push(0xF4); // hlt
+
+            let mut machine = Machine::new(
+                MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+                rom_with_code(&code),
+            )
+            .unwrap();
+            assert_eq!(
+                machine.run_until_halt_or_cycles(5_000_000).unwrap(),
+                StopReason::Halted,
+                "mode {mode:#04x} guest ran to hlt"
+            );
+            // Present two whole frames so the final render is a clean full frame of
+            // the drawn VRAM (advance only resets the scanline cursor past one frame).
+            let dots = machine.video_mut().frame_dots();
+            machine.video_mut().advance(dots * 2);
+
+            let (frame, width, _height) = machine.frame_argb();
+            let raster_row = row as usize * scan;
+            for (i, (color, want)) in samples.iter().enumerate() {
+                let col = 10 + i * 10;
+                let got = frame[raster_row * width + col];
+                assert_eq!(
+                    got, *want,
+                    "mode {mode:#04x} color {color}: got {got:#08x}, want {want:#08x}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn int10_mode_set_bit7_preserves_cga_framebuffer() {
         let mut m = int15_machine(16);
         m.cpu.registers.set_eax(0x0004);
