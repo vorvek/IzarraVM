@@ -251,61 +251,6 @@ fn open_in_file_manager(path: &Path) {
     }
 }
 
-#[derive(Clone, Copy)]
-enum DriveIcon {
-    Floppy,
-    Cd,
-    Hdd,
-}
-
-/// Draw a small drive-type glyph inline and advance the cursor. Painter shapes
-/// rather than emoji, so it renders the same regardless of the font's emoji
-/// coverage.
-fn drive_icon(ui: &mut egui::Ui, kind: DriveIcon) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-    let col = ui.visuals().text_color();
-    let dim = egui::Color32::from_gray(120);
-    let stroke = egui::Stroke::new(1.0, col);
-    let p = ui.painter();
-    let body = rect.shrink(2.0);
-    match kind {
-        DriveIcon::Floppy => {
-            p.rect_stroke(body, 1.0, stroke, egui::StrokeKind::Inside);
-            // Metal shutter at the top, label patch at the bottom.
-            let shutter = egui::Rect::from_min_size(
-                body.left_top() + egui::vec2(body.width() * 0.5, 1.0),
-                egui::vec2(body.width() * 0.3, body.height() * 0.35),
-            );
-            p.rect_filled(shutter, 0.0, dim);
-            let label = egui::Rect::from_min_max(
-                body.left_bottom() + egui::vec2(2.0, -body.height() * 0.4),
-                body.right_bottom() + egui::vec2(-2.0, -1.0),
-            );
-            p.rect_filled(label, 0.0, dim);
-        }
-        DriveIcon::Cd => {
-            let c = body.center();
-            p.circle_stroke(c, body.width() * 0.45, stroke);
-            p.circle_filled(c, 1.5, col);
-        }
-        DriveIcon::Hdd => {
-            p.rect_stroke(body, 2.0, stroke, egui::StrokeKind::Inside);
-            p.circle_filled(body.right_bottom() + egui::vec2(-3.5, -3.5), 1.5, col);
-        }
-    }
-}
-
-/// A small square LED that glows green when a drive was just accessed.
-fn access_led(ui: &mut egui::Ui, lit: bool) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-    let color = if lit {
-        egui::Color32::from_rgb(48, 220, 64)
-    } else {
-        egui::Color32::from_rgb(28, 52, 30)
-    };
-    ui.painter().rect_filled(rect.shrink(1.0), 2.0, color);
-}
-
 /// Apply the beige theme to a ui subtree: dark ink text and faceplate-coloured
 /// widgets with bevel-toned borders, so standard egui buttons, sliders, and
 /// selectable labels inside it read as plastic without bespoke widgets.
@@ -1661,93 +1606,140 @@ impl GuiApp {
         }
     }
 
-    /// The three drive rows: A: floppy (load IMG/folder, eject), CD-ROM (the same
-    /// pair, disabled for now), and C: (open the host folder, no mount). `running`
-    /// gates the floppy actions on a live emulation thread to send commands to.
+    /// The three drive bays. `running` gates the media actions on a live
+    /// emulation thread to send commands to.
     fn drives_ui(&mut self, ui: &mut egui::Ui, running: bool) {
         let lit = |at: Option<Instant>| at.is_some_and(|t| t.elapsed() < LED_GLOW);
         let floppy_lit = lit(self.floppy_access_at);
         let c_lit = lit(self.c_access_at);
         let cd_lit = lit(self.cd_access_at);
 
-        // A: floppy. Icon, name, then the access LED on the header row; the drive
-        // letter in the header makes the status line below it letter-free.
-        ui.horizontal(|ui| {
-            drive_icon(ui, DriveIcon::Floppy);
-            ui.label("A: floppy");
-            access_led(ui, floppy_lit);
-        });
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(running, egui::Button::new("Load IMG..."))
-                .clicked()
-            {
-                self.load_floppy_img();
-            }
-            if ui
-                .add_enabled(running, egui::Button::new("Load folder..."))
-                .clicked()
-            {
-                self.load_floppy_folder();
-            }
-            let mounted = self.floppy_label.is_some();
-            if ui
-                .add_enabled(running && mounted, egui::Button::new("Eject"))
-                .clicked()
-            {
-                if let Some(emu) = &self.emu {
-                    emu.eject_floppy();
+        // Floppy A:
+        beige_group(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("FLOPPY  A:").color(LABEL).size(11.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    activity_led(ui, floppy_lit);
+                });
+            });
+            ui.horizontal(|ui| {
+                let w = (ui.available_width() - 30.0).max(20.0);
+                let (slot, _) = ui.allocate_exact_size(egui::vec2(w, 10.0), egui::Sense::hover());
+                bevel_rect(ui.painter(), slot, RECESS, false);
+                let mounted = self.floppy_label.is_some();
+                if eject_button(ui, running && mounted) {
+                    self.eject_floppy_action();
                 }
-                self.floppy_label = None;
-                self.floppy_source = None;
-                // Forget the mount so it is not restored next launch.
-                self.prefs.last_floppy_image = None;
-                self.prefs.last_floppy_folder = None;
-                self.save_prefs();
-            }
-        });
-        ui.label(self.floppy_label.as_deref().unwrap_or("(empty)"));
-
-        ui.add_space(4.0);
-
-        // CD-ROM (D:): mount an ISO or a CUE/BIN into the ATAPI drive live.
-        ui.horizontal(|ui| {
-            drive_icon(ui, DriveIcon::Cd);
-            ui.label("D: CD-ROM");
-            access_led(ui, cd_lit);
-        });
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(running, egui::Button::new("Load ISO/CUE..."))
-                .clicked()
-            {
-                self.load_cd_image();
-            }
-            let mounted = self.cd_label.is_some();
-            if ui
-                .add_enabled(running && mounted, egui::Button::new("Eject"))
-                .clicked()
-            {
-                if let Some(emu) = &self.emu {
-                    emu.eject_cd();
+            });
+            ui.label(
+                egui::RichText::new(self.floppy_label.as_deref().unwrap_or("(empty)"))
+                    .color(MUTED)
+                    .italics()
+                    .size(11.0),
+            );
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(running, egui::Button::new("Load IMG"))
+                    .clicked()
+                {
+                    self.load_floppy_img();
                 }
-                self.cd_label = None;
+                if ui
+                    .add_enabled(running, egui::Button::new("Load folder"))
+                    .clicked()
+                {
+                    self.load_floppy_folder();
+                }
+            });
+        });
+
+        ui.add_space(8.0);
+
+        // CD-ROM D:
+        beige_group(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("CD-ROM  D:").color(LABEL).size(11.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    activity_led(ui, cd_lit);
+                });
+            });
+            ui.horizontal(|ui| {
+                let w = (ui.available_width() - 30.0).max(20.0);
+                let (slot, _) = ui.allocate_exact_size(egui::vec2(w, 18.0), egui::Sense::hover());
+                bevel_rect(ui.painter(), slot, RECESS, false);
+                // Tray seam.
+                let seam = slot.center().y;
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(slot.left() + 5.0, seam),
+                        egui::pos2(slot.right() - 5.0, seam),
+                    ],
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(0x3D, 0x38, 0x2D)),
+                );
+                let mounted = self.cd_label.is_some();
+                if eject_button(ui, running && mounted) {
+                    self.eject_cd_action();
+                }
+            });
+            ui.label(
+                egui::RichText::new(self.cd_label.as_deref().unwrap_or("(empty)"))
+                    .color(MUTED)
+                    .italics()
+                    .size(11.0),
+            );
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(running, egui::Button::new("Load ISO"))
+                    .clicked()
+                {
+                    self.load_cd_image();
+                }
+                // Folder-to-ISO is not built yet; the button is present but
+                // disabled so the two bays match. Wire it when the backend lands.
+                ui.add_enabled(false, egui::Button::new("Load folder"))
+                    .on_disabled_hover_text("Folder mounting is not available for the CD yet");
+            });
+        });
+
+        ui.add_space(8.0);
+
+        // Hard Disk C:
+        beige_group(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("HARD DISK  C:").color(LABEL).size(11.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    activity_led(ui, c_lit);
+                });
+            });
+            if ui.button("Open C: folder").clicked() {
+                open_in_file_manager(&self.c_drive);
             }
+            ui.label(
+                egui::RichText::new(self.c_drive.display().to_string())
+                    .color(MUTED)
+                    .size(11.0),
+            );
         });
-        ui.label(self.cd_label.as_deref().unwrap_or("(empty)"));
+    }
 
-        ui.add_space(4.0);
-
-        // C: drive. Auto-mounted; no mount button, just open the host folder.
-        ui.horizontal(|ui| {
-            drive_icon(ui, DriveIcon::Hdd);
-            ui.label("C: drive");
-            access_led(ui, c_lit);
-        });
-        if ui.button("Open C: folder").clicked() {
-            open_in_file_manager(&self.c_drive);
+    /// Eject drive A: and forget the mount so it is not restored next launch.
+    fn eject_floppy_action(&mut self) {
+        if let Some(emu) = &self.emu {
+            emu.eject_floppy();
         }
-        ui.label(self.c_drive.display().to_string());
+        self.floppy_label = None;
+        self.floppy_source = None;
+        self.prefs.last_floppy_image = None;
+        self.prefs.last_floppy_folder = None;
+        self.save_prefs();
+    }
+
+    /// Eject the CD.
+    fn eject_cd_action(&mut self) {
+        if let Some(emu) = &self.emu {
+            emu.eject_cd();
+        }
+        self.cd_label = None;
     }
 
     /// Pick a floppy IMG and mount it live. The image is writable in memory and
