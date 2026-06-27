@@ -101,6 +101,7 @@ int33:
 ; positions, drop the callback and the re-entrancy guard, and report installed
 ; (AX=0xFFFF) with two buttons. Returns AX,BX; preserves CX,DX,SI,DI.
 m_reset:
+    call cursor_hide                   ; restore any drawn cell before clearing state
     mov word [cs:cur_x], CENTER_X
     mov word [cs:cur_y], CENTER_Y
     mov word [cs:show_count], 0xFFFF
@@ -145,15 +146,15 @@ m_show:
     xor ax, ax                        ; clamp at 0 (visible)
 .store:
     mov [cs:show_count], ax
-    ; cursor draw wired in Task 3.5
+    call cursor_show                   ; draw if the count reached 0 (visible)
     pop ax
     iret
 
 ; 0x02 hide: show_count -= 1 (signed, no floor). Returns nothing; preserve ALL
 ; (no general register is touched).
 m_hide:
-    ; cursor restore wired in Task 3.5
     dec word [cs:show_count]
+    call cursor_hide                   ; restore the cell so the cursor disappears
     iret
 
 ; 0x03 get position and buttons. Returns BX,CX,DX; preserves AX,SI,DI (none of
@@ -189,6 +190,8 @@ m_setpos:
     mov ax, [cs:max_y]
 .y_hi:
     mov [cs:cur_y], ax
+    call cursor_hide                   ; move: restore the old cell, redraw at new
+    call cursor_show
     pop ax
     iret
 
@@ -379,6 +382,8 @@ m_cond_off:
 .v_ok:
     mov [cs:cond_top], ax
     mov [cs:cond_bottom], bx
+    call cursor_hide                   ; re-evaluate: hide if now inside the box
+    call cursor_show                   ; redraw if still visible and outside it
     pop bx
     pop ax
     iret
@@ -664,6 +669,85 @@ m_get_version:
 .skip:
     iret
 
+; ---- text-mode software cursor (page 0, mode 03h, B800:0) ----
+; The cursor cell is col = cur_x >> 3, row = cur_y >> 3 (fixed 200-line Microsoft
+; convention: 8 virtual lines per text row). Byte offset in B800 =
+; (row*80 + col)*2. Presentation: cell' = (cell AND screen_mask) XOR cursor_mask.
+; Both routines work on the resident state via [cs:...] and reach B800 through ES,
+; so they are correct regardless of the caller's DS and safe from interrupt
+; context. Each saves and restores every register it touches.
+
+; cursor_hide: if a cell is currently drawn (saved_off != 0xFFFF), write the saved
+; cell back to B800 and mark none drawn. Safe to call when nothing is drawn.
+cursor_hide:
+    push ax
+    push bx
+    push es
+    mov bx, [cs:saved_off]
+    cmp bx, 0xFFFF
+    je .done
+    mov ax, 0xB800
+    mov es, ax
+    mov ax, [cs:saved_cell]
+    mov [es:bx], ax
+    mov word [cs:saved_off], 0xFFFF
+.done:
+    pop es
+    pop bx
+    pop ax
+    ret
+
+; cursor_show: if visible (show_count == 0) and the cursor's virtual position is
+; outside the conditional-off box, save the underlying cell and draw
+; (cell AND screen_mask) XOR cursor_mask. No-op otherwise. Assumes nothing is
+; currently drawn (call cursor_hide first when moving).
+cursor_show:
+    push ax
+    push bx
+    push cx
+    push dx
+    push es
+    cmp word [cs:show_count], 0
+    jne .done                         ; hidden
+    ; conditional-off test in virtual space: skip drawing if inside the box
+    mov ax, [cs:cur_x]
+    cmp ax, [cs:cond_left]
+    jl .visible
+    cmp ax, [cs:cond_right]
+    jg .visible
+    mov ax, [cs:cur_y]
+    cmp ax, [cs:cond_top]
+    jl .visible
+    cmp ax, [cs:cond_bottom]
+    jg .visible
+    jmp .done                         ; inside the hidden box
+.visible:
+    ; cell offset = (row*80 + col)*2 ; col=cur_x>>3, row=cur_y>>3
+    mov ax, [cs:cur_y]
+    shr ax, 3
+    mov bx, 80
+    mul bx                            ; dx:ax = row*80 (row<=24 so ax is enough)
+    mov bx, [cs:cur_x]
+    shr bx, 3
+    add ax, bx
+    shl ax, 1                         ; byte offset
+    mov bx, ax
+    mov ax, 0xB800
+    mov es, ax
+    mov ax, [es:bx]
+    mov [cs:saved_cell], ax
+    mov [cs:saved_off], bx
+    and ax, [cs:text_screen_mask]
+    xor ax, [cs:text_cursor_mask]
+    mov [es:bx], ax
+.done:
+    pop es
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
 ; ---- PS/2 packet handler (far-called by the BIOS INT 74h ISR) ----
 ; Stack after prologue: [bp+6]=Z, [bp+8]=Y, [bp+10]=X, [bp+12]=status.
 packet_handler:
@@ -736,6 +820,12 @@ packet_handler:
     mov ax, [max_y]
 .yh:
     mov [cur_y], ax
+
+    ; the cursor reflects the new position: restore the old cell and redraw.
+    ; cursor_hide/show use [cs:] state and save ax,bx,cx,dx,es, so DX (the status
+    ; byte) and SI/DI (the signed deltas) survive for the button-edge code below.
+    call cursor_hide
+    call cursor_show
 
     ; three-button edge tracking. dh = old mask, bl = new mask.
     ; A 0->1 edge is a press: bump press_cnt[i], record press_x/y[i] = cur pos.
