@@ -55,6 +55,15 @@ const SCREW: egui::Color32 = egui::Color32::from_rgb(0xA8, 0x9E, 0x80);
 /// The panel face as f32 RGB, for the logo recolor unmix target.
 const PANEL_FACE_F32: [f32; 3] = [205.0, 195.0, 164.0];
 
+/// The embedded logo as pre-decoded straight RGBA (off-white background). It is
+/// recoloured to the panel beige at load. Regenerate with the PowerShell recipe
+/// in the design doc if the source art changes.
+const LOGO_RGBA: &[u8] = include_bytes!("../assets/izarra3000_logo.rgba");
+const LOGO_W: usize = 94;
+const LOGO_H: usize = 53;
+/// The source PNG's flat background colour, the unmix origin.
+const LOGO_BG_F32: [f32; 3] = [236.0, 230.0, 223.0];
+
 /// Pack 0x00RRGGBB words into a tightly-packed opaque RGBA8 buffer for upload.
 fn words_to_rgba(words: &[u32], width: usize, height: usize) -> Vec<u8> {
     let mut rgba = vec![0u8; width * height * 4];
@@ -406,6 +415,29 @@ fn eject_button(ui: &mut egui::Ui, enabled: bool) -> bool {
         egui::Stroke::new(1.5, col),
     );
     enabled && resp.clicked()
+}
+
+/// Recolour the logo's flat off-white background to `beige` with a per-pixel
+/// unmix. For each pixel, `w` is how much of it is background
+/// (`min(r/bg, g/bg, b/bg)`, clamped); the pixel is shifted by `w * (beige -
+/// bg)`. Pure background maps exactly to beige, ink stays ink, and the
+/// anti-aliased edges blend into beige with no halo. Alpha is preserved.
+fn recolor_logo(raw: &[u8], beige: [f32; 3]) -> Vec<u8> {
+    let bg = LOGO_BG_F32;
+    let mut out = vec![0u8; raw.len()];
+    for (src, dst) in raw.chunks_exact(4).zip(out.chunks_exact_mut(4)) {
+        let p = [src[0] as f32, src[1] as f32, src[2] as f32];
+        let w = (p[0] / bg[0])
+            .min(p[1] / bg[1])
+            .min(p[2] / bg[2])
+            .clamp(0.0, 1.0);
+        for c in 0..3 {
+            let v = (p[c] + w * (beige[c] - bg[c])).round().clamp(0.0, 255.0);
+            dst[c] = v as u8;
+        }
+        dst[3] = src[3];
+    }
+    out
 }
 
 /// Host-side master audio gain shared between the UI thread (writes it from the
@@ -2276,6 +2308,17 @@ mod tests {
         // After enough wall time the debt clears and the guest runs again.
         credit = refill_credit(credit, 0.5, clock, cap);
         assert!(credit > 0, "debt repaid once wall-clock catches up");
+    }
+
+    #[test]
+    fn logo_recolor_maps_background_to_beige_and_keeps_ink() {
+        // One pure-background pixel and one pure-black-ink pixel, both opaque.
+        let raw = [236u8, 230, 223, 255, 0, 0, 0, 255];
+        let out = recolor_logo(&raw, PANEL_FACE_F32);
+        // Background becomes the exact panel beige.
+        assert_eq!(&out[0..4], &[205u8, 195, 164, 255]);
+        // Ink is untouched (background coverage is zero).
+        assert_eq!(&out[4..8], &[0u8, 0, 0, 255]);
     }
 
     #[test]
