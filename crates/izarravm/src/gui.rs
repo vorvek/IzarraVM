@@ -1502,47 +1502,84 @@ impl GuiApp {
         let mut keep_open = true;
         let mut accept = false;
         let modal = egui::Modal::new(egui::Id::new("config-modal")).show(ctx, |ui| {
-            ui.set_width(340.0);
-            ui.heading("Configuration");
-            ui.add_space(6.0);
-
-            egui::Grid::new("config-keys")
-                .num_columns(2)
-                .spacing([12.0, 6.0])
+            egui::Frame::new()
+                .fill(PANEL_FACE)
+                .inner_margin(egui::Margin::same(18))
+                .corner_radius(4.0)
                 .show(ui, |ui| {
-                    ui.label("Input release");
-                    bind_button(ui, &mut dialog, BindTarget::InputRelease);
-                    ui.end_row();
-                    ui.label("Full screen");
-                    bind_button(ui, &mut dialog, BindTarget::Fullscreen);
-                    ui.end_row();
+                    beige_visuals(ui);
+                    ui.set_width(440.0);
+                    ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
+
+                    ui.label(egui::RichText::new("Configuration").color(INK).size(18.0));
+                    ui.add_space(6.0);
+
+                    ui.label(egui::RichText::new("INPUT").color(LABEL).size(11.0));
+                    beige_group(ui, |ui| {
+                        egui::Grid::new("config-keys")
+                            .num_columns(2)
+                            .spacing([16.0, 10.0])
+                            .show(ui, |ui| {
+                                ui.label("Input release");
+                                bind_button(ui, &mut dialog, BindTarget::InputRelease);
+                                ui.end_row();
+                                ui.label("Full screen");
+                                bind_button(ui, &mut dialog, BindTarget::Fullscreen);
+                                ui.end_row();
+                            });
+                    });
+
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("DISPLAY").color(LABEL).size(11.0));
+                    beige_group(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Voodoo render threads");
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    for threads in DISTIRA_RENDER_THREAD_CHOICES.iter().rev() {
+                                        ui.selectable_value(
+                                            &mut dialog.glide_threads,
+                                            *threads,
+                                            threads.to_string(),
+                                        );
+                                    }
+                                },
+                            );
+                        });
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label("CRT emulation");
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.selectable_value(
+                                        &mut dialog.crt_style,
+                                        CrtStyle::YeOlde,
+                                        "Ye Olde Screene",
+                                    );
+                                    ui.selectable_value(
+                                        &mut dialog.crt_style,
+                                        CrtStyle::Subtle,
+                                        "Subtle",
+                                    );
+                                    ui.selectable_value(&mut dialog.crt_style, CrtStyle::Off, "No");
+                                },
+                            );
+                        });
+                    });
+
+                    ui.add_space(14.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Accept").clicked() {
+                            accept = true;
+                            keep_open = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep_open = false;
+                        }
+                    });
                 });
-
-            ui.separator();
-            ui.label("Display");
-            ui.horizontal(|ui| {
-                ui.label("Voodoo rendering threads");
-                for threads in DISTIRA_RENDER_THREAD_CHOICES {
-                    ui.selectable_value(&mut dialog.glide_threads, threads, threads.to_string());
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("CRT emulation");
-                ui.selectable_value(&mut dialog.crt_style, CrtStyle::Off, "No");
-                ui.selectable_value(&mut dialog.crt_style, CrtStyle::Subtle, "Subtle");
-                ui.selectable_value(&mut dialog.crt_style, CrtStyle::YeOlde, "Ye Olde Screene");
-            });
-
-            ui.separator();
-            ui.horizontal(|ui| {
-                if ui.button("Accept").clicked() {
-                    accept = true;
-                    keep_open = false;
-                }
-                if ui.button("Cancel").clicked() {
-                    keep_open = false;
-                }
-            });
         });
         if modal.should_close() {
             keep_open = false;
