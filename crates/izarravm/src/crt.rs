@@ -6,23 +6,25 @@
 //! Drawn through an `egui_wgpu` paint callback so it composites inside egui's own
 //! render pass. `CrtResources` (pipeline, sampler, source texture, uniform, bind
 //! group) lives in the renderer's `callback_resources`; `CrtCallback` carries the
-//! per-frame data (new framebuffer bytes when the guest advanced, plus the on/off
-//! flag) and uploads it in `prepare`.
+//! per-frame data (new framebuffer bytes when the guest advanced, the CRT style
+//! selector, and a time for the Ye Olde grain) and uploads it in `prepare`.
 
 use egui_wgpu::CallbackTrait;
 
-// CRT model constants, locked from the approved tuner. A single shadow-mask
-// look; the only runtime parameter is on/off. To switch to an aperture grille,
-// change the mask branch in the shader — not exposed in the UI by design.
-// (kept inline in the WGSL below; listed here for reference)
-//   scanDepth 0.03  beam 0.40  sharp 4.0  maskStrength 0.02  maskPitch 2.0
-//   bloom 0.10  glowRadius 1.2  brightness 1.09  (curvature 0 — omitted)
+// CRT look. Two styles selected at runtime by the `style` uniform (0 off,
+// 1 subtle, 2 Ye Olde). The subtle look is the approved tuner values; Ye Olde
+// adds visible scanlines + shadow mask, 0.10 barrel curvature, softer focus,
+// and faint animated grain. An aperture grille would be a mask-branch swap.
 
 const SHADER: &str = r#"
 struct U {
   src_size: vec2<f32>,
-  crt_on: f32,
+  style: f32, // 0 off, 1 subtle, 2 Ye Olde
   srgb: f32,
+  time: f32,
+  pad0: f32,
+  pad1: f32,
+  pad2: f32,
 };
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var tex: texture_2d<f32>;
@@ -45,30 +47,20 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VsOut {
   return o;
 }
 
-const SCAN_DEPTH: f32 = 0.03;
-const BEAM: f32 = 0.40;
-const SHARP: f32 = 4.0;
-const MASK_STRENGTH: f32 = 0.02;
-const MASK_PITCH: f32 = 2.0;
-const BLOOM: f32 = 0.10;
-const GLOW_RADIUS: f32 = 1.2;
-const BRIGHTNESS: f32 = 1.09;
-
-// Sharp-bilinear: remap the fractional texel toward a step so edges are crisp
-// without nearest-neighbour stair-stepping. Texture sampler is LINEAR.
-fn sample_sharp(t: vec2<f32>) -> vec3<f32> {
+// Sharp-bilinear with adjustable softness (higher `sharp` = crisper edges).
+fn sample_sharp(t: vec2<f32>, sharp: f32) -> vec3<f32> {
   let px = t * u.src_size - vec2<f32>(0.5);
   let tf = floor(px);
   var f = px - tf;
-  f = clamp((f - 0.5) * SHARP + 0.5, vec2<f32>(0.0), vec2<f32>(1.0));
+  f = clamp((f - 0.5) * sharp + 0.5, vec2<f32>(0.0), vec2<f32>(1.0));
   let s = (tf + 0.5 + f) / u.src_size;
   return textureSample(tex, samp, s).rgb;
 }
 
-// 8-tap ring average for halation.
-fn glow(t: vec2<f32>) -> vec3<f32> {
+// 8-tap ring average for halation, radius in source texels.
+fn glow(t: vec2<f32>, radius: f32) -> vec3<f32> {
   var g = vec3<f32>(0.0);
-  let r = GLOW_RADIUS / u.src_size;
+  let r = radius / u.src_size;
   for (var i = 0; i < 8; i = i + 1) {
     let a = f32(i) / 8.0 * 6.2832;
     g = g + textureSample(tex, samp, t + vec2<f32>(cos(a), sin(a)) * r).rgb;
@@ -76,22 +68,26 @@ fn glow(t: vec2<f32>) -> vec3<f32> {
   return g / 8.0;
 }
 
-// Shadow mask in physical output-pixel space: staggered RGB triads plus a faint
-// horizontal-gap term.
-fn shadow_mask(col: vec3<f32>, frag: vec2<f32>) -> vec3<f32> {
-  let lo = 1.0 - MASK_STRENGTH;
-  let row = floor(frag.y / (MASK_PITCH * 1.5)) % 2.0;
-  let s = floor(frag.x / MASK_PITCH + row * 1.5) % 3.0;
+// Staggered RGB shadow-mask triads in physical output-pixel space.
+fn shadow_mask(col: vec3<f32>, frag: vec2<f32>, pitch: f32, strength: f32) -> vec3<f32> {
+  let lo = 1.0 - strength;
+  let row = floor(frag.y / (pitch * 1.5)) % 2.0;
+  let s = floor(frag.x / pitch + row * 1.5) % 3.0;
   var m = vec3<f32>(lo);
   if (s < 0.5) { m.r = 1.0; } else if (s < 1.5) { m.g = 1.0; } else { m.b = 1.0; }
   let gap = mix(1.0, lo, 0.5);
-  let hg = step(1.0, floor(frag.y / (MASK_PITCH * 0.75)) % 2.0) * 0.6;
+  let hg = step(1.0, floor(frag.y / (pitch * 0.75)) % 2.0) * 0.6;
   m = m * mix(1.0, gap, hg);
   return col * m;
 }
 
-// Exact sRGB -> linear, used only to cancel an sRGB render target's encode so
-// the on-screen result matches the tuner's nonlinear math.
+// Cheap hash for the Ye Olde animated grain.
+fn hash21(p: vec2<f32>) -> f32 {
+  let h = dot(p, vec2<f32>(127.1, 311.7));
+  return fract(sin(h) * 43758.5453);
+}
+
+// Exact sRGB -> linear, to cancel an sRGB render target's encode.
 fn to_linear(c: vec3<f32>) -> vec3<f32> {
   let lo = c / 12.92;
   let hi = pow((c + 0.055) / 1.055, vec3<f32>(2.4));
@@ -100,16 +96,49 @@ fn to_linear(c: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-  var col = sample_sharp(in.uv);
-  if (u.crt_on > 0.5) {
-    let fy = fract(in.uv.y * u.src_size.y) - 0.5;
-    let b = exp(-(fy * fy) / (2.0 * BEAM * BEAM));
-    col = col * mix(1.0, b, SCAN_DEPTH);
-    let g = max(glow(in.uv) - vec3<f32>(0.25), vec3<f32>(0.0));
-    col = col + g * BLOOM * vec3<f32>(1.12, 0.98, 0.86);
-    col = shadow_mask(col, in.pos.xy);
-    col = col * BRIGHTNESS;
+  let yeolde = u.style > 1.5;
+
+  // Per-style parameters: subtle high-res SVGA vs heavier Ye Olde Screene.
+  let sharp         = select(4.0,  2.5,  yeolde);
+  let scan_depth    = select(0.03, 0.18, yeolde);
+  let beam          = select(0.40, 0.30, yeolde);
+  let mask_pitch    = select(2.0,  3.0,  yeolde);
+  let mask_strength = select(0.02, 0.12, yeolde);
+  let bloom         = select(0.10, 0.25, yeolde);
+  let glow_radius   = select(1.2,  1.8,  yeolde);
+  let brightness    = select(1.09, 1.22, yeolde);
+  let curv          = select(0.0,  0.10, yeolde);
+
+  // Ye Olde barrel curvature: warp the sample coord; pixels off the tube are
+  // blacked out at the very end. We clamp the warped coord so the texture sample
+  // below stays in uniform control flow (no per-pixel early return), which WGSL
+  // requires for sampling.
+  var t = in.uv;
+  var outside = false;
+  if (curv > 0.0) {
+    let c = in.uv * 2.0 - 1.0;
+    let o = c.yx * c.yx * curv;
+    let w = (c + c * o) * 0.5 + 0.5;
+    outside = w.x < 0.0 || w.x > 1.0 || w.y < 0.0 || w.y > 1.0;
+    t = clamp(w, vec2<f32>(0.0), vec2<f32>(1.0));
   }
+
+  var col = sample_sharp(t, sharp);
+  if (u.style > 0.5) {
+    let fy = fract(t.y * u.src_size.y) - 0.5;
+    let b = exp(-(fy * fy) / (2.0 * beam * beam));
+    col = col * mix(1.0, b, scan_depth);
+    let g = max(glow(t, glow_radius) - vec3<f32>(0.25), vec3<f32>(0.0));
+    col = col + g * bloom * vec3<f32>(1.12, 0.98, 0.86);
+    col = shadow_mask(col, in.pos.xy, mask_pitch, mask_strength);
+    col = col * brightness;
+    if (yeolde) {
+      // Faint grain that shifts every frame.
+      let n = hash21(in.pos.xy + vec2<f32>(u.time * 53.0, u.time * 91.0)) - 0.5;
+      col = col + vec3<f32>(n * 0.05);
+    }
+  }
+  if (outside) { col = vec3<f32>(0.0); }
   col = clamp(col, vec3<f32>(0.0), vec3<f32>(1.0));
   if (u.srgb > 0.5) { col = to_linear(col); }
   return vec4<f32>(col, 1.0);
@@ -124,10 +153,12 @@ pub struct CrtFrame {
     pub height: u32,
 }
 
-/// Per-paint callback: the optional new frame plus the live on/off flag.
+/// Per-paint callback: the optional new frame, the CRT style selector (0 off,
+/// 1 subtle, 2 Ye Olde), and a monotonic time in seconds for the Ye Olde grain.
 pub struct CrtCallback {
     pub frame: Option<CrtFrame>,
-    pub crt_on: bool,
+    pub style: u32,
+    pub time: f32,
 }
 
 /// Persistent GPU resources, stored in the renderer's `callback_resources`.
@@ -269,7 +300,7 @@ impl CrtResources {
         });
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("crt-uniform"),
-            size: 16,
+            size: 32,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -362,13 +393,18 @@ impl CallbackTrait for CrtCallback {
             );
         }
         let (w, h) = res.dims;
-        let data: [f32; 4] = [
+        // 8 floats = 32 bytes (std140-safe): src_size.xy, style, srgb, time, pad×3.
+        let data: [f32; 8] = [
             w as f32,
             h as f32,
-            if self.crt_on { 1.0 } else { 0.0 },
+            self.style as f32,
             if res.srgb { 1.0 } else { 0.0 },
+            self.time,
+            0.0,
+            0.0,
+            0.0,
         ];
-        let mut bytes = [0u8; 16];
+        let mut bytes = [0u8; 32];
         for (i, v) in data.iter().enumerate() {
             bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
         }
@@ -399,5 +435,27 @@ impl CallbackTrait for CrtCallback {
         render_pass.set_pipeline(&res.pipeline);
         render_pass.set_bind_group(0, &res.bind_group, &[]);
         render_pass.draw(0..3, 0..1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SHADER;
+
+    /// Parse and validate the WGSL through naga so a shader error fails the test
+    /// suite instead of panicking at pipeline creation when the GUI launches.
+    /// Catches the easy-to-trip cases: textureSample outside uniform control flow,
+    /// type mismatches, and uniform-buffer layout errors.
+    #[test]
+    fn shader_compiles_under_naga() {
+        let module = wgpu::naga::front::wgsl::parse_str(SHADER)
+            .unwrap_or_else(|e| panic!("WGSL parse error: {e}"));
+        let mut validator = wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        );
+        validator
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("WGSL validation error: {e}"));
     }
 }
