@@ -94,36 +94,42 @@ pub fn seed_keyboard_ring(mem: &mut Memory, ascii: &[u8]) -> Result<(), DosError
     Ok(())
 }
 
-/// Resolve the C: root: `<base>/c_drive` if it exists (portable mode), else
-/// `<home>/.izarravm/c_drive`. The chosen path is created if missing.
-pub fn resolve_c_root_in(base: &Path, home: &Path) -> PathBuf {
-    let local = base.join("c_drive");
-    let chosen = if local.is_dir() {
-        local
-    } else {
-        home.join(".izarravm").join("c_drive")
-    };
+/// The default per-user C: root, `<home>/.izarravm/c_drive`, created if missing.
+/// This is where `c_drive`, `cmos.bin`, and `izarravm.conf` live for a normal
+/// launch, so they never land in whatever directory the binary was started from.
+pub fn default_c_root_in(home: &Path) -> PathBuf {
+    let chosen = home.join(".izarravm").join("c_drive");
     let _ = std::fs::create_dir_all(&chosen);
     chosen
 }
 
-/// Resolve the C: root for a normal launch. Portable mode keys off the
-/// executable's own directory, not the process working directory: a release
-/// unpacked with a `c_drive` beside it stays self-contained, while launching the
-/// binary from an arbitrary folder (a dev tree, whatever the shell's cwd is)
-/// does not scatter `c_drive`, `cmos.bin`, and `izarravm.conf` there. With no
-/// `c_drive` next to the executable it falls back to the per-user
-/// `<home>/.izarravm`. `home_dir` is un-deprecated on the project MSRV and
-/// behaves correctly on Windows and Unix, so no `dirs` crate is pulled in.
-pub fn resolve_c_root() -> PathBuf {
-    let base = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf))
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| PathBuf::from("."));
-    #[allow(deprecated)]
-    let home = std::env::home_dir().unwrap_or_else(|| base.clone());
-    resolve_c_root_in(&base, &home)
+/// The portable C: root, `<exe_dir>/c_drive`, created if missing. Selected only
+/// when the user opts in with `--portable`, so a self-contained release keeps its
+/// state beside the executable.
+pub fn portable_c_root_in(exe_dir: &Path) -> PathBuf {
+    let chosen = exe_dir.join("c_drive");
+    let _ = std::fs::create_dir_all(&chosen);
+    chosen
+}
+
+/// Resolve the C: root for a normal launch: the per-user `<home>/.izarravm` by
+/// default, or a `c_drive` beside the executable when `portable` is set. Portable
+/// mode keys off the executable's own directory, not the process working
+/// directory. `home_dir` is un-deprecated on the project MSRV and behaves
+/// correctly on Windows and Unix, so no `dirs` crate is pulled in.
+pub fn resolve_c_root(portable: bool) -> PathBuf {
+    if portable {
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf))
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        portable_c_root_in(&exe_dir)
+    } else {
+        #[allow(deprecated)]
+        let home = std::env::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        default_c_root_in(&home)
+    }
 }
 
 /// How `toka_dos_install` lays the OS down onto the C: drive.
@@ -16732,21 +16738,20 @@ mod tests {
     }
 
     #[test]
-    fn resolve_c_root_prefers_local_then_creates() {
+    fn portable_c_root_uses_exe_dir_and_creates() {
         let tmp = std::env::temp_dir().join(format!("izarra_croot_{}", std::process::id()));
-        let local = tmp.join("c_drive");
-        std::fs::create_dir_all(&local).unwrap();
-        // When ./c_drive exists relative to `base`, it wins.
-        let got = resolve_c_root_in(&tmp, &tmp.join("home"));
-        assert_eq!(got, local);
+        // --portable puts the C: drive beside the executable.
+        let got = portable_c_root_in(&tmp);
+        assert_eq!(got, tmp.join("c_drive"));
+        assert!(got.is_dir());
         std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
-    fn resolve_c_root_falls_back_to_home_and_creates() {
+    fn default_c_root_uses_home_and_creates() {
         let tmp = std::env::temp_dir().join(format!("izarra_chome_{}", std::process::id()));
         let home = tmp.join("home");
-        let got = resolve_c_root_in(&tmp.join("nowhere"), &home);
+        let got = default_c_root_in(&home);
         assert_eq!(got, home.join(".izarravm").join("c_drive"));
         assert!(got.is_dir());
         std::fs::remove_dir_all(&tmp).ok();

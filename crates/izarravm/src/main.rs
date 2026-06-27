@@ -38,6 +38,10 @@ struct Cli {
     video: Option<VideoCard>,
     #[arg(long)]
     c_drive: Option<PathBuf>,
+    /// Keep the C: drive, cmos.bin, and izarravm.conf beside the executable
+    /// instead of in the per-user <home>/.izarravm. For self-contained installs.
+    #[arg(long)]
+    portable: bool,
     #[arg(long)]
     soundfont: Option<PathBuf>,
     #[arg(long)]
@@ -87,10 +91,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     let mut config = load_config(&cli)?;
     // When the user gave no C: location (no --c_drive, no --dosroot, and the
-    // config left at its "." default), auto-mount from ./c_drive or
-    // ~/.izarravm/c_drive and lay down Toka-DOS if it is missing.
+    // config left at its "." default), auto-mount from the per-user
+    // ~/.izarravm/c_drive (or, with --portable, a c_drive beside the executable)
+    // and lay down Toka-DOS if it is missing.
     if cli.c_drive.is_none() && cli.dosroot.is_none() && config.dos.c_drive == Path::new(".") {
-        let c_root = izarravm_dos::resolve_c_root();
+        let c_root = izarravm_dos::resolve_c_root(cli.portable);
         let files = izarravm_firmware::toka_dos_system_files();
         izarravm_dos::toka_dos_install(
             &c_root,
