@@ -350,6 +350,26 @@ fn eject_button(ui: &mut egui::Ui, enabled: bool) -> bool {
     enabled && resp.clicked()
 }
 
+/// The classic ascending-bars volume icon from period CD-ROM front panels: a
+/// row of vertical bars stepping up in height, drawn at the left of the volume
+/// row in place of a text label.
+fn volume_icon(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(18.0, 14.0), egui::Sense::hover());
+    let bars = 4;
+    let bar_w = 3.0;
+    let gap = 1.5;
+    for i in 0..bars {
+        let frac = (i + 1) as f32 / bars as f32;
+        let bh = rect.height() * frac;
+        let x = rect.left() + i as f32 * (bar_w + gap);
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(x, rect.bottom() - bh),
+            egui::pos2(x + bar_w, rect.bottom()),
+        );
+        ui.painter().rect_filled(bar, 0.0, LABEL);
+    }
+}
+
 /// Recolour the logo's flat off-white background to `beige` with a per-pixel
 /// unmix. For each pixel, `w` is how much of it is background
 /// (`min(r/bg, g/bg, b/bg)`, clamped); the pixel is shifted by `w * (beige -
@@ -1228,19 +1248,16 @@ impl GuiApp {
         self.save_prefs();
     }
 
-    /// The inboard edge tab shown while the panel is open: the whole left column
-    /// is clickable, flat (not a raised button), with a small triangle icon.
-    /// Clicking collapses the panel.
+    /// The close tab while the panel is open: the full-height left edge of the
+    /// panel is clickable, the same beige as the background so it reads as the
+    /// border, with a small triangle icon. It highlights on hover. Clicking
+    /// collapses the panel.
     fn open_handle(&mut self, ui: &mut egui::Ui) {
         let h = ui.available_height().max(40.0);
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(16.0, h), egui::Sense::click());
-        let fill = if resp.hovered() { BEVEL_HI } else { FACEPLATE };
-        ui.painter().rect_filled(rect, 0.0, fill);
-        // A thin groove separates the handle column from the panel body.
-        ui.painter().line_segment(
-            [rect.right_top(), rect.right_bottom()],
-            egui::Stroke::new(1.0, BEVEL_LO),
-        );
+        if resp.hovered() {
+            ui.painter().rect_filled(rect, 0.0, BEVEL_HI);
+        }
         // Triangle icon pointing inward (collapse the panel).
         let c = rect.center();
         let tri = vec![
@@ -1263,11 +1280,6 @@ impl GuiApp {
         let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
         let fill = if resp.hovered() { BEVEL_HI } else { PANEL_FACE };
         ui.painter().rect_filled(rect, 0.0, fill);
-        // A thin groove on the inboard edge, against the black screen.
-        ui.painter().line_segment(
-            [rect.left_top(), rect.left_bottom()],
-            egui::Stroke::new(1.0, BEVEL_LO),
-        );
         // Triangle icon pointing outward (pull the panel out).
         let c = rect.center();
         let tri = vec![
@@ -1285,8 +1297,9 @@ impl GuiApp {
     fn controls_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_top(|ui| {
             self.open_handle(ui);
-            ui.add_space(8.0);
+            ui.add_space(6.0);
             ui.vertical(|ui| {
+                ui.add_space(12.0);
                 beige_visuals(ui);
                 self.panel_body(ui);
             });
@@ -1404,14 +1417,23 @@ impl GuiApp {
                 let line = |ui: &mut egui::Ui, text: String| {
                     ui.label(egui::RichText::new(text).color(MUTED).size(12.0));
                 };
-                line(
-                    ui,
-                    format!(
-                        "GSW-586 - {} mode - {} MHz",
-                        mode.canonical_name(),
-                        mode.clock_hz() / 1_000_000
-                    ),
-                );
+                // CPU and mode line, with the COM1 toggle aligned to its right.
+                ui.horizontal(|ui| {
+                    line(
+                        ui,
+                        format!(
+                            "GSW-586 - {} mode - {} MHz",
+                            mode.canonical_name(),
+                            mode.clock_hz() / 1_000_000
+                        ),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let com1_label = if self.show_com1 { "Hide COM1" } else { "COM1" };
+                        if ui.button(com1_label).clicked() {
+                            self.show_com1 = !self.show_com1;
+                        }
+                    });
+                });
                 line(
                     ui,
                     format!(
@@ -1429,18 +1451,18 @@ impl GuiApp {
                 );
 
                 ui.add_space(6.0);
+                // Volume row: the classic ascending-bars icon and a slider that
+                // stretches to fill the remaining width.
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("VOL").color(LABEL).size(11.0));
+                    volume_icon(ui);
+                    ui.add_space(4.0);
+                    ui.spacing_mut().slider_width = (ui.available_width() - 8.0).max(40.0);
                     let slider =
                         ui.add(egui::Slider::new(&mut self.volume, 0.0..=1.0).show_value(false));
                     if slider.changed() {
                         self.gain.set(volume_gain(self.volume));
                         self.prefs.master_volume = self.volume;
                         self.save_prefs();
-                    }
-                    let com1_label = if self.show_com1 { "Hide COM1" } else { "COM1" };
-                    if ui.button(com1_label).clicked() {
-                        self.show_com1 = !self.show_com1;
                     }
                 });
 
@@ -1996,20 +2018,27 @@ impl GuiApp {
         }
         // Mirror the host lock keys onto the guest each frame.
         self.sync_guest_locks();
-        let panel_frame = egui::Frame::new()
-            .fill(PANEL_FACE)
-            .inner_margin(egui::Margin::same(12));
         if self.panel_open {
+            // No left/top/bottom margin so the close tab is flush to the left
+            // edge and spans the full height; the body adds its own padding.
+            let open_frame = egui::Frame::new()
+                .fill(PANEL_FACE)
+                .inner_margin(egui::Margin {
+                    left: 0,
+                    right: 12,
+                    top: 0,
+                    bottom: 0,
+                });
             egui::SidePanel::right("controls")
                 .exact_width(320.0)
                 .resizable(false)
-                .frame(panel_frame)
+                .frame(open_frame)
                 .show(ctx, |ui| self.controls_ui(ui));
         } else {
             egui::SidePanel::right("controls-tab")
                 .exact_width(18.0)
                 .resizable(false)
-                .frame(panel_frame)
+                .frame(egui::Frame::new().fill(PANEL_FACE))
                 .show(ctx, |ui| self.collapsed_tab(ui));
         }
         egui::CentralPanel::default()
