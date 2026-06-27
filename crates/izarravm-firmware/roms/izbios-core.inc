@@ -78,6 +78,11 @@ bios_start:
     add di, 4
     loop .fill_slave
 
+    ; Give IRQ12 (INT 74h) a real PS/2 mouse ISR; the other slave IRQs keep the
+    ; EOI-only stub. DS is 0 here, so these stores land in IVT segment 0.
+    mov word [0x74 * 4], int74
+    mov word [0x74 * 4 + 2], ROM_SEG
+
     ; 8259 PIC init (verbatim from kbd-bios): IRQ0..7 -> INT 08h..0Fh.
     mov al, 0x11
     out PORT_PIC_CMD, al
@@ -168,6 +173,78 @@ irq_stub_slave:
     out PORT_PIC_CMD, al         ; then the master cascade line (IR2)
     pop ax
     iret
+
+; int74: IRQ12 (PS/2 mouse). Reads exactly ONE aux byte per interrupt (the model
+; re-latches the next aux byte on each 0x60 read, so a drain loop would desync the
+; 3-byte assembly), stores it in the EBDA packet buffer, and on the third byte
+; far-calls the INT 15h C207-registered handler with the 4-word PS/2 frame.
+int74:
+    push ax
+    push bx
+    push si
+    push ds
+    mov ax, EBDA_SEG
+    mov ds, ax
+    in al, PORT_KBD_CMD              ; 0x64 status
+    test al, KBC_STATUS_OBF
+    jz .eoi                          ; nothing waiting
+    test al, KBC_STATUS_AUX
+    jnz .aux
+    in al, PORT_KBD_DATA             ; a keyboard byte: drain to clear OBF, ignore
+    jmp .eoi
+.aux:
+    in al, PORT_KBD_DATA             ; one aux byte
+    mov bl, [EBDA_MOUSE_IDX]
+    xor bh, bh
+    mov si, EBDA_MOUSE_PKT
+    add si, bx
+    mov [si], al                     ; packet[index] = byte
+    inc bl
+    cmp bl, 3
+    jb .save_idx
+    mov byte [EBDA_MOUSE_IDX], 0     ; packet complete, reset index
+    call int74_dispatch
+    jmp .eoi
+.save_idx:
+    mov [EBDA_MOUSE_IDX], bl
+.eoi:
+    mov al, 0x20
+    out PORT_PIC2_CMD, al            ; EOI slave
+    out PORT_PIC_CMD, al             ; EOI master cascade (IR2)
+    pop ds
+    pop si
+    pop bx
+    pop ax
+    iret
+
+; int74_dispatch: build the RBIL 4-word frame from EBDA_MOUSE_PKT and far-call the
+; registered handler if non-null. DS = EBDA_SEG on entry. Clobbers ax,bx,cx,dx.
+int74_dispatch:
+    mov ax, [EBDA_MOUSE_HANDLER]     ; offset
+    mov dx, [EBDA_MOUSE_HANDLER + 2] ; segment
+    mov cx, ax
+    or cx, dx
+    jz .done                         ; null handler, nothing to call
+    ; WORD1 status = packet byte 0 (bit0 left, bit1 right, bit3 reserved, bit4/5
+    ; X/Y sign), high byte 0.
+    mov al, [EBDA_MOUSE_PKT]
+    xor ah, ah
+    push ax
+    ; WORD2 X = packet byte 1, high byte 0 (sign carried in status bit4).
+    mov al, [EBDA_MOUSE_PKT + 1]
+    xor ah, ah
+    push ax
+    ; WORD3 Y = packet byte 2, high byte 0 (sign carried in status bit5).
+    mov al, [EBDA_MOUSE_PKT + 2]
+    xor ah, ah
+    push ax
+    ; WORD4 = 0.
+    xor ax, ax
+    push ax
+    call far [EBDA_MOUSE_HANDLER]    ; indirect far call through DS:EBDA_MOUSE_HANDLER
+    add sp, 8                        ; drop the four words after the handler RETF
+.done:
+    ret
 
 ; --- POST sequencer ---------------------------------------------------------
 ; Walk post_step_table (emitted last by izbios-tables.inc). Each entry is

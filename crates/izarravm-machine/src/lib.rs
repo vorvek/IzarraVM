@@ -1960,6 +1960,21 @@ impl Machine {
         self.last_abs = (x.clamp(0, MOUSE_GUEST_MAX_X), y.clamp(0, MOUSE_GUEST_MAX_Y));
     }
 
+    /// Test seam: register a mouse packet handler (the INT 15h C207 effect),
+    /// enable aux reporting, and enable IRQ12 in the 8042 command byte, so a guest
+    /// self-test can install a handler without a full driver. `seg:off` is the far
+    /// pointer the BIOS INT 74h ISR will call.
+    pub fn register_mouse_handler_for_test(&mut self, seg: u16, off: u16) {
+        let base = (u32::from(EBDA_SEGMENT) << 4) + EBDA_MOUSE_HANDLER_OFF;
+        self.write_physical_u16(base, off);
+        self.write_physical_u16(base + 2, seg);
+        // Ensure the 8042 command byte has IRQ12 (bit1) enabled, then turn on aux
+        // reporting. Without bit1, a latched aux byte never arms IRQ12.
+        self.keyboard.write_port(0x64, 0x60); // write-command-byte
+        self.keyboard.write_port(0x60, 0x03); // IRQ1 + IRQ12 enabled
+        self.keyboard.set_mouse_reporting(true);
+    }
+
     #[cfg(test)]
     fn read_io_port_u8(&mut self, port: u16) -> u8 {
         let mut bus = self.make_bus();
