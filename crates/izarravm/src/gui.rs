@@ -1094,15 +1094,19 @@ impl GuiApp {
             self.cd_access_at = Some(now);
         }
 
-        // A gear at the top-right opens the configuration modal.
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .button("\u{2699}")
-                .on_hover_text("Configuration")
-                .clicked()
-            {
-                self.open_config_dialog();
-            }
+        // A gear at the top-right opens the configuration modal. The horizontal
+        // wrapper keeps it to a single top row (a bare right_to_left layout would
+        // take the whole panel height and centre the button vertically).
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button("\u{2699}")
+                    .on_hover_text("Configuration")
+                    .clicked()
+                {
+                    self.open_config_dialog();
+                }
+            });
         });
 
         ui.heading("Machine");

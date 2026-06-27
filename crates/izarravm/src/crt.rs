@@ -13,7 +13,7 @@ use egui_wgpu::CallbackTrait;
 
 // CRT look. Two styles selected at runtime by the `style` uniform (0 off,
 // 1 subtle, 2 Ye Olde). The subtle look is the approved tuner values; Ye Olde
-// adds visible scanlines + shadow mask, 0.10 barrel curvature, softer focus,
+// adds visible scanlines + shadow mask, 0.02 barrel curvature, softer focus,
 // and faint animated grain. An aperture grille would be a mask-branch swap.
 
 const SHADER: &str = r#"
@@ -107,7 +107,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
   let bloom         = select(0.10, 0.25, yeolde);
   let glow_radius   = select(1.2,  1.8,  yeolde);
   let brightness    = select(1.09, 1.22, yeolde);
-  let curv          = select(0.0,  0.10, yeolde);
+  let curv          = select(0.0,  0.02, yeolde);
 
   // Ye Olde barrel curvature: warp the sample coord; pixels off the tube are
   // blacked out at the very end. We clamp the warped coord so the texture sample
