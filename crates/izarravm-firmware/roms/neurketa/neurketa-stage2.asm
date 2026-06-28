@@ -142,7 +142,6 @@ sieve:
 ;
 ; GP register use: si = column c, di = row r, dx = per-pixel iter, bx = checksum.
 fp_mandel:
-    push bp
     finit                          ; reset the x87 stack to a known state
     xor bx, bx                     ; checksum = 0
     xor di, di                     ; r = 0
@@ -150,6 +149,8 @@ fp_mandel:
     cmp di, MANDEL_ROWS
     jae .done
     ; cy = -1.0 + 0.0625 * r
+    ; r and c are small non-negative (< 64), so the full-word store is exact and
+    ; fild reads a correct small positive integer.
     mov [m_tmpw], di
     fild word [m_tmpw]
     fmul dword [c_step]
@@ -209,7 +210,6 @@ fp_mandel:
     inc di
     jmp .row
 .done:
-    pop bp
     ret
 
 ; x87 constants as IEEE-754 single dwords.
