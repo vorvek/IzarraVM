@@ -851,6 +851,17 @@ enum DecodeGroup {
     /// (CF preserved), and the existing flag setters verbatim; STI's interrupt shadow is set in the
     /// executor exactly as the fused handler did.
     FlagsMisc,
+    /// The string-operation block (task A8): MOVS (0xa4/0xa5), CMPS (0xa6/0xa7), STOS (0xaa/0xab),
+    /// LODS (0xac/0xad), and SCAS (0xae/0xaf). None carry a ModRM or an immediate — the operands are
+    /// implicit (DS:SI source, ES:DI destination, accumulator), so `decode` pre-parses nothing beyond
+    /// the prefixes + opcode it already read (the REP/REPNE prefix and any segment override are
+    /// captured in `insn.prefixes` by `read_prefixes`). The executor is a thin call to the existing
+    /// `run_string` helper with `insn.prefixes` passed through, exactly as the fused arms did, so the
+    /// REP loop, the REPE/REPNE ZF-termination, the DF-driven SI/DI increment/decrement, the operand-
+    /// size element width, the DS:SI segment override on the source (ES:DI destination fixed), and the
+    /// per-iteration data-access clocks all stay in `run_string`/`string_step` unchanged. The TEST
+    /// AL/AX,imm forms that share the 0xa8/0xa9 neighbourhood are NOT string ops and stay on Fallback.
+    StringOps,
     /// Not yet converted to the split: decode parses nothing extra and `execute_decoded` hands the
     /// opcode to the shared fused `dispatch_opcode`.
     Fallback,
@@ -1266,6 +1277,12 @@ impl Cpu386 {
         ) {
             return DecodeGroup::FlagsMisc;
         }
+        // String operations (task A8): MOVS (0xa4/0xa5), CMPS (0xa6/0xa7), STOS (0xaa/0xab), LODS
+        // (0xac/0xad), SCAS (0xae/0xaf). None carry a ModRM or an immediate. 0xa8/0xa9 (TEST AL/AX,imm)
+        // sit between them and are deliberately excluded — they are not string ops and stay Fallback.
+        if matches!(opcode, 0xa4..=0xa7 | 0xaa..=0xaf) {
+            return DecodeGroup::StringOps;
+        }
         DecodeGroup::Fallback
     }
 
@@ -1557,6 +1574,14 @@ impl Cpu386 {
                     _ => {}
                 }
             }
+            DecodeGroup::StringOps => {
+                // String operations (MOVS/CMPS/STOS/LODS/SCAS). No ModRM, no immediate: the operands
+                // are all implicit (DS:SI source, ES:DI destination, the accumulator), so there is
+                // nothing to pre-parse here. The REP/REPNE prefix and any segment override were
+                // already read into `insn.prefixes` by `read_prefixes` at the top of `decode`; the
+                // executor passes them straight through to `run_string`. The element width is derived
+                // from the opcode's low bit (byte vs operand-size) in the executor, not the stream.
+            }
             // Both fallback groups pre-parse nothing in `decode` (the second 0F byte was already
             // folded into `insn.opcode` above): their executors re-read any ModRM/immediate from the
             // post-opcode eip in the shared fused dispatch.
@@ -1613,6 +1638,11 @@ impl Cpu386 {
             // the single flag-bit ops) runs through its split executor, consuming the pre-parsed
             // ModRM/operand for TEST and running the same flag/register logic as the fused path.
             DecodeGroup::FlagsMisc => self.execute_flags_misc_decoded(insn, bus),
+            // The string-operation block (MOVS/CMPS/STOS/LODS/SCAS, byte and word/dword) runs through
+            // its split executor, a thin call to the existing `run_string` helper with the pre-decoded
+            // `insn.prefixes` (REP/REPNE + segment override) passed through — the REP loop, ZF
+            // termination, DF direction, and per-iteration clocks all stay in `run_string` unchanged.
+            DecodeGroup::StringOps => self.execute_string_decoded(insn, bus),
             DecodeGroup::TwoByteFallback => {
                 // Un-converted two-byte (0F) opcode. `decode` already read + charged the second
                 // byte and applied the ISA gate, folding it into `insn.opcode` as 0x0F00 | second.
@@ -2607,6 +2637,48 @@ impl Cpu386 {
         }
     }
 
+    /// The string-operation block (MOVS/CMPS/STOS/LODS/SCAS) through the decode/execute split. This
+    /// is intentionally a thin wrapper: every opcode here is implicit-operand, so `decode` pre-parsed
+    /// nothing, and the executor simply re-dispatches to the existing `run_string` helper VERBATIM —
+    /// the same `(StringOp, BusWidth)` pairing each fused arm used, with `insn.prefixes` passed
+    /// straight through. All the load-bearing semantics live in the unchanged helper and are NOT
+    /// reimplemented here:
+    ///   - the REP/REPNE loop and the CX/ECX==0 termination (`run_string`, keyed on `prefixes.rep`);
+    ///   - the REPE-vs-REPNE ZF early-termination for CMPS/SCAS (`run_string`);
+    ///   - the DF-driven SI/DI increment/decrement (`adjust_index_register`, keyed on FLAG_DF);
+    ///   - the DS:SI source segment override vs the fixed ES:DI destination (`read_string_src`/
+    ///     `write_string_dst`, keyed on `prefixes.segment_override`);
+    ///   - the per-iteration data-access clocks (charged by the bus accesses inside `string_step`).
+    ///
+    /// The element width is the only thing derived here, exactly as the fused arms did: byte for the
+    /// even opcodes (0xa4/0xa6/0xaa/0xac/0xae) and the operand-size width for the odd ones. The
+    /// instruction-fetch clocks (prefix + opcode) were charged once in `decode`; this executor
+    /// re-fetches nothing, and the returned `clocks(4)` matches each fused arm.
+    fn execute_string_decoded<B: CpuBus>(
+        &mut self,
+        insn: &DecodedInsn,
+        bus: &mut B,
+    ) -> ExecResult<CycleOutcome> {
+        let prefixes = insn.prefixes;
+        let address_size = insn.address_size;
+        // The low opcode bit selects the element width: 0 = byte, 1 = operand-size (word/dword).
+        let width = if insn.opcode & 1 == 0 {
+            BusWidth::Byte
+        } else {
+            insn.operand_size.bus_width()
+        };
+        let op = match insn.opcode as u8 {
+            0xa4 | 0xa5 => StringOp::Movs,
+            0xa6 | 0xa7 => StringOp::Cmps,
+            0xaa | 0xab => StringOp::Stos,
+            0xac | 0xad => StringOp::Lods,
+            0xae | 0xaf => StringOp::Scas,
+            opcode => unreachable!("string opcode {opcode:#x}"),
+        };
+        self.run_string(bus, op, width, prefixes, address_size)?;
+        Ok(clocks(4))
+    }
+
     /// The far/indirect/RET/INT control-flow block + 0xff group 5 through the decode/execute split.
     /// Each arm mirrors the former fused handler verbatim — same far-pointer reconstruction, same
     /// ret/retf and interrupt/IRET delivery, same FF sub-op dispatch off `modrm.reg`, same clocks —
@@ -2988,48 +3060,12 @@ impl Cpu386 {
             // split (`DecodeGroup::Stack` -> `execute_stack_decoded`); not handled here.
             // 0xa0-0xa3 (MOV (E)AX<->moffs, byte and word) are converted to the split
             // (`DecodeGroup::DataMove` -> `execute_datamove_decoded`); not handled here.
-            0xa4 => {
-                self.run_string(bus, StringOp::Movs, BusWidth::Byte, prefixes, address_size)?;
-                Ok(clocks(4))
-            }
-            0xa5 => {
-                self.run_string(
-                    bus,
-                    StringOp::Movs,
-                    operand_size.bus_width(),
-                    prefixes,
-                    address_size,
-                )?;
-                Ok(clocks(4))
-            }
-            0xa6 => {
-                self.run_string(bus, StringOp::Cmps, BusWidth::Byte, prefixes, address_size)?;
-                Ok(clocks(4))
-            }
-            0xa7 => {
-                self.run_string(
-                    bus,
-                    StringOp::Cmps,
-                    operand_size.bus_width(),
-                    prefixes,
-                    address_size,
-                )?;
-                Ok(clocks(4))
-            }
-            0xae => {
-                self.run_string(bus, StringOp::Scas, BusWidth::Byte, prefixes, address_size)?;
-                Ok(clocks(4))
-            }
-            0xaf => {
-                self.run_string(
-                    bus,
-                    StringOp::Scas,
-                    operand_size.bus_width(),
-                    prefixes,
-                    address_size,
-                )?;
-                Ok(clocks(4))
-            }
+            // 0xa4/0xa5 (MOVS), 0xa6/0xa7 (CMPS), 0xae/0xaf (SCAS) are converted to the
+            // decode/execute split: `route_group` classifies them as `DecodeGroup::StringOps` and
+            // `execute_string_decoded` runs them (a thin call to the unchanged `run_string` helper
+            // with the prefixes passed through, so the REP loop/DF/segment-override/per-iteration
+            // clocks stay in one place). Not handled here. 0xa8/0xa9 below are TEST AL/AX,imm — not
+            // string ops — and remain on the fused path.
             0xa8 => {
                 let imm = self.fetch_u8(bus)?;
                 let al = self.read_gpr8(0);
@@ -3042,34 +3078,9 @@ impl Cpu386 {
                 self.alu(4, acc, imm, operand_size.bus_width());
                 Ok(clocks(2))
             }
-            0xaa => {
-                self.run_string(bus, StringOp::Stos, BusWidth::Byte, prefixes, address_size)?;
-                Ok(clocks(4))
-            }
-            0xab => {
-                self.run_string(
-                    bus,
-                    StringOp::Stos,
-                    operand_size.bus_width(),
-                    prefixes,
-                    address_size,
-                )?;
-                Ok(clocks(4))
-            }
-            0xac => {
-                self.run_string(bus, StringOp::Lods, BusWidth::Byte, prefixes, address_size)?;
-                Ok(clocks(4))
-            }
-            0xad => {
-                self.run_string(
-                    bus,
-                    StringOp::Lods,
-                    operand_size.bus_width(),
-                    prefixes,
-                    address_size,
-                )?;
-                Ok(clocks(4))
-            }
+            // 0xaa/0xab (STOS) and 0xac/0xad (LODS) are converted to the decode/execute split:
+            // `route_group` classifies them as `DecodeGroup::StringOps` and `execute_string_decoded`
+            // runs them via the unchanged `run_string` helper. Not handled here.
             // 0xb0-0xb7 (MOV r8,imm8) and 0xb8-0xbf (MOV r16/32,imm) are converted to the split
             // (`DecodeGroup::DataMove` -> `execute_datamove_decoded`); not handled here.
             // 0xc2/0xc3 (RET near, with and without an imm16 release) and 0xca/0xcb (RETF, ditto) are
@@ -17786,5 +17797,340 @@ mod tests {
             bus.pending_irq.is_none(),
             "interrupt must be taken after the shadow expires"
         );
+    }
+
+    /// One golden end-state for a string-operation case (task A8). The string ops touch both
+    /// registers and memory, and the inputs differ widely per form (SI/DI/CX/AX/DF, the REP prefix,
+    /// the source/dest memory image), so each case carries its own register seed (`regs`) and memory
+    /// image (`setup`) on top of the shared `string_seed`. The captured fields are the standard
+    /// differential set plus the destination memory writes: end gpr (AX,CX,DX,BX,SP,BP,SI,DI),
+    /// eflags (CMPS/SCAS set them; MOVS/STOS/LODS leave them), eip, the (offset,value) memory deltas
+    /// (MOVS/STOS write the destination; CMPS/SCAS/LODS write nothing), and the InstructionPrefetch
+    /// fetch count (prefix + opcode, charged once in `decode` — small and CX-independent even for the
+    /// REP forms, since the per-element data accesses are bus reads/writes, not instruction fetches).
+    struct StringGolden {
+        name: &'static str,
+        code: &'static [u8],
+        /// Per-case register seed applied after `string_seed` (SI/DI/CX/AX, the DF flag, segment
+        /// bases for the override case), applied identically on the split and fused-reference paths.
+        regs: fn(&mut Cpu386),
+        /// Per-case memory image (the source and destination bytes), applied identically on both
+        /// paths before the run.
+        setup: fn(&mut [u8]),
+        gpr: [u32; 8],
+        eflags: u32,
+        eip: u32,
+        deltas: &'static [(usize, u8)],
+        fetch: usize,
+    }
+
+    /// Shared register seed for the string-operation golden battery: CS/DS/ES/SS = 0 and eip = 0.
+    /// Everything that varies per form (the index registers, the count, the accumulator, DF, and the
+    /// ES base for the segment-override case) is set by each case's `regs` closure, so the seed itself
+    /// stays minimal and every input is explicit at the case site.
+    fn string_seed(cpu: &mut Cpu386) {
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Es, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+    }
+
+    /// The string-operation differential battery (task A8). Captured from the PRIOR fused reference
+    /// (`execute_instruction_legacy`) via `regen_string_goldens`; see `flags_misc_golden_cases` for
+    /// the capture recipe. Never edit by hand — re-run the regen WHILE the fused arms (0xa4-0xa7,
+    /// 0xaa-0xaf) still exist in `dispatch_opcode`, then paste, then delete the fused arms.
+    ///
+    /// Covers the plain single-step forms (MOVSB forward DF=0 and backward DF=1; MOVSW; CMPSB
+    /// flags+advance; STOSB; LODSB; SCASB; the DS:SI segment override) AND the REP forms, which are
+    /// the load-bearing cases: REP MOVSB (CX iterations → CX=0, every element copied, SI/DI advanced
+    /// by CX*width), REPE CMPSB (early termination on the first mismatch → CX and ZF prove where it
+    /// stopped), and REPNE SCASB (early termination on the first match → CX and ZF).
+    fn string_golden_cases() -> &'static [StringGolden] {
+        &[
+            // MOVSB forward (0xa4), DF=0: [ds:si]=0x42 at 0x100 → [es:di] at 0x200; SI/DI increment.
+            StringGolden {
+                name: "movsb df=0 (a4)",
+                code: &[0xa4],
+                regs: |c| {
+                    c.set_flag(FLAG_DF, false);
+                    c.registers.set_esi(0x100);
+                    c.registers.set_edi(0x200);
+                },
+                setup: |m| m[0x100] = 0x42,
+                gpr: [0, 0, 0, 0, 0, 0, 0x101, 0x201],
+                eflags: 0x2,
+                eip: 0x1,
+                deltas: &[(0x200, 0x42)],
+                fetch: 2,
+            },
+            // MOVSB backward (0xa4), DF=1: same copy, but SI/DI decrement.
+            StringGolden {
+                name: "movsb df=1 (a4)",
+                code: &[0xa4],
+                regs: |c| {
+                    c.set_flag(FLAG_DF, true);
+                    c.registers.set_esi(0x100);
+                    c.registers.set_edi(0x200);
+                },
+                setup: |m| m[0x100] = 0x42,
+                gpr: [0, 0, 0, 0, 0, 0, 0x0ff, 0x1ff],
+                eflags: 0x402,
+                eip: 0x1,
+                deltas: &[(0x200, 0x42)],
+                fetch: 2,
+            },
+            // MOVSW (0xa5), DF=0: word [0x100..0x102]=0x1234 → [0x200..0x202]; SI/DI += 2.
+            StringGolden {
+                name: "movsw df=0 (a5)",
+                code: &[0xa5],
+                regs: |c| {
+                    c.set_flag(FLAG_DF, false);
+                    c.registers.set_esi(0x100);
+                    c.registers.set_edi(0x200);
+                },
+                setup: |m| m[0x100..0x102].copy_from_slice(&0x1234u16.to_le_bytes()),
+                gpr: [0, 0, 0, 0, 0, 0, 0x102, 0x202],
+                eflags: 0x2,
+                eip: 0x1,
+                deltas: &[(0x200, 0x34), (0x201, 0x12)],
+                fetch: 2,
+            },
+            // CMPSB unequal (0xa6): [ds:si]=0x10, [es:di]=0x20 → 0x10-0x20 borrows (ZF=0, CF=1);
+            // SI/DI advance even on mismatch. No memory write.
+            StringGolden {
+                name: "cmpsb unequal (a6)",
+                code: &[0xa6],
+                regs: |c| {
+                    c.set_flag(FLAG_DF, false);
+                    c.registers.set_esi(0x100);
+                    c.registers.set_edi(0x200);
+                },
+                setup: |m| {
+                    m[0x100] = 0x10;
+                    m[0x200] = 0x20;
+                },
+                gpr: [0, 0, 0, 0, 0, 0, 0x101, 0x201],
+                eflags: 0x87,
+                eip: 0x1,
+                deltas: &[],
+                fetch: 2,
+            },
+            // STOSB (0xaa): AL=0x5a → [es:di]=0x200; DI increments. AL preserved.
+            StringGolden {
+                name: "stosb (aa)",
+                code: &[0xaa],
+                regs: |c| {
+                    c.set_flag(FLAG_DF, false);
+                    c.write_gpr8(0, 0x5a);
+                    c.registers.set_edi(0x200);
+                },
+                setup: |_m| {},
+                gpr: [0x5a, 0, 0, 0, 0, 0, 0, 0x201],
+                eflags: 0x2,
+                eip: 0x1,
+                deltas: &[(0x200, 0x5a)],
+                fetch: 2,
+            },
+            // LODSB (0xac): [ds:si]=0x7e at 0x100 → AL; SI increments. No memory write.
+            StringGolden {
+                name: "lodsb (ac)",
+                code: &[0xac],
+                regs: |c| {
+                    c.set_flag(FLAG_DF, false);
+                    c.registers.set_esi(0x100);
+                },
+                setup: |m| m[0x100] = 0x7e,
+                gpr: [0x7e, 0, 0, 0, 0, 0, 0x101, 0],
+                eflags: 0x2,
+                eip: 0x1,
+                deltas: &[],
+                fetch: 2,
+            },
+            // SCASB equal (0xae): AL=0x41, [es:di]=0x41 → ZF set; DI increments, SI untouched.
+            StringGolden {
+                name: "scasb equal (ae)",
+                code: &[0xae],
+                regs: |c| {
+                    c.set_flag(FLAG_DF, false);
+                    c.write_gpr8(0, 0x41);
+                    c.registers.set_edi(0x200);
+                },
+                setup: |m| m[0x200] = 0x41,
+                gpr: [0x41, 0, 0, 0, 0, 0, 0, 0x201],
+                eflags: 0x46,
+                eip: 0x1,
+                deltas: &[],
+                fetch: 2,
+            },
+            // MOVSB with an ES: source segment override (0x26 0xa4): ds=0, es base 0x200, so the source
+            // reads from es:si (0x210), not ds:si (0x10); the destination stays es:di (0x230).
+            StringGolden {
+                name: "es: movsb override (26 a4)",
+                code: &[0x26, 0xa4],
+                regs: |c| {
+                    c.load_segment_real(SegmentIndex::Es, 0x20); // base 0x200
+                    c.set_flag(FLAG_DF, false);
+                    c.registers.set_esi(0x10);
+                    c.registers.set_edi(0x30);
+                },
+                setup: |m| m[0x210] = 0x99,
+                gpr: [0, 0, 0, 0, 0, 0, 0x11, 0x31],
+                eflags: 0x2,
+                eip: 0x2,
+                deltas: &[(0x230, 0x99)],
+                fetch: 3,
+            },
+            // REP MOVSB (0xf3 0xa4), CX=3, DF=0: copies 3 bytes [0x100..0x103]→[0x200..0x203];
+            // CX→0, SI/DI advance by 3. The fetch count is small (prefix+opcode), CX-independent.
+            StringGolden {
+                name: "rep movsb cx=3 (f3 a4)",
+                code: &[0xf3, 0xa4],
+                regs: |c| {
+                    c.set_flag(FLAG_DF, false);
+                    c.registers.set_esi(0x100);
+                    c.registers.set_edi(0x200);
+                    c.registers.set_ecx(3);
+                },
+                setup: |m| m[0x100..0x103].copy_from_slice(&[1, 2, 3]),
+                gpr: [0, 0, 0, 0, 0, 0, 0x103, 0x203],
+                eflags: 0x2,
+                eip: 0x2,
+                deltas: &[(0x200, 1), (0x201, 2), (0x202, 3)],
+                fetch: 3,
+            },
+            // REPE CMPSB (0xf3 0xa6), CX=4, DF=0: "AABB" vs "AACC" mismatches at index 2, so the
+            // repeat stops there with ZF clear after 3 iterations; CX 4→3→2→1, SI/DI advance by 3.
+            StringGolden {
+                name: "repe cmpsb cx=4 (f3 a6)",
+                code: &[0xf3, 0xa6],
+                regs: |c| {
+                    c.set_flag(FLAG_DF, false);
+                    c.registers.set_esi(0x100);
+                    c.registers.set_edi(0x200);
+                    c.registers.set_ecx(4);
+                },
+                setup: |m| {
+                    m[0x100..0x104].copy_from_slice(b"AABB");
+                    m[0x200..0x204].copy_from_slice(b"AACC");
+                },
+                gpr: [0, 1, 0, 0, 0, 0, 0x103, 0x203],
+                eflags: 0x97,
+                eip: 0x2,
+                deltas: &[],
+                fetch: 3,
+            },
+            // REPNE SCASB (0xf2 0xae), CX=4, AL='C', DF=0: dest "AACA" scans until the match at
+            // index 2, stopping with ZF set after 3 iterations; CX 4→3→2→1, DI advances by 3.
+            StringGolden {
+                name: "repne scasb cx=4 (f2 ae)",
+                code: &[0xf2, 0xae],
+                regs: |c| {
+                    c.set_flag(FLAG_DF, false);
+                    c.write_gpr8(0, b'C');
+                    c.registers.set_edi(0x200);
+                    c.registers.set_ecx(4);
+                },
+                setup: |m| m[0x200..0x204].copy_from_slice(b"AACA"),
+                gpr: [0x43, 1, 0, 0, 0, 0, 0, 0x203],
+                eflags: 0x46,
+                eip: 0x2,
+                deltas: &[],
+                fetch: 3,
+            },
+        ]
+    }
+
+    #[test]
+    fn string_split_matches_golden_across_ops() {
+        // The string-operation block (MOVS/CMPS/STOS/LODS/SCAS and the REP/REPE/REPNE forms) is
+        // converted to the decode/execute split, so its fused arms are deleted and it can no longer be
+        // diffed against a fused executor in-tree. Run each case through cycle() (the split) and
+        // assert the architectural end-state against goldens captured from the pre-split fused path via
+        // `regen_string_goldens`. The register file proves SI/DI/CX/AX moved correctly (direction,
+        // element width, REP count decremented to 0 or stopped early); eflags is load-bearing for
+        // CMPS/SCAS; the memory deltas prove the destination image (MOVS/STOS) is byte-exact; and the
+        // fetch count proves each instruction-fetch byte (prefix + opcode) was charged exactly once
+        // regardless of how many elements the REP loop processed.
+        for g in string_golden_cases() {
+            let mut mem = vec![0u8; 0x400];
+            mem[..g.code.len()].copy_from_slice(g.code);
+            (g.setup)(&mut mem);
+
+            let mut split = Cpu386::default();
+            string_seed(&mut split);
+            (g.regs)(&mut split);
+            let mut sbus = TestBus::with_memory(mem);
+            let _ = split.cycle(&mut sbus);
+
+            assert_eq!(split.registers.gpr, g.gpr, "gpr mismatch for {}", g.name);
+            assert_eq!(
+                split.registers.eflags, g.eflags,
+                "eflags mismatch for {}",
+                g.name
+            );
+            assert_eq!(split.registers.eip, g.eip, "eip mismatch for {}", g.name);
+            for &(offset, value) in g.deltas {
+                assert_eq!(
+                    sbus.memory[offset], value,
+                    "memory[{offset:#x}] mismatch for {}",
+                    g.name
+                );
+            }
+            assert_eq!(
+                seam_fetch_count(&sbus),
+                g.fetch,
+                "instruction-fetch cycle count mismatch for {} (seam must charge fetches once)",
+                g.name
+            );
+        }
+    }
+
+    /// Regenerate `string_golden_cases` from the fused reference. Ignored by default. Run WHILE the
+    /// fused arms (0xa4-0xa7, 0xaa-0xaf) still exist in `dispatch_opcode` (i.e. the parent commit
+    /// a9e0fec0):
+    ///   git worktree add ../regen-a8 a9e0fec0
+    ///   cd ../regen-a8
+    ///   cargo test -p izarravm-cpu --lib regen_string_goldens -- --ignored --nocapture
+    /// then paste the output over `string_golden_cases` and only then delete the fused arms.
+    #[test]
+    #[ignore = "prints golden literals; run with --ignored --nocapture against the fused reference"]
+    fn regen_string_goldens() {
+        for g in string_golden_cases() {
+            let mut mem = vec![0u8; 0x400];
+            mem[..g.code.len()].copy_from_slice(g.code);
+            (g.setup)(&mut mem);
+            let initial = mem.clone();
+
+            let mut fused = Cpu386::default();
+            string_seed(&mut fused);
+            (g.regs)(&mut fused);
+            let mut fbus = TestBus::with_memory(mem);
+            fused.begin_instruction();
+            if fused.execute_instruction_legacy(&mut fbus).is_err() {
+                println!(
+                    "            // TODO regen {}: fused path unavailable here; run against the base commit",
+                    g.name
+                );
+                continue;
+            }
+            let deltas: Vec<(usize, u8)> = fbus
+                .memory
+                .iter()
+                .enumerate()
+                .filter(|(i, b)| **b != initial[*i])
+                .map(|(i, b)| (i, *b))
+                .collect();
+            let fetch = seam_fetch_count(&fbus);
+            println!(
+                "            // {}: gpr {:?}, eflags {:#x}, eip {:#x}, deltas {:?}, fetch {}",
+                g.name,
+                fused.registers.gpr,
+                fused.registers.eflags,
+                fused.registers.eip,
+                deltas,
+                fetch,
+            );
+        }
     }
 }
