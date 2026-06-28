@@ -1,7 +1,7 @@
-; IZMOUSE.COM - Toka-DOS PS/2 mouse driver (INT 33h), a TSR.
+; TOKAMOUS.COM - Toka-DOS PS/2 mouse driver (INT 33h), a TSR.
 ; Installs an INT 33h dispatcher and registers a PS/2 packet handler with the
 ; BIOS (INT 15h AX=C207). The BIOS INT 74h ISR far-calls the handler per packet.
-; Assemble: nasm -f bin tools/izmouse.asm -o IZMOUSE.COM
+; Assemble: nasm -f bin tools/izmouse.asm -o TOKAMOUS.COM
     cpu 386
     org 0x100
 

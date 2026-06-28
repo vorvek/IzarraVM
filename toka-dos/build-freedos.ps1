@@ -153,6 +153,13 @@ $sortExe = Join-Path $sortdir 'sort.exe'
 if (-not (Test-Path $sortExe)) { throw "sort.exe not produced" }
 Write-Host "SORT.EXE: $((Get-Item $sortExe).Length) bytes"
 
+# --- TOKAMOUS (our INT 33h PS/2 mouse TSR, rebranded from izmouse.asm) ---
+$tokamous = Join-Path $root 'build-freedos-tokamous.com'
+& nasm -f bin (Join-Path $root 'tools\izmouse.asm') -o $tokamous
+if ($LASTEXITCODE) { throw "nasm tokamous failed" }
+if (-not (Test-Path $tokamous)) { throw "TOKAMOUS not produced" }
+Write-Host "TOKAMOUS.COM: $((Get-Item $tokamous).Length) bytes"
+
 # --- Assemble the committed image ---
 & python (Join-Path $root '..\scripts\build-freedos-image.py')
 if ($LASTEXITCODE -ne 0) { throw "image build failed" }

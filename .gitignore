@@ -42,3 +42,7 @@ toka-dos/freedos/sort/**/*.exe
 toka-dos/freedos/sort/**/*.map
 toka-dos/freedos/move/**/*.err
 toka-dos/freedos/sort/**/*.err
+
+# TOKAMOUS.COM staged output (build-freedos.ps1). Source stays izmouse.asm; only
+# the output binary is gitignored (Task 6 image builder reads this path).
+toka-dos/build-freedos-tokamous.com
