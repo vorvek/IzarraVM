@@ -788,6 +788,13 @@ enum DecodeGroup {
     /// The ALU block: ADD/OR/ADC/SBB/AND/SUB/XOR/CMP across forms 0-5
     /// (`opcode < 0x40 && (opcode & 7) < 6`).
     Alu,
+    /// The single-byte data-movement block: MOV r/m<->reg (0x88-0x8b), MOV r/m<->Sreg (0x8c/0x8e),
+    /// LEA (0x8d), MOV (E)AX<->moffs (0xa0-0xa3), MOV r,imm (0xb0-0xbf), MOV r/m,imm group 11
+    /// (0xc6/0xc7), XCHG r/m,reg (0x86/0x87), and XCHG reg,(E)AX (0x90-0x97; 0x90 is NOP). The
+    /// two-byte MOVZX/MOVSX (0F B6/B7/BE/BF) stay on `Fallback`: `decode` reads only one opcode byte
+    /// (so `insn.opcode` is 0x0f for every two-byte form), and the single-byte ALU/data-move pattern
+    /// established no convention for representing or pre-parsing the second opcode byte.
+    DataMove,
     /// Not yet converted to the split: decode parses nothing extra and `execute_decoded` hands the
     /// opcode to the shared fused `dispatch_opcode`.
     Fallback,
@@ -1094,6 +1101,28 @@ impl Cpu386 {
         if opcode < 0x40 && (opcode & 0x07) < 6 {
             return DecodeGroup::Alu;
         }
+        // Single-byte data-movement block. Listed explicitly (not a range) because the surrounding
+        // opcodes are unrelated: 0x8f is POP r/m, 0xa4-0xaf are the string ops, 0xc4/0xc5 are
+        // LES/LDS. 0x90-0x97 is XCHG reg,(E)AX with 0x90 = NOP. The MOVZX/MOVSX two-byte forms are
+        // intentionally absent (see `DecodeGroup::DataMove`).
+        if matches!(
+            opcode,
+            0x86 | 0x87
+                | 0x88
+                | 0x89
+                | 0x8a
+                | 0x8b
+                | 0x8c
+                | 0x8d
+                | 0x8e
+                | 0x90..=0x97
+                | 0xa0..=0xa3
+                | 0xb0..=0xbf
+                | 0xc6
+                | 0xc7
+        ) {
+            return DecodeGroup::DataMove;
+        }
         DecodeGroup::Fallback
     }
 
@@ -1158,6 +1187,61 @@ impl Cpu386 {
                     insn.imm = self.fetch_immediate(bus, operand_size)?;
                 }
             }
+            DecodeGroup::DataMove => {
+                // Single-byte data-movement block. The arms split three ways by how the operand is
+                // encoded; the byte budget each consumes here is what the executor must NOT re-fetch.
+                match opcode {
+                    // ModRM r/m forms: MOV r/m<->reg/Sreg, LEA, XCHG r/m. Parse the ModRM + its
+                    // addressing-mode descriptor (instruction bytes only, so it stays cacheable).
+                    0x86..=0x8e => {
+                        let modrm = self.fetch_modrm(bus)?;
+                        let operand =
+                            self.parse_addressing_mode(bus, prefixes, address_size, modrm)?;
+                        insn.modrm = Some(modrm);
+                        insn.operand = Some(operand);
+                    }
+                    // MOV r/m,imm (group 11). The displacement (if any) precedes the immediate in
+                    // the encoding, so parse the operand first, then fetch the immediate. Only
+                    // reg=000 is a defined encoding; for any other reg field the fused handler
+                    // faults *before* decoding the operand or immediate, so do the same here and
+                    // leave `operand`/`imm` unparsed (the executor re-detects the bad reg and
+                    // raises the identical group-opcode error with the same bytes consumed).
+                    0xc6 => {
+                        let modrm = self.fetch_modrm(bus)?;
+                        insn.modrm = Some(modrm);
+                        if modrm.reg == 0 {
+                            let operand =
+                                self.parse_addressing_mode(bus, prefixes, address_size, modrm)?;
+                            insn.operand = Some(operand);
+                            insn.imm = u32::from(self.fetch_u8(bus)?);
+                        }
+                    }
+                    0xc7 => {
+                        let modrm = self.fetch_modrm(bus)?;
+                        insn.modrm = Some(modrm);
+                        if modrm.reg == 0 {
+                            let operand =
+                                self.parse_addressing_mode(bus, prefixes, address_size, modrm)?;
+                            insn.operand = Some(operand);
+                            insn.imm = self.fetch_immediate(bus, operand_size)?;
+                        }
+                    }
+                    // MOV (E)AX<->moffs: a direct displacement (address-size wide), no ModRM.
+                    0xa0..=0xa3 => {
+                        insn.imm = self.fetch_moffs(bus, address_size)?;
+                    }
+                    // MOV r8,imm8.
+                    0xb0..=0xb7 => {
+                        insn.imm = u32::from(self.fetch_u8(bus)?);
+                    }
+                    // MOV r16/32,imm16/32.
+                    0xb8..=0xbf => {
+                        insn.imm = self.fetch_immediate(bus, operand_size)?;
+                    }
+                    // XCHG reg,(E)AX (0x90-0x97): no operand bytes; 0x90 is NOP (XCHG AX,AX).
+                    _ => {}
+                }
+            }
             DecodeGroup::Fallback => {}
         }
 
@@ -1189,6 +1273,9 @@ impl Cpu386 {
             // The whole ALU block (ADD/OR/ADC/SBB/AND/SUB/XOR/CMP, forms 0-5) runs through the
             // split executor, consuming the ModRM/immediate `decode` pre-parsed.
             DecodeGroup::Alu => self.execute_alu_decoded(insn, bus),
+            // The single-byte data-movement block runs through its split executor, consuming the
+            // ModRM/operand/immediate `decode` pre-parsed.
+            DecodeGroup::DataMove => self.execute_datamove_decoded(insn, bus),
             DecodeGroup::Fallback => {
                 // Fallback: `decode` already read the prefixes + opcode and ran the LOCK check,
                 // leaving eip just past the opcode. Continue into the shared dispatch from there,
@@ -1297,6 +1384,233 @@ impl Cpu386 {
         }
 
         Ok(clocks(2))
+    }
+
+    /// Resolve a pre-decoded data-movement ModRM r/m form into its `(ModRm, RmOperand)`: the ModRM
+    /// (for its `reg` field) plus the r/m operand resolved against the live registers — a register
+    /// operand as-is, a memory descriptor with its effective address recomputed now. Mirrors
+    /// `resolve_alu_modrm_operand`; centralizes the `decode`-populated-these `.expect`s.
+    fn resolve_datamove_modrm_operand(&self, insn: &DecodedInsn) -> (ModRm, RmOperand) {
+        let modrm = insn.modrm.expect("data-move r/m form decoded with a ModRM");
+        let operand = match insn
+            .operand
+            .expect("data-move r/m form decoded with an operand")
+        {
+            DecodedOperand::Reg(index) => RmOperand::Register(index),
+            DecodedOperand::Mem(addr) => self.resolve_addr_mode(&addr),
+        };
+        (modrm, operand)
+    }
+
+    /// The single-byte data-movement block (MOV/LEA/XCHG and their immediate/moffs/Sreg forms)
+    /// through the decode/execute split. Each arm mirrors the former fused handler verbatim — same
+    /// operand wiring, same segment-load path for 0x8e, same XCHG read/write order, same clocks —
+    /// but consumes the ModRM/operand/immediate `decode` already parsed (so the executor never
+    /// re-fetches an instruction byte). Memory operands resolve from the pre-decoded descriptor, so
+    /// the effective address is recomputed against the live registers each call.
+    fn execute_datamove_decoded<B: CpuBus>(
+        &mut self,
+        insn: &DecodedInsn,
+        bus: &mut B,
+    ) -> ExecResult<CycleOutcome> {
+        let opcode = insn.opcode as u8;
+        let operand_size = insn.operand_size;
+
+        match opcode {
+            0x86 => {
+                // XCHG r/m8, r8. Cross-write; the operand was resolved once in decode so the
+                // displacement is not re-fetched.
+                let (modrm, operand) = self.resolve_datamove_modrm_operand(insn);
+                let rm = self.read_operand_u8(bus, operand)?;
+                let reg = self.read_gpr8(modrm.reg);
+                self.write_operand_u8(bus, operand, reg)?;
+                self.write_gpr8(modrm.reg, rm);
+                Ok(clocks(3))
+            }
+            0x87 => {
+                // XCHG r/m16/32, r16/32. Cross-write.
+                let (modrm, operand) = self.resolve_datamove_modrm_operand(insn);
+                let rm = self.read_operand_sized(bus, operand, operand_size)?;
+                let reg = self.read_gpr_sized(modrm.reg, operand_size);
+                self.write_operand_sized(bus, operand, operand_size, reg)?;
+                self.write_gpr_sized(modrm.reg, operand_size, rm);
+                Ok(clocks(3))
+            }
+            0x88 => {
+                // MOV r/m8, r8.
+                let (modrm, operand) = self.resolve_datamove_modrm_operand(insn);
+                let value = self.read_gpr8(modrm.reg);
+                self.write_operand_u8(bus, operand, value)?;
+                Ok(clocks(2))
+            }
+            0x89 => {
+                // MOV r/m16/32, r16/32.
+                let (modrm, operand) = self.resolve_datamove_modrm_operand(insn);
+                let value = self.read_gpr_sized(modrm.reg, operand_size);
+                self.write_operand_sized(bus, operand, operand_size, value)?;
+                Ok(clocks(2))
+            }
+            0x8a => {
+                // MOV r8, r/m8.
+                let (modrm, operand) = self.resolve_datamove_modrm_operand(insn);
+                let value = self.read_operand_u8(bus, operand)?;
+                self.write_gpr8(modrm.reg, value);
+                Ok(clocks(2))
+            }
+            0x8b => {
+                // MOV r16/32, r/m16/32.
+                let (modrm, operand) = self.resolve_datamove_modrm_operand(insn);
+                let value = self.read_operand_sized(bus, operand, operand_size)?;
+                self.write_gpr_sized(modrm.reg, operand_size, value);
+                Ok(clocks(2))
+            }
+            0x8c => {
+                // MOV r/m16, Sreg. Always a word store regardless of operand size.
+                let (modrm, operand) = self.resolve_datamove_modrm_operand(insn);
+                let value = u32::from(self.segment_from_reg_field(modrm.reg).selector);
+                self.write_operand_sized(bus, operand, OperandSize::Word, value)?;
+                Ok(clocks(2))
+            }
+            0x8d => {
+                // LEA reg, m: load the effective address, not the memory it points at. mod=3 (a
+                // register r/m) is an invalid encoding and faults #UD.
+                let (modrm, operand) = self.resolve_datamove_modrm_operand(insn);
+                match operand {
+                    RmOperand::Memory(mem) => {
+                        self.write_gpr_sized(modrm.reg, operand_size, mem.offset);
+                        Ok(clocks(2))
+                    }
+                    RmOperand::Register(_) => Err(InternalFault::Exception {
+                        vector: 6,
+                        error_code: None,
+                    }),
+                }
+            }
+            0x8e => {
+                // MOV Sreg, r/m16. Reads a word r/m, then loads the segment register through the
+                // shared segment-load path (which can fault and, in protected mode, reload the
+                // descriptor). CS (reg=1) and reg>5 are invalid and #GP, matching the fused handler.
+                let (modrm, operand) = self.resolve_datamove_modrm_operand(insn);
+                let value = self.read_operand_sized(bus, operand, OperandSize::Word)?;
+                let segment = match modrm.reg {
+                    0 => SegmentIndex::Es,
+                    2 => SegmentIndex::Ss,
+                    3 => SegmentIndex::Ds,
+                    4 => SegmentIndex::Fs,
+                    5 => SegmentIndex::Gs,
+                    _ => {
+                        return Err(CpuError::GeneralProtection {
+                            selector: value as u16,
+                        }
+                        .into());
+                    }
+                };
+                self.load_segment(bus, segment, value as u16)?;
+                Ok(clocks(7))
+            }
+            0x90 => {
+                // NOP (XCHG (E)AX, (E)AX): a no-op with the same clocks as the other XCHG-acc forms.
+                Ok(clocks(3))
+            }
+            0x91..=0x97 => {
+                // XCHG (E)AX, reg. The register index is the low 3 opcode bits.
+                let reg = opcode & 7;
+                let acc = self.read_gpr_sized(0, operand_size);
+                let other = self.read_gpr_sized(reg, operand_size);
+                self.write_gpr_sized(0, operand_size, other);
+                self.write_gpr_sized(reg, operand_size, acc);
+                Ok(clocks(3))
+            }
+            0xa0 => {
+                // MOV AL, moffs8: byte form, ignores the operand-size prefix, flags untouched. The
+                // moffs displacement was captured into `imm` by decode.
+                let value = self.read_memory_u8(
+                    bus,
+                    insn.prefixes.segment_override.unwrap_or(SegmentIndex::Ds),
+                    insn.imm,
+                    BusAccessKind::DataRead,
+                )?;
+                self.write_gpr8(0, value);
+                Ok(clocks(4))
+            }
+            0xa1 => {
+                // MOV (E)AX, moffs.
+                let value = self.read_memory_sized(
+                    bus,
+                    insn.prefixes.segment_override.unwrap_or(SegmentIndex::Ds),
+                    insn.imm,
+                    operand_size,
+                    BusAccessKind::DataRead,
+                )?;
+                self.write_gpr_sized(0, operand_size, value);
+                Ok(clocks(4))
+            }
+            0xa2 => {
+                // MOV moffs8, AL.
+                let value = self.read_gpr8(0);
+                self.write_memory_u8(
+                    bus,
+                    insn.prefixes.segment_override.unwrap_or(SegmentIndex::Ds),
+                    insn.imm,
+                    value,
+                    BusAccessKind::DataWrite,
+                )?;
+                Ok(clocks(4))
+            }
+            0xa3 => {
+                // MOV moffs, (E)AX.
+                let value = self.read_gpr_sized(0, operand_size);
+                self.write_memory_sized(
+                    bus,
+                    insn.prefixes.segment_override.unwrap_or(SegmentIndex::Ds),
+                    insn.imm,
+                    operand_size,
+                    value,
+                    BusAccessKind::DataWrite,
+                )?;
+                Ok(clocks(4))
+            }
+            0xb0..=0xb7 => {
+                // MOV r8, imm8. The immediate was captured into `imm` by decode.
+                self.write_gpr8(opcode - 0xb0, insn.imm as u8);
+                Ok(clocks(2))
+            }
+            0xb8..=0xbf => {
+                // MOV r16/32, imm16/32.
+                self.write_gpr_sized(opcode - 0xb8, operand_size, insn.imm);
+                Ok(clocks(2))
+            }
+            0xc6 => {
+                // MOV r/m8, imm8 (group 11). Only reg=000 is defined; decode left `operand`/`imm`
+                // unparsed for any other reg field, so re-raise the identical group-opcode error.
+                let modrm = insn.modrm.expect("group-11 form decoded with a ModRM");
+                if modrm.reg != 0 {
+                    return Err(CpuError::UnsupportedGroupOpcode {
+                        opcode,
+                        extension: modrm.reg,
+                    }
+                    .into());
+                }
+                let (_, operand) = self.resolve_datamove_modrm_operand(insn);
+                self.write_operand_u8(bus, operand, insn.imm as u8)?;
+                Ok(clocks(2))
+            }
+            0xc7 => {
+                // MOV r/m16/32, imm16/32 (group 11). Same reg=000 gate as 0xc6.
+                let modrm = insn.modrm.expect("group-11 form decoded with a ModRM");
+                if modrm.reg != 0 {
+                    return Err(CpuError::UnsupportedGroupOpcode {
+                        opcode,
+                        extension: modrm.reg,
+                    }
+                    .into());
+                }
+                let (_, operand) = self.resolve_datamove_modrm_operand(insn);
+                self.write_operand_sized(bus, operand, operand_size, insn.imm)?;
+                Ok(clocks(2))
+            }
+            _ => unreachable!("data-move opcode {opcode:#x}"),
+        }
     }
 
     // Transitional fused entry: reads the prefixes + opcode + LOCK check itself, then dispatches.
@@ -1603,93 +1917,9 @@ impl Cpu386 {
                 self.alu(4, value, reg, operand_size.bus_width());
                 Ok(clocks(2))
             }
-            0x86 => {
-                // XCHG r/m8, r8. Decode the operand once, then cross-write; decoding twice would
-                // re-fetch the displacement and over-advance eip for a memory operand.
-                let modrm = self.fetch_modrm(bus)?;
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                let rm = self.read_operand_u8(bus, operand)?;
-                let reg = self.read_gpr8(modrm.reg);
-                self.write_operand_u8(bus, operand, reg)?;
-                self.write_gpr8(modrm.reg, rm);
-                Ok(clocks(3))
-            }
-            0x87 => {
-                // XCHG r/m16/32, r16/32. Decode the operand once, then cross-write.
-                let modrm = self.fetch_modrm(bus)?;
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                let rm = self.read_operand_sized(bus, operand, operand_size)?;
-                let reg = self.read_gpr_sized(modrm.reg, operand_size);
-                self.write_operand_sized(bus, operand, operand_size, reg)?;
-                self.write_gpr_sized(modrm.reg, operand_size, rm);
-                Ok(clocks(3))
-            }
-            0x88 => {
-                let modrm = self.fetch_modrm(bus)?;
-                let value = self.read_gpr8(modrm.reg);
-                self.write_rm_u8(bus, prefixes, address_size, modrm, value)?;
-                Ok(clocks(2))
-            }
-            0x89 => {
-                let modrm = self.fetch_modrm(bus)?;
-                let value = self.read_gpr_sized(modrm.reg, operand_size);
-                self.write_rm_sized(bus, prefixes, address_size, operand_size, modrm, value)?;
-                Ok(clocks(2))
-            }
-            0x8a => {
-                let modrm = self.fetch_modrm(bus)?;
-                let value = self.read_rm_u8(bus, prefixes, address_size, modrm)?;
-                self.write_gpr8(modrm.reg, value);
-                Ok(clocks(2))
-            }
-            0x8b => {
-                let modrm = self.fetch_modrm(bus)?;
-                let value = self.read_rm_sized(bus, prefixes, address_size, operand_size, modrm)?;
-                self.write_gpr_sized(modrm.reg, operand_size, value);
-                Ok(clocks(2))
-            }
-            0x8c => {
-                let modrm = self.fetch_modrm(bus)?;
-                let value = u32::from(self.segment_from_reg_field(modrm.reg).selector);
-                self.write_rm_sized(bus, prefixes, address_size, OperandSize::Word, modrm, value)?;
-                Ok(clocks(2))
-            }
-            0x8d => {
-                let modrm = self.fetch_modrm(bus)?;
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                match operand {
-                    RmOperand::Memory(mem) => {
-                        // LEA loads the effective address, not the memory it points at.
-                        self.write_gpr_sized(modrm.reg, operand_size, mem.offset);
-                        Ok(clocks(2))
-                    }
-                    // LEA requires a memory operand; mod=3 is an invalid encoding.
-                    RmOperand::Register(_) => Err(InternalFault::Exception {
-                        vector: 6,
-                        error_code: None,
-                    }),
-                }
-            }
-            0x8e => {
-                let modrm = self.fetch_modrm(bus)?;
-                let value =
-                    self.read_rm_sized(bus, prefixes, address_size, OperandSize::Word, modrm)?;
-                let segment = match modrm.reg {
-                    0 => SegmentIndex::Es,
-                    2 => SegmentIndex::Ss,
-                    3 => SegmentIndex::Ds,
-                    4 => SegmentIndex::Fs,
-                    5 => SegmentIndex::Gs,
-                    _ => {
-                        return Err(CpuError::GeneralProtection {
-                            selector: value as u16,
-                        }
-                        .into());
-                    }
-                };
-                self.load_segment(bus, segment, value as u16)?;
-                Ok(clocks(7))
-            }
+            // 0x86-0x8e (XCHG r/m,reg; MOV r/m<->reg/Sreg; LEA) are converted to the
+            // decode/execute split: `route_group` classifies them as `DecodeGroup::DataMove` and
+            // `execute_datamove_decoded` runs them. They must NOT be re-handled here (single path).
             0x8f => {
                 // POP r/m16/32 (group 1A). Only reg=000 is defined; other reg
                 // values are an illegal encoding. The popped value goes to the
@@ -1751,17 +1981,8 @@ impl Cpu386 {
                 self.write_gpr_sized(modrm.reg, operand_size, offset);
                 Ok(clocks(7))
             }
-            0x90 => Ok(clocks(3)),
-            0x91..=0x97 => {
-                // XCHG AX/EAX, reg. The register index is the low 3 opcode bits; 0x90 (index 0,
-                // XCHG AX,AX) is the existing NOP arm.
-                let reg = opcode & 7;
-                let acc = self.read_gpr_sized(0, operand_size);
-                let other = self.read_gpr_sized(reg, operand_size);
-                self.write_gpr_sized(0, operand_size, other);
-                self.write_gpr_sized(reg, operand_size, acc);
-                Ok(clocks(3))
-            }
+            // 0x90 (NOP / XCHG AX,AX) and 0x91-0x97 (XCHG (E)AX, reg) are converted to the split
+            // (`DecodeGroup::DataMove` -> `execute_datamove_decoded`); not handled here.
             0x98 => {
                 // CBW / CWDE: sign-extend the accumulator into the next width.
                 match operand_size {
@@ -1832,57 +2053,8 @@ impl Cpu386 {
                 self.write_gpr8(4, ah);
                 Ok(clocks(2))
             }
-            0xa0 => {
-                // MOV AL, moffs8: byte form, ignores the operand-size prefix and
-                // leaves flags untouched.
-                let offset = self.fetch_moffs(bus, address_size)?;
-                let value = self.read_memory_u8(
-                    bus,
-                    prefixes.segment_override.unwrap_or(SegmentIndex::Ds),
-                    offset,
-                    BusAccessKind::DataRead,
-                )?;
-                self.write_gpr8(0, value);
-                Ok(clocks(4))
-            }
-            0xa2 => {
-                // MOV moffs8, AL: byte counterpart to 0xa3, flags untouched.
-                let offset = self.fetch_moffs(bus, address_size)?;
-                let value = self.read_gpr8(0);
-                self.write_memory_u8(
-                    bus,
-                    prefixes.segment_override.unwrap_or(SegmentIndex::Ds),
-                    offset,
-                    value,
-                    BusAccessKind::DataWrite,
-                )?;
-                Ok(clocks(4))
-            }
-            0xa1 => {
-                let offset = self.fetch_moffs(bus, address_size)?;
-                let value = self.read_memory_sized(
-                    bus,
-                    prefixes.segment_override.unwrap_or(SegmentIndex::Ds),
-                    offset,
-                    operand_size,
-                    BusAccessKind::DataRead,
-                )?;
-                self.write_gpr_sized(0, operand_size, value);
-                Ok(clocks(4))
-            }
-            0xa3 => {
-                let offset = self.fetch_moffs(bus, address_size)?;
-                let value = self.read_gpr_sized(0, operand_size);
-                self.write_memory_sized(
-                    bus,
-                    prefixes.segment_override.unwrap_or(SegmentIndex::Ds),
-                    offset,
-                    operand_size,
-                    value,
-                    BusAccessKind::DataWrite,
-                )?;
-                Ok(clocks(4))
-            }
+            // 0xa0-0xa3 (MOV (E)AX<->moffs, byte and word) are converted to the split
+            // (`DecodeGroup::DataMove` -> `execute_datamove_decoded`); not handled here.
             0xa4 => {
                 self.run_string(bus, StringOp::Movs, BusWidth::Byte, prefixes, address_size)?;
                 Ok(clocks(4))
@@ -1965,16 +2137,8 @@ impl Cpu386 {
                 )?;
                 Ok(clocks(4))
             }
-            0xb0..=0xb7 => {
-                let value = self.fetch_u8(bus)?;
-                self.write_gpr8(opcode - 0xb0, value);
-                Ok(clocks(2))
-            }
-            0xb8..=0xbf => {
-                let value = self.fetch_immediate(bus, operand_size)?;
-                self.write_gpr_sized(opcode - 0xb8, operand_size, value);
-                Ok(clocks(2))
-            }
+            // 0xb0-0xb7 (MOV r8,imm8) and 0xb8-0xbf (MOV r16/32,imm) are converted to the split
+            // (`DecodeGroup::DataMove` -> `execute_datamove_decoded`); not handled here.
             0xc2 => {
                 // RET near, release imm16 bytes of arguments. The release count is always a
                 // 16-bit immediate fetched from the instruction stream before the return
@@ -2002,38 +2166,8 @@ impl Cpu386 {
                 self.return_far(bus, operand_size)?;
                 Ok(clocks(17))
             }
-            0xc6 => {
-                let modrm = self.fetch_modrm(bus)?;
-                if modrm.reg != 0 {
-                    return Err(CpuError::UnsupportedGroupOpcode {
-                        opcode,
-                        extension: modrm.reg,
-                    }
-                    .into());
-                }
-                // Displacement bytes (if any) come before the immediate in the encoding,
-                // so decode the operand first, then fetch the immediate.
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                let value = self.fetch_u8(bus)?;
-                self.write_operand_u8(bus, operand, value)?;
-                Ok(clocks(2))
-            }
-            0xc7 => {
-                let modrm = self.fetch_modrm(bus)?;
-                if modrm.reg != 0 {
-                    return Err(CpuError::UnsupportedGroupOpcode {
-                        opcode,
-                        extension: modrm.reg,
-                    }
-                    .into());
-                }
-                // Displacement bytes (if any) come before the immediate in the encoding,
-                // so decode the operand first, then fetch the immediate.
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                let value = self.fetch_immediate(bus, operand_size)?;
-                self.write_operand_sized(bus, operand, operand_size, value)?;
-                Ok(clocks(2))
-            }
+            // 0xc6/0xc7 (MOV r/m,imm group 11) are converted to the split
+            // (`DecodeGroup::DataMove` -> `execute_datamove_decoded`); not handled here.
             0xc8 => {
                 // ENTER imm16, imm8: build a stack frame. NestingLevel is taken mod 32.
                 // Counterpart to LEAVE. Stack-pointer width follows push's real-mode-vs-
@@ -3623,26 +3757,9 @@ impl Cpu386 {
         }
     }
 
-    fn write_rm_u8<B: CpuBus>(
-        &mut self,
-        bus: &mut B,
-        prefixes: Prefixes,
-        address_size: AddressSize,
-        modrm: ModRm,
-        value: u8,
-    ) -> ExecResult<()> {
-        match self.decode_rm_operand(bus, prefixes, address_size, modrm)? {
-            RmOperand::Register(index) => self.write_gpr8(index, value),
-            RmOperand::Memory(memory) => self.write_memory_u8(
-                bus,
-                memory.segment,
-                memory.offset,
-                value,
-                BusAccessKind::DataWrite,
-            )?,
-        }
-        Ok(())
-    }
+    // (`write_rm_u8` was removed with the legacy 0x88 MOV r/m8,r8 handler — its only caller. The
+    // converted data-move executor writes the byte r/m via `write_operand_u8` on the pre-decoded
+    // operand instead. The sized/read siblings remain in use by the fallback handlers.)
 
     fn read_rm_sized<B: CpuBus>(
         &mut self,
@@ -12324,7 +12441,10 @@ mod tests {
         cpu.control.cr0 |= CR0_AM;
         cpu.set_flag(FLAG_AC, true);
 
-        let result = cpu.execute_instruction_legacy(&mut bus);
+        // 0xa1 (MOV AX, moffs) is converted to the split, so drive it through the split executor;
+        // the legacy fused entry no longer carries that arm. The #AC alignment check fires in the
+        // shared memory-read helper either way.
+        let result = exec_one_split(&mut cpu, &mut bus);
 
         assert!(
             matches!(
@@ -12346,7 +12466,7 @@ mod tests {
         cpu.control.cr0 |= 0x0000_0010; // bit 4 (ET), not AM
         cpu.set_flag(FLAG_AC, true);
 
-        assert!(cpu.execute_instruction_legacy(&mut bus).is_ok());
+        assert!(exec_one_split(&mut cpu, &mut bus).is_ok());
     }
 
     #[test]
@@ -12355,7 +12475,7 @@ mod tests {
         let (mut cpu, mut bus) = cpl3_word_read_at(0x0041);
         cpu.control.cr0 |= CR0_AM;
 
-        assert!(cpu.execute_instruction_legacy(&mut bus).is_ok());
+        assert!(exec_one_split(&mut cpu, &mut bus).is_ok());
     }
 
     #[test]
@@ -12372,7 +12492,7 @@ mod tests {
         ds.selector = 0x0000;
         cpu.registers.set_segment(SegmentIndex::Ds, ds);
 
-        assert!(cpu.execute_instruction_legacy(&mut bus).is_ok());
+        assert!(exec_one_split(&mut cpu, &mut bus).is_ok());
     }
 
     #[test]
@@ -12382,7 +12502,7 @@ mod tests {
         cpu.control.cr0 |= CR0_AM;
         cpu.set_flag(FLAG_AC, true);
 
-        assert!(cpu.execute_instruction_legacy(&mut bus).is_ok());
+        assert!(exec_one_split(&mut cpu, &mut bus).is_ok());
     }
 
     #[test]
@@ -13059,6 +13179,17 @@ mod tests {
     }
 
     /// Run a single instruction from `code` at the given level and return the result.
+    /// Run one instruction through the production decode/execute split and return the raw
+    /// `InternalFault` (without exception delivery), so a test can assert `is_ok()`/`unwrap_err()`
+    /// exactly as it did against `execute_instruction_legacy`. Use this for opcodes already
+    /// converted to the split — `execute_instruction_legacy` routes only through the legacy fused
+    /// `dispatch_opcode`, which no longer carries the converted arms, so it would wrongly #UD them.
+    fn exec_one_split<B: CpuBus>(cpu: &mut Cpu386, bus: &mut B) -> ExecResult<CycleOutcome> {
+        cpu.begin_instruction();
+        let insn = cpu.decode(bus)?;
+        cpu.execute_decoded(&insn, bus)
+    }
+
     fn run_at_level(code: &[u8], level: CpuLevel) -> Result<CycleOutcome, InternalFault> {
         let mut memory = vec![0; 1024];
         memory[..code.len()].copy_from_slice(code);
@@ -13068,7 +13199,11 @@ mod tests {
         cpu.load_segment_real(SegmentIndex::Ds, 0);
         cpu.registers.eip = 0;
         let mut bus = TestBus::with_memory(memory);
-        cpu.execute_instruction_legacy(&mut bus)
+        // Route through the split so converted groups (ALU, data-move) execute; the legacy fused
+        // entry would #UD them now that their arms are gone from `dispatch_opcode`. Prefix-gating
+        // (66/67 at I286, the 0F two-byte ISA gate) lives in `decode`/`dispatch_opcode` either way,
+        // so the #UD-at-286 assertions still hold.
+        exec_one_split(&mut cpu, &mut bus)
     }
 
     #[test]
@@ -13296,15 +13431,13 @@ mod tests {
         // (decode/execute split) and through execute_instruction_legacy (fused) from identical
         // start state and assert identical end state. Guards that, for opcodes still on the legacy
         // path, the seam stays behaviorally bit-identical to the fused path across addressing forms.
-        // The ALU block is no longer comparable this way: it is fully converted to the split, so its
-        // former fused executor was deleted (there must be no second ALU plumbing path). The ALU
-        // split is covered against golden end-states in `alu_split_matches_golden_across_ops`.
-        let cases: &[(&str, &[u8])] = &[
-            ("mov ax,[0x20]", &[0xa1, 0x20, 0x00]),
-            ("mov [bx],cx", &[0x89, 0x0f]),
-            ("inc word [bx]", &[0xff, 0x07]),
-            ("lea ax,[bx+si+3]", &[0x8d, 0x40, 0x03]),
-        ];
+        // The ALU block and the single-byte data-movement block (MOV/LEA/XCHG and friends) are no
+        // longer comparable this way: both are fully converted to the split, so their former fused
+        // executors were deleted (there must be no second plumbing path). They are covered against
+        // golden end-states in `alu_split_matches_golden_across_ops` and
+        // `datamove_split_matches_golden_across_ops`. `inc word [bx]` (0xff /0) is still on the
+        // fallback path, so it remains a valid differential case here.
+        let cases: &[(&str, &[u8])] = &[("inc word [bx]", &[0xff, 0x07])];
         for (name, code) in cases {
             let mut mem = vec![0u8; 0x200];
             mem[..code.len()].copy_from_slice(code);
@@ -13712,6 +13845,329 @@ mod tests {
             let fetch = seam_fetch_count(&fbus);
             println!(
                 "            AluGolden {{ name: {:?}, code: &{:?}, gpr: {:?}, eflags: {:#x}, eip: {:#x}, deltas: &{:?}, fetch: {} }},",
+                g.name,
+                g.code,
+                fused.registers.gpr,
+                fused.registers.eflags,
+                fused.registers.eip,
+                deltas,
+                fetch,
+            );
+        }
+    }
+
+    /// One golden end-state for a data-movement case, captured the same way as `AluGolden`: opcode
+    /// bytes plus expected end gpr (AX,CX,DX,BX,SP,BP,SI,DI), eflags, eip, (offset,value) memory
+    /// writes, and InstructionPrefetch fetch count. Data-movement ops do not touch flags, so the
+    /// eflags field just confirms that (it should equal the seed's `0x02`).
+    struct DataMoveGolden {
+        name: &'static str,
+        code: &'static [u8],
+        gpr: [u32; 8],
+        eflags: u32,
+        eip: u32,
+        deltas: &'static [(usize, u8)],
+        fetch: usize,
+    }
+
+    /// The data-movement differential battery: MOV/LEA/XCHG across forms and addressing modes, plus
+    /// the moffs / immediate / Sreg variants, each with its golden end-state. Captured from the
+    /// PRIOR fused reference (`execute_instruction_legacy` -> `dispatch_opcode`) via
+    /// `regen_datamove_goldens`; see `alu_golden_cases` for the full capture recipe (the goldens
+    /// must come from the reference path, never from the split path they guard). The MOVZX/MOVSX
+    /// two-byte forms are deliberately absent — they stay on `Fallback` (see `DecodeGroup::DataMove`).
+    fn datamove_golden_cases() -> &'static [DataMoveGolden] {
+        &[
+            // MOV r/m<->reg, byte and word, register and memory r/m.
+            DataMoveGolden {
+                name: "mov [bx],cx",
+                code: &[137, 15],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x2,
+                deltas: &[(16, 4), (17, 3)],
+                fetch: 3,
+            },
+            DataMoveGolden {
+                name: "mov [bp+si+4],al(byte)",
+                code: &[136, 66, 4],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x3,
+                deltas: &[(28, 2)],
+                fetch: 4,
+            },
+            DataMoveGolden {
+                name: "mov dx,bx(reg)",
+                code: &[137, 218],
+                gpr: [258, 772, 16, 16, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x2,
+                deltas: &[],
+                fetch: 3,
+            },
+            DataMoveGolden {
+                name: "mov cx,[0x20]",
+                code: &[139, 14, 32, 0],
+                gpr: [258, 4369, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x4,
+                deltas: &[],
+                fetch: 5,
+            },
+            DataMoveGolden {
+                name: "mov al,[bx](byte)",
+                code: &[138, 7],
+                gpr: [256, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x2,
+                deltas: &[],
+                fetch: 3,
+            },
+            // MOV r/m,Sreg and MOV Sreg,r/m (load ES, leaves the addressing segments untouched).
+            DataMoveGolden {
+                name: "mov [bx],es",
+                code: &[140, 7],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x2,
+                deltas: &[],
+                fetch: 3,
+            },
+            DataMoveGolden {
+                name: "mov es,[0x20]",
+                code: &[142, 6, 32, 0],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x4,
+                deltas: &[],
+                fetch: 5,
+            },
+            // LEA: effective address into the register, disp+index and direct-disp forms.
+            DataMoveGolden {
+                name: "lea ax,[bx+si+3]",
+                code: &[141, 64, 3],
+                gpr: [27, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+            },
+            DataMoveGolden {
+                name: "lea dx,[0x20]",
+                code: &[141, 22, 32, 0],
+                gpr: [258, 772, 32, 16, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x4,
+                deltas: &[],
+                fetch: 5,
+            },
+            // MOV (E)AX<->moffs, byte and word, read and write.
+            DataMoveGolden {
+                name: "mov al,[moffs8 0x20]",
+                code: &[160, 32, 0],
+                gpr: [273, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+            },
+            DataMoveGolden {
+                name: "mov ax,[moffs 0x20]",
+                code: &[161, 32, 0],
+                gpr: [4369, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+            },
+            DataMoveGolden {
+                name: "mov [moffs8 0x30],al",
+                code: &[162, 48, 0],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x3,
+                deltas: &[(48, 2)],
+                fetch: 4,
+            },
+            DataMoveGolden {
+                name: "mov [moffs 0x30],ax",
+                code: &[163, 48, 0],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x3,
+                deltas: &[(48, 2), (49, 1)],
+                fetch: 4,
+            },
+            // MOV r,imm (byte and word).
+            DataMoveGolden {
+                name: "mov bl,0x7f",
+                code: &[179, 127],
+                gpr: [258, 772, 1286, 127, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x2,
+                deltas: &[],
+                fetch: 3,
+            },
+            DataMoveGolden {
+                name: "mov si,0x1234",
+                code: &[190, 52, 18],
+                gpr: [258, 772, 1286, 16, 0, 16, 4660, 24],
+                eflags: 0x2,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+            },
+            // MOV r/m,imm (group 11), register and memory.
+            DataMoveGolden {
+                name: "mov byte [bx],0x55",
+                code: &[198, 7, 85],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x3,
+                deltas: &[(16, 85)],
+                fetch: 4,
+            },
+            DataMoveGolden {
+                name: "mov word [bx],0xbeef",
+                code: &[199, 7, 239, 190],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x4,
+                deltas: &[(16, 239), (17, 190)],
+                fetch: 5,
+            },
+            DataMoveGolden {
+                name: "mov dx,0xabcd(grp11 reg)",
+                code: &[199, 194, 205, 171],
+                gpr: [258, 772, 43981, 16, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x4,
+                deltas: &[],
+                fetch: 5,
+            },
+            // XCHG r/m,reg (byte and word, register and memory) and XCHG (E)AX,reg + NOP.
+            DataMoveGolden {
+                name: "xchg [bx],cx",
+                code: &[135, 15],
+                gpr: [258, 0, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x2,
+                deltas: &[(16, 4), (17, 3)],
+                fetch: 3,
+            },
+            DataMoveGolden {
+                name: "xchg dl,bl(byte reg)",
+                code: &[134, 211],
+                gpr: [258, 772, 1296, 6, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x2,
+                deltas: &[],
+                fetch: 3,
+            },
+            DataMoveGolden {
+                name: "xchg ax,cx",
+                code: &[145],
+                gpr: [772, 258, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x1,
+                deltas: &[],
+                fetch: 2,
+            },
+            DataMoveGolden {
+                name: "nop",
+                code: &[144],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x1,
+                deltas: &[],
+                fetch: 2,
+            },
+        ]
+    }
+
+    #[test]
+    fn datamove_split_matches_golden_across_ops() {
+        // The single-byte data-movement block (MOV/LEA/XCHG and their immediate/moffs/Sreg forms)
+        // is converted to the decode/execute split, so it can no longer be diffed against a fused
+        // executor (that path was deleted to keep a single implementation). Instead, run each form
+        // through cycle() and assert the architectural end-state against goldens captured from the
+        // pre-split fused path (see `datamove_golden_cases` for the capture recipe). This exercises
+        // decode's ModRM/immediate/moffs parsing, the executor's operand wiring, the EA recompute,
+        // and the once-only instruction-fetch charge.
+        for g in datamove_golden_cases() {
+            let mut mem = vec![0u8; 0x200];
+            mem[..g.code.len()].copy_from_slice(g.code);
+            mem[0x20..0x22].copy_from_slice(&0x1111u16.to_le_bytes());
+            let initial = mem.clone();
+
+            let mut split = Cpu386::default();
+            seam_seed(&mut split);
+            let mut sbus = TestBus::with_memory(mem);
+            let _ = split.cycle(&mut sbus);
+
+            assert_eq!(split.registers.gpr, g.gpr, "gpr mismatch for {}", g.name);
+            assert_eq!(
+                split.registers.eflags, g.eflags,
+                "eflags mismatch for {}",
+                g.name
+            );
+            assert_eq!(split.registers.eip, g.eip, "eip mismatch for {}", g.name);
+            let deltas: Vec<(usize, u8)> = sbus
+                .memory
+                .iter()
+                .enumerate()
+                .filter(|(i, b)| **b != initial[*i])
+                .map(|(i, b)| (i, *b))
+                .collect();
+            assert_eq!(deltas, g.deltas, "memory-write mismatch for {}", g.name);
+            assert_eq!(
+                seam_fetch_count(&sbus),
+                g.fetch,
+                "instruction-fetch cycle count mismatch for {} (seam must charge fetches once)",
+                g.name
+            );
+        }
+    }
+
+    /// Regenerate the `datamove_golden_cases` literals from the PRIOR fused reference. Ignored by
+    /// default (it only prints). Mirror of `regen_alu_goldens`: drive each case through
+    /// `execute_instruction_legacy` (the fused path) and print a ready-to-paste literal, so the
+    /// goldens come from the reference rather than the split path they guard.
+    ///
+    /// Run it WHILE the group's fused arms still exist in `dispatch_opcode`:
+    ///   cargo test -p izarravm-cpu --lib regen_datamove_goldens -- --ignored --nocapture
+    /// then paste the output over `datamove_golden_cases` and only then delete the fused arms.
+    #[test]
+    #[ignore = "prints golden literals; run with --ignored --nocapture against the fused reference"]
+    fn regen_datamove_goldens() {
+        for g in datamove_golden_cases() {
+            let mut mem = vec![0u8; 0x200];
+            mem[..g.code.len()].copy_from_slice(g.code);
+            mem[0x20..0x22].copy_from_slice(&0x1111u16.to_le_bytes());
+            let initial = mem.clone();
+
+            let mut fused = Cpu386::default();
+            seam_seed(&mut fused);
+            let mut fbus = TestBus::with_memory(mem);
+            fused.begin_instruction();
+            if fused.execute_instruction_legacy(&mut fbus).is_err() {
+                println!(
+                    "            // TODO regen {}: fused path unavailable here; run before deleting the fused arms",
+                    g.name
+                );
+                continue;
+            }
+            let deltas: Vec<(usize, u8)> = fbus
+                .memory
+                .iter()
+                .enumerate()
+                .filter(|(i, b)| **b != initial[*i])
+                .map(|(i, b)| (i, *b))
+                .collect();
+            let fetch = seam_fetch_count(&fbus);
+            println!(
+                "            DataMoveGolden {{ name: {:?}, code: &{:?}, gpr: {:?}, eflags: {:#x}, eip: {:#x}, deltas: &{:?}, fetch: {} }},",
                 g.name,
                 g.code,
                 fused.registers.gpr,
