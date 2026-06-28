@@ -782,7 +782,14 @@ enum DecodedOperand {
 ///
 /// Extension pattern for the remaining group-conversion tasks: add ONE variant here, ONE arm in
 /// `route_group`, ONE parse arm in `decode`, and ONE execute arm in `execute_decoded`. `Fallback`
-/// is everything still on the legacy fused dispatch.
+/// is everything still on the legacy fused dispatch; `TwoByteFallback` is the un-converted 0F map.
+///
+/// For a two-byte (0F) group there are two extra rules, both because `decode` already folded the
+/// second byte into `insn.opcode` as 0x0F00 | second (see the "two-byte (0F) decode convention"
+/// block in `decode`): (a) the execute arm MUST dispatch off the full `insn.opcode` (u16) BEFORE
+/// any `as u8` narrowing — `0x0Fb6` narrows to `0xb6` and would alias a single-byte opcode (see the
+/// aliasing note in `execute_datamove_decoded`); and (b) the execute arm must NOT re-read the
+/// second byte and must NOT re-apply the ISA gate — both already happened once in `decode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DecodeGroup {
     /// The ALU block: ADD/OR/ADC/SBB/AND/SUB/XOR/CMP across forms 0-5
@@ -798,6 +805,13 @@ enum DecodeGroup {
     /// Not yet converted to the split: decode parses nothing extra and `execute_decoded` hands the
     /// opcode to the shared fused `dispatch_opcode`.
     Fallback,
+    /// An un-converted two-byte (0F) opcode (`opcode & 0xff00 == 0x0f00`). `decode` already folded
+    /// the second byte into `insn.opcode` as 0x0F00 | second, read + charged it, and applied the
+    /// ISA gate; `execute_decoded` hands the second byte (`insn.opcode as u8`) straight to
+    /// `execute_two_byte` without re-reading or re-gating. Distinct from `Fallback` so the routing
+    /// predicate (`& 0xff00 == 0x0f00`) lives only in `route_group` and the `as u8` narrowing can
+    /// never alias a 0F opcode onto a single-byte one (no arm-ordering dependence).
+    TwoByteFallback,
 }
 
 /// How decode charges the instruction-fetch clocks when an instruction is replayed from a
@@ -1099,15 +1113,15 @@ impl Cpu386 {
     /// lives in exactly one place. `prefixes` is taken (unused for the ALU group) because future
     /// groups route on it (e.g. the 0x0F two-byte map, or operand-size-sensitive forms).
     fn route_group(opcode: u16, _prefixes: Prefixes) -> DecodeGroup {
-        // Two-byte (0F) map. `decode` folds the second byte into `opcode` as 0x0F00 | second, so a
-        // 0F opcode is classified by its low byte. MOVZX/MOVSX (0F B6/B7/BE/BF) are data movement
-        // and run through the split; every other 0F opcode stays on `Fallback` (the un-converted
-        // fused `execute_two_byte`). Handled first so the single-byte predicates below never see a
-        // 0F-high-byte value.
+        // Two-byte (0F) map — the ONE place the `& 0xff00 == 0x0f00` predicate lives. `decode`
+        // folds the second byte into `opcode` as 0x0F00 | second, so a 0F opcode is classified by
+        // its low byte. MOVZX/MOVSX (0F B6/B7/BE/BF) are data movement and run through the split;
+        // every other 0F opcode is `TwoByteFallback` (the un-converted fused `execute_two_byte`).
+        // Handled first so the single-byte predicates below never see a 0F-high-byte value.
         if opcode & 0xff00 == 0x0f00 {
             return match opcode & 0xff {
                 0xb6 | 0xb7 | 0xbe | 0xbf => DecodeGroup::DataMove,
-                _ => DecodeGroup::Fallback,
+                _ => DecodeGroup::TwoByteFallback,
             };
         }
         // ALU block: ADD/OR/ADC/SBB/AND/SUB/XOR/CMP, forms 0-5 (`op = (opcode>>3)&7`,
@@ -1276,7 +1290,10 @@ impl Cpu386 {
                     _ => {}
                 }
             }
-            DecodeGroup::Fallback => {}
+            // Both fallback groups pre-parse nothing in `decode` (the second 0F byte was already
+            // folded into `insn.opcode` above): their executors re-read any ModRM/immediate from the
+            // post-opcode eip in the shared fused dispatch.
+            DecodeGroup::Fallback | DecodeGroup::TwoByteFallback => {}
         }
 
         // Finalize `len`/`fetch` once, after every group's pre-parse, so a converted group never
@@ -1310,7 +1327,7 @@ impl Cpu386 {
             // The single-byte data-movement block runs through its split executor, consuming the
             // ModRM/operand/immediate `decode` pre-parsed.
             DecodeGroup::DataMove => self.execute_datamove_decoded(insn, bus),
-            DecodeGroup::Fallback if insn.opcode & 0xff00 == 0x0f00 => {
+            DecodeGroup::TwoByteFallback => {
                 // Un-converted two-byte (0F) opcode. `decode` already read + charged the second
                 // byte and applied the ISA gate, folding it into `insn.opcode` as 0x0F00 | second.
                 // Hand the second byte to `execute_two_byte`, which re-reads only this opcode's
@@ -2841,16 +2858,18 @@ impl Cpu386 {
                 Ok(clocks(19))
             }
             0x0f => {
-                // The two-byte opcode was folded into `opcode` (0x0F00 | second) by `decode`,
-                // which already read + charged the second byte and applied the ISA gate. The
-                // un-converted 0F opcodes still dispatch through `execute_two_byte`; pass the
-                // second byte through `opcode` rather than re-reading it.
+                // LEGACY-REFERENCE ONLY. This arm is reached solely via the test-only
+                // `execute_instruction_legacy`, which reads a single opcode byte and so arrives here
+                // with the bare 0x0F. The production `cycle` path never does: `decode` folds the
+                // second byte into `insn.opcode` as 0x0F00 | second and routes it through
+                // `DecodeGroup::TwoByteFallback`, which calls `execute_two_byte` directly — so a
+                // combined 0F value never re-enters `dispatch_opcode`.
                 //
-                // (Unreachable on the `cycle` path today: every `0x0F00 | second` value enters
-                // `dispatch_opcode` only via the `Fallback` route, where `decode` already replaced
-                // the first byte with the combined value, so `opcode` here is never the bare 0x0F.
-                // Retained for the transitional `execute_instruction_legacy` reference, which reads
-                // a single byte and so reaches this arm with the bare 0x0F first byte.)
+                // DO NOT copy this `fetch_u8` + `check_two_byte_isa_gate` shape into a converted 0F
+                // executor. It re-reads and re-charges the second byte (and re-applies the gate) ON
+                // PURPOSE, so the fused reference stays self-contained; the production path reads and
+                // gates that byte exactly once, in `decode`. A converted 0F group must take the
+                // second byte from `insn.opcode` instead (see the extension rules on `DecodeGroup`).
                 let second = self.fetch_u8(bus)?;
                 self.check_two_byte_isa_gate(second)?;
                 self.execute_two_byte(bus, second, prefixes, address_size, operand_size)
@@ -14005,8 +14024,9 @@ mod tests {
     /// the moffs / immediate / Sreg variants, each with its golden end-state. Captured from the
     /// PRIOR fused reference (`execute_instruction_legacy` -> `dispatch_opcode`) via
     /// `regen_datamove_goldens`; see `alu_golden_cases` for the full capture recipe (the goldens
-    /// must come from the reference path, never from the split path they guard). The MOVZX/MOVSX
-    /// two-byte forms are deliberately absent — they stay on `Fallback` (see `DecodeGroup::DataMove`).
+    /// must come from the reference path, never from the split path they guard). The two-byte
+    /// MOVZX/MOVSX forms — also in `DecodeGroup::DataMove` — have their own battery
+    /// (`movzx_movsx_golden_cases`), so they are absent here.
     fn datamove_golden_cases() -> &'static [DataMoveGolden] {
         &[
             // MOV r/m<->reg, byte and word, register and memory r/m.
