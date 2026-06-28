@@ -1254,7 +1254,8 @@ packet_handler:
     pop bp
     retf
 
-; ---- install / TSR ----
+resident_end:
+; ---- install / TSR (transient: discarded by AH=31h KEEP) ----
 install:
     push es
     xor ax, ax
@@ -1287,4 +1288,3 @@ install:
     int 0x21
 
 banner          db 'Toka-DOS mouse driver installed.', 13, 10, '$'
-resident_end:
