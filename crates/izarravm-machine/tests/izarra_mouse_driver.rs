@@ -30,11 +30,15 @@ use izarravm_machine::{Machine, MachineProfile, StopReason};
 // Regenerate after editing the asm: `nasm -f bin mtest.asm -o MTEST.COM` from the
 // fixtures dir (same rebuild contract as the committed tokados.rom blob).
 const MTEST_COM: &[u8] = include_bytes!("fixtures/MTEST.COM");
+const CBLEAK_COM: &[u8] = include_bytes!("fixtures/CBLEAK.COM");
+const GFXCUR_COM: &[u8] = include_bytes!("fixtures/GFXCUR.COM");
 
 // AUTOEXEC.BAT: load the resident mouse driver, then run the self-test. MOUSE.COM
 // installs to C:\DOS (on the PATH); MTEST.COM lands at the C: root, which is the
 // boot drive's current directory, so a bare MTEST finds it.
 const AUTOEXEC: &str = "@ECHO OFF\r\nC:\\DOS\\MOUSE\r\nMTEST\r\n";
+const AUTOEXEC_CBLEAK: &str = "@ECHO OFF\r\nC:\\DOS\\MOUSE\r\nCBLEAK\r\n";
+const AUTOEXEC_GFXCUR: &str = "@ECHO OFF\r\nC:\\DOS\\MOUSE\r\nGFXCUR\r\n";
 
 /// Install Toka-DOS onto a fresh temp C:, drop MTEST.COM at the root, write the
 /// AUTOEXEC.BAT above, and return a booted machine plus the temp dir (kept alive
@@ -54,6 +58,58 @@ fn boot_with_mtest() -> (Machine, tempfile::TempDir) {
     machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
     machine.set_toka_c_root(dir.path().to_path_buf());
     (machine, dir)
+}
+
+fn boot_with_cbleak() -> (Machine, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let files = izarravm_firmware::toka_dos_system_files();
+    izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format).unwrap();
+    std::fs::write(dir.path().join("CBLEAK.COM"), CBLEAK_COM).unwrap();
+    std::fs::write(dir.path().join("AUTOEXEC.BAT"), AUTOEXEC_CBLEAK).unwrap();
+
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        izarra_bios(),
+    )
+    .unwrap();
+    machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+    machine.set_toka_c_root(dir.path().to_path_buf());
+    (machine, dir)
+}
+
+fn boot_with_gfxcur() -> (Machine, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let files = izarravm_firmware::toka_dos_system_files();
+    izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format).unwrap();
+    std::fs::write(dir.path().join("GFXCUR.COM"), GFXCUR_COM).unwrap();
+    std::fs::write(dir.path().join("AUTOEXEC.BAT"), AUTOEXEC_GFXCUR).unwrap();
+
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        izarra_bios(),
+    )
+    .unwrap();
+    machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+    machine.set_toka_c_root(dir.path().to_path_buf());
+    (machine, dir)
+}
+
+fn type_line(machine: &mut Machine, text: &str) {
+    for ch in text.chars().chain(std::iter::once('\r')) {
+        let codes: &[u8] = match ch {
+            'v' | 'V' => &[0x2f, 0xaf],
+            'e' | 'E' => &[0x12, 0x92],
+            'r' | 'R' => &[0x13, 0x93],
+            '\r' => &[0x1c, 0x9c],
+            _ => &[],
+        };
+        assert!(!codes.is_empty(), "unmapped test character {ch:?}");
+        for code in codes {
+            machine.inject_key_scancodes(&[*code]);
+        }
+        machine.run_until_halt_or_cycles(500_000).unwrap();
+    }
+    machine.run_until_halt_or_cycles(8_000_000).unwrap();
 }
 
 #[test]
@@ -117,5 +173,47 @@ fn mouse_driver_passes_the_guest_self_test_end_to_end() {
             "MTEST never exited within {MAX_CHUNKS} chunks; it may be stuck before \
              the poll, or the injected motion never reached the driver"
         ),
+    }
+}
+
+#[test]
+fn mouse_driver_does_not_call_a_child_callback_after_exec_return() {
+    let (mut machine, _dir) = boot_with_cbleak();
+    let reason = machine.run_until_halt_or_cycles(80_000_000).unwrap();
+    assert!(
+        !matches!(reason, StopReason::TestExit { code: 99 }),
+        "CBLEAK's callback fired before the child returned"
+    );
+    let text = machine.screen_text().as_text();
+    assert!(
+        text.contains("C:\\>"),
+        "CBLEAK should have returned to the shell prompt; got:\n{text}"
+    );
+    machine.inject_mouse(8, 0, 0);
+    let reason = machine.run_until_halt_or_cycles(4_000_000).unwrap();
+    assert!(
+        !matches!(reason, StopReason::TestExit { code: 99 }),
+        "stale child mouse callback fired after EXEC return"
+    );
+
+    type_line(&mut machine, "ver");
+    let text = machine.screen_text().as_text();
+    assert!(
+        text.contains("Toka-DOS v3.0"),
+        "shell should still accept commands after post-child mouse motion; got:\n{text}"
+    );
+}
+
+#[test]
+fn mouse_driver_does_not_draw_text_cursor_in_graphics_modes() {
+    let (mut machine, _dir) = boot_with_gfxcur();
+    let reason = machine.run_until_halt_or_cycles(80_000_000).unwrap();
+    match reason {
+        StopReason::TestExit { code: 0 } => {}
+        StopReason::TestExit { code } => panic!(
+            "GFXCUR reported failure code {code} (1=mouse reset failed, \
+             2=graphics-mode Show Cursor wrote through B800)"
+        ),
+        other => panic!("expected GFXCUR to exit through the unit tester, got {other:?}"),
     }
 }

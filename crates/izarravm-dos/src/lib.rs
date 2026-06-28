@@ -2297,7 +2297,7 @@ impl DosKernel {
 
         // Patch the child PSP.
         let psp = usize::from(child_psp) * 16;
-        mem.write_u16(psp + 0x02, ARENA_TOP)?; // child owns to the top (DOS default)
+        let child_prog_top = mem.read_u16(psp + 0x02)?;
         mem.write_u16(psp + 0x16, parent_psp)?; // parent PSP link
         mem.write_u16(psp + 0x2c, env_seg)?; // environment segment
         self.write_command_tail(mem, psp, cmdtail_seg, cmdtail_off)?;
@@ -2333,10 +2333,9 @@ impl DosKernel {
             chain_first: env_mcb, // the chain starts at the env block
             resident: false,
         };
-        // Write the child program block: owned by the child PSP, the last block,
-        // filling conventional memory to the top. Its header sits just above the env
-        // data, so the child chain reads env -> program -> (free tail once shrunk).
-        write_child_program_mcb(mem, child_psp)?;
+        // Write the child program block from the loader's PSP:0x02 top. A .COM
+        // keeps its 64 KiB segment, leaving a free tail above its high stack.
+        write_child_program_mcb(mem, child_psp, child_prog_top)?;
         self.dta = (child_psp, 0x80);
         // A fresh child has terminated no child of its own.
         self.last_exit_code = 0;
@@ -15810,7 +15809,7 @@ mod tests {
         match action {
             DosAction::Exec { child_ax, .. } => {
                 assert_eq!(child_ax, 0x0000); // null FCBs -> valid drives
-                assert_eq!(mem.read_u16(child_psp + 0x02).unwrap(), 0xa000);
+                assert_eq!(mem.read_u16(child_psp + 0x02).unwrap(), 0x1203);
                 assert_eq!(mem.read_u16(child_psp + 0x16).unwrap(), 0x0100); // parent
                 assert_eq!(mem.read_u16(child_psp + 0x2c).unwrap(), 0x0201); // env data seg
                 assert_eq!(mem.read_u8(child_psp + 0x80).unwrap(), 0); // empty tail
@@ -15819,6 +15818,33 @@ mod tests {
             }
             other => panic!("expected Exec, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn exec_loaded_com_can_exec_a_child_above_its_stack() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("SHELL.COM"), [0xcdu8, 0x20]).unwrap();
+        std::fs::write(dir.path().join("CHILD.COM"), [0xcdu8, 0x20]).unwrap();
+        let (mut kernel, mut mem) = exec_kernel(dir.path());
+
+        place_exec_inputs(&mut mem, "C:\\SHELL.COM", 0);
+        let shell = exec_al0(&mut kernel, &mut mem);
+        assert!(!shell.cf);
+        let shell_psp = kernel.arena.psp_seg;
+        assert_eq!(shell_psp, 0x0203);
+        assert_eq!(kernel.arena.free_base(&mem), shell_psp + 0x1000);
+
+        let shell_stack = usize::from(shell_psp) * 16 + 0xfffc;
+        mem.write_u16(shell_stack, 0xbeef).unwrap();
+        place_exec_inputs(&mut mem, "C:\\CHILD.COM", 0);
+        let child = exec_al0(&mut kernel, &mut mem);
+        assert!(!child.cf);
+        assert!(kernel.arena.psp_seg >= shell_psp + 0x1000);
+
+        kernel.finish_exec(0, &mut mem).unwrap();
+        assert_eq!(kernel.arena.psp_seg, shell_psp);
+        assert_eq!(mem.read_u16(shell_stack).unwrap(), 0xbeef);
+        assert_eq!(kernel.arena.free_base(&mem), shell_psp + 0x1000);
     }
 
     #[test]
@@ -15852,7 +15878,7 @@ mod tests {
         assert_eq!(mem.read_u16(0x10054).unwrap(), 0x0203); // entry CS
         assert_eq!(mem.read_u16(0x0203 * 16 + 0xfffc).unwrap(), 0x0000);
         assert_eq!(mem.read_u16(0x0203 * 16 + 0x16).unwrap(), 0x0100);
-        assert_eq!(kernel.arena.free_base(&mem), ARENA_TOP);
+        assert_eq!(kernel.arena.free_base(&mem), 0x1203);
     }
 
     #[test]
