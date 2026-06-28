@@ -109,6 +109,57 @@ $commandCom = Join-Path $fcdir 'command.com'
 if (-not (Test-Path $commandCom)) { throw "command.com not produced at $commandCom" }
 Write-Host "command.com: $((Get-Item $commandCom).Length) bytes"
 
+# --- FreeDOS userland: move + sort (Open Watcom wcl, native Win64; no owwin/gmake) ---
+# Their src/Makefile is GNU-make; we replicate the wcl compile/link steps. UPX skipped.
+# English via kitten fallbacks (link kitten, ship no .nls catalog). Stage with Copy-Item
+# (never Move-Item: a host MOVE could resolve to the freshly built MOVE.EXE).
+#
+# NB: -fo=/-fe= names are given WITHOUT the .obj/.exe extension. On this Open Watcom
+# (2.0beta1) the wcl driver, given e.g. -fo=kitten.obj, splits at the dot and tries
+# to open ".obj" as a link input ("Unable to open .obj" on stderr) -- harmless (it
+# still passes -fo=kitten to wcc and emits kitten.obj) but it muddies the log AND
+# wcl returns 0 either way, so the noise can't be distinguished from a real failure.
+# Dropping the extension lets wcl apply the default (.obj for -c, .exe for link) and
+# the build runs silent. -we (warnings-as-errors) is kept: both tools compile clean.
+$env:INCLUDE = "$env:WATCOM\h"
+
+$movedir = Join-Path $fd 'move\src'
+$mvCf = @('-bt=DOS','-bcl=DOS','-D__MSDOS__','-oas','-s','-wx','-we','-zq','-fm','-k12288','-mc')
+Push-Location $movedir
+try {
+    & wcl @mvCf -fo=kitten   -c ..\kitten\kitten.c
+    if ($LASTEXITCODE) { throw "wcl kitten (move) failed" }
+    & wcl @mvCf -fo=tnyprntf -c ..\tnyprntf\tnyprntf.c
+    if ($LASTEXITCODE) { throw "wcl tnyprntf (move) failed" }
+    & wcl @mvCf -fe=move move.c movedir.c misc.c tnyprntf.obj kitten.obj
+    if ($LASTEXITCODE) { throw "wcl move failed" }
+} finally { Pop-Location }
+$moveExe = Join-Path $movedir 'move.exe'
+if (-not (Test-Path $moveExe)) { throw "move.exe not produced" }
+Write-Host "MOVE.EXE: $((Get-Item $moveExe).Length) bytes"
+
+$sortdir = Join-Path $fd 'sort\src'
+$srtCf = @('-oas','-bt=DOS','-D__MSDOS__','-zp1','-s','-0','-wx','-we','-zq','-fm','-mc')
+Push-Location $sortdir
+try {
+    & wcl @srtCf -fo=kitten   -c ..\kitten\kitten.c   # REQUIRED: sort.c uses get_line() from kitten.c
+    if ($LASTEXITCODE) { throw "wcl kitten (sort) failed" }
+    & wcl @srtCf -fo=tnyprntf -c ..\tnyprntf\tnyprntf.c
+    if ($LASTEXITCODE) { throw "wcl tnyprntf (sort) failed" }
+    & wcl @srtCf -fe=sort sort.c kitten.obj tnyprntf.obj
+    if ($LASTEXITCODE) { throw "wcl sort failed" }
+} finally { Pop-Location }
+$sortExe = Join-Path $sortdir 'sort.exe'
+if (-not (Test-Path $sortExe)) { throw "sort.exe not produced" }
+Write-Host "SORT.EXE: $((Get-Item $sortExe).Length) bytes"
+
+# --- TOKAMOUS (our INT 33h PS/2 mouse TSR, rebranded from izmouse.asm) ---
+$tokamous = Join-Path $root 'build-freedos-tokamous.com'
+& nasm -f bin (Join-Path $root 'tools\izmouse.asm') -o $tokamous
+if ($LASTEXITCODE) { throw "nasm tokamous failed" }
+if (-not (Test-Path $tokamous)) { throw "TOKAMOUS not produced" }
+Write-Host "TOKAMOUS.COM: $((Get-Item $tokamous).Length) bytes"
+
 # --- Assemble the committed image ---
 & python (Join-Path $root '..\scripts\build-freedos-image.py')
 if ($LASTEXITCODE -ne 0) { throw "image build failed" }

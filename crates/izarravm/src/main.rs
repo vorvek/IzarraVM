@@ -985,4 +985,64 @@ mod tokados_smoke {
             "parent shell did not recover after running/exiting the child COMMAND.COM (COMSPEC reload of renamed shell failed).\n{text}"
         );
     }
+
+    // TOKAMOUS loads at boot (AUTOEXEC runs it). Validates the Task 5 resident-restructure
+    // didn't break the TSR install.
+    #[test]
+    #[ignore = "boots a full DOS image (slow in debug); run with --ignored"]
+    fn tokados_mouse_driver_loads() {
+        let (mut machine, _stop) = boot(500_000_000);
+        let text = machine.screen_text().as_text().to_ascii_lowercase();
+        assert!(
+            text.contains("mouse driver installed"),
+            "TOKAMOUS did not install at boot.\n{text}"
+        );
+        // It responds to hardware without faulting (consumes an IRQ12 packet).
+        machine.inject_mouse_relative(20, 10, 0);
+        machine
+            .run_until_halt_or_cycles(2_000_000)
+            .expect("mouse packet");
+    }
+
+    // move + sort are external .EXEs on the image and run from the prompt.
+    #[test]
+    #[ignore = "boots a full DOS image (slow in debug); run with --ignored"]
+    fn tokados_move_and_sort_run() {
+        let (mut machine, _stop) = boot(500_000_000);
+
+        // Type a command and let it run to completion, returning the 80x25 screen.
+        // MOVE's usage screen is long enough to scroll its own banner off-screen if a
+        // second command runs after it, so we capture each tool's screen right away.
+        fn run_cmd(machine: &mut Machine, cmd: &str) -> String {
+            for ch in cmd.chars() {
+                for code in ascii_to_set1(ch) {
+                    machine.inject_key_scancodes(&[code]);
+                }
+                machine.run_until_halt_or_cycles(10_000_000).expect("type");
+            }
+            // Generous budget: loading an external .EXE from the floppy image plus its
+            // run is slow in this path, and MOVE's usage screen must fully print before
+            // we snapshot (otherwise its banner hasn't reached the framebuffer yet).
+            machine
+                .run_until_halt_or_cycles(80_000_000)
+                .expect("settle");
+            machine.screen_text().as_text().to_ascii_lowercase()
+        }
+
+        // MOVE prints its rebranded banner ("Toka-DOS MOVE 3.0 (Toka-DOS)") only via its
+        // usage screen (`/?`); with no args it just errors "Required parameter missing".
+        // `/?` demonstrably runs the .EXE and surfaces the banner.
+        let move_text = run_cmd(&mut machine, "move /?\r");
+        assert!(
+            move_text.contains("toka-dos move"),
+            "MOVE.EXE did not run/print its banner.\n{move_text}"
+        );
+
+        // SORT prints its banner ("Toka-DOS SORT 3.0 (FreeDOS v1.4)") on `/?` too.
+        let sort_text = run_cmd(&mut machine, "sort /?\r");
+        assert!(
+            sort_text.contains("toka-dos sort"),
+            "SORT.EXE did not run/print its banner.\n{sort_text}"
+        );
+    }
 }

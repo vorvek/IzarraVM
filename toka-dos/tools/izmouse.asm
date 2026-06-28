@@ -1,7 +1,7 @@
-; IZMOUSE.COM - Toka-DOS PS/2 mouse driver (INT 33h), a TSR.
+; TOKAMOUS.COM - Toka-DOS PS/2 mouse driver (INT 33h), a TSR.
 ; Installs an INT 33h dispatcher and registers a PS/2 packet handler with the
 ; BIOS (INT 15h AX=C207). The BIOS INT 74h ISR far-calls the handler per packet.
-; Assemble: nasm -f bin tools/izmouse.asm -o IZMOUSE.COM
+; Assemble: nasm -f bin tools/izmouse.asm -o TOKAMOUS.COM
     cpu 386
     org 0x100
 
@@ -745,14 +745,13 @@ m_get_language:
     iret
 
 ; 0x24 get driver version/type/IRQ.
-; Only when BX==0 on entry: return BX=0x0820, CX=0x0400. Preserves AX,DX,SI,DI.
-; If BX != 0, leave all registers unchanged.
+; Returns BH=major(8), BL=minor(0x20), CH=mouse-type(4=PS/2), CL=IRQ(0=PS/2).
+; Preserves AX,DX,SI,DI. The "BX=0 on entry" in the INT 33h spec is an INPUT
+; calling-convention note to callers, not a guard the driver should enforce;
+; programs rely on AX=0x24 returning version/type unconditionally.
 m_get_version:
-    cmp bx, 0
-    jne .skip
     mov bx, 0x0820
     mov cx, 0x0400
-.skip:
     iret
 
 ; Return AX = the first conventional MCB header Toka-DOS published. In the full
@@ -1254,7 +1253,8 @@ packet_handler:
     pop bp
     retf
 
-; ---- install / TSR ----
+resident_end:
+; ---- install / TSR (transient: discarded by AH=31h KEEP) ----
 install:
     push es
     xor ax, ax
@@ -1287,4 +1287,3 @@ install:
     int 0x21
 
 banner          db 'Toka-DOS mouse driver installed.', 13, 10, '$'
-resident_end:
