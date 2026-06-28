@@ -48,3 +48,18 @@ fn baseline_charges_fewer_clocks_than_the_sieve() {
         sieve.elapsed_clocks()
     );
 }
+
+#[test]
+fn faster_modes_charge_fewer_guest_clocks_for_the_sieve() {
+    let i386 = run(GswMode::Gsw386, 1).elapsed_clocks();
+    let i486 = run(GswMode::Gsw486, 1).elapsed_clocks();
+    let i586 = run(GswMode::Gsw586, 1).elapsed_clocks();
+    assert!(
+        i486 < i386,
+        "486 ({i486}) should be cheaper than 386 ({i386})"
+    );
+    assert!(
+        i586 < i486,
+        "586 ({i586}) should be cheaper than 486 ({i486})"
+    );
+}
