@@ -948,16 +948,8 @@ mod sp1_smoke {
         );
     }
 
-    // DEFERRED (SP-1 secondary criterion) — currently FAILS by design, kept as an
-    // executable spec for the follow-up. The keyboard *delivery* chain is verified
-    // correct (PIC IRQ1 unmasked, INT 09h fires, BDA ring fills with the right
-    // scancodes, INT 16h returns them), but the real FreeDOS kernel's interactive
-    // readline consumes the keys without echoing — most likely it treats STDIN/STDOUT
-    // as non-character-devices (INT 21h AH=44 IOCTL) and reads non-interactively.
-    // Root cause + trace in dev_docs/2026-06-28-sp1-boot-fault-log.md. This is real
-    // FreeDOS-kernel-level work, deferred past the SP-1 boot spike.
     #[test]
-    #[ignore = "DEFERRED/known-failing: real-booted FreeDOS readline does not echo injected keys (SP-1 secondary; see fault log)"]
+    #[ignore = "needs IZARRAVM_FREEDOS_SPIKE_IMG (run scripts/prep-freedos-spike.py)"]
     fn sp1_freedos_runs_injected_ver() {
         // Boot to the interactive prompt first.
         let (mut machine, _stop) = boot(spike_image(), 500_000_000);
