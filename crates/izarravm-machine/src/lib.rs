@@ -11103,6 +11103,20 @@ struct MachineBus<'a> {
 /// deliberately closes it.
 const A20_MASK: u32 = !(1 << 20);
 
+/// The port each byte of a wider-than-byte I/O cycle targets. The IDE/ATA 16-bit
+/// data registers (primary `0x1F0`, secondary `0x170`) stream every byte through
+/// the same port via their data FIFO, so a word/dword access repeats the port.
+/// Every other (8-bit-decoded) port takes consecutive bytes at `port`, `port+1`,
+/// ... - exactly the VGA index/data-pair behaviour a single 16-bit `OUT` to
+/// `0x3C4`/`0x3CE`/`0x3D4` relies on to set an index and its datum at once.
+const fn io_word_sub_port(port: u16, index: u32) -> u16 {
+    if port == ata::PRIMARY_CMD_BASE || port == ide::SECONDARY_CMD_BASE {
+        port
+    } else {
+        port.wrapping_add(index as u16)
+    }
+}
+
 impl CpuBus for MachineBus<'_> {
     fn read_memory(
         &mut self,
@@ -11268,7 +11282,18 @@ impl CpuBus for MachineBus<'_> {
         }
 
         if width != BusWidth::Byte {
-            return Err(BusError::WidthMismatch { width });
+            // A wider-than-byte port access decomposes into byte cycles, the way the
+            // ISA bus does for a port that is not 16-bit: the low byte comes from the
+            // port and each higher byte from the next port (`io_word_sub_port` keeps
+            // the IDE/ATA data registers on the same port). This is the canonical VGA
+            // mode-set path - a single 16-bit `OUT 0x3C4`/`0x3CE`/`0x3D4` sets an
+            // index and its datum - which used to halt the VM with WidthMismatch.
+            let mut value = 0u32;
+            for i in 0..width.bytes() {
+                let byte = self.read_io(io_word_sub_port(port, i), BusWidth::Byte)?;
+                value |= (byte & 0xff) << (8 * i);
+            }
+            return Ok(value);
         }
 
         if self.video_io_disabled_for_port(port) {
@@ -11404,7 +11429,16 @@ impl CpuBus for MachineBus<'_> {
         }
 
         if width != BusWidth::Byte {
-            return Err(BusError::WidthMismatch { width });
+            // A wider-than-byte port write decomposes into byte cycles, mirroring
+            // `read_io`: the low byte goes to the port and each higher byte to the
+            // next port (`io_word_sub_port` keeps the IDE/ATA data registers on the
+            // same port). The VGA index/data idiom (a single 16-bit `OUT 0x3C4`/
+            // `0x3CE`/`0x3D4`) depends on this; it used to halt the VM with
+            // WidthMismatch.
+            for i in 0..width.bytes() {
+                self.write_io(io_word_sub_port(port, i), BusWidth::Byte, value >> (8 * i))?;
+            }
+            return Ok(());
         }
 
         if self.video_io_disabled_for_port(port) {
@@ -13151,6 +13185,23 @@ mod tests {
         bus.write_io(0x3D4, BusWidth::Byte, u32::from(index))
             .unwrap();
         bus.read_io(0x3D5, BusWidth::Byte).unwrap() as u8
+    }
+
+    #[test]
+    fn word_out_to_a_vga_register_pair_splits_into_two_byte_cycles() {
+        // `OUT DX, AX` (16-bit) to a VGA index/data port pair is the canonical
+        // mode-set idiom: the low byte (AL) selects the index at the port, the high
+        // byte (AH) writes the data at port+1. The byte-only I/O bus used to reject
+        // any non-byte width with WidthMismatch, halting the VM on real VGA setup
+        // code (HOUSERS / TSUMERA SETUP.EXE both crash on exactly this).
+        let mut m = int15_machine(1);
+        {
+            let mut bus = m.make_bus();
+            // AX = 0x420F: CRTC index 0x0F (cursor location low), data 0x42.
+            bus.write_io(0x3D4, BusWidth::Word, 0x420F).unwrap();
+        }
+        // The low byte set the index, the high byte wrote the data at 0x3D5.
+        assert_eq!(color_crtc_reg(&mut m, 0x0F), 0x42);
     }
 
     #[test]
