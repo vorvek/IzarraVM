@@ -24,6 +24,7 @@ start:
     cld
     xor ax, ax
     mov ds, ax
+    mov es, ax
     mov ss, ax
     mov sp, 0x7000
 
@@ -67,7 +68,7 @@ report:
     jmp .hang
 
 ; emit_u16_padded: write ax as the low word of a u32, then a zero high word,
-; advancing the device index by 4. Preserves cx and dx.
+; advancing the device index by 4. Clobbers ax. Preserves cx and dx.
 emit_u16_padded:
     out PORT_DATA, al
     mov al, ah
@@ -80,6 +81,7 @@ emit_u16_padded:
 ; sieve: run SIEVE_ITER passes of the 8190 sieve. Returns bx = prime count of
 ; the last pass (1899 for a correct run). Uses es:di into SIEVE_SEG.
 sieve:
+    push bp
     mov bp, SIEVE_ITER
 .pass:
     mov ax, SIEVE_SEG
@@ -116,6 +118,7 @@ sieve:
 .pass_done:
     dec bp
     jnz .pass
+    pop bp
     ret
 
 ; The image build pads to a 1.44 MiB floppy; stage 2 must fit the 16 loaded
