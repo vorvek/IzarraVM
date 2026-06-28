@@ -4,6 +4,8 @@ pub const X86_BOOT_TEST_IMAGE: &[u8] = include_bytes!("../roms/boot-suite/izarra
 pub const X86_BOOT_TEST_BOOT_SOURCE: &str = include_str!("../roms/boot-suite/boot.asm");
 pub const X86_BOOT_TEST_STAGE2_SOURCE: &str = include_str!("../roms/boot-suite/stage2.asm");
 pub const X86_BOOT_TEST_RESULTS_SOURCE: &str = include_str!("../roms/boot-suite/results.inc");
+pub const NEURKETA_IMAGE: &[u8] = include_bytes!("../roms/neurketa/neurketa.img");
+pub const NEURKETA_STAGE2_SOURCE: &str = include_str!("../roms/neurketa/neurketa-stage2.asm");
 pub const HELLO_COM: &[u8] = include_bytes!("../roms/dos/hello.com");
 pub const HELLO_COM_SOURCE: &str = include_str!("../roms/dos/hello.asm");
 pub const ECHO_COM: &[u8] = include_bytes!("../roms/dos/echo.com");
@@ -76,6 +78,14 @@ pub fn izarra_bios() -> &'static [u8] {
 
 pub fn boot_test_image() -> &'static [u8] {
     X86_BOOT_TEST_IMAGE
+}
+
+/// The Neurketa benchmark boot image: a 1.44 MiB floppy that boots a 16-bit
+/// loader plus the Sieve payload. Run with `Machine::new_boot_image`, preload
+/// the selector with `Machine::set_bench_selector`, and read the results back
+/// with `Machine::bench_iterations` / `bench_aux` after the `TestExit` stop.
+pub fn neurketa_image() -> &'static [u8] {
+    NEURKETA_IMAGE
 }
 
 pub fn toka_dos_rom() -> &'static [u8] {
@@ -591,6 +601,14 @@ mod tests {
         assert!(results.records.iter().any(|record| {
             record.status == SuiteRecordStatus::Fail && record.name == "sound.opl3"
         }));
+    }
+
+    #[test]
+    fn neurketa_image_is_a_full_floppy() {
+        assert_eq!(neurketa_image().len(), X86_BOOT_TEST_IMAGE_SIZE);
+        // The boot sector ends in the 0xAA55 signature.
+        let image = neurketa_image();
+        assert_eq!(&image[510..512], &[0x55, 0xAA]);
     }
 
     #[test]
