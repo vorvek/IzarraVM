@@ -37,12 +37,20 @@ pub const REG_H: usize = 6;
 pub const REG_CRC: usize = 8;
 pub const REG_EXIT: usize = 12;
 
+/// Neurketa benchmark region, above the video-test registers. The host preloads
+/// REG_SELECTOR before boot; the guest reads it to pick a payload, then writes
+/// its result primitives back into the result registers before CMD_EXIT.
+pub const REG_SELECTOR: usize = 16;
+pub const REG_RESULT_ITER: usize = 17;
+pub const REG_RESULT_AUX: usize = 21;
+pub const REG_RESULT_STATUS: usize = 25;
+
 /// Commands written to `PORT_COMMAND`.
 pub const CMD_CRC: u8 = 1;
 pub const CMD_SNAPSHOT: u8 = 2;
 pub const CMD_EXIT: u8 = 3;
 
-const REG_FILE_SIZE: usize = 16;
+const REG_FILE_SIZE: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnitTester {
@@ -128,6 +136,24 @@ impl UnitTester {
     pub fn exit_code(&self) -> u8 {
         self.regs[REG_EXIT]
     }
+
+    /// Read a single register-file byte, 0 if the offset is out of range.
+    pub fn reg_u8(&self, offset: usize) -> u8 {
+        self.regs.get(offset).copied().unwrap_or(0)
+    }
+
+    /// Write a single register-file byte; ignored if the offset is out of range.
+    pub fn set_reg_u8(&mut self, offset: usize, value: u8) {
+        if let Some(slot) = self.regs.get_mut(offset) {
+            *slot = value;
+        }
+    }
+
+    /// Read a little-endian u32 starting at `offset`, missing bytes treated as 0.
+    pub fn reg_u32(&self, offset: usize) -> u32 {
+        let byte = |i: usize| self.regs.get(offset + i).copied().unwrap_or(0);
+        u32::from_le_bytes([byte(0), byte(1), byte(2), byte(3)])
+    }
 }
 
 /// Standard zlib/IEEE CRC-32 (polynomial 0xEDB88320), the same value 86Box's
@@ -176,5 +202,23 @@ mod tests {
         ut.write_port(PORT_COMMAND, CMD_CRC);
         assert_eq!(ut.take_pending(), Some(CMD_CRC));
         assert_eq!(ut.take_pending(), None);
+    }
+
+    #[test]
+    fn benchmark_region_round_trips_through_the_host_helpers() {
+        let mut ut = UnitTester::default();
+        ut.set_reg_u8(REG_SELECTOR, 1);
+        assert_eq!(ut.reg_u8(REG_SELECTOR), 1);
+
+        // Guest writes iterations and aux as little-endian u32 via the data port.
+        ut.write_port(PORT_INDEX, REG_RESULT_ITER as u8);
+        for byte in 40u32.to_le_bytes() {
+            ut.write_port(PORT_DATA, byte);
+        }
+        for byte in 1899u32.to_le_bytes() {
+            ut.write_port(PORT_DATA, byte);
+        }
+        assert_eq!(ut.reg_u32(REG_RESULT_ITER), 40);
+        assert_eq!(ut.reg_u32(REG_RESULT_AUX), 1899);
     }
 }
