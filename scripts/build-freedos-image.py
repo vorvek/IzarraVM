@@ -62,9 +62,13 @@ def main():
     kernel = open(os.path.join(kdir, "bin", "kernel.sys"), "rb").read()
     shell  = open(os.path.join(fcdir, "command.com"), "rb").read()
 
+    tokamous = open(os.path.join(repo, "toka-dos", "build-freedos-tokamous.com"), "rb").read()
+    move = open(os.path.join(repo, "toka-dos", "freedos", "move", "src", "move.exe"), "rb").read()
+    sort = open(os.path.join(repo, "toka-dos", "freedos", "sort", "src", "sort.exe"), "rb").read()
+
     config_sys = (b"FILES=40\r\nLASTDRIVE=Z\r\n"
                   b"SHELL=A:\\TOKACMD.COM A:\\ /E:2048 /P=A:\\AUTOEXEC.BAT\r\n")
-    autoexec   = b"@ECHO OFF\r\n"   # no-op; drops to prompt (SP-1 lesson: /P=batch, not bare /P)
+    autoexec   = b"@ECHO OFF\r\nTOKAMOUS\r\n"
 
     img = bytearray(IMG_SIZE)
     img[0:512] = boot
@@ -74,7 +78,11 @@ def main():
 
     # KERNEL.SYS must be in the root dir before the first free slot; add it first.
     files = [("KERNEL.SYS", kernel), ("TOKACMD.COM", shell),
-             ("COMMAND.COM", shell),  # byte-copy alias
+             ("COMMAND.COM", shell),          # byte-copy alias
+             ("TOKAMOUS.COM", tokamous),
+             ("MOUSE.COM", tokamous),         # byte-copy alias
+             ("MOVE.EXE", move),
+             ("SORT.EXE", sort),
              ("CONFIG.SYS", config_sys), ("AUTOEXEC.BAT", autoexec)]
 
     next_free = 2
@@ -110,7 +118,7 @@ def main():
     out = os.path.join(repo, "crates", "izarravm-firmware", "roms", "tokados.img")
     with open(out, "wb") as f:
         f.write(img)
-    print(f"tokados.img: {len(img)} bytes (kernel={len(kernel)}, shell={len(shell)})")
+    print(f"tokados.img: {len(img)} bytes (kernel={len(kernel)}, shell={len(shell)}, tokamous={len(tokamous)}, move={len(move)}, sort={len(sort)})")
 
 if __name__ == "__main__":
     main()
