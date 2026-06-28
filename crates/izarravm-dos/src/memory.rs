@@ -808,15 +808,31 @@ pub(super) fn write_env_mcb(
     write_mcb_header(mem, env_mcb, b'M', child_psp, env_paras, NO_NAME)
 }
 
-pub(super) fn write_child_program_mcb(mem: &mut Memory, child_psp: u16) -> Result<(), DosError> {
-    write_mcb_header(
-        mem,
-        child_psp.wrapping_sub(1),
-        b'Z',
-        child_psp,
-        ARENA_TOP - child_psp,
-        PROG_NAME,
-    )
+pub(super) fn write_child_program_mcb(
+    mem: &mut Memory,
+    child_psp: u16,
+    prog_top: u16,
+) -> Result<(), DosError> {
+    if prog_top < ARENA_TOP {
+        write_mcb_header(
+            mem,
+            child_psp.wrapping_sub(1),
+            b'M',
+            child_psp,
+            prog_top - child_psp,
+            PROG_NAME,
+        )?;
+        write_mcb_header(mem, prog_top, b'Z', 0, ARENA_TOP - prog_top - 1, NO_NAME)
+    } else {
+        write_mcb_header(
+            mem,
+            child_psp.wrapping_sub(1),
+            b'Z',
+            child_psp,
+            prog_top - child_psp,
+            PROG_NAME,
+        )
+    }
 }
 
 pub(super) fn write_free_mcb_to_cap(

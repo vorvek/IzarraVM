@@ -9,6 +9,9 @@ VIRT_MAX_X      equ 639
 VIRT_MAX_Y      equ 199
 CENTER_X        equ VIRT_MAX_X / 2
 CENTER_Y        equ VIRT_MAX_Y / 2
+MCB_SCAN_START  equ 0x0050
+MCB_SCAN_LIMIT  equ 0x0300
+ARENA_TOP       equ 0xA000
 
 start:
     jmp install
@@ -43,6 +46,8 @@ cb_mask         dw 0
 ; low word offset, high word segment). Keep cb_off immediately before cb_seg.
 cb_off          dw 0
 cb_seg          dw 0
+cb_owner        dw 0                  ; owner PSP from the live MCB containing cb_seg
+cb_mcb_seg      dw 0                  ; MCB header paragraph for that owner block
 cond_left       dw 0
 cond_top        dw 0
 cond_right      dw VIRT_MAX_X
@@ -58,6 +63,7 @@ saved_cell      dw 0
 saved_off       dw 0xFFFF
 in_callback     db 0                 ; re-entrancy guard for the user callback
 cond_active     db 0                 ; 1 = a conditional-off region is in effect
+cb_live_tmp     db 0                 ; scratch result byte for callback validation
 
 ; ---- INT 33h dispatcher ----
 ; A flat compare ladder over the core function set 0x00..0x10. AX > 0x10 falls
@@ -183,6 +189,8 @@ m_reset:
     mov word [cs:cb_mask], 0
     mov word [cs:cb_seg], 0
     mov word [cs:cb_off], 0
+    mov word [cs:cb_owner], 0
+    mov word [cs:cb_mcb_seg], 0
     mov ax, 0xFFFF
     mov bx, 2
     iret
@@ -399,6 +407,16 @@ m_set_callback:
     mov [cs:cb_mask], cx
     mov [cs:cb_seg], es
     mov [cs:cb_off], dx
+    mov word [cs:cb_owner], 0
+    mov word [cs:cb_mcb_seg], 0
+    push ax
+    mov ax, es
+    or ax, dx
+    or ax, cx
+    jz .no_owner
+    call find_callback_mcb
+.no_owner:
+    pop ax
     iret
 
 ; 0x0D / 0x0E light-pen emulation on/off: inert. Returns nothing; preserve ALL.
@@ -737,6 +755,144 @@ m_get_version:
 .skip:
     iret
 
+; Return AX = the first conventional MCB header Toka-DOS published. In the full
+; boot path the system PSP is at 0200h (MCB 01FFh), while synthetic unit setups may
+; use lower roots. Pick the first plausible self-owned block.
+find_first_mcb:
+    push bx
+    push es
+    mov ax, MCB_SCAN_START
+.scan:
+    cmp ax, MCB_SCAN_LIMIT
+    jae .not_found
+    mov es, ax
+    mov bl, [es:0]
+    cmp bl, 'M'
+    je .sig_ok
+    cmp bl, 'Z'
+    jne .next
+.sig_ok:
+    mov bx, ax
+    inc bx
+    cmp [es:1], bx
+    jne .next
+    cmp word [es:3], 0
+    jne .done
+.next:
+    inc ax
+    jmp .scan
+.not_found:
+    mov ax, ARENA_TOP
+.done:
+    pop es
+    pop bx
+    ret
+
+; Follow Toka-DOS's conventional-memory MCB chain and remember the live block that
+; contains the registered callback segment. This runs when a program installs a
+; callback, not from IRQ context.
+find_callback_mcb:
+    push ax
+    push bx
+    push cx
+    push dx
+    push es
+    call find_first_mcb
+.scan:
+    cmp ax, ARENA_TOP
+    jae .done
+    mov es, ax
+    mov bl, [es:0]
+    cmp bl, 'M'
+    je .valid_sig
+    cmp bl, 'Z'
+    jne .done
+.valid_sig:
+    mov dx, ax
+    inc dx                              ; data segment = MCB + 1
+    mov cx, dx
+    add cx, [es:3]                      ; first paragraph after this block
+    mov bx, [cs:cb_seg]
+    cmp bx, dx
+    jb .next
+    cmp bx, cx
+    jae .next
+    mov [cs:cb_mcb_seg], ax
+    mov bx, [es:1]
+    mov [cs:cb_owner], bx
+    jmp .done
+.next:
+    cmp byte [es:0], 'Z'
+    je .done
+    mov bx, [es:3]
+    inc bx                              ; skip data plus the next MCB header
+    add ax, bx
+    jmp .scan
+.done:
+    pop es
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; Return ZF=0 when the registered callback still belongs to the same live MCB.
+; If no owner was found at registration, allow the callback for compatibility.
+callback_still_live:
+    push ax
+    push bx
+    push cx
+    push dx
+    push es
+    mov byte [cs:cb_live_tmp], 1
+    mov dx, [cs:cb_owner]
+    or dx, dx
+    jz .done
+    mov bx, [cs:cb_mcb_seg]
+    or bx, bx
+    jz .dead
+    call find_first_mcb
+.scan:
+    cmp ax, ARENA_TOP
+    jae .dead
+    mov es, ax
+    mov cl, [es:0]
+    cmp cl, 'M'
+    je .valid_sig
+    cmp cl, 'Z'
+    jne .dead
+.valid_sig:
+    cmp ax, bx
+    je .candidate
+    cmp cl, 'Z'
+    je .dead
+    mov cx, [es:3]
+    inc cx
+    add ax, cx
+    jmp .scan
+.candidate:
+    cmp [es:1], dx
+    jne .dead
+    mov ax, bx
+    inc ax
+    mov cx, ax
+    add cx, [es:3]
+    mov dx, [cs:cb_seg]
+    cmp dx, ax
+    jb .dead
+    cmp dx, cx
+    jb .done
+.dead:
+    mov byte [cs:cb_live_tmp], 0
+.done:
+    pop es
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    cmp byte [cs:cb_live_tmp], 0
+    ret
+
 ; ---- text-mode software cursor (page 0, mode 03h, B800:0) ----
 ; The cursor cell is col = cur_x >> 3, row = cur_y >> 3 (fixed 200-line Microsoft
 ; convention: 8 virtual lines per text row). Byte offset in B800 =
@@ -744,6 +900,21 @@ m_get_version:
 ; Both routines work on the resident state via [cs:...] and reach B800 through ES,
 ; so they are correct regardless of the caller's DS and safe from interrupt
 ; context. Each saves and restores every register it touches.
+
+; Return ZF=1 when the active BIOS video mode is color text mode 03h. The software
+; cursor knows only the B800 80-column text layout; in graphics modes it must not
+; touch the video aperture.
+cursor_text_mode:
+    push ax
+    push es
+    mov ax, 0x40
+    mov es, ax
+    mov al, [es:0x49]
+    and al, 0x7F
+    cmp al, 0x03
+    pop es
+    pop ax
+    ret
 
 ; cursor_hide: if a cell is currently drawn (saved_off != 0xFFFF), write the saved
 ; cell back to B800 and mark none drawn. Safe to call when nothing is drawn.
@@ -754,10 +925,13 @@ cursor_hide:
     mov bx, [cs:saved_off]
     cmp bx, 0xFFFF
     je .done
+    call cursor_text_mode
+    jne .drop_saved
     mov ax, 0xB800
     mov es, ax
     mov ax, [cs:saved_cell]
     mov [es:bx], ax
+.drop_saved:
     mov word [cs:saved_off], 0xFFFF
 .done:
     pop es
@@ -775,6 +949,8 @@ cursor_show:
     push cx
     push dx
     push es
+    call cursor_text_mode
+    jne .done
     cmp word [cs:show_count], 0
     jne .done                         ; hidden
     cmp byte [cs:cond_active], 0
@@ -1047,6 +1223,8 @@ packet_handler:
     jz .no_callback                   ; no event the caller asked for
     cmp byte [in_callback], 0
     jne .no_callback                  ; re-entrant, skip
+    call callback_still_live
+    jz .no_callback                   ; callback owner exited or block was reused
 
     mov byte [in_callback], 1
     ; Register block the Microsoft contract hands the callback:
