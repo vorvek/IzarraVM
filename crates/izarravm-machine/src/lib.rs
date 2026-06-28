@@ -1636,6 +1636,19 @@ impl Machine {
         if machine.dos.has_umb_arena() {
             machine.dos.set_umb_link(true);
         }
+        // A program loaded directly under DOS still expects the BIOS POST to have
+        // programmed PIT counter 0 (mode 2, count 65536 -> the 18.2 Hz tick), the
+        // way probe-pit.inc leaves it on a real boot. Without it counter 0 never
+        // counts, so a guest that polls the timer for a delay or a speed
+        // calibration (TSUMERA's setup does) reads a frozen count and spins
+        // forever. IRQ0 stays PIC-masked here, so this advances the count without
+        // delivering an unhandled tick.
+        {
+            let mut bus = machine.make_bus();
+            let _ = bus.write_io(0x43, BusWidth::Byte, 0x34);
+            let _ = bus.write_io(0x40, BusWidth::Byte, 0x00);
+            let _ = bus.write_io(0x40, BusWidth::Byte, 0x00);
+        }
         Ok(machine)
     }
 
@@ -13202,6 +13215,31 @@ mod tests {
         }
         // The low byte set the index, the high byte wrote the data at 0x3D5.
         assert_eq!(color_crtc_reg(&mut m, 0x0F), 0x42);
+    }
+
+    #[test]
+    fn new_dos_program_leaves_pit_counter0_running() {
+        // A directly-loaded DOS program must see PIT counter 0 ticking, the way the
+        // BIOS POST leaves it; otherwise a guest that polls the timer for a delay or
+        // a speed calibration spins forever (TSUMERA's setup does exactly that).
+        static PROG: &[u8] = &[0xeb, 0xfe]; // JMP $ - we only need a machine to run.
+        let mut m =
+            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), PROG)
+                .unwrap();
+        fn latched_count(m: &mut Machine) -> u16 {
+            let mut bus = m.make_bus();
+            bus.write_io(0x43, BusWidth::Byte, 0x00).unwrap(); // latch counter 0
+            let lo = bus.read_io(0x40, BusWidth::Byte).unwrap() as u16;
+            let hi = bus.read_io(0x40, BusWidth::Byte).unwrap() as u16;
+            lo | (hi << 8)
+        }
+        let before = latched_count(&mut m);
+        m.run_until_halt_or_cycles(100_000).unwrap();
+        let after = latched_count(&mut m);
+        assert_ne!(
+            before, after,
+            "PIT counter 0 must advance after new_dos_program (POST-equivalent timer setup)"
+        );
     }
 
     #[test]
