@@ -960,24 +960,29 @@ mod tokados_smoke {
 
     #[test]
     #[ignore = "boots a full DOS image (slow in debug); run with --ignored"]
-    fn tokados_survives_child_then_prompts() {
+    fn tokados_child_shell_reload_then_prompts() {
         let (mut machine, _stop) = boot(500_000_000);
-        for ch in "dir\r".chars() {
-            for code in ascii_to_set1(ch) {
-                machine.inject_key_scancodes(&[code]);
+        // Spawn the COMMAND.COM alias as a CHILD shell: this EXECs the renamed shell
+        // and forces COMSPEC/transient resolution (the only path the TOKACMD.COM-primary
+        // + COMMAND.COM-alias rename could actually break). Then exit back to the parent
+        // and confirm the parent shell still works.
+        for cmd in ["command\r", "exit\r", "ver\r"] {
+            for ch in cmd.chars() {
+                for code in ascii_to_set1(ch) {
+                    machine.inject_key_scancodes(&[code]);
+                }
+                machine.run_until_halt_or_cycles(5_000_000).expect("type");
             }
-            machine.run_until_halt_or_cycles(5_000_000).expect("type");
-        }
-        for ch in "ver\r".chars() {
-            for code in ascii_to_set1(ch) {
-                machine.inject_key_scancodes(&[code]);
-            }
-            machine.run_until_halt_or_cycles(5_000_000).expect("type");
+            machine
+                .run_until_halt_or_cycles(30_000_000)
+                .expect("settle");
         }
         let text = machine.screen_text().as_text().to_ascii_lowercase();
+        // After the child shell loads, exits, and we type ver, the parent prompt must
+        // echo the command — proving COMSPEC reload of the renamed shell works.
         assert!(
-            text.matches("a:\\>").count() >= 2,
-            "shell did not return to a working prompt after a command.\n{text}"
+            text.contains("a:\\>ver"),
+            "parent shell did not recover after running/exiting the child COMMAND.COM (COMSPEC reload of renamed shell failed).\n{text}"
         );
     }
 }

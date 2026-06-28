@@ -28,6 +28,7 @@ def fat_set(fat, cluster, value):  # FAT12 nibble-pack helper
 
 def name11(fn):
     base, _, ext = fn.partition(".")
+    assert len(base) <= 8 and len(ext) <= 3, f"name not 8.3: {fn}"
     return (base.upper().ljust(8) + ext.upper().ljust(3)).encode("ascii")
 
 def stamp_bpb(img, oem=b"TOKADOS ", label=b"TOKA-DOS   "):
@@ -79,6 +80,8 @@ def main():
     next_free = 2
     for slot, (fn, data) in enumerate(files):
         nclu = max(1, (len(data) + CLUSTER - 1) // CLUSTER)
+        usable = (IMG_SIZE - DATA_START) // CLUSTER
+        assert next_free - 2 + nclu <= usable, f"out of clusters writing {fn}"
         first = next_free
         for i in range(nclu):
             c = first + i
