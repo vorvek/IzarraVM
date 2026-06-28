@@ -161,7 +161,7 @@ impl FromStr for VideoCard {
     }
 }
 
-/// The state of the EMM386-equivalent role of the IEMM memory manager, the way a
+/// The state of the EMM386-equivalent role of the IZEMM memory manager, the way a
 /// period CONFIG.SYS selects it. HIMEM (XMS + the HMA) is a separate, always-on
 /// facility; this governs only upper memory and expanded memory, the part a 386
 /// needs the manager's address remapping for:
@@ -232,7 +232,7 @@ pub const DEFAULT_FILES: u16 = 40;
 pub const DEFAULT_BUFFERS: u16 = 20;
 
 /// The subset of CONFIG.SYS directives the HLE SYSINIT maps into machine state:
-/// the EMM386/IEMM mode its DEVICE= lines select, whether DOS=UMB asks for the
+/// the EMM386/IZEMM mode its DEVICE= lines select, whether DOS=UMB asks for the
 /// UMB area to be linked, EMS sizing knobs, and boot-scalar DOS settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConfigSysMemory {
@@ -244,11 +244,11 @@ pub struct ConfigSysMemory {
     pub files: u16,
     /// CONFIG.SYS BUFFERS= count. Stored for the DOS buffer model.
     pub buffers: u16,
-    /// Optional EMS page-frame segment from an IEMM/EMM386 `FRAME=` token.
+    /// Optional EMS page-frame segment from an IZEMM/EMM386 `FRAME=` token.
     /// The token is written in hexadecimal like real EMM386 CONFIG.SYS lines.
     pub ems_frame_seg: Option<u16>,
     /// Optional expanded-memory backing-pool size in KiB. Real EMM386 accepts a
-    /// bare decimal number on its DEVICE line; IEMM follows that convention.
+    /// bare decimal number on its DEVICE line; IZEMM follows that convention.
     pub ems_pool_kb: Option<u32>,
 }
 
@@ -287,13 +287,13 @@ fn split_device_path_and_args(rest: &str) -> (&str, &str) {
     (&rest[..path_end], rest[path_end..].trim_start())
 }
 
-/// Read the memory-manager intent out of a CONFIG.SYS. The IEMM memory manager
-/// (filed as IEMM.EXE in Toka-DOS, or the real-DOS EMM386.EXE) provides upper
-/// memory only when HIMEM.SYS loads first, matching real DOS, so an IEMM/EMM386
+/// Read the memory-manager intent out of a CONFIG.SYS. The IZEMM memory manager
+/// (filed as IZEMM.EXE in Toka-DOS, or the real-DOS EMM386.EXE) provides upper
+/// memory only when HIMEM.SYS loads first, matching real DOS, so an IZEMM/EMM386
 /// line with no preceding HIMEM line (or no such line at all) yields Unloaded:
 /// - HIMEM.SYS only -> Unloaded (XMS, no UMB/EMS)
-/// - HIMEM.SYS + IEMM.EXE NOEMS -> NoEms (UMBs, no EMS frame)
-/// - HIMEM.SYS + IEMM.EXE RAM (or no arg) -> Ram (UMBs + EMS frame)
+/// - HIMEM.SYS + IZEMM.EXE NOEMS -> NoEms (UMBs, no EMS frame)
+/// - HIMEM.SYS + IZEMM.EXE RAM (or no arg) -> Ram (UMBs + EMS frame)
 ///
 /// EMM386.EXE is accepted as an alias so a pasted real-DOS CONFIG.SYS still works.
 ///
@@ -320,13 +320,15 @@ pub fn parse_config_sys(text: &str) -> ConfigSysMemory {
             let name = dos_basename(path);
             if name == "HIMEM.SYS" {
                 himem = true;
-            } else if (name == "IEMM.EXE"
+            } else if (name == "IZEMM.EXE"
+                || name == "IZEMM"
+                || name == "IEMM.EXE"
                 || name == "IEMM"
                 || name == "EMM386.EXE"
                 || name == "EMM386")
                 && himem
             {
-                // IEMM (the Toka-DOS manager) or its real-DOS alias EMM386 loads
+                // IZEMM (the Toka-DOS manager) or its real-DOS alias EMM386 loads
                 // only with a prior HIMEM. NOEMS omits the EMS frame.
                 let mut line_frame_seg = None;
                 let mut line_pool_kb = None;
@@ -392,7 +394,7 @@ pub fn dos_basename(path: &str) -> &str {
     path.rsplit(['\\', '/']).next().unwrap_or(path)
 }
 
-/// Every DEVICE=/DEVICEHIGH= line in order. Memory-manager lines (HIMEM/IEMM/
+/// Every DEVICE=/DEVICEHIGH= line in order. Memory-manager lines (HIMEM/IZEMM/
 /// EMM386) are included; the caller decides which basenames it handles itself.
 pub fn parse_device_lines(text: &str) -> Vec<ConfigDeviceLine> {
     let mut lines = Vec::new();
@@ -781,7 +783,7 @@ pub struct MachineConfig {
     pub cpu: GswMode,
     pub memory_mib: u16,
     pub video: VideoCard,
-    /// The IEMM EMM386-role state: unloaded (HIMEM only), noems (UMBs only), or
+    /// The IZEMM EMM386-role state: unloaded (HIMEM only), noems (UMBs only), or
     /// ram (UMBs plus the EMS page frame). Defaults to the do-it-right `ram` box.
     pub emm386: Emm386Mode,
 }
@@ -1205,18 +1207,18 @@ mod tests {
             Emm386Mode::Unloaded
         );
 
-        // IEMM.EXE is the Toka-DOS memory manager name; it drives the mode the
+        // IZEMM.EXE is the Toka-DOS memory manager name; it drives the mode the
         // same way EMM386.EXE does. Both the full and the bare name work.
-        let iemm_ram = parse_config_sys("DEVICE=HIMEM.SYS\r\nDEVICE=IEMM.EXE RAM\r\n");
+        let iemm_ram = parse_config_sys("DEVICE=HIMEM.SYS\r\nDEVICE=IZEMM.EXE RAM\r\n");
         assert_eq!(iemm_ram.emm386, Emm386Mode::Ram);
-        let iemm_noems = parse_config_sys("DEVICE=HIMEM.SYS\r\nDEVICE=IEMM.EXE NOEMS\r\n");
+        let iemm_noems = parse_config_sys("DEVICE=HIMEM.SYS\r\nDEVICE=IZEMM.EXE NOEMS\r\n");
         assert_eq!(iemm_noems.emm386, Emm386Mode::NoEms);
-        let iemm_bare = parse_config_sys("DEVICE=HIMEM.SYS\r\nDEVICE=IEMM\r\n");
+        let iemm_bare = parse_config_sys("DEVICE=HIMEM.SYS\r\nDEVICE=IZEMM\r\n");
         assert_eq!(iemm_bare.emm386, Emm386Mode::Ram);
         // The real-DOS EMM386 name stays accepted (a pasted real-DOS config works).
         let emm386_bare = parse_config_sys("DEVICE=HIMEM.SYS\r\nDEVICE=EMM386\r\n");
         assert_eq!(emm386_bare.emm386, Emm386Mode::Ram);
-        // IEMM without a preceding HIMEM cannot load either.
+        // IEMM (legacy alias, still accepted) without a preceding HIMEM cannot load either.
         assert_eq!(
             parse_config_sys("DEVICE=IEMM.EXE RAM\r\n").emm386,
             Emm386Mode::Unloaded
@@ -1224,9 +1226,21 @@ mod tests {
     }
 
     #[test]
+    fn config_sys_recognizes_izemm_and_keeps_legacy_iemm() {
+        // New canonical name selects the EMM mode.
+        let izemm = parse_config_sys("DEVICE=HIMEM.SYS\r\nDEVICE=IZEMM.EXE RAM\r\n");
+        assert_eq!(izemm.emm386, Emm386Mode::Ram);
+        let izemm_bare = parse_config_sys("DEVICE=HIMEM.SYS\r\nDEVICE=IZEMM\r\n");
+        assert_eq!(izemm_bare.emm386, Emm386Mode::Ram);
+        // Legacy IEMM name is still tolerated so an untouched CONFIG.SYS keeps working.
+        let iemm = parse_config_sys("DEVICE=HIMEM.SYS\r\nDEVICE=IEMM.EXE RAM\r\n");
+        assert_eq!(iemm.emm386, Emm386Mode::Ram);
+    }
+
+    #[test]
     fn config_sys_parses_iemm_frame_and_pool_size_knobs() {
         let config = parse_config_sys(
-            "DEVICE=C:\\DOS\\HIMEM.SYS /TESTMEM:OFF\r\nDEVICE=C:\\DOS\\IEMM.EXE RAM FRAME=D000 4096\r\nDOS=HIGH,UMB\r\n",
+            "DEVICE=C:\\DOS\\HIMEM.SYS /TESTMEM:OFF\r\nDEVICE=C:\\DOS\\IZEMM.EXE RAM FRAME=D000 4096\r\nDOS=HIGH,UMB\r\n",
         );
 
         assert_eq!(config.emm386, Emm386Mode::Ram);
@@ -1238,7 +1252,7 @@ mod tests {
     #[test]
     fn config_sys_accepts_quoted_device_paths() {
         let config = parse_config_sys(
-            "DEVICE=\"C:\\DOS\\HIMEM.SYS\" /TESTMEM:OFF\r\nDEVICEHIGH=\"C:\\DOS\\IEMM.EXE\" RAM FRAME=D000 4096\r\n",
+            "DEVICE=\"C:\\DOS\\HIMEM.SYS\" /TESTMEM:OFF\r\nDEVICEHIGH=\"C:\\DOS\\IZEMM.EXE\" RAM FRAME=D000 4096\r\n",
         );
 
         assert_eq!(config.emm386, Emm386Mode::Ram);
