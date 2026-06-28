@@ -751,6 +751,67 @@ struct ModRm {
     rm: u8,
 }
 
+/// A decoded memory addressing-mode *descriptor* (NOT a resolved address). It holds the
+/// segment plus the base/index register numbers, scale, and displacement read from the
+/// instruction bytes, so the effective offset can be recomputed from live registers each
+/// time the decoded instruction is replayed. `resolve_addr_mode` turns this into a live
+/// `RmOperand::Memory`. `address_size` is carried here (rather than passed to
+/// `resolve_addr_mode`) so resolve is a pure function of the descriptor and so it can pick
+/// 16- vs 32-bit register width and the matching offset wraparound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AddrMode {
+    segment: SegmentIndex,
+    base: Option<u8>,
+    index: Option<u8>,
+    scale: u8,
+    disp: i32,
+    address_size: AddressSize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecodedOperand {
+    Reg(u8),
+    Mem(AddrMode),
+}
+
+/// How decode charges the instruction-fetch clocks when an instruction is replayed from a
+/// cache. Unused in Stage A: decode here charges fetch clocks through its real `fetch_u8`
+/// reads (exactly as the fused path did), so `execute_decoded` charges nothing extra. This
+/// type is populated with a placeholder (the real instruction length, zero wait states) and
+/// is only fully exercised in the later cache stage.
+// Stage-A scaffold: the variants/fields are written but not yet read; the cache stage
+// (Stage B) consumes them to replay fetch clocks without re-reading the bus.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+enum FetchCost {
+    Uniform { len: u8, wait_states: u8 },
+    PerByte([u8; 15], u8),
+}
+
+/// A decoded instruction: the prefix/opcode/operand-size results plus, for opcodes already
+/// converted to the decode/execute split, the pre-parsed ModRM and operand descriptor.
+/// Opcodes still on the legacy path leave `modrm`/`operand` as `None` and are re-read by
+/// `execute_instruction_legacy`.
+// Stage-A scaffold: `imm`/`imm2` (and the `len`/`fetch` placeholders) are populated by `decode`
+// but not read until later tasks convert immediate-bearing opcodes and the cache stage lands.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+struct DecodedInsn {
+    /// eip of the first byte of the instruction (before any prefixes), used to rewind so the
+    /// legacy fallback re-reads from the instruction start.
+    start_eip: u32,
+    len: u8,
+    fetch: FetchCost,
+    prefixes: Prefixes,
+    opcode: u16,
+    operand_size: OperandSize,
+    address_size: AddressSize,
+    modrm: Option<ModRm>,
+    operand: Option<DecodedOperand>,
+    imm: u32,
+    imm2: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MemoryOperand {
     segment: SegmentIndex,
@@ -971,7 +1032,9 @@ impl Cpu386 {
         self.begin_instruction();
         let start_eip = self.registers.eip;
         let start_cs = self.registers.cs().selector;
-        let result = self.execute_instruction(bus);
+        let result = self
+            .decode(bus)
+            .and_then(|insn| self.execute_decoded(&insn, bus));
         let outcome = match result {
             Ok(outcome) => outcome,
             Err(InternalFault::Exception { vector, error_code }) => {
@@ -1000,8 +1063,18 @@ impl Cpu386 {
         })
     }
 
-    fn execute_instruction<B: CpuBus>(&mut self, bus: &mut B) -> ExecResult<CycleOutcome> {
-        let instruction_eip = self.registers.eip;
+    /// Stage A of the decode/execute split. Reads the prefixes and opcode (mirroring the top
+    /// of the legacy fused path) and, for the opcodes already converted to the split, parses
+    /// the ModRM + addressing-mode descriptor up front. Opcodes still on the legacy path leave
+    /// `modrm`/`operand` as `None`; `execute_decoded` hands them to the shared fused dispatch,
+    /// which re-reads their ModRM/immediates from the post-opcode eip.
+    ///
+    /// Clock note (rule 2): decode's real `fetch_u8` reads charge the instruction-fetch clocks
+    /// for the prefixes + opcode exactly once. `execute_decoded` charges nothing extra: the
+    /// split opcode runs from the pre-decoded operand, and the legacy fallback continues the
+    /// fused dispatch from where decode left off (it does NOT re-read the prefixes/opcode).
+    fn decode<B: CpuBus>(&mut self, bus: &mut B) -> ExecResult<DecodedInsn> {
+        let start_eip = self.registers.eip;
         let prefixes = self.read_prefixes(bus)?;
         let opcode = self.fetch_u8(bus)?;
         if prefixes.lock {
@@ -1010,6 +1083,139 @@ impl Cpu386 {
         let operand_size = self.operand_size(prefixes);
         let address_size = self.address_size(prefixes);
 
+        let mut insn = DecodedInsn {
+            start_eip,
+            // `len` is a placeholder in Stage A (decode charges fetch clocks via its real
+            // reads, not via `fetch`); it is finalized when the cache stage lands.
+            len: (self.registers.eip.wrapping_sub(start_eip)) as u8,
+            fetch: FetchCost::Uniform {
+                len: (self.registers.eip.wrapping_sub(start_eip)) as u8,
+                wait_states: 0,
+            },
+            prefixes,
+            opcode: u16::from(opcode),
+            operand_size,
+            address_size,
+            modrm: None,
+            operand: None,
+            imm: 0,
+            imm2: 0,
+        };
+
+        // ADD r/m8, reg8 (0x00) and ADD r/m16/32, reg16/32 (0x01) are the first opcodes routed
+        // through the split: parse their ModRM + addressing-mode descriptor now.
+        if matches!(opcode, 0x00 | 0x01) {
+            let modrm = self.fetch_modrm(bus)?;
+            let operand = self.parse_addressing_mode(bus, prefixes, address_size, modrm)?;
+            insn.modrm = Some(modrm);
+            insn.operand = Some(operand);
+            let consumed = self.registers.eip.wrapping_sub(start_eip) as u8;
+            insn.len = consumed;
+            insn.fetch = FetchCost::Uniform {
+                len: consumed,
+                wait_states: 0,
+            };
+        }
+
+        Ok(insn)
+    }
+
+    /// Stage A executor. For the opcodes converted to the split (ADD r/m,reg), execute from the
+    /// pre-decoded `operand`/`modrm` (resolving the addressing-mode descriptor against the live
+    /// registers). Every other opcode continues into the shared fused dispatch (which re-reads
+    /// its ModRM/immediates from the post-opcode eip) so behavior is byte-for-byte unchanged.
+    fn execute_decoded<B: CpuBus>(
+        &mut self,
+        insn: &DecodedInsn,
+        bus: &mut B,
+    ) -> ExecResult<CycleOutcome> {
+        match insn.opcode {
+            0x00 | 0x01 => self.execute_add_rm_reg(insn, bus),
+            opcode => {
+                // Legacy fallback: `decode` already read the prefixes + opcode and ran the LOCK
+                // check, leaving eip just past the opcode. Continue into the shared fused
+                // dispatch from there, so each fused arm re-reads its ModRM/immediates exactly as
+                // before and the prefix/opcode fetch clocks are charged only once (rule 2).
+                self.dispatch_legacy_opcode(
+                    bus,
+                    insn.start_eip,
+                    insn.prefixes,
+                    opcode as u8,
+                    insn.operand_size,
+                    insn.address_size,
+                )
+            }
+        }
+    }
+
+    /// ADD r/m, reg through the decode/execute split (ALU form 0/1, op=0). Mirrors the ADD case
+    /// of `execute_alu_block` but consumes the pre-decoded operand instead of re-parsing it.
+    fn execute_add_rm_reg<B: CpuBus>(
+        &mut self,
+        insn: &DecodedInsn,
+        bus: &mut B,
+    ) -> ExecResult<CycleOutcome> {
+        let modrm = insn.modrm.expect("ADD r/m,reg decoded with a ModRM");
+        let operand = match insn.operand.expect("ADD r/m,reg decoded with an operand") {
+            DecodedOperand::Reg(index) => RmOperand::Register(index),
+            DecodedOperand::Mem(addr) => self.resolve_addr_mode(&addr),
+        };
+        // op = 0 (ADD); write_back is always true (ADD is not CMP).
+        if insn.opcode == 0x00 {
+            let a = u32::from(self.read_operand_u8(bus, operand)?);
+            let b = u32::from(self.read_gpr8(modrm.reg));
+            let result = self.alu(0, a, b, BusWidth::Byte) as u8;
+            self.write_operand_u8(bus, operand, result)?;
+        } else {
+            let operand_size = insn.operand_size;
+            let a = self.read_operand_sized(bus, operand, operand_size)?;
+            let b = self.read_gpr_sized(modrm.reg, operand_size);
+            let result = self.alu(0, a, b, operand_size.bus_width());
+            self.write_operand_sized(bus, operand, operand_size, result)?;
+        }
+        Ok(clocks(2))
+    }
+
+    // Transitional fused entry: reads the prefixes + opcode + LOCK check itself, then dispatches.
+    // The production `cycle` path goes through `decode`/`execute_decoded` (which call
+    // `dispatch_legacy_opcode` directly to keep the fetch clocks charged once), so this whole-
+    // instruction entry now has callers only in the test suite; it is retained as the documented
+    // fused reference and is removed when the seam covers every opcode.
+    #[allow(dead_code)]
+    fn execute_instruction_legacy<B: CpuBus>(&mut self, bus: &mut B) -> ExecResult<CycleOutcome> {
+        let instruction_eip = self.registers.eip;
+        let prefixes = self.read_prefixes(bus)?;
+        let opcode = self.fetch_u8(bus)?;
+        if prefixes.lock {
+            self.check_lock_target(bus, opcode)?;
+        }
+        let operand_size = self.operand_size(prefixes);
+        let address_size = self.address_size(prefixes);
+        self.dispatch_legacy_opcode(
+            bus,
+            instruction_eip,
+            prefixes,
+            opcode,
+            operand_size,
+            address_size,
+        )
+    }
+
+    /// The fused opcode dispatch, shared by the legacy direct path and the decode/execute seam.
+    /// The caller is responsible for having already read the prefixes + opcode and run any LOCK
+    /// check; `eip` must point at the byte immediately after the opcode so each arm re-reads its
+    /// ModRM/immediate from there. The seam calls this with the values `decode` already read, so
+    /// the prefix/opcode instruction-fetch clocks are charged exactly once.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_legacy_opcode<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        instruction_eip: u32,
+        prefixes: Prefixes,
+        opcode: u8,
+        operand_size: OperandSize,
+        address_size: AddressSize,
+    ) -> ExecResult<CycleOutcome> {
         match opcode {
             opcode if opcode < 0x40 && (opcode & 0x07) < 6 => {
                 self.execute_alu_block(bus, opcode, prefixes, address_size, operand_size)
@@ -3194,84 +3400,136 @@ impl Cpu386 {
         address_size: AddressSize,
         modrm: ModRm,
     ) -> ExecResult<RmOperand> {
-        if modrm.mode == 3 {
-            return Ok(RmOperand::Register(modrm.rm));
+        // Parse the addressing-mode descriptor (reads instruction bytes, no GP registers),
+        // then resolve it against live registers. The two-step form keeps a single source of
+        // truth for both the legacy callers and the decode/execute split.
+        match self.parse_addressing_mode(bus, prefixes, address_size, modrm)? {
+            DecodedOperand::Reg(index) => Ok(RmOperand::Register(index)),
+            DecodedOperand::Mem(addr) => Ok(self.resolve_addr_mode(&addr)),
         }
-
-        let (default_segment, offset) = match address_size {
-            AddressSize::Word => self.decode_16bit_address(bus, modrm)?,
-            AddressSize::Dword => self.decode_32bit_address(bus, modrm)?,
-        };
-
-        Ok(RmOperand::Memory(MemoryOperand {
-            segment: prefixes.segment_override.unwrap_or(default_segment),
-            offset,
-        }))
     }
 
-    fn decode_16bit_address<B: CpuBus>(
+    /// Parse a ModRM addressing mode into a descriptor. Reads only instruction bytes
+    /// (displacement, SIB) and never a general register, so the result can be replayed after
+    /// the registers change. The effective offset is computed later by `resolve_addr_mode`.
+    fn parse_addressing_mode<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        prefixes: Prefixes,
+        address_size: AddressSize,
+        modrm: ModRm,
+    ) -> ExecResult<DecodedOperand> {
+        if modrm.mode == 3 {
+            return Ok(DecodedOperand::Reg(modrm.rm));
+        }
+
+        let mut addr = match address_size {
+            AddressSize::Word => self.parse_16bit_address(bus, modrm)?,
+            AddressSize::Dword => self.parse_32bit_address(bus, modrm)?,
+        };
+        if let Some(segment) = prefixes.segment_override {
+            addr.segment = segment;
+        }
+        Ok(DecodedOperand::Mem(addr))
+    }
+
+    /// Resolve an addressing-mode descriptor into a live memory operand by reading the base
+    /// and index registers now. Reads only general registers (no instruction bytes), so it is
+    /// safe to call repeatedly on a cached descriptor.
+    fn resolve_addr_mode(&self, addr: &AddrMode) -> RmOperand {
+        let offset = match addr.address_size {
+            AddressSize::Word => {
+                let base = addr
+                    .base
+                    .map_or(0u32, |reg| u32::from(self.read_gpr16(reg)));
+                let index = addr
+                    .index
+                    .map_or(0u32, |reg| u32::from(self.read_gpr16(reg)));
+                let sum = base
+                    .wrapping_add(index.wrapping_mul(u32::from(addr.scale)))
+                    .wrapping_add(addr.disp as u32);
+                (sum as u16) as u32
+            }
+            AddressSize::Dword => {
+                let base = addr.base.map_or(0u32, |reg| self.read_gpr32(reg));
+                let index = addr.index.map_or(0u32, |reg| self.read_gpr32(reg));
+                base.wrapping_add(index.wrapping_mul(u32::from(addr.scale)))
+                    .wrapping_add(addr.disp as u32)
+            }
+        };
+        RmOperand::Memory(MemoryOperand {
+            segment: addr.segment,
+            offset,
+        })
+    }
+
+    fn parse_16bit_address<B: CpuBus>(
         &mut self,
         bus: &mut B,
         modrm: ModRm,
-    ) -> ExecResult<(SegmentIndex, u32)> {
-        let bx = u32::from(self.read_gpr16(3));
-        let bp = u32::from(self.read_gpr16(5));
-        let si = u32::from(self.read_gpr16(6));
-        let di = u32::from(self.read_gpr16(7));
+    ) -> ExecResult<AddrMode> {
+        // 16-bit addressing combines a fixed pair of registers; encode each pair as the
+        // descriptor's (base, index) with scale 1. bx=3, bp=5, si=6, di=7.
         let mut uses_bp = false;
-
-        let base = match modrm.rm {
-            0 => bx.wrapping_add(si),
-            1 => bx.wrapping_add(di),
+        let (base, index) = match modrm.rm {
+            0 => (Some(3), Some(6)), // bx+si
+            1 => (Some(3), Some(7)), // bx+di
             2 => {
                 uses_bp = true;
-                bp.wrapping_add(si)
+                (Some(5), Some(6)) // bp+si
             }
             3 => {
                 uses_bp = true;
-                bp.wrapping_add(di)
+                (Some(5), Some(7)) // bp+di
             }
-            4 => si,
-            5 => di,
-            6 if modrm.mode == 0 => u32::from(self.fetch_u16(bus)?),
+            4 => (None, Some(6)),                 // si
+            5 => (None, Some(7)),                 // di
+            6 if modrm.mode == 0 => (None, None), // disp16 only
             6 => {
                 uses_bp = true;
-                bp
+                (Some(5), None) // bp
             }
-            _ => bx,
+            _ => (Some(3), None), // bx
         };
 
-        let displacement = match modrm.mode {
+        let disp = match modrm.mode {
+            0 if modrm.rm == 6 => i32::from(self.fetch_u16(bus)? as i16),
             0 => 0,
             1 => self.fetch_i8(bus)? as i32,
             2 => i32::from(self.fetch_u16(bus)? as i16),
             _ => 0,
         };
 
-        let offset = ((base as i32).wrapping_add(displacement) as u16) as u32;
         let segment = if uses_bp {
             SegmentIndex::Ss
         } else {
             SegmentIndex::Ds
         };
-        Ok((segment, offset))
+        Ok(AddrMode {
+            segment,
+            base,
+            index,
+            scale: 1,
+            disp,
+            address_size: AddressSize::Word,
+        })
     }
 
-    fn decode_32bit_address<B: CpuBus>(
+    fn parse_32bit_address<B: CpuBus>(
         &mut self,
         bus: &mut B,
         modrm: ModRm,
-    ) -> ExecResult<(SegmentIndex, u32)> {
+    ) -> ExecResult<AddrMode> {
         let mut base_reg = None;
-        let mut index = 0u32;
-        let mut scale = 1u32;
+        let mut index_reg = None;
+        let mut scale = 1u8;
 
         if modrm.rm == 4 {
             let sib = self.fetch_u8(bus)?;
             scale = 1 << (sib >> 6);
-            let index_reg = (sib >> 3) & 0x07;
-            if index_reg != 4 {
-                index = self.read_gpr32(index_reg);
+            let idx = (sib >> 3) & 0x07;
+            if idx != 4 {
+                index_reg = Some(idx);
             }
             let base = sib & 0x07;
             if !(modrm.mode == 0 && base == 5) {
@@ -3281,23 +3539,26 @@ impl Cpu386 {
             base_reg = Some(modrm.rm);
         }
 
-        let base = base_reg.map_or(0, |reg| self.read_gpr32(reg));
-        let displacement = match modrm.mode {
+        let disp = match modrm.mode {
             0 if base_reg.is_none() => self.fetch_u32(bus)? as i32,
             0 => 0,
             1 => self.fetch_i8(bus)? as i32,
             2 => self.fetch_u32(bus)? as i32,
             _ => 0,
         };
-        let offset = base
-            .wrapping_add(index.wrapping_mul(scale))
-            .wrapping_add(displacement as u32);
         let segment = if matches!(base_reg, Some(4 | 5)) {
             SegmentIndex::Ss
         } else {
             SegmentIndex::Ds
         };
-        Ok((segment, offset))
+        Ok(AddrMode {
+            segment,
+            base: base_reg,
+            index: index_reg,
+            scale,
+            disp,
+            address_size: AddressSize::Dword,
+        })
     }
 
     fn read_rm_u8<B: CpuBus>(
@@ -11549,7 +11810,7 @@ mod tests {
         cpu.registers.eip = 0;
         let mut bus = TestBus::with_memory(vec![0x0f, 0x08, 0, 0]);
 
-        let result = cpu.execute_instruction(&mut bus);
+        let result = cpu.execute_instruction_legacy(&mut bus);
 
         assert!(
             matches!(
@@ -11581,7 +11842,7 @@ mod tests {
         cpu.registers.eip = 0;
         let mut bus = TestBus::with_memory(vec![0x0f, 0x09, 0, 0]);
 
-        let result = cpu.execute_instruction(&mut bus);
+        let result = cpu.execute_instruction_legacy(&mut bus);
 
         assert!(
             matches!(
@@ -11643,7 +11904,7 @@ mod tests {
         cpu.registers.eip = 0;
         let mut bus = TestBus::with_memory(vec![0x0f, 0x01, 0x3e, 0x40, 0x00, 0, 0, 0]);
 
-        let result = cpu.execute_instruction(&mut bus);
+        let result = cpu.execute_instruction_legacy(&mut bus);
 
         assert!(
             matches!(
@@ -11665,7 +11926,7 @@ mod tests {
         cpu.registers.eip = 0;
         let mut bus = TestBus::with_memory(vec![0x0f, 0x01, 0xff, 0, 0]);
 
-        let result = cpu.execute_instruction(&mut bus);
+        let result = cpu.execute_instruction_legacy(&mut bus);
 
         assert!(
             matches!(
@@ -11957,7 +12218,7 @@ mod tests {
         cpu.registers.eip = 0;
         let mut bus = TestBus::with_memory(memory);
 
-        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
         assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
     }
 
@@ -11971,7 +12232,7 @@ mod tests {
         cpu.registers.eip = 0;
         let mut bus = TestBus::with_memory(memory);
 
-        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
         assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
     }
 
@@ -12016,7 +12277,7 @@ mod tests {
         cpu.control.cr0 |= CR0_AM;
         cpu.set_flag(FLAG_AC, true);
 
-        let result = cpu.execute_instruction(&mut bus);
+        let result = cpu.execute_instruction_legacy(&mut bus);
 
         assert!(
             matches!(
@@ -12038,7 +12299,7 @@ mod tests {
         cpu.control.cr0 |= 0x0000_0010; // bit 4 (ET), not AM
         cpu.set_flag(FLAG_AC, true);
 
-        assert!(cpu.execute_instruction(&mut bus).is_ok());
+        assert!(cpu.execute_instruction_legacy(&mut bus).is_ok());
     }
 
     #[test]
@@ -12047,7 +12308,7 @@ mod tests {
         let (mut cpu, mut bus) = cpl3_word_read_at(0x0041);
         cpu.control.cr0 |= CR0_AM;
 
-        assert!(cpu.execute_instruction(&mut bus).is_ok());
+        assert!(cpu.execute_instruction_legacy(&mut bus).is_ok());
     }
 
     #[test]
@@ -12064,7 +12325,7 @@ mod tests {
         ds.selector = 0x0000;
         cpu.registers.set_segment(SegmentIndex::Ds, ds);
 
-        assert!(cpu.execute_instruction(&mut bus).is_ok());
+        assert!(cpu.execute_instruction_legacy(&mut bus).is_ok());
     }
 
     #[test]
@@ -12074,7 +12335,7 @@ mod tests {
         cpu.control.cr0 |= CR0_AM;
         cpu.set_flag(FLAG_AC, true);
 
-        assert!(cpu.execute_instruction(&mut bus).is_ok());
+        assert!(cpu.execute_instruction_legacy(&mut bus).is_ok());
     }
 
     #[test]
@@ -12203,7 +12464,7 @@ mod tests {
         cpu.registers.set_eax(0);
         let mut bus = TestBus::with_memory(vec![0x0f, 0xa2, 0, 0]);
 
-        assert!(cpu.execute_instruction(&mut bus).is_ok());
+        assert!(cpu.execute_instruction_legacy(&mut bus).is_ok());
         assert_eq!(cpu.registers.eax(), 1);
         assert_eq!(cpu.registers.ebx().to_le_bytes(), *b"Genu");
     }
@@ -12307,7 +12568,7 @@ mod tests {
         cpu.registers.set_edx(0);
         cpu.registers.set_eax(0x2); // bit 1 is reserved
         let mut bus = TestBus::with_memory(memory);
-        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
         assert!(matches!(
             fault,
             InternalFault::Exception {
@@ -12325,7 +12586,7 @@ mod tests {
         cpu.registers.set_edx(0x0001_0000); // bit 48 set
         cpu.registers.set_eax(0);
         let mut bus = TestBus::with_memory(memory);
-        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
         assert!(matches!(
             fault,
             InternalFault::Exception {
@@ -12363,7 +12624,7 @@ mod tests {
         cpu.registers.set_edx(0);
         cpu.registers.set_eax(1_000_000);
         let mut bus = TestBus::with_memory(memory);
-        cpu.execute_instruction(&mut bus).unwrap();
+        cpu.execute_instruction_legacy(&mut bus).unwrap();
         assert_eq!(cpu.time_stamp_counter(), 1_000_000);
     }
 
@@ -12371,7 +12632,7 @@ mod tests {
     fn wrmsr_is_general_protection_at_cpl3() {
         let (mut cpu, mut bus) = cpl3_code(&[0x0f, 0x30]);
         cpu.registers.set_ecx(MSR_WHCR);
-        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
         assert!(matches!(
             fault,
             InternalFault::Exception {
@@ -12386,7 +12647,7 @@ mod tests {
         let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x32], 0x20);
         cpu.registers.set_ecx(0x1234_5678);
         let mut bus = TestBus::with_memory(memory);
-        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
         assert!(matches!(
             fault,
             InternalFault::Exception {
@@ -12400,7 +12661,7 @@ mod tests {
     fn rdtsc_is_general_protection_when_tsd_set_at_cpl3() {
         let (mut cpu, mut bus) = cpl3_code(&[0x0f, 0x31]);
         cpu.control.cr4 |= CR4_TSD;
-        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
         assert!(matches!(
             fault,
             InternalFault::Exception {
@@ -12414,7 +12675,7 @@ mod tests {
     fn rdtsc_runs_at_cpl3_when_tsd_clear() {
         let (mut cpu, mut bus) = cpl3_code(&[0x0f, 0x31]);
         cpu.elapsed_clocks = 42;
-        assert!(cpu.execute_instruction(&mut bus).is_ok());
+        assert!(cpu.execute_instruction_legacy(&mut bus).is_ok());
         assert_eq!(cpu.registers.eax(), 42);
     }
 
@@ -12604,7 +12865,7 @@ mod tests {
         // 0F C7 C9: mod=3 register form is #UD.
         let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0xc7, 0xc9], 0x20);
         let mut bus = TestBus::with_memory(memory);
-        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
         assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
     }
 
@@ -12613,7 +12874,7 @@ mod tests {
         // 0F C7 06 40 00: reg=/0, not CMPXCHG8B -> #UD.
         let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0xc7, 0x06, 0x40, 0x00], 0x80);
         let mut bus = TestBus::with_memory(memory);
-        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
         assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
     }
 
@@ -12636,7 +12897,7 @@ mod tests {
         // F0 0F C7 C9: LOCK on the register form -> #UD.
         let (mut cpu, memory) = real_mode_cpu(&[0xf0, 0x0f, 0xc7, 0xc9], 0x20);
         let mut bus = TestBus::with_memory(memory);
-        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
         assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
     }
 
@@ -12683,7 +12944,7 @@ mod tests {
         let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x05], 0x20);
         cpu.msr.efer = 0;
         let mut bus = TestBus::with_memory(memory);
-        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
         assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
     }
 
@@ -12707,7 +12968,7 @@ mod tests {
     fn sysret_is_general_protection_at_cpl3() {
         let (mut cpu, mut bus) = cpl3_code(&[0x0f, 0x07]);
         cpu.msr.efer = EFER_SCE;
-        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
         assert!(matches!(
             fault,
             InternalFault::Exception {
@@ -12722,7 +12983,7 @@ mod tests {
         let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x07], 0x20);
         cpu.msr.efer = 0;
         let mut bus = TestBus::with_memory(memory);
-        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
         assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
     }
 
@@ -12731,7 +12992,7 @@ mod tests {
         // No SMM is modeled, so RSM always faults #UD.
         let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0xaa], 0x20);
         let mut bus = TestBus::with_memory(memory);
-        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
         assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
     }
 
@@ -12746,7 +13007,7 @@ mod tests {
         cpu.load_segment_real(SegmentIndex::Cs, 0);
         cpu.registers.eip = 0;
         let mut bus = TestBus::with_memory(memory);
-        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
         assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
     }
 
@@ -12760,7 +13021,7 @@ mod tests {
         cpu.load_segment_real(SegmentIndex::Ds, 0);
         cpu.registers.eip = 0;
         let mut bus = TestBus::with_memory(memory);
-        cpu.execute_instruction(&mut bus)
+        cpu.execute_instruction_legacy(&mut bus)
     }
 
     #[test]
@@ -12803,7 +13064,7 @@ mod tests {
         cpu.registers.eip = 0;
         let mut bus = TestBus::with_memory(memory);
         assert!(
-            cpu.execute_instruction(&mut bus).is_ok(),
+            cpu.execute_instruction_legacy(&mut bus).is_ok(),
             "MOVZX fetched from BIOS ROM must run even at I286"
         );
     }
@@ -12859,7 +13120,7 @@ mod tests {
         cpu.load_segment_real(SegmentIndex::Ds, 0);
         cpu.registers.eip = 0;
         let mut bus = TestBus::with_memory(memory);
-        assert!(cpu.execute_instruction(&mut bus).is_ok());
+        assert!(cpu.execute_instruction_legacy(&mut bus).is_ok());
         assert_eq!(cpu.gdtr.limit, 0x00ff);
         assert_eq!(cpu.gdtr.base, 0x0000_1000);
     }
@@ -12956,6 +13217,138 @@ mod tests {
         cpu.load_segment_real(SegmentIndex::Ss, 0);
         cpu.registers.eip = 0;
         (cpu, memory)
+    }
+
+    #[test]
+    fn seam_matches_fused_path_across_addressing_forms() {
+        // Run a battery of instructions through cycle() (decode/execute split) and through
+        // execute_instruction_legacy (fused) from identical start state and assert identical end
+        // state. Guards that the seam stays behaviorally bit-identical to the fused path for both
+        // the converted opcode (ADD r/m,reg) and the legacy fallback, across addressing forms.
+        let cases: &[(&str, &[u8])] = &[
+            ("add ax,bx", &[0x01, 0xd8]),
+            ("add [bx+si],ax", &[0x01, 0x00]),
+            ("add [bp+di+4],cx", &[0x01, 0x4b, 0x04]),
+            ("add [0x20],dx", &[0x01, 0x16, 0x20, 0x00]),
+            ("add [si],al(byte)", &[0x00, 0x04]),
+            ("mov ax,[0x20]", &[0xa1, 0x20, 0x00]),
+            ("mov [bx],cx", &[0x89, 0x0f]),
+            ("sub [bp+2],ax", &[0x29, 0x46, 0x02]),
+            ("inc word [bx]", &[0xff, 0x07]),
+            ("lea ax,[bx+si+3]", &[0x8d, 0x40, 0x03]),
+            ("xor [di],bx", &[0x31, 0x1d]),
+            ("cmp [bx+4],dx", &[0x39, 0x57, 0x04]),
+        ];
+        for (name, code) in cases {
+            let mut mem = vec![0u8; 0x200];
+            mem[..code.len()].copy_from_slice(code);
+            mem[0x20..0x22].copy_from_slice(&0x1111u16.to_le_bytes());
+            let seed = |cpu: &mut Cpu386| {
+                cpu.load_segment_real(SegmentIndex::Cs, 0);
+                cpu.load_segment_real(SegmentIndex::Ds, 0);
+                cpu.load_segment_real(SegmentIndex::Ss, 0);
+                cpu.registers.eip = 0;
+                cpu.write_reg16(Reg16::Ax, 0x0102);
+                cpu.write_reg16(Reg16::Bx, 0x0010);
+                cpu.write_reg16(Reg16::Cx, 0x0304);
+                cpu.write_reg16(Reg16::Dx, 0x0506);
+                cpu.write_reg16(Reg16::Si, 0x0008);
+                cpu.write_reg16(Reg16::Di, 0x0018);
+                cpu.write_reg16(Reg16::Bp, 0x0010);
+            };
+
+            let mut fused = Cpu386::default();
+            seed(&mut fused);
+            let mut fbus = TestBus::with_memory(mem.clone());
+            fused.begin_instruction();
+            let _ = fused.execute_instruction_legacy(&mut fbus);
+
+            let mut split = Cpu386::default();
+            seed(&mut split);
+            let mut sbus = TestBus::with_memory(mem.clone());
+            let _ = split.cycle(&mut sbus);
+
+            assert_eq!(
+                split.registers.gpr, fused.registers.gpr,
+                "gpr mismatch for {name}"
+            );
+            assert_eq!(
+                split.registers.eflags, fused.registers.eflags,
+                "eflags mismatch for {name}"
+            );
+            assert_eq!(
+                split.registers.eip, fused.registers.eip,
+                "eip mismatch for {name}"
+            );
+            assert_eq!(sbus.memory, fbus.memory, "memory mismatch for {name}");
+        }
+    }
+
+    #[test]
+    fn decode_then_execute_matches_fused_for_add_rm_reg() {
+        // 01 D8 = ADD AX, BX (ALU form 1, op=0, modrm mode=3 rm=0 reg=3).
+        // The decode + execute_decoded path must produce the same result as the legacy
+        // fused path for the same starting register state.
+        let code = [0x01, 0xd8];
+
+        // Reference: the fused/legacy path.
+        let (mut fused, mem) = real_mode_cpu(&code, 0x10);
+        fused.write_reg16(Reg16::Ax, 0x1234);
+        fused.write_reg16(Reg16::Bx, 0x1111);
+        let mut fused_bus = TestBus::with_memory(mem.clone());
+        fused.begin_instruction();
+        let fused_outcome = fused.execute_instruction_legacy(&mut fused_bus).unwrap();
+
+        // Under test: the decode/execute split.
+        let (mut split, _mem) = real_mode_cpu(&code, 0x10);
+        split.write_reg16(Reg16::Ax, 0x1234);
+        split.write_reg16(Reg16::Bx, 0x1111);
+        let mut split_bus = TestBus::with_memory(mem);
+        split.begin_instruction();
+        let insn = split.decode(&mut split_bus).unwrap();
+        assert_eq!(insn.opcode, 0x01);
+        assert_eq!(insn.operand, Some(DecodedOperand::Reg(0))); // r/m = AX
+        let split_outcome = split.execute_decoded(&insn, &mut split_bus).unwrap();
+
+        assert_eq!(split.read_reg16(Reg16::Ax), 0x2345);
+        assert_eq!(split.read_reg16(Reg16::Ax), fused.read_reg16(Reg16::Ax));
+        assert_eq!(split.registers.eflags, fused.registers.eflags);
+        assert_eq!(split.registers.eip, fused.registers.eip);
+        assert_eq!(split_outcome.core_clocks, fused_outcome.core_clocks);
+    }
+
+    #[test]
+    fn decoded_add_rm_reg_recomputes_ea_from_live_registers() {
+        // 01 07 = ADD [BX], AX (modrm mode=0 rm=7 -> [BX]). Decode once, then change BX before
+        // executing: the addressing-mode descriptor must resolve against the *new* BX, proving
+        // the decoded form stores a descriptor and not a baked-in offset.
+        let code = [0x01, 0x07];
+        let (mut cpu, mut mem) = real_mode_cpu(&code, 0x40);
+        // Seed both candidate target words.
+        mem[0x20..0x22].copy_from_slice(&0x0001u16.to_le_bytes());
+        mem[0x30..0x32].copy_from_slice(&0x0001u16.to_le_bytes());
+        let mut bus = TestBus::with_memory(mem);
+        cpu.write_reg16(Reg16::Ax, 0x0010);
+        cpu.write_reg16(Reg16::Bx, 0x0020);
+
+        cpu.begin_instruction();
+        let insn = cpu.decode(&mut bus).unwrap();
+        // The descriptor must name BX (register 3) as its base, not a resolved offset.
+        match insn.operand {
+            Some(DecodedOperand::Mem(addr)) => {
+                assert_eq!(addr.base, Some(3));
+                assert_eq!(addr.index, None);
+                assert_eq!(addr.disp, 0);
+            }
+            other => panic!("expected a memory operand, got {other:?}"),
+        }
+
+        // Move the pointer before executing.
+        cpu.write_reg16(Reg16::Bx, 0x0030);
+        cpu.execute_decoded(&insn, &mut bus).unwrap();
+
+        assert_eq!(bus.memory[0x20], 0x01, "old target must be untouched");
+        assert_eq!(bus.memory[0x30], 0x11, "new target (BX=0x30) gets AX added");
     }
 
     #[test]
@@ -13510,7 +13903,7 @@ mod tests {
     fn sldt_is_invalid_in_real_mode() {
         let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x00, 0xc0], 0x20);
         let mut bus = TestBus::with_memory(memory);
-        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
         assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
     }
 
@@ -13590,7 +13983,7 @@ mod tests {
             cpu.cycle(&mut bus).unwrap(); // FLDZ, FLD1, FDIV
         }
         assert_ne!(cpu.fpu.status & 0x04, 0, "ZE flag set");
-        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
         assert!(matches!(fault, InternalFault::Exception { vector: 16, .. }));
     }
 
@@ -13814,7 +14207,7 @@ mod tests {
         memory[0x102..0x104].copy_from_slice(&20u16.to_le_bytes());
         cpu.write_reg16(Reg16::Ax, 25);
         let mut bus = TestBus::with_memory(memory);
-        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
         assert!(matches!(fault, InternalFault::Exception { vector: 5, .. }));
     }
 
@@ -13881,7 +14274,7 @@ mod tests {
         cpu.control.cr0 |= CR0_PE;
         cpu.registers.eflags = 0x2 | FLAG_VM; // IOPL 0
         let mut bus = TestBus::with_memory(memory);
-        let fault = cpu.execute_instruction(&mut bus).unwrap_err();
+        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
         assert!(matches!(fault, InternalFault::Exception { vector: 13, .. }));
     }
 
