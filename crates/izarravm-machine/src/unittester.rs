@@ -22,6 +22,7 @@
 //! Register file (little-endian):
 //!   [0..2] X   [2..4] Y   [4..6] W   [6..8] H   (rectangle, set before CRC)
 //!   [8..12] CRC result    [12] exit code (set before Exit)
+//!   [16] benchmark selector  [17..21] iterations  [21..25] aux  [25] status
 
 /// I/O ports. 0xE0-0xE3 are the other Lotura registers; this device owns the
 /// next three.
@@ -39,7 +40,7 @@ pub const REG_EXIT: usize = 12;
 
 /// Neurketa benchmark region, above the video-test registers. The host preloads
 /// REG_SELECTOR before boot; the guest reads it to pick a payload, then writes
-/// its result primitives back into the result registers before CMD_EXIT.
+/// its iteration count, aux value, and status before CMD_EXIT.
 pub const REG_SELECTOR: usize = 16;
 pub const REG_RESULT_ITER: usize = 17;
 pub const REG_RESULT_AUX: usize = 21;
