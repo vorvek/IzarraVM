@@ -30421,13 +30421,13 @@ mod tests {
             machine.run_until_halt_or_cycles(4_000_000).unwrap();
         };
 
-        // BASIC is the install-time alias for IBASIC, so running it proves both
+        // BASIC is the install-time alias for IZBASIC, so running it proves both
         // the alias file and the EXEC path for a P3 tool.
         type_line(&mut machine, "BASIC");
         let text = machine.screen_text().as_text();
         assert!(
             text.contains("Izarra BASIC"),
-            "the BASIC alias ran IBASIC; got:\n{text}"
+            "the BASIC alias ran IZBASIC; got:\n{text}"
         );
     }
 

@@ -221,17 +221,19 @@ fn remove_root_system_file_copies(
 /// drive on every (re)install so an upgrade-in-place from a pre-rename install
 /// does not leave the stale binaries beside the new `IZ*` ones. `MOUSE.COM` is
 /// deliberately absent: it stays a kept alias.
-const LEGACY_RENAMED_FILES: &[&str] =
-    &["ICOMMAND.COM", "IEMM.COM", "IEMM.EXE", "ICDEX.COM", "IBASIC.COM"];
+const LEGACY_RENAMED_FILES: &[&str] = &[
+    "ICOMMAND.COM",
+    "IEMM.COM",
+    "IEMM.EXE",
+    "ICDEX.COM",
+    "IBASIC.COM",
+];
 
 /// Delete the stale `I`-prefixed binaries that the IZ rebrand renamed, from both
 /// the C: root and `C:\DOS`. A legacy name still present in `files` is left
 /// alone: that means the current ROM still ships it as the live binary (true
 /// only before the ROM is rebuilt), so it is not actually stale.
-fn remove_legacy_renamed_files(
-    c_root: &Path,
-    files: &[(String, Vec<u8>)],
-) -> std::io::Result<()> {
+fn remove_legacy_renamed_files(c_root: &Path, files: &[(String, Vec<u8>)]) -> std::io::Result<()> {
     let dos_dir = c_root.join("DOS");
     for name in LEGACY_RENAMED_FILES {
         if files.iter().any(|(f, _)| f.eq_ignore_ascii_case(name)) {
