@@ -16,7 +16,7 @@ ROOT_SECTS  = (ROOTENT * 32 + BPS - 1) // BPS
 DATA_START  = ROOT_START + ROOT_SECTS * BPS
 CLUSTER     = SPC * BPS
 
-def fat_set(fat, cluster, value):  # verbatim from prep-freedos-spike.py
+def fat_set(fat, cluster, value):  # FAT12 nibble-pack helper
     o = (cluster * 3) // 2
     v = fat[o] | (fat[o + 1] << 8)
     if cluster & 1:
