@@ -870,8 +870,9 @@ a multitasking environment, terminate this process/task manually.\r
 
 # Displayed during the initialization phase of FreeCOM, if its own
 # filename could not be determined.
+# Modified by the Toka-DOS project, 2026: rebranded product name in user-facing message.
 :TEXT_MSG_FREECOM_NOT_FOUND#1
-FreeCOM executable not found.
+Toka-DOS shell not found.
 You must specify the complete path to COMMAND.COM
 as the first argument of COMMAND, for instance:
 C:\\FDOS

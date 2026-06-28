@@ -44,8 +44,9 @@
 #define KERNEL_VERSION "- GIT "
 #endif
 
+/* Modified by the Toka-DOS project, 2026: changed display banner from "FreeDOS kernel" to "Toka-DOS 3.0 kernel". */
 /* actual version string */
-#define KVS(v,s,o) "FreeDOS kernel " v "(build 20" #s " OEM:" #o ") [compiled " __DATE__ "]\n"
+#define KVS(v,s,o) "Toka-DOS 3.0 kernel " v "(build 20" #s " OEM:" #o ") [compiled " __DATE__ "]\n"
 #define xKVS(v,s,o) KVS(v,s,o)
 #define KERNEL_VERSION_STRING xKVS(KERNEL_VERSION, REVISION_SEQ, OEM_ID)
 

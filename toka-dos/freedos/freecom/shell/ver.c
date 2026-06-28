@@ -1,5 +1,6 @@
 /* $Id$
  * VER.C
+ * Modified by the Toka-DOS project, 2026: changed shellname from "FreeCom" to "Toka-DOS" and shellver leading version from "0.86 - " to "3.0 - ".
  *
  *  06/30/98 (Rob Lake)
  *      rewrote ver command to accept switches, now ver alone prints
@@ -41,7 +42,7 @@
 #include "../err_fcts.h"
 #include "../strings.h"
 
-const char shellver[] = "0.86 - "
+const char shellver[] = "3.0 - "
 #if defined(__BORLANDC__)
 	"BORLANDC"
 #elif defined(__TURBOC__)
@@ -56,7 +57,7 @@ const char shellver[] = "0.86 - "
 #endif
 ;
 static const char shelldate[] = __DATE__ " " __TIME__;
-const char shellname[] = "FreeCom";
+const char shellname[] = "Toka-DOS";
 
 #if 0
 void short_version(void)

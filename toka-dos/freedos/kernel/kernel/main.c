@@ -26,6 +26,7 @@
 /* write to the Free Software Foundation, Inc.,                 */
 /* 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA.     */
 /****************************************************************/
+/* Modified by the Toka-DOS project, 2026: added toka_banner and print it in signon() before existing copyright output. */
 
 #include "portab.h"
 #include "init-mod.h"
@@ -43,6 +44,10 @@ static char copyright[] =
     "WARRANTY; you can redistribute it and/or modify it under the terms of the\n"
     "GNU General Public License as published by the Free Software Foundation;\n"
     "either version 2, or (at your option) any later version.\n";
+
+static char toka_banner[] =
+    "Toka-DOS 3.0  (C) 1997 JTM Soluciones - tongue firmly in cheek.\n"
+    "(C) 2026 Toka-DOS project. Built on FreeDOS - see NOTICE / GUI About for licensing.\n";
 
 struct _KernelConfig InitKernelConfig BSS_INIT({0});
 
@@ -413,6 +418,7 @@ STATIC VOID FsConfig(VOID)
 
 STATIC VOID signon()
 {
+  printf("%s", toka_banner);
   printf("\r%S"
          "Kernel compatibility %d.%d - "
 #if defined(__BORLANDC__)

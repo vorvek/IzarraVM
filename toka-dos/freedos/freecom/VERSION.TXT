@@ -1,1 +1,1 @@
-FreeCom version 0.86 - WATCOMC [Dec 21 2024]
+Toka-DOS version 3.0 (built from FreeCom 0.86)
