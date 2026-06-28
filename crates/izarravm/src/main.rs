@@ -10,7 +10,9 @@ use izarravm_core::{
     VideoCard,
 };
 use izarravm_dos::{DosKernelServices, HostDrive};
-use izarravm_firmware::{SuiteRecordStatus, boot_test_image, parse_result_block, test_rom};
+use izarravm_firmware::{
+    SuiteRecordStatus, boot_test_image, neurketa_image, parse_result_block, test_rom,
+};
 use izarravm_input::InputState;
 use izarravm_machine::{Machine, MachineProfile, StopReason};
 use std::error::Error;
@@ -59,6 +61,8 @@ struct Cli {
     headless_test_rom: bool,
     #[arg(long)]
     headless_boot_suite: bool,
+    #[arg(long)]
+    headless_bench: bool,
     #[arg(long)]
     headless_keyboard: bool,
     #[arg(long)]
@@ -139,6 +143,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         return run_boot_suite(&hardware);
     }
 
+    if cli.headless_bench {
+        return run_bench(&hardware);
+    }
+
     if let Some(path) = &cli.headless_run {
         return run_headless_program(path, &hardware, &dos, cli.stdin_text.as_deref());
     }
@@ -215,6 +223,91 @@ fn run_boot_suite(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
     println!("records: {}", results.records.len());
     println!("stop: {stop_reason:?}");
     print_com1(&machine.serial_text());
+    Ok(())
+}
+
+/// One Neurketa run: boot the image in `mode`, preload `selector`, run to the
+/// guest's CMD_EXIT, and read back the charged guest clocks, the reported
+/// result primitives, and the host wall time.
+struct BenchRun {
+    clocks: u64,
+    iterations: u32,
+    aux: u32,
+    wall: std::time::Duration,
+}
+
+fn run_bench_one(
+    hardware: &HardwareProfile,
+    mode: GswMode,
+    selector: u8,
+    budget: u64,
+) -> Result<BenchRun, Box<dyn Error>> {
+    let mut machine = Machine::new_boot_image(
+        MachineProfile::from_hardware_profile(hardware),
+        neurketa_image(),
+    )?;
+    machine.set_mode(mode);
+    machine.set_bench_selector(selector);
+    let started = std::time::Instant::now();
+    let stop = machine.run_until_halt_or_cycles(budget)?;
+    let wall = started.elapsed();
+    if !matches!(stop, StopReason::TestExit { .. }) {
+        return Err(format!(
+            "neurketa {} selector {selector} did not exit cleanly: {stop:?}",
+            mode.canonical_name()
+        )
+        .into());
+    }
+    Ok(BenchRun {
+        clocks: machine.elapsed_clocks(),
+        iterations: machine.bench_iterations(),
+        aux: machine.bench_aux(),
+        wall,
+    })
+}
+
+/// Run the Neurketa payloads in every CPU mode and print, per mode, the guest
+/// cycles per iteration and the host real-time factor. Phase 0 runs the Sieve
+/// (selector 1) against the empty baseline (selector 0); later phases add the C
+/// payloads and the era-reference comparison.
+fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
+    // The run stops at the guest's CMD_EXIT, so this is only a safety cap.
+    const BENCH_BUDGET: u64 = 50_000_000_000;
+    const SEL_BASELINE: u8 = 0;
+    const SEL_SIEVE: u8 = 1;
+
+    let modes = [
+        GswMode::Gsw286,
+        GswMode::Gsw386,
+        GswMode::Gsw486,
+        GswMode::Gsw586,
+    ];
+
+    println!("mode    cyc/iter      iters   primes   guest_ms   wall_ms   rt_factor");
+    for mode in modes {
+        let base = run_bench_one(hardware, mode, SEL_BASELINE, BENCH_BUDGET)?;
+        let sieve = run_bench_one(hardware, mode, SEL_SIEVE, BENCH_BUDGET)?;
+        let work = sieve.clocks.saturating_sub(base.clocks);
+        let iters = u64::from(sieve.iterations.max(1));
+        let cyc_per_iter = work as f64 / iters as f64;
+        let guest_secs = work as f64 / mode.clock_hz() as f64;
+        let wall_secs = sieve.wall.as_secs_f64();
+        let rt = if wall_secs > 0.0 {
+            guest_secs / wall_secs
+        } else {
+            0.0
+        };
+        println!(
+            "{:<6} {:>10.2} {:>10} {:>8} {:>10.3} {:>9.3} {:>10.3}",
+            mode.canonical_name(),
+            cyc_per_iter,
+            sieve.iterations,
+            sieve.aux,
+            guest_secs * 1000.0,
+            wall_secs * 1000.0,
+            rt,
+        );
+    }
     Ok(())
 }
 
