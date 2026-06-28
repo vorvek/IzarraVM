@@ -28,3 +28,17 @@ toka-dos/freedos/**/bin/
 toka-dos/freedos/freecom/**/*.err
 !toka-dos/freedos/freecom/strings/*.err
 !toka-dos/freedos/freecom/suppl/src/nls/*.err
+
+# FreeDOS userland move + sort build outputs (build-freedos.ps1, Open Watcom wcl).
+# Only generated files: the .obj wcl emits next to each .c, the linked .exe, the .map
+# (-fm), and any *.err wcc diagnostics. The vendored NLS catalogs use language-suffix names
+# (move.en, sort.es, ...), NOT *.err, so no language table is at risk here -- but the
+# *.err rule is scoped to move/sort and any committed .err table would need a ! below.
+toka-dos/freedos/move/**/*.obj
+toka-dos/freedos/move/**/*.exe
+toka-dos/freedos/move/**/*.map
+toka-dos/freedos/sort/**/*.obj
+toka-dos/freedos/sort/**/*.exe
+toka-dos/freedos/sort/**/*.map
+toka-dos/freedos/move/**/*.err
+toka-dos/freedos/sort/**/*.err
