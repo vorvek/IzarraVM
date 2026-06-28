@@ -330,7 +330,7 @@ fn run_izarra_bios(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
 }
 
 /// Boot the Izarra 3000 BIOS into Toka-DOS, type an optional script at the
-/// ICOMMAND prompt, and print the VGA text screen. With no floppy mounted the
+/// IZCMD prompt, and print the VGA text screen. With no floppy mounted the
 /// BIOS falls through to the hard-disk boot, which brings up Toka-DOS from C:.
 fn run_headless_toka(
     hardware: &HardwareProfile,
@@ -344,13 +344,13 @@ fn run_headless_toka(
     machine.mount_c_drive(dos.c_drive.clone());
     machine.set_toka_c_root(dos.c_drive.root().to_path_buf());
 
-    // Boot through POST and into the ICOMMAND prompt. POST is fast (fast_post),
+    // Boot through POST and into the IZCMD prompt. POST is fast (fast_post),
     // so roughly a second of cycles is ample to reach the prompt.
     machine.run_until_halt_or_cycles(hardware.clock_hz)?;
 
     // Feed the script character by character. The BDA keyboard ring holds only
     // 15 entries, so injecting a whole line at once overflows it on a long
-    // command. Typing one character and running briefly lets ICOMMAND's line
+    // command. Typing one character and running briefly lets IZCMD's line
     // input drain the ring before the next character, so any line length works.
     if let Some(text) = stdin_text {
         let per_char = 200_000u64;

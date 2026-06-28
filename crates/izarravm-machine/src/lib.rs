@@ -333,10 +333,10 @@ const DOS_LOAD_SEGMENT: u16 = 0x0200;
 /// convention (a fixed nonzero byte the guest can probe).
 pub const LOTURA_ID_VALUE: u8 = 0x5a;
 
-/// Default drive number the ICDEX HLE exposes the CD-ROM at (0 = A:). With no
+/// Default drive number the IZCDEX HLE exposes the CD-ROM at (0 = A:). With no
 /// CONFIG.SYS block drivers, the CD is D:, after A: floppy and C: host drive.
 ///
-/// ICDEX = Izarra CD-ROM Extensions, the Toka-DOS CD redirector. Its INT 2Fh
+/// IZCDEX = Izarra CD-ROM Extensions, the Toka-DOS CD redirector. Its INT 2Fh
 /// interface is intentionally ABI-compatible with the CD extension interface
 /// DOS games probe for, so titles detect the drive without a real driver.
 pub const CD_DRIVE_NUMBER: u8 = 3;
@@ -395,7 +395,7 @@ pub struct MachineProfile {
     pub wait_states: WaitStateProfile,
     pub address_pipelining: bool,
     pub cache_enabled: bool,
-    /// The IEMM EMM386-role state (UMB / EMS provisioning); see `Emm386Mode`.
+    /// The IZEMM EMM386-role state (UMB / EMS provisioning); see `Emm386Mode`.
     pub emm386: Emm386Mode,
 }
 
@@ -844,7 +844,7 @@ pub struct Machine {
     // owns the mounted disc image, the ATA register file, and the CD-audio
     // playback state the mixer streams.
     ide: ide::IdeChannel,
-    // MSCDEX/ICDEX volume-descriptor preference. The default selects the primary
+    // MSCDEX/IZCDEX volume-descriptor preference. The default selects the primary
     // volume descriptor.
     icdex_vd_preference: u16,
     // Guest BDS entries installed through INT 2Fh AX=0801h. The DOS-owned BDS
@@ -874,7 +874,7 @@ pub struct Machine {
     // headless runs and unit tests finish inside their cycle budgets. The GUI
     // clears it after construction to keep the full power-on experience.
     fast_post: bool,
-    // Booter-inert mode: when set, the Toka-DOS HLE and IEMM stand down so a
+    // Booter-inert mode: when set, the Toka-DOS HLE and IZEMM stand down so a
     // self-booting disk owns the DOS/memory-manager interrupts through the IVT
     // (the BIOS services stay intercepted). INT 19h sets it by boot source: a
     // floppy boot turns it on (the disk's sector-0 code is the OS), a C: Toka-DOS
@@ -897,7 +897,7 @@ pub struct Machine {
     // RAM above 1 MB, the HMA-allocation flag, and the local-A20 nesting count. A
     // guest reaches it via INT 2Fh AX=4310h (an INT 66h entry stub in ROM).
     xms: xms::XmsState,
-    // Applied IEMM knobs from CONFIG.SYS. The mode lives in profile.emm386; these
+    // Applied IZEMM knobs from CONFIG.SYS. The mode lives in profile.emm386; these
     // two fields hold the optional RAM-mode EMS pool size and page-frame segment.
     ems_pool_kb: Option<u32>,
     ems_frame_seg: u16,
@@ -1290,7 +1290,7 @@ impl Machine {
         })
     }
 
-    /// Re-apply the full CONFIG.SYS IEMM memory-manager configuration, including
+    /// Re-apply the full CONFIG.SYS IZEMM memory-manager configuration, including
     /// RAM-mode EMS pool and FRAME knobs. Rebuilds XMS/EMS only when the effective
     /// manager state changes, so a warm reboot with the same CONFIG.SYS preserves
     /// live XMS/EMS allocations while still re-laying the DOS UMB arena.
@@ -1327,7 +1327,7 @@ impl Machine {
         self.furnish_dos_upper_memory()
     }
 
-    /// Enter or leave booter-inert mode. When set, the Toka-DOS HLE and IEMM stop
+    /// Enter or leave booter-inert mode. When set, the Toka-DOS HLE and IZEMM stop
     /// intercepting the DOS/memory-manager interrupts (0x20/0x21/0x25/0x26/0x29/
     /// 0x2F/0x66), so a self-booting disk's own handlers run through the IVT;
     /// the BIOS services stay intercepted. The booter track sets this; nothing
@@ -1640,7 +1640,7 @@ impl Machine {
     }
 
     /// Lay out the upper-memory window and hand the DOS kernel its UMB arena: the
-    /// IEMM SYSINIT step. Reserve the ROM, then carve the largest remaining hole as
+    /// IZEMM SYSINIT step. Reserve the ROM, then carve the largest remaining hole as
     /// the UMB pool. With no upper memory free, the kernel keeps no arena.
     ///
     /// This rebuilds the window from scratch every call, so a warm reboot (INT 19h
@@ -4581,7 +4581,7 @@ impl Machine {
             self.write_guest_block(BOOT_SECTOR_ADDRESS as u32, &sector[..512]);
             self.cpu.registers.set_edx(0x00); // DL = 00h: booted from floppy A:
             // The floppy's own sector-0 code is the OS now, so the HLE Toka-DOS
-            // and IEMM stand down and the disk owns the DOS interrupts through the
+            // and IZEMM stand down and the disk owns the DOS interrupts through the
             // IVT. Real hardware just runs whatever sector 0 holds; this confines
             // the HLE injection to the C: boot below.
             self.booter_inert = true;
@@ -4803,7 +4803,7 @@ impl Machine {
         tail.extend_from_slice(b" /C ");
         tail.extend_from_slice(&command);
 
-        self.write_guest_block(scratch + u32::from(path_off), b"C:\\DOS\\ICOMMAND.COM\0");
+        self.write_guest_block(scratch + u32::from(path_off), b"C:\\DOS\\IZCMD.COM\0");
         self.write_physical_u8(scratch + u32::from(tail_off), tail.len() as u8);
         self.write_guest_block(scratch + u32::from(tail_off) + 1, &tail);
         self.write_physical_u8(scratch + u32::from(tail_off) + 1 + tail.len() as u32, 0x0d);
@@ -4815,7 +4815,7 @@ impl Machine {
         self.write_physical_u16(scratch + u32::from(epb_off) + 0x0a, 0);
         self.write_physical_u16(scratch + u32::from(epb_off) + 0x0c, 0);
 
-        // Run a transient ICOMMAND /C child until ICOMMAND grows a true resident
+        // Run a transient IZCMD /C child until IZCMD grows a true resident
         // INT 2Eh entry point.
         self.cpu.registers.set_eax(0x4b00);
         self.cpu
@@ -4829,7 +4829,7 @@ impl Machine {
         self.handle_dos_int(0x21)
     }
 
-    /// Service the DOS-owned and ICDEX functions of `INT 2Fh` (the multiplex
+    /// Service the DOS-owned and IZCDEX functions of `INT 2Fh` (the multiplex
     /// interrupt) as HLE bridges. Unrecognized AX values fall through unchanged
     /// so other INT 2Fh consumers are unaffected. Returns true if the bridge
     /// handled the call.
@@ -5532,9 +5532,9 @@ impl Machine {
                 self.set_bx(old_restore.1);
                 true
             }
-            // Network-redirector / ICDEX installation check (RBIL INTERRUP.K,
+            // Network-redirector / IZCDEX installation check (RBIL INTERRUP.K,
             // INT 2F/AX=1100h). The caller pushes a DADAh marker, runs INT 2Fh,
-            // and a present ICDEX returns AL=FFh and replaces the pushed word
+            // and a present IZCDEX returns AL=FFh and replaces the pushed word
             // with ADADh. A strict probe checks that the word changed, so we
             // rewrite it. The INT pushed IP, CS, FLAGS over the marker, so the
             // marker sits at SS:SP+6. Without that marker this is the plain
@@ -5670,7 +5670,7 @@ impl Machine {
                 }
                 true
             }
-            // Drive check: BX = ADADh signals ICDEX present; AX nonzero if the
+            // Drive check: BX = ADADh signals IZCDEX present; AX nonzero if the
             // drive in CX is a supported CD-ROM.
             0x150B => {
                 let cx = self.cpu.registers.ecx() as u16;
@@ -5708,7 +5708,7 @@ impl Machine {
                 self.set_bx(XMS_ENTRY_OFF);
                 true
             }
-            // Get ICDEX version: BH = major, BL = minor. Report 2.23.
+            // Get IZCDEX version: BH = major, BL = minor. Report 2.23.
             0x150C => {
                 let ebx = (self.cpu.registers.ebx() & !0xFFFF) | 0x0217; // 2.23
                 self.cpu.registers.set_ebx(ebx);
@@ -7774,7 +7774,7 @@ impl Machine {
         // The ROM BIOS boot path reads A: CHS 0/0/1 to 0000:7C00 with INT 13h,
         // then far-jumps there. Once that sector is in place, a self-booting disk
         // owns DOS-family interrupts through its IVT handlers. Host-side Toka-DOS
-        // and IEMM must stand down before the sector's first INT 21h/2Fh/66h.
+        // and IZEMM must stand down before the sector's first INT 21h/2Fh/66h.
         if ah == 0x02
             && done > 0
             && cyl == 0
@@ -8932,16 +8932,16 @@ impl Machine {
     }
 
     /// Place the Toka-DOS boot record (TOKABOOT) at 0x7C00 and set up the DOS
-    /// base context so the boot record's EXEC of C:\DOS\ICOMMAND.COM works. The BIOS
+    /// base context so the boot record's EXEC of C:\DOS\IZCMD.COM works. The BIOS
     /// then jumps to 0x7C00 like a real INT 19h boot.
     fn toka_load_boot_record(&mut self) -> u8 {
-        // Toka-DOS is bootable only when it is installed on C: (C:\DOS\ICOMMAND.COM
+        // Toka-DOS is bootable only when it is installed on C: (C:\DOS\IZCMD.COM
         // present). The boot record always lives in the ROM, so without this
         // check the machine would "boot" a drive that carries no OS.
         let installed = self
             .toka_c_root
             .as_ref()
-            .is_some_and(|root| root.join("DOS").join("ICOMMAND.COM").exists());
+            .is_some_and(|root| root.join("DOS").join("IZCMD.COM").exists());
         if !installed {
             return 1; // not installed: the BIOS reports and idles
         }
@@ -8961,7 +8961,7 @@ impl Machine {
         if self.setup_toka_dos_base().is_err() {
             return 0xfe;
         }
-        // The bundled Toka-DOS boot record is the OS for C:, so the HLE DOS/IEMM
+        // The bundled Toka-DOS boot record is the OS for C:, so the HLE DOS/IZEMM
         // services are live again. This mirrors handle_int19's C: path for BIOS
         // ROM boots that request LoadBootRecord through the service port.
         self.booter_inert = false;
@@ -8976,7 +8976,7 @@ impl Machine {
     fn setup_toka_dos_base(&mut self) -> Result<(), MachineError> {
         install_dos_low_memory_stubs(&mut self.memory)?;
         let env: [(&str, &str); 3] = [
-            ("COMSPEC", "C:\\DOS\\ICOMMAND.COM"),
+            ("COMSPEC", "C:\\DOS\\IZCMD.COM"),
             ("PATH", "C:\\DOS"),
             ("PROMPT", "$p$g"),
         ];
@@ -9036,7 +9036,7 @@ impl Machine {
             let label = device_label(&line);
             if matches!(
                 base.as_str(),
-                "HIMEM.SYS" | "IEMM.EXE" | "IEMM" | "EMM386.EXE" | "EMM386"
+                "HIMEM.SYS" | "IZEMM.EXE" | "IZEMM" | "IEMM.EXE" | "IEMM" | "EMM386.EXE" | "EMM386"
             ) {
                 self.dos
                     .write_boot_message(&format!("{label} (memory manager)"));
@@ -12126,7 +12126,7 @@ fn install_boot_bios_stubs(memory: &mut Memory) -> Result<(), BusError> {
 
     // BIOS service interrupts the host intercepts by vector. Their IVT targets
     // point at the ROM IRET so they survive a guest low-memory wipe. INT 33h is
-    // the mouse driver and INT 2Fh is the ICDEX CD bridge; INT 29h is the DOS
+    // the mouse driver and INT 2Fh is the IZCDEX CD bridge; INT 29h is the DOS
     // fast-console hook; INT 25h/26h are the DOS absolute disk read/write; INT
     // 27h is the obsolete TSR exit; INT 28h is the DOS idle hook's default IRET;
     // INT 2Ah is the DOS network/critical-section hook; INT 2Bh-2Dh, 32h,
@@ -16580,7 +16580,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("CONFIG.SYS"),
-            "DEVICE=C:\\DOS\\HIMEM.SYS\r\nDEVICE=C:\\DOS\\IEMM.EXE RAM\r\nDOS=HIGH,UMB\r\nLASTDRIVE=Z\r\n",
+            "DEVICE=C:\\DOS\\HIMEM.SYS\r\nDEVICE=C:\\DOS\\IZEMM.EXE RAM\r\nDOS=HIGH,UMB\r\nLASTDRIVE=Z\r\n",
         )
         .unwrap();
         let mut machine =
@@ -16612,7 +16612,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("CONFIG.SYS"),
-            "DEVICE=C:\\DOS\\HIMEM.SYS\r\nDEVICE=C:\\DOS\\IEMM.EXE RAM\r\nFILES=37\r\nBUFFERS=12\r\n",
+            "DEVICE=C:\\DOS\\HIMEM.SYS\r\nDEVICE=C:\\DOS\\IZEMM.EXE RAM\r\nFILES=37\r\nBUFFERS=12\r\n",
         )
         .unwrap();
         let mut machine =
@@ -19495,7 +19495,7 @@ mod tests {
         );
         m.pending_soft_int = None;
 
-        // Booter-inert mode stands the DOS/IEMM vectors down so the guest's own
+        // Booter-inert mode stands the DOS/IZEMM vectors down so the guest's own
         // handlers run through the IVT.
         m.set_booter_inert(true);
         assert!(m.booter_inert());
@@ -19658,7 +19658,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dos_dir = dir.path().join("DOS");
         std::fs::create_dir_all(&dos_dir).unwrap();
-        std::fs::write(dos_dir.join("ICOMMAND.COM"), b"stub").unwrap();
+        std::fs::write(dos_dir.join("IZCMD.COM"), b"stub").unwrap();
         let mut m = int15_machine(16);
         m.set_toka_c_root(dir.path().to_path_buf());
         m.set_booter_inert(true); // simulate a prior booter boot
@@ -19681,7 +19681,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dos_dir = dir.path().join("DOS");
         std::fs::create_dir_all(&dos_dir).unwrap();
-        std::fs::write(dos_dir.join("ICOMMAND.COM"), b"stub").unwrap();
+        std::fs::write(dos_dir.join("IZCMD.COM"), b"stub").unwrap();
         let mut m = int15_machine(16);
         m.set_toka_c_root(dir.path().to_path_buf());
         m.set_booter_inert(true);
@@ -22194,7 +22194,7 @@ mod tests {
         machine.cpu.registers.set_esp(0x0100);
         let marker_addr = 0x9000 * 16 + (0x0100 + 6);
         // A pushed word other than DADAh is the plain redirector install check.
-        // It must not claim ICDEX installed or touch the stack word.
+        // It must not claim IZCDEX installed or touch the stack word.
         machine.memory.write_u16(marker_addr, 0x1234).unwrap();
         machine.cpu.registers.set_eax(0xCAFE_1100);
         assert!(machine.handle_int2f());
@@ -23136,7 +23136,7 @@ mod tests {
     }
 
     #[test]
-    fn dos_com_int2e_execs_icommand_with_c_tail() {
+    fn dos_com_int2e_execs_izcmd_with_c_tail() {
         // Parent: DS:SI -> counted "ECHO OK\r"; INT 2Eh; exit with EXEC error on
         // CF, else with AH=4Dh child code.
         let parent: &[u8] = &[
@@ -23144,8 +23144,8 @@ mod tests {
             0x4c, 0xcd, 0x21, 0xb4, 0x4d, 0xcd, 0x21, 0xb4, 0x4c, 0xcd, 0x21, 0x07, b'E', b'C',
             b'H', b'O', b' ', b'O', b'K', 0x0d,
         ];
-        // Child ICOMMAND.COM test double: print Y only if PSP:80h is " /C ECHO OK".
-        let icommand: &[u8] = &[
+        // Child IZCMD.COM test double: print Y only if PSP:80h is " /C ECHO OK".
+        let izcmd: &[u8] = &[
             0xbe, 0x80, 0x00, 0xac, 0x3c, 0x0b, 0x75, 0x15, 0xbf, 0x28, 0x01, 0xb9, 0x0b, 0x00,
             0xf3, 0xa6, 0x75, 0x0b, 0xb2, b'Y', 0xb4, 0x02, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd,
             0x21, 0xb2, b'N', 0xb4, 0x02, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21, b' ', b'/',
@@ -23154,7 +23154,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dos_dir = dir.path().join("DOS");
         std::fs::create_dir_all(&dos_dir).unwrap();
-        std::fs::write(dos_dir.join("ICOMMAND.COM"), icommand).unwrap();
+        std::fs::write(dos_dir.join("IZCMD.COM"), izcmd).unwrap();
         let mut machine =
             Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), parent)
                 .unwrap();
@@ -27317,8 +27317,8 @@ mod tests {
         // Format installs the Toka-DOS system files onto C:.
         machine.perform_toka_service(0x02);
         assert_eq!(machine.toka_service_status, 0);
-        assert!(dir.path().join("DOS").join("ICOMMAND.COM").exists());
-        assert!(!dir.path().join("ICOMMAND.COM").exists());
+        assert!(dir.path().join("DOS").join("IZCMD.COM").exists());
+        assert!(!dir.path().join("IZCMD.COM").exists());
         let status = with_bus(&mut machine, |bus| {
             bus.read_io(0x00e3, BusWidth::Byte).unwrap() as u8
         });
@@ -29202,7 +29202,7 @@ mod tests {
 
         machine.cpu.registers.set_eax(0x1500);
         assert!(machine.handle_int2f());
-        assert_eq!(machine.cpu.registers.ecx() as u16, 4, "ICDEX moves to E:");
+        assert_eq!(machine.cpu.registers.ecx() as u16, 4, "IZCDEX moves to E:");
     }
 
     #[test]
@@ -29262,7 +29262,7 @@ mod tests {
         std::fs::write(
             dir.path().join("CONFIG.SYS"),
             "DEVICE=C:\\DOS\\HIMEM.SYS /TESTMEM:OFF\r\n\
-             DEVICE=C:\\DOS\\IEMM.EXE RAM\r\n\
+             DEVICE=C:\\DOS\\IZEMM.EXE RAM\r\n\
              DOS=HIGH,UMB\r\n\
              DEVICEHIGH=C:\\HIGHDEV.SYS\r\n",
         )
@@ -29298,7 +29298,7 @@ mod tests {
         std::fs::write(
             dir.path().join("CONFIG.SYS"),
             "DEVICE=C:\\DOS\\HIMEM.SYS /TESTMEM:OFF\r\n\
-             DEVICE=C:\\DOS\\IEMM.EXE RAM\r\n\
+             DEVICE=C:\\DOS\\IZEMM.EXE RAM\r\n\
              DOS=HIGH,UMB\r\n\
              DEVICE=C:\\LOWDEV.SYS\r\n",
         )
@@ -29359,7 +29359,7 @@ mod tests {
         std::fs::write(
             dir.path().join("CONFIG.SYS"),
             "DEVICE=C:\\DOS\\HIMEM.SYS /TESTMEM:OFF\r\n\
-             DEVICE=C:\\DOS\\IEMM.EXE RAM\r\n\
+             DEVICE=C:\\DOS\\IZEMM.EXE RAM\r\n\
              DOS=HIGH\r\n\
              DEVICEHIGH=C:\\UNLINKD.SYS\r\n",
         )
@@ -29652,7 +29652,7 @@ mod tests {
         machine.set_toka_c_root(dir.path().to_path_buf());
 
         // POST, fall through the (absent) floppy to the disk boot, TOKABOOT, and
-        // into ICOMMAND. One clock-second of cycles is ample with fast POST.
+        // into IZCMD. One clock-second of cycles is ample with fast POST.
         machine.run_until_halt_or_cycles(22_000_000).unwrap();
 
         let screen = machine.screen_text();
@@ -29663,7 +29663,7 @@ mod tests {
         );
         assert!(
             text.contains("C:\\>"),
-            "ICOMMAND prompt on the VGA screen; got:\n{text}"
+            "IZCMD prompt on the VGA screen; got:\n{text}"
         );
     }
 
@@ -29710,11 +29710,11 @@ mod tests {
 
         let ram = run_mem_with_config(
             "DEVICE=C:\\DOS\\HIMEM.SYS /TESTMEM:OFF\r\n\
-             DEVICE=C:\\DOS\\IEMM.EXE RAM\r\nDOS=HIGH,UMB\r\n",
+             DEVICE=C:\\DOS\\IZEMM.EXE RAM\r\nDOS=HIGH,UMB\r\n",
         );
         let noems = run_mem_with_config(
             "DEVICE=C:\\DOS\\HIMEM.SYS /TESTMEM:OFF\r\n\
-             DEVICE=C:\\DOS\\IEMM.EXE NOEMS\r\nDOS=HIGH,UMB\r\n",
+             DEVICE=C:\\DOS\\IZEMM.EXE NOEMS\r\nDOS=HIGH,UMB\r\n",
         );
 
         // RAM provisions an EMS page frame: MEM prints an 'Expanded free' KB line.
@@ -29735,7 +29735,7 @@ mod tests {
     }
 
     #[test]
-    fn toka_icdex_reports_live_cd_letter_and_version() {
+    fn toka_izcdex_reports_live_cd_letter_and_version() {
         let dir = tempfile::tempdir().unwrap();
         let files = izarravm_firmware::toka_dos_system_files();
         izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format)
@@ -29749,7 +29749,7 @@ mod tests {
         machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
         machine.set_toka_c_root(dir.path().to_path_buf());
 
-        // A minimal valid data disc (one 2048-byte sector); ICDEX only probes the
+        // A minimal valid data disc (one 2048-byte sector); IZCDEX only probes the
         // redirector, it does not read the medium.
         let iso = vec![0u8; crate::cdimage::DATA_SECTOR];
         let image = CdImage::from_iso(iso).unwrap();
@@ -29760,6 +29760,7 @@ mod tests {
         fn key_codes(ch: char) -> Vec<u8> {
             let make: u8 = match ch {
                 'i' => 0x17,
+                'z' => 0x2c,
                 'c' => 0x2e,
                 'd' => 0x20,
                 'e' => 0x12,
@@ -29769,7 +29770,7 @@ mod tests {
             };
             vec![make, make | 0x80]
         }
-        for ch in "icdex\r".chars() {
+        for ch in "izcdex\r".chars() {
             for code in key_codes(ch) {
                 machine.inject_key_scancodes(&[code]);
             }
@@ -29780,17 +29781,17 @@ mod tests {
         // New-only wording proves the rewritten tool shipped and ran.
         assert!(
             text.contains("extensions status"),
-            "ICDEX prints the new status header; got:\n{text}"
+            "IZCDEX prints the new status header; got:\n{text}"
         );
         // Live values from the HLE handler.
         assert!(
             text.contains("D:") && text.contains("2.23"),
-            "ICDEX prints the live CD drive letter D: and version 2.23; got:\n{text}"
+            "IZCDEX prints the live CD drive letter D: and version 2.23; got:\n{text}"
         );
         // The old fake banner's lines must be gone.
         assert!(
             !text.contains("extensions installed") && !text.contains("Driver ICD0001"),
-            "the old fake ICDEX banner is gone; got:\n{text}"
+            "the old fake IZCDEX banner is gone; got:\n{text}"
         );
     }
 
@@ -29869,7 +29870,7 @@ mod tests {
         machine.set_toka_c_root(dir.path().to_path_buf());
         machine.run_until_halt_or_cycles(22_000_000).unwrap();
 
-        // Type "path" (ICOMMAND uppercases the verb) then Enter, lowercase so no
+        // Type "path" (IZCMD uppercases the verb) then Enter, lowercase so no
         // Shift is needed.
         fn key_codes(ch: char) -> Vec<u8> {
             let make: u8 = match ch {
@@ -29904,7 +29905,7 @@ mod tests {
     }
 
     /// IBM Set-1 make codes for every character the SET and TESTS commands type.
-    /// ICOMMAND uppercases verbs, so lowercase input needs no Shift. Returns
+    /// IZCMD uppercases verbs, so lowercase input needs no Shift. Returns
     /// make + break (make | 0x80), or an empty vec for an unmapped char.
     #[cfg(test)]
     fn tests_env_key_codes(ch: char) -> Vec<u8> {
@@ -29943,7 +29944,7 @@ mod tests {
             .unwrap();
 
         // The committed dev fixture lives at the repo root, two levels above this
-        // crate's manifest dir. Copy it into the temp C: root so ICOMMAND can EXEC
+        // crate's manifest dir. Copy it into the temp C: root so IZCMD can EXEC
         // it from C:\.
         let tests_com = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
@@ -29980,9 +29981,9 @@ mod tests {
 
     #[test]
     fn toka_set_env_reaches_a_launched_child() {
-        // SET FOO=HELLO in ICOMMAND, then TESTS ENV FOO HELLO: the child must read
+        // SET FOO=HELLO in IZCMD, then TESTS ENV FOO HELLO: the child must read
         // its inherited environment and find FOO=HELLO, reporting exit 0 through
-        // the unit-tester. Proves the env segment ICOMMAND builds reaches EXEC.
+        // the unit-tester. Proves the env segment IZCMD builds reaches EXEC.
         let reason = run_tests_env_scenario(&["set foo=hello\r", "tests env foo hello\r"]);
         assert_eq!(
             reason,
@@ -30046,7 +30047,7 @@ mod tests {
         .unwrap();
         machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
         machine.set_toka_c_root(dir.path().to_path_buf());
-        // POST, disk boot, TOKABOOT, ICOMMAND, then AUTOEXEC runs TESTS DEV, which
+        // POST, disk boot, TOKABOOT, IZCMD, then AUTOEXEC runs TESTS DEV, which
         // exits through the unit-tester as soon as the round-trip matches. The
         // full-screen RLE POST background adds ~10M cycles before the disk boot, so
         // the budget covers the heavier POST plus the boot/DOS/driver round-trip.

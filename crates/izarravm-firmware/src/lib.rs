@@ -43,7 +43,7 @@ static IZARRA_FLASH: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::new(|| 
     flash
 });
 
-/// The Toka-DOS ROM image: a packed blob of the OS system files (ICOMMAND, the
+/// The Toka-DOS ROM image: a packed blob of the OS system files (IZCMD, the
 /// boot record, and the tools) that the machine lays down onto the C: drive.
 /// It lives in the motherboard BOOT.rom alongside the BIOS and Belunza.
 pub const TOKA_DOS_ROM: &[u8] = include_bytes!("../roms/tokados.rom");
@@ -118,7 +118,7 @@ pub fn toka_boot_record() -> Option<&'static [u8]> {
 /// ...     file data
 ///
 /// directory entry (20 bytes):
-///   0  11  name, 8.3 packed and space padded (e.g. "ICOMMAND COM")
+///   0  11  name, 8.3 packed and space padded (e.g. "IZCMD   COM")
 ///   11 1   flags (bit0 = system file)
 ///   12 4   data offset from start of blob (u32 LE)
 ///   16 4   data length (u32 LE)
@@ -149,7 +149,7 @@ pub mod toka_rom {
         pub data: &'a [u8],
     }
 
-    /// Decode an 8.3 name field ("ICOMMAND COM") into "ICOMMAND.COM". A blank
+    /// Decode an 8.3 name field ("IZCMD   COM") into "IZCMD.COM". A blank
     /// extension yields just the base name.
     fn decode_8_3(raw: &[u8]) -> String {
         let base = String::from_utf8_lossy(&raw[0..8]).trim_end().to_string();
@@ -409,8 +409,8 @@ mod tests {
         // The shell and the boot record are present; the boot record is a real
         // 512-byte sector and is not flagged as a C: system file.
         assert!(
-            files.iter().any(|f| f.name == "ICOMMAND.COM"),
-            "ICOMMAND.COM missing from the ROM"
+            files.iter().any(|f| f.name == "IZCMD.COM"),
+            "IZCMD.COM missing from the ROM"
         );
         let boot = toka_boot_record().expect("ROM has a boot record");
         assert_eq!(boot.len(), 512, "boot record is one sector");

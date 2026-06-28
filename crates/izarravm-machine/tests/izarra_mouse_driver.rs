@@ -72,8 +72,16 @@ fn mouse_driver_passes_the_guest_self_test_end_to_end() {
     // the left button down and keeps moving right+down, exactly what the poll
     // checks, so whichever chunk the poll is live in, a move is waiting. This
     // makes the test robust to where the chunk boundaries fall.
-    const CHUNK: u64 = 20_000_000;
-    const MAX_CHUNKS: usize = 12; // generous: boot + static checks + motion settle
+    // The host injects the held-button motion once per chunk, so the chunk must be
+    // small enough that the held left button streams as a dense run of packets (the
+    // way a real held button does), not a sparse pulse. With a coarse chunk, MTEST's
+    // Stage-C poll can latch onto a button-less driver-init event in the gap before
+    // the next injection and report a (correct) motion with no button held - a
+    // false failure that depends on exactly where the boot cycle count lands. A fine
+    // cadence keeps the button continuously asserted across the poll. The total
+    // budget (MAX_CHUNKS * CHUNK) still covers boot + DOS + MOUSE install + the test.
+    const CHUNK: u64 = 2_000_000;
+    const MAX_CHUNKS: usize = 120;
     let mut final_reason = None;
     for _ in 0..MAX_CHUNKS {
         match machine.run_until_halt_or_cycles(CHUNK).unwrap() {

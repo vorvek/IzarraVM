@@ -4,7 +4,7 @@
 //! memory with its real-mode-reachable HMA window.
 //!
 //! This is the single place those boundaries are defined. The memory manager
-//! (IEMM) and the BIOS memory services classify an address through here instead
+//! (IZEMM) and the BIOS memory services classify an address through here instead
 //! of scattering the same magic constants across the crate. It is a pure address
 //! model: no state, no A20 effect, no wraparound. Those ride a later slice; this
 //! one only names where things live.
