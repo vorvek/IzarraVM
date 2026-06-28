@@ -655,6 +655,9 @@ pub struct Cpu386 {
     pub ldtr: SegmentRegister,
     pub tr: SegmentRegister,
     pub elapsed_clocks: u64,
+    // Fractional remainder carried by the per-level cycle scaling so the cheap
+    // ops do not round to zero. Reset on a level change. See scale_clocks.
+    timing_rem: u64,
     pub halted: bool,
     // STI sets this to block maskable interrupt delivery for one instruction:
     // the 386 holds off interrupts until the instruction after STI, which makes
@@ -840,6 +843,19 @@ impl Cpu386 {
     /// runs at the default full ISA.
     pub fn set_level(&mut self, level: CpuLevel) {
         self.level = level;
+        self.timing_rem = 0;
+    }
+
+    /// Scale a retired instruction's clocks by the active level's timing factor,
+    /// carrying the fractional remainder so a run of cheap ops is not rounded to
+    /// zero. This is the single per-mode timing dial; it feeds both the CPU's
+    /// own clock counter and, through the returned CycleOutcome, the machine's
+    /// device timing.
+    fn scale_clocks(&mut self, clocks: u32) -> u64 {
+        let (num, den) = level_timing(self.level);
+        let scaled = u64::from(clocks) * u64::from(num) + self.timing_rem;
+        self.timing_rem = scaled % u64::from(den);
+        scaled / u64::from(den)
     }
 
     /// Reported (L1 KB, L2 KB) cache for the live level. Cosmetic, no timing effect.
@@ -939,9 +955,10 @@ impl Cpu386 {
                         InternalFault::Cpu(error) => error,
                         InternalFault::Exception { vector, .. } => CpuError::IdtLimit { vector },
                     })?;
-                self.elapsed_clocks += 61;
+                let charged = self.scale_clocks(61);
+                self.elapsed_clocks += charged;
                 return Ok(CycleOutcome {
-                    core_clocks: 61,
+                    core_clocks: charged.min(u64::from(u32::MAX)) as u32,
                     halted: false,
                 });
             }
@@ -971,8 +988,12 @@ impl Cpu386 {
             Err(InternalFault::Cpu(error)) => return Err(error),
         };
 
-        self.elapsed_clocks += u64::from(outcome.core_clocks);
-        Ok(outcome)
+        let charged = self.scale_clocks(outcome.core_clocks);
+        self.elapsed_clocks += charged;
+        Ok(CycleOutcome {
+            core_clocks: charged.min(u64::from(u32::MAX)) as u32,
+            halted: outcome.halted,
+        })
     }
 
     fn execute_instruction<B: CpuBus>(&mut self, bus: &mut B) -> ExecResult<CycleOutcome> {
@@ -5108,6 +5129,21 @@ fn clocks(core_clocks: u32) -> CycleOutcome {
     CycleOutcome {
         core_clocks,
         halted: false,
+    }
+}
+
+/// Provisional per-level cycle scaling as (numerator, denominator). ponytail: a
+/// coarse scalar that makes the four modes differ in instructions per clock;
+/// sub-project B calibrates these against the cached CPU manuals and refines to
+/// a per-instruction-class model if a single scalar cannot hold the benchmarks
+/// in their era band. I386 is 1:1 because the base clocks(N) table already holds
+/// roughly 386-era values.
+const fn level_timing(level: CpuLevel) -> (u32, u32) {
+    match level {
+        CpuLevel::I286 => (4, 3),
+        CpuLevel::I386 => (1, 1),
+        CpuLevel::I486 => (1, 2),
+        CpuLevel::I586 => (2, 5),
     }
 }
 
@@ -12203,6 +12239,32 @@ mod tests {
         );
         cpu.registers.eip = 0;
         (cpu, TestBus::with_memory(memory))
+    }
+
+    #[test]
+    fn higher_levels_charge_fewer_clocks_for_the_same_work() {
+        // 01 D8 is ADD AX, BX: a register ALU op that never faults.
+        fn elapsed_for(level: CpuLevel) -> u64 {
+            let (mut cpu, memory) = real_mode_cpu(&[0x01, 0xd8], 0x20);
+            cpu.set_level(level);
+            let mut bus = TestBus::with_memory(memory);
+            for _ in 0..1000 {
+                cpu.registers.eip = 0;
+                cpu.cycle(&mut bus).unwrap();
+            }
+            cpu.elapsed_clocks
+        }
+        let i386 = elapsed_for(CpuLevel::I386);
+        let i486 = elapsed_for(CpuLevel::I486);
+        let i586 = elapsed_for(CpuLevel::I586);
+        assert!(
+            i486 < i386,
+            "486 ({i486}) should charge fewer than 386 ({i386})"
+        );
+        assert!(
+            i586 < i486,
+            "586 ({i586}) should charge fewer than 486 ({i486})"
+        );
     }
 
     #[test]
