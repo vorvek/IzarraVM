@@ -38,6 +38,30 @@ fn sieve_reports_1899_primes_in_every_mode() {
 }
 
 #[test]
+fn fp_mandelbrot_is_consistent_across_the_fpu_modes() {
+    // The FP payload (selector 3) runs only where there is an FPU (486 and 586).
+    let m486 = run(GswMode::Gsw486, 3);
+    let m586 = run(GswMode::Gsw586, 3);
+    assert_eq!(m486.bench_status(), 1, "486 status");
+    assert_eq!(m486.bench_iterations(), 1536, "pixel count");
+    let csum = m486.bench_aux();
+    assert_eq!(
+        m586.bench_aux(),
+        csum,
+        "x87 is deterministic so 486 ({csum}) and 586 ({}) must agree",
+        m586.bench_aux()
+    );
+    // Non-degenerate: not all pixels escaped on iteration 0-ish, and not all
+    // pixels ran to maxiter. 1536 pixels, maxiter 64.
+    assert_ne!(csum, 0, "checksum should be non-zero");
+    assert!(
+        csum > 1536,
+        "more than one iteration per pixel on average somewhere"
+    );
+    assert!(csum < 1536 * 64, "not every pixel ran to maxiter");
+}
+
+#[test]
 fn baseline_charges_fewer_clocks_than_the_sieve() {
     let baseline = run(GswMode::Gsw386, 0);
     let sieve = run(GswMode::Gsw386, 1);
