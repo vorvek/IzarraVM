@@ -10043,6 +10043,28 @@ impl Machine {
         self.test_snapshot_path = path;
     }
 
+    /// Preload the Neurketa benchmark selector the guest reads at start to pick
+    /// its payload. Call before `run_until_halt_or_cycles`.
+    pub fn set_bench_selector(&mut self, selector: u8) {
+        self.unittester
+            .set_reg_u8(unittester::REG_SELECTOR, selector);
+    }
+
+    /// The iteration count the Neurketa payload reported before `CMD_EXIT`.
+    pub fn bench_iterations(&self) -> u32 {
+        self.unittester.reg_u32(unittester::REG_RESULT_ITER)
+    }
+
+    /// The payload-specific auxiliary value (the Sieve reports its prime count).
+    pub fn bench_aux(&self) -> u32 {
+        self.unittester.reg_u32(unittester::REG_RESULT_AUX)
+    }
+
+    /// The payload status byte (1 once the payload ran to completion).
+    pub fn bench_status(&self) -> u8 {
+        self.unittester.reg_u8(unittester::REG_RESULT_STATUS)
+    }
+
     /// Set the HMA minimum-request threshold in KB, the `/HMAMIN=` HIMEM
     /// parameter. XMS function 01h then refuses a request below this size so the
     /// HMA stays free for a larger claimant (such as DOS=HIGH). The config wiring
