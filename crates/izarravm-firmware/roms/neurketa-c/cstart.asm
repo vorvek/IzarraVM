@@ -29,6 +29,9 @@ CMD_EXIT     equ 3
 ; Register-file offsets.
 REG_EXIT_OFF equ 12
 RES_ITER_OFF equ 17
+; RES_AUX_OFF and RES_STAT_OFF document the register layout for reference only.
+; The report path reaches those offsets through the data-port post-increment
+; after selecting RES_ITER_OFF, so it never names them; they are not load-bearing.
 RES_AUX_OFF  equ 21
 RES_STAT_OFF equ 25
 
