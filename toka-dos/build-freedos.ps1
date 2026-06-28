@@ -108,3 +108,8 @@ try {
 $commandCom = Join-Path $fcdir 'command.com'
 if (-not (Test-Path $commandCom)) { throw "command.com not produced at $commandCom" }
 Write-Host "command.com: $((Get-Item $commandCom).Length) bytes"
+
+# --- Assemble the committed image ---
+& python (Join-Path $root '..\scripts\build-freedos-image.py')
+if ($LASTEXITCODE -ne 0) { throw "image build failed" }
+Write-Host "Toka-DOS image built: crates/izarravm-firmware/roms/tokados.img"
