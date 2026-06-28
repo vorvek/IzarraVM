@@ -136,7 +136,7 @@ pub fn resolve_c_root(portable: bool) -> PathBuf {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallMode {
     /// Install only if Toka-DOS is absent (first boot). The presence of
-    /// `C:\DOS\ICOMMAND.COM` is the marker.
+    /// `C:\DOS\IZCMD.COM` is the marker.
     EnsureIfMissing,
     /// Overwrite the system files from ROM, leaving any user files in place.
     Repair,
@@ -145,12 +145,12 @@ pub enum InstallMode {
 }
 
 fn toka_dos_marker(c_root: &Path) -> PathBuf {
-    c_root.join("DOS").join("ICOMMAND.COM")
+    c_root.join("DOS").join("IZCMD.COM")
 }
 
 /// The default AUTOEXEC.BAT: put the tools directory on the PATH, set a
 /// path-showing prompt, and load the mouse driver. DOS line endings (CRLF).
-const DEFAULT_AUTOEXEC_BAT: &str = "@ECHO OFF\r\nPATH=C:\\DOS\r\nPROMPT=$P$G\r\nMOUSE\r\n";
+const DEFAULT_AUTOEXEC_BAT: &str = "@ECHO OFF\r\nPATH=C:\\DOS\r\nPROMPT=$P$G\r\nIZMOUSE\r\n";
 
 const DEFAULT_FILE_COUNT: u16 = 40;
 const DEFAULT_BUFFER_COUNT: u16 = 20;
@@ -165,13 +165,13 @@ const C_DRIVE_VOLUME_LABEL: [u8; 11] = *b"NO NAME    ";
 const C_DRIVE_FS_TYPE: [u8; 8] = *b"FAT16   ";
 
 /// The default CONFIG.SYS: the directives a period DOS carries. The HIMEM.SYS
-/// and IEMM.EXE RAM lines select the IEMM RAM mode (UMBs plus the EMS page
+/// and IZEMM.EXE RAM lines select the IZEMM RAM mode (UMBs plus the EMS page
 /// frame) at SYSINIT, the way a real DOS=HIGH,UMB box is configured; the machine
-/// parses these to drive the memory layout. IEMM.EXE is the Toka-DOS memory
+/// parses these to drive the memory layout. IZEMM.EXE is the Toka-DOS memory
 /// manager; the parser also accepts the real-DOS EMM386.EXE name so a pasted
 /// real-DOS config still drives the mode. The CD-extension DEVICE= line is still
 /// left out until that driver exists.
-const DEFAULT_CONFIG_SYS: &str = "DEVICE=C:\\DOS\\HIMEM.SYS /TESTMEM:OFF\r\nDEVICE=C:\\DOS\\IEMM.EXE RAM\r\nDOS=HIGH,UMB\r\nFILES=40\r\nBUFFERS=20\r\nLASTDRIVE=E\r\n";
+const DEFAULT_CONFIG_SYS: &str = "DEVICE=C:\\DOS\\HIMEM.SYS /TESTMEM:OFF\r\nDEVICE=C:\\DOS\\IZEMM.EXE RAM\r\nDOS=HIGH,UMB\r\nFILES=40\r\nBUFFERS=20\r\nLASTDRIVE=E\r\n";
 
 /// How the boot-config writer treats an existing CONFIG.SYS / AUTOEXEC.BAT.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7384,28 +7384,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let files = vec![
-            ("ICOMMAND.COM".to_string(), vec![1u8, 2, 3]),
+            ("IZCMD.COM".to_string(), vec![1u8, 2, 3]),
             ("VER.COM".to_string(), vec![4u8]),
         ];
 
         // Format lays everything down on a fresh drive under C:\DOS.
         toka_dos_install(root, &files, InstallMode::Format).unwrap();
-        assert!(root.join("DOS").join("ICOMMAND.COM").exists());
+        assert!(root.join("DOS").join("IZCMD.COM").exists());
         assert!(root.join("DOS").join("VER.COM").exists());
-        assert!(!root.join("ICOMMAND.COM").exists());
+        assert!(!root.join("IZCMD.COM").exists());
         assert!(!root.join("VER.COM").exists());
 
         // EnsureIfMissing is a no-op once the marker is present: a hand-edited
         // system file is left untouched.
-        std::fs::write(root.join("DOS").join("ICOMMAND.COM"), b"edited").unwrap();
-        std::fs::write(root.join("ICOMMAND.COM"), b"stale").unwrap();
+        std::fs::write(root.join("DOS").join("IZCMD.COM"), b"edited").unwrap();
+        std::fs::write(root.join("IZCMD.COM"), b"stale").unwrap();
         toka_dos_install(root, &files, InstallMode::EnsureIfMissing).unwrap();
         assert_eq!(
-            std::fs::read(root.join("DOS").join("ICOMMAND.COM")).unwrap(),
+            std::fs::read(root.join("DOS").join("IZCMD.COM")).unwrap(),
             b"edited"
         );
         assert!(
-            !root.join("ICOMMAND.COM").exists(),
+            !root.join("IZCMD.COM").exists(),
             "EnsureIfMissing removes stale root system files"
         );
 
@@ -7413,7 +7413,7 @@ mod tests {
         std::fs::write(root.join("USER.TXT"), b"x").unwrap();
         toka_dos_install(root, &files, InstallMode::Repair).unwrap();
         assert_eq!(
-            std::fs::read(root.join("DOS").join("ICOMMAND.COM")).unwrap(),
+            std::fs::read(root.join("DOS").join("IZCMD.COM")).unwrap(),
             vec![1, 2, 3]
         );
         assert!(root.join("USER.TXT").exists());
@@ -7421,7 +7421,7 @@ mod tests {
         // Format wipes the stray user file, then reinstalls.
         toka_dos_install(root, &files, InstallMode::Format).unwrap();
         assert!(!root.join("USER.TXT").exists());
-        assert!(root.join("DOS").join("ICOMMAND.COM").exists());
+        assert!(root.join("DOS").join("IZCMD.COM").exists());
     }
 
     #[test]
@@ -7448,17 +7448,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let files = vec![
-            ("ICOMMAND.COM".to_string(), vec![1u8]),
+            ("IZCMD.COM".to_string(), vec![1u8]),
             ("COMMAND.COM".to_string(), vec![1u8]),
             ("MEM.COM".to_string(), vec![2u8]),
         ];
         toka_dos_install(root, &files, InstallMode::Format).unwrap();
 
         // System files live under C:\DOS, including the shell and COMMAND alias.
-        assert!(root.join("DOS").join("ICOMMAND.COM").exists());
+        assert!(root.join("DOS").join("IZCMD.COM").exists());
         assert!(root.join("DOS").join("COMMAND.COM").exists());
         assert!(root.join("DOS").join("MEM.COM").exists());
-        assert!(!root.join("ICOMMAND.COM").exists());
+        assert!(!root.join("IZCMD.COM").exists());
         assert!(!root.join("COMMAND.COM").exists());
         assert!(!root.join("MEM.COM").exists());
 
@@ -7471,11 +7471,11 @@ mod tests {
         let config = std::fs::read_to_string(root.join("CONFIG.SYS")).unwrap();
         assert!(config.contains("DOS=HIGH,UMB"));
         assert!(config.contains("LASTDRIVE=E"));
-        // The shipped default names the Toka-DOS memory manager IEMM.EXE (the
+        // The shipped default names the Toka-DOS memory manager IZEMM.EXE (the
         // parser also accepts the real-DOS EMM386.EXE alias).
         assert!(
-            config.contains("DEVICE=C:\\DOS\\IEMM.EXE RAM"),
-            "the default CONFIG.SYS loads the IEMM manager"
+            config.contains("DEVICE=C:\\DOS\\IZEMM.EXE RAM"),
+            "the default CONFIG.SYS loads the IZEMM manager"
         );
 
         // Repair hands back the known-good default and saves the prior file to
@@ -7509,7 +7509,7 @@ mod tests {
     #[test]
     fn default_autoexec_loads_mouse_driver() {
         assert!(
-            DEFAULT_AUTOEXEC_BAT.contains("MOUSE\r\n"),
+            DEFAULT_AUTOEXEC_BAT.contains("IZMOUSE\r\n"),
             "default AUTOEXEC.BAT must load the mouse driver"
         );
     }
@@ -7518,7 +7518,7 @@ mod tests {
     fn repair_backs_up_custom_config_sys() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let files = vec![("ICOMMAND.COM".to_string(), vec![1u8])];
+        let files = vec![("IZCMD.COM".to_string(), vec![1u8])];
         toka_dos_install(root, &files, InstallMode::Format).unwrap();
 
         std::fs::write(root.join("CONFIG.SYS"), b"REM broken").unwrap();
@@ -7540,7 +7540,7 @@ mod tests {
     fn repair_backs_up_custom_autoexec_bat() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let files = vec![("ICOMMAND.COM".to_string(), vec![1u8])];
+        let files = vec![("IZCMD.COM".to_string(), vec![1u8])];
         toka_dos_install(root, &files, InstallMode::Format).unwrap();
 
         std::fs::write(root.join("AUTOEXEC.BAT"), b"REM mine").unwrap();
@@ -7562,17 +7562,17 @@ mod tests {
     fn repair_writes_defaults_and_no_old_when_absent() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let files = vec![("ICOMMAND.COM".to_string(), vec![1u8])];
+        let files = vec![("IZCMD.COM".to_string(), vec![1u8])];
         std::fs::create_dir_all(root).unwrap();
-        std::fs::write(root.join("ICOMMAND.COM"), vec![1u8]).unwrap();
+        std::fs::write(root.join("IZCMD.COM"), vec![1u8]).unwrap();
         assert!(!root.join("CONFIG.SYS").exists());
         assert!(!root.join("AUTOEXEC.BAT").exists());
 
         toka_dos_install(root, &files, InstallMode::Repair).unwrap();
 
-        assert!(root.join("DOS").join("ICOMMAND.COM").exists());
+        assert!(root.join("DOS").join("IZCMD.COM").exists());
         assert!(
-            !root.join("ICOMMAND.COM").exists(),
+            !root.join("IZCMD.COM").exists(),
             "Repair removes stale root system files"
         );
         assert_eq!(
@@ -7597,7 +7597,7 @@ mod tests {
     fn repair_leaves_unrelated_user_files_untouched() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let files = vec![("ICOMMAND.COM".to_string(), vec![1u8])];
+        let files = vec![("IZCMD.COM".to_string(), vec![1u8])];
         toka_dos_install(root, &files, InstallMode::Format).unwrap();
 
         let wolf_dir = root.join("GAMES").join("WOLF3D");
@@ -7618,7 +7618,7 @@ mod tests {
     fn repair_overwrites_stale_config_old() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let files = vec![("ICOMMAND.COM".to_string(), vec![1u8])];
+        let files = vec![("IZCMD.COM".to_string(), vec![1u8])];
         toka_dos_install(root, &files, InstallMode::Format).unwrap();
 
         std::fs::write(root.join("CONFIG.OLD"), b"REM stale").unwrap();
