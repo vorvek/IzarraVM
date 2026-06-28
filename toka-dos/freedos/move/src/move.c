@@ -30,6 +30,8 @@
 
 */
 
+/* Modified by the Toka-DOS project, 2026: rebranded product banner. */
+
 /* I N C L U D E S */
 /*----------------------------------------------------*/
 
@@ -559,7 +561,7 @@ static void do_move(const char *src_filename, const char *dest_filename)
 
 static void Usage(char switchch)
 {
-    PRINTF("%s " VERSION "\n", catgets(cat, 0,0,"Move"));
+    PRINTF("%s " VERSION "\n", catgets(cat, 0,0,"Toka-DOS MOVE"));
     PRINTF("%s\n",  catgets(cat, 0,1,"Moves a file/directory to another location."));
     PRINTF("%s\n",  catgets(cat, 0,2,"(C) 1997-2002 by Joe Cosentino"));
     PRINTF("%s\n\n",catgets(cat, 0,3,"(C) 2003-2004 by Imre Leber"));

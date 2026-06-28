@@ -17,6 +17,7 @@
 *    along with this program; if not, write to the Free Software
 *    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
 */
+/* Modified by the Toka-DOS project, 2026: rebranded banner. */
 #include <fcntl.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -182,7 +183,7 @@ usage(nl_catd cat)
     if (cat != cat) {}; /* avoid unused argument error in kitten */
 #endif
   
-    PRINTF("FreeDOS SORT v1.4\n");	/* *** VERSION *** */
+    PRINTF("Toka-DOS SORT 3.0 (FreeDOS v1.4)\n");	/* *** VERSION *** */
     if (err)
         PRINTF(catgets(cat, 2, 0, "Invalid parameter\n"));
     PRINTF(catgets(cat, 0, 0, "    SORT [/R] [/+num] [/A] [/?] [file]\n"));
