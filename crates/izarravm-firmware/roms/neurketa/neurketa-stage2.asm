@@ -19,6 +19,12 @@ SIEVE_SIZE    equ 8190
 SIEVE_SEG     equ 0x2000
 SIEVE_ITER    equ 40
 
+; x87 escape-time Mandelbrot over a 48x32 grid.
+MANDEL_COLS   equ 48
+MANDEL_ROWS   equ 32
+MANDEL_PIXELS equ 1536            ; 48 * 32
+MANDEL_MAXIT  equ 64
+
 start:
     cli
     cld
@@ -33,6 +39,8 @@ start:
     in  al, PORT_DATA          ; al = selector
     cmp al, 1
     je  .sieve
+    cmp al, 3
+    je  .fpmandel
 
     ; selector 0 or unknown: empty baseline, iterations 0, aux 0.
     xor ax, ax
@@ -42,6 +50,11 @@ start:
 .sieve:
     call sieve                 ; bx = prime count of the last pass
     mov ax, SIEVE_ITER         ; iterations
+    jmp report
+
+.fpmandel:
+    call fp_mandel             ; bx = 16-bit checksum of all pixel iter counts
+    mov ax, MANDEL_PIXELS      ; iterations = pixel count (1536)
     jmp report
 
 ; report: ax = iterations, bx = aux. Writes both as little-endian u32 (low word
@@ -120,6 +133,100 @@ sieve:
     jnz .pass
     pop bp
     ret
+
+; fp_mandel: x87 escape-time Mandelbrot over a 48x32 grid, maxiter 64. Returns
+; bx = 16-bit wrapping sum of the per-pixel iteration counts. Uses only base
+; x87 (no FCOMI/FCMOV) so it runs in both 486 and 586 mode. The complex values
+; live in memory dwords; the x87 stack never holds more than two entries and is
+; balanced on every path.
+;
+; GP register use: si = column c, di = row r, dx = per-pixel iter, bx = checksum.
+fp_mandel:
+    push bp
+    finit                          ; reset the x87 stack to a known state
+    xor bx, bx                     ; checksum = 0
+    xor di, di                     ; r = 0
+.row:
+    cmp di, MANDEL_ROWS
+    jae .done
+    ; cy = -1.0 + 0.0625 * r
+    mov [m_tmpw], di
+    fild word [m_tmpw]
+    fmul dword [c_step]
+    fadd dword [c_ybase]
+    fstp dword [m_cy]
+    xor si, si                     ; c = 0
+.col:
+    cmp si, MANDEL_COLS
+    jae .col_done
+    ; cx = -2.0 + 0.0625 * c
+    mov [m_tmpw], si
+    fild word [m_tmpw]
+    fmul dword [c_step]
+    fadd dword [c_xbase]
+    fstp dword [m_cx]
+    ; zx = 0.0, zy = 0.0
+    fldz
+    fst  dword [m_zx]
+    fstp dword [m_zy]
+    xor dx, dx                     ; iter = 0
+.iter:
+    cmp dx, MANDEL_MAXIT
+    jae .pixel_done
+    ; zx2 = zx*zx ; zy2 = zy*zy
+    fld  dword [m_zx]
+    fmul st0, st0
+    fstp dword [m_zx2]
+    fld  dword [m_zy]
+    fmul st0, st0
+    fstp dword [m_zy2]
+    ; if zx2 + zy2 > 4.0 break
+    fld  dword [m_zx2]
+    fadd dword [m_zy2]
+    fcomp dword [c_four]           ; compare (zx2+zy2) to 4.0, pop it
+    fnstsw ax
+    sahf
+    ja   .pixel_done               ; C0/C2/C3 -> above means magnitude^2 > 4
+    ; zy = 2.0*zx*zy + cy
+    fld  dword [c_two]
+    fmul dword [m_zx]
+    fmul dword [m_zy]
+    fadd dword [m_cy]
+    ; zx = zx2 - zy2 + cx  (compute before overwriting m_zy so old zy is used)
+    fld  dword [m_zx2]
+    fsub dword [m_zy2]
+    fadd dword [m_cx]
+    ; now store: st0 = new zx, st1 = new zy
+    fstp dword [m_zx]
+    fstp dword [m_zy]
+    inc dx
+    jmp .iter
+.pixel_done:
+    add bx, dx                     ; checksum += iter (16-bit wrapping)
+    inc si
+    jmp .col
+.col_done:
+    inc di
+    jmp .row
+.done:
+    pop bp
+    ret
+
+; x87 constants as IEEE-754 single dwords.
+c_step   dd 0.0625
+c_xbase  dd -2.0
+c_ybase  dd -1.0
+c_two    dd 2.0
+c_four   dd 4.0
+
+; Mandelbrot scratch (single-precision complex values + a word for FILD).
+m_tmpw   dw 0
+m_cx     dd 0.0
+m_cy     dd 0.0
+m_zx     dd 0.0
+m_zy     dd 0.0
+m_zx2    dd 0.0
+m_zy2    dd 0.0
 
 ; The image build pads to a 1.44 MiB floppy; stage 2 must fit the 16 loaded
 ; sectors (8192 bytes), which this comfortably does.
