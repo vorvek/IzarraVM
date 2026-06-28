@@ -84,6 +84,7 @@ def main():
              ("MOVE.EXE", move),
              ("SORT.EXE", sort),
              ("CONFIG.SYS", config_sys), ("AUTOEXEC.BAT", autoexec)]
+    assert len(files) <= ROOTENT, f"too many root entries: {len(files)} > {ROOTENT}"
 
     next_free = 2
     for slot, (fn, data) in enumerate(files):

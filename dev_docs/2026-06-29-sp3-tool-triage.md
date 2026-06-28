@@ -39,7 +39,7 @@ Everything else below is decided here but executed incrementally in later sub-pr
 
 ## Triage table
 
-43 source files in `toka-dos/tools/` (42 `.c` + 1 `.asm`) plus `izcmd/izcmd.c`.
+44 source files in `toka-dos/tools/` (43 `.c` + 1 `.asm`) plus `izcmd/izcmd.c` = 45 total.
 
 | Tool | File | Verdict | Reason |
 |---|---|---|---|
