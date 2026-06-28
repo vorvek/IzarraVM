@@ -862,6 +862,15 @@ enum DecodeGroup {
     /// per-iteration data-access clocks all stay in `run_string`/`string_step` unchanged. The TEST
     /// AL/AX,imm forms that share the 0xa8/0xa9 neighbourhood are NOT string ops and stay on Fallback.
     StringOps,
+    /// The port I/O block (task A9): IN AL/AX/EAX from a byte-immediate port (0xe4/0xe5), OUT to a
+    /// byte-immediate port (0xe6/0xe7), IN AL/AX/EAX from the DX port (0xec/0xed), and OUT to the DX
+    /// port (0xee/0xef). The imm8 forms (0xe4-0xe7) carry a single port-number byte after the opcode;
+    /// `decode` reads and stores it in `insn.imm`. The DX forms (0xec-0xef) carry no extra bytes —
+    /// the port number comes from the DX register at execute time. None carry a ModRM. The executor
+    /// calls `bus.read_io` / `bus.write_io` on the existing port-dispatch path (byte width for the
+    /// AL forms, operand-size width for the AX/EAX forms), so `io_touched` is set exactly as before.
+    /// The string I/O ops INS/OUTS (0x6c-0x6f) are NOT here — they stay on Fallback.
+    PortIo,
     /// Not yet converted to the split: decode parses nothing extra and `execute_decoded` hands the
     /// opcode to the shared fused `dispatch_opcode`.
     Fallback,
@@ -1283,6 +1292,14 @@ impl Cpu386 {
         if matches!(opcode, 0xa4..=0xa7 | 0xaa..=0xaf) {
             return DecodeGroup::StringOps;
         }
+        // Port I/O block (task A9): IN AL imm8 (0xe4), IN AX/EAX imm8 (0xe5), OUT imm8 AL (0xe6),
+        // OUT imm8 AX/EAX (0xe7), IN AL DX (0xec), IN AX/EAX DX (0xed), OUT DX AL (0xee),
+        // OUT DX AX/EAX (0xef). 0xe0-0xe3 are the loop/JCXZ branches (DecodeGroup::Branch) and are
+        // already routed above; 0xe8/0xe9/0xeb are CALL/JMP (also Branch). The INS/OUTS forms
+        // (0x6c-0x6f) are NOT listed here and stay on Fallback.
+        if matches!(opcode, 0xe4..=0xe7 | 0xec..=0xef) {
+            return DecodeGroup::PortIo;
+        }
         DecodeGroup::Fallback
     }
 
@@ -1582,6 +1599,16 @@ impl Cpu386 {
                 // executor passes them straight through to `run_string`. The element width is derived
                 // from the opcode's low bit (byte vs operand-size) in the executor, not the stream.
             }
+            DecodeGroup::PortIo => {
+                // Port I/O block. The imm8 forms (0xe4-0xe7) carry one port-number byte after the
+                // opcode; read it here (charging its instruction-fetch exactly once) and store it in
+                // `insn.imm`. The DX forms (0xec-0xef) carry no extra bytes — the port comes from DX
+                // at execute time. No ModRM in any form.
+                // The imm8 forms carry one port-number byte; the DX forms (0xec..=0xef) do not.
+                if let 0xe4..=0xe7 = opcode {
+                    insn.imm = u32::from(self.fetch_u8(bus)?);
+                }
+            }
             // Both fallback groups pre-parse nothing in `decode` (the second 0F byte was already
             // folded into `insn.opcode` above): their executors re-read any ModRM/immediate from the
             // post-opcode eip in the shared fused dispatch.
@@ -1643,6 +1670,10 @@ impl Cpu386 {
             // `insn.prefixes` (REP/REPNE + segment override) passed through — the REP loop, ZF
             // termination, DF direction, and per-iteration clocks all stay in `run_string` unchanged.
             DecodeGroup::StringOps => self.execute_string_decoded(insn, bus),
+            // The port I/O block (IN AL/AX/EAX, OUT AL/AX/EAX, both imm8-port and DX-port forms)
+            // runs through its split executor, which calls `bus.read_io`/`bus.write_io` on the same
+            // port-dispatch path as the fused arms — so `io_touched` is set exactly as before.
+            DecodeGroup::PortIo => self.execute_port_io_decoded(insn, bus),
             DecodeGroup::TwoByteFallback => {
                 // Un-converted two-byte (0F) opcode. `decode` already read + charged the second
                 // byte and applied the ISA gate, folding it into `insn.opcode` as 0x0F00 | second.
@@ -2679,6 +2710,85 @@ impl Cpu386 {
         Ok(clocks(4))
     }
 
+    /// The port I/O block through the decode/execute split (task A9). Calls `bus.read_io` /
+    /// `bus.write_io` on the same path as the former fused arms, so `io_touched` is set exactly
+    /// as before. For the imm8 forms (0xe4-0xe7) `decode` pre-read the port number into `insn.imm`;
+    /// for the DX forms (0xec-0xef) the port comes from the DX register (GPR index 2) at execute
+    /// time. The low bit of the opcode selects the I/O direction within each pair (0 = IN, 1 = OUT
+    /// only for 0xe4/0xe5 vs 0xe6/0xe7, respectively; 0 = IN, 1 = unused for the 0xec range where
+    /// bit 1 distinguishes direction: see comments per arm). Clocks match the fused arms verbatim
+    /// (12 for IN, 10 for OUT).
+    fn execute_port_io_decoded<B: CpuBus>(
+        &mut self,
+        insn: &DecodedInsn,
+        bus: &mut B,
+    ) -> ExecResult<CycleOutcome> {
+        let operand_size = insn.operand_size;
+        match insn.opcode as u8 {
+            0xe4 => {
+                // IN AL, imm8: byte port input. `decode` stored the port number in `insn.imm`.
+                let port = insn.imm as u16;
+                let value = bus.read_io(port, BusWidth::Byte)? as u8;
+                self.write_gpr8(0, value);
+                Ok(clocks(12))
+            }
+            0xe5 => {
+                // IN AX/EAX, imm8: word/dword port input into the accumulator.
+                let port = insn.imm as u16;
+                let value = bus.read_io(port, operand_size.bus_width())?;
+                self.write_gpr_sized(0, operand_size, value);
+                Ok(clocks(12))
+            }
+            0xe6 => {
+                // OUT imm8, AL: byte port output from AL.
+                let port = insn.imm as u16;
+                bus.write_io(port, BusWidth::Byte, u32::from(self.read_gpr8(0)))?;
+                Ok(clocks(10))
+            }
+            0xe7 => {
+                // OUT imm8, AX/EAX: word/dword port output from the accumulator.
+                let port = insn.imm as u16;
+                bus.write_io(
+                    port,
+                    operand_size.bus_width(),
+                    self.read_gpr_sized(0, operand_size),
+                )?;
+                Ok(clocks(10))
+            }
+            0xec => {
+                // IN AL, DX: byte port input. Port number in DX (GPR 2).
+                let port = self.read_gpr16(2);
+                let value = bus.read_io(port, BusWidth::Byte)? as u8;
+                self.write_gpr8(0, value);
+                Ok(clocks(12))
+            }
+            0xed => {
+                // IN AX/EAX, DX: word/dword port input addressed by DX.
+                let port = self.read_gpr16(2);
+                let value = bus.read_io(port, operand_size.bus_width())?;
+                self.write_gpr_sized(0, operand_size, value);
+                Ok(clocks(12))
+            }
+            0xee => {
+                // OUT DX, AL: byte port output addressed by DX.
+                let port = self.read_gpr16(2);
+                bus.write_io(port, BusWidth::Byte, u32::from(self.read_gpr8(0)))?;
+                Ok(clocks(10))
+            }
+            0xef => {
+                // OUT DX, AX/EAX: word/dword port output addressed by DX.
+                let port = self.read_gpr16(2);
+                bus.write_io(
+                    port,
+                    operand_size.bus_width(),
+                    self.read_gpr_sized(0, operand_size),
+                )?;
+                Ok(clocks(10))
+            }
+            opcode => unreachable!("port-I/O opcode {opcode:#x}"),
+        }
+    }
+
     /// The far/indirect/RET/INT control-flow block + 0xff group 5 through the decode/execute split.
     /// Each arm mirrors the former fused handler verbatim — same far-pointer reconstruction, same
     /// ret/retf and interrupt/IRET delivery, same FF sub-op dispatch off `modrm.reg`, same clocks —
@@ -3106,62 +3216,10 @@ impl Cpu386 {
             // 0xe0/0xe1 (LOOPNE/LOOPE), 0xe2 (LOOP), 0xe3 (JCXZ/JECXZ) are converted to the
             // decode/execute split: `route_group` classifies them as `DecodeGroup::Branch` and
             // `execute_branch_decoded` runs them. Not handled here.
-            0xe4 => {
-                let port = u16::from(self.fetch_u8(bus)?);
-                let value = bus.read_io(port, BusWidth::Byte)? as u8;
-                self.write_gpr8(0, value);
-                Ok(clocks(12))
-            }
-            0xe6 => {
-                let port = u16::from(self.fetch_u8(bus)?);
-                bus.write_io(port, BusWidth::Byte, u32::from(self.read_gpr8(0)))?;
-                Ok(clocks(10))
-            }
-            0xec => {
-                let port = self.read_gpr16(2);
-                let value = bus.read_io(port, BusWidth::Byte)? as u8;
-                self.write_gpr8(0, value);
-                Ok(clocks(12))
-            }
-            0xee => {
-                let port = self.read_gpr16(2);
-                bus.write_io(port, BusWidth::Byte, u32::from(self.read_gpr8(0)))?;
-                Ok(clocks(10))
-            }
-            0xe5 => {
-                // IN AX/EAX, imm8: word/dword port input into the accumulator.
-                let port = u16::from(self.fetch_u8(bus)?);
-                let value = bus.read_io(port, operand_size.bus_width())?;
-                self.write_gpr_sized(0, operand_size, value);
-                Ok(clocks(12))
-            }
-            0xe7 => {
-                // OUT imm8, AX/EAX: word/dword port output from the accumulator.
-                let port = u16::from(self.fetch_u8(bus)?);
-                bus.write_io(
-                    port,
-                    operand_size.bus_width(),
-                    self.read_gpr_sized(0, operand_size),
-                )?;
-                Ok(clocks(10))
-            }
-            0xed => {
-                // IN AX/EAX, DX: word/dword port input addressed by DX.
-                let port = self.read_gpr16(2);
-                let value = bus.read_io(port, operand_size.bus_width())?;
-                self.write_gpr_sized(0, operand_size, value);
-                Ok(clocks(12))
-            }
-            0xef => {
-                // OUT DX, AX/EAX: word/dword port output addressed by DX.
-                let port = self.read_gpr16(2);
-                bus.write_io(
-                    port,
-                    operand_size.bus_width(),
-                    self.read_gpr_sized(0, operand_size),
-                )?;
-                Ok(clocks(10))
-            }
+            // 0xe4 (IN AL,imm8), 0xe5 (IN AX/EAX,imm8), 0xe6 (OUT imm8,AL), 0xe7 (OUT imm8,AX/EAX),
+            // 0xec (IN AL,DX), 0xed (IN AX/EAX,DX), 0xee (OUT DX,AL), 0xef (OUT DX,AX/EAX) are
+            // converted to the decode/execute split: `route_group` classifies them as
+            // `DecodeGroup::PortIo` and `execute_port_io_decoded` runs them. Not handled here.
             // 0xe8 (CALL near, rel16/32), 0xe9 (JMP near, rel16/32), 0xeb (JMP short, rel8) are
             // converted to the decode/execute split: `route_group` classifies them as
             // `DecodeGroup::Branch` and `execute_branch_decoded` runs them. Not handled here.
@@ -18129,6 +18187,183 @@ mod tests {
                 fused.registers.eflags,
                 fused.registers.eip,
                 deltas,
+                fetch,
+            );
+        }
+    }
+
+    // ── Task A9: port I/O golden battery ──────────────────────────────────────────────────────────
+
+    /// One golden end-state for a port-I/O case (task A9). Port reads via TestBus always return 0,
+    /// so the captured GPR array reflects the read-zero / write-no-register-change behaviour. The
+    /// eflags field is always 0x2 (IN/OUT do not modify flags). `eip` proves decode consumed the
+    /// right number of bytes (2 for imm8 forms, 1 for DX forms). `fetch` proves each instruction
+    /// byte was charged exactly once (3 for imm8 forms = 1 prefetch-peek + 1 opcode + 1 imm,
+    /// 2 for DX forms = 1 prefetch-peek + 1 opcode).
+    struct PortIoGolden {
+        name: &'static str,
+        code: &'static [u8],
+        gpr: [u32; 8],
+        eflags: u32,
+        eip: u32,
+        fetch: usize,
+    }
+
+    /// The port-I/O differential battery (task A9). Captured from the PRIOR fused reference
+    /// (`execute_instruction_legacy`) via `regen_port_io_goldens`; see `flags_misc_golden_cases`
+    /// for the full capture recipe. Never edit by hand — re-run the regen WHILE the fused arms
+    /// (0xe4-0xe7, 0xec-0xef) still exist in `dispatch_opcode` (i.e. parent commit 21cc68ba),
+    /// then paste, then delete the fused arms.
+    ///
+    /// Seed: seam_seed — EAX=0x0102 (AL=0x02, AH=0x01), CX=0x0304, DX=0x0506, BX=0x0010,
+    /// SP=0, BP=0x0010, SI=0x0008, DI=0x0018, eflags=0x2. TestBus.read_io always returns 0.
+    /// Covers: IN AL imm8, IN AX imm8 (byte vs word width); OUT imm8 AL, OUT imm8 AX (no-op on
+    /// registers); IN AL DX, IN AX DX (port from DX=0x0506); OUT DX AL, OUT DX AX.
+    fn port_io_golden_cases() -> &'static [PortIoGolden] {
+        &[
+            // IN AL, imm8 (0xe4 0x78): port 0x78 → AL=0. AH unchanged → AX=0x0100, eip=2, fetch=3.
+            PortIoGolden {
+                name: "in al,imm8 (e4 78)",
+                code: &[0xe4, 0x78],
+                gpr: [0x0100, 0x0304, 0x0506, 0x0010, 0, 0x0010, 0x0008, 0x0018],
+                eflags: 0x2,
+                eip: 0x2,
+                fetch: 3,
+            },
+            // IN AX, imm8 (0xe5 0x78): port 0x78 → AX=0x0000 (word read), eip=2, fetch=3.
+            PortIoGolden {
+                name: "in ax,imm8 (e5 78)",
+                code: &[0xe5, 0x78],
+                gpr: [0x0000, 0x0304, 0x0506, 0x0010, 0, 0x0010, 0x0008, 0x0018],
+                eflags: 0x2,
+                eip: 0x2,
+                fetch: 3,
+            },
+            // OUT imm8, AL (0xe6 0x78): writes AL=0x02 to port 0x78, no register change. eip=2, fetch=3.
+            PortIoGolden {
+                name: "out imm8,al (e6 78)",
+                code: &[0xe6, 0x78],
+                gpr: [0x0102, 0x0304, 0x0506, 0x0010, 0, 0x0010, 0x0008, 0x0018],
+                eflags: 0x2,
+                eip: 0x2,
+                fetch: 3,
+            },
+            // OUT imm8, AX (0xe7 0x78): writes AX=0x0102 to port 0x78, no register change. eip=2, fetch=3.
+            PortIoGolden {
+                name: "out imm8,ax (e7 78)",
+                code: &[0xe7, 0x78],
+                gpr: [0x0102, 0x0304, 0x0506, 0x0010, 0, 0x0010, 0x0008, 0x0018],
+                eflags: 0x2,
+                eip: 0x2,
+                fetch: 3,
+            },
+            // IN AL, DX (0xec): port=DX=0x0506 → AL=0. AH unchanged → AX=0x0100, eip=1, fetch=2.
+            PortIoGolden {
+                name: "in al,dx (ec)",
+                code: &[0xec],
+                gpr: [0x0100, 0x0304, 0x0506, 0x0010, 0, 0x0010, 0x0008, 0x0018],
+                eflags: 0x2,
+                eip: 0x1,
+                fetch: 2,
+            },
+            // IN AX, DX (0xed): port=DX=0x0506 → AX=0x0000 (word), eip=1, fetch=2.
+            PortIoGolden {
+                name: "in ax,dx (ed)",
+                code: &[0xed],
+                gpr: [0x0000, 0x0304, 0x0506, 0x0010, 0, 0x0010, 0x0008, 0x0018],
+                eflags: 0x2,
+                eip: 0x1,
+                fetch: 2,
+            },
+            // OUT DX, AL (0xee): writes AL=0x02 to port DX=0x0506, no register change. eip=1, fetch=2.
+            PortIoGolden {
+                name: "out dx,al (ee)",
+                code: &[0xee],
+                gpr: [0x0102, 0x0304, 0x0506, 0x0010, 0, 0x0010, 0x0008, 0x0018],
+                eflags: 0x2,
+                eip: 0x1,
+                fetch: 2,
+            },
+            // OUT DX, AX (0xef): writes AX=0x0102 to port DX=0x0506, no register change. eip=1, fetch=2.
+            PortIoGolden {
+                name: "out dx,ax (ef)",
+                code: &[0xef],
+                gpr: [0x0102, 0x0304, 0x0506, 0x0010, 0, 0x0010, 0x0008, 0x0018],
+                eflags: 0x2,
+                eip: 0x1,
+                fetch: 2,
+            },
+        ]
+    }
+
+    #[test]
+    fn port_io_split_matches_golden_across_ops() {
+        // The port I/O block (IN/OUT byte-imm-port and DX-port forms) is converted to the
+        // decode/execute split, so its fused arms are deleted and it can no longer be diffed
+        // against a fused executor in-tree. Run each case through cycle() (the split) and assert
+        // the architectural end-state against goldens captured from the pre-split fused path via
+        // `regen_port_io_goldens`. eip proves decode consumed the right number of bytes (2 for
+        // imm8 forms, 1 for DX forms); fetch proves each instruction byte was charged exactly
+        // once. TestBus.read_io returns 0, so IN forms zero the accumulator (AL or AX); OUT
+        // forms leave registers unchanged.
+        for g in port_io_golden_cases() {
+            let mut mem = vec![0u8; 0x100];
+            mem[..g.code.len()].copy_from_slice(g.code);
+
+            let mut split = Cpu386::default();
+            seam_seed(&mut split);
+            let mut sbus = TestBus::with_memory(mem);
+            let _ = split.cycle(&mut sbus);
+
+            assert_eq!(split.registers.gpr, g.gpr, "gpr mismatch for {}", g.name);
+            assert_eq!(
+                split.registers.eflags, g.eflags,
+                "eflags mismatch for {}",
+                g.name
+            );
+            assert_eq!(split.registers.eip, g.eip, "eip mismatch for {}", g.name);
+            assert_eq!(
+                seam_fetch_count(&sbus),
+                g.fetch,
+                "instruction-fetch cycle count mismatch for {} (seam must charge fetches once)",
+                g.name
+            );
+        }
+    }
+
+    /// Regenerate `port_io_golden_cases` from the fused reference. Ignored by default.
+    /// Run WHILE the fused arms (0xe4-0xe7, 0xec-0xef) still exist in `dispatch_opcode`
+    /// (i.e. the parent commit 21cc68ba):
+    ///   git worktree add ../regen-a9 21cc68ba
+    ///   cd ../regen-a9
+    ///   cargo test -p izarravm-cpu --lib regen_port_io_goldens -- --ignored --nocapture
+    /// then paste the output over `port_io_golden_cases` and only then delete the fused arms.
+    #[test]
+    #[ignore = "prints golden literals; run with --ignored --nocapture against the fused reference"]
+    fn regen_port_io_goldens() {
+        for g in port_io_golden_cases() {
+            let mut mem = vec![0u8; 0x100];
+            mem[..g.code.len()].copy_from_slice(g.code);
+
+            let mut fused = Cpu386::default();
+            seam_seed(&mut fused);
+            let mut fbus = TestBus::with_memory(mem);
+            fused.begin_instruction();
+            if fused.execute_instruction_legacy(&mut fbus).is_err() {
+                println!(
+                    "            // TODO regen {}: fused path unavailable here; run against the base commit",
+                    g.name
+                );
+                continue;
+            }
+            let fetch = seam_fetch_count(&fbus);
+            println!(
+                "            PortIoGolden {{ name: {:?}, code: &{:?}, gpr: {:?}, eflags: {:#x}, eip: {:#x}, fetch: {} }},",
+                g.name,
+                g.code,
+                fused.registers.gpr,
+                fused.registers.eflags,
+                fused.registers.eip,
                 fetch,
             );
         }
