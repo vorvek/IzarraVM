@@ -24,6 +24,7 @@ min_x           dw 0
 max_x           dw VIRT_MAX_X
 min_y           dw 0
 max_y           dw VIRT_MAX_Y
+scr_max_y       dw VIRT_MAX_Y        ; vertical virtual max for the active video mode
 press_cnt       times 3 dw 0
 release_cnt     times 3 dw 0
 press_x         times 3 dw 0
@@ -100,13 +101,58 @@ int33:
     je m_cond_off
     jmp x33_high
 
+; Size the vertical virtual range to the active BIOS video mode (BDA 40:49). The
+; INT 33h coordinate system is 0..639 x 0..(rows-1): text and 200-line modes use
+; 0..199, the 640x350 EGA modes 0..349, and the 640x480 VGA modes 0..479. Without
+; this a high-res mode (BGI sets 0x12) leaves the cursor clamped to the top 199
+; rows. Sets scr_max_y/max_y/cond_bottom and reclamps the cursor. Preserves ALL.
+apply_mode_yrange:
+    push ax
+    push bx
+    push es
+    mov ax, 0x40
+    mov es, ax
+    mov al, [es:0x49]                  ; current video mode
+    and al, 0x7F                       ; drop the no-clear flag bit
+    mov bx, VIRT_MAX_Y                 ; default 199 (text + 200-line modes)
+    cmp al, 0x0F
+    je .y349
+    cmp al, 0x10
+    je .y349
+    cmp al, 0x11
+    je .y479
+    cmp al, 0x12
+    je .y479
+    jmp .store
+.y349:
+    mov bx, 349
+    jmp .store
+.y479:
+    mov bx, 479
+.store:
+    mov [cs:scr_max_y], bx
+    mov [cs:max_y], bx
+    mov [cs:cond_bottom], bx
+    mov ax, [cs:cur_y]                 ; reclamp the cursor into the new range
+    cmp ax, bx
+    jbe .done
+    mov [cs:cur_y], bx
+.done:
+    pop es
+    pop bx
+    pop ax
+    ret
+
 ; 0x00 reset and status. Re-centre, hide, clear edge counters and their saved
 ; positions, drop the callback and the re-entrancy guard, and report installed
 ; (AX=0xFFFF) with two buttons. Returns AX,BX; preserves CX,DX,SI,DI.
 m_reset:
     call cursor_hide                   ; restore any drawn cell before clearing state
     mov word [cs:cur_x], CENTER_X
-    mov word [cs:cur_y], CENTER_Y
+    call apply_mode_yrange             ; size the vertical range to the video mode
+    mov ax, [cs:scr_max_y]
+    shr ax, 1
+    mov [cs:cur_y], ax                 ; centre vertically in the active range
     mov word [cs:show_count], 0xFFFF
     mov byte [cs:buttons], 0
     mov word [cs:press_cnt], 0
@@ -303,9 +349,9 @@ m_set_vrange:
     jge .lo_ok
     xor ax, ax
 .lo_ok:
-    cmp bx, VIRT_MAX_Y
+    cmp bx, [cs:scr_max_y]
     jle .hi_ok
-    mov bx, VIRT_MAX_Y
+    mov bx, [cs:scr_max_y]
 .hi_ok:
     mov [cs:min_y], ax
     mov [cs:max_y], bx
