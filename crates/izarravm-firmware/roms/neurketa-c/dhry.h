@@ -76,7 +76,7 @@
  *  IzarraVM adaptation note (not part of the original Dhrystone):
  *
  *  This is the unmodified Dhrystone 2.1 measurement loop, repackaged to run
- *  freestanding as an Open Watcom .COM under the IzarraVM harness. There is no
+ *  freestanding as an Open Watcom .EXE under the IzarraVM harness. There is no
  *  C runtime: all timing, malloc, printf and scanf have been removed, the two
  *  records are static, the run count is fixed, and the program reports a
  *  16-bit self-check fold to the Lotura unit-tester device instead of printing.
