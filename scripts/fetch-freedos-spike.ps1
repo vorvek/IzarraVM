@@ -1,21 +1,25 @@
-# Fetches a known-good prebuilt bootable FreeDOS 1.44MB floppy image for the SP-1
-# boot spike. The image is a dev-local GPL FreeDOS artifact, never committed.
+# Fetches a prebuilt FreeDOS 1.44MB floppy image for the SP-1 boot spike and
+# saves it as the RAW installer image.  The image is a dev-local GPL FreeDOS
+# artifact, never committed.  After running this script, run
+# scripts/prep-freedos-spike.py to produce the bootable freedos-spike.img used
+# by the smoke test.
 # Override the source if the FreeDOS download layout changes:
 #   $env:FREEDOS_SPIKE_URL  -> a .zip of floppy images to download (default below)
 #   $env:FREEDOS_SPIKE_SRC  -> a local .zip or .img to use instead of downloading
+# NOTE: update $Url if FreeDOS changes its release layout or version.
 $ErrorActionPreference = 'Stop'
 
 $Url  = if ($env:FREEDOS_SPIKE_URL) { $env:FREEDOS_SPIKE_URL }
-        else { 'https://www.ibiblio.org/pub/micro/pc-stuff/freedos/files/distributions/1.3/FD13-FloppyEdition.zip' }
+        else { 'https://www.ibiblio.org/pub/micro/pc-stuff/freedos/files/distributions/1.4/FD14-FloppyEdition.zip' }
 $Dest = Join-Path $PSScriptRoot '..\.local\freedos'
-$Img  = Join-Path $Dest 'freedos-spike.img'
+$Img  = Join-Path $Dest 'freedos-raw.img'
 $Size = 1474560   # 1.44MB floppy: 80 cyl x 2 heads x 18 sec x 512 b
 
 New-Item -ItemType Directory -Force -Path $Dest | Out-Null
 
 if ((Test-Path $Img -PathType Leaf) -and ((Get-Item $Img).Length -eq $Size)) {
     Write-Host "Already present: $Img"
-    Write-Host "Set IZARRAVM_FREEDOS_SPIKE_IMG=$Img"
+    Write-Host "Next: run scripts/prep-freedos-spike.py to produce the bootable freedos-spike.img"
     exit 0
 }
 
@@ -48,5 +52,5 @@ if ($src -like '*.img' -or $src -like '*.ima') {
 Remove-Item -Recurse -Force $work
 $len = (Get-Item $Img).Length
 if ($len -ne $Size) { throw "Image is $len bytes, expected $Size." }
-Write-Host "FreeDOS spike image ready: $Img ($len bytes)"
-Write-Host "Set IZARRAVM_FREEDOS_SPIKE_IMG=$Img for the smoke test."
+Write-Host "FreeDOS RAW installer image ready: $Img ($len bytes)"
+Write-Host "Next: run scripts/prep-freedos-spike.py to produce the bootable freedos-spike.img."

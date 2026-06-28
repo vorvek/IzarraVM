@@ -736,10 +736,10 @@ mod sp1_smoke {
     use super::*;
     use izarravm_machine::StopReason;
 
-    /// The prebuilt FreeDOS floppy produced by scripts/fetch-freedos-spike.ps1.
+    /// The prebuilt FreeDOS floppy produced by scripts/prep-freedos-spike.py.
     fn spike_image() -> Vec<u8> {
         let path = std::env::var("IZARRAVM_FREEDOS_SPIKE_IMG")
-            .expect("set IZARRAVM_FREEDOS_SPIKE_IMG (run scripts/fetch-freedos-spike.ps1)");
+            .expect("set IZARRAVM_FREEDOS_SPIKE_IMG (run scripts/prep-freedos-spike.py (uses the local FreeDOS disks or fetch-freedos-spike.ps1's raw image) and set IZARRAVM_FREEDOS_SPIKE_IMG)");
         std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"))
     }
 
@@ -757,7 +757,7 @@ mod sp1_smoke {
     }
 
     #[test]
-    #[ignore = "needs IZARRAVM_FREEDOS_SPIKE_IMG (run scripts/fetch-freedos-spike.ps1)"]
+    #[ignore = "needs IZARRAVM_FREEDOS_SPIKE_IMG (run scripts/prep-freedos-spike.py (uses the local FreeDOS disks or fetch-freedos-spike.ps1's raw image) and set IZARRAVM_FREEDOS_SPIKE_IMG)"]
     fn sp1_freedos_boots_to_prompt() {
         let (machine, stop) = boot(spike_image(), 500_000_000);
 
