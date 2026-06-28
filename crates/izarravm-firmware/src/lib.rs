@@ -14,6 +14,14 @@ pub const TYPE_COM: &[u8] = include_bytes!("../roms/dos/type.com");
 pub const TYPE_COM_SOURCE: &str = include_str!("../roms/dos/type.asm");
 pub const EXEHELLO_EXE: &[u8] = include_bytes!("../roms/dos/exehello.exe");
 pub const EXEHELLO_EXE_SOURCE: &str = include_str!("../roms/dos/exehello.asm");
+/// The freestanding Dhrystone 2.1 benchmark, built as a small-model DOS .EXE.
+/// It carries no C runtime: the records are static, the run count is fixed at
+/// 10000, and the result is a 16-bit self-check fold reported to the Lotura
+/// unit-tester device. Load it with `Machine::new_dos_program` and read the
+/// result back with `Machine::bench_iterations` (10000) and `bench_aux` (the
+/// fold). It is a .EXE rather than a .COM so the MZ relocations place its global
+/// variables in the data segment instead of overwriting the code.
+pub const DHRYSTONE_EXE: &[u8] = include_bytes!("../roms/neurketa-c/dhrystone.exe");
 pub const KBD_BIOS: &[u8] = include_bytes!("../roms/kbd-bios.bin");
 pub const KBD_BIOS_SOURCE: &str = include_str!("../roms/kbd-bios.asm");
 pub const KBD_RESIDENT_BIOS: &[u8] = include_bytes!("../roms/kbd-resident.bin");
@@ -208,6 +216,10 @@ pub fn echo_com() -> &'static [u8] {
 
 pub fn exehello_exe() -> &'static [u8] {
     EXEHELLO_EXE
+}
+
+pub fn dhrystone_exe() -> &'static [u8] {
+    DHRYSTONE_EXE
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -624,5 +636,10 @@ mod tests {
         // e_crlc at offset 6: at least one relocation, the load-bearing DS load.
         let e_crlc = u16::from_le_bytes([EXEHELLO_EXE[6], EXEHELLO_EXE[7]]);
         assert!(e_crlc >= 1, "fixture must carry a relocation, got {e_crlc}");
+    }
+
+    #[test]
+    fn dhrystone_exe_starts_with_mz() {
+        assert_eq!(&dhrystone_exe()[0..2], &[0x4D, 0x5A]);
     }
 }
