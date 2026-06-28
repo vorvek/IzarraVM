@@ -17,4 +17,14 @@ Rebuild:
     nasm -f bin -I . neurketa-stage2.asm -o stage2.bin
 
 then concatenate boot.bin (offset 0) and stage2.bin (offset 512) into a
-1,474,560-byte neurketa.img (see the plan for the PowerShell step).
+1,474,560-byte neurketa.img:
+
+```powershell
+$boot = [IO.File]::ReadAllBytes("boot.bin")
+$stage2 = [IO.File]::ReadAllBytes("stage2.bin")
+$img = New-Object byte[] 1474560
+[Array]::Copy($boot, 0, $img, 0, 512)
+[Array]::Copy($stage2, 0, $img, 512, $stage2.Length)
+[IO.File]::WriteAllBytes("neurketa.img", $img)
+Remove-Item boot.bin, stage2.bin
+```
