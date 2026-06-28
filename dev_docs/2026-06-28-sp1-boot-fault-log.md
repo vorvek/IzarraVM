@@ -121,6 +121,38 @@ the prompt was already visible.  CS:IP = `F000:48E2` (BIOS idle HLT loop).
 
 ---
 
+## Secondary criterion (typed input) — DEFERRED, root cause found
+
+The secondary smoke test `sp1_freedos_runs_injected_ver` injects `ver\r` at the
+prompt and asserts the command echoes (`a:\>ver`). It currently **fails by
+design** and is kept `#[ignore]`d as an executable spec for a follow-up.
+
+The keyboard **delivery** chain was traced end-to-end and is **provably correct**:
+
+- PIC: master IMR=0x00 (IRQ1 unmasked by FreeDOS at boot), ICW2 base 0x08
+  (IRQ1 → INT 09h), IF set, IRQ0 timer firing.
+- INT 09h fires on injection. IVT: INT 09h = `0070:0016` (FreeDOS installed its
+  own ISR), INT 16h = `f000:48e2` (our shipped BIOS).
+- BDA ring (0x41E) fills with the correct scancode:ASCII pairs for `ver\r`;
+  head/tail advance via the BIOS enqueue.
+- The guest's INT 16h read consumes the ring and returns the right `AX`
+  (e.g. `2f76` for 'v').
+
+The break is **inside the real FreeDOS kernel's interactive readline**: it reads
+each delivered key but never echoes or builds the command line — no INT 10h, no
+INT 29h, no INT 21h dispatch after Enter. Leading hypothesis: the kernel reports
+STDIN/STDOUT as **non-character-devices** (INT 21h AH=44 / 4400h IOCTL), so
+FreeCOM reads non-interactively (no echo). This is real FreeDOS-kernel-level work,
+not a minimal keyboard fix, so it is deferred past SP-1.
+
+Recommended follow-up (for SP-2 or a dedicated console sub-task):
+- Hook the guest's first INT 21h AH=0Ah at the prompt and single-step the
+  kernel readline to find where the returned char is dropped.
+- Check INT 21h AH=4400h for handles 0/1 in this boot — if STDIN/STDOUT are
+  reported non-character, that matches every symptom.
+- Confirm whether our HLE-intercepted INT 10h leaves the kernel's char-I/O path
+  in an unexpected state (INT 10h trampoline is `ff00:0000`).
+
 ## Note for SP-2
 
 The shipped image should be built from vendored FreeDOS source with a proper
