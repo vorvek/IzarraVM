@@ -851,6 +851,10 @@ impl Cpu386 {
     /// zero. This is the single per-mode timing dial; it feeds both the CPU's
     /// own clock counter and, through the returned CycleOutcome, the machine's
     /// device timing.
+    ///
+    /// May return 0 for a cheap op in a faster mode; that is safe because the
+    /// remainder carry guarantees a clock tick within a few instructions and the
+    /// machine's batch loop advances on instruction progress, not on clocks alone.
     fn scale_clocks(&mut self, clocks: u32) -> u64 {
         let (num, den) = level_timing(self.level);
         let scaled = u64::from(clocks) * u64::from(num) + self.timing_rem;
