@@ -749,9 +749,7 @@ mod sp1_smoke {
             izarravm_firmware::izarra_bios(),
         )
         .expect("build machine");
-        machine
-            .mount_floppy(image)
-            .expect("mount 1.44MB floppy");
+        machine.mount_floppy(image).expect("mount 1.44MB floppy");
         let stop = machine
             .run_until_halt_or_cycles(cycles)
             .expect("run machine");
@@ -774,6 +772,30 @@ mod sp1_smoke {
         assert!(
             text.contains(":\\>"),
             "no DOS prompt on screen (stop={stop:?}).\n--- screen ---\n{text}\n--- end screen ---"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs IZARRAVM_FREEDOS_SPIKE_IMG (run scripts/fetch-freedos-spike.ps1)"]
+    fn sp1_freedos_runs_injected_ver() {
+        // Boot to the interactive prompt first.
+        let (mut machine, _stop) = boot(spike_image(), 500_000_000);
+
+        // Type `ver` + Enter through the real keyboard path (lowercase: DOS is
+        // case-insensitive; ascii_to_set1 covers lowercase letters and CR).
+        for ch in "ver\r".chars() {
+            for code in ascii_to_set1(ch) {
+                machine.inject_key_scancodes(&[code]);
+            }
+            machine
+                .run_until_halt_or_cycles(5_000_000)
+                .expect("type key");
+        }
+
+        let text = machine.screen_text().as_text().to_ascii_lowercase();
+        assert!(
+            text.contains("version") || text.contains("dos"),
+            "VER produced no version banner.\n--- screen ---\n{text}\n--- end screen ---"
         );
     }
 }
