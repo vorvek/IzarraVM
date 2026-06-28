@@ -802,6 +802,12 @@ enum DecodeGroup {
     /// convention exists: `decode` folds the second opcode byte into `insn.opcode` as 0x0F00 |
     /// second, so `route_group` can classify them and the executor can pre-parse their ModRM.
     DataMove,
+    /// The stack block: PUSH/POP reg (0x50-0x5f), PUSH/POP seg (0x06/0x07/0x0e/0x16/0x17/
+    /// 0x1e/0x1f), PUSH imm (0x68/0x6a), POP r/m (0x8f), PUSHA/POPA (0x60/0x61),
+    /// PUSHF/POPF (0x9c/0x9d), ENTER/LEAVE (0xc8/0xc9). `decode` reads the ModRM (for 0x8f)
+    /// or the immediate bytes (for 0x68/0x6a/0xc8) and stores them; the executor re-uses
+    /// pre-parsed values so no instruction bytes are re-fetched.
+    Stack,
     /// Not yet converted to the split: decode parses nothing extra and `execute_decoded` hands the
     /// opcode to the shared fused `dispatch_opcode`.
     Fallback,
@@ -1151,6 +1157,16 @@ impl Cpu386 {
         ) {
             return DecodeGroup::DataMove;
         }
+        // Stack block: PUSH/POP reg, PUSH/POP seg, PUSH imm, POP r/m, PUSHA/POPA,
+        // PUSHF/POPF, ENTER/LEAVE. 0xFF (group 5, which includes PUSH r/m /6) is a
+        // separate multi-sub-op group handled as a unit by task A5 — do NOT list it here.
+        if matches!(
+            opcode,
+            0x06 | 0x07 | 0x0e | 0x16 | 0x17 | 0x1e | 0x1f | 0x50
+                ..=0x5f | 0x60 | 0x61 | 0x68 | 0x6a | 0x8f | 0x9c | 0x9d | 0xc8 | 0xc9
+        ) {
+            return DecodeGroup::Stack;
+        }
         DecodeGroup::Fallback
     }
 
@@ -1290,6 +1306,42 @@ impl Cpu386 {
                     _ => {}
                 }
             }
+            DecodeGroup::Stack => {
+                // Stack block. Most opcodes carry no extra encoded bytes; only four sub-cases
+                // fetch operand bytes here (all others are either register-encoded or implied).
+                match insn.opcode as u8 {
+                    // 0x68 PUSH imm16/32: fetch the full-width immediate; executor pushes it.
+                    0x68 => {
+                        insn.imm = self.fetch_immediate(bus, operand_size)?;
+                    }
+                    // 0x6a PUSH imm8: fetch one byte; executor sign-extends to operand width.
+                    0x6a => {
+                        insn.imm = u32::from(self.fetch_u8(bus)?);
+                    }
+                    // 0x8f POP r/m (group 1A): fetch ModRM + addressing descriptor. For
+                    // reg!=0 (undefined encoding) leave `operand` as None so the executor can
+                    // re-detect the bad reg field and raise the identical error with the same
+                    // bytes consumed (mirrors the group-11 approach in DataMove).
+                    0x8f => {
+                        let modrm = self.fetch_modrm(bus)?;
+                        insn.modrm = Some(modrm);
+                        if modrm.reg == 0 {
+                            let operand =
+                                self.parse_addressing_mode(bus, prefixes, address_size, modrm)?;
+                            insn.operand = Some(operand);
+                        }
+                    }
+                    // 0xc8 ENTER imm16, imm8: frame size into `imm`, nesting level into `imm2`
+                    // (masked to 5 bits here so the executor doesn't have to repeat it).
+                    0xc8 => {
+                        insn.imm = u32::from(self.fetch_u16(bus)?);
+                        insn.imm2 = u32::from(self.fetch_u8(bus)? & 0x1f);
+                    }
+                    // All other stack opcodes (PUSH/POP reg, PUSH/POP seg, PUSHA/POPA,
+                    // PUSHF/POPF, LEAVE) carry no extra encoded bytes.
+                    _ => {}
+                }
+            }
             // Both fallback groups pre-parse nothing in `decode` (the second 0F byte was already
             // folded into `insn.opcode` above): their executors re-read any ModRM/immediate from the
             // post-opcode eip in the shared fused dispatch.
@@ -1327,6 +1379,9 @@ impl Cpu386 {
             // The single-byte data-movement block runs through its split executor, consuming the
             // ModRM/operand/immediate `decode` pre-parsed.
             DecodeGroup::DataMove => self.execute_datamove_decoded(insn, bus),
+            // The stack block runs through its split executor, consuming the ModRM/immediate
+            // `decode` pre-parsed.
+            DecodeGroup::Stack => self.execute_stack_decoded(insn, bus),
             DecodeGroup::TwoByteFallback => {
                 // Un-converted two-byte (0F) opcode. `decode` already read + charged the second
                 // byte and applied the ISA gate, folding it into `insn.opcode` as 0x0F00 | second.
@@ -1708,48 +1763,21 @@ impl Cpu386 {
         }
     }
 
-    // Transitional fused entry: reads the prefixes + opcode + LOCK check itself, then dispatches.
-    // The production `cycle` path goes through `decode`/`execute_decoded` (which call
-    // `dispatch_opcode` directly to keep the fetch clocks charged once), so this whole-instruction
-    // entry now has callers only in the test suite; it is retained as the documented fused
-    // reference and is removed when the seam covers every opcode.
-    #[allow(dead_code)]
-    fn execute_instruction_legacy<B: CpuBus>(&mut self, bus: &mut B) -> ExecResult<CycleOutcome> {
-        let instruction_eip = self.registers.eip;
-        let prefixes = self.read_prefixes(bus)?;
-        let opcode = self.fetch_u8(bus)?;
-        if prefixes.lock {
-            self.check_lock_target(bus, opcode)?;
-        }
-        let operand_size = self.operand_size(prefixes);
-        let address_size = self.address_size(prefixes);
-        self.dispatch_opcode(
-            bus,
-            instruction_eip,
-            prefixes,
-            opcode,
-            operand_size,
-            address_size,
-        )
-    }
-
-    /// The live opcode dispatch the production seam calls on every fallback opcode (and that the
-    /// test-only `execute_instruction_legacy` reference also delegates to). The caller is
-    /// responsible for having already read the prefixes + opcode and run any LOCK check;
-    /// `instruction_eip` is only used for the unsupported-opcode error, and the current eip must
-    /// point at the byte immediately after the opcode so each arm re-reads its ModRM/immediate
-    /// from there. The seam calls this with the values `decode` already read, so the prefix/opcode
-    /// instruction-fetch clocks are charged exactly once.
-    #[allow(clippy::too_many_arguments)]
-    fn dispatch_opcode<B: CpuBus>(
+    /// Stack-block executor: PUSH/POP reg, PUSH/POP seg, PUSH imm, POP r/m, PUSHA/POPA,
+    /// PUSHF/POPF, ENTER/LEAVE.
+    ///
+    /// Each arm mirrors the former fused handler verbatim (same push/pop helpers, same flag
+    /// masking via `check_v86_iopl` + `load_flags`, same PUSHA SP-snapshot, same ENTER
+    /// nesting frame-copy, same LEAVE SP/BP semantics), but consumes the ModRM/immediate
+    /// `decode` already parsed so the executor never re-fetches an instruction byte.
+    fn execute_stack_decoded<B: CpuBus>(
         &mut self,
+        insn: &DecodedInsn,
         bus: &mut B,
-        instruction_eip: u32,
-        prefixes: Prefixes,
-        opcode: u8,
-        operand_size: OperandSize,
-        address_size: AddressSize,
     ) -> ExecResult<CycleOutcome> {
+        let opcode = insn.opcode as u8;
+        let operand_size = insn.operand_size;
+
         match opcode {
             0x06 => {
                 self.push(
@@ -1797,14 +1825,6 @@ impl Cpu386 {
                 let value = self.pop(bus, OperandSize::Word)? as u16;
                 self.load_segment(bus, SegmentIndex::Ds, value)?;
                 Ok(clocks(7))
-            }
-            0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 => {
-                Err(CpuError::UnsupportedOpcode {
-                    opcode,
-                    cs: self.registers.cs().selector,
-                    eip: instruction_eip,
-                }
-                .into())
             }
             0x50..=0x57 => {
                 let index = opcode - 0x50;
@@ -1854,10 +1874,173 @@ impl Cpu386 {
                 Ok(clocks(18))
             }
             0x68 => {
-                let value = self.fetch_immediate(bus, operand_size)?;
+                // PUSH imm16/32: `decode` fetched the full-width immediate into `insn.imm`.
+                self.push(bus, insn.imm, operand_size)?;
+                Ok(clocks(2))
+            }
+            0x6a => {
+                // PUSH imm8: sign-extend the byte (stored in `insn.imm`) to the operand size.
+                let value = sign_extend_u8(insn.imm as u8);
                 self.push(bus, value, operand_size)?;
                 Ok(clocks(2))
             }
+            0x8f => {
+                // POP r/m16/32 (group 1A). Only reg=000 is defined; other reg values are an
+                // illegal encoding. `decode` left `operand` as None for any reg != 0, so
+                // re-raise the identical error with the same bytes consumed.
+                let modrm = insn.modrm.expect("POP r/m decoded with a ModRM");
+                if modrm.reg != 0 {
+                    return Err(CpuError::UnsupportedGroupOpcode {
+                        opcode,
+                        extension: modrm.reg,
+                    }
+                    .into());
+                }
+                let (_, operand) = self.resolve_decoded_modrm_operand(insn);
+                let value = self.pop(bus, operand_size)?;
+                self.write_operand_sized(bus, operand, operand_size, value)?;
+                Ok(clocks(5))
+            }
+            0x9c => {
+                // PUSHF / PUSHFD. The low 16 flag bits push the same in both forms. The
+                // dword form additionally carries the 486 AC and ID bits (RF and VM are
+                // masked to 0 in the pushed image). operand_size drives whether push writes
+                // 2 or 4 bytes.
+                self.check_v86_iopl()?;
+                let value = match operand_size {
+                    OperandSize::Word => self.registers.eflags & 0xffff,
+                    OperandSize::Dword => self.registers.eflags & (0xffff | FLAG_AC | FLAG_ID),
+                };
+                self.push(bus, value, operand_size)?;
+                Ok(clocks(3))
+            }
+            0x9d => {
+                // POPF / POPFD: load the popped image through the shared flag-load.
+                self.check_v86_iopl()?;
+                let value = self.pop(bus, operand_size)?;
+                self.load_flags(value, operand_size);
+                Ok(clocks(4))
+            }
+            0xc8 => {
+                // ENTER imm16, imm8: build a stack frame. NestingLevel (already masked to 5
+                // bits by `decode`) is taken from `insn.imm2`; frame size from `insn.imm`.
+                let alloc = insn.imm as u16;
+                let level = insn.imm2; // already & 0x1f from decode
+                let size = operand_size.bytes();
+                let frame_bp = self.read_gpr_sized(5, operand_size);
+                self.push(bus, frame_bp, operand_size)?;
+                let frame_temp = self.read_gpr_sized(4, operand_size);
+                if level > 0 {
+                    // Copy the display: the saved frame pointers of the enclosing scopes.
+                    let mut bp = self.read_gpr_sized(5, operand_size);
+                    for _ in 1..level {
+                        bp = bp.wrapping_sub(size) & operand_size.mask();
+                        self.write_gpr_sized(5, operand_size, bp);
+                        let display = self.read_memory_sized(
+                            bus,
+                            SegmentIndex::Ss,
+                            bp,
+                            operand_size,
+                            BusAccessKind::DataRead,
+                        )?;
+                        self.push(bus, display, operand_size)?;
+                    }
+                    self.push(bus, frame_temp, operand_size)?;
+                }
+                self.write_gpr_sized(5, operand_size, frame_temp);
+                match operand_size {
+                    OperandSize::Word => {
+                        let sp = self.read_gpr16(4).wrapping_sub(alloc);
+                        self.write_gpr16(4, sp);
+                    }
+                    OperandSize::Dword => {
+                        if self.is_protected_mode() {
+                            let esp = self.registers.esp().wrapping_sub(u32::from(alloc));
+                            self.registers.set_esp(esp);
+                        } else {
+                            let sp = self.read_gpr16(4).wrapping_sub(alloc);
+                            self.write_gpr16(4, sp);
+                        }
+                    }
+                }
+                Ok(clocks(10))
+            }
+            0xc9 => {
+                // LEAVE: (E)SP <- (E)BP, then (E)BP <- pop. The stack-pointer move follows
+                // the stack width: a 16-bit real-mode stack moves only SP and keeps
+                // ESP[31:16]; a 32-bit stack moves the full ESP. The operand size still
+                // selects BP vs EBP for the popped frame pointer.
+                let frame = self.read_gpr_sized(5, operand_size);
+                if self.is_protected_mode() {
+                    self.write_gpr_sized(4, operand_size, frame);
+                } else {
+                    self.write_gpr16(4, frame as u16);
+                }
+                let saved = self.pop(bus, operand_size)?;
+                self.write_gpr_sized(5, operand_size, saved);
+                Ok(clocks(4))
+            }
+            _ => unreachable!("stack opcode {opcode:#x}"),
+        }
+    }
+
+    // Transitional fused entry: reads the prefixes + opcode + LOCK check itself, then dispatches.
+    // The production `cycle` path goes through `decode`/`execute_decoded` (which call
+    // `dispatch_opcode` directly to keep the fetch clocks charged once), so this whole-instruction
+    // entry now has callers only in the test suite; it is retained as the documented fused
+    // reference and is removed when the seam covers every opcode.
+    #[allow(dead_code)]
+    fn execute_instruction_legacy<B: CpuBus>(&mut self, bus: &mut B) -> ExecResult<CycleOutcome> {
+        let instruction_eip = self.registers.eip;
+        let prefixes = self.read_prefixes(bus)?;
+        let opcode = self.fetch_u8(bus)?;
+        if prefixes.lock {
+            self.check_lock_target(bus, opcode)?;
+        }
+        let operand_size = self.operand_size(prefixes);
+        let address_size = self.address_size(prefixes);
+        self.dispatch_opcode(
+            bus,
+            instruction_eip,
+            prefixes,
+            opcode,
+            operand_size,
+            address_size,
+        )
+    }
+
+    /// The live opcode dispatch the production seam calls on every fallback opcode (and that the
+    /// test-only `execute_instruction_legacy` reference also delegates to). The caller is
+    /// responsible for having already read the prefixes + opcode and run any LOCK check;
+    /// `instruction_eip` is only used for the unsupported-opcode error, and the current eip must
+    /// point at the byte immediately after the opcode so each arm re-reads its ModRM/immediate
+    /// from there. The seam calls this with the values `decode` already read, so the prefix/opcode
+    /// instruction-fetch clocks are charged exactly once.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_opcode<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        instruction_eip: u32,
+        prefixes: Prefixes,
+        opcode: u8,
+        operand_size: OperandSize,
+        address_size: AddressSize,
+    ) -> ExecResult<CycleOutcome> {
+        match opcode {
+            // 0x06/0x07/0x0e/0x16/0x17/0x1e/0x1f (PUSH/POP seg) are converted to the
+            // decode/execute split (`DecodeGroup::Stack` -> `execute_stack_decoded`);
+            // not handled here.
+            0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 => {
+                Err(CpuError::UnsupportedOpcode {
+                    opcode,
+                    cs: self.registers.cs().selector,
+                    eip: instruction_eip,
+                }
+                .into())
+            }
+            // 0x50-0x57 (PUSH reg), 0x58-0x5f (POP reg), 0x60 (PUSHA/PUSHAD), 0x61 (POPA/POPAD),
+            // 0x68 (PUSH imm16/32) are converted to the decode/execute split
+            // (`DecodeGroup::Stack` -> `execute_stack_decoded`); not handled here.
             0x69 => {
                 // IMUL r, r/m, imm16/32: signed multiply of r/m by a full-width immediate.
                 let modrm = self.fetch_modrm(bus)?;
@@ -1868,12 +2051,8 @@ impl Cpu386 {
                 self.write_gpr_sized(modrm.reg, operand_size, result);
                 Ok(clocks(14))
             }
-            0x6a => {
-                // PUSH imm8: sign-extend the byte to the operand size, then push it.
-                let value = sign_extend_u8(self.fetch_u8(bus)?);
-                self.push(bus, value, operand_size)?;
-                Ok(clocks(2))
-            }
+            // 0x6a (PUSH imm8) is converted to the decode/execute split
+            // (`DecodeGroup::Stack` -> `execute_stack_decoded`); not handled here.
             0x6b => {
                 // IMUL r, r/m, imm8: signed multiply of r/m by a sign-extended byte immediate.
                 let modrm = self.fetch_modrm(bus)?;
@@ -2015,28 +2194,8 @@ impl Cpu386 {
             // 0x86-0x8e (XCHG r/m,reg; MOV r/m<->reg/Sreg; LEA) are converted to the
             // decode/execute split: `route_group` classifies them as `DecodeGroup::DataMove` and
             // `execute_datamove_decoded` runs them. They must NOT be re-handled here (single path).
-            0x8f => {
-                // POP r/m16/32 (group 1A). Only reg=000 is defined; other reg
-                // values are an illegal encoding. The popped value goes to the
-                // r/m operand, which may be a register or memory. No flags change.
-                let modrm = self.fetch_modrm(bus)?;
-                if modrm.reg != 0 {
-                    return Err(CpuError::UnsupportedGroupOpcode {
-                        opcode,
-                        extension: modrm.reg,
-                    }
-                    .into());
-                }
-                // The displacement (if any) is fetched while decoding the operand,
-                // so decode first, then pop. A POP into memory addressed through
-                // ESP would, per Intel, compute the effective address after the
-                // stack increment; that edge case is not exercised here and is
-                // deferred (the common register and disp-addressed forms match).
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                let value = self.pop(bus, operand_size)?;
-                self.write_operand_sized(bus, operand, operand_size, value)?;
-                Ok(clocks(5))
-            }
+            // 0x8f (POP r/m, group 1A) is converted to `DecodeGroup::Stack` ->
+            // `execute_stack_decoded`; not handled here.
             0xc4 | 0xc5 => {
                 // LES (0xc4) / LDS (0xc5): load a far pointer from memory. The ModRM r/m
                 // names the memory operand; the low half (operand size) goes into the reg
@@ -2114,26 +2273,8 @@ impl Cpu386 {
                 }
                 Ok(clocks(2))
             }
-            0x9c => {
-                // PUSHF / PUSHFD. The low 16 flag bits push the same in both forms. The
-                // dword form additionally carries the 486 AC and ID bits (RF and VM are
-                // masked to 0 in the pushed image, so they never appear). operand_size
-                // drives whether push writes 2 or 4 bytes.
-                self.check_v86_iopl()?;
-                let value = match operand_size {
-                    OperandSize::Word => self.registers.eflags & 0xffff,
-                    OperandSize::Dword => self.registers.eflags & (0xffff | FLAG_AC | FLAG_ID),
-                };
-                self.push(bus, value, operand_size)?;
-                Ok(clocks(3))
-            }
-            0x9d => {
-                // POPF / POPFD: load the popped image through the shared flag-load.
-                self.check_v86_iopl()?;
-                let value = self.pop(bus, operand_size)?;
-                self.load_flags(value, operand_size);
-                Ok(clocks(4))
-            }
+            // 0x9c (PUSHF/PUSHFD) and 0x9d (POPF/POPFD) are converted to the decode/execute
+            // split (`DecodeGroup::Stack` -> `execute_stack_decoded`); not handled here.
             0x9e => {
                 // SAHF: load CF/PF/AF/ZF/SF from AH; OF and the reserved bits are untouched.
                 // The trailing | 0x02 keeps the always-one reserved bit set, matching
@@ -2263,66 +2404,8 @@ impl Cpu386 {
             }
             // 0xc6/0xc7 (MOV r/m,imm group 11) are converted to the split
             // (`DecodeGroup::DataMove` -> `execute_datamove_decoded`); not handled here.
-            0xc8 => {
-                // ENTER imm16, imm8: build a stack frame. NestingLevel is taken mod 32.
-                // Counterpart to LEAVE. Stack-pointer width follows push's real-mode-vs-
-                // protected model (the SS B-bit refinement is deferred there too).
-                let alloc = self.fetch_u16(bus)?;
-                let level = u32::from(self.fetch_u8(bus)? & 0x1f);
-                let size = operand_size.bytes();
-                let frame_bp = self.read_gpr_sized(5, operand_size);
-                self.push(bus, frame_bp, operand_size)?;
-                let frame_temp = self.read_gpr_sized(4, operand_size);
-                if level > 0 {
-                    // Copy the display: the saved frame pointers of the enclosing scopes.
-                    let mut bp = self.read_gpr_sized(5, operand_size);
-                    for _ in 1..level {
-                        bp = bp.wrapping_sub(size) & operand_size.mask();
-                        self.write_gpr_sized(5, operand_size, bp);
-                        let display = self.read_memory_sized(
-                            bus,
-                            SegmentIndex::Ss,
-                            bp,
-                            operand_size,
-                            BusAccessKind::DataRead,
-                        )?;
-                        self.push(bus, display, operand_size)?;
-                    }
-                    self.push(bus, frame_temp, operand_size)?;
-                }
-                self.write_gpr_sized(5, operand_size, frame_temp);
-                match operand_size {
-                    OperandSize::Word => {
-                        let sp = self.read_gpr16(4).wrapping_sub(alloc);
-                        self.write_gpr16(4, sp);
-                    }
-                    OperandSize::Dword => {
-                        if self.is_protected_mode() {
-                            let esp = self.registers.esp().wrapping_sub(u32::from(alloc));
-                            self.registers.set_esp(esp);
-                        } else {
-                            let sp = self.read_gpr16(4).wrapping_sub(alloc);
-                            self.write_gpr16(4, sp);
-                        }
-                    }
-                }
-                Ok(clocks(10))
-            }
-            0xc9 => {
-                // LEAVE: (E)SP <- (E)BP, then (E)BP <- pop. The stack-pointer move
-                // follows the stack width: a 16-bit real-mode stack moves only SP and
-                // keeps ESP[31:16]; a 32-bit stack moves the full ESP. The operand size
-                // still selects BP vs EBP for the popped frame pointer.
-                let frame = self.read_gpr_sized(5, operand_size);
-                if self.is_protected_mode() {
-                    self.write_gpr_sized(4, operand_size, frame);
-                } else {
-                    self.write_gpr16(4, frame as u16);
-                }
-                let saved = self.pop(bus, operand_size)?;
-                self.write_gpr_sized(5, operand_size, saved);
-                Ok(clocks(4))
-            }
+            // 0xc8 (ENTER) and 0xc9 (LEAVE) are converted to `DecodeGroup::Stack` ->
+            // `execute_stack_decoded`; not handled here.
             0xcc => {
                 // INT 3: one-byte breakpoint trap to vector 3.
                 self.software_interrupt(bus, 3)?;
@@ -15565,5 +15648,412 @@ mod tests {
         let mut bus = TestBus::with_memory(memory);
         cpu.cycle(&mut bus).unwrap();
         assert!(!cpu.flag(FLAG_IF), "CLI cleared IF");
+    }
+
+    // ---- Stack-group golden battery (A4) ----
+
+    /// One golden end-state for a stack-group case, captured from the fused reference
+    /// (`execute_instruction_legacy`) via `regen_stack_goldens`. Stack ops mutate SS:SP and stack
+    /// memory, so this captures the full register file (incl. ESP/EBP), eflags (PUSHF/POPF/POPA
+    /// touch flags), eip, memory-write deltas, and the InstructionPrefetch fetch count.
+    struct StackGolden {
+        name: &'static str,
+        code: &'static [u8],
+        gpr: [u32; 8],
+        eflags: u32,
+        eip: u32,
+        deltas: &'static [(usize, u8)],
+        fetch: usize,
+    }
+
+    /// Seed for the stack golden battery. Uses a 512-byte memory image with a stack at
+    /// 0x1f0 (grows down into the low half) and known register values for non-stack GPRs.
+    /// The instruction is placed at offset 0; the stack region starts at 0x1f0.
+    fn stack_seed(cpu: &mut Cpu386) {
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        // AX=0x0102, CX=0x0304, DX=0x0506, BX=0x0708 (non-zero non-trivial values)
+        cpu.write_reg16(Reg16::Ax, 0x0102);
+        cpu.write_reg16(Reg16::Cx, 0x0304);
+        cpu.write_reg16(Reg16::Dx, 0x0506);
+        cpu.write_reg16(Reg16::Bx, 0x0708);
+        // SP=0x01f0, BP=0x01f0 (frame-pointer tests start at the same level)
+        cpu.write_reg16(Reg16::Sp, 0x01f0);
+        cpu.write_reg16(Reg16::Bp, 0x01f0);
+        cpu.write_reg16(Reg16::Si, 0x0008);
+        cpu.write_reg16(Reg16::Di, 0x0018);
+        // eflags: only the always-set reserved bit 1 (PUSHF/POPF tests perturb CF below)
+        cpu.registers.eflags = 0x02;
+    }
+
+    /// The stack-group differential battery. Captured from the PRIOR fused reference
+    /// (`execute_instruction_legacy`) via `regen_stack_goldens`; see `alu_golden_cases` for the
+    /// full capture recipe. Never edit by hand — re-run the regen from the pre-split commit.
+    fn stack_golden_cases() -> &'static [StackGolden] {
+        &[
+            // PUSH reg (0x50-0x57): SP decrements by 2, then value written at ss:SP.
+            // Initial SP=0x1f0 so push target is 0x1ee (= 494). The initial 0xBEEF at 0x1f0
+            // is unaffected by pushes (they go to 0x1ee = 494).
+            StackGolden {
+                name: "push ax",
+                code: &[80],
+                gpr: [258, 772, 1286, 1800, 494, 496, 8, 24],
+                eflags: 0x2,
+                eip: 0x1,
+                deltas: &[(494, 2), (495, 1)],
+                fetch: 2,
+            },
+            StackGolden {
+                name: "push bx",
+                code: &[83],
+                gpr: [258, 772, 1286, 1800, 494, 496, 8, 24],
+                eflags: 0x2,
+                eip: 0x1,
+                deltas: &[(494, 8), (495, 7)],
+                fetch: 2,
+            },
+            StackGolden {
+                name: "push cx",
+                code: &[81],
+                gpr: [258, 772, 1286, 1800, 494, 496, 8, 24],
+                eflags: 0x2,
+                eip: 0x1,
+                deltas: &[(494, 4), (495, 3)],
+                fetch: 2,
+            },
+            StackGolden {
+                name: "push si",
+                code: &[86],
+                gpr: [258, 772, 1286, 1800, 494, 496, 8, 24],
+                eflags: 0x2,
+                eip: 0x1,
+                deltas: &[(494, 8)],
+                fetch: 2,
+            },
+            // POP reg (0x58-0x5f): reads from SS:SP=0x1f0 (BEEF planted there), SP += 2.
+            StackGolden {
+                name: "pop ax",
+                code: &[88],
+                gpr: [48879, 772, 1286, 1800, 498, 496, 8, 24],
+                eflags: 0x2,
+                eip: 0x1,
+                deltas: &[],
+                fetch: 2,
+            },
+            StackGolden {
+                name: "pop bx",
+                code: &[91],
+                gpr: [258, 772, 1286, 48879, 498, 496, 8, 24],
+                eflags: 0x2,
+                eip: 0x1,
+                deltas: &[],
+                fetch: 2,
+            },
+            // PUSH seg (0x06/0x0e/0x16/0x1e): push ES/CS/SS/DS selectors. All are 0 from
+            // stack_seed, so no bytes change from initial (they write 0x0000 over 0x0000).
+            StackGolden {
+                name: "push es",
+                code: &[6],
+                gpr: [258, 772, 1286, 1800, 494, 496, 8, 24],
+                eflags: 0x2,
+                eip: 0x1,
+                deltas: &[],
+                fetch: 2,
+            },
+            StackGolden {
+                name: "push cs",
+                code: &[14],
+                gpr: [258, 772, 1286, 1800, 494, 496, 8, 24],
+                eflags: 0x2,
+                eip: 0x1,
+                deltas: &[],
+                fetch: 2,
+            },
+            StackGolden {
+                name: "push ss",
+                code: &[22],
+                gpr: [258, 772, 1286, 1800, 494, 496, 8, 24],
+                eflags: 0x2,
+                eip: 0x1,
+                deltas: &[],
+                fetch: 2,
+            },
+            StackGolden {
+                name: "push ds",
+                code: &[30],
+                gpr: [258, 772, 1286, 1800, 494, 496, 8, 24],
+                eflags: 0x2,
+                eip: 0x1,
+                deltas: &[],
+                fetch: 2,
+            },
+            // POP seg (0x07/0x17/0x1f): pops 0xBEEF from stack into ES/SS/DS. No gpr delta
+            // (segment selectors are not in `gpr`); SP advances.
+            StackGolden {
+                name: "pop es",
+                code: &[7],
+                gpr: [258, 772, 1286, 1800, 498, 496, 8, 24],
+                eflags: 0x2,
+                eip: 0x1,
+                deltas: &[],
+                fetch: 2,
+            },
+            StackGolden {
+                name: "pop ss",
+                code: &[23],
+                gpr: [258, 772, 1286, 1800, 498, 496, 8, 24],
+                eflags: 0x2,
+                eip: 0x1,
+                deltas: &[],
+                fetch: 2,
+            },
+            StackGolden {
+                name: "pop ds",
+                code: &[31],
+                gpr: [258, 772, 1286, 1800, 498, 496, 8, 24],
+                eflags: 0x2,
+                eip: 0x1,
+                deltas: &[],
+                fetch: 2,
+            },
+            // PUSH imm16 (0x68): push 0x1234 to ss:0x1ee.
+            StackGolden {
+                name: "push imm16 0x1234",
+                code: &[104, 52, 18],
+                gpr: [258, 772, 1286, 1800, 494, 496, 8, 24],
+                eflags: 0x2,
+                eip: 0x3,
+                deltas: &[(494, 52), (495, 18)],
+                fetch: 4,
+            },
+            // PUSH imm8 +5 (0x6a 0x05): sign-extended to 0x0005; high byte 0x00 over 0x00 = no delta.
+            StackGolden {
+                name: "push imm8 +5",
+                code: &[106, 5],
+                gpr: [258, 772, 1286, 1800, 494, 496, 8, 24],
+                eflags: 0x2,
+                eip: 0x2,
+                deltas: &[(494, 5)],
+                fetch: 3,
+            },
+            // PUSH imm8 -1 (0x6a 0xff): sign-extended to 0xffff; both bytes 0xff change.
+            StackGolden {
+                name: "push imm8 -1",
+                code: &[106, 255],
+                gpr: [258, 772, 1286, 1800, 494, 496, 8, 24],
+                eflags: 0x2,
+                eip: 0x2,
+                deltas: &[(494, 255), (495, 255)],
+                fetch: 3,
+            },
+            // POP r/m (0x8f /0) memory form: 8F 06 10 01 = POP word [0x0110]. Pops 0xBEEF from
+            // ss:0x1f0, writes to ds:0x0110 (= offset 272 dec). SP advances to 0x1f2 (= 498).
+            StackGolden {
+                name: "pop r/m mem [0x0110]",
+                code: &[143, 6, 16, 1],
+                gpr: [258, 772, 1286, 1800, 498, 496, 8, 24],
+                eflags: 0x2,
+                eip: 0x4,
+                deltas: &[(272, 239), (273, 190)],
+                fetch: 5,
+            },
+            // POP r/m register form: 8F /0 mod=11 rm=000 -> POP AX. AX gets 0xBEEF.
+            StackGolden {
+                name: "pop r/m reg ax",
+                code: &[143, 192],
+                gpr: [48879, 772, 1286, 1800, 498, 496, 8, 24],
+                eflags: 0x2,
+                eip: 0x2,
+                deltas: &[],
+                fetch: 3,
+            },
+            // PUSHA (0x60): snapshot SP=0x1f0 before pushing 8 words. Pushes AX,CX,DX,BX,
+            // snapshot-SP,BP,SI,DI. SP ends at 0x1e0 (= 480). The BEEF word at 0x1f0 is
+            // overwritten by the SP-snapshot push (0x1ee-0x1ef <- 0x1f0 LE).
+            StackGolden {
+                name: "pusha",
+                code: &[96],
+                gpr: [258, 772, 1286, 1800, 480, 496, 8, 24],
+                eflags: 0x2,
+                eip: 0x1,
+                deltas: &[
+                    (480, 24),
+                    (482, 8),
+                    (484, 240),
+                    (485, 1),
+                    (486, 240),
+                    (487, 1),
+                    (488, 8),
+                    (489, 7),
+                    (490, 6),
+                    (491, 5),
+                    (492, 4),
+                    (493, 3),
+                    (494, 2),
+                    (495, 1),
+                ],
+                fetch: 2,
+            },
+            // POPA (0x61): pops DI,SI,BP,discard,BX,DX,CX,AX from SP=0x1f0. DI gets 0xBEEF
+            // (it's the first pop at 0x1f0). All others pop 0x00. SP ends at 0x200 (= 512).
+            StackGolden {
+                name: "popa",
+                code: &[97],
+                gpr: [0, 0, 0, 0, 512, 0, 0, 48879],
+                eflags: 0x2,
+                eip: 0x1,
+                deltas: &[],
+                fetch: 2,
+            },
+            // PUSHF (0x9c): push eflags (0x0002) to ss:0x1ee. High byte 0x00 over 0x00 = no delta.
+            StackGolden {
+                name: "pushf",
+                code: &[156],
+                gpr: [258, 772, 1286, 1800, 494, 496, 8, 24],
+                eflags: 0x2,
+                eip: 0x1,
+                deltas: &[(494, 2)],
+                fetch: 2,
+            },
+            // POPF (0x9d): pops 0x0097 from ss:0x1f0 (overridden from BEEF in the test loop).
+            // CF+PF+AF+ZF+SF all set. SP advances to 0x1f2 (= 498).
+            StackGolden {
+                name: "popf",
+                code: &[157],
+                gpr: [258, 772, 1286, 1800, 498, 496, 8, 24],
+                eflags: 0x97,
+                eip: 0x1,
+                deltas: &[],
+                fetch: 2,
+            },
+            // ENTER imm16=4, imm8=1 (nesting level 1): push BP (0x01f0), copy frame ptr, set
+            // BP = pre-push SP - 2, then SP -= alloc (4). Stack frame consumes 4 bytes (2 for
+            // saved BP, 2 for the display copy). SP ends at 0x1e8 (= 488); BP=0x1ee (= 494).
+            StackGolden {
+                name: "enter 4,1",
+                code: &[200, 4, 0, 1],
+                gpr: [258, 772, 1286, 1800, 488, 494, 8, 24],
+                eflags: 0x2,
+                eip: 0x4,
+                deltas: &[(492, 238), (493, 1), (494, 240), (495, 1)],
+                fetch: 5,
+            },
+            // LEAVE (0xc9): SP <- BP = 0x1f0, then pop BP from ss:0x1f0 (BEEF). BP = 0xBEEF,
+            // SP = 0x1f2 (= 498).
+            StackGolden {
+                name: "leave",
+                code: &[201],
+                gpr: [258, 772, 1286, 1800, 498, 48879, 8, 24],
+                eflags: 0x2,
+                eip: 0x1,
+                deltas: &[],
+                fetch: 2,
+            },
+        ]
+    }
+
+    /// Seed memory for the stack golden battery. Plants 0xBEEF at SS:SP=0x1f0 (the first
+    /// word a POP reads) so POP tests have a stable, visible source. Each case gets a fresh
+    /// 0x200-byte vector so earlier writes don't bleed into later cases. The POPF case
+    /// overwrites this with 0x0097 in the regen/assert loops to give CF+PF+AF+ZF+SF.
+    fn stack_seed_mem(mem: &mut [u8], code: &[u8]) {
+        mem[..code.len()].copy_from_slice(code);
+        // POP tests: plant 0xBEEF at ss:0x1f0 (the initial SP — the first word a POP reads).
+        mem[0x1f0..0x1f2].copy_from_slice(&0xbeefu16.to_le_bytes());
+    }
+
+    #[test]
+    fn stack_split_matches_golden_across_ops() {
+        // The stack-group opcodes (PUSH/POP reg/seg/imm, PUSHA/POPA, PUSHF/POPF, ENTER/LEAVE,
+        // POP r/m) are converted to the decode/execute split, so they can no longer be diffed
+        // against a fused executor (that path was deleted). Run each through cycle() and assert
+        // the architectural end-state against goldens captured from the pre-split fused path via
+        // `regen_stack_goldens`. Covers register and memory operands, SP semantics, flag
+        // masking (PUSHF/POPF), the PUSHA SP-snapshot, and the ENTER nesting frame-copy.
+        for g in stack_golden_cases() {
+            let mut mem = vec![0u8; 0x200];
+            stack_seed_mem(&mut mem, g.code);
+            // POPF needs a known flags word at SS:SP (0x1f0) instead of BEEF.
+            if g.name == "popf" {
+                mem[0x1f0..0x1f2].copy_from_slice(&0x0097u16.to_le_bytes());
+            }
+            let initial = mem.clone();
+
+            let mut split = Cpu386::default();
+            stack_seed(&mut split);
+            let mut sbus = TestBus::with_memory(mem);
+            let _ = split.cycle(&mut sbus);
+
+            assert_eq!(split.registers.gpr, g.gpr, "gpr mismatch for {}", g.name);
+            assert_eq!(
+                split.registers.eflags, g.eflags,
+                "eflags mismatch for {}",
+                g.name
+            );
+            assert_eq!(split.registers.eip, g.eip, "eip mismatch for {}", g.name);
+            let deltas: Vec<(usize, u8)> = sbus
+                .memory
+                .iter()
+                .enumerate()
+                .filter(|(i, b)| **b != initial[*i])
+                .map(|(i, b)| (i, *b))
+                .collect();
+            assert_eq!(deltas, g.deltas, "memory-write mismatch for {}", g.name);
+            assert_eq!(
+                seam_fetch_count(&sbus),
+                g.fetch,
+                "instruction-fetch cycle count mismatch for {} (seam must charge fetches once)",
+                g.name
+            );
+        }
+    }
+
+    /// Regenerate `stack_golden_cases` from the fused reference. Ignored by default.
+    /// Run WHILE the stack group's fused arms still exist in `dispatch_opcode`:
+    ///   cargo test -p izarravm-cpu --lib regen_stack_goldens -- --ignored --nocapture
+    /// then paste the output over `stack_golden_cases` and only then do the conversion.
+    #[test]
+    #[ignore = "prints golden literals; run with --ignored --nocapture against the fused reference"]
+    fn regen_stack_goldens() {
+        for g in stack_golden_cases() {
+            let mut mem = vec![0u8; 0x200];
+            stack_seed_mem(&mut mem, g.code);
+            if g.name == "popf" {
+                mem[0x1f0..0x1f2].copy_from_slice(&0x0097u16.to_le_bytes());
+            }
+            let initial = mem.clone();
+
+            let mut fused = Cpu386::default();
+            stack_seed(&mut fused);
+            let mut fbus = TestBus::with_memory(mem);
+            fused.begin_instruction();
+            if fused.execute_instruction_legacy(&mut fbus).is_err() {
+                println!(
+                    "            // TODO regen {}: fused path unavailable here; run before deleting fused arms",
+                    g.name
+                );
+                continue;
+            }
+            let deltas: Vec<(usize, u8)> = fbus
+                .memory
+                .iter()
+                .enumerate()
+                .filter(|(i, b)| **b != initial[*i])
+                .map(|(i, b)| (i, *b))
+                .collect();
+            let fetch = seam_fetch_count(&fbus);
+            println!(
+                "            StackGolden {{ name: {:?}, code: &{:?}, gpr: {:?}, eflags: {:#x}, eip: {:#x}, deltas: &{:?}, fetch: {} }},",
+                g.name,
+                g.code,
+                fused.registers.gpr,
+                fused.registers.eflags,
+                fused.registers.eip,
+                deltas,
+                fetch,
+            );
+        }
     }
 }
