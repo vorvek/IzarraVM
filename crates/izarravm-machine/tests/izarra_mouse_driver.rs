@@ -22,7 +22,7 @@
 // for Stage C the host pointer -> 8042 -> IRQ12 -> BIOS INT 74h ISR ->
 // MOUSE.COM packet handler -> INT 33h state.
 
-use izarravm_core::VideoCard;
+use izarravm_core::{GswMode, VideoCard};
 use izarravm_firmware::izarra_bios;
 use izarravm_machine::{Machine, MachineProfile, StopReason};
 
@@ -55,6 +55,13 @@ fn boot_with_mtest() -> (Machine, tempfile::TempDir) {
         izarra_bios(),
     )
     .unwrap();
+    // Pin to the 386 level this profile declares. The CPU resets to the full-ISA
+    // I586 default, where the per-mode cycle seam scales clocks 2/5; that changes
+    // how many guest instructions fit in each fixed CycleLimit chunk below, which
+    // thins out the held-button motion stream and trips MTEST's Stage-C button
+    // check. At I386 the seam is 1:1, restoring the cadence this self-test was
+    // tuned against (the seam scales nothing on a 386).
+    machine.set_mode(GswMode::Gsw386);
     machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
     machine.set_toka_c_root(dir.path().to_path_buf());
     (machine, dir)
