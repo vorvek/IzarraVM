@@ -774,6 +774,25 @@ enum DecodedOperand {
     Mem(AddrMode),
 }
 
+/// Which decode/execute path an opcode takes. This is the SINGLE source of truth for routing:
+/// `route_group` classifies an opcode once, and both `decode` (to decide what to pre-parse) and
+/// `execute_decoded` (to decide how to execute) match on the same `DecodeGroup` value. Never
+/// re-derive a routing predicate inline in either function — a one-sided edit would have `decode`
+/// parse a ModRM the executor never consumes (or make a `.expect()` panic).
+///
+/// Extension pattern for the remaining group-conversion tasks: add ONE variant here, ONE arm in
+/// `route_group`, ONE parse arm in `decode`, and ONE execute arm in `execute_decoded`. `Fallback`
+/// is everything still on the legacy fused dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecodeGroup {
+    /// The ALU block: ADD/OR/ADC/SBB/AND/SUB/XOR/CMP across forms 0-5
+    /// (`opcode < 0x40 && (opcode & 7) < 6`).
+    Alu,
+    /// Not yet converted to the split: decode parses nothing extra and `execute_decoded` hands the
+    /// opcode to the shared fused `dispatch_opcode`.
+    Fallback,
+}
+
 /// How decode charges the instruction-fetch clocks when an instruction is replayed from a
 /// cache. Unused in Stage A: decode here charges fetch clocks through its real `fetch_u8`
 /// reads (exactly as the fused path did), so `execute_decoded` charges nothing extra. This
@@ -1064,6 +1083,20 @@ impl Cpu386 {
         })
     }
 
+    /// The single routing authority for the decode/execute split: classify an opcode into the
+    /// group whose dedicated split path handles it, or `Fallback` for the shared fused dispatch.
+    /// `decode` and `execute_decoded` both call this and match on the result, so the predicate
+    /// lives in exactly one place. `prefixes` is taken (unused for the ALU group) because future
+    /// groups route on it (e.g. the 0x0F two-byte map, or operand-size-sensitive forms).
+    fn route_group(opcode: u16, _prefixes: Prefixes) -> DecodeGroup {
+        // ALU block: ADD/OR/ADC/SBB/AND/SUB/XOR/CMP, forms 0-5 (`op = (opcode>>3)&7`,
+        // `form = opcode & 7`; forms 6/7 are the segment PUSH/POP and are NOT ALU).
+        if opcode < 0x40 && (opcode & 0x07) < 6 {
+            return DecodeGroup::Alu;
+        }
+        DecodeGroup::Fallback
+    }
+
     /// Stage A of the decode/execute split. Reads the prefixes and opcode (mirroring the top
     /// of the legacy fused path) and, for the opcodes already converted to the split, parses
     /// the ModRM + addressing-mode descriptor up front. Opcodes still on the legacy path leave
@@ -1086,11 +1119,13 @@ impl Cpu386 {
 
         let mut insn = DecodedInsn {
             start_eip,
-            // `len` is a placeholder in Stage A (decode charges fetch clocks via its real
-            // reads, not via `fetch`); it is finalized when the cache stage lands.
-            len: (self.registers.eip.wrapping_sub(start_eip)) as u8,
+            // `len`/`fetch` are placeholders here; the single finalize after the group pre-parse
+            // below overwrites them with the real consumed length (prefixes + opcode + operands).
+            // In Stage A `fetch` is unused at replay time — decode charges fetch clocks via its
+            // real reads; the cache stage (Stage B) is where `fetch` is consumed.
+            len: 0,
             fetch: FetchCost::Uniform {
-                len: (self.registers.eip.wrapping_sub(start_eip)) as u8,
+                len: 0,
                 wait_states: 0,
             },
             prefixes,
@@ -1103,30 +1138,38 @@ impl Cpu386 {
             imm2: 0,
         };
 
-        // The whole ALU block (ADD/OR/ADC/SBB/AND/SUB/XOR/CMP across forms 0-5) is routed through
-        // the split. Forms 0-3 carry a ModRM: parse it + its addressing-mode descriptor now (the
-        // descriptor reads instruction bytes only, so it stays cacheable). Forms 4/5 carry an
-        // accumulator immediate: fetch it here (charging its fetch clocks once) so the executor
-        // consumes `imm` without re-reading. `op = (opcode>>3)&7`, `form = opcode & 7`.
-        if opcode < 0x40 && (opcode & 0x07) < 6 {
-            let form = opcode & 0x07;
-            if form < 4 {
-                let modrm = self.fetch_modrm(bus)?;
-                let operand = self.parse_addressing_mode(bus, prefixes, address_size, modrm)?;
-                insn.modrm = Some(modrm);
-                insn.operand = Some(operand);
-            } else if form == 4 {
-                insn.imm = u32::from(self.fetch_u8(bus)?);
-            } else {
-                insn.imm = self.fetch_immediate(bus, operand_size)?;
+        // Pre-parse the operands of converted groups. The group classifier is the single routing
+        // authority; `execute_decoded` matches the same `DecodeGroup` to decide how to execute.
+        match Self::route_group(insn.opcode, prefixes) {
+            DecodeGroup::Alu => {
+                // ALU block. Forms 0-3 carry a ModRM: parse it + its addressing-mode descriptor now
+                // (the descriptor reads instruction bytes only, so it stays cacheable). Forms 4/5
+                // carry an accumulator immediate: fetch it here (charging its fetch clocks once) so
+                // the executor consumes `imm` without re-reading. `op = (opcode>>3)&7`, `form = &7`.
+                let form = opcode & 0x07;
+                if form < 4 {
+                    let modrm = self.fetch_modrm(bus)?;
+                    let operand = self.parse_addressing_mode(bus, prefixes, address_size, modrm)?;
+                    insn.modrm = Some(modrm);
+                    insn.operand = Some(operand);
+                } else if form == 4 {
+                    insn.imm = u32::from(self.fetch_u8(bus)?);
+                } else {
+                    insn.imm = self.fetch_immediate(bus, operand_size)?;
+                }
             }
-            let consumed = self.registers.eip.wrapping_sub(start_eip) as u8;
-            insn.len = consumed;
-            insn.fetch = FetchCost::Uniform {
-                len: consumed,
-                wait_states: 0,
-            };
+            DecodeGroup::Fallback => {}
         }
+
+        // Finalize `len`/`fetch` once, after every group's pre-parse, so a converted group never
+        // has to re-write them: a group's match arm only fetches its operand bytes; this single
+        // assignment captures the total bytes `decode` consumed (prefixes + opcode + operands).
+        let consumed = self.registers.eip.wrapping_sub(start_eip) as u8;
+        insn.len = consumed;
+        insn.fetch = FetchCost::Uniform {
+            len: consumed,
+            wait_states: 0,
+        };
 
         Ok(insn)
     }
@@ -1140,11 +1183,13 @@ impl Cpu386 {
         insn: &DecodedInsn,
         bus: &mut B,
     ) -> ExecResult<CycleOutcome> {
-        match insn.opcode {
+        // Route on the same group classifier `decode` used, so the parse side and the execute
+        // side can never drift out of sync.
+        match Self::route_group(insn.opcode, insn.prefixes) {
             // The whole ALU block (ADD/OR/ADC/SBB/AND/SUB/XOR/CMP, forms 0-5) runs through the
-            // split executor. Same condition `decode` uses to pre-parse the ModRM/immediate.
-            opcode if opcode < 0x40 && (opcode & 0x07) < 6 => self.execute_alu_decoded(insn, bus),
-            opcode => {
+            // split executor, consuming the ModRM/immediate `decode` pre-parsed.
+            DecodeGroup::Alu => self.execute_alu_decoded(insn, bus),
+            DecodeGroup::Fallback => {
                 // Fallback: `decode` already read the prefixes + opcode and ran the LOCK check,
                 // leaving eip just past the opcode. Continue into the shared dispatch from there,
                 // so each arm re-reads its ModRM/immediates exactly as before and the prefix/opcode
@@ -1153,7 +1198,7 @@ impl Cpu386 {
                     bus,
                     insn.start_eip,
                     insn.prefixes,
-                    opcode as u8,
+                    insn.opcode as u8,
                     insn.operand_size,
                     insn.address_size,
                 )
@@ -1161,14 +1206,18 @@ impl Cpu386 {
         }
     }
 
-    /// Resolve the pre-decoded r/m operand of an ALU form (0-3) against the live registers:
-    /// a register operand is returned as-is, a memory descriptor has its effective address
-    /// recomputed now (`resolve_addr_mode` reads only base/index registers, no instruction bytes).
-    fn resolve_alu_operand(&self, insn: &DecodedInsn) -> RmOperand {
-        match insn.operand.expect("ALU r/m form decoded with an operand") {
+    /// Resolve the pre-decoded ModRM r/m form (forms 0-3) into its `(ModRm, RmOperand)`: the
+    /// ModRM (for its `reg` field) plus the r/m operand resolved against the live registers — a
+    /// register operand as-is, a memory descriptor with its effective address recomputed now
+    /// (`resolve_addr_mode` reads only base/index registers, no instruction bytes). Centralizes
+    /// the `decode`-populated-this `.expect`s so each form arm doesn't repeat them.
+    fn resolve_alu_modrm_operand(&self, insn: &DecodedInsn) -> (ModRm, RmOperand) {
+        let modrm = insn.modrm.expect("ALU r/m form decoded with a ModRM");
+        let operand = match insn.operand.expect("ALU r/m form decoded with an operand") {
             DecodedOperand::Reg(index) => RmOperand::Register(index),
             DecodedOperand::Mem(addr) => self.resolve_addr_mode(&addr),
-        }
+        };
+        (modrm, operand)
     }
 
     /// The entire ALU block (ADD/OR/ADC/SBB/AND/SUB/XOR/CMP across all six forms) through the
@@ -1191,8 +1240,7 @@ impl Cpu386 {
 
         match form {
             0 => {
-                let modrm = insn.modrm.expect("ALU form 0 decoded with a ModRM");
-                let operand = self.resolve_alu_operand(insn);
+                let (modrm, operand) = self.resolve_alu_modrm_operand(insn);
                 let a = u32::from(self.read_operand_u8(bus, operand)?);
                 let b = u32::from(self.read_gpr8(modrm.reg));
                 let result = self.alu(op, a, b, BusWidth::Byte) as u8;
@@ -1201,8 +1249,7 @@ impl Cpu386 {
                 }
             }
             1 => {
-                let modrm = insn.modrm.expect("ALU form 1 decoded with a ModRM");
-                let operand = self.resolve_alu_operand(insn);
+                let (modrm, operand) = self.resolve_alu_modrm_operand(insn);
                 let a = self.read_operand_sized(bus, operand, operand_size)?;
                 let b = self.read_gpr_sized(modrm.reg, operand_size);
                 let result = self.alu(op, a, b, operand_size.bus_width());
@@ -1211,8 +1258,7 @@ impl Cpu386 {
                 }
             }
             2 => {
-                let modrm = insn.modrm.expect("ALU form 2 decoded with a ModRM");
-                let operand = self.resolve_alu_operand(insn);
+                let (modrm, operand) = self.resolve_alu_modrm_operand(insn);
                 let a = u32::from(self.read_gpr8(modrm.reg));
                 let b = u32::from(self.read_operand_u8(bus, operand)?);
                 let result = self.alu(op, a, b, BusWidth::Byte) as u8;
@@ -1221,8 +1267,7 @@ impl Cpu386 {
                 }
             }
             3 => {
-                let modrm = insn.modrm.expect("ALU form 3 decoded with a ModRM");
-                let operand = self.resolve_alu_operand(insn);
+                let (modrm, operand) = self.resolve_alu_modrm_operand(insn);
                 let a = self.read_gpr_sized(modrm.reg, operand_size);
                 let b = self.read_operand_sized(bus, operand, operand_size)?;
                 let result = self.alu(op, a, b, operand_size.bus_width());
@@ -13304,29 +13349,37 @@ mod tests {
         }
     }
 
-    #[test]
-    fn alu_split_matches_golden_across_ops() {
-        // The whole ALU block (ADD/OR/ADC/SBB/AND/SUB/XOR/CMP) is converted to the decode/execute
-        // split, so it can no longer be diffed against a fused executor (that path was deleted to
-        // keep a single ALU implementation). Instead, run each op/form through cycle() and assert
-        // the architectural end-state against goldens captured from the pre-split fused path
-        // (commit 332be72). This exercises decode's ModRM/immediate parsing, the executor's operand
-        // wiring + write-back gating, the EA recompute, and the once-only instruction-fetch charge.
-        //
-        // Golden fields per case: opcode bytes, end gpr (AX,CX,DX,BX,SP,BP,SI,DI), end eflags, end
-        // eip, the list of (offset, value) memory writes, and the InstructionPrefetch fetch count.
-        struct Golden {
-            name: &'static str,
-            code: &'static [u8],
-            gpr: [u32; 8],
-            eflags: u32,
-            eip: u32,
-            deltas: &'static [(usize, u8)],
-            fetch: usize,
-        }
-        let cases: &[Golden] = &[
+    /// One golden end-state for an ALU case run from `seam_seed`: the opcode bytes plus the
+    /// expected end gpr (AX,CX,DX,BX,SP,BP,SI,DI), eflags, eip, (offset,value) memory writes, and
+    /// InstructionPrefetch fetch count. Shared between the assertion test and the regen helper.
+    struct AluGolden {
+        name: &'static str,
+        code: &'static [u8],
+        gpr: [u32; 8],
+        eflags: u32,
+        eip: u32,
+        deltas: &'static [(usize, u8)],
+        fetch: usize,
+    }
+
+    /// The ALU differential battery: every op/form/addressing-mode case plus its golden end-state.
+    ///
+    /// HOW TO CAPTURE / REGENERATE GOLDENS (read before editing any `gpr`/`eflags`/`deltas`/`fetch`
+    /// below, and follow this same recipe for every future group-conversion task):
+    ///   1. The goldens are captured from the PRIOR fused reference (`execute_instruction_legacy`),
+    ///      NOT from the new split path. Capturing from the split would be tautological — it would
+    ///      assert the code matches itself and catch nothing.
+    ///   2. Run `cargo test -p izarravm-cpu --lib regen_alu_goldens -- --ignored --nocapture` while
+    ///      the group's fused arm still exists, then paste the printed literals here. For a new
+    ///      group, capture BEFORE you delete its fused arm from `dispatch_opcode`.
+    ///   3. For THIS (ALU) group the fused arm is already gone on `perf-decode-cache`, so the regen
+    ///      helper must be run from the pre-split base commit (332be72): `git stash`, check out the
+    ///      base, run the command, paste, then return. (These goldens were captured exactly so.)
+    ///   4. Never hand-edit a golden to make a failing test pass — re-capture from the reference.
+    fn alu_golden_cases() -> &'static [AluGolden] {
+        &[
             // Forms 0-3 (r/m,reg and reg,r/m, byte and word), several addressing modes.
-            Golden {
+            AluGolden {
                 name: "add ax,bx",
                 code: &[0x01, 0xd8],
                 gpr: [274, 772, 1286, 16, 0, 16, 8, 24],
@@ -13335,7 +13388,7 @@ mod tests {
                 deltas: &[],
                 fetch: 3,
             },
-            Golden {
+            AluGolden {
                 name: "add [bx+si],ax",
                 code: &[0x01, 0x00],
                 gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
@@ -13344,7 +13397,7 @@ mod tests {
                 deltas: &[(24, 2), (25, 1)],
                 fetch: 3,
             },
-            Golden {
+            AluGolden {
                 name: "add [bp+di+4],cx",
                 code: &[0x01, 0x4b, 0x04],
                 gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
@@ -13353,7 +13406,7 @@ mod tests {
                 deltas: &[(44, 4), (45, 3)],
                 fetch: 4,
             },
-            Golden {
+            AluGolden {
                 name: "add [0x20],dx",
                 code: &[0x01, 0x16, 0x20, 0x00],
                 gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
@@ -13362,7 +13415,7 @@ mod tests {
                 deltas: &[(32, 23), (33, 22)],
                 fetch: 5,
             },
-            Golden {
+            AluGolden {
                 name: "add [si],al(byte)",
                 code: &[0x00, 0x04],
                 gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
@@ -13372,7 +13425,7 @@ mod tests {
                 fetch: 3,
             },
             // Every ALU op through word r/m,reg (form 1) with a memory operand: op-by-op coverage.
-            Golden {
+            AluGolden {
                 name: "add [bx],ax(form1)",
                 code: &[0x01, 0x07],
                 gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
@@ -13381,7 +13434,7 @@ mod tests {
                 deltas: &[(16, 2), (17, 1)],
                 fetch: 3,
             },
-            Golden {
+            AluGolden {
                 name: "or [bx],ax(form1)",
                 code: &[0x09, 0x07],
                 gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
@@ -13390,7 +13443,7 @@ mod tests {
                 deltas: &[(16, 2), (17, 1)],
                 fetch: 3,
             },
-            Golden {
+            AluGolden {
                 name: "adc [bx],ax(form1)",
                 code: &[0x11, 0x07],
                 gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
@@ -13399,7 +13452,7 @@ mod tests {
                 deltas: &[(16, 2), (17, 1)],
                 fetch: 3,
             },
-            Golden {
+            AluGolden {
                 name: "sbb [bx],ax(form1)",
                 code: &[0x19, 0x07],
                 gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
@@ -13408,7 +13461,7 @@ mod tests {
                 deltas: &[(16, 254), (17, 254)],
                 fetch: 3,
             },
-            Golden {
+            AluGolden {
                 name: "and [bx],ax(form1)",
                 code: &[0x21, 0x07],
                 gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
@@ -13417,7 +13470,7 @@ mod tests {
                 deltas: &[],
                 fetch: 3,
             },
-            Golden {
+            AluGolden {
                 name: "sub [bx],ax(form1)",
                 code: &[0x29, 0x07],
                 gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
@@ -13426,7 +13479,7 @@ mod tests {
                 deltas: &[(16, 254), (17, 254)],
                 fetch: 3,
             },
-            Golden {
+            AluGolden {
                 name: "xor [bx],ax(form1)",
                 code: &[0x31, 0x07],
                 gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
@@ -13435,7 +13488,7 @@ mod tests {
                 deltas: &[(16, 2), (17, 1)],
                 fetch: 3,
             },
-            Golden {
+            AluGolden {
                 name: "cmp [bx],ax(form1)",
                 code: &[0x39, 0x07],
                 gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
@@ -13445,7 +13498,7 @@ mod tests {
                 fetch: 3,
             },
             // reg,r/m direction (form 3, word; writes a register) and byte directions (forms 0/2).
-            Golden {
+            AluGolden {
                 name: "or cx,[bx+si]",
                 code: &[0x0b, 0x08],
                 gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
@@ -13454,7 +13507,7 @@ mod tests {
                 deltas: &[],
                 fetch: 3,
             },
-            Golden {
+            AluGolden {
                 name: "and dx,[di]",
                 code: &[0x23, 0x15],
                 gpr: [258, 772, 0, 16, 0, 16, 8, 24],
@@ -13463,7 +13516,7 @@ mod tests {
                 deltas: &[],
                 fetch: 3,
             },
-            Golden {
+            AluGolden {
                 name: "adc al,[bx](byte form2)",
                 code: &[0x12, 0x07],
                 gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
@@ -13472,7 +13525,7 @@ mod tests {
                 deltas: &[],
                 fetch: 3,
             },
-            Golden {
+            AluGolden {
                 name: "xor [si],bl(byte form0)",
                 code: &[0x30, 0x1c],
                 gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
@@ -13482,7 +13535,7 @@ mod tests {
                 fetch: 3,
             },
             // Immediate accumulator forms: byte AL,imm8 (form 4) and word AX,imm16 (form 5).
-            Golden {
+            AluGolden {
                 name: "add al,imm8(form4)",
                 code: &[0x04, 0x7f],
                 gpr: [385, 772, 1286, 16, 0, 16, 8, 24],
@@ -13491,7 +13544,7 @@ mod tests {
                 deltas: &[],
                 fetch: 3,
             },
-            Golden {
+            AluGolden {
                 name: "or al,imm8(form4)",
                 code: &[0x0c, 0xaa],
                 gpr: [426, 772, 1286, 16, 0, 16, 8, 24],
@@ -13500,7 +13553,7 @@ mod tests {
                 deltas: &[],
                 fetch: 3,
             },
-            Golden {
+            AluGolden {
                 name: "cmp al,imm8(form4)",
                 code: &[0x3c, 0x05],
                 gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
@@ -13509,7 +13562,7 @@ mod tests {
                 deltas: &[],
                 fetch: 3,
             },
-            Golden {
+            AluGolden {
                 name: "add ax,imm16(form5)",
                 code: &[0x05, 0x34, 0x12],
                 gpr: [4918, 772, 1286, 16, 0, 16, 8, 24],
@@ -13518,7 +13571,7 @@ mod tests {
                 deltas: &[],
                 fetch: 4,
             },
-            Golden {
+            AluGolden {
                 name: "sub ax,imm16(form5)",
                 code: &[0x2d, 0x34, 0x12],
                 gpr: [61134, 772, 1286, 16, 0, 16, 8, 24],
@@ -13527,7 +13580,7 @@ mod tests {
                 deltas: &[],
                 fetch: 4,
             },
-            Golden {
+            AluGolden {
                 name: "cmp ax,imm16(form5)",
                 code: &[0x3d, 0x02, 0x01],
                 gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
@@ -13537,7 +13590,7 @@ mod tests {
                 fetch: 4,
             },
             // Remaining addressing forms carried over from the original battery.
-            Golden {
+            AluGolden {
                 name: "sub [bp+2],ax",
                 code: &[0x29, 0x46, 0x02],
                 gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
@@ -13546,7 +13599,7 @@ mod tests {
                 deltas: &[(18, 254), (19, 254)],
                 fetch: 4,
             },
-            Golden {
+            AluGolden {
                 name: "xor [di],bx",
                 code: &[0x31, 0x1d],
                 gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
@@ -13555,7 +13608,7 @@ mod tests {
                 deltas: &[(24, 16)],
                 fetch: 3,
             },
-            Golden {
+            AluGolden {
                 name: "cmp [bx+4],dx",
                 code: &[0x39, 0x57, 0x04],
                 gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
@@ -13564,8 +13617,19 @@ mod tests {
                 deltas: &[],
                 fetch: 4,
             },
-        ];
-        for g in cases {
+        ]
+    }
+
+    #[test]
+    fn alu_split_matches_golden_across_ops() {
+        // The whole ALU block (ADD/OR/ADC/SBB/AND/SUB/XOR/CMP) is converted to the decode/execute
+        // split, so it can no longer be diffed against a fused executor (that path was deleted to
+        // keep a single ALU implementation). Instead, run each op/form through cycle() and assert
+        // the architectural end-state against goldens captured from the pre-split fused path
+        // (commit 332be72; see `alu_golden_cases` for the capture recipe). This exercises decode's
+        // ModRM/immediate parsing, the executor's operand wiring + write-back gating, the EA
+        // recompute, and the once-only instruction-fetch charge.
+        for g in alu_golden_cases() {
             let mut mem = vec![0u8; 0x200];
             mem[..g.code.len()].copy_from_slice(g.code);
             mem[0x20..0x22].copy_from_slice(&0x1111u16.to_le_bytes());
@@ -13596,6 +13660,65 @@ mod tests {
                 g.fetch,
                 "instruction-fetch cycle count mismatch for {} (seam must charge fetches once)",
                 g.name
+            );
+        }
+    }
+
+    /// Regenerate the `alu_golden_cases` literals from the PRIOR fused reference. Ignored by
+    /// default (it only prints; it asserts nothing). This is the copy-paste template for every
+    /// future group-conversion task: drive each case through `execute_instruction_legacy` (the
+    /// fused path) and print a ready-to-paste golden literal, so the goldens come from the
+    /// reference implementation rather than from the split path they guard (which would be
+    /// tautological).
+    ///
+    /// Run it WHILE the group's fused arm still exists:
+    ///   cargo test -p izarravm-cpu --lib regen_alu_goldens -- --ignored --nocapture
+    /// For the ALU group specifically the fused arm is already deleted on this branch, so this must
+    /// be run from the pre-split base commit (332be72) — see the recipe on `alu_golden_cases`. A
+    /// case whose opcode the current fused path can no longer execute prints a TODO marker instead
+    /// of a wrong literal, so a stale run can never silently bake bad goldens.
+    ///
+    /// The printed `code` bytes are decimal (e.g. `&[1, 216]`); that compiles identically to the
+    /// hex source form, so paste the numeric result fields and keep your hex encoding if preferred.
+    #[test]
+    #[ignore = "prints golden literals; run with --ignored --nocapture against the fused reference"]
+    fn regen_alu_goldens() {
+        for g in alu_golden_cases() {
+            let mut mem = vec![0u8; 0x200];
+            mem[..g.code.len()].copy_from_slice(g.code);
+            mem[0x20..0x22].copy_from_slice(&0x1111u16.to_le_bytes());
+            let initial = mem.clone();
+
+            let mut fused = Cpu386::default();
+            seam_seed(&mut fused);
+            let mut fbus = TestBus::with_memory(mem);
+            fused.begin_instruction();
+            // The fused reference is the source of truth. If it errors, the group's fused arm is
+            // gone from THIS checkout: re-run from the base commit instead of pasting bad output.
+            if fused.execute_instruction_legacy(&mut fbus).is_err() {
+                println!(
+                    "            // TODO regen {}: fused path unavailable here; run from base commit 332be72",
+                    g.name
+                );
+                continue;
+            }
+            let deltas: Vec<(usize, u8)> = fbus
+                .memory
+                .iter()
+                .enumerate()
+                .filter(|(i, b)| **b != initial[*i])
+                .map(|(i, b)| (i, *b))
+                .collect();
+            let fetch = seam_fetch_count(&fbus);
+            println!(
+                "            AluGolden {{ name: {:?}, code: &{:?}, gpr: {:?}, eflags: {:#x}, eip: {:#x}, deltas: &{:?}, fetch: {} }},",
+                g.name,
+                g.code,
+                fused.registers.gpr,
+                fused.registers.eflags,
+                fused.registers.eip,
+                deltas,
+                fetch,
             );
         }
     }
