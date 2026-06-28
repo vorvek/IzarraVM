@@ -819,6 +819,17 @@ enum DecodeGroup {
     /// `div`/`inc_dec` verbatim so the flag and #DE/#UD fault logic lives in exactly one place.
     /// Group 5 (0xff: indirect CALL/JMP, control flow) is deliberately NOT here.
     Group,
+    /// The relative-displacement + loop control-flow block (task A6a): Jcc short (0x70-0x7f, rel8),
+    /// the two-byte Jcc near (0F 80-0F 8F, rel16/32 — folded into `insn.opcode` as 0x0F8x by the
+    /// two-byte convention), JMP short (0xeb, rel8), JMP near (0xe9, rel16/32), CALL near (0xe8,
+    /// rel16/32), and the loop/JCXZ branches (0xe0-0xe3, rel8). Every one ends in a single
+    /// `relative_jump(disp, operand_size)` when taken, so `decode` reads the displacement (sign-
+    /// extended to i32 per the rel8/rel16/rel32 width, charging its fetch once) and stores it in
+    /// `insn.imm`; the executor re-uses it without re-fetching. eip is already at the instruction
+    /// end when the executor runs (decode advanced it), so the eip-relative target math is bit-for-
+    /// bit identical to the fused path. The far/indirect/RET/INT control flow and 0xFF group 5 stay
+    /// on Fallback/TwoByteFallback (task A6b) — do NOT route them here.
+    Branch,
     /// Not yet converted to the split: decode parses nothing extra and `execute_decoded` hands the
     /// opcode to the shared fused `dispatch_opcode`.
     Fallback,
@@ -1141,6 +1152,9 @@ impl Cpu386 {
         if opcode & 0xff00 == 0x0f00 {
             return match opcode & 0xff {
                 0xb6 | 0xb7 | 0xbe | 0xbf => DecodeGroup::DataMove,
+                // Two-byte Jcc near (0F 80-0F 8F, rel16/32). The branch group (task A6a) handles
+                // these; every other 0F opcode stays on the un-converted fused path.
+                0x80..=0x8f => DecodeGroup::Branch,
                 _ => DecodeGroup::TwoByteFallback,
             };
         }
@@ -1190,6 +1204,14 @@ impl Cpu386 {
             0x80..=0x83 | 0xc0 | 0xc1 | 0xd0..=0xd3 | 0xf6 | 0xf7 | 0xfe
         ) {
             return DecodeGroup::Group;
+        }
+        // Relative-displacement + loop control flow (task A6a): Jcc short (0x70-0x7f), the loop/JCXZ
+        // branches (0xe0-0xe3), CALL near (0xe8), JMP near (0xe9), JMP short (0xeb). The two-byte
+        // Jcc near forms are routed in the 0F block above. The far/indirect/RET/INT control flow
+        // (0x9a/0xc2/0xc3/0xca/0xcb/0xcc/0xcd/0xce/0xcf/0xea) and 0xff group 5 are task A6b and stay
+        // on Fallback — do NOT list them here.
+        if matches!(opcode, 0x70..=0x7f | 0xe0..=0xe3 | 0xe8 | 0xe9 | 0xeb) {
+            return DecodeGroup::Branch;
         }
         DecodeGroup::Fallback
     }
@@ -1400,6 +1422,29 @@ impl Cpu386 {
                     _ => {}
                 }
             }
+            DecodeGroup::Branch => {
+                // Relative-displacement + loop control flow. Every opcode here carries a relative
+                // displacement and nothing else; fetch it now (charging its fetch clocks once) and
+                // store it sign-extended to i32 in `insn.imm`. The executor replays the SAME
+                // `relative_jump(disp, operand_size)` math the fused path used, so the byte width of
+                // the sign-extension is what matters and is matched per-opcode here:
+                //   - rel8 (Jcc short 0x70-0x7f, the loop/JCXZ branches 0xe0-0xe3, JMP short 0xeb):
+                //     one displacement byte, sign-extended.
+                //   - rel16/32 (CALL near 0xe8, JMP near 0xe9, two-byte Jcc near 0x0F80-0x0F8F):
+                //     operand-size-wide displacement, sign-extended (matching `fetch_relative`).
+                // Storing the displacement (not the target) keeps the eip-relative computation in
+                // the executor, where eip is already at the instruction end.
+                match insn.opcode {
+                    0x70..=0x7f | 0xe0..=0xe3 | 0xeb => {
+                        insn.imm = self.fetch_i8(bus)? as i32 as u32;
+                    }
+                    // 0xe8/0xe9 (single byte) and 0x0F80-0x0F8F (two byte) take an operand-size-wide
+                    // relative displacement.
+                    _ => {
+                        insn.imm = self.fetch_relative(bus, operand_size)? as u32;
+                    }
+                }
+            }
             // Both fallback groups pre-parse nothing in `decode` (the second 0F byte was already
             // folded into `insn.opcode` above): their executors re-read any ModRM/immediate from the
             // post-opcode eip in the shared fused dispatch.
@@ -1443,6 +1488,10 @@ impl Cpu386 {
             // The arithmetic /ext groups 1-4 run through their split executor, consuming the
             // ModRM (whose `reg` is the sub-op) and the conditional immediate `decode` pre-parsed.
             DecodeGroup::Group => self.execute_group_decoded(insn, bus),
+            // The relative-displacement + loop control-flow block runs through its split executor,
+            // consuming the relative displacement `decode` pre-parsed (eip is already at the
+            // instruction end, so the eip-relative target math matches the fused path).
+            DecodeGroup::Branch => self.execute_branch_decoded(insn, bus),
             DecodeGroup::TwoByteFallback => {
                 // Un-converted two-byte (0F) opcode. `decode` already read + charged the second
                 // byte and applied the ISA gate, folding it into `insn.opcode` as 0x0F00 | second.
@@ -2202,6 +2251,108 @@ impl Cpu386 {
         }
     }
 
+    /// The relative-displacement + loop control-flow block (Jcc short/near, JMP short/near, CALL
+    /// near, LOOP/LOOPE/LOOPNE/JCXZ) through the decode/execute split. Each arm mirrors its former
+    /// fused handler verbatim — same condition/count test, same push order for CALL, same clocks —
+    /// but takes the relative displacement from `insn.imm` (decode already fetched + sign-extended +
+    /// charged it) instead of re-reading it. eip is already at the instruction end here (decode
+    /// advanced it), so `relative_jump(disp, operand_size)` reproduces the fused eip-relative target
+    /// math (16- vs 32-bit IP wrap, operand-size mask) bit-for-bit.
+    fn execute_branch_decoded<B: CpuBus>(
+        &mut self,
+        insn: &DecodedInsn,
+        bus: &mut B,
+    ) -> ExecResult<CycleOutcome> {
+        let operand_size = insn.operand_size;
+        let address_size = insn.address_size;
+        // The displacement was stored sign-extended (rel8/rel16/rel32) as i32 by `decode`.
+        let rel = insn.imm as i32;
+
+        // The two-byte Jcc near (0x0F80-0x0F8F) must be matched on the FULL u16 BEFORE any `as u8`
+        // narrowing — `insn.opcode as u8` would alias 0x0F8x onto the single-byte 0x8x opcodes. Both
+        // the single-byte Jcc short (0x70-0x7f) and the two-byte Jcc near share the same condition
+        // mapping (the low nibble), so handle them together off `insn.opcode & 0x0f`. Same clocks (3)
+        // as the fused Jcc handlers.
+        if matches!(insn.opcode, 0x70..=0x7f | 0x0f80..=0x0f8f) {
+            if self.condition((insn.opcode & 0x0f) as u8) {
+                self.relative_jump(rel, operand_size);
+            }
+            return Ok(clocks(3));
+        }
+
+        match insn.opcode as u8 {
+            0xe0 | 0xe1 => {
+                // LOOPNE (E0) / LOOPE (E1): decrement (E)CX, branch while non-zero and ZF matches.
+                let count_nonzero = match address_size {
+                    AddressSize::Word => {
+                        let next = self.read_gpr16(1).wrapping_sub(1);
+                        self.write_gpr16(1, next);
+                        next != 0
+                    }
+                    AddressSize::Dword => {
+                        let next = self.registers.ecx().wrapping_sub(1);
+                        self.registers.set_ecx(next);
+                        next != 0
+                    }
+                };
+                let zf = self.flag(FLAG_ZF);
+                let taken = count_nonzero && (if insn.opcode as u8 == 0xe1 { zf } else { !zf });
+                if taken {
+                    self.relative_jump(rel, operand_size);
+                }
+                Ok(clocks(11))
+            }
+            0xe2 => {
+                // LOOP: decrement (E)CX, branch while non-zero.
+                let taken = match address_size {
+                    AddressSize::Word => {
+                        let next = self.read_gpr16(1).wrapping_sub(1);
+                        self.write_gpr16(1, next);
+                        next != 0
+                    }
+                    AddressSize::Dword => {
+                        let next = self.registers.ecx().wrapping_sub(1);
+                        self.registers.set_ecx(next);
+                        next != 0
+                    }
+                };
+                if taken {
+                    self.relative_jump(rel, operand_size);
+                }
+                Ok(clocks(11))
+            }
+            0xe3 => {
+                // JCXZ / JECXZ: no decrement; branch when (E)CX is zero.
+                let count_zero = match address_size {
+                    AddressSize::Word => self.read_gpr16(1) == 0,
+                    AddressSize::Dword => self.registers.ecx() == 0,
+                };
+                if count_zero {
+                    self.relative_jump(rel, operand_size);
+                }
+                Ok(clocks(9))
+            }
+            0xe8 => {
+                // CALL near, relative. Push the return address (eip, already at the instruction
+                // end) before branching — the same order the fused handler used.
+                self.push(bus, self.registers.eip, operand_size)?;
+                self.relative_jump(rel, operand_size);
+                Ok(clocks(7))
+            }
+            0xe9 => {
+                // JMP near, relative.
+                self.relative_jump(rel, operand_size);
+                Ok(clocks(7))
+            }
+            0xeb => {
+                // JMP short, relative.
+                self.relative_jump(rel, operand_size);
+                Ok(clocks(7))
+            }
+            opcode => unreachable!("branch opcode {opcode:#x}"),
+        }
+    }
+
     // Transitional fused entry: reads the prefixes + opcode + LOCK check itself, then dispatches.
     // The production `cycle` path goes through `decode`/`execute_decoded` (which call
     // `dispatch_opcode` directly to keep the fetch clocks charged once), so this whole-instruction
@@ -2354,13 +2505,9 @@ impl Cpu386 {
                 )?;
                 Ok(clocks(14))
             }
-            0x70..=0x7f => {
-                let rel = self.fetch_i8(bus)? as i32;
-                if self.condition(opcode & 0x0f) {
-                    self.relative_jump(rel, operand_size);
-                }
-                Ok(clocks(3))
-            }
+            // 0x70-0x7f (Jcc short, rel8) are converted to the decode/execute split:
+            // `route_group` classifies them as `DecodeGroup::Branch` and `execute_branch_decoded`
+            // runs them. Not handled here.
             // 0x80/0x81/0x82/0x83 (group 1 ALU r/m,imm; 0x82 is the undocumented 0x80 alias) are
             // converted to the decode/execute split: `route_group` classifies them as
             // `DecodeGroup::Group` and `execute_group_decoded` runs them. Not handled here.
@@ -2626,59 +2773,9 @@ impl Cpu386 {
                 Ok(clocks(2))
             }
             0xd8..=0xdf => self.execute_fpu(bus, opcode, prefixes, address_size),
-            0xe0 | 0xe1 => {
-                // LOOPNE (E0) / LOOPE (E1): decrement (E)CX, branch while non-zero and ZF matches.
-                let rel = self.fetch_i8(bus)? as i32;
-                let count_nonzero = match address_size {
-                    AddressSize::Word => {
-                        let next = self.read_gpr16(1).wrapping_sub(1);
-                        self.write_gpr16(1, next);
-                        next != 0
-                    }
-                    AddressSize::Dword => {
-                        let next = self.registers.ecx().wrapping_sub(1);
-                        self.registers.set_ecx(next);
-                        next != 0
-                    }
-                };
-                let zf = self.flag(FLAG_ZF);
-                let taken = count_nonzero && (if opcode == 0xe1 { zf } else { !zf });
-                if taken {
-                    self.relative_jump(rel, operand_size);
-                }
-                Ok(clocks(11))
-            }
-            0xe2 => {
-                let rel = self.fetch_i8(bus)? as i32;
-                let taken = match address_size {
-                    AddressSize::Word => {
-                        let next = self.read_gpr16(1).wrapping_sub(1);
-                        self.write_gpr16(1, next);
-                        next != 0
-                    }
-                    AddressSize::Dword => {
-                        let next = self.registers.ecx().wrapping_sub(1);
-                        self.registers.set_ecx(next);
-                        next != 0
-                    }
-                };
-                if taken {
-                    self.relative_jump(rel, operand_size);
-                }
-                Ok(clocks(11))
-            }
-            0xe3 => {
-                // JCXZ / JECXZ: no decrement; branch when (E)CX is zero.
-                let rel = self.fetch_i8(bus)? as i32;
-                let count_zero = match address_size {
-                    AddressSize::Word => self.read_gpr16(1) == 0,
-                    AddressSize::Dword => self.registers.ecx() == 0,
-                };
-                if count_zero {
-                    self.relative_jump(rel, operand_size);
-                }
-                Ok(clocks(9))
-            }
+            // 0xe0/0xe1 (LOOPNE/LOOPE), 0xe2 (LOOP), 0xe3 (JCXZ/JECXZ) are converted to the
+            // decode/execute split: `route_group` classifies them as `DecodeGroup::Branch` and
+            // `execute_branch_decoded` runs them. Not handled here.
             0xe4 => {
                 let port = u16::from(self.fetch_u8(bus)?);
                 let value = bus.read_io(port, BusWidth::Byte)? as u8;
@@ -2735,22 +2832,9 @@ impl Cpu386 {
                 )?;
                 Ok(clocks(10))
             }
-            0xe8 => {
-                let rel = self.fetch_relative(bus, operand_size)?;
-                self.push(bus, self.registers.eip, operand_size)?;
-                self.relative_jump(rel, operand_size);
-                Ok(clocks(7))
-            }
-            0xe9 => {
-                let rel = self.fetch_relative(bus, operand_size)?;
-                self.relative_jump(rel, operand_size);
-                Ok(clocks(7))
-            }
-            0xeb => {
-                let rel = self.fetch_i8(bus)? as i32;
-                self.relative_jump(rel, operand_size);
-                Ok(clocks(7))
-            }
+            // 0xe8 (CALL near, rel16/32), 0xe9 (JMP near, rel16/32), 0xeb (JMP short, rel8) are
+            // converted to the decode/execute split: `route_group` classifies them as
+            // `DecodeGroup::Branch` and `execute_branch_decoded` runs them. Not handled here.
             0x9b => {
                 // WAIT/FWAIT: trap with #MF if the x87 has a pending unmasked exception
                 // (gated on CR0.NE; otherwise the FERR#/IRQ13 path the PC uses applies and
@@ -3256,13 +3340,9 @@ impl Cpu386 {
                 }
                 Ok(clocks(1))
             }
-            0x80..=0x8f => {
-                let rel = self.fetch_relative(bus, operand_size)?;
-                if self.condition(opcode & 0x0f) {
-                    self.relative_jump(rel, operand_size);
-                }
-                Ok(clocks(3))
-            }
+            // 0x80-0x8f (Jcc near, rel16/32) are converted to the decode/execute split: `decode`
+            // folds them into `insn.opcode` as 0x0F80-0x0F8F, `route_group` classifies them as
+            // `DecodeGroup::Branch`, and `execute_branch_decoded` runs them. Not handled here.
             0x90..=0x9f => {
                 // SETcc r/m8: set the byte to 1 when the condition holds, else 0. The condition
                 // code is the low nibble of the opcode; SETcc is always byte-wide and touches no
@@ -16535,5 +16615,290 @@ mod tests {
             3,
             "the split must charge the same fetches as the non-faulting div bl golden (3)"
         );
+    }
+
+    /// One golden end-state for a relative/loop branch case (task A6a). Adds `cx` to the shared
+    /// golden shape so a single battery can drive both the taken and not-taken LOOP/JCXZ/LOOPcc
+    /// outcomes (which differ only in the post-decrement count) from one seed — `branch_seed`
+    /// overwrites CX with this per-case value before the instruction runs. The captured fields are
+    /// the standard set: end gpr (AX,CX,DX,BX,SP,BP,SI,DI), eflags, eip (the branch target — the key
+    /// assertion for this group), (offset,value) memory writes (CALL's pushed return address), and
+    /// the InstructionPrefetch fetch count.
+    struct BranchGolden {
+        name: &'static str,
+        code: &'static [u8],
+        cx: u32,
+        gpr: [u32; 8],
+        eflags: u32,
+        eip: u32,
+        deltas: &'static [(usize, u8)],
+        fetch: usize,
+    }
+
+    /// Seed for the branch golden battery. CS/DS/SS = 0, eip = 0, SP = 0x100 (a safe in-image stack
+    /// so CALL's push lands in the 0x200-byte image), ZF pre-set (so the Jcc/LOOPcc condition cases
+    /// are deterministic), and CX set per case (the caller overwrites it from `BranchGolden::cx`).
+    fn branch_seed(cpu: &mut Cpu386, cx: u32) {
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Sp, 0x0100);
+        cpu.set_flag(FLAG_ZF, true);
+        cpu.registers.set_ecx(cx);
+    }
+
+    /// The relative/loop branch differential battery. Captured from the PRIOR fused reference via
+    /// `regen_branch_goldens`; see `alu_golden_cases` for the full capture recipe. The branch group's
+    /// fused arms (0x70-0x7f, 0xe0-0xe3, 0xe8/0xe9/0xeb, 0F 80-0F 8F) are already deleted on
+    /// `perf-decode-cache`, so these were captured from the pre-split base commit (a94ed279): check
+    /// it out, run the regen, paste, return. Never hand-edit a golden — re-capture from the reference.
+    /// Covers: Jcc short taken/not-taken (JZ/JNZ with ZF set), Jcc near (two-byte) taken/not-taken,
+    /// JMP short, JMP near, CALL near (the pushed return address + SP delta), LOOP taken (CX
+    /// decremented, nonzero) and not-taken (CX hits 0), LOOPE/LOOPNE (ZF interaction), and JCXZ
+    /// taken (CX==0) / not-taken (CX!=0).
+    fn branch_golden_cases() -> &'static [BranchGolden] {
+        &[
+            // Jcc short (rel8). ZF is pre-set, so JZ is taken and JNZ falls through.
+            BranchGolden {
+                name: "jz +5 taken (74, ZF set)",
+                code: &[0x74, 0x05],
+                cx: 3,
+                gpr: [0, 3, 0, 0, 256, 0, 0, 0],
+                eflags: 0x42,
+                eip: 0x7,
+                deltas: &[],
+                fetch: 3,
+            },
+            BranchGolden {
+                name: "jnz +5 not taken (75, ZF set)",
+                code: &[0x75, 0x05],
+                cx: 3,
+                gpr: [0, 3, 0, 0, 256, 0, 0, 0],
+                eflags: 0x42,
+                eip: 0x2,
+                deltas: &[],
+                fetch: 3,
+            },
+            // Jcc short with a backward (negative) rel8 — exercises the sign-extension.
+            BranchGolden {
+                name: "jz -2 taken backward (74, ZF set)",
+                code: &[0x74, 0xfe],
+                cx: 3,
+                gpr: [0, 3, 0, 0, 256, 0, 0, 0],
+                eflags: 0x42,
+                eip: 0x0,
+                deltas: &[],
+                fetch: 3,
+            },
+            // Jcc near, two-byte (rel16). ZF pre-set: 0F 84 taken, 0F 85 falls through.
+            BranchGolden {
+                name: "jz near +0x100 taken (0F 84, ZF set)",
+                code: &[0x0f, 0x84, 0x00, 0x01],
+                cx: 3,
+                gpr: [0, 3, 0, 0, 256, 0, 0, 0],
+                eflags: 0x42,
+                eip: 0x104,
+                deltas: &[],
+                fetch: 5,
+            },
+            BranchGolden {
+                name: "jnz near +0x100 not taken (0F 85, ZF set)",
+                code: &[0x0f, 0x85, 0x00, 0x01],
+                cx: 3,
+                gpr: [0, 3, 0, 0, 256, 0, 0, 0],
+                eflags: 0x42,
+                eip: 0x4,
+                deltas: &[],
+                fetch: 5,
+            },
+            // JMP short (rel8) and JMP near (rel16): unconditional.
+            BranchGolden {
+                name: "jmp short +5 (eb)",
+                code: &[0xeb, 0x05],
+                cx: 3,
+                gpr: [0, 3, 0, 0, 256, 0, 0, 0],
+                eflags: 0x42,
+                eip: 0x7,
+                deltas: &[],
+                fetch: 3,
+            },
+            BranchGolden {
+                name: "jmp near +0x100 (e9)",
+                code: &[0xe9, 0x00, 0x01],
+                cx: 3,
+                gpr: [0, 3, 0, 0, 256, 0, 0, 0],
+                eflags: 0x42,
+                eip: 0x103,
+                deltas: &[],
+                fetch: 4,
+            },
+            // CALL near (rel16): push the return address (post-instruction eip = 3) then branch.
+            // SP drops by 2 (0x100 -> 0xfe) and [SS:0xfe] holds the little-endian return address.
+            BranchGolden {
+                name: "call near +0x100 (e8, push return)",
+                code: &[0xe8, 0x00, 0x01],
+                cx: 3,
+                gpr: [0, 3, 0, 0, 254, 0, 0, 0],
+                eflags: 0x42,
+                eip: 0x103,
+                deltas: &[(0xfe, 0x03)],
+                fetch: 4,
+            },
+            // LOOP (0xe2): decrement CX, branch while nonzero.
+            BranchGolden {
+                name: "loop +5 taken (e2, cx 3->2)",
+                code: &[0xe2, 0x05],
+                cx: 3,
+                gpr: [0, 2, 0, 0, 256, 0, 0, 0],
+                eflags: 0x42,
+                eip: 0x7,
+                deltas: &[],
+                fetch: 3,
+            },
+            BranchGolden {
+                name: "loop +5 not taken (e2, cx 1->0)",
+                code: &[0xe2, 0x05],
+                cx: 1,
+                gpr: [0, 0, 0, 0, 256, 0, 0, 0],
+                eflags: 0x42,
+                eip: 0x2,
+                deltas: &[],
+                fetch: 3,
+            },
+            // LOOPE (0xe1, loops while ZF=1) and LOOPNE (0xe0, loops while ZF=0). ZF pre-set.
+            BranchGolden {
+                name: "loope +5 taken (e1, ZF set, cx 3->2)",
+                code: &[0xe1, 0x05],
+                cx: 3,
+                gpr: [0, 2, 0, 0, 256, 0, 0, 0],
+                eflags: 0x42,
+                eip: 0x7,
+                deltas: &[],
+                fetch: 3,
+            },
+            BranchGolden {
+                name: "loopne +5 not taken (e0, ZF set, cx 3->2)",
+                code: &[0xe0, 0x05],
+                cx: 3,
+                gpr: [0, 2, 0, 0, 256, 0, 0, 0],
+                eflags: 0x42,
+                eip: 0x2,
+                deltas: &[],
+                fetch: 3,
+            },
+            // JCXZ (0xe3): branch when CX == 0, no decrement.
+            BranchGolden {
+                name: "jcxz +5 taken (e3, cx==0)",
+                code: &[0xe3, 0x05],
+                cx: 0,
+                gpr: [0, 0, 0, 0, 256, 0, 0, 0],
+                eflags: 0x42,
+                eip: 0x7,
+                deltas: &[],
+                fetch: 3,
+            },
+            BranchGolden {
+                name: "jcxz +5 not taken (e3, cx!=0)",
+                code: &[0xe3, 0x05],
+                cx: 1,
+                gpr: [0, 1, 0, 0, 256, 0, 0, 0],
+                eflags: 0x42,
+                eip: 0x2,
+                deltas: &[],
+                fetch: 3,
+            },
+        ]
+    }
+
+    #[test]
+    fn branch_split_matches_golden_across_ops() {
+        // The relative/loop branch block (Jcc short/near, JMP short/near, CALL near, LOOP/LOOPE/
+        // LOOPNE/JCXZ) is converted to the decode/execute split, so its fused arms are deleted and it
+        // can no longer be diffed against a fused executor. Run each case through cycle() (the split)
+        // and assert the architectural end-state against goldens captured from the pre-split fused
+        // path via `regen_branch_goldens`. The eip field is the load-bearing assertion: it is the
+        // branch target, proving decode stored the right sign-extended displacement and the executor
+        // reproduced the fused eip-relative math (rel8 vs rel16, taken vs fall-through). CALL also
+        // asserts the pushed return address (memory delta) and the SP decrement (gpr[4]).
+        for g in branch_golden_cases() {
+            let mut mem = vec![0u8; 0x200];
+            mem[..g.code.len()].copy_from_slice(g.code);
+            let initial = mem.clone();
+
+            let mut split = Cpu386::default();
+            branch_seed(&mut split, g.cx);
+            let mut sbus = TestBus::with_memory(mem);
+            let _ = split.cycle(&mut sbus);
+
+            assert_eq!(split.registers.gpr, g.gpr, "gpr mismatch for {}", g.name);
+            assert_eq!(
+                split.registers.eflags, g.eflags,
+                "eflags mismatch for {}",
+                g.name
+            );
+            assert_eq!(split.registers.eip, g.eip, "eip mismatch for {}", g.name);
+            let deltas: Vec<(usize, u8)> = sbus
+                .memory
+                .iter()
+                .enumerate()
+                .filter(|(i, b)| **b != initial[*i])
+                .map(|(i, b)| (i, *b))
+                .collect();
+            assert_eq!(deltas, g.deltas, "memory-write mismatch for {}", g.name);
+            assert_eq!(
+                seam_fetch_count(&sbus),
+                g.fetch,
+                "instruction-fetch cycle count mismatch for {} (seam must charge fetches once)",
+                g.name
+            );
+        }
+    }
+
+    /// Regenerate `branch_golden_cases` from the fused reference. Ignored by default.
+    /// The branch fused arms are already deleted on `perf-decode-cache`, so run this from the
+    /// pre-split base commit (a94ed279) where they still exist:
+    ///   git stash && git checkout a94ed279
+    ///   cargo test -p izarravm-cpu --lib regen_branch_goldens -- --ignored --nocapture
+    /// then paste the output over `branch_golden_cases`, return to the branch, and only then trust it.
+    #[test]
+    #[ignore = "prints golden literals; run with --ignored --nocapture against the fused reference"]
+    fn regen_branch_goldens() {
+        for g in branch_golden_cases() {
+            let mut mem = vec![0u8; 0x200];
+            mem[..g.code.len()].copy_from_slice(g.code);
+            let initial = mem.clone();
+
+            let mut fused = Cpu386::default();
+            branch_seed(&mut fused, g.cx);
+            let mut fbus = TestBus::with_memory(mem);
+            fused.begin_instruction();
+            if fused.execute_instruction_legacy(&mut fbus).is_err() {
+                println!(
+                    "            // TODO regen {}: fused path unavailable here; run against the base commit",
+                    g.name
+                );
+                continue;
+            }
+            let deltas: Vec<(usize, u8)> = fbus
+                .memory
+                .iter()
+                .enumerate()
+                .filter(|(i, b)| **b != initial[*i])
+                .map(|(i, b)| (i, *b))
+                .collect();
+            let fetch = seam_fetch_count(&fbus);
+            println!(
+                "            BranchGolden {{ name: {:?}, code: &{:?}, cx: {}, gpr: {:?}, eflags: {:#x}, eip: {:#x}, deltas: &{:?}, fetch: {} }},",
+                g.name,
+                g.code,
+                g.cx,
+                fused.registers.gpr,
+                fused.registers.eflags,
+                fused.registers.eip,
+                deltas,
+                fetch,
+            );
+        }
     }
 }
