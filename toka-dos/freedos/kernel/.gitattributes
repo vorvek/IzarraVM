@@ -1,0 +1,6 @@
+* text eol=crlf
+*.up -text
+*.UP -text
+ci_*.sh text eol=lf
+.travis.yml text eol=lf
+.github/workflows/*.yml text eol=lf
