@@ -808,6 +808,17 @@ enum DecodeGroup {
     /// or the immediate bytes (for 0x68/0x6a/0xc8) and stores them; the executor re-uses
     /// pre-parsed values so no instruction bytes are re-fetched.
     Stack,
+    /// The arithmetic /ext groups 1-4, every one a ModRM whose `reg` field selects the sub-op:
+    /// group 1 ALU r/m,imm (0x80/0x81/0x82/0x83), group 2 shift/rotate (0xc0/0xc1/0xd0-0xd3),
+    /// group 3 TEST/NOT/NEG/MUL/IMUL/DIV/IDIV (0xf6/0xf7), and group 4 INC/DEC byte (0xfe).
+    /// `decode` parses the ModRM + addressing descriptor and then the immediate IF this opcode
+    /// carries one: group 1 always (imm8 for 0x80/0x82, imm16/32 for 0x81, sign-extended imm8
+    /// for 0x83), group 2's count-by-imm8 forms (0xc0/0xc1) always, but group 3's immediate is
+    /// present ONLY for the TEST sub-op (`reg <= 1`) — NOT/NEG/MUL/IMUL/DIV/IDIV have none, so
+    /// the byte budget changes with `reg`. The executor reuses `self.alu`/`shift_rotate`/`mul`/
+    /// `div`/`inc_dec` verbatim so the flag and #DE/#UD fault logic lives in exactly one place.
+    /// Group 5 (0xff: indirect CALL/JMP, control flow) is deliberately NOT here.
+    Group,
     /// Not yet converted to the split: decode parses nothing extra and `execute_decoded` hands the
     /// opcode to the shared fused `dispatch_opcode`.
     Fallback,
@@ -838,9 +849,9 @@ enum FetchCost {
 /// converted to the decode/execute split, the pre-parsed ModRM, operand descriptor, and
 /// immediate. Opcodes still on the legacy path leave `modrm`/`operand` as `None` (and `imm` 0)
 /// and are re-read by `execute_instruction_legacy`.
-// Stage-A scaffold: `imm` is now read by the converted ALU immediate forms; `imm2` (and the
-// `len`/`fetch` placeholders) are populated by `decode` but stay unread until later tasks convert
-// two-immediate opcodes and the cache stage lands.
+// Stage-A scaffold: `imm` is read by the converted ALU/group immediate forms and `imm2` by the
+// converted ENTER (and any other second-immediate form); the `len`/`fetch` placeholders are
+// populated by `decode` but stay unread until the cache stage lands.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 struct DecodedInsn {
@@ -859,6 +870,9 @@ struct DecodedInsn {
     /// address MOV forms 0xA0-0xA3 (decode fetches it address-size-wide; the executor uses it as
     /// the memory offset, not as a data immediate).
     imm: u32,
+    /// A second immediate when the encoding carries two: ENTER's nesting level (0xc8, masked to
+    /// 5 bits in `decode`). Available for any future group/other form that needs a second
+    /// immediate; left 0 for the single-immediate and no-immediate opcodes.
     imm2: u32,
 }
 
@@ -1167,6 +1181,16 @@ impl Cpu386 {
         ) {
             return DecodeGroup::Stack;
         }
+        // Arithmetic /ext groups 1-4 (every one a ModRM whose `reg` selects the sub-op): group 1
+        // ALU r/m,imm (0x80-0x83), group 2 shift/rotate (0xc0/0xc1/0xd0-0xd3), group 3 TEST/NOT/
+        // NEG/MUL/IMUL/DIV/IDIV (0xf6/0xf7), group 4 INC/DEC byte (0xfe). 0xff (group 5) is the
+        // indirect-CALL/JMP control-flow group and stays on Fallback — do NOT list it here.
+        if matches!(
+            opcode,
+            0x80..=0x83 | 0xc0 | 0xc1 | 0xd0..=0xd3 | 0xf6 | 0xf7 | 0xfe
+        ) {
+            return DecodeGroup::Group;
+        }
         DecodeGroup::Fallback
     }
 
@@ -1342,6 +1366,40 @@ impl Cpu386 {
                     _ => {}
                 }
             }
+            DecodeGroup::Group => {
+                // Arithmetic /ext groups 1-4. Every opcode here is a ModRM whose `reg` field is
+                // the sub-op selector; parse the ModRM + addressing descriptor (instruction bytes
+                // only, so it stays cacheable) for all of them. Then fetch the immediate ONLY for
+                // the opcodes that carry one, mirroring each fused handler's fetch order exactly so
+                // the bytes consumed (and thus the fetch clocks charged) are byte-identical:
+                //   - group 1 (0x80-0x83): always an immediate. 0x80/0x82 imm8, 0x81 imm16/32,
+                //     0x83 a sign-extended imm8 (sign-extend here so the executor takes `imm` as-is,
+                //     matching the fused handler which sign-extended at fetch time).
+                //   - group 2 count-by-imm8 (0xc0/0xc1): always one imm8 count byte. The 1/CL forms
+                //     (0xd0-0xd3) and group 4 (0xfe) carry NO immediate.
+                //   - group 3 (0xf6/0xf7): an immediate ONLY for the TEST sub-op. The fused
+                //     reference implements TEST as `reg == 0` alone (the `reg == 1` alias is NOT a
+                //     TEST there — it falls through to UnsupportedGroupOpcode and consumes no
+                //     immediate), so we match it exactly: fetch the immediate only for `reg == 0`.
+                //     NOT/NEG/MUL/IMUL/DIV/IDIV (and the undefined reg==1) have none, so the byte
+                //     budget here depends on `reg`. Getting this conditional wrong mis-charges the
+                //     fetch and diverges from the fused path.
+                let modrm = self.fetch_modrm(bus)?;
+                let operand = self.parse_addressing_mode(bus, prefixes, address_size, modrm)?;
+                insn.modrm = Some(modrm);
+                insn.operand = Some(operand);
+                match opcode {
+                    0x80 | 0x82 => insn.imm = u32::from(self.fetch_u8(bus)?),
+                    0x81 => insn.imm = self.fetch_immediate(bus, operand_size)?,
+                    0x83 => insn.imm = sign_extend_u8(self.fetch_u8(bus)?),
+                    0xc0 | 0xc1 => insn.imm = u32::from(self.fetch_u8(bus)?),
+                    0xf6 if modrm.reg == 0 => insn.imm = u32::from(self.fetch_u8(bus)?),
+                    0xf7 if modrm.reg == 0 => insn.imm = self.fetch_immediate(bus, operand_size)?,
+                    // 0xd0-0xd3 (count 1/CL), 0xfe (INC/DEC), and 0xf6/0xf7 with reg!=0 carry no
+                    // immediate after the ModRM.
+                    _ => {}
+                }
+            }
             // Both fallback groups pre-parse nothing in `decode` (the second 0F byte was already
             // folded into `insn.opcode` above): their executors re-read any ModRM/immediate from the
             // post-opcode eip in the shared fused dispatch.
@@ -1382,6 +1440,9 @@ impl Cpu386 {
             // The stack block runs through its split executor, consuming the ModRM/immediate
             // `decode` pre-parsed.
             DecodeGroup::Stack => self.execute_stack_decoded(insn, bus),
+            // The arithmetic /ext groups 1-4 run through their split executor, consuming the
+            // ModRM (whose `reg` is the sub-op) and the conditional immediate `decode` pre-parsed.
+            DecodeGroup::Group => self.execute_group_decoded(insn, bus),
             DecodeGroup::TwoByteFallback => {
                 // Un-converted two-byte (0F) opcode. `decode` already read + charged the second
                 // byte and applied the ISA gate, folding it into `insn.opcode` as 0x0F00 | second.
@@ -1984,6 +2045,163 @@ impl Cpu386 {
         }
     }
 
+    /// The arithmetic /ext groups 1-4 (ALU r/m,imm; shift/rotate; TEST/NOT/NEG/MUL/IMUL/DIV/IDIV;
+    /// INC/DEC byte) through the decode/execute split. Every opcode is a ModRM whose `reg` field
+    /// selects the sub-op; `decode` already parsed the ModRM + addressing descriptor and fetched the
+    /// conditional immediate, so the executor resolves the r/m operand from the pre-decoded
+    /// descriptor (EA recomputed against the live registers) and reuses `self.alu`/`shift_rotate`/
+    /// `mul`/`div`/`inc_dec` verbatim. Each arm mirrors its former fused handler exactly — same
+    /// operand wiring, same write-back gating (CMP and TEST compute flags only), same #DE/#UD fault
+    /// points, same clocks — so behavior and the bytes consumed stay byte-for-byte unchanged.
+    fn execute_group_decoded<B: CpuBus>(
+        &mut self,
+        insn: &DecodedInsn,
+        bus: &mut B,
+    ) -> ExecResult<CycleOutcome> {
+        let opcode = insn.opcode as u8;
+        let operand_size = insn.operand_size;
+        let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+
+        match opcode {
+            0x80 | 0x82 => {
+                // Group 1 ALU r/m8, imm8. `reg` selects ADD/OR/ADC/SBB/AND/SUB/XOR/CMP; CMP (/7)
+                // computes flags only (no write-back). The imm8 was fetched + charged by `decode`.
+                let imm = insn.imm;
+                let a = u32::from(self.read_operand_u8(bus, operand)?);
+                let result = self.alu(modrm.reg, a, imm, BusWidth::Byte) as u8;
+                if modrm.reg != 7 {
+                    self.write_operand_u8(bus, operand, result)?;
+                }
+                Ok(clocks(2))
+            }
+            0x81 => {
+                // Group 1 ALU r/m16/32, imm16/32. Full-width immediate from `decode`.
+                let imm = insn.imm;
+                let a = self.read_operand_sized(bus, operand, operand_size)?;
+                let result = self.alu(modrm.reg, a, imm, operand_size.bus_width());
+                if modrm.reg != 7 {
+                    self.write_operand_sized(bus, operand, operand_size, result)?;
+                }
+                Ok(clocks(2))
+            }
+            0x83 => {
+                // Group 1 ALU r/m16/32, imm8 sign-extended to the operand width. `decode` already
+                // sign-extended the byte into `insn.imm`.
+                let imm = insn.imm;
+                let a = self.read_operand_sized(bus, operand, operand_size)?;
+                let result = self.alu(modrm.reg, a, imm, operand_size.bus_width());
+                if modrm.reg != 7 {
+                    self.write_operand_sized(bus, operand, operand_size, result)?;
+                }
+                Ok(clocks(2))
+            }
+            0xc0 | 0xc1 | 0xd0 | 0xd1 | 0xd2 | 0xd3 => {
+                // Group 2 shift/rotate. `reg` selects ROL/ROR/RCL/RCR/SHL/SHR/SAL/SAR; the count
+                // source is the imm8 `decode` fetched (0xc0/0xc1), the literal 1 (0xd0/0xd1), or CL
+                // (0xd2/0xd3). `shift_rotate` owns every flag rule (masked count, 1-bit-vs-multi OF),
+                // reused verbatim. Even-numbered opcodes are the byte form.
+                let op = modrm.reg;
+                let count = match opcode {
+                    0xc0 | 0xc1 => insn.imm as u8,
+                    0xd0 | 0xd1 => 1,
+                    _ => (self.registers.ecx() & 0xff) as u8,
+                };
+                if opcode & 1 == 0 {
+                    let value = u32::from(self.read_operand_u8(bus, operand)?);
+                    let result = self.shift_rotate(op, value, count, BusWidth::Byte) as u8;
+                    self.write_operand_u8(bus, operand, result)?;
+                } else {
+                    let value = self.read_operand_sized(bus, operand, operand_size)?;
+                    let result = self.shift_rotate(op, value, count, operand_size.bus_width());
+                    self.write_operand_sized(bus, operand, operand_size, result)?;
+                }
+                Ok(clocks(2))
+            }
+            0xf6 => {
+                // Group 3 byte. /0 TEST (AND-for-flags, no write-back) takes the imm8 `decode`
+                // fetched for reg==0; the other sub-ops carry no immediate. NOT (/2) touches no
+                // flags; NEG (/3) sets flags like 0 - operand; MUL/IMUL (/4,/5) and DIV/IDIV
+                // (/6,/7) reuse `mul`/`div` (DIV raises #DE on divide-by-zero / quotient overflow).
+                // reg==1 is undefined in the fused reference: it consumes no immediate and faults as
+                // UnsupportedGroupOpcode, preserved here.
+                let value = u32::from(self.read_operand_u8(bus, operand)?);
+                match modrm.reg {
+                    0 => {
+                        self.alu(4, value, insn.imm, BusWidth::Byte);
+                    }
+                    2 => self.write_operand_u8(bus, operand, !(value as u8))?, // NOT: no flags
+                    3 => {
+                        // NEG: flags like 0 - operand (CF set unless operand is 0).
+                        let result = self.alu_sub(0, value, 0, BusWidth::Byte) as u8;
+                        self.write_operand_u8(bus, operand, result)?;
+                    }
+                    4 => self.mul(value, false, BusWidth::Byte), // MUL
+                    5 => self.mul(value, true, BusWidth::Byte),  // IMUL
+                    6 => self.div(value, false, BusWidth::Byte)?, // DIV
+                    7 => self.div(value, true, BusWidth::Byte)?, // IDIV
+                    _ => {
+                        return Err(CpuError::UnsupportedGroupOpcode {
+                            opcode: 0xf6,
+                            extension: modrm.reg,
+                        }
+                        .into());
+                    }
+                }
+                Ok(clocks(2))
+            }
+            0xf7 => {
+                // Group 3 word/dword. Same sub-op layout as 0xf6 at the operand width.
+                let value = self.read_operand_sized(bus, operand, operand_size)?;
+                match modrm.reg {
+                    0 => {
+                        self.alu(4, value, insn.imm, operand_size.bus_width());
+                    }
+                    2 => {
+                        // NOT: bitwise complement, no flags changed. Mask like every other
+                        // write_operand_sized caller so no high bits are passed.
+                        let result = !value & operand_size.mask();
+                        self.write_operand_sized(bus, operand, operand_size, result)?;
+                    }
+                    3 => {
+                        // NEG: flags like 0 - operand (CF set unless operand is 0).
+                        let result = self.alu_sub(0, value, 0, operand_size.bus_width());
+                        self.write_operand_sized(bus, operand, operand_size, result)?;
+                    }
+                    4 => self.mul(value, false, operand_size.bus_width()), // MUL
+                    5 => self.mul(value, true, operand_size.bus_width()),  // IMUL
+                    6 => self.div(value, false, operand_size.bus_width())?, // DIV
+                    7 => self.div(value, true, operand_size.bus_width())?, // IDIV
+                    _ => {
+                        return Err(CpuError::UnsupportedGroupOpcode {
+                            opcode: 0xf7,
+                            extension: modrm.reg,
+                        }
+                        .into());
+                    }
+                }
+                Ok(clocks(2))
+            }
+            0xfe => {
+                // Group 4 INC/DEC byte. /0 INC, /1 DEC; any other reg is #UD (the fused reference's
+                // UnsupportedGroupOpcode). INC/DEC preserve CF (handled inside `inc_dec`).
+                match modrm.reg {
+                    0 | 1 => {
+                        let value = u32::from(self.read_operand_u8(bus, operand)?);
+                        let result = self.inc_dec(value, modrm.reg == 1, BusWidth::Byte) as u8;
+                        self.write_operand_u8(bus, operand, result)?;
+                        Ok(clocks(2))
+                    }
+                    extension => Err(CpuError::UnsupportedGroupOpcode {
+                        opcode: 0xfe,
+                        extension,
+                    }
+                    .into()),
+                }
+            }
+            _ => unreachable!("group opcode {opcode:#x}"),
+        }
+    }
+
     // Transitional fused entry: reads the prefixes + opcode + LOCK check itself, then dispatches.
     // The production `cycle` path goes through `decode`/`execute_decoded` (which call
     // `dispatch_opcode` directly to keep the fetch clocks charged once), so this whole-instruction
@@ -2143,40 +2361,9 @@ impl Cpu386 {
                 }
                 Ok(clocks(3))
             }
-            // 0x82 is an undocumented alias of 0x80 (group-1 r/m8, imm8): identical encoding.
-            0x80 | 0x82 => {
-                let modrm = self.fetch_modrm(bus)?;
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                let imm = u32::from(self.fetch_u8(bus)?);
-                let a = u32::from(self.read_operand_u8(bus, operand)?);
-                let result = self.alu(modrm.reg, a, imm, BusWidth::Byte) as u8;
-                if modrm.reg != 7 {
-                    self.write_operand_u8(bus, operand, result)?;
-                }
-                Ok(clocks(2))
-            }
-            0x81 => {
-                let modrm = self.fetch_modrm(bus)?;
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                let imm = self.fetch_immediate(bus, operand_size)?;
-                let a = self.read_operand_sized(bus, operand, operand_size)?;
-                let result = self.alu(modrm.reg, a, imm, operand_size.bus_width());
-                if modrm.reg != 7 {
-                    self.write_operand_sized(bus, operand, operand_size, result)?;
-                }
-                Ok(clocks(2))
-            }
-            0x83 => {
-                let modrm = self.fetch_modrm(bus)?;
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                let imm = sign_extend_u8(self.fetch_u8(bus)?);
-                let a = self.read_operand_sized(bus, operand, operand_size)?;
-                let result = self.alu(modrm.reg, a, imm, operand_size.bus_width());
-                if modrm.reg != 7 {
-                    self.write_operand_sized(bus, operand, operand_size, result)?;
-                }
-                Ok(clocks(2))
-            }
+            // 0x80/0x81/0x82/0x83 (group 1 ALU r/m,imm; 0x82 is the undocumented 0x80 alias) are
+            // converted to the decode/execute split: `route_group` classifies them as
+            // `DecodeGroup::Group` and `execute_group_decoded` runs them. Not handled here.
             0x84 => {
                 let modrm = self.fetch_modrm(bus)?;
                 let value = self.read_rm_u8(bus, prefixes, address_size, modrm)?;
@@ -2601,76 +2788,10 @@ impl Cpu386 {
                     halted: true,
                 })
             }
-            0xf6 => {
-                let modrm = self.fetch_modrm(bus)?;
-                if modrm.reg == 0 {
-                    // TEST r/m8, imm8 (unchanged)
-                    let value = self.read_rm_u8(bus, prefixes, address_size, modrm)?;
-                    let imm = self.fetch_u8(bus)?;
-                    self.alu(4, u32::from(value), u32::from(imm), BusWidth::Byte);
-                    return Ok(clocks(2));
-                }
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                let value = u32::from(self.read_operand_u8(bus, operand)?);
-                match modrm.reg {
-                    2 => self.write_operand_u8(bus, operand, !(value as u8))?, // NOT: no flags changed
-                    3 => {
-                        // NEG: flags like 0 - operand (CF set unless operand is 0).
-                        let result = self.alu_sub(0, value, 0, BusWidth::Byte) as u8;
-                        self.write_operand_u8(bus, operand, result)?;
-                    }
-                    4 => self.mul(value, false, BusWidth::Byte), // MUL
-                    5 => self.mul(value, true, BusWidth::Byte),  // IMUL
-                    6 => self.div(value, false, BusWidth::Byte)?, // DIV
-                    7 => self.div(value, true, BusWidth::Byte)?, // IDIV
-                    _ => {
-                        return Err(CpuError::UnsupportedGroupOpcode {
-                            opcode: 0xf6,
-                            extension: modrm.reg,
-                        }
-                        .into());
-                    }
-                }
-                Ok(clocks(2))
-            }
-            0xf7 => {
-                let modrm = self.fetch_modrm(bus)?;
-                if modrm.reg == 0 {
-                    // TEST r/m, imm (unchanged)
-                    let value =
-                        self.read_rm_sized(bus, prefixes, address_size, operand_size, modrm)?;
-                    let imm = self.fetch_immediate(bus, operand_size)?;
-                    self.alu(4, value, imm, operand_size.bus_width());
-                    return Ok(clocks(2));
-                }
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                let value = self.read_operand_sized(bus, operand, operand_size)?;
-                match modrm.reg {
-                    2 => {
-                        // NOT: bitwise complement, no flags changed. Mask like every
-                        // other write_operand_sized caller so no high bits are passed.
-                        let result = !value & operand_size.mask();
-                        self.write_operand_sized(bus, operand, operand_size, result)?;
-                    }
-                    3 => {
-                        // NEG: flags like 0 - operand (CF set unless operand is 0).
-                        let result = self.alu_sub(0, value, 0, operand_size.bus_width());
-                        self.write_operand_sized(bus, operand, operand_size, result)?;
-                    }
-                    4 => self.mul(value, false, operand_size.bus_width()), // MUL
-                    5 => self.mul(value, true, operand_size.bus_width()),  // IMUL
-                    6 => self.div(value, false, operand_size.bus_width())?, // DIV
-                    7 => self.div(value, true, operand_size.bus_width())?, // IDIV
-                    _ => {
-                        return Err(CpuError::UnsupportedGroupOpcode {
-                            opcode: 0xf7,
-                            extension: modrm.reg,
-                        }
-                        .into());
-                    }
-                }
-                Ok(clocks(2))
-            }
+            // 0xf6/0xf7 (group 3: TEST/NOT/NEG/MUL/IMUL/DIV/IDIV) are converted to the
+            // decode/execute split: `route_group` classifies them as `DecodeGroup::Group` and
+            // `execute_group_decoded` runs them (the conditional TEST immediate is parsed in
+            // `decode`). Not handled here.
             0xf5 => {
                 // CMC: complement the carry flag.
                 self.set_flag(FLAG_CF, !self.flag(FLAG_CF));
@@ -2783,44 +2904,10 @@ impl Cpu386 {
                     .into()),
                 }
             }
-            0xc0 | 0xc1 | 0xd0 | 0xd1 | 0xd2 | 0xd3 => {
-                let modrm = self.fetch_modrm(bus)?;
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                let op = modrm.reg;
-                let count = match opcode {
-                    0xc0 | 0xc1 => self.fetch_u8(bus)?,
-                    0xd0 | 0xd1 => 1,
-                    _ => (self.registers.ecx() & 0xff) as u8,
-                };
-                if opcode & 1 == 0 {
-                    // byte forms 0xc0/0xd0/0xd2
-                    let value = u32::from(self.read_operand_u8(bus, operand)?);
-                    let result = self.shift_rotate(op, value, count, BusWidth::Byte) as u8;
-                    self.write_operand_u8(bus, operand, result)?;
-                } else {
-                    let value = self.read_operand_sized(bus, operand, operand_size)?;
-                    let result = self.shift_rotate(op, value, count, operand_size.bus_width());
-                    self.write_operand_sized(bus, operand, operand_size, result)?;
-                }
-                Ok(clocks(2))
-            }
-            0xfe => {
-                let modrm = self.fetch_modrm(bus)?;
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                match modrm.reg {
-                    0 | 1 => {
-                        let value = u32::from(self.read_operand_u8(bus, operand)?);
-                        let result = self.inc_dec(value, modrm.reg == 1, BusWidth::Byte) as u8;
-                        self.write_operand_u8(bus, operand, result)?;
-                        Ok(clocks(2))
-                    }
-                    extension => Err(CpuError::UnsupportedGroupOpcode {
-                        opcode: 0xfe,
-                        extension,
-                    }
-                    .into()),
-                }
-            }
+            // 0xc0/0xc1/0xd0-0xd3 (group 2 shift/rotate) and 0xfe (group 4 INC/DEC byte) are
+            // converted to the decode/execute split: `route_group` classifies them as
+            // `DecodeGroup::Group` and `execute_group_decoded` runs them. Not handled here.
+            // (0xff, group 5, stays on this fused path — it is indirect CALL/JMP control flow.)
             0x40..=0x4f => {
                 let index = opcode & 0x07;
                 let is_dec = opcode >= 0x48;
@@ -16055,5 +16142,398 @@ mod tests {
                 fetch,
             );
         }
+    }
+
+    /// One golden end-state for an arithmetic /ext group case (groups 1-4), captured the same way
+    /// as the other group goldens: opcode bytes plus expected end gpr (AX,CX,DX,BX,SP,BP,SI,DI),
+    /// eflags, eip, (offset,value) memory writes, and InstructionPrefetch fetch count. Groups 1-3
+    /// touch flags (ALU/shift/TEST/NEG/MUL/DIV), so eflags is load-bearing; group 4 (INC/DEC) must
+    /// leave CF untouched, which the CF-preserving seed makes visible in eflags.
+    struct GroupGolden {
+        name: &'static str,
+        code: &'static [u8],
+        gpr: [u32; 8],
+        eflags: u32,
+        eip: u32,
+        deltas: &'static [(usize, u8)],
+        fetch: usize,
+    }
+
+    /// Seed for the group golden battery: the same register file as `seam_seed` plus CL=4 (a small
+    /// shift count) and CF pre-set in eflags so the INC/DEC CF-preservation is observable. CX is
+    /// 0x0304 so CL = 0x04.
+    fn group_seed(cpu: &mut Cpu386) {
+        seam_seed(cpu);
+        // Pre-set CF (bit 0) on top of the always-set reserved bit 1. This makes the group 4
+        // INC/DEC CF-preservation visible (CF must still be set after) and feeds ADC/SBB/RCR.
+        cpu.registers.eflags = 0x03;
+    }
+
+    /// Seed memory for the group battery: plant 0x3412 at [bx] = ds:0x10 (the r/m memory target),
+    /// so byte [0x10] = 0x12 and word [0x10] = 0x3412. Fresh image per case so writes don't bleed.
+    fn group_seed_mem(mem: &mut [u8], code: &[u8]) {
+        mem[..code.len()].copy_from_slice(code);
+        mem[0x10..0x12].copy_from_slice(&0x3412u16.to_le_bytes());
+    }
+
+    /// The arithmetic /ext group (1-4) differential battery. Captured from the PRIOR fused reference
+    /// (`execute_instruction_legacy`) via `regen_group_goldens`; see `alu_golden_cases` for the full
+    /// capture recipe. Never edit by hand — re-run the regen WHILE the fused arms still exist in
+    /// `dispatch_opcode`, then paste, then delete the fused arms. Covers: group 1 ALU r/m,imm
+    /// (byte/word, CMP no-writeback, 0x83 sign-extend), group 2 shift/rotate (SHL/SHR/SAR/ROL/RCR
+    /// with count 1/CL/imm8), group 3 TEST-with-imm/NOT/NEG/MUL/IMUL and a non-faulting DIV, and
+    /// group 4 INC/DEC (CF preserved). The DIV-by-zero #DE fault is a separate test (goldens only
+    /// capture success).
+    fn group_golden_cases() -> &'static [GroupGolden] {
+        &[
+            // Group 1: ALU r/m, imm (0x80/0x81/0x82/0x83). Includes CMP no-writeback and 0x83
+            // sign-extend (both byte/word and a register form).
+            GroupGolden {
+                name: "add byte [bx],0x05 (80 /0)",
+                code: &[128, 7, 5],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x6,
+                eip: 0x3,
+                deltas: &[(16, 23)],
+                fetch: 4,
+            },
+            GroupGolden {
+                name: "or byte [bx],0xf0 (80 /1)",
+                code: &[128, 15, 240],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x82,
+                eip: 0x3,
+                deltas: &[(16, 242)],
+                fetch: 4,
+            },
+            GroupGolden {
+                name: "cmp byte [bx],0x12 (80 /7 no writeback)",
+                code: &[128, 63, 18],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x46,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+            },
+            GroupGolden {
+                name: "add word [bx],0x1234 (81 /0)",
+                code: &[129, 7, 52, 18],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x4,
+                deltas: &[(16, 70), (17, 70)],
+                fetch: 5,
+            },
+            GroupGolden {
+                name: "cmp word [bx],0x3412 (81 /7 no writeback)",
+                code: &[129, 63, 18, 52],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x46,
+                eip: 0x4,
+                deltas: &[],
+                fetch: 5,
+            },
+            GroupGolden {
+                name: "add word [bx],-2 (83 /0 sign-extend)",
+                code: &[131, 7, 254],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x13,
+                eip: 0x3,
+                deltas: &[(16, 16)],
+                fetch: 4,
+            },
+            GroupGolden {
+                name: "sub ax,-1 (83 /5 sign-extend reg)",
+                code: &[131, 232, 255],
+                gpr: [259, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x17,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+            },
+            // Group 2: shift/rotate (0xc0/0xc1/0xd0-0xd3). Flags load-bearing; count 1/CL/imm8.
+            GroupGolden {
+                name: "shl byte [bx],1 (d0 /4)",
+                code: &[208, 39],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x6,
+                eip: 0x2,
+                deltas: &[(16, 36)],
+                fetch: 3,
+            },
+            GroupGolden {
+                name: "shr word [bx],1 (d1 /5)",
+                code: &[209, 47],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x6,
+                eip: 0x2,
+                deltas: &[(16, 9), (17, 26)],
+                fetch: 3,
+            },
+            GroupGolden {
+                name: "shl ax,1 (d1 /4 reg)",
+                code: &[209, 224],
+                gpr: [516, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x2,
+                deltas: &[],
+                fetch: 3,
+            },
+            GroupGolden {
+                name: "rol byte [bx],cl (d2 /0)",
+                code: &[210, 7],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x3,
+                eip: 0x2,
+                deltas: &[(16, 33)],
+                fetch: 3,
+            },
+            GroupGolden {
+                name: "sar word [bx],cl (d3 /7)",
+                code: &[211, 63],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x6,
+                eip: 0x2,
+                deltas: &[(16, 65), (17, 3)],
+                fetch: 3,
+            },
+            GroupGolden {
+                name: "rcr word [bx],3 (c1 /3 imm8)",
+                code: &[193, 31, 3],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x3,
+                deltas: &[(16, 130), (17, 166)],
+                fetch: 4,
+            },
+            GroupGolden {
+                name: "shl ax,4 (c1 /4 imm8 reg)",
+                code: &[193, 224, 4],
+                gpr: [4128, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+            },
+            // Group 3: F6/F7 (TEST-with-imm/NOT/NEG/MUL/IMUL/DIV). DIV here is non-faulting; the
+            // DIV-by-zero #DE is covered by `group_div_by_zero_raises_de_through_the_split`.
+            GroupGolden {
+                name: "test byte [bx],0x0f (f6 /0 imm)",
+                code: &[246, 7, 15],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+            },
+            GroupGolden {
+                name: "test ax,0x00ff (f7 /0 imm reg)",
+                code: &[247, 192, 255, 0],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x4,
+                deltas: &[],
+                fetch: 5,
+            },
+            GroupGolden {
+                name: "not word [bx] (f7 /2)",
+                code: &[247, 23],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x3,
+                eip: 0x2,
+                deltas: &[(16, 237), (17, 203)],
+                fetch: 3,
+            },
+            GroupGolden {
+                name: "neg ax (f7 /3 reg)",
+                code: &[247, 216],
+                gpr: [65278, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x93,
+                eip: 0x2,
+                deltas: &[],
+                fetch: 3,
+            },
+            GroupGolden {
+                name: "mul bl (f6 /4 reg)",
+                code: &[246, 227],
+                gpr: [32, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x2,
+                deltas: &[],
+                fetch: 3,
+            },
+            GroupGolden {
+                name: "imul cx (f7 /5 reg)",
+                code: &[247, 233],
+                gpr: [2568, 772, 3, 16, 0, 16, 8, 24],
+                eflags: 0x803,
+                eip: 0x2,
+                deltas: &[],
+                fetch: 3,
+            },
+            GroupGolden {
+                name: "div bl (f6 /6 reg, non-faulting)",
+                code: &[246, 243],
+                gpr: [528, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x3,
+                eip: 0x2,
+                deltas: &[],
+                fetch: 3,
+            },
+            // Group 4: INC/DEC byte (0xfe). CF must be preserved (the seed pre-sets CF; both end
+            // states keep bit 0 set).
+            GroupGolden {
+                name: "inc byte [bx] (fe /0, CF preserved)",
+                code: &[254, 7],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x3,
+                eip: 0x2,
+                deltas: &[(16, 19)],
+                fetch: 3,
+            },
+            GroupGolden {
+                name: "dec byte [bx] (fe /1, CF preserved)",
+                code: &[254, 15],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x7,
+                eip: 0x2,
+                deltas: &[(16, 17)],
+                fetch: 3,
+            },
+        ]
+    }
+
+    #[test]
+    fn group_split_matches_golden_across_ops() {
+        // The arithmetic /ext groups 1-4 (ALU r/m,imm; shift/rotate; TEST/NOT/NEG/MUL/IMUL/DIV/IDIV;
+        // INC/DEC) are converted to the decode/execute split, so they can no longer be diffed
+        // against a fused executor (those arms were deleted). Run each through cycle() and assert
+        // the architectural end-state against goldens captured from the pre-split fused path via
+        // `regen_group_goldens`. Exercises decode's ModRM/addressing parse, the conditional F6/F7
+        // immediate, the executor's sub-op dispatch + write-back gating (CMP/TEST flags-only), the
+        // reused shift/mul/div flag logic, CF preservation on INC/DEC, and the once-only fetch
+        // charge. The DIV-by-zero #DE fault is covered separately (goldens capture success only).
+        for g in group_golden_cases() {
+            let mut mem = vec![0u8; 0x200];
+            group_seed_mem(&mut mem, g.code);
+            let initial = mem.clone();
+
+            let mut split = Cpu386::default();
+            group_seed(&mut split);
+            let mut sbus = TestBus::with_memory(mem);
+            let _ = split.cycle(&mut sbus);
+
+            assert_eq!(split.registers.gpr, g.gpr, "gpr mismatch for {}", g.name);
+            assert_eq!(
+                split.registers.eflags, g.eflags,
+                "eflags mismatch for {}",
+                g.name
+            );
+            assert_eq!(split.registers.eip, g.eip, "eip mismatch for {}", g.name);
+            let deltas: Vec<(usize, u8)> = sbus
+                .memory
+                .iter()
+                .enumerate()
+                .filter(|(i, b)| **b != initial[*i])
+                .map(|(i, b)| (i, *b))
+                .collect();
+            assert_eq!(deltas, g.deltas, "memory-write mismatch for {}", g.name);
+            assert_eq!(
+                seam_fetch_count(&sbus),
+                g.fetch,
+                "instruction-fetch cycle count mismatch for {} (seam must charge fetches once)",
+                g.name
+            );
+        }
+    }
+
+    /// Regenerate `group_golden_cases` from the fused reference. Ignored by default.
+    /// Run WHILE the group's fused arms (0x80-0x83, 0xc0/0xc1/0xd0-0xd3, 0xf6/0xf7, 0xfe) still
+    /// exist in `dispatch_opcode`:
+    ///   cargo test -p izarravm-cpu --lib regen_group_goldens -- --ignored --nocapture
+    /// then paste the output over `group_golden_cases` and only then delete the fused arms.
+    #[test]
+    #[ignore = "prints golden literals; run with --ignored --nocapture against the fused reference"]
+    fn regen_group_goldens() {
+        for g in group_golden_cases() {
+            let mut mem = vec![0u8; 0x200];
+            group_seed_mem(&mut mem, g.code);
+            let initial = mem.clone();
+
+            let mut fused = Cpu386::default();
+            group_seed(&mut fused);
+            let mut fbus = TestBus::with_memory(mem);
+            fused.begin_instruction();
+            if fused.execute_instruction_legacy(&mut fbus).is_err() {
+                println!(
+                    "            // TODO regen {}: fused path unavailable here; run before deleting fused arms",
+                    g.name
+                );
+                continue;
+            }
+            let deltas: Vec<(usize, u8)> = fbus
+                .memory
+                .iter()
+                .enumerate()
+                .filter(|(i, b)| **b != initial[*i])
+                .map(|(i, b)| (i, *b))
+                .collect();
+            let fetch = seam_fetch_count(&fbus);
+            println!(
+                "            GroupGolden {{ name: {:?}, code: &{:?}, gpr: {:?}, eflags: {:#x}, eip: {:#x}, deltas: &{:?}, fetch: {} }},",
+                g.name,
+                g.code,
+                fused.registers.gpr,
+                fused.registers.eflags,
+                fused.registers.eip,
+                deltas,
+                fetch,
+            );
+        }
+    }
+
+    #[test]
+    fn group_div_by_zero_raises_de_through_the_split() {
+        // The DIV-by-zero #DE fault path (goldens capture success only, so it needs an explicit
+        // test). `div bl` (F6 /6, mod=11 rm=011) with BL = 0 must raise the divide error. The
+        // group 3 fused arm is deleted on this branch, so this drives the decode/execute split
+        // (exec_one_split) directly and asserts the fault is CpuError::DivideError. The `div`
+        // helper checks divide-by-zero BEFORE any register write, and `decode` consumes exactly
+        // the F6 + ModRM bytes (no immediate for /6), so we also assert eip advanced by 2. The
+        // InstructionPrefetch count (3, one read-ahead past the 2-byte op — see the non-faulting
+        // `div bl` golden, which also reports 3) confirms decode charged the fetch and the
+        // executor faulted with no extra fetch.
+        let code = [0xf6, 0xf3]; // div bl
+        let mut mem = vec![0u8; 0x40];
+        mem[..code.len()].copy_from_slice(&code);
+
+        let mut split = Cpu386::default();
+        split.load_segment_real(SegmentIndex::Cs, 0);
+        split.load_segment_real(SegmentIndex::Ds, 0);
+        split.registers.eip = 0;
+        split.write_reg16(Reg16::Ax, 0x0102);
+        split.write_reg16(Reg16::Bx, 0x0700); // BL = 0 -> divide by zero
+        let mut sbus = TestBus::with_memory(mem);
+        let split_err = exec_one_split(&mut split, &mut sbus).unwrap_err();
+
+        assert!(
+            matches!(split_err, InternalFault::Cpu(CpuError::DivideError)),
+            "split DIV-by-zero must raise CpuError::DivideError, got {split_err:?}"
+        );
+        // AX must be untouched: the #DE is raised before any quotient/remainder write-back.
+        assert_eq!(
+            split.read_reg16(Reg16::Ax),
+            0x0102,
+            "AX must be unchanged when DIV faults before write-back"
+        );
+        assert_eq!(
+            split.registers.eip, 2,
+            "decode must consume the F6 + ModRM bytes (no immediate for /6) before the #DE"
+        );
+        assert_eq!(
+            seam_fetch_count(&sbus),
+            3,
+            "the split must charge the same fetches as the non-faulting div bl golden (3)"
+        );
     }
 }
