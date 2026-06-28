@@ -835,6 +835,9 @@ struct DecodedInsn {
     address_size: AddressSize,
     modrm: Option<ModRm>,
     operand: Option<DecodedOperand>,
+    /// The instruction's primary immediate. Also carries the moffs displacement for the direct-
+    /// address MOV forms 0xA0-0xA3 (decode fetches it address-size-wide; the executor uses it as
+    /// the memory offset, not as a data immediate).
     imm: u32,
     imm2: u32,
 }
@@ -1293,14 +1296,22 @@ impl Cpu386 {
         }
     }
 
-    /// Resolve the pre-decoded ModRM r/m form (forms 0-3) into its `(ModRm, RmOperand)`: the
-    /// ModRM (for its `reg` field) plus the r/m operand resolved against the live registers — a
-    /// register operand as-is, a memory descriptor with its effective address recomputed now
-    /// (`resolve_addr_mode` reads only base/index registers, no instruction bytes). Centralizes
-    /// the `decode`-populated-this `.expect`s so each form arm doesn't repeat them.
-    fn resolve_alu_modrm_operand(&self, insn: &DecodedInsn) -> (ModRm, RmOperand) {
-        let modrm = insn.modrm.expect("ALU r/m form decoded with a ModRM");
-        let operand = match insn.operand.expect("ALU r/m form decoded with an operand") {
+    /// Resolve a pre-decoded ModRM r/m form into its `(ModRm, RmOperand)`: the ModRM (for its `reg`
+    /// field) plus the r/m operand resolved against the live registers — a register operand as-is, a
+    /// memory descriptor with its effective address recomputed now (`resolve_addr_mode` reads only
+    /// base/index registers, no instruction bytes). Centralizes the `decode`-populated `.expect`s so
+    /// each group executor doesn't repeat them.
+    ///
+    /// Shared by every group whose decode arm pre-parses a ModRM (ALU, data-move, and the stack /
+    /// group1-5 / bit / system / FPU groups to come): the panic location already names the calling
+    /// executor, so the messages stay group-agnostic. Calling this when decode did NOT populate
+    /// `modrm`/`operand` (i.e. a non-ModRM form) is a routing bug and panics by design.
+    fn resolve_decoded_modrm_operand(&self, insn: &DecodedInsn) -> (ModRm, RmOperand) {
+        let modrm = insn.modrm.expect("ModRM r/m form decoded with a ModRM");
+        let operand = match insn
+            .operand
+            .expect("ModRM r/m form decoded with an operand")
+        {
             DecodedOperand::Reg(index) => RmOperand::Register(index),
             DecodedOperand::Mem(addr) => self.resolve_addr_mode(&addr),
         };
@@ -1327,7 +1338,7 @@ impl Cpu386 {
 
         match form {
             0 => {
-                let (modrm, operand) = self.resolve_alu_modrm_operand(insn);
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
                 let a = u32::from(self.read_operand_u8(bus, operand)?);
                 let b = u32::from(self.read_gpr8(modrm.reg));
                 let result = self.alu(op, a, b, BusWidth::Byte) as u8;
@@ -1336,7 +1347,7 @@ impl Cpu386 {
                 }
             }
             1 => {
-                let (modrm, operand) = self.resolve_alu_modrm_operand(insn);
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
                 let a = self.read_operand_sized(bus, operand, operand_size)?;
                 let b = self.read_gpr_sized(modrm.reg, operand_size);
                 let result = self.alu(op, a, b, operand_size.bus_width());
@@ -1345,7 +1356,7 @@ impl Cpu386 {
                 }
             }
             2 => {
-                let (modrm, operand) = self.resolve_alu_modrm_operand(insn);
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
                 let a = u32::from(self.read_gpr8(modrm.reg));
                 let b = u32::from(self.read_operand_u8(bus, operand)?);
                 let result = self.alu(op, a, b, BusWidth::Byte) as u8;
@@ -1354,7 +1365,7 @@ impl Cpu386 {
                 }
             }
             3 => {
-                let (modrm, operand) = self.resolve_alu_modrm_operand(insn);
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
                 let a = self.read_gpr_sized(modrm.reg, operand_size);
                 let b = self.read_operand_sized(bus, operand, operand_size)?;
                 let result = self.alu(op, a, b, operand_size.bus_width());
@@ -1386,22 +1397,6 @@ impl Cpu386 {
         Ok(clocks(2))
     }
 
-    /// Resolve a pre-decoded data-movement ModRM r/m form into its `(ModRm, RmOperand)`: the ModRM
-    /// (for its `reg` field) plus the r/m operand resolved against the live registers — a register
-    /// operand as-is, a memory descriptor with its effective address recomputed now. Mirrors
-    /// `resolve_alu_modrm_operand`; centralizes the `decode`-populated-these `.expect`s.
-    fn resolve_datamove_modrm_operand(&self, insn: &DecodedInsn) -> (ModRm, RmOperand) {
-        let modrm = insn.modrm.expect("data-move r/m form decoded with a ModRM");
-        let operand = match insn
-            .operand
-            .expect("data-move r/m form decoded with an operand")
-        {
-            DecodedOperand::Reg(index) => RmOperand::Register(index),
-            DecodedOperand::Mem(addr) => self.resolve_addr_mode(&addr),
-        };
-        (modrm, operand)
-    }
-
     /// The single-byte data-movement block (MOV/LEA/XCHG and their immediate/moffs/Sreg forms)
     /// through the decode/execute split. Each arm mirrors the former fused handler verbatim — same
     /// operand wiring, same segment-load path for 0x8e, same XCHG read/write order, same clocks —
@@ -1420,7 +1415,7 @@ impl Cpu386 {
             0x86 => {
                 // XCHG r/m8, r8. Cross-write; the operand was resolved once in decode so the
                 // displacement is not re-fetched.
-                let (modrm, operand) = self.resolve_datamove_modrm_operand(insn);
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
                 let rm = self.read_operand_u8(bus, operand)?;
                 let reg = self.read_gpr8(modrm.reg);
                 self.write_operand_u8(bus, operand, reg)?;
@@ -1429,7 +1424,7 @@ impl Cpu386 {
             }
             0x87 => {
                 // XCHG r/m16/32, r16/32. Cross-write.
-                let (modrm, operand) = self.resolve_datamove_modrm_operand(insn);
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
                 let rm = self.read_operand_sized(bus, operand, operand_size)?;
                 let reg = self.read_gpr_sized(modrm.reg, operand_size);
                 self.write_operand_sized(bus, operand, operand_size, reg)?;
@@ -1438,35 +1433,35 @@ impl Cpu386 {
             }
             0x88 => {
                 // MOV r/m8, r8.
-                let (modrm, operand) = self.resolve_datamove_modrm_operand(insn);
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
                 let value = self.read_gpr8(modrm.reg);
                 self.write_operand_u8(bus, operand, value)?;
                 Ok(clocks(2))
             }
             0x89 => {
                 // MOV r/m16/32, r16/32.
-                let (modrm, operand) = self.resolve_datamove_modrm_operand(insn);
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
                 let value = self.read_gpr_sized(modrm.reg, operand_size);
                 self.write_operand_sized(bus, operand, operand_size, value)?;
                 Ok(clocks(2))
             }
             0x8a => {
                 // MOV r8, r/m8.
-                let (modrm, operand) = self.resolve_datamove_modrm_operand(insn);
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
                 let value = self.read_operand_u8(bus, operand)?;
                 self.write_gpr8(modrm.reg, value);
                 Ok(clocks(2))
             }
             0x8b => {
                 // MOV r16/32, r/m16/32.
-                let (modrm, operand) = self.resolve_datamove_modrm_operand(insn);
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
                 let value = self.read_operand_sized(bus, operand, operand_size)?;
                 self.write_gpr_sized(modrm.reg, operand_size, value);
                 Ok(clocks(2))
             }
             0x8c => {
                 // MOV r/m16, Sreg. Always a word store regardless of operand size.
-                let (modrm, operand) = self.resolve_datamove_modrm_operand(insn);
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
                 let value = u32::from(self.segment_from_reg_field(modrm.reg).selector);
                 self.write_operand_sized(bus, operand, OperandSize::Word, value)?;
                 Ok(clocks(2))
@@ -1474,7 +1469,7 @@ impl Cpu386 {
             0x8d => {
                 // LEA reg, m: load the effective address, not the memory it points at. mod=3 (a
                 // register r/m) is an invalid encoding and faults #UD.
-                let (modrm, operand) = self.resolve_datamove_modrm_operand(insn);
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
                 match operand {
                     RmOperand::Memory(mem) => {
                         self.write_gpr_sized(modrm.reg, operand_size, mem.offset);
@@ -1490,7 +1485,7 @@ impl Cpu386 {
                 // MOV Sreg, r/m16. Reads a word r/m, then loads the segment register through the
                 // shared segment-load path (which can fault and, in protected mode, reload the
                 // descriptor). CS (reg=1) and reg>5 are invalid and #GP, matching the fused handler.
-                let (modrm, operand) = self.resolve_datamove_modrm_operand(insn);
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
                 let value = self.read_operand_sized(bus, operand, OperandSize::Word)?;
                 let segment = match modrm.reg {
                     0 => SegmentIndex::Es,
@@ -1591,7 +1586,7 @@ impl Cpu386 {
                     }
                     .into());
                 }
-                let (_, operand) = self.resolve_datamove_modrm_operand(insn);
+                let (_, operand) = self.resolve_decoded_modrm_operand(insn);
                 self.write_operand_u8(bus, operand, insn.imm as u8)?;
                 Ok(clocks(2))
             }
@@ -1605,7 +1600,7 @@ impl Cpu386 {
                     }
                     .into());
                 }
-                let (_, operand) = self.resolve_datamove_modrm_operand(insn);
+                let (_, operand) = self.resolve_decoded_modrm_operand(insn);
                 self.write_operand_sized(bus, operand, operand_size, insn.imm)?;
                 Ok(clocks(2))
             }
@@ -14177,6 +14172,35 @@ mod tests {
                 fetch,
             );
         }
+    }
+
+    #[test]
+    fn group11_mov_rm_imm_with_nonzero_reg_faults_without_consuming_the_immediate() {
+        // C6 /1 is an undefined group-11 encoding (only reg=000 is MOV r/m,imm). This is the one
+        // data-move path the goldens can't cover: decode DEFERS parsing the operand/immediate when
+        // reg != 0 and the executor re-raises the error. Drive it through the split (which returns
+        // the raw fault without eip rewind) and assert two things:
+        //   1. the fault is UnsupportedGroupOpcode { opcode: 0xc6, extension: 1 }, and
+        //   2. eip advanced to exactly 2 (opcode + ModRM) — proving decode did NOT over-consume the
+        //      trailing imm8 (0x55) on the fault path, so the bytes charged match the fused handler.
+        let (mut cpu, memory) = real_mode_cpu(&[0xc6, 0xc9, 0x55], 0x20);
+        let mut bus = TestBus::with_memory(memory);
+
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(
+            matches!(
+                fault,
+                InternalFault::Cpu(CpuError::UnsupportedGroupOpcode {
+                    opcode: 0xc6,
+                    extension: 1
+                })
+            ),
+            "{fault:?}"
+        );
+        assert_eq!(
+            cpu.registers.eip, 2,
+            "decode must stop after the ModRM on the fault path (imm8 not consumed)"
+        );
     }
 
     #[test]
