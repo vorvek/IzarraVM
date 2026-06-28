@@ -793,9 +793,12 @@ mod sp1_smoke {
         }
 
         let text = machine.screen_text().as_text().to_ascii_lowercase();
+        // The FreeCom/kernel banners already contain "version" and "dos", so matching
+        // those would false-pass. Require the typed command echoed at the prompt — it
+        // only appears if our injected keystrokes reached COMMAND.COM.
         assert!(
-            text.contains("version") || text.contains("dos"),
-            "VER produced no version banner.\n--- screen ---\n{text}\n--- end screen ---"
+            text.contains("a:\\>ver"),
+            "typed VER was not echoed at the prompt; the keyboard->shell path did not work.\n--- screen ---\n{text}\n--- end screen ---"
         );
     }
 }
