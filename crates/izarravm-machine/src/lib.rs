@@ -1959,13 +1959,19 @@ impl Machine {
     pub fn set_mouse_absolute(&mut self, x: i32, y: i32, buttons: u8) {
         let x = x.clamp(0, MOUSE_GUEST_MAX_X);
         let y = y.clamp(0, MOUSE_GUEST_MAX_Y);
-        let mut dx = x - self.last_abs.0;
-        let mut dy = y - self.last_abs.1;
+        let dx = x - self.last_abs.0;
+        let dy = y - self.last_abs.1;
         self.last_abs = (x, y);
-        // The host coalesces a frame of motion into one call, so the delta can
-        // exceed a single PS/2 packet's 9-bit range on a fast flick. Split it into
-        // packet-sized chunks instead of clamping, so the full motion reaches the
-        // guest. Always inject once so a button-only edge (zero delta) still fires.
+        self.inject_mouse_relative(dx, dy, buttons);
+    }
+
+    /// Inject a relative mouse motion (the host's per-frame coalesced delta) as one
+    /// or more PS/2 packets. A fast flick can exceed a single packet's 9-bit range,
+    /// so split it into packet-sized chunks instead of clamping, so the full motion
+    /// reaches the guest. Always injects once so a button-only edge (zero motion)
+    /// still fires. The guest driver owns the cursor position, range, and the
+    /// mickey-to-pixel ratio; the host forwards raw relative counts.
+    pub fn inject_mouse_relative(&mut self, mut dx: i32, mut dy: i32, buttons: u8) {
         loop {
             let sx = dx.clamp(-255, 255);
             let sy = dy.clamp(-255, 255);

@@ -204,22 +204,14 @@ struct Frame {
     cd_accesses: u64,      // monotonic CD access count, drives the LED
 }
 
-/// The guest cursor coordinate range: x spans 0..639, y spans 0..199. These are
-/// the GUI's own virtual pointer limits; they match the INT 33h driver's range.
-const MOUSE_GUEST_MAX_X: i32 = 639;
-const MOUSE_GUEST_MAX_Y: i32 = 199;
-
 /// UI-to-emulation-thread messages.
 enum Command {
     Keys(Vec<u8>),
-    /// An absolute host mouse position mapped onto the guest screen: `x` 0..639,
-    /// `y` 0..199, plus the button mask. The host pointer's position over the
-    /// framebuffer rect maps straight to the guest cursor (no relative drift, no
-    /// confinement), which the BIOS menus read through INT 33h. Capture only.
-    MouseAbsolute(i32, i32, u8),
-    /// Set the machine's last-known absolute mouse position without injecting
-    /// a motion event. Sent on capture entry so the first real delta is small.
-    SeedMouseOrigin(i32, i32),
+    /// A coalesced frame of relative mouse motion (raw mickey counts) plus the
+    /// button mask. The guest driver applies its mickey ratio and clamps the cursor
+    /// to the active video mode's range; the host just forwards the counts, so the
+    /// cursor is never confined to a stale virtual range. Capture only.
+    MouseRelative(i32, i32, u8),
     /// Mount a floppy image into drive A: live. `flush_path` is the source IMG to
     /// rewrite a dirty image to on eject; folder mounts pass None (read-only).
     MountFloppy {
@@ -565,12 +557,8 @@ impl Emulator {
         let _ = self.commands.send(Command::Keys(codes));
     }
 
-    fn send_mouse_absolute(&self, x: i32, y: i32, buttons: u8) {
-        let _ = self.commands.send(Command::MouseAbsolute(x, y, buttons));
-    }
-
-    fn send_mouse_origin(&self, x: i32, y: i32) {
-        let _ = self.commands.send(Command::SeedMouseOrigin(x, y));
+    fn send_mouse_relative(&self, dx: i32, dy: i32, buttons: u8) {
+        let _ = self.commands.send(Command::MouseRelative(dx, dy, buttons));
     }
 
     fn mount_floppy(&self, bytes: Vec<u8>, flush_path: Option<PathBuf>) {
@@ -691,10 +679,9 @@ fn emulate(
         loop {
             match commands.try_recv() {
                 Ok(Command::Keys(codes)) => machine.inject_key_scancodes(&codes),
-                Ok(Command::MouseAbsolute(x, y, buttons)) => {
-                    machine.set_mouse_absolute(x, y, buttons)
+                Ok(Command::MouseRelative(dx, dy, buttons)) => {
+                    machine.inject_mouse_relative(dx, dy, buttons)
                 }
-                Ok(Command::SeedMouseOrigin(x, y)) => machine.seed_mouse_origin(x, y),
                 Ok(Command::MountFloppy { bytes, flush_path }) => {
                     match machine.mount_floppy(bytes) {
                         Ok(()) => floppy_flush_path = flush_path,
@@ -868,13 +855,12 @@ pub struct GuiApp {
     // path scales host pointer motion across it into guest pixels. None until the
     // monitor has been drawn at least once.
     screen_rect: Option<egui::Rect>,
-    // Accumulated guest cursor position (0..639 x 0..199) while captured: raw
-    // relative motion from the locked cursor adds into it, clamped to the screen.
-    // Reset to the centre on capture enter.
-    abs_x: f32,
-    abs_y: f32,
-    // Raw motion accumulates into abs_x/abs_y on every DeviceEvent but the guest
-    // position is only flushed once per frame (set here, cleared in about_to_wait).
+    // Raw relative mouse motion (mickeys) accumulated since the last frame flush
+    // while captured. The guest driver owns the cursor position, range, and mickey
+    // ratio, so the host only forwards these counts, coalesced once per frame.
+    mouse_rel_x: f32,
+    mouse_rel_y: f32,
+    // Set on motion, cleared by the once-per-frame flush in about_to_wait.
     // An 8000 Hz mouse fires ~130 events per frame; sending one guest packet each
     // floods the emulation thread with guest IRQ12s and stalls the UI thread.
     mouse_dirty: bool,
@@ -1009,8 +995,8 @@ impl GuiApp {
             want_capture: false,
             last_buttons: 0,
             screen_rect: None,
-            abs_x: 0.0,
-            abs_y: 0.0,
+            mouse_rel_x: 0.0,
+            mouse_rel_y: 0.0,
             mouse_dirty: false,
             audio,
             emu: None,
@@ -1208,13 +1194,10 @@ impl GuiApp {
         self.input_captured = !self.input_captured;
         self.last_buttons = 0;
         if self.input_captured {
-            // Start the guest cursor centred; raw motion accumulates from there.
-            self.abs_x = MOUSE_GUEST_MAX_X as f32 / 2.0;
-            self.abs_y = MOUSE_GUEST_MAX_Y as f32 / 2.0;
-            // Seed the machine's last-known position so the first delta is small.
-            if let Some(emu) = &self.emu {
-                emu.send_mouse_origin(self.abs_x as i32, self.abs_y as i32);
-            }
+            // Drop any motion accumulated before capture; the guest driver owns the
+            // cursor position from here.
+            self.mouse_rel_x = 0.0;
+            self.mouse_rel_y = 0.0;
             self.sync_guest_locks();
             let _ = window
                 .set_cursor_grab(winit::window::CursorGrabMode::Locked)
@@ -1231,46 +1214,47 @@ impl GuiApp {
         window.set_title(&self.title);
     }
 
-    /// Update the guest button mask from a pointer button edge and resend the
-    /// current absolute position with the new mask.
+    /// Update the guest button mask from a pointer button edge and send it with any
+    /// motion still pending this frame, so a click lands at the cursor's spot.
     fn set_guest_button(&mut self, bit: u8, pressed: bool) {
         if pressed {
             self.last_buttons |= bit;
         } else {
             self.last_buttons &= !bit;
         }
+        let dx = self.mouse_rel_x as i32;
+        let dy = self.mouse_rel_y as i32;
+        self.mouse_rel_x = 0.0;
+        self.mouse_rel_y = 0.0;
+        self.mouse_dirty = false;
         if let Some(emu) = &self.emu {
-            emu.send_mouse_absolute(self.abs_x as i32, self.abs_y as i32, self.last_buttons);
+            emu.send_mouse_relative(dx, dy, self.last_buttons);
         }
     }
 
-    /// Add raw relative motion (winit DeviceEvent::MouseMotion) into the guest
-    /// cursor position, scaled across the framebuffer rect into guest pixels and
-    /// clamped to the screen, then send the new absolute position.
-    fn accumulate_guest_motion(&mut self, dx: f32, dy: f32, ppp: f32) {
-        let Some(rect) = self.screen_rect else {
-            return;
-        };
-        let sx = MOUSE_GUEST_MAX_X as f32 / (rect.width() * ppp).max(1.0);
-        let sy = MOUSE_GUEST_MAX_Y as f32 / (rect.height() * ppp).max(1.0);
-        self.abs_x = (self.abs_x + dx * sx).clamp(0.0, MOUSE_GUEST_MAX_X as f32);
-        self.abs_y = (self.abs_y + dy * sy).clamp(0.0, MOUSE_GUEST_MAX_Y as f32);
-        // Defer the guest send to the per-frame flush in about_to_wait; the machine
-        // diffs against its last position, so the dropped intermediate sends lose no
-        // motion (and a large coalesced delta is split across packets there).
+    /// Accumulate raw relative mouse motion (mickeys) for the next per-frame flush.
+    /// The guest driver applies its ratio and clamps to the video mode's range, so
+    /// the host forwards the raw counts unscaled and unclamped.
+    fn accumulate_guest_motion(&mut self, dx: f32, dy: f32) {
+        self.mouse_rel_x += dx;
+        self.mouse_rel_y += dy;
         self.mouse_dirty = true;
     }
 
-    /// Send the latest accumulated guest cursor position, if it moved since the
-    /// last flush. Called once per frame so an 8000 Hz mouse drives the guest at
+    /// Send the motion accumulated since the last flush as one coalesced relative
+    /// packet, if any. Called once per frame so an 8000 Hz mouse drives the guest at
     /// the refresh rate, not at the host polling rate.
     fn flush_guest_motion(&mut self) {
         if !self.mouse_dirty {
             return;
         }
         self.mouse_dirty = false;
+        let dx = self.mouse_rel_x as i32;
+        let dy = self.mouse_rel_y as i32;
+        self.mouse_rel_x = 0.0;
+        self.mouse_rel_y = 0.0;
         if let Some(emu) = &self.emu {
-            emu.send_mouse_absolute(self.abs_x as i32, self.abs_y as i32, self.last_buttons);
+            emu.send_mouse_relative(dx, dy, self.last_buttons);
         }
     }
 
@@ -2531,12 +2515,8 @@ impl ApplicationHandler for WinitApp {
             }
             // Raw relative pointer motion drives the captured guest cursor.
             DeviceEvent::MouseMotion { delta } if self.gui.input_captured => {
-                let ppp = self
-                    .window
-                    .as_ref()
-                    .map_or(1.0, |w| w.scale_factor() as f32);
                 self.gui
-                    .accumulate_guest_motion(delta.0 as f32, delta.1 as f32, ppp);
+                    .accumulate_guest_motion(delta.0 as f32, delta.1 as f32);
             }
             _ => {}
         }
@@ -2561,12 +2541,7 @@ impl ApplicationHandler for WinitApp {
             // capture directly), then flush it as one coalesced guest packet.
             let (rdx, rdy) = self.raw_mouse.take();
             if self.gui.input_captured && (rdx != 0 || rdy != 0) {
-                let ppp = self
-                    .window
-                    .as_ref()
-                    .map_or(1.0, |w| w.scale_factor() as f32);
-                self.gui
-                    .accumulate_guest_motion(rdx as f32, rdy as f32, ppp);
+                self.gui.accumulate_guest_motion(rdx as f32, rdy as f32);
             }
             self.gui.flush_guest_motion();
             self.render(event_loop);
