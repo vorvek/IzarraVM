@@ -11284,6 +11284,14 @@ impl CpuBus for MachineBus<'_> {
 
     fn prefetch_memory(&mut self, address: u32, out: &mut [u8]) -> Result<usize, BusError> {
         let address = self.apply_a20(address);
+        // Fast path: a prefetch window entirely within conventional RAM (below
+        // the 0xA0000 video aperture) is one bounded slice copy instead of a
+        // gauntlet-walking read_phys_u8 per byte.
+        let ram_end = address as usize + out.len();
+        if ram_end <= 0x000A_0000 && ram_end <= self.memory.len() {
+            out.copy_from_slice(&self.memory.as_slice()[address as usize..ram_end]);
+            return Ok(out.len());
+        }
         let mut copied = 0;
         for (offset, byte) in out.iter_mut().enumerate() {
             match self.read_phys_u8(address + offset as u32) {
@@ -12618,6 +12626,17 @@ impl MachineBus<'_> {
             return Ok(());
         }
 
+        // Fast path: an access lying entirely within conventional RAM, below the
+        // 0xA0000 video aperture, touches none of the device windows decoded
+        // below and resolves to the same backing-store read the gauntlet ends
+        // with. This is the overwhelmingly common access for real-mode code, so
+        // skip straight to the slice copy.
+        let ram_end = address as usize + width;
+        if ram_end <= 0x000A_0000 && ram_end <= self.memory.len() {
+            out.copy_from_slice(&self.memory.as_slice()[address as usize..ram_end]);
+            return Ok(());
+        }
+
         if let Some(offset) = rom_offset(address, width) {
             out.copy_from_slice(&self.rom[offset..offset + width]);
             return Ok(());
@@ -12741,6 +12760,14 @@ impl MachineBus<'_> {
     }
 
     fn write_memory_byte(&mut self, address: u32, value: u8) -> Result<(), BusError> {
+        // Fast path: conventional RAM below the 0xA0000 video aperture has no
+        // device window here and resolves to the same backing-store write the
+        // gauntlet below ends with.
+        let addr = address as usize;
+        if addr < 0x000A_0000 && addr < self.memory.len() {
+            return self.memory.write_u8(addr, value);
+        }
+
         if rom_offset(address, 1).is_some() {
             return Ok(());
         }
