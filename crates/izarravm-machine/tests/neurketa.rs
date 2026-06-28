@@ -74,6 +74,16 @@ fn baseline_charges_fewer_clocks_than_the_sieve() {
 }
 
 #[test]
+fn fp_mandelbrot_diverges_across_the_fpu_modes() {
+    let m486 = run(GswMode::Gsw486, 3).elapsed_clocks();
+    let m586 = run(GswMode::Gsw586, 3).elapsed_clocks();
+    assert!(
+        m586 < m486,
+        "586 ({m586}) should charge fewer than 486 ({m486})"
+    );
+}
+
+#[test]
 fn faster_modes_charge_fewer_guest_clocks_for_the_sieve() {
     let i386 = run(GswMode::Gsw386, 1).elapsed_clocks();
     let i486 = run(GswMode::Gsw486, 1).elapsed_clocks();
