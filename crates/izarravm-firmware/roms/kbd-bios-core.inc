@@ -332,8 +332,11 @@ int16:
     pop ds
     je .read_wait          ; buffer empty: spin (IRQ fills it)
     push ds
-    mov cx, 0x0040
-    mov ds, cx
+    ; INT 16h must preserve CX (IBM AT BIOS contract: every register but AX/FLAGS).
+    ; FreeDOS's CONRead uses CX as its read-loop counter, so use BX (reloaded on the
+    ; next line) as the DS-load scratch here instead of clobbering CX.
+    mov bx, 0x0040
+    mov ds, bx
     mov bx, [KB_BUF_HEAD]
     mov ax, [bx]           ; AX = scancode:ascii
     add bx, 2
@@ -366,8 +369,9 @@ int16:
     pop ds
     je .read16_wait
     push ds
-    mov cx, 0x0040
-    mov ds, cx
+    ; Preserve CX (see the AH=00h .read note above): use BX as the DS-load scratch.
+    mov bx, 0x0040
+    mov ds, bx
     mov bx, [KB_BUF_HEAD]
     mov ax, [bx]
     add bx, 2
