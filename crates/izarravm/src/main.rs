@@ -226,9 +226,8 @@ fn run_boot_suite(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// One Neurketa run: boot the image in `mode`, preload `selector`, run to the
-/// guest's CMD_EXIT, and read back the charged guest clocks, the reported
-/// result primitives, and the host wall time.
+/// One bench run result: raw guest clocks, the reported iteration count and
+/// self-check value, and the host wall time.
 struct BenchRun {
     clocks: u64,
     iterations: u32,
@@ -236,24 +235,36 @@ struct BenchRun {
     wall: std::time::Duration,
 }
 
+/// How a benchmark payload is loaded: baked into the Neurketa boot image and
+/// chosen by a selector byte, or a freestanding DOS .EXE.
+#[derive(Debug)]
+enum BenchSource {
+    BootSelector(u8),
+    DosExe(&'static [u8]),
+}
+
 fn run_bench_one(
     hardware: &HardwareProfile,
     mode: GswMode,
-    selector: u8,
+    source: &BenchSource,
     budget: u64,
 ) -> Result<BenchRun, Box<dyn Error>> {
-    let mut machine = Machine::new_boot_image(
-        MachineProfile::from_hardware_profile(hardware),
-        neurketa_image(),
-    )?;
+    let profile = MachineProfile::from_hardware_profile(hardware);
+    let mut machine = match source {
+        BenchSource::BootSelector(selector) => {
+            let mut m = Machine::new_boot_image(profile, neurketa_image())?;
+            m.set_bench_selector(*selector);
+            m
+        }
+        BenchSource::DosExe(exe) => Machine::new_dos_program(profile, exe)?,
+    };
     machine.set_mode(mode);
-    machine.set_bench_selector(selector);
     let started = std::time::Instant::now();
     let stop = machine.run_until_halt_or_cycles(budget)?;
     let wall = started.elapsed();
     if !matches!(stop, StopReason::TestExit { .. }) {
         return Err(format!(
-            "neurketa {} selector {selector} did not exit cleanly: {stop:?}",
+            "bench {} {source:?} did not exit cleanly: {stop:?}",
             mode.canonical_name()
         )
         .into());
@@ -266,25 +277,30 @@ fn run_bench_one(
     })
 }
 
-/// A benchmark payload the harness can run: a display name, the guest selector
-/// byte, and the lowest GSW mode it applies to. FP payloads need an FPU, so they
-/// start at 486.
+/// A benchmark payload the harness can run: a display name, how the payload is
+/// loaded, and the lowest GSW mode it applies to. FP payloads need an FPU, so
+/// they start at 486.
 struct Bench {
     name: &'static str,
-    selector: u8,
+    source: BenchSource,
     min_mode: GswMode,
 }
 
 const BENCHES: &[Bench] = &[
     Bench {
         name: "sieve",
-        selector: 1,
+        source: BenchSource::BootSelector(1),
         min_mode: GswMode::Gsw286,
     },
     Bench {
         name: "fp-mandel",
-        selector: 3,
+        source: BenchSource::BootSelector(3),
         min_mode: GswMode::Gsw486,
+    },
+    Bench {
+        name: "dhrystone",
+        source: BenchSource::DosExe(izarravm_firmware::DHRYSTONE_EXE),
+        min_mode: GswMode::Gsw286,
     },
 ];
 
@@ -301,12 +317,11 @@ fn mode_rank(mode: GswMode) -> u8 {
 
 /// Run every benchmark in each CPU mode it applies to, printing one labeled row
 /// per benchmark per mode. The per-mode baseline (boot and report overhead) is
-/// measured once per mode and subtracted from each payload. Later phases add the
-/// era-reference comparison and a JSON report.
+/// measured once per mode and subtracted from BootSelector payloads. DosExe
+/// payloads have their own startup and report the full elapsed clocks.
 fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
     // The run stops at the guest's CMD_EXIT, so this is only a safety cap.
     const BENCH_BUDGET: u64 = 50_000_000_000;
-    const SEL_BASELINE: u8 = 0;
 
     let modes = [
         GswMode::Gsw286,
@@ -315,28 +330,44 @@ fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
         GswMode::Gsw586,
     ];
 
-    // Per-mode baseline clocks, indexed by mode_rank.
+    // Per-mode baseline clocks for BootSelector benches, indexed by mode_rank.
     let mut baseline = [0u64; 4];
     for mode in modes {
         baseline[mode_rank(mode) as usize] =
-            run_bench_one(hardware, mode, SEL_BASELINE, BENCH_BUDGET)?.clocks;
+            run_bench_one(hardware, mode, &BenchSource::BootSelector(0), BENCH_BUDGET)?.clocks;
     }
 
     println!(
-        "{:<10} {:<5} {:>12} {:>8} {:>9} {:>10} {:>9} {:>10}",
-        "bench", "mode", "cyc/iter", "iters", "aux", "guest_ms", "wall_ms", "rt_factor"
+        "{:<10} {:<5} {:>12} {:>8} {:>9} {:>12} {:>10} {:>9} {:>10}",
+        "bench",
+        "mode",
+        "cyc/iter",
+        "iters",
+        "aux",
+        "iters/sec",
+        "guest_ms",
+        "wall_ms",
+        "rt_factor"
     );
     for bench in BENCHES {
         for mode in modes {
             if mode_rank(mode) < mode_rank(bench.min_mode) {
                 continue;
             }
-            let run = run_bench_one(hardware, mode, bench.selector, BENCH_BUDGET)?;
-            let base = baseline[mode_rank(mode) as usize];
-            let work = run.clocks.saturating_sub(base);
+            let run = run_bench_one(hardware, mode, &bench.source, BENCH_BUDGET)?;
+            let baseline_clocks = match bench.source {
+                BenchSource::BootSelector(_) => baseline[mode_rank(mode) as usize],
+                BenchSource::DosExe(_) => 0,
+            };
+            let work = run.clocks.saturating_sub(baseline_clocks);
             let iters = u64::from(run.iterations.max(1));
             let cyc_per_iter = work as f64 / iters as f64;
             let guest_secs = work as f64 / mode.clock_hz() as f64;
+            let iters_per_sec = if guest_secs > 0.0 {
+                iters as f64 / guest_secs
+            } else {
+                0.0
+            };
             let wall_secs = run.wall.as_secs_f64();
             let rt = if wall_secs > 0.0 {
                 guest_secs / wall_secs
@@ -344,12 +375,13 @@ fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
                 0.0
             };
             println!(
-                "{:<10} {:<5} {:>12.2} {:>8} {:>9} {:>10.3} {:>9.3} {:>10.3}",
+                "{:<10} {:<5} {:>12.2} {:>8} {:>9} {:>12.1} {:>10.3} {:>9.3} {:>10.3}",
                 bench.name,
                 mode.canonical_name(),
                 cyc_per_iter,
                 run.iterations,
                 run.aux,
+                iters_per_sec,
                 guest_secs * 1000.0,
                 wall_secs * 1000.0,
                 rt,
