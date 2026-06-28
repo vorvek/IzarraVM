@@ -12,3 +12,19 @@
 
 # Python bytecode caches from authoring tools
 __pycache__/
+
+# FreeDOS kernel build outputs (build-freedos.ps1). The vendored kernel tree's
+# own .gitignore already covers *.obj/*.lib/*.exe/*.com/*.bin/*.sys/*.map/config.bat;
+# this only adds the owcc .o files the cross-compile (owwin) profile emits, which
+# that vendored ignore predates. Shipped artifact is tokados.img, not these.
+toka-dos/freedos/**/*.o
+toka-dos/freedos/**/bin/
+
+# FreeCOM build outputs (build-freedos.ps1). The vendored freecom tree's own
+# .gitignore covers *.obj/*.lib/*.exe/command.com/*.cln/config.bat/config.mak/
+# strings.h/strings.dat, but NOT the per-source *.err diagnostic files wcc drops
+# next to each compiled .c. Ignore those, but never the vendored language tables
+# (strings/*.err and suppl/src/nls/*.err are committed source, not build output).
+toka-dos/freedos/freecom/**/*.err
+!toka-dos/freedos/freecom/strings/*.err
+!toka-dos/freedos/freecom/suppl/src/nls/*.err

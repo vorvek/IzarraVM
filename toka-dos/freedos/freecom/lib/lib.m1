@@ -1,0 +1,8 @@
+.AUTODEPEND
+
+CFG_DEPENDENCIES = makefile.mak
+
+!include "..\config.mak"
+
+all: $(CFG) freecom.lib
+

@@ -58,6 +58,11 @@ static IZARRA_FLASH: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::new(|| 
 /// It lives in the motherboard BOOT.rom alongside the BIOS and Belunza.
 pub const TOKA_DOS_ROM: &[u8] = include_bytes!("../roms/tokados.rom");
 
+/// The Toka-DOS floppy disk image: a 1.44 MiB bootable floppy disk image
+/// containing a complete Toka-DOS system. Used for booting real FreeDOS on
+/// the Izarra 3000.
+pub const TOKADOS_IMG: &[u8] = include_bytes!("../roms/tokados.img");
+
 /// The slice of the 2 MB BOOT.rom reserved for Toka-DOS. The BIOS keeps its
 /// 64 KiB and Belunza gets the rest. The fit test fails loudly if the packed
 /// OS ever outgrows this.
@@ -98,6 +103,10 @@ pub fn neurketa_image() -> &'static [u8] {
 
 pub fn toka_dos_rom() -> &'static [u8] {
     TOKA_DOS_ROM
+}
+
+pub fn tokados_img() -> &'static [u8] {
+    TOKADOS_IMG
 }
 
 /// The Toka-DOS system files as owned (DOS 8.3 name, bytes) pairs, ready to hand
@@ -641,5 +650,12 @@ mod tests {
     #[test]
     fn dhrystone_exe_starts_with_mz() {
         assert_eq!(&dhrystone_exe()[0..2], &[0x4D, 0x5A]);
+    }
+
+    #[test]
+    fn tokados_img_is_a_144_floppy_with_boot_signature() {
+        let img = super::tokados_img();
+        assert_eq!(img.len(), 1_474_560, "tokados.img must be a 1.44MB floppy");
+        assert_eq!(&img[0x1FE..0x200], &[0x55, 0xAA], "boot signature");
     }
 }

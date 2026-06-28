@@ -905,24 +905,19 @@ mod tests {
 }
 
 #[cfg(test)]
-mod sp1_smoke {
+mod tokados_smoke {
     use super::*;
     use izarravm_machine::StopReason;
 
-    /// The prebuilt FreeDOS floppy produced by scripts/prep-freedos-spike.py.
-    fn spike_image() -> Vec<u8> {
-        let path = std::env::var("IZARRAVM_FREEDOS_SPIKE_IMG")
-            .expect("set IZARRAVM_FREEDOS_SPIKE_IMG (run scripts/prep-freedos-spike.py (uses the local FreeDOS disks or fetch-freedos-spike.ps1's raw image) and set IZARRAVM_FREEDOS_SPIKE_IMG)");
-        std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"))
-    }
-
-    fn boot(image: Vec<u8>, cycles: u64) -> (Machine, StopReason) {
+    fn boot(cycles: u64) -> (Machine, StopReason) {
         let mut machine = Machine::new(
             MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
             izarravm_firmware::izarra_bios(),
         )
         .expect("build machine");
-        machine.mount_floppy(image).expect("mount 1.44MB floppy");
+        machine
+            .mount_floppy(izarravm_firmware::tokados_img().to_vec())
+            .expect("mount tokados.img");
         let stop = machine
             .run_until_halt_or_cycles(cycles)
             .expect("run machine");
@@ -930,32 +925,24 @@ mod sp1_smoke {
     }
 
     #[test]
-    #[ignore = "needs IZARRAVM_FREEDOS_SPIKE_IMG (run scripts/prep-freedos-spike.py (uses the local FreeDOS disks or fetch-freedos-spike.ps1's raw image) and set IZARRAVM_FREEDOS_SPIKE_IMG)"]
-    fn sp1_freedos_boots_to_prompt() {
-        let (machine, stop) = boot(spike_image(), 500_000_000);
-
-        // A clean boot never CpuErrors. If it does, the message carries the
-        // opcode + CS:EIP — that is the first fault to fix.
+    #[ignore = "boots a full DOS image (slow in debug); run with --ignored or in a release CI step"]
+    fn tokados_boots_to_prompt() {
+        let (machine, stop) = boot(500_000_000);
         if let StopReason::CpuError(msg) = &stop {
-            panic!("CPU fault during FreeDOS boot: {msg}");
+            panic!("CPU fault during Toka-DOS boot: {msg}");
         }
-
-        // Primary success criterion: an interactive DOS prompt is on screen.
         let text = machine.screen_text().as_text();
         assert!(
-            text.contains(":\\>"),
-            "no DOS prompt on screen (stop={stop:?}).\n--- screen ---\n{text}\n--- end screen ---"
+            text.contains("Toka-DOS 3.0"),
+            "Toka-DOS 3.0 banner not on screen (stop={stop:?}).\n{text}"
         );
+        assert!(text.contains(":\\>"), "no DOS prompt on screen.\n{text}");
     }
 
     #[test]
-    #[ignore = "needs IZARRAVM_FREEDOS_SPIKE_IMG (run scripts/prep-freedos-spike.py)"]
-    fn sp1_freedos_runs_injected_ver() {
-        // Boot to the interactive prompt first.
-        let (mut machine, _stop) = boot(spike_image(), 500_000_000);
-
-        // Type `ver` + Enter through the real keyboard path (lowercase: DOS is
-        // case-insensitive; ascii_to_set1 covers lowercase letters and CR).
+    #[ignore = "boots a full DOS image (slow in debug); run with --ignored"]
+    fn tokados_runs_injected_ver() {
+        let (mut machine, _stop) = boot(500_000_000);
         for ch in "ver\r".chars() {
             for code in ascii_to_set1(ch) {
                 machine.inject_key_scancodes(&[code]);
@@ -964,14 +951,38 @@ mod sp1_smoke {
                 .run_until_halt_or_cycles(5_000_000)
                 .expect("type key");
         }
-
         let text = machine.screen_text().as_text().to_ascii_lowercase();
-        // The FreeCom/kernel banners already contain "version" and "dos", so matching
-        // those would false-pass. Require the typed command echoed at the prompt — it
-        // only appears if our injected keystrokes reached COMMAND.COM.
         assert!(
             text.contains("a:\\>ver"),
-            "typed VER was not echoed at the prompt; the keyboard->shell path did not work.\n--- screen ---\n{text}\n--- end screen ---"
+            "typed VER not echoed at the prompt.\n{text}"
+        );
+    }
+
+    #[test]
+    #[ignore = "boots a full DOS image (slow in debug); run with --ignored"]
+    fn tokados_child_shell_reload_then_prompts() {
+        let (mut machine, _stop) = boot(500_000_000);
+        // Spawn the COMMAND.COM alias as a CHILD shell: this EXECs the renamed shell
+        // and forces COMSPEC/transient resolution (the only path the TOKACMD.COM-primary
+        // + COMMAND.COM-alias rename could actually break). Then exit back to the parent
+        // and confirm the parent shell still works.
+        for cmd in ["command\r", "exit\r", "ver\r"] {
+            for ch in cmd.chars() {
+                for code in ascii_to_set1(ch) {
+                    machine.inject_key_scancodes(&[code]);
+                }
+                machine.run_until_halt_or_cycles(5_000_000).expect("type");
+            }
+            machine
+                .run_until_halt_or_cycles(30_000_000)
+                .expect("settle");
+        }
+        let text = machine.screen_text().as_text().to_ascii_lowercase();
+        // After the child shell loads, exits, and we type ver, the parent prompt must
+        // echo the command — proving COMSPEC reload of the renamed shell works.
+        assert!(
+            text.contains("a:\\>ver"),
+            "parent shell did not recover after running/exiting the child COMMAND.COM (COMSPEC reload of renamed shell failed).\n{text}"
         );
     }
 }

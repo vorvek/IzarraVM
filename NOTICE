@@ -1,0 +1,5 @@
+IzarraVM bundles Toka-DOS, built from FreeDOS source (https://www.freedos.org/).
+FreeDOS kernel: (C) 1995-2012 Pasquale J. Villani and The FreeDOS Project, GPLv2-or-later.
+FreeCOM: (C) 1994-2005 Tim Norman and others, GPLv2-or-later.
+Modified by the Toka-DOS project (2026). Corresponding source: toka-dos/freedos/.
+Full license: GPL-3.0 (see LICENSE).

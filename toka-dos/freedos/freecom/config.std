@@ -1,0 +1,80 @@
+# defaults for DOS; can be overridden in compiler makefiles
+DIRSEP = \ #a backslash
+ECHOTO = echoto
+ECHOTODEP = echoto.bat
+LIBLIST = ,
+ECHOLIB = echolib
+ECHOLIBDEP = echolib.bat
+CP = copy
+CLO =
+SCRIPTS_PATH = ..\scripts
+!if $(TOP2LVL)0 == 10
+SCRIPTS_PATH = ..\..\scripts
+!endif
+RMFILES = $(SCRIPTS_PATH)\rmfiles
+
+## Where the pre-compiled SUPPL files are located
+## See DOCS\SUPPL.TXT for more information about this library
+SUPPL_INC_PATH = ..$(DIRSEP)suppl
+SUPPL_LIB_PATH = $(SUPPL_INC_PATH)
+
+## Memory model of FreeCOM
+!if $(DEBUG)0 == 10
+SHELL_MMODEL=m
+DEBUG=-DDEBUG
+!else
+SHELL_MMODEL=s
+DEBUG=-UDEBUG -DNDEBUG
+!endif
+SHELL_MMODEL_COMP=$(SHELL_MMODEL)
+
+## Memory model of fixstrs, requires far data pointers, so uses compact memory model by default
+FIXSTRS_MMODEL=-mc
+
+## Add -DDEBUG=1 below to enable debug support for assembly files
+NASMFLAGS = -I$(TOP)/include
+
+!include "$(TOP)/mkfiles/$(COMPILER).mak"
+
+INCLUDEPATH = $(INCLUDEPATH) -I$(SUPPL_INC_PATH)
+
+## Which programs to use
+NASM = $(XNASM)
+
+## Add -DDEBUG=1 below to enable FreeCOM-debug support for C files
+## Add -DNDEBUG=1 below to disable any debug (even assert)
+
+!if $(XMS_SWAP)0 == 10
+__XMS_SWAP = -DXMS_SWAP
+!endif
+
+!if $(FIXSTRS_BUILD)0 == 10
+MMODEL = $(FIXSTRS_MMODEL)
+!endif
+
+# Default configuration
+# added strings.h here because $(CFG) is included everywhere already
+## Add -D_NO__DOS_DATE if your compiler does not have no dosdate_t (*)
+## Add -D_NO__DOS_TIME if your compiler does not have no dostime_t (*)
+## Add -D_NO_FMEMCHR if your compiler does not have no _fmemchr() (*)
+## Add -D_NO_FMEMCMP if your compiler does not have no _fmemcmp() (*)
+##
+## (*) Note: Should be detected by CONFIG.H automatically for Turbo C
+##     and Borland C compilers.
+$(CFG): $(ECHOTODEP) $(CFG_DEPENDENCIES) $(TOP)/config.mak
+	$(RMFILES) $(CFG)
+	$(ECHOTO) $(CFG) $(CFLAGS1)
+	$(ECHOTO) $(CFG) $(CFLAGS2)
+	$(ECHOTO) $(CFG) $(INCLUDEPATH)
+	$(ECHOTO) $(CFG) -m$(SHELL_MMODEL_COMP) $(MMODEL)
+	$(ECHOTO) $(CFG) $(DEBUG) $(__XMS_SWAP)
+
+echoto.bat: $(SCRIPTS_PATH)\echoto.bat
+	$(CP) $(SCRIPTS_PATH)\echoto.bat .
+
+echolib.bat: $(SCRIPTS_PATH)\echolib.bat
+	$(CP) $(SCRIPTS_PATH)\echolib.bat .
+
+#		*Implicit Rules*
+.asm.obj:
+	$(NASM) -f obj $(NASMFLAGS) -DMODEL=$(SHELL_MMODEL) -DCOMPILER=$(COMPILER) $(__XMS_SWAP) $<

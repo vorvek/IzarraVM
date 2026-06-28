@@ -1,0 +1,49 @@
+name: Build
+on:
+  pull_request:
+    types:
+      - opened
+      - edited
+      - ready_for_review
+      - reopened
+      - synchronize
+  push:
+
+jobs:
+  build:
+    if: contains(github.event.head_commit.message, '[skip ci]') == false
+
+    runs-on: ubuntu-22.04
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: prerequisites
+      run: ./ci_prereq.sh
+      env:
+          TC201_ARCHIVE_PATHNAME: ${{ vars.TC201_ARCHIVE_PATHNAME }}
+          TC201_ARCHIVE_FILENAME: ${{ vars.TC201_ARCHIVE_FILENAME }}
+          TC201_ARCHIVE_PASSPHRASE: ${{ secrets.TC201_ARCHIVE_PASSPHRASE }}
+
+    - name: build
+      run: ./ci_build.sh
+
+    - name: test
+      run: ./ci_test.sh
+
+    - name: make snapshot name
+      id: snapshotname
+      run: |
+        (
+          today=`date -u +%F | tr '\n' '-'`
+          s_sha=`echo -n ${GITHUB_SHA} | cut -c1-8`
+          printf "fname=snapshot-%s%s\n" $today $s_sha >> $GITHUB_OUTPUT
+        )
+
+    - name: upload
+      if: github.repository == 'FDOS/freecom' &&
+        (github.event_name == 'push' || github.event.pull_request.merged == true)
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ steps.snapshotname.outputs.fname }}
+        path: _output
