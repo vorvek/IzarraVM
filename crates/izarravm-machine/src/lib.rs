@@ -12955,7 +12955,22 @@ impl MachineBus<'_> {
             .complete_transfer(req, req.cylinder, req.head, last_sector, success);
     }
 
+    #[inline]
     fn memory_wait_states(&self, address: u32) -> u8 {
+        // Conventional RAM (below the 0xA0000 video aperture) is never overlapped
+        // by a ROM, VGA, Margo, or Distira window, so it always runs at RAM speed.
+        // The hot fetch/data path hits this on every access, so keep it a tiny
+        // inlinable check and defer the device-window gauntlet to a cold helper.
+        // This matches the fall-through the gauntlet would reach anyway (it already
+        // classifies by the base address only).
+        if address < 0x000A_0000 {
+            return self.wait_states.ram;
+        }
+        self.memory_wait_states_device(address)
+    }
+
+    #[cold]
+    fn memory_wait_states_device(&self, address: u32) -> u8 {
         if rom_offset(address, 1).is_some() {
             self.wait_states.rom
         } else if self.vga_gfx_offset(address, 1).is_some()

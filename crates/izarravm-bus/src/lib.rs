@@ -185,6 +185,7 @@ impl BusCycle {
 
     /// The clock cost of a cycle without allocating its per-state detail vector.
     /// Matches `BusCycle::new(...).clocks` exactly: T1 + T2 plus the wait states.
+    #[inline]
     pub const fn clocks_for(_width: BusWidth, wait_states: u8) -> u32 {
         2 + wait_states as u32
     }
@@ -268,6 +269,7 @@ impl BusTrace {
     /// only when the trace is in `Full` mode. In `Counts`/`Off` this bumps the
     /// clock total (and the access count) without touching the heap, which is the
     /// fast path the interpreter fetch loop takes.
+    #[inline]
     pub fn record(&mut self, kind: BusAccessKind, address: u32, width: BusWidth, wait_states: u8) {
         let clocks = BusCycle::clocks_for(width, wait_states);
         self.elapsed_clocks += u64::from(clocks);
