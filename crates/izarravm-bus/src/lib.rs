@@ -271,11 +271,26 @@ impl BusTrace {
     /// fast path the interpreter fetch loop takes.
     #[inline]
     pub fn record(&mut self, kind: BusAccessKind, address: u32, width: BusWidth, wait_states: u8) {
+        // Off-mode (the interpreter's hot path) only bumps the clock total, so keep
+        // that a tiny inlinable body and push the count/detail bookkeeping into a
+        // cold helper. Folding this into the per-access caller avoids a cross-crate
+        // call on every fetched byte and memory access.
         let clocks = BusCycle::clocks_for(width, wait_states);
         self.elapsed_clocks += u64::from(clocks);
         if self.mode != TracingMode::Off {
-            self.access_count += 1;
+            self.record_traced(kind, address, width, wait_states);
         }
+    }
+
+    #[cold]
+    fn record_traced(
+        &mut self,
+        kind: BusAccessKind,
+        address: u32,
+        width: BusWidth,
+        wait_states: u8,
+    ) {
+        self.access_count += 1;
         if self.mode == TracingMode::Full && self.capacity > 0 {
             if self.cycles.len() == self.capacity {
                 self.cycles.pop_front();
