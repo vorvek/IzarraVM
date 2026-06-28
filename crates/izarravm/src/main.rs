@@ -266,15 +266,47 @@ fn run_bench_one(
     })
 }
 
-/// Run the Neurketa payloads in every CPU mode and print, per mode, the guest
-/// cycles per iteration and the host real-time factor. Phase 0 runs the Sieve
-/// (selector 1) against the empty baseline (selector 0); later phases add the C
-/// payloads and the era-reference comparison.
+/// A benchmark payload the harness can run: a display name, the guest selector
+/// byte, and the lowest GSW mode it applies to. FP payloads need an FPU, so they
+/// start at 486.
+struct Bench {
+    name: &'static str,
+    selector: u8,
+    min_mode: GswMode,
+}
+
+const BENCHES: &[Bench] = &[
+    Bench {
+        name: "sieve",
+        selector: 1,
+        min_mode: GswMode::Gsw286,
+    },
+    Bench {
+        name: "fp-mandel",
+        selector: 3,
+        min_mode: GswMode::Gsw486,
+    },
+];
+
+/// Rank the modes from slowest to fastest so a benchmark's min_mode gates which
+/// modes it runs in.
+fn mode_rank(mode: GswMode) -> u8 {
+    match mode {
+        GswMode::Gsw286 => 0,
+        GswMode::Gsw386 => 1,
+        GswMode::Gsw486 => 2,
+        GswMode::Gsw586 => 3,
+    }
+}
+
+/// Run every benchmark in each CPU mode it applies to, printing one labeled row
+/// per benchmark per mode. The per-mode baseline (boot and report overhead) is
+/// measured once per mode and subtracted from each payload. Later phases add the
+/// era-reference comparison and a JSON report.
 fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
     // The run stops at the guest's CMD_EXIT, so this is only a safety cap.
     const BENCH_BUDGET: u64 = 50_000_000_000;
     const SEL_BASELINE: u8 = 0;
-    const SEL_SIEVE: u8 = 1;
 
     let modes = [
         GswMode::Gsw286,
@@ -283,30 +315,46 @@ fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
         GswMode::Gsw586,
     ];
 
-    println!("mode    cyc/iter      iters   primes   guest_ms   wall_ms   rt_factor");
+    // Per-mode baseline clocks, indexed by mode_rank.
+    let mut baseline = [0u64; 4];
     for mode in modes {
-        let base = run_bench_one(hardware, mode, SEL_BASELINE, BENCH_BUDGET)?;
-        let sieve = run_bench_one(hardware, mode, SEL_SIEVE, BENCH_BUDGET)?;
-        let work = sieve.clocks.saturating_sub(base.clocks);
-        let iters = u64::from(sieve.iterations.max(1));
-        let cyc_per_iter = work as f64 / iters as f64;
-        let guest_secs = work as f64 / mode.clock_hz() as f64;
-        let wall_secs = sieve.wall.as_secs_f64();
-        let rt = if wall_secs > 0.0 {
-            guest_secs / wall_secs
-        } else {
-            0.0
-        };
-        println!(
-            "{:<6} {:>10.2} {:>10} {:>8} {:>10.3} {:>9.3} {:>10.3}",
-            mode.canonical_name(),
-            cyc_per_iter,
-            sieve.iterations,
-            sieve.aux,
-            guest_secs * 1000.0,
-            wall_secs * 1000.0,
-            rt,
-        );
+        baseline[mode_rank(mode) as usize] =
+            run_bench_one(hardware, mode, SEL_BASELINE, BENCH_BUDGET)?.clocks;
+    }
+
+    println!(
+        "{:<10} {:<5} {:>12} {:>8} {:>9} {:>10} {:>9} {:>10}",
+        "bench", "mode", "cyc/iter", "iters", "aux", "guest_ms", "wall_ms", "rt_factor"
+    );
+    for bench in BENCHES {
+        for mode in modes {
+            if mode_rank(mode) < mode_rank(bench.min_mode) {
+                continue;
+            }
+            let run = run_bench_one(hardware, mode, bench.selector, BENCH_BUDGET)?;
+            let base = baseline[mode_rank(mode) as usize];
+            let work = run.clocks.saturating_sub(base);
+            let iters = u64::from(run.iterations.max(1));
+            let cyc_per_iter = work as f64 / iters as f64;
+            let guest_secs = work as f64 / mode.clock_hz() as f64;
+            let wall_secs = run.wall.as_secs_f64();
+            let rt = if wall_secs > 0.0 {
+                guest_secs / wall_secs
+            } else {
+                0.0
+            };
+            println!(
+                "{:<10} {:<5} {:>12.2} {:>8} {:>9} {:>10.3} {:>9.3} {:>10.3}",
+                bench.name,
+                mode.canonical_name(),
+                cyc_per_iter,
+                run.iterations,
+                run.aux,
+                guest_secs * 1000.0,
+                wall_secs * 1000.0,
+                rt,
+            );
+        }
     }
     Ok(())
 }
