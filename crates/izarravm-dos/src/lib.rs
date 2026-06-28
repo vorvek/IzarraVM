@@ -199,6 +199,7 @@ fn write_system_files(
         std::fs::write(dos_dir.join(name), bytes)?;
     }
     remove_root_system_file_copies(c_root, files)?;
+    remove_legacy_renamed_files(c_root, files)?;
     write_default_boot_config(c_root, policy)
 }
 
@@ -211,6 +212,37 @@ fn remove_root_system_file_copies(
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+/// Old `I`-prefixed system filenames the IZ rebrand replaced. Removed from a
+/// drive on every (re)install so an upgrade-in-place from a pre-rename install
+/// does not leave the stale binaries beside the new `IZ*` ones. `MOUSE.COM` is
+/// deliberately absent: it stays a kept alias.
+const LEGACY_RENAMED_FILES: &[&str] =
+    &["ICOMMAND.COM", "IEMM.COM", "IEMM.EXE", "ICDEX.COM", "IBASIC.COM"];
+
+/// Delete the stale `I`-prefixed binaries that the IZ rebrand renamed, from both
+/// the C: root and `C:\DOS`. A legacy name still present in `files` is left
+/// alone: that means the current ROM still ships it as the live binary (true
+/// only before the ROM is rebuilt), so it is not actually stale.
+fn remove_legacy_renamed_files(
+    c_root: &Path,
+    files: &[(String, Vec<u8>)],
+) -> std::io::Result<()> {
+    let dos_dir = c_root.join("DOS");
+    for name in LEGACY_RENAMED_FILES {
+        if files.iter().any(|(f, _)| f.eq_ignore_ascii_case(name)) {
+            continue;
+        }
+        for path in [c_root.join(name), dos_dir.join(name)] {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
         }
     }
     Ok(())
@@ -7390,6 +7422,25 @@ mod tests {
         toka_dos_install(root, &files, InstallMode::Format).unwrap();
         assert!(!root.join("USER.TXT").exists());
         assert!(root.join("DOS").join("ICOMMAND.COM").exists());
+    }
+
+    #[test]
+    fn install_sheds_legacy_renamed_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("DOS")).unwrap();
+        // Pre-rename install artifacts that must not survive a reprovision.
+        std::fs::write(root.join("DOS").join("ICOMMAND.COM"), b"old").unwrap();
+        std::fs::write(root.join("DOS").join("IEMM.EXE"), b"old").unwrap();
+        std::fs::write(root.join("DOS").join("ICDEX.COM"), b"old").unwrap();
+
+        let files = vec![("IZCMD.COM".to_string(), vec![1u8])];
+        toka_dos_install(root, &files, InstallMode::Repair).unwrap();
+
+        assert!(root.join("DOS").join("IZCMD.COM").exists());
+        assert!(!root.join("DOS").join("ICOMMAND.COM").exists());
+        assert!(!root.join("DOS").join("IEMM.EXE").exists());
+        assert!(!root.join("DOS").join("ICDEX.COM").exists());
     }
 
     #[test]
