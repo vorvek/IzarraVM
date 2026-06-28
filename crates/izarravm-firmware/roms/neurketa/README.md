@@ -8,8 +8,10 @@
 - `neurketa.img` is the checked-in 1.44 MiB boot image.
 
 Payloads: selector 0 is the empty baseline (boot and report overhead only),
-selector 1 is the BYTE Sieve (8190 flags, 40 passes, 1899 primes per pass). The
-host subtracts the baseline cycles from the Sieve cycles to isolate the work.
+selector 1 is the BYTE Sieve (8190 flags, 40 passes, 1899 primes per pass), and
+selector 3 is an x87 floating-point Mandelbrot (48x32 grid, maxiter 64),
+scheduled only in the 486 and 586 modes because the lower modes have no FPU. The
+host subtracts the baseline cycles from a payload's cycles to isolate the work.
 
 Rebuild:
 

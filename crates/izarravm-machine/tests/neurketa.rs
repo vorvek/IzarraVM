@@ -74,7 +74,7 @@ fn baseline_charges_fewer_clocks_than_the_sieve() {
 }
 
 #[test]
-fn fp_mandelbrot_diverges_across_the_fpu_modes() {
+fn fp_mandelbrot_charges_fewer_clocks_in_586_than_486() {
     let m486 = run(GswMode::Gsw486, 3).elapsed_clocks();
     let m586 = run(GswMode::Gsw586, 3).elapsed_clocks();
     assert!(
