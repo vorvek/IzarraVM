@@ -789,11 +789,12 @@ enum FetchCost {
 }
 
 /// A decoded instruction: the prefix/opcode/operand-size results plus, for opcodes already
-/// converted to the decode/execute split, the pre-parsed ModRM and operand descriptor.
-/// Opcodes still on the legacy path leave `modrm`/`operand` as `None` and are re-read by
-/// `execute_instruction_legacy`.
-// Stage-A scaffold: `imm`/`imm2` (and the `len`/`fetch` placeholders) are populated by `decode`
-// but not read until later tasks convert immediate-bearing opcodes and the cache stage lands.
+/// converted to the decode/execute split, the pre-parsed ModRM, operand descriptor, and
+/// immediate. Opcodes still on the legacy path leave `modrm`/`operand` as `None` (and `imm` 0)
+/// and are re-read by `execute_instruction_legacy`.
+// Stage-A scaffold: `imm` is now read by the converted ALU immediate forms; `imm2` (and the
+// `len`/`fetch` placeholders) are populated by `decode` but stay unread until later tasks convert
+// two-immediate opcodes and the cache stage lands.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 struct DecodedInsn {
@@ -1102,13 +1103,23 @@ impl Cpu386 {
             imm2: 0,
         };
 
-        // ADD r/m8, reg8 (0x00) and ADD r/m16/32, reg16/32 (0x01) are the first opcodes routed
-        // through the split: parse their ModRM + addressing-mode descriptor now.
-        if matches!(opcode, 0x00 | 0x01) {
-            let modrm = self.fetch_modrm(bus)?;
-            let operand = self.parse_addressing_mode(bus, prefixes, address_size, modrm)?;
-            insn.modrm = Some(modrm);
-            insn.operand = Some(operand);
+        // The whole ALU block (ADD/OR/ADC/SBB/AND/SUB/XOR/CMP across forms 0-5) is routed through
+        // the split. Forms 0-3 carry a ModRM: parse it + its addressing-mode descriptor now (the
+        // descriptor reads instruction bytes only, so it stays cacheable). Forms 4/5 carry an
+        // accumulator immediate: fetch it here (charging its fetch clocks once) so the executor
+        // consumes `imm` without re-reading. `op = (opcode>>3)&7`, `form = opcode & 7`.
+        if opcode < 0x40 && (opcode & 0x07) < 6 {
+            let form = opcode & 0x07;
+            if form < 4 {
+                let modrm = self.fetch_modrm(bus)?;
+                let operand = self.parse_addressing_mode(bus, prefixes, address_size, modrm)?;
+                insn.modrm = Some(modrm);
+                insn.operand = Some(operand);
+            } else if form == 4 {
+                insn.imm = u32::from(self.fetch_u8(bus)?);
+            } else {
+                insn.imm = self.fetch_immediate(bus, operand_size)?;
+            }
             let consumed = self.registers.eip.wrapping_sub(start_eip) as u8;
             insn.len = consumed;
             insn.fetch = FetchCost::Uniform {
@@ -1120,9 +1131,9 @@ impl Cpu386 {
         Ok(insn)
     }
 
-    /// Stage A executor. For the opcodes converted to the split (ADD r/m,reg), execute from the
-    /// pre-decoded `operand`/`modrm` (resolving the addressing-mode descriptor against the live
-    /// registers). Every other opcode continues into the shared fused dispatch (which re-reads
+    /// Stage A executor. For the opcodes converted to the split (the whole ALU block), execute from
+    /// the pre-decoded `operand`/`modrm`/`imm` (resolving the addressing-mode descriptor against the
+    /// live registers). Every other opcode continues into the shared fused dispatch (which re-reads
     /// its ModRM/immediates from the post-opcode eip) so behavior is byte-for-byte unchanged.
     fn execute_decoded<B: CpuBus>(
         &mut self,
@@ -1130,7 +1141,9 @@ impl Cpu386 {
         bus: &mut B,
     ) -> ExecResult<CycleOutcome> {
         match insn.opcode {
-            0x00 | 0x01 => self.execute_add_rm_reg(insn, bus),
+            // The whole ALU block (ADD/OR/ADC/SBB/AND/SUB/XOR/CMP, forms 0-5) runs through the
+            // split executor. Same condition `decode` uses to pre-parse the ModRM/immediate.
+            opcode if opcode < 0x40 && (opcode & 0x07) < 6 => self.execute_alu_decoded(insn, bus),
             opcode => {
                 // Fallback: `decode` already read the prefixes + opcode and ran the LOCK check,
                 // leaving eip just past the opcode. Continue into the shared dispatch from there,
@@ -1148,31 +1161,96 @@ impl Cpu386 {
         }
     }
 
-    /// ADD r/m, reg through the decode/execute split (ALU form 0/1, op=0). Mirrors the ADD case
-    /// of `execute_alu_block` but consumes the pre-decoded operand instead of re-parsing it.
-    fn execute_add_rm_reg<B: CpuBus>(
+    /// Resolve the pre-decoded r/m operand of an ALU form (0-3) against the live registers:
+    /// a register operand is returned as-is, a memory descriptor has its effective address
+    /// recomputed now (`resolve_addr_mode` reads only base/index registers, no instruction bytes).
+    fn resolve_alu_operand(&self, insn: &DecodedInsn) -> RmOperand {
+        match insn.operand.expect("ALU r/m form decoded with an operand") {
+            DecodedOperand::Reg(index) => RmOperand::Register(index),
+            DecodedOperand::Mem(addr) => self.resolve_addr_mode(&addr),
+        }
+    }
+
+    /// The entire ALU block (ADD/OR/ADC/SBB/AND/SUB/XOR/CMP across all six forms) through the
+    /// decode/execute split. This is the canonical split executor: `op`/`form`/`write_back` are
+    /// derived from the opcode exactly as the former fused ALU handler did, the r/m operand for
+    /// forms 0-3 is resolved from the pre-decoded descriptor (so the EA is recomputed against the
+    /// live registers each call), and the immediate for forms 4-5 is taken from `insn.imm` (decode
+    /// already fetched and charged it, so the executor must NOT re-fetch). `self.alu` is reused
+    /// verbatim so the flag logic lives in exactly one place.
+    fn execute_alu_decoded<B: CpuBus>(
         &mut self,
         insn: &DecodedInsn,
         bus: &mut B,
     ) -> ExecResult<CycleOutcome> {
-        let modrm = insn.modrm.expect("ADD r/m,reg decoded with a ModRM");
-        let operand = match insn.operand.expect("ADD r/m,reg decoded with an operand") {
-            DecodedOperand::Reg(index) => RmOperand::Register(index),
-            DecodedOperand::Mem(addr) => self.resolve_addr_mode(&addr),
-        };
-        // op = 0 (ADD); write_back is always true (ADD is not CMP).
-        if insn.opcode == 0x00 {
-            let a = u32::from(self.read_operand_u8(bus, operand)?);
-            let b = u32::from(self.read_gpr8(modrm.reg));
-            let result = self.alu(0, a, b, BusWidth::Byte) as u8;
-            self.write_operand_u8(bus, operand, result)?;
-        } else {
-            let operand_size = insn.operand_size;
-            let a = self.read_operand_sized(bus, operand, operand_size)?;
-            let b = self.read_gpr_sized(modrm.reg, operand_size);
-            let result = self.alu(0, a, b, operand_size.bus_width());
-            self.write_operand_sized(bus, operand, operand_size, result)?;
+        let opcode = insn.opcode as u8;
+        let op = (opcode >> 3) & 0x07;
+        let form = opcode & 0x07;
+        let write_back = op != 7; // CMP computes flags only
+        let operand_size = insn.operand_size;
+
+        match form {
+            0 => {
+                let modrm = insn.modrm.expect("ALU form 0 decoded with a ModRM");
+                let operand = self.resolve_alu_operand(insn);
+                let a = u32::from(self.read_operand_u8(bus, operand)?);
+                let b = u32::from(self.read_gpr8(modrm.reg));
+                let result = self.alu(op, a, b, BusWidth::Byte) as u8;
+                if write_back {
+                    self.write_operand_u8(bus, operand, result)?;
+                }
+            }
+            1 => {
+                let modrm = insn.modrm.expect("ALU form 1 decoded with a ModRM");
+                let operand = self.resolve_alu_operand(insn);
+                let a = self.read_operand_sized(bus, operand, operand_size)?;
+                let b = self.read_gpr_sized(modrm.reg, operand_size);
+                let result = self.alu(op, a, b, operand_size.bus_width());
+                if write_back {
+                    self.write_operand_sized(bus, operand, operand_size, result)?;
+                }
+            }
+            2 => {
+                let modrm = insn.modrm.expect("ALU form 2 decoded with a ModRM");
+                let operand = self.resolve_alu_operand(insn);
+                let a = u32::from(self.read_gpr8(modrm.reg));
+                let b = u32::from(self.read_operand_u8(bus, operand)?);
+                let result = self.alu(op, a, b, BusWidth::Byte) as u8;
+                if write_back {
+                    self.write_gpr8(modrm.reg, result);
+                }
+            }
+            3 => {
+                let modrm = insn.modrm.expect("ALU form 3 decoded with a ModRM");
+                let operand = self.resolve_alu_operand(insn);
+                let a = self.read_gpr_sized(modrm.reg, operand_size);
+                let b = self.read_operand_sized(bus, operand, operand_size)?;
+                let result = self.alu(op, a, b, operand_size.bus_width());
+                if write_back {
+                    self.write_gpr_sized(modrm.reg, operand_size, result);
+                }
+            }
+            4 => {
+                // imm8 was fetched + charged by `decode`; consume it from the decoded instruction.
+                let imm = insn.imm;
+                let a = u32::from(self.read_gpr8(0));
+                let result = self.alu(op, a, imm, BusWidth::Byte) as u8;
+                if write_back {
+                    self.write_gpr8(0, result);
+                }
+            }
+            5 => {
+                // imm16/32 was fetched + charged by `decode`; consume it from the decoded form.
+                let imm = insn.imm;
+                let a = self.read_gpr_sized(0, operand_size);
+                let result = self.alu(op, a, imm, operand_size.bus_width());
+                if write_back {
+                    self.write_gpr_sized(0, operand_size, result);
+                }
+            }
+            _ => unreachable!("alu form {form}"),
         }
+
         Ok(clocks(2))
     }
 
@@ -1219,9 +1297,6 @@ impl Cpu386 {
         address_size: AddressSize,
     ) -> ExecResult<CycleOutcome> {
         match opcode {
-            opcode if opcode < 0x40 && (opcode & 0x07) < 6 => {
-                self.execute_alu_block(bus, opcode, prefixes, address_size, operand_size)
-            }
             0x06 => {
                 self.push(
                     bus,
@@ -3054,81 +3129,6 @@ impl Cpu386 {
             }
             .into()),
         }
-    }
-
-    fn execute_alu_block<B: CpuBus>(
-        &mut self,
-        bus: &mut B,
-        opcode: u8,
-        prefixes: Prefixes,
-        address_size: AddressSize,
-        operand_size: OperandSize,
-    ) -> ExecResult<CycleOutcome> {
-        let op = (opcode >> 3) & 0x07;
-        let form = opcode & 0x07;
-        let write_back = op != 7; // CMP computes flags only
-
-        match form {
-            0 => {
-                let modrm = self.fetch_modrm(bus)?;
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                let a = u32::from(self.read_operand_u8(bus, operand)?);
-                let b = u32::from(self.read_gpr8(modrm.reg));
-                let result = self.alu(op, a, b, BusWidth::Byte) as u8;
-                if write_back {
-                    self.write_operand_u8(bus, operand, result)?;
-                }
-            }
-            1 => {
-                let modrm = self.fetch_modrm(bus)?;
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                let a = self.read_operand_sized(bus, operand, operand_size)?;
-                let b = self.read_gpr_sized(modrm.reg, operand_size);
-                let result = self.alu(op, a, b, operand_size.bus_width());
-                if write_back {
-                    self.write_operand_sized(bus, operand, operand_size, result)?;
-                }
-            }
-            2 => {
-                let modrm = self.fetch_modrm(bus)?;
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                let a = u32::from(self.read_gpr8(modrm.reg));
-                let b = u32::from(self.read_operand_u8(bus, operand)?);
-                let result = self.alu(op, a, b, BusWidth::Byte) as u8;
-                if write_back {
-                    self.write_gpr8(modrm.reg, result);
-                }
-            }
-            3 => {
-                let modrm = self.fetch_modrm(bus)?;
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                let a = self.read_gpr_sized(modrm.reg, operand_size);
-                let b = self.read_operand_sized(bus, operand, operand_size)?;
-                let result = self.alu(op, a, b, operand_size.bus_width());
-                if write_back {
-                    self.write_gpr_sized(modrm.reg, operand_size, result);
-                }
-            }
-            4 => {
-                let imm = u32::from(self.fetch_u8(bus)?);
-                let a = u32::from(self.read_gpr8(0));
-                let result = self.alu(op, a, imm, BusWidth::Byte) as u8;
-                if write_back {
-                    self.write_gpr8(0, result);
-                }
-            }
-            5 => {
-                let imm = self.fetch_immediate(bus, operand_size)?;
-                let a = self.read_gpr_sized(0, operand_size);
-                let result = self.alu(op, a, imm, operand_size.bus_width());
-                if write_back {
-                    self.write_gpr_sized(0, operand_size, result);
-                }
-            }
-            _ => unreachable!("alu form {form}"),
-        }
-
-        Ok(clocks(2))
     }
 
     fn read_prefixes<B: CpuBus>(&mut self, bus: &mut B) -> ExecResult<Prefixes> {
@@ -13221,52 +13221,58 @@ mod tests {
         (cpu, memory)
     }
 
+    /// Shared seed for the seam differential / golden batteries below: a fixed real-mode register
+    /// set plus a known word at [0x20], so each instruction has stable inputs.
+    fn seam_seed(cpu: &mut Cpu386) {
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x0102);
+        cpu.write_reg16(Reg16::Bx, 0x0010);
+        cpu.write_reg16(Reg16::Cx, 0x0304);
+        cpu.write_reg16(Reg16::Dx, 0x0506);
+        cpu.write_reg16(Reg16::Si, 0x0008);
+        cpu.write_reg16(Reg16::Di, 0x0018);
+        cpu.write_reg16(Reg16::Bp, 0x0010);
+    }
+
+    fn seam_fetch_count(bus: &TestBus) -> usize {
+        bus.trace
+            .cycles()
+            .iter()
+            .filter(|c| c.kind == BusAccessKind::InstructionPrefetch)
+            .count()
+    }
+
     #[test]
     fn seam_matches_fused_path_across_addressing_forms() {
-        // Run a battery of instructions through cycle() (decode/execute split) and through
-        // execute_instruction_legacy (fused) from identical start state and assert identical end
-        // state. Guards that the seam stays behaviorally bit-identical to the fused path for both
-        // the converted opcode (ADD r/m,reg) and the legacy fallback, across addressing forms.
+        // Run a battery of *non-converted* (legacy-fallback) instructions through cycle()
+        // (decode/execute split) and through execute_instruction_legacy (fused) from identical
+        // start state and assert identical end state. Guards that, for opcodes still on the legacy
+        // path, the seam stays behaviorally bit-identical to the fused path across addressing forms.
+        // The ALU block is no longer comparable this way: it is fully converted to the split, so its
+        // former fused executor was deleted (there must be no second ALU plumbing path). The ALU
+        // split is covered against golden end-states in `alu_split_matches_golden_across_ops`.
         let cases: &[(&str, &[u8])] = &[
-            ("add ax,bx", &[0x01, 0xd8]),
-            ("add [bx+si],ax", &[0x01, 0x00]),
-            ("add [bp+di+4],cx", &[0x01, 0x4b, 0x04]),
-            ("add [0x20],dx", &[0x01, 0x16, 0x20, 0x00]),
-            ("add [si],al(byte)", &[0x00, 0x04]),
             ("mov ax,[0x20]", &[0xa1, 0x20, 0x00]),
             ("mov [bx],cx", &[0x89, 0x0f]),
-            ("sub [bp+2],ax", &[0x29, 0x46, 0x02]),
             ("inc word [bx]", &[0xff, 0x07]),
             ("lea ax,[bx+si+3]", &[0x8d, 0x40, 0x03]),
-            ("xor [di],bx", &[0x31, 0x1d]),
-            ("cmp [bx+4],dx", &[0x39, 0x57, 0x04]),
         ];
         for (name, code) in cases {
             let mut mem = vec![0u8; 0x200];
             mem[..code.len()].copy_from_slice(code);
             mem[0x20..0x22].copy_from_slice(&0x1111u16.to_le_bytes());
-            let seed = |cpu: &mut Cpu386| {
-                cpu.load_segment_real(SegmentIndex::Cs, 0);
-                cpu.load_segment_real(SegmentIndex::Ds, 0);
-                cpu.load_segment_real(SegmentIndex::Ss, 0);
-                cpu.registers.eip = 0;
-                cpu.write_reg16(Reg16::Ax, 0x0102);
-                cpu.write_reg16(Reg16::Bx, 0x0010);
-                cpu.write_reg16(Reg16::Cx, 0x0304);
-                cpu.write_reg16(Reg16::Dx, 0x0506);
-                cpu.write_reg16(Reg16::Si, 0x0008);
-                cpu.write_reg16(Reg16::Di, 0x0018);
-                cpu.write_reg16(Reg16::Bp, 0x0010);
-            };
 
             let mut fused = Cpu386::default();
-            seed(&mut fused);
+            seam_seed(&mut fused);
             let mut fbus = TestBus::with_memory(mem.clone());
             fused.begin_instruction();
             let _ = fused.execute_instruction_legacy(&mut fbus);
 
             let mut split = Cpu386::default();
-            seed(&mut split);
+            seam_seed(&mut split);
             let mut sbus = TestBus::with_memory(mem.clone());
             let _ = split.cycle(&mut sbus);
 
@@ -13290,38 +13296,319 @@ mod tests {
             // timing. Count the InstructionPrefetch bus cycles on each path and require equality.
             // This is scale-independent, unlike `core_clocks` (cycle() scales via scale_clocks
             // while the fused reference returns raw clocks).
-            let fetch_count = |bus: &TestBus| {
-                bus.trace
-                    .cycles()
-                    .iter()
-                    .filter(|c| c.kind == BusAccessKind::InstructionPrefetch)
-                    .count()
-            };
             assert_eq!(
-                fetch_count(&sbus),
-                fetch_count(&fbus),
+                seam_fetch_count(&sbus),
+                seam_fetch_count(&fbus),
                 "instruction-fetch cycle count mismatch for {name} (seam must charge fetches once)"
             );
         }
     }
 
     #[test]
-    fn decode_then_execute_matches_fused_for_add_rm_reg() {
-        // 01 D8 = ADD AX, BX (ALU form 1, op=0, modrm mode=3 rm=0 reg=3).
-        // The decode + execute_decoded path must produce the same result as the legacy
-        // fused path for the same starting register state.
+    fn alu_split_matches_golden_across_ops() {
+        // The whole ALU block (ADD/OR/ADC/SBB/AND/SUB/XOR/CMP) is converted to the decode/execute
+        // split, so it can no longer be diffed against a fused executor (that path was deleted to
+        // keep a single ALU implementation). Instead, run each op/form through cycle() and assert
+        // the architectural end-state against goldens captured from the pre-split fused path
+        // (commit 332be72). This exercises decode's ModRM/immediate parsing, the executor's operand
+        // wiring + write-back gating, the EA recompute, and the once-only instruction-fetch charge.
+        //
+        // Golden fields per case: opcode bytes, end gpr (AX,CX,DX,BX,SP,BP,SI,DI), end eflags, end
+        // eip, the list of (offset, value) memory writes, and the InstructionPrefetch fetch count.
+        struct Golden {
+            name: &'static str,
+            code: &'static [u8],
+            gpr: [u32; 8],
+            eflags: u32,
+            eip: u32,
+            deltas: &'static [(usize, u8)],
+            fetch: usize,
+        }
+        let cases: &[Golden] = &[
+            // Forms 0-3 (r/m,reg and reg,r/m, byte and word), several addressing modes.
+            Golden {
+                name: "add ax,bx",
+                code: &[0x01, 0xd8],
+                gpr: [274, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x06,
+                eip: 0x02,
+                deltas: &[],
+                fetch: 3,
+            },
+            Golden {
+                name: "add [bx+si],ax",
+                code: &[0x01, 0x00],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x02,
+                eip: 0x02,
+                deltas: &[(24, 2), (25, 1)],
+                fetch: 3,
+            },
+            Golden {
+                name: "add [bp+di+4],cx",
+                code: &[0x01, 0x4b, 0x04],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x02,
+                eip: 0x03,
+                deltas: &[(44, 4), (45, 3)],
+                fetch: 4,
+            },
+            Golden {
+                name: "add [0x20],dx",
+                code: &[0x01, 0x16, 0x20, 0x00],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x06,
+                eip: 0x04,
+                deltas: &[(32, 23), (33, 22)],
+                fetch: 5,
+            },
+            Golden {
+                name: "add [si],al(byte)",
+                code: &[0x00, 0x04],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x02,
+                eip: 0x02,
+                deltas: &[(8, 2)],
+                fetch: 3,
+            },
+            // Every ALU op through word r/m,reg (form 1) with a memory operand: op-by-op coverage.
+            Golden {
+                name: "add [bx],ax(form1)",
+                code: &[0x01, 0x07],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x02,
+                eip: 0x02,
+                deltas: &[(16, 2), (17, 1)],
+                fetch: 3,
+            },
+            Golden {
+                name: "or [bx],ax(form1)",
+                code: &[0x09, 0x07],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x02,
+                eip: 0x02,
+                deltas: &[(16, 2), (17, 1)],
+                fetch: 3,
+            },
+            Golden {
+                name: "adc [bx],ax(form1)",
+                code: &[0x11, 0x07],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x02,
+                eip: 0x02,
+                deltas: &[(16, 2), (17, 1)],
+                fetch: 3,
+            },
+            Golden {
+                name: "sbb [bx],ax(form1)",
+                code: &[0x19, 0x07],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x93,
+                eip: 0x02,
+                deltas: &[(16, 254), (17, 254)],
+                fetch: 3,
+            },
+            Golden {
+                name: "and [bx],ax(form1)",
+                code: &[0x21, 0x07],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x46,
+                eip: 0x02,
+                deltas: &[],
+                fetch: 3,
+            },
+            Golden {
+                name: "sub [bx],ax(form1)",
+                code: &[0x29, 0x07],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x93,
+                eip: 0x02,
+                deltas: &[(16, 254), (17, 254)],
+                fetch: 3,
+            },
+            Golden {
+                name: "xor [bx],ax(form1)",
+                code: &[0x31, 0x07],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x02,
+                eip: 0x02,
+                deltas: &[(16, 2), (17, 1)],
+                fetch: 3,
+            },
+            Golden {
+                name: "cmp [bx],ax(form1)",
+                code: &[0x39, 0x07],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x93,
+                eip: 0x02,
+                deltas: &[],
+                fetch: 3,
+            },
+            // reg,r/m direction (form 3, word; writes a register) and byte directions (forms 0/2).
+            Golden {
+                name: "or cx,[bx+si]",
+                code: &[0x0b, 0x08],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x02,
+                eip: 0x02,
+                deltas: &[],
+                fetch: 3,
+            },
+            Golden {
+                name: "and dx,[di]",
+                code: &[0x23, 0x15],
+                gpr: [258, 772, 0, 16, 0, 16, 8, 24],
+                eflags: 0x46,
+                eip: 0x02,
+                deltas: &[],
+                fetch: 3,
+            },
+            Golden {
+                name: "adc al,[bx](byte form2)",
+                code: &[0x12, 0x07],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x02,
+                eip: 0x02,
+                deltas: &[],
+                fetch: 3,
+            },
+            Golden {
+                name: "xor [si],bl(byte form0)",
+                code: &[0x30, 0x1c],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x02,
+                eip: 0x02,
+                deltas: &[(8, 16)],
+                fetch: 3,
+            },
+            // Immediate accumulator forms: byte AL,imm8 (form 4) and word AX,imm16 (form 5).
+            Golden {
+                name: "add al,imm8(form4)",
+                code: &[0x04, 0x7f],
+                gpr: [385, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x896,
+                eip: 0x02,
+                deltas: &[],
+                fetch: 3,
+            },
+            Golden {
+                name: "or al,imm8(form4)",
+                code: &[0x0c, 0xaa],
+                gpr: [426, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x86,
+                eip: 0x02,
+                deltas: &[],
+                fetch: 3,
+            },
+            Golden {
+                name: "cmp al,imm8(form4)",
+                code: &[0x3c, 0x05],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x93,
+                eip: 0x02,
+                deltas: &[],
+                fetch: 3,
+            },
+            Golden {
+                name: "add ax,imm16(form5)",
+                code: &[0x05, 0x34, 0x12],
+                gpr: [4918, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x06,
+                eip: 0x03,
+                deltas: &[],
+                fetch: 4,
+            },
+            Golden {
+                name: "sub ax,imm16(form5)",
+                code: &[0x2d, 0x34, 0x12],
+                gpr: [61134, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x93,
+                eip: 0x03,
+                deltas: &[],
+                fetch: 4,
+            },
+            Golden {
+                name: "cmp ax,imm16(form5)",
+                code: &[0x3d, 0x02, 0x01],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x46,
+                eip: 0x03,
+                deltas: &[],
+                fetch: 4,
+            },
+            // Remaining addressing forms carried over from the original battery.
+            Golden {
+                name: "sub [bp+2],ax",
+                code: &[0x29, 0x46, 0x02],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x93,
+                eip: 0x03,
+                deltas: &[(18, 254), (19, 254)],
+                fetch: 4,
+            },
+            Golden {
+                name: "xor [di],bx",
+                code: &[0x31, 0x1d],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x02,
+                eip: 0x02,
+                deltas: &[(24, 16)],
+                fetch: 3,
+            },
+            Golden {
+                name: "cmp [bx+4],dx",
+                code: &[0x39, 0x57, 0x04],
+                gpr: [258, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x97,
+                eip: 0x03,
+                deltas: &[],
+                fetch: 4,
+            },
+        ];
+        for g in cases {
+            let mut mem = vec![0u8; 0x200];
+            mem[..g.code.len()].copy_from_slice(g.code);
+            mem[0x20..0x22].copy_from_slice(&0x1111u16.to_le_bytes());
+            let initial = mem.clone();
+
+            let mut split = Cpu386::default();
+            seam_seed(&mut split);
+            let mut sbus = TestBus::with_memory(mem);
+            let _ = split.cycle(&mut sbus);
+
+            assert_eq!(split.registers.gpr, g.gpr, "gpr mismatch for {}", g.name);
+            assert_eq!(
+                split.registers.eflags, g.eflags,
+                "eflags mismatch for {}",
+                g.name
+            );
+            assert_eq!(split.registers.eip, g.eip, "eip mismatch for {}", g.name);
+            let deltas: Vec<(usize, u8)> = sbus
+                .memory
+                .iter()
+                .enumerate()
+                .filter(|(i, b)| **b != initial[*i])
+                .map(|(i, b)| (i, *b))
+                .collect();
+            assert_eq!(deltas, g.deltas, "memory-write mismatch for {}", g.name);
+            assert_eq!(
+                seam_fetch_count(&sbus),
+                g.fetch,
+                "instruction-fetch cycle count mismatch for {} (seam must charge fetches once)",
+                g.name
+            );
+        }
+    }
+
+    #[test]
+    fn decode_then_execute_matches_golden_for_add_rm_reg() {
+        // 01 D8 = ADD AX, BX (ALU form 1, op=0, modrm mode=3 rm=0 reg=3). The decode +
+        // execute_decoded path must produce the architectural ADD result. (Once the ALU block was
+        // fully converted to the split, the former fused executor was deleted, so this asserts the
+        // known-correct end-state directly rather than diffing against a removed reference path.)
         let code = [0x01, 0xd8];
 
-        // Reference: the fused/legacy path.
-        let (mut fused, mem) = real_mode_cpu(&code, 0x10);
-        fused.write_reg16(Reg16::Ax, 0x1234);
-        fused.write_reg16(Reg16::Bx, 0x1111);
-        let mut fused_bus = TestBus::with_memory(mem.clone());
-        fused.begin_instruction();
-        let fused_outcome = fused.execute_instruction_legacy(&mut fused_bus).unwrap();
-
-        // Under test: the decode/execute split.
-        let (mut split, _mem) = real_mode_cpu(&code, 0x10);
+        let (mut split, mem) = real_mode_cpu(&code, 0x10);
         split.write_reg16(Reg16::Ax, 0x1234);
         split.write_reg16(Reg16::Bx, 0x1111);
         let mut split_bus = TestBus::with_memory(mem);
@@ -13331,11 +13618,13 @@ mod tests {
         assert_eq!(insn.operand, Some(DecodedOperand::Reg(0))); // r/m = AX
         let split_outcome = split.execute_decoded(&insn, &mut split_bus).unwrap();
 
+        // 0x1234 + 0x1111 = 0x2345: no carry/zero/sign/overflow/aux, low byte 0x45 has odd parity
+        // (PF clear), so only the always-set reserved bit 1 remains.
         assert_eq!(split.read_reg16(Reg16::Ax), 0x2345);
-        assert_eq!(split.read_reg16(Reg16::Ax), fused.read_reg16(Reg16::Ax));
-        assert_eq!(split.registers.eflags, fused.registers.eflags);
-        assert_eq!(split.registers.eip, fused.registers.eip);
-        assert_eq!(split_outcome.core_clocks, fused_outcome.core_clocks);
+        assert_eq!(split.read_reg16(Reg16::Bx), 0x1111); // source untouched
+        assert_eq!(split.registers.eflags, 0x02);
+        assert_eq!(split.registers.eip, 0x02);
+        assert_eq!(split_outcome.core_clocks, 2);
     }
 
     #[test]
@@ -13370,6 +13659,34 @@ mod tests {
 
         assert_eq!(bus.memory[0x20], 0x01, "old target must be untouched");
         assert_eq!(bus.memory[0x30], 0x11, "new target (BX=0x30) gets AX added");
+    }
+
+    #[test]
+    fn alu_split_recomputes_effective_address() {
+        // 00 07 = ADD [BX], AL (ALU form 0, op=0). Decode once, then execute against two different
+        // BX values: each execution must resolve [BX] against the *current* BX and update the byte
+        // there, proving the generalized ALU split recomputes the effective address every run.
+        let code = [0x00, 0x07];
+        let (mut cpu, mut mem) = real_mode_cpu(&code, 0x60);
+        mem[0x40] = 0x01;
+        mem[0x50] = 0x02;
+        let mut bus = TestBus::with_memory(mem);
+        cpu.write_reg16(Reg16::Ax, 0x0010); // AL = 0x10, AH = 0
+
+        cpu.begin_instruction();
+        let insn = cpu.decode(&mut bus).unwrap();
+
+        // First run with BX = 0x40: the byte at [0x40] gains AL.
+        cpu.write_reg16(Reg16::Bx, 0x0040);
+        cpu.execute_decoded(&insn, &mut bus).unwrap();
+        assert_eq!(bus.memory[0x40], 0x11, "[BX=0x40] must get AL added");
+        assert_eq!(bus.memory[0x50], 0x02, "[0x50] untouched on the first run");
+
+        // Re-execute the SAME decoded instruction with BX = 0x50: the EA must follow BX.
+        cpu.write_reg16(Reg16::Bx, 0x0050);
+        cpu.execute_decoded(&insn, &mut bus).unwrap();
+        assert_eq!(bus.memory[0x40], 0x11, "[0x40] untouched on the second run");
+        assert_eq!(bus.memory[0x50], 0x12, "[BX=0x50] must get AL added");
     }
 
     #[test]
