@@ -730,3 +730,50 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod sp1_smoke {
+    use super::*;
+    use izarravm_machine::StopReason;
+
+    /// The prebuilt FreeDOS floppy produced by scripts/fetch-freedos-spike.ps1.
+    fn spike_image() -> Vec<u8> {
+        let path = std::env::var("IZARRAVM_FREEDOS_SPIKE_IMG")
+            .expect("set IZARRAVM_FREEDOS_SPIKE_IMG (run scripts/fetch-freedos-spike.ps1)");
+        std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"))
+    }
+
+    fn boot(image: Vec<u8>, cycles: u64) -> (Machine, StopReason) {
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .expect("build machine");
+        machine
+            .mount_floppy(image)
+            .expect("mount 1.44MB floppy");
+        let stop = machine
+            .run_until_halt_or_cycles(cycles)
+            .expect("run machine");
+        (machine, stop)
+    }
+
+    #[test]
+    #[ignore = "needs IZARRAVM_FREEDOS_SPIKE_IMG (run scripts/fetch-freedos-spike.ps1)"]
+    fn sp1_freedos_boots_to_prompt() {
+        let (machine, stop) = boot(spike_image(), 500_000_000);
+
+        // A clean boot never CpuErrors. If it does, the message carries the
+        // opcode + CS:EIP — that is the first fault to fix.
+        if let StopReason::CpuError(msg) = &stop {
+            panic!("CPU fault during FreeDOS boot: {msg}");
+        }
+
+        // Primary success criterion: an interactive DOS prompt is on screen.
+        let text = machine.screen_text().as_text();
+        assert!(
+            text.contains(":\\>"),
+            "no DOS prompt on screen (stop={stop:?}).\n--- screen ---\n{text}\n--- end screen ---"
+        );
+    }
+}
