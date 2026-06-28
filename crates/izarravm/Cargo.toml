@@ -30,3 +30,12 @@ izarravm-video = { path = "../izarravm-video" }
 serde.workspace = true
 time = { version = "0.3.45", default-features = false, features = ["std", "local-offset"] }
 toml.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# Raw Input FFI for the WM_INPUT mouse hook that keeps a high-polling-rate mouse
+# from flooding winit's event pump. Matches the version winit already pulls in.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_Input",
+    "Win32_UI_WindowsAndMessaging",
+] }

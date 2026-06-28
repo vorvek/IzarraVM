@@ -5,8 +5,10 @@ use izarravm_dos::HostDrive;
 use izarravm_input::HostKeyboard;
 use izarravm_machine::{ActiveDisplay, Machine, MachineProfile, StopReason};
 use izarravm_video::{DISTIRA_RENDER_THREAD_CHOICES, normalize_distira_render_threads};
+use std::cell::Cell;
 use std::error::Error;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -883,14 +885,10 @@ pub struct GuiApp {
     // Guest frame counter of the texture currently uploaded, so we rebuild it
     // only when a new frame is presented rather than on every update().
     frame_seq: u64,
-    // Host-loop diagnostics, recomputed once a second: update() calls per second
-    // and egui input events per second. Surfaced in the panel to tell a vsync-
-    // capped loop from an unbounded spin under an input flood.
+    // Host render rate, recomputed once a second and surfaced in the panel.
     metrics_mark: Option<Instant>,
     frames_since: u32,
-    events_since: u32,
     host_fps: f64,
-    input_rate: f64,
     // What is mounted in drive A:, for the label. None shows "(empty)". The
     // emulation thread owns the actual mount; this string mirrors it for display.
     floppy_label: Option<String>,
@@ -1019,9 +1017,7 @@ impl GuiApp {
             frame_seq: u64::MAX,
             metrics_mark: None,
             frames_since: 0,
-            events_since: 0,
             host_fps: 0.0,
-            input_rate: 0.0,
             floppy_label: None,
             floppy_source,
             floppy_access_seen: 0,
@@ -1510,13 +1506,7 @@ impl GuiApp {
                         self.profile.memory_mib
                     ),
                 );
-                line(
-                    ui,
-                    format!(
-                        "Host {:.0} fps - {:.0} input/s",
-                        self.host_fps, self.input_rate
-                    ),
-                );
+                line(ui, format!("Host {:.0} fps", self.host_fps));
 
                 ui.add_space(6.0);
                 // Volume row: the classic ascending-bars icon and a slider that
@@ -2068,18 +2058,14 @@ impl GuiApp {
     fn ui(&mut self, ctx: &egui::Context) {
         // The window title (capture-lock hint) is set directly on the winit window
         // from the event loop now; viewport commands are not applied without eframe.
-        // Host-loop diagnostics: count this frame and the input events egui saw,
-        // rolling the rates up once a second.
+        // Host render rate: count this frame, roll the rate up once a second.
         let now = Instant::now();
         self.frames_since += 1;
-        self.events_since += ctx.input(|i| i.events.len()) as u32;
         let mark = *self.metrics_mark.get_or_insert(now);
         let window = now.duration_since(mark).as_secs_f64();
         if window >= 1.0 {
             self.host_fps = self.frames_since as f64 / window;
-            self.input_rate = self.events_since as f64 / window;
             self.frames_since = 0;
-            self.events_since = 0;
             self.metrics_mark = Some(now);
         }
         // Mirror the host lock keys onto the guest each frame.
@@ -2246,9 +2232,88 @@ struct WinitApp {
     // When the next frame is due. about_to_wait paces redraws to the guest
     // refresh rate with ControlFlow::WaitUntil rather than spinning at host vsync.
     next_frame: Instant,
+    // Raw mouse motion the Windows WM_INPUT hook accumulates between frames; drained
+    // each frame in about_to_wait. Always zero on platforms without the hook.
+    raw_mouse: RawMouseAccum,
 }
 
 impl WinitApp {
+    /// Draw one frame: run the egui pass and present it. Called every frame from
+    /// about_to_wait, and on demand for OS-driven repaints (resize). Driving the
+    /// steady-state redraw from about_to_wait rather than request_redraw matters
+    /// on Windows: request_redraw posts WM_PAINT, the lowest-priority message,
+    /// which a high-polling-rate mouse (8000 Hz of WM_INPUT) starves out, dropping
+    /// the host frame rate. winit dispatches about_to_wait from its own loop
+    /// bookkeeping, so it survives the flood.
+    fn render(&mut self, event_loop: &ActiveEventLoop) {
+        let (Some(window), Some(egui_winit), Some(wgpu), Some(renderer)) = (
+            self.window.as_ref(),
+            self.egui_winit.as_mut(),
+            self.wgpu.as_mut(),
+            self.egui_renderer.as_mut(),
+        ) else {
+            return;
+        };
+        // Clone the Context (Arc-backed, cheap) so the run() closure only
+        // borrows self.gui, not self.egui_ctx as well.
+        let egui_ctx = self.egui_ctx.clone();
+        let raw_input = egui_winit.take_egui_input(window);
+        let full = egui_ctx.run(raw_input, |ctx| self.gui.ui(ctx));
+        egui_winit.handle_platform_output(window, full.platform_output);
+        let tris = egui_ctx.tessellate(full.shapes, full.pixels_per_point);
+        let desc = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [wgpu.config.width, wgpu.config.height],
+            pixels_per_point: full.pixels_per_point,
+        };
+        let mut encoder = wgpu.device.create_command_encoder(&Default::default());
+        for (id, delta) in &full.textures_delta.set {
+            renderer.update_texture(&wgpu.device, &wgpu.queue, *id, delta);
+        }
+        renderer.update_buffers(&wgpu.device, &wgpu.queue, &mut encoder, &tris, &desc);
+        let frame = match wgpu.surface.get_current_texture() {
+            Ok(f) => f,
+            // The surface changed or was lost: rebuild it and skip this
+            // frame; the next redraw draws to the fresh surface.
+            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
+                wgpu.surface.configure(&wgpu.device, &wgpu.config);
+                return;
+            }
+            // A transient timeout: just skip the frame, no reconfigure.
+            Err(wgpu::SurfaceError::Timeout) => return,
+            // Fatal: log and exit rather than spin on a dead surface.
+            Err(err @ (wgpu::SurfaceError::OutOfMemory | wgpu::SurfaceError::Other)) => {
+                error!(?err, "fatal surface error; exiting");
+                event_loop.exit();
+                return;
+            }
+        };
+        let view = frame.texture.create_view(&Default::default());
+        {
+            let mut pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("egui"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                })
+                .forget_lifetime();
+            renderer.render(&mut pass, &tris, &desc);
+        }
+        for id in &full.textures_delta.free {
+            renderer.free_texture(id);
+        }
+        wgpu.queue.submit(Some(encoder.finish()));
+        frame.present();
+    }
+
     /// Translate one physical key transition to the guest. The configurable input
     /// release and fullscreen hotkeys are intercepted (and withheld from the
     /// guest); a pending rebind capture swallows the next key; everything else
@@ -2428,87 +2493,25 @@ impl ApplicationHandler for WinitApp {
             }
         }
 
-        let (Some(window), Some(egui_winit), Some(wgpu), Some(renderer)) = (
-            self.window.as_ref(),
-            self.egui_winit.as_mut(),
-            self.wgpu.as_mut(),
-            self.egui_renderer.as_mut(),
-        ) else {
-            return;
-        };
-
-        let _ = egui_winit.on_window_event(window, &event);
+        // Let egui observe the event for its own input handling. Scope the
+        // borrow so the match arms below can take &mut self to render.
+        if let (Some(window), Some(egui_winit)) = (self.window.as_ref(), self.egui_winit.as_mut()) {
+            let _ = egui_winit.on_window_event(window, &event);
+        }
         match event {
             WindowEvent::CloseRequested => {
                 self.gui.shutdown_for_exit();
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
-                wgpu.config.width = size.width.max(1);
-                wgpu.config.height = size.height.max(1);
-                wgpu.surface.configure(&wgpu.device, &wgpu.config);
-                window.request_redraw();
+                if let Some(wgpu) = self.wgpu.as_mut() {
+                    wgpu.config.width = size.width.max(1);
+                    wgpu.config.height = size.height.max(1);
+                    wgpu.surface.configure(&wgpu.device, &wgpu.config);
+                }
+                self.render(event_loop);
             }
-            WindowEvent::RedrawRequested => {
-                // Clone the Context (Arc-backed, cheap) so the run() closure only
-                // borrows self.gui, not self.egui_ctx as well.
-                let egui_ctx = self.egui_ctx.clone();
-                let raw_input = egui_winit.take_egui_input(window);
-                let full = egui_ctx.run(raw_input, |ctx| self.gui.ui(ctx));
-                egui_winit.handle_platform_output(window, full.platform_output);
-                let tris = egui_ctx.tessellate(full.shapes, full.pixels_per_point);
-                let desc = egui_wgpu::ScreenDescriptor {
-                    size_in_pixels: [wgpu.config.width, wgpu.config.height],
-                    pixels_per_point: full.pixels_per_point,
-                };
-                let mut encoder = wgpu.device.create_command_encoder(&Default::default());
-                for (id, delta) in &full.textures_delta.set {
-                    renderer.update_texture(&wgpu.device, &wgpu.queue, *id, delta);
-                }
-                renderer.update_buffers(&wgpu.device, &wgpu.queue, &mut encoder, &tris, &desc);
-                let frame = match wgpu.surface.get_current_texture() {
-                    Ok(f) => f,
-                    // The surface changed or was lost: rebuild it and skip this
-                    // frame; the next redraw draws to the fresh surface.
-                    Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
-                        wgpu.surface.configure(&wgpu.device, &wgpu.config);
-                        return;
-                    }
-                    // A transient timeout: just skip the frame, no reconfigure.
-                    Err(wgpu::SurfaceError::Timeout) => return,
-                    // Fatal: log and exit rather than spin on a dead surface.
-                    Err(err @ (wgpu::SurfaceError::OutOfMemory | wgpu::SurfaceError::Other)) => {
-                        error!(?err, "fatal surface error; exiting");
-                        event_loop.exit();
-                        return;
-                    }
-                };
-                let view = frame.texture.create_view(&Default::default());
-                {
-                    let mut pass = encoder
-                        .begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("egui"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: &view,
-                                resolve_target: None,
-                                ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                                    store: wgpu::StoreOp::Store,
-                                },
-                            })],
-                            depth_stencil_attachment: None,
-                            timestamp_writes: None,
-                            occlusion_query_set: None,
-                        })
-                        .forget_lifetime();
-                    renderer.render(&mut pass, &tris, &desc);
-                }
-                for id in &full.textures_delta.free {
-                    renderer.free_texture(id);
-                }
-                wgpu.queue.submit(Some(encoder.finish()));
-                frame.present();
-            }
+            WindowEvent::RedrawRequested => self.render(event_loop),
             _ => {}
         }
     }
@@ -2547,21 +2550,140 @@ impl ApplicationHandler for WinitApp {
                 self.gui.toggle_capture(window, &mut self.host_kbd);
             }
         }
-        // Pace redraws to the guest refresh rate. Only request a redraw once the
-        // deadline has elapsed; requesting unconditionally would defeat the
-        // WaitUntil below and spin the UI thread at host vsync.
+        // Pace rendering to the guest refresh rate. Render directly here once the
+        // deadline elapses rather than via request_redraw: winit dispatches
+        // about_to_wait from its own loop, so it keeps firing under a mouse-event
+        // flood that would starve the WM_PAINT request_redraw posts on Windows.
         let now = Instant::now();
         if now >= self.next_frame {
-            // Flush a frame's worth of coalesced mouse motion as one guest packet.
-            self.gui.flush_guest_motion();
-            if let Some(window) = &self.window {
-                window.request_redraw();
+            // Apply the raw mouse motion the Windows WM_INPUT hook accumulated since
+            // the last frame (zero elsewhere, where DeviceEvent::MouseMotion drives
+            // capture directly), then flush it as one coalesced guest packet.
+            let (rdx, rdy) = self.raw_mouse.take();
+            if self.gui.input_captured && (rdx != 0 || rdy != 0) {
+                let ppp = self
+                    .window
+                    .as_ref()
+                    .map_or(1.0, |w| w.scale_factor() as f32);
+                self.gui
+                    .accumulate_guest_motion(rdx as f32, rdy as f32, ppp);
             }
+            self.gui.flush_guest_motion();
+            self.render(event_loop);
             let hz = self.gui.guest_refresh_hz().max(1.0);
             self.next_frame = now + Duration::from_secs_f64(1.0 / hz);
         }
         event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(self.next_frame));
     }
+}
+
+/// Accumulated raw mouse motion (relative counts) shared between the Windows
+/// WM_INPUT message hook and the event loop. On other platforms nothing writes it
+/// and captured motion still comes from winit's DeviceEvent::MouseMotion.
+#[derive(Clone, Default)]
+struct RawMouseAccum(Rc<Cell<(i64, i64)>>);
+
+impl RawMouseAccum {
+    /// Take the accumulated delta and reset it to zero.
+    fn take(&self) -> (i64, i64) {
+        self.0.replace((0, 0))
+    }
+}
+
+/// Read the relative motion out of a WM_INPUT mouse packet. Returns None for
+/// keyboard packets (so the caller lets winit handle them and the raw keyboard
+/// path is preserved) and for absolute-pointer packets (tablets).
+#[cfg(windows)]
+fn read_raw_mouse_delta(
+    msg: &windows_sys::Win32::UI::WindowsAndMessaging::MSG,
+) -> Option<(i32, i32)> {
+    use std::mem::{size_of, zeroed};
+    use windows_sys::Win32::UI::Input::{
+        GetRawInputData, HRAWINPUT, RAWINPUT, RAWINPUTHEADER, RID_INPUT, RIM_TYPEMOUSE,
+    };
+    unsafe {
+        let mut data: RAWINPUT = zeroed();
+        let mut size = size_of::<RAWINPUT>() as u32;
+        let header = size_of::<RAWINPUTHEADER>() as u32;
+        let read = GetRawInputData(
+            msg.lParam as HRAWINPUT,
+            RID_INPUT,
+            &mut data as *mut _ as *mut _,
+            &mut size,
+            header,
+        );
+        if read == u32::MAX || data.header.dwType != RIM_TYPEMOUSE {
+            return None;
+        }
+        let mouse = data.data.mouse;
+        // Bit 0 of usFlags is MOUSE_MOVE_ABSOLUTE; clear means relative motion.
+        if mouse.usFlags & 1 != 0 {
+            return None;
+        }
+        Some((mouse.lLastX, mouse.lLastY))
+    }
+}
+
+/// Build the event loop. On Windows it installs a WM_INPUT hook that drains mouse
+/// raw input into `raw_mouse` and swallows those messages, so an 8000 Hz mouse
+/// never reaches winit's per-report handler (three DeviceEvents each, which
+/// starves the loop). Keyboard raw input falls through to winit unchanged.
+#[cfg(windows)]
+fn build_event_loop(
+    raw_mouse: RawMouseAccum,
+) -> Result<EventLoop<()>, winit::error::EventLoopError> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        DefWindowProcW, MSG, WM_INPUT, WM_MOUSEMOVE,
+    };
+    use winit::platform::windows::EventLoopBuilderExtWindows;
+    let mut builder = EventLoop::builder();
+    // Last legacy mouse-move we let through, to throttle the flood below.
+    let last_move = Cell::new(None::<Instant>);
+    builder.with_msg_hook(move |ptr| {
+        let msg = unsafe { &*(ptr as *const MSG) };
+        match msg.message {
+            WM_INPUT => match read_raw_mouse_delta(msg) {
+                Some((dx, dy)) => {
+                    let (ax, ay) = raw_mouse.0.get();
+                    raw_mouse.0.set((ax + dx as i64, ay + dy as i64));
+                    // Clean up the raw input the way the default handler would have.
+                    unsafe { DefWindowProcW(msg.hwnd, msg.message, msg.wParam, msg.lParam) };
+                    true
+                }
+                None => false,
+            },
+            // Legacy WM_MOUSEMOVE still arrives (RIDEV_NOLEGACY would break window
+            // dragging and resizing). Each one DefWindowProc'd synchronously
+            // re-enters the window proc for WM_NCHITTEST + WM_SETCURSOR, and an
+            // 8000 Hz mouse makes ~1000 of those a second, which halves the frame
+            // rate while the cursor is visible. egui only needs the latest cursor
+            // position per frame, so let one through every 8 ms (for hover and
+            // clicks) and drop the rest WITHOUT DefWindowProc, so the hit-test and
+            // set-cursor chain never fires for them. The OS still moves the visible
+            // cursor sprite regardless; these messages are only notifications.
+            WM_MOUSEMOVE => {
+                let now = Instant::now();
+                let recent = last_move
+                    .get()
+                    .is_some_and(|t| now.duration_since(t) < Duration::from_millis(8));
+                if recent {
+                    true
+                } else {
+                    last_move.set(Some(now));
+                    false
+                }
+            }
+            _ => false,
+        }
+    });
+    builder.build()
+}
+
+#[cfg(not(windows))]
+fn build_event_loop(
+    _raw_mouse: RawMouseAccum,
+) -> Result<EventLoop<()>, winit::error::EventLoopError> {
+    EventLoop::builder().build()
 }
 
 /// Open the window and run the emulator. Returns when the user closes it.
@@ -2574,7 +2696,8 @@ pub fn run(
     test_pattern: bool,
     rtc_setup: crate::cmos::RtcSetup,
 ) -> Result<(), Box<dyn Error>> {
-    let event_loop = EventLoop::new()?;
+    let raw_mouse = RawMouseAccum::default();
+    let event_loop = build_event_loop(raw_mouse.clone())?;
     let gui = GuiApp::new(
         profile,
         rom,
@@ -2602,6 +2725,7 @@ pub fn run(
         egui_winit: None,
         egui_renderer: None,
         next_frame: Instant::now(),
+        raw_mouse,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
