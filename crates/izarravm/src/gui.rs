@@ -309,6 +309,33 @@ fn beige_group<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R 
     res.inner
 }
 
+/// The shared beige look for IzarraVM's floating windows (COM1, About,
+/// License): PANEL_FACE fill, 12px inner padding, beige widget visuals,
+/// draggable + closable. The caller supplies the title, the open flag (the
+/// window's own close control flips it), a default size, and the body.
+fn beige_window(
+    ctx: &egui::Context,
+    title: &str,
+    open: &mut bool,
+    default_size: [f32; 2],
+    add: impl FnOnce(&mut egui::Ui),
+) {
+    egui::Window::new(title)
+        .open(open)
+        .resizable(true)
+        .default_size(default_size)
+        .frame(
+            egui::Frame::new()
+                .fill(PANEL_FACE)
+                .inner_margin(egui::Margin::same(12))
+                .corner_radius(4.0),
+        )
+        .show(ctx, |ui| {
+            beige_visuals(ui);
+            add(ui);
+        });
+}
+
 /// A small square drive-activity LED.
 fn activity_led(ui: &mut egui::Ui, lit: bool) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
@@ -1580,7 +1607,7 @@ impl GuiApp {
         let modal = egui::Modal::new(egui::Id::new("config-modal")).show(ctx, |ui| {
             egui::Frame::new()
                 .fill(PANEL_FACE)
-                .inner_margin(egui::Margin::same(18))
+                .inner_margin(egui::Margin::same(12))
                 .corner_radius(4.0)
                 .show(ui, |ui| {
                     beige_visuals(ui);
@@ -1699,28 +1726,24 @@ impl GuiApp {
             None => String::new(),
         };
         let mut open = self.show_com1;
-        egui::Window::new("COM1")
-            .open(&mut open)
-            .resizable(true)
-            .default_size([480.0, 320.0])
-            .show(ctx, |ui| {
-                egui::Frame::new()
-                    .fill(egui::Color32::WHITE)
-                    .inner_margin(egui::Margin::same(4))
-                    .show(ui, |ui| {
-                        ui.style_mut().spacing.scroll.bar_width = 6.0;
-                        egui::ScrollArea::vertical()
-                            .stick_to_bottom(true)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                ui.add(egui::Label::new(
-                                    egui::RichText::new(serial)
-                                        .monospace()
-                                        .color(egui::Color32::BLACK),
-                                ));
-                            });
-                    });
-            });
+        beige_window(ctx, "COM1", &mut open, [480.0, 320.0], |ui| {
+            egui::Frame::new()
+                .fill(egui::Color32::WHITE)
+                .inner_margin(egui::Margin::same(4))
+                .show(ui, |ui| {
+                    ui.style_mut().spacing.scroll.bar_width = 6.0;
+                    egui::ScrollArea::vertical()
+                        .stick_to_bottom(true)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.add(egui::Label::new(
+                                egui::RichText::new(serial)
+                                    .monospace()
+                                    .color(egui::Color32::BLACK),
+                            ));
+                        });
+                });
+        });
         self.show_com1 = open;
     }
 
