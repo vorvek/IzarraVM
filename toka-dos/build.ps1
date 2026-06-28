@@ -14,7 +14,7 @@ $env:INCLUDE = "$env:WATCOM\h"
 $build = Join-Path $root 'build'
 # Wipe the build dir first so a renamed or removed tool cannot linger in it and
 # get packed into the ROM (a stale build/emm386.com would otherwise ship next to
-# the renamed iemm.com, breaking reproducibility from a clean checkout).
+# the renamed izemm.com, breaking reproducibility from a clean checkout).
 if (Test-Path $build) { Remove-Item -Recurse -Force $build }
 New-Item -ItemType Directory -Force $build | Out-Null
 
@@ -42,8 +42,8 @@ function LinkCom($name, $objNames) {
 Compile "$root\runtime\toka.c" 'toka.obj'
 
 # The shell.
-Compile "$root\icommand\icommand.c" 'icommand.obj'
-LinkCom 'icommand' @('icommand.obj', 'toka.obj')
+Compile "$root\izcmd\izcmd.c" 'izcmd.obj'
+LinkCom 'izcmd' @('izcmd.obj', 'toka.obj')
 
 # External tools: one .c per tool under tools/, each linked with the runtime.
 Get-ChildItem "$root\tools\*.c" -ErrorAction SilentlyContinue | ForEach-Object {
@@ -54,8 +54,8 @@ Get-ChildItem "$root\tools\*.c" -ErrorAction SilentlyContinue | ForEach-Object {
 
 # The mouse driver is hand-written NASM, not a C tool, so build it explicitly into
 # $build where the packer collects it as a system .COM.
-& nasm -f bin "$root\tools\mouse.asm" -o "$build\MOUSE.COM"
-if ($LASTEXITCODE -ne 0) { throw "nasm failed on mouse" }
+& nasm -f bin "$root\tools\izmouse.asm" -o "$build\IZMOUSE.COM"
+if ($LASTEXITCODE -ne 0) { throw "nasm failed on izmouse" }
 
 # Dev tools: built with the same recipe but emitted to the C: drive fixture dir,
 # not packed into tokados.rom. TESTS.COM is a tracked debug tool, not a system

@@ -1,4 +1,4 @@
-/* ibasic.c - IBASIC: the Izarra BASIC interpreter (stub).
+/* izbasic.c - IZBASIC: the Izarra BASIC interpreter (stub).
  *
  * Toka-DOS tool. Built small model with Open Watcom and linked `system com`.
  * This release ships a placeholder: it prints a banner and exits. The actual

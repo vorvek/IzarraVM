@@ -1,12 +1,12 @@
-/* iemm.c - IEMM: the Izarra memory-manager status tool.
+/* izemm.c - IZEMM: the Izarra memory-manager status tool.
  *
  * Reports the real EMS / upper-memory state by probing INT 67h, the way a user
  * checks expanded memory at the prompt. Reflects the three EMM386 roles the
- * CONFIG.SYS DEVICE=IEMM.EXE line selects: RAM (a page frame plus backing
+ * CONFIG.SYS DEVICE=IZEMM.EXE line selects: RAM (a page frame plus backing
  * pages), NOEMS (a frameless manager; upper memory is active but there is no
  * frame), or no manager at all (unloaded; HIMEM only).
  *
- * Usage: IEMM
+ * Usage: IZEMM
  */
 #include <dos.h>
 #include "toka.h"
@@ -15,7 +15,7 @@ int main(void)
 {
     union REGS r;
 
-    t_putln("IEMM Expanded-Memory Manager");
+    t_putln("IZEMM Expanded-Memory Manager");
 
     /* AH=40h: get manager status. AH=0 means a manager is installed. With no
      * manager INT 67h is not hooked, so AH comes back unchanged (nonzero) and

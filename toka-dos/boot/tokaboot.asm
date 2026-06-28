@@ -26,13 +26,13 @@ start:
         int 0x10
 
         ; Print the startup line through the DOS console (AH=09h), so it lands on
-        ; the VGA text screen through the same path ICOMMAND's output uses.
+        ; the VGA text screen through the same path IZCMD's output uses.
         mov dx, msg
         mov ah, 0x09
         int 0x21
 
 .launch:
-        ; EXEC C:\DOS\ICOMMAND.COM. DS:DX -> program path, ES:BX -> parameter block.
+        ; EXEC C:\DOS\IZCMD.COM. DS:DX -> program path, ES:BX -> parameter block.
         ; The environment segment 0 in the block means inherit the shell
         ; environment the machine prepared.
         mov ax, 0x4B00
@@ -46,7 +46,7 @@ start:
         jmp .halt
 
 msg:    db "Starting Toka-DOS v3.0...", 13, 10, "$"
-path:   db "C:\DOS\ICOMMAND.COM", 0
+path:   db "C:\DOS\IZCMD.COM", 0
 
         align 2
 epb:

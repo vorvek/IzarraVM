@@ -1,7 +1,7 @@
 # Toka-DOS
 
 The Izarra 3000's bundled operating system, an MS-DOS 6.22 clone. This tree holds
-the source for the ICOMMAND shell, the boot record, the DOS tools, and the
+the source for the IZCMD shell, the boot record, the DOS tools, and the
 packer that bundles them into the motherboard ROM image.
 
 The product version shown on screen is "Toka-DOS v3.0". The DOS API version
@@ -12,7 +12,7 @@ DOS 6.22-compatible system.
 
 - `runtime/` shared C runtime (`toka.h`, `toka.c`): INT 21h and INT 10h wrappers,
   command-tail parsing, EXEC. Linked into every binary.
-- `icommand/` the command interpreter (ICOMMAND.COM). COMMAND.COM is a duplicate.
+- `izcmd/` the command interpreter (IZCMD.COM). COMMAND.COM is a duplicate.
 - `boot/` TOKABOOT, the 512-byte boot record (NASM).
 - `tools/` one C source per external tool (added per phase).
 - `pack/` the ROM packer (authoring-only Rust binary).

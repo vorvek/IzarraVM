@@ -3,7 +3,7 @@
  * Queries the running machine the way MS-DOS MEM.EXE does: it walks the real
  * MCB chain (from the List of Lists at INT 21h AH=52h, first MCB at [ES:BX-2]),
  * asks the XMS driver for free extended memory, and probes INT 67h for the
- * expanded-memory state IEMM.EXE provides. Modeled on iemm.c, which is already
+ * expanded-memory state IZEMM.EXE provides. Modeled on izemm.c, which is already
  * live.
  */
 #include <dos.h>
@@ -103,7 +103,7 @@ int main(void)
     }
     t_putln("");
 
-    /* Expanded / EMS via INT 67h, exactly as iemm.c. AH=40h status (AH=0 means a
+    /* Expanded / EMS via INT 67h, exactly as izemm.c. AH=40h status (AH=0 means a
      * manager is installed), AH=41h page frame (AH=0 RAM, else NOEMS/frameless),
      * AH=42h page counts (BX free, DX total), each page 16 KB. */
     r.x.ax = 0x4000;

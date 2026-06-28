@@ -1,4 +1,4 @@
-/* icdex.c - ICDEX: the Izarra CD-ROM extensions status tool.
+/* izcdex.c - IZCDEX: the Izarra CD-ROM extensions status tool.
  *
  * Reports the live CD-ROM redirector state the way a user checks MSCDEX at the
  * prompt. The redirector is resident in the HLE permanently, so this tool only
@@ -6,7 +6,7 @@
  * find the first drive number, AX=150Dh for the drive letter, AX=150Ch for the
  * version. With no extensions present it says so.
  *
- * Usage: ICDEX
+ * Usage: IZCDEX
  */
 #include <dos.h>
 #include "toka.h"
@@ -19,7 +19,7 @@ int main(void)
     unsigned drive;
     unsigned ndrives;
 
-    t_putln("ICDEX CD-ROM extensions status");
+    t_putln("IZCDEX CD-ROM extensions status");
 
     /* AX=1500h install check. BX = number of CD-ROM drives, CX = the first
      * drive number (0 = A:). BX = 0 means no extensions. */

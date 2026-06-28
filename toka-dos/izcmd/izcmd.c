@@ -1,4 +1,4 @@
-/* icommand.c - the Toka-DOS command interpreter (ICOMMAND.COM).
+/* izcmd.c - the Toka-DOS command interpreter (IZCMD.COM).
  *
  * Sets 80x25 text mode at boot (TOKABOOT already did, and we leave its startup
  * line on screen), then runs a prompt loop. Internal commands run in process;
@@ -244,14 +244,14 @@ static void put_dir_name(const char *name)
 }
 
 /* The master environment: a DOS-format block of KEY=VALUE strings, each NUL
- * terminated, ended by an empty string (a double NUL). ICOMMAND owns it and
+ * terminated, ended by an empty string (a double NUL). IZCMD owns it and
  * seeds it. PATH is deliberately absent at boot, the way real COMMAND.COM leaves
  * it: AUTOEXEC.BAT sets it (the default config carries PATH=C:\DOS), and until
  * then external commands resolve from the current directory. SET/PATH/PROMPT
  * edit this block and the prompt reads it. (Children still inherit the boot
  * environment, so a SET after boot is not yet propagated into a launched
  * program.) */
-static char master_env[2048] = "PROMPT=$p$g\0COMSPEC=C:\\DOS\\ICOMMAND.COM\0";
+static char master_env[2048] = "PROMPT=$p$g\0COMSPEC=C:\\DOS\\IZCMD.COM\0";
 
 static int key_matches(const char *entry, const char *name, int namelen)
 {

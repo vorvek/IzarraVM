@@ -1,4 +1,4 @@
-/* toka.h - shared runtime for Toka-DOS tools and the ICOMMAND shell.
+/* toka.h - shared runtime for Toka-DOS tools and the IZCMD shell.
  *
  * Every Toka-DOS binary is a tiny real-mode .COM built small model with Open
  * Watcom and linked `system com`. These helpers wrap the DOS and BIOS interrupt

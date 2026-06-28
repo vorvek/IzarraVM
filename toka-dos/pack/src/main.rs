@@ -35,10 +35,11 @@ const BOOT_RECORD: &str = "TOKABOOT.BIN";
 /// Duplicate-name aliases: (canonical, alias). Emitted only when the canonical
 /// file is present in the build.
 const ALIASES: &[(&str, &str)] = &[
-    ("ICOMMAND.COM", "COMMAND.COM"),
-    ("ICDEX.COM", "MSCDEX.COM"),
-    ("IBASIC.COM", "BASIC.COM"),
+    ("IZCMD.COM", "COMMAND.COM"),
+    ("IZCDEX.COM", "MSCDEX.COM"),
+    ("IZBASIC.COM", "BASIC.COM"),
     ("EDITOR.COM", "EDIT.COM"),
+    ("IZMOUSE.COM", "MOUSE.COM"),
 ];
 
 struct PackFile {
@@ -47,7 +48,7 @@ struct PackFile {
     data: Vec<u8>,
 }
 
-/// Encode "ICOMMAND.COM" into the 11-byte 8.3 field "ICOMMAND COM".
+/// Encode "IZCMD.COM" into the 11-byte 8.3 field "IZCMD   COM".
 fn pack_8_3(name: &str) -> [u8; 11] {
     let mut out = [b' '; 11];
     let (base, ext) = name.split_once('.').unwrap_or((name, ""));
