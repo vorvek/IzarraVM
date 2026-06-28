@@ -843,6 +843,14 @@ enum DecodeGroup {
     /// IRET, inc_dec, and push helpers verbatim, so the protected-mode descriptor loads, gates,
     /// faults, interrupt-shadow/IF semantics, and clocks are byte-identical to the fused path.
     ControlFlow,
+    /// The flags and miscellaneous register block (task A7): TEST r/m,reg (0x84/0x85), INC/DEC reg
+    /// (0x40-0x4f), CBW/CWDE (0x98), CWD/CDQ (0x99), SAHF (0x9e), LAHF (0x9f), and the single
+    /// flag-bit ops CMC/CLC/STC/CLI/STI/CLD/STD (0xf5/0xf8-0xfd). TEST (0x84/0x85) carries a
+    /// ModRM r/m form and is the only A7 opcode `decode` pre-parses; all other A7 opcodes carry no
+    /// encoded operand. The executor reuses `alu` (AND-for-flags, no write-back), `inc_dec`
+    /// (CF preserved), and the existing flag setters verbatim; STI's interrupt shadow is set in the
+    /// executor exactly as the fused handler did.
+    FlagsMisc,
     /// Not yet converted to the split: decode parses nothing extra and `execute_decoded` hands the
     /// opcode to the shared fused `dispatch_opcode`.
     Fallback,
@@ -1235,6 +1243,29 @@ impl Cpu386 {
         ) {
             return DecodeGroup::ControlFlow;
         }
+        // Flags + misc register block (task A7): TEST r/m,reg (0x84/0x85), INC/DEC reg (0x40-0x4f),
+        // CBW/CWDE (0x98), CWD/CDQ (0x99), SAHF/LAHF (0x9e/0x9f), and the single flag-bit ops
+        // CMC/CLC/STC/CLI/STI/CLD/STD (0xf5/0xf8-0xfd). None carry an immediate; only 0x84/0x85
+        // carry a ModRM (parsed in `decode`).
+        if matches!(
+            opcode,
+            0x40..=0x4f
+                | 0x84
+                | 0x85
+                | 0x98
+                | 0x99
+                | 0x9e
+                | 0x9f
+                | 0xf5
+                | 0xf8
+                | 0xf9
+                | 0xfa
+                | 0xfb
+                | 0xfc
+                | 0xfd
+        ) {
+            return DecodeGroup::FlagsMisc;
+        }
         DecodeGroup::Fallback
     }
 
@@ -1508,6 +1539,24 @@ impl Cpu386 {
                     _ => {}
                 }
             }
+            DecodeGroup::FlagsMisc => {
+                // Flags + misc register block. Only TEST r/m,reg (0x84/0x85) carries a ModRM; parse
+                // it + the addressing-mode descriptor here (instruction bytes only, stays cacheable).
+                // Every other A7 opcode carries no encoded operand after the opcode byte — the
+                // register/flag operands are implicit (reg field encoded in the opcode or implied).
+                match opcode {
+                    0x84 | 0x85 => {
+                        let modrm = self.fetch_modrm(bus)?;
+                        let operand =
+                            self.parse_addressing_mode(bus, prefixes, address_size, modrm)?;
+                        insn.modrm = Some(modrm);
+                        insn.operand = Some(operand);
+                    }
+                    // INC/DEC reg (0x40-0x4f), CBW/CWDE (0x98), CWD/CDQ (0x99), SAHF/LAHF
+                    // (0x9e/0x9f), CMC/CLC/STC/CLI/STI/CLD/STD (0xf5/0xf8-0xfd): no operand bytes.
+                    _ => {}
+                }
+            }
             // Both fallback groups pre-parse nothing in `decode` (the second 0F byte was already
             // folded into `insn.opcode` above): their executors re-read any ModRM/immediate from the
             // post-opcode eip in the shared fused dispatch.
@@ -1560,6 +1609,10 @@ impl Cpu386 {
             // 0xca/0xcd) or the pre-parsed ModRM/descriptor (for 0xff), and reusing the existing
             // far-call/far-jump/ret/retf/interrupt/IRET/inc_dec/push helpers verbatim.
             DecodeGroup::ControlFlow => self.execute_control_flow_decoded(insn, bus),
+            // The flags + misc register block (TEST r/m,reg, INC/DEC reg, CBW/CWD, SAHF/LAHF, and
+            // the single flag-bit ops) runs through its split executor, consuming the pre-parsed
+            // ModRM/operand for TEST and running the same flag/register logic as the fused path.
+            DecodeGroup::FlagsMisc => self.execute_flags_misc_decoded(insn, bus),
             DecodeGroup::TwoByteFallback => {
                 // Un-converted two-byte (0F) opcode. `decode` already read + charged the second
                 // byte and applied the ISA gate, folding it into `insn.opcode` as 0x0F00 | second.
@@ -2421,6 +2474,139 @@ impl Cpu386 {
         }
     }
 
+    /// The flags + misc register block (task A7) through the decode/execute split. Each arm mirrors
+    /// the former fused handler verbatim — same `alu` call for TEST (op=4, AND-for-flags, no
+    /// write-back), same `inc_dec` for INC/DEC reg (CF preserved), same sign-extend logic for
+    /// CBW/CWDE and CWD/CDQ, same flag-byte masking for SAHF/LAHF, same `set_flag` + `check_v86_iopl`
+    /// for the flag-bit ops, and same STI interrupt shadow — but consumes the ModRM/operand
+    /// `decode` pre-parsed for TEST (so the executor re-fetches nothing). The r/m operand for TEST
+    /// is resolved from the pre-decoded descriptor against the live registers each call.
+    fn execute_flags_misc_decoded<B: CpuBus>(
+        &mut self,
+        insn: &DecodedInsn,
+        bus: &mut B,
+    ) -> ExecResult<CycleOutcome> {
+        let operand_size = insn.operand_size;
+
+        match insn.opcode as u8 {
+            0x84 => {
+                // TEST r/m8, reg8. AND-for-flags only; no write-back (same as op=4, write_back=false).
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let value = self.read_operand_u8(bus, operand)?;
+                let reg = self.read_gpr8(modrm.reg);
+                self.alu(4, u32::from(value), u32::from(reg), BusWidth::Byte);
+                Ok(clocks(2))
+            }
+            0x85 => {
+                // TEST r/m16/32, reg16/32. AND-for-flags only; no write-back.
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let value = self.read_operand_sized(bus, operand, operand_size)?;
+                let reg = self.read_gpr_sized(modrm.reg, operand_size);
+                self.alu(4, value, reg, operand_size.bus_width());
+                Ok(clocks(2))
+            }
+            opcode @ 0x40..=0x4f => {
+                // INC (0x40-0x47) / DEC (0x48-0x4f) register. CF is preserved by `inc_dec`.
+                let index = opcode & 0x07;
+                let is_dec = opcode >= 0x48;
+                let value = self.read_gpr_sized(index, operand_size);
+                let result = self.inc_dec(value, is_dec, operand_size.bus_width());
+                self.write_gpr_sized(index, operand_size, result);
+                Ok(clocks(2))
+            }
+            0x98 => {
+                // CBW / CWDE: sign-extend the accumulator into the next width.
+                match operand_size {
+                    OperandSize::Word => {
+                        let ax = i16::from(self.read_gpr8(0) as i8) as u16;
+                        self.write_gpr16(0, ax);
+                    }
+                    OperandSize::Dword => {
+                        let eax = i32::from(self.read_gpr16(0) as i16) as u32;
+                        self.write_gpr32(0, eax);
+                    }
+                }
+                Ok(clocks(3))
+            }
+            0x99 => {
+                // CWD / CDQ: fill (E)DX with the sign of the accumulator.
+                match operand_size {
+                    OperandSize::Word => {
+                        let dx = if (self.read_gpr16(0) as i16) < 0 {
+                            0xffff
+                        } else {
+                            0
+                        };
+                        self.write_gpr16(2, dx);
+                    }
+                    OperandSize::Dword => {
+                        let edx = if (self.read_gpr32(0) as i32) < 0 {
+                            0xffff_ffff
+                        } else {
+                            0
+                        };
+                        self.write_gpr32(2, edx);
+                    }
+                }
+                Ok(clocks(2))
+            }
+            0x9e => {
+                // SAHF: load CF/PF/AF/ZF/SF from AH; OF and the reserved bits are untouched.
+                // The trailing | 0x02 keeps the always-one reserved bit set.
+                let ah = u32::from(self.read_gpr8(4));
+                self.registers.eflags = (self.registers.eflags & !0xd5) | (ah & 0xd5) | 0x02;
+                Ok(clocks(3))
+            }
+            0x9f => {
+                // LAHF: AH = low flag byte with bit1 forced 1, bits 3 and 5 forced 0.
+                let ah = ((self.registers.eflags as u8) & 0xd5) | 0x02;
+                self.write_gpr8(4, ah);
+                Ok(clocks(2))
+            }
+            0xf5 => {
+                // CMC: complement the carry flag.
+                self.set_flag(FLAG_CF, !self.flag(FLAG_CF));
+                Ok(clocks(2))
+            }
+            0xf8 => {
+                // CLC: clear the carry flag.
+                self.set_flag(FLAG_CF, false);
+                Ok(clocks(2))
+            }
+            0xf9 => {
+                // STC: set the carry flag.
+                self.set_flag(FLAG_CF, true);
+                Ok(clocks(2))
+            }
+            0xfa => {
+                // CLI. IOPL-sensitive: faults to the monitor in a V86 task below IOPL 3.
+                self.check_v86_iopl()?;
+                self.set_flag(FLAG_IF, false);
+                Ok(clocks(3))
+            }
+            0xfb => {
+                // STI sets IF and arms the one-instruction shadow so the instruction immediately
+                // after STI always executes before any interrupt is taken. The shadow is set here
+                // in the executor exactly as the fused handler did.
+                self.check_v86_iopl()?;
+                self.set_flag(FLAG_IF, true);
+                self.interrupt_shadow = true;
+                Ok(clocks(3))
+            }
+            0xfc => {
+                // CLD: clear the direction flag.
+                self.set_flag(FLAG_DF, false);
+                Ok(clocks(2))
+            }
+            0xfd => {
+                // STD: set the direction flag.
+                self.set_flag(FLAG_DF, true);
+                Ok(clocks(2))
+            }
+            opcode => unreachable!("flags-misc opcode {opcode:#x}"),
+        }
+    }
+
     /// The far/indirect/RET/INT control-flow block + 0xff group 5 through the decode/execute split.
     /// Each arm mirrors the former fused handler verbatim — same far-pointer reconstruction, same
     /// ret/retf and interrupt/IRET delivery, same FF sub-op dispatch off `modrm.reg`, same clocks —
@@ -2746,20 +2932,9 @@ impl Cpu386 {
             // 0x80/0x81/0x82/0x83 (group 1 ALU r/m,imm; 0x82 is the undocumented 0x80 alias) are
             // converted to the decode/execute split: `route_group` classifies them as
             // `DecodeGroup::Group` and `execute_group_decoded` runs them. Not handled here.
-            0x84 => {
-                let modrm = self.fetch_modrm(bus)?;
-                let value = self.read_rm_u8(bus, prefixes, address_size, modrm)?;
-                let reg = self.read_gpr8(modrm.reg);
-                self.alu(4, u32::from(value), u32::from(reg), BusWidth::Byte);
-                Ok(clocks(2))
-            }
-            0x85 => {
-                let modrm = self.fetch_modrm(bus)?;
-                let value = self.read_rm_sized(bus, prefixes, address_size, operand_size, modrm)?;
-                let reg = self.read_gpr_sized(modrm.reg, operand_size);
-                self.alu(4, value, reg, operand_size.bus_width());
-                Ok(clocks(2))
-            }
+            // 0x84/0x85 (TEST r/m,reg byte/word) are converted to the decode/execute split:
+            // `route_group` classifies them as `DecodeGroup::FlagsMisc` and
+            // `execute_flags_misc_decoded` runs them. Not handled here.
             // 0x86-0x8e (XCHG r/m,reg; MOV r/m<->reg/Sreg; LEA) are converted to the
             // decode/execute split: `route_group` classifies them as `DecodeGroup::DataMove` and
             // `execute_datamove_decoded` runs them. They must NOT be re-handled here (single path).
@@ -2806,58 +2981,11 @@ impl Cpu386 {
             }
             // 0x90 (NOP / XCHG AX,AX) and 0x91-0x97 (XCHG (E)AX, reg) are converted to the split
             // (`DecodeGroup::DataMove` -> `execute_datamove_decoded`); not handled here.
-            0x98 => {
-                // CBW / CWDE: sign-extend the accumulator into the next width.
-                match operand_size {
-                    OperandSize::Word => {
-                        let ax = i16::from(self.read_gpr8(0) as i8) as u16;
-                        self.write_gpr16(0, ax);
-                    }
-                    OperandSize::Dword => {
-                        let eax = i32::from(self.read_gpr16(0) as i16) as u32;
-                        self.write_gpr32(0, eax);
-                    }
-                }
-                Ok(clocks(3))
-            }
-            0x99 => {
-                // CWD / CDQ: fill (E)DX with the sign of the accumulator.
-                match operand_size {
-                    OperandSize::Word => {
-                        let dx = if (self.read_gpr16(0) as i16) < 0 {
-                            0xffff
-                        } else {
-                            0
-                        };
-                        self.write_gpr16(2, dx);
-                    }
-                    OperandSize::Dword => {
-                        let edx = if (self.read_gpr32(0) as i32) < 0 {
-                            0xffff_ffff
-                        } else {
-                            0
-                        };
-                        self.write_gpr32(2, edx);
-                    }
-                }
-                Ok(clocks(2))
-            }
+            // 0x98 (CBW/CWDE), 0x99 (CWD/CDQ), 0x9e (SAHF), 0x9f (LAHF) are converted to the
+            // decode/execute split: `route_group` classifies them as `DecodeGroup::FlagsMisc` and
+            // `execute_flags_misc_decoded` runs them. Not handled here.
             // 0x9c (PUSHF/PUSHFD) and 0x9d (POPF/POPFD) are converted to the decode/execute
             // split (`DecodeGroup::Stack` -> `execute_stack_decoded`); not handled here.
-            0x9e => {
-                // SAHF: load CF/PF/AF/ZF/SF from AH; OF and the reserved bits are untouched.
-                // The trailing | 0x02 keeps the always-one reserved bit set, matching
-                // set_flag and load_flags.
-                let ah = u32::from(self.read_gpr8(4));
-                self.registers.eflags = (self.registers.eflags & !0xd5) | (ah & 0xd5) | 0x02;
-                Ok(clocks(3))
-            }
-            0x9f => {
-                // LAHF: AH = low flag byte with bit1 forced 1, bits 3 and 5 forced 0.
-                let ah = ((self.registers.eflags as u8) & 0xd5) | 0x02;
-                self.write_gpr8(4, ah);
-                Ok(clocks(2))
-            }
             // 0xa0-0xa3 (MOV (E)AX<->moffs, byte and word) are converted to the split
             // (`DecodeGroup::DataMove` -> `execute_datamove_decoded`); not handled here.
             0xa4 => {
@@ -3053,42 +3181,9 @@ impl Cpu386 {
             // decode/execute split: `route_group` classifies them as `DecodeGroup::Group` and
             // `execute_group_decoded` runs them (the conditional TEST immediate is parsed in
             // `decode`). Not handled here.
-            0xf5 => {
-                // CMC: complement the carry flag.
-                self.set_flag(FLAG_CF, !self.flag(FLAG_CF));
-                Ok(clocks(2))
-            }
-            0xf8 => {
-                self.set_flag(FLAG_CF, false);
-                Ok(clocks(2))
-            }
-            0xf9 => {
-                // STC: set the carry flag.
-                self.set_flag(FLAG_CF, true);
-                Ok(clocks(2))
-            }
-            0xfa => {
-                // CLI. IOPL-sensitive: faults to the monitor in a V86 task below IOPL 3.
-                self.check_v86_iopl()?;
-                self.set_flag(FLAG_IF, false);
-                Ok(clocks(3))
-            }
-            0xfb => {
-                // STI sets IF and arms the one-instruction shadow so the instruction
-                // immediately after STI always executes before any interrupt is taken.
-                self.check_v86_iopl()?;
-                self.set_flag(FLAG_IF, true);
-                self.interrupt_shadow = true;
-                Ok(clocks(3))
-            }
-            0xfc => {
-                self.set_flag(FLAG_DF, false);
-                Ok(clocks(2))
-            }
-            0xfd => {
-                self.set_flag(FLAG_DF, true);
-                Ok(clocks(2))
-            }
+            // 0xf5 (CMC), 0xf8 (CLC), 0xf9 (STC), 0xfa (CLI), 0xfb (STI), 0xfc (CLD), 0xfd (STD)
+            // are converted to the decode/execute split: `route_group` classifies them as
+            // `DecodeGroup::FlagsMisc` and `execute_flags_misc_decoded` runs them. Not handled here.
             // 0xc0/0xc1/0xd0-0xd3 (group 2 shift/rotate) and 0xfe (group 4 INC/DEC byte) are
             // converted to the decode/execute split: `route_group` classifies them as
             // `DecodeGroup::Group` and `execute_group_decoded` runs them. Not handled here.
@@ -3096,14 +3191,9 @@ impl Cpu386 {
             // to the split: `route_group` classifies it as `DecodeGroup::ControlFlow` and
             // `execute_control_flow_decoded` runs it (the ModRM + addressing descriptor is parsed in
             // `decode`; the indirect target is read from memory in the executor). Not handled here.
-            0x40..=0x4f => {
-                let index = opcode & 0x07;
-                let is_dec = opcode >= 0x48;
-                let value = self.read_gpr_sized(index, operand_size);
-                let result = self.inc_dec(value, is_dec, operand_size.bus_width());
-                self.write_gpr_sized(index, operand_size, result);
-                Ok(clocks(2))
-            }
+            // 0x40-0x4f (INC/DEC reg) are converted to the decode/execute split:
+            // `route_group` classifies them as `DecodeGroup::FlagsMisc` and
+            // `execute_flags_misc_decoded` runs them. Not handled here.
             0xd7 => {
                 // XLAT: AL = [segment:(B)X + AL]. DS is the default, overridable; the 16-bit base
                 // plus AL wraps inside the segment.
@@ -4181,24 +4271,10 @@ impl Cpu386 {
         })
     }
 
-    fn read_rm_u8<B: CpuBus>(
-        &mut self,
-        bus: &mut B,
-        prefixes: Prefixes,
-        address_size: AddressSize,
-        modrm: ModRm,
-    ) -> ExecResult<u8> {
-        match self.decode_rm_operand(bus, prefixes, address_size, modrm)? {
-            RmOperand::Register(index) => Ok(self.read_gpr8(index)),
-            RmOperand::Memory(memory) => {
-                self.read_memory_u8(bus, memory.segment, memory.offset, BusAccessKind::DataRead)
-            }
-        }
-    }
-
-    // (`write_rm_u8` was removed with the legacy 0x88 MOV r/m8,r8 handler — its only caller. The
-    // converted data-move executor writes the byte r/m via `write_operand_u8` on the pre-decoded
-    // operand instead. The sized/read siblings remain in use by the fallback handlers.)
+    // (`read_rm_u8` was removed with the legacy 0x84 TEST r/m8,reg8 handler — its only remaining
+    // caller. The converted flags-misc executor reads the byte r/m via `read_operand_u8` on the
+    // pre-decoded operand instead. `write_rm_u8` was removed earlier with the legacy 0x88 MOV
+    // r/m8,r8 handler. The sized/read siblings remain in use by the fallback handlers.)
 
     fn read_rm_sized<B: CpuBus>(
         &mut self,
@@ -13940,14 +14016,15 @@ mod tests {
         // executors were deleted (there must be no second plumbing path). They are covered against
         // golden end-states in `alu_split_matches_golden_across_ops` and
         // `datamove_split_matches_golden_across_ops`. `inc word [bx]` (0xff /0) used to be the case
-        // here, but 0xff (group 5) is now converted (`DecodeGroup::ControlFlow`), so use `test [bx],
-        // cx` (0x85, a ModRM r/m TEST still on the fallback path) to keep exercising a memory
-        // addressing form through the seam.
-        let cases: &[(&str, &[u8])] = &[("test [bx], cx", &[0x85, 0x0f])];
+        // here, but 0xff (group 5) is now converted (`DecodeGroup::ControlFlow`). `test [bx], cx`
+        // (0x85) was used after that, but 0x84/0x85 are now converted (`DecodeGroup::FlagsMisc`).
+        // Use `xlat` (0xd7), still on Fallback, to keep exercising a memory-read through the seam:
+        // AL = [DS:BX+AL]. With seam_seed: BX=0x10, AL=0x02, so reads from 0x12.
+        let cases: &[(&str, &[u8])] = &[("xlat", &[0xd7])];
         for (name, code) in cases {
             let mut mem = vec![0u8; 0x200];
             mem[..code.len()].copy_from_slice(code);
-            mem[0x20..0x22].copy_from_slice(&0x1111u16.to_le_bytes());
+            mem[0x12] = 0xab; // the XLAT lookup result planted at [BX+AL]=0x12
 
             let mut fused = Cpu386::default();
             seam_seed(&mut fused);
@@ -15904,11 +15981,13 @@ mod tests {
     #[test]
     fn cli_faults_in_v86_below_iopl3() {
         // CLI (0xFA) in a V86 task with IOPL 0 traps to the monitor with #GP(0).
+        // CLI is converted to DecodeGroup::FlagsMisc, so drive it through the split (exec_one_split)
+        // rather than execute_instruction_legacy, which no longer carries the 0xFA arm.
         let (mut cpu, memory) = real_mode_cpu(&[0xfa], 0x40);
         cpu.control.cr0 |= CR0_PE;
         cpu.registers.eflags = 0x2 | FLAG_VM; // IOPL 0
         let mut bus = TestBus::with_memory(memory);
-        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
         assert!(matches!(fault, InternalFault::Exception { vector: 13, .. }));
     }
 
@@ -17341,6 +17420,371 @@ mod tests {
                 })
             ),
             "FF /7 must raise the undefined group-opcode error, got {err:?}"
+        );
+    }
+
+    // ---- Flags + misc register golden battery (A7) ----
+
+    /// One golden end-state for a flags/misc register case (task A7). The standard shape:
+    /// opcode bytes, expected end gpr (AX,CX,DX,BX,SP,BP,SI,DI), eflags, eip, and the
+    /// InstructionPrefetch fetch count. No memory writes (none of the A7 opcodes write to memory),
+    /// so no `deltas` field. The `eflags` field is load-bearing for most cases (TEST/SAHF/CLC/STC/
+    /// CMC/CLD/STD/CLI/STI change flags; INC/DEC change S/Z/O/A/P while preserving CF; CBW/CWD
+    /// change registers only). `eip` advances past the instruction (1 byte for all except TEST
+    /// 0x84/0x85 which have a ModRM, so 2 bytes).
+    struct FlagsMiscGolden {
+        name: &'static str,
+        code: &'static [u8],
+        gpr: [u32; 8],
+        eflags: u32,
+        eip: u32,
+        fetch: usize,
+    }
+
+    /// Seed for the flags/misc golden battery: the same register file as `seam_seed` plus CF
+    /// pre-set (so INC/DEC CF-preservation is visible and CMC/CLC/STC have a known starting CF),
+    /// and AH=0xd7 (= 0b11010111: CF/PF/AF/ZF/SF all 1, bits 3/5 forced — so LAHF/SAHF transfer
+    /// a non-trivial value). AH lives in the high byte of AX; write_gpr8(4, 0xd7) sets it.
+    fn flags_misc_seed(cpu: &mut Cpu386) {
+        seam_seed(cpu);
+        // CF set (bit 0 on top of always-1 bit 1). Makes INC/DEC CF-preservation observable and
+        // gives CMC/CLC/STC a known starting state.
+        cpu.registers.eflags = 0x03;
+        // AH = 0xd7 (bit pattern: CF=1, PF=1, AF=1, ZF=1, SF=1, reserved bits 1/3/5).
+        // This is the value SAHF loads into the low flag byte, and LAHF reads it back out.
+        cpu.write_gpr8(4, 0xd7);
+    }
+
+    /// Seed memory for the flags/misc battery: plant a word at [bx]=ds:0x10 (the TEST r/m target).
+    fn flags_misc_seed_mem(mem: &mut [u8], code: &[u8]) {
+        mem[..code.len()].copy_from_slice(code);
+        // TEST byte [bx]: [0x10] = 0x12; TEST word [bx]: [0x10..0x12] = 0x3412.
+        mem[0x10..0x12].copy_from_slice(&0x3412u16.to_le_bytes());
+    }
+
+    /// The flags + misc register differential battery (task A7). Captured from the PRIOR fused
+    /// reference (`execute_instruction_legacy`) via `regen_flags_misc_goldens`; see
+    /// `alu_golden_cases` for the full capture recipe. Never edit by hand — re-run the regen WHILE
+    /// the fused arms (0x40-0x4f, 0x84/0x85, 0x98/0x99, 0x9e/0x9f, 0xf5/0xf8-0xfd) still exist
+    /// in `dispatch_opcode`, then paste, then delete the fused arms. Covers: TEST byte/word reg and
+    /// mem (flags set, no write-back); INC/DEC reg (CF preserved, overflow and sign visible); CBW/
+    /// CWDE/CWD/CDQ (operand-size-dependent sign extension); SAHF/LAHF (flag-byte round-trip); and
+    /// all seven flag-bit ops CMC/CLC/STC/CLI/STI/CLD/STD (correct bit set/clear/complement;
+    /// STI interrupt shadow is covered by a dedicated test).
+    fn flags_misc_golden_cases() -> &'static [FlagsMiscGolden] {
+        // Captured from the fused reference (`execute_instruction_legacy`) via
+        // `regen_flags_misc_goldens` run against parent commit 3912fbc5.
+        // Seed: AX=0xD702 (AH=0xd7, AL=0x02; seam_seed sets AX=0x0102 then AH=0xd7),
+        // CX=0x0304, DX=0x0506, BX=0x0010, SP=0, BP=0x0010, SI=0x0008, DI=0x0018.
+        // eflags=0x03 (CF=1, always-1 bit1=1). Memory: [0x10..0x12] = 0x3412.
+        &[
+            // TEST r/m8,reg8 (0x84): flags only, no write-back. TEST AL,AL: 0x02 AND 0x02 = 0x02,
+            // ZF=0 PF=0 SF=0 CF=0 OF=0 → eflags=0x02 (reserved bit only).
+            FlagsMiscGolden {
+                name: "test al,al (84 c0)",
+                code: &[0x84, 0xc0],
+                gpr: [55042, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x2,
+                fetch: 3,
+            },
+            // TEST r/m8,reg8 (0x84): TEST [bx],cl: [0x10]=0x12 AND CL=0x04 → 0x00, ZF=1 → 0x46.
+            FlagsMiscGolden {
+                name: "test [bx],cl (84 0f)",
+                code: &[0x84, 0x0f],
+                gpr: [55042, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x46,
+                eip: 0x2,
+                fetch: 3,
+            },
+            // TEST r/m16,reg16 (0x85): TEST BX,CX: 0x0010 AND 0x0304 = 0x0000, ZF=1 PF=1 → 0x46.
+            FlagsMiscGolden {
+                name: "test bx,cx (85 cb)",
+                code: &[0x85, 0xcb],
+                gpr: [55042, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x46,
+                eip: 0x2,
+                fetch: 3,
+            },
+            // TEST r/m16,reg16 (0x85): TEST [bx],cx: [0x10]=0x3412 AND 0x0304 = 0x0000, ZF=1 → 0x46.
+            FlagsMiscGolden {
+                name: "test [bx],cx (85 0f)",
+                code: &[0x85, 0x0f],
+                gpr: [55042, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x46,
+                eip: 0x2,
+                fetch: 3,
+            },
+            // INC AX (0x40): AX=0xd702 → 0xd703. CF preserved (stays 1). AF set (low nibble 2→3).
+            FlagsMiscGolden {
+                name: "inc ax (40)",
+                code: &[0x40],
+                gpr: [55043, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x87,
+                eip: 0x1,
+                fetch: 2,
+            },
+            // INC DI (0x47): DI=0x0018 → 0x0019. CF preserved (stays 1). No half-carry.
+            FlagsMiscGolden {
+                name: "inc di (47)",
+                code: &[0x47],
+                gpr: [55042, 772, 1286, 16, 0, 16, 8, 25],
+                eflags: 0x3,
+                eip: 0x1,
+                fetch: 2,
+            },
+            // DEC AX (0x48): AX=0xd702 → 0xd701. CF preserved (stays 1). SF set (high bit of AH).
+            FlagsMiscGolden {
+                name: "dec ax (48)",
+                code: &[0x48],
+                gpr: [55041, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x83,
+                eip: 0x1,
+                fetch: 2,
+            },
+            // DEC DI (0x4f): DI=0x0018 → 0x0017. CF preserved (stays 1). AF set.
+            FlagsMiscGolden {
+                name: "dec di (4f)",
+                code: &[0x4f],
+                gpr: [55042, 772, 1286, 16, 0, 16, 8, 23],
+                eflags: 0x7,
+                eip: 0x1,
+                fetch: 2,
+            },
+            // CBW (0x98): sign-extend AL=0x02 (positive) → AX=0x0002. AH cleared.
+            FlagsMiscGolden {
+                name: "cbw (98, al=0x02)",
+                code: &[0x98],
+                gpr: [2, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x3,
+                eip: 0x1,
+                fetch: 2,
+            },
+            // CWD (0x99): AX=0xd702 (sign bit set; 0xd702 as i16 = -10494 < 0) → DX=0xFFFF.
+            FlagsMiscGolden {
+                name: "cwd (99, ax positive)",
+                code: &[0x99],
+                gpr: [55042, 772, 65535, 16, 0, 16, 8, 24],
+                eflags: 0x3,
+                eip: 0x1,
+                fetch: 2,
+            },
+            // SAHF (0x9e): AH=0xd7 (= 1101_0111b) → flags low byte = d7 (CF=1 PF=1 AF=1 ZF=1 SF=1).
+            FlagsMiscGolden {
+                name: "sahf (9e, ah=0xd7)",
+                code: &[0x9e],
+                gpr: [55042, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0xd7,
+                eip: 0x1,
+                fetch: 2,
+            },
+            // LAHF (0x9f): eflags=0x03 → AH = (0x03 & 0xD5) | 0x02 = 0x03. AX = 0x0302=770.
+            FlagsMiscGolden {
+                name: "lahf (9f, eflags=0x03)",
+                code: &[0x9f],
+                gpr: [770, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x3,
+                eip: 0x1,
+                fetch: 2,
+            },
+            // CMC (0xf5): CF was 1 → CF=0. eflags: 0x03 → 0x02.
+            FlagsMiscGolden {
+                name: "cmc (f5, cf=1->0)",
+                code: &[0xf5],
+                gpr: [55042, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x1,
+                fetch: 2,
+            },
+            // CLC (0xf8): CF=0. eflags: 0x03 → 0x02.
+            FlagsMiscGolden {
+                name: "clc (f8)",
+                code: &[0xf8],
+                gpr: [55042, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x1,
+                fetch: 2,
+            },
+            // STC (0xf9): CF=1. eflags stays 0x03 (already set).
+            FlagsMiscGolden {
+                name: "stc (f9)",
+                code: &[0xf9],
+                gpr: [55042, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x3,
+                eip: 0x1,
+                fetch: 2,
+            },
+            // CLD (0xfc): DF=0. DF was already 0 in seed; eflags stays 0x03.
+            FlagsMiscGolden {
+                name: "cld (fc)",
+                code: &[0xfc],
+                gpr: [55042, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x3,
+                eip: 0x1,
+                fetch: 2,
+            },
+            // STD (0xfd): DF=1. eflags: 0x03 → 0x403.
+            FlagsMiscGolden {
+                name: "std (fd)",
+                code: &[0xfd],
+                gpr: [55042, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x403,
+                eip: 0x1,
+                fetch: 2,
+            },
+        ]
+    }
+
+    #[test]
+    fn flags_misc_split_matches_golden_across_ops() {
+        // The flags + misc register block (TEST r/m,reg, INC/DEC reg, CBW/CWD, SAHF/LAHF, and the
+        // single flag-bit ops) is converted to the decode/execute split, so its fused arms are
+        // deleted and it can no longer be diffed against a fused executor in-tree. Run each case
+        // through cycle() (the split) and assert the architectural end-state against goldens
+        // captured from the pre-split fused path via `regen_flags_misc_goldens`. eflags is
+        // load-bearing for most cases (flags change); eip proves decode consumed the right bytes
+        // (1 for implicit-operand ops, 2 for TEST with ModRM); fetch proves each instruction byte
+        // was charged exactly once. INC/DEC CF-preservation is observable because the seed pre-sets
+        // CF and the goldens carry it.
+        for g in flags_misc_golden_cases() {
+            let mut mem = vec![0u8; 0x200];
+            flags_misc_seed_mem(&mut mem, g.code);
+
+            let mut split = Cpu386::default();
+            flags_misc_seed(&mut split);
+            let mut sbus = TestBus::with_memory(mem);
+            let _ = split.cycle(&mut sbus);
+
+            assert_eq!(split.registers.gpr, g.gpr, "gpr mismatch for {}", g.name);
+            assert_eq!(
+                split.registers.eflags, g.eflags,
+                "eflags mismatch for {}",
+                g.name
+            );
+            assert_eq!(split.registers.eip, g.eip, "eip mismatch for {}", g.name);
+            assert_eq!(
+                seam_fetch_count(&sbus),
+                g.fetch,
+                "instruction-fetch cycle count mismatch for {} (seam must charge fetches once)",
+                g.name
+            );
+        }
+    }
+
+    /// Regenerate `flags_misc_golden_cases` from the fused reference. Ignored by default.
+    /// Run WHILE the fused arms (0x40-0x4f, 0x84/0x85, 0x98/0x99, 0x9e/0x9f, 0xf5/0xf8-0xfd)
+    /// still exist in `dispatch_opcode` (i.e. the parent commit 3912fbc5):
+    ///   git worktree add ../regen-a7 3912fbc5
+    ///   cd ../regen-a7
+    ///   cargo test -p izarravm-cpu --lib regen_flags_misc_goldens -- --ignored --nocapture
+    /// then paste the output over `flags_misc_golden_cases` and only then delete the fused arms.
+    #[test]
+    #[ignore = "prints golden literals; run with --ignored --nocapture against the fused reference"]
+    fn regen_flags_misc_goldens() {
+        for g in flags_misc_golden_cases() {
+            let mut mem = vec![0u8; 0x200];
+            flags_misc_seed_mem(&mut mem, g.code);
+            let initial = mem.clone();
+
+            let mut fused = Cpu386::default();
+            flags_misc_seed(&mut fused);
+            let mut fbus = TestBus::with_memory(mem);
+            fused.begin_instruction();
+            if fused.execute_instruction_legacy(&mut fbus).is_err() {
+                println!(
+                    "            // TODO regen {}: fused path unavailable here; run against the base commit",
+                    g.name
+                );
+                continue;
+            }
+            let deltas: Vec<(usize, u8)> = fbus
+                .memory
+                .iter()
+                .enumerate()
+                .filter(|(i, b)| **b != initial[*i])
+                .map(|(i, b)| (i, *b))
+                .collect();
+            let fetch = seam_fetch_count(&fbus);
+            println!(
+                "            FlagsMiscGolden {{ name: {:?}, code: &{:?}, gpr: {:?}, eflags: {:#x}, eip: {:#x}, fetch: {} }},",
+                g.name,
+                g.code,
+                fused.registers.gpr,
+                fused.registers.eflags,
+                fused.registers.eip,
+                fetch,
+            );
+            if !deltas.is_empty() {
+                println!("            // memory deltas: {:?}", deltas);
+            }
+        }
+    }
+
+    /// STI's interrupt shadow: after STI, the immediately-following instruction executes before
+    /// any interrupt is taken, even when a hardware interrupt is already pending. Drive three
+    /// back-to-back cycles through the split: STI then NOP (0x90) then another NOP. A fake
+    /// interrupt is pending from the start via `TestBus.pending_irq`. Prove: (1) after STI the
+    /// interrupt is NOT taken (shadow active), (2) after NOP the interrupt is still pending (shadow
+    /// let NOP through), and (3) after the next cycle the interrupt is consumed (shadow expired).
+    #[test]
+    fn sti_interrupt_shadow_defers_interrupt_by_one_instruction() {
+        let mut memory = vec![0u8; 0x400];
+        // STI (0xfb) followed by two NOPs (0x90).
+        memory[0] = 0xfb; // STI
+        memory[1] = 0x90; // NOP — executes before interrupt is taken (shadow)
+        memory[2] = 0x90; // NOP — not reached; interrupt taken instead
+        // IVT entry for vector 0x08 (IRQ0) at byte offset 0x20 (0x0008 * 4):
+        // offset=0x0200, segment=0x0000.
+        memory[0x20..0x22].copy_from_slice(&0x0200u16.to_le_bytes());
+        memory[0x22..0x24].copy_from_slice(&0x0000u16.to_le_bytes());
+        // IRET at the handler target (not reached in this test but avoids unmapped-memory errors
+        // if the CPU tries to read into it).
+        memory[0x200] = 0xcf;
+
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Sp, 0x100);
+        // Start with IF clear so STI is what enables interrupts.
+        cpu.set_flag(FLAG_IF, false);
+
+        let mut bus = TestBus::with_memory(memory);
+        // Arm a pending IRQ 8. `interrupt_pending()` returns true while `pending_irq.is_some()`.
+        bus.pending_irq = Some(8);
+
+        // Cycle 1: STI (0xfb). IF becomes set; interrupt_shadow is armed. The pending IRQ is NOT
+        // serviced yet (shadow active): eip advances to 1.
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(
+            cpu.registers.eip, 1,
+            "eip must be 1 after STI — NOP not yet executed"
+        );
+        assert!(cpu.flag(FLAG_IF), "STI must set IF");
+        assert!(
+            bus.pending_irq.is_some(),
+            "interrupt must not be taken during the STI cycle itself"
+        );
+
+        // Cycle 2: NOP (0x90). Shadow consumed at cycle start → interrupt check skipped → NOP
+        // executes → eip advances to 2. IRQ still pending.
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(
+            cpu.registers.eip, 2,
+            "eip must be 2 after NOP — shadow let NOP through"
+        );
+        assert!(
+            bus.pending_irq.is_some(),
+            "interrupt must still be pending after NOP (shadow consumed, interrupt check skipped)"
+        );
+
+        // Cycle 3: no shadow, IF set, IRQ pending → interrupt is acknowledged before fetch.
+        // `acknowledge_interrupt` takes the pending_irq, so it becomes None.
+        cpu.cycle(&mut bus).unwrap();
+        assert!(
+            bus.pending_irq.is_none(),
+            "interrupt must be taken after the shadow expires"
         );
     }
 }
