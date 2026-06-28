@@ -1132,11 +1132,11 @@ impl Cpu386 {
         match insn.opcode {
             0x00 | 0x01 => self.execute_add_rm_reg(insn, bus),
             opcode => {
-                // Legacy fallback: `decode` already read the prefixes + opcode and ran the LOCK
-                // check, leaving eip just past the opcode. Continue into the shared fused
-                // dispatch from there, so each fused arm re-reads its ModRM/immediates exactly as
-                // before and the prefix/opcode fetch clocks are charged only once (rule 2).
-                self.dispatch_legacy_opcode(
+                // Fallback: `decode` already read the prefixes + opcode and ran the LOCK check,
+                // leaving eip just past the opcode. Continue into the shared dispatch from there,
+                // so each arm re-reads its ModRM/immediates exactly as before and the prefix/opcode
+                // fetch clocks are charged only once (rule 2).
+                self.dispatch_opcode(
                     bus,
                     insn.start_eip,
                     insn.prefixes,
@@ -1178,9 +1178,9 @@ impl Cpu386 {
 
     // Transitional fused entry: reads the prefixes + opcode + LOCK check itself, then dispatches.
     // The production `cycle` path goes through `decode`/`execute_decoded` (which call
-    // `dispatch_legacy_opcode` directly to keep the fetch clocks charged once), so this whole-
-    // instruction entry now has callers only in the test suite; it is retained as the documented
-    // fused reference and is removed when the seam covers every opcode.
+    // `dispatch_opcode` directly to keep the fetch clocks charged once), so this whole-instruction
+    // entry now has callers only in the test suite; it is retained as the documented fused
+    // reference and is removed when the seam covers every opcode.
     #[allow(dead_code)]
     fn execute_instruction_legacy<B: CpuBus>(&mut self, bus: &mut B) -> ExecResult<CycleOutcome> {
         let instruction_eip = self.registers.eip;
@@ -1191,7 +1191,7 @@ impl Cpu386 {
         }
         let operand_size = self.operand_size(prefixes);
         let address_size = self.address_size(prefixes);
-        self.dispatch_legacy_opcode(
+        self.dispatch_opcode(
             bus,
             instruction_eip,
             prefixes,
@@ -1201,13 +1201,15 @@ impl Cpu386 {
         )
     }
 
-    /// The fused opcode dispatch, shared by the legacy direct path and the decode/execute seam.
-    /// The caller is responsible for having already read the prefixes + opcode and run any LOCK
-    /// check; `eip` must point at the byte immediately after the opcode so each arm re-reads its
-    /// ModRM/immediate from there. The seam calls this with the values `decode` already read, so
-    /// the prefix/opcode instruction-fetch clocks are charged exactly once.
+    /// The live opcode dispatch the production seam calls on every fallback opcode (and that the
+    /// test-only `execute_instruction_legacy` reference also delegates to). The caller is
+    /// responsible for having already read the prefixes + opcode and run any LOCK check;
+    /// `instruction_eip` is only used for the unsupported-opcode error, and the current eip must
+    /// point at the byte immediately after the opcode so each arm re-reads its ModRM/immediate
+    /// from there. The seam calls this with the values `decode` already read, so the prefix/opcode
+    /// instruction-fetch clocks are charged exactly once.
     #[allow(clippy::too_many_arguments)]
-    fn dispatch_legacy_opcode<B: CpuBus>(
+    fn dispatch_opcode<B: CpuBus>(
         &mut self,
         bus: &mut B,
         instruction_eip: u32,
@@ -13281,6 +13283,25 @@ mod tests {
                 "eip mismatch for {name}"
             );
             assert_eq!(sbus.memory, fbus.memory, "memory mismatch for {name}");
+
+            // Clock-neutrality guard: the seam must charge each instruction-fetch byte exactly
+            // once. The machine derives device/IRQ timing from the bus-trace fetch records, so a
+            // double-charge (e.g. decode reading the opcode and the fallback re-reading it) drifts
+            // timing. Count the InstructionPrefetch bus cycles on each path and require equality.
+            // This is scale-independent, unlike `core_clocks` (cycle() scales via scale_clocks
+            // while the fused reference returns raw clocks).
+            let fetch_count = |bus: &TestBus| {
+                bus.trace
+                    .cycles()
+                    .iter()
+                    .filter(|c| c.kind == BusAccessKind::InstructionPrefetch)
+                    .count()
+            };
+            assert_eq!(
+                fetch_count(&sbus),
+                fetch_count(&fbus),
+                "instruction-fetch cycle count mismatch for {name} (seam must charge fetches once)"
+            );
         }
     }
 
