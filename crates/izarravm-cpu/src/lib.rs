@@ -830,6 +830,19 @@ enum DecodeGroup {
     /// bit identical to the fused path. The far/indirect/RET/INT control flow and 0xFF group 5 stay
     /// on Fallback/TwoByteFallback (task A6b) — do NOT route them here.
     Branch,
+    /// The far/indirect/RET/INT control-flow block (task A6b): CALL far direct (0x9a) and JMP far
+    /// direct (0xea), RET near (0xc3) and RET near imm16 (0xc2), RETF (0xcb) and RETF imm16 (0xca),
+    /// INT3 (0xcc), INT n (0xcd), INTO (0xce), IRET (0xcf), and the heterogeneous 0xff group 5
+    /// (/0 INC, /1 DEC, /2 near-indirect CALL, /3 far-indirect CALL, /4 near-indirect JMP, /5
+    /// far-indirect JMP, /6 PUSH r/m, /7 #UD). `decode` reads each form's immediate (the far-pointer
+    /// offset+selector for 0x9a/0xea into `imm`/`imm2`, the imm16 stack-release for 0xc2/0xca into
+    /// `imm`, the imm8 vector for 0xcd into `imm`) or parses the ModRM + addressing descriptor (for
+    /// 0xff); the executor consumes those and re-fetches nothing. The indirect CALL/JMP read their
+    /// target FROM MEMORY at execute time, so decode captures only the addressing descriptor, NOT the
+    /// target. Every executor reuses the existing far-call/far-jump, ret/retf, interrupt-delivery,
+    /// IRET, inc_dec, and push helpers verbatim, so the protected-mode descriptor loads, gates,
+    /// faults, interrupt-shadow/IF semantics, and clocks are byte-identical to the fused path.
+    ControlFlow,
     /// Not yet converted to the split: decode parses nothing extra and `execute_decoded` hands the
     /// opcode to the shared fused `dispatch_opcode`.
     Fallback,
@@ -1207,11 +1220,20 @@ impl Cpu386 {
         }
         // Relative-displacement + loop control flow (task A6a): Jcc short (0x70-0x7f), the loop/JCXZ
         // branches (0xe0-0xe3), CALL near (0xe8), JMP near (0xe9), JMP short (0xeb). The two-byte
-        // Jcc near forms are routed in the 0F block above. The far/indirect/RET/INT control flow
-        // (0x9a/0xc2/0xc3/0xca/0xcb/0xcc/0xcd/0xce/0xcf/0xea) and 0xff group 5 are task A6b and stay
-        // on Fallback — do NOT list them here.
+        // Jcc near forms are routed in the 0F block above.
         if matches!(opcode, 0x70..=0x7f | 0xe0..=0xe3 | 0xe8 | 0xe9 | 0xeb) {
             return DecodeGroup::Branch;
+        }
+        // Far/indirect/RET/INT control flow + 0xff group 5 (task A6b): CALL/JMP far direct
+        // (0x9a/0xea), RET/RETF with and without an imm16 release (0xc2/0xc3/0xca/0xcb), INT3/INT n/
+        // INTO/IRET (0xcc-0xcf), and 0xff (group 5: INC/DEC r/m, near/far indirect CALL/JMP, PUSH
+        // r/m, /7 #UD). These change CS/segment state and are delivered through the existing
+        // far-call/far-jump/ret/retf/interrupt/IRET helpers, which the executor reuses verbatim.
+        if matches!(
+            opcode,
+            0x9a | 0xc2 | 0xc3 | 0xca | 0xcb | 0xcc | 0xcd | 0xce | 0xcf | 0xea | 0xff
+        ) {
+            return DecodeGroup::ControlFlow;
         }
         DecodeGroup::Fallback
     }
@@ -1445,6 +1467,47 @@ impl Cpu386 {
                     }
                 }
             }
+            DecodeGroup::ControlFlow => {
+                // Far/indirect/RET/INT control flow + 0xff group 5. Each form reads exactly the bytes
+                // its fused handler read, in the same order, so the fetch clocks are byte-identical:
+                match insn.opcode as u8 {
+                    // 0x9a CALL far direct / 0xea JMP far direct: a far pointer immediate — the
+                    // offset (operand-size wide) THEN the 16-bit selector, exactly as the fused
+                    // handler fetched them. Store the offset in `imm` and the selector in `imm2`; the
+                    // executor reconstructs the same far target.
+                    0x9a | 0xea => {
+                        insn.imm = match operand_size {
+                            OperandSize::Word => u32::from(self.fetch_u16(bus)?),
+                            OperandSize::Dword => self.fetch_u32(bus)?,
+                        };
+                        insn.imm2 = u32::from(self.fetch_u16(bus)?);
+                    }
+                    // 0xc2 RET near imm16 / 0xca RETF imm16: the 16-bit stack-release count is part
+                    // of the instruction stream and is fetched BEFORE the executor pops, so read it
+                    // here. (The operand size only selects the pop width, not the release width.)
+                    0xc2 | 0xca => {
+                        insn.imm = u32::from(self.fetch_u16(bus)?);
+                    }
+                    // 0xcd INT n: the imm8 vector. Read it here; the executor reuses it. (The V86
+                    // IOPL check is part of execution, not decode, so it stays in the executor.)
+                    0xcd => {
+                        insn.imm = u32::from(self.fetch_u8(bus)?);
+                    }
+                    // 0xff group 5: parse the ModRM + addressing descriptor (instruction bytes only,
+                    // so it stays cacheable). The /ext is `modrm.reg`. The indirect CALL/JMP read
+                    // their target FROM MEMORY at execute time (resolved against live registers), so
+                    // decode captures ONLY the descriptor here — never the target.
+                    0xff => {
+                        let modrm = self.fetch_modrm(bus)?;
+                        let operand =
+                            self.parse_addressing_mode(bus, prefixes, address_size, modrm)?;
+                        insn.modrm = Some(modrm);
+                        insn.operand = Some(operand);
+                    }
+                    // 0xc3 RET near, 0xcb RETF, 0xcc INT3, 0xce INTO, 0xcf IRET: no encoded operand.
+                    _ => {}
+                }
+            }
             // Both fallback groups pre-parse nothing in `decode` (the second 0F byte was already
             // folded into `insn.opcode` above): their executors re-read any ModRM/immediate from the
             // post-opcode eip in the shared fused dispatch.
@@ -1492,6 +1555,11 @@ impl Cpu386 {
             // consuming the relative displacement `decode` pre-parsed (eip is already at the
             // instruction end, so the eip-relative target math matches the fused path).
             DecodeGroup::Branch => self.execute_branch_decoded(insn, bus),
+            // The far/indirect/RET/INT control-flow block + 0xff group 5 runs through its split
+            // executor, consuming the far-pointer/imm16/imm8 `decode` pre-parsed (for 0x9a/0xea/0xc2/
+            // 0xca/0xcd) or the pre-parsed ModRM/descriptor (for 0xff), and reusing the existing
+            // far-call/far-jump/ret/retf/interrupt/IRET/inc_dec/push helpers verbatim.
+            DecodeGroup::ControlFlow => self.execute_control_flow_decoded(insn, bus),
             DecodeGroup::TwoByteFallback => {
                 // Un-converted two-byte (0F) opcode. `decode` already read + charged the second
                 // byte and applied the ISA gate, folding it into `insn.opcode` as 0x0F00 | second.
@@ -2353,6 +2421,173 @@ impl Cpu386 {
         }
     }
 
+    /// The far/indirect/RET/INT control-flow block + 0xff group 5 through the decode/execute split.
+    /// Each arm mirrors the former fused handler verbatim — same far-pointer reconstruction, same
+    /// ret/retf and interrupt/IRET delivery, same FF sub-op dispatch off `modrm.reg`, same clocks —
+    /// but consumes what `decode` pre-parsed (the far-pointer offset/selector in `imm`/`imm2`, the
+    /// imm16 release in `imm`, the imm8 vector in `imm`, or the ModRM/descriptor) so the executor
+    /// re-fetches no instruction byte. The protected-mode descriptor loads, gates, faults, the
+    /// V86 IOPL check, the interrupt-shadow/IF semantics, and the FF indirect target read all stay in
+    /// the unchanged helpers, so behavior is byte-for-byte identical to the fused path.
+    fn execute_control_flow_decoded<B: CpuBus>(
+        &mut self,
+        insn: &DecodedInsn,
+        bus: &mut B,
+    ) -> ExecResult<CycleOutcome> {
+        let operand_size = insn.operand_size;
+        let address_size = insn.address_size;
+
+        match insn.opcode as u8 {
+            0x9a => {
+                // CALL far direct. `decode` fetched the far pointer (offset into `imm`, selector into
+                // `imm2`); reconstruct it and deliver through the unchanged far-call helper.
+                let offset = insn.imm;
+                let selector = insn.imm2 as u16;
+                self.far_call(bus, selector, offset, operand_size)?;
+                Ok(clocks(17))
+            }
+            0xea => {
+                // JMP far direct. Same far-pointer reconstruction, via the far-jump helper.
+                let offset = insn.imm;
+                let selector = insn.imm2 as u16;
+                self.far_jump(bus, selector, offset, operand_size)?;
+                Ok(clocks(17))
+            }
+            0xc2 => {
+                // RET near, release imm16 bytes of arguments. `decode` fetched the release count into
+                // `imm`; pop the return offset (operand-size wide) THEN release, the same order the
+                // fused handler used.
+                let release = insn.imm as u16;
+                let target = self.pop(bus, operand_size)?;
+                self.set_eip(target & operand_size.mask());
+                self.release_stack(release);
+                Ok(clocks(10))
+            }
+            0xc3 => {
+                let target = self.pop(bus, operand_size)?;
+                self.set_eip(target & operand_size.mask());
+                Ok(clocks(10))
+            }
+            0xca => {
+                // RETF, release imm16 bytes. `decode` fetched the count into `imm`; pop CS:IP via the
+                // far-return helper THEN release.
+                let release = insn.imm as u16;
+                self.return_far(bus, operand_size)?;
+                self.release_stack(release);
+                Ok(clocks(17))
+            }
+            0xcb => {
+                self.return_far(bus, operand_size)?;
+                Ok(clocks(17))
+            }
+            0xcc => {
+                // INT 3: one-byte breakpoint trap to vector 3, via the shared delivery path.
+                self.software_interrupt(bus, 3)?;
+                Ok(clocks(33))
+            }
+            0xcd => {
+                // INT n. IOPL-sensitive in V86 (checked here, exactly as the fused handler did,
+                // before the delivery). `decode` fetched the vector into `imm`.
+                self.check_v86_iopl()?;
+                let vector = insn.imm as u8;
+                self.software_interrupt(bus, vector)?;
+                Ok(clocks(37))
+            }
+            0xce => {
+                // INTO: trap to vector 4 only when OF is set; otherwise a no-op.
+                if self.flag(FLAG_OF) {
+                    self.software_interrupt(bus, 4)?;
+                    Ok(clocks(35))
+                } else {
+                    Ok(clocks(3))
+                }
+            }
+            0xcf => {
+                self.iret(bus, operand_size)?;
+                Ok(clocks(22))
+            }
+            0xff => {
+                // Group 5. The /ext is `modrm.reg`. `decode` pre-parsed the ModRM + descriptor; the
+                // r/m operand resolves against the live registers here. The indirect CALL/JMP read
+                // their target FROM MEMORY now, mirroring the fused handler's read order exactly.
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                match modrm.reg {
+                    0 | 1 => {
+                        let value = self.read_operand_sized(bus, operand, operand_size)?;
+                        let result = self.inc_dec(value, modrm.reg == 1, operand_size.bus_width());
+                        self.write_operand_sized(bus, operand, operand_size, result)?;
+                        Ok(clocks(2))
+                    }
+                    2 => {
+                        let target = self.read_operand_sized(bus, operand, operand_size)?;
+                        self.push(bus, self.registers.eip, operand_size)?;
+                        self.set_eip(target & operand_size.mask());
+                        Ok(clocks(7))
+                    }
+                    4 => {
+                        let target = self.read_operand_sized(bus, operand, operand_size)?;
+                        self.set_eip(target & operand_size.mask());
+                        Ok(clocks(7))
+                    }
+                    6 => {
+                        let value = self.read_operand_sized(bus, operand, operand_size)?;
+                        self.push(bus, value, operand_size)?;
+                        Ok(clocks(2))
+                    }
+                    3 | 5 => {
+                        // Far CALL (/3) and far JMP (/5) via memory. The operand must be memory;
+                        // mod=3 is an invalid encoding and faults as #UD.
+                        let memory = match operand {
+                            RmOperand::Memory(memory) => memory,
+                            RmOperand::Register(_) => {
+                                return Err(InternalFault::Exception {
+                                    vector: 6,
+                                    error_code: None,
+                                });
+                            }
+                        };
+                        let offset = self.read_memory_sized(
+                            bus,
+                            memory.segment,
+                            memory.offset,
+                            operand_size,
+                            BusAccessKind::DataRead,
+                        )?;
+                        // The selector follows the offset in memory. Its address is computed in the
+                        // address-size space, so on a 16-bit real-mode segment it wraps at 0xffff
+                        // (offset 0xfffe puts the selector at 0x0000, not past the limit), matching
+                        // the 80386.
+                        let selector_offset = match address_size {
+                            AddressSize::Word => u32::from(
+                                (memory.offset as u16).wrapping_add(operand_size.bytes() as u16),
+                            ),
+                            AddressSize::Dword => memory.offset.wrapping_add(operand_size.bytes()),
+                        };
+                        let selector = self.read_memory_sized(
+                            bus,
+                            memory.segment,
+                            selector_offset,
+                            OperandSize::Word,
+                            BusAccessKind::DataRead,
+                        )? as u16;
+                        if modrm.reg == 3 {
+                            self.far_call(bus, selector, offset, operand_size)?;
+                        } else {
+                            self.far_jump(bus, selector, offset, operand_size)?;
+                        }
+                        Ok(clocks(11))
+                    }
+                    extension => Err(CpuError::UnsupportedGroupOpcode {
+                        opcode: 0xff,
+                        extension,
+                    }
+                    .into()),
+                }
+            }
+            opcode => unreachable!("control-flow opcode {opcode:#x}"),
+        }
+    }
+
     // Transitional fused entry: reads the prefixes + opcode + LOCK check itself, then dispatches.
     // The production `cycle` path goes through `decode`/`execute_decoded` (which call
     // `dispatch_opcode` directly to keep the fetch clocks charged once), so this whole-instruction
@@ -2709,63 +2944,19 @@ impl Cpu386 {
             }
             // 0xb0-0xb7 (MOV r8,imm8) and 0xb8-0xbf (MOV r16/32,imm) are converted to the split
             // (`DecodeGroup::DataMove` -> `execute_datamove_decoded`); not handled here.
-            0xc2 => {
-                // RET near, release imm16 bytes of arguments. The release count is always a
-                // 16-bit immediate fetched from the instruction stream before the return
-                // address is popped; the operand size only selects the offset pop width.
-                let release = self.fetch_u16(bus)?;
-                let target = self.pop(bus, operand_size)?;
-                self.set_eip(target & operand_size.mask());
-                self.release_stack(release);
-                Ok(clocks(10))
-            }
-            0xc3 => {
-                let target = self.pop(bus, operand_size)?;
-                self.set_eip(target & operand_size.mask());
-                Ok(clocks(10))
-            }
-            0xca => {
-                // RETF, release imm16 bytes. The count is part of the instruction stream, so
-                // it is fetched before the pops.
-                let release = self.fetch_u16(bus)?;
-                self.return_far(bus, operand_size)?;
-                self.release_stack(release);
-                Ok(clocks(17))
-            }
-            0xcb => {
-                self.return_far(bus, operand_size)?;
-                Ok(clocks(17))
-            }
+            // 0xc2/0xc3 (RET near, with and without an imm16 release) and 0xca/0xcb (RETF, ditto) are
+            // converted to the decode/execute split: `route_group` classifies them as
+            // `DecodeGroup::ControlFlow` and `execute_control_flow_decoded` runs them (the imm16
+            // release count is parsed in `decode`). Not handled here.
             // 0xc6/0xc7 (MOV r/m,imm group 11) are converted to the split
             // (`DecodeGroup::DataMove` -> `execute_datamove_decoded`); not handled here.
             // 0xc8 (ENTER) and 0xc9 (LEAVE) are converted to `DecodeGroup::Stack` ->
             // `execute_stack_decoded`; not handled here.
-            0xcc => {
-                // INT 3: one-byte breakpoint trap to vector 3.
-                self.software_interrupt(bus, 3)?;
-                Ok(clocks(33))
-            }
-            0xcd => {
-                // INT n. IOPL-sensitive in V86 so the monitor can virtualize software
-                // interrupts; otherwise it dispatches through the IVT/IDT.
-                self.check_v86_iopl()?;
-                let vector = self.fetch_u8(bus)?;
-                self.software_interrupt(bus, vector)?;
-                Ok(clocks(37))
-            }
-            0xce => {
-                // INTO: trap to vector 4 only when OF is set; otherwise a no-op.
-                if self.flag(FLAG_OF) {
-                    self.software_interrupt(bus, 4)?;
-                    Ok(clocks(35))
-                } else {
-                    Ok(clocks(3))
-                }
-            }
-            0xcf => {
-                self.iret(bus, operand_size)?;
-                Ok(clocks(22))
-            }
+            // 0xcc (INT3), 0xcd (INT n, imm8 vector), 0xce (INTO), 0xcf (IRET) are converted to the
+            // split: `route_group` classifies them as `DecodeGroup::ControlFlow` and
+            // `execute_control_flow_decoded` runs them (the imm8 vector for 0xcd is parsed in
+            // `decode`; the V86 IOPL check and the interrupt/IRET delivery stay in the executor's
+            // shared helpers). Not handled here.
             0xd6 => {
                 // SALC/SETALC (undocumented): AL = CF ? 0xFF : 0x00. Flags unaffected.
                 let value = if self.flag(FLAG_CF) { 0xff } else { 0x00 };
@@ -2847,24 +3038,10 @@ impl Cpu386 {
                 }
                 Ok(clocks(6))
             }
-            0x9a => {
-                let offset = match operand_size {
-                    OperandSize::Word => u32::from(self.fetch_u16(bus)?),
-                    OperandSize::Dword => self.fetch_u32(bus)?,
-                };
-                let selector = self.fetch_u16(bus)?;
-                self.far_call(bus, selector, offset, operand_size)?;
-                Ok(clocks(17))
-            }
-            0xea => {
-                let offset = match operand_size {
-                    OperandSize::Word => u32::from(self.fetch_u16(bus)?),
-                    OperandSize::Dword => self.fetch_u32(bus)?,
-                };
-                let selector = self.fetch_u16(bus)?;
-                self.far_jump(bus, selector, offset, operand_size)?;
-                Ok(clocks(17))
-            }
+            // 0x9a (CALL far direct) and 0xea (JMP far direct) are converted to the decode/execute
+            // split: `route_group` classifies them as `DecodeGroup::ControlFlow` and
+            // `execute_control_flow_decoded` runs them (the far pointer — offset then selector — is
+            // parsed in `decode` into `imm`/`imm2`). Not handled here.
             0xf4 => {
                 self.halted = true;
                 Ok(CycleOutcome {
@@ -2912,86 +3089,13 @@ impl Cpu386 {
                 self.set_flag(FLAG_DF, true);
                 Ok(clocks(2))
             }
-            0xff => {
-                let modrm = self.fetch_modrm(bus)?;
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                match modrm.reg {
-                    0 | 1 => {
-                        let value = self.read_operand_sized(bus, operand, operand_size)?;
-                        let result = self.inc_dec(value, modrm.reg == 1, operand_size.bus_width());
-                        self.write_operand_sized(bus, operand, operand_size, result)?;
-                        Ok(clocks(2))
-                    }
-                    2 => {
-                        let target = self.read_operand_sized(bus, operand, operand_size)?;
-                        self.push(bus, self.registers.eip, operand_size)?;
-                        self.set_eip(target & operand_size.mask());
-                        Ok(clocks(7))
-                    }
-                    4 => {
-                        let target = self.read_operand_sized(bus, operand, operand_size)?;
-                        self.set_eip(target & operand_size.mask());
-                        Ok(clocks(7))
-                    }
-                    6 => {
-                        let value = self.read_operand_sized(bus, operand, operand_size)?;
-                        self.push(bus, value, operand_size)?;
-                        Ok(clocks(2))
-                    }
-                    3 | 5 => {
-                        // Far CALL (/3) and far JMP (/5) via memory. The operand must be memory;
-                        // mod=3 is an invalid encoding and faults as #UD.
-                        let memory = match operand {
-                            RmOperand::Memory(memory) => memory,
-                            RmOperand::Register(_) => {
-                                return Err(InternalFault::Exception {
-                                    vector: 6,
-                                    error_code: None,
-                                });
-                            }
-                        };
-                        let offset = self.read_memory_sized(
-                            bus,
-                            memory.segment,
-                            memory.offset,
-                            operand_size,
-                            BusAccessKind::DataRead,
-                        )?;
-                        // The selector follows the offset in memory. Its address is
-                        // computed in the address-size space, so on a 16-bit real-mode
-                        // segment it wraps at 0xffff (offset 0xfffe puts the selector at
-                        // 0x0000, not past the limit), matching the 80386.
-                        let selector_offset = match address_size {
-                            AddressSize::Word => u32::from(
-                                (memory.offset as u16).wrapping_add(operand_size.bytes() as u16),
-                            ),
-                            AddressSize::Dword => memory.offset.wrapping_add(operand_size.bytes()),
-                        };
-                        let selector = self.read_memory_sized(
-                            bus,
-                            memory.segment,
-                            selector_offset,
-                            OperandSize::Word,
-                            BusAccessKind::DataRead,
-                        )? as u16;
-                        if modrm.reg == 3 {
-                            self.far_call(bus, selector, offset, operand_size)?;
-                        } else {
-                            self.far_jump(bus, selector, offset, operand_size)?;
-                        }
-                        Ok(clocks(11))
-                    }
-                    extension => Err(CpuError::UnsupportedGroupOpcode {
-                        opcode: 0xff,
-                        extension,
-                    }
-                    .into()),
-                }
-            }
             // 0xc0/0xc1/0xd0-0xd3 (group 2 shift/rotate) and 0xfe (group 4 INC/DEC byte) are
             // converted to the decode/execute split: `route_group` classifies them as
             // `DecodeGroup::Group` and `execute_group_decoded` runs them. Not handled here.
-            // (0xff, group 5, stays on this fused path — it is indirect CALL/JMP control flow.)
+            // 0xff (group 5: INC/DEC r/m, near/far indirect CALL/JMP, PUSH r/m, /7 #UD) is converted
+            // to the split: `route_group` classifies it as `DecodeGroup::ControlFlow` and
+            // `execute_control_flow_decoded` runs it (the ModRM + addressing descriptor is parsed in
+            // `decode`; the indirect target is read from memory in the executor). Not handled here.
             0x40..=0x4f => {
                 let index = opcode & 0x07;
                 let is_dec = opcode >= 0x48;
@@ -13835,9 +13939,11 @@ mod tests {
         // longer comparable this way: both are fully converted to the split, so their former fused
         // executors were deleted (there must be no second plumbing path). They are covered against
         // golden end-states in `alu_split_matches_golden_across_ops` and
-        // `datamove_split_matches_golden_across_ops`. `inc word [bx]` (0xff /0) is still on the
-        // fallback path, so it remains a valid differential case here.
-        let cases: &[(&str, &[u8])] = &[("inc word [bx]", &[0xff, 0x07])];
+        // `datamove_split_matches_golden_across_ops`. `inc word [bx]` (0xff /0) used to be the case
+        // here, but 0xff (group 5) is now converted (`DecodeGroup::ControlFlow`), so use `test [bx],
+        // cx` (0x85, a ModRM r/m TEST still on the fallback path) to keep exercising a memory
+        // addressing form through the seam.
+        let cases: &[(&str, &[u8])] = &[("test [bx], cx", &[0x85, 0x0f])];
         for (name, code) in cases {
             let mut mem = vec![0u8; 0x200];
             mem[..code.len()].copy_from_slice(code);
@@ -16900,5 +17006,341 @@ mod tests {
                 fetch,
             );
         }
+    }
+
+    /// One golden end-state for a control-flow case (task A6b). Mirrors the `BranchGolden` shape but
+    /// adds `cs` (the CS selector) and a per-case `setup` closure, because this group changes
+    /// segment state (RETF, far-direct CALL/JMP, and the INT/IRET deliveries reload CS) and each
+    /// form needs its own in-memory image (a far pointer / IVT entry / saved stack frame). The
+    /// captured fields are the standard set plus `cs`: end gpr (AX,CX,DX,BX,SP,BP,SI,DI), the CS
+    /// selector, eflags, eip, (offset,value) memory writes (CALL/PUSH/INT push; INC/DEC write), and
+    /// the InstructionPrefetch fetch count.
+    struct ControlFlowGolden {
+        name: &'static str,
+        code: &'static [u8],
+        /// Per-case memory image written before the run (IVT entries, far pointers, saved frames),
+        /// applied identically on the split and the fused-reference paths.
+        setup: fn(&mut [u8]),
+        gpr: [u32; 8],
+        cs: u16,
+        eflags: u32,
+        eip: u32,
+        deltas: &'static [(usize, u8)],
+        fetch: usize,
+    }
+
+    /// Shared register seed for the control-flow golden battery: CS/DS/SS = 0, eip = 0, SP = 0x100
+    /// (a safe in-image stack), BX = 0x40 (so `[bx]` addresses the in-image FF r/m operand), and the
+    /// OF/IF flags set so INTO traps and the interrupt deliveries record IF being cleared. The
+    /// per-case `setup` closure lays down the memory image each form needs.
+    fn controlflow_seed(cpu: &mut Cpu386) {
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Sp, 0x0100);
+        cpu.write_reg16(Reg16::Bx, 0x0040);
+        cpu.set_flag(FLAG_OF, true);
+        cpu.set_flag(FLAG_IF, true);
+    }
+
+    /// The far/indirect/RET/INT control-flow + 0xff group-5 differential battery. Captured from the
+    /// PRIOR fused reference via `regen_controlflow_goldens`; see `branch_golden_cases` for the
+    /// capture recipe. These opcodes' fused arms are deleted on `perf-decode-cache`, so the goldens
+    /// were captured from the pre-split base commit (HEAD before A6b, dc1cf4e2): the regen runs the
+    /// fused `execute_instruction_legacy` there, prints the literals, and they are pasted back.
+    ///
+    /// Covers the non-faulting success paths: RET near (with and without an imm16 SP-release), RETF
+    /// (the CS reload + SP delta), FF /0 INC and FF /1 DEC r/m (the memory write + the flag update),
+    /// FF /6 PUSH r/m (the pushed value + SP drop), FF /2 near-indirect CALL (the pushed return +
+    /// the new eip), FF /4 near-indirect JMP (the new eip, nothing pushed), CALL/JMP far direct
+    /// (0x9a/0xea — the CS:eip transfer, plus CALL's pushed CS:IP), and the INT3/INT n/INTO/IRET
+    /// deliveries (CS:eip from the IVT, the pushed FLAGS:CS:IP frame / the restored frame, IF
+    /// cleared). The shared `controlflow_seed` plus each case's `setup` makes every input stable.
+    fn controlflow_golden_cases() -> &'static [ControlFlowGolden] {
+        &[
+            ControlFlowGolden {
+                name: "ret near (c3, pop 0x0100)",
+                code: &[0xc3],
+                setup: |m| m[0x100..0x102].copy_from_slice(&0x0100u16.to_le_bytes()),
+                gpr: [0, 0, 0, 64, 258, 0, 0, 0],
+                cs: 0x0,
+                eflags: 0xa02,
+                eip: 0x100,
+                deltas: &[],
+                fetch: 2,
+            },
+            ControlFlowGolden {
+                name: "ret near imm16 (c2 04 00, pop then release 4)",
+                code: &[0xc2, 0x04, 0x00],
+                setup: |m| m[0x100..0x102].copy_from_slice(&0x0100u16.to_le_bytes()),
+                gpr: [0, 0, 0, 64, 262, 0, 0, 0],
+                cs: 0x0,
+                eflags: 0xa02,
+                eip: 0x100,
+                deltas: &[],
+                fetch: 4,
+            },
+            ControlFlowGolden {
+                name: "retf (cb, pop 0x0100:0x3000)",
+                code: &[0xcb],
+                setup: |m| {
+                    m[0x100..0x102].copy_from_slice(&0x0100u16.to_le_bytes());
+                    m[0x102..0x104].copy_from_slice(&0x3000u16.to_le_bytes());
+                },
+                gpr: [0, 0, 0, 64, 260, 0, 0, 0],
+                cs: 0x3000,
+                eflags: 0xa02,
+                eip: 0x100,
+                deltas: &[],
+                fetch: 2,
+            },
+            ControlFlowGolden {
+                name: "ff /0 inc word [bx] (0x0080 -> 0x0081)",
+                code: &[0xff, 0x07],
+                setup: |m| m[0x40..0x42].copy_from_slice(&0x0080u16.to_le_bytes()),
+                gpr: [0, 0, 0, 64, 256, 0, 0, 0],
+                cs: 0x0,
+                eflags: 0x206,
+                eip: 0x2,
+                deltas: &[(64, 129)],
+                fetch: 3,
+            },
+            ControlFlowGolden {
+                name: "ff /1 dec word [bx] (0x0080 -> 0x007f)",
+                code: &[0xff, 0x0f],
+                setup: |m| m[0x40..0x42].copy_from_slice(&0x0080u16.to_le_bytes()),
+                gpr: [0, 0, 0, 64, 256, 0, 0, 0],
+                cs: 0x0,
+                eflags: 0x212,
+                eip: 0x2,
+                deltas: &[(64, 127)],
+                fetch: 3,
+            },
+            ControlFlowGolden {
+                name: "ff /6 push word [bx] (push 0x0080)",
+                code: &[0xff, 0x37],
+                setup: |m| m[0x40..0x42].copy_from_slice(&0x0080u16.to_le_bytes()),
+                gpr: [0, 0, 0, 64, 254, 0, 0, 0],
+                cs: 0x0,
+                eflags: 0xa02,
+                eip: 0x2,
+                deltas: &[(254, 128)],
+                fetch: 3,
+            },
+            ControlFlowGolden {
+                name: "ff /2 call near [bx] (push return 2, jump 0x0080)",
+                code: &[0xff, 0x17],
+                setup: |m| m[0x40..0x42].copy_from_slice(&0x0080u16.to_le_bytes()),
+                gpr: [0, 0, 0, 64, 254, 0, 0, 0],
+                cs: 0x0,
+                eflags: 0xa02,
+                eip: 0x80,
+                deltas: &[(254, 2)],
+                fetch: 3,
+            },
+            ControlFlowGolden {
+                name: "ff /4 jmp near [bx] (jump 0x0080, nothing pushed)",
+                code: &[0xff, 0x27],
+                setup: |m| m[0x40..0x42].copy_from_slice(&0x0080u16.to_le_bytes()),
+                gpr: [0, 0, 0, 64, 256, 0, 0, 0],
+                cs: 0x0,
+                eflags: 0xa02,
+                eip: 0x80,
+                deltas: &[],
+                fetch: 3,
+            },
+            ControlFlowGolden {
+                name: "call far 0x3000:0x0100 (9a, push cs:ip)",
+                code: &[0x9a, 0x00, 0x01, 0x00, 0x30],
+                setup: |_m| {},
+                gpr: [0, 0, 0, 64, 252, 0, 0, 0],
+                cs: 0x3000,
+                eflags: 0xa02,
+                eip: 0x100,
+                deltas: &[(252, 5)],
+                fetch: 6,
+            },
+            ControlFlowGolden {
+                name: "jmp far 0x3000:0x0100 (ea, nothing pushed)",
+                code: &[0xea, 0x00, 0x01, 0x00, 0x30],
+                setup: |_m| {},
+                gpr: [0, 0, 0, 64, 256, 0, 0, 0],
+                cs: 0x3000,
+                eflags: 0xa02,
+                eip: 0x100,
+                deltas: &[],
+                fetch: 6,
+            },
+            ControlFlowGolden {
+                name: "int3 (cc, ivt[3] -> 0000:0040)",
+                code: &[0xcc],
+                setup: |m| m[12..14].copy_from_slice(&0x0040u16.to_le_bytes()),
+                gpr: [0, 0, 0, 64, 250, 0, 0, 0],
+                cs: 0x0,
+                eflags: 0x802,
+                eip: 0x40,
+                deltas: &[(250, 1), (254, 2), (255, 10)],
+                fetch: 2,
+            },
+            ControlFlowGolden {
+                name: "int 0x21 (cd 21, ivt[0x21] -> 0000:0050)",
+                code: &[0xcd, 0x21],
+                setup: |m| m[0x84..0x86].copy_from_slice(&0x0050u16.to_le_bytes()),
+                gpr: [0, 0, 0, 64, 250, 0, 0, 0],
+                cs: 0x0,
+                eflags: 0x802,
+                eip: 0x50,
+                deltas: &[(250, 2), (254, 2), (255, 10)],
+                fetch: 3,
+            },
+            ControlFlowGolden {
+                name: "into with OF set (ce, ivt[4] -> 0000:0060)",
+                code: &[0xce],
+                setup: |m| m[16..18].copy_from_slice(&0x0060u16.to_le_bytes()),
+                gpr: [0, 0, 0, 64, 250, 0, 0, 0],
+                cs: 0x0,
+                eflags: 0x802,
+                eip: 0x60,
+                deltas: &[(250, 1), (254, 2), (255, 10)],
+                fetch: 2,
+            },
+            ControlFlowGolden {
+                name: "iret (cf, restore 0000:0100 flags 0x0202)",
+                code: &[0xcf],
+                setup: |m| {
+                    m[0x100..0x102].copy_from_slice(&0x0100u16.to_le_bytes());
+                    m[0x102..0x104].copy_from_slice(&0x0000u16.to_le_bytes());
+                    m[0x104..0x106].copy_from_slice(&0x0202u16.to_le_bytes());
+                },
+                gpr: [0, 0, 0, 64, 262, 0, 0, 0],
+                cs: 0x0,
+                eflags: 0x202,
+                eip: 0x100,
+                deltas: &[],
+                fetch: 2,
+            },
+        ]
+    }
+
+    #[test]
+    fn controlflow_split_matches_golden_across_ops() {
+        // The far/indirect/RET/INT control-flow block + 0xff group 5 is converted to the decode/
+        // execute split, so its fused arms are deleted and it can no longer be diffed against a fused
+        // executor in-tree. Run each case through cycle() (the split) and assert the architectural
+        // end-state against goldens captured from the pre-split fused path via
+        // `regen_controlflow_goldens`. eip is the branch/return/vector target; cs proves RETF / the
+        // far-direct / INT deliveries reloaded the segment; the memory deltas prove CALL/PUSH/INT
+        // pushed (and INC/DEC wrote) the right bytes; the fetch count proves decode charged each
+        // instruction byte exactly once.
+        for g in controlflow_golden_cases() {
+            let mut mem = vec![0u8; 0x200];
+            mem[..g.code.len()].copy_from_slice(g.code);
+            (g.setup)(&mut mem);
+            let initial = mem.clone();
+
+            let mut split = Cpu386::default();
+            controlflow_seed(&mut split);
+            let mut sbus = TestBus::with_memory(mem);
+            split.cycle(&mut sbus).unwrap();
+
+            assert_eq!(split.registers.gpr, g.gpr, "gpr mismatch for {}", g.name);
+            assert_eq!(
+                split.registers.cs().selector,
+                g.cs,
+                "cs mismatch for {}",
+                g.name
+            );
+            assert_eq!(
+                split.registers.eflags, g.eflags,
+                "eflags mismatch for {}",
+                g.name
+            );
+            assert_eq!(split.registers.eip, g.eip, "eip mismatch for {}", g.name);
+            let deltas: Vec<(usize, u8)> = sbus
+                .memory
+                .iter()
+                .enumerate()
+                .filter(|(i, b)| **b != initial[*i])
+                .map(|(i, b)| (i, *b))
+                .collect();
+            assert_eq!(deltas, g.deltas, "memory-write mismatch for {}", g.name);
+            assert_eq!(
+                seam_fetch_count(&sbus),
+                g.fetch,
+                "instruction-fetch cycle count mismatch for {} (seam must charge fetches once)",
+                g.name
+            );
+        }
+    }
+
+    /// Regenerate `controlflow_golden_cases` from the fused reference. Ignored by default. The
+    /// control-flow fused arms are already deleted on `perf-decode-cache`, so run this from the
+    /// pre-split base commit (HEAD before A6b, dc1cf4e2) where they still exist:
+    ///   git worktree add ../regen dc1cf4e2 && cd ../regen
+    ///   cargo test -p izarravm-cpu --lib regen_controlflow_goldens -- --ignored --nocapture
+    /// then paste the output over `controlflow_golden_cases`, return to the branch, and only then
+    /// trust it. (Copy this test body + the struct/seed into the throwaway worktree if the fused
+    /// base predates them.)
+    #[test]
+    #[ignore = "prints golden literals; run with --ignored --nocapture against the fused reference"]
+    fn regen_controlflow_goldens() {
+        for g in controlflow_golden_cases() {
+            let mut mem = vec![0u8; 0x200];
+            mem[..g.code.len()].copy_from_slice(g.code);
+            (g.setup)(&mut mem);
+            let initial = mem.clone();
+
+            let mut fused = Cpu386::default();
+            controlflow_seed(&mut fused);
+            let mut fbus = TestBus::with_memory(mem);
+            fused.begin_instruction();
+            if fused.execute_instruction_legacy(&mut fbus).is_err() {
+                println!(
+                    "            // TODO regen {}: fused path unavailable here; run against the base commit",
+                    g.name
+                );
+                continue;
+            }
+            let deltas: Vec<(usize, u8)> = fbus
+                .memory
+                .iter()
+                .enumerate()
+                .filter(|(i, b)| **b != initial[*i])
+                .map(|(i, b)| (i, *b))
+                .collect();
+            let fetch = seam_fetch_count(&fbus);
+            println!(
+                "            // {}\n            gpr: {:?}, cs: {:#x}, eflags: {:#x}, eip: {:#x}, deltas: &{:?}, fetch: {},",
+                g.name,
+                fused.registers.gpr,
+                fused.registers.cs().selector,
+                fused.registers.eflags,
+                fused.registers.eip,
+                deltas,
+                fetch,
+            );
+        }
+    }
+
+    /// FF /7 is an undefined group-5 encoding and must raise the group-opcode error (which the
+    /// emulator maps to #UD), not silently execute. Drive it through the split and assert the error.
+    #[test]
+    fn controlflow_ff_ext7_is_undefined() {
+        // 0xff 0x3f: mod=00 reg=111 rm=111 -> group 5 /7 with a memory r/m. The /7 extension is
+        // undefined regardless of the addressing form.
+        let (mut cpu, memory) = real_mode_cpu(&[0xff, 0x3f], 0x100);
+        let mut bus = TestBus::with_memory(memory);
+        let err = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                InternalFault::Cpu(CpuError::UnsupportedGroupOpcode {
+                    opcode: 0xff,
+                    extension: 7
+                })
+            ),
+            "FF /7 must raise the undefined group-opcode error, got {err:?}"
+        );
     }
 }
