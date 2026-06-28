@@ -788,12 +788,12 @@ enum DecodeGroup {
     /// The ALU block: ADD/OR/ADC/SBB/AND/SUB/XOR/CMP across forms 0-5
     /// (`opcode < 0x40 && (opcode & 7) < 6`).
     Alu,
-    /// The single-byte data-movement block: MOV r/m<->reg (0x88-0x8b), MOV r/m<->Sreg (0x8c/0x8e),
+    /// The data-movement block: MOV r/m<->reg (0x88-0x8b), MOV r/m<->Sreg (0x8c/0x8e),
     /// LEA (0x8d), MOV (E)AX<->moffs (0xa0-0xa3), MOV r,imm (0xb0-0xbf), MOV r/m,imm group 11
-    /// (0xc6/0xc7), XCHG r/m,reg (0x86/0x87), and XCHG reg,(E)AX (0x90-0x97; 0x90 is NOP). The
-    /// two-byte MOVZX/MOVSX (0F B6/B7/BE/BF) stay on `Fallback`: `decode` reads only one opcode byte
-    /// (so `insn.opcode` is 0x0f for every two-byte form), and the single-byte ALU/data-move pattern
-    /// established no convention for representing or pre-parsing the second opcode byte.
+    /// (0xc6/0xc7), XCHG r/m,reg (0x86/0x87), XCHG reg,(E)AX (0x90-0x97; 0x90 is NOP), and the
+    /// two-byte MOVZX/MOVSX (0F B6/B7/BE/BF). The 0F forms join here now that the two-byte decode
+    /// convention exists: `decode` folds the second opcode byte into `insn.opcode` as 0x0F00 |
+    /// second, so `route_group` can classify them and the executor can pre-parse their ModRM.
     DataMove,
     /// Not yet converted to the split: decode parses nothing extra and `execute_decoded` hands the
     /// opcode to the shared fused `dispatch_opcode`.
@@ -1099,6 +1099,17 @@ impl Cpu386 {
     /// lives in exactly one place. `prefixes` is taken (unused for the ALU group) because future
     /// groups route on it (e.g. the 0x0F two-byte map, or operand-size-sensitive forms).
     fn route_group(opcode: u16, _prefixes: Prefixes) -> DecodeGroup {
+        // Two-byte (0F) map. `decode` folds the second byte into `opcode` as 0x0F00 | second, so a
+        // 0F opcode is classified by its low byte. MOVZX/MOVSX (0F B6/B7/BE/BF) are data movement
+        // and run through the split; every other 0F opcode stays on `Fallback` (the un-converted
+        // fused `execute_two_byte`). Handled first so the single-byte predicates below never see a
+        // 0F-high-byte value.
+        if opcode & 0xff00 == 0x0f00 {
+            return match opcode & 0xff {
+                0xb6 | 0xb7 | 0xbe | 0xbf => DecodeGroup::DataMove,
+                _ => DecodeGroup::Fallback,
+            };
+        }
         // ALU block: ADD/OR/ADC/SBB/AND/SUB/XOR/CMP, forms 0-5 (`op = (opcode>>3)&7`,
         // `form = opcode & 7`; forms 6/7 are the segment PUSH/POP and are NOT ALU).
         if opcode < 0x40 && (opcode & 0x07) < 6 {
@@ -1144,10 +1155,27 @@ impl Cpu386 {
         let prefixes = self.read_prefixes(bus)?;
         let opcode = self.fetch_u8(bus)?;
         if prefixes.lock {
+            // The LOCK check runs on the first opcode byte and peeks (does not consume) the byte
+            // after it — for 0F that peek is the second opcode byte, so it must happen before the
+            // second-byte fetch below, exactly as the fused path ordered it.
             self.check_lock_target(bus, opcode)?;
         }
         let operand_size = self.operand_size(prefixes);
         let address_size = self.address_size(prefixes);
+
+        // The two-byte (0F) decode convention. When the first byte is 0F, read the second byte
+        // here — charging its instruction-fetch exactly once — and fold it into `insn.opcode` as
+        // `0x0F00 | second`. Every later 0F group routes on this combined value, and the fused
+        // fallback (`execute_two_byte`) consumes the second byte from `insn.opcode as u8` rather
+        // than re-reading it. The 286/586 ISA #UD gates apply once, right after the read (matching
+        // the point the fused path faulted), with the firmware-ROM exemption preserved.
+        let opcode = if opcode == 0x0f {
+            let second = self.fetch_u8(bus)?;
+            self.check_two_byte_isa_gate(second)?;
+            0x0f00u16 | u16::from(second)
+        } else {
+            u16::from(opcode)
+        };
 
         let mut insn = DecodedInsn {
             start_eip,
@@ -1161,7 +1189,7 @@ impl Cpu386 {
                 wait_states: 0,
             },
             prefixes,
-            opcode: u16::from(opcode),
+            opcode,
             operand_size,
             address_size,
             modrm: None,
@@ -1191,12 +1219,15 @@ impl Cpu386 {
                 }
             }
             DecodeGroup::DataMove => {
-                // Single-byte data-movement block. The arms split three ways by how the operand is
-                // encoded; the byte budget each consumes here is what the executor must NOT re-fetch.
+                // Data-movement block. The arms split by how the operand is encoded; the byte
+                // budget each consumes here is what the executor must NOT re-fetch. The 0F
+                // MOVZX/MOVSX forms (0x0Fb6/b7/be/bf) carry a plain ModRM, like the single-byte
+                // ModRM forms below.
                 match opcode {
-                    // ModRM r/m forms: MOV r/m<->reg/Sreg, LEA, XCHG r/m. Parse the ModRM + its
-                    // addressing-mode descriptor (instruction bytes only, so it stays cacheable).
-                    0x86..=0x8e => {
+                    // ModRM r/m forms: MOV r/m<->reg/Sreg, LEA, XCHG r/m (single byte) and
+                    // MOVZX/MOVSX (two byte). Parse the ModRM + its addressing-mode descriptor
+                    // (instruction bytes only, so it stays cacheable).
+                    0x86..=0x8e | 0x0fb6 | 0x0fb7 | 0x0fbe | 0x0fbf => {
                         let modrm = self.fetch_modrm(bus)?;
                         let operand =
                             self.parse_addressing_mode(bus, prefixes, address_size, modrm)?;
@@ -1279,6 +1310,19 @@ impl Cpu386 {
             // The single-byte data-movement block runs through its split executor, consuming the
             // ModRM/operand/immediate `decode` pre-parsed.
             DecodeGroup::DataMove => self.execute_datamove_decoded(insn, bus),
+            DecodeGroup::Fallback if insn.opcode & 0xff00 == 0x0f00 => {
+                // Un-converted two-byte (0F) opcode. `decode` already read + charged the second
+                // byte and applied the ISA gate, folding it into `insn.opcode` as 0x0F00 | second.
+                // Hand the second byte to `execute_two_byte`, which re-reads only this opcode's
+                // ModRM/immediate from the post-second-byte eip (the second byte is never re-read).
+                self.execute_two_byte(
+                    bus,
+                    insn.opcode as u8,
+                    insn.prefixes,
+                    insn.address_size,
+                    insn.operand_size,
+                )
+            }
             DecodeGroup::Fallback => {
                 // Fallback: `decode` already read the prefixes + opcode and ran the LOCK check,
                 // leaving eip just past the opcode. Continue into the shared dispatch from there,
@@ -1397,19 +1441,58 @@ impl Cpu386 {
         Ok(clocks(2))
     }
 
-    /// The single-byte data-movement block (MOV/LEA/XCHG and their immediate/moffs/Sreg forms)
-    /// through the decode/execute split. Each arm mirrors the former fused handler verbatim — same
-    /// operand wiring, same segment-load path for 0x8e, same XCHG read/write order, same clocks —
-    /// but consumes the ModRM/operand/immediate `decode` already parsed (so the executor never
-    /// re-fetches an instruction byte). Memory operands resolve from the pre-decoded descriptor, so
-    /// the effective address is recomputed against the live registers each call.
+    /// The data-movement block (MOV/LEA/XCHG and their immediate/moffs/Sreg forms, plus the two-byte
+    /// MOVZX/MOVSX) through the decode/execute split. Each arm mirrors the former fused handler
+    /// verbatim — same operand wiring, same segment-load path for 0x8e, same XCHG read/write order,
+    /// same clocks — but consumes the ModRM/operand/immediate `decode` already parsed (so the
+    /// executor never re-fetches an instruction byte). Memory operands resolve from the pre-decoded
+    /// descriptor, so the effective address is recomputed against the live registers each call.
     fn execute_datamove_decoded<B: CpuBus>(
         &mut self,
         insn: &DecodedInsn,
         bus: &mut B,
     ) -> ExecResult<CycleOutcome> {
-        let opcode = insn.opcode as u8;
         let operand_size = insn.operand_size;
+
+        // Two-byte forms first: `insn.opcode as u8` below would alias 0x0Fb6/b7/be/bf onto the
+        // single-byte MOV r,imm opcodes (0xb6/b7/be/bf), so the 0F forms must be dispatched off the
+        // full u16. MOVZX zero-extends, MOVSX sign-extends, an 8- or 16-bit source into the
+        // destination register at the operand size; none touch flags. Same clocks (3) and operand
+        // wiring as the former `execute_two_byte` arms, but from the pre-decoded operand.
+        match insn.opcode {
+            0x0fb6 => {
+                // MOVZX r, r/m8: zero-extend the byte into the destination at the operand width.
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let value = u32::from(self.read_operand_u8(bus, operand)?);
+                self.write_gpr_sized(modrm.reg, operand_size, value);
+                return Ok(clocks(3));
+            }
+            0x0fb7 => {
+                // MOVZX r, r/m16: zero-extend the word into the destination.
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let value = self.read_operand_sized(bus, operand, OperandSize::Word)?;
+                self.write_gpr_sized(modrm.reg, operand_size, value);
+                return Ok(clocks(3));
+            }
+            0x0fbe => {
+                // MOVSX r, r/m8: sign-extend the byte into the destination.
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let value = sign_extend_u8(self.read_operand_u8(bus, operand)?);
+                self.write_gpr_sized(modrm.reg, operand_size, value);
+                return Ok(clocks(3));
+            }
+            0x0fbf => {
+                // MOVSX r, r/m16: sign-extend the word into the destination.
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let value =
+                    self.read_operand_sized(bus, operand, OperandSize::Word)? as i16 as i32 as u32;
+                self.write_gpr_sized(modrm.reg, operand_size, value);
+                return Ok(clocks(3));
+            }
+            _ => {}
+        }
+
+        let opcode = insn.opcode as u8;
 
         match opcode {
             0x86 => {
@@ -2757,7 +2840,21 @@ impl Cpu386 {
                 self.set_szp(u32::from(result), BusWidth::Byte);
                 Ok(clocks(19))
             }
-            0x0f => self.execute_two_byte(bus, prefixes, address_size, operand_size),
+            0x0f => {
+                // The two-byte opcode was folded into `opcode` (0x0F00 | second) by `decode`,
+                // which already read + charged the second byte and applied the ISA gate. The
+                // un-converted 0F opcodes still dispatch through `execute_two_byte`; pass the
+                // second byte through `opcode` rather than re-reading it.
+                //
+                // (Unreachable on the `cycle` path today: every `0x0F00 | second` value enters
+                // `dispatch_opcode` only via the `Fallback` route, where `decode` already replaced
+                // the first byte with the combined value, so `opcode` here is never the bare 0x0F.
+                // Retained for the transitional `execute_instruction_legacy` reference, which reads
+                // a single byte and so reaches this arm with the bare 0x0F first byte.)
+                let second = self.fetch_u8(bus)?;
+                self.check_two_byte_isa_gate(second)?;
+                self.execute_two_byte(bus, second, prefixes, address_size, operand_size)
+            }
             _ => Err(CpuError::UnsupportedOpcode {
                 opcode,
                 cs: self.registers.cs().selector,
@@ -2767,41 +2864,46 @@ impl Cpu386 {
         }
     }
 
-    fn execute_two_byte<B: CpuBus>(
-        &mut self,
-        bus: &mut B,
-        prefixes: Prefixes,
-        address_size: AddressSize,
-        operand_size: OperandSize,
-    ) -> ExecResult<CycleOutcome> {
-        let opcode = self.fetch_u8(bus)?;
-        // Guest-level ISA gate for the 0F-extended group. At the 286 level the core
-        // raises #UD for every 0F opcode the 386 (and later) introduced that it
-        // otherwise executes: MOVZX/MOVSX, BT/BTS/BTR/BTC, BSF/BSR, SHLD/SHRD,
-        // SETcc, the 0F-form IMUL and Jcc, MOV to/from CR, and the 486 additions
-        // (INVD/WBINVD, CMPXCHG, XADD, BSWAP). The 286-era 0F opcodes the core
-        // supports (0F 01 LGDT/LIDT) stay allowed. CPUID is gated separately below
-        // because it is absent on both the 286 and the 386. Code fetched from the
-        // BIOS ROM is exempt (see cs_in_firmware_rom), so the gate only ever holds
-        // guest code that selected a lower GSW mode.
-        if self.level.is_pre_386() && !self.cs_in_firmware_rom() && is_386plus_two_byte(opcode) {
-            return Err(InternalFault::Exception {
-                vector: 6,
-                error_code: None,
-            });
+    /// The guest-level ISA #UD gate for the whole 0F-extended group. At the 286 level the core
+    /// raises #UD for every 0F opcode the 386 (and later) introduced that it otherwise executes:
+    /// MOVZX/MOVSX, BT/BTS/BTR/BTC, BSF/BSR, SHLD/SHRD, SETcc, the 0F-form IMUL and Jcc, MOV
+    /// to/from CR, and the 486 additions (INVD/WBINVD, CMPXCHG, XADD, BSWAP). The 286-era 0F
+    /// opcodes the core supports (0F 01 LGDT/LIDT) stay allowed. CPUID is gated separately because
+    /// it is absent on both the 286 and the 386. The 586-class additions (RDTSC, RDMSR/WRMSR,
+    /// CMOVcc, CMPXCHG8B, SYSCALL/SYSRET, RSM) #UD when the guest has throttled below the 586
+    /// level. Code fetched from the BIOS ROM is exempt (see `cs_in_firmware_rom`), so the gate only
+    /// ever holds guest code that selected a lower GSW mode.
+    ///
+    /// `decode` applies this once, right after reading the second 0F byte — the same logical point
+    /// (and eip) the fused path faulted at — so both the converted split path and the un-converted
+    /// fused fallback share a single gate.
+    fn check_two_byte_isa_gate(&self, second: u8) -> ExecResult<()> {
+        if self.cs_in_firmware_rom() {
+            return Ok(());
         }
-        // The 586-class additions (RDTSC, RDMSR/WRMSR, CMOVcc, CMPXCHG8B, SYSCALL/SYSRET,
-        // RSM) raise #UD when the guest has throttled below the 586 level, the same way
-        // CPUID is gated. Firmware running from ROM is exempt.
-        if !self.level.has_pentium_isa()
-            && !self.cs_in_firmware_rom()
-            && is_586plus_two_byte(opcode)
+        if (self.level.is_pre_386() && is_386plus_two_byte(second))
+            || (!self.level.has_pentium_isa() && is_586plus_two_byte(second))
         {
             return Err(InternalFault::Exception {
                 vector: 6,
                 error_code: None,
             });
         }
+        Ok(())
+    }
+
+    /// Execute an un-converted 0F (two-byte) opcode. `second` is the second opcode byte that
+    /// `decode` (or, for the fused reference, the `0x0F` dispatch arm) already read + charged and
+    /// gated; this never re-reads it. Converted 0F groups (MOVZX/MOVSX) bypass this entirely via
+    /// `route_group`/`execute_decoded`.
+    fn execute_two_byte<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        opcode: u8,
+        prefixes: Prefixes,
+        address_size: AddressSize,
+        operand_size: OperandSize,
+    ) -> ExecResult<CycleOutcome> {
         match opcode {
             // Limit: MMX is not gated to 586+; a throttled 386/486 GSW mode would
             // wrongly accept it. Gate it with the others if that fidelity gap matters.
@@ -2982,39 +3084,8 @@ impl Cpu386 {
                 self.write_operand_u8(bus, operand, u8::from(set))?;
                 Ok(clocks(4))
             }
-            0xb6 => {
-                // MOVZX r, r/m8: zero-extend the byte into the destination at the operand width.
-                let modrm = self.fetch_modrm(bus)?;
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                let value = u32::from(self.read_operand_u8(bus, operand)?);
-                self.write_gpr_sized(modrm.reg, operand_size, value);
-                Ok(clocks(3))
-            }
-            0xb7 => {
-                // MOVZX r, r/m16: zero-extend the word into the destination.
-                let modrm = self.fetch_modrm(bus)?;
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                let value = self.read_operand_sized(bus, operand, OperandSize::Word)?;
-                self.write_gpr_sized(modrm.reg, operand_size, value);
-                Ok(clocks(3))
-            }
-            0xbe => {
-                // MOVSX r, r/m8: sign-extend the byte into the destination.
-                let modrm = self.fetch_modrm(bus)?;
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                let value = sign_extend_u8(self.read_operand_u8(bus, operand)?);
-                self.write_gpr_sized(modrm.reg, operand_size, value);
-                Ok(clocks(3))
-            }
-            0xbf => {
-                // MOVSX r, r/m16: sign-extend the word into the destination.
-                let modrm = self.fetch_modrm(bus)?;
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                let value =
-                    self.read_operand_sized(bus, operand, OperandSize::Word)? as i16 as i32 as u32;
-                self.write_gpr_sized(modrm.reg, operand_size, value);
-                Ok(clocks(3))
-            }
+            // MOVZX/MOVSX (0F B6/B7/BE/BF) are converted to the decode/execute split; they route
+            // through `DecodeGroup::DataMove` and `execute_datamove_decoded`, never reaching here.
             0xaf => {
                 // IMUL r, r/m: two-operand signed multiply into the reg destination.
                 let modrm = self.fetch_modrm(bus)?;
@@ -13239,10 +13310,75 @@ mod tests {
         cpu.load_segment_real(SegmentIndex::Cs, 0xF000);
         cpu.load_segment_real(SegmentIndex::Ds, 0);
         cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Bx, 0x0042);
         let mut bus = TestBus::with_memory(memory);
+        // Drive through the split (MOVZX is a converted group now); the firmware-ROM exemption to
+        // the 286 ISA gate lives in `decode`, which `exec_one_split` exercises. Confirm the op truly
+        // ran (AX = zero-extended BL) rather than merely not faulting.
         assert!(
-            cpu.execute_instruction_legacy(&mut bus).is_ok(),
+            exec_one_split(&mut cpu, &mut bus).is_ok(),
             "MOVZX fetched from BIOS ROM must run even at I286"
+        );
+        assert_eq!(
+            cpu.read_reg16(Reg16::Ax),
+            0x0042,
+            "MOVZX must have zero-extended BL into AX"
+        );
+    }
+
+    #[test]
+    fn unconverted_two_byte_opcode_matches_the_fused_reference_after_the_convention() {
+        // RDTSC (0F 31) is NOT converted: it stays on the Fallback path. After the two-byte decode
+        // convention landed it must still execute identically to the fused reference — decode folds
+        // the second byte into insn.opcode and the Fallback arm hands it to execute_two_byte without
+        // re-reading it. Diff the split path against execute_instruction_legacy (both un-converted,
+        // so both still run RDTSC) for register/eip equality AND identical InstructionPrefetch
+        // counts: a second-byte double-charge in the convention would drift the fetch count here.
+        let code = [0x0f, 0x31];
+        let mut mem = vec![0u8; 64];
+        mem[..code.len()].copy_from_slice(&code);
+
+        let mut fused = Cpu386::default();
+        fused.load_segment_real(SegmentIndex::Cs, 0);
+        fused.registers.eip = 0;
+        let mut fbus = TestBus::with_memory(mem.clone());
+        fused.begin_instruction();
+        fused
+            .execute_instruction_legacy(&mut fbus)
+            .expect("RDTSC must run on the fused reference");
+
+        let mut split = Cpu386::default();
+        split.load_segment_real(SegmentIndex::Cs, 0);
+        split.registers.eip = 0;
+        let mut sbus = TestBus::with_memory(mem);
+        exec_one_split(&mut split, &mut sbus).expect("RDTSC must run through the split convention");
+
+        assert_eq!(split.registers.eip, fused.registers.eip, "eip must match");
+        assert_eq!(split.registers.gpr, fused.registers.gpr, "gpr must match");
+        assert_eq!(
+            seam_fetch_count(&sbus),
+            seam_fetch_count(&fbus),
+            "the convention must charge the same fetches as the fused path (no second-byte re-read)"
+        );
+    }
+
+    #[test]
+    fn throttled_286_raises_ud_for_an_unconverted_two_byte_opcode_via_the_new_gate() {
+        // BSWAP EAX (0F C8) is a 486 addition and stays on Fallback. The ISA gate that #UDs it at
+        // the 286 level now lives in `decode` (the shared convention point), not in execute_two_byte.
+        // Proving an *un-converted* 0F op still #UDs confirms the gate did not get tied to the one
+        // converted group.
+        let code = [0x0f, 0xc8];
+        assert!(
+            matches!(
+                run_at_level(&code, CpuLevel::I286).unwrap_err(),
+                InternalFault::Exception { vector: 6, .. }
+            ),
+            "BSWAP must #UD at I286 through the new gate location"
+        );
+        assert!(
+            run_at_level(&code, CpuLevel::I486).is_ok(),
+            "BSWAP must run at I486"
         );
     }
 
@@ -14163,6 +14299,187 @@ mod tests {
             let fetch = seam_fetch_count(&fbus);
             println!(
                 "            DataMoveGolden {{ name: {:?}, code: &{:?}, gpr: {:?}, eflags: {:#x}, eip: {:#x}, deltas: &{:?}, fetch: {} }},",
+                g.name,
+                g.code,
+                fused.registers.gpr,
+                fused.registers.eflags,
+                fused.registers.eip,
+                deltas,
+                fetch,
+            );
+        }
+    }
+
+    /// One golden end-state for a MOVZX/MOVSX case run from `movzx_seed` (a real-mode register set
+    /// with sentinel bytes/words in memory). The opcode bytes plus expected end gpr, eflags
+    /// (MOVZX/MOVSX never touch flags, so this must stay the seed's `0x02`), eip, memory writes
+    /// (always empty — these are pure loads), and InstructionPrefetch fetch count. Captured from the
+    /// PRIOR fused reference via `regen_movzx_movsx_goldens`; see `alu_golden_cases` for the recipe.
+    struct MovzxMovsxGolden {
+        name: &'static str,
+        code: &'static [u8],
+        gpr: [u32; 8],
+        eflags: u32,
+        eip: u32,
+        deltas: &'static [(usize, u8)],
+        fetch: usize,
+    }
+
+    /// Seed for the MOVZX/MOVSX battery. Same register set as `seam_seed`, but it also plants
+    /// sentinels so the byte/word, sign/zero, and EA-recompute cases have stable, sign-bit-set
+    /// sources: byte 0x80 at [0x10] (= [BX]), word 0x8081 at [0x18] (= [BX+SI], BX=0x10 + SI=0x08),
+    /// and word 0xBEEF at [0x20] (the direct-disp source). The 0x80/0x8081/0xBEEF high bits make
+    /// zero- vs sign-extension visibly different.
+    fn movzx_seed(cpu: &mut Cpu386, mem: &mut [u8]) {
+        seam_seed(cpu);
+        mem[0x10] = 0x80;
+        mem[0x18..0x1a].copy_from_slice(&0x8081u16.to_le_bytes());
+        mem[0x20..0x22].copy_from_slice(&0xBEEFu16.to_le_bytes());
+    }
+
+    /// The MOVZX/MOVSX differential battery: 0F B6/B7 (zero-extend byte/word) and 0F BE/BF
+    /// (sign-extend byte/word), each in a register form and a memory form, plus an EA-recompute
+    /// case ([BX+SI], resolved against the live registers in the executor). Goldens captured from
+    /// the fused reference (`execute_instruction_legacy`); never edit by hand — re-run the regen.
+    fn movzx_movsx_golden_cases() -> &'static [MovzxMovsxGolden] {
+        &[
+            // MOVZX r16, r/m8 (0F B6): zero-extend a byte. BL = low byte of BX(0x10) = 0x10.
+            MovzxMovsxGolden {
+                name: "movzx ax, bl(reg)",
+                code: &[15, 182, 195],
+                gpr: [16, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+            },
+            // byte [BX] = [0x10] = 0x80, zero-extended to 0x0080 (= 128).
+            MovzxMovsxGolden {
+                name: "movzx ax, [bx](byte, sign bit set)",
+                code: &[15, 182, 7],
+                gpr: [128, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+            },
+            // MOVZX r16, r/m16 (0F B7): word [0x20] = 0xBEEF, zero-extended (= 48879).
+            MovzxMovsxGolden {
+                name: "movzx cx, [0x20](word)",
+                code: &[15, 183, 14, 32, 0],
+                gpr: [258, 48879, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x5,
+                deltas: &[],
+                fetch: 6,
+            },
+            // MOVSX r16, r/m8 (0F BE): byte [BX] = 0x80, sign-extended to 0xFF80 (= 65408).
+            MovzxMovsxGolden {
+                name: "movsx dx, [bx](byte, sign bit set)",
+                code: &[15, 190, 23],
+                gpr: [258, 772, 65408, 16, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+            },
+            // DL = low byte of DX(0x0506) = 0x06, positive, sign-extends to 0x0006 (= 6).
+            MovzxMovsxGolden {
+                name: "movsx ax, dl(reg, positive byte)",
+                code: &[15, 190, 194],
+                gpr: [6, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+            },
+            // MOVSX r16, r/m16 (0F BF), EA recomputed from live BX+SI = 0x18; word [0x18] = 0x8081,
+            // sign-extended stays 0x8081 at 16 bits (= 32897).
+            MovzxMovsxGolden {
+                name: "movsx ax, [bx+si](word, sign bit set)",
+                code: &[15, 191, 0],
+                gpr: [32897, 772, 1286, 16, 0, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+            },
+        ]
+    }
+
+    #[test]
+    fn movzx_movsx_split_matches_golden() {
+        // MOVZX/MOVSX (0F B6/B7/BE/BF) are converted to the split, so they can no longer be diffed
+        // against a fused executor (that arm was deleted). Run each through cycle() and assert the
+        // architectural end-state against goldens captured from the pre-split fused path. Covers
+        // byte and word sources, zero vs sign extend, reg and mem operands, and an EA-recompute
+        // case. MOVZX/MOVSX do not modify flags, so eflags must stay the seed value.
+        for g in movzx_movsx_golden_cases() {
+            let mut mem = vec![0u8; 0x200];
+            mem[..g.code.len()].copy_from_slice(g.code);
+            let mut split = Cpu386::default();
+            movzx_seed(&mut split, &mut mem);
+            let initial = mem.clone();
+            let mut sbus = TestBus::with_memory(mem);
+            split.cycle(&mut sbus).expect("movzx/movsx must execute");
+
+            assert_eq!(split.registers.gpr, g.gpr, "gpr mismatch for {}", g.name);
+            assert_eq!(
+                split.registers.eflags, g.eflags,
+                "eflags mismatch for {} (MOVZX/MOVSX must not touch flags)",
+                g.name
+            );
+            assert_eq!(split.registers.eip, g.eip, "eip mismatch for {}", g.name);
+            let deltas: Vec<(usize, u8)> = sbus
+                .memory
+                .iter()
+                .enumerate()
+                .filter(|(i, b)| **b != initial[*i])
+                .map(|(i, b)| (i, *b))
+                .collect();
+            assert_eq!(deltas, g.deltas, "memory-write mismatch for {}", g.name);
+            assert_eq!(
+                seam_fetch_count(&sbus),
+                g.fetch,
+                "instruction-fetch cycle count mismatch for {} (seam must charge fetches once)",
+                g.name
+            );
+        }
+    }
+
+    /// Regenerate the `movzx_movsx_golden_cases` literals from the PRIOR fused reference. Ignored by
+    /// default. Mirror of `regen_datamove_goldens`; run WHILE the MOVZX/MOVSX arms still exist in
+    /// `execute_two_byte`:
+    ///   cargo test -p izarravm-cpu --lib regen_movzx_movsx_goldens -- --ignored --nocapture
+    /// then paste the output over `movzx_movsx_golden_cases` and only then delete the fused arms.
+    #[test]
+    #[ignore = "prints golden literals; run with --ignored --nocapture against the fused reference"]
+    fn regen_movzx_movsx_goldens() {
+        for g in movzx_movsx_golden_cases() {
+            let mut mem = vec![0u8; 0x200];
+            mem[..g.code.len()].copy_from_slice(g.code);
+            let mut fused = Cpu386::default();
+            movzx_seed(&mut fused, &mut mem);
+            let initial = mem.clone();
+            let mut fbus = TestBus::with_memory(mem);
+            fused.begin_instruction();
+            if fused.execute_instruction_legacy(&mut fbus).is_err() {
+                println!(
+                    "            // TODO regen {}: fused path unavailable here; run before deleting the fused arms",
+                    g.name
+                );
+                continue;
+            }
+            let deltas: Vec<(usize, u8)> = fbus
+                .memory
+                .iter()
+                .enumerate()
+                .filter(|(i, b)| **b != initial[*i])
+                .map(|(i, b)| (i, *b))
+                .collect();
+            let fetch = seam_fetch_count(&fbus);
+            println!(
+                "            MovzxMovsxGolden {{ name: {:?}, code: &{:?}, gpr: {:?}, eflags: {:#x}, eip: {:#x}, deltas: &{:?}, fetch: {} }},",
                 g.name,
                 g.code,
                 fused.registers.gpr,
