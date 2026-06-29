@@ -4646,25 +4646,20 @@ impl Machine {
             return;
         }
         // Fixed disk (Katea ATA primary master): boot from LBA 0 if it carries a
-        // boot signature. The disk's own sector-0 code is the OS, so the HLE
-        // stands down on the DOS vectors (INT 13h stays intercepted, so Katea
-        // still serves disk I/O). DL=0x80 = booted from the first fixed disk.
-        let sector0 = self
+        // boot signature. Unlike the floppy path, INT 13h stays intercepted so
+        // Katea keeps serving disk I/O to the booted OS. DL=80h = first fixed disk.
+        if let Some(sector0) = self
             .ata
             .as_ref()
             .and_then(|d| d.read_lba(0))
-            .map(<[u8]>::to_vec);
-        if let Some(sector0) = sector0 {
-            if sector0.len() >= 512 && sector0[510] == 0x55 && sector0[511] == 0xAA {
-                self.write_guest_block(BOOT_SECTOR_ADDRESS as u32, &sector0[..512]);
-                self.cpu.registers.set_edx(0x80); // DL = 80h: booted from first fixed disk
-                // The disk's own sector-0 code is the OS now, so the HLE Toka-DOS
-                // and IZEMM stand down while INT 13h remains intercepted so Katea
-                // continues to serve disk I/O to the booted OS.
-                self.booter_inert = true;
-                self.set_cs_ip(0x0000, BOOT_SECTOR_ADDRESS as u16);
-                return;
-            }
+            .filter(|s| s.len() >= 512 && s[510] == 0x55 && s[511] == 0xAA)
+            .map(<[u8]>::to_vec)
+        {
+            self.write_guest_block(BOOT_SECTOR_ADDRESS as u32, &sector0[..512]);
+            self.cpu.registers.set_edx(0x80);
+            self.booter_inert = true;
+            self.set_cs_ip(0x0000, BOOT_SECTOR_ADDRESS as u16);
+            return;
         }
         // No bootable floppy: try the C: Toka-DOS HLE boot. A zero status means the
         // boot record landed at 0x7C00 and the DOS base is set up; jump to it.
@@ -20137,7 +20132,7 @@ mod tests {
         // disk's own sector-0 code, so the HLE Toka-DOS stands down exactly the
         // same way the floppy path does. DL=0x80 signals the first fixed disk.
         let mut m = int15_machine(16);
-        // Build a minimal 2-sector image with the 0x55AA boot signature.
+        // Build a minimal 4-sector image with the 0x55AA boot signature.
         let mut img = vec![0u8; 512 * 4];
         img[0] = 0xEB; // recognisable first byte
         img[510] = 0x55;
@@ -20158,6 +20153,27 @@ mod tests {
             m.read_physical_u8(BOOT_SECTOR_ADDRESS as u32),
             0xEB,
             "sector 0 byte 0 must land at 0x7C00"
+        );
+    }
+
+    #[test]
+    fn int19_skips_ata_without_boot_signature() {
+        // An ATA disk whose LBA 0 lacks the 0x55AA signature is not bootable: the
+        // ATA branch must fall through (to the C: HLE / int18 path) without copying
+        // sector 0 or standing the HLE down. Tasks 3-5 rely on this fall-through.
+        let mut m = int15_machine(16);
+        let mut img = vec![0u8; 512 * 4];
+        img[0] = 0xEB; // sentinel first byte, but NO 0x55AA signature
+        m.mount_hdd(img);
+        m.handle_int19();
+        assert!(
+            !m.booter_inert(),
+            "an unsigned ATA disk must not stand the HLE down"
+        );
+        assert_ne!(
+            m.read_physical_u8(BOOT_SECTOR_ADDRESS as u32),
+            0xEB,
+            "an unsigned ATA disk's sector 0 must not be copied to 0x7C00"
         );
     }
 
