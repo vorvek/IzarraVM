@@ -13,10 +13,6 @@ pub(crate) struct NameTable {
     map: Vec<([u8; 11], PathBuf)>, // folded 8.3 -> host path, insertion order
 }
 
-// Limit: built and tested standalone; the directory-tree builder that consumes
-// these methods lands in a later M1 task, so nothing references them from the
-// lib yet.
-#[allow(dead_code)]
 impl NameTable {
     pub(crate) fn new() -> Self {
         Self::default()
@@ -38,6 +34,8 @@ impl NameTable {
     }
 
     /// Reverse lookup: the host path a folded name came from, if any.
+    // Limit: the reverse map is the M2 write side; nothing reads it until then.
+    #[allow(dead_code)]
     pub(crate) fn host_path(&self, name: &[u8; 11]) -> Option<&PathBuf> {
         self.map.iter().find(|(n, _)| n == name).map(|(_, p)| p)
     }

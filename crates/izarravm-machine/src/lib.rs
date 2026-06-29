@@ -38,6 +38,7 @@ mod fdc;
 mod floppy;
 mod ide;
 mod katea_names;
+mod katea_tree;
 mod katea_volume;
 mod keyboard;
 mod lpt;
