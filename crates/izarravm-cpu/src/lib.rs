@@ -932,6 +932,37 @@ enum DecodeGroup {
     /// entire x87 stack/control/status logic stays in those leaf helpers. The only change is WHERE
     /// the ModRM is fetched: once, in `decode`.
     Fpu,
+    /// The heterogeneous catch-all of every remaining IMPLEMENTED one-off opcode (task A14), a MIX
+    /// of single-byte and two-byte (0F) forms that did not fit a themed group. The members are:
+    ///   - BCD adjust: DAA (0x27), DAS (0x2F), AAA (0x37), AAS (0x3F) — no encoded operand.
+    ///   - AAM (0xD4) / AAD (0xD5) — each carries an imm8 base, fetched by `decode` into `insn.imm`.
+    ///   - SALC (0xD6, undocumented) and XLAT (0xD7) — no encoded operand; XLAT reads [seg:BX+AL]
+    ///     from memory at execute time against the live registers.
+    ///   - TEST AL,imm8 (0xA8, imm8 into `insn.imm`) and TEST AX/EAX,imm (0xA9, operand-size imm).
+    ///   - three-operand IMUL: IMUL r,r/m,imm16/32 (0x69) and IMUL r,r/m,imm8 (0x6B) — a ModRM r/m
+    ///     plus an immediate (`decode` parses the ModRM + addressing descriptor, then fetches the imm).
+    ///   - string port I/O: INSB/INSW (0x6C/0x6D), OUTSB/OUTSW (0x6E/0x6F) — implicit operands; the
+    ///     executor is a thin call to the existing `run_string` (REP/DF/segment-override stay there).
+    ///   - HLT (0xF4) — sets the halted state.
+    ///   - the two-byte system/serializing/CPU-id ops with no encoded operand: SYSCALL (0F 05),
+    ///     SYSRET (0F 07), INVD/WBINVD (0F 08/09), WRMSR (0F 30), RDTSC (0F 31), RDMSR (0F 32),
+    ///     CPUID (0F A2), BSWAP r32 (0F C8-CF).
+    ///   - CMPXCHG8B m64 (0F C7 /1) — a ModRM r/m form (`decode` parses the ModRM + descriptor).
+    ///   - the MMX integer-SIMD block (the `is_mmx_two_byte` opcodes): EMMS (0F 77, no ModRM); the
+    ///     shift-by-imm forms (0F 71/72/73, a ModRM whose `rm` is the register plus a trailing imm8);
+    ///     MOVD/MOVQ and every Pxxx mm,mm/m64 — all ModRM r/m forms (`decode` parses the ModRM +
+    ///     descriptor; the imm8 is fetched only for 0F 71/72/73).
+    ///
+    /// `decode` parses each form's ModRM + addressing descriptor (instruction bytes only, so it stays
+    /// cacheable) and its immediate exactly as the fused handler did, so the byte budget — and thus the
+    /// fetch clocks — is byte-identical. The executor reuses the existing BCD/`imul_truncated`/
+    /// `run_string`/`execute_mmx_decoded`/CPUID/RDTSC/`syscall`/halt leaf logic verbatim; the only
+    /// change is WHERE the ModRM/immediate is fetched (once, in `decode`). The 0F forms are folded
+    /// into `insn.opcode` as 0x0F00 | second and dispatched off the full u16. The genuinely
+    /// unimplemented neighbours (single-byte 0x63 ARPL / 0xF1; 0F 21/23 MOV DR; 0F AA RSM; the
+    /// other unmapped 0F bytes) are NOT routed here — they stay on Fallback / TwoByteFallback and
+    /// still #UD as `UnsupportedOpcode` / `UnsupportedTwoByteOpcode`.
+    Misc,
     /// Not yet converted to the split: decode parses nothing extra and `execute_decoded` hands the
     /// opcode to the shared fused `dispatch_opcode`.
     Fallback,
@@ -1271,6 +1302,14 @@ impl Cpu386 {
                 // MOV reg,CR / MOV CR,reg (0F 20/22). 0F 21/23 (MOV reg,DR / MOV DR,reg) and 0F B2/
                 // B4/B5 (LSS/LFS/LGS) are unimplemented in the fused path and stay TwoByteFallback.
                 0x00 | 0x01 | 0x02 | 0x03 | 0x06 | 0x20 | 0x22 => DecodeGroup::SystemSeg,
+                // Heterogeneous one-off 0F block (task A14): the no-operand system/serializing/CPU-id
+                // ops SYSCALL/SYSRET (05/07), INVD/WBINVD (08/09), WRMSR/RDTSC/RDMSR (30/31/32),
+                // CPUID (A2), BSWAP (C8-CF); CMPXCHG8B (C7, a ModRM form); and the whole MMX block
+                // (`is_mmx_two_byte`). 0F AA (RSM) is unimplemented and stays TwoByteFallback.
+                0x05 | 0x07 | 0x08 | 0x09 | 0x30 | 0x31 | 0x32 | 0xa2 | 0xc7 | 0xc8..=0xcf => {
+                    DecodeGroup::Misc
+                }
+                second if is_mmx_two_byte(second as u8) => DecodeGroup::Misc,
                 _ => DecodeGroup::TwoByteFallback,
             };
         }
@@ -1388,6 +1427,18 @@ impl Cpu386 {
         // fused #MF gate and calls the existing `execute_fpu_register`/`execute_fpu_memory`.
         if matches!(opcode, 0x9b | 0xd8..=0xdf) {
             return DecodeGroup::Fpu;
+        }
+        // Heterogeneous one-off single-byte block (task A14): BCD adjust DAA/DAS/AAA/AAS
+        // (0x27/0x2f/0x37/0x3f), three-operand IMUL (0x69/0x6b), string port I/O INS/OUTS
+        // (0x6c-0x6f), TEST AL/AX,imm (0xa8/0xa9), AAM/AAD (0xd4/0xd5), SALC/XLAT (0xd6/0xd7),
+        // and HLT (0xf4). 0x63 (ARPL) and 0xf1 are unimplemented in the fused path and stay
+        // on Fallback (they #UD as `UnsupportedOpcode`).
+        if matches!(
+            opcode,
+            0x27 | 0x2f | 0x37 | 0x3f | 0x69 | 0x6b | 0x6c
+                ..=0x6f | 0xa8 | 0xa9 | 0xd4 | 0xd5 | 0xd6 | 0xd7 | 0xf4
+        ) {
+            return DecodeGroup::Misc;
         }
         DecodeGroup::Fallback
     }
@@ -1775,6 +1826,74 @@ impl Cpu386 {
                     insn.modrm = Some(modrm);
                 }
             }
+            DecodeGroup::Misc => {
+                // The heterogeneous one-off block (task A14). Each opcode reads exactly the bytes
+                // its fused handler read, in the same order, so the fetch clocks stay byte-identical.
+                match insn.opcode {
+                    // Three-operand IMUL: a ModRM r/m form THEN an immediate (operand-size-wide for
+                    // 0x69, sign-extended imm8 for 0x6b). Parse the ModRM + addressing descriptor
+                    // (instruction bytes only, so it stays cacheable), then fetch the immediate.
+                    0x69 => {
+                        let modrm = self.fetch_modrm(bus)?;
+                        let operand =
+                            self.parse_addressing_mode(bus, prefixes, address_size, modrm)?;
+                        insn.modrm = Some(modrm);
+                        insn.operand = Some(operand);
+                        insn.imm = self.fetch_immediate(bus, operand_size)?;
+                    }
+                    0x6b => {
+                        let modrm = self.fetch_modrm(bus)?;
+                        let operand =
+                            self.parse_addressing_mode(bus, prefixes, address_size, modrm)?;
+                        insn.modrm = Some(modrm);
+                        insn.operand = Some(operand);
+                        insn.imm = sign_extend_u8(self.fetch_u8(bus)?);
+                    }
+                    // AAM/AAD (0xd4/0xd5): the imm8 base (TEST AL,imm8 0xa8 likewise): fetch one byte.
+                    0xa8 | 0xd4 | 0xd5 => {
+                        insn.imm = u32::from(self.fetch_u8(bus)?);
+                    }
+                    // TEST AX/EAX,imm (0xa9): an operand-size-wide accumulator immediate.
+                    0xa9 => {
+                        insn.imm = self.fetch_immediate(bus, operand_size)?;
+                    }
+                    // CMPXCHG8B (0F C7 /1): a ModRM r/m (m64) form, no immediate. Parse the ModRM +
+                    // addressing descriptor; the executor re-detects the register form / bad /ext.
+                    0x0fc7 => {
+                        let modrm = self.fetch_modrm(bus)?;
+                        let operand =
+                            self.parse_addressing_mode(bus, prefixes, address_size, modrm)?;
+                        insn.modrm = Some(modrm);
+                        insn.operand = Some(operand);
+                    }
+                    // The MMX shift-by-immediate forms (0F 71/72/73). The fused path read ONLY the
+                    // ModRM byte and then the imm8 count — it never decoded an addressing mode (these
+                    // are register-form, `modrm.rm` is the target). Mirror that exactly so the byte
+                    // budget matches even the malformed mode != 3 encoding: ModRM, then imm8, with no
+                    // addressing-descriptor parse.
+                    0x0f71..=0x0f73 => {
+                        let modrm = self.fetch_modrm(bus)?;
+                        insn.modrm = Some(modrm);
+                        insn.imm = u32::from(self.fetch_u8(bus)?);
+                    }
+                    // The rest of the MMX block, except EMMS (0F 77), which has no ModRM and falls to
+                    // the no-operand arm below. Every other MMX opcode is a ModRM r/m form: parse the
+                    // ModRM + addressing descriptor. (MOVD/MOVQ and the Pxxx forms carry no immediate.)
+                    op if op != 0x0f77 && op & 0xff00 == 0x0f00 && is_mmx_two_byte(op as u8) => {
+                        let modrm = self.fetch_modrm(bus)?;
+                        let operand =
+                            self.parse_addressing_mode(bus, prefixes, address_size, modrm)?;
+                        insn.modrm = Some(modrm);
+                        insn.operand = Some(operand);
+                    }
+                    // Every other one-off carries no encoded operand after the opcode byte(s):
+                    // the BCD adjusts (0x27/0x2f/0x37/0x3f), SALC/XLAT (0xd6/0xd7), INS/OUTS
+                    // (0x6c-0x6f), HLT (0xf4), EMMS (0F 77), and the no-operand 0F system/serializing/
+                    // CPU-id ops (05/07/08/09/30/31/32/a2/c8-cf). XLAT reads memory at execute from
+                    // live registers; the rest take implicit/register/no operands.
+                    _ => {}
+                }
+            }
             // Both fallback groups pre-parse nothing in `decode` (the second 0F byte was already
             // folded into `insn.opcode` above): their executors re-read any ModRM/immediate from the
             // post-opcode eip in the shared fused dispatch.
@@ -1861,18 +1980,18 @@ impl Cpu386 {
             // `execute_fpu_memory` verbatim — the entire x87 stack/control/status logic stays in
             // those leaf helpers unchanged.
             DecodeGroup::Fpu => self.execute_fpu_decoded(insn, bus),
+            // The heterogeneous one-off block (BCD adjust, AAM/AAD, SALC/XLAT, TEST imm, three-
+            // operand IMUL, INS/OUTS, HLT, and the no-operand 0F system/serializing/CPU-id ops,
+            // CMPXCHG8B, and MMX) runs through its split executor, consuming the pre-decoded
+            // ModRM/operand/immediate and reusing the existing BCD/`imul_truncated`/`run_string`/
+            // CPUID/RDTSC/`syscall`/halt/MMX leaf logic verbatim.
+            DecodeGroup::Misc => self.execute_misc_decoded(insn, bus),
             DecodeGroup::TwoByteFallback => {
                 // Un-converted two-byte (0F) opcode. `decode` already read + charged the second
                 // byte and applied the ISA gate, folding it into `insn.opcode` as 0x0F00 | second.
-                // Hand the second byte to `execute_two_byte`, which re-reads only this opcode's
-                // ModRM/immediate from the post-second-byte eip (the second byte is never re-read).
-                self.execute_two_byte(
-                    bus,
-                    insn.opcode as u8,
-                    insn.prefixes,
-                    insn.address_size,
-                    insn.operand_size,
-                )
+                // Hand the second byte to `execute_two_byte`; every opcode it still handles takes no
+                // encoded operand, so it re-reads nothing (the second byte is never re-read).
+                self.execute_two_byte(insn.opcode as u8, insn.operand_size)
             }
             DecodeGroup::Fallback => {
                 // Fallback: `decode` already read the prefixes + opcode and ran the LOCK check,
@@ -3757,15 +3876,20 @@ impl Cpu386 {
     /// point at the byte immediately after the opcode so each arm re-reads its ModRM/immediate
     /// from there. The seam calls this with the values `decode` already read, so the prefix/opcode
     /// instruction-fetch clocks are charged exactly once.
+    // After task A14 every IMPLEMENTED opcode is converted to the split, so the only live arms left
+    // here are the prefix-byte #UD guard, the legacy-reference `0x0F` dispatch (test-only), and the
+    // `UnsupportedOpcode` catch-all. `prefixes`/`address_size` are no longer read by any remaining
+    // arm (the IMUL/INS-OUTS/XLAT/BCD arms that used them moved to `execute_misc_decoded`); they stay
+    // in the signature so the seam call site is unchanged until task A15 deletes the Fallback path.
     #[allow(clippy::too_many_arguments)]
     fn dispatch_opcode<B: CpuBus>(
         &mut self,
         bus: &mut B,
         instruction_eip: u32,
-        prefixes: Prefixes,
+        _prefixes: Prefixes,
         opcode: u8,
         operand_size: OperandSize,
-        address_size: AddressSize,
+        _address_size: AddressSize,
     ) -> ExecResult<CycleOutcome> {
         match opcode {
             // 0x06/0x07/0x0e/0x16/0x17/0x1e/0x1f (PUSH/POP seg) are converted to the
@@ -3782,60 +3906,17 @@ impl Cpu386 {
             // 0x50-0x57 (PUSH reg), 0x58-0x5f (POP reg), 0x60 (PUSHA/PUSHAD), 0x61 (POPA/POPAD),
             // 0x68 (PUSH imm16/32) are converted to the decode/execute split
             // (`DecodeGroup::Stack` -> `execute_stack_decoded`); not handled here.
-            0x69 => {
-                // IMUL r, r/m, imm16/32: signed multiply of r/m by a full-width immediate.
-                let modrm = self.fetch_modrm(bus)?;
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                let src = self.read_operand_sized(bus, operand, operand_size)?;
-                let imm = self.fetch_immediate(bus, operand_size)?;
-                let result = self.imul_truncated(src, imm, operand_size);
-                self.write_gpr_sized(modrm.reg, operand_size, result);
-                Ok(clocks(14))
-            }
+            // 0x69/0x6b (three-operand IMUL) and 0x6c-0x6f (INS/OUTS) are converted to the
+            // decode/execute split (task A14): `route_group` classifies them as `DecodeGroup::Misc`
+            // and `execute_misc_decoded` runs them (the ModRM + immediate for IMUL is parsed in
+            // `decode`; INS/OUTS reuse `run_string` with the prefixes passed through). Not handled
+            // here.
             // 0x6a (PUSH imm8) is converted to the decode/execute split
             // (`DecodeGroup::Stack` -> `execute_stack_decoded`); not handled here.
-            0x6b => {
-                // IMUL r, r/m, imm8: signed multiply of r/m by a sign-extended byte immediate.
-                let modrm = self.fetch_modrm(bus)?;
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                let src = self.read_operand_sized(bus, operand, operand_size)?;
-                let imm = sign_extend_u8(self.fetch_u8(bus)?);
-                let result = self.imul_truncated(src, imm, operand_size);
-                self.write_gpr_sized(modrm.reg, operand_size, result);
-                Ok(clocks(14))
-            }
             // 0x62 (BOUND r,m) is converted to the decode/execute split (task A12): `route_group`
             // classifies it as `DecodeGroup::SystemSeg` and `execute_system_seg_decoded` runs it
             // (the ModRM + addressing descriptor is parsed in `decode`; the bounds are read from
             // memory and the #BR/#UD faults raised in the executor). Not handled here.
-            0x6c => {
-                self.run_string(bus, StringOp::Ins, BusWidth::Byte, prefixes, address_size)?;
-                Ok(clocks(15))
-            }
-            0x6d => {
-                self.run_string(
-                    bus,
-                    StringOp::Ins,
-                    operand_size.bus_width(),
-                    prefixes,
-                    address_size,
-                )?;
-                Ok(clocks(15))
-            }
-            0x6e => {
-                self.run_string(bus, StringOp::Outs, BusWidth::Byte, prefixes, address_size)?;
-                Ok(clocks(14))
-            }
-            0x6f => {
-                self.run_string(
-                    bus,
-                    StringOp::Outs,
-                    operand_size.bus_width(),
-                    prefixes,
-                    address_size,
-                )?;
-                Ok(clocks(14))
-            }
             // 0x70-0x7f (Jcc short, rel8) are converted to the decode/execute split:
             // `route_group` classifies them as `DecodeGroup::Branch` and `execute_branch_decoded`
             // runs them. Not handled here.
@@ -3870,19 +3951,10 @@ impl Cpu386 {
             // `execute_string_decoded` runs them (a thin call to the unchanged `run_string` helper
             // with the prefixes passed through, so the REP loop/DF/segment-override/per-iteration
             // clocks stay in one place). Not handled here. 0xa8/0xa9 below are TEST AL/AX,imm — not
-            // string ops — and remain on the fused path.
-            0xa8 => {
-                let imm = self.fetch_u8(bus)?;
-                let al = self.read_gpr8(0);
-                self.alu(4, u32::from(al), u32::from(imm), BusWidth::Byte);
-                Ok(clocks(2))
-            }
-            0xa9 => {
-                let imm = self.fetch_immediate(bus, operand_size)?;
-                let acc = self.read_gpr_sized(0, operand_size);
-                self.alu(4, acc, imm, operand_size.bus_width());
-                Ok(clocks(2))
-            }
+            // string ops. 0xa8/0xa9 (TEST AL/AX,imm) are converted to the decode/execute split
+            // (task A14): `route_group` classifies them as `DecodeGroup::Misc` and
+            // `execute_misc_decoded` runs them (the immediate is fetched in `decode`). Not handled
+            // here.
             // 0xaa/0xab (STOS) and 0xac/0xad (LODS) are converted to the decode/execute split:
             // `route_group` classifies them as `DecodeGroup::StringOps` and `execute_string_decoded`
             // runs them via the unchanged `run_string` helper. Not handled here.
@@ -3901,12 +3973,11 @@ impl Cpu386 {
             // `execute_control_flow_decoded` runs them (the imm8 vector for 0xcd is parsed in
             // `decode`; the V86 IOPL check and the interrupt/IRET delivery stay in the executor's
             // shared helpers). Not handled here.
-            0xd6 => {
-                // SALC/SETALC (undocumented): AL = CF ? 0xFF : 0x00. Flags unaffected.
-                let value = if self.flag(FLAG_CF) { 0xff } else { 0x00 };
-                self.write_gpr8(0, value);
-                Ok(clocks(2))
-            }
+            // 0xd4/0xd5 (AAM/AAD), 0xd6 (SALC), 0xd7 (XLAT) are converted to the decode/execute
+            // split (task A14): `route_group` classifies them as `DecodeGroup::Misc` and
+            // `execute_misc_decoded` runs them (the imm8 base for AAM/AAD is fetched in `decode`;
+            // XLAT reads [seg:BX+AL] from memory at execute against the live registers). Not
+            // handled here.
             // 0xd8-0xdf (the x87 FPU escape opcodes) are converted to the decode/execute split:
             // `route_group` classifies them as `DecodeGroup::Fpu` and `execute_fpu_decoded` runs
             // them (the ModRM + addressing descriptor are parsed once in `decode`; the existing
@@ -3929,13 +4000,9 @@ impl Cpu386 {
             // split: `route_group` classifies them as `DecodeGroup::ControlFlow` and
             // `execute_control_flow_decoded` runs them (the far pointer — offset then selector — is
             // parsed in `decode` into `imm`/`imm2`). Not handled here.
-            0xf4 => {
-                self.halted = true;
-                Ok(CycleOutcome {
-                    core_clocks: 5,
-                    halted: true,
-                })
-            }
+            // 0xf4 (HLT) is converted to the decode/execute split (task A14): `route_group`
+            // classifies it as `DecodeGroup::Misc` and `execute_misc_decoded` sets the halted
+            // state (the existing logic, verbatim). Not handled here.
             // 0xf6/0xf7 (group 3: TEST/NOT/NEG/MUL/IMUL/DIV/IDIV) are converted to the
             // decode/execute split: `route_group` classifies them as `DecodeGroup::Group` and
             // `execute_group_decoded` runs them (the conditional TEST immediate is parsed in
@@ -3953,117 +4020,9 @@ impl Cpu386 {
             // 0x40-0x4f (INC/DEC reg) are converted to the decode/execute split:
             // `route_group` classifies them as `DecodeGroup::FlagsMisc` and
             // `execute_flags_misc_decoded` runs them. Not handled here.
-            0xd7 => {
-                // XLAT: AL = [segment:(B)X + AL]. DS is the default, overridable; the 16-bit base
-                // plus AL wraps inside the segment.
-                let segment = prefixes.segment_override.unwrap_or(SegmentIndex::Ds);
-                let al = u32::from(self.read_gpr8(0));
-                let offset = match address_size {
-                    AddressSize::Word => u32::from(self.read_gpr16(3).wrapping_add(al as u16)),
-                    AddressSize::Dword => self.read_gpr32(3).wrapping_add(al),
-                };
-                let value = self.read_memory_u8(bus, segment, offset, BusAccessKind::DataRead)?;
-                self.write_gpr8(0, value);
-                Ok(clocks(5))
-            }
-            0x27 => {
-                // DAA: decimal adjust AL after addition. OF is left undefined.
-                let old_al = self.read_gpr8(0);
-                let old_cf = self.flag(FLAG_CF);
-                let mut al = old_al;
-                self.set_flag(FLAG_CF, false);
-                if (al & 0x0f) > 9 || self.flag(FLAG_AF) {
-                    let (sum, carry) = al.overflowing_add(6);
-                    al = sum;
-                    self.set_flag(FLAG_CF, old_cf || carry);
-                    self.set_flag(FLAG_AF, true);
-                } else {
-                    self.set_flag(FLAG_AF, false);
-                }
-                if old_al > 0x99 || old_cf {
-                    al = al.wrapping_add(0x60);
-                    self.set_flag(FLAG_CF, true); // the high correction always sets CF
-                }
-                self.write_gpr8(0, al);
-                self.set_szp(u32::from(al), BusWidth::Byte);
-                Ok(clocks(4))
-            }
-            0x2f => {
-                // DAS: decimal adjust AL after subtraction. OF is left undefined.
-                let old_al = self.read_gpr8(0);
-                let old_cf = self.flag(FLAG_CF);
-                let mut al = old_al;
-                self.set_flag(FLAG_CF, false);
-                if (al & 0x0f) > 9 || self.flag(FLAG_AF) {
-                    let (diff, borrow) = al.overflowing_sub(6);
-                    al = diff;
-                    self.set_flag(FLAG_CF, old_cf || borrow);
-                    self.set_flag(FLAG_AF, true);
-                } else {
-                    self.set_flag(FLAG_AF, false);
-                }
-                if old_al > 0x99 || old_cf {
-                    al = al.wrapping_sub(0x60);
-                    self.set_flag(FLAG_CF, true); // the high correction always sets CF
-                }
-                self.write_gpr8(0, al);
-                self.set_szp(u32::from(al), BusWidth::Byte);
-                Ok(clocks(4))
-            }
-            0x37 => {
-                // AAA: ASCII adjust AL after addition. OF/SF/ZF/PF are left undefined.
-                if (self.read_gpr8(0) & 0x0f) > 9 || self.flag(FLAG_AF) {
-                    let ax = self.read_gpr16(0).wrapping_add(0x106);
-                    self.write_gpr16(0, ax);
-                    self.set_flag(FLAG_AF, true);
-                    self.set_flag(FLAG_CF, true);
-                } else {
-                    self.set_flag(FLAG_AF, false);
-                    self.set_flag(FLAG_CF, false);
-                }
-                let al = self.read_gpr8(0) & 0x0f;
-                self.write_gpr8(0, al);
-                Ok(clocks(4))
-            }
-            0x3f => {
-                // AAS: ASCII adjust AL after subtraction. OF/SF/ZF/PF are left undefined.
-                if (self.read_gpr8(0) & 0x0f) > 9 || self.flag(FLAG_AF) {
-                    let ax = self.read_gpr16(0).wrapping_sub(6);
-                    self.write_gpr16(0, ax.wrapping_sub(0x100));
-                    self.set_flag(FLAG_AF, true);
-                    self.set_flag(FLAG_CF, true);
-                } else {
-                    self.set_flag(FLAG_AF, false);
-                    self.set_flag(FLAG_CF, false);
-                }
-                let al = self.read_gpr8(0) & 0x0f;
-                self.write_gpr8(0, al);
-                Ok(clocks(4))
-            }
-            0xd4 => {
-                // AAM: AH = AL / imm8, AL = AL % imm8. OF/AF/CF undefined; SF/ZF/PF from AL.
-                let divisor = self.fetch_u8(bus)?;
-                if divisor == 0 {
-                    return Err(CpuError::DivideError.into());
-                }
-                let al = self.read_gpr8(0);
-                self.write_gpr8(4, al / divisor);
-                let rem = al % divisor;
-                self.write_gpr8(0, rem);
-                self.set_szp(u32::from(rem), BusWidth::Byte);
-                Ok(clocks(17))
-            }
-            0xd5 => {
-                // AAD: AL = (AL + AH*imm8) & 0xff, AH = 0. OF/AF/CF undefined; SF/ZF/PF from AL.
-                let multiplier = self.fetch_u8(bus)?;
-                let al = self.read_gpr8(0);
-                let ah = self.read_gpr8(4);
-                let result = al.wrapping_add(ah.wrapping_mul(multiplier));
-                self.write_gpr8(0, result);
-                self.write_gpr8(4, 0);
-                self.set_szp(u32::from(result), BusWidth::Byte);
-                Ok(clocks(19))
-            }
+            // 0x27/0x2f/0x37/0x3f (DAA/DAS/AAA/AAS) are converted to the decode/execute split
+            // (task A14): `route_group` classifies them as `DecodeGroup::Misc` and
+            // `execute_misc_decoded` runs the same BCD-adjust logic verbatim. Not handled here.
             0x0f => {
                 // LEGACY-REFERENCE ONLY. This arm is reached solely via the test-only
                 // `execute_instruction_legacy`, which reads a single opcode byte and so arrives here
@@ -4079,7 +4038,7 @@ impl Cpu386 {
                 // second byte from `insn.opcode` instead (see the extension rules on `DecodeGroup`).
                 let second = self.fetch_u8(bus)?;
                 self.check_two_byte_isa_gate(second)?;
-                self.execute_two_byte(bus, second, prefixes, address_size, operand_size)
+                self.execute_two_byte(second, operand_size)
             }
             _ => Err(CpuError::UnsupportedOpcode {
                 opcode,
@@ -4118,22 +4077,26 @@ impl Cpu386 {
         Ok(())
     }
 
-    /// Execute an un-converted 0F (two-byte) opcode. `second` is the second opcode byte that
+    /// Execute an un-converted 0F (two-byte) opcode. `opcode` is the second opcode byte that
     /// `decode` (or, for the fused reference, the `0x0F` dispatch arm) already read + charged and
     /// gated; this never re-reads it. Converted 0F groups (MOVZX/MOVSX) bypass this entirely via
     /// `route_group`/`execute_decoded`.
-    fn execute_two_byte<B: CpuBus>(
+    ///
+    /// Every opcode that remains here takes NO encoded operand (it reads no instruction bytes), so
+    /// the heterogeneous `Misc` group (task A14) also leaf-calls this for its no-operand 0F members
+    /// (SYSCALL/SYSRET/INVD/WBINVD/WRMSR/RDTSC/RDMSR/CPUID/BSWAP) rather than duplicating them — the
+    /// bus, prefixes, and address size are therefore no longer parameters. The genuinely
+    /// unimplemented 0F bytes still fall through to the `UnsupportedTwoByteOpcode` arm and #UD.
+    fn execute_two_byte(
         &mut self,
-        bus: &mut B,
         opcode: u8,
-        prefixes: Prefixes,
-        address_size: AddressSize,
         operand_size: OperandSize,
     ) -> ExecResult<CycleOutcome> {
         match opcode {
-            // Limit: MMX is not gated to 586+; a throttled 386/486 GSW mode would
-            // wrongly accept it. Gate it with the others if that fidelity gap matters.
-            op if is_mmx_two_byte(op) => self.execute_mmx(bus, op, prefixes, address_size),
+            // The MMX block (`is_mmx_two_byte`) is converted to the decode/execute split (task A14):
+            // `route_group` classifies it as `DecodeGroup::Misc` and `execute_mmx_decoded` runs it
+            // (the ModRM + the 0F 71/72/73 imm8 are parsed in `decode`). Not handled here.
+            // Limit: MMX is not gated to 586+; a throttled 386/486 GSW mode would wrongly accept it.
             // 0F 00 (group 6: SLDT/STR/LLDT/LTR/VERR/VERW), 0F 01 (group 7: SGDT/SIDT/LGDT/LIDT/
             // SMSW/LMSW/INVLPG), 0F 02 (LAR), 0F 03 (LSL), and 0F 06 (CLTS) are converted to the
             // decode/execute split (task A12): `route_group` classifies them as
@@ -4318,37 +4281,10 @@ impl Cpu386 {
                 self.write_gpr32(2, edx); // EDX
                 Ok(clocks(14))
             }
-            0xc7 => {
-                // CMPXCHG8B m64 (0F C7 /1): compare EDX:EAX with the 64-bit memory operand.
-                // Equal -> ZF set and ECX:EBX stored; unequal -> ZF clear and the memory
-                // value loaded into EDX:EAX. Only ZF changes. The register form and any other
-                // group-7 extension are #UD.
-                let modrm = self.fetch_modrm(bus)?;
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                let mem = match operand {
-                    RmOperand::Memory(mem) if modrm.reg == 1 => mem,
-                    _ => {
-                        return Err(InternalFault::Exception {
-                            vector: 6,
-                            error_code: None,
-                        });
-                    }
-                };
-                let current = self.read_qword(bus, mem)?;
-                if current == self.read_edx_eax() {
-                    let source =
-                        (u64::from(self.read_gpr32(1)) << 32) | u64::from(self.read_gpr32(3));
-                    self.write_qword(bus, mem, source)?;
-                    self.set_flag(FLAG_ZF, true);
-                } else {
-                    self.set_edx_eax(current);
-                    // Re-write the destination with its own value so the bus still sees a
-                    // write on the unequal branch, matching the locked read-modify-write.
-                    self.write_qword(bus, mem, current)?;
-                    self.set_flag(FLAG_ZF, false);
-                }
-                Ok(clocks(10))
-            }
+            // CMPXCHG8B m64 (0F C7 /1) is converted to the decode/execute split (task A14):
+            // `route_group` classifies it as `DecodeGroup::Misc` and `execute_misc_decoded` runs it
+            // (the ModRM + addressing descriptor is parsed in `decode`; the register form / wrong
+            // /ext #UD and the read-modify-write stay in the executor). Not handled here.
             0xc8..=0xcf => {
                 // BSWAP r32 (0F C8+r): reverse the byte order of a 32-bit register. The low
                 // three bits of the opcode pick the register. The 16-bit-operand form is
@@ -4635,22 +4571,6 @@ impl Cpu386 {
         })
     }
 
-    fn decode_rm_operand<B: CpuBus>(
-        &mut self,
-        bus: &mut B,
-        prefixes: Prefixes,
-        address_size: AddressSize,
-        modrm: ModRm,
-    ) -> ExecResult<RmOperand> {
-        // Parse the addressing-mode descriptor (reads instruction bytes, no GP registers),
-        // then resolve it against live registers. The two-step form keeps a single source of
-        // truth for both the legacy callers and the decode/execute split.
-        match self.parse_addressing_mode(bus, prefixes, address_size, modrm)? {
-            DecodedOperand::Reg(index) => Ok(RmOperand::Register(index)),
-            DecodedOperand::Mem(addr) => Ok(self.resolve_addr_mode(&addr)),
-        }
-    }
-
     /// Parse a ModRM addressing mode into a descriptor. Reads only instruction bytes
     /// (displacement, SIB) and never a general register, so the result can be replayed after
     /// the registers change. The effective offset is computed later by `resolve_addr_mode`.
@@ -4807,49 +4727,6 @@ impl Cpu386 {
     // caller. The converted flags-misc executor reads the byte r/m via `read_operand_u8` on the
     // pre-decoded operand instead. `write_rm_u8` was removed earlier with the legacy 0x88 MOV
     // r/m8,r8 handler. The sized/read siblings remain in use by the fallback handlers.)
-
-    fn read_rm_sized<B: CpuBus>(
-        &mut self,
-        bus: &mut B,
-        prefixes: Prefixes,
-        address_size: AddressSize,
-        operand_size: OperandSize,
-        modrm: ModRm,
-    ) -> ExecResult<u32> {
-        match self.decode_rm_operand(bus, prefixes, address_size, modrm)? {
-            RmOperand::Register(index) => Ok(self.read_gpr_sized(index, operand_size)),
-            RmOperand::Memory(memory) => self.read_memory_sized(
-                bus,
-                memory.segment,
-                memory.offset,
-                operand_size,
-                BusAccessKind::DataRead,
-            ),
-        }
-    }
-
-    fn write_rm_sized<B: CpuBus>(
-        &mut self,
-        bus: &mut B,
-        prefixes: Prefixes,
-        address_size: AddressSize,
-        operand_size: OperandSize,
-        modrm: ModRm,
-        value: u32,
-    ) -> ExecResult<()> {
-        match self.decode_rm_operand(bus, prefixes, address_size, modrm)? {
-            RmOperand::Register(index) => self.write_gpr_sized(index, operand_size, value),
-            RmOperand::Memory(memory) => self.write_memory_sized(
-                bus,
-                memory.segment,
-                memory.offset,
-                operand_size,
-                value,
-                BusAccessKind::DataWrite,
-            )?,
-        }
-        Ok(())
-    }
 
     fn read_operand_u8<B: CpuBus>(&mut self, bus: &mut B, operand: RmOperand) -> ExecResult<u8> {
         match operand {
@@ -6795,6 +6672,270 @@ impl Cpu386 {
         }
     }
 
+    /// The heterogeneous one-off block (task A14) through the decode/execute split. Each arm mirrors
+    /// the former fused handler verbatim — same flag effects, same memory access, same clocks — but
+    /// consumes the ModRM/operand/immediate `decode` pre-parsed (so the executor never re-fetches an
+    /// instruction byte). The MMX block and CMPXCHG8B resolve their pre-decoded ModRM here; the
+    /// no-operand 0F system/serializing/CPU-id ops (SYSCALL/SYSRET/INVD/WBINVD/WRMSR/RDTSC/RDMSR/
+    /// CPUID/BSWAP) read no instruction bytes, so they reuse the existing `execute_two_byte` leaf
+    /// logic verbatim (it re-reads nothing for them). Dispatch is off the FULL u16 `insn.opcode`
+    /// so a 0F low byte can never alias a single-byte opcode.
+    fn execute_misc_decoded<B: CpuBus>(
+        &mut self,
+        insn: &DecodedInsn,
+        bus: &mut B,
+    ) -> ExecResult<CycleOutcome> {
+        let operand_size = insn.operand_size;
+        let address_size = insn.address_size;
+        match insn.opcode {
+            0x27 => {
+                // DAA: decimal adjust AL after addition. OF is left undefined.
+                let old_al = self.read_gpr8(0);
+                let old_cf = self.flag(FLAG_CF);
+                let mut al = old_al;
+                self.set_flag(FLAG_CF, false);
+                if (al & 0x0f) > 9 || self.flag(FLAG_AF) {
+                    let (sum, carry) = al.overflowing_add(6);
+                    al = sum;
+                    self.set_flag(FLAG_CF, old_cf || carry);
+                    self.set_flag(FLAG_AF, true);
+                } else {
+                    self.set_flag(FLAG_AF, false);
+                }
+                if old_al > 0x99 || old_cf {
+                    al = al.wrapping_add(0x60);
+                    self.set_flag(FLAG_CF, true); // the high correction always sets CF
+                }
+                self.write_gpr8(0, al);
+                self.set_szp(u32::from(al), BusWidth::Byte);
+                Ok(clocks(4))
+            }
+            0x2f => {
+                // DAS: decimal adjust AL after subtraction. OF is left undefined.
+                let old_al = self.read_gpr8(0);
+                let old_cf = self.flag(FLAG_CF);
+                let mut al = old_al;
+                self.set_flag(FLAG_CF, false);
+                if (al & 0x0f) > 9 || self.flag(FLAG_AF) {
+                    let (diff, borrow) = al.overflowing_sub(6);
+                    al = diff;
+                    self.set_flag(FLAG_CF, old_cf || borrow);
+                    self.set_flag(FLAG_AF, true);
+                } else {
+                    self.set_flag(FLAG_AF, false);
+                }
+                if old_al > 0x99 || old_cf {
+                    al = al.wrapping_sub(0x60);
+                    self.set_flag(FLAG_CF, true); // the high correction always sets CF
+                }
+                self.write_gpr8(0, al);
+                self.set_szp(u32::from(al), BusWidth::Byte);
+                Ok(clocks(4))
+            }
+            0x37 => {
+                // AAA: ASCII adjust AL after addition. OF/SF/ZF/PF are left undefined.
+                if (self.read_gpr8(0) & 0x0f) > 9 || self.flag(FLAG_AF) {
+                    let ax = self.read_gpr16(0).wrapping_add(0x106);
+                    self.write_gpr16(0, ax);
+                    self.set_flag(FLAG_AF, true);
+                    self.set_flag(FLAG_CF, true);
+                } else {
+                    self.set_flag(FLAG_AF, false);
+                    self.set_flag(FLAG_CF, false);
+                }
+                let al = self.read_gpr8(0) & 0x0f;
+                self.write_gpr8(0, al);
+                Ok(clocks(4))
+            }
+            0x3f => {
+                // AAS: ASCII adjust AL after subtraction. OF/SF/ZF/PF are left undefined.
+                if (self.read_gpr8(0) & 0x0f) > 9 || self.flag(FLAG_AF) {
+                    let ax = self.read_gpr16(0).wrapping_sub(6);
+                    self.write_gpr16(0, ax.wrapping_sub(0x100));
+                    self.set_flag(FLAG_AF, true);
+                    self.set_flag(FLAG_CF, true);
+                } else {
+                    self.set_flag(FLAG_AF, false);
+                    self.set_flag(FLAG_CF, false);
+                }
+                let al = self.read_gpr8(0) & 0x0f;
+                self.write_gpr8(0, al);
+                Ok(clocks(4))
+            }
+            0x69 => {
+                // IMUL r, r/m, imm16/32: signed multiply of r/m by a full-width immediate.
+                // `decode` parsed the ModRM/operand and fetched the immediate into `insn.imm`.
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let src = self.read_operand_sized(bus, operand, operand_size)?;
+                let result = self.imul_truncated(src, insn.imm, operand_size);
+                self.write_gpr_sized(modrm.reg, operand_size, result);
+                Ok(clocks(14))
+            }
+            0x6b => {
+                // IMUL r, r/m, imm8: signed multiply of r/m by a sign-extended byte immediate.
+                // `decode` parsed the ModRM/operand and sign-extended the imm8 into `insn.imm`.
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let src = self.read_operand_sized(bus, operand, operand_size)?;
+                let result = self.imul_truncated(src, insn.imm, operand_size);
+                self.write_gpr_sized(modrm.reg, operand_size, result);
+                Ok(clocks(14))
+            }
+            0x6c => {
+                self.run_string(
+                    bus,
+                    StringOp::Ins,
+                    BusWidth::Byte,
+                    insn.prefixes,
+                    address_size,
+                )?;
+                Ok(clocks(15))
+            }
+            0x6d => {
+                self.run_string(
+                    bus,
+                    StringOp::Ins,
+                    operand_size.bus_width(),
+                    insn.prefixes,
+                    address_size,
+                )?;
+                Ok(clocks(15))
+            }
+            0x6e => {
+                self.run_string(
+                    bus,
+                    StringOp::Outs,
+                    BusWidth::Byte,
+                    insn.prefixes,
+                    address_size,
+                )?;
+                Ok(clocks(14))
+            }
+            0x6f => {
+                self.run_string(
+                    bus,
+                    StringOp::Outs,
+                    operand_size.bus_width(),
+                    insn.prefixes,
+                    address_size,
+                )?;
+                Ok(clocks(14))
+            }
+            0xa8 => {
+                // TEST AL, imm8: AND-for-flags, no write-back. `decode` fetched the imm8.
+                let al = self.read_gpr8(0);
+                self.alu(4, u32::from(al), insn.imm, BusWidth::Byte);
+                Ok(clocks(2))
+            }
+            0xa9 => {
+                // TEST AX/EAX, imm: AND-for-flags, no write-back. `decode` fetched the immediate.
+                let acc = self.read_gpr_sized(0, operand_size);
+                self.alu(4, acc, insn.imm, operand_size.bus_width());
+                Ok(clocks(2))
+            }
+            0xd4 => {
+                // AAM: AH = AL / imm8, AL = AL % imm8. OF/AF/CF undefined; SF/ZF/PF from AL.
+                // `decode` fetched the imm8 base into `insn.imm`; a base of 0 raises #DE.
+                let divisor = insn.imm as u8;
+                if divisor == 0 {
+                    return Err(CpuError::DivideError.into());
+                }
+                let al = self.read_gpr8(0);
+                self.write_gpr8(4, al / divisor);
+                let rem = al % divisor;
+                self.write_gpr8(0, rem);
+                self.set_szp(u32::from(rem), BusWidth::Byte);
+                Ok(clocks(17))
+            }
+            0xd5 => {
+                // AAD: AL = (AL + AH*imm8) & 0xff, AH = 0. OF/AF/CF undefined; SF/ZF/PF from AL.
+                let multiplier = insn.imm as u8;
+                let al = self.read_gpr8(0);
+                let ah = self.read_gpr8(4);
+                let result = al.wrapping_add(ah.wrapping_mul(multiplier));
+                self.write_gpr8(0, result);
+                self.write_gpr8(4, 0);
+                self.set_szp(u32::from(result), BusWidth::Byte);
+                Ok(clocks(19))
+            }
+            0xd6 => {
+                // SALC/SETALC (undocumented): AL = CF ? 0xFF : 0x00. Flags unaffected.
+                let value = if self.flag(FLAG_CF) { 0xff } else { 0x00 };
+                self.write_gpr8(0, value);
+                Ok(clocks(2))
+            }
+            0xd7 => {
+                // XLAT: AL = [segment:(B)X + AL]. DS is the default, overridable; the 16-bit base
+                // plus AL wraps inside the segment. Read from live registers at execute time.
+                let segment = insn.prefixes.segment_override.unwrap_or(SegmentIndex::Ds);
+                let al = u32::from(self.read_gpr8(0));
+                let offset = match address_size {
+                    AddressSize::Word => u32::from(self.read_gpr16(3).wrapping_add(al as u16)),
+                    AddressSize::Dword => self.read_gpr32(3).wrapping_add(al),
+                };
+                let value = self.read_memory_u8(bus, segment, offset, BusAccessKind::DataRead)?;
+                self.write_gpr8(0, value);
+                Ok(clocks(5))
+            }
+            0xf4 => {
+                // HLT: stop fetching until the next interrupt. Sets the halted state.
+                self.halted = true;
+                Ok(CycleOutcome {
+                    core_clocks: 5,
+                    halted: true,
+                })
+            }
+            // CMPXCHG8B (0F C7 /1): the ModRM was pre-parsed; resolve the m64 operand here and reuse
+            // the same compare/store/load-and-set-ZF logic as the former fused arm. The register
+            // form and any other group-7 /ext are #UD.
+            0x0fc7 => {
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let mem = match operand {
+                    RmOperand::Memory(mem) if modrm.reg == 1 => mem,
+                    _ => {
+                        return Err(InternalFault::Exception {
+                            vector: 6,
+                            error_code: None,
+                        });
+                    }
+                };
+                let current = self.read_qword(bus, mem)?;
+                if current == self.read_edx_eax() {
+                    let source =
+                        (u64::from(self.read_gpr32(1)) << 32) | u64::from(self.read_gpr32(3));
+                    self.write_qword(bus, mem, source)?;
+                    self.set_flag(FLAG_ZF, true);
+                } else {
+                    self.set_edx_eax(current);
+                    // Re-write the destination with its own value so the bus still sees a write on
+                    // the unequal branch, matching the locked read-modify-write.
+                    self.write_qword(bus, mem, current)?;
+                    self.set_flag(FLAG_ZF, false);
+                }
+                Ok(clocks(10))
+            }
+            // The MMX block (EMMS, the shift-by-imm forms, MOVD/MOVQ, and the Pxxx forms) runs
+            // through its split executor, consuming the pre-decoded ModRM/operand and the pre-fetched
+            // imm8 (for the 0F 71/72/73 shifts).
+            op if op & 0xff00 == 0x0f00 && is_mmx_two_byte(op as u8) => {
+                self.execute_mmx_decoded(insn, bus)
+            }
+            // The remaining 0F system/serializing/CPU-id ops carry no encoded operand and re-read no
+            // instruction bytes in `execute_two_byte`, so reuse that leaf logic verbatim: SYSCALL
+            // (05), SYSRET (07), INVD/WBINVD (08/09), WRMSR/RDTSC/RDMSR (30/31/32), CPUID (A2),
+            // BSWAP (C8-CF). `decode` already read + gated the second byte; this never re-reads it.
+            0x0f05
+            | 0x0f07
+            | 0x0f08
+            | 0x0f09
+            | 0x0f30
+            | 0x0f31
+            | 0x0f32
+            | 0x0fa2
+            | 0x0fc8..=0x0fcf => self.execute_two_byte(insn.opcode as u8, insn.operand_size),
+            opcode => unreachable!("misc opcode {opcode:#x}"),
+        }
+    }
+
     fn execute_fpu_memory<B: CpuBus>(
         &mut self,
         bus: &mut B,
@@ -7951,22 +8092,28 @@ impl Cpu386 {
     // and MOVD/MOVQ have their own operand shapes; everything else is the regular
     // Pxxx mm, mm/m64 form.
 
-    fn execute_mmx<B: CpuBus>(
+    /// The MMX integer-SIMD block through the decode/execute split (task A14). `decode` already
+    /// fetched the ModRM (for every opcode except EMMS, which has none) and, for the shift-by-imm
+    /// forms (0F 71/72/73), the trailing imm8 into `insn.imm`; this never re-reads an instruction
+    /// byte. The r/m operand resolves from the pre-decoded descriptor against the live registers.
+    /// The lane math (`mmx::*`) and the #UD for an unmapped sub-op (`fpu_unsupported`) are reused
+    /// verbatim, so the only change from the former `execute_mmx` is WHERE the ModRM/imm came from.
+    fn execute_mmx_decoded<B: CpuBus>(
         &mut self,
+        insn: &DecodedInsn,
         bus: &mut B,
-        opcode: u8,
-        prefixes: Prefixes,
-        address_size: AddressSize,
     ) -> ExecResult<CycleOutcome> {
+        let opcode = insn.opcode as u8;
         if opcode == 0x77 {
             self.fpu.emms();
             return Ok(clocks(6));
         }
-        let modrm = self.fetch_modrm(bus)?;
+        let modrm = insn.modrm.expect("an MMX opcode decoded with a ModRM");
 
         if matches!(opcode, 0x71..=0x73) {
             // Shift mm by an immediate; modrm.reg selects the shift, modrm.rm the register.
-            let count = u64::from(self.fetch_u8(bus)?);
+            // `decode` fetched the imm8 count into `insn.imm`.
+            let count = u64::from(insn.imm);
             let target = modrm.rm;
             let a = self.fpu.mm(target);
             let result = match (opcode, modrm.reg) {
@@ -7984,37 +8131,37 @@ impl Cpu386 {
             return Ok(clocks(6));
         }
 
+        let (_, operand) = self.resolve_decoded_modrm_operand(insn);
         let dest = modrm.reg;
         match opcode {
             0x6e => {
                 // MOVD mm, r/m32: zero-extend a dword into the register.
-                let v =
-                    self.read_rm_sized(bus, prefixes, address_size, OperandSize::Dword, modrm)?;
+                let v = self.read_operand_sized(bus, operand, OperandSize::Dword)?;
                 self.fpu.set_mm(dest, u64::from(v));
                 return Ok(clocks(4));
             }
             0x7e => {
                 // MOVD r/m32, mm: store the low dword.
                 let v = self.fpu.mm(dest) as u32;
-                self.write_rm_sized(bus, prefixes, address_size, OperandSize::Dword, modrm, v)?;
+                self.write_operand_sized(bus, operand, OperandSize::Dword, v)?;
                 return Ok(clocks(4));
             }
             0x6f => {
                 // MOVQ mm, mm/m64.
-                let v = self.read_mmx_operand(bus, prefixes, address_size, modrm)?;
+                let v = self.read_mmx_operand(bus, operand)?;
                 self.fpu.set_mm(dest, v);
                 return Ok(clocks(4));
             }
             0x7f => {
                 // MOVQ mm/m64, mm.
                 let v = self.fpu.mm(dest);
-                self.write_mmx_operand(bus, prefixes, address_size, modrm, v)?;
+                self.write_mmx_operand(bus, operand, v)?;
                 return Ok(clocks(4));
             }
             _ => {}
         }
 
-        let src = self.read_mmx_operand(bus, prefixes, address_size, modrm)?;
+        let src = self.read_mmx_operand(bus, operand)?;
         let a = self.fpu.mm(dest);
         let result = match opcode {
             0x60 => mmx::punpcklbw(a, src),
@@ -8067,14 +8214,11 @@ impl Cpu386 {
         Ok(clocks(4))
     }
 
-    fn read_mmx_operand<B: CpuBus>(
-        &mut self,
-        bus: &mut B,
-        prefixes: Prefixes,
-        address_size: AddressSize,
-        modrm: ModRm,
-    ) -> ExecResult<u64> {
-        match self.decode_rm_operand(bus, prefixes, address_size, modrm)? {
+    /// Read an MMX r/m operand (a register MMX value or an m64 from memory) from the pre-resolved
+    /// operand `decode` produced. The register form indexes the MMX file by `rm`; the memory form
+    /// reads the 64-bit value against the live effective address.
+    fn read_mmx_operand<B: CpuBus>(&mut self, bus: &mut B, operand: RmOperand) -> ExecResult<u64> {
+        match operand {
             RmOperand::Register(index) => Ok(self.fpu.mm(index)),
             RmOperand::Memory(mem) => self.read_qword(bus, mem),
         }
@@ -8083,12 +8227,10 @@ impl Cpu386 {
     fn write_mmx_operand<B: CpuBus>(
         &mut self,
         bus: &mut B,
-        prefixes: Prefixes,
-        address_size: AddressSize,
-        modrm: ModRm,
+        operand: RmOperand,
         value: u64,
     ) -> ExecResult<()> {
-        match self.decode_rm_operand(bus, prefixes, address_size, modrm)? {
+        match operand {
             RmOperand::Register(index) => {
                 self.fpu.set_mm(index, value);
                 Ok(())
@@ -13857,19 +13999,20 @@ mod tests {
 
     #[test]
     fn cmpxchg8b_register_form_is_undefined_opcode() {
-        // 0F C7 C9: mod=3 register form is #UD.
+        // 0F C7 C9: mod=3 register form is #UD. CMPXCHG8B is converted (`DecodeGroup::Misc`), so
+        // drive it through the split — the executor re-detects the register form and #UDs.
         let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0xc7, 0xc9], 0x20);
         let mut bus = TestBus::with_memory(memory);
-        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
         assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
     }
 
     #[test]
     fn cmpxchg8b_wrong_group_extension_is_undefined_opcode() {
-        // 0F C7 06 40 00: reg=/0, not CMPXCHG8B -> #UD.
+        // 0F C7 06 40 00: reg=/0, not CMPXCHG8B -> #UD. Driven through the split (converted).
         let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0xc7, 0x06, 0x40, 0x00], 0x80);
         let mut bus = TestBus::with_memory(memory);
-        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
         assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
     }
 
@@ -14322,62 +14465,36 @@ mod tests {
 
     #[test]
     fn seam_matches_fused_path_across_addressing_forms() {
-        // Run a battery of *non-converted* (legacy-fallback) instructions through cycle()
-        // (decode/execute split) and through execute_instruction_legacy (fused) from identical
-        // start state and assert identical end state. Guards that, for opcodes still on the legacy
-        // path, the seam stays behaviorally bit-identical to the fused path across addressing forms.
-        // The ALU block and the single-byte data-movement block (MOV/LEA/XCHG and friends) are no
-        // longer comparable this way: both are fully converted to the split, so their former fused
-        // executors were deleted (there must be no second plumbing path). They are covered against
-        // golden end-states in `alu_split_matches_golden_across_ops` and
-        // `datamove_split_matches_golden_across_ops`. `inc word [bx]` (0xff /0) used to be the case
-        // here, but 0xff (group 5) is now converted (`DecodeGroup::ControlFlow`). `test [bx], cx`
-        // (0x85) was used after that, but 0x84/0x85 are now converted (`DecodeGroup::FlagsMisc`).
-        // Use `xlat` (0xd7), still on Fallback, to keep exercising a memory-read through the seam:
-        // AL = [DS:BX+AL]. With seam_seed: BX=0x10, AL=0x02, so reads from 0x12.
-        let cases: &[(&str, &[u8])] = &[("xlat", &[0xd7])];
-        for (name, code) in cases {
-            let mut mem = vec![0u8; 0x200];
-            mem[..code.len()].copy_from_slice(code);
-            mem[0x12] = 0xab; // the XLAT lookup result planted at [BX+AL]=0x12
+        // Historically this diffed a *still-on-Fallback* memory-read opcode through cycle()
+        // (decode/execute split) against execute_instruction_legacy (fused) to guard the seam.
+        // After task A14 there is no longer any IMPLEMENTED opcode on Fallback to diff this way —
+        // every implemented opcode is converted to the split, so the fused executor for each was
+        // deleted. `inc word [bx]` (0xff), `test [bx],cx` (0x85), then `xlat` (0xd7) each served as
+        // the exemplar in turn and were converted away (`ControlFlow`/`FlagsMisc`/`Misc`). The seam's
+        // memory-read + single-fetch-charge behaviour is now covered by the per-group golden
+        // batteries (which assert eip, the memory write/read, AND `seam_fetch_count` == golden). Run
+        // XLAT — the last memory-read exemplar, now `DecodeGroup::Misc` — through the split and assert
+        // it both reads the right table byte AND charges each instruction-fetch byte exactly once.
+        let mut mem = vec![0u8; 0x200];
+        mem[0] = 0xd7; // XLAT
+        mem[0x12] = 0xab; // the XLAT lookup result planted at [BX+AL]=0x12 (BX=0x10, AL=0x02)
 
-            let mut fused = Cpu386::default();
-            seam_seed(&mut fused);
-            let mut fbus = TestBus::with_memory(mem.clone());
-            fused.begin_instruction();
-            let _ = fused.execute_instruction_legacy(&mut fbus);
+        let mut split = Cpu386::default();
+        seam_seed(&mut split);
+        let mut sbus = TestBus::with_memory(mem);
+        exec_one_split(&mut split, &mut sbus).unwrap();
 
-            let mut split = Cpu386::default();
-            seam_seed(&mut split);
-            let mut sbus = TestBus::with_memory(mem.clone());
-            let _ = split.cycle(&mut sbus);
-
-            assert_eq!(
-                split.registers.gpr, fused.registers.gpr,
-                "gpr mismatch for {name}"
-            );
-            assert_eq!(
-                split.registers.eflags, fused.registers.eflags,
-                "eflags mismatch for {name}"
-            );
-            assert_eq!(
-                split.registers.eip, fused.registers.eip,
-                "eip mismatch for {name}"
-            );
-            assert_eq!(sbus.memory, fbus.memory, "memory mismatch for {name}");
-
-            // Clock-neutrality guard: the seam must charge each instruction-fetch byte exactly
-            // once. The machine derives device/IRQ timing from the bus-trace fetch records, so a
-            // double-charge (e.g. decode reading the opcode and the fallback re-reading it) drifts
-            // timing. Count the InstructionPrefetch bus cycles on each path and require equality.
-            // This is scale-independent, unlike `core_clocks` (cycle() scales via scale_clocks
-            // while the fused reference returns raw clocks).
-            assert_eq!(
-                seam_fetch_count(&sbus),
-                seam_fetch_count(&fbus),
-                "instruction-fetch cycle count mismatch for {name} (seam must charge fetches once)"
-            );
-        }
+        // AL = [DS:BX+AL] = mem[0x12] = 0xab; the rest of AX (AH=0x01) is unchanged.
+        assert_eq!(split.read_reg16(Reg16::Ax), 0x01ab, "xlat result");
+        assert_eq!(split.registers.eip, 0x1, "eip past the 1-byte opcode");
+        // Clock-neutrality guard: 1 opcode-prefetch peek + 1 opcode byte = 2 instruction fetches;
+        // the data read of the table byte is a DataRead, not an InstructionPrefetch. A decode/execute
+        // double-charge of the opcode would push this past 2.
+        assert_eq!(
+            seam_fetch_count(&sbus),
+            2,
+            "the seam must charge each instruction-fetch byte exactly once"
+        );
     }
 
     /// One golden end-state for an ALU case run from `seam_seed`: the opcode bytes plus the
@@ -20419,6 +20536,550 @@ mod tests {
                 st.iter()
                     .map(|b| format!(" {b:#018x},"))
                     .collect::<String>(),
+            );
+        }
+    }
+
+    // ── Task A14: the heterogeneous one-off golden battery ─────────────────────────────────────────
+
+    /// One golden end-state for a Misc case (task A14). Captures the architectural register file
+    /// (AX,CX,DX,BX,SP,BP,SI,DI), eflags, eip, the (offset,value) memory writes, the instruction-
+    /// fetch cycle count, and the MMX register file + x87 tag word (so the MMX/EMMS members are
+    /// covered too). Port reads via TestBus always return 0, so the IN/OUT-derived register/memory
+    /// values reflect the read-zero behaviour; the port traffic itself is asserted separately by the
+    /// dedicated INS/OUTS tests.
+    struct MiscGolden {
+        name: &'static str,
+        code: &'static [u8],
+        gpr: [u32; 8],
+        eflags: u32,
+        eip: u32,
+        deltas: &'static [(usize, u8)],
+        fetch: usize,
+        mmx: [u64; 8],
+        fpu_tag: u16,
+    }
+
+    /// Seed for the Misc golden battery: a fixed register file giving BCD/IMUL/TEST/XLAT/MMX stable
+    /// inputs. AL=0x29, AH=0x05 (so DAA/AAA/AAM/AAD/TEST exercise the adjust/flag paths); CF/AF preset
+    /// so DAA/DAS see an incoming carry; BX=0x10 (XLAT base); CX/DX/SI/DI/BP fixed. EDX:EAX and ECX:EBX
+    /// are also given known 32-bit halves for CMPXCHG8B (set after this via the high words below).
+    fn misc_seed(cpu: &mut Cpu386) {
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.registers.set_eax(0x0000_0529); // AL=0x29, AH=0x05
+        cpu.registers.set_ecx(0x0000_0304);
+        cpu.registers.set_edx(0x0000_0506);
+        cpu.registers.set_ebx(0x0000_0010);
+        cpu.registers.set_esi(0x0000_0008);
+        cpu.registers.set_edi(0x0000_0018);
+        cpu.registers.set_ebp(0x0000_0010);
+        cpu.registers.eflags = 0x13; // CF=1, AF=1 (bit 4) on top of the always-1 bit 1
+        // Seed the MMX register file so MOVQ/Pxxx/EMMS have non-trivial inputs.
+        cpu.fpu.set_mm(0, 0x0102_0304_0506_0708);
+        cpu.fpu.set_mm(1, 0x1010_1010_1010_1010);
+    }
+
+    /// Seed memory for the Misc battery: plant the XLAT lookup table byte at [BX+AL]=[0x39], an
+    /// m64 for CMPXCHG8B at [0x40], and a packed-byte source for the MMX memory form at [0x100].
+    fn misc_seed_mem(mem: &mut [u8], code: &[u8]) {
+        mem[..code.len()].copy_from_slice(code);
+        mem[0x39] = 0xab; // XLAT: [DS:BX+AL] with BX=0x10, AL=0x29 -> 0x39
+        mem[0x40..0x48].copy_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes()); // CMPXCHG8B m64
+        mem[0x100..0x108].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]); // MMX m64 source
+    }
+
+    /// The heterogeneous one-off differential battery (task A14). Captured from the PRIOR fused
+    /// reference (`execute_instruction_legacy`) via `regen_misc_goldens` at parent commit f1d65e0f
+    /// WHILE the fused arms (single-byte 0x27/0x2f/0x37/0x3f/0x69/0x6b/0x6c-0x6f/0xa8/0xa9/0xd4/0xd5/
+    /// 0xd6/0xd7/0xf4 and the 0F CMPXCHG8B/MMX/CPUID/RDTSC/...) still existed. Never edit by hand —
+    /// re-run the regen from the pre-split commit. Covers: DAA/DAS/AAA/AAS (BCD flag effects),
+    /// AAM/AAD (incl. the imm8 base), TEST AL/AX,imm (flags only), IMUL r,r/m,imm8/imm16 (OF/CF set),
+    /// SALC, XLAT (memory read), HLT, CPUID, RDTSC, MOVD/MOVQ/PADDB/EMMS (MMX), and CMPXCHG8B.
+    fn misc_golden_cases() -> &'static [MiscGolden] {
+        // Captured verbatim from the fused reference at parent f1d65e0f via `regen_misc_goldens`
+        // (run in a throwaway worktree). Never edit by hand.
+        MISC_GOLDEN_CASES
+    }
+
+    /// The captured Misc golden literals. The `code`/`name` are authored; the remaining fields are
+    /// the fused reference's end-state, pasted verbatim from `regen_misc_goldens` (parent f1d65e0f).
+    /// gpr/code are the regen's printed (decimal) literals; do not hand-edit.
+    const MISC_GOLDEN_CASES: &[MiscGolden] = &[
+        MiscGolden {
+            name: "daa (27)",
+            code: &[39],
+            gpr: [1423, 772, 1286, 16, 0, 16, 8, 24],
+            eflags: 0x93,
+            eip: 0x1,
+            deltas: &[],
+            fetch: 2,
+            mmx: [
+                0x0102030405060708,
+                0x1010101010101010,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+            ],
+            fpu_tag: 0x0,
+        },
+        MiscGolden {
+            name: "das (2f)",
+            code: &[47],
+            gpr: [1475, 772, 1286, 16, 0, 16, 8, 24],
+            eflags: 0x97,
+            eip: 0x1,
+            deltas: &[],
+            fetch: 2,
+            mmx: [
+                0x0102030405060708,
+                0x1010101010101010,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+            ],
+            fpu_tag: 0x0,
+        },
+        MiscGolden {
+            name: "aaa (37)",
+            code: &[55],
+            gpr: [1551, 772, 1286, 16, 0, 16, 8, 24],
+            eflags: 0x13,
+            eip: 0x1,
+            deltas: &[],
+            fetch: 2,
+            mmx: [
+                0x0102030405060708,
+                0x1010101010101010,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+            ],
+            fpu_tag: 0x0,
+        },
+        MiscGolden {
+            name: "aas (3f)",
+            code: &[63],
+            gpr: [1027, 772, 1286, 16, 0, 16, 8, 24],
+            eflags: 0x13,
+            eip: 0x1,
+            deltas: &[],
+            fetch: 2,
+            mmx: [
+                0x0102030405060708,
+                0x1010101010101010,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+            ],
+            fpu_tag: 0x0,
+        },
+        MiscGolden {
+            name: "aam (d4 0a)",
+            code: &[212, 10],
+            gpr: [1025, 772, 1286, 16, 0, 16, 8, 24],
+            eflags: 0x13,
+            eip: 0x2,
+            deltas: &[],
+            fetch: 3,
+            mmx: [
+                0x0102030405060708,
+                0x1010101010101010,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+            ],
+            fpu_tag: 0x0,
+        },
+        MiscGolden {
+            name: "aad (d5 0a)",
+            code: &[213, 10],
+            gpr: [91, 772, 1286, 16, 0, 16, 8, 24],
+            eflags: 0x13,
+            eip: 0x2,
+            deltas: &[],
+            fetch: 3,
+            mmx: [
+                0x0102030405060708,
+                0x1010101010101010,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+            ],
+            fpu_tag: 0x0,
+        },
+        MiscGolden {
+            name: "test al,imm8 (a8 0f)",
+            code: &[168, 15],
+            gpr: [1321, 772, 1286, 16, 0, 16, 8, 24],
+            eflags: 0x16,
+            eip: 0x2,
+            deltas: &[],
+            fetch: 3,
+            mmx: [
+                0x0102030405060708,
+                0x1010101010101010,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+            ],
+            fpu_tag: 0x0,
+        },
+        MiscGolden {
+            name: "test ax,imm16 (a9 ff 00)",
+            code: &[169, 255, 0],
+            gpr: [1321, 772, 1286, 16, 0, 16, 8, 24],
+            eflags: 0x12,
+            eip: 0x3,
+            deltas: &[],
+            fetch: 4,
+            mmx: [
+                0x0102030405060708,
+                0x1010101010101010,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+            ],
+            fpu_tag: 0x0,
+        },
+        MiscGolden {
+            name: "imul ax,bx,imm8 (6b c3 02)",
+            code: &[107, 195, 2],
+            gpr: [32, 772, 1286, 16, 0, 16, 8, 24],
+            eflags: 0x12,
+            eip: 0x3,
+            deltas: &[],
+            fetch: 4,
+            mmx: [
+                0x0102030405060708,
+                0x1010101010101010,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+            ],
+            fpu_tag: 0x0,
+        },
+        MiscGolden {
+            name: "imul ax,bx,imm16 (69 c3 00 40)",
+            code: &[105, 195, 0, 64],
+            gpr: [0, 772, 1286, 16, 0, 16, 8, 24],
+            eflags: 0x813,
+            eip: 0x4,
+            deltas: &[],
+            fetch: 5,
+            mmx: [
+                0x0102030405060708,
+                0x1010101010101010,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+            ],
+            fpu_tag: 0x0,
+        },
+        MiscGolden {
+            name: "salc (d6)",
+            code: &[214],
+            gpr: [1535, 772, 1286, 16, 0, 16, 8, 24],
+            eflags: 0x13,
+            eip: 0x1,
+            deltas: &[],
+            fetch: 2,
+            mmx: [
+                0x0102030405060708,
+                0x1010101010101010,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+            ],
+            fpu_tag: 0x0,
+        },
+        MiscGolden {
+            name: "xlat (d7)",
+            code: &[215],
+            gpr: [1451, 772, 1286, 16, 0, 16, 8, 24],
+            eflags: 0x13,
+            eip: 0x1,
+            deltas: &[],
+            fetch: 2,
+            mmx: [
+                0x0102030405060708,
+                0x1010101010101010,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+            ],
+            fpu_tag: 0x0,
+        },
+        MiscGolden {
+            name: "rdtsc (0f 31)",
+            code: &[15, 49],
+            gpr: [0, 772, 0, 16, 0, 16, 8, 24],
+            eflags: 0x13,
+            eip: 0x2,
+            deltas: &[],
+            fetch: 3,
+            mmx: [
+                0x0102030405060708,
+                0x1010101010101010,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+            ],
+            fpu_tag: 0x0,
+        },
+        MiscGolden {
+            name: "movd mm0,eax (0f 6e c0)",
+            code: &[15, 110, 192],
+            gpr: [1321, 772, 1286, 16, 0, 16, 8, 24],
+            eflags: 0x13,
+            eip: 0x3,
+            deltas: &[],
+            fetch: 4,
+            mmx: [
+                0x0000000000000529,
+                0x1010101010101010,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+            ],
+            fpu_tag: 0x0,
+        },
+        MiscGolden {
+            name: "movq mm1,mm0 (0f 6f c8)",
+            code: &[15, 111, 200],
+            gpr: [1321, 772, 1286, 16, 0, 16, 8, 24],
+            eflags: 0x13,
+            eip: 0x3,
+            deltas: &[],
+            fetch: 4,
+            mmx: [
+                0x0102030405060708,
+                0x0102030405060708,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+            ],
+            fpu_tag: 0x0,
+        },
+        MiscGolden {
+            name: "paddb mm0,[0x100] (0f fc 06 00 01)",
+            code: &[15, 252, 6, 0, 1],
+            gpr: [1321, 772, 1286, 16, 0, 16, 8, 24],
+            eflags: 0x13,
+            eip: 0x5,
+            deltas: &[],
+            fetch: 6,
+            mmx: [
+                0x0909090909090909,
+                0x1010101010101010,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+            ],
+            fpu_tag: 0x0,
+        },
+        MiscGolden {
+            name: "emms (0f 77)",
+            code: &[15, 119],
+            gpr: [1321, 772, 1286, 16, 0, 16, 8, 24],
+            eflags: 0x13,
+            eip: 0x2,
+            deltas: &[],
+            fetch: 3,
+            mmx: [
+                0x0102030405060708,
+                0x1010101010101010,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+            ],
+            fpu_tag: 0xffff,
+        },
+        MiscGolden {
+            name: "cmpxchg8b [0x40] (0f c7 0e 40 00)",
+            code: &[15, 199, 14, 64, 0],
+            gpr: [84281096, 772, 16909060, 16, 0, 16, 8, 24],
+            eflags: 0x13,
+            eip: 0x5,
+            deltas: &[],
+            fetch: 6,
+            mmx: [
+                0x0102030405060708,
+                0x1010101010101010,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+                0x0000000000000000,
+            ],
+            fpu_tag: 0x0,
+        },
+    ];
+
+    #[test]
+    fn misc_split_matches_golden_across_ops() {
+        // The Misc one-off opcodes are converted to the decode/execute split, so their fused arms
+        // are deleted and they can no longer be diffed against a fused executor in-tree. Run each
+        // case through the split (`exec_one_split`) and assert the architectural end-state — GPRs,
+        // eflags, the MMX file + x87 tag, and the memory writes — against goldens captured from the
+        // pre-split fused path (parent f1d65e0f) via `regen_misc_goldens`. eip + fetch prove decode
+        // consumed and charged every byte (opcode + ModRM + displacement + immediate) exactly once.
+        for g in misc_golden_cases() {
+            let mut mem = vec![0u8; 0x200];
+            misc_seed_mem(&mut mem, g.code);
+            let initial = mem.clone();
+
+            let mut split = Cpu386::default();
+            misc_seed(&mut split);
+            let mut sbus = TestBus::with_memory(mem);
+            exec_one_split(&mut split, &mut sbus).unwrap();
+
+            assert_eq!(split.registers.gpr, g.gpr, "gpr mismatch for {}", g.name);
+            assert_eq!(
+                split.registers.eflags, g.eflags,
+                "eflags mismatch for {}",
+                g.name
+            );
+            assert_eq!(split.registers.eip, g.eip, "eip mismatch for {}", g.name);
+            let mmx: [u64; 8] = std::array::from_fn(|i| split.fpu.mm(i as u8));
+            assert_eq!(mmx, g.mmx, "mmx register mismatch for {}", g.name);
+            assert_eq!(split.fpu.tag, g.fpu_tag, "fpu tag mismatch for {}", g.name);
+            let deltas: Vec<(usize, u8)> = sbus
+                .memory
+                .iter()
+                .enumerate()
+                .filter(|(i, b)| **b != initial[*i])
+                .map(|(i, b)| (i, *b))
+                .collect();
+            assert_eq!(deltas, g.deltas, "memory-write mismatch for {}", g.name);
+            assert_eq!(
+                seam_fetch_count(&sbus),
+                g.fetch,
+                "instruction-fetch cycle count mismatch for {} (seam must charge fetches once)",
+                g.name
+            );
+        }
+    }
+
+    /// AAM with a base of 0 is a divide error (#DE) — the only Misc op that faults on its operand,
+    /// so it is asserted here (through the split) rather than carried as a golden end-state.
+    /// (`aam_zero_divisor_is_divide_error` covers the same via `cycle`; this pins the split decode
+    /// path specifically: decode fetches the imm8 base, the executor raises #DE on base 0.)
+    #[test]
+    fn misc_aam_base_zero_is_divide_error() {
+        let (mut cpu, memory) = real_mode_cpu(&[0xd4, 0x00], 0x20);
+        let mut bus = TestBus::with_memory(memory);
+        assert!(
+            matches!(
+                exec_one_split(&mut cpu, &mut bus),
+                Err(InternalFault::Cpu(CpuError::DivideError))
+            ),
+            "AAM base 0 must raise #DE through the split"
+        );
+    }
+
+    /// Regenerate `MISC_GOLDEN_CASES` from the fused reference. Ignored by default. Run WHILE the
+    /// fused one-off arms still exist (parent commit f1d65e0f):
+    ///   git worktree add ../regen-a14 f1d65e0f
+    ///   cd ../regen-a14
+    ///   # paste this test + the cases/seed/struct in, then:
+    ///   cargo test -p izarravm-cpu --lib regen_misc_goldens -- --ignored --nocapture
+    /// then paste the output over `MISC_GOLDEN_CASES` and only then delete the fused arms.
+    #[test]
+    #[ignore = "prints golden literals; run with --ignored --nocapture against the fused reference"]
+    fn regen_misc_goldens() {
+        for g in misc_golden_cases() {
+            let mut mem = vec![0u8; 0x200];
+            misc_seed_mem(&mut mem, g.code);
+            let initial = mem.clone();
+
+            let mut fused = Cpu386::default();
+            misc_seed(&mut fused);
+            let mut fbus = TestBus::with_memory(mem);
+            fused.begin_instruction();
+            if fused.execute_instruction_legacy(&mut fbus).is_err() {
+                println!(
+                    "            // TODO regen {}: fused path unavailable here; run against the base commit",
+                    g.name
+                );
+                continue;
+            }
+            let deltas: Vec<(usize, u8)> = fbus
+                .memory
+                .iter()
+                .enumerate()
+                .filter(|(i, b)| **b != initial[*i])
+                .map(|(i, b)| (i, *b))
+                .collect();
+            let fetch = seam_fetch_count(&fbus);
+            let mmx: [u64; 8] = std::array::from_fn(|i| fused.fpu.mm(i as u8));
+            println!(
+                "    MiscGolden {{ name: {:?}, code: &{:?}, gpr: {:?}, eflags: {:#x}, eip: {:#x}, deltas: &{:?}, fetch: {}, mmx: [{} ], fpu_tag: {:#x} }},",
+                g.name,
+                g.code,
+                fused.registers.gpr,
+                fused.registers.eflags,
+                fused.registers.eip,
+                deltas,
+                fetch,
+                mmx.iter()
+                    .map(|b| format!(" {b:#018x},"))
+                    .collect::<String>(),
+                fused.fpu.tag,
             );
         }
     }
