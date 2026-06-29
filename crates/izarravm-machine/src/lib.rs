@@ -37,6 +37,7 @@ mod fat_name;
 mod fdc;
 mod floppy;
 mod ide;
+mod katea_names;
 mod katea_volume;
 mod keyboard;
 mod lpt;
