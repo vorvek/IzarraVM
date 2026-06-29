@@ -22,6 +22,7 @@ use izarravm_video::{
     VGA_TEXT_MEMORY_SIZE, VGA_TEXT_PAGE_STRIDE, Vga, VgaRaster, VideoMode, bytes_per_pixel, font,
     pixel_format, vbe_mode,
 };
+pub use katea_volume::{FileSource, KateaVolume, VolumeFile};
 use thiserror::Error;
 
 mod ata;
@@ -36,6 +37,7 @@ mod fat_name;
 mod fdc;
 mod floppy;
 mod ide;
+mod katea_volume;
 mod keyboard;
 mod lpt;
 mod memmap;
