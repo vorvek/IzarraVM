@@ -55,6 +55,9 @@ const LED_OFF: egui::Color32 = egui::Color32::from_rgb(0x2D, 0x4A, 0x2E);
 /// The Izarra 3000 logo's red, sampled from the wordmark. Used for the floating
 /// window headers so they read as branded and contrast on the beige frame.
 const LOGO_RED: egui::Color32 = egui::Color32::from_rgb(0xC7, 0x44, 0x46);
+/// A darker blue for hyperlinks, legible on the beige panel (egui's default
+/// link blue is too light against it).
+const LINK_BLUE: egui::Color32 = egui::Color32::from_rgb(0x0D, 0x47, 0xA1);
 
 /// The panel face as f32 RGB, for the logo recolor unmix target.
 const PANEL_FACE_F32: [f32; 3] = [205.0, 195.0, 164.0];
@@ -351,7 +354,12 @@ fn beige_window(
     .frame(
         egui::Frame::new()
             .fill(PANEL_FACE)
-            .inner_margin(egui::Margin::same(12))
+            .inner_margin(egui::Margin {
+                left: 14,
+                right: 14,
+                top: 12,
+                bottom: 12,
+            })
             .corner_radius(4.0),
     )
     .show(ctx, |ui| {
@@ -382,6 +390,39 @@ fn info_button(ui: &mut egui::Ui) -> egui::Response {
         stroke,
     );
     resp
+}
+
+/// Render multi-line attribution text, turning any embedded http(s) URL into a
+/// clickable hyperlink (link color comes from the ui's `hyperlink_color`). One
+/// label per source line so each stays on its own line in a wide-enough window;
+/// keeps the NOTICE file as the single source of truth.
+fn notice_block(ui: &mut egui::Ui, text: &str, color: egui::Color32, size: f32) {
+    ui.spacing_mut().item_spacing.y = 1.0;
+    for line in text.lines() {
+        let Some(start) = line.find("http") else {
+            ui.label(egui::RichText::new(line).color(color).size(size));
+            continue;
+        };
+        // The URL runs until whitespace or a closing paren.
+        let len = line[start..]
+            .find(|c: char| c.is_whitespace() || c == ')')
+            .unwrap_or(line.len() - start);
+        let (url, before, after) = (
+            &line[start..start + len],
+            &line[..start],
+            &line[start + len..],
+        );
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            if !before.is_empty() {
+                ui.label(egui::RichText::new(before).color(color).size(size));
+            }
+            ui.hyperlink_to(egui::RichText::new(url).size(size), url);
+            if !after.is_empty() {
+                ui.label(egui::RichText::new(after).color(color).size(size));
+            }
+        });
+    }
 }
 
 /// A small square drive-activity LED.
@@ -1670,7 +1711,12 @@ impl GuiApp {
         let modal = egui::Modal::new(egui::Id::new("config-modal")).show(ctx, |ui| {
             egui::Frame::new()
                 .fill(PANEL_FACE)
-                .inner_margin(egui::Margin::same(12))
+                .inner_margin(egui::Margin {
+                    left: 14,
+                    right: 14,
+                    top: 12,
+                    bottom: 12,
+                })
                 .corner_radius(4.0)
                 .show(ui, |ui| {
                     beige_visuals(ui);
@@ -1840,7 +1886,8 @@ impl GuiApp {
     fn about_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_about;
         let mut open_license = self.show_license;
-        beige_window(ctx, "About IzarraVM", &mut open, [360.0, 440.0], |ui| {
+        beige_window(ctx, "About IzarraVM", &mut open, [540.0, 420.0], |ui| {
+            ui.visuals_mut().hyperlink_color = LINK_BLUE;
             ui.label(
                 egui::RichText::new(concat!("IzarraVM ", env!("CARGO_PKG_VERSION")))
                     .color(INK)
@@ -1865,11 +1912,7 @@ impl GuiApp {
                     .size(11.0)
                     .strong(),
             );
-            ui.label(
-                egui::RichText::new(include_str!("../../../NOTICE"))
-                    .color(MUTED)
-                    .size(11.0),
-            );
+            notice_block(ui, include_str!("../../../NOTICE"), MUTED, 11.0);
             ui.add_space(8.0);
             if ui.button("View license").clicked() {
                 open_license = true;
