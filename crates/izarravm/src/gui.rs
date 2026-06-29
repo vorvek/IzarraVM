@@ -921,7 +921,7 @@ pub struct GuiApp {
     cd_label: Option<String>,
     cd_access_seen: u64,
     cd_access_at: Option<Instant>,
-    // Whether the floating COM1 window is open. The sidebar button and the
+    // Whether the floating COM1 window is open. The footer button and the
     // window's own close control both flip this.
     show_com1: bool,
     // Whether the floating About window is open. The footer info button and the
@@ -2193,6 +2193,8 @@ impl GuiApp {
         }
         // The configuration modal renders on top of everything when open.
         self.config_ui(ctx);
+        // About must dispatch before License: its "View license" button sets
+        // show_license, so this order opens the License window the same frame.
         if self.show_about {
             self.about_window(ctx);
         }
