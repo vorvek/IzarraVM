@@ -1,3 +1,4 @@
+mod bench_reference;
 mod cmos;
 mod crt;
 mod gui;
@@ -394,7 +395,7 @@ fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
             } else {
                 0.0
             };
-            println!(
+            print!(
                 "{:<10} {:<5} {:>12.2} {:>8} {:>9} {:>12.1} {:>10.3} {:>9.3} {:>10.3}",
                 bench.name,
                 mode.canonical_name(),
@@ -406,9 +407,28 @@ fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
                 wall_secs * 1000.0,
                 rt,
             );
+            // Soft reporter: tag each row against the era reference band. This
+            // is observability only and never changes the exit code; calibrating
+            // these into band is a later task, so most rows tag LOW or HIGH today.
+            println!("{}", band_tag(bench.name, mode, iters_per_sec));
         }
     }
     Ok(())
+}
+
+/// Compare a measured `iters/sec` to the matching era reference band and return
+/// a tag to append to the row: ` [in band]`, ` [LOW <ratio>]`, ` [HIGH <ratio>]`,
+/// or empty when no band is encoded for this payload/mode.
+fn band_tag(payload: &str, mode: GswMode, iters_per_sec: f64) -> String {
+    use bench_reference::BandVerdict;
+    let Some(band) = bench_reference::band_for(payload, mode) else {
+        return String::new();
+    };
+    match band.verdict(iters_per_sec) {
+        BandVerdict::InBand => " [in band]".to_string(),
+        BandVerdict::Low => format!(" [LOW {:.2}]", iters_per_sec / band.target),
+        BandVerdict::High => format!(" [HIGH {:.2}]", iters_per_sec / band.target),
+    }
 }
 
 /// Load and run a DOS .COM/.EXE headless, then exit with its DOS exit code.
