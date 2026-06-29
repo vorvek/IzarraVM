@@ -11,11 +11,11 @@
 // these up.
 #![allow(dead_code)]
 
-use crate::fat32::FAT32_EOC;
+use crate::fat32::{FAT32_EOC, fat32_dir_entry};
 use crate::katea_names::NameTable;
 use crate::katea_volume::{
-    FAT0_MEDIA, FileSource, NUM_FATS, PART_START, RESERVED_SECTORS, ROOT_CLUSTER, SECTOR,
-    fat_size_sectors, sectors_per_cluster,
+    ATTR_ARCHIVE, FAT0_MEDIA, FileSource, NUM_FATS, PART_START, RESERVED_SECTORS, ROOT_CLUSTER,
+    SECTOR, fat_size_sectors, sectors_per_cluster,
 };
 use std::collections::HashSet;
 use std::path::Path;
@@ -336,6 +336,75 @@ impl ClusterIndex {
     }
 }
 
+/// The FAT subdirectory attribute (ATTR_DIRECTORY); files use `ATTR_ARCHIVE`.
+const ATTR_SUBDIR: u8 = 0x10;
+
+/// Build the 32-byte directory entries for `dir` in directory order:
+/// `.`/`..` first (non-root only), then files (archive attr), then
+/// subdirectories (0x10). `.` points at this directory's own first cluster and
+/// `..` at the parent's; a subdir entry points at the child's first cluster.
+fn dir_entries(dir: &TreeDir, is_root: bool) -> Vec<[u8; 32]> {
+    let mut out: Vec<[u8; 32]> = Vec::new();
+    if !is_root {
+        let dot = *b".          ";
+        out.push(fat32_dir_entry(
+            &dot,
+            ATTR_SUBDIR,
+            dir.first_cluster,
+            0,
+            0,
+            0,
+        ));
+        let dotdot = *b"..         ";
+        out.push(fat32_dir_entry(
+            &dotdot,
+            ATTR_SUBDIR,
+            dir.parent_first_cluster,
+            0,
+            0,
+            0,
+        ));
+    }
+    for f in &dir.files {
+        let size = u32::try_from(f.source.len()).unwrap_or(u32::MAX);
+        out.push(fat32_dir_entry(
+            &f.name,
+            ATTR_ARCHIVE,
+            f.first_cluster,
+            0,
+            0,
+            size,
+        ));
+    }
+    for s in &dir.subdirs {
+        out.push(fat32_dir_entry(
+            &s.name,
+            ATTR_SUBDIR,
+            s.dir.first_cluster,
+            0,
+            0,
+            0,
+        ));
+    }
+    out
+}
+
+/// One 512-byte sector (the `sector`-th, 16 entries) of `dir`'s directory data,
+/// zero-padded past the last entry. `sector` indexes into the directory's entry
+/// list 16 entries at a time, so the >16-entry (multi-cluster) case is served by
+/// the later sectors.
+pub(crate) fn dir_sector(dir: &TreeDir, is_root: bool, sector: u32) -> [u8; SECTOR] {
+    let entries = dir_entries(dir, is_root);
+    let mut out = [0u8; SECTOR];
+    let start = (sector as usize) * 16;
+    for i in 0..16usize {
+        if let Some(e) = entries.get(start + i) {
+            out[i * 32..i * 32 + 32].copy_from_slice(e);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,6 +515,70 @@ mod tests {
             u32::from_le_bytes([s[0], s[1], s[2], s[3]]) & 0x0FFF_FFFF,
             0x0FFF_FFF8
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn directory_sector_emits_dot_dotdot_files_and_subdir_entries() {
+        let root = scratch("dir");
+        std::fs::create_dir_all(root.join("SUB")).unwrap();
+        std::fs::write(root.join("SUB/A.TXT"), b"hi").unwrap();
+        let sys = vec![("KERNEL.SYS".to_string(), vec![0u8; 10])];
+        let mut tree = build_tree(&root, &sys);
+        allocate(&mut tree);
+
+        // Root sector 0: entry 0 = KERNEL.SYS (archive), and a SUB subdir entry (0x10).
+        let rootsec = dir_sector(&tree.root, true, 0);
+        assert_eq!(&rootsec[0..11], b"KERNEL  SYS");
+        assert_eq!(rootsec[11], 0x20); // archive
+        let sub = &tree.root.subdirs[0];
+        // Find SUB's 32-byte entry in the root sector.
+        let pos = (0..16)
+            .map(|i| i * 32)
+            .find(|&o| &rootsec[o..o + 11] == b"SUB        ")
+            .unwrap();
+        assert_eq!(rootsec[pos + 11] & 0x10, 0x10, "subdir attribute");
+
+        // SUB sector 0: `.` then `..`, then A.TXT.
+        let subsec = dir_sector(&sub.dir, false, 0);
+        assert_eq!(&subsec[0..11], b".          ");
+        assert_eq!(subsec[11] & 0x10, 0x10);
+        assert_eq!(&subsec[32..43], b"..         ");
+        assert_eq!(&subsec[64..75], b"A       TXT");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn directory_spanning_multiple_clusters_serves_later_sectors() {
+        let root = scratch("multiclu");
+        for i in 0..20 {
+            std::fs::write(root.join(format!("F{i:02}.TXT")), b"x").unwrap();
+        }
+        let mut tree = build_tree(&root, &[]);
+        allocate(&mut tree);
+        // 20 file entries (16 per 512B sector at spc=1) need more than one cluster.
+        assert!(
+            tree.root.cluster_count >= 2,
+            "20 entries need > 1 cluster at spc=1"
+        );
+        // Second sector (entries 16..32 in directory order) holds the 17th+ entries.
+        let s1 = dir_sector(&tree.root, true, 1);
+        // The walk sorts F00.TXT..F19.TXT and there are no subdirs/system files,
+        // so the 17th directory entry (0-based index 16) is F16.TXT.
+        assert_eq!(
+            &s1[0..11],
+            b"F16     TXT",
+            "sector 1, entry 0 is the 17th file"
+        );
+        assert_eq!(s1[11], crate::katea_volume::ATTR_ARCHIVE, "a file entry");
+        // The 20th (last) file lands at index 19 -> sector 1, entry 3.
+        assert_eq!(
+            &s1[3 * 32..3 * 32 + 11],
+            b"F19     TXT",
+            "entry 19 is F19.TXT"
+        );
+        // Entries past the 20th are zero-padded.
+        assert_eq!(s1[4 * 32], 0x00, "no entry past the last file");
         std::fs::remove_dir_all(&root).ok();
     }
 }
