@@ -330,11 +330,12 @@ fn header_text(text: &str, size: f32) -> egui::RichText {
 /// License): PANEL_FACE fill, a dark-beige border, beige inner padding, a bold
 /// logo-red header, no collapse button, draggable + closable. The caller
 /// supplies the title, the open flag (the window's own close control flips it),
-/// a default size, and the body.
+/// whether the window shows a resize grip, a default size, and the body.
 fn beige_window(
     ctx: &egui::Context,
     title: &str,
     open: &mut bool,
+    resizable: bool,
     default_size: [f32; 2],
     add: impl FnOnce(&mut egui::Ui),
 ) {
@@ -352,7 +353,7 @@ fn beige_window(
     });
     egui::Window::new(header_text(title, 15.0))
         .open(open)
-        .resizable(true)
+        .resizable(resizable)
         .collapsible(false)
         .default_size(default_size)
         .frame(
@@ -418,17 +419,32 @@ fn notice_block(ui: &mut egui::Ui, text: &str, color: egui::Color32, size: f32) 
             &line[..start],
             &line[start + len..],
         );
-        // A shrink-to-content row (not wrapped) so it centers as one unit.
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            if !before.is_empty() {
-                ui.label(egui::RichText::new(before).color(color).size(size));
-            }
-            ui.hyperlink_to(egui::RichText::new(url).size(size), url);
-            if !after.is_empty() {
-                ui.label(egui::RichText::new(after).color(color).size(size));
-            }
+        // A plain horizontal takes the full width and left-biases in a centered
+        // layout, so measure the line and allocate a row exactly that wide; the
+        // centered layout then centers the whole row.
+        let mut row = ui.fonts(|f| {
+            f.layout_no_wrap(
+                format!("{before}{url}{after}"),
+                egui::FontId::proportional(size),
+                color,
+            )
+            .size()
         });
+        row.x += 2.0;
+        ui.allocate_ui_with_layout(
+            row,
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                if !before.is_empty() {
+                    ui.label(egui::RichText::new(before).color(color).size(size));
+                }
+                ui.hyperlink_to(egui::RichText::new(url).size(size), url);
+                if !after.is_empty() {
+                    ui.label(egui::RichText::new(after).color(color).size(size));
+                }
+            },
+        );
     }
 }
 
@@ -1842,7 +1858,7 @@ impl GuiApp {
             None => String::new(),
         };
         let mut open = self.show_com1;
-        beige_window(ctx, "COM1", &mut open, [480.0, 320.0], |ui| {
+        beige_window(ctx, "COM1", &mut open, true, [480.0, 320.0], |ui| {
             egui::Frame::new()
                 .fill(egui::Color32::WHITE)
                 .inner_margin(egui::Margin::same(4))
@@ -1867,23 +1883,30 @@ impl GuiApp {
     /// white inside the shared beige chrome. Opened from the About window.
     fn license_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_license;
-        beige_window(ctx, "License (GPL-3.0)", &mut open, [640.0, 520.0], |ui| {
-            egui::Frame::new()
-                .fill(egui::Color32::WHITE)
-                .inner_margin(egui::Margin::same(4))
-                .show(ui, |ui| {
-                    ui.style_mut().spacing.scroll.bar_width = 6.0;
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.add(egui::Label::new(
-                                egui::RichText::new(include_str!("../../../LICENSE"))
-                                    .monospace()
-                                    .color(egui::Color32::BLACK),
-                            ));
-                        });
-                });
-        });
+        beige_window(
+            ctx,
+            "License (GPL-3.0)",
+            &mut open,
+            true,
+            [640.0, 520.0],
+            |ui| {
+                egui::Frame::new()
+                    .fill(egui::Color32::WHITE)
+                    .inner_margin(egui::Margin::same(4))
+                    .show(ui, |ui| {
+                        ui.style_mut().spacing.scroll.bar_width = 6.0;
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.add(egui::Label::new(
+                                    egui::RichText::new(include_str!("../../../LICENSE"))
+                                        .monospace()
+                                        .color(egui::Color32::BLACK),
+                                ));
+                            });
+                    });
+            },
+        );
         self.show_license = open;
     }
 
@@ -1893,40 +1916,49 @@ impl GuiApp {
     fn about_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_about;
         let mut open_license = self.show_license;
-        beige_window(ctx, "About IzarraVM", &mut open, [540.0, 420.0], |ui| {
-            ui.vertical_centered(|ui| {
-                ui.visuals_mut().hyperlink_color = LINK_BLUE;
-                ui.label(
-                    egui::RichText::new(concat!("IzarraVM ", env!("CARGO_PKG_VERSION")))
-                        .color(INK)
-                        .size(18.0)
-                        .strong(),
-                );
-                ui.label(
-                    egui::RichText::new("the Izarra 3000 virtual machine")
+        beige_window(
+            ctx,
+            "About IzarraVM",
+            &mut open,
+            false,
+            [540.0, 420.0],
+            |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.visuals_mut().hyperlink_color = LINK_BLUE;
+                    ui.label(
+                        egui::RichText::new(concat!("IzarraVM ", env!("CARGO_PKG_VERSION")))
+                            .color(INK)
+                            .size(18.0)
+                            .strong(),
+                    );
+                    ui.label(
+                        egui::RichText::new("the Izarra 3000 virtual machine")
+                            .color(MUTED)
+                            .size(12.0),
+                    );
+                    ui.hyperlink_to("github.com/vorvek/IzarraVM", GITHUB_URL);
+                    ui.label(
+                        egui::RichText::new(
+                            "\u{00A9} 2026 General Simulation Works \u{00B7} GPL-3.0",
+                        )
                         .color(MUTED)
                         .size(12.0),
-                );
-                ui.hyperlink_to("github.com/vorvek/IzarraVM", GITHUB_URL);
-                ui.label(
-                    egui::RichText::new("\u{00A9} 2026 General Simulation Works \u{00B7} GPL-3.0")
-                        .color(MUTED)
-                        .size(12.0),
-                );
-                ui.separator();
-                ui.label(
-                    egui::RichText::new("Bundled software")
-                        .color(LABEL)
-                        .size(11.0)
-                        .strong(),
-                );
-                notice_block(ui, include_str!("../../../NOTICE"), MUTED, 11.0);
-                ui.add_space(8.0);
-                if ui.button("View license").clicked() {
-                    open_license = true;
-                }
-            });
-        });
+                    );
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("Bundled software")
+                            .color(LABEL)
+                            .size(11.0)
+                            .strong(),
+                    );
+                    notice_block(ui, include_str!("../../../NOTICE"), MUTED, 11.0);
+                    ui.add_space(8.0);
+                    if ui.button("View license").clicked() {
+                        open_license = true;
+                    }
+                });
+            },
+        );
         self.show_about = open;
         self.show_license = open_license;
     }
