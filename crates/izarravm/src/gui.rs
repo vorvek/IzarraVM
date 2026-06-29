@@ -52,9 +52,17 @@ const LABEL: egui::Color32 = egui::Color32::from_rgb(0x6B, 0x62, 0x48);
 const MUTED: egui::Color32 = egui::Color32::from_rgb(0x5C, 0x53, 0x40);
 const LED_ON: egui::Color32 = egui::Color32::from_rgb(0x46, 0xE0, 0x5A);
 const LED_OFF: egui::Color32 = egui::Color32::from_rgb(0x2D, 0x4A, 0x2E);
+/// The Izarra 3000 logo's red, sampled from the wordmark. Used for the floating
+/// window headers so they read as branded and contrast on the beige frame.
+const LOGO_RED: egui::Color32 = egui::Color32::from_rgb(0xC7, 0x44, 0x46);
+/// A darker blue for hyperlinks, legible on the beige panel (egui's default
+/// link blue is too light against it).
+const LINK_BLUE: egui::Color32 = egui::Color32::from_rgb(0x0D, 0x47, 0xA1);
 
 /// The panel face as f32 RGB, for the logo recolor unmix target.
 const PANEL_FACE_F32: [f32; 3] = [205.0, 195.0, 164.0];
+
+const GITHUB_URL: &str = "https://github.com/vorvek/IzarraVM";
 
 /// The embedded logo as pre-decoded straight RGBA (off-white background). It is
 /// recoloured to the panel beige at load. Regenerate with the PowerShell recipe
@@ -307,6 +315,137 @@ fn beige_group<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R 
         });
     bevel_edges(ui.painter(), res.response.rect, true);
     res.inner
+}
+
+/// The shared red, bold header style for dialog and floating-window titles, so
+/// the brand red lives in one place (window titles and the config header).
+fn header_text(text: &str, size: f32) -> egui::RichText {
+    egui::RichText::new(text)
+        .color(LOGO_RED)
+        .strong()
+        .size(size)
+}
+
+/// The shared beige look for IzarraVM's floating windows (COM1, About,
+/// License): PANEL_FACE fill, a dark-beige border, beige inner padding, a bold
+/// logo-red header, no collapse button, draggable + closable. The caller
+/// supplies the title, the open flag (the window's own close control flips it),
+/// whether the window shows a resize grip, a default size, and the body.
+fn beige_window(
+    ctx: &egui::Context,
+    title: &str,
+    open: &mut bool,
+    resizable: bool,
+    default_size: [f32; 2],
+    add: impl FnOnce(&mut egui::Ui),
+) {
+    // egui paints the title bar (title text + close button) from the global
+    // style before the body runs, so darken the interactive glyphs (the close
+    // X) to read on the beige frame here, then restore. The title text itself
+    // is a bold logo-red RichText below.
+    let saved_widgets = ctx.style().visuals.widgets.clone();
+    ctx.style_mut(|s| {
+        s.visuals.widgets.inactive.fg_stroke.color = INK;
+        s.visuals.widgets.hovered.fg_stroke.color = INK;
+        s.visuals.widgets.active.fg_stroke.color = INK;
+        s.visuals.widgets.hovered.weak_bg_fill = BEVEL_HI;
+        s.visuals.widgets.active.weak_bg_fill = BEVEL_LO;
+    });
+    egui::Window::new(header_text(title, 15.0))
+        .open(open)
+        .resizable(resizable)
+        .collapsible(false)
+        .default_size(default_size)
+        .frame(
+            egui::Frame::new()
+                .fill(PANEL_FACE)
+                .stroke(egui::Stroke::new(1.5, BEVEL_LO))
+                .inner_margin(egui::Margin {
+                    left: 14,
+                    right: 14,
+                    top: 12,
+                    bottom: 12,
+                })
+                .corner_radius(4.0),
+        )
+        .show(ctx, |ui| {
+            beige_visuals(ui);
+            add(ui);
+        });
+    ctx.style_mut(|s| {
+        s.visuals.widgets = saved_widgets;
+    });
+}
+
+/// A small painted "i in a circle" info-icon button, since the default font
+/// lacks the U+1F6C8 glyph. Matches the adjacent buttons' footprint; returns
+/// the click response so callers can add hover text and handle clicks.
+fn info_button(ui: &mut egui::Ui) -> egui::Response {
+    let h = ui.spacing().interact_size.y;
+    let resp = ui.add_sized([h, h], egui::Button::new(""));
+    let rect = resp.rect;
+    let c = rect.center();
+    let r = (h * 0.32).round();
+    let stroke = egui::Stroke::new(1.5, INK);
+    let p = ui.painter();
+    p.circle_stroke(c, r, stroke);
+    // The dot and stem of the lowercase "i".
+    p.circle_filled(c - egui::vec2(0.0, r * 0.45), 1.1, INK);
+    p.line_segment(
+        [c - egui::vec2(0.0, r * 0.05), c + egui::vec2(0.0, r * 0.5)],
+        stroke,
+    );
+    resp
+}
+
+/// Render multi-line attribution text, turning any embedded http(s) URL into a
+/// clickable hyperlink (link color comes from the ui's `hyperlink_color`). One
+/// label per source line so each stays on its own line in a wide-enough window
+/// and centers cleanly in a centered layout; keeps the NOTICE file as the
+/// single source of truth.
+fn notice_block(ui: &mut egui::Ui, text: &str, color: egui::Color32, size: f32) {
+    ui.spacing_mut().item_spacing.y = 1.0;
+    for line in text.lines() {
+        let Some(start) = line.find("http") else {
+            ui.label(egui::RichText::new(line).color(color).size(size));
+            continue;
+        };
+        // The URL runs until whitespace or a closing paren.
+        let len = line[start..]
+            .find(|c: char| c.is_whitespace() || c == ')')
+            .unwrap_or(line.len() - start);
+        let (url, before, after) = (
+            &line[start..start + len],
+            &line[..start],
+            &line[start + len..],
+        );
+        // A plain horizontal takes the full width and left-biases in a centered
+        // layout, so measure the line and allocate a row exactly that wide; the
+        // centered layout then centers the whole row.
+        let mut row = ui.fonts(|f| {
+            f.layout_no_wrap(
+                format!("{before}{url}{after}"),
+                egui::FontId::proportional(size),
+                color,
+            )
+            .size()
+        });
+        row.x += 2.0;
+        ui.allocate_ui_with_layout(
+            row,
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                if !before.is_empty() {
+                    ui.label(egui::RichText::new(before).color(color).size(size));
+                }
+                ui.hyperlink_to(egui::RichText::new(url).size(size), url);
+                if !after.is_empty() {
+                    ui.label(egui::RichText::new(after).color(color).size(size));
+                }
+            },
+        );
+    }
 }
 
 /// A small square drive-activity LED.
@@ -892,9 +1031,15 @@ pub struct GuiApp {
     cd_label: Option<String>,
     cd_access_seen: u64,
     cd_access_at: Option<Instant>,
-    // Whether the floating COM1 window is open. The sidebar button and the
+    // Whether the floating COM1 window is open. The footer button and the
     // window's own close control both flip this.
     show_com1: bool,
+    // Whether the floating About window is open. The footer info button and the
+    // window's own close control both flip this.
+    show_about: bool,
+    // Whether the floating License (GPL-3.0) window is open. The About window's
+    // "View license" button and the window's own close control flip this.
+    show_license: bool,
     // Master volume slider position, 0.0..1.0. Cubed into a host-side gain that
     // the emulation thread reads through `gain`.
     volume: f32,
@@ -1014,6 +1159,8 @@ impl GuiApp {
             cd_access_seen: 0,
             cd_access_at: None,
             show_com1: false,
+            show_about: false,
+            show_license: false,
             volume,
             gain,
             glide_render_threads,
@@ -1469,9 +1616,8 @@ impl GuiApp {
                         ),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let com1_label = if self.show_com1 { "Hide COM1" } else { "COM1" };
-                        if ui.button(com1_label).clicked() {
-                            self.show_com1 = !self.show_com1;
+                        if info_button(ui).on_hover_text("About").clicked() {
+                            self.show_about = true;
                         }
                         if ui
                             .button("\u{2699}")
@@ -1482,14 +1628,22 @@ impl GuiApp {
                         }
                     });
                 });
-                line(
-                    ui,
-                    format!(
-                        "Speed {:.0}% - {} MB",
-                        speed * 100.0,
-                        self.profile.memory_mib
-                    ),
-                );
+                ui.horizontal(|ui| {
+                    line(
+                        ui,
+                        format!(
+                            "Speed {:.0}% - {} MB",
+                            speed * 100.0,
+                            self.profile.memory_mib
+                        ),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let com1_label = if self.show_com1 { "Hide COM1" } else { "COM1" };
+                        if ui.button(com1_label).clicked() {
+                            self.show_com1 = !self.show_com1;
+                        }
+                    });
+                });
                 line(ui, format!("Host {:.0} fps", self.host_fps));
 
                 ui.add_space(6.0);
@@ -1580,14 +1734,21 @@ impl GuiApp {
         let modal = egui::Modal::new(egui::Id::new("config-modal")).show(ctx, |ui| {
             egui::Frame::new()
                 .fill(PANEL_FACE)
-                .inner_margin(egui::Margin::same(18))
+                .inner_margin(egui::Margin {
+                    left: 14,
+                    right: 14,
+                    top: 12,
+                    bottom: 12,
+                })
                 .corner_radius(4.0)
                 .show(ui, |ui| {
                     beige_visuals(ui);
                     ui.set_width(440.0);
                     ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
 
-                    ui.label(egui::RichText::new("Configuration").color(INK).size(18.0));
+                    ui.vertical_centered(|ui| {
+                        ui.label(header_text("Configuration", 18.0));
+                    });
                     ui.add_space(6.0);
 
                     ui.label(egui::RichText::new("INPUT").color(LABEL).size(11.0));
@@ -1685,9 +1846,9 @@ impl GuiApp {
     }
 
     /// The floating COM1 window: black monospace serial log on white, auto-scrolled
-    /// to the bottom, the same console look the sidebar used to carry inline. The
-    /// window is draggable, resizable, and closable; its open state is bound to
-    /// `show_com1` so the close control and the sidebar button stay in sync.
+    /// to the bottom, inside the shared beige chrome. The window is draggable,
+    /// resizable, and closable; its open state is bound to `show_com1` so the
+    /// close control and the footer button stay in sync.
     fn com1_window(&mut self, ctx: &egui::Context) {
         let serial = match &self.emu {
             Some(emu) => emu
@@ -1699,29 +1860,109 @@ impl GuiApp {
             None => String::new(),
         };
         let mut open = self.show_com1;
-        egui::Window::new("COM1")
-            .open(&mut open)
-            .resizable(true)
-            .default_size([480.0, 320.0])
-            .show(ctx, |ui| {
+        beige_window(ctx, "COM1", &mut open, true, [480.0, 320.0], |ui| {
+            egui::Frame::new()
+                .fill(egui::Color32::WHITE)
+                .inner_margin(egui::Margin::same(4))
+                .show(ui, |ui| {
+                    ui.style_mut().spacing.scroll.bar_width = 6.0;
+                    egui::ScrollArea::vertical()
+                        .stick_to_bottom(true)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.add(egui::Label::new(
+                                egui::RichText::new(serial)
+                                    .monospace()
+                                    .color(egui::Color32::BLACK),
+                            ));
+                        });
+                });
+        });
+        self.show_com1 = open;
+    }
+
+    /// The floating License window: the full GPL-3.0 text, black monospace on
+    /// white inside the shared beige chrome. Opened from the About window.
+    fn license_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_license;
+        beige_window(
+            ctx,
+            "License (GPL-3.0)",
+            &mut open,
+            true,
+            [640.0, 520.0],
+            |ui| {
                 egui::Frame::new()
                     .fill(egui::Color32::WHITE)
                     .inner_margin(egui::Margin::same(4))
                     .show(ui, |ui| {
                         ui.style_mut().spacing.scroll.bar_width = 6.0;
                         egui::ScrollArea::vertical()
-                            .stick_to_bottom(true)
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 ui.add(egui::Label::new(
-                                    egui::RichText::new(serial)
+                                    egui::RichText::new(include_str!("../../../LICENSE"))
                                         .monospace()
                                         .color(egui::Color32::BLACK),
                                 ));
                             });
                     });
-            });
-        self.show_com1 = open;
+            },
+        );
+        self.show_license = open;
+    }
+
+    /// The floating About window: product/version/copyright and a GitHub link
+    /// first, then the bundled third-party attribution (verbatim NOTICE), then
+    /// a button to open the full license.
+    fn about_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_about;
+        let mut open_license = self.show_license;
+        beige_window(
+            ctx,
+            "About IzarraVM",
+            &mut open,
+            false,
+            [540.0, 420.0],
+            |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.visuals_mut().hyperlink_color = LINK_BLUE;
+                    ui.label(
+                        egui::RichText::new(concat!("IzarraVM ", env!("CARGO_PKG_VERSION")))
+                            .color(INK)
+                            .size(18.0)
+                            .strong(),
+                    );
+                    ui.label(
+                        egui::RichText::new("the Izarra 3000 virtual machine")
+                            .color(MUTED)
+                            .size(12.0),
+                    );
+                    ui.hyperlink_to("github.com/vorvek/IzarraVM", GITHUB_URL);
+                    ui.label(
+                        egui::RichText::new(
+                            "\u{00A9} 2026 General Simulation Works \u{00B7} GPL-3.0",
+                        )
+                        .color(MUTED)
+                        .size(12.0),
+                    );
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("Bundled software")
+                            .color(LABEL)
+                            .size(11.0)
+                            .strong(),
+                    );
+                    notice_block(ui, include_str!("../../../NOTICE"), MUTED, 11.0);
+                    ui.add_space(8.0);
+                    if ui.button("View license").clicked() {
+                        open_license = true;
+                    }
+                });
+            },
+        );
+        self.show_about = open;
+        self.show_license = open_license;
     }
 
     /// Write the current prefs to disk. Best-effort: GuiPrefs::save logs and
@@ -2086,6 +2327,14 @@ impl GuiApp {
         }
         // The configuration modal renders on top of everything when open.
         self.config_ui(ctx);
+        // About must dispatch before License: its "View license" button sets
+        // show_license, so this order opens the License window the same frame.
+        if self.show_about {
+            self.about_window(ctx);
+        }
+        if self.show_license {
+            self.license_window(ctx);
+        }
     }
 }
 

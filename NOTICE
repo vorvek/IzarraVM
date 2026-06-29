@@ -1,8 +1,8 @@
 IzarraVM bundles Toka-DOS, built from FreeDOS source (https://www.freedos.org/).
-FreeDOS kernel: (C) 1995-2012 Pasquale J. Villani and The FreeDOS Project, GPLv2-or-later.
-FreeCOM: (C) 1994-2005 Tim Norman and others, GPLv2-or-later.
+FreeDOS kernel: © 1995-2012 Pasquale J. Villani and The FreeDOS Project, GPLv2-or-later.
+FreeCOM: © 1994-2005 Tim Norman and others, GPLv2-or-later.
 Modified by the Toka-DOS project (2026). Corresponding source: toka-dos/freedos/.
 Full license: GPL-3.0 (see LICENSE).
-FreeDOS MOVE: (C) 1997-2002 Joe Cosentino, (C) 2003-2004 Imre Leber, GPLv2-or-later.
-FreeDOS SORT: (C) 1995 Jim Lynch, updated 2003-2004 Eric Auer, GPLv2-or-later.
-kitten (NLS): (C) 1999-2000 Jim Hall et al., LGPL-2.1. tnyprntf: (C) 1995 Pasquale J. Villani, GPLv2+.
+FreeDOS MOVE: © 1997-2002 Joe Cosentino, © 2003-2004 Imre Leber, GPLv2-or-later.
+FreeDOS SORT: © 1995 Jim Lynch, updated 2003-2004 Eric Auer, GPLv2-or-later.
+kitten (NLS): © 1999-2000 Jim Hall et al., LGPL-2.1. tnyprntf: © 1995 Pasquale J. Villani, GPLv2+.
