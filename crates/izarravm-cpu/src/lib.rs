@@ -15269,6 +15269,164 @@ mod tests {
     }
 
     #[test]
+    fn straight_line_run_discards_cached_opcode_overwritten_to_a_different_op() {
+        // The strongly discriminating SMC case: a later instruction is cached as one opcode (INC AX,
+        // a +1), an earlier guest store then overwrites it with a DIFFERENT opcode (DEC AX, a -1), and
+        // the executor must re-decode the new opcode rather than replay the stale cached form. Because
+        // the cached form (INC, +1) and the rewritten form (DEC, -1) have OPPOSITE effects, a stale
+        // snapshot replay produces the wrong sign and the assertion fails - unlike a rewrite to the
+        // already-cached value, which a stale replay would pass.
+        //
+        // Layout (DS = CS = SS = 0):
+        //   0x00: C6 06 05 00 48   MOV byte [0x05], 0x48   ; store: patch P (0x05) from 0x40 to 0x48
+        //   P = 0x05: 40           INC AX                  ; cached as INC AX first; 0x48 = DEC AX after
+        //   0x06: F4               HLT
+        let code = [
+            0xc6, 0x06, 0x05, 0x00, 0x48, // MOV byte [0x0005], 0x48
+            0x40, // INC AX  (P, patched to 0x48 = DEC AX at runtime)
+            0xf4, // HLT
+        ];
+        let (mut cpu, memory) = real_mode_cpu(&code, 1024);
+        let mut bus = TestBus::with_memory(memory);
+
+        // Cache P as INC AX BEFORE any rewrite: run a single instruction starting at P so it decodes
+        // and caches as INC AX (0x40). This is the cached form a stale replay would later wrongly use.
+        cpu.registers.eip = 0x05;
+        cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
+        assert!(
+            cpu.decode_cache.get(0x05).is_some(),
+            "P must be cached as INC AX before the rewrite"
+        );
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 1, "the warm INC ran once");
+
+        // Now run from the top: the store overwrites P's opcode byte (0x40 -> 0x48). That write hits a
+        // cached code byte, bumping the decode-cache generation, so when control reaches P it
+        // re-decodes the NEW byte (DEC AX) instead of replaying the cached INC.
+        cpu.registers.eip = 0;
+        cpu.registers.set_eax(0);
+        drive_straight_line_runs(&mut cpu, &mut bus);
+        // DEC AX ran (AX = 0xFFFF). A stale-snapshot executor that replayed the cached INC AX would
+        // leave AX = 0x0001, failing this assertion - that is the discrimination the L1 test lacked.
+        assert_eq!(
+            cpu.read_reg16(Reg16::Ax),
+            0xffff,
+            "the rewritten DEC AX must run, not the stale cached INC AX"
+        );
+        assert_eq!(
+            bus.memory[0x05], 0x48,
+            "P's opcode byte was patched to DEC AX"
+        );
+    }
+
+    #[test]
+    fn straight_line_run_stops_at_a_page_crossing_instruction() {
+        // The continuation rule `(lin & 0xfff) + len <= 0x1000` keeps a run from executing a cached
+        // instruction that would straddle a 4 KB page boundary; that instruction must run through the
+        // normal path instead. This exercises BOTH sides of the `<= 0x1000` bound:
+        //   - an instruction ENDING exactly at 0x1000 is allowed and runs as a continuation;
+        //   - an instruction CROSSING 0x1000 ends the run and runs afterward via the normal path.
+        // Real-mode flat layout (CS base 0, so lin == eip). The probe instruction is MOV AL, 7
+        // (0xB0 0x07), a 2-byte straight-line DataMove with an observable effect (AL = 7).
+
+        // Case A: the probe begins at 0xFFE and ends at 0x1000 (0xFFE + 2 == 0x1000) -> ALLOWED.
+        //   0xFFD: 40         INC AX
+        //   0xFFE: B0 07       MOV AL, 7   (ends exactly at 0x1000)
+        //   0x1000: F4         HLT
+        {
+            let mut memory = vec![0u8; 0x2000];
+            memory[0xffd] = 0x40; // INC AX
+            memory[0xffe] = 0xb0; // MOV AL,
+            memory[0xfff] = 0x07; //   7
+            memory[0x1000] = 0xf4; // HLT
+            let mut cpu = Cpu386::default();
+            cpu.load_segment_real(SegmentIndex::Cs, 0);
+            cpu.load_segment_real(SegmentIndex::Ds, 0);
+            cpu.load_segment_real(SegmentIndex::Ss, 0);
+            let mut bus = TestBus::with_memory(memory);
+
+            // Warm the decode cache for all three instructions so the only thing gating a continuation
+            // is the page check, not a cache miss.
+            cpu.registers.eip = 0xffd;
+            drive_straight_line_runs(&mut cpu, &mut bus);
+
+            // Run once from 0xFFD: INC is the run's first instruction, then the cached MOV AL,7 (ending
+            // exactly at 0x1000) runs as a continuation in the SAME run.
+            cpu.registers.eip = 0xffd;
+            cpu.registers.set_eax(0);
+            let outcome = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
+            assert!(!outcome.halted);
+            // The MOV ran as a continuation: AL == 7 and the run advanced past it (eip past 0x1000 is
+            // the HLT, which ends the run as a non-straight-line group, leaving eip at 0x1000).
+            assert_eq!(
+                cpu.read_reg16(Reg16::Ax) & 0xff,
+                7,
+                "MOV AL,7 ending at 0x1000 must run"
+            );
+            assert_eq!(
+                cpu.registers.eip, 0x1000,
+                "the run reached the HLT after the MOV"
+            );
+        }
+
+        // Case B: the probe begins at 0xFFF and ends at 0x1001 (0xFFF + 2 > 0x1000) -> CROSSES.
+        //   0xFFE: 40         INC AX
+        //   0xFFF: B0 07       MOV AL, 7   (straddles the page boundary)
+        //   0x1001: F4         HLT
+        {
+            let mut memory = vec![0u8; 0x2000];
+            memory[0xffd] = 0x40; // INC AX (warm anchor)
+            memory[0xffe] = 0x40; // INC AX
+            memory[0xfff] = 0xb0; // MOV AL,
+            memory[0x1000] = 0x07; //   7  (this byte is on the next page)
+            memory[0x1001] = 0xf4; // HLT
+            let mut cpu = Cpu386::default();
+            cpu.load_segment_real(SegmentIndex::Cs, 0);
+            cpu.load_segment_real(SegmentIndex::Ds, 0);
+            cpu.load_segment_real(SegmentIndex::Ss, 0);
+            let mut bus = TestBus::with_memory(memory);
+
+            // Warm all instructions (INC 0xFFD, INC 0xFFE, MOV 0xFFF, HLT 0x1001) into the cache.
+            cpu.registers.eip = 0xffd;
+            drive_straight_line_runs(&mut cpu, &mut bus);
+            assert!(
+                cpu.decode_cache.get(0xfff).is_some(),
+                "the page-crossing MOV must be cached, so only the page check can stop the run"
+            );
+
+            // Run once from 0xFFD: INC (0xFFD, first) + INC (0xFFE, continuation) run, then the cached
+            // MOV at 0xFFF is REJECTED by the page check (0xFFF + 2 > 0x1000) and the run STOPS there.
+            cpu.registers.eip = 0xffd;
+            cpu.registers.set_eax(0);
+            let outcome = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
+            assert!(!outcome.halted);
+            assert_eq!(cpu.read_reg16(Reg16::Ax), 2, "the two INCs ran");
+            assert_eq!(
+                cpu.read_reg16(Reg16::Ax) & 0xff,
+                2,
+                "the page-crossing MOV did NOT run in this call (AL is not 7)"
+            );
+            assert_eq!(
+                cpu.registers.eip, 0xfff,
+                "the run stopped at the page-crossing MOV"
+            );
+
+            // The crossing MOV runs correctly afterward through the normal path (first instruction of
+            // the next run, not subject to the continuation page check).
+            let outcome = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
+            assert!(!outcome.halted);
+            assert_eq!(
+                cpu.read_reg16(Reg16::Ax) & 0xff,
+                7,
+                "MOV AL,7 ran via the normal path"
+            );
+            assert_eq!(
+                cpu.registers.eip, 0x1001,
+                "eip advanced past the crossing MOV"
+            );
+        }
+    }
+
+    #[test]
     fn straight_line_run_faults_on_cached_continuation_keeping_earlier_effects() {
         // A fault raised by a CACHED straight-line instruction running as a continuation
         // (run_one_cached) must route through the SAME tail the per-instruction path uses: a CPU-class
