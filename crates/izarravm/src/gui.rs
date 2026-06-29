@@ -1729,9 +1729,9 @@ impl GuiApp {
     }
 
     /// The floating COM1 window: black monospace serial log on white, auto-scrolled
-    /// to the bottom, the same console look the sidebar used to carry inline. The
-    /// window is draggable, resizable, and closable; its open state is bound to
-    /// `show_com1` so the close control and the sidebar button stay in sync.
+    /// to the bottom, inside the shared beige chrome. The window is draggable,
+    /// resizable, and closable; its open state is bound to `show_com1` so the
+    /// close control and the footer button stay in sync.
     fn com1_window(&mut self, ctx: &egui::Context) {
         let serial = match &self.emu {
             Some(emu) => emu
