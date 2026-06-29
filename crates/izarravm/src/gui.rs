@@ -56,6 +56,8 @@ const LED_OFF: egui::Color32 = egui::Color32::from_rgb(0x2D, 0x4A, 0x2E);
 /// The panel face as f32 RGB, for the logo recolor unmix target.
 const PANEL_FACE_F32: [f32; 3] = [205.0, 195.0, 164.0];
 
+const GITHUB_URL: &str = "https://github.com/vorvek/IzarraVM";
+
 /// The embedded logo as pre-decoded straight RGBA (off-white background). It is
 /// recoloured to the panel beige at load. Regenerate with the PowerShell recipe
 /// in the design doc if the source art changes.
@@ -922,6 +924,12 @@ pub struct GuiApp {
     // Whether the floating COM1 window is open. The sidebar button and the
     // window's own close control both flip this.
     show_com1: bool,
+    // Whether the floating About window is open. The footer info button and the
+    // window's own close control both flip this.
+    show_about: bool,
+    // Whether the floating License (GPL-3.0) window is open. The About window's
+    // "View license" button and the window's own close control flip this.
+    show_license: bool,
     // Master volume slider position, 0.0..1.0. Cubed into a host-side gain that
     // the emulation thread reads through `gain`.
     volume: f32,
@@ -1041,6 +1049,8 @@ impl GuiApp {
             cd_access_seen: 0,
             cd_access_at: None,
             show_com1: false,
+            show_about: false,
+            show_license: false,
             volume,
             gain,
             glide_render_threads,
@@ -1496,9 +1506,8 @@ impl GuiApp {
                         ),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let com1_label = if self.show_com1 { "Hide COM1" } else { "COM1" };
-                        if ui.button(com1_label).clicked() {
-                            self.show_com1 = !self.show_com1;
+                        if ui.button("\u{1F6C8}").on_hover_text("About").clicked() {
+                            self.show_about = true;
                         }
                         if ui
                             .button("\u{2699}")
@@ -1509,14 +1518,22 @@ impl GuiApp {
                         }
                     });
                 });
-                line(
-                    ui,
-                    format!(
-                        "Speed {:.0}% - {} MB",
-                        speed * 100.0,
-                        self.profile.memory_mib
-                    ),
-                );
+                ui.horizontal(|ui| {
+                    line(
+                        ui,
+                        format!(
+                            "Speed {:.0}% - {} MB",
+                            speed * 100.0,
+                            self.profile.memory_mib
+                        ),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let com1_label = if self.show_com1 { "Hide COM1" } else { "COM1" };
+                        if ui.button(com1_label).clicked() {
+                            self.show_com1 = !self.show_com1;
+                        }
+                    });
+                });
                 line(ui, format!("Host {:.0} fps", self.host_fps));
 
                 ui.add_space(6.0);
@@ -1745,6 +1762,73 @@ impl GuiApp {
                 });
         });
         self.show_com1 = open;
+    }
+
+    /// The floating License window: the full GPL-3.0 text, black monospace on
+    /// white inside the shared beige chrome. Opened from the About window.
+    fn license_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_license;
+        beige_window(ctx, "License (GPL-3.0)", &mut open, [640.0, 520.0], |ui| {
+            egui::Frame::new()
+                .fill(egui::Color32::WHITE)
+                .inner_margin(egui::Margin::same(4))
+                .show(ui, |ui| {
+                    ui.style_mut().spacing.scroll.bar_width = 6.0;
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.add(egui::Label::new(
+                                egui::RichText::new(include_str!("../../../LICENSE"))
+                                    .monospace()
+                                    .color(egui::Color32::BLACK),
+                            ));
+                        });
+                });
+        });
+        self.show_license = open;
+    }
+
+    /// The floating About window: product/version/copyright and a GitHub link
+    /// first, then the bundled third-party attribution (verbatim NOTICE), then
+    /// a button to open the full license.
+    fn about_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_about;
+        let mut open_license = self.show_license;
+        beige_window(ctx, "About IzarraVM", &mut open, [360.0, 440.0], |ui| {
+            ui.label(
+                egui::RichText::new(concat!("IzarraVM ", env!("CARGO_PKG_VERSION")))
+                    .color(INK)
+                    .size(18.0),
+            );
+            ui.label(
+                egui::RichText::new("the Izarra 3000 virtual machine")
+                    .color(MUTED)
+                    .size(12.0),
+            );
+            ui.hyperlink_to("github.com/vorvek/IzarraVM", GITHUB_URL);
+            ui.label(
+                egui::RichText::new("\u{00A9} 2026 General Simulation Works \u{00B7} GPL-3.0")
+                    .color(MUTED)
+                    .size(12.0),
+            );
+            ui.separator();
+            ui.label(
+                egui::RichText::new("Bundled software")
+                    .color(LABEL)
+                    .size(11.0),
+            );
+            ui.label(
+                egui::RichText::new(include_str!("../../../NOTICE"))
+                    .color(MUTED)
+                    .size(11.0),
+            );
+            ui.add_space(8.0);
+            if ui.button("View license").clicked() {
+                open_license = true;
+            }
+        });
+        self.show_about = open;
+        self.show_license = open_license;
     }
 
     /// Write the current prefs to disk. Best-effort: GuiPrefs::save logs and
@@ -2109,6 +2193,12 @@ impl GuiApp {
         }
         // The configuration modal renders on top of everything when open.
         self.config_ui(ctx);
+        if self.show_about {
+            self.about_window(ctx);
+        }
+        if self.show_license {
+            self.license_window(ctx);
+        }
     }
 }
 
