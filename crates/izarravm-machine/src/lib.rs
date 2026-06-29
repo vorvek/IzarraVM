@@ -11007,7 +11007,16 @@ impl Machine {
                         // cap boundary always lands right after the STI (the shadow
                         // would block the per-batch check forever).
                         let can_take_before = cpu.can_take_interrupt();
-                        match cpu.cycle_no_interrupt_check(&mut bus) {
+                        // Run a straight-line run of instructions inside the CPU in one call (the
+                        // first via the normal single path, then cached straight-line continuations)
+                        // instead of bouncing here per instruction. The run ends on a fault, halt, a
+                        // non-straight-line / un-cached / page-crossing terminator, an interrupt-
+                        // serviceable transition, or its cap. The batch-break checks below still run
+                        // on the collapsed outcome: the executor's internal transition check ends the
+                        // RUN at the edge, and the machine's check below ends the BATCH so the next
+                        // batch services the interrupt. Both are needed.
+                        let remaining = cap.saturating_sub(u64::from(batch_core));
+                        match cpu.run_straight_line(&mut bus, remaining) {
                             Ok(o) => {
                                 batch_core = batch_core.saturating_add(o.core_clocks);
                                 if o.halted {
@@ -11744,6 +11753,15 @@ impl CpuBus for MachineBus<'_> {
 
     fn acknowledge_interrupt(&mut self) -> Option<u8> {
         self.pic.acknowledge()
+    }
+
+    #[inline]
+    fn requires_step_break(&self) -> bool {
+        // The exact condition the batch loop checks after each instruction: a port access touched
+        // time-dependent device state, or an HLE software interrupt is pending. The straight-line
+        // run executor ends its run on this so the machine services it at the old per-instruction
+        // boundary.
+        *self.io_touched || self.pending_soft_int.is_some()
     }
 
     fn interrupt_acknowledge(&mut self, vector: u8, _ax: u16) -> Result<(), BusError> {

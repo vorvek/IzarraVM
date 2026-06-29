@@ -427,6 +427,15 @@ pub trait CpuBus {
     fn acknowledge_interrupt(&mut self) -> Option<u8> {
         None
     }
+
+    /// True when the machine must service something before the next instruction runs: a port
+    /// access touched time-dependent device state, or an HLE software interrupt is pending. The
+    /// straight-line run executor checks this after each instruction and ends the run so the
+    /// machine services it at exactly the old per-instruction boundary. Defaulted false for buses
+    /// without devices.
+    fn requires_step_break(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
