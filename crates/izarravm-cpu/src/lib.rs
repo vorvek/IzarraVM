@@ -675,6 +675,10 @@ pub struct Cpu386 {
     prefetch: PrefetchWindow,
     written_pages: [Option<u32>; TRACKED_WRITE_PAGES],
     written_pages_overflow: bool,
+    // Direct-mapped cache of decoded instructions keyed by linear EIP. Skips re-decoding hot-loop
+    // bytes; a generation counter (inside) invalidates it on any change that could alter a decode.
+    // Transparent accelerator, excluded from equality and reset on clone. See DecodeCache.
+    decode_cache: DecodeCache,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -982,28 +986,11 @@ enum DecodeGroup {
     TwoByteFallback,
 }
 
-/// How decode charges the instruction-fetch clocks when an instruction is replayed from a
-/// cache. Unused in Stage A: decode here charges fetch clocks through its real `fetch_u8`
-/// reads (exactly as the fused path did), so `execute_decoded` charges nothing extra. This
-/// type is populated with a placeholder (the real instruction length, zero wait states) and
-/// is only fully exercised in the later cache stage.
-// Stage-A scaffold: the variants/fields are written but not yet read; the cache stage
-// (Stage B) consumes them to replay fetch clocks without re-reading the bus.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy)]
-enum FetchCost {
-    Uniform { len: u8, wait_states: u8 },
-    PerByte([u8; 15], u8),
-}
-
 /// A decoded instruction: the prefix/opcode/operand-size results plus the pre-parsed ModRM, operand
 /// descriptor, and immediate for the forms that carry them. After Stage A every implemented opcode
 /// is converted to the decode/execute split; the no-operand forms (and the dead-end fallbacks) leave
-/// `modrm`/`operand` as `None` (and `imm` 0).
-// Stage-A scaffold: `imm` is read by the converted ALU/group immediate forms and `imm2` by the
-// converted ENTER (and any other second-immediate form); the `len`/`fetch` placeholders are
-// populated by `decode` but stay unread until the cache stage lands.
-#[allow(dead_code)]
+/// `modrm`/`operand` as `None` (and `imm` 0). This is the value the decode cache stores per line, so
+/// it is kept small and dense (see DecodeCache).
 #[derive(Debug, Clone, Copy)]
 struct DecodedInsn {
     /// eip of the first byte of the instruction (before any prefixes). Carried as the `eip` field of
@@ -1011,7 +998,6 @@ struct DecodedInsn {
     /// to the instruction start on a delivered exception.
     start_eip: u32,
     len: u8,
-    fetch: FetchCost,
     prefixes: Prefixes,
     opcode: u16,
     operand_size: OperandSize,
@@ -1026,6 +1012,174 @@ struct DecodedInsn {
     /// 5 bits in `decode`). Available for any future group/other form that needs a second
     /// immediate; left 0 for the single-immediate and no-immediate opcodes.
     imm2: u32,
+    /// The routed decode group, resolved ONCE in `decode` (the single `route_group` authority) and
+    /// stored so `execute_decoded` matches the variant directly instead of re-running the opcode
+    /// classifier. `route_group` is pure over `(opcode, prefixes)`, both captured here, so the
+    /// stored value is exactly what a re-call would return.
+    group: DecodeGroup,
+}
+
+/// Number of direct-mapped lines in the decode cache. Power of two so the index is a mask. 4096 is
+/// the Stage B starting size (B7 tunes it); the footprint is the knob that matters on a normal
+/// (8-32 MB L3) machine, so it is kept small and dense.
+/// Direct-mapped decode-cache lines (power of two). A release best-of-6 sweep on dhrystone/sieve
+/// 586 found the knee at 2048: 1024 left ~2% on the table, while 4096 and 8192 were within
+/// measurement noise of 2048. At ~48 bytes per line (DecodeLine = tag + generation + DecodedInsn)
+/// that is ~96 KB, comfortably inside L2 on a normal (8-32 MB L3) machine, so the per-line size is
+/// not the footprint limiter here and the line value is left dense rather than squeezed to 32 bytes.
+const DECODE_CACHE_LINES: usize = 2048;
+
+/// The SMC watch bitmap tracks cached code at BYTE granularity. Coarser granularities fail on the
+/// flat tiny-model layout the benchmarks (and many real-mode DOS programs) use: with cs=ds=ss=0,
+/// the stack sits just below the code and globals sit just above or among it, so a 4 KB-page OR even
+/// a 64-byte-block watch flushes the whole cache on data/stack writes that merely sit near code
+/// (measured: dhrystone +45%). A byte-granular mark only flags an address as code when an
+/// instruction was actually decoded there, so a write to an adjacent data byte never false-triggers.
+/// Coverage is the low 2 MiB of physical space, which holds all real-mode code (conventional + UMB +
+/// HMA); a write or fetch above 2 MiB is treated as NOT code (no flush). That means self-modifying
+/// code located above 2 MiB is not caught, an exotic case (real-mode SMC, the realistic domain,
+/// lives below 1 MiB) accepted to keep the bitmap small and the common path free of false flushes.
+/// 2 MiB / 8 bits = 2^15 `u64` = 256 KB, allocated once per cache; only the words for live code and
+/// written bytes are ever touched, so its working set is a handful of lines.
+const SMC_BYTE_COVERAGE: u32 = 2 << 20;
+const SMC_BITMAP_WORDS: usize = (SMC_BYTE_COVERAGE / 64) as usize;
+
+/// One direct-mapped decode-cache line. `insn` is `None` until first filled. A filled line is a hit
+/// only when its `tag` matches the lookup linear address AND its `gen` matches the live generation,
+/// so advancing the generation invalidates every line in O(1) without clearing the array.
+#[derive(Debug, Clone, Copy, Default)]
+struct DecodeLine {
+    tag: u32,
+    generation: u32,
+    insn: Option<DecodedInsn>,
+}
+
+/// A direct-mapped, generation-stamped cache of decoded instructions keyed by linear EIP
+/// (`cs.base + eip`). It lets a hot loop skip re-decoding the same bytes every iteration. The `gen`
+/// counter is advanced whenever a decode could change meaning: CS base / paging / mode changes (via
+/// `invalidate_code_caches`) and an ISA-level change (via `set_level`). A bump makes every stamped
+/// line miss, so the next execution at each address re-decodes and re-stamps. It is NOT advanced on
+/// a near branch (`set_eip` only moves eip, which already changes the linear key) nor on a plain
+/// data write to a non-code page, both of which would flush the cache every loop iteration.
+/// Self-modifying code IS handled: `code_blocks` marks every 64-byte physical block an instruction
+/// was cached from, and a write into a marked block advances the generation (cross-page SMC). The
+/// benchmark path has no SMC, and identical bench checksums verify nothing stale is served.
+///
+/// Transparent accelerator, not architectural state: excluded from `Cpu386` equality (like
+/// `PrefetchWindow`) and reset rather than copied on clone.
+struct DecodeCache {
+    lines: Box<[DecodeLine]>,
+    mask: u32,
+    generation: u32,
+    /// Bitmap (1 bit per physical byte, low `SMC_BYTE_COVERAGE` bytes) of bytes an instruction has
+    /// been cached from. A write touching a marked byte advances the generation. Monotonic: marks
+    /// are never cleared, so there are no false negatives (every cached byte stays watched); a stale
+    /// mark only costs a harmless spurious generation bump if a former-code byte is later written.
+    code_bytes: Box<[u64]>,
+}
+
+impl DecodeCache {
+    fn new(lines: usize) -> Self {
+        assert!(
+            lines.is_power_of_two(),
+            "decode cache size must be a power of two"
+        );
+        Self {
+            lines: vec![DecodeLine::default(); lines].into_boxed_slice(),
+            mask: (lines - 1) as u32,
+            // Fresh lines default to generation 0; start live at 1 so they miss until first filled.
+            generation: 1,
+            code_bytes: vec![0u64; SMC_BITMAP_WORDS].into_boxed_slice(),
+        }
+    }
+
+    /// Mark the bytes `[physical, physical + len)` as holding cached code, so a later write touching
+    /// any of them invalidates the cache. An instruction is at most 15 bytes. Bytes above the
+    /// covered range are skipped (treated as non-code by `is_code_byte`).
+    #[inline]
+    fn mark_code_range(&mut self, physical: u32, len: u8) {
+        for i in 0..u32::from(len) {
+            let addr = physical.wrapping_add(i);
+            if addr < SMC_BYTE_COVERAGE {
+                self.code_bytes[(addr >> 6) as usize] |= 1u64 << (addr & 63);
+            }
+        }
+    }
+
+    /// Whether this physical byte was decoded as part of a cached instruction. Bytes above the
+    /// covered range answer `false`: SMC there is not tracked (an accepted, documented gap).
+    #[inline]
+    fn is_code_byte(&self, physical: u32) -> bool {
+        physical < SMC_BYTE_COVERAGE
+            && self.code_bytes[(physical >> 6) as usize] & (1u64 << (physical & 63)) != 0
+    }
+
+    /// Whether any byte in `[physical, physical + width)` is a cached code byte.
+    #[inline]
+    fn range_hits_code(&self, physical: u32, width: u32) -> bool {
+        (0..width).any(|i| self.is_code_byte(physical.wrapping_add(i)))
+    }
+
+    #[inline]
+    fn get(&self, lin: u32) -> Option<DecodedInsn> {
+        let line = &self.lines[(lin & self.mask) as usize];
+        if line.generation == self.generation && line.tag == lin {
+            line.insn
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn put(&mut self, lin: u32, insn: DecodedInsn) {
+        self.lines[(lin & self.mask) as usize] = DecodeLine {
+            tag: lin,
+            generation: self.generation,
+            insn: Some(insn),
+        };
+    }
+
+    /// Invalidate every cached line by advancing the generation. O(1): stamped lines fail the
+    /// generation check and re-decode on next use. Skips 0 on wrap so a fresh line never aliases.
+    #[inline]
+    fn invalidate(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.generation = 1;
+        }
+    }
+}
+
+impl Default for DecodeCache {
+    fn default() -> Self {
+        Self::new(DECODE_CACHE_LINES)
+    }
+}
+
+impl Clone for DecodeCache {
+    fn clone(&self) -> Self {
+        // The cache is a transparent accelerator: a clone starts empty (and re-decodes) rather than
+        // copying every line, so cloning a CPU stays cheap and never depends on cache contents.
+        Self::new(self.lines.len())
+    }
+}
+
+impl PartialEq for DecodeCache {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for DecodeCache {}
+
+impl std::fmt::Debug for DecodeCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "DecodeCache {{ {} lines, gen {} }}",
+            self.lines.len(),
+            self.generation
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1064,6 +1218,10 @@ impl Cpu386 {
     fn invalidate_code_caches(&mut self) {
         self.code_page.valid = false;
         self.prefetch.invalidate();
+        // Every CS-base change (CS load) and paging remap (via flush_tlb_and_code_caches) routes
+        // through here, so this is the structural hook for the decode cache too: a remap can make
+        // the same linear address decode differently (D-bit aliasing, page remap), so invalidate.
+        self.decode_cache.invalidate();
     }
 
     fn flush_tlb_and_code_caches(&mut self) {
@@ -1085,6 +1243,42 @@ impl Cpu386 {
             *slot = Some(page);
         } else {
             self.written_pages_overflow = true;
+        }
+    }
+
+    /// The machine calls this when the A20 gate toggles. A20 is masked at the bus on every access,
+    /// so the CPU never sees it directly, yet it changes which physical bytes back a linear address
+    /// near the 1 MB wrap. The prefetch (cached bytes) and the decode cache (cached decode of those
+    /// bytes) would otherwise replay stale content, so invalidate both. Rare; a coarse flush is fine.
+    pub fn note_a20_changed(&mut self) {
+        self.invalidate_code_caches();
+    }
+
+    /// The decode cache's current generation. Advances on every cache invalidation (CS/paging/mode
+    /// change, ISA-level change, A20 toggle, self-modifying write). Exposed for observability and so
+    /// the machine can verify the A20 seam end-to-end.
+    pub fn decode_cache_generation(&self) -> u32 {
+        self.decode_cache.generation
+    }
+
+    /// The machine calls this after a device (e.g. a disk/floppy DMA transfer) writes guest RAM.
+    /// Such writes bypass the CPU's own self-modifying-code tracking (which only sees CPU writes via
+    /// `note_code_write`), so if the written RAM held cached code (a loaded overlay or boot stage)
+    /// the prefetch and decode cache would replay stale bytes. This is a coarse whole-cache
+    /// invalidation, which is fine because device transfers are infrequent.
+    pub fn note_device_memory_write(&mut self) {
+        self.invalidate_code_caches();
+    }
+
+    /// A guest data write of `width` bytes to `physical`. If any written byte was decoded as part of
+    /// a cached instruction it is self-modifying code, so advance the decode-cache generation to
+    /// re-decode those lines. Byte-exact: a 16-bit stack push just below the code (the flat
+    /// tiny-model layout the benchmarks use) writes only its own two bytes, so it never disturbs the
+    /// adjacent code.
+    #[inline]
+    fn note_code_write(&mut self, physical: u32, width: u32) {
+        if self.decode_cache.range_hits_code(physical, width) {
+            self.decode_cache.invalidate();
         }
     }
 
@@ -1121,6 +1315,9 @@ impl Cpu386 {
     pub fn set_level(&mut self, level: CpuLevel) {
         self.level = level;
         self.timing_rem = 0;
+        // The ISA level gates the two-byte #UD checks in decode, so the same bytes can decode
+        // differently after a level change. Invalidate the decode cache so it re-decodes.
+        self.decode_cache.invalidate();
     }
 
     /// Scale a retired instruction's clocks by the active level's timing factor,
@@ -1248,8 +1445,9 @@ impl Cpu386 {
         self.begin_instruction();
         let start_eip = self.registers.eip;
         let start_cs = self.registers.cs().selector;
+        let lin = self.linear_eip();
         let result = self
-            .decode(bus)
+            .fetch_decoded(bus, lin)
             .and_then(|insn| self.execute_decoded(&insn, bus));
         let outcome = match result {
             Ok(outcome) => outcome,
@@ -1451,6 +1649,63 @@ impl Cpu386 {
         DecodeGroup::Fallback
     }
 
+    /// Stage B fetch front-end. Returns the decoded instruction for the current linear EIP, served
+    /// from the decode cache on a hit (re-decode skipped) or decoded once and cached on a miss. On a
+    /// hit, `decode` does not run, so this replays the instruction-fetch clocks `decode` would have
+    /// charged and advances eip past the instruction, leaving the CPU in exactly the state the miss
+    /// path produces before `execute_decoded` runs (eip at the instruction end; the same fetch bus
+    /// cycles charged). The prefetch window is not touched on a hit because `execute_decoded` reads
+    /// operands over the data bus, never the instruction stream.
+    fn fetch_decoded<B: CpuBus>(&mut self, bus: &mut B, lin: u32) -> ExecResult<DecodedInsn> {
+        if let Some(insn) = self.decode_cache.get(lin) {
+            self.charge_cached_fetch(bus, lin, insn.len)?;
+            return Ok(insn);
+        }
+        let insn = self.decode(bus)?;
+        // A LOCK-prefixed instruction is never cached: `decode` runs `check_lock_target`, which both
+        // peeks the lock target over the bus (charging fetch clocks that are NOT part of `len`, so a
+        // cached replay would under-charge them) and raises #UD for a non-lockable target. Replaying
+        // it from the cache would skip both. LOCK is rare, so re-decoding it every time is free.
+        if !insn.prefixes.lock {
+            // Mark the physical block(s) this instruction occupies so a later write into them
+            // invalidates the cache (cross-page SMC). decode just warmed the code-page translation,
+            // so resolving the physical start is a cache hit (and the identity map without paging). A
+            // page-straddling instruction under paging marks the tail block from the contiguous
+            // physical of its first page, which is the one remaining exotic gap.
+            let physical = self.translate_code_linear(bus, lin)?;
+            self.decode_cache.mark_code_range(physical, insn.len);
+            self.decode_cache.put(lin, insn);
+        }
+        Ok(insn)
+    }
+
+    /// Replay the instruction-fetch bus clocks for a cache hit and advance eip past the instruction.
+    /// `decode` charges one fetch cycle per byte at its linear address, plus ONE extra for the
+    /// opcode: `read_prefixes` fetches (and charges) the first non-prefix byte to test it, rewinds
+    /// eip without un-charging, and `decode` then re-fetches that opcode byte. So a successfully
+    /// decoded instruction always costs `len + 1` instruction-fetch cycles, the opcode byte charged
+    /// twice. This replays that: the `len` bytes at `lin..lin+len`, then one more at `lin` (the
+    /// opcode for the common no-prefix case, making the replay byte-exact there).
+    ///
+    /// Charging per byte at its real linear address (not a stored scalar) makes the replay per-byte
+    /// region- and A20-aware for free: `charge_instruction_fetch` recomputes the wait states from
+    /// each address and applies A20, exactly as the miss path's `fetch_u8` did, so an instruction
+    /// whose bytes straddle a wait-state region or the A20-wrap boundary charges identically on a hit
+    /// (amendment 1). Without paging the linear address equals the physical address. The two
+    /// remaining edges are guest-invisible (they change only the bus-clock metric, never a result):
+    /// a paging page-cross charges the tail at the contiguous linear address rather than the second
+    /// page's physical, and a prefixed instruction's doubled opcode charge lands at `lin` (a prefix)
+    /// rather than the opcode. Neither occurs on the benchmark path, where cyc/iter is bit-identical.
+    fn charge_cached_fetch<B: CpuBus>(&mut self, bus: &mut B, lin: u32, len: u8) -> ExecResult<()> {
+        for i in 0..u32::from(len) {
+            bus.charge_instruction_fetch(lin.wrapping_add(i))?;
+        }
+        // The opcode-byte double-charge (read_prefixes peek + decode re-fetch).
+        bus.charge_instruction_fetch(lin)?;
+        self.registers.eip = self.registers.eip.wrapping_add(u32::from(len));
+        Ok(())
+    }
+
     /// Stage A of the decode/execute split. Reads the prefixes and opcode (mirroring the top
     /// of the legacy fused path) and, for the opcodes already converted to the split, parses
     /// the ModRM + addressing-mode descriptor up front. Opcodes still on the legacy path leave
@@ -1488,17 +1743,15 @@ impl Cpu386 {
             u16::from(opcode)
         };
 
+        // The single `route_group` authority runs ONCE here; the result is stored in the insn so
+        // `execute_decoded` matches the variant directly rather than re-classifying the opcode.
+        let group = Self::route_group(opcode, prefixes);
+
         let mut insn = DecodedInsn {
             start_eip,
-            // `len`/`fetch` are placeholders here; the single finalize after the group pre-parse
-            // below overwrites them with the real consumed length (prefixes + opcode + operands).
-            // In Stage A `fetch` is unused at replay time — decode charges fetch clocks via its
-            // real reads; the cache stage (Stage B) is where `fetch` is consumed.
+            // `len` is a placeholder here; the single finalize after the group pre-parse below
+            // overwrites it with the real consumed length (prefixes + opcode + operands).
             len: 0,
-            fetch: FetchCost::Uniform {
-                len: 0,
-                wait_states: 0,
-            },
             prefixes,
             opcode,
             operand_size,
@@ -1507,11 +1760,11 @@ impl Cpu386 {
             operand: None,
             imm: 0,
             imm2: 0,
+            group,
         };
 
-        // Pre-parse the operands of converted groups. The group classifier is the single routing
-        // authority; `execute_decoded` matches the same `DecodeGroup` to decide how to execute.
-        match Self::route_group(insn.opcode, prefixes) {
+        // Pre-parse the operands of converted groups, dispatching on the group resolved above.
+        match group {
             DecodeGroup::Alu => {
                 // ALU block. Forms 0-3 carry a ModRM: parse it + its addressing-mode descriptor now
                 // (the descriptor reads instruction bytes only, so it stays cacheable). Forms 4/5
@@ -1908,15 +2161,10 @@ impl Cpu386 {
             DecodeGroup::Fallback | DecodeGroup::TwoByteFallback => {}
         }
 
-        // Finalize `len`/`fetch` once, after every group's pre-parse, so a converted group never
-        // has to re-write them: a group's match arm only fetches its operand bytes; this single
-        // assignment captures the total bytes `decode` consumed (prefixes + opcode + operands).
-        let consumed = self.registers.eip.wrapping_sub(start_eip) as u8;
-        insn.len = consumed;
-        insn.fetch = FetchCost::Uniform {
-            len: consumed,
-            wait_states: 0,
-        };
+        // Finalize `len` once, after every group's pre-parse, so a converted group never has to
+        // re-write it: a group's match arm only fetches its operand bytes; this single assignment
+        // captures the total bytes `decode` consumed (prefixes + opcode + operands).
+        insn.len = self.registers.eip.wrapping_sub(start_eip) as u8;
 
         Ok(insn)
     }
@@ -1930,9 +2178,9 @@ impl Cpu386 {
         insn: &DecodedInsn,
         bus: &mut B,
     ) -> ExecResult<CycleOutcome> {
-        // Route on the same group classifier `decode` used, so the parse side and the execute
-        // side can never drift out of sync.
-        match Self::route_group(insn.opcode, insn.prefixes) {
+        // Dispatch on the group `decode` already resolved and stored, so the parse side and the
+        // execute side can never drift out of sync and `route_group` runs only once per instruction.
+        match insn.group {
             // The whole ALU block (ADD/OR/ADC/SBB/AND/SUB/XOR/CMP, forms 0-5) runs through the
             // split executor, consuming the ModRM/immediate `decode` pre-parsed.
             DecodeGroup::Alu => self.execute_alu_decoded(insn, bus),
@@ -4715,7 +4963,11 @@ impl Cpu386 {
             }
             descriptor.base.wrapping_add(offset)
         };
-        self.translate_linear(bus, linear, write)
+        let physical = self.translate_linear(bus, linear, write)?;
+        if write {
+            self.note_code_write(physical, width);
+        }
+        Ok(physical)
     }
 
     fn translate_linear<B: CpuBus>(
@@ -13976,6 +14228,291 @@ mod tests {
         cpu.begin_instruction();
         let insn = cpu.decode(bus)?;
         cpu.execute_decoded(&insn, bus)
+    }
+
+    #[test]
+    fn decoded_insn_stays_dense() {
+        // The decode cache stores one DecodedInsn per line. At the chosen 2048 lines this caps the
+        // footprint near 96 KB (see DECODE_CACHE_LINES), so the guard is against unbounded growth,
+        // not a hard 32-byte target: if a field pushes it past 48 bytes, move a rarely-used field
+        // behind recompute-at-execute (or shrink the cache) rather than letting the line balloon.
+        assert!(
+            std::mem::size_of::<DecodedInsn>() <= 48,
+            "DecodedInsn grew to {} bytes",
+            std::mem::size_of::<DecodedInsn>()
+        );
+    }
+
+    #[test]
+    fn decode_cache_hits_only_on_matching_tag_and_generation() {
+        // A real decoded instruction to store. ADD AX, BX (01 D8).
+        let (mut cpu, mem) = real_mode_cpu(&[0x01, 0xd8], 0x20);
+        let mut bus = TestBus::with_memory(mem);
+        cpu.registers.eip = 0;
+        let insn = cpu.decode(&mut bus).unwrap();
+
+        let mut cache = DecodeCache::new(4); // mask = 3
+        let lin = 0x100;
+        assert!(cache.get(lin).is_none(), "an empty line misses");
+        cache.put(lin, insn);
+        assert!(cache.get(lin).is_some(), "a filled line hits");
+        // lin + 4 lands in the same direct-mapped slot (mask 3) but carries a different tag.
+        assert!(
+            cache.get(lin + 4).is_none(),
+            "a different tag in the same slot misses (no false hit)"
+        );
+        cache.invalidate();
+        assert!(
+            cache.get(lin).is_none(),
+            "a generation bump invalidates every stamped line"
+        );
+        cache.put(lin, insn);
+        assert!(
+            cache.get(lin).is_some(),
+            "re-filling after a bump hits again"
+        );
+    }
+
+    #[test]
+    fn decode_cache_invalidate_skips_zero_on_wrap() {
+        // The generation must never land back on 0 (a fresh line's default), or stale lines alias.
+        let mut cache = DecodeCache::new(2);
+        cache.generation = u32::MAX;
+        cache.invalidate();
+        assert_eq!(cache.generation, 1, "wrap skips 0");
+    }
+
+    #[test]
+    fn cycle_serves_a_repeated_instruction_from_the_decode_cache() {
+        // INC AX (0x40): one byte, no branch, so re-executing at the same linear address is a hit.
+        let (mut cpu, mem) = real_mode_cpu(&[0x40], 0x20);
+        let mut bus = TestBus::with_memory(mem);
+        let lin = cpu.linear_eip();
+
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.eax() & 0xffff, 1, "first run increments AX");
+        assert!(
+            cpu.decode_cache.get(lin).is_some(),
+            "cycle caches the decoded instruction"
+        );
+
+        // Re-run at the same linear address: served from the cache, identical effect.
+        cpu.set_eip(0);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.eax() & 0xffff, 2, "cached INC AX runs again");
+
+        // A CS load routes through invalidate_code_caches, which drops the cache.
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        assert!(
+            cpu.decode_cache.get(lin).is_none(),
+            "invalidate_code_caches clears the decode cache"
+        );
+    }
+
+    #[test]
+    fn lock_prefixed_instructions_are_not_cached() {
+        // LOCK ADD [BX], AL (F0 00 07). `decode` runs check_lock_target, which peeks the lock
+        // target over the bus (charging clocks that are not part of `len`) and would #UD a
+        // non-lockable target. A cached replay skips both, so a LOCK instruction must re-decode
+        // every time and is never cached.
+        let (mut cpu, mem) = real_mode_cpu(&[0xf0, 0x00, 0x07], 0x40);
+        let mut bus = TestBus::with_memory(mem);
+        cpu.registers.set_eax(1); // AL = 1
+        cpu.registers.set_ebx(0x20);
+        let lin = cpu.linear_eip();
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(bus.memory[0x20], 1, "LOCK ADD [BX], AL executed");
+        assert!(
+            cpu.decode_cache.get(lin).is_none(),
+            "a LOCK-prefixed instruction must not be cached (it re-charges + re-validates each run)"
+        );
+    }
+
+    #[test]
+    fn cross_page_write_into_cached_code_invalidates_it() {
+        // INC AX (0x40) at page 1; a store program at page 2 overwrites that byte with 0x48 (DEC
+        // AX). Executing on a different page than the write is the cross-page SMC case begin_
+        // instruction's current-page check cannot catch. The store program sits at 0x2008 so none
+        // of its bytes collide with 0x1000's direct-mapped slot (slot 0); a collision would evict
+        // the line and mask whether SMC actually invalidated it.
+        let mut memory = vec![0u8; 0x3000];
+        memory[0x1000] = 0x40; // INC AX
+        memory[0x2008] = 0xb0; // MOV AL, imm8
+        memory[0x2009] = 0x48; //   = 0x48 (DEC AX opcode)
+        memory[0x200a] = 0xa2; // MOV moffs16, AL
+        memory[0x200b] = 0x00;
+        memory[0x200c] = 0x10; //   moffs = 0x1000
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        let mut bus = TestBus::with_memory(memory);
+
+        // 1. Run INC AX at 0x1000: caches it and marks physical page 1 as code.
+        cpu.registers.set_eax(0);
+        cpu.set_eip(0x1000);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.eax() & 0xffff, 1, "INC AX ran");
+        assert!(cpu.decode_cache.get(0x1000).is_some(), "0x1000 is cached");
+
+        // 2. From page 2, store 0x48 over the byte at 0x1000 (a write into the cached code page).
+        cpu.set_eip(0x2008);
+        cpu.cycle(&mut bus).unwrap(); // MOV AL, 0x48
+        cpu.cycle(&mut bus).unwrap(); // MOV [0x1000], AL -> record_write_page bumps the generation
+        assert!(
+            cpu.decode_cache.get(0x1000).is_none(),
+            "a write into the cached code page invalidated it"
+        );
+
+        // 3. Re-run at 0x1000: re-decodes the NEW opcode 0x48 (DEC AX), not the stale INC AX.
+        cpu.registers.set_eax(5);
+        cpu.set_eip(0x1000);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(
+            cpu.registers.eax() & 0xffff,
+            4,
+            "the freshly written DEC AX ran, not the stale cached INC AX"
+        );
+    }
+
+    #[test]
+    fn data_write_to_a_non_code_page_does_not_flush_the_cache() {
+        // The whole point of the code-page bitmap: a plain data write must NOT invalidate the cache,
+        // or a write-heavy loop (dhrystone) would re-decode every iteration. Cache code on page 1,
+        // run the store program on page 2 (at 0x2008 so it does not collide with 0x1000's slot),
+        // write to page 3 (never executed), assert the line lives.
+        let mut memory = vec![0u8; 0x4000];
+        memory[0x1000] = 0x40; // INC AX at page 1
+        memory[0x2008] = 0xb0; // MOV AL, imm8
+        memory[0x2009] = 0x99;
+        memory[0x200a] = 0xa2; // MOV moffs16, AL
+        memory[0x200b] = 0x50;
+        memory[0x200c] = 0x30; //   moffs = 0x3050 (page 3, holds no code)
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.set_eip(0x1000);
+        cpu.cycle(&mut bus).unwrap(); // cache INC AX, mark page 1
+        assert!(cpu.decode_cache.get(0x1000).is_some());
+
+        cpu.set_eip(0x2008);
+        cpu.cycle(&mut bus).unwrap(); // MOV AL, 0x99
+        cpu.cycle(&mut bus).unwrap(); // MOV [0x3050], AL -> page 3 is not a code page
+        assert!(
+            cpu.decode_cache.get(0x1000).is_some(),
+            "a data write to a non-code page must not flush the decode cache"
+        );
+    }
+
+    #[test]
+    fn d_bit_change_at_the_same_linear_address_re_decodes() {
+        // The cache is keyed on the linear address, but a decode also depends on the code segment's
+        // D bit (16- vs 32-bit operand/address size). MOV (E)AX, imm (0xB8) is 3 bytes in a 16-bit
+        // segment (imm16) and 5 bytes in a 32-bit one (imm32). Caching the 16-bit form and then
+        // aliasing the same linear with a 32-bit code segment must re-decode, not replay the 3-byte
+        // form. A real protected-mode CS load routes through invalidate_code_caches; this drives
+        // that effect directly (set the 32-bit CS, then invalidate) to avoid a full GDT setup.
+        let mut memory = vec![0u8; 0x100];
+        memory[0..5].copy_from_slice(&[0xb8, 0x34, 0x12, 0x78, 0x56]); // B8 imm
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0); // 16-bit
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(memory);
+
+        // 16-bit: MOV AX, 0x1234 (3 bytes).
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.eax() & 0xffff, 0x1234);
+        assert_eq!(cpu.registers.eip, 3);
+        assert!(cpu.decode_cache.get(0).is_some());
+
+        // Alias linear 0 with a 32-bit code segment (same base 0).
+        let cs32 = SegmentRegister {
+            default_size_32: true,
+            ..cpu.registers.cs()
+        };
+        cpu.registers.set_segment(SegmentIndex::Cs, cs32);
+        cpu.invalidate_code_caches();
+        assert!(
+            cpu.decode_cache.get(0).is_none(),
+            "the D-bit change invalidated the cached 16-bit decode"
+        );
+
+        // 32-bit: MOV EAX, 0x56781234 (5 bytes), not the stale 3-byte form.
+        cpu.registers.set_eax(0);
+        cpu.set_eip(0);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(
+            cpu.registers.eax(),
+            0x5678_1234,
+            "a 32-bit immediate was read"
+        );
+        assert_eq!(
+            cpu.registers.eip, 5,
+            "the 32-bit MOV is 5 bytes, not the cached 3"
+        );
+    }
+
+    #[test]
+    fn a_fetch_page_made_not_present_re_faults_after_invalidation() {
+        // A cache hit must not execute an instruction whose fetch would now fault. Page linear
+        // 0x1000 -> frame 0x5000 (present), cache INC AX there, then clear the PTE present bit and
+        // flush (which bumps the decode generation). Re-entry must re-decode, fault on the absent
+        // fetch page, and leave AX untouched -- never replay the cached INC AX. (Observed via AX
+        // rather than cr2 because, with no IDT mapped, delivering the #PF cascades a second fault.)
+        let mut memory = vec![0u8; 0x8000];
+        memory[0x6000..0x6004].copy_from_slice(&0x0000_7007u32.to_le_bytes()); // PD[0] -> PT 0x7000
+        memory[0x7004..0x7008].copy_from_slice(&0x0000_5007u32.to_le_bytes()); // PT[1] (lin 0x1000) -> 0x5000
+        memory[0x5000] = 0x40; // INC AX at linear 0x1000
+        let mut cpu = Cpu386::default();
+        cpu.control.cr3 = 0x6000;
+        cpu.control.cr0 |= CR0_PE | CR0_PG;
+        cpu.registers
+            .set_segment(SegmentIndex::Cs, SegmentRegister::flat(0, 0x9b));
+        cpu.registers.eip = 0x1000;
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap(); // INC AX runs (AX 0 -> 1), cached at linear 0x1000
+        assert_eq!(cpu.registers.eax() & 0xffff, 1);
+        assert!(cpu.decode_cache.get(0x1000).is_some());
+
+        // Clear the PTE present bit and flush so the cache invalidates.
+        bus.memory[0x7004..0x7008].copy_from_slice(&0x0000_5006u32.to_le_bytes());
+        cpu.flush_tlb_and_code_caches();
+        assert!(
+            cpu.decode_cache.get(0x1000).is_none(),
+            "the flush invalidated the cache"
+        );
+
+        cpu.registers.set_eax(5);
+        cpu.set_eip(0x1000);
+        let _ = cpu.cycle(&mut bus); // faults on the absent fetch page (delivery may error: no IDT)
+        assert_eq!(
+            cpu.registers.eax() & 0xffff,
+            5,
+            "the re-fetch from the now-absent page faulted; the stale cached INC AX did NOT run"
+        );
+    }
+
+    #[test]
+    fn note_a20_changed_invalidates_the_decode_cache() {
+        // A20 is masked at the bus, not the CPU, so toggling it changes which physical bytes back a
+        // linear address near the 1 MB wrap without any CPU-visible state change. The machine calls
+        // note_a20_changed on the transition so a cached decode of the old bytes is not replayed.
+        let (mut cpu, mem) = real_mode_cpu(&[0x40], 0x20);
+        let mut bus = TestBus::with_memory(mem);
+        let lin = cpu.linear_eip();
+        cpu.cycle(&mut bus).unwrap();
+        assert!(cpu.decode_cache.get(lin).is_some());
+
+        cpu.note_a20_changed();
+        assert!(
+            cpu.decode_cache.get(lin).is_none(),
+            "an A20 toggle invalidates the decode cache"
+        );
     }
 
     fn run_at_level(code: &[u8], level: CpuLevel) -> Result<CycleOutcome, InternalFault> {
