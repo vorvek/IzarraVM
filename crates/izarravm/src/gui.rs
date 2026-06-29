@@ -52,6 +52,9 @@ const LABEL: egui::Color32 = egui::Color32::from_rgb(0x6B, 0x62, 0x48);
 const MUTED: egui::Color32 = egui::Color32::from_rgb(0x5C, 0x53, 0x40);
 const LED_ON: egui::Color32 = egui::Color32::from_rgb(0x46, 0xE0, 0x5A);
 const LED_OFF: egui::Color32 = egui::Color32::from_rgb(0x2D, 0x4A, 0x2E);
+/// The Izarra 3000 logo's red, sampled from the wordmark. Used for the floating
+/// window headers so they read as branded and contrast on the beige frame.
+const LOGO_RED: egui::Color32 = egui::Color32::from_rgb(0xC7, 0x44, 0x46);
 
 /// The panel face as f32 RGB, for the logo recolor unmix target.
 const PANEL_FACE_F32: [f32; 3] = [205.0, 195.0, 164.0];
@@ -312,9 +315,10 @@ fn beige_group<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R 
 }
 
 /// The shared beige look for IzarraVM's floating windows (COM1, About,
-/// License): PANEL_FACE fill, 12px inner padding, beige widget visuals,
-/// draggable + closable. The caller supplies the title, the open flag (the
-/// window's own close control flips it), a default size, and the body.
+/// License): PANEL_FACE fill, 12px inner padding, beige widget visuals, a bold
+/// logo-red header, no collapse button, draggable + closable. The caller
+/// supplies the title, the open flag (the window's own close control flips it),
+/// a default size, and the body.
 fn beige_window(
     ctx: &egui::Context,
     title: &str,
@@ -322,20 +326,62 @@ fn beige_window(
     default_size: [f32; 2],
     add: impl FnOnce(&mut egui::Ui),
 ) {
-    egui::Window::new(title)
-        .open(open)
-        .resizable(true)
-        .default_size(default_size)
-        .frame(
-            egui::Frame::new()
-                .fill(PANEL_FACE)
-                .inner_margin(egui::Margin::same(12))
-                .corner_radius(4.0),
-        )
-        .show(ctx, |ui| {
-            beige_visuals(ui);
-            add(ui);
-        });
+    // egui paints the title bar (title text + close button) from the global
+    // style before the body runs, so darken the interactive glyphs (the close
+    // X) to read on the beige frame here, then restore. The title text itself
+    // is a bold logo-red RichText below.
+    let saved_widgets = ctx.style().visuals.widgets.clone();
+    ctx.style_mut(|s| {
+        s.visuals.widgets.inactive.fg_stroke.color = INK;
+        s.visuals.widgets.hovered.fg_stroke.color = INK;
+        s.visuals.widgets.active.fg_stroke.color = INK;
+        s.visuals.widgets.hovered.weak_bg_fill = BEVEL_HI;
+        s.visuals.widgets.active.weak_bg_fill = BEVEL_LO;
+    });
+    egui::Window::new(
+        egui::RichText::new(title)
+            .color(LOGO_RED)
+            .strong()
+            .size(15.0),
+    )
+    .open(open)
+    .resizable(true)
+    .collapsible(false)
+    .default_size(default_size)
+    .frame(
+        egui::Frame::new()
+            .fill(PANEL_FACE)
+            .inner_margin(egui::Margin::same(12))
+            .corner_radius(4.0),
+    )
+    .show(ctx, |ui| {
+        beige_visuals(ui);
+        add(ui);
+    });
+    ctx.style_mut(|s| {
+        s.visuals.widgets = saved_widgets;
+    });
+}
+
+/// A small painted "i in a circle" info-icon button, since the default font
+/// lacks the U+1F6C8 glyph. Matches the adjacent buttons' footprint; returns
+/// the click response so callers can add hover text and handle clicks.
+fn info_button(ui: &mut egui::Ui) -> egui::Response {
+    let h = ui.spacing().interact_size.y;
+    let resp = ui.add_sized([h, h], egui::Button::new(""));
+    let rect = resp.rect;
+    let c = rect.center();
+    let r = (h * 0.32).round();
+    let stroke = egui::Stroke::new(1.5, INK);
+    let p = ui.painter();
+    p.circle_stroke(c, r, stroke);
+    // The dot and stem of the lowercase "i".
+    p.circle_filled(c - egui::vec2(0.0, r * 0.45), 1.1, INK);
+    p.line_segment(
+        [c - egui::vec2(0.0, r * 0.05), c + egui::vec2(0.0, r * 0.5)],
+        stroke,
+    );
+    resp
 }
 
 /// A small square drive-activity LED.
@@ -1506,7 +1552,7 @@ impl GuiApp {
                         ),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("\u{1F6C8}").on_hover_text("About").clicked() {
+                        if info_button(ui).on_hover_text("About").clicked() {
                             self.show_about = true;
                         }
                         if ui
@@ -1798,7 +1844,8 @@ impl GuiApp {
             ui.label(
                 egui::RichText::new(concat!("IzarraVM ", env!("CARGO_PKG_VERSION")))
                     .color(INK)
-                    .size(18.0),
+                    .size(18.0)
+                    .strong(),
             );
             ui.label(
                 egui::RichText::new("the Izarra 3000 virtual machine")
@@ -1815,7 +1862,8 @@ impl GuiApp {
             ui.label(
                 egui::RichText::new("Bundled software")
                     .color(LABEL)
-                    .size(11.0),
+                    .size(11.0)
+                    .strong(),
             );
             ui.label(
                 egui::RichText::new(include_str!("../../../NOTICE"))
