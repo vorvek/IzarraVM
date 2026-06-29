@@ -206,6 +206,13 @@ impl AtaDisk {
         }
     }
 
+    /// Whether this disk is a flat image (vs a lazy host-folder facade). Only an
+    /// image has flushable bytes; a folder is read-only with no backing buffer, so
+    /// callers that persist `bytes()` must skip it (see `Machine::eject_hdd`).
+    pub fn is_image(&self) -> bool {
+        matches!(self.backing, Backing::Image(_))
+    }
+
     /// Read one whole 512-byte sector at `lba`, or None if past the end. The facade
     /// synthesizes sectors on demand, so this returns an owned array rather than a
     /// borrow into a backing buffer.

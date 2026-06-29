@@ -257,17 +257,39 @@ impl KateaVolume {
         let mut root_dir = Vec::with_capacity(files.len() * 32);
         let mut mapped = Vec::with_capacity(files.len());
 
+        // The root directory is a single cluster here (matching the static image),
+        // so it holds cluster_bytes/32 entries. Files past that, past the disk's
+        // cluster count, or larger than FAT32's 4 GiB limit are dropped with a
+        // warning rather than panicking or silently vanishing from DIR. ponytail: a
+        // multi-cluster root and a folder-sized disk are Milestone-1 work; M0 only
+        // needs to prove the read path, so a bounded, loud cap is enough.
+        let max_root_entries = cluster_bytes as usize / 32;
         for f in files {
-            let size = u32::try_from(f.source.len()).expect("file larger than 4 GiB");
+            let Ok(size) = u32::try_from(f.source.len()) else {
+                eprintln!(
+                    "katea: skipping {} (>= 4 GiB, not FAT32-representable)",
+                    f.name
+                );
+                continue;
+            };
             // At least one cluster even for an empty file: the Python builder uses
             // max(1, ceil(len/cluster_bytes)) and stamps a real first cluster.
             let nclu = (size.div_ceil(cluster_bytes)).max(1);
             let first = next_free;
-            assert!(
-                first + nclu - 1 <= count_of_clusters + 1,
-                "out of clusters writing {}",
-                f.name
-            );
+            if root_dir.len() / 32 >= max_root_entries {
+                eprintln!(
+                    "katea: root directory full ({max_root_entries} entries); dropping {} and any further files",
+                    f.name
+                );
+                break;
+            }
+            if first + nclu - 1 > count_of_clusters + 1 {
+                eprintln!(
+                    "katea: disk full; dropping {} and any further files",
+                    f.name
+                );
+                break;
+            }
             // Chain c -> c+1, last -> EOC.
             for i in 0..nclu {
                 let c = first + i;
@@ -472,19 +494,22 @@ pub fn extract_system_payload(image: &[u8]) -> SystemPayload {
     let cluster_lba = |cluster: u32| part_start + first_data_sector + (cluster - root_clus) * spc32;
     // Concatenate a cluster chain's raw bytes, following c -> FAT[c] to EOC.
     let read_chain = |first: u32| -> Vec<u8> {
+        // A cluster chain can't be longer than the disk has sectors; bound the walk
+        // so a cyclic or corrupt FAT (this fn is pub) can't loop forever.
+        let max_clusters = image.len() / SECTOR;
         let mut out = Vec::new();
         let mut c = first;
-        loop {
+        for _ in 0..max_clusters {
             for s in 0..spc32 {
                 out.extend_from_slice(sector(cluster_lba(c) + s));
             }
             let next = fat_entry(c);
             if next >= 0x0FFF_FFF8 {
-                break;
+                return out;
             }
             c = next;
         }
-        out
+        panic!("katea: cluster chain from {first} exceeds the disk; corrupt FAT")
     };
 
     // Walk the root directory (a cluster chain starting at RootClus), parsing

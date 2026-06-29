@@ -1506,9 +1506,15 @@ impl Machine {
 
     /// Eject the hard disk, returning its current image bytes (including any
     /// in-session writes) so the caller can flush them back. None when no disk is
-    /// mounted. Clears the BDA fixed-disk count.
+    /// mounted OR when the disk is a read-only host-folder facade (which has no
+    /// flushable image — returning its empty `bytes()` would persist a 0-byte file).
+    /// Clears the BDA fixed-disk count.
     pub fn eject_hdd(&mut self) -> Option<Vec<u8>> {
-        let bytes = self.ata.take().map(|d| d.bytes().to_vec());
+        let bytes = self
+            .ata
+            .take()
+            .filter(ata::AtaDisk::is_image)
+            .map(|d| d.bytes().to_vec());
         let _ = self.clear_fixed_disk_parameter_table();
         let _ = self.memory.write_u8(0x475, 0);
         bytes

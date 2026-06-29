@@ -1227,8 +1227,9 @@ mod tokados_smoke {
     #[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
     fn katea_host_folder_boots_and_lists_a_host_file() {
         // A unique scratch folder under the system temp dir, holding one host file
-        // whose 8.3 name (GREETING.TXT -> GREETI~1.TXT) is distinct from the system
-        // files, so spotting it in DIR proves the host folder reached the volume.
+        // whose 8.3 name (GREETING.TXT — already a valid 8.3 name, no ~n fold) is
+        // distinct from the system files, so spotting it in DIR proves the host
+        // folder reached the volume.
         let dir = std::env::temp_dir().join(format!(
             "katea_folder_{}_{}",
             std::process::id(),
@@ -1261,7 +1262,7 @@ mod tokados_smoke {
             "no C:\\> prompt after folder boot (stop={stop:?}).\n{text}"
         );
 
-        // DIR C: must list the host file, folded to its short name (GREETI~1).
+        // DIR C: must list the host file by its 8.3 name (GREETING.TXT).
         for ch in "dir c:\\\r".chars() {
             for code in ascii_to_set1(ch) {
                 machine.inject_key_scancodes(&[code]);
@@ -1274,10 +1275,33 @@ mod tokados_smoke {
             .run_until_halt_or_cycles(40_000_000)
             .expect("settle dir");
         let dir_text = machine.screen_text().as_text().to_ascii_lowercase();
+
+        // TYPE the host file: this drives the kernel to READ the file's data, which
+        // the facade serves lazily (open+seek+read) straight from the host file on
+        // disk — proving the data path, not just the synthesized directory entry.
+        // The host folder must still exist while the read happens, so the cleanup
+        // waits until after both screens are captured.
+        for ch in "type c:\\greeting.txt\r".chars() {
+            for code in ascii_to_set1(ch) {
+                machine.inject_key_scancodes(&[code]);
+            }
+            machine
+                .run_until_halt_or_cycles(5_000_000)
+                .expect("type the type command");
+        }
+        machine
+            .run_until_halt_or_cycles(40_000_000)
+            .expect("settle type");
+        let type_text = machine.screen_text().as_text().to_ascii_lowercase();
+
         std::fs::remove_dir_all(&dir).ok();
         assert!(
             dir_text.contains("greeti"),
             "DIR C: did not list the host file off the folder facade.\n{dir_text}"
+        );
+        assert!(
+            type_text.contains("hi from the host folder"),
+            "TYPE did not print the host file's contents read lazily through the facade.\n{type_text}"
         );
     }
 }
