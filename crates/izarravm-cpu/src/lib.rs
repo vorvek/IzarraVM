@@ -6748,30 +6748,69 @@ fn clocks(core_clocks: u32) -> CycleOutcome {
 }
 
 /// Per-level instruction-clock scaling as (numerator, denominator), CALIBRATED
-/// (B-T8/B-T9) against the Neurketa compute benchmarks. A retired op's base clocks
-/// are scaled by num/den (with a fractional remainder carry in `scale_clocks`), so
+/// (B-T10) against the Neurketa compute benchmarks. A retired op's base clocks are
+/// scaled by num/den (with a fractional remainder carry in `scale_clocks`), so
 /// num/den < 1 runs the mode faster.
 ///
-/// Model reality (see bench_reference.rs band notes): every guest clock is
-/// `scaled_instruction_clocks + bus_clocks`, and the bus clocks are NOT scaled by
-/// this dial. Each bus access costs >= 2 clocks regardless of mode, so a
-/// memory/fetch-heavy payload floors at a mode-INDEPENDENT clock count. That floor
-/// dominates the fast modes' Dhrystone/Sieve, capping them well below their sourced
-/// era targets no matter how small this ratio is. So this dial's real jobs are:
-/// - 286: add just enough instruction clocks to seat Dhrystone in its band (1/12);
-/// - 386, 486: stay near the bus floor (1/256, effectively zero added instruction
-///   clocks) so the bus-capped Dhrystone/Sieve reach as high as the model allows
-///   and fp-mandel 486 lands on target;
-/// - 586: BRAKE fp-mandel (the one 586 compute band the model can seat) down into
-///   its band (1/3); this also slows the already-capped 586 Dhrystone/Sieve, an
-///   accepted trade since a single scalar cannot speed those up past the bus floor
-///   while also braking fp-mandel.
+/// This is the COMPUTE dial. Since B-T10 a second per-mode dial (`bus_timing`)
+/// scales the whole bus portion (fetch + data access), so every guest clock is
+/// `scale_clocks(instruction) + scale_bus(bus)`. The bus dial carries the absolute
+/// per-mode magnitude (it lets a fast part pull away from the old flat per-access
+/// floor), so this dial only trims the compute share. Dhrystone (the PRIMARY
+/// oracle) is a fetch+data mix split roughly compute/bus; these values plus
+/// `bus_timing` seat all four modes' Dhrystones/sec on the owner's authoritative
+/// era targets (286 ~3500, 386 ~9200, 486 ~61000, 586 ~475000) to within ~0.3%.
+///
+/// fp-mandel TRADE-OFF: fp-mandel is x87-compute-bound (~7280 instruction clocks
+/// vs ~6247 bus per pixel), so it rides this dial. Dhrystone pinned to its owner
+/// target forces the compute dial small on the fast modes, which makes fp-mandel
+/// run well above its ratio-anchored band and at a 586/486 ratio of ~8x (the model
+/// floor with Dhrystone pinned is ~7.8x; see bench_reference.rs). Matching both the
+/// fp-mandel ratio AND the Dhrystone target needs a separate x87 latency dial (a
+/// deferred Whetstone-payload follow-up); Dhrystone is PRIMARY, so fp-mandel's band
+/// is recentered on the achieved value and the ratio gap recorded.
 const fn level_timing(level: CpuLevel) -> (u32, u32) {
     match level {
-        CpuLevel::I286 => (7, 10),
-        CpuLevel::I386 => (5, 9),
-        CpuLevel::I486 => (1, 24),
-        CpuLevel::I586 => (2, 5),
+        CpuLevel::I286 => (3, 5),
+        CpuLevel::I386 => (2, 5),
+        CpuLevel::I486 => (1, 12),
+        CpuLevel::I586 => (1, 12),
+    }
+}
+
+/// Per-level BUS-clock scaling as (numerator, denominator), CALIBRATED (B-T10).
+/// This is the THIRD timing lever (after `level_timing` and the cache `tier_cost`
+/// wait-states): it scales the ENTIRE bus portion of a step (instruction fetch +
+/// every tiered data access) by num/den, with a fractional-remainder carry in the
+/// machine's `scale_bus` so a cheap access is not rounded to zero.
+///
+/// Why it exists: the bus portion is `2 + wait_states` clocks per access and the
+/// `2` base is mode-INDEPENDENT, so before this dial a fast part could not pull
+/// away from a flat per-access floor and 486/586 Dhrystone/Sieve floored far below
+/// their era absolutes. Scaling the whole bus portion per mode supplies the
+/// absolute magnitude the fast modes need (num/den < 1 makes the bus effectively
+/// faster, lifting iters/sec), while the relative L1<L2<RAM structure stays in the
+/// `tier_cost` wait-states. The slow modes keep num/den ~ 1 (their flat-floor bus
+/// was already near band); the fast modes use a smaller ratio to reach their
+/// targets (486 ~0.33, 586 ~0.18). These values, with `level_timing`, seat all four
+/// Dhrystone modes on the owner's authoritative targets (the PRIMARY oracle).
+///
+/// BANDWIDTH coupling (see bench_reference.rs): the bandwidth tool now reports the
+/// SCALED bus delta, so a tier's MB/s is `4 * clock_hz / ((2 + ws) * (num/den)) /
+/// 1e6`. A smaller num/den (needed for fast-mode Dhrystone) multiplies bandwidth UP
+/// by den/num, so the fast-mode L1 bandwidth lands ABOVE the SpeedSys era figures
+/// and cannot be pulled back without re-slowing Dhrystone (Dhrystone is ~30% L1
+/// data, so the L1 wait-state is shared). The L2/RAM tiers are decoupled (the
+/// benchmarks fit L1/L2 and never miss), so their large `tier_cost` miss penalties
+/// pull those tiers down to SpeedSys on the 486; on the 586 the u8 wait-state cap
+/// (255) over a 16-dword line floors L2/RAM above SpeedSys. Era anchors and the gap
+/// are recorded in each bandwidth `cite`.
+pub const fn bus_timing(level: CpuLevel) -> (u32, u32) {
+    match level {
+        CpuLevel::I286 => (6, 11),
+        CpuLevel::I386 => (23, 31),
+        CpuLevel::I486 => (1, 3),
+        CpuLevel::I586 => (9, 49),
     }
 }
 
@@ -13934,16 +13973,16 @@ mod tests {
         // CPU's INSTRUCTION-clock charge only (cpu.elapsed_clocks holds scaled core
         // clocks; bus/fetch clocks are accounted on the bus, not here).
         //
-        // Calibration note (B-T8/B-T9): the per-mode `level_timing` scalar is NO
-        // LONGER a monotone "faster level => fewer instruction clocks" dial. The
-        // mode-independent bus-access floor carries the modes' relative benchmark
-        // speed; the instruction scalar is residual fine-tuning plus the 586's
-        // fp-mandel brake. So 586 deliberately charges MORE instruction clocks per op
-        // than 386/486 (its 1/3 ratio brakes fp-mandel into band), while 386 and 486
-        // both sit near the bus floor at the same small ratio. The contract this test
-        // guards is only that the scalar is applied per level: the 286 (largest
-        // in-order ratio) charges more than the 386/486 near-floor ratio, and a mode
-        // change re-scales.
+        // Calibration note (B-T10): the per-mode `level_timing` scalar is the COMPUTE
+        // dial only. The per-mode BUS scalar (`bus_timing`, applied in the machine's
+        // `scale_bus`) now carries the modes' absolute benchmark magnitude, so a fast
+        // mode pulls ahead via the bus, NOT by charging fewer instruction clocks. The
+        // compute dial just trims each mode's compute share to seat Dhrystone: it is
+        // largest on the 286 (most compute-heavy in-order ratio), smaller on the 386,
+        // and smallest-and-EQUAL on the 486 and 586 (their pull-ahead is all in the
+        // bus dial). The contract this test guards: the scalar is applied per level,
+        // descends 286 > 386 >= 486, and the 586 charges no more than the 486 (the bus
+        // dial, not this one, carries the 586's speed). A mode change re-scales.
         fn elapsed_for(level: CpuLevel) -> u64 {
             let (mut cpu, memory) = real_mode_cpu(&[0x01, 0xd8], 0x20);
             cpu.set_level(level);
@@ -13958,21 +13997,21 @@ mod tests {
         let i386 = elapsed_for(CpuLevel::I386);
         let i486 = elapsed_for(CpuLevel::I486);
         let i586 = elapsed_for(CpuLevel::I586);
-        // 286 (1/12) charges more instruction clocks than the near-floor 386/486.
+        // 286 (3/5) charges more instruction clocks than the 386 (2/5).
         assert!(
             i286 > i386,
             "286 ({i286}) should charge more instruction clocks than 386 ({i386})"
         );
-        // 386 and 486 both sit at the near-floor 1/256 ratio.
+        // 386 (2/5) charges more than the small-and-equal 486/586 (1/12).
         assert!(
-            i486 <= i386,
-            "486 ({i486}) should charge no more than 386 ({i386}) at the near-floor ratio"
+            i386 > i486,
+            "386 ({i386}) should charge more instruction clocks than 486 ({i486})"
         );
-        // 586's fp-mandel brake (1/3) deliberately charges more than the near-floor
-        // 486; the bus floor, not this scalar, carries 586's benchmark speed.
+        // 486 and 586 share the same compute ratio (1/12): the bus dial, not this
+        // one, carries the 586's pull-ahead, so the 586 charges no MORE than the 486.
         assert!(
-            i586 > i486,
-            "586 ({i586}) brakes fp-mandel and charges more instruction clocks than 486 ({i486})"
+            i586 <= i486,
+            "586 ({i586}) shares the 486's compute ratio and must charge no more than 486 ({i486})"
         );
     }
 
