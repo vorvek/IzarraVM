@@ -1026,6 +1026,11 @@ struct DecodedInsn {
     /// 5 bits in `decode`). Available for any future group/other form that needs a second
     /// immediate; left 0 for the single-immediate and no-immediate opcodes.
     imm2: u32,
+    /// The routed decode group, resolved ONCE in `decode` (the single `route_group` authority) and
+    /// stored so `execute_decoded` matches the variant directly instead of re-running the opcode
+    /// classifier. `route_group` is pure over `(opcode, prefixes)`, both captured here, so the
+    /// stored value is exactly what a re-call would return.
+    group: DecodeGroup,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1488,6 +1493,10 @@ impl Cpu386 {
             u16::from(opcode)
         };
 
+        // The single `route_group` authority runs ONCE here; the result is stored in the insn so
+        // `execute_decoded` matches the variant directly rather than re-classifying the opcode.
+        let group = Self::route_group(opcode, prefixes);
+
         let mut insn = DecodedInsn {
             start_eip,
             // `len`/`fetch` are placeholders here; the single finalize after the group pre-parse
@@ -1507,11 +1516,11 @@ impl Cpu386 {
             operand: None,
             imm: 0,
             imm2: 0,
+            group,
         };
 
-        // Pre-parse the operands of converted groups. The group classifier is the single routing
-        // authority; `execute_decoded` matches the same `DecodeGroup` to decide how to execute.
-        match Self::route_group(insn.opcode, prefixes) {
+        // Pre-parse the operands of converted groups, dispatching on the group resolved above.
+        match group {
             DecodeGroup::Alu => {
                 // ALU block. Forms 0-3 carry a ModRM: parse it + its addressing-mode descriptor now
                 // (the descriptor reads instruction bytes only, so it stays cacheable). Forms 4/5
@@ -1930,9 +1939,9 @@ impl Cpu386 {
         insn: &DecodedInsn,
         bus: &mut B,
     ) -> ExecResult<CycleOutcome> {
-        // Route on the same group classifier `decode` used, so the parse side and the execute
-        // side can never drift out of sync.
-        match Self::route_group(insn.opcode, insn.prefixes) {
+        // Dispatch on the group `decode` already resolved and stored, so the parse side and the
+        // execute side can never drift out of sync and `route_group` runs only once per instruction.
+        match insn.group {
             // The whole ALU block (ADD/OR/ADC/SBB/AND/SUB/XOR/CMP, forms 0-5) runs through the
             // split executor, consuming the ModRM/immediate `decode` pre-parsed.
             DecodeGroup::Alu => self.execute_alu_decoded(insn, bus),
