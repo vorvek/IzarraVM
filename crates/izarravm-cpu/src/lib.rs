@@ -15573,6 +15573,68 @@ mod tests {
     }
 
     #[test]
+    fn straight_line_run_never_executes_an_int_after_a_taken_branch() {
+        // Regression guard against the "recompiler executes non-executed code" claim: a
+        // side-effecting instruction (INT 0x13) sitting in the contiguous bytes AFTER a taken
+        // branch must NEVER be dispatched, even after the decode cache is warm. INT n is a
+        // ControlFlow terminator, so `run_straight_line` breaks BEFORE it the moment it is the next
+        // cached instruction; it can only ever run if eip genuinely points at it via real control
+        // flow. The JMP here makes eip skip the INT entirely, so the executed-INT trace must stay
+        // empty for vector 0x13.
+        //
+        //   0x00: 40           INC AX
+        //   0x01: 40           INC AX
+        //   0x02: EB 02        JMP +2 -> 0x06        (taken branch over the INT)
+        //   0x04: CD 13        INT 0x13              (contiguous bytes; must NEVER run)
+        //   0x06: F4           HLT
+        let code = [
+            0x40, // INC AX
+            0x40, // INC AX
+            0xeb, 0x02, // JMP +2 -> 0x06 (skips the INT 0x13)
+            0xcd, 0x13, // INT 0x13 (must never execute)
+            0xf4, // HLT
+        ];
+        let (mut cpu, memory) = real_mode_cpu(&code, 1024);
+        let mut bus = TestBus::with_memory(memory);
+
+        // First drive: warms the decode cache (the INC/INC/JMP block becomes a cached run) and runs
+        // to the HLT. A warm cache is exactly the condition under which an over-read of trailing
+        // bytes would surface, so this is the case the claim must be tested against.
+        drive_straight_line_runs(&mut cpu, &mut bus);
+        assert_eq!(
+            cpu.read_reg16(Reg16::Ax),
+            2,
+            "only the two pre-JMP INCs ran"
+        );
+        assert_eq!(cpu.registers.eip, 0x07, "control reached the HLT at 0x06");
+
+        // Re-arm and drive again from the top with the cache now hot, to be sure a cached
+        // straight-line run still stops before the INT rather than over-reading into it.
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0);
+        cpu.halted = false;
+        drive_straight_line_runs(&mut cpu, &mut bus);
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 2);
+
+        // The decisive assertion: across both drives, NO software interrupt was ever acknowledged
+        // for vector 0x13. `software_interrupt` is the single dispatch point for an executed INT n,
+        // and it always calls `bus.interrupt_acknowledge(vector, ..)`, which the TestBus records as
+        // an InterruptAcknowledge cycle. An empty result proves the post-branch INT bytes are inert.
+        let executed_int13 = bus
+            .trace
+            .cycles()
+            .iter()
+            .filter(|c| c.kind == BusAccessKind::InterruptAcknowledge && c.address == 0x13)
+            .count();
+        assert_eq!(
+            executed_int13, 0,
+            "the straight-line executor dispatched INT 0x13 from bytes after a taken branch; \
+             this would be a genuine over-read of non-executed code"
+        );
+    }
+
+    #[test]
     fn straight_line_run_ends_on_port_io_step_break() {
         // A port access (OUT) touches time-dependent device state, so the old per-instruction machine
         // loop ended the step immediately after it (io_touched). The executor must do the same via

@@ -13848,6 +13848,88 @@ mod tests {
     }
 
     #[test]
+    fn measure_read_bandwidth_curve_descends_per_tier() {
+        // The end-to-end proof that "the three speed levels work": drive the bus over
+        // block sizes chosen to land well inside each tier FOR THAT MODE (not at a
+        // boundary, so the separation is clean), compute MB/s, and assert the curve
+        // descends L1 > L2 > RAM. A fixed TOTAL budget amortizes the cold first pass.
+        const TOTAL: u64 = 16 * 1024 * 1024;
+        const BASE: u32 = 0x10_0000;
+
+        // MB/s from a sample, mirroring the --headless-bandwidth derivation.
+        fn mbps(machine: &mut Machine, mode: GswMode, block: u32) -> f64 {
+            let sample = machine.measure_read_bandwidth(BASE, block, TOTAL);
+            assert!(sample.clocks > 0, "{mode:?} block {block}: zero clocks");
+            sample.bytes as f64 / (sample.clocks as f64 / mode.clock_hz() as f64) / 1.0e6
+        }
+
+        // A fresh machine per (mode, block) so each measurement starts cold and
+        // nothing carries over, exactly like the bandwidth tool does.
+        fn measure(mode: GswMode, block: u32) -> f64 {
+            let mut machine = Machine::new_boot_image(
+                MachineProfile::gsw_386(24, VideoCard::Et4000Ax),
+                izarravm_firmware::neurketa_image(),
+            )
+            .expect("boot image");
+            machine.set_mode(mode);
+            mbps(&mut machine, mode, block)
+        }
+
+        // 586: L1 64K, L2 512K. 32K is deep in L1, 256K deep in L2, 2M is RAM.
+        {
+            let l1 = measure(GswMode::Gsw586, 32 * 1024);
+            let l2 = measure(GswMode::Gsw586, 256 * 1024);
+            let ram = measure(GswMode::Gsw586, 2 * 1024 * 1024);
+            assert!(
+                l1 > l2 * 1.05,
+                "586: L1 {l1:.1} must exceed L2 {l2:.1} MB/s"
+            );
+            assert!(
+                l2 > ram * 1.05,
+                "586: L2 {l2:.1} must exceed RAM {ram:.1} MB/s"
+            );
+        }
+
+        // 486: L1 16K, L2 128K. 8K is deep in L1, 64K deep in L2, 256K is RAM.
+        {
+            let l1 = measure(GswMode::Gsw486, 8 * 1024);
+            let l2 = measure(GswMode::Gsw486, 64 * 1024);
+            let ram = measure(GswMode::Gsw486, 256 * 1024);
+            assert!(
+                l1 > l2 * 1.05,
+                "486: L1 {l1:.1} must exceed L2 {l2:.1} MB/s"
+            );
+            assert!(
+                l2 > ram * 1.05,
+                "486: L2 {l2:.1} must exceed RAM {ram:.1} MB/s"
+            );
+        }
+
+        // 386: L2 64K, no L1. 32K is deep in L2, 1M is well into RAM. The 386 L2-vs-RAM
+        // step is the narrowest, so pick a small L2 block and a large RAM block to
+        // separate them cleanly and assert a >5% margin.
+        {
+            let l2 = measure(GswMode::Gsw386, 32 * 1024);
+            let ram = measure(GswMode::Gsw386, 1024 * 1024);
+            assert!(
+                l2 > ram * 1.05,
+                "386: L2 {l2:.1} must exceed RAM {ram:.1} MB/s"
+            );
+        }
+
+        // 286: no cache. Two sizes must be roughly flat (no tier step), within 20%.
+        {
+            let small = measure(GswMode::Gsw286, 8 * 1024);
+            let large = measure(GswMode::Gsw286, 1024 * 1024);
+            let ratio = small / large;
+            assert!(
+                (0.8..=1.25).contains(&ratio),
+                "286 is cacheless: {small:.1} vs {large:.1} MB/s should be flat (ratio {ratio:.3})"
+            );
+        }
+    }
+
+    #[test]
     fn cache_geometry_matches_cache_kb() {
         // The machine geometry must agree with the CPU's cache_kb readout (KB).
         for (level, (l1_kb, l2_kb)) in [

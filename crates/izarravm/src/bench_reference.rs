@@ -473,6 +473,39 @@ mod tests {
     }
 
     #[test]
+    fn bench_band_tiers_descend_l1_l2_ram() {
+        // The "L1 > L2 > RAM" descending invariant is documented in the cites; this
+        // enforces it on the encoded targets for every mode that has the tiers.
+        // (286 has RAM only -- its presence is covered by the presence test.)
+        let target = |tier, mode| {
+            band_for(tier, mode)
+                .unwrap_or_else(|| panic!("missing {tier} band for {mode:?}"))
+                .target
+        };
+        // 486 and 586: all three tiers present, l1 > l2 > ram.
+        for mode in [GswMode::Gsw486, GswMode::Gsw586] {
+            let l1 = target("bandwidth-l1", mode);
+            let l2 = target("bandwidth-l2", mode);
+            let ram = target("bandwidth-ram", mode);
+            assert!(
+                l1 > l2,
+                "{mode:?}: L1 target {l1} must exceed L2 target {l2}"
+            );
+            assert!(
+                l2 > ram,
+                "{mode:?}: L2 target {l2} must exceed RAM target {ram}"
+            );
+        }
+        // 386: no L1; l2 > ram.
+        let l2_386 = target("bandwidth-l2", GswMode::Gsw386);
+        let ram_386 = target("bandwidth-ram", GswMode::Gsw386);
+        assert!(
+            l2_386 > ram_386,
+            "386: L2 target {l2_386} must exceed RAM target {ram_386}"
+        );
+    }
+
+    #[test]
     fn bench_band_in_order_modes_are_tighter_than_586() {
         // For each runnable payload, every in-order mode's relative band width
         // must be <= the 586's (the superscalar mode carries the widest gap).
