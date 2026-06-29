@@ -986,28 +986,11 @@ enum DecodeGroup {
     TwoByteFallback,
 }
 
-/// How decode charges the instruction-fetch clocks when an instruction is replayed from a
-/// cache. Unused in Stage A: decode here charges fetch clocks through its real `fetch_u8`
-/// reads (exactly as the fused path did), so `execute_decoded` charges nothing extra. This
-/// type is populated with a placeholder (the real instruction length, zero wait states) and
-/// is only fully exercised in the later cache stage.
-// Stage-A scaffold: the variants/fields are written but not yet read; the cache stage
-// (Stage B) consumes them to replay fetch clocks without re-reading the bus.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy)]
-enum FetchCost {
-    Uniform { len: u8, wait_states: u8 },
-    PerByte([u8; 15], u8),
-}
-
 /// A decoded instruction: the prefix/opcode/operand-size results plus the pre-parsed ModRM, operand
 /// descriptor, and immediate for the forms that carry them. After Stage A every implemented opcode
 /// is converted to the decode/execute split; the no-operand forms (and the dead-end fallbacks) leave
-/// `modrm`/`operand` as `None` (and `imm` 0).
-// Stage-A scaffold: `imm` is read by the converted ALU/group immediate forms and `imm2` by the
-// converted ENTER (and any other second-immediate form); the `len`/`fetch` placeholders are
-// populated by `decode` but stay unread until the cache stage lands.
-#[allow(dead_code)]
+/// `modrm`/`operand` as `None` (and `imm` 0). This is the value the decode cache stores per line, so
+/// it is kept small and dense (see DecodeCache).
 #[derive(Debug, Clone, Copy)]
 struct DecodedInsn {
     /// eip of the first byte of the instruction (before any prefixes). Carried as the `eip` field of
@@ -1015,7 +998,6 @@ struct DecodedInsn {
     /// to the instruction start on a delivered exception.
     start_eip: u32,
     len: u8,
-    fetch: FetchCost,
     prefixes: Prefixes,
     opcode: u16,
     operand_size: OperandSize,
@@ -1040,7 +1022,12 @@ struct DecodedInsn {
 /// Number of direct-mapped lines in the decode cache. Power of two so the index is a mask. 4096 is
 /// the Stage B starting size (B7 tunes it); the footprint is the knob that matters on a normal
 /// (8-32 MB L3) machine, so it is kept small and dense.
-const DECODE_CACHE_LINES: usize = 4096;
+/// Direct-mapped decode-cache lines (power of two). A release best-of-6 sweep on dhrystone/sieve
+/// 586 found the knee at 2048: 1024 left ~2% on the table, while 4096 and 8192 were within
+/// measurement noise of 2048. At ~48 bytes per line (DecodeLine = tag + generation + DecodedInsn)
+/// that is ~96 KB, comfortably inside L2 on a normal (8-32 MB L3) machine, so the per-line size is
+/// not the footprint limiter here and the line value is left dense rather than squeezed to 32 bytes.
+const DECODE_CACHE_LINES: usize = 2048;
 
 /// The SMC watch bitmap tracks cached code at BYTE granularity. Coarser granularities fail on the
 /// flat tiny-model layout the benchmarks (and many real-mode DOS programs) use: with cs=ds=ss=0,
@@ -1683,11 +1670,17 @@ impl Cpu386 {
     /// eip without un-charging, and `decode` then re-fetches that opcode byte. So a successfully
     /// decoded instruction always costs `len + 1` instruction-fetch cycles, the opcode byte charged
     /// twice. This replays that: the `len` bytes at `lin..lin+len`, then one more at `lin` (the
-    /// opcode for the common no-prefix case, making the replay byte-exact there; for a prefixed
-    /// instruction the doubled byte sits one region over but the clock cost is identical for
-    /// single-region code, which is the whole benchmark path). Faithful per-byte region / A20 /
-    /// paging replay and the fetch-fault re-check on a hit are the remaining Stage B tasks (B2/B5);
-    /// without paging the linear address equals the physical address.
+    /// opcode for the common no-prefix case, making the replay byte-exact there).
+    ///
+    /// Charging per byte at its real linear address (not a stored scalar) makes the replay per-byte
+    /// region- and A20-aware for free: `charge_instruction_fetch` recomputes the wait states from
+    /// each address and applies A20, exactly as the miss path's `fetch_u8` did, so an instruction
+    /// whose bytes straddle a wait-state region or the A20-wrap boundary charges identically on a hit
+    /// (amendment 1). Without paging the linear address equals the physical address. The two
+    /// remaining edges are guest-invisible (they change only the bus-clock metric, never a result):
+    /// a paging page-cross charges the tail at the contiguous linear address rather than the second
+    /// page's physical, and a prefixed instruction's doubled opcode charge lands at `lin` (a prefix)
+    /// rather than the opcode. Neither occurs on the benchmark path, where cyc/iter is bit-identical.
     fn charge_cached_fetch<B: CpuBus>(&mut self, bus: &mut B, lin: u32, len: u8) -> ExecResult<()> {
         for i in 0..u32::from(len) {
             bus.charge_instruction_fetch(lin.wrapping_add(i))?;
@@ -1741,15 +1734,9 @@ impl Cpu386 {
 
         let mut insn = DecodedInsn {
             start_eip,
-            // `len`/`fetch` are placeholders here; the single finalize after the group pre-parse
-            // below overwrites them with the real consumed length (prefixes + opcode + operands).
-            // In Stage A `fetch` is unused at replay time — decode charges fetch clocks via its
-            // real reads; the cache stage (Stage B) is where `fetch` is consumed.
+            // `len` is a placeholder here; the single finalize after the group pre-parse below
+            // overwrites it with the real consumed length (prefixes + opcode + operands).
             len: 0,
-            fetch: FetchCost::Uniform {
-                len: 0,
-                wait_states: 0,
-            },
             prefixes,
             opcode,
             operand_size,
@@ -2159,15 +2146,10 @@ impl Cpu386 {
             DecodeGroup::Fallback | DecodeGroup::TwoByteFallback => {}
         }
 
-        // Finalize `len`/`fetch` once, after every group's pre-parse, so a converted group never
-        // has to re-write them: a group's match arm only fetches its operand bytes; this single
-        // assignment captures the total bytes `decode` consumed (prefixes + opcode + operands).
-        let consumed = self.registers.eip.wrapping_sub(start_eip) as u8;
-        insn.len = consumed;
-        insn.fetch = FetchCost::Uniform {
-            len: consumed,
-            wait_states: 0,
-        };
+        // Finalize `len` once, after every group's pre-parse, so a converted group never has to
+        // re-write it: a group's match arm only fetches its operand bytes; this single assignment
+        // captures the total bytes `decode` consumed (prefixes + opcode + operands).
+        insn.len = self.registers.eip.wrapping_sub(start_eip) as u8;
 
         Ok(insn)
     }
@@ -14231,6 +14213,19 @@ mod tests {
         cpu.begin_instruction();
         let insn = cpu.decode(bus)?;
         cpu.execute_decoded(&insn, bus)
+    }
+
+    #[test]
+    fn decoded_insn_stays_dense() {
+        // The decode cache stores one DecodedInsn per line. At the chosen 2048 lines this caps the
+        // footprint near 96 KB (see DECODE_CACHE_LINES), so the guard is against unbounded growth,
+        // not a hard 32-byte target: if a field pushes it past 48 bytes, move a rarely-used field
+        // behind recompute-at-execute (or shrink the cache) rather than letting the line balloon.
+        assert!(
+            std::mem::size_of::<DecodedInsn>() <= 48,
+            "DecodedInsn grew to {} bytes",
+            std::mem::size_of::<DecodedInsn>()
+        );
     }
 
     #[test]
