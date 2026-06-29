@@ -1042,6 +1042,21 @@ struct DecodedInsn {
 /// (8-32 MB L3) machine, so it is kept small and dense.
 const DECODE_CACHE_LINES: usize = 4096;
 
+/// The SMC watch bitmap tracks cached code at BYTE granularity. Coarser granularities fail on the
+/// flat tiny-model layout the benchmarks (and many real-mode DOS programs) use: with cs=ds=ss=0,
+/// the stack sits just below the code and globals sit just above or among it, so a 4 KB-page OR even
+/// a 64-byte-block watch flushes the whole cache on data/stack writes that merely sit near code
+/// (measured: dhrystone +45%). A byte-granular mark only flags an address as code when an
+/// instruction was actually decoded there, so a write to an adjacent data byte never false-triggers.
+/// Coverage is the low 2 MiB of physical space, which holds all real-mode code (conventional + UMB +
+/// HMA); a write or fetch above 2 MiB is treated as NOT code (no flush). That means self-modifying
+/// code located above 2 MiB is not caught, an exotic case (real-mode SMC, the realistic domain,
+/// lives below 1 MiB) accepted to keep the bitmap small and the common path free of false flushes.
+/// 2 MiB / 8 bits = 2^15 `u64` = 256 KB, allocated once per cache; only the words for live code and
+/// written bytes are ever touched, so its working set is a handful of lines.
+const SMC_BYTE_COVERAGE: u32 = 2 << 20;
+const SMC_BITMAP_WORDS: usize = (SMC_BYTE_COVERAGE / 64) as usize;
+
 /// One direct-mapped decode-cache line. `insn` is `None` until first filled. A filled line is a hit
 /// only when its `tag` matches the lookup linear address AND its `gen` matches the live generation,
 /// so advancing the generation invalidates every line in O(1) without clearing the array.
@@ -1058,9 +1073,10 @@ struct DecodeLine {
 /// `invalidate_code_caches`) and an ISA-level change (via `set_level`). A bump makes every stamped
 /// line miss, so the next execution at each address re-decodes and re-stamps. It is NOT advanced on
 /// a near branch (`set_eip` only moves eip, which already changes the linear key) nor on a plain
-/// data write, which would flush the cache every loop iteration. Self-modifying-code invalidation
-/// (a write into a page that holds cached instructions) is a later Stage B task; the benchmark path
-/// has no SMC, and identical bench checksums verify nothing stale is served.
+/// data write to a non-code page, both of which would flush the cache every loop iteration.
+/// Self-modifying code IS handled: `code_blocks` marks every 64-byte physical block an instruction
+/// was cached from, and a write into a marked block advances the generation (cross-page SMC). The
+/// benchmark path has no SMC, and identical bench checksums verify nothing stale is served.
 ///
 /// Transparent accelerator, not architectural state: excluded from `Cpu386` equality (like
 /// `PrefetchWindow`) and reset rather than copied on clone.
@@ -1068,6 +1084,11 @@ struct DecodeCache {
     lines: Box<[DecodeLine]>,
     mask: u32,
     generation: u32,
+    /// Bitmap (1 bit per physical byte, low `SMC_BYTE_COVERAGE` bytes) of bytes an instruction has
+    /// been cached from. A write touching a marked byte advances the generation. Monotonic: marks
+    /// are never cleared, so there are no false negatives (every cached byte stays watched); a stale
+    /// mark only costs a harmless spurious generation bump if a former-code byte is later written.
+    code_bytes: Box<[u64]>,
 }
 
 impl DecodeCache {
@@ -1081,7 +1102,35 @@ impl DecodeCache {
             mask: (lines - 1) as u32,
             // Fresh lines default to generation 0; start live at 1 so they miss until first filled.
             generation: 1,
+            code_bytes: vec![0u64; SMC_BITMAP_WORDS].into_boxed_slice(),
         }
+    }
+
+    /// Mark the bytes `[physical, physical + len)` as holding cached code, so a later write touching
+    /// any of them invalidates the cache. An instruction is at most 15 bytes. Bytes above the
+    /// covered range are skipped (treated as non-code by `is_code_byte`).
+    #[inline]
+    fn mark_code_range(&mut self, physical: u32, len: u8) {
+        for i in 0..u32::from(len) {
+            let addr = physical.wrapping_add(i);
+            if addr < SMC_BYTE_COVERAGE {
+                self.code_bytes[(addr >> 6) as usize] |= 1u64 << (addr & 63);
+            }
+        }
+    }
+
+    /// Whether this physical byte was decoded as part of a cached instruction. Bytes above the
+    /// covered range answer `false`: SMC there is not tracked (an accepted, documented gap).
+    #[inline]
+    fn is_code_byte(&self, physical: u32) -> bool {
+        physical < SMC_BYTE_COVERAGE
+            && self.code_bytes[(physical >> 6) as usize] & (1u64 << (physical & 63)) != 0
+    }
+
+    /// Whether any byte in `[physical, physical + width)` is a cached code byte.
+    #[inline]
+    fn range_hits_code(&self, physical: u32, width: u32) -> bool {
+        (0..width).any(|i| self.is_code_byte(physical.wrapping_add(i)))
     }
 
     #[inline]
@@ -1207,6 +1256,18 @@ impl Cpu386 {
             *slot = Some(page);
         } else {
             self.written_pages_overflow = true;
+        }
+    }
+
+    /// A guest data write of `width` bytes to `physical`. If any written byte was decoded as part of
+    /// a cached instruction it is self-modifying code, so advance the decode-cache generation to
+    /// re-decode those lines. Byte-exact: a 16-bit stack push just below the code (the flat
+    /// tiny-model layout the benchmarks use) writes only its own two bytes, so it never disturbs the
+    /// adjacent code.
+    #[inline]
+    fn note_code_write(&mut self, physical: u32, width: u32) {
+        if self.decode_cache.range_hits_code(physical, width) {
+            self.decode_cache.invalidate();
         }
     }
 
@@ -1590,6 +1651,13 @@ impl Cpu386 {
             return Ok(insn);
         }
         let insn = self.decode(bus)?;
+        // Mark the physical block(s) this instruction occupies so a later write into them
+        // invalidates the cache (cross-page SMC). decode just warmed the code-page translation, so
+        // resolving the physical start is a cache hit (and the identity map without paging). A
+        // page-straddling instruction under paging marks the tail block from the contiguous physical
+        // of its first page, which is the one remaining exotic gap.
+        let physical = self.translate_code_linear(bus, lin)?;
+        self.decode_cache.mark_code_range(physical, insn.len);
         self.decode_cache.put(lin, insn);
         Ok(insn)
     }
@@ -4883,7 +4951,11 @@ impl Cpu386 {
             }
             descriptor.base.wrapping_add(offset)
         };
-        self.translate_linear(bus, linear, write)
+        let physical = self.translate_linear(bus, linear, write)?;
+        if write {
+            self.note_code_write(physical, width);
+        }
+        Ok(physical)
     }
 
     fn translate_linear<B: CpuBus>(
@@ -14209,6 +14281,85 @@ mod tests {
         assert!(
             cpu.decode_cache.get(lin).is_none(),
             "invalidate_code_caches clears the decode cache"
+        );
+    }
+
+    #[test]
+    fn cross_page_write_into_cached_code_invalidates_it() {
+        // INC AX (0x40) at page 1; a store program at page 2 overwrites that byte with 0x48 (DEC
+        // AX). Executing on a different page than the write is the cross-page SMC case begin_
+        // instruction's current-page check cannot catch. The store program sits at 0x2008 so none
+        // of its bytes collide with 0x1000's direct-mapped slot (slot 0); a collision would evict
+        // the line and mask whether SMC actually invalidated it.
+        let mut memory = vec![0u8; 0x3000];
+        memory[0x1000] = 0x40; // INC AX
+        memory[0x2008] = 0xb0; // MOV AL, imm8
+        memory[0x2009] = 0x48; //   = 0x48 (DEC AX opcode)
+        memory[0x200a] = 0xa2; // MOV moffs16, AL
+        memory[0x200b] = 0x00;
+        memory[0x200c] = 0x10; //   moffs = 0x1000
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        let mut bus = TestBus::with_memory(memory);
+
+        // 1. Run INC AX at 0x1000: caches it and marks physical page 1 as code.
+        cpu.registers.set_eax(0);
+        cpu.set_eip(0x1000);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.eax() & 0xffff, 1, "INC AX ran");
+        assert!(cpu.decode_cache.get(0x1000).is_some(), "0x1000 is cached");
+
+        // 2. From page 2, store 0x48 over the byte at 0x1000 (a write into the cached code page).
+        cpu.set_eip(0x2008);
+        cpu.cycle(&mut bus).unwrap(); // MOV AL, 0x48
+        cpu.cycle(&mut bus).unwrap(); // MOV [0x1000], AL -> record_write_page bumps the generation
+        assert!(
+            cpu.decode_cache.get(0x1000).is_none(),
+            "a write into the cached code page invalidated it"
+        );
+
+        // 3. Re-run at 0x1000: re-decodes the NEW opcode 0x48 (DEC AX), not the stale INC AX.
+        cpu.registers.set_eax(5);
+        cpu.set_eip(0x1000);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(
+            cpu.registers.eax() & 0xffff,
+            4,
+            "the freshly written DEC AX ran, not the stale cached INC AX"
+        );
+    }
+
+    #[test]
+    fn data_write_to_a_non_code_page_does_not_flush_the_cache() {
+        // The whole point of the code-page bitmap: a plain data write must NOT invalidate the cache,
+        // or a write-heavy loop (dhrystone) would re-decode every iteration. Cache code on page 1,
+        // run the store program on page 2 (at 0x2008 so it does not collide with 0x1000's slot),
+        // write to page 3 (never executed), assert the line lives.
+        let mut memory = vec![0u8; 0x4000];
+        memory[0x1000] = 0x40; // INC AX at page 1
+        memory[0x2008] = 0xb0; // MOV AL, imm8
+        memory[0x2009] = 0x99;
+        memory[0x200a] = 0xa2; // MOV moffs16, AL
+        memory[0x200b] = 0x50;
+        memory[0x200c] = 0x30; //   moffs = 0x3050 (page 3, holds no code)
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.set_eip(0x1000);
+        cpu.cycle(&mut bus).unwrap(); // cache INC AX, mark page 1
+        assert!(cpu.decode_cache.get(0x1000).is_some());
+
+        cpu.set_eip(0x2008);
+        cpu.cycle(&mut bus).unwrap(); // MOV AL, 0x99
+        cpu.cycle(&mut bus).unwrap(); // MOV [0x3050], AL -> page 3 is not a code page
+        assert!(
+            cpu.decode_cache.get(0x1000).is_some(),
+            "a data write to a non-code page must not flush the decode cache"
         );
     }
 
