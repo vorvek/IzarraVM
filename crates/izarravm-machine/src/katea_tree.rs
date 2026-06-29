@@ -3,21 +3,27 @@
 //! directory tree whose FAT and directory sectors are computed on demand, so
 //! RAM scales with the entry count rather than the disk or file sizes.
 
-// Limit: this is the first M1 task — the tree model + the metadata-only walk.
-// The cluster fields (`first_cluster`/`cluster_count`/`parent_first_cluster`)
-// and the types/`build_tree` are exercised only by the Task 3 unit test so far;
-// cluster allocation, computed FAT/dir sectors, and `KateaTreeVolume` (the
-// non-test consumers) land in the later M1 tasks. Removed as those tasks wire
-// these up.
+// The whole tree-volume stack is reachable only from this module's own tests
+// until the final M1 task wires `KateaTreeVolume` into the ATA `HostFolder`
+// backing (`ata.rs`) and `mount_hdd_folder` (`lib.rs`). Until that crate-level
+// consumer exists, every item here (`KateaTreeVolume` and everything it builds
+// on) is "unused" from the crate's view, so a module-level allow is the minimum:
+// per-item `#[allow(dead_code)]` would land on essentially every item. A couple
+// items stay test/M2-only even after the mount lands — `tree()`/`cluster_to_lba`
+// (test), the bidirectional name map and `parent_first_cluster` (M2 writes) —
+// so this allow only narrows, it does not vanish, when that task removes it.
 #![allow(dead_code)]
 
-use crate::fat32::{FAT32_EOC, fat32_dir_entry};
+use crate::fat32::{FAT32_EOC, fat32_dir_entry, fat32_fsinfo_sector};
 use crate::katea_names::NameTable;
 use crate::katea_volume::{
-    ATTR_ARCHIVE, FAT0_MEDIA, FileSource, NUM_FATS, PART_START, RESERVED_SECTORS, ROOT_CLUSTER,
-    SECTOR, fat_size_sectors, sectors_per_cluster,
+    ATTR_ARCHIVE, BACKUP_BOOT_SECTOR, BACKUP_FSINFO_SECTOR, FAT0_MEDIA, FSINFO_SECTOR, FileSource,
+    NUM_FATS, PART_START, PART_TYPE_FAT32_LBA, RESERVED_SECTORS, ROOT_CLUSTER, SECTOR,
+    fat_size_sectors, lba_to_chs, sectors_per_cluster, stamp_fat32_bpb,
 };
 use std::collections::HashSet;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 /// Cap recursion so a pathological tree (or an undetected loop) can't run away;
@@ -405,6 +411,303 @@ pub(crate) fn dir_sector(dir: &TreeDir, is_root: bool, sector: u32) -> [u8; SECT
     out
 }
 
+/// A flattened directory: its precomputed 32-byte entries plus the cluster run
+/// it occupies. The entries are small (32 bytes each), so holding them costs RAM
+/// proportional to the entry count, not the disk size.
+struct FlatDir {
+    entries: Vec<[u8; 32]>,
+    first_cluster: u32,
+    cluster_count: u32,
+}
+
+/// A flattened file: its (cloned) source, byte size, and cluster run. The source
+/// is `FileSource::HostFile { path, len }` for host files (lazy, no slurp) or
+/// `InMemory` for the overlaid system files.
+struct FlatFile {
+    source: FileSource,
+    size: u32,
+    first_cluster: u32,
+    cluster_count: u32,
+}
+
+/// What a cluster run holds, indexing into `dirs`/`files` (no pointers).
+enum Role {
+    Dir(usize),
+    File(usize),
+}
+
+/// A lazy, read-only, whole-disk FAT32 volume over a recursive host-folder tree.
+/// The sibling of M0's flat `KateaVolume`, generalized to a full directory tree:
+/// FAT and directory sectors are computed on demand and file data is read lazily,
+/// so RAM scales with the entry count rather than the disk or file sizes.
+///
+/// The struct is **pointer-free**: it owns only `Vec`s (the flattened dirs/files
+/// and the sorted cluster-run table), the two stamped boot sectors, the geometry,
+/// and the cluster index. `tree` is kept whole for the test and M2 (writes); it is
+/// not consulted by `read_sector` — that path resolves a cluster through `runs`.
+pub(crate) struct KateaTreeVolume {
+    /// The owned tree; kept for tests / M2, not used by `read_sector`.
+    tree: HostTree,
+    geo: Geometry,
+    /// LBA 0: the MBR with the partition entry + 0x55AA stamped in.
+    mbr: [u8; SECTOR],
+    /// The FAT32 VBR (at PART_START) with the BPB stamped over the boot code.
+    vbr: [u8; SECTOR],
+    /// FSInfo free-cluster count, served at both FSInfo sectors.
+    free_count: u32,
+    /// FSInfo next-free hint (= `ClusterIndex::next_free`).
+    next_free: u32,
+    /// The computed FAT (run-end set + next_free); generates any FAT sector.
+    fat: ClusterIndex,
+    /// Flattened directories, indexed by `Role::Dir`.
+    dirs: Vec<FlatDir>,
+    /// Flattened files, indexed by `Role::File`.
+    files: Vec<FlatFile>,
+    /// `(first_cluster, last_cluster, role)` runs, sorted by `first_cluster`.
+    runs: Vec<(u32, u32, Role)>,
+}
+
+impl KateaTreeVolume {
+    /// Build the whole-disk view from the boot sectors, a host folder, and the
+    /// in-memory system files overlaid at the root. Construction walks metadata
+    /// only — it never reads host file *contents* (those are read lazily, one
+    /// 512-byte span at a time, in `read_sector`).
+    pub(crate) fn new(
+        mbr: &[u8; SECTOR],
+        vbr: &[u8; SECTOR],
+        host_root: &Path,
+        system_files: &[(String, Vec<u8>)],
+    ) -> Self {
+        let mut tree = build_tree(host_root, system_files);
+        let geo = allocate(&mut tree);
+        let fat = ClusterIndex::build(&tree, &geo);
+        let next_free = fat.next_free();
+        // Used data clusters are 2..next_free; the rest of the addressable range
+        // is free. `saturating_sub` guards the (impossible) empty-disk underflow.
+        let free_count = geo
+            .count_of_clusters
+            .saturating_sub(next_free - ROOT_CLUSTER);
+
+        // --- MBR: stamp the single partition entry + signature, with the dynamic
+        // partition size (mirrors KateaVolume::new but `geo`-driven). ----------
+        let mut mbr_out = *mbr;
+        let pe = 0x1BE; // first partition entry
+        mbr_out[pe] = 0x80; // active / bootable
+        mbr_out[pe + 1..pe + 4].copy_from_slice(&lba_to_chs(geo.part_start));
+        mbr_out[pe + 4] = PART_TYPE_FAT32_LBA;
+        mbr_out[pe + 5..pe + 8].copy_from_slice(&lba_to_chs(geo.part_start + geo.part_sectors - 1));
+        mbr_out[pe + 8..pe + 12].copy_from_slice(&geo.part_start.to_le_bytes()); // RelSect
+        mbr_out[pe + 12..pe + 16].copy_from_slice(&geo.part_sectors.to_le_bytes()); // NumSect
+        mbr_out[0x1FE] = 0x55;
+        mbr_out[0x1FF] = 0xAA;
+
+        // --- VBR: stamp the FAT32 BPB over the boot code, keeping the boot code.
+        let mut vbr_out = *vbr;
+        stamp_fat32_bpb(
+            &mut vbr_out,
+            geo.spc,
+            geo.fatsz,
+            geo.part_start,
+            geo.part_sectors,
+        );
+
+        // --- flatten the tree into dirs/files + the sorted run table -----------
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+        let mut runs = Vec::new();
+        flatten(&tree.root, true, &mut dirs, &mut files, &mut runs);
+        runs.sort_by_key(|r| r.0);
+
+        Self {
+            tree,
+            geo,
+            mbr: mbr_out,
+            vbr: vbr_out,
+            free_count,
+            next_free,
+            fat,
+            dirs,
+            files,
+            runs,
+        }
+    }
+
+    /// The whole-disk sector count, so the ATA layer can derive its geometry.
+    pub(crate) fn total_sectors(&self) -> u32 {
+        self.geo.total_sectors
+    }
+
+    /// The owned tree (for tests / M2 writes; `read_sector` does not use it).
+    pub(crate) fn tree(&self) -> &HostTree {
+        &self.tree
+    }
+
+    /// Absolute LBA of a data cluster's first sector.
+    pub(crate) fn cluster_to_lba(&self, cluster: u32) -> u32 {
+        self.geo.part_start
+            + self.geo.first_data_sector
+            + (cluster - ROOT_CLUSTER) * u32::from(self.geo.spc)
+    }
+
+    /// Read one whole-disk sector by absolute LBA. Resolves entirely from
+    /// in-memory metadata except for `HostFile` data, read on demand. Out-of-range
+    /// or unmapped sectors read back as zeros.
+    pub(crate) fn read_sector(&self, lba: u32) -> [u8; SECTOR] {
+        if lba == 0 {
+            return self.mbr;
+        }
+        if lba < self.geo.part_start {
+            return [0u8; SECTOR];
+        }
+        let rel = lba - self.geo.part_start; // partition-relative sector
+
+        // Reserved area: VBR (0), FSInfo (1), backup boot (6), backup FSInfo (7).
+        if rel == 0 || rel == u32::from(BACKUP_BOOT_SECTOR) {
+            return self.vbr;
+        }
+        if rel == u32::from(FSINFO_SECTOR) || rel == u32::from(BACKUP_FSINFO_SECTOR) {
+            return fat32_fsinfo_sector(self.free_count, self.next_free);
+        }
+
+        // FAT region: NUM_FATS identical copies, each `fatsz` long.
+        let reserved = u32::from(RESERVED_SECTORS);
+        let fat_end = reserved + u32::from(NUM_FATS) * self.geo.fatsz;
+        if (reserved..fat_end).contains(&rel) {
+            let within = (rel - reserved) % self.geo.fatsz;
+            return self.fat.fat_sector(within, &self.geo);
+        }
+
+        // Data region: cluster 2 begins at `first_data_sector`.
+        if rel >= self.geo.first_data_sector {
+            let data_lba = rel - self.geo.first_data_sector;
+            let spc = u32::from(self.geo.spc);
+            let cluster = ROOT_CLUSTER + data_lba / spc;
+            let sector_in_cluster = data_lba % spc;
+            return self.data_sector(cluster, sector_in_cluster);
+        }
+
+        [0u8; SECTOR]
+    }
+
+    /// Resolve one data-region sector by finding the run owning `cluster`, then
+    /// serving directory entries or lazy file bytes. A cluster in no run is free
+    /// space (zeros).
+    fn data_sector(&self, cluster: u32, sector_in_cluster: u32) -> [u8; SECTOR] {
+        let Some(run) = self
+            .runs
+            .iter()
+            .find(|(first, last, _)| cluster >= *first && cluster <= *last)
+        else {
+            return [0u8; SECTOR]; // free space
+        };
+        let cluster_off = cluster - run.0; // cluster index within the run
+        let spc = u32::from(self.geo.spc);
+        match &run.2 {
+            Role::Dir(id) => {
+                let d = &self.dirs[*id];
+                let sector_in_dir = cluster_off * spc + sector_in_cluster;
+                let mut out = [0u8; SECTOR];
+                let start = (sector_in_dir as usize) * 16;
+                for i in 0..16usize {
+                    if let Some(e) = d.entries.get(start + i) {
+                        out[i * 32..i * 32 + 32].copy_from_slice(e);
+                    }
+                }
+                out
+            }
+            Role::File(id) => {
+                let f = &self.files[*id];
+                let byte_off = u64::from(cluster_off) * u64::from(spc) * SECTOR as u64
+                    + u64::from(sector_in_cluster) * SECTOR as u64;
+                read_source_span(&f.source, byte_off, f.size)
+            }
+        }
+    }
+}
+
+/// Flatten the tree depth-first into `dirs`/`files` + the cluster-run table. The
+/// recursion order matches `assign_dir` (dir chain, then its files, then its
+/// subdirs), but `read_sector` searches `runs` by cluster, so the order is not
+/// load-bearing for reads — only for keeping each entity's run contiguous.
+fn flatten(
+    dir: &TreeDir,
+    is_root: bool,
+    dirs: &mut Vec<FlatDir>,
+    files: &mut Vec<FlatFile>,
+    runs: &mut Vec<(u32, u32, Role)>,
+) {
+    let id = dirs.len();
+    dirs.push(FlatDir {
+        entries: dir_entries(dir, is_root),
+        first_cluster: dir.first_cluster,
+        cluster_count: dir.cluster_count,
+    });
+    runs.push((
+        dir.first_cluster,
+        dir.first_cluster + dir.cluster_count - 1,
+        Role::Dir(id),
+    ));
+    for f in &dir.files {
+        let fid = files.len();
+        files.push(FlatFile {
+            source: clone_source(&f.source),
+            size: u32::try_from(f.source.len()).unwrap_or(u32::MAX),
+            first_cluster: f.first_cluster,
+            cluster_count: f.cluster_count,
+        });
+        runs.push((
+            f.first_cluster,
+            f.first_cluster + f.cluster_count - 1,
+            Role::File(fid),
+        ));
+    }
+    for s in &dir.subdirs {
+        flatten(&s.dir, false, dirs, files, runs);
+    }
+}
+
+/// `FileSource` is not `Clone` (it holds a `Vec`); clone it explicitly.
+fn clone_source(s: &FileSource) -> FileSource {
+    match s {
+        FileSource::InMemory(v) => FileSource::InMemory(v.clone()),
+        FileSource::HostFile { path, len } => FileSource::HostFile {
+            path: path.clone(),
+            len: *len,
+        },
+    }
+}
+
+/// Read one 512-byte span at `byte_off` from a source, zero-padding past `size`.
+/// Same contract as M0's `katea_volume::read_source_span`: a `HostFile` opens,
+/// seeks, and reads exactly the in-file portion on demand; an I/O error logs and
+/// reads back as zeros so a vanished/shrunk host file can't panic the guest.
+fn read_source_span(source: &FileSource, byte_off: u64, size: u32) -> [u8; SECTOR] {
+    let mut out = [0u8; SECTOR];
+    let valid = u64::from(size).saturating_sub(byte_off).min(SECTOR as u64) as usize;
+    if valid == 0 {
+        return out;
+    }
+    match source {
+        FileSource::InMemory(v) => {
+            let start = byte_off as usize;
+            out[..valid].copy_from_slice(&v[start..start + valid]);
+        }
+        FileSource::HostFile { path, .. } => {
+            match File::open(path).and_then(|mut f| {
+                f.seek(SeekFrom::Start(byte_off))?;
+                f.read_exact(&mut out[..valid])
+            }) {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("katea: read {} @ {byte_off}: {e}", path.display());
+                    out = [0u8; SECTOR];
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,6 +882,49 @@ mod tests {
         );
         // Entries past the 20th are zero-padded.
         assert_eq!(s1[4 * 32], 0x00, "no entry past the last file");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn read_sector_serves_mbr_vbr_dirs_and_lazy_file_data_at_depth() {
+        let root = scratch("vol");
+        std::fs::create_dir_all(root.join("GAMES/HELLO")).unwrap();
+        std::fs::write(
+            root.join("GAMES/HELLO/HELLO.COM"),
+            (0..600u32).map(|i| (i % 251) as u8).collect::<Vec<u8>>(),
+        )
+        .unwrap();
+        let sys = vec![("KERNEL.SYS".to_string(), vec![0xEBu8; 100])];
+
+        // Borrow the real boot sectors from the committed image (any 512-byte
+        // MBR/VBR with a 55AA signature works for the unit test).
+        let img = izarravm_firmware::tokados_hdd_img();
+        let mut mbr = [0u8; 512];
+        mbr.copy_from_slice(&img[0..512]);
+        let mut vbr = [0u8; 512];
+        vbr.copy_from_slice(&img[2048 * 512..2048 * 512 + 512]);
+
+        let vol = KateaTreeVolume::new(&mbr, &vbr, &root, &sys);
+
+        // LBA 0 = MBR with the partition entry + 55AA.
+        let s0 = vol.read_sector(0);
+        assert_eq!(s0[0x1FE], 0x55);
+        assert_eq!(s0[0x1FF], 0xAA);
+        // VBR at PART_START has the FAT32 BPB signature.
+        let vbr_lba = 2048;
+        let sv = vol.read_sector(vbr_lba);
+        assert_eq!(sv[0x1FE], 0x55);
+        assert_eq!(sv[0x1FF], 0xAA);
+
+        // Walk to HELLO.COM's first data sector and verify lazy bytes match host.
+        let games = &vol.tree().root.subdirs[0].dir;
+        let hello = &games.subdirs[0].dir;
+        let f = &hello.files[0];
+        let lba = vol.cluster_to_lba(f.first_cluster);
+        let data = vol.read_sector(lba);
+        let expect: Vec<u8> = (0..512u32).map(|i| (i % 251) as u8).collect();
+        assert_eq!(&data[..], &expect[..]);
+
         std::fs::remove_dir_all(&root).ok();
     }
 }
