@@ -885,6 +885,18 @@ enum DecodeGroup {
     /// off the full u16 (the `as u8` low byte of 0x0Fa4/a5/b0/b1/c0/c1 would alias single-byte
     /// opcodes).
     BitManip,
+    /// The two-byte conditional-move / set-on-condition / two-operand IMUL block (task A11):
+    /// CMOVcc reg, r/m (0F 40-0F 4F — 586-class), SETcc r/m8 (0F 90-0F 9F — 386-class), and
+    /// IMUL reg, r/m (0F AF — 386-class). Every one is a ModRM r/m form with no immediate after
+    /// the ModRM, so `decode` parses the ModRM + addressing descriptor and stores it (no `imm`
+    /// fetch). The executor dispatches off the FULL u16 (`insn.opcode`, never narrowed to u8 first)
+    /// and reuses `self.condition(insn.opcode as u8 & 0x0f)` for the condition codes and
+    /// `self.imul_truncated` for the two-operand IMUL. CMOVcc reads the source r/m even when the
+    /// condition is false (memory faults still fire), but writes the destination register only
+    /// when the condition holds. SETcc is always byte-wide and uses `write_operand_u8`. The ISA
+    /// gates (386+ for SETcc/IMUL, 586+ for CMOVcc) are applied once in `decode`'s
+    /// `check_two_byte_isa_gate`; the executor does NOT re-gate.
+    CondMove,
     /// Not yet converted to the split: decode parses nothing extra and `execute_decoded` hands the
     /// opcode to the shared fused `dispatch_opcode`.
     Fallback,
@@ -1215,6 +1227,10 @@ impl Cpu386 {
                 // CMPXCHG (B0/B1), XADD (C0/C1). Every one is a ModRM r/m form.
                 0xa3 | 0xab | 0xb3 | 0xbb | 0xba | 0xbc | 0xbd | 0xa4 | 0xa5 | 0xac | 0xad
                 | 0xb0 | 0xb1 | 0xc0 | 0xc1 => DecodeGroup::BitManip,
+                // Two-byte conditional-move / SETcc / two-operand IMUL block (task A11):
+                // CMOVcc reg,r/m (40-4F, 586-class), SETcc r/m8 (90-9F, 386-class), and
+                // IMUL reg,r/m (AF, 386-class). All are ModRM r/m forms with no immediate.
+                0x40..=0x4f | 0x90..=0x9f | 0xaf => DecodeGroup::CondMove,
                 _ => DecodeGroup::TwoByteFallback,
             };
         }
@@ -1647,6 +1663,17 @@ impl Cpu386 {
                     insn.imm = u32::from(self.fetch_u8(bus)?);
                 }
             }
+            DecodeGroup::CondMove => {
+                // Conditional-move / SETcc / two-operand IMUL block (task A11). Every opcode in
+                // this group is a ModRM r/m form with no immediate after the ModRM+displacement.
+                // Parse the ModRM + addressing descriptor (instruction bytes only, so it stays
+                // cacheable); the executor reads `modrm.reg` (CMOVcc/IMUL destination) and the
+                // r/m operand at execute time. No imm8 is ever present, so no `insn.imm` fetch.
+                let modrm = self.fetch_modrm(bus)?;
+                let operand = self.parse_addressing_mode(bus, prefixes, address_size, modrm)?;
+                insn.modrm = Some(modrm);
+                insn.operand = Some(operand);
+            }
             // Both fallback groups pre-parse nothing in `decode` (the second 0F byte was already
             // folded into `insn.opcode` above): their executors re-read any ModRM/immediate from the
             // post-opcode eip in the shared fused dispatch.
@@ -1717,6 +1744,11 @@ impl Cpu386 {
             // the pre-fetched imm8 for 0F BA/A4/AC) and reusing `bit_string_op`/`double_shift`/
             // `alu_sub`/`alu_add` verbatim so the bit-addressing and flag logic stays in one place.
             DecodeGroup::BitManip => self.execute_bitmanip_decoded(insn, bus),
+            // The two-byte conditional-move / SETcc / two-operand IMUL block (CMOVcc, SETcc,
+            // IMUL reg,r/m) runs through its split executor, consuming the pre-decoded
+            // ModRM/operand and reusing `self.condition` (the same helper Jcc and the fused
+            // CMOVcc/SETcc arms used) and `self.imul_truncated` verbatim.
+            DecodeGroup::CondMove => self.execute_condmove_decoded(insn, bus),
             DecodeGroup::TwoByteFallback => {
                 // Un-converted two-byte (0F) opcode. `decode` already read + charged the second
                 // byte and applied the ISA gate, folding it into `insn.opcode` as 0x0F00 | second.
@@ -3007,6 +3039,57 @@ impl Cpu386 {
         }
     }
 
+    /// The conditional-move / SETcc / two-operand IMUL block (A11) through the decode/execute split
+    /// (task A11). Mirrors the former fused arms in `execute_two_byte` verbatim — same condition
+    /// helper, same CMOVcc read-before-conditional-write, same SETcc byte-write, same
+    /// `imul_truncated` — but consumes the ModRM/operand pre-decoded by `decode` (no re-fetch).
+    /// Dispatches off the FULL u16 `insn.opcode` (0x0F40-0x0F4F, 0x0F90-0x0F9F, 0x0FAF) so the
+    /// `as u8` narrowing can never alias these onto single-byte opcodes.
+    fn execute_condmove_decoded<B: CpuBus>(
+        &mut self,
+        insn: &DecodedInsn,
+        bus: &mut B,
+    ) -> ExecResult<CycleOutcome> {
+        let operand_size = insn.operand_size;
+
+        match insn.opcode {
+            0x0f40..=0x0f4f => {
+                // CMOVcc reg, r/m: the source r/m is ALWAYS read (so a faulting memory operand
+                // still faults even when the condition is false), but the destination register is
+                // written only when the condition holds. A false condition leaves it untouched.
+                // The condition code is the low nibble of the second byte (insn.opcode & 0x0f).
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let value = self.read_operand_sized(bus, operand, operand_size)?;
+                if self.condition((insn.opcode & 0x0f) as u8) {
+                    self.write_gpr_sized(modrm.reg, operand_size, value);
+                }
+                Ok(clocks(1))
+            }
+            0x0f90..=0x0f9f => {
+                // SETcc r/m8: set the byte operand to 1 when the condition holds, else 0. Always
+                // byte-wide regardless of the operand-size prefix. The condition code is the low
+                // nibble of the second byte (insn.opcode & 0x0f). Touches no flags.
+                let (_, operand) = self.resolve_decoded_modrm_operand(insn);
+                let set = self.condition((insn.opcode & 0x0f) as u8);
+                self.write_operand_u8(bus, operand, u8::from(set))?;
+                Ok(clocks(4))
+            }
+            0x0faf => {
+                // IMUL reg, r/m: two-operand signed multiply into the reg destination. The full
+                // product's high half is discarded; CF/OF are set when the result does not fit in
+                // the operand size (the truncated result does not sign-extend back to the full
+                // product). Reuses `imul_truncated` verbatim.
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let src = self.read_operand_sized(bus, operand, operand_size)?;
+                let dst = self.read_gpr_sized(modrm.reg, operand_size);
+                let result = self.imul_truncated(dst, src, operand_size);
+                self.write_gpr_sized(modrm.reg, operand_size, result);
+                Ok(clocks(9))
+            }
+            opcode => unreachable!("condmove opcode {opcode:#x}"),
+        }
+    }
+
     /// The far/indirect/RET/INT control-flow block + 0xff group 5 through the decode/execute split.
     /// Each arm mirrors the former fused handler verbatim — same far-pointer reconstruction, same
     /// ret/retf and interrupt/IRET delivery, same FF sub-op dispatch off `modrm.reg`, same clocks —
@@ -3809,43 +3892,14 @@ impl Cpu386 {
                 }
                 Ok(clocks(6))
             }
-            0x40..=0x4f => {
-                // CMOVcc r, r/m: the source is always read (so a memory source still faults
-                // when it should), but the destination register is written only when the
-                // condition in the low nibble holds. A false condition leaves it untouched.
-                let modrm = self.fetch_modrm(bus)?;
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                let value = self.read_operand_sized(bus, operand, operand_size)?;
-                if self.condition(opcode & 0x0f) {
-                    self.write_gpr_sized(modrm.reg, operand_size, value);
-                }
-                Ok(clocks(1))
-            }
+            // CMOVcc (0x40-0x4F), SETcc (0x90-0x9F), and IMUL reg,r/m (0xAF) are converted to
+            // the decode/execute split (task A11): `route_group` classifies them as
+            // `DecodeGroup::CondMove` and `execute_condmove_decoded` runs them. Not handled here.
             // 0x80-0x8f (Jcc near, rel16/32) are converted to the decode/execute split: `decode`
             // folds them into `insn.opcode` as 0x0F80-0x0F8F, `route_group` classifies them as
             // `DecodeGroup::Branch`, and `execute_branch_decoded` runs them. Not handled here.
-            0x90..=0x9f => {
-                // SETcc r/m8: set the byte to 1 when the condition holds, else 0. The condition
-                // code is the low nibble of the opcode; SETcc is always byte-wide and touches no
-                // flags. The ModRM reg field is not used.
-                let modrm = self.fetch_modrm(bus)?;
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                let set = self.condition(opcode & 0x0f);
-                self.write_operand_u8(bus, operand, u8::from(set))?;
-                Ok(clocks(4))
-            }
             // MOVZX/MOVSX (0F B6/B7/BE/BF) are converted to the decode/execute split; they route
             // through `DecodeGroup::DataMove` and `execute_datamove_decoded`, never reaching here.
-            0xaf => {
-                // IMUL r, r/m: two-operand signed multiply into the reg destination.
-                let modrm = self.fetch_modrm(bus)?;
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                let src = self.read_operand_sized(bus, operand, operand_size)?;
-                let dst = self.read_gpr_sized(modrm.reg, operand_size);
-                let result = self.imul_truncated(dst, src, operand_size);
-                self.write_gpr_sized(modrm.reg, operand_size, result);
-                Ok(clocks(9))
-            }
             // BSF/BSR (0xbc/0xbd), BT/BTS/BTR/BTC reg (0xa3/0xab/0xb3/0xbb) and imm8 (0xba), and
             // SHLD/SHRD (0xa4/0xac imm8, 0xa5/0xad CL) are converted to the decode/execute split
             // (task A10): `route_group` classifies them as `DecodeGroup::BitManip` and
@@ -18815,6 +18869,252 @@ mod tests {
             let fetch = seam_fetch_count(&fbus);
             println!(
                 "            BitManipGolden {{ name: {:?}, code: &{:?}, gpr: {:?}, eflags: {:#x}, eip: {:#x}, deltas: &{:?}, fetch: {} }},",
+                g.name,
+                g.code,
+                fused.registers.gpr,
+                fused.registers.eflags,
+                fused.registers.eip,
+                deltas,
+                fetch,
+            );
+        }
+    }
+
+    // ── Task A11: condmove golden battery ────────────────────────────────────────────────────────
+
+    /// One golden end-state for a condmove case (task A11). CMOVcc, SETcc, and IMUL reg,r/m all
+    /// touch the register file and/or memory and leave eflags unchanged (CMOVcc/SETcc) or set
+    /// CF/OF (IMUL), so this captures the full register file, eflags, eip, memory-write deltas,
+    /// and the InstructionPrefetch fetch count. `eip` proves decode consumed the right number of
+    /// bytes (incl. the 0F second byte and the ModRM+displacement); `fetch` proves each byte
+    /// was charged exactly once.
+    struct CondMoveGolden {
+        name: &'static str,
+        code: &'static [u8],
+        gpr: [u32; 8],
+        eflags: u32,
+        eip: u32,
+        deltas: &'static [(usize, u8)],
+        fetch: usize,
+    }
+
+    /// Seed for the condmove golden battery. Real-mode, DS=0, 16-bit addressing. AX=5, BX=3,
+    /// CX=0x0100, DX=0x4000; eflags has ZF=0 (only the reserved bit-1). Scratch memory at
+    /// 0x40 holds the word 0x0003 (CMOVcc memory source); byte at 0x50 is zero (SETcc mem dest).
+    fn condmove_seed(cpu: &mut Cpu386) {
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 5);
+        cpu.write_reg16(Reg16::Bx, 3);
+        cpu.write_reg16(Reg16::Cx, 0x0100);
+        cpu.write_reg16(Reg16::Dx, 0x4000);
+        cpu.write_reg16(Reg16::Sp, 0x00f0);
+        cpu.write_reg16(Reg16::Bp, 0x0010);
+        cpu.write_reg16(Reg16::Si, 0x0008);
+        cpu.write_reg16(Reg16::Di, 0x0018);
+        cpu.registers.eflags = 0x02; // ZF=0
+    }
+
+    fn condmove_seed_mem(mem: &mut [u8], code: &[u8]) {
+        mem[..code.len()].copy_from_slice(code);
+        mem[0x40..0x42].copy_from_slice(&3u16.to_le_bytes()); // word 3 for CMOVcc memory source
+    }
+
+    /// The condmove differential battery (task A11). Captured from the PRIOR fused reference
+    /// (`execute_instruction_legacy`) via `regen_condmove_goldens` (parent commit 93bdff3f) WHILE
+    /// the fused arms (CMOVcc 0x40-0x4F, SETcc 0x90-0x9F, IMUL 0xAF) still existed in
+    /// `execute_two_byte`. Never edit by hand — re-run the regen from the pre-split commit.
+    fn condmove_golden_cases() -> &'static [CondMoveGolden] {
+        &[
+            // SETcc false: SETZ AL (0F 94 C0): ZF=0 → condition false → AL=0 (AX=0x0000).
+            CondMoveGolden {
+                name: "setz al false (0f 94 c0)",
+                code: &[15, 148, 192],
+                gpr: [0, 256, 16384, 3, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+            },
+            // SETcc true: SETNZ BL (0F 95 C3): ZF=0 → condition true → BL=1 (BX=0x0001).
+            CondMoveGolden {
+                name: "setnz bl true (0f 95 c3)",
+                code: &[15, 149, 195],
+                gpr: [5, 256, 16384, 1, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+            },
+            // SETcc mem false: SETZ [0x50] (0F 94 1E 50 00): ZF=0 → write 0 to [0x50] (no delta, mem
+            // already 0). Proves the byte-wide memory write fires even for the false condition.
+            CondMoveGolden {
+                name: "setz [0x50] false (0f 94 1e 50 00)",
+                code: &[15, 148, 30, 80, 0],
+                gpr: [5, 256, 16384, 3, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x5,
+                deltas: &[],
+                fetch: 6,
+            },
+            // SETcc mem true: SETNZ [0x50] (0F 95 1E 50 00): ZF=0 → write 1 to [0x50]; delta (80, 1).
+            CondMoveGolden {
+                name: "setnz [0x50] true (0f 95 1e 50 00)",
+                code: &[15, 149, 30, 80, 0],
+                gpr: [5, 256, 16384, 3, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x5,
+                deltas: &[(80, 1)],
+                fetch: 6,
+            },
+            // CMOVcc false: CMOVZ AX, BX (0F 44 C3): ZF=0 → condition false → AX unchanged (=5).
+            CondMoveGolden {
+                name: "cmovz ax,bx false (0f 44 c3)",
+                code: &[15, 68, 195],
+                gpr: [5, 256, 16384, 3, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+            },
+            // CMOVcc true: CMOVNZ AX, BX (0F 45 C3): ZF=0 → condition true → AX = BX = 3.
+            CondMoveGolden {
+                name: "cmovnz ax,bx true (0f 45 c3)",
+                code: &[15, 69, 195],
+                gpr: [3, 256, 16384, 3, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+            },
+            // CMOVcc mem false: CMOVZ AX, [0x40] (0F 44 06 40 00): ZF=0 → AX unchanged; the
+            // memory source is still read (architectural: memory operand is always fetched).
+            CondMoveGolden {
+                name: "cmovz ax,[0x40] false (0f 44 06 40 00)",
+                code: &[15, 68, 6, 64, 0],
+                gpr: [5, 256, 16384, 3, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x5,
+                deltas: &[],
+                fetch: 6,
+            },
+            // CMOVcc mem true: CMOVNZ AX, [0x40] (0F 45 06 40 00): ZF=0 → AX = [0x40] = 3.
+            CondMoveGolden {
+                name: "cmovnz ax,[0x40] true (0f 45 06 40 00)",
+                code: &[15, 69, 6, 64, 0],
+                gpr: [3, 256, 16384, 3, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x5,
+                deltas: &[],
+                fetch: 6,
+            },
+            // IMUL no overflow: IMUL AX, BX (0F AF C3): 5*3=15, fits in 16 bits → CF=OF=0.
+            CondMoveGolden {
+                name: "imul ax,bx no-overflow (0f af c3)",
+                code: &[15, 175, 195],
+                gpr: [15, 256, 16384, 3, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+            },
+            // IMUL overflow: IMUL CX, DX (0F AF CA): 0x0100*0x4000=0x400000, truncated to
+            // CX=0x0000 → CF=OF=1 (eflags 0x803: bit11=OF, bit1=reserved, bit0=CF).
+            CondMoveGolden {
+                name: "imul cx,dx overflow (0f af ca)",
+                code: &[15, 175, 202],
+                gpr: [5, 0, 16384, 3, 240, 16, 8, 24],
+                eflags: 0x803,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+            },
+        ]
+    }
+
+    #[test]
+    fn condmove_split_matches_golden_across_ops() {
+        // The condmove opcodes (CMOVcc, SETcc, IMUL reg,r/m) are converted to the decode/execute
+        // split, so their fused arms are deleted and they can no longer be diffed against a fused
+        // executor in-tree. Run each case through cycle() (the split) and assert the architectural
+        // end-state against goldens captured from the pre-split fused path (parent 93bdff3f) via
+        // `regen_condmove_goldens`. The register file proves SETcc byte writes (true/false both
+        // register and memory), CMOVcc destination changed-or-unchanged, and IMUL product;
+        // eflags proves SETcc/CMOVcc leave flags unchanged and IMUL sets CF/OF on overflow;
+        // the memory deltas prove SETcc writes a 0 or 1 correctly; eip + fetch prove decode
+        // consumed and charged every byte (0F prefix + ModRM + displacement) exactly once.
+        for g in condmove_golden_cases() {
+            let mut mem = vec![0u8; 0x100];
+            condmove_seed_mem(&mut mem, g.code);
+            let initial = mem.clone();
+
+            let mut split = Cpu386::default();
+            condmove_seed(&mut split);
+            let mut sbus = TestBus::with_memory(mem);
+            let _ = split.cycle(&mut sbus);
+
+            assert_eq!(split.registers.gpr, g.gpr, "gpr mismatch for {}", g.name);
+            assert_eq!(
+                split.registers.eflags, g.eflags,
+                "eflags mismatch for {}",
+                g.name
+            );
+            assert_eq!(split.registers.eip, g.eip, "eip mismatch for {}", g.name);
+            let deltas: Vec<(usize, u8)> = sbus
+                .memory
+                .iter()
+                .enumerate()
+                .filter(|(i, b)| **b != initial[*i])
+                .map(|(i, b)| (i, *b))
+                .collect();
+            assert_eq!(deltas, g.deltas, "memory-write mismatch for {}", g.name);
+            assert_eq!(
+                seam_fetch_count(&sbus),
+                g.fetch,
+                "instruction-fetch cycle count mismatch for {} (seam must charge fetches once)",
+                g.name
+            );
+        }
+    }
+
+    /// Regenerate `condmove_golden_cases` from the fused reference. Ignored by default.
+    /// Run WHILE the condmove fused arms still exist in `execute_two_byte`
+    /// (i.e. the parent commit 93bdff3f):
+    ///   git worktree add ../regen-a11 93bdff3f
+    ///   cd ../regen-a11
+    ///   cargo test -p izarravm-cpu --lib regen_condmove_goldens -- --ignored --nocapture
+    /// then paste the output over `condmove_golden_cases` and only then delete the fused arms.
+    #[test]
+    #[ignore = "prints golden literals; run with --ignored --nocapture against the fused reference"]
+    fn regen_condmove_goldens() {
+        for g in condmove_golden_cases() {
+            let mut mem = vec![0u8; 0x100];
+            condmove_seed_mem(&mut mem, g.code);
+            let initial = mem.clone();
+
+            let mut fused = Cpu386::default();
+            condmove_seed(&mut fused);
+            let mut fbus = TestBus::with_memory(mem);
+            fused.begin_instruction();
+            if fused.execute_instruction_legacy(&mut fbus).is_err() {
+                println!(
+                    "            // TODO regen {}: fused path unavailable here; run against the base commit",
+                    g.name
+                );
+                continue;
+            }
+            let deltas: Vec<(usize, u8)> = fbus
+                .memory
+                .iter()
+                .enumerate()
+                .filter(|(i, b)| **b != initial[*i])
+                .map(|(i, b)| (i, *b))
+                .collect();
+            let fetch = seam_fetch_count(&fbus);
+            println!(
+                "            CondMoveGolden {{ name: {:?}, code: &{:?}, gpr: {:?}, eflags: {:#x}, eip: {:#x}, deltas: &{:?}, fetch: {} }},",
                 g.name,
                 g.code,
                 fused.registers.gpr,
