@@ -3,16 +3,14 @@
 //! directory tree whose FAT and directory sectors are computed on demand, so
 //! RAM scales with the entry count rather than the disk or file sizes.
 
-// The whole tree-volume stack is reachable only from this module's own tests
-// until the final M1 task wires `KateaTreeVolume` into the ATA `HostFolder`
-// backing (`ata.rs`) and `mount_hdd_folder` (`lib.rs`). Until that crate-level
-// consumer exists, every item here (`KateaTreeVolume` and everything it builds
-// on) is "unused" from the crate's view, so a module-level allow is the minimum:
-// per-item `#[allow(dead_code)]` would land on essentially every item. A couple
-// items stay test/M2-only even after the mount lands — `tree()`/`cluster_to_lba`
-// (test), the bidirectional name map and `parent_first_cluster` (M2 writes) —
-// so this allow only narrows, it does not vanish, when that task removes it.
-#![allow(dead_code)]
+// `KateaTreeVolume` is now consumed by the ATA `HostFolder` backing (`ata.rs`)
+// and `mount_hdd_folder` (`lib.rs`), so the read path (`new`/`read_sector`/
+// `total_sectors`) is live and the module-level dead-code allow is gone. A few
+// items remain reachable only from this module's `#[cfg(test)]` tests; each
+// carries a narrow `#[allow(dead_code)]` at its definition: `tree()`/
+// `cluster_to_lba()` and the `tree` field they read, and the free `dir_sector`
+// (the per-volume read path inlines the same logic in `data_sector`). The `tree`
+// field is also the seam the M2 write engine will read.
 
 use crate::fat32::{FAT32_EOC, fat32_dir_entry, fat32_fsinfo_sector};
 use crate::katea_names::NameTable;
@@ -276,6 +274,7 @@ fn assign_dir(dir: &mut TreeDir, is_root: bool, parent: u32, next: &mut u32, clu
 /// `next_free` (the first never-allocated cluster) and derive every FAT entry —
 /// and any FAT sector — from those, so RAM scales with the chain count rather
 /// than the disk size.
+#[derive(Debug)]
 pub(crate) struct ClusterIndex {
     next_free: u32,           // first cluster never allocated
     chain_ends: HashSet<u32>, // last cluster of every chain (-> EOC)
@@ -399,6 +398,11 @@ fn dir_entries(dir: &TreeDir, is_root: bool) -> Vec<[u8; 32]> {
 /// zero-padded past the last entry. `sector` indexes into the directory's entry
 /// list 16 entries at a time, so the >16-entry (multi-cluster) case is served by
 /// the later sectors.
+///
+/// Test-only: the live read path serves directory sectors via `data_sector`,
+/// which inlines this slice math over the precomputed `FlatDir::entries`. The
+/// module tests exercise this standalone helper directly.
+#[allow(dead_code)]
 pub(crate) fn dir_sector(dir: &TreeDir, is_root: bool, sector: u32) -> [u8; SECTOR] {
     let entries = dir_entries(dir, is_root);
     let mut out = [0u8; SECTOR];
@@ -411,26 +415,26 @@ pub(crate) fn dir_sector(dir: &TreeDir, is_root: bool, sector: u32) -> [u8; SECT
     out
 }
 
-/// A flattened directory: its precomputed 32-byte entries plus the cluster run
-/// it occupies. The entries are small (32 bytes each), so holding them costs RAM
-/// proportional to the entry count, not the disk size.
+/// A flattened directory: just its precomputed 32-byte entries. The entries are
+/// small (32 bytes each), so holding them costs RAM proportional to the entry
+/// count, not the disk size. The cluster span this directory occupies lives in
+/// the `runs` table, so it is not duplicated here.
+#[derive(Debug)]
 struct FlatDir {
     entries: Vec<[u8; 32]>,
-    first_cluster: u32,
-    cluster_count: u32,
 }
 
-/// A flattened file: its (cloned) source, byte size, and cluster run. The source
-/// is `FileSource::HostFile { path, len }` for host files (lazy, no slurp) or
-/// `InMemory` for the overlaid system files.
+/// A flattened file: its (cloned) source and byte size. The source is
+/// `FileSource::HostFile { path, len }` for host files (lazy, no slurp) or
+/// `InMemory` for the overlaid system files. Its cluster span lives in `runs`.
+#[derive(Debug)]
 struct FlatFile {
     source: FileSource,
     size: u32,
-    first_cluster: u32,
-    cluster_count: u32,
 }
 
 /// What a cluster run holds, indexing into `dirs`/`files` (no pointers).
+#[derive(Debug)]
 enum Role {
     Dir(usize),
     File(usize),
@@ -445,8 +449,10 @@ enum Role {
 /// and the sorted cluster-run table), the two stamped boot sectors, the geometry,
 /// and the cluster index. `tree` is kept whole for the test and M2 (writes); it is
 /// not consulted by `read_sector` — that path resolves a cluster through `runs`.
+#[derive(Debug)]
 pub(crate) struct KateaTreeVolume {
-    /// The owned tree; kept for tests / M2, not used by `read_sector`.
+    /// The owned tree; kept for tests / M2 (writes), not read by `read_sector`.
+    #[allow(dead_code)]
     tree: HostTree,
     geo: Geometry,
     /// LBA 0: the MBR with the partition entry + 0x55AA stamped in.
@@ -538,11 +544,14 @@ impl KateaTreeVolume {
     }
 
     /// The owned tree (for tests / M2 writes; `read_sector` does not use it).
+    #[allow(dead_code)]
     pub(crate) fn tree(&self) -> &HostTree {
         &self.tree
     }
 
-    /// Absolute LBA of a data cluster's first sector.
+    /// Absolute LBA of a data cluster's first sector. Test-only: the read path
+    /// goes the other way (LBA -> cluster) inside `read_sector`.
+    #[allow(dead_code)]
     pub(crate) fn cluster_to_lba(&self, cluster: u32) -> u32 {
         self.geo.part_start
             + self.geo.first_data_sector
@@ -639,8 +648,6 @@ fn flatten(
     let id = dirs.len();
     dirs.push(FlatDir {
         entries: dir_entries(dir, is_root),
-        first_cluster: dir.first_cluster,
-        cluster_count: dir.cluster_count,
     });
     runs.push((
         dir.first_cluster,
@@ -652,8 +659,6 @@ fn flatten(
         files.push(FlatFile {
             source: clone_source(&f.source),
             size: u32::try_from(f.source.len()).unwrap_or(u32::MAX),
-            first_cluster: f.first_cluster,
-            cluster_count: f.cluster_count,
         });
         runs.push((
             f.first_cluster,
