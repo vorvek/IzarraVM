@@ -963,15 +963,22 @@ enum DecodeGroup {
     /// other unmapped 0F bytes) are NOT routed here — they stay on Fallback / TwoByteFallback and
     /// still #UD as `UnsupportedOpcode` / `UnsupportedTwoByteOpcode`.
     Misc,
-    /// Not yet converted to the split: decode parses nothing extra and `execute_decoded` hands the
-    /// opcode to the shared fused `dispatch_opcode`.
+    /// A single-byte opcode with no split implementation. After Stage A this is a pure dead-end: the
+    /// only members are the genuinely-unimplemented 0x63 (ARPL) and 0xF1 (ICEBP), plus — as a
+    /// decode-bug guard — any prefix byte `read_prefixes` did not consume. `execute_decoded` raises
+    /// `UnsupportedOpcode` for them (via `unsupported_single_byte_opcode`); `decode` parses nothing
+    /// extra. No IMPLEMENTED opcode routes here — `every_implemented_opcode_routes_off_the_legacy_fallback`
+    /// locks that invariant.
     Fallback,
-    /// An un-converted two-byte (0F) opcode (`opcode & 0xff00 == 0x0f00`). `decode` already folded
-    /// the second byte into `insn.opcode` as 0x0F00 | second, read + charged it, and applied the
-    /// ISA gate; `execute_decoded` hands the second byte (`insn.opcode as u8`) straight to
-    /// `execute_two_byte` without re-reading or re-gating. Distinct from `Fallback` so the routing
-    /// predicate (`& 0xff00 == 0x0f00`) lives only in `route_group` and the `as u8` narrowing can
-    /// never alias a 0F opcode onto a single-byte one (no arm-ordering dependence).
+    /// A two-byte (0F) opcode handled by `execute_two_byte` rather than a dedicated split group
+    /// (`opcode & 0xff00 == 0x0f00`). `decode` already folded the second byte into `insn.opcode` as
+    /// 0x0F00 | second, read + charged it, and applied the ISA gate; `execute_decoded` hands the
+    /// second byte (`insn.opcode as u8`) straight to `execute_two_byte` without re-reading or
+    /// re-gating. Most members #UD as `UnsupportedTwoByteOpcode` (the unimplemented 0F bytes), but a
+    /// few are explicitly handled there (e.g. 0F AA RSM, which #UDs because no SMM is modeled).
+    /// Distinct from `Fallback` so the routing predicate (`& 0xff00 == 0x0f00`) lives only in
+    /// `route_group` and the `as u8` narrowing can never alias a 0F opcode onto a single-byte one
+    /// (no arm-ordering dependence).
     TwoByteFallback,
 }
 
@@ -989,18 +996,19 @@ enum FetchCost {
     PerByte([u8; 15], u8),
 }
 
-/// A decoded instruction: the prefix/opcode/operand-size results plus, for opcodes already
-/// converted to the decode/execute split, the pre-parsed ModRM, operand descriptor, and
-/// immediate. Opcodes still on the legacy path leave `modrm`/`operand` as `None` (and `imm` 0)
-/// and are re-read by `execute_instruction_legacy`.
+/// A decoded instruction: the prefix/opcode/operand-size results plus the pre-parsed ModRM, operand
+/// descriptor, and immediate for the forms that carry them. After Stage A every implemented opcode
+/// is converted to the decode/execute split; the no-operand forms (and the dead-end fallbacks) leave
+/// `modrm`/`operand` as `None` (and `imm` 0).
 // Stage-A scaffold: `imm` is read by the converted ALU/group immediate forms and `imm2` by the
 // converted ENTER (and any other second-immediate form); the `len`/`fetch` placeholders are
 // populated by `decode` but stay unread until the cache stage lands.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 struct DecodedInsn {
-    /// eip of the first byte of the instruction (before any prefixes), used to rewind so the
-    /// legacy fallback re-reads from the instruction start.
+    /// eip of the first byte of the instruction (before any prefixes). Carried as the `eip` field of
+    /// the `UnsupportedOpcode` #UD the dead-end `Fallback` arm raises, and used by `cycle` to rewind
+    /// to the instruction start on a delivered exception.
     start_eip: u32,
     len: u8,
     fetch: FetchCost,
@@ -1994,18 +2002,15 @@ impl Cpu386 {
                 self.execute_two_byte(insn.opcode as u8, insn.operand_size)
             }
             DecodeGroup::Fallback => {
-                // Fallback: `decode` already read the prefixes + opcode and ran the LOCK check,
-                // leaving eip just past the opcode. Continue into the shared dispatch from there,
-                // so each arm re-reads its ModRM/immediates exactly as before and the prefix/opcode
-                // fetch clocks are charged only once (rule 2).
-                self.dispatch_opcode(
-                    bus,
-                    insn.start_eip,
-                    insn.prefixes,
-                    insn.opcode as u8,
-                    insn.operand_size,
-                    insn.address_size,
-                )
+                // Fallback is now a pure dead-end: after Stage A every IMPLEMENTED single-byte opcode
+                // is routed to a dedicated split group, so the only opcodes that land here are the
+                // genuinely-unimplemented ones (0x63 ARPL, 0xF1 ICEBP) and — as a decode-bug guard —
+                // any prefix byte `read_prefixes` failed to consume. Raise the same `UnsupportedOpcode`
+                // the legacy fused dispatch did, carrying the instruction-start eip (`insn.start_eip`)
+                // exactly as the old `instruction_eip` field. `execute_two_byte` still STAYS — it is
+                // the leaf for the no-operand 0F ops (`execute_misc_decoded`) and the TwoByteFallback
+                // #UD handler above — but the single-byte fused dispatch is gone.
+                Err(self.unsupported_single_byte_opcode(insn.opcode as u8, insn.start_eip))
             }
         }
     }
@@ -3844,209 +3849,21 @@ impl Cpu386 {
         }
     }
 
-    // Transitional fused entry: reads the prefixes + opcode + LOCK check itself, then dispatches.
-    // The production `cycle` path goes through `decode`/`execute_decoded` (which call
-    // `dispatch_opcode` directly to keep the fetch clocks charged once), so this whole-instruction
-    // entry now has callers only in the test suite; it is retained as the documented fused
-    // reference and is removed when the seam covers every opcode.
-    #[allow(dead_code)]
-    fn execute_instruction_legacy<B: CpuBus>(&mut self, bus: &mut B) -> ExecResult<CycleOutcome> {
-        let instruction_eip = self.registers.eip;
-        let prefixes = self.read_prefixes(bus)?;
-        let opcode = self.fetch_u8(bus)?;
-        if prefixes.lock {
-            self.check_lock_target(bus, opcode)?;
-        }
-        let operand_size = self.operand_size(prefixes);
-        let address_size = self.address_size(prefixes);
-        self.dispatch_opcode(
-            bus,
-            instruction_eip,
-            prefixes,
+    /// Raise the #UD for a single-byte opcode that the decode/execute split does not implement.
+    /// After Stage A every IMPLEMENTED opcode is routed by `route_group` to a dedicated split group,
+    /// so the only opcodes that reach here (via the `DecodeGroup::Fallback` arm of `execute_decoded`)
+    /// are the genuinely-unimplemented ones — 0x63 (ARPL) and 0xF1 (ICEBP), plus any prefix byte that
+    /// `read_prefixes` did not consume (which would be a decode bug). All produce the same
+    /// `UnsupportedOpcode` the fused path produced: `opcode` is the byte, `cs` the current selector,
+    /// and `eip` the instruction's start (the byte before any ModRM/immediate would sit), matching
+    /// the legacy error fields exactly.
+    fn unsupported_single_byte_opcode(&self, opcode: u8, instruction_eip: u32) -> InternalFault {
+        CpuError::UnsupportedOpcode {
             opcode,
-            operand_size,
-            address_size,
-        )
-    }
-
-    /// The live opcode dispatch the production seam calls on every fallback opcode (and that the
-    /// test-only `execute_instruction_legacy` reference also delegates to). The caller is
-    /// responsible for having already read the prefixes + opcode and run any LOCK check;
-    /// `instruction_eip` is only used for the unsupported-opcode error, and the current eip must
-    /// point at the byte immediately after the opcode so each arm re-reads its ModRM/immediate
-    /// from there. The seam calls this with the values `decode` already read, so the prefix/opcode
-    /// instruction-fetch clocks are charged exactly once.
-    // After task A14 every IMPLEMENTED opcode is converted to the split, so the only live arms left
-    // here are the prefix-byte #UD guard, the legacy-reference `0x0F` dispatch (test-only), and the
-    // `UnsupportedOpcode` catch-all. `prefixes`/`address_size` are no longer read by any remaining
-    // arm (the IMUL/INS-OUTS/XLAT/BCD arms that used them moved to `execute_misc_decoded`); they stay
-    // in the signature so the seam call site is unchanged until task A15 deletes the Fallback path.
-    #[allow(clippy::too_many_arguments)]
-    fn dispatch_opcode<B: CpuBus>(
-        &mut self,
-        bus: &mut B,
-        instruction_eip: u32,
-        _prefixes: Prefixes,
-        opcode: u8,
-        operand_size: OperandSize,
-        _address_size: AddressSize,
-    ) -> ExecResult<CycleOutcome> {
-        match opcode {
-            // 0x06/0x07/0x0e/0x16/0x17/0x1e/0x1f (PUSH/POP seg) are converted to the
-            // decode/execute split (`DecodeGroup::Stack` -> `execute_stack_decoded`);
-            // not handled here.
-            0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 => {
-                Err(CpuError::UnsupportedOpcode {
-                    opcode,
-                    cs: self.registers.cs().selector,
-                    eip: instruction_eip,
-                }
-                .into())
-            }
-            // 0x50-0x57 (PUSH reg), 0x58-0x5f (POP reg), 0x60 (PUSHA/PUSHAD), 0x61 (POPA/POPAD),
-            // 0x68 (PUSH imm16/32) are converted to the decode/execute split
-            // (`DecodeGroup::Stack` -> `execute_stack_decoded`); not handled here.
-            // 0x69/0x6b (three-operand IMUL) and 0x6c-0x6f (INS/OUTS) are converted to the
-            // decode/execute split (task A14): `route_group` classifies them as `DecodeGroup::Misc`
-            // and `execute_misc_decoded` runs them (the ModRM + immediate for IMUL is parsed in
-            // `decode`; INS/OUTS reuse `run_string` with the prefixes passed through). Not handled
-            // here.
-            // 0x6a (PUSH imm8) is converted to the decode/execute split
-            // (`DecodeGroup::Stack` -> `execute_stack_decoded`); not handled here.
-            // 0x62 (BOUND r,m) is converted to the decode/execute split (task A12): `route_group`
-            // classifies it as `DecodeGroup::SystemSeg` and `execute_system_seg_decoded` runs it
-            // (the ModRM + addressing descriptor is parsed in `decode`; the bounds are read from
-            // memory and the #BR/#UD faults raised in the executor). Not handled here.
-            // 0x70-0x7f (Jcc short, rel8) are converted to the decode/execute split:
-            // `route_group` classifies them as `DecodeGroup::Branch` and `execute_branch_decoded`
-            // runs them. Not handled here.
-            // 0x80/0x81/0x82/0x83 (group 1 ALU r/m,imm; 0x82 is the undocumented 0x80 alias) are
-            // converted to the decode/execute split: `route_group` classifies them as
-            // `DecodeGroup::Group` and `execute_group_decoded` runs them. Not handled here.
-            // 0x84/0x85 (TEST r/m,reg byte/word) are converted to the decode/execute split:
-            // `route_group` classifies them as `DecodeGroup::FlagsMisc` and
-            // `execute_flags_misc_decoded` runs them. Not handled here.
-            // 0x86-0x8e (XCHG r/m,reg; MOV r/m<->reg/Sreg; LEA) are converted to the
-            // decode/execute split: `route_group` classifies them as `DecodeGroup::DataMove` and
-            // `execute_datamove_decoded` runs them. They must NOT be re-handled here (single path).
-            // 0x8f (POP r/m, group 1A) is converted to `DecodeGroup::Stack` ->
-            // `execute_stack_decoded`; not handled here.
-            // 0xc4/0xc5 (LES/LDS, load far pointer into ES/DS + reg) are converted to the
-            // decode/execute split (task A12): `route_group` classifies them as
-            // `DecodeGroup::SystemSeg` and `execute_system_seg_decoded` runs them (the ModRM +
-            // addressing descriptor is parsed in `decode`; the far pointer is read from memory and
-            // the segment loaded through the unchanged `load_segment` in the executor; mod=3 #UDs).
-            // Not handled here.
-            // 0x90 (NOP / XCHG AX,AX) and 0x91-0x97 (XCHG (E)AX, reg) are converted to the split
-            // (`DecodeGroup::DataMove` -> `execute_datamove_decoded`); not handled here.
-            // 0x98 (CBW/CWDE), 0x99 (CWD/CDQ), 0x9e (SAHF), 0x9f (LAHF) are converted to the
-            // decode/execute split: `route_group` classifies them as `DecodeGroup::FlagsMisc` and
-            // `execute_flags_misc_decoded` runs them. Not handled here.
-            // 0x9c (PUSHF/PUSHFD) and 0x9d (POPF/POPFD) are converted to the decode/execute
-            // split (`DecodeGroup::Stack` -> `execute_stack_decoded`); not handled here.
-            // 0xa0-0xa3 (MOV (E)AX<->moffs, byte and word) are converted to the split
-            // (`DecodeGroup::DataMove` -> `execute_datamove_decoded`); not handled here.
-            // 0xa4/0xa5 (MOVS), 0xa6/0xa7 (CMPS), 0xae/0xaf (SCAS) are converted to the
-            // decode/execute split: `route_group` classifies them as `DecodeGroup::StringOps` and
-            // `execute_string_decoded` runs them (a thin call to the unchanged `run_string` helper
-            // with the prefixes passed through, so the REP loop/DF/segment-override/per-iteration
-            // clocks stay in one place). Not handled here. 0xa8/0xa9 below are TEST AL/AX,imm — not
-            // string ops. 0xa8/0xa9 (TEST AL/AX,imm) are converted to the decode/execute split
-            // (task A14): `route_group` classifies them as `DecodeGroup::Misc` and
-            // `execute_misc_decoded` runs them (the immediate is fetched in `decode`). Not handled
-            // here.
-            // 0xaa/0xab (STOS) and 0xac/0xad (LODS) are converted to the decode/execute split:
-            // `route_group` classifies them as `DecodeGroup::StringOps` and `execute_string_decoded`
-            // runs them via the unchanged `run_string` helper. Not handled here.
-            // 0xb0-0xb7 (MOV r8,imm8) and 0xb8-0xbf (MOV r16/32,imm) are converted to the split
-            // (`DecodeGroup::DataMove` -> `execute_datamove_decoded`); not handled here.
-            // 0xc2/0xc3 (RET near, with and without an imm16 release) and 0xca/0xcb (RETF, ditto) are
-            // converted to the decode/execute split: `route_group` classifies them as
-            // `DecodeGroup::ControlFlow` and `execute_control_flow_decoded` runs them (the imm16
-            // release count is parsed in `decode`). Not handled here.
-            // 0xc6/0xc7 (MOV r/m,imm group 11) are converted to the split
-            // (`DecodeGroup::DataMove` -> `execute_datamove_decoded`); not handled here.
-            // 0xc8 (ENTER) and 0xc9 (LEAVE) are converted to `DecodeGroup::Stack` ->
-            // `execute_stack_decoded`; not handled here.
-            // 0xcc (INT3), 0xcd (INT n, imm8 vector), 0xce (INTO), 0xcf (IRET) are converted to the
-            // split: `route_group` classifies them as `DecodeGroup::ControlFlow` and
-            // `execute_control_flow_decoded` runs them (the imm8 vector for 0xcd is parsed in
-            // `decode`; the V86 IOPL check and the interrupt/IRET delivery stay in the executor's
-            // shared helpers). Not handled here.
-            // 0xd4/0xd5 (AAM/AAD), 0xd6 (SALC), 0xd7 (XLAT) are converted to the decode/execute
-            // split (task A14): `route_group` classifies them as `DecodeGroup::Misc` and
-            // `execute_misc_decoded` runs them (the imm8 base for AAM/AAD is fetched in `decode`;
-            // XLAT reads [seg:BX+AL] from memory at execute against the live registers). Not
-            // handled here.
-            // 0xd8-0xdf (the x87 FPU escape opcodes) are converted to the decode/execute split:
-            // `route_group` classifies them as `DecodeGroup::Fpu` and `execute_fpu_decoded` runs
-            // them (the ModRM + addressing descriptor are parsed once in `decode`; the existing
-            // `execute_fpu_register`/`execute_fpu_memory` leaf helpers run the x87 logic). Not
-            // handled here.
-            // 0xe0/0xe1 (LOOPNE/LOOPE), 0xe2 (LOOP), 0xe3 (JCXZ/JECXZ) are converted to the
-            // decode/execute split: `route_group` classifies them as `DecodeGroup::Branch` and
-            // `execute_branch_decoded` runs them. Not handled here.
-            // 0xe4 (IN AL,imm8), 0xe5 (IN AX/EAX,imm8), 0xe6 (OUT imm8,AL), 0xe7 (OUT imm8,AX/EAX),
-            // 0xec (IN AL,DX), 0xed (IN AX/EAX,DX), 0xee (OUT DX,AL), 0xef (OUT DX,AX/EAX) are
-            // converted to the decode/execute split: `route_group` classifies them as
-            // `DecodeGroup::PortIo` and `execute_port_io_decoded` runs them. Not handled here.
-            // 0xe8 (CALL near, rel16/32), 0xe9 (JMP near, rel16/32), 0xeb (JMP short, rel8) are
-            // converted to the decode/execute split: `route_group` classifies them as
-            // `DecodeGroup::Branch` and `execute_branch_decoded` runs them. Not handled here.
-            // 0x9b (WAIT/FWAIT) is converted to the decode/execute split: `route_group` classifies
-            // it as `DecodeGroup::Fpu` and `execute_fpu_decoded` runs the same pending-#MF check.
-            // Not handled here.
-            // 0x9a (CALL far direct) and 0xea (JMP far direct) are converted to the decode/execute
-            // split: `route_group` classifies them as `DecodeGroup::ControlFlow` and
-            // `execute_control_flow_decoded` runs them (the far pointer — offset then selector — is
-            // parsed in `decode` into `imm`/`imm2`). Not handled here.
-            // 0xf4 (HLT) is converted to the decode/execute split (task A14): `route_group`
-            // classifies it as `DecodeGroup::Misc` and `execute_misc_decoded` sets the halted
-            // state (the existing logic, verbatim). Not handled here.
-            // 0xf6/0xf7 (group 3: TEST/NOT/NEG/MUL/IMUL/DIV/IDIV) are converted to the
-            // decode/execute split: `route_group` classifies them as `DecodeGroup::Group` and
-            // `execute_group_decoded` runs them (the conditional TEST immediate is parsed in
-            // `decode`). Not handled here.
-            // 0xf5 (CMC), 0xf8 (CLC), 0xf9 (STC), 0xfa (CLI), 0xfb (STI), 0xfc (CLD), 0xfd (STD)
-            // are converted to the decode/execute split: `route_group` classifies them as
-            // `DecodeGroup::FlagsMisc` and `execute_flags_misc_decoded` runs them. Not handled here.
-            // 0xc0/0xc1/0xd0-0xd3 (group 2 shift/rotate) and 0xfe (group 4 INC/DEC byte) are
-            // converted to the decode/execute split: `route_group` classifies them as
-            // `DecodeGroup::Group` and `execute_group_decoded` runs them. Not handled here.
-            // 0xff (group 5: INC/DEC r/m, near/far indirect CALL/JMP, PUSH r/m, /7 #UD) is converted
-            // to the split: `route_group` classifies it as `DecodeGroup::ControlFlow` and
-            // `execute_control_flow_decoded` runs it (the ModRM + addressing descriptor is parsed in
-            // `decode`; the indirect target is read from memory in the executor). Not handled here.
-            // 0x40-0x4f (INC/DEC reg) are converted to the decode/execute split:
-            // `route_group` classifies them as `DecodeGroup::FlagsMisc` and
-            // `execute_flags_misc_decoded` runs them. Not handled here.
-            // 0x27/0x2f/0x37/0x3f (DAA/DAS/AAA/AAS) are converted to the decode/execute split
-            // (task A14): `route_group` classifies them as `DecodeGroup::Misc` and
-            // `execute_misc_decoded` runs the same BCD-adjust logic verbatim. Not handled here.
-            0x0f => {
-                // LEGACY-REFERENCE ONLY. This arm is reached solely via the test-only
-                // `execute_instruction_legacy`, which reads a single opcode byte and so arrives here
-                // with the bare 0x0F. The production `cycle` path never does: `decode` folds the
-                // second byte into `insn.opcode` as 0x0F00 | second and routes it through
-                // `DecodeGroup::TwoByteFallback`, which calls `execute_two_byte` directly — so a
-                // combined 0F value never re-enters `dispatch_opcode`.
-                //
-                // DO NOT copy this `fetch_u8` + `check_two_byte_isa_gate` shape into a converted 0F
-                // executor. It re-reads and re-charges the second byte (and re-applies the gate) ON
-                // PURPOSE, so the fused reference stays self-contained; the production path reads and
-                // gates that byte exactly once, in `decode`. A converted 0F group must take the
-                // second byte from `insn.opcode` instead (see the extension rules on `DecodeGroup`).
-                let second = self.fetch_u8(bus)?;
-                self.check_two_byte_isa_gate(second)?;
-                self.execute_two_byte(second, operand_size)
-            }
-            _ => Err(CpuError::UnsupportedOpcode {
-                opcode,
-                cs: self.registers.cs().selector,
-                eip: instruction_eip,
-            }
-            .into()),
+            cs: self.registers.cs().selector,
+            eip: instruction_eip,
         }
+        .into()
     }
 
     /// The guest-level ISA #UD gate for the whole 0F-extended group. At the 286 level the core
@@ -4077,10 +3894,11 @@ impl Cpu386 {
         Ok(())
     }
 
-    /// Execute an un-converted 0F (two-byte) opcode. `opcode` is the second opcode byte that
-    /// `decode` (or, for the fused reference, the `0x0F` dispatch arm) already read + charged and
-    /// gated; this never re-reads it. Converted 0F groups (MOVZX/MOVSX) bypass this entirely via
-    /// `route_group`/`execute_decoded`.
+    /// Execute a two-byte (0F) opcode that has no dedicated split group. `opcode` is the second
+    /// opcode byte that `decode` already read + charged and gated; this never re-reads it. Reached
+    /// two ways: the `TwoByteFallback` arm of `execute_decoded` (which #UDs the unimplemented bytes),
+    /// and as a leaf call from `execute_misc_decoded` for the no-operand 0F members. The converted 0F
+    /// groups (MOVZX/MOVSX and the rest) bypass this entirely via `route_group`/`execute_decoded`.
     ///
     /// Every opcode that remains here takes NO encoded operand (it reads no instruction bytes), so
     /// the heterogeneous `Misc` group (task A14) also leaf-calls this for its no-operand 0F members
@@ -12940,7 +12758,7 @@ mod tests {
         cpu.registers.eip = 0;
         let mut bus = TestBus::with_memory(vec![0x0f, 0x08, 0, 0]);
 
-        let result = cpu.execute_instruction_legacy(&mut bus);
+        let result = exec_one_split(&mut cpu, &mut bus);
 
         assert!(
             matches!(
@@ -12972,7 +12790,7 @@ mod tests {
         cpu.registers.eip = 0;
         let mut bus = TestBus::with_memory(vec![0x0f, 0x09, 0, 0]);
 
-        let result = cpu.execute_instruction_legacy(&mut bus);
+        let result = exec_one_split(&mut cpu, &mut bus);
 
         assert!(
             matches!(
@@ -13352,7 +13170,7 @@ mod tests {
         cpu.registers.eip = 0;
         let mut bus = TestBus::with_memory(memory);
 
-        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
         assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
     }
 
@@ -13366,7 +13184,7 @@ mod tests {
         cpu.registers.eip = 0;
         let mut bus = TestBus::with_memory(memory);
 
-        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
         assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
     }
 
@@ -13601,7 +13419,7 @@ mod tests {
         cpu.registers.set_eax(0);
         let mut bus = TestBus::with_memory(vec![0x0f, 0xa2, 0, 0]);
 
-        assert!(cpu.execute_instruction_legacy(&mut bus).is_ok());
+        assert!(exec_one_split(&mut cpu, &mut bus).is_ok());
         assert_eq!(cpu.registers.eax(), 1);
         assert_eq!(cpu.registers.ebx().to_le_bytes(), *b"Genu");
     }
@@ -13705,7 +13523,7 @@ mod tests {
         cpu.registers.set_edx(0);
         cpu.registers.set_eax(0x2); // bit 1 is reserved
         let mut bus = TestBus::with_memory(memory);
-        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
         assert!(matches!(
             fault,
             InternalFault::Exception {
@@ -13723,7 +13541,7 @@ mod tests {
         cpu.registers.set_edx(0x0001_0000); // bit 48 set
         cpu.registers.set_eax(0);
         let mut bus = TestBus::with_memory(memory);
-        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
         assert!(matches!(
             fault,
             InternalFault::Exception {
@@ -13761,7 +13579,7 @@ mod tests {
         cpu.registers.set_edx(0);
         cpu.registers.set_eax(1_000_000);
         let mut bus = TestBus::with_memory(memory);
-        cpu.execute_instruction_legacy(&mut bus).unwrap();
+        exec_one_split(&mut cpu, &mut bus).unwrap();
         assert_eq!(cpu.time_stamp_counter(), 1_000_000);
     }
 
@@ -13769,7 +13587,7 @@ mod tests {
     fn wrmsr_is_general_protection_at_cpl3() {
         let (mut cpu, mut bus) = cpl3_code(&[0x0f, 0x30]);
         cpu.registers.set_ecx(MSR_WHCR);
-        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
         assert!(matches!(
             fault,
             InternalFault::Exception {
@@ -13784,7 +13602,7 @@ mod tests {
         let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x32], 0x20);
         cpu.registers.set_ecx(0x1234_5678);
         let mut bus = TestBus::with_memory(memory);
-        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
         assert!(matches!(
             fault,
             InternalFault::Exception {
@@ -13798,7 +13616,7 @@ mod tests {
     fn rdtsc_is_general_protection_when_tsd_set_at_cpl3() {
         let (mut cpu, mut bus) = cpl3_code(&[0x0f, 0x31]);
         cpu.control.cr4 |= CR4_TSD;
-        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
         assert!(matches!(
             fault,
             InternalFault::Exception {
@@ -13812,7 +13630,7 @@ mod tests {
     fn rdtsc_runs_at_cpl3_when_tsd_clear() {
         let (mut cpu, mut bus) = cpl3_code(&[0x0f, 0x31]);
         cpu.elapsed_clocks = 42;
-        assert!(cpu.execute_instruction_legacy(&mut bus).is_ok());
+        assert!(exec_one_split(&mut cpu, &mut bus).is_ok());
         assert_eq!(cpu.registers.eax(), 42);
     }
 
@@ -14035,7 +13853,7 @@ mod tests {
         // F0 0F C7 C9: LOCK on the register form -> #UD.
         let (mut cpu, memory) = real_mode_cpu(&[0xf0, 0x0f, 0xc7, 0xc9], 0x20);
         let mut bus = TestBus::with_memory(memory);
-        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
         assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
     }
 
@@ -14082,7 +13900,7 @@ mod tests {
         let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x05], 0x20);
         cpu.msr.efer = 0;
         let mut bus = TestBus::with_memory(memory);
-        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
         assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
     }
 
@@ -14106,7 +13924,7 @@ mod tests {
     fn sysret_is_general_protection_at_cpl3() {
         let (mut cpu, mut bus) = cpl3_code(&[0x0f, 0x07]);
         cpu.msr.efer = EFER_SCE;
-        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
         assert!(matches!(
             fault,
             InternalFault::Exception {
@@ -14121,7 +13939,7 @@ mod tests {
         let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x07], 0x20);
         cpu.msr.efer = 0;
         let mut bus = TestBus::with_memory(memory);
-        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
         assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
     }
 
@@ -14130,7 +13948,7 @@ mod tests {
         // No SMM is modeled, so RSM always faults #UD.
         let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0xaa], 0x20);
         let mut bus = TestBus::with_memory(memory);
-        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
         assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
     }
 
@@ -14145,16 +13963,15 @@ mod tests {
         cpu.load_segment_real(SegmentIndex::Cs, 0);
         cpu.registers.eip = 0;
         let mut bus = TestBus::with_memory(memory);
-        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
         assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
     }
 
-    /// Run a single instruction from `code` at the given level and return the result.
     /// Run one instruction through the production decode/execute split and return the raw
     /// `InternalFault` (without exception delivery), so a test can assert `is_ok()`/`unwrap_err()`
-    /// exactly as it did against `execute_instruction_legacy`. Use this for opcodes already
-    /// converted to the split — `execute_instruction_legacy` routes only through the legacy fused
-    /// `dispatch_opcode`, which no longer carries the converted arms, so it would wrongly #UD them.
+    /// directly on the result. This is the single per-instruction entry the test suite uses now that
+    /// the transitional fused reference is gone: it is exactly what `cycle` runs, minus the
+    /// interrupt-service prologue and the exception-delivery epilogue.
     fn exec_one_split<B: CpuBus>(cpu: &mut Cpu386, bus: &mut B) -> ExecResult<CycleOutcome> {
         cpu.begin_instruction();
         let insn = cpu.decode(bus)?;
@@ -14170,10 +13987,8 @@ mod tests {
         cpu.load_segment_real(SegmentIndex::Ds, 0);
         cpu.registers.eip = 0;
         let mut bus = TestBus::with_memory(memory);
-        // Route through the split so converted groups (ALU, data-move) execute; the legacy fused
-        // entry would #UD them now that their arms are gone from `dispatch_opcode`. Prefix-gating
-        // (66/67 at I286, the 0F two-byte ISA gate) lives in `decode`/`dispatch_opcode` either way,
-        // so the #UD-at-286 assertions still hold.
+        // Route through the production split. Prefix-gating (66/67 at I286, the 0F two-byte ISA gate)
+        // lives in `decode`, so the #UD-at-286 assertions hold on the same path the guest runs.
         exec_one_split(&mut cpu, &mut bus)
     }
 
@@ -14232,38 +14047,37 @@ mod tests {
     }
 
     #[test]
-    fn unconverted_two_byte_opcode_matches_the_fused_reference_after_the_convention() {
-        // RDTSC (0F 31) is NOT converted: it stays on the Fallback path. After the two-byte decode
-        // convention landed it must still execute identically to the fused reference — decode folds
-        // the second byte into insn.opcode and the Fallback arm hands it to execute_two_byte without
-        // re-reading it. Diff the split path against execute_instruction_legacy (both un-converted,
-        // so both still run RDTSC) for register/eip equality AND identical InstructionPrefetch
-        // counts: a second-byte double-charge in the convention would drift the fetch count here.
+    fn two_byte_convention_charges_the_second_byte_exactly_once() {
+        // RDTSC (0F 31) is a two-byte op routed through `DecodeGroup::Misc` (it leaf-calls
+        // `execute_two_byte`). The two-byte decode convention folds the second byte into
+        // `insn.opcode` as 0x0F31 in `decode`, and the executor never re-reads it. Guard that
+        // single-charge here: running RDTSC through the production split must advance eip past both
+        // bytes, write a sane TSC into EDX:EAX, and charge exactly 3 instruction fetches (one
+        // prefetch-window peek plus the two opcode bytes 0x0F and 0x31). A second-byte double-read in
+        // the convention would push the fetch count past 3; nothing else in the file pins this
+        // convention property for a 0F op so directly.
         let code = [0x0f, 0x31];
         let mut mem = vec![0u8; 64];
         mem[..code.len()].copy_from_slice(&code);
 
-        let mut fused = Cpu386::default();
-        fused.load_segment_real(SegmentIndex::Cs, 0);
-        fused.registers.eip = 0;
-        let mut fbus = TestBus::with_memory(mem.clone());
-        fused.begin_instruction();
-        fused
-            .execute_instruction_legacy(&mut fbus)
-            .expect("RDTSC must run on the fused reference");
-
         let mut split = Cpu386::default();
         split.load_segment_real(SegmentIndex::Cs, 0);
         split.registers.eip = 0;
+        split.elapsed_clocks = 42;
         let mut sbus = TestBus::with_memory(mem);
         exec_one_split(&mut split, &mut sbus).expect("RDTSC must run through the split convention");
 
-        assert_eq!(split.registers.eip, fused.registers.eip, "eip must match");
-        assert_eq!(split.registers.gpr, fused.registers.gpr, "gpr must match");
+        assert_eq!(
+            split.registers.eip, 0x2,
+            "eip must advance past both opcode bytes"
+        );
+        // RDTSC writes the running counter into EDX:EAX; with 42 clocks elapsed EAX reads it back.
+        assert_eq!(split.registers.edx(), 0, "TSC high dword");
+        assert_eq!(split.registers.eax(), 42, "TSC low dword = elapsed clocks");
         assert_eq!(
             seam_fetch_count(&sbus),
-            seam_fetch_count(&fbus),
-            "the convention must charge the same fetches as the fused path (no second-byte re-read)"
+            3,
+            "the convention must charge the second 0F byte exactly once (no re-read)"
         );
     }
 
@@ -14284,6 +14098,190 @@ mod tests {
         assert!(
             run_at_level(&code, CpuLevel::I486).is_ok(),
             "BSWAP must run at I486"
+        );
+    }
+
+    /// The single-byte opcode values that the production split does NOT hand to a real group: every
+    /// prefix byte `read_prefixes` consumes (the six segment overrides, the 66h/67h operand/address-
+    /// size prefixes, LOCK 0xF0, and REP/REPNE 0xF3/0xF2) and 0x0F (the two-byte escape), none of
+    /// which is an instruction on its own — `read_prefixes`/`decode` consume them before
+    /// `route_group` ever classifies the following opcode, so reaching them AS an opcode is a decode
+    /// bug — plus 0x63 (ARPL) and 0xF1 (ICEBP/INT1), which are genuinely unimplemented. Everything
+    /// else in the single-byte space is implemented and MUST route to a real group. This list is the
+    /// sole authority for "not routed as a single-byte opcode"; the coverage test below derives the
+    /// implemented set as its complement.
+    const UNIMPLEMENTED_SINGLE_BYTE: &[u8] = &[
+        0x26, 0x2e, 0x36, 0x3e, 0x64, 0x65, // segment-override prefix bytes
+        0x66, 0x67, // operand-size / address-size prefix bytes
+        0xf0, 0xf2, 0xf3, // LOCK / REPNE / REP prefix bytes
+        0x0f, // two-byte (0F) escape: folded into 0x0F00 | second by `decode`, never routed bare
+        0x63, // ARPL (unimplemented)
+        0xf1, // ICEBP / INT1 (unimplemented)
+    ];
+
+    /// True when the second byte of a 0F opcode names an IMPLEMENTED two-byte instruction. The
+    /// complement (within 0x00..=0xff) is the un-implemented 0F space that MUST stay on
+    /// `TwoByteFallback` and #UD. Built from the routed sets in `route_group` plus the no-operand
+    /// 0F ops `execute_two_byte` still handles directly (which `route_group` sends to `Misc`).
+    fn implemented_two_byte(second: u8) -> bool {
+        // The 0F bytes `route_group` classifies into a real group (DataMove/Branch/BitManip/
+        // CondMove/SystemSeg/Misc), mirrored exactly from the 0F arm of `route_group`.
+        let routed = matches!(
+            second,
+            // MOVZX/MOVSX (DataMove)
+            0xb6 | 0xb7 | 0xbe | 0xbf
+            // Jcc near (Branch)
+            | 0x80..=0x8f
+            // BitManip
+            | 0xa3 | 0xab | 0xb3 | 0xbb | 0xba | 0xbc | 0xbd | 0xa4 | 0xa5 | 0xac | 0xad
+            | 0xb0 | 0xb1 | 0xc0 | 0xc1
+            // CMOVcc / SETcc / IMUL (CondMove)
+            | 0x40..=0x4f | 0x90..=0x9f | 0xaf
+            // SystemSeg
+            | 0x00 | 0x01 | 0x02 | 0x03 | 0x06 | 0x20 | 0x22
+            // no-operand system/serializing/CPU-id + CMPXCHG8B + BSWAP (Misc)
+            | 0x05 | 0x07 | 0x08 | 0x09 | 0x30 | 0x31 | 0x32 | 0xa2 | 0xc7 | 0xc8..=0xcf
+        );
+        routed || is_mmx_two_byte(second)
+    }
+
+    #[test]
+    fn every_implemented_opcode_routes_off_the_legacy_fallback() {
+        // Stage-A invariant lock: after the transitional fused fallback is gone, the production
+        // `decode`/`execute_decoded` seam must hand EVERY implemented opcode to a dedicated split
+        // group. `DecodeGroup::Fallback`/`TwoByteFallback` are the only two variants whose executor
+        // raises `Unsupported{,TwoByte}Opcode`, so proving every implemented opcode routes to some
+        // OTHER variant proves production never enters the dead-end fallback for a real instruction.
+        //
+        // Exhaustive partition (no representative sampling): classify the entire single-byte and
+        // two-byte opcode space and check the implemented/unimplemented split against the authority
+        // lists above. A future edit that drops an implemented opcode back to Fallback, or adds an
+        // opcode without routing it, fails here.
+        let prefixes = Prefixes::default();
+
+        for byte in 0x00u16..=0xff {
+            let unimplemented = UNIMPLEMENTED_SINGLE_BYTE.contains(&(byte as u8));
+            let group = Cpu386::route_group(byte, prefixes);
+            let is_fallback = matches!(group, DecodeGroup::Fallback);
+            assert!(
+                !matches!(group, DecodeGroup::TwoByteFallback),
+                "single-byte opcode {byte:#04x} must never route to TwoByteFallback"
+            );
+            if unimplemented {
+                assert!(
+                    is_fallback,
+                    "unimplemented single-byte opcode {byte:#04x} must stay on Fallback, got {group:?}"
+                );
+            } else {
+                assert!(
+                    !is_fallback,
+                    "implemented single-byte opcode {byte:#04x} must route off Fallback to a real group"
+                );
+            }
+        }
+
+        for second in 0x00u16..=0xff {
+            // `decode` folds the second byte into the opcode as 0x0F00 | second.
+            let opcode = 0x0f00 | second;
+            let group = Cpu386::route_group(opcode, prefixes);
+            let is_two_byte_fallback = matches!(group, DecodeGroup::TwoByteFallback);
+            assert!(
+                !matches!(group, DecodeGroup::Fallback),
+                "two-byte opcode 0F {second:#04x} must route via the 0F map, never plain Fallback"
+            );
+            if implemented_two_byte(second as u8) {
+                assert!(
+                    !is_two_byte_fallback,
+                    "implemented two-byte opcode 0F {second:#04x} must route off TwoByteFallback to a real group"
+                );
+            } else {
+                assert!(
+                    is_two_byte_fallback,
+                    "unimplemented two-byte opcode 0F {second:#04x} must stay on TwoByteFallback, got {group:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fallback_path_is_reached_only_by_unimplemented_opcodes_and_still_uds() {
+        // The runtime companion to the routing-partition test: drive each genuinely-unimplemented
+        // opcode through the production split (`exec_one_split` -> `decode` -> `execute_decoded`) and
+        // confirm the ONLY behavior the Fallback / TwoByteFallback arms produce is the exact
+        // `Unsupported{,TwoByte}Opcode` #UD the legacy fused path produced — same error variant,
+        // carrying the same `cs`. This proves the fallback arms are a pure dead-end for real
+        // instructions: nothing implemented can reach them, and the unimplemented ones still #UD.
+        for &op in UNIMPLEMENTED_SINGLE_BYTE {
+            // The eight prefix bytes are valid as prefixes; they only #UD when they are the whole
+            // instruction (no following opcode), which `read_prefixes` reaches end-of-stream on at
+            // I286 but treats as a real prefix at I586. To exercise the Fallback opcode arm we need a
+            // byte that is an *opcode*, never a prefix: ARPL (0x63) and ICEBP (0xf1). The prefix
+            // bytes are covered by the routing-partition test above and the dedicated #UD guards.
+            if matches!(op, 0x63 | 0xf1) {
+                let mut cpu = Cpu386::default();
+                cpu.load_segment_real(SegmentIndex::Cs, 0);
+                cpu.registers.eip = 0;
+                let mut bus = TestBus::with_memory(vec![op, 0, 0, 0]);
+                let err = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+                assert!(
+                    matches!(
+                        err,
+                        InternalFault::Cpu(CpuError::UnsupportedOpcode { opcode, cs, .. })
+                            if opcode == op && cs == 0
+                    ),
+                    "single-byte opcode {op:#04x} must #UD as UnsupportedOpcode, got {err:?}"
+                );
+            }
+        }
+
+        // A representative un-implemented 0F byte from each kind of gap that falls through to the
+        // generic catch-all: 0x0a (unmapped), 0x21 (MOV reg,DR), 0x23 (MOV DR,reg), 0xb2 (LSS),
+        // 0xb4 (LFS), 0xb5 (LGS). Each routes to TwoByteFallback and #UDs as UnsupportedTwoByteOpcode.
+        // (0F AA RSM also routes to TwoByteFallback but is an EXPLICITLY handled arm in
+        // `execute_two_byte` that #UDs with vector 6 because no SMM is modeled — it is "implemented",
+        // just always invalid — so it is not part of this generic-catch-all sweep.)
+        for second in [0x0au8, 0x21, 0x23, 0xb2, 0xb4, 0xb5] {
+            assert!(
+                !implemented_two_byte(second),
+                "test bug: 0F {second:#04x} is actually implemented"
+            );
+            let mut cpu = Cpu386::default();
+            cpu.load_segment_real(SegmentIndex::Cs, 0);
+            cpu.registers.eip = 0;
+            let mut bus = TestBus::with_memory(vec![0x0f, second, 0xc0, 0, 0]);
+            let err = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    InternalFault::Cpu(CpuError::UnsupportedTwoByteOpcode { opcode, cs, .. })
+                        if opcode == second && cs == 0
+                ),
+                "two-byte opcode 0F {second:#04x} must #UD as UnsupportedTwoByteOpcode, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn single_byte_f1_is_an_undefined_opcode() {
+        // 0xF1 (ICEBP / INT1) is not implemented as a single-byte opcode. It must #UD through the
+        // production split exactly like ARPL (0x63): `route_group` leaves it on Fallback and the
+        // Fallback arm raises UnsupportedOpcode. Dedicated guard alongside the ARPL/prefix-byte
+        // #UD tests so a future edit that mis-routes 0xF1 is caught here.
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(vec![0xf1, 0, 0, 0]);
+        let err = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                InternalFault::Cpu(CpuError::UnsupportedOpcode {
+                    opcode: 0xf1,
+                    cs: 0,
+                    eip: 0
+                })
+            ),
+            "0xF1 must raise UnsupportedOpcode at CS:EIP 0:0, got {err:?}"
         );
     }
 
@@ -14841,11 +14839,16 @@ mod tests {
             seam_seed(&mut fused);
             let mut fbus = TestBus::with_memory(mem);
             fused.begin_instruction();
-            // The fused reference is the source of truth. If it errors, the group's fused arm is
-            // gone from THIS checkout: re-run from the base commit instead of pasting bad output.
-            if fused.execute_instruction_legacy(&mut fbus).is_err() {
+            // Stage A removed the in-tree fused reference (`execute_instruction_legacy`), so this
+            // checkout's regen captures from the production split instead — which is tautological for
+            // catching split bugs (the goldens it prints are exactly what the split now produces).
+            // Only use an in-checkout regen run to RE-derive goldens after an intentional behavior
+            // change; to capture an INDEPENDENT reference, run this test from a pre-Stage-A worktree
+            // (see the recipe on the cases fn). A case the split can't execute prints a TODO marker
+            // rather than a wrong literal.
+            if exec_one_split(&mut fused, &mut fbus).is_err() {
                 println!(
-                    "            // TODO regen {}: fused path unavailable here; run from base commit 332be72",
+                    "            // TODO regen {}: opcode not executable here; run from a pre-Stage-A worktree",
                     g.name
                 );
                 continue;
@@ -15167,7 +15170,7 @@ mod tests {
             seam_seed(&mut fused);
             let mut fbus = TestBus::with_memory(mem);
             fused.begin_instruction();
-            if fused.execute_instruction_legacy(&mut fbus).is_err() {
+            if exec_one_split(&mut fused, &mut fbus).is_err() {
                 println!(
                     "            // TODO regen {}: fused path unavailable here; run before deleting the fused arms",
                     g.name
@@ -15348,7 +15351,7 @@ mod tests {
             let initial = mem.clone();
             let mut fbus = TestBus::with_memory(mem);
             fused.begin_instruction();
-            if fused.execute_instruction_legacy(&mut fbus).is_err() {
+            if exec_one_split(&mut fused, &mut fbus).is_err() {
                 println!(
                     "            // TODO regen {}: fused path unavailable here; run before deleting the fused arms",
                     g.name
@@ -16850,7 +16853,7 @@ mod tests {
             stack_seed(&mut fused);
             let mut fbus = TestBus::with_memory(mem);
             fused.begin_instruction();
-            if fused.execute_instruction_legacy(&mut fbus).is_err() {
+            if exec_one_split(&mut fused, &mut fbus).is_err() {
                 println!(
                     "            // TODO regen {}: fused path unavailable here; run before deleting fused arms",
                     g.name
@@ -17198,7 +17201,7 @@ mod tests {
             group_seed(&mut fused);
             let mut fbus = TestBus::with_memory(mem);
             fused.begin_instruction();
-            if fused.execute_instruction_legacy(&mut fbus).is_err() {
+            if exec_one_split(&mut fused, &mut fbus).is_err() {
                 println!(
                     "            // TODO regen {}: fused path unavailable here; run before deleting fused arms",
                     g.name
@@ -17527,7 +17530,7 @@ mod tests {
             branch_seed(&mut fused, g.cx);
             let mut fbus = TestBus::with_memory(mem);
             fused.begin_instruction();
-            if fused.execute_instruction_legacy(&mut fbus).is_err() {
+            if exec_one_split(&mut fused, &mut fbus).is_err() {
                 println!(
                     "            // TODO regen {}: fused path unavailable here; run against the base commit",
                     g.name
@@ -17843,7 +17846,7 @@ mod tests {
             controlflow_seed(&mut fused);
             let mut fbus = TestBus::with_memory(mem);
             fused.begin_instruction();
-            if fused.execute_instruction_legacy(&mut fbus).is_err() {
+            if exec_one_split(&mut fused, &mut fbus).is_err() {
                 println!(
                     "            // TODO regen {}: fused path unavailable here; run against the base commit",
                     g.name
@@ -18159,7 +18162,7 @@ mod tests {
             flags_misc_seed(&mut fused);
             let mut fbus = TestBus::with_memory(mem);
             fused.begin_instruction();
-            if fused.execute_instruction_legacy(&mut fbus).is_err() {
+            if exec_one_split(&mut fused, &mut fbus).is_err() {
                 println!(
                     "            // TODO regen {}: fused path unavailable here; run against the base commit",
                     g.name
@@ -18565,7 +18568,7 @@ mod tests {
             (g.regs)(&mut fused);
             let mut fbus = TestBus::with_memory(mem);
             fused.begin_instruction();
-            if fused.execute_instruction_legacy(&mut fbus).is_err() {
+            if exec_one_split(&mut fused, &mut fbus).is_err() {
                 println!(
                     "            // TODO regen {}: fused path unavailable here; run against the base commit",
                     g.name
@@ -18749,7 +18752,7 @@ mod tests {
             seam_seed(&mut fused);
             let mut fbus = TestBus::with_memory(mem);
             fused.begin_instruction();
-            if fused.execute_instruction_legacy(&mut fbus).is_err() {
+            if exec_one_split(&mut fused, &mut fbus).is_err() {
                 println!(
                     "            // TODO regen {}: fused path unavailable here; run against the base commit",
                     g.name
@@ -19127,7 +19130,7 @@ mod tests {
             bitmanip_case_override(g.name, &mut fused);
             let mut fbus = TestBus::with_memory(mem);
             fused.begin_instruction();
-            if fused.execute_instruction_legacy(&mut fbus).is_err() {
+            if exec_one_split(&mut fused, &mut fbus).is_err() {
                 println!(
                     "            // TODO regen {}: fused path unavailable here; run against the base commit",
                     g.name
@@ -19373,7 +19376,7 @@ mod tests {
             condmove_seed(&mut fused);
             let mut fbus = TestBus::with_memory(mem);
             fused.begin_instruction();
-            if fused.execute_instruction_legacy(&mut fbus).is_err() {
+            if exec_one_split(&mut fused, &mut fbus).is_err() {
                 println!(
                     "            // TODO regen {}: fused path unavailable here; run against the base commit",
                     g.name
@@ -20011,7 +20014,7 @@ mod tests {
             system_seg_case_override(g.name, &mut fused);
             let mut fbus = TestBus::with_memory(mem);
             fused.begin_instruction();
-            if fused.execute_instruction_legacy(&mut fbus).is_err() {
+            if exec_one_split(&mut fused, &mut fbus).is_err() {
                 println!(
                     "            // TODO regen {}: fused path unavailable here; run against the base commit",
                     g.name
@@ -20505,7 +20508,7 @@ mod tests {
             fpu_seed(&mut fused);
             let mut fbus = TestBus::with_memory(mem);
             fused.begin_instruction();
-            if fused.execute_instruction_legacy(&mut fbus).is_err() {
+            if exec_one_split(&mut fused, &mut fbus).is_err() {
                 println!(
                     "            // TODO regen {}: fused path unavailable here; run against the base commit",
                     g.name
@@ -21051,7 +21054,7 @@ mod tests {
             misc_seed(&mut fused);
             let mut fbus = TestBus::with_memory(mem);
             fused.begin_instruction();
-            if fused.execute_instruction_legacy(&mut fbus).is_err() {
+            if exec_one_split(&mut fused, &mut fbus).is_err() {
                 println!(
                     "            // TODO regen {}: fused path unavailable here; run against the base commit",
                     g.name
