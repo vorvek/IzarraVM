@@ -1951,6 +1951,13 @@ impl Machine {
         }
     }
 
+    /// Inject a scroll-wheel detent as a PS/2 packet (IntelliMouse 4-byte mode).
+    pub fn inject_mouse_wheel(&mut self, dz: i32) {
+        if self.keyboard.inject_mouse_wheel(dz) {
+            self.pic.request(12);
+        }
+    }
+
     /// Map the GUI's absolute captured pointer onto relative aux-device motion.
     /// The host pointer is clamped to the virtual space; the delta against the
     /// previous position drives a PS/2 packet through the 8042, so the guest

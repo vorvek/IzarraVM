@@ -1,14 +1,18 @@
 //! PS/2 auxiliary (mouse) device, as the 8042 controller multiplexes it.
-//! Tracks the reporting enable, the queued data bytes, and the
-//! sample-rate/resolution/scaling state the driver sets up during detection.
+//! Models a Microsoft IntelliMouse: it powers up as a standard three-byte mouse
+//! (id 0x00) and switches to four-byte wheel mode (id 0x03) once the driver
+//! plays the 200/100/80 sample-rate "magic knock". A reset or set-defaults drops
+//! it back to three bytes. Tracks the reporting enable, the queued data bytes,
+//! and the sample-rate/resolution/scaling state the driver sets up during
+//! detection.
 
 use std::collections::VecDeque;
 
-/// A standard PS/2 (three-byte) mouse. Tracks the reporting enable, the queued
-/// data bytes, and the sample-rate/resolution/scaling state the driver sets up
-/// during detection. Movement and button changes queue a three-byte packet and
-/// (when reporting is on) raise IRQ12 through the controller.
-#[derive(Debug, Clone, PartialEq)]
+/// The PS/2 mouse device state. Movement and button changes queue a packet
+/// (three bytes, or four with a Z wheel byte in IntelliMouse mode) and, when
+/// reporting is on, raise IRQ12 through the controller. The sample-rate history
+/// detects the IntelliMouse knock, which flips `intellimouse`/`device_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Ps2Mouse {
     pub(crate) queue: VecDeque<u8>, // bytes waiting to be moved into the aux output buffer
     pub(crate) reporting: bool,     // data-reporting enabled (command 0xF4 on / 0xF5 off)
@@ -17,6 +21,9 @@ pub(crate) struct Ps2Mouse {
     scaling_2to1: bool,             // 2:1 scaling (0xE7 on / 0xE6 off)
     buttons: u8,                    // current button bitmask (bit0 left, bit1 right, bit2 middle)
     expecting_data: Option<u8>,     // a mouse command awaiting its parameter byte
+    device_id: u8,                  // 0x00 standard, 0x03 IntelliMouse (set by the knock)
+    intellimouse: bool,             // four-byte wheel mode enabled
+    rate_history: [u8; 3],          // last three 0xF3 sample rates (for the magic knock)
 }
 
 impl Default for Ps2Mouse {
@@ -29,6 +36,9 @@ impl Default for Ps2Mouse {
             scaling_2to1: false,
             buttons: 0,
             expecting_data: None,
+            device_id: 0x00,
+            intellimouse: false,
+            rate_history: [0; 3],
         }
     }
 }
@@ -41,7 +51,14 @@ impl Ps2Mouse {
         if let Some(cmd) = self.expecting_data.take() {
             match cmd {
                 // 0xF3 set sample rate, 0xE8 set resolution: record the parameter.
-                0xF3 => self.sample_rate = value,
+                0xF3 => {
+                    self.sample_rate = value;
+                    self.rate_history = [self.rate_history[1], self.rate_history[2], value];
+                    if self.rate_history == [200, 100, 80] {
+                        self.device_id = 0x03;
+                        self.intellimouse = true;
+                    }
+                }
                 0xE8 => self.resolution = value,
                 _ => {}
             }
@@ -55,6 +72,9 @@ impl Ps2Mouse {
                 self.sample_rate = 100;
                 self.resolution = 2;
                 self.scaling_2to1 = false;
+                self.device_id = 0x00;
+                self.intellimouse = false;
+                self.rate_history = [0; 3];
                 self.queue.push_back(0xFA);
                 self.queue.push_back(0xAA);
                 self.queue.push_back(0x00);
@@ -65,6 +85,9 @@ impl Ps2Mouse {
                 self.sample_rate = 100;
                 self.resolution = 2;
                 self.scaling_2to1 = false;
+                self.device_id = 0x00;
+                self.intellimouse = false;
+                self.rate_history = [0; 3];
                 self.queue.push_back(0xFA);
             }
             0xF4 => {
@@ -104,19 +127,27 @@ impl Ps2Mouse {
                 self.queue.push_back(self.sample_rate);
             }
             0xF2 => {
-                // Get device id: ACK then 0x00 (standard PS/2 mouse).
+                // Get device id: ACK then 0x00 (standard) or 0x03 (IntelliMouse).
                 self.queue.push_back(0xFA);
-                self.queue.push_back(0x00);
+                self.queue.push_back(self.device_id);
             }
             _ => self.queue.push_back(0xFA), // ack anything else
         }
     }
 
-    /// Queue a standard three-byte movement packet for `dx`/`dy` (host pixels,
-    /// y down positive) and the button mask. Returns true if reporting is enabled
-    /// so the controller can raise IRQ12. Movement while reporting is off is
-    /// dropped, matching a real mouse that holds its line idle until enabled.
-    pub(crate) fn queue_movement(&mut self, dx: i32, dy: i32, buttons: u8) -> bool {
+    /// The current button bitmask (bit0 left, bit1 right, bit2 middle), so a
+    /// wheel-only injection can reuse it instead of clearing the buttons.
+    pub(crate) fn current_buttons(&self) -> u8 {
+        self.buttons
+    }
+
+    /// Queue a movement packet for `dx`/`dy` (host pixels, y down positive), the
+    /// button mask, and `dz` (wheel detents). The packet is three bytes for a
+    /// standard mouse, or four (with a signed Z byte) in IntelliMouse mode.
+    /// Returns true if reporting is enabled so the controller can raise IRQ12.
+    /// Movement while reporting is off is dropped, matching a real mouse that
+    /// holds its line idle until enabled.
+    pub(crate) fn queue_movement(&mut self, dx: i32, dy: i32, buttons: u8, dz: i32) -> bool {
         self.buttons = buttons & 0x07;
         if !self.reporting {
             return false;
@@ -135,6 +166,63 @@ impl Ps2Mouse {
         self.queue.push_back(byte0);
         self.queue.push_back((cx & 0xff) as u8);
         self.queue.push_back((cy & 0xff) as u8);
+        if self.intellimouse {
+            let cz = dz.clamp(-8, 7) as i8; // signed wheel detent
+            self.queue.push_back(cz as u8);
+        }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn magic_knock_switches_to_intellimouse() {
+        let mut m = Ps2Mouse::default();
+        for rate in [200u8, 100, 80] {
+            m.write_byte(0xF3); // set sample rate
+            m.queue.clear(); // drop the ACK
+            m.write_byte(rate); // the parameter
+            m.queue.clear();
+        }
+        m.write_byte(0xF2); // get device id
+        assert_eq!(m.queue.pop_front(), Some(0xFA)); // ACK
+        assert_eq!(m.queue.pop_front(), Some(0x03)); // IntelliMouse id
+    }
+
+    #[test]
+    fn intellimouse_packet_is_four_bytes_with_z() {
+        let mut m = Ps2Mouse::default();
+        for rate in [200u8, 100, 80] {
+            m.write_byte(0xF3);
+            m.write_byte(rate);
+        }
+        m.queue.clear();
+        m.reporting = true;
+        assert!(m.queue_movement(0, 0, 0, -1)); // dz = -1
+        assert_eq!(m.queue.len(), 4);
+        let _b0 = m.queue.pop_front().unwrap();
+        let _x = m.queue.pop_front().unwrap();
+        let _y = m.queue.pop_front().unwrap();
+        assert_eq!(m.queue.pop_front().unwrap() as i8, -1); // Z byte
+    }
+
+    #[test]
+    fn reset_drops_back_to_three_byte() {
+        let mut m = Ps2Mouse::default();
+        for rate in [200u8, 100, 80] {
+            m.write_byte(0xF3);
+            m.write_byte(rate);
+        }
+        m.write_byte(0xFF); // reset
+        m.queue.clear();
+        m.write_byte(0xF2);
+        assert_eq!(m.queue.pop_front(), Some(0xFA));
+        assert_eq!(m.queue.pop_front(), Some(0x00)); // back to standard id
+        m.reporting = true;
+        assert!(m.queue_movement(1, 1, 0, 0));
+        assert_eq!(m.queue.len(), 3); // 3-byte packet again
     }
 }

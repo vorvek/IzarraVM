@@ -59,7 +59,16 @@ impl Keyboard8042 {
     /// button mask. Queues a PS/2 packet and latches the first byte when data
     /// reporting is enabled. Returns true if that should pulse IRQ12.
     pub fn inject_mouse(&mut self, dx: i32, dy: i32, buttons: u8) -> bool {
-        let reporting = self.mouse.queue_movement(dx, dy, buttons);
+        let reporting = self.mouse.queue_movement(dx, dy, buttons, 0);
+        self.latch_next();
+        reporting && self.irq12_armed
+    }
+
+    /// Inject a wheel detent: a Z-only PS/2 packet (no motion, buttons unchanged).
+    /// Returns true if reporting is on so the caller can raise IRQ12.
+    pub fn inject_mouse_wheel(&mut self, dz: i32) -> bool {
+        let buttons = self.mouse.current_buttons();
+        let reporting = self.mouse.queue_movement(0, 0, buttons, dz);
         self.latch_next();
         reporting && self.irq12_armed
     }
