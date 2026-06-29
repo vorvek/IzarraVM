@@ -402,6 +402,130 @@ impl KateaVolume {
     }
 }
 
+/// The system payload pulled back out of a whole-disk FAT32 image: the two boot
+/// sectors and the root files in directory order. Feeding `mbr`/`vbr` and the
+/// files (as `InMemory`) back into `KateaVolume::new` reproduces the image.
+#[derive(Debug)]
+pub struct SystemPayload {
+    /// LBA 0: the MBR (with its partition entry and 0x55AA signature).
+    pub mbr: [u8; SECTOR],
+    /// The FAT32 VBR at `PART_START`.
+    pub vbr: [u8; SECTOR],
+    /// Root-directory files in directory order as `(8.3 name, contents)`.
+    pub files: Vec<(String, Vec<u8>)>,
+}
+
+/// Pull the system payload back out of a whole-disk FAT32 image laid out exactly
+/// like `tokados-hdd.img` — the inverse of `KateaVolume::new`. Returns the MBR
+/// (LBA 0), the partition's VBR (the sector at `PART_START`), and the root files
+/// in directory order.
+///
+/// This reads the BPB straight from the image rather than trusting the module
+/// constants, so a malformed or unexpected image surfaces as a panic here rather
+/// than a silent mismatch: it reads RESERVED, NUM_FATS, FATSz32, RootClus, and
+/// spc out of the VBR and walks the on-disk FAT chains, concatenating cluster
+/// bytes truncated to each entry's file size. LFN (attr 0x0F), volume-label
+/// (attr bit 0x08), free (0x00), and deleted (0xE5) entries are skipped.
+///
+/// Panics only on a truncated/garbled image (the embedded one is well formed, and
+/// the round-trip test guards regressions).
+pub fn extract_system_payload(image: &[u8]) -> SystemPayload {
+    let sector = |lba: u32| -> &[u8] {
+        let off = lba as usize * SECTOR;
+        image
+            .get(off..off + SECTOR)
+            .unwrap_or_else(|| panic!("katea: image too short for LBA {lba}"))
+    };
+    let le16 = |s: &[u8], at: usize| u16::from_le_bytes([s[at], s[at + 1]]);
+    let le32 = |s: &[u8], at: usize| u32::from_le_bytes([s[at], s[at + 1], s[at + 2], s[at + 3]]);
+
+    let mut mbr = [0u8; SECTOR];
+    mbr.copy_from_slice(sector(0));
+
+    // The partition start is in the MBR partition entry (RelSect); fall back to the
+    // constant only as a sanity check — they must agree for our own image.
+    let part_start = le32(&mbr, 0x1BE + 8);
+    debug_assert_eq!(part_start, PART_START, "MBR partition start != PART_START");
+
+    let mut vbr = [0u8; SECTOR];
+    vbr.copy_from_slice(sector(part_start));
+
+    // BPB fields, read from the on-disk VBR.
+    let reserved = le16(&vbr, 0x0E);
+    let num_fats = vbr[0x10];
+    let fatsz = le32(&vbr, 0x24); // BPB_FATSz32
+    let root_clus = le32(&vbr, 0x2C);
+    let spc = vbr[0x0D];
+
+    let first_data_sector = u32::from(reserved) + u32::from(num_fats) * fatsz;
+    let spc32 = u32::from(spc);
+
+    // The first FAT, partition-relative, used to follow cluster chains.
+    let fat_base = part_start + u32::from(reserved);
+    let fat_entry = |cluster: u32| -> u32 {
+        let byte_off = cluster as usize * 4;
+        let fat_sector = fat_base + (byte_off / SECTOR) as u32;
+        let within = byte_off % SECTOR;
+        le32(sector(fat_sector), within) & 0x0FFF_FFFF
+    };
+    // The absolute LBA of the first sector of a data cluster.
+    let cluster_lba = |cluster: u32| part_start + first_data_sector + (cluster - root_clus) * spc32;
+    // Concatenate a cluster chain's raw bytes, following c -> FAT[c] to EOC.
+    let read_chain = |first: u32| -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut c = first;
+        loop {
+            for s in 0..spc32 {
+                out.extend_from_slice(sector(cluster_lba(c) + s));
+            }
+            let next = fat_entry(c);
+            if next >= 0x0FFF_FFF8 {
+                break;
+            }
+            c = next;
+        }
+        out
+    };
+
+    // Walk the root directory (a cluster chain starting at RootClus), parsing
+    // 32-byte entries.
+    let root_bytes = read_chain(root_clus);
+    let mut files = Vec::new();
+    for entry in root_bytes.chunks_exact(32) {
+        match entry[0] {
+            0x00 => break,    // no further entries in this directory
+            0xE5 => continue, // deleted
+            _ => {}
+        }
+        let attr = entry[11];
+        if attr == 0x0F || attr & 0x08 != 0 {
+            // LFN fragment or the volume label: not a file.
+            continue;
+        }
+        let name = decode_83(&entry[0..11]);
+        let first = (le16(entry, 0x14) as u32) << 16 | le16(entry, 0x1A) as u32;
+        let size = le32(entry, 0x1C);
+        let mut data = read_chain(first);
+        data.truncate(size as usize);
+        files.push((name, data));
+    }
+
+    SystemPayload { mbr, vbr, files }
+}
+
+/// Decode an 11-byte 8.3 directory field ("KERNEL  SYS") into "KERNEL.SYS" — the
+/// inverse of `fold_83`. A blank extension yields just the base name. Re-folding
+/// the result through `fold_83` reproduces the original 11 bytes exactly.
+pub(crate) fn decode_83(raw: &[u8]) -> String {
+    let base = String::from_utf8_lossy(&raw[0..8]).trim_end().to_string();
+    let ext = String::from_utf8_lossy(&raw[8..11]).trim_end().to_string();
+    if ext.is_empty() {
+        base
+    } else {
+        format!("{base}.{ext}")
+    }
+}
+
 /// Read exactly one 512-byte span at `byte_off` from a file's source, zero-padding
 /// the tail past `size`. For `HostFile`, this opens, seeks, and reads on demand —
 /// no whole-file slurp.
@@ -755,5 +879,82 @@ mod tests {
     fn total_sectors_is_the_whole_disk() {
         let vol = KateaVolume::new(&synthetic_mbr(), &synthetic_vbr(), Vec::new());
         assert_eq!(vol.total_sectors(), 98304, "48 MiB whole-disk sector count");
+    }
+
+    /// The extractor pulls the exact system payload back out of the committed,
+    /// proven-bootable image: the five files at their known sizes/first bytes, and
+    /// both boot sectors carrying the 0x55AA signature.
+    #[test]
+    fn extracts_the_embedded_image_payload() {
+        let img = izarravm_firmware::tokados_hdd_img();
+        let payload = extract_system_payload(img);
+
+        assert_eq!(&payload.mbr[510..512], &[0x55, 0xAA], "MBR boot signature");
+        assert_eq!(&payload.vbr[510..512], &[0x55, 0xAA], "VBR boot signature");
+
+        // The files, in directory order, with their known sizes.
+        let by_name: std::collections::HashMap<&str, &Vec<u8>> =
+            payload.files.iter().map(|(n, d)| (n.as_str(), d)).collect();
+        assert_eq!(
+            by_name.get("KERNEL.SYS").map(|d| d.len()),
+            Some(70556),
+            "KERNEL.SYS size"
+        );
+        assert_eq!(
+            by_name.get("COMMAND.COM").map(|d| d.len()),
+            Some(87652),
+            "COMMAND.COM size"
+        );
+        assert!(by_name.contains_key("CONFIG.SYS"), "CONFIG.SYS present");
+        assert!(by_name.contains_key("AUTOEXEC.BAT"), "AUTOEXEC.BAT present");
+        assert!(by_name.contains_key("HELLO.TXT"), "HELLO.TXT present");
+
+        // FreeDOS KERNEL.SYS is a raw binary, not an MZ: it begins with a short
+        // JMP (0xEB) past the embedded BPB — the load-bearing first byte the boot
+        // sector relies on.
+        assert_eq!(
+            by_name.get("KERNEL.SYS").unwrap()[0],
+            0xEB,
+            "KERNEL.SYS begins with a short JMP"
+        );
+    }
+
+    /// The definitive boot de-risk: extracting the committed image and rebuilding a
+    /// `KateaVolume` from it reproduces the proven-bootable disk byte-for-byte,
+    /// every sector. If the facade matches the image the kernel boots, then the
+    /// facade boots. A mismatch reports the exact LBA and the first differing byte.
+    #[test]
+    fn facade_reproduces_the_bootable_image_byte_for_byte() {
+        let img = izarravm_firmware::tokados_hdd_img();
+        let payload = extract_system_payload(img);
+        let volume_files = payload
+            .files
+            .into_iter()
+            .map(|(name, data)| VolumeFile {
+                name,
+                source: FileSource::InMemory(data),
+            })
+            .collect();
+        let vol = KateaVolume::new(&payload.mbr, &payload.vbr, volume_files);
+
+        let total = vol.total_sectors();
+        assert_eq!(
+            img.len(),
+            total as usize * SECTOR,
+            "image length matches the whole-disk sector count"
+        );
+        for lba in 0..total {
+            let got = vol.read_sector(lba);
+            let off = lba as usize * SECTOR;
+            let want = &img[off..off + SECTOR];
+            if got != want {
+                let first_diff = (0..SECTOR).find(|&i| got[i] != want[i]).unwrap();
+                panic!(
+                    "sector mismatch at LBA {lba}: first differing byte {first_diff} \
+                     (facade={:#04x}, image={:#04x})",
+                    got[first_diff], want[first_diff]
+                );
+            }
+        }
     }
 }

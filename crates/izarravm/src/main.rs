@@ -78,6 +78,11 @@ struct Cli {
     headless_boot_floppy: Option<PathBuf>,
     #[arg(long)]
     headless_boot_hdd: Option<PathBuf>,
+    /// Boot the Katea host-folder facade: mount the given directory as C: through
+    /// the real FreeDOS system files, run the BIOS, and print the boot diagnostics.
+    /// The folder's top-level files are surfaced read-only beside the OS.
+    #[arg(long)]
+    hdd_folder: Option<PathBuf>,
     #[arg(long)]
     headless_run: Option<PathBuf>,
     #[arg(long)]
@@ -180,6 +185,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     if let Some(path) = &cli.headless_boot_hdd {
         return run_boot_hdd(path, cli.cycles, &hardware);
+    }
+
+    if let Some(dir) = &cli.hdd_folder {
+        return run_boot_hdd_folder(dir, cli.cycles, &hardware);
     }
 
     let rom = match cli.bios.as_deref() {
@@ -630,6 +639,43 @@ fn run_boot_hdd(
     let cs = machine.cpu().registers.cs().selector;
     let ip = machine.cpu().registers.eip as u16;
     println!("image: {} ({image_len} bytes)", path.display());
+    println!("stop: {stop_reason:?}");
+    println!("CS:IP = {cs:04X}:{ip:04X}");
+    let mut at_7c00 = [0u8; 16];
+    for (offset, byte) in at_7c00.iter_mut().enumerate() {
+        *byte = machine.read_physical_u8(0x7c00 + offset as u32);
+    }
+    let hex: Vec<String> = at_7c00.iter().map(|byte| format!("{byte:02X}")).collect();
+    println!("0000:7C00 = {}", hex.join(" "));
+    if cs < 0xf000 {
+        println!("boot: boot sector is executing outside the BIOS region");
+    } else {
+        println!("boot: still in the BIOS (no boot, or read error)");
+    }
+    print_video_summary(&mut machine);
+    Ok(())
+}
+
+/// Mount a host folder as C: through the Katea facade (real FreeDOS system files
+/// plus the folder's top-level files, read-only), run the BIOS so INT 19h boots
+/// it, and print the same diagnostics as `run_boot_hdd`. The lazy-facade analogue
+/// of the flat-image boot loop.
+fn run_boot_hdd_folder(
+    dir: &Path,
+    cycles: Option<u64>,
+    hardware: &HardwareProfile,
+) -> Result<(), Box<dyn Error>> {
+    let mut machine = Machine::new(
+        MachineProfile::from_hardware_profile(hardware),
+        izarravm_firmware::izarra_bios(),
+    )?;
+    machine.mount_hdd_folder(dir)?;
+    let budget = cycles.unwrap_or(DEFAULT_BOOT_HDD_CYCLES);
+    let stop_reason = machine.run_until_halt_or_cycles(budget)?;
+
+    let cs = machine.cpu().registers.cs().selector;
+    let ip = machine.cpu().registers.eip as u16;
+    println!("folder: {}", dir.display());
     println!("stop: {stop_reason:?}");
     println!("CS:IP = {cs:04X}:{ip:04X}");
     let mut at_7c00 = [0u8; 16];
@@ -1168,6 +1214,70 @@ mod tokados_smoke {
         assert!(
             dir_text.contains("hello"),
             "DIR C: did not list HELLO.TXT off the FAT32 volume.\n{dir_text}"
+        );
+    }
+
+    /// The Katea host-folder facade end-to-end: mount a real host directory as C:
+    /// through `mount_hdd_folder` (the lazy facade, not a flat image), boot the
+    /// real FreeDOS kernel, and confirm it reaches C:\> and lists a file that lives
+    /// only in the host folder. This proves the mount path — system files from the
+    /// committed image + host files folded to 8.3 — boots and reads host files,
+    /// the M0 deliverable.
+    #[test]
+    #[ignore = "boots a full DOS image from a host-folder facade (slow in debug); run with --ignored"]
+    fn katea_host_folder_boots_and_lists_a_host_file() {
+        // A unique scratch folder under the system temp dir, holding one host file
+        // whose 8.3 name (GREETING.TXT -> GREETI~1.TXT) is distinct from the system
+        // files, so spotting it in DIR proves the host folder reached the volume.
+        let dir = std::env::temp_dir().join(format!(
+            "katea_folder_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        std::fs::write(dir.join("GREETING.TXT"), b"hi from the host folder\r\n")
+            .expect("write host file");
+
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .expect("build machine");
+        machine.mount_hdd_folder(&dir).expect("mount host folder");
+        let stop = machine
+            .run_until_halt_or_cycles(500_000_000)
+            .expect("run machine");
+        if let StopReason::CpuError(msg) = &stop {
+            let text = machine.screen_text().as_text();
+            std::fs::remove_dir_all(&dir).ok();
+            panic!("CPU fault during Katea folder boot: {msg}\nstop={stop:?}\n{text}");
+        }
+        let text = machine.screen_text().as_text().to_ascii_lowercase();
+        assert!(
+            text.contains("c:\\>"),
+            "no C:\\> prompt after folder boot (stop={stop:?}).\n{text}"
+        );
+
+        // DIR C: must list the host file, folded to its short name (GREETI~1).
+        for ch in "dir c:\\\r".chars() {
+            for code in ascii_to_set1(ch) {
+                machine.inject_key_scancodes(&[code]);
+            }
+            machine
+                .run_until_halt_or_cycles(5_000_000)
+                .expect("type dir");
+        }
+        machine
+            .run_until_halt_or_cycles(40_000_000)
+            .expect("settle dir");
+        let dir_text = machine.screen_text().as_text().to_ascii_lowercase();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            dir_text.contains("greeti"),
+            "DIR C: did not list the host file off the folder facade.\n{dir_text}"
         );
     }
 }

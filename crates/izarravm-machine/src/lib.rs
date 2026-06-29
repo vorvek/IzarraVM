@@ -1433,6 +1433,70 @@ impl Machine {
         let _ = self.memory.write_u8(0x475, 1); // BDA fixed-disk count
     }
 
+    /// Mount a host folder as the primary master (C:) through the Katea facade: the
+    /// real FreeDOS system files (KERNEL.SYS, COMMAND.COM, CONFIG.SYS, AUTOEXEC.BAT)
+    /// come from the committed bootable image, and the folder's top-level files are
+    /// surfaced read-only beside them so the booted kernel can read host files
+    /// without holding the folder in RAM. M0 is read-only; guest writes are no-ops.
+    ///
+    /// The system files are laid down first (InMemory) so the boot-critical system
+    /// area matches the proven-bootable layout byte-for-byte; host files follow,
+    /// each read lazily from its path. A host file whose 8.3 name would collide with
+    /// a system file is skipped (the system file wins).
+    ///
+    /// ponytail: top-level files only — subdirectory recursion is later (M1+).
+    pub fn mount_hdd_folder(&mut self, dir: &std::path::Path) -> std::io::Result<()> {
+        // The system payload comes from the committed image; HELLO.TXT is the
+        // static demo file, skipped here so the host folder supplies the user files.
+        let payload = katea_volume::extract_system_payload(izarravm_firmware::tokados_hdd_img());
+
+        // The system files come first (InMemory). Their canonical 8.3 names seed
+        // `used` so any later host file with the same folded name collides into a
+        // `~n` suffix and never overwrites a boot-critical file.
+        let mut files = Vec::new();
+        let mut used: Vec<[u8; 11]> = Vec::new();
+        for (name, data) in payload.files {
+            if name.eq_ignore_ascii_case("HELLO.TXT") {
+                continue;
+            }
+            // The extracted names are already canonical 8.3; running them through
+            // unique_name records them in `used` (folding is exact for valid names).
+            fat_name::unique_name(std::path::Path::new(&name), false, &mut used);
+            files.push(VolumeFile {
+                name,
+                source: FileSource::InMemory(data),
+            });
+        }
+
+        // Top-level host files, folded to unique 8.3 names that never collide with
+        // a system name (those seed `used`).
+        let mut entries: Vec<std::fs::DirEntry> =
+            std::fs::read_dir(dir)?.filter_map(Result::ok).collect();
+        // Stable order so the synthesized directory is deterministic across runs.
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let path = entry.path();
+            let meta = entry.metadata()?;
+            if !meta.is_file() {
+                continue; // ponytail: directories/symlinks are out of scope for M0
+            }
+            let name11 = fat_name::unique_name(&path, false, &mut used);
+            files.push(VolumeFile {
+                name: katea_volume::decode_83(&name11),
+                source: FileSource::HostFile {
+                    path,
+                    len: meta.len(),
+                },
+            });
+        }
+
+        let volume = KateaVolume::new(&payload.mbr, &payload.vbr, files);
+        self.ata = Some(ata::AtaDisk::from_host_folder(volume));
+        let _ = self.publish_fixed_disk_parameter_table();
+        let _ = self.memory.write_u8(0x475, 1); // BDA fixed-disk count
+        Ok(())
+    }
+
     /// Mount a synthesized FAT32 volume as drive C: for the DOS absolute-disk
     /// interface. INT 25h reads its sectors; INT 26h writes are write-protected
     /// (the volume is read-only). Build one with `build_fat32`.
@@ -4654,8 +4718,7 @@ impl Machine {
             .ata
             .as_ref()
             .and_then(|d| d.read_lba(0))
-            .filter(|s| s.len() >= 512 && s[510] == 0x55 && s[511] == 0xAA)
-            .map(<[u8]>::to_vec)
+            .filter(|s| s[510] == 0x55 && s[511] == 0xAA)
         {
             self.write_guest_block(BOOT_SECTOR_ADDRESS as u32, &sector0[..512]);
             self.cpu.registers.set_edx(0x80);
@@ -7241,11 +7304,7 @@ impl Machine {
                     return Err(0x0a);
                 }
             } else {
-                let Some(bytes) = self
-                    .ata
-                    .as_ref()
-                    .and_then(|disk| disk.read_lba(sector_lba))
-                    .map(<[u8]>::to_vec)
+                let Some(bytes) = self.ata.as_ref().and_then(|disk| disk.read_lba(sector_lba))
                 else {
                     return Err(0x0b);
                 };
@@ -8128,11 +8187,7 @@ impl Machine {
             let lba = start_lba + u32::from(i);
             let addr = buffer.wrapping_add(u32::from(i) * 512);
             if ah == 0x02 {
-                let data = self
-                    .ata
-                    .as_ref()
-                    .and_then(|d| d.read_lba(lba))
-                    .map(<[u8]>::to_vec);
+                let data = self.ata.as_ref().and_then(|d| d.read_lba(lba));
                 match data {
                     Some(bytes) => self.write_guest_block(addr, &bytes),
                     None => break,
@@ -8204,11 +8259,7 @@ impl Machine {
             let lba = start_lba + u32::from(i);
             let addr = buffer.wrapping_add(u32::from(i) * LONG_SECTOR_BYTES);
             if ah == 0x0A {
-                let data = self
-                    .ata
-                    .as_ref()
-                    .and_then(|d| d.read_lba(lba))
-                    .map(<[u8]>::to_vec);
+                let data = self.ata.as_ref().and_then(|d| d.read_lba(lba));
                 match data {
                     Some(bytes) => {
                         self.write_guest_block(addr, &bytes);
@@ -8366,11 +8417,7 @@ impl Machine {
             let l = lba + u32::from(i);
             let addr = buffer.wrapping_add(u32::from(i) * 512);
             if ah == 0x42 {
-                let data = self
-                    .ata
-                    .as_ref()
-                    .and_then(|d| d.read_lba(l))
-                    .map(<[u8]>::to_vec);
+                let data = self.ata.as_ref().and_then(|d| d.read_lba(l));
                 match data {
                     Some(bytes) => self.write_guest_block(addr, &bytes),
                     None => break,
