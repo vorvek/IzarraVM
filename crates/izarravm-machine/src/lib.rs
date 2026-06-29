@@ -22,6 +22,7 @@ use izarravm_video::{
     VGA_TEXT_MEMORY_SIZE, VGA_TEXT_PAGE_STRIDE, Vga, VgaRaster, VideoMode, bytes_per_pixel, font,
     pixel_format, vbe_mode,
 };
+pub use katea_volume::{FileSource, KateaVolume, VolumeFile};
 use thiserror::Error;
 
 mod ata;
@@ -36,6 +37,7 @@ mod fat_name;
 mod fdc;
 mod floppy;
 mod ide;
+mod katea_volume;
 mod keyboard;
 mod lpt;
 mod memmap;
@@ -1431,6 +1433,70 @@ impl Machine {
         let _ = self.memory.write_u8(0x475, 1); // BDA fixed-disk count
     }
 
+    /// Mount a host folder as the primary master (C:) through the Katea facade: the
+    /// real FreeDOS system files (KERNEL.SYS, COMMAND.COM, CONFIG.SYS, AUTOEXEC.BAT)
+    /// come from the committed bootable image, and the folder's top-level files are
+    /// surfaced read-only beside them so the booted kernel can read host files
+    /// without holding the folder in RAM. M0 is read-only; guest writes are no-ops.
+    ///
+    /// The system files are laid down first (InMemory) so the boot-critical system
+    /// area matches the proven-bootable layout byte-for-byte; host files follow,
+    /// each read lazily from its path. A host file whose 8.3 name would collide with
+    /// a system file is skipped (the system file wins).
+    ///
+    /// ponytail: top-level files only — subdirectory recursion is later (M1+).
+    pub fn mount_hdd_folder(&mut self, dir: &std::path::Path) -> std::io::Result<()> {
+        // The system payload comes from the committed image; HELLO.TXT is the
+        // static demo file, skipped here so the host folder supplies the user files.
+        let payload = katea_volume::extract_system_payload(izarravm_firmware::tokados_hdd_img());
+
+        // The system files come first (InMemory). Their canonical 8.3 names seed
+        // `used` so any later host file with the same folded name collides into a
+        // `~n` suffix and never overwrites a boot-critical file.
+        let mut files = Vec::new();
+        let mut used: Vec<[u8; 11]> = Vec::new();
+        for (name, data) in payload.files {
+            if name.eq_ignore_ascii_case("HELLO.TXT") {
+                continue;
+            }
+            // The extracted names are already canonical 8.3; running them through
+            // unique_name records them in `used` (folding is exact for valid names).
+            fat_name::unique_name(std::path::Path::new(&name), false, &mut used);
+            files.push(VolumeFile {
+                name,
+                source: FileSource::InMemory(data),
+            });
+        }
+
+        // Top-level host files, folded to unique 8.3 names that never collide with
+        // a system name (those seed `used`).
+        let mut entries: Vec<std::fs::DirEntry> =
+            std::fs::read_dir(dir)?.filter_map(Result::ok).collect();
+        // Stable order so the synthesized directory is deterministic across runs.
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let path = entry.path();
+            let meta = entry.metadata()?;
+            if !meta.is_file() {
+                continue; // ponytail: directories/symlinks are out of scope for M0
+            }
+            let name11 = fat_name::unique_name(&path, false, &mut used);
+            files.push(VolumeFile {
+                name: katea_volume::decode_83(&name11),
+                source: FileSource::HostFile {
+                    path,
+                    len: meta.len(),
+                },
+            });
+        }
+
+        let volume = KateaVolume::new(&payload.mbr, &payload.vbr, files);
+        self.ata = Some(ata::AtaDisk::from_host_folder(volume));
+        let _ = self.publish_fixed_disk_parameter_table();
+        let _ = self.memory.write_u8(0x475, 1); // BDA fixed-disk count
+        Ok(())
+    }
+
     /// Mount a synthesized FAT32 volume as drive C: for the DOS absolute-disk
     /// interface. INT 25h reads its sectors; INT 26h writes are write-protected
     /// (the volume is read-only). Build one with `build_fat32`.
@@ -1440,9 +1506,15 @@ impl Machine {
 
     /// Eject the hard disk, returning its current image bytes (including any
     /// in-session writes) so the caller can flush them back. None when no disk is
-    /// mounted. Clears the BDA fixed-disk count.
+    /// mounted OR when the disk is a read-only host-folder facade (which has no
+    /// flushable image — returning its empty `bytes()` would persist a 0-byte file).
+    /// Clears the BDA fixed-disk count.
     pub fn eject_hdd(&mut self) -> Option<Vec<u8>> {
-        let bytes = self.ata.take().map(|d| d.bytes().to_vec());
+        let bytes = self
+            .ata
+            .take()
+            .filter(ata::AtaDisk::is_image)
+            .map(|d| d.bytes().to_vec());
         let _ = self.clear_fixed_disk_parameter_table();
         let _ = self.memory.write_u8(0x475, 0);
         bytes
@@ -4645,6 +4717,21 @@ impl Machine {
             self.set_cs_ip(0x0000, BOOT_SECTOR_ADDRESS as u16);
             return;
         }
+        // Fixed disk (Katea ATA primary master): boot from LBA 0 if it carries a
+        // boot signature. Unlike the floppy path, INT 13h stays intercepted so
+        // Katea keeps serving disk I/O to the booted OS. DL=80h = first fixed disk.
+        if let Some(sector0) = self
+            .ata
+            .as_ref()
+            .and_then(|d| d.read_lba(0))
+            .filter(|s| s[510] == 0x55 && s[511] == 0xAA)
+        {
+            self.write_guest_block(BOOT_SECTOR_ADDRESS as u32, &sector0[..512]);
+            self.cpu.registers.set_edx(0x80);
+            self.booter_inert = true;
+            self.set_cs_ip(0x0000, BOOT_SECTOR_ADDRESS as u16);
+            return;
+        }
         // No bootable floppy: try the C: Toka-DOS HLE boot. A zero status means the
         // boot record landed at 0x7C00 and the DOS base is set up; jump to it.
         if self.toka_load_boot_record() == 0 {
@@ -7223,11 +7310,7 @@ impl Machine {
                     return Err(0x0a);
                 }
             } else {
-                let Some(bytes) = self
-                    .ata
-                    .as_ref()
-                    .and_then(|disk| disk.read_lba(sector_lba))
-                    .map(<[u8]>::to_vec)
+                let Some(bytes) = self.ata.as_ref().and_then(|disk| disk.read_lba(sector_lba))
                 else {
                     return Err(0x0b);
                 };
@@ -8110,11 +8193,7 @@ impl Machine {
             let lba = start_lba + u32::from(i);
             let addr = buffer.wrapping_add(u32::from(i) * 512);
             if ah == 0x02 {
-                let data = self
-                    .ata
-                    .as_ref()
-                    .and_then(|d| d.read_lba(lba))
-                    .map(<[u8]>::to_vec);
+                let data = self.ata.as_ref().and_then(|d| d.read_lba(lba));
                 match data {
                     Some(bytes) => self.write_guest_block(addr, &bytes),
                     None => break,
@@ -8131,6 +8210,19 @@ impl Machine {
                 }
             }
             done += 1;
+        }
+        // A CHS read of LBA 0 (the MBR) to 0000:7C00 is a fixed-disk boot. Mirror
+        // the INT 19h ATA branch: only a sector carrying the 55AA boot signature is
+        // a real OS, so stand the HLE Toka-DOS and IZEMM down (the booted OS then
+        // owns the DOS interrupts via its IVT). Without the signature the boot ROM
+        // falls back to the HLE C: shim, which needs the HLE live, so leave it set.
+        // Unlike the floppy, INT 13h stays intercepted so Katea keeps serving I/O.
+        if ah == 0x02 && done > 0 && start_lba == 0 && buffer == BOOT_SECTOR_ADDRESS as u32 {
+            let signed = self.read_physical_u8(buffer + 510) == 0x55
+                && self.read_physical_u8(buffer + 511) == 0xAA;
+            if signed {
+                self.booter_inert = true;
+            }
         }
         self.set_eax_al(done);
         if done == count {
@@ -8173,11 +8265,7 @@ impl Machine {
             let lba = start_lba + u32::from(i);
             let addr = buffer.wrapping_add(u32::from(i) * LONG_SECTOR_BYTES);
             if ah == 0x0A {
-                let data = self
-                    .ata
-                    .as_ref()
-                    .and_then(|d| d.read_lba(lba))
-                    .map(<[u8]>::to_vec);
+                let data = self.ata.as_ref().and_then(|d| d.read_lba(lba));
                 match data {
                     Some(bytes) => {
                         self.write_guest_block(addr, &bytes);
@@ -8335,11 +8423,7 @@ impl Machine {
             let l = lba + u32::from(i);
             let addr = buffer.wrapping_add(u32::from(i) * 512);
             if ah == 0x42 {
-                let data = self
-                    .ata
-                    .as_ref()
-                    .and_then(|d| d.read_lba(l))
-                    .map(<[u8]>::to_vec);
+                let data = self.ata.as_ref().and_then(|d| d.read_lba(l));
                 match data {
                     Some(bytes) => self.write_guest_block(addr, &bytes),
                     None => break,
@@ -20107,6 +20191,57 @@ mod tests {
             m.cpu.registers.edx() as u8,
             0x80,
             "DL=80h: the C: branch ran"
+        );
+    }
+
+    #[test]
+    fn int19_boots_from_ata_when_no_floppy() {
+        // Booting from a fixed disk (ATA primary master) hands the machine to the
+        // disk's own sector-0 code, so the HLE Toka-DOS stands down exactly the
+        // same way the floppy path does. DL=0x80 signals the first fixed disk.
+        let mut m = int15_machine(16);
+        // Build a minimal 4-sector image with the 0x55AA boot signature.
+        let mut img = vec![0u8; 512 * 4];
+        img[0] = 0xEB; // recognisable first byte
+        img[510] = 0x55;
+        img[511] = 0xAA;
+        m.mount_hdd(img);
+        assert!(!m.booter_inert(), "booter-inert defaults off");
+        m.handle_int19();
+        assert!(
+            m.booter_inert(),
+            "an ATA boot stands the HLE down so the disk owns the DOS interrupts"
+        );
+        assert_eq!(
+            m.cpu.registers.edx() as u8,
+            0x80,
+            "DL=80h: the ATA fixed-disk branch ran"
+        );
+        assert_eq!(
+            m.read_physical_u8(BOOT_SECTOR_ADDRESS as u32),
+            0xEB,
+            "sector 0 byte 0 must land at 0x7C00"
+        );
+    }
+
+    #[test]
+    fn int19_skips_ata_without_boot_signature() {
+        // An ATA disk whose LBA 0 lacks the 0x55AA signature is not bootable: the
+        // ATA branch must fall through (to the C: HLE / int18 path) without copying
+        // sector 0 or standing the HLE down. Tasks 3-5 rely on this fall-through.
+        let mut m = int15_machine(16);
+        let mut img = vec![0u8; 512 * 4];
+        img[0] = 0xEB; // sentinel first byte, but NO 0x55AA signature
+        m.mount_hdd(img);
+        m.handle_int19();
+        assert!(
+            !m.booter_inert(),
+            "an unsigned ATA disk must not stand the HLE down"
+        );
+        assert_ne!(
+            m.read_physical_u8(BOOT_SECTOR_ADDRESS as u32),
+            0xEB,
+            "an unsigned ATA disk's sector 0 must not be copied to 0x7C00"
         );
     }
 

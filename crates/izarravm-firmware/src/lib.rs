@@ -63,6 +63,13 @@ pub const TOKA_DOS_ROM: &[u8] = include_bytes!("../roms/tokados.rom");
 /// the Izarra 3000.
 pub const TOKADOS_IMG: &[u8] = include_bytes!("../roms/tokados.img");
 
+/// The Toka-DOS hard-disk image: a partitioned, bootable FAT32 disk image with a
+/// standard MBR, one primary FAT32-LBA partition, and a complete Toka-DOS system
+/// (KERNEL.SYS, COMMAND.COM, CONFIG.SYS, AUTOEXEC.BAT, HELLO.TXT). Mount with
+/// `Machine::mount_hdd`; INT 19h boots LBA 0 (the MBR), which chains to the
+/// partition's FAT32 VBR. Built by scripts/build-freedos-hdd-image.py.
+pub const TOKADOS_HDD_IMG: &[u8] = include_bytes!("../roms/tokados-hdd.img");
+
 /// The slice of the 2 MB BOOT.rom reserved for Toka-DOS. The BIOS keeps its
 /// 64 KiB and Belunza gets the rest. The fit test fails loudly if the packed
 /// OS ever outgrows this.
@@ -107,6 +114,10 @@ pub fn toka_dos_rom() -> &'static [u8] {
 
 pub fn tokados_img() -> &'static [u8] {
     TOKADOS_IMG
+}
+
+pub fn tokados_hdd_img() -> &'static [u8] {
+    TOKADOS_HDD_IMG
 }
 
 /// The Toka-DOS system files as owned (DOS 8.3 name, bytes) pairs, ready to hand

@@ -160,10 +160,42 @@ boot_entry:
     ; fall through into .disk
 
 .disk:
-    ; Boot Toka-DOS from C:. The C: drive is host-backed, so the "sector" read is
-    ; HLE: ask the machine (Lotura service port 0xE3) to place the Toka-DOS boot
-    ; record at 0000:7C00, then read the status. 0 means it is loaded and the DOS
-    ; base context is ready; anything else means Toka-DOS is not installed.
+    ; Fixed-disk boot. Try a REAL hard-disk (Katea/ATA) boot first: read the MBR
+    ; at CHS(0,0,1) of drive 0x80 to 0000:7C00 and enter it, exactly like the
+    ; floppy path above. The MBR relocates itself and chains to the active
+    ; partition's VBR, which loads the kernel. With no fixed disk present the host
+    ; INT 13h is a no-op that leaves FLAGS untouched, so the preset CF survives as
+    ; "no disk" and we fall through to the HLE Toka-DOS C: shim below. This is what
+    ; lets the real FreeDOS kernel boot from an ATA disk while the legacy host-
+    ; backed C: still works when no disk is attached.
+    xor ax, ax
+    mov es, ax                  ; ES = 0
+    mov bx, 0x7c00             ; ES:BX = 0000:7C00 destination
+    mov ax, 0x0201            ; AH=02 read, AL=01 one sector
+    mov cx, 0x0001            ; CH=0 cylinder, CL=1 sector (1-based)
+    mov dx, 0x0080            ; DH=0 head, DL=80h first fixed disk
+    stc                        ; preset CF: no disk -> host no-op leaves it set
+    int 0x13
+    jc .disk_hle               ; no fixed disk attached: fall back to the HLE shim
+
+    ; MBR read OK. Set DS=ES=0 first (the .read_error fall-through ran boot_status_line,
+    ; which leaves DS pointing at a string segment), so the signature test and the boot
+    ; sector both see segment 0. Then require the 55AA boot signature, exactly like the
+    ; INT 19h ATA branch: a disk with none is not bootable and falls back to the HLE
+    ; Toka-DOS C: shim. DL = first fixed disk so the MBR (and its VBR) know the drive.
+    xor ax, ax
+    mov ds, ax
+    mov es, ax
+    cmp word [0x7dfe], 0xaa55
+    jne .disk_hle
+    mov dl, 0x80
+    jmp 0x0000:0x7c00
+
+.disk_hle:
+    ; No real disk: boot Toka-DOS from the host-backed C: via the HLE. Ask the
+    ; machine (Lotura service port 0xE3) to place the Toka-DOS boot record at
+    ; 0000:7C00, then read the status. 0 means it is loaded and the DOS base
+    ; context is ready; anything else means Toka-DOS is not installed.
     mov al, 0x10                ; LoadBootRecord
     out 0xE3, al
     in  al, 0xE3                ; status: 0 = loaded

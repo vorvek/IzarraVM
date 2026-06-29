@@ -153,8 +153,20 @@ start:
     mov ax, [last_y]
     cmp ax, [base_y]
     jle fail_c_dir                      ; must have moved down (y increased)
+    ; The held left button must coincide with the motion. A button-less driver-init
+    ; event can move the cursor in the gap before the next host injection, so this one
+    ; getpos may show motion without the button. Don't fail on a single sample: keep
+    ; polling within the cap for a sample where the held button and the motion coincide.
+    ; This samples the button over a window, not one cycle point, so the check is robust
+    ; to where the host's per-chunk injection lands in the guest cycle cadence -- any
+    ; boot-path change (e.g. Katea's extra ATA probe on the HLE-C: fallback) shifts that
+    ; cadence and otherwise flips this single-point sample pass<->fail.
     test word [last_btn], 0x0001
-    jz fail_c_btn                       ; left button must be set
+    jnz .btn_held                       ; motion + button together: a good sample
+    dec ecx
+    jnz .poll                           ; retry: keep looking for a button-held sample
+    jmp fail_c_btn                      ; cap hit while moving but never with the button
+.btn_held:
     mov ax, [last_x]
     sub ax, [base_x]                    ; ax = x delta (pixels)
     mov bx, [last_y]

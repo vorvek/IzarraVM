@@ -55,6 +55,19 @@ mod error {
     pub const ABRT: u8 = 0x04; // command aborted
 }
 
+/// Where the disk's sectors come from. A flat image holds the whole disk in RAM
+/// (the today path: a mounted .img); a host-folder facade serves sectors lazily
+/// from a `KateaVolume` over a host directory, so a huge folder never lands in
+/// memory. The facade is read-only in M0: writes are no-ops.
+#[derive(Debug)]
+enum Backing {
+    /// A flat sector array, addressed by `lba * SECTOR`.
+    Image(Vec<u8>),
+    /// A lazy FAT32 view over a host folder. Boxed because `KateaVolume` is large
+    /// relative to the `Vec` it sits beside in the enum.
+    HostFolder(Box<crate::katea_volume::KateaVolume>),
+}
+
 /// What the data port is moving.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -67,10 +80,11 @@ enum Phase {
     DataOut,
 }
 
-/// An image-backed ATA hard disk and its task-file register set.
+/// An ATA hard disk and its task-file register set. The sectors come from either
+/// a flat image or a lazy host-folder facade (see `Backing`).
 #[derive(Debug)]
 pub struct AtaDisk {
-    image: Vec<u8>,
+    backing: Backing,
     cylinders: u32,
     /// True after any guest write, so the host flushes the image back to disk.
     pub dirty: bool,
@@ -115,12 +129,26 @@ impl AtaDisk {
             image.resize(image.len() + pad, 0);
         }
         let total_sectors = (image.len() / SECTOR) as u32;
+        Self::with_backing(Backing::Image(image), total_sectors)
+    }
+
+    /// Mount a lazy host-folder facade as the disk. The geometry is derived from
+    /// the volume's whole-disk sector count, the same way `new` derives it from an
+    /// image length, so the BIOS sees the same CHS translation either way.
+    pub fn from_host_folder(volume: crate::katea_volume::KateaVolume) -> Self {
+        let total_sectors = volume.total_sectors();
+        Self::with_backing(Backing::HostFolder(Box::new(volume)), total_sectors)
+    }
+
+    /// Shared constructor: derive the cylinder count from the sector count and
+    /// initialize the task-file registers to their reset state.
+    fn with_backing(backing: Backing, total_sectors: u32) -> Self {
         // Cylinders fill out whatever the head/track product leaves. At least one
         // so an empty image still presents a one-cylinder disk rather than zero.
         let per_cyl = HEADS * SECTORS_PER_TRACK;
         let cylinders = (total_sectors / per_cyl).max(1);
         Self {
-            image,
+            backing,
             cylinders,
             dirty: false,
             features: 0,
@@ -145,7 +173,10 @@ impl AtaDisk {
 
     /// Total addressable sectors (LBA28 capacity), capped at the 28-bit ceiling.
     pub fn total_sectors(&self) -> u32 {
-        let sectors = (self.image.len() / SECTOR) as u32;
+        let sectors = match &self.backing {
+            Backing::Image(image) => (image.len() / SECTOR) as u32,
+            Backing::HostFolder(volume) => volume.total_sectors(),
+        };
         sectors.min((1 << 28) - 1)
     }
 
@@ -165,24 +196,56 @@ impl AtaDisk {
     }
 
     /// The backing image bytes, including any in-session writes, for flush-back.
+    /// A host-folder facade has no flat image to flush; it returns an empty slice
+    /// and never sets `dirty` (the flush caller is gated on `dirty`), so the empty
+    /// slice is never written back.
     pub fn bytes(&self) -> &[u8] {
-        &self.image
+        match &self.backing {
+            Backing::Image(image) => image,
+            Backing::HostFolder(_) => &[],
+        }
     }
 
-    /// Read one whole 512-byte sector at `lba`, or None if past the end.
-    pub fn read_lba(&self, lba: u32) -> Option<&[u8]> {
-        let off = lba as usize * SECTOR;
-        self.image.get(off..off + SECTOR)
+    /// Whether this disk is a flat image (vs a lazy host-folder facade). Only an
+    /// image has flushable bytes; a folder is read-only with no backing buffer, so
+    /// callers that persist `bytes()` must skip it (see `Machine::eject_hdd`).
+    pub fn is_image(&self) -> bool {
+        matches!(self.backing, Backing::Image(_))
+    }
+
+    /// Read one whole 512-byte sector at `lba`, or None if past the end. The facade
+    /// synthesizes sectors on demand, so this returns an owned array rather than a
+    /// borrow into a backing buffer.
+    pub fn read_lba(&self, lba: u32) -> Option<[u8; SECTOR]> {
+        match &self.backing {
+            Backing::Image(image) => {
+                let off = lba as usize * SECTOR;
+                image.get(off..off + SECTOR).map(|s| {
+                    let mut out = [0u8; SECTOR];
+                    out.copy_from_slice(s);
+                    out
+                })
+            }
+            Backing::HostFolder(volume) => {
+                (lba < volume.total_sectors()).then(|| volume.read_sector(lba))
+            }
+        }
     }
 
     /// Overwrite one whole 512-byte sector at `lba`. Returns false if past the
-    /// end or `data` is short.
+    /// end or `data` is short. A host-folder facade is read-only in M0, so writes
+    /// to it always fail.
     pub fn write_lba(&mut self, lba: u32, data: &[u8]) -> bool {
+        // ponytail: the write-back engine (syncing guest writes to host files) is
+        // M1 work; M0 is read-only, so a folder-backed write is simply rejected.
+        let Backing::Image(image) = &mut self.backing else {
+            return false;
+        };
         let off = lba as usize * SECTOR;
-        if data.len() < SECTOR || off + SECTOR > self.image.len() {
+        if data.len() < SECTOR || off + SECTOR > image.len() {
             return false;
         }
-        self.image[off..off + SECTOR].copy_from_slice(&data[..SECTOR]);
+        image[off..off + SECTOR].copy_from_slice(&data[..SECTOR]);
         self.dirty = true;
         true
     }
@@ -415,7 +478,7 @@ impl AtaDisk {
         let mut buf = Vec::with_capacity(count as usize * SECTOR);
         for l in lba..end {
             match self.read_lba(l) {
-                Some(s) => buf.extend_from_slice(s),
+                Some(s) => buf.extend_from_slice(&s),
                 None => {
                     self.abort();
                     return;

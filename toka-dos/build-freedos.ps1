@@ -65,6 +65,24 @@ if ($LASTEXITCODE -ne 0) { throw "boot sector nasm failed" }
 if ((Get-Item $bootBin).Length -ne 512) { throw "boot sector is not 512 bytes" }
 Write-Host "fat12com.bin: 512 bytes"
 
+# --- FAT32 LBA boot sector (the Katea HDD VBR) ---
+# boot32lb.asm is self-contained (no hdr\ includes) and unconditionally FAT32+LBA
+# (no -dISFAT12); it uses INT 13h AH=42h exclusively. Mirrors boot/makefile.
+$fat32Bin = Join-Path $kdir 'boot\fat32lba.bin'
+& nasm "$kdir\boot\boot32lb.asm" -o $fat32Bin
+if ($LASTEXITCODE -ne 0) { throw "FAT32 LBA boot sector nasm failed" }
+if ((Get-Item $fat32Bin).Length -ne 512) { throw "FAT32 LBA boot sector is not 512 bytes" }
+Write-Host "fat32lba.bin: 512 bytes"
+
+# --- Master Boot Record (the Katea HDD MBR) ---
+# Our minimal standard MBR: scans the partition table for the active entry and
+# chains to its VBR via INT 13h AH=42h. FreeDOS ships no standalone MBR.
+$mbrBin = Join-Path $kdir 'boot\mbr.bin'
+& nasm "$kdir\boot\mbr.asm" -o $mbrBin
+if ($LASTEXITCODE -ne 0) { throw "MBR nasm failed" }
+if ((Get-Item $mbrBin).Length -ne 512) { throw "MBR is not 512 bytes" }
+Write-Host "mbr.bin: 512 bytes"
+
 # --- FreeCOM (English, XMS-swap default) ---
 # Unlike the kernel, FreeCOM's own build.bat works on Win64 *directly* -- so we
 # drive it rather than replicate its stages. Two reasons it's not the kernel's
@@ -160,7 +178,11 @@ if ($LASTEXITCODE) { throw "nasm tokamous failed" }
 if (-not (Test-Path $tokamous)) { throw "TOKAMOUS not produced" }
 Write-Host "TOKAMOUS.COM: $((Get-Item $tokamous).Length) bytes"
 
-# --- Assemble the committed image ---
+# --- Assemble the committed images (FAT12 floppy + FAT32 HDD) ---
 & python (Join-Path $root '..\scripts\build-freedos-image.py')
-if ($LASTEXITCODE -ne 0) { throw "image build failed" }
-Write-Host "Toka-DOS image built: crates/izarravm-firmware/roms/tokados.img"
+if ($LASTEXITCODE -ne 0) { throw "floppy image build failed" }
+Write-Host "Toka-DOS floppy image built: crates/izarravm-firmware/roms/tokados.img"
+
+& python (Join-Path $root '..\scripts\build-freedos-hdd-image.py')
+if ($LASTEXITCODE -ne 0) { throw "HDD image build failed" }
+Write-Host "Toka-DOS HDD image built: crates/izarravm-firmware/roms/tokados-hdd.img"
