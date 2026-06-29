@@ -22,6 +22,7 @@ old_int33_seg   dw 0
 cur_x           dw CENTER_X
 cur_y           dw CENTER_Y
 buttons         db 0
+wheel           db 0                  ; signed wheel counter since last fn 0x03
 show_count      dw 0xFFFF            ; -1, hidden
 min_x           dw 0
 max_x           dw VIRT_MAX_X
@@ -161,6 +162,7 @@ m_reset:
     mov [cs:cur_y], ax                 ; centre vertically in the active range
     mov word [cs:show_count], 0xFFFF
     mov byte [cs:buttons], 0
+    mov byte [cs:wheel], 0             ; clear the accumulated wheel counter
     mov word [cs:press_cnt], 0
     mov word [cs:press_cnt + 2], 0
     mov word [cs:press_cnt + 4], 0
@@ -222,8 +224,10 @@ m_hide:
 ; 0x03 get position and buttons. Returns BX,CX,DX; preserves AX,SI,DI (none of
 ; them is written).
 m_getpos:
-    mov bx, [cs:buttons]
-    and bx, 0x0007
+    mov bl, [cs:buttons]
+    and bl, 0x07
+    mov bh, [cs:wheel]                 ; BH = signed wheel counter (CuteMouse wheel API)
+    mov byte [cs:wheel], 0             ; consume the accumulated detents
     mov cx, [cs:cur_x]
     mov dx, [cs:cur_y]
     iret
@@ -478,6 +482,8 @@ m_cond_off:
 ; Each arm preserves every register outside its documented return set.
 ; State is always accessed CS-relative (the TSR runs on the caller's DS).
 x33_high:
+    cmp ax, 0x0011
+    je m_wheel_api
     cmp ax, 0x0012
     je m_large_gfx_cursor
     cmp ax, 0x0013
@@ -513,6 +519,16 @@ x33_high:
     cmp ax, 0x0052
     je m_restore_state
     ; catch-all: leave all registers unchanged
+    iret
+
+; 0x11 get wheel capabilities (CuteMouse wheel API). AX=0x574D ("WM") signals
+; support; CX bit0 = wheel present; BX = button count. This driver tracks the
+; signed wheel detents (fn 0x03 BH) on a 3-button PS/2 IntelliMouse, so report
+; BX=3 / CX=1. Preserves DX,SI,DI.
+m_wheel_api:
+    mov ax, 0x574D
+    mov bx, 3                         ; button count (this driver reports 3)
+    mov cx, 1                         ; bit0 = wheel present
     iret
 
 ; 0x12 define large graphics cursor: return AX=0xFFFF. Preserves BX,CX,DX,SI,DI.
@@ -1013,6 +1029,11 @@ packet_handler:
     mov al, dl
     and al, 0x07
     mov [buttons], al                 ; new button mask (bit0 L, bit1 R, bit2 M)
+
+    ; wheel: signed Z from the 4-word frame (0 for a 3-byte mouse) into the counter.
+    ; DS=CS here so [wheel] is the resident byte; dx still carries status, leave it.
+    mov al, [bp+6]
+    add [wheel], al
 
     ; signed dx: the status sign bit is authoritative, the packet byte is the low
     ; 8 bits. queue_movement clamps deltas to the 9-bit range -256..255, so a fast
