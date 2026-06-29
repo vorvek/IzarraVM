@@ -28,6 +28,11 @@ const DEFAULT_TEST_ROM_CYCLES: u64 = 200_000_000;
 /// sector's early work; --cycles tunes it up for a longer investigation.
 const DEFAULT_BOOT_FLOPPY_CYCLES: u64 = 50_000_000;
 
+/// Default cycle budget for --headless-boot-hdd. A real DOS boot from the HDD
+/// image (MBR -> VBR -> kernel -> CONFIG.SYS -> shell) needs much more headroom
+/// than the bare floppy boot-sector run; --cycles tunes it for investigation.
+const DEFAULT_BOOT_HDD_CYCLES: u64 = 500_000_000;
+
 #[derive(Debug, Parser)]
 #[command(version, about = "IzarraVM emulator scaffold")]
 struct Cli {
@@ -71,6 +76,8 @@ struct Cli {
     headless_toka: bool,
     #[arg(long)]
     headless_boot_floppy: Option<PathBuf>,
+    #[arg(long)]
+    headless_boot_hdd: Option<PathBuf>,
     #[arg(long)]
     headless_run: Option<PathBuf>,
     #[arg(long)]
@@ -169,6 +176,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     if let Some(path) = &cli.headless_boot_floppy {
         return run_boot_floppy(path, cli.cycles, &hardware);
+    }
+
+    if let Some(path) = &cli.headless_boot_hdd {
+        return run_boot_hdd(path, cli.cycles, &hardware);
     }
 
     let rom = match cli.bios.as_deref() {
@@ -596,6 +607,46 @@ fn run_boot_floppy(
     Ok(())
 }
 
+/// Mount a hard-disk IMG, run the Izarra BIOS so INT 19h bootstraps it from LBA 0
+/// (the MBR, which chains to the partition VBR), and print CS:IP plus the loaded
+/// sector and the text screen. The diagnostic loop for the Katea FAT32 HDD boot:
+/// a human reads the screen for the FreeDOS boot messages and the `C:\>` prompt,
+/// and CS:IP / a CpuError for where a boot fault landed.
+fn run_boot_hdd(
+    path: &Path,
+    cycles: Option<u64>,
+    hardware: &HardwareProfile,
+) -> Result<(), Box<dyn Error>> {
+    let image = std::fs::read(path)?;
+    let image_len = image.len();
+    let mut machine = Machine::new(
+        MachineProfile::from_hardware_profile(hardware),
+        izarravm_firmware::izarra_bios(),
+    )?;
+    machine.mount_hdd(image);
+    let budget = cycles.unwrap_or(DEFAULT_BOOT_HDD_CYCLES);
+    let stop_reason = machine.run_until_halt_or_cycles(budget)?;
+
+    let cs = machine.cpu().registers.cs().selector;
+    let ip = machine.cpu().registers.eip as u16;
+    println!("image: {} ({image_len} bytes)", path.display());
+    println!("stop: {stop_reason:?}");
+    println!("CS:IP = {cs:04X}:{ip:04X}");
+    let mut at_7c00 = [0u8; 16];
+    for (offset, byte) in at_7c00.iter_mut().enumerate() {
+        *byte = machine.read_physical_u8(0x7c00 + offset as u32);
+    }
+    let hex: Vec<String> = at_7c00.iter().map(|byte| format!("{byte:02X}")).collect();
+    println!("0000:7C00 = {}", hex.join(" "));
+    if cs < 0xf000 {
+        println!("boot: boot sector is executing outside the BIOS region");
+    } else {
+        println!("boot: still in the BIOS (no boot, or read error)");
+    }
+    print_video_summary(&mut machine);
+    Ok(())
+}
+
 /// After a headless run, report the active video mode and whether the screen
 /// holds meaningful content. It renders a full frame and counts non-background
 /// pixels with a small histogram of the busiest DAC indices; in text mode it
@@ -924,6 +975,22 @@ mod tokados_smoke {
         (machine, stop)
     }
 
+    /// Boot the committed FAT32 HDD image (no floppy): INT 19h reads LBA 0 (the
+    /// MBR), which chains to the partition VBR, which loads KERNEL.SYS. The kernel
+    /// then mounts the FAT32 partition as C: and launches the shell.
+    fn boot_hdd(cycles: u64) -> (Machine, StopReason) {
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .expect("build machine");
+        machine.mount_hdd(izarravm_firmware::tokados_hdd_img().to_vec());
+        let stop = machine
+            .run_until_halt_or_cycles(cycles)
+            .expect("run machine");
+        (machine, stop)
+    }
+
     #[test]
     #[ignore = "boots a full DOS image (slow in debug); run with --ignored or in a release CI step"]
     fn tokados_boots_to_prompt() {
@@ -1043,6 +1110,64 @@ mod tokados_smoke {
         assert!(
             sort_text.contains("toka-dos sort"),
             "SORT.EXE did not run/print its banner.\n{sort_text}"
+        );
+    }
+
+    // Katea-1 Milestone-0 GO/NO-GO gate: the real FreeDOS kernel must boot to
+    // C:\> from the synthesized static FAT32 HDD image (no floppy) and read a file
+    // off the volume. If this passes, the static-image approach is proven and the
+    // lazy host-folder facade work can begin; if it cannot reach C:\>, it is a
+    // NO-GO and we stop before any facade work.
+    #[test]
+    #[ignore = "boots a full DOS image from a FAT32 HDD (slow in debug); run with --ignored"]
+    fn katea_static_hdd_boots() {
+        let (mut machine, stop) = boot_hdd(500_000_000);
+        if let StopReason::CpuError(msg) = &stop {
+            let text = machine.screen_text().as_text();
+            panic!("CPU fault during Katea HDD boot: {msg}\nstop={stop:?}\n{text}");
+        }
+        let text = machine.screen_text().as_text().to_ascii_lowercase();
+        // The kernel must assign the FAT32 partition to C: and prompt there, NOT A:.
+        assert!(
+            text.contains("c:\\>"),
+            "no C:\\> prompt after HDD boot (stop={stop:?}).\n{text}"
+        );
+
+        // VER: the kernel responds with its version banner.
+        for ch in "ver\r".chars() {
+            for code in ascii_to_set1(ch) {
+                machine.inject_key_scancodes(&[code]);
+            }
+            machine
+                .run_until_halt_or_cycles(5_000_000)
+                .expect("type ver");
+        }
+        machine
+            .run_until_halt_or_cycles(20_000_000)
+            .expect("settle ver");
+        let ver_text = machine.screen_text().as_text().to_ascii_lowercase();
+        assert!(
+            ver_text.contains("c:\\>ver"),
+            "VER not echoed at the C: prompt.\n{ver_text}"
+        );
+
+        // DIR C: must list the test file from the FAT32 root directory, proving the
+        // kernel read the volume's filesystem.
+        for ch in "dir c:\\\r".chars() {
+            for code in ascii_to_set1(ch) {
+                machine.inject_key_scancodes(&[code]);
+            }
+            machine
+                .run_until_halt_or_cycles(5_000_000)
+                .expect("type dir");
+        }
+        machine
+            .run_until_halt_or_cycles(40_000_000)
+            .expect("settle dir");
+        let dir_text = machine.screen_text().as_text().to_ascii_lowercase();
+        assert!(
+            dir_text.contains("hello"),
+            "DIR C: did not list HELLO.TXT off the FAT32 volume.\n{dir_text}"
         );
     }
 }

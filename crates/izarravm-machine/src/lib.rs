@@ -8148,6 +8148,19 @@ impl Machine {
             }
             done += 1;
         }
+        // A CHS read of LBA 0 (the MBR) to 0000:7C00 is a fixed-disk boot. Mirror
+        // the INT 19h ATA branch: only a sector carrying the 55AA boot signature is
+        // a real OS, so stand the HLE Toka-DOS and IZEMM down (the booted OS then
+        // owns the DOS interrupts via its IVT). Without the signature the boot ROM
+        // falls back to the HLE C: shim, which needs the HLE live, so leave it set.
+        // Unlike the floppy, INT 13h stays intercepted so Katea keeps serving I/O.
+        if ah == 0x02 && done > 0 && start_lba == 0 && buffer == BOOT_SECTOR_ADDRESS as u32 {
+            let signed = self.read_physical_u8(buffer + 510) == 0x55
+                && self.read_physical_u8(buffer + 511) == 0xAA;
+            if signed {
+                self.booter_inert = true;
+            }
+        }
         self.set_eax_al(done);
         if done == count {
             self.set_eax_ah(0x00);
