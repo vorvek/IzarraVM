@@ -11,11 +11,13 @@
 // these up.
 #![allow(dead_code)]
 
+use crate::fat32::FAT32_EOC;
 use crate::katea_names::NameTable;
 use crate::katea_volume::{
-    FileSource, NUM_FATS, PART_START, RESERVED_SECTORS, ROOT_CLUSTER, SECTOR, fat_size_sectors,
-    sectors_per_cluster,
+    FAT0_MEDIA, FileSource, NUM_FATS, PART_START, RESERVED_SECTORS, ROOT_CLUSTER, SECTOR,
+    fat_size_sectors, sectors_per_cluster,
 };
+use std::collections::HashSet;
 use std::path::Path;
 
 /// Cap recursion so a pathological tree (or an undetected loop) can't run away;
@@ -261,6 +263,79 @@ fn assign_dir(dir: &mut TreeDir, is_root: bool, parent: u32, next: &mut u32, clu
     }
 }
 
+/// The computed-on-demand FAT. Task 4 assigns every chain as one *contiguous
+/// run* of clusters, so a used cluster's FAT entry is simply `c + 1` unless `c`
+/// is the last cluster of its run (then EOC), and any cluster the tree never
+/// touched is free (0). We therefore store only the set of run-end clusters and
+/// `next_free` (the first never-allocated cluster) and derive every FAT entry —
+/// and any FAT sector — from those, so RAM scales with the chain count rather
+/// than the disk size.
+pub(crate) struct ClusterIndex {
+    next_free: u32,           // first cluster never allocated
+    chain_ends: HashSet<u32>, // last cluster of every chain (-> EOC)
+}
+
+impl ClusterIndex {
+    pub(crate) fn build(tree: &HostTree, _geo: &Geometry) -> Self {
+        let mut chain_ends = HashSet::new();
+        let mut next_free = ROOT_CLUSTER;
+        fn visit(dir: &TreeDir, ends: &mut HashSet<u32>, next_free: &mut u32) {
+            push_run(dir.first_cluster, dir.cluster_count, ends, next_free);
+            for f in &dir.files {
+                push_run(f.first_cluster, f.cluster_count, ends, next_free);
+            }
+            for s in &dir.subdirs {
+                visit(&s.dir, ends, next_free);
+            }
+        }
+        fn push_run(first: u32, count: u32, ends: &mut HashSet<u32>, next_free: &mut u32) {
+            if count == 0 {
+                return;
+            }
+            ends.insert(first + count - 1);
+            *next_free = (*next_free).max(first + count);
+        }
+        visit(&tree.root, &mut chain_ends, &mut next_free);
+        Self {
+            next_free,
+            chain_ends,
+        }
+    }
+
+    /// The FAT entry value for cluster `c` (28-bit).
+    pub(crate) fn fat_entry(&self, c: u32) -> u32 {
+        match c {
+            0 => FAT0_MEDIA,
+            1 => FAT32_EOC,
+            _ if c < self.next_free => {
+                if self.chain_ends.contains(&c) {
+                    FAT32_EOC
+                } else {
+                    c + 1
+                }
+            }
+            _ => 0, // free
+        }
+    }
+
+    /// One 512-byte sector of a FAT copy: the `sector`-th sector holds entries
+    /// `[sector*128 .. sector*128+128)`. Past the entries it is zero.
+    pub(crate) fn fat_sector(&self, sector: u32, _geo: &Geometry) -> [u8; SECTOR] {
+        let mut out = [0u8; SECTOR];
+        let base = sector * 128; // 128 FAT32 entries per 512B sector
+        for i in 0..128u32 {
+            let v = (self.fat_entry(base + i) & 0x0FFF_FFFF).to_le_bytes();
+            let off = (i as usize) * 4;
+            out[off..off + 4].copy_from_slice(&v);
+        }
+        out
+    }
+
+    pub(crate) fn next_free(&self) -> u32 {
+        self.next_free
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,6 +411,41 @@ mod tests {
         );
         assert_eq!(geo.total_sectors, geo.part_start + geo.part_sectors);
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fat_sector_reflects_the_allocated_chains() {
+        let root = scratch("fat");
+        std::fs::write(root.join("A.TXT"), vec![0u8; 600]).unwrap(); // 2 clusters
+        let sys = vec![("KERNEL.SYS".to_string(), vec![0u8; 100])]; // 1 cluster
+        let mut tree = build_tree(&root, &sys);
+        let geo = allocate(&mut tree);
+        let idx = ClusterIndex::build(&tree, &geo);
+
+        // FAT[0] media, FAT[1] EOC, FAT[2]=root (single cluster -> EOC).
+        assert_eq!(idx.fat_entry(0) & 0x0FFF_FFFF, 0x0FFF_FFF8);
+        assert_eq!(idx.fat_entry(1), 0x0FFF_FFFF);
+        assert_eq!(idx.fat_entry(2), 0x0FFF_FFFF); // root, 1 cluster
+        // A.TXT occupies 2 contiguous clusters c -> c+1 -> EOC.
+        let a = tree
+            .root
+            .files
+            .iter()
+            .find(|f| &f.name == b"A       TXT")
+            .unwrap();
+        assert_eq!(idx.fat_entry(a.first_cluster), a.first_cluster + 1);
+        assert_eq!(idx.fat_entry(a.first_cluster + 1), 0x0FFF_FFFF);
+        // A free cluster past the end is 0.
+        assert_eq!(idx.fat_entry(geo.count_of_clusters + 2), 0);
+
+        // The first FAT sector (partition-relative LBA RESERVED_SECTORS) holds the
+        // first 128 entries little-endian.
+        let s = idx.fat_sector(0, &geo);
+        assert_eq!(
+            u32::from_le_bytes([s[0], s[1], s[2], s[3]]) & 0x0FFF_FFFF,
+            0x0FFF_FFF8
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 }
