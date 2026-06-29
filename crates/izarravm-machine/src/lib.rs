@@ -11377,6 +11377,29 @@ impl CpuBus for MachineBus<'_> {
         Ok(())
     }
 
+    fn charge_instruction_fetch_run(&mut self, start: u32, count: u32) -> Result<(), BusError> {
+        if count == 0 {
+            return Ok(());
+        }
+        let first = self.apply_a20(start);
+        let last = self.apply_a20(start.wrapping_add(count - 1));
+        let first_ws = self.memory_wait_states(first);
+        // Uniform iff every byte lands in the same wait-state region with no A20 wrap
+        // between the ends. apply_a20 already folded both ends, so equal wait-states on
+        // contiguous post-A20 addresses means the whole run is one region.
+        let uniform =
+            last == first.wrapping_add(count - 1) && first_ws == self.memory_wait_states(last);
+        if uniform {
+            self.trace
+                .record_instruction_fetch_run(first, count, first_ws);
+        } else {
+            for i in 0..count {
+                self.charge_instruction_fetch(start.wrapping_add(i))?;
+            }
+        }
+        Ok(())
+    }
+
     fn read_io(&mut self, port: u16, width: BusWidth) -> Result<u32, BusError> {
         *self.io_touched = true;
         self.trace.record(

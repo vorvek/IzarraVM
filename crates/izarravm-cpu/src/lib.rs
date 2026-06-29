@@ -1697,9 +1697,7 @@ impl Cpu386 {
     /// page's physical, and a prefixed instruction's doubled opcode charge lands at `lin` (a prefix)
     /// rather than the opcode. Neither occurs on the benchmark path, where cyc/iter is bit-identical.
     fn charge_cached_fetch<B: CpuBus>(&mut self, bus: &mut B, lin: u32, len: u8) -> ExecResult<()> {
-        for i in 0..u32::from(len) {
-            bus.charge_instruction_fetch(lin.wrapping_add(i))?;
-        }
+        bus.charge_instruction_fetch_run(lin, u32::from(len))?;
         // The opcode-byte double-charge (read_prefixes peek + decode re-fetch).
         bus.charge_instruction_fetch(lin)?;
         self.registers.eip = self.registers.eip.wrapping_add(u32::from(len));
