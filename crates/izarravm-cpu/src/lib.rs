@@ -675,6 +675,10 @@ pub struct Cpu386 {
     prefetch: PrefetchWindow,
     written_pages: [Option<u32>; TRACKED_WRITE_PAGES],
     written_pages_overflow: bool,
+    // Direct-mapped cache of decoded instructions keyed by linear EIP. Skips re-decoding hot-loop
+    // bytes; a generation counter (inside) invalidates it on any change that could alter a decode.
+    // Transparent accelerator, excluded from equality and reset on clone. See DecodeCache.
+    decode_cache: DecodeCache,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1033,6 +1037,115 @@ struct DecodedInsn {
     group: DecodeGroup,
 }
 
+/// Number of direct-mapped lines in the decode cache. Power of two so the index is a mask. 4096 is
+/// the Stage B starting size (B7 tunes it); the footprint is the knob that matters on a normal
+/// (8-32 MB L3) machine, so it is kept small and dense.
+const DECODE_CACHE_LINES: usize = 4096;
+
+/// One direct-mapped decode-cache line. `insn` is `None` until first filled. A filled line is a hit
+/// only when its `tag` matches the lookup linear address AND its `gen` matches the live generation,
+/// so advancing the generation invalidates every line in O(1) without clearing the array.
+#[derive(Debug, Clone, Copy, Default)]
+struct DecodeLine {
+    tag: u32,
+    generation: u32,
+    insn: Option<DecodedInsn>,
+}
+
+/// A direct-mapped, generation-stamped cache of decoded instructions keyed by linear EIP
+/// (`cs.base + eip`). It lets a hot loop skip re-decoding the same bytes every iteration. The `gen`
+/// counter is advanced whenever a decode could change meaning: CS base / paging / mode changes (via
+/// `invalidate_code_caches`) and an ISA-level change (via `set_level`). A bump makes every stamped
+/// line miss, so the next execution at each address re-decodes and re-stamps. It is NOT advanced on
+/// a near branch (`set_eip` only moves eip, which already changes the linear key) nor on a plain
+/// data write, which would flush the cache every loop iteration. Self-modifying-code invalidation
+/// (a write into a page that holds cached instructions) is a later Stage B task; the benchmark path
+/// has no SMC, and identical bench checksums verify nothing stale is served.
+///
+/// Transparent accelerator, not architectural state: excluded from `Cpu386` equality (like
+/// `PrefetchWindow`) and reset rather than copied on clone.
+struct DecodeCache {
+    lines: Box<[DecodeLine]>,
+    mask: u32,
+    generation: u32,
+}
+
+impl DecodeCache {
+    fn new(lines: usize) -> Self {
+        assert!(
+            lines.is_power_of_two(),
+            "decode cache size must be a power of two"
+        );
+        Self {
+            lines: vec![DecodeLine::default(); lines].into_boxed_slice(),
+            mask: (lines - 1) as u32,
+            // Fresh lines default to generation 0; start live at 1 so they miss until first filled.
+            generation: 1,
+        }
+    }
+
+    #[inline]
+    fn get(&self, lin: u32) -> Option<DecodedInsn> {
+        let line = &self.lines[(lin & self.mask) as usize];
+        if line.generation == self.generation && line.tag == lin {
+            line.insn
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn put(&mut self, lin: u32, insn: DecodedInsn) {
+        self.lines[(lin & self.mask) as usize] = DecodeLine {
+            tag: lin,
+            generation: self.generation,
+            insn: Some(insn),
+        };
+    }
+
+    /// Invalidate every cached line by advancing the generation. O(1): stamped lines fail the
+    /// generation check and re-decode on next use. Skips 0 on wrap so a fresh line never aliases.
+    #[inline]
+    fn invalidate(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.generation = 1;
+        }
+    }
+}
+
+impl Default for DecodeCache {
+    fn default() -> Self {
+        Self::new(DECODE_CACHE_LINES)
+    }
+}
+
+impl Clone for DecodeCache {
+    fn clone(&self) -> Self {
+        // The cache is a transparent accelerator: a clone starts empty (and re-decodes) rather than
+        // copying every line, so cloning a CPU stays cheap and never depends on cache contents.
+        Self::new(self.lines.len())
+    }
+}
+
+impl PartialEq for DecodeCache {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for DecodeCache {}
+
+impl std::fmt::Debug for DecodeCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "DecodeCache {{ {} lines, gen {} }}",
+            self.lines.len(),
+            self.generation
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MemoryOperand {
     segment: SegmentIndex,
@@ -1069,6 +1182,10 @@ impl Cpu386 {
     fn invalidate_code_caches(&mut self) {
         self.code_page.valid = false;
         self.prefetch.invalidate();
+        // Every CS-base change (CS load) and paging remap (via flush_tlb_and_code_caches) routes
+        // through here, so this is the structural hook for the decode cache too: a remap can make
+        // the same linear address decode differently (D-bit aliasing, page remap), so invalidate.
+        self.decode_cache.invalidate();
     }
 
     fn flush_tlb_and_code_caches(&mut self) {
@@ -1126,6 +1243,9 @@ impl Cpu386 {
     pub fn set_level(&mut self, level: CpuLevel) {
         self.level = level;
         self.timing_rem = 0;
+        // The ISA level gates the two-byte #UD checks in decode, so the same bytes can decode
+        // differently after a level change. Invalidate the decode cache so it re-decodes.
+        self.decode_cache.invalidate();
     }
 
     /// Scale a retired instruction's clocks by the active level's timing factor,
@@ -1253,8 +1373,9 @@ impl Cpu386 {
         self.begin_instruction();
         let start_eip = self.registers.eip;
         let start_cs = self.registers.cs().selector;
+        let lin = self.linear_eip();
         let result = self
-            .decode(bus)
+            .fetch_decoded(bus, lin)
             .and_then(|insn| self.execute_decoded(&insn, bus));
         let outcome = match result {
             Ok(outcome) => outcome,
@@ -1454,6 +1575,44 @@ impl Cpu386 {
             return DecodeGroup::Misc;
         }
         DecodeGroup::Fallback
+    }
+
+    /// Stage B fetch front-end. Returns the decoded instruction for the current linear EIP, served
+    /// from the decode cache on a hit (re-decode skipped) or decoded once and cached on a miss. On a
+    /// hit, `decode` does not run, so this replays the instruction-fetch clocks `decode` would have
+    /// charged and advances eip past the instruction, leaving the CPU in exactly the state the miss
+    /// path produces before `execute_decoded` runs (eip at the instruction end; the same fetch bus
+    /// cycles charged). The prefetch window is not touched on a hit because `execute_decoded` reads
+    /// operands over the data bus, never the instruction stream.
+    fn fetch_decoded<B: CpuBus>(&mut self, bus: &mut B, lin: u32) -> ExecResult<DecodedInsn> {
+        if let Some(insn) = self.decode_cache.get(lin) {
+            self.charge_cached_fetch(bus, lin, insn.len)?;
+            return Ok(insn);
+        }
+        let insn = self.decode(bus)?;
+        self.decode_cache.put(lin, insn);
+        Ok(insn)
+    }
+
+    /// Replay the instruction-fetch bus clocks for a cache hit and advance eip past the instruction.
+    /// `decode` charges one fetch cycle per byte at its linear address, plus ONE extra for the
+    /// opcode: `read_prefixes` fetches (and charges) the first non-prefix byte to test it, rewinds
+    /// eip without un-charging, and `decode` then re-fetches that opcode byte. So a successfully
+    /// decoded instruction always costs `len + 1` instruction-fetch cycles, the opcode byte charged
+    /// twice. This replays that: the `len` bytes at `lin..lin+len`, then one more at `lin` (the
+    /// opcode for the common no-prefix case, making the replay byte-exact there; for a prefixed
+    /// instruction the doubled byte sits one region over but the clock cost is identical for
+    /// single-region code, which is the whole benchmark path). Faithful per-byte region / A20 /
+    /// paging replay and the fetch-fault re-check on a hit are the remaining Stage B tasks (B2/B5);
+    /// without paging the linear address equals the physical address.
+    fn charge_cached_fetch<B: CpuBus>(&mut self, bus: &mut B, lin: u32, len: u8) -> ExecResult<()> {
+        for i in 0..u32::from(len) {
+            bus.charge_instruction_fetch(lin.wrapping_add(i))?;
+        }
+        // The opcode-byte double-charge (read_prefixes peek + decode re-fetch).
+        bus.charge_instruction_fetch(lin)?;
+        self.registers.eip = self.registers.eip.wrapping_add(u32::from(len));
+        Ok(())
     }
 
     /// Stage A of the decode/execute split. Reads the prefixes and opcode (mirroring the top
@@ -13985,6 +14144,72 @@ mod tests {
         cpu.begin_instruction();
         let insn = cpu.decode(bus)?;
         cpu.execute_decoded(&insn, bus)
+    }
+
+    #[test]
+    fn decode_cache_hits_only_on_matching_tag_and_generation() {
+        // A real decoded instruction to store. ADD AX, BX (01 D8).
+        let (mut cpu, mem) = real_mode_cpu(&[0x01, 0xd8], 0x20);
+        let mut bus = TestBus::with_memory(mem);
+        cpu.registers.eip = 0;
+        let insn = cpu.decode(&mut bus).unwrap();
+
+        let mut cache = DecodeCache::new(4); // mask = 3
+        let lin = 0x100;
+        assert!(cache.get(lin).is_none(), "an empty line misses");
+        cache.put(lin, insn);
+        assert!(cache.get(lin).is_some(), "a filled line hits");
+        // lin + 4 lands in the same direct-mapped slot (mask 3) but carries a different tag.
+        assert!(
+            cache.get(lin + 4).is_none(),
+            "a different tag in the same slot misses (no false hit)"
+        );
+        cache.invalidate();
+        assert!(
+            cache.get(lin).is_none(),
+            "a generation bump invalidates every stamped line"
+        );
+        cache.put(lin, insn);
+        assert!(
+            cache.get(lin).is_some(),
+            "re-filling after a bump hits again"
+        );
+    }
+
+    #[test]
+    fn decode_cache_invalidate_skips_zero_on_wrap() {
+        // The generation must never land back on 0 (a fresh line's default), or stale lines alias.
+        let mut cache = DecodeCache::new(2);
+        cache.generation = u32::MAX;
+        cache.invalidate();
+        assert_eq!(cache.generation, 1, "wrap skips 0");
+    }
+
+    #[test]
+    fn cycle_serves_a_repeated_instruction_from_the_decode_cache() {
+        // INC AX (0x40): one byte, no branch, so re-executing at the same linear address is a hit.
+        let (mut cpu, mem) = real_mode_cpu(&[0x40], 0x20);
+        let mut bus = TestBus::with_memory(mem);
+        let lin = cpu.linear_eip();
+
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.eax() & 0xffff, 1, "first run increments AX");
+        assert!(
+            cpu.decode_cache.get(lin).is_some(),
+            "cycle caches the decoded instruction"
+        );
+
+        // Re-run at the same linear address: served from the cache, identical effect.
+        cpu.set_eip(0);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.eax() & 0xffff, 2, "cached INC AX runs again");
+
+        // A CS load routes through invalidate_code_caches, which drops the cache.
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        assert!(
+            cpu.decode_cache.get(lin).is_none(),
+            "invalidate_code_caches clears the decode cache"
+        );
     }
 
     fn run_at_level(code: &[u8], level: CpuLevel) -> Result<CycleOutcome, InternalFault> {
