@@ -39,6 +39,7 @@ mod ide;
 mod keyboard;
 mod lpt;
 mod memmap;
+mod mouse;
 mod pic;
 mod pit;
 mod rtc;
