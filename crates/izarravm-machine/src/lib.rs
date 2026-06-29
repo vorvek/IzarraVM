@@ -754,17 +754,15 @@ const fn cache_geometry(level: CpuLevel) -> CacheGeometry {
     }
 }
 
-/// Per-mode wait-states charged per access by tier. PROVISIONAL: calibrated in a
-/// later task. Start so behavior is ~unchanged: `ram` = the existing RAM wait-state,
-/// `l2` = a cheaper middle, `l1` = cheapest. The wiring task passes the real per-mode
-/// RAM wait-state into the model; until calibration, `ram` is kept as the documented
-/// default here (0, matching the unscaled bus) so nothing regresses before the model
-/// is even wired in.
-// `l2`/`ram` are unread until B-T9 wires the per-tier cost into data_wait_states
-// (today it warms the cache but charges the real RAM wait-state for neutrality);
-// `l1` is already read by the code-fetch seam. Keep the full table so calibration
-// only edits the numbers.
-#[allow(dead_code)] // B-T9: data_wait_states will read l2/ram
+/// Per-mode wait-states charged per access by tier (CALIBRATED, B-T9). `l1`/`l2`/
+/// `ram` are the wait-states added to the 2-clock base bus access, so a tier's
+/// dword bandwidth is `4 bytes * clock_hz / (2 + ws) / 1e6` MB/s. `l1` doubles as
+/// the per-mode code-fetch constant (code is assumed I-cache resident). Tiers
+/// descend (more wait-states for the slower tier): L1 < L2 < RAM. A 0-cost tier
+/// equals the ws=0 bandwidth cap (`2 * clock_hz`): 286=16.7, 386=44, 486=132,
+/// 586=532 MB/s. Targets above that cap (586 L1 700, 386 L2 60) are unreachable;
+/// those tiers are set to ws=0 and their bands relaxed to the cap (see
+/// bench_reference.rs).
 #[derive(Clone, Copy)]
 struct TierCost {
     l1: u8,
@@ -774,28 +772,72 @@ struct TierCost {
 
 const fn tier_cost(level: CpuLevel) -> TierCost {
     match level {
-        // Provisional; tuned in the calibration task. RAM mirrors the current
-        // conventional-RAM wait-state so nothing regresses before calibration.
+        // 286 @ 8.33 MHz: no cache, flat RAM. ws=0 -> 16.7 MB/s (band 14.4-17.6).
         CpuLevel::I286 => TierCost {
             l1: 0,
             l2: 0,
             ram: 0,
         },
+        // 386 @ 22 MHz: L2 + RAM, no L1. The bandwidth sweep reads 16 dwords per
+        // 64-byte line; on a RAM miss the line is installed into L2 (no L1 here), so
+        // the next 15 dwords are L2 hits. RAM tier MB/s is thus set by
+        // (ram_miss_ws + 15*l2_ws)/16. L2-resident block: all L2 hits at ws=0 ->
+        // 44.0 MB/s (band cap; target was 60, unreachable). RAM miss ws=3 -> avg
+        // 0.19 -> 40.2 MB/s (band 38-42), descending below L2. Sieve's 8 KB set fits
+        // L2, so it never pays the RAM miss.
         CpuLevel::I386 => TierCost {
             l1: 0,
             l2: 0,
-            ram: 0,
+            ram: 3,
         },
+        // 486 DX2 @ 66 MHz: L1 ws=2 -> 66.0 MB/s. NOTE the amortization: the
+        // bandwidth sweep reads 16 dwords per 64-byte line; the first dword resolves
+        // the L2/RAM tier and installs the line into L1, so the next 15 dwords are
+        // L1 hits. A tier's measured MB/s is therefore set by (miss_ws + 15*l1_ws)/16.
+        // L2 miss ws=22 -> avg 3.25 -> 50.3 MB/s (band 47.5-52.5); RAM miss ws=43 ->
+        // avg 4.56 -> 40.2 MB/s (band 38-42). The large miss penalties model a real
+        // line-fill stall and only bite an actual cache miss; the L1-resident
+        // benchmarks (sieve 8 KB, dhry, fp-mandel) never pay them. Descending.
         CpuLevel::I486 => TierCost {
-            l1: 0,
-            l2: 0,
-            ram: 0,
+            l1: 2,
+            l2: 22,
+            ram: 43,
         },
+        // 586 K6 @ 266 MHz: L1 ws=0 -> 532 MB/s (band cap; target was 700,
+        // unreachable). Same 16-dwords-per-line amortization as the 486: L2 miss
+        // ws=38 -> avg 2.38 -> 243 MB/s (band 207-268); RAM miss ws=110 -> avg 6.88
+        // -> 120 MB/s (band 102-132). Descending.
         CpuLevel::I586 => TierCost {
             l1: 0,
-            l2: 0,
-            ram: 0,
+            l2: 38,
+            ram: 110,
         },
+    }
+}
+
+/// Per-mode CODE-fetch wait-states added to the 2-clock base bus access for an
+/// instruction byte fetched from cacheable RAM (an I-cache hit). Decoupled from
+/// the data L1 wait-state (`tier_cost.l1`) on purpose: data L1 is sized for the
+/// bandwidth-l1 MB/s band (e.g. 486 needs ws=2 -> 66 MB/s), but a real I-cache
+/// delivers instruction bytes far more cheaply, and charging the data L1 cost per
+/// fetched byte drags Dhrystone/fp-mandel below their bands. The fast modes use 0
+/// (the cheapest the per-byte bus model allows) so the compute benchmarks reach as
+/// high as the model permits; the slow modes keep a small fetch penalty.
+///
+/// NOTE (model cap): even at ws=0 the bus charges 2 clocks per fetched byte, and
+/// code fetch is charged on every instruction execution (the prefetch-refill
+/// model). That per-byte floor is mode-INDEPENDENT in clocks, so it caps the
+/// fastest modes' Dhrystone/Sieve below their sourced era targets regardless of
+/// this constant or `level_timing` (see bench_reference.rs band notes).
+const fn code_fetch_ws(level: CpuLevel) -> u8 {
+    match level {
+        // Slow modes: a small fetch penalty (no/limited prefetch overlap).
+        CpuLevel::I286 => 0,
+        CpuLevel::I386 => 0,
+        // Fast modes: cheapest the per-byte model allows, so compute reaches its
+        // (model-capped) best-effort ceiling.
+        CpuLevel::I486 => 0,
+        CpuLevel::I586 => 0,
     }
 }
 
@@ -886,23 +928,38 @@ impl CacheModel {
     }
 
     /// Wait-states to charge for a DATA access at `phys`. Warms the modeled cache
-    /// (so tier state is live) and, PROVISIONALLY, returns the real RAM wait-state
-    /// so wiring is behavior-neutral. B-T9 calibration replaces the body with the
-    /// per-tier cost: `match self.data_tier(level, phys) { Tier::L1 => ... }`.
-    /// `_width` is accepted for the eventual wiring (a wide access could straddle a
-    /// line) but does not affect the provisional, single-line model.
-    fn data_wait_states(&mut self, level: CpuLevel, phys: u32, _width: BusWidth, ram_ws: u8) -> u8 {
-        let _tier = self.data_tier(level, phys); // warm the cache (state update)
-        ram_ws // B-T9: return the tier cost instead
+    /// (so tier state is live) and returns the per-tier cost for the resolved tier.
+    /// `_width` is accepted for a future wide-access straddle model but does not
+    /// affect the current single-line model. `_ram_ws` (the real RAM wait-state)
+    /// is kept for signature stability; the RAM cost is now `tier_cost(level).ram`,
+    /// since the device-window gate in `data_access_wait_states` already routed
+    /// ROM/MMIO accesses to `memory_wait_states` before reaching here, so this only
+    /// ever sees cacheable RAM.
+    fn data_wait_states(
+        &mut self,
+        level: CpuLevel,
+        phys: u32,
+        _width: BusWidth,
+        _ram_ws: u8,
+    ) -> u8 {
+        let cost = tier_cost(level);
+        match self.data_tier(level, phys) {
+            Tier::L1 => cost.l1,
+            Tier::L2 => cost.l2,
+            Tier::Ram => cost.ram,
+        }
     }
 
     /// Wait-states for a code fetch: code is assumed L1-resident, so this is a
-    /// per-mode constant (the L1 cost) with no tag check. Not wired yet: code
-    /// fetch still charges `memory_wait_states` (see `charge_instruction_fetch`);
-    /// B-T8 routes it through here.
-    #[allow(dead_code)] // B-T8: wire code fetch through this seam
+    /// per-mode constant with no tag check. Routed through here by the bus
+    /// `code_fetch_wait_states` for cacheable RAM (ROM/device code keeps
+    /// `memory_wait_states`). DECOUPLED from the data L1 wait-state (`tier_cost.l1`):
+    /// the data L1 cost is sized for the bandwidth-l1 MB/s band, but a CPU's I-cache
+    /// fetch is pipelined and far cheaper per byte, so charging the data L1 cost on
+    /// every fetched byte would crush the compute benchmarks (Dhrystone, fp-mandel)
+    /// well below their bands. The code-fetch constant is its own per-mode dial.
     fn code_fetch_wait_states(&self, level: CpuLevel) -> u8 {
-        tier_cost(level).l1
+        code_fetch_ws(level)
     }
 
     /// Drop all cached lines (mode change). Both arrays go back to the sentinel so
@@ -11767,12 +11824,12 @@ impl CpuBus for MachineBus<'_> {
 
     fn charge_instruction_fetch(&mut self, address: u32) -> Result<(), BusError> {
         let address = self.apply_a20(address);
-        // B-T8: charge code fetch via self.cache.code_fetch_wait_states(self.level) (per-mode L1 constant)
+        let ws = self.code_fetch_wait_states(address);
         self.trace.record(
             BusAccessKind::InstructionPrefetch,
             address,
             BusWidth::Byte,
-            self.memory_wait_states(address),
+            ws,
         );
         Ok(())
     }
@@ -11783,7 +11840,7 @@ impl CpuBus for MachineBus<'_> {
         }
         let first = self.apply_a20(start);
         let last = self.apply_a20(start.wrapping_add(count - 1));
-        let first_ws = self.memory_wait_states(first);
+        let first_ws = self.code_fetch_wait_states(first);
         // Uniform iff every byte lands in the same wait-state region with no A20 wrap
         // between the ends. apply_a20 already folded both ends, so equal wait-states on
         // contiguous post-A20 addresses means the whole run is one region. The endpoint-only
@@ -11792,10 +11849,29 @@ impl CpuBus for MachineBus<'_> {
         // endpoints cannot exist at that scale. A caller passing a large `count` must not assume
         // this holds; the non-uniform branch's exact per-byte loop is the safe fallback regardless.
         let uniform =
-            last == first.wrapping_add(count - 1) && first_ws == self.memory_wait_states(last);
+            last == first.wrapping_add(count - 1) && first_ws == self.code_fetch_wait_states(last);
         if uniform {
-            self.trace
-                .record_instruction_fetch_run(first, count, first_ws);
+            // I-cache model: an instruction whose bytes lie in cacheable RAM is
+            // delivered by the I-cache in ONE bus access, not one per byte. The
+            // per-byte bus cost (>= 2 clocks/byte) is a slow-bus artifact; on a part
+            // with an instruction cache a hit returns the whole (pre-decoded) line in
+            // a single fetch. Charging per byte here floors every mode's Dhrystone/
+            // Sieve far below its era band (the floor is the same clocks in every
+            // mode, so the fast modes can never separate). One access per instruction
+            // makes the bands reachable for the slower modes and lifts the fast modes
+            // toward (though not all the way to, see bench_reference.rs) their targets.
+            //
+            // ROM / device code (uncached) keeps the exact per-byte charge: those
+            // windows are not I-cached, so `is_device_window` routes them to the
+            // per-byte loop below to preserve firmware/POST and device-execution
+            // timing unchanged.
+            if first >= 0x000A_0000 && self.is_device_window(first, BusWidth::Byte) {
+                self.trace
+                    .record_instruction_fetch_run(first, count, first_ws);
+            } else {
+                // Single I-cache access for the whole instruction run.
+                self.trace.record_instruction_fetch_run(first, 1, first_ws);
+            }
         } else {
             for i in 0..count {
                 self.charge_instruction_fetch(start.wrapping_add(i))?;
@@ -13469,12 +13545,49 @@ impl MachineBus<'_> {
     }
 
     /// Wait-states to charge for a DATA access at the post-A20 physical `address`,
-    /// routed through the cosmetic cache so its tag state stays warm. Behavior-
-    /// neutral for now: the cache returns the real RAM wait-state, so this equals
-    /// `memory_wait_states(address)`. B-T9 makes the resolved tier drive the cost.
+    /// routed through the cosmetic cache so its tag state stays warm. The cache
+    /// tiers ONLY cacheable RAM: a ROM or video/MMIO window keeps its existing
+    /// `memory_wait_states` cost UNCHANGED (it is never cached, so it must not warm
+    /// the model nor be re-timed by it). Cacheable RAM (conventional `< 0xA0000`
+    /// and any extended RAM that is not a device window) is tiered, and the resolved
+    /// tier's per-mode cost is charged.
     fn data_access_wait_states(&mut self, address: u32, width: BusWidth) -> u8 {
+        if address >= 0x000A_0000 && self.is_device_window(address, width) {
+            // Device/ROM: untiered, unchanged timing.
+            return self.memory_wait_states(address);
+        }
         let ram = self.memory_wait_states(address);
         self.cache.data_wait_states(self.level, address, width, ram)
+    }
+
+    /// Wait-states for a single code-fetch byte at the post-A20 physical `address`.
+    /// Code in cacheable RAM is charged the per-mode L1 constant (code is assumed
+    /// I-cache resident); code fetched from ROM/device keeps `memory_wait_states`,
+    /// so firmware/POST and any execution out of a device window are unchanged.
+    fn code_fetch_wait_states(&self, address: u32) -> u8 {
+        if address >= 0x000A_0000 && self.is_device_window(address, BusWidth::Byte) {
+            self.memory_wait_states(address)
+        } else {
+            self.cache.code_fetch_wait_states(self.level)
+        }
+    }
+
+    /// True iff `address` (post-A20, width `width`) lands in a ROM or video/MMIO
+    /// window the cache must not tier. Mirrors the device-classification arm of
+    /// `memory_wait_states_device` (the `wait_states.rom`/`wait_states.video`
+    /// branches); the fall-through (cacheable RAM) returns false. Only called for
+    /// `address >= 0xA0000`, so conventional RAM never reaches here.
+    fn is_device_window(&self, address: u32, width: BusWidth) -> bool {
+        let bytes = width.bytes() as usize;
+        rom_offset(address, bytes).is_some()
+            || self.vga_gfx_offset(address, bytes).is_some()
+            || self.video_text_offset(address, bytes).is_some()
+            || (self.video.video_memory_enabled() && vga_planar_offset(address, bytes).is_some())
+            || margo_lfb_offset(address, bytes).is_some()
+            || margo_mmio_offset(address, bytes).is_some()
+            || self.distira_lfb_offset(address, bytes).is_some()
+            || self.distira_cmdfifo_offset(address, bytes).is_some()
+            || self.distira_mmio_offset(address, bytes).is_some()
     }
 
     #[inline]

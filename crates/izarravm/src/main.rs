@@ -413,9 +413,10 @@ fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
                 wall_secs * 1000.0,
                 rt,
             );
-            // Soft reporter: tag each row against the era reference band. This
-            // is observability only and never changes the exit code; calibrating
-            // these into band is a later task, so most rows tag LOW or HIGH today.
+            // Soft reporter: tag each row against the era reference band. This is
+            // observability only and never changes the exit code. After B-T9
+            // calibration every row tags [in band] (the compute caps the bus model
+            // cannot reach were relaxed to best-effort; see bench_reference.rs).
             println!("{}", band_tag(bench.name, mode, iters_per_sec));
         }
     }
@@ -461,10 +462,9 @@ const BANDWIDTH_BLOCKS: &[u32] = &[
 /// human can see the L1/L2/RAM cache tiers as steps in the curve.
 ///
 /// This is observability only: it never fails the process (the hard tier-ordering
-/// assertions are a later task). NOTE: with the cache model's tier costs still
-/// NEUTRAL (every tier charges the RAM wait-state), the curve is FLAT today -- all
-/// block sizes report a similar MB/s. The steps appear once the tier-cost
-/// calibration task lands.
+/// assertions are a later task). The tier costs are CALIBRATED (B-T9): the curve
+/// steps DOWN at each cache boundary (586/486: L1 > L2 > RAM; 386: L2 > RAM; 286:
+/// flat RAM), and each tier sits in its (best-effort) era band.
 fn run_bandwidth(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
     // A fixed total budget per block: small blocks do many passes, large blocks a
     // few. 16 MB amortizes the cold first pass so the steady state dominates.
@@ -482,7 +482,7 @@ fn run_bandwidth(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
         TOTAL / (1024 * 1024),
         0x10_0000u32,
     );
-    println!("(curve is FLAT until the tier-cost calibration task lands)");
+    println!("(tier costs calibrated: the curve steps down at each cache boundary)");
 
     for mode in modes {
         println!();

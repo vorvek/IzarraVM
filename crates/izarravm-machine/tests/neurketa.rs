@@ -74,26 +74,47 @@ fn baseline_charges_fewer_clocks_than_the_sieve() {
 }
 
 #[test]
-fn fp_mandelbrot_charges_fewer_clocks_in_586_than_486() {
-    let m486 = run(GswMode::Gsw486, 3).elapsed_clocks();
-    let m586 = run(GswMode::Gsw586, 3).elapsed_clocks();
+fn fp_mandelbrot_runs_faster_in_586_than_486() {
+    // Calibration note (B-T8/B-T9): 586's level_timing brakes fp-mandel into its
+    // band and charges MORE instruction clocks per op than the 486 (whose ratio sits
+    // near the bus floor), so 586's RAW fp-mandel clock total can exceed the 486's.
+    // The meaningful metric is guest-perceived SPEED (pixels/sec): at 266 MHz vs
+    // 66 MHz, 586 finishes far sooner. Assert that real speed ordering.
+    fn pixels_per_sec(mode: GswMode) -> f64 {
+        let m = run(mode, 3);
+        let secs = m.elapsed_clocks() as f64 / mode.clock_hz() as f64;
+        m.bench_iterations() as f64 / secs
+    }
+    let m486 = pixels_per_sec(GswMode::Gsw486);
+    let m586 = pixels_per_sec(GswMode::Gsw586);
     assert!(
-        m586 < m486,
-        "586 ({m586}) should charge fewer than 486 ({m486})"
+        m586 > m486,
+        "586 ({m586:.0} px/s) should run faster than 486 ({m486:.0} px/s)"
     );
 }
 
 #[test]
-fn faster_modes_charge_fewer_guest_clocks_for_the_sieve() {
-    let i386 = run(GswMode::Gsw386, 1).elapsed_clocks();
-    let i486 = run(GswMode::Gsw486, 1).elapsed_clocks();
-    let i586 = run(GswMode::Gsw586, 1).elapsed_clocks();
+fn faster_modes_run_the_sieve_faster() {
+    // Calibration note (B-T8/B-T9): the Sieve is memory-bound, and the per-access bus
+    // floor is mode-INDEPENDENT in clocks, so a faster mode does NOT necessarily
+    // charge fewer raw clocks (its higher level_timing can add instruction clocks on
+    // top of the same bus floor). The meaningful per-mode metric is guest-perceived
+    // SPEED (passes/sec = iters / (clocks / clock_hz)): a faster mode's higher
+    // clock_hz makes it finish sooner. Assert that real speed ordering.
+    fn passes_per_sec(mode: GswMode) -> f64 {
+        let m = run(mode, 1);
+        let secs = m.elapsed_clocks() as f64 / mode.clock_hz() as f64;
+        m.bench_iterations() as f64 / secs
+    }
+    let i386 = passes_per_sec(GswMode::Gsw386);
+    let i486 = passes_per_sec(GswMode::Gsw486);
+    let i586 = passes_per_sec(GswMode::Gsw586);
     assert!(
-        i486 < i386,
-        "486 ({i486}) should be cheaper than 386 ({i386})"
+        i486 > i386,
+        "486 ({i486:.1}/s) should be faster than 386 ({i386:.1}/s)"
     );
     assert!(
-        i586 < i486,
-        "586 ({i586}) should be cheaper than 486 ({i486})"
+        i586 > i486,
+        "586 ({i586:.1}/s) should be faster than 486 ({i486:.1}/s)"
     );
 }

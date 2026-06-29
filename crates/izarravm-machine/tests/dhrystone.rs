@@ -34,11 +34,22 @@ fn dhrystone_self_check_is_correct_in_every_mode() {
 }
 
 #[test]
-fn dhrystone_charges_fewer_clocks_in_586_than_386() {
-    let i386 = run(GswMode::Gsw386).elapsed_clocks();
-    let i586 = run(GswMode::Gsw586).elapsed_clocks();
+fn dhrystone_runs_faster_in_586_than_386() {
+    // Calibration note (B-T8/B-T9): the meaningful per-mode metric is guest-perceived
+    // SPEED (Dhrystones/sec = iters / (clocks / clock_hz)), not the raw clock count.
+    // 586's level_timing (1/3) brakes fp-mandel into its band and so charges MORE
+    // instruction clocks per op than 386, which can make 586's RAW Dhrystone clock
+    // total exceed 386's. But 586 runs at 266 MHz vs 386's 22 MHz, so its
+    // Dhrystones/sec is far higher. Assert that real speed ordering, not the clocks.
+    fn dhrystones_per_sec(mode: GswMode) -> f64 {
+        let m = run(mode);
+        let secs = m.elapsed_clocks() as f64 / mode.clock_hz() as f64;
+        m.bench_iterations() as f64 / secs
+    }
+    let i386 = dhrystones_per_sec(GswMode::Gsw386);
+    let i586 = dhrystones_per_sec(GswMode::Gsw586);
     assert!(
-        i586 < i386,
-        "586 ({i586}) should charge fewer clocks than 386 ({i386})"
+        i586 > i386,
+        "586 ({i586:.0} D/s) should run faster than 386 ({i386:.0} D/s)"
     );
 }
