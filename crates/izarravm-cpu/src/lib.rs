@@ -1405,6 +1405,33 @@ impl Cpu386 {
     }
 
     pub fn cycle<B: CpuBus>(&mut self, bus: &mut B) -> Result<CycleOutcome, CpuError> {
+        // `cycle` is the per-instruction prologue (halt-wake + hardware interrupt
+        // service) followed by one instruction. The two halves are split so the
+        // machine batch loop can run the prologue once per batch and then run a
+        // sequence of instructions through `cycle_no_interrupt_check`:
+        // `interrupt_pending()` is driven by the PIC and cannot change mid-batch
+        // (devices advance only after the batch, and any guest PIC access ends the
+        // batch), so a per-batch interrupt check is equivalent to the old
+        // per-instruction one. Every existing caller keeps the old behavior because
+        // this thin wrapper composes the two halves exactly as before.
+        match self.service_pending_interrupt(bus)? {
+            Some(outcome) => Ok(outcome),
+            None => self.cycle_no_interrupt_check(bus),
+        }
+    }
+
+    /// The interrupt prologue of `cycle`: wake from HLT if an enabled interrupt is
+    /// pending, then service one pending hardware interrupt. Returns `Some(outcome)`
+    /// when this call produced a complete cycle (it stayed halted or it took an
+    /// interrupt) and `None` when the caller should run an instruction next. The
+    /// STI one-instruction shadow is *tested* here but NOT consumed: the consume
+    /// belongs to a running instruction (`cycle_no_interrupt_check`), so that when
+    /// the machine runs this once per batch a `STI; HLT` idle loop still eventually
+    /// takes its interrupt instead of spinning forever.
+    pub fn service_pending_interrupt<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+    ) -> Result<Option<CycleOutcome>, CpuError> {
         // Wake from HLT only when a maskable interrupt can actually be taken. The 386
         // exits HLT on an enabled interrupt; a masked or IF-disabled request leaves it
         // halted. NMI and the other non-maskable wake sources are out of scope.
@@ -1412,21 +1439,18 @@ impl Cpu386 {
             if self.flag(FLAG_IF) && bus.interrupt_pending() {
                 self.halted = false;
             } else {
-                return Ok(CycleOutcome {
+                return Ok(Some(CycleOutcome {
                     core_clocks: 1,
                     halted: true,
-                });
+                }));
             }
         }
 
-        // Consume the one-instruction shadow set by STI. While it is active the
-        // interrupt check below is skipped so the instruction after STI always
-        // executes before an interrupt can be taken.
-        let shadowed = self.interrupt_shadow;
-        self.interrupt_shadow = false;
-
-        // Service a pending hardware interrupt before fetching the next instruction.
-        if !shadowed && self.flag(FLAG_IF) && bus.interrupt_pending() {
+        // Test the one-instruction shadow set by STI without consuming it. While the
+        // shadow is active the interrupt check is skipped so the instruction after STI
+        // always executes before an interrupt can be taken; the consume happens in
+        // `cycle_no_interrupt_check` when that next instruction runs.
+        if !self.interrupt_shadow && self.flag(FLAG_IF) && bus.interrupt_pending() {
             if let Some(vector) = bus.acknowledge_interrupt() {
                 self.hardware_interrupt(bus, vector)
                     .map_err(|fault| match fault {
@@ -1435,12 +1459,27 @@ impl Cpu386 {
                     })?;
                 let charged = self.scale_clocks(61);
                 self.elapsed_clocks += charged;
-                return Ok(CycleOutcome {
+                return Ok(Some(CycleOutcome {
                     core_clocks: charged.min(u64::from(u32::MAX)) as u32,
                     halted: false,
-                });
+                }));
             }
         }
+
+        Ok(None)
+    }
+
+    /// Fetch and execute exactly one instruction with NO halt handling and NO
+    /// interrupt check. The caller (`cycle`, or the machine batch loop) is
+    /// responsible for having run `service_pending_interrupt` first. This consumes
+    /// the STI one-instruction shadow: a running instruction uses up the one-cycle
+    /// delay, so the instruction after STI runs here and the shadow is clear by the
+    /// next interrupt check.
+    pub fn cycle_no_interrupt_check<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+    ) -> Result<CycleOutcome, CpuError> {
+        self.interrupt_shadow = false;
 
         self.begin_instruction();
         let start_eip = self.registers.eip;
@@ -6136,6 +6175,17 @@ impl Cpu386 {
     /// True when the interrupt flag is set, so a maskable interrupt can be taken.
     pub fn interrupts_enabled(&self) -> bool {
         self.flag(FLAG_IF)
+    }
+
+    /// True when a maskable interrupt could be serviced at this instruction
+    /// boundary: IF is set AND the STI one-instruction shadow is not pending. The
+    /// machine batch loop watches this transition so it can end a batch whenever an
+    /// instruction makes an interrupt newly serviceable (POPF/IRET enabling IF, or
+    /// the instruction after STI consuming the shadow). That keeps the per-batch
+    /// interrupt check equivalent to the old per-instruction one without re-querying
+    /// the PIC inside the batch.
+    pub fn can_take_interrupt(&self) -> bool {
+        self.flag(FLAG_IF) && !self.interrupt_shadow
     }
 
     fn flag(&self, flag: u32) -> bool {
