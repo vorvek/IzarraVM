@@ -81,6 +81,18 @@ impl Keyboard8042 {
         self.mouse.reporting = on;
     }
 
+    /// Put the aux device into IntelliMouse 4-byte mode (the platform enables wheel
+    /// support at mouse-enable).
+    pub fn enable_mouse_wheel(&mut self) {
+        self.mouse.enable_wheel();
+    }
+
+    /// Test seam: report whether the aux device is in IntelliMouse 4-byte mode.
+    #[cfg(test)]
+    pub fn mouse_wheel_enabled(&self) -> bool {
+        self.mouse.is_intellimouse()
+    }
+
     /// Enable or disable IRQ12 (the mouse interrupt) in the 8042 command byte,
     /// the seam the BIOS INT 15h AX=C200/C205 services use when they enable the
     /// pointing device. A real PS/2 BIOS enabling the mouse sets command-byte

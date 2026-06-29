@@ -44,6 +44,19 @@ impl Default for Ps2Mouse {
 }
 
 impl Ps2Mouse {
+    /// Put the device into IntelliMouse (4-byte / wheel) mode. The platform enables
+    /// this at mouse-enable; the magic knock also reaches it via write_byte.
+    pub(crate) fn enable_wheel(&mut self) {
+        self.device_id = 0x03;
+        self.intellimouse = true;
+    }
+
+    /// Test seam: whether the device is in IntelliMouse 4-byte (wheel) mode.
+    #[cfg(test)]
+    pub(crate) fn is_intellimouse(&self) -> bool {
+        self.intellimouse
+    }
+
     /// Handle a byte the guest wrote to the mouse (via the controller's 0xD4
     /// path). Most commands queue an ACK (0xFA); a parameter-taking command
     /// (set sample rate / resolution) records the next byte as its parameter.
@@ -55,8 +68,7 @@ impl Ps2Mouse {
                     self.sample_rate = value;
                     self.rate_history = [self.rate_history[1], self.rate_history[2], value];
                     if self.rate_history == [200, 100, 80] {
-                        self.device_id = 0x03;
-                        self.intellimouse = true;
+                        self.enable_wheel();
                     }
                 }
                 0xE8 => self.resolution = value,
