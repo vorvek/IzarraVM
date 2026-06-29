@@ -871,6 +871,20 @@ enum DecodeGroup {
     /// AL forms, operand-size width for the AX/EAX forms), so `io_touched` is set exactly as before.
     /// The string I/O ops INS/OUTS (0x6c-0x6f) are NOT here — they stay on Fallback.
     PortIo,
+    /// The two-byte bit-manipulation block (task A10): BT/BTS/BTR/BTC with a reg bit index
+    /// (0F A3/AB/B3/BB), BT/BTS/BTR/BTC with an imm8 bit index (0F BA group 8, /4../7), BSF/BSR
+    /// (0F BC/BD), the double-precision shifts SHLD/SHRD (0F A4/A5/AC/AD, count imm8 or CL),
+    /// CMPXCHG (0F B0/B1), and XADD (0F C0/C1). Every one is a ModRM r/m form, so `decode` parses
+    /// the ModRM + addressing descriptor for all of them; only the imm8-count forms (0F BA, and the
+    /// SHLD/SHRD imm8 variants 0F A4/AC) carry an immediate after the ModRM, which `decode` fetches
+    /// into `insn.imm`. The executor reuses `bit_string_op` (so the classic BT-memory bit-offset
+    /// addressing — a reg bit index that walks past the operand width into an adjacent memory
+    /// element — is computed at execute from the LIVE reg index, never cached at decode),
+    /// `double_shift`, `alu_sub`, and `alu_add` verbatim, so the CF/ZF/flag semantics live in one
+    /// place. Folded into `insn.opcode` as 0x0F00 | second by the two-byte convention and dispatched
+    /// off the full u16 (the `as u8` low byte of 0x0Fa4/a5/b0/b1/c0/c1 would alias single-byte
+    /// opcodes).
+    BitManip,
     /// Not yet converted to the split: decode parses nothing extra and `execute_decoded` hands the
     /// opcode to the shared fused `dispatch_opcode`.
     Fallback,
@@ -1196,6 +1210,11 @@ impl Cpu386 {
                 // Two-byte Jcc near (0F 80-0F 8F, rel16/32). The branch group (task A6a) handles
                 // these; every other 0F opcode stays on the un-converted fused path.
                 0x80..=0x8f => DecodeGroup::Branch,
+                // Two-byte bit-manipulation block (task A10): BT/BTS/BTR/BTC reg (A3/AB/B3/BB),
+                // BT/BTS/BTR/BTC imm8 (BA group 8), BSF/BSR (BC/BD), SHLD/SHRD (A4/A5/AC/AD),
+                // CMPXCHG (B0/B1), XADD (C0/C1). Every one is a ModRM r/m form.
+                0xa3 | 0xab | 0xb3 | 0xbb | 0xba | 0xbc | 0xbd | 0xa4 | 0xa5 | 0xac | 0xad
+                | 0xb0 | 0xb1 | 0xc0 | 0xc1 => DecodeGroup::BitManip,
                 _ => DecodeGroup::TwoByteFallback,
             };
         }
@@ -1609,6 +1628,25 @@ impl Cpu386 {
                     insn.imm = u32::from(self.fetch_u8(bus)?);
                 }
             }
+            DecodeGroup::BitManip => {
+                // Two-byte bit-manipulation block. Every opcode is a ModRM r/m form; parse the
+                // ModRM + addressing descriptor (instruction bytes only, so it stays cacheable)
+                // for all of them. The reg field is the source register for BT/BTS/BTR/BTC reg,
+                // SHLD/SHRD, CMPXCHG, and XADD; the destination register for BSF/BSR; and the
+                // sub-op selector (the /ext) for the 0F BA group. The bit-offset-adjusted memory
+                // address for the BT-memory reg form is computed at EXECUTE from the live reg bit
+                // index (in `bit_string_op`), so decode captures only the base descriptor here.
+                let modrm = self.fetch_modrm(bus)?;
+                let operand = self.parse_addressing_mode(bus, prefixes, address_size, modrm)?;
+                insn.modrm = Some(modrm);
+                insn.operand = Some(operand);
+                // Three forms carry an imm8 AFTER the ModRM+displacement: 0F BA (the bit index)
+                // and the SHLD/SHRD imm8 variants 0F A4/AC (the shift count). The CL-count forms
+                // 0F A5/AD and the reg-index/reg-source forms carry no immediate.
+                if let 0xba | 0xa4 | 0xac = insn.opcode & 0xff {
+                    insn.imm = u32::from(self.fetch_u8(bus)?);
+                }
+            }
             // Both fallback groups pre-parse nothing in `decode` (the second 0F byte was already
             // folded into `insn.opcode` above): their executors re-read any ModRM/immediate from the
             // post-opcode eip in the shared fused dispatch.
@@ -1674,6 +1712,11 @@ impl Cpu386 {
             // runs through its split executor, which calls `bus.read_io`/`bus.write_io` on the same
             // port-dispatch path as the fused arms — so `io_touched` is set exactly as before.
             DecodeGroup::PortIo => self.execute_port_io_decoded(insn, bus),
+            // The two-byte bit-manipulation block (BT/BTS/BTR/BTC, BSF/BSR, SHLD/SHRD, CMPXCHG,
+            // XADD) runs through its split executor, consuming the pre-decoded ModRM/operand (and
+            // the pre-fetched imm8 for 0F BA/A4/AC) and reusing `bit_string_op`/`double_shift`/
+            // `alu_sub`/`alu_add` verbatim so the bit-addressing and flag logic stays in one place.
+            DecodeGroup::BitManip => self.execute_bitmanip_decoded(insn, bus),
             DecodeGroup::TwoByteFallback => {
                 // Un-converted two-byte (0F) opcode. `decode` already read + charged the second
                 // byte and applied the ISA gate, folding it into `insn.opcode` as 0x0F00 | second.
@@ -2789,6 +2832,181 @@ impl Cpu386 {
         }
     }
 
+    /// The two-byte bit-manipulation block (BT/BTS/BTR/BTC reg+imm8, BSF/BSR, SHLD/SHRD, CMPXCHG,
+    /// XADD) through the decode/execute split. Each arm mirrors the former `execute_two_byte`
+    /// handler verbatim — same operand wiring, same read/write order, same clocks — but consumes the
+    /// ModRM/operand `decode` pre-parsed and the imm8 `decode` pre-fetched (for 0F BA/A4/AC). Memory
+    /// operands resolve from the pre-decoded descriptor, so the effective address is recomputed
+    /// against the live registers each call; for the BT-memory reg form the live reg bit index can
+    /// walk the address past the operand width, which `bit_string_op` handles unchanged. Dispatch is
+    /// off the FULL u16 `insn.opcode` because the `as u8` low byte of 0x0Fa4/a5/b0/b1/c0/c1 aliases
+    /// single-byte opcodes; the second 0F byte is never re-read and the ISA gate is never re-applied
+    /// (both already done once in `decode`).
+    fn execute_bitmanip_decoded<B: CpuBus>(
+        &mut self,
+        insn: &DecodedInsn,
+        bus: &mut B,
+    ) -> ExecResult<CycleOutcome> {
+        let operand_size = insn.operand_size;
+        let address_size = insn.address_size;
+
+        match insn.opcode {
+            0x0fbc => {
+                // BSF: index of the lowest set bit. Source 0 -> ZF=1, destination unchanged
+                // (386 silicon; Intel documents the destination as undefined).
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let src =
+                    self.read_operand_sized(bus, operand, operand_size)? & operand_size.mask();
+                if src == 0 {
+                    self.set_flag(FLAG_ZF, true);
+                } else {
+                    self.set_flag(FLAG_ZF, false);
+                    self.write_gpr_sized(modrm.reg, operand_size, src.trailing_zeros());
+                }
+                Ok(clocks(10))
+            }
+            0x0fbd => {
+                // BSR: index of the highest set bit. Source 0 -> ZF=1, destination unchanged
+                // (386 silicon; Intel documents the destination as undefined).
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let src =
+                    self.read_operand_sized(bus, operand, operand_size)? & operand_size.mask();
+                if src == 0 {
+                    self.set_flag(FLAG_ZF, true);
+                } else {
+                    self.set_flag(FLAG_ZF, false);
+                    self.write_gpr_sized(modrm.reg, operand_size, 31 - src.leading_zeros());
+                }
+                Ok(clocks(10))
+            }
+            0x0fa3 | 0x0fab | 0x0fb3 | 0x0fbb => {
+                // BT/BTS/BTR/BTC r/m, r. The opcodes are 8 apart: A3=BT, AB=BTS, B3=BTR, BB=BTC.
+                // The bit index in the reg operand is signed for a memory operand; the adjusted
+                // address is computed inside `bit_string_op` from the live reg index (register_index
+                // = true), never pre-resolved at decode.
+                let op = ((insn.opcode as u8) - 0xa3) / 8;
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let index = self.read_gpr_sized(modrm.reg, operand_size);
+                self.bit_string_op(bus, op, operand, index, operand_size, address_size, true)?;
+                Ok(clocks(6))
+            }
+            0x0fba => {
+                // BT/BTS/BTR/BTC r/m, imm8: /4=BT, /5=BTS, /6=BTR, /7=BTC. The imm8 was fetched by
+                // `decode` (after the ModRM+displacement) into `insn.imm`. /0../3 are not defined
+                // bit-test ops and #UD before the operation runs (matching the fused handler, which
+                // resolved the operand and read the imm8 first, then faulted on the bad /ext).
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                if modrm.reg < 4 {
+                    return Err(InternalFault::Exception {
+                        vector: 6,
+                        error_code: None,
+                    });
+                }
+                let op = modrm.reg - 4;
+                self.bit_string_op(
+                    bus,
+                    op,
+                    operand,
+                    insn.imm,
+                    operand_size,
+                    address_size,
+                    false,
+                )?;
+                Ok(clocks(6))
+            }
+            0x0fa4 | 0x0fac => {
+                // SHLD (A4) / SHRD (AC) r/m, r, imm8. The imm8 count was fetched by `decode` into
+                // `insn.imm`. Read order (src reg, then dest r/m) matches the fused handler.
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let src = self.read_gpr_sized(modrm.reg, operand_size);
+                let count = insn.imm as u8;
+                let dest = self.read_operand_sized(bus, operand, operand_size)?;
+                let result =
+                    self.double_shift(insn.opcode == 0x0fa4, dest, src, count, operand_size);
+                self.write_operand_sized(bus, operand, operand_size, result)?;
+                Ok(clocks(3))
+            }
+            0x0fa5 | 0x0fad => {
+                // SHLD (A5) / SHRD (AD) r/m, r, CL. No immediate — the count is the low byte of CL.
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let src = self.read_gpr_sized(modrm.reg, operand_size);
+                let count = (self.registers.ecx() & 0xff) as u8;
+                let dest = self.read_operand_sized(bus, operand, operand_size)?;
+                let result =
+                    self.double_shift(insn.opcode == 0x0fa5, dest, src, count, operand_size);
+                self.write_operand_sized(bus, operand, operand_size, result)?;
+                Ok(clocks(3))
+            }
+            0x0fb0 | 0x0fb1 => {
+                // CMPXCHG r/m, r. B0 is the byte form, B1 the word/dword form. Compare the
+                // accumulator (AL/AX/EAX) with the destination exactly like CMP (acc - dest),
+                // setting every ALU flag from that subtraction. If they are equal (ZF set after
+                // the compare) the source register is stored into the destination; otherwise the
+                // destination value is loaded into the accumulator. Either way the destination is
+                // written once, which is what makes the LOCK form meaningful.
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let size = if insn.opcode == 0x0fb0 {
+                    None
+                } else {
+                    Some(operand_size)
+                };
+                match size {
+                    None => {
+                        let dest = self.read_operand_u8(bus, operand)?;
+                        let acc = self.read_gpr8(0);
+                        self.alu_sub(u32::from(acc), u32::from(dest), 0, BusWidth::Byte);
+                        if self.flag(FLAG_ZF) {
+                            let src = self.read_gpr8(modrm.reg);
+                            self.write_operand_u8(bus, operand, src)?;
+                        } else {
+                            self.write_gpr8(0, dest);
+                            // Re-write the destination with its own value so the bus sees a write
+                            // even on the unequal branch, matching the architectural read-modify-
+                            // write of CMPXCHG.
+                            self.write_operand_u8(bus, operand, dest)?;
+                        }
+                    }
+                    Some(size) => {
+                        let dest = self.read_operand_sized(bus, operand, size)?;
+                        let acc = self.read_gpr_sized(0, size);
+                        self.alu_sub(acc, dest, 0, size.bus_width());
+                        if self.flag(FLAG_ZF) {
+                            let src = self.read_gpr_sized(modrm.reg, size);
+                            self.write_operand_sized(bus, operand, size, src)?;
+                        } else {
+                            self.write_gpr_sized(0, size, dest);
+                            self.write_operand_sized(bus, operand, size, dest)?;
+                        }
+                    }
+                }
+                Ok(clocks(6))
+            }
+            0x0fc0 | 0x0fc1 => {
+                // XADD r/m, r. C0 is the byte form, C1 the word/dword form. The exchange-and-add
+                // first saves the destination, then writes dest + src back to the destination and
+                // copies the saved destination into the source register. The flags come out
+                // exactly like ADD of the two operands (reuse alu_add).
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                if insn.opcode == 0x0fc0 {
+                    let dest = self.read_operand_u8(bus, operand)?;
+                    let src = self.read_gpr8(modrm.reg);
+                    let sum =
+                        self.alu_add(u32::from(dest), u32::from(src), 0, BusWidth::Byte) as u8;
+                    self.write_operand_u8(bus, operand, sum)?;
+                    self.write_gpr8(modrm.reg, dest);
+                } else {
+                    let dest = self.read_operand_sized(bus, operand, operand_size)?;
+                    let src = self.read_gpr_sized(modrm.reg, operand_size);
+                    let sum = self.alu_add(dest, src, 0, operand_size.bus_width());
+                    self.write_operand_sized(bus, operand, operand_size, sum)?;
+                    self.write_gpr_sized(modrm.reg, operand_size, dest);
+                }
+                Ok(clocks(4))
+            }
+            opcode => unreachable!("bit-manipulation opcode {opcode:#x}"),
+        }
+    }
+
     /// The far/indirect/RET/INT control-flow block + 0xff group 5 through the decode/execute split.
     /// Each arm mirrors the former fused handler verbatim — same far-pointer reconstruction, same
     /// ret/retf and interrupt/IRET delivery, same FF sub-op dispatch off `modrm.reg`, same clocks —
@@ -3628,92 +3846,10 @@ impl Cpu386 {
                 self.write_gpr_sized(modrm.reg, operand_size, result);
                 Ok(clocks(9))
             }
-            0xbc => {
-                // BSF: index of the lowest set bit. Source 0 -> ZF=1, destination unchanged
-                // (386 silicon; Intel documents the destination as undefined).
-                let modrm = self.fetch_modrm(bus)?;
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                let src =
-                    self.read_operand_sized(bus, operand, operand_size)? & operand_size.mask();
-                if src == 0 {
-                    self.set_flag(FLAG_ZF, true);
-                } else {
-                    self.set_flag(FLAG_ZF, false);
-                    self.write_gpr_sized(modrm.reg, operand_size, src.trailing_zeros());
-                }
-                Ok(clocks(10))
-            }
-            0xbd => {
-                // BSR: index of the highest set bit. Source 0 -> ZF=1, destination unchanged
-                // (386 silicon; Intel documents the destination as undefined).
-                let modrm = self.fetch_modrm(bus)?;
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                let src =
-                    self.read_operand_sized(bus, operand, operand_size)? & operand_size.mask();
-                if src == 0 {
-                    self.set_flag(FLAG_ZF, true);
-                } else {
-                    self.set_flag(FLAG_ZF, false);
-                    self.write_gpr_sized(modrm.reg, operand_size, 31 - src.leading_zeros());
-                }
-                Ok(clocks(10))
-            }
-            0xa3 | 0xab | 0xb3 | 0xbb => {
-                // BT/BTS/BTR/BTC r/m, r. The opcodes are 8 apart: A3=BT, AB=BTS, B3=BTR, BB=BTC.
-                // The bit index in the reg operand is signed for a memory operand.
-                let op = (opcode - 0xa3) / 8;
-                let modrm = self.fetch_modrm(bus)?;
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                let index = self.read_gpr_sized(modrm.reg, operand_size);
-                self.bit_string_op(bus, op, operand, index, operand_size, address_size, true)?;
-                Ok(clocks(6))
-            }
-            0xba => {
-                // BT/BTS/BTR/BTC r/m, imm8: /4=BT, /5=BTS, /6=BTR, /7=BTC. The imm8 follows the
-                // ModRM and displacement. /0../3 are not defined bit-test ops.
-                let modrm = self.fetch_modrm(bus)?;
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                let imm = self.fetch_u8(bus)?;
-                if modrm.reg < 4 {
-                    return Err(InternalFault::Exception {
-                        vector: 6,
-                        error_code: None,
-                    });
-                }
-                let op = modrm.reg - 4;
-                self.bit_string_op(
-                    bus,
-                    op,
-                    operand,
-                    u32::from(imm),
-                    operand_size,
-                    address_size,
-                    false,
-                )?;
-                Ok(clocks(6))
-            }
-            0xa4 | 0xac => {
-                // SHLD (A4) / SHRD (AC) r/m, r, imm8. The imm8 follows the ModRM and displacement.
-                let modrm = self.fetch_modrm(bus)?;
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                let src = self.read_gpr_sized(modrm.reg, operand_size);
-                let count = self.fetch_u8(bus)?;
-                let dest = self.read_operand_sized(bus, operand, operand_size)?;
-                let result = self.double_shift(opcode == 0xa4, dest, src, count, operand_size);
-                self.write_operand_sized(bus, operand, operand_size, result)?;
-                Ok(clocks(3))
-            }
-            0xa5 | 0xad => {
-                // SHLD (A5) / SHRD (AD) r/m, r, CL.
-                let modrm = self.fetch_modrm(bus)?;
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                let src = self.read_gpr_sized(modrm.reg, operand_size);
-                let count = (self.registers.ecx() & 0xff) as u8;
-                let dest = self.read_operand_sized(bus, operand, operand_size)?;
-                let result = self.double_shift(opcode == 0xa5, dest, src, count, operand_size);
-                self.write_operand_sized(bus, operand, operand_size, result)?;
-                Ok(clocks(3))
-            }
+            // BSF/BSR (0xbc/0xbd), BT/BTS/BTR/BTC reg (0xa3/0xab/0xb3/0xbb) and imm8 (0xba), and
+            // SHLD/SHRD (0xa4/0xac imm8, 0xa5/0xad CL) are converted to the decode/execute split
+            // (task A10): `route_group` classifies them as `DecodeGroup::BitManip` and
+            // `execute_bitmanip_decoded` runs them. Not handled here.
             0x08 | 0x09 => {
                 // INVD (08) / WBINVD (09): flush the internal caches. Both are privileged and
                 // raise #UD outside CPL 0. We model no cache, so they are no-ops after the
@@ -3727,74 +3863,9 @@ impl Cpu386 {
                 }
                 Ok(clocks(4))
             }
-            0xb0 | 0xb1 => {
-                // CMPXCHG r/m, r. B0 is the byte form, B1 the word/dword form. Compare the
-                // accumulator (AL/AX/EAX) with the destination exactly like CMP (acc - dest),
-                // setting every ALU flag from that subtraction. If they are equal (ZF set after
-                // the compare) the source register is stored into the destination; otherwise the
-                // destination value is loaded into the accumulator. Either way the destination is
-                // written once, which is what makes the LOCK form meaningful.
-                let modrm = self.fetch_modrm(bus)?;
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                let size = if opcode == 0xb0 {
-                    None
-                } else {
-                    Some(operand_size)
-                };
-                match size {
-                    None => {
-                        let dest = self.read_operand_u8(bus, operand)?;
-                        let acc = self.read_gpr8(0);
-                        self.alu_sub(u32::from(acc), u32::from(dest), 0, BusWidth::Byte);
-                        if self.flag(FLAG_ZF) {
-                            let src = self.read_gpr8(modrm.reg);
-                            self.write_operand_u8(bus, operand, src)?;
-                        } else {
-                            self.write_gpr8(0, dest);
-                            // Re-write the destination with its own value so the bus sees a write
-                            // even on the unequal branch, matching the architectural read-modify-
-                            // write of CMPXCHG.
-                            self.write_operand_u8(bus, operand, dest)?;
-                        }
-                    }
-                    Some(size) => {
-                        let dest = self.read_operand_sized(bus, operand, size)?;
-                        let acc = self.read_gpr_sized(0, size);
-                        self.alu_sub(acc, dest, 0, size.bus_width());
-                        if self.flag(FLAG_ZF) {
-                            let src = self.read_gpr_sized(modrm.reg, size);
-                            self.write_operand_sized(bus, operand, size, src)?;
-                        } else {
-                            self.write_gpr_sized(0, size, dest);
-                            self.write_operand_sized(bus, operand, size, dest)?;
-                        }
-                    }
-                }
-                Ok(clocks(6))
-            }
-            0xc0 | 0xc1 => {
-                // XADD r/m, r. C0 is the byte form, C1 the word/dword form. The exchange-and-add
-                // first saves the destination, then writes dest + src back to the destination and
-                // copies the saved destination into the source register. The flags come out
-                // exactly like ADD of the two operands (reuse alu_add).
-                let modrm = self.fetch_modrm(bus)?;
-                let operand = self.decode_rm_operand(bus, prefixes, address_size, modrm)?;
-                if opcode == 0xc0 {
-                    let dest = self.read_operand_u8(bus, operand)?;
-                    let src = self.read_gpr8(modrm.reg);
-                    let sum =
-                        self.alu_add(u32::from(dest), u32::from(src), 0, BusWidth::Byte) as u8;
-                    self.write_operand_u8(bus, operand, sum)?;
-                    self.write_gpr8(modrm.reg, dest);
-                } else {
-                    let dest = self.read_operand_sized(bus, operand, operand_size)?;
-                    let src = self.read_gpr_sized(modrm.reg, operand_size);
-                    let sum = self.alu_add(dest, src, 0, operand_size.bus_width());
-                    self.write_operand_sized(bus, operand, operand_size, sum)?;
-                    self.write_gpr_sized(modrm.reg, operand_size, dest);
-                }
-                Ok(clocks(4))
-            }
+            // CMPXCHG (0xb0/0xb1) and XADD (0xc0/0xc1) are converted to the decode/execute split
+            // (task A10): `route_group` classifies them as `DecodeGroup::BitManip` and
+            // `execute_bitmanip_decoded` runs them. Not handled here.
             0xa2 => {
                 // CPUID (0F A2). Not privileged: it runs at any CPL. The leaf selector is in
                 // EAX. The result registers are EAX, EBX, ECX, EDX (full 32-bit writes). We
@@ -18364,6 +18435,392 @@ mod tests {
                 fused.registers.gpr,
                 fused.registers.eflags,
                 fused.registers.eip,
+                fetch,
+            );
+        }
+    }
+
+    // ── Task A10: bit-manipulation golden battery ─────────────────────────────────────────────────
+
+    /// One golden end-state for a bit-manipulation case (task A10). BT/BTS/BTR/BTC, BSF/BSR,
+    /// SHLD/SHRD, CMPXCHG, and XADD all set flags (CF for BT-family, ZF for BSF/BSR/CMPXCHG, the
+    /// full ALU set for SHLD/SHRD/CMPXCHG/XADD), write registers, and — for the memory r/m forms —
+    /// write memory, so this captures the full register file, eflags, eip, memory-write deltas, and
+    /// the InstructionPrefetch fetch count. `eip` proves decode consumed the right number of bytes
+    /// (incl. the 0F second byte and the imm8 for 0F BA/A4/AC); `fetch` proves each instruction byte
+    /// was charged exactly once.
+    struct BitManipGolden {
+        name: &'static str,
+        code: &'static [u8],
+        gpr: [u32; 8],
+        eflags: u32,
+        eip: u32,
+        deltas: &'static [(usize, u8)],
+        fetch: usize,
+    }
+
+    /// Seed for the bit-manipulation golden battery. Real-mode, DS=0, with a scratch word region
+    /// the memory r/m forms address. Registers are chosen so each op has a non-trivial, observable
+    /// result: BX=3 (a bit index that exercises CF and the set/reset/toggle write-backs), CX=0x0008
+    /// (so the BTR/BTC register cases find bit 3 already set), and a known pattern at the scratch
+    /// region for the memory BT-walk cases. The instruction is placed at offset 0; the scratch
+    /// region starts at 0x40.
+    fn bitmanip_seed(cpu: &mut Cpu386) {
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        // AX=0x0034 (accumulator for CMPXCHG: matches the planted dest 0x0034 so the equal branch
+        // fires), CX=0x0008 (bit 3 set, for BTR/BTC register cases), DX=0x0506, BX=3 (bit index /
+        // CMPXCHG-XADD source), SP=0x00f0, BP=0x0010, SI=0x0008, DI=0x0018.
+        cpu.write_reg16(Reg16::Ax, 0x0034);
+        cpu.write_reg16(Reg16::Cx, 0x0008);
+        cpu.write_reg16(Reg16::Dx, 0x0506);
+        cpu.write_reg16(Reg16::Bx, 0x0003);
+        cpu.write_reg16(Reg16::Sp, 0x00f0);
+        cpu.write_reg16(Reg16::Bp, 0x0010);
+        cpu.write_reg16(Reg16::Si, 0x0008);
+        cpu.write_reg16(Reg16::Di, 0x0018);
+        // eflags: only the always-set reserved bit 1.
+        cpu.registers.eflags = 0x02;
+    }
+
+    /// Lay the instruction bytes at offset 0 and plant the scratch data the memory r/m forms read.
+    /// Word at 0x40 = 0x1234 (the BTS positive-index walk lands in the NEXT word at 0x42, proving
+    /// the bit-offset addressing), byte at 0x40 = 0x34 also serves as the CMPXCHG/XADD byte dest.
+    fn bitmanip_seed_mem(mem: &mut [u8], code: &[u8]) {
+        mem[..code.len()].copy_from_slice(code);
+        // Scratch words: 0x40 = 0x1234, 0x42 = 0x0000, 0x44 = 0xffff (so a positive walk into 0x42
+        // sets a bit in a zero word, observable as a clean single-byte delta).
+        mem[0x40..0x42].copy_from_slice(&0x1234u16.to_le_bytes());
+        mem[0x42..0x44].copy_from_slice(&0x0000u16.to_le_bytes());
+        mem[0x44..0x46].copy_from_slice(&0xffffu16.to_le_bytes());
+    }
+
+    /// The bit-manipulation differential battery (task A10). Captured from the PRIOR fused reference
+    /// (`execute_instruction_legacy`) via `regen_bitmanip_goldens`; see `alu_golden_cases` for the
+    /// full capture recipe. Never edit by hand — re-run the regen from the pre-split commit
+    /// (parent 430a6051) WHILE the fused arms (0F A3/AB/B3/BB/BA/BC/BD/A4/A5/AC/AD/B0/B1/C0/C1)
+    /// still exist in `execute_two_byte`, then paste, then delete the fused arms.
+    fn bitmanip_golden_cases() -> &'static [BitManipGolden] {
+        &[
+            // BT CX, BX (0F A3 D9): test bit BX=3 of CX=0x0008 (bit 3 set) -> CF=1, no write.
+            BitManipGolden {
+                name: "bt cx,bx (0f a3 d9)",
+                code: &[15, 163, 217],
+                gpr: [52, 8, 1286, 3, 240, 16, 8, 24],
+                eflags: 0x3,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+            },
+            // BTS CX, BX (0F AB D9): set bit 3 of CX=0x0008 (already set) -> CF=1, CX unchanged.
+            BitManipGolden {
+                name: "bts cx,bx (0f ab d9)",
+                code: &[15, 171, 217],
+                gpr: [52, 8, 1286, 3, 240, 16, 8, 24],
+                eflags: 0x3,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+            },
+            // BTR CX, BX (0F B3 D9): reset bit 3 of CX=0x0008 -> CF=1 (old bit), CX=0x0000.
+            BitManipGolden {
+                name: "btr cx,bx (0f b3 d9)",
+                code: &[15, 179, 217],
+                gpr: [52, 0, 1286, 3, 240, 16, 8, 24],
+                eflags: 0x3,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+            },
+            // BTC CX, BX (0F BB D9): toggle bit 3 of CX=0x0008 -> CF=1 (old), CX=0x0000.
+            BitManipGolden {
+                name: "btc cx,bx (0f bb d9)",
+                code: &[15, 187, 217],
+                gpr: [52, 0, 1286, 3, 240, 16, 8, 24],
+                eflags: 0x3,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+            },
+            // BTS [0x40], BX (0F AB 1E 40 00): BX=3 -> sets bit 3 of the word at 0x40=0x1234.
+            // (No walk: index 3 < 16, lands in the first word.) 0x1234 has bit 3 clear, so the low
+            // byte goes 0x34 -> 0x3c (=60): delta (64, 60). CF=0 (old bit clear).
+            BitManipGolden {
+                name: "bts [0x40],bx no-walk (0f ab 1e 40 00)",
+                code: &[15, 171, 30, 64, 0],
+                gpr: [52, 8, 1286, 3, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x5,
+                deltas: &[(64, 60)],
+                fetch: 6,
+            },
+            // BTS [0x40], DX with DX=16 -> bit index 16 walks to the NEXT word at 0x42 (the subtle
+            // BT-memory case): sets bit 0 of the 0x0000 word at 0x42, so the delta is at byte 66
+            // (=0x42), NOT the base 0x40. This is the load-bearing assertion for bit-offset
+            // addressing: the write must land in the adjacent element. DX is overridden to 16.
+            BitManipGolden {
+                name: "bts [0x40],dx walk-to-next-word (0f ab 16 40 00)",
+                code: &[15, 171, 22, 64, 0],
+                gpr: [52, 8, 16, 3, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x5,
+                deltas: &[(66, 1)],
+                fetch: 6,
+            },
+            // BTS [0x40], imm8=5 (0F BA 2E 40 00 05): /5=BTS, fixed imm8 index 5 -> bit 5 of the
+            // word at 0x40=0x1234 is already set, so CF=1 and NO memory write (no delta). Proves the
+            // imm8 form addresses the base word and the unchanged-write path.
+            BitManipGolden {
+                name: "bts [0x40],5 (0f ba 2e 40 00 05)",
+                code: &[15, 186, 46, 64, 0, 5],
+                gpr: [52, 8, 1286, 3, 240, 16, 8, 24],
+                eflags: 0x3,
+                eip: 0x6,
+                deltas: &[],
+                fetch: 7,
+            },
+            // BT CX, imm8=3 (0F BA E1 03): /4=BT, mod=3 rm=CX -> CF = bit 3 of CX=0x0008 = 1.
+            BitManipGolden {
+                name: "bt cx,3 (0f ba e1 03)",
+                code: &[15, 186, 225, 3],
+                gpr: [52, 8, 1286, 3, 240, 16, 8, 24],
+                eflags: 0x3,
+                eip: 0x4,
+                deltas: &[],
+                fetch: 5,
+            },
+            // BSF BX, CX (0F BC D9): CX=0x0008 -> lowest set bit index 3 into BX, ZF=0.
+            BitManipGolden {
+                name: "bsf bx,cx (0f bc d9)",
+                code: &[15, 188, 217],
+                gpr: [52, 8, 1286, 3, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+            },
+            // BSR BX, CX (0F BD D9): CX=0x0008 -> highest set bit index 3 into BX, ZF=0.
+            BitManipGolden {
+                name: "bsr bx,cx (0f bd d9)",
+                code: &[15, 189, 217],
+                gpr: [52, 8, 1286, 3, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+            },
+            // BSF BX, CX with CX=0 (0F BC D9, CX overridden to 0): ZF=1 (eflags 0x42), BX preserved
+            // at its preset 0xbeef (=48879). Proves the zero-source path leaves the destination.
+            BitManipGolden {
+                name: "bsf bx,cx zero-src (0f bc d9)",
+                code: &[15, 188, 217],
+                gpr: [52, 0, 1286, 48879, 240, 16, 8, 24],
+                eflags: 0x42,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+            },
+            // SHLD AX, BX, imm8=4 (0F A4 D8 04): mod=3 reg=BX rm=AX. AX=0x0034, BX=3 -> shifts AX
+            // left 4, filling from BX's high bits -> AX=0x0340 (=832). Proves the imm8 count + flags.
+            BitManipGolden {
+                name: "shld ax,bx,4 (0f a4 d8 04)",
+                code: &[15, 164, 216, 4],
+                gpr: [832, 8, 1286, 3, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x4,
+                deltas: &[],
+                fetch: 5,
+            },
+            // SHRD AX, BX, imm8=4 (0F AC D8 04): shifts AX right 4, filling from BX's low bits ->
+            // AX=0x3003 (=12291), CF=1 + PF (eflags 0x6).
+            BitManipGolden {
+                name: "shrd ax,bx,4 (0f ac d8 04)",
+                code: &[15, 172, 216, 4],
+                gpr: [12291, 8, 1286, 3, 240, 16, 8, 24],
+                eflags: 0x6,
+                eip: 0x4,
+                deltas: &[],
+                fetch: 5,
+            },
+            // SHLD AX, BX, CL (0F A5 D8): CL=8 (CX=0x0008 -> CL=8) -> shift AX left 8 -> AX=0x3400
+            // (=13312).
+            BitManipGolden {
+                name: "shld ax,bx,cl (0f a5 d8)",
+                code: &[15, 165, 216],
+                gpr: [13312, 8, 1286, 3, 240, 16, 8, 24],
+                eflags: 0x6,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+            },
+            // SHRD AX, BX, CL (0F AD D8): CL=8 -> shift AX right 8 -> AX=0x0300 (=768).
+            BitManipGolden {
+                name: "shrd ax,bx,cl (0f ad d8)",
+                code: &[15, 173, 216],
+                gpr: [768, 8, 1286, 3, 240, 16, 8, 24],
+                eflags: 0x6,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+            },
+            // CMPXCHG [0x40], BL byte form (0F B0 1E 40 00): AL=0x34 == dest byte 0x34 -> equal:
+            // ZF=1 (eflags 0x46), store BL=3 into [0x40]: delta (64, 3). The equal branch + write.
+            BitManipGolden {
+                name: "cmpxchg [0x40],bl equal (0f b0 1e 40 00)",
+                code: &[15, 176, 30, 64, 0],
+                gpr: [52, 8, 1286, 3, 240, 16, 8, 24],
+                eflags: 0x46,
+                eip: 0x5,
+                deltas: &[(64, 3)],
+                fetch: 6,
+            },
+            // CMPXCHG CX, BX word form (0F B1 D9): AX=0x0034 != CX=0x0008 -> unequal: ZF=0
+            // (eflags 0x12), load CX into AX (AX=0x0008). Register dest, the unequal re-write.
+            BitManipGolden {
+                name: "cmpxchg cx,bx unequal (0f b1 d9)",
+                code: &[15, 177, 217],
+                gpr: [8, 8, 1286, 3, 240, 16, 8, 24],
+                eflags: 0x12,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+            },
+            // XADD BL, CL byte form (0F C0 CB): mod=3 reg=CL(1) rm=BL(3). dest=BL=3, src=CL=8 ->
+            // BL=11, CL=3 (old dest), flags like ADD(3,8).
+            BitManipGolden {
+                name: "xadd bl,cl (0f c0 cb)",
+                code: &[15, 192, 203],
+                gpr: [52, 3, 1286, 11, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+            },
+            // XADD [0x40], CX word form (0F C1 0E 40 00): dest=word[0x40]=0x1234, src=CX=0x0008 ->
+            // [0x40]=0x123c (low byte 0x34 -> 0x3c=60: delta (64, 60)), CX=0x1234 (=4660, old dest),
+            // flags like ADD. Proves the memory XADD path.
+            BitManipGolden {
+                name: "xadd [0x40],cx (0f c1 0e 40 00)",
+                code: &[15, 193, 14, 64, 0],
+                gpr: [52, 4660, 1286, 3, 240, 16, 8, 24],
+                eflags: 0x6,
+                eip: 0x5,
+                deltas: &[(64, 60)],
+                fetch: 6,
+            },
+        ]
+    }
+
+    /// Per-case register overrides applied AFTER `bitmanip_seed`, so a few cases can drive an
+    /// operand the default seed doesn't cover (the BT-memory walk needs DX=16; the BSF zero-source
+    /// case needs CX=0). Applied identically on both the split and the fused (regen) path so the
+    /// goldens stay a faithful differential. Returns None when the default seed suffices.
+    fn bitmanip_case_override(name: &str, cpu: &mut Cpu386) {
+        match name {
+            "bts [0x40],dx walk-to-next-word (0f ab 16 40 00)" => {
+                // DX=16 so the bit index walks one 16-bit element past 0x40, into the word at 0x42.
+                cpu.write_reg16(Reg16::Dx, 16);
+            }
+            "bsf bx,cx zero-src (0f bc d9)" => {
+                cpu.write_reg16(Reg16::Cx, 0);
+                cpu.write_reg16(Reg16::Bx, 0xbeef); // preset so "destination unchanged" is visible
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn bitmanip_split_matches_golden_across_ops() {
+        // The bit-manipulation opcodes (BT/BTS/BTR/BTC reg+imm8, BSF/BSR, SHLD/SHRD imm8+CL,
+        // CMPXCHG, XADD) are converted to the decode/execute split, so their fused arms are deleted
+        // and they can no longer be diffed against a fused executor in-tree. Run each case through
+        // cycle() (the split) and assert the architectural end-state against goldens captured from
+        // the pre-split fused path via `regen_bitmanip_goldens`. The register file proves the
+        // set/reset/toggle write-backs, BSF/BSR indices, double-shift results, and the CMPXCHG/XADD
+        // exchanges; eflags proves CF (BT-family), ZF (BSF/BSR/CMPXCHG), and the ALU flags
+        // (SHLD/SHRD/CMPXCHG/XADD); the memory deltas prove the memory r/m write path — crucially
+        // the BT-memory walk lands the write in the ADJACENT word, not the base word; eip + fetch
+        // prove decode consumed and charged every byte (0F prefix + ModRM + imm8) exactly once.
+        for g in bitmanip_golden_cases() {
+            let mut mem = vec![0u8; 0x100];
+            bitmanip_seed_mem(&mut mem, g.code);
+            let initial = mem.clone();
+
+            let mut split = Cpu386::default();
+            bitmanip_seed(&mut split);
+            bitmanip_case_override(g.name, &mut split);
+            let mut sbus = TestBus::with_memory(mem);
+            let _ = split.cycle(&mut sbus);
+
+            assert_eq!(split.registers.gpr, g.gpr, "gpr mismatch for {}", g.name);
+            assert_eq!(
+                split.registers.eflags, g.eflags,
+                "eflags mismatch for {}",
+                g.name
+            );
+            assert_eq!(split.registers.eip, g.eip, "eip mismatch for {}", g.name);
+            let deltas: Vec<(usize, u8)> = sbus
+                .memory
+                .iter()
+                .enumerate()
+                .filter(|(i, b)| **b != initial[*i])
+                .map(|(i, b)| (i, *b))
+                .collect();
+            assert_eq!(deltas, g.deltas, "memory-write mismatch for {}", g.name);
+            assert_eq!(
+                seam_fetch_count(&sbus),
+                g.fetch,
+                "instruction-fetch cycle count mismatch for {} (seam must charge fetches once)",
+                g.name
+            );
+        }
+    }
+
+    /// Regenerate `bitmanip_golden_cases` from the fused reference. Ignored by default.
+    /// Run WHILE the bit-manipulation fused arms still exist in `execute_two_byte`
+    /// (i.e. the parent commit 430a6051):
+    ///   git worktree add ../regen-a10 430a6051
+    ///   cd ../regen-a10
+    ///   cargo test -p izarravm-cpu --lib regen_bitmanip_goldens -- --ignored --nocapture
+    /// then paste the output over `bitmanip_golden_cases` and only then delete the fused arms.
+    #[test]
+    #[ignore = "prints golden literals; run with --ignored --nocapture against the fused reference"]
+    fn regen_bitmanip_goldens() {
+        for g in bitmanip_golden_cases() {
+            let mut mem = vec![0u8; 0x100];
+            bitmanip_seed_mem(&mut mem, g.code);
+            let initial = mem.clone();
+
+            let mut fused = Cpu386::default();
+            bitmanip_seed(&mut fused);
+            bitmanip_case_override(g.name, &mut fused);
+            let mut fbus = TestBus::with_memory(mem);
+            fused.begin_instruction();
+            if fused.execute_instruction_legacy(&mut fbus).is_err() {
+                println!(
+                    "            // TODO regen {}: fused path unavailable here; run against the base commit",
+                    g.name
+                );
+                continue;
+            }
+            let deltas: Vec<(usize, u8)> = fbus
+                .memory
+                .iter()
+                .enumerate()
+                .filter(|(i, b)| **b != initial[*i])
+                .map(|(i, b)| (i, *b))
+                .collect();
+            let fetch = seam_fetch_count(&fbus);
+            println!(
+                "            BitManipGolden {{ name: {:?}, code: &{:?}, gpr: {:?}, eflags: {:#x}, eip: {:#x}, deltas: &{:?}, fetch: {} }},",
+                g.name,
+                g.code,
+                fused.registers.gpr,
+                fused.registers.eflags,
+                fused.registers.eip,
+                deltas,
                 fetch,
             );
         }
