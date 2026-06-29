@@ -14363,6 +14363,96 @@ mod tests {
         );
     }
 
+    #[test]
+    fn d_bit_change_at_the_same_linear_address_re_decodes() {
+        // The cache is keyed on the linear address, but a decode also depends on the code segment's
+        // D bit (16- vs 32-bit operand/address size). MOV (E)AX, imm (0xB8) is 3 bytes in a 16-bit
+        // segment (imm16) and 5 bytes in a 32-bit one (imm32). Caching the 16-bit form and then
+        // aliasing the same linear with a 32-bit code segment must re-decode, not replay the 3-byte
+        // form. A real protected-mode CS load routes through invalidate_code_caches; this drives
+        // that effect directly (set the 32-bit CS, then invalidate) to avoid a full GDT setup.
+        let mut memory = vec![0u8; 0x100];
+        memory[0..5].copy_from_slice(&[0xb8, 0x34, 0x12, 0x78, 0x56]); // B8 imm
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0); // 16-bit
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(memory);
+
+        // 16-bit: MOV AX, 0x1234 (3 bytes).
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.eax() & 0xffff, 0x1234);
+        assert_eq!(cpu.registers.eip, 3);
+        assert!(cpu.decode_cache.get(0).is_some());
+
+        // Alias linear 0 with a 32-bit code segment (same base 0).
+        let cs32 = SegmentRegister {
+            default_size_32: true,
+            ..cpu.registers.cs()
+        };
+        cpu.registers.set_segment(SegmentIndex::Cs, cs32);
+        cpu.invalidate_code_caches();
+        assert!(
+            cpu.decode_cache.get(0).is_none(),
+            "the D-bit change invalidated the cached 16-bit decode"
+        );
+
+        // 32-bit: MOV EAX, 0x56781234 (5 bytes), not the stale 3-byte form.
+        cpu.registers.set_eax(0);
+        cpu.set_eip(0);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(
+            cpu.registers.eax(),
+            0x5678_1234,
+            "a 32-bit immediate was read"
+        );
+        assert_eq!(
+            cpu.registers.eip, 5,
+            "the 32-bit MOV is 5 bytes, not the cached 3"
+        );
+    }
+
+    #[test]
+    fn a_fetch_page_made_not_present_re_faults_after_invalidation() {
+        // A cache hit must not execute an instruction whose fetch would now fault. Page linear
+        // 0x1000 -> frame 0x5000 (present), cache INC AX there, then clear the PTE present bit and
+        // flush (which bumps the decode generation). Re-entry must re-decode, fault on the absent
+        // fetch page, and leave AX untouched -- never replay the cached INC AX. (Observed via AX
+        // rather than cr2 because, with no IDT mapped, delivering the #PF cascades a second fault.)
+        let mut memory = vec![0u8; 0x8000];
+        memory[0x6000..0x6004].copy_from_slice(&0x0000_7007u32.to_le_bytes()); // PD[0] -> PT 0x7000
+        memory[0x7004..0x7008].copy_from_slice(&0x0000_5007u32.to_le_bytes()); // PT[1] (lin 0x1000) -> 0x5000
+        memory[0x5000] = 0x40; // INC AX at linear 0x1000
+        let mut cpu = Cpu386::default();
+        cpu.control.cr3 = 0x6000;
+        cpu.control.cr0 |= CR0_PE | CR0_PG;
+        cpu.registers
+            .set_segment(SegmentIndex::Cs, SegmentRegister::flat(0, 0x9b));
+        cpu.registers.eip = 0x1000;
+        let mut bus = TestBus::with_memory(memory);
+
+        cpu.cycle(&mut bus).unwrap(); // INC AX runs (AX 0 -> 1), cached at linear 0x1000
+        assert_eq!(cpu.registers.eax() & 0xffff, 1);
+        assert!(cpu.decode_cache.get(0x1000).is_some());
+
+        // Clear the PTE present bit and flush so the cache invalidates.
+        bus.memory[0x7004..0x7008].copy_from_slice(&0x0000_5006u32.to_le_bytes());
+        cpu.flush_tlb_and_code_caches();
+        assert!(
+            cpu.decode_cache.get(0x1000).is_none(),
+            "the flush invalidated the cache"
+        );
+
+        cpu.registers.set_eax(5);
+        cpu.set_eip(0x1000);
+        let _ = cpu.cycle(&mut bus); // faults on the absent fetch page (delivery may error: no IDT)
+        assert_eq!(
+            cpu.registers.eax() & 0xffff,
+            5,
+            "the re-fetch from the now-absent page faulted; the stale cached INC AX did NOT run"
+        );
+    }
+
     fn run_at_level(code: &[u8], level: CpuLevel) -> Result<CycleOutcome, InternalFault> {
         let mut memory = vec![0; 1024];
         memory[..code.len()].copy_from_slice(code);
