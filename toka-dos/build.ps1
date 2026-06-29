@@ -54,7 +54,7 @@ Get-ChildItem "$root\tools\*.c" -ErrorAction SilentlyContinue | ForEach-Object {
 
 # The mouse driver is hand-written NASM, not a C tool, so build it explicitly into
 # $build where the packer collects it as a system .COM.
-& nasm -f bin "$root\tools\izmouse.asm" -o "$build\IZMOUSE.COM"
+& nasm -f bin "$root\tools\tokamous.asm" -o "$build\IZMOUSE.COM"
 if ($LASTEXITCODE -ne 0) { throw "nasm failed on izmouse" }
 
 # Dev tools: built with the same recipe but emitted to the C: drive fixture dir,
