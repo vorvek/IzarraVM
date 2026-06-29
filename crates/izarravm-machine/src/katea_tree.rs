@@ -12,12 +12,24 @@
 #![allow(dead_code)]
 
 use crate::katea_names::NameTable;
-use crate::katea_volume::FileSource;
+use crate::katea_volume::{
+    FileSource, NUM_FATS, PART_START, RESERVED_SECTORS, ROOT_CLUSTER, SECTOR, fat_size_sectors,
+    sectors_per_cluster,
+};
 use std::path::Path;
 
 /// Cap recursion so a pathological tree (or an undetected loop) can't run away;
 /// also roughly the depth DOS's 64-char path limit allows.
 const MAX_DEPTH: usize = 32;
+
+/// Floor on the data-cluster count so the synthesized partition is always a
+/// valid, boot-tested FAT32. This is exactly the M0 static disk's data-cluster
+/// count: `(PART_SECTORS - used) / spc` for the proven-bootable 96256-sector
+/// partition (`used = 32 + 2*741`). Flooring here means a small host folder
+/// reproduces M0's known-good geometry (`part_sectors = 96256`, `fatsz = 741`)
+/// instead of landing just under `sectors_per_cluster`'s FAT32 floor (66601
+/// sectors), where it would panic. A larger folder grows past this floor.
+const MIN_DATA_CLUSTERS: u32 = 94_742;
 
 #[derive(Debug)]
 pub(crate) struct TreeFile {
@@ -127,6 +139,128 @@ fn fold_literal_83(name: &str) -> [u8; 11] {
     out
 }
 
+/// The synthesized disk's geometry, derived from the tree's cluster needs.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Geometry {
+    pub spc: u8,
+    pub fatsz: u32,
+    pub part_start: u32, // = PART_START
+    pub part_sectors: u32,
+    pub total_sectors: u32,     // whole disk
+    pub first_data_sector: u32, // partition-relative; cluster 2 begins here
+    pub count_of_clusters: u32,
+}
+
+/// Entries a directory needs: its files + subdirs, plus `.`/`..` for non-root.
+fn entry_count(dir: &TreeDir, is_root: bool) -> u32 {
+    let dot = if is_root { 0 } else { 2 };
+    dot + dir.files.len() as u32 + dir.subdirs.len() as u32
+}
+
+/// Clusters a chain of `bytes` needs at this cluster size (>=1, even for empty).
+fn clusters_for(bytes: u64, cluster_bytes: u32) -> u32 {
+    (bytes.div_ceil(u64::from(cluster_bytes)) as u32).max(1)
+}
+
+/// Sum the cluster needs of the whole tree, pick the geometry that fits, then
+/// assign first_cluster/cluster_count across the tree depth-first. The root is
+/// cluster 2.
+///
+/// The cluster size (`spc`) the FAT and partition are sized with must match the
+/// one `sectors_per_cluster` derives from the final partition size, or the BPB
+/// is internally inconsistent and the disk won't boot. We reach that fixed point
+/// by computing the *final* partition size each iteration (not a padded guess)
+/// and re-deriving `spc` from it; if it disagrees we adopt the larger and redo.
+/// `sectors_per_cluster`'s table is monotonic in size and the partition only
+/// grows with `spc`, so the loop climbs the table at most a few steps and stops.
+pub(crate) fn allocate(tree: &mut HostTree) -> Geometry {
+    let mut spc: u8 = 1;
+    let geo = loop {
+        let cluster_bytes = u32::from(spc) * SECTOR as u32;
+        let used_data = tree_cluster_demand(tree, cluster_bytes);
+        // Need a valid FAT32; pad with headroom (25%) so DIR shows free space and
+        // M2 has room, and floor at the boot-tested M0 cluster count so the small-
+        // folder partition reproduces M0's known-good geometry (see
+        // MIN_DATA_CLUSTERS) rather than landing just under the FAT32 floor.
+        let needed = used_data.max(1);
+        let count_of_clusters = (needed + needed / 4).max(MIN_DATA_CLUSTERS);
+        // Size the FAT from the whole partition it lives in, exactly as M0 does
+        // (`fat_size_sectors(PART_SECTORS, spc)`): the formula's divisor accounts
+        // for the FAT sectors, so passing the full partition is self-correcting.
+        // We do not know `fatsz` until we size the partition, and the partition
+        // size includes the FAT — so close the loop by re-deriving `fatsz` from
+        // the partition built with the previous estimate until it is stable (it
+        // settles in one or two steps because the data region dominates).
+        let data_sectors = count_of_clusters * u32::from(spc);
+        let mut fatsz = fat_size_sectors(u32::from(RESERVED_SECTORS) + data_sectors, spc);
+        loop {
+            let part = u32::from(RESERVED_SECTORS) + u32::from(NUM_FATS) * fatsz + data_sectors;
+            let next_fatsz = fat_size_sectors(part, spc);
+            if next_fatsz == fatsz {
+                break;
+            }
+            fatsz = next_fatsz;
+        }
+        let used = u32::from(RESERVED_SECTORS) + u32::from(NUM_FATS) * fatsz;
+        let part_sectors = used + data_sectors;
+        // Self-consistency: the spc the table picks for THIS partition must equal
+        // the spc we sized with. If not, climb to it and recompute from scratch.
+        let derived = sectors_per_cluster(part_sectors);
+        if derived != spc {
+            spc = derived;
+            continue;
+        }
+        break Geometry {
+            spc,
+            fatsz,
+            part_start: PART_START,
+            part_sectors,
+            total_sectors: PART_START + part_sectors,
+            first_data_sector: used,
+            count_of_clusters,
+        };
+    };
+    debug_assert_eq!(sectors_per_cluster(geo.part_sectors), geo.spc);
+    // Assign clusters now that geometry is fixed.
+    let cluster_bytes = u32::from(geo.spc) * SECTOR as u32;
+    let mut next = ROOT_CLUSTER; // 2
+    assign_dir(&mut tree.root, true, 0, &mut next, cluster_bytes);
+    geo
+}
+
+/// Total data clusters the tree consumes (directories + files), for sizing.
+fn tree_cluster_demand(tree: &HostTree, cluster_bytes: u32) -> u32 {
+    fn dir_demand(dir: &TreeDir, is_root: bool, cluster_bytes: u32) -> u32 {
+        let mut n = clusters_for(u64::from(entry_count(dir, is_root)) * 32, cluster_bytes);
+        for f in &dir.files {
+            n += clusters_for(f.source.len(), cluster_bytes);
+        }
+        for s in &dir.subdirs {
+            n += dir_demand(&s.dir, false, cluster_bytes);
+        }
+        n
+    }
+    dir_demand(&tree.root, true, cluster_bytes)
+}
+
+/// Depth-first: assign this directory's chain, then its files' chains, then
+/// recurse into subdirectories. `parent` is the parent dir's first cluster.
+fn assign_dir(dir: &mut TreeDir, is_root: bool, parent: u32, next: &mut u32, cluster_bytes: u32) {
+    dir.first_cluster = *next;
+    dir.parent_first_cluster = parent;
+    dir.cluster_count = clusters_for(u64::from(entry_count(dir, is_root)) * 32, cluster_bytes);
+    *next += dir.cluster_count;
+    for f in &mut dir.files {
+        f.first_cluster = *next;
+        f.cluster_count = clusters_for(f.source.len(), cluster_bytes);
+        *next += f.cluster_count;
+    }
+    for s in &mut dir.subdirs {
+        let parent_fc = dir.first_cluster;
+        assign_dir(&mut s.dir, false, parent_fc, next, cluster_bytes);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,5 +302,40 @@ mod tests {
         assert_eq!(hello.files[0].source.len(), 600);
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn allocation_chains_dirs_and_files_and_sizes_the_disk() {
+        let root = scratch("alloc");
+        std::fs::create_dir_all(root.join("SUB")).unwrap();
+        std::fs::write(root.join("SUB/A.TXT"), vec![0u8; 600]).unwrap(); // 2 clusters at 512B/clu
+        let sys = vec![("KERNEL.SYS".to_string(), vec![0u8; 100])];
+        let mut tree = build_tree(&root, &sys);
+        let geo = allocate(&mut tree);
+
+        // Root is cluster 2 (one cluster: KERNEL.SYS + SUB = 2 entries).
+        assert_eq!(tree.root.first_cluster, 2);
+        assert_eq!(tree.root.cluster_count, 1);
+        // SUB is a subdir directory chain; its `..` points at the root (cluster 2).
+        let sub = &tree.root.subdirs[0].dir;
+        assert!(sub.first_cluster >= 3);
+        assert_eq!(sub.parent_first_cluster, 2);
+        // A.TXT spans 2 clusters.
+        assert_eq!(sub.files[0].cluster_count, 2);
+        // Geometry: a valid FAT32 (>= 65525 clusters), spc derived, fatsz via the
+        // kernel formula (not fatgen103).
+        assert!(geo.count_of_clusters >= 65525);
+        assert!(geo.total_sectors > geo.part_start);
+        // The geometry must be self-consistent: the spc used to size the FAT/disk
+        // must equal the one `sectors_per_cluster` picks for the final partition.
+        assert_eq!(sectors_per_cluster(geo.part_sectors), geo.spc);
+        // first_data_sector == reserved + NUM_FATS * fatsz; total == part_start + part_sectors.
+        assert_eq!(
+            geo.first_data_sector,
+            u32::from(RESERVED_SECTORS) + u32::from(NUM_FATS) * geo.fatsz
+        );
+        assert_eq!(geo.total_sectors, geo.part_start + geo.part_sectors);
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }
