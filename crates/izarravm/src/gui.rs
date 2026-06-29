@@ -1746,7 +1746,9 @@ impl GuiApp {
                     ui.set_width(440.0);
                     ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
 
-                    ui.label(header_text("Configuration", 18.0));
+                    ui.vertical_centered(|ui| {
+                        ui.label(header_text("Configuration", 18.0));
+                    });
                     ui.add_space(6.0);
 
                     ui.label(egui::RichText::new("INPUT").color(LABEL).size(11.0));
