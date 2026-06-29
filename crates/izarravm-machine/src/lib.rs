@@ -4274,21 +4274,6 @@ impl Machine {
     /// the BIOS INT 74h ISR (izbios ROM) far-calls that pointer on each completed
     /// 3-byte PS/2 packet. C208/C209 (read/write the raw device port) report
     /// function-not-supported (AH=86h, CF set).
-    /// Enable the pointing device the way the INT 15h C200-enable and C205-init
-    /// services do: turn on aux data reporting, arm IRQ12 in the 8042 command byte,
-    /// and (since our emulated mouse always has a wheel) put it in IntelliMouse
-    /// 4-byte mode. The matching EBDA packet-size byte is set to 4 so the BIOS INT
-    /// 74h ISR accumulates the wheel byte and delivers it as the frame's Z word.
-    fn enable_pointing_device(&mut self) {
-        self.keyboard.set_mouse_reporting(true);
-        self.keyboard.set_mouse_irq(true);
-        self.keyboard.enable_mouse_wheel();
-        // Tell the BIOS ISR to assemble 4-byte packets. Same EBDA-base computation
-        // the C207 handler uses for the handler pointer, at the packet-size offset.
-        let pkt_size = (u32::from(EBDA_SEGMENT) << 4) + EBDA_MOUSE_PKT_SIZE_OFF;
-        self.write_guest_block(pkt_size, &[4]);
-    }
-
     fn int15_c2_pointing_device(&mut self, al: u8) {
         let bh = (self.cpu.registers.ebx() as u16 >> 8) as u8;
         match al {
@@ -4386,6 +4371,21 @@ impl Machine {
                 self.set_int_frame_carry(true);
             }
         }
+    }
+
+    /// Enable the pointing device the way the INT 15h C200-enable and C205-init
+    /// services do: turn on aux data reporting, arm IRQ12 in the 8042 command byte,
+    /// and (since our emulated mouse always has a wheel) put it in IntelliMouse
+    /// 4-byte mode. The matching EBDA packet-size byte is set to 4 so the BIOS INT
+    /// 74h ISR accumulates the wheel byte and delivers it as the frame's Z word.
+    fn enable_pointing_device(&mut self) {
+        self.keyboard.set_mouse_reporting(true);
+        self.keyboard.set_mouse_irq(true);
+        self.keyboard.enable_mouse_wheel();
+        // Tell the BIOS ISR to assemble 4-byte packets. Same EBDA-base computation
+        // the C207 handler uses for the handler pointer, at the packet-size offset.
+        let pkt_size = (u32::from(EBDA_SEGMENT) << 4) + EBDA_MOUSE_PKT_SIZE_OFF;
+        self.write_guest_block(pkt_size, &[4]);
     }
 
     /// INT 15h AX=E801h (and the AX=E881h 32-bit variant). Reports extended memory in two
