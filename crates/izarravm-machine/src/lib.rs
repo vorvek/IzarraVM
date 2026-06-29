@@ -717,6 +717,195 @@ impl TimingFactors {
     }
 }
 
+/// Bytes per modeled cache line. K6-class geometry: 64-byte lines on every tier.
+const CACHE_LINE_BYTES: u32 = 64;
+/// Largest L1 across all modes (586 = 64 KB) in lines: 64 KB / 64 B = 1024.
+const CACHE_L1_MAX_LINES: usize = (64 * 1024) / CACHE_LINE_BYTES as usize;
+/// Largest L2 across all modes (586 = 512 KB) in lines: 512 KB / 64 B = 8192.
+const CACHE_L2_MAX_LINES: usize = (512 * 1024) / CACHE_LINE_BYTES as usize;
+
+/// Per-mode modeled cache geometry (bytes); 0 means that tier does not exist.
+/// Mirrors `CpuLevel::cache_kb` (the CPUID/cache readout) so the timing model and
+/// the reported sizes never drift apart.
+#[derive(Clone, Copy)]
+struct CacheGeometry {
+    l1_bytes: u32,
+    l2_bytes: u32,
+}
+
+const fn cache_geometry(level: CpuLevel) -> CacheGeometry {
+    match level {
+        CpuLevel::I286 => CacheGeometry {
+            l1_bytes: 0,
+            l2_bytes: 0,
+        },
+        CpuLevel::I386 => CacheGeometry {
+            l1_bytes: 0,
+            l2_bytes: 64 * 1024,
+        },
+        CpuLevel::I486 => CacheGeometry {
+            l1_bytes: 16 * 1024,
+            l2_bytes: 128 * 1024,
+        },
+        CpuLevel::I586 => CacheGeometry {
+            l1_bytes: 64 * 1024,
+            l2_bytes: 512 * 1024,
+        },
+    }
+}
+
+/// Per-mode wait-states charged per access by tier. PROVISIONAL: calibrated in a
+/// later task. Start so behavior is ~unchanged: `ram` = the existing RAM wait-state,
+/// `l2` = a cheaper middle, `l1` = cheapest. The wiring task passes the real per-mode
+/// RAM wait-state into the model; until calibration, `ram` is kept as the documented
+/// default here (0, matching the unscaled bus) so nothing regresses before the model
+/// is even wired in.
+#[derive(Clone, Copy)]
+struct TierCost {
+    l1: u8,
+    l2: u8,
+    ram: u8,
+}
+
+const fn tier_cost(level: CpuLevel) -> TierCost {
+    match level {
+        // Provisional; tuned in the calibration task. RAM mirrors the current
+        // conventional-RAM wait-state so nothing regresses before calibration.
+        CpuLevel::I286 => TierCost {
+            l1: 0,
+            l2: 0,
+            ram: 0,
+        },
+        CpuLevel::I386 => TierCost {
+            l1: 0,
+            l2: 0,
+            ram: 0,
+        },
+        CpuLevel::I486 => TierCost {
+            l1: 0,
+            l2: 0,
+            ram: 0,
+        },
+        CpuLevel::I586 => TierCost {
+            l1: 0,
+            l2: 0,
+            ram: 0,
+        },
+    }
+}
+
+/// Which modeled cache tier a data access resolves to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Tier {
+    L1,
+    L2,
+    Ram,
+}
+
+/// Cosmetic multi-tier cache. It only sets the guest-perceived TIMING of a memory
+/// access; the host always reads real memory. There is no real data cache, no
+/// associativity beyond direct-mapped tag matching, no replacement policy, and no
+/// coherence (MESI). Two direct-mapped tag arrays (L1, L2) each sized to the
+/// LARGEST geometry across modes; the live level's geometry picks how many of those
+/// lines are in play via a power-of-two mask. The full line number is stored as the
+/// tag so a smaller per-mode mask still disambiguates aliased lines.
+///
+/// Wired into `read_memory`/`write_memory` in the next task; until then it is
+/// exercised only by the unit tests below.
+#[allow(dead_code)] // wired in the next task
+struct CacheModel {
+    l1_tags: Box<[u32]>, // sized to the largest L1 line count (586: 1024)
+    l2_tags: Box<[u32]>, // sized to the largest L2 line count (586: 8192)
+}
+
+/// Sentinel tag that cannot be a valid line number, so a freshly filled array is
+/// all-miss. `line = phys >> 6`; with a 32-bit phys the top line number is
+/// `0xFFFF_FFFF >> 6 < u32::MAX`, so `u32::MAX` is never a real tag.
+const CACHE_EMPTY_TAG: u32 = u32::MAX;
+
+#[allow(dead_code)] // wired in the next task
+impl CacheModel {
+    fn new() -> Self {
+        Self {
+            l1_tags: vec![CACHE_EMPTY_TAG; CACHE_L1_MAX_LINES].into_boxed_slice(),
+            l2_tags: vec![CACHE_EMPTY_TAG; CACHE_L2_MAX_LINES].into_boxed_slice(),
+        }
+    }
+
+    /// Resolve a DATA access at `phys` to a tier for the live `level`, installing the
+    /// line into the cheaper tiers on a miss (modeling an inclusive fill). A 0-size
+    /// tier is skipped: the 286 has neither tier (always RAM); the 386 has no L1.
+    ///
+    /// Performance fallback if the wiring task shows this is too costly: replace the
+    /// tag arrays with a high-water-mark span model -- track the min/max touched
+    /// physical data address since the last reset, then classify span <= L1 -> L1,
+    /// span <= L2 -> L2, else RAM. Same signature, cheaper, and exact for the
+    /// contiguous sweeps the benchmark uses.
+    fn data_tier(&mut self, level: CpuLevel, phys: u32) -> Tier {
+        let line = phys >> 6;
+        let g = cache_geometry(level);
+        if g.l1_bytes != 0 {
+            let l1_lines = g.l1_bytes / CACHE_LINE_BYTES;
+            let idx = (line & (l1_lines - 1)) as usize;
+            if self.l1_tags[idx] == line {
+                return Tier::L1;
+            }
+        }
+        if g.l2_bytes != 0 {
+            let l2_lines = g.l2_bytes / CACHE_LINE_BYTES;
+            let idx = (line & (l2_lines - 1)) as usize;
+            if self.l2_tags[idx] == line {
+                // L2 hit: pull the line up into L1 (if L1 exists) for next time.
+                self.install_l1(g, line);
+                return Tier::L2;
+            }
+        }
+        // Miss in both: serve from RAM and fill the existing tiers.
+        self.install_l1(g, line);
+        self.install_l2(g, line);
+        Tier::Ram
+    }
+
+    fn install_l1(&mut self, g: CacheGeometry, line: u32) {
+        if g.l1_bytes != 0 {
+            let l1_lines = g.l1_bytes / CACHE_LINE_BYTES;
+            self.l1_tags[(line & (l1_lines - 1)) as usize] = line;
+        }
+    }
+
+    fn install_l2(&mut self, g: CacheGeometry, line: u32) {
+        if g.l2_bytes != 0 {
+            let l2_lines = g.l2_bytes / CACHE_LINE_BYTES;
+            self.l2_tags[(line & (l2_lines - 1)) as usize] = line;
+        }
+    }
+
+    /// Wait-states for a DATA access, mapping its resolved tier to `tier_cost`.
+    /// `_width` is accepted for the eventual wiring (a wide access could straddle a
+    /// line) but does not affect the provisional, single-line model.
+    fn data_wait_states(&mut self, level: CpuLevel, phys: u32, _width: BusWidth) -> u8 {
+        let cost = tier_cost(level);
+        match self.data_tier(level, phys) {
+            Tier::L1 => cost.l1,
+            Tier::L2 => cost.l2,
+            Tier::Ram => cost.ram,
+        }
+    }
+
+    /// Wait-states for a code fetch: code is assumed L1-resident, so this is a
+    /// per-mode constant (the L1 cost) with no tag check.
+    fn code_fetch_wait_states(&self, level: CpuLevel) -> u8 {
+        tier_cost(level).l1
+    }
+
+    /// Drop all cached lines (mode change). Both arrays go back to the sentinel so
+    /// the next access to any line is a cold miss.
+    fn reset(&mut self) {
+        self.l1_tags.fill(CACHE_EMPTY_TAG);
+        self.l2_tags.fill(CACHE_EMPTY_TAG);
+    }
+}
+
 #[derive(Debug)]
 pub struct Machine {
     profile: MachineProfile,
@@ -13331,6 +13520,52 @@ mod tests {
 
     const BIOS_TEXT_WHITE: u8 = 0x3F;
 
+    // The CacheModel tests below exercise tier IDENTITY, not the wait-state numbers:
+    // tier_cost is a provisional all-zeros table until the calibration task, so the
+    // (uncalibrated) wait-states carry no meaning yet. What must hold now is that the
+    // model resolves L1/L2/RAM correctly per the per-mode geometry.
+    #[test]
+    fn cache_model_resolves_tiers_by_working_set() {
+        let mut c = CacheModel::new();
+        let warm = |c: &mut CacheModel, base: u32, len: u32| {
+            for off in (0..len).step_by(64) {
+                c.data_tier(CpuLevel::I486, base + off);
+            }
+        };
+        warm(&mut c, 0x10_0000, 8 * 1024); // 8K fits 486 L1 (16K)
+        assert_eq!(c.data_tier(CpuLevel::I486, 0x10_0000), Tier::L1);
+        warm(&mut c, 0x20_0000, 64 * 1024); // 64K exceeds L1, fits L2 (128K)
+        assert_eq!(c.data_tier(CpuLevel::I486, 0x20_0000), Tier::L2);
+        warm(&mut c, 0x40_0000, 256 * 1024); // 256K exceeds 486 L2 -> RAM
+        assert_eq!(c.data_tier(CpuLevel::I486, 0x40_0000), Tier::Ram);
+        assert_eq!(c.data_tier(CpuLevel::I286, 0x10_0000), Tier::Ram); // 286: no cache
+    }
+
+    #[test]
+    fn cache_model_reset_goes_cold() {
+        let mut c = CacheModel::new();
+        c.data_tier(CpuLevel::I586, 0x30_0000); // installs the line
+        assert_eq!(c.data_tier(CpuLevel::I586, 0x30_0000), Tier::L1); // hot
+        c.reset();
+        assert_ne!(c.data_tier(CpuLevel::I586, 0x30_0000), Tier::L1); // cold again
+    }
+
+    #[test]
+    fn cache_geometry_matches_cache_kb() {
+        // The machine geometry must agree with the CPU's cache_kb readout (KB).
+        for (level, (l1_kb, l2_kb)) in [
+            (CpuLevel::I286, (0u16, 0u16)),
+            (CpuLevel::I386, (0, 64)),
+            (CpuLevel::I486, (16, 128)),
+            (CpuLevel::I586, (64, 512)),
+        ] {
+            let g = cache_geometry(level);
+            assert_eq!(g.l1_bytes / 1024, u32::from(l1_kb), "{level:?} L1");
+            assert_eq!(g.l2_bytes / 1024, u32::from(l2_kb), "{level:?} L2");
+            assert_eq!(level.cache_kb(), (l1_kb, l2_kb)); // mirrors cpu cache_kb
+        }
+    }
+
     #[test]
     fn slow_post_paces_without_null_vector_runaway() {
         // Under slow POST the BIOS drives PIT channel 0 to pace the chime and the
@@ -16558,7 +16793,7 @@ mod tests {
 
         machine.set_mode(GswMode::Gsw586);
         assert_eq!(machine.cpu.level(), CpuLevel::I586);
-        assert_eq!(machine.cache_config(), (32, 512));
+        assert_eq!(machine.cache_config(), (64, 512));
     }
 
     #[test]

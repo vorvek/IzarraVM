@@ -67,14 +67,15 @@ impl GswMode {
     }
 
     /// Reported cache sizes per compatibility mode as (L1 KB, L2 KB). The L2 is a
-    /// motherboard cache module; the whole table is cosmetic and feeds the cache
-    /// readout only, with no timing effect.
+    /// motherboard cache module. Mirrors `CpuLevel::cache_kb` and the machine
+    /// CacheModel geometry, which drive data-access timing (no longer cosmetic).
+    /// The 586 L1 is 64 KB: the K6 has 32 KB instruction + 32 KB data.
     pub const fn cache_kb(self) -> (u16, u16) {
         match self {
             Self::Gsw286 => (0, 0),
             Self::Gsw386 => (0, 64),
             Self::Gsw486 => (16, 128),
-            Self::Gsw586 => (32, 512),
+            Self::Gsw586 => (64, 512),
         }
     }
 
@@ -1147,7 +1148,7 @@ mod tests {
         assert_eq!(GswMode::Gsw286.cache_kb(), (0, 0));
         assert_eq!(GswMode::Gsw386.cache_kb(), (0, 64));
         assert_eq!(GswMode::Gsw486.cache_kb(), (16, 128));
-        assert_eq!(GswMode::Gsw586.cache_kb(), (32, 512));
+        assert_eq!(GswMode::Gsw586.cache_kb(), (64, 512));
     }
 
     #[test]
