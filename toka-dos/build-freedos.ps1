@@ -153,9 +153,9 @@ $sortExe = Join-Path $sortdir 'sort.exe'
 if (-not (Test-Path $sortExe)) { throw "sort.exe not produced" }
 Write-Host "SORT.EXE: $((Get-Item $sortExe).Length) bytes"
 
-# --- TOKAMOUS (our INT 33h PS/2 mouse TSR, rebranded from izmouse.asm) ---
+# --- TOKAMOUS (our INT 33h PS/2 mouse TSR, rebranded from tokamous.asm) ---
 $tokamous = Join-Path $root 'build-freedos-tokamous.com'
-& nasm -f bin (Join-Path $root 'tools\izmouse.asm') -o $tokamous
+& nasm -f bin (Join-Path $root 'tools\tokamous.asm') -o $tokamous
 if ($LASTEXITCODE) { throw "nasm tokamous failed" }
 if (-not (Test-Path $tokamous)) { throw "TOKAMOUS not produced" }
 Write-Host "TOKAMOUS.COM: $((Get-Item $tokamous).Length) bytes"

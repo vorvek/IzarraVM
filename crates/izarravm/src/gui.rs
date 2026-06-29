@@ -220,6 +220,9 @@ enum Command {
     /// to the active video mode's range; the host just forwards the counts, so the
     /// cursor is never confined to a stale virtual range. Capture only.
     MouseRelative(i32, i32, u8),
+    /// One scroll-wheel detent from the host, forwarded to the emulated mouse.
+    /// Positive is scroll-up, negative is scroll-down. Capture only.
+    MouseWheel(i32),
     /// Mount a floppy image into drive A: live. `flush_path` is the source IMG to
     /// rewrite a dirty image to on eject; folder mounts pass None (read-only).
     MountFloppy {
@@ -700,6 +703,10 @@ impl Emulator {
         let _ = self.commands.send(Command::MouseRelative(dx, dy, buttons));
     }
 
+    fn send_mouse_wheel(&self, dz: i32) {
+        let _ = self.commands.send(Command::MouseWheel(dz));
+    }
+
     fn mount_floppy(&self, bytes: Vec<u8>, flush_path: Option<PathBuf>) {
         let _ = self
             .commands
@@ -821,6 +828,7 @@ fn emulate(
                 Ok(Command::MouseRelative(dx, dy, buttons)) => {
                     machine.inject_mouse_relative(dx, dy, buttons)
                 }
+                Ok(Command::MouseWheel(dz)) => machine.inject_mouse_wheel(dz),
                 Ok(Command::MountFloppy { bytes, flush_path }) => {
                     match machine.mount_floppy(bytes) {
                         Ok(()) => floppy_flush_path = flush_path,
@@ -1003,6 +1011,9 @@ pub struct GuiApp {
     // An 8000 Hz mouse fires ~130 events per frame; sending one guest packet each
     // floods the emulation thread with guest IRQ12s and stalls the UI thread.
     mouse_dirty: bool,
+    // Fractional scroll-wheel carry (trackpads/pixel-delta) so only whole detents
+    // are forwarded to the guest. A full notch sends exactly one +/-1 wheel command.
+    wheel_accum: f32,
     // The cpal stream is !Send, so it stays here on the UI thread; the
     // emulation thread gets a Send sink cloned from it.
     audio: Option<AudioPlayer>,
@@ -1143,6 +1154,7 @@ impl GuiApp {
             mouse_rel_x: 0.0,
             mouse_rel_y: 0.0,
             mouse_dirty: false,
+            wheel_accum: 0.0,
             audio,
             emu: None,
             frame_seq: u64::MAX,
@@ -1376,6 +1388,23 @@ impl GuiApp {
         self.mouse_dirty = false;
         if let Some(emu) = &self.emu {
             emu.send_mouse_relative(dx, dy, self.last_buttons);
+        }
+    }
+
+    /// Forward host scroll-wheel motion to the guest. `lines` is signed notches
+    /// (positive = scroll-up); fractional pixel-delta accumulates so only whole
+    /// detents are sent, one +/-1 command per notch.
+    fn forward_guest_wheel(&mut self, lines: f32) {
+        self.wheel_accum += lines;
+        if let Some(emu) = &self.emu {
+            while self.wheel_accum >= 1.0 {
+                emu.send_mouse_wheel(1); // scroll-up = +1
+                self.wheel_accum -= 1.0;
+            }
+            while self.wheel_accum <= -1.0 {
+                emu.send_mouse_wheel(-1);
+                self.wheel_accum += 1.0;
+            }
         }
     }
 
@@ -2718,10 +2747,15 @@ impl ApplicationHandler for WinitApp {
                 self.gui.set_guest_button(bit, pressed);
                 return;
             }
-            if matches!(
-                event,
-                WindowEvent::CursorMoved { .. } | WindowEvent::MouseWheel { .. }
-            ) {
+            if let WindowEvent::MouseWheel { delta, .. } = &event {
+                let lines = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => *y,
+                    winit::event::MouseScrollDelta::PixelDelta(p) => (p.y as f32) / 120.0,
+                };
+                self.gui.forward_guest_wheel(lines);
+                return;
+            }
+            if matches!(event, WindowEvent::CursorMoved { .. }) {
                 return;
             }
         }

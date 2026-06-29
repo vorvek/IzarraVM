@@ -83,6 +83,16 @@ bios_start:
     mov word [0x74 * 4], int74
     mov word [0x74 * 4 + 2], ROM_SEG
 
+    ; Seed the EBDA mouse packet size to 3 (standard PS/2). The machine zero-fills
+    ; the EBDA at reset, so without this the size byte would be 0 and int74 would
+    ; never reach a packet boundary. The IntelliMouse detect bumps it to 4. Push DS
+    ; to EBDA_SEG for the single byte, then restore DS = 0 for the rest of bring-up.
+    push ds
+    mov ax, EBDA_SEG
+    mov ds, ax
+    mov byte [EBDA_MOUSE_PKT_SIZE], 3
+    pop ds
+
     ; 8259 PIC init (verbatim from kbd-bios): IRQ0..7 -> INT 08h..0Fh.
     mov al, 0x11
     out PORT_PIC_CMD, al
@@ -176,8 +186,9 @@ irq_stub_slave:
 
 ; int74: IRQ12 (PS/2 mouse). Reads exactly ONE aux byte per interrupt (the model
 ; re-latches the next aux byte on each 0x60 read, so a drain loop would desync the
-; 3-byte assembly), stores it in the EBDA packet buffer, and on the third byte
-; far-calls the INT 15h C207-registered handler with the 4-word PS/2 frame.
+; packet assembly), stores it in the EBDA packet buffer, and on the final byte
+; (EBDA_MOUSE_PKT_SIZE: 3 standard, 4 IntelliMouse) far-calls the INT 15h
+; C207-registered handler with the 4-word PS/2 frame.
 int74:
     push ax
     push bx
@@ -198,9 +209,9 @@ int74:
     xor bh, bh
     mov si, EBDA_MOUSE_PKT
     add si, bx
-    mov [si], al                     ; packet[index] = byte
+    mov [si], al                     ; packet[index] = byte (buffer is 4 bytes wide)
     inc bl
-    cmp bl, 3
+    cmp bl, [EBDA_MOUSE_PKT_SIZE]     ; 3 standard, 4 IntelliMouse
     jb .save_idx
     mov byte [EBDA_MOUSE_IDX], 0     ; packet complete, reset index
     call int74_dispatch
@@ -238,8 +249,16 @@ int74_dispatch:
     mov al, [EBDA_MOUSE_PKT + 2]
     xor ah, ah
     push ax
-    ; WORD4 = 0.
+    ; WORD4 Z = the IntelliMouse wheel byte (packet byte 3), sign-extended to a word.
+    ; Standard 3-byte packets carry no wheel byte, so push 0 then. This is the LAST
+    ; word pushed before the far call, landing at [bp+6] in the handler frame; the
+    ; matching `add sp, 8` below drops all four words.
     xor ax, ax
+    cmp byte [EBDA_MOUSE_PKT_SIZE], 4
+    jb .push_z
+    mov al, [EBDA_MOUSE_PKT + 3]
+    cbw                              ; sign-extend the signed wheel detent into AX
+.push_z:
     push ax
     call far [EBDA_MOUSE_HANDLER]    ; indirect far call through DS:EBDA_MOUSE_HANDLER
     add sp, 8                        ; drop the four words after the handler RETF

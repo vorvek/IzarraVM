@@ -39,6 +39,7 @@ mod ide;
 mod keyboard;
 mod lpt;
 mod memmap;
+mod mouse;
 mod pic;
 mod pit;
 mod rtc;
@@ -1946,6 +1947,13 @@ impl Machine {
     /// reporting is enabled, this requests IRQ12 so a guest ISR runs.
     pub fn inject_mouse(&mut self, dx: i32, dy: i32, buttons: u8) {
         if self.keyboard.inject_mouse(dx, dy, buttons) {
+            self.pic.request(12);
+        }
+    }
+
+    /// Inject a scroll-wheel detent as a PS/2 packet (IntelliMouse 4-byte mode).
+    pub fn inject_mouse_wheel(&mut self, dz: i32) {
+        if self.keyboard.inject_mouse_wheel(dz) {
             self.pic.request(12);
         }
     }
@@ -4275,8 +4283,18 @@ impl Machine {
             // 8042 command byte (a real PS/2 BIOS does both); without that, a
             // latched aux byte never raises the interrupt and the ISR never runs.
             0x00 => {
-                self.keyboard.set_mouse_reporting(bh != 0);
-                self.keyboard.set_mouse_irq(bh != 0);
+                if bh != 0 {
+                    self.enable_pointing_device();
+                } else {
+                    // C200 disable: stop reporting and mask IRQ12. Leave the wheel
+                    // mode and EBDA packet size untouched. Known ceiling: the platform
+                    // drives the device to 4-byte at enable and assumes it stays. A
+                    // guest that resets the aux device (0xFF) and stays 3-byte would
+                    // desync the BIOS int74 ISR (still expecting 4 bytes); no consumer
+                    // does this today.
+                    self.keyboard.set_mouse_reporting(false);
+                    self.keyboard.set_mouse_irq(false);
+                }
                 self.set_eax_ah(0x00);
                 self.set_int_frame_carry(false);
             }
@@ -4307,8 +4325,7 @@ impl Machine {
             // acknowledge. The driver does a C200 enable afterwards too; both
             // leave reporting on and IRQ12 armed without re-centring.
             0x05 => {
-                self.keyboard.set_mouse_reporting(true);
-                self.keyboard.set_mouse_irq(true);
+                self.enable_pointing_device();
                 self.set_eax_ah(0x00);
                 self.set_int_frame_carry(false);
             }
@@ -4354,6 +4371,21 @@ impl Machine {
                 self.set_int_frame_carry(true);
             }
         }
+    }
+
+    /// Enable the pointing device the way the INT 15h C200-enable and C205-init
+    /// services do: turn on aux data reporting, arm IRQ12 in the 8042 command byte,
+    /// and (since our emulated mouse always has a wheel) put it in IntelliMouse
+    /// 4-byte mode. The matching EBDA packet-size byte is set to 4 so the BIOS INT
+    /// 74h ISR accumulates the wheel byte and delivers it as the frame's Z word.
+    fn enable_pointing_device(&mut self) {
+        self.keyboard.set_mouse_reporting(true);
+        self.keyboard.set_mouse_irq(true);
+        self.keyboard.enable_mouse_wheel();
+        // Tell the BIOS ISR to assemble 4-byte packets. Same EBDA-base computation
+        // the C207 handler uses for the handler pointer, at the packet-size offset.
+        let pkt_size = (u32::from(EBDA_SEGMENT) << 4) + EBDA_MOUSE_PKT_SIZE_OFF;
+        self.write_guest_block(pkt_size, &[4]);
     }
 
     /// INT 15h AX=E801h (and the AX=E881h 32-bit variant). Reports extended memory in two
@@ -11989,9 +12021,14 @@ const DOS_INT24_DEFAULT_STUB_ADDRESS: usize = 0x0637;
 /// 0x22 overlapped the fixed-disk parameter table (0x20..0x2F): a mounted HDD
 /// clobbered the handler pointer and a registered handler corrupted the disk
 /// geometry. The mouse sub-block lives in the free 0x01..0x0F gap: handler
-/// far-pointer at 0x02/0x04, packet buffer at 0x06..0x08, byte-index at 0x09. The
-/// izbios INT 74h ISR mirrors these offsets.
+/// far-pointer at 0x02/0x04, packet buffer at 0x06..0x09 (4 bytes, the IntelliMouse
+/// wheel byte included), byte-index at 0x0A, packet size at 0x0B. The izbios INT 74h
+/// ISR mirrors these offsets (izbios-defs.inc EBDA_MOUSE_*).
 const EBDA_MOUSE_HANDLER_OFF: u32 = 0x0002;
+/// EBDA offset of the mouse packet-size byte (izbios-defs.inc EBDA_MOUSE_PKT_SIZE):
+/// 3 for a standard mouse, 4 once the platform enables IntelliMouse wheel mode. The
+/// BIOS INT 74h ISR accumulates this many aux bytes before dispatching a frame.
+const EBDA_MOUSE_PKT_SIZE_OFF: u32 = 0x000B;
 
 /// Soft-INT vector the XMS driver entry stub triggers to trap into the host. INT
 /// 66h sits in the user-reserved range (RBIL: INT 60h-66h are free for
@@ -31521,6 +31558,59 @@ mod tests {
         let base = (u32::from(EBDA_SEGMENT) << 4) + EBDA_MOUSE_HANDLER_OFF;
         assert_eq!(read_u16(&mut m, base), 0x5678, "offset stored");
         assert_eq!(read_u16(&mut m, base + 2), 0x1234, "segment stored");
+    }
+
+    #[test]
+    fn c205_init_enables_intellimouse_wheel_and_sets_ebda_packet_size() {
+        let mut m = int15_machine(4);
+        // The aux device powers up as a standard 3-byte mouse.
+        assert!(!m.keyboard.mouse_wheel_enabled(), "starts in 3-byte mode");
+        // INT 15h AX=C205, BH=3 (the standard init the driver issues at startup).
+        m.cpu.registers.set_eax(0xC205);
+        m.cpu.registers.set_ebx(0x0300);
+        m.handle_int15();
+        assert_eq!(
+            (m.cpu.registers.eax() >> 8) as u8,
+            0x00,
+            "C205 returns AH=0"
+        );
+        // The platform enables wheel mode at mouse-enable: the device is now 4-byte,
+        assert!(
+            m.keyboard.mouse_wheel_enabled(),
+            "device in IntelliMouse mode"
+        );
+        // and the BIOS-visible EBDA packet size is 4 so int74 assembles the Z byte.
+        let pkt_size = (u32::from(EBDA_SEGMENT) << 4) + EBDA_MOUSE_PKT_SIZE_OFF;
+        assert_eq!(m.read_physical_u8(pkt_size), 4, "EBDA packet size is 4");
+    }
+
+    #[test]
+    fn c200_enable_turns_on_the_wheel_and_disable_leaves_it() {
+        let mut m = int15_machine(4);
+        // C200 enable (BH=1) flips on IntelliMouse 4-byte mode and packet size 4.
+        m.cpu.registers.set_eax(0xC200);
+        m.cpu.registers.set_ebx(0x0100);
+        m.handle_int15();
+        assert!(
+            m.keyboard.mouse_wheel_enabled(),
+            "enable turns on the wheel"
+        );
+        let pkt_size = (u32::from(EBDA_SEGMENT) << 4) + EBDA_MOUSE_PKT_SIZE_OFF;
+        assert_eq!(m.read_physical_u8(pkt_size), 4, "enable sets packet size 4");
+        // C200 disable (BH=0) stops reporting but leaves the wheel mode and the EBDA
+        // packet size as-is (the known no-resize ceiling).
+        m.cpu.registers.set_eax(0xC200);
+        m.cpu.registers.set_ebx(0x0000);
+        m.handle_int15();
+        assert!(
+            m.keyboard.mouse_wheel_enabled(),
+            "disable leaves wheel mode untouched"
+        );
+        assert_eq!(
+            m.read_physical_u8(pkt_size),
+            4,
+            "disable leaves the packet size untouched"
+        );
     }
 
     #[test]

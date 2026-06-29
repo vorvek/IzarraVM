@@ -32,6 +32,10 @@ use izarravm_machine::{Machine, MachineProfile, StopReason};
 const MTEST_COM: &[u8] = include_bytes!("fixtures/MTEST.COM");
 const CBLEAK_COM: &[u8] = include_bytes!("fixtures/CBLEAK.COM");
 const GFXCUR_COM: &[u8] = include_bytes!("fixtures/GFXCUR.COM");
+// WHEELTEST.COM, assembled from tests/fixtures/wheeltest.asm and committed
+// alongside it (same rebuild contract as MTEST.COM). Exercises the SP-3b
+// scroll-wheel path end-to-end: INT 33h fn 0x11 (wheel API) + fn 0x03 BH.
+const WHEELTEST_COM: &[u8] = include_bytes!("fixtures/WHEELTEST.COM");
 
 // AUTOEXEC.BAT: load the resident mouse driver, then run the self-test. MOUSE.COM
 // installs to C:\DOS (on the PATH); MTEST.COM lands at the C: root, which is the
@@ -39,6 +43,7 @@ const GFXCUR_COM: &[u8] = include_bytes!("fixtures/GFXCUR.COM");
 const AUTOEXEC: &str = "@ECHO OFF\r\nC:\\DOS\\MOUSE\r\nMTEST\r\n";
 const AUTOEXEC_CBLEAK: &str = "@ECHO OFF\r\nC:\\DOS\\MOUSE\r\nCBLEAK\r\n";
 const AUTOEXEC_GFXCUR: &str = "@ECHO OFF\r\nC:\\DOS\\MOUSE\r\nGFXCUR\r\n";
+const AUTOEXEC_WHEEL: &str = "@ECHO OFF\r\nC:\\DOS\\MOUSE\r\nWHEELTEST\r\n";
 
 /// Install Toka-DOS onto a fresh temp C:, drop MTEST.COM at the root, write the
 /// AUTOEXEC.BAT above, and return a booted machine plus the temp dir (kept alive
@@ -96,6 +101,28 @@ fn boot_with_gfxcur() -> (Machine, tempfile::TempDir) {
         izarra_bios(),
     )
     .unwrap();
+    machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
+    machine.set_toka_c_root(dir.path().to_path_buf());
+    (machine, dir)
+}
+
+/// Install Toka-DOS onto a fresh temp C:, drop WHEELTEST.COM at the root, write
+/// the wheel AUTOEXEC.BAT, and return a booted machine plus the temp dir.
+fn boot_with_wheeltest() -> (Machine, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let files = izarravm_firmware::toka_dos_system_files();
+    izarravm_dos::toka_dos_install(dir.path(), &files, izarravm_dos::InstallMode::Format).unwrap();
+    std::fs::write(dir.path().join("WHEELTEST.COM"), WHEELTEST_COM).unwrap();
+    std::fs::write(dir.path().join("AUTOEXEC.BAT"), AUTOEXEC_WHEEL).unwrap();
+
+    let mut machine = Machine::new(
+        MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+        izarra_bios(),
+    )
+    .unwrap();
+    // Match the sibling mtest helper: pin the declared 386 level so the per-mode
+    // cycle seam stays 1:1 and the chunked host injection keeps a steady cadence.
+    machine.set_mode(GswMode::Gsw386);
     machine.mount_c_drive(izarravm_dos::HostDrive::mount_c(dir.path()).unwrap());
     machine.set_toka_c_root(dir.path().to_path_buf());
     (machine, dir)
@@ -179,6 +206,62 @@ fn mouse_driver_passes_the_guest_self_test_end_to_end() {
         None => panic!(
             "MTEST never exited within {MAX_CHUNKS} chunks; it may be stuck before \
              the poll, or the injected motion never reached the driver"
+        ),
+    }
+}
+
+#[test]
+fn mouse_wheel_reported_over_int33_end_to_end() {
+    let (mut machine, _dir) = boot_with_wheeltest();
+
+    // Drive the run in chunks. WHEELTEST's Stage A (the wheel-API probe) runs
+    // uninterrupted; if it fails it exits early and the chunk returns TestExit
+    // with code 1. Stage B then spins in a bounded getpos poll waiting for a
+    // host-injected wheel detent, so the chunk returns CycleLimit. The early
+    // chunks cover POST + disk boot + DOS + MOUSE install, so a CycleLimit can
+    // mean either "still booting" or "now polling" - we cannot tell from
+    // outside, so inject a positive wheel detent on every CycleLimit until
+    // WHEELTEST exits. A detent that lands before the poll starts is harmless:
+    // fn 0x03 consumes the counter each call, so a later detent lands inside the
+    // poll. inject_mouse_wheel(1) makes the device emit Z=+1, the BIOS INT 74h
+    // ISR sign-extends it, the driver accumulates a positive [wheel], and fn
+    // 0x03 returns BH > 0 (non-zero, top bit clear) - exactly what Stage B
+    // checks for a positive injection.
+    const CHUNK: u64 = 2_000_000;
+    const MAX_CHUNKS: usize = 120;
+    let mut final_reason = None;
+    for _ in 0..MAX_CHUNKS {
+        match machine.run_until_halt_or_cycles(CHUNK).unwrap() {
+            StopReason::TestExit { code } => {
+                final_reason = Some(StopReason::TestExit { code });
+                break;
+            }
+            // Positive wheel detent (no motion, buttons unchanged). Only queues a
+            // 4-byte packet once the mouse is in IntelliMouse mode, which the
+            // BIOS C200/C205 enable (driven by the resident MOUSE TSR) turns on.
+            StopReason::CycleLimit { .. } => machine.inject_mouse_wheel(1),
+            other => {
+                final_reason = Some(other);
+                break;
+            }
+        }
+    }
+
+    match final_reason {
+        Some(StopReason::TestExit { code: 0 }) => {}
+        Some(StopReason::TestExit { code }) => panic!(
+            "WHEELTEST reported failure code {code} (1=fn 0x11 wheel API absent, \
+             2=wheel sign wrong (BH negative for a positive injection), \
+             3=no wheel movement seen in fn 0x03 BH)"
+        ),
+        Some(other) => panic!(
+            "expected WHEELTEST to Exit with code 0, got {other:?}; the self-test \
+             never reached its Lotura Exit (check that MOUSE.COM went resident and \
+             WHEELTEST ran)"
+        ),
+        None => panic!(
+            "WHEELTEST never exited within {MAX_CHUNKS} chunks; it may be stuck \
+             before the poll, or the injected wheel detent never reached the driver"
         ),
     }
 }
