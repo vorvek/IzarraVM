@@ -913,6 +913,15 @@ impl CacheModel {
     }
 }
 
+/// The result of a host-driven memory-bandwidth pass: the total bytes moved and
+/// the bus clocks they took. The caller turns this into MB/s with the live mode's
+/// clock: `bytes / (clocks / clock_hz)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BandwidthSample {
+    pub bytes: u64,
+    pub clocks: u64,
+}
+
 #[derive(Debug)]
 pub struct Machine {
     profile: MachineProfile,
@@ -10488,6 +10497,52 @@ impl Machine {
         self.active_mode
     }
 
+    /// Measure pure memory read timing for a block by driving the bus directly.
+    ///
+    /// Resets the modeled cache, then does enough sequential dword-read passes
+    /// over `[base, base + block_bytes)` to move roughly `total_bytes` total, and
+    /// returns the bus clocks elapsed. The caller derives MB/s from
+    /// `bytes / (clocks / clock_hz)`. Pick `base` in extended memory (>= 1 MB) so
+    /// the sweep never crosses the 640 KB-1 MB device/ROM hole; `base +
+    /// block_bytes` must fit the machine's memory.
+    ///
+    /// The reads go through the bus exactly as an instruction's data access would,
+    /// so each access warms the per-mode modeled cache and records its
+    /// wait-states into the shared `BusTrace`. A block that FITS the live mode's
+    /// cache stays resident across passes (fast after pass 1); a block that
+    /// EXCEEDS it re-misses every pass (slow). With many passes the steady state
+    /// dominates, which is what produces the L1/L2/RAM steps once the tier costs
+    /// are calibrated. Until then `data_wait_states` is behavior-neutral, so the
+    /// curve is FLAT (every tier charges the RAM wait-state).
+    pub fn measure_read_bandwidth(
+        &mut self,
+        base: u32,
+        block_bytes: u32,
+        total_bytes: u64,
+    ) -> BandwidthSample {
+        self.cache_model.reset();
+        let block = block_bytes.max(4) & !3; // whole dwords, at least one
+        let passes = (total_bytes / u64::from(block)).max(2);
+        // Build the bus in an inner scope so it drops (releasing the &mut borrow
+        // of self.trace) before we read self.trace.elapsed_clocks() afterwards.
+        {
+            let mut bus = self.make_bus();
+            let start = bus.trace.elapsed_clocks();
+            for _ in 0..passes {
+                for off in (0..block).step_by(4) {
+                    // Conventional RAM in extended memory never errors; ignore so a
+                    // misconfigured base is recorded as zero clocks, not a panic.
+                    let _ = bus.read_memory(base + off, BusWidth::Dword, BusAccessKind::DataRead);
+                }
+            }
+            let clocks = bus.trace.elapsed_clocks() - start;
+            BandwidthSample {
+                bytes: u64::from(block) * passes,
+                clocks,
+            }
+        }
+    }
+
     /// Advance time-based devices by `clocks` of CPU time, carrying fractional
     /// remainders forward for the OPL timers (microseconds), the PIT counters,
     /// and the Margo blit engine (nanoseconds).
@@ -13583,6 +13638,41 @@ mod tests {
         assert_eq!(c.data_tier(CpuLevel::I586, 0x30_0000), Tier::L1); // hot
         c.reset();
         assert_ne!(c.data_tier(CpuLevel::I586, 0x30_0000), Tier::L1); // cold again
+    }
+
+    #[test]
+    fn measure_read_bandwidth_returns_a_finite_sample_in_every_mode() {
+        // Small block (fits every mode's L1 once calibrated) and a large block
+        // (exceeds every L2). Both must move bytes and take clocks; we do NOT
+        // assert tier ordering here -- the tier costs are neutral (B-T7 asserts
+        // ordering after the B-T9 calibration lands).
+        const TOTAL: u64 = 4 * 1024 * 1024;
+        let modes = [
+            GswMode::Gsw286,
+            GswMode::Gsw386,
+            GswMode::Gsw486,
+            GswMode::Gsw586,
+        ];
+        for mode in modes {
+            let mut machine = Machine::new_boot_image(
+                MachineProfile::gsw_386(24, VideoCard::Et4000Ax),
+                izarravm_firmware::neurketa_image(),
+            )
+            .expect("boot image");
+            machine.set_mode(mode);
+            for block in [4 * 1024u32, 1024 * 1024] {
+                let sample = machine.measure_read_bandwidth(0x10_0000, block, TOTAL);
+                assert!(sample.bytes > 0, "{mode:?} block {block}: zero bytes");
+                assert!(sample.clocks > 0, "{mode:?} block {block}: zero clocks");
+                // bytes == block_bytes * passes, with passes = max(2, TOTAL/block).
+                let passes = (TOTAL / u64::from(block)).max(2);
+                assert_eq!(
+                    sample.bytes,
+                    u64::from(block) * passes,
+                    "{mode:?} block {block}: bytes != block * passes"
+                );
+            }
+        }
     }
 
     #[test]
