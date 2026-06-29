@@ -225,8 +225,13 @@
 ; Offsets match crates/izarravm-machine/src/lib.rs EBDA_MOUSE_HANDLER_OFF (0x02).
 %define EBDA_SEG          0x9FC0
 %define EBDA_MOUSE_HANDLER 0x0002   ; far-pointer: offset word 0x02, segment word 0x04
-%define EBDA_MOUSE_PKT     0x0006   ; 3-byte PS/2 packet assembly buffer
-%define EBDA_MOUSE_IDX     0x0009   ; packet byte-index 0..2
+%define EBDA_MOUSE_PKT     0x0006   ; PS/2 packet assembly buffer (4 bytes: 0x06..0x09)
+%define EBDA_MOUSE_IDX     0x000A   ; packet byte-index 0..3 (moved past the 4th packet byte)
+; Bytes per PS/2 packet: 3 for a standard mouse, 4 for an IntelliMouse with a Z
+; wheel byte. Seeded to 3 at POST (bios_start); a guest/driver that confirms the
+; IntelliMouse knock bumps it to 4 so int74 assembles the wheel byte. Free EBDA
+; byte just past EBDA_MOUSE_IDX; nothing else in this ROM touches 0x0A..0x0B.
+%define EBDA_MOUSE_PKT_SIZE 0x000B  ; bytes per packet (3 standard, 4 IntelliMouse)
 
 ; Boxed-menu draw scratch (segment 0 RAM, above BMX_SAVE which ends at 0x0A1F).
 ; The renderer is single-threaded, so these are reused freely between helpers.
