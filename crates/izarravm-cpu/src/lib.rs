@@ -920,6 +920,18 @@ enum DecodeGroup {
     /// 0x63 ARPL) are NOT routed here — they stay on Fallback / TwoByteFallback (the fused path #UDs
     /// them as `UnsupportedOpcode` / `UnsupportedTwoByteOpcode`).
     SystemSeg,
+    /// The x87 FPU block (task A13): the eight escape opcodes 0xD8-0xDF plus WAIT/FWAIT (0x9B).
+    /// Each escape opcode carries a ModRM whose `mod` field selects the form — `mod != 3` is a
+    /// memory operand (parsed in `decode` as a normal addressing descriptor, instruction bytes
+    /// only) and `mod == 3` operates on the FPU stack registers (the ModRM byte alone, no
+    /// addressing descriptor, exactly as the fused handler treated it). The `reg` field (and, for
+    /// the register forms, the full ModRM byte) selects the x87 operation. None carry an immediate.
+    /// 0x9B WAIT has no ModRM at all. The whole group is a THIN wrapper: the executor reproduces the
+    /// fused handler's pending-#MF gate, then calls the EXISTING `execute_fpu_register` /
+    /// `execute_fpu_memory` (for the escapes) or runs the WAIT #MF check (for 0x9B) verbatim — the
+    /// entire x87 stack/control/status logic stays in those leaf helpers. The only change is WHERE
+    /// the ModRM is fetched: once, in `decode`.
+    Fpu,
     /// Not yet converted to the split: decode parses nothing extra and `execute_decoded` hands the
     /// opcode to the shared fused `dispatch_opcode`.
     Fallback,
@@ -1370,6 +1382,13 @@ impl Cpu386 {
         if matches!(opcode, 0x62 | 0xc4 | 0xc5) {
             return DecodeGroup::SystemSeg;
         }
+        // x87 FPU block (task A13): the eight escape opcodes 0xD8-0xDF (each a ModRM r/m or
+        // register form) and WAIT/FWAIT (0x9B, no ModRM). `decode` fetches the ModRM once (and the
+        // addressing descriptor for the mod != 3 memory forms); the executor reproduces the
+        // fused #MF gate and calls the existing `execute_fpu_register`/`execute_fpu_memory`.
+        if matches!(opcode, 0x9b | 0xd8..=0xdf) {
+            return DecodeGroup::Fpu;
+        }
         DecodeGroup::Fallback
     }
 
@@ -1737,6 +1756,25 @@ impl Cpu386 {
                     }
                 }
             }
+            DecodeGroup::Fpu => {
+                // x87 FPU block (task A13). WAIT/FWAIT (0x9B) has no ModRM — nothing to pre-parse.
+                // Each escape opcode (0xD8-0xDF) carries a ModRM: fetch it once here. The fused
+                // handler treated `mod == 3` as the register form (it dispatched on the raw ModRM
+                // byte WITHOUT decoding an addressing mode) and `mod != 3` as a memory operand (it
+                // decoded the addressing mode). Mirror that split exactly so the same instruction
+                // bytes are consumed and charged once: store the ModRM always, and parse the
+                // addressing descriptor ONLY for the memory forms. No FPU opcode carries an
+                // immediate after the ModRM.
+                if opcode != 0x9b {
+                    let modrm = self.fetch_modrm(bus)?;
+                    if modrm.mode != 3 {
+                        let operand =
+                            self.parse_addressing_mode(bus, prefixes, address_size, modrm)?;
+                        insn.operand = Some(operand);
+                    }
+                    insn.modrm = Some(modrm);
+                }
+            }
             // Both fallback groups pre-parse nothing in `decode` (the second 0F byte was already
             // folded into `insn.opcode` above): their executors re-read any ModRM/immediate from the
             // post-opcode eip in the shared fused dispatch.
@@ -1817,6 +1855,12 @@ impl Cpu386 {
             // reusing the existing CR/segment/descriptor leaf helpers verbatim so the TLB and
             // code-cache invalidation hooks fire exactly as before.
             DecodeGroup::SystemSeg => self.execute_system_seg_decoded(insn, bus),
+            // The x87 FPU block (0xD8-0xDF) + WAIT/FWAIT (0x9B) runs through its split executor: a
+            // thin wrapper that reproduces the fused pending-#MF gate, then resolves the pre-decoded
+            // ModRM/operand (for the memory forms) and calls the existing `execute_fpu_register` /
+            // `execute_fpu_memory` verbatim — the entire x87 stack/control/status logic stays in
+            // those leaf helpers unchanged.
+            DecodeGroup::Fpu => self.execute_fpu_decoded(insn, bus),
             DecodeGroup::TwoByteFallback => {
                 // Un-converted two-byte (0F) opcode. `decode` already read + charged the second
                 // byte and applied the ISA gate, folding it into `insn.opcode` as 0x0F00 | second.
@@ -3863,7 +3907,11 @@ impl Cpu386 {
                 self.write_gpr8(0, value);
                 Ok(clocks(2))
             }
-            0xd8..=0xdf => self.execute_fpu(bus, opcode, prefixes, address_size),
+            // 0xd8-0xdf (the x87 FPU escape opcodes) are converted to the decode/execute split:
+            // `route_group` classifies them as `DecodeGroup::Fpu` and `execute_fpu_decoded` runs
+            // them (the ModRM + addressing descriptor are parsed once in `decode`; the existing
+            // `execute_fpu_register`/`execute_fpu_memory` leaf helpers run the x87 logic). Not
+            // handled here.
             // 0xe0/0xe1 (LOOPNE/LOOPE), 0xe2 (LOOP), 0xe3 (JCXZ/JECXZ) are converted to the
             // decode/execute split: `route_group` classifies them as `DecodeGroup::Branch` and
             // `execute_branch_decoded` runs them. Not handled here.
@@ -3874,18 +3922,9 @@ impl Cpu386 {
             // 0xe8 (CALL near, rel16/32), 0xe9 (JMP near, rel16/32), 0xeb (JMP short, rel8) are
             // converted to the decode/execute split: `route_group` classifies them as
             // `DecodeGroup::Branch` and `execute_branch_decoded` runs them. Not handled here.
-            0x9b => {
-                // WAIT/FWAIT: trap with #MF if the x87 has a pending unmasked exception
-                // (gated on CR0.NE; otherwise the FERR#/IRQ13 path the PC uses applies and
-                // is not modeled). With nothing pending it retires as a no-op.
-                if self.control.cr0 & CR0_NE != 0 && self.fpu.pending_unmasked_exception() {
-                    return Err(InternalFault::Exception {
-                        vector: 16,
-                        error_code: None,
-                    });
-                }
-                Ok(clocks(6))
-            }
+            // 0x9b (WAIT/FWAIT) is converted to the decode/execute split: `route_group` classifies
+            // it as `DecodeGroup::Fpu` and `execute_fpu_decoded` runs the same pending-#MF check.
+            // Not handled here.
             // 0x9a (CALL far direct) and 0xea (JMP far direct) are converted to the decode/execute
             // split: `route_group` classifies them as `DecodeGroup::ControlFlow` and
             // `execute_control_flow_decoded` runs them (the far pointer — offset then selector — is
@@ -6698,14 +6737,34 @@ impl Cpu386 {
     // UnsupportedOpcode so they stay visible rather than silently wrong. See
     // dev_docs/coverage-roadmap.md phase 2.
 
-    fn execute_fpu<B: CpuBus>(
+    /// The x87 FPU block (0xD8-0xDF) + WAIT/FWAIT (0x9B) through the decode/execute split (task
+    /// A13). A THIN wrapper: `decode` already fetched the ModRM once (and the addressing descriptor
+    /// for the `mod != 3` memory forms), so this reproduces the fused handler's pending-#MF gate,
+    /// resolves the pre-decoded operand against the live registers, and calls the existing
+    /// `execute_fpu_register` / `execute_fpu_memory` — the entire x87 stack/control/status logic
+    /// stays in those leaf helpers verbatim. Nothing is re-fetched from the instruction stream.
+    fn execute_fpu_decoded<B: CpuBus>(
         &mut self,
+        insn: &DecodedInsn,
         bus: &mut B,
-        opcode: u8,
-        prefixes: Prefixes,
-        address_size: AddressSize,
     ) -> ExecResult<CycleOutcome> {
-        let modrm = self.fetch_modrm(bus)?;
+        let opcode = insn.opcode as u8;
+        if opcode == 0x9b {
+            // WAIT/FWAIT: trap with #MF if the x87 has a pending unmasked exception (gated on
+            // CR0.NE; otherwise the FERR#/IRQ13 path the PC uses applies and is not modeled). With
+            // nothing pending it retires as a no-op. Identical to the former fused 0x9b arm.
+            if self.control.cr0 & CR0_NE != 0 && self.fpu.pending_unmasked_exception() {
+                return Err(InternalFault::Exception {
+                    vector: 16,
+                    error_code: None,
+                });
+            }
+            return Ok(clocks(6));
+        }
+
+        let modrm = insn
+            .modrm
+            .expect("an FPU escape opcode decoded with a ModRM");
         // A pending unmasked exception traps with #MF on the next waiting FPU
         // instruction. The no-wait control ops (FNINIT, FNCLEX) are exempt so they can
         // clear the state. Gated on CR0.NE; with NE clear the part would drive FERR#
@@ -6724,12 +6783,15 @@ impl Cpu386 {
         if modrm.mode == 3 {
             self.execute_fpu_register(opcode, modrm)
         } else {
-            let mem = match self.decode_rm_operand(bus, prefixes, address_size, modrm)? {
-                RmOperand::Memory(memory) => memory,
-                RmOperand::Register(_) => unreachable!("mode != 3 decodes to a memory operand"),
+            // `decode` parsed the addressing descriptor for the memory forms; resolve it against
+            // the live registers now (no instruction bytes are re-read).
+            let mem = match self.resolve_decoded_modrm_operand(insn) {
+                (_, RmOperand::Memory(memory)) => memory,
+                (_, RmOperand::Register(_)) => {
+                    unreachable!("mode != 3 decodes to a memory operand")
+                }
             };
-            let operand_size = self.operand_size(prefixes);
-            self.execute_fpu_memory(bus, opcode, modrm.reg, mem, operand_size)
+            self.execute_fpu_memory(bus, opcode, modrm.reg, mem, insn.operand_size)
         }
     }
 
@@ -15980,7 +16042,9 @@ mod tests {
             cpu.cycle(&mut bus).unwrap(); // FLDZ, FLD1, FDIV
         }
         assert_ne!(cpu.fpu.status & 0x04, 0, "ZE flag set");
-        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
+        // FWAIT (0x9b) is now on the decode/execute split (its fused arm is gone), so drive it
+        // through `exec_one_split` rather than the legacy fused entry, which would #UD it.
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
         assert!(matches!(fault, InternalFault::Exception { vector: 16, .. }));
     }
 
@@ -19864,6 +19928,497 @@ mod tests {
                 fused.tr.selector,
                 fused.registers.segment(SegmentIndex::Es).selector,
                 fused.registers.segment(SegmentIndex::Ds).selector,
+            );
+        }
+    }
+
+    // ---- Task A13: x87 FPU (0xD8-0xDF) + WAIT (0x9B) decode/execute split ----
+
+    struct FpuGolden {
+        name: &'static str,
+        code: &'static [u8],
+        gpr: [u32; 8],
+        eflags: u32,
+        eip: u32,
+        deltas: &'static [(usize, u8)],
+        fetch: usize,
+        fpu_control: u16,
+        fpu_status: u16,
+        fpu_tag: u16,
+        /// The architectural stack ST(0)..ST(7), each f64 captured as raw bits (NaN-stable).
+        st: [u64; 8],
+    }
+
+    /// Seed for the x87 FPU golden battery. Real mode, CS=DS=SS=0, 16-bit addressing. The FPU is
+    /// reset (FINIT state) and then ST(1)=1.25, ST(0)=3.5 are pushed so the stack ops (FADD ST0,ST1;
+    /// FXCH; FST; FNSTSW; FCOM; ...) have stable, distinct inputs; TOP therefore starts at 6. A
+    /// non-default control word (0x027f, the FINIT default) and a status condition are left as the
+    /// push set them. GPRs are a fixed pattern (AX..DI) so the FNSTSW-AX / integer-flag forms have an
+    /// observable before/after.
+    fn fpu_seed(cpu: &mut Cpu386) {
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x1111);
+        cpu.write_reg16(Reg16::Cx, 0x2222);
+        cpu.write_reg16(Reg16::Dx, 0x3333);
+        cpu.write_reg16(Reg16::Bx, 0x4444);
+        cpu.write_reg16(Reg16::Sp, 0x00f0);
+        cpu.write_reg16(Reg16::Bp, 0x0010);
+        cpu.write_reg16(Reg16::Si, 0x0008);
+        cpu.write_reg16(Reg16::Di, 0x0018);
+        cpu.registers.eflags = 0x02;
+        cpu.fpu.finit();
+        cpu.fpu.push(1.25); // ST(1)
+        cpu.fpu.push(3.5); // ST(0)
+    }
+
+    /// Plant the instruction bytes plus the float/int scratch the memory forms read. A 4-byte real
+    /// 2.0 at [0x100], an 8-byte real 1.5 at [0x108], a 4-byte int 7 at [0x110], a 2-byte int 9 at
+    /// [0x118], and a 16-bit control word 0x037f at [0x120] (for FLDCW). The store forms write into
+    /// the free area at [0x130] onward.
+    fn fpu_seed_mem(mem: &mut [u8], code: &[u8]) {
+        mem[..code.len()].copy_from_slice(code);
+        mem[0x100..0x104].copy_from_slice(&2.0f32.to_le_bytes());
+        mem[0x108..0x110].copy_from_slice(&1.5f64.to_le_bytes());
+        mem[0x110..0x114].copy_from_slice(&7i32.to_le_bytes());
+        mem[0x118..0x11a].copy_from_slice(&9i16.to_le_bytes());
+        mem[0x120..0x122].copy_from_slice(&0x037fu16.to_le_bytes());
+    }
+
+    fn assert_fpu_state(cpu: &Cpu386, g: &FpuGolden) {
+        assert_eq!(cpu.registers.gpr, g.gpr, "gpr mismatch for {}", g.name);
+        assert_eq!(
+            cpu.registers.eflags, g.eflags,
+            "eflags mismatch for {}",
+            g.name
+        );
+        assert_eq!(cpu.registers.eip, g.eip, "eip mismatch for {}", g.name);
+        assert_eq!(
+            cpu.fpu.control, g.fpu_control,
+            "fpu control mismatch for {}",
+            g.name
+        );
+        assert_eq!(
+            cpu.fpu.status, g.fpu_status,
+            "fpu status mismatch for {}",
+            g.name
+        );
+        assert_eq!(cpu.fpu.tag, g.fpu_tag, "fpu tag mismatch for {}", g.name);
+        let st: [u64; 8] = std::array::from_fn(|i| cpu.fpu.get(i as u8).to_bits());
+        assert_eq!(st, g.st, "fpu stack ST(0)..ST(7) mismatch for {}", g.name);
+    }
+
+    /// The x87 FPU differential battery (task A13). Captured from the PRIOR fused reference
+    /// (`execute_instruction_legacy` -> `dispatch_opcode` -> `execute_fpu`) via `regen_fpu_goldens`
+    /// (parent commit 0b928034) WHILE the fused 0xD8-0xDF / 0x9B arms still existed. Never edit by
+    /// hand — re-run the regen from the pre-split commit. Covers a representative set: a memory load
+    /// (FLD m32), a memory store (FST m32), an FPU stack op (FADD ST0,ST1 and FXCH), the control word
+    /// (FLDCW / FNSTCW), the status word (FNSTSW AX and FNSTSW m16), a few arithmetic / compare ops,
+    /// an integer-operand memory form (FIADD m32), and WAIT/FWAIT (0x9B).
+    fn fpu_golden_cases() -> &'static [FpuGolden] {
+        // Captured verbatim from the fused reference at parent 0b928034 via `regen_fpu_goldens`
+        // (run in a throwaway worktree). Never edit by hand.
+        &[
+            FpuGolden {
+                name: "fwait (9b)",
+                code: &[155],
+                gpr: [4369, 8738, 13107, 17476, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x1,
+                deltas: &[],
+                fetch: 2,
+                fpu_control: 0x37f,
+                fpu_status: 0x3000,
+                fpu_tag: 0xfff,
+                st: [
+                    0x400c000000000000,
+                    0x3ff4000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                ],
+            },
+            FpuGolden {
+                name: "fld m32 [0x100] (d9 06 00 01)",
+                code: &[217, 6, 0, 1],
+                gpr: [4369, 8738, 13107, 17476, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x4,
+                deltas: &[],
+                fetch: 5,
+                fpu_control: 0x37f,
+                fpu_status: 0x2800,
+                fpu_tag: 0x3ff,
+                st: [
+                    0x4000000000000000,
+                    0x400c000000000000,
+                    0x3ff4000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                ],
+            },
+            FpuGolden {
+                name: "fst m32 [0x130] (d9 16 30 01)",
+                code: &[217, 22, 48, 1],
+                gpr: [4369, 8738, 13107, 17476, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x4,
+                deltas: &[(306, 96), (307, 64)],
+                fetch: 5,
+                fpu_control: 0x37f,
+                fpu_status: 0x3000,
+                fpu_tag: 0xfff,
+                st: [
+                    0x400c000000000000,
+                    0x3ff4000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                ],
+            },
+            FpuGolden {
+                name: "fstp m32 [0x130] (d9 1e 30 01)",
+                code: &[217, 30, 48, 1],
+                gpr: [4369, 8738, 13107, 17476, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x4,
+                deltas: &[(306, 96), (307, 64)],
+                fetch: 5,
+                fpu_control: 0x37f,
+                fpu_status: 0x3800,
+                fpu_tag: 0x3fff,
+                st: [
+                    0x3ff4000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x400c000000000000,
+                ],
+            },
+            FpuGolden {
+                name: "fadd st0,st1 (d8 c1)",
+                code: &[216, 193],
+                gpr: [4369, 8738, 13107, 17476, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x2,
+                deltas: &[],
+                fetch: 3,
+                fpu_control: 0x37f,
+                fpu_status: 0x3000,
+                fpu_tag: 0xfff,
+                st: [
+                    0x4013000000000000,
+                    0x3ff4000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                ],
+            },
+            FpuGolden {
+                name: "fmul st0,st1 (d8 c9)",
+                code: &[216, 201],
+                gpr: [4369, 8738, 13107, 17476, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x2,
+                deltas: &[],
+                fetch: 3,
+                fpu_control: 0x37f,
+                fpu_status: 0x3000,
+                fpu_tag: 0xfff,
+                st: [
+                    0x4011800000000000,
+                    0x3ff4000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                ],
+            },
+            FpuGolden {
+                name: "fcom st1 (d8 d1)",
+                code: &[216, 209],
+                gpr: [4369, 8738, 13107, 17476, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x2,
+                deltas: &[],
+                fetch: 3,
+                fpu_control: 0x37f,
+                fpu_status: 0x3000,
+                fpu_tag: 0xfff,
+                st: [
+                    0x400c000000000000,
+                    0x3ff4000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                ],
+            },
+            FpuGolden {
+                name: "fxch st1 (d9 c9)",
+                code: &[217, 201],
+                gpr: [4369, 8738, 13107, 17476, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x2,
+                deltas: &[],
+                fetch: 3,
+                fpu_control: 0x37f,
+                fpu_status: 0x3000,
+                fpu_tag: 0xfff,
+                st: [
+                    0x3ff4000000000000,
+                    0x400c000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                ],
+            },
+            FpuGolden {
+                name: "fadd m64 [0x108] (dc 06 08 01)",
+                code: &[220, 6, 8, 1],
+                gpr: [4369, 8738, 13107, 17476, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x4,
+                deltas: &[],
+                fetch: 5,
+                fpu_control: 0x37f,
+                fpu_status: 0x3000,
+                fpu_tag: 0xfff,
+                st: [
+                    0x4014000000000000,
+                    0x3ff4000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                ],
+            },
+            FpuGolden {
+                name: "fiadd m32 [0x110] (da 06 10 01)",
+                code: &[218, 6, 16, 1],
+                gpr: [4369, 8738, 13107, 17476, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x4,
+                deltas: &[],
+                fetch: 5,
+                fpu_control: 0x37f,
+                fpu_status: 0x3000,
+                fpu_tag: 0xfff,
+                st: [
+                    0x4025000000000000,
+                    0x3ff4000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                ],
+            },
+            FpuGolden {
+                name: "fldcw [0x120] (d9 2e 20 01)",
+                code: &[217, 46, 32, 1],
+                gpr: [4369, 8738, 13107, 17476, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x4,
+                deltas: &[],
+                fetch: 5,
+                fpu_control: 0x37f,
+                fpu_status: 0x3000,
+                fpu_tag: 0xfff,
+                st: [
+                    0x400c000000000000,
+                    0x3ff4000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                ],
+            },
+            FpuGolden {
+                name: "fnstcw [0x130] (d9 3e 30 01)",
+                code: &[217, 62, 48, 1],
+                gpr: [4369, 8738, 13107, 17476, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x4,
+                deltas: &[(304, 127), (305, 3)],
+                fetch: 5,
+                fpu_control: 0x37f,
+                fpu_status: 0x3000,
+                fpu_tag: 0xfff,
+                st: [
+                    0x400c000000000000,
+                    0x3ff4000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                ],
+            },
+            FpuGolden {
+                name: "fnstsw ax (df e0)",
+                code: &[223, 224],
+                gpr: [12288, 8738, 13107, 17476, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x2,
+                deltas: &[],
+                fetch: 3,
+                fpu_control: 0x37f,
+                fpu_status: 0x3000,
+                fpu_tag: 0xfff,
+                st: [
+                    0x400c000000000000,
+                    0x3ff4000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                ],
+            },
+            FpuGolden {
+                name: "fnstsw m16 [0x130] (dd 3e 30 01)",
+                code: &[221, 62, 48, 1],
+                gpr: [4369, 8738, 13107, 17476, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x4,
+                deltas: &[(305, 48)],
+                fetch: 5,
+                fpu_control: 0x37f,
+                fpu_status: 0x3000,
+                fpu_tag: 0xfff,
+                st: [
+                    0x400c000000000000,
+                    0x3ff4000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                    0x0000000000000000,
+                ],
+            },
+        ]
+    }
+
+    #[test]
+    fn fpu_split_matches_golden_across_ops() {
+        // The x87 FPU opcodes (0xD8-0xDF) and WAIT (0x9B) are converted to the decode/execute split,
+        // so their fused arms are deleted and they can no longer be diffed against a fused executor
+        // in-tree. Run each case through the split (`exec_one_split`) and assert the architectural
+        // end-state — GPRs, eflags, the FPU control/status/tag words, and the architectural stack
+        // ST(0)..ST(7) — against goldens captured from the pre-split fused path (parent 0b928034)
+        // via `regen_fpu_goldens`. eip + fetch prove decode consumed and charged every byte (opcode +
+        // ModRM + displacement) exactly once; the memory deltas prove the store path.
+        for g in fpu_golden_cases() {
+            let mut mem = vec![0u8; 0x200];
+            fpu_seed_mem(&mut mem, g.code);
+            let initial = mem.clone();
+
+            let mut split = Cpu386::default();
+            fpu_seed(&mut split);
+            let mut sbus = TestBus::with_memory(mem);
+            exec_one_split(&mut split, &mut sbus).unwrap();
+
+            assert_fpu_state(&split, g);
+            let deltas: Vec<(usize, u8)> = sbus
+                .memory
+                .iter()
+                .enumerate()
+                .filter(|(i, b)| **b != initial[*i])
+                .map(|(i, b)| (i, *b))
+                .collect();
+            assert_eq!(deltas, g.deltas, "memory-write mismatch for {}", g.name);
+            assert_eq!(
+                seam_fetch_count(&sbus),
+                g.fetch,
+                "instruction-fetch cycle count mismatch for {} (seam must charge fetches once)",
+                g.name
+            );
+        }
+    }
+
+    /// Regenerate `fpu_golden_cases` from the fused reference. Ignored by default. Run WHILE the
+    /// x87 fused arms still exist (parent commit 0b928034):
+    ///   git worktree add ../regen-a13 0b928034
+    ///   cd ../regen-a13
+    ///   # paste this test + the cases/seed/struct in, then:
+    ///   cargo test -p izarravm-cpu --lib regen_fpu_goldens -- --ignored --nocapture
+    /// then paste the output over `fpu_golden_cases` and only then delete the fused arms.
+    #[test]
+    #[ignore = "prints golden literals; run with --ignored --nocapture against the fused reference"]
+    fn regen_fpu_goldens() {
+        for g in fpu_golden_cases() {
+            let mut mem = vec![0u8; 0x200];
+            fpu_seed_mem(&mut mem, g.code);
+            let initial = mem.clone();
+
+            let mut fused = Cpu386::default();
+            fpu_seed(&mut fused);
+            let mut fbus = TestBus::with_memory(mem);
+            fused.begin_instruction();
+            if fused.execute_instruction_legacy(&mut fbus).is_err() {
+                println!(
+                    "            // TODO regen {}: fused path unavailable here; run against the base commit",
+                    g.name
+                );
+                continue;
+            }
+            let deltas: Vec<(usize, u8)> = fbus
+                .memory
+                .iter()
+                .enumerate()
+                .filter(|(i, b)| **b != initial[*i])
+                .map(|(i, b)| (i, *b))
+                .collect();
+            let fetch = seam_fetch_count(&fbus);
+            let st: [u64; 8] = std::array::from_fn(|i| fused.fpu.get(i as u8).to_bits());
+            println!(
+                "            FpuGolden {{ name: {:?}, code: &{:?}, gpr: {:?}, eflags: {:#x}, eip: {:#x}, deltas: &{:?}, fetch: {}, fpu_control: {:#x}, fpu_status: {:#x}, fpu_tag: {:#x}, st: [{} ] }},",
+                g.name,
+                g.code,
+                fused.registers.gpr,
+                fused.registers.eflags,
+                fused.registers.eip,
+                deltas,
+                fetch,
+                fused.fpu.control,
+                fused.fpu.status,
+                fused.fpu.tag,
+                st.iter()
+                    .map(|b| format!(" {b:#018x},"))
+                    .collect::<String>(),
             );
         }
     }
