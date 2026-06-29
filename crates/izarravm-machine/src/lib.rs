@@ -11432,7 +11432,11 @@ impl CpuBus for MachineBus<'_> {
         let first_ws = self.memory_wait_states(first);
         // Uniform iff every byte lands in the same wait-state region with no A20 wrap
         // between the ends. apply_a20 already folded both ends, so equal wait-states on
-        // contiguous post-A20 addresses means the whole run is one region.
+        // contiguous post-A20 addresses means the whole run is one region. The endpoint-only
+        // test relies on `count` being one instruction's length (at most 15 bytes), far smaller
+        // than any wait-state region: a narrower region wholly contained between two matching
+        // endpoints cannot exist at that scale. A caller passing a large `count` must not assume
+        // this holds; the non-uniform branch's exact per-byte loop is the safe fallback regardless.
         let uniform =
             last == first.wrapping_add(count - 1) && first_ws == self.memory_wait_states(last);
         if uniform {
