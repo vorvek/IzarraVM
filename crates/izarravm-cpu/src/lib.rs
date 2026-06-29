@@ -1261,6 +1261,15 @@ impl Cpu386 {
         self.decode_cache.generation
     }
 
+    /// The machine calls this after a device (e.g. a disk/floppy DMA transfer) writes guest RAM.
+    /// Such writes bypass the CPU's own self-modifying-code tracking (which only sees CPU writes via
+    /// `note_code_write`), so if the written RAM held cached code (a loaded overlay or boot stage)
+    /// the prefetch and decode cache would replay stale bytes. This is a coarse whole-cache
+    /// invalidation, which is fine because device transfers are infrequent.
+    pub fn note_device_memory_write(&mut self) {
+        self.invalidate_code_caches();
+    }
+
     /// A guest data write of `width` bytes to `physical`. If any written byte was decoded as part of
     /// a cached instruction it is self-modifying code, so advance the decode-cache generation to
     /// re-decode those lines. Byte-exact: a 16-bit stack push just below the code (the flat
@@ -1653,14 +1662,20 @@ impl Cpu386 {
             return Ok(insn);
         }
         let insn = self.decode(bus)?;
-        // Mark the physical block(s) this instruction occupies so a later write into them
-        // invalidates the cache (cross-page SMC). decode just warmed the code-page translation, so
-        // resolving the physical start is a cache hit (and the identity map without paging). A
-        // page-straddling instruction under paging marks the tail block from the contiguous physical
-        // of its first page, which is the one remaining exotic gap.
-        let physical = self.translate_code_linear(bus, lin)?;
-        self.decode_cache.mark_code_range(physical, insn.len);
-        self.decode_cache.put(lin, insn);
+        // A LOCK-prefixed instruction is never cached: `decode` runs `check_lock_target`, which both
+        // peeks the lock target over the bus (charging fetch clocks that are NOT part of `len`, so a
+        // cached replay would under-charge them) and raises #UD for a non-lockable target. Replaying
+        // it from the cache would skip both. LOCK is rare, so re-decoding it every time is free.
+        if !insn.prefixes.lock {
+            // Mark the physical block(s) this instruction occupies so a later write into them
+            // invalidates the cache (cross-page SMC). decode just warmed the code-page translation,
+            // so resolving the physical start is a cache hit (and the identity map without paging). A
+            // page-straddling instruction under paging marks the tail block from the contiguous
+            // physical of its first page, which is the one remaining exotic gap.
+            let physical = self.translate_code_linear(bus, lin)?;
+            self.decode_cache.mark_code_range(physical, insn.len);
+            self.decode_cache.put(lin, insn);
+        }
         Ok(insn)
     }
 
@@ -14291,6 +14306,25 @@ mod tests {
         assert!(
             cpu.decode_cache.get(lin).is_none(),
             "invalidate_code_caches clears the decode cache"
+        );
+    }
+
+    #[test]
+    fn lock_prefixed_instructions_are_not_cached() {
+        // LOCK ADD [BX], AL (F0 00 07). `decode` runs check_lock_target, which peeks the lock
+        // target over the bus (charging clocks that are not part of `len`) and would #UD a
+        // non-lockable target. A cached replay skips both, so a LOCK instruction must re-decode
+        // every time and is never cached.
+        let (mut cpu, mem) = real_mode_cpu(&[0xf0, 0x00, 0x07], 0x40);
+        let mut bus = TestBus::with_memory(mem);
+        cpu.registers.set_eax(1); // AL = 1
+        cpu.registers.set_ebx(0x20);
+        let lin = cpu.linear_eip();
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(bus.memory[0x20], 1, "LOCK ADD [BX], AL executed");
+        assert!(
+            cpu.decode_cache.get(lin).is_none(),
+            "a LOCK-prefixed instruction must not be cached (it re-charges + re-validates each run)"
         );
     }
 

@@ -739,6 +739,10 @@ pub struct Machine {
     // it to know when to stop and service devices (see run_until_clock). A field
     // rather than a loop local so make_bus's one-off host accesses share it.
     io_touched: bool,
+    // Set by MachineBus when a device (DMA disk/floppy transfer, DMA block copy) writes guest RAM,
+    // which bypasses the CPU's self-modifying-code tracking. The run loop tells the CPU to drop its
+    // prefetch + decode cache at end of step so staged code is never replayed stale.
+    device_wrote_memory: bool,
     // Toka-DOS service (Lotura port 0xE3): a write records the command here, the
     // run loop performs it after the cycle (it needs &mut self for host I/O), and
     // the resulting status is read back at 0xE3.
@@ -1147,6 +1151,7 @@ impl Machine {
             text_scanline_override: None,
             pending_soft_int: None,
             io_touched: false,
+            device_wrote_memory: false,
             pending_toka_service: None,
             toka_service_status: 0,
             toka_c_root: None,
@@ -2100,6 +2105,7 @@ impl Machine {
             unittester: &mut self.unittester,
             wait_states: self.profile.wait_states,
             io_touched: &mut self.io_touched,
+            device_wrote_memory: &mut self.device_wrote_memory,
         }
     }
 
@@ -10816,6 +10822,7 @@ impl Machine {
         while self.elapsed_clocks < deadline {
             self.pending_soft_int = None;
             self.io_touched = false;
+            self.device_wrote_memory = false;
             let trace_before = self.trace.elapsed_clocks();
             // A20 is a machine-layer event the CPU never sees directly, yet toggling it changes
             // which physical bytes back a linear address near the 1 MB wrap. Any A20 write (port
@@ -10878,6 +10885,7 @@ impl Machine {
                     unittester,
                     pci,
                     io_touched,
+                    device_wrote_memory,
                     ..
                 } = self;
                 let mut bus = MachineBus {
@@ -10922,6 +10930,7 @@ impl Machine {
                     unittester,
                     wait_states: profile.wait_states,
                     io_touched,
+                    device_wrote_memory,
                 };
                 // Collapse the batch into one CycleOutcome so every downstream
                 // service step (device advance, CD stall, pending INT/mode/Toka/
@@ -11076,6 +11085,12 @@ impl Machine {
                     if self.keyboard.a20_enabled() != a20_before {
                         self.cpu.note_a20_changed();
                     }
+                    // A device wrote guest RAM this step (a DMA disk/floppy transfer or block copy),
+                    // bypassing the CPU's SMC tracking; drop the prefetch + decode cache so staged
+                    // code is re-decoded rather than replayed stale on a later near branch into it.
+                    if self.device_wrote_memory {
+                        self.cpu.note_device_memory_write();
+                    }
                 }
                 Err(error) => return Ok(StopReason::CpuError(error.to_string())),
             }
@@ -11143,6 +11158,7 @@ struct MachineBus<'a> {
     // or changes time-dependent device state, so it ends the batch to keep that
     // state exact. Memory/MMIO (framebuffer blits, the hot path) does not set it.
     io_touched: &'a mut bool,
+    device_wrote_memory: &'a mut bool,
 }
 
 /// The A20 gate clears address line 20 when it is closed. With the gate off, any
@@ -11558,6 +11574,9 @@ impl CpuBus for MachineBus<'_> {
             // write above recorded the request; fire the block copy here.
             if port == 0x09 && self.dma.mem_to_mem_request_armed() {
                 self.dma.mem_to_mem(self.memory);
+                // A DMA block copy wrote guest RAM directly; if it staged code, drop the caches
+                // (see the FDC transfer path). The run loop honors the flag at end of step.
+                *self.device_wrote_memory = true;
             }
             return Ok(());
         }
@@ -12965,6 +12984,15 @@ impl MachineBus<'_> {
         let success = ok && moved_any;
         self.fdc
             .complete_transfer(req, req.cylinder, req.head, last_sector, success);
+
+        // A disk -> memory transfer wrote guest RAM directly via the DMA controller, bypassing the
+        // CPU's self-modifying-code tracking. If that RAM held cached code (a loaded overlay or boot
+        // stage later re-entered by a near branch, which would not otherwise invalidate), the decode
+        // cache and prefetch must drop it. This runs in the bus, so flag it; the run loop calls the
+        // CPU's note_device_memory_write at the end of the step (where the A20 seam also lives).
+        if req.read && moved_any {
+            *self.device_wrote_memory = true;
+        }
     }
 
     #[inline]
@@ -21661,6 +21689,7 @@ mod tests {
             unittester: &mut machine.unittester,
             wait_states: machine.profile.wait_states,
             io_touched: &mut machine.io_touched,
+            device_wrote_memory: &mut machine.device_wrote_memory,
         };
         f(&mut bus)
     }
@@ -22209,6 +22238,15 @@ mod tests {
             let want = (0xA0 + (i & 0x0F)) as u8;
             assert_eq!(got, want, "byte {i} of the sector in memory");
         }
+
+        // The disk->memory DMA transfer flagged a device memory write, so the run loop will tell
+        // the CPU to drop its prefetch + decode cache (the staged bytes could be re-entered by a
+        // near branch that would not otherwise invalidate). The flag->invalidation step itself is
+        // covered end-to-end by a20_toggle_through_the_run_loop, which shares the seam.
+        assert!(
+            machine.device_wrote_memory,
+            "an FDC disk->memory DMA transfer must flag a device memory write"
+        );
 
         // The completion interrupt is IRQ6 (the controller raised it; advance the
         // device pump so the bus collects it into the PIC).
