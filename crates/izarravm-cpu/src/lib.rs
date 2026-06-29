@@ -897,6 +897,29 @@ enum DecodeGroup {
     /// gates (386+ for SETcc/IMUL, 586+ for CMOVcc) are applied once in `decode`'s
     /// `check_two_byte_isa_gate`; the executor does NOT re-gate.
     CondMove,
+    /// The system / descriptor-table / segment-load block (task A12), a MIX of two-byte (0F) and
+    /// single-byte opcodes that read/write control, descriptor-table, and segment state. The members
+    /// are: the descriptor groups 0F 00 group 6 (SLDT/STR/LLDT/LTR/VERR/VERW) and 0F 01 group 7
+    /// (SGDT/SIDT/LGDT/LIDT/SMSW/LMSW/INVLPG), each a ModRM whose `reg` field is the /ext sub-op
+    /// selector; LAR (0F 02) and LSL (0F 03), which read descriptor access-rights / limit into a
+    /// register; CLTS (0F 06), which clears CR0.TS with no encoded operand; MOV reg,CR / MOV CR,reg
+    /// (0F 20/22), whole-32-bit control-register moves whose ModRM is a register form (`mod` treated
+    /// as 3, `reg` selects the CR number); and the single-byte BOUND r,m (0x62; #BR on an out-of-range
+    /// index, mod=3 is #UD) and LES/LDS (0xC4/0xC5; load a far pointer m16:16/32 into ES/DS + reg,
+    /// mod=3 is #UD).
+    ///
+    /// Every ModRM form has its ModRM + addressing descriptor parsed once in `decode` (instruction
+    /// bytes only, so it stays cacheable); none carry an immediate after the ModRM. The CR/segment/
+    /// descriptor state changes run through the EXISTING leaf helpers verbatim (`load_segment`,
+    /// `load_ldtr`, `load_tr`, `verify_segment`, `store_descriptor_table`, `flush_tlb_and_code_caches`,
+    /// `try_read_descriptor`/`descriptor_accessible`), so the TLB/code-cache invalidation hooks that
+    /// Stage B depends on still fire exactly as before. The far pointer for LES/LDS is read FROM
+    /// MEMORY at execute time (against live registers), never pre-read at decode. Folded into
+    /// `insn.opcode` as 0x0F00 | second for the 0F forms and dispatched off the full u16. The
+    /// genuinely-unimplemented neighbours (0F 21/23 MOV reg,DR / MOV DR,reg, 0F B2/B4/B5 LSS/LFS/LGS,
+    /// 0x63 ARPL) are NOT routed here — they stay on Fallback / TwoByteFallback (the fused path #UDs
+    /// them as `UnsupportedOpcode` / `UnsupportedTwoByteOpcode`).
+    SystemSeg,
     /// Not yet converted to the split: decode parses nothing extra and `execute_decoded` hands the
     /// opcode to the shared fused `dispatch_opcode`.
     Fallback,
@@ -1231,6 +1254,11 @@ impl Cpu386 {
                 // CMOVcc reg,r/m (40-4F, 586-class), SETcc r/m8 (90-9F, 386-class), and
                 // IMUL reg,r/m (AF, 386-class). All are ModRM r/m forms with no immediate.
                 0x40..=0x4f | 0x90..=0x9f | 0xaf => DecodeGroup::CondMove,
+                // System / descriptor-table / segment block (task A12), 0F forms: the descriptor
+                // groups 0F 00 (group 6) and 0F 01 (group 7), LAR/LSL (0F 02/03), CLTS (0F 06), and
+                // MOV reg,CR / MOV CR,reg (0F 20/22). 0F 21/23 (MOV reg,DR / MOV DR,reg) and 0F B2/
+                // B4/B5 (LSS/LFS/LGS) are unimplemented in the fused path and stay TwoByteFallback.
+                0x00 | 0x01 | 0x02 | 0x03 | 0x06 | 0x20 | 0x22 => DecodeGroup::SystemSeg,
                 _ => DecodeGroup::TwoByteFallback,
             };
         }
@@ -1334,6 +1362,13 @@ impl Cpu386 {
         // (0x6c-0x6f) are NOT listed here and stay on Fallback.
         if matches!(opcode, 0xe4..=0xe7 | 0xec..=0xef) {
             return DecodeGroup::PortIo;
+        }
+        // System / descriptor-table / segment block (task A12), single-byte forms: BOUND r,m
+        // (0x62) and LES/LDS (0xc4/0xc5). Each is a ModRM r/m form whose memory operand decode
+        // pre-parses; the far pointer for LES/LDS is read FROM MEMORY at execute. 0x63 (ARPL) is
+        // unimplemented in the fused path (`UnsupportedOpcode`) and stays on Fallback.
+        if matches!(opcode, 0x62 | 0xc4 | 0xc5) {
+            return DecodeGroup::SystemSeg;
         }
         DecodeGroup::Fallback
     }
@@ -1674,6 +1709,34 @@ impl Cpu386 {
                 insn.modrm = Some(modrm);
                 insn.operand = Some(operand);
             }
+            DecodeGroup::SystemSeg => {
+                // System / descriptor-table / segment block (task A12). Every opcode here except
+                // CLTS (0F 06) carries a ModRM; the /ext (`modrm.reg`) selects the sub-op for the
+                // 0F 00 / 0F 01 groups. Parse the ModRM + addressing descriptor (instruction bytes
+                // only, so it stays cacheable). None carry an immediate after the ModRM.
+                match insn.opcode {
+                    // CLTS: no encoded operand.
+                    0x0f06 => {}
+                    // MOV reg,CR / MOV CR,reg (0F 20/22): the ModRM is always a register form (the
+                    // `reg` field is the CR number, `rm` the GPR). The fused path fetches ONLY the
+                    // ModRM byte and #UDs when `mode != 3` BEFORE touching any addressing byte, so
+                    // do the same here: fetch the ModRM, store it, and DO NOT parse an addressing
+                    // mode (a non-register `mode` is rejected in the executor with no extra fetch).
+                    0x0f20 | 0x0f22 => {
+                        let modrm = self.fetch_modrm(bus)?;
+                        insn.modrm = Some(modrm);
+                    }
+                    // The 0F 00/01/02/03 groups, BOUND (0x62), and LES/LDS (0xc4/0xc5): a normal
+                    // ModRM r/m form. Parse the ModRM + its addressing descriptor.
+                    _ => {
+                        let modrm = self.fetch_modrm(bus)?;
+                        let operand =
+                            self.parse_addressing_mode(bus, prefixes, address_size, modrm)?;
+                        insn.modrm = Some(modrm);
+                        insn.operand = Some(operand);
+                    }
+                }
+            }
             // Both fallback groups pre-parse nothing in `decode` (the second 0F byte was already
             // folded into `insn.opcode` above): their executors re-read any ModRM/immediate from the
             // post-opcode eip in the shared fused dispatch.
@@ -1749,6 +1812,11 @@ impl Cpu386 {
             // ModRM/operand and reusing `self.condition` (the same helper Jcc and the fused
             // CMOVcc/SETcc arms used) and `self.imul_truncated` verbatim.
             DecodeGroup::CondMove => self.execute_condmove_decoded(insn, bus),
+            // The system / descriptor-table / segment block (0F 00/01/02/03/06/20/22, BOUND,
+            // LES/LDS) runs through its split executor, consuming the pre-decoded ModRM/operand and
+            // reusing the existing CR/segment/descriptor leaf helpers verbatim so the TLB and
+            // code-cache invalidation hooks fire exactly as before.
+            DecodeGroup::SystemSeg => self.execute_system_seg_decoded(insn, bus),
             DecodeGroup::TwoByteFallback => {
                 // Un-converted two-byte (0F) opcode. `decode` already read + charged the second
                 // byte and applied the ISA gate, folding it into `insn.opcode` as 0x0F00 | second.
@@ -3090,6 +3158,362 @@ impl Cpu386 {
         }
     }
 
+    /// The system / descriptor-table / segment-load block (task A12) through the decode/execute
+    /// split. Each arm mirrors the former fused handler verbatim — the same /ext dispatch off
+    /// `modrm.reg`, the same privilege (`require_cpl0`) and protected-mode gates, the same descriptor
+    /// loads and TLB/code-cache flushes, the same #BR/#UD faults, and the same clocks — but consumes
+    /// the ModRM/operand pre-decoded by `decode` instead of re-fetching. Crucially the state-changing
+    /// leaf helpers (`load_segment`, `load_ldtr`, `load_tr`, `verify_segment`, `store_descriptor_table`,
+    /// `flush_tlb_and_code_caches`, `try_read_descriptor`/`descriptor_accessible`) are reused
+    /// UNCHANGED, so the invalidation hooks Stage B depends on still fire exactly as before. The
+    /// far pointer for LES/LDS is read FROM MEMORY here (against live registers), never at decode.
+    /// Dispatches off the FULL u16 `insn.opcode` (0x0F00/01/02/03/06/20/22 plus single-byte
+    /// 0x62/0xc4/0xc5) so the `as u8` narrowing can never alias a 0F opcode onto a single-byte one.
+    fn execute_system_seg_decoded<B: CpuBus>(
+        &mut self,
+        insn: &DecodedInsn,
+        bus: &mut B,
+    ) -> ExecResult<CycleOutcome> {
+        let operand_size = insn.operand_size;
+        match insn.opcode {
+            0x0f00 => {
+                // Group 6 (SLDT/STR/LLDT/LTR/VERR/VERW). The whole group is invalid outside
+                // protected mode, exactly as the fused handler gated it.
+                if !self.is_protected_mode() {
+                    return Err(InternalFault::Exception {
+                        vector: 6,
+                        error_code: None,
+                    });
+                }
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                match modrm.reg {
+                    0 => {
+                        // SLDT r/m16: store the LDTR selector.
+                        let selector = u32::from(self.ldtr.selector);
+                        self.write_operand_sized(bus, operand, OperandSize::Word, selector)?;
+                        Ok(clocks(2))
+                    }
+                    1 => {
+                        // STR r/m16: store the task-register selector.
+                        let selector = u32::from(self.tr.selector);
+                        self.write_operand_sized(bus, operand, OperandSize::Word, selector)?;
+                        Ok(clocks(2))
+                    }
+                    2 => {
+                        // LLDT r/m16: load the local descriptor table register. Privileged.
+                        self.require_cpl0()?;
+                        let selector =
+                            self.read_operand_sized(bus, operand, OperandSize::Word)? as u16;
+                        self.load_ldtr(bus, selector)?;
+                        Ok(clocks(11))
+                    }
+                    3 => {
+                        // LTR r/m16: load the task register. Privileged.
+                        self.require_cpl0()?;
+                        let selector =
+                            self.read_operand_sized(bus, operand, OperandSize::Word)? as u16;
+                        self.load_tr(bus, selector)?;
+                        Ok(clocks(11))
+                    }
+                    4 | 5 => {
+                        // VERR (/4) / VERW (/5): set ZF if the segment is readable / writable.
+                        let selector =
+                            self.read_operand_sized(bus, operand, OperandSize::Word)? as u16;
+                        let ok = self.verify_segment(bus, selector, modrm.reg == 5)?;
+                        self.set_flag(FLAG_ZF, ok);
+                        Ok(clocks(10))
+                    }
+                    reg => Err(CpuError::UnsupportedGroupOpcode {
+                        opcode: insn.opcode as u8,
+                        extension: reg,
+                    }
+                    .into()),
+                }
+            }
+            0x0f01 => {
+                // Group 7 (SGDT/SIDT/LGDT/LIDT/SMSW/LMSW/INVLPG).
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                match modrm.reg {
+                    4 => {
+                        // SMSW r/m16: store the machine status word (low 16 bits of CR0).
+                        let msw = self.control.cr0 as u16;
+                        self.write_operand_sized(bus, operand, OperandSize::Word, u32::from(msw))?;
+                        Ok(clocks(2))
+                    }
+                    6 => {
+                        // LMSW r/m16: load MP/EM/TS; PE can be set but not cleared. Privileged.
+                        self.require_cpl0()?;
+                        let msw = self.read_operand_sized(bus, operand, OperandSize::Word)?;
+                        let switchable = CR0_MP | CR0_EM | CR0_TS;
+                        let mut cr0 = (self.control.cr0 & !switchable) | (msw & switchable);
+                        if msw & CR0_PE != 0 {
+                            cr0 |= CR0_PE;
+                        }
+                        if self.control.cr0 != cr0 {
+                            self.control.cr0 = cr0;
+                            self.flush_tlb_and_code_caches();
+                        }
+                        Ok(clocks(3))
+                    }
+                    reg => {
+                        // SGDT/SIDT/LGDT/LIDT/INVLPG all require a memory operand.
+                        let memory = match operand {
+                            RmOperand::Memory(memory) => memory,
+                            RmOperand::Register(_) => {
+                                return Err(InternalFault::Exception {
+                                    vector: 6,
+                                    error_code: None,
+                                });
+                            }
+                        };
+                        match reg {
+                            0 => {
+                                // SGDT m: store the GDTR pseudo-descriptor.
+                                self.store_descriptor_table(bus, memory, self.gdtr)?;
+                                Ok(clocks(11))
+                            }
+                            1 => {
+                                // SIDT m: store the IDTR pseudo-descriptor.
+                                self.store_descriptor_table(bus, memory, self.idtr)?;
+                                Ok(clocks(11))
+                            }
+                            2 | 3 => {
+                                // LGDT (/2) / LIDT (/3): load the GDTR/IDTR from a 6-byte image.
+                                let limit = self.read_memory_sized(
+                                    bus,
+                                    memory.segment,
+                                    memory.offset,
+                                    OperandSize::Word,
+                                    BusAccessKind::DataRead,
+                                )? as u16;
+                                let base = self.read_memory_sized(
+                                    bus,
+                                    memory.segment,
+                                    memory.offset + 2,
+                                    OperandSize::Dword,
+                                    BusAccessKind::DataRead,
+                                )?;
+                                let table = DescriptorTable { base, limit };
+                                if reg == 2 {
+                                    self.gdtr = table;
+                                } else {
+                                    self.idtr = table;
+                                }
+                                Ok(clocks(11))
+                            }
+                            7 => {
+                                // INVLPG m: privileged on the 486. Flush the whole TLB (a
+                                // single-page invalidate is a permitted superset).
+                                if self.current_privilege_level() != 0 {
+                                    return Err(InternalFault::Exception {
+                                        vector: 6,
+                                        error_code: None,
+                                    });
+                                }
+                                self.flush_tlb_and_code_caches();
+                                Ok(clocks(12))
+                            }
+                            _ => Err(CpuError::UnsupportedGroupOpcode {
+                                opcode: insn.opcode as u8,
+                                extension: reg,
+                            }
+                            .into()),
+                        }
+                    }
+                }
+            }
+            0x0f02 => {
+                // LAR reg, r/m16: read the descriptor access-rights byte(s). Protected mode only.
+                if !self.is_protected_mode() {
+                    return Err(InternalFault::Exception {
+                        vector: 6,
+                        error_code: None,
+                    });
+                }
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let selector = self.read_operand_sized(bus, operand, OperandSize::Word)? as u16;
+                match self.try_read_descriptor(bus, selector)? {
+                    Some((_, high)) if self.descriptor_accessible(selector, high) => {
+                        let mask = match operand_size {
+                            OperandSize::Word => 0x0000_ff00,
+                            OperandSize::Dword => 0x00f0_ff00,
+                        };
+                        self.write_gpr_sized(modrm.reg, operand_size, high & mask);
+                        self.set_flag(FLAG_ZF, true);
+                    }
+                    _ => self.set_flag(FLAG_ZF, false),
+                }
+                Ok(clocks(11))
+            }
+            0x0f03 => {
+                // LSL reg, r/m16: read the descriptor segment limit. Protected mode only.
+                if !self.is_protected_mode() {
+                    return Err(InternalFault::Exception {
+                        vector: 6,
+                        error_code: None,
+                    });
+                }
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let selector = self.read_operand_sized(bus, operand, OperandSize::Word)? as u16;
+                match self.try_read_descriptor(bus, selector)? {
+                    Some((low, high)) if self.descriptor_accessible(selector, high) => {
+                        let mut limit = (low & 0xffff) | (high & 0x000f_0000);
+                        if high & 0x0080_0000 != 0 {
+                            limit = (limit << 12) | 0x0fff;
+                        }
+                        self.write_gpr_sized(modrm.reg, operand_size, limit);
+                        self.set_flag(FLAG_ZF, true);
+                    }
+                    _ => self.set_flag(FLAG_ZF, false),
+                }
+                Ok(clocks(11))
+            }
+            0x0f06 => {
+                // CLTS: clear the task-switched flag. Privileged.
+                self.require_cpl0()?;
+                self.control.cr0 &= !CR0_TS;
+                Ok(clocks(2))
+            }
+            0x0f20 => {
+                // MOV reg, CR: whole-32-bit read of the selected control register. The ModRM is a
+                // register form (`mode == 3`); any other `mode` is an invalid encoding (#UD). The
+                // `reg` field is the CR number, `rm` the destination GPR.
+                let modrm = insn.modrm.expect("MOV reg,CR decoded with a ModRM");
+                if modrm.mode != 3 {
+                    return Err(CpuError::UnsupportedTwoByteOpcode {
+                        opcode: insn.opcode as u8,
+                        cs: self.registers.cs().selector,
+                        eip: self.registers.eip,
+                    }
+                    .into());
+                }
+                let value = match modrm.reg {
+                    0 => self.control.cr0,
+                    2 => self.control.cr2,
+                    3 => self.control.cr3,
+                    4 => self.control.cr4,
+                    _ => 0,
+                };
+                self.write_gpr32(modrm.rm, value);
+                Ok(clocks(6))
+            }
+            0x0f22 => {
+                // MOV CR, reg: whole-32-bit write of the selected control register. CR0 (paging
+                // enable / WP) and CR3 (page-table base) change translations, so flush the TLB
+                // (and code caches) via the unchanged helper; CR2/CR4 do not.
+                let modrm = insn.modrm.expect("MOV CR,reg decoded with a ModRM");
+                if modrm.mode != 3 {
+                    return Err(CpuError::UnsupportedTwoByteOpcode {
+                        opcode: insn.opcode as u8,
+                        cs: self.registers.cs().selector,
+                        eip: self.registers.eip,
+                    }
+                    .into());
+                }
+                let value = self.read_gpr32(modrm.rm);
+                match modrm.reg {
+                    0 => {
+                        self.control.cr0 = value;
+                        self.flush_tlb_and_code_caches();
+                    }
+                    2 => self.control.cr2 = value,
+                    3 => {
+                        self.control.cr3 = value & 0xffff_f000;
+                        self.flush_tlb_and_code_caches();
+                    }
+                    4 => self.control.cr4 = value,
+                    _ => {}
+                }
+                Ok(clocks(6))
+            }
+            0x62 => {
+                // BOUND r, m: the memory operand holds the signed lower and upper array bounds;
+                // if the register is outside [lower, upper] raise #BR (vector 5). mod=3 -> #UD.
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let memory = match operand {
+                    RmOperand::Memory(memory) => memory,
+                    RmOperand::Register(_) => {
+                        return Err(InternalFault::Exception {
+                            vector: 6,
+                            error_code: None,
+                        });
+                    }
+                };
+                let size = operand_size.bytes();
+                let lower = self.read_memory_sized(
+                    bus,
+                    memory.segment,
+                    memory.offset,
+                    operand_size,
+                    BusAccessKind::DataRead,
+                )?;
+                let upper = self.read_memory_sized(
+                    bus,
+                    memory.segment,
+                    memory.offset + size,
+                    operand_size,
+                    BusAccessKind::DataRead,
+                )?;
+                let index = self.read_gpr_sized(modrm.reg, operand_size);
+                let (index, lower, upper) = match operand_size {
+                    OperandSize::Word => (
+                        i32::from(index as u16 as i16),
+                        i32::from(lower as u16 as i16),
+                        i32::from(upper as u16 as i16),
+                    ),
+                    OperandSize::Dword => (index as i32, lower as i32, upper as i32),
+                };
+                if index < lower || index > upper {
+                    return Err(InternalFault::Exception {
+                        vector: 5,
+                        error_code: None,
+                    });
+                }
+                Ok(clocks(10))
+            }
+            0xc4 | 0xc5 => {
+                // LES (0xc4) / LDS (0xc5): load a far pointer from memory. The low half (operand
+                // size) goes into the reg operand and the next word into ES (0xc4) or DS (0xc5).
+                // The far pointer is read here against the LIVE registers; the segment is loaded
+                // through the unchanged `load_segment`. mod=3 (a register r/m) is #UD.
+                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let mem = match operand {
+                    RmOperand::Memory(mem) => mem,
+                    RmOperand::Register(_) => {
+                        return Err(InternalFault::Exception {
+                            vector: 6,
+                            error_code: None,
+                        });
+                    }
+                };
+                let offset = self.read_memory_sized(
+                    bus,
+                    mem.segment,
+                    mem.offset,
+                    operand_size,
+                    BusAccessKind::DataRead,
+                )?;
+                let selector_offset = mem.offset.wrapping_add(operand_size.bytes());
+                let selector = self.read_memory_sized(
+                    bus,
+                    mem.segment,
+                    selector_offset,
+                    OperandSize::Word,
+                    BusAccessKind::DataRead,
+                )? as u16;
+                let segment = if insn.opcode == 0xc4 {
+                    SegmentIndex::Es
+                } else {
+                    SegmentIndex::Ds
+                };
+                self.load_segment(bus, segment, selector)?;
+                self.write_gpr_sized(modrm.reg, operand_size, offset);
+                Ok(clocks(7))
+            }
+            opcode => unreachable!("system/segment opcode {opcode:#x}"),
+        }
+    }
+
     /// The far/indirect/RET/INT control-flow block + 0xff group 5 through the decode/execute split.
     /// Each arm mirrors the former fused handler verbatim — same far-pointer reconstruction, same
     /// ret/retf and interrupt/IRET delivery, same FF sub-op dispatch off `modrm.reg`, same clocks —
@@ -3336,51 +3760,10 @@ impl Cpu386 {
                 self.write_gpr_sized(modrm.reg, operand_size, result);
                 Ok(clocks(14))
             }
-            0x62 => {
-                // BOUND r, m: the memory operand holds the signed lower and upper array
-                // bounds; if the register is outside [lower, upper] raise #BR (vector 5).
-                let modrm = self.fetch_modrm(bus)?;
-                let memory = match self.decode_rm_operand(bus, prefixes, address_size, modrm)? {
-                    RmOperand::Memory(memory) => memory,
-                    RmOperand::Register(_) => {
-                        return Err(InternalFault::Exception {
-                            vector: 6,
-                            error_code: None,
-                        });
-                    }
-                };
-                let size = operand_size.bytes();
-                let lower = self.read_memory_sized(
-                    bus,
-                    memory.segment,
-                    memory.offset,
-                    operand_size,
-                    BusAccessKind::DataRead,
-                )?;
-                let upper = self.read_memory_sized(
-                    bus,
-                    memory.segment,
-                    memory.offset + size,
-                    operand_size,
-                    BusAccessKind::DataRead,
-                )?;
-                let index = self.read_gpr_sized(modrm.reg, operand_size);
-                let (index, lower, upper) = match operand_size {
-                    OperandSize::Word => (
-                        i32::from(index as u16 as i16),
-                        i32::from(lower as u16 as i16),
-                        i32::from(upper as u16 as i16),
-                    ),
-                    OperandSize::Dword => (index as i32, lower as i32, upper as i32),
-                };
-                if index < lower || index > upper {
-                    return Err(InternalFault::Exception {
-                        vector: 5,
-                        error_code: None,
-                    });
-                }
-                Ok(clocks(10))
-            }
+            // 0x62 (BOUND r,m) is converted to the decode/execute split (task A12): `route_group`
+            // classifies it as `DecodeGroup::SystemSeg` and `execute_system_seg_decoded` runs it
+            // (the ModRM + addressing descriptor is parsed in `decode`; the bounds are read from
+            // memory and the #BR/#UD faults raised in the executor). Not handled here.
             0x6c => {
                 self.run_string(bus, StringOp::Ins, BusWidth::Byte, prefixes, address_size)?;
                 Ok(clocks(15))
@@ -3423,45 +3806,12 @@ impl Cpu386 {
             // `execute_datamove_decoded` runs them. They must NOT be re-handled here (single path).
             // 0x8f (POP r/m, group 1A) is converted to `DecodeGroup::Stack` ->
             // `execute_stack_decoded`; not handled here.
-            0xc4 | 0xc5 => {
-                // LES (0xc4) / LDS (0xc5): load a far pointer from memory. The ModRM r/m
-                // names the memory operand; the low half (operand size) goes into the reg
-                // operand and the next word is loaded into ES (0xc4) or DS (0xc5). No flags
-                // change. mod=3 (a register r/m) is an invalid encoding and faults with #UD.
-                let modrm = self.fetch_modrm(bus)?;
-                let mem = match self.decode_rm_operand(bus, prefixes, address_size, modrm)? {
-                    RmOperand::Memory(mem) => mem,
-                    RmOperand::Register(_) => {
-                        return Err(InternalFault::Exception {
-                            vector: 6,
-                            error_code: None,
-                        });
-                    }
-                };
-                let offset = self.read_memory_sized(
-                    bus,
-                    mem.segment,
-                    mem.offset,
-                    operand_size,
-                    BusAccessKind::DataRead,
-                )?;
-                let selector_offset = mem.offset.wrapping_add(operand_size.bytes());
-                let selector = self.read_memory_sized(
-                    bus,
-                    mem.segment,
-                    selector_offset,
-                    OperandSize::Word,
-                    BusAccessKind::DataRead,
-                )? as u16;
-                let segment = if opcode == 0xc4 {
-                    SegmentIndex::Es
-                } else {
-                    SegmentIndex::Ds
-                };
-                self.load_segment(bus, segment, selector)?;
-                self.write_gpr_sized(modrm.reg, operand_size, offset);
-                Ok(clocks(7))
-            }
+            // 0xc4/0xc5 (LES/LDS, load far pointer into ES/DS + reg) are converted to the
+            // decode/execute split (task A12): `route_group` classifies them as
+            // `DecodeGroup::SystemSeg` and `execute_system_seg_decoded` runs them (the ModRM +
+            // addressing descriptor is parsed in `decode`; the far pointer is read from memory and
+            // the segment loaded through the unchanged `load_segment` in the executor; mod=3 #UDs).
+            // Not handled here.
             // 0x90 (NOP / XCHG AX,AX) and 0x91-0x97 (XCHG (E)AX, reg) are converted to the split
             // (`DecodeGroup::DataMove` -> `execute_datamove_decoded`); not handled here.
             // 0x98 (CBW/CWDE), 0x99 (CWD/CDQ), 0x9e (SAHF), 0x9f (LAHF) are converted to the
@@ -3745,16 +4095,11 @@ impl Cpu386 {
             // Limit: MMX is not gated to 586+; a throttled 386/486 GSW mode would
             // wrongly accept it. Gate it with the others if that fidelity gap matters.
             op if is_mmx_two_byte(op) => self.execute_mmx(bus, op, prefixes, address_size),
-            0x00 => self.execute_descriptor_segment_group(bus, prefixes, address_size, opcode),
-            0x01 => self.execute_descriptor_table_group(bus, prefixes, address_size, opcode),
-            0x02 => self.execute_lar(bus, prefixes, address_size, operand_size),
-            0x03 => self.execute_lsl(bus, prefixes, address_size, operand_size),
-            0x06 => {
-                // CLTS: clear the task-switched flag. Privileged.
-                self.require_cpl0()?;
-                self.control.cr0 &= !CR0_TS;
-                Ok(clocks(2))
-            }
+            // 0F 00 (group 6: SLDT/STR/LLDT/LTR/VERR/VERW), 0F 01 (group 7: SGDT/SIDT/LGDT/LIDT/
+            // SMSW/LMSW/INVLPG), 0F 02 (LAR), 0F 03 (LSL), and 0F 06 (CLTS) are converted to the
+            // decode/execute split (task A12): `route_group` classifies them as
+            // `DecodeGroup::SystemSeg` and `execute_system_seg_decoded` runs them (the ModRM + /ext
+            // dispatch and the descriptor/CR/TLB leaf helpers are reused unchanged). Not handled here.
             0x30 => {
                 // WRMSR: write EDX:EAX into the model-specific register selected by ECX.
                 // Privileged (#GP(0) outside CPL 0). An undefined MSR selector also #GP(0)s.
@@ -3840,58 +4185,12 @@ impl Cpu386 {
                     error_code: None,
                 })
             }
-            0x20 => {
-                let modrm = self.fetch_modrm(bus)?;
-                if modrm.mode != 3 {
-                    return Err(CpuError::UnsupportedTwoByteOpcode {
-                        opcode,
-                        cs: self.registers.cs().selector,
-                        eip: self.registers.eip,
-                    }
-                    .into());
-                }
-                let value = match modrm.reg {
-                    0 => self.control.cr0,
-                    2 => self.control.cr2,
-                    3 => self.control.cr3,
-                    4 => self.control.cr4,
-                    _ => 0,
-                };
-                self.write_gpr32(modrm.rm, value);
-                Ok(clocks(6))
-            }
-            0x22 => {
-                let modrm = self.fetch_modrm(bus)?;
-                if modrm.mode != 3 {
-                    return Err(CpuError::UnsupportedTwoByteOpcode {
-                        opcode,
-                        cs: self.registers.cs().selector,
-                        eip: self.registers.eip,
-                    }
-                    .into());
-                }
-                let value = self.read_gpr32(modrm.rm);
-                match modrm.reg {
-                    // CR0 is fully read/write here, so bit 18 (AM) round-trips. The 386
-                    // core used to force bit 4 on (the ET extension-type bit); here ET
-                    // stays whatever software writes, with no FPU modeled, so nothing is
-                    // forced.
-                    // CR0 (paging enable / WP) and CR3 (page-table base) both
-                    // change translations, so flush the TLB. CR2/CR4 do not.
-                    0 => {
-                        self.control.cr0 = value;
-                        self.flush_tlb_and_code_caches();
-                    }
-                    2 => self.control.cr2 = value,
-                    3 => {
-                        self.control.cr3 = value & 0xffff_f000;
-                        self.flush_tlb_and_code_caches();
-                    }
-                    4 => self.control.cr4 = value,
-                    _ => {}
-                }
-                Ok(clocks(6))
-            }
+            // 0F 20 (MOV reg,CR) and 0F 22 (MOV CR,reg) are converted to the decode/execute split
+            // (task A12): `route_group` classifies them as `DecodeGroup::SystemSeg` and
+            // `execute_system_seg_decoded` runs them (the register-form ModRM is parsed in `decode`;
+            // the whole-32-bit CR read/write, the `mode != 3` #UD, and the CR0/CR3 TLB flush via the
+            // unchanged `flush_tlb_and_code_caches` stay in the executor). Not handled here. 0F 21/23
+            // (MOV reg,DR / MOV DR,reg) remain unimplemented and #UD as `UnsupportedTwoByteOpcode`.
             // CMOVcc (0x40-0x4F), SETcc (0x90-0x9F), and IMUL reg,r/m (0xAF) are converted to
             // the decode/execute split (task A11): `route_group` classifies them as
             // `DecodeGroup::CondMove` and `execute_condmove_decoded` runs them. Not handled here.
@@ -7872,113 +8171,6 @@ impl Cpu386 {
         Ok((low, high))
     }
 
-    fn execute_descriptor_table_group<B: CpuBus>(
-        &mut self,
-        bus: &mut B,
-        prefixes: Prefixes,
-        address_size: AddressSize,
-        opcode: u8,
-    ) -> ExecResult<CycleOutcome> {
-        let modrm = self.fetch_modrm(bus)?;
-        match modrm.reg {
-            4 => {
-                // SMSW r/m16: store the machine status word (low 16 bits of CR0).
-                let msw = self.control.cr0 as u16;
-                self.write_rm_sized(
-                    bus,
-                    prefixes,
-                    address_size,
-                    OperandSize::Word,
-                    modrm,
-                    u32::from(msw),
-                )?;
-                Ok(clocks(2))
-            }
-            6 => {
-                // LMSW r/m16: load MP/EM/TS; PE can be set but not cleared. Privileged.
-                self.require_cpl0()?;
-                let msw =
-                    self.read_rm_sized(bus, prefixes, address_size, OperandSize::Word, modrm)?;
-                let switchable = CR0_MP | CR0_EM | CR0_TS;
-                let mut cr0 = (self.control.cr0 & !switchable) | (msw & switchable);
-                if msw & CR0_PE != 0 {
-                    cr0 |= CR0_PE;
-                }
-                if self.control.cr0 != cr0 {
-                    self.control.cr0 = cr0;
-                    self.flush_tlb_and_code_caches();
-                }
-                Ok(clocks(3))
-            }
-            reg => {
-                let memory = match self.decode_rm_operand(bus, prefixes, address_size, modrm)? {
-                    RmOperand::Memory(memory) => memory,
-                    RmOperand::Register(_) => {
-                        // SGDT/SIDT/LGDT/LIDT/INVLPG all require a memory operand.
-                        return Err(InternalFault::Exception {
-                            vector: 6,
-                            error_code: None,
-                        });
-                    }
-                };
-                match reg {
-                    0 => {
-                        // SGDT m: store the GDTR pseudo-descriptor.
-                        self.store_descriptor_table(bus, memory, self.gdtr)?;
-                        Ok(clocks(11))
-                    }
-                    1 => {
-                        // SIDT m: store the IDTR pseudo-descriptor.
-                        self.store_descriptor_table(bus, memory, self.idtr)?;
-                        Ok(clocks(11))
-                    }
-                    2 | 3 => {
-                        let limit = self.read_memory_sized(
-                            bus,
-                            memory.segment,
-                            memory.offset,
-                            OperandSize::Word,
-                            BusAccessKind::DataRead,
-                        )? as u16;
-                        let base = self.read_memory_sized(
-                            bus,
-                            memory.segment,
-                            memory.offset + 2,
-                            OperandSize::Dword,
-                            BusAccessKind::DataRead,
-                        )?;
-                        let table = DescriptorTable { base, limit };
-                        if reg == 2 {
-                            self.gdtr = table;
-                        } else {
-                            self.idtr = table;
-                        }
-                        Ok(clocks(11))
-                    }
-                    7 => {
-                        // INVLPG m: privileged on the 486. Flush the whole TLB (a
-                        // single-page invalidate is a permitted superset and keeps
-                        // the decode here simple); rare enough in DOS-era code that
-                        // the extra refills do not matter.
-                        if self.current_privilege_level() != 0 {
-                            return Err(InternalFault::Exception {
-                                vector: 6,
-                                error_code: None,
-                            });
-                        }
-                        self.flush_tlb_and_code_caches();
-                        Ok(clocks(12))
-                    }
-                    _ => Err(CpuError::UnsupportedGroupOpcode {
-                        opcode,
-                        extension: reg,
-                    }
-                    .into()),
-                }
-            }
-        }
-    }
-
     fn store_descriptor_table<B: CpuBus>(
         &mut self,
         bus: &mut B,
@@ -8003,83 +8195,6 @@ impl Cpu386 {
             table.base,
             BusAccessKind::DataWrite,
         )
-    }
-
-    fn execute_descriptor_segment_group<B: CpuBus>(
-        &mut self,
-        bus: &mut B,
-        prefixes: Prefixes,
-        address_size: AddressSize,
-        opcode: u8,
-    ) -> ExecResult<CycleOutcome> {
-        // The whole 0F 00 group is invalid outside protected mode.
-        if !self.is_protected_mode() {
-            return Err(InternalFault::Exception {
-                vector: 6,
-                error_code: None,
-            });
-        }
-        let modrm = self.fetch_modrm(bus)?;
-        match modrm.reg {
-            0 => {
-                // SLDT r/m16: store the LDTR selector.
-                let selector = u32::from(self.ldtr.selector);
-                self.write_rm_sized(
-                    bus,
-                    prefixes,
-                    address_size,
-                    OperandSize::Word,
-                    modrm,
-                    selector,
-                )?;
-                Ok(clocks(2))
-            }
-            1 => {
-                // STR r/m16: store the task-register selector.
-                let selector = u32::from(self.tr.selector);
-                self.write_rm_sized(
-                    bus,
-                    prefixes,
-                    address_size,
-                    OperandSize::Word,
-                    modrm,
-                    selector,
-                )?;
-                Ok(clocks(2))
-            }
-            2 => {
-                // LLDT r/m16: load the local descriptor table register. Privileged.
-                self.require_cpl0()?;
-                let selector =
-                    self.read_rm_sized(bus, prefixes, address_size, OperandSize::Word, modrm)?
-                        as u16;
-                self.load_ldtr(bus, selector)?;
-                Ok(clocks(11))
-            }
-            3 => {
-                // LTR r/m16: load the task register. Privileged.
-                self.require_cpl0()?;
-                let selector =
-                    self.read_rm_sized(bus, prefixes, address_size, OperandSize::Word, modrm)?
-                        as u16;
-                self.load_tr(bus, selector)?;
-                Ok(clocks(11))
-            }
-            4 | 5 => {
-                // VERR (/4) / VERW (/5): set ZF if the segment is readable / writable.
-                let selector =
-                    self.read_rm_sized(bus, prefixes, address_size, OperandSize::Word, modrm)?
-                        as u16;
-                let ok = self.verify_segment(bus, selector, modrm.reg == 5)?;
-                self.set_flag(FLAG_ZF, ok);
-                Ok(clocks(10))
-            }
-            reg => Err(CpuError::UnsupportedGroupOpcode {
-                opcode,
-                extension: reg,
-            }
-            .into()),
-        }
     }
 
     fn load_ldtr<B: CpuBus>(&mut self, bus: &mut B, selector: u16) -> ExecResult<()> {
@@ -8182,68 +8297,6 @@ impl Cpu386 {
         // Conforming code is reachable from any privilege; everything else needs
         // DPL >= max(CPL, RPL).
         conforming_code || dpl >= self.current_privilege_level().max(rpl)
-    }
-
-    fn execute_lar<B: CpuBus>(
-        &mut self,
-        bus: &mut B,
-        prefixes: Prefixes,
-        address_size: AddressSize,
-        operand_size: OperandSize,
-    ) -> ExecResult<CycleOutcome> {
-        if !self.is_protected_mode() {
-            return Err(InternalFault::Exception {
-                vector: 6,
-                error_code: None,
-            });
-        }
-        let modrm = self.fetch_modrm(bus)?;
-        let selector =
-            self.read_rm_sized(bus, prefixes, address_size, OperandSize::Word, modrm)? as u16;
-        match self.try_read_descriptor(bus, selector)? {
-            Some((_, high)) if self.descriptor_accessible(selector, high) => {
-                // The access-rights bytes: the access byte plus, for a dword operand, the
-                // G/D/B/AVL attribute nibble.
-                let mask = match operand_size {
-                    OperandSize::Word => 0x0000_ff00,
-                    OperandSize::Dword => 0x00f0_ff00,
-                };
-                self.write_gpr_sized(modrm.reg, operand_size, high & mask);
-                self.set_flag(FLAG_ZF, true);
-            }
-            _ => self.set_flag(FLAG_ZF, false),
-        }
-        Ok(clocks(11))
-    }
-
-    fn execute_lsl<B: CpuBus>(
-        &mut self,
-        bus: &mut B,
-        prefixes: Prefixes,
-        address_size: AddressSize,
-        operand_size: OperandSize,
-    ) -> ExecResult<CycleOutcome> {
-        if !self.is_protected_mode() {
-            return Err(InternalFault::Exception {
-                vector: 6,
-                error_code: None,
-            });
-        }
-        let modrm = self.fetch_modrm(bus)?;
-        let selector =
-            self.read_rm_sized(bus, prefixes, address_size, OperandSize::Word, modrm)? as u16;
-        match self.try_read_descriptor(bus, selector)? {
-            Some((low, high)) if self.descriptor_accessible(selector, high) => {
-                let mut limit = (low & 0xffff) | (high & 0x000f_0000);
-                if high & 0x0080_0000 != 0 {
-                    limit = (limit << 12) | 0x0fff;
-                }
-                self.write_gpr_sized(modrm.reg, operand_size, limit);
-                self.set_flag(FLAG_ZF, true);
-            }
-            _ => self.set_flag(FLAG_ZF, false),
-        }
-        Ok(clocks(11))
     }
 }
 
@@ -12777,7 +12830,9 @@ mod tests {
         cpu.registers.eip = 0;
         let mut bus = TestBus::with_memory(vec![0x0f, 0x01, 0x3e, 0x40, 0x00, 0, 0, 0]);
 
-        let result = cpu.execute_instruction_legacy(&mut bus);
+        // INVLPG (0F 01 /7) is converted to the decode/execute split (task A12); run it through the
+        // split, where the CPL-3 #UD is raised in `execute_system_seg_decoded`.
+        let result = exec_one_split(&mut cpu, &mut bus);
 
         assert!(
             matches!(
@@ -12799,7 +12854,9 @@ mod tests {
         cpu.registers.eip = 0;
         let mut bus = TestBus::with_memory(vec![0x0f, 0x01, 0xff, 0, 0]);
 
-        let result = cpu.execute_instruction_legacy(&mut bus);
+        // INVLPG (0F 01 /7) is converted to the decode/execute split (task A12); the register-form
+        // (mod=3) #UD is raised in `execute_system_seg_decoded`.
+        let result = exec_one_split(&mut cpu, &mut bus);
 
         assert!(
             matches!(
@@ -14076,7 +14133,9 @@ mod tests {
         cpu.load_segment_real(SegmentIndex::Ds, 0);
         cpu.registers.eip = 0;
         let mut bus = TestBus::with_memory(memory);
-        assert!(cpu.execute_instruction_legacy(&mut bus).is_ok());
+        // LGDT (0F 01 /2) is converted to the decode/execute split (task A12); run it through the
+        // split, not the legacy fused entry (whose 0F 01 arm is gone).
+        assert!(exec_one_split(&mut cpu, &mut bus).is_ok());
         assert_eq!(cpu.gdtr.limit, 0x00ff);
         assert_eq!(cpu.gdtr.base, 0x0000_1000);
     }
@@ -15808,8 +15867,41 @@ mod tests {
     fn sldt_is_invalid_in_real_mode() {
         let (mut cpu, memory) = real_mode_cpu(&[0x0f, 0x00, 0xc0], 0x20);
         let mut bus = TestBus::with_memory(memory);
-        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
+        // SLDT (0F 00 /0) is converted to the decode/execute split (task A12); the whole 0F 00
+        // group is #UD outside protected mode, raised in `execute_system_seg_decoded`.
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
         assert!(matches!(fault, InternalFault::Exception { vector: 6, .. }));
+    }
+
+    #[test]
+    fn a12_unimplemented_neighbours_stay_undefined() {
+        // The A12-adjacent opcodes that the fused path never implemented must NOT be routed into the
+        // new SystemSeg split — they remain on Fallback / TwoByteFallback and #UD as before. Guard
+        // the routing so a future edit can't silently capture them. 0F 21/23 (MOV reg,DR / MOV DR,reg)
+        // and 0F B2/B4/B5 (LSS/LFS/LGS) #UD as `UnsupportedTwoByteOpcode`; 0x63 (ARPL) #UDs as
+        // `UnsupportedOpcode`. All surface through the split as a CpuError, never a panic.
+        for code in [
+            &[0x0f, 0x21, 0xc0][..],             // MOV EAX, DR0
+            &[0x0f, 0x23, 0xc0][..],             // MOV DR0, EAX
+            &[0x0f, 0xb2, 0x1e, 0x00, 0x02][..], // LSS BX, [0x200]
+            &[0x0f, 0xb4, 0x1e, 0x00, 0x02][..], // LFS BX, [0x200]
+            &[0x0f, 0xb5, 0x1e, 0x00, 0x02][..], // LGS BX, [0x200]
+            &[0x63, 0xc0][..],                   // ARPL AX, AX
+        ] {
+            let (mut cpu, memory) = real_mode_cpu(code, 0x40);
+            let mut bus = TestBus::with_memory(memory);
+            let err = exec_one_split(&mut cpu, &mut bus).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    InternalFault::Cpu(
+                        CpuError::UnsupportedTwoByteOpcode { .. }
+                            | CpuError::UnsupportedOpcode { .. }
+                    )
+                ),
+                "expected an unsupported-opcode error for {code:02x?}, got {err:?}"
+            );
+        }
     }
 
     #[test]
@@ -16112,7 +16204,9 @@ mod tests {
         memory[0x102..0x104].copy_from_slice(&20u16.to_le_bytes());
         cpu.write_reg16(Reg16::Ax, 25);
         let mut bus = TestBus::with_memory(memory);
-        let fault = cpu.execute_instruction_legacy(&mut bus).unwrap_err();
+        // BOUND (0x62) is converted to the decode/execute split (task A12); the #BR (vector 5) is
+        // raised in `execute_system_seg_decoded`, so run it through the split.
+        let fault = exec_one_split(&mut cpu, &mut bus).unwrap_err();
         assert!(matches!(fault, InternalFault::Exception { vector: 5, .. }));
     }
 
@@ -19122,6 +19216,654 @@ mod tests {
                 fused.registers.eip,
                 deltas,
                 fetch,
+            );
+        }
+    }
+
+    // ── Task A12: system / descriptor-table / segment-load golden battery ──────────────────────────
+
+    /// One golden end-state for a system / descriptor-table / segment-load case (task A12). These
+    /// opcodes change a heterogeneous set of architectural state — GPRs (SLDT/STR/SMSW/LAR/LSL store
+    /// a selector/limit; LES/LDS load the offset), eflags (VERR/VERW/LAR/LSL set ZF), memory
+    /// (SGDT/SIDT store the pseudo-descriptor, SMSW r/m16 stores to memory), the descriptor tables
+    /// (LGDT/LIDT), the control registers (MOV CR, LMSW, CLTS), the LDTR/TR selectors (LLDT/LTR), and
+    /// the ES/DS segment registers (LES/LDS) — so the golden captures all of them. `eip` proves
+    /// decode consumed the right byte count (incl. the 0F second byte + ModRM + displacement);
+    /// `fetch` proves each instruction byte was charged exactly once.
+    struct SystemSegGolden {
+        name: &'static str,
+        code: &'static [u8],
+        /// Whether the case runs in protected mode (CR0.PE set, the seeded GDT live).
+        protected: bool,
+        gpr: [u32; 8],
+        eflags: u32,
+        eip: u32,
+        deltas: &'static [(usize, u8)],
+        fetch: usize,
+        cr0: u32,
+        gdtr_base: u32,
+        gdtr_limit: u16,
+        idtr_base: u32,
+        idtr_limit: u16,
+        ldtr_sel: u16,
+        tr_sel: u16,
+        es_sel: u16,
+        ds_sel: u16,
+    }
+
+    /// Seed for the system/segment golden battery. Real or protected mode (CR0.PE per the case),
+    /// 16-bit addressing, DS=0. A GDT lives at base 0x100, limit 0xff, with descriptors planted at
+    /// selectors 0x08 (a present readable data segment, access 0x92, byte-granular limit 0xffff),
+    /// 0x10 (a present available 386 TSS, access 0x89), and 0x18 (a present LDT system descriptor,
+    /// access 0x82). CR0 carries TS|MP (0x0A) plus PE when protected. gdtr/idtr/ldtr/tr start at
+    /// known values so the load ops (LGDT/LIDT/LLDT/LTR) and the store ops (SGDT/SIDT/SLDT/STR/SMSW)
+    /// both have an observable before/after. Registers: CX=0x0008 (a selector operand for LAR/LSL/
+    /// LLDT/LTR/VERR/VERW), the rest a fixed pattern.
+    fn system_seg_seed(cpu: &mut Cpu386, protected: bool) {
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.load_segment_real(SegmentIndex::Es, 0);
+        cpu.load_segment_real(SegmentIndex::Ss, 0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0x0005);
+        cpu.write_reg16(Reg16::Cx, 0x0008);
+        cpu.write_reg16(Reg16::Dx, 0x4000);
+        cpu.write_reg16(Reg16::Bx, 0x0003);
+        cpu.write_reg16(Reg16::Sp, 0x00f0);
+        cpu.write_reg16(Reg16::Bp, 0x0010);
+        cpu.write_reg16(Reg16::Si, 0x0008);
+        cpu.write_reg16(Reg16::Di, 0x0018);
+        cpu.registers.eflags = 0x02;
+        cpu.gdtr = DescriptorTable {
+            base: 0x100,
+            limit: 0xff,
+        };
+        cpu.idtr = DescriptorTable {
+            base: 0x900,
+            limit: 0x3ff,
+        };
+        cpu.ldtr.selector = 0x0028;
+        cpu.tr.selector = 0x0038;
+        cpu.control.cr0 = CR0_TS | CR0_MP;
+        if protected {
+            cpu.control.cr0 |= CR0_PE;
+        }
+    }
+
+    /// Plant the instruction bytes plus the GDT descriptors and the scratch the memory forms read.
+    fn system_seg_seed_mem(mem: &mut [u8], code: &[u8]) {
+        mem[..code.len()].copy_from_slice(code);
+        // GDT at 0x100. Selector 0x08: present readable data segment (access 0x92), limit 0xffff.
+        mem[0x108..0x10c].copy_from_slice(&0x0000_ffffu32.to_le_bytes());
+        mem[0x10c..0x110].copy_from_slice(&0x0000_9200u32.to_le_bytes());
+        // Selector 0x10: present available 386 TSS (access 0x89), base 0x0005_0000, limit 0x0067.
+        mem[0x110..0x114].copy_from_slice(&0x0000_0067u32.to_le_bytes());
+        mem[0x114..0x118].copy_from_slice(&0x0005_8900u32.to_le_bytes());
+        // Selector 0x18: present LDT system descriptor (access 0x82), base 0x0006_0000, limit 0x0fff.
+        mem[0x118..0x11c].copy_from_slice(&0x0000_0fffu32.to_le_bytes());
+        mem[0x11c..0x120].copy_from_slice(&0x0006_8200u32.to_le_bytes());
+        // A 6-byte GDTR/IDTR pseudo-descriptor image at 0x40 (limit 0x00ff, base 0x0000_1000) for
+        // LGDT/LIDT, and bounds [10, 20] at 0x80/0x84 for BOUND, and a far pointer 0x09:0x1234 at
+        // 0x90 for LES/LDS.
+        mem[0x40..0x46].copy_from_slice(&[0xff, 0x00, 0x00, 0x10, 0x00, 0x00]);
+        mem[0x80..0x82].copy_from_slice(&10u16.to_le_bytes());
+        mem[0x82..0x84].copy_from_slice(&20u16.to_le_bytes());
+        mem[0x90..0x92].copy_from_slice(&0x1234u16.to_le_bytes()); // offset
+        mem[0x92..0x94].copy_from_slice(&0x0009u16.to_le_bytes()); // selector (RPL 1 -> sel 0x08)
+    }
+
+    /// The system/segment differential battery (task A12). Captured from the PRIOR fused reference
+    /// (`execute_instruction_legacy` -> `execute_two_byte`/`dispatch_opcode`) via
+    /// `regen_system_seg_goldens` (parent commit b0a4262d) WHILE the fused arms (0F 00/01/02/03/06/
+    /// 20/22, BOUND 0x62, LES/LDS 0xc4/0xc5) still existed. Never edit by hand — re-run the regen
+    /// from the pre-split commit.
+    fn system_seg_golden_cases() -> &'static [SystemSegGolden] {
+        // Captured verbatim from the fused reference at parent b0a4262d via
+        // `regen_system_seg_goldens` (run in a throwaway worktree). Never edit by hand.
+        &[
+            SystemSegGolden {
+                name: "smsw ax (0f 01 e0)",
+                code: &[15, 1, 224],
+                protected: false,
+                gpr: [10, 8, 16384, 3, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+                cr0: 0xa,
+                gdtr_base: 0x100,
+                gdtr_limit: 0xff,
+                idtr_base: 0x900,
+                idtr_limit: 0x3ff,
+                ldtr_sel: 0x28,
+                tr_sel: 0x38,
+                es_sel: 0x0,
+                ds_sel: 0x0,
+            },
+            SystemSegGolden {
+                name: "smsw [0x60] (0f 01 26 60 00)",
+                code: &[15, 1, 38, 96, 0],
+                protected: false,
+                gpr: [5, 8, 16384, 3, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x5,
+                deltas: &[(96, 10)],
+                fetch: 6,
+                cr0: 0xa,
+                gdtr_base: 0x100,
+                gdtr_limit: 0xff,
+                idtr_base: 0x900,
+                idtr_limit: 0x3ff,
+                ldtr_sel: 0x28,
+                tr_sel: 0x38,
+                es_sel: 0x0,
+                ds_sel: 0x0,
+            },
+            SystemSegGolden {
+                name: "lmsw ax (0f 01 f0)",
+                code: &[15, 1, 240],
+                protected: false,
+                gpr: [5, 8, 16384, 3, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+                cr0: 0x5,
+                gdtr_base: 0x100,
+                gdtr_limit: 0xff,
+                idtr_base: 0x900,
+                idtr_limit: 0x3ff,
+                ldtr_sel: 0x28,
+                tr_sel: 0x38,
+                es_sel: 0x0,
+                ds_sel: 0x0,
+            },
+            SystemSegGolden {
+                name: "clts (0f 06)",
+                code: &[15, 6],
+                protected: false,
+                gpr: [5, 8, 16384, 3, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x2,
+                deltas: &[],
+                fetch: 3,
+                cr0: 0x2,
+                gdtr_base: 0x100,
+                gdtr_limit: 0xff,
+                idtr_base: 0x900,
+                idtr_limit: 0x3ff,
+                ldtr_sel: 0x28,
+                tr_sel: 0x38,
+                es_sel: 0x0,
+                ds_sel: 0x0,
+            },
+            SystemSegGolden {
+                name: "sgdt [0x60] (0f 01 06 60 00)",
+                code: &[15, 1, 6, 96, 0],
+                protected: false,
+                gpr: [5, 8, 16384, 3, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x5,
+                deltas: &[(96, 255), (99, 1)],
+                fetch: 6,
+                cr0: 0xa,
+                gdtr_base: 0x100,
+                gdtr_limit: 0xff,
+                idtr_base: 0x900,
+                idtr_limit: 0x3ff,
+                ldtr_sel: 0x28,
+                tr_sel: 0x38,
+                es_sel: 0x0,
+                ds_sel: 0x0,
+            },
+            SystemSegGolden {
+                name: "sidt [0x60] (0f 01 0e 60 00)",
+                code: &[15, 1, 14, 96, 0],
+                protected: false,
+                gpr: [5, 8, 16384, 3, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x5,
+                deltas: &[(96, 255), (97, 3), (99, 9)],
+                fetch: 6,
+                cr0: 0xa,
+                gdtr_base: 0x100,
+                gdtr_limit: 0xff,
+                idtr_base: 0x900,
+                idtr_limit: 0x3ff,
+                ldtr_sel: 0x28,
+                tr_sel: 0x38,
+                es_sel: 0x0,
+                ds_sel: 0x0,
+            },
+            SystemSegGolden {
+                name: "lgdt [0x40] (0f 01 16 40 00)",
+                code: &[15, 1, 22, 64, 0],
+                protected: false,
+                gpr: [5, 8, 16384, 3, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x5,
+                deltas: &[],
+                fetch: 6,
+                cr0: 0xa,
+                gdtr_base: 0x1000,
+                gdtr_limit: 0xff,
+                idtr_base: 0x900,
+                idtr_limit: 0x3ff,
+                ldtr_sel: 0x28,
+                tr_sel: 0x38,
+                es_sel: 0x0,
+                ds_sel: 0x0,
+            },
+            SystemSegGolden {
+                name: "lidt [0x40] (0f 01 1e 40 00)",
+                code: &[15, 1, 30, 64, 0],
+                protected: false,
+                gpr: [5, 8, 16384, 3, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x5,
+                deltas: &[],
+                fetch: 6,
+                cr0: 0xa,
+                gdtr_base: 0x100,
+                gdtr_limit: 0xff,
+                idtr_base: 0x1000,
+                idtr_limit: 0xff,
+                ldtr_sel: 0x28,
+                tr_sel: 0x38,
+                es_sel: 0x0,
+                ds_sel: 0x0,
+            },
+            SystemSegGolden {
+                name: "mov eax,cr0 (0f 20 c0)",
+                code: &[15, 32, 192],
+                protected: false,
+                gpr: [10, 8, 16384, 3, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+                cr0: 0xa,
+                gdtr_base: 0x100,
+                gdtr_limit: 0xff,
+                idtr_base: 0x900,
+                idtr_limit: 0x3ff,
+                ldtr_sel: 0x28,
+                tr_sel: 0x38,
+                es_sel: 0x0,
+                ds_sel: 0x0,
+            },
+            SystemSegGolden {
+                name: "mov cr2,eax (0f 22 d0)",
+                code: &[15, 34, 208],
+                protected: false,
+                gpr: [5, 8, 16384, 3, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+                cr0: 0xa,
+                gdtr_base: 0x100,
+                gdtr_limit: 0xff,
+                idtr_base: 0x900,
+                idtr_limit: 0x3ff,
+                ldtr_sel: 0x28,
+                tr_sel: 0x38,
+                es_sel: 0x0,
+                ds_sel: 0x0,
+            },
+            SystemSegGolden {
+                name: "bound ax,[0x80] in-range (62 06 80 00)",
+                code: &[98, 6, 128, 0],
+                protected: false,
+                gpr: [15, 8, 16384, 3, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x4,
+                deltas: &[],
+                fetch: 5,
+                cr0: 0xa,
+                gdtr_base: 0x100,
+                gdtr_limit: 0xff,
+                idtr_base: 0x900,
+                idtr_limit: 0x3ff,
+                ldtr_sel: 0x28,
+                tr_sel: 0x38,
+                es_sel: 0x0,
+                ds_sel: 0x0,
+            },
+            SystemSegGolden {
+                name: "les bx,[0x90] (c4 1e 90 00)",
+                code: &[196, 30, 144, 0],
+                protected: false,
+                gpr: [5, 8, 16384, 4660, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x4,
+                deltas: &[],
+                fetch: 5,
+                cr0: 0xa,
+                gdtr_base: 0x100,
+                gdtr_limit: 0xff,
+                idtr_base: 0x900,
+                idtr_limit: 0x3ff,
+                ldtr_sel: 0x28,
+                tr_sel: 0x38,
+                es_sel: 0x9,
+                ds_sel: 0x0,
+            },
+            SystemSegGolden {
+                name: "lds bx,[0x90] (c5 1e 90 00)",
+                code: &[197, 30, 144, 0],
+                protected: false,
+                gpr: [5, 8, 16384, 4660, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x4,
+                deltas: &[],
+                fetch: 5,
+                cr0: 0xa,
+                gdtr_base: 0x100,
+                gdtr_limit: 0xff,
+                idtr_base: 0x900,
+                idtr_limit: 0x3ff,
+                ldtr_sel: 0x28,
+                tr_sel: 0x38,
+                es_sel: 0x0,
+                ds_sel: 0x9,
+            },
+            SystemSegGolden {
+                name: "sldt ax (0f 00 c0)",
+                code: &[15, 0, 192],
+                protected: true,
+                gpr: [40, 8, 16384, 3, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+                cr0: 0xb,
+                gdtr_base: 0x100,
+                gdtr_limit: 0xff,
+                idtr_base: 0x900,
+                idtr_limit: 0x3ff,
+                ldtr_sel: 0x28,
+                tr_sel: 0x38,
+                es_sel: 0x0,
+                ds_sel: 0x0,
+            },
+            SystemSegGolden {
+                name: "str ax (0f 00 c8)",
+                code: &[15, 0, 200],
+                protected: true,
+                gpr: [56, 8, 16384, 3, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+                cr0: 0xb,
+                gdtr_base: 0x100,
+                gdtr_limit: 0xff,
+                idtr_base: 0x900,
+                idtr_limit: 0x3ff,
+                ldtr_sel: 0x28,
+                tr_sel: 0x38,
+                es_sel: 0x0,
+                ds_sel: 0x0,
+            },
+            SystemSegGolden {
+                name: "lldt cx=0x18 (0f 00 d1)",
+                code: &[15, 0, 209],
+                protected: true,
+                gpr: [5, 24, 16384, 3, 240, 16, 8, 24],
+                eflags: 0x2,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+                cr0: 0xb,
+                gdtr_base: 0x100,
+                gdtr_limit: 0xff,
+                idtr_base: 0x900,
+                idtr_limit: 0x3ff,
+                ldtr_sel: 0x18,
+                tr_sel: 0x38,
+                es_sel: 0x0,
+                ds_sel: 0x0,
+            },
+            SystemSegGolden {
+                name: "verr cx (0f 00 e1)",
+                code: &[15, 0, 225],
+                protected: true,
+                gpr: [5, 8, 16384, 3, 240, 16, 8, 24],
+                eflags: 0x42,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+                cr0: 0xb,
+                gdtr_base: 0x100,
+                gdtr_limit: 0xff,
+                idtr_base: 0x900,
+                idtr_limit: 0x3ff,
+                ldtr_sel: 0x28,
+                tr_sel: 0x38,
+                es_sel: 0x0,
+                ds_sel: 0x0,
+            },
+            SystemSegGolden {
+                name: "verw cx (0f 00 e9)",
+                code: &[15, 0, 233],
+                protected: true,
+                gpr: [5, 8, 16384, 3, 240, 16, 8, 24],
+                eflags: 0x42,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+                cr0: 0xb,
+                gdtr_base: 0x100,
+                gdtr_limit: 0xff,
+                idtr_base: 0x900,
+                idtr_limit: 0x3ff,
+                ldtr_sel: 0x28,
+                tr_sel: 0x38,
+                es_sel: 0x0,
+                ds_sel: 0x0,
+            },
+            SystemSegGolden {
+                name: "lar ax,cx (0f 02 c1)",
+                code: &[15, 2, 193],
+                protected: true,
+                gpr: [37376, 8, 16384, 3, 240, 16, 8, 24],
+                eflags: 0x42,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+                cr0: 0xb,
+                gdtr_base: 0x100,
+                gdtr_limit: 0xff,
+                idtr_base: 0x900,
+                idtr_limit: 0x3ff,
+                ldtr_sel: 0x28,
+                tr_sel: 0x38,
+                es_sel: 0x0,
+                ds_sel: 0x0,
+            },
+            SystemSegGolden {
+                name: "lsl ax,cx (0f 03 c1)",
+                code: &[15, 3, 193],
+                protected: true,
+                gpr: [65535, 8, 16384, 3, 240, 16, 8, 24],
+                eflags: 0x42,
+                eip: 0x3,
+                deltas: &[],
+                fetch: 4,
+                cr0: 0xb,
+                gdtr_base: 0x100,
+                gdtr_limit: 0xff,
+                idtr_base: 0x900,
+                idtr_limit: 0x3ff,
+                ldtr_sel: 0x28,
+                tr_sel: 0x38,
+                es_sel: 0x0,
+                ds_sel: 0x0,
+            },
+        ]
+    }
+
+    /// Per-case register overrides applied AFTER `system_seg_seed`. LLDT needs CX pointing at the
+    /// LDT system descriptor (selector 0x18); BOUND and LES/LDS need their default seed. Applied
+    /// identically on the split and the regen (fused) path so the goldens stay a faithful diff.
+    fn system_seg_case_override(name: &str, cpu: &mut Cpu386) {
+        if name == "lldt cx=0x18 (0f 00 d1)" {
+            cpu.write_reg16(Reg16::Cx, 0x18);
+        }
+        if name == "bound ax,[0x80] in-range (62 06 80 00)" {
+            cpu.write_reg16(Reg16::Ax, 15);
+        }
+    }
+
+    fn assert_system_seg_state(cpu: &Cpu386, g: &SystemSegGolden) {
+        assert_eq!(cpu.registers.gpr, g.gpr, "gpr mismatch for {}", g.name);
+        assert_eq!(
+            cpu.registers.eflags, g.eflags,
+            "eflags mismatch for {}",
+            g.name
+        );
+        assert_eq!(cpu.registers.eip, g.eip, "eip mismatch for {}", g.name);
+        assert_eq!(cpu.control.cr0, g.cr0, "cr0 mismatch for {}", g.name);
+        assert_eq!(
+            cpu.gdtr.base, g.gdtr_base,
+            "gdtr.base mismatch for {}",
+            g.name
+        );
+        assert_eq!(
+            cpu.gdtr.limit, g.gdtr_limit,
+            "gdtr.limit mismatch for {}",
+            g.name
+        );
+        assert_eq!(
+            cpu.idtr.base, g.idtr_base,
+            "idtr.base mismatch for {}",
+            g.name
+        );
+        assert_eq!(
+            cpu.idtr.limit, g.idtr_limit,
+            "idtr.limit mismatch for {}",
+            g.name
+        );
+        assert_eq!(
+            cpu.ldtr.selector, g.ldtr_sel,
+            "ldtr selector mismatch for {}",
+            g.name
+        );
+        assert_eq!(
+            cpu.tr.selector, g.tr_sel,
+            "tr selector mismatch for {}",
+            g.name
+        );
+        assert_eq!(
+            cpu.registers.segment(SegmentIndex::Es).selector,
+            g.es_sel,
+            "es selector mismatch for {}",
+            g.name
+        );
+        assert_eq!(
+            cpu.registers.segment(SegmentIndex::Ds).selector,
+            g.ds_sel,
+            "ds selector mismatch for {}",
+            g.name
+        );
+    }
+
+    #[test]
+    fn system_seg_split_matches_golden_across_ops() {
+        // The system / descriptor-table / segment-load opcodes (0F 00/01/02/03/06/20/22, BOUND,
+        // LES/LDS) are converted to the decode/execute split, so their fused arms are deleted and
+        // they can no longer be diffed against a fused executor in-tree. Run each case through the
+        // split (`exec_one_split`) and assert the architectural end-state — GPRs, eflags, the
+        // control register, the GDTR/IDTR, the LDTR/TR selectors, and the ES/DS segment selectors —
+        // against goldens captured from the pre-split fused path (parent b0a4262d) via
+        // `regen_system_seg_goldens`. eip + fetch prove decode consumed and charged every byte (0F
+        // prefix + ModRM + displacement) exactly once; the memory deltas prove the SGDT/SIDT/SMSW
+        // store path; the CR/descriptor/segment fields prove the load ops drove the right state
+        // through the reused leaf helpers (so the TLB/code-cache invalidation hooks still fire).
+        for g in system_seg_golden_cases() {
+            let mut mem = vec![0u8; 0x200];
+            system_seg_seed_mem(&mut mem, g.code);
+            let initial = mem.clone();
+
+            let mut split = Cpu386::default();
+            system_seg_seed(&mut split, g.protected);
+            system_seg_case_override(g.name, &mut split);
+            let mut sbus = TestBus::with_memory(mem);
+            exec_one_split(&mut split, &mut sbus).unwrap();
+
+            assert_system_seg_state(&split, g);
+            let deltas: Vec<(usize, u8)> = sbus
+                .memory
+                .iter()
+                .enumerate()
+                .filter(|(i, b)| **b != initial[*i])
+                .map(|(i, b)| (i, *b))
+                .collect();
+            assert_eq!(deltas, g.deltas, "memory-write mismatch for {}", g.name);
+            assert_eq!(
+                seam_fetch_count(&sbus),
+                g.fetch,
+                "instruction-fetch cycle count mismatch for {} (seam must charge fetches once)",
+                g.name
+            );
+        }
+    }
+
+    /// Regenerate `system_seg_golden_cases` from the fused reference. Ignored by default.
+    /// Run WHILE the system/segment fused arms still exist (parent commit b0a4262d):
+    ///   git worktree add ../regen-a12 b0a4262d
+    ///   cd ../regen-a12
+    ///   # paste this test + the cases/seed/struct in, then:
+    ///   cargo test -p izarravm-cpu --lib regen_system_seg_goldens -- --ignored --nocapture
+    /// then paste the output over `system_seg_golden_cases` and only then delete the fused arms.
+    #[test]
+    #[ignore = "prints golden literals; run with --ignored --nocapture against the fused reference"]
+    fn regen_system_seg_goldens() {
+        for g in system_seg_golden_cases() {
+            let mut mem = vec![0u8; 0x200];
+            system_seg_seed_mem(&mut mem, g.code);
+            let initial = mem.clone();
+
+            let mut fused = Cpu386::default();
+            system_seg_seed(&mut fused, g.protected);
+            system_seg_case_override(g.name, &mut fused);
+            let mut fbus = TestBus::with_memory(mem);
+            fused.begin_instruction();
+            if fused.execute_instruction_legacy(&mut fbus).is_err() {
+                println!(
+                    "            // TODO regen {}: fused path unavailable here; run against the base commit",
+                    g.name
+                );
+                continue;
+            }
+            let deltas: Vec<(usize, u8)> = fbus
+                .memory
+                .iter()
+                .enumerate()
+                .filter(|(i, b)| **b != initial[*i])
+                .map(|(i, b)| (i, *b))
+                .collect();
+            let fetch = seam_fetch_count(&fbus);
+            println!(
+                "            SystemSegGolden {{ name: {:?}, code: &{:?}, protected: {}, gpr: {:?}, eflags: {:#x}, eip: {:#x}, deltas: &{:?}, fetch: {}, cr0: {:#x}, gdtr_base: {:#x}, gdtr_limit: {:#x}, idtr_base: {:#x}, idtr_limit: {:#x}, ldtr_sel: {:#x}, tr_sel: {:#x}, es_sel: {:#x}, ds_sel: {:#x} }},",
+                g.name,
+                g.code,
+                g.protected,
+                fused.registers.gpr,
+                fused.registers.eflags,
+                fused.registers.eip,
+                deltas,
+                fetch,
+                fused.control.cr0,
+                fused.gdtr.base,
+                fused.gdtr.limit,
+                fused.idtr.base,
+                fused.idtr.limit,
+                fused.ldtr.selector,
+                fused.tr.selector,
+                fused.registers.segment(SegmentIndex::Es).selector,
+                fused.registers.segment(SegmentIndex::Ds).selector,
             );
         }
     }
