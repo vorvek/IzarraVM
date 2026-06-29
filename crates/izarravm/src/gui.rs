@@ -317,8 +317,17 @@ fn beige_group<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R 
     res.inner
 }
 
+/// The shared red, bold header style for dialog and floating-window titles, so
+/// the brand red lives in one place (window titles and the config header).
+fn header_text(text: &str, size: f32) -> egui::RichText {
+    egui::RichText::new(text)
+        .color(LOGO_RED)
+        .strong()
+        .size(size)
+}
+
 /// The shared beige look for IzarraVM's floating windows (COM1, About,
-/// License): PANEL_FACE fill, 12px inner padding, beige widget visuals, a bold
+/// License): PANEL_FACE fill, a dark-beige border, beige inner padding, a bold
 /// logo-red header, no collapse button, draggable + closable. The caller
 /// supplies the title, the open flag (the window's own close control flips it),
 /// a default size, and the body.
@@ -341,31 +350,27 @@ fn beige_window(
         s.visuals.widgets.hovered.weak_bg_fill = BEVEL_HI;
         s.visuals.widgets.active.weak_bg_fill = BEVEL_LO;
     });
-    egui::Window::new(
-        egui::RichText::new(title)
-            .color(LOGO_RED)
-            .strong()
-            .size(15.0),
-    )
-    .open(open)
-    .resizable(true)
-    .collapsible(false)
-    .default_size(default_size)
-    .frame(
-        egui::Frame::new()
-            .fill(PANEL_FACE)
-            .inner_margin(egui::Margin {
-                left: 14,
-                right: 14,
-                top: 12,
-                bottom: 12,
-            })
-            .corner_radius(4.0),
-    )
-    .show(ctx, |ui| {
-        beige_visuals(ui);
-        add(ui);
-    });
+    egui::Window::new(header_text(title, 15.0))
+        .open(open)
+        .resizable(true)
+        .collapsible(false)
+        .default_size(default_size)
+        .frame(
+            egui::Frame::new()
+                .fill(PANEL_FACE)
+                .stroke(egui::Stroke::new(1.5, BEVEL_LO))
+                .inner_margin(egui::Margin {
+                    left: 14,
+                    right: 14,
+                    top: 12,
+                    bottom: 12,
+                })
+                .corner_radius(4.0),
+        )
+        .show(ctx, |ui| {
+            beige_visuals(ui);
+            add(ui);
+        });
     ctx.style_mut(|s| {
         s.visuals.widgets = saved_widgets;
     });
@@ -394,8 +399,9 @@ fn info_button(ui: &mut egui::Ui) -> egui::Response {
 
 /// Render multi-line attribution text, turning any embedded http(s) URL into a
 /// clickable hyperlink (link color comes from the ui's `hyperlink_color`). One
-/// label per source line so each stays on its own line in a wide-enough window;
-/// keeps the NOTICE file as the single source of truth.
+/// label per source line so each stays on its own line in a wide-enough window
+/// and centers cleanly in a centered layout; keeps the NOTICE file as the
+/// single source of truth.
 fn notice_block(ui: &mut egui::Ui, text: &str, color: egui::Color32, size: f32) {
     ui.spacing_mut().item_spacing.y = 1.0;
     for line in text.lines() {
@@ -412,7 +418,8 @@ fn notice_block(ui: &mut egui::Ui, text: &str, color: egui::Color32, size: f32) 
             &line[..start],
             &line[start + len..],
         );
-        ui.horizontal_wrapped(|ui| {
+        // A shrink-to-content row (not wrapped) so it centers as one unit.
+        ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
             if !before.is_empty() {
                 ui.label(egui::RichText::new(before).color(color).size(size));
@@ -1723,7 +1730,7 @@ impl GuiApp {
                     ui.set_width(440.0);
                     ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
 
-                    ui.label(egui::RichText::new("Configuration").color(INK).size(18.0));
+                    ui.label(header_text("Configuration", 18.0));
                     ui.add_space(6.0);
 
                     ui.label(egui::RichText::new("INPUT").color(LABEL).size(11.0));
@@ -1887,36 +1894,38 @@ impl GuiApp {
         let mut open = self.show_about;
         let mut open_license = self.show_license;
         beige_window(ctx, "About IzarraVM", &mut open, [540.0, 420.0], |ui| {
-            ui.visuals_mut().hyperlink_color = LINK_BLUE;
-            ui.label(
-                egui::RichText::new(concat!("IzarraVM ", env!("CARGO_PKG_VERSION")))
-                    .color(INK)
-                    .size(18.0)
-                    .strong(),
-            );
-            ui.label(
-                egui::RichText::new("the Izarra 3000 virtual machine")
-                    .color(MUTED)
-                    .size(12.0),
-            );
-            ui.hyperlink_to("github.com/vorvek/IzarraVM", GITHUB_URL);
-            ui.label(
-                egui::RichText::new("\u{00A9} 2026 General Simulation Works \u{00B7} GPL-3.0")
-                    .color(MUTED)
-                    .size(12.0),
-            );
-            ui.separator();
-            ui.label(
-                egui::RichText::new("Bundled software")
-                    .color(LABEL)
-                    .size(11.0)
-                    .strong(),
-            );
-            notice_block(ui, include_str!("../../../NOTICE"), MUTED, 11.0);
-            ui.add_space(8.0);
-            if ui.button("View license").clicked() {
-                open_license = true;
-            }
+            ui.vertical_centered(|ui| {
+                ui.visuals_mut().hyperlink_color = LINK_BLUE;
+                ui.label(
+                    egui::RichText::new(concat!("IzarraVM ", env!("CARGO_PKG_VERSION")))
+                        .color(INK)
+                        .size(18.0)
+                        .strong(),
+                );
+                ui.label(
+                    egui::RichText::new("the Izarra 3000 virtual machine")
+                        .color(MUTED)
+                        .size(12.0),
+                );
+                ui.hyperlink_to("github.com/vorvek/IzarraVM", GITHUB_URL);
+                ui.label(
+                    egui::RichText::new("\u{00A9} 2026 General Simulation Works \u{00B7} GPL-3.0")
+                        .color(MUTED)
+                        .size(12.0),
+                );
+                ui.separator();
+                ui.label(
+                    egui::RichText::new("Bundled software")
+                        .color(LABEL)
+                        .size(11.0)
+                        .strong(),
+                );
+                notice_block(ui, include_str!("../../../NOTICE"), MUTED, 11.0);
+                ui.add_space(8.0);
+                if ui.button("View license").clicked() {
+                    open_license = true;
+                }
+            });
         });
         self.show_about = open;
         self.show_license = open_license;
