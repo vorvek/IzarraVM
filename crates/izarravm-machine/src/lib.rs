@@ -10817,6 +10817,12 @@ impl Machine {
             self.pending_soft_int = None;
             self.io_touched = false;
             let trace_before = self.trace.elapsed_clocks();
+            // A20 is a machine-layer event the CPU never sees directly, yet toggling it changes
+            // which physical bytes back a linear address near the 1 MB wrap. Any A20 write (port
+            // 0x92, the 8042, INT 15h, XMS) sets io_touched or is an HLE INT, so it ends this step;
+            // a before/after compare here is the one seam that catches every source and lets the CPU
+            // invalidate its prefetch + decode cache before the next batch runs.
+            let a20_before = self.keyboard.a20_enabled();
             // Run a batch of straight-line instructions against one MachineBus,
             // then service devices once. The cap holds the batch to at most one
             // DAC sample of CPU time so the per-clock fine-samplers stay exact; a
@@ -11063,6 +11069,12 @@ impl Machine {
                             }
                             None => return Ok(StopReason::Halted),
                         }
+                    }
+                    // The A20 gate toggled during this step (port 0x92, the 8042, INT 15h, or XMS):
+                    // tell the CPU so it drops any prefetch/decoded bytes that A20 now remaps near
+                    // the 1 MB wrap, before the next batch executes against the new gate state.
+                    if self.keyboard.a20_enabled() != a20_before {
+                        self.cpu.note_a20_changed();
                     }
                 }
                 Err(error) => return Ok(StopReason::CpuError(error.to_string())),
@@ -14574,6 +14586,46 @@ mod tests {
             );
         }
         assert!(m.keyboard.a20_enabled(), "8042 agrees A20 is on");
+    }
+
+    #[test]
+    fn a20_toggle_through_the_run_loop_invalidates_the_decode_cache() {
+        // End-to-end check of the A20 -> decode-cache seam: a guest OUT to port 0x92, executed by
+        // the real run loop, must advance the CPU's decode generation (so a wrap-region cached
+        // decode is dropped). The control program -- identical but a NOP instead of the OUT -- must
+        // not advance it, proving the bump comes from the A20 toggle and not incidental run-loop
+        // activity. Both spin on JMP $ so the short run never reaches a HLT or a timer interrupt.
+        fn gen_after_running(program: &[u8]) -> (bool, u32, u32) {
+            let mut m =
+                Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), program)
+                    .unwrap();
+            let before = m.cpu.decode_cache_generation();
+            m.run_until_halt_or_cycles(1000).unwrap();
+            (
+                m.keyboard.a20_enabled(),
+                before,
+                m.cpu.decode_cache_generation(),
+            )
+        }
+
+        // MOV AL, 0; OUT 0x92, AL; JMP $  -- drives A20 off (port 0x92 bit 1 = 0).
+        let (a20, before, after) = gen_after_running(&[0xb0, 0x00, 0xe6, 0x92, 0xeb, 0xfe]);
+        assert!(
+            !a20,
+            "the guest OUT 0x92 toggled A20 off through the run loop"
+        );
+        assert_ne!(
+            after, before,
+            "the A20 toggle advanced the decode generation (note_a20_changed fired)"
+        );
+
+        // MOV AL, 0; NOP; JMP $  -- no port write, so A20 stays on and the generation is steady.
+        let (a20, before, after) = gen_after_running(&[0xb0, 0x00, 0x90, 0xeb, 0xfe]);
+        assert!(a20, "control: A20 stays on");
+        assert_eq!(
+            after, before,
+            "control: no A20 toggle, so the decode generation is unchanged by the run"
+        );
     }
 
     #[test]

@@ -1259,6 +1259,21 @@ impl Cpu386 {
         }
     }
 
+    /// The machine calls this when the A20 gate toggles. A20 is masked at the bus on every access,
+    /// so the CPU never sees it directly, yet it changes which physical bytes back a linear address
+    /// near the 1 MB wrap. The prefetch (cached bytes) and the decode cache (cached decode of those
+    /// bytes) would otherwise replay stale content, so invalidate both. Rare; a coarse flush is fine.
+    pub fn note_a20_changed(&mut self) {
+        self.invalidate_code_caches();
+    }
+
+    /// The decode cache's current generation. Advances on every cache invalidation (CS/paging/mode
+    /// change, ISA-level change, A20 toggle, self-modifying write). Exposed for observability and so
+    /// the machine can verify the A20 seam end-to-end.
+    pub fn decode_cache_generation(&self) -> u32 {
+        self.decode_cache.generation
+    }
+
     /// A guest data write of `width` bytes to `physical`. If any written byte was decoded as part of
     /// a cached instruction it is self-modifying code, so advance the decode-cache generation to
     /// re-decode those lines. Byte-exact: a 16-bit stack push just below the code (the flat
@@ -14450,6 +14465,24 @@ mod tests {
             cpu.registers.eax() & 0xffff,
             5,
             "the re-fetch from the now-absent page faulted; the stale cached INC AX did NOT run"
+        );
+    }
+
+    #[test]
+    fn note_a20_changed_invalidates_the_decode_cache() {
+        // A20 is masked at the bus, not the CPU, so toggling it changes which physical bytes back a
+        // linear address near the 1 MB wrap without any CPU-visible state change. The machine calls
+        // note_a20_changed on the transition so a cached decode of the old bytes is not replayed.
+        let (mut cpu, mem) = real_mode_cpu(&[0x40], 0x20);
+        let mut bus = TestBus::with_memory(mem);
+        let lin = cpu.linear_eip();
+        cpu.cycle(&mut bus).unwrap();
+        assert!(cpu.decode_cache.get(lin).is_some());
+
+        cpu.note_a20_changed();
+        assert!(
+            cpu.decode_cache.get(lin).is_none(),
+            "an A20 toggle invalidates the decode cache"
         );
     }
 
