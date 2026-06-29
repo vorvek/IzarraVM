@@ -10973,27 +10973,73 @@ impl Machine {
                 let mut batch_core = 0u32;
                 let mut halted = false;
                 let mut fault = None;
-                loop {
-                    match cpu.cycle(&mut bus) {
-                        Ok(o) => {
-                            batch_core = batch_core.saturating_add(o.core_clocks);
-                            if o.halted {
-                                halted = true;
-                                break;
-                            }
-                            // A port access read or changed time-dependent device
-                            // state; an HLE INT (pending_soft_int) needs &mut self.
-                            // Stop so the run loop services them at this instant.
-                            if *bus.io_touched || bus.pending_soft_int.is_some() {
-                                break;
-                            }
-                            if u64::from(batch_core) >= cap {
-                                break;
-                            }
+                // Service a pending interrupt / halt-wake ONCE per batch.
+                // interrupt_pending() cannot change mid-batch (devices advance only
+                // after the batch, and any guest PIC access ends the batch via
+                // io_touched), so a per-batch check is equivalent to the old
+                // per-instruction one. The STI one-instruction shadow is still
+                // honored per instruction inside cycle_no_interrupt_check.
+                match cpu.service_pending_interrupt(&mut bus) {
+                    Ok(Some(o)) => {
+                        batch_core = batch_core.saturating_add(o.core_clocks);
+                        if o.halted {
+                            halted = true;
                         }
-                        Err(e) => {
-                            fault = Some(e);
-                            break;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        fault = Some(e);
+                    }
+                }
+                if fault.is_none() && !halted {
+                    loop {
+                        // Watch the "a maskable interrupt is now serviceable" edge
+                        // (IF set AND no STI shadow pending). When an instruction
+                        // raises it - POPF/IRET enabling IF, or the instruction after
+                        // STI consuming the shadow - end the batch so the next batch
+                        // entry re-checks interrupts at exactly that boundary. The
+                        // interrupt-pending check is per-batch, not per-instruction, so
+                        // without this an IF-enable whose window closes inside the same
+                        // batch loses its pending interrupt. Two load-bearing cases:
+                        // the HLE WaitForKey retry (the IRET stub restores IF, then the
+                        // re-run INT 21h clears it again in the same batch, so IRQ1
+                        // would never run), and an `STI; poll; jz` idle loop whose
+                        // cap boundary always lands right after the STI (the shadow
+                        // would block the per-batch check forever).
+                        let can_take_before = cpu.can_take_interrupt();
+                        // Run a straight-line run of instructions inside the CPU in one call (the
+                        // first via the normal single path, then cached straight-line continuations)
+                        // instead of bouncing here per instruction. The run ends on a fault, halt, a
+                        // non-straight-line / un-cached / page-crossing terminator, an interrupt-
+                        // serviceable transition, or its cap. The batch-break checks below still run
+                        // on the collapsed outcome: the executor's internal transition check ends the
+                        // RUN at the edge, and the machine's check below ends the BATCH so the next
+                        // batch services the interrupt. Both are needed.
+                        let remaining = cap.saturating_sub(u64::from(batch_core));
+                        match cpu.run_straight_line(&mut bus, remaining) {
+                            Ok(o) => {
+                                batch_core = batch_core.saturating_add(o.core_clocks);
+                                if o.halted {
+                                    halted = true;
+                                    break;
+                                }
+                                // A port access read or changed time-dependent device
+                                // state; an HLE INT (pending_soft_int) needs &mut self.
+                                // Stop so the run loop services them at this instant.
+                                if *bus.io_touched || bus.pending_soft_int.is_some() {
+                                    break;
+                                }
+                                if !can_take_before && cpu.can_take_interrupt() {
+                                    break;
+                                }
+                                if u64::from(batch_core) >= cap {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                fault = Some(e);
+                                break;
+                            }
                         }
                     }
                 }
@@ -11377,6 +11423,33 @@ impl CpuBus for MachineBus<'_> {
         Ok(())
     }
 
+    fn charge_instruction_fetch_run(&mut self, start: u32, count: u32) -> Result<(), BusError> {
+        if count == 0 {
+            return Ok(());
+        }
+        let first = self.apply_a20(start);
+        let last = self.apply_a20(start.wrapping_add(count - 1));
+        let first_ws = self.memory_wait_states(first);
+        // Uniform iff every byte lands in the same wait-state region with no A20 wrap
+        // between the ends. apply_a20 already folded both ends, so equal wait-states on
+        // contiguous post-A20 addresses means the whole run is one region. The endpoint-only
+        // test relies on `count` being one instruction's length (at most 15 bytes), far smaller
+        // than any wait-state region: a narrower region wholly contained between two matching
+        // endpoints cannot exist at that scale. A caller passing a large `count` must not assume
+        // this holds; the non-uniform branch's exact per-byte loop is the safe fallback regardless.
+        let uniform =
+            last == first.wrapping_add(count - 1) && first_ws == self.memory_wait_states(last);
+        if uniform {
+            self.trace
+                .record_instruction_fetch_run(first, count, first_ws);
+        } else {
+            for i in 0..count {
+                self.charge_instruction_fetch(start.wrapping_add(i))?;
+            }
+        }
+        Ok(())
+    }
+
     fn read_io(&mut self, port: u16, width: BusWidth) -> Result<u32, BusError> {
         *self.io_touched = true;
         self.trace.record(
@@ -11684,6 +11757,15 @@ impl CpuBus for MachineBus<'_> {
 
     fn acknowledge_interrupt(&mut self) -> Option<u8> {
         self.pic.acknowledge()
+    }
+
+    #[inline]
+    fn requires_step_break(&self) -> bool {
+        // The exact condition the batch loop checks after each instruction: a port access touched
+        // time-dependent device state, or an HLE software interrupt is pending. The straight-line
+        // run executor ends its run on this so the machine services it at the old per-instruction
+        // boundary.
+        *self.io_touched || self.pending_soft_int.is_some()
     }
 
     fn interrupt_acknowledge(&mut self, vector: u8, _ax: u16) -> Result<(), BusError> {
@@ -13244,6 +13326,84 @@ mod tests {
 
         assert_eq!(reason, StopReason::Halted);
         assert_eq!(read_u16(&mut machine, 0x46c), 1);
+    }
+
+    // The per-batch interrupt check (Stage-1 lever 2) must not break the classic
+    // STI; HLT idle loop. The CPU services interrupts once at batch entry; the HLT
+    // ends a batch halted, and the NEXT batch's entry check must see IF set, the
+    // shadow already consumed by the HLT instruction, and IRQ0 pending - and take
+    // it. The wrong design (consuming the STI shadow at batch entry instead of per
+    // instruction) makes this loop spin forever and never tick.
+    #[test]
+    fn sti_hlt_idle_loop_still_takes_irq0_per_batch() {
+        // PIC + PIT init as in default_int08_ticks..., then `sti; hlt; jmp $-2`:
+        // STI enables interrupts (one-instruction shadow), HLT parks until IRQ0,
+        // the default INT 08h handler runs and bumps the BDA tick, IRET returns to
+        // the JMP which loops back to STI. The tick at 0x46c must keep advancing.
+        let code: &[u8] = &[
+            0xb0, 0x11, 0xe6, 0x20, // ICW1 master
+            0xb0, 0x08, 0xe6, 0x21, // ICW2 base 08h
+            0xb0, 0x04, 0xe6, 0x21, // ICW3 slave on IR2
+            0xb0, 0x01, 0xe6, 0x21, // ICW4 8086 mode
+            0xb0, 0xfe, 0xe6, 0x21, // unmask IRQ0 only
+            0xb0, 0x36, 0xe6, 0x43, // PIT channel 0 mode 3
+            0xb0, 0xe8, 0xe6, 0x40, // count low 1000
+            0xb0, 0x03, 0xe6, 0x40, // count high
+            0xfb, // sti
+            0xf4, // hlt
+            0xeb, 0xfc, // jmp $-2 (back to the sti)
+        ];
+        let mut machine = Machine::new_boot_image(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            boot_image_with(code),
+        )
+        .unwrap();
+
+        // The loop never genuinely halts, so it exhausts the budget; the assertion
+        // is that the timer ISR ran while it spun, proving the per-batch check still
+        // takes the interrupt for an STI; HLT idle loop.
+        let _ = machine.run_until_halt_or_cycles(2_000_000).unwrap();
+
+        assert!(
+            read_u16(&mut machine, 0x46c) >= 1,
+            "the IRQ0 handler must run for an STI; HLT idle loop under per-batch \
+             interrupt checking (it would spin forever if the STI shadow were \
+             consumed at batch entry instead of per instruction)"
+        );
+    }
+
+    // A run of straight-line instructions between interrupt checks must not delay
+    // the interrupt past the batch: `sti; nop x5; jmp $-7` keeps the CPU busy with
+    // no HLT and no port I/O, so a whole batch of NOPs runs through
+    // cycle_no_interrupt_check before the next batch entry, where IRQ0 is taken.
+    #[test]
+    fn sti_busy_loop_takes_irq0_despite_intervening_instructions() {
+        let code: &[u8] = &[
+            0xb0, 0x11, 0xe6, 0x20, // ICW1 master
+            0xb0, 0x08, 0xe6, 0x21, // ICW2 base 08h
+            0xb0, 0x04, 0xe6, 0x21, // ICW3 slave on IR2
+            0xb0, 0x01, 0xe6, 0x21, // ICW4 8086 mode
+            0xb0, 0xfe, 0xe6, 0x21, // unmask IRQ0 only
+            0xb0, 0x36, 0xe6, 0x43, // PIT channel 0 mode 3
+            0xb0, 0xe8, 0xe6, 0x40, // count low 1000
+            0xb0, 0x03, 0xe6, 0x40, // count high
+            0xfb, // sti
+            0x90, 0x90, 0x90, 0x90, 0x90, // nop x5
+            0xeb, 0xf9, // jmp $-7 (back to the sti)
+        ];
+        let mut machine = Machine::new_boot_image(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            boot_image_with(code),
+        )
+        .unwrap();
+
+        let _ = machine.run_until_halt_or_cycles(2_000_000).unwrap();
+
+        assert!(
+            read_u16(&mut machine, 0x46c) >= 1,
+            "the IRQ0 handler must run for a busy STI loop even with NOPs between \
+             interrupt checks"
+        );
     }
 
     #[test]

@@ -282,6 +282,40 @@ impl BusTrace {
         }
     }
 
+    /// Record a contiguous run of `count` byte-wide instruction-prefetch cycles
+    /// (addresses `address..address + count`, all at `wait_states`) in one shot.
+    /// The clock total advances by `count` cycles' worth unconditionally; the
+    /// access count bumps by `count` when tracing is on; the per-cycle detail is
+    /// pushed only in `Full` mode, honoring the capacity eviction. This is the
+    /// bulk equivalent of `count` `record(InstructionPrefetch, .., Byte, ..)`
+    /// calls, and it is bit-identical to that loop in all three accounting fields.
+    #[inline]
+    pub fn record_instruction_fetch_run(&mut self, address: u32, count: u32, wait_states: u8) {
+        let clocks = BusCycle::clocks_for(BusWidth::Byte, wait_states);
+        self.elapsed_clocks += u64::from(clocks) * u64::from(count);
+        if self.mode != TracingMode::Off {
+            self.record_traced_run(address, count, wait_states);
+        }
+    }
+
+    #[cold]
+    fn record_traced_run(&mut self, address: u32, count: u32, wait_states: u8) {
+        self.access_count += u64::from(count);
+        if self.mode == TracingMode::Full && self.capacity > 0 {
+            for i in 0..count {
+                if self.cycles.len() == self.capacity {
+                    self.cycles.pop_front();
+                }
+                self.cycles.push_back(BusCycle::new(
+                    BusAccessKind::InstructionPrefetch,
+                    address.wrapping_add(i),
+                    BusWidth::Byte,
+                    wait_states,
+                ));
+            }
+        }
+    }
+
     #[cold]
     fn record_traced(
         &mut self,
@@ -362,6 +396,17 @@ pub trait CpuBus {
     /// Charge one byte of instruction-fetch bus time at `address`.
     fn charge_instruction_fetch(&mut self, address: u32) -> Result<(), BusError>;
 
+    /// Charge the instruction-fetch clocks for a run of `count` bytes starting at
+    /// `start`. Equivalent to `count` calls to `charge_instruction_fetch(start + i)`,
+    /// but an impl backed by region-uniform memory may charge it in one op. Default:
+    /// the per-byte loop.
+    fn charge_instruction_fetch_run(&mut self, start: u32, count: u32) -> Result<(), BusError> {
+        for i in 0..count {
+            self.charge_instruction_fetch(start.wrapping_add(i))?;
+        }
+        Ok(())
+    }
+
     fn read_io(&mut self, port: u16, width: BusWidth) -> Result<u32, BusError>;
 
     fn write_io(&mut self, port: u16, width: BusWidth, value: u32) -> Result<(), BusError>;
@@ -381,6 +426,15 @@ pub trait CpuBus {
     /// dropped before acknowledge. Defaulted to `None`.
     fn acknowledge_interrupt(&mut self) -> Option<u8> {
         None
+    }
+
+    /// True when the machine must service something before the next instruction runs: a port
+    /// access touched time-dependent device state, or an HLE software interrupt is pending. The
+    /// straight-line run executor checks this after each instruction and ends the run so the
+    /// machine services it at exactly the old per-instruction boundary. Defaulted false for buses
+    /// without devices.
+    fn requires_step_break(&self) -> bool {
+        false
     }
 }
 
@@ -530,6 +584,56 @@ mod tests {
 
         assert_eq!(a.cycles(), b.cycles());
         assert_eq!(a.elapsed_clocks(), b.elapsed_clocks());
+    }
+
+    #[test]
+    fn record_instruction_fetch_run_matches_per_byte_record_loop() {
+        // The bulk run must be bit-identical to a loop of per-byte `record` calls in
+        // all three accounting fields (elapsed_clocks, access_count, retained cycle
+        // detail) across every tracing mode. Each case uses a non-zero wait-state so
+        // `clocks_for` parity is exercised away from 0, and the Full case picks a
+        // capacity SMALLER than the run so the `pop_front` eviction loop runs.
+        const ADDR: u32 = 0x4_0000;
+        const COUNT: u32 = 5;
+        const WAIT: u8 = 3;
+
+        for (mode, capacity) in [
+            (TracingMode::Off, DEFAULT_BUS_TRACE_CAPACITY),
+            (TracingMode::Counts, DEFAULT_BUS_TRACE_CAPACITY),
+            // capacity (3) < count (5): the run must evict the two oldest cycles.
+            (TracingMode::Full, 3),
+        ] {
+            let mut bulk = BusTrace::with_capacity(capacity);
+            bulk.set_tracing_mode(mode);
+            let mut loop_ = BusTrace::with_capacity(capacity);
+            loop_.set_tracing_mode(mode);
+
+            bulk.record_instruction_fetch_run(ADDR, COUNT, WAIT);
+            for i in 0..COUNT {
+                loop_.record(
+                    BusAccessKind::InstructionPrefetch,
+                    ADDR.wrapping_add(i),
+                    BusWidth::Byte,
+                    WAIT,
+                );
+            }
+
+            assert_eq!(
+                bulk.elapsed_clocks(),
+                loop_.elapsed_clocks(),
+                "elapsed_clocks must match in {mode:?} mode"
+            );
+            assert_eq!(
+                bulk.access_count(),
+                loop_.access_count(),
+                "access_count must match in {mode:?} mode"
+            );
+            assert_eq!(
+                bulk.cycles(),
+                loop_.cycles(),
+                "retained cycle detail must match in {mode:?} mode"
+            );
+        }
     }
 
     #[test]

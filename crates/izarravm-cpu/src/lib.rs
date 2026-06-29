@@ -986,6 +986,27 @@ enum DecodeGroup {
     TwoByteFallback,
 }
 
+/// Whether a decoded group is safe to run as a straight-line continuation: it neither transfers
+/// control, touches a port, changes segment / CR / system state, halts, nor runs a REP string op.
+/// The straight-line run executor keeps pulling such instructions from the decode cache (one call,
+/// no machine-loop bounce) until the next instruction is not one of these. The control-flow,
+/// I/O, segment/system, halt, and string groups all terminate the run so the per-instruction
+/// machine-loop semantics (interrupt service, device advance, HLE INT) are preserved at exactly the
+/// old boundary.
+fn block_straight_line(g: DecodeGroup) -> bool {
+    matches!(
+        g,
+        DecodeGroup::Alu
+            | DecodeGroup::DataMove
+            | DecodeGroup::Stack
+            | DecodeGroup::Group
+            | DecodeGroup::FlagsMisc
+            | DecodeGroup::BitManip
+            | DecodeGroup::CondMove
+            | DecodeGroup::Fpu
+    )
+}
+
 /// A decoded instruction: the prefix/opcode/operand-size results plus the pre-parsed ModRM, operand
 /// descriptor, and immediate for the forms that carry them. After Stage A every implemented opcode
 /// is converted to the decode/execute split; the no-operand forms (and the dead-end fallbacks) leave
@@ -1405,6 +1426,33 @@ impl Cpu386 {
     }
 
     pub fn cycle<B: CpuBus>(&mut self, bus: &mut B) -> Result<CycleOutcome, CpuError> {
+        // `cycle` is the per-instruction prologue (halt-wake + hardware interrupt
+        // service) followed by one instruction. The two halves are split so the
+        // machine batch loop can run the prologue once per batch and then run a
+        // sequence of instructions through `cycle_no_interrupt_check`:
+        // `interrupt_pending()` is driven by the PIC and cannot change mid-batch
+        // (devices advance only after the batch, and any guest PIC access ends the
+        // batch), so a per-batch interrupt check is equivalent to the old
+        // per-instruction one. Every existing caller keeps the old behavior because
+        // this thin wrapper composes the two halves exactly as before.
+        match self.service_pending_interrupt(bus)? {
+            Some(outcome) => Ok(outcome),
+            None => self.cycle_no_interrupt_check(bus),
+        }
+    }
+
+    /// The interrupt prologue of `cycle`: wake from HLT if an enabled interrupt is
+    /// pending, then service one pending hardware interrupt. Returns `Some(outcome)`
+    /// when this call produced a complete cycle (it stayed halted or it took an
+    /// interrupt) and `None` when the caller should run an instruction next. The
+    /// STI one-instruction shadow is *tested* here but NOT consumed: the consume
+    /// belongs to a running instruction (`cycle_no_interrupt_check`), so that when
+    /// the machine runs this once per batch a `STI; HLT` idle loop still eventually
+    /// takes its interrupt instead of spinning forever.
+    pub fn service_pending_interrupt<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+    ) -> Result<Option<CycleOutcome>, CpuError> {
         // Wake from HLT only when a maskable interrupt can actually be taken. The 386
         // exits HLT on an enabled interrupt; a masked or IF-disabled request leaves it
         // halted. NMI and the other non-maskable wake sources are out of scope.
@@ -1412,21 +1460,18 @@ impl Cpu386 {
             if self.flag(FLAG_IF) && bus.interrupt_pending() {
                 self.halted = false;
             } else {
-                return Ok(CycleOutcome {
+                return Ok(Some(CycleOutcome {
                     core_clocks: 1,
                     halted: true,
-                });
+                }));
             }
         }
 
-        // Consume the one-instruction shadow set by STI. While it is active the
-        // interrupt check below is skipped so the instruction after STI always
-        // executes before an interrupt can be taken.
-        let shadowed = self.interrupt_shadow;
-        self.interrupt_shadow = false;
-
-        // Service a pending hardware interrupt before fetching the next instruction.
-        if !shadowed && self.flag(FLAG_IF) && bus.interrupt_pending() {
+        // Test the one-instruction shadow set by STI without consuming it. While the
+        // shadow is active the interrupt check is skipped so the instruction after STI
+        // always executes before an interrupt can be taken; the consume happens in
+        // `cycle_no_interrupt_check` when that next instruction runs.
+        if !self.interrupt_shadow && self.flag(FLAG_IF) && bus.interrupt_pending() {
             if let Some(vector) = bus.acknowledge_interrupt() {
                 self.hardware_interrupt(bus, vector)
                     .map_err(|fault| match fault {
@@ -1435,12 +1480,27 @@ impl Cpu386 {
                     })?;
                 let charged = self.scale_clocks(61);
                 self.elapsed_clocks += charged;
-                return Ok(CycleOutcome {
+                return Ok(Some(CycleOutcome {
                     core_clocks: charged.min(u64::from(u32::MAX)) as u32,
                     halted: false,
-                });
+                }));
             }
         }
+
+        Ok(None)
+    }
+
+    /// Fetch and execute exactly one instruction with NO halt handling and NO
+    /// interrupt check. The caller (`cycle`, or the machine batch loop) is
+    /// responsible for having run `service_pending_interrupt` first. This consumes
+    /// the STI one-instruction shadow: a running instruction uses up the one-cycle
+    /// delay, so the instruction after STI runs here and the shadow is clear by the
+    /// next interrupt check.
+    pub fn cycle_no_interrupt_check<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+    ) -> Result<CycleOutcome, CpuError> {
+        self.interrupt_shadow = false;
 
         self.begin_instruction();
         let start_eip = self.registers.eip;
@@ -1449,6 +1509,27 @@ impl Cpu386 {
         let result = self
             .fetch_decoded(bus, lin)
             .and_then(|insn| self.execute_decoded(&insn, bus));
+        self.finish_instruction(bus, result, start_eip, start_cs)
+    }
+
+    /// The shared rewind / deliver / scale tail of a single instruction's execution, used by both
+    /// `cycle_no_interrupt_check` (get-or-decode fetch) and `run_one_cached` (already-decoded cache
+    /// hit). It owns ONLY what happens after `result` is produced: on a delivered exception it rewinds
+    /// eip (and CS, if a far transfer moved it) to the faulting instruction and delivers the fault
+    /// through `deliver_exception` exactly as the per-instruction path always did, charging the
+    /// architectural 59 core clocks for the dispatch; on a CPU-level error it propagates; otherwise it
+    /// scales the retired clocks (the single per-mode timing dial) and accumulates them. Both callers
+    /// charge their own fetch BEFORE calling this, so it never touches fetch clocks and never double-
+    /// charges. `start_eip` / `start_cs` are captured before the fetch so the rewind lands on the
+    /// instruction's first byte.
+    #[inline]
+    fn finish_instruction<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        result: ExecResult<CycleOutcome>,
+        start_eip: u32,
+        start_cs: u16,
+    ) -> Result<CycleOutcome, CpuError> {
         let outcome = match result {
             Ok(outcome) => outcome,
             Err(InternalFault::Exception { vector, error_code }) => {
@@ -1475,6 +1556,110 @@ impl Cpu386 {
             core_clocks: charged.min(u64::from(u32::MAX)) as u32,
             halted: outcome.halted,
         })
+    }
+
+    /// Run a straight-line run of instructions in one cross-crate call instead of bouncing to the
+    /// machine batch loop once per instruction. The first instruction always goes through the normal
+    /// single-instruction path (`cycle_no_interrupt_check`), which handles a decode miss, a fault, and
+    /// halt. Each continuation runs ONLY when the next instruction is already in the decode cache, is
+    /// a straight-line group, and stays inside the current 4 KB page; any miss, non-straight-line
+    /// group, or page cross ends the run, and that terminator then runs through the normal path on the
+    /// next machine-loop entry. `cap` bounds the run in scaled core clocks.
+    ///
+    /// This is the lean recompiler path: it needs no block cache. Self-modifying code is handled for
+    /// free because every continuation re-peeks `decode_cache.get(lin)`. A guest write that modifies a
+    /// later instruction bumps the decode-cache generation (via `note_code_write`), so the next `get`
+    /// misses and the run ends; the modified instruction re-decodes through the normal path. The
+    /// per-instruction `scale_clocks` + `charge_cached_fetch` calls are kept, so cyc/iter and the bus
+    /// clock metric stay bit-identical to the per-instruction loop.
+    ///
+    /// Interrupt semantics match the per-batch model exactly: every instruction (the first AND each
+    /// continuation) has its "a maskable interrupt just became serviceable" transition checked
+    /// uniformly, so the run ends at precisely the boundary the old per-instruction loop would have
+    /// stopped at (the post-STI instruction consuming the shadow, or POPF/IRET enabling IF). The
+    /// machine's own per-batch transition check then services the interrupt at the next batch entry.
+    pub fn run_straight_line<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        cap: u64,
+    ) -> Result<CycleOutcome, CpuError> {
+        let mut total = 0u64;
+        let mut first = true;
+        loop {
+            let can_take_before = self.can_take_interrupt();
+            let outcome = if first {
+                first = false;
+                self.cycle_no_interrupt_check(bus)?
+            } else {
+                let lin = self.linear_eip();
+                let insn = match self.decode_cache.get(lin) {
+                    Some(i)
+                        if block_straight_line(i.group)
+                            && (lin & 0xfff) + u32::from(i.len) <= 0x1000 =>
+                    {
+                        i
+                    }
+                    _ => break,
+                };
+                self.run_one_cached(bus, &insn, lin)?
+            };
+            total += u64::from(outcome.core_clocks);
+            // The post-instruction break checks run in the SAME ORDER the old per-instruction machine
+            // loop used (halted -> step-break -> interrupt-transition -> cap), so the run ends at
+            // exactly the boundary that loop would have stopped at.
+            if outcome.halted {
+                return Ok(CycleOutcome {
+                    core_clocks: total.min(u64::from(u32::MAX)) as u32,
+                    halted: true,
+                });
+            }
+            // A port access touched time-dependent device state, or an HLE software interrupt is
+            // pending (e.g. an INT n, or an x87 #MF routed to vector 0x10). End the run so the machine
+            // services it now, at the old per-instruction boundary. Checked after the FIRST
+            // instruction too: a port OUT/IN as the run's first instruction must end the run after
+            // that one instruction, exactly like the old loop.
+            if bus.requires_step_break() {
+                break;
+            }
+            // End the run the instant an instruction makes a maskable interrupt serviceable (the
+            // post-STI instruction consuming the shadow, or POPF/IRET enabling IF), so the machine
+            // batch loop services it at the next batch entry, at exactly the old per-instruction
+            // boundary. Checked after the FIRST instruction too: an IF-on-then-off-within-a-run
+            // sequence would otherwise lose the interrupt.
+            if !can_take_before && self.can_take_interrupt() {
+                break;
+            }
+            if total >= cap {
+                break;
+            }
+        }
+        Ok(CycleOutcome {
+            core_clocks: total.min(u64::from(u32::MAX)) as u32,
+            halted: false,
+        })
+    }
+
+    /// Execute one already-decoded cached instruction as a straight-line continuation. Consumes the
+    /// one-instruction STI shadow (a running instruction uses up the one-cycle delay), charges the
+    /// cached-hit fetch (without re-decoding, so no double charge), runs the decoded form, and routes
+    /// a fault / CPU error / retired clocks through the shared `finish_instruction` tail. The fault
+    /// path is the same rewind + `deliver_exception` the per-instruction path uses, so a mid-run fault
+    /// rewinds eip to the faulting instruction and delivers normally rather than being swallowed.
+    #[inline]
+    fn run_one_cached<B: CpuBus>(
+        &mut self,
+        bus: &mut B,
+        insn: &DecodedInsn,
+        lin: u32,
+    ) -> Result<CycleOutcome, CpuError> {
+        self.interrupt_shadow = false;
+        self.begin_instruction();
+        let start_eip = self.registers.eip;
+        let start_cs = self.registers.cs().selector;
+        let result = self
+            .charge_cached_fetch(bus, lin, insn.len)
+            .and_then(|()| self.execute_decoded(insn, bus));
+        self.finish_instruction(bus, result, start_eip, start_cs)
     }
 
     /// The single routing authority for the decode/execute split: classify an opcode into the
@@ -1697,9 +1882,7 @@ impl Cpu386 {
     /// page's physical, and a prefixed instruction's doubled opcode charge lands at `lin` (a prefix)
     /// rather than the opcode. Neither occurs on the benchmark path, where cyc/iter is bit-identical.
     fn charge_cached_fetch<B: CpuBus>(&mut self, bus: &mut B, lin: u32, len: u8) -> ExecResult<()> {
-        for i in 0..u32::from(len) {
-            bus.charge_instruction_fetch(lin.wrapping_add(i))?;
-        }
+        bus.charge_instruction_fetch_run(lin, u32::from(len))?;
         // The opcode-byte double-charge (read_prefixes peek + decode re-fetch).
         bus.charge_instruction_fetch(lin)?;
         self.registers.eip = self.registers.eip.wrapping_add(u32::from(len));
@@ -6140,6 +6323,17 @@ impl Cpu386 {
         self.flag(FLAG_IF)
     }
 
+    /// True when a maskable interrupt could be serviced at this instruction
+    /// boundary: IF is set AND the STI one-instruction shadow is not pending. The
+    /// machine batch loop watches this transition so it can end a batch whenever an
+    /// instruction makes an interrupt newly serviceable (POPF/IRET enabling IF, or
+    /// the instruction after STI consuming the shadow). That keeps the per-batch
+    /// interrupt check equivalent to the old per-instruction one without re-querying
+    /// the PIC inside the batch.
+    pub fn can_take_interrupt(&self) -> bool {
+        self.flag(FLAG_IF) && !self.interrupt_shadow
+    }
+
     fn flag(&self, flag: u32) -> bool {
         self.registers.eflags & flag != 0
     }
@@ -8584,6 +8778,9 @@ mod tests {
         memory: Vec<u8>,
         trace: BusTrace,
         pending_irq: Option<u8>,
+        // Mirrors the machine's `io_touched`: set by any port access, so `requires_step_break`
+        // reports the same step-break edge the real bus does.
+        io_touched: bool,
     }
 
     impl TestBus {
@@ -8592,6 +8789,7 @@ mod tests {
                 memory,
                 trace: BusTrace::default(),
                 pending_irq: None,
+                io_touched: false,
             }
         }
     }
@@ -8668,6 +8866,7 @@ mod tests {
         }
 
         fn read_io(&mut self, port: u16, width: BusWidth) -> Result<u32, BusError> {
+            self.io_touched = true;
             self.trace.push(BusCycle::new(
                 BusAccessKind::IoRead,
                 u32::from(port),
@@ -8678,6 +8877,7 @@ mod tests {
         }
 
         fn write_io(&mut self, port: u16, width: BusWidth, _value: u32) -> Result<(), BusError> {
+            self.io_touched = true;
             self.trace.push(BusCycle::new(
                 BusAccessKind::IoWrite,
                 u32::from(port),
@@ -8703,6 +8903,10 @@ mod tests {
 
         fn acknowledge_interrupt(&mut self) -> Option<u8> {
             self.pending_irq.take()
+        }
+
+        fn requires_step_break(&self) -> bool {
+            self.io_touched
         }
     }
 
@@ -14972,6 +15176,355 @@ mod tests {
         cpu.load_segment_real(SegmentIndex::Ss, 0);
         cpu.registers.eip = 0;
         (cpu, memory)
+    }
+
+    /// Drive `run_straight_line` repeatedly the way the machine batch loop does (without devices or
+    /// interrupts): keep starting a fresh run from the current eip until one halts or a generous step
+    /// budget is exhausted. Returns the number of runs the executor produced, so a test can assert a
+    /// hot loop actually collapsed into multi-instruction runs rather than one-instruction stutters.
+    fn drive_straight_line_runs(cpu: &mut Cpu386, bus: &mut TestBus) -> usize {
+        let mut runs = 0;
+        for _ in 0..10_000 {
+            runs += 1;
+            let outcome = cpu.run_straight_line(bus, u64::MAX).unwrap();
+            if outcome.halted {
+                return runs;
+            }
+        }
+        panic!("straight-line driver never halted");
+    }
+
+    #[test]
+    fn straight_line_hot_loop_matches_per_instruction_result() {
+        // MOV CX,5 ; loop: INC AX ; INC AX ; LOOP loop ; HLT. The body is straight-line (INC AX is
+        // FlagsMisc); LOOP is control flow, so each iteration is a run that ends on the LOOP. After
+        // the first warming pass the body is cached and the runs are multi-instruction.
+        let code = [
+            0xb9, 0x05, 0x00, // MOV CX, 5
+            0x40, // INC AX            (loop target, 0x03)
+            0x40, // INC AX            (0x04)
+            0xe2, 0xfc, // LOOP -4 -> 0x03  (0x05)
+            0xf4, // HLT               (0x07)
+        ];
+        let (mut cpu, memory) = real_mode_cpu(&code, 1024);
+        let mut bus = TestBus::with_memory(memory);
+        let runs = drive_straight_line_runs(&mut cpu, &mut bus);
+        // Two warming INCs (cache cold) plus four loop iterations of two INCs each = 10.
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 10);
+        assert_eq!(cpu.read_reg16(Reg16::Cx), 0);
+        // 17 instructions retire: MOV CX, 2 warming INCs, then 5 LOOP iterations (the body's 2 INCs
+        // run on the four jumping iterations, the fifth LOOP falls through), and HLT =
+        // 1 + 2 + (5 LOOP + 4*2 INC) + 1 = 17. A one-instruction-per-run executor would produce 17
+        // runs; the batching executor produces strictly fewer, proving continuations actually fired
+        // (the four hot iterations each run LOOP + INC + INC in a single run).
+        let retired = 1 + 2 + (5 + 4 * 2) + 1;
+        assert!(
+            runs < retired,
+            "the hot loop must collapse into multi-instruction runs: {runs} runs for {retired} \
+             instructions"
+        );
+    }
+
+    #[test]
+    fn straight_line_run_sees_self_modified_later_instruction() {
+        // The key correctness property of the lean executor: a guest write that modifies a later,
+        // already-cached instruction must make the NEXT continuation re-decode the new bytes, never
+        // replay the stale cached opcode. We loop so the body is cached, then on the second iteration
+        // an early store overwrites a later instruction's opcode in place.
+        //
+        // Layout (DS = CS = 0):
+        //   0x00: B9 02 00        MOV CX, 2
+        //   loop (0x03):
+        //   0x03: C6 06 0A 00 48  MOV byte [0x0A], 0x48   ; patch the op at 0x0A to DEC AX (0x48)
+        //   0x08: 40              INC AX
+        //   0x09: 40              INC AX                  ; cached as INC AX on pass 1, runs DEC on 2
+        //   0x0A: 40              INC AX  <- patched to 0x48 (DEC AX) by the store at 0x03
+        //   0x0B: E2 F6           LOOP -10 -> 0x03
+        //   0x0D: F4              HLT
+        //
+        // Pass 1 (cache cold): the store writes 0x48 over [0x0A] BEFORE 0x0A is ever decoded, so 0x0A
+        //   decodes fresh as DEC AX. AX: +1 (0x08) +1 (0x09) -1 (0x0A) = +1.
+        // Pass 2 (body cached): 0x0A is now cached as DEC AX from pass 1. The store rewrites the same
+        //   0x48, hitting a cached code byte -> generation bump -> the 0x0A continuation re-decodes
+        //   (still DEC AX). AX: +1 +1 -1 = +1. Total AX = 2, CX = 0.
+        // If the executor replayed the stale cache without honoring the SMC bump, 0x0A would run as
+        //   the original INC and AX would be wrong.
+        let code = [
+            0xb9, 0x02, 0x00, // MOV CX, 2
+            0xc6, 0x06, 0x0a, 0x00, 0x48, // MOV byte [0x000A], 0x48   (0x03)
+            0x40, // INC AX                                  (0x08)
+            0x40, // INC AX                                  (0x09)
+            0x40, // INC AX  (patched to DEC AX at runtime)  (0x0A)
+            0xe2, 0xf6, // LOOP -10 -> 0x03                  (0x0B)
+            0xf4, // HLT                                     (0x0D)
+        ];
+        let (mut cpu, memory) = real_mode_cpu(&code, 1024);
+        let mut bus = TestBus::with_memory(memory);
+        drive_straight_line_runs(&mut cpu, &mut bus);
+        // Each of the two iterations nets +1 because the patched op ran as DEC AX, not the stale INC.
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 2);
+        assert_eq!(cpu.read_reg16(Reg16::Cx), 0);
+        // The byte at 0x0A is the patched DEC AX opcode.
+        assert_eq!(bus.memory[0x0a], 0x48);
+    }
+
+    #[test]
+    fn straight_line_run_discards_cached_opcode_overwritten_to_a_different_op() {
+        // The strongly discriminating SMC case: a later instruction is cached as one opcode (INC AX,
+        // a +1), an earlier guest store then overwrites it with a DIFFERENT opcode (DEC AX, a -1), and
+        // the executor must re-decode the new opcode rather than replay the stale cached form. Because
+        // the cached form (INC, +1) and the rewritten form (DEC, -1) have OPPOSITE effects, a stale
+        // snapshot replay produces the wrong sign and the assertion fails - unlike a rewrite to the
+        // already-cached value, which a stale replay would pass.
+        //
+        // Layout (DS = CS = SS = 0):
+        //   0x00: C6 06 05 00 48   MOV byte [0x05], 0x48   ; store: patch P (0x05) from 0x40 to 0x48
+        //   P = 0x05: 40           INC AX                  ; cached as INC AX first; 0x48 = DEC AX after
+        //   0x06: F4               HLT
+        let code = [
+            0xc6, 0x06, 0x05, 0x00, 0x48, // MOV byte [0x0005], 0x48
+            0x40, // INC AX  (P, patched to 0x48 = DEC AX at runtime)
+            0xf4, // HLT
+        ];
+        let (mut cpu, memory) = real_mode_cpu(&code, 1024);
+        let mut bus = TestBus::with_memory(memory);
+
+        // Cache P as INC AX BEFORE any rewrite: run a single instruction starting at P so it decodes
+        // and caches as INC AX (0x40). This is the cached form a stale replay would later wrongly use.
+        cpu.registers.eip = 0x05;
+        cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
+        assert!(
+            cpu.decode_cache.get(0x05).is_some(),
+            "P must be cached as INC AX before the rewrite"
+        );
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 1, "the warm INC ran once");
+
+        // Now run from the top: the store overwrites P's opcode byte (0x40 -> 0x48). That write hits a
+        // cached code byte, bumping the decode-cache generation, so when control reaches P it
+        // re-decodes the NEW byte (DEC AX) instead of replaying the cached INC.
+        cpu.registers.eip = 0;
+        cpu.registers.set_eax(0);
+        drive_straight_line_runs(&mut cpu, &mut bus);
+        // DEC AX ran (AX = 0xFFFF). A stale-snapshot executor that replayed the cached INC AX would
+        // leave AX = 0x0001, failing this assertion - that is the discrimination the L1 test lacked.
+        assert_eq!(
+            cpu.read_reg16(Reg16::Ax),
+            0xffff,
+            "the rewritten DEC AX must run, not the stale cached INC AX"
+        );
+        assert_eq!(
+            bus.memory[0x05], 0x48,
+            "P's opcode byte was patched to DEC AX"
+        );
+    }
+
+    #[test]
+    fn straight_line_run_stops_at_a_page_crossing_instruction() {
+        // The continuation rule `(lin & 0xfff) + len <= 0x1000` keeps a run from executing a cached
+        // instruction that would straddle a 4 KB page boundary; that instruction must run through the
+        // normal path instead. This exercises BOTH sides of the `<= 0x1000` bound:
+        //   - an instruction ENDING exactly at 0x1000 is allowed and runs as a continuation;
+        //   - an instruction CROSSING 0x1000 ends the run and runs afterward via the normal path.
+        // Real-mode flat layout (CS base 0, so lin == eip). The probe instruction is MOV AL, 7
+        // (0xB0 0x07), a 2-byte straight-line DataMove with an observable effect (AL = 7).
+
+        // Case A: the probe begins at 0xFFE and ends at 0x1000 (0xFFE + 2 == 0x1000) -> ALLOWED.
+        //   0xFFD: 40         INC AX
+        //   0xFFE: B0 07       MOV AL, 7   (ends exactly at 0x1000)
+        //   0x1000: F4         HLT
+        {
+            let mut memory = vec![0u8; 0x2000];
+            memory[0xffd] = 0x40; // INC AX
+            memory[0xffe] = 0xb0; // MOV AL,
+            memory[0xfff] = 0x07; //   7
+            memory[0x1000] = 0xf4; // HLT
+            let mut cpu = Cpu386::default();
+            cpu.load_segment_real(SegmentIndex::Cs, 0);
+            cpu.load_segment_real(SegmentIndex::Ds, 0);
+            cpu.load_segment_real(SegmentIndex::Ss, 0);
+            let mut bus = TestBus::with_memory(memory);
+
+            // Warm the decode cache for all three instructions so the only thing gating a continuation
+            // is the page check, not a cache miss.
+            cpu.registers.eip = 0xffd;
+            drive_straight_line_runs(&mut cpu, &mut bus);
+
+            // Run once from 0xFFD: INC is the run's first instruction, then the cached MOV AL,7 (ending
+            // exactly at 0x1000) runs as a continuation in the SAME run.
+            cpu.registers.eip = 0xffd;
+            cpu.registers.set_eax(0);
+            let outcome = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
+            assert!(!outcome.halted);
+            // The MOV ran as a continuation: AL == 7 and the run advanced past it (eip past 0x1000 is
+            // the HLT, which ends the run as a non-straight-line group, leaving eip at 0x1000).
+            assert_eq!(
+                cpu.read_reg16(Reg16::Ax) & 0xff,
+                7,
+                "MOV AL,7 ending at 0x1000 must run"
+            );
+            assert_eq!(
+                cpu.registers.eip, 0x1000,
+                "the run reached the HLT after the MOV"
+            );
+        }
+
+        // Case B: the probe begins at 0xFFF and ends at 0x1001 (0xFFF + 2 > 0x1000) -> CROSSES.
+        //   0xFFE: 40         INC AX
+        //   0xFFF: B0 07       MOV AL, 7   (straddles the page boundary)
+        //   0x1001: F4         HLT
+        {
+            let mut memory = vec![0u8; 0x2000];
+            memory[0xffd] = 0x40; // INC AX (warm anchor)
+            memory[0xffe] = 0x40; // INC AX
+            memory[0xfff] = 0xb0; // MOV AL,
+            memory[0x1000] = 0x07; //   7  (this byte is on the next page)
+            memory[0x1001] = 0xf4; // HLT
+            let mut cpu = Cpu386::default();
+            cpu.load_segment_real(SegmentIndex::Cs, 0);
+            cpu.load_segment_real(SegmentIndex::Ds, 0);
+            cpu.load_segment_real(SegmentIndex::Ss, 0);
+            let mut bus = TestBus::with_memory(memory);
+
+            // Warm all instructions (INC 0xFFD, INC 0xFFE, MOV 0xFFF, HLT 0x1001) into the cache.
+            cpu.registers.eip = 0xffd;
+            drive_straight_line_runs(&mut cpu, &mut bus);
+            assert!(
+                cpu.decode_cache.get(0xfff).is_some(),
+                "the page-crossing MOV must be cached, so only the page check can stop the run"
+            );
+
+            // Run once from 0xFFD: INC (0xFFD, first) + INC (0xFFE, continuation) run, then the cached
+            // MOV at 0xFFF is REJECTED by the page check (0xFFF + 2 > 0x1000) and the run STOPS there.
+            cpu.registers.eip = 0xffd;
+            cpu.registers.set_eax(0);
+            let outcome = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
+            assert!(!outcome.halted);
+            assert_eq!(cpu.read_reg16(Reg16::Ax), 2, "the two INCs ran");
+            assert_eq!(
+                cpu.read_reg16(Reg16::Ax) & 0xff,
+                2,
+                "the page-crossing MOV did NOT run in this call (AL is not 7)"
+            );
+            assert_eq!(
+                cpu.registers.eip, 0xfff,
+                "the run stopped at the page-crossing MOV"
+            );
+
+            // The crossing MOV runs correctly afterward through the normal path (first instruction of
+            // the next run, not subject to the continuation page check).
+            let outcome = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
+            assert!(!outcome.halted);
+            assert_eq!(
+                cpu.read_reg16(Reg16::Ax) & 0xff,
+                7,
+                "MOV AL,7 ran via the normal path"
+            );
+            assert_eq!(
+                cpu.registers.eip, 0x1001,
+                "eip advanced past the crossing MOV"
+            );
+        }
+    }
+
+    #[test]
+    fn straight_line_run_faults_on_cached_continuation_keeping_earlier_effects() {
+        // A fault raised by a CACHED straight-line instruction running as a continuation
+        // (run_one_cached) must route through the SAME tail the per-instruction path uses: a CPU-class
+        // fault (#DE divide-by-zero) propagates out of the run, and the earlier straight-line
+        // instruction's effects are kept. DIV is data-dependent, so it can be cached with a good
+        // divisor and then fault on a later run with a zero divisor - exactly the case where the
+        // faulting instruction is a valid cache hit (a delivered IVT exception would reload CS and
+        // flush the cache, so a register-input fault is the way to reach the cached-continuation path).
+        //
+        //   0x00: 40           INC AX     ; straight-line, runs before the DIV in the same run
+        //   0x01: F6 F3        DIV BL     ; AX / BL ; #DE when BL = 0
+        //   0x03: F4           HLT
+        let code = [
+            0x40, // INC AX
+            0xf6, 0xf3, // DIV BL
+            0xf4, // HLT
+        ];
+        let (mut cpu, memory) = real_mode_cpu(&code, 1024);
+        let mut bus = TestBus::with_memory(memory);
+
+        // Warming pass with a good divisor: AX = 11, BL = 2. This caches both INC and DIV in the live
+        // generation WITHOUT any fault (no CS reload, so the decode cache stays valid).
+        cpu.registers.set_eax(11);
+        cpu.write_reg16(Reg16::Bx, 0x0002);
+        drive_straight_line_runs(&mut cpu, &mut bus);
+        assert!(
+            cpu.decode_cache.get(0x01).is_some(),
+            "DIV must be cached after the warming pass"
+        );
+
+        // Now poke the divisor to 0 and run from the top: INC is the run's first instruction, then the
+        // CACHED DIV runs as a straight-line continuation and faults with #DE.
+        cpu.registers.eip = 0;
+        cpu.registers.set_eax(10);
+        cpu.write_reg16(Reg16::Bx, 0x0000);
+        let err = cpu.run_straight_line(&mut bus, u64::MAX).unwrap_err();
+        assert_eq!(
+            err,
+            CpuError::DivideError,
+            "the cached DIV continuation must propagate #DE"
+        );
+        // INC AX ran before the fault and its effect is kept (AX = 11).
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 11);
+    }
+
+    #[test]
+    fn straight_line_run_stops_before_control_flow_terminator() {
+        // The run must stop at a non-straight-line terminator (here a JMP), which then runs correctly
+        // through the normal single-instruction path on the next entry. INC AX (straight-line) runs,
+        // the JMP ends the run, and the target HLT halts.
+        //
+        //   0x00: 40           INC AX
+        //   0x01: 40           INC AX
+        //   0x02: EB 02        JMP +2 -> 0x06
+        //   0x04: 40           INC AX   (skipped by the jump)
+        //   0x05: 40           INC AX   (skipped)
+        //   0x06: F4           HLT
+        let code = [
+            0x40, // INC AX
+            0x40, // INC AX
+            0xeb, 0x02, // JMP +2 -> 0x06
+            0x40, // INC AX (skipped)
+            0x40, // INC AX (skipped)
+            0xf4, // HLT
+        ];
+        let (mut cpu, memory) = real_mode_cpu(&code, 1024);
+        let mut bus = TestBus::with_memory(memory);
+        drive_straight_line_runs(&mut cpu, &mut bus);
+        // Only the two INCs before the JMP ran; the jump skipped the two after it.
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 2);
+        assert_eq!(cpu.registers.eip, 0x07);
+    }
+
+    #[test]
+    fn straight_line_run_ends_on_port_io_step_break() {
+        // A port access (OUT) touches time-dependent device state, so the old per-instruction machine
+        // loop ended the step immediately after it (io_touched). The executor must do the same via
+        // bus.requires_step_break(): an OUT as the run's FIRST instruction ends the run after that one
+        // instruction, so the following straight-line INC does NOT run in the same call. Without the
+        // step-break the executor would keep going and the device boundary would drift.
+        //
+        //   0x00: E6 80   OUT 0x80, AL   ; PortIo -> sets io_touched
+        //   0x02: 40      INC AX         ; must NOT run in the same run as the OUT
+        //   0x03: F4      HLT
+        let code = [
+            0xe6, 0x80, // OUT 0x80, AL
+            0x40, // INC AX
+            0xf4, // HLT
+        ];
+        let (mut cpu, memory) = real_mode_cpu(&code, 1024);
+        let mut bus = TestBus::with_memory(memory);
+        let outcome = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
+        assert!(!outcome.halted);
+        // eip advanced past only the OUT (2 bytes); the run broke before the INC.
+        assert_eq!(cpu.registers.eip, 0x02);
+        // The INC did not run in this call, so AX is unchanged.
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0);
+        assert!(bus.io_touched, "the OUT must have touched device I/O");
     }
 
     /// Shared seed for the seam differential / golden batteries below: a fixed real-mode register
