@@ -1204,6 +1204,22 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_materializes_a_multi_cluster_file() {
+        // ~1200 bytes at 512-byte clusters spans 3 clusters (the last partially
+        // full), so this exercises the multi-cluster chain gather, the
+        // `capacity = clusters * cluster_bytes` math, and the `data.truncate(size)`
+        // that drops the final cluster's slack. A position-derived pattern makes a
+        // wrong offset or a mis-truncation obvious.
+        let (mut vol, root) = fresh_vol("rec_multiclu");
+        let free = vol.next_free;
+        let payload: Vec<u8> = (0..1200u32).map(|i| (i % 251) as u8).collect();
+        stamp_file(&mut vol, 2, "BIG.DAT", 0x20, free, &payload);
+        vol.reconcile();
+        assert_eq!(std::fs::read(root.join("BIG.DAT")).unwrap(), payload);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn reconcile_makes_a_subdir_and_a_file_inside_it() {
         let (mut vol, root) = fresh_vol("rec_mkdir");
         // MKDIR SUB: a directory entry in the root pointing at a fresh cluster.

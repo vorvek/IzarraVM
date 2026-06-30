@@ -3,10 +3,6 @@
 //! reconcile pass in `katea_tree.rs` can decide what finished files to mirror to
 //! the host folder. Everything here is pure except `atomic_write`.
 
-// Limit: every item here is consumed by `katea_tree::reconcile` (Task 5); until
-// that lands the module's only callers are its own tests.
-#![allow(dead_code)]
-
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
