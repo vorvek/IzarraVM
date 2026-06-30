@@ -950,6 +950,14 @@ mod tests {
             "LICENSE.TXT carries the full GPL text"
         );
 
+        // TOKAMOUS.COM ships as a synthesized binary; the default AUTOEXEC loads it.
+        assert!(by_name.contains_key("TOKAMOUS.COM"), "TOKAMOUS.COM present");
+        let autoexec = by_name.get("AUTOEXEC.BAT").expect("AUTOEXEC.BAT present");
+        assert!(
+            String::from_utf8_lossy(autoexec).contains("SET BLASTER=A220 I5 D1 H5 T6"),
+            "default AUTOEXEC advertises the Sound Blaster"
+        );
+
         // FreeDOS KERNEL.SYS is a raw binary, not an MZ: it begins with a short
         // JMP (0xEB) past the embedded BPB — the load-bearing first byte the boot
         // sector relies on.
