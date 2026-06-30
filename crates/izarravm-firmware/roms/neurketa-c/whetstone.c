@@ -164,7 +164,7 @@ int whet_main(void)
         }
 
         /* Module 7: trigonometric functions (temporaries keep the 8087 stack shallow) */
-        X = 1.0; Y = 1.0;
+        X = 0.5; Y = 0.5;
         for (I = 1; I <= N7; I++) {
             s = whet_sin(X); c = whet_cos(X);
             cxy = whet_cos(X + Y); cxmy = whet_cos(X - Y);
