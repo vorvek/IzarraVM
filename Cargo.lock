@@ -1639,7 +1639,6 @@ dependencies = [
  "izarravm-bus",
  "izarravm-core",
  "izarravm-cpu",
- "izarravm-dos",
  "izarravm-firmware",
  "izarravm-input",
  "izarravm-machine",

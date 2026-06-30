@@ -1481,6 +1481,58 @@ mod tokados_smoke {
         );
     }
 
+    /// Regression: with the full graphical POST (the GUI default), the BIOS leaves
+    /// the Margo linear framebuffer active. A real-MBR FreeDOS boot never sets a
+    /// video mode, so without the izbios mode-03h reset before the boot jump the
+    /// GUI stays frozen on the POST splash while the booted OS writes to the hidden
+    /// VGA text buffer. Boot a host folder with `set_fast_post(false)` (so the
+    /// graphical POST runs and activates Margo) and assert the display latch is
+    /// cleared — i.e. the BIOS handed the screen back to VGA text — by the C:\>
+    /// prompt. The headless `screen_text()` rasterizes the VGA core regardless of
+    /// the latch, so the `margo_active()` check (not the screen text) is what
+    /// guards the GUI-visible bug.
+    #[test]
+    #[ignore = "boots a full DOS image under the slow graphical POST; run with --ignored"]
+    fn katea_full_post_boot_hands_display_back_to_vga() {
+        let dir = std::env::temp_dir().join(format!(
+            "katea_fullpost_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        std::fs::write(dir.join("GREETING.TXT"), b"hi\r\n").expect("write host file");
+
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .expect("build machine");
+        // The GUI runs the full graphical POST, which lights the Margo LFB; headless
+        // defaults to fast POST (text only), so this is the path the e2e tests miss.
+        machine.set_fast_post(false);
+        machine.mount_hdd_folder(&dir).expect("mount host folder");
+        let stop = machine
+            .run_until_halt_or_cycles(600_000_000)
+            .expect("run machine");
+        let text = machine.screen_text().as_text().to_ascii_lowercase();
+        std::fs::remove_dir_all(&dir).ok();
+        if let StopReason::CpuError(msg) = &stop {
+            panic!("CPU fault during full-POST Katea boot: {msg}\n{text}");
+        }
+        assert!(
+            text.contains("c:\\>"),
+            "no C:\\> prompt after full-POST folder boot (stop={stop:?}).\n{text}"
+        );
+        assert!(
+            !machine.margo_active(),
+            "the BIOS must hand the display back to VGA text before booting; the \
+             Margo LFB is still active, so the GUI would show the frozen POST splash"
+        );
+    }
+
     /// The Katea-1 M1 boot-coherence gate: a host folder with a file *in a
     /// subfolder* boots the real FreeDOS kernel, the subfolder is navigable, and a
     /// file at depth reads lazily through the recursive tree facade. This is the
