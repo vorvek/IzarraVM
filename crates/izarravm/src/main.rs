@@ -1630,4 +1630,93 @@ echo deep>SUB\\DEEP.TXT\r\n";
             "SUB\\DEEP.TXT not created: {deep_txt:?}"
         );
     }
+
+    /// Katea-1 M3 gate: real FreeDOS deletes a file, renames a file in place, moves
+    /// a file into a subdir, RMDIRs an emptied dir, renames a subdir, and deletes a
+    /// PRE-EXISTING host file — all reflected in the host folder, read back.
+    #[test]
+    #[ignore = "boots a full DOS image and mutates host files via Katea (slow); run with --ignored"]
+    fn katea_host_folder_delete_rename_move_rmdir() {
+        let dir = std::env::temp_dir().join(format!(
+            "katea_m3_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let ops = dir.join("OPS");
+        std::fs::create_dir_all(ops.join("SUB")).expect("scratch tree");
+        std::fs::create_dir_all(ops.join("EMPTYDIR")).expect("emptydir");
+        std::fs::create_dir_all(ops.join("OLDDIR")).expect("olddir");
+        std::fs::write(ops.join("DELME.TXT"), b"delete me\r\n").unwrap();
+        std::fs::write(ops.join("KEEP.TXT"), b"rename me\r\n").unwrap();
+        std::fs::write(ops.join("MOVEME.TXT"), b"move me\r\n").unwrap();
+        std::fs::write(ops.join("PREEXIST.TXT"), b"existed first\r\n").unwrap();
+        // Only built-in FreeCOM commands (MOVE.EXE is not on the Katea C: drive —
+        // the boot payload carries only KERNEL/COMMAND/CONFIG/AUTOEXEC). The file
+        // move is COPY+DEL; the directory rename is REN, which this FreeCOM's
+        // cmd_rename accepts on directories (its findfirst mask includes FA_DIREC).
+        // Redirection/`\` chars are exact bytes in the batch so only letters are
+        // ever typed.
+        let ops_bat = b"del DELME.TXT\r\n\
+ren KEEP.TXT RENAMED.TXT\r\n\
+copy MOVEME.TXT SUB\\\r\n\
+del MOVEME.TXT\r\n\
+rmdir EMPTYDIR\r\n\
+ren OLDDIR NEWDIR\r\n\
+del PREEXIST.TXT\r\n";
+        std::fs::write(ops.join("OPS.BAT"), ops_bat).expect("seed OPS.BAT");
+
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .expect("build machine");
+        machine.mount_hdd_folder(&dir).expect("mount host folder");
+        let stop = machine
+            .run_until_halt_or_cycles(500_000_000)
+            .expect("run machine");
+        if let StopReason::CpuError(msg) = &stop {
+            let text = machine.screen_text().as_text();
+            std::fs::remove_dir_all(&dir).ok();
+            panic!("CPU fault during Katea M3 boot: {msg}\nstop={stop:?}\n{text}");
+        }
+        let boot_text = machine.screen_text().as_text().to_ascii_lowercase();
+        assert!(
+            boot_text.contains("c:\\>"),
+            "no C:\\> prompt (stop={stop:?}).\n{boot_text}"
+        );
+
+        for (cmd, settle) in [("cd ops\r", 40_000_000u64), ("ops\r", 150_000_000u64)] {
+            for ch in cmd.chars() {
+                for code in ascii_to_set1(ch) {
+                    machine.inject_key_scancodes(&[code]);
+                }
+                machine
+                    .run_until_halt_or_cycles(5_000_000)
+                    .expect("type cmd");
+            }
+            machine
+                .run_until_halt_or_cycles(settle)
+                .expect("settle cmd");
+        }
+        machine.flush_hdd_folder();
+
+        let exists = |p: std::path::PathBuf| p.exists();
+        let del_gone = !exists(ops.join("DELME.TXT"));
+        let renamed = exists(ops.join("RENAMED.TXT")) && !exists(ops.join("KEEP.TXT"));
+        let moved = exists(ops.join("SUB").join("MOVEME.TXT")) && !exists(ops.join("MOVEME.TXT"));
+        let rmdir_gone = !exists(ops.join("EMPTYDIR"));
+        let dir_renamed = exists(ops.join("NEWDIR")) && !exists(ops.join("OLDDIR"));
+        let preexist_gone = !exists(ops.join("PREEXIST.TXT"));
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(del_gone, "DELME.TXT not deleted");
+        assert!(renamed, "KEEP.TXT not renamed to RENAMED.TXT");
+        assert!(moved, "MOVEME.TXT not moved into SUB");
+        assert!(rmdir_gone, "EMPTYDIR not removed");
+        assert!(dir_renamed, "OLDDIR not renamed to NEWDIR");
+        assert!(preexist_gone, "pre-existing PREEXIST.TXT not deleted");
+    }
 }
