@@ -864,6 +864,8 @@ fn emulate(
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
+                    // Channel closed (the GUI dropped the sender on exit) — same
+                    // flush sequence as Shutdown before the thread ends.
                     machine.flush_hdd_folder();
                     flush_floppy(&mut machine, &mut floppy_flush_path);
                     crate::cmos::save_cmos_file(&cmos_path, &machine.cmos_bytes());
