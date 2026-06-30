@@ -19759,6 +19759,13 @@ mod tests {
             .find(|(n, _)| n.eq_ignore_ascii_case("autoexec.bat"))
             .unwrap();
         assert_eq!(autoexec.1, b"new");
+        // A replace updates bytes in place but keeps the original key's case
+        // (KateaTreeVolume folds names case-insensitively, so the stored case is
+        // cosmetic — pinned here so the intent is explicit).
+        assert_eq!(
+            autoexec.0, "AUTOEXEC.BAT",
+            "original key case preserved on replace"
+        );
         assert!(base.iter().any(|(n, b)| n == "KERNEL.SYS" && b == b"k"));
         assert!(base.iter().any(|(n, b)| n == "RUNNER.COM" && b == b"r"));
         assert_eq!(base.len(), 3, "one replace + one append");
