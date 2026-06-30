@@ -1037,6 +1037,9 @@ pub struct Machine {
     pending_toka_service: Option<u8>,
     toka_service_status: u8,
     toka_c_root: Option<std::path::PathBuf>, // host C: root for Repair/Format
+    /// The host folder backing the Katea C: drive (set by `mount_hdd_folder`), so
+    /// the BIOS "Repair Toka-DOS" service can reset CONFIG.SYS/AUTOEXEC.BAT on it.
+    katea_root: Option<std::path::PathBuf>,
     // True while a CallDevice service is on the CPU. A driver running on the
     // borrowed context can issue INT 21h AH=3Fh/40h on a device handle, which
     // would re-enter the same fixed request packet at DEVICE_REQUEST_SCRATCH and
@@ -1371,6 +1374,64 @@ fn device_request_packet_len(command: u8) -> u8 {
     }
 }
 
+/// Files that are NOT overlaid in user-folder mode: the demo file and the two
+/// config files the user owns on C:.
+const USER_OWNED_OR_DEMO: &[&str] = &["HELLO.TXT", "CONFIG.SYS", "AUTOEXEC.BAT"];
+
+/// The payload files overlaid in user-folder mode: the binaries (KERNEL.SYS,
+/// COMMAND.COM, LICENSE.TXT, TOKAMOUS.COM) but not the demo file or the user's
+/// CONFIG.SYS/AUTOEXEC.BAT.
+fn user_folder_overlay(files: Vec<(String, Vec<u8>)>) -> Vec<(String, Vec<u8>)> {
+    files
+        .into_iter()
+        .filter(|(name, _)| {
+            !USER_OWNED_OR_DEMO
+                .iter()
+                .any(|d| name.eq_ignore_ascii_case(d))
+        })
+        .collect()
+}
+
+/// Seed `CONFIG.SYS`/`AUTOEXEC.BAT` into a host folder if they are absent, so the
+/// user always has real, editable copies. Existing files are left untouched (the
+/// user owns them). Case-insensitive on Windows, the supported host.
+fn ensure_user_config(
+    dir: &std::path::Path,
+    config: &[u8],
+    autoexec: &[u8],
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    if !dir.join("CONFIG.SYS").exists() {
+        std::fs::write(dir.join("CONFIG.SYS"), config)?;
+    }
+    if !dir.join("AUTOEXEC.BAT").exists() {
+        std::fs::write(dir.join("AUTOEXEC.BAT"), autoexec)?;
+    }
+    Ok(())
+}
+
+/// A payload file's bytes by 8.3 name. Panics if absent: the image is a committed
+/// compile-time binary, so a missing system file is a build defect, not a runtime
+/// condition (matches `extract_system_payload`'s panic-on-corrupt style).
+fn payload_file(payload: &katea_volume::SystemPayload, name: &str) -> Vec<u8> {
+    payload
+        .files
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|(_, b)| b.clone())
+        .unwrap_or_else(|| panic!("katea: {name} missing from the committed image payload"))
+}
+
+/// The default `(CONFIG.SYS, AUTOEXEC.BAT)` bytes from the committed image payload
+/// — used by Repair, which has no `payload` already in scope.
+fn default_config_pair() -> (Vec<u8>, Vec<u8>) {
+    let payload = katea_volume::extract_system_payload(izarravm_firmware::tokados_hdd_img());
+    (
+        payload_file(&payload, "CONFIG.SYS"),
+        payload_file(&payload, "AUTOEXEC.BAT"),
+    )
+}
+
 /// Merge `overrides` into a system-file list: replace an existing entry whose name
 /// matches case-insensitively, else append. Used to overlay a runner AUTOEXEC.BAT +
 /// extra tools onto the standard Katea payload.
@@ -1457,6 +1518,7 @@ impl Machine {
             pending_toka_service: None,
             toka_service_status: 0,
             toka_c_root: None,
+            katea_root: None,
             in_device_call: false,
             dos_screen_shown: 0,
             dos: izarravm_dos::DosKernel::default(),
@@ -1764,11 +1826,28 @@ impl Machine {
         Ok(())
     }
 
-    /// Mount a host folder as C: through Katea with the standard payload only.
-    /// See [`mount_hdd_folder_with`](Self::mount_hdd_folder_with) to overlay extra
-    /// system files (e.g. a custom AUTOEXEC.BAT or runner tool).
+    /// Mount a host folder as C: through Katea in "user-folder mode": seed the
+    /// default CONFIG.SYS/AUTOEXEC.BAT into `dir` if missing, then overlay only the
+    /// OS binaries so the host folder's config files are authoritative (the user
+    /// owns them). The GUI and `--hdd-folder` use this. For the override mode (a
+    /// throwaway runner disk) see [`mount_hdd_folder_with`](Self::mount_hdd_folder_with).
     pub fn mount_hdd_folder(&mut self, dir: &std::path::Path) -> std::io::Result<()> {
-        self.mount_hdd_folder_with(dir, Vec::new())
+        let payload = katea_volume::extract_system_payload(izarravm_firmware::tokados_hdd_img());
+        // Seed the user-owned config from the payload we already hold (parse the
+        // image once), before `user_folder_overlay` below consumes `payload.files`.
+        ensure_user_config(
+            dir,
+            &payload_file(&payload, "CONFIG.SYS"),
+            &payload_file(&payload, "AUTOEXEC.BAT"),
+        )?;
+        let system_files = user_folder_overlay(payload.files);
+        let volume =
+            katea_tree::KateaTreeVolume::new(&payload.mbr, &payload.vbr, dir, &system_files)?;
+        self.ata = Some(ata::AtaDisk::from_host_folder(volume));
+        self.katea_root = Some(dir.to_path_buf());
+        let _ = self.publish_fixed_disk_parameter_table();
+        let _ = self.memory.write_u8(0x475, 1); // BDA fixed-disk count
+        Ok(())
     }
 
     /// Mount a synthesized FAT32 volume as drive C: for the DOS absolute-disk
@@ -9346,27 +9425,49 @@ impl Machine {
         self.toka_c_root = Some(root);
     }
 
-    /// Perform a Toka-DOS service requested through Lotura port 0xE3, recording
-    /// the status the BIOS reads back. Called from the run loop after the cycle
-    /// that issued the OUT, since the work needs host filesystem and memory.
+    /// Perform a Toka-DOS service requested through Lotura port 0xE3, recording the
+    /// status the BIOS reads back. Cmd 0x01 (Repair Toka-DOS) resets the Katea host
+    /// folder's CONFIG.SYS/AUTOEXEC.BAT; 0x10 is the legacy HLE C: boot shim (reached
+    /// only when Katea is not mounted; removed with the HLE in SP-3).
     fn perform_toka_service(&mut self, command: u8) {
         self.toka_service_status = match command {
-            0x01 => self.toka_install_files(izarravm_dos::InstallMode::Repair),
-            0x02 => self.toka_install_files(izarravm_dos::InstallMode::Format),
+            0x01 => self.katea_repair(),
             0x10 => self.toka_load_boot_record(),
             _ => 0xff,
         };
     }
 
-    fn toka_install_files(&mut self, mode: izarravm_dos::InstallMode) -> u8 {
-        let Some(root) = self.toka_c_root.clone() else {
-            return 1; // no C: root known
+    /// Repair Toka-DOS: back the user's CONFIG.SYS/AUTOEXEC.BAT up to .OLD, write
+    /// fresh defaults from the committed payload, and re-mount so the boot uses
+    /// them. Returns the BIOS status (0 ok, 1 no Katea folder, 0xfe write/mount error).
+    fn katea_repair(&mut self) -> u8 {
+        let Some(root) = self.katea_root.clone() else {
+            return 1; // no Katea host folder mounted
         };
-        let files = izarravm_firmware::toka_dos_system_files();
-        match izarravm_dos::toka_dos_install(&root, &files, mode) {
-            Ok(()) => 0,
-            Err(_) => 0xfe,
+        let (config, autoexec) = default_config_pair();
+        // Per-file, not atomic across the two: if AUTOEXEC's write fails after
+        // CONFIG was already rewritten, the folder is left half-repaired (default
+        // CONFIG, no live AUTOEXEC). No data is lost — both originals survive in
+        // their .OLD — and 0xfe tells the user it failed; Repair is a rare manual
+        // recovery, so the simple sequence is acceptable.
+        for (live_name, old_name, bytes) in [
+            ("CONFIG.SYS", "CONFIG.OLD", &config),
+            ("AUTOEXEC.BAT", "AUTOEXEC.OLD", &autoexec),
+        ] {
+            let live = root.join(live_name);
+            if live.exists() {
+                // Best-effort backup (std::fs::rename replaces an existing .OLD on Windows).
+                let _ = std::fs::rename(&live, root.join(old_name));
+            }
+            if std::fs::write(&live, bytes).is_err() {
+                return 0xfe;
+            }
         }
+        // Rebuild the volume from the repaired folder so the subsequent boot reads it.
+        if self.mount_hdd_folder(&root).is_err() {
+            return 0xfe;
+        }
+        0
     }
 
     /// Place the Toka-DOS boot record (TOKABOOT) at 0x7C00 and set up the DOS
@@ -19816,10 +19917,63 @@ mod tests {
     }
 
     #[test]
+    fn ensure_user_config_seeds_missing_files_only() {
+        let dir = std::env::temp_dir().join(format!("katea_cfg_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A user-owned AUTOEXEC stays; a missing CONFIG.SYS is seeded.
+        std::fs::write(dir.join("AUTOEXEC.BAT"), b"@ECHO OFF\r\nMYGAME\r\n").unwrap();
+        super::ensure_user_config(&dir, b"FILES=40\r\n", b"@ECHO OFF\r\nDEFAULT\r\n").unwrap();
+        assert_eq!(
+            std::fs::read(dir.join("AUTOEXEC.BAT")).unwrap(),
+            b"@ECHO OFF\r\nMYGAME\r\n",
+            "the user's AUTOEXEC must not be overwritten"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("CONFIG.SYS")).unwrap(),
+            b"FILES=40\r\n",
+            "a missing CONFIG.SYS is seeded with the default"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn user_folder_overlay_keeps_binaries_drops_config() {
+        let payload = vec![
+            ("KERNEL.SYS".to_string(), vec![1u8]),
+            ("COMMAND.COM".to_string(), vec![2u8]),
+            ("CONFIG.SYS".to_string(), vec![3u8]),
+            ("AUTOEXEC.BAT".to_string(), vec![4u8]),
+            ("HELLO.TXT".to_string(), vec![5u8]),
+            ("LICENSE.TXT".to_string(), vec![6u8]),
+            ("TOKAMOUS.COM".to_string(), vec![7u8]),
+        ];
+        let names: Vec<String> = super::user_folder_overlay(payload)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert!(names.contains(&"KERNEL.SYS".to_string()));
+        assert!(names.contains(&"TOKAMOUS.COM".to_string()));
+        assert!(names.contains(&"LICENSE.TXT".to_string()));
+        assert!(
+            !names.contains(&"CONFIG.SYS".to_string()),
+            "config is the user's"
+        );
+        assert!(
+            !names.contains(&"AUTOEXEC.BAT".to_string()),
+            "autoexec is the user's"
+        );
+        assert!(
+            !names.contains(&"HELLO.TXT".to_string()),
+            "demo file dropped"
+        );
+    }
+
+    #[test]
     fn flush_hdd_folder_runs_a_final_reconcile() {
         // Mount a temp folder, then flush; confirm flush is callable and a no-op on
-        // an unwritten folder (creates nothing). The end-to-end create/overwrite/grow
-        // is covered by the e2e smoke test; this only proves the plumbing exists.
+        // an unwritten folder (creates nothing beyond the config mount seeds). The
+        // end-to-end create/overwrite/grow is covered by the e2e smoke test; this
+        // only proves the plumbing exists.
         let dir = std::env::temp_dir().join(format!("katea_flush_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -19829,10 +19983,25 @@ mod tests {
         )
         .unwrap();
         m.mount_hdd_folder(&dir).unwrap();
+        // mount_hdd_folder seeds the user-owned CONFIG.SYS/AUTOEXEC.BAT.
+        let listing = |dir: &std::path::Path| -> std::collections::BTreeSet<String> {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect()
+        };
+        let after_mount = listing(&dir);
+        assert!(
+            after_mount.contains("CONFIG.SYS") && after_mount.contains("AUTOEXEC.BAT"),
+            "mount seeds the user-owned config"
+        );
         m.flush_hdd_folder();
-        // With nothing written, no spurious files are created.
-        let count = std::fs::read_dir(&dir).unwrap().count();
-        assert_eq!(count, 0, "flush on an unwritten folder creates nothing");
+        // With nothing written by the guest, flush creates nothing new.
+        assert_eq!(
+            listing(&dir),
+            after_mount,
+            "flush on an unwritten folder creates nothing beyond the seed"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -28764,7 +28933,7 @@ mod tests {
     }
 
     #[test]
-    fn toka_service_port_formats_drive_and_loads_boot_record() {
+    fn toka_service_port_loads_boot_record() {
         let dir = tempfile::tempdir().unwrap();
         let mut machine = test_machine();
         machine.set_toka_c_root(dir.path().to_path_buf());
@@ -28776,17 +28945,15 @@ mod tests {
         });
         assert_eq!(machine.pending_toka_service, Some(0x02));
 
-        // Format installs the Toka-DOS system files onto C:.
+        // Unknown command (Format was removed — Katea makes OS binaries un-corruptible).
         machine.perform_toka_service(0x02);
-        assert_eq!(machine.toka_service_status, 0);
-        assert!(dir.path().join("DOS").join("IZCMD.COM").exists());
-        assert!(!dir.path().join("IZCMD.COM").exists());
-        let status = with_bus(&mut machine, |bus| {
-            bus.read_io(0x00e3, BusWidth::Byte).unwrap() as u8
-        });
-        assert_eq!(status, 0);
+        assert_eq!(machine.toka_service_status, 0xff);
 
         // LoadBootRecord places TOKABOOT at 0x7C00 and wires the DOS return path.
+        // Pre-populate the expected HLE C: structure so LoadBootRecord succeeds.
+        let dos_dir = dir.path().join("DOS");
+        std::fs::create_dir_all(&dos_dir).unwrap();
+        std::fs::write(dos_dir.join("IZCMD.COM"), b"\x90").unwrap();
         machine.perform_toka_service(0x10);
         assert_eq!(machine.toka_service_status, 0);
         let boot = izarravm_firmware::toka_boot_record().unwrap();
@@ -28804,6 +28971,38 @@ mod tests {
             machine.read_physical_u8(BIOS_IRET_STUB_ADDRESS as u32),
             0xcf
         );
+    }
+
+    #[test]
+    fn repair_backs_up_and_rewrites_config() {
+        let dir = std::env::temp_dir().join(format!("katea_repair_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A user who broke their config.
+        std::fs::write(dir.join("CONFIG.SYS"), b"GARBAGE\r\n").unwrap();
+        std::fs::write(dir.join("AUTOEXEC.BAT"), b"BROKEN\r\n").unwrap();
+
+        let mut m = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .unwrap();
+        m.mount_hdd_folder(&dir).unwrap(); // sets katea_root
+        m.perform_toka_service(0x01); // Repair Toka-DOS
+
+        assert_eq!(
+            std::fs::read(dir.join("CONFIG.OLD")).unwrap(),
+            b"GARBAGE\r\n"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("AUTOEXEC.OLD")).unwrap(),
+            b"BROKEN\r\n"
+        );
+        let autoexec = std::fs::read(dir.join("AUTOEXEC.BAT")).unwrap();
+        assert!(
+            String::from_utf8_lossy(&autoexec).contains("SET BLASTER=A220 I5 D1 H5 T6"),
+            "Repair rewrote the default AUTOEXEC"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Publish the DOS device chain through an AH=52h query and report whether a

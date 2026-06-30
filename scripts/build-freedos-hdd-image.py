@@ -149,11 +149,18 @@ def main():
     assert len(vbr) == 512, "FAT32 VBR must be 512 bytes"
     kernel = open(os.path.join(kdir, "bin", "kernel.sys"), "rb").read()
     shell = open(os.path.join(fcdir, "command.com"), "rb").read()
+    tokamous = open(
+        os.path.join(repo, "toka-dos", "build-freedos-tokamous.com"), "rb"
+    ).read()
 
     # CONFIG.SYS / AUTOEXEC point at C: (the HDD), unlike the A: floppy variant.
     config_sys = (b"FILES=40\r\nLASTDRIVE=Z\r\n"
                   b"SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n")
-    autoexec = b"@ECHO OFF\r\nPROMPT $P$G\r\n"
+    # Defaults the user owns (mount_hdd_folder seeds these if missing). SET BLASTER
+    # advertises the emulated SB16 (base 0x220, IRQ5, DMA1, high DMA5, type 6 SB16);
+    # no P (MPU-401) param -- no MPU is emulated. TOKAMOUS loads the INT 33h mouse.
+    autoexec = (b"@ECHO OFF\r\nPROMPT $P$G\r\n"
+                b"SET BLASTER=A220 I5 D1 H5 T6\r\nTOKAMOUS\r\n")
     hello_txt = b"Katea M0 OK\r\n"
     # The kernel signon points at "See C:\\LICENSE.TXT for more."; ship it on C:.
     license_txt = build_license_txt(repo)
@@ -203,6 +210,7 @@ def main():
         ("COMMAND.COM", shell),
         ("CONFIG.SYS", config_sys),
         ("AUTOEXEC.BAT", autoexec),
+        ("TOKAMOUS.COM", tokamous),
         ("HELLO.TXT", hello_txt),
         ("LICENSE.TXT", license_txt),
     ]
@@ -216,7 +224,7 @@ def main():
             c = start + i
             fat[c] = FAT32_EOC if i == nclu - 1 else c + 1
 
-    # Root directory occupies cluster 2 (one cluster is plenty for 5 entries).
+    # Root directory occupies cluster 2 (one cluster is plenty for 7 entries).
     fat[ROOT_CLUSTER] = FAT32_EOC
     next_free = ROOT_CLUSTER + 1
     root = bytearray()
@@ -272,7 +280,7 @@ def main():
     print(f"tokados-hdd.img: {len(img)} bytes "
           f"(part_start={PART_START}, part_sectors={PART_SECTORS}, "
           f"spc={spc}, fatsz={fatsz}, clusters={count_of_clusters}, "
-          f"kernel={len(kernel)}, shell={len(shell)})")
+          f"kernel={len(kernel)}, shell={len(shell)}, tokamous={len(tokamous)})")
 
 
 if __name__ == "__main__":
