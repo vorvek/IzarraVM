@@ -14594,7 +14594,7 @@ mod tests {
         // a speed calibration spins forever (TSUMERA's setup does exactly that).
         static PROG: &[u8] = &[0xeb, 0xfe]; // JMP $ - we only need a machine to run.
         let mut m =
-            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), PROG)
+            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), PROG)
                 .unwrap();
         fn latched_count(m: &mut Machine) -> u16 {
             let mut bus = m.make_bus();
@@ -14608,7 +14608,7 @@ mod tests {
         let after = latched_count(&mut m);
         assert_ne!(
             before, after,
-            "PIT counter 0 must advance after new_dos_program (POST-equivalent timer setup)"
+            "PIT counter 0 must advance after new_raw_program (POST-equivalent timer setup)"
         );
     }
 
@@ -15794,7 +15794,7 @@ mod tests {
         assert_eq!(m.cpu.registers.eax() as u16, 1);
         assert_eq!(m.read_physical_u8(0x5000), b'R');
 
-        m.set_dos_stdin(b"k");
+        m.set_program_stdin(b"k");
         m.cpu.registers.set_eax(0x0D00);
         m.handle_int14();
         assert_eq!(m.cpu.registers.eax() as u16, b'k' as u16);
@@ -15967,7 +15967,7 @@ mod tests {
         // activity. Both spin on JMP $ so the short run never reaches a HLT or a timer interrupt.
         fn gen_after_running(program: &[u8]) -> (bool, u32, u32) {
             let mut m =
-                Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), program)
+                Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), program)
                     .unwrap();
             let before = m.cpu.decode_cache_generation();
             m.run_until_halt_or_cycles(1000).unwrap();
@@ -17659,7 +17659,7 @@ mod tests {
         // mov ah,0; int 16h; mov [0x200],ax; int 20h
         const PROG: [u8; 9] = [0xB4, 0x00, 0xCD, 0x16, 0xA3, 0x00, 0x02, 0xCD, 0x20];
         let mut machine =
-            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
+            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
                 .unwrap();
         machine.write_physical_u8(0x0496, layout);
         machine.inject_key_scancodes(scancodes);
@@ -17673,7 +17673,7 @@ mod tests {
 
     fn int16_peek_guest_exit(scancodes: &[u8], prog: &[u8]) -> StopReason {
         let mut machine =
-            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), prog)
+            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), prog)
                 .unwrap();
         machine.inject_key_scancodes(scancodes);
         machine.run_until_halt_or_cycles(1_000_000).unwrap()
@@ -17835,7 +17835,7 @@ mod tests {
         // mov ah,0x10; int 16h; mov [0x200],ax; int 20h
         const PROG: [u8; 9] = [0xB4, 0x10, 0xCD, 0x16, 0xA3, 0x00, 0x02, 0xCD, 0x20];
         let mut machine =
-            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
+            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
                 .unwrap();
         machine.inject_key_scancodes(scancodes);
         machine.run_until_halt_or_cycles(3_000_000).unwrap();
@@ -17860,7 +17860,7 @@ mod tests {
             0xb8, 0x01, 0x04, 0xcd, 0x16, 0xc7, 0x06, 0x00, 0x02, 0x34, 0x12, 0xcd, 0x20,
         ];
         let mut machine =
-            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
+            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
                 .unwrap();
         machine.run_until_halt_or_cycles(100_000).unwrap();
         assert_eq!(
@@ -17919,7 +17919,7 @@ mod tests {
     fn refurnishing_resets_the_upper_arena_like_a_warm_reboot() {
         const PROG: [u8; 2] = [0xCD, 0x20]; // int 20h
         let mut machine =
-            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
+            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
                 .unwrap();
         let base = (0xc800u32 << 4) as usize;
         // Dirty the pool the way a prior session would: an owned (non-free) block at
@@ -18009,7 +18009,7 @@ mod tests {
     fn config_sys_knobs_repartition_ems_and_place_the_frame() {
         const PROG: [u8; 2] = [0xCD, 0x20];
         let mut machine =
-            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
+            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
                 .unwrap();
 
         machine
@@ -18042,7 +18042,7 @@ mod tests {
         const PROG: [u8; 2] = [0xCD, 0x20];
         // Construct in RAM mode (EMS provisioned, frame reserved).
         let mut machine =
-            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
+            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
                 .unwrap();
         assert!(machine.ems.is_some(), "RAM provisions EMS at construction");
 
@@ -18090,7 +18090,7 @@ mod tests {
     fn re_applying_the_same_mode_preserves_live_xms_allocations() {
         const PROG: [u8; 2] = [0xCD, 0x20];
         let mut m =
-            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
+            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
                 .unwrap();
         // A guest allocates a 64 KB XMS EMB (AH=09h).
         m.cpu.registers.set_eax(0x0900);
@@ -18211,7 +18211,7 @@ mod tests {
         const PROG: [u8; 2] = [0xCD, 0x20]; // int 20h
         let mut p = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         p.emm386 = Emm386Mode::Ram;
-        let mut machine = Machine::new_dos_program(p, &PROG).unwrap();
+        let mut machine = Machine::new_raw_program(p, &PROG).unwrap();
         // Allocate two pages and map logical page 0 into physical slot 0 (the frame
         // base, 0xE0000).
         let handle = {
@@ -18247,7 +18247,7 @@ mod tests {
         const PROG: [u8; 2] = [0xCD, 0x20];
         let mut p = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         p.emm386 = Emm386Mode::Ram;
-        let mut machine = Machine::new_dos_program(p, &PROG).unwrap();
+        let mut machine = Machine::new_raw_program(p, &PROG).unwrap();
         let handle = machine.ems.as_mut().unwrap().allocate(1).unwrap();
         // Source bytes in conventional memory at 0x10000 (segment 0x1000:0).
         for (i, byte) in [0xDE, 0xAD, 0xBE, 0xEF].iter().enumerate() {
@@ -18288,7 +18288,7 @@ mod tests {
         const PROG: [u8; 2] = [0xCD, 0x20];
         let mut p = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         p.emm386 = Emm386Mode::Ram;
-        let mut machine = Machine::new_dos_program(p, &PROG).unwrap();
+        let mut machine = Machine::new_raw_program(p, &PROG).unwrap();
         let handle = machine.ems.as_mut().unwrap().allocate(1).unwrap();
         // A descriptor whose region length is far over 1 MiB. The validation must
         // reject it (96h) before allocating a buffer, not try to allocate ~4 GiB.
@@ -18317,7 +18317,7 @@ mod tests {
         const PROG: [u8; 2] = [0xCD, 0x20];
         let mut p = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         p.emm386 = Emm386Mode::Ram;
-        let mut machine = Machine::new_dos_program(p, &PROG).unwrap();
+        let mut machine = Machine::new_raw_program(p, &PROG).unwrap();
         let handle = machine.ems.as_mut().unwrap().allocate(1).unwrap();
 
         machine.cpu.registers.set_eax(0x5200);
@@ -18351,7 +18351,7 @@ mod tests {
         const PROG: [u8; 2] = [0xCD, 0x20];
         let mut p = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         p.emm386 = Emm386Mode::Ram;
-        let mut machine = Machine::new_dos_program(p, &PROG).unwrap();
+        let mut machine = Machine::new_raw_program(p, &PROG).unwrap();
         let first = machine.ems.as_mut().unwrap().allocate(1).unwrap();
         let second = machine.ems.as_mut().unwrap().allocate(2).unwrap();
         machine
@@ -18405,7 +18405,7 @@ mod tests {
         const PROG: [u8; 2] = [0xCD, 0x20];
         let mut p = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         p.emm386 = Emm386Mode::Ram;
-        let mut machine = Machine::new_dos_program(p, &PROG).unwrap();
+        let mut machine = Machine::new_raw_program(p, &PROG).unwrap();
         let (free, total) = machine.ems.as_ref().unwrap().page_counts();
 
         machine.cpu.registers.set_eax(0x5901);
@@ -18475,7 +18475,7 @@ mod tests {
         const PROG: [u8; 2] = [0xCD, 0x20];
         let mut p = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         p.emm386 = Emm386Mode::Ram;
-        let mut machine = Machine::new_dos_program(p, &PROG).unwrap();
+        let mut machine = Machine::new_raw_program(p, &PROG).unwrap();
 
         for ax in [
             0x4900, 0x4a00, 0x4e00, 0x4f00, 0x5500, 0x5600, 0x6100, 0x6a00,
@@ -18557,7 +18557,7 @@ mod tests {
         const PROG: [u8; 2] = [0xCD, 0x20];
         let mut p = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         p.emm386 = Emm386Mode::NoEms;
-        let mut machine = Machine::new_dos_program(p, &PROG).unwrap();
+        let mut machine = Machine::new_raw_program(p, &PROG).unwrap();
         let ems = machine
             .ems
             .as_ref()
@@ -18637,7 +18637,7 @@ mod tests {
         const PROG: [u8; 2] = [0xCD, 0x20];
         let mut p = MachineProfile::gsw_386(16, VideoCard::Et4000Ax);
         p.emm386 = Emm386Mode::Unloaded;
-        let mut machine = Machine::new_dos_program(p, &PROG).unwrap();
+        let mut machine = Machine::new_raw_program(p, &PROG).unwrap();
         assert!(machine.ems.is_none(), "HIMEM-only provisions no manager");
         machine.make_bus().interrupt_acknowledge(0x67, 0).unwrap();
         assert_eq!(
@@ -24752,11 +24752,11 @@ mod tests {
             b'$',
         ];
         let mut machine =
-            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
+            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
                 .unwrap();
         let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
         assert_eq!(reason, StopReason::DosExit { code: 0 });
-        assert_eq!(machine.dos_output(), b"Hi");
+        assert_eq!(machine.program_output(), b"Hi");
     }
 
     #[test]
@@ -24764,11 +24764,11 @@ mod tests {
         // org 0x100: mov ax,4c07; int 21
         let com: &[u8] = &[0xb8, 0x07, 0x4c, 0xcd, 0x21];
         let mut machine =
-            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
+            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
                 .unwrap();
         let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
         assert_eq!(reason, StopReason::DosExit { code: 7 });
-        assert!(machine.dos_output().is_empty());
+        assert!(machine.program_output().is_empty());
     }
 
     #[test]
@@ -25070,14 +25070,14 @@ mod tests {
 
     #[test]
     fn dos_com_runs_the_committed_hello_fixture() {
-        let mut machine = Machine::new_dos_program(
+        let mut machine = Machine::new_raw_program(
             MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
             izarravm_firmware::HELLO_COM,
         )
         .unwrap();
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
         assert_eq!(reason, StopReason::DosExit { code: 0 });
-        assert_eq!(machine.dos_output(), b"Hello, world!\r\n");
+        assert_eq!(machine.program_output(), b"Hello, world!\r\n");
     }
 
     #[test]
@@ -25086,14 +25086,17 @@ mod tests {
         // prints via AH=09h. Correct output is only possible if load_exe applied
         // the relocation (otherwise DS is the link-time base and the bytes
         // diverge), so this doubles as the end-to-end relocation check.
-        let mut machine = Machine::new_dos_program(
+        let mut machine = Machine::new_raw_program(
             MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
             izarravm_firmware::EXEHELLO_EXE,
         )
         .unwrap();
         let reason = machine.run_until_halt_or_cycles(1_000_000).unwrap();
         assert_eq!(reason, StopReason::DosExit { code: 0 });
-        assert_eq!(machine.dos_output(), b"Hello from a relocated .EXE!\r\n");
+        assert_eq!(
+            machine.program_output(),
+            b"Hello from a relocated .EXE!\r\n"
+        );
     }
 
     #[test]
@@ -25107,23 +25110,23 @@ mod tests {
         ];
 
         let mut available =
-            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
+            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
                 .unwrap();
-        available.set_dos_stdin(b"X");
+        available.set_program_stdin(b"X");
         assert_eq!(
             available.run_until_halt_or_cycles(100_000).unwrap(),
             StopReason::DosExit { code: 0 }
         );
-        assert_eq!(available.dos_output(), b"X"); // char path taken, AL echoed
+        assert_eq!(available.program_output(), b"X"); // char path taken, AL echoed
 
         let mut empty =
-            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
+            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
                 .unwrap();
         assert_eq!(
             empty.run_until_halt_or_cycles(100_000).unwrap(),
             StopReason::DosExit { code: 0 }
         );
-        assert_eq!(empty.dos_output(), b"!"); // empty path taken (ZF=1)
+        assert_eq!(empty.program_output(), b"!"); // empty path taken (ZF=1)
     }
 
     #[test]
@@ -25133,14 +25136,14 @@ mod tests {
             0xb4, 0x01, 0xcd, 0x21, 0xb4, 0x01, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21,
         ];
         let mut machine =
-            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
+            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
                 .unwrap();
-        machine.set_dos_stdin(b"hi");
+        machine.set_program_stdin(b"hi");
         assert_eq!(
             machine.run_until_halt_or_cycles(100_000).unwrap(),
             StopReason::DosExit { code: 0 }
         );
-        assert_eq!(machine.dos_output(), b"hi");
+        assert_eq!(machine.program_output(), b"hi");
     }
 
     #[test]
@@ -29163,7 +29166,7 @@ mod tests {
         // A trivial exit-only program is enough: the env is seeded at load.
         let com: &[u8] = &[0xb8, 0x00, 0x4c, 0xcd, 0x21];
         let machine =
-            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
+            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
                 .unwrap();
         let env_seg = psp_env_segment(&machine);
         assert_ne!(env_seg, 0, "PSP:0x2C must name the env segment");
@@ -29214,7 +29217,7 @@ mod tests {
             dma: SbDma8::D3,
             high_dma: SbDma16::D5,
         };
-        let machine = Machine::new_dos_program(profile, &[0xb8, 0x00, 0x4c, 0xcd, 0x21]).unwrap();
+        let machine = Machine::new_raw_program(profile, &[0xb8, 0x00, 0x4c, 0xcd, 0x21]).unwrap();
         let env_seg = psp_env_segment(&machine);
         assert_ne!(env_seg, 0, "PSP:0x2C must name the env segment");
         assert_eq!(
@@ -29268,7 +29271,7 @@ mod tests {
         // org 0x100: jmp $  (EB FE)
         let com: &[u8] = &[0xeb, 0xfe];
         let mut machine =
-            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
+            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
                 .unwrap();
         machine.inject_key_scancodes(&[0x1e, 0x9e]); // 'a' make + break
         machine.run_until_halt_or_cycles(200_000).unwrap();
@@ -29286,20 +29289,20 @@ mod tests {
             0xb4, 0x01, 0xcd, 0x21, 0xb4, 0x01, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21,
         ];
         let mut machine =
-            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
+            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), com)
                 .unwrap();
         // Type 'h' then 'i' as Set 1 make+break (H=0x23, I=0x17).
         machine.inject_key_scancodes(&[0x23, 0xa3, 0x17, 0x97]);
         let reason = machine.run_until_halt_or_cycles(2_000_000).unwrap();
         assert_eq!(reason, StopReason::DosExit { code: 0 });
-        assert_eq!(machine.dos_output(), b"hi");
+        assert_eq!(machine.program_output(), b"hi");
     }
 
     #[test]
     fn lotura_reports_id_and_switches_mode_live() {
         // org 0x100: mov al,2; out 0xe1,al; mov ax,4c00h; int 21h
         let com: &[u8] = &[0xb0, 0x02, 0xe6, 0xe1, 0xb8, 0x00, 0x4c, 0xcd, 0x21];
-        let mut machine = Machine::new_dos_program(
+        let mut machine = Machine::new_raw_program(
             MachineProfile::gsw_386(16, izarravm_core::VideoCard::Et4000Ax),
             com,
         )
@@ -33536,7 +33539,7 @@ mod tests {
         // sel=3: cp=3/3=1, size_index=3%3=0 => CP850, 8x16 block.
         const PROG: [u8; 6] = [0xB0, 0x03, 0xE6, 0xE7, 0xCD, 0x20];
         let mut machine =
-            Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
+            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), &PROG)
                 .unwrap();
         machine.run_until_halt_or_cycles(1_000_000).unwrap();
         // CP850 8x16 block is CODEPAGE_FONTS[9728 .. 9728+4096]; it must now be at 0xC4000.
