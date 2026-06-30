@@ -2561,6 +2561,14 @@ impl Machine {
         ok
     }
 
+    /// Whether the Margo linear-framebuffer display is the active output (the GUI
+    /// renders it instead of the VGA text/graphics core). A VGA mode set via INT
+    /// 10h clears this latch. Exposed so a test can assert the BIOS hands the
+    /// display back to VGA text before booting an OS.
+    pub fn margo_active(&self) -> bool {
+        self.margo_active
+    }
+
     fn int10_set_mode_number(&mut self, requested_mode: u8) -> bool {
         let mode = requested_mode & 0x7F;
         let clear = requested_mode & 0x80 == 0;

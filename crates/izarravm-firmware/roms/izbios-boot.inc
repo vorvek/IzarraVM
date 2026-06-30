@@ -188,6 +188,19 @@ boot_entry:
     mov es, ax
     cmp word [0x7dfe], 0xaa55
     jne .disk_hle
+    ; Hand the OS a clean VGA text screen before entering the MBR. The graphical
+    ; POST left the Margo LFB active; a real MBR + FreeDOS kernel boots in text
+    ; mode without ever setting a video mode, so without this the display stays
+    ; frozen on the POST splash while the booted OS writes to the (hidden) text
+    ; buffer. A real BIOS leaves mode 03h before INT 19h -- match that. Setting
+    ; mode 03h via INT 10h clears the Margo latch so the VGA core drives the
+    ; display (machine.rs int10_set_mode_number, modes 0x00-0x03). INT 10h may
+    ; use DS/ES as scratch, so re-zero them for the boot sector afterward.
+    mov ax, 0x0003
+    int 0x10
+    xor ax, ax
+    mov ds, ax
+    mov es, ax
     mov dl, 0x80
     jmp 0x0000:0x7c00
 
