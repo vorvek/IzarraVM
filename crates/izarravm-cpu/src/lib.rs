@@ -677,6 +677,9 @@ pub struct Cpu386 {
     // Fractional remainder carried by the per-level cycle scaling so the cheap
     // ops do not round to zero. Reset on a level change. See scale_clocks.
     timing_rem: u64,
+    // Fractional remainder carried by the per-mode FP-clock scaling (scale_fp_clocks).
+    // Reset on a level change alongside timing_rem. See fp_timing.
+    fp_rem: u64,
     pub halted: bool,
     // STI sets this to block maskable interrupt delivery for one instruction:
     // the 386 holds off interrupts until the instruction after STI, which makes
@@ -1427,6 +1430,7 @@ impl Cpu386 {
     pub fn set_level(&mut self, level: CpuLevel) {
         self.level = level;
         self.timing_rem = 0;
+        self.fp_rem = 0;
         // The ISA level gates the two-byte #UD checks in decode, so the same bytes can decode
         // differently after a level change. Invalidate the decode cache so it re-decodes.
         self.decode_cache.invalidate();
@@ -1446,6 +1450,17 @@ impl Cpu386 {
         let scaled = u64::from(clocks) * u64::from(num) + self.timing_rem;
         self.timing_rem = scaled % u64::from(den);
         scaled / u64::from(den)
+    }
+
+    /// Scale an x87 op's raw core clocks by the active level's FP-timing factor, carrying
+    /// the fractional remainder in `fp_rem` so a cheap FP op is not rounded to zero.
+    /// Mirrors `scale_clocks` exactly but uses `fp_timing` and `fp_rem`. With the current
+    /// identity (1, 1) factor this returns `clocks` unchanged.
+    fn scale_fp_clocks(&mut self, clocks: u32) -> u32 {
+        let (num, den) = fp_timing(self.level);
+        let scaled = u64::from(clocks) * u64::from(num) + self.fp_rem;
+        self.fp_rem = scaled % u64::from(den);
+        (scaled / u64::from(den)).min(u64::from(u32::MAX)) as u32
     }
 
     /// Reported (L1 KB, L2 KB) cache for the live level. The same geometry drives
@@ -6952,6 +6967,21 @@ const fn level_timing(level: CpuLevel) -> (u32, u32) {
     }
 }
 
+/// Per-mode FP-op-clock scalar as (numerator, denominator) — a SEPARATE dial from
+/// `level_timing` so the P55C's faster-than-486 x87 unit can be modeled at I586 without
+/// touching the integer-instruction compute ratio. Currently identity (1, 1) for every
+/// mode (bit-identical to the current behaviour); a later P55C-retarget task tunes I586.
+/// Applied in `scale_fp_clocks` with fractional-remainder carry (exact long division),
+/// mirroring the `scale_clocks` / `timing_rem` pattern exactly.
+const fn fp_timing(level: CpuLevel) -> (u32, u32) {
+    match level {
+        CpuLevel::I286 => (1, 1),
+        CpuLevel::I386 => (1, 1),
+        CpuLevel::I486 => (1, 1),
+        CpuLevel::I586 => (1, 1),
+    }
+}
+
 /// Per-level BUS-clock scaling as (numerator, denominator), CALIBRATED (B-T10).
 /// This is the THIRD timing lever (after `level_timing` and the cache `tier_cost`
 /// wait-states): it scales the ENTIRE bus portion of a step (instruction fetch +
@@ -7124,7 +7154,12 @@ impl Cpu386 {
                     error_code: None,
                 });
             }
-            return Ok(clocks(6));
+            // Fall through to the single tail so scale_fp_clocks is applied uniformly.
+            let raw = clocks(6);
+            return Ok(CycleOutcome {
+                core_clocks: self.scale_fp_clocks(raw.core_clocks),
+                halted: raw.halted,
+            });
         }
 
         let modrm = insn
@@ -7145,8 +7180,10 @@ impl Cpu386 {
                 error_code: None,
             });
         }
-        if modrm.mode == 3 {
-            self.execute_fpu_register(opcode, modrm)
+        // Single tail: apply the per-mode FP-timing scalar to every x87 op's raw clocks
+        // (WAIT included above). With fp_timing returning (1,1) this is a no-op.
+        let outcome = if modrm.mode == 3 {
+            self.execute_fpu_register(opcode, modrm)?
         } else {
             // `decode` parsed the addressing descriptor for the memory forms; resolve it against
             // the live registers now (no instruction bytes are re-read).
@@ -7156,8 +7193,12 @@ impl Cpu386 {
                     unreachable!("mode != 3 decodes to a memory operand")
                 }
             };
-            self.execute_fpu_memory(bus, opcode, modrm.reg, mem, insn.operand_size)
-        }
+            self.execute_fpu_memory(bus, opcode, modrm.reg, mem, insn.operand_size)?
+        };
+        Ok(CycleOutcome {
+            core_clocks: self.scale_fp_clocks(outcome.core_clocks),
+            halted: outcome.halted,
+        })
     }
 
     /// The heterogeneous one-off block (task A14) through the decode/execute split. Each arm mirrors
@@ -22607,5 +22648,56 @@ mod tests {
         lazy.materialize_flags();
         assert!(lazy.pending_flags.is_none());
         assert_eq!(lazy.registers.eflags, eager.registers.eflags);
+    }
+
+    #[test]
+    fn fp_timing_identity_does_not_change_fpu_clocks() {
+        // FADD ST,ST(1) is opcode D8 C1 (register form: D8 /0, modrm=C1 → mod=3, reg=0, rm=1).
+        // The FPU executor charges 20 raw clocks for a register-form arithmetic op
+        // (fpu_reg_arith_st0 returns clocks(20)). With fp_timing==(1,1) the identity
+        // scale_fp_clocks call must return 20 unchanged, so elapsed_clocks after one cycle
+        // at I486 must equal elapsed_clocks at I586 — proving the FP factor is truly identity
+        // and does not disturb the existing level_timing scaling.
+        //
+        // We also push 1.0 into ST0 and ST1 first so FADD does not trap on an empty stack;
+        // that means we run three cycles total (FLD1; FLD1; FADD ST,ST(1)) and then measure.
+        // But to isolate just the FADD clock charge, we record elapsed_clocks before and after
+        // the FADD cycle at each level.
+        let code: &[u8] = &[
+            0xd9, 0xe8, // FLD1  → ST0 = 1.0
+            0xd9, 0xe8, // FLD1  → push 1.0 again (ST0=1, ST1=1)
+            0xd8, 0xc1, // FADD ST(0), ST(1)
+        ];
+
+        let fadd_elapsed = |level: CpuLevel| -> u64 {
+            let (mut cpu, memory) = real_mode_cpu(code, 0x20);
+            cpu.set_level(level);
+            let mut bus = TestBus::with_memory(memory);
+            // Execute FLD1; FLD1 to load the stack.
+            cpu.cycle(&mut bus).unwrap();
+            cpu.cycle(&mut bus).unwrap();
+            // Snapshot before the FADD.
+            let before = cpu.elapsed_clocks;
+            cpu.cycle(&mut bus).unwrap();
+            cpu.elapsed_clocks - before
+        };
+
+        let fadd_i486 = fadd_elapsed(CpuLevel::I486);
+        let fadd_i586 = fadd_elapsed(CpuLevel::I586);
+
+        // Both modes share the same level_timing (1,12) and fp_timing (1,1), so the
+        // scaled FADD clock charge must be identical.
+        assert_eq!(
+            fadd_i486,
+            fadd_i586,
+            "fp_timing identity: FADD elapsed at I486 ({fadd_i486}) must equal I586 ({fadd_i586})"
+        );
+
+        // Sanity: the scaled charge must be > 0 (20 raw clocks × 1/12 carries correctly
+        // over many instructions, but a single FADD with a fresh timing_rem should charge ≥ 1).
+        assert!(
+            fadd_i486 > 0,
+            "FADD must charge at least 1 scaled clock at I486 (got {fadd_i486})"
+        );
     }
 }
