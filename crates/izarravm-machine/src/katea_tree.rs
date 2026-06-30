@@ -748,6 +748,15 @@ impl KateaTreeVolume {
         self.geo.count_of_clusters as usize + 2
     }
 
+    /// Whether `c` is a valid data cluster (`2 ..= count_of_clusters + 1`). A FAT
+    /// link outside this range is a corrupt or guest-crafted pointer; reconcile
+    /// holds such a chain rather than computing an out-of-range LBA (which would
+    /// overflow `u32` in debug for large cluster sizes — and reads garbage in
+    /// release). Conservative: never materialize from an out-of-range chain.
+    fn cluster_in_range(&self, c: u32) -> bool {
+        (ROOT_CLUSTER..=self.geo.count_of_clusters + 1).contains(&c)
+    }
+
     /// Reconcile the overlay to the host folder: walk every known directory and
     /// atomically materialize each *complete, touched, changed* 8.3 file, and
     /// create host subdirectories for MKDIR'd entries. Conservative — an
@@ -777,6 +786,9 @@ impl KateaTreeVolume {
             else {
                 continue; // a corrupt directory chain: hold the whole directory
             };
+            if dir_chain.iter().any(|&c| !self.cluster_in_range(c)) {
+                continue; // a chain link outside the data region: hold this dir
+            }
             let mut dir_bytes = Vec::with_capacity(dir_chain.len() * cluster_bytes);
             for c in &dir_chain {
                 let base = self.cluster_to_lba(*c);
@@ -813,6 +825,9 @@ impl KateaTreeVolume {
                         else {
                             continue; // incomplete/corrupt chain: hold
                         };
+                        if fchain.iter().any(|&c| !self.cluster_in_range(c)) {
+                            continue; // chain references an out-of-range cluster: hold
+                        }
                         let capacity = fchain.len() as u64 * cluster_bytes as u64;
                         if u64::from(size) > capacity {
                             continue; // not enough clusters yet: hold
@@ -1216,6 +1231,56 @@ mod tests {
         stamp_file(&mut vol, 2, "BIG.DAT", 0x20, free, &payload);
         vol.reconcile();
         assert_eq!(std::fs::read(root.join("BIG.DAT")).unwrap(), payload);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn reconcile_holds_a_chain_that_references_an_out_of_range_cluster() {
+        // A guest-crafted FAT chain `free -> bogus -> EOC`, where `bogus` is past
+        // the last valid data cluster, must be HELD (no host file, no panic) — never
+        // gathered, which would compute an out-of-range LBA (a u32 overflow in debug
+        // for large cluster sizes, garbage in release). Conservative-by-construction.
+        let (mut vol, root) = fresh_vol("rec_oob");
+        let free = vol.next_free;
+        let bogus = vol.geo.count_of_clusters + 100; // beyond the last valid cluster
+        let set_fat = |vol: &mut KateaTreeVolume, c: u32, v: u32| {
+            let byte = c as usize * 4;
+            let lba = vol.geo.part_start + u32::from(RESERVED_SECTORS) + (byte / SECTOR) as u32;
+            let mut sec = vol.read_sector(lba);
+            let off = byte % SECTOR;
+            sec[off..off + 4].copy_from_slice(&(v & 0x0FFF_FFFF).to_le_bytes());
+            vol.write_sector(lba, &sec);
+        };
+        // free -> bogus -> EOC, with data in `free`'s cluster and a dir entry whose
+        // size (600 > one cluster) forces the chain to follow the bogus link.
+        set_fat(&mut vol, free, bogus);
+        set_fat(&mut vol, bogus, crate::fat32::FAT32_EOC);
+        let base = vol.cluster_to_lba(free);
+        vol.write_sector(base, &[0x42u8; SECTOR]);
+        let dir_lba = vol.cluster_to_lba(2);
+        let mut dsec = vol.read_sector(dir_lba);
+        let entry = crate::fat32::fat32_dir_entry(
+            &{
+                let mut n = [b' '; 11];
+                n[..3].copy_from_slice(b"OOB");
+                n[8..11].copy_from_slice(b"BIN");
+                n
+            },
+            0x20,
+            free,
+            0,
+            0,
+            600,
+        );
+        let slot = (0..16).map(|i| i * 32).find(|&o| dsec[o] == 0).unwrap();
+        dsec[slot..slot + 32].copy_from_slice(&entry);
+        vol.write_sector(dir_lba, &dsec);
+
+        vol.reconcile(); // must not panic
+        assert!(
+            !root.join("OOB.BIN").exists(),
+            "an out-of-range chain must be held, not materialized"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
