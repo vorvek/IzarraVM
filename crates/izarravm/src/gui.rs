@@ -825,6 +825,15 @@ fn emulate(
     let mut credit: i64 = 0;
     let mut last = Instant::now();
     let mut published_seq = u64::MAX; // force the first publish
+    // Dirty-framebuffer cache (graphics modes only, v1): the content-generation key
+    // of the last frame we palette-mapped + published. The guest's vsync counter
+    // (`seq`) advances every retrace even on a totally static mode-13h screen, which
+    // would re-run the 64 KB palette map (`render_words`) ~70x/s for nothing. When
+    // `frame_generation()` returns `Some(k)` and k is unchanged, the graphics output
+    // cannot have changed, so we skip the render + publish: `f.seq` stays put, so the
+    // UI's existing per-seq texture-upload guard skips the upload too. `None` (text
+    // mode / Margo / Distira) always renders, today's behavior (text-cursor blink).
+    let mut last_frame_gen: Option<u64> = None;
 
     let cmos_path = rtc_setup.cmos_path.clone();
     // The source IMG path of the mounted floppy, when it is a writable image
@@ -930,7 +939,13 @@ fn emulate(
         // Publish: clone the framebuffer only when the guest presents a new
         // frame; refresh the light fields every pass so the readout stays live.
         let seq = machine.video().frames_completed();
-        let new_frame = seq != published_seq;
+        // Dirty-framebuffer guard: in a graphics mode whose content key is unchanged
+        // since the last published frame, the output is bit-identical, so skip the
+        // palette map + publish even though `seq` advanced. `None` (text/Margo/
+        // Distira) never short-circuits, preserving today's per-vsync render.
+        let frame_gen = machine.frame_generation();
+        let content_unchanged = matches!((frame_gen, last_frame_gen), (Some(k), Some(p)) if k == p);
+        let new_frame = seq != published_seq && !content_unchanged;
         let rendered = new_frame.then(|| render_words(&mut machine));
         let serial = new_frame.then(|| machine.serial_text());
         let mode = machine.active_mode();
@@ -944,6 +959,9 @@ fn emulate(
                 f.width = width;
                 f.height = height;
                 f.seq = seq;
+                // Remember the published frame's content key so the next vsync with the
+                // same key (static screen) is short-circuited above.
+                last_frame_gen = frame_gen;
             }
             if let Some(serial) = serial {
                 f.serial = serial;
