@@ -923,7 +923,12 @@ impl KateaTreeVolume {
                     let fresh: Vec<&(u32, [u8; 11], bool)> = claimants
                         .iter()
                         .filter(|(d, n, is_dir)| {
-                            *is_dir == m.is_dir && !self.mirrored.contains_key(&(*d, *n))
+                            *is_dir == m.is_dir
+                                && !self.mirrored.contains_key(&(*d, *n))
+                                // Already taken as another disappearance's rename target
+                                // this pass (only reachable under guest-aliased clusters);
+                                // hold rather than clobber the first rename's destination.
+                                && !handled.contains(&(*d, *n))
                         })
                         .collect();
                     if fresh.len() == 1 {
@@ -1051,6 +1056,9 @@ impl KateaTreeVolume {
                         name,
                         first_cluster,
                     } => {
+                        if handled.contains(&(dir_cluster, name)) {
+                            continue; // already renamed in phase 2 (symmetry with MakeFile)
+                        }
                         let path = host_dir.join(crate::katea_volume::decode_83(&name));
                         mkdirs.push((dir_cluster, name, first_cluster, path));
                     }
