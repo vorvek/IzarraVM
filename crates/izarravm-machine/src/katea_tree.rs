@@ -609,11 +609,9 @@ pub(crate) struct KateaTreeVolume {
 #[derive(Clone, Debug)]
 struct MirrorEntry {
     host_path: PathBuf,
-    /// The guest-side first cluster this entry occupies; read by M3 delete/rename.
-    #[allow(dead_code)]
+    /// The guest-side first cluster this entry occupies (drives delete/rename detection).
     first_cluster: u32,
-    /// True when this entry is a directory; read by M3 delete/rename.
-    #[allow(dead_code)]
+    /// True when this entry is a directory.
     is_dir: bool,
     last_fingerprint: Option<u64>,
 }
@@ -838,6 +836,9 @@ impl KateaTreeVolume {
                             first_cluster,
                             is_dir: true,
                         });
+                        // Only descend into dirs Katea already knows; a just-MKDIR'd
+                        // subdir is registered by the materialize phase first, then
+                        // gathered on the next pass.
                         if self.dir_paths.contains_key(&first_cluster) {
                             work.push(first_cluster);
                         }
@@ -909,6 +910,7 @@ impl KateaTreeVolume {
         let cluster_bytes = spc as usize * SECTOR;
         let max = self.max_chain();
 
+        // PHASE 3: materialize creates/overwrites/grows + mkdir.
         // Fixpoint over known directories: MKDIR registers a new directory which is
         // pushed onto the worklist so its files are materialized in the same pass.
         let mut work: Vec<u32> = self.dir_paths.keys().copied().collect();
