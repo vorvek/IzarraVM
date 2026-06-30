@@ -930,7 +930,7 @@ mod tests {
             payload.files.iter().map(|(n, d)| (n.as_str(), d)).collect();
         assert_eq!(
             by_name.get("KERNEL.SYS").map(|d| d.len()),
-            Some(70556),
+            Some(70162),
             "KERNEL.SYS size"
         );
         assert_eq!(
@@ -942,13 +942,29 @@ mod tests {
         assert!(by_name.contains_key("AUTOEXEC.BAT"), "AUTOEXEC.BAT present");
         assert!(by_name.contains_key("HELLO.TXT"), "HELLO.TXT present");
 
+        // The kernel signon points at "See C:\\LICENSE.TXT for more.", so the full
+        // FreeDOS / Toka-DOS licensing ships as a real file on the C: payload.
+        let license = by_name.get("LICENSE.TXT").expect("LICENSE.TXT present");
+        assert!(
+            String::from_utf8_lossy(license).contains("GNU GENERAL PUBLIC LICENSE"),
+            "LICENSE.TXT carries the full GPL text"
+        );
+
         // FreeDOS KERNEL.SYS is a raw binary, not an MZ: it begins with a short
         // JMP (0xEB) past the embedded BPB — the load-bearing first byte the boot
         // sector relies on.
-        assert_eq!(
-            by_name.get("KERNEL.SYS").unwrap()[0],
-            0xEB,
-            "KERNEL.SYS begins with a short JMP"
+        let kernel = by_name.get("KERNEL.SYS").unwrap();
+        assert_eq!(kernel[0], 0xEB, "KERNEL.SYS begins with a short JMP");
+
+        // The rebranded, trimmed signon banner is compiled into the kernel.
+        let has = |needle: &str| kernel.windows(needle.len()).any(|w| w == needle.as_bytes());
+        assert!(
+            has("General Simulation Works"),
+            "the rebranded signon company name is in the kernel"
+        );
+        assert!(
+            !has("JTM Soluciones"),
+            "the old company name was removed from the kernel"
         );
     }
 

@@ -12,7 +12,7 @@ FreeDOS is GPLv2-or-later; this project is GPL-3.0-only. This tree is the GPL
 Neither tag has git submodules. (Upstream master has since diverged: kernel 2045 / FreeCom 0.87.)
 
 ## Local patches applied to the vendored source
-- Rebrand (Toka-DOS 3.0): kernel `hdr/version.h` (KVS banner), `kernel/main.c` (added Toka banner; FreeDOS copyright preserved); FreeCOM `shell/ver.c` (shellname/shellver), `VERSION.TXT`, `strings/DEFAULT.lng` (product strings; GPL/copyright preserved). Each edited file carries a "modified by the Toka-DOS project, 2026" note.
+- Rebrand (Toka-DOS 3.0): kernel `hdr/version.h` (KVS banner), `kernel/main.c` (Toka signon banner — "General Simulation Works", tongue-in-cheek; the verbose FreeDOS/Villani copyright + GPL block was removed from the boot banner and replaced by a "See C:\LICENSE.TXT for more." pointer. The full GPL/copyright is preserved verbatim in C:\LICENSE.TXT, assembled by `scripts/license_txt.py` from the project NOTICE + kernel `COPYING` and shipped on the Katea C: payload); FreeCOM `shell/ver.c` (shellname/shellver), `VERSION.TXT`, `strings/DEFAULT.lng` (product strings; GPL/copyright preserved). Each edited file carries a "modified by the Toka-DOS project, 2026" note.
 - Build fix: FreeCOM `shell/wlinker.bat` adds `op caseexact` — Open Watcom 2.0's wlink defaults to case-insensitive symbol resolution, which collides FreeCOM's libc toupper_/tolower_ with its own toUpper_/toLower_ (infinite recursion at the first console char-translation). Required for a working shell.
 - Build target: kernel built XCPU=86 XFAT=32 (8086 + FAT32 => DOS 7.10), no UPX. XCPU=386 is NOT usable (emits 386 opcodes, e.g. PUSH FS, the emulator lacks).
 

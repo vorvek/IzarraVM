@@ -26,7 +26,10 @@
 /* write to the Free Software Foundation, Inc.,                 */
 /* 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA.     */
 /****************************************************************/
-/* Modified by the Toka-DOS project, 2026: added toka_banner and print it in signon() before existing copyright output. */
+/* Modified by the Toka-DOS project, 2026: signon() prints toka_banner (the Toka-DOS
+   product line) instead of the FreeDOS copyright block; the full FreeDOS/Villani
+   copyright + GPL now ships in C:\LICENSE.TXT (see scripts/license_txt.py), which the
+   banner points to. */
 
 #include "portab.h"
 #include "init-mod.h"
@@ -38,16 +41,9 @@ static BYTE *mainRcsId =
     "$Id: main.c 1699 2012-01-16 20:45:44Z perditionc $";
 #endif
 
-static char copyright[] =
-    "(C) Copyright 1995-2012 Pasquale J. Villani and The FreeDOS Project.\n"
-    "All Rights Reserved. This is free software and comes with ABSOLUTELY NO\n"
-    "WARRANTY; you can redistribute it and/or modify it under the terms of the\n"
-    "GNU General Public License as published by the Free Software Foundation;\n"
-    "either version 2, or (at your option) any later version.\n";
-
 static char toka_banner[] =
-    "Toka-DOS 3.0  (C) 1997 JTM Soluciones - tongue firmly in cheek.\n"
-    "(C) 2026 Toka-DOS project. Built on FreeDOS - see NOTICE / GUI About for licensing.\n";
+    "\r\nToka-DOS 3.0 (C) 1997 General Simulation Works - tongue firmly in cheek.\n"
+    "See C:\\LICENSE.TXT for more.\n";
 
 struct _KernelConfig InitKernelConfig BSS_INIT({0});
 
@@ -444,9 +440,9 @@ STATIC VOID signon()
 #ifdef WITHFAT32
   " - FAT32 support"
 #endif
-  "\n\n%s",
+  "\n",
          MK_FP(FP_SEG(LoL), FP_OFF(LoL->os_release)),
-         MAJOR_RELEASE, MINOR_RELEASE, copyright);
+         MAJOR_RELEASE, MINOR_RELEASE);
 }
 
 STATIC void kernel()
