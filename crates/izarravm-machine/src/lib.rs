@@ -9427,8 +9427,8 @@ impl Machine {
 
     /// Perform a Toka-DOS service requested through Lotura port 0xE3, recording the
     /// status the BIOS reads back. Cmd 0x01 (Repair Toka-DOS) resets the Katea host
-    /// folder's CONFIG.SYS/AUTOEXEC.BAT; 0x10 is the legacy HLE C: boot shim (only
-    /// reached when no ATA disk is present, removed with the HLE in SP-3).
+    /// folder's CONFIG.SYS/AUTOEXEC.BAT; 0x10 is the legacy HLE C: boot shim (reached
+    /// only when Katea is not mounted; removed with the HLE in SP-3).
     fn perform_toka_service(&mut self, command: u8) {
         self.toka_service_status = match command {
             0x01 => self.katea_repair(),
