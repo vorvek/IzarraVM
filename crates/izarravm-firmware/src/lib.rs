@@ -14,6 +14,10 @@ pub const TYPE_COM: &[u8] = include_bytes!("../roms/dos/type.com");
 pub const TYPE_COM_SOURCE: &str = include_str!("../roms/dos/type.asm");
 pub const RUNNER_COM: &[u8] = include_bytes!("../roms/dos/runner.com");
 pub const RUNNER_COM_SOURCE: &str = include_str!("../roms/dos/runner.asm");
+pub const TOKAMOUS_COM: &[u8] = include_bytes!("../roms/dos/tokamous.com");
+// No TOKAMOUS_COM_SOURCE sibling (unlike RUNNER_COM): the canonical .asm lives in
+// toka-dos/tools/tokamous.asm (shared with the floppy/ROM builds), not under this
+// crate's roms/dos/, and is too large to embed as a string for no consumer.
 pub const EXIT42_COM: &[u8] = include_bytes!("../roms/dos/exit42.com");
 pub const EXIT42_COM_SOURCE: &str = include_str!("../roms/dos/exit42.asm");
 pub const EXEHELLO_EXE: &[u8] = include_bytes!("../roms/dos/exehello.exe");
@@ -242,6 +246,15 @@ pub fn echo_com() -> &'static [u8] {
 /// reports it to the unit-tester exit port. Overlaid onto C: as `RUNNER.COM`.
 pub fn runner_com() -> &'static [u8] {
     RUNNER_COM
+}
+
+/// TOKAMOUS, our INT 33h PS/2 mouse TSR. Overlaid onto the Katea C: drive by the
+/// GUI so real FreeDOS boots with a working mouse (the old HLE C: loaded it via
+/// AUTOEXEC). Canonical source: `toka-dos/tools/tokamous.asm` (the floppy/ROM
+/// builds assemble the same file) — only the built `.com` is committed here.
+/// Rebuild: `nasm -f bin toka-dos/tools/tokamous.asm -o crates/izarravm-firmware/roms/dos/tokamous.com`.
+pub fn tokamous_com() -> &'static [u8] {
+    TOKAMOUS_COM
 }
 
 /// A test program that terminates with DOS exit code 42; the katea-run e2e fixture.
@@ -683,5 +696,14 @@ mod tests {
         let img = super::tokados_img();
         assert_eq!(img.len(), 1_474_560, "tokados.img must be a 1.44MB floppy");
         assert_eq!(&img[0x1FE..0x200], &[0x55, 0xAA], "boot signature");
+    }
+
+    #[test]
+    fn tokamous_com_is_embedded() {
+        // The Katea GUI overlays this onto C: so real FreeDOS boots with a mouse.
+        assert!(
+            !super::tokamous_com().is_empty(),
+            "TOKAMOUS.COM bytes must be embedded"
+        );
     }
 }

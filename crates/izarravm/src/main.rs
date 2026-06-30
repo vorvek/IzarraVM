@@ -10,7 +10,6 @@ use izarravm_core::{
     AppConfig, ConfigOverrides, GswMode, HardwareProfile, MidiBackend, SbDma8, SbDma16, SbIrq,
     VideoCard,
 };
-use izarravm_dos::{DosKernelServices, HostDrive};
 use izarravm_firmware::{
     SuiteRecordStatus, boot_test_image, neurketa_image, parse_result_block, test_rom,
 };
@@ -76,8 +75,6 @@ struct Cli {
     #[arg(long)]
     headless_izarra_bios: bool,
     #[arg(long)]
-    headless_toka: bool,
-    #[arg(long)]
     headless_boot_floppy: Option<PathBuf>,
     #[arg(long)]
     headless_boot_hdd: Option<PathBuf>,
@@ -90,8 +87,6 @@ struct Cli {
     /// exiting with its DOS exit code (the Katea replacement for --headless-run).
     #[arg(long)]
     katea_run: Option<PathBuf>,
-    #[arg(long)]
-    headless_run: Option<PathBuf>,
     #[arg(long)]
     stdin_text: Option<String>,
     #[arg(long)]
@@ -115,21 +110,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     let mut config = load_config(&cli)?;
     // When the user gave no C: location (no --c_drive, no --dosroot, and the
-    // config left at its "." default), auto-mount from the per-user
-    // ~/.izarravm/c_drive (or, with --portable, a c_drive beside the executable)
-    // and lay down Toka-DOS if it is missing.
+    // config left at its "." default), use the per-user ~/.izarravm/c_drive (or,
+    // with --portable, a c_drive beside the executable). The folder is just user
+    // data now — Katea boots real FreeDOS from its own synthesized partition, so
+    // nothing is installed onto it.
     if cli.c_drive.is_none() && cli.dosroot.is_none() && config.dos.c_drive == Path::new(".") {
-        let c_root = izarravm_dos::resolve_c_root(cli.portable);
-        let files = izarravm_firmware::toka_dos_system_files();
-        izarravm_dos::toka_dos_install(
-            &c_root,
-            &files,
-            izarravm_dos::InstallMode::EnsureIfMissing,
-        )?;
-        config.dos.c_drive = c_root;
+        config.dos.c_drive = resolve_c_root(cli.portable);
     }
     let hardware = HardwareProfile::from_config(&config)?;
-    let dos = DosKernelServices::new(HostDrive::mount_c(&config.dos.c_drive)?);
     let audio = AudioSubsystem::from_config(&config.audio);
     let input = InputState {
         keyboard_enabled: config.input.keyboard,
@@ -141,7 +129,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         hz = hardware.clock_hz,
         memory_mib = config.machine.memory_mib,
         video = %config.machine.video,
-        c_drive = %dos.c_drive.root().display(),
+        c_drive = %config.dos.c_drive.display(),
         audio_devices = audio.devices.len(),
         keyboard = input.keyboard_enabled,
         mouse = input.mouse_enabled,
@@ -170,10 +158,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         return run_bandwidth(&hardware);
     }
 
-    if let Some(path) = &cli.headless_run {
-        return run_headless_program(path, &hardware, &dos, cli.stdin_text.as_deref());
-    }
-
     if cli.headless_test_rom {
         return run_test_rom(cli.bios.as_deref(), cli.cycles, &hardware);
     }
@@ -184,10 +168,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     if cli.headless_izarra_bios {
         return run_izarra_bios(&hardware);
-    }
-
-    if cli.headless_toka {
-        return run_headless_toka(&hardware, &dos, cli.stdin_text.as_deref());
     }
 
     if let Some(path) = &cli.headless_boot_floppy {
@@ -228,6 +208,32 @@ fn main() -> Result<(), Box<dyn Error>> {
         rtc_setup,
     )?;
     Ok(())
+}
+
+/// The C: root for a normal launch: `<home>/.izarravm/c_drive`, or `c_drive`
+/// beside the executable under `--portable`. Created if missing. Inlined from the
+/// retired HLE crate — it was only a path helper, not DOS emulation.
+fn resolve_c_root(portable: bool) -> PathBuf {
+    let dir = c_root_path(portable);
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// The C: root path (no filesystem side effects), split out so it is testable
+/// without creating directories.
+fn c_root_path(portable: bool) -> PathBuf {
+    if portable {
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(Path::to_path_buf))
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        exe_dir.join("c_drive")
+    } else {
+        #[allow(deprecated)]
+        let home = std::env::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        home.join(".izarravm").join("c_drive")
+    }
 }
 
 /// Run the clean-room boot suite and print its result block.
@@ -553,43 +559,6 @@ fn bandwidth_band_tag(mode: GswMode, block: u32, mb_per_sec: f64) -> String {
     }
 }
 
-/// Load and run a DOS .COM/.EXE headless, then exit with its DOS exit code.
-fn run_headless_program(
-    path: &Path,
-    hardware: &HardwareProfile,
-    dos: &DosKernelServices,
-    stdin_text: Option<&str>,
-) -> Result<(), Box<dyn Error>> {
-    // Compute the exit code in an inner scope so the machine and the loaded
-    // image drop before process::exit (which does not unwind). The DOS exit
-    // code becomes the process status so a .COM result is scriptable.
-    let code = {
-        let image = std::fs::read(path)?;
-        let mut machine =
-            Machine::new_dos_program(MachineProfile::from_hardware_profile(hardware), &image)?;
-        // Mount the configured C: drive so INT 21h file calls resolve.
-        machine.mount_c_drive(dos.c_drive.clone());
-        if let Some(text) = stdin_text {
-            // Type the text through the real keyboard path so it reaches the
-            // program via INT 09h and the BDA ring. Typeable ASCII only
-            // (lowercase, digits, space) until ascii_to_set1 is extended.
-            for ch in text.chars() {
-                for code in ascii_to_set1(ch) {
-                    machine.inject_key_scancodes(&[code]);
-                }
-            }
-        }
-        let stop_reason = machine.run_until_halt_or_cycles(50_000_000)?;
-        print!("{}", String::from_utf8_lossy(machine.dos_output()));
-        println!("stop: {stop_reason:?}");
-        match stop_reason {
-            StopReason::DosExit { code } | StopReason::TestExit { code } => i32::from(code),
-            _ => 1,
-        }
-    };
-    std::process::exit(code);
-}
-
 /// Boot a BIOS/test ROM headless and print the screen text plus POST code.
 fn run_test_rom(
     bios: Option<&Path>,
@@ -661,51 +630,6 @@ fn run_izarra_bios(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
     println!("records: {}", results.records.len());
     println!("declared: {}", results.declared_record_count);
     println!("stop: {stop_reason:?}");
-    Ok(())
-}
-
-/// Boot the Izarra 3000 BIOS into Toka-DOS, type an optional script at the
-/// IZCMD prompt, and print the VGA text screen. With no floppy mounted the
-/// BIOS falls through to the hard-disk boot, which brings up Toka-DOS from C:.
-fn run_headless_toka(
-    hardware: &HardwareProfile,
-    dos: &DosKernelServices,
-    stdin_text: Option<&str>,
-) -> Result<(), Box<dyn Error>> {
-    let mut machine = Machine::new(
-        MachineProfile::from_hardware_profile(hardware),
-        izarravm_firmware::izarra_bios(),
-    )?;
-    machine.mount_c_drive(dos.c_drive.clone());
-    machine.set_toka_c_root(dos.c_drive.root().to_path_buf());
-
-    // Boot through POST and into the IZCMD prompt. POST is fast (fast_post),
-    // so roughly a second of cycles is ample to reach the prompt.
-    machine.run_until_halt_or_cycles(hardware.clock_hz)?;
-
-    // Feed the script character by character. The BDA keyboard ring holds only
-    // 15 entries, so injecting a whole line at once overflows it on a long
-    // command. Typing one character and running briefly lets IZCMD's line
-    // input drain the ring before the next character, so any line length works.
-    if let Some(text) = stdin_text {
-        let per_char = 200_000u64;
-        let line_budget = hardware.clock_hz / 2;
-        for raw in text.split('\n') {
-            let line = raw.trim_end_matches('\r');
-            for ch in line.chars() {
-                for code in ascii_to_set1(ch) {
-                    machine.inject_key_scancodes(&[code]);
-                }
-                machine.run_until_halt_or_cycles(per_char)?;
-            }
-            for code in ascii_to_set1('\r') {
-                machine.inject_key_scancodes(&[code]);
-            }
-            machine.run_until_halt_or_cycles(line_budget)?;
-        }
-    }
-
-    println!("{}", machine.screen_text().as_text());
     Ok(())
 }
 
@@ -1225,6 +1149,31 @@ mod tests {
         assert_eq!(katea_run_prog_name(Path::new("bar.com")), "PROG.COM");
         assert_eq!(katea_run_prog_name(Path::new("noext")), "PROG.COM");
         assert_eq!(katea_run_prog_name(Path::new("a.longext")), "PROG.LON");
+    }
+
+    #[test]
+    fn c_root_path_lives_under_dot_izarravm_when_not_portable() {
+        let p = super::c_root_path(false);
+        assert!(
+            p.ends_with(std::path::Path::new(".izarravm").join("c_drive")),
+            "default C: root should end with .izarravm/c_drive, got {p:?}"
+        );
+    }
+
+    #[test]
+    fn c_root_path_is_a_bare_c_drive_when_portable() {
+        // Portable mode keys off the executable's own directory, so the path is
+        // just <exe_dir>/c_drive — no ~/.izarravm prefix.
+        let p = super::c_root_path(true);
+        assert_eq!(
+            p.file_name().and_then(|n| n.to_str()),
+            Some("c_drive"),
+            "portable C: root should be a c_drive folder, got {p:?}"
+        );
+        assert!(
+            !p.to_string_lossy().contains(".izarravm"),
+            "portable C: root must not use the ~/.izarravm prefix, got {p:?}"
+        );
     }
 }
 
