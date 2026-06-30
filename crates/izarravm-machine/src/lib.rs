@@ -48,6 +48,7 @@ mod memmap;
 mod mouse;
 mod pic;
 mod pit;
+mod raw_program;
 mod rtc;
 mod speaker;
 mod uart;
