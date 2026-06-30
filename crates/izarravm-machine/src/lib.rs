@@ -1037,6 +1037,9 @@ pub struct Machine {
     pending_toka_service: Option<u8>,
     toka_service_status: u8,
     toka_c_root: Option<std::path::PathBuf>, // host C: root for Repair/Format
+    /// The host folder backing the Katea C: drive (set by `mount_hdd_folder`), so
+    /// the BIOS "Repair Toka-DOS" service can reset CONFIG.SYS/AUTOEXEC.BAT on it.
+    katea_root: Option<std::path::PathBuf>,
     // True while a CallDevice service is on the CPU. A driver running on the
     // borrowed context can issue INT 21h AH=3Fh/40h on a device handle, which
     // would re-enter the same fixed request packet at DEVICE_REQUEST_SCRATCH and
@@ -1371,6 +1374,57 @@ fn device_request_packet_len(command: u8) -> u8 {
     }
 }
 
+/// Files that are NOT overlaid in user-folder mode: the demo file and the two
+/// config files the user owns on C:.
+const USER_OWNED_OR_DEMO: &[&str] = &["HELLO.TXT", "CONFIG.SYS", "AUTOEXEC.BAT"];
+
+/// The payload files overlaid in user-folder mode: the binaries (KERNEL.SYS,
+/// COMMAND.COM, LICENSE.TXT, TOKAMOUS.COM) but not the demo file or the user's
+/// CONFIG.SYS/AUTOEXEC.BAT.
+fn user_folder_overlay(files: Vec<(String, Vec<u8>)>) -> Vec<(String, Vec<u8>)> {
+    files
+        .into_iter()
+        .filter(|(name, _)| {
+            !USER_OWNED_OR_DEMO
+                .iter()
+                .any(|d| name.eq_ignore_ascii_case(d))
+        })
+        .collect()
+}
+
+/// Seed `CONFIG.SYS`/`AUTOEXEC.BAT` into a host folder if they are absent, so the
+/// user always has real, editable copies. Existing files are left untouched (the
+/// user owns them). Case-insensitive on Windows, the supported host.
+fn ensure_user_config(
+    dir: &std::path::Path,
+    config: &[u8],
+    autoexec: &[u8],
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    if !dir.join("CONFIG.SYS").exists() {
+        std::fs::write(dir.join("CONFIG.SYS"), config)?;
+    }
+    if !dir.join("AUTOEXEC.BAT").exists() {
+        std::fs::write(dir.join("AUTOEXEC.BAT"), autoexec)?;
+    }
+    Ok(())
+}
+
+/// The default `(CONFIG.SYS, AUTOEXEC.BAT)` bytes from the committed image payload
+/// — the single source for both seeding and Repair.
+fn default_config_pair() -> (Vec<u8>, Vec<u8>) {
+    let payload = katea_volume::extract_system_payload(izarravm_firmware::tokados_hdd_img());
+    let pick = |name: &str| {
+        payload
+            .files
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, b)| b.clone())
+            .unwrap_or_default()
+    };
+    (pick("CONFIG.SYS"), pick("AUTOEXEC.BAT"))
+}
+
 /// Merge `overrides` into a system-file list: replace an existing entry whose name
 /// matches case-insensitively, else append. Used to overlay a runner AUTOEXEC.BAT +
 /// extra tools onto the standard Katea payload.
@@ -1457,6 +1511,7 @@ impl Machine {
             pending_toka_service: None,
             toka_service_status: 0,
             toka_c_root: None,
+            katea_root: None,
             in_device_call: false,
             dos_screen_shown: 0,
             dos: izarravm_dos::DosKernel::default(),
@@ -1764,11 +1819,23 @@ impl Machine {
         Ok(())
     }
 
-    /// Mount a host folder as C: through Katea with the standard payload only.
-    /// See [`mount_hdd_folder_with`](Self::mount_hdd_folder_with) to overlay extra
-    /// system files (e.g. a custom AUTOEXEC.BAT or runner tool).
+    /// Mount a host folder as C: through Katea in "user-folder mode": seed the
+    /// default CONFIG.SYS/AUTOEXEC.BAT into `dir` if missing, then overlay only the
+    /// OS binaries so the host folder's config files are authoritative (the user
+    /// owns them). The GUI and `--hdd-folder` use this. For the override mode (a
+    /// throwaway runner disk) see [`mount_hdd_folder_with`](Self::mount_hdd_folder_with).
     pub fn mount_hdd_folder(&mut self, dir: &std::path::Path) -> std::io::Result<()> {
-        self.mount_hdd_folder_with(dir, Vec::new())
+        let payload = katea_volume::extract_system_payload(izarravm_firmware::tokados_hdd_img());
+        let (config, autoexec) = default_config_pair();
+        ensure_user_config(dir, &config, &autoexec)?;
+        let system_files = user_folder_overlay(payload.files);
+        let volume =
+            katea_tree::KateaTreeVolume::new(&payload.mbr, &payload.vbr, dir, &system_files)?;
+        self.ata = Some(ata::AtaDisk::from_host_folder(volume));
+        self.katea_root = Some(dir.to_path_buf());
+        let _ = self.publish_fixed_disk_parameter_table();
+        let _ = self.memory.write_u8(0x475, 1); // BDA fixed-disk count
+        Ok(())
     }
 
     /// Mount a synthesized FAT32 volume as drive C: for the DOS absolute-disk
@@ -19813,6 +19880,58 @@ mod tests {
         assert!(base.iter().any(|(n, b)| n == "KERNEL.SYS" && b == b"k"));
         assert!(base.iter().any(|(n, b)| n == "RUNNER.COM" && b == b"r"));
         assert_eq!(base.len(), 3, "one replace + one append");
+    }
+
+    #[test]
+    fn ensure_user_config_seeds_missing_files_only() {
+        let dir = std::env::temp_dir().join(format!("katea_cfg_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A user-owned AUTOEXEC stays; a missing CONFIG.SYS is seeded.
+        std::fs::write(dir.join("AUTOEXEC.BAT"), b"@ECHO OFF\r\nMYGAME\r\n").unwrap();
+        super::ensure_user_config(&dir, b"FILES=40\r\n", b"@ECHO OFF\r\nDEFAULT\r\n").unwrap();
+        assert_eq!(
+            std::fs::read(dir.join("AUTOEXEC.BAT")).unwrap(),
+            b"@ECHO OFF\r\nMYGAME\r\n",
+            "the user's AUTOEXEC must not be overwritten"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("CONFIG.SYS")).unwrap(),
+            b"FILES=40\r\n",
+            "a missing CONFIG.SYS is seeded with the default"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn user_folder_overlay_keeps_binaries_drops_config() {
+        let payload = vec![
+            ("KERNEL.SYS".to_string(), vec![1u8]),
+            ("COMMAND.COM".to_string(), vec![2u8]),
+            ("CONFIG.SYS".to_string(), vec![3u8]),
+            ("AUTOEXEC.BAT".to_string(), vec![4u8]),
+            ("HELLO.TXT".to_string(), vec![5u8]),
+            ("LICENSE.TXT".to_string(), vec![6u8]),
+            ("TOKAMOUS.COM".to_string(), vec![7u8]),
+        ];
+        let names: Vec<String> = super::user_folder_overlay(payload)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert!(names.contains(&"KERNEL.SYS".to_string()));
+        assert!(names.contains(&"TOKAMOUS.COM".to_string()));
+        assert!(names.contains(&"LICENSE.TXT".to_string()));
+        assert!(
+            !names.contains(&"CONFIG.SYS".to_string()),
+            "config is the user's"
+        );
+        assert!(
+            !names.contains(&"AUTOEXEC.BAT".to_string()),
+            "autoexec is the user's"
+        );
+        assert!(
+            !names.contains(&"HELLO.TXT".to_string()),
+            "demo file dropped"
+        );
     }
 
     #[test]
