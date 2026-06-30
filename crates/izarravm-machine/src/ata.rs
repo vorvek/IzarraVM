@@ -567,6 +567,12 @@ impl AtaDisk {
             self.phase = Phase::Idle;
             self.status = status::DRDY | status::DSC;
             self.error = 0;
+            // M2: mirror any finished files to the host folder. // ponytail: runs a
+            // full reconcile pass per write command; arm-on-FAT/dir-write only if
+            // this ever shows up in profiling.
+            if let Backing::HostFolder(volume) = &mut self.backing {
+                volume.reconcile();
+            }
             // Completion raises the IRQ, the way a drive signals the write done.
             self.raise_irq();
         }

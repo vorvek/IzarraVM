@@ -5,12 +5,14 @@
 
 // `KateaTreeVolume` is now consumed by the ATA `HostFolder` backing (`ata.rs`)
 // and `mount_hdd_folder` (`lib.rs`), so the read path (`new`/`read_sector`/
-// `total_sectors`) is live and the module-level dead-code allow is gone. A few
-// items remain reachable only from this module's `#[cfg(test)]` tests; each
-// carries a narrow `#[allow(dead_code)]` at its definition: `tree()`/
-// `cluster_to_lba()` and the `tree` field they read, and the free `dir_sector`
+// `total_sectors`) is live and the module-level dead-code allow is gone. The M2
+// write path (`write_sector`/`fat_entry`/`cluster_to_lba`/`reconcile` and the
+// `overlay`/`dir_paths`/`existing_files`/`system_names`/`materialized` state) is
+// now live too. A few items remain reachable only from this module's
+// `#[cfg(test)]` tests; each carries a narrow `#[allow(dead_code)]` at its
+// definition: `tree()` and the `tree` field it reads, and the free `dir_sector`
 // (the per-volume read path inlines the same logic in `data_sector`). The `tree`
-// field is also the seam the M2 write engine will read.
+// field is also the seam the M2 write engine reads at construction.
 
 use crate::fat32::{FAT32_EOC, fat32_dir_entry, fat32_fsinfo_sector};
 use crate::katea_names::NameTable;
@@ -590,20 +592,27 @@ pub(crate) struct KateaTreeVolume {
     /// Directory first-cluster -> its host-filesystem path. Seeded from the tree;
     /// extended on guest MKDIR. Reconcile materializes a file in this directory to
     /// `host_path / 8.3-name`.
-    #[allow(dead_code)] // consumed by mod tests + M2 reconcile pass (next task)
     dir_paths: HashMap<u32, PathBuf>,
     /// (directory first-cluster, folded 8.3 name) -> the existing host file's real
     /// path, so an overwrite replaces the actual (possibly mixed-case) host file
     /// rather than creating an uppercase duplicate. Built from the tree's HostFiles.
-    #[allow(dead_code)] // consumed by mod tests + M2 reconcile pass (next task)
     existing_files: HashMap<(u32, [u8; 11]), PathBuf>,
     /// Folded 8.3 names of the InMemory boot files; never materialized to the host.
-    #[allow(dead_code)] // consumed by mod tests + M2 reconcile pass (next task)
     system_names: HashSet<[u8; 11]>,
     /// (directory first-cluster, folded name) -> last materialized content
     /// fingerprint, so an unchanged file is not re-written every reconcile pass.
-    #[allow(dead_code)] // Limit: consumed by the M2 reconcile pass (next task)
     materialized: HashMap<(u32, [u8; 11]), u64>,
+}
+
+/// One file the reconcile pass has decided to materialize: where to write it, the
+/// bytes, its `(dir first-cluster, folded name)` fingerprint key, and the content
+/// fingerprint recorded on a successful write. Collected during the read phase and
+/// drained afterwards so no `&self` borrow is held across the host I/O.
+struct PendingWrite {
+    path: PathBuf,
+    data: Vec<u8>,
+    key: (u32, [u8; 11]),
+    fingerprint: u64,
 }
 
 impl KateaTreeVolume {
@@ -714,7 +723,6 @@ impl KateaTreeVolume {
     /// The 28-bit FAT entry for cluster `c`, reading the overlay-shadowed FAT (so
     /// guest-written chain links are honored) and falling back to the tree's
     /// computed FAT. Built on `read_sector`, which already consults the overlay.
-    #[allow(dead_code)] // consumed by mod tests + M2 reconcile pass (next task)
     pub(crate) fn fat_entry(&self, c: u32) -> u32 {
         let byte = c as usize * 4;
         let fat_sector_rel = u32::from(RESERVED_SECTORS) + (byte / SECTOR) as u32;
@@ -724,19 +732,166 @@ impl KateaTreeVolume {
         u32::from_le_bytes([sec[off], sec[off + 1], sec[off + 2], sec[off + 3]]) & 0x0FFF_FFFF
     }
 
-    /// Absolute LBA of a data cluster's first sector. Test-only: the read path
-    /// goes the other way (LBA -> cluster) inside `read_sector`.
-    #[allow(dead_code)]
+    /// Absolute LBA of a data cluster's first sector. The reconcile pass and the
+    /// tests resolve cluster -> LBA this way; the read path goes the other way
+    /// (LBA -> cluster) inside `read_sector`.
     pub(crate) fn cluster_to_lba(&self, cluster: u32) -> u32 {
         self.geo.part_start
             + self.geo.first_data_sector
             + (cluster - ROOT_CLUSTER) * u32::from(self.geo.spc)
     }
 
+    /// The maximum cluster-chain length we will follow before treating a chain as
+    /// corrupt (a cyclic/garbled FAT must not loop forever). The data region can
+    /// never exceed the cluster count, so this is a safe ceiling.
+    fn max_chain(&self) -> usize {
+        self.geo.count_of_clusters as usize + 2
+    }
+
+    /// Reconcile the overlay to the host folder: walk every known directory and
+    /// atomically materialize each *complete, touched, changed* 8.3 file, and
+    /// create host subdirectories for MKDIR'd entries. Conservative — an
+    /// incomplete or ambiguous entry is held in the overlay and retried next pass.
+    /// Called after each HostFolder ATA write command and at eject/flush.
+    pub(crate) fn reconcile(&mut self) {
+        let spc = u32::from(self.geo.spc);
+        let cluster_bytes = spc as usize * SECTOR;
+        let max = self.max_chain();
+
+        // Fixpoint over known directories: MKDIR registers a new directory which is
+        // pushed onto the worklist so its files are materialized in the same pass.
+        let mut work: Vec<u32> = self.dir_paths.keys().copied().collect();
+        let mut seen: HashSet<u32> = HashSet::new();
+
+        while let Some(dir_cluster) = work.pop() {
+            if !seen.insert(dir_cluster) {
+                continue;
+            }
+            let Some(host_dir) = self.dir_paths.get(&dir_cluster).cloned() else {
+                continue;
+            };
+
+            // Read the directory's full bytes by following its own cluster chain.
+            let Some(dir_chain) =
+                crate::katea_write::chain(dir_cluster, max, |c| self.fat_entry(c))
+            else {
+                continue; // a corrupt directory chain: hold the whole directory
+            };
+            let mut dir_bytes = Vec::with_capacity(dir_chain.len() * cluster_bytes);
+            for c in &dir_chain {
+                let base = self.cluster_to_lba(*c);
+                for s in 0..spc {
+                    dir_bytes.extend_from_slice(&self.read_sector(base + s));
+                }
+            }
+            let dir_written = dir_chain.iter().any(|c| {
+                let base = self.cluster_to_lba(*c);
+                (0..spc).any(|s| self.overlay.contains_key(&(base + s)))
+            });
+
+            // Decide every entry (read-only); collect actions, then apply.
+            let mut mkdirs: Vec<(u32, std::path::PathBuf)> = Vec::new();
+            let mut writes: Vec<PendingWrite> = Vec::new();
+
+            for e in crate::katea_write::parse_dir(&dir_bytes) {
+                match crate::katea_write::classify(&e, &self.system_names) {
+                    crate::katea_write::EntryAction::Skip => {}
+                    crate::katea_write::EntryAction::MakeDir {
+                        name,
+                        first_cluster,
+                    } => {
+                        let path = host_dir.join(crate::katea_volume::decode_83(&name));
+                        mkdirs.push((first_cluster, path));
+                    }
+                    crate::katea_write::EntryAction::MakeFile {
+                        name,
+                        first_cluster,
+                        size,
+                    } => {
+                        let Some(fchain) =
+                            crate::katea_write::chain(first_cluster, max, |c| self.fat_entry(c))
+                        else {
+                            continue; // incomplete/corrupt chain: hold
+                        };
+                        let capacity = fchain.len() as u64 * cluster_bytes as u64;
+                        if u64::from(size) > capacity {
+                            continue; // not enough clusters yet: hold
+                        }
+                        // Touched this session? Non-empty files must have overlay
+                        // data; a brand-new name in a written directory counts even
+                        // when empty. Untouched tree/system files are skipped.
+                        let data_written = fchain.iter().any(|c| {
+                            let base = self.cluster_to_lba(*c);
+                            (0..spc).any(|s| self.overlay.contains_key(&(base + s)))
+                        });
+                        let is_new = !self.existing_files.contains_key(&(dir_cluster, name));
+                        if !(data_written || (dir_written && is_new)) {
+                            continue;
+                        }
+
+                        // Gather the file bytes (overlay-then-tree), truncate to size.
+                        let mut data = Vec::with_capacity(size as usize);
+                        'gather: for c in &fchain {
+                            let base = self.cluster_to_lba(*c);
+                            for s in 0..spc {
+                                if data.len() >= size as usize {
+                                    break 'gather;
+                                }
+                                data.extend_from_slice(&self.read_sector(base + s));
+                            }
+                        }
+                        data.truncate(size as usize);
+
+                        let fp = crate::katea_write::fingerprint(&data);
+                        if self.materialized.get(&(dir_cluster, name)) == Some(&fp) {
+                            continue; // unchanged since last pass
+                        }
+                        let host_path = self
+                            .existing_files
+                            .get(&(dir_cluster, name))
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                host_dir.join(crate::katea_volume::decode_83(&name))
+                            });
+                        writes.push(PendingWrite {
+                            path: host_path,
+                            data,
+                            key: (dir_cluster, name),
+                            fingerprint: fp,
+                        });
+                    }
+                }
+            }
+
+            // Apply mutations + host I/O (no `self` borrow held across reads now).
+            for (first_cluster, path) in mkdirs {
+                if let Err(e) = std::fs::create_dir_all(&path) {
+                    eprintln!("katea: mkdir {} failed: {e}", path.display());
+                    continue;
+                }
+                self.dir_paths.entry(first_cluster).or_insert(path);
+                if !seen.contains(&first_cluster) {
+                    work.push(first_cluster);
+                }
+            }
+            for w in writes {
+                match crate::katea_write::atomic_write(&w.path, &w.data) {
+                    Ok(()) => {
+                        self.materialized.insert(w.key, w.fingerprint);
+                    }
+                    Err(e) => {
+                        // Hold on failure: the real host file is untouched; retry
+                        // next pass. atomic_write guarantees no torn file.
+                        eprintln!("katea: materialize {} failed: {e}", w.path.display());
+                    }
+                }
+            }
+        }
+    }
+
     /// Store one guest-written sector in the overlay. Reads of this LBA now return
     /// `data` until eject. The interpreter (`reconcile`) reads the overlay to
     /// mirror finished files to the host folder.
-    #[allow(dead_code)] // consumed by mod tests + later M2 reconcile; no prod caller yet
     pub(crate) fn write_sector(&mut self, lba: u32, data: &[u8; SECTOR]) {
         self.overlay.insert(lba, *data);
     }
@@ -914,6 +1069,202 @@ mod tests {
         let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// Stamp a file into a directory exactly as the guest would: allocate `nclu`
+    /// contiguous clusters from `first`, write the FAT chain, write the data, and
+    /// append the 8.3 directory entry to directory `dir_cluster` (single-cluster dirs
+    /// here). Returns the next free cluster. All writes go through the overlay.
+    #[cfg(test)]
+    fn stamp_file(
+        vol: &mut KateaTreeVolume,
+        dir_cluster: u32,
+        name: &str,
+        attr: u8,
+        first: u32,
+        data: &[u8],
+    ) -> u32 {
+        let spc = u32::from(vol.geo.spc);
+        let cluster_bytes = spc as usize * SECTOR;
+        // At least one cluster, even for an empty file or a fresh directory.
+        let nclu = data.len().div_ceil(cluster_bytes).max(1) as u32;
+        // FAT chain c -> c+1 ... -> EOC.
+        for i in 0..nclu {
+            let c = first + i;
+            let v = if i == nclu - 1 {
+                crate::fat32::FAT32_EOC
+            } else {
+                c + 1
+            };
+            let byte = c as usize * 4;
+            let lba = vol.geo.part_start + u32::from(RESERVED_SECTORS) + (byte / SECTOR) as u32;
+            let mut sec = vol.read_sector(lba);
+            let off = byte % SECTOR;
+            sec[off..off + 4].copy_from_slice(&(v & 0x0FFF_FFFF).to_le_bytes());
+            vol.write_sector(lba, &sec);
+        }
+        // Data clusters.
+        for (i, chunk) in data.chunks(cluster_bytes).enumerate() {
+            let c = first + i as u32;
+            let base = vol.cluster_to_lba(c);
+            for (s, sec_bytes) in chunk.chunks(SECTOR).enumerate() {
+                let mut sec = [0u8; SECTOR];
+                sec[..sec_bytes.len()].copy_from_slice(sec_bytes);
+                vol.write_sector(base + s as u32, &sec);
+            }
+        }
+        // Directory entry appended to the directory's first cluster (sector 0). Read
+        // the current (overlay-or-tree) directory, find the first free 32-byte slot,
+        // splice the entry, write it back.
+        let dir_lba = vol.cluster_to_lba(dir_cluster);
+        let mut dsec = vol.read_sector(dir_lba);
+        let mut name11 = [b' '; 11];
+        let (b, x) = name.split_once('.').unwrap_or((name, ""));
+        name11[..b.len()].copy_from_slice(b.as_bytes());
+        name11[8..8 + x.len()].copy_from_slice(x.as_bytes());
+        let entry = crate::fat32::fat32_dir_entry(&name11, attr, first, 0, 0, data.len() as u32);
+        let slot = (0..16)
+            .map(|i| i * 32)
+            .find(|&o| dsec[o] == 0x00 || dsec[o] == 0xE5)
+            .expect("a free dir slot in sector 0");
+        dsec[slot..slot + 32].copy_from_slice(&entry);
+        vol.write_sector(dir_lba, &dsec);
+        first + nclu
+    }
+
+    #[cfg(test)]
+    fn fresh_vol(tag: &str) -> (KateaTreeVolume, std::path::PathBuf) {
+        let root = scratch(tag);
+        let sys = vec![
+            ("KERNEL.SYS".to_string(), vec![0xEBu8; 100]),
+            ("COMMAND.COM".to_string(), vec![0u8; 50]),
+        ];
+        let img = izarravm_firmware::tokados_hdd_img();
+        let mut mbr = [0u8; 512];
+        mbr.copy_from_slice(&img[0..512]);
+        let mut vbr = [0u8; 512];
+        vbr.copy_from_slice(&img[2048 * 512..2048 * 512 + 512]);
+        let vol = KateaTreeVolume::new(&mbr, &vbr, &root, &sys).unwrap();
+        (vol, root)
+    }
+
+    #[test]
+    fn reconcile_creates_a_new_file_in_the_root() {
+        let (mut vol, root) = fresh_vol("rec_create");
+        let free = vol.next_free;
+        stamp_file(&mut vol, 2, "NEW.TXT", 0x20, free, b"created\r\n");
+        vol.reconcile();
+        let got = std::fs::read(root.join("NEW.TXT")).expect("NEW.TXT materialized");
+        assert_eq!(got, b"created\r\n");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn reconcile_overwrites_an_existing_host_file() {
+        let root = scratch("rec_over");
+        std::fs::write(root.join("OLD.TXT"), b"before!!").unwrap(); // 8 bytes
+        let sys = vec![("KERNEL.SYS".to_string(), vec![0xEBu8; 100])];
+        let img = izarravm_firmware::tokados_hdd_img();
+        let mut mbr = [0u8; 512];
+        mbr.copy_from_slice(&img[0..512]);
+        let mut vbr = [0u8; 512];
+        vbr.copy_from_slice(&img[2048 * 512..2048 * 512 + 512]);
+        let mut vol = KateaTreeVolume::new(&mbr, &vbr, &root, &sys).unwrap();
+        // The existing OLD.TXT occupies tree clusters; the guest rewrites it in place.
+        let old_fc = vol
+            .tree()
+            .root
+            .files
+            .iter()
+            .find(|f| &f.name == b"OLD     TXT")
+            .unwrap()
+            .first_cluster;
+        // Overwrite same length (8 bytes) but different content: must still be written.
+        stamp_file(&mut vol, 2, "OLD.TXT", 0x20, old_fc, b"AFTER!!!");
+        vol.reconcile();
+        assert_eq!(std::fs::read(root.join("OLD.TXT")).unwrap(), b"AFTER!!!");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn reconcile_grows_a_file() {
+        let (mut vol, root) = fresh_vol("rec_grow");
+        let free = vol.next_free;
+        let _next = stamp_file(&mut vol, 2, "GROW.TXT", 0x20, free, b"line1\r\n");
+        vol.reconcile();
+        assert_eq!(std::fs::read(root.join("GROW.TXT")).unwrap(), b"line1\r\n");
+        // Grow: re-stamp the same name at the same first cluster with more data.
+        stamp_file(&mut vol, 2, "GROW.TXT", 0x20, free, b"line1\r\nline2\r\n");
+        vol.reconcile();
+        assert_eq!(
+            std::fs::read(root.join("GROW.TXT")).unwrap(),
+            b"line1\r\nline2\r\n"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn reconcile_makes_a_subdir_and_a_file_inside_it() {
+        let (mut vol, root) = fresh_vol("rec_mkdir");
+        // MKDIR SUB: a directory entry in the root pointing at a fresh cluster.
+        let sub_fc = vol.next_free;
+        stamp_file(&mut vol, 2, "SUB", 0x10, sub_fc, &[0u8; 0]); // dir, 1 cluster
+        // A file inside SUB (directory cluster = sub_fc).
+        let file_fc = sub_fc + 1;
+        stamp_file(&mut vol, sub_fc, "DEEP.TXT", 0x20, file_fc, b"deep\r\n");
+        vol.reconcile();
+        assert!(root.join("SUB").is_dir(), "SUB created on host");
+        assert_eq!(
+            std::fs::read(root.join("SUB").join("DEEP.TXT")).unwrap(),
+            b"deep\r\n"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn reconcile_holds_an_incomplete_chain_and_skips_system_files() {
+        let (mut vol, root) = fresh_vol("rec_hold");
+        let free = vol.next_free;
+        // Stamp a directory entry claiming size 600 (2 clusters) but only chain one
+        // cluster (single-cluster EOC chain), so clusters*cb < size -> hold.
+        let byte = free as usize * 4;
+        let lba = vol.geo.part_start + u32::from(RESERVED_SECTORS) + (byte / SECTOR) as u32;
+        let mut sec = vol.read_sector(lba);
+        let off = byte % SECTOR;
+        sec[off..off + 4].copy_from_slice(&crate::fat32::FAT32_EOC.to_le_bytes());
+        vol.write_sector(lba, &sec);
+        let base = vol.cluster_to_lba(free);
+        vol.write_sector(base, &[0x41u8; SECTOR]);
+        let dir_lba = vol.cluster_to_lba(2);
+        let mut dsec = vol.read_sector(dir_lba);
+        let entry = crate::fat32::fat32_dir_entry(
+            &{
+                let mut n = [b' '; 11];
+                n[..4].copy_from_slice(b"HOLD");
+                n[8..11].copy_from_slice(b"BIN");
+                n
+            },
+            0x20,
+            free,
+            0,
+            0,
+            600, // claims 600 bytes but only 1 cluster (512) is chained
+        );
+        let slot = (0..16).map(|i| i * 32).find(|&o| dsec[o] == 0).unwrap();
+        dsec[slot..slot + 32].copy_from_slice(&entry);
+        vol.write_sector(dir_lba, &dsec);
+
+        vol.reconcile();
+        assert!(
+            !root.join("HOLD.BIN").exists(),
+            "incomplete file is held, not written"
+        );
+        // A system file name is never materialized even if it appears written.
+        assert!(
+            !root.join("KERNEL.SYS").exists(),
+            "system file never materialized"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
