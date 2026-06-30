@@ -22480,14 +22480,16 @@ mod tests {
         // pending-derived ZF intact, i.e. set_flag must settle the pending first.
         let mut cpu = Cpu386::default();
         let r = cpu.alu_add_eager(0xff, 0x01, 0, BusWidth::Byte); // CF=1, ZF=1 (result 0x00)
-        let mut lazy = Cpu386::default();
-        lazy.pending_flags = Some(LazyFlags {
-            a: 0xff,
-            b: 0x01,
-            result: r,
-            width: BusWidth::Byte,
-            is_sub: false,
-        });
+        let mut lazy = Cpu386 {
+            pending_flags: Some(LazyFlags {
+                a: 0xff,
+                b: 0x01,
+                result: r,
+                width: BusWidth::Byte,
+                is_sub: false,
+            }),
+            ..Default::default()
+        };
         lazy.set_flag(FLAG_CF, false); // CLC-like eager write
         assert!(!lazy.flag(FLAG_CF), "CF must be cleared by the eager write");
         assert!(
@@ -22523,14 +22525,16 @@ mod tests {
                 } else {
                     eager.alu_add_eager(a, b, 0, w)
                 };
-                let mut lazy = Cpu386::default();
-                lazy.pending_flags = Some(LazyFlags {
-                    a: a & width_mask(w),
-                    b: b & width_mask(w),
-                    result: r,
-                    width: w,
-                    is_sub,
-                });
+                let lazy = Cpu386 {
+                    pending_flags: Some(LazyFlags {
+                        a: a & width_mask(w),
+                        b: b & width_mask(w),
+                        result: r,
+                        width: w,
+                        is_sub,
+                    }),
+                    ..Default::default()
+                };
                 for f in [FLAG_CF, FLAG_PF, FLAG_AF, FLAG_ZF, FLAG_SF, FLAG_OF] {
                     assert_eq!(
                         lazy.flag(f),
@@ -22585,14 +22589,16 @@ mod tests {
         // Reading the whole eflags word (e.g. via eflags()) after a pending op must equal the eager result.
         let mut eager = Cpu386::default();
         let r = eager.alu_add_eager(0x80, 0x80, 0, BusWidth::Byte); // CF=1, OF=1, ZF=1
-        let mut lazy = Cpu386::default();
-        lazy.pending_flags = Some(LazyFlags {
-            a: 0x80,
-            b: 0x80,
-            result: r,
-            width: BusWidth::Byte,
-            is_sub: false,
-        });
+        let mut lazy = Cpu386 {
+            pending_flags: Some(LazyFlags {
+                a: 0x80,
+                b: 0x80,
+                result: r,
+                width: BusWidth::Byte,
+                is_sub: false,
+            }),
+            ..Default::default()
+        };
         assert_eq!(
             lazy.eflags(),
             eager.registers.eflags,
