@@ -1284,13 +1284,26 @@ impl Cpu386 {
         let zf = p.result & mask == 0;
         let sf = p.result & sign != 0;
         let pf = parity(p.result as u8);
-        let mut e = self.registers.eflags & !(FLAG_CF | FLAG_OF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_PF);
-        if cf { e |= FLAG_CF; }
-        if of { e |= FLAG_OF; }
-        if af { e |= FLAG_AF; }
-        if zf { e |= FLAG_ZF; }
-        if sf { e |= FLAG_SF; }
-        if pf { e |= FLAG_PF; }
+        let mut e =
+            self.registers.eflags & !(FLAG_CF | FLAG_OF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_PF);
+        if cf {
+            e |= FLAG_CF;
+        }
+        if of {
+            e |= FLAG_OF;
+        }
+        if af {
+            e |= FLAG_AF;
+        }
+        if zf {
+            e |= FLAG_ZF;
+        }
+        if sf {
+            e |= FLAG_SF;
+        }
+        if pf {
+            e |= FLAG_PF;
+        }
         e | 0x2
     }
 
@@ -3011,6 +3024,8 @@ impl Cpu386 {
                 // masked to 0 in the pushed image). operand_size drives whether push writes
                 // 2 or 4 bytes.
                 self.check_v86_iopl()?;
+                // Settle any deferred arithmetic flags so the pushed image has live CF/PF/AF/ZF/SF/OF.
+                self.materialize_flags();
                 let value = match operand_size {
                     OperandSize::Word => self.registers.eflags & 0xffff,
                     OperandSize::Dword => self.registers.eflags & (0xffff | FLAG_AC | FLAG_ID),
@@ -3426,12 +3441,17 @@ impl Cpu386 {
             0x9e => {
                 // SAHF: load CF/PF/AF/ZF/SF from AH; OF and the reserved bits are untouched.
                 // The trailing | 0x02 keeps the always-one reserved bit set.
+                // Settle deferred flags first: OF (an arithmetic bit) must read live, and this
+                // read-modify-write of the whole word must not leave a stale descriptor behind.
+                self.materialize_flags();
                 let ah = u32::from(self.read_gpr8(4));
                 self.registers.eflags = (self.registers.eflags & !0xd5) | (ah & 0xd5) | 0x02;
                 Ok(clocks(3))
             }
             0x9f => {
                 // LAHF: AH = low flag byte with bit1 forced 1, bits 3 and 5 forced 0.
+                // Settle deferred flags so the captured low byte (CF/PF/AF/ZF/SF) is live.
+                self.materialize_flags();
                 let ah = ((self.registers.eflags as u8) & 0xd5) | 0x02;
                 self.write_gpr8(4, ah);
                 Ok(clocks(2))
@@ -5652,6 +5672,8 @@ impl Cpu386 {
     }
 
     fn real_mode_interrupt<B: CpuBus>(&mut self, bus: &mut B, vector: u8) -> ExecResult<()> {
+        // Settle deferred arithmetic flags so the eflags image pushed for the handler is live.
+        self.materialize_flags();
         self.push(bus, self.registers.eflags as u16 as u32, OperandSize::Word)?;
         self.push(
             bus,
@@ -5700,6 +5722,8 @@ impl Cpu386 {
         let selector = ((gate_low >> 16) & 0xffff) as u16;
         let offset = (gate_low & 0x0000_ffff) | (gate_high & 0xffff_0000);
 
+        // Settle deferred arithmetic flags so the eflags image pushed for the handler is live.
+        self.materialize_flags();
         self.push(bus, self.registers.eflags, OperandSize::Dword)?;
         self.push(
             bus,
@@ -5733,6 +5757,9 @@ impl Cpu386 {
                 self.registers.eflags = value | 0x2;
             }
         }
+        // The loaded image is the new truth for every flag bit; any deferred descriptor would
+        // otherwise override the arithmetic bits we just wrote.
+        self.pending_flags = None;
     }
 
     fn iret<B: CpuBus>(&mut self, bus: &mut B, operand_size: OperandSize) -> ExecResult<()> {
@@ -6080,6 +6107,8 @@ impl Cpu386 {
     }
 
     fn save_task_state<B: CpuBus>(&mut self, bus: &mut B) -> ExecResult<()> {
+        // Settle deferred arithmetic flags so the eflags image saved into the outgoing TSS is live.
+        self.materialize_flags();
         let base = self.tr.base;
         bus.write_memory(
             base + 32,
@@ -6137,6 +6166,8 @@ impl Cpu386 {
             self.write_gpr32(i as u8, value);
         }
         self.registers.eflags = eflags | 0x2;
+        // The incoming task's eflags is the new truth; drop any stale arithmetic descriptor.
+        self.pending_flags = None;
         self.set_eip(eip);
         for (k, segment) in TASK_SEGMENTS.iter().enumerate() {
             let selector = bus.read_memory(
@@ -6643,7 +6674,21 @@ impl Cpu386 {
     }
 
     fn alu_add(&mut self, a: u32, b: u32, carry: u32, width: BusWidth) -> u32 {
-        self.alu_add_eager(a, b, carry, width)
+        if carry != 0 {
+            return self.alu_add_eager(a, b, carry, width);
+        }
+        let mask = width_mask(width);
+        let a = a & mask;
+        let b = b & mask;
+        let result = ((u64::from(a) + u64::from(b)) as u32) & mask;
+        self.pending_flags = Some(LazyFlags {
+            a,
+            b,
+            result,
+            width,
+            is_sub: false,
+        });
+        result
     }
 
     fn alu_sub_eager(&mut self, a: u32, b: u32, borrow: u32, width: BusWidth) -> u32 {
@@ -6661,7 +6706,21 @@ impl Cpu386 {
     }
 
     fn alu_sub(&mut self, a: u32, b: u32, borrow: u32, width: BusWidth) -> u32 {
-        self.alu_sub_eager(a, b, borrow, width)
+        if borrow != 0 {
+            return self.alu_sub_eager(a, b, borrow, width);
+        }
+        let mask = width_mask(width);
+        let a = a & mask;
+        let b = b & mask;
+        let result = (u64::from(a).wrapping_sub(u64::from(b)) as u32) & mask;
+        self.pending_flags = Some(LazyFlags {
+            a,
+            b,
+            result,
+            width,
+            is_sub: true,
+        });
+        result
     }
 
     fn mul(&mut self, operand: u32, signed: bool, width: BusWidth) {
@@ -8945,7 +9004,12 @@ mod tests {
             &[1; 32],
             &[255, 1, 100, 3, 17, 61, 61, 2],
         ];
-        for level in [CpuLevel::I286, CpuLevel::I386, CpuLevel::I486, CpuLevel::I586] {
+        for level in [
+            CpuLevel::I286,
+            CpuLevel::I386,
+            CpuLevel::I486,
+            CpuLevel::I586,
+        ] {
             for start_rem in [0u64, 1, 7, 100] {
                 for seq in seqs {
                     let mut indiv = Cpu386::default();
@@ -16160,11 +16224,7 @@ mod tests {
             let _ = split.cycle(&mut sbus);
 
             assert_eq!(split.registers.gpr, g.gpr, "gpr mismatch for {}", g.name);
-            assert_eq!(
-                split.registers.eflags, g.eflags,
-                "eflags mismatch for {}",
-                g.name
-            );
+            assert_eq!(split.eflags(), g.eflags, "eflags mismatch for {}", g.name);
             assert_eq!(split.registers.eip, g.eip, "eip mismatch for {}", g.name);
             let deltas: Vec<(usize, u8)> = sbus
                 .memory
@@ -16239,7 +16299,7 @@ mod tests {
                 g.name,
                 g.code,
                 fused.registers.gpr,
-                fused.registers.eflags,
+                fused.eflags(),
                 fused.registers.eip,
                 deltas,
                 fetch,
@@ -16499,11 +16559,7 @@ mod tests {
             let _ = split.cycle(&mut sbus);
 
             assert_eq!(split.registers.gpr, g.gpr, "gpr mismatch for {}", g.name);
-            assert_eq!(
-                split.registers.eflags, g.eflags,
-                "eflags mismatch for {}",
-                g.name
-            );
+            assert_eq!(split.eflags(), g.eflags, "eflags mismatch for {}", g.name);
             assert_eq!(split.registers.eip, g.eip, "eip mismatch for {}", g.name);
             let deltas: Vec<(usize, u8)> = sbus
                 .memory
@@ -16563,7 +16619,7 @@ mod tests {
                 g.name,
                 g.code,
                 fused.registers.gpr,
-                fused.registers.eflags,
+                fused.eflags(),
                 fused.registers.eip,
                 deltas,
                 fetch,
@@ -16686,7 +16742,8 @@ mod tests {
 
             assert_eq!(split.registers.gpr, g.gpr, "gpr mismatch for {}", g.name);
             assert_eq!(
-                split.registers.eflags, g.eflags,
+                split.eflags(),
+                g.eflags,
                 "eflags mismatch for {} (MOVZX/MOVSX must not touch flags)",
                 g.name
             );
@@ -16744,7 +16801,7 @@ mod tests {
                 g.name,
                 g.code,
                 fused.registers.gpr,
-                fused.registers.eflags,
+                fused.eflags(),
                 fused.registers.eip,
                 deltas,
                 fetch,
@@ -16803,7 +16860,7 @@ mod tests {
         // (PF clear), so only the always-set reserved bit 1 remains.
         assert_eq!(split.read_reg16(Reg16::Ax), 0x2345);
         assert_eq!(split.read_reg16(Reg16::Bx), 0x1111); // source untouched
-        assert_eq!(split.registers.eflags, 0x02);
+        assert_eq!(split.eflags(), 0x02);
         assert_eq!(split.registers.eip, 0x02);
         assert_eq!(split_outcome.core_clocks, 2);
     }
@@ -18184,11 +18241,7 @@ mod tests {
             let _ = split.cycle(&mut sbus);
 
             assert_eq!(split.registers.gpr, g.gpr, "gpr mismatch for {}", g.name);
-            assert_eq!(
-                split.registers.eflags, g.eflags,
-                "eflags mismatch for {}",
-                g.name
-            );
+            assert_eq!(split.eflags(), g.eflags, "eflags mismatch for {}", g.name);
             assert_eq!(split.registers.eip, g.eip, "eip mismatch for {}", g.name);
             let deltas: Vec<(usize, u8)> = sbus
                 .memory
@@ -18246,7 +18299,7 @@ mod tests {
                 g.name,
                 g.code,
                 fused.registers.gpr,
-                fused.registers.eflags,
+                fused.eflags(),
                 fused.registers.eip,
                 deltas,
                 fetch,
@@ -18534,11 +18587,7 @@ mod tests {
             let _ = split.cycle(&mut sbus);
 
             assert_eq!(split.registers.gpr, g.gpr, "gpr mismatch for {}", g.name);
-            assert_eq!(
-                split.registers.eflags, g.eflags,
-                "eflags mismatch for {}",
-                g.name
-            );
+            assert_eq!(split.eflags(), g.eflags, "eflags mismatch for {}", g.name);
             assert_eq!(split.registers.eip, g.eip, "eip mismatch for {}", g.name);
             let deltas: Vec<(usize, u8)> = sbus
                 .memory
@@ -18594,7 +18643,7 @@ mod tests {
                 g.name,
                 g.code,
                 fused.registers.gpr,
-                fused.registers.eflags,
+                fused.eflags(),
                 fused.registers.eip,
                 deltas,
                 fetch,
@@ -18862,11 +18911,7 @@ mod tests {
             let _ = split.cycle(&mut sbus);
 
             assert_eq!(split.registers.gpr, g.gpr, "gpr mismatch for {}", g.name);
-            assert_eq!(
-                split.registers.eflags, g.eflags,
-                "eflags mismatch for {}",
-                g.name
-            );
+            assert_eq!(split.eflags(), g.eflags, "eflags mismatch for {}", g.name);
             assert_eq!(split.registers.eip, g.eip, "eip mismatch for {}", g.name);
             let deltas: Vec<(usize, u8)> = sbus
                 .memory
@@ -18924,7 +18969,7 @@ mod tests {
                 g.code,
                 g.cx,
                 fused.registers.gpr,
-                fused.registers.eflags,
+                fused.eflags(),
                 fused.registers.eip,
                 deltas,
                 fetch,
@@ -19175,11 +19220,7 @@ mod tests {
                 "cs mismatch for {}",
                 g.name
             );
-            assert_eq!(
-                split.registers.eflags, g.eflags,
-                "eflags mismatch for {}",
-                g.name
-            );
+            assert_eq!(split.eflags(), g.eflags, "eflags mismatch for {}", g.name);
             assert_eq!(split.registers.eip, g.eip, "eip mismatch for {}", g.name);
             let deltas: Vec<(usize, u8)> = sbus
                 .memory
@@ -19239,7 +19280,7 @@ mod tests {
                 g.name,
                 fused.registers.gpr,
                 fused.registers.cs().selector,
-                fused.registers.eflags,
+                fused.eflags(),
                 fused.registers.eip,
                 deltas,
                 fetch,
@@ -19501,11 +19542,7 @@ mod tests {
             let _ = split.cycle(&mut sbus);
 
             assert_eq!(split.registers.gpr, g.gpr, "gpr mismatch for {}", g.name);
-            assert_eq!(
-                split.registers.eflags, g.eflags,
-                "eflags mismatch for {}",
-                g.name
-            );
+            assert_eq!(split.eflags(), g.eflags, "eflags mismatch for {}", g.name);
             assert_eq!(split.registers.eip, g.eip, "eip mismatch for {}", g.name);
             assert_eq!(
                 seam_fetch_count(&sbus),
@@ -19555,7 +19592,7 @@ mod tests {
                 g.name,
                 g.code,
                 fused.registers.gpr,
-                fused.registers.eflags,
+                fused.eflags(),
                 fused.registers.eip,
                 fetch,
             );
@@ -19898,11 +19935,7 @@ mod tests {
             let _ = split.cycle(&mut sbus);
 
             assert_eq!(split.registers.gpr, g.gpr, "gpr mismatch for {}", g.name);
-            assert_eq!(
-                split.registers.eflags, g.eflags,
-                "eflags mismatch for {}",
-                g.name
-            );
+            assert_eq!(split.eflags(), g.eflags, "eflags mismatch for {}", g.name);
             assert_eq!(split.registers.eip, g.eip, "eip mismatch for {}", g.name);
             for &(offset, value) in g.deltas {
                 assert_eq!(
@@ -19960,7 +19993,7 @@ mod tests {
                 "            // {}: gpr {:?}, eflags {:#x}, eip {:#x}, deltas {:?}, fetch {}",
                 g.name,
                 fused.registers.gpr,
-                fused.registers.eflags,
+                fused.eflags(),
                 fused.registers.eip,
                 deltas,
                 fetch,
@@ -20092,11 +20125,7 @@ mod tests {
             let _ = split.cycle(&mut sbus);
 
             assert_eq!(split.registers.gpr, g.gpr, "gpr mismatch for {}", g.name);
-            assert_eq!(
-                split.registers.eflags, g.eflags,
-                "eflags mismatch for {}",
-                g.name
-            );
+            assert_eq!(split.eflags(), g.eflags, "eflags mismatch for {}", g.name);
             assert_eq!(split.registers.eip, g.eip, "eip mismatch for {}", g.name);
             assert_eq!(
                 seam_fetch_count(&sbus),
@@ -20138,7 +20167,7 @@ mod tests {
                 g.name,
                 g.code,
                 fused.registers.gpr,
-                fused.registers.eflags,
+                fused.eflags(),
                 fused.registers.eip,
                 fetch,
             );
@@ -20460,11 +20489,7 @@ mod tests {
             let _ = split.cycle(&mut sbus);
 
             assert_eq!(split.registers.gpr, g.gpr, "gpr mismatch for {}", g.name);
-            assert_eq!(
-                split.registers.eflags, g.eflags,
-                "eflags mismatch for {}",
-                g.name
-            );
+            assert_eq!(split.eflags(), g.eflags, "eflags mismatch for {}", g.name);
             assert_eq!(split.registers.eip, g.eip, "eip mismatch for {}", g.name);
             let deltas: Vec<(usize, u8)> = sbus
                 .memory
@@ -20523,7 +20548,7 @@ mod tests {
                 g.name,
                 g.code,
                 fused.registers.gpr,
-                fused.registers.eflags,
+                fused.eflags(),
                 fused.registers.eip,
                 deltas,
                 fetch,
@@ -20707,11 +20732,7 @@ mod tests {
             let _ = split.cycle(&mut sbus);
 
             assert_eq!(split.registers.gpr, g.gpr, "gpr mismatch for {}", g.name);
-            assert_eq!(
-                split.registers.eflags, g.eflags,
-                "eflags mismatch for {}",
-                g.name
-            );
+            assert_eq!(split.eflags(), g.eflags, "eflags mismatch for {}", g.name);
             assert_eq!(split.registers.eip, g.eip, "eip mismatch for {}", g.name);
             let deltas: Vec<(usize, u8)> = sbus
                 .memory
@@ -20769,7 +20790,7 @@ mod tests {
                 g.name,
                 g.code,
                 fused.registers.gpr,
-                fused.registers.eflags,
+                fused.eflags(),
                 fused.registers.eip,
                 deltas,
                 fetch,
@@ -21275,11 +21296,7 @@ mod tests {
 
     fn assert_system_seg_state(cpu: &Cpu386, g: &SystemSegGolden) {
         assert_eq!(cpu.registers.gpr, g.gpr, "gpr mismatch for {}", g.name);
-        assert_eq!(
-            cpu.registers.eflags, g.eflags,
-            "eflags mismatch for {}",
-            g.name
-        );
+        assert_eq!(cpu.eflags(), g.eflags, "eflags mismatch for {}", g.name);
         assert_eq!(cpu.registers.eip, g.eip, "eip mismatch for {}", g.name);
         assert_eq!(cpu.control.cr0, g.cr0, "cr0 mismatch for {}", g.name);
         assert_eq!(
@@ -21408,7 +21425,7 @@ mod tests {
                 g.code,
                 g.protected,
                 fused.registers.gpr,
-                fused.registers.eflags,
+                fused.eflags(),
                 fused.registers.eip,
                 deltas,
                 fetch,
@@ -21482,11 +21499,7 @@ mod tests {
 
     fn assert_fpu_state(cpu: &Cpu386, g: &FpuGolden) {
         assert_eq!(cpu.registers.gpr, g.gpr, "gpr mismatch for {}", g.name);
-        assert_eq!(
-            cpu.registers.eflags, g.eflags,
-            "eflags mismatch for {}",
-            g.name
-        );
+        assert_eq!(cpu.eflags(), g.eflags, "eflags mismatch for {}", g.name);
         assert_eq!(cpu.registers.eip, g.eip, "eip mismatch for {}", g.name);
         assert_eq!(
             cpu.fpu.control, g.fpu_control,
@@ -21902,7 +21915,7 @@ mod tests {
                 g.name,
                 g.code,
                 fused.registers.gpr,
-                fused.registers.eflags,
+                fused.eflags(),
                 fused.registers.eip,
                 deltas,
                 fetch,
@@ -22365,11 +22378,7 @@ mod tests {
             exec_one_split(&mut split, &mut sbus).unwrap();
 
             assert_eq!(split.registers.gpr, g.gpr, "gpr mismatch for {}", g.name);
-            assert_eq!(
-                split.registers.eflags, g.eflags,
-                "eflags mismatch for {}",
-                g.name
-            );
+            assert_eq!(split.eflags(), g.eflags, "eflags mismatch for {}", g.name);
             assert_eq!(split.registers.eip, g.eip, "eip mismatch for {}", g.name);
             let mmx: [u64; 8] = std::array::from_fn(|i| split.fpu.mm(i as u8));
             assert_eq!(mmx, g.mmx, "mmx register mismatch for {}", g.name);
@@ -22448,7 +22457,7 @@ mod tests {
                 g.name,
                 g.code,
                 fused.registers.gpr,
-                fused.registers.eflags,
+                fused.eflags(),
                 fused.registers.eip,
                 deltas,
                 fetch,
@@ -22467,11 +22476,23 @@ mod tests {
         let mut cpu = Cpu386::default();
         let r = cpu.alu_add_eager(0xff, 0x01, 0, BusWidth::Byte); // CF=1, ZF=1 (result 0x00)
         let mut lazy = Cpu386::default();
-        lazy.pending_flags = Some(LazyFlags { a: 0xff, b: 0x01, result: r, width: BusWidth::Byte, is_sub: false });
+        lazy.pending_flags = Some(LazyFlags {
+            a: 0xff,
+            b: 0x01,
+            result: r,
+            width: BusWidth::Byte,
+            is_sub: false,
+        });
         lazy.set_flag(FLAG_CF, false); // CLC-like eager write
         assert!(!lazy.flag(FLAG_CF), "CF must be cleared by the eager write");
-        assert!(lazy.flag(FLAG_ZF), "ZF from the settled pending must survive");
-        assert!(lazy.pending_flags.is_none(), "set_flag must have settled the pending");
+        assert!(
+            lazy.flag(FLAG_ZF),
+            "ZF from the settled pending must survive"
+        );
+        assert!(
+            lazy.pending_flags.is_none(),
+            "set_flag must have settled the pending"
+        );
     }
 
     #[test]
@@ -22479,21 +22500,82 @@ mod tests {
         // arith_flag computed from a pending descriptor must equal the eager eflags bit for every
         // arithmetic flag, across widths and a spread of operand pairs (incl. carry/borrow/overflow/zero).
         let cases: &[(u32, u32, BusWidth)] = &[
-            (0xff, 0x01, BusWidth::Byte), (0x7f, 0x01, BusWidth::Byte), (0x00, 0x00, BusWidth::Byte),
+            (0xff, 0x01, BusWidth::Byte),
+            (0x7f, 0x01, BusWidth::Byte),
+            (0x00, 0x00, BusWidth::Byte),
             (0x01, 0xff, BusWidth::Byte), // a < b: SUB borrow path sets CF=1
-            (0x80, 0x80, BusWidth::Byte), (0xffff, 0x1, BusWidth::Word), (0x8000, 0x8000, BusWidth::Word),
-            (0xffff_ffff, 0x1, BusWidth::Dword), (0x1234_5678, 0x8765_4321, BusWidth::Dword),
+            (0x80, 0x80, BusWidth::Byte),
+            (0xffff, 0x1, BusWidth::Word),
+            (0x8000, 0x8000, BusWidth::Word),
+            (0xffff_ffff, 0x1, BusWidth::Dword),
+            (0x1234_5678, 0x8765_4321, BusWidth::Dword),
         ];
         for &(a, b, w) in cases {
             for is_sub in [false, true] {
                 let mut eager = Cpu386::default();
-                let r = if is_sub { eager.alu_sub_eager(a, b, 0, w) } else { eager.alu_add_eager(a, b, 0, w) };
+                let r = if is_sub {
+                    eager.alu_sub_eager(a, b, 0, w)
+                } else {
+                    eager.alu_add_eager(a, b, 0, w)
+                };
                 let mut lazy = Cpu386::default();
-                lazy.pending_flags = Some(LazyFlags { a: a & width_mask(w), b: b & width_mask(w), result: r, width: w, is_sub });
+                lazy.pending_flags = Some(LazyFlags {
+                    a: a & width_mask(w),
+                    b: b & width_mask(w),
+                    result: r,
+                    width: w,
+                    is_sub,
+                });
                 for f in [FLAG_CF, FLAG_PF, FLAG_AF, FLAG_ZF, FLAG_SF, FLAG_OF] {
-                    assert_eq!(lazy.flag(f), eager.flag(f), "flag {f:#x} a={a:#x} b={b:#x} sub={is_sub} w={w:?}");
+                    assert_eq!(
+                        lazy.flag(f),
+                        eager.flag(f),
+                        "flag {f:#x} a={a:#x} b={b:#x} sub={is_sub} w={w:?}"
+                    );
                 }
             }
         }
+    }
+
+    #[test]
+    fn alu_add_defers_and_reads_back_identically() {
+        // alu_add (carry 0) must set a pending whose flag reads equal the eager path's eflags bit-for-bit.
+        for &(a, b, w) in &[
+            (0xff_u32, 0x01_u32, BusWidth::Byte),
+            (0x1234_5678_u32, 0x8765_4321_u32, BusWidth::Dword),
+        ] {
+            let mut eager = Cpu386::default();
+            let er = eager.alu_add_eager(a, b, 0, w);
+            let mut lazy = Cpu386::default();
+            let lr = lazy.alu_add(a, b, 0, w);
+            assert_eq!(lr, er, "result");
+            assert!(lazy.pending_flags.is_some(), "carry-0 ADD must defer");
+            for f in [FLAG_CF, FLAG_PF, FLAG_AF, FLAG_ZF, FLAG_SF, FLAG_OF] {
+                assert_eq!(lazy.flag(f), eager.flag(f), "flag {f:#x}");
+            }
+        }
+    }
+
+    #[test]
+    fn whole_eflags_read_materializes_pending() {
+        // Reading the whole eflags word (e.g. via eflags()) after a pending op must equal the eager result.
+        let mut eager = Cpu386::default();
+        let r = eager.alu_add_eager(0x80, 0x80, 0, BusWidth::Byte); // CF=1, OF=1, ZF=1
+        let mut lazy = Cpu386::default();
+        lazy.pending_flags = Some(LazyFlags {
+            a: 0x80,
+            b: 0x80,
+            result: r,
+            width: BusWidth::Byte,
+            is_sub: false,
+        });
+        assert_eq!(
+            lazy.eflags(),
+            eager.registers.eflags,
+            "materialized whole eflags must match eager"
+        );
+        lazy.materialize_flags();
+        assert!(lazy.pending_flags.is_none());
+        assert_eq!(lazy.registers.eflags, eager.registers.eflags);
     }
 }

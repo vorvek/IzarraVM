@@ -348,7 +348,7 @@ fn diffs(cpu: &Cpu386, bus: &FlatBus, expected: &TestState, undefined: u32) -> V
     }
 
     if let Some(want) = regs.eflags {
-        let got = cpu.registers.eflags;
+        let got = cpu.eflags();
         let defined = MODELED_FLAGS & !undefined;
         if (want ^ got) & defined != 0 {
             out.push(format!(
