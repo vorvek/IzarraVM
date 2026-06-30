@@ -883,7 +883,7 @@ impl KateaTreeVolume {
         let live = self.gather_live();
         let live_keys: HashSet<(u32, [u8; 11])> =
             live.iter().map(|l| (l.dir_cluster, l.name)).collect();
-        // first_cluster -> the live entries claiming it (for rename matching, a later task).
+        // first_cluster -> the live entries claiming it (for rename matching in phase 2).
         let mut live_by_cluster: HashMap<u32, Vec<(u32, [u8; 11], bool)>> = HashMap::new();
         for l in &live {
             live_by_cluster.entry(l.first_cluster).or_default().push((
@@ -2120,12 +2120,15 @@ mod tests {
             n
         };
         let (o, m) = (n83(old), n83(new));
+        let mut found = false;
         for slot in (0..16).map(|i| i * 32) {
             if dsec[slot..slot + 11] == o {
                 dsec[slot..slot + 11].copy_from_slice(&m);
+                found = true;
                 break;
             }
         }
+        assert!(found, "rename_entry: {old} not found in dir sector 0");
         vol.write_sector(dir_lba, &dsec);
     }
 
@@ -2171,6 +2174,9 @@ mod tests {
 
     #[test]
     fn reconcile_moves_a_host_file_into_a_subdir() {
+        // Built by hand (not `fresh_vol`) because SUB must exist on the host BEFORE
+        // mount, so the tree walk registers its cluster in `dir_paths` — the move's
+        // destination dir must be known for the rename to resolve.
         let root = scratch("rec_move");
         std::fs::create_dir_all(root.join("SUB")).unwrap();
         let sys = vec![("KERNEL.SYS".to_string(), vec![0xEBu8; 100])];
