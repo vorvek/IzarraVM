@@ -14200,7 +14200,7 @@ mod tests {
         assert_eq!(CpuLevel::I286.cache_kb(), (0, 0));
         assert_eq!(CpuLevel::I386.cache_kb(), (0, 64));
         assert_eq!(CpuLevel::I486.cache_kb(), (16, 128));
-        assert_eq!(CpuLevel::I586.cache_kb(), (64, 512));
+        assert_eq!(CpuLevel::I586.cache_kb(), (32, 512));
     }
 
     // --- Phase 5 Slice A: RDTSC, RDMSR/WRMSR, the K6 MSR set, CR4 ---
@@ -15455,7 +15455,7 @@ mod tests {
         // The AMD-style L1 (0x80000005) and L2 (0x80000006) leaves carry the live level's
         // cache sizes in ECX: L1 KB in bits 31-24, L2 KB in bits 31-16.
         let mut cpu = run_cpuid(0x8000_0005);
-        assert_eq!(cpu.registers.ecx() >> 24, 64); // I586 L1 = 64 KB (K6: 32K I + 32K D)
+        assert_eq!(cpu.registers.ecx() >> 24, 32); // I586 L1 = 32 KB (P55C: 16K I + 16K D)
         cpu = run_cpuid(0x8000_0006);
         assert_eq!(cpu.registers.ecx() >> 16, 512); // I586 L2 = 512 KB
     }
