@@ -783,22 +783,13 @@ fn emulate(
     // the default (fast) so they finish inside their cycle budgets.
     machine.set_fast_post(false);
     machine.set_distira_render_threads(glide_render_threads);
-    // Boot real FreeDOS from this host folder via Katea: the storage controller
-    // presents the folder as a real ATA disk and the guest kernel does its own
-    // FAT / INT 21h (no Rust HLE). TOKAMOUS (our INT 33h PS/2 mouse TSR) and a
-    // mouse-loading AUTOEXEC are overlaid so the GUI boots with a working mouse,
-    // matching the old HLE C: default.
-    let overrides = vec![
-        (
-            "AUTOEXEC.BAT".to_string(),
-            b"@ECHO OFF\r\nPROMPT $P$G\r\nTOKAMOUS\r\n".to_vec(),
-        ),
-        (
-            "TOKAMOUS.COM".to_string(),
-            izarravm_firmware::tokamous_com().to_vec(),
-        ),
-    ];
-    if let Err(err) = machine.mount_hdd_folder_with(&c_drive, overrides) {
+    // Boot real FreeDOS from this host folder via Katea: the controller presents
+    // the folder as a real ATA disk and the kernel does its own FAT / INT 21h.
+    // mount_hdd_folder seeds the user-owned CONFIG.SYS/AUTOEXEC.BAT (which loads
+    // TOKAMOUS and SET BLASTER) and overlays the OS binaries (TOKAMOUS.COM ships
+    // on the payload), so the mouse and Sound Blaster work and the user owns the
+    // config. "Repair Toka-DOS" in the BIOS setup menu resets it.
+    if let Err(err) = machine.mount_hdd_folder(&c_drive) {
         error!(%err, "failed to mount C: host folder");
     }
     // Bring the RTC online: load cmos.bin (or write defaults) and seed the clock
