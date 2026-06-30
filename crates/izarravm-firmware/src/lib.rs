@@ -12,6 +12,8 @@ pub const ECHO_COM: &[u8] = include_bytes!("../roms/dos/echo.com");
 pub const ECHO_COM_SOURCE: &str = include_str!("../roms/dos/echo.asm");
 pub const TYPE_COM: &[u8] = include_bytes!("../roms/dos/type.com");
 pub const TYPE_COM_SOURCE: &str = include_str!("../roms/dos/type.asm");
+pub const RUNNER_COM: &[u8] = include_bytes!("../roms/dos/runner.com");
+pub const RUNNER_COM_SOURCE: &str = include_str!("../roms/dos/runner.asm");
 pub const EXEHELLO_EXE: &[u8] = include_bytes!("../roms/dos/exehello.exe");
 pub const EXEHELLO_EXE_SOURCE: &str = include_str!("../roms/dos/exehello.asm");
 /// The freestanding Dhrystone 2.1 benchmark, built as a small-model DOS .EXE.
@@ -232,6 +234,12 @@ pub fn hello_com() -> &'static [u8] {
 
 pub fn echo_com() -> &'static [u8] {
     ECHO_COM
+}
+
+/// The `--katea-run` harness: EXECs the named program, captures its exit code, and
+/// reports it to the unit-tester exit port. Overlaid onto C: as `RUNNER.COM`.
+pub fn runner_com() -> &'static [u8] {
+    RUNNER_COM
 }
 
 pub fn exehello_exe() -> &'static [u8] {
