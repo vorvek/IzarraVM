@@ -574,9 +574,9 @@ pub(crate) struct KateaTreeVolume {
     /// `(first_cluster, last_cluster, role)` runs, sorted by `first_cluster`.
     runs: Vec<(u32, u32, Role)>,
     /// Sparse write overlay: guest writes land here, reads consult it first. Held
-    /// until eject (no eviction in M2). RAM is bounded by bytes written this
-    /// session. // ponytail: overlay-until-eject; the upgrade is per-file
-    /// host-redirect eviction (M2.5) if multi-GB in-session writes ever matter.
+    /// until eject (no eviction in M2). RAM is bounded by bytes written this session.
+    // ponytail: overlay-until-eject; the upgrade is per-file host-redirect eviction
+    // (M2.5) if multi-GB in-session writes ever matter.
     overlay: HashMap<u32, [u8; SECTOR]>,
 }
 
