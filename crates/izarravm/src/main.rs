@@ -812,6 +812,26 @@ fn katea_run_prog_name(prog: &std::path::Path) -> String {
     format!("PROG.{ext}")
 }
 
+/// A temp directory that removes itself (and any contents) when dropped — on
+/// success, an early `?` return, or a panic.
+struct TempDir(std::path::PathBuf);
+
+impl TempDir {
+    fn new(path: std::path::PathBuf) -> std::io::Result<Self> {
+        std::fs::create_dir_all(&path)?;
+        Ok(Self(path))
+    }
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Boot real FreeDOS from an empty temp dir (the target + RUNNER.COM + a runner
 /// AUTOEXEC overlaid InMemory) via Katea, run the target through RUNNER.COM, and
 /// return its DOS exit code. The screen text is printed for diagnostics.
@@ -828,21 +848,21 @@ fn katea_run(prog: &std::path::Path, profile: MachineProfile) -> Result<i32, Box
         (name, bytes),
     ];
 
-    let dir = std::env::temp_dir().join(format!(
+    // A self-cleaning temp dir: removed on every path (success, the `?` errors
+    // below, or a panic), so a corpus run that hits errors can't accumulate dirs.
+    let dir = TempDir::new(std::env::temp_dir().join(format!(
         "katea_run_{}_{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir)?;
+    )))?;
 
     let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios())?;
-    machine.mount_hdd_folder_with(&dir, overrides)?;
+    machine.mount_hdd_folder_with(dir.path(), overrides)?;
     let stop = machine.run_until_halt_or_cycles(500_000_000)?;
     print!("{}", machine.screen_text().as_text());
-    let _ = std::fs::remove_dir_all(&dir);
 
     let code = match stop {
         StopReason::TestExit { code } | StopReason::DosExit { code } => i32::from(code),
