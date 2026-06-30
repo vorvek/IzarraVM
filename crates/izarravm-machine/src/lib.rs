@@ -40,6 +40,7 @@ mod ide;
 mod katea_names;
 mod katea_tree;
 mod katea_volume;
+mod katea_write;
 mod keyboard;
 mod lpt;
 mod memmap;
