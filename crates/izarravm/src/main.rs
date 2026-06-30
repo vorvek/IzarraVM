@@ -1532,4 +1532,100 @@ mod tokados_smoke {
             "TYPE did not print the subfolder file's contents read lazily through the tree facade.\n{type_text}"
         );
     }
+
+    /// Katea-1 M2 success gate: real FreeDOS, booted from a host folder, creates a
+    /// new file, overwrites an existing one, and grows one — all in a subfolder,
+    /// plus MKDIR a host subdir with a file at depth — and the changes appear
+    /// correctly in the host folder (verified by host-side read-back), with the
+    /// read tree + boot intact.
+    #[test]
+    #[ignore = "boots a full DOS image and writes through Katea (slow in debug); run with --ignored"]
+    fn katea_host_folder_writes_create_overwrite_grow_in_a_subfolder() {
+        let dir = std::env::temp_dir().join(format!(
+            "katea_m2_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let saves = dir.join("SAVES");
+        std::fs::create_dir_all(&saves).expect("scratch tree");
+        // Pre-seed a file to overwrite and a batch file holding the write commands
+        // as exact bytes (so `>`/`>>`/`\` never go through the keyboard).
+        std::fs::write(saves.join("OLD.TXT"), b"before\r\n").expect("seed OLD.TXT");
+        let make_bat = b"echo created>NEW.TXT\r\n\
+echo overwritten>OLD.TXT\r\n\
+echo line1>GROW.TXT\r\n\
+echo line2>>GROW.TXT\r\n\
+mkdir SUB\r\n\
+echo deep>SUB\\DEEP.TXT\r\n";
+        std::fs::write(saves.join("MAKE.BAT"), make_bat).expect("seed MAKE.BAT");
+
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .expect("build machine");
+        machine.mount_hdd_folder(&dir).expect("mount host folder");
+        let stop = machine
+            .run_until_halt_or_cycles(500_000_000)
+            .expect("run machine");
+        if let StopReason::CpuError(msg) = &stop {
+            let text = machine.screen_text().as_text();
+            std::fs::remove_dir_all(&dir).ok();
+            panic!("CPU fault during Katea M2 boot: {msg}\nstop={stop:?}\n{text}");
+        }
+        let boot_text = machine.screen_text().as_text().to_ascii_lowercase();
+        assert!(
+            boot_text.contains("c:\\>"),
+            "no C:\\> prompt after boot (stop={stop:?}).\n{boot_text}"
+        );
+
+        // Only letters are typed: cd into SAVES, then run MAKE.BAT.
+        for cmd in ["cd saves\r", "make\r"] {
+            for ch in cmd.chars() {
+                for code in ascii_to_set1(ch) {
+                    machine.inject_key_scancodes(&[code]);
+                }
+                machine
+                    .run_until_halt_or_cycles(5_000_000)
+                    .expect("type cmd");
+            }
+            machine
+                .run_until_halt_or_cycles(120_000_000)
+                .expect("settle cmd");
+        }
+
+        // Final reconcile, then read the host folder back.
+        machine.flush_hdd_folder();
+
+        let read = |p: std::path::PathBuf| -> String {
+            String::from_utf8_lossy(&std::fs::read(p).unwrap_or_default()).to_string()
+        };
+        let new_txt = read(saves.join("NEW.TXT"));
+        let old_txt = read(saves.join("OLD.TXT"));
+        let grow_txt = read(saves.join("GROW.TXT"));
+        let deep_txt = read(saves.join("SUB").join("DEEP.TXT"));
+        let sub_is_dir = saves.join("SUB").is_dir();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            new_txt.contains("created"),
+            "NEW.TXT not created: {new_txt:?}"
+        );
+        assert!(
+            old_txt.contains("overwritten") && !old_txt.contains("before"),
+            "OLD.TXT not overwritten: {old_txt:?}"
+        );
+        assert!(
+            grow_txt.contains("line1") && grow_txt.contains("line2"),
+            "GROW.TXT not grown: {grow_txt:?}"
+        );
+        assert!(sub_is_dir, "SUB subdir not created on host");
+        assert!(
+            deep_txt.contains("deep"),
+            "SUB\\DEEP.TXT not created: {deep_txt:?}"
+        );
+    }
 }
