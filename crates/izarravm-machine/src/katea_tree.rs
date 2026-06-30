@@ -636,6 +636,18 @@ struct PendingWrite {
     first_cluster: u32,
 }
 
+/// A disappeared mirrored file whose clusters are now claimed by exactly one fresh
+/// live entry: a rename/move. The host file at `old_path` is `fs::rename`d to
+/// `new_path`, and the mirror re-keyed from `old_key` to `new_key`. Collected
+/// during the read phase and applied afterwards so no `&self` borrow spans the I/O.
+struct PendingRename {
+    old_key: (u32, [u8; 11]),
+    new_key: (u32, [u8; 11]),
+    old_path: PathBuf,
+    new_path: PathBuf,
+    first_cluster: u32,
+}
+
 impl KateaTreeVolume {
     /// Build the whole-disk view from the boot sectors, a host folder, and the
     /// in-memory system files overlaid at the root. Construction walks metadata
@@ -881,29 +893,80 @@ impl KateaTreeVolume {
             ));
         }
 
-        // PHASE 2: disappearances. A mirrored entry no longer live is a delete (or a
-        // rename in a later task, or held). Collect read-only, then apply.
+        // PHASE 2: disappearances — a mirrored entry no longer live is a rename/move
+        // (a fresh entry claims its clusters), a delete (chain freed, no claimant), or
+        // held. Collected read-only, then applied. `handled` tells phase 3 to skip an
+        // entry already moved/renamed here.
         let mut deletes: Vec<((u32, [u8; 11]), PathBuf)> = Vec::new();
+        let mut renames: Vec<PendingRename> = Vec::new();
+        let mut handled: HashSet<(u32, [u8; 11])> = HashSet::new();
         for (key, m) in &self.mirrored {
             if live_keys.contains(key) || m.is_dir {
-                continue; // still live, or a directory (a later task)
+                continue; // still live, or a directory (Task 4)
             }
-            // Delete only when no live entry holds the data: empty file, or the chain
-            // was freed and nothing claims the first cluster. Otherwise HOLD.
+            // Rename/move: exactly one FRESH live entry (not already mirrored) holds
+            // this entry's clusters, with a real cluster and matching kind.
+            if m.first_cluster >= 2 {
+                if let Some(claimants) = live_by_cluster.get(&m.first_cluster) {
+                    let fresh: Vec<&(u32, [u8; 11], bool)> = claimants
+                        .iter()
+                        .filter(|(d, n, is_dir)| {
+                            *is_dir == m.is_dir && !self.mirrored.contains_key(&(*d, *n))
+                        })
+                        .collect();
+                    if fresh.len() == 1 {
+                        let &(ndir, nname, _) = fresh[0];
+                        if let Some(host_dir) = self.dir_paths.get(&ndir).cloned() {
+                            let new_path = host_dir.join(crate::katea_volume::decode_83(&nname));
+                            renames.push(PendingRename {
+                                old_key: *key,
+                                new_key: (ndir, nname),
+                                old_path: m.host_path.clone(),
+                                new_path,
+                                first_cluster: m.first_cluster,
+                            });
+                            handled.insert((ndir, nname));
+                            continue;
+                        }
+                    }
+                }
+            }
+            // Delete: empty file, or chain freed with no claimant. Else HOLD.
             let freed = m.first_cluster < 2 || self.fat_entry(m.first_cluster) == 0;
             let claimed = live_by_cluster.contains_key(&m.first_cluster);
             if freed && !claimed {
                 deletes.push((*key, m.host_path.clone()));
             }
         }
+        // Apply renames first (so a move's source path still exists), then deletes.
+        for r in renames {
+            if let Err(e) = std::fs::rename(&r.old_path, &r.new_path) {
+                eprintln!(
+                    "katea: rename {} -> {} failed: {e}",
+                    r.old_path.display(),
+                    r.new_path.display()
+                );
+                continue;
+            }
+            self.mirrored.remove(&r.old_key);
+            self.mirrored.insert(
+                r.new_key,
+                MirrorEntry {
+                    host_path: r.new_path,
+                    first_cluster: r.first_cluster,
+                    is_dir: false,
+                    last_fingerprint: None,
+                },
+            );
+        }
         for (key, path) in deletes {
             if let Err(e) = std::fs::remove_file(&path) {
                 if path.exists() {
                     eprintln!("katea: delete {} failed: {e}", path.display());
-                    continue; // hold — the host file is still there
+                    continue;
                 }
             }
-            self.mirrored.remove(&key); // removed (or already absent): drop the mirror
+            self.mirrored.remove(&key);
         }
 
         let spc = u32::from(self.geo.spc);
@@ -984,6 +1047,9 @@ impl KateaTreeVolume {
                             (0..spc).any(|s| self.overlay.contains_key(&(base + s)))
                         });
                         let is_new = !self.mirrored.contains_key(&(dir_cluster, name));
+                        if handled.contains(&(dir_cluster, name)) {
+                            continue; // already moved/renamed in phase 2
+                        }
                         if !(data_written || (dir_written && is_new)) {
                             continue;
                         }
@@ -2036,6 +2102,97 @@ mod tests {
         assert!(
             root.join("KEEP.TXT").exists(),
             "an intact-chain disappearance must be held, not deleted"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Rename a directory entry in place (DOS `ren`): same slot, same cluster, new
+    /// name. Finds `old` in `dir_cluster`'s sector 0 and overwrites its 11 name bytes.
+    #[cfg(test)]
+    fn rename_entry(vol: &mut KateaTreeVolume, dir_cluster: u32, old: &str, new: &str) {
+        let dir_lba = vol.cluster_to_lba(dir_cluster);
+        let mut dsec = vol.read_sector(dir_lba);
+        let n83 = |s: &str| {
+            let mut n = [b' '; 11];
+            let (b, x) = s.split_once('.').unwrap_or((s, ""));
+            n[..b.len()].copy_from_slice(b.as_bytes());
+            n[8..8 + x.len()].copy_from_slice(x.as_bytes());
+            n
+        };
+        let (o, m) = (n83(old), n83(new));
+        for slot in (0..16).map(|i| i * 32) {
+            if dsec[slot..slot + 11] == o {
+                dsec[slot..slot + 11].copy_from_slice(&m);
+                break;
+            }
+        }
+        vol.write_sector(dir_lba, &dsec);
+    }
+
+    /// Append a directory entry (no data/FAT writes) to `dir_cluster`'s sector 0,
+    /// modeling a move/link of an existing chain into a new directory.
+    #[cfg(test)]
+    fn stamp_file_entry_only(
+        vol: &mut KateaTreeVolume,
+        dir_cluster: u32,
+        name: &str,
+        attr: u8,
+        first: u32,
+        size: u32,
+    ) {
+        let dir_lba = vol.cluster_to_lba(dir_cluster);
+        let mut dsec = vol.read_sector(dir_lba);
+        let mut n = [b' '; 11];
+        let (b, x) = name.split_once('.').unwrap_or((name, ""));
+        n[..b.len()].copy_from_slice(b.as_bytes());
+        n[8..8 + x.len()].copy_from_slice(x.as_bytes());
+        let entry = crate::fat32::fat32_dir_entry(&n, attr, first, 0, 0, size);
+        let slot = (0..16)
+            .map(|i| i * 32)
+            .find(|&o| dsec[o] == 0x00 || dsec[o] == 0xE5)
+            .expect("a free dir slot");
+        dsec[slot..slot + 32].copy_from_slice(&entry);
+        vol.write_sector(dir_lba, &dsec);
+    }
+
+    #[test]
+    fn reconcile_renames_a_host_file_in_place() {
+        let (mut vol, root) = fresh_vol("rec_ren");
+        let free = vol.next_free;
+        stamp_file(&mut vol, 2, "OLD.TXT", 0x20, free, b"keepme\r\n");
+        vol.reconcile();
+        assert!(root.join("OLD.TXT").exists());
+        rename_entry(&mut vol, 2, "OLD.TXT", "NEW.TXT");
+        vol.reconcile();
+        assert!(!root.join("OLD.TXT").exists(), "old name gone");
+        assert_eq!(std::fs::read(root.join("NEW.TXT")).unwrap(), b"keepme\r\n");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn reconcile_moves_a_host_file_into_a_subdir() {
+        let root = scratch("rec_move");
+        std::fs::create_dir_all(root.join("SUB")).unwrap();
+        let sys = vec![("KERNEL.SYS".to_string(), vec![0xEBu8; 100])];
+        let img = izarravm_firmware::tokados_hdd_img();
+        let mut mbr = [0u8; 512];
+        mbr.copy_from_slice(&img[0..512]);
+        let mut vbr = [0u8; 512];
+        vbr.copy_from_slice(&img[2048 * 512..2048 * 512 + 512]);
+        let mut vol = KateaTreeVolume::new(&mbr, &vbr, &root, &sys).unwrap();
+        let sub_fc = vol.tree().root.subdirs[0].dir.first_cluster;
+        let free = vol.next_free;
+        stamp_file(&mut vol, 2, "M.TXT", 0x20, free, b"moved\r\n");
+        vol.reconcile();
+        assert!(root.join("M.TXT").exists());
+        // Move M.TXT from root into SUB: 0xE5 in root, fresh entry in SUB, same cluster.
+        delete_entry(&mut vol, 2, "M.TXT");
+        stamp_file_entry_only(&mut vol, sub_fc, "M.TXT", 0x20, free, 6);
+        vol.reconcile();
+        assert!(!root.join("M.TXT").exists(), "gone from root");
+        assert_eq!(
+            std::fs::read(root.join("SUB").join("M.TXT")).unwrap(),
+            b"moved\r\n"
         );
         std::fs::remove_dir_all(&root).ok();
     }
