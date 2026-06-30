@@ -57,3 +57,44 @@ removes the stack warning. The output starts with the bytes `4D 5A` ("MZ").
 Delete the `cstart.obj`, `dhry_1.obj`, and `dhry_2.obj` intermediates afterward.
 The `wcc` "no prototype" and "missing return value" warnings are inherent to the
 original K&R-style source and are expected.
+
+# Whetstone benchmark (.EXE)
+
+`whetstone.exe` is the Whetstone (Curnow / Wichmann) double-precision benchmark,
+version 1.2 (Rich Painter 1998, public domain), adapted the same way Dhrystone was:
+freestanding, no host services, the result folded to a 16-bit self-check reported
+through the Lotura unit-tester. It is the **FP oracle** for the per-mode `fp_timing`
+factor (see `crates/izarravm-cpu/src/lib.rs`). The harness multiplies its
+iters/sec by a per-sweep FLOP weight to print MFLOPS (see `BENCHES` in
+`crates/izarravm/src/main.rs`).
+
+## Self-contained transcendentals
+
+The standard module sequence and per-module weights (N2..N11) are unchanged, so the
+floating-point operation mix is the original. The six libm transcendentals
+(sin/cos/atan/sqrt/exp/log) are provided as thin **inline-8087 `#pragma aux`
+wrappers** (FSIN/FCOS/FPATAN/F2XM1/FYL2X/FSQRT) in `whetstone.c`, so the .EXE links
+with ZERO libraries, exactly like `dhrystone.exe`. `cstart_whet.asm` FNINIT's the
+FPU and defines `__8087` (the FPU-presence marker `-fpi87` references). The bench is
+486+ (it needs an FPU).
+
+## Files
+
+- `whetstone.c` - the adapted public-domain Whetstone 1.2.
+- `cstart_whet.asm` - the freestanding .EXE startup + the device report path.
+- `whetstone.exe` - the checked-in linked benchmark.
+
+## Rebuild
+
+From this directory, with Open Watcom at `D:/DevTools/OpenWatcom`:
+
+    export WATCOM="D:/DevTools/OpenWatcom"
+    export INCLUDE="D:/DevTools/OpenWatcom/h"
+    "D:/DevTools/OpenWatcom/binnt/wasm.exe" cstart_whet.asm
+    "D:/DevTools/OpenWatcom/binnt/wcc.exe" -ms -0 -fpi87 -fp3 -s -zl -ot whetstone.c
+    "D:/DevTools/OpenWatcom/binnt/wlink.exe" format dos option start=cstart_, quiet \
+        name whetstone.exe file cstart_whet.obj file whetstone.obj
+
+`-fpi87 -fp3` selects inline hardware FP at the 387 level (so FSIN/FCOS assemble).
+The output starts with `4D 5A` ("MZ"). Delete the `cstart_whet.obj` and
+`whetstone.obj` intermediates afterward.

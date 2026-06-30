@@ -56,26 +56,26 @@ pub enum GswMode {
 impl GswMode {
     /// The throttled core clock per compatibility mode: 8.33 MHz (286 mode, the Super
     /// Slow setting), 22 MHz (386 mode, picked for the early-386 game range), 66 MHz
-    /// (486 mode), and 266 MHz native (the K6-266 bin on the 66 MHz bus).
+    /// (486 mode), and 200 MHz native (the Pentium MMX-200 / P55C on the 66 MHz bus).
     pub const fn clock_hz(self) -> u64 {
         match self {
             Self::Gsw286 => 8_333_333,
             Self::Gsw386 => 22_000_000,
             Self::Gsw486 => 66_000_000,
-            Self::Gsw586 => 266_000_000,
+            Self::Gsw586 => 200_000_000,
         }
     }
 
     /// Reported cache sizes per compatibility mode as (L1 KB, L2 KB). The L2 is a
     /// motherboard cache module. Mirrors `CpuLevel::cache_kb` and the machine
     /// CacheModel geometry, which drive data-access timing (no longer cosmetic).
-    /// The 586 L1 is 64 KB: the K6 has 32 KB instruction + 32 KB data.
+    /// The 586 L1 is 32 KB: the Pentium MMX (P55C) has 16 KB instruction + 16 KB data.
     pub const fn cache_kb(self) -> (u16, u16) {
         match self {
             Self::Gsw286 => (0, 0),
             Self::Gsw386 => (0, 64),
             Self::Gsw486 => (16, 128),
-            Self::Gsw586 => (64, 512),
+            Self::Gsw586 => (32, 512),
         }
     }
 
@@ -1137,7 +1137,7 @@ mod tests {
         assert_eq!(GswMode::Gsw286.clock_hz(), 8_333_333);
         assert_eq!(GswMode::Gsw386.clock_hz(), 22_000_000);
         assert_eq!(GswMode::Gsw486.clock_hz(), 66_000_000);
-        assert_eq!(GswMode::Gsw586.clock_hz(), 266_000_000);
+        assert_eq!(GswMode::Gsw586.clock_hz(), 200_000_000);
         assert_eq!(GswMode::Gsw286.canonical_name(), "286");
         assert_eq!(GswMode::Gsw586.canonical_name(), "586");
         assert_eq!(GswMode::default(), GswMode::Gsw386);
@@ -1148,7 +1148,7 @@ mod tests {
         assert_eq!(GswMode::Gsw286.cache_kb(), (0, 0));
         assert_eq!(GswMode::Gsw386.cache_kb(), (0, 64));
         assert_eq!(GswMode::Gsw486.cache_kb(), (16, 128));
-        assert_eq!(GswMode::Gsw586.cache_kb(), (64, 512));
+        assert_eq!(GswMode::Gsw586.cache_kb(), (32, 512));
     }
 
     #[test]

@@ -326,6 +326,10 @@ struct Bench {
     name: &'static str,
     source: BenchSource,
     min_mode: GswMode,
+    /// Floating-point operations per reported iteration. When set, the harness
+    /// reports `MFLOPS = iters_per_sec * flops_per_iter / 1e6` and bands against it
+    /// (Whetstone, the FP oracle). `None` benches band against raw `iters/sec`.
+    flops_per_iter: Option<f64>,
 }
 
 const BENCHES: &[Bench] = &[
@@ -333,18 +337,36 @@ const BENCHES: &[Bench] = &[
         name: "sieve",
         source: BenchSource::BootSelector(1),
         min_mode: GswMode::Gsw286,
+        flops_per_iter: None,
     },
     Bench {
         name: "fp-mandel",
         source: BenchSource::BootSelector(3),
         min_mode: GswMode::Gsw486,
+        flops_per_iter: None,
     },
     Bench {
         name: "dhrystone",
         source: BenchSource::DosExe(izarravm_firmware::DHRYSTONE_EXE),
         min_mode: GswMode::Gsw286,
+        flops_per_iter: None,
+    },
+    // Whetstone: the FP oracle (486+). `flops_per_iter` is the per-sweep FLOP weight,
+    // anchored so the era-calibrated 486 lands at ~6.5 MFLOPS (Roy Longbottom); the
+    // 586 is then tuned to ~34.5 MFLOPS via fp_timing(I586). See whetstone.c.
+    Bench {
+        name: "whetstone",
+        source: BenchSource::DosExe(izarravm_firmware::WHETSTONE_EXE),
+        min_mode: GswMode::Gsw486,
+        flops_per_iter: Some(WHETSTONE_FLOPS_PER_SWEEP),
     },
 ];
+
+/// FLOP weight per Whetstone sweep (the value reported as one iteration). Anchored
+/// to the era 486DX2-66 Whetstone figure (~6.5 MFLOPS): the measured 486 throughput
+/// (250.0 sweeps/sec, era-calibrated 486 timing) times this over 1e6 == 6.5. A pure
+/// units constant; the physical 586/486 ratio lives in fp_timing(I586).
+const WHETSTONE_FLOPS_PER_SWEEP: f64 = 26000.0;
 
 /// Rank the modes from slowest to fastest so a benchmark's min_mode gates which
 /// modes it runs in.
@@ -416,6 +438,15 @@ fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
             } else {
                 0.0
             };
+            // For an FP bench (flops_per_iter set) the metric of record is MFLOPS;
+            // it is what we print and band against. Other benches band on iters/sec.
+            let (band_value, mflops_suffix) = match bench.flops_per_iter {
+                Some(w) => {
+                    let mflops = iters_per_sec * w / 1e6;
+                    (mflops, format!(" mflops={mflops:.2}"))
+                }
+                None => (iters_per_sec, String::new()),
+            };
             print!(
                 "{:<10} {:<5} {:>12.2} {:>8} {:>9} {:>12.1} {:>10.3} {:>9.3} {:>10.3}",
                 bench.name,
@@ -432,7 +463,11 @@ fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
             // observability only and never changes the exit code. After B-T9
             // calibration every row tags [in band] (the compute caps the bus model
             // cannot reach were relaxed to best-effort; see bench_reference.rs).
-            println!("{}", band_tag(bench.name, mode, iters_per_sec));
+            println!(
+                "{}{}",
+                mflops_suffix,
+                band_tag(bench.name, mode, band_value)
+            );
         }
     }
     Ok(())
