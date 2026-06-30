@@ -96,16 +96,10 @@ configend:
 
 realentry:                              ; execution continues here
 
-                push ax
-                push bx
-                pushf              
-                mov ax, 0e31h           ; '1' Tracecode - kernel entered
-                mov bx, 00f0h                                        
-                int 010h
-                popf
-                pop bx
-                pop ax
-
+                ; (Toka-DOS: removed the '1'/'2'/'3' boot tracecodes that printed
+                ; "123" after the boot sector's load message. BL still holds the
+                ; boot drive from the VBR; nothing below clobbers it before it is
+                ; saved to _BootDrive.)
                 jmp     IGROUP:kernel_start
 beyond_entry:   times   256-(beyond_entry-entry) db 0
                                         ; scratch area for data (DOS_PSP)
@@ -119,14 +113,6 @@ segment INIT_TEXT
                 ; kernel start-up
                 ;
 kernel_start:
-
-                push bx
-                pushf              
-                mov ax, 0e32h           ; '2' Tracecode - kernel entered
-                mov bx, 00f0h                                        
-                int 010h
-                popf
-                pop bx
 
                 mov     ax,I_GROUP
                 cli
@@ -184,14 +170,6 @@ kernel_start:
 cont:           ; Now set up call frame
                 mov     ds,[cs:_INIT_DGROUP]
                 mov     bp,sp           ; and set up stack frame for c
-
-                push bx
-                pushf              
-                mov ax, 0e33h           ; '3' Tracecode - kernel entered
-                mov bx, 00f0h                                        
-                int 010h
-                popf
-                pop bx
 
                 mov     byte [_BootDrive],bl ; tell where we came from
 

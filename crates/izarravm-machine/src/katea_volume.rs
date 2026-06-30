@@ -930,7 +930,7 @@ mod tests {
             payload.files.iter().map(|(n, d)| (n.as_str(), d)).collect();
         assert_eq!(
             by_name.get("KERNEL.SYS").map(|d| d.len()),
-            Some(70162),
+            Some(70130),
             "KERNEL.SYS size"
         );
         assert_eq!(

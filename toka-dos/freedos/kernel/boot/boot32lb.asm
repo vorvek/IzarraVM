@@ -135,9 +135,9 @@ cont:		mov	ds, ax
 		sti
 		mov	[drive], dl	; BIOS passes drive number in DL
 
-		mov	si, msg_LoadFreeDOS
-		call	print		; modifies AX BX SI
-
+		; (Toka-DOS: the BIOS already prints "Starting Toka-DOS..." and the
+		; kernel prints its own banner, so the boot sector loads silently --
+		; the old "Loading FreeDOS " message and string were removed.)
 
 ; -------------
 
@@ -392,8 +392,6 @@ no_incr_es:	pop	di
 		ret
 
 ;-----------------------------------------------------------------------
-
-msg_LoadFreeDOS db "Loading FreeDOS ",0
 
        times 0x01ee-$+$$ db 0
 
