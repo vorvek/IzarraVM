@@ -1827,4 +1827,31 @@ del PREEXIST.TXT\r\n";
         );
         assert!(preexist_gone, "pre-existing PREEXIST.TXT not deleted");
     }
+
+    /// The katea-run gate: a program that exits 42, run through real FreeDOS via
+    /// --katea-run, makes `katea_run` return 42 — proving boot -> AUTOEXEC -> RUNNER
+    /// -> EXEC -> AH=4Dh -> unit-tester exit -> TestExit, end to end.
+    #[test]
+    #[ignore = "boots a full FreeDOS image to run one program (slow); run with --ignored"]
+    fn katea_run_captures_a_program_exit_code() {
+        let dir = std::env::temp_dir().join(format!(
+            "katea_run_e2e_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prog = dir.join("EXIT42.COM");
+        std::fs::write(&prog, izarravm_firmware::exit42_com()).unwrap();
+
+        let code =
+            katea_run(&prog, MachineProfile::gsw_386(16, VideoCard::Et4000Ax)).expect("katea_run");
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            code, 42,
+            "the program's DOS exit code must reach the host process"
+        );
+    }
 }
