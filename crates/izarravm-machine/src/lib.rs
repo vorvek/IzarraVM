@@ -19966,8 +19966,9 @@ mod tests {
     #[test]
     fn flush_hdd_folder_runs_a_final_reconcile() {
         // Mount a temp folder, then flush; confirm flush is callable and a no-op on
-        // an unwritten folder (creates nothing). The end-to-end create/overwrite/grow
-        // is covered by the e2e smoke test; this only proves the plumbing exists.
+        // an unwritten folder (creates nothing beyond the config mount seeds). The
+        // end-to-end create/overwrite/grow is covered by the e2e smoke test; this
+        // only proves the plumbing exists.
         let dir = std::env::temp_dir().join(format!("katea_flush_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -19977,10 +19978,25 @@ mod tests {
         )
         .unwrap();
         m.mount_hdd_folder(&dir).unwrap();
+        // mount_hdd_folder seeds the user-owned CONFIG.SYS/AUTOEXEC.BAT.
+        let listing = |dir: &std::path::Path| -> std::collections::BTreeSet<String> {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect()
+        };
+        let after_mount = listing(&dir);
+        assert!(
+            after_mount.contains("CONFIG.SYS") && after_mount.contains("AUTOEXEC.BAT"),
+            "mount seeds the user-owned config"
+        );
         m.flush_hdd_folder();
-        // With nothing written, no spurious files are created.
-        let count = std::fs::read_dir(&dir).unwrap().count();
-        assert_eq!(count, 0, "flush on an unwritten folder creates nothing");
+        // With nothing written by the guest, flush creates nothing new.
+        assert_eq!(
+            listing(&dir),
+            after_mount,
+            "flush on an unwritten folder creates nothing beyond the seed"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
