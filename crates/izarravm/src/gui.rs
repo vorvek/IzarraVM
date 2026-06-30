@@ -1,7 +1,6 @@
 use crate::prefs::{self, CrtStyle, GuiPrefs, KeyBinding};
 use izarravm_audio::{AudioPlayer, AudioSink};
 use izarravm_core::GswMode;
-use izarravm_dos::HostDrive;
 use izarravm_input::HostKeyboard;
 use izarravm_machine::{ActiveDisplay, Machine, MachineProfile, StopReason};
 use izarravm_video::{DISTIRA_RENDER_THREAD_CHOICES, normalize_distira_render_threads};
@@ -784,13 +783,24 @@ fn emulate(
     // the default (fast) so they finish inside their cycle budgets.
     machine.set_fast_post(false);
     machine.set_distira_render_threads(glide_render_threads);
-    match HostDrive::mount_c(&c_drive) {
-        Ok(drive) => machine.mount_c_drive(drive),
-        Err(err) => error!(%err, "failed to mount C: drive"),
+    // Boot real FreeDOS from this host folder via Katea: the storage controller
+    // presents the folder as a real ATA disk and the guest kernel does its own
+    // FAT / INT 21h (no Rust HLE). TOKAMOUS (our INT 33h PS/2 mouse TSR) and a
+    // mouse-loading AUTOEXEC are overlaid so the GUI boots with a working mouse,
+    // matching the old HLE C: default.
+    let overrides = vec![
+        (
+            "AUTOEXEC.BAT".to_string(),
+            b"@ECHO OFF\r\nPROMPT $P$G\r\nTOKAMOUS\r\n".to_vec(),
+        ),
+        (
+            "TOKAMOUS.COM".to_string(),
+            izarravm_firmware::tokamous_com().to_vec(),
+        ),
+    ];
+    if let Err(err) = machine.mount_hdd_folder_with(&c_drive, overrides) {
+        error!(%err, "failed to mount C: host folder");
     }
-    // Let the BIOS boot Toka-DOS from this drive and the setup-menu Repair and
-    // Format options act on it.
-    machine.set_toka_c_root(c_drive.clone());
     // Bring the RTC online: load cmos.bin (or write defaults) and seed the clock
     // from the host time read on the main thread at startup.
     rtc_setup.apply(&mut machine);
@@ -844,13 +854,17 @@ fn emulate(
                     machine.set_distira_render_threads(threads)
                 }
                 Ok(Command::Shutdown) => {
-                    // Flush the floppy and the final CMOS state before exiting.
+                    // Flush the Katea host folder, the floppy, and the final CMOS
+                    // state before exiting (this arm also runs on Reset, which
+                    // shuts the thread down and respawns).
+                    machine.flush_hdd_folder();
                     flush_floppy(&mut machine, &mut floppy_flush_path);
                     crate::cmos::save_cmos_file(&cmos_path, &machine.cmos_bytes());
                     return;
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
+                    machine.flush_hdd_folder();
                     flush_floppy(&mut machine, &mut floppy_flush_path);
                     crate::cmos::save_cmos_file(&cmos_path, &machine.cmos_bytes());
                     return;
