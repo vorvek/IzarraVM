@@ -8825,6 +8825,45 @@ mod tests {
     use super::*;
     use izarravm_bus::{BusCycle, BusTrace, BusWidth};
 
+    #[test]
+    fn scale_clocks_batches_exactly() {
+        // The JIT accumulates raw core_clocks across a straight-line block and scales ONCE at
+        // block exit. That is bit-identical to per-instruction scaling because scale_clocks is
+        // exact long division with a remainder carry. Verified across every mode, several clock
+        // sequences, and a non-zero starting remainder. A regression here silently breaks the
+        // JIT's cyc/iter identity, so this guards the property.
+        let seqs: [&[u32]; 3] = [
+            &[3, 5, 1, 1, 61, 2, 7, 4, 9, 2],
+            &[1; 32],
+            &[255, 1, 100, 3, 17, 61, 61, 2],
+        ];
+        for level in [CpuLevel::I286, CpuLevel::I386, CpuLevel::I486, CpuLevel::I586] {
+            for start_rem in [0u64, 1, 7, 100] {
+                for seq in seqs {
+                    let mut indiv = Cpu386::default();
+                    indiv.set_level(level);
+                    indiv.timing_rem = start_rem;
+                    let mut batch = Cpu386::default();
+                    batch.set_level(level);
+                    batch.timing_rem = start_rem;
+
+                    let sum_individual: u64 = seq.iter().map(|&c| indiv.scale_clocks(c)).sum();
+                    let total: u32 = seq.iter().sum();
+                    let batched = batch.scale_clocks(total);
+
+                    assert_eq!(
+                        sum_individual, batched,
+                        "level {level:?} rem {start_rem} seq {seq:?}: per-insn sum != batched"
+                    );
+                    assert_eq!(
+                        indiv.timing_rem, batch.timing_rem,
+                        "level {level:?} rem {start_rem} seq {seq:?}: remainder carry diverged"
+                    );
+                }
+            }
+        }
+    }
+
     #[derive(Default)]
     struct TestBus {
         memory: Vec<u8>,
