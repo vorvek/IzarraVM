@@ -32,17 +32,17 @@ use std::path::PathBuf;
 
 /// One disk sector. The whole layout (BPB, FATs, directory entries) assumes
 /// 512-byte sectors, matching the Python builder and `AtaDisk`.
-const SECTOR: usize = 512;
+pub(crate) const SECTOR: usize = 512;
 
 // --- whole-disk + partition geometry (mirror build-freedos-hdd-image.py) ------
 
 /// `AtaDisk`'s fixed head count; drives the MBR partition-entry CHS fields.
-const HEADS: u32 = 16;
+pub(crate) const HEADS: u32 = 16;
 /// `AtaDisk`'s fixed sectors-per-track; drives the CHS fields and the BPB.
-const SPT: u32 = 63;
+pub(crate) const SPT: u32 = 63;
 /// 1 MiB-aligned partition start LBA (also the BPB HiddSec). The partition's VBR
 /// stores disk-absolute LBAs because HiddSec carries this offset.
-const PART_START: u32 = 2048;
+pub(crate) const PART_START: u32 = 2048;
 /// 48 MiB disk: large enough for a valid FAT32 (>= 65525 clusters at 1
 /// sector/cluster), small enough to be cheap. The partition fills the rest.
 const DISK_SECTORS: u32 = 48 * 1024 * 1024 / SECTOR as u32; // 98304
@@ -51,20 +51,20 @@ const PART_SECTORS: u32 = DISK_SECTORS - PART_START; // 96256
 
 // --- FAT32 BPB constants (mirror the Python builder, which mirrors fat32.rs) --
 
-const RESERVED_SECTORS: u16 = 32;
-const NUM_FATS: u8 = 2;
-const ROOT_CLUSTER: u32 = 2;
-const FSINFO_SECTOR: u16 = 1;
-const BACKUP_BOOT_SECTOR: u16 = 6;
+pub(crate) const RESERVED_SECTORS: u16 = 32;
+pub(crate) const NUM_FATS: u8 = 2;
+pub(crate) const ROOT_CLUSTER: u32 = 2;
+pub(crate) const FSINFO_SECTOR: u16 = 1;
+pub(crate) const BACKUP_BOOT_SECTOR: u16 = 6;
 /// FreeDOS writes the backup FSInfo right after the backup boot record (+7).
-const BACKUP_FSINFO_SECTOR: u16 = 7;
+pub(crate) const BACKUP_FSINFO_SECTOR: u16 = 7;
 /// MBR partition type for a FAT32 partition addressed via LBA (INT 13h ext).
-const PART_TYPE_FAT32_LBA: u8 = 0x0C;
+pub(crate) const PART_TYPE_FAT32_LBA: u8 = 0x0C;
 /// A regular file's directory-entry attribute (archive bit). The Python builder
 /// stamps 0x20 on every file.
-const ATTR_ARCHIVE: u8 = 0x20;
+pub(crate) const ATTR_ARCHIVE: u8 = 0x20;
 /// FAT[0] = media descriptor 0xF8 (fixed disk) in the low byte, ones above.
-const FAT0_MEDIA: u32 = 0x0FFF_FFF8;
+pub(crate) const FAT0_MEDIA: u32 = 0x0FFF_FFF8;
 
 /// Where a file's bytes live. Small system files are held in RAM; user files are
 /// referenced by path and read on demand so a huge host folder never lands in
@@ -81,7 +81,7 @@ pub enum FileSource {
 
 impl FileSource {
     /// The file's length in bytes, without reading its contents.
-    fn len(&self) -> u64 {
+    pub(crate) fn len(&self) -> u64 {
         match self {
             FileSource::InMemory(v) => v.len() as u64,
             FileSource::HostFile { len, .. } => *len,
@@ -116,7 +116,7 @@ struct MappedFile {
 /// here (rather than calling `fat32.rs`, whose function is private) so this module
 /// owns its geometry. Panics below the FAT32 floor; the 48 MiB partition is well
 /// above it (it lands on the 1-sector cluster branch).
-fn sectors_per_cluster(total_sectors: u32) -> u8 {
+pub(crate) fn sectors_per_cluster(total_sectors: u32) -> u8 {
     match total_sectors {
         0..=66_600 => panic!("partition too small for FAT32"),
         66_601..=532_480 => 1,
@@ -133,7 +133,7 @@ fn sectors_per_cluster(total_sectors: u32) -> u8 {
 /// `(bytes/sector / 4) * spc + nfats`, NOT fatgen103's `(256*spc + nfats) / 2`.
 /// For this 96256-sector partition that gives **741** (fatgen103 gives 746, which
 /// does not boot).
-fn fat_size_sectors(total_sectors: u32, spc: u8) -> u32 {
+pub(crate) fn fat_size_sectors(total_sectors: u32, spc: u8) -> u32 {
     let fatdata = total_sectors - u32::from(RESERVED_SECTORS);
     let fatentpersec = SECTOR as u32 / 4; // 128 FAT32 entries per sector
     let divisor = fatentpersec * u32::from(spc) + u32::from(NUM_FATS);
@@ -144,7 +144,7 @@ fn fat_size_sectors(total_sectors: u32, spc: u8) -> u32 {
 /// 16x63 geometry `AtaDisk` derives. Cylinders above 1023 clamp to the all-ones
 /// `0xFE 0xFF 0xFF` "use LBA" marker — the standard MBR convention and exactly
 /// what the Python `lba_to_chs` does.
-fn lba_to_chs(lba: u32) -> [u8; 3] {
+pub(crate) fn lba_to_chs(lba: u32) -> [u8; 3] {
     let cyl = lba / (HEADS * SPT);
     let rem = lba % (HEADS * SPT);
     let head = rem / SPT;
@@ -230,7 +230,7 @@ impl KateaVolume {
 
         // --- VBR: stamp the FAT32 BPB over the boot code, keeping the boot code.
         let mut vbr_out = *vbr;
-        stamp_fat32_bpb(&mut vbr_out, spc, fatsz);
+        stamp_fat32_bpb(&mut vbr_out, spc, fatsz, PART_START, PART_SECTORS);
         assert!(
             vbr_out[0x1FE] == 0x55 && vbr_out[0x1FF] == 0xAA,
             "VBR boot signature missing"
@@ -606,10 +606,18 @@ fn fold_83(name: &str) -> [u8; 11] {
 }
 
 /// Stamp the FAT32 BPB over `vbr`, keeping its boot code. Field offsets/values
-/// mirror the Python builder's `stamp_fat32_bpb` exactly: HiddSec is PART_START
+/// mirror the Python builder's `stamp_fat32_bpb` exactly: HiddSec is `part_start`
 /// (this is a partition, not a superfloppy), BS_DrvNum is 0x80, the label is
 /// "TOKA-DOS   " and the serial 0x32303236. All multi-byte fields little-endian.
-fn stamp_fat32_bpb(vbr: &mut [u8; SECTOR], spc: u8, fatsz: u32) {
+/// `part_start` (HiddSec) and `part_sectors` (TotSec32) are passed so the
+/// dynamically-sized tree volume can reuse the same stamp.
+pub(crate) fn stamp_fat32_bpb(
+    vbr: &mut [u8; SECTOR],
+    spc: u8,
+    fatsz: u32,
+    part_start: u32,
+    part_sectors: u32,
+) {
     vbr[0x03..0x0B].copy_from_slice(b"MSWIN4.1"); // OEM (fatgen103 recommendation)
     vbr[0x0B..0x0D].copy_from_slice(&(SECTOR as u16).to_le_bytes()); // bytes/sector
     vbr[0x0D] = spc; // sectors/cluster
@@ -621,8 +629,8 @@ fn stamp_fat32_bpb(vbr: &mut [u8; SECTOR], spc: u8, fatsz: u32) {
     vbr[0x16..0x18].copy_from_slice(&0u16.to_le_bytes()); // FATSz16: 0 on FAT32
     vbr[0x18..0x1A].copy_from_slice(&(SPT as u16).to_le_bytes()); // sectors/track (cosmetic)
     vbr[0x1A..0x1C].copy_from_slice(&(HEADS as u16).to_le_bytes()); // heads (cosmetic)
-    vbr[0x1C..0x20].copy_from_slice(&PART_START.to_le_bytes()); // HiddSec = partition start
-    vbr[0x20..0x24].copy_from_slice(&PART_SECTORS.to_le_bytes()); // TotSec32
+    vbr[0x1C..0x20].copy_from_slice(&part_start.to_le_bytes()); // HiddSec = partition start
+    vbr[0x20..0x24].copy_from_slice(&part_sectors.to_le_bytes()); // TotSec32
     // FAT32 extended BPB.
     vbr[0x24..0x28].copy_from_slice(&fatsz.to_le_bytes()); // BPB_FATSz32
     vbr[0x28..0x2A].copy_from_slice(&0u16.to_le_bytes()); // ExtFlags: mirroring active

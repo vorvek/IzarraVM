@@ -57,15 +57,15 @@ mod error {
 
 /// Where the disk's sectors come from. A flat image holds the whole disk in RAM
 /// (the today path: a mounted .img); a host-folder facade serves sectors lazily
-/// from a `KateaVolume` over a host directory, so a huge folder never lands in
-/// memory. The facade is read-only in M0: writes are no-ops.
+/// from a `KateaTreeVolume` over a host directory tree, so a huge/deep folder
+/// never lands in memory. The facade is read-only: writes are no-ops (M1).
 #[derive(Debug)]
 enum Backing {
     /// A flat sector array, addressed by `lba * SECTOR`.
     Image(Vec<u8>),
-    /// A lazy FAT32 view over a host folder. Boxed because `KateaVolume` is large
-    /// relative to the `Vec` it sits beside in the enum.
-    HostFolder(Box<crate::katea_volume::KateaVolume>),
+    /// A lazy FAT32 view over a recursive host-folder tree. Boxed because the
+    /// volume is large relative to the `Vec` it sits beside in the enum.
+    HostFolder(Box<crate::katea_tree::KateaTreeVolume>),
 }
 
 /// What the data port is moving.
@@ -132,10 +132,10 @@ impl AtaDisk {
         Self::with_backing(Backing::Image(image), total_sectors)
     }
 
-    /// Mount a lazy host-folder facade as the disk. The geometry is derived from
-    /// the volume's whole-disk sector count, the same way `new` derives it from an
-    /// image length, so the BIOS sees the same CHS translation either way.
-    pub fn from_host_folder(volume: crate::katea_volume::KateaVolume) -> Self {
+    /// Mount a lazy host-folder tree facade as the disk. The geometry is derived
+    /// from the volume's whole-disk sector count, the same way `new` derives it
+    /// from an image length, so the BIOS sees the same CHS translation either way.
+    pub fn from_host_folder(volume: crate::katea_tree::KateaTreeVolume) -> Self {
         let total_sectors = volume.total_sectors();
         Self::with_backing(Backing::HostFolder(Box::new(volume)), total_sectors)
     }
@@ -233,11 +233,11 @@ impl AtaDisk {
     }
 
     /// Overwrite one whole 512-byte sector at `lba`. Returns false if past the
-    /// end or `data` is short. A host-folder facade is read-only in M0, so writes
+    /// end or `data` is short. A host-folder facade is read-only in M1, so writes
     /// to it always fail.
     pub fn write_lba(&mut self, lba: u32, data: &[u8]) -> bool {
         // ponytail: the write-back engine (syncing guest writes to host files) is
-        // M1 work; M0 is read-only, so a folder-backed write is simply rejected.
+        // M2 work; M1 is read-only, so a folder-backed write is simply rejected.
         let Backing::Image(image) = &mut self.backing else {
             return false;
         };

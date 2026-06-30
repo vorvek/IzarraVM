@@ -1304,4 +1304,99 @@ mod tokados_smoke {
             "TYPE did not print the host file's contents read lazily through the facade.\n{type_text}"
         );
     }
+
+    /// The Katea-1 M1 boot-coherence gate: a host folder with a file *in a
+    /// subfolder* boots the real FreeDOS kernel, the subfolder is navigable, and a
+    /// file at depth reads lazily through the recursive tree facade. This is the
+    /// milestone's success gate — it proves the tree volume (`KateaTreeVolume`)
+    /// produces a self-consistent, bootable disk and that `CD` into a synthesized
+    /// subdirectory plus a `TYPE` of a file two levels down (`C:\GAMES\HELLO\`)
+    /// returns the host file's bytes, which M0's flat facade could never expose.
+    #[test]
+    #[ignore = "boots a full DOS image from a host-folder tree (slow in debug); run with --ignored"]
+    fn katea_host_folder_tree_reads_a_file_in_a_subfolder() {
+        // A unique scratch tree under the system temp dir: GAMES\HELLO\READAT.TXT
+        // lives two directory levels down, so reaching it proves the subfolder
+        // chain (root -> GAMES -> HELLO) is navigable and the file reads at depth.
+        let dir = std::env::temp_dir().join(format!(
+            "katea_tree_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let depth = dir.join("GAMES").join("HELLO");
+        std::fs::create_dir_all(&depth).expect("scratch tree");
+        std::fs::write(depth.join("READAT.TXT"), b"read at depth ok\r\n")
+            .expect("write depth file");
+
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .expect("build machine");
+        machine
+            .mount_hdd_folder(&dir)
+            .expect("mount host folder tree");
+        let stop = machine
+            .run_until_halt_or_cycles(500_000_000)
+            .expect("run machine");
+        if let StopReason::CpuError(msg) = &stop {
+            let text = machine.screen_text().as_text();
+            std::fs::remove_dir_all(&dir).ok();
+            panic!("CPU fault during Katea tree boot: {msg}\nstop={stop:?}\n{text}");
+        }
+        let boot_text = machine.screen_text().as_text().to_ascii_lowercase();
+        assert!(
+            boot_text.contains("c:\\>"),
+            "no C:\\> prompt after tree boot (stop={stop:?}).\n{boot_text}"
+        );
+
+        // CD into the subfolder two levels down, then DIR it. DIR listing the file
+        // proves the synthesized subdirectory chain (with its `.`/`..` entries) is
+        // navigable.
+        for cmd in ["cd games\\hello\r", "dir\r"] {
+            for ch in cmd.chars() {
+                for code in ascii_to_set1(ch) {
+                    machine.inject_key_scancodes(&[code]);
+                }
+                machine
+                    .run_until_halt_or_cycles(5_000_000)
+                    .expect("type cmd");
+            }
+            machine
+                .run_until_halt_or_cycles(40_000_000)
+                .expect("settle cmd");
+        }
+        let dir_text = machine.screen_text().as_text().to_ascii_lowercase();
+
+        // TYPE the file at depth: the kernel reads its data clusters, which the
+        // tree facade serves lazily (open+seek+read) straight from the host file
+        // under GAMES\HELLO — proving the lazy data path at depth, not just the
+        // synthesized directory entry. The host tree must still exist while the
+        // read happens, so cleanup waits until both screens are captured.
+        for ch in "type readat.txt\r".chars() {
+            for code in ascii_to_set1(ch) {
+                machine.inject_key_scancodes(&[code]);
+            }
+            machine
+                .run_until_halt_or_cycles(5_000_000)
+                .expect("type the type command");
+        }
+        machine
+            .run_until_halt_or_cycles(40_000_000)
+            .expect("settle type");
+        let type_text = machine.screen_text().as_text().to_ascii_lowercase();
+
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            dir_text.contains("readat"),
+            "DIR in the subfolder did not list the file at depth.\n{dir_text}"
+        );
+        assert!(
+            type_text.contains("read at depth ok"),
+            "TYPE did not print the subfolder file's contents read lazily through the tree facade.\n{type_text}"
+        );
+    }
 }
