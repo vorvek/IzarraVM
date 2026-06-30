@@ -776,20 +776,20 @@ su_draw:
     pop ds
     mov si, su_str_deadnote
     mov di, 8
-    mov ax, SU_MENU_Y + SU_ROW_DY * 11 + 4
+    mov ax, SU_MENU_Y + SU_ROW_DY * 10 + 4
     mov bl, SU_COLOR_INFO
     mov bh, COLOR_BG
     call gfx_text
     ret
 
-; su_service_note: draw a one-line Repair/Format result at SI (CS string) in the
-; row gap below Discard, bright cyan. Persists until the next key repaints. Sets
-; DS = CS. Clobbers AX, DI.
+; su_service_note: draw a one-line Repair result at SI (CS string) in the row
+; below Discard, bright cyan. Persists until the next key repaints. Sets DS = CS.
+; Clobbers AX, DI.
 su_service_note:
     push cs
     pop ds
     mov di, SU_MENU_X
-    mov ax, SU_MENU_Y + SU_ROW_DY * 9
+    mov ax, SU_MENU_Y + SU_ROW_DY * 8
     mov bl, SU_COLOR_VALUE
     mov bh, COLOR_BG
     call gfx_text
