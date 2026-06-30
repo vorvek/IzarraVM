@@ -233,11 +233,11 @@ impl AtaDisk {
     }
 
     /// Overwrite one whole 512-byte sector at `lba`. Returns false if past the
-    /// end or `data` is short. A host-folder facade is read-only in M0, so writes
+    /// end or `data` is short. A host-folder facade is read-only in M1, so writes
     /// to it always fail.
     pub fn write_lba(&mut self, lba: u32, data: &[u8]) -> bool {
         // ponytail: the write-back engine (syncing guest writes to host files) is
-        // M1 work; M0 is read-only, so a folder-backed write is simply rejected.
+        // M2 work; M1 is read-only, so a folder-backed write is simply rejected.
         let Backing::Image(image) = &mut self.backing else {
             return false;
         };

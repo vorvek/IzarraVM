@@ -1463,7 +1463,7 @@ impl Machine {
         // data lazily. The boot sectors carry the dynamic geometry derived from
         // the folder.
         let volume =
-            katea_tree::KateaTreeVolume::new(&payload.mbr, &payload.vbr, dir, &system_files);
+            katea_tree::KateaTreeVolume::new(&payload.mbr, &payload.vbr, dir, &system_files)?;
         self.ata = Some(ata::AtaDisk::from_host_folder(volume));
         let _ = self.publish_fixed_disk_parameter_table();
         let _ = self.memory.write_u8(0x475, 1); // BDA fixed-disk count

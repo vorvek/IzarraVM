@@ -88,8 +88,14 @@ pub(crate) fn build_tree(root: &Path, system_files: &[(String, Vec<u8>)]) -> Hos
     HostTree { root: dir }
 }
 
+// `walk_into` is both the root entry (names already holds the system
+// reservations) and the per-subdirectory recursion; each subdirectory gets its
+// own fresh `NameTable` at the call site.
 fn walk_into(host: &Path, dir: &mut TreeDir, names: &mut NameTable, depth: usize) {
     if depth > MAX_DEPTH {
+        // A too-deep folder is truncated rather than recursed forever; warn once
+        // at the cap so the loss isn't silent (L2).
+        eprintln!("katea: directory tree deeper than {MAX_DEPTH}; truncating");
         return;
     }
     let mut entries: Vec<std::fs::DirEntry> = match std::fs::read_dir(host) {
@@ -108,10 +114,23 @@ fn walk_into(host: &Path, dir: &mut TreeDir, names: &mut NameTable, depth: usize
             let name = names.add_host(&path, true);
             let mut child = TreeDir::default();
             let mut child_names = NameTable::new(); // a fresh table per directory
-            walk_into_with(&path, &mut child, &mut child_names, depth + 1);
+            walk_into(&path, &mut child, &mut child_names, depth + 1);
             dir.subdirs.push(TreeSubdir { name, dir: child });
         } else if ft.is_file() {
             let Ok(md) = e.metadata() else { continue };
+            // Skip any file too large for a FAT32 32-bit size/cluster span, exactly
+            // as M0's `KateaVolume::new` does (`katea_volume.rs`): a `>= 4 GiB` file
+            // can't be represented (the directory `size` field is u32), and letting
+            // it through would also clamp `size` wrong and feed the C1 cluster
+            // overflow. No unit test — a 4 GiB fixture is infeasible — so this
+            // mirrors M0's untested-but-correct pattern (M1).
+            if md.len() >= u32::MAX as u64 {
+                eprintln!(
+                    "katea: skipping {} (>= 4 GiB, not FAT32-representable)",
+                    path.display()
+                );
+                continue;
+            }
             let name = names.add_host(&path, false);
             dir.files.push(TreeFile {
                 name,
@@ -125,12 +144,6 @@ fn walk_into(host: &Path, dir: &mut TreeDir, names: &mut NameTable, depth: usize
         }
         // Non-regular (device/fifo/etc.) is neither dir nor file -> skipped.
     }
-}
-
-// `walk_into` is the root entry (names already holds the system reservations);
-// subdirectories get their own NameTable via this helper.
-fn walk_into_with(host: &Path, dir: &mut TreeDir, names: &mut NameTable, depth: usize) {
-    walk_into(host, dir, names, depth);
 }
 
 /// Fold a known-valid 8.3 system file name like "KERNEL.SYS" to the 11-byte
@@ -168,6 +181,13 @@ fn clusters_for(bytes: u64, cluster_bytes: u32) -> u32 {
     (bytes.div_ceil(u64::from(cluster_bytes)) as u32).max(1)
 }
 
+/// The FAT32 data-cluster ceiling (the largest valid `count_of_clusters`); a host
+/// folder demanding more than this can't be a single FAT32 volume. Per fatgen103
+/// the FAT32 region tops out at `0x0FFF_FFF5` clusters; we cap at the
+/// conservative `0x0FFF_FFF4` (the kernel/Windows ceiling) so the run-of-1
+/// next-cluster encoding never collides with the reserved EOC/bad markers.
+const FAT32_MAX_CLUSTERS: u64 = 0x0FFF_FFF4;
+
 /// Sum the cluster needs of the whole tree, pick the geometry that fits, then
 /// assign first_cluster/cluster_count across the tree depth-first. The root is
 /// cluster 2.
@@ -179,17 +199,79 @@ fn clusters_for(bytes: u64, cluster_bytes: u32) -> u32 {
 /// and re-deriving `spc` from it; if it disagrees we adopt the larger and redo.
 /// `sectors_per_cluster`'s table is monotonic in size and the partition only
 /// grows with `spc`, so the loop climbs the table at most a few steps and stops.
-pub(crate) fn allocate(tree: &mut HostTree) -> Geometry {
+pub(crate) fn allocate(tree: &mut HostTree) -> Result<Geometry, std::io::Error> {
+    // Recompute the cluster demand for whatever cluster size the loop is trying:
+    // bigger clusters pack the same bytes into fewer clusters, so the demand
+    // shrinks as `spc` climbs (a 500 GB folder needs ~1e9 clusters at spc=1 but
+    // only ~16M at spc=64). Computed in `u64` so a huge folder can't overflow.
+    let geo = fat32_geometry_for(|cluster_bytes| tree_cluster_demand(tree, cluster_bytes))?;
+    // Assign clusters now that geometry is fixed.
+    let cluster_bytes = u32::from(geo.spc) * SECTOR as u32;
+    let mut next = ROOT_CLUSTER; // 2
+    assign_dir(&mut tree.root, true, 0, &mut next, cluster_bytes);
+    Ok(geo)
+}
+
+/// The largest FAT32 cluster size, in sectors. `sectors_per_cluster` tops out
+/// here; once we are at this band there is no larger band to climb to, so a folder
+/// that still doesn't fit is genuinely too large for one FAT32 volume.
+const MAX_SPC: u8 = 64;
+
+/// The next-larger valid `spc` band after `spc` (1 -> 8 -> 16 -> 32 -> 64),
+/// mirroring `sectors_per_cluster`'s table. Used when a candidate band can't hold
+/// the data: climb to the next band rather than erroring, unless already at the
+/// top (`MAX_SPC`).
+fn next_spc(spc: u8) -> u8 {
+    match spc {
+        1 => 8,
+        8 => 16,
+        16 => 32,
+        _ => MAX_SPC, // 32 -> 64, and 64 stays 64 (the caller stops there)
+    }
+}
+
+/// Pick a self-consistent, boot-valid FAT32 geometry for a tree. `demand_at`
+/// returns the tree's data-cluster demand at a given cluster size in bytes; the
+/// loop re-queries it each iteration because bigger clusters need fewer of them.
+/// Returns `Err` only when the folder doesn't fit even at the largest cluster size
+/// (`MAX_SPC` = 64, i.e. roughly > 8 TB of data) — `count_of_clusters` past
+/// `FAT32_MAX_CLUSTERS` or a sector count past `u32::MAX` at a *smaller* `spc` just
+/// means "climb to a bigger cluster", not "fail". All sizing is done in `u64`; the
+/// final values are range-checked once before being narrowed into `u32`. (C1)
+///
+/// The cluster size (`spc`) the FAT and partition are sized with must match the
+/// one `sectors_per_cluster` derives from the final partition size, or the BPB is
+/// internally inconsistent and the disk won't boot. We reach that fixed point by
+/// computing the *final* partition size each iteration (not a padded guess) and
+/// re-deriving `spc` from it; if it disagrees we adopt the larger and redo. Both
+/// climbs are monotone in `spc` and the per-spc partition size is ~invariant in
+/// `spc`, so the loop climbs the table at most a few steps and stops.
+fn fat32_geometry_for(demand_at: impl Fn(u32) -> u64) -> Result<Geometry, std::io::Error> {
+    let too_large =
+        || std::io::Error::other("Katea: host folder too large for a single FAT32 volume");
     let mut spc: u8 = 1;
-    let geo = loop {
-        let cluster_bytes = u32::from(spc) * SECTOR as u32;
-        let used_data = tree_cluster_demand(tree, cluster_bytes);
+    loop {
+        // The demand for THIS cluster size: the only honest figure to size from.
+        let used_data = demand_at(u32::from(spc) * SECTOR as u32);
         // Need a valid FAT32; pad with headroom (25%) so DIR shows free space and
         // M2 has room, and floor at the boot-tested M0 cluster count so the small-
         // folder partition reproduces M0's known-good geometry (see
-        // MIN_DATA_CLUSTERS) rather than landing just under the FAT32 floor.
+        // MIN_DATA_CLUSTERS) rather than landing just under the FAT32 floor. All in
+        // u64 so the +25% can't overflow before the checks below.
         let needed = used_data.max(1);
-        let count_of_clusters = (needed + needed / 4).max(MIN_DATA_CLUSTERS);
+        let count_of_clusters = (needed + needed / 4).max(u64::from(MIN_DATA_CLUSTERS));
+        // Too many clusters / too many data sectors for THIS band: if a bigger
+        // cluster size exists, climb to it (it shrinks the cluster count); only at
+        // the top band (MAX_SPC) does this mean the folder is genuinely too large.
+        let data_sectors = count_of_clusters * u64::from(spc);
+        if count_of_clusters > FAT32_MAX_CLUSTERS || data_sectors > u64::from(u32::MAX) {
+            if spc < MAX_SPC {
+                spc = next_spc(spc);
+                continue;
+            }
+            return Err(too_large());
+        }
+        let data_sectors = data_sectors as u32;
         // Size the FAT from the whole partition it lives in, exactly as M0 does
         // (`fat_size_sectors(PART_SECTORS, spc)`): the formula's divisor accounts
         // for the FAT sectors, so passing the full partition is self-correcting.
@@ -197,7 +279,6 @@ pub(crate) fn allocate(tree: &mut HostTree) -> Geometry {
         // size includes the FAT — so close the loop by re-deriving `fatsz` from
         // the partition built with the previous estimate until it is stable (it
         // settles in one or two steps because the data region dominates).
-        let data_sectors = count_of_clusters * u32::from(spc);
         let mut fatsz = fat_size_sectors(u32::from(RESERVED_SECTORS) + data_sectors, spc);
         loop {
             let part = u32::from(RESERVED_SECTORS) + u32::from(NUM_FATS) * fatsz + data_sectors;
@@ -208,7 +289,18 @@ pub(crate) fn allocate(tree: &mut HostTree) -> Geometry {
             fatsz = next_fatsz;
         }
         let used = u32::from(RESERVED_SECTORS) + u32::from(NUM_FATS) * fatsz;
-        let part_sectors = used + data_sectors;
+        // Validate the partition (and whole-disk) sector counts fit u32 in u64
+        // before narrowing; same climb-vs-error rule as above.
+        let part_sectors = u64::from(used) + u64::from(data_sectors);
+        let total_sectors = u64::from(PART_START) + part_sectors;
+        if total_sectors > u64::from(u32::MAX) {
+            if spc < MAX_SPC {
+                spc = next_spc(spc);
+                continue;
+            }
+            return Err(too_large());
+        }
+        let part_sectors = part_sectors as u32;
         // Self-consistency: the spc the table picks for THIS partition must equal
         // the spc we sized with. If not, climb to it and recompute from scratch.
         let derived = sectors_per_cluster(part_sectors);
@@ -216,30 +308,31 @@ pub(crate) fn allocate(tree: &mut HostTree) -> Geometry {
             spc = derived;
             continue;
         }
-        break Geometry {
+        let geo = Geometry {
             spc,
             fatsz,
             part_start: PART_START,
             part_sectors,
-            total_sectors: PART_START + part_sectors,
+            total_sectors: total_sectors as u32,
             first_data_sector: used,
-            count_of_clusters,
+            count_of_clusters: count_of_clusters as u32,
         };
-    };
-    debug_assert_eq!(sectors_per_cluster(geo.part_sectors), geo.spc);
-    // Assign clusters now that geometry is fixed.
-    let cluster_bytes = u32::from(geo.spc) * SECTOR as u32;
-    let mut next = ROOT_CLUSTER; // 2
-    assign_dir(&mut tree.root, true, 0, &mut next, cluster_bytes);
-    geo
+        debug_assert_eq!(sectors_per_cluster(geo.part_sectors), geo.spc);
+        return Ok(geo);
+    }
 }
 
 /// Total data clusters the tree consumes (directories + files), for sizing.
-fn tree_cluster_demand(tree: &HostTree, cluster_bytes: u32) -> u32 {
-    fn dir_demand(dir: &TreeDir, is_root: bool, cluster_bytes: u32) -> u32 {
-        let mut n = clusters_for(u64::from(entry_count(dir, is_root)) * 32, cluster_bytes);
+/// Summed in `u64` so a multi-terabyte host folder can't overflow before the
+/// caller (`fat32_geometry_for`) checks it against `FAT32_MAX_CLUSTERS`.
+fn tree_cluster_demand(tree: &HostTree, cluster_bytes: u32) -> u64 {
+    fn dir_demand(dir: &TreeDir, is_root: bool, cluster_bytes: u32) -> u64 {
+        let mut n = u64::from(clusters_for(
+            u64::from(entry_count(dir, is_root)) * 32,
+            cluster_bytes,
+        ));
         for f in &dir.files {
-            n += clusters_for(f.source.len(), cluster_bytes);
+            n += u64::from(clusters_for(f.source.len(), cluster_bytes));
         }
         for s in &dir.subdirs {
             n += dir_demand(&s.dir, false, cluster_bytes);
@@ -360,11 +453,20 @@ fn dir_entries(dir: &TreeDir, is_root: bool) -> Vec<[u8; 32]> {
             0,
             0,
         ));
+        // Canonical FAT (fatgen103 6.5; cf. `fat32::fat32_dot_entries`): `..` points
+        // at the parent's first cluster, EXCEPT when the parent is the root, where
+        // it must be 0 (the root has no real cluster number to name). The root is
+        // always cluster 2 (ROOT_CLUSTER), so a parent of 2 means "root". (M2)
         let dotdot = *b"..         ";
+        let dotdot_cluster = if dir.parent_first_cluster == ROOT_CLUSTER {
+            0
+        } else {
+            dir.parent_first_cluster
+        };
         out.push(fat32_dir_entry(
             &dotdot,
             ATTR_SUBDIR,
-            dir.parent_first_cluster,
+            dotdot_cluster,
             0,
             0,
             0,
@@ -483,9 +585,9 @@ impl KateaTreeVolume {
         vbr: &[u8; SECTOR],
         host_root: &Path,
         system_files: &[(String, Vec<u8>)],
-    ) -> Self {
+    ) -> Result<Self, std::io::Error> {
         let mut tree = build_tree(host_root, system_files);
-        let geo = allocate(&mut tree);
+        let geo = allocate(&mut tree)?;
         let fat = ClusterIndex::build(&tree, &geo);
         let next_free = fat.next_free();
         // Used data clusters are 2..next_free; the rest of the addressable range
@@ -524,7 +626,7 @@ impl KateaTreeVolume {
         flatten(&tree.root, true, &mut dirs, &mut files, &mut runs);
         runs.sort_by_key(|r| r.0);
 
-        Self {
+        Ok(Self {
             tree,
             geo,
             mbr: mbr_out,
@@ -535,7 +637,7 @@ impl KateaTreeVolume {
             dirs,
             files,
             runs,
-        }
+        })
     }
 
     /// The whole-disk sector count, so the ATA layer can derive its geometry.
@@ -695,7 +797,11 @@ fn read_source_span(source: &FileSource, byte_off: u64, size: u32) -> [u8; SECTO
     match source {
         FileSource::InMemory(v) => {
             let start = byte_off as usize;
-            out[..valid].copy_from_slice(&v[start..start + valid]);
+            // `valid` derives from the declared `size`; clamp it to what the backing
+            // Vec actually holds so a size that disagrees with `v.len()` can never
+            // panic the slice (L1). The padded tail stays zero.
+            let avail = valid.min(v.len().saturating_sub(start));
+            out[..avail].copy_from_slice(&v[start..start + avail]);
         }
         FileSource::HostFile { path, .. } => {
             match File::open(path).and_then(|mut f| {
@@ -763,7 +869,7 @@ mod tests {
         std::fs::write(root.join("SUB/A.TXT"), vec![0u8; 600]).unwrap(); // 2 clusters at 512B/clu
         let sys = vec![("KERNEL.SYS".to_string(), vec![0u8; 100])];
         let mut tree = build_tree(&root, &sys);
-        let geo = allocate(&mut tree);
+        let geo = allocate(&mut tree).expect("small folder fits a FAT32 volume");
 
         // Root is cluster 2 (one cluster: KERNEL.SYS + SUB = 2 entries).
         assert_eq!(tree.root.first_cluster, 2);
@@ -797,7 +903,7 @@ mod tests {
         std::fs::write(root.join("A.TXT"), vec![0u8; 600]).unwrap(); // 2 clusters
         let sys = vec![("KERNEL.SYS".to_string(), vec![0u8; 100])]; // 1 cluster
         let mut tree = build_tree(&root, &sys);
-        let geo = allocate(&mut tree);
+        let geo = allocate(&mut tree).expect("small folder fits a FAT32 volume");
         let idx = ClusterIndex::build(&tree, &geo);
 
         // FAT[0] media, FAT[1] EOC, FAT[2]=root (single cluster -> EOC).
@@ -833,7 +939,7 @@ mod tests {
         std::fs::write(root.join("SUB/A.TXT"), b"hi").unwrap();
         let sys = vec![("KERNEL.SYS".to_string(), vec![0u8; 10])];
         let mut tree = build_tree(&root, &sys);
-        allocate(&mut tree);
+        allocate(&mut tree).expect("small folder fits a FAT32 volume");
 
         // Root sector 0: entry 0 = KERNEL.SYS (archive), and a SUB subdir entry (0x10).
         let rootsec = dir_sector(&tree.root, true, 0);
@@ -863,7 +969,7 @@ mod tests {
             std::fs::write(root.join(format!("F{i:02}.TXT")), b"x").unwrap();
         }
         let mut tree = build_tree(&root, &[]);
-        allocate(&mut tree);
+        allocate(&mut tree).expect("small folder fits a FAT32 volume");
         // 20 file entries (16 per 512B sector at spc=1) need more than one cluster.
         assert!(
             tree.root.cluster_count >= 2,
@@ -909,7 +1015,8 @@ mod tests {
         let mut vbr = [0u8; 512];
         vbr.copy_from_slice(&img[2048 * 512..2048 * 512 + 512]);
 
-        let vol = KateaTreeVolume::new(&mbr, &vbr, &root, &sys);
+        let vol = KateaTreeVolume::new(&mbr, &vbr, &root, &sys)
+            .expect("small folder fits a FAT32 volume");
 
         // LBA 0 = MBR with the partition entry + 55AA.
         let s0 = vol.read_sector(0);
@@ -929,6 +1036,101 @@ mod tests {
         let data = vol.read_sector(lba);
         let expect: Vec<u8> = (0..512u32).map(|i| (i % 251) as u8).collect();
         assert_eq!(&data[..], &expect[..]);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn geometry_bounds_a_huge_folder_and_reproduces_m0_for_a_small_one() {
+        // The demand callback returns the cluster count for a given cluster size in
+        // bytes; the geometry loop re-queries it as `spc` climbs, because bigger
+        // clusters hold the same bytes in fewer of them (see `fat32_geometry_for`).
+
+        // C1: a folder whose demand stays enormous at EVERY cluster size (here a
+        // flat ~80 billion clusters, i.e. roughly > 8 TB of data) doesn't fit even
+        // at the largest cluster size (spc=64) -> must fail loudly, not overflow.
+        let huge = fat32_geometry_for(|_cb| 80_000_000_000);
+        assert!(
+            huge.is_err(),
+            "an ~80-billion-cluster demand exceeds FAT32 at every cluster size"
+        );
+
+        // Regression guard (the bug the per-spc recompute fixes): a ~500 GB folder
+        // demands ~1e9 clusters at spc=1 (over the FAT32 ceiling) but only ~16M at
+        // spc=64, so it MUST be accepted on the large-cluster band rather than
+        // wrongly rejected as "too large".
+        let geo = fat32_geometry_for(|cb| (500u64 << 30) / u64::from(cb))
+            .expect("a 500 GB folder fits FAT32 at a large cluster size");
+        assert_eq!(geo.spc, 64, "500 GB lands on the largest cluster band");
+        assert!(
+            u64::from(geo.count_of_clusters) < FAT32_MAX_CLUSTERS,
+            "count_of_clusters stays under the FAT32 ceiling at spc=64"
+        );
+        // `count * spc` (the data sectors) must not have overflowed u32.
+        assert!(u64::from(geo.count_of_clusters) * u64::from(geo.spc) <= u64::from(u32::MAX));
+        assert_eq!(sectors_per_cluster(geo.part_sectors), geo.spc);
+
+        // A ~1 GB folder must be sized to ~the data (a few GB of sectors), NOT the
+        // ~80 GB the old spc=1-fixed demand would have produced at spc=64. Proves
+        // the demand was recomputed for the chosen cluster size.
+        let geo1g = fat32_geometry_for(|cb| (1u64 << 30) / u64::from(cb))
+            .expect("a 1 GB folder fits FAT32");
+        let two_gib_sectors = (2u64 << 30) / SECTOR as u64; // ~4.2M sectors
+        assert!(
+            u64::from(geo1g.total_sectors) < 8 * two_gib_sectors,
+            "1 GB of files must not balloon to an ~80 GB disk (got {} sectors)",
+            geo1g.total_sectors
+        );
+        assert_eq!(sectors_per_cluster(geo1g.part_sectors), geo1g.spc);
+
+        // A tiny demand floors at MIN_DATA_CLUSTERS and reproduces M0's exact,
+        // boot-tested geometry: spc=1, fatsz=741, count_of_clusters=94742.
+        let small = fat32_geometry_for(|_cb| 10).expect("a tiny demand fits a FAT32 volume");
+        assert_eq!(
+            small.spc, 1,
+            "small folder stays on the 1-sector cluster band"
+        );
+        assert_eq!(small.fatsz, 741, "M0's kernel-formula FAT size");
+        assert_eq!(small.count_of_clusters, 94_742, "M0's data-cluster count");
+        assert_eq!(sectors_per_cluster(small.part_sectors), small.spc);
+    }
+
+    #[test]
+    fn root_child_dotdot_points_at_cluster_zero() {
+        // M2: per fatgen103 6.5, a directory whose parent is the root must encode
+        // its `..` FstClus as 0, not the root's actual cluster (2).
+        let root = scratch("dotdot");
+        std::fs::create_dir_all(root.join("SUB")).unwrap();
+        std::fs::write(root.join("SUB/A.TXT"), b"hi").unwrap();
+        let sys = vec![("KERNEL.SYS".to_string(), vec![0u8; 10])];
+        let mut tree = build_tree(&root, &sys);
+        allocate(&mut tree).expect("small folder fits a FAT32 volume");
+
+        let sub = &tree.root.subdirs[0].dir;
+        // `parent_first_cluster` still records the real parent (root = 2) for M2's
+        // write engine; only the emitted `..` entry collapses it to 0.
+        assert_eq!(sub.parent_first_cluster, ROOT_CLUSTER);
+
+        // SUB sector 0: entry 0 = `.`, entry 1 = `..` (offset 32). Decode `..`'s
+        // FstClusHI@0x14 + FstClusLO@0x1A from the on-disk bytes.
+        let subsec = dir_sector(sub, false, 0);
+        assert_eq!(&subsec[32..43], b"..         ", "entry 1 is ..");
+        let hi = u16::from_le_bytes([subsec[32 + 0x14], subsec[32 + 0x15]]);
+        let lo = u16::from_le_bytes([subsec[32 + 0x1A], subsec[32 + 0x1B]]);
+        let cluster = (u32::from(hi) << 16) | u32::from(lo);
+        assert_eq!(
+            cluster, 0,
+            "root-child `..` FstClus must be 0, not the root's 2"
+        );
+
+        // The `.` entry (offset 0) still names the subdir's own cluster, unaffected.
+        let dot_hi = u16::from_le_bytes([subsec[0x14], subsec[0x15]]);
+        let dot_lo = u16::from_le_bytes([subsec[0x1A], subsec[0x1B]]);
+        let dot_cluster = (u32::from(dot_hi) << 16) | u32::from(dot_lo);
+        assert_eq!(
+            dot_cluster, sub.first_cluster,
+            "`.` names the subdir itself"
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
