@@ -58,7 +58,8 @@ mod error {
 /// Where the disk's sectors come from. A flat image holds the whole disk in RAM
 /// (the today path: a mounted .img); a host-folder facade serves sectors lazily
 /// from a `KateaTreeVolume` over a host directory tree, so a huge/deep folder
-/// never lands in memory. The facade is read-only: writes are no-ops (M1).
+/// never lands in memory. Writes to the facade route into the volume's in-memory
+/// overlay (M2) and are reconciled to host files on command completion.
 #[derive(Debug)]
 enum Backing {
     /// A flat sector array, addressed by `lba * SECTOR`.
@@ -213,6 +214,15 @@ impl AtaDisk {
         matches!(self.backing, Backing::Image(_))
     }
 
+    /// Run the host-folder reconcile pass (M2). A no-op for an image-backed disk.
+    /// The machine calls this at eject/flush so anything held in the overlay is a
+    /// final-pass materialized to the host folder.
+    pub fn reconcile_host_folder(&mut self) {
+        if let Backing::HostFolder(volume) = &mut self.backing {
+            volume.reconcile();
+        }
+    }
+
     /// Read one whole 512-byte sector at `lba`, or None if past the end. The facade
     /// synthesizes sectors on demand, so this returns an owned array rather than a
     /// borrow into a backing buffer.
@@ -232,20 +242,30 @@ impl AtaDisk {
         }
     }
 
-    /// Overwrite one whole 512-byte sector at `lba`. Returns false if past the
-    /// end or `data` is short. A host-folder facade is read-only in M1, so writes
-    /// to it always fail.
+    /// Overwrite one whole 512-byte sector at `lba`. Returns false if past the end
+    /// or `data` is short. An image writes in place; a host-folder facade routes the
+    /// write into its overlay (M2) and reconciles on command completion.
     pub fn write_lba(&mut self, lba: u32, data: &[u8]) -> bool {
-        // ponytail: the write-back engine (syncing guest writes to host files) is
-        // M2 work; M1 is read-only, so a folder-backed write is simply rejected.
-        let Backing::Image(image) = &mut self.backing else {
-            return false;
-        };
-        let off = lba as usize * SECTOR;
-        if data.len() < SECTOR || off + SECTOR > image.len() {
+        if data.len() < SECTOR {
             return false;
         }
-        image[off..off + SECTOR].copy_from_slice(&data[..SECTOR]);
+        match &mut self.backing {
+            Backing::Image(image) => {
+                let off = lba as usize * SECTOR;
+                if off + SECTOR > image.len() {
+                    return false;
+                }
+                image[off..off + SECTOR].copy_from_slice(&data[..SECTOR]);
+            }
+            Backing::HostFolder(volume) => {
+                if lba >= volume.total_sectors() {
+                    return false;
+                }
+                let mut sector = [0u8; SECTOR];
+                sector.copy_from_slice(&data[..SECTOR]);
+                volume.write_sector(lba, &sector);
+            }
+        }
         self.dirty = true;
         true
     }
@@ -556,6 +576,12 @@ impl AtaDisk {
             self.phase = Phase::Idle;
             self.status = status::DRDY | status::DSC;
             self.error = 0;
+            // M2: mirror any finished files to the host folder. // ponytail: runs a
+            // full reconcile pass per write command; arm-on-FAT/dir-write only if
+            // this ever shows up in profiling.
+            if let Backing::HostFolder(volume) = &mut self.backing {
+                volume.reconcile();
+            }
             // Completion raises the IRQ, the way a drive signals the write done.
             self.raise_irq();
         }
@@ -782,5 +808,37 @@ mod tests {
         assert_eq!(disk.status & status::ERR, 0);
         assert_eq!(disk.status & status::DRDY, status::DRDY);
         assert!(disk.take_irq());
+    }
+
+    /// A tiny host-folder-backed disk: a real KateaTreeVolume over a temp folder.
+    fn host_folder_disk(tag: &str) -> (AtaDisk, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("katea_ata_{}_{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("A.TXT"), b"hi").unwrap();
+        let img = izarravm_firmware::tokados_hdd_img();
+        let mut mbr = [0u8; 512];
+        mbr.copy_from_slice(&img[0..512]);
+        let mut vbr = [0u8; 512];
+        vbr.copy_from_slice(&img[2048 * 512..2048 * 512 + 512]);
+        let sys = vec![("KERNEL.SYS".to_string(), vec![0xEBu8; 100])];
+        let vol = crate::katea_tree::KateaTreeVolume::new(&mbr, &vbr, &dir, &sys).unwrap();
+        (AtaDisk::from_host_folder(vol), dir)
+    }
+
+    #[test]
+    fn host_folder_write_lands_in_the_overlay_and_reads_back() {
+        let (mut disk, dir) = host_folder_disk("rw");
+        // Pick a free data sector well past the system area.
+        let lba = 2048 + 32 + 741 * 2 + 5000;
+        let mut data = [0u8; SECTOR];
+        data[0] = 0x77;
+        data[SECTOR - 1] = 0x88;
+        assert!(disk.write_lba(lba, &data), "folder write now accepted");
+        assert!(disk.dirty, "a folder write marks the disk dirty");
+        let back = disk.read_lba(lba).expect("in range");
+        assert_eq!(back[0], 0x77);
+        assert_eq!(back[SECTOR - 1], 0x88);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
