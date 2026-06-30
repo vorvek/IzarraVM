@@ -19,7 +19,7 @@ use crate::katea_volume::{
     NUM_FATS, PART_START, PART_TYPE_FAT32_LBA, RESERVED_SECTORS, ROOT_CLUSTER, SECTOR,
     fat_size_sectors, lba_to_chs, sectors_per_cluster, stamp_fat32_bpb,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -573,6 +573,11 @@ pub(crate) struct KateaTreeVolume {
     files: Vec<FlatFile>,
     /// `(first_cluster, last_cluster, role)` runs, sorted by `first_cluster`.
     runs: Vec<(u32, u32, Role)>,
+    /// Sparse write overlay: guest writes land here, reads consult it first. Held
+    /// until eject (no eviction in M2). RAM is bounded by bytes written this
+    /// session. // ponytail: overlay-until-eject; the upgrade is per-file
+    /// host-redirect eviction (M2.5) if multi-GB in-session writes ever matter.
+    overlay: HashMap<u32, [u8; SECTOR]>,
 }
 
 impl KateaTreeVolume {
@@ -637,6 +642,7 @@ impl KateaTreeVolume {
             dirs,
             files,
             runs,
+            overlay: HashMap::new(),
         })
     }
 
@@ -660,10 +666,21 @@ impl KateaTreeVolume {
             + (cluster - ROOT_CLUSTER) * u32::from(self.geo.spc)
     }
 
+    /// Store one guest-written sector in the overlay. Reads of this LBA now return
+    /// `data` until eject. The interpreter (`reconcile`) reads the overlay to
+    /// mirror finished files to the host folder.
+    #[allow(dead_code)] // consumed by mod tests + later M2 reconcile; no prod caller yet
+    pub(crate) fn write_sector(&mut self, lba: u32, data: &[u8; SECTOR]) {
+        self.overlay.insert(lba, *data);
+    }
+
     /// Read one whole-disk sector by absolute LBA. Resolves entirely from
     /// in-memory metadata except for `HostFile` data, read on demand. Out-of-range
     /// or unmapped sectors read back as zeros.
     pub(crate) fn read_sector(&self, lba: u32) -> [u8; SECTOR] {
+        if let Some(s) = self.overlay.get(&lba) {
+            return *s;
+        }
         if lba == 0 {
             return self.mbr;
         }
@@ -1130,6 +1147,46 @@ mod tests {
         assert_eq!(
             dot_cluster, sub.first_cluster,
             "`.` names the subdir itself"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn overlay_shadows_the_tree_on_read_and_persists_writes() {
+        let root = scratch("overlay");
+        std::fs::write(root.join("A.TXT"), b"hello").unwrap();
+        let sys = vec![("KERNEL.SYS".to_string(), vec![0xEBu8; 100])];
+        let img = izarravm_firmware::tokados_hdd_img();
+        let mut mbr = [0u8; 512];
+        mbr.copy_from_slice(&img[0..512]);
+        let mut vbr = [0u8; 512];
+        vbr.copy_from_slice(&img[2048 * 512..2048 * 512 + 512]);
+        let mut vol = KateaTreeVolume::new(&mbr, &vbr, &root, &sys).unwrap();
+
+        // A sector that has never been written reads the tree's value (the MBR at 0).
+        let tree_mbr = vol.read_sector(0);
+        assert_eq!(tree_mbr[0x1FE], 0x55, "tree MBR signature");
+
+        // Writing an arbitrary sector shadows the tree on the next read.
+        let mut patch = [0u8; 512];
+        patch[0] = 0xAB;
+        patch[511] = 0xCD;
+        vol.write_sector(0, &patch);
+        let after = vol.read_sector(0);
+        assert_eq!(after[0], 0xAB, "overlay shadows the tree MBR");
+        assert_eq!(after[511], 0xCD);
+
+        // A second write to the same LBA wins (latest value).
+        patch[0] = 0x12;
+        vol.write_sector(0, &patch);
+        assert_eq!(vol.read_sector(0)[0], 0x12, "latest write wins");
+
+        // An unwritten data sector still reads the tree (zeros here = free space).
+        let free = vol.read_sector(2048 + vol.geo.first_data_sector + 9000);
+        assert_eq!(
+            free, [0u8; 512],
+            "unwritten sector falls through to the tree"
         );
 
         std::fs::remove_dir_all(&root).ok();
