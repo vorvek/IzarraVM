@@ -1688,6 +1688,8 @@ del PREEXIST.TXT\r\n";
             "no C:\\> prompt (stop={stop:?}).\n{boot_text}"
         );
 
+        // `ops` runs six commands incl. a COPY (heavier than M2's echoes) + an inline
+        // reconcile each, hence a larger settle budget than the M2 e2e's 120M.
         for (cmd, settle) in [("cd ops\r", 40_000_000u64), ("ops\r", 150_000_000u64)] {
             for ch in cmd.chars() {
                 for code in ascii_to_set1(ch) {
@@ -1705,18 +1707,30 @@ del PREEXIST.TXT\r\n";
 
         let exists = |p: std::path::PathBuf| p.exists();
         let del_gone = !exists(ops.join("DELME.TXT"));
-        let renamed = exists(ops.join("RENAMED.TXT")) && !exists(ops.join("KEEP.TXT"));
-        let moved = exists(ops.join("SUB").join("MOVEME.TXT")) && !exists(ops.join("MOVEME.TXT"));
+        let renamed_new = exists(ops.join("RENAMED.TXT"));
+        let renamed_old_gone = !exists(ops.join("KEEP.TXT"));
+        let moved_to_sub = exists(ops.join("SUB").join("MOVEME.TXT"));
+        let moved_from_root_gone = !exists(ops.join("MOVEME.TXT"));
         let rmdir_gone = !exists(ops.join("EMPTYDIR"));
-        let dir_renamed = exists(ops.join("NEWDIR")) && !exists(ops.join("OLDDIR"));
+        let dir_renamed_new = exists(ops.join("NEWDIR"));
+        let dir_renamed_old_gone = !exists(ops.join("OLDDIR"));
         let preexist_gone = !exists(ops.join("PREEXIST.TXT"));
         std::fs::remove_dir_all(&dir).ok();
 
         assert!(del_gone, "DELME.TXT not deleted");
-        assert!(renamed, "KEEP.TXT not renamed to RENAMED.TXT");
-        assert!(moved, "MOVEME.TXT not moved into SUB");
+        assert!(renamed_new, "RENAMED.TXT not present after rename");
+        assert!(renamed_old_gone, "KEEP.TXT still present after rename");
+        assert!(moved_to_sub, "MOVEME.TXT did not arrive in SUB");
+        assert!(
+            moved_from_root_gone,
+            "MOVEME.TXT still in the root (move's delete didn't apply)"
+        );
         assert!(rmdir_gone, "EMPTYDIR not removed");
-        assert!(dir_renamed, "OLDDIR not renamed to NEWDIR");
+        assert!(dir_renamed_new, "NEWDIR not present after dir rename");
+        assert!(
+            dir_renamed_old_gone,
+            "OLDDIR still present after dir rename"
+        );
         assert!(preexist_gone, "pre-existing PREEXIST.TXT not deleted");
     }
 }
