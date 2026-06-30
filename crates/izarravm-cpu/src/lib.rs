@@ -645,6 +645,19 @@ impl std::fmt::Debug for PrefetchWindow {
     }
 }
 
+/// A deferred ADD or SUB whose six arithmetic flags (CF/PF/AF/ZF/SF/OF) have not been computed yet.
+/// `a`/`b` are the width-masked operands, `result` the width-masked result, exactly as `alu_add`/
+/// `alu_sub` computed them. While this is `Some`, the six arithmetic-flag bits in `registers.eflags`
+/// are STALE; this descriptor is the source of truth for them. Control flags in `eflags` stay live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LazyFlags {
+    a: u32,
+    b: u32,
+    result: u32,
+    width: BusWidth,
+    is_sub: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Cpu386 {
     pub registers: Registers,
@@ -682,6 +695,11 @@ pub struct Cpu386 {
     // bytes; a generation counter (inside) invalidates it on any change that could alter a decode.
     // Transparent accelerator, excluded from equality and reset on clone. See DecodeCache.
     decode_cache: DecodeCache,
+    /// Deferred arithmetic flags (lazy-flags optimization). While `Some`, the six arithmetic-flag
+    /// bits in `registers.eflags` are stale. Cpu386 equality is flag-representation-sensitive while a
+    /// deferral is outstanding; real flag comparisons go through `flag()` / `eflags()`, which
+    /// materialize. (Cpu386 `==` is currently unused.)
+    pending_flags: Option<LazyFlags>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1237,6 +1255,55 @@ type ExecResult<T> = Result<T, InternalFault>;
 impl Cpu386 {
     pub fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    /// Compute the six arithmetic flags `pending_flags` represents, returning the full eflags value with
+    /// them applied (control flags untouched). Pure: does not mutate. Returns current eflags if no pending.
+    fn materialized_eflags(&self) -> u32 {
+        let Some(p) = self.pending_flags else {
+            return self.registers.eflags;
+        };
+        let mask = width_mask(p.width);
+        let sign = width_sign(p.width);
+        let (cf, of, af) = if p.is_sub {
+            (
+                u64::from(p.a) < u64::from(p.b),
+                ((p.a ^ p.b) & (p.a ^ p.result) & sign) != 0,
+                ((p.a ^ p.b ^ p.result) & 0x10) != 0,
+            )
+        } else {
+            (
+                u64::from(p.a) + u64::from(p.b) > u64::from(mask),
+                ((p.a ^ p.result) & (p.b ^ p.result) & sign) != 0,
+                ((p.a ^ p.b ^ p.result) & 0x10) != 0,
+            )
+        };
+        let zf = p.result & mask == 0;
+        let sf = p.result & sign != 0;
+        let pf = parity(p.result as u8);
+        let mut e = self.registers.eflags & !(FLAG_CF | FLAG_OF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_PF);
+        if cf { e |= FLAG_CF; }
+        if of { e |= FLAG_OF; }
+        if af { e |= FLAG_AF; }
+        if zf { e |= FLAG_ZF; }
+        if sf { e |= FLAG_SF; }
+        if pf { e |= FLAG_PF; }
+        e | 0x2
+    }
+
+    /// Settle any pending arithmetic flags into `registers.eflags` and clear `pending_flags`.
+    fn materialize_flags(&mut self) {
+        if self.pending_flags.is_some() {
+            self.registers.eflags = self.materialized_eflags();
+            self.pending_flags = None;
+        }
+    }
+
+    /// The architectural EFLAGS value, with any deferred arithmetic flags applied. The public,
+    /// non-mutating accessor for ANY reader that needs the whole eflags word (tests, the conformance
+    /// harness, external callers).
+    pub fn eflags(&self) -> u32 {
+        self.materialized_eflags()
     }
 
     fn invalidate_code_caches(&mut self) {
