@@ -1,3 +1,4 @@
+mod bench_reference;
 mod cmos;
 mod crt;
 mod gui;
@@ -68,6 +69,8 @@ struct Cli {
     headless_boot_suite: bool,
     #[arg(long)]
     headless_bench: bool,
+    #[arg(long)]
+    headless_bandwidth: bool,
     #[arg(long)]
     headless_keyboard: bool,
     #[arg(long)]
@@ -157,6 +160,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     if cli.headless_bench {
         return run_bench(&hardware);
+    }
+
+    if cli.headless_bandwidth {
+        return run_bandwidth(&hardware);
     }
 
     if let Some(path) = &cli.headless_run {
@@ -394,7 +401,7 @@ fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
             } else {
                 0.0
             };
-            println!(
+            print!(
                 "{:<10} {:<5} {:>12.2} {:>8} {:>9} {:>12.1} {:>10.3} {:>9.3} {:>10.3}",
                 bench.name,
                 mode.canonical_name(),
@@ -406,9 +413,135 @@ fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
                 wall_secs * 1000.0,
                 rt,
             );
+            // Soft reporter: tag each row against the era reference band. This is
+            // observability only and never changes the exit code. After B-T9
+            // calibration every row tags [in band] (the compute caps the bus model
+            // cannot reach were relaxed to best-effort; see bench_reference.rs).
+            println!("{}", band_tag(bench.name, mode, iters_per_sec));
         }
     }
     Ok(())
+}
+
+/// Compare a measured `iters/sec` to the matching era reference band and return
+/// a tag to append to the row: ` [in band]`, ` [LOW <ratio>]`, ` [HIGH <ratio>]`,
+/// or empty when no band is encoded for this payload/mode.
+fn band_tag(payload: &str, mode: GswMode, iters_per_sec: f64) -> String {
+    use bench_reference::BandVerdict;
+    let Some(band) = bench_reference::band_for(payload, mode) else {
+        return String::new();
+    };
+    match band.verdict(iters_per_sec) {
+        BandVerdict::InBand => " [in band]".to_string(),
+        BandVerdict::Low => format!(" [LOW {:.2}]", iters_per_sec / band.target),
+        BandVerdict::High => format!(" [HIGH {:.2}]", iters_per_sec / band.target),
+    }
+}
+
+/// Block sizes swept by --headless-bandwidth, powers of two from 4 KB to 4 MB.
+/// A block that fits the live mode's cache stays resident across passes; one that
+/// exceeds it re-misses every pass. The largest block (4 MB) plus the 1 MB base
+/// tops out at 5 MB, well inside the 24 MB machine.
+const BANDWIDTH_BLOCKS: &[u32] = &[
+    4 * 1024,
+    8 * 1024,
+    16 * 1024,
+    32 * 1024,
+    64 * 1024,
+    128 * 1024,
+    256 * 1024,
+    512 * 1024,
+    1024 * 1024,
+    2 * 1024 * 1024,
+    4 * 1024 * 1024,
+];
+
+/// A simplified SpeedSys-style memory-read bandwidth sweep. For each CPU mode it
+/// drives the bus directly from the host (no guest program, so it can touch any
+/// physical address) over a range of block sizes and prints MB/s per block, so a
+/// human can see the L1/L2/RAM cache tiers as steps in the curve.
+///
+/// This is observability only: it never fails the process (the hard tier-ordering
+/// assertions are a later task). The tier costs are CALIBRATED (B-T9): the curve
+/// steps DOWN at each cache boundary (586/486: L1 > L2 > RAM; 386: L2 > RAM; 286:
+/// flat RAM), and each tier sits in its (best-effort) era band.
+fn run_bandwidth(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
+    // A fixed total budget per block: small blocks do many passes, large blocks a
+    // few. 16 MB amortizes the cold first pass so the steady state dominates.
+    const TOTAL: u64 = 16 * 1024 * 1024;
+
+    let modes = [
+        GswMode::Gsw286,
+        GswMode::Gsw386,
+        GswMode::Gsw486,
+        GswMode::Gsw586,
+    ];
+
+    println!(
+        "memory read bandwidth sweep (TOTAL {} MB per block, base 0x{:06X})",
+        TOTAL / (1024 * 1024),
+        0x10_0000u32,
+    );
+    println!("(tier costs calibrated: the curve steps down at each cache boundary)");
+
+    for mode in modes {
+        println!();
+        println!(
+            "mode {} @ {:.2} MHz  L1/L2 = {:?} KB",
+            mode.canonical_name(),
+            mode.clock_hz() as f64 / 1.0e6,
+            mode.cache_kb(),
+        );
+        println!("{:>8} {:>12} {:>16}", "block", "MB/s", "band");
+        for &block in BANDWIDTH_BLOCKS {
+            // A fresh machine per (mode, size) so each measurement starts cold and
+            // nothing carries over from the previous block.
+            let mut machine = Machine::new_boot_image(
+                MachineProfile::from_hardware_profile(hardware),
+                izarravm_firmware::neurketa_image(),
+            )?;
+            machine.set_mode(mode);
+            let sample = machine.measure_read_bandwidth(0x10_0000, block, TOTAL);
+            let mb_per_sec = if sample.clocks > 0 {
+                sample.bytes as f64 / (sample.clocks as f64 / mode.clock_hz() as f64) / 1.0e6
+            } else {
+                0.0
+            };
+            println!(
+                "{:>7}K {:>12.1} {:>16}",
+                block / 1024,
+                mb_per_sec,
+                bandwidth_band_tag(mode, block, mb_per_sec),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Soft band tag for a bandwidth row: pick the tier a block falls into for the
+/// mode's cache geometry (<= L1 -> L1, <= L2 -> L2, else RAM), look up the
+/// matching `bandwidth-*` era band, and tag the measured MB/s against it. Returns
+/// empty when no band is encoded for that mode/tier. Observability only.
+fn bandwidth_band_tag(mode: GswMode, block: u32, mb_per_sec: f64) -> String {
+    use bench_reference::BandVerdict;
+    let (l1_kb, l2_kb) = mode.cache_kb();
+    let block_kb = block / 1024;
+    let tier = if l1_kb != 0 && block_kb <= u32::from(l1_kb) {
+        "bandwidth-l1"
+    } else if l2_kb != 0 && block_kb <= u32::from(l2_kb) {
+        "bandwidth-l2"
+    } else {
+        "bandwidth-ram"
+    };
+    let Some(band) = bench_reference::band_for(tier, mode) else {
+        return String::new();
+    };
+    let label = tier.trim_start_matches("bandwidth-");
+    match band.verdict(mb_per_sec) {
+        BandVerdict::InBand => format!("{label} [in band]"),
+        BandVerdict::Low => format!("{label} [LOW {:.2}]", mb_per_sec / band.target),
+        BandVerdict::High => format!("{label} [HIGH {:.2}]", mb_per_sec / band.target),
+    }
 }
 
 /// Load and run a DOS .COM/.EXE headless, then exit with its DOS exit code.
