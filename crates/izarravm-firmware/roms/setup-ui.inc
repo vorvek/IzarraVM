@@ -249,7 +249,7 @@ su_post_note:
     ; Wipe the two hint rows on the LFB to the field colour.
     mov di, ART_HDR_X
     mov si, ART_HINT1_Y
-    mov cx, 230
+    mov cx, 225
     mov dx, 20
     mov bl, ART_FIELD_INDEX
     call lfb_fill_rect
