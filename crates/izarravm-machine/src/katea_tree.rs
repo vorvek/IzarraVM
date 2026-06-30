@@ -1703,7 +1703,7 @@ mod tests {
     }
 
     #[test]
-    fn new_seeds_dir_paths_existing_files_and_system_names() {
+    fn new_seeds_dir_paths_mirrored_and_system_names() {
         let root = scratch("seed");
         std::fs::create_dir_all(root.join("SAVES")).unwrap();
         std::fs::write(root.join("SAVES").join("OLD.TXT"), b"before").unwrap();
@@ -1719,6 +1719,18 @@ mod tests {
         assert_eq!(vol.dir_paths.get(&2), Some(&root));
         let saves_fc = vol.tree().root.subdirs[0].dir.first_cluster;
         assert_eq!(vol.dir_paths.get(&saves_fc), Some(&root.join("SAVES")));
+
+        // The SAVES subdir is recorded in mirrored under the root, as a directory
+        // (new in M3: subdirs are seeded so disappearance/rename detection sees them).
+        let mut saves = [b' '; 11];
+        saves[..5].copy_from_slice(b"SAVES");
+        let sub_entry = vol
+            .mirrored
+            .get(&(2, saves))
+            .expect("SAVES mirrored under root");
+        assert!(sub_entry.is_dir, "SAVES is a directory entry");
+        assert_eq!(sub_entry.host_path, root.join("SAVES"));
+        assert_eq!(sub_entry.first_cluster, saves_fc);
 
         // The existing host file is recorded in mirrored with the correct host_path.
         let mut old = [b' '; 11];
