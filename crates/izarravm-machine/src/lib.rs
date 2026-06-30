@@ -12,6 +12,7 @@ use izarravm_core::{
     ConfigSysMemory, Emm386Mode, GswMode, HardwareProfile, SoundBlasterConfig, VideoCard,
     WssConfig, YamahaAdpcmConfig,
 };
+pub use izarravm_cpu::PerfCounters;
 use izarravm_cpu::{
     Cpu386, CpuError, CpuLevel, CycleOutcome, Registers, SegmentIndex, SegmentRegister, bus_timing,
 };

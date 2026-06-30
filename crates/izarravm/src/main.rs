@@ -14,7 +14,7 @@ use izarravm_firmware::{
     SuiteRecordStatus, boot_test_image, neurketa_image, parse_result_block, test_rom,
 };
 use izarravm_input::InputState;
-use izarravm_machine::{Machine, MachineProfile, StopReason};
+use izarravm_machine::{Machine, MachineProfile, PerfCounters, StopReason};
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use tracing::info;
@@ -275,6 +275,8 @@ struct BenchRun {
     iterations: u32,
     aux: u32,
     wall: std::time::Duration,
+    /// Host-side perf counters for this run (decode-cache + straight-line diagnostics).
+    perf: PerfCounters,
 }
 
 /// How a benchmark payload is loaded: baked into the Neurketa boot image and
@@ -316,6 +318,7 @@ fn run_bench_one(
         iterations: machine.bench_iterations(),
         aux: machine.bench_aux(),
         wall,
+        perf: machine.cpu().perf_counters().clone(),
     })
 }
 
@@ -413,12 +416,15 @@ fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
         "wall_ms",
         "rt_factor"
     );
+    // Collected for the host-side perf summary printed after the table.
+    let mut perf_rows: Vec<(&'static str, GswMode, PerfCounters)> = Vec::new();
     for bench in BENCHES {
         for mode in modes {
             if mode_rank(mode) < mode_rank(bench.min_mode) {
                 continue;
             }
             let run = run_bench_one(hardware, mode, &bench.source, BENCH_BUDGET)?;
+            perf_rows.push((bench.name, mode, run.perf.clone()));
             let baseline_clocks = match bench.source {
                 BenchSource::BootSelector(_) => baseline[mode_rank(mode) as usize],
                 BenchSource::DosExe(_) => 0,
@@ -469,6 +475,31 @@ fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
                 band_tag(bench.name, mode, band_value)
             );
         }
+    }
+    // Host-side perf summary (RPCS3 idea #1): decode-cache hit rate, average
+    // straight-line run length, and why each run ended. Diagnostics only; lines are
+    // prefixed "perf" so they never parse as a bench row. The counters are host-side
+    // and do not affect cyc/iter (the guest clock metric).
+    println!();
+    println!("=== perf counters (host-side diagnostics; off the guest-timing path) ===");
+    for (name, mode, perf) in &perf_rows {
+        let instructions = perf.instructions.max(1);
+        let decode_hit = 100.0 * (1.0 - perf.decode_misses as f64 / instructions as f64);
+        let insns_per_run = perf.instructions as f64 / perf.straight_line_runs.max(1) as f64;
+        println!(
+            "perf  {:<10} {:<5} instr={:>13}  decode_hit={:>6.2}%  insns/run={:>9.1}  \
+             brk[branch/step/int/cap/halt]={}/{}/{}/{}/{}",
+            name,
+            mode.canonical_name(),
+            perf.instructions,
+            decode_hit,
+            insns_per_run,
+            perf.brk_decode_or_branch,
+            perf.brk_step,
+            perf.brk_interrupt,
+            perf.brk_cap,
+            perf.brk_halt,
+        );
     }
     Ok(())
 }

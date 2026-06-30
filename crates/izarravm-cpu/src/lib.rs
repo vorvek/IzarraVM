@@ -661,6 +661,38 @@ struct LazyFlags {
     is_sub: bool,
 }
 
+/// Host-side performance counters: pure diagnostics for `--headless-bench`, NOT
+/// architectural state. Like the decode cache and TLB, this carries an always-equal
+/// `PartialEq` so it is excluded from `Cpu386` equality (conformance and golden-state
+/// comparisons must ignore it). The only hot-path cost is one `instructions += 1` per
+/// retired instruction; everything else increments at cold per-run sites.
+#[derive(Debug, Clone, Default)]
+pub struct PerfCounters {
+    /// Instructions retired. Every execution path routes through `finish_instruction`.
+    pub instructions: u64,
+    /// Instructions that required a fresh decode (a decode-cache miss in `fetch_decoded`).
+    /// Decode-cache hit rate = 1 - decode_misses / instructions.
+    pub decode_misses: u64,
+    /// Calls to `run_straight_line` (one per machine batch entry). The denominator for
+    /// the average straight-line run length = instructions / straight_line_runs.
+    pub straight_line_runs: u64,
+    /// Why each straight-line run ended (one increment per run; they sum to
+    /// straight_line_runs). These say what limits batch length.
+    pub brk_decode_or_branch: u64, // next insn not cached / not straight-line / page cross
+    pub brk_step: u64, // port I/O or a pending HLE soft-int (requires_step_break)
+    pub brk_interrupt: u64, // an instruction made a maskable interrupt serviceable
+    pub brk_cap: u64,  // the run reached the scaled-clock cap
+    pub brk_halt: u64, // the run executed HLT
+}
+
+impl PartialEq for PerfCounters {
+    // Diagnostic-only: never affects Cpu386 equality (conformance / goldens ignore it).
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+impl Eq for PerfCounters {}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Cpu386 {
     pub registers: Registers,
@@ -701,6 +733,9 @@ pub struct Cpu386 {
     // bytes; a generation counter (inside) invalidates it on any change that could alter a decode.
     // Transparent accelerator, excluded from equality and reset on clone. See DecodeCache.
     decode_cache: DecodeCache,
+    /// Host-side performance counters (diagnostics for `--headless-bench`). Excluded from
+    /// equality via `PerfCounters`'s always-equal `PartialEq`, like the decode cache.
+    perf: PerfCounters,
     /// Deferred arithmetic flags (lazy-flags optimization). While `Some`, the six arithmetic-flag
     /// bits in `registers.eflags` are stale. Cpu386 equality is flag-representation-sensitive while a
     /// deferral is outstanding; real flag comparisons go through `flag()` / `eflags()`, which
@@ -1470,6 +1505,17 @@ impl Cpu386 {
         self.level.cache_kb()
     }
 
+    /// Host-side performance counters accumulated since construction or the last
+    /// `reset_perf_counters`. Diagnostics for `--headless-bench`; not architectural state.
+    pub fn perf_counters(&self) -> &PerfCounters {
+        &self.perf
+    }
+
+    /// Zero the host-side performance counters.
+    pub fn reset_perf_counters(&mut self) {
+        self.perf = PerfCounters::default();
+    }
+
     pub fn is_paging_enabled(&self) -> bool {
         self.control.cr0 & CR0_PG != 0
     }
@@ -1660,6 +1706,7 @@ impl Cpu386 {
 
         let charged = self.scale_clocks(outcome.core_clocks);
         self.elapsed_clocks += charged;
+        self.perf.instructions += 1;
         Ok(CycleOutcome {
             core_clocks: charged.min(u64::from(u32::MAX)) as u32,
             halted: outcome.halted,
@@ -1693,6 +1740,7 @@ impl Cpu386 {
     ) -> Result<CycleOutcome, CpuError> {
         let mut total = 0u64;
         let mut first = true;
+        self.perf.straight_line_runs += 1;
         loop {
             let can_take_before = self.can_take_interrupt();
             let outcome = if first {
@@ -1707,7 +1755,10 @@ impl Cpu386 {
                     {
                         i
                     }
-                    _ => break,
+                    _ => {
+                        self.perf.brk_decode_or_branch += 1;
+                        break;
+                    }
                 };
                 self.run_one_cached(bus, &insn, lin)?
             };
@@ -1716,6 +1767,7 @@ impl Cpu386 {
             // loop used (halted -> step-break -> interrupt-transition -> cap), so the run ends at
             // exactly the boundary that loop would have stopped at.
             if outcome.halted {
+                self.perf.brk_halt += 1;
                 return Ok(CycleOutcome {
                     core_clocks: total.min(u64::from(u32::MAX)) as u32,
                     halted: true,
@@ -1727,6 +1779,7 @@ impl Cpu386 {
             // instruction too: a port OUT/IN as the run's first instruction must end the run after
             // that one instruction, exactly like the old loop.
             if bus.requires_step_break() {
+                self.perf.brk_step += 1;
                 break;
             }
             // End the run the instant an instruction makes a maskable interrupt serviceable (the
@@ -1735,9 +1788,11 @@ impl Cpu386 {
             // boundary. Checked after the FIRST instruction too: an IF-on-then-off-within-a-run
             // sequence would otherwise lose the interrupt.
             if !can_take_before && self.can_take_interrupt() {
+                self.perf.brk_interrupt += 1;
                 break;
             }
             if total >= cap {
+                self.perf.brk_cap += 1;
                 break;
             }
         }
@@ -1955,6 +2010,7 @@ impl Cpu386 {
             return Ok(insn);
         }
         let insn = self.decode(bus)?;
+        self.perf.decode_misses += 1;
         // A LOCK-prefixed instruction is never cached: `decode` runs `check_lock_target`, which both
         // peeks the lock target over the bus (charging fetch clocks that are NOT part of `len`, so a
         // cached replay would under-charge them) and raises #UD for a non-lockable target. Replaying
@@ -9278,6 +9334,57 @@ mod tests {
         assert_eq!(
             u16::from_le_bytes([bus.memory[0x200], bus.memory[0x201]]),
             0x4f56
+        );
+    }
+
+    #[test]
+    fn perf_counters_track_decode_hits_and_run_breaks() {
+        // A tight loop: 0: inc ax (40); 1: inc ax (40); 2: jmp $-4 (EB FC) -> 0.
+        let mut memory = vec![0u8; 1024];
+        memory[0..4].copy_from_slice(&[0x40, 0x40, 0xeb, 0xfc]);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        let mut bus = TestBus::with_memory(memory);
+
+        // Six single steps run the 3-instruction body twice (inc, inc, jmp).
+        for _ in 0..6 {
+            cpu.cycle(&mut bus).unwrap();
+        }
+        let p = cpu.perf_counters();
+        assert_eq!(p.instructions, 6, "six instructions retired");
+        // The three unique linear addresses decode once; the loop's second pass is
+        // served from the decode cache, so misses stay at 3 (a 50% hit rate). This is
+        // the assertion that fails if the decode cache (or the miss counter) breaks.
+        assert_eq!(
+            p.decode_misses, 3,
+            "only the first pass decodes; the loop re-hits"
+        );
+
+        // On the now-warm cache a straight-line run executes the two cached `inc`s and
+        // ends at the non-straight-line backward jmp, bumping the branch break reason.
+        cpu.reset_perf_counters();
+        assert_eq!(
+            cpu.perf_counters().instructions,
+            0,
+            "reset zeroes the counters"
+        );
+        let _ = cpu.run_straight_line(&mut bus, 10_000).unwrap();
+        let p = cpu.perf_counters();
+        assert_eq!(p.straight_line_runs, 1, "one run");
+        assert!(
+            p.instructions >= 1,
+            "the run retired at least the first instruction"
+        );
+        assert_eq!(
+            p.brk_decode_or_branch, 1,
+            "the run ended at the backward jmp"
+        );
+        assert_eq!(
+            p.brk_step + p.brk_interrupt + p.brk_cap + p.brk_halt,
+            0,
+            "no other break reason fired"
         );
     }
 
