@@ -464,7 +464,7 @@ impl CpuLevel {
             Self::I286 => (0, 0),
             Self::I386 => (0, 64),
             Self::I486 => (16, 128),
-            Self::I586 => (64, 512),
+            Self::I586 => (32, 512),
         }
     }
 }
@@ -7014,7 +7014,7 @@ pub const fn bus_timing(level: CpuLevel) -> (u32, u32) {
         CpuLevel::I286 => (6, 11),
         CpuLevel::I386 => (23, 31),
         CpuLevel::I486 => (1, 3),
-        CpuLevel::I586 => (9, 49),
+        CpuLevel::I586 => (7, 30),
     }
 }
 

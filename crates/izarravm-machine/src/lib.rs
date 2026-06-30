@@ -722,8 +722,8 @@ impl TimingFactors {
 
 /// Bytes per modeled cache line. K6-class geometry: 64-byte lines on every tier.
 const CACHE_LINE_BYTES: u32 = 64;
-/// Largest L1 across all modes (586 = 64 KB) in lines: 64 KB / 64 B = 1024.
-const CACHE_L1_MAX_LINES: usize = (64 * 1024) / CACHE_LINE_BYTES as usize;
+/// Largest L1 across all modes (586 = 32 KB) in lines: 32 KB / 64 B = 512.
+const CACHE_L1_MAX_LINES: usize = (32 * 1024) / CACHE_LINE_BYTES as usize;
 /// Largest L2 across all modes (586 = 512 KB) in lines: 512 KB / 64 B = 8192.
 const CACHE_L2_MAX_LINES: usize = (512 * 1024) / CACHE_LINE_BYTES as usize;
 
@@ -751,7 +751,7 @@ const fn cache_geometry(level: CpuLevel) -> CacheGeometry {
             l2_bytes: 128 * 1024,
         },
         CpuLevel::I586 => CacheGeometry {
-            l1_bytes: 64 * 1024,
+            l1_bytes: 32 * 1024,
             l2_bytes: 512 * 1024,
         },
     }
@@ -13928,7 +13928,7 @@ mod tests {
             (CpuLevel::I286, (0u16, 0u16)),
             (CpuLevel::I386, (0, 64)),
             (CpuLevel::I486, (16, 128)),
-            (CpuLevel::I586, (64, 512)),
+            (CpuLevel::I586, (32, 512)),
         ] {
             let g = cache_geometry(level);
             assert_eq!(g.l1_bytes / 1024, u32::from(l1_kb), "{level:?} L1");
@@ -17129,10 +17129,10 @@ mod tests {
         // Boot mode is 386 @ 22 MHz: the PIT factor is PIT_INPUT_HZ / 22 MHz.
         assert_eq!(machine.active_mode(), GswMode::Gsw386);
         assert!((machine.timing.pit_per_clock - PIT_INPUT_HZ as f64 / 22_000_000.0).abs() < 1e-9);
-        // Switching to 586 @ 266 MHz recomputes the factor.
+        // Switching to 586 @ 200 MHz recomputes the factor.
         machine.set_mode(GswMode::Gsw586);
         assert_eq!(machine.active_mode(), GswMode::Gsw586);
-        assert!((machine.timing.pit_per_clock - PIT_INPUT_HZ as f64 / 266_000_000.0).abs() < 1e-9);
+        assert!((machine.timing.pit_per_clock - PIT_INPUT_HZ as f64 / 200_000_000.0).abs() < 1e-9);
         // Super Slow (286) @ 8.33 MHz.
         machine.set_mode(GswMode::Gsw286);
         assert_eq!(machine.active_mode(), GswMode::Gsw286);
@@ -23162,12 +23162,12 @@ mod tests {
     fn audio_sample_cap_is_one_dac_sample_and_never_zero() {
         // The run-loop batch services devices once per cap clocks; the cap must be
         // exactly one 44.1 kHz DAC sample so the DSP/CD producers never alias, and
-        // never 0 (which would stall the batch). Checked at the live 266 MHz
+        // never 0 (which would stall the batch). Checked at the live 200 MHz
         // default and a pathologically slow clock where the floor division would
         // otherwise be 0.
         assert_eq!(
-            TimingFactors::for_clock(266_000_000).clocks_per_audio_sample,
-            266_000_000 / u64::from(DAC_HZ)
+            TimingFactors::for_clock(200_000_000).clocks_per_audio_sample,
+            200_000_000 / u64::from(DAC_HZ)
         );
         assert_eq!(
             TimingFactors::for_clock(40_000).clocks_per_audio_sample,
