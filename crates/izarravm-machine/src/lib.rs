@@ -720,7 +720,9 @@ impl TimingFactors {
     }
 }
 
-/// Bytes per modeled cache line. K6-class geometry: 64-byte lines on every tier.
+/// Bytes per modeled cache line: 64 bytes on every tier. (A real Pentium MMX uses
+/// 32-byte lines; the line size is kept as-is -- out of scope for the P55C timing
+/// retarget, which changed clock / L1 size / dials, not the line geometry.)
 const CACHE_LINE_BYTES: u32 = 64;
 /// Largest L1 across all modes (586 = 32 KB) in lines: 32 KB / 64 B = 512.
 const CACHE_L1_MAX_LINES: usize = (32 * 1024) / CACHE_LINE_BYTES as usize;
@@ -821,15 +823,13 @@ const fn tier_cost(level: CpuLevel) -> TierCost {
             l2: 191,
             ram: 250,
         },
-        // 586 K6 @ 266 MHz: L1 ws=0 (dhry-coupled) -> with bus_timing 9/49 ->
-        // ~2890 MB/s L1 (the bus scale-up that hits the 586 Dhrystone target lifts
-        // L1 bandwidth far above SpeedSys 700; irreducible while Dhrystone is on
-        // target, since both share the L1 + bus timing). Same 16-dwords-per-line
-        // amortization as the 486: L2 miss ws=200 -> ~398 MB/s; RAM miss ws=255 ->
-        // ~323 MB/s. Both ride above SpeedSys (era L2 ~244, RAM ~120) because the u8
-        // wait-state cap (255) over a 16-dword line cannot supply a large enough
-        // per-access average against the 9/49 bus scale; bands recentered, gap in
-        // the cite. Descending.
+        // 586 Pentium MMX-200 @ 200 MHz: L1 ws=0 (dhry-coupled) -> with bus_timing
+        // 7/30 -> ~1700 MB/s L1 (the bus scale that hits the 586 Dhrystone target also
+        // sets L1 bandwidth; irreducible while Dhrystone is on target, since both share
+        // the L1 + bus timing). Same 16-dwords-per-line amortization as the 486: L2
+        // miss ws=200 -> ~235 MB/s; RAM miss ws=255 -> ~191 MB/s. The u8 wait-state cap
+        // (255) over a 16-dword line bounds the per-access average against the 7/30 bus
+        // scale; bands recentered best-effort (Pentium-MMX-200-class). Descending.
         CpuLevel::I586 => TierCost {
             l1: 0,
             l2: 200,
@@ -18489,10 +18489,10 @@ mod tests {
     }
 
     #[test]
-    fn boot_suite_timer_passes_at_native_266mhz() {
+    fn boot_suite_timer_passes_at_native_200mhz() {
         // The boot suite is wall-time-bound: the timer test waits for ten IRQ0
         // edges and the PIT runs at a fixed rate regardless of the CPU clock. At
-        // the 266 MHz native default the cycle budget must scale (clock_hz / 5,
+        // the 200 MHz native default the cycle budget must scale (clock_hz / 5,
         // about 200 ms) or the timer test never reaches its tick target.
         let profile = MachineProfile {
             cpu: GswMode::Gsw586,
@@ -18523,7 +18523,7 @@ mod tests {
         assert_eq!(
             timer.status,
             izarravm_firmware::SuiteRecordStatus::Pass,
-            "timer.irq0 must pass at 266 MHz with the scaled budget"
+            "timer.irq0 must pass at 200 MHz with the scaled budget"
         );
     }
 

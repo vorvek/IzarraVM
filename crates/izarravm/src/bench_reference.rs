@@ -4,7 +4,7 @@
 //! are the project owner's AUTHORITATIVE era targets (these supersede the earlier
 //! researched B-T1 bands); the others are sourced from published period benchmark
 //! data scaled to the IZARRA clock rates (286 @ 8.33 MHz, 386 @ 22 MHz, 486 DX2 @
-//! 66 MHz, K6 "Chomper" 586 @ 266 MHz). After the B-T10 three-dial calibration
+//! 66 MHz, Pentium MMX-200 / P55C 586 @ 200 MHz). After the B-T10 three-dial calibration
 //! (instruction scalar `level_timing`, relative cache tiers `tier_cost`, and the
 //! per-mode bus scalar `bus_timing`) every `--headless-bench` and
 //! `--headless-bandwidth` row tags [in band].
@@ -24,18 +24,21 @@
 //! DHRYSTONE = PRIMARY ORACLE (owner authoritative). The B-T10 bus scalar lets the
 //! fast modes pull away from the old flat per-access bus floor, so all four modes
 //! now hit the owner's targets TIGHTLY (+/-5% in-order, wider best-effort for the
-//! superscalar 586 but centered on 475000):
+//! superscalar 586 but centered on 300000):
 //!   286 ~3500 (~2.0 DMIPS), 386 ~9200 (~5.2 DMIPS), 486 ~61000 (~34.7 DMIPS),
-//!   586 ~475000 (~270 DMIPS).
+//!   586 ~300000 (~170.5 DMIPS).
+//!
+//! WHETSTONE = the FP oracle (P55C retarget). A real Whetstone .EXE payload now runs
+//! at 486/586 and reports MFLOPS; its band carries the owner's authoritative FP
+//! targets (486DX2-66 ~6.5 MFLOPS, Pentium MMX-200 ~34.5 MFLOPS), seated by the
+//! per-mode `fp_timing(I586)` scalar (the full per-op x87-latency dial stays deferred).
 //!
 //! RESIDUAL GAPS (B-T10), recorded in the cites and reported to the owner:
-//!  - fp-mandel: x87-compute-bound, so it rides `level_timing`. Pinning Dhrystone
-//!    to its owner target forces that dial small on the fast modes, so fp-mandel
-//!    runs above its old ratio-anchored absolute and at a 586/486 ratio of ~8x (the
-//!    model floor with Dhrystone pinned is ~7.8x; matching ratio 4.0x AND the
-//!    Dhrystone target needs a separate x87-latency dial -- a deferred Whetstone
-//!    follow-up). The fp bands are recentered on the achieved value; the ratio gap
-//!    is in the cite. Dhrystone is PRIMARY, so this is the accepted trade.
+//!  - fp-mandel: x87-compute-bound, so it rides `level_timing` (and now `fp_timing` at
+//!    586). It is NOT an authoritative payload (we run pixels/sec, not Whetstone MFLOPS),
+//!    so its bands are recentered best-effort on the achieved value. With the P55C clock
+//!    (200 MHz) and the FP scalar its 586/486 ratio is ~5.8x; Whetstone, not fp-mandel,
+//!    is the calibrated FP oracle now. Dhrystone is PRIMARY, so this stays a soft tag.
 //!  - Bandwidth: the tool now reports the SCALED bus delta, so a tier's MB/s is
 //!    `4 * clock_hz / ((2 + ws) * bus_num/bus_den) / 1e6`. The fast-mode L1 tier is
 //!    Dhrystone-coupled (Dhrystone is ~30% L1 data and shares the L1 + bus timing),
@@ -43,9 +46,9 @@
 //!    ABOVE the SpeedSys era figures; pulling it back would re-slow Dhrystone. The
 //!    L2/RAM tiers are decoupled (benchmarks fit L1/L2, never miss), so large
 //!    `tier_cost` miss penalties pull them down: the 486 L2/RAM land SpeedSys-exact;
-//!    the 586 L2/RAM floor a touch high because the u8 wait-state cap (255) over a
-//!    16-dword line cannot supply a large enough per-access average against the 9/49
-//!    bus scale. 286 RAM and 386 L2 are Dhrystone-coupled and ride above SpeedSys.
+//!    the 586 L2/RAM are bounded by the u8 wait-state cap (255) over a 16-dword line,
+//!    which limits the per-access average against the 7/30 bus scale (recentered
+//!    best-effort). 286 RAM and 386 L2 are Dhrystone-coupled and ride above SpeedSys.
 //!    Each bandwidth band is recentered on the achieved value with the SpeedSys era
 //!    anchor and the gap in the cite.
 //!  - Sieve has NO authoritative owner target: best-effort bands centered on the
@@ -54,15 +57,17 @@
 //!
 //! Sources (cross-checked where possible; see the `cite` on each entry):
 //! - PROJECT OWNER AUTHORITATIVE: Dhrystone V1.1 targets 286 ~3500, 386 ~9200,
-//!   486 DX2-66 ~61000, K6 266 ~475000 Dhrystones/sec.
+//!   486 DX2-66 ~61000, Pentium MMX-200 ~300000 Dhrystones/sec.
+//! - PROJECT OWNER AUTHORITATIVE: Whetstone 486DX2-66 ~6.5 MFLOPS, Pentium MMX-200
+//!   ~34.5 MFLOPS (~5.3x, the fp ratio the fp_timing(I586) scalar seats).
 //! - Roy Longbottom's PC benchmark collection
 //!   (http://www.roylongbottom.org.uk/indexOld.htm#anchorCPU): Dhrystone and
-//!   Whetstone period tables used to interpolate to the Izarra clocks; Whetstone
-//!   486DX2-66 ~6.5 MFLOPS vs K6 ~26.8 MFLOPS (~4.12x, the fp ratio anchor).
+//!   Whetstone period tables for the Pentium MMX-200 and 486DX2-66.
 //! - "The (Almost) Definitive 486DX/50 and DX2/66" (SpeedSys): 486DX2-66 L1 read
 //!   ~62-70 MB/s; period 486 RAM bandwidth ~38-40 MB/s.
-//! - VOGONS SpeedSys reports: K6-2(+) class memory bandwidth ~244 MB/s with L2;
-//!   Super-7 K6 L1 read several hundred MB/s (~700 MB/s class).
+//! - The 586 bandwidth bands are recentered best-effort on the model's achieved
+//!   values (Pentium-MMX-200-class, 200 MHz on the 66 MHz bus); no authoritative
+//!   per-tier P55C figure is pinned (the bench gate is Dhrystone + Whetstone).
 
 use izarravm_core::GswMode;
 
@@ -137,13 +142,13 @@ pub fn band_for(payload: &str, mode: GswMode) -> Option<&'static BenchBand> {
 /// - 286 @ 8.33: ~3500/s  (~2.0 DMIPS).
 /// - 386 @ 22:   ~9200/s  (~5.2 DMIPS).
 /// - 486 @ 66:   ~61000/s (~34.7 DMIPS).
-/// - 586 @ 266:  ~475000/s (~270 DMIPS).
+/// - 586 @ 200:  ~300000/s (~170.5 DMIPS).
 pub const BENCH_BANDS: &[BenchBand] = &[
     // ---- Dhrystone (all four modes); target = Dhrystones/sec. OWNER AUTHORITATIVE. ----
     // The B-T10 per-mode bus scalar lifts the fast modes off the old flat per-access
     // bus floor, so all four modes hit the owner's targets within ~0.3%. Bands are
     // tight (+/-5% in-order; the 286 a touch wider for sparse period data; the 586
-    // widest per the band-width-ordering invariant, but centered on 475000).
+    // widest per the band-width-ordering invariant, but centered on 300000).
     BenchBand {
         payload: "dhrystone",
         mode: GswMode::Gsw286,
@@ -174,13 +179,14 @@ pub const BENCH_BANDS: &[BenchBand] = &[
     BenchBand {
         payload: "dhrystone",
         mode: GswMode::Gsw586,
-        target: 475000.0,
+        target: 300000.0,
         // Widest band (superscalar), ~ +/-8%, centered on the owner anchor; stays
         // wider than the in-order modes per the band-width ordering invariant.
-        lo: 437000.0,
-        hi: 513000.0,
+        // Achieved 301341 (bus_timing 7/30).
+        lo: 276000.0,
+        hi: 324000.0,
         unit: "iters/sec",
-        cite: "OWNER AUTHORITATIVE: K6 @ 266 MHz ~475000 Dhrystones/sec (~270 DMIPS); Roy Longbottom PC collection",
+        cite: "OWNER AUTHORITATIVE: Pentium MMX-200 @ 200 MHz ~300000 Dhrystones/sec (~170.5 DMIPS); Roy Longbottom PC collection",
     },
     // ---- BYTE Sieve (all four modes); target = sieve passes/sec. ----
     // NO authoritative owner target. Best-effort bands centered on the B-T10
@@ -218,11 +224,11 @@ pub const BENCH_BANDS: &[BenchBand] = &[
     BenchBand {
         payload: "sieve",
         mode: GswMode::Gsw586,
-        target: 2585.0,
-        lo: 2275.0, // widest band (superscalar), ~ +/-12%, best-effort.
-        hi: 2895.0,
+        target: 1657.0,
+        lo: 1458.0, // widest band (superscalar), ~ +/-12%, best-effort.
+        hi: 1856.0,
         unit: "iters/sec",
-        cite: "NO authoritative Sieve absolute; best-effort centered on B-T10 achieved (~143x the 286 Sieve, tracks integer scaling)",
+        cite: "NO authoritative Sieve absolute; best-effort centered on the P55C-retarget achieved (200 MHz, bus 7/30; ~92x the 286 Sieve, tracks integer scaling)",
     },
     // ---- fp-Mandelbrot (486/586 only); target = pixels/sec. ----
     // fp-mandel is x87-compute-bound, so it rides the `level_timing` dial. With
@@ -246,11 +252,34 @@ pub const BENCH_BANDS: &[BenchBand] = &[
     BenchBand {
         payload: "fp-mandel",
         mode: GswMode::Gsw586,
-        target: 207700.0,
-        lo: 176500.0, // ~ +/-15%: widest band (superscalar), best-effort.
-        hi: 238900.0,
+        target: 141600.0,
+        lo: 120360.0, // ~ +/-15%: widest band (superscalar), best-effort.
+        hi: 162840.0,
         unit: "iters/sec",
-        cite: "B-T10 achieved; 586/486 fp ratio ~8.4x vs era Whetstone ~4.12x (K6 ~26.8 / 486 ~6.5 MFLOPS), gap from Dhrystone-pinned compute dial; needs an x87-latency dial (deferred Whetstone payload)",
+        cite: "P55C-retarget achieved (200 MHz + fp_timing 31/34); 586/486 pixels/sec ratio ~5.8x. fp-mandel is NOT authoritative (pixels/sec, not Whetstone MFLOPS); Whetstone is the FP oracle now. Recenter best-effort",
+    },
+    // ---- Whetstone (486/586 only); target = MFLOPS. OWNER AUTHORITATIVE (FP oracle). ----
+    // The real Whetstone .EXE payload reports MFLOPS = sweeps/sec * the per-sweep FLOP
+    // weight. The weight is anchored so the era-calibrated 486 reads exactly 6.5 MFLOPS
+    // (Roy Longbottom 486DX2-66); fp_timing(I586) is then tuned so the 586 reads 34.5
+    // (Pentium MMX-200). Banded in MFLOPS (the bench prints MFLOPS for this row).
+    BenchBand {
+        payload: "whetstone",
+        mode: GswMode::Gsw486,
+        target: 6.5,
+        lo: 6.175, // +/-5% (in-order); 486 anchors the FP weight, lands 6.50.
+        hi: 6.825,
+        unit: "MFLOPS",
+        cite: "OWNER AUTHORITATIVE: 486DX2-66 ~6.5 MFLOPS Whetstone (Roy Longbottom); anchors the per-sweep FLOP weight (fp_timing(I486) identity)",
+    },
+    BenchBand {
+        payload: "whetstone",
+        mode: GswMode::Gsw586,
+        target: 34.5,
+        lo: 31.7, // widest band (superscalar), ~ +/-8%; lands 34.50 via fp_timing(I586) 31/34.
+        hi: 37.3,
+        unit: "MFLOPS",
+        cite: "OWNER AUTHORITATIVE: Pentium MMX-200 ~34.5 MFLOPS Whetstone (Roy Longbottom); seated by fp_timing(I586) = 31/34",
     },
     // ---- Memory read bandwidth tiers (MB/s), consumed by --headless-bandwidth. ----
     // 286: RAM only (no cache). 386: L2 + RAM. 486/586: L1 + L2 + RAM. The B-T10 bus
@@ -316,29 +345,29 @@ pub const BENCH_BANDS: &[BenchBand] = &[
     BenchBand {
         payload: "bandwidth-l1",
         mode: GswMode::Gsw586,
-        target: 2890.0,
-        lo: 2600.0, // ~ +/-10%, best-effort (Dhrystone-coupled L1).
-        hi: 3180.0,
+        target: 1700.0,
+        lo: 1530.0, // ~ +/-10%, best-effort (Dhrystone-coupled L1). Achieved ~1688-1711.
+        hi: 1870.0,
         unit: "MB/s",
-        cite: "586 L1; Dhrystone-coupled (l1 ws 0 for the 586 Dhrystone target, bus 9/49), so far above era SpeedSys ~700 MB/s; irreducible while Dhrystone is on target; recenter",
+        cite: "586 L1; Dhrystone-coupled (l1 ws 0 for the 586 Dhrystone target, bus 7/30 at 200 MHz), Pentium-MMX-200-class; recenter on achieved",
     },
     BenchBand {
         payload: "bandwidth-l2",
         mode: GswMode::Gsw586,
-        target: 398.0,
-        lo: 358.0, // +/-10%, best-effort.
-        hi: 438.0,
+        target: 235.0,
+        lo: 211.0, // +/-10%, best-effort. Achieved ~234.7-236.2.
+        hi: 259.0,
         unit: "MB/s",
-        cite: "586 L2; decoupled but the u8 ws cap (255) over a 16-dword line floors it above era ~244 MB/s (gap ~1.6x); recenter, below L1 (descending)",
+        cite: "586 L2; decoupled but the u8 ws cap (255) over a 16-dword line floors the per-access average; Pentium-MMX-200-class; recenter, below L1 (descending)",
     },
     BenchBand {
         payload: "bandwidth-ram",
         mode: GswMode::Gsw586,
-        target: 323.0,
-        lo: 290.0, // +/-10%, best-effort.
-        hi: 356.0,
+        target: 191.0,
+        lo: 172.0, // +/-10%, best-effort. Achieved ~191.1.
+        hi: 210.0,
         unit: "MB/s",
-        cite: "586 RAM; decoupled but the u8 ws cap (255) floors it above era ~120 MB/s (gap ~2.7x); recenter, below L2 (descending)",
+        cite: "586 RAM; decoupled but the u8 ws cap (255) floors the per-access average; Pentium-MMX-200-class; recenter, below L2 (descending)",
     },
 ];
 
@@ -390,9 +419,11 @@ mod tests {
                 band.mode
             );
             // The runnable benches must compare in the bench's native unit; the
-            // bandwidth tiers stay MB/s for the probe task.
+            // bandwidth tiers stay MB/s for the probe task; Whetstone bands in MFLOPS.
             let want_unit = if band.payload.starts_with("bandwidth-") {
                 "MB/s"
+            } else if band.payload == "whetstone" {
+                "MFLOPS"
             } else {
                 "iters/sec"
             };
@@ -406,11 +437,11 @@ mod tests {
 
     #[test]
     fn dhrystone_586_is_the_owner_authoritative_target() {
-        // The 586 Dhrystone band is the project owner's AUTHORITATIVE target
-        // (~475000 Dhrystones/sec, ~270 DMIPS), hit tightly by the B-T10 bus scalar.
-        // The cite must mark it owner-authoritative, and the target's DMIPS must be
-        // in the documented ~270 neighborhood. VAX_DHRYSTONES_PER_SEC stays the DMIPS
-        // conversion.
+        // The 586 Dhrystone band is the project owner's AUTHORITATIVE target for the
+        // P55C retarget (~300000 Dhrystones/sec, ~170.5 DMIPS, Pentium MMX-200 @ 200
+        // MHz), hit by the bus_timing(I586) re-tune. The cite must mark it
+        // owner-authoritative, and the target's DMIPS must be in the documented ~170.5
+        // neighborhood. VAX_DHRYSTONES_PER_SEC stays the DMIPS conversion.
         let band = band_for("dhrystone", GswMode::Gsw586).expect("586 dhrystone band");
         assert!(
             band.cite.contains("OWNER AUTHORITATIVE"),
@@ -418,16 +449,33 @@ mod tests {
             band.cite
         );
         assert!(
-            (band.target - 475_000.0).abs() < 1.0,
-            "586 dhrystone target {} must be the owner's 475000",
+            (band.target - 300_000.0).abs() < 1.0,
+            "586 dhrystone target {} must be the owner's 300000 (P55C)",
             band.target
         );
         let dmips = band.target / VAX_DHRYSTONES_PER_SEC;
         assert!(
-            (250.0..290.0).contains(&dmips),
-            "586 target {} is {dmips:.1} DMIPS, expected ~270 (owner authoritative)",
+            (160.0..180.0).contains(&dmips),
+            "586 target {} is {dmips:.1} DMIPS, expected ~170.5 (owner authoritative)",
             band.target
         );
+    }
+
+    #[test]
+    fn whetstone_bands_are_the_owner_authoritative_fp_targets() {
+        // The Whetstone bands carry the owner's authoritative FP targets in MFLOPS:
+        // 486DX2-66 = 6.5, Pentium MMX-200 = 34.5. 486 anchors the FLOP weight;
+        // fp_timing(I586) seats the 586. Not encoded for the FPU-less 286/386.
+        let w486 = band_for("whetstone", GswMode::Gsw486).expect("486 whetstone band");
+        let w586 = band_for("whetstone", GswMode::Gsw586).expect("586 whetstone band");
+        assert!((w486.target - 6.5).abs() < 0.01, "486 whetstone target {}", w486.target);
+        assert!((w586.target - 34.5).abs() < 0.01, "586 whetstone target {}", w586.target);
+        assert_eq!(w486.unit, "MFLOPS");
+        assert_eq!(w586.unit, "MFLOPS");
+        assert!(w486.cite.contains("OWNER AUTHORITATIVE"));
+        assert!(w586.cite.contains("OWNER AUTHORITATIVE"));
+        assert!(band_for("whetstone", GswMode::Gsw286).is_none());
+        assert!(band_for("whetstone", GswMode::Gsw386).is_none());
     }
 
     #[test]
@@ -509,7 +557,7 @@ mod tests {
     fn bench_band_in_order_modes_are_tighter_than_586() {
         // For each runnable payload, every in-order mode's relative band width
         // must be <= the 586's (the superscalar mode carries the widest gap).
-        for payload in ["dhrystone", "sieve", "fp-mandel"] {
+        for payload in ["dhrystone", "sieve", "fp-mandel", "whetstone"] {
             let Some(superscalar) = band_for(payload, GswMode::Gsw586) else {
                 continue;
             };

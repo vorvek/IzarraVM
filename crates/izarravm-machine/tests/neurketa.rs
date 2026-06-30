@@ -78,7 +78,7 @@ fn fp_mandelbrot_runs_faster_in_586_than_486() {
     // Calibration note (B-T8/B-T9): 586's level_timing brakes fp-mandel into its
     // band and charges MORE instruction clocks per op than the 486 (whose ratio sits
     // near the bus floor), so 586's RAW fp-mandel clock total can exceed the 486's.
-    // The meaningful metric is guest-perceived SPEED (pixels/sec): at 266 MHz vs
+    // The meaningful metric is guest-perceived SPEED (pixels/sec): at 200 MHz vs
     // 66 MHz, 586 finishes far sooner. Assert that real speed ordering.
     fn pixels_per_sec(mode: GswMode) -> f64 {
         let m = run(mode, 3);

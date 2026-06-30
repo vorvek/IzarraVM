@@ -39,7 +39,7 @@ fn dhrystone_runs_faster_in_586_than_386() {
     // SPEED (Dhrystones/sec = iters / (clocks / clock_hz)), not the raw clock count.
     // 586's level_timing (1/3) brakes fp-mandel into its band and so charges MORE
     // instruction clocks per op than 386, which can make 586's RAW Dhrystone clock
-    // total exceed 386's. But 586 runs at 266 MHz vs 386's 22 MHz, so its
+    // total exceed 386's. But 586 runs at 200 MHz vs 386's 22 MHz, so its
     // Dhrystones/sec is far higher. Assert that real speed ordering, not the clocks.
     fn dhrystones_per_sec(mode: GswMode) -> f64 {
         let m = run(mode);
