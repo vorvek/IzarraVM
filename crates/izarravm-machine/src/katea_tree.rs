@@ -618,6 +618,14 @@ struct MirrorEntry {
     last_fingerprint: Option<u64>,
 }
 
+/// One live directory entry seen during the gather phase.
+struct LiveEntry {
+    dir_cluster: u32,
+    name: [u8; 11],
+    first_cluster: u32,
+    is_dir: bool,
+}
+
 /// One file the reconcile pass has decided to materialize: where to write it, the
 /// bytes, its `(dir first-cluster, folded name)` fingerprint key, and the content
 /// fingerprint recorded on a successful write. Collected during the read phase and
@@ -788,12 +796,115 @@ impl KateaTreeVolume {
         (ROOT_CLUSTER..=self.geo.count_of_clusters + 1).contains(&c)
     }
 
+    /// Read-only walk of every known directory, collecting its live entries (files
+    /// and subdirs, skipping dots/LFN/volume-label/system names). The basis for
+    /// detecting disappearances (delete/rename) in `reconcile`.
+    fn gather_live(&self) -> Vec<LiveEntry> {
+        let spc = u32::from(self.geo.spc);
+        let cluster_bytes = spc as usize * SECTOR;
+        let max = self.max_chain();
+        let mut work: Vec<u32> = self.dir_paths.keys().copied().collect();
+        let mut seen: HashSet<u32> = HashSet::new();
+        let mut out = Vec::new();
+        while let Some(dir_cluster) = work.pop() {
+            if !seen.insert(dir_cluster) {
+                continue;
+            }
+            let Some(dir_chain) =
+                crate::katea_write::chain(dir_cluster, max, |c| self.fat_entry(c))
+            else {
+                continue;
+            };
+            if dir_chain.iter().any(|&c| !self.cluster_in_range(c)) {
+                continue;
+            }
+            let mut dir_bytes = Vec::with_capacity(dir_chain.len() * cluster_bytes);
+            for c in &dir_chain {
+                let base = self.cluster_to_lba(*c);
+                for s in 0..spc {
+                    dir_bytes.extend_from_slice(&self.read_sector(base + s));
+                }
+            }
+            for e in crate::katea_write::parse_dir(&dir_bytes) {
+                match crate::katea_write::classify(&e, &self.system_names) {
+                    crate::katea_write::EntryAction::Skip => {}
+                    crate::katea_write::EntryAction::MakeDir {
+                        name,
+                        first_cluster,
+                    } => {
+                        out.push(LiveEntry {
+                            dir_cluster,
+                            name,
+                            first_cluster,
+                            is_dir: true,
+                        });
+                        if self.dir_paths.contains_key(&first_cluster) {
+                            work.push(first_cluster);
+                        }
+                    }
+                    crate::katea_write::EntryAction::MakeFile {
+                        name,
+                        first_cluster,
+                        ..
+                    } => {
+                        out.push(LiveEntry {
+                            dir_cluster,
+                            name,
+                            first_cluster,
+                            is_dir: false,
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Reconcile the overlay to the host folder: walk every known directory and
     /// atomically materialize each *complete, touched, changed* 8.3 file, and
     /// create host subdirectories for MKDIR'd entries. Conservative — an
     /// incomplete or ambiguous entry is held in the overlay and retried next pass.
     /// Called after each HostFolder ATA write command and at eject/flush.
     pub(crate) fn reconcile(&mut self) {
+        // PHASE 1: gather all live entries (read-only).
+        let live = self.gather_live();
+        let live_keys: HashSet<(u32, [u8; 11])> =
+            live.iter().map(|l| (l.dir_cluster, l.name)).collect();
+        // first_cluster -> the live entries claiming it (for rename matching, a later task).
+        let mut live_by_cluster: HashMap<u32, Vec<(u32, [u8; 11], bool)>> = HashMap::new();
+        for l in &live {
+            live_by_cluster.entry(l.first_cluster).or_default().push((
+                l.dir_cluster,
+                l.name,
+                l.is_dir,
+            ));
+        }
+
+        // PHASE 2: disappearances. A mirrored entry no longer live is a delete (or a
+        // rename in a later task, or held). Collect read-only, then apply.
+        let mut deletes: Vec<((u32, [u8; 11]), PathBuf)> = Vec::new();
+        for (key, m) in &self.mirrored {
+            if live_keys.contains(key) || m.is_dir {
+                continue; // still live, or a directory (a later task)
+            }
+            // Delete only when no live entry holds the data: empty file, or the chain
+            // was freed and nothing claims the first cluster. Otherwise HOLD.
+            let freed = m.first_cluster < 2 || self.fat_entry(m.first_cluster) == 0;
+            let claimed = live_by_cluster.contains_key(&m.first_cluster);
+            if freed && !claimed {
+                deletes.push((*key, m.host_path.clone()));
+            }
+        }
+        for (key, path) in deletes {
+            if let Err(e) = std::fs::remove_file(&path) {
+                if path.exists() {
+                    eprintln!("katea: delete {} failed: {e}", path.display());
+                    continue; // hold — the host file is still there
+                }
+            }
+            self.mirrored.remove(&key); // removed (or already absent): drop the mirror
+        }
+
         let spc = u32::from(self.geo.spc);
         let cluster_bytes = spc as usize * SECTOR;
         let max = self.max_chain();
@@ -1821,6 +1932,109 @@ mod tests {
             "unwritten sector falls through to the tree"
         );
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Free a cluster chain in the overlay FAT (set each entry to 0), the way DOS
+    /// does on delete. Follows `first -> EOC` via the current (overlay) FAT.
+    #[cfg(test)]
+    fn free_chain(vol: &mut KateaTreeVolume, first: u32) {
+        let mut c = first;
+        for _ in 0..(vol.geo.count_of_clusters + 2) {
+            if c < 2 {
+                break;
+            }
+            let next = vol.fat_entry(c);
+            let byte = c as usize * 4;
+            let lba = vol.geo.part_start + u32::from(RESERVED_SECTORS) + (byte / SECTOR) as u32;
+            let mut sec = vol.read_sector(lba);
+            let off = byte % SECTOR;
+            sec[off..off + 4].copy_from_slice(&0u32.to_le_bytes());
+            vol.write_sector(lba, &sec);
+            if !(2..0x0FFF_FFF8).contains(&next) {
+                break;
+            }
+            c = next;
+        }
+    }
+
+    /// Mark a directory entry deleted (first byte 0xE5) in `dir_cluster`'s sector 0.
+    #[cfg(test)]
+    fn delete_entry(vol: &mut KateaTreeVolume, dir_cluster: u32, name: &str) {
+        let dir_lba = vol.cluster_to_lba(dir_cluster);
+        let mut dsec = vol.read_sector(dir_lba);
+        let mut n = [b' '; 11];
+        let (b, x) = name.split_once('.').unwrap_or((name, ""));
+        n[..b.len()].copy_from_slice(b.as_bytes());
+        n[8..8 + x.len()].copy_from_slice(x.as_bytes());
+        for slot in (0..16).map(|i| i * 32) {
+            if dsec[slot..slot + 11] == n {
+                dsec[slot] = 0xE5;
+                break;
+            }
+        }
+        vol.write_sector(dir_lba, &dsec);
+    }
+
+    #[test]
+    fn reconcile_deletes_a_host_file_when_the_guest_deletes_it() {
+        let (mut vol, root) = fresh_vol("rec_del");
+        let free = vol.next_free;
+        stamp_file(&mut vol, 2, "GONE.TXT", 0x20, free, b"bye\r\n");
+        vol.reconcile();
+        assert!(root.join("GONE.TXT").exists(), "created first");
+        delete_entry(&mut vol, 2, "GONE.TXT");
+        free_chain(&mut vol, free);
+        vol.reconcile();
+        assert!(
+            !root.join("GONE.TXT").exists(),
+            "host file removed on delete"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn reconcile_deletes_a_pre_existing_host_file() {
+        let root = scratch("rec_del_pre");
+        std::fs::write(root.join("OLD.TXT"), b"i was here first").unwrap();
+        let sys = vec![("KERNEL.SYS".to_string(), vec![0xEBu8; 100])];
+        let img = izarravm_firmware::tokados_hdd_img();
+        let mut mbr = [0u8; 512];
+        mbr.copy_from_slice(&img[0..512]);
+        let mut vbr = [0u8; 512];
+        vbr.copy_from_slice(&img[2048 * 512..2048 * 512 + 512]);
+        let mut vol = KateaTreeVolume::new(&mbr, &vbr, &root, &sys).unwrap();
+        let old_fc = vol
+            .tree()
+            .root
+            .files
+            .iter()
+            .find(|f| &f.name == b"OLD     TXT")
+            .unwrap()
+            .first_cluster;
+        delete_entry(&mut vol, 2, "OLD.TXT");
+        free_chain(&mut vol, old_fc);
+        vol.reconcile();
+        assert!(
+            !root.join("OLD.TXT").exists(),
+            "pre-existing host file removed"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn reconcile_holds_a_delete_whose_chain_is_still_intact() {
+        let (mut vol, root) = fresh_vol("rec_del_hold");
+        let free = vol.next_free;
+        stamp_file(&mut vol, 2, "KEEP.TXT", 0x20, free, b"safe\r\n");
+        vol.reconcile();
+        delete_entry(&mut vol, 2, "KEEP.TXT"); // 0xE5 the entry...
+        // ...but do NOT free the chain.
+        vol.reconcile();
+        assert!(
+            root.join("KEEP.TXT").exists(),
+            "an intact-chain disappearance must be held, not deleted"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 }
