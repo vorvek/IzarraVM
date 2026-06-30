@@ -835,27 +835,21 @@ const fn tier_cost(level: CpuLevel) -> TierCost {
     }
 }
 
-/// Per-mode CODE-fetch wait-states added to the 2-clock base bus access for an
-/// instruction byte fetched from cacheable RAM (an I-cache hit). Decoupled from
-/// the data L1 wait-state (`tier_cost.l1`) on purpose: data L1 is sized for the
-/// bandwidth-l1 MB/s band (e.g. 486 needs ws=2 -> 66 MB/s), but a real I-cache
-/// delivers instruction bytes far more cheaply, and charging the data L1 cost per
-/// fetched byte drags Dhrystone/fp-mandel below their bands. The fast modes use 0
-/// (the cheapest the per-byte bus model allows) so the compute benchmarks reach as
-/// high as the model permits; the slow modes keep a small fetch penalty.
-///
-/// NOTE (model cap): even at ws=0 the bus charges 2 clocks per fetched byte, and
-/// code fetch is charged on every instruction execution (the prefetch-refill
-/// model). That per-byte floor is mode-INDEPENDENT in clocks, so it caps the
-/// fastest modes' Dhrystone/Sieve below their sourced era targets regardless of
-/// this constant or `level_timing` (see bench_reference.rs band notes).
+/// Per-mode CODE-fetch wait-state seam: extra wait-states added to the 2-clock base
+/// bus access for an instruction byte fetched from cacheable RAM (an I-cache hit).
+/// It is its own per-mode dial, DECOUPLED from the data cache tiers (`tier_cost`)
+/// and from the bus magnitude lever (`bus_timing`/`scale_bus`): a real I-cache
+/// delivers instruction bytes far more cheaply than a data-tier miss, so code fetch
+/// gets its own knob rather than reusing the data L1 cost. The calibrated modes hit
+/// their Dhrystone era targets with this seam at 0 in every mode, so all entries are
+/// currently 0; the seam stays here so a future fetch-side penalty can be dialed in
+/// per mode without disturbing the data tiers or the bus scale.
 const fn code_fetch_ws(level: CpuLevel) -> u8 {
     match level {
-        // Slow modes: a small fetch penalty (no/limited prefetch overlap).
+        // Currently 0 in every mode: the data tiers + bus scale carry the timing,
+        // and the compute benchmarks land in band with no extra fetch-side cost.
         CpuLevel::I286 => 0,
         CpuLevel::I386 => 0,
-        // Fast modes: cheapest the per-byte model allows, so compute reaches its
-        // (model-capped) best-effort ceiling.
         CpuLevel::I486 => 0,
         CpuLevel::I586 => 0,
     }
@@ -878,8 +872,9 @@ enum Tier {
 /// tag so a smaller per-mode mask still disambiguates aliased lines.
 ///
 /// Wired into `read_memory`/`write_memory`: every data access warms the modeled
-/// cache. It is behavior-neutral for now (it still charges the real RAM
-/// wait-state); B-T9 calibration makes the resolved tier drive the cost.
+/// cache, and the resolved tier already DRIVES the charged data-access cost via
+/// `data_wait_states` -> `tier_cost` (L1/L2/RAM each have their own calibrated
+/// per-mode wait-state).
 #[derive(Debug)]
 struct CacheModel {
     l1_tags: Box<[u32]>, // sized to the largest L1 line count (586: 1024)
@@ -950,18 +945,12 @@ impl CacheModel {
     /// Wait-states to charge for a DATA access at `phys`. Warms the modeled cache
     /// (so tier state is live) and returns the per-tier cost for the resolved tier.
     /// `_width` is accepted for a future wide-access straddle model but does not
-    /// affect the current single-line model. `_ram_ws` (the real RAM wait-state)
-    /// is kept for signature stability; the RAM cost is now `tier_cost(level).ram`,
-    /// since the device-window gate in `data_access_wait_states` already routed
-    /// ROM/MMIO accesses to `memory_wait_states` before reaching here, so this only
-    /// ever sees cacheable RAM.
-    fn data_wait_states(
-        &mut self,
-        level: CpuLevel,
-        phys: u32,
-        _width: BusWidth,
-        _ram_ws: u8,
-    ) -> u8 {
+    /// affect the current single-line model. The RAM cost is `tier_cost(level).ram`,
+    /// not the device `memory_wait_states`: the device-window gate in
+    /// `data_access_wait_states` already routed ROM/MMIO accesses to
+    /// `memory_wait_states` before reaching here, so this only ever sees cacheable
+    /// RAM.
+    fn data_wait_states(&mut self, level: CpuLevel, phys: u32, _width: BusWidth) -> u8 {
         let cost = tier_cost(level);
         match self.data_tier(level, phys) {
             Tier::L1 => cost.l1,
@@ -1006,9 +995,9 @@ pub struct Machine {
     pending_mode: Option<GswMode>,
     timing: TimingFactors,
     cpu: Cpu386,
-    // Cosmetic per-mode cache model. It only warms tag state on data accesses for
-    // now (behavior-neutral); B-T9 calibration makes its tier costs drive the
-    // charged wait-state. Reset on a mode switch (its contents are per-mode).
+    // Per-mode cache model. A data access warms its tag state and the resolved tier
+    // drives the charged wait-state (its per-mode tier costs are calibrated). Reset
+    // on a mode switch (its contents are per-mode).
     cache_model: CacheModel,
     // Fractional-remainder carry for the per-mode bus-clock scaler (B-T10). The bus
     // portion of a step (fetch + tiered data access) is scaled by `bus_timing(level)`
@@ -10588,10 +10577,11 @@ impl Machine {
         self.bus_rem = 0;
     }
 
-    /// The reported (L1 KB, L2 KB) cache for the live mode. Cosmetic: it models a
-    /// motherboard L2 cache module and feeds the BIOS setup and GUI readout only,
-    /// with no timing effect. Driven from the live CPU level so it tracks a Lotura
-    /// mode switch.
+    /// The reported (L1 KB, L2 KB) cache for the live mode (the L2 models a
+    /// motherboard cache module). Feeds the BIOS setup and GUI readout, and the same
+    /// per-mode geometry (`cache_geometry`) also drives the `CacheModel` tiering, so
+    /// this readout tracks the live data-access timing. Driven from the live CPU
+    /// level so it tracks a Lotura mode switch.
     pub fn cache_config(&self) -> (u16, u16) {
         self.cpu.cache_kb()
     }
@@ -10615,9 +10605,9 @@ impl Machine {
     /// wait-states into the shared `BusTrace`. A block that FITS the live mode's
     /// cache stays resident across passes (fast after pass 1); a block that
     /// EXCEEDS it re-misses every pass (slow). With many passes the steady state
-    /// dominates, which is what produces the L1/L2/RAM steps once the tier costs
-    /// are calibrated. Until then `data_wait_states` is behavior-neutral, so the
-    /// curve is FLAT (every tier charges the RAM wait-state).
+    /// dominates, which is what produces the L1/L2/RAM steps: the tier costs are
+    /// calibrated and the cheaper tiers charge fewer wait-states, so the curve
+    /// DESCENDS from L1 down through L2 to RAM as the block grows past each tier.
     pub fn measure_read_bandwidth(
         &mut self,
         base: u32,
@@ -11694,9 +11684,9 @@ struct MachineBus<'a> {
     toka_service_status: u8,                    // a copy, for the 0xE3 status read
     unittester: &'a mut unittester::UnitTester, // Lotura ports 0xE4-0xE6
     wait_states: WaitStateProfile,
-    // The cosmetic cache model and the live CPU level it is keyed on. A data
-    // access warms the cache via data_access_wait_states; the level picks the
-    // per-mode geometry. Behavior-neutral for now (B-T9 applies the tier cost).
+    // The cache model and the live CPU level it is keyed on. A data access warms
+    // the cache via data_access_wait_states; the level picks the per-mode geometry,
+    // and the resolved tier's calibrated cost is the charged wait-state.
     cache: &'a mut CacheModel,
     level: CpuLevel,
     // Set true by any port I/O this batch. The run loop batches straight-line
@@ -13615,8 +13605,7 @@ impl MachineBus<'_> {
             // Device/ROM: untiered, unchanged timing.
             return self.memory_wait_states(address);
         }
-        let ram = self.memory_wait_states(address);
-        self.cache.data_wait_states(self.level, address, width, ram)
+        self.cache.data_wait_states(self.level, address, width)
     }
 
     /// Wait-states for a single code-fetch byte at the post-A20 physical `address`.
@@ -13783,9 +13772,9 @@ mod tests {
     const BIOS_TEXT_WHITE: u8 = 0x3F;
 
     // The CacheModel tests below exercise tier IDENTITY, not the wait-state numbers:
-    // tier_cost is a provisional all-zeros table until the calibration task, so the
-    // (uncalibrated) wait-states carry no meaning yet. What must hold now is that the
-    // model resolves L1/L2/RAM correctly per the per-mode geometry.
+    // tier_cost is calibrated (non-zero) now, but these tests assert only that the
+    // model resolves L1/L2/RAM correctly per the per-mode geometry, not the specific
+    // costs.
     #[test]
     fn cache_model_resolves_tiers_by_working_set() {
         let mut c = CacheModel::new();
@@ -13814,10 +13803,10 @@ mod tests {
 
     #[test]
     fn measure_read_bandwidth_returns_a_finite_sample_in_every_mode() {
-        // Small block (fits every mode's L1 once calibrated) and a large block
-        // (exceeds every L2). Both must move bytes and take clocks; we do NOT
-        // assert tier ordering here -- the tier costs are neutral (B-T7 asserts
-        // ordering after the B-T9 calibration lands).
+        // Small block (fits every mode's L1) and a large block (exceeds every L2).
+        // Both must move bytes and take clocks; we do NOT assert tier ordering here
+        // -- the tier costs are calibrated and a separate ordering test covers the
+        // descending L1/L2/RAM curve.
         const TOTAL: u64 = 4 * 1024 * 1024;
         let modes = [
             GswMode::Gsw286,

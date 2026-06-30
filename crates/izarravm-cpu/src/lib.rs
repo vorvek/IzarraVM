@@ -1360,7 +1360,9 @@ impl Cpu386 {
         scaled / u64::from(den)
     }
 
-    /// Reported (L1 KB, L2 KB) cache for the live level. Cosmetic, no timing effect.
+    /// Reported (L1 KB, L2 KB) cache for the live level. The same geometry drives
+    /// per-mode data-access timing through the machine's `CacheModel`, so this is no
+    /// longer a no-timing readout (see `CpuLevel::cache_kb`).
     pub fn cache_kb(&self) -> (u16, u16) {
         self.level.cache_kb()
     }
