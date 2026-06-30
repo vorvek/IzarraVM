@@ -20,6 +20,10 @@ size and the FATSz32 computation. AtaDisk derives 16 heads x 63 sectors/track, s
 the MBR partition CHS start/end are filled to match that geometry."""
 import os
 import struct
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from license_txt import build_license_txt
 
 # --- disk + partition geometry -------------------------------------------------
 BPS = 512
@@ -151,6 +155,8 @@ def main():
                   b"SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n")
     autoexec = b"@ECHO OFF\r\nPROMPT $P$G\r\n"
     hello_txt = b"Katea M0 OK\r\n"
+    # The kernel signon points at "See C:\\LICENSE.TXT for more."; ship it on C:.
+    license_txt = build_license_txt(repo)
 
     # --- FAT32 geometry for the partition -------------------------------------
     spc = sectors_per_cluster(PART_SECTORS)
@@ -198,6 +204,7 @@ def main():
         ("CONFIG.SYS", config_sys),
         ("AUTOEXEC.BAT", autoexec),
         ("HELLO.TXT", hello_txt),
+        ("LICENSE.TXT", license_txt),
     ]
 
     # Allocate cluster chains, write file data into the data region, and build the
