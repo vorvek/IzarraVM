@@ -224,7 +224,7 @@ def main():
             c = start + i
             fat[c] = FAT32_EOC if i == nclu - 1 else c + 1
 
-    # Root directory occupies cluster 2 (one cluster is plenty for 5 entries).
+    # Root directory occupies cluster 2 (one cluster is plenty for 7 entries).
     fat[ROOT_CLUSTER] = FAT32_EOC
     next_free = ROOT_CLUSTER + 1
     root = bytearray()
@@ -280,7 +280,7 @@ def main():
     print(f"tokados-hdd.img: {len(img)} bytes "
           f"(part_start={PART_START}, part_sectors={PART_SECTORS}, "
           f"spc={spc}, fatsz={fatsz}, clusters={count_of_clusters}, "
-          f"kernel={len(kernel)}, shell={len(shell)})")
+          f"kernel={len(kernel)}, shell={len(shell)}, tokamous={len(tokamous)})")
 
 
 if __name__ == "__main__":
