@@ -22694,8 +22694,7 @@ mod tests {
         // Both modes share the same level_timing (1,12) and fp_timing (1,1), so the
         // scaled FADD clock charge must be identical.
         assert_eq!(
-            fadd_i486,
-            fadd_i586,
+            fadd_i486, fadd_i586,
             "fp_timing identity: FADD elapsed at I486 ({fadd_i486}) must equal I586 ({fadd_i586})"
         );
 

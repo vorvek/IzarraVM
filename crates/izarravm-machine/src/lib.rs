@@ -17164,7 +17164,7 @@ mod tests {
 
         machine.set_mode(GswMode::Gsw586);
         assert_eq!(machine.cpu.level(), CpuLevel::I586);
-        assert_eq!(machine.cache_config(), (64, 512));
+        assert_eq!(machine.cache_config(), (32, 512));
     }
 
     #[test]

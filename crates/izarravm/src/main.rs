@@ -457,7 +457,11 @@ fn run_bench(hardware: &HardwareProfile) -> Result<(), Box<dyn Error>> {
             // observability only and never changes the exit code. After B-T9
             // calibration every row tags [in band] (the compute caps the bus model
             // cannot reach were relaxed to best-effort; see bench_reference.rs).
-            println!("{}{}", mflops_suffix, band_tag(bench.name, mode, band_value));
+            println!(
+                "{}{}",
+                mflops_suffix,
+                band_tag(bench.name, mode, band_value)
+            );
         }
     }
     Ok(())

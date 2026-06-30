@@ -231,15 +231,13 @@ pub const BENCH_BANDS: &[BenchBand] = &[
         cite: "NO authoritative Sieve absolute; best-effort centered on the P55C-retarget achieved (200 MHz, bus 7/30; ~92x the 286 Sieve, tracks integer scaling)",
     },
     // ---- fp-Mandelbrot (486/586 only); target = pixels/sec. ----
-    // fp-mandel is x87-compute-bound, so it rides the `level_timing` dial. With
-    // Dhrystone (PRIMARY) pinned to the owner targets, that dial is forced small on
-    // the fast modes, so fp-mandel runs above its old ratio-anchored absolute and at
-    // a 586/486 ratio of ~8.4x (the model floor with Dhrystone pinned is ~7.8x). The
-    // era Whetstone ratio is ~4.12x (486DX2-66 ~6.5 MFLOPS vs K6 ~26.8); matching
-    // that AND the Dhrystone target needs a separate x87-latency dial -- a deferred
-    // Whetstone-payload follow-up (we run fp-mandel pixels/sec, not Whetstone, so
-    // the absolute was never authoritative). Bands recentered on the B-T10 achieved
-    // value; the era ratio and the residual gap are in the cite.
+    // fp-mandel is x87-compute-bound, so it rides `level_timing` (and `fp_timing` at
+    // 586). It is NOT an authoritative payload -- we run pixels/sec, not Whetstone
+    // MFLOPS -- so its absolute was never pinned. After the P55C retarget (200 MHz +
+    // fp_timing 31/34) its 586/486 ratio is ~5.8x. Whetstone, not fp-mandel, is now the
+    // calibrated FP oracle (it carries the owner's 6.5 / 34.5 MFLOPS targets); the full
+    // per-op x87-latency dial stays deferred. fp-mandel bands are recentered best-effort
+    // on the achieved value.
     BenchBand {
         payload: "fp-mandel",
         mode: GswMode::Gsw486,
@@ -468,8 +466,16 @@ mod tests {
         // fp_timing(I586) seats the 586. Not encoded for the FPU-less 286/386.
         let w486 = band_for("whetstone", GswMode::Gsw486).expect("486 whetstone band");
         let w586 = band_for("whetstone", GswMode::Gsw586).expect("586 whetstone band");
-        assert!((w486.target - 6.5).abs() < 0.01, "486 whetstone target {}", w486.target);
-        assert!((w586.target - 34.5).abs() < 0.01, "586 whetstone target {}", w586.target);
+        assert!(
+            (w486.target - 6.5).abs() < 0.01,
+            "486 whetstone target {}",
+            w486.target
+        );
+        assert!(
+            (w586.target - 34.5).abs() < 0.01,
+            "586 whetstone target {}",
+            w586.target
+        );
         assert_eq!(w486.unit, "MFLOPS");
         assert_eq!(w586.unit, "MFLOPS");
         assert!(w486.cite.contains("OWNER AUTHORITATIVE"));
