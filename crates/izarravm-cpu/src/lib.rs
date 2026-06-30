@@ -668,7 +668,8 @@ struct LazyFlags {
 /// retired instruction; everything else increments at cold per-run sites.
 #[derive(Debug, Clone, Default)]
 pub struct PerfCounters {
-    /// Instructions retired. Every execution path routes through `finish_instruction`.
+    /// Instructions retired: every retired instruction routes through `finish_instruction`
+    /// exactly once. Hardware-interrupt dispatch is charged separately and is NOT counted.
     pub instructions: u64,
     /// Instructions that required a fresh decode (a decode-cache miss in `fetch_decoded`).
     /// Decode-cache hit rate = 1 - decode_misses / instructions.
@@ -676,8 +677,9 @@ pub struct PerfCounters {
     /// Calls to `run_straight_line` (one per machine batch entry). The denominator for
     /// the average straight-line run length = instructions / straight_line_runs.
     pub straight_line_runs: u64,
-    /// Why each straight-line run ended (one increment per run; they sum to
-    /// straight_line_runs). These say what limits batch length.
+    /// Why each straight-line run ended (one increment per run). These say what limits
+    /// batch length. They sum to `straight_line_runs` except for the rare run that ends in
+    /// a propagated hard `CpuError` (a fatal error records no break reason).
     pub brk_decode_or_branch: u64, // next insn not cached / not straight-line / page cross
     pub brk_step: u64, // port I/O or a pending HLE soft-int (requires_step_break)
     pub brk_interrupt: u64, // an instruction made a maskable interrupt serviceable
