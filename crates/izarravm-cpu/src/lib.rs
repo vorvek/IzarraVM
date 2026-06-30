@@ -702,6 +702,11 @@ pub struct Cpu386 {
     /// bits in `registers.eflags` are stale. Cpu386 equality is flag-representation-sensitive while a
     /// deferral is outstanding; real flag comparisons go through `flag()` / `eflags()`, which
     /// materialize. (Cpu386 `==` is currently unused.)
+    ///
+    /// HANDLER INVARIANT: instruction handlers must NOT read `registers.eflags` directly for the
+    /// arithmetic bits (CF/PF/AF/ZF/SF/OF) — those may be deferred here. Read the live value via
+    /// `flag()` (single bit) or `eflags()`/`materialized_eflags()` (whole word), or call
+    /// `materialize_flags()` before a read-modify-write of the whole word.
     pending_flags: Option<LazyFlags>,
 }
 
@@ -3441,8 +3446,8 @@ impl Cpu386 {
             0x9e => {
                 // SAHF: load CF/PF/AF/ZF/SF from AH; OF and the reserved bits are untouched.
                 // The trailing | 0x02 keeps the always-one reserved bit set.
-                // Settle deferred flags first: OF (an arithmetic bit) must read live, and this
-                // read-modify-write of the whole word must not leave a stale descriptor behind.
+                // Settle deferred flags first: the read-modify-write reads registers.eflags to
+                // preserve OF and control bits, so a stale descriptor would corrupt OF in the result.
                 self.materialize_flags();
                 let ah = u32::from(self.read_gpr8(4));
                 self.registers.eflags = (self.registers.eflags & !0xd5) | (ah & 0xd5) | 0x02;
@@ -22550,6 +22555,25 @@ mod tests {
             let lr = lazy.alu_add(a, b, 0, w);
             assert_eq!(lr, er, "result");
             assert!(lazy.pending_flags.is_some(), "carry-0 ADD must defer");
+            for f in [FLAG_CF, FLAG_PF, FLAG_AF, FLAG_ZF, FLAG_SF, FLAG_OF] {
+                assert_eq!(lazy.flag(f), eager.flag(f), "flag {f:#x}");
+            }
+        }
+    }
+
+    #[test]
+    fn alu_sub_defers_and_reads_back_identically() {
+        // alu_sub (borrow 0) must set a pending whose flag reads equal the eager path's eflags bit-for-bit.
+        for &(a, b, w) in &[
+            (0x01_u32, 0xff_u32, BusWidth::Byte),
+            (0x1234_5678_u32, 0x8765_4321_u32, BusWidth::Dword),
+        ] {
+            let mut eager = Cpu386::default();
+            let er = eager.alu_sub_eager(a, b, 0, w);
+            let mut lazy = Cpu386::default();
+            let lr = lazy.alu_sub(a, b, 0, w);
+            assert_eq!(lr, er, "result");
+            assert!(lazy.pending_flags.is_some(), "borrow-0 SUB must defer");
             for f in [FLAG_CF, FLAG_PF, FLAG_AF, FLAG_ZF, FLAG_SF, FLAG_OF] {
                 assert_eq!(lazy.flag(f), eager.flag(f), "flag {f:#x}");
             }
