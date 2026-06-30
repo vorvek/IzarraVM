@@ -214,6 +214,15 @@ impl AtaDisk {
         matches!(self.backing, Backing::Image(_))
     }
 
+    /// Run the host-folder reconcile pass (M2). A no-op for an image-backed disk.
+    /// The machine calls this at eject/flush so anything held in the overlay is a
+    /// final-pass materialized to the host folder.
+    pub fn reconcile_host_folder(&mut self) {
+        if let Backing::HostFolder(volume) = &mut self.backing {
+            volume.reconcile();
+        }
+    }
+
     /// Read one whole 512-byte sector at `lba`, or None if past the end. The facade
     /// synthesizes sectors on demand, so this returns an owned array rather than a
     /// borrow into a backing buffer.

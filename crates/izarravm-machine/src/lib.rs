@@ -1767,6 +1767,9 @@ impl Machine {
     /// flushable image — returning its empty `bytes()` would persist a 0-byte file).
     /// Clears the BDA fixed-disk count.
     pub fn eject_hdd(&mut self) -> Option<Vec<u8>> {
+        if let Some(disk) = self.ata.as_mut() {
+            disk.reconcile_host_folder(); // final pass for a host folder; no-op for images
+        }
         let bytes = self
             .ata
             .take()
@@ -1775,6 +1778,16 @@ impl Machine {
         let _ = self.clear_fixed_disk_parameter_table();
         let _ = self.memory.write_u8(0x475, 0);
         bytes
+    }
+
+    /// Force a final reconcile of a mounted Katea host folder, materializing any
+    /// overlay-held files to the host. Safe to call when no folder is mounted (a
+    /// no-op for an image-backed disk or no disk). Used by the headless `--hdd-
+    /// folder` path and the e2e test before reading the host folder back.
+    pub fn flush_hdd_folder(&mut self) {
+        if let Some(disk) = self.ata.as_mut() {
+            disk.reconcile_host_folder();
+        }
     }
 
     /// Whether the mounted hard disk took a guest write this session, so the host
@@ -19710,6 +19723,27 @@ mod tests {
     fn mount_hdd_seeds_the_bda_fixed_disk_count() {
         let m = machine_with_hdd(64);
         assert_eq!(m.memory.read_u8(0x475).unwrap(), 1, "one fixed disk");
+    }
+
+    #[test]
+    fn flush_hdd_folder_runs_a_final_reconcile() {
+        // Mount a temp folder, then flush; confirm flush is callable and a no-op on
+        // an unwritten folder (creates nothing). The end-to-end create/overwrite/grow
+        // is covered by the e2e smoke test; this only proves the plumbing exists.
+        let dir = std::env::temp_dir().join(format!("katea_flush_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut m = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .unwrap();
+        m.mount_hdd_folder(&dir).unwrap();
+        m.flush_hdd_folder();
+        // With nothing written, no spurious files are created.
+        let count = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(count, 0, "flush on an unwritten folder creates nothing");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
