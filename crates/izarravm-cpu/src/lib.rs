@@ -6402,7 +6402,33 @@ impl Cpu386 {
     }
 
     fn flag(&self, flag: u32) -> bool {
+        const ARITH: u32 = FLAG_CF | FLAG_PF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_OF;
+        if self.pending_flags.is_some() && (flag & ARITH) != 0 && (flag & !ARITH) == 0 {
+            return self.arith_flag(flag);
+        }
         self.registers.eflags & flag != 0
+    }
+
+    /// True iff `flag` (one of the six arithmetic bits) is set, computed from `pending_flags` when present
+    /// so reads never force materialization. For any non-arithmetic (control) flag, or no pending, reads
+    /// `registers.eflags` directly.
+    fn arith_flag(&self, flag: u32) -> bool {
+        let Some(p) = self.pending_flags else {
+            return self.registers.eflags & flag != 0;
+        };
+        let mask = width_mask(p.width);
+        let sign = width_sign(p.width);
+        match flag {
+            FLAG_ZF => p.result & mask == 0,
+            FLAG_SF => p.result & sign != 0,
+            FLAG_PF => parity(p.result as u8),
+            FLAG_AF => ((p.a ^ p.b ^ p.result) & 0x10) != 0,
+            FLAG_CF if p.is_sub => u64::from(p.a) < u64::from(p.b),
+            FLAG_CF => u64::from(p.a) + u64::from(p.b) > u64::from(mask),
+            FLAG_OF if p.is_sub => ((p.a ^ p.b) & (p.a ^ p.result) & sign) != 0,
+            FLAG_OF => ((p.a ^ p.result) & (p.b ^ p.result) & sign) != 0,
+            _ => self.registers.eflags & flag != 0,
+        }
     }
 
     fn set_flag(&mut self, flag: u32, enabled: bool) {
@@ -6595,7 +6621,7 @@ impl Cpu386 {
         result
     }
 
-    fn alu_add(&mut self, a: u32, b: u32, carry: u32, width: BusWidth) -> u32 {
+    fn alu_add_eager(&mut self, a: u32, b: u32, carry: u32, width: BusWidth) -> u32 {
         let mask = width_mask(width);
         let sign = width_sign(width);
         let a = a & mask;
@@ -6609,7 +6635,11 @@ impl Cpu386 {
         result
     }
 
-    fn alu_sub(&mut self, a: u32, b: u32, borrow: u32, width: BusWidth) -> u32 {
+    fn alu_add(&mut self, a: u32, b: u32, carry: u32, width: BusWidth) -> u32 {
+        self.alu_add_eager(a, b, carry, width)
+    }
+
+    fn alu_sub_eager(&mut self, a: u32, b: u32, borrow: u32, width: BusWidth) -> u32 {
         let mask = width_mask(width);
         let sign = width_sign(width);
         let a = a & mask;
@@ -6621,6 +6651,10 @@ impl Cpu386 {
         self.set_flag(FLAG_AF, ((a ^ b ^ result) & 0x10) != 0);
         self.set_szp(result, width);
         result
+    }
+
+    fn alu_sub(&mut self, a: u32, b: u32, borrow: u32, width: BusWidth) -> u32 {
+        self.alu_sub_eager(a, b, borrow, width)
     }
 
     fn mul(&mut self, operand: u32, signed: bool, width: BusWidth) {
@@ -22416,6 +22450,28 @@ mod tests {
                     .collect::<String>(),
                 fused.fpu.tag,
             );
+        }
+    }
+
+    #[test]
+    fn lazy_flag_read_matches_eager_for_add_and_sub() {
+        // arith_flag computed from a pending descriptor must equal the eager eflags bit for every
+        // arithmetic flag, across widths and a spread of operand pairs (incl. carry/borrow/overflow/zero).
+        let cases: &[(u32, u32, BusWidth)] = &[
+            (0xff, 0x01, BusWidth::Byte), (0x7f, 0x01, BusWidth::Byte), (0x00, 0x00, BusWidth::Byte),
+            (0x80, 0x80, BusWidth::Byte), (0xffff, 0x1, BusWidth::Word), (0x8000, 0x8000, BusWidth::Word),
+            (0xffff_ffff, 0x1, BusWidth::Dword), (0x1234_5678, 0x8765_4321, BusWidth::Dword),
+        ];
+        for &(a, b, w) in cases {
+            for is_sub in [false, true] {
+                let mut eager = Cpu386::default();
+                let r = if is_sub { eager.alu_sub_eager(a, b, 0, w) } else { eager.alu_add_eager(a, b, 0, w) };
+                let mut lazy = Cpu386::default();
+                lazy.pending_flags = Some(LazyFlags { a: a & width_mask(w), b: b & width_mask(w), result: r, width: w, is_sub });
+                for f in [FLAG_CF, FLAG_PF, FLAG_AF, FLAG_ZF, FLAG_SF, FLAG_OF] {
+                    assert_eq!(lazy.flag(f), eager.flag(f), "flag {f:#x} a={a:#x} b={b:#x} sub={is_sub} w={w:?}");
+                }
+            }
         }
     }
 }
