@@ -122,6 +122,9 @@ pub(crate) fn chain(first: u32, max: usize, fat_entry: impl Fn(u32) -> u32) -> O
 
 /// A cheap content fingerprint so an unchanged file is not re-written every pass.
 /// A same-length overwrite changes content -> changes the fingerprint -> rewrites.
+/// `DefaultHasher` is not stable across toolchains, which is fine: the fingerprint
+/// cache is session-only and never persisted, so values are only ever compared
+/// within one process run. Do not lift this into a persistent store as-is.
 pub(crate) fn fingerprint(data: &[u8]) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     data.hash(&mut h);
@@ -186,7 +189,42 @@ mod tests {
             first_cluster: fc,
             size: sz,
         };
-        assert_eq!(classify(&mk(".", 0x10, 2, 0), &sys), EntryAction::Skip);
+        // A real FAT `.` / `..` entry has name[0] == 0x2E (the test helper's
+        // `name83(".")` would yield an all-spaces name, which is NOT what reconcile
+        // sees from live directory clusters), so build the dot bytes explicitly.
+        let dot = DirEntry {
+            name: {
+                let mut n = [b' '; 11];
+                n[0] = b'.';
+                n
+            },
+            attr: 0x10,
+            first_cluster: 2,
+            size: 0,
+        };
+        let dotdot = DirEntry {
+            name: {
+                let mut n = [b' '; 11];
+                n[0] = b'.';
+                n[1] = b'.';
+                n
+            },
+            attr: 0x10,
+            first_cluster: 2,
+            size: 0,
+        };
+        assert_eq!(classify(&dot, &sys), EntryAction::Skip, "real `.` entry");
+        assert_eq!(
+            classify(&dotdot, &sys),
+            EntryAction::Skip,
+            "real `..` entry"
+        );
+        // A blank first byte (a malformed/empty slot) is skipped defensively.
+        assert_eq!(
+            classify(&mk(" ", 0x20, 9, 1), &sys),
+            EntryAction::Skip,
+            "blank name"
+        );
         assert_eq!(classify(&mk("X", 0x0F, 0, 0), &sys), EntryAction::Skip); // LFN
         assert_eq!(classify(&mk("LABEL", 0x08, 0, 0), &sys), EntryAction::Skip); // vol label
         assert_eq!(
