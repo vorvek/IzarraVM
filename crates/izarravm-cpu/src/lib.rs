@@ -649,6 +649,9 @@ impl std::fmt::Debug for PrefetchWindow {
 /// `a`/`b` are the width-masked operands, `result` the width-masked result, exactly as `alu_add`/
 /// `alu_sub` computed them. While this is `Some`, the six arithmetic-flag bits in `registers.eflags`
 /// are STALE; this descriptor is the source of truth for them. Control flags in `eflags` stay live.
+/// Only carry-free ADD and borrow-free SUB/CMP are representable: `b` is the raw second operand
+/// (NOT b+carry / b+borrow), so ADC/SBB with a non-zero carry/borrow must NOT be deferred until this
+/// struct gains a carry field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LazyFlags {
     a: u32,
@@ -6403,6 +6406,8 @@ impl Cpu386 {
 
     fn flag(&self, flag: u32) -> bool {
         const ARITH: u32 = FLAG_CF | FLAG_PF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_OF;
+        // Route only a single, purely-arithmetic flag bit through the pending descriptor; a control
+        // bit or multi-bit query falls through to the live eflags.
         if self.pending_flags.is_some() && (flag & ARITH) != 0 && (flag & !ARITH) == 0 {
             return self.arith_flag(flag);
         }
@@ -6427,7 +6432,7 @@ impl Cpu386 {
             FLAG_CF => u64::from(p.a) + u64::from(p.b) > u64::from(mask),
             FLAG_OF if p.is_sub => ((p.a ^ p.b) & (p.a ^ p.result) & sign) != 0,
             FLAG_OF => ((p.a ^ p.result) & (p.b ^ p.result) & sign) != 0,
-            _ => self.registers.eflags & flag != 0,
+            _ => self.registers.eflags & flag != 0, // unreachable under flag()'s guard; defensive
         }
     }
 
@@ -22459,6 +22464,7 @@ mod tests {
         // arithmetic flag, across widths and a spread of operand pairs (incl. carry/borrow/overflow/zero).
         let cases: &[(u32, u32, BusWidth)] = &[
             (0xff, 0x01, BusWidth::Byte), (0x7f, 0x01, BusWidth::Byte), (0x00, 0x00, BusWidth::Byte),
+            (0x01, 0xff, BusWidth::Byte), // a < b: SUB borrow path sets CF=1
             (0x80, 0x80, BusWidth::Byte), (0xffff, 0x1, BusWidth::Word), (0x8000, 0x8000, BusWidth::Word),
             (0xffff_ffff, 0x1, BusWidth::Dword), (0x1234_5678, 0x8765_4321, BusWidth::Dword),
         ];
