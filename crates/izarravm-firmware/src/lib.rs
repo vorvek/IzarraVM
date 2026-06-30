@@ -15,6 +15,9 @@ pub const TYPE_COM_SOURCE: &str = include_str!("../roms/dos/type.asm");
 pub const RUNNER_COM: &[u8] = include_bytes!("../roms/dos/runner.com");
 pub const RUNNER_COM_SOURCE: &str = include_str!("../roms/dos/runner.asm");
 pub const TOKAMOUS_COM: &[u8] = include_bytes!("../roms/dos/tokamous.com");
+// No TOKAMOUS_COM_SOURCE sibling (unlike RUNNER_COM): the canonical .asm lives in
+// toka-dos/tools/tokamous.asm (shared with the floppy/ROM builds), not under this
+// crate's roms/dos/, and is too large to embed as a string for no consumer.
 pub const EXIT42_COM: &[u8] = include_bytes!("../roms/dos/exit42.com");
 pub const EXIT42_COM_SOURCE: &str = include_str!("../roms/dos/exit42.asm");
 pub const EXEHELLO_EXE: &[u8] = include_bytes!("../roms/dos/exehello.exe");
