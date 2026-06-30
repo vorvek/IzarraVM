@@ -6969,16 +6969,22 @@ const fn level_timing(level: CpuLevel) -> (u32, u32) {
 
 /// Per-mode FP-op-clock scalar as (numerator, denominator) — a SEPARATE dial from
 /// `level_timing` so the P55C's faster-than-486 x87 unit can be modeled at I586 without
-/// touching the integer-instruction compute ratio. Currently identity (1, 1) for every
-/// mode (bit-identical to the current behaviour); a later P55C-retarget task tunes I586.
-/// Applied in `scale_fp_clocks` with fractional-remainder carry (exact long division),
-/// mirroring the `scale_clocks` / `timing_rem` pattern exactly.
+/// touching the integer-instruction compute ratio. Identity (1, 1) for 286/386/486 (their
+/// FP rides `level_timing` alone). I586 is `(31, 34)` — x87 ops cost 31/34 of their raw
+/// clocks — CALIBRATED so the Whetstone oracle lands the P55C's 34.5 MFLOPS at 200 MHz
+/// while the era-anchored 486 stays 6.5 (its factor is identity). The factor is near 1
+/// (not the ~1.75x the design predicted) because our Whetstone is bus/integer-bound, not
+/// transcendental-bound: the cheap-x87 timing already lets the 586's faster bus carry most
+/// of the 5.3x 586/486 ratio, so only a small FP nudge remains. Applied in
+/// `scale_fp_clocks` with fractional-remainder carry (exact long division), mirroring the
+/// `scale_clocks` / `timing_rem` pattern exactly. Integer benches (Dhrystone/Sieve) execute
+/// no x87 ops, so this dial leaves them bit-identical.
 const fn fp_timing(level: CpuLevel) -> (u32, u32) {
     match level {
         CpuLevel::I286 => (1, 1),
         CpuLevel::I386 => (1, 1),
         CpuLevel::I486 => (1, 1),
-        CpuLevel::I586 => (1, 1),
+        CpuLevel::I586 => (31, 34),
     }
 }
 
