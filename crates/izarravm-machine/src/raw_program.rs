@@ -4,11 +4,6 @@
 //! (which is identical in spirit but carries a full kernel struct this
 //! crate doesn't want). See `dev_docs/2026-06-30-katea-sp3-program-runtime-design.md`.
 
-// Limit: every item here is consumed by `Machine::new_raw_program` (a later
-// task in this plan); until that lands the module's only callers are its
-// own tests.
-#![allow(dead_code)]
-
 use izarravm_bus::Memory;
 
 /// Conventional memory's top paragraph for a directly-loaded program: 0xA000

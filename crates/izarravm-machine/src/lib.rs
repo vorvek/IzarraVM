@@ -357,6 +357,8 @@ pub enum MachineError {
     Cpu(#[from] CpuError),
     #[error(transparent)]
     Dos(#[from] izarravm_dos::DosError),
+    #[error(transparent)]
+    Program(#[from] raw_program::ProgramLoadError),
     #[error("test BIOS ROM must be exactly 64 KiB, got {0} bytes")]
     InvalidRomSize(usize),
     #[error("boot image must be exactly 1.44 MiB, got {0} bytes")]
@@ -1052,6 +1054,14 @@ pub struct Machine {
     // machine mirrors the new bytes onto the framebuffer so the screen shows them.
     dos_screen_shown: usize,
     dos: izarravm_dos::DosKernel, // DOS kernel state: open files, drive, stdin/stdout
+    /// True only for a `new_raw_program` machine: routes INT 20h/21h/27h to
+    /// `handle_raw_program_int` instead of `handle_dos_int`. See
+    /// `dev_docs/2026-06-30-katea-sp3-program-runtime-design.md` section 3a.
+    program_runtime: bool,
+    /// Accumulated console output for a `new_raw_program` machine (the
+    /// `program_output()`/`set_program_stdin()` counterpart to `self.dos`'s
+    /// `dos_output()`/`set_dos_stdin()`).
+    program_output: Vec<u8>,
     rom: Vec<u8>,
     serial: uart::Uart16450,
     // COM2 (0x2F8-0x2FF, IRQ3). Same UART model as COM1; no host input source.
@@ -1523,6 +1533,8 @@ impl Machine {
             in_device_call: false,
             dos_screen_shown: 0,
             dos: izarravm_dos::DosKernel::default(),
+            program_runtime: false,
+            program_output: Vec::new(),
             rom,
             serial: uart::Uart16450::default(),
             serial2: uart::Uart16450::com2(),
@@ -2097,6 +2109,75 @@ impl Machine {
         Ok(machine)
     }
 
+    /// Build a machine with a DOS-format program loaded and ready to run, with
+    /// no DOS kernel behind it — only `handle_raw_program_int`'s minimal
+    /// terminate/console-I/O surface services interrupts. For tests and
+    /// benchmarks that need a quick runnable machine, not C: drive access.
+    /// See `dev_docs/2026-06-30-katea-sp3-program-runtime-design.md`.
+    pub fn new_raw_program(profile: MachineProfile, image: &[u8]) -> Result<Self, MachineError> {
+        let env_entries = sound_blaster_env_entries(&profile.sound_blaster);
+        let mut rom = vec![0u8; BIOS_ROM_SIZE];
+        let kb = izarravm_firmware::kbd_resident_bios();
+        rom[..kb.len()].copy_from_slice(kb);
+        rom[0xF000] = 0xCF;
+        let mut machine = Self::base(profile, Cpu386::default(), rom)?;
+        install_boot_bios_stubs(&mut machine.memory)?;
+        machine.install_keyboard_bios()?;
+        machine.program_runtime = true;
+
+        let entry = raw_program::load_program(image, &mut machine.memory, DOS_LOAD_SEGMENT)?;
+        machine.apply_raw_program_entry(entry);
+        let prog_top = machine
+            .memory
+            .read_u16(usize::from(DOS_LOAD_SEGMENT) * 16 + 2)?;
+        let entries: Vec<(&str, &str)> = env_entries
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        raw_program::place_environment(&mut machine.memory, DOS_LOAD_SEGMENT, prog_top, &entries)?;
+
+        // Same PIT-counter0 seed new_dos_program uses, so a program that
+        // polls the timer for a delay doesn't spin forever. See the comment
+        // on new_dos_program for the full rationale.
+        {
+            let mut bus = machine.make_bus();
+            let _ = bus.write_io(0x43, BusWidth::Byte, 0x34);
+            let _ = bus.write_io(0x40, BusWidth::Byte, 0x00);
+            let _ = bus.write_io(0x40, BusWidth::Byte, 0x00);
+        }
+        Ok(machine)
+    }
+
+    /// Accumulated console output for a `new_raw_program` machine.
+    pub fn program_output(&self) -> &[u8] {
+        &self.program_output
+    }
+
+    /// Seed the BDA keyboard ring with input bytes for a `new_raw_program`
+    /// machine's character-input calls. Holds up to 15 bytes.
+    pub fn set_program_stdin(&mut self, bytes: &[u8]) {
+        const KBD_BDA_BASE: usize = 0x400;
+        const KBD_HEAD: usize = 0x1a;
+        const KBD_TAIL: usize = 0x1c;
+        const KBD_RING_START: u16 = 0x1e;
+        const KBD_RING_END: u16 = 0x3e;
+        debug_assert!(bytes.len() < 16, "keyboard ring holds 15 entries");
+        let _ = self
+            .memory
+            .write_u16(KBD_BDA_BASE + KBD_HEAD, KBD_RING_START);
+        let mut off = KBD_RING_START;
+        for &b in bytes {
+            let _ = self
+                .memory
+                .write_u16(KBD_BDA_BASE + off as usize, u16::from(b));
+            off += 2;
+            if off >= KBD_RING_END {
+                off = KBD_RING_START;
+            }
+        }
+        let _ = self.memory.write_u16(KBD_BDA_BASE + KBD_TAIL, off);
+    }
+
     /// Lay out the upper-memory window and hand the DOS kernel its UMB arena: the
     /// IZEMM SYSINIT step. Reserve the ROM, then carve the largest remaining hole as
     /// the UMB pool. With no upper memory free, the kernel keeps no arena.
@@ -2150,6 +2231,21 @@ impl Machine {
     /// real-mode eflags with IF set, matching real DOS which hands control with
     /// interrupts enabled so the keyboard ISR can run while a program polls.
     fn apply_program_entry(&mut self, entry: izarravm_dos::ProgramEntry) {
+        let r = &mut self.cpu.registers;
+        r.set_segment(SegmentIndex::Cs, SegmentRegister::real(entry.cs));
+        r.set_segment(SegmentIndex::Ds, SegmentRegister::real(entry.ds));
+        r.set_segment(SegmentIndex::Es, SegmentRegister::real(entry.es));
+        r.set_segment(SegmentIndex::Ss, SegmentRegister::real(entry.ss));
+        r.eip = u32::from(entry.ip);
+        r.set_esp(u32::from(entry.sp));
+        r.eflags = 0x0000_0202; // IF set: DOS programs start with interrupts on
+    }
+
+    /// Set the CPU to a loaded raw program's entry. Identical in effect to
+    /// `apply_program_entry`, kept as a separate copy so `new_raw_program`
+    /// (and this module) never need an `izarravm_dos::ProgramEntry` value —
+    /// `raw_program::ProgramEntry` carries the same six fields independently.
+    fn apply_raw_program_entry(&mut self, entry: raw_program::ProgramEntry) {
         let r = &mut self.cpu.registers;
         r.set_segment(SegmentIndex::Cs, SegmentRegister::real(entry.cs));
         r.set_segment(SegmentIndex::Ds, SegmentRegister::real(entry.ds));
@@ -9251,6 +9347,112 @@ impl Machine {
         let _ = self.memory.write_u16(0x485, u16::from(bytes_per_char));
     }
 
+    /// The minimal interrupt surface for a `new_raw_program` machine: INT 20h
+    /// and AH=4Ch terminate; AH=01h/02h/06h/09h console I/O; anything else
+    /// returns DOS's "invalid function" convention (CF=1, AX=0007h) instead
+    /// of doing nothing silently. No file I/O, no critical error, no EXEC —
+    /// see `dev_docs/2026-06-30-katea-sp3-program-runtime-design.md` section 3.
+    fn handle_raw_program_int(&mut self, vector: u8) -> Result<Option<u8>, BusError> {
+        let ss = self.cpu.registers.segment(SegmentIndex::Ss).base;
+        let sp = self.cpu.registers.esp() as u16;
+        let flags_addr = (ss + u32::from(sp.wrapping_add(4))) as usize;
+
+        if vector == 0x20 {
+            return Ok(Some(0));
+        }
+        let ax = self.cpu.registers.eax() as u16;
+        let ah = (ax >> 8) as u8;
+        match ah {
+            0x4c => return Ok(Some(ax as u8)),
+            0x01 => {
+                const KBD_BDA_BASE: usize = 0x400;
+                const KBD_HEAD: usize = 0x1a;
+                const KBD_TAIL: usize = 0x1c;
+                const KBD_RING_START: u16 = 0x1e;
+                const KBD_RING_END: u16 = 0x3e;
+                let head = self.memory.read_u16(KBD_BDA_BASE + KBD_HEAD)?;
+                let tail = self.memory.read_u16(KBD_BDA_BASE + KBD_TAIL)?;
+                if head == tail {
+                    // Blocking read with an empty ring: rewind the stacked
+                    // return IP by 2 so the IRET stub re-enters the same
+                    // `CD 21`, and set IF so IRQ1 can run the keyboard ISR
+                    // before the retry. Mirrors handle_dos_int's WaitForKey.
+                    let ip_addr = (ss + u32::from(sp)) as usize;
+                    let ret_ip = self.memory.read_u16(ip_addr)?;
+                    self.memory.write_u16(ip_addr, ret_ip.wrapping_sub(2))?;
+                    let mut flags = self.memory.read_u16(flags_addr)?;
+                    flags |= 0x0200; // IF
+                    self.memory.write_u16(flags_addr, flags)?;
+                    return Ok(None);
+                }
+                let word = self.memory.read_u16(KBD_BDA_BASE + usize::from(head))?;
+                let mut next = head + 2;
+                if next >= KBD_RING_END {
+                    next = KBD_RING_START;
+                }
+                self.memory.write_u16(KBD_BDA_BASE + KBD_HEAD, next)?;
+                let ch = word as u8;
+                self.program_output.push(ch);
+                self.cpu.registers.set_eax(u32::from(ch));
+            }
+            0x02 => {
+                let dl = (self.cpu.registers.edx() & 0xff) as u8;
+                self.program_output.push(dl);
+            }
+            0x06 => {
+                let dl = (self.cpu.registers.edx() & 0xff) as u8;
+                if dl == 0xff {
+                    // Char-in-no-wait: report "nothing available" via ZF, the
+                    // same shape int14_fossil_keyboard_read uses for polling.
+                    const KBD_BDA_BASE: usize = 0x400;
+                    const KBD_HEAD: usize = 0x1a;
+                    const KBD_TAIL: usize = 0x1c;
+                    let head = self.memory.read_u16(KBD_BDA_BASE + KBD_HEAD)?;
+                    let tail = self.memory.read_u16(KBD_BDA_BASE + KBD_TAIL)?;
+                    let mut flags = self.memory.read_u16(flags_addr)?;
+                    if head == tail {
+                        flags |= 0x0040; // ZF set: nothing available
+                        self.cpu.registers.set_eax(0);
+                    } else {
+                        let word = self.memory.read_u16(KBD_BDA_BASE + usize::from(head))?;
+                        let mut next = head + 2;
+                        const KBD_RING_START: u16 = 0x1e;
+                        const KBD_RING_END: u16 = 0x3e;
+                        if next >= KBD_RING_END {
+                            next = KBD_RING_START;
+                        }
+                        self.memory.write_u16(KBD_BDA_BASE + KBD_HEAD, next)?;
+                        flags &= !0x0040; // ZF clear: a char is in AL
+                        self.cpu.registers.set_eax(u32::from(word as u8));
+                    }
+                    self.memory.write_u16(flags_addr, flags)?;
+                } else {
+                    self.program_output.push(dl);
+                }
+            }
+            0x09 => {
+                let ds = self.cpu.registers.segment(SegmentIndex::Ds).base;
+                let dx = self.cpu.registers.edx() as u16;
+                let mut addr = ds + u32::from(dx);
+                loop {
+                    let byte = self.memory.read_u8(addr as usize)?;
+                    if byte == b'$' {
+                        break;
+                    }
+                    self.program_output.push(byte);
+                    addr = addr.wrapping_add(1);
+                }
+            }
+            _ => {
+                let mut flags = self.memory.read_u16(flags_addr)?;
+                flags |= 0x0001; // CF
+                self.memory.write_u16(flags_addr, flags)?;
+                self.cpu.registers.set_eax(0x0007);
+            }
+        }
+        Ok(None)
+    }
+
     /// Service a DOS software interrupt (INT 20h or INT 21h) host-side after the
     /// instruction retires. The CPU registers are intact here (a software interrupt
     /// only pushes flags/CS/IP), so the kernel reads and writes them through a
@@ -11728,6 +11930,17 @@ impl Machine {
                             }
                             0x66 => self.handle_xms(),
                             0x67 => self.handle_int67(),
+                            0x20 | 0x21 | 0x27 if self.program_runtime => {
+                                match self.handle_raw_program_int(vector) {
+                                    Ok(Some(code)) => return Ok(StopReason::DosExit { code }),
+                                    Ok(None) => {}
+                                    Err(error) => {
+                                        return Ok(StopReason::CpuError(format!(
+                                            "raw program INT {vector:#04x}: {error}"
+                                        )));
+                                    }
+                                }
+                            }
                             0x20 | 0x21 | 0x27 => match self.handle_dos_int(vector) {
                                 Ok(Some(code)) => {
                                     if let Some(frame) = self.program_frames.pop() {
@@ -14397,6 +14610,88 @@ mod tests {
             before, after,
             "PIT counter 0 must advance after new_dos_program (POST-equivalent timer setup)"
         );
+    }
+
+    #[test]
+    fn new_raw_program_runs_and_exits_via_int20() {
+        let prog: &[u8] = &[0xcd, 0x20]; // int 20h
+        let mut m =
+            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), prog)
+                .unwrap();
+        let reason = m.run_until_halt_or_cycles(100_000).unwrap();
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
+    }
+
+    #[test]
+    fn new_raw_program_exits_with_ah4c_code() {
+        let prog: &[u8] = &[0xb8, 0x2a, 0x4c, 0xcd, 0x21]; // mov ax,4c2a; int 21h
+        let mut m =
+            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), prog)
+                .unwrap();
+        let reason = m.run_until_halt_or_cycles(100_000).unwrap();
+        assert_eq!(reason, StopReason::DosExit { code: 0x2a });
+    }
+
+    #[test]
+    fn new_raw_program_prints_a_dollar_terminated_string() {
+        // org 0x100: mov ah,9 / mov dx,msg / int 21h / mov ax,4c00h / int 21h
+        // msg ("Hi$") placed right after the code, addressed PSP-relative.
+        // Code is 12 bytes, so msg starts at offset 0x100+12 = 0x10C.
+        let prog: &[u8] = &[
+            0xb4, 0x09, 0xba, 0x0c, 0x01, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21, b'H', b'i',
+            b'$',
+        ];
+        let mut m =
+            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), prog)
+                .unwrap();
+        let reason = m.run_until_halt_or_cycles(100_000).unwrap();
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
+        assert_eq!(m.program_output(), b"Hi");
+    }
+
+    #[test]
+    fn new_raw_program_reads_typed_keys_via_ah01() {
+        // org 0x100: mov ah,1 / int 21h / mov ah,1 / int 21h / mov ax,4c00h / int 21h
+        let prog: &[u8] = &[
+            0xb4, 0x01, 0xcd, 0x21, 0xb4, 0x01, 0xcd, 0x21, 0xb8, 0x00, 0x4c, 0xcd, 0x21,
+        ];
+        let mut m =
+            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), prog)
+                .unwrap();
+        m.set_program_stdin(b"hi");
+        let reason = m.run_until_halt_or_cycles(2_000_000).unwrap();
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
+        assert_eq!(m.program_output(), b"hi");
+    }
+
+    #[test]
+    fn new_raw_program_unknown_int21_function_sets_carry() {
+        // org 0x100: mov ah,0xff / int 21h ; the unrecognized AH=FFh falls
+        // into a tight loop on CF so the test can stop and inspect FLAGS
+        // without the program continuing past it.
+        let prog: &[u8] = &[0xb4, 0xff, 0xcd, 0x21, 0xeb, 0xfe];
+        let mut m =
+            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), prog)
+                .unwrap();
+        m.run_until_halt_or_cycles(1_000).unwrap();
+        assert_eq!(m.cpu.registers.eax() as u16, 0x0007);
+        assert_eq!(m.cpu.registers.eflags & 0x0001, 0x0001, "CF set");
+    }
+
+    #[test]
+    fn new_raw_program_seeds_env_one_paragraph_above_prog_top() {
+        let prog: &[u8] = &[0xb8, 0x00, 0x4c, 0xcd, 0x21];
+        let m = Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), prog)
+            .unwrap();
+        let prog_top = m
+            .memory()
+            .read_u16(usize::from(DOS_LOAD_SEGMENT) * 16 + 2)
+            .unwrap();
+        let env_seg = m
+            .memory()
+            .read_u16(usize::from(DOS_LOAD_SEGMENT) * 16 + 0x2c)
+            .unwrap();
+        assert_eq!(env_seg, prog_top + 1);
     }
 
     #[test]
