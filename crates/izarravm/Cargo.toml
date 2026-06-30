@@ -22,7 +22,6 @@ izarravm-audio = { path = "../izarravm-audio" }
 izarravm-bus = { path = "../izarravm-bus" }
 izarravm-core = { path = "../izarravm-core" }
 izarravm-cpu = { path = "../izarravm-cpu" }
-izarravm-dos = { path = "../izarravm-dos" }
 izarravm-firmware = { path = "../izarravm-firmware" }
 izarravm-input = { path = "../izarravm-input" }
 izarravm-machine = { path = "../izarravm-machine" }
