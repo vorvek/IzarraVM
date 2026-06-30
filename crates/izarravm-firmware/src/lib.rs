@@ -26,6 +26,11 @@ pub const EXEHELLO_EXE_SOURCE: &str = include_str!("../roms/dos/exehello.asm");
 /// fold). It is a .EXE rather than a .COM so the MZ relocations place its global
 /// variables in the data segment instead of overwriting the code.
 pub const DHRYSTONE_EXE: &[u8] = include_bytes!("../roms/neurketa-c/dhrystone.exe");
+/// The freestanding Whetstone double-precision FP benchmark .EXE: the floating-point
+/// oracle for the per-mode `fp_timing` factor. Same harness contract as Dhrystone
+/// (load with `Machine::new_dos_program`, read `bench_iterations` = the sweep count
+/// and `bench_aux` = the FP self-check fold). See roms/neurketa-c/whetstone.c.
+pub const WHETSTONE_EXE: &[u8] = include_bytes!("../roms/neurketa-c/whetstone.exe");
 pub const KBD_BIOS: &[u8] = include_bytes!("../roms/kbd-bios.bin");
 pub const KBD_BIOS_SOURCE: &str = include_str!("../roms/kbd-bios.asm");
 pub const KBD_RESIDENT_BIOS: &[u8] = include_bytes!("../roms/kbd-resident.bin");
@@ -255,6 +260,10 @@ pub fn exehello_exe() -> &'static [u8] {
 
 pub fn dhrystone_exe() -> &'static [u8] {
     DHRYSTONE_EXE
+}
+
+pub fn whetstone_exe() -> &'static [u8] {
+    WHETSTONE_EXE
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -676,6 +685,11 @@ mod tests {
     #[test]
     fn dhrystone_exe_starts_with_mz() {
         assert_eq!(&dhrystone_exe()[0..2], &[0x4D, 0x5A]);
+    }
+
+    #[test]
+    fn whetstone_exe_starts_with_mz() {
+        assert_eq!(&whetstone_exe()[0..2], &[0x4D, 0x5A]);
     }
 
     #[test]
