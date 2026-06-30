@@ -871,6 +871,15 @@ pub struct Vga {
     pub(crate) default_palette_loading_enabled: bool,
     pub(crate) grayscale_summing_enabled: bool,
     pub(crate) cga: Cga,
+    // Content-generation counter for the host-side dirty-framebuffer cache. Bumped
+    // inside every display mutator on this Vga: the VRAM writers, the register/DAC
+    // write port, and the start-address latch at vsync. Putting it here (not on the
+    // machine bus) makes it caller-agnostic — a write lands the same whether it came
+    // through the CPU bus or directly from an HLE BIOS INT 10h graphics service, so
+    // neither path can change the output without bumping the gen. The machine folds
+    // this into `Machine::frame_generation`. Over-bumping a no-op write is harmless
+    // (a missed cache hit); missing a change would show a stale frame.
+    pub(crate) content_gen: u64,
 }
 
 impl Default for Vga {
@@ -925,6 +934,7 @@ impl Default for Vga {
             default_palette_loading_enabled: true,
             grayscale_summing_enabled: false,
             cga: Cga::default(),
+            content_gen: 0,
         };
         // Size the work buffer for the boot text mode so the raster is published
         // from the first frame (finalize_frame only publishes a non-empty work).
@@ -1066,6 +1076,7 @@ impl Vga {
     }
 
     pub fn set_display_refresh_enabled(&mut self, enabled: bool) {
+        self.bump_content_gen(); // blanks/unblanks visible output
         self.display_refresh_enabled = enabled;
     }
 
@@ -1237,6 +1248,11 @@ impl Vga {
 
     /// Install a planar mode's timing and reset the beam to the top of frame.
     fn set_planar_mode(&mut self, mode: u8, timing: CrtcTiming) {
+        // A mode change alters the scanout interpretation even between two graphics
+        // modes of identical raster dims (e.g. 0Dh<->13h, both 320x449), which the
+        // dimension fold in `Machine::frame_generation` cannot see. Bump so the host
+        // frame cache re-renders the switch.
+        self.bump_content_gen();
         self.crtc = timing;
         self.crtc_regs = CrtcRegs::from_timing(timing);
         self.seed_vgabios_crtc_readback(mode);
@@ -1898,6 +1914,12 @@ impl Vga {
             });
         }
         if let Some(addr) = self.pending_start.take() {
+            // A start-address latch changes the scanout origin with no VRAM/register
+            // write of its own, so bump the content generation here (only when it
+            // actually moves) so the host dirty-framebuffer cache re-renders.
+            if addr != self.crtc.start_address {
+                self.bump_content_gen();
+            }
             self.crtc.start_address = addr; // latched for the next frame
         }
         self.last_line = 0;
@@ -1996,6 +2018,7 @@ impl Vga {
         if offset >= VGA_PLANE_SIZE {
             return;
         }
+        self.bump_content_gen();
         if self.seq.memory_mode & 0x04 == 0 {
             self.cpu_write_odd_even(offset, data);
             return;
@@ -2058,6 +2081,7 @@ impl Vga {
         let Some((offset, bit)) = self.planar_pixel_offset_at(start, x, y) else {
             return false;
         };
+        self.bump_content_gen();
         let old = self.planar_read_pixel_at(start, x, y);
         let color = self.planar_storage_bits(if xor { old ^ color } else { color });
         let mask = 1 << bit;
@@ -2094,6 +2118,7 @@ impl Vga {
     /// same four-plane VRAM either way (Abrash, Graphics Programming Black Book
     /// ch.47).
     pub fn cpu_write_chain4(&mut self, offset: usize, data: u8) {
+        self.bump_content_gen();
         let plane = offset & 0x3;
         let plane_off = offset >> 2;
         if plane_off < VGA_PLANE_SIZE {
@@ -2196,6 +2221,11 @@ impl Vga {
     /// new value takes effect. Returns `true` if the port is handled.
     pub fn write_port(&mut self, port: u16, value: u8) -> bool {
         self.catch_up();
+        // Any VGA register / DAC write can change the scanout (palette, CRTC origin,
+        // sequencer/GC/attribute state), so bump the content generation. This also
+        // covers HLE BIOS palette writes (e.g. INT 10h AH=10h driving 0x3D9 directly).
+        // Index-only and unhandled-port writes over-bump harmlessly.
+        self.bump_content_gen();
         match port {
             0x3C2 => {
                 self.misc_output = value;
@@ -2717,7 +2747,7 @@ impl Vga {
 
     pub fn write_u8(&mut self, offset: usize, value: u8) -> Result<(), VideoError> {
         if self.is_cga_text_mode() {
-            self.cga_write(offset, value);
+            self.cga_write(offset, value); // bumps content_gen itself
             return Ok(());
         }
         let slot = self
@@ -2725,6 +2755,7 @@ impl Vga {
             .get_mut(offset)
             .ok_or(VideoError::TextMemoryOutOfBounds { offset })?;
         *slot = value;
+        self.bump_content_gen();
         Ok(())
     }
 
@@ -2733,6 +2764,9 @@ impl Vga {
     /// as the planar and mode-X modes). Chain-4 is the mode-13h-specific CPU
     /// write decode; the CRTC display scanout is shared with mode X.
     pub fn set_mode13h(&mut self) {
+        // A mode change alters the scanout even at identical raster dims (0Dh<->13h are
+        // both 320x449); the dimension fold can't see it, so bump the content gen.
+        self.bump_content_gen();
         self.crtc = CrtcTiming::mode13h();
         self.crtc_regs = CrtcRegs::from_timing(self.crtc);
         self.seed_vgabios_crtc_readback(0x13);
@@ -2764,6 +2798,10 @@ impl Vga {
             0x06 => (CrtcTiming::cga_640x200(), CgaMode::Graphics640x200),
             _ => return false,
         };
+        // A mode change alters the scanout even at identical raster dims; bump the
+        // content gen so the host frame cache re-renders the switch (after validation,
+        // so an unsupported mode that returns false above does not bump).
+        self.bump_content_gen();
         self.crtc = timing;
         self.set_misc_mode_bits(0, true, 0x01);
         self.seq.reset = 0x03;
@@ -3132,6 +3170,7 @@ impl Vga {
     /// lives in the layout the guest writes, so the store is a flat copy and the
     /// scanout (`render_cga_row`) reinterprets the banks.
     pub fn cga_write(&mut self, offset: usize, value: u8) {
+        self.bump_content_gen();
         if let Some(slot) = self.cga.fb.get_mut(offset & (CGA_FB_SIZE - 1)) {
             *slot = value;
         }
@@ -3308,6 +3347,30 @@ impl Vga {
         self.mode
     }
 
+    /// True only in a text mode. Text adds time-based cursor/attribute blink with
+    /// no guest write, so the host dirty-framebuffer cache must keep re-rendering
+    /// text screens (the content generation cannot capture blink in v1).
+    pub fn is_text_mode(&self) -> bool {
+        self.mode == VideoMode::Text
+    }
+
+    /// The content-generation counter, bumped by every display mutator (see
+    /// `bump_content_gen`). The machine folds this into `Machine::frame_generation`
+    /// so any output change — from the CPU bus or an HLE BIOS service — invalidates
+    /// the host frame cache.
+    pub fn content_gen(&self) -> u64 {
+        self.content_gen
+    }
+
+    /// Bump the content generation. Called by every method that can change what the
+    /// display scans out (VRAM writers, register/DAC port writes, the start-address
+    /// latch), so the host dirty-framebuffer cache re-renders regardless of which
+    /// caller (CPU bus or HLE BIOS) drove the write. Over-bumping is harmless.
+    #[inline]
+    fn bump_content_gen(&mut self) {
+        self.content_gen = self.content_gen.wrapping_add(1);
+    }
+
     /// The CPU aperture window the Graphics Controller Miscellaneous register
     /// (06h) selects, plus the graphics and chain-odd-even flags. The machine bus
     /// consults this to route the legacy A0000/B0000 mapping in graphics modes.
@@ -3326,6 +3389,7 @@ impl Vga {
     /// Set the border/overscan color. VGA stores Attribute register 11h raw;
     /// CGA mirrors the low five bits into 3D9h's background/intensity field.
     pub fn set_overscan(&mut self, value: u8) {
+        self.bump_content_gen();
         self.attr.overscan = value;
         if self.is_cga_personality() {
             self.cga.color_select = (self.cga.color_select & !0x1F) | (value & 0x1F);
@@ -3357,6 +3421,7 @@ impl Vga {
     /// Set one Attribute palette register (0-15). The index is masked to 4 bits,
     /// the value to 6 bits, matching the 3C0 datapath. Used by INT 10h AH=10h.
     pub fn set_attr_palette_reg(&mut self, index: u8, value: u8) {
+        self.bump_content_gen();
         self.attr.palette[(index & 0x0F) as usize] = value & 0x3F;
     }
 
@@ -3365,6 +3430,11 @@ impl Vga {
     }
 
     pub fn set_attr_register(&mut self, index: u8, value: u8) {
+        // Attribute palette / mode-control / overscan / panning / color-select all
+        // change graphics output; the HLE INT 10h palette services write these
+        // directly. The 0x00..=0x0F path double-bumps via set_attr_palette_reg —
+        // harmless.
+        self.bump_content_gen();
         match index & 0x1F {
             0x00..=0x0F => self.set_attr_palette_reg(index, value),
             0x10 => self.attr.mode_control = value,
@@ -3389,6 +3459,9 @@ impl Vga {
     }
 
     pub fn set_dac_entry(&mut self, index: u8, r: u8, g: u8, b: u8) {
+        // A palette change is a graphics-mode output change with no VRAM write — the
+        // HLE INT 10h AH=10h palette services call this directly, bypassing the bus.
+        self.bump_content_gen();
         let [r, g, b] = self.dac_entry_for_write(r, g, b);
         self.dac.set_entry(index, r, g, b);
     }
@@ -3425,6 +3498,7 @@ impl Vga {
 
     pub fn sum_dac_entry_to_gray(&mut self, index: u8) {
         if self.grayscale_summing_enabled {
+            self.bump_content_gen();
             let [r, g, b] = self.dac.entry(index);
             let gray = Self::gray6(r, g, b);
             self.dac.set_entry(index, gray, gray, gray);

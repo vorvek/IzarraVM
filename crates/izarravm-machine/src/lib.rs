@@ -10434,6 +10434,41 @@ impl Machine {
         }
     }
 
+    /// An O(1) content-generation key for the host-side dirty-framebuffer cache.
+    ///
+    /// Returns `Some(key)` only when the output is a pure function of guest writes —
+    /// the active display is the VGA raster AND the mode is a graphics mode (mode 13h,
+    /// planar, mode X, CGA graphics). The key changes iff the graphics-mode output
+    /// could change, so a consumer that re-renders only when the key moves can never
+    /// show a stale frame, while idling on a static screen. It folds every input that
+    /// can change the output: the Vga `content_gen` (bumped inside every Vga display
+    /// mutator — VRAM writers, register/DAC writes, and the start-address latch — so
+    /// it catches writes from BOTH the CPU bus AND the HLE BIOS INT 10h services that
+    /// mutate `self.video` directly, regardless of caller), plus the raster dimensions
+    /// (so a mode or resolution change always moves the key).
+    ///
+    /// Returns `None` for text mode (time-based cursor/attribute blink toggles with no
+    /// guest write, so writes alone cannot capture it — text keeps re-rendering), and —
+    /// in v1 — for Margo LFB / Distira (their own scanout; a generation for them is
+    /// deferred to v2). Pure `&self`: no rendering, no timing side effects.
+    pub fn frame_generation(&self) -> Option<u64> {
+        if self.active_display() != ActiveDisplay::VgaRaster || self.video.is_text_mode() {
+            return None;
+        }
+        // A cheap reversible mix: each input is multiplied by a distinct large odd
+        // constant, so the key changes whenever any input changes.
+        const K: u64 = 0x9E37_79B9_7F4A_7C15; // golden-ratio odd multiplier
+        let width = u64::from(self.video.raster_width());
+        let height = u64::from(self.video.raster_height());
+        let key = self
+            .video
+            .content_gen()
+            .wrapping_mul(K)
+            .wrapping_add(width.wrapping_mul(0x0001_0000_0001))
+            .wrapping_add(height.wrapping_mul(0x1_0000_0001_0000));
+        Some(key)
+    }
+
     /// zlib/IEEE CRC-32 of a framebuffer rectangle, each pixel hashed as its four
     /// `0x00RRGGBB` bytes (little-endian). The rectangle is clamped to the frame;
     /// one fully outside it hashes nothing (CRC of empty input, 0). This is the
@@ -25686,6 +25721,184 @@ mod tests {
         );
         // Sanity: still on row 0 of the active area.
         assert!(w >= 72);
+    }
+
+    #[test]
+    fn frame_generation_tracks_graphics_writes() {
+        let mut machine = test_machine();
+
+        // Text mode (the power-up default) is never memoized: cursor/attribute blink
+        // toggles with no guest write, so the gen must be None so the GUI keeps
+        // re-rendering.
+        assert_eq!(machine.video().active_mode(), VideoMode::Text);
+        assert_eq!(
+            machine.frame_generation(),
+            None,
+            "text mode is not memoizable (blink)"
+        );
+
+        // A graphics mode (mode 13h) is a pure function of guest writes, so it gets a
+        // generation key.
+        machine.video_mut().set_mode13h();
+        assert_eq!(machine.video().active_mode(), VideoMode::Mode13h);
+        let gen0 = machine
+            .frame_generation()
+            .expect("graphics mode has a generation");
+
+        // Stable across repeated calls with no intervening writes (so a static screen
+        // stays a cache hit).
+        assert_eq!(
+            machine.frame_generation(),
+            Some(gen0),
+            "no write -> same generation"
+        );
+        assert_eq!(
+            machine.frame_generation(),
+            Some(gen0),
+            "still stable on a third call"
+        );
+
+        // A write into the VGA memory aperture changes the key (the framebuffer moved).
+        machine.write_physical_u8(0xA0000, 0x2A);
+        let gen1 = machine.frame_generation().expect("still graphics");
+        assert_ne!(gen1, gen0, "a VRAM write bumps the generation");
+
+        // ...and is stable again afterward.
+        assert_eq!(
+            machine.frame_generation(),
+            Some(gen1),
+            "stable after the VRAM write"
+        );
+
+        // A VGA register / DAC port write (a palette change is the classic graphics-mode
+        // output change with no VRAM write) changes the key. 0x3C8/0x3C9 are the DAC
+        // write-index / data ports.
+        {
+            let mut bus = machine.make_bus();
+            bus.write_io(0x3C8, BusWidth::Byte, 0x00).unwrap(); // DAC write index 0
+            bus.write_io(0x3C9, BusWidth::Byte, 0x3F).unwrap(); // red component
+        }
+        let gen2 = machine.frame_generation().expect("still graphics");
+        assert_ne!(gen2, gen1, "a VGA port write bumps the generation");
+
+        // A mode / resolution change always moves the key (the raster dims are folded
+        // into the key).
+        assert!(machine.set_vga_mode(0x12)); // 640x480 planar (raster 640x525)
+        assert_eq!(machine.video().active_mode(), VideoMode::Planar);
+        let gen3 = machine.frame_generation().expect("planar is graphics");
+        assert_ne!(gen3, gen2, "a resolution change moves the generation");
+
+        // Returning to text mode drops back to None.
+        machine.video_mut().set_text_mode();
+        assert_eq!(machine.video().active_mode(), VideoMode::Text);
+        assert_eq!(
+            machine.frame_generation(),
+            None,
+            "back in text mode -> not memoizable"
+        );
+    }
+
+    // Regression: the HLE BIOS INT 10h graphics services mutate `self.video` directly
+    // (bypassing the CPU bus), so the content generation must live inside the Vga
+    // mutators, not on the bus, or a BIOS-drawing program would be frozen by the cache.
+    // Each sub-case stays in an ALREADY-established graphics mode (same dims before and
+    // after the BIOS call) so the dims fold cannot mask a missing bump.
+    #[test]
+    fn frame_generation_tracks_same_dims_mode_switch() {
+        // Mode 13h and mode 0Dh are both 320x449 raster, so the dimension fold in
+        // frame_generation cannot tell them apart. A program switching between them
+        // (INT 10h AH=00h, no intervening VRAM write) must still move the key, or the
+        // host frame cache would freeze on the switch. The mode-set helpers bump the
+        // content gen to cover this.
+        let mut machine = int15_machine(16);
+        machine.video_mut().set_mode13h();
+        assert_eq!(machine.video().active_mode(), VideoMode::Mode13h);
+        let dims_before = (
+            machine.video().raster_width(),
+            machine.video().raster_height(),
+        );
+        let before = machine
+            .frame_generation()
+            .expect("mode 13h is a graphics mode");
+
+        assert!(machine.video_mut().set_mode(0x0D)); // 320x200x16 planar, same raster dims
+        let dims_after = (
+            machine.video().raster_width(),
+            machine.video().raster_height(),
+        );
+        assert_eq!(
+            dims_before, dims_after,
+            "13h and 0Dh share raster dims, so the dims fold cannot move the key"
+        );
+        let after = machine
+            .frame_generation()
+            .expect("mode 0Dh is a graphics mode");
+        assert_ne!(
+            after, before,
+            "a same-dims graphics-to-graphics mode switch must still bump the generation"
+        );
+    }
+
+    #[test]
+    fn frame_generation_tracks_hle_bios_graphics_writes() {
+        // Mode 13h, INT 10h AH=0Ch WRITE PIXEL (AL=color, CX=col, DX=row, BH=page).
+        let mut machine = int15_machine(16);
+        machine.video_mut().set_mode13h();
+        assert_eq!(machine.video().active_mode(), VideoMode::Mode13h);
+        let before = machine
+            .frame_generation()
+            .expect("mode 13h is a graphics mode");
+
+        machine.cpu.registers.set_eax(0x0C2A); // AH=0Ch, AL=0x2A
+        machine.cpu.registers.set_ebx(0x0000); // BH=page 0
+        machine.cpu.registers.set_ecx(10); // column
+        machine.cpu.registers.set_edx(20); // row
+        machine.handle_int10();
+        let after = machine.frame_generation().expect("still mode 13h");
+        assert_ne!(
+            after, before,
+            "INT 10h AH=0Ch write-pixel must bump the generation (HLE bypasses the bus)"
+        );
+
+        // CGA graphics (mode 04h), INT 10h AH=0Eh TELETYPE — draws a glyph as pixels.
+        let mut cga = int15_machine(16);
+        cga.cpu.registers.set_eax(0x0004); // set CGA graphics mode 04h
+        cga.handle_int10();
+        assert_eq!(cga.video().active_mode(), VideoMode::Cga);
+        let dims_before = (cga.video().raster_width(), cga.video().raster_height());
+        let before = cga
+            .frame_generation()
+            .expect("CGA graphics has a generation");
+
+        cga.cpu.registers.set_eax(0x0E41); // AH=0Eh TTY, AL='A'
+        cga.cpu.registers.set_ebx(0x0002); // BH=page 0, BL=color 2
+        cga.handle_int10();
+        let dims_after = (cga.video().raster_width(), cga.video().raster_height());
+        assert_eq!(
+            dims_before, dims_after,
+            "dims unchanged, so the dims fold can't mask the bump"
+        );
+        let after = cga.frame_generation().expect("still CGA graphics");
+        assert_ne!(
+            after, before,
+            "INT 10h AH=0Eh teletype in CGA graphics must bump the generation"
+        );
+
+        // A palette change via INT 10h AH=10h AL=10h (set one DAC register) in mode 13h
+        // — the classic graphics output change with no VRAM write — must bump too.
+        let mut pal = int15_machine(16);
+        pal.video_mut().set_mode13h();
+        let before = pal.frame_generation().expect("mode 13h graphics");
+        pal.cpu.registers.set_eax(0x1010); // AH=10h, AL=10h set DAC register
+        pal.cpu.registers.set_ebx(0x0005); // BX = DAC index 5
+        pal.cpu.registers.set_ecx(0x3F00); // CH=green, CL=blue
+        pal.cpu.registers.set_edx(0x3F00); // DH=red
+        pal.handle_int10();
+        let after = pal.frame_generation().expect("still mode 13h");
+        assert_ne!(
+            after, before,
+            "INT 10h AH=10h palette write must bump the generation"
+        );
     }
 
     #[test]
