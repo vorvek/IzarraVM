@@ -7,12 +7,12 @@
 // and `mount_hdd_folder` (`lib.rs`), so the read path (`new`/`read_sector`/
 // `total_sectors`) is live and the module-level dead-code allow is gone. The M2
 // write path (`write_sector`/`fat_entry`/`cluster_to_lba`/`reconcile` and the
-// `overlay`/`dir_paths`/`existing_files`/`system_names`/`materialized` state) is
-// now live too. A few items remain reachable only from this module's
-// `#[cfg(test)]` tests; each carries a narrow `#[allow(dead_code)]` at its
-// definition: `tree()` and the `tree` field it reads, and the free `dir_sector`
-// (the per-volume read path inlines the same logic in `data_sector`). The `tree`
-// field is also the seam the M2 write engine reads at construction.
+// `overlay`/`dir_paths`/`mirrored`/`system_names` state) is now live too. A few
+// items remain reachable only from this module's `#[cfg(test)]` tests; each
+// carries a narrow `#[allow(dead_code)]` at its definition: `tree()` and the
+// `tree` field it reads, and the free `dir_sector` (the per-volume read path
+// inlines the same logic in `data_sector`). The `tree` field is also the seam
+// the M2 write engine reads at construction.
 
 use crate::fat32::{FAT32_EOC, fat32_dir_entry, fat32_fsinfo_sector};
 use crate::katea_names::NameTable;
@@ -593,15 +593,29 @@ pub(crate) struct KateaTreeVolume {
     /// extended on guest MKDIR. Reconcile materializes a file in this directory to
     /// `host_path / 8.3-name`.
     dir_paths: HashMap<u32, PathBuf>,
-    /// (directory first-cluster, folded 8.3 name) -> the existing host file's real
-    /// path, so an overwrite replaces the actual (possibly mixed-case) host file
-    /// rather than creating an uppercase duplicate. Built from the tree's HostFiles.
-    existing_files: HashMap<(u32, [u8; 11]), PathBuf>,
+    /// What Katea believes currently exists on the host, keyed by
+    /// `(parent dir first-cluster, folded 8.3 name)`. Seeded from the tree at
+    /// mount (every host file + subdir) and maintained by reconcile. Subsumes M2's
+    /// `existing_files` (host_path for case-correct overwrite) and `materialized`
+    /// (content-fingerprint dedupe). The root dir has no entry (it has no parent).
+    mirrored: HashMap<(u32, [u8; 11]), MirrorEntry>,
     /// Folded 8.3 names of the InMemory boot files; never materialized to the host.
     system_names: HashSet<[u8; 11]>,
-    /// (directory first-cluster, folded name) -> last materialized content
-    /// fingerprint, so an unchanged file is not re-written every reconcile pass.
-    materialized: HashMap<(u32, [u8; 11]), u64>,
+}
+
+/// Katea's belief about one host-side entry (file or dir): where it lives, the
+/// guest cluster its directory entry points at, whether it is a directory, and the
+/// last content fingerprint we materialized (None until first written / for a dir).
+#[derive(Clone, Debug)]
+struct MirrorEntry {
+    host_path: PathBuf,
+    /// The guest-side first cluster this entry occupies; read by M3 delete/rename.
+    #[allow(dead_code)]
+    first_cluster: u32,
+    /// True when this entry is a directory; read by M3 delete/rename.
+    #[allow(dead_code)]
+    is_dir: bool,
+    last_fingerprint: Option<u64>,
 }
 
 /// One file the reconcile pass has decided to materialize: where to write it, the
@@ -613,6 +627,7 @@ struct PendingWrite {
     data: Vec<u8>,
     key: (u32, [u8; 11]),
     fingerprint: u64,
+    first_cluster: u32,
 }
 
 impl KateaTreeVolume {
@@ -659,25 +674,42 @@ impl KateaTreeVolume {
             geo.part_sectors,
         );
 
-        // --- seed the M2 write maps from the (allocated) tree --------------------
+        // --- seed the write maps from the (allocated) tree ----------------------
         let mut dir_paths: HashMap<u32, PathBuf> = HashMap::new();
-        let mut existing_files: HashMap<(u32, [u8; 11]), PathBuf> = HashMap::new();
+        let mut mirrored: HashMap<(u32, [u8; 11]), MirrorEntry> = HashMap::new();
         fn seed(
             dir: &TreeDir,
             dir_paths: &mut HashMap<u32, PathBuf>,
-            existing_files: &mut HashMap<(u32, [u8; 11]), PathBuf>,
+            mirrored: &mut HashMap<(u32, [u8; 11]), MirrorEntry>,
         ) {
             dir_paths.insert(dir.first_cluster, dir.host_path.clone());
             for f in &dir.files {
                 if let FileSource::HostFile { path, .. } = &f.source {
-                    existing_files.insert((dir.first_cluster, f.name), path.clone());
+                    mirrored.insert(
+                        (dir.first_cluster, f.name),
+                        MirrorEntry {
+                            host_path: path.clone(),
+                            first_cluster: f.first_cluster,
+                            is_dir: false,
+                            last_fingerprint: None,
+                        },
+                    );
                 }
             }
             for s in &dir.subdirs {
-                seed(&s.dir, dir_paths, existing_files);
+                mirrored.insert(
+                    (dir.first_cluster, s.name),
+                    MirrorEntry {
+                        host_path: s.dir.host_path.clone(),
+                        first_cluster: s.dir.first_cluster,
+                        is_dir: true,
+                        last_fingerprint: None,
+                    },
+                );
+                seed(&s.dir, dir_paths, mirrored);
             }
         }
-        seed(&tree.root, &mut dir_paths, &mut existing_files);
+        seed(&tree.root, &mut dir_paths, &mut mirrored);
         let system_names: HashSet<[u8; 11]> = system_files
             .iter()
             .map(|(name, _)| fold_literal_83(name))
@@ -703,9 +735,8 @@ impl KateaTreeVolume {
             runs,
             overlay: HashMap::new(),
             dir_paths,
-            existing_files,
+            mirrored,
             system_names,
-            materialized: HashMap::new(),
         })
     }
 
@@ -802,7 +833,7 @@ impl KateaTreeVolume {
             });
 
             // Decide every entry (read-only); collect actions, then apply.
-            let mut mkdirs: Vec<(u32, std::path::PathBuf)> = Vec::new();
+            let mut mkdirs: Vec<(u32, [u8; 11], u32, std::path::PathBuf)> = Vec::new();
             let mut writes: Vec<PendingWrite> = Vec::new();
 
             for e in crate::katea_write::parse_dir(&dir_bytes) {
@@ -813,7 +844,7 @@ impl KateaTreeVolume {
                         first_cluster,
                     } => {
                         let path = host_dir.join(crate::katea_volume::decode_83(&name));
-                        mkdirs.push((first_cluster, path));
+                        mkdirs.push((dir_cluster, name, first_cluster, path));
                     }
                     crate::katea_write::EntryAction::MakeFile {
                         name,
@@ -839,7 +870,7 @@ impl KateaTreeVolume {
                             let base = self.cluster_to_lba(*c);
                             (0..spc).any(|s| self.overlay.contains_key(&(base + s)))
                         });
-                        let is_new = !self.existing_files.contains_key(&(dir_cluster, name));
+                        let is_new = !self.mirrored.contains_key(&(dir_cluster, name));
                         if !(data_written || (dir_written && is_new)) {
                             continue;
                         }
@@ -858,13 +889,18 @@ impl KateaTreeVolume {
                         data.truncate(size as usize);
 
                         let fp = crate::katea_write::fingerprint(&data);
-                        if self.materialized.get(&(dir_cluster, name)) == Some(&fp) {
+                        if self
+                            .mirrored
+                            .get(&(dir_cluster, name))
+                            .and_then(|m| m.last_fingerprint)
+                            == Some(fp)
+                        {
                             continue; // unchanged since last pass
                         }
                         let host_path = self
-                            .existing_files
+                            .mirrored
                             .get(&(dir_cluster, name))
-                            .cloned()
+                            .map(|m| m.host_path.clone())
                             .unwrap_or_else(|| {
                                 host_dir.join(crate::katea_volume::decode_83(&name))
                             });
@@ -873,18 +909,25 @@ impl KateaTreeVolume {
                             data,
                             key: (dir_cluster, name),
                             fingerprint: fp,
+                            first_cluster,
                         });
                     }
                 }
             }
 
             // Apply mutations + host I/O (no `self` borrow held across reads now).
-            for (first_cluster, path) in mkdirs {
+            for (parent, name, first_cluster, path) in mkdirs {
                 if let Err(e) = std::fs::create_dir_all(&path) {
                     eprintln!("katea: mkdir {} failed: {e}", path.display());
                     continue;
                 }
-                self.dir_paths.entry(first_cluster).or_insert(path);
+                self.dir_paths.entry(first_cluster).or_insert(path.clone());
+                self.mirrored.entry((parent, name)).or_insert(MirrorEntry {
+                    host_path: path,
+                    first_cluster,
+                    is_dir: true,
+                    last_fingerprint: None,
+                });
                 if !seen.contains(&first_cluster) {
                     work.push(first_cluster);
                 }
@@ -892,7 +935,15 @@ impl KateaTreeVolume {
             for w in writes {
                 match crate::katea_write::atomic_write(&w.path, &w.data) {
                     Ok(()) => {
-                        self.materialized.insert(w.key, w.fingerprint);
+                        self.mirrored.insert(
+                            w.key,
+                            MirrorEntry {
+                                host_path: w.path.clone(),
+                                first_cluster: w.first_cluster,
+                                is_dir: false,
+                                last_fingerprint: Some(w.fingerprint),
+                            },
+                        );
                     }
                     Err(e) => {
                         // Hold on failure: the real host file is untouched; retry
@@ -1669,12 +1720,12 @@ mod tests {
         let saves_fc = vol.tree().root.subdirs[0].dir.first_cluster;
         assert_eq!(vol.dir_paths.get(&saves_fc), Some(&root.join("SAVES")));
 
-        // The existing host file maps (SAVES cluster, folded name) -> its real path.
+        // The existing host file is recorded in mirrored with the correct host_path.
         let mut old = [b' '; 11];
         old[..3].copy_from_slice(b"OLD");
         old[8..11].copy_from_slice(b"TXT");
         assert_eq!(
-            vol.existing_files.get(&(saves_fc, old)),
+            vol.mirrored.get(&(saves_fc, old)).map(|m| &m.host_path),
             Some(&root.join("SAVES").join("OLD.TXT"))
         );
 
