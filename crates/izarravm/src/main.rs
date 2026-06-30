@@ -1582,8 +1582,10 @@ echo deep>SUB\\DEEP.TXT\r\n";
             "no C:\\> prompt after boot (stop={stop:?}).\n{boot_text}"
         );
 
-        // Only letters are typed: cd into SAVES, then run MAKE.BAT.
-        for cmd in ["cd saves\r", "make\r"] {
+        // Only letters are typed: cd into SAVES (cheap), then run MAKE.BAT (six
+        // file-writing commands, each doing disk I/O + an inline reconcile, so it
+        // gets a far larger settle budget than the trivial cd).
+        for (cmd, settle) in [("cd saves\r", 40_000_000u64), ("make\r", 120_000_000u64)] {
             for ch in cmd.chars() {
                 for code in ascii_to_set1(ch) {
                     machine.inject_key_scancodes(&[code]);
@@ -1593,7 +1595,7 @@ echo deep>SUB\\DEEP.TXT\r\n";
                     .expect("type cmd");
             }
             machine
-                .run_until_halt_or_cycles(120_000_000)
+                .run_until_halt_or_cycles(settle)
                 .expect("settle cmd");
         }
 
