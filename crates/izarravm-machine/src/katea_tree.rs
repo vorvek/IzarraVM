@@ -981,7 +981,7 @@ impl KateaTreeVolume {
             }
         }
         // Files before dirs, so a just-emptied dir's host files are gone before we
-        // try to remove the (now-empty) host dir.
+        // try to remove the (now-empty) host dir. (bool Ord: false(file) < true(dir).)
         deletes.sort_by_key(|d| d.is_dir);
         for d in deletes {
             let res = if d.is_dir {
@@ -2211,6 +2211,10 @@ mod tests {
         let mut c = vol.next_free;
         while vol.fat_entry(c) != 0 {
             c += 1;
+            assert!(
+                c < vol.geo.count_of_clusters + 2,
+                "no free cluster in the test volume"
+            );
         }
         c
     }
@@ -2257,13 +2261,24 @@ mod tests {
     #[test]
     fn reconcile_renames_a_host_subdir() {
         let (mut vol, root) = fresh_vol("rec_dirren");
-        let _fc = make_subdir(&mut vol, 2, "OLDDIR");
+        let fc = make_subdir(&mut vol, 2, "OLDDIR");
         vol.reconcile();
         assert!(root.join("OLDDIR").is_dir());
         rename_entry(&mut vol, 2, "OLDDIR", "NEWDIR");
         vol.reconcile();
         assert!(!root.join("OLDDIR").exists(), "old dir name gone");
         assert!(root.join("NEWDIR").is_dir(), "dir renamed on host");
+
+        // A file later created inside the (same-cluster) renamed dir must land under
+        // the NEW host path — proving dir_paths was updated to NEWDIR on the rename.
+        let file_fc = next_free_for_test(&vol);
+        stamp_file(&mut vol, fc, "INSIDE.TXT", 0x20, file_fc, b"in\r\n");
+        vol.reconcile();
+        assert_eq!(
+            std::fs::read(root.join("NEWDIR").join("INSIDE.TXT")).unwrap(),
+            b"in\r\n",
+            "a file in the renamed dir resolves to the new host path"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -2283,6 +2298,10 @@ mod tests {
         assert!(
             root.join("FULL").is_dir(),
             "non-empty host dir is NOT removed"
+        );
+        assert!(
+            root.join("FULL").join("IN.TXT").exists(),
+            "the child file survives the held rmdir"
         );
         std::fs::remove_dir_all(&root).ok();
     }
