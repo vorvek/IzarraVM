@@ -1159,6 +1159,22 @@ mod tests {
             "default C: root should end with .izarravm/c_drive, got {p:?}"
         );
     }
+
+    #[test]
+    fn c_root_path_is_a_bare_c_drive_when_portable() {
+        // Portable mode keys off the executable's own directory, so the path is
+        // just <exe_dir>/c_drive — no ~/.izarravm prefix.
+        let p = super::c_root_path(true);
+        assert_eq!(
+            p.file_name().and_then(|n| n.to_str()),
+            Some("c_drive"),
+            "portable C: root should be a c_drive folder, got {p:?}"
+        );
+        assert!(
+            !p.to_string_lossy().contains(".izarravm"),
+            "portable C: root must not use the ~/.izarravm prefix, got {p:?}"
+        );
+    }
 }
 
 #[cfg(test)]
