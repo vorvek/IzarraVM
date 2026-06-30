@@ -1410,19 +1410,16 @@ fn ensure_user_config(
     Ok(())
 }
 
-/// The default `(CONFIG.SYS, AUTOEXEC.BAT)` bytes from the committed image payload
-/// — the single source for both seeding and Repair.
-fn default_config_pair() -> (Vec<u8>, Vec<u8>) {
-    let payload = katea_volume::extract_system_payload(izarravm_firmware::tokados_hdd_img());
-    let pick = |name: &str| {
-        payload
-            .files
-            .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case(name))
-            .map(|(_, b)| b.clone())
-            .unwrap_or_default()
-    };
-    (pick("CONFIG.SYS"), pick("AUTOEXEC.BAT"))
+/// A payload file's bytes by 8.3 name. Panics if absent: the image is a committed
+/// compile-time binary, so a missing system file is a build defect, not a runtime
+/// condition (matches `extract_system_payload`'s panic-on-corrupt style).
+fn payload_file(payload: &katea_volume::SystemPayload, name: &str) -> Vec<u8> {
+    payload
+        .files
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|(_, b)| b.clone())
+        .unwrap_or_else(|| panic!("katea: {name} missing from the committed image payload"))
 }
 
 /// Merge `overrides` into a system-file list: replace an existing entry whose name
@@ -1826,8 +1823,13 @@ impl Machine {
     /// throwaway runner disk) see [`mount_hdd_folder_with`](Self::mount_hdd_folder_with).
     pub fn mount_hdd_folder(&mut self, dir: &std::path::Path) -> std::io::Result<()> {
         let payload = katea_volume::extract_system_payload(izarravm_firmware::tokados_hdd_img());
-        let (config, autoexec) = default_config_pair();
-        ensure_user_config(dir, &config, &autoexec)?;
+        // Seed the user-owned config from the payload we already hold (parse the
+        // image once), before `user_folder_overlay` below consumes `payload.files`.
+        ensure_user_config(
+            dir,
+            &payload_file(&payload, "CONFIG.SYS"),
+            &payload_file(&payload, "AUTOEXEC.BAT"),
+        )?;
         let system_files = user_folder_overlay(payload.files);
         let volume =
             katea_tree::KateaTreeVolume::new(&payload.mbr, &payload.vbr, dir, &system_files)?;
