@@ -22,7 +22,7 @@ use crate::katea_volume::{
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Cap recursion so a pathological tree (or an undetected loop) can't run away;
 /// also roughly the depth DOS's 64-char path limit allows.
@@ -58,6 +58,9 @@ pub(crate) struct TreeDir {
     pub first_cluster: u32, // this directory's first cluster (root = 2)
     pub cluster_count: u32,
     pub parent_first_cluster: u32, // for `..`; 0 when the parent is the root
+    /// This directory's host-filesystem path (root = the mounted folder). Used by
+    /// the M2 write engine to know where to materialize files created here.
+    pub host_path: std::path::PathBuf,
 }
 
 #[derive(Debug)]
@@ -70,7 +73,10 @@ pub(crate) struct HostTree {
 /// file contents. Cluster fields are zero here; Task 4 assigns them.
 pub(crate) fn build_tree(root: &Path, system_files: &[(String, Vec<u8>)]) -> HostTree {
     let mut names = NameTable::new();
-    let mut dir = TreeDir::default();
+    let mut dir = TreeDir {
+        host_path: root.to_path_buf(),
+        ..TreeDir::default()
+    };
 
     // System files first, with their canonical 8.3 names reserved.
     for (name, bytes) in system_files {
@@ -112,7 +118,10 @@ fn walk_into(host: &Path, dir: &mut TreeDir, names: &mut NameTable, depth: usize
         let path = e.path();
         if ft.is_dir() {
             let name = names.add_host(&path, true);
-            let mut child = TreeDir::default();
+            let mut child = TreeDir {
+                host_path: path.clone(),
+                ..TreeDir::default()
+            };
             let mut child_names = NameTable::new(); // a fresh table per directory
             walk_into(&path, &mut child, &mut child_names, depth + 1);
             dir.subdirs.push(TreeSubdir { name, dir: child });
@@ -578,6 +587,23 @@ pub(crate) struct KateaTreeVolume {
     // ponytail: overlay-until-eject; the upgrade is per-file host-redirect eviction
     // (M2.5) if multi-GB in-session writes ever matter.
     overlay: HashMap<u32, [u8; SECTOR]>,
+    /// Directory first-cluster -> its host-filesystem path. Seeded from the tree;
+    /// extended on guest MKDIR. Reconcile materializes a file in this directory to
+    /// `host_path / 8.3-name`.
+    #[allow(dead_code)] // consumed by mod tests + M2 reconcile pass (next task)
+    dir_paths: HashMap<u32, PathBuf>,
+    /// (directory first-cluster, folded 8.3 name) -> the existing host file's real
+    /// path, so an overwrite replaces the actual (possibly mixed-case) host file
+    /// rather than creating an uppercase duplicate. Built from the tree's HostFiles.
+    #[allow(dead_code)] // consumed by mod tests + M2 reconcile pass (next task)
+    existing_files: HashMap<(u32, [u8; 11]), PathBuf>,
+    /// Folded 8.3 names of the InMemory boot files; never materialized to the host.
+    #[allow(dead_code)] // consumed by mod tests + M2 reconcile pass (next task)
+    system_names: HashSet<[u8; 11]>,
+    /// (directory first-cluster, folded name) -> last materialized content
+    /// fingerprint, so an unchanged file is not re-written every reconcile pass.
+    #[allow(dead_code)] // Limit: consumed by the M2 reconcile pass (next task)
+    materialized: HashMap<(u32, [u8; 11]), u64>,
 }
 
 impl KateaTreeVolume {
@@ -624,6 +650,30 @@ impl KateaTreeVolume {
             geo.part_sectors,
         );
 
+        // --- seed the M2 write maps from the (allocated) tree --------------------
+        let mut dir_paths: HashMap<u32, PathBuf> = HashMap::new();
+        let mut existing_files: HashMap<(u32, [u8; 11]), PathBuf> = HashMap::new();
+        fn seed(
+            dir: &TreeDir,
+            dir_paths: &mut HashMap<u32, PathBuf>,
+            existing_files: &mut HashMap<(u32, [u8; 11]), PathBuf>,
+        ) {
+            dir_paths.insert(dir.first_cluster, dir.host_path.clone());
+            for f in &dir.files {
+                if let FileSource::HostFile { path, .. } = &f.source {
+                    existing_files.insert((dir.first_cluster, f.name), path.clone());
+                }
+            }
+            for s in &dir.subdirs {
+                seed(&s.dir, dir_paths, existing_files);
+            }
+        }
+        seed(&tree.root, &mut dir_paths, &mut existing_files);
+        let system_names: HashSet<[u8; 11]> = system_files
+            .iter()
+            .map(|(name, _)| fold_literal_83(name))
+            .collect();
+
         // --- flatten the tree into dirs/files + the sorted run table -----------
         let mut dirs = Vec::new();
         let mut files = Vec::new();
@@ -643,6 +693,10 @@ impl KateaTreeVolume {
             files,
             runs,
             overlay: HashMap::new(),
+            dir_paths,
+            existing_files,
+            system_names,
+            materialized: HashMap::new(),
         })
     }
 
@@ -655,6 +709,19 @@ impl KateaTreeVolume {
     #[allow(dead_code)]
     pub(crate) fn tree(&self) -> &HostTree {
         &self.tree
+    }
+
+    /// The 28-bit FAT entry for cluster `c`, reading the overlay-shadowed FAT (so
+    /// guest-written chain links are honored) and falling back to the tree's
+    /// computed FAT. Built on `read_sector`, which already consults the overlay.
+    #[allow(dead_code)] // consumed by mod tests + M2 reconcile pass (next task)
+    pub(crate) fn fat_entry(&self, c: u32) -> u32 {
+        let byte = c as usize * 4;
+        let fat_sector_rel = u32::from(RESERVED_SECTORS) + (byte / SECTOR) as u32;
+        let lba = self.geo.part_start + fat_sector_rel;
+        let off = byte % SECTOR;
+        let sec = self.read_sector(lba);
+        u32::from_le_bytes([sec[off], sec[off + 1], sec[off + 2], sec[off + 3]]) & 0x0FFF_FFFF
     }
 
     /// Absolute LBA of a data cluster's first sector. Test-only: the read path
@@ -1147,6 +1214,76 @@ mod tests {
         assert_eq!(
             dot_cluster, sub.first_cluster,
             "`.` names the subdir itself"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn new_seeds_dir_paths_existing_files_and_system_names() {
+        let root = scratch("seed");
+        std::fs::create_dir_all(root.join("SAVES")).unwrap();
+        std::fs::write(root.join("SAVES").join("OLD.TXT"), b"before").unwrap();
+        let sys = vec![("KERNEL.SYS".to_string(), vec![0xEBu8; 100])];
+        let img = izarravm_firmware::tokados_hdd_img();
+        let mut mbr = [0u8; 512];
+        mbr.copy_from_slice(&img[0..512]);
+        let mut vbr = [0u8; 512];
+        vbr.copy_from_slice(&img[2048 * 512..2048 * 512 + 512]);
+        let vol = KateaTreeVolume::new(&mbr, &vbr, &root, &sys).unwrap();
+
+        // Root cluster (2) maps to the mounted folder; SAVES maps to its host subdir.
+        assert_eq!(vol.dir_paths.get(&2), Some(&root));
+        let saves_fc = vol.tree().root.subdirs[0].dir.first_cluster;
+        assert_eq!(vol.dir_paths.get(&saves_fc), Some(&root.join("SAVES")));
+
+        // The existing host file maps (SAVES cluster, folded name) -> its real path.
+        let mut old = [b' '; 11];
+        old[..3].copy_from_slice(b"OLD");
+        old[8..11].copy_from_slice(b"TXT");
+        assert_eq!(
+            vol.existing_files.get(&(saves_fc, old)),
+            Some(&root.join("SAVES").join("OLD.TXT"))
+        );
+
+        // KERNEL.SYS is a system name (never materialized).
+        let mut kern = [b' '; 11];
+        kern[..6].copy_from_slice(b"KERNEL");
+        kern[8..11].copy_from_slice(b"SYS");
+        assert!(vol.system_names.contains(&kern));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fat_entry_reads_overlay_then_tree() {
+        let root = scratch("fatentry");
+        std::fs::write(root.join("A.TXT"), vec![0u8; 600]).unwrap(); // 2 clusters
+        let sys = vec![("KERNEL.SYS".to_string(), vec![0u8; 100])];
+        let img = izarravm_firmware::tokados_hdd_img();
+        let mut mbr = [0u8; 512];
+        mbr.copy_from_slice(&img[0..512]);
+        let mut vbr = [0u8; 512];
+        vbr.copy_from_slice(&img[2048 * 512..2048 * 512 + 512]);
+        let mut vol = KateaTreeVolume::new(&mbr, &vbr, &root, &sys).unwrap();
+
+        // The tree's FAT marks cluster 2 (root) as EOC.
+        assert_eq!(vol.fat_entry(2), 0x0FFF_FFFF);
+
+        // Write a FAT sector into the overlay setting FAT[some_free] = EOC; fat_entry
+        // now reflects the guest write.
+        let free = vol.next_free; // first never-allocated cluster
+        let byte = free as usize * 4;
+        let fat_sector_rel = u32::from(RESERVED_SECTORS) + (byte / SECTOR) as u32;
+        let lba = vol.geo.part_start + fat_sector_rel;
+        let mut sec = vol.read_sector(lba);
+        let off = byte % SECTOR;
+        sec[off..off + 4].copy_from_slice(&0x0FFF_FFFFu32.to_le_bytes());
+        vol.write_sector(lba, &sec);
+        assert_eq!(
+            vol.fat_entry(free),
+            0x0FFF_FFFF,
+            "overlay FAT write is visible"
         );
 
         std::fs::remove_dir_all(&root).ok();
