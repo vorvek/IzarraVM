@@ -9445,6 +9445,11 @@ impl Machine {
             return 1; // no Katea host folder mounted
         };
         let (config, autoexec) = default_config_pair();
+        // Per-file, not atomic across the two: if AUTOEXEC's write fails after
+        // CONFIG was already rewritten, the folder is left half-repaired (default
+        // CONFIG, no live AUTOEXEC). No data is lost — both originals survive in
+        // their .OLD — and 0xfe tells the user it failed; Repair is a rare manual
+        // recovery, so the simple sequence is acceptable.
         for (live_name, old_name, bytes) in [
             ("CONFIG.SYS", "CONFIG.OLD", &config),
             ("AUTOEXEC.BAT", "AUTOEXEC.OLD", &autoexec),
