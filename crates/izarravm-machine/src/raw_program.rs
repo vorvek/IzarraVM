@@ -318,6 +318,7 @@ pub fn load_program(
 mod tests {
     use super::*;
 
+    #[allow(clippy::too_many_arguments)] // a test-only MZ header builder; one field per param is clearer than a struct here
     fn build_mz(
         module: &[u8],
         relocs: &[(u16, u16)],
