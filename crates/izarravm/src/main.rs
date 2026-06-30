@@ -86,6 +86,10 @@ struct Cli {
     /// The folder's top-level files are surfaced read-only beside the OS.
     #[arg(long)]
     hdd_folder: Option<PathBuf>,
+    /// Boot real FreeDOS from a temp Katea disk and run a single DOS program,
+    /// exiting with its DOS exit code (the Katea replacement for --headless-run).
+    #[arg(long)]
+    katea_run: Option<PathBuf>,
     #[arg(long)]
     headless_run: Option<PathBuf>,
     #[arg(long)]
@@ -196,6 +200,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     if let Some(dir) = &cli.hdd_folder {
         return run_boot_hdd_folder(dir, cli.cycles, &hardware);
+    }
+
+    if let Some(prog) = &cli.katea_run {
+        let code = katea_run(prog, MachineProfile::from_hardware_profile(&hardware))?;
+        std::process::exit(code);
     }
 
     let rom = match cli.bios.as_deref() {
@@ -789,6 +798,82 @@ fn run_boot_hdd(
     Ok(())
 }
 
+/// The fixed 8.3 name the target program is overlaid as on the Katea C: drive.
+/// DOS dispatches .COM vs .EXE by the MZ signature, but a faithful extension is
+/// kept (uppercased, truncated to 3 chars; defaults to COM when there is none).
+fn katea_run_prog_name(prog: &std::path::Path) -> String {
+    let ext = prog
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_uppercase())
+        .filter(|e| !e.is_empty())
+        .unwrap_or_else(|| "COM".to_string());
+    let ext: String = ext.chars().take(3).collect();
+    format!("PROG.{ext}")
+}
+
+/// A temp directory that removes itself (and any contents) when dropped — on
+/// success, an early `?` return, or a panic.
+struct TempDir(std::path::PathBuf);
+
+impl TempDir {
+    fn new(path: std::path::PathBuf) -> std::io::Result<Self> {
+        std::fs::create_dir_all(&path)?;
+        Ok(Self(path))
+    }
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Boot real FreeDOS from an empty temp dir (the target + RUNNER.COM + a runner
+/// AUTOEXEC overlaid InMemory) via Katea, run the target through RUNNER.COM, and
+/// return its DOS exit code. The screen text is printed for diagnostics.
+fn katea_run(prog: &std::path::Path, profile: MachineProfile) -> Result<i32, Box<dyn Error>> {
+    let bytes = std::fs::read(prog)?;
+    let name = katea_run_prog_name(prog);
+    let autoexec = format!("@echo off\r\nRUNNER {name}\r\n").into_bytes();
+    let overrides = vec![
+        ("AUTOEXEC.BAT".to_string(), autoexec),
+        (
+            "RUNNER.COM".to_string(),
+            izarravm_firmware::runner_com().to_vec(),
+        ),
+        (name, bytes),
+    ];
+
+    // A self-cleaning temp dir: removed on every path (success, the `?` errors
+    // below, or a panic), so a corpus run that hits errors can't accumulate dirs.
+    let dir = TempDir::new(std::env::temp_dir().join(format!(
+        "katea_run_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )))?;
+
+    let mut machine = Machine::new(profile, izarravm_firmware::izarra_bios())?;
+    machine.mount_hdd_folder_with(dir.path(), overrides)?;
+    let stop = machine.run_until_halt_or_cycles(500_000_000)?;
+    print!("{}", machine.screen_text().as_text());
+
+    let code = match stop {
+        StopReason::TestExit { code } | StopReason::DosExit { code } => i32::from(code),
+        other => {
+            eprintln!("katea-run: did not reach a program exit (stop={other:?})");
+            1
+        }
+    };
+    Ok(code)
+}
+
 /// Mount a host folder as C: through the Katea facade (real FreeDOS system files
 /// plus the folder's top-level files, read-only), run the BIOS so INT 19h boots
 /// it, and print the same diagnostics as `run_boot_hdd`. The lazy-facade analogue
@@ -1131,6 +1216,15 @@ mod tests {
         for (i, w) in want.iter().enumerate() {
             assert_eq!(codepage_index_for_layout(i as u8), *w);
         }
+    }
+
+    #[test]
+    fn katea_run_prog_name_picks_a_clean_8_3_name() {
+        use std::path::Path;
+        assert_eq!(katea_run_prog_name(Path::new("/x/FOO.EXE")), "PROG.EXE");
+        assert_eq!(katea_run_prog_name(Path::new("bar.com")), "PROG.COM");
+        assert_eq!(katea_run_prog_name(Path::new("noext")), "PROG.COM");
+        assert_eq!(katea_run_prog_name(Path::new("a.longext")), "PROG.LON");
     }
 }
 
@@ -1732,5 +1826,33 @@ del PREEXIST.TXT\r\n";
             "OLDDIR still present after dir rename"
         );
         assert!(preexist_gone, "pre-existing PREEXIST.TXT not deleted");
+    }
+
+    /// The katea-run gate: a program that exits 42, run through real FreeDOS via
+    /// --katea-run, makes `katea_run` return 42 — proving boot -> AUTOEXEC -> RUNNER
+    /// -> EXEC -> AH=4Dh -> unit-tester exit -> TestExit, end to end.
+    #[test]
+    #[ignore = "boots a full FreeDOS image to run one program (slow); run with --ignored"]
+    fn katea_run_captures_a_program_exit_code() {
+        // Self-cleaning dir (drops at the end of the test body, after the assert),
+        // so a panic mid-test can't leak it — same guard the production katea_run uses.
+        let dir = TempDir::new(std::env::temp_dir().join(format!(
+            "katea_run_e2e_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )))
+        .unwrap();
+        let prog = dir.path().join("EXIT42.COM");
+        std::fs::write(&prog, izarravm_firmware::exit42_com()).unwrap();
+
+        let code =
+            katea_run(&prog, MachineProfile::gsw_386(16, VideoCard::Et4000Ax)).expect("katea_run");
+        assert_eq!(
+            code, 42,
+            "the program's DOS exit code must reach the host process"
+        );
     }
 }

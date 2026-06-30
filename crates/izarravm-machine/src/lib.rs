@@ -1370,6 +1370,18 @@ fn device_request_packet_len(command: u8) -> u8 {
     }
 }
 
+/// Merge `overrides` into a system-file list: replace an existing entry whose name
+/// matches case-insensitively, else append. Used to overlay a runner AUTOEXEC.BAT +
+/// extra tools onto the standard Katea payload.
+fn apply_overrides(base: &mut Vec<(String, Vec<u8>)>, overrides: Vec<(String, Vec<u8>)>) {
+    for (name, bytes) in overrides {
+        match base.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+            Some(slot) => slot.1 = bytes,
+            None => base.push((name, bytes)),
+        }
+    }
+}
+
 impl Machine {
     /// Shared field initialization for the public constructors. They differ only
     /// in the CPU entry state and the ROM image, so each hands those in and
@@ -1719,28 +1731,25 @@ impl Machine {
         let _ = self.memory.write_u8(0x475, 1); // BDA fixed-disk count
     }
 
-    /// Mount a host folder as the primary master (C:) through the Katea facade: the
-    /// real FreeDOS system files (KERNEL.SYS, COMMAND.COM, CONFIG.SYS, AUTOEXEC.BAT)
-    /// come from the committed bootable image, and the folder's full recursive
-    /// subdirectory tree is surfaced read-only beside them so the booted kernel can
-    /// navigate subfolders and read host files at any depth without holding the
-    /// folder in RAM. M1 is read-only; guest writes are no-ops.
-    ///
-    /// The system files are laid down first (InMemory) so the boot-critical system
-    /// area matches the proven-bootable layout; the host tree's FAT and directory
-    /// sectors are computed on demand and host-file data is read lazily, so RAM
-    /// scales with the entry count rather than the disk or file sizes. A host file
-    /// whose 8.3 name would collide with a system file folds to a `~n` suffix (the
-    /// system file's reserved name wins).
-    pub fn mount_hdd_folder(&mut self, dir: &std::path::Path) -> std::io::Result<()> {
+    /// Mount a host folder as C: through Katea with extra InMemory system files
+    /// overlaid on top of the standard payload. Each entry in `overrides` replaces
+    /// an existing payload file of the same name (case-insensitive, e.g. a custom
+    /// AUTOEXEC.BAT) or is appended (e.g. a runner tool). Overlaid files win 8.3
+    /// collisions and are never written to the host folder.
+    pub fn mount_hdd_folder_with(
+        &mut self,
+        dir: &std::path::Path,
+        overrides: Vec<(String, Vec<u8>)>,
+    ) -> std::io::Result<()> {
         // The system payload comes from the committed image; HELLO.TXT is the
         // static demo file, dropped here so the host folder supplies the user files.
         let payload = katea_volume::extract_system_payload(izarravm_firmware::tokados_hdd_img());
-        let system_files: Vec<(String, Vec<u8>)> = payload
+        let mut system_files: Vec<(String, Vec<u8>)> = payload
             .files
             .into_iter()
             .filter(|(name, _)| !name.eq_ignore_ascii_case("HELLO.TXT"))
             .collect();
+        apply_overrides(&mut system_files, overrides);
 
         // The recursive tree volume walks `dir` (metadata only) overlaying the
         // system files at the root, and serves FAT/dir sectors on demand + file
@@ -1752,6 +1761,13 @@ impl Machine {
         let _ = self.publish_fixed_disk_parameter_table();
         let _ = self.memory.write_u8(0x475, 1); // BDA fixed-disk count
         Ok(())
+    }
+
+    /// Mount a host folder as C: through Katea with the standard payload only.
+    /// See [`mount_hdd_folder_with`](Self::mount_hdd_folder_with) to overlay extra
+    /// system files (e.g. a custom AUTOEXEC.BAT or runner tool).
+    pub fn mount_hdd_folder(&mut self, dir: &std::path::Path) -> std::io::Result<()> {
+        self.mount_hdd_folder_with(dir, Vec::new())
     }
 
     /// Mount a synthesized FAT32 volume as drive C: for the DOS absolute-disk
@@ -19723,6 +19739,36 @@ mod tests {
     fn mount_hdd_seeds_the_bda_fixed_disk_count() {
         let m = machine_with_hdd(64);
         assert_eq!(m.memory.read_u8(0x475).unwrap(), 1, "one fixed disk");
+    }
+
+    #[test]
+    fn apply_overrides_replaces_by_name_and_appends_new() {
+        let mut base = vec![
+            ("AUTOEXEC.BAT".to_string(), b"old".to_vec()),
+            ("KERNEL.SYS".to_string(), b"k".to_vec()),
+        ];
+        apply_overrides(
+            &mut base,
+            vec![
+                ("autoexec.bat".to_string(), b"new".to_vec()), // case-insensitive replace
+                ("RUNNER.COM".to_string(), b"r".to_vec()),     // append
+            ],
+        );
+        let autoexec = base
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("autoexec.bat"))
+            .unwrap();
+        assert_eq!(autoexec.1, b"new");
+        // A replace updates bytes in place but keeps the original key's case
+        // (KateaTreeVolume folds names case-insensitively, so the stored case is
+        // cosmetic — pinned here so the intent is explicit).
+        assert_eq!(
+            autoexec.0, "AUTOEXEC.BAT",
+            "original key case preserved on replace"
+        );
+        assert!(base.iter().any(|(n, b)| n == "KERNEL.SYS" && b == b"k"));
+        assert!(base.iter().any(|(n, b)| n == "RUNNER.COM" && b == b"r"));
+        assert_eq!(base.len(), 3, "one replace + one append");
     }
 
     #[test]
