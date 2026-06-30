@@ -34,6 +34,21 @@ fn volume_gain(volume: f32) -> f32 {
 /// the clock_hz/20 budget cap (50 ms of guest time).
 const EMU_SLICE: Duration = Duration::from_millis(1);
 
+/// Ceiling on how often accumulated mouse motion is flushed into the guest,
+/// independent of (and generally faster than) the video refresh rate that
+/// paces rendering. A real PS/2 mouse samples at well under this; it just
+/// keeps a violent host flick's motion arriving in small, frequent packets
+/// rather than one huge coalesced delta that the guest can only convey as a
+/// long train of catch-up packets (see `Machine::inject_mouse_relative`).
+///
+/// Must stay below the keyboard controller's own drain rate or the aux queue
+/// grows without bound under sustained motion even though no single flush is
+/// ever large: `AUX_BYTE_SETTLE_US` (keyboard.rs) paces aux bytes out of the
+/// 8042 at 1/ms, and a TOKAMOUS-driven IntelliMouse packet is 4 bytes, so the
+/// guest can never drain faster than 250 packets/s. 100 Hz leaves over 2x
+/// headroom under that ceiling.
+const MOUSE_FLUSH_HZ: f64 = 100.0;
+
 /// How long a drive-access LED stays lit after the last access, so a burst of
 /// fast reads reads as a steady glow rather than an imperceptible flicker.
 const LED_GLOW: Duration = Duration::from_millis(150);
@@ -2519,6 +2534,9 @@ struct WinitApp {
     // When the next frame is due. about_to_wait paces redraws to the guest
     // refresh rate with ControlFlow::WaitUntil rather than spinning at host vsync.
     next_frame: Instant,
+    // When the next mouse-motion flush is due, paced independently of next_frame
+    // at MOUSE_FLUSH_HZ (see its doc comment).
+    next_mouse_flush: Instant,
     // Raw mouse motion the Windows WM_INPUT hook accumulates between frames; drained
     // each frame in about_to_wait. Always zero on platforms without the hook.
     raw_mouse: RawMouseAccum,
@@ -2838,25 +2856,33 @@ impl ApplicationHandler for WinitApp {
                 self.gui.toggle_capture(window, &mut self.host_kbd);
             }
         }
+        // Apply the raw mouse motion the Windows WM_INPUT hook accumulated since
+        // the last pass (zero elsewhere, where DeviceEvent::MouseMotion drives
+        // capture directly) every time, regardless of which deadline below is
+        // due, so it is never left stranded in raw_mouse between flushes.
+        let now = Instant::now();
+        let (rdx, rdy) = self.raw_mouse.take();
+        if self.gui.input_captured && (rdx != 0 || rdy != 0) {
+            self.gui.accumulate_guest_motion(rdx as f32, rdy as f32);
+        }
+        // Flush mouse motion on its own, faster cadence (MOUSE_FLUSH_HZ),
+        // independent of rendering: see that constant's doc comment.
+        if now >= self.next_mouse_flush {
+            self.gui.flush_guest_motion();
+            self.next_mouse_flush = now + Duration::from_secs_f64(1.0 / MOUSE_FLUSH_HZ);
+        }
         // Pace rendering to the guest refresh rate. Render directly here once the
         // deadline elapses rather than via request_redraw: winit dispatches
         // about_to_wait from its own loop, so it keeps firing under a mouse-event
         // flood that would starve the WM_PAINT request_redraw posts on Windows.
-        let now = Instant::now();
         if now >= self.next_frame {
-            // Apply the raw mouse motion the Windows WM_INPUT hook accumulated since
-            // the last frame (zero elsewhere, where DeviceEvent::MouseMotion drives
-            // capture directly), then flush it as one coalesced guest packet.
-            let (rdx, rdy) = self.raw_mouse.take();
-            if self.gui.input_captured && (rdx != 0 || rdy != 0) {
-                self.gui.accumulate_guest_motion(rdx as f32, rdy as f32);
-            }
-            self.gui.flush_guest_motion();
             self.render(event_loop);
             let hz = self.gui.guest_refresh_hz().max(1.0);
             self.next_frame = now + Duration::from_secs_f64(1.0 / hz);
         }
-        event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(self.next_frame));
+        event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+            self.next_frame.min(self.next_mouse_flush),
+        ));
     }
 }
 
@@ -3008,6 +3034,7 @@ pub fn run(
         egui_winit: None,
         egui_renderer: None,
         next_frame: Instant::now(),
+        next_mouse_flush: Instant::now(),
         raw_mouse,
     };
     event_loop.run_app(&mut app)?;

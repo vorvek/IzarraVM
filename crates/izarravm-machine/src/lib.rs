@@ -2416,23 +2416,20 @@ impl Machine {
         self.inject_mouse_relative(dx, dy, buttons);
     }
 
-    /// Inject a relative mouse motion (the host's per-frame coalesced delta) as one
-    /// or more PS/2 packets. A fast flick can exceed a single packet's 9-bit range,
-    /// so split it into packet-sized chunks instead of clamping, so the full motion
-    /// reaches the guest. Always injects once so a button-only edge (zero motion)
-    /// still fires. The guest driver owns the cursor position, range, and the
-    /// mickey-to-pixel ratio; the host forwards raw relative counts.
-    pub fn inject_mouse_relative(&mut self, mut dx: i32, mut dy: i32, buttons: u8) {
-        loop {
-            let sx = dx.clamp(-255, 255);
-            let sy = dy.clamp(-255, 255);
-            self.inject_mouse(sx, sy, buttons);
-            dx -= sx;
-            dy -= sy;
-            if dx == 0 && dy == 0 {
-                break;
-            }
-        }
+    /// Inject a relative mouse motion (the host's per-flush coalesced delta) as one
+    /// PS/2 packet. A real PS/2 mouse only ever conveys one packet's worth of motion
+    /// (the 9-bit signed range, +-255) however far it physically travelled between
+    /// samples; it does not retroactively split an extreme delta into a train of
+    /// catch-up packets, so a clamp here matches real hardware (and a low-resolution
+    /// DOS game's cursor has no use for more precision than that anyway). Splitting
+    /// instead of clamping was tried first and made a violent host flick queue
+    /// dozens of packets at once -- far more than any real mouse could transmit --
+    /// which starved the guest's other interrupts (timer, keyboard) for long enough
+    /// to look like a freeze while it drained the backlog.
+    pub fn inject_mouse_relative(&mut self, dx: i32, dy: i32, buttons: u8) {
+        let sx = dx.clamp(-255, 255);
+        let sy = dy.clamp(-255, 255);
+        self.inject_mouse(sx, sy, buttons);
     }
 
     /// Seed the absolute-pointer origin without injecting motion, called when the
@@ -10957,6 +10954,12 @@ impl Machine {
             )
         });
         self.speaker.accumulate(seconds, ch2_before, transitions);
+
+        // Decay the keyboard-to-aux settle window (see KEYBOARD_TO_AUX_SETTLE_US
+        // in keyboard.rs) so a mouse byte held back by a just-read keyboard
+        // scancode releases once real PS/2 wire time has actually elapsed.
+        self.keyboard
+            .advance_mouse_pacing(clocks as f64 * self.timing.micros_per_clock);
 
         if self.keyboard.take_irq() {
             self.pic.request(1); // IRQ1: keyboard output buffer has a scancode
@@ -21335,6 +21338,11 @@ mod tests {
             bus.write_io(0x60, BusWidth::Byte, 0xF4).unwrap(); // enable data reporting
             assert_eq!(bus.read_io(0x60, BusWidth::Byte).unwrap(), 0xFA); // mouse ACK
         }
+        // The ACK read armed the keyboard controller's aux settle window (see
+        // AUX_BYTE_SETTLE_US in keyboard.rs); advance past it -- comfortably
+        // more than 1ms regardless of the active GSW clock rate -- so the
+        // movement packet below latches without an unrelated pacing delay.
+        machine.advance_devices_clocks(1_000_000);
         // Move right 4, down 2, left button down.
         machine.inject_mouse(4, 2, 0x01);
         assert!(machine.irq12_pending(), "movement requests IRQ12");
@@ -21345,7 +21353,9 @@ mod tests {
         assert_eq!(b0 & 0x01, 0x01, "left button");
         assert_eq!(b0 & 0x10, 0x00, "X positive");
         assert_eq!(b0 & 0x20, 0x20, "Y sign set (screen-down move)");
+        machine.advance_devices_clocks(1_000_000); // pace the next aux byte
         assert_eq!(machine.read_io_port_u8(0x60), 4, "dx byte");
+        machine.advance_devices_clocks(1_000_000); // pace the next aux byte
         assert_eq!(machine.read_io_port_u8(0x60) as i8 as i32, -2, "dy byte");
     }
 
@@ -21368,6 +21378,18 @@ mod tests {
             let new_ccb = ccb | 0x01 | 0x02;
             bus.write_io(0x64, BusWidth::Byte, 0x60).unwrap();
             bus.write_io(0x60, BusWidth::Byte, new_ccb as u32).unwrap();
+        }
+        // Drain the IRQ1 edge the CCB read above itself arms in
+        // respond_immediately (a pre-existing quirk unrelated to AUX enable:
+        // it fires for any controller-command response while command-byte
+        // bit0 is set, which it is by default), then acknowledge it the way
+        // the CPU eventually would so it doesn't linger as a pending PIC
+        // request. This keeps the assertion below honestly testing whether
+        // the AUX-enable sequence, not this earlier CCB read, arms IRQ1.
+        machine.advance_devices_clocks(1_000_000);
+        machine.pic.acknowledge();
+        {
+            let mut bus = machine.make_bus();
             // Enable AUX data reporting: 0xD4 routes 0xF4 to the mouse.
             bus.write_io(0x64, BusWidth::Byte, 0xD4).unwrap();
             bus.write_io(0x60, BusWidth::Byte, 0xF4).unwrap();
@@ -21381,7 +21403,12 @@ mod tests {
                 "mouse ACK"
             );
         }
-        // The enable handshake must not have armed IRQ1 or queued a keyboard byte.
+        // The AUX-enable sequence itself must not arm IRQ1. The ACK read also
+        // armed the keyboard controller's aux settle window (see
+        // AUX_BYTE_SETTLE_US in keyboard.rs); advance past it too, 1,000,000
+        // clocks being far more than 1ms regardless of the active GSW clock
+        // rate.
+        machine.advance_devices_clocks(1_000_000);
         assert!(
             !machine.irq1_pending(),
             "AUX enable must not arm the keyboard interrupt"
@@ -21403,7 +21430,9 @@ mod tests {
         let b0 = machine.read_io_port_u8(0x60);
         assert_eq!(b0 & 0x08, 0x08, "sync bit");
         assert_eq!(b0 & 0x01, 0x01, "left button");
+        machine.advance_devices_clocks(1_000_000); // pace the next aux byte
         assert_eq!(machine.read_io_port_u8(0x60), 6, "dx byte");
+        machine.advance_devices_clocks(1_000_000); // pace the next aux byte
         assert_eq!(
             machine.read_io_port_u8(0x60),
             3,

@@ -11,11 +11,32 @@ const STATUS_OBF: u8 = 0x01; // output buffer full (data waiting on 0x60)
 const STATUS_SYS: u8 = 0x04; // system flag, set after a passed self-test
 const STATUS_AUX: u8 = 0x20; // the byte in the output buffer came from the mouse
 
+// How long, in emulated microseconds, reading ANY real device byte (a
+// keyboard scancode or an aux/mouse byte) off 0x60 holds back the next aux
+// byte from latching. Real PS/2 hardware serializes each device byte onto
+// its own wire at roughly 1ms/byte (~10kHz device clock), so a byte that
+// finished arriving microseconds ago genuinely could not be followed by
+// another one that fast. Two distinct races this guards:
+//   - A guest that reads 0x60 twice in a row (Prince of Persia's INT 09h
+//     handler reads 0x60 itself, then chains to the BIOS's INT 09h handler,
+//     which reads 0x60 again expecting the same stale scancode -- see
+//     `reread_returns_stale_byte_until_next_arrives`) must not have a
+//     freshly queued mouse byte race into that second read, corrupting BIOS
+//     shift-state handling.
+//   - A host mouse "flick" can queue many PS/2 packets at once (no real
+//     mouse could ever transmit that fast); without pacing, the mouse
+//     driver's IRQ12 handler gets slammed with a burst of back-to-back
+//     interrupts far outside anything real hardware produces.
+// Excludes controller-command echoes (self-test, CCB read, etc.): those are
+// an immediate digital handshake, not a serialized device transmission.
+const AUX_BYTE_SETTLE_US: f64 = 1000.0;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Keyboard8042 {
-    queue: VecDeque<u8>, // host-injected scancodes waiting to be latched
-    output: Option<u8>,  // the byte currently readable on 0x60
-    output_is_aux: bool, // the latched byte came from the mouse (status bit 5)
+    queue: VecDeque<u8>,         // host-injected scancodes waiting to be latched
+    output: Option<u8>,          // the byte currently readable on 0x60
+    output_is_aux: bool,         // the latched byte came from the mouse (status bit 5)
+    output_is_device_byte: bool, // the latched byte is a real scancode or aux byte
     status: u8,
     command_byte: u8,                   // 8042 command byte (bit 0 = IRQ1 enable)
     expecting_command_data: Option<u8>, // a 0x64 command awaiting its 0x60 data
@@ -26,6 +47,7 @@ pub struct Keyboard8042 {
     scan_set: u8,                       // active scancode set (0xF0 select; default 2)
     last_byte: u8,                      // last scancode latched, for 0xFE resend
     mouse: Ps2Mouse,
+    aux_settle_us: f64, // microseconds left before the next aux byte may latch
 }
 
 impl Default for Keyboard8042 {
@@ -34,6 +56,7 @@ impl Default for Keyboard8042 {
             queue: VecDeque::new(),
             output: None,
             output_is_aux: false,
+            output_is_device_byte: false,
             status: STATUS_SYS,
             command_byte: 0x01, // IRQ1 enabled, translation on (as a PC BIOS leaves it)
             expecting_command_data: None,
@@ -44,6 +67,7 @@ impl Default for Keyboard8042 {
             scan_set: 2, // PS/2 keyboards power up in set 2
             last_byte: 0,
             mouse: Ps2Mouse::default(),
+            aux_settle_us: 0.0,
         }
     }
 }
@@ -176,6 +200,7 @@ impl Keyboard8042 {
         }
         self.output = Some(response);
         self.output_is_aux = false;
+        self.output_is_device_byte = false; // a controller echo, not a real device byte
         self.status |= STATUS_OBF;
         self.status &= !STATUS_AUX;
         if self.command_byte & 0x01 != 0 {
@@ -202,22 +227,35 @@ impl Keyboard8042 {
             let code = self.queue.pop_front().unwrap();
             self.output = Some(code);
             self.output_is_aux = false;
+            self.output_is_device_byte = true;
             self.last_byte = code; // remember for a 0xFE resend
             self.status |= STATUS_OBF;
             self.status &= !STATUS_AUX;
             if self.command_byte & 0x01 != 0 {
                 self.irq_armed = true;
             }
-        } else if !aux_disabled {
+        } else if !aux_disabled && self.aux_settle_us <= 0.0 {
             if let Some(code) = self.mouse.queue.pop_front() {
                 self.output = Some(code);
                 self.output_is_aux = true;
+                self.output_is_device_byte = true;
                 self.status |= STATUS_OBF | STATUS_AUX;
                 // Command byte bit 1 enables the mouse interrupt (IRQ12).
                 if self.command_byte & 0x02 != 0 {
                     self.irq12_armed = true;
                 }
             }
+        }
+    }
+
+    /// Decay the aux settle window (see `AUX_BYTE_SETTLE_US`) by `micros` of
+    /// emulated time, releasing a held-back aux byte once it elapses. Called
+    /// once per device-clocking tick from `Machine::advance_devices`, which
+    /// has the real elapsed time.
+    pub(crate) fn advance_mouse_pacing(&mut self, micros: f64) {
+        if self.aux_settle_us > 0.0 {
+            self.aux_settle_us = (self.aux_settle_us - micros).max(0.0);
+            self.latch_next(); // a byte held back by the settle window may now latch
         }
     }
 
@@ -264,8 +302,20 @@ impl Keyboard8042 {
                 // of Persia does exactly that and reads its shift state from the
                 // BDA flag the BIOS sets from that second read.
                 let value = self.output.unwrap_or(0x00);
+                if self.status & STATUS_OBF != 0 && self.output_is_device_byte {
+                    // A real device byte (keyboard or aux) was just consumed:
+                    // hold off latching the next aux byte for a short settle
+                    // window. This guards two races: a chained re-read (see
+                    // the comment above) seeing this same stale value rather
+                    // than a freshly arrived aux byte, and a flooded aux
+                    // queue (a host mouse "flick" can queue many packets at
+                    // once) delivering its bytes to the guest faster than any
+                    // real PS/2 mouse could transmit them.
+                    self.aux_settle_us = AUX_BYTE_SETTLE_US;
+                }
                 self.status &= !(STATUS_OBF | STATUS_AUX);
                 self.output_is_aux = false;
+                self.output_is_device_byte = false;
                 self.latch_next(); // latch the next queued byte now that OBF is clear
                 Some(value)
             }
@@ -413,6 +463,11 @@ mod tests {
         kbd.write_port(0x64, 0xD4); // next 0x60 byte goes to the mouse
         kbd.write_port(0x60, 0xF4); // enable data reporting
         assert_eq!(kbd.read_port(0x60), Some(0xFA), "mouse acks enable");
+        // The ACK read armed the aux settle window (see AUX_BYTE_SETTLE_US);
+        // clear it so callers can inject and immediately read a movement
+        // packet, matching a real driver that doesn't move the mouse in the
+        // same instant the enable handshake completes.
+        kbd.advance_mouse_pacing(AUX_BYTE_SETTLE_US);
     }
 
     #[test]
@@ -420,6 +475,72 @@ mod tests {
         let mut kbd = Keyboard8042::default();
         enable_mouse(&mut kbd);
         assert!(kbd.mouse.reporting, "0xF4 enabled data reporting");
+    }
+
+    #[test]
+    fn keyboard_reread_is_not_hijacked_by_a_pending_mouse_byte() {
+        // Regression for the Prince of Persia screen-corruption/freeze bug.
+        // PoP's own INT 09h handler reads 0x60, then chains to the BIOS's
+        // INT 09h handler, which reads 0x60 again expecting the same stale
+        // scancode back (see reread_returns_stale_byte_until_next_arrives).
+        // If a mouse packet happens to be queued behind it at that exact
+        // moment (e.g. mid-flick), the second read must not see a freshly
+        // latched mouse byte instead -- that corrupts the BIOS's
+        // shift-state handling and desyncs the mouse driver's own packet
+        // framing.
+        let mut kbd = Keyboard8042::default();
+        enable_mouse(&mut kbd);
+        kbd.take_irq12(); // drain the IRQ12 edge the ACK byte itself armed
+        kbd.push_scancodes(&[0x1e]); // 'A' make: latches immediately
+        // A mouse packet queues up behind the held keyboard byte. It cannot
+        // latch yet -- the output register is occupied -- so no IRQ12 arms.
+        assert!(
+            !kbd.inject_mouse(5, -3, 0x01),
+            "the mouse byte is queued but not yet latched"
+        );
+
+        // PoP's own ISR consumes the keyboard byte...
+        assert_eq!(kbd.read_port(0x60), Some(0x1e));
+        assert_eq!(
+            kbd.read_port(0x64).unwrap() & STATUS_AUX,
+            0,
+            "the byte just consumed was the keyboard's"
+        );
+        // ...then the chained BIOS handler re-reads 0x60, expecting the
+        // same stale scancode -- not the mouse byte waiting right behind it.
+        assert_eq!(
+            kbd.read_port(0x60),
+            Some(0x1e),
+            "a pending mouse byte must not hijack the chained re-read"
+        );
+        assert_eq!(
+            kbd.read_port(0x64).unwrap() & STATUS_AUX,
+            0,
+            "the re-read is still flagged as a keyboard byte, not AUX"
+        );
+        assert!(
+            !kbd.take_irq12(),
+            "no mouse interrupt has fired yet -- its byte is still held back"
+        );
+
+        // Once the settle window elapses, the untouched mouse byte latches
+        // normally and the mouse driver's packet framing is never disturbed.
+        kbd.advance_mouse_pacing(2000.0); // comfortably past the settle window
+        let status = kbd.read_port(0x64).unwrap();
+        assert_eq!(
+            status & STATUS_OBF,
+            STATUS_OBF,
+            "the mouse byte now latches"
+        );
+        assert_eq!(
+            status & STATUS_AUX,
+            STATUS_AUX,
+            "and is correctly flagged AUX"
+        );
+        assert!(
+            kbd.take_irq12(),
+            "IRQ12 arms once the byte actually latches"
+        );
     }
 
     #[test]
@@ -440,8 +561,12 @@ mod tests {
         assert_eq!(b0 & 0x01, 0x01, "left button");
         assert_eq!(b0 & 0x10, 0x00, "X positive, no sign");
         assert_eq!(b0 & 0x20, 0x00, "Y positive (up), no sign");
+        // Each byte is paced ~1ms apart (AUX_BYTE_SETTLE_US), matching real
+        // PS/2 serial transmission; advance past it between reads.
+        kbd.advance_mouse_pacing(AUX_BYTE_SETTLE_US);
         let bx = kbd.read_port(0x60).unwrap();
         assert_eq!(bx, 5, "dx byte");
+        kbd.advance_mouse_pacing(AUX_BYTE_SETTLE_US);
         let by = kbd.read_port(0x60).unwrap();
         assert_eq!(by, 3, "dy byte (negated screen delta)");
     }
@@ -507,8 +632,10 @@ mod tests {
         let b0 = kbd.read_port(0x60).unwrap();
         assert_eq!(b0 & 0x10, 0x10, "X sign set for leftward move");
         assert_eq!(b0 & 0x20, 0x20, "Y sign set for downward move");
+        kbd.advance_mouse_pacing(AUX_BYTE_SETTLE_US);
         let bx = kbd.read_port(0x60).unwrap();
         assert_eq!(bx as i8 as i32, -4, "dx is -4 two's complement");
+        kbd.advance_mouse_pacing(AUX_BYTE_SETTLE_US);
         let by = kbd.read_port(0x60).unwrap();
         assert_eq!(by as i8 as i32, -7, "dy is -7 (down)");
     }
