@@ -6437,6 +6437,8 @@ impl Cpu386 {
     }
 
     fn set_flag(&mut self, flag: u32, enabled: bool) {
+        // Settle any deferred arithmetic flags first so this eager write composes on live eflags.
+        self.materialize_flags();
         if enabled {
             self.registers.eflags |= flag;
         } else {
@@ -22456,6 +22458,20 @@ mod tests {
                 fused.fpu.tag,
             );
         }
+    }
+
+    #[test]
+    fn eager_flag_write_after_pending_is_correct() {
+        // A pending ADD sets CF; a later CLC (eager, via set_flag) must clear CF while leaving the
+        // pending-derived ZF intact, i.e. set_flag must settle the pending first.
+        let mut cpu = Cpu386::default();
+        let r = cpu.alu_add_eager(0xff, 0x01, 0, BusWidth::Byte); // CF=1, ZF=1 (result 0x00)
+        let mut lazy = Cpu386::default();
+        lazy.pending_flags = Some(LazyFlags { a: 0xff, b: 0x01, result: r, width: BusWidth::Byte, is_sub: false });
+        lazy.set_flag(FLAG_CF, false); // CLC-like eager write
+        assert!(!lazy.flag(FLAG_CF), "CF must be cleared by the eager write");
+        assert!(lazy.flag(FLAG_ZF), "ZF from the settled pending must survive");
+        assert!(lazy.pending_flags.is_none(), "set_flag must have settled the pending");
     }
 
     #[test]
