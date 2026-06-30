@@ -1422,6 +1422,16 @@ fn payload_file(payload: &katea_volume::SystemPayload, name: &str) -> Vec<u8> {
         .unwrap_or_else(|| panic!("katea: {name} missing from the committed image payload"))
 }
 
+/// The default `(CONFIG.SYS, AUTOEXEC.BAT)` bytes from the committed image payload
+/// — used by Repair, which has no `payload` already in scope.
+fn default_config_pair() -> (Vec<u8>, Vec<u8>) {
+    let payload = katea_volume::extract_system_payload(izarravm_firmware::tokados_hdd_img());
+    (
+        payload_file(&payload, "CONFIG.SYS"),
+        payload_file(&payload, "AUTOEXEC.BAT"),
+    )
+}
+
 /// Merge `overrides` into a system-file list: replace an existing entry whose name
 /// matches case-insensitively, else append. Used to overlay a runner AUTOEXEC.BAT +
 /// extra tools onto the standard Katea payload.
@@ -9415,27 +9425,44 @@ impl Machine {
         self.toka_c_root = Some(root);
     }
 
-    /// Perform a Toka-DOS service requested through Lotura port 0xE3, recording
-    /// the status the BIOS reads back. Called from the run loop after the cycle
-    /// that issued the OUT, since the work needs host filesystem and memory.
+    /// Perform a Toka-DOS service requested through Lotura port 0xE3, recording the
+    /// status the BIOS reads back. Cmd 0x01 (Repair Toka-DOS) resets the Katea host
+    /// folder's CONFIG.SYS/AUTOEXEC.BAT; 0x10 is the legacy HLE C: boot shim (only
+    /// reached when no ATA disk is present, removed with the HLE in SP-3).
     fn perform_toka_service(&mut self, command: u8) {
         self.toka_service_status = match command {
-            0x01 => self.toka_install_files(izarravm_dos::InstallMode::Repair),
-            0x02 => self.toka_install_files(izarravm_dos::InstallMode::Format),
+            0x01 => self.katea_repair(),
             0x10 => self.toka_load_boot_record(),
             _ => 0xff,
         };
     }
 
-    fn toka_install_files(&mut self, mode: izarravm_dos::InstallMode) -> u8 {
-        let Some(root) = self.toka_c_root.clone() else {
-            return 1; // no C: root known
+    /// Repair Toka-DOS: back the user's CONFIG.SYS/AUTOEXEC.BAT up to .OLD, write
+    /// fresh defaults from the committed payload, and re-mount so the boot uses
+    /// them. Returns the BIOS status (0 ok, 1 no Katea folder, 0xfe write/mount error).
+    fn katea_repair(&mut self) -> u8 {
+        let Some(root) = self.katea_root.clone() else {
+            return 1; // no Katea host folder mounted
         };
-        let files = izarravm_firmware::toka_dos_system_files();
-        match izarravm_dos::toka_dos_install(&root, &files, mode) {
-            Ok(()) => 0,
-            Err(_) => 0xfe,
+        let (config, autoexec) = default_config_pair();
+        for (live_name, old_name, bytes) in [
+            ("CONFIG.SYS", "CONFIG.OLD", &config),
+            ("AUTOEXEC.BAT", "AUTOEXEC.OLD", &autoexec),
+        ] {
+            let live = root.join(live_name);
+            if live.exists() {
+                // Best-effort backup (std::fs::rename replaces an existing .OLD on Windows).
+                let _ = std::fs::rename(&live, root.join(old_name));
+            }
+            if std::fs::write(&live, bytes).is_err() {
+                return 0xfe;
+            }
         }
+        // Rebuild the volume from the repaired folder so the subsequent boot reads it.
+        if self.mount_hdd_folder(&root).is_err() {
+            return 0xfe;
+        }
+        0
     }
 
     /// Place the Toka-DOS boot record (TOKABOOT) at 0x7C00 and set up the DOS
@@ -28885,7 +28912,7 @@ mod tests {
     }
 
     #[test]
-    fn toka_service_port_formats_drive_and_loads_boot_record() {
+    fn toka_service_port_loads_boot_record() {
         let dir = tempfile::tempdir().unwrap();
         let mut machine = test_machine();
         machine.set_toka_c_root(dir.path().to_path_buf());
@@ -28897,17 +28924,15 @@ mod tests {
         });
         assert_eq!(machine.pending_toka_service, Some(0x02));
 
-        // Format installs the Toka-DOS system files onto C:.
+        // Unknown command (Format was removed — Katea makes OS binaries un-corruptible).
         machine.perform_toka_service(0x02);
-        assert_eq!(machine.toka_service_status, 0);
-        assert!(dir.path().join("DOS").join("IZCMD.COM").exists());
-        assert!(!dir.path().join("IZCMD.COM").exists());
-        let status = with_bus(&mut machine, |bus| {
-            bus.read_io(0x00e3, BusWidth::Byte).unwrap() as u8
-        });
-        assert_eq!(status, 0);
+        assert_eq!(machine.toka_service_status, 0xff);
 
         // LoadBootRecord places TOKABOOT at 0x7C00 and wires the DOS return path.
+        // Pre-populate the expected HLE C: structure so LoadBootRecord succeeds.
+        let dos_dir = dir.path().join("DOS");
+        std::fs::create_dir_all(&dos_dir).unwrap();
+        std::fs::write(dos_dir.join("IZCMD.COM"), b"\x90").unwrap();
         machine.perform_toka_service(0x10);
         assert_eq!(machine.toka_service_status, 0);
         let boot = izarravm_firmware::toka_boot_record().unwrap();
@@ -28925,6 +28950,38 @@ mod tests {
             machine.read_physical_u8(BIOS_IRET_STUB_ADDRESS as u32),
             0xcf
         );
+    }
+
+    #[test]
+    fn repair_backs_up_and_rewrites_config() {
+        let dir = std::env::temp_dir().join(format!("katea_repair_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A user who broke their config.
+        std::fs::write(dir.join("CONFIG.SYS"), b"GARBAGE\r\n").unwrap();
+        std::fs::write(dir.join("AUTOEXEC.BAT"), b"BROKEN\r\n").unwrap();
+
+        let mut m = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .unwrap();
+        m.mount_hdd_folder(&dir).unwrap(); // sets katea_root
+        m.perform_toka_service(0x01); // Repair Toka-DOS
+
+        assert_eq!(
+            std::fs::read(dir.join("CONFIG.OLD")).unwrap(),
+            b"GARBAGE\r\n"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("AUTOEXEC.OLD")).unwrap(),
+            b"BROKEN\r\n"
+        );
+        let autoexec = std::fs::read(dir.join("AUTOEXEC.BAT")).unwrap();
+        assert!(
+            String::from_utf8_lossy(&autoexec).contains("SET BLASTER=A220 I5 D1 H5 T6"),
+            "Repair rewrote the default AUTOEXEC"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Publish the DOS device chain through an AH=52h query and report whether a
