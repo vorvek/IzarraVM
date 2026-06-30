@@ -1834,21 +1834,22 @@ del PREEXIST.TXT\r\n";
     #[test]
     #[ignore = "boots a full FreeDOS image to run one program (slow); run with --ignored"]
     fn katea_run_captures_a_program_exit_code() {
-        let dir = std::env::temp_dir().join(format!(
+        // Self-cleaning dir (drops at the end of the test body, after the assert),
+        // so a panic mid-test can't leak it — same guard the production katea_run uses.
+        let dir = TempDir::new(std::env::temp_dir().join(format!(
             "katea_run_e2e_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let prog = dir.join("EXIT42.COM");
+        )))
+        .unwrap();
+        let prog = dir.path().join("EXIT42.COM");
         std::fs::write(&prog, izarravm_firmware::exit42_com()).unwrap();
 
         let code =
             katea_run(&prog, MachineProfile::gsw_386(16, VideoCard::Et4000Ax)).expect("katea_run");
-        std::fs::remove_dir_all(&dir).ok();
         assert_eq!(
             code, 42,
             "the program's DOS exit code must reach the host process"
