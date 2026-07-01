@@ -24683,7 +24683,7 @@ mod tests {
         // Guest: STI (fb) ; OUT 0x80,AL (e6 80) ; INT 0x21 (cd 21) ; HLT (f4).
         let guest = [0xfb, 0xe6, 0x80, 0xcd, 0x21, 0xf4];
         let monitor = [0xf4]; // unused: we emulate the monitor from Rust below.
-        let bitmap = vec![0u8; 0x20 + 1]; // all permitted
+        let bitmap = vec![0u8; 0x20 + 1]; // all-zero: ports 0..0x100 permitted (+ terminator byte)
         let (mut cpu, mut bus) = v86_world(&monitor, &guest, &bitmap);
         enter_v86_direct(&mut cpu, 0, 0x1000);
 
@@ -24694,11 +24694,21 @@ mod tests {
             if !cpu.is_v86_mode() && cpu.registers.cs().selector == R0_CS {
                 // In the monitor because the guest faulted. Read the V86 #GP(13) frame,
                 // advance the guest EIP past the faulting instruction, IRET back to V86.
+                // Both STI and INT 0x21 arrive here as #GP(13): each is IOPL-sensitive and
+                // faults because the V86 task runs at IOPL 0 < 3 (check_v86_iopl). INT 0x21
+                // does NOT dispatch through its own IDT gate — it is intercepted before
+                // delivery, so every trap in this test is vector 13.
                 traps += 1;
                 // Discard the error code (vector 13 pushes one) so IRET pops from EIP.
+                // Frame layout from the handler's ESP upward is [err], EIP, CS, ... (see the
+                // sibling deliver_exception test); after skipping the 4-byte error code the
+                // V86 EIP is at the top of stack, so cpu_mem(&bus, esp) reads it directly.
                 let esp = cpu.registers.esp() + 4;
                 cpu.registers.set_esp(esp);
                 let guest_eip = u32::from_le_bytes(cpu_mem(&bus, esp));
+                // The guest is loaded at phys 0xA000 == V86 CS(0x0A00) << 4, so guest_eip
+                // (a segment offset) indexes the guest code bytes directly. This literal
+                // tracks v86_world's guest load base and enter_v86_direct's V86 CS.
                 let opcode = bus.memory[(0xA000 + guest_eip) as usize];
                 let len = match opcode {
                     0xfb => 1, // STI
