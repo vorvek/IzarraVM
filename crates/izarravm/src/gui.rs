@@ -922,17 +922,18 @@ fn emulate(
             // framebuffer is presented instead.
             if matches!(stop, Some(StopReason::Halted)) {
                 machine.advance_devices_clocks(budget);
-            } else if machine.active_mode().timing_class() == TimingClass::Approximate {
-                // Approximate class (486/586): if the CPU could not run the full
-                // wall-clock budget (host too slow this slice), advance the devices and
-                // the audio-pump clock by the shortfall so music/timers hold realtime
-                // instead of underrunning. Exclude the intentional device stall. The
-                // Accurate class (286/386) keeps exact guest-clock-coupled pacing.
-                let productive = ran.saturating_sub(stalled);
-                let shortfall = budget.saturating_sub(productive);
-                if shortfall > 0 {
-                    machine.pace_devices_to_wall(shortfall);
-                }
+            } else if machine.active_mode().timing_class() == TimingClass::Approximate
+                && stalled > 0
+            {
+                // Approximate class (486/586): a device I/O stall (floppy/CD seek)
+                // jumped the master clock without advancing the devices, so fill the
+                // device gap to match and audio keeps playing through a disk grind
+                // instead of the sink starving. The master clock is NOT bumped here:
+                // stall_for already advanced it by the stall, and re-adding it gave
+                // the audio pump a cumulative lead over wall time. The Accurate
+                // class (286/386) keeps exact main behavior (devices resume from
+                // the next instruction's own advance).
+                machine.advance_devices_clocks(stalled);
             }
             if let Some(sink) = &sink {
                 pump_audio(
