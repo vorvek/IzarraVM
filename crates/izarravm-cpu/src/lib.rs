@@ -1368,13 +1368,10 @@ impl DecodeGroup {
     }
 }
 
-/// Whether a decoded group is safe to run as a straight-line continuation: it neither transfers
-/// control, touches a port, changes segment / CR / system state, halts, nor runs a REP string op.
-/// The straight-line run executor keeps pulling such instructions from the decode cache (one call,
-/// no machine-loop bounce) until the next instruction is not one of these. The control-flow,
-/// I/O, segment/system, halt, and string groups all terminate the run so the per-instruction
-/// machine-loop semantics (interrupt service, device advance, HLE INT) are preserved at exactly the
-/// old boundary.
+/// Whether a decoded group is safe to run as a cached continuation: it either falls through or is a
+/// relative branch whose target is just the next live EIP. It must not touch a port, change CS/system
+/// state, halt, or run a REP string op. The executor still checks step breaks, interrupts, faults,
+/// and the batch clock cap after every instruction.
 fn block_straight_line(g: DecodeGroup) -> bool {
     matches!(
         g,
@@ -1382,6 +1379,7 @@ fn block_straight_line(g: DecodeGroup) -> bool {
             | DecodeGroup::DataMove
             | DecodeGroup::Stack
             | DecodeGroup::Group
+            | DecodeGroup::Branch
             | DecodeGroup::FlagsMisc
             | DecodeGroup::BitManip
             | DecodeGroup::CondMove
@@ -2251,16 +2249,15 @@ impl Cpu386 {
         self.finish_instruction(bus, result, start_eip, start_cs, group, profile_start)
     }
 
-    /// The shared rewind / deliver / scale tail of a single instruction's execution, used by both
-    /// `cycle_no_interrupt_check` (get-or-decode fetch) and `run_one_cached` (already-decoded cache
-    /// hit). It owns ONLY what happens after `result` is produced: on a delivered exception it rewinds
-    /// eip (and CS, if a far transfer moved it) to the faulting instruction and delivers the fault
-    /// through `deliver_exception` exactly as the per-instruction path always did, charging the
-    /// architectural 59 core clocks for the dispatch; on a CPU-level error it propagates; otherwise it
-    /// scales the retired clocks (the single per-mode timing dial) and accumulates them. Both callers
-    /// charge their own fetch BEFORE calling this, so it never touches fetch clocks and never double-
-    /// charges. `start_eip` / `start_cs` are captured before the fetch so the rewind lands on the
-    /// instruction's first byte.
+    /// The shared rewind / deliver / scale tail of a single instruction's execution. It owns ONLY
+    /// what happens after `result` is produced: on a delivered exception it rewinds eip (and CS, if a
+    /// far transfer moved it) to the faulting instruction and delivers the fault through
+    /// `deliver_exception` exactly as the per-instruction path always did, charging the architectural
+    /// 59 core clocks for the dispatch; on a CPU-level error it propagates; otherwise it scales the
+    /// retired clocks (the single per-mode timing dial) and accumulates them. Callers charge their own
+    /// fetch BEFORE calling this, so it never touches fetch clocks and never double-charges.
+    /// `start_eip` / `start_cs` are captured before the fetch so the rewind lands on the instruction's
+    /// first byte.
     #[inline]
     fn finish_instruction<B: CpuBus>(
         &mut self,
@@ -2394,10 +2391,9 @@ impl Cpu386 {
 
     /// Execute one already-decoded cached instruction as a straight-line continuation. Consumes the
     /// one-instruction STI shadow (a running instruction uses up the one-cycle delay), charges the
-    /// cached-hit fetch (without re-decoding, so no double charge), runs the decoded form, and routes
-    /// a fault / CPU error / retired clocks through the shared `finish_instruction` tail. The fault
-    /// path is the same rewind + `deliver_exception` the per-instruction path uses, so a mid-run fault
-    /// rewinds eip to the faulting instruction and delivers normally rather than being swallowed.
+    /// cached-hit fetch (without re-decoding, so no double charge), runs the decoded form, and uses a
+    /// small profiling-off success tail. Faults and profiling route through `finish_instruction`, so a
+    /// mid-run fault still rewinds eip to the faulting instruction and delivers normally.
     #[inline]
     fn run_one_cached<B: CpuBus>(
         &mut self,
@@ -2410,11 +2406,26 @@ impl Cpu386 {
         let start_eip = self.registers.eip;
         let start_cs = self.registers.cs().selector;
         let profiling = self.profile.enabled;
-        let profile_start = if profiling {
-            self.profile.sample_start()
-        } else {
-            None
-        };
+        if !profiling {
+            return match self
+                .charge_cached_fetch(bus, lin, insn.len)
+                .and_then(|()| self.execute_decoded(insn, bus))
+            {
+                Ok(outcome) => {
+                    let charged = self.scale_clocks(outcome.core_clocks);
+                    self.elapsed_clocks += charged;
+                    self.perf.instructions += 1;
+                    Ok(CycleOutcome {
+                        core_clocks: charged.min(u64::from(u32::MAX)) as u32,
+                        halted: outcome.halted,
+                    })
+                }
+                Err(fault) => {
+                    self.finish_instruction(bus, Err(fault), start_eip, start_cs, None, None)
+                }
+            };
+        }
+        let profile_start = self.profile.sample_start();
         let result = self
             .charge_cached_fetch(bus, lin, insn.len)
             .and_then(|()| self.execute_decoded(insn, bus));
@@ -10595,8 +10606,8 @@ mod tests {
             "only the first pass decodes; the loop re-hits"
         );
 
-        // On the now-warm cache a straight-line run executes the two cached `inc`s and
-        // ends at the non-straight-line backward jmp, bumping the branch break reason.
+        // On the now-warm cache a straight-line run executes the two cached `inc`s and the cached
+        // backward JMP repeatedly until the batch cap fires.
         cpu.reset_perf_counters();
         assert_eq!(
             cpu.perf_counters().instructions,
@@ -10610,12 +10621,10 @@ mod tests {
             p.instructions >= 1,
             "the run retired at least the first instruction"
         );
+        assert_eq!(p.brk_decode_or_branch, 0, "the cached JMP stayed in-run");
+        assert_eq!(p.brk_cap, 1, "the run ended at the clock cap");
         assert_eq!(
-            p.brk_decode_or_branch, 1,
-            "the run ended at the backward jmp"
-        );
-        assert_eq!(
-            p.brk_step + p.brk_interrupt + p.brk_cap + p.brk_halt,
+            p.brk_step + p.brk_interrupt + p.brk_halt,
             0,
             "no other break reason fired"
         );
@@ -17058,9 +17067,8 @@ mod tests {
 
     #[test]
     fn straight_line_hot_loop_matches_per_instruction_result() {
-        // MOV CX,5 ; loop: INC AX ; INC AX ; LOOP loop ; HLT. The body is straight-line (INC AX is
-        // FlagsMisc); LOOP is control flow, so each iteration is a run that ends on the LOOP. After
-        // the first warming pass the body is cached and the runs are multi-instruction.
+        // MOV CX,5 ; loop: INC AX ; INC AX ; LOOP loop ; HLT. Once the loop body is cached, the
+        // relative LOOP can run as a continuation too, so one hot run can chain several iterations.
         let code = [
             0xb9, 0x05, 0x00, // MOV CX, 5
             0x40, // INC AX            (loop target, 0x03)
@@ -17077,14 +17085,15 @@ mod tests {
         // 17 instructions retire: MOV CX, 2 warming INCs, then 5 LOOP iterations (the body's 2 INCs
         // run on the four jumping iterations, the fifth LOOP falls through), and HLT =
         // 1 + 2 + (5 LOOP + 4*2 INC) + 1 = 17. A one-instruction-per-run executor would produce 17
-        // runs; the batching executor produces strictly fewer, proving continuations actually fired
-        // (the four hot iterations each run LOOP + INC + INC in a single run).
+        // runs; with cached branch continuations this cold-start case reaches HLT in five runner
+        // entries: MOV miss, first INC miss, second INC miss, the hot chained loop, then HLT.
         let retired = 1 + 2 + (5 + 4 * 2) + 1;
         assert!(
             runs < retired,
             "the hot loop must collapse into multi-instruction runs: {runs} runs for {retired} \
              instructions"
         );
+        assert_eq!(runs, 5, "cached LOOP should stay inside the hot run");
     }
 
     #[test]
@@ -17335,10 +17344,9 @@ mod tests {
     }
 
     #[test]
-    fn straight_line_run_stops_before_control_flow_terminator() {
-        // The run must stop at a non-straight-line terminator (here a JMP), which then runs correctly
-        // through the normal single-instruction path on the next entry. INC AX (straight-line) runs,
-        // the JMP ends the run, and the target HLT halts.
+    fn straight_line_run_executes_cached_relative_jump_continuation() {
+        // A cached relative JMP is safe to run as a continuation: it only changes EIP, and the next
+        // continuation lookup uses that live target rather than falling through into skipped bytes.
         //
         //   0x00: 40           INC AX
         //   0x01: 40           INC AX
@@ -17357,20 +17365,64 @@ mod tests {
         let (mut cpu, memory) = real_mode_cpu(&code, 1024);
         let mut bus = TestBus::with_memory(memory);
         drive_straight_line_runs(&mut cpu, &mut bus);
-        // Only the two INCs before the JMP ran; the jump skipped the two after it.
+
+        cpu.registers.eip = 0;
+        cpu.registers.set_eax(0);
+        cpu.halted = false;
+        let outcome = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
+        assert!(!outcome.halted, "the HLT target is still a terminator");
         assert_eq!(cpu.read_reg16(Reg16::Ax), 2);
-        assert_eq!(cpu.registers.eip, 0x07);
+        assert_eq!(
+            cpu.registers.eip, 0x06,
+            "the cached JMP ran and skipped to the HLT target"
+        );
+    }
+
+    #[test]
+    fn straight_line_run_stops_before_ret_control_flow_terminator() {
+        // RET changes SP and transfers through memory, so it remains a ControlFlow terminator. A hot
+        // run reaches the cached RET but leaves it for the next runner entry.
+        //
+        //   0x00: 40           INC AX
+        //   0x01: 40           INC AX
+        //   0x02: C3           RET        ; stack target 0x06
+        //   0x03: 40           INC AX     ; skipped after RET
+        //   0x06: F4           HLT
+        let code = [
+            0x40, // INC AX
+            0x40, // INC AX
+            0xc3, // RET
+            0x40, // INC AX (skipped)
+            0x40, // INC AX (skipped)
+            0x40, // INC AX (skipped)
+            0xf4, // HLT
+        ];
+        let (mut cpu, mut memory) = real_mode_cpu(&code, 1024);
+        memory[0x100..0x102].copy_from_slice(&0x0006u16.to_le_bytes());
+        cpu.write_reg16(Reg16::Sp, 0x0100);
+        let mut bus = TestBus::with_memory(memory);
+        drive_straight_line_runs(&mut cpu, &mut bus);
+
+        bus.memory[0x100..0x102].copy_from_slice(&0x0006u16.to_le_bytes());
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0);
+        cpu.write_reg16(Reg16::Sp, 0x0100);
+        cpu.halted = false;
+        let outcome = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
+        assert!(!outcome.halted);
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 2);
+        assert_eq!(
+            cpu.registers.eip, 0x02,
+            "RET must not run as a continuation"
+        );
     }
 
     #[test]
     fn straight_line_run_never_executes_an_int_after_a_taken_branch() {
         // Regression guard against the "recompiler executes non-executed code" claim: a
         // side-effecting instruction (INT 0x13) sitting in the contiguous bytes AFTER a taken
-        // branch must NEVER be dispatched, even after the decode cache is warm. INT n is a
-        // ControlFlow terminator, so `run_straight_line` breaks BEFORE it the moment it is the next
-        // cached instruction; it can only ever run if eip genuinely points at it via real control
-        // flow. The JMP here makes eip skip the INT entirely, so the executed-INT trace must stay
-        // empty for vector 0x13.
+        // branch must NEVER be dispatched, even after the decode cache is warm. The cached JMP here
+        // makes EIP skip the INT entirely, so the executed-INT trace must stay empty for vector 0x13.
         //
         //   0x00: 40           INC AX
         //   0x01: 40           INC AX
@@ -17398,8 +17450,8 @@ mod tests {
         );
         assert_eq!(cpu.registers.eip, 0x07, "control reached the HLT at 0x06");
 
-        // Re-arm and drive again from the top with the cache now hot, to be sure a cached
-        // straight-line run still stops before the INT rather than over-reading into it.
+        // Re-arm and drive again from the top with the cache now hot, to be sure a cached relative
+        // branch continuation still targets the HLT rather than over-reading into the INT bytes.
         cpu.load_segment_real(SegmentIndex::Cs, 0);
         cpu.registers.eip = 0;
         cpu.write_reg16(Reg16::Ax, 0);
