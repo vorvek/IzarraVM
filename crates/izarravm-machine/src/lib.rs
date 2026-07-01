@@ -20262,6 +20262,24 @@ mod tests {
         image
     }
 
+    // SP-4b M0 Task 2 (increment 1): the standalone V86 spike boots, enters V86 via
+    // the real-mode -> PM+paging -> IRETD-into-V86 transition, and the V86 stub signals
+    // exit code 0xA5 through the unit-tester port. Proves the transition in isolation.
+    #[test]
+    fn v86spike_enters_v86_and_signals() {
+        let mut machine = Machine::new_boot_image(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            boot_image_with(izarravm_firmware::V86SPIKE_BIN),
+        )
+        .unwrap();
+        let reason = machine.run_until_halt_or_cycles(50_000_000).unwrap();
+        assert_eq!(
+            reason,
+            StopReason::TestExit { code: 0xA5 },
+            "V86 spike did not reach the V86 stub and signal (stop={reason:?})"
+        );
+    }
+
     #[test]
     fn hlt_wakes_on_pit_timer_tick() {
         // Boot code: init the PIC, unmask IRQ0, program channel 0 (mode 3, count 1000),

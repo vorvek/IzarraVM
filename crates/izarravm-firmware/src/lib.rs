@@ -33,6 +33,11 @@ pub const DHRYSTONE_EXE: &[u8] = include_bytes!("../roms/neurketa-c/dhrystone.ex
 /// (load with `Machine::new_raw_program`, read `bench_iterations` = the sweep count
 /// and `bench_aux` = the FP self-check fold). See roms/neurketa-c/whetstone.c.
 pub const WHETSTONE_EXE: &[u8] = include_bytes!("../roms/neurketa-c/whetstone.exe");
+/// The standalone V86 monitor spike (SP-4b M0 Task 2): a 512-byte boot sector that
+/// enters Virtual-8086 mode under a hand-built monitor and signals success through
+/// the unit-tester exit port. Run via `Machine::new_boot_image`.
+pub const V86SPIKE_BIN: &[u8] = include_bytes!("../roms/dos/v86spike.bin");
+pub const V86SPIKE_SOURCE: &str = include_str!("../roms/dos/v86spike.asm");
 pub const KBD_BIOS: &[u8] = include_bytes!("../roms/kbd-bios.bin");
 pub const KBD_BIOS_SOURCE: &str = include_str!("../roms/kbd-bios.asm");
 pub const KBD_RESIDENT_BIOS: &[u8] = include_bytes!("../roms/kbd-resident.bin");
