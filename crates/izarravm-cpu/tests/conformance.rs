@@ -164,6 +164,8 @@ fn apply_state(cpu: &mut Cpu386, bus: &mut FlatBus, state: &TestState) {
     if let Some(v) = regs.eip {
         cpu.registers.eip = v;
     }
+    // These direct pokes bypass recompute_alignment_armed; fine while the vectors are
+    // 386-only (no EFLAGS bit 18); recompute here if 486 #AC vectors land.
     if let Some(v) = regs.eflags {
         cpu.registers.eflags = v;
     }

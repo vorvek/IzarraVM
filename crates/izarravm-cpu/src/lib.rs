@@ -8915,6 +8915,8 @@ impl Cpu386 {
         }
     }
 
+    // Inlined so the constant `flag` masks reach set_flag_live's AC check and fold it away.
+    #[inline]
     fn set_flag(&mut self, flag: u32, enabled: bool) {
         const ARITH: u32 = FLAG_CF | FLAG_PF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_OF;
         if self.pending_flags.is_some() {

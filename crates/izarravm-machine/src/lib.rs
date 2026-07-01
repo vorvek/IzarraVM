@@ -9994,6 +9994,11 @@ impl CpuBus for MachineBus<'_> {
         // bases. So in the Approximate class (`flat_data_cost`) the charge is
         // always the flat L1 cost: skip apply_a20 and the wait-state routing.
         // The Accurate class keeps the full path so its tag arrays stay warm.
+        //
+        // Accepted residue: a same-instruction REP OUTS that moves the Distira
+        // BAR over its own source buffer keeps charging the stale entry's flat
+        // cost until the post-instruction io_touched step break invalidates it.
+        // That divergence is timing-only; functional behavior is identical.
         if self.flat_data_cost {
             self.trace.record(kind, address, width, self.cache.cost.l1);
             return Ok(());
@@ -19926,6 +19931,50 @@ mod tests {
             direct_map_changed: &mut machine.direct_map_changed,
         };
         f(&mut bus)
+    }
+
+    #[test]
+    fn instruction_fetch_run_fast_path_stops_at_the_video_aperture() {
+        // Pins the `end < 0xA0000` guard in charge_instruction_fetch_run: a run whose
+        // last byte is 0x9FFFF takes the conventional-RAM fast path (one collapsed
+        // I-cache access at the per-mode code-fetch constant), while a run straddling
+        // 0xA0000 must fall through to the full classification, which sees the VGA
+        // window's wait-states, goes non-uniform, and charges per byte.
+        use izarravm_bus::BusCycle;
+        let mut machine = test_machine();
+        // Preconditions for the straddle case: the A0000 window decodes as a device
+        // window, and its wait-states differ from the code-fetch constant (otherwise
+        // the uniform arm legitimately collapses the run and the paths are
+        // charge-identical by design).
+        assert!(machine.video.video_memory_enabled());
+        let code_ws = machine.cache_model.code_fetch_wait_states();
+        let video_ws = machine.profile.wait_states.video;
+        assert_ne!(
+            code_ws, video_ws,
+            "test needs distinct RAM/video wait-states"
+        );
+
+        with_bus(&mut machine, |bus| {
+            // Fast path: 4 bytes ending exactly at 0x9FFFF -> one I-cache access.
+            let before = bus.trace.elapsed_clocks();
+            bus.charge_instruction_fetch_run(0x0009_FFFC, 4).unwrap();
+            assert_eq!(
+                bus.trace.elapsed_clocks() - before,
+                u64::from(BusCycle::clocks_for(BusWidth::Byte, code_ws)),
+                "run ending at 0x9FFFF charges a single I-cache access"
+            );
+            // Slow path: 4 bytes straddling 0xA0000 -> non-uniform (RAM then VGA
+            // window), charged per byte: two at the code-fetch constant, two at
+            // the video cost.
+            let before = bus.trace.elapsed_clocks();
+            bus.charge_instruction_fetch_run(0x0009_FFFE, 4).unwrap();
+            assert_eq!(
+                bus.trace.elapsed_clocks() - before,
+                2 * u64::from(BusCycle::clocks_for(BusWidth::Byte, code_ws))
+                    + 2 * u64::from(BusCycle::clocks_for(BusWidth::Byte, video_ws)),
+                "run straddling 0xA0000 keeps the per-byte classification"
+            );
+        });
     }
 
     #[test]
