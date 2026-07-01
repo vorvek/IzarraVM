@@ -67,7 +67,8 @@ xms_table: times XMS_HANDLES*XMS_SLOT db 0
 
 ; SP-4b M3 UMB: the free upper window 0xC8000-0xEFFFF (above the VGA BIOS, below
 ; system ROM), 160 KB, page-mapped at INIT to extended RAM just above the HMA. The
-; guest allocator (XMS 10h/11h/12h) hands out segment runs in [0xC800, 0xF000).
+; guest allocator (XMS 10h/11h/12h) hands out segment runs in [0xC800, umb_win_end)
+; — the window ends at 0xF000, or 0xE000 when the EMS page frame is on (SP-4b M2).
 UMB_LIN_BASE  equ 0x000C8000      ; first upper-hole linear byte
 UMB_BYTES     equ 0x00028000      ; 160 KB (0xC8000..0xEFFFF)
 UMB_PHYS_BASE equ 0x00110000      ; backing physical (just above the HMA)
@@ -925,13 +926,15 @@ xf_realloc_umb:
 umb_free_run:
     push cx
     push si
-    cmp dx, UMB_SEG_PARAS         ; bigger than the whole window? can't fit (dodges
+    mov ax, [cs:umb_win_end]      ; window end (drops to 0xE000 when the EMS
+    sub ax, UMB_SEG_BASE          ; page frame carves the top; SP-4b M2)
+    cmp dx, ax                    ; bigger than the whole window? can't fit (dodges
     ja .none                      ; the 16-bit wrap on cursor+need for huge probes).
     mov bx, UMB_SEG_BASE
 .restart:
     mov ax, bx
     add ax, dx                    ; cursor + need
-    cmp ax, UMB_SEG_BASE + UMB_SEG_PARAS
+    cmp ax, [cs:umb_win_end]
     ja .none
     mov si, umb_table
     mov cx, UMB_SLOTS
@@ -985,7 +988,7 @@ umb_largest:
     add si, UMB_SLOT
     loop .l
     neg ax
-    add ax, UMB_SEG_BASE + UMB_SEG_PARAS  ; window_end - highest_top
+    add ax, [cs:umb_win_end]      ; window_end - highest_top
     pop dx
     pop si
     pop cx
@@ -1021,7 +1024,7 @@ umb_max_grow:
     push cx
     push di
     mov di, [cs:si+2]             ; our seg
-    mov ax, UMB_SEG_BASE + UMB_SEG_PARAS  ; nearest boundary = window end
+    mov ax, [cs:umb_win_end]      ; nearest boundary = window end
     push si
     mov si, umb_table
     mov cx, UMB_SLOTS
@@ -1066,9 +1069,9 @@ ems_int67:
     jmp [cs:ems_disp]
 ems_jt:
     dw ef_status, ef_frame, ef_counts, ef_alloc     ; 40h-43h
-    dw ef_map, ef_undef, ef_version, ef_undef       ; 44h-47h (45/47: incr B)
-    dw ef_undef, ef_undef, ef_undef, ef_undef       ; 48h-4Bh (48/4B: incr B)
-    dw ef_undef                                     ; 4Ch     (incr B)
+    dw ef_map, ef_free, ef_version, ef_save         ; 44h-47h
+    dw ef_restore, ef_undef, ef_undef, ef_count     ; 48h-4Bh (49/4A reserved)
+    dw ef_pages                                     ; 4Ch
 
 ef_undef:
     mov ah, 0x84                  ; undefined function
@@ -1184,6 +1187,195 @@ ef_map:
     iret
 .badphys:
     mov ah, 0x8B                  ; physical page out of range
+    iret
+
+; 45h release: DX = handle. Unmaps its frame slots, scrubs its pages from
+; every saved_map (a freed-and-reassigned page must not be reinstated by a
+; later 48h restore — mirrors the retired HLE's invalidate_freed), then
+; returns the run to the pool.
+ef_free:
+    push si
+    call ems_slot_of
+    jc .badh
+    push ax
+    push bx
+    push cx
+    push dx
+    push di
+    mov di, [cs:si+4]             ; DI = first freed page
+    mov dx, di
+    add dx, [cs:si+2]             ; DX = end (exclusive)
+    xor bx, bx                    ; BL = physical slot 0..3
+.slots:
+    push si
+    movzx si, bl
+    add si, si
+    mov cx, [cs:ems_frame_map + si]
+    cmp cx, di
+    jb .ns
+    cmp cx, dx
+    jae .ns
+    mov word [cs:ems_frame_map + si], 0xFFFF
+    mov al, bl
+    mov cx, 0xFFFF
+    call ems_remap_slot           ; restore the INIT mapping
+.ns:
+    pop si
+    inc bx
+    cmp bx, 4
+    jb .slots
+    push si                       ; scrub [DI,DX) from every saved_map
+    mov si, ems_table
+    mov cx, EMS_HANDLES
+.scrub:
+    cmp byte [cs:si+1], 0         ; saved?
+    je .nh
+    push cx
+    push si
+    add si, 8                     ; saved_map
+    mov cx, 4
+.sm:
+    mov ax, [cs:si]
+    cmp ax, di
+    jb .smn
+    cmp ax, dx
+    jae .smn
+    mov word [cs:si], 0xFFFF
+.smn:
+    add si, 2
+    loop .sm
+    pop si
+    pop cx
+.nh:
+    add si, EMS_SLOT
+    loop .scrub
+    pop si
+    mov ax, [cs:si+2]             ; release the run + the slot (its own saved
+    add [cs:ems_free], ax         ; context dies with saved=0)
+    mov byte [cs:si], 0
+    mov byte [cs:si+1], 0
+    pop di
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    pop si
+    xor ah, ah
+    iret
+.badh:
+    pop si
+    iret                          ; AH = 0x83 from ems_slot_of
+
+; 47h save / 48h restore the frame map under DX = handle.
+ef_save:
+    push si
+    call ems_slot_of
+    jc .badh
+    cmp byte [cs:si+1], 0
+    jne .already
+    push ax
+    push cx
+    push di
+    mov di, 4                     ; four slots
+    xor cx, cx                    ; word offset 0,2,4,6
+.cp:
+    push si
+    mov si, cx
+    mov ax, [cs:ems_frame_map + si]
+    pop si
+    push si
+    add si, cx
+    mov [cs:si+8], ax
+    pop si
+    add cx, 2
+    dec di
+    jnz .cp
+    mov byte [cs:si+1], 1
+    pop di
+    pop cx
+    pop ax
+    pop si
+    xor ah, ah
+    iret
+.already:
+    pop si
+    mov ah, 0x8D                  ; context already saved
+    iret
+.badh:
+    pop si
+    iret
+
+ef_restore:
+    push si
+    call ems_slot_of
+    jc .badh
+    cmp byte [cs:si+1], 0
+    je .none
+    push ax
+    push bx
+    push cx
+    push di
+    xor bx, bx                    ; BL = physical slot 0..3
+.rs:
+    movzx di, bl
+    add di, di
+    push si
+    add si, di
+    mov cx, [cs:si+8]             ; saved word (page or 0xFFFF)
+    pop si
+    push si
+    mov si, di
+    mov [cs:ems_frame_map + si], cx
+    pop si
+    mov al, bl
+    call ems_remap_slot           ; maps or restores per CX
+    inc bx
+    cmp bx, 4
+    jb .rs
+    mov byte [cs:si+1], 0
+    pop di
+    pop cx
+    pop bx
+    pop ax
+    pop si
+    xor ah, ah
+    iret
+.none:
+    pop si
+    mov ah, 0x8E                  ; no saved context
+    iret
+.badh:
+    pop si
+    iret
+
+; 4Bh open-handle count -> BX. 4Ch handle pages: DX = handle -> BX.
+ef_count:
+    push si
+    push cx
+    xor bx, bx
+    mov si, ems_table
+    mov cx, EMS_HANDLES
+.c:
+    cmp byte [cs:si], 0
+    je .n
+    inc bx
+.n:
+    add si, EMS_SLOT
+    loop .c
+    pop cx
+    pop si
+    xor ah, ah
+    iret
+ef_pages:
+    push si
+    call ems_slot_of
+    jc .badh
+    mov bx, [cs:si+2]
+    pop si
+    xor ah, ah
+    iret
+.badh:
+    pop si
     iret
 
 ; --- EMS helpers --------------------------------------------------------------

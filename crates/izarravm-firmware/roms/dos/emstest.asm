@@ -4,8 +4,10 @@
 ; version -> frame segment -> page counts -> allocate 4 pages -> map logical
 ; pages through the frame slots, writing distinct patterns and reading them
 ; back through OTHER slots (the runtime-remap proof: the same backing page is
-; visible wherever it is mapped) -> then signal 0xA5 (success) via the
-; unit-tester exit port. Any other code names the step that broke (0xEn).
+; visible wherever it is mapped) -> save context -> unmap -> restore context
+; (the mapping comes back) -> free and watch the counts recover -> then signal
+; 0xA5 (success) via the unit-tester exit port. Any other code names the step
+; that broke (0xEn).
 ;
 ; Build: nasm -f bin emstest.asm -o emstest.com
 cpu 386
@@ -100,6 +102,71 @@ start:
     cmp dword [es:0], PAT_B
     jne f_remap2
 
+    ; 9. save the mapping context (47h) under the handle
+    mov ah, 0x47
+    mov dx, [handle]
+    int 0x67
+    or ah, ah
+    jnz f_save
+
+    ; 10. unmap slot 1 (44h, logical 0xFFFF): E400 falls back to the dormant
+    ;     UMB backing — pattern B must no longer be visible there
+    mov ah, 0x44
+    mov al, 1
+    mov bx, 0xFFFF
+    int 0x67
+    or ah, ah
+    jnz f_unmap
+    cmp dword [es:0], PAT_B
+    je f_unmap
+
+    ; 11. restore the context (48h): slot 1 maps logical 1 again -> pattern B
+    mov ah, 0x48
+    mov dx, [handle]
+    int 0x67
+    or ah, ah
+    jnz f_restore
+    cmp dword [es:0], PAT_B
+    jne f_restore
+
+    ; 12. counts reflect the allocation (42h): free = 252 of 256
+    mov ah, 0x42
+    int 0x67
+    or ah, ah
+    jnz f_counts2
+    cmp bx, 252
+    jne f_counts2
+
+    ; 13. pages for the handle (4Ch) = 4; open handles (4Bh) = 1
+    mov ah, 0x4C
+    mov dx, [handle]
+    int 0x67
+    or ah, ah
+    jnz f_pages
+    cmp bx, 4
+    jne f_pages
+    mov ah, 0x4B
+    int 0x67
+    or ah, ah
+    jnz f_pages
+    cmp bx, 1
+    jne f_pages
+
+    ; 14. free the handle (45h); counts recover, no open handles remain
+    mov ah, 0x45
+    mov dx, [handle]
+    int 0x67
+    or ah, ah
+    jnz f_free
+    mov ah, 0x42
+    int 0x67
+    cmp bx, 256
+    jne f_free
+    mov ah, 0x4B
+    int 0x67
+    or bx, bx
+    jnz f_free
+
     mov al, OK
     jmp sig
 
@@ -118,6 +185,18 @@ f_map1:   mov al, 0xE6
 f_remap:  mov al, 0xE7
           jmp sig
 f_remap2: mov al, 0xE8
+          jmp sig
+f_save:   mov al, 0xE9
+          jmp sig
+f_unmap:  mov al, 0xEA
+          jmp sig
+f_restore: mov al, 0xEB
+          jmp sig
+f_counts2: mov al, 0xEC
+          jmp sig
+f_pages:  mov al, 0xED
+          jmp sig
+f_free:   mov al, 0xEE
 
 sig:
     mov ah, al
