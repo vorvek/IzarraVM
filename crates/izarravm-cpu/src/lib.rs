@@ -8726,6 +8726,16 @@ impl Cpu386 {
         }
     }
 
+    #[inline]
+    fn set_flag_live(&mut self, flag: u32, enabled: bool) {
+        if enabled {
+            self.registers.eflags |= flag;
+        } else {
+            self.registers.eflags &= !flag;
+        }
+        self.registers.eflags |= 0x2;
+    }
+
     fn set_flag(&mut self, flag: u32, enabled: bool) {
         const ARITH: u32 = FLAG_CF | FLAG_PF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_OF;
         if self.pending_flags.is_some() {
@@ -8741,12 +8751,7 @@ impl Cpu386 {
                 self.materialize_flags();
             }
         }
-        if enabled {
-            self.registers.eflags |= flag;
-        } else {
-            self.registers.eflags &= !flag;
-        }
-        self.registers.eflags |= 0x2;
+        self.set_flag_live(flag, enabled);
     }
 
     fn alu(&mut self, op: u8, a: u32, b: u32, width: BusWidth) -> u32 {
@@ -8804,7 +8809,7 @@ impl Cpu386 {
             } else {
                 ((s >> n) | (s << (bits - n))) & mask
             };
-            self.set_szp(result, operand_size.bus_width());
+            self.set_shift_result_flags(None, None, result, operand_size.bus_width());
             return result;
         }
         // A nonzero count always overwrites cf on the first iteration; unlike the
@@ -8823,12 +8828,13 @@ impl Cpu386 {
                 s >>= 1;
             }
         }
-        self.set_flag(FLAG_CF, cf);
-        if count == 1 {
+        let of = if count == 1 {
             // OF is defined only for a single-bit count: set when the sign bit changed.
-            self.set_flag(FLAG_OF, (dest ^ d) & msb != 0);
-        }
-        self.set_szp(d, operand_size.bus_width());
+            Some((dest ^ d) & msb != 0)
+        } else {
+            None
+        };
+        self.set_shift_result_flags(Some(cf), of, d, operand_size.bus_width());
         d & mask
     }
 
@@ -8891,23 +8897,32 @@ impl Cpu386 {
                 _ => unreachable!("shift/rotate op {op}"),
             }
         }
-        self.set_flag(FLAG_CF, cf);
-        if count == 1 {
-            // OF is defined only for a single-bit count.
-            let top = (v & msb) != 0;
-            let of = match op {
-                0 | 2 => top ^ cf,                      // ROL, RCL: top bit XOR carry out
-                1 | 3 => top ^ ((v & (msb >> 1)) != 0), // ROR, RCR: top two bits XORed
-                4 | 6 => top ^ cf,                      // SHL: top bit of result XOR carry out
-                5 => (value & msb) != 0,                // SHR: most-significant bit of the original
-                7 => false,                             // SAR never overflows
-                _ => unreachable!("shift/rotate op {op}"),
-            };
-            self.set_flag(FLAG_OF, of);
-        }
-        // Shifts set SF/ZF/PF; rotates leave them (and AF) untouched.
         if matches!(op, 4..=7) {
-            self.set_szp(v, width);
+            let of = if count == 1 {
+                // OF is defined only for a single-bit count.
+                let top = (v & msb) != 0;
+                Some(match op {
+                    4 | 6 => top ^ cf,       // SHL: top bit of result XOR carry out
+                    5 => (value & msb) != 0, // SHR: most-significant bit of the original
+                    7 => false,              // SAR never overflows
+                    _ => unreachable!("shift op {op}"),
+                })
+            } else {
+                None
+            };
+            self.set_shift_result_flags(Some(cf), of, v, width);
+        } else {
+            self.set_flag(FLAG_CF, cf);
+            if count == 1 {
+                // OF is defined only for a single-bit count.
+                let top = (v & msb) != 0;
+                let of = match op {
+                    0 | 2 => top ^ cf,                      // ROL, RCL: top bit XOR carry out
+                    1 | 3 => top ^ ((v & (msb >> 1)) != 0), // ROR, RCR: top two bits XORed
+                    _ => unreachable!("rotate op {op}"),
+                };
+                self.set_flag(FLAG_OF, of);
+            }
         }
         v & mask
     }
@@ -9167,11 +9182,52 @@ impl Cpu386 {
     }
 
     fn set_szp(&mut self, result: u32, width: BusWidth) {
+        if self.pending_flags.is_some() {
+            self.materialize_flags();
+        }
+        self.set_szp_live(result, width);
+    }
+
+    fn set_szp_live(&mut self, result: u32, width: BusWidth) {
         let mask = width_mask(width);
         let sign = width_sign(width);
-        self.set_flag(FLAG_ZF, result & mask == 0);
-        self.set_flag(FLAG_SF, result & sign != 0);
-        self.set_flag(FLAG_PF, parity(result as u8));
+        self.set_flag_live(FLAG_ZF, result & mask == 0);
+        self.set_flag_live(FLAG_SF, result & sign != 0);
+        self.set_flag_live(FLAG_PF, parity(result as u8));
+    }
+
+    fn set_shift_result_flags(
+        &mut self,
+        cf: Option<bool>,
+        of: Option<bool>,
+        result: u32,
+        width: BusWidth,
+    ) {
+        if self.pending_flags.is_none() {
+            if let Some(cf) = cf {
+                self.set_flag_live(FLAG_CF, cf);
+            }
+            if let Some(of) = of {
+                self.set_flag_live(FLAG_OF, of);
+            }
+            self.set_szp_live(result, width);
+            return;
+        }
+
+        let cf = match cf {
+            Some(cf) => cf,
+            None => self.flag(FLAG_CF),
+        };
+        let of = match of {
+            Some(of) => of,
+            None => self.flag(FLAG_OF),
+        };
+        let af = self.flag(FLAG_AF);
+        self.pending_flags = None;
+        self.set_flag_live(FLAG_CF, cf);
+        self.set_flag_live(FLAG_OF, of);
+        self.set_flag_live(FLAG_AF, af);
+        self.set_szp_live(result, width);
     }
 
     fn condition(&self, condition: u8) -> bool {
@@ -25764,6 +25820,48 @@ mod tests {
         assert!(cpu.pending_flags.is_some(), "DEC should stay lazy");
         assert!(!cpu.flag(FLAG_CF), "DEC preserves CF");
         assert!(cpu.flag(FLAG_SF));
+    }
+
+    #[test]
+    fn shift_after_pending_flags_matches_materialized_without_materializing() {
+        for &(op, value, count) in &[
+            (4, 0x4000, 1), // SHL defines OF
+            (4, 0x0001, 2), // SHL preserves previous OF for multi-bit counts
+            (5, 0x8001, 2), // SHR
+            (7, 0x8001, 2), // SAR
+        ] {
+            let mut expected = Cpu386::default();
+            expected.alu_add(0x7f, 0x01, 0, BusWidth::Byte); // pending OF+AF
+            expected.materialize_flags();
+            let expected_result = expected.shift_rotate(op, value, count, BusWidth::Word);
+            let expected_flags = expected.eflags();
+
+            let mut lazy = Cpu386::default();
+            lazy.alu_add(0x7f, 0x01, 0, BusWidth::Byte);
+            lazy.reset_perf_counters();
+            let lazy_result = lazy.shift_rotate(op, value, count, BusWidth::Word);
+
+            assert_eq!(lazy_result, expected_result, "op={op} count={count}");
+            assert_eq!(lazy.eflags(), expected_flags, "op={op} count={count}");
+            assert_eq!(lazy.perf.flag_materializations, 0, "op={op} count={count}");
+            assert!(lazy.pending_flags.is_none(), "op={op} count={count}");
+        }
+
+        let mut expected = Cpu386::default();
+        expected.alu_add(0x7f, 0x01, 0, BusWidth::Byte);
+        expected.materialize_flags();
+        let expected_result = expected.double_shift(true, 0x0001, 0, 2, OperandSize::Word);
+        let expected_flags = expected.eflags();
+
+        let mut lazy = Cpu386::default();
+        lazy.alu_add(0x7f, 0x01, 0, BusWidth::Byte);
+        lazy.reset_perf_counters();
+        let lazy_result = lazy.double_shift(true, 0x0001, 0, 2, OperandSize::Word);
+
+        assert_eq!(lazy_result, expected_result);
+        assert_eq!(lazy.eflags(), expected_flags);
+        assert_eq!(lazy.perf.flag_materializations, 0);
+        assert!(lazy.pending_flags.is_none());
     }
 
     #[test]
