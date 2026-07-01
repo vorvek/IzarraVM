@@ -1450,18 +1450,15 @@ fn block_straight_line(g: DecodeGroup) -> bool {
 /// transition, clock cap, decode-cache re-peek at the new linear EIP, page-local decode)
 /// is unchanged, and a faulting stack read or segment-limit hit still routes through
 /// `finish_instruction`'s rewind-and-deliver exactly as on the one-instruction path.
-fn block_continuable(insn: &DecodedInsn) -> bool {
-    if block_straight_line(insn.group) {
+fn block_continuable(group: DecodeGroup, opcode: u16, modrm: Option<ModRm>) -> bool {
+    if block_straight_line(group) {
         return true;
     }
-    if insn.group != DecodeGroup::ControlFlow {
+    if group != DecodeGroup::ControlFlow {
         return false;
     }
-    match insn.opcode {
-        0xc2 | 0xc3 => true,
-        0xff => matches!(insn.modrm, Some(m) if m.reg == 2 || m.reg == 4),
-        _ => false,
-    }
+    matches!(opcode, 0xc2 | 0xc3)
+        || (opcode == 0xff && matches!(modrm, Some(m) if m.reg == 2 || m.reg == 4))
 }
 
 impl CpuProfileState {
@@ -1615,6 +1612,11 @@ struct DecodedInsn {
     /// classifier. `route_group` is pure over `(opcode, prefixes)`, both captured here, so the
     /// stored value is exactly what a re-call would return.
     group: DecodeGroup,
+    /// Whether this instruction may run as a straight-line-run continuation
+    /// (`block_continuable`), resolved ONCE at decode so the per-continuation gate in
+    /// `run_straight_line` is a single flag test. Pure over `(group, opcode, modrm)`,
+    /// all captured here.
+    continuable: bool,
 }
 
 /// Number of direct-mapped lines in the decode cache. Power of two so the index is a mask. 4096 is
@@ -2554,11 +2556,7 @@ impl Cpu386 {
             } else {
                 let lin = self.linear_eip();
                 let insn = match self.decode_cache.get(lin) {
-                    Some(i)
-                        if block_continuable(&i) && (lin & 0xfff) + u32::from(i.len) <= 0x1000 =>
-                    {
-                        i
-                    }
+                    Some(i) if i.continuable && (lin & 0xfff) + u32::from(i.len) <= 0x1000 => i,
                     _ => {
                         self.perf.brk_decode_or_branch += 1;
                         break;
@@ -3775,6 +3773,9 @@ impl Cpu386 {
             imm: 0,
             imm2: 0,
             group,
+            // Placeholder; the finalize below resolves it once the ModRM (the 0xFF /ext
+            // discriminator) has been pre-parsed.
+            continuable: false,
         };
 
         // Pre-parse the operands of converted groups, dispatching on the group resolved above.
@@ -4179,6 +4180,9 @@ impl Cpu386 {
         // re-write it: a group's match arm only fetches its operand bytes; this single assignment
         // captures the total bytes `decode` consumed (prefixes + opcode + operands).
         insn.len = self.registers.eip.wrapping_sub(start_eip) as u8;
+        // Resolve the continuation gate once per decode (the ModRM is in by now), so the
+        // per-continuation check in `run_straight_line` reads a single cached flag.
+        insn.continuable = block_continuable(insn.group, insn.opcode, insn.modrm);
 
         Ok(insn)
     }
