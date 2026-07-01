@@ -6995,7 +6995,12 @@ impl Cpu386 {
         offset: u32,
         kind: BusAccessKind,
     ) -> ExecResult<u8> {
-        let physical = self.translate_segmented(bus, segment, offset, 1, false)?;
+        let linear = self.segment_linear_byte(segment, offset)?;
+        let physical = if self.control.cr0 & CR0_PG == 0 {
+            linear
+        } else {
+            self.translate_linear(bus, linear, false)?
+        };
         if let Some(value) = self.read_direct_byte_page_cached(bus, physical, kind)? {
             return Ok(value);
         }
@@ -7012,13 +7017,37 @@ impl Cpu386 {
         value: u8,
         kind: BusAccessKind,
     ) -> ExecResult<()> {
-        let physical = self.translate_segmented(bus, segment, offset, 1, true)?;
+        let linear = self.segment_linear_byte(segment, offset)?;
+        let physical = if self.control.cr0 & CR0_PG == 0 {
+            self.record_write_page(linear);
+            linear
+        } else {
+            self.translate_linear(bus, linear, true)?
+        };
+        self.note_code_write(physical, 1);
         if self.write_direct_byte_page_cached(bus, physical, value, kind)? {
             return Ok(());
         }
         let write = bus.write_memory_direct(physical, BusWidth::Byte, u32::from(value), kind)?;
         self.record_data_write(kind, write.direct);
         Ok(())
+    }
+
+    #[inline]
+    fn segment_linear_byte(&self, segment: SegmentIndex, offset: u32) -> ExecResult<u32> {
+        let descriptor = self.registers.segment(segment);
+        if descriptor.base == 0 && descriptor.limit == u32::MAX {
+            return Ok(offset);
+        }
+        if offset > descriptor.limit {
+            return Err(CpuError::SegmentLimit {
+                segment,
+                offset,
+                width: 1,
+            }
+            .into());
+        }
+        Ok(descriptor.base.wrapping_add(offset))
     }
 
     fn read_memory_sized<B: CpuBus>(
