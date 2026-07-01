@@ -111,6 +111,14 @@ impl Keyboard8042 {
         self.mouse.enable_wheel();
     }
 
+    pub fn set_mouse_sample_rate_code(&mut self, code: u8) -> bool {
+        self.mouse.set_sample_rate_code(code)
+    }
+
+    pub fn mouse_sample_rate(&self) -> u8 {
+        self.mouse.sample_rate()
+    }
+
     /// Test seam: report whether the aux device is in IntelliMouse 4-byte mode.
     #[cfg(test)]
     pub fn mouse_wheel_enabled(&self) -> bool {

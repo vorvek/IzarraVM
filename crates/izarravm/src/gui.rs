@@ -45,9 +45,9 @@ const EMU_SLICE: Duration = Duration::from_millis(1);
 /// grows without bound under sustained motion even though no single flush is
 /// ever large: `AUX_BYTE_SETTLE_US` (keyboard.rs) paces aux bytes out of the
 /// 8042 at 1/ms, and a TOKAMOUS-driven IntelliMouse packet is 4 bytes, so the
-/// guest can never drain faster than 250 packets/s. 100 Hz leaves over 2x
-/// headroom under that ceiling.
-const MOUSE_FLUSH_HZ: f64 = 100.0;
+/// guest can never drain faster than 250 packets/s. 200 Hz matches the highest
+/// standard PS/2 sample rate while leaving room for the aux byte pacing.
+const MOUSE_FLUSH_HZ: f64 = 200.0;
 
 /// How long a drive-access LED stays lit after the last access, so a burst of
 /// fast reads reads as a steady glow rather than an imperceptible flicker.
@@ -1458,8 +1458,8 @@ impl GuiApp {
     }
 
     /// Send the motion accumulated since the last flush as one coalesced relative
-    /// packet, if any. Called once per frame so an 8000 Hz mouse drives the guest at
-    /// the refresh rate, not at the host polling rate.
+    /// packet, if any. The caller paces this separately from rendering so an 8000
+    /// Hz mouse drives the guest at MOUSE_FLUSH_HZ, not at the host polling rate.
     fn flush_guest_motion(&mut self) {
         if !self.mouse_dirty {
             return;

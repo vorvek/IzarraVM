@@ -449,13 +449,11 @@ test_sb_8bit_dma:
     out dx, al
     mov al, 0x11
     out dx, al
-    mov al, 0x48
+    mov al, 0x14
     out dx, al
     mov al, 0x1F
     out dx, al
     mov al, 0x00
-    out dx, al
-    mov al, 0x14
     out dx, al
     ; IRQ5 -> vector 0x0D (PIC base 0x08 set by test_timer). Install the handler
     ; and unmask IRQ5 (clear IMR bit5), then spin until the handler bumps the

@@ -4758,9 +4758,19 @@ impl Machine {
                 self.set_eax_ah(0x00);
                 self.set_int_frame_carry(false);
             }
-            // C202 set sample rate (BH=rate code 0-6) and C203 set resolution
-            // (BH=0-3): no hardware rate/resolution is modeled, so accept and ignore.
-            0x02 | 0x03 => {
+            // C202 set sample rate (BH=rate code 0-6).
+            0x02 => {
+                if self.keyboard.set_mouse_sample_rate_code(bh) {
+                    self.set_eax_ah(0x00);
+                    self.set_int_frame_carry(false);
+                } else {
+                    self.set_eax_ah(0x86);
+                    self.set_int_frame_carry(true);
+                }
+            }
+            // C203 set resolution (BH=0-3): no hardware resolution is modeled, so
+            // accept and ignore.
+            0x03 => {
                 self.set_eax_ah(0x00);
                 self.set_int_frame_carry(false);
             }
@@ -4787,12 +4797,13 @@ impl Machine {
             0x06 => {
                 if bh == 0x00 {
                     // Status byte 1 (BL): bit5 mouse enabled. Status byte 2 (CL):
-                    // resolution code 2. Status byte 3 (DL): sample rate 100.
+                    // resolution code 2. Status byte 3 (DL): current sample rate.
                     let ebx = (self.cpu.registers.ebx() & !0xFF) | 0x20;
                     self.cpu.registers.set_ebx(ebx);
                     let ecx = (self.cpu.registers.ecx() & !0xFF) | 0x02;
                     self.cpu.registers.set_ecx(ecx);
-                    let edx = (self.cpu.registers.edx() & !0xFF) | 100;
+                    let edx = (self.cpu.registers.edx() & !0xFF)
+                        | u32::from(self.keyboard.mouse_sample_rate());
                     self.cpu.registers.set_edx(edx);
                 }
                 self.set_eax_ah(0x00);
@@ -21722,7 +21733,7 @@ mod tests {
             bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap();
             bus.write_io(0x83, BusWidth::Byte, 0x01).unwrap();
             bus.write_io(0x0A, BusWidth::Byte, 0x01).unwrap();
-            for &b in &[0x41u8, 0x2B, 0x11, 0x48, 0x0F, 0x00, 0x14] {
+            for &b in &[0x41u8, 0x2B, 0x11, 0x14, 0x0F, 0x00] {
                 bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
             }
         });
@@ -21762,7 +21773,7 @@ mod tests {
             bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap();
             bus.write_io(0x83, BusWidth::Byte, 0x01).unwrap();
             bus.write_io(0x0A, BusWidth::Byte, 0x01).unwrap();
-            for &b in &[0x41u8, 0x2B, 0x11, 0x48, 0x0F, 0x00, 0x14] {
+            for &b in &[0x41u8, 0x2B, 0x11, 0x14, 0x0F, 0x00] {
                 bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
             }
         });
@@ -21791,7 +21802,7 @@ mod tests {
             bus.write_io(0x82, BusWidth::Byte, 0x01).unwrap();
             bus.write_io(0x0A, BusWidth::Byte, 0x03).unwrap();
             // DSP: 11025 Hz, block 16, single-cycle 8-bit DMA output.
-            for &b in &[0x41u8, 0x2B, 0x11, 0x48, 0x0F, 0x00, 0x14] {
+            for &b in &[0x41u8, 0x2B, 0x11, 0x14, 0x0F, 0x00] {
                 bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
             }
         });
@@ -21867,7 +21878,7 @@ mod tests {
             bus.write_io(0x83, BusWidth::Byte, 0x01).unwrap(); // page -> 0x01_0000
             bus.write_io(0x0A, BusWidth::Byte, 0x01).unwrap(); // unmask ch1
             // DSP: 11025 Hz, block 16, single 8-bit DMA output.
-            for &b in &[0x41u8, 0x2B, 0x11, 0x48, 0x0F, 0x00, 0x14] {
+            for &b in &[0x41u8, 0x2B, 0x11, 0x14, 0x0F, 0x00] {
                 bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
             }
         });
@@ -21917,7 +21928,7 @@ mod tests {
             // DSP: set the interleaved byte rate via the 0x40 TIME CONSTANT
             // (tc 0xD3 -> 1_000_000/45 = 22_222 byte/s; SB Pro stereo halves it
             // to the per-channel frame rate), block 16, single 8-bit DMA output.
-            for &b in &[0x40u8, 0xD3, 0x48, 0x0F, 0x00, 0x14] {
+            for &b in &[0x40u8, 0xD3, 0x14, 0x0F, 0x00] {
                 bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
             }
         });
@@ -22121,7 +22132,7 @@ mod tests {
             bus.write_io(0x03, BusWidth::Byte, 0x00).unwrap();
             bus.write_io(0x83, BusWidth::Byte, 0x02).unwrap(); // ch1 page -> 0x02_0000
             bus.write_io(0x0A, BusWidth::Byte, 0x01).unwrap(); // unmask ch1
-            for &b in &[0x41u8, 0x2B, 0x11, 0x48, 0x0F, 0x00, 0x14] {
+            for &b in &[0x41u8, 0x2B, 0x11, 0x14, 0x0F, 0x00] {
                 bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
             }
             // OPL: key a full sustained tone on channel 0 (modulator + carrier +
@@ -23325,7 +23336,7 @@ mod tests {
             bus.write_io(0x83, BusWidth::Byte, 0x01).unwrap();
             bus.write_io(0x0A, BusWidth::Byte, 0x01).unwrap();
             // DSP: 11025 Hz, block 16, single-cycle 8-bit DMA output.
-            for &b in &[0x41u8, 0x2B, 0x11, 0x48, 0x0F, 0x00, 0x14] {
+            for &b in &[0x41u8, 0x2B, 0x11, 0x14, 0x0F, 0x00] {
                 bus.write_io(0x22C, BusWidth::Byte, u32::from(b)).unwrap();
             }
         });
@@ -33076,6 +33087,20 @@ mod tests {
         // and the BIOS-visible EBDA packet size is 4 so int74 assembles the Z byte.
         let pkt_size = (u32::from(EBDA_SEGMENT) << 4) + EBDA_MOUSE_PKT_SIZE_OFF;
         assert_eq!(m.read_physical_u8(pkt_size), 4, "EBDA packet size is 4");
+    }
+
+    #[test]
+    fn c202_sample_rate_is_reported_by_c206_status() {
+        let mut m = int15_machine(4);
+        m.cpu.registers.set_eax(0xC202);
+        m.cpu.registers.set_ebx(0x0600); // BIOS rate code 6 = 200 Hz
+        m.handle_int15();
+        assert_eq!((m.cpu.registers.eax() >> 8) as u8, 0x00);
+
+        m.cpu.registers.set_eax(0xC206);
+        m.cpu.registers.set_ebx(0x0000); // BH=0 status
+        m.handle_int15();
+        assert_eq!(m.cpu.registers.edx() as u8, 200);
     }
 
     #[test]
