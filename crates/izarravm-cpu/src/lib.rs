@@ -1954,6 +1954,21 @@ impl Cpu386 {
         self.control.cr0 & CR0_PE != 0
     }
 
+    /// True while executing ring-0 protected-mode code that is not a V86 task —
+    /// i.e., inside a V86 monitor (TOKAEMM). The machine defers deferred HLE
+    /// interrupt servicing (`handle_int10`/`handle_int13`/…, which assume a
+    /// real-mode INT frame at SS:SP) while this holds, so the HLE runs only once
+    /// the monitor has reflected the INT back into the V86 guest.
+    ///
+    /// ASSUMPTION: today "ring-0 PM" is *only* the TOKAEMM monitor — every stock
+    /// HLE-served BIOS INT (10h–1Ah) is issued from real mode, so this reads false
+    /// there. A future protected-mode guest that legitimately issued an HLE INT at
+    /// CPL 0 would have it deferred until it next left ring-0 PM; revisit this gate
+    /// when PM DOS-extender / DPMI support lands.
+    pub fn is_ring0_protected(&self) -> bool {
+        self.is_protected_mode() && !self.is_v86_mode() && self.current_privilege_level() == 0
+    }
+
     /// The live instruction-set level the core presents to the guest.
     pub fn level(&self) -> CpuLevel {
         self.level
@@ -2444,7 +2459,7 @@ impl Cpu386 {
                 if self.registers.cs().selector != start_cs {
                     self.load_segment_real(SegmentIndex::Cs, start_cs);
                 }
-                self.deliver_exception(bus, vector, error_code)
+                self.deliver_exception(bus, vector, error_code, false)
                     .map_err(|fault| match fault {
                         InternalFault::Cpu(error) => error,
                         InternalFault::Exception { vector, .. } => CpuError::IdtLimit { vector },
@@ -6093,8 +6108,16 @@ impl Cpu386 {
             0xcd => {
                 // INT n. IOPL-sensitive in V86 (checked here, exactly as the fused handler did,
                 // before the delivery). `decode` fetched the vector into `imm`.
-                self.check_v86_iopl()?;
                 let vector = insn.imm as u8;
+                // In V86 a below-IOPL `INT n` faults to the monitor, but the emulator's HLE
+                // BIOS/DOS services (INT 10h video, INT 13h disk, …) are driven from
+                // `interrupt_acknowledge`, which the fault path would otherwise skip — so the
+                // guest's console output would never render under a V86 monitor. Notify the bus
+                // first, exactly as real-mode `software_interrupt` does, then raise the #GP.
+                if self.is_v86_mode() && self.iopl() < 3 {
+                    bus.interrupt_acknowledge(vector, self.read_gpr16(0))?;
+                    self.check_v86_iopl()?;
+                }
                 self.software_interrupt(bus, vector)?;
                 Ok(clocks(37))
             }
@@ -7941,7 +7964,7 @@ impl Cpu386 {
     fn software_interrupt<B: CpuBus>(&mut self, bus: &mut B, vector: u8) -> ExecResult<()> {
         bus.interrupt_acknowledge(vector, self.read_gpr16(0))?;
         if self.is_protected_mode() {
-            self.deliver_exception(bus, vector, None)
+            self.deliver_exception(bus, vector, None, true)
         } else {
             self.real_mode_interrupt(bus, vector)
         }
@@ -7972,7 +7995,7 @@ impl Cpu386 {
     // (the video mode-set), not the INTA handshake, which the PIC handled already.
     fn hardware_interrupt<B: CpuBus>(&mut self, bus: &mut B, vector: u8) -> ExecResult<()> {
         if self.is_protected_mode() {
-            self.deliver_exception(bus, vector, None)
+            self.deliver_exception(bus, vector, None, true)
         } else {
             self.real_mode_interrupt(bus, vector)
         }
@@ -7983,6 +8006,10 @@ impl Cpu386 {
         bus: &mut B,
         vector: u8,
         error_code: Option<u32>,
+        // External hardware interrupts and software `INT n` never push an error code,
+        // even on a vector that a CPU exception would carry one for (e.g. IRQ0 remapped
+        // to vector 8, #DF). Only a genuine CPU exception pushes one.
+        is_external: bool,
     ) -> ExecResult<()> {
         if !self.is_protected_mode() {
             return self.software_interrupt(bus, vector);
@@ -8045,9 +8072,10 @@ impl Cpu386 {
         self.push(bus, saved_eflags, OperandSize::Dword)?;
         self.push(bus, u32::from(saved_cs), OperandSize::Dword)?;
         self.push(bus, saved_eip, OperandSize::Dword)?;
-        // The error code is pushed only for the vectors that carry one, regardless of
-        // what the caller supplied: 8 #DF, 10 #TS, 11 #NP, 12 #SS, 13 #GP, 14 #PF, 17 #AC.
-        if vector_pushes_error_code(vector) {
+        // The error code is pushed only for a CPU exception on a vector that carries one
+        // (8 #DF, 10 #TS, 11 #NP, 12 #SS, 13 #GP, 14 #PF, 17 #AC) — never for an external
+        // hardware interrupt or software `INT n`, even when it lands on such a vector.
+        if !is_external && vector_pushes_error_code(vector) {
             self.push(bus, error_code.unwrap_or(0), OperandSize::Dword)?;
         }
 
@@ -8157,7 +8185,9 @@ impl Cpu386 {
     ) -> ExecResult<()> {
         // A protected-mode far call to a system descriptor goes through a call gate,
         // which supplies its own CS:offset (the instruction's offset is ignored).
-        if self.is_protected_mode() {
+        // A V86 task (PE=1 but VM=1) uses 8086 far-call semantics — its selector is a
+        // real-mode segment, never a descriptor — so it falls through to the direct path.
+        if self.is_protected_mode() && !self.is_v86_mode() {
             let (low, high) = self.read_transfer_descriptor(bus, selector)?;
             if (high >> 8) & 0x10 == 0 {
                 return self.far_system_transfer(bus, selector, low, high, true);
@@ -8204,7 +8234,8 @@ impl Cpu386 {
         offset: u32,
         operand_size: OperandSize,
     ) -> ExecResult<()> {
-        if self.is_protected_mode() {
+        // As in `far_call`: a V86 task's far jump is 8086-style, not a descriptor load.
+        if self.is_protected_mode() && !self.is_v86_mode() {
             let (low, high) = self.read_transfer_descriptor(bus, selector)?;
             if (high >> 8) & 0x10 == 0 {
                 return self.far_system_transfer(bus, selector, low, high, false);
@@ -21194,6 +21225,23 @@ mod tests {
     }
 
     #[test]
+    fn v86_far_call_uses_real_mode_segments() {
+        // CALL FAR 0x8FA9:0x1234 (9A off16 seg16) in a V86 task must be an 8086-style
+        // far call (CS = 0x8FA9, base 0x8FA90), never a GDT descriptor lookup — 0x8FA9
+        // is not a valid selector and would #GP. Regression for the SP-4b V86 boot:
+        // real FreeDOS makes far calls to high segments while virtualized.
+        let (mut cpu, memory) = real_mode_cpu(&[0x9a, 0x34, 0x12, 0xa9, 0x8f], 0x200);
+        cpu.control.cr0 |= CR0_PE;
+        cpu.registers.eflags = 0x2 | FLAG_VM | 0x3000; // IOPL 3
+        cpu.registers.set_esp(0x100);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.cs().selector, 0x8fa9);
+        assert_eq!(cpu.registers.cs().base, 0x8_fa90);
+        assert_eq!(cpu.registers.eip & 0xffff, 0x1234);
+    }
+
+    #[test]
     fn cli_faults_in_v86_below_iopl3() {
         // CLI (0xFA) in a V86 task with IOPL 0 traps to the monitor with #GP(0).
         // CLI is converted to DecodeGroup::FlagsMisc, so drive it through the split (exec_one_split)
@@ -26200,7 +26248,7 @@ mod tests {
         cpu.load_segment_real(SegmentIndex::Gs, 0x4444);
         let saved_eflags = cpu.registers.eflags;
 
-        cpu.deliver_exception(&mut bus, 13, Some(0)).unwrap();
+        cpu.deliver_exception(&mut bus, 13, Some(0), false).unwrap();
 
         assert!(!cpu.is_v86_mode(), "VM must be cleared on monitor entry");
         assert_eq!(cpu.registers.cs().selector, R0_CS);
@@ -26222,6 +26270,28 @@ mod tests {
         assert_eq!(rd(28) & 0xffff, 0x1111, "V86 DS");
         assert_eq!(rd(32) & 0xffff, 0x3333, "V86 FS");
         assert_eq!(rd(36) & 0xffff, 0x4444, "V86 GS");
+    }
+
+    #[test]
+    fn v86_external_interrupt_on_vector_8_pushes_no_error_code() {
+        // A real DOS boot under a V86 monitor keeps the PIC at base 0x08, so IRQ0
+        // lands on vector 8 (#DF). An EXTERNAL interrupt must NOT push an error code
+        // even there — only a genuine CPU exception does. (is_external = true.)
+        let (mut cpu, mut bus) = v86_world(&[0xf4], &[0xf4], &[0x00]);
+        int_gate(&mut bus.memory, 8, MON_CODE);
+        enter_v86_direct(&mut cpu, 0x10, 0x1000);
+
+        cpu.deliver_exception(&mut bus, 8, None, true).unwrap();
+
+        // In the monitor: the top of the ring-0 stack is the V86 EIP, not an error
+        // code (the frame is EIP, CS, EFLAGS, ... with no error code beneath EIP).
+        let esp = cpu.registers.esp();
+        assert_eq!(cpu.registers.eip, MON_CODE);
+        assert_eq!(
+            u32::from_le_bytes(cpu_mem(&bus, esp)),
+            0x10,
+            "external interrupt on vector 8 must not push an error code"
+        );
     }
 
     #[test]

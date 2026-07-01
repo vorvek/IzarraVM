@@ -16,6 +16,8 @@ pub const RUNNER_COM: &[u8] = include_bytes!("../roms/dos/runner.com");
 pub const RUNNER_COM_SOURCE: &str = include_str!("../roms/dos/runner.asm");
 pub const EXIT42_COM: &[u8] = include_bytes!("../roms/dos/exit42.com");
 pub const EXIT42_COM_SOURCE: &str = include_str!("../roms/dos/exit42.asm");
+pub const TOKAEMM_SYS: &[u8] = include_bytes!("../roms/dos/tokaemm.sys");
+pub const TOKAEMM_SYS_SOURCE: &str = include_str!("../roms/dos/tokaemm.asm");
 pub const EXEHELLO_EXE: &[u8] = include_bytes!("../roms/dos/exehello.exe");
 pub const EXEHELLO_EXE_SOURCE: &str = include_str!("../roms/dos/exehello.asm");
 /// The freestanding Dhrystone 2.1 benchmark, built as a small-model DOS .EXE.
@@ -31,6 +33,11 @@ pub const DHRYSTONE_EXE: &[u8] = include_bytes!("../roms/neurketa-c/dhrystone.ex
 /// (load with `Machine::new_raw_program`, read `bench_iterations` = the sweep count
 /// and `bench_aux` = the FP self-check fold). See roms/neurketa-c/whetstone.c.
 pub const WHETSTONE_EXE: &[u8] = include_bytes!("../roms/neurketa-c/whetstone.exe");
+/// The standalone V86 monitor spike (SP-4b M0 Task 2): a 512-byte boot sector that
+/// enters Virtual-8086 mode under a hand-built monitor and signals success through
+/// the unit-tester exit port. Run via `Machine::new_boot_image`.
+pub const V86SPIKE_BIN: &[u8] = include_bytes!("../roms/dos/v86spike.bin");
+pub const V86SPIKE_SOURCE: &str = include_str!("../roms/dos/v86spike.asm");
 pub const KBD_BIOS: &[u8] = include_bytes!("../roms/kbd-bios.bin");
 pub const KBD_BIOS_SOURCE: &str = include_str!("../roms/kbd-bios.asm");
 pub const KBD_RESIDENT_BIOS: &[u8] = include_bytes!("../roms/kbd-resident.bin");
@@ -123,6 +130,16 @@ pub fn runner_com() -> &'static [u8] {
 /// A test program that terminates with DOS exit code 42; the katea-run e2e fixture.
 pub fn exit42_com() -> &'static [u8] {
     EXIT42_COM
+}
+
+/// TOKAEMM.SYS (SP-4b M0): a bespoke memory-manager char device. Its INIT runs
+/// at SYSINIT, builds a load-relative protected-mode + paging + ring-0 monitor
+/// environment in its own resident memory, then IRETDs the running kernel into
+/// virtual-8086 mode — so the rest of DOS boots and runs virtualized under the
+/// monitor. It stays resident permanently. Overlaid onto C: and loaded via
+/// `DEVICE=C:\TOKAEMM.SYS`.
+pub fn tokaemm_sys() -> &'static [u8] {
+    TOKAEMM_SYS
 }
 
 pub fn exehello_exe() -> &'static [u8] {

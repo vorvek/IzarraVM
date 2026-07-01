@@ -9367,7 +9367,14 @@ impl Machine {
                 self.cpu.note_direct_map_changed();
                 self.direct_map_changed = false;
             }
-            self.pending_soft_int = None;
+            // A V86 software INT that the TOKAEMM monitor is reflecting sets
+            // pending_soft_int in one batch (at the #GP to the monitor) but is only
+            // serviced a later batch, once the monitor has IRETed back into V86 with
+            // the real-mode frame in place. Preserve the pending vector across the
+            // monitor's batches — only reset it when NOT inside the ring-0 monitor.
+            if !self.cpu.is_ring0_protected() {
+                self.pending_soft_int = None;
+            }
             self.io_touched = false;
             self.device_wrote_memory = false;
             let trace_before = self.trace.elapsed_clocks();
@@ -9622,7 +9629,13 @@ impl Machine {
                             service_stop = Some(StopReason::TestExit { code });
                         }
                     }
+                    // A software INT taken by a V86 guest faults to the TOKAEMM monitor
+                    // (ring-0 PM) before its frame is reflected onto the guest stack. The
+                    // HLE BIOS services assume that real-mode-style frame at SS:SP+4 (see
+                    // `set_int_frame_carry`), so defer them while the monitor runs; they
+                    // fire once it IRETs back into V86 with the frame in place.
                     if service_stop.is_none()
+                        && !self.cpu.is_ring0_protected()
                         && let Some(vector) = self.pending_soft_int
                     {
                         serviced = true;
@@ -20260,6 +20273,24 @@ mod tests {
         image[510] = 0x55;
         image[511] = 0xaa;
         image
+    }
+
+    // SP-4b M0 Task 2 (increment 1): the standalone V86 spike boots, enters V86 via
+    // the real-mode -> PM+paging -> IRETD-into-V86 transition, and the V86 stub signals
+    // exit code 0xA5 through the unit-tester port. Proves the transition in isolation.
+    #[test]
+    fn v86spike_enters_v86_and_signals() {
+        let mut machine = Machine::new_boot_image(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            boot_image_with(izarravm_firmware::V86SPIKE_BIN),
+        )
+        .unwrap();
+        let reason = machine.run_until_halt_or_cycles(50_000_000).unwrap();
+        assert_eq!(
+            reason,
+            StopReason::TestExit { code: 0xA5 },
+            "V86 spike did not reach the V86 stub and signal (stop={reason:?})"
+        );
     }
 
     #[test]

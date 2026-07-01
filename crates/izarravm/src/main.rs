@@ -2260,4 +2260,77 @@ del PREEXIST.TXT\r\n";
             "the program's DOS exit code must reach the host process"
         );
     }
+
+    /// SP-4b M0 GO/NO-GO: `DEVICE=C:\TOKAEMM.SYS` puts the running kernel into V86
+    /// under TOKAEMM's ring-0 monitor at SYSINIT, and real FreeDOS still finishes
+    /// booting to C:\> — every instruction and hardware IRQ from the DEVICE= line
+    /// onward runs virtualized. The gate: the DOS prompt reaches the screen.
+    ///
+    /// CONFIG.SYS and TOKAEMM.SYS are both passed as `mount_hdd_folder_with`
+    /// overrides (which replace/append onto the committed system files). The host
+    /// `dir` stays empty: a CONFIG.SYS written there would collide with the
+    /// system CONFIG.SYS whose 8.3 name is reserved first, and lose the `~n` fold.
+    #[test]
+    #[ignore = "boots a full DOS image (slow in debug); run with --ignored"]
+    fn tokaemm_m0_freedos_survives_in_v86() {
+        let dir = std::env::temp_dir().join(format!(
+            "tokaemm_t3a_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        // The stock CONFIG.SYS (from the committed image) plus a DEVICE= line for
+        // the bespoke driver. Passed as an override so it replaces the system copy.
+        let config = b"FILES=40\r\nLASTDRIVE=Z\r\nDEVICE=C:\\TOKAEMM.SYS\r\n\
+SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
+            .to_vec();
+
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .expect("build machine");
+        machine
+            .mount_hdd_folder_with(
+                &dir,
+                vec![
+                    ("CONFIG.SYS".to_string(), config),
+                    (
+                        "TOKAEMM.SYS".to_string(),
+                        izarravm_firmware::tokaemm_sys().to_vec(),
+                    ),
+                ],
+            )
+            .expect("mount host folder with overrides");
+
+        let stop = machine.run_until_halt_or_cycles(500_000_000);
+        let text = machine.screen_text().as_text();
+        // FreeDOS boots to the C:\> prompt with the whole system running in V86
+        // under TOKAEMM's monitor (SYSINIT + FreeCOM + every IRQ virtualized).
+        if !text.to_lowercase().contains("c:\\>") {
+            std::fs::remove_dir_all(&dir).ok();
+            panic!("FreeDOS did not reach C:\\> in V86 (stop={stop:?}).\n{text}");
+        }
+
+        // Run a command at the virtualized prompt: type `VER` and confirm the shell
+        // executes it and returns to a fresh prompt — interactive DOS in V86.
+        for ch in "ver\r".chars() {
+            for code in ascii_to_set1(ch) {
+                machine.inject_key_scancodes(&[code]);
+            }
+            let _ = machine.run_until_halt_or_cycles(20_000_000);
+        }
+        let _ = machine.run_until_halt_or_cycles(60_000_000);
+        let after = machine.screen_text().as_text();
+        std::fs::remove_dir_all(&dir).ok();
+        let prompts = after.to_lowercase().matches("c:\\>").count();
+        assert!(
+            prompts >= 2,
+            "VER did not run at the V86 prompt (expected a second C:\\>).\n{after}"
+        );
+    }
 }
