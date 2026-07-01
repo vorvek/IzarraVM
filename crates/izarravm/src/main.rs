@@ -10,11 +10,16 @@ use izarravm_core::{
     AppConfig, ConfigOverrides, GswMode, HardwareProfile, MidiBackend, SbDma8, SbDma16, SbIrq,
     VideoCard,
 };
+use izarravm_cpu::CpuProfileSnapshot;
 use izarravm_firmware::{
     SuiteRecordStatus, boot_test_image, neurketa_image, parse_result_block, test_rom,
 };
 use izarravm_input::InputState;
-use izarravm_machine::{Machine, MachineProfile, PerfCounters, StopReason};
+use izarravm_machine::{
+    Machine, MachineHostProfileSnapshot, MachineProfile, PerfCounters, StopReason,
+};
+use serde_json::json;
+use std::cmp::Reverse;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use tracing::info;
@@ -71,6 +76,15 @@ struct Cli {
     /// Run one supplied DOS EXE through the raw-program bench harness in GSW-586.
     #[arg(long)]
     headless_bench_exe: Option<PathBuf>,
+    /// Run one supplied DOS EXE twice in GSW-586: baseline, then profiling buckets.
+    #[arg(long)]
+    headless_profile_exe: Option<PathBuf>,
+    /// Write --headless-profile-exe output as pretty JSON. Parent directory must exist.
+    #[arg(long)]
+    profile_json: Option<PathBuf>,
+    /// Sample every Nth instruction in --headless-profile-exe.
+    #[arg(long, default_value_t = 1024)]
+    profile_sample_stride: u64,
     #[arg(long)]
     headless_bandwidth: bool,
     #[arg(long)]
@@ -159,6 +173,15 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     if let Some(path) = &cli.headless_bench_exe {
         return run_bench_exe(path, &hardware);
+    }
+
+    if let Some(path) = &cli.headless_profile_exe {
+        return run_profile_exe(
+            path,
+            cli.profile_json.as_deref(),
+            cli.profile_sample_stride,
+            &hardware,
+        );
     }
 
     if cli.headless_bandwidth {
@@ -284,6 +307,8 @@ struct BenchRun {
     wall: std::time::Duration,
     /// Host-side perf counters for this run (decode-cache + straight-line diagnostics).
     perf: PerfCounters,
+    machine_profile: MachineHostProfileSnapshot,
+    cpu_profile: CpuProfileSnapshot,
 }
 
 /// How a benchmark payload is loaded: baked into the Neurketa boot image and
@@ -300,6 +325,16 @@ fn run_bench_one(
     source: &BenchSource<'_>,
     budget: u64,
 ) -> Result<BenchRun, Box<dyn Error>> {
+    run_bench_one_profiled(hardware, mode, source, budget, None)
+}
+
+fn run_bench_one_profiled(
+    hardware: &HardwareProfile,
+    mode: GswMode,
+    source: &BenchSource<'_>,
+    budget: u64,
+    sample_stride: Option<u64>,
+) -> Result<BenchRun, Box<dyn Error>> {
     let profile = MachineProfile::from_hardware_profile(hardware);
     let mut machine = match source {
         BenchSource::BootSelector(selector) => {
@@ -310,6 +345,9 @@ fn run_bench_one(
         BenchSource::DosExe(exe) => Machine::new_raw_program(profile, exe)?,
     };
     machine.set_mode(mode);
+    if let Some(sample_stride) = sample_stride {
+        machine.enable_host_profiling(sample_stride);
+    }
     let started = std::time::Instant::now();
     let stop = machine.run_until_halt_or_cycles(budget)?;
     let wall = started.elapsed();
@@ -328,6 +366,8 @@ fn run_bench_one(
         aux: machine.bench_aux(),
         wall,
         perf,
+        machine_profile: machine.host_profile_snapshot(),
+        cpu_profile: machine.cpu().profile_snapshot(),
     })
 }
 
@@ -577,6 +617,300 @@ fn run_bench_exe(path: &Path, hardware: &HardwareProfile) -> Result<(), Box<dyn 
         rt,
     );
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BenchMetrics {
+    cycles_per_iter: f64,
+    guest_ms: f64,
+    wall_ms: f64,
+    rt_factor: f64,
+    iters_per_sec: f64,
+}
+
+fn bench_metrics(run: &BenchRun, mode: GswMode) -> BenchMetrics {
+    let iters = u64::from(run.iterations.max(1));
+    let cycles_per_iter = run.clocks as f64 / iters as f64;
+    let guest_secs = run.clocks as f64 / mode.clock_hz() as f64;
+    let iters_per_sec = if guest_secs > 0.0 {
+        iters as f64 / guest_secs
+    } else {
+        0.0
+    };
+    let wall_secs = run.wall.as_secs_f64();
+    let rt_factor = if wall_secs > 0.0 {
+        guest_secs / wall_secs
+    } else {
+        0.0
+    };
+    BenchMetrics {
+        cycles_per_iter,
+        guest_ms: guest_secs * 1000.0,
+        wall_ms: wall_secs * 1000.0,
+        rt_factor,
+        iters_per_sec,
+    }
+}
+
+fn print_single_bench_row(name: &str, mode: GswMode, run: &BenchRun) {
+    let metrics = bench_metrics(run, mode);
+    println!(
+        "{:<10} {:<5} {:>12.2} {:>8} {:>9} {:>12.1} {:>10.3} {:>9.3} {:>10.3}",
+        name,
+        mode.canonical_name(),
+        metrics.cycles_per_iter,
+        run.iterations,
+        run.aux,
+        metrics.iters_per_sec,
+        metrics.guest_ms,
+        metrics.wall_ms,
+        metrics.rt_factor,
+    );
+}
+
+fn run_profile_exe(
+    path: &Path,
+    json_path: Option<&Path>,
+    sample_stride: u64,
+    hardware: &HardwareProfile,
+) -> Result<(), Box<dyn Error>> {
+    const BENCH_BUDGET: u64 = 50_000_000_000;
+    let exe = std::fs::read(path)?;
+    let mode = GswMode::Gsw586;
+    let source = BenchSource::DosExe(&exe);
+    let baseline = run_bench_one(hardware, mode, &source, BENCH_BUDGET)?;
+    let profiled =
+        run_bench_one_profiled(hardware, mode, &source, BENCH_BUDGET, Some(sample_stride))?;
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("exe");
+
+    println!("# baseline");
+    println!(
+        "{:<10} {:<5} {:>12} {:>8} {:>9} {:>12} {:>10} {:>9} {:>10}",
+        "bench",
+        "mode",
+        "cyc/iter",
+        "iters",
+        "aux",
+        "iters/sec",
+        "guest_ms",
+        "wall_ms",
+        "rt_factor"
+    );
+    print_single_bench_row(name, mode, &baseline);
+
+    let baseline_metrics = bench_metrics(&baseline, mode);
+    println!();
+    print_machine_profile(&profiled.machine_profile);
+    println!();
+    print_cpu_profile(&profiled.cpu_profile);
+    println!();
+    println!("=== perf counters ===");
+    print_perf_counter_row("profile", mode, &profiled.perf);
+
+    if let Some(json_path) = json_path {
+        write_profile_json(
+            path,
+            json_path,
+            sample_stride,
+            &baseline,
+            &profiled,
+            baseline_metrics,
+        )?;
+    }
+    Ok(())
+}
+
+fn print_machine_profile(snapshot: &MachineHostProfileSnapshot) {
+    let mut phases = snapshot.phases.clone();
+    phases.sort_by_key(|phase| Reverse(phase.wall_ns));
+    let total_ns = phases.iter().map(|phase| phase.wall_ns).sum::<u64>().max(1);
+    println!("=== machine phases ===");
+    println!(
+        "{:<20} {:>12} {:>10} {:>8}",
+        "phase", "wall_ms", "count", "share"
+    );
+    for phase in phases
+        .iter()
+        .filter(|phase| phase.count > 0 || phase.wall_ns > 0)
+    {
+        println!(
+            "{:<20} {:>12.3} {:>10} {:>7.2}%",
+            phase.name,
+            phase.wall_ns as f64 / 1_000_000.0,
+            phase.count,
+            100.0 * phase.wall_ns as f64 / total_ns as f64,
+        );
+    }
+}
+
+fn print_cpu_profile(snapshot: &CpuProfileSnapshot) {
+    let mut groups = snapshot.groups.clone();
+    groups.sort_by_key(|group| Reverse(group.sample_wall_ns));
+    let total_instructions = groups
+        .iter()
+        .map(|group| group.instructions)
+        .sum::<u64>()
+        .max(1);
+    let total_guest = groups
+        .iter()
+        .map(|group| group.guest_core_clocks)
+        .sum::<u64>()
+        .max(1);
+    let total_sample = groups
+        .iter()
+        .map(|group| group.sample_wall_ns)
+        .sum::<u64>()
+        .max(1);
+    println!(
+        "=== cpu groups (sample_stride={}) ===",
+        snapshot.sample_stride
+    );
+    println!(
+        "{:<18} {:>13} {:>8} {:>13} {:>8} {:>12} {:>8} {:>9}",
+        "group", "instr", "instr%", "guest_clk", "guest%", "sample_ms", "sample%", "samples"
+    );
+    for group in groups
+        .iter()
+        .filter(|group| group.instructions > 0 || group.samples > 0)
+    {
+        println!(
+            "{:<18} {:>13} {:>7.2}% {:>13} {:>7.2}% {:>12.3} {:>7.2}% {:>9}",
+            group.name,
+            group.instructions,
+            100.0 * group.instructions as f64 / total_instructions as f64,
+            group.guest_core_clocks,
+            100.0 * group.guest_core_clocks as f64 / total_guest as f64,
+            group.sample_wall_ns as f64 / 1_000_000.0,
+            100.0 * group.sample_wall_ns as f64 / total_sample as f64,
+            group.samples,
+        );
+    }
+}
+
+fn write_profile_json(
+    exe_path: &Path,
+    json_path: &Path,
+    sample_stride: u64,
+    baseline: &BenchRun,
+    profiled: &BenchRun,
+    baseline_metrics: BenchMetrics,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(parent) = json_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        && !parent.exists()
+    {
+        return Err(format!(
+            "profile JSON parent directory does not exist: {}",
+            parent.display()
+        )
+        .into());
+    }
+
+    let mut machine_phases = profiled.machine_profile.phases.clone();
+    machine_phases.sort_by_key(|phase| Reverse(phase.wall_ns));
+    let mut cpu_groups = profiled.cpu_profile.groups.clone();
+    cpu_groups.sort_by_key(|group| Reverse(group.sample_wall_ns));
+    let report = json!({
+        "schema": "izarravm-profile-v1",
+        "exe": exe_path.display().to_string(),
+        "mode": "586",
+        "sample_stride": sample_stride.max(1),
+        "baseline": {
+            "wall_ms": baseline_metrics.wall_ms,
+            "guest_ms": baseline_metrics.guest_ms,
+            "rt_factor": baseline_metrics.rt_factor,
+            "cycles_per_iter": baseline_metrics.cycles_per_iter,
+            "iters": baseline.iterations,
+            "aux": baseline.aux,
+        },
+        "profile": {
+            "wall_ms": profiled.wall.as_secs_f64() * 1000.0,
+            "machine_phases": machine_phases.iter().map(|phase| json!({
+                "name": phase.name,
+                "wall_ns": phase.wall_ns,
+                "count": phase.count,
+            })).collect::<Vec<_>>(),
+            "cpu_groups": cpu_groups.iter().map(|group| json!({
+                "name": group.name,
+                "instructions": group.instructions,
+                "guest_core_clocks": group.guest_core_clocks,
+                "sample_wall_ns": group.sample_wall_ns,
+                "samples": group.samples,
+            })).collect::<Vec<_>>(),
+            "perf": perf_counters_json(&profiled.perf),
+        },
+    });
+    std::fs::write(json_path, serde_json::to_string_pretty(&report)?)?;
+    Ok(())
+}
+
+fn perf_counters_json(perf: &PerfCounters) -> serde_json::Value {
+    json!({
+        "instructions": perf.instructions,
+        "decode_misses": perf.decode_misses,
+        "straight_line_runs": perf.straight_line_runs,
+        "brk_decode_or_branch": perf.brk_decode_or_branch,
+        "brk_step": perf.brk_step,
+        "brk_interrupt": perf.brk_interrupt,
+        "brk_cap": perf.brk_cap,
+        "brk_halt": perf.brk_halt,
+        "data_direct_reads": perf.data_direct_reads,
+        "data_slow_reads": perf.data_slow_reads,
+        "data_direct_writes": perf.data_direct_writes,
+        "data_slow_writes": perf.data_slow_writes,
+        "direct_page_hits": perf.direct_page_hits,
+        "direct_page_misses": perf.direct_page_misses,
+        "direct_data_pointer_reads": perf.direct_data_pointer_reads,
+        "direct_data_pointer_writes": perf.direct_data_pointer_writes,
+        "fetch_page_hits": perf.fetch_page_hits,
+        "fetch_page_misses": perf.fetch_page_misses,
+        "slow_prefetch_refills": perf.slow_prefetch_refills,
+        "direct_map_invalidations": perf.direct_map_invalidations,
+        "rep_string_iterations": perf.rep_string_iterations,
+        "rep_string_fast_iterations": perf.rep_string_fast_iterations,
+        "flag_materializations": perf.flag_materializations,
+        "cache_tier_lookups": perf.cache_tier_lookups,
+    })
+}
+
+fn print_perf_counter_row(name: &str, mode: GswMode, perf: &PerfCounters) {
+    let instructions = perf.instructions.max(1);
+    let decode_hit = 100.0 * (1.0 - perf.decode_misses as f64 / instructions as f64);
+    let insns_per_run = perf.instructions as f64 / perf.straight_line_runs.max(1) as f64;
+    println!(
+        "perf  {:<10} {:<5} instr={:>13}  decode_hit={:>6.2}%  insns/run={:>9.1}  \
+         brk[branch/step/int/cap/halt]={}/{}/{}/{}/{}  \
+         data[rd d/s wr d/s]={}/{}/{}/{}  ptr[rd/wr]={}/{}  \
+         page[h/m]={}/{}  fetch_page[h/m slow_refill]={}/{}/{}  \
+         map_inv={}  rep[fast/all]={}/{}  flags_mat={}  cache_lookups={}",
+        name,
+        mode.canonical_name(),
+        perf.instructions,
+        decode_hit,
+        insns_per_run,
+        perf.brk_decode_or_branch,
+        perf.brk_step,
+        perf.brk_interrupt,
+        perf.brk_cap,
+        perf.brk_halt,
+        perf.data_direct_reads,
+        perf.data_slow_reads,
+        perf.data_direct_writes,
+        perf.data_slow_writes,
+        perf.direct_data_pointer_reads,
+        perf.direct_data_pointer_writes,
+        perf.direct_page_hits,
+        perf.direct_page_misses,
+        perf.fetch_page_hits,
+        perf.fetch_page_misses,
+        perf.slow_prefetch_refills,
+        perf.direct_map_invalidations,
+        perf.rep_string_fast_iterations,
+        perf.rep_string_iterations,
+        perf.flag_materializations,
+        perf.cache_tier_lookups,
+    );
 }
 
 /// Compare a measured `iters/sec` to the matching era reference band and return

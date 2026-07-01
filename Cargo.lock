@@ -1646,6 +1646,7 @@ dependencies = [
  "pollster",
  "rfd",
  "serde",
+ "serde_json",
  "time",
  "toml",
  "tracing",
