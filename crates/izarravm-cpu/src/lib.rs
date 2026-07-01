@@ -24677,4 +24677,55 @@ mod tests {
             "permitted OUT should reach the I/O bus"
         );
     }
+
+    #[test]
+    fn v86_monitor_round_trip_go_no_go() {
+        // Guest: STI (fb) ; OUT 0x80,AL (e6 80) ; INT 0x21 (cd 21) ; HLT (f4).
+        let guest = [0xfb, 0xe6, 0x80, 0xcd, 0x21, 0xf4];
+        let monitor = [0xf4]; // unused: we emulate the monitor from Rust below.
+        let bitmap = vec![0u8; 0x20 + 1]; // all permitted
+        let (mut cpu, mut bus) = v86_world(&monitor, &guest, &bitmap);
+        enter_v86_direct(&mut cpu, 0, 0x1000);
+
+        let mut traps = 0;
+        let mut guest_hlt = false;
+        for _ in 0..64 {
+            let outcome = cpu.cycle(&mut bus).unwrap();
+            if !cpu.is_v86_mode() && cpu.registers.cs().selector == R0_CS {
+                // In the monitor because the guest faulted. Read the V86 #GP(13) frame,
+                // advance the guest EIP past the faulting instruction, IRET back to V86.
+                traps += 1;
+                // Discard the error code (vector 13 pushes one) so IRET pops from EIP.
+                let esp = cpu.registers.esp() + 4;
+                cpu.registers.set_esp(esp);
+                let guest_eip = u32::from_le_bytes(cpu_mem(&bus, esp));
+                let opcode = bus.memory[(0xA000 + guest_eip) as usize];
+                let len = match opcode {
+                    0xfb => 1, // STI
+                    0xcd => 2, // INT imm8
+                    other => {
+                        panic!("unexpected trap on opcode {other:#x} at guest eip {guest_eip:#x}")
+                    }
+                };
+                bus.memory[esp as usize..esp as usize + 4]
+                    .copy_from_slice(&(guest_eip + len).to_le_bytes());
+                cpu.iret(&mut bus, OperandSize::Dword).unwrap();
+                continue;
+            }
+            if outcome.halted && cpu.is_v86_mode() {
+                guest_hlt = true;
+                break;
+            }
+        }
+
+        assert!(guest_hlt, "guest never reached its terminal HLT");
+        assert_eq!(traps, 2, "STI and INT 0x21 must each trap once");
+        assert!(
+            bus.trace
+                .cycles()
+                .iter()
+                .any(|c| c.kind == BusAccessKind::IoWrite && c.address == 0x80),
+            "permitted OUT 0x80 should have run in V86"
+        );
+    }
 }
