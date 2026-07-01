@@ -8937,16 +8937,25 @@ impl Cpu386 {
     fn inc_dec(&mut self, value: u32, is_dec: bool, width: BusWidth) -> u32 {
         // INC/DEC affect OF/SF/ZF/AF/PF exactly like ADD/SUB by 1, but leave CF.
         let carry = self.flag(FLAG_CF);
+        let mask = width_mask(width);
+        let value = value & mask;
         let result = if is_dec {
-            self.alu_sub(value, 1, 0, width)
+            value.wrapping_sub(1) & mask
         } else {
-            self.alu_add(value, 1, 0, width)
+            value.wrapping_add(1) & mask
         };
-        if let Some(p) = &mut self.pending_flags {
-            p.cf_override = Some(carry);
-        } else {
-            self.set_flag(FLAG_CF, carry);
-        }
+        self.pending_flags = Some(LazyFlags {
+            a: value,
+            b: 1,
+            result,
+            width,
+            op: if is_dec {
+                LazyFlagOp::Sub
+            } else {
+                LazyFlagOp::Add
+            },
+            cf_override: Some(carry),
+        });
         result
     }
 
