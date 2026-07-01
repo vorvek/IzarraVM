@@ -9087,6 +9087,17 @@ impl Machine {
         self.advance_devices(clocks);
     }
 
+    /// Advance device time by `shortfall` guest clocks WITHOUT running the CPU, and
+    /// bump `elapsed_clocks` to match. Used by the GUI in the Approximate class when
+    /// the CPU could not run its full wall-clock budget: the devices (PIT/OPL/DSP/DMA
+    /// producers) and the audio-pump clock advance on real elapsed time so music and
+    /// timers hold realtime instead of underrunning. Guest-invisible to program
+    /// RESULTS (no instruction runs); only the approximate time base moves.
+    pub fn pace_devices_to_wall(&mut self, shortfall: u64) {
+        self.advance_devices(shortfall);
+        self.elapsed_clocks += shortfall;
+    }
+
     /// Rebuild the DSP resampler when the programmed sample rate changes, so it
     /// always runs rate_hz -> 44100.
     fn sync_dsp_resampler(&mut self) {
@@ -18194,6 +18205,18 @@ mod tests {
         );
         let flags = machine.cpu().registers.eflags;
         assert_eq!(flags & 0x0001, 0, "CF clear after WAIT");
+    }
+
+    #[test]
+    fn pace_devices_to_wall_advances_clock_by_the_shortfall() {
+        let mut machine = test_machine();
+        let before = machine.elapsed_clocks();
+        machine.pace_devices_to_wall(1000);
+        assert_eq!(
+            machine.elapsed_clocks(),
+            before + 1000,
+            "the shortfall must advance the guest clock so audio pacing tracks wall time"
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use crate::prefs::{self, CrtStyle, GuiPrefs, KeyBinding};
 use izarravm_audio::{AudioPlayer, AudioSink};
-use izarravm_core::GswMode;
+use izarravm_core::{GswMode, TimingClass};
 use izarravm_input::HostKeyboard;
 use izarravm_machine::{ActiveDisplay, Machine, MachineProfile, StopReason};
 use izarravm_video::{DISTIRA_RENDER_THREAD_CHOICES, normalize_distira_render_threads};
@@ -922,6 +922,17 @@ fn emulate(
             // framebuffer is presented instead.
             if matches!(stop, Some(StopReason::Halted)) {
                 machine.advance_devices_clocks(budget);
+            } else if machine.active_mode().timing_class() == TimingClass::Approximate {
+                // Approximate class (486/586): if the CPU could not run the full
+                // wall-clock budget (host too slow this slice), advance the devices and
+                // the audio-pump clock by the shortfall so music/timers hold realtime
+                // instead of underrunning. Exclude the intentional device stall. The
+                // Accurate class (286/386) keeps exact guest-clock-coupled pacing.
+                let productive = ran.saturating_sub(stalled);
+                let shortfall = budget.saturating_sub(productive);
+                if shortfall > 0 {
+                    machine.pace_devices_to_wall(shortfall);
+                }
             }
             if let Some(sink) = &sink {
                 pump_audio(
