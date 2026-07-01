@@ -942,11 +942,11 @@ fn emulate(
             // ran from the credit so the stall still costs wall-clock time, but
             // exclude it from the speed measurement below.
             let stalled = machine.io_stall_clocks().saturating_sub(stall_before);
+            let mut topped_up = 0u64;
             // A halted guest (POST done, nothing to boot) stops driving the video
             // beam, so the display would freeze on whatever half-drawn frame was
             // completing when HLT ran. Keep scanning the VGA so the final, complete
             // framebuffer is presented instead.
-            let mut topped_up = 0u64;
             if matches!(stop, Some(StopReason::Halted)) {
                 machine.advance_devices_clocks(budget);
             } else if approximate {

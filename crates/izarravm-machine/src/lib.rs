@@ -18244,12 +18244,34 @@ mod tests {
         // device_fill_never_moves_the_master_clock above: that path fills a gap
         // the master clock already jumped over; this one creates the time.
         let mut machine = test_machine();
+        fn latched_count(m: &mut Machine) -> u16 {
+            let mut bus = m.make_bus();
+            bus.write_io(0x43, BusWidth::Byte, 0x00).unwrap(); // latch counter 0
+            let lo = bus.read_io(0x40, BusWidth::Byte).unwrap() as u16;
+            let hi = bus.read_io(0x40, BusWidth::Byte).unwrap() as u16;
+            lo | (hi << 8)
+        }
+        {
+            // Program PIT counter 0 (mode 3, reload 0 = 65536) so it counts; the
+            // test ROM machine never ran the POST timer setup.
+            let mut bus = machine.make_bus();
+            bus.write_io(0x43, BusWidth::Byte, 0x36).unwrap();
+            bus.write_io(0x40, BusWidth::Byte, 0x00).unwrap();
+            bus.write_io(0x40, BusWidth::Byte, 0x00).unwrap();
+        }
         let before = machine.elapsed_clocks();
-        machine.advance_wall_shortfall(1000);
+        let pit_before = latched_count(&mut machine);
+        // 100_000 clocks at the 386 mode rate is ~4.5ms, thousands of PIT ticks.
+        machine.advance_wall_shortfall(100_000);
         assert_eq!(
             machine.elapsed_clocks(),
-            before + 1000,
+            before + 100_000,
             "advance_wall_shortfall must advance the master clock by exactly `clocks`"
+        );
+        assert_ne!(
+            latched_count(&mut machine),
+            pit_before,
+            "advance_wall_shortfall must advance device time (PIT counter 0 moved)"
         );
     }
 
