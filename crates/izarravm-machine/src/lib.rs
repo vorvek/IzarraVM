@@ -855,7 +855,7 @@ const fn cache_geometry(level: CpuLevel) -> CacheGeometry {
 /// limits the per-access average). `l1` also doubles as nothing here -- the code
 /// fetch uses its own `code_fetch_ws` dial. See bench_reference.rs for the bands
 /// and the recorded SpeedSys gaps.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct TierCost {
     l1: u8,
     l2: u8,
@@ -916,7 +916,7 @@ const fn tier_cost(level: CpuLevel) -> TierCost {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct CacheLevelConfig {
     l1_mask: u32,
     l2_mask: u32,
@@ -1009,6 +1009,9 @@ enum Tier {
 struct CacheModel {
     l1_tags: Box<[u32]>, // sized to the largest L1 line count (586: 512)
     l2_tags: Box<[u32]>, // sized to the largest L2 line count (586: 8192)
+    config: CacheLevelConfig,
+    cost: TierCost,
+    code_fetch_ws: u8,
     lookups: u64,
 }
 
@@ -1018,12 +1021,22 @@ struct CacheModel {
 const CACHE_EMPTY_TAG: u32 = u32::MAX;
 
 impl CacheModel {
-    fn new() -> Self {
+    fn new(level: CpuLevel) -> Self {
         Self {
             l1_tags: vec![CACHE_EMPTY_TAG; CACHE_L1_MAX_LINES].into_boxed_slice(),
             l2_tags: vec![CACHE_EMPTY_TAG; CACHE_L2_MAX_LINES].into_boxed_slice(),
+            config: cache_level_config(level),
+            cost: tier_cost(level),
+            code_fetch_ws: code_fetch_ws(level),
             lookups: 0,
         }
+    }
+
+    fn set_level(&mut self, level: CpuLevel) {
+        self.config = cache_level_config(level);
+        self.cost = tier_cost(level);
+        self.code_fetch_ws = code_fetch_ws(level);
+        self.reset();
     }
 
     /// Resolve a DATA access at `phys` to a tier for the live `level`, installing the
@@ -1082,13 +1095,11 @@ impl CacheModel {
     /// `memory_wait_states` before reaching here, so this only ever sees cacheable
     /// RAM.
     #[inline(always)]
-    fn data_wait_states(&mut self, level: CpuLevel, phys: u32, _width: BusWidth) -> u8 {
-        let config = cache_level_config(level);
-        let cost = tier_cost(level);
-        match self.data_tier_with_config(config, phys) {
-            Tier::L1 => cost.l1,
-            Tier::L2 => cost.l2,
-            Tier::Ram => cost.ram,
+    fn data_wait_states(&mut self, phys: u32, _width: BusWidth) -> u8 {
+        match self.data_tier_with_config(self.config, phys) {
+            Tier::L1 => self.cost.l1,
+            Tier::L2 => self.cost.l2,
+            Tier::Ram => self.cost.ram,
         }
     }
 
@@ -1100,8 +1111,8 @@ impl CacheModel {
     /// fetch is pipelined and far cheaper per byte, so charging the data L1 cost on
     /// every fetched byte would crush the compute benchmarks (Dhrystone, fp-mandel)
     /// well below their bands. The code-fetch constant is its own per-mode dial.
-    fn code_fetch_wait_states(&self, level: CpuLevel) -> u8 {
-        code_fetch_ws(level)
+    fn code_fetch_wait_states(&self) -> u8 {
+        self.code_fetch_ws
     }
 
     /// Drop all cached lines (mode change). Both arrays go back to the sentinel so
@@ -1650,7 +1661,7 @@ impl Machine {
             pending_mode: None,
             timing,
             cpu,
-            cache_model: CacheModel::new(),
+            cache_model: CacheModel::new(cpu_level_for_mode(active_mode)),
             bus_rem: 0,
             video: Box::new(Vga::default()),
             paradise_non_vga: false,
@@ -2554,7 +2565,6 @@ impl Machine {
             toka_service_status: self.toka_service_status,
             unittester: &mut self.unittester,
             wait_states: self.profile.wait_states,
-            level: self.cpu.level(),
             cache: &mut self.cache_model,
             io_touched: &mut self.io_touched,
             device_wrote_memory: &mut self.device_wrote_memory,
@@ -8614,7 +8624,7 @@ impl Machine {
         self.cpu.set_level(cpu_level_for_mode(mode));
         // The modeled cache contents are per-mode (geometry changes with the CPU
         // level); a mode switch starts cold.
-        self.cache_model.reset();
+        self.cache_model.set_level(cpu_level_for_mode(mode));
         // The bus scaler's fractional carry is per-mode (the ratio changes); start
         // a new mode with no carried remainder, exactly like the CPU does for its
         // instruction-clock scaler.
@@ -9473,7 +9483,6 @@ impl Machine {
                     toka_service_status: *toka_service_status,
                     unittester,
                     wait_states: profile.wait_states,
-                    level: cpu.level(),
                     cache: cache_model,
                     io_touched,
                     device_wrote_memory,
@@ -9765,11 +9774,10 @@ struct MachineBus<'a> {
     toka_service_status: u8,                  // a copy, for the 0xE3 status read
     unittester: &'a mut unittester::UnitTester, // Lotura ports 0xE4-0xE6
     wait_states: WaitStateProfile,
-    // The cache model and the live CPU level it is keyed on. A data access warms
-    // the cache via data_access_wait_states; the level picks the per-mode geometry,
-    // and the resolved tier's calibrated cost is the charged wait-state.
+    // The cache model carries the active CPU level's geometry/cost. A data access
+    // warms it via data_access_wait_states, and the resolved tier's calibrated cost
+    // is the charged wait-state.
     cache: &'a mut CacheModel,
-    level: CpuLevel,
     // Set true by any port I/O this batch. The run loop batches straight-line
     // instructions and services devices once per batch; a port access (a PIT
     // latch read, 0x3DA retrace poll, RTC read, a PIT/PIC/DSP/mode write) reads
@@ -11839,7 +11847,7 @@ impl MachineBus<'_> {
             // Device/ROM: untiered, unchanged timing.
             return self.memory_wait_states(address);
         }
-        self.cache.data_wait_states(self.level, address, width)
+        self.cache.data_wait_states(address, width)
     }
 
     /// Wait-states for a single code-fetch byte at the post-A20 physical `address`.
@@ -11850,7 +11858,7 @@ impl MachineBus<'_> {
         if address >= 0x000A_0000 && self.is_device_window(address, BusWidth::Byte) {
             self.memory_wait_states(address)
         } else {
-            self.cache.code_fetch_wait_states(self.level)
+            self.cache.code_fetch_wait_states()
         }
     }
 
@@ -12043,7 +12051,7 @@ mod tests {
 
     #[test]
     fn cache_model_resolves_tiers_by_working_set() {
-        let mut c = CacheModel::new();
+        let mut c = CacheModel::new(CpuLevel::I486);
         let warm = |c: &mut CacheModel, base: u32, len: u32| {
             for off in (0..len).step_by(64) {
                 c.data_tier(CpuLevel::I486, base + off);
@@ -12060,7 +12068,7 @@ mod tests {
 
     #[test]
     fn cache_model_reset_goes_cold() {
-        let mut c = CacheModel::new();
+        let mut c = CacheModel::new(CpuLevel::I586);
         c.data_tier(CpuLevel::I586, 0x30_0000); // installs the line
         assert_eq!(c.data_tier(CpuLevel::I586, 0x30_0000), Tier::L1); // hot
         c.reset();
@@ -19803,7 +19811,6 @@ mod tests {
             toka_service_status: machine.toka_service_status,
             unittester: &mut machine.unittester,
             wait_states: machine.profile.wait_states,
-            level: machine.cpu.level(),
             cache: &mut machine.cache_model,
             io_touched: &mut machine.io_touched,
             device_wrote_memory: &mut machine.device_wrote_memory,
