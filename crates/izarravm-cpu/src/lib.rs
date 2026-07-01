@@ -1457,6 +1457,16 @@ fn block_continuable(group: DecodeGroup, opcode: u16, modrm: Option<ModRm>) -> b
     if block_straight_line(group) {
         return true;
     }
+    // String ops (MOVS/CMPS/STOS/LODS/SCAS, REP or not) fall through, never touch a port
+    // (INS/OUTS are Misc and stay terminators), and never change CS. The REP forms are
+    // safe too because `run_string` executes the WHOLE repeat atomically inside one
+    // instruction dispatch (no mid-instruction yield or eip-resume seam exists), so the
+    // interrupt window is the instruction boundary in both run positions — identical to
+    // the per-instruction loop. A faulting iteration routes through finish_instruction's
+    // rewind exactly as on the one-instruction path.
+    if group == DecodeGroup::StringOps {
+        return true;
+    }
     if group != DecodeGroup::ControlFlow {
         return false;
     }
