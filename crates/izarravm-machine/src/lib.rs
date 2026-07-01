@@ -158,6 +158,10 @@ const DISTIRA_PCI_REVISION: u8 = 0x02;
 pub const LOW_BIOS_BASE: u32 = 0x000f_0000;
 pub const BIOS_ROM_SIZE: usize = 64 * 1024;
 const BIOS_ROM_SEGMENT: u16 = (LOW_BIOS_BASE >> 4) as u16;
+const RAM_LOOKUP_PAGE_BITS: usize = 12;
+const RAM_LOOKUP_PAGE_SIZE: usize = 1 << RAM_LOOKUP_PAGE_BITS;
+const RAM_LOOKUP_PAGE_MASK: usize = RAM_LOOKUP_PAGE_SIZE - 1;
+const RAM_LOOKUP_SLOW: usize = usize::MAX;
 const BIOS_FONT_8X8_ROM_OFFSET: u16 = 0xC000;
 const BIOS_FONT_8X14_ROM_OFFSET: u16 = 0xC800;
 const BIOS_FONT_8X16_ROM_OFFSET: u16 = 0xD600;
@@ -576,6 +580,19 @@ impl PciConfig {
         self.distira_present && self.distira_command & 0x0002 != 0
     }
 
+    fn distira_memory_decode_key(&self) -> (bool, u32) {
+        (self.distira_memory_enabled(), self.distira_mem_base)
+    }
+
+    fn distira_bar_overlaps(&self, start: usize, end: usize) -> bool {
+        if !self.distira_memory_enabled() {
+            return false;
+        }
+        let bar_start = u64::from(self.distira_mem_base);
+        let bar_end = bar_start + u64::from(DISTIRA_PCI_BAR_SIZE);
+        (start as u64) < bar_end && bar_start < (end as u64)
+    }
+
     fn read_data(&self, port_offset: u16, width: BusWidth) -> u32 {
         let base = (self.address & 0xfc) + u32::from(port_offset);
         (0..width.bytes())
@@ -638,6 +655,78 @@ impl PciConfig {
             && ((self.address >> 11) & 0x1f) as u8 == DISTIRA_PCI_SLOT
             && ((self.address >> 8) & 0x07) == 0
     }
+}
+
+#[derive(Debug)]
+struct RamPageLookup {
+    page_bases: Box<[usize]>,
+    memory_len: usize,
+}
+
+impl RamPageLookup {
+    fn new(memory_len: usize, pci: &PciConfig) -> Self {
+        let page_count = memory_len.div_ceil(RAM_LOOKUP_PAGE_SIZE);
+        let mut lookup = Self {
+            page_bases: vec![RAM_LOOKUP_SLOW; page_count].into_boxed_slice(),
+            memory_len,
+        };
+        lookup.rebuild(memory_len, pci);
+        lookup
+    }
+
+    fn rebuild(&mut self, memory_len: usize, pci: &PciConfig) {
+        self.memory_len = memory_len;
+        let page_count = memory_len.div_ceil(RAM_LOOKUP_PAGE_SIZE);
+        if self.page_bases.len() != page_count {
+            self.page_bases = vec![RAM_LOOKUP_SLOW; page_count].into_boxed_slice();
+        } else {
+            self.page_bases.fill(RAM_LOOKUP_SLOW);
+        }
+
+        for (page, base) in self.page_bases.iter_mut().enumerate() {
+            let start = page * RAM_LOOKUP_PAGE_SIZE;
+            let end = (start + RAM_LOOKUP_PAGE_SIZE).min(memory_len);
+            if ram_lookup_page_is_direct(start, end, pci) {
+                *base = start;
+            }
+        }
+    }
+
+    #[inline]
+    fn direct_bytes(&self, address: u32, bytes: usize) -> Option<(usize, usize)> {
+        let start = address as usize;
+        let end = start.checked_add(bytes)?;
+        if bytes == 0 || end > self.memory_len {
+            return None;
+        }
+        let first_page = start >> RAM_LOOKUP_PAGE_BITS;
+        let last_page = (end - 1) >> RAM_LOOKUP_PAGE_BITS;
+        let first_base = self.page_bases.get(first_page).copied()?;
+        if first_base == RAM_LOOKUP_SLOW {
+            return None;
+        }
+        if first_page == last_page {
+            let mapped_start = first_base + (start & RAM_LOOKUP_PAGE_MASK);
+            return Some((mapped_start, mapped_start + bytes));
+        }
+        for page in first_page..=last_page {
+            if self.page_bases.get(page).copied()? == RAM_LOOKUP_SLOW {
+                return None;
+            }
+        }
+        let mapped_start = first_base + (start & RAM_LOOKUP_PAGE_MASK);
+        Some((mapped_start, mapped_start + bytes))
+    }
+}
+
+fn ram_lookup_page_is_direct(start: usize, end: usize, pci: &PciConfig) -> bool {
+    if end <= 0x000A_0000 {
+        return true;
+    }
+    if start < 0x0010_0000 {
+        return false;
+    }
+    !pci.distira_bar_overlaps(start, end)
 }
 
 fn port_span_in(port: u16, width: BusWidth, start: u16, end: u16) -> bool {
@@ -1013,6 +1102,7 @@ pub struct Machine {
     // clocks). Reset on a mode switch (the per-mode ratio changes).
     bus_rem: u64,
     memory: Memory,
+    ram_lookup: RamPageLookup,
     // Boxed: Vga is ~99 KB. Inline, the Machine value (and its Result wrapper)
     // got copied through the constructors enough times in debug builds to
     // overflow the main-thread stack before the binary did any work. On the heap
@@ -1490,6 +1580,8 @@ impl Machine {
         let memory_mib = profile.memory_mib;
         let distira = Distira::new();
         let pci = PciConfig::new(profile.video == VideoCard::Distira);
+        let memory = Memory::from_mib(profile.memory_mib)?;
+        let ram_lookup = RamPageLookup::new(memory.len(), &pci);
         let timing = TimingFactors::for_clock(active_mode.clock_hz());
         // Partition extended RAM between XMS and EMS from the EMM386 mode.
         let (xms, ems) = build_xms_ems(memory_mib, profile.emm386, None, EMS_FRAME_DEFAULT_SEG);
@@ -1507,7 +1599,8 @@ impl Machine {
             ..BIOS_MASTER_IRQ_ISR_ROM_OFFSET + BIOS_MASTER_IRQ_ISR_STUB.len()]
             .copy_from_slice(&BIOS_MASTER_IRQ_ISR_STUB);
         let machine = Self {
-            memory: Memory::from_mib(profile.memory_mib)?,
+            memory,
+            ram_lookup,
             profile,
             active_mode,
             pending_mode: None,
@@ -2605,6 +2698,7 @@ impl Machine {
     fn make_bus(&mut self) -> MachineBus<'_> {
         MachineBus {
             memory: &mut self.memory,
+            ram_lookup: &mut self.ram_lookup,
             video: &mut self.video,
             margo: &mut self.margo,
             distira: &mut self.distira,
@@ -11704,6 +11798,7 @@ impl Machine {
                     cpu,
                     cache_model,
                     memory,
+                    ram_lookup,
                     video,
                     margo,
                     distira,
@@ -11746,6 +11841,7 @@ impl Machine {
                 } = self;
                 let mut bus = MachineBus {
                     memory,
+                    ram_lookup,
                     video,
                     margo,
                     distira,
@@ -12021,6 +12117,7 @@ impl Machine {
 
 struct MachineBus<'a> {
     memory: &'a mut Memory,
+    ram_lookup: &'a mut RamPageLookup,
     video: &'a mut Vga,
     margo: &'a mut Margo,
     distira: &'a mut Distira,
@@ -12493,7 +12590,11 @@ impl CpuBus for MachineBus<'_> {
             self.wait_states.io,
         );
 
+        let pci_decode = self.pci.distira_memory_decode_key();
         if self.pci.write_io(port, width, value) {
+            if self.pci.distira_memory_decode_key() != pci_decode {
+                self.ram_lookup.rebuild(self.memory.len(), self.pci);
+            }
             return Ok(());
         }
 
@@ -13637,25 +13738,17 @@ impl MachineBus<'_> {
 
     #[inline]
     fn direct_ram_range(&self, address: u32, width: BusWidth) -> Option<(usize, usize)> {
+        self.direct_ram_bytes(address, width.bytes() as usize)
+    }
+
+    #[inline]
+    fn direct_ram_bytes(&self, address: u32, bytes: usize) -> Option<(usize, usize)> {
         let start = address as usize;
-        let end = start.checked_add(width.bytes() as usize)?;
-        if end > self.memory.len() {
-            return None;
-        }
-        if end <= 0x000A_0000 {
+        let end = start.checked_add(bytes)?;
+        if end <= 0x000A_0000 && end <= self.memory.len() {
             return Some((start, end));
         }
-        if self.is_device_window(address, width) {
-            return None;
-        }
-        if let Some(ems) = self.ems {
-            let last = address + width.bytes() - 1;
-            if ems.in_frame(address) || ems.in_frame(last) {
-                return None;
-            }
-        }
-        // ponytail: flat RAM only; a real page-pointer table can replace this if profiling justifies it.
-        Some((start, end))
+        self.ram_lookup.direct_bytes(address, bytes)
     }
 
     /// The plane-window offset for an access that the guest-selected GC06 graphics
@@ -13686,14 +13779,8 @@ impl MachineBus<'_> {
             return Ok(());
         }
 
-        // Fast path: an access lying entirely within conventional RAM, below the
-        // 0xA0000 video aperture, touches none of the device windows decoded
-        // below and resolves to the same backing-store read the gauntlet ends
-        // with. This is the overwhelmingly common access for real-mode code, so
-        // skip straight to the slice copy.
-        let ram_end = address as usize + width;
-        if ram_end <= 0x000A_0000 && ram_end <= self.memory.len() {
-            out.copy_from_slice(&self.memory.as_slice()[address as usize..ram_end]);
+        if let Some((start, end)) = self.direct_ram_bytes(address, width) {
+            out.copy_from_slice(&self.memory.as_slice()[start..end]);
             return Ok(());
         }
 
@@ -13820,11 +13907,7 @@ impl MachineBus<'_> {
     }
 
     fn write_memory_byte(&mut self, address: u32, value: u8) -> Result<(), BusError> {
-        // Fast path: conventional RAM below the 0xA0000 video aperture has no
-        // device window here and resolves to the same backing-store write the
-        // gauntlet below ends with.
-        let addr = address as usize;
-        if addr < 0x000A_0000 && addr < self.memory.len() {
+        if let Some((addr, _)) = self.direct_ram_bytes(address, 1) {
             return self.memory.write_u8(addr, value);
         }
 
@@ -23325,6 +23408,7 @@ mod tests {
     fn with_bus<R>(machine: &mut Machine, f: impl FnOnce(&mut MachineBus) -> R) -> R {
         let mut bus = MachineBus {
             memory: &mut machine.memory,
+            ram_lookup: &mut machine.ram_lookup,
             video: &mut machine.video,
             margo: &mut machine.margo,
             distira: &mut machine.distira,
@@ -23370,6 +23454,120 @@ mod tests {
             device_wrote_memory: &mut machine.device_wrote_memory,
         };
         f(&mut bus)
+    }
+
+    #[test]
+    fn ram_lookup_rebuilds_when_distira_bar_moves_over_ram() {
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(24, VideoCard::Distira),
+            vec![0u8; BIOS_ROM_SIZE],
+        )
+        .unwrap();
+        const RAM_ADDR: u32 = 0x0100_0000;
+        machine.memory.write_u8(RAM_ADDR as usize, 0x5a).unwrap();
+
+        with_bus(&mut machine, |bus| {
+            let config_addr = 0x8000_0000 | (u32::from(DISTIRA_PCI_SLOT) << 11) | 0x10;
+            bus.write_io(PCI_CONFIG_ADDRESS_PORT, BusWidth::Dword, config_addr)
+                .unwrap();
+            bus.write_io(PCI_CONFIG_DATA_PORT, BusWidth::Dword, RAM_ADDR)
+                .unwrap();
+            bus.write_memory(RAM_ADDR, BusWidth::Byte, 0xa5, BusAccessKind::DataWrite)
+                .unwrap();
+        });
+
+        assert_eq!(
+            machine.memory.read_u8(RAM_ADDR as usize).unwrap(),
+            0x5a,
+            "Distira BAR relocation must invalidate direct-RAM lookup entries"
+        );
+    }
+
+    // Profiling probe for the RAM page lookup. Not a correctness test; run with:
+    // cargo test --release -p izarravm-machine ram_lookup_profile -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn ram_lookup_profile() {
+        let iters = std::env::var("IZARRAVM_PROFILE_ITERS")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(5_000_000);
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(24, VideoCard::Et4000Ax),
+            vec![0u8; BIOS_ROM_SIZE],
+        )
+        .unwrap();
+
+        for i in 0..1024u32 {
+            machine.write_physical_u8(0x2000 + i, i as u8);
+            machine.write_physical_u8(0x10_0000 + i, i as u8);
+        }
+
+        fn report(label: &str, iters: u32, mut body: impl FnMut(u32) -> u32) -> u32 {
+            let t = std::time::Instant::now();
+            let mut checksum = 0u32;
+            for i in 0..iters {
+                checksum = checksum
+                    .wrapping_add(std::hint::black_box(body(i)).rotate_left(i & 31))
+                    .wrapping_add(i);
+            }
+            let secs = t.elapsed().as_secs_f64();
+            let ns = secs * 1.0e9 / f64::from(iters);
+            println!(
+                "{label:<32} {ns:>8.2} ns/op  {:>8.1} Mops/s  checksum={checksum:#010x}",
+                f64::from(iters) / secs / 1.0e6
+            );
+            checksum
+        }
+
+        with_bus(&mut machine, |bus| {
+            println!("ram_lookup_profile: {iters} iterations");
+            assert!(bus.direct_ram_bytes(0x10_0000, 4).is_some());
+            assert!(bus.direct_ram_bytes(LOW_BIOS_BASE, 4).is_none());
+
+            let low = report("lookup low RAM", iters, |i| {
+                let (start, _) = bus.direct_ram_bytes(0x2000 + ((i & 0xff) << 2), 4).unwrap();
+                start as u32
+            });
+            let high = report("lookup extended RAM", iters, |i| {
+                let (start, _) = bus
+                    .direct_ram_bytes(0x10_0000 + ((i & 0xff) << 2), 4)
+                    .unwrap();
+                start as u32
+            });
+            let slow = report("lookup ROM miss", iters, |i| {
+                u32::from(
+                    bus.direct_ram_bytes(LOW_BIOS_BASE + ((i & 0xff) << 2), 4)
+                        .is_some(),
+                )
+            });
+            let read_low = report("bus read low RAM", iters, |i| {
+                bus.read_memory(
+                    0x2000 + ((i & 0xff) << 2),
+                    BusWidth::Dword,
+                    BusAccessKind::DataRead,
+                )
+                .unwrap()
+            });
+            let read_high = report("bus read extended RAM", iters, |i| {
+                bus.read_memory(
+                    0x10_0000 + ((i & 0xff) << 2),
+                    BusWidth::Dword,
+                    BusAccessKind::DataRead,
+                )
+                .unwrap()
+            });
+            let read_rom = report("bus read ROM", iters, |i| {
+                bus.read_memory(
+                    LOW_BIOS_BASE + ((i & 0xff) << 2),
+                    BusWidth::Dword,
+                    BusAccessKind::DataRead,
+                )
+                .unwrap()
+            });
+
+            std::hint::black_box((low, high, slow, read_low, read_high, read_rom));
+        });
     }
 
     #[test]
