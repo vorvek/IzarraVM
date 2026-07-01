@@ -21515,6 +21515,66 @@ mod tests {
     }
 
     #[test]
+    fn bios_irq12_preserves_interrupted_cx_dx() {
+        // IRQ12 can interrupt any game code, even when the game never calls INT 33h.
+        // The BIOS mouse ISR's dispatch helper uses CX/DX while assembling a packet,
+        // so the outer ISR has to save them before IRET returns to the interrupted
+        // instruction stream.
+        const PROGRAM: &[u8] = &[
+            0xb9, 0x34, 0x12, // mov cx,1234h
+            0xba, 0x78, 0x56, // mov dx,5678h
+            0xfb, // sti
+            0xbb, 0xff, 0xff, // mov bx,ffffh
+            0x4b, // dec bx
+            0x75, 0xfd, // jnz $-3
+            0x89, 0x0e, 0x00, 0x70, // mov [7000h],cx
+            0x89, 0x16, 0x02, 0x70, // mov [7002h],dx
+            0xfa, // cli
+            0xf4, // hlt
+        ];
+
+        let mut machine = Machine::new(
+            MachineProfile::gsw_386(16, VideoCard::Et4000Ax),
+            izarravm_firmware::izarra_bios(),
+        )
+        .unwrap();
+        let _ = machine.run_until_halt_or_cycles(20_000_000).unwrap();
+        for (offset, byte) in PROGRAM.iter().copied().enumerate() {
+            machine.write_physical_u8(0x8000 + offset as u32, byte);
+        }
+
+        machine.register_mouse_handler_for_test(0, 0); // null handler still exercises dispatch
+        {
+            let mut bus = machine.make_bus();
+            bus.write_io(0x21, BusWidth::Byte, 0xfb).unwrap(); // master: IRQ2 only
+            bus.write_io(0xa1, BusWidth::Byte, 0xef).unwrap(); // slave: IRQ12 only
+        }
+
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Cs, SegmentRegister::real(0));
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Ds, SegmentRegister::real(0));
+        machine
+            .cpu
+            .registers
+            .set_segment(SegmentIndex::Ss, SegmentRegister::real(0));
+        machine.cpu.registers.eip = 0x8000;
+        machine.cpu.registers.eflags = 0x0002;
+        machine.cpu.registers.set_esp(0x9000);
+
+        machine.inject_mouse(7, 0, 0);
+        let reason = machine.run_until_halt_or_cycles(10_000_000).unwrap();
+
+        assert_eq!(reason, StopReason::Halted);
+        assert_eq!(machine.read_physical_u16(0x7000), 0x1234, "CX survived");
+        assert_eq!(machine.read_physical_u16(0x7002), 0x5678, "DX survived");
+    }
+
+    #[test]
     fn set_mouse_absolute_synthesizes_relative_deltas() {
         let mut m = int15_machine(16);
         m.enable_8042_irq12();
