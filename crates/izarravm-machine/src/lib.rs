@@ -4854,18 +4854,19 @@ impl Machine {
 
     /// Service INT 19h (BOOTSTRAP LOADER). Re-run the boot: load the boot sector of
     /// the default drive to 0000:7C00 and jump there. The default drive is A: when
-    /// a floppy is mounted, otherwise C: (the Toka-DOS HLE boot). When neither is
-    /// bootable, fall through to the INT 18h path. DL carries the drive the loaded
-    /// code booted from (00h floppy, 80h fixed disk), the way a real BIOS leaves it.
+    /// a floppy is mounted, otherwise the Katea ATA fixed disk (80h) when it carries
+    /// a 0x55AA MBR signature. When neither is bootable, fall through to the INT 18h
+    /// path. DL carries the drive the loaded code booted from (00h floppy, 80h fixed
+    /// disk), the way a real BIOS leaves it.
     ///
     /// This mirrors the izarra-bios ROM's own INT 19h: a mounted floppy is treated
     /// as bootable and sector 0 is loaded with no 0xAA55 signature check, so a guest
     /// re-invoking INT 19h gets the same outcome the ROM gives at power-on.
     ///
     /// Limit: the floppy boot copies sector 0 and jumps; it does not retry on a
-    /// read error. C: boots the bundled Toka-DOS through the existing HLE record, not
-    /// an arbitrary MBR. To lift this, read the C: partition table and load a
-    /// guest-supplied MBR the same way the floppy path loads its boot sector.
+    /// read error. The fixed-disk boot loads the real MBR at LBA 0 (signature-gated)
+    /// and lets it chain to the active partition — the Rust Toka-DOS HLE boot record
+    /// that used to back a non-bootable C: was retired in SP-3.
     fn handle_int19(&mut self) {
         // A: floppy first. Copy its boot sector (CHS 0,0,1) to 0000:7C00 and jump
         // there. A mounted floppy is bootable (matching the ROM path); only an
@@ -9360,7 +9361,7 @@ impl Machine {
                         self.set_mode(mode); // live Lotura switch takes effect next instruction
                     }
                     if let Some(cmd) = self.pending_toka_service.take() {
-                        self.perform_toka_service(cmd); // Repair/Format/LoadBootRecord
+                        self.perform_toka_service(cmd); // Repair (cmd 0x01)
                     }
                     if let Some(cmd) = self.unittester.take_pending() {
                         if let Some(code) = self.perform_unittester(cmd) {
@@ -10016,7 +10017,8 @@ impl CpuBus for MachineBus<'_> {
             return Ok(());
         }
         if port == 0x00e3 {
-            // Toka-DOS service command: 1 Repair, 2 Format, 0x10 LoadBootRecord.
+            // Toka-DOS service command: 1 = Repair (the only one left after the HLE
+            // was retired in SP-3; Format and LoadBootRecord are gone).
             // The run loop performs it after this cycle (it needs &mut self).
             *self.pending_toka_service = Some(value as u8);
             return Ok(());
