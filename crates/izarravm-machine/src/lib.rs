@@ -9983,6 +9983,21 @@ impl CpuBus for MachineBus<'_> {
         width: BusWidth,
         kind: BusAccessKind,
     ) -> Result<(), BusError> {
+        // Only the CPU's DirectPageCache fast paths call this, and a live entry
+        // guarantees cacheable RAM under the current A20 state: `direct_page`
+        // installs a page only when `apply_a20` is the identity for it (an A20
+        // toggle then invalidates the cache via note_a20_changed), and the
+        // direct map never covers a device window. Conventional pages sit below
+        // the 0xA0000 aperture; extended pages start at 1 MiB, exclude the
+        // Distira BAR (whose decode changes rebuild the map AND invalidate the
+        // cache), and system RAM ends below the Margo LFB/MMIO and high-ROM
+        // bases. So in the Approximate class (`flat_data_cost`) the charge is
+        // always the flat L1 cost: skip apply_a20 and the wait-state routing.
+        // The Accurate class keeps the full path so its tag arrays stay warm.
+        if self.flat_data_cost {
+            self.trace.record(kind, address, width, self.cache.cost.l1);
+            return Ok(());
+        }
         let address = self.apply_a20(address);
         let ws = self.data_access_wait_states(address, width);
         self.trace.record(kind, address, width, ws);
