@@ -1,18 +1,20 @@
 ; v86spike.asm — SP-4b M0 Task 2 standalone V86 spike.
 ;
-; Increment 3: the monitor now also REFLECTS software interrupts to the V86
-; real-mode IVT and unwinds IRET. The V86 stub installs an IVT[0x80] handler,
-; does INT 0x80 (#GP -> monitor reflects -> handler runs in V86 -> IRET -> #GP ->
-; monitor unwinds), and checks a marker the handler set. It also re-checks the
-; CLI/STI/PUSHF virtual-IF path from increment 2. Signals 0xA5 on success.
+; Increment 3b: a real hardware timer IRQ, delivered to the V86 task by the CPU
+; (SP-4a hardware_interrupt -> deliver_exception V86 path), is reflected by the
+; monitor to the guest's V86 INT 08h handler. The stub programs the PIC (master
+; base 0x20, to dodge the error-code exception vectors) + PIT, installs a V86
+; timer handler at IVT[8], STIs, and spins until a tick lands. Signals 0xA5.
 ;
-; Split into a 512-byte boot sector (real-mode setup) + a stage2 (PM monitor +
-; V86 stub) at 0x8000, because the monitor no longer fits in one sector.
+; Also still proves increments 2-3: CLI/STI/PUSHF virtual-IF + INT n reflection.
+;
+; The V86 task runs with REAL IF=1 (so IRQs reach the monitor); VIF is the guest's
+; view of IF. The monitor reflects vector 0x20 -> V86 INT 08h.
 ;
 ; Physical map (identity-paged, < 1 MiB):
-;   0x00800 VIF byte   0x00810 marker byte   0x01000 PD   0x02000 PT (1 MiB)
-;   0x03000 GDT   0x04000 IDT   0x05000 TSS(+bitmap)   0x06000 V86 stack top
-;   0x07000 ring-0 stack top (ESP0)   0x07c00 boot sector   0x08000 stage2
+;   0x00800 VIF  0x00810 marker  0x00820 tick counter  0x01000 PD  0x02000 PT
+;   0x03000 GDT  0x04000 IDT  0x05000 TSS  0x06000 V86 stack  0x07000 ESP0
+;   0x07c00 boot sector   0x08000 stage2
 cpu 386
 
 section .boot vstart=0x7c00
@@ -26,12 +28,12 @@ start:
     mov ss, ax
     mov sp, 0x7000
 
-    mov di, 0x0800                          ; zero VIF/marker + tables
+    mov di, 0x0800
     mov cx, (0x6000 - 0x0800) / 2
     xor ax, ax
     rep stosw
 
-    mov dword [0x1000], 0x2000 | 7          ; PD[0] -> PT
+    mov dword [0x1000], 0x2000 | 7
     mov di, 0x2000
     mov eax, 0x0000_0007
     mov cx, 256
@@ -41,22 +43,48 @@ start:
     add di, 4
     loop .fill_pt
 
-    mov dword [0x3008], 0x0000FFFF          ; [08] ring0 code 32-bit
+    mov dword [0x3008], 0x0000FFFF
     mov dword [0x300C], 0x00CF9B00
-    mov dword [0x3010], 0x0000FFFF          ; [10] ring0 data
+    mov dword [0x3010], 0x0000FFFF
     mov dword [0x3014], 0x00CF9300
-    mov dword [0x3018], 0x50000088          ; [18] TSS base 0x5000 limit 0x88
+    mov dword [0x3018], 0x50000088
     mov dword [0x301C], 0x00008900
 
-    mov dword [0x5004], 0x7000              ; ESP0
-    mov word  [0x5008], 0x0010              ; SS0
-    mov word  [0x5066], 0x0068              ; I/O-map base
+    mov dword [0x5004], 0x7000
+    mov word  [0x5008], 0x0010
+    mov word  [0x5066], 0x0068
 
-    mov word [0x4000 + 13*8],     monitor   ; IDT[13] #GP -> monitor
+    ; IDT[13] #GP -> monitor (sensitive instructions)
+    mov word [0x4000 + 13*8],     monitor
     mov word [0x4000 + 13*8 + 2], 0x0008
     mov byte [0x4000 + 13*8 + 4], 0
     mov byte [0x4000 + 13*8 + 5], 0x8E
     mov word [0x4000 + 13*8 + 6], 0
+    ; IDT[0x20] hardware IRQ0 -> monitor_irq
+    mov word [0x4000 + 0x20*8],     monitor_irq
+    mov word [0x4000 + 0x20*8 + 2], 0x0008
+    mov byte [0x4000 + 0x20*8 + 4], 0
+    mov byte [0x4000 + 0x20*8 + 5], 0x8E
+    mov word [0x4000 + 0x20*8 + 6], 0
+
+    ; PIC: remap master to base 0x20, unmask IRQ0 only
+    mov al, 0x11
+    out 0x20, al
+    mov al, 0x20
+    out 0x21, al
+    mov al, 0x04
+    out 0x21, al
+    mov al, 0x01
+    out 0x21, al
+    mov al, 0xFE
+    out 0x21, al
+    ; PIT channel 0, mode 3, count 0x8000 (ticks spaced well apart)
+    mov al, 0x36
+    out 0x43, al
+    mov al, 0x00
+    out 0x40, al
+    mov al, 0x80
+    out 0x40, al
 
     lgdt [gdtr]
     lidt [idtr]
@@ -71,7 +99,7 @@ gdtr:
     dw 0x1F
     dd 0x3000
 idtr:
-    dw 0xFF
+    dw 0x1FF                                 ; 64 vectors (covers IRQ0 at 0x20)
     dd 0x4000
 
     times 510 - ($ - $$) db 0
@@ -93,17 +121,17 @@ pm_entry:
     push dword 0                            ; ES
     push dword 0                            ; SS = 0
     push dword 0x6000                       ; V86 ESP
-    push dword 0x00020002                   ; EFLAGS VM | bit1, IOPL 0
+    push dword 0x00020202                   ; EFLAGS: VM | IF (real) | bit1, IOPL 0
     push dword 0                            ; CS = 0
-    push dword v86_stub                     ; EIP (linear)
+    push dword v86_stub                     ; EIP
     iretd
 
-; ---- ring-0 monitor. entry: [esp]=err,+4=EIP,+8=CS,+12=EFLAGS,+16=ESP,+20=SS ----
+; ---- #GP monitor (software sensitive instructions). frame: err@0,EIP@4,CS@8,... ----
 monitor:
-    mov eax, [esp+8]                        ; V86 CS
+    mov eax, [esp+8]
     shl eax, 4
     movzx ebx, word [esp+4]
-    add eax, ebx                            ; eax = linear of faulting opcode
+    add eax, ebx
     movzx edx, byte [eax]
     cmp dl, 0xFA
     je .cli
@@ -117,7 +145,7 @@ monitor:
     je .intn
     cmp dl, 0xCF
     je .iret_op
-    mov al, 0xFD                            ; unhandled -> fail
+    mov al, 0xFD
     jmp signal32
 .cli:
     mov byte [0x0800], 0
@@ -158,11 +186,9 @@ monitor:
     add esp, 4
     iretd
 .intn:
-    ; opcode 0xCD imm8 at eax; reflect INT n to real-mode IVT.
-    movzx esi, byte [eax+1]                 ; n
-    mov ebx, [esp+20]                        ; V86 SS
+    movzx esi, byte [eax+1]
+    mov ebx, [esp+20]
     shl ebx, 4
-    ; push FLAGS (IF := VIF)
     mov ax, [esp+12]
     and ax, 0xFDFF
     cmp byte [0x0800], 0
@@ -172,41 +198,37 @@ monitor:
     sub word [esp+16], 2
     movzx ecx, word [esp+16]
     mov [ebx+ecx], ax
-    ; push CS
     mov ax, [esp+8]
     sub word [esp+16], 2
     movzx ecx, word [esp+16]
     mov [ebx+ecx], ax
-    ; push return IP = EIP + 2
     mov ax, [esp+4]
     add ax, 2
     sub word [esp+16], 2
     movzx ecx, word [esp+16]
     mov [ebx+ecx], ax
-    ; load CS:IP from IVT[n] (linear n*4)
     mov edi, esi
     shl edi, 2
-    movzx eax, word [edi]                    ; new IP
+    movzx eax, word [edi]
     mov word [esp+4], ax
-    movzx eax, word [edi+2]                  ; new CS
+    movzx eax, word [edi+2]
     mov word [esp+8], ax
-    mov byte [0x0800], 0                     ; interrupt gate clears VIF
+    mov byte [0x0800], 0
     add esp, 4
     iretd
 .iret_op:
-    ; pop IP, CS, FLAGS from V86 stack back into the frame.
     mov ebx, [esp+20]
     shl ebx, 4
     movzx ecx, word [esp+16]
-    mov ax, [ebx+ecx]                        ; IP
+    mov ax, [ebx+ecx]
     mov word [esp+4], ax
     add word [esp+16], 2
     movzx ecx, word [esp+16]
-    mov ax, [ebx+ecx]                        ; CS
+    mov ax, [ebx+ecx]
     mov word [esp+8], ax
     add word [esp+16], 2
     movzx ecx, word [esp+16]
-    mov ax, [ebx+ecx]                        ; FLAGS
+    mov ax, [ebx+ecx]
     add word [esp+16], 2
     test ax, 0x0200
     setnz cl
@@ -215,6 +237,35 @@ monitor:
     mov word [esp+12], ax
     add esp, 4
     iretd
+
+; ---- hardware IRQ0 monitor (vector 0x20, NO error code). Reflect to V86 INT 08h. ----
+; frame: EIP@0, CS@4, EFLAGS@8, ESP@12, SS@16, ...
+monitor_irq:
+    mov ebx, [esp+16]                        ; V86 SS
+    shl ebx, 4
+    mov ax, [esp+8]                          ; flags, IF := VIF
+    and ax, 0xFDFF
+    cmp byte [0x0800], 0
+    je .q_flags
+    or ax, 0x0200
+.q_flags:
+    sub word [esp+12], 2
+    movzx ecx, word [esp+12]
+    mov [ebx+ecx], ax                        ; push FLAGS
+    mov ax, [esp+4]                          ; CS
+    sub word [esp+12], 2
+    movzx ecx, word [esp+12]
+    mov [ebx+ecx], ax
+    mov ax, [esp]                            ; return IP = interrupted EIP (async)
+    sub word [esp+12], 2
+    movzx ecx, word [esp+12]
+    mov [ebx+ecx], ax
+    movzx eax, word [0x20]                   ; IVT[8] IP
+    mov word [esp], ax
+    movzx eax, word [0x22]                   ; IVT[8] CS
+    mov word [esp+4], ax
+    mov byte [0x0800], 0                     ; interrupt gate clears VIF
+    iretd                                    ; no error code -> no add esp
 
 signal32:
     mov ah, al
@@ -232,24 +283,31 @@ v86_stub:
     mov ds, ax
     mov ss, ax
     mov sp, 0x6000
-    ; increment-2 regression: CLI -> IF clear
     cli
     pushf
     pop ax
     test ax, 0x0200
     jnz .fail
-    sti                                     ; IF set
+    sti
     pushf
     pop ax
     test ax, 0x0200
     jz .fail
-    ; increment-3: INT reflection + IRET unwind
-    mov word [0x200], int80_handler         ; IVT[0x80] IP (CS base 0)
-    mov word [0x202], 0                      ; IVT[0x80] CS
-    mov byte [0x810], 0                      ; marker
+    ; INT reflection + IRET unwind
+    mov word [0x200], int80_handler
+    mov word [0x202], 0
+    mov byte [0x810], 0
     int 0x80
     cmp byte [0x810], 0xCC
     jne .fail
+    ; IRQ0 timer reflection
+    mov word [0x20], v86_timer               ; IVT[8]
+    mov word [0x22], 0
+    mov byte [0x820], 0
+    sti
+.wait_tick:
+    cmp byte [0x820], 0
+    je .wait_tick
     mov al, 0xA5
     jmp .signal
 .fail:
@@ -266,4 +324,12 @@ v86_stub:
 
 int80_handler:
     mov byte [0x810], 0xCC
+    iret
+
+v86_timer:
+    inc byte [0x820]
+    push ax
+    mov al, 0x20
+    out 0x20, al                             ; EOI
+    pop ax
     iret
