@@ -2448,6 +2448,16 @@ impl Cpu386 {
     /// advanced past the instruction by `charge_cached_fetch`, matching the normal decoded executor.
     #[inline]
     fn execute_hot_cached_decoded(&mut self, insn: &DecodedInsn) -> Option<CycleOutcome> {
+        if insn.opcode <= 0xff {
+            let opcode = insn.opcode as u8;
+            if opcode < 0x40 && (opcode & 0x07) < 6 {
+                return self.execute_hot_cached_alu(insn, opcode);
+            }
+            if matches!(opcode, 0x80..=0x83) {
+                return self.execute_hot_cached_group1(insn, opcode);
+            }
+        }
+
         match insn.opcode {
             0x70..=0x7f | 0x0f80..=0x0f8f => {
                 if self.condition((insn.opcode & 0x0f) as u8) {
@@ -2590,6 +2600,138 @@ impl Cpu386 {
             },
             _ => None,
         }
+    }
+
+    #[inline]
+    fn execute_hot_cached_alu(&mut self, insn: &DecodedInsn, opcode: u8) -> Option<CycleOutcome> {
+        let op = (opcode >> 3) & 0x07;
+        let form = opcode & 0x07;
+        let write_back = op != 7;
+        let operand_size = insn.operand_size;
+
+        match form {
+            0 => {
+                let modrm = insn.modrm?;
+                let DecodedOperand::Reg(index) = insn.operand? else {
+                    return None;
+                };
+                let result = self.alu(
+                    op,
+                    u32::from(self.read_gpr8(index)),
+                    u32::from(self.read_gpr8(modrm.reg)),
+                    BusWidth::Byte,
+                ) as u8;
+                if write_back {
+                    self.write_gpr8(index, result);
+                }
+            }
+            1 => {
+                let modrm = insn.modrm?;
+                let DecodedOperand::Reg(index) = insn.operand? else {
+                    return None;
+                };
+                let result = self.alu(
+                    op,
+                    self.read_gpr_sized(index, operand_size),
+                    self.read_gpr_sized(modrm.reg, operand_size),
+                    operand_size.bus_width(),
+                );
+                if write_back {
+                    self.write_gpr_sized(index, operand_size, result);
+                }
+            }
+            2 => {
+                let modrm = insn.modrm?;
+                let DecodedOperand::Reg(index) = insn.operand? else {
+                    return None;
+                };
+                let result = self.alu(
+                    op,
+                    u32::from(self.read_gpr8(modrm.reg)),
+                    u32::from(self.read_gpr8(index)),
+                    BusWidth::Byte,
+                ) as u8;
+                if write_back {
+                    self.write_gpr8(modrm.reg, result);
+                }
+            }
+            3 => {
+                let modrm = insn.modrm?;
+                let DecodedOperand::Reg(index) = insn.operand? else {
+                    return None;
+                };
+                let result = self.alu(
+                    op,
+                    self.read_gpr_sized(modrm.reg, operand_size),
+                    self.read_gpr_sized(index, operand_size),
+                    operand_size.bus_width(),
+                );
+                if write_back {
+                    self.write_gpr_sized(modrm.reg, operand_size, result);
+                }
+            }
+            4 => {
+                let result =
+                    self.alu(op, u32::from(self.read_gpr8(0)), insn.imm, BusWidth::Byte) as u8;
+                if write_back {
+                    self.write_gpr8(0, result);
+                }
+            }
+            5 => {
+                let result = self.alu(
+                    op,
+                    self.read_gpr_sized(0, operand_size),
+                    insn.imm,
+                    operand_size.bus_width(),
+                );
+                if write_back {
+                    self.write_gpr_sized(0, operand_size, result);
+                }
+            }
+            _ => return None,
+        }
+
+        Some(clocks(2))
+    }
+
+    #[inline]
+    fn execute_hot_cached_group1(
+        &mut self,
+        insn: &DecodedInsn,
+        opcode: u8,
+    ) -> Option<CycleOutcome> {
+        let modrm = insn.modrm?;
+        let DecodedOperand::Reg(index) = insn.operand? else {
+            return None;
+        };
+
+        match opcode {
+            0x80 | 0x82 => {
+                let result = self.alu(
+                    modrm.reg,
+                    u32::from(self.read_gpr8(index)),
+                    insn.imm,
+                    BusWidth::Byte,
+                ) as u8;
+                if modrm.reg != 7 {
+                    self.write_gpr8(index, result);
+                }
+            }
+            0x81 | 0x83 => {
+                let result = self.alu(
+                    modrm.reg,
+                    self.read_gpr_sized(index, insn.operand_size),
+                    insn.imm,
+                    insn.operand_size.bus_width(),
+                );
+                if modrm.reg != 7 {
+                    self.write_gpr_sized(index, insn.operand_size, result);
+                }
+            }
+            _ => return None,
+        }
+
+        Some(clocks(2))
     }
 
     /// The single routing authority for the decode/execute split: classify an opcode into the
@@ -17442,6 +17584,41 @@ mod tests {
         assert!(!outcome.halted);
         assert_eq!(cpu.read_reg16(Reg16::Ax), 5, "CMOVE false leaves AX");
         assert_eq!(cpu.read_reg16(Reg16::Sp), 0x0100, "CMOVE is not INC SP");
+    }
+
+    #[test]
+    fn straight_line_run_executes_hot_alu_group_cached_forms() {
+        // MOV AX,10 ; MOV BX,3 ; ADD AX,BX ; SUB AX,1 ; CMP AX,12 ; JNZ dead ;
+        // OR AL,1 ; XOR AL,1 ; AND AX,0x00ff ; HLT. The warm second run exercises cached ALU
+        // reg/reg, accumulator immediate, group-1 register immediate, CMP no-writeback, and flags.
+        let code = [
+            0xb8, 0x0a, 0x00, // MOV AX, 10
+            0xbb, 0x03, 0x00, // MOV BX, 3
+            0x01, 0xd8, // ADD AX, BX
+            0x83, 0xe8, 0x01, // SUB AX, 1
+            0x83, 0xf8, 0x0c, // CMP AX, 12
+            0x75, 0x07, // JNZ dead (not taken)
+            0x0c, 0x01, // OR AL, 1
+            0x34, 0x01, // XOR AL, 1
+            0x25, 0xff, 0x00, // AND AX, 0x00ff
+            0xf4, // HLT
+            0xb8, 0xad, 0xde, // dead: MOV AX, 0xDEAD
+        ];
+        let (mut cpu, memory) = real_mode_cpu(&code, 1024);
+        let mut bus = TestBus::with_memory(memory);
+        drive_straight_line_runs(&mut cpu, &mut bus);
+
+        cpu.registers.eip = 0;
+        cpu.registers.set_eax(0);
+        cpu.registers.set_ebx(0);
+        cpu.halted = false;
+        let outcome = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
+        assert!(!outcome.halted);
+        assert_eq!(cpu.registers.eip, 0x17, "run stopped at HLT");
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 0x000c);
+        assert_eq!(cpu.read_reg16(Reg16::Bx), 3);
+        assert!(!cpu.flag(FLAG_ZF), "final AND leaves a nonzero result");
+        assert!(!cpu.flag(FLAG_SF));
     }
 
     #[test]
