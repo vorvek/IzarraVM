@@ -2274,9 +2274,9 @@ del PREEXIST.TXT\r\n";
     /// system CONFIG.SYS whose 8.3 name is reserved first, and lose the `~n` fold.
     #[test]
     #[ignore = "boots a full DOS image (slow in debug); run with --ignored"]
-    fn tokaemm_sys_init_runs_at_sysinit() {
+    fn tokaemm_init_enters_v86() {
         let dir = std::env::temp_dir().join(format!(
-            "tokaemm_t1_{}_{}",
+            "tokaemm_t3a_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2312,21 +2312,16 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
         let stop = machine
             .run_until_halt_or_cycles(500_000_000)
             .expect("run machine");
-        if let StopReason::CpuError(msg) = &stop {
-            let text = machine.screen_text().as_text();
-            std::fs::remove_dir_all(&dir).ok();
-            panic!("CPU fault during TOKAEMM boot: {msg}\nstop={stop:?}\n{text}");
-        }
-
         let text = machine.screen_text().as_text();
         std::fs::remove_dir_all(&dir).ok();
-        assert!(
-            text.contains("TOKAEMM M0 task1: INIT ran"),
-            "INIT marker not on screen (stop={stop:?}).\n{text}"
-        );
-        assert!(
-            text.contains(":\\>"),
-            "no DOS prompt — boot didn't finish (stop={stop:?}).\n{text}"
+        // Task 3 increment A: TOKAEMM.SYS INIT builds its PM/paging env and enters
+        // V86, where the stub signals 0xA5 through the unit-tester exit port. (It
+        // does not yet return to DOS, so the boot stops here rather than reaching
+        // C:\> — that is Task 3 increment B.)
+        assert_eq!(
+            stop,
+            StopReason::TestExit { code: 0xA5 },
+            "TOKAEMM INIT did not enter V86 and signal 0xA5 (stop={stop:?}).\n{text}"
         );
     }
 }
