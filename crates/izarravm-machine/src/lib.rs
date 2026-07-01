@@ -12,8 +12,8 @@ use izarravm_bus::{
     DirectPage, Memory, TracingMode,
 };
 use izarravm_core::{
-    ConfigSysMemory, Emm386Mode, GswMode, HardwareProfile, SoundBlasterConfig, VideoCard,
-    WssConfig, YamahaAdpcmConfig,
+    ConfigSysMemory, Emm386Mode, GswMode, HardwareProfile, SoundBlasterConfig, TimingClass,
+    VideoCard, WssConfig, YamahaAdpcmConfig,
 };
 pub use izarravm_cpu::PerfCounters;
 use izarravm_cpu::{
@@ -2566,6 +2566,7 @@ impl Machine {
             unittester: &mut self.unittester,
             wait_states: self.profile.wait_states,
             cache: &mut self.cache_model,
+            flat_data_cost: matches!(self.active_mode.timing_class(), TimingClass::Approximate),
             io_touched: &mut self.io_touched,
             device_wrote_memory: &mut self.device_wrote_memory,
             direct_map_changed: &mut self.direct_map_changed,
@@ -8682,6 +8683,10 @@ impl Machine {
         // of self.trace) before we read self.trace.elapsed_clocks() afterwards.
         let raw = {
             let mut bus = self.make_bus();
+            // The bandwidth sweep verifies the ACCURATE tier calibration (a host
+            // diagnostic, not guest-perceived time), so it always tiers even in the
+            // Approximate class.
+            bus.flat_data_cost = false;
             let start = bus.trace.elapsed_clocks();
             for _ in 0..passes {
                 for off in (0..block).step_by(4) {
@@ -9484,6 +9489,7 @@ impl Machine {
                     unittester,
                     wait_states: profile.wait_states,
                     cache: cache_model,
+                    flat_data_cost: matches!(active_mode.timing_class(), TimingClass::Approximate),
                     io_touched,
                     device_wrote_memory,
                     direct_map_changed,
@@ -9778,6 +9784,11 @@ struct MachineBus<'a> {
     // warms it via data_access_wait_states, and the resolved tier's calibrated cost
     // is the charged wait-state.
     cache: &'a mut CacheModel,
+    /// True in the Approximate timing class (486/586): data accesses charge a flat
+    /// cost and skip the per-access cache-tier tag arrays. False in the Accurate
+    /// class (286/386) and forced false by the bandwidth diagnostic so its tier
+    /// curve stays on the accurate model.
+    flat_data_cost: bool,
     // Set true by any port I/O this batch. The run loop batches straight-line
     // instructions and services devices once per batch; a port access (a PIT
     // latch read, 0x3DA retrace poll, RTC read, a PIT/PIC/DSP/mode write) reads
@@ -11844,8 +11855,15 @@ impl MachineBus<'_> {
     /// tier's per-mode cost is charged.
     fn data_access_wait_states(&mut self, address: u32, width: BusWidth) -> u8 {
         if address >= 0x000A_0000 && self.is_device_window(address, width) {
-            // Device/ROM: untiered, unchanged timing.
+            // Device/ROM: untiered, unchanged timing (both classes).
             return self.memory_wait_states(address);
+        }
+        if self.flat_data_cost {
+            // Approximate class (486/586): charge the flat L1-resident cost and skip
+            // the per-access tag-array tiering (the Slice-0 measured floor). The
+            // benchmarks are L1-resident so cyc/iter stays near the accurate model;
+            // the win is skipping ~3M tag lookups per run. Guest-invisible: only time.
+            return self.cache.cost.l1;
         }
         self.cache.data_wait_states(address, width)
     }
@@ -12190,6 +12208,33 @@ mod tests {
                 "286 is cacheless: {small:.1} vs {large:.1} MB/s should be flat (ratio {ratio:.3})"
             );
         }
+    }
+
+    #[test]
+    fn approximate_class_bypasses_cache_tiering_accurate_class_does_not() {
+        use izarravm_core::GswMode;
+        let mut machine = test_machine();
+
+        // Accurate class (386): a conventional-RAM data access warms the tier model.
+        // (read_physical_u16 routes through read_memory -> data_access_wait_states;
+        // read_physical_u8 takes a raw read_phys_u8 path that never tiers.)
+        machine.set_mode(GswMode::Gsw386);
+        let before = machine.cache_tier_lookups();
+        let _ = machine.read_physical_u16(0x2_0000);
+        assert!(
+            machine.cache_tier_lookups() > before,
+            "386 (Accurate) must tier the access (lookups increment)"
+        );
+
+        // Approximate class (586): the same access charges the flat cost, no tiering.
+        machine.set_mode(GswMode::Gsw586);
+        let before = machine.cache_tier_lookups();
+        let _ = machine.read_physical_u16(0x2_0000);
+        assert_eq!(
+            machine.cache_tier_lookups(),
+            before,
+            "586 (Approximate) must bypass tiering (lookups unchanged)"
+        );
     }
 
     #[test]
@@ -19812,6 +19857,7 @@ mod tests {
             unittester: &mut machine.unittester,
             wait_states: machine.profile.wait_states,
             cache: &mut machine.cache_model,
+            flat_data_cost: matches!(machine.active_mode.timing_class(), TimingClass::Approximate),
             io_touched: &mut machine.io_touched,
             device_wrote_memory: &mut machine.device_wrote_memory,
             direct_map_changed: &mut machine.direct_map_changed,
