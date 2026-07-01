@@ -1000,16 +1000,23 @@ fn print_perf_counter_row(name: &str, mode: GswMode, perf: &PerfCounters) {
 
 /// Compare a measured `iters/sec` to the matching era reference band and return
 /// a tag to append to the row: ` [in band]`, ` [LOW <ratio>]`, ` [HIGH <ratio>]`,
-/// or empty when no band is encoded for this payload/mode.
+/// or empty when no band is encoded for this payload/mode. Approximate-class
+/// modes (486/586; see TimingClass) carry an extra trailing ` [approx]` marker,
+/// since their band is informational rather than a gate.
 fn band_tag(payload: &str, mode: GswMode, iters_per_sec: f64) -> String {
     use bench_reference::BandVerdict;
     let Some(band) = bench_reference::band_for(payload, mode) else {
         return String::new();
     };
-    match band.verdict(iters_per_sec) {
+    let verdict = match band.verdict(iters_per_sec) {
         BandVerdict::InBand => " [in band]".to_string(),
         BandVerdict::Low => format!(" [LOW {:.2}]", iters_per_sec / band.target),
         BandVerdict::High => format!(" [HIGH {:.2}]", iters_per_sec / band.target),
+    };
+    if mode.timing_class() == izarravm_core::TimingClass::Approximate {
+        format!("{verdict} [approx]")
+    } else {
+        verdict
     }
 }
 
