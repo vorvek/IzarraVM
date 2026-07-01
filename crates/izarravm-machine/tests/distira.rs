@@ -574,7 +574,7 @@ fn distira_pci_config_ports_report_voodoo_graphics_identity() {
         0xED, 0x66, 0xA3, 0x00, 0x02, 0xCD, 0x20,
     ];
     let mut machine =
-        Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Distira), &PROG).unwrap();
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Distira), &PROG).unwrap();
 
     let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
 
@@ -595,7 +595,7 @@ fn distira_pci_bar_maps_voodoo_mmio_and_lfb_windows() {
         0x20,
     ];
     let mut machine =
-        Machine::new_dos_program(MachineProfile::gsw_386(16, VideoCard::Distira), &PROG).unwrap();
+        Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Distira), &PROG).unwrap();
 
     let reason = machine.run_until_halt_or_cycles(100_000).unwrap();
     assert_eq!(reason, StopReason::DosExit { code: 0 });

@@ -300,7 +300,7 @@ fn run_bench_one(
             m.set_bench_selector(*selector);
             m
         }
-        BenchSource::DosExe(exe) => Machine::new_dos_program(profile, exe)?,
+        BenchSource::DosExe(exe) => Machine::new_raw_program(profile, exe)?,
     };
     machine.set_mode(mode);
     let started = std::time::Instant::now();
