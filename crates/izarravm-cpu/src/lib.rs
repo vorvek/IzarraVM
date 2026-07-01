@@ -178,37 +178,6 @@ pub enum CpuError {
     DivideError,
 }
 
-// ---------------------------------------------------------------------------
-// V86 debug trace (TOKAEMM SP-4b bring-up). A thread-local ring buffer of the
-// last interrupt deliveries + IRETs, populated only when `TOKAEMM_TRACE` is set
-// in the environment, and drained by the test harness after a fatal CpuError to
-// localize where a V86 boot went wrong. Zero cost when the env var is unset.
-// ---------------------------------------------------------------------------
-thread_local! {
-    static V86_TRACE: std::cell::RefCell<std::collections::VecDeque<String>> =
-        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
-    static V86_TRACE_ON: bool = std::env::var_os("TOKAEMM_TRACE").is_some();
-    static V86_ITRACE_ON: bool = std::env::var_os("TOKAEMM_ITRACE").is_some();
-}
-
-fn v86_trace(msg: impl FnOnce() -> String) {
-    if V86_TRACE_ON.with(|on| *on) {
-        V86_TRACE.with(|t| {
-            let mut t = t.borrow_mut();
-            if t.len() >= 512 {
-                t.pop_front();
-            }
-            t.push_back(msg());
-        });
-    }
-}
-
-/// Drain the V86 debug trace (see [`v86_trace`]). Test-only; empty unless
-/// `TOKAEMM_TRACE` was set.
-pub fn take_v86_trace() -> Vec<String> {
-    V86_TRACE.with(|t| t.borrow_mut().drain(..).collect())
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reg16 {
     Ax,
@@ -2434,10 +2403,6 @@ impl Cpu386 {
         self.begin_instruction();
         let start_eip = self.registers.eip;
         let start_cs = self.registers.cs().selector;
-        if V86_ITRACE_ON.with(|on| *on) && self.is_v86_mode() {
-            let ip = start_eip & 0xffff;
-            v86_trace(move || format!("I  {start_cs:04x}:{ip:04x}"));
-        }
         let lin = self.linear_eip();
         let profiling = self.profile.enabled;
         let profile_start = if profiling {
@@ -8023,8 +7988,6 @@ impl Cpu386 {
     // interrupt_acknowledge: that hook is the software-INT device side-effect path
     // (the video mode-set), not the INTA handshake, which the PIC handled already.
     fn hardware_interrupt<B: CpuBus>(&mut self, bus: &mut B, vector: u8) -> ExecResult<()> {
-        let v86 = self.is_v86_mode();
-        v86_trace(move || format!("HWIRQ v={vector:#04x} v86={v86}"));
         if self.is_protected_mode() {
             self.deliver_exception(bus, vector, None, true)
         } else {
@@ -8126,25 +8089,6 @@ impl Cpu386 {
         }
         self.load_segment(bus, SegmentIndex::Cs, selector)?;
         self.set_eip(offset);
-        if V86_TRACE_ON.with(|on| *on) {
-            let op = if source_v86 {
-                let lin = (u32::from(saved_cs) << 4).wrapping_add(saved_eip & 0xffff);
-                self.read_system_linear_u32(bus, lin).unwrap_or(0)
-            } else {
-                0
-            };
-            v86_trace(|| {
-                format!(
-                    "DLV v={vector:#04x} ext={is_external} src_v86={source_v86} guest={saved_cs:04x}:{:04x} op={op:08x} -> {selector:#06x}:{offset:#06x}",
-                    saved_eip & 0xffff
-                )
-            });
-            // Record the reflected INT vector (guest `INT n` faulting to the monitor).
-            if source_v86 && vector == 0x0d && (op & 0xff) == 0xcd {
-                let intv = (op >> 8) & 0xff;
-                v86_trace(move || format!("INTREFL {intv:#04x}"));
-            }
-        }
         Ok(())
     }
 
@@ -8182,13 +8126,6 @@ impl Cpu386 {
                 let eip = self.pop(bus, OperandSize::Dword)?;
                 let cs = self.pop(bus, OperandSize::Dword)? as u16;
                 let flags = self.pop(bus, OperandSize::Dword)?;
-                v86_trace(|| {
-                    format!(
-                        "IRETD cpl={} retVM={} cs={cs:#06x} eip={eip:#06x}",
-                        self.current_privilege_level(),
-                        flags & FLAG_VM != 0
-                    )
-                });
 
                 if self.current_privilege_level() == 0 && flags & FLAG_VM != 0 {
                     // Return INTO a V86 task: pop the V86 tail and reload real-mode segments.

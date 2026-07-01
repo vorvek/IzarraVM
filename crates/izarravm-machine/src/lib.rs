@@ -9367,7 +9367,14 @@ impl Machine {
                 self.cpu.note_direct_map_changed();
                 self.direct_map_changed = false;
             }
-            self.pending_soft_int = None;
+            // A V86 software INT that the TOKAEMM monitor is reflecting sets
+            // pending_soft_int in one batch (at the #GP to the monitor) but is only
+            // serviced a later batch, once the monitor has IRETed back into V86 with
+            // the real-mode frame in place. Preserve the pending vector across the
+            // monitor's batches — only reset it when NOT inside the ring-0 monitor.
+            if !self.cpu.is_ring0_protected() {
+                self.pending_soft_int = None;
+            }
             self.io_touched = false;
             self.device_wrote_memory = false;
             let trace_before = self.trace.elapsed_clocks();
