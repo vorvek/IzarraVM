@@ -43,7 +43,7 @@ reproduces the Izarra 3000 exactly as it was built.
 
 | Area | Izarra 3000 hardware |
 | --- | --- |
-| CPU | GSW-586, a K6-class 266 MHz part on a 66 MHz bus. Toka can throttle it to 486DX2 66 MHz or 386DX 25 MHz without rebooting. |
+| CPU | GSW-586, a Pentium MMX @200MHz part on a 66 MHz bus. Toka can throttle it to 486DX2 66 MHz or 386DX 25 MHz without rebooting. |
 | Memory | 24 MB SDRAM, with Toka mapping itself out of conventional memory when DOS games need the first 640 KB. |
 | Graphics | VEGA chipset: Margo 2D, Distira 3D, 4 MB video memory, VESA VBE 2.0, VGA mode 13h, and up to 1024x768 at 32-bit color. |
 | Sound | ReSonique 2: Sound Blaster 16 compatible digital audio, OPL3 FM, MPU-401 MIDI, wavetable daughterboard, and Yamaha ADPCM-B playback. |
@@ -85,7 +85,4 @@ cargo build --workspace
 
 ## License
 
-GNU GPL v3.0 only (see [LICENSE](LICENSE)). The subsystems are clean-room
-reimplementations built from primary hardware/OS documentation; reference
-implementations (e.g. FreeDOS for the DOS layer, Nuked-OPL3 for audio) are used
-only as behavioral oracles to check assumptions, never copied or translated.
+GNU GPL v3.0 (see [LICENSE](LICENSE)).
