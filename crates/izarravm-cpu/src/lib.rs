@@ -2474,6 +2474,11 @@ impl Cpu386 {
                     return Ok(outcome);
                 }
             }
+            DecodeGroup::Branch => {
+                if let Some(outcome) = self.execute_hot_cached_branch(insn, bus)? {
+                    return Ok(outcome);
+                }
+            }
             _ => {}
         }
         self.execute_decoded(insn, bus)
@@ -3210,6 +3215,21 @@ impl Cpu386 {
             }
             _ => Ok(None),
         }
+    }
+
+    #[inline]
+    fn execute_hot_cached_branch<B: CpuBus>(
+        &mut self,
+        insn: &DecodedInsn,
+        bus: &mut B,
+    ) -> ExecResult<Option<CycleOutcome>> {
+        if insn.opcode as u8 != 0xe8 {
+            return Ok(None);
+        }
+
+        self.push(bus, self.registers.eip, insn.operand_size)?;
+        self.relative_jump(insn.imm as i32, insn.operand_size);
+        Ok(Some(clocks(7)))
     }
 
     /// The single routing authority for the decode/execute split: classify an opcode into the
@@ -18583,6 +18603,51 @@ mod tests {
         assert_eq!(
             cpu.registers.eip, 0x06,
             "the cached JMP ran and skipped to the HLT target"
+        );
+    }
+
+    #[test]
+    fn straight_line_run_executes_cached_near_call_continuation() {
+        // CALL near is a relative branch plus a normal stack push, so it can run as a cached
+        // continuation while RET remains the terminator.
+        //
+        //   0x00: B8 01 00     MOV AX, 1
+        //   0x03: E8 03 00     CALL 0x09        ; return address 0x06
+        //   0x06: 40           INC AX           ; return site, not reached in this run
+        //   0x07: F4           HLT
+        //   0x08: 90           NOP
+        //   0x09: 40           INC AX           ; subroutine
+        //   0x0A: C3           RET              ; existing stop boundary
+        let code = [
+            0xb8, 0x01, 0x00, // MOV AX, 1
+            0xe8, 0x03, 0x00, // CALL +3 -> 0x09
+            0x40, // INC AX (return site)
+            0xf4, // HLT
+            0x90, // NOP
+            0x40, // INC AX (subroutine)
+            0xc3, // RET
+        ];
+        let (mut cpu, memory) = real_mode_cpu(&code, 1024);
+        cpu.write_reg16(Reg16::Sp, 0x0200);
+        let mut bus = TestBus::with_memory(memory);
+        drive_straight_line_runs(&mut cpu, &mut bus);
+
+        bus.memory[0x01fe..0x0200].fill(0);
+        cpu.registers.eip = 0;
+        cpu.write_reg16(Reg16::Ax, 0);
+        cpu.write_reg16(Reg16::Sp, 0x0200);
+        cpu.halted = false;
+        let outcome = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
+        assert!(!outcome.halted);
+        assert_eq!(cpu.read_reg16(Reg16::Ax), 2);
+        assert_eq!(cpu.read_reg16(Reg16::Sp), 0x01fe);
+        assert_eq!(
+            u16::from_le_bytes([bus.memory[0x01fe], bus.memory[0x01ff]]),
+            0x0006
+        );
+        assert_eq!(
+            cpu.registers.eip, 0x0a,
+            "cached CALL reached the subroutine RET, which remains a terminator"
         );
     }
 
