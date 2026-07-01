@@ -2803,11 +2803,11 @@ impl Cpu386 {
                     let DecodedOperand::Reg(index) = insn.operand? else {
                         return None;
                     };
-                    self.write_gpr_sized(
-                        modrm.reg,
-                        insn.operand_size,
-                        self.read_gpr_sized(index, insn.operand_size),
-                    );
+                    if insn.operand_size == OperandSize::Word {
+                        self.write_gpr16(modrm.reg, self.read_gpr16(index));
+                    } else {
+                        self.write_gpr32(modrm.reg, self.read_gpr32(index));
+                    }
                     Some(clocks(2))
                 }
                 0x8d => {
@@ -18392,10 +18392,10 @@ mod tests {
 
     #[test]
     fn straight_line_run_executes_hot_register_cached_forms() {
-        // MOV AX,1 ; TEST AX,AX ; JNZ target ; MOV BX,dead ; target: MOV CX,2 ; MOV BX,AX ; DEC CX
-        // HLT. The warm second run exercises cached continuation fast paths for TEST reg/reg, JNZ,
-        // MOV reg,imm, MOV reg,reg, and DEC reg. The skipped MOV proves the branch target, not the
-        // contiguous bytes, drives the next continuation.
+        // MOV AX,1 ; TEST AX,AX ; JNZ target ; MOV BX,dead ; target: MOV CX,2 ; MOV BX,AX ;
+        // MOV AX,BX ; DEC CX ; HLT. The warm second run exercises cached continuation fast paths
+        // for TEST reg/reg, JNZ, MOV reg,imm, both MOV reg/reg directions, and DEC reg. The skipped
+        // MOV proves the branch target, not the contiguous bytes, drives the next continuation.
         let code = [
             0xb8, 0x01, 0x00, // MOV AX, 1
             0x85, 0xc0, // TEST AX, AX
@@ -18403,6 +18403,7 @@ mod tests {
             0xbb, 0xad, 0xde, // MOV BX, 0xDEAD (skipped)
             0xb9, 0x02, 0x00, // MOV CX, 2
             0x89, 0xc3, // MOV BX, AX
+            0x8b, 0xc3, // MOV AX, BX
             0x49, // DEC CX
             0xf4, // HLT
         ];
@@ -18417,7 +18418,7 @@ mod tests {
         cpu.halted = false;
         let outcome = cpu.run_straight_line(&mut bus, u64::MAX).unwrap();
         assert!(!outcome.halted, "HLT remains a terminator");
-        assert_eq!(cpu.registers.eip, 0x10, "run stopped at HLT");
+        assert_eq!(cpu.registers.eip, 0x12, "run stopped at HLT");
         assert_eq!(cpu.read_reg16(Reg16::Ax), 1);
         assert_eq!(cpu.read_reg16(Reg16::Bx), 1, "taken JNZ skipped dead MOV");
         assert_eq!(cpu.read_reg16(Reg16::Cx), 1, "MOV imm then DEC ran");
