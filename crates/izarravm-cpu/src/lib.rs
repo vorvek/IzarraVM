@@ -7040,7 +7040,14 @@ impl Cpu386 {
             }
             descriptor.base.wrapping_add(offset)
         };
-        let physical = self.translate_linear(bus, linear, write)?;
+        let physical = if self.control.cr0 & CR0_PG == 0 {
+            if write {
+                self.record_write_page(linear);
+            }
+            linear
+        } else {
+            self.translate_linear(bus, linear, write)?
+        };
         if write {
             self.note_code_write(physical, width);
         }
