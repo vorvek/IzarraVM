@@ -476,6 +476,7 @@ const TLB_ENTRIES: usize = 64;
 const PREFETCH_WINDOW_BYTES: usize = 32;
 const TRACKED_WRITE_PAGES: usize = 8;
 const DIRECT_PAGE_CACHE_LINES: usize = 64;
+const CPU_PROFILE_GROUPS: usize = 16;
 
 #[derive(Clone, Copy)]
 struct TlbEntry {
@@ -878,6 +879,61 @@ impl PartialEq for PerfCounters {
 }
 impl Eq for PerfCounters {}
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CpuProfileBucket {
+    pub name: &'static str,
+    pub instructions: u64,
+    pub guest_core_clocks: u64,
+    pub sample_wall_ns: u64,
+    pub samples: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CpuProfileSnapshot {
+    pub sample_stride: u64,
+    pub groups: Vec<CpuProfileBucket>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CpuProfileBucketState {
+    instructions: u64,
+    guest_core_clocks: u64,
+    sample_wall_ns: u64,
+    samples: u64,
+}
+
+#[derive(Clone)]
+struct CpuProfileState {
+    enabled: bool,
+    sample_stride: u64,
+    until_sample: u64,
+    groups: [CpuProfileBucketState; CPU_PROFILE_GROUPS],
+}
+
+impl Default for CpuProfileState {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sample_stride: 1,
+            until_sample: 1,
+            groups: [CpuProfileBucketState::default(); CPU_PROFILE_GROUPS],
+        }
+    }
+}
+
+impl PartialEq for CpuProfileState {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for CpuProfileState {}
+
+impl std::fmt::Debug for CpuProfileState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CpuProfileState")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Cpu386 {
     pub registers: Registers,
@@ -924,6 +980,8 @@ pub struct Cpu386 {
     /// Host-side performance counters (diagnostics for `--headless-bench`). Excluded from
     /// equality via `PerfCounters`'s always-equal `PartialEq`, like the decode cache.
     perf: PerfCounters,
+    /// Optional host-side profiling. Off for normal execution and excluded from equality.
+    profile: CpuProfileState,
     /// Deferred arithmetic flags (lazy-flags optimization). While `Some`, the six arithmetic-flag
     /// bits in `registers.eflags` are stale. Cpu386 equality is flag-representation-sensitive while a
     /// deferral is outstanding; real flag comparisons go through `flag()` / `eflags()`, which
@@ -1247,6 +1305,69 @@ enum DecodeGroup {
     TwoByteFallback,
 }
 
+impl DecodeGroup {
+    const ALL: [DecodeGroup; CPU_PROFILE_GROUPS] = [
+        DecodeGroup::Alu,
+        DecodeGroup::DataMove,
+        DecodeGroup::Stack,
+        DecodeGroup::Group,
+        DecodeGroup::Branch,
+        DecodeGroup::ControlFlow,
+        DecodeGroup::FlagsMisc,
+        DecodeGroup::StringOps,
+        DecodeGroup::PortIo,
+        DecodeGroup::BitManip,
+        DecodeGroup::CondMove,
+        DecodeGroup::SystemSeg,
+        DecodeGroup::Fpu,
+        DecodeGroup::Misc,
+        DecodeGroup::Fallback,
+        DecodeGroup::TwoByteFallback,
+    ];
+
+    const fn profile_index(self) -> usize {
+        match self {
+            DecodeGroup::Alu => 0,
+            DecodeGroup::DataMove => 1,
+            DecodeGroup::Stack => 2,
+            DecodeGroup::Group => 3,
+            DecodeGroup::Branch => 4,
+            DecodeGroup::ControlFlow => 5,
+            DecodeGroup::FlagsMisc => 6,
+            DecodeGroup::StringOps => 7,
+            DecodeGroup::PortIo => 8,
+            DecodeGroup::BitManip => 9,
+            DecodeGroup::CondMove => 10,
+            DecodeGroup::SystemSeg => 11,
+            DecodeGroup::Fpu => 12,
+            DecodeGroup::Misc => 13,
+            DecodeGroup::Fallback => 14,
+            DecodeGroup::TwoByteFallback => 15,
+        }
+    }
+
+    const fn profile_name(self) -> &'static str {
+        match self {
+            DecodeGroup::Alu => "alu",
+            DecodeGroup::DataMove => "data_move",
+            DecodeGroup::Stack => "stack",
+            DecodeGroup::Group => "group",
+            DecodeGroup::Branch => "branch",
+            DecodeGroup::ControlFlow => "control_flow",
+            DecodeGroup::FlagsMisc => "flags_misc",
+            DecodeGroup::StringOps => "string_ops",
+            DecodeGroup::PortIo => "port_io",
+            DecodeGroup::BitManip => "bit_manip",
+            DecodeGroup::CondMove => "cond_move",
+            DecodeGroup::SystemSeg => "system_seg",
+            DecodeGroup::Fpu => "fpu",
+            DecodeGroup::Misc => "misc",
+            DecodeGroup::Fallback => "fallback",
+            DecodeGroup::TwoByteFallback => "two_byte_fallback",
+        }
+    }
+}
+
 /// Whether a decoded group is safe to run as a straight-line continuation: it neither transfers
 /// control, touches a port, changes segment / CR / system state, halts, nor runs a REP string op.
 /// The straight-line run executor keeps pulling such instructions from the decode cache (one call,
@@ -1266,6 +1387,75 @@ fn block_straight_line(g: DecodeGroup) -> bool {
             | DecodeGroup::CondMove
             | DecodeGroup::Fpu
     )
+}
+
+impl CpuProfileState {
+    fn enable(&mut self, sample_stride: u64) {
+        *self = Self {
+            enabled: true,
+            sample_stride: sample_stride.max(1),
+            until_sample: 1,
+            groups: [CpuProfileBucketState::default(); CPU_PROFILE_GROUPS],
+        };
+    }
+
+    fn disable(&mut self) {
+        *self = Self::default();
+    }
+
+    #[inline]
+    fn sample_start(&self) -> Option<std::time::Instant> {
+        (self.enabled && self.until_sample == 1).then(std::time::Instant::now)
+    }
+
+    #[inline]
+    fn record(
+        &mut self,
+        group: DecodeGroup,
+        guest_core_clocks: u64,
+        start: Option<std::time::Instant>,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let bucket = &mut self.groups[group.profile_index()];
+        bucket.instructions += 1;
+        bucket.guest_core_clocks += guest_core_clocks;
+        if let Some(start) = start {
+            bucket.samples += 1;
+            bucket.sample_wall_ns = bucket
+                .sample_wall_ns
+                .saturating_add(duration_ns_u64(start.elapsed()));
+        }
+        self.until_sample = if self.until_sample <= 1 {
+            self.sample_stride
+        } else {
+            self.until_sample - 1
+        };
+    }
+
+    fn snapshot(&self) -> CpuProfileSnapshot {
+        CpuProfileSnapshot {
+            sample_stride: self.sample_stride,
+            groups: DecodeGroup::ALL
+                .iter()
+                .map(|&group| {
+                    let bucket = self.groups[group.profile_index()];
+                    CpuProfileBucket {
+                        name: group.profile_name(),
+                        instructions: bucket.instructions,
+                        guest_core_clocks: bucket.guest_core_clocks,
+                        sample_wall_ns: bucket.sample_wall_ns,
+                        samples: bucket.samples,
+                    }
+                })
+                .collect(),
+        }
+    }
+}
+
+fn duration_ns_u64(duration: std::time::Duration) -> u64 {
+    duration.as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
 /// A decoded instruction: the prefix/opcode/operand-size results plus the pre-parsed ModRM, operand
@@ -1733,6 +1923,20 @@ impl Cpu386 {
         self.perf = PerfCounters::default();
     }
 
+    /// Enable host-side CPU bucket profiling. Guest-visible state and timing are unchanged.
+    pub fn enable_profiling(&mut self, sample_stride: u64) {
+        self.profile.enable(sample_stride);
+    }
+
+    /// Disable and clear host-side CPU bucket profiling.
+    pub fn disable_profiling(&mut self) {
+        self.profile.disable();
+    }
+
+    pub fn profile_snapshot(&self) -> CpuProfileSnapshot {
+        self.profile.snapshot()
+    }
+
     #[inline]
     fn record_data_read(&mut self, kind: BusAccessKind, direct: bool) {
         if kind == BusAccessKind::DataRead {
@@ -2028,10 +2232,23 @@ impl Cpu386 {
         let start_eip = self.registers.eip;
         let start_cs = self.registers.cs().selector;
         let lin = self.linear_eip();
-        let result = self
-            .fetch_decoded(bus, lin)
-            .and_then(|insn| self.execute_decoded(&insn, bus));
-        self.finish_instruction(bus, result, start_eip, start_cs)
+        let profiling = self.profile.enabled;
+        let profile_start = if profiling {
+            self.profile.sample_start()
+        } else {
+            None
+        };
+        let mut group = None;
+        let result = match self.fetch_decoded(bus, lin) {
+            Ok(insn) => {
+                if profiling {
+                    group = Some(insn.group);
+                }
+                self.execute_decoded(&insn, bus)
+            }
+            Err(fault) => Err(fault),
+        };
+        self.finish_instruction(bus, result, start_eip, start_cs, group, profile_start)
     }
 
     /// The shared rewind / deliver / scale tail of a single instruction's execution, used by both
@@ -2051,6 +2268,8 @@ impl Cpu386 {
         result: ExecResult<CycleOutcome>,
         start_eip: u32,
         start_cs: u16,
+        group: Option<DecodeGroup>,
+        profile_start: Option<std::time::Instant>,
     ) -> Result<CycleOutcome, CpuError> {
         let outcome = match result {
             Ok(outcome) => outcome,
@@ -2075,6 +2294,9 @@ impl Cpu386 {
         let charged = self.scale_clocks(outcome.core_clocks);
         self.elapsed_clocks += charged;
         self.perf.instructions += 1;
+        if let Some(group) = group {
+            self.profile.record(group, charged, profile_start);
+        }
         Ok(CycleOutcome {
             core_clocks: charged.min(u64::from(u32::MAX)) as u32,
             halted: outcome.halted,
@@ -2187,10 +2409,23 @@ impl Cpu386 {
         self.begin_instruction();
         let start_eip = self.registers.eip;
         let start_cs = self.registers.cs().selector;
+        let profiling = self.profile.enabled;
+        let profile_start = if profiling {
+            self.profile.sample_start()
+        } else {
+            None
+        };
         let result = self
             .charge_cached_fetch(bus, lin, insn.len)
             .and_then(|()| self.execute_decoded(insn, bus));
-        self.finish_instruction(bus, result, start_eip, start_cs)
+        self.finish_instruction(
+            bus,
+            result,
+            start_eip,
+            start_cs,
+            profiling.then_some(insn.group),
+            profile_start,
+        )
     }
 
     /// The single routing authority for the decode/execute split: classify an opcode into the
@@ -3149,29 +3384,87 @@ impl Cpu386 {
             }
             0x88 => {
                 // MOV r/m8, r8.
-                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let modrm = insn.modrm.expect("MOV r/m8,r8 decoded with a ModRM");
                 let value = self.read_gpr8(modrm.reg);
-                self.write_operand_u8(bus, operand, value)?;
+                match insn.operand.expect("MOV r/m8,r8 decoded with an operand") {
+                    DecodedOperand::Reg(index) => self.write_gpr8(index, value),
+                    DecodedOperand::Mem(addr) => {
+                        let RmOperand::Memory(memory) = self.resolve_addr_mode(&addr) else {
+                            unreachable!("memory descriptor resolved to register")
+                        };
+                        self.write_memory_u8(
+                            bus,
+                            memory.segment,
+                            memory.offset,
+                            value,
+                            BusAccessKind::DataWrite,
+                        )?;
+                    }
+                }
                 Ok(clocks(2))
             }
             0x89 => {
                 // MOV r/m16/32, r16/32.
-                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
+                let modrm = insn.modrm.expect("MOV r/m,r decoded with a ModRM");
                 let value = self.read_gpr_sized(modrm.reg, operand_size);
-                self.write_operand_sized(bus, operand, operand_size, value)?;
+                match insn.operand.expect("MOV r/m,r decoded with an operand") {
+                    DecodedOperand::Reg(index) => {
+                        self.write_gpr_sized(index, operand_size, value);
+                    }
+                    DecodedOperand::Mem(addr) => {
+                        let RmOperand::Memory(memory) = self.resolve_addr_mode(&addr) else {
+                            unreachable!("memory descriptor resolved to register")
+                        };
+                        self.write_memory_sized(
+                            bus,
+                            memory.segment,
+                            memory.offset,
+                            operand_size,
+                            value,
+                            BusAccessKind::DataWrite,
+                        )?;
+                    }
+                }
                 Ok(clocks(2))
             }
             0x8a => {
                 // MOV r8, r/m8.
-                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
-                let value = self.read_operand_u8(bus, operand)?;
+                let modrm = insn.modrm.expect("MOV r8,r/m8 decoded with a ModRM");
+                let value = match insn.operand.expect("MOV r8,r/m8 decoded with an operand") {
+                    DecodedOperand::Reg(index) => self.read_gpr8(index),
+                    DecodedOperand::Mem(addr) => {
+                        let RmOperand::Memory(memory) = self.resolve_addr_mode(&addr) else {
+                            unreachable!("memory descriptor resolved to register")
+                        };
+                        self.read_memory_u8(
+                            bus,
+                            memory.segment,
+                            memory.offset,
+                            BusAccessKind::DataRead,
+                        )?
+                    }
+                };
                 self.write_gpr8(modrm.reg, value);
                 Ok(clocks(2))
             }
             0x8b => {
                 // MOV r16/32, r/m16/32.
-                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
-                let value = self.read_operand_sized(bus, operand, operand_size)?;
+                let modrm = insn.modrm.expect("MOV r,r/m decoded with a ModRM");
+                let value = match insn.operand.expect("MOV r,r/m decoded with an operand") {
+                    DecodedOperand::Reg(index) => self.read_gpr_sized(index, operand_size),
+                    DecodedOperand::Mem(addr) => {
+                        let RmOperand::Memory(memory) = self.resolve_addr_mode(&addr) else {
+                            unreachable!("memory descriptor resolved to register")
+                        };
+                        self.read_memory_sized(
+                            bus,
+                            memory.segment,
+                            memory.offset,
+                            operand_size,
+                            BusAccessKind::DataRead,
+                        )?
+                    }
+                };
                 self.write_gpr_sized(modrm.reg, operand_size, value);
                 Ok(clocks(2))
             }
@@ -3823,16 +4116,46 @@ impl Cpu386 {
         match insn.opcode as u8 {
             0x84 => {
                 // TEST r/m8, reg8. AND-for-flags only; no write-back (same as op=4, write_back=false).
-                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
-                let value = self.read_operand_u8(bus, operand)?;
+                let modrm = insn.modrm.expect("TEST r/m8,reg8 decoded with a ModRM");
+                let value = match insn
+                    .operand
+                    .expect("TEST r/m8,reg8 decoded with an operand")
+                {
+                    DecodedOperand::Reg(index) => self.read_gpr8(index),
+                    DecodedOperand::Mem(addr) => {
+                        let RmOperand::Memory(memory) = self.resolve_addr_mode(&addr) else {
+                            unreachable!("memory descriptor resolved to register")
+                        };
+                        self.read_memory_u8(
+                            bus,
+                            memory.segment,
+                            memory.offset,
+                            BusAccessKind::DataRead,
+                        )?
+                    }
+                };
                 let reg = self.read_gpr8(modrm.reg);
                 self.alu(4, u32::from(value), u32::from(reg), BusWidth::Byte);
                 Ok(clocks(2))
             }
             0x85 => {
                 // TEST r/m16/32, reg16/32. AND-for-flags only; no write-back.
-                let (modrm, operand) = self.resolve_decoded_modrm_operand(insn);
-                let value = self.read_operand_sized(bus, operand, operand_size)?;
+                let modrm = insn.modrm.expect("TEST r/m,reg decoded with a ModRM");
+                let value = match insn.operand.expect("TEST r/m,reg decoded with an operand") {
+                    DecodedOperand::Reg(index) => self.read_gpr_sized(index, operand_size),
+                    DecodedOperand::Mem(addr) => {
+                        let RmOperand::Memory(memory) = self.resolve_addr_mode(&addr) else {
+                            unreachable!("memory descriptor resolved to register")
+                        };
+                        self.read_memory_sized(
+                            bus,
+                            memory.segment,
+                            memory.offset,
+                            operand_size,
+                            BusAccessKind::DataRead,
+                        )?
+                    }
+                };
                 let reg = self.read_gpr_sized(modrm.reg, operand_size);
                 self.alu(4, value, reg, operand_size.bus_width());
                 Ok(clocks(2))
@@ -7321,8 +7644,20 @@ impl Cpu386 {
     }
 
     fn set_flag(&mut self, flag: u32, enabled: bool) {
-        // Settle any deferred arithmetic flags first so this eager write composes on live eflags.
-        self.materialize_flags();
+        const ARITH: u32 = FLAG_CF | FLAG_PF | FLAG_AF | FLAG_ZF | FLAG_SF | FLAG_OF;
+        if self.pending_flags.is_some() {
+            let arith = flag & ARITH;
+            if flag == FLAG_CF {
+                if let Some(p) = &mut self.pending_flags {
+                    p.cf_override = Some(enabled);
+                }
+                self.registers.eflags |= 0x2;
+                return;
+            }
+            if arith != 0 {
+                self.materialize_flags();
+            }
+        }
         if enabled {
             self.registers.eflags |= flag;
         } else {
@@ -10284,6 +10619,77 @@ mod tests {
             0,
             "no other break reason fired"
         );
+    }
+
+    fn profile_test_cpu(code: &[u8]) -> (Cpu386, TestBus) {
+        let mut memory = vec![0u8; 1024];
+        memory[..code.len()].copy_from_slice(code);
+        let mut cpu = Cpu386::default();
+        cpu.load_segment_real(SegmentIndex::Cs, 0);
+        cpu.load_segment_real(SegmentIndex::Ds, 0);
+        cpu.registers.eip = 0;
+        (cpu, TestBus::with_memory(memory))
+    }
+
+    fn profile_bucket<'a>(snapshot: &'a CpuProfileSnapshot, name: &str) -> &'a CpuProfileBucket {
+        snapshot
+            .groups
+            .iter()
+            .find(|bucket| bucket.name == name)
+            .expect("profile bucket exists")
+    }
+
+    #[test]
+    fn cpu_profile_disabled_records_no_groups() {
+        let (mut cpu, mut bus) = profile_test_cpu(&[0x40]); // inc ax
+
+        cpu.cycle_no_interrupt_check(&mut bus).unwrap();
+
+        let snapshot = cpu.profile_snapshot();
+        assert!(
+            snapshot.groups.iter().all(|bucket| bucket.instructions == 0
+                && bucket.guest_core_clocks == 0
+                && bucket.samples == 0
+                && bucket.sample_wall_ns == 0),
+            "profiling must be inert until explicitly enabled"
+        );
+    }
+
+    #[test]
+    fn cpu_profile_records_decode_groups() {
+        let code = [
+            0x05, 0x01, 0x00, // add ax,1        (alu)
+            0x8b, 0xc0, // mov ax,ax       (data_move)
+            0xd9, 0xe8, // fld1            (fpu)
+        ];
+        let (mut cpu, mut bus) = profile_test_cpu(&code);
+        cpu.enable_profiling(1);
+
+        for _ in 0..3 {
+            cpu.cycle_no_interrupt_check(&mut bus).unwrap();
+        }
+
+        let snapshot = cpu.profile_snapshot();
+        for name in ["alu", "data_move", "fpu"] {
+            let bucket = profile_bucket(&snapshot, name);
+            assert_eq!(bucket.instructions, 1, "{name} instruction count");
+            assert_eq!(bucket.samples, 1, "{name} sampled every instruction");
+        }
+    }
+
+    #[test]
+    fn cpu_profile_sample_stride_is_deterministic() {
+        let (mut cpu, mut bus) = profile_test_cpu(&[0x40, 0x40, 0x40, 0x40]); // inc ax x4
+        cpu.enable_profiling(2);
+
+        for _ in 0..4 {
+            cpu.cycle_no_interrupt_check(&mut bus).unwrap();
+        }
+
+        let snapshot = cpu.profile_snapshot();
+        let bucket = profile_bucket(&snapshot, "flags_misc");
+        assert_eq!(bucket.instructions, 4);
+        assert_eq!(bucket.samples, 2);
     }
 
     #[test]
@@ -23642,8 +24048,8 @@ mod tests {
 
     #[test]
     fn eager_flag_write_after_pending_is_correct() {
-        // A pending ADD sets CF; a later CLC (eager, via set_flag) must clear CF while leaving the
-        // pending-derived ZF intact, i.e. set_flag must settle the pending first.
+        // A pending ADD sets CF; a later CLC-like set_flag must clear CF while leaving the
+        // pending-derived ZF intact, without forcing the rest of the lazy flags live.
         let mut cpu = Cpu386::default();
         let r = cpu.alu_add_eager(0xff, 0x01, 0, BusWidth::Byte); // CF=1, ZF=1 (result 0x00)
         let mut lazy = Cpu386 {
@@ -23657,15 +24063,40 @@ mod tests {
             }),
             ..Default::default()
         };
+        lazy.reset_perf_counters();
         lazy.set_flag(FLAG_CF, false); // CLC-like eager write
         assert!(!lazy.flag(FLAG_CF), "CF must be cleared by the eager write");
         assert!(
             lazy.flag(FLAG_ZF),
-            "ZF from the settled pending must survive"
+            "ZF from the pending descriptor must survive"
         );
         assert!(
-            lazy.pending_flags.is_none(),
-            "set_flag must have settled the pending"
+            lazy.pending_flags.is_some(),
+            "single-CF writes should use the lazy CF override"
+        );
+        assert_eq!(
+            lazy.perf.flag_materializations, 0,
+            "CF override should not materialize lazy flags"
+        );
+    }
+
+    #[test]
+    fn non_arithmetic_flag_write_after_pending_stays_lazy() {
+        let mut lazy = Cpu386::default();
+        lazy.alu_sub(1, 1, 0, BusWidth::Byte); // pending ZF=1
+        lazy.reset_perf_counters();
+
+        lazy.set_flag(FLAG_DF, true);
+
+        assert!(lazy.flag(FLAG_DF), "DF write must be visible");
+        assert!(lazy.flag(FLAG_ZF), "pending arithmetic flags must survive");
+        assert!(
+            lazy.pending_flags.is_some(),
+            "non-arithmetic writes should not settle pending arithmetic flags"
+        );
+        assert_eq!(
+            lazy.perf.flag_materializations, 0,
+            "non-arithmetic writes should not materialize lazy flags"
         );
     }
 

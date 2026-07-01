@@ -1125,6 +1125,147 @@ pub struct BandwidthSample {
     pub clocks: u64,
 }
 
+const MACHINE_PROFILE_PHASES: usize = 6;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MachineProfilePhase {
+    pub name: &'static str,
+    pub wall_ns: u64,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MachineHostProfileSnapshot {
+    pub phases: Vec<MachineProfilePhase>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MachineProfilePhaseKind {
+    CpuBatch,
+    AdvanceDevices,
+    SoftInt,
+    ConsoleFlush,
+    HaltFastForward,
+    CdStall,
+}
+
+impl MachineProfilePhaseKind {
+    const ALL: [Self; MACHINE_PROFILE_PHASES] = [
+        Self::CpuBatch,
+        Self::AdvanceDevices,
+        Self::SoftInt,
+        Self::ConsoleFlush,
+        Self::HaltFastForward,
+        Self::CdStall,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::CpuBatch => 0,
+            Self::AdvanceDevices => 1,
+            Self::SoftInt => 2,
+            Self::ConsoleFlush => 3,
+            Self::HaltFastForward => 4,
+            Self::CdStall => 5,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::CpuBatch => "cpu_batch",
+            Self::AdvanceDevices => "advance_devices",
+            Self::SoftInt => "soft_int",
+            Self::ConsoleFlush => "console_flush",
+            Self::HaltFastForward => "halt_fast_forward",
+            Self::CdStall => "cd_stall",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct MachineProfilePhaseState {
+    wall_ns: u64,
+    count: u64,
+}
+
+#[derive(Clone)]
+struct MachineHostProfile {
+    enabled: bool,
+    phases: [MachineProfilePhaseState; MACHINE_PROFILE_PHASES],
+}
+
+impl Default for MachineHostProfile {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            phases: [MachineProfilePhaseState::default(); MACHINE_PROFILE_PHASES],
+        }
+    }
+}
+
+impl PartialEq for MachineHostProfile {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for MachineHostProfile {}
+
+impl std::fmt::Debug for MachineHostProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MachineHostProfile")
+    }
+}
+
+impl MachineHostProfile {
+    fn enable(&mut self) {
+        *self = Self {
+            enabled: true,
+            phases: [MachineProfilePhaseState::default(); MACHINE_PROFILE_PHASES],
+        };
+    }
+
+    fn disable(&mut self) {
+        *self = Self::default();
+    }
+
+    #[inline]
+    fn start(&self) -> Option<std::time::Instant> {
+        self.enabled.then(std::time::Instant::now)
+    }
+
+    #[inline]
+    fn record(&mut self, phase: MachineProfilePhaseKind, start: Option<std::time::Instant>) {
+        let Some(start) = start else {
+            return;
+        };
+        let bucket = &mut self.phases[phase.index()];
+        bucket.count += 1;
+        bucket.wall_ns = bucket
+            .wall_ns
+            .saturating_add(duration_ns_u64(start.elapsed()));
+    }
+
+    fn snapshot(&self) -> MachineHostProfileSnapshot {
+        MachineHostProfileSnapshot {
+            phases: MachineProfilePhaseKind::ALL
+                .iter()
+                .map(|&phase| {
+                    let bucket = self.phases[phase.index()];
+                    MachineProfilePhase {
+                        name: phase.name(),
+                        wall_ns: bucket.wall_ns,
+                        count: bucket.count,
+                    }
+                })
+                .collect(),
+        }
+    }
+}
+
+fn duration_ns_u64(duration: std::time::Duration) -> u64 {
+    duration.as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
 #[derive(Debug)]
 pub struct Machine {
     profile: MachineProfile,
@@ -1168,6 +1309,7 @@ pub struct Machine {
     // Set when the RAM direct-map table changes, so cached host pointers in the CPU are dropped
     // before any later guest access can use a stale RAM page classification.
     direct_map_changed: bool,
+    host_profile: MachineHostProfile,
     // Toka-DOS service (Lotura port 0xE3): a write records the command here, the
     // run loop performs it after the cycle (it needs &mut self for host I/O), and
     // the resulting status is read back at 0xE3.
@@ -1522,6 +1664,7 @@ impl Machine {
             io_touched: false,
             device_wrote_memory: false,
             direct_map_changed: false,
+            host_profile: MachineHostProfile::default(),
             pending_toka_service: None,
             toka_service_status: 0,
             katea_root: None,
@@ -2203,6 +2346,20 @@ impl Machine {
 
     pub fn cpu(&self) -> &Cpu386 {
         &self.cpu
+    }
+
+    pub fn enable_host_profiling(&mut self, sample_stride: u64) {
+        self.host_profile.enable();
+        self.cpu.enable_profiling(sample_stride);
+    }
+
+    pub fn disable_host_profiling(&mut self) {
+        self.host_profile.disable();
+        self.cpu.disable_profiling();
+    }
+
+    pub fn host_profile_snapshot(&self) -> MachineHostProfileSnapshot {
+        self.host_profile.snapshot()
     }
 
     pub fn memory(&self) -> &Memory {
@@ -9221,6 +9378,7 @@ impl Machine {
                 .timing
                 .clocks_per_audio_sample
                 .min(deadline - self.elapsed_clocks);
+            let cpu_batch_start = self.host_profile.start();
             let outcome = {
                 let Machine {
                     profile,
@@ -9408,6 +9566,8 @@ impl Machine {
                     }),
                 }
             };
+            self.host_profile
+                .record(MachineProfilePhaseKind::CpuBatch, cpu_batch_start);
 
             match outcome {
                 Ok(outcome) => {
@@ -9421,27 +9581,42 @@ impl Machine {
                     // Advance the OPL timers so AdLib detection's delay loops see
                     // the overflow flag (the synthesis clock is driven separately
                     // by `render_audio`).
+                    let advance_start = self.host_profile.start();
                     self.advance_devices(step);
+                    self.host_profile
+                        .record(MachineProfilePhaseKind::AdvanceDevices, advance_start);
                     // Charge the CD-ROM's seek + transfer time for a read the
                     // instruction just issued, the way the floppy stalls. The
                     // guest clock jumps; the GUI's realtime pacing turns that into
                     // a visible wait.
                     let cd_secs = self.ide.take_stall_secs();
                     if cd_secs > 0.0 {
+                        let cd_start = self.host_profile.start();
                         self.stall_for(cd_secs);
+                        self.host_profile
+                            .record(MachineProfilePhaseKind::CdStall, cd_start);
                     }
+                    let service_start = self.host_profile.start();
+                    let mut serviced = false;
+                    let mut service_stop = None;
                     if let Some(mode) = self.pending_mode.take() {
+                        serviced = true;
                         self.set_mode(mode); // live Lotura switch takes effect next instruction
                     }
                     if let Some(cmd) = self.pending_toka_service.take() {
+                        serviced = true;
                         self.perform_toka_service(cmd); // Repair (cmd 0x01)
                     }
                     if let Some(cmd) = self.unittester.take_pending() {
+                        serviced = true;
                         if let Some(code) = self.perform_unittester(cmd) {
-                            return Ok(StopReason::TestExit { code });
+                            service_stop = Some(StopReason::TestExit { code });
                         }
                     }
-                    if let Some(vector) = self.pending_soft_int {
+                    if service_stop.is_none()
+                        && let Some(vector) = self.pending_soft_int
+                    {
+                        serviced = true;
                         match vector {
                             0x10 | 0x42 => self.handle_int10(),
                             0x11 => self.handle_int11(),
@@ -9467,10 +9642,12 @@ impl Machine {
                             0x67 => self.handle_int67(),
                             0x20 | 0x21 | 0x27 if self.program_runtime => {
                                 match self.handle_raw_program_int(vector) {
-                                    Ok(Some(code)) => return Ok(StopReason::DosExit { code }),
+                                    Ok(Some(code)) => {
+                                        service_stop = Some(StopReason::DosExit { code });
+                                    }
                                     Ok(None) => {}
                                     Err(error) => {
-                                        return Ok(StopReason::CpuError(format!(
+                                        service_stop = Some(StopReason::CpuError(format!(
                                             "raw program INT {vector:#04x}: {error}"
                                         )));
                                     }
@@ -9479,15 +9656,32 @@ impl Machine {
                             _ => {}
                         }
                     }
+                    if serviced {
+                        self.host_profile
+                            .record(MachineProfilePhaseKind::SoftInt, service_start);
+                    }
+                    if let Some(stop) = service_stop {
+                        return Ok(stop);
+                    }
                     // Mirror any DOS console output onto the VGA text screen.
+                    let console_start = self.host_profile.start();
                     self.flush_dos_console_to_screen();
+                    self.host_profile
+                        .record(MachineProfilePhaseKind::ConsoleFlush, console_start);
                     if outcome.halted {
+                        let halt_start = self.host_profile.start();
                         match self.next_timer_wake(deadline) {
                             Some(wake_step) => {
                                 self.elapsed_clocks += wake_step;
                                 self.advance_devices(wake_step);
+                                self.host_profile
+                                    .record(MachineProfilePhaseKind::HaltFastForward, halt_start);
                             }
-                            None => return Ok(StopReason::Halted),
+                            None => {
+                                self.host_profile
+                                    .record(MachineProfilePhaseKind::HaltFastForward, halt_start);
+                                return Ok(StopReason::Halted);
+                            }
                         }
                     }
                     // The A20 gate toggled during this step (port 0x92, the 8042, INT 15h, or XMS):
@@ -12326,6 +12520,35 @@ mod tests {
                 .unwrap();
         let reason = m.run_until_halt_or_cycles(100_000).unwrap();
         assert_eq!(reason, StopReason::DosExit { code: 0x2a });
+    }
+
+    #[test]
+    fn raw_program_profile_records_cpu_batch_phase() {
+        let prog: &[u8] = &[0xb8, 0x00, 0x4c, 0xcd, 0x21]; // mov ax,4c00; int 21h
+        let mut m =
+            Machine::new_raw_program(MachineProfile::gsw_386(16, VideoCard::Et4000Ax), prog)
+                .unwrap();
+        m.enable_host_profiling(1);
+
+        let reason = m.run_until_halt_or_cycles(100_000).unwrap();
+
+        assert_eq!(reason, StopReason::DosExit { code: 0 });
+        let host = m.host_profile_snapshot();
+        let cpu_batch = host
+            .phases
+            .iter()
+            .find(|phase| phase.name == "cpu_batch")
+            .expect("cpu_batch phase exists");
+        assert!(cpu_batch.count > 0, "CPU batches should be counted");
+        assert!(
+            cpu_batch.wall_ns > 0,
+            "CPU batch wall time should be measured"
+        );
+        let cpu = m.cpu().profile_snapshot();
+        assert!(
+            cpu.groups.iter().any(|bucket| bucket.instructions > 0),
+            "CPU group profile should record retired instructions"
+        );
     }
 
     #[test]
