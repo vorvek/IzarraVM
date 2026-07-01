@@ -317,6 +317,14 @@ monitor:
     jmp .done_gp
 .intn:
     movzx ebx, byte [eax+1]      ; INT vector operand
+    cmp bl, 0xC0                 ; TOKAEMM-private monitor call (XMS-move memcpy)?
+    jne .intn_reflect
+    cmp word [esp+20], 0x544D    ; guest DX == 'TM' cookie? (pushad EDX slot)
+    jne .intn_reflect            ; not our cookie: reflect INT 0xC0 like any other
+    add word [ebp], 2            ; skip past INT 0xC0
+    call flat_memcpy
+    jmp .done_gp
+.intn_reflect:
     add word [ebp], 2            ; return IP = past INT n
     call reflect_vector
     jmp .done_gp
@@ -435,6 +443,24 @@ maybe_deliver:
     mov ebx, 9
     jmp reflect_vector
 .none:
+    ret
+
+; Ring-0 flat memcpy for the XMS block MOVE (INT 0xC0 monitor service). The guest
+; driver put dst linear in EDI, src linear in ESI, byte count in ECX (all live in
+; the pushad frame), and enabled A20 first. deliver_exception NULLED ES/DS/FS/GS on
+; the V86->ring0 entry, and a null selector faults a PM memory access, so reload ES
+; to the flat selector (DS is already 0x10 from monitor entry). Reads the three
+; args from the pushad slots (this routine was `call`ed, so +4 for the return addr:
+; guest EDI=[esp+4], ESI=[esp+8], ECX=[esp+28]). The frame is only read, never
+; written, so .done_gp's popad restores the guest's registers afterwards.
+flat_memcpy:
+    mov ax, 0x10
+    mov es, ax                    ; ES = flat (base 0); DS already 0x10
+    mov edi, [esp + 4]            ; guest EDI = dst linear
+    mov esi, [esp + 8]            ; guest ESI = src linear
+    mov ecx, [esp + 28]           ; guest ECX = byte count
+    cld
+    rep movsb                     ; DS:ESI -> ES:EDI, both flat
     ret
 
 ; Debug failure signal via the unit-tester exit port (AL = code).
