@@ -191,12 +191,20 @@ pm_init:                          ; EBP=pd_lin, ESI=drv_seg, EBX=monitor ESP0
     mov es, ax
     mov ss, ax
     mov esp, ebx                  ; monitor ring-0 stack (driver-resident)
-    lea eax, [ebp + 0x1000]       ; PD[0] -> PT (= PD + 0x1000)
+    ; PD[0..3] -> the four PTs that follow the PD (each PT maps 4 MiB), so the
+    ; identity map covers 0..16 MiB and the XMS-move memcpy can reach every EMB.
+    lea eax, [ebp + 0x1000]       ; first PT linear = PD + 0x1000
     or eax, 7
-    mov [ebp], eax
-    lea edi, [ebp + 0x1000]       ; PT: 1024 identity entries (0..4 MiB)
+    mov edi, ebp                  ; write PD entries
+    mov ecx, 4
+.pde:
+    mov [edi], eax
+    add eax, 0x1000               ; next PT is one page further
+    add edi, 4
+    loop .pde
+    lea edi, [ebp + 0x1000]       ; 4096 identity entries (0..16 MiB), present/rw/user
     mov eax, 7
-    mov ecx, 1024
+    mov ecx, 4096
 .pt:
     mov [edi], eax
     add eax, 0x1000
@@ -451,5 +459,7 @@ mon_stack_top:
 
 align 4096
 tables:
-    times 0x3000 db 0
+    ; PD (1 page) + 4 PT (4 pages) = 0x5000, plus up to 0xFF0 of page-rounding slack
+    ; (pd_lin = round_up_4k(base+tables), base is only paragraph-aligned) -> 0x6000.
+    times 0x6000 db 0
 resident_end:
