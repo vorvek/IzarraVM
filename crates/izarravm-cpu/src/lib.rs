@@ -178,6 +178,37 @@ pub enum CpuError {
     DivideError,
 }
 
+// ---------------------------------------------------------------------------
+// V86 debug trace (TOKAEMM SP-4b bring-up). A thread-local ring buffer of the
+// last interrupt deliveries + IRETs, populated only when `TOKAEMM_TRACE` is set
+// in the environment, and drained by the test harness after a fatal CpuError to
+// localize where a V86 boot went wrong. Zero cost when the env var is unset.
+// ---------------------------------------------------------------------------
+thread_local! {
+    static V86_TRACE: std::cell::RefCell<std::collections::VecDeque<String>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+    static V86_TRACE_ON: bool = std::env::var_os("TOKAEMM_TRACE").is_some();
+    static V86_ITRACE_ON: bool = std::env::var_os("TOKAEMM_ITRACE").is_some();
+}
+
+fn v86_trace(msg: impl FnOnce() -> String) {
+    if V86_TRACE_ON.with(|on| *on) {
+        V86_TRACE.with(|t| {
+            let mut t = t.borrow_mut();
+            if t.len() >= 512 {
+                t.pop_front();
+            }
+            t.push_back(msg());
+        });
+    }
+}
+
+/// Drain the V86 debug trace (see [`v86_trace`]). Test-only; empty unless
+/// `TOKAEMM_TRACE` was set.
+pub fn take_v86_trace() -> Vec<String> {
+    V86_TRACE.with(|t| t.borrow_mut().drain(..).collect())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reg16 {
     Ax,
@@ -1954,6 +1985,15 @@ impl Cpu386 {
         self.control.cr0 & CR0_PE != 0
     }
 
+    /// True while executing ring-0 protected-mode code that is not a V86 task —
+    /// i.e., inside a V86 monitor (TOKAEMM). The machine defers deferred HLE
+    /// interrupt servicing (`handle_int10`/`handle_int13`/…, which assume a
+    /// real-mode INT frame at SS:SP) while this holds, so the HLE runs only once
+    /// the monitor has reflected the INT back into the V86 guest.
+    pub fn is_ring0_protected(&self) -> bool {
+        self.is_protected_mode() && !self.is_v86_mode() && self.current_privilege_level() == 0
+    }
+
     /// The live instruction-set level the core presents to the guest.
     pub fn level(&self) -> CpuLevel {
         self.level
@@ -2394,6 +2434,10 @@ impl Cpu386 {
         self.begin_instruction();
         let start_eip = self.registers.eip;
         let start_cs = self.registers.cs().selector;
+        if V86_ITRACE_ON.with(|on| *on) && self.is_v86_mode() {
+            let ip = start_eip & 0xffff;
+            v86_trace(move || format!("I  {start_cs:04x}:{ip:04x}"));
+        }
         let lin = self.linear_eip();
         let profiling = self.profile.enabled;
         let profile_start = if profiling {
@@ -6093,8 +6137,16 @@ impl Cpu386 {
             0xcd => {
                 // INT n. IOPL-sensitive in V86 (checked here, exactly as the fused handler did,
                 // before the delivery). `decode` fetched the vector into `imm`.
-                self.check_v86_iopl()?;
                 let vector = insn.imm as u8;
+                // In V86 a below-IOPL `INT n` faults to the monitor, but the emulator's HLE
+                // BIOS/DOS services (INT 10h video, INT 13h disk, …) are driven from
+                // `interrupt_acknowledge`, which the fault path would otherwise skip — so the
+                // guest's console output would never render under a V86 monitor. Notify the bus
+                // first, exactly as real-mode `software_interrupt` does, then raise the #GP.
+                if self.is_v86_mode() && self.iopl() < 3 {
+                    bus.interrupt_acknowledge(vector, self.read_gpr16(0))?;
+                    self.check_v86_iopl()?;
+                }
                 self.software_interrupt(bus, vector)?;
                 Ok(clocks(37))
             }
@@ -7971,6 +8023,8 @@ impl Cpu386 {
     // interrupt_acknowledge: that hook is the software-INT device side-effect path
     // (the video mode-set), not the INTA handshake, which the PIC handled already.
     fn hardware_interrupt<B: CpuBus>(&mut self, bus: &mut B, vector: u8) -> ExecResult<()> {
+        let v86 = self.is_v86_mode();
+        v86_trace(move || format!("HWIRQ v={vector:#04x} v86={v86}"));
         if self.is_protected_mode() {
             self.deliver_exception(bus, vector, None, true)
         } else {
@@ -8072,6 +8126,25 @@ impl Cpu386 {
         }
         self.load_segment(bus, SegmentIndex::Cs, selector)?;
         self.set_eip(offset);
+        if V86_TRACE_ON.with(|on| *on) {
+            let op = if source_v86 {
+                let lin = (u32::from(saved_cs) << 4).wrapping_add(saved_eip & 0xffff);
+                self.read_system_linear_u32(bus, lin).unwrap_or(0)
+            } else {
+                0
+            };
+            v86_trace(|| {
+                format!(
+                    "DLV v={vector:#04x} ext={is_external} src_v86={source_v86} guest={saved_cs:04x}:{:04x} op={op:08x} -> {selector:#06x}:{offset:#06x}",
+                    saved_eip & 0xffff
+                )
+            });
+            // Record the reflected INT vector (guest `INT n` faulting to the monitor).
+            if source_v86 && vector == 0x0d && (op & 0xff) == 0xcd {
+                let intv = (op >> 8) & 0xff;
+                v86_trace(move || format!("INTREFL {intv:#04x}"));
+            }
+        }
         Ok(())
     }
 
@@ -8109,6 +8182,13 @@ impl Cpu386 {
                 let eip = self.pop(bus, OperandSize::Dword)?;
                 let cs = self.pop(bus, OperandSize::Dword)? as u16;
                 let flags = self.pop(bus, OperandSize::Dword)?;
+                v86_trace(|| {
+                    format!(
+                        "IRETD cpl={} retVM={} cs={cs:#06x} eip={eip:#06x}",
+                        self.current_privilege_level(),
+                        flags & FLAG_VM != 0
+                    )
+                });
 
                 if self.current_privilege_level() == 0 && flags & FLAG_VM != 0 {
                     // Return INTO a V86 task: pop the V86 tail and reload real-mode segments.
@@ -8162,7 +8242,9 @@ impl Cpu386 {
     ) -> ExecResult<()> {
         // A protected-mode far call to a system descriptor goes through a call gate,
         // which supplies its own CS:offset (the instruction's offset is ignored).
-        if self.is_protected_mode() {
+        // A V86 task (PE=1 but VM=1) uses 8086 far-call semantics — its selector is a
+        // real-mode segment, never a descriptor — so it falls through to the direct path.
+        if self.is_protected_mode() && !self.is_v86_mode() {
             let (low, high) = self.read_transfer_descriptor(bus, selector)?;
             if (high >> 8) & 0x10 == 0 {
                 return self.far_system_transfer(bus, selector, low, high, true);
@@ -8209,7 +8291,8 @@ impl Cpu386 {
         offset: u32,
         operand_size: OperandSize,
     ) -> ExecResult<()> {
-        if self.is_protected_mode() {
+        // As in `far_call`: a V86 task's far jump is 8086-style, not a descriptor load.
+        if self.is_protected_mode() && !self.is_v86_mode() {
             let (low, high) = self.read_transfer_descriptor(bus, selector)?;
             if (high >> 8) & 0x10 == 0 {
                 return self.far_system_transfer(bus, selector, low, high, false);
@@ -21196,6 +21279,23 @@ mod tests {
         cpu.cycle(&mut bus).unwrap();
         assert_eq!(cpu.registers.segment(SegmentIndex::Ds).base, 0x1_2340);
         assert_eq!(cpu.registers.segment(SegmentIndex::Ds).selector, 0x1234);
+    }
+
+    #[test]
+    fn v86_far_call_uses_real_mode_segments() {
+        // CALL FAR 0x8FA9:0x1234 (9A off16 seg16) in a V86 task must be an 8086-style
+        // far call (CS = 0x8FA9, base 0x8FA90), never a GDT descriptor lookup — 0x8FA9
+        // is not a valid selector and would #GP. Regression for the SP-4b V86 boot:
+        // real FreeDOS makes far calls to high segments while virtualized.
+        let (mut cpu, memory) = real_mode_cpu(&[0x9a, 0x34, 0x12, 0xa9, 0x8f], 0x200);
+        cpu.control.cr0 |= CR0_PE;
+        cpu.registers.eflags = 0x2 | FLAG_VM | 0x3000; // IOPL 3
+        cpu.registers.set_esp(0x100);
+        let mut bus = TestBus::with_memory(memory);
+        cpu.cycle(&mut bus).unwrap();
+        assert_eq!(cpu.registers.cs().selector, 0x8fa9);
+        assert_eq!(cpu.registers.cs().base, 0x8_fa90);
+        assert_eq!(cpu.registers.eip & 0xffff, 0x1234);
     }
 
     #[test]

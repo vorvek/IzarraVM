@@ -2261,12 +2261,10 @@ del PREEXIST.TXT\r\n";
         );
     }
 
-    /// SP-4b M0 Task 1: prove the bespoke `.SYS` device-driver seam end to end.
-    /// A minimal TOKAEMM.SYS is overlaid onto C: and loaded via `DEVICE=` in a
-    /// CONFIG.SYS override. Its INIT runs at SYSINIT (real mode, no V86), prints a
-    /// marker through INT 29h, and reports "no resident code" (r_endaddr = header
-    /// seg:0) so DOS unloads it again. The gate: the marker reaches the screen AND
-    /// FreeDOS still boots to C:\>.
+    /// SP-4b M0 GO/NO-GO: `DEVICE=C:\TOKAEMM.SYS` puts the running kernel into V86
+    /// under TOKAEMM's ring-0 monitor at SYSINIT, and real FreeDOS still finishes
+    /// booting to C:\> — every instruction and hardware IRQ from the DEVICE= line
+    /// onward runs virtualized. The gate: the DOS prompt reaches the screen.
     ///
     /// CONFIG.SYS and TOKAEMM.SYS are both passed as `mount_hdd_folder_with`
     /// overrides (which replace/append onto the committed system files). The host
@@ -2274,7 +2272,7 @@ del PREEXIST.TXT\r\n";
     /// system CONFIG.SYS whose 8.3 name is reserved first, and lose the `~n` fold.
     #[test]
     #[ignore = "boots a full DOS image (slow in debug); run with --ignored"]
-    fn tokaemm_init_enters_v86() {
+    fn tokaemm_m0_freedos_survives_in_v86() {
         let dir = std::env::temp_dir().join(format!(
             "tokaemm_t3a_{}_{}",
             std::process::id(),
@@ -2309,19 +2307,20 @@ SHELL=C:\\COMMAND.COM C:\\ /E:2048 /P=C:\\AUTOEXEC.BAT\r\n"
             )
             .expect("mount host folder with overrides");
 
-        let stop = machine
-            .run_until_halt_or_cycles(500_000_000)
-            .expect("run machine");
+        let stop = machine.run_until_halt_or_cycles(500_000_000);
         let text = machine.screen_text().as_text();
         std::fs::remove_dir_all(&dir).ok();
-        // Task 3 increment A: TOKAEMM.SYS INIT builds its PM/paging env and enters
-        // V86, where the stub signals 0xA5 through the unit-tester exit port. (It
-        // does not yet return to DOS, so the boot stops here rather than reaching
-        // C:\> — that is Task 3 increment B.)
-        assert_eq!(
-            stop,
-            StopReason::TestExit { code: 0xA5 },
-            "TOKAEMM INIT did not enter V86 and signal 0xA5 (stop={stop:?}).\n{text}"
-        );
+        // FreeDOS boots to the C:\> prompt with the whole system running in V86
+        // under TOKAEMM's monitor (SYSINIT + FreeCOM + every IRQ virtualized).
+        if !text.to_lowercase().contains("c:\\>") {
+            let trace = izarravm_cpu::take_v86_trace();
+            let tail: Vec<_> = trace.iter().rev().take(120).rev().cloned().collect();
+            panic!(
+                "FreeDOS did not reach C:\\> in V86 (stop={stop:?}).\n{text}\n\
+                 --- last {} V86 trace events (set TOKAEMM_TRACE=1) ---\n{}",
+                tail.len(),
+                tail.join("\n")
+            );
+        }
     }
 }

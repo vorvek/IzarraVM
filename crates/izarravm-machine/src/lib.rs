@@ -9622,7 +9622,13 @@ impl Machine {
                             service_stop = Some(StopReason::TestExit { code });
                         }
                     }
+                    // A software INT taken by a V86 guest faults to the TOKAEMM monitor
+                    // (ring-0 PM) before its frame is reflected onto the guest stack. The
+                    // HLE BIOS services assume that real-mode-style frame at SS:SP+4 (see
+                    // `set_int_frame_carry`), so defer them while the monitor runs; they
+                    // fire once it IRETs back into V86 with the frame in place.
                     if service_stop.is_none()
+                        && !self.cpu.is_ring0_protected()
                         && let Some(vector) = self.pending_soft_int
                     {
                         serviced = true;
