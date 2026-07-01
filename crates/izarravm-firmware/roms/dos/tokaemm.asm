@@ -479,6 +479,10 @@ xf_info:
     jmp xms_fail
 
 ; 0Fh resize EMB: BX=new KB, DX=handle. Free + re-place; restore on failure.
+; ponytail: re-places without copying the old contents to the new base — data is
+; preserved only when find_gap returns the same base (no fragmentation). This
+; mirrors the retired FlatEmbAllocator::resize (the M1 goal was HLE parity); a
+; copy-on-relocate (via the INT 0xC0 memcpy) is a future-milestone fidelity item.
 xf_resize:
     push cx
     push si
