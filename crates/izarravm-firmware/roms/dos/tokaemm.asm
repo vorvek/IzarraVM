@@ -991,8 +991,11 @@ pm_init:                          ; EBP=pd_lin, ESI=drv_seg, EBX=monitor ESP0
     add edi, 4
     loop .pt
     ; SP-4b M3: page the free upper window 0xC8000-0xEFFFF to extended RAM (the
-    ; EMM386 trick). Those holes have no RAM of their own -> the guest reads them as
-    ; open bus (0xFF) without this. ROM/video PTEs stay identity; only these 40 move.
+    ; EMM386 trick). On real hardware these holes have no RAM; a UMB there must be
+    ; extended RAM mapped in. (This emulator's flat array also backs phys 0xC8000 via
+    ; read_phys's fallback, so identity would work too -- but mapping proper extended
+    ; RAM is faithful and keeps the UMB accounted against extended memory, not phantom
+    ; RAM.) ROM/video PTEs stay identity; only these 40 move.
     lea edi, [ebp + 0x1000 + (UMB_LIN_BASE >> 12) * 4]  ; PT0 entry for 0xC8000
     mov eax, UMB_PHYS_BASE | 7                          ; backing base, present/rw/user
     mov ecx, UMB_BYTES >> 12                            ; 40 pages
